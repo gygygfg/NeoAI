@@ -1,39 +1,50 @@
 local backend = require("NeoAI.backend")
 local ui = require("NeoAI.ui")
+local config = require("NeoAI.config")
 
 local M = {}
+local final_config = nil
 
 function M.setup(user_config)
-  -- 初始化
+  -- 初始化：合并用户配置和默认配置
   user_config = user_config or {}
+
+  -- 使用默认配置作为基础，用户配置会覆盖对应的字段
+  final_config = vim.tbl_deep_extend("force", config.defaults, user_config)
 
   backend.setup({
     -- 后端配置
-    config_dir = user_config.config_dir,
-    config_file = user_config.config_file,
+    config_dir = final_config.background.config_dir,
+    config_file = final_config.background.config_file,
   })
 
   ui.setup({
     -- UI配置
-    width = user_config.width or 80,
-    height = user_config.height or 20,
-    border = user_config.border or "rounded",
-    auto_scroll = user_config.auto_scroll ~= false,
-    show_timestamps = user_config.show_timestamps ~= false,
-    show_role_icons = user_config.show_role_icons ~= false,
+    width = final_config.ui.width,
+    height = final_config.ui.height,
+    border = final_config.ui.border,
+    auto_scroll = final_config.ui.auto_scroll,
+    show_timestamps = final_config.ui.show_timestamps,
+    show_role_icons = final_config.show_role_icons,
+    role_icons = final_config.role_icons,
+    colors = final_config.colors,
+    keymaps = final_config.keymaps,
   })
 
   -- 设置命令
   M.setup_commands()
 
-  vim.print("[NeoAI] 插件已加载")
+  -- 设置快捷键
+  M.setup_keymaps(final_config.keymaps)
+
+  vim.notify("[NeoAI] 插件已加载")
 end
 
 function M.setup_commands()
   -- 创建命令
   vim.api.nvim_create_user_command("NeoAIOpen", function(opts)
-    -- 打开聊天
-    local mode = opts.args or "float"
+    -- 打开聊天，使用配置中的默认模式
+    local mode = opts.args ~= "" and opts.args or final_config.ui.default_mode
 
     if mode == "float" then
       ui.open_float()
@@ -42,7 +53,7 @@ function M.setup_commands()
     elseif mode == "tab" then
       ui.open_tab()
     else
-      vim.print("未知模式: " .. mode .. " (可用: float, split, tab)")
+      vim.notify("未知模式: " .. mode .. " (可用: float, split, tab)")
     end
   end, {
     nargs = "?",
@@ -56,8 +67,8 @@ function M.setup_commands()
 
   vim.api.nvim_create_user_command("NeoAISend", function(opts)
     -- 发送消息
-    if backend.current_session and opts.args and opts.args ~= "" then
-      backend.send_message(backend.current_session, opts.args)
+    if opts.args and opts.args ~= "" then
+      backend.send_message(opts.args)
       ui.update_display()
     end
   end, { nargs = "+" })
@@ -66,7 +77,7 @@ function M.setup_commands()
     -- 新建会话
     local name = opts.args ~= "" and opts.args or nil
     backend.new_session(name)
-    vim.print("新会话已创建: " .. backend.sessions[backend.current_session].name)
+    vim.notify("新会话已创建: " .. backend.sessions[backend.current_session].name)
 
     if ui.is_open then
       ui.update_display()
@@ -78,22 +89,22 @@ function M.setup_commands()
     local session_id = tonumber(opts.args)
     if session_id and backend.sessions[session_id] then
       backend.current_session = session_id
-      vim.print("切换到会话: " .. backend.sessions[session_id].name)
+      vim.notify("切换到会话: " .. backend.sessions[session_id].name)
 
       if ui.is_open then
         ui.update_display()
       end
     else
-      vim.print("无效的会话ID")
+      vim.notify("无效的会话ID")
     end
   end, { nargs = 1 })
 
   vim.api.nvim_create_user_command("NeoAIList", function()
     -- 列出会话
-    vim.print("=== 会话列表 ===")
+    vim.notify("=== 会话列表 ===")
     for id, session in pairs(backend.sessions) do
       local current = (id == backend.current_session) and " [当前]" or ""
-      vim.print(string.format("%d. %s (%d条消息)%s", id, session.name, #session.messages, current))
+      vim.notify(string.format("%d. %s (%d条消息)%s", id, session.name, #session.messages, current))
     end
   end, {})
 
@@ -102,7 +113,7 @@ function M.setup_commands()
     if backend.current_session then
       local filepath = opts.args ~= "" and opts.args or nil
       backend.export_session(backend.current_session, filepath)
-      vim.print("会话已导出: " .. (filepath or backend.config_file))
+      vim.notify("会话已导出: " .. (filepath or backend.config_file))
     end
   end, { nargs = "?" })
 
@@ -110,7 +121,7 @@ function M.setup_commands()
     -- 导入会话
     local filepath = opts.args ~= "" and opts.args or nil
     local imported = backend.import_sessions(filepath)
-    vim.print("已导入 " .. #imported .. " 个会话")
+    vim.notify("已导入 " .. #imported .. " 个会话")
   end, { nargs = "?" })
 
   vim.api.nvim_create_user_command("NeoAIMode", function(opts)
@@ -119,7 +130,7 @@ function M.setup_commands()
     if mode == "float" or mode == "split" or mode == "tab" then
       ui.switch_mode(mode)
     else
-      vim.print("可用模式: float, split, tab")
+      vim.notify("可用模式: float, split, tab")
     end
   end, { nargs = 1 })
 
@@ -127,30 +138,19 @@ function M.setup_commands()
     -- 获取统计
     if backend.current_session then
       local stats = backend.get_session_stats(backend.current_session)
-      vim.print("=== 会话统计 ===")
-      vim.print("总消息数: " .. stats.total_messages)
-      vim.print("用户消息: " .. stats.user_messages)
-      vim.print("AI消息: " .. stats.ai_messages)
-      vim.print("可编辑消息: " .. stats.editable_messages)
-      vim.print("持续时间: " .. stats.duration_minutes .. " 分钟")
+      vim.notify("=== 会话统计 ===")
+      vim.notify("总消息数: " .. stats.total_messages)
+      vim.notify("用户消息: " .. stats.user_messages)
+      vim.notify("AI消息: " .. stats.ai_messages)
+      vim.notify("可编辑消息: " .. stats.editable_messages)
+      vim.notify("持续时间: " .. stats.duration_minutes .. " 分钟")
     end
   end, {})
 end
 
 function M.setup_keymaps(keymaps)
-  -- 快捷键设置
-  keymaps = keymaps
-    or {
-      open = "<leader>cc",
-      close = "<leader>cq",
-      send = "<leader>cs",
-      new = "<leader>cn",
-    }
-
-  vim.keymap.set("n", keymaps.open, "<cmd>NeoAIOpen<CR>", { desc = "打开聊天" })
-  vim.keymap.set("n", keymaps.close, "<cmd>NeoAIClose<CR>", { desc = "关闭聊天" })
-  vim.keymap.set("n", keymaps.send, ":<C-u>NeoAISend ", { desc = "发送消息" })
-  vim.keymap.set("n", keymaps.new, "<cmd>NeoAINew<CR>", { desc = "新建会话" })
+  -- 快捷键设置已移至 ui.lua 中作为 buffer-local 快捷键处理
+  -- 不再注册全局快捷键，仅在聊天 buffer 中生效
 end
 
 function M.toggle_message_edit(message_id)
