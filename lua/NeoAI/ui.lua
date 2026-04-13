@@ -323,11 +323,14 @@ function M.adjust_window_size(content_width, content_height)
   -- 标签模式由Neovim自动管理
 end
 
---- 调整树窗口大小（修复宽度不够问题）
+--- 调整树窗口大小（动态宽度，最大值为屏幕一半）
 function M.adjust_tree_window_size()
   if not is_win_valid(M.windows.tree) or not is_buf_valid(M.tree_buffers.main) then
     return
   end
+
+  local editor_w = vim.o.columns
+  local max_width = math.floor(editor_w * 0.5)
 
   -- 计算树内容的最大宽度
   local lines = vim.api.nvim_buf_get_lines(M.tree_buffers.main, 0, -1, false)
@@ -338,25 +341,16 @@ function M.adjust_tree_window_size()
     max_w = math.max(max_w, width)
   end
 
-  -- 增加边距确保边框完整显示
-  local target = math.min(max_w + 8, 60) -- 增加边距从4到8
-  target = math.max(target, M.WINDOW_LIMITS.tree.min_width)
+  -- 动态宽度 = 内容宽度 + 边距，但不超过屏幕一半
+  local target = math.min(max_w + 10, max_width)
+  target = clamp(target, M.WINDOW_LIMITS.tree.min_width, max_width)
 
-  -- 在浮动模式下，树窗口宽度不能超过主窗口的 35%
-  if M.current_mode == M.ui_modes.FLOAT and is_win_valid(M.windows.main) then
-    local main_w = vim.api.nvim_win_get_width(M.windows.main)
-    target = math.min(target, math.floor(main_w * 0.35))
+  local current_w = vim.api.nvim_win_get_width(M.windows.tree)
+  if target ~= current_w then
+    safe_win_call(function()
+      vim.api.nvim_win_set_width(M.windows.tree, target)
+    end)
   end
-
-  -- 确保窗口不会超出屏幕
-  local editor_w = vim.o.columns
-  if target > editor_w * 0.9 then
-    target = math.floor(editor_w * 0.9)
-  end
-
-  safe_win_call(function()
-    vim.api.nvim_win_set_width(M.windows.tree, target)
-  end)
 end
 
 -- ── 窗口策略函数 ─────────────────────────────────────────────────────────────
@@ -1234,8 +1228,24 @@ function M.open_float()
       M.create_buffers()
     end
 
-    -- 创建树浮动窗口（合理宽度，直接获取焦点）
-    local tree_w = math.max(60, math.floor(M.config.ui.width * 0.7))
+    -- 计算树窗口宽度（动态宽度，最大值为屏幕一半）
+    local editor_width = vim.o.columns
+    local max_width = math.floor(editor_width * 0.5)
+
+    -- 根据内容计算宽度
+    local lines = vim.api.nvim_buf_get_lines(M.tree_buffers.main, 0, -1, false)
+    local max_content_width = 0
+    for _, line in ipairs(lines) do
+      local w = display_width(line)
+      if w > max_content_width then
+        max_content_width = w
+      end
+    end
+
+    -- 动态宽度 = 内容宽度 + 边距，但不超过屏幕一半
+    local tree_w = math.min(max_content_width + 10, max_width)
+    tree_w = clamp(tree_w, M.WINDOW_LIMITS.tree.min_width, max_width)
+
     local float_opts = M.get_window_strategy(M.ui_modes.FLOAT)()
     float_opts.width = tree_w
     float_opts.col = math.floor((vim.o.columns - tree_w) / 2)
@@ -1243,7 +1253,12 @@ function M.open_float()
     M.windows.tree = vim.api.nvim_open_win(M.tree_buffers.main, true, float_opts)
     M.windows.main = M.windows.tree -- 树窗口就是主窗口
 
+    -- 设置窗口选项
     vim.api.nvim_set_option_value("winfixwidth", true, { win = M.windows.tree })
+    vim.api.nvim_set_option_value("wrap", true, { win = M.windows.tree })
+    vim.api.nvim_set_option_value("linebreak", true, { win = M.windows.tree })
+    vim.api.nvim_set_option_value("breakindent", true, { win = M.windows.tree })
+    
     M.setup_tree_cursor_autocmd()
     M.is_open = true
     M.current_mode = M.ui_modes.FLOAT
