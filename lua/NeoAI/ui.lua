@@ -19,9 +19,18 @@ M.original_tabline = nil -- 原始标签栏设置
 M.original_showtabline = nil -- 原始标签栏显示设置
 M.input_start_line = nil -- 输入区域起始行
 M.input_end_line = nil -- 输入区域结束行
-M.showing_tree = true -- 是否显示树视图
+M._showing_tree = nil -- 运行时的树视图切换状态（nil=由后端决定）
 M._debounce_timers = {} -- 防抖计时器表
 M._resize_pending = false -- 是否有待处理的调整大小请求
+
+-- 判断是否应显示树视图（优先使用运行时切换状态，否则由后端决定）
+-- @return boolean
+function M.should_show_tree()
+  if M._showing_tree ~= nil then
+    return M._showing_tree
+  end
+  return backend.should_show_tree()
+end
 
 -- 各模式窗口大小限制
 M.WINDOW_LIMITS = {
@@ -445,25 +454,29 @@ end
 -- 完成后自动将光标定位到输入行并进入插入模式
 -- @param win_opts 窗口配置选项表
 function M.setup_windows(win_opts)
+  vim.notify("执行")
   M.windows.main = vim.api.nvim_open_win(M.buffers.main, true, win_opts)
   M.set_window_wrap()
   M.setup_buffers()
   M.is_open = true
 
   -- 异步等待渲染完成后将光标定位到输入提示行
-  vim.schedule(function()
+  vim.defer_fn(function()
     if M.is_open and is_win_valid(M.windows.main) and is_buf_valid(M.buffers.main) then
       -- 确保输入行可编辑
       vim.api.nvim_set_option_value("modifiable", true, { buf = M.buffers.main })
       vim.api.nvim_set_option_value("readonly", false, { buf = M.buffers.main })
-      -- 滚动到最后一行（输入行），确保光标在最下面
-      local line_count = vim.api.nvim_buf_line_count(M.buffers.main)
-      vim.api.nvim_win_set_cursor(M.windows.main, { line_count, 0 })
-      vim.cmd("normal! zb")
-      -- 进入插入模式准备输入
-      vim.cmd("startinsert")
+
+      -- 定位到输入行
+      if M.input_start_line then
+        local cursor_line = M.input_start_line + 1 -- +1 因为 cursor 是 1-indexed
+        vim.api.nvim_win_set_cursor(M.windows.main, { cursor_line, 0 })
+        vim.cmd("normal! zb")
+        -- 进入插入模式准备输入
+        vim.cmd("startinsert")
+      end
     end
-  end)
+  end, 100) -- 100ms 延迟确保渲染完成
 end
 
 --- 设置树窗口光标移动自动命令
@@ -565,14 +578,12 @@ function M.setup_tree_cursor_autocmd()
 
         -- 查找目标行
         local target_line = nil
-        local target_pos = nil
 
         if direction == 1 then
           -- 向下：找第一个大于当前行的对话轮次
           for _, item in ipairs(all_turn_lines) do
             if item.line > current_line then
               target_line = item.line
-              target_pos = item.pos
               break
             end
           end
@@ -581,7 +592,6 @@ function M.setup_tree_cursor_autocmd()
           for i = #all_turn_lines, 1, -1 do
             if all_turn_lines[i].line < current_line then
               target_line = all_turn_lines[i].line
-              target_pos = all_turn_lines[i].pos
               break
             end
           end
@@ -665,8 +675,8 @@ function M.get_tab_label()
           bufname:match("NeoAI")
           or bufname:match("NeoAI://")
           or bufname:match("NeoAI%-Tree")
-          or vim.api.nvim_buf_get_option(buf, "filetype") == "NeoAI"
-          or vim.api.nvim_buf_get_option(buf, "filetype") == "NeoAITree"
+          or vim.api.nvim_get_option_value("filetype", { buf = buf }) == "NeoAI"
+          or vim.api.nvim_get_option_value("filetype", { buf = buf }) == "NeoAITree"
         )
       then
         has_neoai = true
@@ -795,7 +805,6 @@ function M.render_session_tree()
 
   -- 标题（缩短以适配更小宽度）
   local title = "📂 Chat History"
-  local title_width = display_width(title)
   local separator_len = 30
   table.insert(lines, "╭─ " .. title .. " ─" .. string.rep("─", separator_len) .. "╮")
 
@@ -836,7 +845,15 @@ function M.render_session_tree()
   for line_num, pos in pairs(M.tree_buffers.session_positions) do
     if pos.type == "session" then
       local hl = (pos.id == backend.current_session) and "Todo" or "Normal"
-      vim.api.nvim_buf_add_highlight(buf, ns_id, hl, line_num - 1, 0, -1)
+      local line_idx = line_num - 1
+      local buf_line_count = vim.api.nvim_buf_line_count(buf)
+      if line_idx >= 0 and line_idx < buf_line_count then
+        vim.api.nvim_buf_set_extmark(buf, ns_id, line_idx, 0, {
+          end_row = line_idx + 1,
+          end_col = 0,
+          hl_group = hl,
+        })
+      end
     end
   end
 
@@ -855,8 +872,8 @@ end
 -- @param lines 行数组（会被修改）
 -- @param session 会话对象
 -- @param session_id 会话ID
--- @param is_current 是否为当前会话
-function M._render_session_messages(lines, session, session_id, is_current)
+-- @param _ 是否为当前会话（当前未使用）
+function M._render_session_messages(lines, session, session_id, _)
   if not session.messages or #session.messages == 0 then
     table.insert(lines, "  └─ (空会话)")
     return
@@ -929,8 +946,8 @@ function M.setup_tree_keymaps()
       backend.sync_data(backend.current_session)
 
       backend.current_session = sid
-      local session = backend.sessions[sid]
-      vim.notify("[NeoAI] 切换到会话: " .. (session and session.name or sid))
+      -- local session = backend.sessions[sid]
+      -- vim.notify("[NeoAI] 切换到会话: " .. (session and session.name or sid))
       M.open_chat_after_tree_selection()
     else
       -- 点击在空白行：创建新会话
@@ -1072,16 +1089,16 @@ function M.update_display()
   end
 
   -- 刷新树视图
-  if M.showing_tree and is_win_valid(M.windows.tree) and is_buf_valid(M.tree_buffers.main) then
+  if M.should_show_tree() and is_win_valid(M.windows.tree) and is_buf_valid(M.tree_buffers.main) then
     M.render_session_tree()
   end
 end
 
 --- 设置缓冲区可编辑性
 -- 建立缓冲区行号到消息对象的映射表，用于控制哪些行可以编辑
--- @param buf 缓冲区句柄
+-- @param _ 缓冲区句柄（当前未使用）
 -- @param session 会话对象
-function M._setup_editability(buf, session)
+function M._setup_editability(_, session)
   if not session or not session.messages then
     return
   end
@@ -1091,14 +1108,13 @@ function M._setup_editability(buf, session)
 
   for i, msg in ipairs(session.messages) do
     -- 标题行（不映射，不可编辑）
-    local header_line = current_line
     current_line = current_line + 1
 
     -- 获取当前消息的内容行数（自动换行后的行数）
     local content_lines = wrap_message_content(msg.content, 60 - 4)
 
     -- 只映射内容行（不映射标题行），这些行可以被用户编辑
-    for j, content_line in ipairs(content_lines) do
+    for j, _ in ipairs(content_lines) do
       local line_num = current_line + j - 1
       M._line_to_message[line_num] = {
         session_id = session.id,
@@ -1212,13 +1228,24 @@ function M.open_chat_after_tree_selection()
       M.tree_buffers.main = nil
     end
   end
+
+  -- 从树选择后切换到聊天界面：定位光标到输入行
+  vim.defer_fn(function()
+    if is_win_valid(M.windows.main) and is_buf_valid(M.buffers.main) and M.input_start_line then
+      vim.api.nvim_set_option_value("modifiable", true, { buf = M.buffers.main })
+      vim.api.nvim_set_option_value("readonly", false, { buf = M.buffers.main })
+      vim.api.nvim_win_set_cursor(M.windows.main, { M.input_start_line + 1, 0 })
+      vim.cmd("normal! zb")
+      vim.cmd("startinsert")
+    end
+  end, 50)
 end
 
 --- 打开浮窗模式
 function M.open_float()
   ensure_active_session()
 
-  if M.showing_tree then
+  if M.should_show_tree() then
     if not is_buf_valid(M.tree_buffers.main) then
       M.create_tree_buffers()
     end
@@ -1258,10 +1285,17 @@ function M.open_float()
     vim.api.nvim_set_option_value("wrap", true, { win = M.windows.tree })
     vim.api.nvim_set_option_value("linebreak", true, { win = M.windows.tree })
     vim.api.nvim_set_option_value("breakindent", true, { win = M.windows.tree })
-    
+
     M.setup_tree_cursor_autocmd()
     M.is_open = true
     M.current_mode = M.ui_modes.FLOAT
+
+    -- 树视图模式：定位光标到第一行
+    vim.defer_fn(function()
+      if is_win_valid(M.windows.tree) and is_buf_valid(M.tree_buffers.main) then
+        vim.api.nvim_win_set_cursor(M.windows.tree, { 1, 0 })
+      end
+    end, 50)
     return
   end
 
@@ -1275,7 +1309,7 @@ end
 function M.open_split()
   ensure_active_session()
 
-  if M.showing_tree then
+  if M.should_show_tree() then
     if not is_buf_valid(M.tree_buffers.main) then
       M.create_tree_buffers()
     end
@@ -1293,6 +1327,13 @@ function M.open_split()
     M.setup_tree_cursor_autocmd()
     M.is_open = true
     M.current_mode = M.ui_modes.SPLIT
+
+    -- 树视图模式：定位光标到第一行
+    vim.defer_fn(function()
+      if is_win_valid(M.windows.tree) and is_buf_valid(M.tree_buffers.main) then
+        vim.api.nvim_win_set_cursor(M.windows.tree, { 1, 0 })
+      end
+    end, 50)
     return
   end
 
@@ -1310,13 +1351,24 @@ function M.open_split()
   M.setup_buffers()
   M.is_open = true
   M.current_mode = M.ui_modes.SPLIT
+
+  -- 非树模式：定位光标到输入行
+  vim.defer_fn(function()
+    if M.is_open and is_win_valid(M.windows.main) and is_buf_valid(M.buffers.main) and M.input_start_line then
+      vim.api.nvim_set_option_value("modifiable", true, { buf = M.buffers.main })
+      vim.api.nvim_set_option_value("readonly", false, { buf = M.buffers.main })
+      vim.api.nvim_win_set_cursor(M.windows.main, { M.input_start_line + 1, 0 })
+      vim.cmd("normal! zb")
+      vim.cmd("startinsert")
+    end
+  end, 50)
 end
 
 --- 打开标签页模式
 function M.open_tab()
   ensure_active_session()
 
-  if M.showing_tree then
+  if M.should_show_tree() then
     -- 先创建主缓冲区（不打开窗口）
     M.create_buffers()
 
@@ -1342,6 +1394,13 @@ function M.open_tab()
 
     M.is_open = true
     M.current_mode = M.ui_modes.TAB
+
+    -- 树视图模式：定位光标到第一行
+    vim.defer_fn(function()
+      if is_win_valid(M.windows.tree) and is_buf_valid(M.tree_buffers.main) then
+        vim.api.nvim_win_set_cursor(M.windows.tree, { 1, 0 })
+      end
+    end, 50)
     return
   end
 
@@ -1354,6 +1413,17 @@ function M.open_tab()
   M.setup_buffers()
   M.is_open = true
   M.current_mode = M.ui_modes.TAB
+
+  -- 非树模式：定位光标到输入行
+  vim.defer_fn(function()
+    if M.is_open and is_win_valid(M.windows.main) and is_buf_valid(M.buffers.main) and M.input_start_line then
+      vim.api.nvim_set_option_value("modifiable", true, { buf = M.buffers.main })
+      vim.api.nvim_set_option_value("readonly", false, { buf = M.buffers.main })
+      vim.api.nvim_win_set_cursor(M.windows.main, { M.input_start_line + 1, 0 })
+      vim.cmd("normal! zb")
+      vim.cmd("startinsert")
+    end
+  end, 50)
 end
 
 -- ── 输入处理 ───────────────────────────────────────────────────────────────
@@ -1525,7 +1595,7 @@ function M._save_edited_line(line_num)
   if success then
     vim.notify("[NeoAI] 消息修改已保存: " .. msg, vim.log.levels.INFO)
   else
-    vim.notify("[NeoAI] 消息修改保存失败" .. msg, vim.log.levels.INFO)
+    -- vim.notify("[NeoAI] 消息修改保存失败" .. msg, vim.log.levels.INFO)
   end
 end
 
@@ -1722,9 +1792,9 @@ function M.close()
         if M.current_mode == M.ui_modes.TAB then
           local tab = vim.api.nvim_win_get_tabpage(win)
           if tab ~= vim.api.nvim_get_current_tabpage() then
-            pcall(vim.cmd, "tabclose " .. vim.api.nvim_tabpage_get_number(tab))
+            pcall(vim.api.nvim_command, "tabclose " .. vim.api.nvim_tabpage_get_number(tab))
           else
-            pcall(vim.cmd, "tabclose")
+            pcall(vim.api.nvim_command, "tabclose")
           end
         else
           vim.api.nvim_win_close(win, true)
@@ -1804,7 +1874,7 @@ end
 --- 切换树视图显示
 -- 显示/隐藏会话列表的树视图窗口，需要重新创建窗口才能生效
 function M.toggle_tree_view()
-  M.showing_tree = not M.showing_tree -- 切换状态
+  M._showing_tree = not M._showing_tree -- 切换状态
   if M.is_open then
     local mode = M.current_mode
     M.close() -- 关闭当前窗口
@@ -1818,9 +1888,9 @@ function M.toggle_tree_view()
       M.open_tab()
     end
 
-    vim.notify("[NeoAI] 树视图已" .. (M.showing_tree and " 显示" or "隐藏"))
+    vim.notify("[NeoAI] 树视图已" .. (M._showing_tree and " 显示" or "隐藏"))
   else
-    vim.notify("[NeoAI] 树视图将在下次打开聊天时" .. (M.showing_tree and "显示" or "隐藏"))
+    vim.notify("[NeoAI] 树视图将在下次打开聊天时" .. (M._showing_tree and "显示" or "隐藏"))
   end
 end
 
@@ -1907,10 +1977,10 @@ function M.setup(user_config)
   end)
 
   -- 数据同步事件：预留回调（可用于状态栏提示等）
-  backend.on("data_synced", function(data)
+  backend.on("data_synced", function(_)
     -- 数据已同步，可以在这里添加UI反馈（如状态栏提示）
     -- 暂时不需要额外操作，仅作日志记录
-    -- vim.notify("[NeoAI] 数据已同步: " .. data.action, vim.log.levels.DEBUG)
+    -- vim.notify("[NeoAI] 数据已同步", vim.log.levels.DEBUG)
   end)
 
   -- ── Neovim 自动命令 ──

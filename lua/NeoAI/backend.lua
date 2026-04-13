@@ -749,4 +749,19 @@ function M.setup(user_config)
   vim.notify("[NeoAI] 后端已初始化，当前会话: " .. (M.sessions[M.current_session] and M.sessions[M.current_session].name or "无"))
 end
 
+--- 判断是否应该显示树视图（会话列表）
+-- 当存在多个会话时显示树视图供用户选择，否则直接进入聊天界面
+-- @return boolean 是否应显示树视图
+function M.should_show_tree()
+  -- 如果只有一个会话，直接进入聊天界面
+  local session_count = 0
+  for _, _ in pairs(M.sessions) do
+    session_count = session_count + 1
+    if session_count > 1 then
+      return true -- 多个会话，显示树视图
+    end
+  end
+  return false -- 只有一个或没有会话，进入聊天界面
+end
+
 return M
