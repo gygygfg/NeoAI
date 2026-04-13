@@ -31,50 +31,6 @@ M.WINDOW_LIMITS = {
   tree = { min_width = 40, max_width_ratio = 0.35 },
 }
 
--- 边框字符映射表（用于不同边框样式）
-local BORDER_CHARS = {
-  rounded = {
-    top_left = "╭",
-    top_right = "╮",
-    bottom_left = "╰",
-    bottom_right = "╯",
-    vertical = "│",
-    horizontal = "─",
-  },
-  single = {
-    top_left = "┌",
-    top_right = "┐",
-    bottom_left = "└",
-    bottom_right = "┘",
-    vertical = "│",
-    horizontal = "─",
-  },
-  double = {
-    top_left = "╔",
-    top_right = "╗",
-    bottom_left = "╚",
-    bottom_right = "╝",
-    vertical = "║",
-    horizontal = "═",
-  },
-  solid = {
-    top_left = "┏",
-    top_right = "┓",
-    bottom_left = "┗",
-    bottom_right = "┛",
-    vertical = "┃",
-    horizontal = "━",
-  },
-  none = { top_left = "", top_right = "", bottom_left = "", bottom_right = "", vertical = "", horizontal = "" },
-}
-
--- 获取边框配置（用于 nvim_open_win）
--- @param border_style 边框样式名称（如 "rounded", "single" 等）
--- @return table 边框字符配置表
-local function get_border_config(border_style)
-  return BORDER_CHARS[border_style] or BORDER_CHARS.rounded
-end
-
 -- 分隔线字符映射表
 local SEPARATOR_CHARS = { single = "─", double = "═", solid = "━", dotted = "┈", dashed = "┄" }
 
@@ -282,6 +238,14 @@ function M.cleanup_windows()
   cleanup_table(M.buffers, is_buf_valid)
   cleanup_table(M.tree_buffers, is_buf_valid)
 
+  -- 清理已删除的缓冲区引用
+  if not is_buf_valid(M.buffers.main) then
+    M.buffers.main = nil
+  end
+  if not is_buf_valid(M.tree_buffers.main) then
+    M.tree_buffers.main = nil
+  end
+
   return cleaned
 end
 
@@ -420,7 +384,7 @@ function M.get_window_strategy(mode)
         height = height,
         row = row,
         col = col,
-        border = get_border_config(M.config.ui.border), -- 使用自定义边框字符
+        border = M.config.ui.border, -- 使用配置的边框样式
         style = "minimal", -- 最小化样式，隐藏行号等
         focusable = true, -- 允许获取焦点
       }
@@ -439,7 +403,7 @@ function M.get_window_strategy(mode)
         row = 0,
         col = vim.o.columns - width, -- 靠右对齐
         style = "minimal",
-        border = get_border_config(M.config.ui.border),
+        border = M.config.ui.border,
       }
     end,
 
@@ -473,7 +437,7 @@ function M.get_window_strategy(mode)
         row = 0,
         col = 0, -- 与父窗口左上角对齐
         style = "minimal",
-        border = get_border_config(M.config.ui.border),
+        border = M.config.ui.border,
         focusable = true,
       }
     end,
@@ -701,7 +665,16 @@ function M.get_tab_label()
       local buf = vim.api.nvim_win_get_buf(win)
       -- 通过缓冲区名称判断是否为 NeoAI
       local bufname = vim.api.nvim_buf_get_name(buf)
-      if bufname and (bufname:match("^NeoAI") or bufname:match("NeoAI://") or bufname:match("NeoAI%-Tree")) then
+      if
+        bufname
+        and (
+          bufname:match("NeoAI")
+          or bufname:match("NeoAI://")
+          or bufname:match("NeoAI%-Tree")
+          or vim.api.nvim_buf_get_option(buf, "filetype") == "NeoAI"
+          or vim.api.nvim_buf_get_option(buf, "filetype") == "NeoAITree"
+        )
+      then
         has_neoai = true
         break
       end
@@ -735,8 +708,14 @@ end
 --- 创建主缓冲区
 -- 创建用于显示聊天内容的主缓冲区，并初始化欢迎信息
 function M.create_buffers()
+  -- 如果已存在有效缓冲区，直接复用
+  if is_buf_valid(M.buffers.main) then
+    return
+  end
+
   M.buffers.main = vim.api.nvim_create_buf(false, true) -- 不关联文件，设为列表缓冲区
-  vim.api.nvim_buf_set_name(M.buffers.main, "NeoAI://chat") -- 设置缓冲区名称，方便 :b 切换
+  vim.api.nvim_buf_set_name(M.buffers.main, "NeoAI:chat") -- 设置缓冲区名称，方便 :b 切换
+  vim.api.nvim_set_option_value("buflisted", true, { buf = M.buffers.main }) -- 让 buffer 出现在 :ls 列表中
   -- 初始化欢迎信息
   vim.api.nvim_buf_set_lines(M.buffers.main, 0, -1, false, {
     "",
@@ -749,10 +728,17 @@ end
 --- 创建树视图缓冲区
 -- 创建用于显示会话列表树视图的缓冲区，设置文件类型和渲染初始内容
 function M.create_tree_buffers()
+  -- 如果已存在有效树缓冲区，直接复用
+  if is_buf_valid(M.tree_buffers.main) then
+    return
+  end
+
   M.tree_buffers.main = vim.api.nvim_create_buf(false, true)
-  vim.api.nvim_buf_set_name(M.tree_buffers.main, "NeoAI://Tree")
+  vim.api.nvim_buf_set_name(M.tree_buffers.main, "NeoAI-Tree")
   vim.api.nvim_set_option_value("filetype", "NeoAITree", { buf = M.tree_buffers.main }) -- 设置专属文件类型（用于语法高亮等）
-  vim.api.nvim_set_option_value("bufhidden", "wipe", { buf = M.tree_buffers.main }) -- 隐藏时自动删除
+  vim.api.nvim_set_option_value("buftype", "nofile", { buf = M.tree_buffers.main }) -- 非文件缓冲区
+  vim.api.nvim_set_option_value("bufhidden", "hide", { buf = M.tree_buffers.main }) -- 隐藏时保留缓冲区
+  vim.api.nvim_set_option_value("buflisted", true, { buf = M.tree_buffers.main }) -- 让 buffer 出现在 :ls 列表中
   M.render_session_tree() -- 渲染会话树内容
   M.setup_tree_keymaps() -- 设置树视图快捷键
 end
@@ -763,7 +749,7 @@ function M.setup_buffers()
   vim.api.nvim_set_option_value("filetype", "NeoAI", { buf = M.buffers.main })
   vim.api.nvim_set_option_value("modifiable", true, { buf = M.buffers.main }) -- 允许编辑
   vim.api.nvim_set_option_value("buftype", "nofile", { buf = M.buffers.main }) -- 非文件缓冲区
-  vim.api.nvim_set_option_value("bufhidden", "wipe", { buf = M.buffers.main }) -- 隐藏时自动删除
+  vim.api.nvim_set_option_value("bufhidden", "hide", { buf = M.buffers.main }) -- 隐藏时保留缓冲区
   vim.api.nvim_set_option_value("swapfile", false, { buf = M.buffers.main }) -- 不创建交换文件
   M.setup_keymaps() -- 设置快捷键
   M.setup_input_handling() -- 设置输入处理（自动命令）
@@ -1158,53 +1144,105 @@ end
 
 --- 选择会话后打开聊天窗口
 function M.open_chat_after_tree_selection()
-  -- 关闭树视图窗口
-  if is_win_valid(M.windows.tree) then
-    vim.api.nvim_win_close(M.windows.tree, true)
-    M.windows.tree = nil
-  end
-
-  if is_buf_valid(M.tree_buffers.main) then
-    vim.api.nvim_buf_delete(M.tree_buffers.main, { force = true })
-    M.tree_buffers.main = nil
-  end
-
   local mode = M.current_mode
+
   if mode == M.ui_modes.FLOAT then
-    local opts = M.get_window_strategy(M.ui_modes.FLOAT)()
-    M.setup_windows(opts)
+    -- 浮动模式：树和主窗口是同一个，先替换缓冲区再删除树缓冲区
+    if is_win_valid(M.windows.main) then
+      -- 切换回聊天缓冲区
+      vim.api.nvim_win_set_buf(M.windows.main, M.buffers.main)
+      M.windows.tree = nil -- 树视图已隐藏
+      M.set_window_wrap()
+      M.setup_buffers()
+      -- 删除树缓冲区
+      if is_buf_valid(M.tree_buffers.main) then
+        vim.api.nvim_buf_delete(M.tree_buffers.main, { force = true })
+        M.tree_buffers.main = nil
+      end
+      -- 确保光标聚焦在浮动窗口上
+      vim.api.nvim_set_current_win(M.windows.main)
+    else
+      -- 窗口不存在，重新创建
+      local opts = M.get_window_strategy(M.ui_modes.FLOAT)()
+      M.setup_windows(opts)
+    end
   elseif mode == M.ui_modes.SPLIT then
-    vim.cmd("belowright vsplit")
-    M.windows.main = vim.api.nvim_get_current_win()
-    vim.api.nvim_win_set_buf(M.windows.main, M.buffers.main)
-    M.set_window_wrap()
-    M.setup_buffers()
+    -- 分割模式：复用现有的分割窗口，只替换缓冲区内容
+    if is_win_valid(M.windows.tree) then
+      -- 将树窗口重新用于显示聊天内容
+      vim.api.nvim_win_set_buf(M.windows.tree, M.buffers.main)
+      M.windows.main = M.windows.tree
+      M.windows.tree = nil
+      vim.api.nvim_win_set_width(M.windows.main, math.floor(vim.o.columns * 0.4))
+      -- 禁用行号
+      vim.api.nvim_set_option_value("number", false, { win = M.windows.main })
+      vim.api.nvim_set_option_value("relativenumber", false, { win = M.windows.main })
+      M.set_window_wrap()
+      M.setup_buffers()
+    else
+      -- 如果树窗口不存在，创建新的分割窗口
+      vim.cmd("belowright vsplit")
+      M.windows.main = vim.api.nvim_get_current_win()
+      vim.api.nvim_win_set_buf(M.windows.main, M.buffers.main)
+      -- 禁用行号
+      vim.api.nvim_set_option_value("number", false, { win = M.windows.main })
+      vim.api.nvim_set_option_value("relativenumber", false, { win = M.windows.main })
+      M.set_window_wrap()
+      M.setup_buffers()
+    end
+    -- 删除树缓冲区
+    if is_buf_valid(M.tree_buffers.main) then
+      vim.api.nvim_buf_delete(M.tree_buffers.main, { force = true })
+      M.tree_buffers.main = nil
+    end
   elseif mode == M.ui_modes.TAB then
-    vim.cmd("tabnew")
-    M.windows.main = vim.api.nvim_get_current_win()
-    vim.api.nvim_win_set_buf(M.windows.main, M.buffers.main)
-    M.set_window_wrap()
-    M.original_tabline = vim.o.tabline
-    M.original_showtabline = vim.o.showtabline
-    vim.o.showtabline = 2
-    vim.o.tabline = '%!v:lua.neoai_get_tab_label()'
-    M.setup_buffers()
+    -- 标签页模式：复用当前标签页，只替换缓冲区内容
+    if is_win_valid(M.windows.tree) then
+      -- 将树窗口重新用于显示聊天内容
+      vim.api.nvim_win_set_buf(M.windows.tree, M.buffers.main)
+      M.windows.main = M.windows.tree
+      M.windows.tree = nil
+      M.set_window_wrap()
+      M.setup_buffers()
+    else
+      -- 如果树窗口不存在，创建新的标签页
+      vim.cmd("tabnew")
+      M.windows.main = vim.api.nvim_get_current_win()
+      vim.api.nvim_win_set_buf(M.windows.main, M.buffers.main)
+      M.set_window_wrap()
+      M.setup_buffers()
+    end
+    -- 删除树缓冲区
+    if is_buf_valid(M.tree_buffers.main) then
+      vim.api.nvim_buf_delete(M.tree_buffers.main, { force = true })
+      M.tree_buffers.main = nil
+    end
   end
 end
 
 --- 打开浮窗模式
 function M.open_float()
   ensure_active_session()
-  M.create_buffers()
-
-  if M.showing_tree and not is_buf_valid(M.tree_buffers.main) then
-    M.create_tree_buffers()
-  end
 
   if M.showing_tree then
-    local strategy = M.get_window_strategy("tree")
-    local opts = strategy(M.windows.main, math.min(50, math.floor(M.config.ui.width * 0.5)))
-    M.windows.tree = vim.api.nvim_open_win(M.tree_buffers.main, true, opts)
+    if not is_buf_valid(M.tree_buffers.main) then
+      M.create_tree_buffers()
+    end
+
+    -- 先创建主缓冲区（不显示）
+    if not is_buf_valid(M.buffers.main) then
+      M.create_buffers()
+    end
+
+    -- 创建树浮动窗口（合理宽度，直接获取焦点）
+    local tree_w = math.max(60, math.floor(M.config.ui.width * 0.7))
+    local float_opts = M.get_window_strategy(M.ui_modes.FLOAT)()
+    float_opts.width = tree_w
+    float_opts.col = math.floor((vim.o.columns - tree_w) / 2)
+
+    M.windows.tree = vim.api.nvim_open_win(M.tree_buffers.main, true, float_opts)
+    M.windows.main = M.windows.tree -- 树窗口就是主窗口
+
     vim.api.nvim_set_option_value("winfixwidth", true, { win = M.windows.tree })
     M.setup_tree_cursor_autocmd()
     M.is_open = true
@@ -1212,6 +1250,7 @@ function M.open_float()
     return
   end
 
+  M.create_buffers()
   local opts = M.get_window_strategy(M.ui_modes.FLOAT)()
   M.setup_windows(opts)
   M.current_mode = M.ui_modes.FLOAT
@@ -1220,20 +1259,21 @@ end
 --- 打开分割窗口模式
 function M.open_split()
   ensure_active_session()
-  M.create_buffers()
-
-  if M.showing_tree and not is_buf_valid(M.tree_buffers.main) then
-    M.create_tree_buffers()
-  end
 
   if M.showing_tree then
-    local strategy = M.get_window_strategy("tree")
-    local tree_w = math.min(50, math.floor(vim.o.columns * 0.3))
-    local opts = strategy(M.windows.main, tree_w)
-    vim.cmd("vsplit")
+    if not is_buf_valid(M.tree_buffers.main) then
+      M.create_tree_buffers()
+    end
+
+    -- 先创建主缓冲区（不打开窗口）
+    M.create_buffers()
+
+    -- 使用 split 打开窗口，然后用树缓冲区替换
+    vim.cmd("belowright vsplit")
     M.windows.tree = vim.api.nvim_get_current_win()
     vim.api.nvim_win_set_buf(M.windows.tree, M.tree_buffers.main)
-    vim.api.nvim_win_set_width(M.windows.tree, opts.width)
+    local tree_w = math.min(50, math.floor(vim.o.columns * 0.3))
+    vim.api.nvim_win_set_width(M.windows.tree, tree_w)
     vim.api.nvim_set_option_value("winfixwidth", true, { win = M.windows.tree })
     M.setup_tree_cursor_autocmd()
     M.is_open = true
@@ -1241,11 +1281,16 @@ function M.open_split()
     return
   end
 
+  M.create_buffers()
+
   vim.cmd("belowright vsplit")
   M.windows.main = vim.api.nvim_get_current_win()
   vim.api.nvim_win_set_buf(M.windows.main, M.buffers.main)
   local opts = M.get_window_strategy(M.ui_modes.SPLIT)()
   vim.api.nvim_win_set_width(M.windows.main, opts.width)
+  -- 禁用行号
+  vim.api.nvim_set_option_value("number", false, { win = M.windows.main })
+  vim.api.nvim_set_option_value("relativenumber", false, { win = M.windows.main })
   M.set_window_wrap()
   M.setup_buffers()
   M.is_open = true
@@ -1255,35 +1300,42 @@ end
 --- 打开标签页模式
 function M.open_tab()
   ensure_active_session()
-  M.create_buffers()
-
-  if M.showing_tree and not is_buf_valid(M.tree_buffers.main) then
-    M.create_tree_buffers()
-  end
 
   if M.showing_tree then
+    -- 先创建主缓冲区（不打开窗口）
+    M.create_buffers()
+
+    -- 创建树缓冲区
+    if not is_buf_valid(M.tree_buffers.main) then
+      M.create_tree_buffers()
+    end
+
     vim.cmd("tabnew")
-    local strategy = M.get_window_strategy("tree")
-    local tree_w = math.min(50, math.floor(vim.o.columns * 0.3))
-    local opts = strategy(nil, tree_w)
+    local temp_buf = vim.api.nvim_get_current_buf()
+
+    -- 隐藏临时缓冲区而不是删除，避免产生空buffer
+    vim.api.nvim_set_option_value("bufhidden", "wipe", { buf = temp_buf })
+    vim.api.nvim_set_option_value("buflisted", false, { buf = temp_buf })
+
     M.windows.tree = vim.api.nvim_get_current_win()
     vim.api.nvim_win_set_buf(M.windows.tree, M.tree_buffers.main)
-    vim.api.nvim_win_set_width(M.windows.tree, opts.width)
+
+    local tree_w = math.min(50, math.floor(vim.o.columns * 0.3))
+    vim.api.nvim_win_set_width(M.windows.tree, tree_w)
     vim.api.nvim_set_option_value("winfixwidth", true, { win = M.windows.tree })
     M.setup_tree_cursor_autocmd()
+
     M.is_open = true
     M.current_mode = M.ui_modes.TAB
     return
   end
 
+  M.create_buffers()
+
   vim.cmd("tabnew")
   M.windows.main = vim.api.nvim_get_current_win()
   vim.api.nvim_win_set_buf(M.windows.main, M.buffers.main)
   M.set_window_wrap()
-  M.original_tabline = vim.o.tabline
-  M.original_showtabline = vim.o.showtabline
-  vim.o.showtabline = 2
-  vim.o.tabline = '%!v:lua.require("NeoAI.ui").get_tab_label()'
   M.setup_buffers()
   M.is_open = true
   M.current_mode = M.ui_modes.TAB
@@ -1650,21 +1702,37 @@ function M.close()
   -- 关闭所有窗口（主窗口、树视图窗口等）
   for _, win in pairs(M.windows) do
     if is_win_valid(win) then
-      vim.api.nvim_win_close(win, true)
+      safe_win_call(function()
+        -- 标签模式下，关闭整个标签页而不是单个窗口
+        if M.current_mode == M.ui_modes.TAB then
+          local tab = vim.api.nvim_win_get_tabpage(win)
+          if tab ~= vim.api.nvim_get_current_tabpage() then
+            pcall(vim.cmd, "tabclose " .. vim.api.nvim_tabpage_get_number(tab))
+          else
+            pcall(vim.cmd, "tabclose")
+          end
+        else
+          vim.api.nvim_win_close(win, true)
+        end
+      end)
     end
   end
 
   -- 删除所有主缓冲区
   for _, buf in pairs(M.buffers) do
     if is_buf_valid(buf) then
-      vim.api.nvim_buf_delete(buf, { force = true })
+      pcall(function()
+        vim.api.nvim_buf_delete(buf, { force = true })
+      end)
     end
   end
 
   -- 删除所有树视图缓冲区
   for _, buf in pairs(M.tree_buffers) do
     if is_buf_valid(buf) then
-      vim.api.nvim_buf_delete(buf, { force = true })
+      pcall(function()
+        vim.api.nvim_buf_delete(buf, { force = true })
+      end)
     end
   end
 
@@ -1681,15 +1749,8 @@ function M.close()
 
   -- 清理自动命令组（避免内存泄漏）
   pcall(vim.api.nvim_del_augroup_by_name, "NeoAIInput")
+  pcall(vim.api.nvim_del_augroup_by_name, "NeoAITreeCursor")
   pcall(vim.api.nvim_del_augroup_by_name, "NeoAIResize")
-
-  -- 恢复标签栏设置（如果在标签页模式下修改过）
-  if M.original_tabline then
-    vim.o.tabline = M.original_tabline
-  end
-  if M.original_showtabline then
-    vim.o.showtabline = M.original_showtabline
-  end
 
   -- 重置所有状态变量
   M.windows = {}
