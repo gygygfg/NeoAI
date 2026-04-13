@@ -68,6 +68,13 @@ local BORDER_CHARS = {
   none = { top_left = "", top_right = "", bottom_left = "", bottom_right = "", vertical = "", horizontal = "" },
 }
 
+-- 获取边框配置（用于 nvim_open_win）
+-- @param border_style 边框样式名称（如 "rounded", "single" 等）
+-- @return table 边框字符配置表
+local function get_border_config(border_style)
+  return BORDER_CHARS[border_style] or BORDER_CHARS.rounded
+end
+
 -- 分隔线字符映射表
 local SEPARATOR_CHARS = { single = "─", double = "═", solid = "━", dotted = "┈", dashed = "┄" }
 
@@ -413,7 +420,7 @@ function M.get_window_strategy(mode)
         height = height,
         row = row,
         col = col,
-        border = M.config.ui.border, -- 使用配置的边框样式
+        border = get_border_config(M.config.ui.border), -- 使用自定义边框字符
         style = "minimal", -- 最小化样式，隐藏行号等
         focusable = true, -- 允许获取焦点
       }
@@ -432,6 +439,7 @@ function M.get_window_strategy(mode)
         row = 0,
         col = vim.o.columns - width, -- 靠右对齐
         style = "minimal",
+        border = get_border_config(M.config.ui.border),
       }
     end,
 
@@ -465,7 +473,7 @@ function M.get_window_strategy(mode)
         row = 0,
         col = 0, -- 与父窗口左上角对齐
         style = "minimal",
-        border = M.config.ui.border,
+        border = get_border_config(M.config.ui.border),
         focusable = true,
       }
     end,
@@ -485,21 +493,19 @@ function M.setup_windows(win_opts)
   M.is_open = true
 
   -- 异步等待渲染完成后将光标定位到输入提示行
-  vim.defer_fn(function()
+  vim.schedule(function()
     if M.is_open and is_win_valid(M.windows.main) and is_buf_valid(M.buffers.main) then
-      -- 确保缓冲区已渲染完成
-      vim.api.nvim_buf_call(M.buffers.main, function()
-        vim.cmd("redraw")
-      end)
-      -- 将光标定位到输入提示行
-      M.focus_input_line()
       -- 确保输入行可编辑
       vim.api.nvim_set_option_value("modifiable", true, { buf = M.buffers.main })
       vim.api.nvim_set_option_value("readonly", false, { buf = M.buffers.main })
+      -- 滚动到最后一行（输入行），确保光标在最下面
+      local line_count = vim.api.nvim_buf_line_count(M.buffers.main)
+      vim.api.nvim_win_set_cursor(M.windows.main, { line_count, 0 })
+      vim.cmd("normal! zb")
       -- 进入插入模式准备输入
       vim.cmd("startinsert")
     end
-  end, 10)
+  end)
 end
 
 --- 设置树窗口光标移动自动命令
@@ -694,7 +700,8 @@ function M.get_tab_label()
     for _, win in ipairs(wins) do
       local buf = vim.api.nvim_win_get_buf(win)
       -- 通过缓冲区名称判断是否为 NeoAI
-      if vim.api.nvim_buf_get_name(buf):match("^NeoAI") or vim.api.nvim_buf_get_name(buf):match("NeoAI://") then
+      local bufname = vim.api.nvim_buf_get_name(buf)
+      if bufname and (bufname:match("^NeoAI") or bufname:match("NeoAI://") or bufname:match("NeoAI%-Tree")) then
         has_neoai = true
         break
       end
@@ -718,12 +725,18 @@ function M.get_tab_label()
   return label .. "%#TabLine#%T" -- 结尾添加默认标签样式
 end
 
+-- 为 vim 表达式提供全局函数（解决 E117 错误）
+_G.neoai_get_tab_label = function()
+  return M.get_tab_label()
+end
+
 -- ── 缓冲区管理 ──────────────────────────────────────────────────────────────
 
 --- 创建主缓冲区
 -- 创建用于显示聊天内容的主缓冲区，并初始化欢迎信息
 function M.create_buffers()
   M.buffers.main = vim.api.nvim_create_buf(false, true) -- 不关联文件，设为列表缓冲区
+  vim.api.nvim_buf_set_name(M.buffers.main, "NeoAI://chat") -- 设置缓冲区名称，方便 :b 切换
   -- 初始化欢迎信息
   vim.api.nvim_buf_set_lines(M.buffers.main, 0, -1, false, {
     "",
@@ -737,7 +750,7 @@ end
 -- 创建用于显示会话列表树视图的缓冲区，设置文件类型和渲染初始内容
 function M.create_tree_buffers()
   M.tree_buffers.main = vim.api.nvim_create_buf(false, true)
-  vim.api.nvim_buf_set_name(M.tree_buffers.main, "NeoAI-Tree")
+  vim.api.nvim_buf_set_name(M.tree_buffers.main, "NeoAI://Tree")
   vim.api.nvim_set_option_value("filetype", "NeoAITree", { buf = M.tree_buffers.main }) -- 设置专属文件类型（用于语法高亮等）
   vim.api.nvim_set_option_value("bufhidden", "wipe", { buf = M.tree_buffers.main }) -- 隐藏时自动删除
   M.render_session_tree() -- 渲染会话树内容
@@ -747,7 +760,6 @@ end
 --- 设置缓冲区属性
 -- 配置主缓冲区的各项属性，并初始化快捷键、输入处理和显示
 function M.setup_buffers()
-  vim.api.nvim_buf_set_name(M.buffers.main, "NeoAI")
   vim.api.nvim_set_option_value("filetype", "NeoAI", { buf = M.buffers.main })
   vim.api.nvim_set_option_value("modifiable", true, { buf = M.buffers.main }) -- 允许编辑
   vim.api.nvim_set_option_value("buftype", "nofile", { buf = M.buffers.main }) -- 非文件缓冲区
@@ -948,11 +960,12 @@ function M.setup_tree_keymaps()
     end
   end, "选择会话")
 
-  -- n键：新建会话
+  -- n键：新建会话并跳到开始对话界面
   map("n", function()
     backend.new_session("会话 " .. (#backend.sessions + 1))
     vim.notify("[NeoAI] 新会话已创建")
     M.render_session_tree() -- 刷新树视图
+    M.open_chat_after_tree_selection() -- 跳到对话界面
   end, "新建会话")
 
   -- 关闭快捷键
@@ -1028,11 +1041,11 @@ function M.update_display()
   table.insert(lines, "")
   table.insert(separator_positions, separator_line_num)
 
-  -- 记录输入行位置（用户输入区域）
+  -- 记录输入行位置（用户输入区域，默认 1 行高）
   local input_line = #lines
   table.insert(lines, "")
   M.input_start_line = input_line -- 输入区域起始行
-  M.input_end_line = input_line -- 输入区域结束行
+  M.input_end_line = input_line -- 输入区域结束行（默认 1 行高）
 
   -- 写入缓冲区
   vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
@@ -1174,7 +1187,7 @@ function M.open_chat_after_tree_selection()
     M.original_tabline = vim.o.tabline
     M.original_showtabline = vim.o.showtabline
     vim.o.showtabline = 2
-    vim.o.tabline = '%!v:lua.require("NeoAI.ui").get_tab_label()'
+    vim.o.tabline = '%!v:lua.neoai_get_tab_label()'
     M.setup_buffers()
   end
 end
@@ -1530,6 +1543,10 @@ end
 -- 将光标移动到缓冲区底部的输入区域，方便用户继续输入
 function M.focus_input_line()
   if M.input_start_line and is_buf_valid(M.buffers.main) and is_win_valid(M.windows.main) then
+    -- 确保输入区域只有 1 行高
+    if M.input_end_line and M.input_end_line > M.input_start_line then
+      M.input_end_line = M.input_start_line
+    end
     vim.api.nvim_win_set_cursor(M.windows.main, { M.input_start_line + 1, 0 }) -- +1 因为 cursor 是 1-indexed
   end
 end

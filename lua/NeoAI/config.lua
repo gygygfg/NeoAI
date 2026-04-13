@@ -122,9 +122,9 @@ M.defaults = {
   background = {
     -- 后端配置 (数据存储相关)
 
-    -- 配置目录路径，默认使用 Neovim 的配置目录下的 NeoAI 文件夹
-    -- 可通过 vim.fn.stdpath("config") 查看具体路径
-    config_dir = vim.fn.stdpath("config") .. "/NeoAI",
+    -- 配置目录路径，默认使用 Neovim 的缓存目录下的 NeoAI 文件夹
+    -- 可通过 vim.fn.stdpath("cache") 查看具体路径
+    config_dir = vim.fn.stdpath("cache") .. "/NeoAI",
 
     -- 会话数据文件路径，默认为 config_dir 下的 sessions.json
     -- 可自定义为其他路径或文件名

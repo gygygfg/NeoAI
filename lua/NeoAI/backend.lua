@@ -6,7 +6,8 @@ local config = require("NeoAI.config")
 -- 模块状态变量
 M.config_dir = nil          -- 配置目录路径
 M.config_file = nil         -- 会话数据文件路径
-M.sessions = {}             -- 所有会话列表
+M.sessions = {}             -- 所有会话列表（节点集合）
+M.session_graph = {}        -- 有向图的邻接表表示：session_id -> {children = {id1, id2, ...}, parent = id}
 M.current_session = nil     -- 当前活跃会话 ID
 M.message_handlers = {}     -- 消息事件处理器映射表
 M.editable_states = {}      -- 消息可编辑状态缓存
@@ -47,8 +48,9 @@ end
 
 --- 创建一个新的会话
 -- @param name 会话名称（可选）
+-- @param parent_id 父会话 ID（可选，用于构建有向图关系）
 -- @return table 新创建的会话对象
-function M.new_session(name)
+function M.new_session(name, parent_id)
   local session_id = #M.sessions + 1
   local session = {
     id = session_id,
@@ -64,6 +66,18 @@ function M.new_session(name)
   }
 
   M.sessions[session_id] = session
+  
+  -- 初始化有向图邻接表结构
+  M.session_graph[session_id] = {
+    children = {},  -- 子节点列表
+    parent = parent_id or nil,  -- 父节点 ID
+  }
+  
+  -- 如果指定了父节点，建立有向边
+  if parent_id and M.session_graph[parent_id] then
+    table.insert(M.session_graph[parent_id].children, session_id)
+  end
+  
   M.current_session = session_id
   M._auto_sync(session_id)            -- 自动持久化到文件
   M._trigger("session_created", session)
@@ -385,7 +399,8 @@ function M.export_session(session_id, filepath, internal)
     return false
   end
 
-  -- 构建导出数据结构
+  -- 构建导出数据结构（包含有向图邻接表信息）
+  local graph_rel = M.session_graph[session_id] or {parent = nil, children = {}}
   local export_data = {
     id = session.id,
     name = session.name,
@@ -394,7 +409,17 @@ function M.export_session(session_id, filepath, internal)
     updated_at = session.updated_at,
     config = session.config,
     export_time = os.time(),
+    -- 有向图关系信息（所有 ID 转为字符串）
+    graph_relations = {
+      parent = graph_rel.parent and tostring(graph_rel.parent),
+      children = {},
+    },
   }
+  
+  -- 转换子节点 ID 为字符串
+  for _, child_id in ipairs(graph_rel.children or {}) do
+    table.insert(export_data.graph_relations.children, tostring(child_id))
+  end
 
   -- 序列化消息
   for _, msg in ipairs(session.messages) do
@@ -420,8 +445,28 @@ function M.export_session(session_id, filepath, internal)
     end
   end
 
-  -- 更新指定会话的数据
-  all_data[session.id] = export_data
+  -- 更新指定会话的数据（转换为字符串键）
+  all_data[tostring(session.id)] = export_data
+
+  -- 同时保存完整的图结构信息（在所有会话导出时更新）
+  if not all_data._graph then
+    all_data._graph = {}
+  end
+  
+  -- 将图结构转换为字符串键（JSON 要求键为字符串）
+  local graph_to_save = {}
+  for sid, relations in pairs(M.session_graph) do
+    local sid_str = tostring(sid)
+    graph_to_save[sid_str] = {
+      parent = relations.parent and tostring(relations.parent),
+      children = {},
+    }
+    for _, child_id in ipairs(relations.children) do
+      table.insert(graph_to_save[sid_str].children, tostring(child_id))
+    end
+  end
+  all_data._graph = graph_to_save
+  
   vim.fn.writefile({ vim.fn.json_encode(all_data) }, filepath)
 
   if not internal then
@@ -449,29 +494,72 @@ function M.import_sessions(filepath)
   local data = vim.fn.json_decode(table.concat(content, "\n")) or {}
   local imported = {}
 
-  for _, session_data in pairs(data) do
-    local session = {
-      id = session_data.id,
-      name = session_data.name,
-      messages = {},
-      created_at = session_data.created_at or os.time(),
-      updated_at = session_data.updated_at or os.time(),
-      config = session_data.config or {},
-    }
-
-    -- 重建消息对象
-    for _, msg_data in ipairs(session_data.messages or {}) do
-      local msg = M.create_message(msg_data.role, msg_data.content, msg_data.timestamp, msg_data.metadata)
-      msg.id = msg_data.id
-      msg.editable = msg_data.editable or false
-      if msg.editable then
-        M.editable_states[msg.id] = true
+  -- 先导入图结构关系（如果存在）
+  if data._graph then
+    -- 将字符串键转换回整数
+    for sid_str, relations in pairs(data._graph) do
+      local sid = tonumber(sid_str)
+      if sid then
+        M.session_graph[sid] = {
+          children = {},
+          parent = relations.parent and tonumber(relations.parent),
+        }
+        for _, child_str in ipairs(relations.children or {}) do
+          local child_id = tonumber(child_str)
+          if child_id then
+            table.insert(M.session_graph[sid].children, child_id)
+          end
+        end
       end
-      table.insert(session.messages, msg)
     end
+  end
 
-    M.sessions[session.id] = session
-    table.insert(imported, session.id)
+  for session_key, session_data in pairs(data) do
+    -- 跳过元数据字段
+    if session_key ~= "_graph" then
+      local session = {
+        id = session_data.id,
+        name = session_data.name,
+        messages = {},
+        created_at = session_data.created_at or os.time(),
+        updated_at = session_data.updated_at or os.time(),
+        config = session_data.config or {},
+      }
+
+      -- 重建消息对象
+      for _, msg_data in ipairs(session_data.messages or {}) do
+        local msg = M.create_message(msg_data.role, msg_data.content, msg_data.timestamp, msg_data.metadata)
+        msg.id = msg_data.id
+        msg.editable = msg_data.editable or false
+        if msg.editable then
+          M.editable_states[msg.id] = true
+        end
+        table.insert(session.messages, msg)
+      end
+
+      M.sessions[session.id] = session
+      table.insert(imported, session.id)
+      
+      -- 如果图结构中没有该会话的信息，初始化默认值
+      if not M.session_graph[session.id] then
+        M.session_graph[session.id] = {
+          children = {},
+          parent = nil,
+        }
+      end
+      
+      -- 从 graph_relations 中恢复图结构（兼容旧数据格式）
+      if session_data.graph_relations then
+        M.session_graph[session.id].parent = session_data.graph_relations.parent and tonumber(session_data.graph_relations.parent)
+        M.session_graph[session.id].children = {}
+        for _, child_str in ipairs(session_data.graph_relations.children or {}) do
+          local child_id = tonumber(child_str)
+          if child_id then
+            table.insert(M.session_graph[session.id].children, child_id)
+          end
+        end
+      end
+    end
   end
 
   M._trigger("sessions_imported", { count = #imported })
@@ -511,6 +599,121 @@ function M.get_session_stats(session_id)
   end
 
   return stats
+end
+
+--- 获取会话的父节点
+-- @param session_id 会话 ID
+-- @return number|nil 父节点 ID，不存在返回 nil
+function M.get_parent(session_id)
+  if M.session_graph[session_id] then
+    return M.session_graph[session_id].parent
+  end
+  return nil
+end
+
+--- 获取会话的子节点列表
+-- @param session_id 会话 ID
+-- @return table 子节点 ID 列表
+function M.get_children(session_id)
+  if M.session_graph[session_id] then
+    return M.session_graph[session_id].children or {}
+  end
+  return {}
+end
+
+--- 获取会话的所有祖先节点（递归）
+-- @param session_id 会话 ID
+-- @return table 祖先节点 ID 列表（从直接父节点到根节点）
+function M.get_ancestors(session_id)
+  local ancestors = {}
+  local current = M.get_parent(session_id)
+  while current do
+    table.insert(ancestors, current)
+    current = M.get_parent(current)
+  end
+  return ancestors
+end
+
+--- 获取会话的所有后代节点（递归）
+-- @param session_id 会话 ID
+-- @return table 后代节点 ID 列表
+function M.get_descendants(session_id)
+  local descendants = {}
+  local children = M.get_children(session_id)
+  
+  for _, child_id in ipairs(children) do
+    table.insert(descendants, child_id)
+    -- 递归获取子节点的后代
+    local child_descendants = M.get_descendants(child_id)
+    for _, desc_id in ipairs(child_descendants) do
+      table.insert(descendants, desc_id)
+    end
+  end
+  
+  return descendants
+end
+
+--- 建立两个会话之间的有向边关系
+-- @param parent_id 父会话 ID
+-- @param child_id 子会话 ID
+-- @return boolean 是否成功建立关系
+function M.add_edge(parent_id, child_id)
+  if not M.sessions[parent_id] or not M.sessions[child_id] then
+    return false
+  end
+  
+  -- 初始化图结构（如果不存在）
+  if not M.session_graph[parent_id] then
+    M.session_graph[parent_id] = { children = {}, parent = nil }
+  end
+  if not M.session_graph[child_id] then
+    M.session_graph[child_id] = { children = {}, parent = nil }
+  end
+  
+  -- 避免重复添加边
+  for _, existing_child in ipairs(M.session_graph[parent_id].children) do
+    if existing_child == child_id then
+      return true  -- 边已存在
+    end
+  end
+  
+  -- 添加有向边：parent_id -> child_id
+  table.insert(M.session_graph[parent_id].children, child_id)
+  M.session_graph[child_id].parent = parent_id
+  
+  return true
+end
+
+--- 删除两个会话之间的有向边关系
+-- @param parent_id 父会话 ID
+-- @param child_id 子会话 ID
+-- @return boolean 是否成功删除关系
+function M.remove_edge(parent_id, child_id)
+  if not M.session_graph[parent_id] or not M.session_graph[child_id] then
+    return false
+  end
+  
+  -- 从父节点的子节点列表中移除
+  local children = M.session_graph[parent_id].children
+  for i, existing_child in ipairs(children) do
+    if existing_child == child_id then
+      table.remove(children, i)
+      break
+    end
+  end
+  
+  -- 清除子节点的父节点引用
+  if M.session_graph[child_id].parent == parent_id then
+    M.session_graph[child_id].parent = nil
+  end
+  
+  return true
+end
+
+--- 获取图的完整结构（用于调试或导出）
+-- @return table 图的邻接表结构
+function M.get_graph_structure()
+  return M.session_graph
 end
 
 --- 后端模块初始化
