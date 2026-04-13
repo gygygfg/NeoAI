@@ -18,6 +18,9 @@ function M.setup(user_config)
     config_file = final_config.background.config_file,
   })
 
+  -- 创建自定义高亮组
+  M.setup_highlights()
+
   ui.setup({
     -- UI配置
     width = final_config.ui.width,
@@ -38,6 +41,20 @@ function M.setup(user_config)
   M.setup_keymaps(final_config.keymaps)
 
   vim.notify("[NeoAI] 插件已加载")
+end
+
+function M.setup_highlights()
+  -- NeoAIMessages: 消息区域高亮
+  vim.api.nvim_set_hl(0, "NeoAIMessages", {
+    default = true,
+    link = "Normal",
+  })
+
+  -- NeoAIInput: 输入区域高亮
+  vim.api.nvim_set_hl(0, "NeoAIInput", {
+    default = true,
+    link = "Normal",
+  })
 end
 
 function M.setup_commands()
@@ -88,6 +105,9 @@ function M.setup_commands()
     -- 切换会话
     local session_id = tonumber(opts.args)
     if session_id and backend.sessions[session_id] then
+      -- 同步当前会话数据
+      backend.sync_data(backend.current_session)
+      
       backend.current_session = session_id
       vim.notify("切换到会话: " .. backend.sessions[session_id].name)
 
@@ -133,6 +153,11 @@ function M.setup_commands()
       vim.notify("可用模式: float, split, tab")
     end
   end, { nargs = 1 })
+
+  vim.api.nvim_create_user_command("NeoAITree", function(opts)
+    -- 切换树视图显示
+    ui.toggle_tree_view()
+  end, {})
 
   vim.api.nvim_create_user_command("NeoAIStats", function()
     -- 获取统计

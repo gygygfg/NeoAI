@@ -43,8 +43,18 @@ function M.new_session(name)
   M.sessions[session_id] = session
   M.current_session = session_id
 
+  -- 自动同步数据到配置文件
+  M.export_session(session_id, M.config_file, true)
+
   -- 触发会话创建事件
   M.trigger_event("session_created", session)
+  
+  -- 触发数据同步事件
+  M.trigger_event("data_synced", { 
+    session_id = session_id, 
+    action = "session_created",
+    timestamp = os.time()
+  })
 
   return session
 end
@@ -64,8 +74,18 @@ function M.add_message(session_id, message)
     table.remove(session.messages, 1)
   end
 
+  -- 自动同步数据到配置文件
+  M.export_session(session_id, M.config_file, true)
+
   -- 触发消息事件
   M.trigger_event("message_added", { session_id = session_id, message = message })
+  
+  -- 触发数据同步事件
+  M.trigger_event("data_synced", { 
+    session_id = session_id, 
+    action = "message_added",
+    timestamp = os.time()
+  })
 
   return message
 end
@@ -78,15 +98,32 @@ function M.edit_message(session_id, message_id, new_content)
   end
 
   for i, msg in ipairs(session.messages) do
-    if msg.id == message_id and msg.editable then
+    -- 兼容字符串和数字ID
+    if tostring(msg.id) == tostring(message_id) then
+      -- 保存旧内容用于比较
+      local old_content = msg.content
+
+      -- 更新消息内容和时间戳
       msg.content = new_content
       msg.timestamp = os.time()
       session.updated_at = os.time()
+
+      -- 自动同步数据到配置文件
+      M.export_session(session_id, M.config_file, true)
 
       M.trigger_event("message_edited", {
         session_id = session_id,
         message_id = message_id,
         message = msg,
+        old_content = old_content,
+      })
+
+      -- 触发数据同步事件
+      M.trigger_event("data_synced", {
+        session_id = session_id,
+        action = "message_edited",
+        message_id = message_id,
+        timestamp = os.time()
       })
       return true
     end
@@ -107,9 +144,20 @@ function M.delete_message(session_id, message_id)
       table.remove(session.messages, i)
       session.updated_at = os.time()
 
+      -- 自动同步数据到配置文件
+      M.export_session(session_id, M.config_file, true)
+
       M.trigger_event("message_deleted", {
         session_id = session_id,
         message_id = message_id,
+      })
+      
+      -- 触发数据同步事件
+      M.trigger_event("data_synced", { 
+        session_id = session_id, 
+        action = "message_deleted",
+        message_id = message_id,
+        timestamp = os.time()
       })
       return true
     end
@@ -205,6 +253,9 @@ function M.simulate_ai_reply(session_id, user_message, callback)
 
     session.updated_at = os.time()
 
+    -- 自动同步数据到配置文件
+    M.export_session(session_id, M.config_file, true)
+
     if callback then
       callback(response)
     end
@@ -212,6 +263,13 @@ function M.simulate_ai_reply(session_id, user_message, callback)
     M.trigger_event("ai_replied", {
       session_id = session_id,
       message = pending_msg,
+    })
+    
+    -- 触发数据同步事件
+    M.trigger_event("data_synced", { 
+      session_id = session_id, 
+      action = "ai_replied",
+      timestamp = os.time()
     })
   end, 1000 + math.random(500, 1500))
 end
@@ -254,6 +312,51 @@ function M.trigger_event(event, data)
   local handlers = M.message_handlers[event] or {}
   for _, handler in ipairs(handlers) do
     handler(data)
+  end
+end
+
+--- 自动同步所有会话数据到配置文件
+-- @param session_id 可选，指定会话ID，如果为nil则同步所有会话
+function M.sync_data(session_id)
+  if session_id then
+    -- 同步指定会话
+    local session = M.sessions[session_id]
+    if session then
+      M.export_session(session_id, M.config_file, true)
+      return true
+    end
+  else
+    -- 同步所有会话
+    for id, _ in pairs(M.sessions) do
+      M.export_session(id, M.config_file, true)
+    end
+    return true
+  end
+  return false
+end
+
+--- 防抖同步：延迟执行，避免频繁写入
+-- @param session_id 可选，指定会话ID
+local debounce_sync_timer = nil
+function M.debounce_sync(session_id, delay_ms)
+  delay_ms = delay_ms or 500 -- 默认500ms延迟
+  
+  -- 取消现有定时器
+  if debounce_sync_timer then
+    debounce_sync_timer:stop()
+    if not debounce_sync_timer:is_closing() then
+      debounce_sync_timer:close()
+    end
+  end
+  
+  -- 启动新定时器
+  debounce_sync_timer = vim.loop.new_timer()
+  if debounce_sync_timer then
+    debounce_sync_timer:start(delay_ms, 0, function()
+      vim.schedule(function()
+        M.sync_data(session_id)
+      end)
+    end)
   end
 end
 
