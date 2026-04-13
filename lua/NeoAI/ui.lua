@@ -205,12 +205,6 @@ local function sanitize_line(str)
   return tostring(str):gsub("[\r\n]+", " ")
 end
 
---- 根据配置获取边框字符
--- @return table 边框字符表
-function M.get_border_chars()
-  return BORDER_CHARS[M.config.ui.info_border] or BORDER_CHARS.single
-end
-
 --- 获取输入框分隔线字符
 -- @return string 分隔线字符
 function M.get_separator_char()
@@ -508,31 +502,175 @@ function M.setup_windows(win_opts)
   end, 10)
 end
 
---- 打开树窗口
--- 创建并显示会话列表的树视图窗口，用于浏览和切换历史会话
--- @param parent_win 父窗口句柄（树窗口将相对于此窗口定位）
--- @param width 窗口宽度（可选，默认45）
-function M.open_tree_window(parent_win, width)
-  local strategy = M.get_window_strategy("tree")
-  local opts = strategy(parent_win, width)
-
-  -- 如果树缓冲区未创建，则先创建
+--- 设置树窗口光标移动自动命令
+-- 为树缓冲区注册 CursorMoved 事件处理器，支持智能跳转：
+-- 向下移动时跳到下一轮对话开始，向上移动时跳到上一轮对话开始
+function M.setup_tree_cursor_autocmd()
   if not is_buf_valid(M.tree_buffers.main) then
-    M.create_tree_buffers()
+    return
   end
 
-  M.windows.tree = vim.api.nvim_open_win(M.tree_buffers.main, false, opts)
-  vim.api.nvim_set_option_value("winfixwidth", true, { win = M.windows.tree })
+  -- 记录上一次的光标位置
+  local last_cursor_pos = { 0, 0 }
+  -- 防止递归触发
+  local is_moving = false
+  -- 记录上一次的跳转目标（用于避免重复跳转）
+  local last_target_line = nil
+  -- 等待树渲染完成的防抖定时器
+  local is_ready = false
+  local ready_timer = nil
+  -- 跳转防抖定时器（防止过快触发）
+  local jump_debounce_timer = nil
 
-  if is_win_valid(M.windows.tree) then
-    vim.api.nvim_set_option_value("wrap", true, { win = M.windows.tree })
-    vim.api.nvim_set_option_value("linebreak", true, { win = M.windows.tree })
+  -- 延迟启用跳转功能，等待树渲染完成
+  local function enable_after_delay()
+    if ready_timer then
+      ready_timer:stop()
+      if not ready_timer:is_closing() then
+        ready_timer:close()
+      end
+    end
+
+    ready_timer = vim.loop.new_timer()
+    if ready_timer then
+      ready_timer:start(200, 0, function()
+        vim.schedule(function()
+          is_ready = true
+        end)
+      end)
+    end
   end
 
-  -- 创建后立即调整大小
-  vim.defer_fn(function()
-    M.adjust_tree_window_size()
-  end, 10)
+  enable_after_delay()
+
+  local tree_augroup = vim.api.nvim_create_augroup("NeoAITreeCursor", { clear = true })
+  vim.api.nvim_create_autocmd("CursorMoved", {
+    group = tree_augroup,
+    buffer = M.tree_buffers.main,
+    callback = function()
+      -- 未就绪或正在移动或窗口无效，直接返回
+      if not is_ready or is_moving or not is_win_valid(M.windows.tree) then
+        return
+      end
+
+      local current_pos = vim.api.nvim_win_get_cursor(M.windows.tree)
+      local last_line = last_cursor_pos[1]
+      local current_line = current_pos[1]
+
+      -- 只在行号改变时触发（忽略列移动）
+      if current_line == last_line then
+        last_cursor_pos = current_pos
+        return
+      end
+
+      -- 判断移动方向
+      local direction = 0
+      if current_line > last_line then
+        direction = 1 -- 向下
+      elseif current_line < last_line then
+        direction = -1 -- 向上
+      end
+
+      -- 如果有上下移动，尝试跳转到下一个/上一个对话轮次
+      if direction ~= 0 then
+        -- 确保 session_positions 已初始化且为 table
+        local session_positions = M.tree_buffers.session_positions
+        if not session_positions or type(session_positions) ~= "table" then
+          -- 未初始化完成，重置就绪状态并重新计时
+          is_ready = false
+          enable_after_delay()
+          last_cursor_pos = current_pos
+          return
+        end
+
+        -- 创建快照（防止并发修改）
+        local positions_snapshot = vim.deepcopy(session_positions) or {}
+
+        -- 收集所有对话轮次的行
+        local all_turn_lines = {}
+        for line_num, pos in pairs(positions_snapshot) do
+          if pos and type(pos) == "table" and pos.type == "conversation_turn" then
+            table.insert(all_turn_lines, { line = line_num, turn_index = pos.turn_index, pos = pos })
+          end
+        end
+
+        -- 按行号排序
+        table.sort(all_turn_lines, function(a, b)
+          return a.line < b.line
+        end)
+
+        -- 查找目标行
+        local target_line = nil
+        local target_pos = nil
+
+        if direction == 1 then
+          -- 向下：找第一个大于当前行的对话轮次
+          for _, item in ipairs(all_turn_lines) do
+            if item.line > current_line then
+              target_line = item.line
+              target_pos = item.pos
+              break
+            end
+          end
+        else
+          -- 向上：找最后一个小于当前行的对话轮次
+          for i = #all_turn_lines, 1, -1 do
+            if all_turn_lines[i].line < current_line then
+              target_line = all_turn_lines[i].line
+              target_pos = all_turn_lines[i].pos
+              break
+            end
+          end
+        end
+
+        -- 如果找到目标行且与上次跳转不同，执行跳转
+        if target_line and target_line ~= last_target_line then
+          -- 取消之前的防抖定时器
+          if jump_debounce_timer then
+            jump_debounce_timer:stop()
+            if not jump_debounce_timer:is_closing() then
+              jump_debounce_timer:close()
+            end
+          end
+
+          -- 防抖延迟（50ms）
+          jump_debounce_timer = vim.loop.new_timer()
+          if not jump_debounce_timer then
+            return
+          end
+
+          local captured_target_line = target_line
+
+          jump_debounce_timer:start(50, 0, function()
+            vim.schedule(function()
+              if not is_win_valid(M.windows.tree) then
+                return
+              end
+
+              is_moving = true
+              last_target_line = captured_target_line
+
+              -- 更新位置为目标行（避免再次触发）
+              last_cursor_pos = { captured_target_line, 0 }
+
+              -- 设置光标
+              pcall(function()
+                vim.api.nvim_win_set_cursor(M.windows.tree, { captured_target_line, 0 })
+              end)
+              is_moving = false
+            end)
+          end)
+          return
+        end
+
+        -- 没找到目标行（已在边界），清除上次目标记录
+        last_target_line = nil
+      end
+
+      -- 更新上一次的位置
+      last_cursor_pos = current_pos
+    end,
+  })
 end
 
 -- ── 标签页标签管理 ─────────────────────────────────────────────────────────
@@ -733,15 +871,14 @@ function M._render_session_messages(lines, session, session_id, is_current)
   end
 
   local turns = group_messages_into_turns(session.messages)
-  local max_turns = math.min(#turns, 8) -- 限制最多显示8轮，避免过长
 
-  for i = 1, max_turns do
+  for i = 1, #turns do
     local turn = turns[i]
-    local is_last = (i == max_turns)
+    local is_last = (i == #turns)
     local indent = is_last and "  └─ " or "  ├─ " -- 最后一轮用 └─，其他用 ├─
 
-    -- 用户消息预览（截断为20字符）
-    local user_preview = truncate_content(sanitize_line(turn.user_msg.content), 20)
+    -- 用户消息预览（截断为40字符）
+    local user_preview = truncate_content(sanitize_line(turn.user_msg.content), 40)
     local user_time = os.date("%H:%M", turn.user_msg.timestamp)
     table.insert(lines, string.format("%s💬 [%s] %s", indent, user_time, user_preview))
 
@@ -757,7 +894,7 @@ function M._render_session_messages(lines, session, session_id, is_current)
 
     -- 助手消息预览
     if turn.assistant_msg then
-      local asst_preview = truncate_content(sanitize_line(turn.assistant_msg.content), 25)
+      local asst_preview = truncate_content(sanitize_line(turn.assistant_msg.content), 45)
       local asst_time = os.date("%H:%M", turn.assistant_msg.timestamp)
       local reply_indent = is_last and "     " or "  │  " -- 缩进样式
       table.insert(lines, string.format("%s🤖 [%s] %s", reply_indent, asst_time, asst_preview))
@@ -770,11 +907,6 @@ function M._render_session_messages(lines, session, session_id, is_current)
         line = reply_idx - 1,
       }
     end
-  end
-
-  -- 超出8轮时显示提示
-  if #turns > 8 then
-    table.insert(lines, string.format("  └─ ... 还有 %d 轮 对话", #turns - 8))
   end
 end
 
@@ -832,38 +964,6 @@ function M.setup_tree_keymaps()
     M.render_session_tree()
     vim.notify("[NeoAI] 已刷新")
   end, "刷新树")
-end
-
--- ── 会话管理 ───────────────────────────────────────────────────────────────
-
---- 添加对话消息到缓冲区（简化函数）
--- 将新消息添加到当前会话，并触发界面更新
--- @param role 角色 (user/assistant/system)
--- @param content 消息内容
-function M.add_message(role, content)
-  if not is_buf_valid(M.buffers.main) then
-    return
-  end
-
-  local session = backend.current_session and backend.sessions[backend.current_session]
-  if not session then
-    vim.notify("[NeoAI] 错误: 没有活跃的会话", vim.log.levels.WARN)
-    return
-  end
-
-  -- 创建消息对象（包含唯一ID、角色、内容、时间戳）
-  local msg = {
-    id = vim.uv.hrtime(), -- 使用高精度时间作为唯一ID
-    role = role,
-    content = content,
-    timestamp = os.time(),
-  }
-
-  -- 添加到会话消息列表
-  table.insert(session.messages, msg)
-
-  -- 更新显示（刷新界面）
-  M.update_display()
 end
 
 --- 更新主显示
@@ -1093,6 +1193,7 @@ function M.open_float()
     local opts = strategy(M.windows.main, math.min(50, math.floor(M.config.ui.width * 0.5)))
     M.windows.tree = vim.api.nvim_open_win(M.tree_buffers.main, true, opts)
     vim.api.nvim_set_option_value("winfixwidth", true, { win = M.windows.tree })
+    M.setup_tree_cursor_autocmd()
     M.is_open = true
     M.current_mode = M.ui_modes.FLOAT
     return
@@ -1121,6 +1222,7 @@ function M.open_split()
     vim.api.nvim_win_set_buf(M.windows.tree, M.tree_buffers.main)
     vim.api.nvim_win_set_width(M.windows.tree, opts.width)
     vim.api.nvim_set_option_value("winfixwidth", true, { win = M.windows.tree })
+    M.setup_tree_cursor_autocmd()
     M.is_open = true
     M.current_mode = M.ui_modes.SPLIT
     return
@@ -1155,6 +1257,7 @@ function M.open_tab()
     vim.api.nvim_win_set_buf(M.windows.tree, M.tree_buffers.main)
     vim.api.nvim_win_set_width(M.windows.tree, opts.width)
     vim.api.nvim_set_option_value("winfixwidth", true, { win = M.windows.tree })
+    M.setup_tree_cursor_autocmd()
     M.is_open = true
     M.current_mode = M.ui_modes.TAB
     return
