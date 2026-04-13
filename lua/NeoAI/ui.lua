@@ -567,7 +567,8 @@ function M.get_tab_label()
       label = label .. "🤖 NeoAI" -- NeoAI 标签页显示机器人图标
     else
       -- 非 NeoAI 标签页显示第一个缓冲区的文件名
-      local buflist = vim.fn.tabpagebuflist(tabpage)
+      local tabnr = vim.api.nvim_tabpage_get_number(tabpage)
+      local buflist = vim.fn.tabpagebuflist(tabnr)
       if buflist and #buflist > 0 then
         local bufname = vim.fn.bufname(buflist[1])
         label = label .. (bufname and bufname ~= "" and vim.fn.fnamemodify(bufname, ":t") or "[No Name]")
