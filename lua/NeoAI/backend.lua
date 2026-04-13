@@ -1,66 +1,81 @@
+-- NeoAI 后端模块
+-- 负责会话管理、消息 CRUD、数据持久化（导入/导出）以及 AI 回复模拟
 local M = {}
 local config = require("NeoAI.config")
 
--- 配置文件默认路径
-M.config_dir = nil
-M.config_file = nil
+-- 模块状态变量
+M.config_dir = nil          -- 配置目录路径
+M.config_file = nil         -- 会话数据文件路径
+M.sessions = {}             -- 所有会话列表
+M.current_session = nil     -- 当前活跃会话 ID
+M.message_handlers = {}     -- 消息事件处理器映射表
+M.editable_states = {}      -- 消息可编辑状态缓存
 
--- 会话管理
-M.sessions = {}
-M.current_session = nil
-M.message_handlers = {}
-M.editable_states = {} -- 记录消息的可编辑状态
-
+--- 创建一条新消息
+-- @param role 角色类型 (user/assistant/system)
+-- @param content 消息内容
+-- @param timestamp 时间戳（可选，默认为当前时间）
+-- @param metadata 附加元数据（可选）
+-- @return table 消息对象
 function M.create_message(role, content, timestamp, metadata)
-  -- 消息结构
   return {
-    id = os.time() .. math.random(1000, 9999),
-    role = role, -- 'user', 'assistant', 'system'
+    id = os.time() .. math.random(1000, 9999),  -- 唯一 ID
+    role = role,
     content = content,
     timestamp = timestamp or os.time(),
     metadata = metadata or {},
-    editable = false,
-    pending = false, -- 是否正在处理
+    editable = false,   -- 是否可编辑
+    pending = false,    -- 是否正在等待 AI 回复
   }
 end
 
+--- 自动同步指定会话数据到文件
+-- @param session_id 会话 ID
+function M._auto_sync(session_id)
+  M.export_session(session_id, M.config_file, true)
+end
+
+--- 触发指定类型的事件，通知所有注册的处理器
+-- @param event 事件名称
+-- @param data 事件数据
+function M._trigger(event, data)
+  local handlers = M.message_handlers[event] or {}
+  for _, handler in ipairs(handlers) do
+    handler(data)
+  end
+end
+
+--- 创建一个新的会话
+-- @param name 会话名称（可选）
+-- @return table 新创建的会话对象
 function M.new_session(name)
-  -- 创建新会话
   local session_id = #M.sessions + 1
   local session = {
     id = session_id,
     name = name or ("会话" .. session_id),
-    messages = {},
+    messages = {},        -- 消息列表
     created_at = os.time(),
     updated_at = os.time(),
     config = {
-      auto_scroll = config.defaults.auto_scroll,
-      show_timestamps = config.defaults.show_timestamps,
+      auto_scroll = config.defaults.ui.auto_scroll,
+      show_timestamps = config.defaults.ui.show_timestamps,
       max_history = config.defaults.background.max_history,
     },
   }
 
   M.sessions[session_id] = session
   M.current_session = session_id
-
-  -- 自动同步数据到配置文件
-  M.export_session(session_id, M.config_file, true)
-
-  -- 触发会话创建事件
-  M.trigger_event("session_created", session)
-  
-  -- 触发数据同步事件
-  M.trigger_event("data_synced", { 
-    session_id = session_id, 
-    action = "session_created",
-    timestamp = os.time()
-  })
+  M._auto_sync(session_id)            -- 自动持久化到文件
+  M._trigger("session_created", session)
 
   return session
 end
 
+--- 向指定会话添加一条消息
+-- @param session_id 会话 ID
+-- @param message 消息对象
+-- @return table|nil 添加的消息对象，或失败时返回 nil
 function M.add_message(session_id, message)
-  -- 添加消息
   local session = M.sessions[session_id]
   if not session then
     return nil
@@ -69,61 +84,40 @@ function M.add_message(session_id, message)
   table.insert(session.messages, message)
   session.updated_at = os.time()
 
-  -- 限制历史长度
-  if #session.messages > session.config.max_history then
+  -- 如果消息数超出最大历史限制，删除最早的消息
+  if session.config.max_history > 0 and #session.messages > session.config.max_history then
     table.remove(session.messages, 1)
   end
 
-  -- 自动同步数据到配置文件
-  M.export_session(session_id, M.config_file, true)
-
-  -- 触发消息事件
-  M.trigger_event("message_added", { session_id = session_id, message = message })
-  
-  -- 触发数据同步事件
-  M.trigger_event("data_synced", { 
-    session_id = session_id, 
-    action = "message_added",
-    timestamp = os.time()
-  })
+  M._auto_sync(session_id)
+  M._trigger("message_added", { session_id = session_id, message = message })
 
   return message
 end
 
+--- 编辑指定会话中的某条消息
+-- @param session_id 会话 ID
+-- @param message_id 消息 ID
+-- @param new_content 新的消息内容
+-- @return boolean 是否编辑成功
 function M.edit_message(session_id, message_id, new_content)
-  -- 编辑消息
   local session = M.sessions[session_id]
   if not session then
     return false
   end
 
   for i, msg in ipairs(session.messages) do
-    -- 兼容字符串和数字ID
     if tostring(msg.id) == tostring(message_id) then
-      -- 保存旧内容用于比较
       local old_content = msg.content
-
-      -- 更新消息内容和时间戳
       msg.content = new_content
       msg.timestamp = os.time()
       session.updated_at = os.time()
-
-      -- 自动同步数据到配置文件
-      M.export_session(session_id, M.config_file, true)
-
-      M.trigger_event("message_edited", {
+      M._auto_sync(session_id)
+      M._trigger("message_edited", {
         session_id = session_id,
         message_id = message_id,
         message = msg,
         old_content = old_content,
-      })
-
-      -- 触发数据同步事件
-      M.trigger_event("data_synced", {
-        session_id = session_id,
-        action = "message_edited",
-        message_id = message_id,
-        timestamp = os.time()
       })
       return true
     end
@@ -132,8 +126,127 @@ function M.edit_message(session_id, message_id, new_content)
   return false
 end
 
+--- 从缓冲区读取并保存编辑的消息（UI 层调用此接口）
+-- 根据行号从缓冲区读取完整消息内容（支持多行/换行），然后调用 edit_message 保存
+-- @param session_id 会话 ID
+-- @param message_id 消息 ID
+-- @param buf 缓冲区句柄
+-- @param start_line 消息内容起始行（0-indexed）
+-- @param end_line 消息内容结束行（0-indexed，不包含）
+-- @return boolean, string? 是否成功, 失败原因（可选）
+function M.save_buffer_edit(session_id, message_id, buf, start_line, end_line)
+  -- 参数校验
+  local session = M.sessions[session_id]
+  if not session then
+    return false, "会话不存在"
+  end
+
+  local target_msg = nil
+  for _, msg in ipairs(session.messages) do
+    if tostring(msg.id) == tostring(message_id) then
+      target_msg = msg
+      break
+    end
+  end
+
+  if not target_msg then
+    return false, "消息不存在"
+  end
+
+  -- 从缓冲区读取编辑后的内容
+  local lines = vim.api.nvim_buf_get_lines(buf, start_line, end_line, false)
+  if not lines or #lines == 0 then
+    return false, "缓冲区内容为空"
+  end
+
+  local content = table.concat(lines, "\n")
+  content = vim.trim(content)
+
+  if content == "" then
+    return false, "内容为空，未保存"
+  end
+
+  if content == target_msg.content then
+    return false, "内容未修改"
+  end
+
+  -- 调用 edit_message 保存
+  local success = M.edit_message(session_id, message_id, content)
+  if success then
+    local preview = string.sub(content, 1, 50)
+    if #content > 50 then
+      preview = preview .. "..."
+    end
+    return true, preview
+  end
+
+  return false, "保存失败"
+end
+
+--- 查找缓冲区中某行所属的消息对象
+-- 根据当前缓冲区的内容行，重新计算行号到消息的映射，返回指定行对应的消息信息
+-- @param session 会话对象
+-- @param buf 缓冲区句柄
+-- @param target_line 目标行号（0-indexed）
+-- @return table? 消息信息 {session_id, message_id, start_line, end_line}，找不到返回 nil
+function M.find_message_at_line(session, buf, target_line)
+  if not session or not session.messages then
+    return nil
+  end
+
+  local current_line = 0
+  for i, msg in ipairs(session.messages) do
+    -- 标题行（不可编辑）
+    current_line = current_line + 1
+
+    -- 计算内容行（wrap_message_content 模拟 UI 的换行逻辑）
+    local wrap_width = 60 - 4
+    local content_text = msg.content or ""
+    local content_line_count = 0
+    for line in content_text:gmatch("[^\r\n]+") do
+      -- 每一行按 wrap_width 换行
+      local remaining = line
+      while #remaining > 0 do
+        content_line_count = content_line_count + 1
+        if #remaining <= wrap_width then
+          break
+        end
+        remaining = remaining:sub(wrap_width + 1)
+      end
+    end
+    if content_text == "" then
+      content_line_count = 1
+    end
+
+    local msg_start = current_line
+    local msg_end = current_line + content_line_count
+
+    -- 检查目标行是否在当前消息的内容范围内
+    if target_line >= msg_start and target_line < msg_end then
+      return {
+        session_id = session.id,
+        message_id = msg.id,
+        start_line = msg_start,
+        end_line = msg_end,
+      }
+    end
+
+    current_line = msg_end
+
+    -- 消息间的空行
+    if i < #session.messages then
+      current_line = current_line + 1
+    end
+  end
+
+  return nil
+end
+
+--- 删除指定会话中的某条消息
+-- @param session_id 会话 ID
+-- @param message_id 消息 ID
+-- @return boolean 是否删除成功
 function M.delete_message(session_id, message_id)
-  -- 删除消息
   local session = M.sessions[session_id]
   if not session then
     return false
@@ -143,22 +256,8 @@ function M.delete_message(session_id, message_id)
     if msg.id == message_id then
       table.remove(session.messages, i)
       session.updated_at = os.time()
-
-      -- 自动同步数据到配置文件
-      M.export_session(session_id, M.config_file, true)
-
-      M.trigger_event("message_deleted", {
-        session_id = session_id,
-        message_id = message_id,
-      })
-      
-      -- 触发数据同步事件
-      M.trigger_event("data_synced", { 
-        session_id = session_id, 
-        action = "message_deleted",
-        message_id = message_id,
-        timestamp = os.time()
-      })
+      M._auto_sync(session_id)
+      M._trigger("message_deleted", { session_id = session_id, message_id = message_id })
       return true
     end
   end
@@ -166,8 +265,12 @@ function M.delete_message(session_id, message_id)
   return false
 end
 
+--- 设置消息的可编辑状态
+-- @param session_id 会话 ID
+-- @param message_id 消息 ID
+-- @param editable 是否可编辑
+-- @return boolean 是否设置成功
 function M.set_editable(session_id, message_id, editable)
-  -- 设置消息可编辑状态
   local session = M.sessions[session_id]
   if not session then
     return false
@@ -176,15 +279,8 @@ function M.set_editable(session_id, message_id, editable)
   for _, msg in ipairs(session.messages) do
     if msg.id == message_id then
       msg.editable = editable
-
-      -- 保存到编辑状态记录
       M.editable_states[message_id] = editable
-
-      M.trigger_event("editability_changed", {
-        session_id = session_id,
-        message_id = message_id,
-        editable = editable,
-      })
+      M._trigger("editability_changed", { session_id = session_id, message_id = message_id, editable = editable })
       return true
     end
   end
@@ -192,8 +288,11 @@ function M.set_editable(session_id, message_id, editable)
   return false
 end
 
+--- 切换消息的可编辑状态
+-- @param session_id 会话 ID
+-- @param message_id 消息 ID
+-- @return boolean|nil 新的可编辑状态，或失败时返回 nil
 function M.toggle_editability(session_id, message_id)
-  -- 切换消息编辑状态
   local session = M.sessions[session_id]
   if not session then
     return false
@@ -204,12 +303,7 @@ function M.toggle_editability(session_id, message_id)
       local new_state = not msg.editable
       msg.editable = new_state
       M.editable_states[message_id] = new_state
-
-      M.trigger_event("editability_changed", {
-        session_id = session_id,
-        message_id = message_id,
-        editable = new_state,
-      })
+      M._trigger("editability_changed", { session_id = session_id, message_id = message_id, editable = new_state })
       return new_state
     end
   end
@@ -217,20 +311,25 @@ function M.toggle_editability(session_id, message_id)
   return false
 end
 
--- 模拟AI回复
+--- 模拟 AI 回复（用于演示/测试）
+-- 会先显示"思考中..."的占位消息，延迟后替换为真实回复
+-- @param session_id 会话 ID
+-- @param user_message 用户消息内容
+-- @param callback 回复完成后的回调函数（可选）
 function M.simulate_ai_reply(session_id, user_message, callback)
   local session = M.sessions[session_id]
   if not session then
     return
   end
 
-  -- 创建待处理消息
+  -- 创建 pending 状态的占位消息
   local pending_msg = M.create_message("assistant", "思考中...", os.time(), { pending = true })
   pending_msg.pending = true
   M.add_message(session_id, pending_msg)
 
-  -- 模拟AI思考延迟
+  -- 延迟模拟 AI 回复
   vim.defer_fn(function()
+    -- 预定义的回复模板
     local responses = {
       "这是一个模拟回复。在实际应用中，这里会连接到AI API。",
       "我理解你的问题。可以告诉我更多细节吗？",
@@ -241,7 +340,7 @@ function M.simulate_ai_reply(session_id, user_message, callback)
 
     local response = responses[math.random(#responses)]
 
-    -- 更新消息
+    -- 更新占位消息为真实回复
     for i, msg in ipairs(session.messages) do
       if msg.id == pending_msg.id then
         msg.content = response
@@ -252,31 +351,22 @@ function M.simulate_ai_reply(session_id, user_message, callback)
     end
 
     session.updated_at = os.time()
-
-    -- 自动同步数据到配置文件
-    M.export_session(session_id, M.config_file, true)
+    M._auto_sync(session_id)
 
     if callback then
       callback(response)
     end
 
-    M.trigger_event("ai_replied", {
-      session_id = session_id,
-      message = pending_msg,
-    })
-    
-    -- 触发数据同步事件
-    M.trigger_event("data_synced", { 
-      session_id = session_id, 
-      action = "ai_replied",
-      timestamp = os.time()
-    })
-  end, 1000 + math.random(500, 1500))
+    M._trigger("ai_replied", { session_id = session_id, message = pending_msg })
+  end, 1000 + math.random(500, 1500))  -- 1~2.5 秒随机延迟
 end
 
+--- 发送消息（用户消息 + 触发 AI 回复）
+-- @param session_id 会话 ID 或消息内容（若为内容则使用当前会话）
+-- @param content 消息内容
+-- @return table|nil 发送的用户消息对象，或失败时返回 nil
 function M.send_message(session_id, content)
-  -- 发送消息
-  -- 如果只传了一个参数，则第一个参数是content，自动使用current_session
+  -- 兼容参数顺序：若 content 为空，则第一个参数就是内容
   if content == nil then
     content = session_id
     session_id = M.current_session
@@ -287,39 +377,31 @@ function M.send_message(session_id, content)
     return nil
   end
 
-  -- 用户消息
+  -- 创建并添加用户消息
   local user_msg = M.create_message("user", content)
   M.add_message(session_id, user_msg)
 
-  -- 模拟AI回复
+  -- 触发 AI 模拟回复
   M.simulate_ai_reply(session_id, content, function(response)
-    M.trigger_event("response_received", {
-      session_id = session_id,
-      response = response,
-    })
+    M._trigger("response_received", { session_id = session_id, response = response })
   end)
 
   return user_msg
 end
 
+--- 注册事件监听器
+-- @param event 事件名称
+-- @param handler 回调函数
 function M.on(event, handler)
-  -- 事件系统
   M.message_handlers[event] = M.message_handlers[event] or {}
   table.insert(M.message_handlers[event], handler)
 end
 
-function M.trigger_event(event, data)
-  local handlers = M.message_handlers[event] or {}
-  for _, handler in ipairs(handlers) do
-    handler(data)
-  end
-end
-
---- 自动同步所有会话数据到配置文件
--- @param session_id 可选，指定会话ID，如果为nil则同步所有会话
+--- 同步指定（或全部）会话数据到文件
+-- @param session_id 会话 ID（可选，为空时同步所有会话）
+-- @return boolean 是否成功
 function M.sync_data(session_id)
   if session_id then
-    -- 同步指定会话
     local session = M.sessions[session_id]
     if session then
       M.export_session(session_id, M.config_file, true)
@@ -335,21 +417,22 @@ function M.sync_data(session_id)
   return false
 end
 
---- 防抖同步：延迟执行，避免频繁写入
--- @param session_id 可选，指定会话ID
+--- 防抖同步：延迟指定时间后执行 sync_data，期间重复调用会重置计时器
+-- @param session_id 会话 ID
+-- @param delay_ms 延迟时间（毫秒），默认 500
 local debounce_sync_timer = nil
 function M.debounce_sync(session_id, delay_ms)
-  delay_ms = delay_ms or 500 -- 默认500ms延迟
-  
-  -- 取消现有定时器
+  delay_ms = delay_ms or 500
+
+  -- 停止旧的计时器
   if debounce_sync_timer then
     debounce_sync_timer:stop()
     if not debounce_sync_timer:is_closing() then
       debounce_sync_timer:close()
     end
   end
-  
-  -- 启动新定时器
+
+  -- 创建新的计时器
   debounce_sync_timer = vim.loop.new_timer()
   if debounce_sync_timer then
     debounce_sync_timer:start(delay_ms, 0, function()
@@ -360,14 +443,18 @@ function M.debounce_sync(session_id, delay_ms)
   end
 end
 
+--- 导出指定会话到 JSON 文件
+-- @param session_id 会话 ID
+-- @param filepath 导出文件路径（可选，默认使用 config_file）
+-- @param internal 是否为内部调用（为 true 时不触发事件）
+-- @return boolean 是否导出成功
 function M.export_session(session_id, filepath, internal)
-  -- 导出会话到配置
   local session = M.sessions[session_id]
   if not session then
     return false
   end
 
-  -- 创建可序列化的副本
+  -- 构建导出数据结构
   local export_data = {
     id = session.id,
     name = session.name,
@@ -378,25 +465,22 @@ function M.export_session(session_id, filepath, internal)
     export_time = os.time(),
   }
 
-  -- 转换消息，移除临时字段
+  -- 序列化消息
   for _, msg in ipairs(session.messages) do
-    local export_msg = {
+    table.insert(export_data.messages, {
       id = msg.id,
       role = msg.role,
       content = msg.content,
       timestamp = msg.timestamp,
       metadata = msg.metadata,
       editable = M.editable_states[msg.id] or false,
-    }
-    table.insert(export_data.messages, export_msg)
+    })
   end
 
   filepath = filepath or M.config_file
+  vim.fn.mkdir(M.config_dir, "p")  -- 确保目录存在
 
-  -- 确保目录存在
-  vim.fn.mkdir(M.config_dir, "p")
-
-  -- 读取现有数据
+  -- 读取已有的数据（合并模式）
   local all_data = {}
   if vim.fn.filereadable(filepath) == 1 then
     local content = vim.fn.readfile(filepath)
@@ -405,30 +489,25 @@ function M.export_session(session_id, filepath, internal)
     end
   end
 
-  -- 更新或添加会话
+  -- 更新指定会话的数据
   all_data[session.id] = export_data
-
-  -- 写入文件
-  local json_str = vim.fn.json_encode(all_data)
-  vim.fn.writefile({ json_str }, filepath)
+  vim.fn.writefile({ vim.fn.json_encode(all_data) }, filepath)
 
   if not internal then
-    M.trigger_event("session_exported", {
-      session_id = session_id,
-      filepath = filepath,
-    })
+    M._trigger("session_exported", { session_id = session_id, filepath = filepath })
   end
 
   return true
 end
 
+--- 导出所有会话到 JSON 文件
+-- @param filepath 导出文件路径（可选）
+-- @return number 导出的会话数量
 function M.export_all(filepath)
-  -- 导出所有会话
   filepath = filepath or M.config_file
   vim.fn.mkdir(M.config_dir, "p")
 
   local all_data = {}
-
   for id, session in pairs(M.sessions) do
     all_data[id] = {
       id = session.id,
@@ -440,14 +519,14 @@ function M.export_all(filepath)
     }
   end
 
-  local json_str = vim.fn.json_encode(all_data)
-  vim.fn.writefile({ json_str }, filepath)
-
+  vim.fn.writefile({ vim.fn.json_encode(all_data) }, filepath)
   return #M.sessions
 end
 
+--- 从 JSON 文件导入会话数据
+-- @param filepath 导入文件路径（可选）
+-- @return table 导入的会话 ID 列表
 function M.import_sessions(filepath)
-  -- 导入会话
   filepath = filepath or M.config_file
 
   if vim.fn.filereadable(filepath) ~= 1 then
@@ -472,16 +551,14 @@ function M.import_sessions(filepath)
       config = session_data.config or {},
     }
 
-    -- 导入消息
+    -- 重建消息对象
     for _, msg_data in ipairs(session_data.messages or {}) do
       local msg = M.create_message(msg_data.role, msg_data.content, msg_data.timestamp, msg_data.metadata)
       msg.id = msg_data.id
       msg.editable = msg_data.editable or false
-
       if msg.editable then
         M.editable_states[msg.id] = true
       end
-
       table.insert(session.messages, msg)
     end
 
@@ -489,12 +566,14 @@ function M.import_sessions(filepath)
     table.insert(imported, session.id)
   end
 
-  M.trigger_event("sessions_imported", { count = #imported })
+  M._trigger("sessions_imported", { count = #imported })
   return imported
 end
 
+--- 获取指定会话的统计信息
+-- @param session_id 会话 ID
+-- @return table 统计数据表
 function M.get_session_stats(session_id)
-  -- 获取会话统计
   local session = M.sessions[session_id]
   if not session then
     return {}
@@ -509,6 +588,7 @@ function M.get_session_stats(session_id)
     duration_minutes = math.floor((os.time() - session.created_at) / 60),
   }
 
+  -- 按角色分类统计
   for _, msg in ipairs(session.messages) do
     if msg.role == "user" then
       stats.user_messages = stats.user_messages + 1
@@ -517,7 +597,6 @@ function M.get_session_stats(session_id)
     elseif msg.role == "system" then
       stats.system_messages = stats.system_messages + 1
     end
-
     if msg.editable then
       stats.editable_messages = stats.editable_messages + 1
     end
@@ -526,29 +605,29 @@ function M.get_session_stats(session_id)
   return stats
 end
 
+--- 后端模块初始化
+-- 读取配置、导入已有数据、创建默认会话
+-- @param user_config 用户配置（可选）
 function M.setup(user_config)
-  -- 初始化
   user_config = user_config or {}
-
-  -- 使用默认配置作为基础
   M.config_dir = user_config.config_dir or config.defaults.background.config_dir
   M.config_file = user_config.config_file or (M.config_dir .. "/sessions.json")
 
-  -- 加载现有会话
+  -- 尝试导入已有的会话数据
   M.import_sessions()
 
-  -- 如果没有会话，创建一个默认的
+  -- 如果没有任何会话，创建默认会话
   local has_sessions = false
   for _, _ in pairs(M.sessions) do
     has_sessions = true
     break
   end
-  
+
   if not has_sessions then
     M.new_session("默认会话")
   end
-  
-  -- 设置当前会话为第一个可用的会话
+
+  -- 设置当前活跃会话
   if not M.current_session then
     for id, _ in pairs(M.sessions) do
       M.current_session = id

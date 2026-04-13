@@ -136,8 +136,10 @@ M.defaults = {
   },
 }
 
+--- 获取有效的配置文件路径
+-- @param cfg 配置表
+-- @return string 配置文件路径
 function M.get_config_file(cfg)
-  -- 获取有效的配置文件路径
   return cfg.config_file or (cfg.config_dir .. "/sessions.json")
 end
 
