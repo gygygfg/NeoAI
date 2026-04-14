@@ -45,22 +45,64 @@ local SEPARATOR_CHARS = { single = "─", double = "═", solid = "━", dotted 
 
 -- ── 工具函数集 ───────────────────────────────────────────────────────────────
 
+-- ── 防抖定时器管理 ───────────────────────────────────────────────────────────
+
+--- 生成唯一的防抖定时器名称
+-- @param prefix 前缀标识
+-- @return string 唯一的定时器名称（带时间戳）
+local function make_debounce_key(prefix)
+  return string.format("%s_%d_%d", prefix, vim.loop.now(), math.random(100000, 999999))
+end
+
+--- 清理指定的防抖定时器
+-- @param timer_name 定时器名称
+local function cleanup_debounce_timer(timer_name)
+  local old_timer = M._debounce_timers[timer_name]
+  if old_timer then
+    old_timer:stop()
+    if not old_timer:is_closing() then
+      old_timer:close()
+    end
+    M._debounce_timers[timer_name] = nil
+  end
+end
+
+--- 清理所有防抖定时器
+local function cleanup_all_debounce_timers()
+  for name, timer in pairs(M._debounce_timers) do
+    if timer and not timer:is_closing() then
+      timer:stop()
+      timer:close()
+    end
+    M._debounce_timers[name] = nil
+  end
+end
+
 --- 防抖函数：在指定延迟后执行函数，期间重复调用会重置计时器
 -- @param fn 要执行的函数
 -- @param delay_ms 延迟时间（毫秒）
+-- @param key_prefix 可选的前缀标识（用于区分不同的防抖场景）
 -- @return function 包装后的防抖函数
-local function debounce(fn, delay_ms)
+local function debounce(fn, delay_ms, key_prefix)
+  key_prefix = key_prefix or tostring(fn)
+
   return function(...)
     local args = { ... }
-    local timer_name = tostring(fn)
+    -- 生成唯一的定时器名称，避免不同场景共享同一个定时器
+    local timer_name = make_debounce_key(key_prefix)
 
-    -- 停止旧的计时器
-    local old_timer = M._debounce_timers[timer_name]
-    if old_timer then
-      old_timer:stop()
-      if not old_timer:is_closing() then
-        old_timer:close()
+    -- 如果提供了 key_prefix，则清理该前缀下的所有旧定时器
+    -- 否则仅清理基于函数名的旧定时器（向后兼容）
+    if key_prefix ~= tostring(fn) then
+      -- 清理同前缀的旧定时器
+      for name, _ in pairs(M._debounce_timers) do
+        if name:find("^" .. key_prefix .. "_") then
+          cleanup_debounce_timer(name)
+        end
       end
+    else
+      -- 向后兼容：清理基于函数名的旧定时器
+      cleanup_debounce_timer(timer_name)
     end
 
     -- 创建新的计时器
@@ -68,6 +110,8 @@ local function debounce(fn, delay_ms)
     M._debounce_timers[timer_name] = timer
     timer:start(delay_ms, 0, function()
       vim.schedule(function()
+        -- 执行完成后清理定时器引用
+        M._debounce_timers[timer_name] = nil
         fn(unpack(args))
       end)
     end)
@@ -391,10 +435,40 @@ function M.schedule_resize()
   end, 100)
 end
 
---- 防抖后的更新显示函数（50ms 延迟）
-M.update_display_debounced = debounce(function()
+--- 防抖后的更新显示函数集合（50ms 延迟）
+-- 为不同事件类型创建独立的防抖函数，避免共享定时器导致意外延迟
+-- 每个事件类型使用唯一前缀，确保定时器不会互相干扰
+M.update_display_debounced = {}
+
+-- 通用防抖更新（向后兼容）
+M.update_display_debounced.default = debounce(function()
   M.update_display()
-end, 50)
+end, 50, "update_display_default")
+
+-- 各事件类型独立的防抖更新函数
+M.update_display_debounced.message = debounce(function()
+  M.update_display()
+end, 50, "update_display_message")
+
+M.update_display_debounced.delete = debounce(function()
+  M.update_display()
+end, 50, "update_display_delete")
+
+M.update_display_debounced.reply = debounce(function()
+  M.update_display()
+end, 50, "update_display_reply")
+
+M.update_display_debounced.response = debounce(function()
+  M.update_display()
+end, 50, "update_display_response")
+
+M.update_display_debounced.session = debounce(function()
+  M.update_display()
+end, 50, "update_display_session")
+
+M.update_display_debounced.turn = debounce(function()
+  M.update_display()
+end, 50, "update_display_turn")
 
 --- 调整窗口大小（根据内容自动计算）
 -- @param content_width 内容宽度
@@ -593,6 +667,29 @@ function M.setup_tree_cursor_autocmd()
     return
   end
 
+  -- ── 统一的定时器生命周期管理 ──
+  -- 存储该 autocmd 实例相关的所有定时器
+  local autocmd_timers = {}
+
+  --- 注册定时器到统一管理
+  local function register_timer(timer)
+    if timer then
+      table.insert(autocmd_timers, timer)
+    end
+    return timer
+  end
+
+  --- 清理所有注册的定时器
+  local function cleanup_autocmd_timers()
+    for _, timer in ipairs(autocmd_timers) do
+      if timer and not timer:is_closing() then
+        timer:stop()
+        timer:close()
+      end
+    end
+    autocmd_timers = {}
+  end
+
   -- 记录上一次的光标位置
   local last_cursor_pos = { 0, 0 }
   -- 防止递归触发
@@ -618,6 +715,7 @@ function M.setup_tree_cursor_autocmd()
 
     ready_timer = vim.loop.new_timer()
     if ready_timer then
+      register_timer(ready_timer)
       ready_timer:start(200, 0, function()
         vim.schedule(function()
           is_ready = true
@@ -629,6 +727,16 @@ function M.setup_tree_cursor_autocmd()
   enable_after_delay()
 
   local tree_augroup = vim.api.nvim_create_augroup("NeoAITreeCursor", { clear = true })
+
+  -- 注册缓冲区删除/窗口关闭时的清理回调，防止内存泄漏
+  vim.api.nvim_create_autocmd({ "BufDelete", "WinClosed" }, {
+    group = tree_augroup,
+    buffer = M.tree_buffers.main,
+    callback = function()
+      cleanup_autocmd_timers()
+    end,
+  })
+
   vim.api.nvim_create_autocmd("CursorMoved", {
     group = tree_augroup,
     buffer = M.tree_buffers.main,
@@ -737,6 +845,9 @@ function M.setup_tree_cursor_autocmd()
           if not jump_debounce_timer then
             return
           end
+
+          -- 注册到统一生命周期管理
+          register_timer(jump_debounce_timer)
 
           local captured_target_line = target_line
 
@@ -885,58 +996,50 @@ function M.setup_buffers()
   M.update_display() -- 初始渲染显示
 end
 
--- ── 树视图管理 ─────────────────────────────────────────────────────────────
+-- ── 统一重绘函数 ─────────────────────────────────────────────────────────────
 
---- 将消息按对话轮次分组（仅用于树视图）
--- 将扁平的消息列表按"用户消息 + 助手回复"为一组进行聚合
--- 便于在树视图中以对话轮次为单位展示
--- @param messages 消息数组
--- @return table 分组后的对话轮次表
-local function group_messages_into_turns(messages)
-  local turns = {}
-  local current = nil
-
-  for i, msg in ipairs(messages) do
-    if msg.role == "user" then
-      -- 用户消息：创建新的对话轮次
-      current = { user_msg = msg, assistant_msg = nil, index = i }
-      table.insert(turns, current)
-    elseif msg.role == "assistant" and current and not current.assistant_msg then
-      -- 助手消息：附加到当前轮次（每条用户消息只对应一条助手回复）
-      current.assistant_msg = msg
-    else
-      -- 其他情况：创建独立轮次（如孤立的助手消息）
-      table.insert(turns, { user_msg = msg, assistant_msg = nil, index = i })
-    end
-  end
-
-  return turns
-end
-
---- 渲染会话树（文件树样式，合并共享历史）
--- 在树视图中展示所有会话及其消息预览，支持点击切换会话
-function M.render_session_tree()
+--- 统一重绘树视图界面
+-- 封装树视图的完整渲染流程：清除内容、重绘、设置高亮、调整大小
+function M._render_tree_interface()
   local buf = M.tree_buffers.main
   if not is_buf_valid(buf) then
     return
   end
 
-  -- 确保缓冲区可修改（清除只读状态）
+  -- 确保缓冲区可修改
   vim.api.nvim_set_option_value("modifiable", true, { buf = buf })
   vim.api.nvim_set_option_value("readonly", false, { buf = buf })
-  vim.api.nvim_buf_set_lines(buf, 0, -1, false, {})
 
-  -- 清除旧的虚拟文本（避免重复叠加）
+  -- 清除旧内容和虚拟文本
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, {})
   local ns_bottom_hint = vim.api.nvim_create_namespace("NeoAITreeBottomHint")
   vim.api.nvim_buf_clear_namespace(buf, ns_bottom_hint, 0, -1)
 
-  -- 递增树渲染版本号（通知光标回调重置导航状态）
+  -- 递增版本号（通知光标回调重置导航状态）
   M._tree_version = (M._tree_version or 0) + 1
 
+  -- 渲染树内容
+  M._build_tree_content()
+
+  -- 应用高亮和设置只读
+  M._apply_tree_highlights(buf)
+  vim.api.nvim_set_option_value("modifiable", false, { buf = buf })
+  vim.api.nvim_set_option_value("readonly", true, { buf = buf })
+
+  -- 延迟调整窗口大小
+  vim.defer_fn(function()
+    M.adjust_tree_window_size()
+  end, 10)
+end
+
+--- 构建树视图内容（内部辅助函数）
+-- @return table 行数组
+function M._build_tree_content()
+  local buf = M.tree_buffers.main
   local lines = {}
-  local ns_id = vim.api.nvim_create_namespace("NeoAITree") -- 高亮命名空间
-  M.tree_buffers.session_positions = {} -- 记录每行对应的会话/消息信息
-  M._next_line_num = 1 -- 显式追踪下一个行号（1-indexed，与 nvim_win_get_cursor 一致）
+  local ns_id = vim.api.nvim_create_namespace("NeoAITree")
+  M.tree_buffers.session_positions = {}
+  M._next_line_num = 1
 
   -- 标题
   local title = "Chat History"
@@ -945,7 +1048,6 @@ function M.render_session_tree()
   M._next_line_num = M._next_line_num + 1
 
   if backend.sessions and #backend.sessions > 0 then
-    -- 找出所有根会话（没有父节点或父节点不存在的会话）
     local root_sessions = {}
     for session_id, session in pairs(backend.sessions) do
       local graph = backend.session_graph[session_id]
@@ -955,13 +1057,11 @@ function M.render_session_tree()
     end
     table.sort(root_sessions)
 
-    -- 渲染每个根会话及其子树
     for idx, session_id in ipairs(root_sessions) do
       local is_last_root = (idx == #root_sessions)
       local session = backend.sessions[session_id]
       local prefix = is_last_root and "└─ " or "├─ "
       local file_icon = "󰈙"
-      local is_current = (session_id == backend.current_session)
       local session_info =
         string.format("%s%s %s (%d)", prefix, file_icon, sanitize_line(session.name), #session.messages)
       table.insert(lines, session_info)
@@ -971,14 +1071,12 @@ function M.render_session_tree()
       M._next_line_num = M._next_line_num + 1
 
       local child_prefix = is_last_root and "   " or "│  "
-      -- 递归渲染：合并共享历史，在分支点展开子节点
       M._render_session_tree_recursive(lines, session_id, session, child_prefix, true)
 
-      table.insert(lines, "") -- 会话间空行
+      table.insert(lines, "")
       M._next_line_num = M._next_line_num + 1
     end
   else
-    -- 无会话时的提示
     table.insert(lines, "│")
     M._next_line_num = M._next_line_num + 1
     table.insert(lines, "│  暂无会话")
@@ -991,11 +1089,19 @@ function M.render_session_tree()
     M._next_line_num = M._next_line_num + 1
   end
 
-  -- 写入缓冲区（不包含底部提示）
+  -- 写入缓冲区
   vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
 
-  -- 根据窗口宽度手动分割提示文本
-  local win_width = 40 -- 默认值
+  -- 添加底部提示
+  M._add_tree_bottom_hints(buf, lines, ns_id)
+end
+
+--- 添加树视图底部提示（内部辅助函数）
+-- @param buf 缓冲区句柄
+-- @param lines 行数组
+-- @param ns_id 命名空间ID
+function M._add_tree_bottom_hints(buf, lines, ns_id)
+  local win_width = 40
   if is_win_valid(M.windows.tree) then
     win_width = vim.api.nvim_win_get_width(M.windows.tree)
   elseif is_win_valid(M.windows.main) then
@@ -1004,7 +1110,6 @@ function M.render_session_tree()
 
   local max_width_per_line = math.max(25, win_width - 2)
 
-  -- 定义提示部分
   local all_parts = {
     "<CR> 选择",
     "n 分支",
@@ -1014,7 +1119,6 @@ function M.render_session_tree()
     "q 关闭",
   }
 
-  -- 重新组合，确保每行显示宽度不超过 max_width_per_line
   local hint_lines = {}
   local current_line = ""
   for _, part in ipairs(all_parts) do
@@ -1033,19 +1137,8 @@ function M.render_session_tree()
     table.insert(hint_lines, current_line)
   end
 
-  -- 计算最长行宽度用于分隔线长度
-  local max_hint_width = 0
-  for _, line in ipairs(hint_lines) do
-    local w = display_width(line)
-    if w > max_hint_width then
-      max_hint_width = w
-    end
-  end
-
-  -- 分隔线长度 = 实际文本可用宽度
   local separator_len = calculate_text_width()
 
-  -- 添加分隔线和提示行
   table.insert(lines, "")
   M._next_line_num = M._next_line_num + 1
   local separator_line = #lines
@@ -1057,25 +1150,21 @@ function M.render_session_tree()
     M._next_line_num = M._next_line_num + 1
   end
 
-  -- 重新写入包含提示的缓冲区
   vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
 
-  -- 添加分隔线高亮
-  vim.api.nvim_buf_set_extmark(buf, ns_bottom_hint, separator_line, 0, {
+  vim.api.nvim_buf_set_extmark(buf, ns_id, separator_line, 0, {
     end_row = separator_line + 1,
     hl_group = "Comment",
     hl_eol = true,
   })
 
-  -- 延迟调整分隔线长度（确保窗口已渲染完成）
+  -- 延迟调整分隔线长度
   vim.defer_fn(function()
     if not is_buf_valid(buf) then
       return
     end
 
     local text_width = calculate_text_width()
-
-    -- 查找分隔线位置（从底部向上搜索）
     local line_count = vim.api.nvim_buf_line_count(buf)
     local sep_line_idx = nil
     for i = line_count, 1, -1 do
@@ -1092,15 +1181,19 @@ function M.render_session_tree()
 
     local new_sep_text = string.rep(M.get_separator_char(), text_width)
 
-    -- 替换分隔线内容
     vim.api.nvim_set_option_value("modifiable", true, { buf = buf })
     vim.api.nvim_set_option_value("readonly", false, { buf = buf })
     vim.api.nvim_buf_set_lines(buf, sep_line_idx, sep_line_idx + 1, false, { new_sep_text })
     vim.api.nvim_set_option_value("modifiable", false, { buf = buf })
     vim.api.nvim_set_option_value("readonly", true, { buf = buf })
   end, 50)
+end
 
-  -- 应用高亮（所有会话统一样式，不高亮当前会话）
+--- 应用树视图高亮（内部辅助函数）
+-- @param buf 缓冲区句柄
+function M._apply_tree_highlights(buf)
+  local ns_id = vim.api.nvim_create_namespace("NeoAITree")
+
   for line_num, pos in pairs(M.tree_buffers.session_positions) do
     if pos.type == "session" then
       local hl = "Normal"
@@ -1115,15 +1208,183 @@ function M.render_session_tree()
       end
     end
   end
+end
 
-  -- 设置只读，防止误编辑
-  vim.api.nvim_set_option_value("modifiable", false, { buf = buf })
-  vim.api.nvim_set_option_value("readonly", true, { buf = buf })
+--- 统一重绘聊天界面
+-- 封装聊天界面的完整渲染流程：清除内容、重绘消息、设置可编辑性、调整窗口
+function M._render_chat_interface()
+  local buf = M.buffers.main
+  if not is_buf_valid(buf) then
+    return
+  end
 
-  -- 延迟调整大小，确保内容已渲染
-  vim.defer_fn(function()
-    M.adjust_tree_window_size()
-  end, 10)
+  -- 保存当前光标位置
+  local save_cursor = is_win_valid(M.windows.main) and vim.api.nvim_win_get_cursor(M.windows.main) or nil
+
+  -- 确保缓冲区可修改
+  vim.api.nvim_set_option_value("modifiable", true, { buf = buf })
+  vim.api.nvim_set_option_value("readonly", false, { buf = buf })
+
+  -- 清除旧内容和命名空间
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, {})
+  local ns_virtual_text = vim.api.nvim_create_namespace("NeoAIVirtualText")
+  local ns_highlight = vim.api.nvim_create_namespace("NeoAIHighlight")
+  vim.api.nvim_buf_clear_namespace(buf, ns_virtual_text, 0, -1)
+  vim.api.nvim_buf_clear_namespace(buf, ns_highlight, 0, -1)
+
+  -- 构建聊天内容
+  local lines, separator_positions = M._build_chat_content()
+
+  -- 写入缓冲区
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+
+  -- 添加分隔线和输入提示
+  M._add_chat_separators(buf, lines, separator_positions, ns_virtual_text, ns_highlight)
+
+  -- 设置可编辑性
+  local session = backend.current_session and backend.sessions[backend.current_session]
+  M._setup_editability(buf, session)
+
+  -- 记录行数
+  M._last_buffer_line_count = vim.api.nvim_buf_line_count(buf)
+
+  -- 调整窗口大小
+  local max_width = calculate_text_width()
+  M.adjust_window_size(max_width, #lines)
+  M.set_window_wrap()
+
+  -- 恢复光标或滚动到底部
+  if is_win_valid(M.windows.main) then
+    local last_line = vim.api.nvim_buf_line_count(buf)
+    if save_cursor and save_cursor[1] <= last_line then
+      pcall(vim.api.nvim_win_set_cursor, M.windows.main, save_cursor)
+    else
+      vim.api.nvim_win_set_cursor(M.windows.main, { M.input_start_line + 1, 0 })
+    end
+  end
+end
+
+--- 构建聊天内容（内部辅助函数）
+-- @return table 行数组, table 分隔线位置
+function M._build_chat_content()
+  local lines = {}
+  local max_width = calculate_text_width()
+  local separator_positions = {}
+  local session = backend.current_session and backend.sessions[backend.current_session]
+
+  -- 渲染消息
+  if session and session.messages and #session.messages > 0 then
+    for i, msg in ipairs(session.messages) do
+      -- 添加角色标题行
+      local role_icon = M.config.show_role_icons and (M.config.role_icons[msg.role] or "") or ""
+      local role_name = string.upper(msg.role)
+      local header = role_icon .. " " .. role_name
+      if M.config.show_timestamps then
+        header = header .. " · " .. os.date("%H:%M", msg.timestamp)
+      end
+      table.insert(lines, header)
+
+      -- 添加消息内容（自动换行）
+      local content_lines = wrap_message_content(msg.content, max_width - 4)
+      for _, line in ipairs(content_lines) do
+        table.insert(lines, line)
+      end
+
+      -- 记录分割线位置
+      if i < #session.messages then
+        table.insert(lines, "")
+        table.insert(separator_positions, #lines - 1)
+      end
+    end
+  else
+    -- 空状态：显示欢迎信息
+    table.insert(lines, "")
+    table.insert(lines, "  欢迎使用 NeoAI!")
+    table.insert(lines, "  输入消息开始对话")
+    table.insert(lines, "")
+  end
+
+  return lines, separator_positions
+end
+
+--- 添加聊天分隔和输入提示（内部辅助函数）
+-- @param buf 缓冲区句柄
+-- @param lines 行数组
+-- @param separator_positions 分隔线位置
+-- @param ns_virtual_text 虚拟文本命名空间
+-- @param ns_highlight 高亮命名空间
+function M._add_chat_separators(buf, lines, separator_positions, ns_virtual_text, ns_highlight)
+  -- 记录输入提示分割线位置
+  local separator_line_num = #lines
+  table.insert(lines, "")
+  table.insert(separator_positions, separator_line_num)
+
+  -- 记录输入行位置
+  local input_line = #lines
+  table.insert(lines, "")
+  M.input_start_line = input_line
+  M.input_end_line = input_line
+
+  -- 重新写入缓冲区
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+
+  -- 添加虚拟文本分割线
+  local max_width = calculate_text_width()
+  for _, sep_line in ipairs(separator_positions) do
+    vim.api.nvim_buf_set_extmark(buf, ns_virtual_text, sep_line, 0, {
+      virt_text = { { string.rep(M.get_separator_char(), max_width), "Comment" } },
+      virt_text_pos = "overlay",
+    })
+  end
+
+  -- 为输入行添加虚拟文本提示
+  local ns_input = vim.api.nvim_create_namespace("NeoAIInputPrompt")
+  vim.api.nvim_buf_set_extmark(buf, ns_input, M.input_start_line, 0, {
+    virt_text = { { "输入消息: ", "Comment" } },
+    virt_text_pos = "overlay",
+  })
+
+  -- 高亮输入区域
+  vim.api.nvim_buf_set_extmark(buf, ns_highlight, M.input_start_line, 0, {
+    end_row = M.input_end_line + 1,
+    hl_group = "NeoAIInput",
+    hl_eol = true,
+  })
+end
+
+-- ── 树视图管理 ─────────────────────────────────────────────────────────────
+
+--- 将消息按对话轮次分组（仅用于树视图）
+-- 将扁平的消息列表按"用户消息 + 助手回复"为一组进行聚合
+-- 便于在树视图中以对话轮次为单位展示
+-- @param messages 消息数组
+-- @return table 分组后的对话轮次表
+local function group_messages_into_turns(messages)
+  local turns = {}
+  local current = nil
+
+  for i, msg in ipairs(messages) do
+    if msg.role == "user" then
+      current = { user_msg = msg, assistant_msg = nil, index = i }
+      table.insert(turns, current)
+    elseif msg.role == "assistant" and current and not current.assistant_msg then
+      current.assistant_msg = msg
+    else
+      table.insert(turns, { user_msg = msg, assistant_msg = nil, index = i })
+    end
+  end
+
+  return turns
+end
+
+--- 渲染会话树（文件树样式，合并共享历史）
+-- 在树视图中展示所有会话及其消息预览，支持点击切换会话
+function M.render_session_tree()
+  if not is_buf_valid(M.tree_buffers.main) then
+    return
+  end
+
+  M._render_tree_interface()
 end
 
 --- 递归渲染会话树（合并共享历史，在分支点展开子节点）
@@ -1565,116 +1826,10 @@ end
 --- 更新主显示
 -- 重新渲染主缓冲区的内容，包括所有会话消息和输入提示区域
 function M.update_display()
-  local buf = M.buffers.main
-  if not is_buf_valid(buf) then
-    return
-  end
+  -- 渲染聊天界面
+  M._render_chat_interface()
 
-  -- 保存当前光标位置（刷新后恢复）
-  local save_cursor = is_win_valid(M.windows.main) and vim.api.nvim_win_get_cursor(M.windows.main) or nil
-
-  vim.api.nvim_set_option_value("modifiable", true, { buf = buf })
-  vim.api.nvim_buf_set_lines(buf, 0, -1, false, {})
-
-  -- 清除旧的虚拟文本和高亮（避免重复叠加）
-  local ns_virtual_text = vim.api.nvim_create_namespace("NeoAIVirtualText")
-  local ns_highlight = vim.api.nvim_create_namespace("NeoAIHighlight")
-  vim.api.nvim_buf_clear_namespace(buf, ns_virtual_text, 0, -1)
-  vim.api.nvim_buf_clear_namespace(buf, ns_highlight, 0, -1)
-
-  local lines = {}
-  local max_width = calculate_text_width()
-  local separator_positions = {} -- 记录分割线位置（不可编辑区域）
-  local session = backend.current_session and backend.sessions[backend.current_session]
-
-  -- 渲染消息
-  if session and session.messages and #session.messages > 0 then
-    for i, msg in ipairs(session.messages) do
-      -- 添加角色标题行（如 "💬 USER · 14:30"）
-      local role_icon = M.config.show_role_icons and (M.config.role_icons[msg.role] or "") or ""
-      local role_name = string.upper(msg.role)
-      local header = role_icon .. " " .. role_name
-      if M.config.show_timestamps then
-        header = header .. " · " .. os.date("%H:%M", msg.timestamp)
-      end
-      table.insert(lines, header)
-
-      -- 添加消息内容（自动换行处理）
-      local content_lines = wrap_message_content(msg.content, max_width - 4)
-      for _, line in ipairs(content_lines) do
-        table.insert(lines, line)
-      end
-
-      -- 记录分割线位置（消息之间的分隔线，不可编辑）
-      if i < #session.messages then
-        table.insert(lines, "") -- 占位行
-        table.insert(separator_positions, #lines - 1)
-      end
-    end
-  else
-    -- 空状态：显示欢迎信息
-    table.insert(lines, "")
-    table.insert(lines, "  欢迎使用 NeoAI!")
-    table.insert(lines, "  输入消息开始对话")
-    table.insert(lines, "")
-  end
-
-  -- 记录输入提示分割线位置
-  local separator_line_num = #lines
-  table.insert(lines, "")
-  table.insert(separator_positions, separator_line_num)
-
-  -- 记录输入行位置（用户输入区域，默认 1 行高）
-  local input_line = #lines
-  table.insert(lines, "")
-  M.input_start_line = input_line -- 输入区域起始行
-  M.input_end_line = input_line -- 输入区域结束行（默认 1 行高）
-
-  -- 写入缓冲区
-  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
-
-  -- 添加虚拟文本分割线（不可编辑的分隔线）
-  for _, sep_line in ipairs(separator_positions) do
-    vim.api.nvim_buf_set_extmark(buf, ns_virtual_text, sep_line, 0, {
-      virt_text = { { string.rep(M.get_separator_char(), max_width), "Comment" } },
-      virt_text_pos = "overlay",
-    })
-  end
-
-  -- 设置消息区域为可编辑，分割线区域不可编辑
-  M._setup_editability(buf, session)
-
-  -- 为输入行添加虚拟文本提示
-  local ns_input = vim.api.nvim_create_namespace("NeoAIInputPrompt")
-  vim.api.nvim_buf_set_extmark(buf, ns_input, M.input_start_line, 0, {
-    virt_text = { { "输入消息: ", "Comment" } },
-    virt_text_pos = "overlay",
-  })
-
-  -- 高亮输入区域
-  vim.api.nvim_buf_set_extmark(buf, ns_highlight, M.input_start_line, 0, {
-    end_row = M.input_end_line + 1,
-    hl_group = "NeoAIInput",
-    hl_eol = true,
-  })
-
-  -- 记录当前缓冲区行数
-  M._last_buffer_line_count = vim.api.nvim_buf_line_count(buf)
-
-  M.adjust_window_size(max_width, #lines)
-  M.set_window_wrap()
-
-  -- 恢复光标或滚动到底部
-  if is_win_valid(M.windows.main) then
-    local last_line = vim.api.nvim_buf_line_count(buf)
-    if save_cursor and save_cursor[1] <= last_line then
-      pcall(vim.api.nvim_win_set_cursor, M.windows.main, save_cursor)
-    else
-      vim.api.nvim_win_set_cursor(M.windows.main, { M.input_start_line + 1, 0 })
-    end
-  end
-
-  -- 刷新树视图
+  -- 刷新树视图（如果应该显示）
   if M.should_show_tree() and is_win_valid(M.windows.tree) and is_buf_valid(M.tree_buffers.main) then
     M.render_session_tree()
   end
@@ -2502,7 +2657,7 @@ function M.setup(user_config)
 
   -- 消息添加事件：更新显示并定位光标到输入行
   backend.on("message_added", function(data)
-    M.update_display_debounced() -- 防抖更新显示
+    M.update_display_debounced.message() -- 防抖更新显示
     -- 每轮对话结束后自动定位光标到输入行
     vim.defer_fn(function()
       M.focus_input_line()
@@ -2527,17 +2682,17 @@ function M.setup(user_config)
 
   -- 消息删除事件：刷新显示
   backend.on("message_deleted", function(data)
-    M.update_display_debounced()
+    M.update_display_debounced.delete()
     -- 自动同步数据
     backend.debounce_sync(data.session_id)
   end)
 
   -- AI 回复完成事件：刷新显示并定位光标
   backend.on("ai_replied", function(data)
-    M.update_display_debounced()
+    M.update_display_debounced.reply()
     -- AI回复完成后，异步等待渲染完成再定位光标
     vim.defer_fn(function()
-      if M.update_display_debounced then
+      if M.update_display_debounced.reply then
         -- 等待防抖更新完成
         vim.defer_fn(function()
           M.focus_input_line()
@@ -2562,10 +2717,10 @@ function M.setup(user_config)
 
   -- 响应接收事件：刷新显示并定位光标
   backend.on("response_received", function(data)
-    M.update_display_debounced()
+    M.update_display_debounced.response()
     -- 响应接收后，异步等待渲染完成再定位光标
     vim.defer_fn(function()
-      if M.update_display_debounced then
+      if M.update_display_debounced.response then
         -- 等待防抖更新完成
         vim.defer_fn(function()
           M.focus_input_line()
@@ -2578,7 +2733,7 @@ function M.setup(user_config)
 
   -- 会话创建事件：刷新显示
   backend.on("session_created", function(data)
-    M.update_display_debounced()
+    M.update_display_debounced.session()
     -- 自动同步数据
     backend.debounce_sync(data.id)
   end)
@@ -2602,7 +2757,7 @@ function M.setup(user_config)
         M.setup_tree_cursor_autocmd()
       end)
     end
-    M.update_display_debounced()
+    M.update_display_debounced.turn()
     backend.debounce_sync(data.session_id)
   end)
 
@@ -2618,7 +2773,7 @@ function M.setup(user_config)
         M.setup_tree_cursor_autocmd()
       end)
     end
-    M.update_display_debounced()
+    M.update_display_debounced.turn()
     backend.debounce_sync(data.session_id or M.current_session)
 
     -- 提示：数据已持久化
@@ -2641,16 +2796,28 @@ function M.setup(user_config)
     end,
   })
 
-  -- 当前缓冲区所在窗口大小调整事件：重新计算分隔线和内容宽度
+  -- 窗口大小调整事件：重新渲染整个界面（tree 和 chat）
   vim.api.nvim_create_autocmd("WinResized", {
     group = group,
     pattern = "*",
     callback = function()
-      if M.is_open and is_win_valid(M.windows.main) then
-        local changed_win = vim.v.event.window
-        if changed_win == M.windows.main or (is_win_valid(M.windows.tree) and changed_win == M.windows.tree) then
-          M.schedule_resize()
-        end
+      if M.is_open then
+        -- 防抖后重新渲染整个界面（包括聊天和树视图）
+        vim.defer_fn(function()
+          if not M.is_open then
+            return
+          end
+
+          -- 重新渲染聊天界面
+          if is_buf_valid(M.buffers.main) then
+            M._render_chat_interface()
+          end
+
+          -- 重新渲染树视图
+          if M.should_show_tree() and is_buf_valid(M.tree_buffers.main) then
+            M._render_tree_interface()
+          end
+        end, 100)
       end
     end,
   })
