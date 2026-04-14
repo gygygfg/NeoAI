@@ -29,85 +29,158 @@ M._reasoning_float_buffers = {} -- 推理浮动窗口缓冲区 {message_id = buf
 M._last_reasoning_len_for_float = 0 -- 上次推理内容长度（用于检测停止增长）
 M._no_reasoning_update_count = 0 -- 连续没有推理内容更新的次数
 
---- 关闭指定消息的推理浮动窗口
+-- ── 推理内容显示引擎（浮动窗口 → 折叠文本） ──────────────────────────────────
+-- 三阶段生命周期：
+--   1. start_reasoning(msg_id)    — 开启浮动窗口
+--   2. update_reasoning(msg_id)   — 实时更新浮动窗口文本
+--   3. finish_reasoning(msg_id)   — 关闭浮动窗口，变为折叠文本
+
+--- 推理显示配置表
+M.reasoning_config = {
+  max_width = 80,         -- 浮动窗口最大宽度
+  max_height = 8,         -- 浮动窗口最大高度
+  fold_on_finish = true,  -- 思考完成后是否默认折叠
+}
+
+-- 前向声明：这些函数在下方定义，引擎需要提前引用
+local sanitize_line, wrap_text, truncate_content, is_win_valid
+
+--- 推理显示状态管理（内部）
+local reasoning_engine = {
+  config = M.reasoning_config,  -- 引用配置表
+  -- { message_id = {
+  --   phase = "idle" | "thinking" | "finished",
+  --   float_win = nil,          -- 浮动窗口 ID
+  --   float_buf = nil,          -- 浮动窗口缓冲区 ID
+  --   anchor_win = nil,         -- 锚点窗口
+  --   anchor_row = nil,         -- 锚点行
+  --   text = "",                -- 当前推理文本
+  --   fold_state = false,       -- 折叠状态（仅在 finished 阶段有效）
+  -- } }
+  states = {},
+}
+
+--- 获取推理显示状态
 -- @param message_id 消息ID
-function M.close_reasoning_float(message_id)
-  local win_id = M._reasoning_float_wins[message_id]
-  if win_id and vim.api.nvim_win_is_valid(win_id) then
-    vim.api.nvim_win_close(win_id, true)
+-- @return table 状态对象
+local function get_state(message_id)
+  if not reasoning_engine.states[message_id] then
+    reasoning_engine.states[message_id] = {
+      phase = "idle",
+      float_win = nil,
+      float_buf = nil,
+      anchor_win = nil,
+      anchor_row = nil,
+      text = "",
+      fold_state = false,
+    }
   end
-  M._reasoning_float_wins[message_id] = nil
-  M._reasoning_float_buffers[message_id] = nil
+  return reasoning_engine.states[message_id]
 end
 
---- 为推理内容创建浮动窗口
+--- 清理指定消息的浮动窗口
 -- @param message_id 消息ID
--- @param reasoning_text 推理内容
--- @param anchor_win 锚点窗口（通常是主窗口）
--- @param anchor_row 锚点行（相对于窗口的行号）
--- @return number 浮动窗口ID
-function M.create_reasoning_float_window(message_id, reasoning_text, anchor_win, anchor_row)
-  -- 先关闭已存在的浮动窗口
-  M.close_reasoning_float(message_id)
-  
-  -- 创建缓冲区
-  local buf = vim.api.nvim_create_buf(false, true)
-  M._reasoning_float_buffers[message_id] = buf
-  
-  -- 设置缓冲区内容（自动换行）
+local function destroy_float(message_id)
+  local state = reasoning_engine.states[message_id]
+  if not state then return end
+
+  if state.float_win and vim.api.nvim_win_is_valid(state.float_win) then
+    vim.api.nvim_win_close(state.float_win, true)
+  end
+  state.float_win = nil
+  state.float_buf = nil
+end
+
+--- 创建或更新浮动窗口内容
+-- @param state 推理状态对象
+local function refresh_float(state)
+  if not state.float_win or not vim.api.nvim_win_is_valid(state.float_win) then
+    return
+  end
+
+  local buf = state.float_buf
+  if not buf or not vim.api.nvim_buf_is_valid(buf) then
+    return
+  end
+
+  -- 格式化文本为行数组（自动换行）
+  local width = reasoning_engine.config.max_width - 2
   local lines = {}
-  local float_width = math.min(80, vim.o.columns - 5)
-  local max_width = float_width - 2
-  
-  for line in reasoning_text:gmatch("[^\r\n]+") do
-    -- Inline sanitize logic: remove newlines and malformed tags
-    local cleaned = tostring(line):gsub("[\r\n]+", " "):gsub("<%x%x>", "")
-    
-    -- Inline wrap_text logic (UTF-8 aware)
-    local wrapped = {}
-    local current = ""
-    for ch in cleaned:gmatch("[%z\1-\127\194-\244][\128-\191]*") do
-      if #current + #ch <= max_width or current == "" then
-        current = current .. ch
-      else
-        table.insert(wrapped, current)
-        current = ch
-      end
-    end
-    if current ~= "" then
-      table.insert(wrapped, current)
-    end
-    if #wrapped == 0 then
-      table.insert(wrapped, cleaned)
-    end
-    
+  for line in state.text:gmatch("[^\r\n]+") do
+    local cleaned = sanitize_line(line)
+    local wrapped = wrap_text(cleaned, width)
     for _, wl in ipairs(wrapped) do
       table.insert(lines, wl)
     end
   end
-  if #lines == 0 then
-    table.insert(lines, "暂无思考内容")
+
+  -- 限制显示行数（超出部分截断，显示提示）
+  local max_h = reasoning_engine.config.max_height
+  if #lines > max_h then
+    local cutoff = max_h - 1
+    local shown = {}
+    for i = 1, cutoff do
+      table.insert(shown, lines[i])
+    end
+    local remaining = #lines - cutoff
+    table.insert(shown, string.format("  ... 还有 %d 行", remaining))
+    lines = shown
   end
 
+  if #lines == 0 then
+    table.insert(lines, "思考中...")
+  end
+
+  -- 更新缓冲区内容
+  vim.api.nvim_set_option_value('modifiable', true, { buf = buf })
   vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
   vim.api.nvim_set_option_value('modifiable', false, { buf = buf })
-  vim.api.nvim_set_option_value('readonly', true, { buf = buf })
+
+  -- 滚动到底部
+  local line_count = vim.api.nvim_buf_line_count(buf)
+  pcall(vim.api.nvim_win_set_cursor, state.float_win, { line_count, 0 })
+end
+
+--- 阶段 1：开启推理浮动窗口
+-- @param message_id 消息ID
+-- @param anchor_win 锚点窗口（通常是主窗口）
+-- @param anchor_row 锚点行（相对于窗口的行号）
+function M.start_reasoning(message_id, anchor_win, anchor_row)
+  local state = get_state(message_id)
+  state.phase = "thinking"
+  state.text = ""
+  state.anchor_win = (anchor_win and is_win_valid(anchor_win)) and anchor_win or M.windows.main
+  state.anchor_row = anchor_row
+
+  -- 守护检查：锚点窗口必须有效
+  if not is_win_valid(state.anchor_win) then
+    return
+  end
+
+  -- 销毁旧浮动窗口
+  destroy_float(message_id)
+
+  -- 创建新缓冲区
+  local buf = vim.api.nvim_create_buf(false, true)
+  state.float_buf = buf
+
   vim.api.nvim_set_option_value('buftype', 'nofile', { buf = buf })
   vim.api.nvim_set_option_value('filetype', 'NeoAIReasoning', { buf = buf })
 
-  -- 计算浮动窗口位置（相对于编辑器）
-  local win_config = vim.api.nvim_win_get_config(anchor_win)
+  -- 计算浮动窗口位置
+  local ok, win_config = pcall(vim.api.nvim_win_get_config, state.anchor_win)
+  if not ok then
+    return
+  end
   local win_row = win_config.row or 0
   local win_col = win_config.col or 0
 
-  -- 获取光标位置或指定的锚点行
-  local cursor = vim.api.nvim_win_get_cursor(anchor_win)
-  local target_row = anchor_row or cursor[1]
+  local ok2, cursor = pcall(vim.api.nvim_win_get_cursor, state.anchor_win)
+  local target_row = anchor_row or (ok2 and cursor[1] or 1)
 
-  -- 浮动窗口配置
-  local float_width = math.min(80, vim.o.columns - win_col - 5)
-  local float_height = 5
-  local float_row = win_row + target_row - vim.fn.line('w0', anchor_win) + 1
+  local float_width = reasoning_engine.config.max_width
+  local float_height = reasoning_engine.config.max_height
+  local float_row = win_row + target_row - vim.fn.line('w0', state.anchor_win) + 1
   local float_col = win_col + 2
 
   -- 确保不超出屏幕
@@ -128,7 +201,7 @@ function M.create_reasoning_float_window(message_id, reasoning_text, anchor_win,
     zindex = 100,
   })
 
-  -- 设置窗口选项（这些是窗口本地选项）
+  -- 设置窗口选项
   vim.api.nvim_set_option_value('wrap', true, { win = win_id })
   vim.api.nvim_set_option_value('linebreak', true, { win = win_id })
   vim.api.nvim_set_option_value('breakindent', false, { win = win_id })
@@ -137,28 +210,222 @@ function M.create_reasoning_float_window(message_id, reasoning_text, anchor_win,
   vim.api.nvim_set_option_value('signcolumn', 'no', { win = win_id })
   vim.api.nvim_set_option_value('foldenable', false, { win = win_id })
   vim.api.nvim_set_option_value('winhl', 'NormalFloat:CommentFloat', { win = win_id })
-  
+
+  state.float_win = win_id
+
+  -- 同步到旧的兼容表
   M._reasoning_float_wins[message_id] = win_id
-  
-  return win_id
+  M._reasoning_float_buffers[message_id] = buf
+end
+
+--- 阶段 2：更新推理文本（实时追加）
+-- @param message_id 消息ID
+-- @param text 新增的推理文本（追加到现有内容）
+function M.update_reasoning(message_id, text)
+  local state = get_state(message_id)
+  if state.phase ~= "thinking" then
+    return
+  end
+
+  if text and text ~= "" then
+    state.text = state.text .. text
+  end
+
+  refresh_float(state)
+end
+
+--- 阶段 3：完成推理，关闭浮动窗口，变为折叠文本
+-- @param message_id 消息ID
+-- @param fold_on_finish 是否默认折叠（可选，默认使用配置）
+function M.finish_reasoning(message_id, fold_on_finish)
+  local state = get_state(message_id)
+  if state.phase ~= "thinking" then
+    return
+  end
+
+  state.phase = "finished"
+  state.fold_state = (fold_on_finish ~= nil) and fold_on_finish or reasoning_engine.config.fold_on_finish
+
+  -- 关闭浮动窗口
+  destroy_float(message_id)
+
+  -- 同步到旧的兼容表
+  M._reasoning_float_wins[message_id] = nil
+  M._reasoning_float_buffers[message_id] = nil
+  M._reasoning_fold_state[message_id] = state.fold_state
+end
+
+--- 获取推理内容在正文中的显示行（用于 _build_chat_content 调用）
+-- 根据当前阶段和折叠状态生成正确的显示行
+-- @param message_id 消息ID
+-- @param max_width 最大行宽
+-- @return table 显示行数组
+function M.get_reasoning_display_lines(message_id, max_width)
+  local state = reasoning_engine.states[message_id]
+  if not state or state.text == "" then
+    return {}
+  end
+
+  local total_lines = 0
+  for _ in state.text:gmatch("[^\r\n]+") do
+    total_lines = total_lines + 1
+  end
+
+  if total_lines == 0 then
+    return {}
+  end
+
+  local result = {}
+
+  if state.phase == "thinking" then
+    -- 思考中：只显示标题行（内容在浮动窗口中）
+    local float_visible = state.float_win and vim.api.nvim_win_is_valid(state.float_win)
+    local icon = float_visible and "▼" or "▶"
+    table.insert(result, string.format("  %s [思考中，共 %d 行] 浮动窗口", icon, total_lines))
+  elseif state.phase == "finished" then
+    -- 思考完成：根据折叠状态显示
+    local icon = state.fold_state and "▶" or "▼"
+    table.insert(result, string.format("  %s [思考完成，共 %d 行] 点击展开/折叠", icon, total_lines))
+
+    -- 展开状态：显示全部内容
+    if not state.fold_state then
+      for line in state.text:gmatch("[^\r\n]+") do
+        local cleaned = truncate_content(sanitize_line(line), max_width - 6)
+        table.insert(result, "    " .. cleaned)
+      end
+    end
+  end
+
+  return result
 end
 
 --- 切换推理内容的折叠状态
 -- @param message_id 消息ID
 function M.toggle_reasoning_fold(message_id)
-  M._reasoning_fold_state[message_id] = not M._reasoning_fold_state[message_id]
-  M.update_display()
+  local state = reasoning_engine.states[message_id]
+  if state and state.phase == "finished" then
+    state.fold_state = not state.fold_state
+    M._reasoning_fold_state[message_id] = state.fold_state
+    M.update_display()
+  end
 end
 
 --- 判断推理内容是否处于折叠状态
 -- @param message_id 消息ID
 -- @return boolean true=折叠，false=展开
 function M.is_reasoning_folded(message_id)
-  -- 默认：思考中时展开，思考完成后折叠
+  local state = reasoning_engine.states[message_id]
+  if state then
+    if state.phase == "finished" then
+      return state.fold_state
+    end
+    return false -- 思考中默认展开
+  end
+  -- 回退到旧兼容表
   if M._reasoning_fold_state[message_id] == nil then
-    return false -- 默认展开
+    return false
   end
   return M._reasoning_fold_state[message_id]
+end
+
+--- 关闭指定消息的推理浮动窗口（兼容旧接口）
+-- @param message_id 消息ID
+function M.close_reasoning_float(message_id)
+  destroy_float(message_id)
+  M._reasoning_float_wins[message_id] = nil
+  M._reasoning_float_buffers[message_id] = nil
+end
+
+--- 为推理内容创建浮动窗口（兼容旧接口，内部使用引擎）
+-- @param message_id 消息ID
+-- @param reasoning_text 推理内容
+-- @param anchor_win 锚点窗口
+-- @param anchor_row 锚点行
+-- @return number 浮动窗口ID
+function M.create_reasoning_float_window(message_id, reasoning_text, anchor_win, anchor_row)
+  local state = get_state(message_id)
+  if state.float_win and vim.api.nvim_win_is_valid(state.float_win) then
+    destroy_float(message_id)
+  end
+
+  state.phase = "thinking"
+  state.text = reasoning_text or ""
+  state.anchor_win = (anchor_win and is_win_valid(anchor_win)) and anchor_win or M.windows.main
+  state.anchor_row = anchor_row
+
+  -- 守护检查
+  if not is_win_valid(state.anchor_win) then
+    return nil
+  end
+
+  -- 创建新缓冲区
+  local buf = vim.api.nvim_create_buf(false, true)
+  state.float_buf = buf
+
+  vim.api.nvim_set_option_value('buftype', 'nofile', { buf = buf })
+  vim.api.nvim_set_option_value('filetype', 'NeoAIReasoning', { buf = buf })
+
+  -- 格式化文本
+  local width = reasoning_engine.config.max_width - 2
+  local lines = {}
+  for line in (reasoning_text or ""):gmatch("[^\r\n]+") do
+    local cleaned = sanitize_line(line)
+    local wrapped = wrap_text(cleaned, width)
+    for _, wl in ipairs(wrapped) do
+      table.insert(lines, wl)
+    end
+  end
+  if #lines == 0 then
+    table.insert(lines, "暂无思考内容")
+  end
+
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+  vim.api.nvim_set_option_value('modifiable', false, { buf = buf })
+  vim.api.nvim_set_option_value('readonly', true, { buf = buf })
+
+  -- 计算位置
+  local ok, win_config = pcall(vim.api.nvim_win_get_config, state.anchor_win)
+  if not ok then return nil end
+  local win_row = win_config.row or 0
+  local win_col = win_config.col or 0
+  local ok2, cursor = pcall(vim.api.nvim_win_get_cursor, state.anchor_win)
+  local target_row = anchor_row or (ok2 and cursor[1] or 1)
+
+  local float_width = reasoning_engine.config.max_width
+  local float_height = math.min(reasoning_engine.config.max_height, #lines)
+  local float_row = win_row + target_row - vim.fn.line('w0', state.anchor_win) + 1
+  local float_col = win_col + 2
+
+  if float_row + float_height > vim.o.lines then
+    float_row = vim.o.lines - float_height - 2
+  end
+
+  local win_id = vim.api.nvim_open_win(buf, false, {
+    relative = 'editor',
+    row = math.max(0, float_row),
+    col = math.max(0, float_col),
+    width = float_width,
+    height = float_height,
+    style = 'minimal',
+    border = 'rounded',
+    focusable = false,
+    zindex = 100,
+  })
+
+  vim.api.nvim_set_option_value('wrap', true, { win = win_id })
+  vim.api.nvim_set_option_value('linebreak', true, { win = win_id })
+  vim.api.nvim_set_option_value('breakindent', false, { win = win_id })
+  vim.api.nvim_set_option_value('number', false, { win = win_id })
+  vim.api.nvim_set_option_value('relativenumber', false, { win = win_id })
+  vim.api.nvim_set_option_value('signcolumn', 'no', { win = win_id })
+  vim.api.nvim_set_option_value('foldenable', false, { win = win_id })
+  vim.api.nvim_set_option_value('winhl', 'NormalFloat:CommentFloat', { win = win_id })
+
+  state.float_win = win_id
+  M._reasoning_float_wins[message_id] = win_id
+  M._reasoning_float_buffers[message_id] = buf
+
+  return win_id
 end
 
 -- 判断是否应显示树视图（优先使用运行时切换状态，否则由后端决定）
@@ -268,7 +535,7 @@ end
 --- 检查窗口句柄是否有效
 -- @param win 窗口句柄
 -- @return boolean 是否有效
-local function is_win_valid(win)
+is_win_valid = function(win)
   return win and vim.api.nvim_win_is_valid(win)
 end
 
@@ -343,7 +610,7 @@ end
 -- @param text 原始文本
 -- @param max_width 最大宽度（字符数）
 -- @return table 换行后的行数组
-local function wrap_text(text, max_width)
+wrap_text = function(text, max_width)
   local wrapped = {}
   local current = ""
   for ch in text:gmatch("[%z\1-\127\194-\244][\128-\191]*") do
@@ -364,7 +631,7 @@ end
 -- @param content 原始内容
 -- @param max_chars 最大字符数（中文/英文都算 1 个字符）
 -- @return string 截断后的内容
-local function truncate_content(content, max_chars)
+truncate_content = function(content, max_chars)
   if not content or content == "" then
     return ""
   end
@@ -437,7 +704,7 @@ end
 --- 清理字符串中的换行符和乱码标记（如 <e5>、<e8><af> 等）
 -- @param str 输入字符串
 -- @return string 清理后的字符串
-local function sanitize_line(str)
+sanitize_line = function(str)
   if not str then
     return ""
   end
@@ -1422,244 +1689,85 @@ function M._render_chat_interface()
   end, 50)
 end
 
---- 为所有推理内容创建浮动窗口（仅为思考中的消息创建）
+--- 为所有推理内容创建浮动窗口（使用新引擎，仅为思考中的消息创建）
 -- 遍历会话消息，为思考中的消息创建浮动窗口
 function M._create_reasoning_float_windows()
   local session = backend.current_session and backend.sessions[backend.current_session]
   if not session or not session.messages then
     return
   end
-  
+
   if not is_win_valid(M.windows.main) or not is_buf_valid(M.buffers.main) then
     return
   end
-  
-  -- 遍历消息，为思考中的消息创建浮动窗口
+
+  -- 遍历消息，为思考中的消息创建/更新浮动窗口
   local current_line = 0
   for _, msg in ipairs(session.messages) do
     -- 标题行
     current_line = current_line + 1
-    
-    -- 检查是否有推理内容且正在思考中
+
+    -- 检查是否有推理内容
     if msg.metadata and msg.metadata.has_reasoning and msg.metadata.reasoning_content
-      and M.config.llm.show_reasoning and msg.pending then
-      -- 记录推理内容所在的行号
-      M._reasoning_line_for_msg[msg.id] = current_line
-      
-      -- 只为思考中的消息创建浮动窗口
-      M.create_reasoning_float_window(
-        msg.id, 
-        msg.metadata.reasoning_content, 
-        M.windows.main, 
-        current_line
-      )
-      
-      -- 跳过推理内容行（只有标题行）
-      current_line = current_line + 1
-    elseif msg.metadata and msg.metadata.has_reasoning and msg.metadata.reasoning_content
       and M.config.llm.show_reasoning then
-      -- 思考已完成的消息，只记录行号
+
+      local is_pending = msg.pending -- true = 思考中
+      local reasoning_text = msg.metadata.reasoning_content
+
+      -- 记录行号
       M._reasoning_line_for_msg[msg.id] = current_line
+
+      if is_pending then
+        -- 思考中：使用引擎更新浮动窗口
+        local state = reasoning_engine.states[msg.id]
+        if state and state.phase == "thinking" then
+          M.update_reasoning(msg.id, reasoning_text)
+        else
+          M.start_reasoning(msg.id, M.windows.main, current_line)
+          M.update_reasoning(msg.id, reasoning_text)
+        end
+      else
+        -- 思考已完成：确保引擎处于 finished 状态
+        local state = reasoning_engine.states[msg.id]
+        if not state or state.phase ~= "finished" then
+          get_state(msg.id)
+          reasoning_engine.states[msg.id].phase = "finished"
+          reasoning_engine.states[msg.id].text = reasoning_text
+          reasoning_engine.states[msg.id].fold_state = M._reasoning_fold_state[msg.id] or false
+          destroy_float(msg.id)
+          M._reasoning_float_wins[msg.id] = nil
+          M._reasoning_float_buffers[msg.id] = nil
+        end
+      end
+
       current_line = current_line + 1
     end
-    
+
     -- 跳过消息内容行
     local content_lines = wrap_message_content(msg.content or "", calculate_text_width() - 4)
     current_line = current_line + #content_lines
-    
+
     -- 跳过消息间的空行
     current_line = current_line + 1
   end
 end
 
--- ── 推理内容自动折叠显示 ────────────────────────────────────────────────────
-
--- 命名空间 ID（用于虚拟文本）
-local reasoning_ns_id = vim.api.nvim_create_namespace('NeoAIReasoningVirtualText')
-
--- 推理内容状态管理 {message_id = {word_queue, extmark_id, anchor_line, ...}}
-local reasoning_state = {}
-
--- 默认配置
-local REASONING_MAX_LINES = 5  -- 思考中时最多显示行数
-local REASONING_MAX_WIDTH = 80  -- 默认最大宽度，会自动更新
-
---- 获取当前窗口的可用宽度
-local function get_reasoning_available_width()
-  local win_width = 0
-  if is_win_valid(M.windows.main) then
-    win_width = vim.api.nvim_win_get_width(M.windows.main)
-  else
-    return REASONING_MAX_WIDTH
-  end
-  
-  local sign_width = 0
-  local number_width = 0
-  
-  -- 获取符号列宽度
-  local sc = vim.api.nvim_get_option_value("signcolumn", { win = M.windows.main })
-  if sc == "yes" or sc == "auto" then
-    sign_width = 2
-  end
-  
-  -- 获取行号列宽度
-  if vim.api.nvim_get_option_value("number", { win = M.windows.main })
-    or vim.api.nvim_get_option_value("relativenumber", { win = M.windows.main }) then
-    number_width = vim.api.nvim_get_option_value("numberwidth", { win = M.windows.main }) or 4
-  end
-  
-  return win_width - sign_width - number_width - 2  -- 减去边距
-end
-
---- 将推理文本格式化为显示行（支持自动换行）
--- @param word_queue 单词/行队列
--- @param width 最大宽度
--- @return table 格式化后的行数组
-local function format_reasoning_to_lines(word_queue, width)
-  width = width or get_reasoning_available_width()
-  local lines = {}
-  local current_line = ""
-  
-  for _, word in ipairs(word_queue) do
-    if current_line == "" then
-      current_line = word
-    else
-      local new_line = current_line .. " " .. word
-      if #new_line <= width then
-        current_line = new_line
-      else
-        table.insert(lines, current_line)
-        current_line = word
-      end
-    end
-  end
-  
-  if current_line ~= "" then
-    table.insert(lines, current_line)
-  end
-  
-  return lines
-end
-
---- 更新推理内容的虚拟文本显示
--- @param message_id 消息ID
--- @param buf 缓冲区句柄
--- @param anchor_line 锚点行（在缓冲区中的位置）
-local function update_reasoning_display(message_id, buf, anchor_line)
-  local state = reasoning_state[message_id]
-  if not state or not is_buf_valid(buf) then
-    return
-  end
-  
-  -- 计算所有行
-  local all_lines = format_reasoning_to_lines(state.word_queue, get_reasoning_available_width())
-  
-  -- 只保留最后 REASONING_MAX_LINES 行
-  local display_lines = {}
-  local start_idx = math.max(1, #all_lines - REASONING_MAX_LINES + 1)
-  for i = start_idx, #all_lines do
-    table.insert(display_lines, all_lines[i])
-  end
-  
-  -- 构建虚拟行数据（带语法高亮）
-  local virt_lines_data = {}
-  for _, line in ipairs(display_lines) do
-    table.insert(virt_lines_data, {{line, "Comment"}})
-  end
-  
-  -- 清除旧的 extmark
-  vim.api.nvim_buf_clear_namespace(buf, reasoning_ns_id, 0, -1)
-  
-  -- 创建新的 extmark（在锚点行上方显示）
-  state.extmark_id = vim.api.nvim_buf_set_extmark(buf, reasoning_ns_id, anchor_line, 0, {
-    virt_lines = virt_lines_data,
-    virt_lines_above = true,
-    hl_mode = "combine",
-    id = state.extmark_id,  -- 复用已有的 ID
-  })
-end
-
---- 添加推理内容到消息队列
--- @param message_id 消息ID
--- @param text 新增的推理文本
--- @param buf 缓冲区句柄
--- @param anchor_line 锚点行
-function M.add_reasoning_text(message_id, text, buf, anchor_line)
-  if not text or text == "" then
-    return
-  end
-  
-  -- 初始化状态
-  if not reasoning_state[message_id] then
-    reasoning_state[message_id] = {
-      word_queue = {},
-      extmark_id = nil,
-      anchor_line = anchor_line,
-    }
-  end
-  
-  local state = reasoning_state[message_id]
-  
-  -- 简单的分词，按空格和换行分割
-  for word in text:gmatch("%S+") do
-    table.insert(state.word_queue, word)
-  end
-  
-  -- 更新显示
-  update_reasoning_display(message_id, buf, anchor_line)
-end
-
---- 完成推理内容显示
--- @param message_id 消息ID
--- @param buf 缓冲区句柄
--- @param is_fold_completed 是否折叠已完成的内容
--- @return table 完成后的全部显示行
-function M.complete_reasoning(message_id, buf, is_fold_completed)
-  local state = reasoning_state[message_id]
-  if not state then
-    return {}
-  end
-  
-  -- 清除虚拟文本
-  if is_buf_valid(buf) then
-    vim.api.nvim_buf_clear_namespace(buf, reasoning_ns_id, 0, -1)
-  end
-  
-  -- 生成最终的显示行
-  local all_lines = format_reasoning_to_lines(state.word_queue, get_reasoning_available_width())
-  
-  -- 如果已完成且需要折叠，只保留标题行
-  if is_fold_completed then
-    local result = {}
-    local total_lines = #all_lines
-    local header = string.format("  ▼ [思考完成，共 %d 行] 点击折叠/展开", total_lines)
-    table.insert(result, header)
-    -- 不添加内容行（已折叠）
-    return result
-  end
-  
-  -- 否则返回全部行
-  local result = {}
-  for _, line in ipairs(all_lines) do
-    if line and line ~= "" then
-      table.insert(result, "    " .. sanitize_line(line))
-    end
-  end
-  
-  return result
-end
-
---- 清理推理内容状态
+-- ── 旧兼容层：清理所有推理状态 ───────────────────────────────────────────────
+-- 窗口大小变化时调用，清理所有推理引擎状态
 -- @param message_id 消息ID（可选，不提供则清理所有）
 function M.cleanup_reason_state(message_id)
   if message_id then
-    reasoning_state[message_id] = nil
+    destroy_float(message_id)
+    reasoning_engine.states[message_id] = nil
   else
-    reasoning_state = {}
+    for msg_id, _ in pairs(reasoning_engine.states) do
+      destroy_float(msg_id)
+    end
+    reasoning_engine.states = {}
   end
 end
 
---- 构建推理内容显示行（内部辅助函数）
+--- 构建推理内容显示行（内部辅助函数，委托给新引擎）
 -- 思考中时使用浮动窗口，思考完成后变为折叠文本
 -- @param reasoning_text 推理内容字符串
 -- @param max_width 最大宽度
@@ -1667,50 +1775,29 @@ end
 -- @param message_id 消息ID（用于跟踪折叠状态）
 -- @return table 推理内容行数组
 local function build_reasoning_lines(reasoning_text, max_width, is_complete, message_id)
-  local reasoning_lines_list = {}
-  for line in reasoning_text:gmatch("[^\r\n]+") do
-    table.insert(reasoning_lines_list, line)
+  -- 同步文本到引擎状态
+  local state = get_state(message_id)
+
+  if is_complete and state.phase == "thinking" then
+    -- 思考完成：切换到 finished 阶段
+    state.phase = "finished"
+    state.fold_state = reasoning_engine.config.fold_on_finish
+    state.text = reasoning_text or ""
+    destroy_float(message_id)
+    M._reasoning_float_wins[message_id] = nil
+    M._reasoning_float_buffers[message_id] = nil
+    M._reasoning_fold_state[message_id] = state.fold_state
+  elseif not is_complete and state.phase == "idle" then
+    -- 首次检测到推理：开始 thinking 阶段
+    state.phase = "thinking"
+    state.text = reasoning_text or ""
+  elseif not is_complete then
+    -- 更新推理文本
+    state.text = reasoning_text or ""
   end
 
-  local total_lines = #reasoning_lines_list
-  local result = {}
-
-  if total_lines == 0 then
-    return {}
-  end
-
-  -- 构建标题行
-  local status_text = is_complete and "思考完成" or "思考中"
-
-  -- 思考中：使用浮动窗口显示
-  if not is_complete then
-    local float_visible = M._reasoning_float_wins[message_id] ~= nil
-    local fold_icon = float_visible and "▼" or "▶"
-    local header = string.format("  %s [%s，共 %d 行] 浮动窗口", fold_icon, status_text, total_lines)
-    table.insert(result, header)
-    -- 不在正文中显示内容，浮动窗口会显示
-    return result
-  end
-
-  -- 思考完成后：使用折叠文本显示
-  local folded = M.is_reasoning_folded(message_id)
-  local fold_icon = folded and "▶" or "▼"
-  local header = string.format("  %s [%s，共 %d 行] 点击展开/折叠", fold_icon, status_text, total_lines)
-  table.insert(result, header)
-
-  -- 根据折叠状态决定是否显示内容
-  if not folded then
-    -- 展开状态：显示全部内容
-    for i = 1, total_lines do
-      local display_line = reasoning_lines_list[i]
-      if display_line and display_line ~= "" then
-        local truncated = truncate_content(sanitize_line(display_line), max_width - 6)
-        table.insert(result, "    " .. truncated)
-      end
-    end
-  end
-
-  return result
+  -- 委托给引擎生成显示行
+  return M.get_reasoning_display_lines(message_id, max_width)
 end
 
 --- 构建聊天内容（内部辅助函数）
@@ -2927,11 +3014,17 @@ end
 -- 将光标移动到缓冲区底部的输入区域，方便用户继续输入
 function M.focus_input_line()
   if M.input_start_line and is_buf_valid(M.buffers.main) and is_win_valid(M.windows.main) then
+    local line_count = vim.api.nvim_buf_line_count(M.buffers.main)
+    local target_line = M.input_start_line + 1 -- +1 因为 cursor 是 1-indexed
     -- 确保输入区域只有 1 行高
     if M.input_end_line and M.input_end_line > M.input_start_line then
       M.input_end_line = M.input_start_line
     end
-    vim.api.nvim_win_set_cursor(M.windows.main, { M.input_start_line + 1, 0 }) -- +1 因为 cursor 是 1-indexed
+    -- 边界检查：确保目标行在缓冲区范围内
+    if target_line > line_count then
+      target_line = math.max(1, line_count)
+    end
+    pcall(vim.api.nvim_win_set_cursor, M.windows.main, { target_line, 0 })
   end
 end
 
@@ -3248,17 +3341,13 @@ function M.setup(user_config)
 
   -- AI 回复完成事件：刷新显示并定位光标
   backend.on("ai_replied", function(data)
-    -- 思考完成时：关闭推理浮动窗口，并将内容设为折叠状态
-    if data.message and data.message.id then
+    -- 思考完成时：调用引擎关闭浮动窗口并变为折叠文本
+    if data.message and data.message.id and data.message.metadata
+       and data.message.metadata.has_reasoning then
       local msg_id = data.message.id
-      -- 关闭浮动窗口
-      M.close_reasoning_float(msg_id)
+      M.finish_reasoning(msg_id, true) -- 思考完成后默认折叠
       M._last_reasoning_len_for_float = 0
       M._no_reasoning_update_count = 0
-      -- 将推理内容设为折叠状态（思考完成后默认折叠）
-      if data.message.metadata and data.message.metadata.has_reasoning then
-        M._reasoning_fold_state[msg_id] = true
-      end
     end
     M.update_display_debounced.reply()
     -- AI回复完成后，异步等待渲染完成再定位光标
@@ -3278,25 +3367,26 @@ function M.setup(user_config)
   backend.on("ai_stream_update", function(data)
     -- 立即更新显示，不使用防抖（需要实时显示流式内容）
     M.update_display()
-    
+
     -- 检测推理内容是否已停止更新（思考完成但回复还在继续）
-    -- 策略：记录每次更新时是否有推理内容，如果连续多次没有，说明思考已完成
+    -- 使用新引擎状态判断
     vim.defer_fn(function()
       if data.message and data.message.id and data.message.metadata then
         local msg_id = data.message.id
-        local float_win = M._reasoning_float_wins[msg_id]
-        
-        -- 如果浮动窗口存在，检查推理内容是否停止
-        if float_win and vim.api.nvim_win_is_valid(float_win) then
+        local state = reasoning_engine.states[msg_id]
+
+        -- 如果引擎处于 thinking 阶段，检查推理内容是否停止
+        if state and state.phase == "thinking" and state.float_win
+           and vim.api.nvim_win_is_valid(state.float_win) then
           local current_reasoning = data.message.metadata.reasoning_content or ""
           local current_len = #current_reasoning
           local prev_len = M._last_reasoning_len_for_float or 0
-          
+
           -- 如果推理内容长度没有变化，增加计数
           if current_len > 0 and current_len == prev_len then
             M._no_reasoning_update_count = (M._no_reasoning_update_count or 0) + 1
-            
-            -- 如果连续 3 次没有更新，关闭浮动窗口
+
+            -- 如果连续 3 次没有更新，关闭浮动窗口（引擎会处理状态转换）
             if M._no_reasoning_update_count >= 3 then
               M.close_reasoning_float(msg_id)
               M._no_reasoning_update_count = 0
@@ -3305,12 +3395,12 @@ function M.setup(user_config)
             -- 有更新或刚开始，重置计数
             M._no_reasoning_update_count = 0
           end
-          
+
           M._last_reasoning_len_for_float = current_len
         end
       end
     end, 150)
-    
+
     -- 光标跟随到输入行
     vim.defer_fn(function()
       M.focus_input_line()
@@ -3324,20 +3414,34 @@ function M.setup(user_config)
     -- 重置长度跟踪和计数（思考还在进行中）
     M._last_reasoning_len_for_float = 0
     M._no_reasoning_update_count = 0
-    
-    -- 立即更新显示以更新推理内容虚拟文本
-    if M.config.llm.show_reasoning and is_buf_valid(M.buffers.main) then
+
+    -- 使用新引擎：启动或更新推理浮动窗口
+    if M.config.llm.show_reasoning and is_buf_valid(M.buffers.main) and data.message then
+      local msg = data.message
+      local msg_id = msg.id
+      local reasoning_text = msg.metadata and msg.metadata.reasoning_content or ""
+
+      local state = reasoning_engine.states[msg_id]
+
+      if state and state.phase == "thinking" then
+        -- 引擎已在 thinking 阶段，直接更新文本
+        M.update_reasoning(msg_id, reasoning_text)
+      else
+        -- 首次启动：计算锚点行
+        local anchor_row = M._reasoning_line_for_msg[msg_id]
+        M.start_reasoning(msg_id, M.windows.main, anchor_row)
+        M.update_reasoning(msg_id, reasoning_text)
+      end
+
       M.update_display()
-      
+
       -- 滚动浮动窗口到底部
       vim.defer_fn(function()
-        local msg = data.message
-        if msg and msg.id then
-          local float_win = M._reasoning_float_wins[msg.id]
+        if msg_id then
+          local float_win = M._reasoning_float_wins[msg_id]
           if float_win and vim.api.nvim_win_is_valid(float_win) then
             local buf = vim.api.nvim_win_get_buf(float_win)
             local line_count = vim.api.nvim_buf_line_count(buf)
-            -- 将光标移动到底部并滚动
             vim.api.nvim_win_set_cursor(float_win, { line_count, 0 })
             vim.api.nvim_win_call(float_win, function()
               vim.cmd("normal! Gzb")
