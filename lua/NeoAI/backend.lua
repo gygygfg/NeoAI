@@ -214,8 +214,8 @@ function M.save_buffer_edit(session_id, message_id, buf, start_line, end_line)
 end
 
 --- 计算推理内容在UI中占用的行数（与 ui.lua 中的 build_reasoning_lines 保持一致）
--- 流式阶段：标题行 + min(行数, 5)（展开状态）
--- 完成后：标题行 + 全部行数（展开状态）或仅标题行（折叠状态）
+-- 思考中：1 行（标题行）
+-- 完成后：1 行（标题行）或 1 + 全部行数（展开状态）
 -- @param reasoning_text 推理内容字符串
 -- @param max_width 最大宽度
 -- @param is_complete 思考是否已完成
@@ -225,19 +225,24 @@ local function count_reasoning_display_lines(reasoning_text, max_width, is_compl
   if not reasoning_text or reasoning_text == "" then
     return 0
   end
-  
-  local line_count = 0
-  for _ in reasoning_text:gmatch("[^\r\n]+") do
-    line_count = line_count + 1
+
+  -- 思考中：只有标题行
+  if not is_complete then
+    return 1
   end
-  
-  -- 查询折叠状态（使用 ui 模块的函数）
+
+  -- 思考完成后：查询折叠状态
   local ui = require("NeoAI.ui")
   local folded = ui.is_reasoning_folded(message_id)
-  
+
   if folded then
     return 1 -- 仅标题行
   else
+    -- 计算内容行数
+    local line_count = 0
+    for _ in reasoning_text:gmatch("[^\r\n]+") do
+      line_count = line_count + 1
+    end
     return 1 + line_count -- 标题行 + 全部内容
   end
 end
