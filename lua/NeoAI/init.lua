@@ -58,6 +58,12 @@ end
 --- 注册所有 NeoVim 用户命令和快捷键
 -- @param final_config 合并后的完整配置
 function M.setup_commands(final_config)
+  -- 设置全局快捷键
+  if final_config.keymaps and final_config.keymaps.open then
+    -- 打开聊天窗口
+    vim.keymap.set("n", final_config.keymaps.open, "<cmd>NeoAIOpen<CR>", { noremap = true, silent = true, desc = "NeoAI: 打开聊天窗口" })
+  end
+
   -- NeoAIOpen: 打开聊天窗口，支持模式参数
   vim.api.nvim_create_user_command("NeoAIOpen", function(opts)
     local mode = opts.args ~= "" and opts.args or final_config.ui.default_mode

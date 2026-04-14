@@ -67,8 +67,8 @@ M.defaults = {
 
   keymaps = {
     -- 快捷键配置 (Keymaps)
-    -- 打开聊天窗口，默认 <leader>cc (按 leader 键后按 c, c)
-    open = "<leader>cc",
+    -- 打开聊天窗口，默认 <leader>nc (按 leader 键后按 n, c)
+    open = "<leader>nc",
 
     -- 关闭聊天窗口，默认 q
     close = "q",
@@ -76,8 +76,8 @@ M.defaults = {
     -- 发送消息，默认 <leader>cs (按 leader 键后按 c, s)
     send = "<C-s>",
 
-    -- 新建对话，默认 <leader>cn (按 leader 键后按 c, n)
-    new = "<leader>cn",
+    -- 新建对话，默认 <leader>cn (按 leader 键后按 n, n)
+    new = "<leader>nn",
 
     -- 在输入行按回车发送消息（正常模式下）
     normal_mode_send = "<CR>",
