@@ -125,8 +125,10 @@ local function calculate_text_width()
 
   if target_win then
     -- 行号列宽度
-    if vim.api.nvim_get_option_value("number", { win = target_win }) or
-       vim.api.nvim_get_option_value("relativenumber", { win = target_win }) then
+    if
+      vim.api.nvim_get_option_value("number", { win = target_win })
+      or vim.api.nvim_get_option_value("relativenumber", { win = target_win })
+    then
       local nw = vim.api.nvim_get_option_value("numberwidth", { win = target_win })
       text_width = text_width - (tonumber(nw) or 4)
     end
@@ -176,15 +178,47 @@ local function wrap_text(text, max_width)
   return #wrapped > 0 and wrapped or { text }
 end
 
---- 截断过长的内容
+--- 截断过长的内容（正确支持 UTF-8 多字节字符）
 -- @param content 原始内容
--- @param max_len 最大长度
+-- @param max_chars 最大字符数（中文/英文都算 1 个字符）
 -- @return string 截断后的内容
-local function truncate_content(content, max_len)
-  if #content <= max_len then
+local function truncate_content(content, max_chars)
+  if not content or content == "" then
+    return ""
+  end
+  -- 统计字符数（使用 Lua 标准库的 string.len 和模式匹配处理 UTF-8）
+  local char_count = 0
+  local byte_idx = 1
+  local pos = 1
+  local len = #content
+
+  while pos <= len and char_count < max_chars do
+    local byte = content:byte(pos)
+    -- 确定 UTF-8 字符字节数
+    local char_len
+    if byte < 0x80 then
+      char_len = 1
+    elseif byte < 0xE0 then
+      char_len = 2
+    elseif byte < 0xF0 then
+      char_len = 3
+    elseif byte < 0xF8 then
+      char_len = 4
+    else
+      char_len = 1 -- 无效字节，跳过
+    end
+
+    pos = pos + char_len
+    char_count = char_count + 1
+  end
+
+  if char_count < max_chars or pos > len then
     return content
   end
-  return content:sub(1, max_len) .. "..."
+
+  -- 截断到完整的字符边界
+  local truncated = content:sub(1, pos - 1)
+  return truncated .. "…"
 end
 
 --- 将消息内容按行换行处理
@@ -218,14 +252,36 @@ local function display_width(str)
   return #chinese_chars
 end
 
---- 清理字符串中的换行符
+--- 清理字符串中的换行符和乱码标记（如 <e5>、<e8><af> 等）
 -- @param str 输入字符串
 -- @return string 清理后的字符串
 local function sanitize_line(str)
   if not str then
     return ""
   end
-  return tostring(str):gsub("[\r\n]+", " ")
+  return tostring(str):gsub("[\r\n]+", " "):gsub("<%x%x>", "")
+end
+
+--- 根据缩进深度动态计算预览长度（越深的分支越短）
+-- @param tree_prefix 树形缩进前缀
+-- @param max_chars 最大字符数（默认 20）
+-- @return number 预览字符数（范围 5~max_chars）
+local function calc_preview_length(tree_prefix, max_chars)
+  max_chars = max_chars or 20
+  -- 计算缩进深度（每个 "│  " 或 "   " 或 "├─ " 或 "└─ " 算一级）
+  local depth = 0
+  local pos = 1
+  while pos <= #tree_prefix do
+    local segment = tree_prefix:sub(pos, pos + 2)
+    if segment == "│  " or segment == "   " or segment == "├─ " or segment == "└─ " then
+      depth = depth + 1
+      pos = pos + 3
+    else
+      pos = pos + 1
+    end
+  end
+  -- 深度越深，预览越短（范围 5~20）
+  return math.max(5, max_chars - depth)
 end
 
 --- 获取输入框分隔线字符
@@ -548,6 +604,8 @@ function M.setup_tree_cursor_autocmd()
   local ready_timer = nil
   -- 跳转防抖定时器（防止过快触发）
   local jump_debounce_timer = nil
+  -- 树渲染版本计数器（用于检测删除/刷新后的状态重置）
+  local tree_render_version = 0
 
   -- 延迟启用跳转功能，等待树渲染完成
   local function enable_after_delay()
@@ -581,8 +639,20 @@ function M.setup_tree_cursor_autocmd()
       end
 
       local current_pos = vim.api.nvim_win_get_cursor(M.windows.tree)
-      local last_line = last_cursor_pos[1]
       local current_line = current_pos[1]
+
+      -- 检测树是否被重新渲染（版本号变化或总行数变化）
+      local buf_line_count = vim.api.nvim_buf_line_count(M.tree_buffers.main)
+      local current_version = M._tree_version or 0
+      if current_version ~= tree_render_version or buf_line_count < last_cursor_pos[1] then
+        -- 树已修改，重置导航状态
+        tree_render_version = current_version
+        last_cursor_pos = current_pos
+        last_target_line = nil
+        return
+      end
+
+      local last_line = last_cursor_pos[1]
 
       -- 只在行号改变时触发（忽略列移动）
       if current_line == last_line then
@@ -613,11 +683,16 @@ function M.setup_tree_cursor_autocmd()
         -- 创建快照（防止并发修改）
         local positions_snapshot = vim.deepcopy(session_positions) or {}
 
-        -- 收集所有对话轮次的行
+        -- 收集所有可导航的行（对话轮次 + 所有会话节点）
         local all_turn_lines = {}
         for line_num, pos in pairs(positions_snapshot) do
-          if pos and type(pos) == "table" and pos.type == "conversation_turn" then
-            table.insert(all_turn_lines, { line = line_num, turn_index = pos.turn_index, pos = pos })
+          if pos and type(pos) == "table" then
+            if pos.type == "conversation_turn" then
+              table.insert(all_turn_lines, { line = line_num, turn_index = pos.turn_index, pos = pos })
+            elseif pos.type == "session" and pos.id then
+              -- 所有会话节点都作为导航目标（包括空会话和有消息的会话）
+              table.insert(all_turn_lines, { line = line_num, turn_index = 0, pos = pos })
+            end
           end
         end
 
@@ -838,7 +913,7 @@ local function group_messages_into_turns(messages)
   return turns
 end
 
---- 渲染会话树（修复宽度不够问题）
+--- 渲染会话树（文件树样式，合并共享历史）
 -- 在树视图中展示所有会话及其消息预览，支持点击切换会话
 function M.render_session_tree()
   local buf = M.tree_buffers.main
@@ -855,38 +930,65 @@ function M.render_session_tree()
   local ns_bottom_hint = vim.api.nvim_create_namespace("NeoAITreeBottomHint")
   vim.api.nvim_buf_clear_namespace(buf, ns_bottom_hint, 0, -1)
 
+  -- 递增树渲染版本号（通知光标回调重置导航状态）
+  M._tree_version = (M._tree_version or 0) + 1
+
   local lines = {}
   local ns_id = vim.api.nvim_create_namespace("NeoAITree") -- 高亮命名空间
   M.tree_buffers.session_positions = {} -- 记录每行对应的会话/消息信息
+  M._next_line_num = 1 -- 显式追踪下一个行号（1-indexed，与 nvim_win_get_cursor 一致）
 
-  -- 标题（缩短以适配更小宽度）
-  local title = "📂 Chat History"
+  -- 标题
+  local title = "Chat History"
   local separator_len = 30
   table.insert(lines, "╭─ " .. title .. " ─" .. string.rep("─", separator_len) .. "╮")
+  M._next_line_num = M._next_line_num + 1
 
   if backend.sessions and #backend.sessions > 0 then
-    -- 遍历所有会话，渲染每个会话及其消息预览
+    -- 找出所有根会话（没有父节点或父节点不存在的会话）
+    local root_sessions = {}
     for session_id, session in pairs(backend.sessions) do
+      local graph = backend.session_graph[session_id]
+      if not graph or not graph.parent or not backend.sessions[graph.parent] then
+        table.insert(root_sessions, session_id)
+      end
+    end
+    table.sort(root_sessions)
+
+    -- 渲染每个根会话及其子树
+    for idx, session_id in ipairs(root_sessions) do
+      local is_last_root = (idx == #root_sessions)
+      local session = backend.sessions[session_id]
+      local prefix = is_last_root and "└─ " or "├─ "
+      local file_icon = "󰈙"
       local is_current = (session_id == backend.current_session)
-      local icon = is_current and "📁" or "📂" -- 当前会话用打开的文件夹图标
-      local session_info = string.format("%s %s (%d)", icon, sanitize_line(session.name), #session.messages)
+      local session_info =
+        string.format("%s%s %s (%d)", prefix, file_icon, sanitize_line(session.name), #session.messages)
       table.insert(lines, session_info)
 
-      local line_idx = #lines
-      -- 记录该行对应的会话信息（用于点击事件处理）
-      M.tree_buffers.session_positions[line_idx] = { type = "session", id = session_id, line = line_idx - 1 }
+      M.tree_buffers.session_positions[M._next_line_num] =
+        { type = "session", id = session_id, line = M._next_line_num - 1 }
+      M._next_line_num = M._next_line_num + 1
 
-      -- 渲染该会话的消息预览
-      M._render_session_messages(lines, session, session_id, is_current)
+      local child_prefix = is_last_root and "   " or "│  "
+      -- 递归渲染：合并共享历史，在分支点展开子节点
+      M._render_session_tree_recursive(lines, session_id, session, child_prefix, true)
+
       table.insert(lines, "") -- 会话间空行
+      M._next_line_num = M._next_line_num + 1
     end
   else
     -- 无会话时的提示
     table.insert(lines, "│")
+    M._next_line_num = M._next_line_num + 1
     table.insert(lines, "│  暂无会话")
+    M._next_line_num = M._next_line_num + 1
     table.insert(lines, "│")
+    M._next_line_num = M._next_line_num + 1
     table.insert(lines, "│  按 <CR> 创建新会话")
+    M._next_line_num = M._next_line_num + 1
     table.insert(lines, "")
+    M._next_line_num = M._next_line_num + 1
   end
 
   -- 写入缓冲区（不包含底部提示）
@@ -945,11 +1047,14 @@ function M.render_session_tree()
 
   -- 添加分隔线和提示行
   table.insert(lines, "")
+  M._next_line_num = M._next_line_num + 1
   local separator_line = #lines
   table.insert(lines, string.rep(M.get_separator_char(), separator_len))
+  M._next_line_num = M._next_line_num + 1
 
   for _, line in ipairs(hint_lines) do
     table.insert(lines, line)
+    M._next_line_num = M._next_line_num + 1
   end
 
   -- 重新写入包含提示的缓冲区
@@ -995,10 +1100,10 @@ function M.render_session_tree()
     vim.api.nvim_set_option_value("readonly", true, { buf = buf })
   end, 50)
 
-  -- 应用高亮（当前会话用 Todo 高亮，其他用 Normal）
+  -- 应用高亮（所有会话统一样式，不高亮当前会话）
   for line_num, pos in pairs(M.tree_buffers.session_positions) do
     if pos.type == "session" then
-      local hl = (pos.id == backend.current_session) and "Todo" or "Normal"
+      local hl = "Normal"
       local line_idx = line_num - 1
       local buf_line_count = vim.api.nvim_buf_line_count(buf)
       if line_idx >= 0 and line_idx < buf_line_count then
@@ -1021,54 +1126,230 @@ function M.render_session_tree()
   end, 10)
 end
 
---- 渲染会话消息
--- 在树视图中渲染单个会话的消息预览（按对话轮次展示）
+--- 递归渲染会话树（合并共享历史，在分支点展开子节点）
 -- @param lines 行数组（会被修改）
+-- @param session_id 当前会话 ID
 -- @param session 会话对象
--- @param session_id 会话ID
--- @param _ 是否为当前会话（当前未使用）
-function M._render_session_messages(lines, session, session_id, _)
-  if not session.messages or #session.messages == 0 then
-    table.insert(lines, "  └─ (空会话)")
+-- @param tree_prefix 树形缩进前缀
+-- @param is_last 是否为最后一个兄弟节点
+function M._render_session_tree_recursive(lines, session_id, session, tree_prefix, is_last)
+  local turns = group_messages_into_turns(session.messages or {})
+  if #turns == 0 then
+    local empty_line = tree_prefix .. "└─ (空会话)"
+    table.insert(lines, empty_line)
+    M.tree_buffers.session_positions[M._next_line_num] =
+      { type = "session", id = session_id, line = M._next_line_num - 1 }
+    M._next_line_num = M._next_line_num + 1
     return
   end
 
-  local turns = group_messages_into_turns(session.messages)
+  -- 找出所有子分支及其共同前缀轮次
+  local children = backend.get_children(session_id)
+  local child_info = {} -- { session_id, common_turns }
 
+  for _, child_id in ipairs(children) do
+    if backend.sessions[child_id] then
+      local common = backend.get_common_prefix_turns(session_id, child_id)
+      table.insert(child_info, { session_id = child_id, common_turns = common })
+    end
+  end
+
+  -- 计算最大分支点（所有子分支中最大的共同前缀轮次）
+  local max_branch_turn = 0
+  for _, info in ipairs(child_info) do
+    if info.common_turns > max_branch_turn then
+      max_branch_turn = info.common_turns
+    end
+  end
+
+  -- 按共同前缀轮次分组的子分支
+  local branches_by_turn = {}
+  for _, info in ipairs(child_info) do
+    if info.common_turns > 0 then
+      branches_by_turn[info.common_turns] = branches_by_turn[info.common_turns] or {}
+      table.insert(branches_by_turn[info.common_turns], info)
+    end
+  end
+
+  -- 渲染消息轮次
+  local preview_len = calc_preview_length(tree_prefix)
   for i = 1, #turns do
     local turn = turns[i]
-    local is_last = (i == #turns)
-    local indent = is_last and "  └─ " or "  ├─ " -- 最后一轮用 └─，其他用 ├─
+    local is_last_turn = (i == #turns) and (max_branch_turn == 0)
+    local line_prefix = tree_prefix .. (is_last_turn and "└─ " or "├─ ")
 
-    -- 用户消息预览（截断为40字符）
-    local user_preview = truncate_content(sanitize_line(turn.user_msg.content), 40)
+    -- 用户消息
+    local user_preview = truncate_content(sanitize_line(turn.user_msg.content), preview_len)
     local user_time = os.date("%H:%M", turn.user_msg.timestamp)
-    table.insert(lines, string.format("%s💬 [%s] %s", indent, user_time, user_preview))
+    table.insert(lines, string.format("%s💬 [%s] %s", line_prefix, user_time, user_preview))
 
-    local line_idx = #lines
-    -- 记录该行的位置信息（用于点击后跳转到对应消息）
-    M.tree_buffers.session_positions[line_idx] = {
+    M.tree_buffers.session_positions[M._next_line_num] = {
       type = "conversation_turn",
       session_id = session_id,
       turn_index = i,
       user_message_index = turn.index,
-      line = line_idx - 1,
+      line = M._next_line_num - 1,
     }
+    M._next_line_num = M._next_line_num + 1
 
-    -- 助手消息预览
+    -- 助手消息
     if turn.assistant_msg then
-      local asst_preview = truncate_content(sanitize_line(turn.assistant_msg.content), 45)
+      local asst_preview = truncate_content(sanitize_line(turn.assistant_msg.content), preview_len)
       local asst_time = os.date("%H:%M", turn.assistant_msg.timestamp)
-      local reply_indent = is_last and "     " or "  │  " -- 缩进样式
-      table.insert(lines, string.format("%s🤖 [%s] %s", reply_indent, asst_time, asst_preview))
+      local reply_prefix = tree_prefix .. (is_last_turn and "   " or "│  ")
+      table.insert(lines, string.format("%s🤖 [%s] %s", reply_prefix, asst_time, asst_preview))
 
-      local reply_idx = #lines
-      M.tree_buffers.session_positions[reply_idx] = {
+      M.tree_buffers.session_positions[M._next_line_num] = {
         type = "assistant_reply",
         session_id = session_id,
         turn_index = i,
-        line = reply_idx - 1,
+        line = M._next_line_num - 1,
       }
+      M._next_line_num = M._next_line_num + 1
+    end
+
+    -- 检查是否在这个轮次有分支点
+    if branches_by_turn[i] then
+      local branch_children = branches_by_turn[i]
+      local cont_prefix = tree_prefix .. (is_last_turn and "   " or "│  ")
+
+      for bidx, branch in ipairs(branch_children) do
+        local child_session = backend.sessions[branch.session_id]
+        if child_session then
+          local is_last_child = (bidx == #branch_children)
+          local child_prefix = cont_prefix .. (is_last_child and "└─ " or "├─ ")
+          local child_icon = "󰈙"
+          local child_info_line = string.format(
+            "%s%s %s (%d)",
+            child_prefix,
+            child_icon,
+            sanitize_line(child_session.name),
+            #child_session.messages
+          )
+          table.insert(lines, child_info_line)
+
+          M.tree_buffers.session_positions[M._next_line_num] = {
+            type = "session",
+            id = branch.session_id,
+            line = M._next_line_num - 1,
+          }
+          M._next_line_num = M._next_line_num + 1
+
+          -- 递归渲染子会话（只渲染超出共同前缀的部分）
+          local sub_prefix = cont_prefix .. (is_last_child and "   " or "│  ")
+          M._render_session_tree_tail(lines, branch.session_id, child_session, sub_prefix, true, i)
+        end
+      end
+    end
+  end
+end
+
+--- 渲染会话的"尾部"消息（超出共同前缀的部分）
+-- @param lines 行数组
+-- @param session_id 会话 ID
+-- @param session 会话对象
+-- @param tree_prefix 树形缩进前缀
+-- @param is_last 是否为最后一个兄弟
+-- @param skip_turns 跳过的轮次数（与父会话的共同前缀）
+function M._render_session_tree_tail(lines, session_id, session, tree_prefix, is_last, skip_turns)
+  local turns = group_messages_into_turns(session.messages or {})
+  if skip_turns >= #turns then
+    return
+  end
+
+  -- 检查是否有子分支
+  local children = backend.get_children(session_id)
+  local child_info = {}
+  for _, child_id in ipairs(children) do
+    if backend.sessions[child_id] then
+      local common = backend.get_common_prefix_turns(session_id, child_id)
+      table.insert(child_info, { session_id = child_id, common_turns = common })
+    end
+  end
+
+  -- 找出在尾部范围内的最大分支点
+  local max_branch_turn = 0
+  for _, info in ipairs(child_info) do
+    if info.common_turns > max_branch_turn and info.common_turns > skip_turns then
+      max_branch_turn = info.common_turns
+    end
+  end
+
+  -- 按绝对轮次分组的子分支（只包含在尾部范围内的）
+  local branches_by_turn = {}
+  for _, info in ipairs(child_info) do
+    if info.common_turns > skip_turns then
+      branches_by_turn[info.common_turns] = branches_by_turn[info.common_turns] or {}
+      table.insert(branches_by_turn[info.common_turns], info)
+    end
+  end
+
+  local preview_len = calc_preview_length(tree_prefix)
+
+  for i = skip_turns + 1, #turns do
+    local turn = turns[i]
+    local is_last_turn = (i == #turns) and (max_branch_turn <= i)
+    local line_prefix = tree_prefix .. (is_last_turn and "└─ " or "├─ ")
+
+    local user_preview = truncate_content(sanitize_line(turn.user_msg.content), preview_len)
+    local user_time = os.date("%H:%M", turn.user_msg.timestamp)
+    table.insert(lines, string.format("%s💬 [%s] %s", line_prefix, user_time, user_preview))
+
+    M.tree_buffers.session_positions[M._next_line_num] = {
+      type = "conversation_turn",
+      session_id = session_id,
+      turn_index = i,
+      user_message_index = turn.index,
+      line = M._next_line_num - 1,
+    }
+    M._next_line_num = M._next_line_num + 1
+
+    if turn.assistant_msg then
+      local asst_preview = truncate_content(sanitize_line(turn.assistant_msg.content), preview_len)
+      local asst_time = os.date("%H:%M", turn.assistant_msg.timestamp)
+      local reply_prefix = tree_prefix .. (is_last_turn and "   " or "│  ")
+      table.insert(lines, string.format("%s🤖 [%s] %s", reply_prefix, asst_time, asst_preview))
+
+      M.tree_buffers.session_positions[M._next_line_num] = {
+        type = "assistant_reply",
+        session_id = session_id,
+        turn_index = i,
+        line = M._next_line_num - 1,
+      }
+      M._next_line_num = M._next_line_num + 1
+    end
+
+    -- 检查子分支（使用绝对轮次索引）
+    if branches_by_turn[i] then
+      local branch_children = branches_by_turn[i]
+      local cont_prefix = tree_prefix .. (is_last_turn and "   " or "│  ")
+
+      for bidx, branch in ipairs(branch_children) do
+        local child_session = backend.sessions[branch.session_id]
+        if child_session then
+          local is_last_child = (bidx == #branch_children)
+          local child_prefix = cont_prefix .. (is_last_child and "└─ " or "├─ ")
+          local child_icon = "󰈙"
+          local child_info_line = string.format(
+            "%s%s %s (%d)",
+            child_prefix,
+            child_icon,
+            sanitize_line(child_session.name),
+            #child_session.messages
+          )
+          table.insert(lines, child_info_line)
+
+          M.tree_buffers.session_positions[M._next_line_num] = {
+            type = "session",
+            id = branch.session_id,
+            line = M._next_line_num - 1,
+          }
+          M._next_line_num = M._next_line_num + 1
+
+          local sub_prefix = cont_prefix .. (is_last_child and "   " or "│  ")
+          M._render_session_tree_tail(lines, branch.session_id, child_session, sub_prefix, true, i)
+        end
+      end
     end
   end
 end
@@ -1105,7 +1386,7 @@ function M.setup_tree_keymaps()
       M.open_chat_after_tree_selection()
     else
       -- 点击在空白行：创建新会话
-      backend.new_session("会话 " .. (#backend.sessions + 1))
+      backend.new_session()
       vim.notify("[NeoAI] 新会话已创建")
       M.open_chat_after_tree_selection()
     end
@@ -1163,7 +1444,7 @@ function M.setup_tree_keymaps()
 
   -- N键：新建空对话
   map(M.config.tree_keymaps.new_conversation, function()
-    backend.new_empty_conversation("空对话 " .. (#backend.sessions + 1))
+    backend.new_empty_conversation()
     vim.schedule(function()
       M.render_session_tree()
     end)
@@ -1185,8 +1466,24 @@ function M.setup_tree_keymaps()
           M.render_session_tree()
         end)
       end
+    elseif pos and pos.type == "session" then
+      -- 在会话标题行上：检查是否为空会话
+      local sid = pos.id
+      local session = backend.sessions[sid]
+      if session and #(session.messages or {}) == 0 then
+        -- 空会话：直接删除
+        if backend.delete_branch(sid) then
+          vim.schedule(function()
+            M.render_session_tree()
+          end)
+        end
+      elseif session and #(session.messages or {}) > 0 then
+        vim.notify("[NeoAI] 该会话有对话内容，请使用 D 删除整个分支", vim.log.levels.WARN)
+      else
+        vim.notify("[NeoAI] 找不到该会话，请刷新树后重试", vim.log.levels.WARN)
+      end
     else
-      vim.notify("[NeoAI] 请将光标放在要删除的对话轮次上", vim.log.levels.WARN)
+      vim.notify("[NeoAI] 请将光标放在要删除的对话轮次或会话上", vim.log.levels.WARN)
     end
   end, "删除当前轮次")
 
@@ -1201,23 +1498,34 @@ function M.setup_tree_keymaps()
       local sid = pos.id
       local session = backend.sessions[sid]
       if session then
-        -- 确认删除
-        local confirm = vim.fn.confirm("确定要删除分支 '" .. session.name .. "' 及其所有子会话吗？", "&Yes\n&No", 2)
-        if confirm == 1 then
+        -- 空会话直接删除，有内容的需要确认
+        if #(session.messages or {}) == 0 then
           if backend.delete_branch(sid) then
             vim.schedule(function()
               M.render_session_tree()
             end)
           end
+        else
+          local confirm =
+            vim.fn.confirm("确定要删除分支 '" .. session.name .. "' 及其所有子会话吗？", "&Yes\n&No", 2)
+          if confirm == 1 then
+            if backend.delete_branch(sid) then
+              vim.schedule(function()
+                M.render_session_tree()
+              end)
+            end
+          end
         end
+      else
+        vim.notify("[NeoAI] 找不到该会话，请刷新树后重试", vim.log.levels.WARN)
       end
     elseif pos and (pos.type == "conversation_turn" or pos.type == "assistant_reply") then
       -- 在对话轮次或助手回复行上：删除该轮次所在的分支
       local sid = pos.session_id
       local session = backend.sessions[sid]
       if session then
-        -- 确认删除
-        local confirm = vim.fn.confirm("确定要删除分支 '" .. session.name .. "' 及其所有子会话吗？", "&Yes\n&No", 2)
+        local confirm =
+          vim.fn.confirm("确定要删除分支 '" .. session.name .. "' 及其所有子会话吗？", "&Yes\n&No", 2)
         if confirm == 1 then
           if backend.delete_branch(sid) then
             vim.schedule(function()
@@ -1225,6 +1533,8 @@ function M.setup_tree_keymaps()
             end)
           end
         end
+      else
+        vim.notify("[NeoAI] 找不到该会话，请刷新树后重试", vim.log.levels.WARN)
       end
     else
       vim.notify("[NeoAI] 请将光标放在要删除的会话或对话轮次上", vim.log.levels.WARN)
@@ -1240,6 +1550,16 @@ function M.setup_tree_keymaps()
     M.render_session_tree()
     vim.notify("[NeoAI] 已刷新")
   end, "刷新树")
+
+  -- e键：打开配置文件
+  map(M.config.tree_keymaps.open_config, function()
+    if M.config and M.config.background and M.config.background.config_dir then
+      local config_file = require("NeoAI.config").get_config_file(M.config.background)
+      vim.cmd("edit " .. vim.fn.fnameescape(config_file))
+    else
+      vim.notify("[NeoAI] 无法找到配置文件路径", vim.log.levels.WARN)
+    end
+  end, "打开配置文件")
 end
 
 --- 更新主显示
@@ -1407,7 +1727,7 @@ local function ensure_active_session()
   end
 
   if #backend.sessions == 0 then
-    backend.new_session("默认会话")
+    backend.new_session()
   else
     for id, _ in pairs(backend.sessions) do
       backend.current_session = id
@@ -2122,6 +2442,7 @@ function M.close()
   M._resize_pending = false
   M._line_to_message = nil
   M._last_buffer_line_count = nil
+  M._next_line_num = nil
 end
 
 --- 切换UI模式
@@ -2301,9 +2622,11 @@ function M.setup(user_config)
     backend.debounce_sync(data.session_id or M.current_session)
 
     -- 提示：数据已持久化
-    vim.notify("[NeoAI] 分支已删除并同步到 " ..
-      (backend.config_file and backend.config_file:match("([^/]+)$") or "sessions.json"),
-      vim.log.levels.INFO)
+    vim.notify(
+      "[NeoAI] 分支已删除并同步到 "
+        .. (backend.config_file and backend.config_file:match("([^/]+)$") or "sessions.json"),
+      vim.log.levels.INFO
+    )
   end)
 
   -- ── Neovim 自动命令 ──
@@ -2325,8 +2648,7 @@ function M.setup(user_config)
     callback = function()
       if M.is_open and is_win_valid(M.windows.main) then
         local changed_win = vim.v.event.window
-        if changed_win == M.windows.main or
-           (is_win_valid(M.windows.tree) and changed_win == M.windows.tree) then
+        if changed_win == M.windows.main or (is_win_valid(M.windows.tree) and changed_win == M.windows.tree) then
           M.schedule_resize()
         end
       end

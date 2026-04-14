@@ -99,6 +99,9 @@ M.defaults = {
 
     -- 删除当前整个分支（从根到叶子）
     delete_branch = "D",
+
+    -- 打开配置文件
+    open_config = "e",
   },
 
   role_icons = {

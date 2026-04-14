@@ -12,6 +12,7 @@ M.current_session = nil -- 当前活跃会话 ID
 M.message_handlers = {} -- 消息事件处理器映射表
 M.editable_states = {} -- 消息可编辑状态缓存
 M.llm_config = nil -- LLM API 配置（从 setup 传入的合并后配置）
+M._session_counter = 0 -- 全局会话计数器（用于统一命名）
 
 --- 创建一条新消息
 -- @param role 角色类型 (user/assistant/system)
@@ -53,9 +54,23 @@ end
 -- @return table 新创建的会话对象
 function M.new_session(name, parent_id)
   local session_id = #M.sessions + 1
+  M._session_counter = M._session_counter + 1
+
+  -- 统一命名：根会话用"会话N"，分支用"会话父N-子序号"
+  if not name then
+    if parent_id then
+      -- 分支：使用父会话ID和分支计数器
+      M._branch_counters = M._branch_counters or {}
+      M._branch_counters[parent_id] = (M._branch_counters[parent_id] or 0) + 1
+      name = string.format("会话%d-%d", parent_id, M._branch_counters[parent_id])
+    else
+      name = "会话" .. M._session_counter
+    end
+  end
+
   local session = {
     id = session_id,
-    name = name or ("会话" .. session_id),
+    name = name,
     messages = {}, -- 消息列表
     created_at = os.time(),
     updated_at = os.time(),
@@ -835,6 +850,10 @@ function M.import_sessions(filepath)
   local data = vim.fn.json_decode(table.concat(content, "\n")) or {}
   local imported = {}
 
+  -- 重置计数器（避免导入后命名冲突）
+  M._session_counter = 0
+  M._branch_counters = {}
+
   -- 先导入图结构关系（如果存在）
   if data._graph then
     -- 将字符串键转换回整数
@@ -901,6 +920,13 @@ function M.import_sessions(filepath)
           end
         end
       end
+    end
+  end
+
+  -- 设置计数器为最大会话 ID
+  for sid, _ in pairs(M.sessions) do
+    if sid > M._session_counter then
+      M._session_counter = sid
     end
   end
 
@@ -1052,6 +1078,46 @@ function M.remove_edge(parent_id, child_id)
   return true
 end
 
+--- 计算两个会话的共同前缀轮次数（通过比较消息内容）
+-- @param session_id_a 会话 A
+-- @param session_id_b 会话 B
+-- @return number 共同前缀的轮次数
+function M.get_common_prefix_turns(session_id_a, session_id_b)
+  local session_a = M.sessions[session_id_a]
+  local session_b = M.sessions[session_id_b]
+  if not session_a or not session_b then
+    return 0
+  end
+
+  local common = 0
+  local msg_a = session_a.messages
+  local msg_b = session_b.messages
+  local len = math.min(#msg_a, #msg_b)
+
+  for i = 1, len do
+    if msg_a[i].role == msg_b[i].role and msg_a[i].content == msg_b[i].content then
+      if msg_a[i].role == "user" then
+        common = common + 1
+      end
+    else
+      break
+    end
+  end
+
+  return common
+end
+
+--- 获取指定会话的所有直接子分支
+-- @param session_id 会话 ID
+-- @return table 子分支 ID 列表
+function M.get_children(session_id)
+  local graph = M.session_graph[session_id]
+  if not graph then
+    return {}
+  end
+  return vim.deepcopy(graph.children)
+end
+
 --- 获取图的完整结构（用于调试或导出）
 -- @return table 图的邻接表结构
 function M.get_graph_structure()
@@ -1080,7 +1146,7 @@ function M.setup(user_config)
   end
 
   if not has_sessions then
-    M.new_session("默认会话")
+    M.new_session()
   end
 
   -- 设置当前活跃会话
@@ -1133,9 +1199,8 @@ function M.create_branch_at_turn(session_id, turn_index)
   local target_turn = turns[turn_index]
   local last_msg_index = target_turn.assistant_msg_index or target_turn.user_msg_index
 
-  -- 创建新会话，名称为原会话名称加分支标识
-  local new_name = session.name .. " (分支 " .. turn_index .. ")"
-  local new_session = M.new_session(new_name, session_id)
+  -- 创建新分支会话（自动命名）
+  local new_session = M.new_session(nil, session_id)
 
   -- 复制从开始到该轮次的所有消息
   for i = 1, last_msg_index do
@@ -1144,13 +1209,13 @@ function M.create_branch_at_turn(session_id, turn_index)
     M.add_message(new_session.id, new_msg)
   end
 
-  vim.notify("[NeoAI] 已创建分支: " .. new_name, vim.log.levels.INFO)
+  vim.notify("[NeoAI] 已创建分支: " .. new_session.name, vim.log.levels.INFO)
   return new_session
 end
 
 --- 新建空对话
 -- 创建一个没有任何消息的新会话
--- @param name 会话名称（可选）
+-- @param name 会话名称（可选，留空则使用自动命名）
 -- @return table 新创建的会话对象
 function M.new_empty_conversation(name)
   local session = M.new_session(name)
