@@ -1,0 +1,499 @@
+-- NeoAI 工具函数模块
+-- 从 backend.lua 和 ui.lua 提取的通用工具函数
+
+local M = {}
+
+-- ── 文本处理工具 ───────────────────────────────────────────────────────────
+
+--- 清理字符串中的换行符和乱码标记（如 <e5>、<e8><af> 等）
+-- @param str 输入字符串
+-- @return string 清理后的字符串
+function M.sanitize_line(str)
+  if not str then
+    return ""
+  end
+  return tostring(str):gsub("[\r\n]+", " "):gsub("<%x%x>", "")
+end
+
+--- 文本自动换行
+-- @param text 原始文本
+-- @param max_width 最大宽度（字符数）
+-- @return table 换行后的行数组
+function M.wrap_text(text, max_width)
+  local wrapped = {}
+  local current = ""
+  for ch in text:gmatch("[%z\1-\127\194-\244][\128-\191]*") do
+    if #current + #ch <= max_width or current == "" then
+      current = current .. ch
+    else
+      table.insert(wrapped, current)
+      current = ch
+    end
+  end
+  if current ~= "" then
+    table.insert(wrapped, current)
+  end
+  return #wrapped > 0 and wrapped or { text }
+end
+
+--- 将消息内容按行换行处理
+-- @param content 原始内容
+-- @param max_width 最大宽度
+-- @return table 换行后的行数组
+function M.wrap_message_content(content, max_width)
+  local result = {}
+  for line in content:gmatch("[^\r\n]+") do
+    for _, wl in ipairs(M.wrap_text(line, max_width)) do
+      table.insert(result, wl)
+    end
+  end
+  return #result > 0 and result or { "" }
+end
+
+--- 截断过长的内容（正确支持 UTF-8 多字节字符）
+-- @param content 原始内容
+-- @param max_chars 最大字符数（中文/英文都算 1 个字符）
+-- @return string 截断后的内容
+function M.truncate_content(content, max_chars)
+  if not content or content == "" then
+    return ""
+  end
+  -- 统计字符数（使用 Lua 标准库的 string.len 和模式匹配处理 UTF-8）
+  local char_count = 0
+  local byte_idx = 1
+  local pos = 1
+  local len = #content
+
+  while pos <= len and char_count < max_chars do
+    local byte = content:byte(pos)
+    -- 确定 UTF-8 字符字节数
+    local char_len
+    if byte < 0x80 then
+      char_len = 1
+    elseif byte < 0xE0 then
+      char_len = 2
+    elseif byte < 0xF0 then
+      char_len = 3
+    elseif byte < 0xF8 then
+      char_len = 4
+    else
+      char_len = 1 -- 无效字节，跳过
+    end
+
+    pos = pos + char_len
+    char_count = char_count + 1
+  end
+
+  if char_count < max_chars or pos > len then
+    return content
+  end
+
+  -- 截断到完整的字符边界
+  local truncated = content:sub(1, pos - 1)
+  return truncated .. "…"
+end
+
+--- 计算字符串的显示宽度（考虑中文等宽字符）
+-- @param str 输入字符串
+-- @return number 显示宽度
+function M.display_width(str)
+  if not str or str == "" then
+    return 0
+  end
+  local chinese_chars = str:gsub("[%z\1-\127\194-\244][\128-\191]*", function(ch)
+    if #ch >= 3 then
+      return "aa" -- 中文字符按 2 个英文字符宽度计算
+    else
+      return ch
+    end
+  end)
+  return #chinese_chars
+end
+
+--- 将值限制在指定范围内
+-- @param val 输入值
+-- @param min_val 最小值
+-- @param max_val 最大值
+-- @return number 限制后的值
+function M.clamp(val, min_val, max_val)
+  return math.max(min_val, math.min(val, max_val))
+end
+
+--- 根据缩进深度动态计算预览长度（越深的分支越短）
+-- @param tree_prefix 树形缩进前缀
+-- @param max_chars 最大字符数（默认 20）
+-- @return number 预览字符数（范围 5~max_chars）
+function M.calc_preview_length(tree_prefix, max_chars)
+  max_chars = max_chars or 20
+  -- 计算缩进深度（每个 "│  " 或 "   " 或 "├─ " 或 "└─ " 算一级）
+  local depth = 0
+  local pos = 1
+  while pos <= #tree_prefix do
+    local segment = tree_prefix:sub(pos, pos + 2)
+    if segment == "│  " or segment == "   " or segment == "├─ " or segment == "└─ " then
+      depth = depth + 1
+      pos = pos + 3
+    else
+      pos = pos + 1
+    end
+  end
+  -- 深度越深，预览越短（范围 5~20）
+  return math.max(5, max_chars - depth)
+end
+
+-- ── 窗口/缓冲区验证工具 ────────────────────────────────────────────────────
+
+--- 检查窗口句柄是否有效
+-- @param win 窗口句柄
+-- @return boolean 是否有效
+function M.is_win_valid(win)
+  return win and vim.api.nvim_win_is_valid(win)
+end
+
+--- 检查缓冲区是否有效
+-- @param buf 缓冲区句柄
+-- @return boolean 是否有效
+function M.is_buf_valid(buf)
+  return type(buf) == "number" and buf > 0 and vim.api.nvim_buf_is_valid(buf)
+end
+
+--- 安全地调用窗口操作（捕获可能的异常）
+-- @param fn 要执行的函数
+-- @return boolean 是否成功
+function M.safe_win_call(fn)
+  return pcall(fn)
+end
+
+-- ── 防抖工具 ───────────────────────────────────────────────────────────────
+
+--- 生成唯一的防抖定时器名称
+-- @param prefix 前缀标识
+-- @return string 唯一的定时器名称（带时间戳）
+function M.make_debounce_key(prefix)
+  return string.format("%s_%d_%d", prefix, vim.loop.now(), math.random(100000, 999999))
+end
+
+-- ── SSE 解析工具 ───────────────────────────────────────────────────────────
+
+--- 解析 SSE (Server-Sent Events) 数据行
+-- 从流式响应中提取 "data:" 字段的 JSON 内容
+-- @param line SSE 数据行（如 "data: {...}"）
+-- @return table? 解析后的 JSON 对象，失败返回 nil
+function M.parse_sse_data(line)
+  if not line or not line:match("^data:") then
+    return nil
+  end
+
+  local json_str = line:match("^data:%s*(.+)$")
+  if not json_str or json_str == "[DONE]" then
+    return nil
+  end
+
+  local ok, parsed = pcall(vim.fn.json_decode, json_str)
+  if not ok or not parsed then
+    return nil
+  end
+
+  return parsed
+end
+
+--- 从 SSE delta 中提取推理/思考内容（reasoning_content）
+-- deepseek-reasoner 等思考模型会在 delta 中返回 reasoning_content 字段
+-- @param delta SSE delta 对象
+-- @return string? 推理内容片段，无则返回 nil
+function M.extract_reasoning_from_delta(delta)
+  if not delta then
+    return nil
+  end
+  -- OpenAI 兼容格式：delta.reasoning_content 或 delta.reasoning
+  local reasoning = delta.reasoning_content or delta.reasoning
+  -- 过滤 vim.NIL（JSON null 值）
+  if reasoning and reasoning ~= vim.NIL then
+    return tostring(reasoning)
+  end
+  return nil
+end
+
+-- ── 推理内容显示工具 ──────────────────────────────────────────────────────
+
+--- 计算推理内容在UI中占用的行数
+-- 思考中：1 行（标题行）
+-- 完成后：1 行（标题行）或 1 + 全部行数（展开状态）
+-- @param reasoning_text 推理内容字符串
+-- @param max_width 最大宽度
+-- @param is_complete 思考是否已完成
+-- @param message_id 消息ID（用于查询折叠状态）
+-- @param is_reasoning_folded_func 判断推理是否折叠的函数（可选）
+-- @return number 推理内容显示行数
+function M.count_reasoning_display_lines(reasoning_text, max_width, is_complete, message_id, is_reasoning_folded_func)
+  if not reasoning_text or reasoning_text == "" then
+    return 0
+  end
+
+  -- 思考中：只有标题行
+  if not is_complete then
+    return 1
+  end
+
+  -- 思考完成后：查询折叠状态
+  local folded = false
+  if is_reasoning_folded_func then
+    folded = is_reasoning_folded_func(message_id)
+  else
+    -- 尝试从 ui 模块获取
+    local ok, ui = pcall(require, "NeoAI.ui")
+    if ok and ui then
+      folded = ui.is_reasoning_folded(message_id)
+    end
+  end
+
+  if folded then
+    return 1 -- 仅标题行
+  else
+    -- 计算内容行数
+    local line_count = 0
+    for _ in reasoning_text:gmatch("[^\r\n]+") do
+      line_count = line_count + 1
+    end
+    return 1 + line_count -- 标题行 + 全部内容
+  end
+end
+
+-- ── 窗口计算工具 ──────────────────────────────────────────────────────────
+
+--- 计算窗口实际文本可用宽度（减去装饰列）
+-- @param target_win 目标窗口句柄（可选）
+-- @return number 文本可用宽度
+function M.calculate_text_width(target_win)
+  -- 获取窗口宽度（含所有装饰列）
+  local win_width = 0
+  if target_win and M.is_win_valid(target_win) then
+    win_width = vim.api.nvim_win_get_width(target_win)
+  end
+
+  if win_width < 1 then
+    return 40 -- 默认值
+  end
+
+  -- 获取实际文本可用宽度（减去装饰列）
+  local text_width = win_width
+
+  if target_win then
+    -- 行号列宽度
+    if
+      vim.api.nvim_get_option_value("number", { win = target_win })
+      or vim.api.nvim_get_option_value("relativenumber", { win = target_win })
+    then
+      local nw = vim.api.nvim_get_option_value("numberwidth", { win = target_win })
+      text_width = text_width - (tonumber(nw) or 4)
+    end
+
+    -- 符号列宽度
+    local sc = vim.api.nvim_get_option_value("signcolumn", { win = target_win })
+    if sc == "yes" then
+      text_width = text_width - 2
+    elseif sc == "auto" then
+      -- auto 时检查是否有符号显示
+      local signs = vim.fn.sign_getplaced(vim.api.nvim_win_get_buf(target_win), { group = "*" })
+      if signs and signs[1] and #signs[1].signs > 0 then
+        text_width = text_width - 2
+      end
+    end
+
+    -- 折叠列宽度
+    if vim.api.nvim_get_option_value("foldenable", { win = target_win }) then
+      local fc = vim.api.nvim_get_option_value("foldcolumn", { win = target_win })
+      if fc ~= "0" and fc ~= 0 then
+        text_width = text_width - (tonumber(fc) or 1)
+      end
+    end
+  end
+
+  return math.max(1, text_width)
+end
+
+-- ── 防抖工具（完整实现） ───────────────────────────────────────────────────
+
+--- 清理指定的防抖定时器
+-- @param debounce_timers 防抖定时器表
+-- @param timer_name 定时器名称
+function M.cleanup_debounce_timer(debounce_timers, timer_name)
+  local old_timer = debounce_timers[timer_name]
+  if old_timer then
+    old_timer:stop()
+    if not old_timer:is_closing() then
+      old_timer:close()
+    end
+    debounce_timers[timer_name] = nil
+  end
+end
+
+--- 清理所有防抖定时器
+-- @param debounce_timers 防抖定时器表
+function M.cleanup_all_debounce_timers(debounce_timers)
+  for name, timer in pairs(debounce_timers) do
+    if timer and not timer:is_closing() then
+      timer:stop()
+      timer:close()
+    end
+    debounce_timers[name] = nil
+  end
+end
+
+--- 防抖函数：在指定延迟后执行函数，期间重复调用会重置计时器
+-- @param fn 要执行的函数
+-- @param delay_ms 延迟时间（毫秒）
+-- @param key_prefix 可选的前缀标识（用于区分不同的防抖场景）
+-- @param debounce_timers 防抖定时器表（由调用者管理）
+-- @return function 包装后的防抖函数
+function M.debounce(fn, delay_ms, key_prefix, debounce_timers)
+  key_prefix = key_prefix or tostring(fn)
+
+  return function(...)
+    local args = { ... }
+    -- 生成唯一的定时器名称，避免不同场景共享同一个定时器
+    local timer_name = M.make_debounce_key(key_prefix)
+
+    -- 如果提供了 key_prefix，则清理该前缀下的所有旧定时器
+    -- 否则仅清理基于函数名的旧定时器（向后兼容）
+    if key_prefix ~= tostring(fn) then
+      -- 清理同前缀的旧定时器
+      for name, _ in pairs(debounce_timers) do
+        if name:find("^" .. key_prefix .. "_") then
+          M.cleanup_debounce_timer(debounce_timers, name)
+        end
+      end
+    else
+      -- 向后兼容：清理基于函数名的旧定时器
+      M.cleanup_debounce_timer(debounce_timers, timer_name)
+    end
+
+    -- 创建新的计时器
+    local timer = assert(vim.loop.new_timer())
+    debounce_timers[timer_name] = timer
+    timer:start(delay_ms, 0, function()
+      vim.schedule(function()
+        -- 执行完成后清理定时器引用
+        debounce_timers[timer_name] = nil
+        fn(unpack(args))
+      end)
+    end)
+  end
+end
+
+-- ── 窗口管理工具 ──────────────────────────────────────────────────────────
+
+--- 验证并限制窗口位置和大小
+-- @param row 行
+-- @param col 列
+-- @param width 宽度
+-- @param height 高度
+-- @return 验证后的行、列、宽度、高度
+function M.validate_window_position(row, col, width, height)
+  local editor_width = vim.o.columns
+  local editor_height = vim.o.lines - (vim.o.cmdheight or 1)
+
+  width = M.clamp(width, 10, editor_width)
+  height = M.clamp(height, 5, editor_height)
+  row = M.clamp(row, 0, editor_height - height)
+  col = M.clamp(col, 0, editor_width - width)
+
+  return row, col, width, height
+end
+
+--- 根据窗口模式应用大小限制
+-- @param mode 窗口模式
+-- @param width 原始宽度
+-- @param height 原始高度
+-- @param window_limits 窗口限制配置表
+-- @return 调整后的宽度和高度
+function M.apply_size_limits(mode, width, height, window_limits)
+  local limits = window_limits[mode] or window_limits.float
+  local editor_width = vim.o.columns
+  local editor_height = vim.o.lines
+
+  if limits.max_width_ratio then
+    width = math.min(width, math.floor(editor_width * limits.max_width_ratio))
+  end
+  if limits.max_height_ratio then
+    height = math.min(height, math.floor(editor_height * limits.max_height_ratio))
+  end
+  if limits.min_width then
+    width = math.max(width, limits.min_width)
+  end
+  if limits.min_height then
+    height = math.max(height, limits.min_height)
+  end
+
+  return width, height
+end
+
+--- 设置窗口换行选项
+-- @param windows 窗口表
+function M.set_window_wrap(windows)
+  for _, win in pairs(windows) do
+    if M.is_win_valid(win) then
+      vim.api.nvim_set_option_value("wrap", true, { win = win })
+      vim.api.nvim_set_option_value("linebreak", true, { win = win })
+      vim.api.nvim_set_option_value("breakindent", true, { win = win })
+      -- 启用折叠功能，使用标记折叠法
+      vim.api.nvim_set_option_value("foldmethod", "marker", { win = win })
+      vim.api.nvim_set_option_value("foldenable", true, { win = win })
+    end
+  end
+end
+
+--- 清理无效的窗口和缓冲区
+-- @param windows 窗口表
+-- @param buffers 缓冲区表
+-- @param tree_buffers 树缓冲区表
+-- @param reasoning_float_wins 推理浮动窗口表
+-- @param reasoning_float_buffers 推理浮动缓冲区表
+-- @return integer 清理的数量
+function M.cleanup_windows(windows, buffers, tree_buffers, reasoning_float_wins, reasoning_float_buffers)
+  local cleaned = 0
+
+  local function cleanup_table(t, validator)
+    for key, value in pairs(t) do
+      if not validator(value) then
+        t[key] = nil
+        cleaned = cleaned + 1
+      end
+    end
+  end
+
+  cleanup_table(windows, M.is_win_valid)
+  cleanup_table(buffers, M.is_buf_valid)
+  cleanup_table(tree_buffers, M.is_buf_valid)
+
+  -- 清理推理浮动窗口（由调用者负责关闭）
+  cleanup_table(reasoning_float_wins, function(win)
+    return win and vim.api.nvim_win_is_valid(win)
+  end)
+  cleanup_table(reasoning_float_buffers, M.is_buf_valid)
+
+  -- 清理已删除的缓冲区引用
+  if not M.is_buf_valid(buffers.main) then
+    buffers.main = nil
+  end
+  if not M.is_buf_valid(tree_buffers.main) then
+    tree_buffers.main = nil
+  end
+
+  return cleaned
+end
+
+--- 计算文本换行后的行数
+-- @param content 文本内容
+-- @param max_width 最大宽度
+-- @return number 行数
+function M.count_wrapped_lines(content, max_width)
+  if not content or content == "" then
+    return 1
+  end
+
+  local lines = M.wrap_message_content(content, max_width)
+  return #lines
+end
+
+return M

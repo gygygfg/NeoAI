@@ -3,6 +3,7 @@
 local M = {}
 local backend = require("NeoAI.backend")
 local config = require("NeoAI.config")
+local utils = require("NeoAI.utils")
 
 -- ── 模块常量与状态 ───────────────────────────────────────────────────────────
 
@@ -35,17 +36,16 @@ M._reasoning_float_buffers = {} -- 推理浮动窗口缓冲区 {message_id = buf
 
 --- 推理显示配置表
 M.reasoning_config = {
-  max_width = 80,         -- 浮动窗口最大宽度
-  max_height = 8,         -- 浮动窗口最大高度
-  fold_on_finish = true,  -- 思考完成后是否默认折叠
+  max_width = 80, -- 浮动窗口最大宽度
+  max_height = 8, -- 浮动窗口最大高度
+  fold_on_finish = true, -- 思考完成后是否默认折叠
 }
 
--- 前向声明：这些函数在下方定义，引擎需要提前引用
-local sanitize_line, wrap_text, truncate_content, is_win_valid
+-- 前向声明：这些函数在 utils 模块中定义
 
 --- 推理显示状态管理（内部）
 local reasoning_engine = {
-  config = M.reasoning_config,  -- 引用配置表
+  config = M.reasoning_config, -- 引用配置表
   -- { message_id = {
   --   phase = "idle" | "thinking" | "finished",
   --   float_win = nil,          -- 浮动窗口 ID
@@ -80,7 +80,9 @@ end
 -- @param message_id 消息ID
 local function destroy_float(message_id)
   local state = reasoning_engine.states[message_id]
-  if not state then return end
+  if not state then
+    return
+  end
 
   if state.float_win and vim.api.nvim_win_is_valid(state.float_win) then
     vim.api.nvim_win_close(state.float_win, true)
@@ -105,8 +107,8 @@ local function refresh_float(state)
   local width = reasoning_engine.config.max_width - 2
   local lines = {}
   for line in state.text:gmatch("[^\r\n]+") do
-    local cleaned = sanitize_line(line)
-    local wrapped = wrap_text(cleaned, width)
+    local cleaned = utils.sanitize_line(line)
+    local wrapped = utils.wrap_text(cleaned, width)
     for _, wl in ipairs(wrapped) do
       table.insert(lines, wl)
     end
@@ -120,9 +122,9 @@ local function refresh_float(state)
   end
 
   -- 更新缓冲区内容
-  vim.api.nvim_set_option_value('modifiable', true, { buf = buf })
+  vim.api.nvim_set_option_value("modifiable", true, { buf = buf })
   vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
-  vim.api.nvim_set_option_value('modifiable', false, { buf = buf })
+  vim.api.nvim_set_option_value("modifiable", false, { buf = buf })
 
   -- 滚动到底部
   local line_count = vim.api.nvim_buf_line_count(buf)
@@ -137,11 +139,11 @@ function M.start_reasoning(message_id, anchor_win, anchor_row)
   local state = get_state(message_id)
   state.phase = "thinking"
   state.text = ""
-  state.anchor_win = (anchor_win and is_win_valid(anchor_win)) and anchor_win or M.windows.main
+  state.anchor_win = (anchor_win and utils.is_win_valid(anchor_win)) and anchor_win or M.windows.main
   state.anchor_row = anchor_row
 
   -- 守护检查：锚点窗口必须有效
-  if not is_win_valid(state.anchor_win) then
+  if not utils.is_win_valid(state.anchor_win) then
     return
   end
 
@@ -152,8 +154,8 @@ function M.start_reasoning(message_id, anchor_win, anchor_row)
   local buf = vim.api.nvim_create_buf(false, true)
   state.float_buf = buf
 
-  vim.api.nvim_set_option_value('buftype', 'nofile', { buf = buf })
-  vim.api.nvim_set_option_value('filetype', 'NeoAIReasoning', { buf = buf })
+  vim.api.nvim_set_option_value("buftype", "nofile", { buf = buf })
+  vim.api.nvim_set_option_value("filetype", "NeoAIReasoning", { buf = buf })
 
   -- 计算浮动窗口位置
   local ok, win_config = pcall(vim.api.nvim_win_get_config, state.anchor_win)
@@ -168,7 +170,7 @@ function M.start_reasoning(message_id, anchor_win, anchor_row)
 
   local float_width = reasoning_engine.config.max_width
   local float_height = reasoning_engine.config.max_height
-  local float_row = win_row + target_row - vim.fn.line('w0', state.anchor_win) + 1
+  local float_row = win_row + target_row - vim.fn.line("w0", state.anchor_win) + 1
   local float_col = win_col + 2
 
   -- 确保不超出屏幕
@@ -178,26 +180,26 @@ function M.start_reasoning(message_id, anchor_win, anchor_row)
 
   -- 创建浮动窗口
   local win_id = vim.api.nvim_open_win(buf, false, {
-    relative = 'editor',
+    relative = "editor",
     row = math.max(0, float_row),
     col = math.max(0, float_col),
     width = float_width,
     height = float_height,
-    style = 'minimal',
-    border = 'rounded',
+    style = "minimal",
+    border = "rounded",
     focusable = false,
     zindex = 100,
   })
 
   -- 设置窗口选项
-  vim.api.nvim_set_option_value('wrap', true, { win = win_id })
-  vim.api.nvim_set_option_value('linebreak', true, { win = win_id })
-  vim.api.nvim_set_option_value('breakindent', false, { win = win_id })
-  vim.api.nvim_set_option_value('number', false, { win = win_id })
-  vim.api.nvim_set_option_value('relativenumber', false, { win = win_id })
-  vim.api.nvim_set_option_value('signcolumn', 'no', { win = win_id })
-  vim.api.nvim_set_option_value('foldenable', false, { win = win_id })
-  vim.api.nvim_set_option_value('winhl', 'NormalFloat:CommentFloat', { win = win_id })
+  vim.api.nvim_set_option_value("wrap", true, { win = win_id })
+  vim.api.nvim_set_option_value("linebreak", true, { win = win_id })
+  vim.api.nvim_set_option_value("breakindent", false, { win = win_id })
+  vim.api.nvim_set_option_value("number", false, { win = win_id })
+  vim.api.nvim_set_option_value("relativenumber", false, { win = win_id })
+  vim.api.nvim_set_option_value("signcolumn", "no", { win = win_id })
+  vim.api.nvim_set_option_value("foldenable", false, { win = win_id })
+  vim.api.nvim_set_option_value("winhl", "NormalFloat:CommentFloat", { win = win_id })
 
   state.float_win = win_id
 
@@ -276,7 +278,7 @@ function M.get_reasoning_display_lines(message_id, max_width)
       -- 折叠状态：使用折叠标记包裹内容
       table.insert(result, string.format("  ▶ [思考完成，共 %d 行] {{{", total_lines))
       for line in state.text:gmatch("[^\r\n]+") do
-        local cleaned = truncate_content(sanitize_line(line), max_width - 6)
+        local cleaned = utils.truncate_content(utils.sanitize_line(line), max_width - 6)
         table.insert(result, "    " .. cleaned)
       end
       table.insert(result, "    }}}")
@@ -284,7 +286,7 @@ function M.get_reasoning_display_lines(message_id, max_width)
       -- 展开状态：显示标题和全部内容
       table.insert(result, string.format("  ▼ [思考完成，共 %d 行]", total_lines))
       for line in state.text:gmatch("[^\r\n]+") do
-        local cleaned = truncate_content(sanitize_line(line), max_width - 6)
+        local cleaned = utils.truncate_content(utils.sanitize_line(line), max_width - 6)
         table.insert(result, "    " .. cleaned)
       end
     end
@@ -304,7 +306,7 @@ function M.toggle_reasoning_fold(message_id)
 
     -- 使用 Neovim 折叠命令确保折叠状态生效
     vim.defer_fn(function()
-      if is_win_valid(M.windows.main) then
+      if utils.is_win_valid(M.windows.main) then
         vim.api.nvim_win_call(M.windows.main, function()
           if state.fold_state then
             vim.cmd("fold")
@@ -357,11 +359,11 @@ function M.create_reasoning_float_window(message_id, reasoning_text, anchor_win,
 
   state.phase = "thinking"
   state.text = reasoning_text or ""
-  state.anchor_win = (anchor_win and is_win_valid(anchor_win)) and anchor_win or M.windows.main
+  state.anchor_win = (anchor_win and utils.is_win_valid(anchor_win)) and anchor_win or M.windows.main
   state.anchor_row = anchor_row
 
   -- 守护检查
-  if not is_win_valid(state.anchor_win) then
+  if not utils.is_win_valid(state.anchor_win) then
     return nil
   end
 
@@ -369,15 +371,15 @@ function M.create_reasoning_float_window(message_id, reasoning_text, anchor_win,
   local buf = vim.api.nvim_create_buf(false, true)
   state.float_buf = buf
 
-  vim.api.nvim_set_option_value('buftype', 'nofile', { buf = buf })
-  vim.api.nvim_set_option_value('filetype', 'NeoAIReasoning', { buf = buf })
+  vim.api.nvim_set_option_value("buftype", "nofile", { buf = buf })
+  vim.api.nvim_set_option_value("filetype", "NeoAIReasoning", { buf = buf })
 
   -- 格式化文本
   local width = reasoning_engine.config.max_width - 2
   local lines = {}
   for line in (reasoning_text or ""):gmatch("[^\r\n]+") do
-    local cleaned = sanitize_line(line)
-    local wrapped = wrap_text(cleaned, width)
+    local cleaned = utils.sanitize_line(line)
+    local wrapped = utils.wrap_text(cleaned, width)
     for _, wl in ipairs(wrapped) do
       table.insert(lines, wl)
     end
@@ -387,12 +389,14 @@ function M.create_reasoning_float_window(message_id, reasoning_text, anchor_win,
   end
 
   vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
-  vim.api.nvim_set_option_value('modifiable', false, { buf = buf })
-  vim.api.nvim_set_option_value('readonly', true, { buf = buf })
+  vim.api.nvim_set_option_value("modifiable", false, { buf = buf })
+  vim.api.nvim_set_option_value("readonly", true, { buf = buf })
 
   -- 计算位置
   local ok, win_config = pcall(vim.api.nvim_win_get_config, state.anchor_win)
-  if not ok then return nil end
+  if not ok then
+    return nil
+  end
   local win_row = win_config.row or 0
   local win_col = win_config.col or 0
   local ok2, cursor = pcall(vim.api.nvim_win_get_cursor, state.anchor_win)
@@ -400,7 +404,7 @@ function M.create_reasoning_float_window(message_id, reasoning_text, anchor_win,
 
   local float_width = reasoning_engine.config.max_width
   local float_height = math.min(reasoning_engine.config.max_height, #lines)
-  local float_row = win_row + target_row - vim.fn.line('w0', state.anchor_win) + 1
+  local float_row = win_row + target_row - vim.fn.line("w0", state.anchor_win) + 1
   local float_col = win_col + 2
 
   if float_row + float_height > vim.o.lines then
@@ -408,25 +412,25 @@ function M.create_reasoning_float_window(message_id, reasoning_text, anchor_win,
   end
 
   local win_id = vim.api.nvim_open_win(buf, false, {
-    relative = 'editor',
+    relative = "editor",
     row = math.max(0, float_row),
     col = math.max(0, float_col),
     width = float_width,
     height = float_height,
-    style = 'minimal',
-    border = 'rounded',
+    style = "minimal",
+    border = "rounded",
     focusable = false,
     zindex = 100,
   })
 
-  vim.api.nvim_set_option_value('wrap', true, { win = win_id })
-  vim.api.nvim_set_option_value('linebreak', true, { win = win_id })
-  vim.api.nvim_set_option_value('breakindent', false, { win = win_id })
-  vim.api.nvim_set_option_value('number', false, { win = win_id })
-  vim.api.nvim_set_option_value('relativenumber', false, { win = win_id })
-  vim.api.nvim_set_option_value('signcolumn', 'no', { win = win_id })
-  vim.api.nvim_set_option_value('foldenable', false, { win = win_id })
-  vim.api.nvim_set_option_value('winhl', 'NormalFloat:CommentFloat', { win = win_id })
+  vim.api.nvim_set_option_value("wrap", true, { win = win_id })
+  vim.api.nvim_set_option_value("linebreak", true, { win = win_id })
+  vim.api.nvim_set_option_value("breakindent", false, { win = win_id })
+  vim.api.nvim_set_option_value("number", false, { win = win_id })
+  vim.api.nvim_set_option_value("relativenumber", false, { win = win_id })
+  vim.api.nvim_set_option_value("signcolumn", "no", { win = win_id })
+  vim.api.nvim_set_option_value("foldenable", false, { win = win_id })
+  vim.api.nvim_set_option_value("winhl", "NormalFloat:CommentFloat", { win = win_id })
 
   state.float_win = win_id
   M._reasoning_float_wins[message_id] = win_id
@@ -459,287 +463,6 @@ local SEPARATOR_CHARS = { single = "─", double = "═", solid = "━", dotted 
 
 -- ── 防抖定时器管理 ───────────────────────────────────────────────────────────
 
---- 生成唯一的防抖定时器名称
--- @param prefix 前缀标识
--- @return string 唯一的定时器名称（带时间戳）
-local function make_debounce_key(prefix)
-  return string.format("%s_%d_%d", prefix, vim.loop.now(), math.random(100000, 999999))
-end
-
---- 清理指定的防抖定时器
--- @param timer_name 定时器名称
-local function cleanup_debounce_timer(timer_name)
-  local old_timer = M._debounce_timers[timer_name]
-  if old_timer then
-    old_timer:stop()
-    if not old_timer:is_closing() then
-      old_timer:close()
-    end
-    M._debounce_timers[timer_name] = nil
-  end
-end
-
---- 清理所有防抖定时器
-local function cleanup_all_debounce_timers()
-  for name, timer in pairs(M._debounce_timers) do
-    if timer and not timer:is_closing() then
-      timer:stop()
-      timer:close()
-    end
-    M._debounce_timers[name] = nil
-  end
-end
-
---- 防抖函数：在指定延迟后执行函数，期间重复调用会重置计时器
--- @param fn 要执行的函数
--- @param delay_ms 延迟时间（毫秒）
--- @param key_prefix 可选的前缀标识（用于区分不同的防抖场景）
--- @return function 包装后的防抖函数
-local function debounce(fn, delay_ms, key_prefix)
-  key_prefix = key_prefix or tostring(fn)
-
-  return function(...)
-    local args = { ... }
-    -- 生成唯一的定时器名称，避免不同场景共享同一个定时器
-    local timer_name = make_debounce_key(key_prefix)
-
-    -- 如果提供了 key_prefix，则清理该前缀下的所有旧定时器
-    -- 否则仅清理基于函数名的旧定时器（向后兼容）
-    if key_prefix ~= tostring(fn) then
-      -- 清理同前缀的旧定时器
-      for name, _ in pairs(M._debounce_timers) do
-        if name:find("^" .. key_prefix .. "_") then
-          cleanup_debounce_timer(name)
-        end
-      end
-    else
-      -- 向后兼容：清理基于函数名的旧定时器
-      cleanup_debounce_timer(timer_name)
-    end
-
-    -- 创建新的计时器
-    local timer = assert(vim.loop.new_timer())
-    M._debounce_timers[timer_name] = timer
-    timer:start(delay_ms, 0, function()
-      vim.schedule(function()
-        -- 执行完成后清理定时器引用
-        M._debounce_timers[timer_name] = nil
-        fn(unpack(args))
-      end)
-    end)
-  end
-end
-
---- 将值限制在指定范围内
--- @param val 输入值
--- @param min_val 最小值
--- @param max_val 最大值
--- @return number 限制后的值
-local function clamp(val, min_val, max_val)
-  return math.max(min_val, math.min(val, max_val))
-end
-
---- 检查窗口句柄是否有效
--- @param win 窗口句柄
--- @return boolean 是否有效
-is_win_valid = function(win)
-  return win and vim.api.nvim_win_is_valid(win)
-end
-
---- 检查缓冲区是否有效
--- @param buf 缓冲区句柄
--- @return boolean 是否有效
-local function is_buf_valid(buf)
-  return type(buf) == "number" and buf > 0 and vim.api.nvim_buf_is_valid(buf)
-end
-
---- 安全地调用窗口操作（捕获可能的异常）
--- @param fn 要执行的函数
--- @return boolean 是否成功
-local function safe_win_call(fn)
-  return pcall(fn)
-end
-
---- 计算窗口实际文本可用宽度（减去装饰列）
--- @return number 文本可用宽度
-local function calculate_text_width()
-  -- 获取窗口宽度（含所有装饰列）
-  local win_width = 0
-  if is_win_valid(M.windows.tree) then
-    win_width = vim.api.nvim_win_get_width(M.windows.tree)
-  elseif is_win_valid(M.windows.main) then
-    win_width = vim.api.nvim_win_get_width(M.windows.main)
-  end
-
-  if win_width < 1 then
-    return 40 -- 默认值
-  end
-
-  -- 获取实际文本可用宽度（减去装饰列）
-  local target_win = is_win_valid(M.windows.tree) and M.windows.tree or M.windows.main
-  local text_width = win_width
-
-  if target_win then
-    -- 行号列宽度
-    if
-      vim.api.nvim_get_option_value("number", { win = target_win })
-      or vim.api.nvim_get_option_value("relativenumber", { win = target_win })
-    then
-      local nw = vim.api.nvim_get_option_value("numberwidth", { win = target_win })
-      text_width = text_width - (tonumber(nw) or 4)
-    end
-
-    -- 符号列宽度
-    local sc = vim.api.nvim_get_option_value("signcolumn", { win = target_win })
-    if sc == "yes" then
-      text_width = text_width - 2
-    elseif sc == "auto" then
-      -- auto 时检查是否有符号显示
-      local signs = vim.fn.sign_getplaced(vim.api.nvim_win_get_buf(target_win), { group = "*" })
-      if signs and signs[1] and #signs[1].signs > 0 then
-        text_width = text_width - 2
-      end
-    end
-
-    -- 折叠列宽度
-    if vim.api.nvim_get_option_value("foldenable", { win = target_win }) then
-      local fc = vim.api.nvim_get_option_value("foldcolumn", { win = target_win })
-      if fc ~= "0" and fc ~= 0 then
-        text_width = text_width - (tonumber(fc) or 1)
-      end
-    end
-  end
-
-  return math.max(1, text_width)
-end
-
---- 文本自动换行
--- @param text 原始文本
--- @param max_width 最大宽度（字符数）
--- @return table 换行后的行数组
-wrap_text = function(text, max_width)
-  local wrapped = {}
-  local current = ""
-  for ch in text:gmatch("[%z\1-\127\194-\244][\128-\191]*") do
-    if #current + #ch <= max_width or current == "" then
-      current = current .. ch
-    else
-      table.insert(wrapped, current)
-      current = ch
-    end
-  end
-  if current ~= "" then
-    table.insert(wrapped, current)
-  end
-  return #wrapped > 0 and wrapped or { text }
-end
-
---- 截断过长的内容（正确支持 UTF-8 多字节字符）
--- @param content 原始内容
--- @param max_chars 最大字符数（中文/英文都算 1 个字符）
--- @return string 截断后的内容
-truncate_content = function(content, max_chars)
-  if not content or content == "" then
-    return ""
-  end
-  -- 统计字符数（使用 Lua 标准库的 string.len 和模式匹配处理 UTF-8）
-  local char_count = 0
-  local byte_idx = 1
-  local pos = 1
-  local len = #content
-
-  while pos <= len and char_count < max_chars do
-    local byte = content:byte(pos)
-    -- 确定 UTF-8 字符字节数
-    local char_len
-    if byte < 0x80 then
-      char_len = 1
-    elseif byte < 0xE0 then
-      char_len = 2
-    elseif byte < 0xF0 then
-      char_len = 3
-    elseif byte < 0xF8 then
-      char_len = 4
-    else
-      char_len = 1 -- 无效字节，跳过
-    end
-
-    pos = pos + char_len
-    char_count = char_count + 1
-  end
-
-  if char_count < max_chars or pos > len then
-    return content
-  end
-
-  -- 截断到完整的字符边界
-  local truncated = content:sub(1, pos - 1)
-  return truncated .. "…"
-end
-
---- 将消息内容按行换行处理
--- @param content 原始内容
--- @param max_width 最大宽度
--- @return table 换行后的行数组
-local function wrap_message_content(content, max_width)
-  local result = {}
-  for line in content:gmatch("[^\r\n]+") do
-    for _, wl in ipairs(wrap_text(line, max_width)) do
-      table.insert(result, wl)
-    end
-  end
-  return #result > 0 and result or { "" }
-end
-
---- 计算字符串的显示宽度（考虑中文等宽字符）
--- @param str 输入字符串
--- @return number 显示宽度
-local function display_width(str)
-  if not str or str == "" then
-    return 0
-  end
-  local chinese_chars = str:gsub("[%z\1-\127\194-\244][\128-\191]*", function(ch)
-    if #ch >= 3 then
-      return "aa" -- 中文字符按 2 个英文字符宽度计算
-    else
-      return ch
-    end
-  end)
-  return #chinese_chars
-end
-
---- 清理字符串中的换行符和乱码标记（如 <e5>、<e8><af> 等）
--- @param str 输入字符串
--- @return string 清理后的字符串
-sanitize_line = function(str)
-  if not str then
-    return ""
-  end
-  return tostring(str):gsub("[\r\n]+", " "):gsub("<%x%x>", "")
-end
-
---- 根据缩进深度动态计算预览长度（越深的分支越短）
--- @param tree_prefix 树形缩进前缀
--- @param max_chars 最大字符数（默认 20）
--- @return number 预览字符数（范围 5~max_chars）
-local function calc_preview_length(tree_prefix, max_chars)
-  max_chars = max_chars or 20
-  -- 计算缩进深度（每个 "│  " 或 "   " 或 "├─ " 或 "└─ " 算一级）
-  local depth = 0
-  local pos = 1
-  while pos <= #tree_prefix do
-    local segment = tree_prefix:sub(pos, pos + 2)
-    if segment == "│  " or segment == "   " or segment == "├─ " or segment == "└─ " then
-      depth = depth + 1
-      pos = pos + 3
-    else
-      pos = pos + 1
-    end
-  end
-  -- 深度越深，预览越短（范围 5~20）
-  return math.max(5, max_chars - depth)
-end
-
 --- 获取输入框分隔线字符
 -- @return string 分隔线字符
 function M.get_separator_char()
@@ -748,99 +471,45 @@ end
 
 -- ── 窗口管理函数 ─────────────────────────────────────────────────────────────
 
---- 验证并限制窗口位置和大小
+--- 验证并限制窗口位置和大小（使用 utils 版本）
 -- @param row 行
 -- @param col 列
 -- @param width 宽度
 -- @param height 高度
 -- @return 验证后的行、列、宽度、高度
 function M.validate_window_position(row, col, width, height)
-  local editor_width = vim.o.columns
-  local editor_height = vim.o.lines - (vim.o.cmdheight or 1)
-
-  width = clamp(width, 10, editor_width)
-  height = clamp(height, 5, editor_height)
-  row = clamp(row, 0, editor_height - height)
-  col = clamp(col, 0, editor_width - width)
-
-  return row, col, width, height
+  return utils.validate_window_position(row, col, width, height)
 end
 
---- 根据窗口模式应用大小限制
+--- 根据窗口模式应用大小限制（使用 utils 版本）
 -- @param mode 窗口模式
 -- @param width 原始宽度
 -- @param height 原始高度
 -- @return 调整后的宽度和高度
 function M.apply_size_limits(mode, width, height)
-  local limits = M.WINDOW_LIMITS[mode] or M.WINDOW_LIMITS.float
-  local editor_width = vim.o.columns
-  local editor_height = vim.o.lines
-
-  if limits.max_width_ratio then
-    width = math.min(width, math.floor(editor_width * limits.max_width_ratio))
-  end
-  if limits.max_height_ratio then
-    height = math.min(height, math.floor(editor_height * limits.max_height_ratio))
-  end
-  if limits.min_width then
-    width = math.max(width, limits.min_width)
-  end
-  if limits.min_height then
-    height = math.max(height, limits.min_height)
-  end
-
-  return width, height
+  return utils.apply_size_limits(mode, width, height, M.WINDOW_LIMITS)
 end
 
---- 清理无效的窗口和缓冲区
+--- 清理无效的窗口和缓冲区（使用 utils 版本）
 -- @return integer 清理的数量
 function M.cleanup_windows()
-  local cleaned = 0
-
-  local function cleanup_table(t, validator)
-    for key, value in pairs(t) do
-      if not validator(value) then
-        t[key] = nil
-        cleaned = cleaned + 1
-      end
-    end
-  end
-
-  cleanup_table(M.windows, is_win_valid)
-  cleanup_table(M.buffers, is_buf_valid)
-  cleanup_table(M.tree_buffers, is_buf_valid)
-  
-  -- 清理推理浮动窗口
+  -- 先关闭所有推理浮动窗口
   for msg_id, _ in pairs(M._reasoning_float_wins) do
     M.close_reasoning_float(msg_id)
-    cleaned = cleaned + 1
-  end
-  cleanup_table(M._reasoning_float_wins, function(win) return win and vim.api.nvim_win_is_valid(win) end)
-  cleanup_table(M._reasoning_float_buffers, is_buf_valid)
-
-  -- 清理已删除的缓冲区引用
-  if not is_buf_valid(M.buffers.main) then
-    M.buffers.main = nil
-  end
-  if not is_buf_valid(M.tree_buffers.main) then
-    M.tree_buffers.main = nil
   end
 
-  return cleaned
+  return utils.cleanup_windows(
+    M.windows,
+    M.buffers,
+    M.tree_buffers,
+    M._reasoning_float_wins,
+    M._reasoning_float_buffers
+  )
 end
 
---- 设置窗口换行选项
+--- 设置窗口换行选项（使用 utils 版本）
 function M.set_window_wrap()
-  for _, win in pairs(M.windows) do
-    if is_win_valid(win) then
-      vim.api.nvim_set_option_value("wrap", true, { win = win })
-      vim.api.nvim_set_option_value("linebreak", true, { win = win })
-      vim.api.nvim_set_option_value("breakindent", true, { win = win })
-      -- 启用折叠功能，使用标记折叠法
-      vim.api.nvim_set_option_value("foldmethod", "marker", { win = win })
-      vim.api.nvim_set_option_value("foldenable", true, { win = win })
-    end
-  end
+  utils.set_window_wrap(M.windows)
 end
 
 --- 计划调整窗口大小（防抖）
@@ -852,7 +521,7 @@ function M.schedule_resize()
 
   vim.defer_fn(function()
     M._resize_pending = false
-    if M.is_open and is_win_valid(M.windows.main) then
+    if M.is_open and utils.is_win_valid(M.windows.main) then
       M.update_display()
     end
   end, 100)
@@ -864,40 +533,40 @@ end
 M.update_display_debounced = {}
 
 -- 通用防抖更新（向后兼容）
-M.update_display_debounced.default = debounce(function()
+M.update_display_debounced.default = utils.debounce(function()
   M.update_display()
-end, 50, "update_display_default")
+end, 50, "update_display_default", M._debounce_timers)
 
 -- 各事件类型独立的防抖更新函数
-M.update_display_debounced.message = debounce(function()
+M.update_display_debounced.message = utils.debounce(function()
   M.update_display()
-end, 50, "update_display_message")
+end, 50, "update_display_message", M._debounce_timers)
 
-M.update_display_debounced.delete = debounce(function()
+M.update_display_debounced.delete = utils.debounce(function()
   M.update_display()
-end, 50, "update_display_delete")
+end, 50, "update_display_delete", M._debounce_timers)
 
-M.update_display_debounced.reply = debounce(function()
+M.update_display_debounced.reply = utils.debounce(function()
   M.update_display()
-end, 50, "update_display_reply")
+end, 50, "update_display_reply", M._debounce_timers)
 
-M.update_display_debounced.response = debounce(function()
+M.update_display_debounced.response = utils.debounce(function()
   M.update_display()
-end, 50, "update_display_response")
+end, 50, "update_display_response", M._debounce_timers)
 
-M.update_display_debounced.session = debounce(function()
+M.update_display_debounced.session = utils.debounce(function()
   M.update_display()
-end, 50, "update_display_session")
+end, 50, "update_display_session", M._debounce_timers)
 
-M.update_display_debounced.turn = debounce(function()
+M.update_display_debounced.turn = utils.debounce(function()
   M.update_display()
-end, 50, "update_display_turn")
+end, 50, "update_display_turn", M._debounce_timers)
 
 --- 调整窗口大小（根据内容自动计算）
 -- @param content_width 内容宽度
 -- @param content_height 内容高度
 function M.adjust_window_size(content_width, content_height)
-  if not is_win_valid(M.windows.main) then
+  if not utils.is_win_valid(M.windows.main) then
     return
   end
 
@@ -907,15 +576,15 @@ function M.adjust_window_size(content_width, content_height)
 
   -- 浮动模式：居中显示，自动调整大小
   if mode == M.ui_modes.FLOAT then
-    local w = clamp(content_width + 6, 50, math.min(math.floor(editor_w * 0.85), 140))
-    local h = clamp(content_height + 6, 8, math.min(editor_h - 6, 45))
+    local w = utils.clamp(content_width + 6, 50, math.min(math.floor(editor_w * 0.85), 140))
+    local h = utils.clamp(content_height + 6, 8, math.min(editor_h - 6, 45))
     w, h = M.apply_size_limits("float", w, h)
 
     local row = math.max(0, math.floor((editor_h - h) / 2))
     local col = math.max(0, math.floor((editor_w - w) / 2))
     row, col, w, h = M.validate_window_position(row, col, w, h)
 
-    safe_win_call(function()
+    utils.safe_win_call(function()
       vim.api.nvim_win_set_config(M.windows.main, {
         relative = "editor",
         row = row,
@@ -926,10 +595,10 @@ function M.adjust_window_size(content_width, content_height)
     end)
   -- 分割模式：调整宽度
   elseif mode == M.ui_modes.SPLIT then
-    local w = clamp(content_width + 6, 40, math.min(math.floor(editor_w * 0.6), 120))
+    local w = utils.clamp(content_width + 6, 40, math.min(math.floor(editor_w * 0.6), 120))
     w = M.apply_size_limits("split", w, editor_h)
 
-    safe_win_call(function()
+    utils.safe_win_call(function()
       vim.api.nvim_win_set_width(M.windows.main, w)
     end)
   end
@@ -938,7 +607,7 @@ end
 
 --- 调整树窗口大小（动态宽度，最大值为屏幕一半）
 function M.adjust_tree_window_size()
-  if not is_win_valid(M.windows.tree) or not is_buf_valid(M.tree_buffers.main) then
+  if not utils.is_win_valid(M.windows.tree) or not utils.is_buf_valid(M.tree_buffers.main) then
     return
   end
 
@@ -950,17 +619,17 @@ function M.adjust_tree_window_size()
   local max_w = 0
 
   for _, line in ipairs(lines) do
-    local width = display_width(line)
+    local width = utils.display_width(line)
     max_w = math.max(max_w, width)
   end
 
   -- 动态宽度 = 内容宽度 + 边距，但不超过屏幕一半
   local target = math.min(max_w + 10, max_width)
-  target = clamp(target, M.WINDOW_LIMITS.tree.min_width, max_width)
+  target = utils.clamp(target, M.WINDOW_LIMITS.tree.min_width, max_width)
 
   local current_w = vim.api.nvim_win_get_width(M.windows.tree)
   if target ~= current_w then
-    safe_win_call(function()
+    utils.safe_win_call(function()
       vim.api.nvim_win_set_width(M.windows.tree, target)
     end)
   end
@@ -1028,7 +697,7 @@ function M.get_window_strategy(mode)
       width = math.max(width, M.WINDOW_LIMITS.tree.min_width)
 
       -- 限制树窗口宽度不超过父窗口的指定比例
-      if M.WINDOW_LIMITS.tree.max_width_ratio and parent_win and is_win_valid(parent_win) then
+      if M.WINDOW_LIMITS.tree.max_width_ratio and parent_win and utils.is_win_valid(parent_win) then
         local parent_width = vim.api.nvim_win_get_width(parent_win)
         width = math.min(width, math.floor(parent_width * M.WINDOW_LIMITS.tree.max_width_ratio))
       end
@@ -1065,7 +734,7 @@ function M.setup_windows(win_opts)
 
   -- 异步等待渲染完成后将光标定位到输入提示行
   vim.defer_fn(function()
-    if M.is_open and is_win_valid(M.windows.main) and is_buf_valid(M.buffers.main) then
+    if M.is_open and utils.is_win_valid(M.windows.main) and utils.is_buf_valid(M.buffers.main) then
       -- 确保输入行可编辑
       vim.api.nvim_set_option_value("modifiable", true, { buf = M.buffers.main })
       vim.api.nvim_set_option_value("readonly", false, { buf = M.buffers.main })
@@ -1086,7 +755,7 @@ end
 -- 为树缓冲区注册 CursorMoved 事件处理器，支持智能跳转：
 -- 向下移动时跳到下一轮对话开始，向上移动时跳到上一轮对话开始
 function M.setup_tree_cursor_autocmd()
-  if not is_buf_valid(M.tree_buffers.main) then
+  if not utils.is_buf_valid(M.tree_buffers.main) then
     return
   end
 
@@ -1165,7 +834,7 @@ function M.setup_tree_cursor_autocmd()
     buffer = M.tree_buffers.main,
     callback = function()
       -- 未就绪或正在移动或窗口无效，直接返回
-      if not is_ready or is_moving or not is_win_valid(M.windows.tree) then
+      if not is_ready or is_moving or not utils.is_win_valid(M.windows.tree) then
         return
       end
 
@@ -1276,7 +945,7 @@ function M.setup_tree_cursor_autocmd()
 
           jump_debounce_timer:start(50, 0, function()
             vim.schedule(function()
-              if not is_win_valid(M.windows.tree) then
+              if not utils.is_win_valid(M.windows.tree) then
                 return
               end
 
@@ -1372,7 +1041,7 @@ end
 -- 创建用于显示聊天内容的主缓冲区，并初始化欢迎信息
 function M.create_buffers()
   -- 如果已存在有效缓冲区，直接复用
-  if is_buf_valid(M.buffers.main) then
+  if utils.is_buf_valid(M.buffers.main) then
     return
   end
 
@@ -1392,7 +1061,7 @@ end
 -- 创建用于显示会话列表树视图的缓冲区，设置文件类型和渲染初始内容
 function M.create_tree_buffers()
   -- 如果已存在有效树缓冲区，直接复用
-  if is_buf_valid(M.tree_buffers.main) then
+  if utils.is_buf_valid(M.tree_buffers.main) then
     return
   end
 
@@ -1409,18 +1078,18 @@ end
 --- 设置缓冲区属性
 -- 配置主缓冲区的各项属性，并初始化快捷键、输入处理和显示
 function M.setup_buffers()
-  vim.api.nvim_set_option_value("filetype", "markdown", { buf = M.buffers.main })
+  vim.api.nvim_set_option_value("filetype", "text", { buf = M.buffers.main })
   vim.api.nvim_set_option_value("modifiable", true, { buf = M.buffers.main }) -- 允许编辑
   vim.api.nvim_set_option_value("buftype", "nofile", { buf = M.buffers.main }) -- 非文件缓冲区
   vim.api.nvim_set_option_value("bufhidden", "hide", { buf = M.buffers.main }) -- 隐藏时保留缓冲区
   vim.api.nvim_set_option_value("swapfile", false, { buf = M.buffers.main }) -- 不创建交换文件
-  
+
   -- 设置缩进选项
   vim.api.nvim_set_option_value("shiftwidth", 4, { buf = M.buffers.main })
   vim.api.nvim_set_option_value("tabstop", 4, { buf = M.buffers.main })
   vim.api.nvim_set_option_value("softtabstop", 4, { buf = M.buffers.main })
   vim.api.nvim_set_option_value("expandtab", true, { buf = M.buffers.main })
-  
+
   M.setup_keymaps() -- 设置快捷键
   M.setup_input_handling() -- 设置输入处理（自动命令）
   M.update_display() -- 初始渲染显示
@@ -1432,7 +1101,7 @@ end
 -- 封装树视图的完整渲染流程：清除内容、重绘、设置高亮、调整大小
 function M._render_tree_interface()
   local buf = M.tree_buffers.main
-  if not is_buf_valid(buf) then
+  if not utils.is_buf_valid(buf) then
     return
   end
 
@@ -1493,7 +1162,7 @@ function M._build_tree_content()
       local prefix = is_last_root and "└─ " or "├─ "
       local file_icon = "󰈙"
       local session_info =
-        string.format("%s%s %s (%d)", prefix, file_icon, sanitize_line(session.name), #session.messages)
+        string.format("%s%s %s (%d)", prefix, file_icon, utils.sanitize_line(session.name), #session.messages)
       table.insert(lines, session_info)
 
       M.tree_buffers.session_positions[M._next_line_num] =
@@ -1532,9 +1201,9 @@ end
 -- @param ns_id 命名空间ID
 function M._add_tree_bottom_hints(buf, lines, ns_id)
   local win_width = 40
-  if is_win_valid(M.windows.tree) then
+  if utils.is_win_valid(M.windows.tree) then
     win_width = vim.api.nvim_win_get_width(M.windows.tree)
-  elseif is_win_valid(M.windows.main) then
+  elseif utils.is_win_valid(M.windows.main) then
     win_width = vim.api.nvim_win_get_width(M.windows.main)
   end
 
@@ -1554,7 +1223,7 @@ function M._add_tree_bottom_hints(buf, lines, ns_id)
   for _, part in ipairs(all_parts) do
     local prefixed = "🔹 " .. part
     local test_line = current_line == "" and prefixed or (current_line .. "  " .. prefixed)
-    if display_width(test_line) <= max_width_per_line and current_line ~= "" then
+    if utils.display_width(test_line) <= max_width_per_line and current_line ~= "" then
       current_line = test_line
     else
       if current_line ~= "" then
@@ -1567,7 +1236,7 @@ function M._add_tree_bottom_hints(buf, lines, ns_id)
     table.insert(hint_lines, current_line)
   end
 
-  local separator_len = calculate_text_width()
+  local separator_len = utils.calculate_text_width()
 
   table.insert(lines, "")
   M._next_line_num = M._next_line_num + 1
@@ -1590,11 +1259,11 @@ function M._add_tree_bottom_hints(buf, lines, ns_id)
 
   -- 延迟调整分隔线长度
   vim.defer_fn(function()
-    if not is_buf_valid(buf) then
+    if not utils.is_buf_valid(buf) then
       return
     end
 
-    local text_width = calculate_text_width()
+    local text_width = utils.calculate_text_width()
     local line_count = vim.api.nvim_buf_line_count(buf)
     local sep_line_idx = nil
     for i = line_count, 1, -1 do
@@ -1644,12 +1313,12 @@ end
 -- 封装聊天界面的完整渲染流程：清除内容、重绘消息、设置可编辑性、调整窗口
 function M._render_chat_interface()
   local buf = M.buffers.main
-  if not is_buf_valid(buf) then
+  if not utils.is_buf_valid(buf) then
     return
   end
 
   -- 保存当前光标位置
-  local save_cursor = is_win_valid(M.windows.main) and vim.api.nvim_win_get_cursor(M.windows.main) or nil
+  local save_cursor = utils.is_win_valid(M.windows.main) and vim.api.nvim_win_get_cursor(M.windows.main) or nil
 
   -- 确保缓冲区可修改
   vim.api.nvim_set_option_value("modifiable", true, { buf = buf })
@@ -1679,12 +1348,12 @@ function M._render_chat_interface()
   M._last_buffer_line_count = vim.api.nvim_buf_line_count(buf)
 
   -- 调整窗口大小
-  local max_width = calculate_text_width()
+  local max_width = utils.calculate_text_width()
   M.adjust_window_size(max_width, #lines)
   M.set_window_wrap()
 
   -- 恢复光标或滚动到底部
-  if is_win_valid(M.windows.main) then
+  if utils.is_win_valid(M.windows.main) then
     local last_line = vim.api.nvim_buf_line_count(buf)
     if save_cursor and save_cursor[1] <= last_line then
       pcall(vim.api.nvim_win_set_cursor, M.windows.main, save_cursor)
@@ -1692,7 +1361,7 @@ function M._render_chat_interface()
       vim.api.nvim_win_set_cursor(M.windows.main, { M.input_start_line + 1, 0 })
     end
   end
-  
+
   -- 创建推理内容浮动窗口（延迟执行，确保渲染完成）
   vim.defer_fn(function()
     M._create_reasoning_float_windows()
@@ -1707,7 +1376,7 @@ function M._create_reasoning_float_windows()
     return
   end
 
-  if not is_win_valid(M.windows.main) or not is_buf_valid(M.buffers.main) then
+  if not utils.is_win_valid(M.windows.main) or not utils.is_buf_valid(M.buffers.main) then
     return
   end
 
@@ -1718,9 +1387,12 @@ function M._create_reasoning_float_windows()
     current_line = current_line + 1
 
     -- 检查是否有推理内容
-    if msg.metadata and msg.metadata.has_reasoning and msg.metadata.reasoning_content
-      and M.config.llm.show_reasoning then
-
+    if
+      msg.metadata
+      and msg.metadata.has_reasoning
+      and msg.metadata.reasoning_content
+      and M.config.llm.show_reasoning
+    then
       local is_pending = msg.pending -- true = 思考中
       local reasoning_text = msg.metadata.reasoning_content
 
@@ -1765,7 +1437,7 @@ function M._create_reasoning_float_windows()
     end
 
     -- 跳过消息内容行
-    local content_lines = wrap_message_content(msg.content or "", calculate_text_width() - 4)
+    local content_lines = utils.wrap_message_content(msg.content or "", utils.calculate_text_width() - 4)
     current_line = current_line + #content_lines
 
     -- 跳过消息间的空行
@@ -1825,7 +1497,7 @@ end
 -- @return table 行数组, table 分隔线位置
 function M._build_chat_content()
   local lines = {}
-  local max_width = calculate_text_width()
+  local max_width = utils.calculate_text_width()
   local separator_positions = {}
   local session = backend.current_session and backend.sessions[backend.current_session]
 
@@ -1860,18 +1532,23 @@ function M._build_chat_content()
       table.insert(lines, header)
 
       -- 如果消息有推理内容且启用了显示，直接插入推理内容行
-      if msg.metadata and msg.metadata.has_reasoning and msg.metadata.reasoning_content
-        and M.config.llm.show_reasoning then
+      if
+        msg.metadata
+        and msg.metadata.has_reasoning
+        and msg.metadata.reasoning_content
+        and M.config.llm.show_reasoning
+      then
         -- 判断推理是否完成：优先使用 reasoning_finished 标记（模型开始输出正文时设置）
-        local is_complete = msg.metadata.reasoning_finished or (not msg.pending)
-        local reasoning_display_lines = build_reasoning_lines(msg.metadata.reasoning_content, max_width, is_complete, msg.id)
+        local is_complete = msg.metadata.reasoning_finished or not msg.pending
+        local reasoning_display_lines =
+          build_reasoning_lines(msg.metadata.reasoning_content, max_width, is_complete, msg.id)
         for _, rline in ipairs(reasoning_display_lines) do
           table.insert(lines, rline)
         end
       end
 
       -- 添加消息内容（自动换行）
-      local content_lines = wrap_message_content(msg.content or "", max_width - 4)
+      local content_lines = utils.wrap_message_content(msg.content or "", max_width - 4)
       for _, line in ipairs(content_lines) do
         table.insert(lines, line)
       end
@@ -1915,7 +1592,7 @@ function M._add_chat_separators(buf, lines, separator_positions, ns_virtual_text
   vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
 
   -- 添加虚拟文本分割线
-  local max_width = calculate_text_width()
+  local max_width = utils.calculate_text_width()
   for _, sep_line in ipairs(separator_positions) do
     vim.api.nvim_buf_set_extmark(buf, ns_virtual_text, sep_line, 0, {
       virt_text = { { string.rep(M.get_separator_char(), max_width), "Comment" } },
@@ -1966,7 +1643,7 @@ end
 --- 渲染会话树（文件树样式，合并共享历史）
 -- 在树视图中展示所有会话及其消息预览，支持点击切换会话
 function M.render_session_tree()
-  if not is_buf_valid(M.tree_buffers.main) then
+  if not utils.is_buf_valid(M.tree_buffers.main) then
     return
   end
 
@@ -2019,14 +1696,14 @@ function M._render_session_tree_recursive(lines, session_id, session, tree_prefi
   end
 
   -- 渲染消息轮次
-  local preview_len = calc_preview_length(tree_prefix)
+  local preview_len = utils.calc_preview_length(tree_prefix)
   for i = 1, #turns do
     local turn = turns[i]
     local is_last_turn = (i == #turns) and (max_branch_turn == 0)
     local line_prefix = tree_prefix .. (is_last_turn and "└─ " or "├─ ")
 
     -- 用户消息
-    local user_preview = truncate_content(sanitize_line(turn.user_msg.content), preview_len)
+    local user_preview = utils.truncate_content(utils.sanitize_line(turn.user_msg.content), preview_len)
     local user_time = os.date("%H:%M", turn.user_msg.timestamp)
     table.insert(lines, string.format("%s💬 [%s] %s", line_prefix, user_time, user_preview))
 
@@ -2041,7 +1718,7 @@ function M._render_session_tree_recursive(lines, session_id, session, tree_prefi
 
     -- 助手消息
     if turn.assistant_msg then
-      local asst_preview = truncate_content(sanitize_line(turn.assistant_msg.content), preview_len)
+      local asst_preview = utils.truncate_content(utils.sanitize_line(turn.assistant_msg.content), preview_len)
       local asst_time = os.date("%H:%M", turn.assistant_msg.timestamp)
       local reply_prefix = tree_prefix .. (is_last_turn and "   " or "│  ")
       table.insert(lines, string.format("%s🤖 [%s] %s", reply_prefix, asst_time, asst_preview))
@@ -2131,14 +1808,14 @@ function M._render_session_tree_tail(lines, session_id, session, tree_prefix, is
     end
   end
 
-  local preview_len = calc_preview_length(tree_prefix)
+  local preview_len = utils.calc_preview_length(tree_prefix)
 
   for i = skip_turns + 1, #turns do
     local turn = turns[i]
     local is_last_turn = (i == #turns) and (max_branch_turn <= i)
     local line_prefix = tree_prefix .. (is_last_turn and "└─ " or "├─ ")
 
-    local user_preview = truncate_content(sanitize_line(turn.user_msg.content), preview_len)
+    local user_preview = utils.truncate_content(utils.sanitize_line(turn.user_msg.content), preview_len)
     local user_time = os.date("%H:%M", turn.user_msg.timestamp)
     table.insert(lines, string.format("%s💬 [%s] %s", line_prefix, user_time, user_preview))
 
@@ -2152,7 +1829,7 @@ function M._render_session_tree_tail(lines, session_id, session, tree_prefix, is
     M._next_line_num = M._next_line_num + 1
 
     if turn.assistant_msg then
-      local asst_preview = truncate_content(sanitize_line(turn.assistant_msg.content), preview_len)
+      local asst_preview = utils.truncate_content(utils.sanitize_line(turn.assistant_msg.content), preview_len)
       local asst_time = os.date("%H:%M", turn.assistant_msg.timestamp)
       local reply_prefix = tree_prefix .. (is_last_turn and "   " or "│  ")
       table.insert(lines, string.format("%s🤖 [%s] %s", reply_prefix, asst_time, asst_preview))
@@ -2204,7 +1881,7 @@ end
 --- 设置树视图快捷键
 -- 为树视图缓冲区绑定导航和操作快捷键
 function M.setup_tree_keymaps()
-  if not is_buf_valid(M.tree_buffers.main) then
+  if not utils.is_buf_valid(M.tree_buffers.main) then
     return
   end
 
@@ -2416,7 +2093,7 @@ function M.update_display()
   M._render_chat_interface()
 
   -- 刷新树视图（如果应该显示）
-  if M.should_show_tree() and is_win_valid(M.windows.tree) and is_buf_valid(M.tree_buffers.main) then
+  if M.should_show_tree() and utils.is_win_valid(M.windows.tree) and utils.is_buf_valid(M.tree_buffers.main) then
     M.render_session_tree()
   end
 end
@@ -2438,16 +2115,20 @@ function M._setup_editability(_, session)
     current_line = current_line + 1
 
     -- 跳过推理内容行（不映射，不可编辑）
-    if msg.metadata and msg.metadata.has_reasoning and msg.metadata.reasoning_content
-      and M.config.llm.show_reasoning then
+    if
+      msg.metadata
+      and msg.metadata.has_reasoning
+      and msg.metadata.reasoning_content
+      and M.config.llm.show_reasoning
+    then
       -- 判断推理是否完成：优先使用 reasoning_finished 标记
-      local is_complete = msg.metadata.reasoning_finished or (not msg.pending)
+      local is_complete = msg.metadata.reasoning_finished or not msg.pending
       local reasoning_display_lines = build_reasoning_lines(msg.metadata.reasoning_content, 60, is_complete, msg.id)
       current_line = current_line + #reasoning_display_lines
     end
 
     -- 获取当前消息的内容行数（自动换行后的行数）
-    local content_lines = wrap_message_content(msg.content or "", 60 - 4)
+    local content_lines = utils.wrap_message_content(msg.content or "", 60 - 4)
 
     -- 只映射内容行（不映射标题行），这些行可以被用户编辑
     for j, _ in ipairs(content_lines) do
@@ -2494,14 +2175,14 @@ function M.open_chat_after_tree_selection()
 
   if mode == M.ui_modes.FLOAT then
     -- 浮动模式：树和主窗口是同一个，先替换缓冲区再删除树缓冲区
-    if is_win_valid(M.windows.main) then
+    if utils.is_win_valid(M.windows.main) then
       -- 切换回聊天缓冲区
       vim.api.nvim_win_set_buf(M.windows.main, M.buffers.main)
       M.windows.tree = nil -- 树视图已隐藏
       M.set_window_wrap()
       M.setup_buffers()
       -- 删除树缓冲区
-      if is_buf_valid(M.tree_buffers.main) then
+      if utils.is_buf_valid(M.tree_buffers.main) then
         vim.api.nvim_buf_delete(M.tree_buffers.main, { force = true })
         M.tree_buffers.main = nil
       end
@@ -2514,7 +2195,7 @@ function M.open_chat_after_tree_selection()
     end
   elseif mode == M.ui_modes.SPLIT then
     -- 分割模式：复用现有的分割窗口，只替换缓冲区内容
-    if is_win_valid(M.windows.tree) then
+    if utils.is_win_valid(M.windows.tree) then
       -- 将树窗口重新用于显示聊天内容
       vim.api.nvim_win_set_buf(M.windows.tree, M.buffers.main)
       M.windows.main = M.windows.tree
@@ -2537,13 +2218,13 @@ function M.open_chat_after_tree_selection()
       M.setup_buffers()
     end
     -- 删除树缓冲区
-    if is_buf_valid(M.tree_buffers.main) then
+    if utils.is_buf_valid(M.tree_buffers.main) then
       vim.api.nvim_buf_delete(M.tree_buffers.main, { force = true })
       M.tree_buffers.main = nil
     end
   elseif mode == M.ui_modes.TAB then
     -- 标签页模式：复用当前标签页，只替换缓冲区内容
-    if is_win_valid(M.windows.tree) then
+    if utils.is_win_valid(M.windows.tree) then
       -- 将树窗口重新用于显示聊天内容
       vim.api.nvim_win_set_buf(M.windows.tree, M.buffers.main)
       M.windows.main = M.windows.tree
@@ -2559,7 +2240,7 @@ function M.open_chat_after_tree_selection()
       M.setup_buffers()
     end
     -- 删除树缓冲区
-    if is_buf_valid(M.tree_buffers.main) then
+    if utils.is_buf_valid(M.tree_buffers.main) then
       vim.api.nvim_buf_delete(M.tree_buffers.main, { force = true })
       M.tree_buffers.main = nil
     end
@@ -2567,7 +2248,7 @@ function M.open_chat_after_tree_selection()
 
   -- 从树选择后切换到聊天界面：定位光标到输入行
   vim.defer_fn(function()
-    if is_win_valid(M.windows.main) and is_buf_valid(M.buffers.main) and M.input_start_line then
+    if utils.is_win_valid(M.windows.main) and utils.is_buf_valid(M.buffers.main) and M.input_start_line then
       vim.api.nvim_set_option_value("modifiable", true, { buf = M.buffers.main })
       vim.api.nvim_set_option_value("readonly", false, { buf = M.buffers.main })
       vim.api.nvim_win_set_cursor(M.windows.main, { M.input_start_line + 1, 0 })
@@ -2582,12 +2263,12 @@ function M.open_float()
   ensure_active_session()
 
   if M.should_show_tree() then
-    if not is_buf_valid(M.tree_buffers.main) then
+    if not utils.is_buf_valid(M.tree_buffers.main) then
       M.create_tree_buffers()
     end
 
     -- 先创建主缓冲区（不显示）
-    if not is_buf_valid(M.buffers.main) then
+    if not utils.is_buf_valid(M.buffers.main) then
       M.create_buffers()
     end
 
@@ -2628,7 +2309,7 @@ function M.open_float()
 
     -- 树视图模式：定位光标到第一行
     vim.defer_fn(function()
-      if is_win_valid(M.windows.tree) and is_buf_valid(M.tree_buffers.main) then
+      if utils.is_win_valid(M.windows.tree) and utils.is_buf_valid(M.tree_buffers.main) then
         vim.api.nvim_win_set_cursor(M.windows.tree, { 1, 0 })
       end
     end, 50)
@@ -2646,7 +2327,7 @@ function M.open_split()
   ensure_active_session()
 
   if M.should_show_tree() then
-    if not is_buf_valid(M.tree_buffers.main) then
+    if not utils.is_buf_valid(M.tree_buffers.main) then
       M.create_tree_buffers()
     end
 
@@ -2670,7 +2351,7 @@ function M.open_split()
 
     -- 树视图模式：定位光标到第一行
     vim.defer_fn(function()
-      if is_win_valid(M.windows.tree) and is_buf_valid(M.tree_buffers.main) then
+      if utils.is_win_valid(M.windows.tree) and utils.is_buf_valid(M.tree_buffers.main) then
         vim.api.nvim_win_set_cursor(M.windows.tree, { 1, 0 })
       end
     end, 50)
@@ -2694,7 +2375,12 @@ function M.open_split()
 
   -- 非树模式：定位光标到输入行
   vim.defer_fn(function()
-    if M.is_open and is_win_valid(M.windows.main) and is_buf_valid(M.buffers.main) and M.input_start_line then
+    if
+      M.is_open
+      and utils.is_win_valid(M.windows.main)
+      and utils.is_buf_valid(M.buffers.main)
+      and M.input_start_line
+    then
       vim.api.nvim_set_option_value("modifiable", true, { buf = M.buffers.main })
       vim.api.nvim_set_option_value("readonly", false, { buf = M.buffers.main })
       vim.api.nvim_win_set_cursor(M.windows.main, { M.input_start_line + 1, 0 })
@@ -2713,7 +2399,7 @@ function M.open_tab()
     M.create_buffers()
 
     -- 创建树缓冲区
-    if not is_buf_valid(M.tree_buffers.main) then
+    if not utils.is_buf_valid(M.tree_buffers.main) then
       M.create_tree_buffers()
     end
 
@@ -2741,7 +2427,7 @@ function M.open_tab()
 
     -- 树视图模式：定位光标到第一行
     vim.defer_fn(function()
-      if is_win_valid(M.windows.tree) and is_buf_valid(M.tree_buffers.main) then
+      if utils.is_win_valid(M.windows.tree) and utils.is_buf_valid(M.tree_buffers.main) then
         vim.api.nvim_win_set_cursor(M.windows.tree, { 1, 0 })
       end
     end, 50)
@@ -2760,7 +2446,12 @@ function M.open_tab()
 
   -- 非树模式：定位光标到输入行
   vim.defer_fn(function()
-    if M.is_open and is_win_valid(M.windows.main) and is_buf_valid(M.buffers.main) and M.input_start_line then
+    if
+      M.is_open
+      and utils.is_win_valid(M.windows.main)
+      and utils.is_buf_valid(M.buffers.main)
+      and M.input_start_line
+    then
       vim.api.nvim_set_option_value("modifiable", true, { buf = M.buffers.main })
       vim.api.nvim_set_option_value("readonly", false, { buf = M.buffers.main })
       vim.api.nvim_win_set_cursor(M.windows.main, { M.input_start_line + 1, 0 })
@@ -2798,7 +2489,7 @@ function M.setup_input_handling()
     group = group,
     buffer = M.buffers.main,
     callback = function()
-      if not is_win_valid(M.windows.main) or not is_buf_valid(M.buffers.main) then
+      if not utils.is_win_valid(M.windows.main) or not utils.is_buf_valid(M.buffers.main) then
         return
       end
       local cur_line = vim.api.nvim_win_get_cursor(M.windows.main)[1] - 1 -- 0-indexed
@@ -2824,7 +2515,7 @@ function M.setup_input_handling()
       vim.api.nvim_set_option_value("readonly", not is_editable, { buf = M.buffers.main })
 
       -- 管理输入行虚拟文本提示（光标在输入行时显示"输入消息: "提示）
-      if cur_line == M.input_start_line and is_buf_valid(M.buffers.main) then
+      if cur_line == M.input_start_line and utils.is_buf_valid(M.buffers.main) then
         M._update_input_prompt()
       end
     end,
@@ -2836,7 +2527,7 @@ function M.setup_input_handling()
     group = group,
     buffer = M.buffers.main,
     callback = function()
-      if not is_win_valid(M.windows.main) or not is_buf_valid(M.buffers.main) then
+      if not utils.is_win_valid(M.windows.main) or not utils.is_buf_valid(M.buffers.main) then
         return
       end
 
@@ -2862,7 +2553,7 @@ function M.setup_input_handling()
     group = group,
     buffer = M.buffers.main,
     callback = function()
-      if not is_win_valid(M.windows.main) or not is_buf_valid(M.buffers.main) then
+      if not utils.is_win_valid(M.windows.main) or not utils.is_buf_valid(M.buffers.main) then
         return
       end
 
@@ -2899,7 +2590,7 @@ function M.setup_input_handling()
     group = group,
     buffer = M.buffers.main,
     callback = function()
-      if not is_win_valid(M.windows.main) or not is_buf_valid(M.buffers.main) then
+      if not utils.is_win_valid(M.windows.main) or not utils.is_buf_valid(M.buffers.main) then
         return
       end
       local cur_line = vim.api.nvim_win_get_cursor(M.windows.main)[1] - 1
@@ -2921,7 +2612,7 @@ end
 -- 委托 backend.save_buffer_edit 接口处理缓冲区读取和消息保存
 -- @param line_num 编辑的行号（0-indexed）
 function M._save_edited_line(line_num)
-  if not is_buf_valid(M.buffers.main) then
+  if not utils.is_buf_valid(M.buffers.main) then
     return
   end
 
@@ -2959,7 +2650,7 @@ end
 --- 更新输入提示虚拟文本
 -- 当输入行为空时显示"输入消息: "提示，有内容时隐藏
 function M._update_input_prompt()
-  if not M.input_start_line or not is_buf_valid(M.buffers.main) then
+  if not M.input_start_line or not utils.is_buf_valid(M.buffers.main) then
     return
   end
 
@@ -2982,7 +2673,7 @@ end
 --- 保存并发送消息
 -- 从输入区域读取用户输入的内容，发送到后端 AI，并清空输入区域
 function M.save_and_send()
-  if not M.input_start_line or not is_buf_valid(M.buffers.main) then
+  if not M.input_start_line or not utils.is_buf_valid(M.buffers.main) then
     vim.notify("[NeoAI] 错误: 缓冲区无效", vim.log.levels.WARN)
     return
   end
@@ -3036,7 +2727,7 @@ end
 --- 光标定位到输入消息行
 -- 将光标移动到缓冲区底部的输入区域，方便用户继续输入
 function M.focus_input_line()
-  if M.input_start_line and is_buf_valid(M.buffers.main) and is_win_valid(M.windows.main) then
+  if M.input_start_line and utils.is_buf_valid(M.buffers.main) and utils.is_win_valid(M.windows.main) then
     local line_count = vim.api.nvim_buf_line_count(M.buffers.main)
     local target_line = M.input_start_line + 1 -- +1 因为 cursor 是 1-indexed
     -- 确保输入区域只有 1 行高
@@ -3056,7 +2747,7 @@ end
 --- 清理快捷键
 -- 删除主缓冲区所有模式下的自定义快捷键，避免与其他插件冲突
 function M.clear_keymaps()
-  if not is_buf_valid(M.buffers.main) then
+  if not utils.is_buf_valid(M.buffers.main) then
     return
   end
 
@@ -3072,7 +2763,7 @@ end
 --- 设置快捷键
 -- 为主缓冲区绑定所有自定义快捷键，包括消息编辑、会话管理、发送等功能
 function M.setup_keymaps()
-  if not is_win_valid(M.windows.main) then
+  if not utils.is_win_valid(M.windows.main) then
     return
   end
 
@@ -3085,7 +2776,7 @@ function M.setup_keymaps()
 
   -- 普通模式：e 键进入编辑模式
   map("n", "e", function()
-    if is_win_valid(M.windows.main) then
+    if utils.is_win_valid(M.windows.main) then
       local cur_line = vim.api.nvim_win_get_cursor(M.windows.main)[1] - 1
       -- 检查是否在可编辑行（通过 _line_to_message 映射表判断）
       if M._line_to_message and M._line_to_message[cur_line] then
@@ -3100,7 +2791,7 @@ function M.setup_keymaps()
   -- 思考中：打开/关闭浮动窗口
   -- 思考完成后：展开/折叠文本
   map("n", "r", function()
-    if is_win_valid(M.windows.main) then
+    if utils.is_win_valid(M.windows.main) then
       local cur_line = vim.api.nvim_win_get_cursor(M.windows.main)[1] - 1
       -- 检查当前行是否属于某个有推理内容的消息
       local session = backend.current_session and backend.sessions[backend.current_session]
@@ -3110,12 +2801,16 @@ function M.setup_keymaps()
           -- 标题行
           current_line = current_line + 1
           -- 推理内容行
-          if msg.metadata and msg.metadata.has_reasoning and msg.metadata.reasoning_content
-            and M.config.llm.show_reasoning then
+          if
+            msg.metadata
+            and msg.metadata.has_reasoning
+            and msg.metadata.reasoning_content
+            and M.config.llm.show_reasoning
+          then
             -- 如果光标在推理内容标题行上
             if cur_line == current_line then
               -- 判断推理是否完成：优先使用 reasoning_finished 标记
-              local is_complete = msg.metadata.reasoning_finished or (not msg.pending)
+              local is_complete = msg.metadata.reasoning_finished or not msg.pending
 
               if is_complete then
                 -- 思考完成后：切换折叠状态
@@ -3125,15 +2820,10 @@ function M.setup_keymaps()
                 if M._reasoning_float_wins[msg.id] then
                   M.close_reasoning_float(msg.id)
                 else
-                  M.create_reasoning_float_window(
-                    msg.id,
-                    msg.metadata.reasoning_content,
-                    M.windows.main,
-                    current_line
-                  )
+                  M.create_reasoning_float_window(msg.id, msg.metadata.reasoning_content, M.windows.main, current_line)
                 end
               end
-              
+
               -- 刷新显示
               M.update_display_debounced.message()
               return
@@ -3141,7 +2831,7 @@ function M.setup_keymaps()
             current_line = current_line + 1
           else
             -- 跳过内容和分隔行
-            local content_lines = wrap_message_content(msg.content or "", calculate_text_width() - 4)
+            local content_lines = utils.wrap_message_content(msg.content or "", utils.calculate_text_width() - 4)
             current_line = current_line + #content_lines
           end
           -- 消息间的空行
@@ -3169,7 +2859,7 @@ function M.setup_keymaps()
 
   -- 正常模式下回车：智能判断是发送消息还是进入编辑模式
   map("n", M.config.keymaps.normal_mode_send, function()
-    if is_win_valid(M.windows.main) then
+    if utils.is_win_valid(M.windows.main) then
       local cur_line = vim.api.nvim_win_get_cursor(M.windows.main)[1] - 1
       local input_end = M.input_end_line or M.input_start_line
       -- 检查是否在输入区域（缓冲区底部）
@@ -3210,8 +2900,8 @@ function M.close()
 
   -- 关闭所有窗口（主窗口、树视图窗口等）
   for _, win in pairs(M.windows) do
-    if is_win_valid(win) then
-      safe_win_call(function()
+    if utils.is_win_valid(win) then
+      utils.safe_win_call(function()
         -- 标签模式下，关闭整个标签页而不是单个窗口
         if M.current_mode == M.ui_modes.TAB then
           local tab = vim.api.nvim_win_get_tabpage(win)
@@ -3229,7 +2919,7 @@ function M.close()
 
   -- 删除所有主缓冲区
   for _, buf in pairs(M.buffers) do
-    if is_buf_valid(buf) then
+    if utils.is_buf_valid(buf) then
       pcall(function()
         vim.api.nvim_buf_delete(buf, { force = true })
       end)
@@ -3238,7 +2928,7 @@ function M.close()
 
   -- 删除所有树视图缓冲区
   for _, buf in pairs(M.tree_buffers) do
-    if is_buf_valid(buf) then
+    if utils.is_buf_valid(buf) then
       pcall(function()
         vim.api.nvim_buf_delete(buf, { force = true })
       end)
@@ -3366,8 +3056,7 @@ function M.setup(user_config)
   -- AI 回复完成事件：刷新显示并定位光标
   backend.on("ai_replied", function(data)
     -- 尝试关闭浮动窗口（如果还未关闭的话，幂等操作）
-    if data.message and data.message.id and data.message.metadata
-       and data.message.metadata.has_reasoning then
+    if data.message and data.message.id and data.message.metadata and data.message.metadata.has_reasoning then
       local msg_id = data.message.id
       M.finish_reasoning(msg_id, true)
     end
@@ -3401,7 +3090,7 @@ function M.setup(user_config)
   -- AI 推理内容更新事件（流式思考过程）：实时更新推理内容显示
   backend.on("ai_reasoning_update", function(data)
     -- 使用新引擎：启动或更新推理浮动窗口
-    if M.config.llm.show_reasoning and is_buf_valid(M.buffers.main) and data.message then
+    if M.config.llm.show_reasoning and utils.is_buf_valid(M.buffers.main) and data.message then
       local msg = data.message
       local msg_id = msg.id
       local reasoning_text = msg.metadata and msg.metadata.reasoning_content or ""
@@ -3459,11 +3148,11 @@ function M.setup(user_config)
   -- 窗口大小变化时自动更新推理内容宽度
   vim.api.nvim_create_autocmd("VimResized", {
     callback = function()
-      if M.is_open and is_buf_valid(M.buffers.main) then
+      if M.is_open and utils.is_buf_valid(M.buffers.main) then
         -- 清理所有推理状态，下次更新时会重新计算宽度
         M.cleanup_reason_state()
       end
-    end
+    end,
   })
 
   -- 响应接收事件：刷新显示并定位光标
@@ -3498,11 +3187,11 @@ function M.setup(user_config)
 
   -- 轮次删除事件：重新渲染树视图
   backend.on("turn_deleted", function(data)
-    if M.should_show_tree() and is_buf_valid(M.tree_buffers.main) then
+    if M.should_show_tree() and utils.is_buf_valid(M.tree_buffers.main) then
       vim.schedule(function()
         M.render_session_tree()
         -- 重置光标追踪状态（缓冲区内容已重建）
-        if is_win_valid(M.windows.tree) then
+        if utils.is_win_valid(M.windows.tree) then
           vim.api.nvim_win_set_cursor(M.windows.tree, { 1, 0 })
         end
         M.setup_tree_cursor_autocmd()
@@ -3514,11 +3203,11 @@ function M.setup(user_config)
 
   -- 分支删除事件：重新渲染树视图
   backend.on("branch_deleted", function(data)
-    if M.should_show_tree() and is_buf_valid(M.tree_buffers.main) then
+    if M.should_show_tree() and utils.is_buf_valid(M.tree_buffers.main) then
       vim.schedule(function()
         M.render_session_tree()
         -- 重置光标追踪状态（缓冲区内容已重建）
-        if is_win_valid(M.windows.tree) then
+        if utils.is_win_valid(M.windows.tree) then
           vim.api.nvim_win_set_cursor(M.windows.tree, { 1, 0 })
         end
         M.setup_tree_cursor_autocmd()
@@ -3560,12 +3249,12 @@ function M.setup(user_config)
           end
 
           -- 重新渲染聊天界面
-          if is_buf_valid(M.buffers.main) then
+          if utils.is_buf_valid(M.buffers.main) then
             M._render_chat_interface()
           end
 
           -- 重新渲染树视图
-          if M.should_show_tree() and is_buf_valid(M.tree_buffers.main) then
+          if M.should_show_tree() and utils.is_buf_valid(M.tree_buffers.main) then
             M._render_tree_interface()
           end
         end, 100)
