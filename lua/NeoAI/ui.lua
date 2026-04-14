@@ -104,6 +104,57 @@ local function safe_win_call(fn)
   return pcall(fn)
 end
 
+--- 计算窗口实际文本可用宽度（减去装饰列）
+-- @return number 文本可用宽度
+local function calculate_text_width()
+  -- 获取窗口宽度（含所有装饰列）
+  local win_width = 0
+  if is_win_valid(M.windows.tree) then
+    win_width = vim.api.nvim_win_get_width(M.windows.tree)
+  elseif is_win_valid(M.windows.main) then
+    win_width = vim.api.nvim_win_get_width(M.windows.main)
+  end
+
+  if win_width < 1 then
+    return 40 -- 默认值
+  end
+
+  -- 获取实际文本可用宽度（减去装饰列）
+  local target_win = is_win_valid(M.windows.tree) and M.windows.tree or M.windows.main
+  local text_width = win_width
+
+  if target_win then
+    -- 行号列宽度
+    if vim.api.nvim_get_option_value("number", { win = target_win }) or
+       vim.api.nvim_get_option_value("relativenumber", { win = target_win }) then
+      local nw = vim.api.nvim_get_option_value("numberwidth", { win = target_win })
+      text_width = text_width - (tonumber(nw) or 4)
+    end
+
+    -- 符号列宽度
+    local sc = vim.api.nvim_get_option_value("signcolumn", { win = target_win })
+    if sc == "yes" then
+      text_width = text_width - 2
+    elseif sc == "auto" then
+      -- auto 时检查是否有符号显示
+      local signs = vim.fn.sign_getplaced(vim.api.nvim_win_get_buf(target_win), { group = "*" })
+      if signs and signs[1] and #signs[1].signs > 0 then
+        text_width = text_width - 2
+      end
+    end
+
+    -- 折叠列宽度
+    if vim.api.nvim_get_option_value("foldenable", { win = target_win }) then
+      local fc = vim.api.nvim_get_option_value("foldcolumn", { win = target_win })
+      if fc ~= "0" and fc ~= 0 then
+        text_width = text_width - (tonumber(fc) or 1)
+      end
+    end
+  end
+
+  return math.max(1, text_width)
+end
+
 --- 文本自动换行
 -- @param text 原始文本
 -- @param max_width 最大宽度（字符数）
@@ -749,7 +800,7 @@ end
 --- 设置缓冲区属性
 -- 配置主缓冲区的各项属性，并初始化快捷键、输入处理和显示
 function M.setup_buffers()
-  vim.api.nvim_set_option_value("filetype", "NeoAI", { buf = M.buffers.main })
+  vim.api.nvim_set_option_value("filetype", "markdown", { buf = M.buffers.main })
   vim.api.nvim_set_option_value("modifiable", true, { buf = M.buffers.main }) -- 允许编辑
   vim.api.nvim_set_option_value("buftype", "nofile", { buf = M.buffers.main }) -- 非文件缓冲区
   vim.api.nvim_set_option_value("bufhidden", "hide", { buf = M.buffers.main }) -- 隐藏时保留缓冲区
@@ -795,12 +846,18 @@ function M.render_session_tree()
     return
   end
 
+  -- 确保缓冲区可修改（清除只读状态）
   vim.api.nvim_set_option_value("modifiable", true, { buf = buf })
+  vim.api.nvim_set_option_value("readonly", false, { buf = buf })
   vim.api.nvim_buf_set_lines(buf, 0, -1, false, {})
+
+  -- 清除旧的虚拟文本（避免重复叠加）
+  local ns_bottom_hint = vim.api.nvim_create_namespace("NeoAITreeBottomHint")
+  vim.api.nvim_buf_clear_namespace(buf, ns_bottom_hint, 0, -1)
 
   local lines = {}
   local ns_id = vim.api.nvim_create_namespace("NeoAITree") -- 高亮命名空间
-  M.tree_buffers.session_positions = {} -- 记录每行对应的会话/消息位置信息
+  M.tree_buffers.session_positions = {} -- 记录每行对应的会话/消息信息
 
   -- 标题（缩短以适配更小宽度）
   local title = "📂 Chat History"
@@ -832,13 +889,111 @@ function M.render_session_tree()
     table.insert(lines, "")
   end
 
-  -- 底部操作提示
-  local bottom_width = 50
-  table.insert(lines, string.rep("─", bottom_width))
-  table.insert(lines, "🔹 <CR> 选择  🔹 n 新建  🔹 q 关闭")
-
-  -- 写入缓冲区
+  -- 写入缓冲区（不包含底部提示）
   vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+
+  -- 根据窗口宽度手动分割提示文本
+  local win_width = 40 -- 默认值
+  if is_win_valid(M.windows.tree) then
+    win_width = vim.api.nvim_win_get_width(M.windows.tree)
+  elseif is_win_valid(M.windows.main) then
+    win_width = vim.api.nvim_win_get_width(M.windows.main)
+  end
+
+  local max_width_per_line = math.max(25, win_width - 2)
+
+  -- 定义提示部分
+  local all_parts = {
+    "<CR> 选择",
+    "n 分支",
+    "N 空对话",
+    "d 删轮次",
+    "D 删分支",
+    "q 关闭",
+  }
+
+  -- 重新组合，确保每行显示宽度不超过 max_width_per_line
+  local hint_lines = {}
+  local current_line = ""
+  for _, part in ipairs(all_parts) do
+    local prefixed = "🔹 " .. part
+    local test_line = current_line == "" and prefixed or (current_line .. "  " .. prefixed)
+    if display_width(test_line) <= max_width_per_line and current_line ~= "" then
+      current_line = test_line
+    else
+      if current_line ~= "" then
+        table.insert(hint_lines, current_line)
+      end
+      current_line = prefixed
+    end
+  end
+  if current_line ~= "" then
+    table.insert(hint_lines, current_line)
+  end
+
+  -- 计算最长行宽度用于分隔线长度
+  local max_hint_width = 0
+  for _, line in ipairs(hint_lines) do
+    local w = display_width(line)
+    if w > max_hint_width then
+      max_hint_width = w
+    end
+  end
+
+  -- 分隔线长度 = 实际文本可用宽度
+  local separator_len = calculate_text_width()
+
+  -- 添加分隔线和提示行
+  table.insert(lines, "")
+  local separator_line = #lines
+  table.insert(lines, string.rep(M.get_separator_char(), separator_len))
+
+  for _, line in ipairs(hint_lines) do
+    table.insert(lines, line)
+  end
+
+  -- 重新写入包含提示的缓冲区
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+
+  -- 添加分隔线高亮
+  vim.api.nvim_buf_set_extmark(buf, ns_bottom_hint, separator_line, 0, {
+    end_row = separator_line + 1,
+    hl_group = "Comment",
+    hl_eol = true,
+  })
+
+  -- 延迟调整分隔线长度（确保窗口已渲染完成）
+  vim.defer_fn(function()
+    if not is_buf_valid(buf) then
+      return
+    end
+
+    local text_width = calculate_text_width()
+
+    -- 查找分隔线位置（从底部向上搜索）
+    local line_count = vim.api.nvim_buf_line_count(buf)
+    local sep_line_idx = nil
+    for i = line_count, 1, -1 do
+      local line = vim.api.nvim_buf_get_lines(buf, i - 1, i, false)[1]
+      if line and line:match("^[─]+$") and #line > 10 then
+        sep_line_idx = i - 1
+        break
+      end
+    end
+
+    if not sep_line_idx then
+      return
+    end
+
+    local new_sep_text = string.rep(M.get_separator_char(), text_width)
+
+    -- 替换分隔线内容
+    vim.api.nvim_set_option_value("modifiable", true, { buf = buf })
+    vim.api.nvim_set_option_value("readonly", false, { buf = buf })
+    vim.api.nvim_buf_set_lines(buf, sep_line_idx, sep_line_idx + 1, false, { new_sep_text })
+    vim.api.nvim_set_option_value("modifiable", false, { buf = buf })
+    vim.api.nvim_set_option_value("readonly", true, { buf = buf })
+  end, 50)
 
   -- 应用高亮（当前会话用 Todo 高亮，其他用 Normal）
   for line_num, pos in pairs(M.tree_buffers.session_positions) do
@@ -956,13 +1111,125 @@ function M.setup_tree_keymaps()
     end
   end, "选择会话")
 
-  -- n键：新建会话并跳到开始对话界面
-  map("n", function()
-    backend.new_session("会话 " .. (#backend.sessions + 1))
-    vim.notify("[NeoAI] 新会话已创建")
-    M.render_session_tree() -- 刷新树视图
+  -- n键：在当前光标位置新建对话分支
+  map(M.config.tree_keymaps.new_branch, function()
+    local cursor = vim.api.nvim_win_get_cursor(M.windows.tree)
+    local line = cursor[1] -- 1-indexed
+    local pos = M.tree_buffers.session_positions and M.tree_buffers.session_positions[line]
+
+    if pos and (pos.type == "conversation_turn" or pos.type == "assistant_reply") then
+      -- 在对话轮次或助手回复行上：创建分支
+      local sid = pos.session_id
+      local turn_index = pos.turn_index
+      local new_session = backend.create_branch_at_turn(sid, turn_index)
+      if new_session then
+        vim.schedule(function()
+          M.render_session_tree()
+        end)
+        backend.current_session = new_session.id
+        M.open_chat_after_tree_selection()
+      end
+    elseif pos and pos.type == "session" then
+      -- 在会话标题行上：复制整个会话作为新分支
+      local sid = pos.id
+      local session = backend.sessions[sid]
+      if session and #session.messages > 0 then
+        -- 在最后一轮创建分支
+        local turn_count = 0
+        for _, msg in ipairs(session.messages) do
+          if msg.role == "user" then
+            turn_count = turn_count + 1
+          end
+        end
+        if turn_count > 0 then
+          local new_session = backend.create_branch_at_turn(sid, turn_count)
+          if new_session then
+            vim.schedule(function()
+              M.render_session_tree()
+            end)
+            backend.current_session = new_session.id
+            M.open_chat_after_tree_selection()
+          end
+        else
+          vim.notify("[NeoAI] 该会话没有对话轮次", vim.log.levels.WARN)
+        end
+      else
+        vim.notify("[NeoAI] 该会话为空", vim.log.levels.WARN)
+      end
+    else
+      vim.notify("[NeoAI] 请先选择一个对话轮次", vim.log.levels.WARN)
+    end
+  end, "新建分支")
+
+  -- N键：新建空对话
+  map(M.config.tree_keymaps.new_conversation, function()
+    backend.new_empty_conversation("空对话 " .. (#backend.sessions + 1))
+    vim.schedule(function()
+      M.render_session_tree()
+    end)
     M.open_chat_after_tree_selection() -- 跳到对话界面
-  end, "新建会话")
+  end, "新建空对话")
+
+  -- d键：删除当前光标这一轮对话
+  map(M.config.tree_keymaps.delete_turn, function()
+    local cursor = vim.api.nvim_win_get_cursor(M.windows.tree)
+    local line = cursor[1] -- 1-indexed
+    local pos = M.tree_buffers.session_positions and M.tree_buffers.session_positions[line]
+
+    if pos and (pos.type == "conversation_turn" or pos.type == "assistant_reply") then
+      -- 在对话轮次或助手回复行上：删除该轮
+      local sid = pos.session_id
+      local turn_index = pos.turn_index
+      if backend.delete_turn(sid, turn_index) then
+        vim.schedule(function()
+          M.render_session_tree()
+        end)
+      end
+    else
+      vim.notify("[NeoAI] 请将光标放在要删除的对话轮次上", vim.log.levels.WARN)
+    end
+  end, "删除当前轮次")
+
+  -- D键：删除当前分支
+  map(M.config.tree_keymaps.delete_branch, function()
+    local cursor = vim.api.nvim_win_get_cursor(M.windows.tree)
+    local line = cursor[1] -- 1-indexed
+    local pos = M.tree_buffers.session_positions and M.tree_buffers.session_positions[line]
+
+    if pos and pos.type == "session" then
+      -- 在会话标题行上：删除该会话及其所有子会话
+      local sid = pos.id
+      local session = backend.sessions[sid]
+      if session then
+        -- 确认删除
+        local confirm = vim.fn.confirm("确定要删除分支 '" .. session.name .. "' 及其所有子会话吗？", "&Yes\n&No", 2)
+        if confirm == 1 then
+          if backend.delete_branch(sid) then
+            vim.schedule(function()
+              M.render_session_tree()
+            end)
+          end
+        end
+      end
+    elseif pos and (pos.type == "conversation_turn" or pos.type == "assistant_reply") then
+      -- 在对话轮次或助手回复行上：删除该轮次所在的分支
+      local sid = pos.session_id
+      local session = backend.sessions[sid]
+      if session then
+        -- 确认删除
+        local confirm = vim.fn.confirm("确定要删除分支 '" .. session.name .. "' 及其所有子会话吗？", "&Yes\n&No", 2)
+        if confirm == 1 then
+          if backend.delete_branch(sid) then
+            vim.schedule(function()
+              M.render_session_tree()
+            end)
+          end
+        end
+      end
+    else
+      vim.notify("[NeoAI] 请将光标放在要删除的会话或对话轮次上", vim.log.levels.WARN)
+    end
+  end, "删除当前分支")
 
   -- 关闭快捷键
   map("q", M.close, "关闭")
@@ -996,7 +1263,7 @@ function M.update_display()
   vim.api.nvim_buf_clear_namespace(buf, ns_highlight, 0, -1)
 
   local lines = {}
-  local max_width = 60
+  local max_width = calculate_text_width()
   local separator_positions = {} -- 记录分割线位置（不可编辑区域）
   local session = backend.current_session and backend.sessions[backend.current_session]
 
@@ -1323,6 +1590,10 @@ function M.open_split()
     local tree_w = math.min(50, math.floor(vim.o.columns * 0.3))
     vim.api.nvim_win_set_width(M.windows.tree, tree_w)
     vim.api.nvim_set_option_value("winfixwidth", true, { win = M.windows.tree })
+    -- 启用自动换行
+    vim.api.nvim_set_option_value("wrap", true, { win = M.windows.tree })
+    vim.api.nvim_set_option_value("linebreak", true, { win = M.windows.tree })
+    vim.api.nvim_set_option_value("breakindent", false, { win = M.windows.tree })
     M.setup_tree_cursor_autocmd()
     M.is_open = true
     M.current_mode = M.ui_modes.SPLIT
@@ -1389,6 +1660,10 @@ function M.open_tab()
     local tree_w = math.min(50, math.floor(vim.o.columns * 0.3))
     vim.api.nvim_win_set_width(M.windows.tree, tree_w)
     vim.api.nvim_set_option_value("winfixwidth", true, { win = M.windows.tree })
+    -- 启用自动换行
+    vim.api.nvim_set_option_value("wrap", true, { win = M.windows.tree })
+    vim.api.nvim_set_option_value("linebreak", true, { win = M.windows.tree })
+    vim.api.nvim_set_option_value("breakindent", false, { win = M.windows.tree })
     M.setup_tree_cursor_autocmd()
 
     M.is_open = true
@@ -1994,6 +2269,43 @@ function M.setup(user_config)
     -- vim.notify("[NeoAI] 数据已同步", vim.log.levels.DEBUG)
   end)
 
+  -- 轮次删除事件：重新渲染树视图
+  backend.on("turn_deleted", function(data)
+    if M.should_show_tree() and is_buf_valid(M.tree_buffers.main) then
+      vim.schedule(function()
+        M.render_session_tree()
+        -- 重置光标追踪状态（缓冲区内容已重建）
+        if is_win_valid(M.windows.tree) then
+          vim.api.nvim_win_set_cursor(M.windows.tree, { 1, 0 })
+        end
+        M.setup_tree_cursor_autocmd()
+      end)
+    end
+    M.update_display_debounced()
+    backend.debounce_sync(data.session_id)
+  end)
+
+  -- 分支删除事件：重新渲染树视图
+  backend.on("branch_deleted", function(data)
+    if M.should_show_tree() and is_buf_valid(M.tree_buffers.main) then
+      vim.schedule(function()
+        M.render_session_tree()
+        -- 重置光标追踪状态（缓冲区内容已重建）
+        if is_win_valid(M.windows.tree) then
+          vim.api.nvim_win_set_cursor(M.windows.tree, { 1, 0 })
+        end
+        M.setup_tree_cursor_autocmd()
+      end)
+    end
+    M.update_display_debounced()
+    backend.debounce_sync(data.session_id or M.current_session)
+
+    -- 提示：数据已持久化
+    vim.notify("[NeoAI] 分支已删除并同步到 " ..
+      (backend.config_file and backend.config_file:match("([^/]+)$") or "sessions.json"),
+      vim.log.levels.INFO)
+  end)
+
   -- ── Neovim 自动命令 ──
 
   -- 窗口大小调整事件：防抖后重新计算窗口大小
@@ -2003,6 +2315,21 @@ function M.setup(user_config)
     pattern = "*",
     callback = function()
       M.schedule_resize() -- 防抖调整窗口大小
+    end,
+  })
+
+  -- 当前缓冲区所在窗口大小调整事件：重新计算分隔线和内容宽度
+  vim.api.nvim_create_autocmd("WinResized", {
+    group = group,
+    pattern = "*",
+    callback = function()
+      if M.is_open and is_win_valid(M.windows.main) then
+        local changed_win = vim.v.event.window
+        if changed_win == M.windows.main or
+           (is_win_valid(M.windows.tree) and changed_win == M.windows.tree) then
+          M.schedule_resize()
+        end
+      end
     end,
   })
 

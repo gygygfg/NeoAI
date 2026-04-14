@@ -6,6 +6,18 @@ local config = require("NeoAI.config")
 
 local M = {}
 
+--- 检查系统是否安装了 curl
+-- @return boolean 如果安装了 curl 返回 true，否则返回 false
+function M.check_curl()
+  if vim.fn.executable("curl") == 1 then
+    return true
+  else
+    vim.notify("[NeoAI] 不会吧，不会吧，不会有人没装curl吧", vim.log.levels.ERROR)
+    vim.notify("[NeoAI] No way, no way, no one hasn't installed curl, right?", vim.log.levels.ERROR)
+    return false
+  end
+end
+
 --- 插件初始化入口
 -- @param user_config 用户自定义配置（可选）
 function M.setup(user_config)
@@ -13,11 +25,14 @@ function M.setup(user_config)
   -- 合并默认配置和用户配置
   local final_config = vim.tbl_deep_extend("force", config.defaults, user_config)
 
+  -- 检查 curl 是否已安装
+  M.check_curl()
+
   -- 初始化后端（会话管理、数据存储）
   backend.setup({
     config_dir = final_config.background.config_dir,
     config_file = final_config.background.config_file,
-    llm = final_config.llm,  -- 传递 LLM 配置给后端
+    llm = final_config.llm, -- 传递 LLM 配置给后端
   })
 
   -- 设置语法高亮
@@ -56,9 +71,9 @@ function M.setup_commands(final_config)
       vim.notify("未知模式: " .. mode .. " (可用: float, split, tab)")
     end
   end, {
-    nargs = "?",  -- 可选参数
+    nargs = "?", -- 可选参数
     complete = function()
-      return { "float", "split", "tab" }  -- 自动补全
+      return { "float", "split", "tab" } -- 自动补全
     end,
   })
 

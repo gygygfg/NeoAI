@@ -8,7 +8,7 @@ M.defaults = {
     -- "float"  - 浮动窗口 (默认推荐)
     -- "split"  - 分割窗口
     -- "tab"    - 标签页
-    default_mode = "float",
+    default_mode = "tab",
 
     -- 聊天窗口宽度 (字符数)，建议范围: 60-120
     width = 80,
@@ -84,6 +84,21 @@ M.defaults = {
 
     -- 在输入行按 Ctrl+s 发送消息（插入模式下）
     insert_mode_send = "<C-s>",
+  },
+
+  tree_keymaps = {
+    -- 树视图快捷键配置
+    -- 在当前光标位置新建对话分支（复制从根到当前轮次的路径）
+    new_branch = "n",
+
+    -- 新建空对话
+    new_conversation = "N",
+
+    -- 删除当前光标所在的这一轮对话
+    delete_turn = "d",
+
+    -- 删除当前整个分支（从根到叶子）
+    delete_branch = "D",
   },
 
   role_icons = {
