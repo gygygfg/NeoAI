@@ -454,7 +454,6 @@ end
 -- 完成后自动将光标定位到输入行并进入插入模式
 -- @param win_opts 窗口配置选项表
 function M.setup_windows(win_opts)
-  vim.notify("执行")
   M.windows.main = vim.api.nvim_open_win(M.buffers.main, true, win_opts)
   M.set_window_wrap()
   M.setup_buffers()
@@ -1949,6 +1948,18 @@ function M.setup(user_config)
         end, 60)
       end
     end, 10)
+    -- 自动同步数据
+    backend.debounce_sync(data.session_id)
+  end)
+
+  -- AI 流式更新事件：实时更新显示，光标自动跟随
+  backend.on("ai_stream_update", function(data)
+    -- 立即更新显示，不使用防抖（需要实时显示流式内容）
+    M.update_display()
+    -- 光标跟随到输入行
+    vim.defer_fn(function()
+      M.focus_input_line()
+    end, 30)
     -- 自动同步数据
     backend.debounce_sync(data.session_id)
   end)

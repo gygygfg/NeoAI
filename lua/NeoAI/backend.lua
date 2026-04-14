@@ -11,6 +11,7 @@ M.session_graph = {}        -- 有向图的邻接表表示：session_id -> {chil
 M.current_session = nil     -- 当前活跃会话 ID
 M.message_handlers = {}     -- 消息事件处理器映射表
 M.editable_states = {}      -- 消息可编辑状态缓存
+M.llm_config = nil          -- LLM API 配置（从 setup 传入的合并后配置）
 
 --- 创建一条新消息
 -- @param role 角色类型 (user/assistant/system)
@@ -256,7 +257,7 @@ function M.find_message_at_line(session, buf, target_line)
   return nil
 end
 
---- 模拟 AI 回复（用于演示/测试）
+--- 模拟 AI 回复（用于演示/测试，已废弃，请使用 request_ai_stream）
 -- 会先显示"思考中..."的占位消息，延迟后替换为真实回复
 -- @param session_id 会话 ID
 -- @param user_message 用户消息内容
@@ -306,6 +307,277 @@ function M.simulate_ai_reply(session_id, user_message, callback)
   end, 1000 + math.random(500, 1500))  -- 1~2.5 秒随机延迟
 end
 
+--- 解析 SSE (Server-Sent Events) 数据行
+-- 从流式响应中提取 "data:" 字段的 JSON 内容
+-- @param line SSE 数据行（如 "data: {...}"）
+-- @return table? 解析后的 JSON 对象，失败返回 nil
+local function parse_sse_data(line)
+  if not line or not line:match("^data:") then
+    return nil
+  end
+
+  local json_str = line:match("^data:%s*(.+)$")
+  if not json_str or json_str == "[DONE]" then
+    return nil
+  end
+
+  local ok, parsed = pcall(vim.fn.json_decode, json_str)
+  if not ok or not parsed then
+    return nil
+  end
+
+  return parsed
+end
+
+--- 构建 API 请求的消息列表（包含系统提示和历史上下文）
+-- @param session 会话对象
+-- @param user_content 用户新消息内容
+-- @return table 消息列表（符合 OpenAI API 格式）
+local function build_api_messages(session, user_content)
+  local messages = {}
+
+  -- 添加系统提示
+  local sys_prompt = M.llm_config and M.llm_config.system_prompt or config.defaults.llm.system_prompt
+  if sys_prompt and sys_prompt ~= "" then
+    table.insert(messages, {
+      role = "system",
+      content = sys_prompt,
+    })
+  end
+
+  -- 添加历史消息（排除最新的用户消息，因为会单独添加）
+  local max_history = M.llm_config and M.llm_config.max_history or config.defaults.background.max_history
+  local history_count = math.min(#session.messages, max_history - 1)
+  local start_idx = math.max(1, #session.messages - history_count + 1)
+
+  for i = start_idx, #session.messages do
+    local msg = session.messages[i]
+    if msg.role == "user" or msg.role == "assistant" then
+      table.insert(messages, {
+        role = msg.role,
+        content = msg.content or "",
+      })
+    end
+  end
+
+  -- 添加当前用户消息
+  table.insert(messages, {
+    role = "user",
+    content = user_content,
+  })
+
+  return messages
+end
+
+--- 使用 curl 发起 HTTPS 流式请求到大模型 API
+-- 支持 OpenAI 兼容的 API 格式，使用 SSE (Server-Sent Events) 协议
+-- @param session_id 会话 ID
+-- @param user_content 用户消息内容
+-- @param on_chunk 流式数据块回调函数（每次收到新内容时调用）
+-- @param on_complete 完成回调函数（请求完成或失败时调用）
+function M.request_ai_stream(session_id, user_content, on_chunk, on_complete)
+  local session = M.sessions[session_id]
+  if not session then
+    if on_complete then
+      on_complete(false, "会话不存在")
+    end
+    return
+  end
+
+  -- 使用存储的 LLM 配置（优先）或回退到默认配置
+  local llm_config = M.llm_config or config.defaults.llm
+
+  -- 验证 API 配置
+  if not llm_config.api_key or llm_config.api_key == "" then
+    local error_msg = "未配置 API 密钥，请设置 OPENAI_API_KEY 环境变量或在配置中提供"
+    vim.notify("[NeoAI] " .. error_msg, vim.log.levels.ERROR)
+    if on_complete then
+      on_complete(false, error_msg)
+    end
+    return
+  end
+
+  -- 创建 pending 状态的占位消息
+  local pending_msg = M.create_message("assistant", "🔄 正在思考...", os.time(), { pending = true })
+  pending_msg.pending = true
+  M.add_message(session_id, pending_msg)
+
+  -- 构建请求体
+  local messages = build_api_messages(session, user_content)
+  local request_body = vim.fn.json_encode({
+    model = llm_config.model,
+    messages = messages,
+    stream = llm_config.stream,
+    temperature = llm_config.temperature,
+    max_tokens = llm_config.max_tokens,
+    top_p = llm_config.top_p,
+  })
+
+  -- 创建临时文件：请求体和响应
+  local body_file = vim.fn.tempname() .. "_body.json"
+  local tmp_file = vim.fn.tempname() .. ".sse"
+
+  -- 将请求体写入文件（避免命令行参数过长）
+  vim.fn.writefile({ request_body }, body_file)
+
+  -- 构建 curl 命令（从文件读取请求体）
+  local curl_cmd = string.format(
+    'curl -s -N --connect-timeout 10 --max-time %d ' ..
+    '-X POST "%s" ' ..
+    '-H "Content-Type: application/json" ' ..
+    '-H "Authorization: Bearer %s" ' ..
+    '-d "@%s" > "%s" 2>&1',
+    llm_config.timeout,
+    llm_config.api_url,
+    llm_config.api_key,
+    body_file,
+    tmp_file
+  )
+
+  -- 用于追踪已累积的内容
+  local accumulated_content = ""
+  local last_update_time = 0
+  local request_finished = false
+
+  -- 启动后台 job 运行 curl 命令
+  local job_id = vim.fn.jobstart(curl_cmd, {
+    on_exit = function(job, exit_code)
+      vim.schedule(function()
+        request_finished = true
+
+        -- 读取完整的响应文件
+        if vim.fn.filereadable(tmp_file) == 1 then
+          local content_lines = vim.fn.readfile(tmp_file)
+          local full_response = table.concat(content_lines, "\n")
+
+          -- 尝试从完整响应中提取最终内容（用于非流式模式或错误处理）
+          if not llm_config.stream and accumulated_content == "" then
+            local ok, response_json = pcall(vim.fn.json_decode, full_response)
+            if ok and response_json and response_json.choices then
+              accumulated_content = response_json.choices[1].message.content or ""
+            end
+          end
+
+          -- 清理临时文件
+          vim.fn.delete(tmp_file)
+          vim.fn.delete(body_file)
+        end
+
+        -- 更新消息为最终内容
+        for i, msg in ipairs(session.messages) do
+          if msg.id == pending_msg.id then
+            msg.content = accumulated_content ~= "" and accumulated_content or "抱歉，未能生成回复。"
+            msg.pending = false
+            msg.timestamp = os.time()
+            break
+          end
+        end
+
+        session.updated_at = os.time()
+        M._auto_sync(session_id)
+
+        -- 触发完成回调
+        if on_complete then
+          local success = exit_code == 0 and accumulated_content ~= ""
+          local error_msg = success and nil or ("请求失败，退出码: " .. exit_code)
+          on_complete(success, error_msg, accumulated_content)
+        end
+
+        M._trigger("ai_replied", {
+          session_id = session_id,
+          message = pending_msg,
+          content = accumulated_content,
+        })
+      end)
+    end,
+  })
+
+  if job_id <= 0 then
+    local error_msg = "无法启动 API 请求（jobstart 失败）"
+    vim.notify("[NeoAI] " .. error_msg, vim.log.levels.ERROR)
+
+    -- 更新错误消息
+    for i, msg in ipairs(session.messages) do
+      if msg.id == pending_msg.id then
+        msg.content = "❌ " .. error_msg
+        msg.pending = false
+        msg.timestamp = os.time()
+        break
+      end
+    end
+
+    if on_complete then
+      on_complete(false, error_msg)
+    end
+    return
+  end
+
+  -- 启动文件监听器，实时读取流式响应
+  local function watch_stream()
+    if request_finished then
+      return
+    end
+
+    if vim.fn.filereadable(tmp_file) == 1 then
+      local content_lines = vim.fn.readfile(tmp_file)
+      local full_content = table.concat(content_lines, "\n")
+
+      -- 解析 SSE 事件
+      local current_time = vim.loop.now()
+      local has_new_content = false
+
+      for line in full_content:gmatch("[^\r\n]+") do
+        if line:match("^data:") then
+          local data = parse_sse_data(line)
+          if data and data.choices and data.choices[1] then
+            local delta = data.choices[1].delta
+            if delta and delta.content and delta.content ~= "" then
+              accumulated_content = accumulated_content .. delta.content
+              has_new_content = true
+            end
+          end
+        end
+      end
+
+      -- 更新 UI（按配置的间隔）
+      if has_new_content and accumulated_content ~= "" then
+        if current_time - last_update_time >= llm_config.stream_update_interval then
+          last_update_time = current_time
+
+          -- 更新 pending 消息内容
+          for i, msg in ipairs(session.messages) do
+            if msg.id == pending_msg.id then
+              msg.content = accumulated_content
+              msg.timestamp = os.time()
+              break
+            end
+          end
+
+          M._auto_sync(session_id)
+          M._trigger("ai_stream_update", {
+            session_id = session_id,
+            message = pending_msg,
+            content = accumulated_content,
+          })
+
+          -- 调用 chunk 回调
+          if on_chunk then
+            on_chunk(accumulated_content)
+          end
+        end
+      end
+    end
+
+    -- 继续监听（如果请求未完成）
+    if not request_finished then
+      vim.defer_fn(watch_stream, 50)  -- 每 50ms 检查一次
+    end
+  end
+
+  -- 启动流式监听
+  vim.defer_fn(watch_stream, 100)
+end
+
 --- 发送消息（用户消息 + 触发 AI 回复）
 -- @param session_id 会话 ID 或消息内容（若为内容则使用当前会话）
 -- @param content 消息内容
@@ -326,10 +598,28 @@ function M.send_message(session_id, content)
   local user_msg = M.create_message("user", content)
   M.add_message(session_id, user_msg)
 
-  -- 触发 AI 模拟回复
-  M.simulate_ai_reply(session_id, content, function(response)
-    M._trigger("response_received", { session_id = session_id, response = response })
-  end)
+  -- 使用流式 API 请求 AI 回复
+  M.request_ai_stream(session_id, content, 
+    -- on_chunk: 流式更新回调（可选，用于自定义处理）
+    function(accumulated_content)
+      -- 触发流式更新事件
+      M._trigger("stream_update", { 
+        session_id = session_id, 
+        content = accumulated_content 
+      })
+    end,
+    -- on_complete: 完成回调
+    function(success, error_msg, final_content)
+      if success then
+        M._trigger("response_received", { 
+          session_id = session_id, 
+          response = final_content 
+        })
+      else
+        vim.notify("[NeoAI] AI 回复失败: " .. (error_msg or "未知错误"), vim.log.levels.WARN)
+      end
+    end
+  )
 
   return user_msg
 end
@@ -724,6 +1014,9 @@ function M.setup(user_config)
   M.config_dir = user_config.config_dir or config.defaults.background.config_dir
   M.config_file = user_config.config_file or (M.config_dir .. "/sessions.json")
 
+  -- 存储 LLM 配置（供流式请求使用）
+  M.llm_config = user_config.llm or config.defaults.llm
+
   -- 尝试导入已有的会话数据
   M.import_sessions()
 
@@ -750,18 +1043,10 @@ function M.setup(user_config)
 end
 
 --- 判断是否应该显示树视图（会话列表）
--- 当存在多个会话时显示树视图供用户选择，否则直接进入聊天界面
+-- 始终显示树视图，供用户选择或创建会话
 -- @return boolean 是否应显示树视图
 function M.should_show_tree()
-  -- 如果只有一个会话，直接进入聊天界面
-  local session_count = 0
-  for _, _ in pairs(M.sessions) do
-    session_count = session_count + 1
-    if session_count > 1 then
-      return true -- 多个会话，显示树视图
-    end
-  end
-  return false -- 只有一个或没有会话，进入聊天界面
+  return true  -- 始终显示树视图
 end
 
 return M

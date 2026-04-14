@@ -134,6 +134,43 @@ M.defaults = {
     -- 0 = 不限制
     max_history = 100,
   },
+
+  llm = {
+    -- 大模型 API 配置（HTTPS 流式请求）
+
+    -- API 端点 URL（支持 OpenAI 兼容的 API 格式）
+    -- 示例: "https://api.openai.com/v1/chat/completions"
+    -- 示例: "https://api.deepseek.com/chat/completions"
+    api_url = "https://api.deepseek.com/chat/completions",
+
+    -- API 密钥（Bearer Token）
+    -- 建议通过环境变量或外部配置文件设置，避免硬编码
+    -- 可使用: os.getenv("DEEPSEEK_API_KEY") 读取环境变量
+    api_key = os.getenv("DEEPSEEK_API_KEY") or "",
+
+    -- 模型名称
+    -- 示例: "gpt-4", "gpt-3.5-turbo", "deepseek-chat", "qwen-plus"
+    model = "deepseek-chat",
+
+    -- 是否启用流式输出（SSE）
+    -- true  = 流式输出，逐步显示 AI 回复
+    -- false = 等待完整响应后一次性显示
+    stream = true,
+
+    -- 系统提示词（设定 AI 的角色和行为）
+    system_prompt = "You are a helpful AI assistant integrated with Neovim. Provide concise, accurate, and helpful responses.",
+
+    -- 请求参数
+    temperature = 0.7, -- 创造性参数 (0-2)
+    max_tokens = 2048, -- 最大生成 token 数
+    top_p = 1.0, -- 核采样参数
+
+    -- 流式输出更新间隔（毫秒）
+    stream_update_interval = 100,
+
+    -- 请求超时时间（秒）
+    timeout = 120,
+  },
 }
 
 --- 获取有效的配置文件路径

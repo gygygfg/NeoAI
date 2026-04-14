@@ -17,6 +17,7 @@ function M.setup(user_config)
   backend.setup({
     config_dir = final_config.background.config_dir,
     config_file = final_config.background.config_file,
+    llm = final_config.llm,  -- 传递 LLM 配置给后端
   })
 
   -- 设置语法高亮

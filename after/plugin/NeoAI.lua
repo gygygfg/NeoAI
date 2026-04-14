@@ -7,7 +7,7 @@ vim.api.nvim_create_autocmd("VimLeavePre", {
   callback = function()
     local backend = require("NeoAI.backend")
     if #backend.sessions > 0 then
-      backend.export_all()
+      backend.sync_data()
     end
   end,
   desc = "退出时自动保存NeoAI会话",
