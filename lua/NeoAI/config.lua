@@ -168,7 +168,13 @@ M.defaults = {
 
     -- 模型名称
     -- 示例: "gpt-4", "gpt-3.5-turbo", "deepseek-chat", "qwen-plus"
-    model = "deepseek-chat",
+    -- 思考模型: "deepseek-reasoner" (会输出 reasoning_content 思考过程)
+    model = "deepseek-reasoner",
+
+    -- 是否启用思考过程显示（仅对支持 reasoning_content 的模型有效，如 deepseek-reasoner）
+    -- true  = 显示思考过程（虚拟文本形式，最后5行可见，其余折叠）
+    -- false = 不显示思考过程
+    show_reasoning = true,
 
     -- 是否启用流式输出（SSE）
     -- true  = 流式输出，逐步显示 AI 回复

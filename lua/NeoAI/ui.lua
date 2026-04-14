@@ -22,6 +22,26 @@ M.input_end_line = nil -- 输入区域结束行
 M._showing_tree = nil -- 运行时的树视图切换状态（nil=由后端决定）
 M._debounce_timers = {} -- 防抖计时器表
 M._resize_pending = false -- 是否有待处理的调整大小请求
+M._reasoning_line_for_msg = {} -- 推理内容行映射 {message_id = line_number}
+M._reasoning_fold_state = {} -- 推理内容折叠状态 {message_id = true/false}
+
+--- 切换推理内容的折叠状态
+-- @param message_id 消息ID
+function M.toggle_reasoning_fold(message_id)
+  M._reasoning_fold_state[message_id] = not M._reasoning_fold_state[message_id]
+  M.update_display()
+end
+
+--- 判断推理内容是否处于折叠状态
+-- @param message_id 消息ID
+-- @return boolean true=折叠，false=展开
+function M.is_reasoning_folded(message_id)
+  -- 默认：思考中时展开，思考完成后折叠
+  if M._reasoning_fold_state[message_id] == nil then
+    return false -- 默认展开
+  end
+  return M._reasoning_fold_state[message_id]
+end
 
 -- 判断是否应显示树视图（优先使用运行时切换状态，否则由后端决定）
 -- @return boolean
@@ -991,6 +1011,13 @@ function M.setup_buffers()
   vim.api.nvim_set_option_value("buftype", "nofile", { buf = M.buffers.main }) -- 非文件缓冲区
   vim.api.nvim_set_option_value("bufhidden", "hide", { buf = M.buffers.main }) -- 隐藏时保留缓冲区
   vim.api.nvim_set_option_value("swapfile", false, { buf = M.buffers.main }) -- 不创建交换文件
+  
+  -- 设置缩进选项
+  vim.api.nvim_set_option_value("shiftwidth", 4, { buf = M.buffers.main })
+  vim.api.nvim_set_option_value("tabstop", 4, { buf = M.buffers.main })
+  vim.api.nvim_set_option_value("softtabstop", 4, { buf = M.buffers.main })
+  vim.api.nvim_set_option_value("expandtab", true, { buf = M.buffers.main })
+  
   M.setup_keymaps() -- 设置快捷键
   M.setup_input_handling() -- 设置输入处理（自动命令）
   M.update_display() -- 初始渲染显示
@@ -1264,6 +1291,63 @@ function M._render_chat_interface()
   end
 end
 
+--- 构建推理内容显示行（内部辅助函数）
+-- 支持展开/折叠切换，思考中和思考完成后都保留内容
+-- @param reasoning_text 推理内容字符串
+-- @param max_width 最大宽度
+-- @param is_complete 思考是否已完成
+-- @param message_id 消息ID（用于跟踪折叠状态）
+-- @return table 推理内容行数组
+local function build_reasoning_lines(reasoning_text, max_width, is_complete, message_id)
+  local reasoning_lines_list = {}
+  for line in reasoning_text:gmatch("[^\r\n]+") do
+    table.insert(reasoning_lines_list, line)
+  end
+
+  local total_lines = #reasoning_lines_list
+  if total_lines == 0 then
+    return {}
+  end
+
+  local result = {}
+  local VISIBLE_COUNT = 5
+  local folded = M.is_reasoning_folded(message_id)
+
+  -- 构建标题行
+  local status_text = is_complete and "思考完成" or "思考中"
+  local fold_icon = folded and "▶" or "▼" -- 展开/折叠图标
+  local header = string.format("  %s [%s，共 %d 行] 点击折叠/展开", fold_icon, status_text, total_lines)
+  table.insert(result, header)
+
+  -- 根据折叠状态决定是否显示内容
+  if not folded then
+    -- 展开状态：显示所有内容
+    if is_complete then
+      -- 思考完成：显示全部内容
+      for i = 1, total_lines do
+        local display_line = reasoning_lines_list[i]
+        if display_line and display_line ~= "" then
+          local truncated = truncate_content(sanitize_line(display_line), max_width - 6)
+          table.insert(result, "    " .. truncated)
+        end
+      end
+    else
+      -- 思考中：显示最后最多5行
+      local visible_count = math.min(VISIBLE_COUNT, total_lines)
+      local start_idx = total_lines - visible_count + 1
+      for i = start_idx, total_lines do
+        local display_line = reasoning_lines_list[i]
+        if display_line and display_line ~= "" then
+          local truncated = truncate_content(sanitize_line(display_line), max_width - 6)
+          table.insert(result, "    " .. truncated)
+        end
+      end
+    end
+  end
+
+  return result
+end
+
 --- 构建聊天内容（内部辅助函数）
 -- @return table 行数组, table 分隔线位置
 function M._build_chat_content()
@@ -1271,6 +1355,24 @@ function M._build_chat_content()
   local max_width = calculate_text_width()
   local separator_positions = {}
   local session = backend.current_session and backend.sessions[backend.current_session]
+
+  -- 清理旧的推理行映射和折叠状态
+  M._reasoning_line_for_msg = {}
+  -- 清理已完成推理的旧消息的折叠状态（保留当前 pending 消息的状态）
+  if session and session.messages then
+    local active_msg_ids = {}
+    for _, msg in ipairs(session.messages) do
+      if msg.metadata and msg.metadata.has_reasoning then
+        active_msg_ids[msg.id] = true
+      end
+    end
+    -- 清理不存在消息的折叠状态
+    for msg_id in pairs(M._reasoning_fold_state) do
+      if not active_msg_ids[msg_id] then
+        M._reasoning_fold_state[msg_id] = nil
+      end
+    end
+  end
 
   -- 渲染消息
   if session and session.messages and #session.messages > 0 then
@@ -1284,8 +1386,18 @@ function M._build_chat_content()
       end
       table.insert(lines, header)
 
+      -- 如果消息有推理内容且启用了显示，直接插入推理内容行
+      if msg.metadata and msg.metadata.has_reasoning and msg.metadata.reasoning_content
+        and M.config.llm.show_reasoning then
+        local is_complete = not msg.pending -- pending=false 表示思考已完成
+        local reasoning_display_lines = build_reasoning_lines(msg.metadata.reasoning_content, max_width, is_complete, msg.id)
+        for _, rline in ipairs(reasoning_display_lines) do
+          table.insert(lines, rline)
+        end
+      end
+
       -- 添加消息内容（自动换行）
-      local content_lines = wrap_message_content(msg.content, max_width - 4)
+      local content_lines = wrap_message_content(msg.content or "", max_width - 4)
       for _, line in ipairs(content_lines) do
         table.insert(lines, line)
       end
@@ -1851,8 +1963,16 @@ function M._setup_editability(_, session)
     -- 标题行（不映射，不可编辑）
     current_line = current_line + 1
 
+    -- 跳过推理内容行（不映射，不可编辑）
+    if msg.metadata and msg.metadata.has_reasoning and msg.metadata.reasoning_content
+      and M.config.llm.show_reasoning then
+      local is_complete = not msg.pending
+      local reasoning_display_lines = build_reasoning_lines(msg.metadata.reasoning_content, 60, is_complete, msg.id)
+      current_line = current_line + #reasoning_display_lines
+    end
+
     -- 获取当前消息的内容行数（自动换行后的行数）
-    local content_lines = wrap_message_content(msg.content, 60 - 4)
+    local content_lines = wrap_message_content(msg.content or "", 60 - 4)
 
     -- 只映射内容行（不映射标题行），这些行可以被用户编辑
     for j, _ in ipairs(content_lines) do
@@ -2273,6 +2393,11 @@ function M.setup_input_handling()
 
       local cur_line = vim.api.nvim_win_get_cursor(M.windows.main)[1] - 1
 
+      -- 检查是否在输入区域（输入区域不应触发消息保存）
+      if M.input_start_line and cur_line >= M.input_start_line then
+        return -- 在输入区域，直接返回
+      end
+
       -- 检查缓冲区行数变化
       local current_count = vim.api.nvim_buf_line_count(M.buffers.main)
       if M._last_buffer_line_count and current_count ~= M._last_buffer_line_count then
@@ -2303,6 +2428,11 @@ function M.setup_input_handling()
         return
       end
       local cur_line = vim.api.nvim_win_get_cursor(M.windows.main)[1] - 1
+
+      -- 检查是否在输入区域（输入区域不应触发"消息修改已保存"）
+      if M.input_start_line and cur_line >= M.input_start_line then
+        return -- 在输入区域，直接返回，不保存
+      end
 
       -- 如果在可编辑的消息内容行，保存编辑的内容
       if M._line_to_message and M._line_to_message[cur_line] then
@@ -2342,10 +2472,13 @@ function M._save_edited_line(line_num)
     backend.save_buffer_edit(msg_info.session_id, msg_info.message_id, M.buffers.main, info.start_line, info.end_line)
 
   if success then
+    -- 只有在实际修改成功时才显示通知（避免空操作或无修改时的干扰）
     vim.notify("[NeoAI] 消息修改已保存: " .. msg, vim.log.levels.INFO)
-  else
-    -- vim.notify("[NeoAI] 消息修改保存失败" .. msg, vim.log.levels.INFO)
+  elseif msg and msg ~= "内容未修改" then
+    -- 只在非"未修改"的错误时显示警告
+    vim.notify("[NeoAI] 消息修改保存失败: " .. msg, vim.log.levels.WARN)
   end
+  -- 如果 msg == "内容未修改"，不显示任何通知，静默忽略
 end
 
 --- 更新输入提示虚拟文本
@@ -2482,6 +2615,47 @@ function M.setup_keymaps()
     end
   end, "编辑消息")
 
+  -- 普通模式：r 键切换推理内容折叠状态
+  map("n", "r", function()
+    if is_win_valid(M.windows.main) then
+      local cur_line = vim.api.nvim_win_get_cursor(M.windows.main)[1] - 1
+      -- 检查当前行是否属于某个有推理内容的消息
+      local session = backend.current_session and backend.sessions[backend.current_session]
+      if session and session.messages then
+        local current_line = 0
+        for _, msg in ipairs(session.messages) do
+          -- 标题行
+          current_line = current_line + 1
+          -- 推理内容行
+          if msg.metadata and msg.metadata.has_reasoning and msg.metadata.reasoning_content
+            and M.config.llm.show_reasoning then
+            local is_complete = not msg.pending
+            local reasoning_lines = build_reasoning_lines(
+              msg.metadata.reasoning_content, 
+              calculate_text_width(), 
+              is_complete, 
+              msg.id
+            )
+            local reasoning_end = current_line + #reasoning_lines - 1
+            -- 如果光标在推理内容范围内，切换折叠状态
+            if cur_line >= current_line and cur_line <= reasoning_end then
+              M.toggle_reasoning_fold(msg.id)
+              return
+            end
+            current_line = reasoning_end + 1
+          else
+            -- 跳过内容和分隔行
+            local content_lines = wrap_message_content(msg.content or "", calculate_text_width() - 4)
+            current_line = current_line + #content_lines
+          end
+          -- 消息间的空行
+          current_line = current_line + 1
+        end
+        vim.notify("[NeoAI] 将光标移到推理内容上以折叠/展开")
+      end
+    end
+  end, "折叠/展开推理内容")
+
   -- 普通模式：s 键导出当前会话
   map("n", "s", function()
     if backend.current_session then
@@ -2598,6 +2772,7 @@ function M.close()
   M._line_to_message = nil
   M._last_buffer_line_count = nil
   M._next_line_num = nil
+  M._reasoning_line_for_msg = nil
 end
 
 --- 切换UI模式
@@ -2711,6 +2886,16 @@ function M.setup(user_config)
     vim.defer_fn(function()
       M.focus_input_line()
     end, 30)
+    -- 自动同步数据
+    backend.debounce_sync(data.session_id)
+  end)
+
+  -- AI 推理内容更新事件（流式思考过程）：实时更新推理内容显示
+  backend.on("ai_reasoning_update", function(data)
+    -- 立即更新显示以更新推理内容虚拟文本
+    if M.config.llm.show_reasoning and is_buf_valid(M.buffers.main) then
+      M.update_display()
+    end
     -- 自动同步数据
     backend.debounce_sync(data.session_id)
   end)

@@ -213,6 +213,35 @@ function M.save_buffer_edit(session_id, message_id, buf, start_line, end_line)
   return false, "保存失败"
 end
 
+--- 计算推理内容在UI中占用的行数（与 ui.lua 中的 build_reasoning_lines 保持一致）
+-- 流式阶段：标题行 + min(行数, 5)（展开状态）
+-- 完成后：标题行 + 全部行数（展开状态）或仅标题行（折叠状态）
+-- @param reasoning_text 推理内容字符串
+-- @param max_width 最大宽度
+-- @param is_complete 思考是否已完成
+-- @param message_id 消息ID（用于查询折叠状态）
+-- @return number 推理内容显示行数
+local function count_reasoning_display_lines(reasoning_text, max_width, is_complete, message_id)
+  if not reasoning_text or reasoning_text == "" then
+    return 0
+  end
+  
+  local line_count = 0
+  for _ in reasoning_text:gmatch("[^\r\n]+") do
+    line_count = line_count + 1
+  end
+  
+  -- 查询折叠状态（使用 ui 模块的函数）
+  local ui = require("NeoAI.ui")
+  local folded = ui.is_reasoning_folded(message_id)
+  
+  if folded then
+    return 1 -- 仅标题行
+  else
+    return 1 + line_count -- 标题行 + 全部内容
+  end
+end
+
 --- 查找缓冲区中某行所属的消息对象
 -- 根据当前缓冲区的内容行，重新计算行号到消息的映射，返回指定行对应的消息信息
 -- @param session 会话对象
@@ -228,6 +257,15 @@ function M.find_message_at_line(session, buf, target_line)
   for i, msg in ipairs(session.messages) do
     -- 标题行（不可编辑）
     current_line = current_line + 1
+
+    -- 跳过推理内容行
+    if msg.metadata and msg.metadata.has_reasoning and msg.metadata.reasoning_content then
+      local llm_config = M.llm_config or config.defaults.llm
+      if llm_config.show_reasoning then
+        local is_complete = not msg.pending
+        current_line = current_line + count_reasoning_display_lines(msg.metadata.reasoning_content, 60, is_complete, msg.id)
+      end
+    end
 
     -- 计算内容行（wrap_message_content 模拟 UI 的换行逻辑）
     local wrap_width = 60 - 4
@@ -344,6 +382,23 @@ local function parse_sse_data(line)
   return parsed
 end
 
+--- 从 SSE delta 中提取推理/思考内容（reasoning_content）
+-- deepseek-reasoner 等思考模型会在 delta 中返回 reasoning_content 字段
+-- @param delta SSE delta 对象
+-- @return string? 推理内容片段，无则返回 nil
+local function extract_reasoning_from_delta(delta)
+  if not delta then
+    return nil
+  end
+  -- OpenAI 兼容格式：delta.reasoning_content 或 delta.reasoning
+  local reasoning = delta.reasoning_content or delta.reasoning
+  -- 过滤 vim.NIL（JSON null 值）
+  if reasoning and reasoning ~= vim.NIL then
+    return tostring(reasoning)
+  end
+  return nil
+end
+
 --- 构建 API 请求的消息列表（包含系统提示和历史上下文）
 -- @param session 会话对象
 -- @param user_content 用户新消息内容
@@ -451,6 +506,7 @@ function M.request_ai_stream(session_id, user_content, on_chunk, on_complete)
 
   -- 用于追踪已累积的内容
   local accumulated_content = ""
+  local accumulated_reasoning = "" -- 推理/思考内容
   local last_update_time = 0
   local request_finished = false
   -- 追踪已处理的文件位置（避免重复处理 SSE 事件）
@@ -478,8 +534,17 @@ function M.request_ai_stream(session_id, user_content, on_chunk, on_complete)
                   local data = parse_sse_data(line)
                   if data and data.choices and data.choices[1] then
                     local delta = data.choices[1].delta
-                    if delta and delta.content and delta.content ~= "" then
-                      accumulated_content = accumulated_content .. delta.content
+                    if delta then
+                      -- 提取推理内容
+                      local reasoning = extract_reasoning_from_delta(delta)
+                      if reasoning then
+                        accumulated_reasoning = accumulated_reasoning .. reasoning
+                      end
+                      -- 提取常规内容
+                      local content = delta.content
+                      if content and content ~= vim.NIL and content ~= "" then
+                        accumulated_content = accumulated_content .. tostring(content)
+                      end
                     end
                   end
                 end
@@ -508,6 +573,11 @@ function M.request_ai_stream(session_id, user_content, on_chunk, on_complete)
             msg.content = accumulated_content ~= "" and accumulated_content or "抱歉，未能生成回复。"
             msg.pending = false
             msg.timestamp = os.time()
+            -- 存储推理/思考内容到 metadata
+            if accumulated_reasoning ~= "" then
+              msg.metadata.reasoning_content = accumulated_reasoning
+              msg.metadata.has_reasoning = true
+            end
             break
           end
         end
@@ -526,6 +596,7 @@ function M.request_ai_stream(session_id, user_content, on_chunk, on_complete)
           session_id = session_id,
           message = pending_msg,
           content = accumulated_content,
+          reasoning_content = accumulated_reasoning,
         })
       end)
     end,
@@ -595,9 +666,27 @@ function M.request_ai_stream(session_id, user_content, on_chunk, on_complete)
           local data = parse_sse_data(line)
           if data and data.choices and data.choices[1] then
             local delta = data.choices[1].delta
-            if delta and delta.content and delta.content ~= "" then
-              accumulated_content = accumulated_content .. delta.content
-              has_new_content = true
+            if delta then
+              -- 提取推理内容
+              local reasoning = extract_reasoning_from_delta(delta)
+              if reasoning then
+                accumulated_reasoning = accumulated_reasoning .. reasoning
+                -- 实时更新消息的 metadata，让 UI 能检测到推理内容
+                pending_msg.metadata.reasoning_content = accumulated_reasoning
+                pending_msg.metadata.has_reasoning = true
+                -- 触发推理内容更新事件
+                M._trigger("ai_reasoning_update", {
+                  session_id = session_id,
+                  message = pending_msg,
+                  reasoning_content = accumulated_reasoning,
+                })
+              end
+              -- 提取常规内容
+              local content = delta.content
+              if content and content ~= vim.NIL and content ~= "" then
+                accumulated_content = accumulated_content .. tostring(content)
+                has_new_content = true
+              end
             end
           end
         end
