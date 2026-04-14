@@ -268,7 +268,8 @@ function M.find_message_at_line(session, buf, target_line)
       local llm_config = M.llm_config or config.defaults.llm
       if llm_config.show_reasoning then
         local is_complete = not msg.pending
-        current_line = current_line + count_reasoning_display_lines(msg.metadata.reasoning_content, 60, is_complete, msg.id)
+        current_line = current_line
+          + count_reasoning_display_lines(msg.metadata.reasoning_content, 60, is_complete, msg.id)
       end
     end
 
@@ -313,56 +314,6 @@ function M.find_message_at_line(session, buf, target_line)
   end
 
   return nil
-end
-
---- 模拟 AI 回复（用于演示/测试，已废弃，请使用 request_ai_stream）
--- 会先显示"思考中..."的占位消息，延迟后替换为真实回复
--- @param session_id 会话 ID
--- @param user_message 用户消息内容
--- @param callback 回复完成后的回调函数（可选）
-function M.simulate_ai_reply(session_id, user_message, callback)
-  local session = M.sessions[session_id]
-  if not session then
-    return
-  end
-
-  -- 创建 pending 状态的占位消息
-  local pending_msg = M.create_message("assistant", "思考中...", os.time(), { pending = true })
-  pending_msg.pending = true
-  M.add_message(session_id, pending_msg)
-
-  -- 延迟模拟 AI 回复
-  vim.defer_fn(function()
-    -- 预定义的回复模板
-    local responses = {
-      "这是一个模拟回复。在实际应用中，这里会连接到AI API。",
-      "我理解你的问题。可以告诉我更多细节吗？",
-      "根据我的分析，建议你尝试以下步骤...",
-      "这是一个很好的问题！让我详细解释一下。",
-      "我可能需要更多信息来给出准确的回答。",
-    }
-
-    local response = responses[math.random(#responses)]
-
-    -- 更新占位消息为真实回复
-    for i, msg in ipairs(session.messages) do
-      if msg.id == pending_msg.id then
-        msg.content = response
-        msg.pending = false
-        msg.timestamp = os.time()
-        break
-      end
-    end
-
-    session.updated_at = os.time()
-    M._auto_sync(session_id)
-
-    if callback then
-      callback(response)
-    end
-
-    M._trigger("ai_replied", { session_id = session_id, message = pending_msg })
-  end, 1000 + math.random(500, 1500)) -- 1~2.5 秒随机延迟
 end
 
 --- 解析 SSE (Server-Sent Events) 数据行
@@ -544,11 +495,23 @@ function M.request_ai_stream(session_id, user_content, on_chunk, on_complete)
                       local reasoning = extract_reasoning_from_delta(delta)
                       if reasoning then
                         accumulated_reasoning = accumulated_reasoning .. reasoning
+                        pending_msg.metadata.reasoning_content = accumulated_reasoning
+                        pending_msg.metadata.has_reasoning = true
+                        pending_msg.metadata.reasoning_finished = false
                       end
                       -- 提取常规内容
                       local content = delta.content
                       if content and content ~= vim.NIL and content ~= "" then
                         accumulated_content = accumulated_content .. tostring(content)
+                        -- 当有常规内容且推理内容已存在时，标记推理已完成
+                        if accumulated_reasoning ~= "" and not pending_msg.metadata.reasoning_finished then
+                          pending_msg.metadata.reasoning_finished = true
+                          -- 立即通知 UI 关闭思考浮动窗口
+                          M._trigger("ai_reasoning_finished", {
+                            session_id = session_id,
+                            message = pending_msg,
+                          })
+                        end
                       end
                     end
                   end
@@ -565,6 +528,11 @@ function M.request_ai_stream(session_id, user_content, on_chunk, on_complete)
             if ok and response_json and response_json.choices then
               accumulated_content = response_json.choices[1].message.content or ""
             end
+          end
+
+          -- 非流式模式：如果同时有推理内容和常规内容，标记推理已完成
+          if not llm_config.stream and accumulated_reasoning ~= "" and accumulated_content ~= "" then
+            pending_msg.metadata.reasoning_finished = true
           end
 
           -- 清理临时文件
@@ -679,6 +647,8 @@ function M.request_ai_stream(session_id, user_content, on_chunk, on_complete)
                 -- 实时更新消息的 metadata，让 UI 能检测到推理内容
                 pending_msg.metadata.reasoning_content = accumulated_reasoning
                 pending_msg.metadata.has_reasoning = true
+                -- 标记推理仍在进行中
+                pending_msg.metadata.reasoning_finished = false
                 -- 触发推理内容更新事件
                 M._trigger("ai_reasoning_update", {
                   session_id = session_id,
@@ -691,6 +661,15 @@ function M.request_ai_stream(session_id, user_content, on_chunk, on_complete)
               if content and content ~= vim.NIL and content ~= "" then
                 accumulated_content = accumulated_content .. tostring(content)
                 has_new_content = true
+                -- 当有常规内容且推理内容已存在时，标记推理已完成
+                if accumulated_reasoning ~= "" and not pending_msg.metadata.reasoning_finished then
+                  pending_msg.metadata.reasoning_finished = true
+                  -- 立即通知 UI 关闭思考浮动窗口
+                  M._trigger("ai_reasoning_finished", {
+                    session_id = session_id,
+                    message = pending_msg,
+                  })
+                end
               end
             end
           end
