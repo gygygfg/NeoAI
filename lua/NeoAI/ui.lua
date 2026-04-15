@@ -3487,8 +3487,11 @@ function M.setup(validated_config)
       -- 传递 fold_on_finish=false 确保推理内容展开显示
       M.finish_reasoning(msg_id, false)
 
-      -- 使用防抖更新显示，避免频繁重绘
-      M.update_display_debounced.message()
+      -- 立即更新显示，确保用户能看到推理内容
+      -- 不使用防抖，避免用户看到悬浮窗口关闭但内容未显示的情况
+      if M.is_open and utils.is_buf_valid(M.buffers.main) then
+        M.update_display()
+      end
     end
     -- 自动同步数据
     backend.debounce_sync(data.session_id)

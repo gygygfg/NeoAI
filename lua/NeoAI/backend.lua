@@ -329,6 +329,9 @@ function M.request_ai_stream(session_id, user_content, on_chunk, on_complete)
   local last_processed_pos = 0
   local last_update_time = 0
   local stream_update_interval = llm_config.stream_update_interval or 100 -- 默认100ms
+  local last_reasoning_update_time = 0 -- 最后一次推理内容更新时间
+  local min_reasoning_completion_delay = 100 -- 最小推理完成延迟（毫秒），确保思考过程真的结束了
+  local min_reasoning_completion_delay = 100 -- 最小推理完成延迟（毫秒），确保思考过程真的结束了
 
   -- 启动后台 job
   local job_id = vim.fn.jobstart(curl_cmd, {
@@ -488,19 +491,20 @@ function M.request_ai_stream(session_id, user_content, on_chunk, on_complete)
   -- 启动文件监听器
   local function watch_stream()
     if request_finished then
+      vim.defer_fn(function() watch_stream() end, 50)
       return
     end
 
     if vim.fn.filereadable(tmp_file) == 1 then
       local file_size = vim.fn.getfsize(tmp_file)
       if file_size <= last_processed_pos then
-        vim.defer_fn(watch_stream, 50)
+        vim.defer_fn(function() watch_stream() end, 50)
         return
       end
 
       local handle = io.open(tmp_file, "r")
       if not handle then
-        vim.defer_fn(watch_stream, 50)
+        vim.defer_fn(function() watch_stream() end, 50)
         return
       end
 
@@ -509,7 +513,7 @@ function M.request_ai_stream(session_id, user_content, on_chunk, on_complete)
       handle:close()
 
       if not new_content or new_content == "" then
-        vim.defer_fn(watch_stream, 50)
+        vim.defer_fn(function() watch_stream() end, 50)
         return
       end
 
@@ -529,6 +533,7 @@ function M.request_ai_stream(session_id, user_content, on_chunk, on_complete)
                 pending_msg.metadata.reasoning_content = accumulated_reasoning
                 pending_msg.metadata.has_reasoning = true
                 pending_msg.metadata.reasoning_finished = false
+                last_reasoning_update_time = vim.loop.now() -- 更新推理内容时间戳
                 -- 触发推理内容更新事件
                 M._trigger("ai_reasoning_update", {
                   session_id = session_id,
@@ -549,23 +554,29 @@ function M.request_ai_stream(session_id, user_content, on_chunk, on_complete)
                     break
                   end
                 end
-                -- 当有常规内容且推理内容已存在时，标记推理已完成
-                -- 注意：这里立即触发完成事件，因为推理内容已经结束
+                -- 当有常规内容且推理内容已存在时，检查是否应该关闭悬浮窗口
+                -- 使用最小延迟确保思考过程真的结束了
                 if accumulated_reasoning ~= "" and not pending_msg.metadata.reasoning_finished then
-                  pending_msg.metadata.reasoning_finished = true
-                  -- 同时更新会话中的消息元数据
-                  for i, msg in ipairs(session.messages) do
-                    if msg.id == pending_msg.id then
-                      msg.metadata = msg.metadata or {}
-                      msg.metadata.reasoning_finished = true
-                      break
+                  local current_time = vim.loop.now()
+                  local time_since_last_reasoning = current_time - last_reasoning_update_time
+                  
+                  -- 如果推理内容已经停止更新超过100ms，则认为思考过程真的结束了
+                  if time_since_last_reasoning >= min_reasoning_completion_delay then
+                    pending_msg.metadata.reasoning_finished = true
+                    -- 同时更新会话中的消息元数据
+                    for i, msg in ipairs(session.messages) do
+                      if msg.id == pending_msg.id then
+                        msg.metadata = msg.metadata or {}
+                        msg.metadata.reasoning_finished = true
+                        break
+                      end
                     end
+                    -- 触发推理完成事件，关闭悬浮窗口
+                    M._trigger("ai_reasoning_finished", {
+                      session_id = session_id,
+                      message = pending_msg,
+                    })
                   end
-                  -- 立即触发推理完成事件，关闭悬浮窗口
-                  M._trigger("ai_reasoning_finished", {
-                    session_id = session_id,
-                    message = pending_msg,
-                  })
                 end
                 -- 控制流式更新频率
                 local current_time = vim.loop.now()
@@ -582,7 +593,7 @@ function M.request_ai_stream(session_id, user_content, on_chunk, on_complete)
       end
     end
 
-    vim.defer_fn(watch_stream, 50)
+    vim.defer_fn(function() watch_stream() end, 50)
   end
 
   watch_stream()
@@ -942,10 +953,13 @@ local function handle_tool_calls(session_id, tool_calls, on_chunk, on_complete)
     )
 
     local accumulated_content = ""
+    local accumulated_reasoning = "" -- 推理/思考内容
     local request_finished = false
     local last_processed_pos = 0
     local last_update_time = 0
     local stream_update_interval = llm_config.stream_update_interval or 100
+    local last_reasoning_update_time = 0 -- 最后一次推理内容更新时间
+    local min_reasoning_completion_delay = 100 -- 最小推理完成延迟（毫秒），确保思考过程真的结束了
 
     -- 为第二次请求创建一个本地的 on_complete 回调
     -- 注意：这里使用闭包来访问外部的 on_complete 参数
@@ -954,6 +968,12 @@ local function handle_tool_calls(session_id, tool_calls, on_chunk, on_complete)
         M._trigger("response_received", {
           session_id = session_id,
           response = final_content or accumulated_content,
+        })
+        M._trigger("ai_replied", {
+          session_id = session_id,
+          message = second_pending_msg,
+          content = final_content or accumulated_content,
+          reasoning_content = accumulated_reasoning,
         })
         -- 如果存在原始的 on_complete 回调，也调用它
         if on_complete then
@@ -988,6 +1008,12 @@ local function handle_tool_calls(session_id, tool_calls, on_chunk, on_complete)
                   local data = utils.parse_sse_data(line)
                   if data and data.choices and data.choices[1] then
                     local delta = data.choices[1].delta
+                    -- 收集推理内容
+                    if delta.reasoning_content and delta.reasoning_content ~= vim.NIL then
+                      local reasoning_str = type(delta.reasoning_content) == "string" and delta.reasoning_content or tostring(delta.reasoning_content)
+                      accumulated_reasoning = accumulated_reasoning .. reasoning_str
+                    end
+                    -- 收集内容
                     if delta and delta.content and delta.content ~= vim.NIL then
                       local content_str = type(delta.content) == "string" and delta.content or tostring(delta.content)
                       accumulated_content = accumulated_content .. content_str
@@ -1015,6 +1041,14 @@ local function handle_tool_calls(session_id, tool_calls, on_chunk, on_complete)
               msg.content = final_content
               msg.pending = false
               msg.timestamp = os.time()
+
+              -- 存储推理内容
+              if accumulated_reasoning ~= "" then
+                msg.metadata = msg.metadata or {}
+                msg.metadata.reasoning_content = accumulated_reasoning
+                msg.metadata.has_reasoning = true
+              end
+
               break
             end
           end
@@ -1023,13 +1057,12 @@ local function handle_tool_calls(session_id, tool_calls, on_chunk, on_complete)
           M._auto_sync(session_id)
 
           -- 如果存在推理内容且尚未触发完成事件，触发推理完成事件
-          -- 注意：第二个请求通常不会有推理内容，但为了完整性保留检查
-          if
-            second_pending_msg.metadata
-            and second_pending_msg.metadata.has_reasoning
-            and not second_pending_msg.metadata.reasoning_finished
-          then
+          if accumulated_reasoning ~= "" and (not second_pending_msg.metadata or not second_pending_msg.metadata.reasoning_finished) then
+            second_pending_msg.metadata = second_pending_msg.metadata or {}
+            second_pending_msg.metadata.reasoning_content = accumulated_reasoning
+            second_pending_msg.metadata.has_reasoning = true
             second_pending_msg.metadata.reasoning_finished = true
+
             M._trigger("ai_reasoning_finished", {
               session_id = session_id,
               message = second_pending_msg,
@@ -1073,13 +1106,13 @@ local function handle_tool_calls(session_id, tool_calls, on_chunk, on_complete)
       if vim.fn.filereadable(tmp_file) == 1 then
         local file_size = vim.fn.getfsize(tmp_file)
         if file_size <= last_processed_pos then
-          vim.defer_fn(watch_stream, 50)
+          vim.defer_fn(function() watch_stream() end, 50)
           return
         end
 
         local handle = io.open(tmp_file, "r")
         if not handle then
-          vim.defer_fn(watch_stream, 50)
+          vim.defer_fn(function() watch_stream() end, 50)
           return
         end
 
@@ -1088,7 +1121,7 @@ local function handle_tool_calls(session_id, tool_calls, on_chunk, on_complete)
         handle:close()
 
         if not new_content or new_content == "" then
-          vim.defer_fn(watch_stream, 50)
+          vim.defer_fn(function() watch_stream() end, 50)
           return
         end
 
@@ -1100,6 +1133,22 @@ local function handle_tool_calls(session_id, tool_calls, on_chunk, on_complete)
             local data = utils.parse_sse_data(line)
             if data and data.choices and data.choices[1] then
               local delta = data.choices[1].delta
+
+              -- 收集推理内容
+              if delta.reasoning_content and delta.reasoning_content ~= vim.NIL then
+                local reasoning_str = type(delta.reasoning_content) == "string" and delta.reasoning_content or tostring(delta.reasoning_content)
+                accumulated_reasoning = accumulated_reasoning .. reasoning_str
+                last_reasoning_update_time = vim.loop.now()
+
+                -- 触发推理更新事件
+                M._trigger("ai_reasoning_update", {
+                  session_id = session_id,
+                  message = second_pending_msg,
+                  reasoning_content = accumulated_reasoning,
+                })
+              end
+
+              -- 收集内容
               if delta and delta.content and delta.content ~= vim.NIL then
                 local content_str = type(delta.content) == "string" and delta.content or tostring(delta.content)
                 accumulated_content = accumulated_content .. content_str
@@ -1126,13 +1175,38 @@ local function handle_tool_calls(session_id, tool_calls, on_chunk, on_complete)
                   end
                 end
               end
+
+              -- 检查推理内容是否完成
+              if accumulated_reasoning ~= "" and not second_pending_msg.metadata.reasoning_finished then
+                local current_time = vim.loop.now()
+                local time_since_last_reasoning = current_time - last_reasoning_update_time
+
+                if time_since_last_reasoning >= min_reasoning_completion_delay then
+                  second_pending_msg.metadata = second_pending_msg.metadata or {}
+                  second_pending_msg.metadata.reasoning_finished = true
+
+                  -- 同时更新会话中的消息元数据
+                  for i, msg in ipairs(session.messages) do
+                    if msg.id == second_pending_msg.id then
+                      msg.metadata = msg.metadata or {}
+                      msg.metadata.reasoning_finished = true
+                      break
+                    end
+                  end
+
+                  M._trigger("ai_reasoning_finished", {
+                    session_id = session_id,
+                    message = second_pending_msg,
+                  })
+                end
+              end
             end
           end
         end
       end
-
-      vim.defer_fn(watch_stream, 50)
     end
+
+    vim.defer_fn(function() watch_stream() end, 50)
 
     watch_stream()
   else
@@ -1217,6 +1291,8 @@ function M.request_ai_stream_with_tools(session_id, user_content, on_chunk, on_c
   local last_processed_pos = 0
   local last_update_time = 0
   local stream_update_interval = llm_config.stream_update_interval or 100 -- 默认100ms
+  local last_reasoning_update_time = 0 -- 最后一次推理内容更新时间
+  local min_reasoning_completion_delay = 100 -- 最小推理完成延迟（毫秒），确保思考过程真的结束了
 
   -- 启动后台 job
   local job_id = vim.fn.jobstart(curl_cmd, {
@@ -1301,6 +1377,7 @@ function M.request_ai_stream_with_tools(session_id, user_content, on_chunk, on_c
                       pending_msg.metadata.reasoning_content = accumulated_reasoning
                       pending_msg.metadata.has_reasoning = true
                       pending_msg.metadata.reasoning_finished = false
+                      last_reasoning_update_time = vim.loop.now() -- 更新推理内容时间戳
                     end
                   end
                 end
@@ -1403,16 +1480,16 @@ function M.request_ai_stream_with_tools(session_id, user_content, on_chunk, on_c
               msg.timestamp = os.time()
 
               -- 直接打印最终内容信息
-              vim.notify(
-                string.format(
-                  "[NeoAI] 请求完成: exit_code=%d, has_tool_calls=%s, accumulated_content_length=%d, final_content=%s",
-                  exit_code,
-                  tostring(has_tool_calls),
-                  #accumulated_content,
-                  #final_content > 50 and string.sub(final_content, 1, 50) .. "..." or final_content
-                ),
-                vim.log.levels.INFO
-              )
+              -- vim.notify(
+              --   string.format(
+              --     "[NeoAI] 请求完成: exit_code=%d, has_tool_calls=%s, accumulated_content_length=%d, final_content=%s",
+              --     exit_code,
+              --     tostring(has_tool_calls),
+              --     #accumulated_content,
+              --     #final_content > 50 and string.sub(final_content, 1, 50) .. "..." or final_content
+              --   ),
+              --   vim.log.levels.INFO
+              -- )
 
               -- 存储推理内容
               if accumulated_reasoning ~= "" then
@@ -1517,13 +1594,13 @@ function M.request_ai_stream_with_tools(session_id, user_content, on_chunk, on_c
     if vim.fn.filereadable(tmp_file) == 1 then
       local file_size = vim.fn.getfsize(tmp_file)
       if file_size <= last_processed_pos then
-        vim.defer_fn(watch_stream, 50)
+        vim.defer_fn(function() watch_stream() end, 50)
         return
       end
 
       local handle = io.open(tmp_file, "r")
       if not handle then
-        vim.defer_fn(watch_stream, 50)
+        vim.defer_fn(function() watch_stream() end, 50)
         return
       end
 
@@ -1532,7 +1609,7 @@ function M.request_ai_stream_with_tools(session_id, user_content, on_chunk, on_c
       handle:close()
 
       if not new_content or new_content == "" then
-        vim.defer_fn(watch_stream, 50)
+        vim.defer_fn(function() watch_stream() end, 50)
         return
       end
 
@@ -1596,6 +1673,7 @@ function M.request_ai_stream_with_tools(session_id, user_content, on_chunk, on_c
               pending_msg.metadata.reasoning_content = accumulated_reasoning
               pending_msg.metadata.has_reasoning = true
               pending_msg.metadata.reasoning_finished = false
+              last_reasoning_update_time = vim.loop.now()  -- 更新推理内容更新时间
               M._trigger("ai_reasoning_update", {
                 session_id = session_id,
                 message = pending_msg,
@@ -1603,23 +1681,29 @@ function M.request_ai_stream_with_tools(session_id, user_content, on_chunk, on_c
               })
             end
 
-            -- 当有推理内容且尚未标记为完成时，标记推理已完成
-            -- 注意：这里立即触发完成事件，因为推理内容已经结束（当开始收到常规内容时）
+            -- 当有推理内容且尚未标记为完成时，检查是否应该关闭悬浮窗口
+            -- 使用最小延迟确保思考过程真的结束了
             if accumulated_reasoning ~= "" and not pending_msg.metadata.reasoning_finished then
-              pending_msg.metadata.reasoning_finished = true
-              -- 同时更新会话中的消息元数据
-              for i, msg in ipairs(session.messages) do
-                if msg.id == pending_msg.id then
-                  msg.metadata = msg.metadata or {}
-                  msg.metadata.reasoning_finished = true
-                  break
+              local current_time = vim.loop.now()
+              local time_since_last_reasoning = current_time - last_reasoning_update_time
+              
+              -- 如果推理内容已经停止更新超过100ms，则认为思考过程真的结束了
+              if time_since_last_reasoning >= min_reasoning_completion_delay then
+                pending_msg.metadata.reasoning_finished = true
+                -- 同时更新会话中的消息元数据
+                for i, msg in ipairs(session.messages) do
+                  if msg.id == pending_msg.id then
+                    msg.metadata = msg.metadata or {}
+                    msg.metadata.reasoning_finished = true
+                    break
+                  end
                 end
+                -- 触发推理完成事件，关闭悬浮窗口
+                M._trigger("ai_reasoning_finished", {
+                  session_id = session_id,
+                  message = pending_msg,
+                })
               end
-              -- 立即触发推理完成事件，关闭悬浮窗口
-              M._trigger("ai_reasoning_finished", {
-                session_id = session_id,
-                message = pending_msg,
-              })
             end
           end
         end
