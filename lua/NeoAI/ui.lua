@@ -1943,7 +1943,7 @@ function M.open_chat_after_tree_selection()
       vim.api.nvim_set_current_win(M.windows.main)
     else
       -- 窗口不存在，重新创建
-      local opts = utils.get_window_strategy(M.ui_modes.FLOAT, M.config, M.WINDOW_LIMITS)()
+      local opts = utils.get_window_strategy(M.ui_modes.SPLIT, M.config, M.WINDOW_LIMITS)()
       M.setup_windows(opts)
       success = true
     end
@@ -1998,7 +1998,7 @@ function M.open_float()
     local lines = vim.api.nvim_buf_get_lines(M.tree_buffers.main, 0, -1, false)
     local max_content_width = 0
     for _, line in ipairs(lines) do
-      local w = display_width(line)
+      local w = utils.display_width(line)
       if w > max_content_width then
         max_content_width = w
       end
@@ -2081,8 +2081,6 @@ function M.open_split()
   vim.cmd("belowright vsplit")
   M.windows.main = vim.api.nvim_get_current_win()
   vim.api.nvim_win_set_buf(M.windows.main, M.buffers.main)
-  local opts = utils.get_window_strategy(M.ui_modes.FLOAT, M.config, M.WINDOW_LIMITS)()
-  vim.api.nvim_win_set_width(M.windows.main, opts.width)
   -- 禁用行号
   vim.api.nvim_set_option_value("number", false, { win = M.windows.main })
   vim.api.nvim_set_option_value("relativenumber", false, { win = M.windows.main })
@@ -2090,6 +2088,16 @@ function M.open_split()
   M.setup_buffers()
   M.is_open = true
   M.current_mode = M.ui_modes.SPLIT
+
+  -- 延迟设置窗口宽度，确保渲染完成
+  vim.defer_fn(function()
+    if utils.is_win_valid(M.windows.main) then
+      local opts = utils.get_window_strategy(M.ui_modes.SPLIT, M.config, M.WINDOW_LIMITS)()
+      vim.api.nvim_win_set_width(M.windows.main, opts.width)
+      -- 重新渲染以确保宽度正确
+      M.update_display()
+    end
+  end, 100)
 
   -- 非树模式：定位光标到输入行
   vim.defer_fn(function()
