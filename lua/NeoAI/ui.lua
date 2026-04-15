@@ -471,26 +471,7 @@ end
 
 -- ── 窗口管理函数 ─────────────────────────────────────────────────────────────
 
---- 验证并限制窗口位置和大小（使用 utils 版本）
--- @param row 行
--- @param col 列
--- @param width 宽度
--- @param height 高度
--- @return 验证后的行、列、宽度、高度
-function M.validate_window_position(row, col, width, height)
-  return utils.validate_window_position(row, col, width, height)
-end
-
---- 根据窗口模式应用大小限制（使用 utils 版本）
--- @param mode 窗口模式
--- @param width 原始宽度
--- @param height 原始高度
--- @return 调整后的宽度和高度
-function M.apply_size_limits(mode, width, height)
-  return utils.apply_size_limits(mode, width, height, M.WINDOW_LIMITS)
-end
-
---- 清理无效的窗口和缓冲区（使用 utils 版本）
+--- 清理无效的窗口和缓冲区
 -- @return integer 清理的数量
 function M.cleanup_windows()
   -- 先关闭所有推理浮动窗口
@@ -505,11 +486,6 @@ function M.cleanup_windows()
     M._reasoning_float_wins,
     M._reasoning_float_buffers
   )
-end
-
---- 设置窗口换行选项（使用 utils 版本）
-function M.set_window_wrap()
-  utils.set_window_wrap(M.windows)
 end
 
 --- 计划调整窗口大小（防抖）
@@ -566,72 +542,25 @@ end, 50, "update_display_turn", M._debounce_timers)
 -- @param content_width 内容宽度
 -- @param content_height 内容高度
 function M.adjust_window_size(content_width, content_height)
-  if not utils.is_win_valid(M.windows.main) then
-    return
-  end
-
-  local mode = M.current_mode
-  local editor_w = vim.o.columns
-  local editor_h = vim.o.lines
-
-  -- 浮动模式：居中显示，自动调整大小
-  if mode == M.ui_modes.FLOAT then
-    local w = utils.clamp(content_width + 6, 50, math.min(math.floor(editor_w * 0.85), 140))
-    local h = utils.clamp(content_height + 6, 8, math.min(editor_h - 6, 45))
-    w, h = M.apply_size_limits("float", w, h)
-
-    local row = math.max(0, math.floor((editor_h - h) / 2))
-    local col = math.max(0, math.floor((editor_w - w) / 2))
-    row, col, w, h = M.validate_window_position(row, col, w, h)
-
-    utils.safe_win_call(function()
-      vim.api.nvim_win_set_config(M.windows.main, {
-        relative = "editor",
-        row = row,
-        col = col,
-        width = w,
-        height = h,
-      })
-    end)
-  -- 分割模式：调整宽度
-  elseif mode == M.ui_modes.SPLIT then
-    local w = utils.clamp(content_width + 6, 40, math.min(math.floor(editor_w * 0.6), 120))
-    w = M.apply_size_limits("split", w, editor_h)
-
-    utils.safe_win_call(function()
-      vim.api.nvim_win_set_width(M.windows.main, w)
-    end)
-  end
-  -- 标签模式由Neovim自动管理
+  utils.adjust_window_size(M.windows, M.current_mode, content_width, content_height, M.WINDOW_LIMITS)
 end
 
 --- 调整树窗口大小（动态宽度，最大值为屏幕一半）
 function M.adjust_tree_window_size()
-  if not utils.is_win_valid(M.windows.tree) or not utils.is_buf_valid(M.tree_buffers.main) then
-    return
-  end
+  utils.adjust_tree_window_size(M.windows, M.tree_buffers, M.WINDOW_LIMITS)
+end
 
-  local editor_w = vim.o.columns
-  local max_width = math.floor(editor_w * 0.5)
-
-  -- 计算树内容的最大宽度
-  local lines = vim.api.nvim_buf_get_lines(M.tree_buffers.main, 0, -1, false)
-  local max_w = 0
-
-  for _, line in ipairs(lines) do
-    local width = utils.display_width(line)
-    max_w = math.max(max_w, width)
-  end
-
-  -- 动态宽度 = 内容宽度 + 边距，但不超过屏幕一半
-  local target = math.min(max_w + 10, max_width)
-  target = utils.clamp(target, M.WINDOW_LIMITS.tree.min_width, max_width)
-
-  local current_w = vim.api.nvim_win_get_width(M.windows.tree)
-  if target ~= current_w then
-    utils.safe_win_call(function()
-      vim.api.nvim_win_set_width(M.windows.tree, target)
-    end)
+--- 设置窗口换行选项（内联实现）
+local function set_window_wrap_inline(windows)
+  for _, win in pairs(windows) do
+    if utils.is_win_valid(win) then
+      vim.api.nvim_set_option_value("wrap", true, { win = win })
+      vim.api.nvim_set_option_value("linebreak", true, { win = win })
+      vim.api.nvim_set_option_value("breakindent", true, { win = win })
+      -- 启用折叠功能，使用标记折叠法
+      vim.api.nvim_set_option_value("foldmethod", "marker", { win = win })
+      vim.api.nvim_set_option_value("foldenable", true, { win = win })
+    end
   end
 end
 
@@ -642,84 +571,7 @@ end
 -- @param mode 窗口模式 (float/split/tab/tree)
 -- @return function 窗口策略函数，调用后返回窗口配置表
 function M.get_window_strategy(mode)
-  local strategies = {
-    -- 浮动窗口策略：在编辑器中央弹出独立窗口
-    [M.ui_modes.FLOAT] = function()
-      local width = math.min(M.config.ui.width, vim.o.columns - 10)
-      local height = math.min(M.config.ui.height, vim.o.lines - 10)
-      width, height = M.apply_size_limits("float", width, height)
-
-      -- 居中计算
-      local row = math.floor((vim.o.lines - height) / 2)
-      local col = math.floor((vim.o.columns - width) / 2)
-      row, col, width, height = M.validate_window_position(row, col, width, height)
-
-      return {
-        relative = "editor", -- 相对于整个编辑器
-        width = width,
-        height = height,
-        row = row,
-        col = col,
-        border = M.config.ui.border, -- 使用配置的边框样式
-        style = "minimal", -- 最小化样式，隐藏行号等
-        focusable = true, -- 允许获取焦点
-      }
-    end,
-
-    -- 分割窗口策略：在编辑器右侧打开垂直分割窗口
-    [M.ui_modes.SPLIT] = function()
-      local width = math.floor(vim.o.columns * 0.4) -- 默认占屏幕40%宽度
-      local height = M.config.ui.height
-      width, height = M.apply_size_limits("split", width, height)
-
-      return {
-        relative = "editor",
-        width = width,
-        height = height,
-        row = 0,
-        col = vim.o.columns - width, -- 靠右对齐
-        style = "minimal",
-        border = M.config.ui.border,
-      }
-    end,
-
-    -- 标签页模式策略：占满整个标签页
-    [M.ui_modes.TAB] = function()
-      local width = vim.o.columns
-      local height = vim.o.lines
-      width, height = M.apply_size_limits("tab", width, height)
-      return { width = width, height = height }
-    end,
-
-    -- 树视图窗口策略：相对于父窗口定位
-    tree = function(parent_win, width)
-      width = width or 45 -- 增加默认宽度
-      width = math.max(width, M.WINDOW_LIMITS.tree.min_width)
-
-      -- 限制树窗口宽度不超过父窗口的指定比例
-      if M.WINDOW_LIMITS.tree.max_width_ratio and parent_win and utils.is_win_valid(parent_win) then
-        local parent_width = vim.api.nvim_win_get_width(parent_win)
-        width = math.min(width, math.floor(parent_width * M.WINDOW_LIMITS.tree.max_width_ratio))
-      end
-
-      -- 确保最小宽度
-      width = math.max(width, 45)
-
-      return {
-        relative = "win", -- 相对于指定窗口
-        win = parent_win or M.windows.main,
-        width = width,
-        height = math.min(M.config.ui.height, vim.o.lines - 10),
-        row = 0,
-        col = 0, -- 与父窗口左上角对齐
-        style = "minimal",
-        border = M.config.ui.border,
-        focusable = true,
-      }
-    end,
-  }
-
-  return strategies[mode]
+  return utils.get_window_strategy(mode, M.config, M.WINDOW_LIMITS)
 end
 
 --- 设置窗口
@@ -727,28 +579,19 @@ end
 -- 完成后自动将光标定位到输入行并进入插入模式
 -- @param win_opts 窗口配置选项表
 function M.setup_windows(win_opts)
-  M.windows.main = vim.api.nvim_open_win(M.buffers.main, true, win_opts)
-  M.set_window_wrap()
-  M.setup_buffers()
-  M.is_open = true
-
-  -- 异步等待渲染完成后将光标定位到输入提示行
-  vim.defer_fn(function()
-    if M.is_open and utils.is_win_valid(M.windows.main) and utils.is_buf_valid(M.buffers.main) then
-      -- 确保输入行可编辑
-      vim.api.nvim_set_option_value("modifiable", true, { buf = M.buffers.main })
-      vim.api.nvim_set_option_value("readonly", false, { buf = M.buffers.main })
-
-      -- 定位到输入行
-      if M.input_start_line then
-        local cursor_line = M.input_start_line + 1 -- +1 因为 cursor 是 1-indexed
-        vim.api.nvim_win_set_cursor(M.windows.main, { cursor_line, 0 })
-        vim.cmd("normal! zb")
-        -- 进入插入模式准备输入
-        vim.cmd("startinsert")
+  utils.setup_windows(M.windows, M.buffers, win_opts, M.setup_buffers, function(windows)
+    for _, win in pairs(windows) do
+      if utils.is_win_valid(win) then
+        vim.api.nvim_set_option_value("wrap", true, { win = win })
+        vim.api.nvim_set_option_value("linebreak", true, { win = win })
+        vim.api.nvim_set_option_value("breakindent", true, { win = win })
+        -- 启用折叠功能，使用标记折叠法
+        vim.api.nvim_set_option_value("foldmethod", "marker", { win = win })
+        vim.api.nvim_set_option_value("foldenable", true, { win = win })
       end
     end
-  end, 100) -- 100ms 延迟确保渲染完成
+  end)
+  M.is_open = true
 end
 
 --- 设置树窗口光标移动自动命令
@@ -1350,7 +1193,7 @@ function M._render_chat_interface()
   -- 调整窗口大小
   local max_width = utils.calculate_text_width()
   M.adjust_window_size(max_width, #lines)
-  M.set_window_wrap()
+  set_window_wrap_inline(M.windows)
 
   -- 恢复光标或滚动到底部
   if utils.is_win_valid(M.windows.main) then
@@ -1733,7 +1576,7 @@ end
 -- @param is_last 是否为最后一个兄弟
 -- @param skip_turns 跳过的轮次数（与父会话的共同前缀）
 function M._render_session_tree_tail(lines, session_id, session, tree_prefix, is_last, skip_turns)
-  local turns = group_messages_into_turns(session.messages or {})
+  local turns = utils.group_messages_into_turns(session.messages or {})
   if skip_turns >= #turns then
     return
   end
@@ -2117,7 +1960,7 @@ function M.open_chat_after_tree_selection()
       -- 切换回聊天缓冲区
       vim.api.nvim_win_set_buf(M.windows.main, M.buffers.main)
       M.windows.tree = nil -- 树视图已隐藏
-      M.set_window_wrap()
+      set_window_wrap_inline(M.windows)
       M.setup_buffers()
       -- 删除树缓冲区
       if utils.is_buf_valid(M.tree_buffers.main) then
@@ -2142,7 +1985,7 @@ function M.open_chat_after_tree_selection()
       -- 禁用行号
       vim.api.nvim_set_option_value("number", false, { win = M.windows.main })
       vim.api.nvim_set_option_value("relativenumber", false, { win = M.windows.main })
-      M.set_window_wrap()
+      set_window_wrap_inline(M.windows)
       M.setup_buffers()
     else
       -- 如果树窗口不存在，创建新的分割窗口
@@ -2152,7 +1995,7 @@ function M.open_chat_after_tree_selection()
       -- 禁用行号
       vim.api.nvim_set_option_value("number", false, { win = M.windows.main })
       vim.api.nvim_set_option_value("relativenumber", false, { win = M.windows.main })
-      M.set_window_wrap()
+      set_window_wrap_inline(M.windows)
       M.setup_buffers()
     end
     -- 删除树缓冲区
@@ -2167,14 +2010,14 @@ function M.open_chat_after_tree_selection()
       vim.api.nvim_win_set_buf(M.windows.tree, M.buffers.main)
       M.windows.main = M.windows.tree
       M.windows.tree = nil
-      M.set_window_wrap()
+      set_window_wrap_inline(M.windows)
       M.setup_buffers()
     else
       -- 如果树窗口不存在，创建新的标签页
       vim.cmd("tabnew")
       M.windows.main = vim.api.nvim_get_current_win()
       vim.api.nvim_win_set_buf(M.windows.main, M.buffers.main)
-      M.set_window_wrap()
+      set_window_wrap_inline(M.windows)
       M.setup_buffers()
     end
     -- 删除树缓冲区
@@ -2306,7 +2149,7 @@ function M.open_split()
   -- 禁用行号
   vim.api.nvim_set_option_value("number", false, { win = M.windows.main })
   vim.api.nvim_set_option_value("relativenumber", false, { win = M.windows.main })
-  M.set_window_wrap()
+  set_window_wrap_inline(M.windows)
   M.setup_buffers()
   M.is_open = true
   M.current_mode = M.ui_modes.SPLIT
@@ -2377,7 +2220,7 @@ function M.open_tab()
   vim.cmd("tabnew")
   M.windows.main = vim.api.nvim_get_current_win()
   vim.api.nvim_win_set_buf(M.windows.main, M.buffers.main)
-  M.set_window_wrap()
+  set_window_wrap_inline(M.windows)
   M.setup_buffers()
   M.is_open = true
   M.current_mode = M.ui_modes.TAB

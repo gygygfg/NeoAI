@@ -15,24 +15,6 @@ M.editable_states = {} -- 消息可编辑状态缓存
 M.llm_config = nil -- LLM API 配置（从 setup 传入的合并后配置）
 M._session_counter = 0 -- 全局会话计数器（用于统一命名）
 
---- 创建一条新消息
--- @param role 角色类型 (user/assistant/system)
--- @param content 消息内容
--- @param timestamp 时间戳（可选，默认为当前时间）
--- @param metadata 附加元数据（可选）
--- @return table 消息对象
-function M.create_message(role, content, timestamp, metadata)
-  return {
-    id = os.time() .. math.random(1000, 9999), -- 唯一 ID
-    role = role,
-    content = content,
-    timestamp = timestamp or os.time(),
-    metadata = metadata or {},
-    editable = false, -- 是否可编辑
-    pending = false, -- 是否正在等待 AI 回复
-  }
-end
-
 --- 自动同步指定会话数据到文件
 -- @param session_id 会话 ID
 function M._auto_sync(session_id)
@@ -269,8 +251,6 @@ function M.find_message_at_line(session, buf, target_line)
   return nil
 end
 
-
-
 --- 使用 curl 发起 HTTPS 流式请求到大模型 API
 -- 支持 OpenAI 兼容的 API 格式，使用 SSE (Server-Sent Events) 协议
 -- @param session_id 会话 ID
@@ -300,7 +280,7 @@ function M.request_ai_stream(session_id, user_content, on_chunk, on_complete)
   end
 
   -- 创建 pending 状态的占位消息
-  local pending_msg = M.create_message("assistant", "🔄 正在思考...", os.time(), { pending = true })
+  local pending_msg = utils.create_message("assistant", "🔄 正在思考...", os.time(), { pending = true })
   pending_msg.pending = true
   M.add_message(session_id, pending_msg)
 
@@ -608,7 +588,7 @@ function M.send_message(session_id, content)
   end
 
   -- 创建并添加用户消息
-  local user_msg = M.create_message("user", content)
+  local user_msg = utils.create_message("user", content)
   M.add_message(session_id, user_msg)
 
   -- 使用流式 API 请求 AI 回复
@@ -820,7 +800,7 @@ function M.import_sessions(filepath)
 
       -- 重建消息对象
       for _, msg_data in ipairs(session_data.messages or {}) do
-        local msg = M.create_message(msg_data.role, msg_data.content, msg_data.timestamp, msg_data.metadata)
+        local msg = utils.create_message(msg_data.role, msg_data.content, msg_data.timestamp, msg_data.metadata)
         msg.id = msg_data.id
         msg.editable = msg_data.editable or false
         if msg.editable then
@@ -909,16 +889,6 @@ function M.get_parent(session_id)
     return M.session_graph[session_id].parent
   end
   return nil
-end
-
---- 获取会话的子节点列表
--- @param session_id 会话 ID
--- @return table 子节点 ID 列表
-function M.get_children(session_id)
-  if M.session_graph[session_id] then
-    return M.session_graph[session_id].children or {}
-  end
-  return {}
 end
 
 --- 获取会话的所有祖先节点（递归）
@@ -1137,7 +1107,7 @@ function M.create_branch_at_turn(session_id, turn_index)
   -- 复制从开始到该轮次的所有消息
   for i = 1, last_msg_index do
     local msg = session.messages[i]
-    local new_msg = M.create_message(msg.role, msg.content, msg.timestamp, vim.deepcopy(msg.metadata))
+    local new_msg = utils.create_message(msg.role, msg.content, msg.timestamp, vim.deepcopy(msg.metadata))
     M.add_message(new_session.id, new_msg)
   end
 

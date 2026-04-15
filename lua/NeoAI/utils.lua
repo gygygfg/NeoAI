@@ -672,56 +672,6 @@ function M.ensure_active_session(backend)
   return true
 end
 
---- 构建推理内容显示行
--- 思考中时使用浮动窗口，思考完成后变为折叠文本
--- @param reasoning_text 推理内容字符串
--- @param max_width 最大宽度
--- @param is_complete 思考是否已完成
--- @param message_id 消息ID（用于跟踪折叠状态）
--- @param states 推理状态表
--- @param reasoning_engine_config 推理引擎配置
--- @param reasoning_fold_state 折叠状态表
--- @param reasoning_float_wins 浮动窗口表
--- @param reasoning_float_buffers 浮动缓冲区表
--- @return table 推理内容行数组
-function M.build_reasoning_lines(
-  reasoning_text,
-  max_width,
-  is_complete,
-  message_id,
-  states,
-  reasoning_engine_config,
-  reasoning_fold_state,
-  reasoning_float_wins,
-  reasoning_float_buffers
-)
-  -- 同步文本到引擎状态
-  local state = M.get_reasoning_state(states, message_id)
-
-  if is_complete and (state.phase == "thinking" or state.phase == "idle") then
-    -- 思考完成（或从持久化状态恢复）：切换到 finished 阶段
-    state.phase = "finished"
-    state.fold_state = reasoning_fold_state[message_id] or reasoning_engine_config.fold_on_finish
-    state.text = reasoning_text or ""
-    M.destroy_reasoning_float(states, message_id)
-    reasoning_float_wins[message_id] = nil
-    reasoning_float_buffers[message_id] = nil
-    reasoning_fold_state[message_id] = state.fold_state
-  elseif not is_complete and state.phase == "idle" then
-    -- 首次检测到推理：开始 thinking 阶段
-    state.phase = "thinking"
-    state.text = reasoning_text or ""
-  elseif not is_complete then
-    -- 更新推理文本
-    state.text = reasoning_text or ""
-  end
-
-  -- 委托给引擎生成显示行
-  -- 注意：这里需要调用 ui 模块的 get_reasoning_display_lines 函数
-  -- 由于循环依赖，这个函数需要在 ui.lua 中实现
-  return {}
-end
-
 --- 防抖同步函数
 -- @param sync_func 同步函数
 -- @param session_id 会话 ID
@@ -752,14 +702,221 @@ function M.create_debounce_sync(sync_func, session_id, delay_ms, timer_ref)
   end
 end
 
---- 创建自动同步函数
--- @param export_func 导出函数
--- @param config_file 配置文件路径
--- @return function 自动同步函数
-function M.create_auto_sync(export_func, config_file)
-  return function(session_id)
-    export_func(session_id, config_file, true)
+-- ── 窗口策略工具 ──────────────────────────────────────────────────────────
+
+--- 获取窗口策略函数
+-- 根据不同的窗口模式（浮动、分割、标签、树视图）返回对应的窗口配置生成函数
+-- @param mode 窗口模式 (float/split/tab/tree)
+-- @param config UI配置
+-- @param window_limits 窗口限制配置
+-- @return function 窗口策略函数，调用后返回窗口配置表
+function M.get_window_strategy(mode, config, window_limits)
+  local strategies = {
+    -- 浮动窗口策略：在编辑器中央弹出独立窗口
+    float = function()
+      local width = math.min(config.ui.width, vim.o.columns - 10)
+      local height = math.min(config.ui.height, vim.o.lines - 10)
+      width, height = M.apply_size_limits("float", width, height, window_limits)
+
+      -- 居中计算
+      local row = math.floor((vim.o.lines - height) / 2)
+      local col = math.floor((vim.o.columns - width) / 2)
+      row, col, width, height = M.validate_window_position(row, col, width, height)
+
+      return {
+        relative = "editor", -- 相对于整个编辑器
+        width = width,
+        height = height,
+        row = row,
+        col = col,
+        border = config.ui.border, -- 使用配置的边框样式
+        style = "minimal", -- 最小化样式，隐藏行号等
+        focusable = true, -- 允许获取焦点
+      }
+    end,
+
+    -- 分割窗口策略：在编辑器右侧打开垂直分割窗口
+    split = function()
+      local width = math.floor(vim.o.columns * 0.4) -- 默认占屏幕40%宽度
+      local height = config.ui.height
+      width, height = M.apply_size_limits("split", width, height, window_limits)
+
+      return {
+        relative = "editor",
+        width = width,
+        height = height,
+        row = 0,
+        col = vim.o.columns - width, -- 靠右对齐
+        style = "minimal",
+        border = config.ui.border,
+      }
+    end,
+
+    -- 标签页模式策略：占满整个标签页
+    tab = function()
+      local width = vim.o.columns
+      local height = vim.o.lines
+      width, height = M.apply_size_limits("tab", width, height, window_limits)
+      return { width = width, height = height }
+    end,
+
+    -- 树视图窗口策略：相对于父窗口定位
+    tree = function(parent_win, width)
+      width = width or 45 -- 增加默认宽度
+      width = math.max(width, window_limits.tree.min_width)
+
+      -- 限制树窗口宽度不超过父窗口的指定比例
+      if window_limits.tree.max_width_ratio and parent_win and M.is_win_valid(parent_win) then
+        local parent_width = vim.api.nvim_win_get_width(parent_win)
+        width = math.min(width, math.floor(parent_width * window_limits.tree.max_width_ratio))
+      end
+
+      -- 确保最小宽度
+      width = math.max(width, 45)
+
+      return {
+        relative = "win", -- 相对于指定窗口
+        win = parent_win,
+        width = width,
+        height = math.min(config.ui.height, vim.o.lines - 10),
+        row = 0,
+        col = 0, -- 与父窗口左上角对齐
+        style = "minimal",
+        border = config.ui.border,
+        focusable = true,
+      }
+    end,
+  }
+
+  return strategies[mode]
+end
+
+--- 调整窗口大小（根据内容自动计算）
+-- @param windows 窗口表
+-- @param current_mode 当前模式
+-- @param content_width 内容宽度
+-- @param content_height 内容高度
+-- @param window_limits 窗口限制配置
+function M.adjust_window_size(windows, current_mode, content_width, content_height, window_limits)
+  if not M.is_win_valid(windows.main) then
+    return
   end
+
+  local editor_w = vim.o.columns
+  local editor_h = vim.o.lines
+
+  -- 浮动模式：居中显示，自动调整大小
+  if current_mode == "float" then
+    local w = M.clamp(content_width + 6, 50, math.min(math.floor(editor_w * 0.85), 140))
+    local h = M.clamp(content_height + 6, 8, math.min(editor_h - 6, 45))
+    w, h = M.apply_size_limits("float", w, h, window_limits)
+
+    local row = math.max(0, math.floor((editor_h - h) / 2))
+    local col = math.max(0, math.floor((editor_w - w) / 2))
+    row, col, w, h = M.validate_window_position(row, col, w, h)
+
+    M.safe_win_call(function()
+      vim.api.nvim_win_set_config(windows.main, {
+        relative = "editor",
+        row = row,
+        col = col,
+        width = w,
+        height = h,
+      })
+    end)
+  -- 分割模式：调整宽度
+  elseif current_mode == "split" then
+    local w = M.clamp(content_width + 6, 40, math.min(math.floor(editor_w * 0.6), 120))
+    w = M.apply_size_limits("split", w, editor_h, window_limits)
+
+    M.safe_win_call(function()
+      vim.api.nvim_win_set_width(windows.main, w)
+    end)
+  end
+  -- 标签模式由Neovim自动管理
+end
+
+--- 调整树窗口大小（动态宽度，最大值为屏幕一半）
+-- @param windows 窗口表
+-- @param tree_buffers 树缓冲区表
+-- @param window_limits 窗口限制配置
+function M.adjust_tree_window_size(windows, tree_buffers, window_limits)
+  if not M.is_win_valid(windows.tree) or not M.is_buf_valid(tree_buffers.main) then
+    return
+  end
+
+  local editor_w = vim.o.columns
+  local max_width = math.floor(editor_w * 0.5)
+
+  -- 计算树内容的最大宽度
+  local lines = vim.api.nvim_buf_get_lines(tree_buffers.main, 0, -1, false)
+  local max_w = 0
+
+  for _, line in ipairs(lines) do
+    local width = M.display_width(line)
+    max_w = math.max(max_w, width)
+  end
+
+  -- 动态宽度 = 内容宽度 + 边距，但不超过屏幕一半
+  local target = math.min(max_w + 10, max_width)
+  target = M.clamp(target, window_limits.tree.min_width, max_width)
+
+  local current_w = vim.api.nvim_win_get_width(windows.tree)
+  if target ~= current_w then
+    M.safe_win_call(function()
+      vim.api.nvim_win_set_width(windows.tree, target)
+    end)
+  end
+end
+
+--- 设置窗口
+-- 打开主聊天窗口并初始化相关组件（缓冲区、快捷键、输入处理）
+-- 完成后自动将光标定位到输入行并进入插入模式
+-- @param windows 窗口表
+-- @param buffers 缓冲区表
+-- @param win_opts 窗口配置选项表
+-- @param setup_buffers_func 设置缓冲区的函数
+-- @param set_window_wrap_func 设置窗口换行的函数
+function M.setup_windows(windows, buffers, win_opts, setup_buffers_func, set_window_wrap_func)
+  windows.main = vim.api.nvim_open_win(buffers.main, true, win_opts)
+  set_window_wrap_func(windows)
+  setup_buffers_func()
+
+  -- 异步等待渲染完成后将光标定位到输入提示行
+  vim.defer_fn(function()
+    if M.is_win_valid(windows.main) and M.is_buf_valid(buffers.main) then
+      -- 确保输入行可编辑
+      vim.api.nvim_set_option_value("modifiable", true, { buf = buffers.main })
+      vim.api.nvim_set_option_value("readonly", false, { buf = buffers.main })
+
+      -- 定位到输入行
+      if windows.input_start_line then
+        local cursor_line = windows.input_start_line + 1 -- +1 因为 cursor 是 1-indexed
+        vim.api.nvim_win_set_cursor(windows.main, { cursor_line, 0 })
+        vim.cmd("normal! zb")
+        -- 进入插入模式准备输入
+        vim.cmd("startinsert")
+      end
+    end
+  end, 100) -- 100ms 延迟确保渲染完成
+end
+
+--- 创建一条新消息
+-- @param role 角色类型 (user/assistant/system)
+-- @param content 消息内容
+-- @param timestamp 时间戳（可选，默认为当前时间）
+-- @param metadata 附加元数据（可选）
+-- @return table 消息对象
+function M.create_message(role, content, timestamp, metadata)
+  return {
+    id = os.time() .. math.random(1000, 9999), -- 唯一 ID
+    role = role,
+    content = content,
+    timestamp = timestamp or os.time(),
+    metadata = metadata or {},
+    editable = false, -- 是否可编辑
+    pending = false, -- 是否正在等待 AI 回复
+  }
 end
 
 return M
