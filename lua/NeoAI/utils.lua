@@ -585,19 +585,68 @@ function M.build_api_messages(session, user_content, llm_config, config)
 
   for i = start_idx, #session.messages do
     local msg = session.messages[i]
+
+    -- 处理普通消息
     if msg.role == "user" or msg.role == "assistant" then
       table.insert(messages, {
         role = msg.role,
         content = msg.content or "",
       })
+
+    -- 处理工具调用消息
+    elseif msg.role == "assistant" and msg.metadata and msg.metadata.tool_calls then
+      local tool_calls = {}
+      for _, tool_call in ipairs(msg.metadata.tool_calls) do
+        table.insert(tool_calls, {
+          id = tool_call.id,
+          type = "function",
+          ["function"] = {
+            name = tool_call.name,
+            arguments = tool_call.arguments,
+          },
+        })
+      end
+
+      -- 当有工具调用时，content 应该为 null 或空字符串
+      -- 但 OpenAI API 期望 content 为 null，所以我们不设置 content 字段
+      local message_entry = {
+        role = "assistant",
+        tool_calls = tool_calls,
+      }
+
+      -- 只有在 content 非空时才添加 content 字段
+      if msg.content and msg.content ~= "" then
+        message_entry.content = msg.content
+      end
+
+      table.insert(messages, message_entry)
+
+    -- 处理工具结果消息
+    elseif msg.role == "tool" then
+      table.insert(messages, {
+        role = "tool",
+        content = msg.content or "",
+        tool_call_id = msg.metadata and msg.metadata.tool_call_id,
+        name = msg.metadata and msg.metadata.tool_name,
+      })
     end
   end
 
-  -- 添加当前用户消息
-  table.insert(messages, {
-    role = "user",
-    content = user_content,
-  })
+  -- 检查是否需要添加用户消息
+  -- 如果最后一条消息已经是用户消息，且内容相同，则不需要重复添加
+  local last_msg = messages[#messages]
+  local should_add_user_msg = true
+
+  if last_msg and last_msg.role == "user" and last_msg.content == user_content then
+    should_add_user_msg = false
+  end
+
+  if should_add_user_msg then
+    table.insert(messages, {
+      role = "user",
+      content = user_content,
+    })
+  end
 
   return messages
 end

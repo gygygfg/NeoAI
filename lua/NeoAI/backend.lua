@@ -3,6 +3,7 @@
 local M = {}
 local config = require("NeoAI.config")
 local utils = require("NeoAI.utils")
+local llm_utils = require("NeoAI.llm_utils")
 
 -- 模块状态变量
 M.config_dir = nil -- 配置目录路径
@@ -58,9 +59,12 @@ function M.new_session(name, parent_id)
     created_at = os.time(),
     updated_at = os.time(),
     config = {
-      auto_scroll = M.validated_config and M.validated_config.ui and M.validated_config.ui.auto_scroll or config.defaults.ui.auto_scroll,
-      show_timestamps = M.validated_config and M.validated_config.ui and M.validated_config.ui.show_timestamps or config.defaults.ui.show_timestamps,
-      max_history = M.validated_config and M.validated_config.background and M.validated_config.background.max_history or config.defaults.background.max_history,
+      auto_scroll = M.validated_config and M.validated_config.ui and M.validated_config.ui.auto_scroll
+        or config.defaults.ui.auto_scroll,
+      show_timestamps = M.validated_config and M.validated_config.ui and M.validated_config.ui.show_timestamps
+        or config.defaults.ui.show_timestamps,
+      max_history = M.validated_config and M.validated_config.background and M.validated_config.background.max_history
+        or config.defaults.background.max_history,
     },
   }
 
@@ -269,12 +273,12 @@ function M.request_ai_stream(session_id, user_content, on_chunk, on_complete)
     return
   end
 
-  -- 使用存储的 LLM 配置（优先）或回退到默认配置
+  -- 使用存储的 LLM 配置
   local llm_config = M.llm_config or (M.validated_config and M.validated_config.llm) or config.defaults.llm
 
   -- 验证 API 配置
   if not llm_config.api_key or llm_config.api_key == "" then
-    local error_msg = "未配置 API 密钥，请设置 OPENAI_API_KEY 环境变量或在配置中提供"
+    local error_msg = "未配置 API 密钥"
     vim.notify("[NeoAI] " .. error_msg, vim.log.levels.ERROR)
     if on_complete then
       on_complete(false, error_msg)
@@ -287,8 +291,9 @@ function M.request_ai_stream(session_id, user_content, on_chunk, on_complete)
   pending_msg.pending = true
   M.add_message(session_id, pending_msg)
 
-  -- 构建请求体
+  -- 构建请求体（不包含工具）
   local messages = utils.build_api_messages(session, user_content, M.llm_config, M.validated_config)
+
   local request_body = vim.fn.json_encode({
     model = llm_config.model,
     messages = messages,
@@ -298,14 +303,13 @@ function M.request_ai_stream(session_id, user_content, on_chunk, on_complete)
     top_p = llm_config.top_p,
   })
 
-  -- 创建临时文件：请求体和响应
+  -- 创建临时文件
   local body_file = vim.fn.tempname() .. "_body.json"
   local tmp_file = vim.fn.tempname() .. ".sse"
 
-  -- 将请求体写入文件（避免命令行参数过长）
   vim.fn.writefile({ request_body }, body_file)
 
-  -- 构建 curl 命令（从文件读取请求体）
+  -- 构建 curl 命令
   local curl_cmd = string.format(
     "curl -s -N --connect-timeout 10 --max-time %d "
       .. '-X POST "%s" '
@@ -319,25 +323,23 @@ function M.request_ai_stream(session_id, user_content, on_chunk, on_complete)
     tmp_file
   )
 
-  -- 用于追踪已累积的内容
   local accumulated_content = ""
   local accumulated_reasoning = "" -- 推理/思考内容
-  local last_update_time = 0
   local request_finished = false
-  -- 追踪已处理的文件位置（避免重复处理 SSE 事件）
   local last_processed_pos = 0
+  local last_update_time = 0
+  local stream_update_interval = llm_config.stream_update_interval or 100 -- 默认100ms
 
-  -- 启动后台 job 运行 curl 命令
+  -- 启动后台 job
   local job_id = vim.fn.jobstart(curl_cmd, {
     on_exit = function(job, exit_code)
       vim.schedule(function()
         request_finished = true
 
-        -- 读取完整的响应文件（如果还有未处理的内容）
+        -- 读取完整的响应文件
         if vim.fn.filereadable(tmp_file) == 1 then
           local handle = io.open(tmp_file, "r")
           if handle then
-            -- 读取剩余未处理的内容
             handle:seek("set", last_processed_pos)
             local remaining = handle:read("*a")
             handle:close()
@@ -359,50 +361,35 @@ function M.request_ai_stream(session_id, user_content, on_chunk, on_complete)
                         pending_msg.metadata.reasoning_finished = false
                       end
                       -- 提取常规内容
-                      local content = delta.content
-                      if content and content ~= vim.NIL and content ~= "" then
-                        accumulated_content = accumulated_content .. tostring(content)
-                        -- 当有常规内容且推理内容已存在时，标记推理已完成
-                        if accumulated_reasoning ~= "" and not pending_msg.metadata.reasoning_finished then
-                          pending_msg.metadata.reasoning_finished = true
-                          -- 立即通知 UI 关闭思考浮动窗口
-                          M._trigger("ai_reasoning_finished", {
-                            session_id = session_id,
-                            message = pending_msg,
-                          })
-                        end
+                      if delta.content and delta.content ~= vim.NIL then
+                        local content_str = type(delta.content) == "string" and delta.content or tostring(delta.content)
+                        accumulated_content = accumulated_content .. content_str
                       end
                     end
                   end
                 end
               end
             end
-          end
 
-          -- 尝试从完整响应中提取最终内容（用于非流式模式或错误处理）
-          if not llm_config.stream and accumulated_content == "" then
-            local content_lines = vim.fn.readfile(tmp_file)
-            local full_response = table.concat(content_lines, "\n")
-            local ok, response_json = pcall(vim.fn.json_decode, full_response)
-            if ok and response_json and response_json.choices then
-              accumulated_content = response_json.choices[1].message.content or ""
-            end
+            -- 清理临时文件
+            vim.fn.delete(tmp_file)
+            vim.fn.delete(body_file)
           end
-
-          -- 非流式模式：如果同时有推理内容和常规内容，标记推理已完成
-          if not llm_config.stream and accumulated_reasoning ~= "" and accumulated_content ~= "" then
-            pending_msg.metadata.reasoning_finished = true
-          end
-
-          -- 清理临时文件
-          vim.fn.delete(tmp_file)
-          vim.fn.delete(body_file)
         end
 
         -- 更新消息为最终内容
         for i, msg in ipairs(session.messages) do
           if msg.id == pending_msg.id then
-            msg.content = accumulated_content ~= "" and accumulated_content or "抱歉，未能生成回复。"
+            local final_content
+            if accumulated_content ~= "" then
+              final_content = accumulated_content
+            elseif accumulated_reasoning ~= "" then
+              final_content = "思考完成:\n" .. accumulated_reasoning
+            else
+              final_content = "抱歉，未能生成回复。"
+            end
+
+            msg.content = final_content
             msg.pending = false
             msg.timestamp = os.time()
             -- 存储推理/思考内容到 metadata
@@ -417,6 +404,11 @@ function M.request_ai_stream(session_id, user_content, on_chunk, on_complete)
         session.updated_at = os.time()
         M._auto_sync(session_id)
 
+        -- 触发最后一次更新
+        if on_chunk then
+          on_chunk(accumulated_content)
+        end
+        
         -- 触发完成回调
         if on_complete then
           local success = exit_code == 0 and accumulated_content ~= ""
@@ -435,10 +427,9 @@ function M.request_ai_stream(session_id, user_content, on_chunk, on_complete)
   })
 
   if job_id <= 0 then
-    local error_msg = "无法启动 API 请求（jobstart 失败）"
+    local error_msg = "无法启动 API 请求"
     vim.notify("[NeoAI] " .. error_msg, vim.log.levels.ERROR)
 
-    -- 更新错误消息
     for i, msg in ipairs(session.messages) do
       if msg.id == pending_msg.id then
         msg.content = "❌ " .. error_msg
@@ -454,29 +445,25 @@ function M.request_ai_stream(session_id, user_content, on_chunk, on_complete)
     return
   end
 
-  -- 启动文件监听器，实时读取流式响应
+  -- 启动文件监听器
   local function watch_stream()
     if request_finished then
       return
     end
 
     if vim.fn.filereadable(tmp_file) == 1 then
-      -- 使用系统命令读取文件并追踪位置（仅读取新内容）
       local file_size = vim.fn.getfsize(tmp_file)
       if file_size <= last_processed_pos then
-        -- 文件没有新内容，跳过
         vim.defer_fn(watch_stream, 50)
         return
       end
 
-      -- 使用 tail 读取新增内容（避免重复处理）
       local handle = io.open(tmp_file, "r")
       if not handle then
         vim.defer_fn(watch_stream, 50)
         return
       end
 
-      -- 跳过已处理的部分
       handle:seek("set", last_processed_pos)
       local new_content = handle:read("*a")
       handle:close()
@@ -486,13 +473,9 @@ function M.request_ai_stream(session_id, user_content, on_chunk, on_complete)
         return
       end
 
-      -- 更新已处理的位置
       last_processed_pos = last_processed_pos + #new_content
 
-      -- 仅解析新增的 SSE 事件
-      local current_time = vim.loop.now()
-      local has_new_content = false
-
+      -- 解析 SSE 事件
       for line in new_content:gmatch("[^\r\n]+") do
         if line:match("^data:") then
           local data = utils.parse_sse_data(line)
@@ -503,10 +486,8 @@ function M.request_ai_stream(session_id, user_content, on_chunk, on_complete)
               local reasoning = utils.extract_reasoning_from_delta(delta)
               if reasoning then
                 accumulated_reasoning = accumulated_reasoning .. reasoning
-                -- 实时更新消息的 metadata，让 UI 能检测到推理内容
                 pending_msg.metadata.reasoning_content = accumulated_reasoning
                 pending_msg.metadata.has_reasoning = true
-                -- 标记推理仍在进行中
                 pending_msg.metadata.reasoning_finished = false
                 -- 触发推理内容更新事件
                 M._trigger("ai_reasoning_update", {
@@ -516,62 +497,663 @@ function M.request_ai_stream(session_id, user_content, on_chunk, on_complete)
                 })
               end
               -- 提取常规内容
-              local content = delta.content
-              if content and content ~= vim.NIL and content ~= "" then
-                accumulated_content = accumulated_content .. tostring(content)
-                has_new_content = true
+              if delta.content and delta.content ~= vim.NIL then
+                local content_str = type(delta.content) == "string" and delta.content or tostring(delta.content)
+                accumulated_content = accumulated_content .. content_str
+                -- 实时更新消息内容，使 UI 能显示流式内容
+                pending_msg.content = accumulated_content
+                -- 同时更新会话中的消息内容
+                for i, msg in ipairs(session.messages) do
+                  if msg.id == pending_msg.id then
+                    msg.content = accumulated_content
+                    break
+                  end
+                end
                 -- 当有常规内容且推理内容已存在时，标记推理已完成
                 if accumulated_reasoning ~= "" and not pending_msg.metadata.reasoning_finished then
                   pending_msg.metadata.reasoning_finished = true
-                  -- 立即通知 UI 关闭思考浮动窗口
+                  -- 通知 UI 关闭思考浮动窗口
                   M._trigger("ai_reasoning_finished", {
                     session_id = session_id,
                     message = pending_msg,
                   })
+                end
+                -- 控制流式更新频率
+                local current_time = vim.loop.now()
+                if current_time - last_update_time >= stream_update_interval then
+                  last_update_time = current_time
+                  if on_chunk then
+                    on_chunk(accumulated_content)
+                  end
                 end
               end
             end
           end
         end
       end
+    end
 
-      -- 更新 UI（按配置的间隔）
-      if has_new_content and accumulated_content ~= "" then
-        if current_time - last_update_time >= llm_config.stream_update_interval then
-          last_update_time = current_time
+    vim.defer_fn(watch_stream, 50)
+  end
 
-          -- 更新 pending 消息内容
-          for i, msg in ipairs(session.messages) do
-            if msg.id == pending_msg.id then
-              msg.content = accumulated_content
-              msg.timestamp = os.time()
-              break
-            end
-          end
+  watch_stream()
+end
 
-          M._auto_sync(session_id)
-          M._trigger("ai_stream_update", {
-            session_id = session_id,
-            message = pending_msg,
-            content = accumulated_content,
+--- 执行工具调用
+-- @param tool_name 工具名称
+-- @param arguments 工具参数
+-- @return table 工具执行结果
+local function execute_tool_call(tool_name, arguments)
+  local result = {}
+
+  -- 根据工具名称调用对应的函数
+  if tool_name == "shell_execute" then
+    result = llm_utils.shell_execute(arguments)
+  elseif tool_name == "read_file" then
+    result = llm_utils.read_file(arguments)
+  elseif tool_name == "write_file" then
+    result = llm_utils.write_file(arguments)
+  elseif tool_name == "list_directory" then
+    result = llm_utils.list_directory(arguments)
+  elseif tool_name == "analyze_code" then
+    result = llm_utils.analyze_code(arguments)
+  else
+    result = { success = false, error = "未知工具: " .. tool_name }
+  end
+
+  return result
+end
+
+--- 处理工具调用并继续对话
+-- @param session_id 会话 ID
+-- @param tool_calls 工具调用列表
+-- @param on_complete 完成回调
+local function handle_tool_calls(session_id, tool_calls, on_complete)
+  local session = M.sessions[session_id]
+  if not session then
+    if on_complete then
+      on_complete(false, "会话不存在")
+    end
+    return
+  end
+
+  -- 首先，更新助理消息以包含工具调用信息
+  local assistant_msg = nil
+  for i = #session.messages, 1, -1 do
+    if session.messages[i].role == "assistant" and session.messages[i].pending then
+      assistant_msg = session.messages[i]
+      break
+    end
+  end
+
+  if assistant_msg then
+    -- 记录工具调用到元数据
+    local tool_calls_metadata = {}
+    for i = 1, #tool_calls do
+      local tool_call = tool_calls[i]
+      if tool_call then
+        local func = tool_call["function"]
+        if func and func.name then
+          table.insert(tool_calls_metadata, {
+            id = tool_call.id,
+            name = func.name,
+            arguments = func.arguments,
           })
+        end
+      end
+    end
 
-          -- 调用 chunk 回调
-          if on_chunk then
-            on_chunk(accumulated_content)
+    assistant_msg.metadata = assistant_msg.metadata or {}
+    assistant_msg.metadata.tool_calls = tool_calls_metadata
+    assistant_msg.pending = false
+    -- 当 AI 返回工具调用时，content 通常为 null 或空字符串
+    -- 设置为空字符串以避免混淆
+    assistant_msg.content = ""
+    
+    -- 触发 AI 回复事件（工具调用场景）
+    M._trigger("ai_replied", {
+      session_id = session_id,
+      message = assistant_msg,
+      content = "",
+      has_tool_calls = true,
+    })
+  end
+  
+  -- 调用完成回调，表示第一次请求成功（即使没有常规内容）
+  if on_complete then
+    on_complete(true, nil, "")
+  end
+
+  -- 为每个工具调用执行并收集结果
+  local tool_results = {}
+
+  -- 调试：打印工具调用信息
+  if M.validated_config and M.validated_config.debug then
+    vim.notify("[NeoAI调试] 工具调用数量: " .. #tool_calls, vim.log.levels.DEBUG)
+    for i, tool_call in ipairs(tool_calls) do
+      if tool_call and tool_call["function"] then
+        local func = tool_call["function"]
+        vim.notify(
+          string.format(
+            "[NeoAI调试] 工具调用%d: id=%s, name=%s, arguments=%s",
+            i,
+            tool_call.id or "(无id)",
+            func.name or "(无名)",
+            func.arguments or "(无参数)"
+          ),
+          vim.log.levels.DEBUG
+        )
+      end
+    end
+  end
+
+  for i = 1, #tool_calls do
+    local tool_call = tool_calls[i]
+    if tool_call then
+      local func = tool_call["function"]
+      if not func or not func.name then
+        -- 跳过不完整的工具调用条目
+        goto continue
+      end
+
+      local tool_name = func.name
+      local arguments = func.arguments
+
+      -- 解析参数（如果是字符串）
+      local parsed_args = {}
+      if type(arguments) == "string" then
+        local ok, decoded = pcall(vim.fn.json_decode, arguments)
+        if ok and decoded then
+          parsed_args = decoded
+        else
+          parsed_args = {}
+        end
+      else
+        parsed_args = arguments or {}
+      end
+
+      -- 执行工具
+      local result = execute_tool_call(tool_name, parsed_args)
+
+      -- 格式化结果
+      local formatted_result = ""
+      if result.success then
+        if result.content then
+          formatted_result = result.content
+        elseif result.output then
+          formatted_result = result.output
+        elseif result.analysis then
+          formatted_result = "分析结果:\n" .. vim.fn.json_encode(result.analysis)
+        else
+          formatted_result = "操作成功"
+        end
+
+        -- 调试：打印工具执行结果
+        if M.validated_config and M.validated_config.debug then
+          local preview = string.sub(formatted_result, 1, 100)
+          if #preview > 100 then
+            preview = preview .. "..."
+          end
+          vim.notify(
+            string.format("[NeoAI调试] 工具执行成功: %s, 结果预览: %s", tool_name, preview),
+            vim.log.levels.DEBUG
+          )
+        end
+      else
+        formatted_result = "错误: " .. (result.error or "未知错误")
+
+        -- 调试：打印工具执行错误
+        if M.validated_config and M.validated_config.debug then
+          vim.notify(
+            string.format("[NeoAI调试] 工具执行失败: %s, 错误: %s", tool_name, result.error or "未知错误"),
+            vim.log.levels.DEBUG
+          )
+        end
+      end
+
+      table.insert(tool_results, {
+        tool_call_id = tool_call.id,
+        role = "tool",
+        name = tool_name,
+        content = formatted_result,
+      })
+    end
+    ::continue::
+  end
+
+  -- 将工具结果添加到消息历史中
+  for _, result in ipairs(tool_results) do
+    local tool_msg = utils.create_message(result.role, result.content, os.time(), {
+      tool_name = result.name,
+      tool_call_id = result.tool_call_id,
+      -- 标记为工具执行结果，支持悬浮文本显示
+      is_tool_result = true,
+      tool_result_content = result.content,
+    })
+    M.add_message(session_id, tool_msg)
+
+    -- 触发工具结果添加事件，UI层可以显示悬浮文本
+    M._trigger("tool_result_added", {
+      session_id = session_id,
+      message = tool_msg,
+      tool_name = result.name,
+      tool_content = result.content,
+    })
+  end
+
+  -- 继续对话：使用工具结果再次请求 AI
+  local last_user_msg = nil
+  for i = #session.messages, 1, -1 do
+    if session.messages[i].role == "user" then
+      last_user_msg = session.messages[i]
+      break
+    end
+  end
+
+  if last_user_msg then
+    -- 重新请求 AI，这次包含工具结果
+    -- 注意：这里不传递原始的 on_complete，因为第一次请求已经完成
+    -- 工具执行是第一次请求的一部分，第二次请求是新的对话轮次
+
+    -- 调试：打印消息历史
+    if M.validated_config and M.validated_config.debug then
+      local messages = utils.build_api_messages(session, last_user_msg.content, M.llm_config, M.validated_config)
+      vim.notify("[NeoAI调试] 第二次请求消息数: " .. #messages, vim.log.levels.DEBUG)
+      for i, msg in ipairs(messages) do
+        local preview = msg.content and string.sub(msg.content, 1, 50) or "(无内容)"
+        if #preview > 50 then
+          preview = preview .. "..."
+        end
+        vim.notify(
+          string.format("[NeoAI调试] 消息%d: role=%s, content=%s", i, msg.role, preview),
+          vim.log.levels.DEBUG
+        )
+      end
+    end
+
+    M.request_ai_stream_with_tools(
+      session_id,
+      last_user_msg.content,
+      nil,
+      -- 新的完成回调，只处理第二次请求的结果
+      function(success, error_msg, final_content)
+        if success then
+          M._trigger("response_received", {
+            session_id = session_id,
+            response = final_content,
+          })
+        else
+          vim.notify("[NeoAI] AI 回复失败: " .. (error_msg or "未知错误"), vim.log.levels.WARN)
+        end
+      end
+    )
+  else
+    if on_complete then
+      on_complete(false, "未找到用户消息")
+    end
+  end
+end
+
+--- 使用 function calling 发起 AI 请求
+-- @param session_id 会话 ID
+-- @param user_content 用户消息内容
+-- @param on_chunk 流式数据块回调函数
+-- @param on_complete 完成回调函数
+function M.request_ai_stream_with_tools(session_id, user_content, on_chunk, on_complete)
+  local session = M.sessions[session_id]
+  if not session then
+    if on_complete then
+      on_complete(false, "会话不存在")
+    end
+    return
+  end
+
+  -- 使用存储的 LLM 配置
+  local llm_config = M.llm_config or (M.validated_config and M.validated_config.llm) or config.defaults.llm
+
+  -- 验证 API 配置
+  if not llm_config.api_key or llm_config.api_key == "" then
+    local error_msg = "未配置 API 密钥"
+    vim.notify("[NeoAI] " .. error_msg, vim.log.levels.ERROR)
+    if on_complete then
+      on_complete(false, error_msg)
+    end
+    return
+  end
+
+  -- 创建 pending 状态的占位消息
+  local pending_msg = utils.create_message("assistant", "🔄 正在思考...", os.time(), { pending = true })
+  pending_msg.pending = true
+  M.add_message(session_id, pending_msg)
+
+  -- 构建请求体（包含工具）
+  local messages = utils.build_api_messages(session, user_content, M.llm_config, M.validated_config)
+  local tools = llm_utils.get_tools()
+
+  local request_body = vim.fn.json_encode({
+    model = llm_config.model,
+    messages = messages,
+    stream = llm_config.stream,
+    temperature = llm_config.temperature,
+    max_tokens = llm_config.max_tokens,
+    top_p = llm_config.top_p,
+    tools = tools,
+    tool_choice = "auto",
+  })
+
+  -- 创建临时文件
+  local body_file = vim.fn.tempname() .. "_body.json"
+  local tmp_file = vim.fn.tempname() .. ".sse"
+
+  vim.fn.writefile({ request_body }, body_file)
+
+  -- 构建 curl 命令
+  local curl_cmd = string.format(
+    "curl -s -N --connect-timeout 10 --max-time %d "
+      .. '-X POST "%s" '
+      .. '-H "Content-Type: application/json" '
+      .. '-H "Authorization: Bearer %s" '
+      .. '-d "@%s" > "%s" 2>&1',
+    llm_config.timeout,
+    llm_config.api_url,
+    llm_config.api_key,
+    body_file,
+    tmp_file
+  )
+
+  local accumulated_content = ""
+  local accumulated_reasoning = "" -- 推理/思考内容
+  local tool_calls = {}
+  local has_tool_calls = false
+  local request_finished = false
+  local last_processed_pos = 0
+  local last_update_time = 0
+  local stream_update_interval = llm_config.stream_update_interval or 100 -- 默认100ms
+
+  -- 启动后台 job
+  local job_id = vim.fn.jobstart(curl_cmd, {
+    on_exit = function(job, exit_code)
+      vim.schedule(function()
+        request_finished = true
+
+        -- 读取完整的响应文件
+        if vim.fn.filereadable(tmp_file) == 1 then
+          local handle = io.open(tmp_file, "r")
+          if handle then
+            handle:seek("set", last_processed_pos)
+            local remaining = handle:read("*a")
+            handle:close()
+
+            -- 处理剩余的 SSE 事件
+            if remaining and remaining ~= "" then
+              for line in remaining:gmatch("[^\r\n]+") do
+                if line:match("^data:") then
+                  local data = utils.parse_sse_data(line)
+                  if data and data.choices and data.choices[1] then
+                    local delta = data.choices[1].delta
+
+                    -- 检查是否有工具调用
+                    if delta.tool_calls then
+                      has_tool_calls = true
+                      for _, tool_call in ipairs(delta.tool_calls) do
+                        local idx = tool_call.index or 0
+                        -- 合并流式片段：按 index 合并
+                        if not tool_calls[idx + 1] then
+                          tool_calls[idx + 1] = tool_call
+                        else
+                          local existing = tool_calls[idx + 1]
+                          -- 合并 id、type、name 等新字段
+                          if tool_call.id then
+                            existing.id = tool_call.id
+                          end
+                          if tool_call.type then
+                            existing.type = tool_call.type
+                          end
+                          if tool_call["function"] then
+                            existing["function"] = existing["function"] or {}
+                            if tool_call["function"].name then
+                              existing["function"].name = tool_call["function"].name
+                            end
+                            if tool_call["function"].arguments then
+                              existing["function"].arguments = (existing["function"].arguments or "")
+                                .. tool_call["function"].arguments
+                            end
+                          end
+                        end
+                      end
+                    end
+
+                    -- 收集内容
+                    if delta.content and delta.content ~= vim.NIL then
+                      local content_str = type(delta.content) == "string" and delta.content or tostring(delta.content)
+                      accumulated_content = accumulated_content .. content_str
+                      -- 实时更新消息内容，使 UI 能显示流式内容
+                      pending_msg.content = accumulated_content
+                      -- 同时更新会话中的消息内容
+                      for i, msg in ipairs(session.messages) do
+                        if msg.id == pending_msg.id then
+                          msg.content = accumulated_content
+                          break
+                        end
+                      end
+                      -- 控制流式更新频率
+                      local current_time = vim.loop.now()
+                      if current_time - last_update_time >= stream_update_interval then
+                        last_update_time = current_time
+                        if on_chunk then
+                          on_chunk(accumulated_content)
+                        end
+                      end
+                    end
+
+                    -- 提取推理内容
+                    local reasoning = utils.extract_reasoning_from_delta(delta)
+                    if reasoning then
+                      accumulated_reasoning = accumulated_reasoning .. reasoning
+                      pending_msg.metadata.reasoning_content = accumulated_reasoning
+                      pending_msg.metadata.has_reasoning = true
+                      pending_msg.metadata.reasoning_finished = false
+                    end
+                  end
+                end
+              end
+            end
+
+            -- 清理临时文件
+            vim.fn.delete(tmp_file)
+            vim.fn.delete(body_file)
+          end
+        end
+
+        -- 更新消息
+        for i, msg in ipairs(session.messages) do
+          if msg.id == pending_msg.id then
+            if has_tool_calls and #tool_calls > 0 then
+              -- 有工具调用，处理工具调用
+              msg.content = "🔧 正在执行工具..."
+              msg.pending = false
+              msg.timestamp = os.time()
+
+              -- 处理工具调用
+              handle_tool_calls(session_id, tool_calls, on_complete)
+            else
+              -- 没有工具调用，正常完成
+              local final_content = accumulated_content ~= "" and accumulated_content
+                or "抱歉，未能生成回复。"
+              msg.content = final_content
+              msg.pending = false
+              msg.timestamp = os.time()
+
+              -- 存储推理内容
+              if accumulated_reasoning ~= "" then
+                msg.metadata.reasoning_content = accumulated_reasoning
+                msg.metadata.has_reasoning = true
+              end
+
+              session.updated_at = os.time()
+              M._auto_sync(session_id)
+
+              -- 触发最后一次更新
+              if on_chunk then
+                on_chunk(accumulated_content)
+              end
+
+              if on_complete then
+                -- 修复：当有工具调用时，即使accumulated_content为空也应视为成功
+                local success = exit_code == 0 and (accumulated_content ~= "" or has_tool_calls)
+                local error_msg = success and nil or ("请求失败，退出码: " .. exit_code)
+                on_complete(success, error_msg, accumulated_content)
+              end
+
+              M._trigger("ai_replied", {
+                session_id = session_id,
+                message = pending_msg,
+                content = accumulated_content,
+                reasoning_content = accumulated_reasoning,
+              })
+            end
+            break
+          end
+        end
+      end)
+    end,
+  })
+
+  if job_id <= 0 then
+    local error_msg = "无法启动 API 请求"
+    vim.notify("[NeoAI] " .. error_msg, vim.log.levels.ERROR)
+
+    for i, msg in ipairs(session.messages) do
+      if msg.id == pending_msg.id then
+        msg.content = "❌ " .. error_msg
+        msg.pending = false
+        msg.timestamp = os.time()
+        break
+      end
+    end
+
+    if on_complete then
+      on_complete(false, error_msg)
+    end
+    return
+  end
+
+  -- 启动文件监听器
+  local function watch_stream()
+    if request_finished then
+      return
+    end
+
+    if vim.fn.filereadable(tmp_file) == 1 then
+      local file_size = vim.fn.getfsize(tmp_file)
+      if file_size <= last_processed_pos then
+        vim.defer_fn(watch_stream, 50)
+        return
+      end
+
+      local handle = io.open(tmp_file, "r")
+      if not handle then
+        vim.defer_fn(watch_stream, 50)
+        return
+      end
+
+      handle:seek("set", last_processed_pos)
+      local new_content = handle:read("*a")
+      handle:close()
+
+      if not new_content or new_content == "" then
+        vim.defer_fn(watch_stream, 50)
+        return
+      end
+
+      last_processed_pos = last_processed_pos + #new_content
+
+      -- 解析 SSE 事件
+      for line in new_content:gmatch("[^\r\n]+") do
+        if line:match("^data:") then
+          local data = utils.parse_sse_data(line)
+          if data and data.choices and data.choices[1] then
+            local delta = data.choices[1].delta
+
+            -- 检查工具调用
+            if delta.tool_calls then
+              has_tool_calls = true
+              for _, tool_call in ipairs(delta.tool_calls) do
+                local idx = tool_call.index or 0
+                -- 合并流式片段：按 index 合并
+                if not tool_calls[idx + 1] then
+                  tool_calls[idx + 1] = tool_call
+                else
+                  local existing = tool_calls[idx + 1]
+                  if tool_call.id then
+                    existing.id = tool_call.id
+                  end
+                  if tool_call.type then
+                    existing.type = tool_call.type
+                  end
+                  if tool_call["function"] then
+                    existing["function"] = existing["function"] or {}
+                    if tool_call["function"].name then
+                      existing["function"].name = tool_call["function"].name
+                    end
+                    if tool_call["function"].arguments then
+                      existing["function"].arguments = (existing["function"].arguments or "")
+                        .. tool_call["function"].arguments
+                    end
+                  end
+                end
+              end
+            end
+
+            -- 收集内容
+            if delta.content and delta.content ~= vim.NIL then
+              local content_str = type(delta.content) == "string" and delta.content or tostring(delta.content)
+              accumulated_content = accumulated_content .. content_str
+            -- 控制流式更新频率
+            local current_time = vim.loop.now()
+            if current_time - last_update_time >= stream_update_interval then
+              last_update_time = current_time
+              if on_chunk then
+                on_chunk(accumulated_content)
+              end
+            end
+            end
+
+            -- 提取推理内容
+            local reasoning = utils.extract_reasoning_from_delta(delta)
+            if reasoning then
+              accumulated_reasoning = accumulated_reasoning .. reasoning
+              pending_msg.metadata.reasoning_content = accumulated_reasoning
+              pending_msg.metadata.has_reasoning = true
+              pending_msg.metadata.reasoning_finished = false
+              M._trigger("ai_reasoning_update", {
+                session_id = session_id,
+                message = pending_msg,
+                reasoning_content = accumulated_reasoning,
+              })
+            end
+
+            -- 当有常规内容且推理内容已存在时，标记推理已完成
+            if
+              accumulated_reasoning ~= ""
+              and accumulated_content ~= ""
+              and not pending_msg.metadata.reasoning_finished
+            then
+              pending_msg.metadata.reasoning_finished = true
+              M._trigger("ai_reasoning_finished", {
+                session_id = session_id,
+                message = pending_msg,
+              })
+            end
           end
         end
       end
     end
 
-    -- 继续监听（如果请求未完成）
-    if not request_finished then
-      vim.defer_fn(watch_stream, 50) -- 每 50ms 检查一次
-    end
+    vim.defer_fn(watch_stream, 50)
   end
 
-  -- 启动流式监听
-  vim.defer_fn(watch_stream, 100)
+  watch_stream()
 end
 
 --- 发送消息（用户消息 + 触发 AI 回复）
@@ -594,14 +1176,23 @@ function M.send_message(session_id, content)
   local user_msg = utils.create_message("user", content)
   M.add_message(session_id, user_msg)
 
+  -- 检查是否启用 function calling
+  local use_function_calling = false
+  if M.validated_config and M.validated_config.llm then
+    use_function_calling = M.validated_config.llm.enable_function_calling or false
+  end
+
+  -- 选择使用哪个请求函数
+  local request_func = use_function_calling and M.request_ai_stream_with_tools or M.request_ai_stream
+
   -- 使用流式 API 请求 AI 回复
-  M.request_ai_stream(
+  request_func(
     session_id,
     content,
     -- on_chunk: 流式更新回调（可选，用于自定义处理）
     function(accumulated_content)
       -- 触发流式更新事件
-      M._trigger("stream_update", {
+      M._trigger("ai_stream_update", {
         session_id = session_id,
         content = accumulated_content,
       })
@@ -1034,8 +1625,10 @@ end
 -- @param validated_config 已验证的配置表（由 init.lua 传入）
 function M.setup(validated_config)
   validated_config = validated_config or {}
-  M.config_dir = validated_config.background and validated_config.background.config_dir or config.defaults.background.config_dir
-  M.config_file = validated_config.background and validated_config.background.config_file or (M.config_dir .. "/sessions.json")
+  M.config_dir = validated_config.background and validated_config.background.config_dir
+    or config.defaults.background.config_dir
+  M.config_file = validated_config.background and validated_config.background.config_file
+    or (M.config_dir .. "/sessions.json")
 
   -- 存储完整的验证后配置
   M.validated_config = validated_config

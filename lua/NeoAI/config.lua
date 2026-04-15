@@ -96,6 +96,7 @@ M.defaults = {
     top_p = 1.0,
     stream_update_interval = 100,
     timeout = 120,
+    enable_function_calling = true, -- 启用 function calling
   },
 }
 
