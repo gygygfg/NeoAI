@@ -33,7 +33,7 @@ M.defaults = {
     -- "none"      - 无边框 (默认推荐)
     info_border = "none",
 
-    -- 输入框分割线样式（用于输入框上方的横线），可选值:
+    -- 输入框分隔线样式（用于输入框上方的横线），可选值:
     -- "single"    - 单线 ─ (默认推荐)
     -- "double"    - 双线 ═
     -- "solid"     - 粗线 ━
@@ -41,7 +41,7 @@ M.defaults = {
     -- "dashed"    - 虚线 ┄
     input_separator = "single",
 
-    -- 消息分割线样式（用于消息块内角色标题和内容的分割），可选值:
+    -- 消息分隔线样式（用于消息块内角色标题和内容的分割），可选值:
     -- "single"    - 单线 ─
     -- "double"    - 双线 ═
     -- "solid"     - 粗线 ━
@@ -66,42 +66,85 @@ M.defaults = {
   },
 
   keymaps = {
-    -- 快捷键配置 (Keymaps)
-    -- 打开聊天窗口，默认 <leader>nc (按 leader 键后按 n, c)
-    open = "<leader>nc",
+    -- 聊天界面快捷键配置
+    chat = {
+      -- 全局快捷键（在任何模式下都可用）
+      global = {
+        -- 打开聊天窗口，默认 <leader>nc (按 leader 键后按 n, c)
+        open = { key = "<leader>nc", desc = "打开聊天" },
 
-    -- 关闭聊天窗口，默认 q
-    close = "q",
+        -- 新建对话，默认 <leader>nn (按 leader 键后按 n, n)
+        new = { key = "<leader>nn", desc = "新建会话" },
+      },
 
-    -- 发送消息，默认 <leader>cs (按 leader 键后按 c, s)
-    send = "<C-s>",
+      -- 普通模式快捷键（聊天窗口内）
+      normal = {
+        -- 编辑消息，默认 e
+        edit_message = { key = "e", desc = "编辑消息" },
 
-    -- 新建对话，默认 <leader>cn (按 leader 键后按 n, n)
-    new = "<leader>nn",
+        -- 切换推理内容显示，默认 r
+        -- 思考中：打开/关闭浮动窗口
+        -- 思考完成后：展开/折叠文本
+        toggle_reasoning = { key = "r", desc = "切换推理内容显示" },
 
-    -- 在输入行按回车发送消息（正常模式下）
-    normal_mode_send = "<CR>",
+        -- 导出当前会话，默认 s
+        export_session = { key = "s", desc = "导出会话" },
 
-    -- 在输入行按 Ctrl+s 发送消息（插入模式下）
-    insert_mode_send = "<C-s>",
-  },
+        -- 关闭聊天窗口，默认 q
+        close = { key = "q", desc = "关闭聊天" },
 
-  tree_keymaps = {
+        -- 关闭聊天窗口，默认 <Esc>
+        close_esc = { key = "<Esc>", desc = "关闭聊天" },
+
+        -- 在输入行按回车发送消息（正常模式下）
+        normal_mode_send = { key = "<CR>", desc = "发送消息或编辑" },
+      },
+
+      -- 插入模式快捷键（聊天窗口内）
+      insert = {
+        -- 发送消息，默认 <C-s>
+        send = { key = "<C-s>", desc = "发送消息" },
+
+        -- 关闭聊天窗口，默认 <C-c>
+        close = { key = "<C-c>", desc = "关闭聊天" },
+
+        -- 正常换行（不发送消息），默认 <CR>
+        newline = { key = "<CR>", desc = "换行" },
+      },
+    },
+
     -- 树视图快捷键配置
-    -- 在当前光标位置新建对话分支（复制从根到当前轮次的路径）
-    new_branch = "n",
+    tree = {
+      -- 普通模式快捷键（树视图窗口内）
+      normal = {
+        -- 选择会话或创建新会话，默认 <CR>
+        select_or_create = { key = "<CR>", desc = "选择会话" },
 
-    -- 新建空对话
-    new_conversation = "N",
+        -- 在当前光标位置新建对话分支，默认 n
+        new_branch = { key = "n", desc = "新建分支" },
 
-    -- 删除当前光标所在的这一轮对话
-    delete_turn = "d",
+        -- 新建空对话，默认 N
+        new_conversation = { key = "N", desc = "新建空对话" },
 
-    -- 删除当前整个分支（从根到叶子）
-    delete_branch = "D",
+        -- 删除当前光标这一轮对话，默认 d
+        delete_turn = { key = "d", desc = "删除当前轮次" },
 
-    -- 打开配置文件
-    open_config = "e",
+        -- 删除当前整个分支，默认 D
+        delete_branch = { key = "D", desc = "删除当前分支" },
+
+        -- 关闭树视图，默认 q
+        close = { key = "q", desc = "关闭" },
+
+        -- 关闭树视图，默认 <Esc>
+        close_esc = { key = "<Esc>", desc = "关闭" },
+
+        -- 刷新树视图，默认 r
+        refresh = { key = "r", desc = "刷新树" },
+
+        -- 打开配置文件，默认 e
+        open_config = { key = "e", desc = "打开配置文件" },
+      },
+    },
   },
 
   role_icons = {
@@ -215,6 +258,103 @@ M.defaults = {
 -- @return string 配置文件路径
 function M.get_config_file(cfg)
   return cfg.config_file or (cfg.config_dir .. "/sessions.json")
+end
+
+--- 确保配置向后兼容
+-- 将旧的配置结构转换为新的结构
+-- @param config 用户配置
+-- @return table 转换后的配置
+function M.ensure_backward_compatibility(config)
+  if not config then
+    return {}
+  end
+
+  -- 如果用户提供了旧的 keymaps 结构，转换为新的结构
+  if config.keymaps and type(config.keymaps) == "table" then
+    -- 检查是否是旧的结构（没有 chat 和 tree 子表）
+    if config.keymaps.open and not config.keymaps.chat then
+      -- 创建新的结构
+      local new_keymaps = {
+        chat = {
+          global = {},
+          normal = {},
+          insert = {},
+        },
+        tree = {
+          normal = {},
+        },
+      }
+
+      -- 转换全局快捷键
+      if config.keymaps.open then
+        new_keymaps.chat.global.open = { key = config.keymaps.open, desc = "打开聊天" }
+      end
+      if config.keymaps.new then
+        new_keymaps.chat.global.new = { key = config.keymaps.new, desc = "新建会话" }
+      end
+
+      -- 转换普通模式快捷键
+      if config.keymaps.close then
+        new_keymaps.chat.normal.close = { key = config.keymaps.close, desc = "关闭聊天" }
+        new_keymaps.chat.normal.close_esc = { key = "<Esc>", desc = "关闭聊天" }
+      end
+      if config.keymaps.normal_mode_send then
+        new_keymaps.chat.normal.normal_mode_send =
+          { key = config.keymaps.normal_mode_send, desc = "发送消息或编辑" }
+      end
+
+      -- 转换插入模式快捷键
+      if config.keymaps.insert_mode_send then
+        new_keymaps.chat.insert.send = { key = config.keymaps.insert_mode_send, desc = "发送消息" }
+      end
+      new_keymaps.chat.insert.newline = { key = "<CR>", desc = "换行" }
+      new_keymaps.chat.insert.close = { key = "<C-c>", desc = "关闭聊天" }
+
+      -- 设置默认的聊天界面快捷键
+      new_keymaps.chat.normal.edit_message = { key = "e", desc = "编辑消息" }
+      new_keymaps.chat.normal.toggle_reasoning = { key = "r", desc = "切换推理内容显示" }
+      new_keymaps.chat.normal.export_session = { key = "s", desc = "导出会话" }
+
+      -- 替换旧的 keymaps
+      config.keymaps = new_keymaps
+    end
+
+    -- 如果用户提供了旧的 tree_keymaps 结构，转换为新的结构
+    if config.tree_keymaps and not config.keymaps.tree then
+      config.keymaps.tree = {
+        normal = {},
+      }
+
+      if config.tree_keymaps.new_branch then
+        config.keymaps.tree.normal.new_branch = { key = config.tree_keymaps.new_branch, desc = "新建分支" }
+      end
+      if config.tree_keymaps.new_conversation then
+        config.keymaps.tree.normal.new_conversation =
+          { key = config.tree_keymaps.new_conversation, desc = "新建空对话" }
+      end
+      if config.tree_keymaps.delete_turn then
+        config.keymaps.tree.normal.delete_turn = { key = config.tree_keymaps.delete_turn, desc = "删除当前轮次" }
+      end
+      if config.tree_keymaps.delete_branch then
+        config.keymaps.tree.normal.delete_branch =
+          { key = config.tree_keymaps.delete_branch, desc = "删除当前分支" }
+      end
+      if config.tree_keymaps.open_config then
+        config.keymaps.tree.normal.open_config = { key = config.tree_keymaps.open_config, desc = "打开配置文件" }
+      end
+
+      -- 设置默认的树视图快捷键
+      config.keymaps.tree.normal.select_or_create = { key = "<CR>", desc = "选择会话" }
+      config.keymaps.tree.normal.close = { key = "q", desc = "关闭" }
+      config.keymaps.tree.normal.close_esc = { key = "<Esc>", desc = "关闭" }
+      config.keymaps.tree.normal.refresh = { key = "r", desc = "刷新树" }
+
+      -- 删除旧的 tree_keymaps
+      config.tree_keymaps = nil
+    end
+  end
+
+  return config
 end
 
 return M

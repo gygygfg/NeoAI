@@ -337,14 +337,6 @@ function M.is_reasoning_folded(message_id)
   return M._reasoning_fold_state[message_id]
 end
 
---- 关闭指定消息的推理浮动窗口（兼容旧接口）
--- @param message_id 消息ID
-function M.close_reasoning_float(message_id)
-  utils.destroy_reasoning_float(reasoning_engine.states, message_id)
-  M._reasoning_float_wins[message_id] = nil
-  M._reasoning_float_buffers[message_id] = nil
-end
-
 --- 为推理内容创建浮动窗口（兼容旧接口，内部使用引擎）
 -- @param message_id 消息ID
 -- @param reasoning_text 推理内容
@@ -456,19 +448,6 @@ M.WINDOW_LIMITS = {
   tree = { min_width = 40, max_width_ratio = 0.35 },
 }
 
--- 分隔线字符映射表
-local SEPARATOR_CHARS = { single = "─", double = "═", solid = "━", dotted = "┈", dashed = "┄" }
-
--- ── 工具函数集 ───────────────────────────────────────────────────────────────
-
--- ── 防抖定时器管理 ───────────────────────────────────────────────────────────
-
---- 获取输入框分隔线字符
--- @return string 分隔线字符
-function M.get_separator_char()
-  return SEPARATOR_CHARS[M.config.ui.input_separator] or "─"
-end
-
 -- ── 窗口管理函数 ─────────────────────────────────────────────────────────────
 
 --- 清理无效的窗口和缓冲区
@@ -476,7 +455,9 @@ end
 function M.cleanup_windows()
   -- 先关闭所有推理浮动窗口
   for msg_id, _ in pairs(M._reasoning_float_wins) do
-    M.close_reasoning_float(msg_id)
+    utils.destroy_reasoning_float(reasoning_engine.states, msg_id)
+    M._reasoning_float_wins[msg_id] = nil
+    M._reasoning_float_buffers[msg_id] = nil
   end
 
   return utils.cleanup_windows(
@@ -506,64 +487,33 @@ end
 --- 防抖后的更新显示函数集合（50ms 延迟）
 -- 为不同事件类型创建独立的防抖函数，避免共享定时器导致意外延迟
 -- 每个事件类型使用唯一前缀，确保定时器不会互相干扰
-M.update_display_debounced = {}
-
--- 通用防抖更新（向后兼容）
-M.update_display_debounced.default = utils.debounce(function()
-  M.update_display()
-end, 50, "update_display_default", M._debounce_timers)
-
--- 各事件类型独立的防抖更新函数
-M.update_display_debounced.message = utils.debounce(function()
-  M.update_display()
-end, 50, "update_display_message", M._debounce_timers)
-
-M.update_display_debounced.delete = utils.debounce(function()
-  M.update_display()
-end, 50, "update_display_delete", M._debounce_timers)
-
-M.update_display_debounced.reply = utils.debounce(function()
-  M.update_display()
-end, 50, "update_display_reply", M._debounce_timers)
-
-M.update_display_debounced.response = utils.debounce(function()
-  M.update_display()
-end, 50, "update_display_response", M._debounce_timers)
-
-M.update_display_debounced.session = utils.debounce(function()
-  M.update_display()
-end, 50, "update_display_session", M._debounce_timers)
-
-M.update_display_debounced.turn = utils.debounce(function()
-  M.update_display()
-end, 50, "update_display_turn", M._debounce_timers)
-
---- 调整窗口大小（根据内容自动计算）
--- @param content_width 内容宽度
--- @param content_height 内容高度
-function M.adjust_window_size(content_width, content_height)
-  utils.adjust_window_size(M.windows, M.current_mode, content_width, content_height, M.WINDOW_LIMITS)
-end
-
---- 调整树窗口大小（动态宽度，最大值为屏幕一半）
-function M.adjust_tree_window_size()
-  utils.adjust_tree_window_size(M.windows, M.tree_buffers, M.WINDOW_LIMITS)
-end
-
---- 设置窗口换行选项（使用 utils 模块）
-local function set_window_wrap_inline(windows)
-  utils.set_window_wrap(windows)
-end
+M.update_display_debounced = {
+  -- 通用防抖更新（向后兼容）
+  default = utils.debounce(function()
+    M.update_display()
+  end, 50, "update_display_default", M._debounce_timers),
+  -- 各事件类型独立的防抖更新函数
+  message = utils.debounce(function()
+    M.update_display()
+  end, 50, "update_display_message", M._debounce_timers),
+  delete = utils.debounce(function()
+    M.update_display()
+  end, 50, "update_display_delete", M._debounce_timers),
+  reply = utils.debounce(function()
+    M.update_display()
+  end, 50, "update_display_reply", M._debounce_timers),
+  response = utils.debounce(function()
+    M.update_display()
+  end, 50, "update_display_response", M._debounce_timers),
+  session = utils.debounce(function()
+    M.update_display()
+  end, 50, "update_display_session", M._debounce_timers),
+  turn = utils.debounce(function()
+    M.update_display()
+  end, 50, "update_display_turn", M._debounce_timers),
+}
 
 -- ── 窗口策略函数 ─────────────────────────────────────────────────────────────
-
---- 获取窗口策略函数
--- 根据不同的窗口模式（浮动、分割、标签、树视图）返回对应的窗口配置生成函数
--- @param mode 窗口模式 (float/split/tab/tree)
--- @return function 窗口策略函数，调用后返回窗口配置表
-function M.get_window_strategy(mode)
-  return utils.get_window_strategy(mode, M.config, M.WINDOW_LIMITS)
-end
 
 --- 设置窗口
 -- 打开主聊天窗口并初始化相关组件（缓冲区、快捷键、输入处理）
@@ -864,11 +814,6 @@ function M.get_tab_label()
   return label .. "%#TabLine#%T" -- 结尾添加默认标签样式
 end
 
--- 为 vim 表达式提供全局函数（解决 E117 错误）
-_G.neoai_get_tab_label = function()
-  return M.get_tab_label()
-end
-
 -- ── 缓冲区管理 ──────────────────────────────────────────────────────────────
 
 --- 创建主缓冲区
@@ -961,7 +906,7 @@ function M.render_tree_interface()
 
   -- 延迟调整窗口大小
   vim.defer_fn(function()
-    M.adjust_tree_window_size()
+    utils.adjust_tree_window_size(M.windows, M.tree_buffers, M.WINDOW_LIMITS)
   end, 10)
 end
 
@@ -1070,12 +1015,15 @@ function M._add_tree_bottom_hints(buf, lines, ns_id)
     table.insert(hint_lines, current_line)
   end
 
-  local separator_len = utils.calculate_text_width()
+  -- 使用正确的窗口计算分隔线长度
+  local target_win = M.windows.tree or M.windows.main
+  local separator_len = utils.calculate_text_width(target_win)
 
   table.insert(lines, "")
   M._next_line_num = M._next_line_num + 1
   local separator_line = #lines
-  table.insert(lines, string.rep(M.get_separator_char(), separator_len))
+  local separator_text = utils.generate_separator(M.config.ui.input_separator, separator_len, M.config)
+  table.insert(lines, separator_text)
   M._next_line_num = M._next_line_num + 1
 
   for _, line in ipairs(hint_lines) do
@@ -1097,7 +1045,9 @@ function M._add_tree_bottom_hints(buf, lines, ns_id)
       return
     end
 
-    local text_width = utils.calculate_text_width()
+    -- 重新获取窗口句柄，因为延迟执行时窗口可能已变化
+    local current_target_win = M.windows.tree or M.windows.main
+    local text_width = utils.calculate_text_width(current_target_win)
     local line_count = vim.api.nvim_buf_line_count(buf)
     local sep_line_idx = nil
     for i = line_count, 1, -1 do
@@ -1112,7 +1062,7 @@ function M._add_tree_bottom_hints(buf, lines, ns_id)
       return
     end
 
-    local new_sep_text = string.rep(M.get_separator_char(), text_width)
+    local new_sep_text = utils.generate_separator(M.config.ui.input_separator, text_width, M.config)
 
     vim.api.nvim_set_option_value("modifiable", true, { buf = buf })
     vim.api.nvim_set_option_value("readonly", false, { buf = buf })
@@ -1182,9 +1132,9 @@ function M.render_chat_interface()
   M._last_buffer_line_count = vim.api.nvim_buf_line_count(buf)
 
   -- 调整窗口大小
-  local max_width = utils.calculate_text_width()
-  M.adjust_window_size(max_width, #lines)
-  set_window_wrap_inline(M.windows)
+  local max_width = utils.calculate_text_width(M.windows.main)
+  utils.adjust_window_size(M.windows, M.current_mode, max_width, #lines, M.WINDOW_LIMITS)
+  utils.set_window_wrap(M.windows)
 
   -- 恢复光标或滚动到底部
   if utils.is_win_valid(M.windows.main) then
@@ -1285,7 +1235,8 @@ function M._create_reasoning_float_windows()
     end
 
     -- 跳过消息内容行
-    local content_lines = utils.wrap_message_content(msg.content or "", utils.calculate_text_width() - 4)
+    local max_width = utils.calculate_text_width(M.windows.main)
+    local content_lines = utils.wrap_message_content(msg.content or "", max_width - 4)
     current_line = current_line + #content_lines
 
     -- 跳过消息间的空行
@@ -1312,7 +1263,7 @@ end
 -- @return table 行数组, table 分隔线位置
 function M._build_chat_content()
   local lines = {}
-  local max_width = utils.calculate_text_width()
+  local max_width = utils.calculate_text_width(M.windows.main)
   local separator_positions = {}
   local session = backend.current_session and backend.sessions[backend.current_session]
 
@@ -1367,7 +1318,7 @@ function M._build_chat_content()
         table.insert(lines, line)
       end
 
-      -- 记录分割线位置
+      -- 记录分隔线位置
       if i < #session.messages then
         table.insert(lines, "")
         table.insert(separator_positions, #lines - 1)
@@ -1391,7 +1342,7 @@ end
 -- @param ns_virtual_text 虚拟文本命名空间
 -- @param ns_highlight 高亮命名空间
 function M._add_chat_separators(buf, lines, separator_positions, ns_virtual_text, ns_highlight)
-  -- 记录输入提示分割线位置
+  -- 记录输入提示分隔线位置
   local separator_line_num = #lines
   table.insert(lines, "")
   table.insert(separator_positions, separator_line_num)
@@ -1405,13 +1356,11 @@ function M._add_chat_separators(buf, lines, separator_positions, ns_virtual_text
   -- 重新写入缓冲区
   vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
 
-  -- 添加虚拟文本分割线
-  local max_width = utils.calculate_text_width()
+  -- 添加虚拟文本分隔线
+  local target_win = M.windows.main
+  local max_width = utils.calculate_text_width(target_win)
   for _, sep_line in ipairs(separator_positions) do
-    vim.api.nvim_buf_set_extmark(buf, ns_virtual_text, sep_line, 0, {
-      virt_text = { { string.rep(M.get_separator_char(), max_width), "Comment" } },
-      virt_text_pos = "overlay",
-    })
+    utils.add_separator_virtual_text(buf, sep_line, max_width, M.config.ui.input_separator, M.config, ns_virtual_text)
   end
 
   -- 为输入行添加虚拟文本提示
@@ -1538,7 +1487,7 @@ function M._render_session_tree_recursive(lines, session_id, session, tree_prefi
             "%s%s %s (%d)",
             child_prefix,
             child_icon,
-            sanitize_line(child_session.name),
+            utils.sanitize_line(child_session.name),
             #child_session.messages
           )
           table.insert(lines, child_info_line)
@@ -1649,7 +1598,7 @@ function M._render_session_tree_tail(lines, session_id, session, tree_prefix, is
             "%s%s %s (%d)",
             child_prefix,
             child_icon,
-            sanitize_line(child_session.name),
+            utils.sanitize_line(child_session.name),
             #child_session.messages
           )
           table.insert(lines, child_info_line)
@@ -1683,8 +1632,9 @@ function M.setup_tree_keymaps()
     vim.keymap.set("n", lhs, rhs, { buffer = buf, desc = desc, noremap = true })
   end
 
-  -- 回车键：选择会话或创建新会话
-  map("<CR>", function()
+  -- 树视图普通模式快捷键
+  -- 选择会话或创建新会话
+  map(M.config.keymaps.tree.normal.select_or_create.key, function()
     local cursor = vim.api.nvim_win_get_cursor(M.windows.tree)
     local line = cursor[1] -- 1-indexed
     local pos = M.tree_buffers.session_positions and M.tree_buffers.session_positions[line]
@@ -1705,10 +1655,10 @@ function M.setup_tree_keymaps()
       vim.notify("[NeoAI] 新会话已创建")
       M.open_chat_after_tree_selection()
     end
-  end, "选择会话")
+  end, M.config.keymaps.tree.normal.select_or_create.desc)
 
-  -- n键：在当前光标位置新建对话分支
-  map(M.config.tree_keymaps.new_branch, function()
+  -- 在当前光标位置新建对话分支
+  map(M.config.keymaps.tree.normal.new_branch.key, function()
     local cursor = vim.api.nvim_win_get_cursor(M.windows.tree)
     local line = cursor[1] -- 1-indexed
     local pos = M.tree_buffers.session_positions and M.tree_buffers.session_positions[line]
@@ -1755,19 +1705,19 @@ function M.setup_tree_keymaps()
     else
       vim.notify("[NeoAI] 请先选择一个对话轮次", vim.log.levels.WARN)
     end
-  end, "新建分支")
+  end, M.config.keymaps.tree.normal.new_branch.desc)
 
-  -- N键：新建空对话
-  map(M.config.tree_keymaps.new_conversation, function()
+  -- 新建空对话
+  map(M.config.keymaps.tree.normal.new_conversation.key, function()
     backend.new_empty_conversation()
     vim.schedule(function()
       M.render_session_tree()
     end)
     M.open_chat_after_tree_selection() -- 跳到对话界面
-  end, "新建空对话")
+  end, M.config.keymaps.tree.normal.new_conversation.desc)
 
-  -- d键：删除当前光标这一轮对话
-  map(M.config.tree_keymaps.delete_turn, function()
+  -- 删除当前光标这一轮对话
+  map(M.config.keymaps.tree.normal.delete_turn.key, function()
     local cursor = vim.api.nvim_win_get_cursor(M.windows.tree)
     local line = cursor[1] -- 1-indexed
     local pos = M.tree_buffers.session_positions and M.tree_buffers.session_positions[line]
@@ -1800,10 +1750,10 @@ function M.setup_tree_keymaps()
     else
       vim.notify("[NeoAI] 请将光标放在要删除的对话轮次或会话上", vim.log.levels.WARN)
     end
-  end, "删除当前轮次")
+  end, M.config.keymaps.tree.normal.delete_turn.desc)
 
-  -- D键：删除当前分支
-  map(M.config.tree_keymaps.delete_branch, function()
+  -- 删除当前分支
+  map(M.config.keymaps.tree.normal.delete_branch.key, function()
     local cursor = vim.api.nvim_win_get_cursor(M.windows.tree)
     local line = cursor[1] -- 1-indexed
     local pos = M.tree_buffers.session_positions and M.tree_buffers.session_positions[line]
@@ -1854,27 +1804,27 @@ function M.setup_tree_keymaps()
     else
       vim.notify("[NeoAI] 请将光标放在要删除的会话或对话轮次上", vim.log.levels.WARN)
     end
-  end, "删除当前分支")
+  end, M.config.keymaps.tree.normal.delete_branch.desc)
 
-  -- 关闭快捷键
-  map("q", M.close, "关闭")
-  map("<Esc>", M.close, "关闭")
+  -- 关闭树视图
+  map(M.config.keymaps.tree.normal.close.key, M.close, M.config.keymaps.tree.normal.close.desc)
+  map(M.config.keymaps.tree.normal.close_esc.key, M.close, M.config.keymaps.tree.normal.close_esc.desc)
 
-  -- r键：刷新树
-  map("r", function()
+  -- 刷新树视图
+  map(M.config.keymaps.tree.normal.refresh.key, function()
     M.render_session_tree()
     vim.notify("[NeoAI] 已刷新")
-  end, "刷新树")
+  end, M.config.keymaps.tree.normal.refresh.desc)
 
-  -- e键：打开配置文件
-  map(M.config.tree_keymaps.open_config, function()
+  -- 打开配置文件
+  map(M.config.keymaps.tree.normal.open_config.key, function()
     if M.config and M.config.background and M.config.background.config_dir then
       local config_file = require("NeoAI.config").get_config_file(M.config.background)
       vim.cmd("edit " .. vim.fn.fnameescape(config_file))
     else
       vim.notify("[NeoAI] 无法找到配置文件路径", vim.log.levels.WARN)
     end
-  end, "打开配置文件")
+  end, M.config.keymaps.tree.normal.open_config.desc)
 end
 
 --- 更新主显示
@@ -1933,7 +1883,7 @@ function M._setup_editability(_, session)
 
     current_line = current_line + #content_lines
 
-    -- 跳过消息间的空行（分割线占位符，不可编辑）
+    -- 跳过消息间的空行（分隔线占位符，不可编辑）
     if i < #session.messages then
       current_line = current_line + 1
     end
@@ -1962,19 +1912,10 @@ local function switch_to_chat_interface(target_win, is_split)
   end
 
   -- 通用设置
-  set_window_wrap_inline(M.windows)
+  utils.set_window_wrap(M.windows)
   M.setup_buffers()
 
   return true
-end
-
---- 清理树视图资源
-local function cleanup_tree_resources()
-  M.windows.tree = nil
-  if utils.is_buf_valid(M.tree_buffers.main) then
-    vim.api.nvim_buf_delete(M.tree_buffers.main, { force = true })
-    M.tree_buffers.main = nil
-  end
 end
 
 --- 定位光标到输入行
@@ -2002,7 +1943,7 @@ function M.open_chat_after_tree_selection()
       vim.api.nvim_set_current_win(M.windows.main)
     else
       -- 窗口不存在，重新创建
-      local opts = M.get_window_strategy(M.ui_modes.FLOAT)()
+      local opts = utils.get_window_strategy(M.ui_modes.FLOAT, M.config, M.WINDOW_LIMITS)()
       M.setup_windows(opts)
       success = true
     end
@@ -2026,7 +1967,11 @@ function M.open_chat_after_tree_selection()
 
   -- 清理树资源
   if success then
-    cleanup_tree_resources()
+    M.windows.tree = nil
+    if utils.is_buf_valid(M.tree_buffers.main) then
+      vim.api.nvim_buf_delete(M.tree_buffers.main, { force = true })
+      M.tree_buffers.main = nil
+    end
     focus_input_line()
   end
 end
@@ -2061,9 +2006,9 @@ function M.open_float()
 
     -- 动态宽度 = 内容宽度 + 边距，但不超过屏幕一半
     local tree_w = math.min(max_content_width + 10, max_width)
-    tree_w = clamp(tree_w, M.WINDOW_LIMITS.tree.min_width, max_width)
+    tree_w = utils.clamp(tree_w, M.WINDOW_LIMITS.tree.min_width, max_width)
 
-    local float_opts = M.get_window_strategy(M.ui_modes.FLOAT)()
+    local float_opts = utils.get_window_strategy(M.ui_modes.FLOAT, M.config, M.WINDOW_LIMITS)()
     float_opts.width = tree_w
     float_opts.col = math.floor((vim.o.columns - tree_w) / 2)
 
@@ -2090,7 +2035,7 @@ function M.open_float()
   end
 
   M.create_buffers()
-  local opts = M.get_window_strategy(M.ui_modes.FLOAT)()
+  local opts = utils.get_window_strategy(M.ui_modes.FLOAT, M.config, M.WINDOW_LIMITS)()
   M.setup_windows(opts)
   M.current_mode = M.ui_modes.FLOAT
 end
@@ -2136,12 +2081,12 @@ function M.open_split()
   vim.cmd("belowright vsplit")
   M.windows.main = vim.api.nvim_get_current_win()
   vim.api.nvim_win_set_buf(M.windows.main, M.buffers.main)
-  local opts = M.get_window_strategy(M.ui_modes.SPLIT)()
+  local opts = utils.get_window_strategy(M.ui_modes.FLOAT, M.config, M.WINDOW_LIMITS)()
   vim.api.nvim_win_set_width(M.windows.main, opts.width)
   -- 禁用行号
   vim.api.nvim_set_option_value("number", false, { win = M.windows.main })
   vim.api.nvim_set_option_value("relativenumber", false, { win = M.windows.main })
-  set_window_wrap_inline(M.windows)
+  utils.set_window_wrap(M.windows)
   M.setup_buffers()
   M.is_open = true
   M.current_mode = M.ui_modes.SPLIT
@@ -2212,7 +2157,7 @@ function M.open_tab()
   vim.cmd("tabnew")
   M.windows.main = vim.api.nvim_get_current_win()
   vim.api.nvim_win_set_buf(M.windows.main, M.buffers.main)
-  set_window_wrap_inline(M.windows)
+  utils.set_window_wrap(M.windows)
   M.setup_buffers()
   M.is_open = true
   M.current_mode = M.ui_modes.TAB
@@ -2548,8 +2493,9 @@ function M.setup_keymaps()
     vim.keymap.set(mode, lhs, rhs, { buffer = buf, desc = desc, noremap = true })
   end
 
-  -- 普通模式：e 键进入编辑模式
-  map("n", "e", function()
+  -- 聊天界面普通模式快捷键
+  -- 编辑消息
+  map("n", M.config.keymaps.chat.normal.edit_message.key, function()
     if utils.is_win_valid(M.windows.main) then
       local cur_line = vim.api.nvim_win_get_cursor(M.windows.main)[1] - 1
       -- 检查是否在可编辑行（通过 _line_to_message 映射表判断）
@@ -2559,12 +2505,12 @@ function M.setup_keymaps()
         vim.notify("[NeoAI] 此行不可编辑")
       end
     end
-  end, "编辑消息")
+  end, M.config.keymaps.chat.normal.edit_message.desc)
 
-  -- 普通模式：r 键切换推理内容显示
+  -- 切换推理内容显示
   -- 思考中：打开/关闭浮动窗口
   -- 思考完成后：展开/折叠文本
-  map("n", "r", function()
+  map("n", M.config.keymaps.chat.normal.toggle_reasoning.key, function()
     if utils.is_win_valid(M.windows.main) then
       local cur_line = vim.api.nvim_win_get_cursor(M.windows.main)[1] - 1
       -- 检查当前行是否属于某个有推理内容的消息
@@ -2592,7 +2538,9 @@ function M.setup_keymaps()
               else
                 -- 思考中：切换浮动窗口
                 if M._reasoning_float_wins[msg.id] then
-                  M.close_reasoning_float(msg.id)
+                  utils.destroy_reasoning_float(reasoning_engine.states, msg.id)
+                  M._reasoning_float_wins[msg.id] = nil
+                  M._reasoning_float_buffers[msg.id] = nil
                 else
                   M.create_reasoning_float_window(msg.id, msg.metadata.reasoning_content, M.windows.main, current_line)
                 end
@@ -2605,7 +2553,8 @@ function M.setup_keymaps()
             current_line = current_line + 1
           else
             -- 跳过内容和分隔行
-            local content_lines = utils.wrap_message_content(msg.content or "", utils.calculate_text_width() - 4)
+            local max_width = utils.calculate_text_width(M.windows.main)
+            local content_lines = utils.wrap_message_content(msg.content or "", max_width - 4)
             current_line = current_line + #content_lines
           end
           -- 消息间的空行
@@ -2614,25 +2563,26 @@ function M.setup_keymaps()
         vim.notify("[NeoAI] 将光标移到推理内容标题行上以切换显示")
       end
     end
-  end, "切换推理内容显示")
+  end, M.config.keymaps.chat.normal.toggle_reasoning.desc)
 
-  -- 普通模式：s 键导出当前会话
-  map("n", "s", function()
+  -- 导出当前会话
+  map("n", M.config.keymaps.chat.normal.export_session.key, function()
     if backend.current_session then
       backend.export_session(backend.current_session)
       vim.notify("[NeoAI] 会话已导出")
     end
-  end, "导出会话")
+  end, M.config.keymaps.chat.normal.export_session.desc)
 
-  -- 配置的快捷键（从用户配置中读取）
-  map("n", M.config.keymaps.open, "<cmd>NeoAIOpen<CR>", "打开聊天")
-  map("n", M.config.keymaps.close, M.close, "关闭聊天")
-  map("n", M.config.keymaps.new, "<cmd>NeoAINew<CR>", "新建会话")
-  map("n", "q", M.close, "关闭聊天")
-  map("n", "<Esc>", M.close, "关闭聊天")
+  -- 全局快捷键（从用户配置中读取）
+  map("n", M.config.keymaps.chat.global.open.key, "<cmd>NeoAIOpen<CR>", M.config.keymaps.chat.global.open.desc)
+  map("n", M.config.keymaps.chat.global.new.key, "<cmd>NeoAINew<CR>", M.config.keymaps.chat.global.new.desc)
+
+  -- 关闭聊天窗口
+  map("n", M.config.keymaps.chat.normal.close.key, M.close, M.config.keymaps.chat.normal.close.desc)
+  map("n", M.config.keymaps.chat.normal.close_esc.key, M.close, M.config.keymaps.chat.normal.close_esc.desc)
 
   -- 正常模式下回车：智能判断是发送消息还是进入编辑模式
-  map("n", M.config.keymaps.normal_mode_send, function()
+  map("n", M.config.keymaps.chat.normal.normal_mode_send.key, function()
     if utils.is_win_valid(M.windows.main) then
       local cur_line = vim.api.nvim_win_get_cursor(M.windows.main)[1] - 1
       local input_end = M.input_end_line or M.input_start_line
@@ -2645,16 +2595,19 @@ function M.setup_keymaps()
         vim.cmd("startinsert")
       end
     end
-  end, "发送消息或编辑")
+  end, M.config.keymaps.chat.normal.normal_mode_send.desc)
 
-  -- 插入模式下：Ctrl+s 发送消息
-  map("i", M.config.keymaps.insert_mode_send, M.save_and_send, "发送消息")
-  map("i", "<C-c>", M.close, "关闭聊天")
+  -- 插入模式快捷键
+  -- 发送消息
+  map("i", M.config.keymaps.chat.insert.send.key, M.save_and_send, M.config.keymaps.chat.insert.send.desc)
 
-  -- 插入模式下回车：正常换行（不发送消息）
-  map("i", "<CR>", function()
+  -- 关闭聊天窗口
+  map("i", M.config.keymaps.chat.insert.close.key, M.close, M.config.keymaps.chat.insert.close.desc)
+
+  -- 正常换行（不发送消息）
+  map("i", M.config.keymaps.chat.insert.newline.key, function()
     vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<CR>", true, false, true), "n", false)
-  end, "换行")
+  end, M.config.keymaps.chat.insert.newline.desc)
 end
 
 -- ── 窗口控制 ──────────────────────────────────────────────────────────────
@@ -2669,7 +2622,9 @@ function M.close()
 
   -- 关闭所有推理浮动窗口
   for msg_id, _ in pairs(M._reasoning_float_wins) do
-    M.close_reasoning_float(msg_id)
+    utils.destroy_reasoning_float(reasoning_engine.states, msg_id)
+    M._reasoning_float_wins[msg_id] = nil
+    M._reasoning_float_buffers[msg_id] = nil
   end
 
   -- 关闭所有窗口（主窗口、树视图窗口等）
@@ -2761,9 +2716,9 @@ function M.switch_mode(mode)
   vim.notify("切换到 " .. mode .. " 模式")
 end
 
---- 切换树视图显示
+--- 切换对话历史树视图显示
 -- 显示/隐藏会话列表的树视图窗口，需要重新创建窗口才能生效
-function M.toggle_tree_view()
+function M.toggle_history_tree()
   M._showing_tree = not M._showing_tree -- 切换状态
   if M.is_open then
     local mode = M.current_mode
@@ -2790,8 +2745,11 @@ end
 -- 合并用户配置，注册后端事件监听器，设置窗口生命周期相关的自动命令
 -- @param user_config 用户配置表
 function M.setup(user_config)
+  -- 确保配置向后兼容
+  local compatible_config = config.ensure_backward_compatibility(user_config or {})
+
   -- 合并默认配置和用户配置
-  M.config = vim.tbl_deep_extend("force", config.defaults, user_config or {})
+  M.config = vim.tbl_deep_extend("force", config.defaults, compatible_config)
 
   -- ── 后端事件监听器（使用防抖处理） ──
 

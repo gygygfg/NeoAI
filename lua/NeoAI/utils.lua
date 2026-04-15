@@ -947,4 +947,80 @@ function M.create_message(role, content, timestamp, metadata)
   }
 end
 
+-- ── 分隔线工具 ────────────────────────────────────────────────────────────
+
+--- 分隔线字符映射表
+M.SEPARATOR_CHARS = { single = "─", double = "═", solid = "━", dotted = "┈", dashed = "┄" }
+
+--- 生成分隔线字符串
+-- @param separator_type 分隔线类型（single/double/solid/dotted/dashed）
+-- @param length 分隔线长度
+-- @param config UI配置（可选，用于获取默认分隔线类型）
+-- @return string 分隔线字符串
+function M.generate_separator(separator_type, length, config)
+  local char = M.SEPARATOR_CHARS[separator_type] or "─"
+
+  -- 如果提供了配置，尝试从配置中获取分隔线类型
+  if config and config.ui and config.ui.input_separator then
+    char = M.SEPARATOR_CHARS[config.ui.input_separator] or char
+  end
+
+  return string.rep(char, length)
+end
+
+--- 为缓冲区添加分隔线虚拟文本
+-- @param buf 缓冲区句柄
+-- @param line_num 行号（0-indexed）
+-- @param max_width 最大宽度
+-- @param separator_type 分隔线类型（可选）
+-- @param config UI配置（可选）
+-- @param ns_id 命名空间ID（可选，不提供则创建新命名空间）
+-- @return number 命名空间ID
+function M.add_separator_virtual_text(buf, line_num, max_width, separator_type, config, ns_id)
+  if not M.is_buf_valid(buf) then
+    return nil
+  end
+
+  ns_id = ns_id or vim.api.nvim_create_namespace("NeoAISeparator")
+  local separator_text = M.generate_separator(separator_type, max_width, config)
+
+  vim.api.nvim_buf_set_extmark(buf, ns_id, line_num, 0, {
+    virt_text = { { separator_text, "Comment" } },
+    virt_text_pos = "overlay",
+  })
+
+  return ns_id
+end
+
+--- 为缓冲区添加分隔线实际文本
+-- @param buf 缓冲区句柄
+-- @param line_num 行号（0-indexed）
+-- @param max_width 最大宽度
+-- @param separator_type 分隔线类型（可选）
+-- @param config UI配置（可选）
+-- @return boolean 是否成功
+function M.add_separator_actual_text(buf, line_num, max_width, separator_type, config)
+  if not M.is_buf_valid(buf) then
+    return false
+  end
+
+  local separator_text = M.generate_separator(separator_type, max_width, config)
+
+  -- 确保缓冲区可修改
+  local was_modifiable = vim.api.nvim_get_option_value("modifiable", { buf = buf })
+  local was_readonly = vim.api.nvim_get_option_value("readonly", { buf = buf })
+
+  vim.api.nvim_set_option_value("modifiable", true, { buf = buf })
+  vim.api.nvim_set_option_value("readonly", false, { buf = buf })
+
+  -- 插入分隔线
+  vim.api.nvim_buf_set_lines(buf, line_num, line_num + 1, false, { separator_text })
+
+  -- 恢复原始状态
+  vim.api.nvim_set_option_value("modifiable", was_modifiable, { buf = buf })
+  vim.api.nvim_set_option_value("readonly", was_readonly, { buf = buf })
+
+  return true
+end
+
 return M

@@ -22,8 +22,12 @@ end
 -- @param user_config 用户自定义配置（可选）
 function M.setup(user_config)
   user_config = user_config or {}
+  
+  -- 确保配置向后兼容
+  local compatible_config = config.ensure_backward_compatibility(user_config)
+  
   -- 合并默认配置和用户配置
-  local final_config = vim.tbl_deep_extend("force", config.defaults, user_config)
+  local final_config = vim.tbl_deep_extend("force", config.defaults, compatible_config)
 
   -- 检查 curl 是否已安装
   M.check_curl()
@@ -59,9 +63,26 @@ end
 -- @param final_config 合并后的完整配置
 function M.setup_commands(final_config)
   -- 设置全局快捷键
-  if final_config.keymaps and final_config.keymaps.open then
+  if final_config.keymaps and final_config.keymaps.chat and final_config.keymaps.chat.global then
     -- 打开聊天窗口
-    vim.keymap.set("n", final_config.keymaps.open, "<cmd>NeoAIOpen<CR>", { noremap = true, silent = true, desc = "NeoAI: 打开聊天窗口" })
+    if final_config.keymaps.chat.global.open then
+      vim.keymap.set(
+        "n",
+        final_config.keymaps.chat.global.open.key,
+        "<cmd>NeoAIOpen<CR>",
+        { noremap = true, silent = true, desc = "NeoAI: " .. final_config.keymaps.chat.global.open.desc }
+      )
+    end
+    
+    -- 新建会话
+    if final_config.keymaps.chat.global.new then
+      vim.keymap.set(
+        "n",
+        final_config.keymaps.chat.global.new.key,
+        "<cmd>NeoAINew<CR>",
+        { noremap = true, silent = true, desc = "NeoAI: " .. final_config.keymaps.chat.global.new.desc }
+      )
+    end
   end
 
   -- NeoAIOpen: 打开聊天窗口，支持模式参数
@@ -156,7 +177,7 @@ function M.setup_commands(final_config)
 
   -- NeoAITree: 切换会话树视图
   vim.api.nvim_create_user_command("NeoAITree", function()
-    ui.toggle_tree_view()
+    ui.toggle_history_tree()
   end, {})
 
   -- NeoAIStats: 显示当前会话统计信息
