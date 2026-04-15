@@ -415,7 +415,7 @@ function M.get_tool_result_display_lines(message_id, max_width)
     local folded = M._tool_fold_state and M._tool_fold_state[message_id] or false
 
     if folded then
-      -- 折叠状态：显示折叠标题
+      -- 折叠状态：使用折叠标记包裹内容（与推理内容保持一致）
       table.insert(result, string.format("  ▶ [工具执行结果，共 %d 行] {{{", total_lines))
       -- 动态计算工具结果缩进
       local tool_indent = math.min(6, math.floor(max_width * 0.15))
@@ -624,6 +624,9 @@ function M.create_tool_float_window(message_id, tool_content, anchor_win, anchor
 
   M._tool_float_wins[message_id] = win_id
 
+  -- 调试信息
+  -- vim.notify("[NeoAI] 创建工具结果浮动窗口: msg_id=" .. tostring(message_id) .. " win_id=" .. win_id, vim.log.levels.DEBUG)
+
   return win_id
 end
 
@@ -634,7 +637,29 @@ function M.toggle_tool_fold(message_id)
     M._tool_fold_state = {}
   end
 
-  M._tool_fold_state[message_id] = not (M._tool_fold_state[message_id] or false)
+  local new_fold_state = not (M._tool_fold_state[message_id] or false)
+  M._tool_fold_state[message_id] = new_fold_state
+
+  -- 如果切换到折叠状态，关闭浮动窗口
+  if new_fold_state then
+    if M._tool_float_wins and M._tool_float_wins[message_id] then
+      local win_id = M._tool_float_wins[message_id]
+      if win_id and vim.api.nvim_win_is_valid(win_id) then
+        vim.api.nvim_win_close(win_id, true)
+      end
+      M._tool_float_wins[message_id] = nil
+
+      -- 清理缓冲区
+      if M._tool_float_buffers and M._tool_float_buffers[message_id] then
+        local buf_id = M._tool_float_buffers[message_id]
+        if buf_id and vim.api.nvim_buf_is_valid(buf_id) then
+          vim.api.nvim_buf_delete(buf_id, { force = true })
+        end
+        M._tool_float_buffers[message_id] = nil
+      end
+    end
+  end
+
   M.update_display()
 
   -- 使用 Neovim 折叠命令确保折叠状态生效
@@ -1077,7 +1102,7 @@ end
 --- 设置缓冲区属性
 -- 配置主缓冲区的各项属性，并初始化快捷键、输入处理和显示
 function M.setup_buffers()
-  vim.api.nvim_set_option_value("filetype", "text", { buf = M.buffers.main })
+  vim.api.nvim_set_option_value("filetype", "markdown", { buf = M.buffers.main })
   vim.api.nvim_set_option_value("modifiable", true, { buf = M.buffers.main }) -- 允许编辑
   vim.api.nvim_set_option_value("buftype", "nofile", { buf = M.buffers.main }) -- 非文件缓冲区
   vim.api.nvim_set_option_value("bufhidden", "hide", { buf = M.buffers.main }) -- 隐藏时保留缓冲区
@@ -2115,59 +2140,69 @@ function M.update_message_incremental(session_id, message_id, content)
   -- 我们需要找到这个消息在缓冲区中的起始行
   local line_offset = 0
   local max_width = utils.calculate_text_width(M.windows.main)
-  
+
   -- 计算前 i-1 个消息占用的行数
   for i = 1, msg_index - 1 do
     local msg = session.messages[i]
     -- 标题行
     line_offset = line_offset + 1
-    
+
     -- 推理内容行
-    if msg.metadata and msg.metadata.has_reasoning and msg.metadata.reasoning_content and M.config.llm.show_reasoning then
+    if
+      msg.metadata
+      and msg.metadata.has_reasoning
+      and msg.metadata.reasoning_content
+      and M.config.llm.show_reasoning
+    then
       local reasoning_display_lines = M.get_reasoning_display_lines(msg.id, max_width)
       line_offset = line_offset + #reasoning_display_lines
     end
-    
+
     -- 工具结果行
     if msg.metadata and msg.metadata.is_tool_result and msg.metadata.tool_result_content then
       local tool_display_lines = M.get_tool_result_display_lines(msg.id, max_width)
       line_offset = line_offset + #tool_display_lines
     end
-    
+
     -- 内容行
     local indent = math.min(4, math.floor(max_width * 0.1))
     local content_lines = utils.wrap_message_content(msg.content or "", max_width - indent)
     line_offset = line_offset + #content_lines
-    
+
     -- 分隔行（如果不是最后一个消息）
     if i < #session.messages then
       line_offset = line_offset + 1
     end
   end
-  
+
   -- 当前消息的标题行
   local title_line = line_offset
   line_offset = line_offset + 1
-  
+
   -- 跳过推理内容行（如果有）
-  if target_msg.metadata and target_msg.metadata.has_reasoning and target_msg.metadata.reasoning_content and M.config.llm.show_reasoning then
+  if
+    target_msg.metadata
+    and target_msg.metadata.has_reasoning
+    and target_msg.metadata.reasoning_content
+    and M.config.llm.show_reasoning
+  then
     local reasoning_display_lines = M.get_reasoning_display_lines(target_msg.id, max_width)
     line_offset = line_offset + #reasoning_display_lines
   end
-  
+
   -- 跳过工具结果行（如果有）
   if target_msg.metadata and target_msg.metadata.is_tool_result and target_msg.metadata.tool_result_content then
     local tool_display_lines = M.get_tool_result_display_lines(target_msg.id, max_width)
     line_offset = line_offset + #tool_display_lines
   end
-  
+
   -- 现在 line_offset 指向内容起始行
   local content_start_line = line_offset
-  
+
   -- 计算新的内容行
   local indent = math.min(4, math.floor(max_width * 0.1))
   local new_content_lines = utils.wrap_message_content(content or "", max_width - indent)
-  
+
   -- 获取当前的内容行数
   local current_line_count = vim.api.nvim_buf_line_count(buf)
   if content_start_line >= current_line_count then
@@ -2175,7 +2210,7 @@ function M.update_message_incremental(session_id, message_id, content)
     M.update_display()
     return
   end
-  
+
   -- 计算当前内容占用的行数
   local current_content_lines = 0
   for i = content_start_line, current_line_count - 1 do
@@ -2186,10 +2221,35 @@ function M.update_message_incremental(session_id, message_id, content)
     end
     current_content_lines = current_content_lines + 1
   end
-  
+
+  -- 确保缓冲区可修改
+  local was_modifiable = vim.api.nvim_get_option_value("modifiable", { buf = buf })
+  local was_readonly = vim.api.nvim_get_option_value("readonly", { buf = buf })
+
+  if not was_modifiable then
+    vim.api.nvim_set_option_value("modifiable", true, { buf = buf })
+  end
+  if was_readonly then
+    vim.api.nvim_set_option_value("readonly", false, { buf = buf })
+  end
+
   -- 替换内容行
-  vim.api.nvim_buf_set_lines(buf, content_start_line, content_start_line + current_content_lines, false, new_content_lines)
-  
+  vim.api.nvim_buf_set_lines(
+    buf,
+    content_start_line,
+    content_start_line + current_content_lines,
+    false,
+    new_content_lines
+  )
+
+  -- 恢复原来的可修改状态
+  if not was_modifiable then
+    vim.api.nvim_set_option_value("modifiable", false, { buf = buf })
+  end
+  if was_readonly then
+    vim.api.nvim_set_option_value("readonly", true, { buf = buf })
+  end
+
   -- 恢复光标位置
   if save_cursor and utils.is_win_valid(M.windows.main) then
     -- 如果光标在更新的区域内，调整光标位置
@@ -2817,10 +2877,30 @@ function M.save_and_send()
     return
   end
 
+  -- 确保缓冲区可修改
+  local buf = M.buffers.main
+  local was_modifiable = vim.api.nvim_get_option_value("modifiable", { buf = buf })
+  local was_readonly = vim.api.nvim_get_option_value("readonly", { buf = buf })
+
+  if not was_modifiable then
+    vim.api.nvim_set_option_value("modifiable", true, { buf = buf })
+  end
+  if was_readonly then
+    vim.api.nvim_set_option_value("readonly", false, { buf = buf })
+  end
+
   -- 清空输入区域（重置为单行空行）
   local input_line_count = end_line - M.input_start_line + 1
-  vim.api.nvim_buf_set_lines(M.buffers.main, M.input_start_line, M.input_start_line + input_line_count, false, { "" })
+  vim.api.nvim_buf_set_lines(buf, M.input_start_line, M.input_start_line + input_line_count, false, { "" })
   M.input_end_line = M.input_start_line -- 重置结束行
+
+  -- 恢复原来的可修改状态
+  if not was_modifiable then
+    vim.api.nvim_set_option_value("modifiable", false, { buf = buf })
+  end
+  if was_readonly then
+    vim.api.nvim_set_option_value("readonly", true, { buf = buf })
+  end
 
   -- 调用后端发送消息
   if backend.send_message(text) then
@@ -2957,6 +3037,15 @@ function M.setup_keymaps()
                 vim.api.nvim_win_close(M._tool_float_wins[msg.id], true)
                 M._tool_float_wins[msg.id] = nil
                 M._tool_fold_state[msg.id] = true -- 关闭后默认折叠
+
+                -- 清理缓冲区
+                if M._tool_float_buffers and M._tool_float_buffers[msg.id] then
+                  local buf_id = M._tool_float_buffers[msg.id]
+                  if buf_id and vim.api.nvim_buf_is_valid(buf_id) then
+                    vim.api.nvim_buf_delete(buf_id, { force = true })
+                  end
+                  M._tool_float_buffers[msg.id] = nil
+                end
               else
                 -- 无浮动窗口，切换折叠状态
                 M.toggle_tool_fold(msg.id)
@@ -3180,6 +3269,9 @@ function M.setup(validated_config)
     M._tool_float_buffers = {}
   end
 
+  -- 初始化时清理所有残留的浮动窗口
+  M.close_all_float_windows()
+
   -- ── 后端事件监听器（使用防抖处理） ──
 
   -- 消息添加事件：更新显示并定位光标到输入行
@@ -3224,16 +3316,36 @@ function M.setup(validated_config)
 
     -- 关闭所有工具结果浮动窗口
     if M._tool_float_wins then
+      local closed_count = 0
       for msg_id, win_id in pairs(M._tool_float_wins) do
-        if win_id and vim.api.nvim_win_is_valid(win_id) then
-          vim.api.nvim_win_close(win_id, true)
-        end
-        M._tool_float_wins[msg_id] = nil
-        -- 关闭后默认折叠
-        if M._tool_fold_state then
-          M._tool_fold_state[msg_id] = true
+        -- 只处理有效的窗口ID
+        if win_id and type(win_id) == "number" then
+          if vim.api.nvim_win_is_valid(win_id) then
+            vim.api.nvim_win_close(win_id, true)
+            closed_count = closed_count + 1
+          end
+          M._tool_float_wins[msg_id] = nil
+          -- 关闭后默认折叠
+          if M._tool_fold_state then
+            M._tool_fold_state[msg_id] = true
+          end
+          -- 同时清理缓冲区
+          if M._tool_float_buffers and M._tool_float_buffers[msg_id] then
+            local buf_id = M._tool_float_buffers[msg_id]
+            if buf_id and vim.api.nvim_buf_is_valid(buf_id) then
+              vim.api.nvim_buf_delete(buf_id, { force = true })
+            end
+            M._tool_float_buffers[msg_id] = nil
+          end
+        else
+          -- 无效的窗口ID，直接清理
+          M._tool_float_wins[msg_id] = nil
         end
       end
+      -- 调试信息
+      -- if closed_count > 0 then
+      --   vim.notify("[NeoAI] 已关闭 " .. closed_count .. " 个工具结果浮动窗口", vim.log.levels.DEBUG)
+      -- end
     end
 
     M.update_display_debounced.reply()
@@ -3263,7 +3375,7 @@ function M.setup(validated_config)
           break
         end
       end
-      
+
       if last_pending_msg then
         -- 使用增量更新
         M.update_message_incremental(data.session_id, last_pending_msg.id, data.content)
@@ -3408,11 +3520,14 @@ function M.setup(validated_config)
     backend.debounce_sync(data.session_id)
   end)
 
-  -- 工具结果添加事件：为工具执行结果创建悬浮窗口
+  -- 工具结果添加事件：处理工具执行结果
   backend.on("tool_result_added", function(data)
     if data.message and data.message.id and data.tool_content then
       local msg_id = data.message.id
       local tool_content = data.tool_content
+
+      -- 调试信息
+      -- vim.notify("[NeoAI] tool_result_added 事件: msg_id=" .. tostring(msg_id), vim.log.levels.DEBUG)
 
       -- 等待消息渲染到缓冲区
       M.update_display()
@@ -3431,15 +3546,30 @@ function M.setup(validated_config)
           current_line = current_line + 1
 
           if msg.id == msg_id then
-            -- 找到目标消息，创建悬浮窗口
-            M.create_tool_float_window(msg_id, tool_content, M.windows.main, current_line)
-
             -- 记录行号映射
             M._tool_line_for_msg[msg_id] = current_line
 
-            -- 默认不折叠（显示悬浮窗口）
+            -- 默认折叠（不创建悬浮窗口）
             if M._tool_fold_state then
-              M._tool_fold_state[msg_id] = false
+              M._tool_fold_state[msg_id] = true
+            end
+
+            -- 确保没有残留的浮动窗口
+            if M._tool_float_wins and M._tool_float_wins[msg_id] then
+              local win_id = M._tool_float_wins[msg_id]
+              if win_id and vim.api.nvim_win_is_valid(win_id) then
+                vim.api.nvim_win_close(win_id, true)
+              end
+              M._tool_float_wins[msg_id] = nil
+            end
+
+            -- 清理缓冲区
+            if M._tool_float_buffers and M._tool_float_buffers[msg_id] then
+              local buf_id = M._tool_float_buffers[msg_id]
+              if buf_id and vim.api.nvim_buf_is_valid(buf_id) then
+                vim.api.nvim_buf_delete(buf_id, { force = true })
+              end
+              M._tool_float_buffers[msg_id] = nil
             end
 
             -- 刷新显示以更新标题行
@@ -3578,6 +3708,60 @@ function M.setup(validated_config)
       end
     end,
   })
+end
+
+--- 关闭所有悬浮窗口（工具结果和推理）
+-- 用于手动清理残留的悬浮窗口
+function M.close_all_float_windows()
+  local closed_count = 0
+
+  -- 关闭工具结果悬浮窗口
+  if M._tool_float_wins then
+    for msg_id, win_id in pairs(M._tool_float_wins) do
+      if win_id and vim.api.nvim_win_is_valid(win_id) then
+        vim.api.nvim_win_close(win_id, true)
+        closed_count = closed_count + 1
+      end
+      M._tool_float_wins[msg_id] = nil
+      -- 关闭后默认折叠
+      if M._tool_fold_state then
+        M._tool_fold_state[msg_id] = true
+      end
+    end
+  end
+
+  -- 关闭推理悬浮窗口
+  if M._reasoning_float_wins then
+    for msg_id, win_id in pairs(M._reasoning_float_wins) do
+      if win_id and vim.api.nvim_win_is_valid(win_id) then
+        vim.api.nvim_win_close(win_id, true)
+        closed_count = closed_count + 1
+      end
+      M._reasoning_float_wins[msg_id] = nil
+    end
+  end
+
+  -- 清理缓冲区
+  if M._tool_float_buffers then
+    for msg_id, buf_id in pairs(M._tool_float_buffers) do
+      if buf_id and vim.api.nvim_buf_is_valid(buf_id) then
+        vim.api.nvim_buf_delete(buf_id, { force = true })
+      end
+      M._tool_float_buffers[msg_id] = nil
+    end
+  end
+
+  if M._reasoning_float_buffers then
+    for msg_id, buf_id in pairs(M._reasoning_float_buffers) do
+      if buf_id and vim.api.nvim_buf_is_valid(buf_id) then
+        vim.api.nvim_buf_delete(buf_id, { force = true })
+      end
+      M._reasoning_float_buffers[msg_id] = nil
+    end
+  end
+
+  vim.notify(string.format("[NeoAI] 已关闭 %d 个悬浮窗口", closed_count), vim.log.levels.INFO)
+  return closed_count
 end
 
 return M

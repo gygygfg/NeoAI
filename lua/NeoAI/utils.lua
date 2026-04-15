@@ -634,14 +634,20 @@ function M.build_api_messages(session, user_content, llm_config, config)
 
   -- 检查是否需要添加用户消息
   -- 如果最后一条消息已经是用户消息，且内容相同，则不需要重复添加
+  -- 另外，如果最后一条消息是工具结果，也不应该添加用户消息，因为工具结果已经包含了完整的上下文
   local last_msg = messages[#messages]
   local should_add_user_msg = true
 
-  if last_msg and last_msg.role == "user" and last_msg.content == user_content then
-    should_add_user_msg = false
+  if last_msg then
+    if last_msg.role == "user" and last_msg.content == user_content then
+      should_add_user_msg = false
+    end
+    -- 注意：在工具调用场景中，即使最后一条消息是工具结果，我们也需要添加用户消息
+    -- 因为AI需要基于工具结果生成回复
+    -- 移除了原来的elseif逻辑
   end
 
-  if should_add_user_msg then
+  if should_add_user_msg and user_content ~= "" then
     table.insert(messages, {
       role = "user",
       content = user_content,

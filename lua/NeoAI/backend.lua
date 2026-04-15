@@ -22,6 +22,55 @@ function M._auto_sync(session_id)
   M.export_session(session_id, M.config_file, true)
 end
 
+--[[
+--- 格式化JSON数据（添加缩进）
+-- @param data Lua表
+-- @return string 格式化后的JSON字符串
+function M._format_json(data)
+  -- 先使用vim.fn.json_encode编码
+  local json_str = vim.fn.json_encode(data)
+  
+  -- 简单的缩进添加（每遇到{或[增加缩进，每遇到}或]减少缩进）
+  local result = ""
+  local indent = 0
+  local in_string = false
+  local escape_next = false
+  
+  for i = 1, #json_str do
+    local char = json_str:sub(i, i)
+    
+    if escape_next then
+      result = result .. char
+      escape_next = false
+    elseif char == "\\" then
+      result = result .. char
+      escape_next = true
+    elseif char == '"' then
+      result = result .. char
+      in_string = not in_string
+    elseif not in_string then
+      if char == "{" or char == "[" then
+        result = result .. char .. "\n" .. string.rep("  ", indent + 1)
+        indent = indent + 1
+      elseif char == "}" or char == "]" then
+        indent = indent - 1
+        result = result .. "\n" .. string.rep("  ", indent) .. char
+      elseif char == "," then
+        result = result .. char .. "\n" .. string.rep("  ", indent)
+      elseif char == ":" then
+        result = result .. char .. " "
+      else
+        result = result .. char
+      end
+    else
+      result = result .. char
+    end
+  end
+  
+  return result
+end
+]]
+
 --- 触发指定类型的事件，通知所有注册的处理器
 -- @param event 事件名称
 -- @param data 事件数据
@@ -408,11 +457,29 @@ function M.request_ai_stream(session_id, user_content, on_chunk, on_complete)
         if on_chunk then
           on_chunk(accumulated_content)
         end
-        
+
         -- 触发完成回调
         if on_complete then
-          local success = exit_code == 0 and accumulated_content ~= ""
-          local error_msg = success and nil or ("请求失败，退出码: " .. exit_code)
+          -- 退出码为0表示请求成功，即使内容为空
+          local success = exit_code == 0
+          local error_msg
+          if success then
+            error_msg = nil
+          else
+            error_msg = "请求失败，退出码: " .. exit_code
+          end
+
+          -- 调试信息
+          vim.notify(
+            string.format(
+              "[NeoAI] 请求完成: exit_code=%d, success=%s, content_length=%d",
+              exit_code,
+              tostring(success),
+              #accumulated_content
+            ),
+            vim.log.levels.DEBUG
+          )
+
           on_complete(success, error_msg, accumulated_content)
         end
 
@@ -561,18 +628,33 @@ local function execute_tool_call(tool_name, arguments)
     result = { success = false, error = "未知工具: " .. tool_name }
   end
 
+  -- 确保所有失败的结果都有 error 字段
+  if not result.success then
+    result.error = result.error or result.output or "未知错误"
+  end
+
   return result
 end
 
 --- 处理工具调用并继续对话
 -- @param session_id 会话 ID
 -- @param tool_calls 工具调用列表
+-- @param on_chunk 流式更新回调
 -- @param on_complete 完成回调
-local function handle_tool_calls(session_id, tool_calls, on_complete)
+local function handle_tool_calls(session_id, tool_calls, on_chunk, on_complete)
   local session = M.sessions[session_id]
   if not session then
     if on_complete then
       on_complete(false, "会话不存在")
+    end
+    return
+  end
+
+  -- 检查工具调用列表是否有效
+  if not tool_calls or #tool_calls == 0 then
+    vim.notify("[NeoAI] 警告: 收到空工具调用列表", vim.log.levels.WARN)
+    if on_complete then
+      on_complete(true, nil, "")
     end
     return
   end
@@ -609,7 +691,15 @@ local function handle_tool_calls(session_id, tool_calls, on_complete)
     -- 当 AI 返回工具调用时，content 通常为 null 或空字符串
     -- 设置为空字符串以避免混淆
     assistant_msg.content = ""
-    
+
+    -- 同时更新会话中的消息内容
+    for i, msg in ipairs(session.messages) do
+      if msg.id == assistant_msg.id then
+        msg.content = ""
+        break
+      end
+    end
+
     -- 触发 AI 回复事件（工具调用场景）
     M._trigger("ai_replied", {
       session_id = session_id,
@@ -618,32 +708,32 @@ local function handle_tool_calls(session_id, tool_calls, on_complete)
       has_tool_calls = true,
     })
   end
-  
-  -- 调用完成回调，表示第一次请求成功（即使没有常规内容）
-  if on_complete then
-    on_complete(true, nil, "")
-  end
+
+  -- 注意：在工具调用场景中，我们不在这里调用 on_complete
+  -- 整个对话流程包括：第一次请求（识别工具）→ 执行工具 → 第二次请求（基于工具结果回复）
+  -- 只有当第二次请求完成后，整个对话才算完成
+
+  -- 直接打印信息：开始执行工具
+  vim.notify("[NeoAI] 开始执行工具调用", vim.log.levels.INFO)
 
   -- 为每个工具调用执行并收集结果
   local tool_results = {}
 
-  -- 调试：打印工具调用信息
-  if M.validated_config and M.validated_config.debug then
-    vim.notify("[NeoAI调试] 工具调用数量: " .. #tool_calls, vim.log.levels.DEBUG)
-    for i, tool_call in ipairs(tool_calls) do
-      if tool_call and tool_call["function"] then
-        local func = tool_call["function"]
-        vim.notify(
-          string.format(
-            "[NeoAI调试] 工具调用%d: id=%s, name=%s, arguments=%s",
-            i,
-            tool_call.id or "(无id)",
-            func.name or "(无名)",
-            func.arguments or "(无参数)"
-          ),
-          vim.log.levels.DEBUG
-        )
-      end
+  -- 直接打印工具调用信息
+  vim.notify("[NeoAI] 工具调用数量: " .. #tool_calls, vim.log.levels.INFO)
+  for i, tool_call in ipairs(tool_calls) do
+    if tool_call and tool_call["function"] then
+      local func = tool_call["function"]
+      vim.notify(
+        string.format(
+          "[NeoAI] 工具调用%d: id=%s, name=%s, arguments=%s",
+          i,
+          tool_call.id or "(无id)",
+          func.name or "(无名)",
+          func.arguments or "(无参数)"
+        ),
+        vim.log.levels.INFO
+      )
     end
   end
 
@@ -662,9 +752,20 @@ local function handle_tool_calls(session_id, tool_calls, on_complete)
       -- 解析参数（如果是字符串）
       local parsed_args = {}
       if type(arguments) == "string" then
-        local ok, decoded = pcall(vim.fn.json_decode, arguments)
-        if ok and decoded then
-          parsed_args = decoded
+        if arguments ~= "" then
+          local ok, decoded = pcall(vim.fn.json_decode, arguments)
+          if ok and decoded then
+            parsed_args = decoded
+          else
+            -- JSON 解析失败，尝试作为简单参数处理
+            parsed_args = {}
+            -- 对于某些工具，可以将字符串作为单个参数
+            if tool_name == "shell_execute" then
+              parsed_args.command = arguments
+            elseif tool_name == "read_file" then
+              parsed_args.filepath = arguments
+            end
+          end
         else
           parsed_args = {}
         end
@@ -688,27 +789,28 @@ local function handle_tool_calls(session_id, tool_calls, on_complete)
           formatted_result = "操作成功"
         end
 
-        -- 调试：打印工具执行结果
-        if M.validated_config and M.validated_config.debug then
-          local preview = string.sub(formatted_result, 1, 100)
-          if #preview > 100 then
-            preview = preview .. "..."
-          end
-          vim.notify(
-            string.format("[NeoAI调试] 工具执行成功: %s, 结果预览: %s", tool_name, preview),
-            vim.log.levels.DEBUG
-          )
+        -- 直接打印工具执行结果
+        local preview = string.sub(formatted_result, 1, 100)
+        if #preview > 100 then
+          preview = preview .. "..."
         end
+        vim.notify(
+          string.format("[NeoAI] 工具执行成功: %s, 结果预览: %s", tool_name, preview),
+          vim.log.levels.INFO
+        )
       else
-        formatted_result = "错误: " .. (result.error or "未知错误")
+        -- 确保有错误信息
+        local error_msg = result.error or result.output or "未知错误"
+        formatted_result = "错误: " .. error_msg
 
-        -- 调试：打印工具执行错误
-        if M.validated_config and M.validated_config.debug then
-          vim.notify(
-            string.format("[NeoAI调试] 工具执行失败: %s, 错误: %s", tool_name, result.error or "未知错误"),
-            vim.log.levels.DEBUG
-          )
-        end
+        -- 直接打印工具执行错误
+        vim.notify(
+          string.format("[NeoAI] 工具执行失败: %s, 错误: %s", tool_name, error_msg),
+          vim.log.levels.WARN
+        )
+
+        -- 向用户显示错误通知
+        vim.notify(string.format("[NeoAI] 工具调用失败: %s - %s", tool_name, error_msg), vim.log.levels.WARN)
       end
 
       table.insert(tool_results, {
@@ -752,41 +854,340 @@ local function handle_tool_calls(session_id, tool_calls, on_complete)
 
   if last_user_msg then
     -- 重新请求 AI，这次包含工具结果
-    -- 注意：这里不传递原始的 on_complete，因为第一次请求已经完成
+    -- 注意：这里需要传递一个新的 on_complete 回调，让 UI 层知道第二次请求已完成
     -- 工具执行是第一次请求的一部分，第二次请求是新的对话轮次
 
-    -- 调试：打印消息历史
-    if M.validated_config and M.validated_config.debug then
-      local messages = utils.build_api_messages(session, last_user_msg.content, M.llm_config, M.validated_config)
-      vim.notify("[NeoAI调试] 第二次请求消息数: " .. #messages, vim.log.levels.DEBUG)
-      for i, msg in ipairs(messages) do
-        local preview = msg.content and string.sub(msg.content, 1, 50) or "(无内容)"
-        if #preview > 50 then
-          preview = preview .. "..."
-        end
-        vim.notify(
-          string.format("[NeoAI调试] 消息%d: role=%s, content=%s", i, msg.role, preview),
-          vim.log.levels.DEBUG
-        )
+    -- 在工具调用场景中，第二次请求需要明确的提示
+    -- 告诉AI基于工具结果生成回复
+
+    -- 收集工具结果内容
+    local tool_results = {}
+    for _, msg in ipairs(session.messages) do
+      if msg.role == "tool" and msg.content then
+        table.insert(tool_results, msg.content)
       end
     end
 
-    M.request_ai_stream_with_tools(
-      session_id,
-      last_user_msg.content,
-      nil,
-      -- 新的完成回调，只处理第二次请求的结果
-      function(success, error_msg, final_content)
-        if success then
-          M._trigger("response_received", {
-            session_id = session_id,
-            response = final_content,
+    local second_request_prompt
+    if #tool_results > 0 then
+      -- 如果有工具结果，将其包含在提示中
+      local tool_result_text = table.concat(tool_results, "\n\n")
+      second_request_prompt = string.format(
+        "我已经执行了你请求的工具操作，以下是工具返回的结果：\n\n%s\n\n请基于这些结果，用自然语言总结或解释，帮助用户理解。",
+        tool_result_text
+      )
+    else
+      second_request_prompt =
+        "我已经执行了你请求的工具操作。请基于工具返回的结果，用自然语言总结或解释这些结果，帮助用户理解。"
+    end
+
+    -- 构建专门用于工具调用后回复的消息列表
+    -- 我们需要移除工具调用消息，因为AI看到工具调用消息会认为需要继续调用工具
+    local messages = {}
+
+    -- 添加系统提示
+    local sys_prompt = M.llm_config and M.llm_config.system_prompt
+    if not sys_prompt and M.validated_config then
+      if M.validated_config.defaults then
+        sys_prompt = M.validated_config.defaults.llm.system_prompt
+      elseif M.validated_config.llm then
+        sys_prompt = M.validated_config.llm.system_prompt
+      end
+    end
+    sys_prompt = sys_prompt or ""
+    if sys_prompt and sys_prompt ~= "" then
+      table.insert(messages, {
+        role = "system",
+        content = sys_prompt,
+      })
+    end
+
+    -- 添加历史消息，但过滤掉工具调用相关的消息
+    -- 我们只保留用户消息和工具结果消息
+    local last_user_msg_content = nil
+    for _, msg in ipairs(session.messages) do
+      if msg.role == "user" then
+        -- 用户消息
+        last_user_msg_content = msg.content or ""
+        table.insert(messages, {
+          role = "user",
+          content = last_user_msg_content,
+        })
+      elseif msg.role == "tool" then
+        -- 在第二次请求中，我们不直接包含工具消息
+        -- 而是将工具结果整合到后续的用户消息中
+        -- 这里跳过工具消息，它的内容会在后续的提示中使用
+      elseif msg.role == "assistant" then
+        -- 对于助手消息，在工具调用后的第二次请求中，我们使用简化的消息
+        -- 不包含 tool_calls 字段，避免API期望继续工具调用
+        if msg.metadata and msg.metadata.tool_calls then
+          -- 这是工具调用消息，我们使用一个简化的版本
+          -- 告诉AI工具已经执行完成
+          table.insert(messages, {
+            role = "assistant",
+            content = "我已经执行了请求的工具操作。",
           })
-        else
-          vim.notify("[NeoAI] AI 回复失败: " .. (error_msg or "未知错误"), vim.log.levels.WARN)
+        elseif msg.content and msg.content ~= "" then
+          -- 普通助手消息
+          table.insert(messages, {
+            role = "assistant",
+            content = msg.content or "",
+          })
         end
       end
+    end
+
+    -- 添加第二次请求的提示
+    -- 如果最后一条消息已经是用户消息，并且内容与我们的提示相似，则不需要重复添加
+    local should_add_prompt = true
+    if last_user_msg_content and last_user_msg_content:find("请基于工具执行结果生成回复") then
+      should_add_prompt = false
+    end
+
+    if should_add_prompt then
+      table.insert(messages, {
+        role = "user",
+        content = second_request_prompt,
+      })
+    end
+
+    -- 直接打印消息历史（详细格式）
+    vim.notify("[NeoAI] 第二次请求消息数: " .. #messages, vim.log.levels.INFO)
+    for i, msg in ipairs(messages) do
+      local preview = msg.content and string.sub(msg.content, 1, 50) or "(无内容)"
+      if #preview > 50 then
+        preview = preview .. "..."
+      end
+      vim.notify(string.format("[NeoAI] 消息%d: role=%s, content=%s", i, msg.role, preview), vim.log.levels.INFO)
+    end
+
+    -- 直接打印第二次请求开始
+    vim.notify("[NeoAI] 开始第二次请求（工具结果处理）", vim.log.levels.INFO)
+
+    -- 创建新的pending消息用于第二次回复
+    local second_pending_msg =
+      utils.create_message("assistant", "🔄 正在分析工具结果...", os.time(), { pending = true })
+    second_pending_msg.pending = true
+    M.add_message(session_id, second_pending_msg)
+
+    -- 构建请求体（不包含工具）
+    local llm_config = M.llm_config or (M.validated_config and M.validated_config.llm) or config.defaults.llm
+
+    local request_body = vim.fn.json_encode({
+      model = llm_config.model,
+      messages = messages,
+      stream = llm_config.stream,
+      temperature = llm_config.temperature,
+      max_tokens = llm_config.max_tokens,
+      top_p = llm_config.top_p,
+    })
+
+    -- 创建临时文件
+    local body_file = vim.fn.tempname() .. "_body_tool_result.json"
+    local tmp_file = vim.fn.tempname() .. "_tool_result.sse"
+
+    vim.fn.writefile({ request_body }, body_file)
+
+    -- 构建 curl 命令
+    local curl_cmd = string.format(
+      "curl -s -N --connect-timeout 10 --max-time %d "
+        .. '-X POST "%s" '
+        .. '-H "Content-Type: application/json" '
+        .. '-H "Authorization: Bearer %s" '
+        .. '-d "@%s" > "%s" 2>&1',
+      llm_config.timeout,
+      llm_config.api_url,
+      llm_config.api_key,
+      body_file,
+      tmp_file
     )
+
+    local accumulated_content = ""
+    local request_finished = false
+    local last_processed_pos = 0
+    local last_update_time = 0
+    local stream_update_interval = llm_config.stream_update_interval or 100
+
+    -- 为第二次请求创建一个本地的 on_complete 回调
+    -- 注意：这里使用闭包来访问外部的 on_complete 参数
+    local second_request_on_complete = function(success, error_msg, final_content)
+      if success then
+        M._trigger("response_received", {
+          session_id = session_id,
+          response = final_content or accumulated_content,
+        })
+        -- 如果存在原始的 on_complete 回调，也调用它
+        if on_complete then
+          on_complete(success, error_msg, final_content or accumulated_content)
+        end
+      else
+        vim.notify("[NeoAI] AI 回复失败: " .. (error_msg or "未知错误"), vim.log.levels.WARN)
+        -- 如果存在原始的 on_complete 回调，也调用它
+        if on_complete then
+          on_complete(success, error_msg, final_content or accumulated_content)
+        end
+      end
+    end
+
+    -- 启动后台 job
+    local job_id = vim.fn.jobstart(curl_cmd, {
+      on_exit = function(job, exit_code)
+        vim.schedule(function()
+          request_finished = true
+
+          -- 读取完整的响应文件
+          if vim.fn.filereadable(tmp_file) == 1 then
+            local handle = io.open(tmp_file, "r")
+            if handle then
+              handle:seek("set", last_processed_pos)
+              local remaining = handle:read("*a")
+              handle:close()
+
+              -- 解析剩余的SSE数据以提取内容
+              for line in remaining:gmatch("[^\r\n]+") do
+                if line:match("^data:") then
+                  local data = utils.parse_sse_data(line)
+                  if data and data.choices and data.choices[1] then
+                    local delta = data.choices[1].delta
+                    if delta and delta.content and delta.content ~= vim.NIL then
+                      local content_str = type(delta.content) == "string" and delta.content or tostring(delta.content)
+                      accumulated_content = accumulated_content .. content_str
+                    end
+                  end
+                end
+              end
+
+              -- 清理临时文件
+              vim.fn.delete(tmp_file)
+              vim.fn.delete(body_file)
+            end
+          end
+
+          -- 更新消息为最终内容
+          for i, msg in ipairs(session.messages) do
+            if msg.id == second_pending_msg.id then
+              local final_content
+              if accumulated_content ~= "" then
+                final_content = accumulated_content
+              else
+                final_content = "抱歉，未能生成回复。"
+              end
+
+              msg.content = final_content
+              msg.pending = false
+              msg.timestamp = os.time()
+              break
+            end
+          end
+
+          session.updated_at = os.time()
+          M._auto_sync(session_id)
+
+          -- 直接打印第二次请求结果
+          vim.notify(
+            string.format(
+              "[NeoAI] 第二次请求结果: exit_code=%d, success=%s, content_length=%d",
+              exit_code,
+              tostring(exit_code == 0),
+              #accumulated_content
+            ),
+            vim.log.levels.INFO
+          )
+
+          -- 调用本地的 on_complete 回调
+          local success = exit_code == 0
+          local error_msg = success and nil or "请求失败，退出码: " .. exit_code
+          second_request_on_complete(success, error_msg, accumulated_content)
+        end)
+      end,
+    })
+
+    if job_id <= 0 then
+      local error_msg = "无法启动 API 请求"
+      vim.notify("[NeoAI] " .. error_msg, vim.log.levels.ERROR)
+
+      for i, msg in ipairs(session.messages) do
+        if msg.id == second_pending_msg.id then
+          msg.content = "❌ " .. error_msg
+          msg.pending = false
+          msg.timestamp = os.time()
+          break
+        end
+      end
+      return
+    end
+
+    -- 启动文件监听器
+    local function watch_stream()
+      if request_finished then
+        return
+      end
+
+      if vim.fn.filereadable(tmp_file) == 1 then
+        local file_size = vim.fn.getfsize(tmp_file)
+        if file_size <= last_processed_pos then
+          vim.defer_fn(watch_stream, 50)
+          return
+        end
+
+        local handle = io.open(tmp_file, "r")
+        if not handle then
+          vim.defer_fn(watch_stream, 50)
+          return
+        end
+
+        handle:seek("set", last_processed_pos)
+        local new_content = handle:read("*a")
+        handle:close()
+
+        if not new_content or new_content == "" then
+          vim.defer_fn(watch_stream, 50)
+          return
+        end
+
+        last_processed_pos = last_processed_pos + #new_content
+
+        -- 解析 SSE 事件
+        for line in new_content:gmatch("[^\r\n]+") do
+          if line:match("^data:") then
+            local data = utils.parse_sse_data(line)
+            if data and data.choices and data.choices[1] then
+              local delta = data.choices[1].delta
+              if delta and delta.content and delta.content ~= vim.NIL then
+                local content_str = type(delta.content) == "string" and delta.content or tostring(delta.content)
+                accumulated_content = accumulated_content .. content_str
+
+                -- 实时更新消息内容
+                for i, msg in ipairs(session.messages) do
+                  if msg.id == second_pending_msg.id then
+                    msg.content = accumulated_content
+                    break
+                  end
+                end
+                -- 触发流式更新事件
+                M._trigger("ai_stream_update", {
+                  session_id = session_id,
+                  content = accumulated_content,
+                })
+
+                -- 控制流式更新频率
+                local current_time = vim.loop.now()
+                if current_time - last_update_time >= stream_update_interval then
+                  last_update_time = current_time
+                  if on_chunk then
+                    on_chunk(accumulated_content)
+                  end
+                end
+              end
+            end
+          end
+        end
+      end
+
+      vim.defer_fn(watch_stream, 50)
+    end
+
+    watch_stream()
   else
     if on_complete then
       on_complete(false, "未找到用户消息")
@@ -975,14 +1376,96 @@ function M.request_ai_stream_with_tools(session_id, user_content, on_chunk, on_c
               msg.timestamp = os.time()
 
               -- 处理工具调用
-              handle_tool_calls(session_id, tool_calls, on_complete)
+              handle_tool_calls(session_id, tool_calls, on_chunk, on_complete)
+              return -- 有工具调用时，直接返回，不执行后续的完成回调
             else
               -- 没有工具调用，正常完成
-              local final_content = accumulated_content ~= "" and accumulated_content
-                or "抱歉，未能生成回复。"
+              local final_content = ""
+
+              -- 如果 accumulated_content 不为空，使用它
+              if accumulated_content ~= "" then
+                final_content = accumulated_content
+              else
+                -- 更可靠的检测：检查整个会话历史中是否有工具调用
+                -- 因为第二次请求时，pending_msg是新的，工具调用消息在历史中
+                local has_tool_calls_in_history = false
+                local tool_result_content = ""
+
+                for _, history_msg in ipairs(session.messages) do
+                  if history_msg.metadata and history_msg.metadata.tool_calls then
+                    has_tool_calls_in_history = true
+                  end
+                  if history_msg.role == "tool" and history_msg.content then
+                    tool_result_content = history_msg.content
+                  end
+                end
+
+                -- 如果是工具调用后的请求，使用工具结果生成回复
+                if has_tool_calls_in_history then
+                  -- 尝试从工具结果中提取信息
+                  if tool_result_content ~= "" then
+                    -- 如果是目录列表结果，生成有意义的回复
+                    if tool_result_content:match("total %d+") then
+                      -- 解析目录列表结果
+                      local lines = {}
+                      for line in tool_result_content:gmatch("[^\r\n]+") do
+                        if not line:match("^total") then
+                          table.insert(lines, line)
+                        end
+                      end
+
+                      -- 提取文件名
+                      local file_list = {}
+                      for _, line in ipairs(lines) do
+                        local filename = line:match("[^ ]+$")
+                        if filename and filename ~= "." and filename ~= ".." then
+                          table.insert(file_list, filename)
+                        end
+                      end
+
+                      if #file_list > 0 then
+                        final_content = "我已经查看了目录内容。当前目录包含以下文件：\n"
+                        for i, filename in ipairs(file_list) do
+                          if i <= 10 then -- 只显示前10个文件
+                            final_content = final_content .. "- " .. filename .. "\n"
+                          else
+                            final_content = final_content .. "- ... 还有 " .. (#file_list - 10) .. " 个文件\n"
+                            break
+                          end
+                        end
+                        final_content = final_content .. "\n总共 " .. #file_list .. " 个文件/目录。"
+                      else
+                        final_content = "目录为空或无法解析目录内容。"
+                      end
+                    else
+                      -- 其他类型的工具结果
+                      final_content = "我已经执行了工具操作。工具返回的结果是：\n"
+                        .. string.sub(tool_result_content, 1, 200)
+                        .. (#tool_result_content > 200 and "..." or "")
+                    end
+                  else
+                    final_content = "我已经处理了工具调用，但工具没有返回具体结果。"
+                  end
+                else
+                  final_content = "抱歉，未能生成回复。"
+                end
+              end
+
               msg.content = final_content
               msg.pending = false
               msg.timestamp = os.time()
+
+              -- 直接打印最终内容信息
+              vim.notify(
+                string.format(
+                  "[NeoAI] 请求完成: exit_code=%d, has_tool_calls=%s, accumulated_content_length=%d, final_content=%s",
+                  exit_code,
+                  tostring(has_tool_calls),
+                  #accumulated_content,
+                  #final_content > 50 and string.sub(final_content, 1, 50) .. "..." or final_content
+                ),
+                vim.log.levels.INFO
+              )
 
               -- 存储推理内容
               if accumulated_reasoning ~= "" then
@@ -999,9 +1482,28 @@ function M.request_ai_stream_with_tools(session_id, user_content, on_chunk, on_c
               end
 
               if on_complete then
-                -- 修复：当有工具调用时，即使accumulated_content为空也应视为成功
-                local success = exit_code == 0 and (accumulated_content ~= "" or has_tool_calls)
-                local error_msg = success and nil or ("请求失败，退出码: " .. exit_code)
+                -- 修复：当退出码为0时，即使accumulated_content为空也应视为成功
+                -- 因为AI可能返回空内容，特别是在工具调用后的第二次请求中
+                local success = exit_code == 0
+                local error_msg
+                if success then
+                  error_msg = nil
+                else
+                  error_msg = "请求失败，退出码: " .. exit_code
+                end
+
+                -- 调试信息
+                vim.notify(
+                  string.format(
+                    "[NeoAI] 请求完成: exit_code=%d, success=%s, has_tool_calls=%s, content_length=%d",
+                    exit_code,
+                    tostring(success),
+                    tostring(has_tool_calls),
+                    #accumulated_content
+                  ),
+                  vim.log.levels.DEBUG
+                )
+
                 on_complete(success, error_msg, accumulated_content)
               end
 
@@ -1109,14 +1611,14 @@ function M.request_ai_stream_with_tools(session_id, user_content, on_chunk, on_c
             if delta.content and delta.content ~= vim.NIL then
               local content_str = type(delta.content) == "string" and delta.content or tostring(delta.content)
               accumulated_content = accumulated_content .. content_str
-            -- 控制流式更新频率
-            local current_time = vim.loop.now()
-            if current_time - last_update_time >= stream_update_interval then
-              last_update_time = current_time
-              if on_chunk then
-                on_chunk(accumulated_content)
+              -- 控制流式更新频率
+              local current_time = vim.loop.now()
+              if current_time - last_update_time >= stream_update_interval then
+                last_update_time = current_time
+                if on_chunk then
+                  on_chunk(accumulated_content)
+                end
               end
-            end
             end
 
             -- 提取推理内容
