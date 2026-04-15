@@ -58,9 +58,9 @@ function M.new_session(name, parent_id)
     created_at = os.time(),
     updated_at = os.time(),
     config = {
-      auto_scroll = config.defaults.ui.auto_scroll,
-      show_timestamps = config.defaults.ui.show_timestamps,
-      max_history = config.defaults.background.max_history,
+      auto_scroll = M.validated_config and M.validated_config.ui and M.validated_config.ui.auto_scroll or config.defaults.ui.auto_scroll,
+      show_timestamps = M.validated_config and M.validated_config.ui and M.validated_config.ui.show_timestamps or config.defaults.ui.show_timestamps,
+      max_history = M.validated_config and M.validated_config.background and M.validated_config.background.max_history or config.defaults.background.max_history,
     },
   }
 
@@ -217,7 +217,7 @@ function M.find_message_at_line(session, buf, target_line, max_width)
 
     -- 跳过推理内容行
     if msg.metadata and msg.metadata.has_reasoning and msg.metadata.reasoning_content then
-      local llm_config = M.llm_config or config.defaults.llm
+      local llm_config = M.llm_config or (M.validated_config and M.validated_config.llm) or config.defaults.llm
       if llm_config.show_reasoning then
         local is_complete = not msg.pending
         current_line = current_line
@@ -270,7 +270,7 @@ function M.request_ai_stream(session_id, user_content, on_chunk, on_complete)
   end
 
   -- 使用存储的 LLM 配置（优先）或回退到默认配置
-  local llm_config = M.llm_config or config.defaults.llm
+  local llm_config = M.llm_config or (M.validated_config and M.validated_config.llm) or config.defaults.llm
 
   -- 验证 API 配置
   if not llm_config.api_key or llm_config.api_key == "" then
@@ -288,7 +288,7 @@ function M.request_ai_stream(session_id, user_content, on_chunk, on_complete)
   M.add_message(session_id, pending_msg)
 
   -- 构建请求体
-  local messages = utils.build_api_messages(session, user_content, M.llm_config, config)
+  local messages = utils.build_api_messages(session, user_content, M.llm_config, M.validated_config)
   local request_body = vim.fn.json_encode({
     model = llm_config.model,
     messages = messages,
@@ -1031,14 +1031,16 @@ end
 
 --- 后端模块初始化
 -- 读取配置、导入已有数据、创建默认会话
--- @param user_config 用户配置（可选）
-function M.setup(user_config)
-  user_config = user_config or {}
-  M.config_dir = user_config.config_dir or config.defaults.background.config_dir
-  M.config_file = user_config.config_file or (M.config_dir .. "/sessions.json")
+-- @param validated_config 已验证的配置表（由 init.lua 传入）
+function M.setup(validated_config)
+  validated_config = validated_config or {}
+  M.config_dir = validated_config.background and validated_config.background.config_dir or config.defaults.background.config_dir
+  M.config_file = validated_config.background and validated_config.background.config_file or (M.config_dir .. "/sessions.json")
 
+  -- 存储完整的验证后配置
+  M.validated_config = validated_config
   -- 存储 LLM 配置（供流式请求使用）
-  M.llm_config = user_config.llm or config.defaults.llm
+  M.llm_config = validated_config.llm or config.defaults.llm
 
   -- 尝试导入已有的会话数据
   M.import_sessions()

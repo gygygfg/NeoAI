@@ -2157,6 +2157,9 @@ function M.open_tab()
   vim.cmd("tabnew")
   M.windows.main = vim.api.nvim_get_current_win()
   vim.api.nvim_win_set_buf(M.windows.main, M.buffers.main)
+  -- 禁用行号
+  vim.api.nvim_set_option_value("number", false, { win = M.windows.main })
+  vim.api.nvim_set_option_value("relativenumber", false, { win = M.windows.main })
   utils.set_window_wrap(M.windows)
   M.setup_buffers()
   M.is_open = true
@@ -2742,14 +2745,11 @@ end
 -- ── 模块初始化 ──────────────────────────────────────────────────────────────
 
 --- 模块初始化
--- 合并用户配置，注册后端事件监听器，设置窗口生命周期相关的自动命令
--- @param user_config 用户配置表
-function M.setup(user_config)
-  -- 确保配置向后兼容
-  local compatible_config = config.ensure_backward_compatibility(user_config or {})
-
-  -- 合并默认配置和用户配置
-  M.config = vim.tbl_deep_extend("force", config.defaults, compatible_config)
+-- 注册后端事件监听器，设置窗口生命周期相关的自动命令
+-- @param validated_config 已验证的配置表（由 init.lua 传入）
+function M.setup(validated_config)
+  -- 直接使用已验证的配置
+  M.config = validated_config
 
   -- ── 后端事件监听器（使用防抖处理） ──
 

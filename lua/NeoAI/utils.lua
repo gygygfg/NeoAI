@@ -17,22 +17,30 @@ end
 
 --- 文本自动换行
 -- @param text 原始文本
--- @param max_width 最大宽度（字符数）
+-- @param max_width 最大宽度（显示宽度）
 -- @return table 换行后的行数组
 function M.wrap_text(text, max_width)
   local wrapped = {}
   local current = ""
+  local current_width = 0
+  
   for ch in text:gmatch("[%z\1-\127\194-\244][\128-\191]*") do
-    if #current + #ch <= max_width or current == "" then
+    local ch_width = M.display_width(ch)
+    
+    if current_width + ch_width <= max_width or current == "" then
       current = current .. ch
+      current_width = current_width + ch_width
     else
       table.insert(wrapped, current)
       current = ch
+      current_width = ch_width
     end
   end
+  
   if current ~= "" then
     table.insert(wrapped, current)
   end
+  
   return #wrapped > 0 and wrapped or { text }
 end
 
@@ -536,7 +544,17 @@ function M.build_api_messages(session, user_content, llm_config, config)
   local messages = {}
 
   -- 添加系统提示
-  local sys_prompt = llm_config and llm_config.system_prompt or config.defaults.llm.system_prompt
+  local sys_prompt = llm_config and llm_config.system_prompt 
+  if not sys_prompt and config then
+    -- 处理两种配置类型：config 模块或验证后的配置表
+    if config.defaults then
+      sys_prompt = config.defaults.llm.system_prompt
+    elseif config.llm then
+      sys_prompt = config.llm.system_prompt
+    end
+  end
+  -- 如果仍然没有获取到，使用空字符串
+  sys_prompt = sys_prompt or ""
   if sys_prompt and sys_prompt ~= "" then
     table.insert(messages, {
       role = "system",
@@ -545,7 +563,17 @@ function M.build_api_messages(session, user_content, llm_config, config)
   end
 
   -- 添加历史消息（排除最新的用户消息，因为会单独添加）
-  local max_history = llm_config and llm_config.max_history or config.defaults.background.max_history
+  local max_history = nil
+  if config then
+    -- 处理两种配置类型：config 模块或验证后的配置表
+    if config.defaults then
+      max_history = config.defaults.background.max_history
+    elseif config.background then
+      max_history = config.background.max_history
+    end
+  end
+  -- 如果仍然没有获取到，使用默认值 100
+  max_history = max_history or 100
   local history_count = math.min(#session.messages, max_history - 1)
   local start_idx = math.max(1, #session.messages - history_count + 1)
 

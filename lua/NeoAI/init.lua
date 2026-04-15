@@ -21,32 +21,33 @@ end
 --- 插件初始化入口
 -- @param user_config 用户自定义配置（可选）
 function M.setup(user_config)
+  -- 1. 接收用户配置
   user_config = user_config or {}
-  
-  -- 确保配置向后兼容
-  local compatible_config = config.ensure_backward_compatibility(user_config)
-  
-  -- 合并默认配置和用户配置
-  local final_config = vim.tbl_deep_extend("force", config.defaults, compatible_config)
+
+  -- 2. 传给 config.lua 进行验证和合并
+  local validated_config, validation_errors = config.validate_and_merge(user_config)
+
+  -- 3. 输出验证警告
+  if validation_errors and #validation_errors > 0 then
+    for _, error_msg in ipairs(validation_errors) do
+      vim.notify("[NeoAI] 配置警告: " .. error_msg, vim.log.levels.WARN)
+    end
+  end
 
   -- 检查 curl 是否已安装
   M.check_curl()
 
   -- 初始化后端（会话管理、数据存储）
-  backend.setup({
-    config_dir = final_config.background.config_dir,
-    config_file = final_config.background.config_file,
-    llm = final_config.llm, -- 传递 LLM 配置给后端
-  })
+  backend.setup(validated_config)
 
   -- 设置语法高亮
   M.setup_highlights()
 
   -- 初始化 UI 界面
-  ui.setup(final_config)
+  ui.setup(validated_config)
 
   -- 注册 NeoVim 命令和快捷键
-  M.setup_commands(final_config)
+  M.setup_commands(validated_config)
 
   vim.notify("[NeoAI] 插件已加载")
 end
@@ -73,7 +74,7 @@ function M.setup_commands(final_config)
         { noremap = true, silent = true, desc = "NeoAI: " .. final_config.keymaps.chat.global.open.desc }
       )
     end
-    
+
     -- 新建会话
     if final_config.keymaps.chat.global.new then
       vim.keymap.set(
@@ -144,7 +145,7 @@ function M.setup_commands(final_config)
   vim.api.nvim_create_user_command("NeoAIList", function()
     vim.notify("=== 会话列表 ===")
     for id, session in pairs(backend.sessions) do
-      local current = (id == backend.current_session) and " [当前]" or ""
+      local current = (id == backend.current_session) and " [ 当前]" or ""
       vim.notify(string.format("%d. %s (%d条消息)%s", id, session.name, #session.messages, current))
     end
   end, {})
@@ -189,7 +190,7 @@ function M.setup_commands(final_config)
       vim.notify("用户消息: " .. stats.user_messages)
       vim.notify("AI消息: " .. stats.ai_messages)
       vim.notify("可编辑消息: " .. stats.editable_messages)
-      vim.notify("持续时间: " .. stats.duration_minutes .. " 分钟")
+      vim.notify("持续时间: " .. stats.duration_minutes .. "  分钟")
     end
   end, {})
 end
