@@ -201,13 +201,16 @@ end
 -- @param session 会话对象
 -- @param buf 缓冲区句柄
 -- @param target_line 目标行号（0-indexed）
+-- @param max_width 最大显示宽度（可选，默认60）
 -- @return table? 消息信息 {session_id, message_id, start_line, end_line}，找不到返回 nil
-function M.find_message_at_line(session, buf, target_line)
+function M.find_message_at_line(session, buf, target_line, max_width)
   if not session or not session.messages then
     return nil
   end
 
+  max_width = max_width or 60
   local current_line = 0
+
   for i, msg in ipairs(session.messages) do
     -- 标题行（不可编辑）
     current_line = current_line + 1
@@ -218,12 +221,12 @@ function M.find_message_at_line(session, buf, target_line)
       if llm_config.show_reasoning then
         local is_complete = not msg.pending
         current_line = current_line
-          + utils.count_reasoning_display_lines(msg.metadata.reasoning_content, 60, is_complete, msg.id)
+          + utils.count_reasoning_display_lines(msg.metadata.reasoning_content, max_width, is_complete, msg.id)
       end
     end
 
     -- 计算内容行（使用 utils.wrap_message_content）
-    local wrap_width = 60 - 4
+    local wrap_width = max_width - 4
     local content_lines = utils.wrap_message_content(msg.content or "", wrap_width)
     local content_line_count = #content_lines
 

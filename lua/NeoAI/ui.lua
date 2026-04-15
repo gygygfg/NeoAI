@@ -37,7 +37,7 @@ M._reasoning_float_buffers = {} -- 推理浮动窗口缓冲区 {message_id = buf
 --- 推理显示配置表
 M.reasoning_config = {
   max_width = 80, -- 浮动窗口最大宽度
-  max_height = 8, -- 浮动窗口最大高度
+  max_height = 5, -- 浮动窗口最大高度
   fold_on_finish = true, -- 思考完成后是否默认折叠
 }
 
@@ -550,18 +550,9 @@ function M.adjust_tree_window_size()
   utils.adjust_tree_window_size(M.windows, M.tree_buffers, M.WINDOW_LIMITS)
 end
 
---- 设置窗口换行选项（内联实现）
+--- 设置窗口换行选项（使用 utils 模块）
 local function set_window_wrap_inline(windows)
-  for _, win in pairs(windows) do
-    if utils.is_win_valid(win) then
-      vim.api.nvim_set_option_value("wrap", true, { win = win })
-      vim.api.nvim_set_option_value("linebreak", true, { win = win })
-      vim.api.nvim_set_option_value("breakindent", true, { win = win })
-      -- 启用折叠功能，使用标记折叠法
-      vim.api.nvim_set_option_value("foldmethod", "marker", { win = win })
-      vim.api.nvim_set_option_value("foldenable", true, { win = win })
-    end
-  end
+  utils.set_window_wrap(windows)
 end
 
 -- ── 窗口策略函数 ─────────────────────────────────────────────────────────────
@@ -940,9 +931,9 @@ end
 
 -- ── 统一重绘函数 ─────────────────────────────────────────────────────────────
 
---- 统一重绘树视图界面
--- 封装树视图的完整渲染流程：清除内容、重绘、设置高亮、调整大小
-function M._render_tree_interface()
+--- 渲染树视图界面（完整流程）
+-- 清除内容、重绘、设置高亮、调整大小
+function M.render_tree_interface()
   local buf = M.tree_buffers.main
   if not utils.is_buf_valid(buf) then
     return
@@ -1152,9 +1143,9 @@ function M._apply_tree_highlights(buf)
   end
 end
 
---- 统一重绘聊天界面
--- 封装聊天界面的完整渲染流程：清除内容、重绘消息、设置可编辑性、调整窗口
-function M._render_chat_interface()
+--- 渲染聊天界面（完整流程）
+-- 清除内容、重绘消息、设置可编辑性、调整窗口
+function M.render_chat_interface()
   local buf = M.buffers.main
   if not utils.is_buf_valid(buf) then
     return
@@ -1447,7 +1438,7 @@ function M.render_session_tree()
     return
   end
 
-  M._render_tree_interface()
+  M.render_tree_interface()
 end
 
 --- 递归渲染会话树（合并共享历史，在分支点展开子节点）
@@ -1890,7 +1881,7 @@ end
 -- 重新渲染主缓冲区的内容，包括所有会话消息和输入提示区域
 function M.update_display()
   -- 渲染聊天界面
-  M._render_chat_interface()
+  M.render_chat_interface()
 
   -- 刷新树视图（如果应该显示）
   if M.should_show_tree() and utils.is_win_valid(M.windows.tree) and utils.is_buf_valid(M.tree_buffers.main) then
@@ -1909,6 +1900,7 @@ function M._setup_editability(_, session)
 
   M._line_to_message = {} -- 行号 -> {session_id, message_id} 映射表
   local current_line = 0
+  local max_width = utils.calculate_text_width(M.windows.main) or 60
 
   for i, msg in ipairs(session.messages) do
     -- 标题行（不映射，不可编辑）
@@ -1923,12 +1915,12 @@ function M._setup_editability(_, session)
     then
       -- 判断推理是否完成：优先使用 reasoning_finished 标记
       local is_complete = msg.metadata.reasoning_finished or not msg.pending
-      local reasoning_display_lines = M.get_reasoning_display_lines(msg.id, 60)
+      local reasoning_display_lines = M.get_reasoning_display_lines(msg.id, max_width)
       current_line = current_line + #reasoning_display_lines
     end
 
     -- 获取当前消息的内容行数（自动换行后的行数）
-    local content_lines = utils.wrap_message_content(msg.content or "", 60 - 4)
+    local content_lines = utils.wrap_message_content(msg.content or "", max_width - 4)
 
     -- 只映射内容行（不映射标题行），这些行可以被用户编辑
     for j, _ in ipairs(content_lines) do
@@ -1950,84 +1942,43 @@ end
 
 -- ── 会话管理 ───────────────────────────────────────────────────────────────
 
---- 选择会话后打开聊天窗口
-function M.open_chat_after_tree_selection()
-  local mode = M.current_mode
-
-  if mode == M.ui_modes.FLOAT then
-    -- 浮动模式：树和主窗口是同一个，先替换缓冲区再删除树缓冲区
-    if utils.is_win_valid(M.windows.main) then
-      -- 切换回聊天缓冲区
-      vim.api.nvim_win_set_buf(M.windows.main, M.buffers.main)
-      M.windows.tree = nil -- 树视图已隐藏
-      set_window_wrap_inline(M.windows)
-      M.setup_buffers()
-      -- 删除树缓冲区
-      if utils.is_buf_valid(M.tree_buffers.main) then
-        vim.api.nvim_buf_delete(M.tree_buffers.main, { force = true })
-        M.tree_buffers.main = nil
-      end
-      -- 确保光标聚焦在浮动窗口上
-      vim.api.nvim_set_current_win(M.windows.main)
-    else
-      -- 窗口不存在，重新创建
-      local opts = M.get_window_strategy(M.ui_modes.FLOAT)()
-      M.setup_windows(opts)
-    end
-  elseif mode == M.ui_modes.SPLIT then
-    -- 分割模式：复用现有的分割窗口，只替换缓冲区内容
-    if utils.is_win_valid(M.windows.tree) then
-      -- 将树窗口重新用于显示聊天内容
-      vim.api.nvim_win_set_buf(M.windows.tree, M.buffers.main)
-      M.windows.main = M.windows.tree
-      M.windows.tree = nil
-      vim.api.nvim_win_set_width(M.windows.main, math.floor(vim.o.columns * 0.4))
-      -- 禁用行号
-      vim.api.nvim_set_option_value("number", false, { win = M.windows.main })
-      vim.api.nvim_set_option_value("relativenumber", false, { win = M.windows.main })
-      set_window_wrap_inline(M.windows)
-      M.setup_buffers()
-    else
-      -- 如果树窗口不存在，创建新的分割窗口
-      vim.cmd("belowright vsplit")
-      M.windows.main = vim.api.nvim_get_current_win()
-      vim.api.nvim_win_set_buf(M.windows.main, M.buffers.main)
-      -- 禁用行号
-      vim.api.nvim_set_option_value("number", false, { win = M.windows.main })
-      vim.api.nvim_set_option_value("relativenumber", false, { win = M.windows.main })
-      set_window_wrap_inline(M.windows)
-      M.setup_buffers()
-    end
-    -- 删除树缓冲区
-    if utils.is_buf_valid(M.tree_buffers.main) then
-      vim.api.nvim_buf_delete(M.tree_buffers.main, { force = true })
-      M.tree_buffers.main = nil
-    end
-  elseif mode == M.ui_modes.TAB then
-    -- 标签页模式：复用当前标签页，只替换缓冲区内容
-    if utils.is_win_valid(M.windows.tree) then
-      -- 将树窗口重新用于显示聊天内容
-      vim.api.nvim_win_set_buf(M.windows.tree, M.buffers.main)
-      M.windows.main = M.windows.tree
-      M.windows.tree = nil
-      set_window_wrap_inline(M.windows)
-      M.setup_buffers()
-    else
-      -- 如果树窗口不存在，创建新的标签页
-      vim.cmd("tabnew")
-      M.windows.main = vim.api.nvim_get_current_win()
-      vim.api.nvim_win_set_buf(M.windows.main, M.buffers.main)
-      set_window_wrap_inline(M.windows)
-      M.setup_buffers()
-    end
-    -- 删除树缓冲区
-    if utils.is_buf_valid(M.tree_buffers.main) then
-      vim.api.nvim_buf_delete(M.tree_buffers.main, { force = true })
-      M.tree_buffers.main = nil
-    end
+--- 切换到聊天界面的通用逻辑
+-- @param target_win 目标窗口
+-- @param is_split 是否为分割模式
+local function switch_to_chat_interface(target_win, is_split)
+  if not utils.is_win_valid(target_win) then
+    return false
   end
 
-  -- 从树选择后切换到聊天界面：定位光标到输入行
+  -- 设置主窗口
+  M.windows.main = target_win
+  vim.api.nvim_win_set_buf(target_win, M.buffers.main)
+
+  -- 分割模式特定设置
+  if is_split then
+    vim.api.nvim_win_set_width(target_win, math.floor(vim.o.columns * 0.4))
+    vim.api.nvim_set_option_value("number", false, { win = target_win })
+    vim.api.nvim_set_option_value("relativenumber", false, { win = target_win })
+  end
+
+  -- 通用设置
+  set_window_wrap_inline(M.windows)
+  M.setup_buffers()
+
+  return true
+end
+
+--- 清理树视图资源
+local function cleanup_tree_resources()
+  M.windows.tree = nil
+  if utils.is_buf_valid(M.tree_buffers.main) then
+    vim.api.nvim_buf_delete(M.tree_buffers.main, { force = true })
+    M.tree_buffers.main = nil
+  end
+end
+
+--- 定位光标到输入行
+local function focus_input_line()
   vim.defer_fn(function()
     if utils.is_win_valid(M.windows.main) and utils.is_buf_valid(M.buffers.main) and M.input_start_line then
       vim.api.nvim_set_option_value("modifiable", true, { buf = M.buffers.main })
@@ -2037,6 +1988,47 @@ function M.open_chat_after_tree_selection()
       vim.cmd("startinsert")
     end
   end, 50)
+end
+
+--- 选择会话后打开聊天窗口
+function M.open_chat_after_tree_selection()
+  local mode = M.current_mode
+  local success = false
+
+  if mode == M.ui_modes.FLOAT then
+    -- 浮动模式
+    if utils.is_win_valid(M.windows.main) then
+      success = switch_to_chat_interface(M.windows.main, false)
+      vim.api.nvim_set_current_win(M.windows.main)
+    else
+      -- 窗口不存在，重新创建
+      local opts = M.get_window_strategy(M.ui_modes.FLOAT)()
+      M.setup_windows(opts)
+      success = true
+    end
+  elseif mode == M.ui_modes.SPLIT then
+    -- 分割模式
+    local target_win = utils.is_win_valid(M.windows.tree) and M.windows.tree or nil
+    if not target_win then
+      vim.cmd("belowright vsplit")
+      target_win = vim.api.nvim_get_current_win()
+    end
+    success = switch_to_chat_interface(target_win, true)
+  elseif mode == M.ui_modes.TAB then
+    -- 标签页模式
+    local target_win = utils.is_win_valid(M.windows.tree) and M.windows.tree or nil
+    if not target_win then
+      vim.cmd("tabnew")
+      target_win = vim.api.nvim_get_current_win()
+    end
+    success = switch_to_chat_interface(target_win, false)
+  end
+
+  -- 清理树资源
+  if success then
+    cleanup_tree_resources()
+    focus_input_line()
+  end
 end
 
 --- 打开浮窗模式
@@ -2408,7 +2400,8 @@ function M._save_edited_line(line_num)
   end
 
   -- 使用 backend 接口查找消息范围
-  local info = backend.find_message_at_line(session, M.buffers.main, line_num)
+  local max_width = utils.calculate_text_width(M.windows.main)
+  local info = backend.find_message_at_line(session, M.buffers.main, line_num, max_width)
   if not info then
     vim.notify("[NeoAI] 未找到对应的消息", vim.log.levels.WARN)
     return
@@ -3043,12 +3036,12 @@ function M.setup(user_config)
 
           -- 重新渲染聊天界面
           if utils.is_buf_valid(M.buffers.main) then
-            M._render_chat_interface()
+            M.render_chat_interface()
           end
 
           -- 重新渲染树视图
           if M.should_show_tree() and utils.is_buf_valid(M.tree_buffers.main) then
-            M._render_tree_interface()
+            M.render_tree_interface()
           end
         end, 100)
       end

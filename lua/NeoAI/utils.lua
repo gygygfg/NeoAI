@@ -94,20 +94,48 @@ function M.truncate_content(content, max_chars)
 end
 
 --- 计算字符串的显示宽度（考虑中文等宽字符）
+-- 使用更准确的字符宽度计算，支持中文、英文、标点等
 -- @param str 输入字符串
 -- @return number 显示宽度
 function M.display_width(str)
   if not str or str == "" then
     return 0
   end
-  local chinese_chars = str:gsub("[%z\1-\127\194-\244][\128-\191]*", function(ch)
-    if #ch >= 3 then
-      return "aa" -- 中文字符按 2 个英文字符宽度计算
+
+  local width = 0
+  local pos = 1
+  local len = #str
+
+  while pos <= len do
+    local byte = str:byte(pos)
+    local char_len
+
+    -- 确定 UTF-8 字符字节数
+    if byte < 0x80 then
+      char_len = 1
+      -- ASCII 字符（英文、数字、标点）宽度为 1
+      width = width + 1
+    elseif byte < 0xE0 then
+      char_len = 2
+      -- 2字节字符（如拉丁扩展）宽度为 1
+      width = width + 1
+    elseif byte < 0xF0 then
+      char_len = 3
+      -- 3字节字符（如中文、日文、韩文）宽度为 2
+      width = width + 2
+    elseif byte < 0xF8 then
+      char_len = 4
+      -- 4字节字符（如表情符号）宽度为 2
+      width = width + 2
     else
-      return ch
+      char_len = 1
+      width = width + 1 -- 无效字节，按 1 宽度处理
     end
-  end)
-  return #chinese_chars
+
+    pos = pos + char_len
+  end
+
+  return width
 end
 
 --- 将值限制在指定范围内
