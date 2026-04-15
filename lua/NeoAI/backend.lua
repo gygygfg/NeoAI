@@ -22,55 +22,6 @@ function M._auto_sync(session_id)
   M.export_session(session_id, M.config_file, true)
 end
 
---[[
---- 格式化JSON数据（添加缩进）
--- @param data Lua表
--- @return string 格式化后的JSON字符串
-function M._format_json(data)
-  -- 先使用vim.fn.json_encode编码
-  local json_str = vim.fn.json_encode(data)
-  
-  -- 简单的缩进添加（每遇到{或[增加缩进，每遇到}或]减少缩进）
-  local result = ""
-  local indent = 0
-  local in_string = false
-  local escape_next = false
-  
-  for i = 1, #json_str do
-    local char = json_str:sub(i, i)
-    
-    if escape_next then
-      result = result .. char
-      escape_next = false
-    elseif char == "\\" then
-      result = result .. char
-      escape_next = true
-    elseif char == '"' then
-      result = result .. char
-      in_string = not in_string
-    elseif not in_string then
-      if char == "{" or char == "[" then
-        result = result .. char .. "\n" .. string.rep("  ", indent + 1)
-        indent = indent + 1
-      elseif char == "}" or char == "]" then
-        indent = indent - 1
-        result = result .. "\n" .. string.rep("  ", indent) .. char
-      elseif char == "," then
-        result = result .. char .. "\n" .. string.rep("  ", indent)
-      elseif char == ":" then
-        result = result .. char .. " "
-      else
-        result = result .. char
-      end
-    else
-      result = result .. char
-    end
-  end
-  
-  return result
-end
-]]
-
 --- 触发指定类型的事件，通知所有注册的处理器
 -- @param event 事件名称
 -- @param data 事件数据
@@ -458,6 +409,34 @@ function M.request_ai_stream(session_id, user_content, on_chunk, on_complete)
           on_chunk(accumulated_content)
         end
 
+        -- 如果存在推理内容且尚未触发完成事件，触发推理完成事件
+        -- 注意：如果已经在收到常规内容时触发过，这里不再重复触发
+        if
+          accumulated_reasoning ~= "" and (not pending_msg.metadata or not pending_msg.metadata.reasoning_finished)
+        then
+          -- 确保元数据存在
+          pending_msg.metadata = pending_msg.metadata or {}
+          pending_msg.metadata.reasoning_content = accumulated_reasoning
+          pending_msg.metadata.has_reasoning = true
+          pending_msg.metadata.reasoning_finished = true
+
+          -- 同时更新会话中的消息元数据
+          for i, msg in ipairs(session.messages) do
+            if msg.id == pending_msg.id then
+              msg.metadata = msg.metadata or {}
+              msg.metadata.reasoning_content = accumulated_reasoning
+              msg.metadata.has_reasoning = true
+              msg.metadata.reasoning_finished = true
+              break
+            end
+          end
+
+          M._trigger("ai_reasoning_finished", {
+            session_id = session_id,
+            message = pending_msg,
+          })
+        end
+
         -- 触发完成回调
         if on_complete then
           -- 退出码为0表示请求成功，即使内容为空
@@ -469,16 +448,10 @@ function M.request_ai_stream(session_id, user_content, on_chunk, on_complete)
             error_msg = "请求失败，退出码: " .. exit_code
           end
 
-          -- 调试信息
-          vim.notify(
-            string.format(
-              "[NeoAI] 请求完成: exit_code=%d, success=%s, content_length=%d",
-              exit_code,
-              tostring(success),
-              #accumulated_content
-            ),
-            vim.log.levels.DEBUG
-          )
+          -- 简化调试信息
+          if not success then
+            vim.notify(string.format("[NeoAI] 请求失败: exit_code=%d", exit_code), vim.log.levels.WARN)
+          end
 
           on_complete(success, error_msg, accumulated_content)
         end
@@ -577,9 +550,18 @@ function M.request_ai_stream(session_id, user_content, on_chunk, on_complete)
                   end
                 end
                 -- 当有常规内容且推理内容已存在时，标记推理已完成
+                -- 注意：这里立即触发完成事件，因为推理内容已经结束
                 if accumulated_reasoning ~= "" and not pending_msg.metadata.reasoning_finished then
                   pending_msg.metadata.reasoning_finished = true
-                  -- 通知 UI 关闭思考浮动窗口
+                  -- 同时更新会话中的消息元数据
+                  for i, msg in ipairs(session.messages) do
+                    if msg.id == pending_msg.id then
+                      msg.metadata = msg.metadata or {}
+                      msg.metadata.reasoning_finished = true
+                      break
+                    end
+                  end
+                  -- 立即触发推理完成事件，关闭悬浮窗口
                   M._trigger("ai_reasoning_finished", {
                     session_id = session_id,
                     message = pending_msg,
@@ -652,7 +634,7 @@ local function handle_tool_calls(session_id, tool_calls, on_chunk, on_complete)
 
   -- 检查工具调用列表是否有效
   if not tool_calls or #tool_calls == 0 then
-    vim.notify("[NeoAI] 警告: 收到空工具调用列表", vim.log.levels.WARN)
+    -- 空工具调用列表，静默处理
     if on_complete then
       on_complete(true, nil, "")
     end
@@ -713,29 +695,8 @@ local function handle_tool_calls(session_id, tool_calls, on_chunk, on_complete)
   -- 整个对话流程包括：第一次请求（识别工具）→ 执行工具 → 第二次请求（基于工具结果回复）
   -- 只有当第二次请求完成后，整个对话才算完成
 
-  -- 直接打印信息：开始执行工具
-  vim.notify("[NeoAI] 开始执行工具调用", vim.log.levels.INFO)
-
   -- 为每个工具调用执行并收集结果
   local tool_results = {}
-
-  -- 直接打印工具调用信息
-  vim.notify("[NeoAI] 工具调用数量: " .. #tool_calls, vim.log.levels.INFO)
-  for i, tool_call in ipairs(tool_calls) do
-    if tool_call and tool_call["function"] then
-      local func = tool_call["function"]
-      vim.notify(
-        string.format(
-          "[NeoAI] 工具调用%d: id=%s, name=%s, arguments=%s",
-          i,
-          tool_call.id or "(无id)",
-          func.name or "(无名)",
-          func.arguments or "(无参数)"
-        ),
-        vim.log.levels.INFO
-      )
-    end
-  end
 
   for i = 1, #tool_calls do
     local tool_call = tool_calls[i]
@@ -790,26 +751,13 @@ local function handle_tool_calls(session_id, tool_calls, on_chunk, on_complete)
         end
 
         -- 直接打印工具执行结果
-        local preview = string.sub(formatted_result, 1, 100)
-        if #preview > 100 then
-          preview = preview .. "..."
-        end
-        vim.notify(
-          string.format("[NeoAI] 工具执行成功: %s, 结果预览: %s", tool_name, preview),
-          vim.log.levels.INFO
-        )
+        -- 工具执行成功，不显示通知
       else
         -- 确保有错误信息
         local error_msg = result.error or result.output or "未知错误"
         formatted_result = "错误: " .. error_msg
 
-        -- 直接打印工具执行错误
-        vim.notify(
-          string.format("[NeoAI] 工具执行失败: %s, 错误: %s", tool_name, error_msg),
-          vim.log.levels.WARN
-        )
-
-        -- 向用户显示错误通知
+        -- 只在工具执行失败时显示错误通知
         vim.notify(string.format("[NeoAI] 工具调用失败: %s - %s", tool_name, error_msg), vim.log.levels.WARN)
       end
 
@@ -825,7 +773,11 @@ local function handle_tool_calls(session_id, tool_calls, on_chunk, on_complete)
 
   -- 将工具结果添加到消息历史中
   for _, result in ipairs(tool_results) do
-    local tool_msg = utils.create_message(result.role, result.content, os.time(), {
+    -- 工具结果消息的content字段设置为空或简化的提示，避免工具输出被打印到正文中
+    -- 完整的工具结果保存在metadata.tool_result_content中，供悬浮文本显示
+    local tool_content = "" -- 设置为空，不显示在正文中
+
+    local tool_msg = utils.create_message(result.role, tool_content, os.time(), {
       tool_name = result.name,
       tool_call_id = result.tool_call_id,
       -- 标记为工具执行结果，支持悬浮文本显示
@@ -870,12 +822,10 @@ local function handle_tool_calls(session_id, tool_calls, on_chunk, on_complete)
 
     local second_request_prompt
     if #tool_results > 0 then
-      -- 如果有工具结果，将其包含在提示中
-      local tool_result_text = table.concat(tool_results, "\n\n")
-      second_request_prompt = string.format(
-        "我已经执行了你请求的工具操作，以下是工具返回的结果：\n\n%s\n\n请基于这些结果，用自然语言总结或解释，帮助用户理解。",
-        tool_result_text
-      )
+      -- 如果有工具结果，告诉AI基于工具结果生成回复，但不直接包含工具结果内容
+      -- 这样可以避免工具输出被直接打印到正文中
+      second_request_prompt =
+        "我已经执行了你请求的工具操作。请基于工具执行的结果，用自然语言总结或解释，帮助用户理解。不要直接引用工具输出的原始内容，而是提供有意义的解释和总结。"
     else
       second_request_prompt =
         "我已经执行了你请求的工具操作。请基于工具返回的结果，用自然语言总结或解释这些结果，帮助用户理解。"
@@ -951,18 +901,7 @@ local function handle_tool_calls(session_id, tool_calls, on_chunk, on_complete)
       })
     end
 
-    -- 直接打印消息历史（详细格式）
-    vim.notify("[NeoAI] 第二次请求消息数: " .. #messages, vim.log.levels.INFO)
-    for i, msg in ipairs(messages) do
-      local preview = msg.content and string.sub(msg.content, 1, 50) or "(无内容)"
-      if #preview > 50 then
-        preview = preview .. "..."
-      end
-      vim.notify(string.format("[NeoAI] 消息%d: role=%s, content=%s", i, msg.role, preview), vim.log.levels.INFO)
-    end
-
-    -- 直接打印第二次请求开始
-    vim.notify("[NeoAI] 开始第二次请求（工具结果处理）", vim.log.levels.INFO)
+    -- 移除调试信息，简化日志输出
 
     -- 创建新的pending消息用于第二次回复
     local second_pending_msg =
@@ -1083,16 +1022,24 @@ local function handle_tool_calls(session_id, tool_calls, on_chunk, on_complete)
           session.updated_at = os.time()
           M._auto_sync(session_id)
 
-          -- 直接打印第二次请求结果
-          vim.notify(
-            string.format(
-              "[NeoAI] 第二次请求结果: exit_code=%d, success=%s, content_length=%d",
-              exit_code,
-              tostring(exit_code == 0),
-              #accumulated_content
-            ),
-            vim.log.levels.INFO
-          )
+          -- 如果存在推理内容且尚未触发完成事件，触发推理完成事件
+          -- 注意：第二个请求通常不会有推理内容，但为了完整性保留检查
+          if
+            second_pending_msg.metadata
+            and second_pending_msg.metadata.has_reasoning
+            and not second_pending_msg.metadata.reasoning_finished
+          then
+            second_pending_msg.metadata.reasoning_finished = true
+            M._trigger("ai_reasoning_finished", {
+              session_id = session_id,
+              message = second_pending_msg,
+            })
+          end
+
+          -- 简化调试信息
+          if exit_code ~= 0 then
+            vim.notify(string.format("[NeoAI] 第二次请求失败: exit_code=%d", exit_code), vim.log.levels.WARN)
+          end
 
           -- 调用本地的 on_complete 回调
           local success = exit_code == 0
@@ -1476,6 +1423,27 @@ function M.request_ai_stream_with_tools(session_id, user_content, on_chunk, on_c
               session.updated_at = os.time()
               M._auto_sync(session_id)
 
+              -- 如果存在推理内容且尚未触发完成事件，触发推理完成事件
+              -- 注意：如果已经在收到常规内容时触发过，这里不再重复触发
+              if accumulated_reasoning ~= "" and (not msg.metadata or not msg.metadata.reasoning_finished) then
+                -- 确保元数据存在
+                msg.metadata = msg.metadata or {}
+                msg.metadata.reasoning_content = accumulated_reasoning
+                msg.metadata.has_reasoning = true
+                msg.metadata.reasoning_finished = true
+
+                -- 同时更新 pending_msg 的元数据
+                pending_msg.metadata = pending_msg.metadata or {}
+                pending_msg.metadata.reasoning_content = accumulated_reasoning
+                pending_msg.metadata.has_reasoning = true
+                pending_msg.metadata.reasoning_finished = true
+
+                M._trigger("ai_reasoning_finished", {
+                  session_id = session_id,
+                  message = pending_msg,
+                })
+              end
+
               -- 触发最后一次更新
               if on_chunk then
                 on_chunk(accumulated_content)
@@ -1492,17 +1460,17 @@ function M.request_ai_stream_with_tools(session_id, user_content, on_chunk, on_c
                   error_msg = "请求失败，退出码: " .. exit_code
                 end
 
-                -- 调试信息
-                vim.notify(
-                  string.format(
-                    "[NeoAI] 请求完成: exit_code=%d, success=%s, has_tool_calls=%s, content_length=%d",
-                    exit_code,
-                    tostring(success),
-                    tostring(has_tool_calls),
-                    #accumulated_content
-                  ),
-                  vim.log.levels.DEBUG
-                )
+                -- 简化调试信息
+                if not success then
+                  vim.notify(
+                    string.format(
+                      "[NeoAI] 请求失败: exit_code=%d, has_tool_calls=%s",
+                      exit_code,
+                      tostring(has_tool_calls)
+                    ),
+                    vim.log.levels.WARN
+                  )
+                end
 
                 on_complete(success, error_msg, accumulated_content)
               end
@@ -1635,13 +1603,19 @@ function M.request_ai_stream_with_tools(session_id, user_content, on_chunk, on_c
               })
             end
 
-            -- 当有常规内容且推理内容已存在时，标记推理已完成
-            if
-              accumulated_reasoning ~= ""
-              and accumulated_content ~= ""
-              and not pending_msg.metadata.reasoning_finished
-            then
+            -- 当有推理内容且尚未标记为完成时，标记推理已完成
+            -- 注意：这里立即触发完成事件，因为推理内容已经结束（当开始收到常规内容时）
+            if accumulated_reasoning ~= "" and not pending_msg.metadata.reasoning_finished then
               pending_msg.metadata.reasoning_finished = true
+              -- 同时更新会话中的消息元数据
+              for i, msg in ipairs(session.messages) do
+                if msg.id == pending_msg.id then
+                  msg.metadata = msg.metadata or {}
+                  msg.metadata.reasoning_finished = true
+                  break
+                end
+              end
+              -- 立即触发推理完成事件，关闭悬浮窗口
               M._trigger("ai_reasoning_finished", {
                 session_id = session_id,
                 message = pending_msg,

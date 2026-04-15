@@ -187,6 +187,10 @@ function M.finish_reasoning(message_id, fold_on_finish)
   state.phase = "finished"
   state.fold_state = (fold_on_finish ~= nil) and fold_on_finish or reasoning_engine.config.fold_on_finish
 
+  -- 调试信息
+  -- vim.notify(string.format("[NeoAI] finish_reasoning: msg_id=%s, phase=%s, float_win=%s",
+  --   tostring(message_id), state.phase, tostring(state.float_win)), vim.log.levels.DEBUG)
+
   -- 关闭浮动窗口
   utils.destroy_reasoning_float(reasoning_engine.states, message_id)
 
@@ -3446,6 +3450,10 @@ function M.setup(validated_config)
 
   -- AI 推理完成事件：立即关闭思考浮动窗口
   backend.on("ai_reasoning_finished", function(data)
+    -- 调试信息
+    -- vim.notify(string.format("[NeoAI] ai_reasoning_finished 事件触发: session_id=%s, msg_id=%s",
+    --   tostring(data.session_id), tostring(data.message and data.message.id)), vim.log.levels.DEBUG)
+
     if data.message and data.message.id then
       local msg_id = data.message.id
 
@@ -3479,7 +3487,8 @@ function M.setup(validated_config)
       -- 传递 fold_on_finish=false 确保推理内容展开显示
       M.finish_reasoning(msg_id, false)
 
-      M.update_display()
+      -- 使用防抖更新显示，避免频繁重绘
+      M.update_display_debounced.message()
     end
     -- 自动同步数据
     backend.debounce_sync(data.session_id)
