@@ -269,45 +269,7 @@ function M.find_message_at_line(session, buf, target_line)
   return nil
 end
 
---- 构建 API 请求的消息列表（包含系统提示和历史上下文）
--- @param session 会话对象
--- @param user_content 用户新消息内容
--- @return table 消息列表（符合 OpenAI API 格式）
-local function build_api_messages(session, user_content)
-  local messages = {}
 
-  -- 添加系统提示
-  local sys_prompt = M.llm_config and M.llm_config.system_prompt or config.defaults.llm.system_prompt
-  if sys_prompt and sys_prompt ~= "" then
-    table.insert(messages, {
-      role = "system",
-      content = sys_prompt,
-    })
-  end
-
-  -- 添加历史消息（排除最新的用户消息，因为会单独添加）
-  local max_history = M.llm_config and M.llm_config.max_history or config.defaults.background.max_history
-  local history_count = math.min(#session.messages, max_history - 1)
-  local start_idx = math.max(1, #session.messages - history_count + 1)
-
-  for i = start_idx, #session.messages do
-    local msg = session.messages[i]
-    if msg.role == "user" or msg.role == "assistant" then
-      table.insert(messages, {
-        role = msg.role,
-        content = msg.content or "",
-      })
-    end
-  end
-
-  -- 添加当前用户消息
-  table.insert(messages, {
-    role = "user",
-    content = user_content,
-  })
-
-  return messages
-end
 
 --- 使用 curl 发起 HTTPS 流式请求到大模型 API
 -- 支持 OpenAI 兼容的 API 格式，使用 SSE (Server-Sent Events) 协议
@@ -343,7 +305,7 @@ function M.request_ai_stream(session_id, user_content, on_chunk, on_complete)
   M.add_message(session_id, pending_msg)
 
   -- 构建请求体
-  local messages = build_api_messages(session, user_content)
+  local messages = utils.build_api_messages(session, user_content, M.llm_config, config)
   local request_body = vim.fn.json_encode({
     model = llm_config.model,
     messages = messages,
@@ -708,27 +670,10 @@ end
 --- 防抖同步：延迟指定时间后执行 sync_data，期间重复调用会重置计时器
 -- @param session_id 会话 ID
 -- @param delay_ms 延迟时间（毫秒），默认 500
-local debounce_sync_timer = nil
+local debounce_sync_timer = { timer = nil }
 function M.debounce_sync(session_id, delay_ms)
-  delay_ms = delay_ms or 500
-
-  -- 停止旧的计时器
-  if debounce_sync_timer then
-    debounce_sync_timer:stop()
-    if not debounce_sync_timer:is_closing() then
-      debounce_sync_timer:close()
-    end
-  end
-
-  -- 创建新的计时器
-  debounce_sync_timer = vim.loop.new_timer()
-  if debounce_sync_timer then
-    debounce_sync_timer:start(delay_ms, 0, function()
-      vim.schedule(function()
-        M.sync_data(session_id)
-      end)
-    end)
-  end
+  local debounce_func = utils.create_debounce_sync(M.sync_data, session_id, delay_ms, debounce_sync_timer)
+  debounce_func()
 end
 
 --- 导出指定会话到 JSON 文件

@@ -58,85 +58,12 @@ local reasoning_engine = {
   states = {},
 }
 
---- 获取推理显示状态
--- @param message_id 消息ID
--- @return table 状态对象
-local function get_state(message_id)
-  if not reasoning_engine.states[message_id] then
-    reasoning_engine.states[message_id] = {
-      phase = "idle",
-      float_win = nil,
-      float_buf = nil,
-      anchor_win = nil,
-      anchor_row = nil,
-      text = "",
-      fold_state = false,
-    }
-  end
-  return reasoning_engine.states[message_id]
-end
-
---- 清理指定消息的浮动窗口
--- @param message_id 消息ID
-local function destroy_float(message_id)
-  local state = reasoning_engine.states[message_id]
-  if not state then
-    return
-  end
-
-  if state.float_win and vim.api.nvim_win_is_valid(state.float_win) then
-    vim.api.nvim_win_close(state.float_win, true)
-  end
-  state.float_win = nil
-  state.float_buf = nil
-end
-
---- 创建或更新浮动窗口内容
--- @param state 推理状态对象
-local function refresh_float(state)
-  if not state.float_win or not vim.api.nvim_win_is_valid(state.float_win) then
-    return
-  end
-
-  local buf = state.float_buf
-  if not buf or not vim.api.nvim_buf_is_valid(buf) then
-    return
-  end
-
-  -- 格式化文本为行数组（自动换行）
-  local width = reasoning_engine.config.max_width - 2
-  local lines = {}
-  for line in state.text:gmatch("[^\r\n]+") do
-    local cleaned = utils.sanitize_line(line)
-    local wrapped = utils.wrap_text(cleaned, width)
-    for _, wl in ipairs(wrapped) do
-      table.insert(lines, wl)
-    end
-  end
-
-  -- 保持所有内容在缓冲区，不截断（让窗口高度限制+自动滚动来处理）
-  -- 窗口创建时已设置 max_height，超出部分会自动隐藏并可通过滚动查看
-
-  if #lines == 0 then
-    table.insert(lines, "思考中...")
-  end
-
-  -- 更新缓冲区内容
-  vim.api.nvim_set_option_value("modifiable", true, { buf = buf })
-  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
-  vim.api.nvim_set_option_value("modifiable", false, { buf = buf })
-
-  -- 滚动到底部
-  local line_count = vim.api.nvim_buf_line_count(buf)
-  pcall(vim.api.nvim_win_set_cursor, state.float_win, { line_count, 0 })
-end
-
 --- 阶段 1：开启推理浮动窗口
 -- @param message_id 消息ID
 -- @param anchor_win 锚点窗口（通常是主窗口）
 -- @param anchor_row 锚点行（相对于窗口的行号）
 function M.start_reasoning(message_id, anchor_win, anchor_row)
-  local state = get_state(message_id)
+  local state = utils.get_reasoning_state(reasoning_engine.states, message_id)
   state.phase = "thinking"
   state.text = ""
   state.anchor_win = (anchor_win and utils.is_win_valid(anchor_win)) and anchor_win or M.windows.main
@@ -148,7 +75,7 @@ function M.start_reasoning(message_id, anchor_win, anchor_row)
   end
 
   -- 销毁旧浮动窗口
-  destroy_float(message_id)
+  utils.destroy_reasoning_float(reasoning_engine.states, message_id)
 
   -- 创建新缓冲区
   local buf = vim.api.nvim_create_buf(false, true)
@@ -208,27 +135,45 @@ function M.start_reasoning(message_id, anchor_win, anchor_row)
   M._reasoning_float_buffers[message_id] = buf
 end
 
---- 阶段 2：更新推理文本（实时追加）
+--- 阶段 2：更新推理文本（实时更新）
 -- @param message_id 消息ID
--- @param text 新增的推理文本（追加到现有内容）
+-- @param text 完整的推理文本（替换现有内容）
 function M.update_reasoning(message_id, text)
-  local state = get_state(message_id)
+  local state = utils.get_reasoning_state(reasoning_engine.states, message_id)
   if state.phase ~= "thinking" then
     return
   end
 
   if text and text ~= "" then
-    state.text = state.text .. text
+    -- 检查新文本是否只是现有文本的扩展（避免重复）
+    local current_text = state.text or ""
+
+    -- 如果文本完全相同，不需要更新
+    if text == current_text then
+      return
+    end
+
+    -- 检查是否是扩展（新文本以现有文本开头）
+    if text:sub(1, #current_text) == current_text then
+      -- 新文本是现有文本的扩展，更新为完整的新文本
+      state.text = text
+    elseif current_text:sub(1, #text) == text then
+      -- 新文本是现有文本的前缀（可能后端发送了旧版本），保持现有文本
+      -- 不更新
+    else
+      -- 完全不同的文本，直接替换
+      state.text = text
+    end
   end
 
-  refresh_float(state)
+  utils.refresh_reasoning_float(state, reasoning_engine.config)
 end
 
 --- 阶段 3：完成推理，关闭浮动窗口，变为折叠文本
 -- @param message_id 消息ID
 -- @param fold_on_finish 是否默认折叠（可选，默认使用配置）
 function M.finish_reasoning(message_id, fold_on_finish)
-  local state = get_state(message_id)
+  local state = utils.get_reasoning_state(reasoning_engine.states, message_id)
   if state.phase ~= "thinking" then
     return
   end
@@ -237,7 +182,7 @@ function M.finish_reasoning(message_id, fold_on_finish)
   state.fold_state = (fold_on_finish ~= nil) and fold_on_finish or reasoning_engine.config.fold_on_finish
 
   -- 关闭浮动窗口
-  destroy_float(message_id)
+  utils.destroy_reasoning_float(reasoning_engine.states, message_id)
 
   -- 同步到旧的兼容表
   M._reasoning_float_wins[message_id] = nil
@@ -251,9 +196,15 @@ end
 -- @param max_width 最大行宽
 -- @return table 显示行数组
 function M.get_reasoning_display_lines(message_id, max_width)
+  -- 尝试从引擎状态获取
   local state = reasoning_engine.states[message_id]
+
+  -- 如果状态不存在或文本为空，尝试从当前会话的消息中恢复
   if not state or state.text == "" then
-    return {}
+    state = M._restore_reasoning_state_from_message(message_id)
+    if not state or state.text == "" then
+      return {}
+    end
   end
 
   local total_lines = 0
@@ -295,10 +246,59 @@ function M.get_reasoning_display_lines(message_id, max_width)
   return result
 end
 
+--- 从消息元数据恢复推理状态
+-- @param message_id 消息ID
+-- @return table|nil 恢复的状态对象
+function M._restore_reasoning_state_from_message(message_id)
+  local session = backend.current_session and backend.sessions[backend.current_session]
+  if not session or not session.messages then
+    return nil
+  end
+
+  -- 查找对应的消息
+  local target_msg = nil
+  for _, msg in ipairs(session.messages) do
+    if tostring(msg.id) == tostring(message_id) then
+      target_msg = msg
+      break
+    end
+  end
+
+  if not target_msg then
+    return nil
+  end
+
+  -- 检查是否有推理内容
+  if not target_msg.metadata or not target_msg.metadata.has_reasoning or not target_msg.metadata.reasoning_content then
+    return nil
+  end
+
+  -- 创建或更新状态
+  local state = utils.get_reasoning_state(reasoning_engine.states, message_id)
+  state.text = target_msg.metadata.reasoning_content or ""
+
+  -- 判断阶段：如果消息已完成（非 pending），则为 finished 阶段
+  if target_msg.pending then
+    state.phase = "thinking"
+    state.fold_state = false -- 思考中默认展开
+  else
+    state.phase = "finished"
+    -- 从折叠状态表恢复折叠状态
+    state.fold_state = M._reasoning_fold_state[message_id] or M.reasoning_config.fold_on_finish
+  end
+
+  return state
+end
+
 --- 切换推理内容的折叠状态
 -- @param message_id 消息ID
 function M.toggle_reasoning_fold(message_id)
+  -- 尝试恢复状态
   local state = reasoning_engine.states[message_id]
+  if not state then
+    state = M._restore_reasoning_state_from_message(message_id)
+  end
+
   if state and state.phase == "finished" then
     state.fold_state = not state.fold_state
     M._reasoning_fold_state[message_id] = state.fold_state
@@ -340,7 +340,7 @@ end
 --- 关闭指定消息的推理浮动窗口（兼容旧接口）
 -- @param message_id 消息ID
 function M.close_reasoning_float(message_id)
-  destroy_float(message_id)
+  utils.destroy_reasoning_float(reasoning_engine.states, message_id)
   M._reasoning_float_wins[message_id] = nil
   M._reasoning_float_buffers[message_id] = nil
 end
@@ -352,9 +352,9 @@ end
 -- @param anchor_row 锚点行
 -- @return number 浮动窗口ID
 function M.create_reasoning_float_window(message_id, reasoning_text, anchor_win, anchor_row)
-  local state = get_state(message_id)
+  local state = utils.get_reasoning_state(reasoning_engine.states, message_id)
   if state.float_win and vim.api.nvim_win_is_valid(state.float_win) then
-    destroy_float(message_id)
+    utils.destroy_reasoning_float(reasoning_engine.states, message_id)
   end
 
   state.phase = "thinking"
@@ -1403,19 +1403,33 @@ function M._create_reasoning_float_windows()
       local state = reasoning_engine.states[msg.id]
       local engine_phase = state and state.phase or "idle"
 
+      -- 如果状态不存在，尝试从消息元数据恢复
+      if not state then
+        state = M._restore_reasoning_state_from_message(msg.id)
+        if state then
+          engine_phase = state.phase
+        end
+      end
+
       if engine_phase == "thinking" then
-        -- 思考中：使用引擎更新浮动窗口
-        M.update_reasoning(msg.id, reasoning_text)
+        -- 思考中：检查是否需要更新浮动窗口
+        -- 注意：这里不调用 update_reasoning，因为实时更新由 ai_reasoning_update 事件处理
+        -- 我们只需要确保浮动窗口存在
+        if not state.float_win or not vim.api.nvim_win_is_valid(state.float_win) then
+          -- 浮动窗口不存在，重新创建
+          M.start_reasoning(msg.id, M.windows.main, current_line)
+          M.update_reasoning(msg.id, reasoning_text)
+        end
       elseif engine_phase == "finished" then
         -- 思考已完成（引擎状态优先）：确保浮动窗口已关闭
         if state and (state.float_win or state.float_buf) then
-          destroy_float(msg.id)
+          utils.destroy_reasoning_float(reasoning_engine.states, msg.id)
           M._reasoning_float_wins[msg.id] = nil
           M._reasoning_float_buffers[msg.id] = nil
         end
       elseif is_pending and reasoning_text and reasoning_text ~= "" then
         -- 引擎状态为 idle 但消息仍在 pending：首次检测到推理，启动引擎
-        get_state(msg.id)
+        utils.get_reasoning_state(reasoning_engine.states, msg.id)
         reasoning_engine.states[msg.id].phase = "thinking"
         reasoning_engine.states[msg.id].text = reasoning_text
         M.start_reasoning(msg.id, M.windows.main, current_line)
@@ -1423,11 +1437,11 @@ function M._create_reasoning_float_windows()
       elseif not is_pending then
         -- 消息已完成：确保引擎处于 finished 状态
         if not state or state.phase ~= "finished" then
-          get_state(msg.id)
+          utils.get_reasoning_state(reasoning_engine.states, msg.id)
           reasoning_engine.states[msg.id].phase = "finished"
           reasoning_engine.states[msg.id].text = reasoning_text
           reasoning_engine.states[msg.id].fold_state = M._reasoning_fold_state[msg.id] or false
-          destroy_float(msg.id)
+          utils.destroy_reasoning_float(reasoning_engine.states, msg.id)
           M._reasoning_float_wins[msg.id] = nil
           M._reasoning_float_buffers[msg.id] = nil
         end
@@ -1450,47 +1464,14 @@ end
 -- @param message_id 消息ID（可选，不提供则清理所有）
 function M.cleanup_reason_state(message_id)
   if message_id then
-    destroy_float(message_id)
+    utils.destroy_reasoning_float(reasoning_engine.states, message_id)
     reasoning_engine.states[message_id] = nil
   else
     for msg_id, _ in pairs(reasoning_engine.states) do
-      destroy_float(msg_id)
+      utils.destroy_reasoning_float(reasoning_engine.states, msg_id)
     end
     reasoning_engine.states = {}
   end
-end
-
---- 构建推理内容显示行（内部辅助函数，委托给新引擎）
--- 思考中时使用浮动窗口，思考完成后变为折叠文本
--- @param reasoning_text 推理内容字符串
--- @param max_width 最大宽度
--- @param is_complete 思考是否已完成
--- @param message_id 消息ID（用于跟踪折叠状态）
--- @return table 推理内容行数组
-local function build_reasoning_lines(reasoning_text, max_width, is_complete, message_id)
-  -- 同步文本到引擎状态
-  local state = get_state(message_id)
-
-  if is_complete and (state.phase == "thinking" or state.phase == "idle") then
-    -- 思考完成（或从持久化状态恢复）：切换到 finished 阶段
-    state.phase = "finished"
-    state.fold_state = M._reasoning_fold_state[message_id] or reasoning_engine.config.fold_on_finish
-    state.text = reasoning_text or ""
-    destroy_float(message_id)
-    M._reasoning_float_wins[message_id] = nil
-    M._reasoning_float_buffers[message_id] = nil
-    M._reasoning_fold_state[message_id] = state.fold_state
-  elseif not is_complete and state.phase == "idle" then
-    -- 首次检测到推理：开始 thinking 阶段
-    state.phase = "thinking"
-    state.text = reasoning_text or ""
-  elseif not is_complete then
-    -- 更新推理文本
-    state.text = reasoning_text or ""
-  end
-
-  -- 委托给引擎生成显示行
-  return M.get_reasoning_display_lines(message_id, max_width)
 end
 
 --- 构建聊天内容（内部辅助函数）
@@ -1540,8 +1521,7 @@ function M._build_chat_content()
       then
         -- 判断推理是否完成：优先使用 reasoning_finished 标记（模型开始输出正文时设置）
         local is_complete = msg.metadata.reasoning_finished or not msg.pending
-        local reasoning_display_lines =
-          build_reasoning_lines(msg.metadata.reasoning_content, max_width, is_complete, msg.id)
+        local reasoning_display_lines = M.get_reasoning_display_lines(msg.id, max_width)
         for _, rline in ipairs(reasoning_display_lines) do
           table.insert(lines, rline)
         end
@@ -1617,29 +1597,6 @@ end
 
 -- ── 树视图管理 ─────────────────────────────────────────────────────────────
 
---- 将消息按对话轮次分组（仅用于树视图）
--- 将扁平的消息列表按"用户消息 + 助手回复"为一组进行聚合
--- 便于在树视图中以对话轮次为单位展示
--- @param messages 消息数组
--- @return table 分组后的对话轮次表
-local function group_messages_into_turns(messages)
-  local turns = {}
-  local current = nil
-
-  for i, msg in ipairs(messages) do
-    if msg.role == "user" then
-      current = { user_msg = msg, assistant_msg = nil, index = i }
-      table.insert(turns, current)
-    elseif msg.role == "assistant" and current and not current.assistant_msg then
-      current.assistant_msg = msg
-    else
-      table.insert(turns, { user_msg = msg, assistant_msg = nil, index = i })
-    end
-  end
-
-  return turns
-end
-
 --- 渲染会话树（文件树样式，合并共享历史）
 -- 在树视图中展示所有会话及其消息预览，支持点击切换会话
 function M.render_session_tree()
@@ -1657,7 +1614,7 @@ end
 -- @param tree_prefix 树形缩进前缀
 -- @param is_last 是否为最后一个兄弟节点
 function M._render_session_tree_recursive(lines, session_id, session, tree_prefix, is_last)
-  local turns = group_messages_into_turns(session.messages or {})
+  local turns = utils.group_messages_into_turns(session.messages or {})
   if #turns == 0 then
     local empty_line = tree_prefix .. "└─ (空会话)"
     table.insert(lines, empty_line)
@@ -2123,7 +2080,7 @@ function M._setup_editability(_, session)
     then
       -- 判断推理是否完成：优先使用 reasoning_finished 标记
       local is_complete = msg.metadata.reasoning_finished or not msg.pending
-      local reasoning_display_lines = build_reasoning_lines(msg.metadata.reasoning_content, 60, is_complete, msg.id)
+      local reasoning_display_lines = M.get_reasoning_display_lines(msg.id, 60)
       current_line = current_line + #reasoning_display_lines
     end
 
@@ -2149,25 +2106,6 @@ function M._setup_editability(_, session)
 end
 
 -- ── 会话管理 ───────────────────────────────────────────────────────────────
-
---- 确保存在活跃会话
--- @return boolean 是否成功
-local function ensure_active_session()
-  if backend.current_session and backend.sessions[backend.current_session] then
-    return true
-  end
-
-  if #backend.sessions == 0 then
-    backend.new_session()
-  else
-    for id, _ in pairs(backend.sessions) do
-      backend.current_session = id
-      break
-    end
-  end
-
-  return true
-end
 
 --- 选择会话后打开聊天窗口
 function M.open_chat_after_tree_selection()
@@ -2260,7 +2198,7 @@ end
 
 --- 打开浮窗模式
 function M.open_float()
-  ensure_active_session()
+  utils.ensure_active_session(backend)
 
   if M.should_show_tree() then
     if not utils.is_buf_valid(M.tree_buffers.main) then
@@ -2324,7 +2262,7 @@ end
 
 --- 打开分割窗口模式
 function M.open_split()
-  ensure_active_session()
+  utils.ensure_active_session(backend)
 
   if M.should_show_tree() then
     if not utils.is_buf_valid(M.tree_buffers.main) then
@@ -2392,7 +2330,7 @@ end
 
 --- 打开标签页模式
 function M.open_tab()
-  ensure_active_session()
+  utils.ensure_active_session(backend)
 
   if M.should_show_tree() then
     -- 先创建主缓冲区（不打开窗口）
@@ -3112,7 +3050,10 @@ function M.setup(user_config)
         M.update_reasoning(msg_id, reasoning_text)
       end
 
-      M.update_display()
+      -- 注意：这里不需要调用 M.update_display()，因为：
+      -- 1. update_reasoning 已经更新了浮动窗口内容
+      -- 2. 聊天界面的推理标题行不需要实时更新（只在思考完成时更新）
+      -- 3. 频繁调用 update_display 会导致整个界面重绘，影响性能
 
       -- 滚动浮动窗口到底部
       vim.defer_fn(function()
@@ -3149,8 +3090,17 @@ function M.setup(user_config)
   vim.api.nvim_create_autocmd("VimResized", {
     callback = function()
       if M.is_open and utils.is_buf_valid(M.buffers.main) then
-        -- 清理所有推理状态，下次更新时会重新计算宽度
-        M.cleanup_reason_state()
+        -- 只关闭浮动窗口，但保留推理状态（包括折叠状态）
+        for msg_id, state in pairs(reasoning_engine.states) do
+          utils.destroy_reasoning_float(reasoning_engine.states, msg_id)
+          M._reasoning_float_wins[msg_id] = nil
+          M._reasoning_float_buffers[msg_id] = nil
+          -- 确保状态中的浮动窗口引用也被清理
+          if state then
+            state.float_win = nil
+            state.float_buf = nil
+          end
+        end
       end
     end,
   })

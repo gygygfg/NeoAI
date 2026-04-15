@@ -496,4 +496,270 @@ function M.count_wrapped_lines(content, max_width)
   return #lines
 end
 
+-- ── 会话消息工具 ──────────────────────────────────────────────────────────
+
+--- 构建 API 请求的消息列表（包含系统提示和历史上下文）
+-- @param session 会话对象
+-- @param user_content 用户新消息内容
+-- @param llm_config LLM配置
+-- @param config 默认配置
+-- @return table 消息列表（符合 OpenAI API 格式）
+function M.build_api_messages(session, user_content, llm_config, config)
+  local messages = {}
+
+  -- 添加系统提示
+  local sys_prompt = llm_config and llm_config.system_prompt or config.defaults.llm.system_prompt
+  if sys_prompt and sys_prompt ~= "" then
+    table.insert(messages, {
+      role = "system",
+      content = sys_prompt,
+    })
+  end
+
+  -- 添加历史消息（排除最新的用户消息，因为会单独添加）
+  local max_history = llm_config and llm_config.max_history or config.defaults.background.max_history
+  local history_count = math.min(#session.messages, max_history - 1)
+  local start_idx = math.max(1, #session.messages - history_count + 1)
+
+  for i = start_idx, #session.messages do
+    local msg = session.messages[i]
+    if msg.role == "user" or msg.role == "assistant" then
+      table.insert(messages, {
+        role = msg.role,
+        content = msg.content or "",
+      })
+    end
+  end
+
+  -- 添加当前用户消息
+  table.insert(messages, {
+    role = "user",
+    content = user_content,
+  })
+
+  return messages
+end
+
+--- 将消息按对话轮次分组（仅用于树视图）
+-- 将扁平的消息列表按"用户消息 + 助手回复"为一组进行聚合
+-- 便于在树视图中以对话轮次为单位展示
+-- @param messages 消息数组
+-- @return table 分组后的对话轮次表
+function M.group_messages_into_turns(messages)
+  local turns = {}
+  local current = nil
+
+  for i, msg in ipairs(messages) do
+    if msg.role == "user" then
+      current = { user_msg = msg, assistant_msg = nil, index = i }
+      table.insert(turns, current)
+    elseif msg.role == "assistant" and current and not current.assistant_msg then
+      current.assistant_msg = msg
+    else
+      table.insert(turns, { user_msg = msg, assistant_msg = nil, index = i })
+    end
+  end
+
+  return turns
+end
+
+-- ── 推理显示引擎工具 ──────────────────────────────────────────────────────
+
+--- 获取推理显示状态
+-- @param states 状态表
+-- @param message_id 消息ID
+-- @return table 状态对象
+function M.get_reasoning_state(states, message_id)
+  if not states[message_id] then
+    states[message_id] = {
+      phase = "idle",
+      float_win = nil,
+      float_buf = nil,
+      anchor_win = nil,
+      anchor_row = nil,
+      text = "",
+      fold_state = false,
+    }
+  end
+  return states[message_id]
+end
+
+--- 清理指定消息的浮动窗口
+-- @param states 状态表
+-- @param message_id 消息ID
+function M.destroy_reasoning_float(states, message_id)
+  local state = states[message_id]
+  if not state then
+    return
+  end
+
+  if state.float_win and vim.api.nvim_win_is_valid(state.float_win) then
+    vim.api.nvim_win_close(state.float_win, true)
+  end
+  state.float_win = nil
+  state.float_buf = nil
+end
+
+--- 创建或更新浮动窗口内容
+-- @param state 推理状态对象
+-- @param config 推理配置
+function M.refresh_reasoning_float(state, config)
+  if not state.float_win or not vim.api.nvim_win_is_valid(state.float_win) then
+    return
+  end
+
+  local buf = state.float_buf
+  if not buf or not vim.api.nvim_buf_is_valid(buf) then
+    return
+  end
+
+  -- 缓存上一次的文本，用于比较
+  local last_text = state._last_float_text or ""
+  local current_text = state.text or ""
+
+  -- 如果文本没有变化，不需要更新
+  if last_text == current_text then
+    return
+  end
+
+  -- 更新缓存
+  state._last_float_text = current_text
+
+  -- 格式化文本为行数组（自动换行）
+  local width = config.max_width - 2
+  local lines = {}
+  for line in current_text:gmatch("[^\r\n]+") do
+    local cleaned = M.sanitize_line(line)
+    local wrapped = M.wrap_text(cleaned, width)
+    for _, wl in ipairs(wrapped) do
+      table.insert(lines, wl)
+    end
+  end
+
+  if #lines == 0 then
+    table.insert(lines, "思考中...")
+  end
+
+  -- 更新缓冲区内容
+  vim.api.nvim_set_option_value("modifiable", true, { buf = buf })
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+  vim.api.nvim_set_option_value("modifiable", false, { buf = buf })
+
+  -- 滚动到底部
+  local line_count = vim.api.nvim_buf_line_count(buf)
+  pcall(vim.api.nvim_win_set_cursor, state.float_win, { line_count, 0 })
+end
+
+-- ── 会话管理工具 ──────────────────────────────────────────────────────────
+
+--- 确保存在活跃会话
+-- @param backend 后端模块
+-- @return boolean 是否成功
+function M.ensure_active_session(backend)
+  if backend.current_session and backend.sessions[backend.current_session] then
+    return true
+  end
+
+  if #backend.sessions == 0 then
+    backend.new_session()
+  else
+    for id, _ in pairs(backend.sessions) do
+      backend.current_session = id
+      break
+    end
+  end
+
+  return true
+end
+
+--- 构建推理内容显示行
+-- 思考中时使用浮动窗口，思考完成后变为折叠文本
+-- @param reasoning_text 推理内容字符串
+-- @param max_width 最大宽度
+-- @param is_complete 思考是否已完成
+-- @param message_id 消息ID（用于跟踪折叠状态）
+-- @param states 推理状态表
+-- @param reasoning_engine_config 推理引擎配置
+-- @param reasoning_fold_state 折叠状态表
+-- @param reasoning_float_wins 浮动窗口表
+-- @param reasoning_float_buffers 浮动缓冲区表
+-- @return table 推理内容行数组
+function M.build_reasoning_lines(
+  reasoning_text,
+  max_width,
+  is_complete,
+  message_id,
+  states,
+  reasoning_engine_config,
+  reasoning_fold_state,
+  reasoning_float_wins,
+  reasoning_float_buffers
+)
+  -- 同步文本到引擎状态
+  local state = M.get_reasoning_state(states, message_id)
+
+  if is_complete and (state.phase == "thinking" or state.phase == "idle") then
+    -- 思考完成（或从持久化状态恢复）：切换到 finished 阶段
+    state.phase = "finished"
+    state.fold_state = reasoning_fold_state[message_id] or reasoning_engine_config.fold_on_finish
+    state.text = reasoning_text or ""
+    M.destroy_reasoning_float(states, message_id)
+    reasoning_float_wins[message_id] = nil
+    reasoning_float_buffers[message_id] = nil
+    reasoning_fold_state[message_id] = state.fold_state
+  elseif not is_complete and state.phase == "idle" then
+    -- 首次检测到推理：开始 thinking 阶段
+    state.phase = "thinking"
+    state.text = reasoning_text or ""
+  elseif not is_complete then
+    -- 更新推理文本
+    state.text = reasoning_text or ""
+  end
+
+  -- 委托给引擎生成显示行
+  -- 注意：这里需要调用 ui 模块的 get_reasoning_display_lines 函数
+  -- 由于循环依赖，这个函数需要在 ui.lua 中实现
+  return {}
+end
+
+--- 防抖同步函数
+-- @param sync_func 同步函数
+-- @param session_id 会话 ID
+-- @param delay_ms 延迟时间（毫秒），默认 500
+-- @param timer_ref 定时器引用表
+-- @return function 防抖同步函数
+function M.create_debounce_sync(sync_func, session_id, delay_ms, timer_ref)
+  delay_ms = delay_ms or 500
+
+  return function()
+    -- 停止旧的计时器
+    if timer_ref.timer then
+      timer_ref.timer:stop()
+      if not timer_ref.timer:is_closing() then
+        timer_ref.timer:close()
+      end
+    end
+
+    -- 创建新的计时器
+    timer_ref.timer = vim.loop.new_timer()
+    if timer_ref.timer then
+      timer_ref.timer:start(delay_ms, 0, function()
+        vim.schedule(function()
+          sync_func(session_id)
+        end)
+      end)
+    end
+  end
+end
+
+--- 创建自动同步函数
+-- @param export_func 导出函数
+-- @param config_file 配置文件路径
+-- @return function 自动同步函数
+function M.create_auto_sync(export_func, config_file)
+  return function(session_id)
+    export_func(session_id, config_file, true)
+  end
+end
+
 return M
