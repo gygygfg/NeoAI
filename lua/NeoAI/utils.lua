@@ -23,10 +23,10 @@ function M.wrap_text(text, max_width)
   local wrapped = {}
   local current = ""
   local current_width = 0
-  
+
   for ch in text:gmatch("[%z\1-\127\194-\244][\128-\191]*") do
     local ch_width = M.display_width(ch)
-    
+
     if current_width + ch_width <= max_width or current == "" then
       current = current .. ch
       current_width = current_width + ch_width
@@ -36,11 +36,11 @@ function M.wrap_text(text, max_width)
       current_width = ch_width
     end
   end
-  
+
   if current ~= "" then
     table.insert(wrapped, current)
   end
-  
+
   return #wrapped > 0 and wrapped or { text }
 end
 
@@ -315,11 +315,24 @@ function M.calculate_text_width(target_win)
   local text_width = win_width
 
   if target_win then
+    -- 检查是否有边框（边框占用左右各1列）
+    -- 注意：只有浮动窗口（relative="editor"或relative="win"）才有边框配置
+    local win_config = vim.api.nvim_win_get_config(target_win)
+    if win_config and win_config.relative and win_config.relative ~= "" then
+      -- 这是浮动窗口，检查边框
+      if win_config.border and win_config.border ~= "none" then
+        -- 边框占用左右各1列，共2列
+        text_width = text_width - 2
+      end
+    end
+    -- 普通分割窗口没有边框配置，不需要减去边框宽度
+
     -- 行号列宽度
-    if
-      vim.api.nvim_get_option_value("number", { win = target_win })
-      or vim.api.nvim_get_option_value("relativenumber", { win = target_win })
-    then
+    -- 只有当行号确实显示时才减去行号列宽度
+    local number_enabled = vim.api.nvim_get_option_value("number", { win = target_win })
+    local relativenumber_enabled = vim.api.nvim_get_option_value("relativenumber", { win = target_win })
+
+    if number_enabled or relativenumber_enabled then
       local nw = vim.api.nvim_get_option_value("numberwidth", { win = target_win })
       text_width = text_width - (tonumber(nw) or 4)
     end
@@ -544,7 +557,7 @@ function M.build_api_messages(session, user_content, llm_config, config)
   local messages = {}
 
   -- 添加系统提示
-  local sys_prompt = llm_config and llm_config.system_prompt 
+  local sys_prompt = llm_config and llm_config.system_prompt
   if not sys_prompt and config then
     -- 处理两种配置类型：config 模块或验证后的配置表
     if config.defaults then

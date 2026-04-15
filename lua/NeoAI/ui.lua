@@ -228,16 +228,20 @@ function M.get_reasoning_display_lines(message_id, max_width)
     if state.fold_state then
       -- 折叠状态：使用折叠标记包裹内容
       table.insert(result, string.format("  ▶ [思考完成，共 %d 行] {{{", total_lines))
+      -- 动态计算推理内容缩进
+      local reasoning_indent = math.min(6, math.floor(max_width * 0.15))
       for line in state.text:gmatch("[^\r\n]+") do
-        local cleaned = utils.truncate_content(utils.sanitize_line(line), max_width - 6)
+        local cleaned = utils.truncate_content(utils.sanitize_line(line), max_width - reasoning_indent)
         table.insert(result, "    " .. cleaned)
       end
       table.insert(result, "    }}}")
     else
       -- 展开状态：显示标题和全部内容
       table.insert(result, string.format("  ▼ [思考完成，共 %d 行]", total_lines))
+      -- 动态计算推理内容缩进
+      local reasoning_indent = math.min(6, math.floor(max_width * 0.15))
       for line in state.text:gmatch("[^\r\n]+") do
-        local cleaned = utils.truncate_content(utils.sanitize_line(line), max_width - 6)
+        local cleaned = utils.truncate_content(utils.sanitize_line(line), max_width - reasoning_indent)
         table.insert(result, "    " .. cleaned)
       end
     end
@@ -1132,9 +1136,15 @@ function M.render_chat_interface()
   M._last_buffer_line_count = vim.api.nvim_buf_line_count(buf)
 
   -- 调整窗口大小
-  local max_width = utils.calculate_text_width(M.windows.main)
-  utils.adjust_window_size(M.windows, M.current_mode, max_width, #lines, M.WINDOW_LIMITS)
-  utils.set_window_wrap(M.windows)
+  -- 使用延迟确保窗口选项（如行号设置）已生效
+  vim.defer_fn(function()
+    if not utils.is_win_valid(M.windows.main) then
+      return
+    end
+    local max_width = utils.calculate_text_width(M.windows.main)
+    utils.adjust_window_size(M.windows, M.current_mode, max_width, #lines, M.WINDOW_LIMITS)
+    utils.set_window_wrap(M.windows)
+  end, 10)
 
   -- 恢复光标或滚动到底部
   if utils.is_win_valid(M.windows.main) then
@@ -1236,7 +1246,9 @@ function M._create_reasoning_float_windows()
 
     -- 跳过消息内容行
     local max_width = utils.calculate_text_width(M.windows.main)
-    local content_lines = utils.wrap_message_content(msg.content or "", max_width - 4)
+    -- 动态计算缩进：窗口较宽时使用缩进，较窄时减少缩进
+    local indent = math.min(4, math.floor(max_width * 0.1))
+    local content_lines = utils.wrap_message_content(msg.content or "", max_width - indent)
     current_line = current_line + #content_lines
 
     -- 跳过消息间的空行
@@ -1264,6 +1276,21 @@ end
 function M._build_chat_content()
   local lines = {}
   local max_width = utils.calculate_text_width(M.windows.main)
+
+  -- 调试信息：输出宽度计算值
+  if M.config and M.config.debug then
+    local win_width = vim.api.nvim_win_get_width(M.windows.main)
+    vim.notify(
+      string.format(
+        "[NeoAI调试] 窗口宽度: %d, 文本可用宽度: %d, 缩进: %d",
+        win_width,
+        max_width,
+        math.min(4, math.floor(max_width * 0.1))
+      ),
+      vim.log.levels.DEBUG
+    )
+  end
+
   local separator_positions = {}
   local session = backend.current_session and backend.sessions[backend.current_session]
 
@@ -1313,7 +1340,9 @@ function M._build_chat_content()
       end
 
       -- 添加消息内容（自动换行）
-      local content_lines = utils.wrap_message_content(msg.content or "", max_width - 4)
+      -- 动态计算缩进：窗口较宽时使用缩进，较窄时减少缩进
+      local indent = math.min(4, math.floor(max_width * 0.1))
+      local content_lines = utils.wrap_message_content(msg.content or "", max_width - indent)
       for _, line in ipairs(content_lines) do
         table.insert(lines, line)
       end
@@ -1870,7 +1899,9 @@ function M._setup_editability(_, session)
     end
 
     -- 获取当前消息的内容行数（自动换行后的行数）
-    local content_lines = utils.wrap_message_content(msg.content or "", max_width - 4)
+    -- 动态计算缩进：窗口较宽时使用缩进，较窄时减少缩进
+    local indent = math.min(4, math.floor(max_width * 0.1))
+    local content_lines = utils.wrap_message_content(msg.content or "", max_width - indent)
 
     -- 只映射内容行（不映射标题行），这些行可以被用户编辑
     for j, _ in ipairs(content_lines) do
@@ -1938,14 +1969,20 @@ function M.open_chat_after_tree_selection()
 
   if mode == M.ui_modes.FLOAT then
     -- 浮动模式
+    -- 先关闭 tree 浮动窗口（如果存在）
+    if utils.is_win_valid(M.windows.tree) then
+      vim.api.nvim_win_close(M.windows.tree, true)
+      M.windows.tree = nil
+    end
+
+    -- 重新创建 chat 浮动窗口
+    local opts = utils.get_window_strategy(M.ui_modes.FLOAT, M.config, M.WINDOW_LIMITS)()
+    M.setup_windows(opts)
+    success = true
+
+    -- 设置当前窗口焦点
     if utils.is_win_valid(M.windows.main) then
-      success = switch_to_chat_interface(M.windows.main, false)
       vim.api.nvim_set_current_win(M.windows.main)
-    else
-      -- 窗口不存在，重新创建
-      local opts = utils.get_window_strategy(M.ui_modes.SPLIT, M.config, M.WINDOW_LIMITS)()
-      M.setup_windows(opts)
-      success = true
     end
   elseif mode == M.ui_modes.SPLIT then
     -- 分割模式
@@ -2080,6 +2117,11 @@ function M.open_split()
 
   vim.cmd("belowright vsplit")
   M.windows.main = vim.api.nvim_get_current_win()
+
+  -- 先设置窗口宽度，再设置缓冲区和渲染
+  local opts = utils.get_window_strategy(M.ui_modes.SPLIT, M.config, M.WINDOW_LIMITS)()
+  vim.api.nvim_win_set_width(M.windows.main, opts.width)
+
   vim.api.nvim_win_set_buf(M.windows.main, M.buffers.main)
   -- 禁用行号
   vim.api.nvim_set_option_value("number", false, { win = M.windows.main })
@@ -2089,15 +2131,12 @@ function M.open_split()
   M.is_open = true
   M.current_mode = M.ui_modes.SPLIT
 
-  -- 延迟设置窗口宽度，确保渲染完成
+  -- 延迟重新渲染以确保所有设置生效
   vim.defer_fn(function()
     if utils.is_win_valid(M.windows.main) then
-      local opts = utils.get_window_strategy(M.ui_modes.SPLIT, M.config, M.WINDOW_LIMITS)()
-      vim.api.nvim_win_set_width(M.windows.main, opts.width)
-      -- 重新渲染以确保宽度正确
       M.update_display()
     end
-  end, 100)
+  end, 50)
 
   -- 非树模式：定位光标到输入行
   vim.defer_fn(function()
@@ -2565,7 +2604,9 @@ function M.setup_keymaps()
           else
             -- 跳过内容和分隔行
             local max_width = utils.calculate_text_width(M.windows.main)
-            local content_lines = utils.wrap_message_content(msg.content or "", max_width - 4)
+            -- 动态计算缩进：窗口较宽时使用缩进，较窄时减少缩进
+            local indent = math.min(4, math.floor(max_width * 0.1))
+            local content_lines = utils.wrap_message_content(msg.content or "", max_width - indent)
             current_line = current_line + #content_lines
           end
           -- 消息间的空行
