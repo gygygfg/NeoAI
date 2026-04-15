@@ -193,13 +193,6 @@ function M.is_buf_valid(buf)
   return type(buf) == "number" and buf > 0 and vim.api.nvim_buf_is_valid(buf)
 end
 
---- 安全地调用窗口操作（捕获可能的异常）
--- @param fn 要执行的函数
--- @return boolean 是否成功
-function M.safe_win_call(fn)
-  return pcall(fn)
-end
-
 -- ── 防抖工具 ───────────────────────────────────────────────────────────────
 
 --- 生成唯一的防抖定时器名称
@@ -884,7 +877,7 @@ function M.adjust_window_size(windows, current_mode, content_width, content_heig
     local col = math.max(0, math.floor((editor_w - w) / 2))
     row, col, w, h = M.validate_window_position(row, col, w, h)
 
-    M.safe_win_call(function()
+    pcall(function()
       vim.api.nvim_win_set_config(windows.main, {
         relative = "editor",
         row = row,
@@ -898,7 +891,7 @@ function M.adjust_window_size(windows, current_mode, content_width, content_heig
     local w = M.clamp(content_width + 6, 40, math.min(math.floor(editor_w * 0.6), 120))
     w = M.apply_size_limits("split", w, editor_h, window_limits)
 
-    M.safe_win_call(function()
+    pcall(function()
       vim.api.nvim_win_set_width(windows.main, w)
     end)
   end
@@ -932,7 +925,7 @@ function M.adjust_tree_window_size(windows, tree_buffers, window_limits)
 
   local current_w = vim.api.nvim_win_get_width(windows.tree)
   if target ~= current_w then
-    M.safe_win_call(function()
+    pcall(function()
       vim.api.nvim_win_set_width(windows.tree, target)
     end)
   end

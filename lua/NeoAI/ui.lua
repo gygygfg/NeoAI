@@ -2682,7 +2682,7 @@ function M.close()
   -- 关闭所有窗口（主窗口、树视图窗口等）
   for _, win in pairs(M.windows) do
     if utils.is_win_valid(win) then
-      utils.safe_win_call(function()
+      pcall(function()
         -- 标签模式下，关闭整个标签页而不是单个窗口
         if M.current_mode == M.ui_modes.TAB then
           local tab = vim.api.nvim_win_get_tabpage(win)
