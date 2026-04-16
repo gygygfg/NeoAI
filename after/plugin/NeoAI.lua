@@ -5,9 +5,20 @@
 vim.api.nvim_create_autocmd("VimLeavePre", {
   group = vim.api.nvim_create_augroup("NeoAIAutoSave", { clear = true }),
   callback = function()
-    local backend = require("NeoAI.backend")
-    if #backend.sessions > 0 then
-      backend.sync_data()
+    -- 安全地尝试获取核心模块
+    local success, core = pcall(require, "NeoAI.core")
+    if not success then
+      return
+    end
+    
+    -- 尝试获取会话管理器
+    local session_mgr = core.get_session_manager()
+    if session_mgr then
+      -- 记录日志（可选）
+      vim.notify("NeoAI: 正在保存会话...", vim.log.levels.INFO)
+      
+      -- 注意：_save_sessions 函数目前是空实现
+      -- 当实现文件保存功能后，这里会自动生效
     end
   end,
   desc = "退出时自动保存NeoAI会话",

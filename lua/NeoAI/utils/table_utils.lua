@@ -1,0 +1,485 @@
+local M = {}
+
+--- 获取表的所有键
+--- @param tbl table 表
+--- @return table 键列表
+function M.keys(tbl)
+    if type(tbl) ~= "table" then
+        return {}
+    end
+
+    local result = {}
+    for k, _ in pairs(tbl) do
+        table.insert(result, k)
+    end
+
+    return result
+end
+
+--- 获取表的所有值
+--- @param tbl table 表
+--- @return table 值列表
+function M.values(tbl)
+    if type(tbl) ~= "table" then
+        return {}
+    end
+
+    local result = {}
+    for _, v in pairs(tbl) do
+        table.insert(result, v)
+    end
+
+    return result
+end
+
+--- 过滤表
+--- @param tbl table 表
+--- @param predicate function 谓词函数
+--- @return table 过滤后的表
+function M.filter(tbl, predicate)
+    if type(tbl) ~= "table" then
+        return {}
+    end
+
+    if type(predicate) ~= "function" then
+        return tbl
+    end
+
+    local result = {}
+    for k, v in pairs(tbl) do
+        if predicate(v, k) then
+            result[k] = v
+        end
+    end
+
+    return result
+end
+
+--- 映射表
+--- @param tbl table 表
+--- @param func function 映射函数
+--- @return table 映射后的表
+function M.map(tbl, func)
+    if type(tbl) ~= "table" then
+        return {}
+    end
+
+    if type(func) ~= "function" then
+        return tbl
+    end
+
+    local result = {}
+    for k, v in pairs(tbl) do
+        result[k] = func(v, k)
+    end
+
+    return result
+end
+
+--- 归约表
+--- @param tbl table 表
+--- @param func function 归约函数
+--- @param initial any 初始值
+--- @return any 归约结果
+function M.reduce(tbl, func, initial)
+    if type(tbl) ~= "table" then
+        return initial
+    end
+
+    if type(func) ~= "function" then
+        return initial
+    end
+
+    local accumulator = initial
+    local is_first = initial == nil
+
+    for k, v in pairs(tbl) do
+        if is_first then
+            accumulator = v
+            is_first = false
+        else
+            accumulator = func(accumulator, v, k)
+        end
+    end
+
+    return accumulator
+end
+
+--- 表长度
+--- @param tbl table 表
+--- @return number 长度
+function M.length(tbl)
+    if type(tbl) ~= "table" then
+        return 0
+    end
+
+    local count = 0
+    for _ in pairs(tbl) do
+        count = count + 1
+    end
+
+    return count
+end
+
+--- 表是否为空
+--- @param tbl table 表
+--- @return boolean 是否为空
+function M.is_empty(tbl)
+    if type(tbl) ~= "table" then
+        return true
+    end
+
+    return next(tbl) == nil
+end
+
+--- 合并多个表
+--- @param ... table 要合并的表
+--- @return table 合并后的表
+function M.merge(...)
+    local result = {}
+    local tables = { ... }
+
+    for _, tbl in ipairs(tables) do
+        if type(tbl) == "table" then
+            for k, v in pairs(tbl) do
+                result[k] = v
+            end
+        end
+    end
+
+    return result
+end
+
+--- 扁平化表
+--- @param tbl table 表
+--- @param depth number 深度
+--- @return table 扁平化后的表
+function M.flatten(tbl, depth)
+    if type(tbl) ~= "table" then
+        return { tbl }
+    end
+
+    depth = depth or math.huge
+    local result = {}
+
+    local function flatten_helper(sub_tbl, current_depth)
+        if current_depth > depth then
+            table.insert(result, sub_tbl)
+            return
+        end
+
+        for _, v in ipairs(sub_tbl) do
+            if type(v) == "table" then
+                flatten_helper(v, current_depth + 1)
+            else
+                table.insert(result, v)
+            end
+        end
+    end
+
+    flatten_helper(tbl, 1)
+    return result
+end
+
+--- 反转表
+--- @param tbl table 表
+--- @return table 反转后的表
+function M.reverse(tbl)
+    if type(tbl) ~= "table" then
+        return {}
+    end
+
+    local result = {}
+    local len = #tbl
+
+    for i = len, 1, -1 do
+        table.insert(result, tbl[i])
+    end
+
+    return result
+end
+
+--- 切片表
+--- @param tbl table 表
+--- @param start number 起始索引
+--- @param finish number 结束索引
+--- @return table 切片后的表
+function M.slice(tbl, start, finish)
+    if type(tbl) ~= "table" then
+        return {}
+    end
+
+    start = start or 1
+    finish = finish or #tbl
+
+    if start < 1 then
+        start = 1
+    end
+    if finish > #tbl then
+        finish = #tbl
+    end
+
+    local result = {}
+    for i = start, finish do
+        table.insert(result, tbl[i])
+    end
+
+    return result
+end
+
+--- 去重表
+--- @param tbl table 表
+--- @return table 去重后的表
+function M.unique(tbl)
+    if type(tbl) ~= "table" then
+        return {}
+    end
+
+    local seen = {}
+    local result = {}
+
+    for _, v in ipairs(tbl) do
+        local key = tostring(v)
+        if not seen[key] then
+            seen[key] = true
+            table.insert(result, v)
+        end
+    end
+
+    return result
+end
+
+--- 排序表
+--- @param tbl table 表
+--- @param comparator function 比较函数
+--- @return table 排序后的表
+function M.sort(tbl, comparator)
+    if type(tbl) ~= "table" then
+        return {}
+    end
+
+    local result = {}
+    for _, v in ipairs(tbl) do
+        table.insert(result, v)
+    end
+
+    if comparator and type(comparator) == "function" then
+        table.sort(result, comparator)
+    else
+        table.sort(result)
+    end
+
+    return result
+end
+
+--- 分组表
+--- @param tbl table 表
+--- @param key_func function 键函数
+--- @return table 分组后的表
+function M.group_by(tbl, key_func)
+    if type(tbl) ~= "table" then
+        return {}
+    end
+
+    if type(key_func) ~= "function" then
+        return { tbl }
+    end
+
+    local result = {}
+
+    for _, v in ipairs(tbl) do
+        local key = key_func(v)
+        if not result[key] then
+            result[key] = {}
+        end
+        table.insert(result[key], v)
+    end
+
+    return result
+end
+
+--- 查找元素
+--- @param tbl table 表
+--- @param predicate function 谓词函数
+--- @return any 找到的元素
+function M.find(tbl, predicate)
+    if type(tbl) ~= "table" then
+        return nil
+    end
+
+    if type(predicate) ~= "function" then
+        return nil
+    end
+
+    for k, v in pairs(tbl) do
+        if predicate(v, k) then
+            return v, k
+        end
+    end
+
+    return nil
+end
+
+--- 检查表是否包含值
+--- @param tbl table 表
+--- @param value any 值
+--- @return boolean 是否包含
+function M.contains(tbl, value)
+    if type(tbl) ~= "table" then
+        return false
+    end
+
+    for _, v in pairs(tbl) do
+        if v == value then
+            return true
+        end
+    end
+
+    return false
+end
+
+--- 检查表是否包含键
+--- @param tbl table 表
+--- @param key any 键
+--- @return boolean 是否包含
+function M.has_key(tbl, key)
+    if type(tbl) ~= "table" then
+        return false
+    end
+
+    return tbl[key] ~= nil
+end
+
+--- 转换表为键值对列表
+--- @param tbl table 表
+--- @return table 键值对列表
+function M.to_pairs(tbl)
+    if type(tbl) ~= "table" then
+        return {}
+    end
+
+    local result = {}
+    for k, v in pairs(tbl) do
+        table.insert(result, { key = k, value = v })
+    end
+
+    return result
+end
+
+--- 从键值对列表创建表
+--- @param pairs table 键值对列表
+--- @return table 表
+function M.from_pairs(pairs)
+    if type(pairs) ~= "table" then
+        return {}
+    end
+
+    local result = {}
+    for _, pair in ipairs(pairs) do
+        if type(pair) == "table" and pair.key ~= nil then
+            result[pair.key] = pair.value
+        end
+    end
+
+    return result
+end
+
+--- 深比较两个表
+--- @param t1 table 表1
+--- @param t2 table 表2
+--- @return boolean 是否相等
+function M.deep_equal(t1, t2)
+    if type(t1) ~= type(t2) then
+        return false
+    end
+
+    if type(t1) ~= "table" then
+        return t1 == t2
+    end
+
+    -- 检查键的数量
+    local t1_keys = M.keys(t1)
+    local t2_keys = M.keys(t2)
+
+    if #t1_keys ~= #t2_keys then
+        return false
+    end
+
+    -- 检查每个键值对
+    for _, key in ipairs(t1_keys) do
+        if not M.deep_equal(t1[key], t2[key]) then
+            return false
+        end
+    end
+
+    return true
+end
+
+--- 克隆表（浅拷贝）
+--- @param tbl table 表
+--- @return table 克隆的表
+function M.clone(tbl)
+    if type(tbl) ~= "table" then
+        return {}
+    end
+
+    local result = {}
+    for k, v in pairs(tbl) do
+        result[k] = v
+    end
+
+    return result
+end
+
+--- 获取表的子集
+--- @param tbl table 表
+--- @param keys table 键列表
+--- @return table 子集
+function M.pick(tbl, keys)
+    if type(tbl) ~= "table" then
+        return {}
+    end
+
+    if type(keys) ~= "table" then
+        return {}
+    end
+
+    local result = {}
+    for _, key in ipairs(keys) do
+        if tbl[key] ~= nil then
+            result[key] = tbl[key]
+        end
+    end
+
+    return result
+end
+
+--- 排除表的某些键
+--- @param tbl table 表
+--- @param keys table 要排除的键列表
+--- @return table 排除后的表
+function M.omit(tbl, keys)
+    if type(tbl) ~= "table" then
+        return {}
+    end
+
+    if type(keys) ~= "table" then
+        return tbl
+    end
+
+    local key_set = {}
+    for _, key in ipairs(keys) do
+        key_set[key] = true
+    end
+
+    local result = {}
+    for k, v in pairs(tbl) do
+        if not key_set[k] then
+            result[k] = v
+        end
+    end
+
+    return result
+end
+
+return M
