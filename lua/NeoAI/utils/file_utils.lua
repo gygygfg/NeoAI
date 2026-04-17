@@ -29,10 +29,10 @@ end
 --- @param path string 文件路径
 --- @param content string 内容
 --- @param append boolean 是否追加模式
---- @return boolean 是否成功，错误时返回false和错误信息
+--- @return boolean|nil 成功时返回true，错误时返回nil和错误信息
 function M.write_file(path, content, append)
     if not path then
-        return false, "路径不能为空"
+        return nil, "路径不能为空"
     end
 
     if content == nil then
@@ -42,7 +42,7 @@ function M.write_file(path, content, append)
     local mode = append and "a" or "w"
     local file, err = io.open(path, mode)
     if not file then
-        return false, "无法打开文件: " .. (err or "未知错误")
+        return nil, "无法打开文件: " .. (err or "未知错误")
     end
 
     local success, write_err = pcall(function()
@@ -51,7 +51,7 @@ function M.write_file(path, content, append)
     end)
 
     if not success then
-        return false, "写入失败: " .. (write_err or "未知错误")
+        return nil, "写入失败: " .. (write_err or "未知错误")
     end
 
     return true
@@ -90,14 +90,14 @@ end
 --- @param path string 文件路径
 --- @param lines table 行列表
 --- @param append boolean 是否追加模式
---- @return boolean 是否成功，错误时返回false和错误信息
+--- @return boolean|nil 成功时返回true，错误时返回nil和错误信息
 function M.write_lines(path, lines, append)
     if not path then
-        return false, "路径不能为空"
+        return nil, "路径不能为空"
     end
 
     if not lines or type(lines) ~= "table" then
-        return false, "行列表无效"
+        return nil, "行列表无效"
     end
 
     local content = table.concat(lines, "\n")
@@ -143,10 +143,10 @@ end
 
 --- 创建目录
 --- @param dir string 目录路径
---- @return boolean 是否成功，错误时返回false和错误信息
+--- @return boolean|nil 成功时返回true，错误时返回nil和错误信息
 function M.mkdir(dir)
     if not dir then
-        return false, "目录路径不能为空"
+        return nil, "目录路径不能为空"
     end
 
     -- 检查目录是否已存在
@@ -161,7 +161,7 @@ function M.mkdir(dir)
     if result == 0 or result == true then
         return true
     else
-        return false, "创建目录失败"
+        return nil, "创建目录失败"
     end
 end
 
@@ -292,15 +292,15 @@ end
 --- 复制文件
 --- @param src string 源文件路径
 --- @param dst string 目标文件路径
---- @return boolean 是否成功，错误时返回false和错误信息
+--- @return boolean|nil 成功时返回true，错误时返回nil和错误信息
 function M.copy_file(src, dst)
     if not src or not dst then
-        return false, "源路径和目标路径不能为空"
+        return nil, "源路径和目标路径不能为空"
     end
 
     local content, err = M.read_file(src)
     if not content then
-        return false, "无法读取源文件: " .. err
+        return nil, "无法读取源文件: " .. err
     end
 
     return M.write_file(dst, content)
@@ -309,16 +309,16 @@ end
 --- 移动文件
 --- @param src string 源文件路径
 --- @param dst string 目标文件路径
---- @return boolean 是否成功，错误时返回false和错误信息
+--- @return boolean|nil 成功时返回true，错误时返回nil和错误信息
 function M.move_file(src, dst)
     if not src or not dst then
-        return false, "源路径和目标路径不能为空"
+        return nil, "源路径和目标路径不能为空"
     end
 
     -- 先复制
     local ok, err = M.copy_file(src, dst)
     if not ok then
-        return false, "复制失败: " .. err
+        return nil, "复制失败: " .. err
     end
 
     -- 然后删除源文件
@@ -326,7 +326,7 @@ function M.move_file(src, dst)
     if not del_ok then
         -- 如果删除失败，尝试删除目标文件
         M.delete_file(dst)
-        return false, "移动失败（无法删除源文件）: " .. del_err
+        return nil, "移动失败（无法删除源文件）: " .. del_err
     end
 
     return true
@@ -334,17 +334,17 @@ end
 
 --- 删除文件
 --- @param path string 文件路径
---- @return boolean 是否成功，错误时返回false和错误信息
+--- @return boolean|nil 成功时返回true，错误时返回nil和错误信息
 function M.delete_file(path)
     if not path then
-        return false, "路径不能为空"
+        return nil, "路径不能为空"
     end
 
     local ok, err = os.remove(path)
     if ok then
         return true
     else
-        return false, "删除失败: " .. (err or "未知错误")
+        return nil, "删除失败: " .. (err or "未知错误")
     end
 end
 
@@ -490,7 +490,7 @@ end
 
 --- 确保目录存在（ensure_dir 是 mkdir 的别名）
 --- @param dir string 目录路径
---- @return boolean 是否成功，错误时返回false和错误信息
+--- @return boolean|nil 成功时返回true，错误时返回nil和错误信息
 function M.ensure_dir(dir)
     return M.mkdir(dir)
 end
@@ -524,7 +524,7 @@ end
 
 --- 创建目录（create_directory 是 mkdir 的别名）
 --- @param dir string 目录路径
---- @return boolean 是否成功，错误时返回false和错误信息
+--- @return boolean|nil 成功时返回true，错误时返回nil和错误信息
 function M.create_directory(dir)
     return M.mkdir(dir)
 end

@@ -3,6 +3,36 @@ local M = {}
 local tool_registry = require("NeoAI.tools.tool_registry")
 local tool_validator = require("NeoAI.tools.tool_validator")
 
+-- 检查 vim 模块是否可用，如果不可用则使用简单的深拷贝函数
+local function deep_copy(obj, seen)
+    if type(obj) ~= "table" then return obj end
+    if seen and seen[obj] then return seen[obj] end
+    
+    local s = seen or {}
+    local res = {}
+    s[obj] = res
+    
+    for k, v in pairs(obj) do
+        res[deep_copy(k, s)] = deep_copy(v, s)
+    end
+    
+    return setmetatable(res, getmetatable(obj))
+end
+
+-- 使用 vim.deepcopy 如果可用，否则使用自定义的深拷贝函数
+local vim_deepcopy = vim and vim.deepcopy or deep_copy
+
+-- 跨平台睡眠函数
+local function sleep(seconds)
+    if package.config:sub(1,1) == "\\" then
+        -- Windows
+        os.execute("timeout /T " .. seconds .. " /NOBREAK > NUL 2>&1")
+    else
+        -- Unix/Linux/Mac
+        os.execute("sleep " .. seconds)
+    end
+end
+
 -- 模块状态
 local state = {
     initialized = false,
@@ -130,16 +160,42 @@ function M.format_result(result)
         return tostring(result)
     elseif result_type == "table" then
         -- 尝试转换为JSON
-        local ok, json = pcall(vim.json.encode, result)
-        if ok then
-            return json
-        else
-            -- 如果无法转换为JSON，使用tostring
-            return tostring(result)
+        local json_encode = vim and vim.json and vim.json.encode
+        if json_encode then
+            local ok, json = pcall(json_encode, result)
+            if ok then
+                return json
+            end
         end
+        
+        -- 如果无法转换为JSON，使用简单的表格表示
+        return M._table_to_string(result)
     else
         return tostring(result)
     end
+end
+
+--- 将表格转换为字符串（内部使用）
+--- @param tbl table 表格
+--- @return string 字符串表示
+function M._table_to_string(tbl)
+    local result = {"{"}
+    for k, v in pairs(tbl) do
+        local key_str = type(k) == "string" and "\"" .. k .. "\"" or tostring(k)
+        local value_str
+        
+        if type(v) == "table" then
+            value_str = M._table_to_string(v)
+        elseif type(v) == "string" then
+            value_str = "\"" .. v .. "\""
+        else
+            value_str = tostring(v)
+        end
+        
+        table.insert(result, "  " .. key_str .. ": " .. value_str)
+    end
+    table.insert(result, "}")
+    return table.concat(result, "\n")
 end
 
 --- 处理错误
@@ -212,7 +268,7 @@ function M.safe_call(func, args, max_retries, retry_delay)
     for attempt = 0, max_retries do
         if attempt > 0 then
             -- 重试前等待
-            os.execute("sleep " .. retry_delay)
+            sleep(retry_delay)
             
             -- 记录重试信息
             M._record_execution("safe_call", args, nil, "重试尝试: " .. attempt, 0)
@@ -387,7 +443,7 @@ end
 function M._record_execution(tool_name, args, result, error_msg, duration)
     local record = {
         tool_name = tool_name,
-        args = vim.deepcopy(args),
+        args = vim_deepcopy(args),
         result = result,
         error = error_msg,
         success = error_msg == nil,

@@ -20,7 +20,7 @@ Session.__index = Session
 --- @param metadata table 元数据
 function Session:new(id, name, metadata)
     local self = setmetatable({}, Session)
-    self.id = id or vim.fn.strftime("%Y%m%d_%H%M%S")
+    self.id = id or vim.fn.strftime("%Y%m%d_%H%M%S") .. "_" .. tostring(math.random(1000, 9999))
     self.name = name or "新会话"
     self.metadata = metadata or {
         created_at = os.time(),
@@ -151,7 +151,13 @@ function M.initialize(options)
     options = options or {}
     state.event_bus = options.event_bus
     state.config = options.config or {}
-    state.max_history_per_session = state.config.max_history_per_session or 100
+    
+    -- 确保配置有默认值
+    state.config.save_path = state.config.save_path or vim.fn.stdpath("data") .. "/neoa"
+    state.config.auto_save = state.config.auto_save or false
+    state.config.max_history_per_session = state.config.max_history_per_session or 100
+    
+    state.max_history_per_session = state.config.max_history_per_session
     state.sessions = {}
     state.current_session_id = nil
     state.initialized = true
@@ -354,6 +360,53 @@ function M.get_entries(session_id, branch_id)
     
     -- 否则返回会话的所有消息
     return session:get_messages()
+end
+
+--- 添加消息到指定会话和分支
+--- @param session_id string 会话ID
+--- @param branch_id number 分支ID
+--- @param role string 角色
+--- @param content string 内容
+--- @param metadata table 元数据
+--- @return table|nil 添加的消息
+function M.add_message_to_branch(session_id, branch_id, role, content, metadata)
+    local session = state.sessions[session_id]
+    if not session then
+        return nil
+    end
+    
+    -- 查找分支
+    local target_branch = nil
+    for _, branch in ipairs(session.branches) do
+        if branch.id == branch_id then
+            target_branch = branch
+            break
+        end
+    end
+    
+    if not target_branch then
+        return nil
+    end
+    
+    -- 创建消息
+    local message = {
+        id = #(target_branch.messages or {}) + 1,
+        role = role,
+        content = content,
+        timestamp = os.time(),
+        metadata = metadata or {}
+    }
+    
+    -- 添加到分支消息列表
+    if not target_branch.messages then
+        target_branch.messages = {}
+    end
+    table.insert(target_branch.messages, message)
+    
+    -- 自动保存
+    M._auto_save_session(session)
+    
+    return message
 end
 
 --- 清理旧消息

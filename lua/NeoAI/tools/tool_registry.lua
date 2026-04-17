@@ -32,19 +32,22 @@ function M.register(tool)
     end
 
     if not tool or not tool.name then
-        vim.notify("工具定义无效: 缺少名称", vim.log.levels.ERROR)
+        -- vim.notify("工具定义无效: 缺少名称", vim.log.levels.ERROR)
+        print("❌ 工具定义无效: 缺少名称")
         return false
     end
 
     if tools[tool.name] then
-        vim.notify("工具已存在: " .. tool.name, vim.log.levels.WARN)
+        -- vim.notify("工具已存在: " .. tool.name, vim.log.levels.WARN)
+        print("⚠️  工具已存在: " .. tool.name)
         return false
     end
 
     -- 验证工具定义
     local valid, error_msg = M.validate_tool(tool)
     if not valid then
-        vim.notify("工具验证失败: " .. error_msg, vim.log.levels.ERROR)
+        -- vim.notify("工具验证失败[ " .. tool.name .. "]: " .. error_msg, vim.log.levels.ERROR)
+        print("❌ 工具验证失败[ " .. tool.name .. "]: " .. error_msg)
         return false
     end
 
@@ -58,6 +61,8 @@ function M.register(tool)
     end
     table.insert(tool_categories[category], tool.name)
 
+    -- vim.notify("工具注册成功: " .. tool.name, vim.log.levels.INFO)
+    print("✅ 工具注册成功: " .. tool.name)
     return true
 end
 
@@ -173,7 +178,7 @@ function M.validate_tool(tool)
 
     -- 检查名称格式
     if not tool.name:match("^[a-zA-Z_][a-zA-Z0-9_]*$") then
-        return false, "工具名称只能包含字母、数字和下划线，且不能以数字开头"
+        return false, "工具名称只能包含字母、数字和下划线，且不能以数字开头。当前名称: '" .. tool.name .. "'"
     end
 
     -- 检查描述（可选但推荐）
@@ -273,6 +278,15 @@ function M.clear()
         error("Tool registry not initialized")
     end
 
+    tools = {}
+    tool_categories = {}
+end
+
+--- 重置注册表（用于测试）
+--- 这会重置所有状态，允许重新初始化
+function M.reset()
+    state.initialized = false
+    state.config = nil
     tools = {}
     tool_categories = {}
 end

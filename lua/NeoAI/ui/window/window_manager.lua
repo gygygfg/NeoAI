@@ -115,6 +115,42 @@ function M.close_window(window_id)
   windows[window_id] = nil
 end
 
+--- 创建聊天窗口（便捷函数）
+--- @param options table 窗口选项
+--- @return string|nil 窗口ID
+function M.create_chat_window(options)
+  return M.create_window("chat", options)
+end
+
+--- 创建树窗口（便捷函数）
+--- @param options table 窗口选项
+--- @return string|nil 窗口ID
+function M.create_tree_window(options)
+  return M.create_window("tree", options)
+end
+
+--- 获取聊天窗口
+--- @return table|nil 聊天窗口信息
+function M.get_chat_window()
+  for id, window in pairs(windows) do
+    if window.type == "chat" then
+      return M.get_window(id)
+    end
+  end
+  return nil
+end
+
+--- 获取树窗口
+--- @return table|nil 树窗口信息
+function M.get_tree_window()
+  for id, window in pairs(windows) do
+    if window.type == "tree" then
+      return M.get_window(id)
+    end
+  end
+  return nil
+end
+
 --- 获取窗口
 --- @param window_id string 窗口ID
 --- @return table|nil 窗口信息

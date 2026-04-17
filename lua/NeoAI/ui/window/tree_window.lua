@@ -724,6 +724,16 @@ function M.refresh()
     return true
 end
 
+--- 检查树窗口是否已打开
+--- @return boolean 是否已打开
+function M.is_open()
+    if not state.initialized then
+        return false
+    end
+    
+    return state.current_window_id ~= nil
+end
+
 --- 选择指定节点
 --- @param node_id string 节点ID
 --- @return boolean 是否成功

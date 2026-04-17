@@ -1,8 +1,35 @@
 local M = {}
 
 local window_manager = require("NeoAI.ui.window.window_manager")
-local logger = require("NeoAI.utils.logger")
 local virtual_input = require("NeoAI.ui.components.virtual_input")
+
+-- 简单的日志函数（临时替代）
+local logger = {
+    debug = function(msg, ...) 
+        if select('#', ...) > 0 then
+            msg = string.format(msg, ...)
+        end
+        vim.notify("[DEBUG] " .. msg, vim.log.levels.DEBUG)
+    end,
+    info = function(msg, ...) 
+        if select('#', ...) > 0 then
+            msg = string.format(msg, ...)
+        end
+        vim.notify("[INFO] " .. msg, vim.log.levels.INFO)
+    end,
+    warn = function(msg, ...) 
+        if select('#', ...) > 0 then
+            msg = string.format(msg, ...)
+        end
+        vim.notify("[WARN] " .. msg, vim.log.levels.WARN)
+    end,
+    error = function(msg, ...) 
+        if select('#', ...) > 0 then
+            msg = string.format(msg, ...)
+        end
+        vim.notify("[ERROR] " .. msg, vim.log.levels.ERROR)
+    end
+}
 
 -- 模块状态
 local state = {
@@ -634,6 +661,12 @@ end
 --- @return table 消息列表
 function M.get_messages()
     return vim.deepcopy(state.message_buffer)
+end
+
+--- 获取消息数量
+--- @return number 消息数量
+function M.get_message_count()
+    return #state.message_buffer
 end
 
 --- 清空消息

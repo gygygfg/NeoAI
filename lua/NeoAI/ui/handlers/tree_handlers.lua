@@ -3,19 +3,42 @@ local M = {}
 -- 模块状态
 local state = {
     initialized = false,
+    event_bus = nil,
     config = nil
 }
 
 --- 初始化树界面处理器
+--- @param event_bus table 事件总线
 --- @param config table 配置
 --- @return boolean 初始化是否成功
-function M.initialize(config)
+function M.initialize(event_bus, config)
     if state.initialized then
         return true
     end
 
+    state.event_bus = event_bus
     state.config = config or {}
     state.initialized = true
+    
+    -- 注册事件监听器
+    if event_bus then
+        event_bus:on("open_tree_window", function()
+            -- 打开树窗口
+            local ui = require("NeoAI.ui")
+            ui.open_tree_ui()
+            
+            -- 触发事件
+            event_bus:emit("tree_window_opened")
+        end)
+        
+        event_bus:on("create_branch", function(session_id, parent_branch_id, name)
+            -- 创建分支
+            local success = M.create_branch(session_id, name, parent_branch_id)
+            if success then
+                event_bus:emit("branch_created", session_id, nil, name)
+            end
+        end)
+    end
     
     return true
 end
@@ -93,10 +116,85 @@ function M.handle_D()
         return
     end
 
-    vim.notify("删除分支", vim.log.levels.ERROR)
+    -- 获取选中的节点
+    local selected_node_id = M.get_selected_node()
+    if not selected_node_id then
+        vim.notify("未选中任何节点", vim.log.levels.WARN)
+        return
+    end
+
+    -- 显示确认对话框
+    local confirm = vim.fn.confirm("确定要删除分支吗？", "&Yes\n&No", 2)
+    if confirm ~= 1 then
+        return
+    end
+
+    -- 删除分支
+    local success, err = M.delete_branch(selected_node_id)
+    if success then
+        vim.notify("分支删除成功", vim.log.levels.INFO)
+    else
+        vim.notify("分支删除失败: " .. err, vim.log.levels.ERROR)
+    end
+end
+
+--- 删除分支
+--- @param branch_id string 分支ID
+--- @return boolean 是否删除成功
+--- @return string|nil 错误信息
+function M.delete_branch(branch_id)
+    if not state.initialized then
+        return false, "树形视图处理器未初始化"
+    end
+
+    if not branch_id or branch_id == "" then
+        return false, "分支ID不能为空"
+    end
+
+    -- 获取分支管理器
+    local branch_manager = require("NeoAI.core.session.branch_manager")
     
-    -- 这里应该显示确认对话框
-    -- 然后删除选中的分支及其所有子分支
+    -- 尝试删除分支
+    local success, err = pcall(branch_manager.delete_branch, branch_manager, branch_id)
+    
+    if success then
+        -- 刷新树视图
+        local tree_window = require("NeoAI.ui.window.tree_window")
+        tree_window.refresh_tree()
+        return true
+    else
+        return false, err or "未知错误"
+    end
+end
+
+--- 创建分支
+--- @param session_id string 会话ID
+--- @param branch_name string 分支名称
+--- @param parent_branch_id string 父分支ID（可选）
+--- @return boolean 是否创建成功
+function M.create_branch(session_id, branch_name, parent_branch_id)
+    if not state.initialized then
+        return false
+    end
+
+    -- 获取分支管理器
+    local branch_manager = require("NeoAI.core.session.branch_manager")
+    
+    -- 创建分支
+    local success, branch_id = pcall(branch_manager.create_branch, branch_manager, session_id, branch_name, parent_branch_id)
+    
+    if success and branch_id then
+        vim.notify("分支创建成功: " .. branch_name, vim.log.levels.INFO)
+        
+        -- 刷新树视图
+        local tree_window = require("NeoAI.ui.window.tree_window")
+        tree_window.refresh_tree()
+        
+        return true
+    else
+        vim.notify("分支创建失败: " .. (branch_id or "未知错误"), vim.log.levels.ERROR)
+        return false
+    end
 end
 
 --- 处理按键
@@ -149,6 +247,9 @@ function M.handle_left()
     end
 
     vim.notify("向左导航", vim.log.levels.INFO)
+    
+    -- 这里应该折叠当前节点或移动到父节点
+end
 
 --- 选择节点
 --- @param node_id string 节点ID
@@ -176,6 +277,14 @@ function M.refresh_tree()
     
     -- 刷新树窗口
     local success = tree_window.refresh()
+    
+    if not success then
+        -- 如果刷新失败，尝试重新打开树窗口
+        local ui = require("NeoAI.ui")
+        ui.open_tree_ui()
+        return true, "树窗口已重新打开"
+    end
+    
     return success
 end
 
@@ -191,9 +300,6 @@ function M.get_selected_node()
     
     -- 获取选中的节点
     return tree_window.get_selected_node()
-end
-    
-    -- 这里应该折叠当前节点或移动到父节点
 end
 
 --- 处理向右导航
@@ -295,6 +401,30 @@ function M.handle_quit()
     
     -- 这里应该关闭树界面
     -- require("NeoAI.ui").close_all_windows()
+end
+
+--- 切换树窗口显示/隐藏
+function M.toggle_tree_window()
+    if not state.initialized then
+        return false, "树形视图处理器未初始化"
+    end
+    
+    -- 获取UI模块
+    local ui = require("NeoAI.ui")
+    
+    -- 检查树窗口是否已打开
+    local tree_window = require("NeoAI.ui.window.tree_window")
+    local is_open = tree_window.is_open()
+    
+    if is_open then
+        -- 如果已打开，则关闭
+        ui.close_all_windows()
+        return true, "树窗口已关闭"
+    else
+        -- 如果未打开，则打开
+        ui.open_tree_ui()
+        return true, "树窗口已打开"
+    end
 end
 
 --- 获取按键映射

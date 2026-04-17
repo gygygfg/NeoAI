@@ -96,7 +96,7 @@ function M.validate_config(config)
       vim.notify("[NeoAI] ai.model must be a string. Using default.", vim.log.levels.WARN)
       config.ai.model = nil
     end
-    if config.ai.api_key and type(config.ai.api_key) ~= "string" then
+    if config.ai.api_key ~= nil and type(config.ai.api_key) ~= "string" then
       vim.notify("[NeoAI] ai.api_key must be a string. Using default.", vim.log.levels.WARN)
       config.ai.api_key = nil
     end

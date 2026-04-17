@@ -25,18 +25,38 @@ end
 
 --- 确保必需字段存在
 function M._ensure_required_fields()
+    -- 新的配置结构
     local required_fields = {
-        api_key = "",
-        max_tokens = 1000,
-        temperature = 0.7,
-        model = "gpt-3.5-turbo",
-        timeout = 30,
-        retry_count = 3
+        ai = {
+            api_key = "",
+            model = "deepseek-reasoner",
+            temperature = 0.7,
+            max_tokens = 4096,
+            stream = true
+        },
+        ui = {
+            default_ui = "tree",
+            window_mode = "tab"
+        },
+        session = {
+            auto_save = true,
+            max_history = 100
+        }
     }
     
+    -- 确保顶层字段存在
     for field, default_value in pairs(required_fields) do
         if state.config[field] == nil then
-            state.config[field] = default_value
+            state.config[field] = vim.deepcopy(default_value)
+        else
+            -- 确保子字段存在
+            if type(default_value) == "table" then
+                for sub_field, sub_default in pairs(default_value) do
+                    if state.config[field][sub_field] == nil then
+                        state.config[field][sub_field] = sub_default
+                    end
+                end
+            end
         end
     end
 end
@@ -84,7 +104,11 @@ end
 --- @return boolean, string 是否有效，错误信息
 function M.validate()
     -- 检查必需字段
-    local required_fields = {"api_key", "max_tokens", "temperature"}
+    local required_fields = {
+        "ai",
+        "ui",
+        "session"
+    }
     
     for _, field in ipairs(required_fields) do
         if state.config[field] == nil then
@@ -92,22 +116,40 @@ function M.validate()
         end
     end
     
-    -- 验证字段值
-    if type(state.config.max_tokens) ~= "number" or state.config.max_tokens <= 0 then
-        return false, "max_tokens 必须是正数"
+    -- 验证AI配置
+    if state.config.ai then
+        if type(state.config.ai.max_tokens) ~= "number" or state.config.ai.max_tokens <= 0 then
+            return false, "ai.max_tokens 必须是正数"
+        end
+        
+        if type(state.config.ai.temperature) ~= "number" or 
+           state.config.ai.temperature < 0 or state.config.ai.temperature > 2 then
+            return false, "ai.temperature 必须在 0 到 2 之间"
+        end
+        
+        if state.config.ai.model and type(state.config.ai.model) ~= "string" then
+            return false, "ai.model 必须是字符串"
+        end
     end
     
-    if type(state.config.temperature) ~= "number" or 
-       state.config.temperature < 0 or state.config.temperature > 2 then
-        return false, "temperature 必须在 0 到 2 之间"
+    -- 验证UI配置
+    if state.config.ui then
+        local valid_uis = {"tree", "chat"}
+        if state.config.ui.default_ui and not vim.tbl_contains(valid_uis, state.config.ui.default_ui) then
+            return false, "ui.default_ui 必须是 'tree' 或 'chat'"
+        end
+        
+        local valid_modes = {"float", "tab", "split"}
+        if state.config.ui.window_mode and not vim.tbl_contains(valid_modes, state.config.ui.window_mode) then
+            return false, "ui.window_mode 必须是 'float', 'tab' 或 'split'"
+        end
     end
     
-    if type(state.config.timeout) ~= "number" or state.config.timeout <= 0 then
-        return false, "timeout 必须是正数"
-    end
-    
-    if type(state.config.retry_count) ~= "number" or state.config.retry_count < 0 then
-        return false, "retry_count 必须是非负数"
+    -- 验证会话配置
+    if state.config.session then
+        if type(state.config.session.max_history) ~= "number" or state.config.session.max_history <= 0 then
+            return false, "session.max_history 必须是正数"
+        end
     end
     
     return true

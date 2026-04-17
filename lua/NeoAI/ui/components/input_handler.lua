@@ -255,13 +255,19 @@ function M._handle_normal_input(key)
     elseif key == "v" then
         -- 进入可视模式
         M.set_mode("visual")
-    elseif key == ":" then
-        -- 命令模式
-        M._handle_command_mode()
-    elseif key == "/" then
-        -- 搜索模式
-        M._handle_search_mode()
+    elseif key == "<CR>" then
+        -- 发送消息
+        M.send_message(state.input_buffer)
+    elseif key == "<Esc>" then
+        -- 确保在普通模式
+        M.set_mode("normal")
     end
+end
+
+--- 获取输入文本（缺失函数）
+--- @return string 输入文本
+function M.get_input_text()
+    return state.input_buffer
 end
 
 --- 处理命令模式（内部使用）

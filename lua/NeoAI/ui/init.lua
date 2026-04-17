@@ -256,6 +256,10 @@ function M.handle_key_input(key)
   -- 增加事件计数
   state.event_count = (state.event_count or 0) + 1
   
+  -- 记录事件处理
+  print(string.format("UI事件处理: 模式=%s, 按键=%s, 计数=%d", 
+    state.current_ui_mode, key, state.event_count))
+  
   -- 避免无限递归，直接调用处理器而不通过handle_key_input
   if state.current_ui_mode == "tree" then
     -- 直接调用树形视图处理器的内部处理逻辑
@@ -269,6 +273,16 @@ function M.handle_key_input(key)
       tree_handlers.handle_d()
     elseif key == "D" then
       tree_handlers.handle_D()
+    elseif key == "r" then
+      tree_handlers.handle_refresh()
+    elseif key == "k" then
+      tree_handlers.handle_up()
+    elseif key == "j" then
+      tree_handlers.handle_down()
+    elseif key == "h" then
+      tree_handlers.handle_left()
+    elseif key == "l" then
+      tree_handlers.handle_right()
     end
   elseif state.current_ui_mode == "chat" then
     -- 直接调用聊天处理器的内部处理逻辑
@@ -280,6 +294,12 @@ function M.handle_key_input(key)
       chat_handlers.handle_escape()
     elseif key == "<Tab>" then
       chat_handlers.handle_tab()
+    elseif key == "r" then
+      chat_handlers.handle_regenerate()
+    elseif key == "<C-c>" then
+      chat_handlers.handle_stop_generation()
+    elseif key == "t" then
+      chat_handlers.handle_toggle_reasoning()
     end
   end
 end

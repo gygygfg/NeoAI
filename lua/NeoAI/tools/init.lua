@@ -62,12 +62,21 @@ function M.register_tool(tool_def)
   end
 
   -- 注册工具
-  local success = tool_registry.register(tool_def)
-  if success then
-    vim.notify("[NeoAI] 工具注册成功: " .. tool_def.name, vim.log.levels.INFO)
+  local success, reg_error = pcall(function()
+    return tool_registry.register(tool_def)
+  end)
+  
+  if not success then
+    vim.notify("工具注册异常: " .. reg_error, vim.log.levels.ERROR)
+    return false
+  elseif reg_error == false then
+    -- 注册失败但没有异常
+    vim.notify("工具注册失败: " .. tool_def.name, vim.log.levels.WARN)
+    return false
   end
-
-  return success
+  
+  vim.notify("[NeoAI] 工具注册成功: " .. tool_def.name, vim.log.levels.INFO)
+  return true
 end
 
 --- 获取所有工具

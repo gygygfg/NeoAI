@@ -3,7 +3,11 @@ local M = {}
 --- 注册文件工具
 --- @return table 工具列表
 function M.register_file_tools()
-    local file_utils = require("NeoAI.utils.file_utils")
+    local ok, file_utils = pcall(require, "NeoAI.utils.file_utils")
+    if not ok then
+        vim.notify("无法加载 file_utils 模块: " .. (file_utils or "未知错误"), vim.log.levels.ERROR)
+        return {}
+    end
     
     local tools = {
         {
@@ -81,8 +85,12 @@ function M.get_all_tools()
     
     -- 添加文件工具
     local file_tools = M.register_file_tools()
-    for _, tool in ipairs(file_tools) do
-        table.insert(all_tools, tool)
+    if type(file_tools) == "table" then
+        for _, tool in ipairs(file_tools) do
+            table.insert(all_tools, tool)
+        end
+    else
+        vim.notify("file_tools 不是table类型: " .. type(file_tools), vim.log.levels.WARN)
     end
     
     return all_tools

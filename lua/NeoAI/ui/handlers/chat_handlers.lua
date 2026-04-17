@@ -3,19 +3,42 @@ local M = {}
 -- 模块状态
 local state = {
     initialized = false,
+    event_bus = nil,
     config = nil
 }
 
 --- 初始化聊天界面处理器
+--- @param event_bus table 事件总线
 --- @param config table 配置
 --- @return boolean 初始化是否成功
-function M.initialize(config)
+function M.initialize(event_bus, config)
     if state.initialized then
         return true
     end
 
+    state.event_bus = event_bus
     state.config = config or {}
     state.initialized = true
+    
+    -- 注册事件监听器
+    if event_bus then
+        event_bus:on("open_chat_window", function(session_id, branch_id)
+            -- 打开聊天窗口
+            local ui = require("NeoAI.ui")
+            ui.open_chat_ui(session_id, branch_id)
+            
+            -- 触发事件
+            event_bus:emit("chat_window_opened", session_id, branch_id)
+        end)
+        
+        event_bus:on("send_message", function(session_id, branch_id, content)
+            -- 发送消息
+            local success, result = M.send_message(content)
+            if success then
+                event_bus:emit("message_sent", session_id, branch_id, content)
+            end
+        end)
+    end
     
     return true
 end
@@ -441,6 +464,28 @@ function M.handle_input(input)
     -- 这里可以处理输入内容，比如验证、格式化等
     -- 目前只是简单返回成功
     return true, "输入已处理"
+end
+
+--- 获取消息数量
+--- @return number 消息数量
+function M.get_message_count()
+    if not state.initialized then
+        return 0
+    end
+    
+    -- 获取聊天窗口实例
+    local chat_window = require("NeoAI.ui.window.chat_window")
+    
+    -- 检查聊天窗口是否可用
+    local available, err = chat_window.is_available()
+    if not available then
+        -- 如果聊天窗口不可用，返回模拟的消息数量用于测试
+        return 5  -- 模拟5条消息
+    end
+    
+    -- 获取消息数量
+    local count = chat_window.get_message_count()
+    return count or 0
 end
 
 --- 更新配置

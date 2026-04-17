@@ -299,6 +299,78 @@ function M.focus_window(window_info)
     end
 end
 
+-- 模块状态
+local state = {
+    initialized = false,
+    config = nil,
+    current_mode = "float", -- 默认模式
+    available_modes = {"float", "tab", "split"}
+}
+
+--- 初始化窗口模式管理器
+--- @param config table 配置
+function M.initialize(config)
+    if state.initialized then
+        return
+    end
+
+    state.config = config or {}
+    state.current_mode = config.default_mode or "float"
+    state.initialized = true
+end
+
+--- 切换窗口模式
+--- @param mode string|nil 目标模式（如果为nil则循环切换）
+function M.toggle_mode(mode)
+    if not state.initialized then
+        return
+    end
+
+    if mode then
+        -- 切换到指定模式
+        if vim.tbl_contains(state.available_modes, mode) then
+            state.current_mode = mode
+            vim.notify("[NeoAI] 窗口模式切换为: " .. mode, vim.log.levels.INFO)
+        else
+            vim.notify("[NeoAI] 无效的窗口模式: " .. mode, vim.log.levels.ERROR)
+        end
+    else
+        -- 循环切换模式
+        local current_index = 1
+        for i, available_mode in ipairs(state.available_modes) do
+            if available_mode == state.current_mode then
+                current_index = i
+                break
+            end
+        end
+        
+        local next_index = (current_index % #state.available_modes) + 1
+        state.current_mode = state.available_modes[next_index]
+        vim.notify("[NeoAI] 窗口模式切换为: " .. state.current_mode, vim.log.levels.INFO)
+    end
+end
+
+--- 获取当前窗口模式
+--- @return string 当前模式
+function M.get_current_mode()
+    return state.current_mode
+end
+
+--- 设置窗口模式
+--- @param mode string 窗口模式
+function M.set_mode(mode)
+    if not state.initialized then
+        return
+    end
+
+    if vim.tbl_contains(state.available_modes, mode) then
+        state.current_mode = mode
+        vim.notify("[NeoAI] 窗口模式设置为: " .. mode, vim.log.levels.INFO)
+    else
+        vim.notify("[NeoAI] 无效的窗口模式: " .. mode, vim.log.levels.ERROR)
+    end
+end
+
 --- 检查窗口是否有效
 --- @param window_info table 窗口信息
 --- @return boolean 是否有效
