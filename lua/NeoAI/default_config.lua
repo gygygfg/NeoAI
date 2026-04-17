@@ -10,6 +10,7 @@ local DEFAULT_CONFIG = {
     temperature = 0.7,
     max_tokens = 4096,
     stream = true,
+    timeout = 60000, -- HTTP请求超时时间（毫秒）
   },
   -- UI配置
   ui = {
@@ -78,7 +79,7 @@ local DEFAULT_CONFIG = {
   -- 测试配置
   test = {
     auto_test = false, -- 是否在启动后自动运行所有测试
-    delay_ms = 500, -- 延迟毫秒数
+    delay_ms = 1500, -- 延迟毫秒数（VimEnter后1500毫秒）
   },
 }
 

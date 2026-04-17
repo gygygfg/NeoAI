@@ -755,4 +755,23 @@ function M.select_node(node_id)
     return true
 end
 
+--- 测试树窗口创建
+--- @return boolean 测试是否成功
+function M.test_window_creation()
+    if not state.initialized then
+        return false
+    end
+    
+    -- 尝试打开一个测试树窗口
+    local window_id = M.open("test_session")
+    
+    if window_id then
+        -- 成功创建，关闭窗口
+        M.close()
+        return true
+    end
+    
+    return false
+end
+
 return M

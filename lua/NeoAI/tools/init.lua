@@ -28,7 +28,7 @@ function M.initialize(tools_config)
   tool_registry.initialize(state.config)
   tool_executor.initialize(state.config)
   tool_validator.initialize(state.config)
-  
+
   -- 初始化新模块
   event_bus.initialize(state.config)
   history_manager.initialize(state.config)
@@ -65,7 +65,7 @@ function M.register_tool(tool_def)
   local success, reg_error = pcall(function()
     return tool_registry.register(tool_def)
   end)
-  
+
   if not success then
     vim.notify("工具注册异常: " .. reg_error, vim.log.levels.ERROR)
     return false
@@ -74,8 +74,8 @@ function M.register_tool(tool_def)
     vim.notify("工具注册失败: " .. tool_def.name, vim.log.levels.WARN)
     return false
   end
-  
-  vim.notify("[NeoAI] 工具注册成功: " .. tool_def.name, vim.log.levels.INFO)
+
+  -- vim.notify("[NeoAI] 工具注册成功: " .. tool_def.name, vim.log.levels.INFO)
   return true
 end
 
@@ -274,7 +274,7 @@ function M.update_config(new_config)
   tool_registry.update_config(state.config)
   tool_executor.update_config(state.config)
   tool_validator.update_config(state.config)
-  
+
   -- 更新新模块配置
   event_bus.initialize(state.config)
   history_manager.initialize(state.config)
@@ -287,7 +287,7 @@ function M.get_event_bus()
   if not state.initialized then
     error("Tools system not initialized")
   end
-  
+
   return event_bus
 end
 
@@ -297,7 +297,7 @@ function M.get_history_manager()
   if not state.initialized then
     error("Tools system not initialized")
   end
-  
+
   return history_manager
 end
 
@@ -307,9 +307,8 @@ function M.get_config_manager()
   if not state.initialized then
     error("Tools system not initialized")
   end
-  
+
   return config_manager
 end
 
 return M
-

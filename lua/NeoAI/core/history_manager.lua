@@ -150,12 +150,45 @@ function M.initialize(options)
     
     options = options or {}
     state.event_bus = options.event_bus
-    state.config = options.config or {}
+    
+    -- 注意：options 可能直接就是配置表，也可能包含在 config 字段中
+    -- 为了兼容性，我们检查 options 是否有 config 字段
+    local input_config = nil
+    if options.config then
+        input_config = options.config or {}
+    else
+        input_config = options or {}
+    end
+    
+    -- 调试信息
+    -- print("[历史管理器] 输入配置: " .. vim.inspect(input_config))
+    -- print("[历史管理器] 输入配置.save_path = " .. tostring(input_config.save_path))
+    -- print("[历史管理器] 输入配置.max_history_per_session = " .. tostring(input_config.max_history_per_session))
+    
+    -- 创建配置的副本，避免修改传入的配置表
+    state.config = vim.deepcopy(input_config)
+    
+    -- 调试信息
+    -- print("[历史管理器] 复制后配置: " .. vim.inspect(state.config))
     
     -- 确保配置有默认值
+    local original_save_path = state.config.save_path
     state.config.save_path = state.config.save_path or vim.fn.stdpath("data") .. "/neoa"
+    
+    -- 调试信息
+    -- if original_save_path ~= state.config.save_path then
+    --     print("[历史管理器] save_path 被修改: " .. tostring(original_save_path) .. " -> " .. tostring(state.config.save_path))
+    -- end
+    
     state.config.auto_save = state.config.auto_save or false
+    
+    local original_max_history = state.config.max_history_per_session
     state.config.max_history_per_session = state.config.max_history_per_session or 100
+    
+    -- 调试信息
+    -- if original_max_history ~= state.config.max_history_per_session then
+    --     print("[历史管理器] max_history_per_session 被修改: " .. tostring(original_max_history) .. " -> " .. tostring(state.config.max_history_per_session))
+    -- end
     
     state.max_history_per_session = state.config.max_history_per_session
     state.sessions = {}
@@ -487,6 +520,16 @@ function M.update_config(new_config)
     
     state.config = vim.tbl_extend("force", state.config, new_config or {})
     state.max_history_per_session = state.config.max_history_per_session or 100
+end
+
+--- 重置历史管理器状态（仅用于测试）
+function M._test_reset()
+    state.initialized = false
+    state.event_bus = nil
+    state.config = nil
+    state.sessions = {}
+    state.current_session_id = nil
+    state.max_history_per_session = 100
 end
 
 return M

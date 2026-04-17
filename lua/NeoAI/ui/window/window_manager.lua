@@ -362,6 +362,51 @@ function M.update_config(new_config)
   state.config = vim.tbl_extend("force", state.config, new_config or {})
 end
 
+--- 检查窗口是否打开
+--- @param window_id string 窗口ID
+--- @return boolean 窗口是否打开
+function M.is_window_open(window_id)
+  if not window_id then
+    return false
+  end
+  
+  local window = windows[window_id]
+  if not window then
+    return false
+  end
+  
+  -- 检查窗口句柄是否有效
+  if window.win and vim.api.nvim_win_is_valid(window.win) then
+    return true
+  end
+  
+  return false
+end
+
+--- 测试窗口创建
+--- @return boolean 测试是否成功
+function M.test_window_creation()
+  if not state.initialized then
+    return false
+  end
+  
+  -- 尝试创建一个测试窗口
+  local test_window_id = M.create_window("test", {
+    title = "测试窗口",
+    width = 40,
+    height = 20,
+    border = "rounded"
+  })
+  
+  if test_window_id then
+    -- 成功创建，关闭测试窗口
+    M.close_window(test_window_id)
+    return true
+  end
+  
+  return false
+end
+
 
 
 return M

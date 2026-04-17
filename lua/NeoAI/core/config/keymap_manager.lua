@@ -122,7 +122,7 @@ function M.set_keymap(context, action, key, desc)
     desc = desc or DEFAULT_KEYMAPS[context][action].desc,
   }
 
-  vim.notify(string.format("[NeoAI] 已设置键位 %s.%s = %s", context, action, key), vim.log.levels.INFO)
+  -- vim.notify(string.format("[NeoAI] 已设置键位 %s.%s = %s", context, action, key), vim.log.levels.INFO)
   return true
 end
 
@@ -371,10 +371,10 @@ function M.get_default_keymaps()
     vim.notify("[NeoAI] 键位管理器未初始化，请先调用initialize()", vim.log.levels.WARN)
     return {}
   end
-  
+
   -- 将内部格式转换为测试期望的格式
   local test_format_keymaps = {}
-  
+
   -- 转换全局上下文键位
   if DEFAULT_KEYMAPS.global then
     for action, key_config in pairs(DEFAULT_KEYMAPS.global) do
@@ -385,11 +385,11 @@ function M.get_default_keymaps()
           -- 模拟动作
           vim.notify(string.format("[NeoAI] 执行动作: %s", action), vim.log.levels.INFO)
         end,
-        desc = key_config.desc or action
+        desc = key_config.desc or action,
       })
     end
   end
-  
+
   return test_format_keymaps
 end
 
@@ -400,15 +400,18 @@ function M.register_keymap(keymap)
   if not keymap or type(keymap) ~= "table" then
     return false
   end
-  
+
   -- 验证必需字段
   if not keymap.mode or not keymap.key or not keymap.action then
     return false
   end
-  
+
   -- 在测试环境中，我们只是记录注册
-  vim.notify(string.format("[NeoAI] 测试: 注册键位 %s (%s)", keymap.key, keymap.desc or "无描述"), vim.log.levels.INFO)
-  
+  vim.notify(
+    string.format("[NeoAI] 测试: 注册键位 %s (%s)", keymap.key, keymap.desc or "无描述"),
+    vim.log.levels.INFO
+  )
+
   return true
 end
 

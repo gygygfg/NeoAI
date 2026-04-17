@@ -1145,6 +1145,26 @@ function M.update_config(new_config)
     end
 end
 
+--- 获取聊天窗口缓冲区句柄
+--- @return number|nil 缓冲区句柄
+function M.get_bufnr()
+    if not state.current_window_id then
+        return nil
+    end
+    
+    return window_manager.get_window_buf(state.current_window_id)
+end
+
+--- 获取聊天窗口窗口句柄
+--- @return number|nil 窗口句柄
+function M.get_winid()
+    if not state.current_window_id then
+        return nil
+    end
+    
+    return window_manager.get_window_win(state.current_window_id)
+end
+
 --- 刷新聊天窗口
 --- @return boolean 是否成功
 function M.refresh()

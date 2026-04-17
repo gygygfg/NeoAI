@@ -19,6 +19,7 @@ local state = {
   windows = {},
   current_ui_mode = nil, -- 'tree' 或 'chat'
   event_count = 0,       -- 事件处理计数
+  event_bus = nil,       -- 事件总线引用
 }
 
 --- 初始化UI模块
@@ -51,6 +52,17 @@ function M.initialize(config)
             return {}
           end
         }
+      end,
+      get_event_bus = function()
+        -- 返回一个模拟的事件总线
+        return {
+          on = function(event, callback)
+            -- 模拟事件监听
+          end,
+          emit = function(event, ...)
+            -- 模拟事件触发
+          end
+        }
       end
     }
     print("⚠️  核心模块未找到，使用模拟模块进行测试")
@@ -74,8 +86,17 @@ function M.initialize(config)
   chat_window.initialize(state.config)
 
   -- 设置事件处理器
-  tree_handlers.initialize(state.config.handlers or {})
-  chat_handlers.initialize(state.config.handlers or {})
+  -- 从核心模块获取事件总线
+  local event_bus = nil
+  if core and core.get_event_bus then
+    event_bus = core.get_event_bus()
+  end
+  
+  -- 保存事件总线引用
+  state.event_bus = event_bus
+  
+  tree_handlers.initialize(event_bus, state.config.handlers or {})
+  chat_handlers.initialize(event_bus, state.config.handlers or {})
 
   state.initialized = true
   return M
@@ -106,6 +127,11 @@ function M.open_tree_ui()
 
     -- 聚焦树窗口
     window_manager.focus_window(tree_win_id)
+    
+    -- 触发树窗口打开事件
+    if state.event_bus and state.event_bus.emit then
+      state.event_bus.emit("tree_window_opened", session_id, "main")
+    end
   end
 end
 
@@ -142,6 +168,11 @@ function M.open_chat_ui(session_id, branch_id)
 
     -- 聚焦聊天窗口
     window_manager.focus_window(chat_win_id)
+    
+    -- 触发聊天窗口打开事件
+    if state.event_bus and state.event_bus.emit then
+      state.event_bus.emit("chat_window_opened", session_id, branch_id)
+    end
   end
 end
 
@@ -249,7 +280,7 @@ end
 --- 处理按键输入
 --- @param key string 按键
 function M.handle_key_input(key)
-  if not state.initialized or not state.current_ui_mode then
+  if not state.initialized then
     return
   end
 
@@ -257,8 +288,13 @@ function M.handle_key_input(key)
   state.event_count = (state.event_count or 0) + 1
   
   -- 记录事件处理
-  print(string.format("UI事件处理: 模式=%s, 按键=%s, 计数=%d", 
-    state.current_ui_mode, key, state.event_count))
+  print(string.format("UI事件处理: 按键=%s, 计数=%d", key, state.event_count))
+  
+  -- 如果没有当前UI模式，只记录事件但不处理
+  if not state.current_ui_mode then
+    print("⚠️  没有当前UI模式，仅记录事件")
+    return
+  end
   
   -- 避免无限递归，直接调用处理器而不通过handle_key_input
   if state.current_ui_mode == "tree" then

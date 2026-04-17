@@ -26,6 +26,7 @@ function M.initialize(core_config)
 
   -- 初始化事件总线
   state.event_bus = event_bus
+  state.event_bus.initialize()
 
   -- 初始化配置管理器
   config_manager.initialize(core_config or {})

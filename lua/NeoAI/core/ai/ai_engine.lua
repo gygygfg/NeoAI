@@ -243,7 +243,7 @@ function M._generate_response_async(generation_id, messages, options, callbacks)
   end
 
   -- 发送HTTP请求（使用兼容的HTTP客户端）
-  local json = require("cjson")
+  local json = require("NeoAI.utils.json")
 
   local request_url = state.config.base_url or "https://api.deepseek.com/chat/completions"
 
@@ -271,39 +271,150 @@ function M._generate_response_async(generation_id, messages, options, callbacks)
 
   -- 检查vim.system是否可用（Neovim 0.10+）
   if vim.system then
-    -- 使用vim.system执行curl命令
-    local result = vim
-      .system(curl_cmd, {
-        text = true,
-      })
-      :wait()
+    -- 使用vim.system的异步模式执行curl命令
+    -- 创建闭包以捕获messages变量
+    local process_response = function(result)
+      -- 在回调中处理响应
+      vim.schedule(function()
+        if result.code ~= 0 then
+          local error_msg = "HTTP请求失败: curl退出码 " .. tostring(result.code)
+          if result.stderr and #result.stderr > 0 then
+            error_msg = error_msg .. ": " .. result.stderr
+          end
+          M._handle_generation_error(generation_id, error_msg, callbacks)
+          return
+        end
 
-    -- 处理响应
-    if result.code ~= 0 then
-      local error_msg = "HTTP请求失败: curl退出码 " .. tostring(result.code)
-      if result.stderr and #result.stderr > 0 then
-        error_msg = error_msg .. ": " .. result.stderr
+        local response_text = result.stdout
+        M._process_http_response(generation_id, response_text, messages, options, callbacks)
+      end)
+    end
+    
+    local system_obj = vim.system(curl_cmd, {
+      text = true,
+    }, process_response)
+
+    -- 设置超时（从配置获取，默认60秒）
+    local timeout_ms = state.config.timeout or 60000
+    vim.defer_fn(function()
+      if system_obj then
+        -- 检查 system_obj 的类型
+        if type(system_obj) == "table" then
+          -- Neovim 0.10+ 返回对象，可能有 pid 方法
+          if system_obj.pid and type(system_obj.pid) == "function" then
+            local pid = system_obj:pid()
+            if pid then
+              system_obj:kill(9) -- 强制终止进程
+              M._handle_generation_error(generation_id, "HTTP请求超时（" .. (timeout_ms/1000) .. "秒）", callbacks)
+            end
+          elseif system_obj.pid and type(system_obj.pid) == "number" then
+            -- pid 是数字属性
+            os.execute("kill -9 " .. system_obj.pid .. " 2>/dev/null")
+            M._handle_generation_error(generation_id, "HTTP请求超时（" .. (timeout_ms/1000) .. "秒）", callbacks)
+          end
+        elseif type(system_obj) == "number" then
+          -- 如果是进程ID，使用系统命令终止
+          os.execute("kill -9 " .. system_obj .. " 2>/dev/null")
+          M._handle_generation_error(generation_id, "HTTP请求超时（" .. (timeout_ms/1000) .. "秒）", callbacks)
+        end
       end
-      M._handle_generation_error(generation_id, error_msg, callbacks)
-      return
-    end
+    end, timeout_ms)
 
-    response_text = result.stdout
+    return -- 立即返回，不等待HTTP请求完成
   else
-    -- 回退到vim.fn.system（旧版本Neovim）
+    -- 回退到vim.fn.system（旧版本Neovim）- 使用vim.loop.spawn实现异步
     local cmd_str = table.concat(curl_cmd, " ")
-    response_text = vim.fn.system(cmd_str)
+    
+    -- 使用vim.loop.spawn实现异步执行
+    local handle
+    local stdout_data = {}
+    local stderr_data = {}
+    
+    -- 创建闭包以捕获messages变量
+    local spawn_callback = function(code, signal)
+      vim.schedule(function()
+        if code ~= 0 then
+          local error_msg = "HTTP请求失败: 退出码 " .. tostring(code)
+          if #stderr_data > 0 then
+            error_msg = error_msg .. ": " .. table.concat(stderr_data, " ")
+          end
+          M._handle_generation_error(generation_id, error_msg, callbacks)
+          return
+        end
 
-    -- 检查命令是否成功
-    if vim.v.shell_error ~= 0 then
-      local error_msg = "HTTP请求失败: shell错误码 " .. tostring(vim.v.shell_error)
-      M._handle_generation_error(generation_id, error_msg, callbacks)
-      return
+        local response_text = table.concat(stdout_data, "")
+        M._process_http_response(generation_id, response_text, messages, options, callbacks)
+      end)
     end
+    
+    handle = vim.loop.spawn("sh", {
+      args = {"-c", cmd_str},
+    }, spawn_callback)
+    
+    if handle then
+      -- 读取stdout
+      vim.loop.read_start(handle, function(err, data)
+        if data then
+          table.insert(stdout_data, data)
+        end
+      end)
+      
+      -- 读取stderr
+      vim.loop.read_start(handle, function(err, data)
+        if data then
+          table.insert(stderr_data, data)
+        end
+      end)
+      
+      -- 设置超时（从配置获取，默认60秒）
+      local timeout_ms = state.config.timeout or 60000
+      vim.defer_fn(function()
+        if handle and handle:is_active() then
+          handle:kill(9) -- 强制终止进程
+          M._handle_generation_error(generation_id, "HTTP请求超时（" .. (timeout_ms/1000) .. "秒）", callbacks)
+        end
+      end, timeout_ms)
+    else
+      M._handle_generation_error(generation_id, "无法启动HTTP请求进程", callbacks)
+    end
+    
+    return -- 立即返回，不等待HTTP请求完成
   end
 
+  -- 注意：这个函数现在会在HTTP请求完成后被异步调用
+  -- 实际的响应处理逻辑已经移到_process_http_response函数中
+  
+  -- 函数立即返回，不等待HTTP请求完成
+  return nil
+end
+
+--- 处理HTTP响应（异步回调）
+--- @param generation_id string 生成ID
+--- @param response_text string 响应文本
+--- @param messages table 消息列表
+--- @param options table 选项
+--- @param callbacks table 回调函数
+function M._process_http_response(generation_id, response_text, messages, options, callbacks)
+  -- 提取回调函数
+  local on_chunk = callbacks and callbacks.on_chunk
+  local on_complete = callbacks and callbacks.on_complete
+  
+  local json = require("NeoAI.utils.json")
+  
+  -- 检查响应文本是否有效
+  if not response_text or response_text == "" then
+    local error_msg = "API响应为空"
+    M._handle_generation_error(generation_id, error_msg, callbacks)
+    return
+  end
+  
   -- 解析响应
-  local response_data = json.decode(response_text)
+  local success, response_data = pcall(json.decode, response_text)
+  if not success then
+    local error_msg = "API响应JSON解析失败: " .. tostring(response_data)
+    M._handle_generation_error(generation_id, error_msg, callbacks)
+    return
+  end
 
   if not response_data or not response_data.choices or #response_data.choices == 0 then
     local error_msg = "API响应格式错误"
@@ -315,6 +426,9 @@ function M._generate_response_async(generation_id, messages, options, callbacks)
 
   -- 处理工具调用
   if options.tools and #options.tools > 0 then
+    -- 延迟加载tool_orchestrator
+    local tool_orchestrator = require("NeoAI.core.ai.tool_orchestrator")
+    -- 现在可以使用传递的messages参数
     local tool_result = tool_orchestrator.execute_tool_loop(messages)
     if tool_result then
       response = tool_result

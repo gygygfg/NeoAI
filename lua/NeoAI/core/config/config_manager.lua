@@ -1,3 +1,5 @@
+local M = {}
+
 local default_config = {
   -- AI配置
   ai = {
@@ -78,3 +80,73 @@ local default_config = {
     delay_ms = 500, -- 延迟毫秒数
   },
 }
+
+-- 当前配置
+local current_config = {}
+
+--- 初始化配置管理器
+--- @param user_config table 用户配置
+function M.initialize(user_config)
+  -- 合并默认配置和用户配置
+  current_config = vim.tbl_deep_extend("force", {}, default_config, user_config or {})
+end
+
+--- 获取配置值
+--- @param key string 配置键（支持点号分隔，如 "ai.model"）
+--- @return any 配置值
+function M.get(key)
+  if not key then
+    return current_config
+  end
+
+  local keys = vim.split(key, ".", { plain = true })
+  local value = current_config
+
+  for _, k in ipairs(keys) do
+    if type(value) == "table" then
+      value = value[k]
+    else
+      return nil
+    end
+  end
+
+  return value
+end
+
+--- 设置配置值
+--- @param key string 配置键（支持点号分隔）
+--- @param value any 配置值
+function M.set(key, value)
+  if not key then
+    return
+  end
+
+  local keys = vim.split(key, ".", { plain = true })
+  local target = current_config
+
+  -- 遍历到倒数第二个键
+  for i = 1, #keys - 1 do
+    local k = keys[i]
+    if not target[k] or type(target[k]) ~= "table" then
+      target[k] = {}
+    end
+    target = target[k]
+  end
+
+  -- 设置最后一个键的值
+  local last_key = keys[#keys]
+  target[last_key] = value
+end
+
+--- 重置配置为默认值
+function M.reset()
+  current_config = vim.tbl_deep_extend("force", {}, default_config)
+end
+
+--- 获取所有配置
+--- @return table 所有配置
+function M.get_all()
+  return vim.tbl_deep_extend("force", {}, current_config)
+end
+
+return M
