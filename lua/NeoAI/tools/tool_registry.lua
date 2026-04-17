@@ -107,6 +107,27 @@ function M.get(tool_name)
     return vim.deepcopy(tools[tool_name])
 end
 
+--- 获取工具（别名，用于兼容性）
+--- @param tool_name string 工具名称
+--- @return table|nil 工具定义
+function M.get_tool(tool_name)
+    return M.get(tool_name)
+end
+
+--- 获取所有工具（以名称为键的表）
+--- @return table 所有工具的表
+function M.get_all_tools()
+    if not state.initialized then
+        error("Tool registry not initialized")
+    end
+
+    local result = {}
+    for name, tool in pairs(tools) do
+        result[name] = vim.deepcopy(tool)
+    end
+    return result
+end
+
 --- 列出所有工具
 --- @param category string|nil 分类（可选）
 --- @return table 工具列表

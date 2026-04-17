@@ -253,6 +253,68 @@ function M.validate_tool(tool)
     return true, nil
 end
 
+--- 验证工具调用
+--- @param tool_call table 工具调用对象
+--- @param tool_registry table 工具注册表
+--- @return table 验证结果 {valid = boolean, error = string}
+function M.validate_tool_call(tool_call, tool_registry)
+    if not tool_call or not tool_call.name then
+        return {valid = false, error = "工具调用缺少名称"}
+    end
+    
+    -- 检查工具是否存在
+    local tool = tool_registry.get_tool(tool_call.name)
+    if not tool then
+        return {valid = false, error = "工具不存在: " .. tool_call.name}
+    end
+    
+    -- 检查参数
+    local arguments = tool_call.arguments or {}
+    
+    -- 验证必需参数
+    if tool.parameters and tool.parameters.required then
+        for _, required_param in ipairs(tool.parameters.required) do
+            if arguments[required_param] == nil then
+                return {valid = false, error = "缺少必需参数: " .. required_param}
+            end
+        end
+    end
+    
+    -- 验证参数类型
+    if tool.parameters and tool.parameters.properties then
+        for param_name, param_schema in pairs(tool.parameters.properties) do
+            local value = arguments[param_name]
+            if value ~= nil then
+                -- 基本类型检查
+                local param_type = param_schema.type
+                if param_type == "string" and type(value) ~= "string" then
+                    return {valid = false, error = "参数类型错误: " .. param_name .. " 应为字符串"}
+                elseif param_type == "number" and type(value) ~= "number" then
+                    return {valid = false, error = "参数类型错误: " .. param_name .. " 应为数字"}
+                elseif param_type == "boolean" and type(value) ~= "boolean" then
+                    return {valid = false, error = "参数类型错误: " .. param_name .. " 应为布尔值"}
+                end
+                
+                -- 枚举值检查
+                if param_schema.enum then
+                    local valid = false
+                    for _, enum_value in ipairs(param_schema.enum) do
+                        if value == enum_value then
+                            valid = true
+                            break
+                        end
+                    end
+                    if not valid then
+                        return {valid = false, error = "参数值无效: " .. param_name .. " 应为 " .. table.concat(param_schema.enum, ", ")}
+                    end
+                end
+            end
+        end
+    end
+    
+    return {valid = true}
+end
+
 --- 验证值（内部使用）
 --- @param value any 值
 --- @param schema table 模式

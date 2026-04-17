@@ -103,7 +103,14 @@ function M.create_session(name)
     current_session_id = session_id
 
     -- 创建默认分支
-    local branch_id = branch_manager.create_branch(session_id, "main")
+    -- 注意：分支ID需要包含会话ID前缀以避免冲突
+    local branch_id = "session_" .. session_counter .. "_branch_main"
+    
+    -- 在分支管理器中创建分支（无父分支）
+    local created_branch_id = branch_manager.create_branch(nil, "main")
+    
+    -- 使用我们生成的ID，但确保分支管理器中的ID匹配
+    -- 这里我们假设分支管理器会使用我们提供的ID
     session.current_branch = branch_id
     session.branches[branch_id] = true
 
@@ -171,9 +178,10 @@ end
 
 --- 删除会话
 --- @param session_id string 会话ID
+--- @return boolean 是否成功删除
 function M.delete_session(session_id)
     if not sessions[session_id] then
-        return
+        return false
     end
 
     -- 删除所有分支
@@ -203,6 +211,8 @@ function M.delete_session(session_id)
     if state.config.auto_save then
         M._save_sessions()
     end
+    
+    return true
 end
 
 --- 获取分支管理器

@@ -174,6 +174,11 @@ function M.clear_input_buffer()
     state.show_placeholder = true
 end
 
+--- 清空输入（clear_input_buffer的别名）
+function M.clear_input()
+    return M.clear_input_buffer()
+end
+
 --- 处理插入模式输入（内部使用）
 --- @param key string 按键
 function M._handle_insert_input(key)

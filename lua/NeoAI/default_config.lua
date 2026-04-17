@@ -27,39 +27,40 @@ local DEFAULT_CONFIG = {
       border = "FloatBorder",
       text = "Normal",
     },
-    keymaps = {
-      global = {
-        open_tree = { key = "<leader>at", desc = "打开树界面" },
-        open_chat = { key = "<leader>ac", desc = "打开聊天界面" },
-        close_all = { key = "<leader>aq", desc = "关闭所有窗口" },
-        toggle_ui = { key = "<leader>aa", desc = "切换UI显示" },
-      },
-      tree = {
-        select = { key = "<CR>", desc = "选择节点/分支" },
-        new_child = { key = "n", desc = "新建子分支" },
-        new_root = { key = "N", desc = "新建根分支" },
-        delete_dialog = { key = "d", desc = "删除对话" },
-        delete_branch = { key = "D", desc = "删除分支" },
-        expand = { key = "o", desc = "展开节点" },
-        collapse = { key = "O", desc = "折叠节点" },
-      },
-      chat = {
-        send = { key = "<C-s>", desc = "发送消息" },
-        cancel = { key = "<Esc>", desc = "取消生成" },
-        edit = { key = "e", desc = "编辑消息" },
-        delete = { key = "dd", desc = "删除消息" },
-        scroll_up = { key = "<C-u>", desc = "向上滚动" },
-        scroll_down = { key = "<C-d>", desc = "向下滚动" },
-        toggle_reasoning = { key = "r", desc = "切换思考过程显示" },
-        newline = { key = "<C-CR>", desc = "新建行" },
-        clear = { key = "<C-u>", desc = "清空输入" },
-      },
-      virtual_input = {
-        normal_mode = { key = "<Esc>", desc = "回到正常模式" },
-        submit = { key = "<CR>", desc = "发送消息" },
-        cancel = { key = "<C-c>", desc = "回到正常模式" },
-        clear = { key = "<C-u>", desc = "清空输入" },
-      },
+  },
+  -- 键位配置
+  keymaps = {
+    global = {
+      open_tree = { key = "<leader>at", desc = "打开树界面" },
+      open_chat = { key = "<leader>ac", desc = "打开聊天界面" },
+      close_all = { key = "<leader>aq", desc = "关闭所有窗口" },
+      toggle_ui = { key = "<leader>aa", desc = "切换UI显示" },
+    },
+    tree = {
+      select = { key = "<CR>", desc = "选择节点/分支" },
+      new_child = { key = "n", desc = "新建子分支" },
+      new_root = { key = "N", desc = "新建根分支" },
+      delete_dialog = { key = "d", desc = "删除对话" },
+      delete_branch = { key = "D", desc = "删除分支" },
+      expand = { key = "o", desc = "展开节点" },
+      collapse = { key = "O", desc = "折叠节点" },
+    },
+    chat = {
+      send = { key = "<C-s>", desc = "发送消息" },
+      cancel = { key = "<Esc>", desc = "取消生成" },
+      edit = { key = "e", desc = "编辑消息" },
+      delete = { key = "dd", desc = "删除消息" },
+      scroll_up = { key = "<C-u>", desc = "向上滚动" },
+      scroll_down = { key = "<C-d>", desc = "向下滚动" },
+      toggle_reasoning = { key = "r", desc = "切换思考过程显示" },
+      newline = { key = "<C-CR>", desc = "新建行" },
+      clear = { key = "<C-u>", desc = "清空输入" },
+    },
+    virtual_input = {
+      normal_mode = { key = "<CR>", desc = "发送消息" },
+      submit = { key = "<C-s>", desc = "发送消息(Ctrl+s)" },
+      cancel = { key = "<Esc>", desc = "取消输入并关闭输入框" },
+      clear = { key = "<C-u>", desc = "清空输入" },
     },
   },
   -- 会话配置
@@ -73,6 +74,11 @@ local DEFAULT_CONFIG = {
     enabled = true,
     builtin = true,
     external = {},
+  },
+  -- 测试配置
+  test = {
+    auto_test = false, -- 是否在启动后自动运行所有测试
+    delay_ms = 500, -- 延迟毫秒数
   },
 }
 
@@ -147,20 +153,20 @@ function M.validate_config(config)
       end
     end
 
-    -- 验证键位配置
-    if config.ui.keymaps then
-      local valid_contexts = { "global", "tree", "chat" }
-      for context, keymap_table in pairs(config.ui.keymaps) do
+    -- 验证键位配置（现在在顶层）
+    if config.keymaps then
+      local valid_contexts = { "global", "tree", "chat", "virtual_input" }
+      for context, keymap_table in pairs(config.keymaps) do
         -- 检查上下文是否有效
         if not vim.tbl_contains(valid_contexts, context) then
           vim.notify(
             string.format(
-              "[NeoAI] Invalid keymap context: %s. Valid contexts are: global, tree, chat. Using default.",
+              "[NeoAI] Invalid keymap context: %s. Valid contexts are: global, tree, chat, virtual_input. Using default.",
               context
             ),
             vim.log.levels.WARN
           )
-          config.ui.keymaps[context] = nil
+          config.keymaps[context] = nil
         else
           -- 检查键位表是否为table
           if type(keymap_table) ~= "table" then
@@ -168,7 +174,7 @@ function M.validate_config(config)
               string.format("[NeoAI] keymaps.%s must be a table. Using default.", context),
               vim.log.levels.WARN
             )
-            config.ui.keymaps[context] = nil
+            config.keymaps[context] = nil
           else
             -- 验证每个键位配置
             for action, key_config in pairs(keymap_table) do

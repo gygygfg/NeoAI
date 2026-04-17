@@ -8,13 +8,16 @@ local state = {
 
 --- 初始化树界面处理器
 --- @param config table 配置
+--- @return boolean 初始化是否成功
 function M.initialize(config)
     if state.initialized then
-        return
+        return true
     end
 
     state.config = config or {}
     state.initialized = true
+    
+    return true
 end
 
 --- 处理回车（选择分支）
@@ -146,6 +149,49 @@ function M.handle_left()
     end
 
     vim.notify("向左导航", vim.log.levels.INFO)
+
+--- 选择节点
+--- @param node_id string 节点ID
+function M.select_node(node_id)
+    if not state.initialized then
+        return false, "树形视图处理器未初始化"
+    end
+    
+    -- 获取树窗口模块
+    local tree_window = require("NeoAI.ui.window.tree_window")
+    
+    -- 选择节点
+    local success = tree_window.select_node(node_id)
+    return success
+end
+
+--- 刷新树
+function M.refresh_tree()
+    if not state.initialized then
+        return false, "树形视图处理器未初始化"
+    end
+    
+    -- 获取树窗口模块
+    local tree_window = require("NeoAI.ui.window.tree_window")
+    
+    -- 刷新树窗口
+    local success = tree_window.refresh()
+    return success
+end
+
+--- 获取选中的节点
+--- @return string|nil 节点ID
+function M.get_selected_node()
+    if not state.initialized then
+        return nil
+    end
+    
+    -- 获取树窗口模块
+    local tree_window = require("NeoAI.ui.window.tree_window")
+    
+    -- 获取选中的节点
+    return tree_window.get_selected_node()
+end
     
     -- 这里应该折叠当前节点或移动到父节点
 end

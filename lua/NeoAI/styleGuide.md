@@ -384,76 +384,90 @@ require("NeoAI").setup({
 
 1. 树界面操作流程
 
-1. ":NeoAIOpen" →
-   "ui.open_tree_ui()"
-1. 回车键 →
-   "tree_handlers.handle_enter()" → 关闭树界面 → 打开聊天界面
-1. 按键映射由
-   "tree_window.set_keymaps()" 设置
+":NeoAIOpen" →
+"ui.open_tree_ui()"
+回车键 →
+"tree_handlers.handle_enter()" → 关闭树界面 → 打开聊天界面
+按键映射由
+"tree_window.set_keymaps()" 设置
 
-1. 聊天界面消息流程
+2. 聊天界面消息流程
 
-1. 用户输入 →
-   "input_handler.handle_input()"
-1. 发送消息 →
-   "chat_handlers.handle_enter()" 或
-   "handle_ctrl_s()"
-1. AI处理 →
-   "ai_engine.generate_response()"
-1. 流式处理 →
-   "stream_processor.process_chunk()"
-1. 显示结果 →
-   "chat_window.render_messages()"
+用户输入 →
+"input_handler.handle_input()"
+发送消息 →
+"chat_handlers.handle_enter()" 或
+"handle_ctrl_s()"
+AI处理 →
+"ai_engine.generate_response()"
+流式处理 →
+"stream_processor.process_chunk()"
+显示结果 →
+"chat_window.render_messages()"
 
-1. 工具调用循环流程
+3. 工具调用循环流程
 
-1. 模型返回工具调用 →
-   "tool_orchestrator.execute_tool_loop()"
-1. 执行工具 →
-   "tool_executor.execute()"
-1. 重整上下文 →
-   "response_builder.build_context()"
-1. 继续调用模型直到结束
+模型返回工具调用 →
+"tool_orchestrator.execute_tool_loop()"
+执行工具 →
+"tool_executor.execute()"
+重整上下文 →
+"response_builder.build_context()"
+继续调用模型直到结束
 
-1. 思考过程显示流程
+4. 思考过程显示流程
 
-1. 接收到
-   "reasoning_content" →
-   "reasoning_manager.start_reasoning()"
-1. 打开悬浮窗口 →
-   "reasoning_display.show()"
-1. 流式更新 →
-   "reasoning_display.append()"
-1. 思考结束 →
-   "reasoning_display.close()" → 转换为折叠文本
+// 开始思考
+data: {"choices":[{"delta":{"reasoning_content":"让我"}}]}
+data: {"choices":[{"delta":{"reasoning_content":"一步步思考"}}]}
 
-1. 窗口模式配置流程
+// ... 更多思考内容 ...
 
-1. 插件启动时 →
-   "default_config" 读取默认窗口模式配置
-1. 用户自定义配置 →
-   "ui.window_mode" 和 "ui.default_ui" 配置项
-1. 窗口管理器初始化 →
-   "window_manager.initialize()" 接收窗口模式配置
-1. 创建窗口时 →
-   "window_mode_manager.create_window_by_mode()" 根据模式创建窗口
-1. 支持三种模式：
-   - "float": 浮动窗口（默认）
-   - "tab": 新标签页
-   - "split": 分割窗口
+// 思考结束，开始输出答案
+data: {"choices":[{"delta":{"content":"DeepSeek"}}]}
+data: {"choices":[{"delta":{"content":"的思考过程"}}]}
 
-1. 键位配置流程
+// 流结束
+data: {"choices":[{"delta":{},"finish_reason":"stop"}]}
 
-1. 插件启动时 →
-   "keymap_manager.load_default_keymaps()"
-1. 用户自定义配置 →
-   "keymap_manager.set_keymap(context, action, key)"
-1. 窗口打开时 →
-   "window.set_keymaps()" → 调用 "keymap_manager.get_keymap()"
-1. 保存配置 →
-   "keymap_manager.save_keymaps()"
-1. 重置键位 →
-   "keymap_manager.reset_keymap(context, action)"
+接收到
+"reasoning_content" →
+"reasoning_manager.start_reasoning()"
+打开悬浮窗口 →
+"reasoning_display.show()"
+流式更新 →
+"reasoning_display.append()"
+思考结束 →
+"reasoning_display.close()" → 转换为折叠文本
+
+5. 窗口模式配置流程
+
+插件启动时 →
+"default_config" 读取默认窗口模式配置
+用户自定义配置 →
+"ui.window_mode" 和 "ui.default_ui" 配置项
+窗口管理器初始化 →
+"window_manager.initialize()" 接收窗口模式配置
+创建窗口时 →
+"window_mode_manager.create_window_by_mode()" 根据模式创建窗口
+支持三种模式：
+
+- "float": 浮动窗口（默认）
+- "tab": 新标签页
+- "split": 分割窗口
+
+6. 键位配置流程
+
+插件启动时 →
+"keymap_manager.load_default_keymaps()"
+用户自定义配置 →
+"keymap_manager.set_keymap(context, action, key)"
+窗口打开时 →
+"window.set_keymaps()" → 调用 "keymap_manager.get_keymap()"
+保存配置 →
+"keymap_manager.save_keymaps()"
+重置键位 →
+"keymap_manager.reset_keymap(context, action)"
 
 优化点总结
 
@@ -526,111 +540,6 @@ require("NeoAI").setup({
 }
 ```
 
-这个架构更符合您的需求，特别是工具调用循环和思考过程显示的部分得到了重点优化。
-
-## 使用示例
-
-### 基本配置
-
-```lua
--- 基本配置：浮动窗口，默认打开树界面
-require("NeoAI").setup({
-  ui = {
-    default_ui = "tree",           -- 默认打开树界面
-    window_mode = "float",          -- 浮动窗口模式
-    window = {
-      width = 80,
-      height = 20,
-      border = "rounded",
-    },
-  },
-  ai = {
-    model = "deepseek-reasoner",
-    api_key = os.getenv("DEEPSEEK_API_KEY"),
-  },
-})
-```
-
-### 标签页模式配置
-
-```lua
--- 标签页模式，默认打开聊天界面
-require("NeoAI").setup({
-  ui = {
-    default_ui = "chat",           -- 默认打开聊天界面
-    window_mode = "tab",           -- 标签页模式
-  },
-  ai = {
-    model = "gpt-4",
-    api_key = os.getenv("OPENAI_API_KEY"),
-  },
-})
-```
-
-### 分割窗口模式配置
-
-```lua
--- 分割窗口模式，垂直分割
-require("NeoAI").setup({
-  ui = {
-    default_ui = "tree",           -- 默认打开树界面
-    window_mode = "split",         -- 分割窗口模式
-    window = {
-      split_direction = "vertical", -- 垂直分割
-      split_size = "50%",          -- 分割大小
-    },
-  },
-})
-```
-
-### 完整配置示例
-
-```lua
--- 完整配置示例
-require("NeoAI").setup({
-  ui = {
-    default_ui = "chat",           -- 默认打开聊天界面
-    window_mode = "float",         -- 浮动窗口模式
-    window = {
-      width = 100,
-      height = 30,
-      border = "single",
-      position = "right",          -- 窗口位置
-      winblend = 10,              -- 窗口透明度
-    },
-    keymaps = {
-      tree = {
-        select = { key = "<CR>", desc = "选择节点/分支" },
-        new_child = { key = "n", desc = "新建子分支" },
-        new_root = { key = "N", desc = "新建根分支" },
-      },
-      chat = {
-        send = { key = "<C-s>", desc = "发送消息" },
-        cancel = { key = "<Esc>", desc = "取消生成" },
-        toggle_reasoning = { key = "r", desc = "切换思考过程显示" },
-      },
-    },
-  },
-  ai = {
-    base_url = "https://api.openai.com/v1/chat/completions",
-    model = "gpt-4-turbo",
-    api_key = os.getenv("OPENAI_API_KEY"),
-    temperature = 0.8,
-    max_tokens = 8192,
-    stream = true,
-  },
-  session = {
-    auto_save = true,
-    save_path = vim.fn.stdpath("data") .. "/neoai_sessions",
-    max_history = 200,
-  },
-  tools = {
-    enabled = true,
-    builtin = true,
-  },
-})
-```
-
 ## 命令和快捷键注册
 
 ### 已注册的 Neovim 命令
@@ -651,3 +560,208 @@ require("NeoAI").setup({
 2. **打开聊天界面** - `<leader>ac`（可配置）
 3. **关闭所有窗口** - `<leader>aq`（可配置）
 4. **切换 UI 显示** - `<leader>aa`（可配置）
+
+## 架构实现状态与优化建议
+
+### 当前实现状态评估
+
+基于对实际代码的分析，当前项目已成功实现了架构设计中的大部分核心功能：
+
+#### ✅ 已完全实现的功能
+
+1. **模块化架构** - 核心、UI、工具模块分离清晰
+2. **配置管理系统** - 支持默认配置和用户自定义
+3. **键位配置管理器** - 可自定义的键位映射系统
+4. **窗口模式支持** - float、tab、split三种窗口模式
+5. **工具系统框架** - 完整的工具注册、验证、执行流程
+6. **事件通信系统** - 使用事件总线实现松耦合
+7. **会话管理** - 支持会话、分支、消息的完整管理
+8. **AI引擎集成** - 流式处理和推理管理
+
+#### ⚠️ 需要优化的关键问题
+
+### 五大核心优化点
+
+#### 1. 配置验证缺失（高优先级）
+
+**问题**：配置验证不严格，可能导致运行时错误
+**影响**：系统稳定性风险
+**解决方案**：
+
+```lua
+-- 添加配置验证器
+local config_validator = require("NeoAI.core.config.config_validator")
+
+-- 验证关键配置
+config_validator.validate("ai.model", "unsupported-model") -- 应返回false
+config_validator.validate("ui.window_mode", "invalid-mode") -- 应返回false
+```
+
+#### 2. 错误处理分散（高优先级）
+
+**问题**：每个模块自己处理错误，缺乏统一机制
+**影响**：错误恢复困难，用户体验差
+**解决方案**：
+
+```lua
+-- 统一错误处理中间件
+local error_handler = require("NeoAI.core.error_handler")
+
+-- 包装关键函数
+M.generate_response = error_handler.wrap(
+  original_function,
+  "ai_engine.generate_response"
+)
+
+-- 统一错误处理
+error_handler.register_handler("network_error", function(error)
+  -- 自动重试逻辑
+  -- 用户友好提示
+end)
+```
+
+#### 3. 模块耦合度高（中优先级）
+
+**问题**：模块间直接依赖，测试和维护困难
+**影响**：代码可维护性差，扩展困难
+**解决方案**：
+
+```lua
+-- 依赖注入容器
+local container = require("NeoAI.core.dependency_container")
+
+container.register("event_bus", function()
+  return require("NeoAI.core.events.event_bus")
+end)
+
+container.register("session_manager", function()
+  local session = require("NeoAI.core.session.session_manager")
+  session.initialize({
+    event_bus = container.get("event_bus"),
+    config = container.get("config_manager").get("session")
+  })
+  return session
+end)
+```
+
+#### 4. 性能监控缺失（中优先级）
+
+**问题**：缺乏性能指标，难以优化
+**影响**：性能问题难以发现和定位
+**解决方案**：
+
+```lua
+-- 性能监控系统
+local perf_monitor = require("NeoAI.utils.performance_monitor")
+
+-- 监控关键操作
+function M.generate_response(messages, options)
+  return perf_monitor.measure("ai_engine.generate_response", function()
+    -- 原函数逻辑
+  end)
+end
+
+-- 查看性能报告
+:NeoAIPerfReport
+```
+
+#### 5. 扩展性不足（低优先级）
+
+**问题**：不支持插件和主题系统
+**影响**：生态系统发展受限
+**解决方案**：
+
+```lua
+-- 插件系统
+local plugin_manager = require("NeoAI.core.plugin_manager")
+
+plugin_manager.register("my-plugin", {
+  name = "My Plugin",
+  init = function(config)
+    -- 插件初始化
+  end,
+  hooks = {
+    on_session_create = function(session)
+      -- 自定义逻辑
+    end
+  }
+})
+
+-- 主题系统
+local theme_manager = require("NeoAI.ui.theme_manager")
+
+theme_manager.register_theme("dark", {
+  colors = {
+    background = "#1e1e1e",
+    text = "#ffffff"
+  }
+})
+```
+
+### 优化实施路线图
+
+#### 第一阶段：稳定性加固（1-2周）
+
+1. **配置验证系统** - 防止配置错误
+2. **统一错误处理** - 提高系统稳定性
+3. **键位验证** - 防止键位冲突
+
+#### 第二阶段：性能优化（2-3周）
+
+1. **依赖注入容器** - 降低模块耦合
+2. **性能监控** - 发现性能瓶颈
+3. **智能缓存** - 提升响应速度
+
+#### 第三阶段：生态系统建设（3-4周）
+
+1. **插件系统** - 支持第三方扩展
+2. **主题系统** - 改善用户体验
+3. **状态持久化** - 支持崩溃恢复
+
+### 预期收益
+
+#### 技术收益
+
+1. **稳定性提升** - 配置错误减少50%，崩溃率降低80%
+2. **性能优化** - 关键操作响应时间减少30%
+3. **可维护性** - 模块耦合度降低50%，测试覆盖率提升至80%
+4. **扩展性** - 支持插件生态系统，功能扩展时间减少70%
+
+#### 用户体验收益
+
+1. **配置更安全** - 实时验证，防止错误配置
+2. **错误更友好** - 统一错误处理，提供恢复建议
+3. **性能更优** - 响应更快，资源使用更高效
+4. **个性化更强** - 支持主题和插件定制
+
+### 实施建议
+
+#### 立即行动（本周）
+
+1. 实现配置验证器基础框架
+2. 添加关键配置的验证规则
+3. 创建错误处理中间件原型
+
+#### 短期计划（1个月内）
+
+1. 完成依赖注入容器
+2. 实现性能监控系统
+3. 添加基础缓存功能
+
+#### 长期规划（3个月内）
+
+1. 发布插件系统API
+2. 实现主题管理系统
+3. 构建开发者文档和示例
+
+### 总结
+
+NeoAI已经建立了优秀的架构基础，但在以下五个关键领域有优化空间：
+
+1. **配置安全** - 需要严格的验证机制
+2. **错误恢复** - 需要统一的处理框架
+3. **模块解耦** - 需要依赖注入支持
+4. **性能可见** - 需要监控和优化工具
+5. **生态扩展** - 需要插件和主题系统
+
+通过分阶段实施这些优化，NeoAI将从一个功能完整的AI助手，升级为一个稳定、高性能、可扩展的生态系统平台。

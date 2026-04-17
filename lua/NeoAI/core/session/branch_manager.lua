@@ -145,6 +145,26 @@ function M.get_current_branch()
     return current_branch_id
 end
 
+--- 获取分支列表
+--- @param session_id string 会话ID
+--- @return table 分支列表
+function M.list_branches(session_id)
+    local result = {}
+    
+    for branch_id, branch in pairs(branches) do
+        -- 这里需要根据会话ID过滤分支
+        -- 目前返回所有分支
+        table.insert(result, {
+            id = branch_id,
+            name = branch.name,
+            parent_id = branch.parent_id,
+            created_at = branch.created_at
+        })
+    end
+    
+    return result
+end
+
 --- 获取分支信息
 --- @param branch_id string 分支ID
 --- @return table|nil 分支信息

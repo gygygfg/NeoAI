@@ -3,6 +3,7 @@ local M = {}
 -- 模块状态
 local state = {
     initialized = false,
+    event_bus = nil,
     config = nil,
     sessions = {},
     current_session_id = nil,
@@ -141,14 +142,16 @@ function Session.load(filepath)
 end
 
 --- 初始化历史管理器
---- @param config table 配置
-function M.initialize(config)
+--- @param options table 选项，包含 event_bus 和 config
+function M.initialize(options)
     if state.initialized then
         return
     end
     
-    state.config = config or {}
-    state.max_history_per_session = config.max_history_per_session or 100
+    options = options or {}
+    state.event_bus = options.event_bus
+    state.config = options.config or {}
+    state.max_history_per_session = state.config.max_history_per_session or 100
     state.sessions = {}
     state.current_session_id = nil
     state.initialized = true
@@ -323,6 +326,34 @@ function M.import_session(import_path)
     M._auto_save_session(session)
     
     return session.id
+end
+
+--- 获取历史记录条目
+--- @param session_id string 会话ID
+--- @param branch_id number|nil 分支ID
+--- @return table 历史记录条目列表
+function M.get_entries(session_id, branch_id)
+    if not state.initialized then
+        return {}
+    end
+    
+    local session = state.sessions[session_id]
+    if not session then
+        return {}
+    end
+    
+    -- 如果指定了分支ID，返回分支消息
+    if branch_id then
+        for _, branch in ipairs(session.branches) do
+            if branch.id == branch_id then
+                return vim.deepcopy(branch.messages or {})
+            end
+        end
+        return {}
+    end
+    
+    -- 否则返回会话的所有消息
+    return session:get_messages()
 end
 
 --- 清理旧消息

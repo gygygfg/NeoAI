@@ -10,7 +10,13 @@ function M.read_file(path)
 
     local file, err = io.open(path, "r")
     if not file then
-        return nil, "无法打开文件: " .. (err or "未知错误")
+        -- 检查文件是否存在
+        local exists = M.exists(path)
+        if not exists then
+            return nil, "文件不存在: " .. path
+        else
+            return nil, "无法打开文件: " .. (err or "未知错误")
+        end
     end
 
     local content = file:read("*a")
@@ -114,6 +120,22 @@ function M.exists(path)
     if file then
         file:close()
         return true
+    end
+
+    return false
+end
+
+--- 检查目录是否存在
+--- @param path string 目录路径
+--- @return boolean 目录是否存在
+function M.dir_exists(path)
+    if not path then
+        return false
+    end
+
+    local ok, stat = pcall(vim.loop.fs_stat, path)
+    if ok and stat then
+        return stat.type == "directory"
     end
 
     return false
@@ -380,6 +402,14 @@ function M.list_dir_recursive(dir, pattern)
     end
 end
 
+--- 列出文件（list_files 是 list_dir_recursive 的别名）
+--- @param dir string 目录路径
+--- @param pattern string 文件模式
+--- @return table|nil 文件列表，错误时返回nil和错误信息
+function M.list_files(dir, pattern)
+    return M.list_dir_recursive(dir, pattern)
+end
+
 --- 检查是否为目录
 --- @param path string 路径
 --- @return boolean 是否为目录
@@ -456,6 +486,47 @@ function M.normalize_path(path)
     end
 
     return "/" .. table.concat(parts, "/")
+end
+
+--- 确保目录存在（ensure_dir 是 mkdir 的别名）
+--- @param dir string 目录路径
+--- @return boolean 是否成功，错误时返回false和错误信息
+function M.ensure_dir(dir)
+    return M.mkdir(dir)
+end
+
+--- 搜索文件
+--- @param dir string 目录路径
+--- @param pattern string 搜索模式（支持通配符）
+--- @param recursive boolean 是否递归搜索
+--- @return table|nil 文件列表，错误时返回nil和错误信息
+function M.search_files(dir, pattern, recursive)
+    if not dir then
+        return nil, "目录路径不能为空"
+    end
+    
+    pattern = pattern or "*"
+    recursive = recursive or false
+    
+    if recursive then
+        return M.list_dir_recursive(dir, pattern)
+    else
+        return M.list_dir(dir, pattern)
+    end
+end
+
+--- 检查文件是否存在（file_exists 是 exists 的别名）
+--- @param path string 路径
+--- @return boolean 是否存在
+function M.file_exists(path)
+    return M.exists(path)
+end
+
+--- 创建目录（create_directory 是 mkdir 的别名）
+--- @param dir string 目录路径
+--- @return boolean 是否成功，错误时返回false和错误信息
+function M.create_directory(dir)
+    return M.mkdir(dir)
 end
 
 return M

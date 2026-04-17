@@ -4,11 +4,104 @@ local M = {}
 local config_store = {}
 local change_callbacks = {}
 
+-- 默认配置
+local default_config = {
+    api_key = "",
+    model = "gpt-3.5-turbo",
+    temperature = 0.7,
+    max_tokens = 1000,
+    save_path = vim.fn.stdpath("data") .. "/neoa",
+    auto_save = true,
+    ui = {
+        theme = "auto",
+        font_size = 14,
+        show_reasoning = true
+    }
+}
+
 --- 初始化配置管理器
 --- @param initial_config table 初始配置
 function M.initialize(initial_config)
-  config_store = vim.deepcopy(initial_config or {})
+  -- 合并默认配置和用户配置
+  local full_config = M.get_full_config(initial_config)
+  
+  -- 验证配置
+  local valid, err = M.validate_config(full_config)
+  if not valid then
+    vim.notify("NeoAI 配置验证失败: " .. err, vim.log.levels.ERROR)
+    -- 使用默认配置作为回退
+    full_config = M.get_default_config()
+  end
+  
+  config_store = vim.deepcopy(full_config)
   change_callbacks = {}
+end
+
+--- 获取默认配置
+--- @return table 默认配置
+function M.get_default_config()
+    return vim.deepcopy(default_config)
+end
+
+--- 验证配置
+--- @param config table 要验证的配置
+--- @return boolean|string 验证结果，true表示有效，字符串表示错误信息
+function M.validate_config(config)
+    if type(config) ~= "table" then
+        return "配置必须是table类型"
+    end
+    
+    -- 基本验证规则
+    local validation_rules = {
+        api_key = { type = "string", required = true },
+        model = { type = "string", required = true },
+        temperature = { type = "number", min = 0, max = 2 },
+        max_tokens = { type = "number", min = 1, max = 4096 },
+        save_path = { type = "string" },
+        auto_save = { type = "boolean" }
+    }
+    
+    for key, rule in pairs(validation_rules) do
+        if rule.required and config[key] == nil then
+            return string.format("缺少必需的配置项: %s", key)
+        end
+        
+        if config[key] ~= nil then
+            -- 检查类型
+            if rule.type and type(config[key]) ~= rule.type then
+                return string.format("配置项 %s 的类型应该是 %s，但得到的是 %s", 
+                    key, rule.type, type(config[key]))
+            end
+            
+            -- 检查数值范围
+            if rule.type == "number" then
+                if rule.min and config[key] < rule.min then
+                    return string.format("配置项 %s 的值不能小于 %s", key, rule.min)
+                end
+                if rule.max and config[key] > rule.max then
+                    return string.format("配置项 %s 的值不能大于 %s", key, rule.max)
+                end
+            end
+        end
+    end
+    
+    return true
+end
+
+--- 合并配置
+--- @param base_config table 基础配置
+--- @param override_config table 覆盖配置
+--- @return table 合并后的配置
+function M.merge_configs(base_config, override_config)
+    return vim.tbl_deep_extend("force", {}, base_config, override_config)
+end
+
+--- 获取完整配置（合并默认值和用户配置）
+--- @param user_config table 用户配置
+--- @return table 完整配置
+function M.get_full_config(user_config)
+    local default = M.get_default_config()
+    return M.merge_configs(default, user_config or {})
 end
 
 --- 获取配置值

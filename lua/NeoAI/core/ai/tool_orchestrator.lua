@@ -99,6 +99,86 @@ end
 --- @param response string|table AI响应
 --- @return table|nil 工具调用列表
 function M.parse_tool_call(response)
+    -- 实现工具调用解析逻辑
+    return nil
+end
+
+--- 执行工具（别名函数）
+--- @param messages_or_tool_calls table 消息列表或工具调用列表
+--- @return string|nil 执行结果
+function M.execute_tools(messages_or_tool_calls)
+    if not messages_or_tool_calls then
+        return nil
+    end
+    
+    -- 检查参数类型
+    if type(messages_or_tool_calls[1]) == "table" and messages_or_tool_calls[1].tool then
+        -- 看起来是工具调用列表
+        local results = {}
+        for _, tool_call in ipairs(messages_or_tool_calls) do
+            local result = M.execute_tool(tool_call)
+            table.insert(results, result)
+        end
+        return M.merge_results(results)
+    else
+        -- 假设是消息列表
+        return M.execute_tool_loop(messages_or_tool_calls)
+    end
+end
+
+--- 选择工具
+--- @param query string 查询内容
+--- @param available_tools table|nil 可用工具列表（可选）
+--- @return table 选择的工具列表
+function M.select_tools(query, available_tools)
+    local tools_to_use = available_tools or state.tools
+    
+    if not tools_to_use or #tools_to_use == 0 then
+        return {}
+    end
+    
+    -- 简单的工具选择逻辑：返回所有工具
+    return tools_to_use
+end
+
+--- 合并结果
+--- @param results table 结果列表
+--- @return string 合并后的结果
+function M.merge_results(results)
+    if not results or #results == 0 then
+        return ""
+    end
+    
+    local merged = {}
+    for i, result in ipairs(results) do
+        table.insert(merged, "结果 " .. i .. ": " .. tostring(result))
+    end
+    
+    return table.concat(merged, "\n\n")
+end
+
+--- 验证工具使用
+--- @param tool_call table 工具调用
+--- @return boolean 是否有效
+function M.validate_tool_use(tool_call)
+    if not tool_call or not tool_call.name then
+        return false
+    end
+    
+    -- 检查工具是否存在
+    for _, tool in ipairs(state.tools) do
+        if tool.name == tool_call.name then
+            return true
+        end
+    end
+    
+    return false
+end
+
+--- 从AI响应中提取工具调用
+--- @param response string|table AI响应
+--- @return table|nil 工具调用列表
+function M.extract_tool_calls(response)
   if not response then
     return nil
   end

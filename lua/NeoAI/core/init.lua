@@ -33,14 +33,13 @@ function M.initialize(core_config)
   -- 初始化键位配置管理器
   state.keymap_mgr = keymap_manager
 
-  -- 从配置管理器获取UI配置
-  local ui_config = config_manager.get("ui") or {}
-  local user_keymaps = ui_config.keymaps or {}
+  -- 从配置管理器获取键位配置
+  local user_keymaps = config_manager.get("keymaps") or {}
 
   -- 直接使用传入的配置中的键位配置
   local default_keymaps = {}
-  if core_config and core_config.ui and core_config.ui.keymaps then
-    default_keymaps = core_config.ui.keymaps
+  if core_config and core_config.keymaps then
+    default_keymaps = core_config.keymaps
   end
 
   -- 初始化键位管理器，传递默认配置和用户配置

@@ -25,11 +25,31 @@ function M.initialize(options)
     -- 监听思考事件
     if state.event_bus then
         state.event_bus.on("reasoning_content", function(content)
+            -- 自动开始思考过程
+            if not state.reasoning_active then
+                M.start_reasoning()
+            end
             M.append_reasoning(content)
         end)
 
         state.event_bus.on("reasoning_chunk", function(chunk)
+            -- 自动开始思考过程
+            if not state.reasoning_active then
+                M.start_reasoning()
+            end
             M.append_reasoning(chunk)
+        end)
+        
+        -- 监听思考开始事件
+        state.event_bus.on("reasoning_started", function()
+            -- 触发UI显示事件
+            state.event_bus.emit("show_reasoning_display")
+        end)
+        
+        -- 监听思考完成事件
+        state.event_bus.on("reasoning_finished", function(reasoning_text, duration)
+            -- 触发UI关闭事件
+            state.event_bus.emit("close_reasoning_display", reasoning_text)
         end)
     end
 end
@@ -66,10 +86,11 @@ function M.append_reasoning(content)
         M.start_reasoning()
     end
 
-    -- 添加内容
-    state.reasoning_text = state.reasoning_text .. content
+    -- 添加内容（确保 content 不是 nil）
+    local safe_content = content or ""
+    state.reasoning_text = state.reasoning_text .. safe_content
     table.insert(state.reasoning_chunks, {
-        content = content,
+        content = safe_content,
         timestamp = os.time()
     })
 
@@ -99,6 +120,23 @@ function M.finish_reasoning()
 
     -- 清空思考内容
     M.clear_reasoning()
+end
+
+--- 添加推理步骤（别名函数）
+--- @param step string 推理步骤
+function M.add_step(step)
+    M.append_reasoning(step)
+end
+
+--- 完成推理（别名函数）
+function M.complete_reasoning()
+    M.finish_reasoning()
+end
+
+--- 获取推理内容
+--- @return string 推理内容
+function M.get_reasoning()
+    return state.reasoning_text
 end
 
 --- 获取思考文本
@@ -161,9 +199,29 @@ function M.get_reasoning_summary(max_length)
 end
 
 --- 格式化思考内容为显示文本
---- @param include_timestamps boolean 是否包含时间戳
+--- @param reasoning_text_or_include_timestamps string|boolean 推理文本或是否包含时间戳
 --- @return string 格式化后的文本
-function M.format_reasoning(include_timestamps)
+function M.format_reasoning(reasoning_text_or_include_timestamps)
+    -- 处理字符串参数（推理文本）
+    if type(reasoning_text_or_include_timestamps) == "string" then
+        local reasoning_text = reasoning_text_or_include_timestamps
+        if not reasoning_text or reasoning_text == "" then
+            return ""
+        end
+        
+        local lines = {}
+        table.insert(lines, "=== 思考过程 ===")
+        table.insert(lines, "")
+        table.insert(lines, reasoning_text)
+        table.insert(lines, "")
+        table.insert(lines, "=== 思考结束 ===")
+        
+        return table.concat(lines, "\n")
+    end
+    
+    -- 处理布尔参数（是否包含时间戳）
+    local include_timestamps = reasoning_text_or_include_timestamps or false
+    
     if not state.reasoning_text or state.reasoning_text == "" then
         return ""
     end

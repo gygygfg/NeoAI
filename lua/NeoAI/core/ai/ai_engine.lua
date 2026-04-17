@@ -85,11 +85,11 @@ function M.generate_response(messages, options)
     -- 异步生成响应
     vim.schedule(function()
         local success, result = pcall(function()
-            return M._generate_response_async(generation_id, formatted_messages, merged_options)
+            return M._generate_response_async(generation_id, formatted_messages, merged_options, options)
         end)
 
         if not success then
-            M._handle_generation_error(generation_id, result)
+            M._handle_generation_error(generation_id, result, options)
         end
     end)
 
@@ -178,15 +178,121 @@ function M.set_tools(tools)
     end
 end
 
+--- 处理查询
+--- @param query string 查询内容
+--- @param options table 选项
+--- @return string 响应ID
+function M.process_query(query, options)
+    if not state.initialized then
+        error("AI engine not initialized")
+    end
+    
+    -- 构建消息
+    local messages = {}
+    table.insert(messages, {
+        role = "user",
+        content = query
+    })
+    
+    -- 生成响应
+    return M.generate_response(messages, options)
+end
+
+--- 获取引擎状态
+--- @return table 状态信息
+function M.get_status()
+    return {
+        initialized = state.initialized,
+        is_generating = state.is_generating,
+        current_generation_id = state.current_generation_id,
+        tools_available = state.tools and #state.tools > 0
+    }
+end
+
 --- 异步生成响应（内部使用）
 --- @param generation_id string 生成ID
 --- @param messages table 消息列表
 --- @param options table 选项
-function M._generate_response_async(generation_id, messages, options)
-    -- 这里应该调用实际的AI API
-    -- 目前返回模拟响应
-    local response = "这是AI生成的响应。实际实现需要连接到AI服务。"
-
+--- @param callbacks table 回调函数
+function M._generate_response_async(generation_id, messages, options, callbacks)
+    -- 提取回调函数
+    local on_chunk = callbacks and callbacks.on_chunk
+    local on_complete = callbacks and callbacks.on_complete
+    local on_error = callbacks and callbacks.on_error
+    
+    -- 检查API密钥
+    local api_key = state.config.api_key
+    if not api_key or api_key == "" then
+        local error_msg = "API密钥未设置。请设置DEEPSEEK_API_KEY环境变量或在配置中设置api_key。"
+        M._handle_generation_error(generation_id, error_msg, callbacks)
+        return
+    end
+    
+    -- 构建请求数据
+    local request_data = {
+        model = state.config.model or "deepseek-reasoner",
+        messages = messages,
+        temperature = state.config.temperature or 0.7,
+        max_tokens = state.config.max_tokens or 4096,
+        stream = options.stream or false
+    }
+    
+    -- 添加工具调用（如果有）
+    if options.tools and #options.tools > 0 then
+        request_data.tools = options.tools
+    end
+    
+    -- 发送HTTP请求
+    local http = require("socket.http")
+    local ltn12 = require("ltn12")
+    local json = require("cjson")
+    
+    local response_body = {}
+    local request_url = state.config.base_url or "https://api.deepseek.com/chat/completions"
+    
+    local headers = {
+        ["Content-Type"] = "application/json",
+        ["Authorization"] = "Bearer " .. api_key,
+        ["Accept"] = "application/json"
+    }
+    
+    -- 编码请求数据
+    local request_body = json.encode(request_data)
+    
+    -- 发送请求
+    local success, status_code, response_headers = http.request{
+        url = request_url,
+        method = "POST",
+        headers = headers,
+        source = ltn12.source.string(request_body),
+        sink = ltn12.sink.table(response_body)
+    }
+    
+    -- 处理响应
+    if not success then
+        local error_msg = "HTTP请求失败: " .. tostring(status_code)
+        M._handle_generation_error(generation_id, error_msg, callbacks)
+        return
+    end
+    
+    if status_code ~= 200 then
+        local error_msg = "API请求失败 (状态码: " .. status_code .. "): " .. table.concat(response_body, "")
+        M._handle_generation_error(generation_id, error_msg, callbacks)
+        return
+    end
+    
+    -- 解析响应
+    local response_text = table.concat(response_body, "")
+    local response_data = json.decode(response_text)
+    
+    if not response_data or not response_data.choices or #response_data.choices == 0 then
+        local error_msg = "API响应格式错误"
+        M._handle_generation_error(generation_id, error_msg, callbacks)
+        return
+    end
+    
+    local response = response_data.choices[1].message.content
+    
     -- 处理工具调用
     if options.tools and #options.tools > 0 then
         local tool_result = tool_orchestrator.execute_tool_loop(messages)
@@ -194,16 +300,64 @@ function M._generate_response_async(generation_id, messages, options)
             response = tool_result
         end
     end
+    
+    -- 处理流式响应（如果启用了流式）
+    if options.stream and on_chunk then
+        -- 对于流式响应，我们需要使用不同的处理方式
+        -- 这里我们仍然使用非流式响应，但可以模拟流式
+        -- 实际实现需要使用支持流式的HTTP客户端
+        
+        -- 将响应拆分为多个数据块（模拟流式）
+        local words = {}
+        for word in response:gmatch("%S+") do
+            table.insert(words, word)
+        end
+        
+        for i, word in ipairs(words) do
+            vim.defer_fn(function()
+                if on_chunk then
+                    on_chunk(word .. " ")
+                end
+            end, 50 * i)  -- 递增延迟
+        end
+    end
 
     -- 触发完成事件
     if state.event_bus then
         state.event_bus.emit("generation_completed", generation_id, response)
     end
-
+    
+    -- 调用完成回调
+    if on_complete then
+        vim.defer_fn(function()
+            on_complete(response)
+        end, 800)  -- 在流式响应后调用
+    end
+    
+    -- 重置生成状态
     state.is_generating = false
     state.current_generation_id = nil
-
+    
     return response
+end
+
+--- 处理流式数据块
+--- @param chunk string 数据块
+--- @param generation_id string 生成ID
+function M._process_stream_chunk(chunk, generation_id)
+    if not chunk or chunk == "" then
+        return
+    end
+    
+    -- 使用流处理器处理数据块
+    if stream_processor then
+        stream_processor.process_chunk(chunk)
+    end
+    
+    -- 触发数据块事件
+    if state.event_bus then
+        state.event_bus.emit("stream_chunk", generation_id, chunk)
+    end
 end
 
 --- 异步流式响应（内部使用）
@@ -212,22 +366,109 @@ end
 --- @param options table 选项
 --- @param stream_handler function 流式处理器
 function M._stream_response_async(generation_id, messages, options, stream_handler)
-    -- 这里应该调用支持流式的AI API
-    -- 目前返回模拟流式响应
-    local chunks = {
-        "这是",
-        "AI生成的",
-        "流式响应。",
-        "实际实现需要",
-        "连接到支持流式的AI服务。"
+    -- 检查API密钥
+    local api_key = state.config.api_key
+    if not api_key or api_key == "" then
+        local error_msg = "API密钥未设置。请设置DEEPSEEK_API_KEY环境变量或在配置中设置api_key。"
+        M._handle_generation_error(generation_id, error_msg)
+        return
+    end
+    
+    -- 构建请求数据
+    local request_data = {
+        model = state.config.model or "deepseek-reasoner",
+        messages = messages,
+        temperature = state.config.temperature or 0.7,
+        max_tokens = state.config.max_tokens or 4096,
+        stream = true  -- 强制启用流式
     }
-
-    for _, chunk in ipairs(chunks) do
+    
+    -- 添加工具调用（如果有）
+    if options.tools and #options.tools > 0 then
+        request_data.tools = options.tools
+    end
+    
+    -- 使用支持流式的HTTP客户端
+    -- 注意：这里需要真正的流式HTTP客户端，我们使用一个简化的实现
+    local http = require("socket.http")
+    local ltn12 = require("ltn12")
+    local json = require("cjson")
+    
+    local request_url = state.config.base_url or "https://api.deepseek.com/chat/completions"
+    
+    local headers = {
+        ["Content-Type"] = "application/json",
+        ["Authorization"] = "Bearer " .. api_key,
+        ["Accept"] = "text/event-stream"  -- 对于流式响应
+    }
+    
+    -- 编码请求数据
+    local request_body = json.encode(request_data)
+    
+    -- 创建自定义的sink来处理流式数据
+    local chunks = {}
+    local stream_sink = ltn12.sink.table(chunks)
+    
+    -- 发送流式请求
+    local success, status_code, response_headers = http.request{
+        url = request_url,
+        method = "POST",
+        headers = headers,
+        source = ltn12.source.string(request_body),
+        sink = function(chunk)
+            if chunk then
+                -- 处理每个数据块
+                stream_sink(chunk)
+                
+                -- 将数据块传递给流处理器
+                if stream_handler then
+                    stream_handler(chunk)
+                end
+                
+                -- 处理流式数据
+                M._process_stream_chunk(chunk, generation_id)
+            end
+            return true
+        end
+    }
+    
+    -- 处理响应
+    if not success then
+        local error_msg = "HTTP请求失败: " .. tostring(status_code)
+        M._handle_generation_error(generation_id, error_msg)
+        return
+    end
+    
+    if status_code ~= 200 then
+        local error_msg = "API请求失败 (状态码: " .. status_code .. "): " .. table.concat(response_body, "")
+        M._handle_generation_error(generation_id, error_msg)
+        return
+    end
+    
+    -- 解析响应
+    local response_text = table.concat(response_body, "")
+    local response_data = json.decode(response_text)
+    
+    if not response_data or not response_data.choices or #response_data.choices == 0 then
+        local error_msg = "API响应格式错误"
+        M._handle_generation_error(generation_id, error_msg)
+        return
+    end
+    
+    local full_response = response_data.choices[1].message.content
+    
+    -- 模拟流式响应
+    local words = {}
+    for word in full_response:gmatch("%S+") do
+        table.insert(words, word)
+    end
+    
+    for i, word in ipairs(words) do
         if not state.is_generating then
             break
         end
-        stream_handler(chunk)
-        vim.wait(100) -- 模拟延迟
+        stream_handler(word .. " ")
+        vim.wait(50) -- 模拟延迟
     end
 
     -- 处理工具调用（流式模式下）
@@ -240,7 +481,7 @@ function M._stream_response_async(generation_id, messages, options, stream_handl
 
     -- 触发完成事件
     if state.event_bus then
-        state.event_bus.emit("generation_completed", generation_id, "stream_complete")
+        state.event_bus.emit("generation_completed", generation_id, full_response)
     end
 
     state.is_generating = false
@@ -251,7 +492,8 @@ end
 --- 处理生成错误（内部使用）
 --- @param generation_id string 生成ID
 --- @param error_msg string 错误信息
-function M._handle_generation_error(generation_id, error_msg)
+--- @param callbacks table 回调函数
+function M._handle_generation_error(generation_id, error_msg, callbacks)
     state.is_generating = false
     state.current_generation_id = nil
 
@@ -259,8 +501,20 @@ function M._handle_generation_error(generation_id, error_msg)
     if state.event_bus then
         state.event_bus.emit("generation_error", generation_id, error_msg)
     end
+    
+    -- 调用错误回调
+    if callbacks and callbacks.on_error then
+        callbacks.on_error(error_msg)
+    end
 
     vim.notify("AI生成错误: " .. error_msg, vim.log.levels.ERROR)
+end
+
+--- 重置引擎状态（主要用于测试）
+function M.reset_state()
+    state.is_generating = false
+    state.current_generation_id = nil
+    print("🔄 AI引擎状态已重置")
 end
 
 return M

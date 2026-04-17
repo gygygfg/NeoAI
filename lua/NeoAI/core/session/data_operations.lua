@@ -1,6 +1,8 @@
 local M = {}
 
 local file_utils = require("NeoAI.utils.file_utils")
+local branch_manager = require("NeoAI.core.session.branch_manager")
+local message_manager = require("NeoAI.core.session.message_manager")
 
 -- 模块状态
 local state = {
@@ -39,9 +41,7 @@ function M.export_session(session_id, format)
         error("Session not found: " .. session_id)
     end
 
-    -- 获取分支管理器
-    local branch_manager = session_manager.get_branch_manager()
-    local message_manager = session_manager.get_message_manager()
+    -- 直接使用导入的分支管理器和消息管理器模块
 
     -- 构建导出数据
     local export_data = {
@@ -265,6 +265,68 @@ function M._export_to_markdown(export_data)
     end
 
     return table.concat(lines, "\n")
+end
+
+--- 保存会话到文件
+--- @param session_id string 会话ID
+--- @param filepath string 文件路径
+--- @return boolean 是否保存成功
+function M.save_session(session_id, filepath)
+    if not state.initialized then
+        error("Data operations not initialized")
+    end
+    
+    local export_data = M.export_session(session_id, "json")
+    if not export_data then
+        return false
+    end
+    
+    filepath = filepath or state.config.save_path .. "/" .. session_id .. ".json"
+    
+    -- 确保目录存在
+    local dir = filepath:match("(.*)/")
+    if dir then
+        file_utils.mkdir(dir)
+    end
+    
+    local success = file_utils.write_file(filepath, vim.json.encode(export_data))
+    
+    if success and state.event_bus then
+        state.event_bus.emit("session_saved", session_id, filepath)
+    end
+    
+    return success
+end
+
+--- 从文件加载会话
+--- @param filepath string 文件路径
+--- @return string|nil 新会话ID
+function M.load_session(filepath)
+    if not state.initialized then
+        error("Data operations not initialized")
+    end
+    
+    if not file_utils.exists(filepath) then
+        error("File not found: " .. filepath)
+    end
+    
+    local content = file_utils.read_file(filepath)
+    if not content then
+        error("Failed to read file: " .. filepath)
+    end
+    
+    local import_data = vim.json.decode(content)
+    if not import_data then
+        error("Invalid JSON in file: " .. filepath)
+    end
+    
+    local new_session_id = M.import_session(import_data, "json")
+    
+    if new_session_id and state.event_bus then
+        state.event_bus.emit("session_loaded", new_session_id, filepath)
+    end
+    
+    return new_session_id
 end
 
 return M

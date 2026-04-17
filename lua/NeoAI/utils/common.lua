@@ -276,4 +276,12 @@ function M.check_type(value, expected_type)
     end
 end
 
+--- 合并表（merge_tables 是 deep_merge 的别名）
+--- @param t1 table 目标表
+--- @param t2 table 源表
+--- @return table 合并后的表
+function M.merge_tables(t1, t2)
+    return M.deep_merge(t1, t2)
+end
+
 return M

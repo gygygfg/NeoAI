@@ -386,4 +386,40 @@ function M.summarize(text, max_length)
     return truncated .. "..."
 end
 
+--- 检查文本是否以指定前缀开头
+--- @param text string 文本
+--- @param prefix string 前缀
+--- @param case_sensitive boolean 是否区分大小写
+--- @return boolean 是否以指定前缀开头
+function M.starts_with(text, prefix, case_sensitive)
+    if not text or not prefix then
+        return false
+    end
+
+    if not case_sensitive then
+        text = text:lower()
+        prefix = prefix:lower()
+    end
+
+    return text:sub(1, #prefix) == prefix
+end
+
+--- 检查文本是否以指定后缀结尾
+--- @param text string 文本
+--- @param suffix string 后缀
+--- @param case_sensitive boolean 是否区分大小写
+--- @return boolean 是否以指定后缀结尾
+function M.ends_with(text, suffix, case_sensitive)
+    if not text or not suffix then
+        return false
+    end
+
+    if not case_sensitive then
+        text = text:lower()
+        suffix = suffix:lower()
+    end
+
+    return text:sub(-#suffix) == suffix
+end
+
 return M

@@ -21,6 +21,28 @@ function M.initialize(config)
 
     state.config = config or {}
     state.initialized = true
+    
+    -- 获取事件总线
+    local event_bus = require("NeoAI.core.events.event_bus")
+    
+    -- 监听思考事件
+    event_bus.on("show_reasoning_display", function(content)
+        M.show(content)
+    end)
+    
+    event_bus.on("reasoning_content", function(content)
+        M.append(content)
+    end)
+    
+    event_bus.on("reasoning_chunk", function(chunk)
+        M.append(chunk)
+    end)
+    
+    event_bus.on("close_reasoning_display", function(reasoning_text)
+        -- 将思考内容转换为折叠文本
+        M._convert_to_folded_text(reasoning_text)
+        M.close()
+    end)
 end
 
 --- 显示思考过程
@@ -35,7 +57,8 @@ function M.show(content)
         M.close()
     end
 
-    state.content_buffer = content or ""
+    -- 确保 content 是字符串
+    state.content_buffer = tostring(content or "")
     state.is_visible = true
 
     -- 创建窗口
@@ -73,13 +96,16 @@ function M.append(content)
         return
     end
 
+    -- 确保 content 是字符串
+    local content_str = tostring(content or "")
+    
     if not state.is_visible or not state.current_window_id then
         -- 如果窗口不可见，先显示
-        M.show(content)
+        M.show(content_str)
         return
     end
 
-    state.content_buffer = state.content_buffer .. content
+    state.content_buffer = state.content_buffer .. content_str
     M._update_window_content()
 end
 
@@ -104,47 +130,58 @@ function M.is_visible()
     return state.is_visible
 end
 
---- 设置位置
---- @param x number X坐标
---- @param y number Y坐标
-function M.set_position(x, y)
+--- 隐藏推理显示
+function M.hide()
     if not state.initialized then
         return
     end
-
-    state.position = { x = x, y = y }
-
-    -- 如果窗口打开，更新位置
-    if state.current_window_id then
-        window_manager.update_window_options(state.current_window_id, {
-            row = y,
-            col = x
-        })
-    end
-end
-
---- 获取位置
---- @return table 位置 {x, y}
-function M.get_position()
-    return vim.deepcopy(state.position)
-end
-
---- 获取内容
---- @return string 思考内容
-function M.get_content()
-    return state.content_buffer
-end
-
---- 清空内容
-function M.clear_content()
-    state.content_buffer = ""
     
     if state.current_window_id then
-        M._update_window_content()
+        window_manager.close_window(state.current_window_id)
+        state.current_window_id = nil
     end
+    
+    state.is_visible = false
 end
 
---- 更新窗口内容（内部使用）
+--- 更新推理显示内容
+--- @param content string 新的内容
+function M.update(content)
+    if not state.initialized then
+        return
+    end
+    
+    if not state.is_visible or not state.current_window_id then
+        M.show(content)
+        return
+    end
+    
+    -- 确保 content 是字符串
+    state.content_buffer = tostring(content or "")
+    M._update_window_content()
+end
+
+--- 将思考内容转换为折叠文本
+--- @param reasoning_text string 思考内容
+function M._convert_to_folded_text(reasoning_text)
+    -- 确保 reasoning_text 是字符串
+    local reasoning_str = tostring(reasoning_text or "")
+    
+    if reasoning_str == "" then
+        return
+    end
+    
+    -- 创建折叠文本格式
+    local folded_text = "\n<details>\n<summary>🤔 思考过程 (点击展开)</summary>\n\n"
+    folded_text = folded_text .. "```\n" .. reasoning_str .. "\n```\n\n"
+    folded_text = folded_text .. "</details>\n"
+    
+    -- 触发事件，将折叠文本添加到聊天历史
+    local event_bus = require("NeoAI.core.events.event_bus")
+    event_bus.emit("add_folded_reasoning", folded_text)
+end
+
+--- 更新窗口内容
 function M._update_window_content()
     if not state.current_window_id then
         return
@@ -160,7 +197,9 @@ function M._update_window_content()
     if state.content_buffer == "" then
         table.insert(lines, "思考中...")
     else
-        local content_lines = vim.split(state.content_buffer, "\n")
+        -- 确保 content_buffer 是字符串
+        local content_str = tostring(state.content_buffer)
+        local content_lines = vim.split(content_str, "\n")
         for _, line in ipairs(content_lines) do
             table.insert(lines, "  " .. line)
         end
@@ -173,7 +212,7 @@ function M._update_window_content()
     window_manager.set_window_content(state.current_window_id, lines)
 end
 
---- 设置按键映射（内部使用）
+--- 设置按键映射
 function M._setup_keymaps()
     if not state.current_window_id then
         return
@@ -230,25 +269,79 @@ function M._setup_keymaps()
         { noremap = true, silent = true })
 end
 
+--- 设置位置
+--- @param x number X坐标
+--- @param y number Y坐标
+function M.set_position(x, y)
+    if not state.initialized then
+        return
+    end
+
+    state.position = { x = x, y = y }
+
+    -- 如果窗口打开，更新位置
+    if state.current_window_id then
+        window_manager.update_window_options(state.current_window_id, {
+            row = y,
+            col = x
+        })
+    end
+end
+
+--- 获取位置
+--- @return table 位置 {x, y}
+function M.get_position()
+    return vim.deepcopy(state.position)
+end
+
+--- 获取内容
+--- @return string 思考内容
+function M.get_content()
+    return tostring(state.content_buffer or "")
+end
+
+--- 清空内容
+function M.clear_content()
+    state.content_buffer = ""
+    
+    if state.current_window_id then
+        M._update_window_content()
+    end
+end
+
 --- 保存内容（内部使用）
 function M._save_content()
-    if not state.initialized or state.content_buffer == "" then
+    if not state.initialized then
+        return
+    end
+    
+    -- 确保 content_buffer 是字符串
+    local content_str = tostring(state.content_buffer or "")
+    
+    if content_str == "" then
         return
     end
 
     -- 这里应该实现保存逻辑
     -- 目前只是记录日志
-    vim.notify("保存思考内容 (" .. #state.content_buffer .. " 字符)", vim.log.levels.INFO)
+    vim.notify("保存思考内容 (" .. #content_str .. " 字符)", vim.log.levels.INFO)
 end
 
 --- 复制内容（内部使用）
 function M._copy_content()
-    if not state.initialized or state.content_buffer == "" then
+    if not state.initialized then
+        return
+    end
+    
+    -- 确保 content_buffer 是字符串
+    local content_str = tostring(state.content_buffer or "")
+    
+    if content_str == "" then
         return
     end
 
     -- 复制到系统剪贴板
-    vim.fn.setreg("+", state.content_buffer)
+    vim.fn.setreg("+", content_str)
     vim.notify("思考内容已复制到剪贴板", vim.log.levels.INFO)
 end
 

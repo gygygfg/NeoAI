@@ -1,6 +1,195 @@
 local M = {}
 
-local file_utils = require("NeoAI.utils.file_utils")
+-- 本地文件操作函数
+local function read_file_content(path)
+    local file, err = io.open(path, "r")
+    if not file then
+        return nil, err
+    end
+    
+    local content = file:read("*a")
+    file:close()
+    return content
+end
+
+local function write_file_content(path, content, append)
+    local mode = append and "a" or "w"
+    local file, err = io.open(path, mode)
+    if not file then
+        return false, err
+    end
+    
+    file:write(content)
+    file:close()
+    return true
+end
+
+local function file_exists(path)
+    local file = io.open(path, "r")
+    if file then
+        file:close()
+        return true
+    end
+    return false
+end
+
+local function create_directory(path)
+    -- 使用 mkdir -p 创建目录
+    local cmd = 'mkdir -p "' .. path .. '" 2>/dev/null'
+    local result = os.execute(cmd)
+    return result == 0 or result == true
+end
+
+--- 读取文件
+--- @param args table 参数
+--- @return string 文件内容
+function M.read_file(args)
+    if not args or not args.path then
+        return "错误: 需要文件路径"
+    end
+
+    local path = args.path
+    local content, error_msg = read_file_content(path)
+
+    if content then
+        return content
+    else
+        return "错误: " .. (error_msg or "无法读取文件")
+    end
+end
+
+--- 写入文件
+--- @param args table 参数
+--- @return boolean 是否成功
+function M.write_file(args)
+    if not args or not args.path or not args.content then
+        return false
+    end
+
+    local path = args.path
+    local content = args.content
+    local append = args.append or false
+
+    local success, error_msg = write_file_content(path, content, append)
+
+    if success then
+        return true
+    else
+        -- 返回 false 而不是抛出错误
+        return false
+    end
+end
+
+--- 列出文件
+--- @param args table 参数
+--- @return table 文件列表
+function M.list_files(args)
+    local dir = args.dir or "."
+    local pattern = args.pattern or "*"
+    local recursive = args.recursive or false
+
+    -- 构建查找模式
+    local search_pattern
+    if recursive then
+        search_pattern = dir .. "/**/" .. pattern
+    else
+        search_pattern = dir .. "/" .. pattern
+    end
+
+    -- 获取文件列表
+    local files = {}
+    local handle = io.popen('find "' .. dir .. '" -name "' .. pattern .. '" -type f 2>/dev/null | head -100')
+    if handle then
+        for line in handle:lines() do
+            table.insert(files, line)
+        end
+        handle:close()
+    end
+
+    return files
+end
+
+--- 搜索文件内容
+--- @param args table 参数
+--- @return table 搜索结果
+function M.search_files(args)
+    if not args or not args.pattern then
+        return {}
+    end
+
+    local pattern = args.pattern
+    local dir = args.dir or "."
+    local file_pattern = args.file_pattern or "*"
+    local case_sensitive = args.case_sensitive or false
+
+    local results = {}
+
+    -- 构建grep命令
+    local grep_cmd = "grep -n"
+    if not case_sensitive then
+        grep_cmd = grep_cmd .. " -i"
+    end
+    grep_cmd = grep_cmd .. " -- '" .. pattern:gsub("'", "'\"'\"'") .. "' "
+    
+    -- 查找文件并搜索
+    local find_cmd = 'find "' .. dir .. '" -type f -name "' .. file_pattern .. '" 2>/dev/null | head -50'
+    local handle = io.popen(find_cmd)
+    
+    if handle then
+        for file in handle:lines() do
+            local search_handle = io.popen(grep_cmd .. '"' .. file .. '" 2>/dev/null')
+            if search_handle then
+                for line in search_handle:lines() do
+                    local line_num, content = line:match("^(%d+):(.+)$")
+                    if line_num and content then
+                        table.insert(results, {
+                            file = file,
+                            line = tonumber(line_num),
+                            content = content
+                        })
+                    end
+                end
+                search_handle:close()
+            end
+        end
+        handle:close()
+    end
+
+    return results
+end
+
+--- 检查文件是否存在
+--- @param args table 参数
+--- @return boolean 是否存在
+function M.file_exists(args)
+    if not args or not args.path then
+        return false
+    end
+
+    return file_exists(args.path)
+end
+
+--- 创建目录
+--- @param args table 参数
+--- @return boolean 是否成功
+function M.create_directory(args)
+    if not args or not args.path then
+        return false
+    end
+
+    local path = args.path
+    local parents = args.parents ~= false -- 默认为true
+
+    if parents then
+        -- 创建父目录
+        return create_directory(path)
+    else
+        -- 只创建最后一级目录
+        local cmd = 'mkdir "' .. path .. '" 2>/dev/null'
+        local result = os.execute(cmd)
+        return result == 0 or result == true
+    end
+end
 
 --- 获取内置文件工具
 --- @return table 工具列表
@@ -197,156 +386,5 @@ function M.get_tools()
     }
 end
 
---- 读取文件
---- @param args table 参数
---- @return string 文件内容
-function M.read_file(args)
-    if not args or not args.path then
-        return "错误: 需要文件路径"
-    end
-
-    local path = args.path
-    local content, error_msg = file_utils.read_file(path)
-
-    if content then
-        return content
-    else
-        return "错误: " .. (error_msg or "无法读取文件")
-    end
-end
-
---- 写入文件
---- @param args table 参数
---- @return boolean 是否成功
-function M.write_file(args)
-    if not args or not args.path or not args.content then
-        return false
-    end
-
-    local path = args.path
-    local content = args.content
-    local append = args.append or false
-
-    local success, error_msg = file_utils.write_file(path, content, append)
-
-    if success then
-        return true
-    else
-        -- 返回错误信息作为字符串
-        error("写入失败: " .. (error_msg or "未知错误"))
-    end
-end
-
---- 列出文件
---- @param args table 参数
---- @return table 文件列表
-function M.list_files(args)
-    local dir = args.dir or "."
-    local pattern = args.pattern or "*"
-    local recursive = args.recursive or false
-
-    -- 构建查找模式
-    local search_pattern
-    if recursive then
-        search_pattern = dir .. "/**/" .. pattern
-    else
-        search_pattern = dir .. "/" .. pattern
-    end
-
-    -- 获取文件列表
-    local files = {}
-    local handle = io.popen('find "' .. dir .. '" -name "' .. pattern .. '" -type f 2>/dev/null | head -100')
-    if handle then
-        for line in handle:lines() do
-            table.insert(files, line)
-        end
-        handle:close()
-    end
-
-    return files
-end
-
---- 搜索文件内容
---- @param args table 参数
---- @return table 搜索结果
-function M.search_files(args)
-    if not args or not args.pattern then
-        return {}
-    end
-
-    local pattern = args.pattern
-    local dir = args.dir or "."
-    local file_pattern = args.file_pattern or "*"
-    local case_sensitive = args.case_sensitive or false
-
-    local results = {}
-
-    -- 构建grep命令
-    local grep_cmd = "grep -n"
-    if not case_sensitive then
-        grep_cmd = grep_cmd .. " -i"
-    end
-    grep_cmd = grep_cmd .. " -- '" .. pattern:gsub("'", "'\"'\"'") .. "' "
-    
-    -- 查找文件并搜索
-    local find_cmd = 'find "' .. dir .. '" -type f -name "' .. file_pattern .. '" 2>/dev/null | head -50'
-    local handle = io.popen(find_cmd)
-    
-    if handle then
-        for file in handle:lines() do
-            local search_handle = io.popen(grep_cmd .. '"' .. file .. '" 2>/dev/null')
-            if search_handle then
-                for line in search_handle:lines() do
-                    local line_num, content = line:match("^(%d+):(.+)$")
-                    if line_num and content then
-                        table.insert(results, {
-                            file = file,
-                            line = tonumber(line_num),
-                            content = content
-                        })
-                    end
-                end
-                search_handle:close()
-            end
-        end
-        handle:close()
-    end
-
-    return results
-end
-
---- 检查文件是否存在
---- @param args table 参数
---- @return boolean 是否存在
-function M.file_exists(args)
-    if not args or not args.path then
-        return false
-    end
-
-    return file_utils.exists(args.path)
-end
-
---- 创建目录
---- @param args table 参数
---- @return boolean 是否成功
-function M.create_directory(args)
-    if not args or not args.path then
-        return false
-    end
-
-    local path = args.path
-    local parents = args.parents ~= false -- 默认为true
-
-    if parents then
-        -- 创建父目录
-        local success, error_msg = file_utils.mkdir(path)
-        return success
-    else
-        -- 只创建最后一级目录
-        local cmd = 'mkdir "' .. path .. '" 2>/dev/null'
-        local result = os.execute(cmd)
-        return result == 0 or result == true
-    end
-end
 
 return M

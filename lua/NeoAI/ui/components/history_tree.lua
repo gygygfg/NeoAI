@@ -55,6 +55,49 @@ function M.collapse_node(node_id)
     state.expanded_nodes[node_id] = nil
 end
 
+--- 更新历史树
+--- @param session_id string 会话ID
+--- @param new_data table 新数据
+function M.update(session_id, new_data)
+    if not state.initialized then
+        return
+    end
+    
+    -- 更新树数据
+    state.tree_data = new_data or {}
+    
+    -- 触发更新事件
+    if state.config.on_update then
+        state.config.on_update(session_id, state.tree_data)
+    end
+end
+
+--- 获取选中的项目
+--- @return table|nil 选中的节点
+function M.get_selected_item()
+    if not state.initialized or not state.selected_node_id then
+        return nil
+    end
+    
+    -- 在树数据中查找选中的节点
+    local function find_node(nodes, node_id)
+        for _, node in ipairs(nodes) do
+            if node.id == node_id then
+                return node
+            end
+            if node.children then
+                local found = find_node(node.children, node_id)
+                if found then
+                    return found
+                end
+            end
+        end
+        return nil
+    end
+    
+    return find_node(state.tree_data, state.selected_node_id)
+end
+
 --- 选择节点
 --- @param node_id string 节点ID
 function M.select_node(node_id)

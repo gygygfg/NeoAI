@@ -146,7 +146,8 @@ function M.open(parent_window_id, options)
 end
 
 --- 关闭虚拟输入框
-function M.close()
+--- @param mode string|nil 关闭模式："submit"（提交发送）、"cancel"（取消）、nil（普通关闭）
+function M.close(mode)
     if not state.active then
         return
     end
@@ -158,6 +159,22 @@ function M.close()
         if state.content == state.placeholder then
             state.content = ""
         end
+    end
+
+    -- 根据关闭模式处理内容
+    if mode == "submit" then
+        -- 提交模式：调用提交回调
+        if state.on_submit then
+            state.on_submit(state.content)
+        end
+    elseif mode == "cancel" then
+        -- 取消模式：调用取消回调
+        if state.on_cancel then
+            state.on_cancel()
+        end
+    else
+        -- 普通关闭：不调用任何回调
+        -- 这通常用于程序内部关闭，不需要特殊处理
     end
 
     -- 关闭窗口
@@ -187,23 +204,8 @@ function M.submit()
         return
     end
 
-    -- 获取内容
-    local lines = vim.api.nvim_buf_get_lines(state.buffer_id, 0, -1, false)
-    local content = ""
-    if #lines > 0 then
-        content = lines[1]
-        if content == state.placeholder then
-            content = ""
-        end
-    end
-
-    -- 调用提交回调
-    if state.on_submit and content ~= "" then
-        state.on_submit(content)
-    end
-
-    -- 关闭输入框
-    M.close()
+    -- 使用新的close函数，传递submit模式
+    M.close("submit")
 end
 
 --- 回到正常模式（不关闭输入框）
@@ -236,13 +238,8 @@ function M.cancel()
         return
     end
 
-    -- 调用取消回调
-    if state.on_cancel then
-        state.on_cancel()
-    end
-
-    -- 关闭输入框
-    M.close()
+    -- 使用新的close函数，传递cancel模式
+    M.close("cancel")
 end
 
 --- 获取当前内容
@@ -304,15 +301,15 @@ end
 --- @return table 键位配置
 function M._get_keymaps()
     local default_keymaps = {
-        normal_mode = "<Esc>",      -- 回到正常模式
-        submit = "<CR>",           -- 发送消息
-        cancel = "<C-c>",          -- 取消输入框
+        normal_mode = "<CR>",      -- 发送消息（Enter键）
+        submit = "<C-s>",          -- 发送消息（Ctrl+s）
+        cancel = "<Esc>",          -- 取消输入并关闭输入框
         clear = "<C-u>"            -- 清空输入
     }
     
-    -- 从配置中获取键位
-    if state.config and state.config.ui and state.config.ui.keymaps and state.config.ui.keymaps.virtual_input then
-        local config_keymaps = state.config.ui.keymaps.virtual_input
+    -- 从配置中获取键位（现在在顶层keymaps）
+    if state.config and state.config.keymaps and state.config.keymaps.virtual_input then
+        local config_keymaps = state.config.keymaps.virtual_input
         local result = {}
         
         -- 映射配置键位到内部键位名称
@@ -336,9 +333,6 @@ function M._setup_keymaps()
         return
     end
     
-    -- 获取键位配置
-    local keymaps = M._get_keymaps()
-
     -- 清除现有映射
     local existing_maps = vim.api.nvim_buf_get_keymap(state.buffer_id, "i")
     for _, map in ipairs(existing_maps) do
@@ -354,30 +348,53 @@ function M._setup_keymaps()
     -- 获取键位配置
     local keymaps = M._get_keymaps()
     
-    -- 提交（Enter）
+    -- 尝试从键位配置管理器获取虚拟输入框的特定配置
+    local ok, keymap_manager = pcall(require, "NeoAI.core.config.keymap_manager")
+    if ok and keymap_manager then
+        local virtual_input_keymaps = keymap_manager.get_context_keymaps("virtual_input")
+        if virtual_input_keymaps then
+            -- 使用虚拟输入框的特定配置
+            for internal_name, default_key in pairs(keymaps) do
+                if virtual_input_keymaps[internal_name] and virtual_input_keymaps[internal_name].key then
+                    keymaps[internal_name] = virtual_input_keymaps[internal_name].key
+                end
+            end
+        end
+    end
+    
+    -- 发送消息（Enter键）
+    if keymaps.normal_mode then
+        vim.api.nvim_buf_set_keymap(state.buffer_id, "i", keymaps.normal_mode, 
+            "<Cmd>lua require('NeoAI.ui.components.virtual_input').submit()<CR>", 
+            { noremap = true, silent = true, desc = "发送消息" })
+        
+        -- 普通模式下也映射Enter键
+        vim.api.nvim_buf_set_keymap(state.buffer_id, "n", keymaps.normal_mode, 
+            "<Cmd>lua require('NeoAI.ui.components.virtual_input').submit()<CR>", 
+            { noremap = true, silent = true, desc = "发送消息" })
+    end
+    
+    -- 发送消息（Ctrl+s）
     if keymaps.submit then
         vim.api.nvim_buf_set_keymap(state.buffer_id, "i", keymaps.submit, 
             "<Cmd>lua require('NeoAI.ui.components.virtual_input').submit()<CR>", 
             { noremap = true, silent = true, desc = "发送消息" })
     end
     
-    -- 回到正常模式（ESC）
-    if keymaps.normal_mode then
-        vim.api.nvim_buf_set_keymap(state.buffer_id, "i", keymaps.normal_mode, 
-            "<Cmd>lua require('NeoAI.ui.components.virtual_input').enter_normal_mode()<CR>", 
-            { noremap = true, silent = true, desc = "回到正常模式" })
-        
-        -- 普通模式下也映射ESC键
-        vim.api.nvim_buf_set_keymap(state.buffer_id, "n", keymaps.normal_mode, 
-            "<Cmd>lua require('NeoAI.ui.components.virtual_input').enter_normal_mode()<CR>", 
-            { noremap = true, silent = true, desc = "回到正常模式" })
-    end
+    -- 退出插入模式（ESC键）- 只退出插入模式，不关闭输入框
+    vim.api.nvim_buf_set_keymap(state.buffer_id, "i", "<Esc>", 
+        "<Cmd>lua require('NeoAI.ui.components.virtual_input').enter_normal_mode()<CR>", 
+        { noremap = true, silent = true, desc = "退出插入模式" })
     
-    -- 回到正常模式（Ctrl+c）
+    vim.api.nvim_buf_set_keymap(state.buffer_id, "n", "<Esc>", 
+        "<Cmd>lua require('NeoAI.ui.components.virtual_input').enter_normal_mode()<CR>", 
+        { noremap = true, silent = true, desc = "退出插入模式" })
+    
+    -- 取消输入（Ctrl+c）
     if keymaps.cancel then
         vim.api.nvim_buf_set_keymap(state.buffer_id, "i", keymaps.cancel, 
-            "<Cmd>lua require('NeoAI.ui.components.virtual_input').enter_normal_mode()<CR>", 
-            { noremap = true, silent = true, desc = "回到正常模式" })
+            "<Cmd>lua require('NeoAI.ui.components.virtual_input').cancel()<CR>", 
+            { noremap = true, silent = true, desc = "取消输入并关闭输入框" })
     end
     
     -- 清空输入（Ctrl+u）
@@ -386,6 +403,15 @@ function M._setup_keymaps()
             "<Cmd>lua require('NeoAI.ui.components.virtual_input').set_content('')<CR>", 
             { noremap = true, silent = true, desc = "清空输入" })
     end
+    
+    -- 普通模式下重新进入插入模式
+    vim.api.nvim_buf_set_keymap(state.buffer_id, "n", "i", 
+        "<Cmd>startinsert<CR>", 
+        { noremap = true, silent = true, desc = "进入插入模式" })
+    
+    vim.api.nvim_buf_set_keymap(state.buffer_id, "n", "a", 
+        "<Cmd>startinsert<CR>", 
+        { noremap = true, silent = true, desc = "进入插入模式" })
 
     -- 内容变化时触发回调
     vim.api.nvim_buf_attach(state.buffer_id, false, {

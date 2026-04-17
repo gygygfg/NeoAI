@@ -46,9 +46,31 @@ function M.filter(tbl, predicate)
     end
 
     local result = {}
-    for k, v in pairs(tbl) do
-        if predicate(v, k) then
-            result[k] = v
+    local is_array = true
+    
+    -- 检查是否是数组表
+    for k in pairs(tbl) do
+        if type(k) ~= "number" or k < 1 or k > #tbl then
+            is_array = false
+            break
+        end
+    end
+    
+    if is_array then
+        -- 数组表：创建连续索引
+        local index = 1
+        for i = 1, #tbl do
+            if predicate(tbl[i], i) then
+                result[index] = tbl[i]
+                index = index + 1
+            end
+        end
+    else
+        -- 字典表：保留原始键
+        for k, v in pairs(tbl) do
+            if predicate(v, k) then
+                result[k] = v
+            end
         end
     end
 
@@ -480,6 +502,44 @@ function M.omit(tbl, keys)
     end
 
     return result
+end
+
+--- 检查表是否包含值（table_contains 是 contains 的别名）
+--- @param tbl table 表
+--- @param value any 值
+--- @return boolean 是否包含
+function M.table_contains(tbl, value)
+    return M.contains(tbl, value)
+end
+
+--- 获取表的所有键（table_keys 是 keys 的别名）
+--- @param tbl table 表
+--- @return table 键列表
+function M.table_keys(tbl)
+    return M.keys(tbl)
+end
+
+--- 获取表的所有值（table_values 是 values 的别名）
+--- @param tbl table 表
+--- @return table 值列表
+function M.table_values(tbl)
+    return M.values(tbl)
+end
+
+--- 过滤表（table_filter 是 filter 的别名）
+--- @param tbl table 表
+--- @param predicate function 谓词函数
+--- @return table 过滤后的表
+function M.table_filter(tbl, predicate)
+    return M.filter(tbl, predicate)
+end
+
+--- 映射表（table_map 是 map 的别名）
+--- @param tbl table 表
+--- @param func function 映射函数
+--- @return table 映射后的表
+function M.table_map(tbl, func)
+    return M.map(tbl, func)
 end
 
 return M

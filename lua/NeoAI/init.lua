@@ -108,15 +108,38 @@ local function register_commands()
   end, {
     desc = "显示NeoAI聊天窗口状态",
   })
+
+  -- NeoAITestAll 命令：运行所有测试
+  vim.api.nvim_create_user_command("NeoAITestAll", function()
+    M.test()
+  end, {
+    desc = "运行所有NeoAI测试",
+  })
+
+  -- NeoAITest 命令：运行指定测试
+  vim.api.nvim_create_user_command("NeoAITest", function(opts)
+    M.test(opts.args)
+  end, {
+    desc = "运行指定NeoAI测试",
+    nargs = 1,
+    complete = function()
+      local test_module = require("NeoAI.test")
+      local completions = {}
+      for name, _ in pairs(test_module.tests) do
+        table.insert(completions, name)
+      end
+      return completions
+    end,
+  })
 end
 
 -- 内部函数：注册全局快捷键
 local function register_global_keymaps()
-  if not state.config or not state.config.ui or not state.config.ui.keymaps then
+  if not state.config or not state.config.keymaps then
     return
   end
 
-  local global_keymaps = state.config.ui.keymaps.global
+  local global_keymaps = state.config.keymaps.global
   if not global_keymaps then
     return
   end
@@ -192,8 +215,8 @@ function M.setup(user_config)
   -- 初始化核心模块（传递整个配置）
   state.core = core.initialize(config)
 
-  -- 初始化UI模块
-  state.ui = ui.initialize(config.ui or {})
+  -- 初始化UI模块（传递完整配置）
+  state.ui = ui.initialize(config)
 
   -- 初始化工具系统
   state.tools = tools.initialize(config.tools or {})
@@ -208,6 +231,17 @@ function M.setup(user_config)
   register_global_keymaps()
 
   vim.notify("[NeoAI] 插件已初始化，命令和快捷键已注册", vim.log.levels.INFO)
+
+  -- 检查是否需要自动运行测试
+  if config.test and config.test.auto_test then
+    local delay_ms = config.test.delay_ms or 500
+
+    -- 延迟执行测试
+    vim.defer_fn(function()
+      vim.notify("[NeoAI] 开始自动运行测试...", vim.log.levels.INFO)
+      M.test()
+    end, delay_ms)
+  end
 
   return M
 end
@@ -275,6 +309,38 @@ function M.get_keymap_manager()
     error("Core not initialized")
   end
   return state.core.get_keymap_manager()
+end
+
+--- 运行测试套件
+--- @param test_name string|nil 可选：指定运行的测试名称，如果为nil则运行所有测试
+function M.test(test_name)
+  -- 加载测试模块
+  local test_module = require("NeoAI.test")
+
+  -- 如果指定了测试名称，只运行该测试
+  if test_name then
+    local test_to_run = test_module.tests[test_name]
+    if test_to_run and test_to_run.run then
+      print("🚀 运行指定测试: " .. test_name)
+      print(string.rep("=", 50))
+
+      local success, result = pcall(test_to_run.run)
+      if success then
+        print("✅ " .. test_name .. " 测试通过")
+      else
+        print("❌ " .. test_name .. " 测试失败: " .. tostring(result))
+      end
+    else
+      print("⚠️ 未找到测试: " .. test_name)
+      print("可用测试:")
+      for name, _ in pairs(test_module.tests) do
+        print("  - " .. name)
+      end
+    end
+  else
+    -- 运行所有测试
+    test_module.run_all_tests()
+  end
 end
 
 return M

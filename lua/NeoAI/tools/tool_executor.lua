@@ -61,17 +61,22 @@ function M.execute(tool_name, args)
         end
     end
 
-    -- 执行工具
+    -- 执行工具（使用安全调用）
     local start_time = os.time()
-    local success, result = pcall(tool.func, args)
+    
+    -- 从配置获取重试参数
+    local max_retries = state.config.max_retries or 0
+    local retry_delay = state.config.retry_delay or 1
+    
+    local result, error_msg = M.safe_call(tool.func, args, max_retries, retry_delay)
     local end_time = os.time()
     local duration = end_time - start_time
 
     -- 处理执行结果
-    if not success then
-        local error_msg = "工具执行错误: " .. result
-        M._record_execution(tool_name, args, nil, error_msg, duration)
-        return M.handle_error(error_msg)
+    if error_msg then
+        local full_error_msg = "工具执行错误: " .. error_msg
+        M._record_execution(tool_name, args, nil, full_error_msg, duration)
+        return M.handle_error(full_error_msg)
     end
 
     -- 格式化结果
@@ -81,6 +86,14 @@ function M.execute(tool_name, args)
     M._record_execution(tool_name, args, formatted_result, nil, duration)
 
     return formatted_result
+end
+
+--- 执行工具（别名，用于兼容性）
+--- @param tool_name string 工具名称
+--- @param args table 参数
+--- @return any 执行结果
+function M.execute_tool(tool_name, args)
+    return M.execute(tool_name, args)
 end
 
 --- 验证参数
@@ -133,9 +146,136 @@ end
 --- @param error_msg string 错误信息
 --- @return string 格式化后的错误信息
 function M.handle_error(error_msg)
-    -- 这里可以添加错误处理逻辑，如日志记录、重试等
-    -- 目前只是返回错误信息
-    return "错误: " .. error_msg
+    -- 分析错误类型
+    local error_type = "未知错误"
+    
+    if string.find(error_msg, "参数") then
+        error_type = "参数错误"
+    elseif string.find(error_msg, "权限") then
+        error_type = "权限错误"
+    elseif string.find(error_msg, "不存在") or string.find(error_msg, "未找到") then
+        error_type = "资源不存在错误"
+    elseif string.find(error_msg, "超时") then
+        error_type = "超时错误"
+    elseif string.find(error_msg, "网络") then
+        error_type = "网络错误"
+    elseif string.find(error_msg, "内存") then
+        error_type = "内存错误"
+    end
+    
+    -- 构建详细的错误信息
+    local detailed_error = string.format(
+        "[%s] %s\n时间: %s",
+        error_type,
+        error_msg,
+        os.date("%Y-%m-%d %H:%M:%S")
+    )
+    
+    -- 记录到日志（如果配置了日志）
+    if state.config and state.config.log_errors then
+        M._log_error(detailed_error)
+    end
+    
+    return detailed_error
+end
+
+--- 记录错误日志
+--- @param error_msg string 错误信息
+function M._log_error(error_msg)
+    -- 简单的日志记录实现
+    -- 在实际项目中，可以集成到现有的日志系统中
+    local log_file = state.config.error_log_file or "/tmp/neoai_tools_error.log"
+    
+    local file = io.open(log_file, "a")
+    if file then
+        file:write(error_msg .. "\n\n")
+        file:close()
+    end
+end
+
+--- 安全调用函数
+--- @param func function 要调用的函数
+--- @param args table 函数参数
+--- @param max_retries number 最大重试次数
+--- @param retry_delay number 重试延迟（秒）
+--- @return any, string 执行结果，错误信息
+function M.safe_call(func, args, max_retries, retry_delay)
+    if not func then
+        return nil, "函数不能为空"
+    end
+    
+    max_retries = max_retries or 0
+    retry_delay = retry_delay or 1
+    
+    local last_error = nil
+    
+    for attempt = 0, max_retries do
+        if attempt > 0 then
+            -- 重试前等待
+            os.execute("sleep " .. retry_delay)
+            
+            -- 记录重试信息
+            M._record_execution("safe_call", args, nil, "重试尝试: " .. attempt, 0)
+        end
+        
+        local start_time = os.time()
+        local success, result = pcall(func, args)
+        local end_time = os.time()
+        local duration = end_time - start_time
+        
+        if success then
+            -- 成功执行
+            if attempt > 0 then
+                M._record_execution("safe_call", args, "重试成功", nil, duration)
+            end
+            return result, nil
+        else
+            -- 执行失败
+            last_error = result
+            M._record_execution("safe_call", args, nil, "执行失败: " .. result, duration)
+            
+            -- 检查是否应该重试
+            if attempt < max_retries then
+                -- 分析错误类型，决定是否重试
+                local should_retry = M._should_retry_error(result)
+                if not should_retry then
+                    break
+                end
+            end
+        end
+    end
+    
+    return nil, "安全调用失败: " .. (last_error or "未知错误")
+end
+
+--- 判断错误是否应该重试
+--- @param error_msg string 错误信息
+--- @return boolean 是否应该重试
+function M._should_retry_error(error_msg)
+    -- 默认重试所有错误
+    -- 可以在这里添加逻辑来过滤不应该重试的错误
+    
+    -- 不应该重试的错误示例：
+    -- 1. 参数验证错误
+    -- 2. 权限错误
+    -- 3. 资源不存在错误
+    
+    local non_retryable_errors = {
+        "参数",
+        "权限",
+        "不存在",
+        "无效",
+        "未找到",
+        "未初始化"
+    }
+    
+    for _, error_pattern in ipairs(non_retryable_errors) do
+        if string.find(error_msg, error_pattern) then
+            return false
+        end
+    end
+    
+    return true
 end
 
 --- 清理资源

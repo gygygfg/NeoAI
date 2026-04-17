@@ -3,6 +3,30 @@ local M = {}
 -- 事件监听器存储
 local listeners = {}
 
+-- 模块状态
+local state = {
+    initialized = false
+}
+
+--- 初始化事件总线
+--- @param options table 选项（可选）
+--- @return table 事件总线实例
+function M.initialize(options)
+    if state.initialized then
+        return M
+    end
+    
+    -- 初始化选项（如果有）
+    options = options or {}
+    
+    -- 重置监听器
+    listeners = {}
+    
+    state.initialized = true
+    
+    return M
+end
+
 --- 监听事件
 --- @param event string 事件名称
 --- @param callback function 回调函数

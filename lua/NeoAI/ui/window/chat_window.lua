@@ -19,7 +19,8 @@ local state = {
     send_count = 0,              -- 发送消息计数
     virtual_input_active = false, -- 虚拟输入框是否激活
     virtual_input_buf = nil,     -- 虚拟输入缓冲区ID
-    virtual_input_win = nil      -- 虚拟输入窗口ID
+    virtual_input_win = nil,     -- 虚拟输入窗口ID
+    current_ai_response = nil    -- 当前AI流式响应
 }
 
 --- 初始化聊天窗口
@@ -30,6 +31,15 @@ function M.initialize(config)
     end
 
     state.config = config or {}
+    
+    -- 确保虚拟输入框能访问键位配置
+    local virtual_input_config = {
+        keymaps = config.keymaps or {}
+    }
+    
+    -- 初始化虚拟输入组件
+    virtual_input.initialize(virtual_input_config)
+    
     state.initialized = true
 end
 
@@ -68,9 +78,28 @@ function M.open(session_id, branch_id)
 
     -- 加载消息
     M._load_messages()
+    
+    -- 如果没有消息，添加一条测试消息
+    if #state.message_buffer == 0 then
+        table.insert(state.message_buffer, {
+            role = "assistant",
+            content = "欢迎使用 NeoAI！我是您的AI助手，随时为您服务。\n\n您可以：\n1. 输入消息与我对话\n2. 按 i 键打开虚拟输入框\n3. 按 Enter 或 Ctrl+s 发送消息\n4. 按 Esc 关闭窗口",
+            metadata = { is_welcome = true }
+        })
+        vim.notify("已添加欢迎消息", vim.log.levels.INFO)
+    end
 
     -- 渲染消息
     M.render_messages()
+    
+    -- 验证渲染是否成功
+    local buf = window_manager.get_window_buf(window_id)
+    if buf and vim.api.nvim_buf_is_valid(buf) then
+        local line_count = vim.api.nvim_buf_line_count(buf)
+        vim.notify(string.format("聊天窗口已打开，缓冲区行数: %d", line_count), vim.log.levels.INFO)
+    else
+        vim.notify("警告: 聊天窗口缓冲区无效", vim.log.levels.WARN)
+    end
 
     -- 设置输入区域
     M._setup_input_area()
@@ -196,6 +225,15 @@ function M.render_messages()
     
     table.insert(content, "")
 
+    -- 调试信息：显示消息数量
+    if #state.message_buffer == 0 then
+        table.insert(content, "📭 暂无消息")
+        table.insert(content, "")
+    else
+        table.insert(content, string.format("📨 消息数量: %d", #state.message_buffer))
+        table.insert(content, "")
+    end
+
     -- 添加消息
     for _, msg in ipairs(state.message_buffer) do
         local role_icon = msg.role == "user" and "👤" or msg.role == "assistant" and "🤖" or "🛠️"
@@ -206,7 +244,8 @@ function M.render_messages()
         if type(msg.content) == "table" then
             table.insert(content, "  " .. vim.json.encode(msg.content))
         else
-            local lines = vim.split(msg.content or "", "\n")
+            local content_text = msg.content or "[空消息]"
+            local lines = vim.split(content_text, "\n")
             for _, line in ipairs(lines) do
                 table.insert(content, "  " .. line)
             end
@@ -240,12 +279,12 @@ function M.render_messages()
     table.insert(content, "")
     table.insert(content, "操作提示:")
     if state.virtual_input_active then
-        table.insert(content, "  • 按 Enter 提交消息")
-        table.insert(content, "  • 按 Esc 或 Ctrl+c 取消输入")
+        table.insert(content, "  • 按 Ctrl+s 发送消息并关闭输入框")
+        table.insert(content, "  • 按 Esc 或 Ctrl+c 直接关闭输入框")
         table.insert(content, "  • 按 Ctrl+u 清空输入框")
     else
         table.insert(content, "  • 按 i 或 a 打开虚拟输入框")
-        table.insert(content, "  • 按 Ctrl+s 发送消息")
+        table.insert(content, "  • 按 Enter 或 Ctrl+s 发送消息")
         table.insert(content, "  • 按 Esc 取消/关闭窗口")
         table.insert(content, "  • 按 Ctrl+u 清空输入")
     end
@@ -256,17 +295,11 @@ function M.render_messages()
         table.insert(content, string.format("📊 统计: 已发送 %d 条消息", state.send_count))
     end
 
-    -- 当虚拟输入框激活时，不设置窗口内容，避免修改只读缓冲区
-    if not state.virtual_input_active then
-        -- 设置窗口内容
-        window_manager.set_window_content(state.current_window_id, content)
-        
-        -- 滚动到底部
-        M._scroll_to_bottom()
-    else
-        -- 虚拟输入框激活时，只更新状态，不渲染
-        -- 这样可以避免修改只读的聊天窗口缓冲区
-    end
+    -- 设置窗口内容
+    window_manager.set_window_content(state.current_window_id, content)
+    
+    -- 滚动到底部
+    M._scroll_to_bottom()
 end
 
 --- 更新输入框
@@ -339,8 +372,13 @@ function M.set_keymaps(keymap_manager)
         keymaps = state.config.keymaps or M._get_default_keymaps()
     end
 
-    -- 发送消息
+    -- 发送消息（Ctrl+s）
     vim.api.nvim_buf_set_keymap(buf, "n", keymaps.send, 
+        ":lua require('NeoAI.ui.window.chat_window')._handle_send()<CR>", 
+        { noremap = true, silent = true, desc = "发送消息" })
+    
+    -- 发送消息（回车键）
+    vim.api.nvim_buf_set_keymap(buf, "n", "<CR>", 
         ":lua require('NeoAI.ui.window.chat_window')._handle_send()<CR>", 
         { noremap = true, silent = true, desc = "发送消息" })
 
@@ -401,7 +439,7 @@ function M.set_keymaps(keymap_manager)
     
     -- 插入模式下发送消息（Ctrl+s）
     vim.api.nvim_buf_set_keymap(buf, "i", keymaps.send, 
-        "<Esc>:lua require('NeoAI.ui.window.chat_window')._handle_send()<CR>", 
+        "<Cmd>lua require('NeoAI.ui.window.chat_window')._handle_send()<CR>", 
         { noremap = true, silent = true, desc = "发送消息" })
 end
 
@@ -527,11 +565,28 @@ function M.add_message(role, content)
         return
     end
 
+    -- 添加到本地缓冲区
     table.insert(state.message_buffer, {
         role = role,
         content = content,
         timestamp = os.time()
     })
+
+    -- 保存到消息管理器（如果有当前分支）
+    if state.current_branch_id then
+        local ok, message_manager = pcall(require, "NeoAI.core.session.message_manager")
+        if ok and message_manager then
+            local message_id = message_manager.add_message(state.current_branch_id, role, content, {
+                timestamp = os.time(),
+                session_id = state.current_session_id
+            })
+            logger.info(string.format("消息已保存到历史: %s (分支: %s)", message_id, state.current_branch_id))
+        else
+            logger.warn("无法保存消息到历史: 消息管理器不可用")
+        end
+    else
+        logger.warn("无法保存消息到历史: 当前分支ID为空")
+    end
 
     M.render_messages()
 end
@@ -595,18 +650,25 @@ function M._handle_send()
         return
     end
 
+    -- 如果输入为空，且虚拟输入框未激活，打开虚拟输入框
+    if state.input_buffer == "" and not state.virtual_input_active then
+        M._enter_input_mode()
+        return
+    end
+    
+    -- 如果输入为空且虚拟输入框已激活，只是关闭虚拟输入框
+    if state.input_buffer == "" and state.virtual_input_active then
+        virtual_input.close()
+        state.virtual_input_active = false
+        return
+    end
+
     -- 如果虚拟输入框激活，先关闭它
     if state.virtual_input_active then
         virtual_input.close()
         state.virtual_input_active = false
     end
-
-    -- 如果输入为空，打开虚拟输入框
-    if state.input_buffer == "" then
-        M._enter_input_mode()
-        return
-    end
-
+    
     -- 设置发送状态
     state.is_sending = true
     state.last_send_time = os.time()
@@ -626,26 +688,170 @@ function M._handle_send()
     -- 显示发送通知
     vim.notify("📤 消息已发送: " .. state.input_buffer, vim.log.levels.INFO)
     
+    -- 保存消息内容用于AI处理
+    local message_content = state.input_buffer
+    
     -- 清空输入
     state.input_buffer = ""
     
-    -- 模拟发送延迟（实际应该调用AI引擎）
-    vim.defer_fn(function()
-        -- 发送完成
-        state.is_sending = false
+    -- 调用AI引擎生成响应
+    M._generate_ai_response(message_content)
+end
+
+--- 生成AI响应
+--- @param user_message string 用户消息
+function M._generate_ai_response(user_message)
+    -- 获取AI引擎实例
+    local ai_engine = require("NeoAI.core.ai.ai_engine")
+    
+    -- 构建消息列表
+    local messages = {
+        {
+            role = "user",
+            content = user_message
+        }
+    }
+    
+    -- 添加历史消息（如果有）
+    for _, msg in ipairs(state.message_buffer) do
+        if msg.role == "user" or msg.role == "assistant" then
+            table.insert(messages, {
+                role = msg.role,
+                content = msg.content
+            })
+        end
+    end
+    
+    -- 调用AI引擎生成响应
+    local generation_id = ai_engine.generate_response(messages, {
+        stream = true,
+        on_chunk = function(chunk)
+            -- 处理流式响应
+            M._handle_ai_chunk(chunk)
+        end,
+        on_complete = function(full_response)
+            -- 处理完成
+            M._handle_ai_complete(full_response)
+        end,
+        on_error = function(error_msg)
+            -- 处理错误
+            M._handle_ai_error(error_msg)
+        end
+    })
+    
+    -- 记录生成ID
+    logger.info("AI响应生成ID: " .. generation_id)
+end
+
+--- 处理AI响应数据块
+--- @param chunk string 响应数据块
+function M._handle_ai_chunk(chunk)
+    if not chunk or chunk == "" then
+        return
+    end
+    
+    -- 记录日志
+    logger.debug("收到AI响应数据块: " .. chunk)
+    
+    -- 检查是否已有正在构建的AI响应
+    if not state.current_ai_response then
+        state.current_ai_response = {
+            content = "",
+            chunks = {},
+            start_time = os.time()
+        }
         
-        -- 记录日志
-        logger.info("消息发送完成")
+        -- 添加AI助手消息占位符
+        M.add_message("assistant", "🔄 AI正在思考...")
+    end
+    
+    -- 更新当前AI响应
+    state.current_ai_response.content = state.current_ai_response.content .. chunk
+    table.insert(state.current_ai_response.chunks, chunk)
+    
+    -- 更新最后一条消息（AI响应）
+    if #state.message_buffer > 0 then
+        local last_msg = state.message_buffer[#state.message_buffer]
+        if last_msg.role == "assistant" then
+            -- 更新消息内容
+            last_msg.content = state.current_ai_response.content
+            
+            -- 计算响应时间
+            local response_time = os.time() - state.current_ai_response.start_time
+            
+            -- 添加状态指示器
+            local status_indicator = "🔄"
+            if response_time > 5 then
+                status_indicator = "⏳"  -- 长时间响应
+            end
+            
+            -- 更新显示
+            M.render_messages()
+            
+            -- 可选：显示进度通知
+            if #state.current_ai_response.chunks % 3 == 0 then  -- 每3个数据块显示一次
+                vim.notify("📝 AI正在回复... (已接收 " .. #state.current_ai_response.chunks .. " 个数据块)", vim.log.levels.INFO)
+            end
+        end
+    end
+end
+
+--- 处理AI响应完成
+--- @param full_response string 完整响应
+function M._handle_ai_complete(full_response)
+    -- 发送完成
+    state.is_sending = false
+    
+    -- 记录日志
+    logger.info("AI响应完成: " .. full_response)
+    
+    -- 如果有正在构建的流式响应，更新它
+    if state.current_ai_response then
+        -- 计算响应时间
+        local response_time = os.time() - state.current_ai_response.start_time
         
-        -- 更新界面
-        M.render_messages()
+        -- 更新最后一条消息（确保使用完整响应）
+        if #state.message_buffer > 0 then
+            local last_msg = state.message_buffer[#state.message_buffer]
+            if last_msg.role == "assistant" then
+                last_msg.content = full_response
+                
+                -- 添加响应时间信息
+                local time_info = string.format(" (响应时间: %.1fs)", response_time)
+                last_msg.metadata = last_msg.metadata or {}
+                last_msg.metadata.response_time = response_time
+                last_msg.metadata.chunk_count = #state.current_ai_response.chunks
+            end
+        end
         
-        -- 显示完成通知
-        vim.notify("✅ 消息发送完成", vim.log.levels.INFO)
-        
-        -- 这里应该调用AI引擎生成响应
-        -- 注意：实际发送给AI的逻辑需要在这里实现
-    end, 1000)  -- 1秒延迟模拟网络请求
+        -- 清理当前AI响应
+        state.current_ai_response = nil
+    else
+        -- 如果没有流式响应，直接添加新消息
+        M.add_message("assistant", full_response)
+    end
+    
+    -- 更新界面
+    M.render_messages()
+    
+    -- 显示完成通知
+    vim.notify("✅ AI响应完成", vim.log.levels.INFO)
+end
+
+--- 处理AI响应错误
+--- @param error_msg string 错误信息
+function M._handle_ai_error(error_msg)
+    -- 发送失败
+    state.is_sending = false
+    
+    -- 记录错误日志
+    logger.error("AI响应错误: " .. error_msg)
+    
+    -- 更新界面
+    M.render_messages()
+    
+    -- 显示错误通知
+    vim.notify("❌ AI响应失败: " .. error_msg, vim.log.levels.ERROR)
 end
 
 --- 进入输入模式（内部使用）
@@ -682,6 +888,7 @@ function M._enter_input_mode()
         end,
         on_cancel = function()
             state.virtual_input_active = false
+            -- 取消时不清空输入内容，保留用户输入
             M.render_messages()
         end,
         on_change = function(content)
@@ -696,6 +903,14 @@ function M._enter_input_mode()
         state.virtual_input_buf = virtual_input.get_buffer_id()
         state.virtual_input_win = virtual_input.get_window_id()
         M.render_messages()
+        
+        -- 自动获取焦点到虚拟输入框
+        vim.defer_fn(function()
+            if state.virtual_input_win and vim.api.nvim_win_is_valid(state.virtual_input_win) then
+                vim.api.nvim_set_current_win(state.virtual_input_win)
+                vim.cmd("startinsert")
+            end
+        end, 50)
     else
         vim.notify("无法打开虚拟输入框", vim.log.levels.ERROR)
     end
@@ -703,15 +918,53 @@ end
 
 --- 设置输入区域（内部使用）
 function M._setup_input_area()
-    -- 初始化虚拟输入组件
-    virtual_input.initialize(state.config)
+    -- 虚拟输入组件已在initialize函数中初始化
+    -- 这里不需要重复初始化
 end
 
 --- 加载消息（内部使用）
 function M._load_messages()
-    -- 这里应该从会话管理器加载消息
-    -- 目前使用空实现
+    -- 从会话管理器加载消息
+    local ok, session_manager = pcall(require, "NeoAI.core.session.session_manager")
+    if not ok then
+        state.message_buffer = {}
+        vim.notify("无法加载会话管理器: " .. session_manager, vim.log.levels.WARN)
+        return
+    end
+    
+    local ok2, message_manager = pcall(require, "NeoAI.core.session.message_manager")
+    if not ok2 then
+        state.message_buffer = {}
+        vim.notify("无法加载消息管理器: " .. message_manager, vim.log.levels.WARN)
+        return
+    end
+    
+    -- 确保有当前会话
+    local session_id = state.current_session_id
+    local branch_id = state.current_branch_id
+    
+    if not session_id or not branch_id then
+        state.message_buffer = {}
+        vim.notify("会话ID或分支ID为空", vim.log.levels.WARN)
+        return
+    end
+    
+    -- 获取消息
+    local messages = message_manager.get_messages(branch_id)
+    
+    -- 转换为聊天窗口格式
     state.message_buffer = {}
+    for _, msg in ipairs(messages) do
+        table.insert(state.message_buffer, {
+            role = msg.role,
+            content = msg.content,
+            metadata = msg.metadata
+        })
+    end
+    
+    -- 调试信息
+    vim.notify(string.format("已加载 %d 条消息 (会话: %s, 分支: %s)", 
+        #state.message_buffer, session_id, branch_id), vim.log.levels.INFO)
 end
 
 --- 滚动到底部（内部使用）
@@ -800,6 +1053,49 @@ function M._toggle_reasoning()
     -- 这里实现切换思考过程显示的逻辑
 end
 
+--- 获取输入内容
+--- @return string|nil 输入内容
+function M.get_input_content()
+    if not state.initialized then
+        return nil
+    end
+    
+    -- 如果虚拟输入框激活，从虚拟输入框获取内容
+    if state.virtual_input_active then
+        return virtual_input.get_content()
+    end
+    
+    return state.input_buffer
+end
+
+--- 发送消息
+--- @param content string 消息内容
+--- @return boolean, string|nil 是否成功，错误信息
+function M.send_message(content)
+    if not state.initialized then
+        return false, "聊天窗口未初始化"
+    end
+    
+    -- 检查窗口是否可用
+    local available, err = M.is_available()
+    if not available then
+        return false, err
+    end
+    
+    -- 验证消息内容
+    if not content or content == "" then
+        return false, "消息内容不能为空"
+    end
+    
+    -- 设置输入内容
+    state.input_buffer = content
+    
+    -- 调用内部发送处理
+    M._handle_send()
+    
+    return true, "消息已发送"
+end
+
 --- 更新配置
 --- @param new_config table 新配置
 function M.update_config(new_config)
@@ -814,6 +1110,22 @@ function M.update_config(new_config)
         M.set_keymaps()
         M.render_messages()
     end
+end
+
+--- 刷新聊天窗口
+--- @return boolean 是否成功
+function M.refresh()
+    if not state.initialized then
+        return false
+    end
+    
+    if not state.current_window_id then
+        return false
+    end
+    
+    -- 重新渲染消息
+    M.render_messages()
+    return true
 end
 
 return M

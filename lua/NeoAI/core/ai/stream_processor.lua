@@ -36,13 +36,55 @@ function M.process_chunk(chunk)
     -- 添加到缓冲区
     state.buffer = state.buffer .. chunk
 
+    -- 尝试解析DeepSeek API格式
+    if chunk:match("^data: ") then
+        M._parse_deepseek_stream(chunk)
     -- 尝试解析特殊标记
-    if chunk:match("^<reasoning>") or state.in_reasoning then
+    elseif chunk:match("^<reasoning>") or state.in_reasoning then
         M._handle_reasoning_chunk(chunk)
     elseif chunk:match("^<tool_call>") then
         M._handle_tool_call_chunk(chunk)
     else
         M._handle_content_chunk(chunk)
+    end
+end
+
+--- 解析DeepSeek流式响应
+--- @param chunk string 数据块
+function M._parse_deepseek_stream(chunk)
+    -- 移除 "data: " 前缀
+    local json_str = chunk:gsub("^data: ", "")
+    
+    -- 跳过 [DONE] 消息
+    if json_str == "[DONE]" then
+        return
+    end
+    
+    -- 解析JSON
+    local ok, data = pcall(vim.json.decode, json_str)
+    if not ok or not data then
+        return
+    end
+    
+    -- 检查是否有思考内容
+    if data.choices and data.choices[1] and data.choices[1].delta then
+        local delta = data.choices[1].delta
+        
+        if delta.reasoning_content then
+            -- 思考内容
+            M.handle_reasoning(delta.reasoning_content)
+        elseif delta.content then
+            -- 普通内容
+            M.handle_content(delta.content)
+        elseif delta.tool_calls then
+            -- 工具调用
+            M.handle_tool_call(delta.tool_calls)
+        end
+        
+        -- 检查是否结束
+        if data.choices[1].finish_reason then
+            M.complete_stream()
+        end
     end
 end
 
@@ -101,20 +143,61 @@ function M.flush_buffer()
         return
     end
 
+    -- 刷新内容缓冲区
+    if state.buffer ~= "" then
+        M.handle_content(state.buffer)
+        state.buffer = ""
+    end
+
     -- 刷新思考缓冲区
     if state.reasoning_buffer ~= "" then
         M._flush_reasoning_buffer()
     end
+end
 
-    -- 刷新内容缓冲区
-    if state.buffer ~= "" then
-        M._flush_content_buffer()
+--- 处理流式数据（别名函数）
+--- @param stream_data string|table 流式数据或session_id
+--- @param data_chunks table|nil 数据块列表（可选）
+function M.process_stream(stream_data, data_chunks)
+    if type(stream_data) == "string" and data_chunks == nil then
+        -- 单个数据块
+        M.process_chunk(stream_data)
+    elseif type(stream_data) == "string" and type(data_chunks) == "table" then
+        -- session_id + 数据块列表
+        for _, chunk in ipairs(data_chunks) do
+            M.process_chunk(chunk)
+        end
+    elseif type(stream_data) == "table" then
+        -- 数据块列表
+        for _, chunk in ipairs(stream_data) do
+            M.process_chunk(chunk)
+        end
     end
+end
 
-    -- 重置状态
-    state.buffer = ""
-    state.reasoning_buffer = ""
-    state.in_reasoning = false
+--- 处理数据块（别名函数）
+--- @param chunk string 数据块
+function M.handle_chunk(chunk)
+    M.process_chunk(chunk)
+end
+
+--- 完成流处理
+--- @param session_id string|nil 会话ID（可选）
+function M.complete_stream(session_id)
+    M.flush_buffer()
+    
+    -- 触发流完成事件
+    if state.event_bus then
+        state.event_bus.emit("stream_completed", session_id)
+    end
+end
+
+--- 获取缓冲区内容
+--- @param session_id string|nil 会话ID（可选）
+--- @return string 缓冲区内容
+function M.get_buffer(session_id)
+    -- 忽略session_id参数，返回当前缓冲区
+    return state.buffer
 end
 
 --- 处理思考数据块（内部使用）

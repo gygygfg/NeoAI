@@ -52,7 +52,7 @@ function M.build_messages(history, query, options)
         
         for i = start_index, #history do
             local msg = history[i]
-            if msg.role and msg.content then
+            if msg and msg.role and msg.content then
                 table.insert(messages, {
                     role = msg.role,
                     content = msg.content,
@@ -265,6 +265,51 @@ function M.estimate_message_tokens(messages)
     end
 
     return total_tokens
+end
+
+--- 构建最终响应
+--- @param params table 参数
+--- @param params.original_messages table 原始消息列表
+--- @param params.ai_response table AI响应
+--- @param params.tool_results table 工具结果列表
+--- @return table 最终响应
+function M.build_response(params)
+    if not params then
+        return {content = "无响应"}
+    end
+
+    local response = {
+        content = ""
+    }
+
+    -- 如果有AI响应内容，添加它
+    if params.ai_response and params.ai_response.content then
+        response.content = params.ai_response.content
+    end
+
+    -- 如果有工具结果，添加到响应中
+    if params.tool_results and #params.tool_results > 0 then
+        if response.content and #response.content > 0 then
+            response.content = response.content .. "\n\n工具调用结果:\n"
+        else
+            response.content = "工具调用结果:\n"
+        end
+
+        for i, result in ipairs(params.tool_results) do
+            response.content = response.content .. string.format("%d. %s\n", i, M.format_tool_result(result))
+        end
+    end
+
+    -- 如果有推理内容，也添加到响应中
+    if params.ai_response and params.ai_response.reasoning then
+        if response.content and #response.content > 0 then
+            response.content = response.content .. "\n\n推理过程:\n" .. params.ai_response.reasoning
+        else
+            response.content = "推理过程:\n" .. params.ai_response.reasoning
+        end
+    end
+
+    return response
 end
 
 return M

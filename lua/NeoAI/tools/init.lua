@@ -3,6 +3,9 @@ local M = {}
 local tool_registry = require("NeoAI.tools.tool_registry")
 local tool_executor = require("NeoAI.tools.tool_executor")
 local tool_validator = require("NeoAI.tools.tool_validator")
+local event_bus = require("NeoAI.tools.event_bus")
+local history_manager = require("NeoAI.tools.history_manager")
+local config_manager = require("NeoAI.tools.config_manager")
 
 -- 模块状态
 local state = {
@@ -25,6 +28,11 @@ function M.initialize(tools_config)
   tool_registry.initialize(state.config)
   tool_executor.initialize(state.config)
   tool_validator.initialize(state.config)
+  
+  -- 初始化新模块
+  event_bus.initialize(state.config)
+  history_manager.initialize(state.config)
+  config_manager.initialize(state.config)
 
   -- 加载内置工具
   if state.config.builtin ~= false then
@@ -194,6 +202,33 @@ function M._load_builtin_tools()
     end
   end
 
+  -- 加载通用工具
+  local general_tools = require("NeoAI.tools.builtin.general_tools")
+  if general_tools and general_tools.get_tools then
+    local tools = general_tools.get_tools()
+    for _, tool in ipairs(tools) do
+      M.register_tool(tool)
+    end
+  end
+
+  -- 加载文件工具（确保目录）
+  local file_utils_tools = require("NeoAI.tools.builtin.file_utils_tools")
+  if file_utils_tools and file_utils_tools.get_tools then
+    local tools = file_utils_tools.get_tools()
+    for _, tool in ipairs(tools) do
+      M.register_tool(tool)
+    end
+  end
+
+  -- 加载日志工具
+  local log_tools = require("NeoAI.tools.builtin.log_tools")
+  if log_tools and log_tools.get_tools then
+    local tools = log_tools.get_tools()
+    for _, tool in ipairs(tools) do
+      M.register_tool(tool)
+    end
+  end
+
   state.builtin_tools_loaded = true
 end
 
@@ -230,6 +265,41 @@ function M.update_config(new_config)
   tool_registry.update_config(state.config)
   tool_executor.update_config(state.config)
   tool_validator.update_config(state.config)
+  
+  -- 更新新模块配置
+  event_bus.initialize(state.config)
+  history_manager.initialize(state.config)
+  config_manager.initialize(state.config)
+end
+
+--- 获取事件总线实例
+--- @return table 事件总线实例
+function M.get_event_bus()
+  if not state.initialized then
+    error("Tools system not initialized")
+  end
+  
+  return event_bus
+end
+
+--- 获取历史管理器实例
+--- @return table 历史管理器实例
+function M.get_history_manager()
+  if not state.initialized then
+    error("Tools system not initialized")
+  end
+  
+  return history_manager
+end
+
+--- 获取配置管理器实例
+--- @return table 配置管理器实例
+function M.get_config_manager()
+  if not state.initialized then
+    error("Tools system not initialized")
+  end
+  
+  return config_manager
 end
 
 return M

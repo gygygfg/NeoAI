@@ -708,4 +708,41 @@ function M.update_config(new_config)
     end
 end
 
+--- 刷新树窗口
+--- @return boolean 是否成功
+function M.refresh()
+    if not state.initialized then
+        return false
+    end
+    
+    if not state.current_window_id then
+        return false
+    end
+    
+    -- 重新渲染树
+    M.render_tree()
+    return true
+end
+
+--- 选择指定节点
+--- @param node_id string 节点ID
+--- @return boolean 是否成功
+function M.select_node(node_id)
+    if not state.initialized then
+        return false
+    end
+    
+    if not node_id then
+        return false
+    end
+    
+    -- 设置选中的节点
+    state.selected_node_id = node_id
+    
+    -- 更新状态行
+    M._update_status_line()
+    
+    return true
+end
+
 return M
