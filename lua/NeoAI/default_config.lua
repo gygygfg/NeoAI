@@ -11,6 +11,7 @@ local DEFAULT_CONFIG = {
     max_tokens = 4096,
     stream = true,
     timeout = 60000, -- HTTP请求超时时间（毫秒）
+    system_prompt = "你是一个AI编程助手，帮助用户解决编程问题。",
   },
   -- UI配置
   ui = {
@@ -67,8 +68,8 @@ local DEFAULT_CONFIG = {
   -- 会话配置
   session = {
     auto_save = true,
-    save_path = vim.fn.stdpath("data") .. "/neoai_sessions",
-    max_history = 100,
+    save_path = vim.fn.stdpath("cache") .. "/neoai_sessions",
+    max_history_per_session = 100,
   },
   -- 工具配置
   tools = {
@@ -81,6 +82,7 @@ local DEFAULT_CONFIG = {
     auto_test = false, -- 是否在启动后自动运行所有测试
     delay_ms = 1500, -- 延迟毫秒数（VimEnter后1500毫秒）
   },
+
 }
 
 --- 验证用户配置
@@ -218,10 +220,10 @@ function M.validate_config(config)
   -- 验证会话配置
   if config.session then
     if
-      config.session.max_history and (type(config.session.max_history) ~= "number" or config.session.max_history < 1)
+      config.session.max_history_per_session and (type(config.session.max_history_per_session) ~= "number" or config.session.max_history_per_session < 1)
     then
-      vim.notify("[NeoAI] session.max_history must be a positive number. Using default.", vim.log.levels.WARN)
-      config.session.max_history = nil
+      vim.notify("[NeoAI] session.max_history_per_session must be a positive number. Using default.", vim.log.levels.WARN)
+      config.session.max_history_per_session = nil
     end
   end
 

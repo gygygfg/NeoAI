@@ -4,7 +4,7 @@ local tool_registry = require("NeoAI.tools.tool_registry")
 local tool_executor = require("NeoAI.tools.tool_executor")
 local tool_validator = require("NeoAI.tools.tool_validator")
 local event_bus = require("NeoAI.tools.event_bus")
-local history_manager = require("NeoAI.tools.history_manager")
+local tool_history_manager = require("NeoAI.tools.tool_history_manager")
 local config_manager = require("NeoAI.tools.config_manager")
 
 -- 模块状态
@@ -31,7 +31,7 @@ function M.initialize(tools_config)
 
   -- 初始化新模块
   event_bus.initialize(state.config)
-  history_manager.initialize(state.config)
+  tool_history_manager.initialize(state.config)
   config_manager.initialize(state.config)
 
   -- 加载内置工具
@@ -57,7 +57,8 @@ function M.register_tool(tool_def)
   -- 验证工具定义
   local valid, error_msg = tool_validator.validate_tool(tool_def)
   if not valid then
-    vim.notify("工具验证失败: " .. error_msg, vim.log.levels.ERROR)
+    local error_level = vim.log.levels and vim.log.levels.ERROR or "ERROR"
+    vim.notify("工具验证失败: " .. error_msg, error_level)
     return false
   end
 
@@ -67,15 +68,18 @@ function M.register_tool(tool_def)
   end)
 
   if not success then
-    vim.notify("工具注册异常: " .. reg_error, vim.log.levels.ERROR)
+    local error_level = vim.log.levels and vim.log.levels.ERROR or "ERROR"
+    vim.notify("工具注册异常: " .. reg_error, error_level)
     return false
   elseif reg_error == false then
     -- 注册失败但没有异常
-    vim.notify("工具注册失败: " .. tool_def.name, vim.log.levels.WARN)
+    local warn_level = vim.log.levels and vim.log.levels.WARN or "WARN"
+    vim.notify("工具注册失败: " .. tool_def.name, warn_level)
     return false
   end
 
-  -- vim.notify("[NeoAI] 工具注册成功: " .. tool_def.name, vim.log.levels.INFO)
+  -- local info_level = vim.log.levels and vim.log.levels.INFO or "INFO"
+  -- vim.notify("[NeoAI] 工具注册成功: " .. tool_def.name, info_level)
   return true
 end
 
@@ -158,7 +162,8 @@ function M.reload_tools()
     M._load_external_tools(state.config.external)
   end
 
-  vim.notify("工具重新加载完成", vim.log.levels.INFO)
+  local info_level = vim.log.levels and vim.log.levels.INFO or "INFO"
+  vim.notify("工具重新加载完成", info_level)
 end
 
 --- 获取工具数量
@@ -277,7 +282,7 @@ function M.update_config(new_config)
 
   -- 更新新模块配置
   event_bus.initialize(state.config)
-  history_manager.initialize(state.config)
+  tool_history_manager.initialize(state.config)
   config_manager.initialize(state.config)
 end
 
@@ -298,7 +303,7 @@ function M.get_history_manager()
     error("Tools system not initialized")
   end
 
-  return history_manager
+  return tool_history_manager
 end
 
 --- 获取配置管理器实例

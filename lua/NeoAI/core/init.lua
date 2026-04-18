@@ -37,11 +37,10 @@ function M.initialize(core_config)
   -- 从配置管理器获取键位配置
   local user_keymaps = config_manager.get("keymaps") or {}
 
-  -- 直接使用传入的配置中的键位配置
-  local default_keymaps = {}
-  if core_config and core_config.keymaps then
-    default_keymaps = core_config.keymaps
-  end
+  -- 获取默认键位配置
+  local default_config_module = require("NeoAI.default_config")
+  local default_config = default_config_module.get_default_config()
+  local default_keymaps = default_config.keymaps
 
   -- 初始化键位管理器，传递默认配置和用户配置
   state.keymap_mgr.initialize(default_keymaps, user_keymaps)

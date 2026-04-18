@@ -1,5 +1,7 @@
 local M = {}
 
+local json = require("NeoAI.utils.json")
+
 -- 模块状态
 local state = {
     initialized = false,
@@ -33,7 +35,7 @@ function M.process_chunk(chunk)
         return
     end
 
-    -- 添加到缓冲区
+    -- 直接添加到缓冲区（去重已在 ai_engine 中处理）
     state.buffer = state.buffer .. chunk
 
     -- 尝试解析DeepSeek API格式
@@ -61,7 +63,7 @@ function M._parse_deepseek_stream(chunk)
     end
     
     -- 解析JSON
-    local ok, data = pcall(vim.json.decode, json_str)
+    local ok, data = pcall(json.decode, json_str)
     if not ok or not data then
         return
     end
@@ -89,15 +91,21 @@ function M._parse_deepseek_stream(chunk)
 end
 
 --- 处理思考内容
---- @param content string 思考内容
+--- @param content any 思考内容
 function M.handle_reasoning(content)
     if not state.initialized then
         return
     end
 
+    -- 确保 content 是字符串类型
+    local safe_content = content
+    if type(safe_content) ~= "string" then
+        safe_content = tostring(safe_content)
+    end
+
     -- 触发思考事件
     if state.event_bus then
-        state.event_bus.emit("reasoning_content", content)
+        state.event_bus.emit("reasoning_content", safe_content)
     end
 
     -- 如果思考缓冲区不为空，先刷新
@@ -107,20 +115,31 @@ function M.handle_reasoning(content)
 
     -- 直接发送思考内容
     if state.event_bus then
-        state.event_bus.emit("reasoning_chunk", content)
+        state.event_bus.emit("reasoning_chunk", safe_content)
     end
 end
 
 --- 处理内容输出
---- @param content string 内容
+--- @param content any 内容
 function M.handle_content(content)
     if not state.initialized then
         return
     end
 
+    -- 确保 content 是字符串类型
+    local safe_content = content
+    if type(safe_content) ~= "string" then
+        safe_content = tostring(safe_content)
+    end
+
+    -- 应用去重和重叠修复功能
+    local text_utils = require("NeoAI.utils.text_utils")
+    safe_content = text_utils.deduplicate_ai_response(safe_content)
+    safe_content = text_utils.fix_stream_overlap(safe_content)
+
     -- 触发内容事件
     if state.event_bus then
-        state.event_bus.emit("content_chunk", content)
+        state.event_bus.emit("content_chunk", safe_content)
     end
 end
 

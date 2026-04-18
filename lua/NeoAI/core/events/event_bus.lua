@@ -72,7 +72,23 @@ function M.emit(event, ...)
     for _, callback in ipairs(event_listeners) do
         local ok, err = pcall(callback, ...)
         if not ok then
-            vim.notify(string.format("Event handler error for '%s': %s", event, err), vim.log.levels.ERROR)
+            -- 安全地记录错误，避免 vim.notify 不可用时导致崩溃
+            local error_msg = string.format("Event handler error for '%s': %s", event, err)
+            
+            -- 尝试使用 vim.notify，如果不可用则回退到 print
+            local notify_ok, notify_err = pcall(function()
+                if vim and vim.notify then
+                    vim.notify(error_msg, vim.log.levels.ERROR)
+                else
+                    -- 回退到标准输出
+                    print("[ERROR] " .. error_msg)
+                end
+            end)
+            
+            -- 如果连回退都失败，至少不会崩溃
+            if not notify_ok then
+                print("[ERROR] Failed to log error: " .. tostring(notify_err))
+            end
         end
     end
 end

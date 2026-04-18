@@ -25,7 +25,7 @@ function M.initialize(event_bus, config)
         event_bus.on("open_tree_window", function(session_id, branch_id)
             -- 在测试环境中，直接触发事件而不打开UI
             -- 在实际使用中，这会打开树窗口
-            local is_test_env = os.getenv("NEOAI_TEST") or (package.loaded["NeoAI.ui"] and not package.loaded["NeoAI.ui"].open_tree_ui)
+            local is_test_env = os.getenv("NEOAI_TEST") or (_G.NEOAI_TEST) or (package.loaded["NeoAI.ui"] and not package.loaded["NeoAI.ui"].open_tree_ui)
             
             if not is_test_env then
                 -- 打开树窗口
@@ -41,7 +41,7 @@ function M.initialize(event_bus, config)
         
         event_bus.on("create_branch", function(session_id, parent_branch_id, name)
             -- 在测试环境中，直接触发事件而不实际创建分支
-            local is_test_env = os.getenv("NEOAI_TEST") or (package.loaded["NeoAI.core"] and not package.loaded["NeoAI.core"].get_session_manager)
+            local is_test_env = os.getenv("NEOAI_TEST") or (_G.NEOAI_TEST) or (package.loaded["NeoAI.core"] and not package.loaded["NeoAI.core"].get_session_manager)
             
             if is_test_env then
                 -- 测试环境：直接触发事件

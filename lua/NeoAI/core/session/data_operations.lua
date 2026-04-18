@@ -329,4 +329,13 @@ function M.load_session(filepath)
     return new_session_id
 end
 
+--- 重置数据操作模块（主要用于测试）
+function M.reset()
+    state.initialized = false
+    state.event_bus = nil
+    state.config = nil
+    
+    return true
+end
+
 return M

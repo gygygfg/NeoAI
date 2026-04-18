@@ -240,7 +240,7 @@ end
 function M._log_error(error_msg)
     -- 简单的日志记录实现
     -- 在实际项目中，可以集成到现有的日志系统中
-    local log_file = state.config.error_log_file or "/tmp/neoai_tools_error.log"
+    local log_file = state.config.error_log_file or vim.fn.stdpath("cache") .. "/neoai_tools_error.log"
     
     local file = io.open(log_file, "a")
     if file then

@@ -9,6 +9,7 @@ local default_config = {
     temperature = 0.7,
     max_tokens = 4096,
     stream = true,
+    system_prompt = "你是一个AI编程助手，帮助用户解决编程问题。",
   },
   -- UI配置
   ui = {
@@ -65,8 +66,8 @@ local default_config = {
   -- 会话配置
   session = {
     auto_save = true,
-    save_path = vim.fn.stdpath("data") .. "/neoai_sessions",
-    max_history = 100,
+    save_path = vim.fn.stdpath("cache") .. "/neoai_sessions",
+    max_history_per_session = 100,
   },
   -- 工具配置
   tools = {

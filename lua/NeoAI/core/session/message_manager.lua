@@ -195,4 +195,15 @@ function M.get_latest_message(branch_id)
     return vim.deepcopy(latest_msg)
 end
 
+--- 重置消息管理器（主要用于测试）
+function M.reset()
+    messages = {}
+    message_counter = 0
+    state.initialized = false
+    state.event_bus = nil
+    state.config = nil
+    
+    return true
+end
+
 return M

@@ -143,11 +143,25 @@ function M.open_chat_ui(session_id, branch_id)
     error("UI not initialized")
   end
 
+  -- 确保会话管理器已初始化
+  local session_manager = core.get_session_manager()
+  if not session_manager then
+    -- 尝试直接加载会话管理器
+    local success, loaded_session_manager = pcall(require, "NeoAI.core.session.session_manager")
+    if success then
+      session_manager = loaded_session_manager
+    end
+  end
+
   -- 如果没有提供参数，使用默认值
   if not session_id then
-    local session_manager = core.get_session_manager()
-    local current_session = session_manager and session_manager.get_current_session()
-    session_id = current_session and current_session.id or "default"
+    if session_manager and session_manager.get_current_session then
+      -- 获取当前会话，这会自动创建默认会话如果不存在
+      local current_session = session_manager.get_current_session()
+      session_id = current_session and current_session.id or "default"
+    else
+      session_id = "default"
+    end
   end
 
   if not branch_id then
@@ -377,7 +391,8 @@ function M.list_windows()
       table.insert(windows, win_handle)
     elseif window_id then
       -- 如果无法获取窗口句柄，记录调试信息
-      vim.notify(string.format("无法获取窗口句柄 for %s: %s", window_type, window_id), vim.log.levels.DEBUG)
+      local debug_level = vim.log.levels and vim.log.levels.DEBUG or "DEBUG"
+      vim.notify(string.format("无法获取窗口句柄 for %s: %s", window_type, window_id), debug_level)
     end
   end
   return windows

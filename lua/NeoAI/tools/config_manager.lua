@@ -40,7 +40,7 @@ function M._ensure_required_fields()
         },
         session = {
             auto_save = true,
-            max_history = 100
+            max_history_per_session = 100
         }
     }
     
@@ -147,8 +147,8 @@ function M.validate()
     
     -- 验证会话配置
     if state.config.session then
-        if type(state.config.session.max_history) ~= "number" or state.config.session.max_history <= 0 then
-            return false, "session.max_history 必须是正数"
+        if type(state.config.session.max_history_per_session) ~= "number" or state.config.session.max_history_per_session <= 0 then
+            return false, "session.max_history_per_session 必须是正数"
         end
     end
     

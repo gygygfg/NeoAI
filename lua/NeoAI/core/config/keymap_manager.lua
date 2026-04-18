@@ -21,7 +21,14 @@ function M.initialize(default_keymaps, user_keymaps)
   -- 合并用户配置
   if user_keymaps then
     for context, keymap_table in pairs(user_keymaps) do
-      if current_keymaps[context] and type(keymap_table) == "table" then
+      if type(keymap_table) == "table" then
+        -- 确保上下文存在
+        if not DEFAULT_KEYMAPS[context] then
+          -- 如果默认配置中没有这个上下文，创建一个空的
+          DEFAULT_KEYMAPS[context] = {}
+          current_keymaps[context] = {}
+        end
+        
         for action, key_config in pairs(keymap_table) do
           if type(key_config) == "table" and key_config.key then
             M.set_keymap(context, action, key_config.key, key_config.desc)
@@ -55,13 +62,15 @@ end
 --- @return table|nil 键位配置 {key = string, desc = string}
 function M.get_keymap(context, action)
   if not current_keymaps[context] then
-    vim.notify(string.format("[NeoAI] 无效的键位上下文: %s", context), vim.log.levels.WARN)
+    -- 改为调试级别日志
+    vim.notify(string.format("[NeoAI] 键位上下文不存在: %s", context), vim.log.levels.DEBUG)
     return nil
   end
 
   local keymap = current_keymaps[context][action]
   if not keymap then
-    vim.notify(string.format("[NeoAI] 上下文 %s 中没有动作: %s", context, action), vim.log.levels.WARN)
+    -- 改为调试级别日志
+    vim.notify(string.format("[NeoAI] 上下文 %s 中没有动作: %s", context, action), vim.log.levels.DEBUG)
     return nil
   end
 
@@ -73,7 +82,8 @@ end
 --- @return table 该上下文的所有键位
 function M.get_context_keymaps(context)
   if not current_keymaps[context] then
-    vim.notify(string.format("[NeoAI] 无效的键位上下文: %s", context), vim.log.levels.WARN)
+    -- 改为调试级别日志，避免在正常使用中显示警告
+    vim.notify(string.format("[NeoAI] 键位上下文不存在: %s (返回空表)", context), vim.log.levels.DEBUG)
     return {}
   end
 
@@ -95,14 +105,19 @@ function M.set_keymap(context, action, key, desc)
 
   -- 验证上下文
   if not DEFAULT_KEYMAPS[context] then
-    vim.notify(string.format("[NeoAI] 无效的键位上下文: %s", context), vim.log.levels.ERROR)
-    return false
+    -- 如果默认配置中没有这个上下文，但用户想要添加，我们允许创建
+    DEFAULT_KEYMAPS[context] = {}
+    vim.notify(string.format("[NeoAI] 创建新的键位上下文: %s", context), vim.log.levels.INFO)
   end
 
   -- 验证动作
   if not DEFAULT_KEYMAPS[context][action] then
-    vim.notify(string.format("[NeoAI] 上下文 %s 中没有动作: %s", context, action), vim.log.levels.ERROR)
-    return false
+    -- 如果默认配置中没有这个动作，但用户想要添加，我们允许创建
+    DEFAULT_KEYMAPS[context][action] = {
+      key = "", -- 默认空键位
+      desc = "用户自定义动作",
+    }
+    vim.notify(string.format("[NeoAI] 创建新的动作: %s.%s", context, action), vim.log.levels.INFO)
   end
 
   -- 验证键位

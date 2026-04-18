@@ -88,6 +88,12 @@ function M.append_reasoning(content)
 
     -- 添加内容（确保 content 不是 nil）
     local safe_content = content or ""
+    
+    -- 确保 safe_content 是字符串类型
+    if type(safe_content) ~= "string" then
+        safe_content = tostring(safe_content)
+    end
+    
     state.reasoning_text = state.reasoning_text .. safe_content
     table.insert(state.reasoning_chunks, {
         content = safe_content,

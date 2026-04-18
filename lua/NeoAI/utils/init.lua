@@ -26,7 +26,8 @@ function M.initialize()
                 end
             end
         else
-            vim.notify("无法加载工具模块: " .. module_name, vim.log.levels.WARN)
+            local warn_level = vim.log.levels and vim.log.levels.WARN or "WARN"
+            vim.notify("无法加载工具模块: " .. module_name, warn_level)
         end
     end
 end

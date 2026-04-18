@@ -1,425 +1,264 @@
 local M = {}
 
---- 截断文本
---- @param text string 文本
---- @param length number 最大长度
---- @param ellipsis string 省略号
---- @return string 截断后的文本
-function M.truncate(text, length, ellipsis)
-    if not text or type(text) ~= "string" then
+--- 去除字符串两端的空白字符
+--- @param str string 输入字符串
+--- @return string 去除空白后的字符串
+function M.trim(str)
+    if not str or type(str) ~= "string" then
         return ""
     end
-
-    length = length or 50
-    ellipsis = ellipsis or "..."
-
-    if #text <= length then
-        return text
-    end
-
-    -- 尝试在单词边界截断
-    local truncated = text:sub(1, length)
-    local last_space = truncated:reverse():find(" ")
-    
-    if last_space then
-        truncated = truncated:sub(1, length - last_space)
-    end
-
-    return truncated .. ellipsis
+    return str:match("^%s*(.-)%s*$") or ""
 end
 
---- 文本换行
---- @param text string 文本
---- @param width number 行宽
---- @return table 换行后的行列表
-function M.wrap(text, width)
-    if not text or type(text) ~= "string" then
-        return {}
-    end
-
-    width = width or 80
-    local lines = {}
-    local current_line = ""
-    local words = {}
-
-    -- 分割单词
-    for word in text:gmatch("%S+") do
-        table.insert(words, word)
-    end
-
-    -- 处理每个单词
-    for _, word in ipairs(words) do
-        if #current_line + #word + 1 <= width then
-            if current_line == "" then
-                current_line = word
-            else
-                current_line = current_line .. " " .. word
-            end
-        else
-            if current_line ~= "" then
-                table.insert(lines, current_line)
-            end
-            current_line = word
-        end
-    end
-
-    -- 添加最后一行
-    if current_line ~= "" then
-        table.insert(lines, current_line)
-    end
-
-    return lines
-end
-
---- 转义字符
---- @param text string 文本
---- @return string 转义后的文本
-function M.escape(text)
-    if not text then
-        return ""
-    end
-
-    local escapes = {
-        ["\\"] = "\\\\",
-        ["\""] = "\\\"",
-        ["\'"] = "\\\'",
-        ["\n"] = "\\n",
-        ["\r"] = "\\r",
-        ["\t"] = "\\t",
-    }
-
-    return text:gsub("[\\\"\'\n\r\t]", escapes)
-end
-
---- 反转义字符
---- @param text string 文本
---- @return string 反转义后的文本
-function M.unescape(text)
-    if not text then
-        return ""
-    end
-
-    local unescapes = {
-        ["\\\\"] = "\\",
-        ["\\\""] = "\"",
-        ["\\\'"] = "\'",
-        ["\\n"] = "\n",
-        ["\\r"] = "\r",
-        ["\\t"] = "\t",
-    }
-
-    for pattern, replacement in pairs(unescapes) do
-        text = text:gsub(pattern, replacement)
-    end
-
-    return text
-end
-
---- 格式化JSON
---- @param data table JSON数据
---- @param indent number 缩进空格数
---- @return string 格式化后的JSON
-function M.format_json(data, indent)
-    indent = indent or 2
-    
-    local ok, json = pcall(vim.json.encode, data)
-    if not ok then
-        return "无效的JSON数据"
-    end
-
-    -- 简单美化（实际应该使用vim.json.encode的indent参数）
-    -- 但Neovim的vim.json.encode不支持indent参数
-    local result = json
-    local spaces = string.rep(" ", indent)
-    
-    -- 简单的美化逻辑
-    local depth = 0
-    local in_string = false
-    local escaped = false
-    local formatted = ""
-    
-    for i = 1, #result do
-        local char = result:sub(i, i)
-        local prev_char = i > 1 and result:sub(i-1, i-1) or ""
-        
-        if not in_string then
-            if char == "{" or char == "[" then
-                formatted = formatted .. char .. "\n"
-                depth = depth + 1
-                formatted = formatted .. string.rep(spaces, depth)
-            elseif char == "}" or char == "]" then
-                formatted = formatted .. "\n"
-                depth = depth - 1
-                formatted = formatted .. string.rep(spaces, depth) .. char
-            elseif char == "," then
-                formatted = formatted .. char .. "\n" .. string.rep(spaces, depth)
-            elseif char == ":" then
-                formatted = formatted .. char .. " "
-            else
-                formatted = formatted .. char
-            end
-        else
-            formatted = formatted .. char
-        end
-        
-        -- 处理字符串状态
-        if char == "\\" and not escaped then
-            escaped = true
-        elseif char == "\"" and not escaped then
-            in_string = not in_string
-            escaped = false
-        else
-            escaped = false
-        end
-    end
-    
-    return formatted
-end
-
---- 计算文本行数
---- @param text string 文本
---- @return number 行数
-function M.count_lines(text)
-    if not text then
-        return 0
-    end
-
-    local count = 1
-    for _ in text:gmatch("\n") do
-        count = count + 1
-    end
-
-    return count
-end
-
---- 移除多余空白
---- @param text string 文本
---- @return string 清理后的文本
-function M.trim(text)
-    if not text then
-        return ""
-    end
-
-    -- 移除首尾空白
-    text = text:gsub("^%s+", ""):gsub("%s+$", "")
-    
-    -- 移除多余的空格
-    text = text:gsub("%s+", " ")
-    
-    return text
-end
-
---- 移除空行
---- @param text string 文本
---- @return string 清理后的文本
-function M.remove_empty_lines(text)
-    if not text then
-        return ""
-    end
-
-    local lines = {}
-    for line in text:gmatch("[^\n]+") do
-        if line:match("%S") then -- 非空行
-            table.insert(lines, line)
-        end
-    end
-
-    return table.concat(lines, "\n")
-end
-
---- 文本对齐
---- @param text string 文本
---- @param width number 宽度
---- @param alignment string 对齐方式 ('left', 'center', 'right')
---- @return string 对齐后的文本
-function M.align(text, width, alignment)
-    if not text then
-        return ""
-    end
-
-    width = width or 80
-    alignment = alignment or "left"
-
-    local text_len = #text
-
-    if text_len >= width then
-        return text:sub(1, width)
-    end
-
-    local padding = width - text_len
-
-    if alignment == "left" then
-        return text .. string.rep(" ", padding)
-    elseif alignment == "right" then
-        return string.rep(" ", padding) .. text
-    elseif alignment == "center" then
-        local left_padding = math.floor(padding / 2)
-        local right_padding = padding - left_padding
-        return string.rep(" ", left_padding) .. text .. string.rep(" ", right_padding)
-    end
-
-    return text
-end
-
---- 分割文本
---- @param text string 文本
+--- 分割字符串
+--- @param str string 输入字符串
 --- @param delimiter string 分隔符
---- @return table 分割后的部分
-function M.split(text, delimiter)
-    if not text then
+--- @return table 分割后的字符串数组
+function M.split(str, delimiter)
+    if not str or type(str) ~= "string" then
         return {}
     end
-
-    delimiter = delimiter or "%s"
+    
+    delimiter = delimiter or ","
     local result = {}
     local pattern = string.format("([^%s]+)", delimiter)
-
-    for part in text:gmatch(pattern) do
-        table.insert(result, part)
+    
+    for match in str:gmatch(pattern) do
+        table.insert(result, match)
     end
-
+    
     return result
 end
 
---- 连接文本
---- @param parts table 文本部分
---- @param delimiter string 分隔符
---- @return string 连接后的文本
-function M.join(parts, delimiter)
+--- 连接字符串数组
+--- @param parts table 字符串数组
+--- @param separator string 分隔符
+--- @return string 连接后的字符串
+function M.join(parts, separator)
     if not parts or type(parts) ~= "table" then
         return ""
     end
-
-    delimiter = delimiter or " "
-    return table.concat(parts, delimiter)
-end
-
---- 文本包含
---- @param text string 文本
---- @param substring string 子字符串
---- @param case_sensitive boolean 是否区分大小写
---- @return boolean 是否包含
-function M.contains(text, substring, case_sensitive)
-    if not text or not substring then
-        return false
-    end
-
-    if not case_sensitive then
-        text = text:lower()
-        substring = substring:lower()
-    end
-
-    return text:find(substring, 1, true) ~= nil
-end
-
---- 文本替换
---- @param text string 文本
---- @param pattern string 模式
---- @param replacement string 替换文本
---- @param replace_all boolean 是否替换所有
---- @return string 替换后的文本
-function M.replace(text, pattern, replacement, replace_all)
-    if not text then
-        return ""
-    end
-
-    if replace_all then
-        return text:gsub(pattern, replacement)
-    else
-        return text:gsub(pattern, replacement, 1)
-    end
-end
-
---- 计算文本相似度（简单实现）
---- @param text1 string 文本1
---- @param text2 string 文本2
---- @return number 相似度（0-1）
-function M.similarity(text1, text2)
-    if not text1 or not text2 then
-        return 0
-    end
-
-    if text1 == text2 then
-        return 1
-    end
-
-    -- 简单实现：计算公共字符比例
-    local common = 0
-    local min_len = math.min(#text1, #text2)
     
-    for i = 1, min_len do
-        if text1:sub(i, i) == text2:sub(i, i) then
-            common = common + 1
+    separator = separator or ","
+    local result = ""
+    
+    for i, part in ipairs(parts) do
+        if i > 1 then
+            result = result .. separator
         end
+        result = result .. tostring(part)
     end
-
-    return common / math.max(#text1, #text2)
+    
+    return result
 end
 
---- 生成文本摘要
---- @param text string 文本
+--- 检查字符串是否以指定前缀开头
+--- @param str string 输入字符串
+--- @param prefix string 前缀
+--- @return boolean 是否以指定前缀开头
+function M.starts_with(str, prefix)
+    if not str or not prefix then
+        return false
+    end
+    return str:sub(1, #prefix) == prefix
+end
+
+--- 检查字符串是否以指定后缀结尾
+--- @param str string 输入字符串
+--- @param suffix string 后缀
+--- @return boolean 是否以指定后缀结尾
+function M.ends_with(str, suffix)
+    if not str or not suffix then
+        return false
+    end
+    return str:sub(-#suffix) == suffix
+end
+
+--- 截断字符串
+--- @param str string 输入字符串
 --- @param max_length number 最大长度
---- @return string 摘要
-function M.summarize(text, max_length)
-    if not text then
+--- @param ellipsis string 省略号（默认"..."）
+--- @return string 截断后的字符串
+function M.truncate(str, max_length, ellipsis)
+    if not str or type(str) ~= "string" then
         return ""
     end
-
-    max_length = max_length or 100
-
-    if #text <= max_length then
-        return text
+    
+    max_length = max_length or 50
+    ellipsis = ellipsis or "..."
+    
+    if #str <= max_length then
+        return str
     end
-
-    -- 尝试在句子边界截断
-    local truncated = text:sub(1, max_length)
-    local last_sentence_end = math.max(
-        truncated:reverse():find("%."),
-        truncated:reverse():find("!"),
-        truncated:reverse():find("?")
-    )
-
-    if last_sentence_end then
-        truncated = truncated:sub(1, max_length - last_sentence_end + 1)
-    end
-
-    return truncated .. "..."
+    
+    return str:sub(1, max_length - #ellipsis) .. ellipsis
 end
 
---- 检查文本是否以指定前缀开头
---- @param text string 文本
---- @param prefix string 前缀
---- @param case_sensitive boolean 是否区分大小写
---- @return boolean 是否以指定前缀开头
-function M.starts_with(text, prefix, case_sensitive)
-    if not text or not prefix then
-        return false
+--- 基本去重函数
+--- @param text string 输入文本
+--- @param min_length number 最小重复长度（默认3）
+--- @return string 去重后的文本
+function M.deduplicate(text, min_length)
+    if not text or type(text) ~= "string" then
+        return ""
     end
-
-    if not case_sensitive then
-        text = text:lower()
-        prefix = prefix:lower()
+    
+    min_length = min_length or 3
+    
+    -- 简单的去重逻辑：移除连续重复的字符序列
+    local result = text
+    
+    -- 处理连续重复的字符（如 "aaaa"）
+    for i = min_length, 10 do  -- 最多检查10个字符的重复
+        local pattern = "([%w%p]{" .. i .. "})" .. "%1+"
+        result = result:gsub(pattern, "%1")
     end
-
-    return text:sub(1, #prefix) == prefix
+    
+    return result
 end
 
---- 检查文本是否以指定后缀结尾
---- @param text string 文本
---- @param suffix string 后缀
---- @param case_sensitive boolean 是否区分大小写
---- @return boolean 是否以指定后缀结尾
-function M.ends_with(text, suffix, case_sensitive)
-    if not text or not suffix then
-        return false
+--- 智能去重：针对AI响应中的常见重复模式
+--- @param text string AI响应文本
+--- @return string 去重后的文本
+function M.deduplicate_ai_response(text)
+    if not text or type(text) ~= "string" then
+        return ""
     end
+    
+    -- 首先应用基本去重
+    local deduplicated = M.deduplicate(text, 3)
+    
+    -- 处理常见的AI重复模式
+    -- 模式1: 重复的短语（如"常见的常见的常见的"）
+    deduplicated = deduplicated:gsub("([%w%p]+)%s*%1%s*%1+", "%1")
+    
+    -- 模式2: 重复的标点（如"。。。"）
+    deduplicated = deduplicated:gsub("([。，；：！？])%1%1+", "%1")
+    
+    -- 模式3: 重复的单词（如"正确正确正确"）
+    deduplicated = deduplicated:gsub("([%a]+)%s+%1%s+%1+", "%1")
+    
+    -- 模式4: 重复的中文字符（简单版本）
+    deduplicated = deduplicated:gsub("([^%s%p]+)%s*%1%s*%1+", "%1")
+    
+    -- 清理多余空格
+    deduplicated = deduplicated:gsub("%s+", " ")
+    deduplicated = deduplicated:gsub("^%s+", ""):gsub("%s+$", "")
+    
+  return deduplicated
+end
 
-    if not case_sensitive then
-        text = text:lower()
-        suffix = suffix:lower()
+--- 智能拼接：检查并移除重叠部分
+--- @param existing_text string 已有文本
+--- @param new_chunk string 新数据块
+--- @param min_overlap number 最小重叠长度（默认3）
+--- @return string 拼接后的文本
+function M.smart_concat(existing_text, new_chunk, min_overlap)
+  if not existing_text or existing_text == "" then
+    return new_chunk or ""
+  end
+  
+  if not new_chunk or new_chunk == "" then
+    return existing_text
+  end
+  
+  min_overlap = min_overlap or 3  -- 降低最小重叠长度
+  
+  -- 如果新chunk很短，直接拼接
+  if #new_chunk < min_overlap then
+    return existing_text .. new_chunk
+  end
+  
+  -- 检查新chunk是否已经包含在现有文本中
+  if existing_text:find(new_chunk, 1, true) then
+    -- 新chunk完全重复，不添加
+    return existing_text
+  end
+  
+  -- 检查重叠部分
+  local max_overlap = math.min(#existing_text, #new_chunk)
+  
+  -- 从最大可能重叠开始检查，直到最小重叠长度
+  for overlap_len = max_overlap, min_overlap, -1 do
+    local existing_end = existing_text:sub(-overlap_len)
+    local new_start = new_chunk:sub(1, overlap_len)
+    
+    if existing_end == new_start then
+      -- 找到重叠部分，移除重叠
+      return existing_text .. new_chunk:sub(overlap_len + 1)
     end
+  end
+  
+  -- 特殊处理：检查标点符号后的重叠
+  -- 例如：现有文本以标点结尾，新chunk以相同标点开头
+  local last_char = existing_text:sub(-1)
+  local first_char = new_chunk:sub(1, 1)
+  
+  -- 中文标点符号
+  local chinese_punctuation = "。，；：！？"
+  
+  if chinese_punctuation:find(last_char, 1, true) and last_char == first_char then
+    -- 标点重复，移除新chunk的第一个字符
+    return existing_text .. new_chunk:sub(2)
+  end
+  
+  -- 检查部分重叠（模糊匹配）
+  -- 对于中文文本，有时重叠可能不是完全相同的字符
+  if #existing_text >= 2 and #new_chunk >= 2 then
+    -- 检查最后2个字符和开头2个字符
+    local existing_end2 = existing_text:sub(-2)
+    local new_start2 = new_chunk:sub(1, 2)
+    
+    -- 如果相似度较高，认为是重叠
+    if existing_end2 == new_start2 then
+      return existing_text .. new_chunk:sub(3)
+    end
+  end
+  
+  -- 没有找到重叠，直接拼接
+  return existing_text .. new_chunk
+end
 
-    return text:sub(-#suffix) == suffix
+--- 检查并修复stream拼接中的重复内容
+--- @param text string 输入文本
+--- @return string 修复后的文本
+function M.fix_stream_overlap(text)
+  if not text or type(text) ~= "string" then
+    return ""
+  end
+  
+  -- 首先应用智能去重
+  local deduplicated = M.deduplicate_ai_response(text)
+  
+  -- 处理常见的stream拼接问题
+  -- 模式1：重复的短语开头（如"我将我将"）
+  deduplicated = deduplicated:gsub("([^%s%p]+)%s*%1", "%1")
+  
+  -- 模式2：重复的标点开头（如"：："）
+  deduplicated = deduplicated:gsub("([。，；：！？])%1", "%1")
+  
+  -- 模式3：重复的单词开头（如"首先首先"）
+  deduplicated = deduplicated:gsub("([%a]+)%s+%1", "%1")
+  
+  -- 模式4：中文重复模式（如"用户用户"）
+  -- 注意：Lua 5.1不支持\u转义序列，使用更通用的模式
+  deduplicated = deduplicated:gsub("([^%s%a%p]+)%s*%1", "%1")
+  
+  -- 模式5：混合重复模式（如"响应：："）
+  deduplicated = deduplicated:gsub("([^%s]+[。，；：！？]?)%s*%1", "%1")
+  
+  -- 模式6：标点后的重复（如"，用户用户"）
+  deduplicated = deduplicated:gsub("([。，；：！？])([^%s]+)%s*%2", "%1%2")
+  
+  -- 模式7：引号内的重复（如"\"测试测试\""）
+  -- 简化模式：匹配引号内的重复内容
+  deduplicated = deduplicated:gsub("([\"'])(.-)%1%s*%1(.-)%1", "%1%2%3%1")
+  
+  -- 清理多余空格
+  deduplicated = deduplicated:gsub("%s+", " ")
+  deduplicated = deduplicated:gsub("^%s+", ""):gsub("%s+$", "")
+  
+  return deduplicated
 end
 
 return M

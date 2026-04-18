@@ -198,4 +198,16 @@ function M._build_tree_node(branch_id)
     return node
 end
 
+--- 重置分支管理器（主要用于测试）
+function M.reset()
+    branches = {}
+    branch_counter = 0
+    current_branch_id = nil
+    state.initialized = false
+    state.event_bus = nil
+    state.config = nil
+    
+    return true
+end
+
 return M

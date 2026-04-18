@@ -100,7 +100,8 @@ local function register_commands()
       if chat_window and chat_window.show_status then
         chat_window.show_status()
       else
-        vim.notify("[NeoAI] 聊天窗口不可用", vim.log.levels.ERROR)
+        local error_level = vim.log.levels and vim.log.levels.ERROR or "ERROR"
+        vim.notify("[NeoAI] 聊天窗口不可用", error_level)
       end
     else
       error("NeoAI not initialized. Call setup() first.")
@@ -146,14 +147,16 @@ local function register_global_keymaps()
 
   -- 安全检查：确保核心模块已初始化
   if not state.core then
-    vim.notify("[NeoAI] 核心模块未初始化，无法注册快捷键", vim.log.levels.WARN)
+    local warn_level = vim.log.levels and vim.log.levels.WARN or "WARN"
+    vim.notify("[NeoAI] 核心模块未初始化，无法注册快捷键", warn_level)
     return
   end
 
   -- 获取键位管理器
   local keymap_manager = state.core.get_keymap_manager()
   if not keymap_manager then
-    vim.notify("[NeoAI] 无法获取键位管理器", vim.log.levels.WARN)
+    local warn_level = vim.log.levels and vim.log.levels.WARN or "WARN"
+    vim.notify("[NeoAI] 无法获取键位管理器", warn_level)
     return
   end
 
@@ -211,6 +214,10 @@ function M.setup(user_config)
   local config = default_config.validate_config(user_config)
   config = default_config.merge_defaults(config)
   config = default_config.sanitize_config(config)
+  
+  -- 添加调试信息，标记配置来源
+  config._debug_source = "main_init_lua"
+  config._debug_timestamp = os.time()
 
   -- 初始化核心模块（传递整个配置）
   state.core = core.initialize(config)
@@ -230,7 +237,8 @@ function M.setup(user_config)
   -- 注册全局快捷键
   register_global_keymaps()
 
-  vim.notify("[NeoAI] 插件已初始化，命令和快捷键已注册", vim.log.levels.INFO)
+  local info_level = vim.log.levels and vim.log.levels.INFO or "INFO"
+  vim.notify("[NeoAI] 插件已初始化，命令和快捷键已注册", info_level)
 
   -- 检查是否需要自动运行测试
   if config.test and config.test.auto_test then
@@ -238,7 +246,8 @@ function M.setup(user_config)
 
     -- 延迟执行测试
     vim.defer_fn(function()
-      vim.notify("[NeoAI] 开始自动运行测试...", vim.log.levels.INFO)
+      local info_level = vim.log.levels and vim.log.levels.INFO or "INFO"
+      vim.notify("[NeoAI] 开始自动运行测试...", info_level)
       M.test()
     end, delay_ms)
   end

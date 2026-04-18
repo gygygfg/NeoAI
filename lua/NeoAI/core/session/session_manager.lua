@@ -52,28 +52,59 @@ function M.initialize(options)
     return M
 end
 
+--- 内部函数：查找空会话
+local function find_empty_session()
+    for session_id, session in pairs(sessions) do
+        -- 检查会话是否为空（没有消息）
+        local message_manager = require("NeoAI.core.session.message_manager")
+        local branch_id = session.current_branch
+        
+        if branch_id then
+            local message_count = message_manager.get_message_count(branch_id)
+            if message_count == 0 then
+                -- 这是一个空会话
+                return session_id, session
+            end
+        end
+    end
+    return nil, nil
+end
+
 --- 内部函数：确保有当前会话
 local function ensure_current_session()
     if not current_session_id then
-        -- 创建默认会话
-        session_counter = session_counter + 1
-        current_session_id = "session_" .. session_counter
+        -- 首先检查是否有空会话可用
+        local empty_session_id, empty_session = find_empty_session()
         
-        -- 创建默认分支（使用简单的分支ID）
-        local branch_id = "branch_main"
-        
-        sessions[current_session_id] = {
-            id = current_session_id,
-            name = "default",
-            created_at = os.time(),
-            updated_at = os.time(),
-            branches = {[branch_id] = true},
-            current_branch = branch_id
-        }
-        
-        -- 触发事件
-        if state.event_bus then
-            state.event_bus.emit("session_created", current_session_id, sessions[current_session_id])
+        if empty_session_id then
+            -- 使用现有的空会话
+            current_session_id = empty_session_id
+            
+            -- 触发事件
+            if state.event_bus then
+                state.event_bus.emit("session_reused", current_session_id, empty_session)
+            end
+        else
+            -- 创建默认会话
+            session_counter = session_counter + 1
+            current_session_id = "session_" .. session_counter
+            
+            -- 创建默认分支（使用简单的分支ID）
+            local branch_id = "branch_main"
+            
+            sessions[current_session_id] = {
+                id = current_session_id,
+                name = "default",
+                created_at = os.time(),
+                updated_at = os.time(),
+                branches = {[branch_id] = true},
+                current_branch = branch_id
+            }
+            
+            -- 触发事件
+            if state.event_bus then
+                state.event_bus.emit("session_created", current_session_id, sessions[current_session_id])
+            end
         end
     end
     return current_session_id
@@ -235,14 +266,95 @@ end
 
 --- 加载会话（内部使用）
 function M._load_sessions()
-    -- TODO: 实现从文件加载会话
-    -- 目前返回空实现
+    if not state.config.auto_save or not state.config.save_path then
+        return
+    end
+    
+    local save_path = state.config.save_path
+    
+    -- 确保目录存在
+    if vim.fn.isdirectory(save_path) == 0 then
+        vim.fn.mkdir(save_path, "p")
+        return
+    end
+    
+    -- 查找所有会话文件
+    local files = vim.fn.glob(save_path .. "/*.json", false, true)
+    
+    for _, filepath in ipairs(files) do
+        local content = vim.fn.readfile(filepath)
+        if #content > 0 then
+            local data = vim.json.decode(table.concat(content, "\n"))
+            if data and data.id then
+                sessions[data.id] = data
+                
+                -- 更新会话计数器
+                local session_num = tonumber(data.id:match("session_(%d+)"))
+                if session_num and session_num > session_counter then
+                    session_counter = session_num
+                end
+            end
+        end
+    end
+    
+    -- 设置当前会话为最新的会话
+    local latest_session = nil
+    local latest_time = 0
+    
+    for session_id, session in pairs(sessions) do
+        if session.updated_at and session.updated_at > latest_time then
+            latest_time = session.updated_at
+            latest_session = session_id
+        end
+    end
+    
+    if latest_session then
+        current_session_id = latest_session
+    end
+end
+
+--- 重置会话管理器（主要用于测试）
+function M.reset()
+    sessions = {}
+    current_session_id = nil
+    session_counter = 0
+    state.initialized = false
+    state.event_bus = nil
+    state.config = nil
+    
+    -- 重置子模块
+    branch_manager.reset()
+    message_manager.reset()
+    data_operations.reset()
+    
+    return true
 end
 
 --- 保存会话（内部使用）
 function M._save_sessions()
-    -- TODO: 实现保存会话到文件
-    -- 目前返回空实现
+    if not state.config.auto_save or not state.config.save_path then
+        return
+    end
+    
+    local save_path = state.config.save_path
+    
+    -- 确保目录存在
+    if vim.fn.isdirectory(save_path) == 0 then
+        vim.fn.mkdir(save_path, "p")
+    end
+    
+    -- 保存所有会话
+    for session_id, session in pairs(sessions) do
+        local filepath = save_path .. "/" .. session_id .. ".json"
+        local data = vim.deepcopy(session)
+        
+        -- 确保数据格式正确
+        data.id = session_id
+        data.updated_at = os.time()
+        
+        local json_str = vim.json.encode(data)
+        vim.fn.writefile({json_str}, filepath)
+    end
 end
 
 return M
