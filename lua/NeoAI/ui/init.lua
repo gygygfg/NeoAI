@@ -181,7 +181,7 @@ function M.open_chat_ui(session_id, branch_id)
 
   if chat_win_id then
     -- 打开聊天窗口，传递窗口ID
-    local success = chat_window.open(session_id, branch_id, chat_win_id)
+    local success = chat_window.open(session_id, chat_win_id, branch_id)
     if success then
       state.windows.chat = chat_win_id
       state.current_ui_mode = "chat"

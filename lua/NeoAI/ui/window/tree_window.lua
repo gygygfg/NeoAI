@@ -59,17 +59,20 @@ function M.open(session_id, window_id)
     { pattern = "NeoAI:window_opening", data = { window_id = window_id, window_type = "tree" } }
   )
 
-  -- 获取缓冲区并设置选项
+  -- 获取缓冲区和窗口句柄并设置选项
   local buf = window_manager.get_window_buf(window_id)
+  local win_handle = window_manager.get_window_win(window_id)
+  
   if buf then
     -- 设置缓冲区选项
     vim.api.nvim_set_option_value("filetype", "markdown", { buf = buf })
-    vim.api.nvim_set_option_value("wrap", true, { buf = buf })
-    vim.api.nvim_set_option_value("linebreak", true, { buf = buf })
-    local win_handle = window_manager.get_window_win(window_id)
-    if win_handle then
-      vim.api.nvim_set_option_value("cursorline", true, { win = win_handle })
-    end
+  end
+  
+  if win_handle then
+    -- 设置窗口选项（wrap 和 linebreak 都是窗口本地选项）
+    vim.api.nvim_set_option_value("wrap", true, { win = win_handle })
+    vim.api.nvim_set_option_value("linebreak", true, { win = win_handle })
+    vim.api.nvim_set_option_value("cursorline", true, { win = win_handle })
   end
 
   -- 触发窗口打开事件

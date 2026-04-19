@@ -799,6 +799,113 @@ function M.run_all()
   return run_all_test_suites()
 end
 
+--- 异步运行所有测试
+--- @param callback function 回调函数
+function M.run_all_async(callback)
+  print("🚀 开始异步注册测试套件...")
+  M.auto_register_test_suites()
+
+  if next(M.test_suites) == nil then
+    print("⚠️  没有找到任何测试套件")
+    if callback then
+      callback({total = 0, passed = 0, failed = 0, errored = 0, skipped = 0, suites = {}})
+    end
+    return
+  end
+
+  -- 使用异步工作器运行测试
+  local async_worker = require("NeoAI.utils.async_worker")
+  
+  -- 为每个测试套件创建异步任务
+  local tasks = {}
+  local suite_results = {}
+  local completed_suites = 0
+  local total_suites = 0
+  
+  for suite_name, suite in pairs(M.test_suites) do
+    total_suites = total_suites + 1
+    
+    table.insert(tasks, {
+      name = "test_suite_" .. suite_name,
+      task_func = function()
+        return suite:run()
+      end,
+      callback = function(success, results)
+        completed_suites = completed_suites + 1
+        
+        if success then
+          suite_results[suite_name] = results
+          print(string.format("✅ 测试套件完成: %s (%d/%d 通过)", suite_name, results.passed, results.total))
+        else
+          print(string.format("❌ 测试套件失败: %s", suite_name))
+          suite_results[suite_name] = {
+            total = 0,
+            passed = 0,
+            failed = 0,
+            errored = 1,
+            skipped = 0,
+            tests = {},
+          }
+        end
+        
+        -- 所有套件完成后执行回调
+        if completed_suites >= total_suites and callback then
+          local total_results = {
+            total = 0,
+            passed = 0,
+            failed = 0,
+            errored = 0,
+            skipped = 0,
+            suites = {},
+          }
+          
+          for name, results in pairs(suite_results) do
+            total_results.total = total_results.total + results.total
+            total_results.passed = total_results.passed + results.passed
+            total_results.failed = total_results.failed + results.failed
+            total_results.errored = total_results.errored + results.errored
+            total_results.skipped = total_results.skipped + results.skipped
+            
+            table.insert(total_results.suites, {
+              name = name,
+              results = results,
+            })
+          end
+          
+          callback(total_results)
+        end
+      end,
+    })
+  end
+  
+  -- 批量提交任务
+  async_worker.submit_batch(tasks)
+end
+
+--- 运行单个测试套件（异步版）
+--- @param suite_name string 测试套件名称
+--- @param callback function 回调函数
+function M.run_suite_async(suite_name, callback)
+  local suite = M.get_suite(suite_name)
+  if not suite then
+    print("❌ 未找到测试套件: " .. suite_name)
+    if callback then
+      callback(nil)
+    end
+    return
+  end
+  
+  local async_worker = require("NeoAI.utils.async_worker")
+  
+  async_worker.submit_task("test_suite_" .. suite_name, function()
+    return suite:run()
+  end, function(success, results)
+    if callback then
+      callback(success and results or nil)
+    end
+  end)
+end
+
 --- 运行特定测试套件
 function M.run_suite(suite_name)
   local suite = M.get_suite(suite_name)

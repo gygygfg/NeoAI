@@ -21,6 +21,9 @@ function M.initialize(config)
   end
   state.config = config or {}
   state.initialized = true
+
+  -- 注册AI响应事件监听器
+  M._setup_event_listeners()
 end
 
 --- 打开聊天窗口
@@ -69,15 +72,18 @@ function M.open(session_id, window_id, branch_id)
 
   -- 获取缓冲区并设置选项
   local buf = window_manager.get_window_buf(window_id)
+  local win_handle = window_manager.get_window_win(window_id)
+
   if buf then
     -- 设置缓冲区选项
     vim.api.nvim_set_option_value("filetype", "markdown", { buf = buf })
-    vim.api.nvim_set_option_value("wrap", true, { buf = buf })
-    vim.api.nvim_set_option_value("linebreak", true, { buf = buf })
-    local win_handle = window_manager.get_window_win(window_id)
-    if win_handle then
-      vim.api.nvim_set_option_value("cursorline", true, { win = win_handle })
-    end
+  end
+
+  if win_handle then
+    -- 设置窗口选项（wrap 和 linebreak 都是窗口本地选项）
+    vim.api.nvim_set_option_value("wrap", true, { win = win_handle })
+    vim.api.nvim_set_option_value("linebreak", true, { win = win_handle })
+    vim.api.nvim_set_option_value("cursorline", true, { win = win_handle })
   end
 
   -- 触发窗口打开事件
@@ -101,52 +107,126 @@ function M.render_chat()
     return
   end
 
-  -- 触发开始渲染对话事件
-  vim.api.nvim_exec_autocmds(
-    "User",
-    { pattern = "NeoAI:dialogue_rendering_start", data = { window_id = state.current_window_id } }
-  )
+  -- 使用异步渲染，避免阻塞主线程
+  vim.schedule(function()
+    -- 触发开始渲染对话事件
+    vim.api.nvim_exec_autocmds(
+      "User",
+      { pattern = "NeoAI:dialogue_rendering_start", data = { window_id = state.current_window_id } }
+    )
 
-  local content = {}
+    -- 使用异步工作器在后台构建内容
+    local async_worker = require("NeoAI.utils.async_worker")
 
-  -- 添加标题
-  table.insert(content, "# NeoAI 聊天")
-  table.insert(content, "")
-  table.insert(content, string.format("会话: %s", state.current_session_id or "未知"))
-  table.insert(content, "---")
-  table.insert(content, "")
+    async_worker.submit_task("render_chat_content", function()
+      local content = {}
 
-  -- 添加消息
-  if #state.messages == 0 then
-    table.insert(content, "暂无消息")
-    table.insert(content, "输入消息开始聊天...")
-  else
-    for _, msg in ipairs(state.messages) do
-      local role_prefix = msg.role == "user" and "👤 用户:" or "🤖 AI:"
-      table.insert(content, string.format("%s %s", role_prefix, msg.content))
+      -- 添加标题
+      table.insert(content, "# NeoAI 聊天")
       table.insert(content, "")
+      table.insert(content, string.format("会话: %s", state.current_session_id or "未知"))
+      table.insert(content, "---")
+      table.insert(content, "")
+
+      -- 添加消息
+      if #state.messages == 0 then
+        table.insert(content, "暂无消息")
+        table.insert(content, "输入消息开始聊天...")
+      else
+        for _, msg in ipairs(state.messages) do
+          local role_prefix = msg.role == "user" and "👤 用户:" or "🤖 AI:"
+          table.insert(content, string.format("%s %s", role_prefix, msg.content))
+          table.insert(content, "")
+        end
+      end
+
+      -- 添加分隔线和输入提示
+      table.insert(content, "---")
+      table.insert(content, "按 'i' 进入插入模式输入消息")
+      table.insert(content, "按 'q' 退出聊天窗口")
+
+      return content
+    end, function(success, content)
+      if success and content then
+        -- 设置窗口内容
+        window_manager.set_window_content(state.current_window_id, content)
+
+        -- 触发渲染完成事件
+        vim.api.nvim_exec_autocmds(
+          "User",
+          { pattern = "NeoAI:rendering_complete", data = { window_id = state.current_window_id } }
+        )
+
+        -- 触发对话渲染完成事件
+        vim.api.nvim_exec_autocmds(
+          "User",
+          { pattern = "NeoAI:dialogue_rendering_complete", data = { window_id = state.current_window_id } }
+        )
+      else
+        print("❌ 聊天内容渲染失败")
+      end
+    end)
+  end)
+end
+
+--- 异步渲染聊天内容（非阻塞版本）
+--- @param callback function|nil 回调函数
+function M.render_chat_async(callback)
+  if not state.current_window_id then
+    if callback then
+      callback(false, "没有活动的聊天窗口")
     end
+    return
   end
 
-  -- 添加分隔线和输入提示
-  table.insert(content, "---")
-  table.insert(content, "按 'i' 进入插入模式输入消息")
-  table.insert(content, "按 'q' 退出聊天窗口")
+  -- 使用异步工作器
+  local async_worker = require("NeoAI.utils.async_worker")
 
-  -- 设置窗口内容
-  window_manager.set_window_content(state.current_window_id, content)
+  async_worker.submit_task("render_chat_async", function()
+    -- 在后台线程中构建内容
+    local content = {}
 
-  -- 触发渲染完成事件
-  vim.api.nvim_exec_autocmds(
-    "User",
-    { pattern = "NeoAI:rendering_complete", data = { window_id = state.current_window_id } }
-  )
+    -- 添加标题
+    table.insert(content, "# NeoAI 聊天")
+    table.insert(content, "")
+    table.insert(content, string.format("会话: %s", state.current_session_id or "未知"))
+    table.insert(content, "---")
+    table.insert(content, "")
 
-  -- 触发对话渲染完成事件
-  vim.api.nvim_exec_autocmds(
-    "User",
-    { pattern = "NeoAI:dialogue_rendering_complete", data = { window_id = state.current_window_id } }
-  )
+    -- 添加消息
+    if #state.messages == 0 then
+      table.insert(content, "暂无消息")
+      table.insert(content, "输入消息开始聊天...")
+    else
+      for _, msg in ipairs(state.messages) do
+        local role_prefix = msg.role == "user" and "👤 用户:" or "🤖 AI:"
+        table.insert(content, string.format("%s %s", role_prefix, msg.content))
+        table.insert(content, "")
+      end
+    end
+
+    -- 添加分隔线和输入提示
+    table.insert(content, "---")
+    table.insert(content, "按 'i' 进入插入模式输入消息")
+    table.insert(content, "按 'q' 退出聊天窗口")
+
+    return content
+  end, function(success, content)
+    if success and content then
+      -- 使用vim.schedule确保在合适的时机更新UI
+      vim.schedule(function()
+        window_manager.set_window_content(state.current_window_id, content)
+      end)
+
+      if callback then
+        callback(true, "聊天内容渲染完成")
+      end
+    else
+      if callback then
+        callback(false, "聊天内容渲染失败")
+      end
+    end
+  end)
 end
 
 --- 刷新聊天窗口
@@ -329,7 +409,7 @@ function M._send_message()
         local success, result = chat_handlers.send_message(last_line)
         if not success then
           print("⚠️  发送消息失败: " .. tostring(result))
-          
+
           -- 显示错误消息
           M.show_floating_text("发送消息失败: " .. tostring(result), {
             timeout = 3000,
@@ -342,7 +422,7 @@ function M._send_message()
       end, 10)
     else
       print("⚠️  聊天处理器未加载，无法发送消息到AI引擎")
-      
+
       -- 模拟AI响应作为后备
       vim.defer_fn(function()
         local simulated_response = "聊天处理器未加载，这是模拟AI响应。"
@@ -425,7 +505,10 @@ function M.close()
   state.messages = {}
 
   -- 触发窗口关闭事件
-  vim.api.nvim_exec_autocmds("User", { pattern = "NeoAI:window_closed", data = { window_id = state.current_window_id } })
+  vim.api.nvim_exec_autocmds(
+    "User",
+    { pattern = "NeoAI:window_closed", data = { window_id = state.current_window_id } }
+  )
 
   -- 触发聊天框关闭完成事件
   vim.api.nvim_exec_autocmds(
@@ -494,10 +577,10 @@ function M.send_message(message)
   if not success then
     return false, "无法添加用户消息"
   end
-  
+
   -- 调用内部发送消息函数（这会触发AI响应）
   M._send_message()
-  
+
   return true, "消息已发送"
 end
 
@@ -608,6 +691,116 @@ function M.close_floating_text()
   )
 
   return true
+end
+
+--- 设置事件监听器（内部函数）
+function M._setup_event_listeners()
+  print("🔧 设置聊天窗口事件监听器...")
+
+  -- 监听AI响应完成事件
+  vim.api.nvim_create_autocmd("User", {
+    pattern = "NeoAI:ai_response_complete",
+    callback = function(args)
+      print("📢 收到AI响应完成事件")
+      local data = args.data or {}
+      local response = data.response
+      local generation_id = data.generation_id
+
+      print("📦 事件数据: response type = " .. type(response) .. ", generation_id = " .. tostring(generation_id))
+
+      -- 提取响应内容
+      local response_content = ""
+      if type(response) == "string" then
+        response_content = response
+      elseif type(response) == "table" and response.content then
+        response_content = response.content
+      elseif type(response) == "table" and response.text then
+        response_content = response.text
+      else
+        response_content = tostring(response)
+      end
+
+      print("📝 提取的响应内容: " .. (response_content or "nil"))
+
+      -- 添加AI响应到聊天窗口
+      if response_content and response_content ~= "" then
+        print("➕ 添加AI响应到聊天窗口...")
+        local success = M.add_message("assistant", response_content)
+        if success then
+          print("✓ AI响应已添加到聊天窗口 (ID: " .. tostring(generation_id) .. ")")
+        else
+          print("✗ 添加AI响应失败")
+        end
+      else
+        print("⚠️  响应内容为空，无法添加")
+      end
+    end,
+  })
+
+  -- 监听AI流式响应事件
+  vim.api.nvim_create_autocmd("User", {
+    pattern = "NeoAI:ai_response_chunk",
+    callback = function(args)
+      local data = args.data or {}
+      local chunk = data.chunk
+      local generation_id = data.generation_id
+
+      -- 提取块内容
+      local chunk_content = ""
+      if type(chunk) == "string" then
+        chunk_content = chunk
+      elseif type(chunk) == "table" and chunk.content then
+        chunk_content = chunk.content
+      elseif type(chunk) == "table" and chunk.text then
+        chunk_content = chunk.text
+      elseif type(chunk) == "table" and chunk.delta then
+        chunk_content = chunk.delta
+      else
+        chunk_content = tostring(chunk)
+      end
+
+      -- 对于流式响应，我们可以更新最后一条消息或显示进度
+      if chunk_content and chunk_content ~= "" then
+        -- 这里可以显示悬浮文本或更新最后一条消息
+        M.show_floating_text("AI正在思考... " .. chunk_content, {
+          timeout = 2000,
+          position = "bottom",
+        })
+      end
+    end,
+  })
+
+  -- 监听流式生成完成事件
+  vim.api.nvim_create_autocmd("User", {
+    pattern = "NeoAI:stream_completed",
+    callback = function(args)
+      local data = args.data or {}
+      local generation_id = data.generation_id
+
+      print("✓ 流式生成完成 (ID: " .. tostring(generation_id) .. ")")
+
+      -- 关闭悬浮文本
+      M.close_floating_text()
+    end,
+  })
+
+  -- 监听生成取消事件
+  vim.api.nvim_create_autocmd("User", {
+    pattern = "NeoAI:generation_cancelled",
+    callback = function(args)
+      local data = args.data or {}
+      local generation_id = data.generation_id
+
+      print("⚠️  AI生成已取消 (ID: " .. tostring(generation_id) .. ")")
+
+      -- 显示取消通知
+      M.show_floating_text("AI生成已取消", {
+        timeout = 3000,
+        position = "center",
+        border = "single",
+      })
+    end,
+  })
 end
 
 return M

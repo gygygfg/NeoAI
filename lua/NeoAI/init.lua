@@ -100,14 +100,69 @@ local function register_commands()
       if chat_window and chat_window.show_status then
         chat_window.show_status()
       else
-        local error_level = vim.log.levels and vim.log.levels.ERROR or "ERROR"
-        vim.notify("[NeoAI] 聊天窗口不可用", error_level)
+        vim.notify("[NeoAI] 聊天窗口状态不可用", vim.log.levels.WARN)
       end
     else
       error("NeoAI not initialized. Call setup() first.")
     end
   end, {
     desc = "显示NeoAI聊天窗口状态",
+  })
+
+  -- NeoAIAsyncDemo 命令：运行异步操作演示
+  vim.api.nvim_create_user_command("NeoAIAsyncDemo", function()
+    local async_demo = require("NeoAI.test_async_operations")
+    async_demo.run_all_demos()
+  end, {
+    desc = "运行NeoAI异步操作演示",
+  })
+
+  -- NeoAITestAsync 命令：异步运行测试
+  vim.api.nvim_create_user_command("NeoAITestAsync", function()
+    local tests = require("NeoAI.tests")
+    tests.run_all_async(function(results)
+      vim.schedule(function()
+        print("\n📊 异步测试结果:")
+        print(string.format("✅ 通过: %d", results.passed))
+        print(string.format("❌ 失败: %d", results.failed))
+        print(string.format("💥 错误: %d", results.errored))
+        print(
+          string.format("📈 通过率: %.1f%%", results.total > 0 and (results.passed / results.total) * 100 or 0)
+        )
+      end)
+    end)
+  end, {
+    desc = "异步运行NeoAI测试",
+  })
+
+  -- NeoAIAsyncStatus 命令：显示异步工作器状态
+  vim.api.nvim_create_user_command("NeoAIAsyncStatus", function()
+    local async_worker = require("NeoAI.utils.async_worker")
+    local status_list = async_worker.get_all_worker_status()
+
+    if #status_list == 0 then
+      print("📊 没有活动的异步工作器")
+    else
+      print("📊 异步工作器状态:")
+      for _, status in ipairs(status_list) do
+        local status_icon = ""
+        if status.status == "running" then
+          status_icon = "🔄"
+        elseif status.status == "completed" then
+          status_icon = "✅"
+        elseif status.status == "failed" then
+          status_icon = "❌"
+        elseif status.status == "idle" then
+          status_icon = "⏸️"
+        else
+          status_icon = "❓"
+        end
+
+        print(string.format("  %s %s - %s (%.3fs)", status_icon, status.name, status.status, status.duration or 0))
+      end
+    end
+  end, {
+    desc = "显示NeoAI异步工作器状态",
   })
 end
 
@@ -231,6 +286,10 @@ function M.setup(user_config)
   state.config = config
   state.initialized = true
 
+  -- 初始化异步工作器
+  local async_worker = require("NeoAI.utils.async_worker")
+  async_worker.initialize()
+
   -- 注册Neovim命令
   register_commands()
 
@@ -246,7 +305,6 @@ function M.setup(user_config)
 
     -- 延迟执行测试
     vim.defer_fn(function()
-      local info_level = vim.log.levels and vim.log.levels.INFO or "INFO"
       vim.notify("[NeoAI] 开始自动运行测试...", info_level)
       M.test()
     end, delay_ms)

@@ -17,7 +17,7 @@ local state = {
     zindex = 50,
   },
   current_mode = "float", -- 默认模式
-  available_modes = { "float", "tab", "split" }
+  available_modes = { "float", "tab", "split" },
 }
 
 --- 初始化窗口管理器
@@ -41,7 +41,7 @@ local function create_float_window(options)
     border = "rounded",
     title = "NeoAI",
     title_pos = "center",
-    zindex = 50
+    zindex = 50,
   }, options or {})
 
   -- 设置窗口大小和位置
@@ -69,8 +69,22 @@ local function create_float_window(options)
 
   -- nvim_open_win 支持的参数列表
   local valid_params = {
-    "relative", "width", "height", "row", "col", "anchor", "win", "bufpos",
-    "external", "focusable", "zindex", "style", "border", "title", "title_pos", "noautocmd"
+    "relative",
+    "width",
+    "height",
+    "row",
+    "col",
+    "anchor",
+    "win",
+    "bufpos",
+    "external",
+    "focusable",
+    "zindex",
+    "style",
+    "border",
+    "title",
+    "title_pos",
+    "noautocmd",
   }
 
   -- 过滤掉不支持的参数
@@ -90,7 +104,7 @@ local function create_float_window(options)
   -- 设置缓冲区选项
   vim.api.nvim_set_option_value("buftype", "nofile", { buf = buf })
   vim.api.nvim_set_option_value("swapfile", false, { buf = buf })
-  vim.api.nvim_set_option_value("bufhidden", "wipe", { buf = buf })
+  vim.api.nvim_set_option_value("bufhidden", "hide", { buf = buf })
   vim.api.nvim_set_option_value("modifiable", true, { buf = buf })
   vim.api.nvim_set_option_value("readonly", false, { buf = buf })
 
@@ -100,7 +114,7 @@ local function create_float_window(options)
   return {
     buf = buf,
     win = win,
-    id = "float_" .. tostring(buf) .. "_" .. tostring(win)
+    id = "float_" .. tostring(buf) .. "_" .. tostring(win),
   }
 end
 
@@ -120,7 +134,7 @@ local function create_tab_window(options)
   -- 设置缓冲区选项
   vim.api.nvim_set_option_value("buftype", "nofile", { buf = buf })
   vim.api.nvim_set_option_value("swapfile", false, { buf = buf })
-  vim.api.nvim_set_option_value("bufhidden", "wipe", { buf = buf })
+  vim.api.nvim_set_option_value("bufhidden", "hide", { buf = buf })
   vim.api.nvim_set_option_value("modifiable", true, { buf = buf })
   vim.api.nvim_set_option_value("readonly", false, { buf = buf })
 
@@ -134,7 +148,7 @@ local function create_tab_window(options)
   return {
     buf = buf,
     win = win,
-    id = "tab_" .. tostring(buf) .. "_" .. tostring(win)
+    id = "tab_" .. tostring(buf) .. "_" .. tostring(win),
   }
 end
 
@@ -172,7 +186,7 @@ local function create_split_window(options)
   -- 设置缓冲区选项
   vim.api.nvim_set_option_value("buftype", "nofile", { buf = buf })
   vim.api.nvim_set_option_value("swapfile", false, { buf = buf })
-  vim.api.nvim_set_option_value("bufhidden", "wipe", { buf = buf })
+  vim.api.nvim_set_option_value("bufhidden", "hide", { buf = buf })
   vim.api.nvim_set_option_value("modifiable", true, { buf = buf })
   vim.api.nvim_set_option_value("readonly", false, { buf = buf })
 
@@ -182,7 +196,7 @@ local function create_split_window(options)
   return {
     buf = buf,
     win = win,
-    id = "split_" .. tostring(buf) .. "_" .. tostring(win)
+    id = "split_" .. tostring(buf) .. "_" .. tostring(win),
   }
 end
 
@@ -233,7 +247,7 @@ local function close_window_by_mode(window_info)
 
         if tabpage_number then
           -- 使用 tabclose 命令关闭指定标签页
-          vim.cmd('tabclose ' .. tabpage_number)
+          vim.cmd("tabclose " .. tabpage_number)
         else
           -- 如果找不到编号，切换到其他标签页再关闭当前标签页
           for _, tp in ipairs(tabpages) do
@@ -243,7 +257,7 @@ local function close_window_by_mode(window_info)
             end
           end
           -- 现在当前标签页是其他标签页，可以安全关闭原标签页
-          vim.cmd('tabclose')
+          vim.cmd("tabclose")
         end
       else
         -- 只有一个标签页，不能关闭
@@ -369,7 +383,7 @@ function M.create_window(window_type, options)
   -- 设置缓冲区选项
   vim.api.nvim_set_option_value("buftype", "nofile", { buf = window_info.buf })
   vim.api.nvim_set_option_value("swapfile", false, { buf = window_info.buf })
-  vim.api.nvim_set_option_value("bufhidden", "wipe", { buf = window_info.buf })
+  vim.api.nvim_set_option_value("bufhidden", "hide", { buf = window_info.buf })
   vim.api.nvim_set_option_value("filetype", "neoai_" .. window_type, { buf = window_info.buf })
   vim.api.nvim_set_option_value("modifiable", true, { buf = window_info.buf })
   vim.api.nvim_set_option_value("readonly", false, { buf = window_info.buf })
