@@ -220,6 +220,10 @@ function M._update_window_content()
     return
   end
 
+  -- 确保缓冲区可修改
+  vim.api.nvim_buf_set_option(window_info.buf, "modifiable", true)
+  vim.api.nvim_buf_set_option(window_info.buf, "readonly", false)
+
   -- 设置缓冲区内容
   vim.api.nvim_buf_set_lines(window_info.buf, 0, -1, false, vim.split(state.content_buffer, "\n"))
 

@@ -88,4 +88,3 @@ M.MESSAGES_CLEARED = "NeoAI:messages_cleared"
 M.MESSAGES_BUILT = "NeoAI:messages_built"
 
 return M
-

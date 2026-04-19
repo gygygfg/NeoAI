@@ -321,8 +321,37 @@ function M._send_message()
     -- 重新渲染聊天以显示用户消息
     M.render_chat()
 
-    -- 等待外部系统处理AI回复
-    -- AI回复将通过 M.add_message("assistant", content) 添加
+    -- 调用聊天处理器发送消息，触发AI响应
+    local chat_handlers_loaded, chat_handlers = pcall(require, "NeoAI.ui.handlers.chat_handlers")
+    if chat_handlers_loaded and type(chat_handlers) == "table" and chat_handlers.send_message then
+      -- 异步调用发送消息，避免阻塞UI
+      vim.defer_fn(function()
+        local success, result = chat_handlers.send_message(last_line)
+        if not success then
+          print("⚠️  发送消息失败: " .. tostring(result))
+          
+          -- 显示错误消息
+          M.show_floating_text("发送消息失败: " .. tostring(result), {
+            timeout = 3000,
+            position = "center",
+            border = "single",
+          })
+        else
+          print("✓ 消息已发送到AI引擎: " .. tostring(result))
+        end
+      end, 10)
+    else
+      print("⚠️  聊天处理器未加载，无法发送消息到AI引擎")
+      
+      -- 模拟AI响应作为后备
+      vim.defer_fn(function()
+        local simulated_response = "聊天处理器未加载，这是模拟AI响应。"
+        local success = M.add_message("assistant", simulated_response)
+        if success then
+          print("✓ 模拟AI响应已添加")
+        end
+      end, 1000)
+    end
   end
 end
 
@@ -445,6 +474,31 @@ function M.is_open()
   end
 
   return state.current_window_id ~= nil
+end
+
+--- 发送消息（公共接口）
+--- @param message string 消息内容
+--- @return boolean 是否成功
+--- @return string|nil 结果信息
+function M.send_message(message)
+  if not state.initialized then
+    return false, "聊天窗口未初始化"
+  end
+
+  if not message or vim.trim(message) == "" then
+    return false, "消息内容不能为空"
+  end
+
+  -- 首先添加用户消息
+  local success = M.add_message("user", message)
+  if not success then
+    return false, "无法添加用户消息"
+  end
+  
+  -- 调用内部发送消息函数（这会触发AI响应）
+  M._send_message()
+  
+  return true, "消息已发送"
 end
 
 --- 添加消息到聊天

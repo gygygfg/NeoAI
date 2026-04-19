@@ -23,7 +23,7 @@ local function try_open_chat_window()
 
   -- 获取当前会话ID
   local session_id = "default"
-  
+
   -- 通过UI模块获取会话ID，避免直接调用核心模块
   if ui and type(ui.get_current_session_id) == "function" then
     local current_session_id = ui.get_current_session_id()
@@ -126,6 +126,167 @@ function M.initialize(config)
           data = { session_id, branch_id, content },
         })
       end
+    end,
+  })
+
+  -- 监听AI响应完成事件
+  vim.api.nvim_create_autocmd("User", {
+    pattern = "NeoAI:ai_response_complete",
+    callback = function(args)
+      local data = args.data or {}
+      local response = data.response
+      local generation_id = data.generation_id
+      local messages = data.messages
+
+      -- 获取聊天窗口实例
+      local chat_window = require("NeoAI.ui.window.chat_window")
+
+      -- 检查聊天窗口是否可用
+      local available, err = pcall(chat_window.is_available)
+      if not available then
+        print("⚠️  聊天窗口不可用，无法显示AI响应: " .. tostring(err))
+        return
+      end
+
+      -- 提取响应内容
+      local response_content = ""
+      if type(response) == "string" then
+        response_content = response
+      elseif type(response) == "table" and response.content then
+        response_content = response.content
+      elseif type(response) == "table" and response.text then
+        response_content = response.text
+      else
+        response_content = tostring(response)
+      end
+
+      -- 添加AI响应到聊天窗口
+      local success = chat_window.add_message("assistant", response_content)
+      if success then
+        print("✓ AI响应已添加到聊天窗口 (ID: " .. tostring(generation_id) .. ")")
+
+        -- 触发响应显示事件
+        vim.api.nvim_exec_autocmds("User", {
+          pattern = "NeoAI:ai_response_displayed",
+          data = {
+            generation_id = generation_id,
+            response = response_content,
+            success = true,
+          },
+        })
+      else
+        print("✗ 无法添加AI响应到聊天窗口")
+      end
+    end,
+  })
+
+  -- 监听AI流式响应事件
+  vim.api.nvim_create_autocmd("User", {
+    pattern = "NeoAI:ai_response_chunk",
+    callback = function(args)
+      local data = args.data or {}
+      local chunk = data.chunk
+      local generation_id = data.generation_id
+      local messages = data.messages
+
+      -- 获取聊天窗口实例
+      local chat_window = require("NeoAI.ui.window.chat_window")
+
+      -- 检查聊天窗口是否可用
+      local available, err = pcall(chat_window.is_available)
+      if not available then
+        print("⚠️  聊天窗口不可用，无法显示流式响应: " .. tostring(err))
+        return
+      end
+
+      -- 提取块内容
+      local chunk_content = ""
+      if type(chunk) == "string" then
+        chunk_content = chunk
+      elseif type(chunk) == "table" and chunk.content then
+        chunk_content = chunk.content
+      elseif type(chunk) == "table" and chunk.text then
+        chunk_content = chunk.text
+      elseif type(chunk) == "table" and chunk.delta then
+        chunk_content = chunk.delta
+      else
+        chunk_content = tostring(chunk)
+      end
+
+      -- 对于流式响应，我们需要特殊处理
+      -- 这里可以显示悬浮文本或更新最后一条消息
+      if chunk_content and chunk_content ~= "" then
+        -- 显示悬浮文本或更新UI
+        chat_window.show_floating_text(chunk_content, {
+          timeout = 2000,
+          position = "bottom",
+        })
+
+        -- 触发流式响应事件
+        vim.api.nvim_exec_autocmds("User", {
+          pattern = "NeoAI:stream_chunk_displayed",
+          data = {
+            generation_id = generation_id,
+            chunk = chunk_content,
+            success = true,
+          },
+        })
+      end
+    end,
+  })
+
+  -- 监听流式生成完成事件
+  vim.api.nvim_create_autocmd("User", {
+    pattern = "NeoAI:stream_completed",
+    callback = function(args)
+      local data = args.data or {}
+      local generation_id = data.generation_id
+      local messages = data.messages
+
+      print("✓ 流式生成完成 (ID: " .. tostring(generation_id) .. ")")
+
+      -- 触发流式完成事件
+      vim.api.nvim_exec_autocmds("User", {
+        pattern = "NeoAI:stream_display_completed",
+        data = {
+          generation_id = generation_id,
+          success = true,
+        },
+      })
+    end,
+  })
+
+  -- 监听生成取消事件
+  vim.api.nvim_create_autocmd("User", {
+    pattern = "NeoAI:generation_cancelled",
+    callback = function(args)
+      local data = args.data or {}
+      local generation_id = data.generation_id
+
+      print("⚠️  AI生成已取消 (ID: " .. tostring(generation_id) .. ")")
+
+      -- 获取聊天窗口实例
+      local chat_window = require("NeoAI.ui.window.chat_window")
+
+      -- 检查聊天窗口是否可用
+      local available, err = pcall(chat_window.is_available)
+      if available then
+        -- 显示取消通知
+        chat_window.show_floating_text("AI生成已取消", {
+          timeout = 3000,
+          position = "center",
+          border = "single",
+        })
+      end
+
+      -- 触发生成取消显示事件
+      vim.api.nvim_exec_autocmds("User", {
+        pattern = "NeoAI:generation_cancelled_displayed",
+        data = {
+          generation_id = generation_id,
+          success = true,
+        },
+      })
     end,
   })
 
@@ -318,50 +479,106 @@ function M.send_message(message)
     end
   end
 
-  -- 发送消息
-  local success, result = chat_window.send_message(message)
-
-  -- 如果发送失败但窗口已打开，尝试直接触发事件（用于测试）
-  if not success then
-    print("⚠️  消息发送失败，但触发事件用于测试: " .. tostring(result))
-    vim.api.nvim_exec_autocmds("User", {
-      pattern = "NeoAI:message_sent",
-      data = { "default", "main", message },
-    })
-    -- 返回成功以继续测试流程
-    success = true
-    result = "消息已发送（测试模式）"
+  -- 调用聊天窗口的send_message函数，它会添加用户消息并触发AI响应
+  local window_success, window_result = chat_window.send_message(message)
+  if not window_success then
+    print("✗ 聊天窗口发送消息失败: " .. tostring(window_result))
+    return false, "聊天窗口发送消息失败: " .. tostring(window_result)
   end
 
-  -- 增加事件计数
-  if success then
-    -- 安全地尝试调用handle_key（如果存在）
-    local ui_loaded, ui = pcall(require, "NeoAI.ui")
-    if ui_loaded and type(ui) == "table" and type(ui.handle_key) == "function" then
-      pcall(ui.handle_key, "<CR>") -- 模拟回车键事件
+  print("✓ 消息已通过聊天窗口发送: " .. message)
+
+  -- 触发消息发送事件
+  local session_id = "default"
+  local branch_id = "main"
+
+  -- 通过UI模块获取会话信息（如果可用）
+  local ui_loaded, ui = pcall(require, "NeoAI.ui")
+  if ui_loaded and type(ui) == "table" and type(ui.get_current_session_id) == "function" then
+    local current_session_id = ui.get_current_session_id()
+    if current_session_id then
+      session_id = current_session_id
     end
+  end
 
-    -- 触发消息发送事件
-    -- 使用默认会话和分支信息，避免直接调用核心模块
-    local session_id = "default"
-    local branch_id = "main"
+  vim.api.nvim_exec_autocmds("User", {
+    pattern = "NeoAI:message_sent",
+    data = { session_id, branch_id, message },
+  })
 
-    -- 通过UI模块获取会话信息（如果可用）
-    local ui_loaded, ui = pcall(require, "NeoAI.ui")
-    if ui_loaded and type(ui) == "table" and type(ui.get_current_session_id) == "function" then
-      local current_session_id = ui.get_current_session_id()
-      if current_session_id then
-        session_id = current_session_id
+  -- 现在调用AI引擎生成响应
+  -- 首先尝试获取AI引擎
+  local ai_engine_loaded, ai_engine = pcall(require, "NeoAI.core.ai.ai_engine")
+  if not ai_engine_loaded or type(ai_engine) ~= "table" then
+    print("⚠️  AI引擎未加载，模拟AI响应")
+
+    -- 模拟AI响应
+    vim.defer_fn(function()
+      local simulated_response = "这是AI的模拟响应。实际应调用AI模型API。"
+      local success = chat_window.add_message("assistant", simulated_response)
+      if success then
+        print("✓ 模拟AI响应已添加到聊天窗口")
+
+        -- 触发模拟响应事件
+        vim.api.nvim_exec_autocmds("User", {
+          pattern = "NeoAI:ai_response_displayed",
+          data = {
+            generation_id = "simulated_" .. os.time(),
+            response = simulated_response,
+            success = true,
+          },
+        })
       end
-    end
+    end, 1000)
 
-    vim.api.nvim_exec_autocmds("User", {
-      pattern = "NeoAI:message_sent",
-      data = { session_id, branch_id, message },
-    })
+    return true, "消息已发送，等待AI响应（模拟模式）"
   end
 
-  return success, result
+  -- 检查AI引擎是否已初始化
+  local engine_status = ai_engine.get_status and ai_engine.get_status()
+  if not engine_status or not engine_status.initialized then
+    print("⚠️  AI引擎未初始化，模拟AI响应")
+
+    -- 模拟AI响应
+    vim.defer_fn(function()
+      local simulated_response = "AI引擎未初始化，这是模拟响应。"
+      local success = chat_window.add_message("assistant", simulated_response)
+      if success then
+        print("✓ 模拟AI响应已添加到聊天窗口")
+
+        -- 触发模拟响应事件
+        vim.api.nvim_exec_autocmds("User", {
+          pattern = "NeoAI:ai_response_displayed",
+          data = {
+            generation_id = "simulated_" .. os.time(),
+            response = simulated_response,
+            success = true,
+          },
+        })
+      end
+    end, 1000)
+
+    return true, "消息已发送，等待AI响应（引擎未初始化）"
+  end
+
+  -- 构建消息格式
+  local messages = {
+    {
+      role = "user",
+      content = message,
+    },
+  }
+
+  -- 调用AI引擎生成响应
+  print("🚀 调用AI引擎生成响应...")
+  local generation_id = ai_engine.generate_response(messages, {
+    use_tools = true, -- 启用工具调用
+    history = nil, -- 可以传递历史消息
+  })
+
+  print("✓ AI引擎已调用，生成ID: " .. tostring(generation_id))
+
+  return true, "消息已发送，AI响应生成中..."
 end
 
 --- 处理响应（测试用）

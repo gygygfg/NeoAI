@@ -16,7 +16,7 @@ local state = {
 ---     - max_tool_result_length: number 最大工具结果长度
 function M.initialize(options)
   if state.initialized then
-    print("警告: 响应构建器已初始化，跳过重复初始化")
+    vim.notify("警告: 响应构建器已初始化，跳过重复初始化")
     return
   end
 
@@ -24,7 +24,7 @@ function M.initialize(options)
   state.config = options.config or {}
   state.initialized = true
 
-  print("响应构建器初始化成功")
+  -- vim.notify("响应构建器初始化成功")
 end
 
 --- 构建消息列表
@@ -369,7 +369,7 @@ end
 function M.reset()
   state.initialized = false
   state.config = nil
-  print("响应构建器已重置")
+  vim.notify("响应构建器已重置")
 end
 
 --- 获取模块状态（用于调试）
@@ -383,7 +383,7 @@ end
 
 -- 测试函数
 local function test()
-  print("=== 开始测试响应构建器 ===")
+  vim.notify("=== 开始测试响应构建器 ===")
 
   -- 初始化模块
   M.initialize({
@@ -401,22 +401,22 @@ local function test()
   }
 
   local messages = M.build_messages(history, "今天的天气怎么样？")
-  print("构建的消息数量:", #messages)
-  print("消息摘要:", M.create_summary(messages))
+  vim.notify("构建的消息数量:", #messages)
+  vim.notify("消息摘要:", M.create_summary(messages))
 
   -- 测试2: 估算token
   local text = "这是一个测试文本，包含中文和English。"
   local tokens = M.estimate_tokens(text)
-  print("文本token估算:", tokens)
+  vim.notify("文本token估算:", tokens)
 
   -- 测试3: 格式化工具结果
   local tool_result = { temperature = 25, condition = "sunny", city = "北京" }
   local formatted = M.format_tool_result(tool_result)
-  print("格式化工具结果:", formatted)
+  vim.notify("格式化工具结果:", formatted)
 
   -- 测试4: 构建工具调用消息
   local tool_call_msg = M.build_tool_call_message("get_weather", { city = "北京" })
-  print("工具调用消息:", vim.inspect(tool_call_msg))
+  vim.notify("工具调用消息:", vim.inspect(tool_call_msg))
 
   -- 测试5: 压缩上下文
   local long_messages = {}
@@ -424,9 +424,9 @@ local function test()
     table.insert(long_messages, { role = "user", content = "消息" .. i })
   end
   local compressed = M.compact_context(long_messages, 500)
-  print("压缩后消息数量:", #compressed)
+  vim.notify("压缩后消息数量:", #compressed)
 
-  print("=== 测试完成 ===")
+  vim.notify("=== 测试完成 ===")
 end
 
 -- 如果直接运行此文件，执行测试

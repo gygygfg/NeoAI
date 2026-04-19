@@ -367,7 +367,7 @@ function M.test(test_name)
     end
   else
     -- 运行所有测试
-    test_module.run_all_tests()
+    test_module.run_all()
   end
 end
 

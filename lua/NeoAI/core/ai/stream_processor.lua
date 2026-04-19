@@ -41,8 +41,7 @@ function M.process_chunk(chunk)
   -- 尝试解析DeepSeek API格式
   if chunk:match("^data: ") then
     M._parse_deepseek_stream(chunk)
-  -- 尝试解析特殊标记
-  elseif chunk:match("^<reasoning>") or state.in_reasoning then
+  elseif chunk:match("^<reasoning>") or state.in_reasoning then -- 尝试解析特殊标记
     M._handle_reasoning_chunk(chunk)
   elseif chunk:match("^<tool_call>") then
     M._handle_tool_call_chunk(chunk)
@@ -106,12 +105,7 @@ function M.handle_reasoning(content)
     safe_content = tostring(safe_content)
   end
 
-  -- 如果思考缓冲区不为空，先刷新
-  if state.reasoning_buffer ~= "" then
-    M._flush_reasoning_buffer()
-  end
-
-  -- 直接发送思考内容
+  -- 直接发送思考内容，不处理缓冲区
   vim.api.nvim_exec_autocmds("User", {
     pattern = "reasoning_chunk",
     data = { safe_content },
@@ -132,12 +126,7 @@ function M.handle_content(content)
     safe_content = tostring(safe_content)
   end
 
-  -- 如果内容缓冲区不为空，先刷新
-  if state.buffer ~= "" then
-    M._flush_content_buffer()
-  end
-
-  -- 触发内容事件
+  -- 直接触发内容事件，不处理缓冲区
   vim.api.nvim_exec_autocmds("User", {
     pattern = "content_chunk",
     data = { safe_content },
@@ -272,13 +261,11 @@ end
 --- @param chunk string 数据块
 --- @return nil
 function M._handle_content_chunk(chunk)
-  -- 直接添加到缓冲区
-  state.buffer = state.buffer .. chunk
-
   -- 如果没有特殊标记，直接处理
   if not chunk:match("^<") then
     M.handle_content(chunk)
   end
+  -- 注意：内容已经在 process_chunk 函数中添加到了缓冲区
 end
 
 --- 刷新思考缓冲区（内部使用）
