@@ -15,7 +15,6 @@ local function escape_string(str)
     ['\r'] = '\\r',
     ['\t'] = '\\t',
   })
-end
 
 -- 编码 Lua 值为 JSON 字符串
 function M.encode(value)
@@ -31,7 +30,7 @@ function M.encode(value)
       return 'null'
     elseif value == -math.huge then
       return 'null'
-    end
+    
     return tostring(value)
   elseif t == "boolean" then
     return value and "true" or "false"
@@ -43,11 +42,10 @@ function M.encode(value)
       if type(k) ~= "number" or k < 1 or math.floor(k) ~= k then
         is_array = false
         break
-      end
+      
       if k > max_index then
         max_index = k
-      end
-    end
+      
     
     -- 检查是否连续
     if is_array then
@@ -55,16 +53,15 @@ function M.encode(value)
         if value[i] == nil then
           is_array = false
           break
-        end
-      end
-    end
+        
+      
     
     if is_array then
       -- 编码为 JSON 数组
       local parts = {}
       for i = 1, max_index do
         parts[i] = M.encode(value[i])
-      end
+      
       return "[" .. table.concat(parts, ",") .. "]"
     else
       -- 编码为 JSON 对象
@@ -72,16 +69,15 @@ function M.encode(value)
       for k, v in pairs(value) do
         if type(k) == "string" then
           table.insert(parts, '"' .. escape_string(k) .. '":' .. M.encode(v))
-        end
-      end
+        
+      
       return "{" .. table.concat(parts, ",") .. "}"
-    end
+    
   elseif t == "nil" then
     return "null"
   else
     error("无法编码类型: " .. t)
-  end
-end
+  
 
 -- 解码 JSON 字符串为 Lua 值（简化版）
 function M.decode(json_str)
@@ -96,9 +92,8 @@ function M.decode(json_str)
         pos = pos + 1
       else
         break
-      end
-    end
-  end
+      
+    
   
   local function parse_value()
     skip_whitespace()
@@ -127,8 +122,8 @@ function M.decode(json_str)
           pos = pos + 2  -- 跳过转义字符和下一个字符
         else
           pos = pos + 1
-        end
-      end
+        
+      
       error("未终止的字符串")
     elseif c == '{' then
       -- 解析对象
@@ -139,7 +134,6 @@ function M.decode(json_str)
       if json_str:sub(pos, pos) == '}' then
         pos = pos + 1
         return obj
-      end
       
       while true do
         skip_whitespace()
@@ -148,7 +142,7 @@ function M.decode(json_str)
         
         if json_str:sub(pos, pos) ~= ':' then
           error("期望 ':'")
-        end
+        
         pos = pos + 1
         
         local value = parse_value()
@@ -163,8 +157,8 @@ function M.decode(json_str)
           pos = pos + 1
         else
           error("期望 ',' 或 '}'")
-        end
-      end
+        
+      
       return obj
     elseif c == '[' then
       -- 解析数组
@@ -175,7 +169,6 @@ function M.decode(json_str)
       if json_str:sub(pos, pos) == ']' then
         pos = pos + 1
         return arr
-      end
       
       local index = 1
       while true do
@@ -192,8 +185,8 @@ function M.decode(json_str)
           pos = pos + 1
         else
           error("期望 ',' 或 ']'")
-        end
-      end
+        
+      
       return arr
     elseif c == 't' and json_str:sub(pos, pos + 3) == 'true' then
       pos = pos + 4
@@ -213,8 +206,8 @@ function M.decode(json_str)
           pos = pos + 1
         else
           break
-        end
-      end
+        
+      
       local num_str = json_str:sub(start, pos - 1)
       return tonumber(num_str)
     elseif (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') then
@@ -226,8 +219,8 @@ function M.decode(json_str)
           pos = pos + 1
         else
           break
-        end
-      end
+        
+      
       local identifier = json_str:sub(start, pos - 1)
       
       if identifier == "true" then
@@ -241,13 +234,11 @@ function M.decode(json_str)
         -- 这可能来自某些API的不规范JSON响应
         -- 为了兼容性，将其作为字符串返回
         return identifier
-      end
+      
     else
       error("无法解析的字符: " .. c)
-    end
-  end
+    
   
   return parse_value()
-end
 
 return M

@@ -1,6 +1,4 @@
-基于您的需求，我对架构进行了优化，重点在于简化结构、明确职责、强化工具调用处理。以下是优化后的架构：
-
-优化后的架构设计
+# 架构设计
 
 NeoAI/
 ├── init.lua # 主入口文件
@@ -52,306 +50,7 @@ NeoAI/
 ├── file_utils.lua # 文件操作
 └── logger.lua # 日志
 
-核心模块功能设计
-
-1. 主入口文件
-
-init.lua
-
-setup(user_config) # 初始化插件，验证配置，设置全局变量
-open_neoai() # 打开NeoAI主界面
-close_all() # 关闭所有界面
-
-default_config.lua
-
-validate_config(config) # 验证用户配置
-merge_defaults(config) # 合并默认配置
-sanitize_config(config) # 清理配置
-get_default_config() # 获取默认配置
-
-默认配置包含：
-
-- ui.default_ui: 默认打开的界面 ('tree' 或 'chat')
-- ui.window_mode: 窗口模式 ('float', 'tab', 'split')
-- ui.window: 窗口尺寸和边框配置
-- ui.keymaps: 键位配置
-- ai: AI相关配置
-- session: 会话配置
-- tools: 工具系统配置
-
-2. 核心业务模块
-
-core/init.lua
-
-initialize(core_config) # 初始化核心模块
-get_session_manager() # 获取会话管理器
-get_ai_engine() # 获取AI引擎
-
-core/config/config_manager.lua
-
-get(key) # 获取配置
-set(key, value) # 设置配置
-validate(key, value) # 验证配置
-on_change(callback) # 配置变更回调
-
-core/config/keymap_manager.lua
-
-load_default_keymaps() # 加载默认键位配置
-get_keymap(context, action) # 获取指定上下文和动作的键位
-set_keymap(context, action, key) # 设置键位映射
-reset_keymap(context, action) # 重置键位到默认值
-list_keymaps(context) # 列出指定上下文的所有键位
-validate_key(key) # 验证键位有效性
-save_keymaps() # 保存键位配置到文件
-load_keymaps() # 从文件加载键位配置
-
-core/session/session_manager.lua
-
-create_session(name) # 创建会话
-get_session(id) # 获取会话
-get_current_session() # 获取当前会话
-set_current_session(id) # 设置当前会话
-list_sessions() # 列出所有会话
-delete_session(id) # 删除会话
-
-core/session/branch_manager.lua
-
-create_branch(parent_id, name) # 创建分支
-switch_branch(branch_id) # 切换分支
-get_branch_tree(session_id) # 获取分支树
-delete_branch(branch_id) # 删除分支
-get_current_branch() # 获取当前分支
-
-core/session/message_manager.lua
-
-add_message(role, content) # 添加消息
-get_messages(branch_id, limit) # 获取消息
-edit_message(msg_id, content) # 编辑消息
-delete_message(msg_id) # 删除消息
-clear_messages(branch_id) # 清空消息
-
-core/session/data_operations.lua
-
-export_session(session_id, format) # 导出会话
-import_session(data, format) # 导入会话
-backup_sessions() # 备份会话
-restore_backup(backup_id) # 恢复备份
-
-core/ai/ai_engine.lua
-
-generate_response(messages, options) # 生成响应
-stream_response(messages, options) # 流式响应
-cancel_generation() # 取消生成
-is_generating() # 是否正在生成
-
-core/ai/stream_processor.lua
-
-process_chunk(chunk) # 处理流式数据块
-handle_reasoning(content) # 处理思考内容
-handle_content(content) # 处理内容输出
-handle_tool_call(tool_call) # 处理工具调用
-flush_buffer() # 刷新缓冲区
-
-core/ai/reasoning_manager.lua
-
-start_reasoning() # 开始思考过程
-append_reasoning(content) # 追加思考内容
-finish_reasoning() # 完成思考过程
-get_reasoning_text() # 获取思考文本
-clear_reasoning() # 清空思考
-
-core/ai/tool_orchestrator.lua
-
-execute_tool_loop(messages) # 执行工具调用循环
-parse_tool_call(response) # 解析工具调用
-execute_tool(tool_call) # 执行单个工具
-build_context(tool_result) # 构建上下文
-should_continue(result) # 判断是否继续调用
-
-core/ai/response_builder.lua
-
-build_messages(history, query) # 构建消息列表
-format_tool_result(result) # 格式化工具结果
-create_summary(messages) # 创建摘要
-compact_context(messages) # 压缩上下文
-
-core/events/event_bus.lua
-
-on(event, callback) # 监听事件
-emit(event, ...) # 触发事件
-off(event, callback) # 取消监听
-clear_listeners(event) # 清除监听器
-
-3. 用户界面模块
-
-ui/init.lua
-
-initialize(ui_config) # 初始化UI
-open_tree_ui() # 打开树界面
-open_chat_ui() # 打开聊天界面
-close_all_windows() # 关闭所有窗口
-
-ui/window/window_manager.lua
-
-create_window(type, options) # 创建窗口
-close_window(window_id) # 关闭窗口
-get_window(window_id) # 获取窗口
-list_windows() # 列出所有窗口
-focus_window(window_id) # 聚焦窗口
-get_window_mode() # 获取当前窗口模式
-set_window_mode(mode) # 设置窗口模式
-
-ui/window/window_mode_manager.lua
-
-create_float_window(options) # 创建浮动窗口
-create_tab_window(options) # 创建标签页窗口
-create_split_window(options) # 创建分割窗口
-create_window_by_mode(mode, options) # 根据模式创建窗口
-close_window(window_info) # 关闭窗口
-set_window_content(window_info, content, filetype) # 设置窗口内容
-append_window_content(window_info, content) # 追加窗口内容
-focus_window(window_info) # 聚焦窗口
-is_window_valid(window_info) # 检查窗口是否有效
-
-ui/window/chat_window.lua
-
-open(session_id, branch_id) # 打开聊天窗口
-render_messages(messages) # 渲染消息
-update_input(content) # 更新输入框
-clear_input() # 清空输入框
-set_keymaps() # 设置按键映射（使用keymap_manager）
-
-ui/window/tree_window.lua
-
-open(session_id) # 打开树状图窗口
-render_tree(tree_data) # 渲染树状图
-refresh_tree() # 刷新树状图
-set_keymaps() # 设置按键映射（使用keymap_manager）
-get_selected_node() # 获取选中节点
-
-ui/components/input_handler.lua
-
-setup_keymaps() # 设置按键映射（使用keymap_manager）
-handle_input() # 处理输入
-send_message(content) # 发送消息
-edit_message(msg_id) # 编辑消息
-set_mode(mode) # 设置模式
-
-ui/components/history_tree.lua
-
-render(session_id) # 渲染历史树
-expand_node(node_id) # 展开节点
-collapse_node(node_id) # 折叠节点
-select_node(node_id) # 选择节点
-update_node(node_id, data) # 更新节点
-
-ui/components/reasoning_display.lua
-
-show(content) # 显示思考过程
-append(content) # 追加内容
-close() # 关闭显示
-is_visible() # 是否可见
-set_position(x, y) # 设置位置
-
-ui/handlers/tree_handlers.lua
-
-handle_enter() # 处理回车（选择分支）
-handle_n() # 处理n键（新建子分支）
-handle_N() # 处理N键（新建根分支）
-handle_d() # 处理d键（删除对话）
-handle_D() # 处理D键（删除分支）
-
-ui/handlers/chat_handlers.lua
-
-handle_enter() # 处理回车（发送消息）
-handle_ctrl_s() # 处理Ctrl+S（发送消息）
-handle_escape() # 处理ESC键
-handle_tab() # 处理Tab键
-handle_scroll() # 处理滚动
-
-4. 工具系统模块（新增）
-
-tools/init.lua
-
-initialize(tools_config) # 初始化工具系统
-register_tool(tool_def) # 注册工具
-get_tools() # 获取所有工具
-execute_tool(name, args) # 执行工具
-
-tools/tool_registry.lua
-
-register(tool) # 注册工具
-unregister(tool_name) # 注销工具
-get(tool_name) # 获取工具定义
-list() # 列出所有工具
-validate_tool(tool) # 验证工具定义
-
-tools/tool_executor.lua
-
-execute(tool_name, args) # 执行工具
-validate_args(tool, args) # 验证参数
-format_result(result) # 格式化结果
-handle_error(error) # 处理错误
-cleanup() # 清理资源
-
-tools/tool_validator.lua
-
-validate_schema(schema) # 验证工具模式
-validate_parameters(params) # 验证参数
-validate_return_type(type) # 验证返回类型
-check_permissions(tool) # 检查权限
-
-tools/builtin/file_tools.lua
-
-read_file(path) # 读取文件
-write_file(path, content) # 写入文件
-list_files(dir) # 列出文件
-search_files(pattern) # 搜索文件
-
-5. 工具库模块（精简）
-
-utils/common.lua
-
-deep_copy(tbl) # 深拷贝
-deep_merge(t1, t2) # 深度合并
-safe_call(func, ...) # 安全调用
-debounce(func, delay) # 防抖
-throttle(func, limit) # 节流
-
-utils/text_utils.lua
-
-truncate(text, length) # 截断文本
-wrap(text, width) # 文本换行
-escape(text) # 转义字符
-unescape(text) # 反转义
-format_json(data) # 格式化JSON
-
-utils/table_utils.lua
-
-keys(tbl) # 获取所有键
-values(tbl) # 获取所有值
-filter(tbl, predicate) # 过滤表
-map(tbl, func) # 映射表
-reduce(tbl, func, init) # 归约表
-
-utils/file_utils.lua
-
-read_lines(path) # 读取行
-write_lines(path, lines) # 写入行
-exists(path) # 检查文件是否存在
-mkdir(dir) # 创建目录
-join_path(...) # 连接路径
-
-utils/logger.lua
-
-log(level, message) # 记录日志
-set_level(level) # 设置日志级别
-set_output(path) # 设置输出路径
-debug(message, ...) # 调试日志
-info(message, ...) # 信息日志
-error(message, ...) # 错误日志
-
-关键流程说明
+# 关键流程说明
 
 1. 启动流程
 
@@ -469,77 +168,6 @@ data: {"choices":[{"delta":{},"finish_reason":"stop"}]}
 重置键位 →
 "keymap_manager.reset_keymap(context, action)"
 
-优化点总结
-
-1. 简化结构：减少不必要的层级，合并相关功能
-2. 明确职责：每个模块/文件职责更清晰
-3. 强化工具系统：新增专用工具模块，支持工具调用循环
-4. 统一事件系统：使用事件总线简化通信
-5. 精简工具库：合并冗余工具函数
-6. 前后端分离：UI与核心逻辑完全解耦
-7. 流式处理优化：专门处理思考过程和工具调用
-8. 配置集中管理：统一配置入口和验证
-9. 键位配置管理：新增键位配置管理器，支持自定义键位映射
-10. 窗口模式支持：新增窗口模式管理器，支持 float、tab、split 三种窗口模式
-11. 默认界面配置：支持配置默认打开的界面（tree 或 chat）
-
-键位配置上下文定义
-
-1. 树界面上下文 ("tree")
-   - "select" - 选择节点/分支
-   - "new_child" - 新建子分支
-   - "new_root" - 新建根分支
-   - "delete_dialog" - 删除对话
-   - "delete_branch" - 删除分支
-   - "expand" - 展开节点
-   - "collapse" - 折叠节点
-
-2. 聊天界面上下文 ("chat")
-   - "send" - 发送消息
-   - "cancel" - 取消生成
-   - "edit" - 编辑消息
-   - "delete" - 删除消息
-   - "scroll_up" - 向上滚动
-   - "scroll_down" - 向下滚动
-   - "toggle_reasoning" - 切换思考过程显示
-
-3. 全局上下文 ("global")
-   - "open_tree" - 打开树界面
-   - "open_chat" - 打开聊天界面
-   - "close_all" - 关闭所有窗口
-   - "toggle_ui" - 切换UI显示
-
-默认键位配置示例
-
-```lua
-{
-  tree = {
-    select = "<CR>",           -- 回车键
-    new_child = "n",           -- n键
-    new_root = "N",            -- Shift+n键
-    delete_dialog = "d",       -- d键
-    delete_branch = "D",       -- Shift+d键
-    expand = "o",              -- o键
-    collapse = "O",             -- Shift+o键
-  },
-  chat = {
-    send = "<C-s>",           -- Ctrl+s键
-    cancel = "<Esc>",         -- ESC键
-    edit = "e",               -- e键
-    delete = "dd",            -- dd键
-    scroll_up = "<C-u>",      -- Ctrl+u键
-    scroll_down = "<C-d>",    -- Ctrl+d键
-    toggle_reasoning = "r",    -- r键
-  },
-  global = {
-    open_tree = "<leader>at",  -- leader+at键
-    open_chat = "<leader>ac",  -- leader+ac键
-    close_all = "<leader>aq",  -- leader+aq键
-    toggle_ui = "<leader>aa",  -- leader+aa键
-  }
-}
-```
-
 ## 命令和快捷键注册
 
 ### 已注册的 Neovim 命令
@@ -561,207 +189,298 @@ data: {"choices":[{"delta":{},"finish_reason":"stop"}]}
 3. **关闭所有窗口** - `<leader>aq`（可配置）
 4. **切换 UI 显示** - `<leader>aa`（可配置）
 
-## 架构实现状态与优化建议
+## 事件系统规范
 
-### 当前实现状态评估
+### 事件命名规范
 
-基于对实际代码的分析，当前项目已成功实现了架构设计中的大部分核心功能：
+所有 NeoAI 事件使用 `NeoAI:` 前缀，遵循以下命名约定：
 
-#### ✅ 已完全实现的功能
+1. **事件类型前缀**：
+   - `NeoAI:generation_` - AI 生成相关事件
+   - `NeoAI:stream_` - 流式处理事件
+   - `NeoAI:reasoning_` - 思考过程事件
+   - `NeoAI:tool_` - 工具调用事件
+   - `NeoAI:session_` - 会话管理事件
+   - `NeoAI:branch_` - 分支管理事件
+   - `NeoAI:message_` - 消息管理事件
+   - `NeoAI:window_` - 窗口管理事件
+   - `NeoAI:config_` - 配置管理事件
+   - `NeoAI:backup_` - 备份管理事件
+   - `NeoAI:log_` - 日志事件
+   - `NeoAI:ai_response_` - AI响应事件
 
-1. **模块化架构** - 核心、UI、工具模块分离清晰
-2. **配置管理系统** - 支持默认配置和用户自定义
-3. **键位配置管理器** - 可自定义的键位映射系统
-4. **窗口模式支持** - float、tab、split三种窗口模式
-5. **工具系统框架** - 完整的工具注册、验证、执行流程
-6. **事件通信系统** - 使用事件总线实现松耦合
-7. **会话管理** - 支持会话、分支、消息的完整管理
-8. **AI引擎集成** - 流式处理和推理管理
+2. **事件动作后缀**：
+   - `_started` - 动作开始
+   - `_completed` - 动作完成
+   - `_error` - 动作错误
+   - `_created` - 创建操作
+   - `_updated` - 更新操作
+   - `_deleted` - 删除操作
+   - `_opened` - 打开操作
+   - `_closed` - 关闭操作
 
-#### ⚠️ 需要优化的关键问题
+### 事件触发规范
 
-### 五大核心优化点
-
-#### 1. 配置验证缺失（高优先级）
-
-**问题**：配置验证不严格，可能导致运行时错误
-**影响**：系统稳定性风险
-**解决方案**：
+#### 触发事件
 
 ```lua
--- 添加配置验证器
-local config_validator = require("NeoAI.core.config.config_validator")
+-- 标准事件触发
+vim.api.nvim_exec_autocmds("User", {
+  pattern = "NeoAI:message_added",
+  data = {message_id, message}
+})
 
--- 验证关键配置
-config_validator.validate("ai.model", "unsupported-model") -- 应返回false
-config_validator.validate("ui.window_mode", "invalid-mode") -- 应返回false
+-- 带窗口ID的事件
+vim.api.nvim_exec_autocmds("User", {
+  pattern = "NeoAI:chat_window_opened",
+  data = {window_id = window_id}
+})
 ```
 
-#### 2. 错误处理分散（高优先级）
-
-**问题**：每个模块自己处理错误，缺乏统一机制
-**影响**：错误恢复困难，用户体验差
-**解决方案**：
+#### 监听事件
 
 ```lua
--- 统一错误处理中间件
-local error_handler = require("NeoAI.core.error_handler")
+-- 创建事件监听器
+local autocmd_id = vim.api.nvim_create_autocmd("User", {
+  pattern = "NeoAI:message_added",
+  callback = function(args)
+    local data = args.data
+    local message_id, message = data[1], data[2]
+    -- 处理事件
+  end
+})
 
--- 包装关键函数
-M.generate_response = error_handler.wrap(
-  original_function,
-  "ai_engine.generate_response"
-)
-
--- 统一错误处理
-error_handler.register_handler("network_error", function(error)
-  -- 自动重试逻辑
-  -- 用户友好提示
-end)
-```
-
-#### 3. 模块耦合度高（中优先级）
-
-**问题**：模块间直接依赖，测试和维护困难
-**影响**：代码可维护性差，扩展困难
-**解决方案**：
-
-```lua
--- 依赖注入容器
-local container = require("NeoAI.core.dependency_container")
-
-container.register("event_bus", function()
-  return require("NeoAI.core.events.event_bus")
-end)
-
-container.register("session_manager", function()
-  local session = require("NeoAI.core.session.session_manager")
-  session.initialize({
-    event_bus = container.get("event_bus"),
-    config = container.get("config_manager").get("session")
-  })
-  return session
-end)
-```
-
-#### 4. 性能监控缺失（中优先级）
-
-**问题**：缺乏性能指标，难以优化
-**影响**：性能问题难以发现和定位
-**解决方案**：
-
-```lua
--- 性能监控系统
-local perf_monitor = require("NeoAI.utils.performance_monitor")
-
--- 监控关键操作
-function M.generate_response(messages, options)
-  return perf_monitor.measure("ai_engine.generate_response", function()
-    -- 原函数逻辑
-  end)
-end
-
--- 查看性能报告
-:NeoAIPerfReport
-```
-
-#### 5. 扩展性不足（低优先级）
-
-**问题**：不支持插件和主题系统
-**影响**：生态系统发展受限
-**解决方案**：
-
-```lua
--- 插件系统
-local plugin_manager = require("NeoAI.core.plugin_manager")
-
-plugin_manager.register("my-plugin", {
-  name = "My Plugin",
-  init = function(config)
-    -- 插件初始化
+-- 一次性监听器
+local once_listener = vim.api.nvim_create_autocmd("User", {
+  pattern = "NeoAI:session_created",
+  callback = function(args)
+    -- 处理事件
+    vim.api.nvim_del_autocmd(once_listener) -- 移除监听器
   end,
-  hooks = {
-    on_session_create = function(session)
-      -- 自定义逻辑
-    end
-  }
-})
-
--- 主题系统
-local theme_manager = require("NeoAI.ui.theme_manager")
-
-theme_manager.register_theme("dark", {
-  colors = {
-    background = "#1e1e1e",
-    text = "#ffffff"
-  }
+  once = true
 })
 ```
 
-### 优化实施路线图
+### 事件数据规范
 
-#### 第一阶段：稳定性加固（1-2周）
+事件数据应遵循以下格式：
 
-1. **配置验证系统** - 防止配置错误
-2. **统一错误处理** - 提高系统稳定性
-3. **键位验证** - 防止键位冲突
+1. **简单数据**：直接传递值
 
-#### 第二阶段：性能优化（2-3周）
+   ```lua
+   data = {session_id, session}
+   ```
 
-1. **依赖注入容器** - 降低模块耦合
-2. **性能监控** - 发现性能瓶颈
-3. **智能缓存** - 提升响应速度
+2. **命名参数**：使用命名参数提高可读性
 
-#### 第三阶段：生态系统建设（3-4周）
+   ```lua
+   data = {window_id = window_id, window_type = "chat"}
+   ```
 
-1. **插件系统** - 支持第三方扩展
-2. **主题系统** - 改善用户体验
-3. **状态持久化** - 支持崩溃恢复
+3. **复杂数据**：传递表结构
+   ```lua
+   data = {
+     tool_call = tool_call,
+     error_msg = error_msg,
+     timestamp = os.time()
+   }
+   ```
 
-### 预期收益
+### 事件分类（基于实际实现）
 
-#### 技术收益
+#### 1. AI 生成事件
 
-1. **稳定性提升** - 配置错误减少50%，崩溃率降低80%
-2. **性能优化** - 关键操作响应时间减少30%
-3. **可维护性** - 模块耦合度降低50%，测试覆盖率提升至80%
-4. **扩展性** - 支持插件生态系统，功能扩展时间减少70%
+- `NeoAI:generation_started` - AI生成开始（数据：`{generation_id, formatted_messages}`）
+- `NeoAI:generation_completed` - AI生成完成（数据：`{generation_id, response}`）
+- `NeoAI:generation_error` - AI生成错误（数据：`{generation_id, error_msg}`）
+- `NeoAI:generation_cancelled` - AI生成取消（数据：`{generation_id}`）
 
-#### 用户体验收益
+#### 2. 流式处理事件
 
-1. **配置更安全** - 实时验证，防止错误配置
-2. **错误更友好** - 统一错误处理，提供恢复建议
-3. **性能更优** - 响应更快，资源使用更高效
-4. **个性化更强** - 支持主题和插件定制
+- `NeoAI:stream_chunk` - 流式数据块到达（数据：`{generation_id, cleaned_chunk}`）
+- `NeoAI:stream_started` - 流式处理开始（数据：`{generation_id, formatted_messages}`）
+- `NeoAI:stream_completed` - 流式处理完成（数据：`{session_id}`）
+- `NeoAI:stream_error` - 流式处理错误
 
-### 实施建议
+#### 3. 推理事件
 
-#### 立即行动（本周）
+- `NeoAI:reasoning_content` - 推理内容到达（数据：`{reasoning_content}`）
+- `NeoAI:reasoning_started` - 推理开始
+- `NeoAI:reasoning_completed` - 推理完成
 
-1. 实现配置验证器基础框架
-2. 添加关键配置的验证规则
-3. 创建错误处理中间件原型
+#### 4. 工具相关事件
 
-#### 短期计划（1个月内）
+- `NeoAI:tool_loop_started` - 工具循环开始（数据：`{current_messages}`）
+- `NeoAI:tool_loop_finished` - 工具循环结束（数据：`{final_result, iteration_count}`）
+- `NeoAI:tool_execution_started` - 工具执行开始（数据：`{tool_call}` 或 `{tool_name, args, start_time}`）
+- `NeoAI:tool_execution_completed` - 工具执行完成（数据：`{tool_call, formatted_result}` 或 `{tool_name, args, result, duration}`）
+- `NeoAI:tool_error` - 工具执行错误（数据：`{tool_call, error_msg}` 或 `{tool_name, args, error_msg, duration}`）
+- `NeoAI:tool_call_detected` - 工具调用检测到（数据：`{tool_call}`）
+- `NeoAI:tool_result_received` - 工具结果接收（数据：`{tool_call, result}`）
 
-1. 完成依赖注入容器
-2. 实现性能监控系统
-3. 添加基础缓存功能
+#### 5. 会话事件
 
-#### 长期规划（3个月内）
+- `NeoAI:session_created` - 会话创建（数据：`{session_id, session}`）
+- `NeoAI:session_reused` - 会话重用（数据：`{session_id, session}`）
+- `NeoAI:session_loaded` - 会话加载（数据：`{new_session_id, filepath}`）
+- `NeoAI:session_saved` - 会话保存（数据：`{session_id, filepath}`）
+- `NeoAI:session_deleted` - 会话删除（数据：`{session_id}`）
+- `NeoAI:session_changed` - 会话变更（数据：`{session_id, session}`）
 
-1. 发布插件系统API
-2. 实现主题管理系统
-3. 构建开发者文档和示例
+#### 6. 分支事件
 
-### 总结
+- `NeoAI:branch_created` - 分支创建（数据：`{branch_id, branch}`）
+- `NeoAI:branch_switched` - 分支切换（数据：`{branch_id, old_branch_id}`）
+- `NeoAI:branch_deleted` - 分支删除（数据：`{branch_id}`）
 
-NeoAI已经建立了优秀的架构基础，但在以下五个关键领域有优化空间：
+#### 7. 消息事件
 
-1. **配置安全** - 需要严格的验证机制
-2. **错误恢复** - 需要统一的处理框架
-3. **模块解耦** - 需要依赖注入支持
-4. **性能可见** - 需要监控和优化工具
-5. **生态扩展** - 需要插件和主题系统
+- `NeoAI:message_added` - 消息添加（数据：`{message_id, message}`）
+- `NeoAI:message_edited` - 消息编辑（数据：`{message_id, old_content, content}`）
+- `NeoAI:message_deleted` - 消息删除（数据：`{message_id, message}`）
+- `NeoAI:messages_cleared` - 消息清空（数据：`{branch_id, deleted_ids}`）
+- `NeoAI:messages_built` - 消息构建完成（数据：`{messages, history_count}`）
+- `NeoAI:message_updated` - 消息更新（数据：`{message_id, message}`）
 
-通过分阶段实施这些优化，NeoAI将从一个功能完整的AI助手，升级为一个稳定、高性能、可扩展的生态系统平台。
+#### 8. 窗口事件
+
+- `NeoAI:chat_window_opened` - 聊天窗口打开（数据：`{window_id = window_id}`）
+- `NeoAI:chat_window_closed` - 聊天窗口关闭（数据：`{window_id = window_id}`）
+- `NeoAI:tree_window_opened` - 树窗口打开（数据：`{window_id = window_id}`）
+- `NeoAI:tree_window_closed` - 树窗口关闭（数据：`{window_id = window_id}`）
+- `NeoAI:window_mode_changed` - 窗口模式变更（数据：`{old_mode, new_mode}`）
+
+#### 9. 配置事件
+
+- `NeoAI:config_loaded` - 配置加载完成（数据：`{config}`）
+- `NeoAI:config_changed` - 配置变更（数据：`{old_config, new_config}`）
+
+#### 10. 状态事件
+
+- `NeoAI:plugin_initialized` - 插件初始化完成
+- `NeoAI:plugin_shutdown` - 插件关闭
+
+#### 11. 备份事件
+
+- `NeoAI:backup_created` - 备份创建（数据：`{backup_file, session_count}`）
+- `NeoAI:backup_restored` - 备份恢复（数据：`{backup_file, restored_session_count}`）
+
+#### 12. 响应构建事件
+
+- `NeoAI:response_built` - 响应构建完成
+
+#### 13. 日志事件
+
+- `NeoAI:log_debug` - 调试日志
+- `NeoAI:log_info` - 信息日志
+- `NeoAI:log_warn` - 警告日志
+- `NeoAI:log_error` - 错误日志
+- `NeoAI:ai_response_chunk` - AI响应数据块
+- `NeoAI:ai_response_complete` - AI响应完成
+- `NeoAI:ai_response_error` - AI响应错误
+
+#### 14. 自定义事件
+
+- `NeoAI:send_message` - 发送消息事件
+- `NeoAI:close_window` - 关闭窗口事件
+
+### 事件使用最佳实践
+
+1. **事件解耦**：模块间通过事件通信，避免直接依赖
+2. **事件命名一致性**：遵循命名规范，保持一致性
+3. **数据最小化**：只传递必要的数据，避免传递大型对象
+4. **错误处理**：事件触发应包含错误处理
+5. **性能考虑**：避免在热路径中频繁触发事件
+6. **清理监听器**：及时清理不再需要的监听器
+
+### 事件调试
+
+```lua
+-- 调试所有 NeoAI 事件
+vim.api.nvim_create_autocmd("User", {
+  pattern = "NeoAI:*",
+  callback = function(args)
+    print("事件触发:", args.match, "数据:", vim.inspect(args.data))
+  end
+})
+
+-- 调试特定事件
+vim.api.nvim_create_autocmd("User", {
+  pattern = "NeoAI:tool_*",
+  callback = function(args)
+    print("工具事件:", args.match, "数据:", vim.inspect(args.data))
+  end
+})
+```
+
+### 事件系统流程
+
+7. 事件通信流程
+
+模块A触发事件 →
+`vim.api.nvim_exec_autocmds("User", {pattern = "NeoAI:event_name", data = data})`
+事件总线分发 →
+模块B监听事件 →
+`vim.api.nvim_create_autocmd("User", {pattern = "NeoAI:event_name", callback = handler})`
+执行回调函数 →
+更新状态或触发新事件
+
+### 事件依赖关系
+
+- **启动事件链**：`NeoAI:session_created` → `NeoAI:branch_created` → `NeoAI:message_added`
+- **AI处理链**：`NeoAI:generation_started` → `NeoAI:stream_started` → `NeoAI:stream_chunk` → `NeoAI:stream_completed`
+- **工具调用链**：`NeoAI:tool_loop_started` → `NeoAI:tool_execution_started` → `NeoAI:tool_execution_completed` → `NeoAI:tool_loop_finished`
+- **窗口管理链**：`NeoAI:WindowOpened` → `NeoAI:ChatBoxOpened` → `NeoAI:WindowClosed`
+
+### 事件测试规范
+
+```lua
+-- 测试事件触发
+local triggered = false
+local listener = vim.api.nvim_create_autocmd("User", {
+  pattern = "NeoAI:test_event",
+  callback = function() triggered = true end
+})
+
+-- 触发事件
+vim.api.nvim_exec_autocmds("User", {pattern = "NeoAI:test_event"})
+
+-- 验证
+assert(triggered, "事件未触发")
+vim.api.nvim_del_autocmd(listener)
+```
+
+### 事件系统的重要性
+
+NeoAI 的事件系统是整个架构的核心通信机制，具有以下重要作用：
+
+1. **模块解耦**：各模块通过事件通信，减少直接依赖
+2. **可扩展性**：新功能可以通过监听现有事件轻松集成
+3. **可观测性**：事件提供了系统状态的完整视图
+4. **调试友好**：事件流可以用于调试和问题诊断
+5. **异步协调**：协调复杂的异步操作流程
+
+### 事件命名一致性说明
+
+经过代码审查和更新，事件命名已实现完全一致性：
+
+1. **大小写统一**：所有事件使用蛇形命名法（snake_case），如 `chat_window_opened`、`tool_loop_started`
+2. **前缀统一**：所有事件使用完整 `NeoAI:` 前缀
+3. **动作词统一**：遵循统一的动作后缀规范（`_started`、`_completed`、`_opened`、`_closed` 等）
+
+**当前状态**：所有事件常量已在 `event_constants.lua` 中集中管理，命名完全一致。
+
+### 事件系统演进建议
+
+1. **创建事件常量模块**：集中管理所有事件名称
+2. **添加事件验证**：验证事件数据和格式
+3. **实现事件总线**：提供更高级的事件管理功能
+4. **添加事件文档生成**：自动生成事件文档
+5. **事件性能监控**：监控事件系统的性能指标
+
+### 相关文档
+
+- `docs/EVENTS.md` - 事件系统设计文档
+- `docs/IMPLEMENTED_EVENTS.md` - 已实现事件列表
+- `docs/NATIVE_EVENTS.md` - 原生事件使用示例
+- `examples/native_events.lua` - 事件使用示例代码

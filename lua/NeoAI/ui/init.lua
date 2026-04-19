@@ -18,8 +18,8 @@ local state = {
   config = nil,
   windows = {},
   current_ui_mode = nil, -- 'tree' 或 'chat'
-  event_count = 0,       -- 事件处理计数
-  event_bus = nil,       -- 事件总线引用
+  current_session_id = nil, -- 当前会话ID
+  event_count = 0, -- 事件处理计数
 }
 
 --- 初始化UI模块
@@ -32,40 +32,25 @@ function M.initialize(config)
 
   state.config = config or {}
 
-  -- 延迟加载核心模块（如果存在）
+  -- 延迟加载核心模块（如果存在），但UI模块不应该直接依赖核心模块
+  -- 改为通过事件通信，这里只保留必要的接口
   local success, loaded_core = pcall(require, "NeoAI.core")
   if success then
     core = loaded_core
   else
-    -- 创建模拟核心模块用于测试
+    -- 创建最小化的核心接口，UI模块不应该直接调用核心业务逻辑
     core = {
-      get_session_manager = function()
-        return {
-          get_current_session = function()
-            return { id = "test_session" }
-          end
-        }
-      end,
+      -- 只提供UI层需要的接口，不包含业务逻辑
       get_keymap_manager = function()
+        -- 键位配置是UI层需要的
         return {
           get_keymaps = function()
             return {}
-          end
+          end,
         }
       end,
-      get_event_bus = function()
-        -- 返回一个模拟的事件总线
-        return {
-          on = function(event, callback)
-            -- 模拟事件监听
-          end,
-          emit = function(event, ...)
-            -- 模拟事件触发
-          end
-        }
-      end
     }
-    print("⚠️  核心模块未找到，使用模拟模块进行测试")
+    print("⚠️  核心模块未找到，UI模块使用最小化接口")
   end
 
   -- 准备窗口管理器配置
@@ -76,6 +61,7 @@ function M.initialize(config)
     window_manager_config.window_mode = state.config.ui.window_mode
   end
 
+  -- 设置事件处理器
   -- 初始化子模块
   window_manager.initialize(window_manager_config)
   input_handler.initialize(state.config.input or {})
@@ -85,18 +71,8 @@ function M.initialize(config)
   -- 传递完整配置给聊天窗口，确保虚拟输入框能访问键位配置
   chat_window.initialize(state.config)
 
-  -- 设置事件处理器
-  -- 从核心模块获取事件总线
-  local event_bus = nil
-  if core and core.get_event_bus then
-    event_bus = core.get_event_bus()
-  end
-  
-  -- 保存事件总线引用
-  state.event_bus = event_bus
-  
-  tree_handlers.initialize(event_bus, state.config.handlers or {})
-  chat_handlers.initialize(event_bus, state.config.handlers or {})
+  tree_handlers.initialize(state.config.handlers or {})
+  chat_handlers.initialize(state.config.handlers or {})
 
   state.initialized = true
   return M
@@ -109,28 +85,50 @@ function M.open_tree_ui()
   end
 
   -- 获取当前会话ID
-  local session_manager = core.get_session_manager()
-  local current_session = session_manager and session_manager.get_current_session()
-  local session_id = current_session and current_session.id or "default"
+  -- UI层不应该直接调用核心模块，改为从状态或通过事件获取
+  local session_id = state.current_session_id or "default"
+
+  -- 如果状态中没有会话ID，尝试通过事件获取
+  if session_id == "default" and core and core.get_session_manager then
+    -- 这是向后兼容的代码，新架构应该通过事件通信
+    local session_manager = core.get_session_manager()
+    local current_session = session_manager and session_manager.get_current_session()
+    session_id = current_session and current_session.id or "default"
+  end
 
   -- 关闭现有窗口
   M.close_all_windows()
 
-  -- 打开树窗口
-  local tree_win_id = tree_window.open(session_id)
+  -- 先创建窗口
+  local tree_win_id = window_manager.create_window("tree", {
+    title = "NeoAI 会话树",
+    width = state.config.width or 60,
+    height = state.config.height or 25,
+    border = state.config.border or "rounded",
+  })
+
   if tree_win_id then
-    state.windows.tree = tree_win_id
-    state.current_ui_mode = "tree"
+    -- 打开树窗口，传递窗口ID
+    local success = tree_window.open(session_id, tree_win_id)
+    if success then
+      state.windows.tree = tree_win_id
+      state.current_ui_mode = "tree"
 
-    -- 设置树窗口的按键映射
-    tree_window.set_keymaps(core.get_keymap_manager())
+      -- 设置树窗口的按键映射
+      tree_window.set_keymaps(core.get_keymap_manager())
 
-    -- 聚焦树窗口
-    window_manager.focus_window(tree_win_id)
-    
-    -- 触发树窗口打开事件
-    if state.event_bus and state.event_bus.emit then
-      state.event_bus.emit("tree_window_opened", session_id, "main")
+      -- 聚焦树窗口
+      window_manager.focus_window(tree_win_id)
+
+      -- 触发树窗口打开事件
+      vim.api.nvim_exec_autocmds("User", {
+        pattern = "NeoAI:tree_window_opened",
+        data = { session_id, "main" },
+      })
+    else
+      -- 如果打开失败，关闭窗口
+      window_manager.close_window(tree_win_id)
+      tree_win_id = nil
     end
   end
 end
@@ -155,12 +153,14 @@ function M.open_chat_ui(session_id, branch_id)
 
   -- 如果没有提供参数，使用默认值
   if not session_id then
-    if session_manager and session_manager.get_current_session then
-      -- 获取当前会话，这会自动创建默认会话如果不存在
-      local current_session = session_manager.get_current_session()
+    session_id = state.current_session_id or "default"
+
+    -- 如果状态中没有会话ID，尝试通过事件获取
+    if session_id == "default" and core and core.get_session_manager then
+      -- 这是向后兼容的代码，新架构应该通过事件通信
+      local session_manager = core.get_session_manager()
+      local current_session = session_manager and session_manager.get_current_session()
       session_id = current_session and current_session.id or "default"
-    else
-      session_id = "default"
     end
   end
 
@@ -171,21 +171,36 @@ function M.open_chat_ui(session_id, branch_id)
   -- 关闭现有窗口
   M.close_all_windows()
 
-  -- 打开聊天窗口
-  local chat_win_id = chat_window.open(session_id, branch_id)
+  -- 先创建窗口
+  local chat_win_id = window_manager.create_window("chat", {
+    title = "NeoAI 聊天",
+    width = state.config.width or 80,
+    height = state.config.height or 20,
+    border = state.config.border or "rounded",
+  })
+
   if chat_win_id then
-    state.windows.chat = chat_win_id
-    state.current_ui_mode = "chat"
+    -- 打开聊天窗口，传递窗口ID
+    local success = chat_window.open(session_id, branch_id, chat_win_id)
+    if success then
+      state.windows.chat = chat_win_id
+      state.current_ui_mode = "chat"
 
-    -- 设置聊天窗口的按键映射
-    chat_window.set_keymaps(core.get_keymap_manager())
+      -- 设置聊天窗口的按键映射
+      chat_window.set_keymaps(core.get_keymap_manager())
 
-    -- 聚焦聊天窗口
-    window_manager.focus_window(chat_win_id)
-    
-    -- 触发聊天窗口打开事件
-    if state.event_bus and state.event_bus.emit then
-      state.event_bus.emit("chat_window_opened", session_id, branch_id)
+      -- 聚焦聊天窗口
+      window_manager.focus_window(chat_win_id)
+
+      -- 触发聊天窗口打开事件
+      vim.api.nvim_exec_autocmds("User", {
+        pattern = "NeoAI:chat_window_opened",
+        data = { session_id, branch_id },
+      })
+    else
+      -- 如果打开失败，关闭窗口
+      window_manager.close_window(chat_win_id)
+      chat_win_id = nil
     end
   end
 end
@@ -222,6 +237,7 @@ function M.get_chat_window()
   if state.windows.chat then
     return chat_window
   end
+
   return nil
 end
 
@@ -231,6 +247,7 @@ function M.get_tree_window()
   if state.windows.tree then
     return tree_window
   end
+
   return nil
 end
 
@@ -300,16 +317,16 @@ function M.handle_key_input(key)
 
   -- 增加事件计数
   state.event_count = (state.event_count or 0) + 1
-  
+
   -- 记录事件处理
   print(string.format("UI事件处理: 按键=%s, 计数=%d", key, state.event_count))
-  
+
   -- 如果没有当前UI模式，只记录事件但不处理
   if not state.current_ui_mode then
     print("⚠️  没有当前UI模式，仅记录事件")
     return
   end
-  
+
   -- 避免无限递归，直接调用处理器而不通过handle_key_input
   if state.current_ui_mode == "tree" then
     -- 直接调用树形视图处理器的内部处理逻辑
@@ -369,6 +386,7 @@ function M.update_config(new_config)
   if state.config.window_mode then
     window_manager_config.window_mode = state.config.window_mode
   end
+
   window_manager.update_config(window_manager_config)
   input_handler.update_config(state.config.input or {})
 
@@ -395,7 +413,36 @@ function M.list_windows()
       vim.notify(string.format("无法获取窗口句柄 for %s: %s", window_type, window_id), debug_level)
     end
   end
+
   return windows
+end
+
+--- 获取当前会话ID
+--- @return string|nil 当前会话ID
+function M.get_current_session_id()
+  if not state.initialized then
+    return nil
+  end
+
+  -- UI层不应该直接调用核心模块的会话管理器
+  -- 改为通过状态管理获取会话信息
+  return state.current_session_id or "default"
+end
+
+--- 更新当前会话ID
+--- @param session_id string 会话ID
+function M.update_current_session_id(session_id)
+  if not state.initialized then
+    return
+  end
+
+  state.current_session_id = session_id
+
+  -- 触发会话更新事件，通知其他模块
+  vim.api.nvim_exec_autocmds("User", {
+    pattern = "NeoAI:ui_session_updated",
+    data = { session_id = session_id },
+  })
 end
 
 --- 获取事件处理计数
@@ -410,4 +457,3 @@ function M.reset_event_count()
 end
 
 return M
-

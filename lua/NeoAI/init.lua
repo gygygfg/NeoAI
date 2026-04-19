@@ -109,30 +109,30 @@ local function register_commands()
   end, {
     desc = "显示NeoAI聊天窗口状态",
   })
-
-  -- NeoAITestAll 命令：运行所有测试
-  vim.api.nvim_create_user_command("NeoAITestAll", function()
-    M.test()
-  end, {
-    desc = "运行所有NeoAI测试",
-  })
-
-  -- NeoAITest 命令：运行指定测试
-  vim.api.nvim_create_user_command("NeoAITest", function(opts)
-    M.test(opts.args)
-  end, {
-    desc = "运行指定NeoAI测试",
-    nargs = 1,
-    complete = function()
-      local test_module = require("NeoAI.test")
-      local completions = {}
-      for name, _ in pairs(test_module.tests) do
-        table.insert(completions, name)
-      end
-      return completions
-    end,
-  })
 end
+
+-- NeoAITestAll 命令：运行所有测试
+vim.api.nvim_create_user_command("NeoAITestAll", function()
+  M.test()
+end, {
+  desc = "运行所有NeoAI测试",
+})
+
+-- NeoAITest 命令：运行指定测试
+vim.api.nvim_create_user_command("NeoAITest", function(opts)
+  M.test(opts.args)
+end, {
+  desc = "运行指定NeoAI测试",
+  nargs = 1,
+  complete = function()
+    local test_module = require("NeoAI.tests")
+    local completions = {}
+    for name, _ in pairs(test_module.tests) do
+      table.insert(completions, name)
+    end
+    return completions
+  end,
+})
 
 -- 内部函数：注册全局快捷键
 local function register_global_keymaps()
@@ -214,7 +214,7 @@ function M.setup(user_config)
   local config = default_config.validate_config(user_config)
   config = default_config.merge_defaults(config)
   config = default_config.sanitize_config(config)
-  
+
   -- 添加调试信息，标记配置来源
   config._debug_source = "main_init_lua"
   config._debug_timestamp = os.time()
@@ -290,6 +290,7 @@ function M.get_session_manager()
   if not state.core then
     error("Core not initialized")
   end
+
   return state.core.get_session_manager()
 end
 
@@ -299,6 +300,7 @@ function M.get_ai_engine()
   if not state.core then
     error("Core not initialized")
   end
+
   return state.core.get_ai_engine()
 end
 
@@ -308,6 +310,7 @@ function M.get_tools()
   if not state.tools then
     error("Tools not initialized")
   end
+
   return state.tools
 end
 
@@ -317,6 +320,7 @@ function M.get_keymap_manager()
   if not state.core then
     error("Core not initialized")
   end
+
   return state.core.get_keymap_manager()
 end
 
@@ -324,7 +328,7 @@ end
 --- @param test_name string|nil 可选：指定运行的测试名称，如果为nil则运行所有测试
 function M.test(test_name)
   -- 加载测试模块
-  local test_module = require("NeoAI.test")
+  local test_module = require("NeoAI.tests")
 
   -- 如果指定了测试名称，只运行该测试
   if test_name then
@@ -333,11 +337,26 @@ function M.test(test_name)
       print("🚀 运行指定测试: " .. test_name)
       print(string.rep("=", 50))
 
-      local success, result = pcall(test_to_run.run)
-      if success then
-        print("✅ " .. test_name .. " 测试通过")
+      local pcall_success, pcall_result = pcall(test_to_run.run)
+      if pcall_success then
+        -- pcall成功，检查测试函数的返回值
+        if type(pcall_result) == "table" and #pcall_result >= 1 then
+          local test_success = pcall_result[1]
+          local test_message = pcall_result[2] or ""
+
+          if test_success then
+            print("✅ " .. test_name .. " 测试通过: " .. test_message)
+          else
+            print("❌ " .. test_name .. " 测试失败: " .. test_message)
+          end
+        else
+          -- 测试函数没有返回预期的格式
+          print("⚠️  " .. test_name .. " 测试返回了意外的格式: " .. type(pcall_result))
+          print("❌ " .. test_name .. " 测试失败: 测试函数没有返回正确的格式 {success, message}")
+        end
       else
-        print("❌ " .. test_name .. " 测试失败: " .. tostring(result))
+        -- pcall失败，测试函数抛出了异常
+        print("❌ " .. test_name .. " 测试失败（异常）: " .. tostring(pcall_result))
       end
     else
       print("⚠️ 未找到测试: " .. test_name)

@@ -23,7 +23,7 @@ function M.initialize(options)
     if state.initialized then
         return M
     end
-
+    
     state.event_bus = options.event_bus
     state.config = options.config or {}
 
@@ -47,7 +47,7 @@ function M.initialize(options)
     if state.config.auto_save and state.config.save_path then
         M._load_sessions()
     end
-
+    
     state.initialized = true
     return M
 end
@@ -67,6 +67,7 @@ local function find_empty_session()
             end
         end
     end
+    
     return nil, nil
 end
 
@@ -81,9 +82,8 @@ local function ensure_current_session()
             current_session_id = empty_session_id
             
             -- 触发事件
-            if state.event_bus then
-                state.event_bus.emit("session_reused", current_session_id, empty_session)
-            end
+            vim.api.nvim_exec_autocmds("User", {pattern = "NeoAI:session_reused", data = {current_session_id, empty_session}})
+            
         else
             -- 创建默认会话
             session_counter = session_counter + 1
@@ -102,11 +102,11 @@ local function ensure_current_session()
             }
             
             -- 触发事件
-            if state.event_bus then
-                state.event_bus.emit("session_created", current_session_id, sessions[current_session_id])
-            end
+            vim.api.nvim_exec_autocmds("User", {pattern = "NeoAI:session_created", data = {current_session_id, sessions[current_session_id]}})
+            
         end
     end
+    
     return current_session_id
 end
 
@@ -117,7 +117,7 @@ function M.create_session(name)
     if not state.initialized then
         error("Session manager not initialized")
     end
-
+    
     session_counter = session_counter + 1
     local session_id = "session_" .. session_counter
 
@@ -146,15 +146,13 @@ function M.create_session(name)
     session.branches[branch_id] = true
 
     -- 触发事件
-    if state.event_bus then
-        state.event_bus.emit("session_created", session_id, session)
-    end
-
+    vim.api.nvim_exec_autocmds("User", {pattern = "NeoAI:session_created", data = {session_id, session}})
+    
     -- 自动保存
     if state.config.auto_save then
         M._save_sessions()
     end
-
+    
     return session_id
 end
 
@@ -165,6 +163,7 @@ function M.get_session(session_id)
     if not session_id then
         return nil
     end
+    
     return vim.deepcopy(sessions[session_id])
 end
 
@@ -174,6 +173,7 @@ function M.get_current_session()
     if not current_session_id then
         ensure_current_session()
     end
+    
     return M.get_session(current_session_id)
 end
 
@@ -183,12 +183,11 @@ function M.set_current_session(session_id)
     if not sessions[session_id] then
         error("Session not found: " .. session_id)
     end
+    
     current_session_id = session_id
 
     -- 触发事件
-    if state.event_bus then
-        state.event_bus.emit("session_changed", session_id, sessions[session_id])
-    end
+    vim.api.nvim_exec_autocmds("User", {pattern = "NeoAI:session_changed", data = {session_id, sessions[session_id]}})
 end
 
 --- 列出所有会话
@@ -204,6 +203,7 @@ function M.list_sessions()
             branch_count = #vim.tbl_keys(session.branches)
         })
     end
+    
     return result
 end
 
@@ -214,13 +214,13 @@ function M.delete_session(session_id)
     if not sessions[session_id] then
         return false
     end
-
+    
     -- 删除所有分支
     local session = sessions[session_id]
     for branch_id, _ in pairs(session.branches) do
         branch_manager.delete_branch(branch_id)
     end
-
+    
     -- 删除会话
     sessions[session_id] = nil
 
@@ -232,12 +232,10 @@ function M.delete_session(session_id)
             current_session_id = session_list[1].id
         end
     end
-
+    
     -- 触发事件
-    if state.event_bus then
-        state.event_bus.emit("session_deleted", session_id)
-    end
-
+    vim.api.nvim_exec_autocmds("User", {pattern = "NeoAI:session_deleted", data = {session_id}})
+    
     -- 自动保存
     if state.config.auto_save then
         M._save_sessions()
@@ -296,6 +294,7 @@ function M._load_sessions()
             end
         end
     end
+end
     
     -- 设置当前会话为最新的会话
     local latest_session = nil
@@ -311,7 +310,6 @@ function M._load_sessions()
     if latest_session then
         current_session_id = latest_session
     end
-end
 
 --- 重置会话管理器（主要用于测试）
 function M.reset()

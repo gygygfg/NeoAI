@@ -4,7 +4,6 @@ local config_manager = require("NeoAI.core.config.config_manager")
 local keymap_manager = require("NeoAI.core.config.keymap_manager")
 local session_manager = require("NeoAI.core.session.session_manager")
 local ai_engine = require("NeoAI.core.ai.ai_engine")
-local event_bus = require("NeoAI.core.events.event_bus")
 
 -- 模块状态
 local state = {
@@ -24,9 +23,8 @@ function M.initialize(core_config)
     return M
   end
 
-  -- 初始化事件总线
-  state.event_bus = event_bus
-  state.event_bus.initialize()
+  -- 不再使用event_bus兼容层，直接使用Neovim原生事件系统
+  state.event_bus = nil
 
   -- 初始化配置管理器
   config_manager.initialize(core_config or {})
@@ -47,13 +45,11 @@ function M.initialize(core_config)
 
   -- 初始化会话管理器
   state.session_mgr = session_manager.initialize({
-    event_bus = state.event_bus,
     config = config_manager.get("session") or {},
   })
 
   -- 初始化AI引擎
   state.ai_engine = ai_engine.initialize({
-    event_bus = state.event_bus,
     config = config_manager.get("ai") or {},
     session_manager = state.session_mgr,
   })
@@ -70,6 +66,7 @@ function M.get_session_manager()
   if not state.initialized then
     error("Core not initialized")
   end
+
   return state.session_mgr
 end
 
@@ -79,17 +76,11 @@ function M.get_ai_engine()
   if not state.initialized then
     error("Core not initialized")
   end
+
   return state.ai_engine
 end
 
---- 获取事件总线
---- @return table 事件总线
-function M.get_event_bus()
-  if not state.initialized then
-    error("Core not initialized")
-  end
-  return state.event_bus
-end
+-- 注意：get_event_bus函数已被移除，请直接使用Neovim原生事件系统
 
 --- 获取配置管理器
 --- @return table 配置管理器
@@ -103,6 +94,7 @@ function M.get_keymap_manager()
   if not state.initialized then
     error("Core not initialized")
   end
+
   return state.keymap_mgr
 end
 

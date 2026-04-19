@@ -4,4 +4,5 @@ output.txt
 *test*
 *fix*
 *example*
-!./lua/NeoAI/test/
+!lua/NeoAI/tests/
+!lua/NeoAI/tests/*.lua

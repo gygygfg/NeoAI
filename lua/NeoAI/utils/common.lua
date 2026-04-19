@@ -6,19 +6,16 @@ local M = {}
 function M.deep_copy(tbl)
     if type(tbl) ~= "table" then
         return tbl
-    end
-
+    
     local result = {}
     for k, v in pairs(tbl) do
         if type(v) == "table" then
             result[k] = M.deep_copy(v)
         else
             result[k] = v
-        end
-    end
-
+        
+    
     return result
-end
 
 --- 深度合并表
 --- @param t1 table 目标表
@@ -27,8 +24,7 @@ end
 function M.deep_merge(t1, t2)
     if type(t1) ~= "table" or type(t2) ~= "table" then
         return t2 or t1
-    end
-
+    
     local result = M.deep_copy(t1)
     
     for k, v in pairs(t2) do
@@ -36,11 +32,9 @@ function M.deep_merge(t1, t2)
             result[k] = M.deep_merge(result[k], v)
         else
             result[k] = v
-        end
-    end
-
+        
+    
     return result
-end
 
 --- 安全调用函数
 --- @param func function 要调用的函数
@@ -49,15 +43,13 @@ end
 function M.safe_call(func, ...)
     if type(func) ~= "function" then
         return nil, "不是函数"
-    end
-
+    
     local ok, result = pcall(func, ...)
     if ok then
         return result
     else
         return nil, result
-    end
-end
+    
 
 --- 防抖函数
 --- @param func function 要防抖的函数
@@ -72,13 +64,11 @@ function M.debounce(func, delay)
         
         if timer then
             timer:close()
-        end
-
+        
         timer = vim.defer_fn(function()
             func(unpack(args))
         end, delay)
-    end
-end
+    
 
 --- 节流函数
 --- @param func function 要节流的函数
@@ -100,16 +90,14 @@ function M.throttle(func, limit)
             -- 如果已经有定时器，取消它
             if timer then
                 timer:close()
-            end
-
+            
             -- 设置新的定时器
             timer = vim.defer_fn(function()
                 last_call = vim.loop.now()
                 func(unpack(args))
             end, limit - (now - last_call))
-        end
-    end
-end
+        
+    
 
 --- 生成唯一ID
 --- @param prefix string 前缀
@@ -119,7 +107,6 @@ function M.unique_id(prefix)
     local time = os.time()
     local random = math.random(1000, 9999)
     return string.format("%s_%d_%d", prefix, time, random)
-end
 
 --- 检查值是否为空
 --- @param value any 要检查的值
@@ -127,18 +114,14 @@ end
 function M.is_empty(value)
     if value == nil then
         return true
-    end
-
+    
     if type(value) == "string" then
         return value == ""
-    end
-
+    
     if type(value) == "table" then
         return next(value) == nil
-    end
-
+    
     return false
-end
 
 --- 默认值
 --- @param value any 值
@@ -147,9 +130,8 @@ end
 function M.default(value, default)
     if value == nil or (type(value) == "string" and value == "") then
         return default
-    end
+    
     return value
-end
 
 --- 等待一段时间
 --- @param ms number 毫秒数
@@ -157,15 +139,13 @@ function M.sleep(ms)
     local start = vim.loop.now()
     while vim.loop.now() - start < ms do
         -- 空循环
-    end
-end
+    
 
 --- 异步等待
 --- @param ms number 毫秒数
 --- @param callback function 回调函数
 function M.sleep_async(ms, callback)
     vim.defer_fn(callback, ms)
-end
 
 --- 重试函数
 --- @param func function 要重试的函数
@@ -186,12 +166,10 @@ function M.retry(func, max_attempts, delay)
             last_error = result
             if attempt < max_attempts then
                 M.sleep(delay)
-            end
-        end
-    end
-
+            
+        
+    
     error("重试失败: " .. tostring(last_error))
-end
 
 --- 测量函数执行时间
 --- @param func function 要测量的函数
@@ -208,8 +186,7 @@ function M.measure_time(func, ...)
         return unpack(result, 2), duration_ms
     else
         error(result[2])
-    end
-end
+    
 
 --- 创建缓存函数
 --- @param func function 要缓存的函数
@@ -225,8 +202,7 @@ function M.cache(func, ttl)
 
         if cached and os.time() - cached.timestamp < ttl then
             return cached.value
-        end
-
+        
         local value = func(...)
         cache[key] = {
             value = value,
@@ -234,15 +210,13 @@ function M.cache(func, ttl)
         }
 
         return value
-    end
-end
+    
 
 --- 清空缓存
 --- @param cache_func function 缓存函数
 function M.clear_cache(cache_func)
     -- 这个函数需要缓存函数有特定的实现
     -- 目前是占位符
-end
 
 --- 生成随机字符串
 --- @param length number 长度
@@ -255,10 +229,8 @@ function M.random_string(length)
     for i = 1, length do
         local rand = math.random(1, #chars)
         result = result .. chars:sub(rand, rand)
-    end
     
     return result
-end
 
 --- 检查类型
 --- @param value any 值
@@ -273,8 +245,7 @@ function M.check_type(value, expected_type)
         return actual_type == "table" and not (#value > 0)
     else
         return actual_type == expected_type
-    end
-end
+    
 
 --- 合并表（merge_tables 是 deep_merge 的别名）
 --- @param t1 table 目标表
@@ -282,6 +253,5 @@ end
 --- @return table 合并后的表
 function M.merge_tables(t1, t2)
     return M.deep_merge(t1, t2)
-end
 
 return M

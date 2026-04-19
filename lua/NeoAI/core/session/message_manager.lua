@@ -17,7 +17,7 @@ function M.initialize(options)
     if state.initialized then
         return
     end
-
+    
     state.event_bus = options.event_bus
     state.config = options.config or {}
     state.initialized = true
@@ -33,15 +33,15 @@ function M.add_message(branch_id, role, content, metadata)
     if not state.initialized then
         error("Message manager not initialized")
     end
-
+    
     if not branch_id then
         error("Branch ID is required")
     end
-
+    
     if not role or not (role == "user" or role == "assistant" or role == "tool") then
         error("Role must be 'user', 'assistant', or 'tool'")
     end
-
+    
     message_counter = message_counter + 1
     local message_id = "msg_" .. message_counter
 
@@ -58,10 +58,8 @@ function M.add_message(branch_id, role, content, metadata)
     messages[message_id] = message
 
     -- 触发事件
-    if state.event_bus then
-        state.event_bus.emit("message_added", message_id, message)
-    end
-
+    vim.api.nvim_exec_autocmds("User", {pattern = "NeoAI:message_added", data = {message_id, message}})
+    
     return message_id
 end
 
@@ -73,7 +71,7 @@ function M.get_messages(branch_id, limit)
     if not branch_id then
         return {}
     end
-
+    
     local result = {}
     local count = 0
 
@@ -84,7 +82,7 @@ function M.get_messages(branch_id, limit)
             table.insert(message_ids, { id = id, created_at = msg.created_at })
         end
     end
-
+    
     -- 按时间排序
     table.sort(message_ids, function(a, b)
         return a.created_at < b.created_at
@@ -95,10 +93,11 @@ function M.get_messages(branch_id, limit)
         if limit and count >= limit then
             break
         end
+        
         table.insert(result, vim.deepcopy(messages[item.id]))
         count = count + 1
     end
-
+    
     return result
 end
 
@@ -109,15 +108,13 @@ function M.edit_message(message_id, content)
     if not messages[message_id] then
         error("Message not found: " .. message_id)
     end
-
+    
     local old_content = messages[message_id].content
     messages[message_id].content = content
     messages[message_id].updated_at = os.time()
 
     -- 触发事件
-    if state.event_bus then
-        state.event_bus.emit("message_edited", message_id, old_content, content)
-    end
+    vim.api.nvim_exec_autocmds("User", {pattern = "NeoAI:message_edited", data = {message_id, old_content, content}})
 end
 
 --- 删除消息
@@ -126,14 +123,12 @@ function M.delete_message(message_id)
     if not messages[message_id] then
         return
     end
-
+    
     local message = messages[message_id]
     messages[message_id] = nil
 
     -- 触发事件
-    if state.event_bus then
-        state.event_bus.emit("message_deleted", message_id, message)
-    end
+    vim.api.nvim_exec_autocmds("User", {pattern = "NeoAI:message_deleted", data = {message_id, message}})
 end
 
 --- 清空消息
@@ -142,7 +137,7 @@ function M.clear_messages(branch_id)
     if not branch_id then
         return
     end
-
+    
     local deleted_ids = {}
     for id, msg in pairs(messages) do
         if msg.branch_id == branch_id then
@@ -150,11 +145,9 @@ function M.clear_messages(branch_id)
             table.insert(deleted_ids, id)
         end
     end
-
+    
     -- 触发事件
-    if state.event_bus then
-        state.event_bus.emit("messages_cleared", branch_id, deleted_ids)
-    end
+    vim.api.nvim_exec_autocmds("User", {pattern = "NeoAI:messages_cleared", data = {branch_id, deleted_ids}})
 end
 
 --- 获取消息数量
@@ -164,14 +157,14 @@ function M.get_message_count(branch_id)
     if not branch_id then
         return 0
     end
-
+    
     local count = 0
     for _, msg in pairs(messages) do
         if msg.branch_id == branch_id then
             count = count + 1
         end
     end
-
+    
     return count
 end
 
@@ -182,7 +175,7 @@ function M.get_latest_message(branch_id)
     if not branch_id then
         return nil
     end
-
+    
     local latest_msg = nil
     for _, msg in pairs(messages) do
         if msg.branch_id == branch_id then
@@ -191,7 +184,7 @@ function M.get_latest_message(branch_id)
             end
         end
     end
-
+    
     return vim.deepcopy(latest_msg)
 end
 

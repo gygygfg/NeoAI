@@ -28,7 +28,7 @@ function M.initialize(default_keymaps, user_keymaps)
           DEFAULT_KEYMAPS[context] = {}
           current_keymaps[context] = {}
         end
-        
+
         for action, key_config in pairs(keymap_table) do
           if type(key_config) == "table" and key_config.key then
             M.set_keymap(context, action, key_config.key, key_config.desc)
@@ -184,6 +184,7 @@ function M.list_keymaps(context)
       vim.notify(string.format("[NeoAI] 无效的键位上下文: %s", context), vim.log.levels.WARN)
       return {}
     end
+
     return vim.deepcopy(current_keymaps[context])
   else
     return vim.deepcopy(current_keymaps)
@@ -249,6 +250,7 @@ function M.save_keymaps()
     if not file then
       error("无法打开文件: " .. config_file_path)
     end
+
     file:write(json)
     file:close()
   end)
@@ -317,6 +319,7 @@ function M.get_available_contexts()
   for context in pairs(DEFAULT_KEYMAPS) do
     table.insert(contexts, context)
   end
+
   return contexts
 end
 
@@ -338,6 +341,7 @@ function M.get_available_actions(context)
   for action in pairs(DEFAULT_KEYMAPS[context]) do
     table.insert(actions, action)
   end
+
   return actions
 end
 
@@ -364,6 +368,7 @@ function M.export_formatted()
         if key_config.desc then
           line = line .. string.format(" (%s)", key_config.desc)
         end
+
         if not is_default then
           line = line .. string.format(" [默认: %s]", default_key)
         end

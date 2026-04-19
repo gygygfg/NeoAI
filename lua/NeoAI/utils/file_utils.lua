@@ -7,7 +7,7 @@ function M.read_file(path)
     if not path then
         return nil, "路径不能为空"
     end
-
+    
     local file, err = io.open(path, "r")
     if not file then
         -- 检查文件是否存在
@@ -18,7 +18,7 @@ function M.read_file(path)
             return nil, "无法打开文件: " .. (err or "未知错误")
         end
     end
-
+    
     local content = file:read("*a")
     file:close()
 
@@ -34,17 +34,17 @@ function M.write_file(path, content, append)
     if not path then
         return nil, "路径不能为空"
     end
-
+    
     if content == nil then
         content = ""
     end
-
+    
     local mode = append and "a" or "w"
     local file, err = io.open(path, mode)
     if not file then
         return nil, "无法打开文件: " .. (err or "未知错误")
     end
-
+    
     local success, write_err = pcall(function()
         file:write(content)
         file:close()
@@ -53,7 +53,7 @@ function M.write_file(path, content, append)
     if not success then
         return nil, "写入失败: " .. (write_err or "未知错误")
     end
-
+    
     return true
 end
 
@@ -64,17 +64,17 @@ function M.read_lines(path)
     if not path then
         return nil, "路径不能为空"
     end
-
+    
     local content, err = M.read_file(path)
     if not content then
         return nil, err
     end
-
+    
     local lines = {}
     for line in content:gmatch("[^\n]+") do
         table.insert(lines, line)
     end
-
+    
     -- 处理最后一行可能没有换行符的情况
     if content:sub(-1) ~= "\n" and content ~= "" then
         local last_line = content:match("[^\n]+$")
@@ -82,7 +82,7 @@ function M.read_lines(path)
             table.insert(lines, last_line)
         end
     end
-
+    
     return lines
 end
 
@@ -95,16 +95,16 @@ function M.write_lines(path, lines, append)
     if not path then
         return nil, "路径不能为空"
     end
-
+    
     if not lines or type(lines) ~= "table" then
         return nil, "行列表无效"
     end
-
+    
     local content = table.concat(lines, "\n")
     if #lines > 0 then
         content = content .. "\n"
     end
-
+    
     return M.write_file(path, content, append)
 end
 
@@ -115,13 +115,13 @@ function M.exists(path)
     if not path then
         return false
     end
-
+    
     local file, err = io.open(path, "r")
     if file then
         file:close()
         return true
     end
-
+    
     return false
 end
 
@@ -132,12 +132,12 @@ function M.dir_exists(path)
     if not path then
         return false
     end
-
+    
     local ok, stat = pcall(vim.loop.fs_stat, path)
     if ok and stat then
         return stat.type == "directory"
     end
-
+    
     return false
 end
 
@@ -148,12 +148,12 @@ function M.mkdir(dir)
     if not dir then
         return nil, "目录路径不能为空"
     end
-
+    
     -- 检查目录是否已存在
     if M.exists(dir) then
         return true
     end
-
+    
     -- 创建目录
     local cmd = string.format('mkdir -p "%s"', dir)
     local result = os.execute(cmd)
@@ -181,7 +181,7 @@ function M.join_path(...)
             end
         end
     end
-
+    
     -- 规范化路径
     result = result:gsub("/+", "/")
     result = result:gsub("/$", "")
@@ -196,14 +196,14 @@ function M.get_extension(path)
     if not path then
         return ""
     end
-
+    
     local filename = M.get_filename(path)
     local dot_index = filename:reverse():find("%.")
 
     if dot_index then
         return filename:sub(-dot_index + 1)
     end
-
+    
     return ""
 end
 
@@ -214,18 +214,18 @@ function M.get_filename(path)
     if not path then
         return ""
     end
-
+    
     local separator = package.config:sub(1, 1) -- 获取路径分隔符
     local parts = {}
     
     for part in path:gmatch("[^" .. separator .. "]+") do
         table.insert(parts, part)
     end
-
+    
     if #parts > 0 then
         return parts[#parts]
     end
-
+    
     return ""
 end
 
@@ -236,21 +236,21 @@ function M.get_dirname(path)
     if not path then
         return ""
     end
-
+    
     local separator = package.config:sub(1, 1)
     local parts = {}
     
     for part in path:gmatch("[^" .. separator .. "]+") do
         table.insert(parts, part)
     end
-
+    
     if #parts > 1 then
         table.remove(parts, #parts)
         return table.concat(parts, separator)
     elseif #parts == 1 then
         return "."
     end
-
+    
     return ""
 end
 
@@ -261,12 +261,12 @@ function M.get_file_size(path)
     if not path then
         return nil
     end
-
+    
     local file, err = io.open(path, "r")
     if not file then
         return nil
     end
-
+    
     local size = file:seek("end")
     file:close()
 
@@ -280,12 +280,12 @@ function M.get_mtime(path)
     if not path then
         return nil
     end
-
+    
     local ok, stat = pcall(vim.loop.fs_stat, path)
     if ok and stat then
         return stat.mtime.sec
     end
-
+    
     return nil
 end
 
@@ -297,12 +297,12 @@ function M.copy_file(src, dst)
     if not src or not dst then
         return nil, "源路径和目标路径不能为空"
     end
-
+    
     local content, err = M.read_file(src)
     if not content then
         return nil, "无法读取源文件: " .. err
     end
-
+    
     return M.write_file(dst, content)
 end
 
@@ -314,13 +314,13 @@ function M.move_file(src, dst)
     if not src or not dst then
         return nil, "源路径和目标路径不能为空"
     end
-
+    
     -- 先复制
     local ok, err = M.copy_file(src, dst)
     if not ok then
         return nil, "复制失败: " .. err
     end
-
+    
     -- 然后删除源文件
     local del_ok, del_err = M.delete_file(src)
     if not del_ok then
@@ -328,7 +328,7 @@ function M.move_file(src, dst)
         M.delete_file(dst)
         return nil, "移动失败（无法删除源文件）: " .. del_err
     end
-
+    
     return true
 end
 
@@ -339,7 +339,7 @@ function M.delete_file(path)
     if not path then
         return nil, "路径不能为空"
     end
-
+    
     local ok, err = os.remove(path)
     if ok then
         return true
@@ -356,7 +356,7 @@ function M.list_dir(dir, pattern)
     if not dir then
         return nil, "目录路径不能为空"
     end
-
+    
     pattern = pattern or "*"
 
     local files = {}
@@ -369,6 +369,7 @@ function M.list_dir(dir, pattern)
                 table.insert(files, line)
             end
         end
+        
         handle:close()
         return files
     else
@@ -384,7 +385,7 @@ function M.list_dir_recursive(dir, pattern)
     if not dir then
         return nil, "目录路径不能为空"
     end
-
+    
     pattern = pattern or "*"
 
     local files = {}
@@ -395,12 +396,14 @@ function M.list_dir_recursive(dir, pattern)
         for line in handle:lines() do
             table.insert(files, line)
         end
+        
         handle:close()
         return files
     else
         return nil, "无法递归列出目录"
     end
 end
+    
 
 --- 列出文件（list_files 是 list_dir_recursive 的别名）
 --- @param dir string 目录路径
@@ -417,12 +420,12 @@ function M.is_directory(path)
     if not path then
         return false
     end
-
+    
     local ok, stat = pcall(vim.loop.fs_stat, path)
     if ok and stat then
         return stat.type == "directory"
     end
-
+    
     return false
 end
 
@@ -433,12 +436,12 @@ function M.is_file(path)
     if not path then
         return false
     end
-
+    
     local ok, stat = pcall(vim.loop.fs_stat, path)
     if ok and stat then
         return stat.type == "file"
     end
-
+    
     return false
 end
 
@@ -449,13 +452,13 @@ function M.abs_path(path)
     if not path then
         return ""
     end
-
+    
     -- 如果是相对路径，转换为绝对路径
     if path:sub(1, 1) ~= "/" then
         local cwd = vim.fn.getcwd()
         path = M.join_path(cwd, path)
     end
-
+    
     return path
 end
 
@@ -466,7 +469,7 @@ function M.normalize_path(path)
     if not path then
         return ""
     end
-
+    
     -- 替换多个斜杠为单个斜杠
     path = path:gsub("/+", "/")
     
@@ -484,7 +487,7 @@ function M.normalize_path(path)
             table.insert(parts, part)
         end
     end
-
+    
     return "/" .. table.concat(parts, "/")
 end
 

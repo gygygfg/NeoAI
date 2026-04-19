@@ -18,7 +18,7 @@ function M.initialize(options)
     if state.initialized then
         return
     end
-
+    
     state.event_bus = options.event_bus
     state.config = options.config or {}
     state.initialized = true
@@ -32,7 +32,7 @@ function M.create_branch(parent_id, name)
     if not state.initialized then
         error("Branch manager not initialized")
     end
-
+    
     branch_counter = branch_counter + 1
     local branch_id = "branch_" .. branch_counter
 
@@ -51,15 +51,13 @@ function M.create_branch(parent_id, name)
     if parent_id and branches[parent_id] then
         table.insert(branches[parent_id].children, branch_id)
     end
-
+    
     -- 设置当前分支
     current_branch_id = branch_id
 
     -- 触发事件
-    if state.event_bus then
-        state.event_bus.emit("branch_created", branch_id, branch)
-    end
-
+    vim.api.nvim_exec_autocmds("User", {pattern = "NeoAI:branch_created", data = {branch_id, branch}})
+    
     return branch_id
 end
 
@@ -69,14 +67,12 @@ function M.switch_branch(branch_id)
     if not branches[branch_id] then
         error("Branch not found: " .. branch_id)
     end
-
+    
     local old_branch_id = current_branch_id
     current_branch_id = branch_id
 
     -- 触发事件
-    if state.event_bus then
-        state.event_bus.emit("branch_switched", branch_id, old_branch_id)
-    end
+    vim.api.nvim_exec_autocmds("User", {pattern = "NeoAI:branch_switched", data = {branch_id, old_branch_id}})
 end
 
 --- 获取分支树
@@ -92,7 +88,7 @@ function M.get_branch_tree(session_id)
             table.insert(root_branches, M._build_tree_node(branch_id))
         end
     end
-
+    
     return root_branches
 end
 
@@ -102,14 +98,14 @@ function M.delete_branch(branch_id)
     if not branches[branch_id] then
         return
     end
-
+    
     local branch = branches[branch_id]
 
     -- 递归删除子分支
     for _, child_id in ipairs(branch.children) do
         M.delete_branch(child_id)
     end
-
+    
     -- 从父分支中移除
     if branch.parent_id and branches[branch.parent_id] then
         local parent = branches[branch.parent_id]
@@ -120,7 +116,7 @@ function M.delete_branch(branch_id)
             end
         end
     end
-
+    
     -- 删除分支
     branches[branch_id] = nil
 
@@ -132,11 +128,9 @@ function M.delete_branch(branch_id)
             break
         end
     end
-
+    
     -- 触发事件
-    if state.event_bus then
-        state.event_bus.emit("branch_deleted", branch_id)
-    end
+    vim.api.nvim_exec_autocmds("User", {pattern = "NeoAI:branch_deleted", data = {branch_id}})
 end
 
 --- 获取当前分支
@@ -180,7 +174,7 @@ function M._build_tree_node(branch_id)
     if not branch then
         return nil
     end
-
+    
     local node = {
         id = branch_id,
         name = branch.name,
@@ -194,7 +188,7 @@ function M._build_tree_node(branch_id)
             table.insert(node.children, child_node)
         end
     end
-
+    
     return node
 end
 

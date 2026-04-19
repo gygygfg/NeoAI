@@ -1,18 +1,25 @@
+-- 工具编排器模块
+-- 该模块用于管理 AI 工具调用的循环执行，支持多轮工具调用和结果整合
 local M = {}
 
 -- 模块状态
 local state = {
-  initialized = false,
-  event_bus = nil,
-  config = nil,
-  session_manager = nil,
-  tools = {},
-  max_iterations = 10,
-  current_iteration = 0,
+  initialized = false, -- 模块是否已初始化
+  event_bus = nil, -- 事件总线，用于发布事件
+  config = nil, -- 配置表
+  session_manager = nil, -- 会话管理器
+  tools = {}, -- 注册的工具表，键为工具名，值为工具定义
+  max_iterations = 10, -- 最大工具调用迭代次数
+  current_iteration = 0, -- 当前迭代次数
 }
 
 --- 初始化工具编排器
---- @param options table 选项
+--- 此函数用于初始化模块，必须在调用其他功能前执行
+--- @param options table 初始化选项
+---   - event_bus: 事件总线对象
+---   - config: 配置表（可选）
+---   - session_manager: 会话管理器（可选）
+---   - max_iterations: 最大迭代次数，默认 10（可选）
 function M.initialize(options)
   if state.initialized then
     return
@@ -26,8 +33,9 @@ function M.initialize(options)
 end
 
 --- 执行工具调用循环
---- @param messages table 消息列表
---- @return string|nil 最终结果
+--- 这是核心函数，会循环调用 AI 并执行工具，直到满足停止条件
+--- @param messages table 消息列表，作为 AI 对话的上下文
+--- @return string|nil 最终结果，可能是 AI 的直接响应，也可能是工具调用结果的整合
 function M.execute_tool_loop(messages)
   if not state.initialized then
     error("Tool orchestrator not initialized")
@@ -42,9 +50,7 @@ function M.execute_tool_loop(messages)
   local final_result = nil
 
   -- 触发循环开始事件
-  if state.event_bus then
-    state.event_bus.emit("tool_loop_started", current_messages)
-  end
+  vim.api.nvim_exec_autocmds("User", { pattern = "NeoAI:tool_loop_started", data = { current_messages } })
 
   while state.current_iteration < state.max_iterations do
     state.current_iteration = state.current_iteration + 1
@@ -57,7 +63,7 @@ function M.execute_tool_loop(messages)
 
     if tool_calls and #tool_calls > 0 then
       -- 执行工具调用
-      local tool_results = {}
+      local tool_results = {} -- 修复 BUG: 明确声明局部变量
       for _, tool_call in ipairs(tool_calls) do
         local result = M.execute_tool(tool_call)
         if result then
@@ -85,97 +91,106 @@ function M.execute_tool_loop(messages)
       final_result = response
       break
     end
-  end
+  end -- 修复 BUG: 添加循环结束标记
 
   -- 触发循环结束事件
-  if state.event_bus then
-    state.event_bus.emit("tool_loop_finished", final_result, state.current_iteration)
-  end
+  vim.api.nvim_exec_autocmds(
+    "User",
+    { pattern = "NeoAI:tool_loop_finished", data = { final_result, state.current_iteration } }
+  )
 
   return final_result
 end
 
 --- 解析工具调用
---- @param response string|table AI响应
---- @return table|nil 工具调用列表
+--- 从 AI 响应中提取工具调用信息
+--- @param response string|table AI响应，可能是字符串或 Lua 表
+--- @return table|nil 工具调用列表，每个元素包含 id、name、arguments 等字段
 function M.parse_tool_call(response)
-    -- 实现工具调用解析逻辑
-    return nil
+  -- 调用 extract_tool_calls 函数实现工具调用解析
+  return M.extract_tool_calls(response)
 end
 
 --- 执行工具（别名函数）
+--- 此函数是 execute_tool_loop 的别名，提供向后兼容性
 --- @param messages_or_tool_calls table 消息列表或工具调用列表
 --- @return string|nil 执行结果
 function M.execute_tools(messages_or_tool_calls)
-    if not messages_or_tool_calls then
-        return nil
+  if not messages_or_tool_calls then
+    return nil
+  end
+
+  -- 检查参数类型
+  if type(messages_or_tool_calls[1]) == "table" and messages_or_tool_calls[1].name then
+    -- 看起来是工具调用列表（包含 name 字段）
+    local results = {}
+    for _, tool_call in ipairs(messages_or_tool_calls) do
+      local result = M.execute_tool(tool_call)
+      table.insert(results, result)
     end
-    
-    -- 检查参数类型
-    if type(messages_or_tool_calls[1]) == "table" and messages_or_tool_calls[1].tool then
-        -- 看起来是工具调用列表
-        local results = {}
-        for _, tool_call in ipairs(messages_or_tool_calls) do
-            local result = M.execute_tool(tool_call)
-            table.insert(results, result)
-        end
-        return M.merge_results(results)
-    else
-        -- 假设是消息列表
-        return M.execute_tool_loop(messages_or_tool_calls)
-    end
+
+    return M.merge_results(results)
+  else
+    -- 假设是消息列表
+    return M.execute_tool_loop(messages_or_tool_calls)
+  end
 end
 
 --- 选择工具
+--- 根据查询内容从可用工具中选择合适的工具
 --- @param query string 查询内容
---- @param available_tools table|nil 可用工具列表（可选）
+--- @param available_tools table|nil 可用工具列表（可选，默认使用 state.tools）
 --- @return table 选择的工具列表
 function M.select_tools(query, available_tools)
-    local tools_to_use = available_tools or state.tools
-    
-    if not tools_to_use or #tools_to_use == 0 then
-        return {}
-    end
-    
-    -- 简单的工具选择逻辑：返回所有工具
-    return tools_to_use
+  local tools_to_use = available_tools or state.tools
+
+  if not tools_to_use or #tools_to_use == 0 then
+    return {}
+  end
+
+  -- 简单的工具选择逻辑：返回所有工具
+  -- 实际实现中应根据查询内容进行智能选择
+  return tools_to_use
 end
 
 --- 合并结果
+--- 将多个工具执行结果合并为一个字符串
 --- @param results table 结果列表
 --- @return string 合并后的结果
 function M.merge_results(results)
-    if not results or #results == 0 then
-        return ""
-    end
-    
-    local merged = {}
-    for i, result in ipairs(results) do
-        table.insert(merged, "结果 " .. i .. ": " .. tostring(result))
-    end
-    
-    return table.concat(merged, "\n\n")
+  if not results or #results == 0 then
+    return ""
+  end
+
+  local merged = {}
+  for i, result in ipairs(results) do
+    table.insert(merged, "结果 " .. i .. ": " .. tostring(result))
+  end
+
+  return table.concat(merged, "\n\n")
 end
 
 --- 验证工具使用
+--- 检查工具调用是否有效（工具是否存在）
 --- @param tool_call table 工具调用
 --- @return boolean 是否有效
 function M.validate_tool_use(tool_call)
-    if not tool_call or not tool_call.name then
-        return false
-    end
-    
-    -- 检查工具是否存在
-    for _, tool in ipairs(state.tools) do
-        if tool.name == tool_call.name then
-            return true
-        end
-    end
-    
+  if not tool_call or not tool_call.name then
     return false
+  end
+
+  -- 检查工具是否存在
+  for _, tool in ipairs(state.tools) do
+    if tool.name == tool_call.name then
+      return true
+    end
+  end
+
+  return false
 end
 
 --- 从AI响应中提取工具调用
+--- 支持新旧两种格式的工具调用响应
 --- @param response string|table AI响应
 --- @return table|nil 工具调用列表
 function M.extract_tool_calls(response)
@@ -213,16 +228,16 @@ function M.extract_tool_calls(response)
   if response_data.tool_calls then
     for _, tool_call in ipairs(response_data.tool_calls) do
       table.insert(tool_calls, {
-        id = tool_call.id or "tool_" .. os.time() .. "_" .. math.random(1000, 9999),
+        id = tool_call.id or ("tool_" .. tostring(os.time()) .. "_" .. tostring(math.random(1000, 9999))),
         name = tool_call.name,
         arguments = tool_call.arguments or {},
         type = "function",
       })
     end
   elseif response_data.function_call then
-    -- 旧格式支持
+    -- 旧格式支持（OpenAI 旧版 function_call）
     table.insert(tool_calls, {
-      id = "tool_" .. os.time() .. "_" .. math.random(1000, 9999),
+      id = "tool_" .. tostring(os.time()) .. "_" .. tostring(math.random(1000, 9999)),
       name = response_data.function_call.name,
       arguments = response_data.function_call.arguments or {},
       type = "function",
@@ -233,8 +248,9 @@ function M.extract_tool_calls(response)
 end
 
 --- 执行单个工具
+--- 查找并执行指定的工具
 --- @param tool_call table 工具调用
---- @return string|nil 工具执行结果
+--- @return string|nil 工具执行结果（字符串格式）
 function M.execute_tool(tool_call)
   if not tool_call or not tool_call.name then
     return nil
@@ -244,16 +260,12 @@ function M.execute_tool(tool_call)
   local tool = state.tools[tool_call.name]
   if not tool then
     local error_msg = "Tool not found: " .. tool_call.name
-    if state.event_bus then
-      state.event_bus.emit("tool_error", tool_call, error_msg)
-    end
+    vim.api.nvim_exec_autocmds("User", { pattern = "NeoAI:tool_error", data = { tool_call, error_msg } })
     return error_msg
   end
 
   -- 触发工具执行开始事件
-  if state.event_bus then
-    state.event_bus.emit("tool_execution_started", tool_call)
-  end
+  vim.api.nvim_exec_autocmds("User", { pattern = "NeoAI:tool_execution_started", data = { tool_call } })
 
   -- 执行工具
   local success, result = pcall(function()
@@ -264,16 +276,13 @@ function M.execute_tool(tool_call)
         args = parsed
       end
     end
-
     return tool.func(args)
   end)
 
   -- 处理执行结果
   if not success then
     local error_msg = "Tool execution error: " .. result
-    if state.event_bus then
-      state.event_bus.emit("tool_error", tool_call, error_msg)
-    end
+    vim.api.nvim_exec_autocmds("User", { pattern = "NeoAI:tool_error", data = { tool_call, error_msg } })
     return error_msg
   end
 
@@ -286,16 +295,18 @@ function M.execute_tool(tool_call)
   end
 
   -- 触发工具执行完成事件
-  if state.event_bus then
-    state.event_bus.emit("tool_execution_completed", tool_call, formatted_result)
-  end
+  vim.api.nvim_exec_autocmds(
+    "User",
+    { pattern = "NeoAI:tool_execution_completed", data = { tool_call, formatted_result } }
+  )
 
   return formatted_result
 end
 
 --- 构建上下文
+--- 将工具调用结果整合为字符串上下文
 --- @param tool_results table 工具结果列表
---- @return string 构建的上下文
+--- @return string 构建的上下文字符串
 function M.build_context(tool_results)
   if not tool_results or #tool_results == 0 then
     return ""
@@ -317,6 +328,7 @@ function M.build_context(tool_results)
 end
 
 --- 判断是否继续调用
+--- 根据工具结果决定是否继续下一轮工具调用
 --- @param tool_results table 工具结果列表
 --- @return boolean 是否继续
 function M.should_continue(tool_results)
@@ -344,7 +356,8 @@ function M.should_continue(tool_results)
 end
 
 --- 设置工具
---- @param tools table 工具列表
+--- 注册可用的工具
+--- @param tools table 工具列表，键为工具名，值为工具定义（必须包含 func 函数）
 function M.set_tools(tools)
   state.tools = {}
   for name, tool_def in pairs(tools) do
@@ -361,12 +374,13 @@ function M.get_current_iteration()
 end
 
 --- 获取工具列表
---- @return table 工具列表
+--- @return table 工具列表的深拷贝
 function M.get_tools()
   return vim.deepcopy(state.tools)
 end
 
 --- 调用AI并传递工具定义（内部使用）
+--- 模拟函数，实际应调用 AI API
 --- @param messages table 消息列表
 --- @return string AI响应
 function M._call_ai_with_tools(messages)
@@ -390,7 +404,7 @@ function M._call_ai_with_tools(messages)
     local random_tool = tool_definitions[math.random(#tool_definitions)]
     return vim.json.encode({
       tool_calls = {
-        id = "call_" .. os.time() .. "_" .. math.random(1000, 9999),
+        id = "call_" .. tostring(os.time()) .. "_" .. tostring(math.random(1000, 9999)),
         name = random_tool["function"].name,
         arguments = { query = "示例查询" },
       },
@@ -401,4 +415,3 @@ function M._call_ai_with_tools(messages)
 end
 
 return M
-

@@ -17,7 +17,7 @@ function M.initialize(options)
     if state.initialized then
         return
     end
-
+    
     state.event_bus = options.event_bus
     state.config = options.config or {}
     state.initialized = true
@@ -31,7 +31,7 @@ function M.export_session(session_id, format)
     if not state.initialized then
         error("Data operations not initialized")
     end
-
+    
     format = format or "json"
 
     -- 获取会话管理器
@@ -40,7 +40,7 @@ function M.export_session(session_id, format)
     if not session then
         error("Session not found: " .. session_id)
     end
-
+    
     -- 直接使用导入的分支管理器和消息管理器模块
 
     -- 构建导出数据
@@ -63,7 +63,7 @@ function M.export_session(session_id, format)
             end
         end
     end
-
+    
     -- 根据格式转换
     if format == "json" then
         return vim.json.encode(export_data)
@@ -82,7 +82,7 @@ function M.import_session(data, format)
     if not state.initialized then
         error("Data operations not initialized")
     end
-
+    
     format = format or "json"
 
     local import_data
@@ -91,11 +91,11 @@ function M.import_session(data, format)
     else
         error("Unsupported format for import: " .. format)
     end
-
+    
     if not import_data or not import_data.session then
         error("Invalid import data")
     end
-
+    
     -- 获取会话管理器
     local session_manager = require("NeoAI.core.session.session_manager")
     local branch_manager = session_manager.get_branch_manager()
@@ -121,7 +121,7 @@ function M.import_session(data, format)
             end
         end
     end
-
+    
     return session_id
 end
 
@@ -130,11 +130,11 @@ function M.backup_sessions()
     if not state.initialized then
         error("Data operations not initialized")
     end
-
+    
     if not state.config.save_path then
         error("Backup path not configured")
     end
-
+    
     -- 获取会话管理器
     local session_manager = require("NeoAI.core.session.session_manager")
     local sessions = session_manager.list_sessions()
@@ -152,7 +152,7 @@ function M.backup_sessions()
             data = session_data
         }
     end
-
+    
     -- 保存备份文件
     local backup_dir = state.config.save_path .. "/backups"
     file_utils.mkdir(backup_dir)
@@ -161,10 +161,8 @@ function M.backup_sessions()
     file_utils.write_file(backup_file, vim.json.encode(backup_data))
 
     -- 触发事件
-    if state.event_bus then
-        state.event_bus.emit("backup_created", backup_file, #sessions)
-    end
-
+    vim.api.nvim_exec_autocmds("User", {pattern = "NeoAI:backup_created", data = {backup_file, #sessions}})
+    
     return backup_file
 end
 
@@ -175,7 +173,7 @@ function M.restore_backup(backup_id)
     if not state.initialized then
         error("Data operations not initialized")
     end
-
+    
     -- 读取备份文件
     local backup_file = backup_id
     if not file_utils.exists(backup_file) then
@@ -186,14 +184,14 @@ function M.restore_backup(backup_id)
             error("Backup not found: " .. backup_id)
         end
     end
-
+    
     local backup_content = file_utils.read_file(backup_file)
     local backup_data = vim.json.decode(backup_content)
 
     if not backup_data or not backup_data.sessions then
         error("Invalid backup file")
     end
-
+    
     local restored_sessions = {}
 
     -- 恢复每个会话
@@ -205,12 +203,10 @@ function M.restore_backup(backup_id)
             name = session_backup.info.name
         })
     end
-
+    
     -- 触发事件
-    if state.event_bus then
-        state.event_bus.emit("backup_restored", backup_file, #restored_sessions)
-    end
-
+    vim.api.nvim_exec_autocmds("User", {pattern = "NeoAI:backup_restored", data = {backup_file, #restored_sessions}})
+    
     return restored_sessions
 end
 
@@ -238,7 +234,7 @@ function M._export_to_markdown(export_data)
                 table.insert(branch_messages, msg)
             end
         end
-
+        
         -- 按时间排序
         table.sort(branch_messages, function(a, b)
             return a.created_at < b.created_at
@@ -263,7 +259,7 @@ function M._export_to_markdown(export_data)
             table.insert(lines, "")
         end
     end
-
+    
     return table.concat(lines, "\n")
 end
 
@@ -292,7 +288,7 @@ function M.save_session(session_id, filepath)
     local success = file_utils.write_file(filepath, vim.json.encode(export_data))
     
     if success and state.event_bus then
-        state.event_bus.emit("session_saved", session_id, filepath)
+        vim.api.nvim_exec_autocmds("User", {pattern = "NeoAI:session_saved", data = {session_id, filepath}})
     end
     
     return success
@@ -323,7 +319,7 @@ function M.load_session(filepath)
     local new_session_id = M.import_session(import_data, "json")
     
     if new_session_id and state.event_bus then
-        state.event_bus.emit("session_loaded", new_session_id, filepath)
+        vim.api.nvim_exec_autocmds("User", {pattern = "NeoAI:session_loaded", data = {new_session_id, filepath}})
     end
     
     return new_session_id

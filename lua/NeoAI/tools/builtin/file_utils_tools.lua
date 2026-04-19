@@ -33,7 +33,6 @@ function M.get_tools()
             }
         }
     }
-end
 
 --- 确保目录存在
 --- @param args table 参数
@@ -41,8 +40,7 @@ end
 function M.ensure_dir(args)
     if not args or not args.path then
         return false
-    end
-
+    
     local path = args.path
     local parents = args.parents ~= false -- 默认为true
 
@@ -57,19 +55,16 @@ function M.ensure_dir(args)
         handle:close()
         if result:find("exists") then
             return true
-        end
-    end
-
+        
+    
     -- 创建目录
     local mkdir_cmd
     if parents then
         mkdir_cmd = 'mkdir -p "' .. path .. '" 2>/dev/null'
     else
         mkdir_cmd = 'mkdir "' .. path .. '" 2>/dev/null'
-    end
-
+    
     local result = os.execute(mkdir_cmd)
     return result == 0 or result == true
-end
 
 return M

@@ -10,27 +10,41 @@ local state = {
   max_history_per_session = 100,
 }
 
+--- @class Session
+--- @field id string 会话ID
+--- @field name string 会话名称
+--- @field metadata table 元数据
+--- @field messages table[] 消息列表
+--- @field branches table[] 分支列表
+--- @field current_branch_id number|nil 当前分支ID
+--- @field add_message fun(self: Session, role: string, content: string, metadata: table|nil): table 添加消息
+--- @field get_messages fun(self: Session, limit: number|nil): table[] 获取消息
+--- @field create_branch fun(self: Session, name: string|nil, from_message_id: number|nil, metadata: table|nil): table 创建分支
+--- @field switch_branch fun(self: Session, branch_id: number): boolean 切换到分支
+--- @field save fun(self: Session, filepath: string, config: table|nil): nil 保存会话到文件
+
 -- 会话结构
 local Session = {}
 Session.__index = Session
 
 --- 创建新会话
---- @param id string 会话ID
---- @param name string 会话名称
---- @param metadata table 元数据
+--- @param id string|nil 会话ID（可选）
+--- @param name string|nil 会话名称（可选）
+--- @param metadata table|nil 元数据（可选）
+--- @return Session 新会话对象
 function Session:new(id, name, metadata)
-  local self = setmetatable({}, Session)
-  self.id = id or vim.fn.strftime("%Y%m%d_%H%M%S") .. "_" .. tostring(math.random(1000, 9999))
-  self.name = name or "新会话"
-  self.metadata = metadata or {
+  local obj = setmetatable({}, Session)
+  obj.id = id or vim.fn.strftime("%Y%m%d_%H%M%S") .. "_" .. tostring(math.random(1000, 9999))
+  obj.name = name or "新会话"
+  obj.metadata = metadata or {
     created_at = os.time(),
     message_count = 0,
     last_updated = os.time(),
   }
-  self.messages = {}
-  self.branches = {}
-  self.current_branch_id = nil
-  return self
+  obj.messages = {}
+  obj.branches = {}
+  obj.current_branch_id = nil
+  return obj
 end
 
 --- 添加消息
@@ -75,7 +89,7 @@ end
 function Session:create_branch(name, from_message_id, metadata)
   local branch = {
     id = #self.branches + 1,
-    name = name or "分支" .. (#self.branches + 1),
+    name = name or ("分支" .. tostring(#self.branches + 1)),
     from_message_id = from_message_id or #self.messages,
     created_at = os.time(),
     metadata = metadata or {},
@@ -104,9 +118,16 @@ local function ensure_directory(dir)
   if vim and vim.fn and vim.fn.mkdir then
     return vim.fn.mkdir(dir, "p") == 1
   else
-    -- 使用纯 Lua 实现
-    local cmd = string.format("mkdir -p '%s' 2>/dev/null", dir)
-    return os.execute(cmd) == 0 or os.execute(cmd) == true
+    -- 使用纯 Lua 实现，支持跨平台
+    local success, err
+    if package.config:sub(1, 1) == "\\" then
+      -- Windows
+      success = os.execute(string.format('if not exist "%s" mkdir "%s"', dir, dir)) == 0
+    else
+      -- Unix-like
+      success = os.execute(string.format("mkdir -p '%s' 2>/dev/null", dir)) == 0
+    end
+    return success
   end
 end
 
@@ -119,7 +140,7 @@ local function write_file(filepath, content)
     local success, err = pcall(function()
       local file = io.open(filepath, "w")
       if not file then
-        error("无法打开文件: " .. filepath)
+        return false
       end
       file:write(content)
       file:close()
@@ -165,7 +186,8 @@ function Session:save(filepath, config)
     end
 
     if dir ~= backup_dir then
-      filepath = backup_dir .. filepath:match("([^/]+)$")
+      local filename = filepath:match("([^/]+)$") or self.id .. ".json"
+      filepath = backup_dir .. filename
       dir = backup_dir
       ensure_directory(dir)
     end
@@ -176,7 +198,13 @@ function Session:save(filepath, config)
     -- 写入失败，尝试使用临时文件
     local temp_file = os.tmpname()
     if write_file(temp_file, json_str) then
-      os.execute(string.format("mv '%s' '%s' 2>/dev/null || cp '%s' '%s'", temp_file, filepath, temp_file, filepath))
+      local cmd
+      if package.config:sub(1, 1) == "\\" then
+        cmd = string.format('move /Y "%s" "%s"', temp_file, filepath)
+      else
+        cmd = string.format("mv '%s' '%s' 2>/dev/null || cp '%s' '%s'", temp_file, filepath, temp_file, filepath)
+      end
+      os.execute(cmd)
     end
   end
 end
@@ -226,11 +254,6 @@ function M.initialize(options)
     input_config = options or {}
   end
 
-  -- 调试信息
-  -- print("[历史管理器] 输入配置: " .. vim.inspect(input_config))
-  -- print("[历史管理器] 输入配置.save_path = " .. tostring(input_config.save_path))
-  -- print("[历史管理器] 输入配置.max_history_per_session = " .. tostring(input_config.max_history_per_session))
-
   -- 创建配置的副本，避免修改传入的配置表
   state.config = vim.deepcopy(input_config)
 
@@ -241,36 +264,23 @@ function M.initialize(options)
     for key, value in pairs(state.config.session) do
       state.config[key] = value
     end
-    -- 保留 session 表以便向后兼容
-    -- state.config.session = nil  -- 可选：移除嵌套表
+    -- 移除嵌套的 session 表，避免配置冲突
+    state.config.session = nil
   end
-
-  -- 调试信息
-  -- print("[历史管理器] 处理后的配置: " .. vim.inspect(state.config))
 
   -- 确保配置有默认值
   local original_save_path = state.config.save_path
   state.config.save_path = state.config.save_path or vim.fn.stdpath("cache") .. "/neoai_sessions"
 
-  -- 调试信息
-  -- if original_save_path ~= state.config.save_path then
-  --     print("[历史管理器] save_path 被修改: " .. tostring(original_save_path) .. " -> " .. tostring(state.config.save_path))
-  -- end
-
   state.config.auto_save = state.config.auto_save or false
+  state.config.auto_load = state.config.auto_load ~= false -- 默认开启自动加载
 
   -- 处理历史记录限制配置（支持两种字段名：max_history_per_session 和 max_history）
   local max_history_value = state.config.max_history_per_session or state.config.max_history
-  local original_max_history = max_history_value
   state.config.max_history_per_session = max_history_value or 100
 
   -- 清理旧的字段名
   state.config.max_history = nil
-
-  -- 调试信息
-  -- if original_max_history ~= state.config.max_history_per_session then
-  --     print("[历史管理器] max_history_per_session 被修改: " .. tostring(original_max_history) .. " -> " .. tostring(state.config.max_history_per_session))
-  -- end
 
   state.max_history_per_session = state.config.max_history_per_session
   state.sessions = {}
@@ -516,6 +526,7 @@ function M.add_message_to_branch(session_id, branch_id, role, content, metadata)
   if not target_branch.messages then
     target_branch.messages = {}
   end
+
   table.insert(target_branch.messages, message)
 
   -- 自动保存
@@ -563,38 +574,24 @@ end
 
 --- 加载保存的会话（内部使用）
 function M._load_sessions()
-  if not state.config.auto_save then
+  -- 检查是否启用自动加载
+  if not state.config.auto_load then
     return
   end
 
   local save_path = state.config.save_path or vim.fn.stdpath("cache") .. "/neoai_sessions"
 
-  -- 调试信息：显示配置来源
-  if state.config._debug_source then
-    -- print("[历史管理器] 配置来源: " .. state.config._debug_source)
-  end
-  -- print("[历史管理器] 保存路径: " .. save_path)
-
   -- 如果目录不存在，创建它
   if vim.fn.isdirectory(save_path) == 0 then
-    print("[历史管理器] 保存目录不存在，创建目录: " .. save_path)
-    if not ensure_directory(save_path) then
-      print("[历史管理器] 无法创建目录，跳过加载: " .. save_path)
-      return
-    end
+    ensure_directory(save_path)
   end
 
   local files = vim.fn.glob(save_path .. "/*.json", false, true)
-  -- print("[历史管理器] 找到 " .. #files .. " 个会话文件")
 
   for _, filepath in ipairs(files) do
-    -- print("[历史管理器] 尝试加载文件: " .. filepath)
     local session = Session.load(filepath)
     if session then
       state.sessions[session.id] = session
-      -- print("[历史管理器] 成功加载会话: " .. session.id)
-    else
-      print("[历史管理器] 保存的文件不存在或格式错误，跳过加载: " .. filepath)
     end
   end
 
@@ -602,16 +599,13 @@ function M._load_sessions()
   local sessions = M.get_sessions()
   if #sessions > 0 then
     state.current_session_id = sessions[1].id
-    -- print("[历史管理器] 设置当前会话为: " .. state.current_session_id)
-  else
-    print("[历史管理器] 没有找到可用的会话")
   end
 end
 
 --- 获取配置
 --- @return table 配置
 function M.get_config()
-  return vim.deepcopy(state.config)
+  return vim.deepcopy(state.config or {})
 end
 
 --- 更新配置
@@ -649,4 +643,3 @@ function M._test_reset()
 end
 
 return M
-

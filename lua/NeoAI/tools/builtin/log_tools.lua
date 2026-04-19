@@ -50,7 +50,6 @@ function M.get_tools()
             permissions = {}
         }
     }
-end
 
 --- 记录日志消息
 --- @param args table 参数
@@ -58,8 +57,7 @@ end
 function M.log_message(args)
     if not args or not args.message then
         return false
-    end
-
+    
     local message = args.message
     local level = args.level or "info"
 
@@ -73,18 +71,15 @@ function M.log_message(args)
         vim_level = vim.log.levels.DEBUG
     else
         vim_level = vim.log.levels.INFO
-    end
-
+    
     -- 记录日志
     vim.notify("[NeoAI Tool] " .. message, vim_level)
     return true
-end
 
 --- 获取日志级别
 --- @param args table 参数
 --- @return table 日志级别列表
 function M.get_log_levels(args)
     return { "info", "warn", "error", "debug" }
-end
 
 return M

@@ -92,17 +92,19 @@ function M.validate_config(config)
   if not config then
     return {}
   end
-
+  
   -- 验证AI配置
   if config.ai then
     if config.ai.model and type(config.ai.model) ~= "string" then
       vim.notify("[NeoAI] ai.model must be a string. Using default.", vim.log.levels.WARN)
       config.ai.model = nil
     end
+    
     if config.ai.api_key ~= nil and type(config.ai.api_key) ~= "string" then
       vim.notify("[NeoAI] ai.api_key must be a string. Using default.", vim.log.levels.WARN)
       config.ai.api_key = nil
     end
+    
     if
       config.ai.temperature
       and (type(config.ai.temperature) ~= "number" or config.ai.temperature < 0 or config.ai.temperature > 2)
@@ -110,12 +112,13 @@ function M.validate_config(config)
       vim.notify("[NeoAI] ai.temperature must be a number between 0 and 2. Using default.", vim.log.levels.WARN)
       config.ai.temperature = nil
     end
+    
     if config.ai.max_tokens and (type(config.ai.max_tokens) ~= "number" or config.ai.max_tokens < 1) then
       vim.notify("[NeoAI] ai.max_tokens must be a positive number. Using default.", vim.log.levels.WARN)
       config.ai.max_tokens = nil
     end
   end
-
+  
   -- 验证UI配置
   if config.ui then
     -- 验证默认UI
@@ -129,7 +132,7 @@ function M.validate_config(config)
         config.ui.default_ui = nil
       end
     end
-
+    
     -- 验证窗口模式
     if config.ui.window_mode then
       local valid_modes = { "float", "tab", "split" }
@@ -144,71 +147,73 @@ function M.validate_config(config)
         config.ui.window_mode = nil
       end
     end
-
+    
     if config.ui.window then
       if config.ui.window.width and (type(config.ui.window.width) ~= "number" or config.ui.window.width < 10) then
         vim.notify("[NeoAI] ui.window.width must be a number >= 10. Using default.", vim.log.levels.WARN)
         config.ui.window.width = nil
       end
+      
       if config.ui.window.height and (type(config.ui.window.height) ~= "number" or config.ui.window.height < 5) then
         vim.notify("[NeoAI] ui.window.height must be a number >= 5. Using default.", vim.log.levels.WARN)
         config.ui.window.height = nil
       end
     end
-
-    -- 验证键位配置（现在在顶层）
-    if config.keymaps then
-      local valid_contexts = { "global", "tree", "chat", "virtual_input" }
-      for context, keymap_table in pairs(config.keymaps) do
-        -- 检查上下文是否有效
-        if not vim.tbl_contains(valid_contexts, context) then
+  end
+  
+  -- 验证键位配置（现在在顶层）
+  if config.keymaps then
+    local valid_contexts = { "global", "tree", "chat", "virtual_input" }
+    for context, keymap_table in pairs(config.keymaps) do
+      -- 检查上下文是否有效
+      if not vim.tbl_contains(valid_contexts, context) then
+        vim.notify(
+          string.format(
+            "[NeoAI] Invalid keymap context: %s. Valid contexts are: global, tree, chat, virtual_input. Using default.",
+            context
+          ),
+          vim.log.levels.WARN
+        )
+        config.keymaps[context] = nil
+      else
+        -- 检查键位表是否为table
+        if type(keymap_table) ~= "table" then
           vim.notify(
-            string.format(
-              "[NeoAI] Invalid keymap context: %s. Valid contexts are: global, tree, chat, virtual_input. Using default.",
-              context
-            ),
+            string.format("[NeoAI] keymaps.%s must be a table. Using default.", context),
             vim.log.levels.WARN
           )
           config.keymaps[context] = nil
         else
-          -- 检查键位表是否为table
-          if type(keymap_table) ~= "table" then
-            vim.notify(
-              string.format("[NeoAI] keymaps.%s must be a table. Using default.", context),
-              vim.log.levels.WARN
-            )
-            config.keymaps[context] = nil
-          else
-            -- 验证每个键位配置
-            for action, key_config in pairs(keymap_table) do
-              -- 检查是否为table且包含key和desc字段
-              if type(key_config) ~= "table" then
+          -- 验证每个键位配置
+          for action, key_config in pairs(keymap_table) do
+            -- 检查是否为table且包含key和desc字段
+            if type(key_config) ~= "table" then
+              vim.notify(
+                string.format(
+                  "[NeoAI] keymaps.%s.%s must be a table with key and desc fields. Using default.",
+                  context,
+                  action
+                ),
+                vim.log.levels.WARN
+              )
+              keymap_table[action] = nil
+            else
+              -- 检查key字段是否存在且为字符串
+              if not key_config.key or type(key_config.key) ~= "string" then
                 vim.notify(
-                  string.format(
-                    "[NeoAI] keymaps.%s.%s must be a table with key and desc fields. Using default.",
-                    context,
-                    action
-                  ),
+                  string.format("[NeoAI] keymaps.%s.%s.key must be a string. Using default.", context, action),
                   vim.log.levels.WARN
                 )
                 keymap_table[action] = nil
-              else
-                -- 检查key字段是否存在且为字符串
-                if not key_config.key or type(key_config.key) ~= "string" then
-                  vim.notify(
-                    string.format("[NeoAI] keymaps.%s.%s.key must be a string. Using default.", context, action),
-                    vim.log.levels.WARN
-                  )
-                  keymap_table[action] = nil
-                end
-                -- 检查desc字段是否存在且为字符串（可选）
-                if key_config.desc and type(key_config.desc) ~= "string" then
-                  vim.notify(
-                    string.format("[NeoAI] keymaps.%s.%s.desc must be a string. Ignoring desc.", context, action),
-                    vim.log.levels.WARN
-                  )
-                  key_config.desc = nil
-                end
+              end
+              
+              -- 检查desc字段是否存在且为字符串（可选）
+              if key_config.desc and type(key_config.desc) ~= "string" then
+                vim.notify(
+                  string.format("[NeoAI] keymaps.%s.%s.desc must be a string. Ignoring desc.", context, action),
+                  vim.log.levels.WARN
+                )
+                key_config.desc = nil
               end
             end
           end
@@ -216,7 +221,7 @@ function M.validate_config(config)
       end
     end
   end
-
+  
   -- 验证会话配置
   if config.session then
     if
@@ -226,7 +231,7 @@ function M.validate_config(config)
       config.session.max_history_per_session = nil
     end
   end
-
+  
   return config
 end
 
@@ -246,7 +251,7 @@ function M.merge_defaults(config)
       end
     end
   end
-
+  
   deep_merge(result, config or {})
   return result
 end
@@ -262,13 +267,13 @@ function M.sanitize_config(config)
       vim.fn.mkdir(path, "p")
     end
   end
-
+  
   -- 清理API密钥
   if config.ai and config.ai.api_key then
     -- 可以在这里添加API密钥的加密或安全处理
     -- 目前只是保留原样
   end
-
+  
   return config
 end
 

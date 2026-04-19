@@ -6,15 +6,12 @@ local M = {}
 function M.keys(tbl)
     if type(tbl) ~= "table" then
         return {}
-    end
-
+    
     local result = {}
     for k, _ in pairs(tbl) do
         table.insert(result, k)
-    end
-
+    
     return result
-end
 
 --- 获取表的所有值
 --- @param tbl table 表
@@ -22,15 +19,12 @@ end
 function M.values(tbl)
     if type(tbl) ~= "table" then
         return {}
-    end
-
+    
     local result = {}
     for _, v in pairs(tbl) do
         table.insert(result, v)
-    end
-
+    
     return result
-end
 
 --- 过滤表
 --- @param tbl table 表
@@ -39,12 +33,10 @@ end
 function M.filter(tbl, predicate)
     if type(tbl) ~= "table" then
         return {}
-    end
-
+    
     if type(predicate) ~= "function" then
         return tbl
-    end
-
+    
     local result = {}
     local is_array = true
     
@@ -53,8 +45,7 @@ function M.filter(tbl, predicate)
         if type(k) ~= "number" or k < 1 or k > #tbl then
             is_array = false
             break
-        end
-    end
+        
     
     if is_array then
         -- 数组表：创建连续索引
@@ -63,19 +54,17 @@ function M.filter(tbl, predicate)
             if predicate(tbl[i], i) then
                 result[index] = tbl[i]
                 index = index + 1
-            end
-        end
+            
+        
     else
         -- 字典表：保留原始键
         for k, v in pairs(tbl) do
             if predicate(v, k) then
                 result[k] = v
-            end
-        end
-    end
-
+            
+        
+    
     return result
-end
 
 --- 映射表
 --- @param tbl table 表
@@ -84,19 +73,15 @@ end
 function M.map(tbl, func)
     if type(tbl) ~= "table" then
         return {}
-    end
-
+    
     if type(func) ~= "function" then
         return tbl
-    end
-
+    
     local result = {}
     for k, v in pairs(tbl) do
         result[k] = func(v, k)
-    end
-
+    
     return result
-end
 
 --- 归约表
 --- @param tbl table 表
@@ -106,12 +91,10 @@ end
 function M.reduce(tbl, func, initial)
     if type(tbl) ~= "table" then
         return initial
-    end
-
+    
     if type(func) ~= "function" then
         return initial
-    end
-
+    
     local accumulator = initial
     local is_first = initial == nil
 
@@ -121,11 +104,9 @@ function M.reduce(tbl, func, initial)
             is_first = false
         else
             accumulator = func(accumulator, v, k)
-        end
-    end
-
+        
+    
     return accumulator
-end
 
 --- 表长度
 --- @param tbl table 表
@@ -133,15 +114,12 @@ end
 function M.length(tbl)
     if type(tbl) ~= "table" then
         return 0
-    end
-
+    
     local count = 0
     for _ in pairs(tbl) do
         count = count + 1
-    end
-
+    
     return count
-end
 
 --- 表是否为空
 --- @param tbl table 表
@@ -149,10 +127,8 @@ end
 function M.is_empty(tbl)
     if type(tbl) ~= "table" then
         return true
-    end
-
+    
     return next(tbl) == nil
-end
 
 --- 合并多个表
 --- @param ... table 要合并的表
@@ -165,12 +141,10 @@ function M.merge(...)
         if type(tbl) == "table" then
             for k, v in pairs(tbl) do
                 result[k] = v
-            end
-        end
-    end
-
+            
+        
+    
     return result
-end
 
 --- 扁平化表
 --- @param tbl table 表
@@ -179,8 +153,7 @@ end
 function M.flatten(tbl, depth)
     if type(tbl) ~= "table" then
         return { tbl }
-    end
-
+    
     depth = depth or math.huge
     local result = {}
 
@@ -188,20 +161,17 @@ function M.flatten(tbl, depth)
         if current_depth > depth then
             table.insert(result, sub_tbl)
             return
-        end
-
+        
         for _, v in ipairs(sub_tbl) do
             if type(v) == "table" then
                 flatten_helper(v, current_depth + 1)
             else
                 table.insert(result, v)
-            end
-        end
-    end
-
+            
+        
+    
     flatten_helper(tbl, 1)
     return result
-end
 
 --- 反转表
 --- @param tbl table 表
@@ -209,17 +179,14 @@ end
 function M.reverse(tbl)
     if type(tbl) ~= "table" then
         return {}
-    end
-
+    
     local result = {}
     local len = #tbl
 
     for i = len, 1, -1 do
         table.insert(result, tbl[i])
-    end
-
+    
     return result
-end
 
 --- 切片表
 --- @param tbl table 表
@@ -229,25 +196,21 @@ end
 function M.slice(tbl, start, finish)
     if type(tbl) ~= "table" then
         return {}
-    end
-
+    
     start = start or 1
     finish = finish or #tbl
 
     if start < 1 then
         start = 1
-    end
+    
     if finish > #tbl then
         finish = #tbl
-    end
-
+    
     local result = {}
     for i = start, finish do
         table.insert(result, tbl[i])
-    end
-
+    
     return result
-end
 
 --- 去重表
 --- @param tbl table 表
@@ -255,8 +218,7 @@ end
 function M.unique(tbl)
     if type(tbl) ~= "table" then
         return {}
-    end
-
+    
     local seen = {}
     local result = {}
 
@@ -265,11 +227,9 @@ function M.unique(tbl)
         if not seen[key] then
             seen[key] = true
             table.insert(result, v)
-        end
-    end
-
+        
+    
     return result
-end
 
 --- 排序表
 --- @param tbl table 表
@@ -278,21 +238,17 @@ end
 function M.sort(tbl, comparator)
     if type(tbl) ~= "table" then
         return {}
-    end
-
+    
     local result = {}
     for _, v in ipairs(tbl) do
         table.insert(result, v)
-    end
-
+    
     if comparator and type(comparator) == "function" then
         table.sort(result, comparator)
     else
         table.sort(result)
-    end
-
+    
     return result
-end
 
 --- 分组表
 --- @param tbl table 表
@@ -301,24 +257,20 @@ end
 function M.group_by(tbl, key_func)
     if type(tbl) ~= "table" then
         return {}
-    end
-
+    
     if type(key_func) ~= "function" then
         return { tbl }
-    end
-
+    
     local result = {}
 
     for _, v in ipairs(tbl) do
         local key = key_func(v)
         if not result[key] then
             result[key] = {}
-        end
+        
         table.insert(result[key], v)
-    end
-
+    
     return result
-end
 
 --- 查找元素
 --- @param tbl table 表
@@ -327,20 +279,16 @@ end
 function M.find(tbl, predicate)
     if type(tbl) ~= "table" then
         return nil
-    end
-
+    
     if type(predicate) ~= "function" then
         return nil
-    end
-
+    
     for k, v in pairs(tbl) do
         if predicate(v, k) then
             return v, k
-        end
-    end
-
+        
+    
     return nil
-end
 
 --- 检查表是否包含值
 --- @param tbl table 表
@@ -349,16 +297,13 @@ end
 function M.contains(tbl, value)
     if type(tbl) ~= "table" then
         return false
-    end
-
+    
     for _, v in pairs(tbl) do
         if v == value then
             return true
-        end
-    end
-
+        
+    
     return false
-end
 
 --- 检查表是否包含键
 --- @param tbl table 表
@@ -367,10 +312,8 @@ end
 function M.has_key(tbl, key)
     if type(tbl) ~= "table" then
         return false
-    end
-
+    
     return tbl[key] ~= nil
-end
 
 --- 转换表为键值对列表
 --- @param tbl table 表
@@ -378,15 +321,12 @@ end
 function M.to_pairs(tbl)
     if type(tbl) ~= "table" then
         return {}
-    end
-
+    
     local result = {}
     for k, v in pairs(tbl) do
         table.insert(result, { key = k, value = v })
-    end
-
+    
     return result
-end
 
 --- 从键值对列表创建表
 --- @param pairs table 键值对列表
@@ -394,17 +334,14 @@ end
 function M.from_pairs(pairs)
     if type(pairs) ~= "table" then
         return {}
-    end
-
+    
     local result = {}
     for _, pair in ipairs(pairs) do
         if type(pair) == "table" and pair.key ~= nil then
             result[pair.key] = pair.value
-        end
-    end
-
+        
+    
     return result
-end
 
 --- 深比较两个表
 --- @param t1 table 表1
@@ -413,29 +350,24 @@ end
 function M.deep_equal(t1, t2)
     if type(t1) ~= type(t2) then
         return false
-    end
-
+    
     if type(t1) ~= "table" then
         return t1 == t2
-    end
-
+    
     -- 检查键的数量
     local t1_keys = M.keys(t1)
     local t2_keys = M.keys(t2)
 
     if #t1_keys ~= #t2_keys then
         return false
-    end
-
+    
     -- 检查每个键值对
     for _, key in ipairs(t1_keys) do
         if not M.deep_equal(t1[key], t2[key]) then
             return false
-        end
-    end
-
+        
+    
     return true
-end
 
 --- 克隆表（浅拷贝）
 --- @param tbl table 表
@@ -443,15 +375,12 @@ end
 function M.clone(tbl)
     if type(tbl) ~= "table" then
         return {}
-    end
-
+    
     local result = {}
     for k, v in pairs(tbl) do
         result[k] = v
-    end
-
+    
     return result
-end
 
 --- 获取表的子集
 --- @param tbl table 表
@@ -460,21 +389,17 @@ end
 function M.pick(tbl, keys)
     if type(tbl) ~= "table" then
         return {}
-    end
-
+    
     if type(keys) ~= "table" then
         return {}
-    end
-
+    
     local result = {}
     for _, key in ipairs(keys) do
         if tbl[key] ~= nil then
             result[key] = tbl[key]
-        end
-    end
-
+        
+    
     return result
-end
 
 --- 排除表的某些键
 --- @param tbl table 表
@@ -483,26 +408,21 @@ end
 function M.omit(tbl, keys)
     if type(tbl) ~= "table" then
         return {}
-    end
-
+    
     if type(keys) ~= "table" then
         return tbl
-    end
-
+    
     local key_set = {}
     for _, key in ipairs(keys) do
         key_set[key] = true
-    end
-
+    
     local result = {}
     for k, v in pairs(tbl) do
         if not key_set[k] then
             result[k] = v
-        end
-    end
-
+        
+    
     return result
-end
 
 --- 检查表是否包含值（table_contains 是 contains 的别名）
 --- @param tbl table 表
@@ -510,21 +430,18 @@ end
 --- @return boolean 是否包含
 function M.table_contains(tbl, value)
     return M.contains(tbl, value)
-end
 
 --- 获取表的所有键（table_keys 是 keys 的别名）
 --- @param tbl table 表
 --- @return table 键列表
 function M.table_keys(tbl)
     return M.keys(tbl)
-end
 
 --- 获取表的所有值（table_values 是 values 的别名）
 --- @param tbl table 表
 --- @return table 值列表
 function M.table_values(tbl)
     return M.values(tbl)
-end
 
 --- 过滤表（table_filter 是 filter 的别名）
 --- @param tbl table 表
@@ -532,7 +449,6 @@ end
 --- @return table 过滤后的表
 function M.table_filter(tbl, predicate)
     return M.filter(tbl, predicate)
-end
 
 --- 映射表（table_map 是 map 的别名）
 --- @param tbl table 表
@@ -540,6 +456,5 @@ end
 --- @return table 映射后的表
 function M.table_map(tbl, func)
     return M.map(tbl, func)
-end
 
 return M

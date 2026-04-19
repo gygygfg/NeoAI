@@ -14,7 +14,6 @@ local state = {
 function M.initialize(config)
     if state.initialized then
         return
-    end
     
     state.config = config or {}
     state.sessions = {}
@@ -23,7 +22,6 @@ function M.initialize(config)
     
     -- 加载默认配置
     M._load_default_config()
-end
 
 --- 加载默认配置
 function M._load_default_config()
@@ -39,9 +37,8 @@ function M._load_default_config()
     for key, value in pairs(default_config) do
         if state.config[key] == nil then
             state.config[key] = value
-        end
-    end
-end
+        
+    
 
 --- 添加会话
 --- @param session table 会话数据
@@ -49,7 +46,6 @@ end
 function M.add_session(session)
     if not session.id then
         session.id = "session_" .. os.time() .. "_" .. math.random(1000, 9999)
-    end
     
     session.created_at = os.time()
     session.updated_at = os.time()
@@ -60,19 +56,16 @@ function M.add_session(session)
     M._cleanup_sessions()
     
     return #state.sessions
-end
 
 --- 获取会话列表
 --- @return table 会话列表
 function M.get_sessions()
     return vim.deepcopy(state.sessions)
-end
 
 --- 获取会话数量
 --- @return number 会话数量
 function M.get_session_count()
     return #state.sessions
-end
 
 --- 获取会话
 --- @param session_id string 会话ID
@@ -81,11 +74,9 @@ function M.get_session(session_id)
     for _, session in ipairs(state.sessions) do
         if session.id == session_id then
             return vim.deepcopy(session)
-        end
-    end
+        
     
     return nil
-end
 
 --- 更新会话
 --- @param session_id string 会话ID
@@ -96,14 +87,12 @@ function M.update_session(session_id, updates)
         if session.id == session_id then
             for key, value in pairs(updates) do
                 session[key] = value
-            end
+            
             session.updated_at = os.time()
             return true
-        end
-    end
+        
     
     return false
-end
 
 --- 删除会话
 --- @param session_id string 会话ID
@@ -113,37 +102,31 @@ function M.delete_session(session_id)
         if session.id == session_id then
             table.remove(state.sessions, i)
             return true
-        end
-    end
+        
     
     return false
-end
 
 --- 更新配置
 --- @param key string 配置键
 --- @param value any 配置值
 function M.update_config(key, value)
     state.config[key] = value
-end
 
 --- 获取配置
 --- @param key string 配置键
 --- @return any 配置值
 function M.get_config(key)
     return state.config[key]
-end
 
 --- 获取所有配置
 --- @return table 所有配置
 function M.get_all_config()
     return vim.deepcopy(state.config)
-end
 
 --- 清理旧会话
 function M._cleanup_sessions()
     if #state.sessions <= state.max_sessions then
         return
-    end
     
     -- 按创建时间排序
     table.sort(state.sessions, function(a, b)
@@ -153,8 +136,7 @@ function M._cleanup_sessions()
     -- 删除最旧的会话
     while #state.sessions > state.max_sessions do
         table.remove(state.sessions, 1)
-    end
-end
+    
 
 --- 导出会话历史
 --- @param filepath string 文件路径
@@ -163,7 +145,7 @@ function M.export_sessions(filepath)
     local data = {
         sessions = state.sessions,
         config = state.config,
-        export_time = os.time()
+        export_time = os.time(})
     }
     
     local content = vim.json.encode(data)
@@ -172,13 +154,12 @@ function M.export_sessions(filepath)
         local file = io.open(filepath, "w")
         if not file then
             error("无法打开文件: " .. filepath)
-        end
+        
         file:write(content)
         file:close()
     end)
     
     return success, err
-end
 
 --- 导入会话历史
 --- @param filepath string 文件路径
@@ -188,7 +169,7 @@ function M.import_sessions(filepath)
         local file = io.open(filepath, "r")
         if not file then
             error("无法打开文件: " .. filepath)
-        end
+        
         local content = file:read("*a")
         file:close()
         return vim.json.decode(content)
@@ -196,19 +177,15 @@ function M.import_sessions(filepath)
     
     if not success then
         return false, data
-    end
     
     if data.sessions then
         state.sessions = data.sessions
-    end
     
     if data.config then
         for key, value in pairs(data.config) do
             state.config[key] = value
-        end
-    end
+        
     
     return true
-end
 
 return M

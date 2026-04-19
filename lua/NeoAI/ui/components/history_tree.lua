@@ -24,7 +24,7 @@ end
 --- @param session_id string 会话ID
 function M.render(session_id)
   if not state.initialized then
-    return
+    return nil
   end
 
   -- 加载树数据
@@ -85,6 +85,7 @@ function M.get_selected_item()
       if node.id == node_id then
         return node
       end
+
       if node.children then
         local found = find_node(node.children, node_id)
         if found then
@@ -92,6 +93,7 @@ function M.get_selected_item()
         end
       end
     end
+
     return nil
   end
 
@@ -132,6 +134,7 @@ function M.update_node(node_id, data)
         end
       end
     end
+
     return false
   end
 
@@ -147,7 +150,27 @@ end
 --- 获取树数据
 --- @return table 树数据
 function M.get_tree_data()
-  return vim.deepcopy(state.tree_data)
+  -- 使用vim.deepcopy进行深拷贝
+  if vim and vim.deepcopy then
+    return vim.deepcopy(state.tree_data)
+  else
+    -- 简单的深拷贝实现（用于测试）
+    local function deepcopy(orig)
+      local orig_type = type(orig)
+      local copy
+      if orig_type == "table" then
+        copy = {}
+        for orig_key, orig_value in next, orig, nil do
+          copy[deepcopy(orig_key)] = deepcopy(orig_value)
+        end
+        setmetatable(copy, deepcopy(getmetatable(orig)))
+      else
+        copy = orig
+      end
+      return copy
+    end
+    return deepcopy(state.tree_data)
+  end
 end
 
 --- 获取展开的节点
@@ -188,6 +211,7 @@ function M.find_node(predicate)
         end
       end
     end
+
     return nil
   end
 
@@ -206,7 +230,10 @@ function M.get_node_path(node_id)
 
   local function find_path_recursive(nodes, current_path)
     for _, node in ipairs(nodes) do
-      local new_path = vim.deepcopy(current_path)
+      local new_path = {}
+      for _, v in ipairs(current_path) do
+        table.insert(new_path, v)
+      end
       table.insert(new_path, node.id)
 
       if node.id == node_id then
@@ -220,6 +247,7 @@ function M.get_node_path(node_id)
         end
       end
     end
+
     return nil
   end
 
@@ -239,7 +267,22 @@ function M.get_children(node_id)
   end)
 
   if node and node.children then
-    return vim.deepcopy(node.children)
+    -- 深拷贝子节点
+    if vim and vim.deepcopy then
+      return vim.deepcopy(node.children)
+    else
+      local copy = {}
+      for i, child in ipairs(node.children) do
+        copy[i] = { id = child.id, name = child.name, type = child.type }
+        if child.children then
+          copy[i].children = {}
+          for j, grandchild in ipairs(child.children) do
+            copy[i].children[j] = { id = grandchild.id, name = grandchild.name, type = grandchild.type }
+          end
+        end
+      end
+      return copy
+    end
   end
 
   return {}
@@ -266,13 +309,14 @@ function M.get_parent(node_id)
         end
       end
     end
+
     return nil
   end
 
   return find_parent_recursive(state.tree_data, nil)
 end
 
---- 构建树（缺失函数）
+--- 构建树
 --- @param session_id string 会话ID
 --- @return table 构建的树数据
 function M.build_tree(session_id)
@@ -284,10 +328,10 @@ function M.build_tree(session_id)
   M._load_tree_data(session_id)
 
   -- 返回构建的树数据
-  return vim.deepcopy(state.tree_data)
+  return M.get_tree_data()
 end
 
---- 刷新树（缺失函数）
+--- 刷新树
 --- @param session_id string 会话ID
 function M.refresh(session_id)
   if not state.initialized then
@@ -302,10 +346,12 @@ function M.refresh(session_id)
     state.config.on_update(session_id, state.tree_data)
   end
 
-  vim.notify("历史树已刷新", vim.log.levels.INFO)
+  if vim and vim.notify then
+    vim.notify("历史树已刷新", vim.log.levels.INFO)
+  end
 end
 
---- 获取指定行的节点（缺失函数）
+--- 获取指定行的节点
 --- @param line_number number 行号（1-based）
 --- @return table|nil 节点数据
 function M.get_node_at_line(line_number)
@@ -316,45 +362,15 @@ function M.get_node_at_line(line_number)
   -- 这里需要根据实际的树渲染逻辑来获取节点
   -- 由于我们不知道具体的渲染实现，这里返回一个模拟节点
   if line_number > 0 and line_number <= #state.tree_data then
-    return vim.deepcopy(state.tree_data[line_number])
+    if vim and vim.deepcopy then
+      return vim.deepcopy(state.tree_data[line_number])
+    else
+      local node = state.tree_data[line_number]
+      return { id = node.id, name = node.name, type = node.type }
+    end
   end
 
   return nil
-end
-
---- 内部函数：加载树数据
---- @param session_id string 会话ID
-function M._load_tree_data(session_id)
-  -- 这里应该从会话管理器加载实际的树数据
-  -- 目前使用模拟数据
-  state.tree_data = {
-    {
-      id = "root_1",
-      name = "会话: " .. (session_id or "default"),
-      type = "session",
-      children = {
-        {
-          id = "branch_1",
-          name = "分支 1",
-          type = "branch",
-          children = {
-            {
-              id = "msg_1",
-              name = "用户: 你好",
-              type = "message",
-              content = "你好",
-            },
-            {
-              id = "msg_2",
-              name = "AI: 你好！有什么可以帮助你的吗？",
-              type = "message",
-              content = "你好！有什么可以帮助你的吗？",
-            },
-          },
-        },
-      },
-    },
-  }
 end
 
 --- 查找节点的父节点
@@ -378,6 +394,7 @@ function M.find_parent(node_id)
         end
       end
     end
+
     return nil
   end
 
@@ -445,6 +462,7 @@ function M.delete_node(node_id)
         end
       end
     end
+
     return false
   end
 
@@ -480,6 +498,7 @@ function M.move_node(node_id, new_parent_id)
         end
       end
     end
+
     return false
   end
 
@@ -488,7 +507,11 @@ function M.move_node(node_id, new_parent_id)
   end
 
   -- 从原位置移除
-  table.remove(old_parent_nodes, node_index)
+  if old_parent_nodes and node_index then
+    table.remove(old_parent_nodes, node_index)
+  else
+    return false
+  end
 
   -- 添加到新位置
   if not new_parent_id then
@@ -501,7 +524,9 @@ function M.move_node(node_id, new_parent_id)
 
     if not new_parent then
       -- 如果找不到新父节点，回滚
-      table.insert(old_parent_nodes, node_index, node_to_move)
+      if old_parent_nodes and node_index then
+        table.insert(old_parent_nodes, node_index, node_to_move)
+      end
       return false
     end
 
@@ -592,5 +617,83 @@ function M.update_config(new_config)
   state.config = vim.tbl_extend("force", state.config, new_config or {})
 end
 
-return M
+-- 测试函数
+local function test_module()
+  print("=== 测试历史树模块 ===")
 
+  -- 初始化模块
+  M.initialize({
+    on_update = function(session_id, data)
+      print("配置更新回调: 会话ID=" .. (session_id or "nil") .. ", 数据节点数=" .. #data)
+    end,
+  })
+
+  -- 构建树
+  local tree_data = M.build_tree("test_session")
+  print("树数据加载完成，根节点数: " .. #tree_data)
+
+  -- 展开节点
+  M.expand_node("branch_1")
+  print("已展开节点: branch_1")
+
+  -- 选择节点
+  M.select_node("branch_2")
+  print("已选择节点: " .. (M.get_selected_node() or "nil"))
+
+  -- 获取选中项目
+  local selected = M.get_selected_item()
+  if selected then
+    print("选中节点名称: " .. selected.name)
+  end
+
+  -- 获取展开节点
+  local expanded = M.get_expanded_nodes()
+  print("展开节点数: " .. #expanded)
+
+  -- 添加新节点
+  local new_node = {
+    id = "new_node_1",
+    name = "新节点",
+    type = "message",
+    content = "测试消息",
+  }
+
+  local added = M.add_node("branch_2", new_node)
+  print("添加节点结果: " .. tostring(added))
+
+  -- 查找节点
+  local found = M.find_node(function(node)
+    return node.name == "新节点"
+  end)
+
+  if found then
+    print("找到节点: " .. found.id)
+  end
+
+  -- 获取父节点
+  local parent = M.get_parent("new_node_1")
+  if parent then
+    print("父节点: " .. parent.name)
+  end
+
+  -- 删除节点
+  local deleted = M.delete_node("new_node_1")
+  print("删除节点结果: " .. tostring(deleted))
+
+  -- 移动节点
+  local moved = M.move_node("branch_2", "session_2")
+  print("移动节点结果: " .. tostring(moved))
+
+  -- 刷新树
+  M.refresh("test_session")
+
+  print("=== 测试完成 ===")
+end
+
+-- 运行测试
+if not vim then
+  -- 非Neovim环境下运行测试
+  test_module()
+end
+
+return M
