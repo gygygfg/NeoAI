@@ -63,6 +63,8 @@ local function create_float_window(options)
 
   -- 创建缓冲区
   local buf = vim.api.nvim_create_buf(false, true)
+  -- 将缓冲区加入缓冲区列表
+  vim.api.nvim_set_option_value("buflisted", true, { buf = buf })
 
   -- 创建浮动窗口
   local win_options = vim.deepcopy(merged_options)
@@ -125,11 +127,9 @@ local function create_tab_window(options)
   -- 创建新标签页
   vim.cmd("tabnew")
 
-  -- 获取当前窗口
+  -- 获取当前窗口和缓冲区
   local win = vim.api.nvim_get_current_win()
-  -- 创建新缓冲区
-  local buf = vim.api.nvim_create_buf(false, true)
-  vim.api.nvim_win_set_buf(win, buf)
+  local buf = vim.api.nvim_get_current_buf()
 
   -- 设置缓冲区选项
   vim.api.nvim_set_option_value("buftype", "nofile", { buf = buf })
@@ -177,11 +177,9 @@ local function create_split_window(options)
   else
     vim.cmd(split_cmd)
   end
-  -- 获取当前窗口
+  -- 获取当前窗口和缓冲区
   local win = vim.api.nvim_get_current_win()
-  -- 创建新缓冲区
-  local buf = vim.api.nvim_create_buf(false, true)
-  vim.api.nvim_win_set_buf(win, buf)
+  local buf = vim.api.nvim_get_current_buf()
 
   -- 设置缓冲区选项
   vim.api.nvim_set_option_value("buftype", "nofile", { buf = buf })
@@ -263,6 +261,10 @@ local function close_window_by_mode(window_info)
         -- 只有一个标签页，不能关闭
         vim.notify("[NeoAI] 不能关闭最后一个标签页", vim.log.levels.WARN)
       end
+      -- 删除缓冲区
+      if vim.api.nvim_buf_is_valid(window_info.buf) then
+        vim.api.nvim_buf_delete(window_info.buf, { force = true })
+      end
     end
   elseif id:match("^split_") then
     -- 分割窗口：关闭窗口
@@ -275,9 +277,30 @@ local function close_window_by_mode(window_info)
   end
 end
 
---- 设置窗口内容
---- @param window_info table 窗口信息
---- @param content string|table 内容
+--- 清理内容表中的换行符
+--- @param content_table table 内容表
+--- @return table 清理后的内容表
+local function clean_content_table(content_table)
+  if type(content_table) ~= "table" then
+    return content_table
+  end
+
+  local cleaned = {}
+  for _, line in ipairs(content_table) do
+    if type(line) == "string" then
+      -- 分割包含换行符的行
+      local sub_lines = vim.split(line, "\n")
+      for _, sub_line in ipairs(sub_lines) do
+        table.insert(cleaned, sub_line)
+      end
+    else
+      table.insert(cleaned, line)
+    end
+  end
+
+  return cleaned
+end
+
 --- @param filetype string 文件类型
 local function set_window_content_by_mode(window_info, content, filetype)
   if not window_info or not window_info.buf then
@@ -296,7 +319,9 @@ local function set_window_content_by_mode(window_info, content, filetype)
 
   -- 设置内容
   if type(content) == "table" then
-    vim.api.nvim_buf_set_lines(buf, 0, -1, false, content)
+    -- 清理内容表中的换行符
+    local cleaned_content = clean_content_table(content)
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, cleaned_content)
   else
     local lines = vim.split(content, "\n")
     vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
@@ -799,16 +824,16 @@ end
 
 --- 渲染树状图（通用函数）
 --- @param tree_data table 树数据
---- @param state table 模块状态
+--- @param tree_state table 树状态
 --- @param load_data_func function 加载数据的函数
 --- @return table 渲染后的内容
-function M.render_tree(tree_data, state, load_data_func)
+function M.render_tree(tree_data, tree_state, load_data_func)
   if tree_data then
-    state.tree_data = tree_data
+    tree_state.tree_data = tree_data
   end
 
   -- 如果没有树数据，尝试加载
-  if #state.tree_data == 0 and load_data_func then
+  if #tree_state.tree_data == 0 and load_data_func then
     -- 调用加载函数，传递 nil 作为 session_id 参数
     load_data_func(nil)
   end
@@ -825,14 +850,14 @@ function M.render_tree(tree_data, state, load_data_func)
   table.insert(content, "")
 
   -- 渲染树
-  if #state.tree_data == 0 then
+  if #tree_state.tree_data == 0 then
     table.insert(content, "暂无会话")
     table.insert(content, "按 N 创建新会话")
   else
-    local root_count = #state.tree_data
-    for i, root_node in ipairs(state.tree_data) do
+    local root_count = #tree_state.tree_data
+    for i, root_node in ipairs(tree_state.tree_data) do
       local is_last = (i == root_count)
-      M._render_tree_node(content, root_node, 0, is_last, "", state)
+      M._render_tree_node(content, root_node, 0, is_last, "", tree_state)
     end
   end
 
@@ -842,12 +867,12 @@ function M.render_tree(tree_data, state, load_data_func)
 
   -- 构建状态行文本
   local status_text = "当前选中: "
-  if state.selected_node_id then
-    local node_name = M._get_node_name_by_id(state.selected_node_id, state.tree_data)
+  if tree_state.selected_node_id then
+    local node_name = M._get_node_name_by_id(tree_state.selected_node_id, tree_state.tree_data)
     if node_name then
       status_text = status_text .. node_name
     else
-      status_text = status_text .. state.selected_node_id
+      status_text = status_text .. tree_state.selected_node_id
     end
   else
     status_text = status_text .. "无"
@@ -864,8 +889,8 @@ end
 --- @param depth number 深度
 --- @param is_last boolean 是否是父节点的最后一个子节点
 --- @param parent_prefix string 父节点的前缀
---- @param state table 模块状态
-function M._render_tree_node(content, node, depth, is_last, parent_prefix, state)
+--- @param tree_state table 树状态
+function M._render_tree_node(content, node, depth, is_last, parent_prefix, tree_state)
   if not node then
     return
   end
@@ -888,7 +913,7 @@ function M._render_tree_node(content, node, depth, is_last, parent_prefix, state
   -- 判断是否有子节点
   local node_prefix = ""
   if node.children and #node.children > 0 then
-    if state.expanded_nodes and state.expanded_nodes[node.id] then
+    if tree_state.expanded_nodes and tree_state.expanded_nodes[node.id] then
       node_prefix = "" -- 展开的节点不需要前缀
     else
       node_prefix = "" -- 折叠的节点也不需要前缀
@@ -913,7 +938,7 @@ function M._render_tree_node(content, node, depth, is_last, parent_prefix, state
   table.insert(content, line)
 
   -- 渲染子节点（如果展开）
-  if state.expanded_nodes and state.expanded_nodes[node.id] and node.children then
+  if tree_state.expanded_nodes and tree_state.expanded_nodes[node.id] and node.children then
     local child_count = #node.children
 
     -- 为子节点生成新的前缀
@@ -928,7 +953,7 @@ function M._render_tree_node(content, node, depth, is_last, parent_prefix, state
 
     for i, child in ipairs(node.children) do
       local child_is_last = (i == child_count)
-      M._render_tree_node(content, child, depth + 1, child_is_last, child_parent_prefix, state)
+      M._render_tree_node(content, child, depth + 1, child_is_last, child_parent_prefix, tree_state)
     end
   end
 end

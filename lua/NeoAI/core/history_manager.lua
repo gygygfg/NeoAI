@@ -34,7 +34,18 @@ Session.__index = Session
 --- @return Session 新会话对象
 function Session:new(id, name, metadata)
   local obj = setmetatable({}, Session)
-  obj.id = id or vim.fn.strftime("%Y%m%d_%H%M%S") .. "_" .. tostring(math.random(1000, 9999))
+
+  -- 生成与 sessions.json 格式兼容的 ID
+  if id then
+    obj.id = id
+  else
+    -- 生成基于时间戳的ID，确保唯一性
+    -- 使用时间戳和随机数组合
+    local timestamp = os.time()
+    local random_num = math.random(1000, 9999)
+    obj.id = tostring(timestamp) .. "_" .. tostring(random_num)
+  end
+
   obj.name = name or "新会话"
   obj.metadata = metadata or {
     created_at = os.time(),
@@ -154,16 +165,62 @@ end
 --- @param filepath string 文件路径
 --- @param config table|nil 可选配置，用于备用目录
 function Session:save(filepath, config)
-  local data = {
-    id = self.id,
-    name = self.name,
-    metadata = self.metadata,
-    messages = self.messages,
-    branches = self.branches,
-    current_branch_id = self.current_branch_id,
-  }
+  -- 转换会话数据为 sessions.json 格式
+  -- 为 sessions.json 生成或查找数字ID
+  local session_num_id = nil
 
-  local json_str = vim.json.encode(data)
+  -- 首先检查这个会话是否已经存在于文件中
+  if vim.fn.filereadable(filepath) == 1 then
+    local content = vim.fn.readfile(filepath)
+    if #content > 0 then
+      local success, existing_sessions = pcall(vim.json.decode, table.concat(content, "\n"))
+      if success and existing_sessions then
+        -- 尝试通过名称和创建时间匹配现有会话
+        for key, existing_session in pairs(existing_sessions) do
+          if
+            existing_session.name == self.name
+            and existing_session.created_at == (self.metadata.created_at or os.time())
+          then
+            -- 找到匹配的会话，使用文件中的ID
+            session_num_id = existing_session.id
+            break
+          end
+        end
+
+        -- 如果没有找到匹配的会话，生成新的ID
+        if not session_num_id then
+          local max_id = 0
+          for key, _ in pairs(existing_sessions) do
+            local num = tonumber(key)
+            if num and num > max_id then
+              max_id = num
+            end
+          end
+          session_num_id = max_id + 1
+        end
+      end
+    end
+  end
+
+  -- 如果文件不存在或读取失败，使用默认ID
+  if not session_num_id then
+    session_num_id = 1
+  end
+
+  local session_data = {
+    messages = self.messages,
+    export_time = os.time(),
+    updated_at = self.metadata.last_updated or os.time(),
+    name = self.name,
+    id = session_num_id,
+    created_at = self.metadata.created_at or os.time(),
+    graph_relations = { children = {} },
+    config = {
+      max_history = state.max_history_per_session or 100,
+      auto_scroll = true,
+      show_timestamps = true,
+    },
+  }
 
   -- 获取目录路径
   local dir = filepath:match("(.*)/")
@@ -182,18 +239,50 @@ function Session:save(filepath, config)
     else
       -- 使用默认的备用目录
       local home_dir = os.getenv("HOME") or "/tmp"
-      backup_dir = home_dir .. "/.cache/nvim/neoai_sessions/"
+      backup_dir = home_dir .. "/.cache/nvim/NeoAI/"
     end
 
     if dir ~= backup_dir then
-      local filename = filepath:match("([^/]+)$") or self.id .. ".json"
-      filepath = backup_dir .. filename
+      filepath = backup_dir .. "sessions.json"
       dir = backup_dir
       ensure_directory(dir)
     end
   end
 
+  -- 读取现有的 sessions.json 文件（如果存在）
+  local all_sessions = {}
+  if vim.fn.filereadable(filepath) == 1 then
+    local content = vim.fn.readfile(filepath)
+    if #content > 0 then
+      local success, data = pcall(vim.json.decode, table.concat(content, "\n"))
+      if success and data then
+        all_sessions = data
+      end
+    end
+  end
+
+  -- 更新或添加当前会话
+  all_sessions[tostring(session_data.id)] = session_data
+
+  -- 更新内存中的会话ID以匹配保存的ID
+  local old_id = self.id
+  self.id = tostring(session_data.id)
+
+  -- 如果ID改变了，需要更新state.sessions中的引用
+  if old_id ~= self.id then
+    -- 从旧的ID位置移除
+    state.sessions[old_id] = nil
+    -- 添加到新的ID位置
+    state.sessions[self.id] = self
+
+    -- 如果这是当前会话，更新current_session_id
+    if state.current_session_id == old_id then
+      state.current_session_id = self.id
+    end
+  end
+
   -- 写入文件
+  local json_str = vim.json.encode(all_sessions)
   if not write_file(filepath, json_str) then
     -- 写入失败，尝试使用临时文件
     local temp_file = os.tmpname()
@@ -211,8 +300,9 @@ end
 
 --- 从文件加载会话
 --- @param filepath string 文件路径
+--- @param session_id string|nil 会话ID（仅当从 sessions.json 加载时需要）
 --- @return Session|nil 加载的会话
-function Session.load(filepath)
+function Session.load(filepath, session_id)
   if vim.fn.filereadable(filepath) == 0 then
     return nil
   end
@@ -227,10 +317,50 @@ function Session.load(filepath)
     return nil
   end
 
-  local session = Session:new(data.id, data.name, data.metadata)
-  session.messages = data.messages or {}
-  session.branches = data.branches or {}
-  session.current_branch_id = data.current_branch_id
+  -- 检查是否是 sessions.json 格式（包含多个会话）
+  if data["1"] or data["2"] or data["3"] then
+    -- 这是 sessions.json 格式，需要根据 session_id 获取特定会话
+    if not session_id then
+      -- 如果没有指定 session_id，返回第一个会话
+      for key, session_data in pairs(data) do
+        return Session._from_sessions_json_format(session_data, key)
+      end
+      return nil
+    else
+      -- 查找指定 ID 的会话
+      local session_data = data[tostring(session_id)]
+      if session_data then
+        return Session._from_sessions_json_format(session_data, tostring(session_id))
+      end
+      return nil
+    end
+  else
+    -- 这是旧的单个会话文件格式
+    local session = Session:new(data.id, data.name, data.metadata)
+    session.messages = data.messages or {}
+    session.branches = data.branches or {}
+    session.current_branch_id = data.current_branch_id
+    return session
+  end
+end
+
+--- 从 sessions.json 格式转换会话数据
+--- @param session_data table sessions.json 格式的会话数据
+--- @param session_id string 会话ID
+--- @return Session 转换后的会话对象
+function Session._from_sessions_json_format(session_data, session_id)
+  -- 转换 metadata
+  local metadata = {
+    created_at = session_data.created_at or os.time(),
+    message_count = #(session_data.messages or {}),
+    last_updated = session_data.updated_at or os.time(),
+  }
+
+  -- 创建会话对象
+  local session = Session:new(session_id, session_data.name, metadata)
+  session.messages = session_data.messages or {}
+  session.branches = {} -- sessions.json 格式不支持分支
+  session.current_branch_id = nil
 
   return session
 end
@@ -408,10 +538,21 @@ function M.delete_session(session_id)
     state.current_session_id = nil
   end
 
-  -- 删除会话文件
+  -- 从 sessions.json 文件中删除会话
   local filepath = M._get_session_filepath(session_id)
   if vim.fn.filereadable(filepath) == 1 then
-    vim.fn.delete(filepath)
+    local content = vim.fn.readfile(filepath)
+    if #content > 0 then
+      local success, all_sessions = pcall(vim.json.decode, table.concat(content, "\n"))
+      if success and all_sessions then
+        -- 删除指定会话
+        all_sessions[tostring(session_id)] = nil
+
+        -- 保存更新后的文件
+        local json_str = vim.json.encode(all_sessions)
+        write_file(filepath, json_str)
+      end
+    end
   end
 
   -- 从内存中删除
@@ -557,8 +698,8 @@ end
 --- @param session_id string 会话ID
 --- @return string 文件路径
 function M._get_session_filepath(session_id)
-  local save_path = state.config.save_path or vim.fn.stdpath("cache") .. "/neoai_sessions"
-  return save_path .. "/" .. session_id .. ".json"
+  local save_path = state.config.save_path or vim.fn.stdpath("cache") .. "/NeoAI"
+  return save_path .. "/sessions.json"
 end
 
 --- 自动保存会话（内部使用）
@@ -579,19 +720,44 @@ function M._load_sessions()
     return
   end
 
-  local save_path = state.config.save_path or vim.fn.stdpath("cache") .. "/neoai_sessions"
+  local save_path = state.config.save_path or vim.fn.stdpath("cache") .. "/NeoAI"
+  local sessions_file = save_path .. "/sessions.json"
 
   -- 如果目录不存在，创建它
   if vim.fn.isdirectory(save_path) == 0 then
     ensure_directory(save_path)
   end
 
-  local files = vim.fn.glob(save_path .. "/*.json", false, true)
-
-  for _, filepath in ipairs(files) do
-    local session = Session.load(filepath)
-    if session then
-      state.sessions[session.id] = session
+  -- 检查 sessions.json 文件是否存在
+  if vim.fn.filereadable(sessions_file) == 1 then
+    -- 从 sessions.json 加载所有会话
+    local content = vim.fn.readfile(sessions_file)
+    if #content > 0 then
+      local success, all_sessions = pcall(vim.json.decode, table.concat(content, "\n"))
+      if success and all_sessions then
+        -- 加载所有会话
+        for session_id_str, session_data in pairs(all_sessions) do
+          -- 跳过 _graph 等非会话数据
+          if session_id_str ~= "_graph" and type(session_data) == "table" and session_data.messages ~= nil then
+            local session = Session._from_sessions_json_format(session_data, session_id_str)
+            if session then
+              state.sessions[session.id] = session
+            end
+          end
+        end
+      end
+    end
+  else
+    -- 向后兼容：尝试从旧的单个文件格式加载
+    local old_save_path = vim.fn.stdpath("cache") .. "/neoai_sessions"
+    if vim.fn.isdirectory(old_save_path) == 1 then
+      local files = vim.fn.glob(old_save_path .. "/*.json", false, true)
+      for _, filepath in ipairs(files) do
+        local session = Session.load(filepath)
+        if session then
+          state.sessions[session.id] = session
+        end
+      end
     end
   end
 

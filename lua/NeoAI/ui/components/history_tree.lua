@@ -696,4 +696,37 @@ if not vim then
   test_module()
 end
 
-return M
+--- 异步构建树
+--- @param session_id string 会话ID
+--- @param callback function 回调函数
+function M.build_tree_async(session_id, callback)
+  if not state.initialized then
+    if callback then
+      callback({})
+    end
+    return
+  end
+
+  -- 使用异步工作器
+  local async_worker = require("NeoAI.utils.async_worker")
+
+  async_worker.submit_task("build_history_tree", function()
+    -- 在后台线程中加载树数据
+    M._load_tree_data(session_id)
+    
+    -- 返回构建的树数据
+    return M.get_tree_data()
+  end, function(success, tree_data, error_msg)
+    if callback then
+      if success then
+        callback(tree_data)
+      else
+        -- 如果异步失败，回退到同步版本
+        local fallback_data = M.build_tree(session_id)
+        callback(fallback_data)
+      end
+    end
+  end)
+end
+
+  return M

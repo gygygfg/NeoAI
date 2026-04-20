@@ -208,6 +208,51 @@ function M._convert_to_folded_text(reasoning_text)
   vim.notify("思考过程已转换为折叠文本并复制到剪贴板", vim.log.levels.INFO)
 end
 
+--- 异步将思考内容转换为折叠文本
+--- @param reasoning_text string 思考内容
+--- @param callback function 回调函数
+function M._convert_to_folded_text_async(reasoning_text, callback)
+  -- 确保 reasoning_text 是字符串
+  local reasoning_str = tostring(reasoning_text or "")
+
+  if reasoning_str == "" then
+    if callback then
+      callback("", "思考内容为空")
+    end
+    return
+  end
+
+  -- 使用异步工作器
+  local async_worker = require("NeoAI.utils.async_worker")
+
+  async_worker.submit_task("convert_to_folded_text", function()
+    -- 在后台线程中创建折叠文本格式
+    local folded_text = "\n<details>\n<summary>🤔 思考过程 (点击展开)</summary>\n\n"
+    folded_text = folded_text .. reasoning_str
+    folded_text = folded_text .. "\n\n</details>\n"
+    
+    return folded_text
+  end, function(success, folded_text, error_msg)
+    if callback then
+      if success then
+        -- 在主线程中复制到剪贴板
+        vim.schedule(function()
+          vim.fn.setreg("+", folded_text)
+          vim.fn.setreg("*", folded_text)
+          vim.notify("思考过程已转换为折叠文本并复制到剪贴板", vim.log.levels.INFO)
+        end)
+        callback(folded_text, nil)
+      else
+        -- 如果异步失败，回退到同步版本
+        vim.schedule(function()
+          M._convert_to_folded_text(reasoning_str)
+        end)
+        callback("", error_msg or "异步转换失败")
+      end
+    end
+  end)
+end
+
 --- 更新窗口内容（内部使用）
 function M._update_window_content()
   if not state.current_window_id then

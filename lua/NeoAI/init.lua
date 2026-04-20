@@ -108,86 +108,7 @@ local function register_commands()
   end, {
     desc = "显示NeoAI聊天窗口状态",
   })
-
-  -- NeoAIAsyncDemo 命令：运行异步操作演示
-  vim.api.nvim_create_user_command("NeoAIAsyncDemo", function()
-    local async_demo = require("NeoAI.test_async_operations")
-    async_demo.run_all_demos()
-  end, {
-    desc = "运行NeoAI异步操作演示",
-  })
-
-  -- NeoAITestAsync 命令：异步运行测试
-  vim.api.nvim_create_user_command("NeoAITestAsync", function()
-    local tests = require("NeoAI.tests")
-    tests.run_all_async(function(results)
-      vim.schedule(function()
-        print("\n📊 异步测试结果:")
-        print(string.format("✅ 通过: %d", results.passed))
-        print(string.format("❌ 失败: %d", results.failed))
-        print(string.format("💥 错误: %d", results.errored))
-        print(
-          string.format("📈 通过率: %.1f%%", results.total > 0 and (results.passed / results.total) * 100 or 0)
-        )
-      end)
-    end)
-  end, {
-    desc = "异步运行NeoAI测试",
-  })
-
-  -- NeoAIAsyncStatus 命令：显示异步工作器状态
-  vim.api.nvim_create_user_command("NeoAIAsyncStatus", function()
-    local async_worker = require("NeoAI.utils.async_worker")
-    local status_list = async_worker.get_all_worker_status()
-
-    if #status_list == 0 then
-      print("📊 没有活动的异步工作器")
-    else
-      print("📊 异步工作器状态:")
-      for _, status in ipairs(status_list) do
-        local status_icon = ""
-        if status.status == "running" then
-          status_icon = "🔄"
-        elseif status.status == "completed" then
-          status_icon = "✅"
-        elseif status.status == "failed" then
-          status_icon = "❌"
-        elseif status.status == "idle" then
-          status_icon = "⏸️"
-        else
-          status_icon = "❓"
-        end
-
-        print(string.format("  %s %s - %s (%.3fs)", status_icon, status.name, status.status, status.duration or 0))
-      end
-    end
-  end, {
-    desc = "显示NeoAI异步工作器状态",
-  })
 end
-
--- NeoAITestAll 命令：运行所有测试
-vim.api.nvim_create_user_command("NeoAITestAll", function()
-  M.test()
-end, {
-  desc = "运行所有NeoAI测试",
-})
-
--- NeoAITest 命令：运行指定测试
-vim.api.nvim_create_user_command("NeoAITest", function(opts)
-  M.test(opts.args)
-end, {
-  desc = "运行指定NeoAI测试",
-  nargs = 1,
-  complete = function()
-    local test_module = require("NeoAI.tests")
-    local completions = {}
-    for name, _ in pairs(test_module.tests) do
-      table.insert(completions, name)
-    end
-    return completions
-  end,
-})
 
 -- 内部函数：注册全局快捷键
 local function register_global_keymaps()
@@ -299,17 +220,6 @@ function M.setup(user_config)
   local info_level = vim.log.levels and vim.log.levels.INFO or "INFO"
   vim.notify("[NeoAI] 插件已初始化，命令和快捷键已注册", info_level)
 
-  -- 检查是否需要自动运行测试
-  if config.test and config.test.auto_test then
-    local delay_ms = config.test.delay_ms or 500
-
-    -- 延迟执行测试
-    vim.defer_fn(function()
-      vim.notify("[NeoAI] 开始自动运行测试...", info_level)
-      M.test()
-    end, delay_ms)
-  end
-
   return M
 end
 
@@ -380,53 +290,6 @@ function M.get_keymap_manager()
   end
 
   return state.core.get_keymap_manager()
-end
-
---- 运行测试套件
---- @param test_name string|nil 可选：指定运行的测试名称，如果为nil则运行所有测试
-function M.test(test_name)
-  -- 加载测试模块
-  local test_module = require("NeoAI.tests")
-
-  -- 如果指定了测试名称，只运行该测试
-  if test_name then
-    local test_to_run = test_module.tests[test_name]
-    if test_to_run and test_to_run.run then
-      print("🚀 运行指定测试: " .. test_name)
-      print(string.rep("=", 50))
-
-      local pcall_success, pcall_result = pcall(test_to_run.run)
-      if pcall_success then
-        -- pcall成功，检查测试函数的返回值
-        if type(pcall_result) == "table" and #pcall_result >= 1 then
-          local test_success = pcall_result[1]
-          local test_message = pcall_result[2] or ""
-
-          if test_success then
-            print("✅ " .. test_name .. " 测试通过: " .. test_message)
-          else
-            print("❌ " .. test_name .. " 测试失败: " .. test_message)
-          end
-        else
-          -- 测试函数没有返回预期的格式
-          print("⚠️  " .. test_name .. " 测试返回了意外的格式: " .. type(pcall_result))
-          print("❌ " .. test_name .. " 测试失败: 测试函数没有返回正确的格式 {success, message}")
-        end
-      else
-        -- pcall失败，测试函数抛出了异常
-        print("❌ " .. test_name .. " 测试失败（异常）: " .. tostring(pcall_result))
-      end
-    else
-      print("⚠️ 未找到测试: " .. test_name)
-      print("可用测试:")
-      for name, _ in pairs(test_module.tests) do
-        print("  - " .. name)
-      end
-    end
-  else
-    -- 运行所有测试
-    test_module.run_all()
-  end
 end
 
 return M

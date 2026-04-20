@@ -82,7 +82,6 @@ local DEFAULT_CONFIG = {
     auto_test = false, -- 是否在启动后自动运行所有测试
     delay_ms = 1500, -- 延迟毫秒数（VimEnter后1500毫秒）
   },
-
 }
 
 --- 验证用户配置
@@ -92,19 +91,19 @@ function M.validate_config(config)
   if not config then
     return {}
   end
-  
+
   -- 验证AI配置
   if config.ai then
     if config.ai.model and type(config.ai.model) ~= "string" then
       vim.notify("[NeoAI] ai.model must be a string. Using default.", vim.log.levels.WARN)
       config.ai.model = nil
     end
-    
+
     if config.ai.api_key ~= nil and type(config.ai.api_key) ~= "string" then
       vim.notify("[NeoAI] ai.api_key must be a string. Using default.", vim.log.levels.WARN)
       config.ai.api_key = nil
     end
-    
+
     if
       config.ai.temperature
       and (type(config.ai.temperature) ~= "number" or config.ai.temperature < 0 or config.ai.temperature > 2)
@@ -112,13 +111,13 @@ function M.validate_config(config)
       vim.notify("[NeoAI] ai.temperature must be a number between 0 and 2. Using default.", vim.log.levels.WARN)
       config.ai.temperature = nil
     end
-    
+
     if config.ai.max_tokens and (type(config.ai.max_tokens) ~= "number" or config.ai.max_tokens < 1) then
       vim.notify("[NeoAI] ai.max_tokens must be a positive number. Using default.", vim.log.levels.WARN)
       config.ai.max_tokens = nil
     end
   end
-  
+
   -- 验证UI配置
   if config.ui then
     -- 验证默认UI
@@ -132,7 +131,7 @@ function M.validate_config(config)
         config.ui.default_ui = nil
       end
     end
-    
+
     -- 验证窗口模式
     if config.ui.window_mode then
       local valid_modes = { "float", "tab", "split" }
@@ -147,20 +146,20 @@ function M.validate_config(config)
         config.ui.window_mode = nil
       end
     end
-    
+
     if config.ui.window then
       if config.ui.window.width and (type(config.ui.window.width) ~= "number" or config.ui.window.width < 10) then
         vim.notify("[NeoAI] ui.window.width must be a number >= 10. Using default.", vim.log.levels.WARN)
         config.ui.window.width = nil
       end
-      
+
       if config.ui.window.height and (type(config.ui.window.height) ~= "number" or config.ui.window.height < 5) then
         vim.notify("[NeoAI] ui.window.height must be a number >= 5. Using default.", vim.log.levels.WARN)
         config.ui.window.height = nil
       end
     end
   end
-  
+
   -- 验证键位配置（现在在顶层）
   if config.keymaps then
     local valid_contexts = { "global", "tree", "chat", "virtual_input" }
@@ -178,10 +177,7 @@ function M.validate_config(config)
       else
         -- 检查键位表是否为table
         if type(keymap_table) ~= "table" then
-          vim.notify(
-            string.format("[NeoAI] keymaps.%s must be a table. Using default.", context),
-            vim.log.levels.WARN
-          )
+          vim.notify(string.format("[NeoAI] keymaps.%s must be a table. Using default.", context), vim.log.levels.WARN)
           config.keymaps[context] = nil
         else
           -- 验证每个键位配置
@@ -206,7 +202,7 @@ function M.validate_config(config)
                 )
                 keymap_table[action] = nil
               end
-              
+
               -- 检查desc字段是否存在且为字符串（可选）
               if key_config.desc and type(key_config.desc) ~= "string" then
                 vim.notify(
@@ -221,17 +217,21 @@ function M.validate_config(config)
       end
     end
   end
-  
+
   -- 验证会话配置
   if config.session then
     if
-      config.session.max_history_per_session and (type(config.session.max_history_per_session) ~= "number" or config.session.max_history_per_session < 1)
+      config.session.max_history_per_session
+      and (type(config.session.max_history_per_session) ~= "number" or config.session.max_history_per_session < 1)
     then
-      vim.notify("[NeoAI] session.max_history_per_session must be a positive number. Using default.", vim.log.levels.WARN)
+      vim.notify(
+        "[NeoAI] session.max_history_per_session must be a positive number. Using default.",
+        vim.log.levels.WARN
+      )
       config.session.max_history_per_session = nil
     end
   end
-  
+
   return config
 end
 
@@ -251,7 +251,7 @@ function M.merge_defaults(config)
       end
     end
   end
-  
+
   deep_merge(result, config or {})
   return result
 end
@@ -267,13 +267,13 @@ function M.sanitize_config(config)
       vim.fn.mkdir(path, "p")
     end
   end
-  
+
   -- 清理API密钥
   if config.ai and config.ai.api_key then
     -- 可以在这里添加API密钥的加密或安全处理
     -- 目前只是保留原样
   end
-  
+
   return config
 end
 

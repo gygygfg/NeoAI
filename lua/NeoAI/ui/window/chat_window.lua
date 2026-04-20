@@ -2,6 +2,7 @@ local M = {}
 local MODULE_NAME = "NeoAI.ui.window.chat_window"
 
 local window_manager = require("NeoAI.ui.window.window_manager")
+local virtual_input = require("NeoAI.ui.components.virtual_input")
 
 -- 模块状态
 local state = {
@@ -21,6 +22,9 @@ function M.initialize(config)
   end
   state.config = config or {}
   state.initialized = true
+
+  -- 初始化虚拟输入组件
+  virtual_input.initialize(config)
 
   -- 注册AI响应事件监听器
   M._setup_event_listeners()
@@ -98,6 +102,17 @@ function M.open(session_id, window_id, branch_id)
   -- 触发聊天框打开事件
   vim.api.nvim_exec_autocmds("User", { pattern = "NeoAI:chat_box_opened", data = { window_id = window_id } })
 
+  -- 调整窗口位置，确保不在屏幕最下方
+  M._adjust_window_position()
+
+  -- 自动获取焦点
+  M._focus_window()
+
+  -- 自动打开虚拟输入框
+  vim.defer_fn(function()
+    M._open_virtual_input()
+  end, 100) -- 延迟100ms，确保窗口完全打开
+
   return true
 end
 
@@ -135,7 +150,22 @@ function M.render_chat()
       else
         for _, msg in ipairs(state.messages) do
           local role_prefix = msg.role == "user" and "👤 用户:" or "🤖 AI:"
-          table.insert(content, string.format("%s %s", role_prefix, msg.content))
+
+          -- 处理消息内容中的换行符
+          local msg_lines = vim.split(msg.content or "", "\n")
+
+          -- 添加第一行（带角色前缀）
+          if #msg_lines > 0 then
+            table.insert(content, string.format("%s %s", role_prefix, msg_lines[1]))
+
+            -- 添加剩余的行（不带角色前缀）
+            for i = 2, #msg_lines do
+              table.insert(content, string.format("    %s", msg_lines[i]))
+            end
+          else
+            table.insert(content, string.format("%s", role_prefix))
+          end
+
           table.insert(content, "")
         end
       end
@@ -150,6 +180,17 @@ function M.render_chat()
       if success and content then
         -- 设置窗口内容
         window_manager.set_window_content(state.current_window_id, content)
+
+        -- 调整窗口位置，确保不在屏幕最下方
+        M._adjust_window_position()
+
+        -- 自动获取焦点
+        M._focus_window()
+
+        -- 打开虚拟输入框
+        vim.defer_fn(function()
+          M._open_virtual_input()
+        end, 50)
 
         -- 触发渲染完成事件
         vim.api.nvim_exec_autocmds(
@@ -216,6 +257,14 @@ function M.render_chat_async(callback)
       -- 使用vim.schedule确保在合适的时机更新UI
       vim.schedule(function()
         window_manager.set_window_content(state.current_window_id, content)
+        -- 调整窗口位置，确保不在屏幕最下方
+        M._adjust_window_position()
+        -- 自动获取焦点
+        M._focus_window()
+        -- 打开虚拟输入框
+        vim.defer_fn(function()
+          M._open_virtual_input()
+        end, 50)
       end)
 
       if callback then
@@ -362,6 +411,110 @@ function M._exit_insert_mode()
   end
 end
 
+--- 获取窗口焦点（内部函数）
+function M._focus_window()
+  if not state.current_window_id then
+    return
+  end
+
+  local win_handle = window_manager.get_window_win(state.current_window_id)
+  if win_handle and vim.api.nvim_win_is_valid(win_handle) then
+    vim.api.nvim_set_current_win(win_handle)
+    return true
+  end
+  return false
+end
+
+--- 调整窗口位置（内部函数）
+--- 确保窗口不在屏幕最下方
+function M._adjust_window_position()
+  if not state.current_window_id then
+    return
+  end
+
+  local win_handle = window_manager.get_window_win(state.current_window_id)
+  if not win_handle or not vim.api.nvim_win_is_valid(win_handle) then
+    return
+  end
+
+  -- 获取窗口配置
+  local win_config = vim.api.nvim_win_get_config(win_handle)
+  if not win_config or win_config.relative == "" then
+    -- 不是浮动窗口，不需要调整
+    return
+  end
+
+  -- 获取屏幕尺寸
+  local screen_height = vim.o.lines
+  local screen_width = vim.o.columns
+
+  -- 获取窗口尺寸
+  local win_height = win_config.height or 20
+  local win_width = win_config.width or 80
+
+  -- 获取当前位置
+  local current_row = win_config.row or 0
+
+  -- 检查窗口是否在屏幕底部（距离底部小于10%）
+  local bottom_threshold = screen_height * 0.9
+  if current_row + win_height > bottom_threshold then
+    -- 调整位置到屏幕中央偏上
+    local new_row = math.floor(screen_height * 0.2)
+    local new_col = math.floor((screen_width - win_width) / 2)
+
+    -- 更新窗口位置
+    win_config.row = new_row
+    win_config.col = new_col
+
+    -- 应用新的窗口配置
+    vim.api.nvim_win_set_config(win_handle, win_config)
+
+    print("📊 调整聊天窗口位置到屏幕中央偏上")
+  end
+end
+
+--- 打开虚拟输入框（内部函数）
+function M._open_virtual_input()
+  if not state.current_window_id then
+    return false
+  end
+
+  local win_handle = window_manager.get_window_win(state.current_window_id)
+  if not win_handle or not vim.api.nvim_win_is_valid(win_handle) then
+    return false
+  end
+
+  -- 检查虚拟输入框是否已经打开
+  -- 这里可以添加检查逻辑，避免重复打开
+
+  -- 打开虚拟输入框
+  local success = virtual_input.open(win_handle, {
+    placeholder = "输入消息...",
+    on_submit = function(content)
+      -- 当用户提交消息时，调用发送消息函数
+      if content and content ~= "" then
+        M.send_message(content)
+      end
+    end,
+    on_cancel = function()
+      -- 当用户取消时，不执行任何操作
+      -- 虚拟输入框保持打开状态
+    end,
+    on_change = function(content)
+      -- 可以在这里处理内容变化
+      -- print("内容变化:", content)
+    end,
+  })
+
+  if success then
+    print("📝 虚拟输入框已打开")
+    return true
+  else
+    print("⚠️  无法打开虚拟输入框")
+    return false
+  end
+end
+
 --- 发送消息（内部函数）
 function M._send_message()
   if not state.current_window_id then
@@ -459,9 +612,56 @@ function M._load_messages(session_id)
     {
       role = "assistant",
       content = "不客气！如果你需要更多帮助，请随时告诉我。",
-      timestamp = os.time() - 1790,
     },
   }
+end
+
+--- 异步加载消息数据（内部函数）
+--- @param session_id string 会话ID
+--- @param callback function 回调函数
+function M._load_messages_async(session_id, callback)
+  -- 使用异步工作器
+  local async_worker = require("NeoAI.utils.async_worker")
+
+  async_worker.submit_task("load_chat_messages", function()
+    -- 在后台线程中加载消息数据
+    -- 这里应该从会话管理器加载消息数据
+    -- 目前使用模拟数据
+    local messages = {
+      {
+        role = "user",
+        content = "你好，请帮我写一个Lua函数",
+        timestamp = os.time() - 3600,
+      },
+      {
+        role = "assistant",
+        content = '当然！这是一个简单的Lua函数示例:\n\n```lua\nfunction greet(name)\n  return "Hello, " .. name .. "!"\nend\n```',
+        timestamp = os.time() - 3590,
+      },
+      {
+        role = "user",
+        content = "谢谢，这个函数很好用",
+        timestamp = os.time() - 1800,
+      },
+      {
+        role = "assistant",
+        content = "不客气！如果你需要更多帮助，请随时告诉我。",
+        timestamp = os.time() - 1790,
+      },
+    }
+
+    return messages
+  end, function(success, messages, error_msg)
+    if callback then
+      if success then
+        callback(messages)
+      else
+        -- 如果异步失败，回退到同步版本
+        M._load_messages(session_id)
+        callback(state.messages)
+      end
+    end
+  end)
 end
 
 --- 关闭聊天窗口
@@ -491,6 +691,9 @@ function M.close()
     "User",
     { pattern = "NeoAI:chat_box_closing", data = { window_id = state.current_window_id } }
   )
+
+  -- 关闭虚拟输入框（只在聊天界面关闭时才关闭，使用force模式）
+  virtual_input.close("force")
 
   window_manager.close_window(state.current_window_id)
 

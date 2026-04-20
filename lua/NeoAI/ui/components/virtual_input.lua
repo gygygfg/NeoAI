@@ -10,10 +10,25 @@ local function set_placeholder_highlight(buf_id)
   local ns_id = vim.api.nvim_create_namespace("NeoAI_VirtualInput")
   vim.api.nvim_buf_clear_namespace(buf_id, ns_id, 0, -1)
 
+  -- 获取缓冲区第一行的内容
+  local lines = vim.api.nvim_buf_get_lines(buf_id, 0, 1, false)
+  if not lines or #lines == 0 then
+    return
+  end
+  
+  local first_line = lines[1] or ""
+  local line_length = #first_line
+  
+  -- 确保 end_col 不超过行长度
+  local end_col = line_length
+  if end_col < 0 then
+    end_col = 0
+  end
+
   -- 设置占位文本高亮
   vim.api.nvim_buf_set_extmark(buf_id, ns_id, 0, 0, {
     end_line = 0,
-    end_col = -1,
+    end_col = end_col,
     hl_group = "Comment",
     priority = 50,
   })
@@ -175,6 +190,21 @@ function M.close(mode)
     return
   end
 
+  -- 只允许force模式关闭输入框
+  if mode ~= "force" then
+    -- 对于submit和cancel模式，只执行回调但不关闭输入框
+    if mode == "submit" then
+      if state.on_submit and type(state.on_submit) == "function" then
+        state.on_submit(state.content)
+      end
+    elseif mode == "cancel" then
+      if state.on_cancel and type(state.on_cancel) == "function" then
+        state.on_cancel()
+      end
+    end
+    return
+  end
+
   -- 保存内容
   if state.buffer_id and vim.api.nvim_buf_is_valid(state.buffer_id) then
     local lines = vim.api.nvim_buf_get_lines(state.buffer_id, 0, -1, false)
@@ -184,19 +214,6 @@ function M.close(mode)
         state.content = ""
       end
     end
-  end
-
-  -- 根据关闭模式处理内容
-  if mode == "submit" then
-    if state.on_submit and type(state.on_submit) == "function" then
-      state.on_submit(state.content)
-    end
-  elseif mode == "cancel" then
-    if state.on_cancel and type(state.on_cancel) == "function" then
-      state.on_cancel()
-    end
-  elseif mode == "force" then
-    -- 强制关闭，不调用回调
   end
 
   -- 关闭窗口
@@ -221,12 +238,30 @@ function M.close(mode)
   end
 end
 
---- 提交输入内容
+--- 提交输入内容（不清空内容，不关闭输入框）
 function M.submit()
   if not state.active then
     return
   end
-  M.close("submit")
+  
+  -- 保存当前内容
+  if state.buffer_id and vim.api.nvim_buf_is_valid(state.buffer_id) then
+    local lines = vim.api.nvim_buf_get_lines(state.buffer_id, 0, -1, false)
+    if #lines > 0 then
+      state.content = lines[1]
+      if state.content == state.placeholder then
+        state.content = ""
+      end
+    end
+  end
+  
+  -- 调用提交回调
+  if state.on_submit and type(state.on_submit) == "function" then
+    state.on_submit(state.content)
+  end
+  
+  -- 不清空内容，保持输入框打开
+  print("📝 消息已发送，输入框保持打开状态")
 end
 
 --- 回到正常模式（不关闭输入框）
@@ -255,12 +290,19 @@ function M.enter_normal_mode()
   end
 end
 
---- 取消输入
+--- 取消输入（不清空内容，不关闭输入框）
 function M.cancel()
   if not state.active then
     return
   end
-  M.close("cancel")
+  
+  -- 只调用取消回调，不关闭输入框
+  if state.on_cancel and type(state.on_cancel) == "function" then
+    state.on_cancel()
+  end
+  
+  -- 不清空内容，保持输入框打开
+  print("📝 输入框保持打开状态（按ESC退出插入模式）")
 end
 
 --- 获取当前内容
@@ -435,7 +477,7 @@ function M._setup_keymaps()
       "i",
       keymaps.cancel,
       "<Cmd>lua require('NeoAI.ui.components.virtual_input').cancel()<CR>",
-      { noremap = true, silent = true, desc = "取消输入并关闭输入框" }
+      { noremap = true, silent = true, desc = "取消输入（不清空内容）" }
     )
   end
 
