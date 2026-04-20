@@ -65,7 +65,7 @@ local DEFAULT_CONFIG = {
   -- 会话配置
   session = {
     auto_save = true,
-    save_path = vim.fn.stdpath("cache") .. "/neoai_sessions",
+    save_path = os.getenv("HOME") .. "/.cache/nvim/NeoAI",
     max_history_per_session = 100,
   },
   -- 工具配置

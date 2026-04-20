@@ -323,14 +323,30 @@ function Session.load(filepath, session_id)
     if not session_id then
       -- 如果没有指定 session_id，返回第一个会话
       for key, session_data in pairs(data) do
-        return Session._from_sessions_json_format(session_data, key)
+        if key ~= "_graph" and type(session_data) == "table" and session_data.messages then
+          -- 确保使用正确的会话ID
+          local session_id_to_use = nil
+          if session_data.id then
+            session_id_to_use = tostring(session_data.id)
+          else
+            session_id_to_use = key
+          end
+          return Session._from_sessions_json_format(session_data, session_id_to_use)
+        end
       end
       return nil
     else
       -- 查找指定 ID 的会话
       local session_data = data[tostring(session_id)]
       if session_data then
-        return Session._from_sessions_json_format(session_data, tostring(session_id))
+        -- 确保使用正确的会话ID
+        local session_id_to_use = nil
+        if session_data.id then
+          session_id_to_use = tostring(session_data.id)
+        else
+          session_id_to_use = tostring(session_id)
+        end
+        return Session._from_sessions_json_format(session_data, session_id_to_use)
       end
       return nil
     end
@@ -358,7 +374,38 @@ function Session._from_sessions_json_format(session_data, session_id)
 
   -- 创建会话对象
   local session = Session:new(session_id, session_data.name, metadata)
-  session.messages = session_data.messages or {}
+
+  -- 处理消息数据，确保格式正确
+  local messages = {}
+  for _, msg in ipairs(session_data.messages or {}) do
+    -- 确保 metadata 是表而不是数组
+    local msg_metadata = msg.metadata or {}
+    if type(msg_metadata) == "table" and #msg_metadata > 0 then
+      -- 如果是数组，转换为表
+      local new_metadata = {}
+      for i, v in ipairs(msg_metadata) do
+        new_metadata[tostring(i)] = v
+      end
+      msg_metadata = new_metadata
+    end
+
+    -- 确保 id 是字符串（兼容数字和字符串ID）
+    local msg_id = msg.id
+    if type(msg_id) == "number" then
+      msg_id = tostring(msg_id)
+    end
+
+    table.insert(messages, {
+      id = msg_id or tostring(#messages + 1),
+      role = msg.role or "user",
+      content = msg.content or "",
+      timestamp = msg.timestamp or os.time(),
+      metadata = msg_metadata,
+      editable = msg.editable or false,
+    })
+  end
+
+  session.messages = messages
   session.branches = {} -- sessions.json 格式不支持分支
   session.current_branch_id = nil
 
@@ -739,7 +786,16 @@ function M._load_sessions()
         for session_id_str, session_data in pairs(all_sessions) do
           -- 跳过 _graph 等非会话数据
           if session_id_str ~= "_graph" and type(session_data) == "table" and session_data.messages ~= nil then
-            local session = Session._from_sessions_json_format(session_data, session_id_str)
+            -- 确保使用正确的会话ID
+            -- 优先使用 session_data.id（数字），如果不存在则使用 session_id_str（字符串）
+            local session_id_to_use = nil
+            if session_data.id then
+              session_id_to_use = tostring(session_data.id)
+            else
+              session_id_to_use = session_id_str
+            end
+
+            local session = Session._from_sessions_json_format(session_data, session_id_to_use)
             if session then
               state.sessions[session.id] = session
             end

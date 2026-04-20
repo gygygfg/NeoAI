@@ -558,63 +558,104 @@ end
 --- 加载树数据（内部使用）
 --- @param session_id string 会话ID
 function M._load_tree_data(session_id)
-  -- 这里应该从会话管理器加载树数据
-  -- 目前使用模拟数据
-  state.tree_data = {
-    {
-      id = "session_1",
-      name = "主会话",
-      metadata = {
-        message_count = 5,
-        created_at = os.time() - 3600,
-      },
-      children = {
-        {
-          id = "branch_1",
-          name = "主分支",
-          metadata = {
-            message_count = 5,
-            created_at = os.time() - 3600,
-          },
-          children = {
-            {
-              id = "branch_2",
-              name = "功能开发",
-              metadata = {
-                message_count = 3,
-                created_at = os.time() - 1800,
-              },
-              children = {},
+  -- 使用 history_tree 组件加载实际的会话数据
+  local history_tree = require("NeoAI.ui.components.history_tree")
+  
+  -- 确保 history_tree 已初始化
+  if not history_tree then
+    error("无法加载 history_tree 模块")
+  end
+  
+  -- 如果 history_tree 未初始化，使用默认配置初始化
+  local config = state.config or {}
+  history_tree.initialize({
+    save_path = config.save_path or os.getenv("HOME") .. "/.cache/nvim/NeoAI",
+    max_messages_per_session = config.max_messages_per_session or 10,
+  })
+  
+  -- 从 history_tree 获取树数据
+  state.tree_data = history_tree.build_tree(session_id)
+  
+  -- 如果获取的数据为空，使用后备数据
+  if not state.tree_data or #state.tree_data == 0 then
+    state.tree_data = {
+      {
+        id = "session_1",
+        name = "示例会话",
+        type = "session",
+        metadata = {
+          message_count = 2,
+          created_at = os.time() - 3600,
+          last_updated = os.time() - 1800,
+        },
+        children = {
+          {
+            id = "msg_1_1",
+            name = "[user] 你好",
+            type = "message",
+            metadata = {
+              role = "user",
+              timestamp = os.time() - 3600,
+              full_content = "你好",
             },
+            children = {},
+          },
+          {
+            id = "msg_1_2",
+            name = "[assistant] 你好！有什么可以帮助你的？",
+            type = "message",
+            metadata = {
+              role = "assistant",
+              timestamp = os.time() - 1800,
+              full_content = "你好！有什么可以帮助你的？",
+            },
+            children = {},
           },
         },
       },
-    },
-    {
-      id = "session_2",
-      name = "测试会话",
-      metadata = {
-        message_count = 2,
-        created_at = os.time() - 7200,
-      },
-      children = {
-        {
-          id = "branch_3",
-          name = "测试分支",
-          metadata = {
-            message_count = 2,
-            created_at = os.time() - 7200,
-          },
-          children = {},
-        },
-      },
-    },
-  }
-
+    }
+  end
+  
   -- 默认展开根节点
   for _, root_node in ipairs(state.tree_data) do
     state.expanded_nodes[root_node.id] = true
   end
+  
+  -- 触发数据加载完成事件
+  vim.api.nvim_exec_autocmds(
+    "User",
+    { pattern = "NeoAI:tree_data_loaded", data = { 
+      window_id = state.current_window_id,
+      session_id = session_id,
+      session_count = #state.tree_data,
+      total_messages = M._count_total_messages(state.tree_data)
+    } }
+  )
+end
+
+--- 计算总消息数（内部使用）
+--- @param nodes table 节点列表
+--- @return number 总消息数
+function M._count_total_messages(nodes)
+  if not nodes then
+    return 0
+  end
+  
+  local count = 0
+  
+  for _, node in ipairs(nodes) do
+    -- 如果是消息节点，计数
+    if node.type == "message" then
+      count = count + 1
+    end
+    
+    -- 递归计数子节点
+    if node.children and #node.children > 0 then
+      count = count + M._count_total_messages(node.children)
+    end
+  end
+  
+  return count
 end
 
 --- 移动选择（内部使用）

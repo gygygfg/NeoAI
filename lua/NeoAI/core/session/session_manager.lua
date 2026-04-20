@@ -283,20 +283,80 @@ function M._load_sessions()
     return
   end
 
-  -- 查找所有会话文件
+  -- 首先尝试加载 sessions.json 文件（新格式）
+  local sessions_file = save_path .. "/sessions.json"
+  if vim.fn.filereadable(sessions_file) == 1 then
+    local content = vim.fn.readfile(sessions_file)
+    if #content > 0 then
+      local success, all_sessions = pcall(vim.json.decode, table.concat(content, "\n"))
+      if success and all_sessions then
+        -- 加载所有会话
+        for session_id_str, session_data in pairs(all_sessions) do
+          -- 跳过 _graph 等非会话数据
+          if session_id_str ~= "_graph" and type(session_data) == "table" and session_data.messages ~= nil then
+            -- 转换会话数据格式
+            local session = {
+              id = session_id_str,
+              name = session_data.name or "会话 " .. session_id_str,
+              created_at = session_data.created_at or os.time(),
+              updated_at = session_data.updated_at or os.time(),
+              messages = {},
+              branches = {},
+              current_branch = nil,
+              metadata = {
+                message_count = #(session_data.messages or {}),
+              },
+            }
+            
+            -- 创建默认分支
+            local branch_id = "branch_main"
+            session.branches = { [branch_id] = true }
+            session.current_branch = branch_id
+            
+            -- 转换消息格式
+            for _, msg in ipairs(session_data.messages or {}) do
+              table.insert(session.messages, {
+                id = tostring(msg.id or #session.messages + 1),
+                role = msg.role or "user",
+                content = msg.content or "",
+                timestamp = msg.timestamp or os.time(),
+                metadata = type(msg.metadata) == "table" and msg.metadata or {},
+              })
+            end
+            
+            sessions[session.id] = session
+            
+            -- 更新会话计数器
+            local session_num = tonumber(session_id_str)
+            if session_num and session_num > session_counter then
+              session_counter = session_num
+            end
+          end
+        end
+        
+        -- 如果成功加载了 sessions.json，就不需要加载单独的会话文件了
+        return
+      end
+    end
+  end
+
+  -- 向后兼容：加载单独的会话文件（旧格式）
   local files = vim.fn.glob(save_path .. "/*.json", false, true)
 
   for _, filepath in ipairs(files) do
-    local content = vim.fn.readfile(filepath)
-    if #content > 0 then
-      local data = vim.json.decode(table.concat(content, "\n"))
-      if data and data.id then
-        sessions[data.id] = data
+    -- 跳过 sessions.json 文件，因为我们已经处理过了
+    if not filepath:match("sessions%.json$") then
+      local content = vim.fn.readfile(filepath)
+      if #content > 0 then
+        local data = vim.json.decode(table.concat(content, "\n"))
+        if data and data.id then
+          sessions[data.id] = data
 
-        -- 更新会话计数器
-        local session_num = tonumber(data.id:match("session_(%d+)"))
-        if session_num and session_num > session_counter then
-          session_counter = session_num
+          -- 更新会话计数器
+          local session_num = tonumber(data.id:match("session_(%d+)"))
+          if session_num and session_num > session_counter then
+            session_counter = session_num
+          end
         end
       end
     end

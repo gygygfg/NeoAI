@@ -543,64 +543,199 @@ end
 --- 加载树数据（内部使用）
 --- @param session_id string 会话ID
 function M._load_tree_data(session_id)
-  -- 这里应该从会话管理器加载树数据
-  -- 目前使用模拟数据
+  -- 清空现有数据
+  state.tree_data = {}
+  
+  -- 尝试从历史管理器加载会话数据
+  local history_manager = require("NeoAI.core.history_manager")
+  local sessions = history_manager.get_sessions()
+  
+  if not sessions or #sessions == 0 then
+    -- 如果没有会话数据，尝试从会话管理器加载
+    local session_manager = require("NeoAI.core.session.session_manager")
+    sessions = session_manager.list_sessions()
+    
+    if not sessions or #sessions == 0 then
+      -- 如果还是没有数据，尝试从文件系统加载
+      sessions = M._load_sessions_from_file()
+    end
+  end
+  
+  -- 转换会话数据为树节点
+  for _, session in ipairs(sessions) do
+    local session_node = {
+      id = "session_" .. session.id,
+      name = session.name or "未命名会话",
+      type = "session",
+      metadata = {
+        message_count = session.metadata and session.metadata.message_count or 0,
+        created_at = session.metadata and session.metadata.created_at or os.time(),
+        last_updated = session.metadata and session.metadata.last_updated or os.time(),
+      },
+      children = {},
+      raw_data = session, -- 保存原始数据供后续使用
+    }
+    
+    -- 如果这是当前会话，添加标记
+    if session_id and tostring(session.id) == tostring(session_id) then
+      session_node.name = session_node.name .. " (当前)"
+      session_node.metadata.is_current = true
+    end
+    
+    -- 尝试加载会话的消息作为子节点
+    M._load_session_messages(session, session_node)
+    
+    table.insert(state.tree_data, session_node)
+    
+    -- 默认展开当前会话
+    if session_node.metadata.is_current then
+      state.expanded_nodes[session_node.id] = true
+    end
+  end
+  
+  -- 如果没有数据，使用模拟数据作为后备
+  if #state.tree_data == 0 then
+    M._load_fallback_data()
+  end
+  
+  -- 按最后更新时间排序
+  table.sort(state.tree_data, function(a, b)
+    return (a.metadata.last_updated or 0) > (b.metadata.last_updated or 0)
+  end)
+end
+
+--- 从文件系统加载会话数据
+--- @return table 会话列表
+function M._load_sessions_from_file()
+  local sessions = {}
+  
+  -- 获取保存路径
+  local config = state.config or {}
+  local save_path = config.save_path or os.getenv("HOME") .. "/.cache/nvim/NeoAI"
+  local sessions_file = save_path .. "/sessions.json"
+  
+  -- 检查文件是否存在
+  if vim.fn.filereadable(sessions_file) == 1 then
+    local content = vim.fn.readfile(sessions_file)
+    if #content > 0 then
+      local success, data = pcall(vim.json.decode, table.concat(content, "\n"))
+      if success and data then
+        -- 转换数据格式
+        for session_id, session_data in pairs(data) do
+          if type(session_data) == "table" and session_data.id then
+            table.insert(sessions, {
+              id = session_id,
+              name = session_data.name or "会话 " .. session_id,
+              metadata = {
+                message_count = #(session_data.messages or {}),
+                created_at = session_data.created_at or os.time(),
+                last_updated = session_data.updated_at or os.time(),
+              },
+              messages = session_data.messages or {},
+            })
+          end
+        end
+      end
+    end
+  end
+  
+  return sessions
+end
+
+--- 加载会话消息作为子节点
+--- @param session table 会话数据
+--- @param session_node table 会话节点
+function M._load_session_messages(session, session_node)
+  if not session or not session_node then
+    return
+  end
+  
+  -- 获取消息数据
+  local messages = session.messages or {}
+  
+  -- 如果没有消息数据，尝试从其他来源获取
+  if #messages == 0 and session.raw_data and session.raw_data.messages then
+    messages = session.raw_data.messages
+  end
+  
+  -- 限制显示的消息数量
+  local max_messages = state.config and state.config.max_messages_per_session or 10
+  local display_messages = {}
+  
+  for i = math.max(1, #messages - max_messages + 1), #messages do
+    table.insert(display_messages, messages[i])
+  end
+  
+  -- 创建消息节点
+  for i, msg in ipairs(display_messages) do
+    local msg_content = msg.content or ""
+    local truncated_content = msg_content
+    
+    -- 截断过长的内容
+    if #truncated_content > 50 then
+      truncated_content = truncated_content:sub(1, 47) .. "..."
+    end
+    
+    local msg_node = {
+      id = "msg_" .. session.id .. "_" .. (msg.id or i),
+      name = "[" .. (msg.role or "unknown") .. "] " .. truncated_content,
+      type = "message",
+      metadata = {
+        role = msg.role,
+        timestamp = msg.timestamp or os.time(),
+        full_content = msg_content,
+        message_id = msg.id,
+      },
+      children = {},
+      raw_data = msg,
+    }
+    
+    table.insert(session_node.children, msg_node)
+  end
+  
+  -- 更新消息计数
+  session_node.metadata.message_count = #messages
+end
+
+--- 加载后备数据（模拟数据）
+function M._load_fallback_data()
   state.tree_data = {
     {
       id = "session_1",
-      name = "主会话",
-      type = "session",
-      metadata = {
-        message_count = 5,
-        created_at = os.time() - 3600,
-      },
-      children = {
-        {
-          id = "branch_1",
-          name = "主分支",
-          type = "branch",
-          metadata = {
-            message_count = 5,
-            created_at = os.time() - 3600,
-          },
-          children = {
-            {
-              id = "branch_2",
-              name = "功能开发",
-              type = "branch",
-              metadata = {
-                message_count = 3,
-                created_at = os.time() - 1800,
-              },
-              children = {},
-            },
-          },
-        },
-      },
-    },
-    {
-      id = "session_2",
-      name = "测试会话",
+      name = "示例会话",
       type = "session",
       metadata = {
         message_count = 2,
-        created_at = os.time() - 7200,
+        created_at = os.time() - 3600,
+        last_updated = os.time() - 1800,
       },
       children = {
         {
-          id = "branch_3",
-          name = "测试分支",
-          type = "branch",
+          id = "msg_1_1",
+          name = "[user] 你好",
+          type = "message",
           metadata = {
-            message_count = 2,
-            created_at = os.time() - 7200,
+            role = "user",
+            timestamp = os.time() - 3600,
+            full_content = "你好",
+          },
+          children = {},
+        },
+        {
+          id = "msg_1_2",
+          name = "[assistant] 你好！有什么可以帮助你的？",
+          type = "message",
+          metadata = {
+            role = "assistant",
+            timestamp = os.time() - 1800,
+            full_content = "你好！有什么可以帮助你的？",
           },
           children = {},
         },
       },
     },
   }
-
+  
   -- 默认展开根节点
   for _, root_node in ipairs(state.tree_data) do
     state.expanded_nodes[root_node.id] = true
