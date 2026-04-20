@@ -37,12 +37,12 @@ end
 function Worker:execute()
   self.status = "running"
   self.start_time = os.clock()
-  
+
   -- 使用vim.schedule_wrap确保回调在合适的时机执行
   local wrapped_callback = vim.schedule_wrap(function(success, result, error_msg)
     self.end_time = os.clock()
     self.duration = self.end_time - self.start_time
-    
+
     if success then
       self.status = "completed"
       self.result = result
@@ -52,25 +52,25 @@ function Worker:execute()
       self.result = nil
       self.error = error_msg
     end
-    
+
     -- 执行回调
     if self.callback then
       self.callback(success, result, error_msg, self)
     end
-    
+
     -- 从活动工作器列表中移除
     state.workers[self.id] = nil
   end)
-  
+
   -- 使用vim.defer_fn在后台线程执行任务
   vim.defer_fn(function()
     local success, result_or_error = pcall(self.task_func)
     wrapped_callback(success, result_or_error, not success and result_or_error or nil)
   end, 0)
-  
+
   -- 添加到活动工作器列表
   state.workers[self.id] = self
-  
+
   return self.id
 end
 
@@ -99,11 +99,11 @@ function M.submit_task(name, task_func, callback)
       active_count = active_count + 1
     end
   end
-  
+
   if active_count >= state.max_workers then
     error(string.format("已达到最大工作器数量限制 (%d)", state.max_workers))
   end
-  
+
   local worker = Worker.new(name, task_func, callback)
   return worker:execute()
 end
@@ -113,16 +113,12 @@ end
 --- @return table 任务ID列表
 function M.submit_batch(tasks)
   local task_ids = {}
-  
+
   for i, task in ipairs(tasks) do
-    local task_id = M.submit_task(
-      task.name or ("batch_task_" .. i),
-      task.task_func,
-      task.callback
-    )
+    local task_id = M.submit_task(task.name or ("batch_task_" .. i), task.task_func, task.callback)
     table.insert(task_ids, task_id)
   end
-  
+
   return task_ids
 end
 
@@ -131,7 +127,7 @@ end
 --- @return boolean 是否所有任务都完成
 function M.wait_all(timeout)
   local start_time = os.clock()
-  
+
   while true do
     -- 检查是否所有工作器都已完成
     local all_completed = true
@@ -141,18 +137,20 @@ function M.wait_all(timeout)
         break
       end
     end
-    
+
     if all_completed then
       return true
     end
-    
+
     -- 检查超时
     if timeout and (os.clock() - start_time) > timeout then
       return false
     end
-    
+
     -- 短暂等待后继续检查
-    vim.wait(100, function() return false end)
+    vim.wait(100, function()
+      return false
+    end)
   end
 end
 
@@ -171,11 +169,11 @@ end
 --- @return table 所有工作器状态列表
 function M.get_all_worker_status()
   local status_list = {}
-  
+
   for _, worker in pairs(state.workers) do
     table.insert(status_list, worker:get_info())
   end
-  
+
   return status_list
 end
 
@@ -196,13 +194,13 @@ end
 --- 清理已完成的工作器
 function M.cleanup_completed()
   local to_remove = {}
-  
+
   for id, worker in pairs(state.workers) do
     if worker.status == "completed" or worker.status == "failed" or worker.status == "cancelled" then
       table.insert(to_remove, id)
     end
   end
-  
+
   for _, id in ipairs(to_remove) do
     state.workers[id] = nil
   end
@@ -239,13 +237,13 @@ function M.run_tests_async(test_suite, callback)
     errored = 0,
     tests = {},
   }
-  
+
   local completed_tests = 0
   local total_tests = #test_suite.tests
-  
+
   -- 为每个测试创建异步任务
   local tasks = {}
-  
+
   for i, test in ipairs(test_suite.tests) do
     table.insert(tasks, {
       name = "test_" .. test.name,
@@ -253,7 +251,7 @@ function M.run_tests_async(test_suite, callback)
         local start_time = os.clock()
         local success, err = pcall(test.func)
         local duration = os.clock() - start_time
-        
+
         return {
           name = test.name,
           success = success,
@@ -263,10 +261,10 @@ function M.run_tests_async(test_suite, callback)
       end,
       callback = function(success, result)
         completed_tests = completed_tests + 1
-        
+
         if success then
           test_results.total = test_results.total + 1
-          
+
           if result.success then
             test_results.passed = test_results.passed + 1
             result.status = "PASS"
@@ -284,9 +282,9 @@ function M.run_tests_async(test_suite, callback)
             duration = 0,
           }
         end
-        
+
         table.insert(test_results.tests, result)
-        
+
         -- 所有测试完成后执行回调
         if completed_tests >= total_tests then
           if callback then
@@ -296,7 +294,7 @@ function M.run_tests_async(test_suite, callback)
       end,
     })
   end
-  
+
   -- 批量提交任务
   return M.submit_batch(tasks)
 end
@@ -314,14 +312,13 @@ function M.initialize()
   -- 定期清理已完成的工作器
   vim.defer_fn(function()
     M.cleanup_completed()
-    
+
     -- 每30秒清理一次
     vim.defer_fn(function()
       M.cleanup_completed()
     end, 30000)
   end, 30000)
-  
-  print("✅ 异步工作器已初始化")
 end
 
 return M
+

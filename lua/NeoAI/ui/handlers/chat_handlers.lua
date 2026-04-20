@@ -111,24 +111,6 @@ function M.initialize(config)
     end,
   })
 
-  vim.api.nvim_create_autocmd("User", {
-    pattern = "send_message",
-    callback = function(args)
-      local session_id = args.data and args.data[1] or "default"
-      local branch_id = args.data and args.data[2] or "main"
-      local content = args.data and args.data[3] or ""
-
-      -- 发送消息
-      local success, result = M.send_message(content)
-      if success then
-        vim.api.nvim_exec_autocmds("User", {
-          pattern = "NeoAI:message_sent",
-          data = { session_id, branch_id, content },
-        })
-      end
-    end,
-  })
-
   -- 监听AI响应完成事件
   vim.api.nvim_create_autocmd("User", {
     pattern = "NeoAI:ai_response_complete",
@@ -293,292 +275,118 @@ function M.initialize(config)
   return true
 end
 
---- 处理回车（发送消息）
-function M.handle_enter()
-  if not state.initialized then
-    return
-  end
-
-  -- 获取聊天窗口实例
-  local chat_window = require("NeoAI.ui.window.chat_window")
-
-  -- 检查聊天窗口是否可用
-  local available, err = pcall(chat_window.is_available)
-  if not available then
-    -- 尝试自动打开聊天窗口
-    local error_msg = tostring(err or "未知错误")
-    local level = vim.log.levels and vim.log.levels.WARN or "WARN"
-    vim.notify("聊天窗口不可用，尝试自动打开: " .. error_msg, level)
-
-    -- 使用辅助函数尝试打开窗口
-    local opened = try_open_chat_window()
-    if opened then
-      -- 窗口已打开，重新检查可用性
-      local available_after_open, err_after_open = pcall(chat_window.is_available)
-      if available_after_open then
-        -- 窗口可用，继续处理
-        local input_content = chat_window.get_input_content()
-        if not input_content or input_content == "" then
-          local warn_level = vim.log.levels and vim.log.levels.WARN or "WARN"
-          vim.notify("消息内容不能为空", warn_level)
-          return
-        end
-
-        -- 发送消息
-        local success, result = chat_window.send_message(input_content)
-        if success then
-          local info_level = vim.log.levels and vim.log.levels.INFO or "INFO"
-          vim.notify("消息已发送", info_level)
-        else
-          local error_level = vim.log.levels and vim.log.levels.ERROR or "ERROR"
-          vim.notify("发送消息失败: " .. tostring(result), error_level)
-        end
-      else
-        local info_level = vim.log.levels and vim.log.levels.INFO or "INFO"
-        vim.notify("聊天窗口已打开，请重新发送消息", info_level)
-      end
-    else
-      local error_level = vim.log.levels and vim.log.levels.ERROR or "ERROR"
-      vim.notify("无法打开聊天窗口", error_level)
-    end
-    return
-  end
-
-  -- 获取输入内容
-  local input_content = chat_window.get_input_content()
-  if not input_content or input_content == "" then
-    local warn_level = vim.log.levels and vim.log.levels.WARN or "WARN"
-    vim.notify("消息内容不能为空", warn_level)
-    return
-  end
-
-  -- 发送消息
-  local success, result = chat_window.send_message(input_content)
-  if not success then
-    local error_level = vim.log.levels and vim.log.levels.ERROR or "ERROR"
-    vim.notify("发送消息失败: " .. tostring(result), error_level)
-  else
-    local info_level = vim.log.levels and vim.log.levels.INFO or "INFO"
-    vim.notify("消息发送成功", info_level)
-  end
-
-  return success, result
-end
-
---- 处理Ctrl+S（发送消息）
-function M.handle_ctrl_s()
-  if not state.initialized then
-    return
-  end
-
-  -- 与回车键功能相同
-  M.handle_enter()
-end
-
---- 发送消息（测试用）
---- @param message string 消息内容
-function M.send_message(message)
+--- 设置发送按键
+--- @param mode string 模式: "insert" 或 "normal"
+--- @param key string 按键
+function M.set_send_key(mode, key)
   if not state.initialized then
     return false, "聊天处理器未初始化"
   end
 
+  if mode ~= "insert" and mode ~= "normal" then
+    return false, "模式必须是 'insert' 或 'normal'"
+  end
+
+  if not key or type(key) ~= "string" then
+    return false, "按键必须是字符串"
+  end
+
+  -- 更新配置中的发送按键
+  if not state.config.keymaps then
+    state.config.keymaps = {}
+  end
+  if not state.config.keymaps.chat then
+    state.config.keymaps.chat = {}
+  end
+  if not state.config.keymaps.chat.send then
+    state.config.keymaps.chat.send = {}
+  end
+
+  state.config.keymaps.chat.send[mode] = { key = key, desc = "发送消息" }
+
+  -- 更新按键映射
+  M.update_keymaps()
+
+  return true, "发送按键已设置为: " .. key .. " (模式: " .. mode .. ")"
+end
+
+--- 更新按键映射
+function M.update_keymaps()
+  if not state.initialized or not state.config or not state.config.keymaps then
+    return
+  end
+
+  local chat_keymaps = state.config.keymaps.chat
+  if not chat_keymaps or not chat_keymaps.send then
+    return
+  end
+
+  -- 这里可以添加按键映射更新的逻辑
+  -- 例如：重新绑定按键到 send_message 函数
+  print("按键映射已更新")
+end
+
+--- 发送消息
+--- @param content string 消息内容
+--- @param session_id string|nil 会话ID（可选）
+--- @param branch_id string|nil 分支ID（可选）
+--- @param window_id number|nil 窗口ID（可选）
+--- @param format boolean|nil 是否格式化消息（可选，默认true）
+--- @return boolean 是否成功
+--- @return string|nil 结果信息
+function M.send_message(content, session_id, branch_id, window_id, format)
+  if not state.initialized then
+    return false, "聊天处理器未初始化"
+  end
+
+  if not content or vim.trim(content) == "" then
+    return false, "消息内容不能为空"
+  end
+
+  -- 默认格式化消息
+  local format_message = format ~= false
+  local final_message = content
+
+  if format_message then
+    -- 格式化消息：添加日期时间
+    final_message = string.format("[%s] %s", os.date("%Y-%m-%d %H:%M:%S"), content)
+  end
+
   -- 获取聊天窗口实例
   local chat_window = require("NeoAI.ui.window.chat_window")
 
   -- 检查聊天窗口是否可用
   local available, err = pcall(chat_window.is_available)
   if not available then
-    -- 如果聊天窗口不可用，尝试自动打开
-    print("⚠️  聊天窗口不可用，尝试自动打开: " .. tostring(err or "未知错误"))
-
-    -- 使用辅助函数尝试打开窗口
-    local opened = try_open_chat_window()
-    if opened then
-      print("✓ 聊天窗口已打开，准备发送消息")
-
-      -- 等待窗口渲染完成事件
-      local render_complete = false
-      local max_wait_time = 3000 -- 最多等待3秒
-      local wait_interval = 100 -- 每次等待100毫秒
-      local total_wait = 0
-
-      -- 监听渲染完成事件
-      local remove_listener = nil
-      local listener = function(args)
-        print("📢 收到窗口渲染完成事件，可以发送消息了")
-        render_complete = true
-        -- 移除监听器，避免重复触发
-        if remove_listener then
-          pcall(remove_listener)
-          remove_listener = nil
-        end
-      end
-
-      -- 添加监听器并保存移除函数
-      local success, result = pcall(vim.api.nvim_create_autocmd, "User", {
-        pattern = "NeoAI:chat_window:render_complete",
-        callback = listener,
-      })
-
-      if success then
-        remove_listener = result
-      else
-        print("⚠️  事件总线未初始化，假设窗口已渲染完成")
-        render_complete = true
-      end
-
-      -- 等待渲染完成
-      while not render_complete and total_wait < max_wait_time do
-        vim.wait(wait_interval)
-        total_wait = total_wait + wait_interval
-      end
-
-      if not render_complete then
-        print("⚠️  窗口渲染等待超时，继续尝试发送消息")
-      end
-
-      -- 给窗口一些时间初始化
-      vim.defer_fn(function()
-        -- 窗口已打开，重新检查可用性
-        local available_after_open, err_after_open = pcall(chat_window.is_available)
-        if available_after_open then
-          -- 窗口可用，发送消息
-          local send_success, send_result = chat_window.send_message(message)
-          if send_success then
-            print("✓ 消息已发送: " .. message)
-
-            -- 触发消息发送事件
-            vim.api.nvim_exec_autocmds("User", {
-              pattern = "NeoAI:message_sent",
-              data = { "default", "main", message },
-            })
-            return true, "消息已发送"
-          else
-            print("✗ 发送消息失败: " .. tostring(send_result))
-            return false, "发送消息失败: " .. tostring(send_result)
-          end
-        else
-          print("⚠️  窗口打开后仍然不可用: " .. tostring(err_after_open))
-          return false, "窗口打开后仍然不可用: " .. tostring(err_after_open)
-        end
-      end, 100)
-
-      -- 返回true表示窗口已打开，消息将在延迟后发送
-      return true, "窗口已打开，正在发送消息..."
-    else
-      print("✗ 无法打开聊天窗口，模拟发送")
-      -- 即使窗口打开失败，也模拟发送成功用于测试
-      print("⚠️  模拟发送消息: " .. message)
-
-      -- 在模拟发送时也触发事件（用于测试）
-      vim.api.nvim_exec_autocmds("User", {
-        pattern = "NeoAI:message_sent",
-        data = { "default", "main", message },
-      })
-      return true, "消息已发送（模拟，窗口状态: " .. tostring(err) .. "）"
-    end
+    return false, "聊天窗口不可用: " .. tostring(err)
   end
 
-  -- 调用聊天窗口的send_message函数，它会添加用户消息并触发AI响应
-  local window_success, window_result = chat_window.send_message(message)
-  if not window_success then
-    print("✗ 聊天窗口发送消息失败: " .. tostring(window_result))
-    return false, "聊天窗口发送消息失败: " .. tostring(window_result)
+  -- 通过聊天窗口发送消息
+  local success, result = chat_window.send_message(final_message)
+  if not success then
+    return false, "发送消息失败: " .. tostring(result)
   end
 
-  print("✓ 消息已通过聊天窗口发送: " .. message)
+  -- print("✓ 消息已发送: " .. content)
 
-  -- 触发消息发送事件
-  local session_id = "default"
-  local branch_id = "main"
-
-  -- 通过UI模块获取会话信息（如果可用）
-  local ui_loaded, ui = pcall(require, "NeoAI.ui")
-  if ui_loaded and type(ui) == "table" and type(ui.get_current_session_id) == "function" then
-    local current_session_id = ui.get_current_session_id()
-    if current_session_id then
-      session_id = current_session_id
-    end
-  end
-
+  -- 触发消息已发送事件
+  local event_pattern = format_message and "NeoAI:formatted_message_sent" or "NeoAI:message_sent"
   vim.api.nvim_exec_autocmds("User", {
-    pattern = "NeoAI:message_sent",
-    data = { session_id, branch_id, message },
-  })
-
-  -- 现在调用AI引擎生成响应
-  -- 首先尝试获取AI引擎
-  local ai_engine_loaded, ai_engine = pcall(require, "NeoAI.core.ai.ai_engine")
-  if not ai_engine_loaded or type(ai_engine) ~= "table" then
-    print("⚠️  AI引擎未加载，模拟AI响应")
-
-    -- 模拟AI响应
-    vim.defer_fn(function()
-      local simulated_response = "这是AI的模拟响应。实际应调用AI模型API。"
-      local success = chat_window.add_message("assistant", simulated_response)
-      if success then
-        print("✓ 模拟AI响应已添加到聊天窗口")
-
-        -- 触发模拟响应事件
-        vim.api.nvim_exec_autocmds("User", {
-          pattern = "NeoAI:ai_response_displayed",
-          data = {
-            generation_id = "simulated_" .. os.time(),
-            response = simulated_response,
-            success = true,
-          },
-        })
-      end
-    end, 1000)
-
-    return true, "消息已发送，等待AI响应（模拟模式）"
-  end
-
-  -- 检查AI引擎是否已初始化
-  local engine_status = ai_engine.get_status and ai_engine.get_status()
-  if not engine_status or not engine_status.initialized then
-    print("⚠️  AI引擎未初始化，模拟AI响应")
-
-    -- 模拟AI响应
-    vim.defer_fn(function()
-      local simulated_response = "AI引擎未初始化，这是模拟响应。"
-      local success = chat_window.add_message("assistant", simulated_response)
-      if success then
-        print("✓ 模拟AI响应已添加到聊天窗口")
-
-        -- 触发模拟响应事件
-        vim.api.nvim_exec_autocmds("User", {
-          pattern = "NeoAI:ai_response_displayed",
-          data = {
-            generation_id = "simulated_" .. os.time(),
-            response = simulated_response,
-            success = true,
-          },
-        })
-      end
-    end, 1000)
-
-    return true, "消息已发送，等待AI响应（引擎未初始化）"
-  end
-
-  -- 构建消息格式
-  local messages = {
-    {
+    pattern = event_pattern,
+    data = {
+      session_id = session_id or "default",
+      branch_id = branch_id or "main",
+      original_content = content,
+      formatted_content = format_message and final_message or nil,
+      message = final_message,
+      window_id = window_id,
+      timestamp = os.time(),
       role = "user",
-      content = message,
+      format = format_message,
     },
-  }
-
-  -- 调用AI引擎生成响应
-  print("🚀 调用AI引擎生成响应...")
-  local generation_id = ai_engine.generate_response(messages, {
-    use_tools = true, -- 启用工具调用
-    history = nil, -- 可以传递历史消息
   })
 
-  print("✓ AI引擎已调用，生成ID: " .. tostring(generation_id))
-
-  return true, "消息已发送，AI响应生成中..."
+  return true, format_message and "消息已发送并格式化" or "消息已发送"
 end
 
 --- 处理响应（测试用）
@@ -704,6 +512,78 @@ function M.handle_scroll()
   -- 这里应该处理消息滚动
 end
 
+--- 处理发送消息按键
+local function handle_send_key()
+  if not state.initialized then
+    return
+  end
+
+  -- 获取聊天窗口实例
+  local chat_window = require("NeoAI.ui.window.chat_window")
+
+  -- 检查聊天窗口是否可用
+  local available, err = pcall(chat_window.is_available)
+  if not available then
+    -- 尝试自动打开聊天窗口
+    local error_msg = tostring(err or "未知错误")
+    local level = vim.log.levels and vim.log.levels.WARN or "WARN"
+    vim.notify("聊天窗口不可用，尝试自动打开: " .. error_msg, level)
+
+    -- 使用辅助函数尝试打开窗口
+    local opened = try_open_chat_window()
+    if opened then
+      -- 窗口已打开，重新检查可用性
+      local available_after_open, err_after_open = pcall(chat_window.is_available)
+      if available_after_open then
+        -- 窗口可用，继续处理
+        local input_content = chat_window.get_input_content()
+        if not input_content or input_content == "" then
+          local warn_level = vim.log.levels and vim.log.levels.WARN or "WARN"
+          vim.notify("消息内容不能为空", warn_level)
+          return
+        end
+
+        -- 发送消息
+        local success, result = M.send_message(input_content)
+        if success then
+          local info_level = vim.log.levels and vim.log.levels.INFO or "INFO"
+          vim.notify("消息已发送", info_level)
+        else
+          local error_level = vim.log.levels and vim.log.levels.ERROR or "ERROR"
+          vim.notify("发送消息失败: " .. tostring(result), error_level)
+        end
+      else
+        local info_level = vim.log.levels and vim.log.levels.INFO or "INFO"
+        vim.notify("聊天窗口已打开，请重新发送消息", info_level)
+      end
+    else
+      local error_level = vim.log.levels and vim.log.levels.ERROR or "ERROR"
+      vim.notify("无法打开聊天窗口", error_level)
+    end
+    return
+  end
+
+  -- 获取输入内容
+  local input_content = chat_window.get_input_content()
+  if not input_content or input_content == "" then
+    local warn_level = vim.log.levels and vim.log.levels.WARN or "WARN"
+    vim.notify("消息内容不能为空", warn_level)
+    return
+  end
+
+  -- 发送消息
+  local success, result = M.send_message(input_content)
+  if not success then
+    local error_level = vim.log.levels and vim.log.levels.ERROR or "ERROR"
+    vim.notify("发送消息失败: " .. tostring(result), error_level)
+  else
+    local info_level = vim.log.levels and vim.log.levels.INFO or "INFO"
+    vim.notify("消息发送成功", info_level)
+  end
+
+  return success, result
+end
+
 --- 处理按键
 --- @param key string 按键
 function M.handle_key(key)
@@ -711,18 +591,43 @@ function M.handle_key(key)
     return
   end
 
-  local key_handlers = {
-    ["<CR>"] = M.handle_enter,
-    ["<C-s>"] = M.handle_ctrl_s,
-    ["<Esc>"] = M.handle_escape,
-    ["<Tab>"] = M.handle_tab,
-    ["<ScrollWheelUp>"] = function()
-      M.handle_scroll()
-    end,
-    ["<ScrollWheelDown>"] = function()
-      M.handle_scroll()
-    end,
-  }
+  -- 从配置中获取按键映射
+  local key_handlers = {}
+
+  if state.config and state.config.keymaps and state.config.keymaps.chat then
+    local chat_keymaps = state.config.keymaps.chat
+
+    -- 处理发送按键
+    if chat_keymaps.send then
+      if chat_keymaps.send.insert then
+        key_handlers[chat_keymaps.send.insert.key] = handle_send_key
+      end
+      if chat_keymaps.send.normal then
+        key_handlers[chat_keymaps.send.normal.key] = handle_send_key
+      end
+    end
+
+    -- 处理其他按键
+    for action, key_config in pairs(chat_keymaps) do
+      if action ~= "send" and type(key_config) == "table" and key_config.key then
+        -- 这里可以根据 action 映射到不同的处理函数
+        -- 目前先使用通用的处理函数
+        key_handlers[key_config.key] = function()
+          vim.notify("处理按键: " .. action, vim.log.levels.INFO)
+        end
+      end
+    end
+  end
+
+  -- 添加默认的按键处理
+  key_handlers["<Esc>"] = M.handle_escape
+  key_handlers["<Tab>"] = M.handle_tab
+  key_handlers["<ScrollWheelUp>"] = function()
+    M.handle_scroll()
+  end
+  key_handlers["<ScrollWheelDown>"] = function()
+    M.handle_scroll()
+  end
 
   local handler = key_handlers[key]
   if handler then
@@ -900,27 +805,35 @@ end
 --- 获取按键映射
 --- @return table 按键映射表
 function M.get_keymaps()
-  return {
-    ["<CR>"] = "发送消息",
-    ["<C-s>"] = "发送消息",
-    ["<Esc>"] = "取消/退出",
-    ["<Tab>"] = "Tab补全",
-    ["<C-p>"] = "上一条历史",
-    ["<C-n>"] = "下一条历史",
-    ["<C-u>"] = "清空输入",
-    ["yy"] = "复制消息",
-    ["e"] = "编辑消息",
-    ["dd"] = "删除消息",
-    ["r"] = "重新生成",
-    ["<C-c>"] = "停止生成",
-    ["t"] = "切换思考显示",
-    ["E"] = "导出对话",
-    ["I"] = "导入对话",
-    ["b"] = "切换分支",
-    ["B"] = "新建分支",
-    ["q"] = "返回树界面",
-    ["?"] = "帮助",
-  }
+  if not state.initialized or not state.config or not state.config.keymaps then
+    return {}
+  end
+
+  local chat_keymaps = state.config.keymaps.chat
+  if not chat_keymaps then
+    return {}
+  end
+
+  local keymaps = {}
+
+  -- 处理发送按键
+  if chat_keymaps.send then
+    if chat_keymaps.send.insert then
+      keymaps[chat_keymaps.send.insert.key] = "发送消息(插入模式)"
+    end
+    if chat_keymaps.send.normal then
+      keymaps[chat_keymaps.send.normal.key] = "发送消息(普通模式)"
+    end
+  end
+
+  -- 处理其他按键
+  for action, key_config in pairs(chat_keymaps) do
+    if action ~= "send" and type(key_config) == "table" and key_config.key then
+      keymaps[key_config.key] = key_config.desc or action
+    end
+  end
+
+  return keymaps
 end
 
 --- 处理输入

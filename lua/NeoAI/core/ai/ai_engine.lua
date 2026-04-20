@@ -56,6 +56,9 @@ function M.initialize(options)
     config = state.config,
   })
 
+  -- 设置事件监听器
+  M._setup_event_listeners()
+
   -- 标记引擎为已初始化状态
   state.initialized = true
   return M
@@ -97,13 +100,13 @@ function M.generate_response(messages, options)
         tool_results = { tool_result },
       })
 
-      -- 从AI响应中提取ID（如果存在）
-      local response_id = nil
-      if tool_result and tool_result.id then
-        response_id = tool_result.id
-      elseif tool_result and type(tool_result) == "table" and tool_result.response_id then
-        response_id = tool_result.response_id
-      end
+      -- 使用当前的生成ID
+      local generation_id = state.current_generation_id
+
+      -- 从AI响应中提取ID（如果存在），否则使用当前的生成ID
+      local response_id = generation_id
+      -- tool_result 是字符串，不是表，所以直接使用 generation_id
+      -- 如果将来 tool_result 可能包含 ID，可以在这里添加逻辑
 
       -- 触发响应完成事件（使用原生事件）
       vim.api.nvim_exec_autocmds("User", {
@@ -135,8 +138,14 @@ function M.generate_response(messages, options)
         ai_response = ai_response,
       })
 
-      -- 从AI响应中提取ID
-      local response_id = ai_response.id
+      -- 使用当前的生成ID
+      local generation_id = state.current_generation_id
+
+      -- 从AI响应中提取ID，否则使用当前的生成ID
+      local response_id = generation_id
+      if ai_response and ai_response.id then
+        response_id = ai_response.id
+      end
 
       -- 触发响应完成事件（使用原生事件）
       vim.api.nvim_exec_autocmds("User", {
@@ -154,9 +163,12 @@ function M.generate_response(messages, options)
     end)
   end
 
-  -- 注意：由于ID来自AI响应，无法立即返回
-  -- 客户端需要通过事件监听获取ID
-  return nil -- 或者返回一个占位符，表示ID将在事件中提供
+  -- 生成一个临时的生成ID并返回
+  local temp_generation_id = "gen_" .. os.time() .. "_" .. math.random(1000, 9999)
+  state.current_generation_id = temp_generation_id
+
+  -- 客户端可以通过事件监听获取最终的AI响应ID
+  return temp_generation_id
 end
 
 -- 流式生成 AI 响应
@@ -488,6 +500,64 @@ end
 -- 流式处理器接口
 function M.process_chunk(chunk)
   return state.stream_processor.process_chunk(chunk)
+end
+
+--- 设置事件监听器（内部函数）
+function M._setup_event_listeners()
+  -- 监听格式化消息发送事件
+  vim.api.nvim_create_autocmd("User", {
+    pattern = "NeoAI:formatted_message_sent",
+    callback = function(args)
+      local data = args.data or {}
+      local original_content = data.original_content
+      local formatted_content = data.formatted_content
+      local session_id = data.session_id
+      local window_id = data.window_id
+
+      print("📢 AI引擎收到格式化用户消息: " .. (original_content or ""))
+
+      -- 检查是否正在生成
+      if state.is_generating then
+        print("⚠️  AI引擎正在生成响应，忽略新消息")
+        return
+      end
+
+      -- 构建消息列表（使用格式化后的内容）
+      local messages = {
+        {
+          role = "user",
+          content = formatted_content or original_content,
+          timestamp = data.timestamp or os.time(),
+        },
+      }
+
+      -- 开始生成AI响应
+      if messages and #messages > 0 then
+        print("🚀 开始生成AI响应...")
+
+        -- 触发生成开始事件
+        vim.api.nvim_exec_autocmds("User", {
+          pattern = "NeoAI:generation_started",
+          data = {
+            session_id = session_id,
+            window_id = window_id,
+            message_count = #messages,
+          },
+        })
+
+        -- 调用生成响应函数
+        local generation_id = M.generate_response(messages, {
+          session_id = session_id,
+          window_id = window_id,
+          use_tools = true, -- 启用工具调用
+        })
+
+        print("✅ AI响应生成任务已启动 (ID: " .. tostring(generation_id) .. ")")
+      else
+        print("⚠️  没有消息数据，无法生成响应")
+      end
+    end,
+  })
 end
 
 -- 导出模块

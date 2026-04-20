@@ -87,4 +87,12 @@ M.CLOSE_WINDOW = "NeoAI:close_window"
 M.MESSAGES_CLEARED = "NeoAI:messages_cleared"
 M.MESSAGES_BUILT = "NeoAI:messages_built"
 
+-- 聊天消息流事件（用于解耦 UI 和业务逻辑）
+M.USER_MESSAGE_READY = "NeoAI:user_message_ready"          -- 用户消息已准备好发送
+M.USER_MESSAGE_SENDING = "NeoAI:user_message_sending"      -- 用户消息开始发送
+M.USER_MESSAGE_SENT = "NeoAI:user_message_sent"            -- 用户消息已发送到业务层
+M.AI_RESPONSE_READY = "NeoAI:ai_response_ready"            -- AI 响应已准备好显示
+M.AI_RESPONSE_RECEIVED = "NeoAI:ai_response_received"      -- AI 响应已接收到
+M.CHAT_INPUT_READY = "NeoAI:chat_input_ready"              -- 聊天输入已准备好
+
 return M

@@ -71,8 +71,6 @@ function M.open(session_id, window_id, branch_id)
     "User",
     { pattern = "NeoAI:window_opening", data = { window_id = window_id, window_type = "chat" } }
   )
-  state.current_session_id = session_id
-  state.messages = {}
 
   -- 获取缓冲区并设置选项
   local buf = window_manager.get_window_buf(window_id)
@@ -187,10 +185,7 @@ function M.render_chat()
         -- 自动获取焦点
         M._focus_window()
 
-        -- 打开虚拟输入框
-        vim.defer_fn(function()
-          M._open_virtual_input()
-        end, 50)
+        -- 注意：虚拟输入框已经在 open() 函数中打开，这里不需要重复打开
 
         -- 触发渲染完成事件
         vim.api.nvim_exec_autocmds(
@@ -346,7 +341,27 @@ function M.set_keymaps(keymap_manager)
   end
 
   local function send_message()
-    M._send_message()
+    if not state.current_window_id then
+      print("⚠️  聊天窗口未打开")
+      return
+    end
+
+    local buf = window_manager.get_window_buf(state.current_window_id)
+    if not buf then
+      print("⚠️  无法获取聊天窗口缓冲区")
+      return
+    end
+
+    -- 获取缓冲区最后一行内容
+    local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+    local last_line = lines[#lines] or ""
+
+    -- 如果最后一行不是空行，发送消息
+    if vim.trim(last_line) ~= "" then
+      M.send_message(last_line)
+    else
+      print("⚠️  消息内容不能为空")
+    end
   end
 
   local function exit_insert_mode()
@@ -485,15 +500,36 @@ function M._open_virtual_input()
   end
 
   -- 检查虚拟输入框是否已经打开
-  -- 这里可以添加检查逻辑，避免重复打开
+  local virtual_input = require("NeoAI.ui.components.virtual_input")
+  if virtual_input.is_active() then
+    print("⚠️  虚拟输入框已经打开，跳过重复打开")
+    return true
+  end
 
   -- 打开虚拟输入框
   local success = virtual_input.open(win_handle, {
     placeholder = "输入消息...",
     on_submit = function(content)
-      -- 当用户提交消息时，调用发送消息函数
+      -- 当用户提交消息时，通过聊天处理器发送消息
       if content and content ~= "" then
-        M.send_message(content)
+        -- 获取聊天处理器
+        local chat_handlers_loaded, chat_handlers = pcall(require, "NeoAI.ui.handlers.chat_handlers")
+        if chat_handlers_loaded and chat_handlers then
+          -- 调用新的 send_message 函数
+          local success, result = chat_handlers.send_message(
+            content,
+            state.current_session_id or "default",
+            "main",
+            state.current_window_id,
+            true -- 格式化消息
+          )
+
+          if not success then
+            print("⚠️  发送消息失败: " .. tostring(result))
+          end
+        else
+          print("⚠️  无法加载聊天处理器")
+        end
       end
     end,
     on_cancel = function()
@@ -512,79 +548,6 @@ function M._open_virtual_input()
   else
     print("⚠️  无法打开虚拟输入框")
     return false
-  end
-end
-
---- 发送消息（内部函数）
-function M._send_message()
-  if not state.current_window_id then
-    return
-  end
-
-  local buf = window_manager.get_window_buf(state.current_window_id)
-  if not buf then
-    return
-  end
-
-  -- 获取当前行内容
-  local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
-  local last_line = lines[#lines] or ""
-
-  -- 如果最后一行不是空行，处理消息
-  if vim.trim(last_line) ~= "" then
-    -- 触发聊天框发送事件
-    vim.api.nvim_exec_autocmds(
-      "User",
-      { pattern = "NeoAI:chat_box_sending", data = { window_id = state.current_window_id, message = last_line } }
-    )
-
-    -- 添加用户消息到聊天记录
-    table.insert(state.messages, {
-      role = "user",
-      content = last_line,
-      timestamp = os.time(),
-    })
-
-    -- 触发聊天框发送完成事件
-    vim.api.nvim_exec_autocmds(
-      "User",
-      { pattern = "NeoAI:chat_box_sent", data = { window_id = state.current_window_id, message = last_line } }
-    )
-
-    -- 重新渲染聊天以显示用户消息
-    M.render_chat()
-
-    -- 调用聊天处理器发送消息，触发AI响应
-    local chat_handlers_loaded, chat_handlers = pcall(require, "NeoAI.ui.handlers.chat_handlers")
-    if chat_handlers_loaded and type(chat_handlers) == "table" and chat_handlers.send_message then
-      -- 异步调用发送消息，避免阻塞UI
-      vim.defer_fn(function()
-        local success, result = chat_handlers.send_message(last_line)
-        if not success then
-          print("⚠️  发送消息失败: " .. tostring(result))
-
-          -- 显示错误消息
-          M.show_floating_text("发送消息失败: " .. tostring(result), {
-            timeout = 3000,
-            position = "center",
-            border = "single",
-          })
-        else
-          print("✓ 消息已发送到AI引擎: " .. tostring(result))
-        end
-      end, 10)
-    else
-      print("⚠️  聊天处理器未加载，无法发送消息到AI引擎")
-
-      -- 模拟AI响应作为后备
-      vim.defer_fn(function()
-        local simulated_response = "聊天处理器未加载，这是模拟AI响应。"
-        local success = M.add_message("assistant", simulated_response)
-        if success then
-          print("✓ 模拟AI响应已添加")
-        end
-      end, 1000)
-    end
   end
 end
 
@@ -762,6 +725,12 @@ function M.is_open()
   return state.current_window_id ~= nil
 end
 
+--- 检查聊天窗口是否可用（兼容旧版本）
+--- @return boolean 是否可用
+function M.is_available()
+  return M.is_open()
+end
+
 --- 发送消息（公共接口）
 --- @param message string 消息内容
 --- @return boolean 是否成功
@@ -781,8 +750,19 @@ function M.send_message(message)
     return false, "无法添加用户消息"
   end
 
-  -- 调用内部发送消息函数（这会触发AI响应）
-  M._send_message()
+  -- 触发统一的消息发送事件
+  vim.api.nvim_exec_autocmds("User", {
+    pattern = "NeoAI:message_sent",
+    data = {
+      message = message,
+      window_id = state.current_window_id,
+      session_id = state.current_session_id,
+      timestamp = os.time(),
+      role = "user",
+    },
+  })
+
+  -- print("✓ 用户消息已发送，等待AI响应...")
 
   return true, "消息已发送"
 end
@@ -898,18 +878,26 @@ end
 
 --- 设置事件监听器（内部函数）
 function M._setup_event_listeners()
-  print("🔧 设置聊天窗口事件监听器...")
+  -- 注意：AI响应完成事件现在由聊天处理器（chat_handlers.lua）处理
+  -- 以实现前后端分离，避免重复添加AI响应
 
-  -- 监听AI响应完成事件
+  -- 监听AI响应已准备好事件（新的事件系统）
+
+  -- 监听AI响应已准备好事件（新的事件系统）
   vim.api.nvim_create_autocmd("User", {
-    pattern = "NeoAI:ai_response_complete",
+    pattern = "NeoAI:ai_response_ready",
     callback = function(args)
-      print("📢 收到AI响应完成事件")
+      print("📢 收到AI响应已准备好事件")
       local data = args.data or {}
       local response = data.response
-      local generation_id = data.generation_id
+      local window_id = data.window_id
+      local session_id = data.session_id
 
-      print("📦 事件数据: response type = " .. type(response) .. ", generation_id = " .. tostring(generation_id))
+      -- 检查是否是当前窗口的消息
+      if window_id and window_id ~= state.current_window_id then
+        print("⚠️  响应不是给当前窗口的，忽略")
+        return
+      end
 
       -- 提取响应内容
       local response_content = ""
@@ -923,20 +911,41 @@ function M._setup_event_listeners()
         response_content = tostring(response)
       end
 
-      print("📝 提取的响应内容: " .. (response_content or "nil"))
-
       -- 添加AI响应到聊天窗口
       if response_content and response_content ~= "" then
-        print("➕ 添加AI响应到聊天窗口...")
+        print("➕ 添加AI响应到聊天窗口 (新事件系统)...")
         local success = M.add_message("assistant", response_content)
         if success then
-          print("✓ AI响应已添加到聊天窗口 (ID: " .. tostring(generation_id) .. ")")
+          print("✓ AI响应已添加到聊天窗口")
+          -- 重新渲染聊天窗口
+          M.render_chat()
         else
           print("✗ 添加AI响应失败")
         end
       else
         print("⚠️  响应内容为空，无法添加")
       end
+    end,
+  })
+
+  -- 监听消息发送事件（用于更新UI状态）
+  vim.api.nvim_create_autocmd("User", {
+    pattern = "NeoAI:message_sent",
+    callback = function(args)
+      -- print("📢 收到消息发送事件")
+      local data = args.data or {}
+      local message = data.message
+      local window_id = data.window_id
+      local session_id = data.session_id
+      local role = data.role or "user"
+
+      -- 检查是否是当前窗口的消息
+      if window_id and window_id ~= state.current_window_id then
+        print("⚠️  消息不是给当前窗口的，忽略")
+        return
+      end
+
+      -- print("✓ " .. role .. "消息已发送: " .. (message or ""))
     end,
   })
 

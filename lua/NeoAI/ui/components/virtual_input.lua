@@ -1,37 +1,33 @@
 local M = {}
 
--- 辅助函数：设置占位文本高亮
-local function set_placeholder_highlight(buf_id)
+-- 辅助函数：设置虚拟文本占位符
+local function set_virtual_placeholder(buf_id, placeholder, show)
   if not buf_id or not vim.api.nvim_buf_is_valid(buf_id) then
     return
   end
 
-  -- 清除之前的高亮
-  local ns_id = vim.api.nvim_create_namespace("NeoAI_VirtualInput")
+  -- 使用专门的命名空间用于虚拟文本
+  local ns_id = vim.api.nvim_create_namespace("NeoAI_VirtualInput_Placeholder")
+  
+  -- 清除之前的虚拟文本
   vim.api.nvim_buf_clear_namespace(buf_id, ns_id, 0, -1)
-
-  -- 获取缓冲区第一行的内容
-  local lines = vim.api.nvim_buf_get_lines(buf_id, 0, 1, false)
-  if not lines or #lines == 0 then
-    return
-  end
   
-  local first_line = lines[1] or ""
-  local line_length = #first_line
-  
-  -- 确保 end_col 不超过行长度
-  local end_col = line_length
-  if end_col < 0 then
-    end_col = 0
+  if show then
+    -- 获取缓冲区内容
+    local lines = vim.api.nvim_buf_get_lines(buf_id, 0, 1, false)
+    local first_line = lines and lines[1] or ""
+    
+    -- 只在缓冲区为空时显示占位符
+    if first_line == "" then
+      -- 设置虚拟文本占位符
+      vim.api.nvim_buf_set_extmark(buf_id, ns_id, 0, 0, {
+        virt_text = {{placeholder, "Comment"}},
+        virt_text_pos = "overlay",
+        hl_mode = "combine",
+        priority = 100, -- 高优先级，确保显示在最上层
+      })
+    end
   end
-
-  -- 设置占位文本高亮
-  vim.api.nvim_buf_set_extmark(buf_id, ns_id, 0, 0, {
-    end_line = 0,
-    end_col = end_col,
-    hl_group = "Comment",
-    priority = 50,
-  })
 end
 
 -- 模块状态
@@ -48,6 +44,8 @@ local state = {
   on_submit = nil,
   on_cancel = nil,
   on_change = nil,
+  resize_listener_id = nil, -- 窗口大小变化监听器ID
+  _updating_buffer = false, -- 防抖标志，防止递归调用
 }
 
 --- 初始化虚拟输入组件
@@ -116,17 +114,24 @@ function M.open(parent_window_id, options)
   end
 
   -- 设置缓冲区选项
-  vim.bo[state.buffer_id].buftype = "prompt"
+  vim.bo[state.buffer_id].buftype = "" -- 不使用 prompt 缓冲区
   vim.bo[state.buffer_id].bufhidden = "wipe"
   vim.bo[state.buffer_id].swapfile = false
   vim.bo[state.buffer_id].filetype = "markdown"
 
+  -- 不再设置提示符，因为不使用 prompt 缓冲区
+  -- if vim.fn.exists('*prompt_setprompt') == 1 then
+  --   vim.fn.prompt_setprompt(state.buffer_id, "> ")
+  -- end
+
   -- 设置缓冲区内容
+  vim.api.nvim_buf_set_lines(state.buffer_id, 0, -1, false, { state.content })
+  
+  -- 根据内容是否为空来显示占位符
   if state.content == "" then
-    vim.api.nvim_buf_set_lines(state.buffer_id, 0, -1, false, { state.placeholder })
-    set_placeholder_highlight(state.buffer_id)
+    set_virtual_placeholder(state.buffer_id, state.placeholder, true)
   else
-    vim.api.nvim_buf_set_lines(state.buffer_id, 0, -1, false, { state.content })
+    set_virtual_placeholder(state.buffer_id, state.placeholder, false)
   end
 
   -- 计算输入框位置（在父窗口底部）
@@ -176,6 +181,9 @@ function M.open(parent_window_id, options)
   -- 激活状态
   state.active = true
 
+  -- 创建窗口大小变化监听器
+  M._setup_window_resize_listener(parent_window_id)
+
   -- 进入插入模式
   vim.api.nvim_set_current_win(state.window_id)
   vim.cmd("startinsert!")
@@ -210,9 +218,6 @@ function M.close(mode)
     local lines = vim.api.nvim_buf_get_lines(state.buffer_id, 0, -1, false)
     if #lines > 0 then
       state.content = lines[1]
-      if state.content == state.placeholder then
-        state.content = ""
-      end
     end
   end
 
@@ -225,6 +230,9 @@ function M.close(mode)
   if state.buffer_id and vim.api.nvim_buf_is_valid(state.buffer_id) then
     vim.api.nvim_buf_delete(state.buffer_id, { force = true })
   end
+
+  -- 清理窗口大小变化监听器
+  M._cleanup_window_resize_listener()
 
   -- 重置状态
   state.active = false
@@ -243,25 +251,20 @@ function M.submit()
   if not state.active then
     return
   end
-  
-  -- 保存当前内容
-  if state.buffer_id and vim.api.nvim_buf_is_valid(state.buffer_id) then
-    local lines = vim.api.nvim_buf_get_lines(state.buffer_id, 0, -1, false)
-    if #lines > 0 then
-      state.content = lines[1]
-      if state.content == state.placeholder then
-        state.content = ""
-      end
-    end
-  end
-  
+
+  -- 使用 get_content() 获取当前内容（这会正确处理占位符）
+  state.content = M.get_content()
+
   -- 调用提交回调
   if state.on_submit and type(state.on_submit) == "function" then
     state.on_submit(state.content)
   end
-  
-  -- 不清空内容，保持输入框打开
-  print("📝 消息已发送，输入框保持打开状态")
+
+  -- 清空输入框内容
+  M.set_content("")
+
+  -- 保持输入框打开
+  print("📝 消息已发送，输入框已清空")
 end
 
 --- 回到正常模式（不关闭输入框）
@@ -275,9 +278,6 @@ function M.enter_normal_mode()
     local lines = vim.api.nvim_buf_get_lines(state.buffer_id, 0, -1, false)
     if #lines > 0 then
       state.content = lines[1]
-      if state.content == state.placeholder then
-        state.content = ""
-      end
     end
   end
 
@@ -295,12 +295,12 @@ function M.cancel()
   if not state.active then
     return
   end
-  
+
   -- 只调用取消回调，不关闭输入框
   if state.on_cancel and type(state.on_cancel) == "function" then
     state.on_cancel()
   end
-  
+
   -- 不清空内容，保持输入框打开
   print("📝 输入框保持打开状态（按ESC退出插入模式）")
 end
@@ -309,16 +309,16 @@ end
 --- @return string 输入内容
 function M.get_content()
   if state.active and state.buffer_id and vim.api.nvim_buf_is_valid(state.buffer_id) then
+    -- 获取缓冲区内容
     local lines = vim.api.nvim_buf_get_lines(state.buffer_id, 0, -1, false)
     if #lines > 0 then
-      local content = lines[1]
-      if content == state.placeholder then
-        return ""
-      end
-      return content
+      -- 直接返回缓冲区内容，占位符不会出现在这里
+      return lines[1]
     end
   end
-  return state.content
+
+  -- 返回状态中存储的内容
+  return state.content or ""
 end
 
 --- 设置内容
@@ -327,12 +327,23 @@ function M.set_content(content)
   state.content = content or ""
 
   if state.active and state.buffer_id and vim.api.nvim_buf_is_valid(state.buffer_id) then
+    -- 设置防抖标志
+    state._updating_buffer = true
+
+    -- 设置缓冲区内容
+    vim.api.nvim_buf_set_lines(state.buffer_id, 0, -1, false, { state.content })
+    
+    -- 根据内容是否为空来显示或隐藏占位符
     if state.content == "" then
-      vim.api.nvim_buf_set_lines(state.buffer_id, 0, -1, false, { state.placeholder })
-      set_placeholder_highlight(state.buffer_id)
+      set_virtual_placeholder(state.buffer_id, state.placeholder, true)
     else
-      vim.api.nvim_buf_set_lines(state.buffer_id, 0, -1, false, { state.content })
+      set_virtual_placeholder(state.buffer_id, state.placeholder, false)
     end
+
+    -- 清除防抖标志
+    vim.defer_fn(function()
+      state._updating_buffer = false
+    end, 10)
   end
 end
 
@@ -371,15 +382,31 @@ function M._get_keymaps()
   }
 
   -- 从配置中获取键位
-  if state.config and state.config.keymaps and state.config.keymaps.virtual_input then
-    local config_keymaps = state.config.keymaps.virtual_input
+  if state.config and state.config.keymaps and state.config.keymaps.chat then
+    local chat_keymaps = state.config.keymaps.chat
     local result = {}
 
-    -- 映射配置键位到内部键位名称
+    -- 从 chat 配置中获取发送按键
+    if chat_keymaps.send then
+      if chat_keymaps.send.insert then
+        result.normal_mode = chat_keymaps.send.insert.key
+      end
+      if chat_keymaps.send.normal then
+        result.submit = chat_keymaps.send.normal.key
+      end
+    end
+    
+    -- 获取其他按键
+    if chat_keymaps.cancel then
+      result.cancel = chat_keymaps.cancel.key
+    end
+    if chat_keymaps.clear then
+      result.clear = chat_keymaps.clear.key
+    end
+    
+    -- 确保所有键位都有值
     for internal_name, default_key in pairs(default_keymaps) do
-      if config_keymaps[internal_name] and config_keymaps[internal_name].key then
-        result[internal_name] = config_keymaps[internal_name].key
-      else
+      if not result[internal_name] then
         result[internal_name] = default_key
       end
     end
@@ -511,13 +538,37 @@ function M._setup_keymaps()
 
   -- 内容变化时触发回调
   local attach_id = vim.api.nvim_buf_attach(state.buffer_id, false, {
-    on_lines = function(_, _, _, _, _, _, _)
+    on_lines = function(_, _, first_line, last_line, _, _, _)
+      -- 使用防抖机制避免递归调用
+      if state._updating_buffer then
+        return
+      end
+
+      state._updating_buffer = true
+
+      -- 获取当前缓冲区内容
+      local lines = vim.api.nvim_buf_get_lines(state.buffer_id, 0, -1, false)
+      if #lines > 0 then
+        local current_content = lines[1]
+        
+        -- 更新 state.content
+        state.content = current_content
+        
+        -- 根据内容是否为空来更新虚拟占位符
+        if current_content == "" then
+          set_virtual_placeholder(state.buffer_id, state.placeholder, true)
+        else
+          set_virtual_placeholder(state.buffer_id, state.placeholder, false)
+        end
+      end
+
       if state.on_change and type(state.on_change) == "function" then
-        local content = M.get_content()
         vim.defer_fn(function()
-          state.on_change(content)
+          state.on_change(state.content)
         end, 0)
       end
+
+      state._updating_buffer = false
     end,
     on_detach = function()
       -- 清理回调
@@ -527,6 +578,96 @@ function M._setup_keymaps()
 
   -- 保存attach_id以便后续清理
   state._attach_id = attach_id
+end
+
+--- 设置窗口大小变化监听器（内部函数）
+--- @param parent_window_id number 父窗口ID
+function M._setup_window_resize_listener(parent_window_id)
+  if not parent_window_id or not vim.api.nvim_win_is_valid(parent_window_id) then
+    return
+  end
+
+  -- 清理现有的监听器
+  if state.resize_listener_id then
+    pcall(vim.api.nvim_del_autocmd, state.resize_listener_id)
+    state.resize_listener_id = nil
+  end
+
+  -- 创建窗口大小变化监听器
+  state.resize_listener_id = vim.api.nvim_create_autocmd("WinScrolled", {
+    callback = function(args)
+      -- 检查是否是父窗口的大小变化
+      if args.win == parent_window_id then
+        -- 延迟调整位置，避免频繁更新
+        vim.defer_fn(function()
+          M._adjust_position()
+        end, 10)
+      end
+    end,
+    pattern = "*",
+  })
+
+  -- 保存父窗口ID
+  state.parent_window_id = parent_window_id
+end
+
+--- 调整虚拟输入框位置（内部函数）
+function M._adjust_position()
+  if not state.active then
+    return
+  end
+
+  if not state.window_id or not vim.api.nvim_win_is_valid(state.window_id) then
+    return
+  end
+
+  if not state.parent_window_id or not vim.api.nvim_win_is_valid(state.parent_window_id) then
+    return
+  end
+
+  -- 获取父窗口当前尺寸
+  local parent_height = vim.api.nvim_win_get_height(state.parent_window_id)
+  local parent_width = vim.api.nvim_win_get_width(state.parent_window_id)
+
+  -- 输入框高度和边框宽度
+  local input_height = 3
+  local border_width = 2
+
+  -- 计算新位置（固定在父窗口底部）
+  local win_width = math.max(20, parent_width - 4)
+  local win_row = math.max(0, parent_height - input_height - 1)
+
+  -- 获取当前窗口配置
+  local win_config = vim.api.nvim_win_get_config(state.window_id)
+  if not win_config then
+    return
+  end
+
+  -- 只更新位置和尺寸（如果变化超过阈值）
+  local current_width = win_config.width or win_width
+  local current_row = win_config.row or win_row
+
+  -- 如果位置或尺寸变化超过1个像素，则更新
+  if math.abs(current_width - win_width) > 1 or math.abs(current_row - win_row) > 1 then
+    win_config.width = win_width
+    win_config.height = input_height
+    win_config.row = win_row
+    win_config.col = border_width
+
+    -- 应用新的窗口配置
+    vim.api.nvim_win_set_config(state.window_id, win_config)
+
+    -- 调试信息（可选）
+    -- print(string.format("📐 调整虚拟输入框位置: 宽度=%d, 行=%d", win_width, win_row))
+  end
+end
+
+--- 清理窗口大小变化监听器（内部函数）
+function M._cleanup_window_resize_listener()
+  if state.resize_listener_id then
+    pcall(vim.api.nvim_del_autocmd, state.resize_listener_id)
+    state.resize_listener_id = nil
+  end
 end
 
 return M

@@ -48,7 +48,10 @@ local DEFAULT_CONFIG = {
       collapse = { key = "O", desc = "折叠节点" },
     },
     chat = {
-      send = { key = "<C-s>", desc = "发送消息" },
+      send = {
+        insert = { key = "<CR>", desc = "发送消息" },
+        normal = { key = "<CR>", desc = "发送消息" },
+      },
       cancel = { key = "<Esc>", desc = "取消生成" },
       edit = { key = "e", desc = "编辑消息" },
       delete = { key = "dd", desc = "删除消息" },
@@ -56,12 +59,6 @@ local DEFAULT_CONFIG = {
       scroll_down = { key = "<C-d>", desc = "向下滚动" },
       toggle_reasoning = { key = "r", desc = "切换思考过程显示" },
       newline = { key = "<C-CR>", desc = "新建行" },
-      clear = { key = "<C-u>", desc = "清空输入" },
-    },
-    virtual_input = {
-      normal_mode = { key = "<CR>", desc = "发送消息" },
-      submit = { key = "<C-s>", desc = "发送消息(Ctrl+s)" },
-      cancel = { key = "<Esc>", desc = "取消输入并关闭输入框" },
       clear = { key = "<C-u>", desc = "清空输入" },
     },
   },
@@ -162,13 +159,13 @@ function M.validate_config(config)
 
   -- 验证键位配置（现在在顶层）
   if config.keymaps then
-    local valid_contexts = { "global", "tree", "chat", "virtual_input" }
+    local valid_contexts = { "global", "tree", "chat" }
     for context, keymap_table in pairs(config.keymaps) do
       -- 检查上下文是否有效
       if not vim.tbl_contains(valid_contexts, context) then
         vim.notify(
           string.format(
-            "[NeoAI] Invalid keymap context: %s. Valid contexts are: global, tree, chat, virtual_input. Using default.",
+            "[NeoAI] Invalid keymap context: %s. Valid contexts are: global, tree, chat. Using default.",
             context
           ),
           vim.log.levels.WARN
@@ -182,34 +179,92 @@ function M.validate_config(config)
         else
           -- 验证每个键位配置
           for action, key_config in pairs(keymap_table) do
-            -- 检查是否为table且包含key和desc字段
-            if type(key_config) ~= "table" then
-              vim.notify(
-                string.format(
-                  "[NeoAI] keymaps.%s.%s must be a table with key and desc fields. Using default.",
-                  context,
-                  action
-                ),
-                vim.log.levels.WARN
-              )
-              keymap_table[action] = nil
-            else
-              -- 检查key字段是否存在且为字符串
-              if not key_config.key or type(key_config.key) ~= "string" then
+            -- 特殊处理 send 配置（它本身是一个包含 insert 和 normal 的表）
+            if action == "send" then
+              if type(key_config) ~= "table" then
                 vim.notify(
-                  string.format("[NeoAI] keymaps.%s.%s.key must be a string. Using default.", context, action),
+                  string.format(
+                    "[NeoAI] keymaps.%s.send must be a table with insert and normal fields. Using default.",
+                    context
+                  ),
                   vim.log.levels.WARN
                 )
                 keymap_table[action] = nil
-              end
+              else
+                -- 验证 insert 配置
+                if key_config.insert then
+                  if type(key_config.insert) ~= "table" then
+                    vim.notify(
+                      string.format(
+                        "[NeoAI] keymaps.%s.send.insert must be a table with key and desc fields. Using default.",
+                        context
+                      ),
+                      vim.log.levels.WARN
+                    )
+                    key_config.insert = nil
+                  else
+                    if not key_config.insert.key or type(key_config.insert.key) ~= "string" then
+                      vim.notify(
+                        string.format("[NeoAI] keymaps.%s.send.insert.key must be a string. Using default.", context),
+                        vim.log.levels.WARN
+                      )
+                      key_config.insert = nil
+                    end
+                  end
+                end
 
-              -- 检查desc字段是否存在且为字符串（可选）
-              if key_config.desc and type(key_config.desc) ~= "string" then
+                -- 验证 normal 配置
+                if key_config.normal then
+                  if type(key_config.normal) ~= "table" then
+                    vim.notify(
+                      string.format(
+                        "[NeoAI] keymaps.%s.send.normal must be a table with key and desc fields. Using default.",
+                        context
+                      ),
+                      vim.log.levels.WARN
+                    )
+                    key_config.normal = nil
+                  else
+                    if not key_config.normal.key or type(key_config.normal.key) ~= "string" then
+                      vim.notify(
+                        string.format("[NeoAI] keymaps.%s.send.normal.key must be a string. Using default.", context),
+                        vim.log.levels.WARN
+                      )
+                      key_config.normal = nil
+                    end
+                  end
+                end
+              end
+            else
+              -- 处理其他普通键位配置
+              if type(key_config) ~= "table" then
                 vim.notify(
-                  string.format("[NeoAI] keymaps.%s.%s.desc must be a string. Ignoring desc.", context, action),
+                  string.format(
+                    "[NeoAI] keymaps.%s.%s must be a table with key and desc fields. Using default.",
+                    context,
+                    action
+                  ),
                   vim.log.levels.WARN
                 )
-                key_config.desc = nil
+                keymap_table[action] = nil
+              else
+                -- 检查key字段是否存在且为字符串
+                if not key_config.key or type(key_config.key) ~= "string" then
+                  vim.notify(
+                    string.format("[NeoAI] keymaps.%s.%s.key must be a string. Using default.", context, action),
+                    vim.log.levels.WARN
+                  )
+                  keymap_table[action] = nil
+                end
+
+                -- 检查desc字段是否存在且为字符串（可选）
+                if key_config.desc and type(key_config.desc) ~= "string" then
+                  vim.notify(
+                    string.format("[NeoAI] keymaps.%s.%s.desc must be a string. Ignoring desc.", context, action),
+                    vim.log.levels.WARN
+                  )
+                  key_config.desc = nil
+                end
               end
             end
           end
