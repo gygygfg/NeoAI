@@ -1,5 +1,6 @@
 local M = {}
 local MODULE_NAME = "NeoAI.ui.window.tree_window"
+
 local window_manager = require("NeoAI.ui.window.window_manager")
 
 -- 模块状态
@@ -14,8 +15,6 @@ local state = {
   cursor_augroup = nil, -- 光标移动自动命令组
   float_win_id = nil, -- 悬浮窗口ID
   float_buf_id = nil, -- 悬浮窗口缓冲区ID
-  node_counter = 0, -- 节点计数器，用于生成序号
-  max_node_number = 0, -- 最大节点编号
 }
 
 --- 初始化树窗口
@@ -27,13 +26,12 @@ function M.initialize(config)
 
   state.config = config or {}
   state.initialized = true
-  state.node_counter = 0
-  state.max_node_number = 0
 end
 
 --- 打开树状图窗口
 --- @param session_id string 会话ID
---- @param window_id string 窗口ID（必须由调用者通过 window_manager 创建）                                                                  --- @return boolean 是否成功
+--- @param window_id string 窗口ID（必须由调用者通过 window_manager 创建）
+--- @return boolean 是否成功
 function M.open(session_id, window_id)
   if not state.initialized then
     error("Tree window not initialized")
@@ -58,8 +56,6 @@ function M.open(session_id, window_id)
   state.current_session_id = session_id
   state.selected_node_id = nil
   state.expanded_nodes = {}
-  state.node_counter = 0
-  state.max_node_number = 0
 
   -- 触发窗口打开事件
   vim.api.nvim_exec_autocmds(
@@ -90,9 +86,6 @@ function M.open(session_id, window_id)
   -- 加载树数据
   M._load_tree_data(session_id)
 
-  -- 先计算树的总节点数，用于序号生成
-  M._calculate_node_numbers(state.tree_data)
-
   -- 渲染树
   M.render_tree(state.tree_data)
 
@@ -108,48 +101,6 @@ function M.open(session_id, window_id)
   return true
 end
 
---- 计算树的总节点数并生成序号映射
---- @param nodes table 节点列表
---- @return number 总节点数
-function M._calculate_node_numbers(nodes)
-  if not nodes then
-    return 0
-  end
-
-  local count = 0
-  local node_stack = {}
-
-  -- 使用栈进行深度优先遍历
-  -- 先将所有根节点逆序入栈，确保深度优先遍历的顺序
-  for i = #nodes, 1, -1 do
-    table.insert(node_stack, { node = nodes[i], depth = 0 })
-  end
-
-  -- 存储每个节点的编号
-  state.node_numbers = {}
-
-  -- 深度优先遍历
-  while #node_stack > 0 do
-    local stack_item = table.remove(node_stack)
-    local node = stack_item.node
-    local depth = stack_item.depth
-
-    -- 为当前节点分配编号
-    count = count + 1
-    state.node_numbers[node.id] = count
-
-    -- 如果节点有子节点且是展开状态，将子节点逆序入栈
-    if state.expanded_nodes[node.id] and node.children and #node.children > 0 then
-      for i = #node.children, 1, -1 do
-        table.insert(node_stack, { node = node.children[i], depth = depth + 1 })
-      end
-    end
-  end
-
-  state.max_node_number = count
-  return count
-end
-
 --- 渲染树状图
 --- @param tree_data table 树数据
 function M.render_tree(tree_data)
@@ -157,19 +108,11 @@ function M.render_tree(tree_data)
     return
   end
 
-  -- 重置计数器
-  state.node_counter = 0
-  state.node_numbers = {}
-
   -- 触发开始渲染树事件
   vim.api.nvim_exec_autocmds(
     "User",
     { pattern = "NeoAI:tree_rendering_start", data = { window_id = state.current_window_id } }
   )
-
-  -- 计算节点总数和编号
-  local total_nodes = M._calculate_node_numbers(tree_data)
-  state.node_counter = total_nodes
 
   -- 获取窗口宽度，并减去左侧行号栏的宽度
   local window_width = nil
@@ -224,13 +167,6 @@ function M.refresh_tree()
 
   -- 重新加载数据
   M._load_tree_data(state.current_session_id)
-
-  -- 重置计数器
-  state.node_counter = 0
-  state.node_numbers = {}
-
-  -- 重新计算节点编号
-  M._calculate_node_numbers(state.tree_data)
 
   -- 重新渲染
   M.render_tree(state.tree_data)
@@ -560,9 +496,6 @@ function M.close()
     state.tree_data = {}
     state.selected_node_id = nil
     state.expanded_nodes = {}
-    state.node_counter = 0
-    state.max_node_number = 0
-    state.node_numbers = {}
     return
   end
 
@@ -596,9 +529,6 @@ function M.close()
   state.expanded_nodes = {}
   state.float_win_id = nil
   state.float_buf_id = nil
-  state.node_counter = 0
-  state.max_node_number = 0
-  state.node_numbers = {}
 
   -- 触发窗口关闭事件
   vim.api.nvim_exec_autocmds(
@@ -637,14 +567,6 @@ function M._render_tree_node(content, node, depth, is_last, parent_prefix)
     return
   end
 
-  -- 获取当前节点的编号
-  local node_number = state.node_numbers[node.id] or 0
-  local number_str = tostring(node_number)
-
-  -- 计算编号的宽度，确保对齐
-  local max_number_len = tostring(state.max_node_number):len()
-  local padded_number = string.rep(" ", max_number_len - number_str:len()) .. number_str
-
   -- 生成当前节点的前缀
   local current_prefix = parent_prefix or ""
   local line_prefix = ""
@@ -652,9 +574,9 @@ function M._render_tree_node(content, node, depth, is_last, parent_prefix)
   if depth > 0 then
     -- 使用文件树样式的连接符
     if is_last then
-      line_prefix = current_prefix .. "└───"
+      line_prefix = current_prefix .. "└── "
     else
-      line_prefix = current_prefix .. "├───"
+      line_prefix = current_prefix .. "├── "
     end
   else
     line_prefix = "" -- 根节点没有前缀
@@ -719,8 +641,8 @@ function M._render_tree_node(content, node, depth, is_last, parent_prefix)
     cleaned_name = "未命名节点"
   end
 
-  -- 生成节点行，包含序号
-  local line = padded_number .. " " .. line_prefix .. node_prefix .. cleaned_name
+  -- 生成节点行
+  local line = line_prefix .. node_prefix .. cleaned_name
   if node.metadata then
     -- 显示会话的消息数量
     if node.type == "session" and node.metadata.message_count then
@@ -749,9 +671,9 @@ function M._render_tree_node(content, node, depth, is_last, parent_prefix)
     local child_parent_prefix = parent_prefix or ""
     if depth > 0 then
       if is_last then
-        child_parent_prefix = child_parent_prefix .. "    " -- 最后一 个子节点，父节点是空格
+        child_parent_prefix = child_parent_prefix .. "    " -- 最后一个子节点，父节点是空格
       else
-        child_parent_prefix = child_parent_prefix .. "│   " -- 不是最 后一个子节点，父节点是竖线
+        child_parent_prefix = child_parent_prefix .. "│   " -- 不是最后一个子节点，父节点是竖线
       end
     end
 

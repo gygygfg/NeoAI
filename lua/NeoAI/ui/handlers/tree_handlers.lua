@@ -67,7 +67,7 @@ function M.initialize(event_bus, config)
         })
       else
         -- 实际环境：创建分支
-        local success = M.create_branch(session_id, name, parent_branch_id)
+        local success = M.create_branch(parent_branch_id, name)
         if success then
           vim.api.nvim_exec_autocmds("User", {
             pattern = "NeoAI:branch_created",
@@ -193,7 +193,7 @@ function M.delete_branch(branch_id)
   local branch_manager = require("NeoAI.core.session.branch_manager")
 
   -- 尝试删除分支
-  local success, err = pcall(branch_manager.delete_branch, branch_manager, branch_id)
+  local success, err = pcall(branch_manager.delete_branch, branch_id)
 
   if success then
     -- 刷新树视图
@@ -206,24 +206,92 @@ function M.delete_branch(branch_id)
 end
 
 --- 创建分支
---- @param session_id string 会话ID
---- @param branch_name string 分支名称
 --- @param parent_branch_id string 父分支ID（可选）
+--- @param branch_name string 分支名称
 --- @return boolean 是否创建成功
-function M.create_branch(session_id, branch_name, parent_branch_id)
+function M.create_branch(parent_branch_id, branch_name)
   if not state.initialized then
     return false
   end
 
+  -- 调试：打印参数
+  print("调试：create_branch 被调用")
+  print("  父分支ID: " .. (parent_branch_id or "nil（创建根分支）"))
+  print("  分支名称: " .. (branch_name or "nil"))
+
+  -- 首先尝试使用树管理器
+  local tree_manager_loaded, tree_manager = pcall(require, "NeoAI.core.session.tree_manager")
+  if tree_manager_loaded and tree_manager then
+    -- 确保树管理器已初始化
+    if not tree_manager.is_initialized or not tree_manager.is_initialized() then
+      tree_manager.initialize({
+        event_bus = state.event_bus,
+        config = state.config,
+      })
+    end
+
+    local node_id = nil
+
+    if not parent_branch_id then
+      -- 创建根分支
+      node_id = tree_manager.create_root_branch(branch_name)
+      print("✓ 树管理器创建根分支成功，节点ID: " .. node_id)
+    else
+      -- 检查父节点类型
+      local parent_node = tree_manager.get_node(parent_branch_id)
+      if parent_node then
+        if parent_node.type == "root_branch" or parent_node.type == "sub_branch" then
+          -- 创建子分支
+          node_id = tree_manager.create_sub_branch(parent_branch_id, branch_name)
+          print("✓ 树管理器创建子分支成功，节点ID: " .. node_id)
+        elseif parent_node.type == "session" then
+          -- 会话节点不能创建子分支
+          vim.notify("错误：会话节点不能创建子分支", vim.log.levels.ERROR)
+          return false
+        else
+          vim.notify("错误：未知的父节点类型: " .. parent_node.type, vim.log.levels.ERROR)
+          return false
+        end
+      else
+        -- 父节点不存在，尝试使用旧的分支管理器
+        print("⚠️  父节点不存在，回退到旧的分支管理器")
+        return M._create_branch_fallback(parent_branch_id, branch_name)
+      end
+    end
+
+    if node_id then
+      vim.notify("分支创建成功: " .. branch_name, vim.log.levels.INFO)
+
+      -- 刷新树视图
+      local tree_window = require("NeoAI.ui.window.tree_window")
+      tree_window.refresh_tree()
+
+      return true
+    else
+      vim.notify("分支创建失败", vim.log.levels.ERROR)
+      return false
+    end
+  else
+    -- 树管理器不可用，使用旧的分支管理器
+    print("⚠️  树管理器不可用，回退到旧的分支管理器")
+    return M._create_branch_fallback(parent_branch_id, branch_name)
+  end
+end
+
+--- 创建分支（回退方法，使用旧的分支管理器）
+--- @param parent_branch_id string 父分支ID（可选）
+--- @param branch_name string 分支名称
+--- @return boolean 是否创建成功
+function M._create_branch_fallback(parent_branch_id, branch_name)
   -- 获取分支管理器
   local branch_manager = require("NeoAI.core.session.branch_manager")
 
   -- 创建分支
-  local success, branch_id =
-    pcall(branch_manager.create_branch, branch_manager, session_id, branch_name, parent_branch_id)
+  local success, branch_id = pcall(branch_manager.create_branch, parent_branch_id, branch_name)
 
   if success and branch_id then
     vim.notify("分支创建成功: " .. branch_name, vim.log.levels.INFO)
+    print("✓ 分支管理器创建分支成功，分支ID: " .. branch_id)
 
     -- 更新历史管理器
     local history_manager_loaded, history_manager = pcall(require, "NeoAI.core.history_manager")
@@ -237,7 +305,7 @@ function M.create_branch(session_id, branch_name, parent_branch_id)
           branch_id = branch_id,
           parent_branch_id = parent_branch_id,
         })
-        
+
         -- 自动保存会话
         history_manager._auto_save_session(current_session)
         print("✓ 分支信息已保存到历史管理器")

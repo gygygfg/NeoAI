@@ -55,6 +55,18 @@ function Session:new(id, name, metadata)
   obj.messages = {}
   obj.branches = {}
   obj.current_branch_id = nil
+  
+  -- 为每个新会话创建默认分支
+  obj:create_branch("主分支", nil, {
+    created_at = os.time(),
+    branch_id = "default",
+    parent_branch_id = nil,
+    is_default = true,
+  })
+  
+  -- 设置默认分支为当前分支
+  obj.current_branch_id = "default"
+  
   return obj
 end
 
@@ -220,6 +232,8 @@ function Session:save(filepath, config)
       auto_scroll = true,
       show_timestamps = true,
     },
+    branches = self.branches,
+    current_branch_id = self.current_branch_id,
   }
 
   -- 获取目录路径
@@ -407,8 +421,9 @@ function Session._from_sessions_json_format(session_data, session_id)
   end
 
   session.messages = messages
-  session.branches = {} -- sessions.json 格式不支持分支
-  session.current_branch_id = nil
+  -- 加载分支数据（如果存在）
+  session.branches = session_data.branches or {}
+  session.current_branch_id = session_data.current_branch_id
 
   return session
 end
