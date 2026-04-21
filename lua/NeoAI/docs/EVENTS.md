@@ -72,8 +72,17 @@ print(events.EVENTS.GENERATION_STARTED)  -- 输出: "NeoAI:generation_started"
 - `MESSAGE_ADDED` - 消息添加
   - 数据: `{message_id, message}`
 - `MESSAGE_EDITED` - 消息编辑
+  - 数据: `{message_id, old_content, new_content}`
 - `MESSAGE_DELETED` - 消息删除
-- `MESSAGE_UPDATED` - 消息更新
+  - 数据: `{message_id, message}`
+- `MESSAGES_CLEARED` - 消息清空
+  - 数据: `{branch_id, deleted_ids}`
+- `MESSAGES_BUILT` - 消息构建完成
+  - 数据: `{messages, history_count}`
+- `MESSAGE_SENT` - 消息发送
+  - 数据: `{session_id, branch_id, original_content, formatted_content, message, window_id, timestamp}`
+- `FORMATTED_MESSAGE_SENT` - 格式化消息发送
+  - 数据: `{session_id, branch_id, original_content, formatted_content, message, window_id, timestamp}`
 
 ### UI 事件
 - `CHAT_WINDOW_OPENED` - 聊天窗口打开

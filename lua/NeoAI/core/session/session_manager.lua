@@ -202,12 +202,23 @@ end
 function M.list_sessions()
   local result = {}
   for id, session in pairs(sessions) do
+    -- 计算消息数量
+    local message_count = 0
+    if session.messages then
+      message_count = #session.messages
+    elseif session.metadata and session.metadata.message_count then
+      message_count = session.metadata.message_count
+    end
+    
     table.insert(result, {
       id = id,
       name = session.name,
       created_at = session.created_at,
       updated_at = session.updated_at,
       branch_count = #vim.tbl_keys(session.branches),
+      metadata = {
+        message_count = message_count,
+      },
     })
   end
 
@@ -295,8 +306,10 @@ function M._load_sessions()
           -- 跳过 _graph 等非会话数据
           if session_id_str ~= "_graph" and type(session_data) == "table" and session_data.messages ~= nil then
             -- 转换会话数据格式
+            -- 使用一致的会话ID格式：session_<数字>
+            local session_id = "session_" .. session_id_str
             local session = {
-              id = session_id_str,
+              id = session_id,
               name = session_data.name or "会话 " .. session_id_str,
               created_at = session_data.created_at or os.time(),
               updated_at = session_data.updated_at or os.time(),
@@ -324,7 +337,17 @@ function M._load_sessions()
               })
             end
             
-            sessions[session.id] = session
+            sessions[session_id] = session
+            
+            -- 触发会话加载事件
+            vim.api.nvim_exec_autocmds("User", {
+              pattern = "NeoAI:session_loaded",
+              data = {
+                new_session_id = session_id,
+                filepath = sessions_file,
+                session = session
+              }
+            })
             
             -- 更新会话计数器
             local session_num = tonumber(session_id_str)
@@ -351,6 +374,16 @@ function M._load_sessions()
         local data = vim.json.decode(table.concat(content, "\n"))
         if data and data.id then
           sessions[data.id] = data
+          
+          -- 触发会话加载事件（旧格式）
+          vim.api.nvim_exec_autocmds("User", {
+            pattern = "NeoAI:session_loaded",
+            data = {
+              new_session_id = data.id,
+              filepath = filepath,
+              session = data
+            }
+          })
 
           -- 更新会话计数器
           local session_num = tonumber(data.id:match("session_(%d+)"))
@@ -419,6 +452,16 @@ function M._save_sessions()
 
     local json_str = vim.json.encode(data)
     vim.fn.writefile({ json_str }, filepath)
+    
+    -- 触发会话保存事件
+    vim.api.nvim_exec_autocmds("User", {
+      pattern = "NeoAI:session_saved",
+      data = {
+        session_id = session_id,
+        filepath = filepath,
+        session = session
+      }
+    })
   end
 end
 

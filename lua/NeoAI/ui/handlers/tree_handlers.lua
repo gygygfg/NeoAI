@@ -225,6 +225,29 @@ function M.create_branch(session_id, branch_name, parent_branch_id)
   if success and branch_id then
     vim.notify("分支创建成功: " .. branch_name, vim.log.levels.INFO)
 
+    -- 更新历史管理器
+    local history_manager_loaded, history_manager = pcall(require, "NeoAI.core.history_manager")
+    if history_manager_loaded and history_manager then
+      -- 获取当前会话
+      local current_session = history_manager.get_current_session()
+      if current_session then
+        -- 在会话中创建分支
+        current_session:create_branch(branch_name, nil, {
+          created_at = os.time(),
+          branch_id = branch_id,
+          parent_branch_id = parent_branch_id,
+        })
+        
+        -- 自动保存会话
+        history_manager._auto_save_session(current_session)
+        print("✓ 分支信息已保存到历史管理器")
+      else
+        print("⚠️  无法获取当前会话，无法保存分支信息")
+      end
+    else
+      print("⚠️  无法加载历史管理器")
+    end
+
     -- 刷新树视图
     local tree_window = require("NeoAI.ui.window.tree_window")
     tree_window.refresh_tree()

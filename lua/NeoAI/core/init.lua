@@ -4,6 +4,7 @@ local config_manager = require("NeoAI.core.config.config_manager")
 local keymap_manager = require("NeoAI.core.config.keymap_manager")
 local session_manager = require("NeoAI.core.session.session_manager")
 local ai_engine = require("NeoAI.core.ai.ai_engine")
+local history_manager = require("NeoAI.core.history_manager")
 
 -- 模块状态
 local state = {
@@ -54,6 +55,11 @@ function M.initialize(core_config)
     session_manager = state.session_mgr,
   })
 
+  -- 初始化历史管理器
+  history_manager.initialize({
+    config = config_manager.get("session") or {},
+  })
+
   state.config = core_config
   state.initialized = true
 
@@ -96,6 +102,16 @@ function M.get_keymap_manager()
   end
 
   return state.keymap_mgr
+end
+
+--- 获取历史管理器
+--- @return table 历史管理器
+function M.get_history_manager()
+  if not state.initialized then
+    error("Core not initialized")
+  end
+
+  return history_manager
 end
 
 return M

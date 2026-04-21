@@ -12,6 +12,8 @@ local state = {
   current_session_id = nil, -- 当前聊天窗口关联的会话ID
   messages = {},
   cursor_augroup = nil, -- 光标移动自动命令组
+  last_render_time = 0, -- 上次渲染时间
+  render_debounce_timer = nil, -- 防抖定时器
 }
 
 --- 初始化聊天窗口
@@ -116,6 +118,36 @@ end
 
 --- 渲染聊天内容
 function M.render_chat()
+  if not state.current_window_id then
+    return
+  end
+
+  -- 防抖处理：避免频繁渲染
+  local now = vim.loop.now()
+  if now - state.last_render_time < 100 then -- 100毫秒内不重复渲染
+    -- 取消之前的定时器
+    if state.render_debounce_timer then
+      state.render_debounce_timer:stop()
+      state.render_debounce_timer:close()
+      state.render_debounce_timer = nil
+    end
+    
+    -- 设置新的定时器
+    state.render_debounce_timer = vim.loop.new_timer()
+    state.render_debounce_timer:start(100, 0, vim.schedule_wrap(function()
+      state.render_debounce_timer:close()
+      state.render_debounce_timer = nil
+      M._do_render_chat()
+    end))
+    return
+  end
+  
+  state.last_render_time = now
+  M._do_render_chat()
+end
+
+--- 实际执行渲染聊天内容
+function M._do_render_chat()
   if not state.current_window_id then
     return
   end

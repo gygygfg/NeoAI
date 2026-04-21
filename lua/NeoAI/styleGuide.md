@@ -341,6 +341,8 @@ local once_listener = vim.api.nvim_create_autocmd("User", {
 - `NeoAI:messages_cleared` - 消息清空（数据：`{branch_id, deleted_ids}`）
 - `NeoAI:messages_built` - 消息构建完成（数据：`{messages, history_count}`）
 - `NeoAI:message_updated` - 消息更新（数据：`{message_id, message}`）
+- `NeoAI:message_sent` - 消息发送（数据：`{message, window_id, session_id, timestamp, role}`）
+- `NeoAI:formatted_message_sent` - 格式化消息发送（数据：`{original_content, formatted_content, session_id, window_id, timestamp}`）
 
 #### 8. 窗口事件
 

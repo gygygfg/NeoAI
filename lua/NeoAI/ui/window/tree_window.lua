@@ -8,10 +8,13 @@ local state = {
   initialized = false,
   config = nil,
   current_window_id = nil,
+  current_session_id = nil, -- 当前会话ID
   tree_data = {},
   selected_node_id = nil,
   expanded_nodes = {},
   cursor_augroup = nil, -- 光标移动自动命令组
+  float_win_id = nil, -- 悬浮窗口ID
+  float_buf_id = nil, -- 悬浮窗口缓冲区ID
 }
 
 --- 初始化树窗口
@@ -50,6 +53,7 @@ function M.open(session_id, window_id)
   end
 
   state.current_window_id = window_id
+  state.current_session_id = session_id
   state.selected_node_id = nil
   state.expanded_nodes = {}
 
@@ -62,16 +66,17 @@ function M.open(session_id, window_id)
   -- 获取缓冲区和窗口句柄并设置选项
   local buf = window_manager.get_window_buf(window_id)
   local win_handle = window_manager.get_window_win(window_id)
-  
+
   if buf then
     -- 设置缓冲区选项
     vim.api.nvim_set_option_value("filetype", "markdown", { buf = buf })
   end
-  
+
   if win_handle then
     -- 设置窗口选项（wrap 和 linebreak 都是窗口本地选项）
-    vim.api.nvim_set_option_value("wrap", true, { win = win_handle })
-    vim.api.nvim_set_option_value("linebreak", true, { win = win_handle })
+    -- 注意：为了确保截断生效，将 wrap 设置为 false
+    vim.api.nvim_set_option_value("wrap", false, { win = win_handle })
+    vim.api.nvim_set_option_value("linebreak", false, { win = win_handle })
     vim.api.nvim_set_option_value("cursorline", true, { win = win_handle })
   end
 
@@ -82,10 +87,13 @@ function M.open(session_id, window_id)
   M._load_tree_data(session_id)
 
   -- 渲染树
-  M.render_tree()
+  M.render_tree(state.tree_data)
 
   -- 设置按键映射
   M.set_keymaps()
+
+  -- 初始化悬浮窗口
+  M._update_float_window()
 
   -- 触发树窗口打开事件
   vim.api.nvim_exec_autocmds("User", { pattern = "NeoAI:tree_window_opened", data = { window_id = window_id } })
@@ -106,8 +114,31 @@ function M.render_tree(tree_data)
     { pattern = "NeoAI:tree_rendering_start", data = { window_id = state.current_window_id } }
   )
 
-  -- 使用 window_manager 的通用渲染函数
-  local content = window_manager.render_tree(tree_data, state, M._load_tree_data)
+  -- 获取窗口宽度，并减去左侧行号栏的宽度
+  local window_width = nil
+  local win_handle = window_manager.get_window_win(state.current_window_id)
+  if win_handle and vim.api.nvim_win_is_valid(win_handle) then
+    local win_config = vim.api.nvim_win_get_config(win_handle)
+    if win_config and win_config.width then
+      window_width = win_config.width
+
+      -- 减去左侧行号栏的宽度
+      local number_width = vim.api.nvim_get_option_value("numberwidth", { win = win_handle })
+      if number_width then
+        window_width = window_width - number_width
+      end
+
+      -- 减去符号列的宽度（如果有）
+      local signcolumn = vim.api.nvim_get_option_value("signcolumn", { win = win_handle })
+      if signcolumn and signcolumn ~= "no" then
+        -- 符号列通常占用2个字符宽度
+        window_width = window_width - 2
+      end
+    end
+  end
+
+  -- 使用 window_manager 的通用渲染函数，传递窗口宽度
+  local content = window_manager.render_tree(tree_data, state, M._load_tree_data, window_width)
 
   -- 设置窗口内容
   window_manager.set_window_content(state.current_window_id, content)
@@ -135,10 +166,10 @@ function M.refresh_tree()
   end
 
   -- 重新加载数据
-  M._load_tree_data()
+  M._load_tree_data(state.current_session_id)
 
   -- 重新渲染
-  M.render_tree()
+  M.render_tree(state.tree_data)
 end
 
 --- 设置按键映射
@@ -296,6 +327,17 @@ function M._setup_cursor_listener(buf)
       M._update_cursor_highlight()
     end,
     desc = "更新树窗口光标高亮",
+  })
+
+  -- 监听窗口大小变化事件
+  vim.api.nvim_create_autocmd({ "WinResized", "VimResized" }, {
+    group = state.cursor_augroup,
+    buffer = buf,
+    callback = function()
+      -- 更新悬浮窗口位置
+      M._update_float_window()
+    end,
+    desc = "更新树窗口悬浮窗口位置",
   })
 end
 
@@ -466,13 +508,22 @@ function M.close()
     state.cursor_augroup = nil
   end
 
+  -- 关闭悬浮窗口
+  M._close_float_window()
+
   state.current_window_id = nil
+  state.current_session_id = nil
   state.tree_data = {}
   state.selected_node_id = nil
   state.expanded_nodes = {}
+  state.float_win_id = nil
+  state.float_buf_id = nil
 
   -- 触发窗口关闭事件
-  vim.api.nvim_exec_autocmds("User", { pattern = "NeoAI:window_closed", data = { window_id = state.current_window_id } })
+  vim.api.nvim_exec_autocmds(
+    "User",
+    { pattern = "NeoAI:window_closed", data = { window_id = state.current_window_id } }
+  )
 
   -- 触发树窗口关闭完成事件
   vim.api.nvim_exec_autocmds(
@@ -519,8 +570,55 @@ function M._render_tree_node(content, node, depth, is_last, parent_prefix)
     node_prefix = "" -- 没有子节点的节点也不需要前缀
   end
 
+  -- 清理节点名称中的二进制数据和控制字符
+  local cleaned_name = node.name
+  if cleaned_name then
+    -- 检测是否包含乱码
+    local function detect_garbage(str)
+      if not str then
+        return false
+      end
+
+      -- 检测 <xx> 格式的十六进制字符
+      if str:match("%b<>"):match("^<[0-9a-fA-F][0-9a-fA-F]>$") then
+        return true
+      end
+
+      -- 检测控制字符
+      for i = 1, #str do
+        local byte = str:byte(i)
+        if byte < 32 and byte ~= 9 and byte ~= 10 and byte ~= 13 then
+          return true
+        end
+      end
+
+      return false
+    end
+
+    -- 检测是否需要清理
+    if detect_garbage(cleaned_name) then
+      -- 移除所有<xx>格式的标记
+      cleaned_name = cleaned_name:gsub("%b<>", " ")
+
+      -- 移除控制字符
+      cleaned_name = cleaned_name:gsub("[%c%z]", " ")
+
+      -- 合并多余的空格
+      cleaned_name = cleaned_name:gsub("%s+", " ")
+      cleaned_name = cleaned_name:gsub("^%s+", "")
+      cleaned_name = cleaned_name:gsub("%s+$", "")
+
+      -- 如果清理后为空，使用默认名称
+      if cleaned_name == "" then
+        cleaned_name = "未命名节点"
+      end
+    end
+  else
+    cleaned_name = "未命名节点"
+  end
+
   -- 生成节点行
-  local line = line_prefix .. node_prefix .. node.name
+  local line = line_prefix .. node_prefix .. cleaned_name
   if node.metadata then
     if node.metadata.message_count then
       line = line .. string.format(" (%d 消息)", node.metadata.message_count)
@@ -560,22 +658,37 @@ end
 function M._load_tree_data(session_id)
   -- 使用 history_tree 组件加载实际的会话数据
   local history_tree = require("NeoAI.ui.components.history_tree")
-  
+
   -- 确保 history_tree 已初始化
   if not history_tree then
     error("无法加载 history_tree 模块")
   end
-  
+
   -- 如果 history_tree 未初始化，使用默认配置初始化
   local config = state.config or {}
+
+  -- 确保有正确的保存路径
+  local save_path = config.save_path
+  if not save_path and config.session then
+    save_path = config.session.save_path
+  end
+  if not save_path then
+    save_path = os.getenv("HOME") .. "/.cache/nvim/NeoAI"
+  end
+
   history_tree.initialize({
-    save_path = config.save_path or os.getenv("HOME") .. "/.cache/nvim/NeoAI",
+    save_path = save_path,
     max_messages_per_session = config.max_messages_per_session or 10,
   })
-  
+
+  -- 强制刷新历史树数据
+  if history_tree.refresh then
+    history_tree.refresh(session_id)
+  end
+
   -- 从 history_tree 获取树数据
   state.tree_data = history_tree.build_tree(session_id)
-  
+
   -- 如果获取的数据为空，使用后备数据
   if not state.tree_data or #state.tree_data == 0 then
     state.tree_data = {
@@ -615,22 +728,22 @@ function M._load_tree_data(session_id)
       },
     }
   end
-  
+
   -- 默认展开根节点
   for _, root_node in ipairs(state.tree_data) do
     state.expanded_nodes[root_node.id] = true
   end
-  
+
   -- 触发数据加载完成事件
-  vim.api.nvim_exec_autocmds(
-    "User",
-    { pattern = "NeoAI:tree_data_loaded", data = { 
+  vim.api.nvim_exec_autocmds("User", {
+    pattern = "NeoAI:tree_data_loaded",
+    data = {
       window_id = state.current_window_id,
       session_id = session_id,
       session_count = #state.tree_data,
-      total_messages = M._count_total_messages(state.tree_data)
-    } }
-  )
+      total_messages = M._count_total_messages(state.tree_data),
+    },
+  })
 end
 
 --- 计算总消息数（内部使用）
@@ -640,21 +753,21 @@ function M._count_total_messages(nodes)
   if not nodes then
     return 0
   end
-  
+
   local count = 0
-  
+
   for _, node in ipairs(nodes) do
     -- 如果是消息节点，计数
     if node.type == "message" then
       count = count + 1
     end
-    
+
     -- 递归计数子节点
     if node.children and #node.children > 0 then
       count = count + M._count_total_messages(node.children)
     end
   end
-  
+
   return count
 end
 
@@ -662,21 +775,21 @@ end
 --- @param direction string 方向 ('up' 或 'down')
 function M._move_selection(direction)
   -- 触发选择移动事件
-  vim.api.nvim_exec_autocmds(
-    "User",
-    { pattern = "NeoAI:tree_node_selection_moving", data = { window_id = state.current_window_id, direction = direction } }
-  )
+  vim.api.nvim_exec_autocmds("User", {
+    pattern = "NeoAI:tree_node_selection_moving",
+    data = { window_id = state.current_window_id, direction = direction },
+  })
 
   -- 实现选择移动逻辑
   -- 目前是简化实现
   vim.notify("移动选择: " .. direction, vim.log.levels.INFO)
-  M.render_tree(nil)
+  M.render_tree(state.tree_data)
 
   -- 触发选择移动完成事件
-  vim.api.nvim_exec_autocmds(
-    "User",
-    { pattern = "NeoAI:tree_node_selection_moved", data = { window_id = state.current_window_id, direction = direction } }
-  )
+  vim.api.nvim_exec_autocmds("User", {
+    pattern = "NeoAI:tree_node_selection_moved",
+    data = { window_id = state.current_window_id, direction = direction },
+  })
 end
 
 --- 展开节点（内部使用）
@@ -689,7 +802,7 @@ function M._expand_node()
     })
 
     state.expanded_nodes[state.selected_node_id] = true
-    M.render_tree()
+    M.render_tree(state.tree_data)
 
     -- 触发节点展开完成事件
     vim.api.nvim_exec_autocmds("User", {
@@ -709,7 +822,7 @@ function M._collapse_node()
     })
 
     state.expanded_nodes[state.selected_node_id] = nil
-    M.render_tree()
+    M.render_tree(state.tree_data)
 
     -- 触发节点折叠完成事件
     vim.api.nvim_exec_autocmds("User", {
@@ -733,13 +846,13 @@ function M._select_node()
 
     -- 调用tree_handlers的handle_enter函数
     local tree_handlers = require("NeoAI.ui.handlers.tree_handlers")
-    tree_handlers.handle_enter(selected_node_id)
+    tree_handlers.handle_enter()
 
     -- 触发节点选择完成事件
-    vim.api.nvim_exec_autocmds(
-      "User",
-      { pattern = "NeoAI:tree_node_selected", data = { window_id = state.current_window_id, node_id = selected_node_id } }
-    )
+    vim.api.nvim_exec_autocmds("User", {
+      pattern = "NeoAI:tree_node_selected",
+      data = { window_id = state.current_window_id, node_id = selected_node_id },
+    })
   else
     vim.notify("未选中任何节点", vim.log.levels.WARN)
   end
@@ -827,68 +940,129 @@ function M._highlight_selected_node()
   -- 目前是简化实现
 end
 
---- 更新状态行（内部使用）
-function M._update_status_line()
+--- 创建或更新悬浮窗口（内部使用）
+function M._update_float_window()
   if not state.current_window_id then
     return
   end
 
-  -- 获取当前窗口内容
-  local buf = window_manager.get_window_buf(state.current_window_id)
-  if not buf or not vim.api.nvim_buf_is_valid(buf) then
+  -- 获取主窗口信息
+  local main_win_handle = window_manager.get_window_win(state.current_window_id)
+  if not main_win_handle or not vim.api.nvim_win_is_valid(main_win_handle) then
     return
   end
 
-  -- 获取所有行
-  local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
-  if #lines == 0 then
-    return
-  end
+  -- 构建状态文本
+  local status_text = "当前选中: "
 
-  -- 查找状态行和分隔行
-  local status_line_index = -1
-  local separator_line_index = -1
-
-  for i = #lines, 1, -1 do
-    local line = lines[i]
-    -- 更宽松的匹配，处理可能的前导空格
-    if line:find("当前选中") then
-      status_line_index = i - 1 -- 转换为0-based索引
-    elseif line == "---" then
-      separator_line_index = i - 1 -- 转换为0-based索引
-      break -- 找到分隔行后停止，假设状态行在它后面
-    end
-  end
-
-  -- 如果找到状态行，更新它
-  if status_line_index >= 0 then
-    local status_text = "当前选中: "
-
-    if state.selected_node_id then
-      local node_name = M._get_node_name_by_id(state.selected_node_id)
-      if node_name then
-        status_text = status_text .. node_name
-      else
-        status_text = status_text .. state.selected_node_id
-      end
+  if state.selected_node_id then
+    local node_name = M._get_node_name_by_id(state.selected_node_id)
+    if node_name then
+      -- 移除换行符，确保是单行字符串
+      status_text = status_text .. node_name:gsub("\n", " "):gsub("\r", " ")
     else
-      status_text = status_text .. "无"
+      status_text = status_text .. state.selected_node_id
     end
-
-    -- 确保缓冲区可修改 - 使用新的API
-    vim.bo[buf].modifiable = true
-    vim.bo[buf].readonly = false
-
-    -- 更新状态行
-    vim.api.nvim_buf_set_lines(buf, status_line_index, status_line_index + 1, false, { status_text })
-
-    -- 恢复只读状态 - 使用新的API
-    vim.bo[buf].modifiable = false
-    vim.bo[buf].readonly = true
   else
-    -- 如果没有找到状态行，重新渲染整个树
-    M.render_tree()
+    status_text = status_text .. "无"
   end
+
+  -- 计算悬浮窗口位置（右上角）
+  -- 获取主窗口的屏幕位置和大小
+  local main_win_info = vim.fn.getwininfo(main_win_handle)
+  if not main_win_info or #main_win_info == 0 then
+    return
+  end
+
+  local win_info = main_win_info[1]
+  local main_width = win_info.width
+  local main_height = win_info.height
+  local main_row = win_info.winrow - 1 -- 转换为0-based
+  local main_col = win_info.wincol - 1 -- 转换为0-based
+
+  -- 计算悬浮窗口大小（基于文本长度）
+  local float_width = math.min(#status_text + 4, main_width - 4) -- 留出边距
+  local float_height = 1
+
+  -- 计算位置：右上角，稍微偏移避免紧贴边缘
+  -- 相对于主窗口的位置（从主窗口的左上角开始计算）
+  local relative_col = main_width - float_width - 2 -- 右侧对齐，留出2字符边距
+  local relative_row = 1 -- 顶部对齐，留出1行边距
+
+  -- 如果悬浮窗口不存在，创建它
+  if not state.float_win_id or not vim.api.nvim_win_is_valid(state.float_win_id) then
+    -- 创建缓冲区
+    state.float_buf_id = vim.api.nvim_create_buf(false, true)
+    vim.api.nvim_set_option_value("buflisted", false, { buf = state.float_buf_id })
+    vim.api.nvim_set_option_value("modifiable", true, { buf = state.float_buf_id })
+    vim.api.nvim_set_option_value("readonly", false, { buf = state.float_buf_id })
+
+    -- 创建悬浮窗口
+    local float_opts = {
+      relative = "win",
+      win = main_win_handle,
+      width = float_width,
+      height = float_height,
+      col = relative_col,
+      row = relative_row,
+      style = "minimal",
+      border = "single",
+      focusable = false,
+      zindex = 100, -- 确保悬浮窗口在主窗口之上
+    }
+
+    state.float_win_id = vim.api.nvim_open_win(state.float_buf_id, false, float_opts)
+
+    -- 设置窗口选项
+    vim.api.nvim_set_option_value("wrap", false, { win = state.float_win_id })
+    vim.api.nvim_set_option_value("cursorline", false, { win = state.float_win_id })
+    vim.api.nvim_set_option_value("number", false, { win = state.float_win_id })
+    vim.api.nvim_set_option_value("signcolumn", "no", { win = state.float_win_id })
+  else
+    -- 更新现有悬浮窗口的位置和大小
+    local float_opts = {
+      relative = "win",
+      win = main_win_handle,
+      width = float_width,
+      height = float_height,
+      col = relative_col,
+      row = relative_row,
+    }
+
+    vim.api.nvim_win_set_config(state.float_win_id, float_opts)
+  end
+
+  -- 更新悬浮窗口内容
+  if state.float_buf_id and vim.api.nvim_buf_is_valid(state.float_buf_id) then
+    -- 临时设置缓冲区为可修改以便更新内容
+    vim.api.nvim_set_option_value("modifiable", true, { buf = state.float_buf_id })
+    vim.api.nvim_set_option_value("readonly", false, { buf = state.float_buf_id })
+
+    vim.api.nvim_buf_set_lines(state.float_buf_id, 0, -1, false, { status_text })
+
+    -- 设置缓冲区为只读
+    vim.api.nvim_set_option_value("modifiable", false, { buf = state.float_buf_id })
+    vim.api.nvim_set_option_value("readonly", true, { buf = state.float_buf_id })
+  end
+end
+
+--- 关闭悬浮窗口（内部使用）
+function M._close_float_window()
+  if state.float_win_id and vim.api.nvim_win_is_valid(state.float_win_id) then
+    vim.api.nvim_win_close(state.float_win_id, true)
+    state.float_win_id = nil
+  end
+
+  if state.float_buf_id and vim.api.nvim_buf_is_valid(state.float_buf_id) then
+    vim.api.nvim_buf_delete(state.float_buf_id, { force = true })
+    state.float_buf_id = nil
+  end
+end
+
+--- 更新状态行（内部使用）
+function M._update_status_line()
+  -- 使用悬浮窗口显示选中信息
+  M._update_float_window()
 end
 
 --- 更新配置
@@ -903,7 +1077,7 @@ function M.update_config(new_config)
   -- 如果窗口打开，重新设置按键映射
   if state.current_window_id then
     M.set_keymaps()
-    M.render_tree()
+    M.render_tree(state.tree_data)
   end
 end
 
@@ -919,7 +1093,7 @@ function M.refresh()
   end
 
   -- 重新渲染树
-  M.render_tree()
+  M.render_tree(state.tree_data)
   return true
 end
 
@@ -974,7 +1148,7 @@ function M.test_window_creation()
   end
 
   -- 尝试打开一个测试树窗口
-  local window_id = M.open("test_session")
+  local window_id = M.open("test_session", "win_test")
 
   if window_id then
     -- 成功创建，关闭窗口

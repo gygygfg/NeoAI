@@ -96,6 +96,20 @@ vim.api.nvim_create_autocmd("User", {
 ### 消息事件
 - `NeoAI:message_added` - 消息添加
   - 数据: `{message_id, message}`
+- `NeoAI:message_edited` - 消息编辑
+  - 数据: `{message_id, old_content, new_content}`
+- `NeoAI:message_deleted` - 消息删除
+  - 数据: `{message_id, message}`
+- `NeoAI:message_updated` - 消息更新
+  - 数据: `{message_id, message}`
+- `NeoAI:messages_cleared` - 消息清空
+  - 数据: `{branch_id, deleted_ids}`
+- `NeoAI:messages_built` - 消息构建完成
+  - 数据: `{messages, history_count}`
+- `NeoAI:message_sent` - 消息发送
+  - 数据: `{session_id, branch_id, original_content, formatted_content, message, window_id, timestamp}`
+- `NeoAI:formatted_message_sent` - 格式化消息发送
+  - 数据: `{session_id, branch_id, original_content, formatted_content, message, window_id, timestamp}`
 
 ### UI 事件
 - `NeoAI:chat_window_opened` - 聊天窗口打开

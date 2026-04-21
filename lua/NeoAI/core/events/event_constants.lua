@@ -47,6 +47,8 @@ M.MESSAGE_ADDED = "NeoAI:message_added"
 M.MESSAGE_EDITED = "NeoAI:message_edited"
 M.MESSAGE_DELETED = "NeoAI:message_deleted"
 M.MESSAGE_UPDATED = "NeoAI:message_updated"
+M.MESSAGE_SENT = "NeoAI:message_sent"
+M.FORMATTED_MESSAGE_SENT = "NeoAI:formatted_message_sent"
 
 -- UI 事件
 M.CHAT_WINDOW_OPENED = "NeoAI:chat_window_opened"

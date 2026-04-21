@@ -93,6 +93,9 @@ end
 --- @return integer 任务ID
 function M.submit_task(name, task_func, callback)
   -- 检查是否达到最大工作器限制
+  -- 首先清理已完成的工作器
+  M.cleanup_completed()
+  
   local active_count = 0
   for _, worker in pairs(state.workers) do
     if worker.status == "running" then
@@ -101,7 +104,21 @@ function M.submit_task(name, task_func, callback)
   end
 
   if active_count >= state.max_workers then
-    error(string.format("已达到最大工作器数量限制 (%d)", state.max_workers))
+    -- 尝试强制清理长时间运行的工作器
+    local now = os.clock()
+    for id, worker in pairs(state.workers) do
+      if worker.status == "running" and worker.start_time and (now - worker.start_time) > 30 then
+        -- 超过30秒的工作器标记为失败
+        worker.status = "failed"
+        worker.error = "工作器超时"
+        state.workers[id] = nil
+        active_count = active_count - 1
+      end
+    end
+    
+    if active_count >= state.max_workers then
+      error(string.format("已达到最大工作器数量限制 (%d)", state.max_workers))
+    end
   end
 
   local worker = Worker.new(name, task_func, callback)

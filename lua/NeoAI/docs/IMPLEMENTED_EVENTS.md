@@ -49,7 +49,22 @@ NeoAI 已经直接使用 Neovim 原生事件系统为所有关键的异步操作
 |------|----------|------|
 | `NeoAI:message_added` | `{message_id, message}` | 消息添加 |
 | `NeoAI:message_edited` | `{message_id, old_content, new_content}` | 消息编辑 |
-| `NeoAI:message_deleted` | `{message_id}` | 消息删除 |
+| `NeoAI:message_deleted` | `{message_id, message}` | 消息删除 |
+| `NeoAI:message_updated` | `{message_id, message}` | 消息更新 |
+| `NeoAI:messages_cleared` | `{branch_id, deleted_ids}` | 消息清空 |
+
+### 响应构建器 (`core/ai/response_builder.lua`)
+
+| 事件 | 数据格式 | 描述 |
+|------|----------|------|
+| `NeoAI:messages_built` | `{messages, history_count}` | 消息构建完成 |
+
+### 聊天处理器 (`ui/handlers/chat_handlers.lua`)
+
+| 事件 | 数据格式 | 描述 |
+|------|----------|------|
+| `NeoAI:message_sent` | `{session_id, branch_id, original_content, formatted_content, message, window_id, timestamp}` | 消息发送 |
+| `NeoAI:formatted_message_sent` | `{session_id, branch_id, original_content, formatted_content, message, window_id, timestamp}` | 格式化消息发送 |
 
 ### 窗口管理器 (`ui/window/window_manager.lua`)
 

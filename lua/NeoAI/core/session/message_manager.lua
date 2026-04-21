@@ -117,6 +117,41 @@ function M.edit_message(message_id, content)
   vim.api.nvim_exec_autocmds("User", { pattern = "NeoAI:message_edited", data = { message_id, old_content, content } })
 end
 
+--- 更新消息
+--- @param message_id string 消息ID
+--- @param updates table 更新字段
+function M.update_message(message_id, updates)
+  if not messages[message_id] then
+    return false
+  end
+
+  if not updates or type(updates) ~= "table" then
+    return false
+  end
+
+  local old_message = vim.deepcopy(messages[message_id])
+  
+  -- 应用更新
+  for key, value in pairs(updates) do
+    if key ~= "id" and key ~= "branch_id" then -- 保护关键字段
+      messages[message_id][key] = value
+    end
+  end
+  
+  messages[message_id].updated_at = os.time()
+  
+  -- 触发消息更新事件
+  vim.api.nvim_exec_autocmds("User", {
+    pattern = "NeoAI:message_updated",
+    data = {
+      message_id = message_id,
+      message = messages[message_id]
+    }
+  })
+  
+  return true
+end
+
 --- 删除消息
 --- @param message_id string 消息ID
 function M.delete_message(message_id)

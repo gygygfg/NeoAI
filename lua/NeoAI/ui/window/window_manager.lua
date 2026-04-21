@@ -822,12 +822,61 @@ function M.is_window_valid(window_info)
   return win_valid and buf_valid
 end
 
+--- 安全截断字符串，避免截断中文字符
+--- @param str string 要截断的字符串
+--- @param max_len number 最大长度
+--- @return string 截断后的字符串
+local function safe_truncate(str, max_len)
+  if #str <= max_len then
+    return str
+  end
+  
+  -- 清理字符串中的控制字符和二进制数据
+  local cleaned_str = str:gsub("[%c%z]", ""):gsub("%b<>", "")
+  
+  -- 如果清理后的字符串更短，使用清理后的版本
+  if #cleaned_str < #str then
+    str = cleaned_str
+    if #str <= max_len then
+      return str
+    end
+  end
+  
+  -- 尝试找到合适的截断点
+  local truncated = str:sub(1, max_len)
+  
+  -- 检查最后一个字符是否是中文字符的一部分
+  -- 中文字符在UTF-8中占用3个字节，如果截断位置在字符中间，会显示乱码
+  local last_char = truncated:sub(-1)
+  local byte = last_char:byte()
+  
+  -- 如果最后一个字节是UTF-8多字节字符的中间字节（0x80-0xBF），则向前调整
+  if byte >= 0x80 and byte <= 0xBF then
+    -- 向前查找完整的字符边界
+    for i = max_len - 1, 1, -1 do
+      local prev_byte = truncated:sub(i, i):byte()
+      -- 检查是否是UTF-8字符的起始字节
+      if prev_byte < 0x80 or prev_byte >= 0xC0 then
+        -- 找到字符边界，截断到这里
+        truncated = truncated:sub(1, i)
+        break
+      end
+    end
+  end
+  
+  -- 移除可能残留的二进制标记
+  truncated = truncated:gsub("%b<>", "")
+  
+  return truncated
+end
+
 --- 渲染树状图（通用函数）
 --- @param tree_data table 树数据
 --- @param tree_state table 树状态
 --- @param load_data_func function 加载数据的函数
+--- @param window_width number|nil 窗口宽度
 --- @return table 渲染后的内容
-function M.render_tree(tree_data, tree_state, load_data_func)
+function M.render_tree(tree_data, tree_state, load_data_func, window_width)
   if tree_data then
     tree_state.tree_data = tree_data
   end
@@ -857,28 +906,13 @@ function M.render_tree(tree_data, tree_state, load_data_func)
     local root_count = #tree_state.tree_data
     for i, root_node in ipairs(tree_state.tree_data) do
       local is_last = (i == root_count)
-      M._render_tree_node(content, root_node, 0, is_last, "", tree_state)
+      M._render_tree_node(content, root_node, 0, is_last, "", tree_state, window_width)
     end
   end
 
-  -- 添加提示
+  -- 添加提示分隔线
   table.insert(content, "")
   table.insert(content, "---")
-
-  -- 构建状态行文本
-  local status_text = "当前选中: "
-  if tree_state.selected_node_id then
-    local node_name = M._get_node_name_by_id(tree_state.selected_node_id, tree_state.tree_data)
-    if node_name then
-      status_text = status_text .. node_name
-    else
-      status_text = status_text .. tree_state.selected_node_id
-    end
-  else
-    status_text = status_text .. "无"
-  end
-
-  table.insert(content, status_text)
 
   return content
 end
@@ -890,7 +924,8 @@ end
 --- @param is_last boolean 是否是父节点的最后一个子节点
 --- @param parent_prefix string 父节点的前缀
 --- @param tree_state table 树状态
-function M._render_tree_node(content, node, depth, is_last, parent_prefix, tree_state)
+--- @param window_width number|nil 窗口宽度
+function M._render_tree_node(content, node, depth, is_last, parent_prefix, tree_state, window_width)
   if not node then
     return
   end
@@ -922,17 +957,88 @@ function M._render_tree_node(content, node, depth, is_last, parent_prefix, tree_
     node_prefix = "" -- 没有子节点的节点也不需要前缀
   end
 
+  -- 清理节点名称中的二进制数据和控制字符
+  local cleaned_name = node.name
+  if cleaned_name then
+    -- 激进地移除所有<xx>格式的标记（包括十六进制和可能的其他格式）
+    cleaned_name = cleaned_name:gsub("%b<>", " ")
+    
+    -- 移除控制字符
+    cleaned_name = cleaned_name:gsub("[%c%z]", " ")
+    
+    -- 合并多余的空格
+    cleaned_name = cleaned_name:gsub("%s+", " ")
+    cleaned_name = cleaned_name:gsub("^%s+", "")
+    cleaned_name = cleaned_name:gsub("%s+$", "")
+    
+    -- 如果清理后为空，使用默认名称
+    if cleaned_name == "" then
+      cleaned_name = "未命名节点"
+    end
+  else
+    cleaned_name = "未命名节点"
+  end
+  
   -- 生成节点行
-  local line = line_prefix .. node_prefix .. node.name
+  local line = line_prefix .. node_prefix .. cleaned_name
+  local metadata_str = ""
+  
   if node.metadata then
     if node.metadata.message_count then
-      line = line .. string.format(" (%d 消息)", node.metadata.message_count)
+      -- 只显示消息数量，不显示括号和'消息'字样
+      metadata_str = metadata_str .. " (" .. tostring(node.metadata.message_count) .. ")"
     end
 
     if node.metadata.created_at then
       local time_str = os.date("%H:%M", node.metadata.created_at)
-      line = line .. " [" .. time_str .. "]"
+      metadata_str = metadata_str .. " [" .. time_str .. "]"
     end
+  end
+
+  -- 如果提供了窗口宽度，进行截断
+  if window_width and window_width > 0 then
+    -- 计算前缀长度（包括连接符和空格）
+    local prefix_length = #line_prefix + #node_prefix
+    
+    -- 计算可用宽度（减去前缀长度和边距）
+    local available_width = window_width - prefix_length - 3 -- 减去3个字符作为边距
+    
+    if available_width > 0 then
+      -- 计算节点名称和元数据的总长度
+      local total_length = #cleaned_name + #metadata_str
+      
+      if total_length > available_width then
+        -- 需要截断：优先保留节点名称，截断元数据
+        local name_available = available_width - 3 -- 为"..."留出空间
+        
+        if #cleaned_name > name_available then
+          -- 节点名称太长，需要截断节点名称
+          line = line_prefix .. node_prefix .. safe_truncate(cleaned_name, name_available) .. "..."
+        else
+          -- 节点名称可以完整显示，截断或省略元数据
+          local metadata_available = available_width - #cleaned_name
+          
+          if #metadata_str > metadata_available then
+            -- 元数据太长，尝试显示部分元数据
+            if metadata_available >= 5 then -- 至少显示 "..." 和一些内容
+              line = line_prefix .. node_prefix .. cleaned_name .. safe_truncate(metadata_str, metadata_available - 3) .. "..."
+            else
+              -- 没有足够空间显示元数据，只显示节点名称
+              line = line_prefix .. node_prefix .. cleaned_name
+            end
+          else
+            -- 有足够空间显示完整的节点名称和元数据
+            line = line_prefix .. node_prefix .. cleaned_name .. metadata_str
+          end
+        end
+      else
+        -- 有足够空间显示完整的行
+        line = line_prefix .. node_prefix .. cleaned_name .. metadata_str
+      end
+    end
+  else
+    -- 没有窗口宽度限制，显示完整的行
+    line = line_prefix .. node_prefix .. node.name .. metadata_str
   end
 
   table.insert(content, line)
@@ -953,7 +1059,7 @@ function M._render_tree_node(content, node, depth, is_last, parent_prefix, tree_
 
     for i, child in ipairs(node.children) do
       local child_is_last = (i == child_count)
-      M._render_tree_node(content, child, depth + 1, child_is_last, child_parent_prefix, tree_state)
+      M._render_tree_node(content, child, depth + 1, child_is_last, child_parent_prefix, tree_state, window_width)
     end
   end
 end

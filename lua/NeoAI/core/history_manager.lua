@@ -373,10 +373,11 @@ function Session._from_sessions_json_format(session_data, session_id)
   }
 
   -- 创建会话对象
-  local session = Session:new(session_id, session_data.name, metadata)
+  local session = Session:new(session_id, session_data.name or "", metadata)
 
   -- 处理消息数据，确保格式正确
   local messages = {}
+
   for _, msg in ipairs(session_data.messages or {}) do
     -- 确保 metadata 是表而不是数组
     local msg_metadata = msg.metadata or {}
@@ -410,6 +411,22 @@ function Session._from_sessions_json_format(session_data, session_id)
   session.current_branch_id = nil
 
   return session
+end
+
+--- 触发事件（内部使用）
+--- @param event_name string 事件名称
+--- @param data table 事件数据
+local function trigger_event(event_name, data)
+  if not state.event_bus then
+    -- 如果没有事件总线，使用 Neovim 原生事件系统
+    vim.api.nvim_exec_autocmds("User", {
+      pattern = event_name,
+      data = data,
+    })
+  else
+    -- 使用事件总线
+    state.event_bus.trigger(event_name, data)
+  end
 end
 
 --- 初始化历史管理器
@@ -449,7 +466,7 @@ function M.initialize(options)
   local original_save_path = state.config.save_path
   state.config.save_path = state.config.save_path or vim.fn.stdpath("cache") .. "/neoai_sessions"
 
-  state.config.auto_save = state.config.auto_save or false
+  state.config.auto_save = state.config.auto_save ~= false -- 默认开启自动保存
   state.config.auto_load = state.config.auto_load ~= false -- 默认开启自动加载
 
   -- 处理历史记录限制配置（支持两种字段名：max_history_per_session 和 max_history）
@@ -481,6 +498,17 @@ function M.create_session(name, metadata)
   state.sessions[session.id] = session
   state.current_session_id = session.id
 
+  -- 触发会话创建事件
+  trigger_event("NeoAI:session_created", {
+    session_id = session.id,
+    session = {
+      id = session.id,
+      name = session.name,
+      metadata = session.metadata,
+      message_count = #session.messages,
+    }
+  })
+
   -- 自动保存
   M._auto_save_session(session)
 
@@ -509,7 +537,20 @@ function M.switch_session(session_id)
     return false
   end
 
+  local old_session_id = state.current_session_id
   state.current_session_id = session_id
+  
+  -- 触发会话变更事件
+  trigger_event("NeoAI:session_changed", {
+    session_id = session_id,
+    session = {
+      id = session_id,
+      name = state.sessions[session_id].name,
+      metadata = state.sessions[session_id].metadata,
+      message_count = #state.sessions[session_id].messages,
+    }
+  })
+  
   return true
 end
 
@@ -525,6 +566,18 @@ function M.add_message(role, content, metadata)
   end
 
   local message = session:add_message(role, content, metadata)
+  
+  -- 触发消息添加事件
+  trigger_event("NeoAI:message_added", {
+    message_id = message.id,
+    message = {
+      id = message.id,
+      role = message.role,
+      content = message.content,
+      timestamp = message.timestamp,
+      metadata = message.metadata,
+    }
+  })
 
   -- 自动保存
   M._auto_save_session(session)
@@ -604,6 +657,11 @@ function M.delete_session(session_id)
 
   -- 从内存中删除
   state.sessions[session_id] = nil
+  
+  -- 触发会话删除事件
+  trigger_event("NeoAI:session_deleted", {
+    session_id = session_id
+  })
 
   return true
 end
@@ -758,6 +816,18 @@ function M._auto_save_session(session)
 
   local filepath = M._get_session_filepath(session.id)
   session:save(filepath, state.config)
+  
+  -- 触发会话保存事件
+  trigger_event("NeoAI:session_saved", {
+    session_id = session.id,
+    filepath = filepath,
+    session = {
+      id = session.id,
+      name = session.name,
+      metadata = session.metadata,
+      message_count = #session.messages,
+    }
+  })
 end
 
 --- 加载保存的会话（内部使用）
@@ -798,6 +868,18 @@ function M._load_sessions()
             local session = Session._from_sessions_json_format(session_data, session_id_to_use)
             if session then
               state.sessions[session.id] = session
+              
+              -- 触发会话加载事件
+              trigger_event("NeoAI:session_loaded", {
+                new_session_id = session.id,
+                filepath = sessions_file,
+                session = {
+                  id = session.id,
+                  name = session.name,
+                  metadata = session.metadata,
+                  message_count = #session.messages,
+                }
+              })
             end
           end
         end
