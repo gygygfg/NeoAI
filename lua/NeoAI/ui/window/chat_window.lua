@@ -28,7 +28,7 @@ function M.initialize(config)
 
   -- 初始化虚拟输入组件
   virtual_input.initialize(config)
-  
+
   -- 初始化会话辅助模块
   session_helper.initialize(config)
 
@@ -135,17 +135,21 @@ function M.render_chat()
       state.render_debounce_timer:close()
       state.render_debounce_timer = nil
     end
-    
+
     -- 设置新的定时器
     state.render_debounce_timer = vim.loop.new_timer()
-    state.render_debounce_timer:start(100, 0, vim.schedule_wrap(function()
-      state.render_debounce_timer:close()
-      state.render_debounce_timer = nil
-      M._do_render_chat()
-    end))
+    state.render_debounce_timer:start(
+      100,
+      0,
+      vim.schedule_wrap(function()
+        state.render_debounce_timer:close()
+        state.render_debounce_timer = nil
+        M._do_render_chat()
+      end)
+    )
     return
   end
-  
+
   state.last_render_time = now
   M._do_render_chat()
 end
@@ -185,19 +189,63 @@ function M._do_render_chat()
         for _, msg in ipairs(state.messages) do
           local role_prefix = msg.role == "user" and "👤 用户:" or "🤖 AI:"
 
-          -- 处理消息内容中的换行符
-          local msg_lines = vim.split(msg.content or "", "\n")
+          -- 检查是否是AI消息且包含思考过程
+          local has_reasoning = false
+          local reasoning_content = ""
+          local main_content = msg.content or ""
 
-          -- 添加第一行（带角色前缀）
-          if #msg_lines > 0 then
-            table.insert(content, string.format("%s %s", role_prefix, msg_lines[1]))
+          -- 尝试解析消息中的思考过程（如果消息是JSON格式）
+          if msg.role == "assistant" and type(msg.content) == "string" then
+            local json_ok, parsed = pcall(vim.json.decode, msg.content)
+            if json_ok and type(parsed) == "table" then
+              if parsed.reasoning_content and parsed.reasoning_content ~= "" then
+                has_reasoning = true
+                reasoning_content = parsed.reasoning_content
+                main_content = parsed.content or ""
+              end
+            end
+          end
 
-            -- 添加剩余的行（不带角色前缀）
-            for i = 2, #msg_lines do
-              table.insert(content, string.format("    %s", msg_lines[i]))
+          if has_reasoning then
+            -- 显示思考过程（折叠）
+            table.insert(content, string.format("%s 🤔 思考过程（点击展开）", role_prefix))
+            table.insert(content, "<details>")
+            table.insert(content, "<summary>思考过程</summary>")
+            table.insert(content, "")
+
+            -- 添加思考内容
+            local reasoning_lines = vim.split(reasoning_content, "\n")
+            for _, line in ipairs(reasoning_lines) do
+              table.insert(content, string.format("    %s", line))
+            end
+
+            table.insert(content, "")
+            table.insert(content, "</details>")
+            table.insert(content, "")
+
+            -- 显示正文内容
+            if main_content and main_content ~= "" then
+              table.insert(content, string.format("%s 📝 回答:", role_prefix))
+              local main_lines = vim.split(main_content, "\n")
+              for _, line in ipairs(main_lines) do
+                table.insert(content, string.format("    %s", line))
+              end
             end
           else
-            table.insert(content, string.format("%s", role_prefix))
+            -- 普通消息显示
+            local msg_lines = vim.split(main_content, "\n")
+
+            -- 添加第一行（带角色前缀）
+            if #msg_lines > 0 then
+              table.insert(content, string.format("%s %s", role_prefix, msg_lines[1]))
+
+              -- 添加剩余的行（不带角色前缀）
+              for i = 2, #msg_lines do
+                table.insert(content, string.format("    %s", msg_lines[i]))
+              end
+            else
+              table.insert(content, string.format("%s", role_prefix))
+            end
           end
 
           table.insert(content, "")
@@ -211,32 +259,35 @@ function M._do_render_chat()
 
       return content
     end, function(success, content)
-      if success and content then
-        -- 设置窗口内容
-        window_manager.set_window_content(state.current_window_id, content)
+      -- 使用 vim.schedule 确保在主线程执行，避免阻塞
+      vim.schedule(function()
+        if success and content then
+          -- 设置窗口内容
+          window_manager.set_window_content(state.current_window_id, content)
 
-        -- 调整窗口位置，确保不在屏幕最下方
-        M._adjust_window_position()
+          -- 调整窗口位置，确保不在屏幕最下方
+          M._adjust_window_position()
 
-        -- 自动获取焦点
-        M._focus_window()
+          -- 自动获取焦点
+          M._focus_window()
 
-        -- 注意：虚拟输入框已经在 open() 函数中打开，这里不需要重复打开
+          -- 注意：虚拟输入框已经在 open() 函数中打开，这里不需要重复打开
 
-        -- 触发渲染完成事件
-        vim.api.nvim_exec_autocmds(
-          "User",
-          { pattern = "NeoAI:rendering_complete", data = { window_id = state.current_window_id } }
-        )
+          -- 触发渲染完成事件
+          vim.api.nvim_exec_autocmds(
+            "User",
+            { pattern = "NeoAI:rendering_complete", data = { window_id = state.current_window_id } }
+          )
 
-        -- 触发对话渲染完成事件
-        vim.api.nvim_exec_autocmds(
-          "User",
-          { pattern = "NeoAI:dialogue_rendering_complete", data = { window_id = state.current_window_id } }
-        )
-      else
-        print("❌ 聊天内容渲染失败")
-      end
+          -- 触发对话渲染完成事件
+          vim.api.nvim_exec_autocmds(
+            "User",
+            { pattern = "NeoAI:dialogue_rendering_complete", data = { window_id = state.current_window_id } }
+          )
+        else
+          print("❌ 聊天内容渲染失败")
+        end
+      end)
     end)
   end)
 end
@@ -382,14 +433,14 @@ function M.set_keymaps(keymap_manager)
       return
     end
 
-    local buf = window_manager.get_window_buf(state.current_window_id)
-    if not buf then
+    local chat_buf = window_manager.get_window_buf(state.current_window_id)
+    if not chat_buf then
       print("⚠️  无法获取聊天窗口缓冲区")
       return
     end
 
     -- 获取缓冲区最后一行内容
-    local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+    local lines = vim.api.nvim_buf_get_lines(chat_buf, 0, -1, false)
     local last_line = lines[#lines] or ""
 
     -- 如果最后一行不是空行，发送消息
@@ -470,7 +521,7 @@ function M._focus_window()
 
   local win_handle = window_manager.get_window_win(state.current_window_id)
   if win_handle and vim.api.nvim_win_is_valid(win_handle) then
-    vim.api.nvim_set_current_win(win_handle)
+    pcall(vim.api.nvim_set_current_win, win_handle)
     return true
   end
   return false
@@ -518,9 +569,7 @@ function M._adjust_window_position()
     win_config.col = new_col
 
     -- 应用新的窗口配置
-    vim.api.nvim_win_set_config(win_handle, win_config)
-
-    print("📊 调整聊天窗口位置到屏幕中央偏上")
+    pcall(vim.api.nvim_win_set_config, win_handle, win_config)
   end
 end
 
@@ -536,7 +585,6 @@ function M._open_virtual_input()
   end
 
   -- 检查虚拟输入框是否已经打开
-  local virtual_input = require("NeoAI.ui.components.virtual_input")
   if virtual_input.is_active() then
     print("⚠️  虚拟输入框已经打开，跳过重复打开")
     return true
@@ -551,20 +599,62 @@ function M._open_virtual_input()
         -- 获取聊天处理器
         local chat_handlers_loaded, chat_handlers = pcall(require, "NeoAI.ui.handlers.chat_handlers")
         if chat_handlers_loaded and chat_handlers then
-          -- 调用新的 send_message 函数
+          -- 调用异步版本的 send_message 函数，避免界面卡住
+          -- 获取窗口句柄（数字）
+          local win_handle = window_manager.get_window_win(state.current_window_id)
           local success, result = chat_handlers.send_message(
             content,
             state.current_session_id or "default",
             "main",
-            state.current_window_id,
-            true -- 格式化消息
+            win_handle, -- 窗口句柄（数字）
+            true, -- 格式化消息
+            function(async_success, async_result, async_error)
+              -- 异步回调函数
+              if async_success then
+                print("✓ 异步消息发送成功: " .. tostring(async_result))
+
+                -- 触发AI响应生成（如果需要）
+                -- 这里可以添加触发AI响应的逻辑
+              else
+                print("✗ 异步消息发送失败: " .. tostring(async_error or async_result))
+
+                -- 显示错误提示
+                M.show_floating_text("发送消息失败: " .. tostring(async_error or async_result), {
+                  timeout = 3000,
+                  position = "center",
+                  border = "single",
+                })
+              end
+            end
           )
 
           if not success then
-            print("⚠️  发送消息失败: " .. tostring(result))
+            print("⚠️  启动异步消息发送失败: " .. tostring(result))
+
+            -- 显示错误提示
+            M.show_floating_text("启动发送失败: " .. tostring(result), {
+              timeout = 3000,
+              position = "center",
+              border = "single",
+            })
+          else
+            print("✓ " .. tostring(result))
+
+            -- 显示发送成功提示
+            M.show_floating_text("消息发送中...", {
+              timeout = 1000,
+              position = "bottom",
+            })
           end
         else
           print("⚠️  无法加载聊天处理器")
+
+          -- 显示错误提示
+          M.show_floating_text("无法加载聊天处理器", {
+            timeout = 3000,
+            position = "center",
+            border = "single",
+          })
         end
       end
     end,
@@ -592,7 +682,7 @@ end
 function M._load_messages(session_id)
   -- 清空当前消息
   state.messages = {}
-  
+
   -- 优先从会话管理器加载消息
   local session_messages = session_helper.load_messages_from_session(100)
   if #session_messages > 0 then
@@ -725,6 +815,7 @@ function M.update_title(title)
   local ok, err = pcall(vim.api.nvim_win_set_config, win_handle, { title = title })
   if not ok then
     -- 如果 nvim_win_set_config 不支持 title 参数（旧版本 Neovim），静默忽略
+    -- 空块：兼容旧版本 Neovim
   end
 end
 
@@ -760,11 +851,71 @@ function M.is_available()
   return M.is_open()
 end
 
---- 发送消息（公共接口）
+--- 发送消息（异步版本）
+--- @param message string 消息内容
+--- @param callback function|nil 回调函数（可选）
+--- @return boolean 是否成功启动异步发送
+--- @return string|nil 结果信息
+function M.send_message(message, callback)
+  if not state.initialized then
+    if callback then
+      callback(false, "聊天窗口未初始化")
+    end
+    return false, "聊天窗口未初始化"
+  end
+
+  if not message or vim.trim(message) == "" then
+    if callback then
+      callback(false, "消息内容不能为空")
+    end
+    return false, "消息内容不能为空"
+  end
+
+  -- 使用异步工作器发送消息，避免阻塞界面
+  local async_worker = require("NeoAI.utils.async_worker")
+
+  -- 提交异步任务
+  local task_id = async_worker.submit_task("send_chat_message_window", function()
+    -- 首先添加用户消息
+    local success = M.add_message("user", message)
+    if not success then
+      return false, "无法添加用户消息"
+    end
+
+    -- 触发统一的消息发送事件
+    vim.api.nvim_exec_autocmds("User", {
+      pattern = "NeoAI:message_sent",
+      data = {
+        message = message,
+        window_id = state.current_window_id,
+        session_id = state.current_session_id,
+        timestamp = os.time(),
+        role = "user",
+      },
+    })
+
+    return true, "消息已发送"
+  end, function(success, result, error_msg)
+    -- 异步任务完成后的回调
+    if callback then
+      callback(success, result, error_msg)
+    end
+
+    if success then
+      print("✓ 聊天窗口异步消息发送完成: " .. tostring(result))
+    else
+      print("✗ 聊天窗口异步消息发送失败: " .. tostring(error_msg or result))
+    end
+  end)
+
+  return true, "聊天窗口异步消息发送任务已启动 (ID: " .. tostring(task_id) .. ")"
+end
+
+--- 发送消息（同步版本，向后兼容）
 --- @param message string 消息内容
 --- @return boolean 是否成功
 --- @return string|nil 结果信息
-function M.send_message(message)
+function M.send_message_sync(message)
   if not state.initialized then
     return false, "聊天窗口未初始化"
   end
@@ -790,8 +941,6 @@ function M.send_message(message)
       role = "user",
     },
   })
-
-  -- print("✓ 用户消息已发送，等待AI响应...")
 
   return true, "消息已发送"
 end
@@ -855,7 +1004,7 @@ function M._trigger_auto_save()
       end
     end)
   end
-  
+
   -- 同时触发历史管理器的保存
   local history_mgr_loaded, history_mgr = pcall(require, "NeoAI.core.history_manager")
   if history_mgr_loaded and history_mgr then
@@ -879,13 +1028,13 @@ function M._persist_message(role, content)
     timestamp = os.time(),
     window_id = state.current_window_id,
   })
-  
+
   if success then
     print("✓ 消息已持久化到所有管理器")
   else
     print("⚠️  消息持久化失败")
   end
-  
+
   -- 触发自动保存
   M._trigger_auto_save()
 end
@@ -1093,6 +1242,59 @@ function M._setup_event_listeners()
       })
     end,
   })
+end
+
+--- 获取当前聊天窗口的窗口ID
+--- @return string|nil 窗口ID，如果没有打开的窗口则返回nil
+function M.get_current_window_id()
+  return state.current_window_id
+end
+
+--- 获取聊天窗口中的消息
+--- @return table 消息列表
+function M.get_messages()
+  return state.messages or {}
+end
+
+--- 设置聊天窗口中的消息
+--- @param messages table 消息列表
+--- @return boolean 是否成功
+function M.set_messages(messages)
+  if not messages or type(messages) ~= "table" then
+    return false
+  end
+
+  state.messages = messages
+
+  -- 如果窗口打开，更新显示
+  if state.current_window_id then
+    M.render_chat()
+  end
+
+  return true
+end
+
+--- 更新特定消息
+--- @param index number 消息索引（1-based）
+--- @param content string 新的消息内容
+--- @return boolean 是否成功
+function M.update_message(index, content)
+  if not state.messages or index < 1 or index > #state.messages then
+    return false
+  end
+
+  if not content or type(content) ~= "string" then
+    return false
+  end
+
+  state.messages[index].content = content
+
+  -- 如果窗口打开，更新显示
+  if state.current_window_id then
+    M.render_chat()
+  end
+
+  return true
 end
 
 return M

@@ -353,15 +353,50 @@ function M.build_response(params)
     end
   end
 
-  -- 如果有推理内容，也添加到响应中
-  if params.ai_response and params.ai_response.reasoning then
-    if response.content and #response.content > 0 then
-      response.content = response.content .. "\n\n推理过程:\n" .. params.ai_response.reasoning
-    else
-      response.content = "推理过程:\n" .. params.ai_response.reasoning
+  -- 如果有推理内容，将思考和正文内容分开存储
+  if params.ai_response then
+    -- 存储思考内容
+    if params.ai_response.reasoning then
+      response.reasoning_content = params.ai_response.reasoning
+    end
+    
+    -- 存储思考内容（兼容旧字段）
+    if params.ai_response.reasoning_content then
+      response.reasoning_content = params.ai_response.reasoning_content
+    end
+    
+    -- 如果响应是JSON格式，尝试解析
+    if type(params.ai_response.content) == "string" then
+      local json_ok, parsed = pcall(vim.json.decode, params.ai_response.content)
+      if json_ok and type(parsed) == "table" then
+        if parsed.reasoning_content then
+          response.reasoning_content = parsed.reasoning_content
+        end
+        if parsed.content then
+          response.content = parsed.content
+        end
+      end
     end
   end
 
+  -- 如果有思考内容，将响应转换为JSON格式
+  if response.reasoning_content and response.reasoning_content ~= "" then
+    local final_response = {
+      reasoning_content = response.reasoning_content,
+      content = response.content or "",
+      id = response.id,
+      model = response.model,
+      usage = response.usage,
+      finish_reason = response.finish_reason,
+    }
+    
+    -- 将JSON转换为字符串
+    local json_ok, json_str = pcall(vim.json.encode, final_response)
+    if json_ok then
+      response.content = json_str
+    end
+  end
+  
   return response
 end
 

@@ -65,7 +65,12 @@ function M._parse_deepseek_stream(chunk)
   -- 解析JSON
   local ok, data = pcall(json.decode, json_str)
   if not ok or not data then
-    vim.notify("解析JSON失败: " .. tostring(json_str), vim.log.levels.ERROR)
+    -- 只显示前100个字符，避免显示过长的错误信息
+    local error_preview = tostring(json_str):sub(1, 100)
+    if #tostring(json_str) > 100 then
+      error_preview = error_preview .. "..."
+    end
+    vim.notify("解析JSON失败: " .. error_preview, vim.log.levels.ERROR)
     return
   end
 
@@ -73,14 +78,18 @@ function M._parse_deepseek_stream(chunk)
   if data.choices and data.choices[1] and data.choices[1].delta then
     local delta = data.choices[1].delta
 
-    if delta.reasoning_content then
-      -- 思考内容
+    -- 处理思考内容（只有当reasoning_content不为null且不为空字符串时）
+    if delta.reasoning_content ~= nil and delta.reasoning_content ~= "" then
       M.handle_reasoning(delta.reasoning_content)
-    elseif delta.content then
-      -- 普通内容
+    end
+    
+    -- 处理普通内容（只有当content不为null且不为空字符串时）
+    if delta.content ~= nil and delta.content ~= "" then
       M.handle_content(delta.content)
-    elseif delta.tool_calls then
-      -- 工具调用
+    end
+    
+    -- 处理工具调用
+    if delta.tool_calls then
       M.handle_tool_call(delta.tool_calls)
     end
 

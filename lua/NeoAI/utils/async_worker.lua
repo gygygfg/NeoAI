@@ -39,7 +39,14 @@ function Worker:execute()
   self.start_time = os.clock()
 
   -- 使用vim.schedule_wrap确保回调在合适的时机执行
-  local wrapped_callback = vim.schedule_wrap(function(success, result, error_msg)
+  -- 同时添加直接执行的回调作为备选方案
+  local callback_executed = false
+  local function execute_callback(success, result, error_msg)
+    if callback_executed then
+      return  -- 避免重复执行
+    end
+    callback_executed = true
+    
     self.end_time = os.clock()
     self.duration = self.end_time - self.start_time
 
@@ -60,13 +67,59 @@ function Worker:execute()
 
     -- 从活动工作器列表中移除
     state.workers[self.id] = nil
-  end)
+  end
+  
+  -- 创建包装的回调
+  local wrapped_callback = vim.schedule_wrap(execute_callback)
+  
+  -- 创建直接回调（作为备选）
+  local direct_callback = execute_callback
+  
+  -- 设置超时机制（5秒）
+  local timeout_timer = vim.loop.new_timer()
+  timeout_timer:start(5000, 0, vim.schedule_wrap(function()
+    if not callback_executed then
+      print("⚠️  异步任务超时，强制标记为失败")
+      execute_callback(false, nil, "任务执行超时")
+    end
+    timeout_timer:close()
+  end))
 
   -- 使用vim.defer_fn在后台线程执行任务
-  vim.defer_fn(function()
+  -- 添加额外的错误处理以确保稳定性
+  local ok, defer_err = pcall(function()
+    vim.defer_fn(function()
+      local success, result_or_error = pcall(self.task_func)
+      
+      -- 首先尝试使用包装的回调
+      local callback_ok, callback_err = pcall(function()
+        wrapped_callback(success, result_or_error, not success and result_or_error or nil)
+      end)
+      
+      -- 如果包装的回调失败，使用直接回调
+      if not callback_ok then
+        print("⚠️  包装回调失败，使用直接回调: " .. tostring(callback_err))
+        direct_callback(success, result_or_error, not success and result_or_error or nil)
+      end
+    end, 0)
+  end)
+  
+  if not ok then
+    -- 如果vim.defer_fn失败，直接同步执行
+    print("警告: vim.defer_fn 失败，同步执行任务: " .. tostring(defer_err))
     local success, result_or_error = pcall(self.task_func)
-    wrapped_callback(success, result_or_error, not success and result_or_error or nil)
-  end, 0)
+    
+    -- 尝试使用包装的回调
+    local callback_ok, callback_err = pcall(function()
+      wrapped_callback(success, result_or_error, not success and result_or_error or nil)
+    end)
+    
+    -- 如果包装的回调失败，使用直接回调
+    if not callback_ok then
+      print("⚠️  包装回调失败，使用直接回调: " .. tostring(callback_err))
+      direct_callback(success, result_or_error, not success and result_or_error or nil)
+    end
+  end
 
   -- 添加到活动工作器列表
   state.workers[self.id] = self

@@ -24,7 +24,7 @@ local function try_open_chat_window()
 
   -- 获取当前会话ID
   local session_id = session_helper.get_current_session_id() or "default"
-  
+
   -- 如果没有会话ID，创建一个新会话
   if session_id == "default" then
     session_id = session_helper.create_session("聊天会话") or "default"
@@ -33,16 +33,17 @@ local function try_open_chat_window()
   -- 打开聊天窗口
   pcall(ui.open_chat_ui, session_id, "main")
 
-  -- 等待窗口渲染完成
-  -- 给窗口一些时间初始化和渲染
+  -- 使用异步方式等待窗口渲染完成
+  -- 避免阻塞UI线程
   local max_attempts = 10 -- 最多尝试10次
   local attempt = 0
 
-  while attempt < max_attempts do
-    -- 等待一小段时间
-    vim.wait(50, function()
+  -- 使用vim.defer_fn进行异步检查
+  local check_window = function()
+    if attempt >= max_attempts then
+      -- 超时仍未打开
       return false
-    end, 10, true)
+    end
 
     -- 检查窗口是否可用
     local available, _ = pcall(chat_window.is_available)
@@ -51,10 +52,17 @@ local function try_open_chat_window()
     end
 
     attempt = attempt + 1
+
+    -- 继续异步检查
+    vim.defer_fn(check_window, 50)
+    return nil -- 表示还在检查中
   end
 
-  -- 如果超时仍未打开，返回false
-  return false
+  -- 开始异步检查
+  vim.defer_fn(check_window, 50)
+
+  -- 立即返回，让调用者知道已开始尝试打开窗口
+  return true
 end
 
 --- 初始化聊天界面处理器
@@ -67,7 +75,7 @@ function M.initialize(config)
 
   state.config = config or {}
   state.initialized = true
-  
+
   -- 初始化会话辅助模块
   session_helper.initialize(config)
 
@@ -112,6 +120,94 @@ function M.initialize(config)
     end,
   })
 
+  -- 监听用户消息发送事件，自动触发AI响应
+  vim.api.nvim_create_autocmd("User", {
+    pattern = "NeoAI:message_sent",
+    callback = function(args)
+      local data = args.data or {}
+      local message = data.message
+      local window_id = data.window_id
+      local session_id = data.session_id
+      local role = data.role or "user"
+
+      -- 只处理用户消息
+      if role ~= "user" then
+        return
+      end
+
+      -- 检查是否是当前窗口的消息
+      if window_id then
+        -- 获取聊天窗口实例
+        local chat_window = require("NeoAI.ui.window.chat_window")
+        local current_window_id = chat_window.get_current_window_id()
+        if current_window_id and window_id ~= current_window_id then
+          print("⚠️  消息不是给当前窗口的，忽略")
+          return
+        end
+      end
+
+      print("📢 收到用户消息，准备触发AI响应...")
+
+      -- 获取AI引擎
+      local core_loaded, core = pcall(require, "NeoAI.core")
+      if not core_loaded or not core then
+        print("⚠️  无法加载核心模块")
+        return
+      end
+
+      local ai_engine = core.get_ai_engine()
+      if not ai_engine then
+        print("⚠️  无法获取AI引擎")
+        return
+      end
+
+      -- 获取会话管理器
+      local session_manager = core.get_session_manager()
+      if not session_manager then
+        print("⚠️  无法获取会话管理器")
+        return
+      end
+
+      -- 获取当前会话
+      local current_session = session_manager.get_current_session()
+      if not current_session then
+        print("⚠️  无法获取当前会话")
+        return
+      end
+
+      -- 获取会话中的消息（使用会话助手）
+      local session_messages = session_helper.load_messages_from_session()
+      if not session_messages or #session_messages == 0 then
+        print("⚠️  会话中没有消息")
+        return
+      end
+
+      -- 构建消息列表
+      local messages = {}
+      for _, msg in ipairs(session_messages) do
+        table.insert(messages, {
+          role = msg.role,
+          content = msg.content,
+        })
+      end
+
+      -- 在聊天窗口中显示AI回复占位符
+      local chat_window = require("NeoAI.ui.window.chat_window")
+      if chat_window.is_available() then
+        chat_window.add_message("assistant", "🤖 AI正在思考...")
+      end
+
+      -- 触发AI响应生成
+      local generation_id = ai_engine.generate_response(messages, {
+        session_id = session_id or current_session.id,
+        window_id = window_id,
+        stream = false, -- 禁用流式响应，避免卡住
+      })
+
+      print("✓ 已触发AI响应生成 (ID: " .. tostring(generation_id) .. ")")
+    end,
+  })
+
   -- 监听AI响应完成事件
   vim.api.nvim_create_autocmd("User", {
     pattern = "NeoAI:ai_response_complete",
@@ -143,35 +239,70 @@ function M.initialize(config)
         response_content = tostring(response)
       end
 
-      -- 添加AI响应到聊天窗口
-      local success = chat_window.add_message("assistant", response_content)
-      if success then
-        print("✓ AI响应已添加到聊天窗口 (ID: " .. tostring(generation_id) .. ")")
-
-        -- 保存AI响应到所有管理器
-        local success = session_helper.save_message_to_all("assistant", response_content, {
-          generation_id = generation_id,
-          timestamp = os.time(),
-        })
-        
-        if success then
-          print("✓ AI响应已保存到所有管理器")
-        else
-          print("⚠️  保存AI响应失败")
+      -- 更新AI回复占位符为实际响应
+      -- 首先获取聊天窗口中的消息
+      local messages = chat_window.get_messages()
+      if messages and #messages > 0 then
+        -- 查找最后一个AI消息（占位符）
+        local last_ai_index = nil
+        for i = #messages, 1, -1 do
+          if messages[i].role == "assistant" then
+            last_ai_index = i
+            break
+          end
         end
 
-        -- 触发响应显示事件
-        vim.api.nvim_exec_autocmds("User", {
-          pattern = "NeoAI:ai_response_displayed",
-          data = {
-            generation_id = generation_id,
-            response = response_content,
-            success = true,
-          },
-        })
+        if last_ai_index then
+          -- 更新占位符消息
+          messages[last_ai_index].content = response_content
+
+          -- 重新渲染聊天窗口
+          chat_window.set_messages(messages)
+          chat_window.render_chat()
+
+          print("✓ AI响应已更新到聊天窗口 (ID: " .. tostring(generation_id) .. ")")
+        else
+          -- 如果没有找到AI消息，添加新的
+          local success = chat_window.add_message("assistant", response_content)
+          if success then
+            print("✓ AI响应已添加到聊天窗口 (ID: " .. tostring(generation_id) .. ")")
+          else
+            print("✗ 无法添加AI响应到聊天窗口")
+            return
+          end
+        end
       else
-        print("✗ 无法添加AI响应到聊天窗口")
+        -- 如果没有消息，添加新的
+        local success = chat_window.add_message("assistant", response_content)
+        if success then
+          print("✓ AI响应已添加到聊天窗口 (ID: " .. tostring(generation_id) .. ")")
+        else
+          print("✗ 无法添加AI响应到聊天窗口")
+          return
+        end
       end
+
+      -- 保存AI响应到所有管理器
+      local success = session_helper.save_message_to_all("assistant", response_content, {
+        generation_id = generation_id,
+        timestamp = os.time(),
+      })
+
+      if success then
+        print("✓ AI响应已保存到所有管理器")
+      else
+        print("⚠️  保存AI响应失败")
+      end
+
+      -- 触发响应显示事件
+      vim.api.nvim_exec_autocmds("User", {
+        pattern = "NeoAI:ai_response_displayed",
+        data = {
+          generation_id = generation_id,
+          response = response_content,
+          success = true,
+        },
+      })
     end,
   })
 
@@ -208,24 +339,61 @@ function M.initialize(config)
         chunk_content = tostring(chunk)
       end
 
-      -- 对于流式响应，我们需要特殊处理
-      -- 这里可以显示悬浮文本或更新最后一条消息
+      -- 对于流式响应，更新AI回复占位符
       if chunk_content and chunk_content ~= "" then
-        -- 显示悬浮文本或更新UI
-        chat_window.show_floating_text(chunk_content, {
-          timeout = 2000,
-          position = "bottom",
-        })
+        -- 获取聊天窗口中的消息
+        local messages = chat_window.get_messages()
+        if messages and #messages > 0 then
+          -- 查找最后一个AI消息（占位符）
+          local last_ai_index = nil
+          for i = #messages, 1, -1 do
+            if messages[i].role == "assistant" then
+              last_ai_index = i
+              break
+            end
+          end
 
-        -- 触发流式响应事件
-        vim.api.nvim_exec_autocmds("User", {
-          pattern = "NeoAI:stream_chunk_displayed",
-          data = {
-            generation_id = generation_id,
-            chunk = chunk_content,
-            success = true,
-          },
-        })
+          if last_ai_index then
+            -- 使用update_message函数更新消息
+            local current_content = messages[last_ai_index].content or ""
+
+            -- 如果当前内容是占位符，替换它
+            if current_content == "🤖 AI正在思考..." then
+              chat_window.update_message(last_ai_index, chunk_content)
+            else
+              -- 否则追加内容
+              chat_window.update_message(last_ai_index, current_content .. chunk_content)
+            end
+
+            -- 显示进度提示
+            chat_window.show_floating_text("AI正在思考...", {
+              timeout = 1000,
+              position = "bottom",
+            })
+
+            -- 触发流式响应事件
+            vim.api.nvim_exec_autocmds("User", {
+              pattern = "NeoAI:stream_chunk_displayed",
+              data = {
+                generation_id = generation_id,
+                chunk = chunk_content,
+                success = true,
+              },
+            })
+          else
+            -- 如果没有找到AI消息，显示悬浮文本
+            chat_window.show_floating_text(chunk_content, {
+              timeout = 2000,
+              position = "bottom",
+            })
+          end
+        else
+          -- 如果没有消息，显示悬浮文本
+          chat_window.show_floating_text(chunk_content, {
+            timeout = 2000,
+            position = "bottom",
+          })
+        end
       end
     end,
   })
@@ -339,7 +507,107 @@ function M.update_keymaps()
   print("按键映射已更新")
 end
 
---- 发送消息
+--- 发送消息（异步版本）
+--- @param content string 消息内容
+--- @param session_id string|nil 会话ID（可选）
+--- @param branch_id string|nil 分支ID（可选）
+--- @param window_id number|nil 窗口ID（可选）
+--- @param format boolean|nil 是否格式化消息（可选，默认true）
+--- @param callback function|nil 回调函数（可选）
+--- @return boolean 是否成功启动异步发送
+--- @return string|nil 结果信息
+function M.send_message(content, session_id, branch_id, window_id, format, callback)
+  if not state.initialized then
+    if callback then
+      callback(false, "聊天处理器未初始化")
+    end
+    return false, "聊天处理器未初始化"
+  end
+
+  if not content or vim.trim(content) == "" then
+    if callback then
+      callback(false, "消息内容不能为空")
+    end
+    return false, "消息内容不能为空"
+  end
+
+  -- 使用异步工作器发送消息，避免阻塞界面
+  local async_worker = require("NeoAI.utils.async_worker")
+
+  -- 提交异步任务
+  local task_id = async_worker.submit_task("send_chat_message", function()
+    -- 默认格式化消息
+    local format_message = format ~= false
+    local final_message = content
+
+    if format_message then
+      -- 格式化消息：添加日期时间
+      final_message = string.format("[%s] %s", os.date("%Y-%m-%d %H:%M:%S"), content)
+    end
+
+    -- 获取聊天窗口实例
+    local chat_window = require("NeoAI.ui.window.chat_window")
+
+    -- 检查聊天窗口是否可用
+    local available, err = pcall(chat_window.is_available)
+    if not available then
+      return false, "聊天窗口不可用: " .. tostring(err)
+    end
+
+    -- 通过聊天窗口发送消息
+    local success, result = chat_window.send_message(final_message)
+    if not success then
+      return false, "发送消息失败: " .. tostring(result)
+    end
+
+    -- 使用会话辅助模块保存消息
+    local save_success = session_helper.save_message_to_all("user", content, {
+      timestamp = os.time(),
+      window_id = window_id,
+      formatted = format_message,
+    })
+
+    if save_success then
+      print("✓ 用户消息已保存到所有管理器")
+    else
+      print("⚠️  保存用户消息失败")
+    end
+
+    -- 触发消息已发送事件
+    local event_pattern = format_message and "NeoAI:formatted_message_sent" or "NeoAI:message_sent"
+    vim.api.nvim_exec_autocmds("User", {
+      pattern = event_pattern,
+      data = {
+        session_id = session_id or "default",
+        branch_id = branch_id or "main",
+        original_content = content,
+        formatted_content = format_message and final_message or nil,
+        message = final_message,
+        window_id = window_id,
+        timestamp = os.time(),
+        role = "user",
+        format = format_message,
+      },
+    })
+
+    return true, format_message and "消息已发送并格式化" or "消息已发送"
+  end, function(success, result, error_msg)
+    -- 异步任务完成后的回调
+    if callback then
+      callback(success, result, error_msg)
+    end
+
+    if success then
+      print("✓ 异步消息发送完成: " .. tostring(result))
+    else
+      print("✗ 异步消息发送失败: " .. tostring(error_msg or result))
+    end
+  end)
+
+  return true, "异步消息发送任务已启动 (ID: " .. tostring(task_id) .. ")"
+end
+
+--- 发送消息（同步版本，向后兼容）
 --- @param content string 消息内容
 --- @param session_id string|nil 会话ID（可选）
 --- @param branch_id string|nil 分支ID（可选）
@@ -347,7 +615,7 @@ end
 --- @param format boolean|nil 是否格式化消息（可选，默认true）
 --- @return boolean 是否成功
 --- @return string|nil 结果信息
-function M.send_message(content, session_id, branch_id, window_id, format)
+function M.send_message_sync(content, session_id, branch_id, window_id, format)
   if not state.initialized then
     return false, "聊天处理器未初始化"
   end
@@ -386,14 +654,12 @@ function M.send_message(content, session_id, branch_id, window_id, format)
     window_id = window_id,
     formatted = format_message,
   })
-  
+
   if success then
     print("✓ 用户消息已保存到所有管理器")
   else
     print("⚠️  保存用户消息失败")
   end
-
-  -- print("✓ 消息已发送: " .. content)
 
   -- 触发消息已发送事件
   local event_pattern = format_message and "NeoAI:formatted_message_sent" or "NeoAI:message_sent"
@@ -597,14 +863,31 @@ local function handle_send_key()
     return
   end
 
-  -- 发送消息
-  local success, result = M.send_message(input_content)
+  -- 发送消息（使用异步版本，避免界面卡住）
+  local success, result = M.send_message(
+    input_content,
+    nil,
+    nil,
+    nil,
+    nil,
+    function(async_success, async_result, async_error)
+      -- 异步回调函数
+      if async_success then
+        local info_level = vim.log.levels and vim.log.levels.INFO or "INFO"
+        vim.notify("消息发送成功", info_level)
+      else
+        local error_level = vim.log.levels and vim.log.levels.ERROR or "ERROR"
+        vim.notify("发送消息失败: " .. tostring(async_error or async_result), error_level)
+      end
+    end
+  )
+
   if not success then
     local error_level = vim.log.levels and vim.log.levels.ERROR or "ERROR"
-    vim.notify("发送消息失败: " .. tostring(result), error_level)
+    vim.notify("启动异步消息发送失败: " .. tostring(result), error_level)
   else
     local info_level = vim.log.levels and vim.log.levels.INFO or "INFO"
-    vim.notify("消息发送成功", info_level)
+    vim.notify("消息发送中...", info_level)
   end
 
   return success, result
