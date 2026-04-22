@@ -1,6 +1,13 @@
 ---@module "NeoAI.utils.skiplist"
 --- 跳表（Skip List）实现
---- 支持按 key 排序的 O(log n) 插入、查找、删除和范围查询
+---
+--- 核心思想：多层链表，不同层级（forward[i]）代表不同"方向"
+---   - forward[1]: 底层方向，连接所有节点（完整有序链表）
+---   - forward[2]: 第2层方向，跳过部分节点（快速通道）
+---   - forward[N]: 第N层方向，跳过更多节点（高速通道）
+---
+--- 每个节点有多个 forward 指针，指向不同层级的后继节点。
+--- 层级越高，跳过的节点越多，查询越快。
 ---
 --- 使用方式:
 ---   local SkipList = require("NeoAI.utils.skiplist")
@@ -11,26 +18,28 @@
 
 local M = {}
 
---- 默认最大层级
 local DEFAULT_MAX_LEVEL = 16
---- 默认晋升概率
 local DEFAULT_PROBABILITY = 0.5
 
 --- 创建跳表节点
---- @param key number 键（时间戳或序号）
+--- @param key number 键
 --- @param value any 值
---- @param level number 节点层级
+--- @param level number 节点层级（forward 指针数量）
 --- @return table 节点
 local function create_node(key, value, level)
   return {
     key = key,
     value = value,
-    forward = {}, -- forward[1..level] 前向指针
+    -- forward[i] 是第 i 层方向上的下一个节点
+    -- forward[1] = 底层方向（连接所有节点）
+    -- forward[2] = 第2层方向（跳过部分节点）
+    -- forward[level] = 最高层方向（跳过最多节点）
+    forward = {},
     level = level,
   }
 end
 
---- 随机生成层级
+--- 随机生成节点层级（决定该节点有多少个 forward 方向）
 --- @param max_level number 最大层级
 --- @param probability number 晋升概率
 --- @return number 层级
@@ -46,25 +55,25 @@ end
 --- @param opts table|nil 可选参数
 ---   - max_level: number 最大层级（默认 16）
 ---   - probability: number 晋升概率（默认 0.5）
----   - unique: boolean 是否允许重复 key（默认 true，允许重复）
+---   - unique: boolean 是否允许重复 key（默认 true）
 --- @return table 跳表实例
 function M:new(opts)
   opts = opts or {}
   local max_level = opts.max_level or DEFAULT_MAX_LEVEL
   local probability = opts.probability or DEFAULT_PROBABILITY
-  local unique = opts.unique ~= false -- 默认允许重复
+  local unique = opts.unique ~= false
 
   local list = {
     max_level = max_level,
     probability = probability,
     unique = unique,
-    level = 1, -- 当前最高层级
-    size = 0,  -- 节点数量
+    level = 1,  -- 当前最高层级（当前有多少个方向可用）
+    size = 0,   -- 节点数量
     header = create_node(-math.huge, nil, max_level),
     tail = create_node(math.huge, nil, max_level),
   }
 
-  -- 初始化 header 的所有 forward 指向 tail
+  -- 头节点的所有方向都指向尾节点
   for i = 1, max_level do
     list.header.forward[i] = list.tail
   end
@@ -76,46 +85,47 @@ function M:new(opts)
 end
 
 --- 插入节点
---- 如果 unique=true 且 key 已存在，则覆盖旧值
+--- 从最高层方向开始查找，逐层下降，记录每层需要更新的节点
 --- @param key number 键
 --- @param value any 值
---- @return boolean 是否成功插入（unique=false 时始终返回 true）
+--- @return boolean
 function M:insert(key, value)
-  local update = {} -- update[i] = 第 i 层需要更新的节点
+  -- update[i] = 在第 i 层方向上，新节点应该插入在 update[i] 之后
+  local update = {}
   local current = self.header
 
-  -- 从最高层开始查找插入位置
+  -- 从最高层方向开始，逐层向下查找插入位置
   for i = self.level, 1, -1 do
+    -- 在当前方向上，一直向前直到遇到更大的 key
     while current.forward[i] and current.forward[i].key < key do
       current = current.forward[i]
     end
+    -- 记录第 i 层方向上需要更新的节点
     update[i] = current
   end
 
-  -- 到达底层，检查是否已存在
+  -- 到达底层方向（forward[1]），检查是否已存在
   current = current.forward[1]
 
   if self.unique and current and current.key == key then
-    -- 覆盖旧值
     current.value = value
     return true
   end
 
-  -- 生成新节点的层级
+  -- 随机决定新节点有多少个 forward 方向
   local new_level = random_level(self.max_level, self.probability)
 
   if new_level > self.level then
-    -- 补充 update 数组
+    -- 新节点比当前最高层还高，补充 update 数组
     for i = self.level + 1, new_level do
       update[i] = self.header
     end
     self.level = new_level
   end
 
-  -- 创建新节点
   local new_node = create_node(key, value, new_level)
 
-  -- 插入节点
+  -- 在每一层方向上插入新节点
   for i = 1, new_level do
     new_node.forward[i] = update[i].forward[i]
     update[i].forward[i] = new_node
@@ -126,19 +136,20 @@ function M:insert(key, value)
 end
 
 --- 搜索指定 key 的节点
+--- 从最高层方向开始，快速跳过不需要的节点
 --- @param key number 键
---- @return any|nil 找到的值，未找到返回 nil
+--- @return any|nil
 function M:search(key)
   local current = self.header
 
-  -- 从最高层开始查找
+  -- 从最高层方向开始查找，逐层下降
   for i = self.level, 1, -1 do
     while current.forward[i] and current.forward[i].key < key do
       current = current.forward[i]
     end
   end
 
-  -- 到达底层
+  -- 到达底层方向，检查目标节点
   current = current.forward[1]
 
   if current and current.key == key then
@@ -150,12 +161,12 @@ end
 
 --- 删除指定 key 的节点
 --- @param key number 键
---- @return boolean 是否删除成功
+--- @return boolean
 function M:delete(key)
   local update = {}
   local current = self.header
 
-  -- 查找要删除的节点
+  -- 从最高层方向开始，记录每层需要更新的节点
   for i = self.level, 1, -1 do
     while current.forward[i] and current.forward[i].key < key do
       current = current.forward[i]
@@ -169,7 +180,7 @@ function M:delete(key)
     return false
   end
 
-  -- 删除节点
+  -- 在每一层方向上跳过被删除的节点
   for i = 1, self.level do
     if update[i].forward[i] ~= current then
       break
@@ -177,7 +188,7 @@ function M:delete(key)
     update[i].forward[i] = current.forward[i]
   end
 
-  -- 更新跳表层数
+  -- 降低跳表层数（如果最高层方向已空）
   while self.level > 1 and self.header.forward[self.level] == self.tail do
     self.level = self.level - 1
   end
@@ -187,11 +198,12 @@ function M:delete(key)
 end
 
 --- 范围查询：获取 key 在 [min_key, max_key] 范围内的所有值
+--- 利用高层方向快速定位起点，然后沿底层方向遍历
 --- @param min_key number 最小 key（包含）
 --- @param max_key number 最大 key（包含）
---- @param opts table|nil 可选参数
+--- @param opts table|nil
 ---   - limit: number 最大返回数量
----   - reverse: boolean 是否逆序返回
+---   - reverse: boolean 是否逆序
 --- @return table 值列表
 function M:range(min_key, max_key, opts)
   opts = opts or {}
@@ -201,7 +213,7 @@ function M:range(min_key, max_key, opts)
   local result = {}
   local current = self.header
 
-  -- 找到第一个 >= min_key 的节点
+  -- 从最高层方向快速定位到 >= min_key 的位置
   for i = self.level, 1, -1 do
     while current.forward[i] and current.forward[i].key < min_key do
       current = current.forward[i]
@@ -211,18 +223,17 @@ function M:range(min_key, max_key, opts)
   current = current.forward[1]
 
   if reverse then
-    -- 逆序：先收集所有符合条件的节点，再反转
+    -- 先沿底层方向收集所有符合条件的节点
     local temp = {}
     while current and current ~= self.tail and current.key <= max_key do
       table.insert(temp, current.value)
       current = current.forward[1]
     end
-    -- 反转并截取
+    -- 反转截取
     for i = #temp, math.max(1, #temp - limit + 1), -1 do
       table.insert(result, temp[i])
     end
   else
-    -- 正序
     local count = 0
     while current and current ~= self.tail and current.key <= max_key and count < limit do
       table.insert(result, current.value)
@@ -234,7 +245,7 @@ function M:range(min_key, max_key, opts)
   return result
 end
 
---- 获取所有节点（按 key 排序）
+--- 获取所有节点
 --- @param reverse boolean|nil 是否逆序
 --- @return table 值列表
 function M:all(reverse)
@@ -243,8 +254,8 @@ function M:all(reverse)
   })
 end
 
---- 获取第一个节点
---- @return any|nil 第一个值
+--- 获取第一个节点（底层方向第一个）
+--- @return any|nil
 function M:first()
   local node = self.header.forward[1]
   if node and node ~= self.tail then
@@ -253,8 +264,8 @@ function M:first()
   return nil
 end
 
---- 获取最后一个节点
---- @return any|nil 最后一个值
+--- 获取最后一个节点（沿最高层方向快速定位）
+--- @return any|nil
 function M:last()
   local current = self.header
   for i = self.level, 1, -1 do
@@ -269,7 +280,7 @@ function M:last()
 end
 
 --- 获取节点数量
---- @return number 节点数量
+--- @return number
 function M:get_size()
   return self.size
 end
@@ -290,11 +301,11 @@ function M:is_empty()
 end
 
 --- 遍历所有节点（迭代器）
+--- 沿底层方向（forward[1]）遍历，保证有序
 --- @param reverse boolean|nil 是否逆序遍历
---- @return function 迭代器函数
+--- @return function 迭代器函数 (key, value)
 function M:iter(reverse)
   if reverse then
-    -- 逆序遍历：先收集所有节点
     local nodes = {}
     local current = self.header.forward[1]
     while current and current ~= self.tail do

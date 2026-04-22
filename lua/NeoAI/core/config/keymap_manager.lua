@@ -1,6 +1,6 @@
 local M = {}
 
--- 默认键位配置（由init.lua传入）
+-- 已合并的键位配置（由主init.lua传入，已完成默认和用户配置的合并）
 local DEFAULT_KEYMAPS = nil
 
 -- 当前键位配置
@@ -9,34 +9,13 @@ local current_keymaps = {}
 local config_file_path = vim.fn.stdpath("config") .. "/neoai_keymaps.json"
 
 --- 初始化键位管理器
---- @param default_keymaps table 默认键位配置（从default_keymaps.lua传入）
---- @param user_keymaps table 用户自定义键位配置
-function M.initialize(default_keymaps, user_keymaps)
-  -- 设置默认配置
-  DEFAULT_KEYMAPS = vim.deepcopy(default_keymaps)
+--- @param merged_keymaps table 已合并的键位配置（主init.lua已完成配置合并）
+function M.initialize(merged_keymaps)
+  -- 设置默认配置为传入的已合并配置
+  DEFAULT_KEYMAPS = vim.deepcopy(merged_keymaps)
 
-  -- 加载默认配置
+  -- 加载配置
   M.load_default_keymaps()
-
-  -- 合并用户配置
-  if user_keymaps then
-    for context, keymap_table in pairs(user_keymaps) do
-      if type(keymap_table) == "table" then
-        -- 确保上下文存在
-        if not DEFAULT_KEYMAPS[context] then
-          -- 如果默认配置中没有这个上下文，创建一个空的
-          DEFAULT_KEYMAPS[context] = {}
-          current_keymaps[context] = {}
-        end
-
-        for action, key_config in pairs(keymap_table) do
-          if type(key_config) == "table" and key_config.key then
-            M.set_keymap(context, action, key_config.key, key_config.desc)
-          end
-        end
-      end
-    end
-  end
 
   -- 尝试从文件加载保存的配置
   M.load_keymaps()
@@ -44,7 +23,7 @@ function M.initialize(default_keymaps, user_keymaps)
   vim.notify("[NeoAI] 键位配置管理器已初始化", vim.log.levels.INFO)
 end
 
---- 加载默认键位配置
+--- 加载已合并的键位配置
 function M.load_default_keymaps()
   -- 检查DEFAULT_KEYMAPS是否已初始化
   if not DEFAULT_KEYMAPS then

@@ -7,8 +7,8 @@ local tool_registry = require("NeoAI.tools.tool_registry")
 local tool_executor = require("NeoAI.tools.tool_executor")
 local tool_validator = require("NeoAI.tools.tool_validator")
 local tool_history_manager = require("NeoAI.tools.tool_history_manager")
-local config_manager = require("NeoAI.tools.config_manager")
 -- 注意：event_bus 已被移除，使用 core/events 系统替代
+-- 注意：config 模块不再直接导入，配置由主 init 传入
 
 -- 模块内部状态
 local state = {
@@ -34,9 +34,11 @@ function M.initialize(tools_config)
   tool_executor.initialize(state.config)
   tool_validator.initialize(state.config)
 
-  -- 初始化历史管理器和配置管理器
+  -- 初始化历史管理器
   tool_history_manager.initialize(state.config)
-  config_manager.initialize(state.config)
+  
+  -- 初始化配置（如果需要的话）
+  -- 注意：tools_config 应该是已经处理好的配置，所以这里不需要再次初始化
 
   -- 加载内置工具（如果配置允许）
   if state.config.builtin ~= false then
@@ -297,9 +299,8 @@ function M.update_config(new_config)
   tool_executor.update_config(state.config)
   tool_validator.update_config(state.config)
 
-  -- 更新历史管理器和配置管理器配置
-  tool_history_manager.update_config(state.config) -- 修复：应该调用update_config而非initialize
-  config_manager.update_config(state.config) -- 修复：应该调用update_config而非initialize
+  -- 更新历史管理器配置
+  tool_history_manager.update_config(state.config)
 end
 
 --- 获取历史管理器实例
@@ -319,7 +320,54 @@ function M.get_config_manager()
     error("工具系统未初始化")
   end
 
-  return config_manager
+  -- 创建一个简单的配置管理器包装器
+  local config_wrapper = {}
+  
+  function config_wrapper.get(key)
+    if not key then
+      return state.config
+    end
+    
+    -- 支持点分隔的键路径
+    local parts = vim.split(key, ".", { plain = true })
+    local value = state.config
+    
+    for _, part in ipairs(parts) do
+      if value and type(value) == "table" then
+        value = value[part]
+      else
+        return nil
+      end
+    end
+    
+    return value
+  end
+  
+  function config_wrapper.set(key, value)
+    -- 简单的设置实现
+    if not key then
+      return
+    end
+    
+    local parts = vim.split(key, ".", { plain = true })
+    local target = state.config
+    
+    for i = 1, #parts - 1 do
+      local part = parts[i]
+      if not target[part] or type(target[part]) ~= "table" then
+        target[part] = {}
+      end
+      target = target[part]
+    end
+    
+    target[parts[#parts]] = value
+  end
+  
+  function config_wrapper.get_all()
+    return state.config
+  end
+  
+  return config_wrapper
 end
 
 -- 导出模块

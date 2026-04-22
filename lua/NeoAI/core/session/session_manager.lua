@@ -423,11 +423,25 @@ name = session_data.name or ("会话 " .. session_id_str),
         end
         
         -- 如果成功加载了 sessions.json，就不需要加载单独的会话文件了
-        -- 但仍然需要同步到 tree_manager
+        -- 检查 tree_manager 是否已有保存的树数据，如果没有则从 session_manager 同步
         pcall(function()
           local tree_mgr = require("NeoAI.core.session.tree_manager")
           if tree_mgr.is_initialized and tree_mgr.is_initialized() then
-            tree_mgr.sync_from_session_manager()
+            -- 检查 tree_manager 是否已有数据（从 _tree_graph 加载的）
+            local tree_data = tree_mgr.get_tree()
+            local has_real_nodes = false
+            if tree_data then
+              for _, node in ipairs(tree_data) do
+                if node.type == "virtual_root" and node.children and #node.children > 0 then
+                  has_real_nodes = true
+                  break
+                end
+              end
+            end
+            -- 如果没有实际节点数据，从 session_manager 同步
+            if not has_real_nodes then
+              tree_mgr.sync_from_session_manager()
+            end
           end
         end)
         return
@@ -476,11 +490,25 @@ name = session_data.name or ("会话 " .. session_id_str),
     end
   end
 
-  -- 加载完成后同步到 tree_manager
+  -- 加载完成后同步到 tree_manager（仅当 tree_manager 没有保存的树数据时）
   pcall(function()
     local tree_mgr = require("NeoAI.core.session.tree_manager")
     if tree_mgr.is_initialized and tree_mgr.is_initialized() then
-      tree_mgr.sync_from_session_manager()
+      -- 检查 tree_manager 是否已有数据（从 _tree_graph 加载的）
+      local tree_data = tree_mgr.get_tree()
+      local has_real_nodes = false
+      if tree_data then
+        for _, node in ipairs(tree_data) do
+          if node.type == "virtual_root" and node.children and #node.children > 0 then
+            has_real_nodes = true
+            break
+          end
+        end
+      end
+      -- 如果没有实际节点数据，从 session_manager 同步
+      if not has_real_nodes then
+        tree_mgr.sync_from_session_manager()
+      end
     end
   end)
 

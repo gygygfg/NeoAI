@@ -1,6 +1,5 @@
 local M = {}
 
-local config_manager = require("NeoAI.core.config.config_manager")
 local keymap_manager = require("NeoAI.core.config.keymap_manager")
 local session_manager = require("NeoAI.core.session.session_manager")
 local ai_engine = require("NeoAI.core.ai.ai_engine")
@@ -27,37 +26,29 @@ function M.initialize(core_config)
   -- 不再使用event_bus兼容层，直接使用Neovim原生事件系统
   state.event_bus = nil
 
-  -- 初始化配置管理器
-  config_manager.initialize(core_config or {})
-
   -- 初始化键位配置管理器
   state.keymap_mgr = keymap_manager
 
-  -- 从配置管理器获取键位配置
-  local user_keymaps = config_manager.get("keymaps") or {}
+  -- 从传入的配置获取键位配置（主init.lua已经完成配置合并）
+  local keymaps_config = (core_config or {}).keymaps or {}
 
-  -- 获取默认键位配置
-  local default_config_module = require("NeoAI.default_config")
-  local default_config = default_config_module.get_default_config()
-  local default_keymaps = default_config.keymaps
-
-  -- 初始化键位管理器，传递默认配置和用户配置
-  state.keymap_mgr.initialize(default_keymaps, user_keymaps)
+  -- 初始化键位管理器，传递完整的键位配置
+  state.keymap_mgr.initialize(keymaps_config)
 
   -- 初始化会话管理器
   state.session_mgr = session_manager.initialize({
-    config = config_manager.get("session") or {},
+    config = (core_config or {}).session or {},
   })
 
   -- 初始化AI引擎
   state.ai_engine = ai_engine.initialize({
-    config = config_manager.get("ai") or {},
+    config = (core_config or {}).ai or {},
     session_manager = state.session_mgr,
   })
 
   -- 初始化历史管理器
   history_manager.initialize({
-    config = config_manager.get("session") or {},
+    config = (core_config or {}).session or {},
   })
 
   state.config = core_config
@@ -91,7 +82,58 @@ end
 --- 获取配置管理器
 --- @return table 配置管理器
 function M.get_config_manager()
-  return config_manager
+  if not state.initialized then
+    error("Core not initialized")
+  end
+
+  -- 创建一个简单的配置管理器包装器
+  local config_wrapper = {}
+
+  function config_wrapper.get(key)
+    if not key then
+      return state.config
+    end
+
+    -- 支持点分隔的键路径
+    local parts = vim.split(key, ".", { plain = true })
+    local value = state.config
+
+    for _, part in ipairs(parts) do
+      if value and type(value) == "table" then
+        value = value[part]
+      else
+        return nil
+      end
+    end
+
+    return value
+  end
+
+  function config_wrapper.set(key, value)
+    -- 简单的设置实现
+    if not key then
+      return
+    end
+
+    local parts = vim.split(key, ".", { plain = true })
+    local target = state.config
+
+    for i = 1, #parts - 1 do
+      local part = parts[i]
+      if not target[part] or type(target[part]) ~= "table" then
+        target[part] = {}
+      end
+      target = target[part]
+    end
+
+    target[parts[#parts]] = value
+  end
+
+  function config_wrapper.get_all()
+    return state.config
+  end
+
+  return config_wrapper
 end
 
 --- 获取键位配置管理器

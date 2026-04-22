@@ -18,7 +18,28 @@ local state = {
   initialized = false,
   event_bus = nil,
   config = nil,
+  save_debounce_timer = nil, -- 保存防抖定时器
 }
+
+--- 防抖保存（内部使用）
+local function debounce_save()
+  if not state.config or not state.config.save_path then
+    return
+  end
+  if state.save_debounce_timer then
+    state.save_debounce_timer:stop()
+    state.save_debounce_timer:close()
+    state.save_debounce_timer = nil
+  end
+  state.save_debounce_timer = vim.loop.new_timer()
+  state.save_debounce_timer:start(500, 0, vim.schedule_wrap(function()
+    if state.save_debounce_timer then
+      state.save_debounce_timer:close()
+      state.save_debounce_timer = nil
+    end
+    M._save_tree_data()
+  end))
+end
 
 --- 初始化树管理器
 --- @param options table 选项
@@ -33,6 +54,25 @@ function M.initialize(options)
   
   -- 初始化虚拟根节点
   M._ensure_virtual_root()
+
+  -- 尝试从 session_manager 获取 save_path（如果未提供）
+  if not state.config.save_path then
+    pcall(function()
+      local sm = require("NeoAI.core.session.session_manager")
+      if sm.is_initialized and sm.is_initialized() then
+        -- 通过内部状态获取 save_path
+        -- 由于没有公开 API，尝试从 session_manager 的配置中获取
+        local sm_config = debug.getregistry() and nil
+        -- 更可靠的方式：直接使用默认路径
+        state.config.save_path = vim.fn.stdpath("cache") .. "/neoai_sessions"
+      end
+    end)
+  end
+
+  -- 加载保存的树数据
+  if state.config.save_path then
+    M._load_tree_data()
+  end
 end
 
 --- 确保虚拟根节点存在（内部使用）
@@ -87,6 +127,9 @@ function M.create_root_branch(name)
     pattern = "NeoAI:root_branch_created", 
     data = { node_id, node } 
   })
+
+  -- 自动保存
+  debounce_save()
 
   return node_id
 end
@@ -147,6 +190,9 @@ function M.create_sub_branch(parent_id, name)
     pattern = "NeoAI:sub_branch_created", 
     data = { node_id, node, parent_id } 
   })
+
+  -- 自动保存
+  debounce_save()
 
   return node_id
 end
@@ -231,6 +277,9 @@ function M.create_session(parent_id, name, metadata)
     data = { node_id, node, parent_id } 
   })
 
+  -- 自动保存
+  debounce_save()
+
   return node_id
 end
 
@@ -314,6 +363,9 @@ function M.create_conversation_round(session_id, round_number, user_message, ai_
     data = { node_id, node, session_id } 
   })
 
+  -- 自动保存
+  debounce_save()
+
   return node_id
 end
 
@@ -373,6 +425,9 @@ function M.create_message(round_id, role, content, round_number, message_index)
     pattern = "NeoAI:message_created", 
     data = { node_id, node, round_id } 
   })
+
+  -- 自动保存
+  debounce_save()
 
   return node_id
 end
@@ -482,6 +537,9 @@ function M.delete_node(node_id)
     pattern = "NeoAI:node_deleted", 
     data = { node_id, node.type } 
   })
+
+  -- 自动保存
+  debounce_save()
 end
 
 --- 重命名节点
@@ -501,6 +559,9 @@ function M.rename_node(node_id, new_name)
     pattern = "NeoAI:node_renamed", 
     data = { node_id, old_name, new_name } 
   })
+
+  -- 自动保存
+  debounce_save()
 end
 
 --- 移动节点
@@ -559,6 +620,9 @@ function M.move_node(node_id, new_parent_id)
     pattern = "NeoAI:node_moved", 
     data = { node_id, node.parent_id, new_parent_id } 
   })
+
+  -- 自动保存
+  debounce_save()
 end
 
 --- 重置树管理器（主要用于测试）
@@ -710,6 +774,125 @@ function M.sync_from_session_manager()
         end
       end
     end
+  end
+end
+
+--- 保存树数据到文件（内部使用）
+--- 将 tree_nodes 和 node_counter 保存到 sessions.json 的 _tree_graph 字段
+function M._save_tree_data()
+  if not state.config or not state.config.save_path then
+    return
+  end
+
+  local save_path = state.config.save_path
+
+  -- 确保目录存在
+  if vim.fn.isdirectory(save_path) == 0 then
+    vim.fn.mkdir(save_path, "p")
+  end
+
+  local sessions_file = save_path .. "/sessions.json"
+  local all_data = {}
+
+  -- 读取现有的 sessions.json
+  if vim.fn.filereadable(sessions_file) == 1 then
+    local content = vim.fn.readfile(sessions_file)
+    if #content > 0 then
+      local success, existing_data = pcall(vim.json.decode, table.concat(content, "\n"))
+      if success and existing_data then
+        all_data = existing_data
+      end
+    end
+  end
+
+  -- 构建树图数据
+  local tree_graph = {
+    node_counter = node_counter,
+    nodes = {},
+    virtual_root_children = {}, -- 单独保存虚拟根节点的子节点ID列表
+  }
+
+  -- 保存虚拟根节点的子节点ID列表
+  if tree_nodes["virtual_root"] and tree_nodes["virtual_root"].children then
+    tree_graph.virtual_root_children = vim.deepcopy(tree_nodes["virtual_root"].children)
+  end
+
+  -- 保存所有节点（跳过虚拟根节点，它会在初始化时重建）
+  for node_id, node in pairs(tree_nodes) do
+    if node_id ~= "virtual_root" then
+      tree_graph.nodes[node_id] = {
+        id = node.id,
+        name = node.name,
+        type = node.type,
+        parent_id = node.parent_id,
+        created_at = node.created_at,
+        children = vim.deepcopy(node.children or {}),
+        metadata = vim.deepcopy(node.metadata or {}),
+      }
+    end
+  end
+
+  -- 将树图数据写入 _tree_graph 字段
+  all_data["_tree_graph"] = tree_graph
+
+  -- 写回文件
+  local json_str = vim.json.encode(all_data)
+  vim.fn.writefile({ json_str }, sessions_file)
+end
+
+--- 从文件加载树数据（内部使用）
+function M._load_tree_data()
+  if not state.config or not state.config.save_path then
+    return
+  end
+
+  local save_path = state.config.save_path
+  local sessions_file = save_path .. "/sessions.json"
+
+  if vim.fn.filereadable(sessions_file) ~= 1 then
+    return
+  end
+
+  local content = vim.fn.readfile(sessions_file)
+  if #content == 0 then
+    return
+  end
+
+  local success, all_data = pcall(vim.json.decode, table.concat(content, "\n"))
+  if not success or not all_data then
+    return
+  end
+
+  local tree_graph = all_data["_tree_graph"]
+  if not tree_graph or not tree_graph.nodes then
+    return
+  end
+
+  -- 恢复节点计数器
+  if tree_graph.node_counter then
+    node_counter = tree_graph.node_counter
+  end
+
+  -- 确保虚拟根节点存在
+  M._ensure_virtual_root()
+
+  -- 恢复所有节点
+  for node_id, node_data in pairs(tree_graph.nodes) do
+    tree_nodes[node_id] = {
+      id = node_data.id,
+      name = node_data.name,
+      type = node_data.type,
+      parent_id = node_data.parent_id,
+      created_at = node_data.created_at,
+      children = vim.deepcopy(node_data.children or {}),
+      metadata = vim.deepcopy(node_data.metadata or {}),
+    }
+  end
+
+  -- 恢复虚拟根节点的子节点列表
+  if tree_graph.virtual_root_children then
+    tree_nodes["virtual_root"].children = vim.deepcopy(tree_graph.virtual_root_children)
+    tree_nodes["virtual_root"].metadata.node_count = #tree_nodes["virtual_root"].children
   end
 end
 

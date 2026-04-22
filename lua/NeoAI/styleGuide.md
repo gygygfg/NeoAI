@@ -6,7 +6,8 @@ NeoAI/
 ├── core/ # 核心业务逻辑
 │ ├── init.lua # 核心模块入口
 │ ├── config/ # 配置管理
-│ │ ├── config_manager.lua # 配置管理（合并验证功能）
+│ │ ├── keymap_manager.lua # 键位配置管理器
+│ │ └── # 注意：config_manager.lua 已移除，使用 default_config.lua 替代
 │ │ └── keymap_manager.lua # 键位配置管理器（新增）
 │ ├── session/ # 会话管理
 │ │ ├── session_manager.lua # 会话管理器

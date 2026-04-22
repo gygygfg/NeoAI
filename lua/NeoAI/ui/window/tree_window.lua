@@ -799,7 +799,7 @@ function M._load_tree_data(session_id)
     end)
   end
   if not save_path then
-    -- 使用与 config_manager 默认值一致的路径
+    -- 使用与 default_config 默认值一致的路径
     save_path = vim.fn.stdpath("cache") .. "/neoai_sessions"
   end
 
