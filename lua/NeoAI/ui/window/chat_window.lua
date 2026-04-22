@@ -823,6 +823,34 @@ function M.add_message(role, content)
   return true
 end
 
+--- 触发自动保存（内部函数）
+function M._trigger_auto_save()
+  -- 直接调用会话管理器的内部保存函数
+  local session_mgr_loaded, session_mgr = pcall(require, "NeoAI.core.session.session_manager")
+  if session_mgr_loaded and session_mgr then
+    -- 使用pcall安全调用内部函数
+    pcall(function()
+      -- 检查是否有保存函数
+      if session_mgr._save_sessions then
+        session_mgr._save_sessions()
+      end
+    end)
+  end
+  
+  -- 同时触发历史管理器的保存
+  local history_mgr_loaded, history_mgr = pcall(require, "NeoAI.core.history_manager")
+  if history_mgr_loaded and history_mgr then
+    pcall(function()
+      -- 检查历史管理器是否有保存函数
+      if history_mgr.save_sessions then
+        history_mgr.save_sessions()
+      elseif history_mgr._save_sessions then
+        history_mgr._save_sessions()
+      end
+    end)
+  end
+end
+
 --- 持久化消息到存储系统（内部函数）
 --- @param role string 角色 ('user' 或 'assistant')
 --- @param content string 消息内容
@@ -860,6 +888,9 @@ function M._persist_message(role, content)
       window_id = state.current_window_id,
     })
   end
+  
+  -- 触发自动保存
+  M._trigger_auto_save()
 end
 
 --- 显示悬浮文本

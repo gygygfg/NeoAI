@@ -71,8 +71,8 @@ local DEFAULT_CONFIG = {
   -- 会话配置
   session = {
     auto_save = true,
-    save_path = vim.fn.stdpath("cache") .. "/sessions.json",
-    max_history_per_session = 100,
+    save_path = vim.fn.stdpath("cache") .. "/NeoAI",
+    max_history_per_session = 1000,
   },
   -- 工具配置
   tools = {
@@ -646,4 +646,3 @@ function M.get_default_config()
 end
 
 return M
-

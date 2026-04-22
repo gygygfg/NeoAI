@@ -15,6 +15,7 @@ local state = {
   event_bus = nil,
   config = nil,
   save_debounce_timer = nil, -- 保存防抖定时器
+  autocmd_ids = {}, -- 自动命令ID列表
 }
 
 --- 防抖保存（内部使用）
@@ -48,6 +49,16 @@ function M.initialize(options)
 
   state.event_bus = options.event_bus
   state.config = options.config or {}
+  
+  -- 处理 session 配置
+  if state.config.session then
+    -- 将 session 配置合并到根配置中，以便向后兼容
+    for key, value in pairs(state.config.session) do
+      if state.config[key] == nil then
+        state.config[key] = value
+      end
+    end
+  end
 
   -- 初始化子模块
   branch_manager.initialize({
@@ -68,6 +79,30 @@ function M.initialize(options)
   -- 加载保存的会话
   if state.config.auto_save and state.config.save_path then
     M._load_sessions()
+  end
+
+  -- 监听消息相关事件，触发自动保存
+  -- 使用 Neovim 原生事件系统
+  state.autocmd_ids = {}
+  
+  local autocmd_patterns = {
+    "NeoAI:message_added",
+    "NeoAI:message_edited",
+    "NeoAI:message_updated",
+    "NeoAI:message_deleted",
+    "NeoAI:messages_cleared",
+  }
+  
+  for _, pattern in ipairs(autocmd_patterns) do
+    local autocmd_id = vim.api.nvim_create_autocmd("User", {
+      pattern = pattern,
+      callback = function(args)
+        if state.config.auto_save then
+          debounce_save()
+        end
+      end,
+    })
+    table.insert(state.autocmd_ids, autocmd_id)
   end
 
   state.initialized = true
@@ -544,6 +579,14 @@ function M.reset()
     state.save_debounce_timer:stop()
     state.save_debounce_timer:close()
     state.save_debounce_timer = nil
+  end
+
+  -- 清理自动命令
+  if state.autocmd_ids then
+    for _, autocmd_id in ipairs(state.autocmd_ids) do
+      pcall(vim.api.nvim_del_autocmd, autocmd_id)
+    end
+    state.autocmd_ids = {}
   end
 
   -- 重置子模块

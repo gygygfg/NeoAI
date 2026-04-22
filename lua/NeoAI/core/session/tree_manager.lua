@@ -55,19 +55,19 @@ function M.initialize(options)
   -- 初始化虚拟根节点
   M._ensure_virtual_root()
 
-  -- 尝试从 session_manager 获取 save_path（如果未提供）
-  if not state.config.save_path then
-    pcall(function()
-      local sm = require("NeoAI.core.session.session_manager")
-      if sm.is_initialized and sm.is_initialized() then
-        -- 通过内部状态获取 save_path
-        -- 由于没有公开 API，尝试从 session_manager 的配置中获取
-        local sm_config = debug.getregistry() and nil
-        -- 更可靠的方式：直接使用默认路径
-        state.config.save_path = vim.fn.stdpath("cache") .. "/neoai_sessions"
-      end
-    end)
+  -- 从配置中获取保存路径（支持 config.session.save_path 结构）
+  local save_path = state.config.save_path
+  if not save_path and state.config.session then
+    save_path = state.config.session.save_path
   end
+  
+  -- 如果未提供 save_path，使用默认值
+  if not save_path then
+    save_path = vim.fn.stdpath("cache") .. "/NeoAI"
+  end
+  
+  -- 确保 save_path 在配置中可用
+  state.config.save_path = save_path
 
   -- 加载保存的树数据
   if state.config.save_path then

@@ -782,25 +782,11 @@ function M._load_tree_data(session_id)
   -- 如果 history_tree 未初始化，使用默认配置初始化
   local config = state.config or {}
 
-  -- 确保有正确的保存路径，与 session_manager 保持一致
-  -- 优先从配置中获取，否则从 session_manager 获取，最后使用默认值
-  local save_path = config.save_path
-  if not save_path and config.session then
-    save_path = config.session.save_path
-  end
+  -- 从配置中获取保存路径
+  local save_path = config.session and config.session.save_path
   if not save_path then
-    -- 尝试从 session_manager 获取实际使用的路径
-    pcall(function()
-      local sm = require("NeoAI.core.session.session_manager")
-      if sm.is_initialized and sm.is_initialized() then
-        -- 通过内部状态获取 save_path（没有公开 API，直接访问 state）
-        -- 或者通过重新初始化获取
-      end
-    end)
-  end
-  if not save_path then
-    -- 使用与 default_config 默认值一致的路径
-    save_path = vim.fn.stdpath("cache") .. "/neoai_sessions"
+    -- 如果配置中没有保存路径，使用默认值
+    save_path = vim.fn.stdpath("cache") .. "/NeoAI"
   end
 
   history_tree.initialize({
