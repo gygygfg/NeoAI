@@ -107,8 +107,8 @@ local function create_float_window(options)
   vim.api.nvim_set_option_value("buftype", "nofile", { buf = buf })
   vim.api.nvim_set_option_value("swapfile", false, { buf = buf })
   vim.api.nvim_set_option_value("bufhidden", "hide", { buf = buf })
-  vim.api.nvim_set_option_value("modifiable", true, { buf = buf })
-  vim.api.nvim_set_option_value("readonly", false, { buf = buf })
+  vim.api.nvim_set_option_value("modifiable", false, { buf = buf })
+  vim.api.nvim_set_option_value("readonly", true, { buf = buf })
 
   -- 设置缓冲区名称（临时名称，后面会覆盖）
   vim.api.nvim_buf_set_name(buf, "neoai://float/temp")
@@ -135,8 +135,8 @@ local function create_tab_window(options)
   vim.api.nvim_set_option_value("buftype", "nofile", { buf = buf })
   vim.api.nvim_set_option_value("swapfile", false, { buf = buf })
   vim.api.nvim_set_option_value("bufhidden", "hide", { buf = buf })
-  vim.api.nvim_set_option_value("modifiable", true, { buf = buf })
-  vim.api.nvim_set_option_value("readonly", false, { buf = buf })
+  vim.api.nvim_set_option_value("modifiable", false, { buf = buf })
+  vim.api.nvim_set_option_value("readonly", true, { buf = buf })
 
   -- 设置缓冲区名称（临时名称，后面会覆盖）
   vim.api.nvim_buf_set_name(buf, "neoai://tab/temp")
@@ -185,8 +185,8 @@ local function create_split_window(options)
   vim.api.nvim_set_option_value("buftype", "nofile", { buf = buf })
   vim.api.nvim_set_option_value("swapfile", false, { buf = buf })
   vim.api.nvim_set_option_value("bufhidden", "hide", { buf = buf })
-  vim.api.nvim_set_option_value("modifiable", true, { buf = buf })
-  vim.api.nvim_set_option_value("readonly", false, { buf = buf })
+  vim.api.nvim_set_option_value("modifiable", false, { buf = buf })
+  vim.api.nvim_set_option_value("readonly", true, { buf = buf })
 
   -- 设置缓冲区名称（临时名称，后面会覆盖）
   vim.api.nvim_buf_set_name(buf, "neoai://split/temp")

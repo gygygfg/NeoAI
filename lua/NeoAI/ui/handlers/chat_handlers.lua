@@ -1,4 +1,5 @@
 local M = {}
+local session_helper = require("NeoAI.utils.session_helper")
 
 -- 模块状态
 local state = {
@@ -22,14 +23,11 @@ local function try_open_chat_window()
   end
 
   -- 获取当前会话ID
-  local session_id = "default"
-
-  -- 通过UI模块获取会话ID，避免直接调用核心模块
-  if ui and type(ui.get_current_session_id) == "function" then
-    local current_session_id = ui.get_current_session_id()
-    if current_session_id then
-      session_id = current_session_id
-    end
+  local session_id = session_helper.get_current_session_id() or "default"
+  
+  -- 如果没有会话ID，创建一个新会话
+  if session_id == "default" then
+    session_id = session_helper.create_session("聊天会话") or "default"
   end
 
   -- 打开聊天窗口
@@ -69,6 +67,9 @@ function M.initialize(config)
 
   state.config = config or {}
   state.initialized = true
+  
+  -- 初始化会话辅助模块
+  session_helper.initialize(config)
 
   -- 注意：聊天窗口已经在 ui/init.lua 中初始化，这里不需要重复初始化
   -- 避免重复的事件监听器注册和状态冲突
@@ -147,30 +148,16 @@ function M.initialize(config)
       if success then
         print("✓ AI响应已添加到聊天窗口 (ID: " .. tostring(generation_id) .. ")")
 
-        -- 保存会话历史
-        local history_manager_loaded, history_manager = pcall(require, "NeoAI.core.history_manager")
-        if history_manager_loaded and history_manager then
-          -- 获取当前会话
-          local current_session = history_manager.get_current_session()
-          if not current_session then
-            -- 创建新会话
-            local session_id = history_manager.create_session("聊天会话")
-            print("✓ 创建新会话: " .. session_id)
-          end
-          
-          -- 添加AI响应到历史记录
-          local message_added = history_manager.add_message("assistant", response_content, {
-            generation_id = generation_id,
-            timestamp = os.time(),
-          })
-          
-          if message_added then
-            print("✓ AI响应已保存到会话历史")
-          else
-            print("⚠️  无法保存AI响应到会话历史")
-          end
+        -- 保存AI响应到所有管理器
+        local success = session_helper.save_message_to_all("assistant", response_content, {
+          generation_id = generation_id,
+          timestamp = os.time(),
+        })
+        
+        if success then
+          print("✓ AI响应已保存到所有管理器")
         else
-          print("⚠️  无法加载历史管理器")
+          print("⚠️  保存AI响应失败")
         end
 
         -- 触发响应显示事件
@@ -393,31 +380,17 @@ function M.send_message(content, session_id, branch_id, window_id, format)
     return false, "发送消息失败: " .. tostring(result)
   end
 
-  -- 保存用户消息到历史记录
-  local history_manager_loaded, history_manager = pcall(require, "NeoAI.core.history_manager")
-  if history_manager_loaded and history_manager then
-    -- 获取当前会话
-    local current_session = history_manager.get_current_session()
-    if not current_session then
-      -- 创建新会话
-      local session_id = history_manager.create_session("聊天会话")
-      print("✓ 创建新会话: " .. session_id)
-    end
-    
-    -- 添加用户消息到历史记录
-    local message_added = history_manager.add_message("user", content, {
-      timestamp = os.time(),
-      window_id = window_id,
-      formatted = format_message,
-    })
-    
-    if message_added then
-      print("✓ 用户消息已保存到会话历史")
-    else
-      print("⚠️  无法保存用户消息到会话历史")
-    end
+  -- 使用会话辅助模块保存消息
+  local success = session_helper.save_message_to_all("user", content, {
+    timestamp = os.time(),
+    window_id = window_id,
+    formatted = format_message,
+  })
+  
+  if success then
+    print("✓ 用户消息已保存到所有管理器")
   else
-    print("⚠️  无法加载历史管理器")
+    print("⚠️  保存用户消息失败")
   end
 
   -- print("✓ 消息已发送: " .. content)

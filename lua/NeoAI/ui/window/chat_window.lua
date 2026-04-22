@@ -3,6 +3,7 @@ local MODULE_NAME = "NeoAI.ui.window.chat_window"
 
 local window_manager = require("NeoAI.ui.window.window_manager")
 local virtual_input = require("NeoAI.ui.components.virtual_input")
+local session_helper = require("NeoAI.utils.session_helper")
 
 -- 模块状态
 local state = {
@@ -27,6 +28,9 @@ function M.initialize(config)
 
   -- 初始化虚拟输入组件
   virtual_input.initialize(config)
+  
+  -- 初始化会话辅助模块
+  session_helper.initialize(config)
 
   -- 注册AI响应事件监听器
   M._setup_event_listeners()
@@ -586,9 +590,24 @@ end
 --- 加载消息数据（内部函数）
 --- @param session_id string 会话ID
 function M._load_messages(session_id)
-  -- 这里应该从会话管理器加载消息数据
-  -- 目前保持空数据
+  -- 清空当前消息
   state.messages = {}
+  
+  -- 优先从会话管理器加载消息
+  local session_messages = session_helper.load_messages_from_session(100)
+  if #session_messages > 0 then
+    state.messages = session_messages
+    print("✓ 从会话管理器加载了 " .. #session_messages .. " 条消息")
+  else
+    -- 如果会话管理器没有消息，从历史管理器加载
+    local history_messages = session_helper.load_messages_from_history(100)
+    if #history_messages > 0 then
+      state.messages = history_messages
+      print("✓ 从历史管理器加载了 " .. #history_messages .. " 条消息")
+    else
+      print("⚠️  没有找到历史消息")
+    end
+  end
 end
 
 --- 异步加载消息数据（内部函数）
@@ -855,38 +874,16 @@ end
 --- @param role string 角色 ('user' 或 'assistant')
 --- @param content string 消息内容
 function M._persist_message(role, content)
-  -- 保存到 session_manager 的 message_manager
-  local session_mgr_loaded, session_mgr = pcall(require, "NeoAI.core.session.session_manager")
-  if session_mgr_loaded and session_mgr and session_mgr.is_initialized and session_mgr.is_initialized() then
-    local current_session = session_mgr.get_current_session()
-    if current_session and current_session.current_branch then
-      local msg_mgr = session_mgr.get_message_manager()
-      if msg_mgr then
-        pcall(msg_mgr.add_message, msg_mgr, current_session.current_branch, role, content, {
-          timestamp = os.time(),
-          window_id = state.current_window_id,
-        })
-      end
-    end
-  end
-
-  -- 同步到 tree_manager，确保树视图能显示新消息
-  local tree_mgr_loaded, tree_mgr = pcall(require, "NeoAI.core.session.tree_manager")
-  if tree_mgr_loaded and tree_mgr and tree_mgr.is_initialized and tree_mgr.is_initialized() then
-    pcall(tree_mgr.sync_from_session_manager)
-  end
-
-  -- 保存到 history_manager
-  local history_mgr_loaded, history_mgr = pcall(require, "NeoAI.core.history_manager")
-  if history_mgr_loaded and history_mgr then
-    local current_session = history_mgr.get_current_session()
-    if not current_session then
-      pcall(history_mgr.create_session, "聊天会话")
-    end
-    pcall(history_mgr.add_message, role, content, {
-      timestamp = os.time(),
-      window_id = state.current_window_id,
-    })
+  -- 使用会话辅助模块保存消息
+  local success = session_helper.save_message_to_all(role, content, {
+    timestamp = os.time(),
+    window_id = state.current_window_id,
+  })
+  
+  if success then
+    print("✓ 消息已持久化到所有管理器")
+  else
+    print("⚠️  消息持久化失败")
   end
   
   -- 触发自动保存

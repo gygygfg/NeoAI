@@ -497,7 +497,12 @@ name = session_data.name or ("会话 " .. session_id_str),
           -- 恢复消息到 message_manager
           if data.messages then
             for _, msg in ipairs(data.messages) do
-              message_manager.add_message(msg.branch_id, msg.role, msg.content, msg.metadata)
+              message_manager.add_message(
+                msg.branch_id,
+                msg.role or "user",
+                msg.content or "",
+                type(msg.metadata) == "table" and msg.metadata or {}
+              )
             end
           end
           -- 清除 messages 字段避免冗余

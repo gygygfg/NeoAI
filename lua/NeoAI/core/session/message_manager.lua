@@ -58,8 +58,17 @@ function M.add_message(branch_id, role, content, metadata)
     error("Message manager not initialized")
   end
   if not branch_id then error("Branch ID is required") end
-  if not role or not (role == "user" or role == "assistant" or role == "tool") then
-    error("Role must be 'user', 'assistant', or 'tool'")
+  
+  -- 规范化角色值
+  local normalized_role = role
+  if not role then
+    normalized_role = "user"
+  elseif role == "user" or role == "assistant" or role == "tool" then
+    normalized_role = role
+  else
+    -- 如果角色无效，默认为 "user"
+    normalized_role = "user"
+    print("⚠️  警告: 无效的角色值 '" .. tostring(role) .. "'，已规范化为 'user'")
   end
 
   message_counter = message_counter + 1
@@ -69,7 +78,7 @@ function M.add_message(branch_id, role, content, metadata)
   local message = {
     id = message_id,
     branch_id = branch_id,
-    role = role,
+    role = normalized_role,
     content = content,
     metadata = metadata or {},
     created_at = created_at,
