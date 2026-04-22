@@ -564,6 +564,7 @@ function M._load_tree_data(session_id)
 
   -- 如果没有数据，使用模拟数据作为后备
   if #state.tree_data == 0 then
+    print("调试：树数据为空，加载后备数据", vim.log.levels.WARN)
     M._load_fallback_data()
   end
 
@@ -571,33 +572,81 @@ function M._load_tree_data(session_id)
   if #state.tree_data > 0 and state.tree_data[1].type == "virtual_root" then
     state.expanded_nodes[state.tree_data[1].id] = true
   end
+
+  -- 调试：打印最终加载的树数据
+  print("调试：最终树数据根节点数量: " .. #state.tree_data, vim.log.levels.INFO)
+  for i, node in ipairs(state.tree_data) do
+    print("调试：最终根节点 " .. i .. ": " .. (node.name or "未命名") .. " (类型: " .. (node.type or "未知") .. ")", vim.log.levels.INFO)
+    if node.children then
+      print("调试：  子节点数量: " .. #node.children, vim.log.levels.INFO)
+    end
+  end
 end
 
 --- 加载树状结构数据（内部使用）
 --- @param session_id string 会话ID
 function M._load_tree_structure(session_id)
+  print("调试：开始加载树状结构数据", vim.log.levels.INFO)
+  
   -- 尝试从树管理器加载数据
   local tree_manager_loaded, tree_manager = pcall(require, "NeoAI.core.session.tree_manager")
   if tree_manager_loaded and tree_manager then
+    print("调试：成功加载树管理器模块", vim.log.levels.INFO)
+    
     -- 确保树管理器已初始化
-    if not tree_manager.is_initialized or not tree_manager.is_initialized() then
+    if tree_manager.is_initialized and not tree_manager.is_initialized() then
+      print("调试：初始化树管理器", vim.log.levels.INFO)
       local config = state.config or {}
       tree_manager.initialize({
         event_bus = nil, -- 暂时不需要事件总线
         config = config,
       })
+    else
+      print("调试：树管理器已初始化", vim.log.levels.INFO)
     end
 
     -- 获取树状结构
+    print("调试：调用 tree_manager.get_tree()", vim.log.levels.INFO)
     local tree_structure = tree_manager.get_tree()
+    
     if tree_structure and #tree_structure > 0 then
-      -- 转换树管理器节点为历史树节点
-      state.tree_data = M._convert_tree_manager_nodes(tree_structure, session_id)
-      return
+      print("调试：从树管理器获取到树结构，节点数量: " .. #tree_structure, vim.log.levels.INFO)
+      
+      -- 检查虚拟根节点是否有实际子节点
+      local has_real_nodes = false
+      for _, node in ipairs(tree_structure) do
+        if node.type == "virtual_root" then
+          -- 检查虚拟根节点的子节点数量
+          if node.children and #node.children > 0 then
+            has_real_nodes = true
+            print("调试：虚拟根节点有 " .. #node.children .. " 个子节点", vim.log.levels.INFO)
+          else
+            print("调试：虚拟根节点没有子节点", vim.log.levels.INFO)
+          end
+        else
+          -- 如果有非虚拟根节点的节点，也视为有实际数据
+          has_real_nodes = true
+          print("调试：发现非虚拟根节点: " .. node.type, vim.log.levels.INFO)
+        end
+      end
+      
+      if has_real_nodes then
+        -- 转换树管理器节点为历史树节点
+        state.tree_data = M._convert_tree_manager_nodes(tree_structure, session_id)
+        print("调试：转换后的树数据根节点数量: " .. #state.tree_data, vim.log.levels.INFO)
+        return
+      else
+        print("调试：树管理器只有虚拟根节点，没有实际数据", vim.log.levels.WARN)
+      end
+    else
+      print("调试：树管理器返回空结构或nil", vim.log.levels.WARN)
     end
+  else
+    print("调试：无法加载树管理器模块: " .. tostring(tree_manager_loaded), vim.log.levels.WARN)
   end
 
   -- 如果树管理器没有数据，生成示例数据
+  print("调试：生成示例数据", vim.log.levels.INFO)
   M._load_example_data()
 end
 
@@ -606,18 +655,27 @@ end
 --- @param session_id string 会话ID
 --- @return table 历史树节点列表
 function M._convert_tree_manager_nodes(tree_nodes, session_id)
+  print("调试：开始转换树管理器节点，输入节点数量: " .. #tree_nodes, vim.log.levels.INFO)
+  
   local result = {}
 
-  for _, node in ipairs(tree_nodes) do
+  for i, node in ipairs(tree_nodes) do
+    print("调试：转换节点 " .. i .. ": " .. (node.id or "未知ID") .. " (类型: " .. (node.type or "未知") .. ")", vim.log.levels.INFO)
+    
     local converted_node = {
       id = node.id,
       name = node.name,
       type = node.type,
-      metadata = vim.deepcopy(node.metadata) or {},
+      metadata = {},
       children = {},
       raw_data = node,
     }
 
+    -- 复制元数据
+    if node.metadata then
+      converted_node.metadata = vim.deepcopy(node.metadata)
+    end
+    
     -- 设置元数据
     if not converted_node.metadata.created_at then
       converted_node.metadata.created_at = node.created_at or os.time()
@@ -628,34 +686,63 @@ function M._convert_tree_manager_nodes(tree_nodes, session_id)
 
     -- 递归转换子节点
     if node.children and #node.children > 0 then
+      print("调试：节点 " .. node.id .. " 有 " .. #node.children .. " 个子节点", vim.log.levels.INFO)
       converted_node.children = M._convert_tree_manager_nodes(node.children, session_id)
+    else
+      print("调试：节点 " .. node.id .. " 没有子节点", vim.log.levels.INFO)
     end
 
     table.insert(result, converted_node)
+    print("调试：已添加节点 " .. node.id .. " 到结果中", vim.log.levels.INFO)
 
     -- 默认展开虚拟根节点
     if converted_node.type == "virtual_root" then
+      print("调试：设置虚拟根节点展开状态: " .. converted_node.id, vim.log.levels.INFO)
       state.expanded_nodes[converted_node.id] = true
     end
   end
 
+  print("调试：节点转换完成，结果节点数量: " .. #result, vim.log.levels.INFO)
   return result
 end
 
 --- 加载示例数据（内部使用）
 function M._load_example_data()
+  print("调试：开始加载示例数据", vim.log.levels.INFO)
+  
   -- 尝试从树管理器生成示例树
   local tree_manager_loaded, tree_manager = pcall(require, "NeoAI.core.session.tree_manager")
   if tree_manager_loaded and tree_manager then
-    -- 生成示例树
-    local example_tree = tree_manager.generate_example_tree()
-    if example_tree and #example_tree > 0 then
-      state.tree_data = M._convert_tree_manager_nodes(example_tree, nil)
-      return
+    print("调试：成功加载树管理器用于示例数据", vim.log.levels.INFO)
+    
+    -- 确保树管理器已初始化
+    if tree_manager.is_initialized and not tree_manager.is_initialized() then
+      print("调试：初始化树管理器用于示例数据", vim.log.levels.INFO)
+      local config = state.config or {}
+      tree_manager.initialize({
+        event_bus = nil,
+        config = config,
+      })
     end
+    
+    -- 生成示例树
+    print("调试：调用 tree_manager.generate_example_tree()", vim.log.levels.INFO)
+    local example_tree = tree_manager.generate_example_tree()
+    
+    if example_tree and #example_tree > 0 then
+      print("调试：成功生成示例树，节点数量: " .. #example_tree, vim.log.levels.INFO)
+      state.tree_data = M._convert_tree_manager_nodes(example_tree, nil)
+      print("调试：示例数据转换完成，根节点数量: " .. #state.tree_data, vim.log.levels.INFO)
+      return
+    else
+      print("调试：无法生成示例树或返回空", vim.log.levels.WARN)
+    end
+  else
+    print("调试：无法加载树管理器用于示例数据", vim.log.levels.WARN)
   end
 
   -- 如果无法生成示例树，使用硬编码的示例数据
+  print("调试：使用硬编码的后备数据", vim.log.levels.INFO)
   M._load_fallback_data()
 end
 

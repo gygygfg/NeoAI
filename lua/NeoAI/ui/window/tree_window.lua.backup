@@ -395,7 +395,7 @@ function M.get_selected_node()
 
   -- 计算内容偏移量
   -- 树内容前面有5行：标题、提示、空行、虚拟根节点、空行
-  local content_offset = 5
+  local content_offset = 9
 
   -- 调整光标行号，减去内容偏移
   local adjusted_line = cursor_line - content_offset

@@ -154,6 +154,7 @@ end
 --- @param tree_data table 树数据
 function M.render_tree(tree_data)
   if not state.current_window_id then
+    print("调试：没有当前窗口ID", vim.log.levels.WARN)
     return
   end
 
@@ -194,14 +195,61 @@ function M.render_tree(tree_data)
     end
   end
 
+  -- 调试：打印树数据信息
+  print("调试：开始渲染树，节点总数: " .. total_nodes, vim.log.levels.INFO)
+  if tree_data and #tree_data > 0 then
+    print("调试：树数据根节点数量: " .. #tree_data, vim.log.levels.INFO)
+    for i, node in ipairs(tree_data) do
+      print(
+        "调试：根节点 "
+          .. i
+          .. ": "
+          .. (node.name or "未命名")
+          .. " (类型: "
+          .. (node.type or "未知")
+          .. ")",
+        vim.log.levels.INFO
+      )
+      if node.children then
+        print("调试：  子节点数量: " .. #node.children, vim.log.levels.INFO)
+      end
+    end
+  else
+    print("调试：树数据为空或无效", vim.log.levels.WARN)
+  end
+
   -- 使用 window_manager 的通用渲染函数，传递窗口宽度
   local content = window_manager.render_tree(tree_data, state, M._load_tree_data, window_width)
+
+  -- 调试：打印渲染后的内容
+  print("调试：渲染后的内容行数: " .. #content, vim.log.levels.INFO)
+  if #content > 0 then
+    for i = 1, math.min(10, #content) do
+      print("调试：内容行 " .. i .. ": " .. content[i], vim.log.levels.INFO)
+    end
+  end
 
   -- 设置窗口内容
   window_manager.set_window_content(state.current_window_id, content)
 
   -- 高亮选中节点
   M._highlight_selected_node()
+
+  -- 设置光标位置到选中的节点
+  if state.selected_node_id then
+    local win_handle = window_manager.get_window_win(state.current_window_id)
+    if win_handle and vim.api.nvim_win_is_valid(win_handle) then
+      -- 构建行号映射找到选中节点所在行
+      local line_to_node = M._build_line_to_node_map()
+      for line, node_id in pairs(line_to_node) do
+        if node_id == state.selected_node_id then
+          local cursor_line = line + 2 -- 内容偏移量（标题行+空行）
+          vim.api.nvim_win_set_cursor(win_handle, { cursor_line + 1, 0 }) -- 1-based
+          break
+        end
+      end
+    end
+  end
 
   -- 触发渲染完成事件
   vim.api.nvim_exec_autocmds(
@@ -457,18 +505,18 @@ function M.get_selected_node()
   local cursor_pos = vim.api.nvim_win_get_cursor(win_handle)
   local cursor_line = cursor_pos[1] - 1 -- 转换为0-based
 
-  -- 计算内容偏移量
-  -- 树内容前面有5行：标题、提示、空行、虚拟根节点、空行
-  local content_offset = 5
+  -- 构建行号到节点ID的映射
+  local line_to_node = M._build_line_to_node_map()
 
-  -- 调整光标行号，减去内容偏移
-  local adjusted_line = cursor_line - content_offset
-  if adjusted_line < 0 then
-    return nil -- 光标在标题、提示、空行、虚拟根节点或空行上
+  -- 遍历映射，查找光标所在行对应的节点ID
+  for line, node_id in pairs(line_to_node) do
+    -- 节点行号 + 内容偏移量(2) = 实际光标行号
+    if line + 2 == cursor_line then
+      return node_id
+    end
   end
 
-  -- 根据调整后的行号查找对应的节点ID
-  return M._get_node_id_at_line(adjusted_line)
+  return nil
 end
 
 --- 根据行号获取节点ID（内部使用）
@@ -480,38 +528,8 @@ function M._get_node_id_at_line(line_number)
     return nil
   end
 
-  -- 构建行号到节点ID的映射
-  local line_to_node = {}
-  local current_line = 0
-
-  local function traverse_node(node, depth)
-    -- 跳过虚拟根节点的显示（它只作为容器）
-    if node.type == "virtual_root" then
-      -- 虚拟根节点本身不显示，直接遍历其子节点
-      if state.expanded_nodes[node.id] and node.children then
-        for _, child in ipairs(node.children) do
-          traverse_node(child, depth)
-        end
-      end
-      return
-    end
-
-    -- 记录当前行的节点ID
-    line_to_node[current_line] = node.id
-    current_line = current_line + 1
-
-    -- 如果节点展开，遍历子节点
-    if state.expanded_nodes[node.id] and node.children then
-      for _, child in ipairs(node.children) do
-        traverse_node(child, depth + 1)
-      end
-    end
-  end
-
-  -- 遍历所有根节点
-  for _, root_node in ipairs(state.tree_data) do
-    traverse_node(root_node, 0)
-  end
+  -- 使用 _build_line_to_node_map 构建映射
+  local line_to_node = M._build_line_to_node_map()
 
   -- 返回对应行的节点ID
   return line_to_node[line_number]
@@ -765,11 +783,15 @@ end
 --- 加载树数据（内部使用）
 --- @param session_id string 会话ID
 function M._load_tree_data(session_id)
+  -- 调试：打印加载树数据的开始
+  print("调试：开始加载树数据，会话ID: " .. (session_id or "nil"), vim.log.levels.INFO)
+
   -- 使用 history_tree 组件加载实际的会话数据
   local history_tree = require("NeoAI.ui.components.history_tree")
 
   -- 确保 history_tree 已初始化
   if not history_tree then
+    print("调试：无法加载 history_tree 模块", vim.log.levels.ERROR)
     error("无法加载 history_tree 模块")
   end
 
@@ -792,14 +814,39 @@ function M._load_tree_data(session_id)
 
   -- 强制刷新历史树数据
   if history_tree.refresh then
+    print("调试：调用 history_tree.refresh", vim.log.levels.INFO)
     history_tree.refresh(session_id)
+  else
+    print("调试：history_tree.refresh 函数不存在", vim.log.levels.WARN)
   end
 
   -- 从 history_tree 获取树数据
+  print("调试：调用 history_tree.build_tree", vim.log.levels.INFO)
   state.tree_data = history_tree.build_tree(session_id)
+
+  -- 调试：打印获取的树数据信息
+  if state.tree_data then
+    print("调试：获取到树数据，根节点数量: " .. #state.tree_data, vim.log.levels.INFO)
+    for i, node in ipairs(state.tree_data) do
+      print(
+        "调试：根节点 "
+          .. i
+          .. ": "
+          .. (node.name or "未命名")
+          .. " (类型: "
+          .. (node.type or "未知")
+          .. ")",
+        vim.log.levels.INFO
+      )
+    end
+  else
+    print("调试：获取的树数据为 nil", vim.log.levels.WARN)
+    state.tree_data = {}
+  end
 
   -- 如果获取的数据为空，使用后备数据
   if not state.tree_data or #state.tree_data == 0 then
+    print("调试：树数据为空，使用后备数据", vim.log.levels.WARN)
     state.tree_data = {
       {
         id = "session_1",
@@ -841,6 +888,34 @@ function M._load_tree_data(session_id)
   -- 默认展开根节点
   for _, root_node in ipairs(state.tree_data) do
     state.expanded_nodes[root_node.id] = true
+
+    -- 如果是虚拟根节点，也默认展开其子节点
+    if root_node.type == "virtual_root" and root_node.children then
+      for _, child_node in ipairs(root_node.children) do
+        state.expanded_nodes[child_node.id] = true
+
+        -- 对于根分支节点，也默认展开其子节点
+        if child_node.type == "root_branch" and child_node.children then
+          for _, sub_child in ipairs(child_node.children) do
+            state.expanded_nodes[sub_child.id] = true
+
+            -- 对于子分支节点，也默认展开其子节点
+            if sub_child.type == "sub_branch" and sub_child.children then
+              for _, session_node in ipairs(sub_child.children) do
+                state.expanded_nodes[session_node.id] = true
+
+                -- 对于会话节点，也默认展开其子节点
+                if session_node.type == "session" and session_node.children then
+                  for _, round_node in ipairs(session_node.children) do
+                    state.expanded_nodes[round_node.id] = true
+                  end
+                end
+              end
+            end
+          end
+        end
+      end
+    end
   end
 
   -- 触发数据加载完成事件
@@ -853,6 +928,9 @@ function M._load_tree_data(session_id)
       total_messages = M._count_total_messages(state.tree_data),
     },
   })
+
+  -- 调试：打印加载完成信息
+  print("调试：树数据加载完成，总节点数: " .. #state.tree_data, vim.log.levels.INFO)
 end
 
 --- 计算总消息数（内部使用）
@@ -880,6 +958,43 @@ function M._count_total_messages(nodes)
   return count
 end
 
+--- 构建行号到节点ID的映射（内部使用）
+--- @return table 行号到节点ID的映射表
+function M._build_line_to_node_map()
+  local line_to_node = {}
+  local current_line = 0
+
+  local function traverse_node(node)
+    -- 跳过虚拟根节点的显示（它只作为容器）
+    if node.type == "virtual_root" then
+      if state.expanded_nodes[node.id] and node.children then
+        for _, child in ipairs(node.children) do
+          traverse_node(child)
+        end
+      end
+      return
+    end
+
+    -- 记录当前行的节点ID
+    line_to_node[current_line] = node.id
+    current_line = current_line + 1
+
+    -- 如果节点展开，遍历子节点
+    if state.expanded_nodes[node.id] and node.children then
+      for _, child in ipairs(node.children) do
+        traverse_node(child)
+      end
+    end
+  end
+
+  -- 遍历所有根节点
+  for _, root_node in ipairs(state.tree_data) do
+    traverse_node(root_node)
+  end
+
+  return line_to_node, current_line
+end
+
 --- 移动选择（内部使用）
 --- @param direction string 方向 ('up' 或 'down')
 function M._move_selection(direction)
@@ -889,9 +1004,52 @@ function M._move_selection(direction)
     data = { window_id = state.current_window_id, direction = direction },
   })
 
-  -- 实现选择移动逻辑
-  -- 目前是简化实现
-  vim.notify("移动选择: " .. direction, vim.log.levels.INFO)
+  -- 构建行号到节点ID的映射
+  local line_to_node, total_lines = M._build_line_to_node_map()
+
+  if total_lines == 0 then
+    return
+  end
+
+  -- 查找当前选中节点所在的行号
+  local current_line = nil
+  if state.selected_node_id then
+    for line, node_id in pairs(line_to_node) do
+      if node_id == state.selected_node_id then
+        current_line = line
+        break
+      end
+    end
+  end
+
+  -- 计算新的行号
+  local new_line
+  if current_line == nil then
+    -- 没有选中任何节点，默认选中第一个
+    new_line = 0
+  elseif direction == "up" then
+    new_line = current_line - 1
+    if new_line < 0 then
+      new_line = total_lines - 1 -- 循环到末尾
+    end
+  elseif direction == "down" then
+    new_line = current_line + 1
+    if new_line >= total_lines then
+      new_line = 0 -- 循环到开头
+    end
+  end
+
+  -- 更新选中的节点ID
+  state.selected_node_id = line_to_node[new_line]
+
+  -- 更新光标位置（加上内容偏移量3）
+  local win_handle = window_manager.get_window_win(state.current_window_id)
+  if win_handle and vim.api.nvim_win_is_valid(win_handle) then
+          local cursor_line = new_line + 2 -- 内容偏移量（标题行+空行）
+    vim.api.nvim_win_set_cursor(win_handle, { cursor_line + 1, 0 }) -- 1-based
+  end
+
+  -- 重新渲染树以更新高亮
   M.render_tree(state.tree_data)
 
   -- 触发选择移动完成事件
@@ -963,7 +1121,7 @@ function M._select_node()
       data = { window_id = state.current_window_id, node_id = selected_node_id },
     })
   else
-    vim.notify("未选中任何节点", vim.log.levels.WARN)
+    print("未选中任何节点", vim.log.levels.WARN)
   end
 end
 
@@ -988,12 +1146,12 @@ function M._new_child_branch()
     local success = tree_handlers.create_branch(state.selected_node_id, branch_name)
 
     if success then
-      vim.notify("子分支创建成功: " .. branch_name, vim.log.levels.INFO)
+      print("子分支创建成功: " .. branch_name, vim.log.levels.INFO)
 
       -- 刷新树视图
       M.refresh_tree()
     else
-      vim.notify("子分支创建失败", vim.log.levels.ERROR)
+      print("子分支创建失败", vim.log.levels.ERROR)
     end
 
     -- 触发新建子分支完成事件
@@ -1002,7 +1160,7 @@ function M._new_child_branch()
       data = { window_id = state.current_window_id, node_id = state.selected_node_id },
     })
   else
-    vim.notify("请先选择一个节点", vim.log.levels.WARN)
+    print("请先选择一个节点", vim.log.levels.WARN)
   end
 end
 
@@ -1022,12 +1180,12 @@ function M._new_root_branch()
   local success = tree_handlers.create_branch(nil, branch_name)
 
   if success then
-    vim.notify("根分支创建成功: " .. branch_name, vim.log.levels.INFO)
+    print("根分支创建成功: " .. branch_name, vim.log.levels.INFO)
 
     -- 刷新树视图
     M.refresh_tree()
   else
-    vim.notify("根分支创建失败", vim.log.levels.ERROR)
+    print("根分支创建失败", vim.log.levels.ERROR)
   end
 
   -- 触发新建根分支完成事件
@@ -1057,12 +1215,12 @@ function M._delete_node()
     local success, err = tree_handlers.delete_branch(state.selected_node_id)
 
     if success then
-      vim.notify("节点删除成功: " .. state.selected_node_id, vim.log.levels.INFO)
+      print("节点删除成功: " .. state.selected_node_id, vim.log.levels.INFO)
 
       -- 刷新树视图
       M.refresh_tree()
     else
-      vim.notify("节点删除失败: " .. (err or "未知错误"), vim.log.levels.ERROR)
+      print("节点删除失败: " .. (err or "未知错误"), vim.log.levels.ERROR)
     end
 
     -- 触发删除节点完成事件
@@ -1071,7 +1229,7 @@ function M._delete_node()
       data = { window_id = state.current_window_id, node_id = state.selected_node_id },
     })
   else
-    vim.notify("请先选择一个节点", vim.log.levels.WARN)
+    print("请先选择一个节点", vim.log.levels.WARN)
   end
 end
 
@@ -1101,12 +1259,12 @@ function M._delete_node_force()
     local success, err = tree_handlers.delete_branch(state.selected_node_id)
 
     if success then
-      vim.notify("节点强制删除成功: " .. state.selected_node_id, vim.log.levels.INFO)
+      print("节点强制删除成功: " .. state.selected_node_id, vim.log.levels.INFO)
 
       -- 刷新树视图
       M.refresh_tree()
     else
-      vim.notify("节点强制删除失败: " .. (err or "未知错误"), vim.log.levels.ERROR)
+      print("节点强制删除失败: " .. (err or "未知错误"), vim.log.levels.ERROR)
     end
 
     -- 触发强制删除节点完成事件
@@ -1115,7 +1273,7 @@ function M._delete_node_force()
       data = { window_id = state.current_window_id, node_id = state.selected_node_id },
     })
   else
-    vim.notify("请先选择一个节点", vim.log.levels.WARN)
+    print("请先选择一个节点", vim.log.levels.WARN)
   end
 end
 

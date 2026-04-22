@@ -316,6 +316,30 @@ function M._create_branch_fallback(parent_branch_id, branch_name)
       print("⚠️  无法加载历史管理器")
     end
 
+    -- 同时更新树管理器（如果可用）
+    local tree_manager_loaded, tree_manager = pcall(require, "NeoAI.core.session.tree_manager")
+    if tree_manager_loaded and tree_manager then
+      -- 确保树管理器已初始化
+      if not tree_manager.is_initialized or not tree_manager.is_initialized() then
+        tree_manager.initialize({
+          event_bus = state.event_bus,
+          config = state.config,
+        })
+      end
+      
+      if not parent_branch_id then
+        -- 创建根分支
+        local tree_node_id = tree_manager.create_root_branch(branch_name)
+        print("✓ 分支信息已同步到树管理器，节点ID: " .. tree_node_id)
+      else
+        -- 创建子分支
+        local tree_node_id = tree_manager.create_sub_branch(parent_branch_id, branch_name)
+        print("✓ 分支信息已同步到树管理器，节点ID: " .. tree_node_id)
+      end
+    else
+      print("⚠️  无法加载树管理器，分支信息不会在树中显示")
+    end
+
     -- 刷新树视图
     local tree_window = require("NeoAI.ui.window.tree_window")
     tree_window.refresh_tree()

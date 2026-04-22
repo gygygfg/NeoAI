@@ -877,12 +877,15 @@ end
 --- @param window_width number|nil 窗口宽度
 --- @return table 渲染后的内容
 function M.render_tree(tree_data, tree_state, load_data_func, window_width)
+  print("调试：[window_manager] 开始渲染树", vim.log.levels.INFO)
+  
   if tree_data then
     tree_state.tree_data = tree_data
   end
 
   -- 如果没有树数据，尝试加载
   if #tree_state.tree_data == 0 and load_data_func then
+    print("调试：[window_manager] 树数据为空，调用加载函数", vim.log.levels.INFO)
     -- 调用加载函数，传递 nil 作为 session_id 参数
     load_data_func(nil)
   end
@@ -891,29 +894,58 @@ function M.render_tree(tree_data, tree_state, load_data_func, window_width)
 
   -- 添加标题
   table.insert(content, "=== NeoAI 会话树 ===")
-  table.insert(content, "使用方向键导航，Enter 选择，n/N 新建分支，d/D 删除")
-  table.insert(content, "")
-
-  -- 添加虚拟根节点
-  table.insert(content, "NeoAI 会话")
   table.insert(content, "")
 
   -- 渲染树
   if #tree_state.tree_data == 0 then
+    print("调试：[window_manager] 树数据仍然为空", vim.log.levels.WARN)
     table.insert(content, "暂无会话")
     table.insert(content, "按 N 创建新会话")
   else
+    print("调试：[window_manager] 开始渲染树数据，根节点数量: " .. #tree_state.tree_data, vim.log.levels.INFO)
+    
+    -- 检查是否有虚拟根节点
+    local has_virtual_root = false
+    for i, root_node in ipairs(tree_state.tree_data) do
+      if root_node.type == "virtual_root" then
+        has_virtual_root = true
+        print("调试：[window_manager] 发现虚拟根节点: " .. root_node.name, vim.log.levels.INFO)
+        break
+      end
+    end
+    
     local root_count = #tree_state.tree_data
     for i, root_node in ipairs(tree_state.tree_data) do
+      print("调试：[window_manager] 渲染根节点 " .. i .. ": " .. root_node.name .. " (类型: " .. root_node.type .. ")", vim.log.levels.INFO)
       local is_last = (i == root_count)
-      M._render_tree_node(content, root_node, 0, is_last, "", tree_state, window_width)
+      
+      -- 如果是虚拟根节点，直接渲染其子节点
+      if root_node.type == "virtual_root" then
+        print("调试：[window_manager] 跳过虚拟根节点渲染，直接渲染子节点", vim.log.levels.INFO)
+        if root_node.children and #root_node.children > 0 then
+          local child_count = #root_node.children
+          for j, child in ipairs(root_node.children) do
+            local child_is_last = (j == child_count)
+            M._render_tree_node(content, child, 0, child_is_last, "", tree_state, window_width)
+          end
+        else
+          print("调试：[window_manager] 虚拟根节点没有子节点", vim.log.levels.WARN)
+          table.insert(content, "暂无会话")
+          table.insert(content, "按 N 创建新会话")
+        end
+      else
+        -- 正常渲染非虚拟根节点
+        M._render_tree_node(content, root_node, 0, is_last, "", tree_state, window_width)
+      end
     end
   end
 
-  -- 添加提示分隔线
+  -- 添加分隔线和按键提示
   table.insert(content, "")
   table.insert(content, "---")
+  table.insert(content, "使用方向键导航，Enter 选择，n/N 新建分支，d/D 删除")
 
+  print("调试：[window_manager] 渲染完成，内容行数: " .. #content, vim.log.levels.INFO)
   return content
 end
 
