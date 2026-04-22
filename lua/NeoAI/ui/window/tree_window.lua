@@ -693,45 +693,17 @@ function M._render_tree_node(content, node, depth, is_last, parent_prefix)
   -- 清理节点名称中的二进制数据和控制字符
   local cleaned_name = node.name
   if cleaned_name then
-    -- 检测是否包含乱码
-    local function detect_garbage(str)
-      if not str then
-        return false
-      end
-
-      -- 检测 <xx> 格式的十六进制字符
-      if str:match("%b<>"):match("^<[0-9a-fA-F][0-9a-fA-F]>$") then
-        return true
-      end
-
-      -- 检测控制字符
-      for i = 1, #str do
-        local byte = str:byte(i)
-        if byte < 32 and byte ~= 9 and byte ~= 10 and byte ~= 13 then
-          return true
-        end
-      end
-
-      return false
-    end
-
-    -- 检测是否需要清理
-    if detect_garbage(cleaned_name) then
-      -- 移除所有<xx>格式的标记
-      cleaned_name = cleaned_name:gsub("%b<>", " ")
-
-      -- 移除控制字符
-      cleaned_name = cleaned_name:gsub("[%c%z]", " ")
-
-      -- 合并多余的空格
-      cleaned_name = cleaned_name:gsub("%s+", " ")
-      cleaned_name = cleaned_name:gsub("^%s+", "")
-      cleaned_name = cleaned_name:gsub("%s+$", "")
-
-      -- 如果清理后为空，使用默认名称
-      if cleaned_name == "" then
-        cleaned_name = "未命名节点"
-      end
+    -- 清理节点名称中的乱码（UTF-8截断导致的 <xx> 格式）
+    -- 移除所有 <xx> 格式的十六进制标记（单个尖括号内容）
+    cleaned_name = cleaned_name:gsub("<[%x][%x]>", "")
+    -- 移除控制字符
+    cleaned_name = cleaned_name:gsub("[%c%z]", "")
+    -- 合并多余空格
+    cleaned_name = cleaned_name:gsub("%s+", " ")
+    cleaned_name = cleaned_name:gsub("^%s+", "")
+    cleaned_name = cleaned_name:gsub("%s+$", "")
+    if cleaned_name == "" then
+      cleaned_name = "未命名节点"
     end
   else
     cleaned_name = "未命名节点"
@@ -760,22 +732,34 @@ function M._render_tree_node(content, node, depth, is_last, parent_prefix)
   table.insert(content, line)
 
   -- 渲染子节点（如果展开）
+  -- 需求1: conversation_round 类型的节点不展开显示子消息，问答绑定在一行
+  -- 但如果有用户创建的子分支（node类型），仍然需要显示
   if state.expanded_nodes[node.id] and node.children then
-    local child_count = #node.children
-
-    -- 为子节点生成新的前缀
-    local child_parent_prefix = parent_prefix or ""
-    if depth > 0 then
-      if is_last then
-        child_parent_prefix = child_parent_prefix .. "    " -- 最后一 个子节点，父节点是空格
-      else
-        child_parent_prefix = child_parent_prefix .. "│   " -- 不是最 后一个子节点，父节点是竖线
+    -- 过滤子节点：跳过 message 类型的子节点（问答已在一行显示），但显示其他类型（如 node 子分支）
+    local visible_children = {}
+    for _, child in ipairs(node.children) do
+      if child.type ~= "message" then
+        table.insert(visible_children, child)
       end
     end
 
-    for i, child in ipairs(node.children) do
-      local child_is_last = (i == child_count)
-      M._render_tree_node(content, child, depth + 1, child_is_last, child_parent_prefix)
+    if #visible_children > 0 then
+      local child_count = #visible_children
+
+      -- 为子节点生成新的前缀
+      local child_parent_prefix = parent_prefix or ""
+      if depth > 0 then
+        if is_last then
+          child_parent_prefix = child_parent_prefix .. "    "
+        else
+          child_parent_prefix = child_parent_prefix .. "│   "
+        end
+      end
+
+      for i, child in ipairs(visible_children) do
+        local child_is_last = (i == child_count)
+        M._render_tree_node(content, child, depth + 1, child_is_last, child_parent_prefix)
+      end
     end
   end
 end
@@ -798,13 +782,25 @@ function M._load_tree_data(session_id)
   -- 如果 history_tree 未初始化，使用默认配置初始化
   local config = state.config or {}
 
-  -- 确保有正确的保存路径
+  -- 确保有正确的保存路径，与 session_manager 保持一致
+  -- 优先从配置中获取，否则从 session_manager 获取，最后使用默认值
   local save_path = config.save_path
   if not save_path and config.session then
     save_path = config.session.save_path
   end
   if not save_path then
-    save_path = os.getenv("HOME") .. "/.cache/nvim/NeoAI"
+    -- 尝试从 session_manager 获取实际使用的路径
+    pcall(function()
+      local sm = require("NeoAI.core.session.session_manager")
+      if sm.is_initialized and sm.is_initialized() then
+        -- 通过内部状态获取 save_path（没有公开 API，直接访问 state）
+        -- 或者通过重新初始化获取
+      end
+    end)
+  end
+  if not save_path then
+    -- 使用与 config_manager 默认值一致的路径
+    save_path = vim.fn.stdpath("cache") .. "/neoai_sessions"
   end
 
   history_tree.initialize({
@@ -844,79 +840,22 @@ function M._load_tree_data(session_id)
     state.tree_data = {}
   end
 
-  -- 如果获取的数据为空，使用后备数据
+  -- 如果获取的数据为空，保持空数据
   if not state.tree_data or #state.tree_data == 0 then
-    print("调试：树数据为空，使用后备数据", vim.log.levels.WARN)
-    state.tree_data = {
-      {
-        id = "session_1",
-        name = "示例会话",
-        type = "session",
-        metadata = {
-          message_count = 2,
-          created_at = os.time() - 3600,
-          last_updated = os.time() - 1800,
-        },
-        children = {
-          {
-            id = "msg_1_1",
-            name = "[user] 你好",
-            type = "message",
-            metadata = {
-              role = "user",
-              timestamp = os.time() - 3600,
-              full_content = "你好",
-            },
-            children = {},
-          },
-          {
-            id = "msg_1_2",
-            name = "[assistant] 你好！有什么可以帮助你的？",
-            type = "message",
-            metadata = {
-              role = "assistant",
-              timestamp = os.time() - 1800,
-              full_content = "你好！有什么可以帮助你的？",
-            },
-            children = {},
-          },
-        },
-      },
-    }
+    print("调试：树数据为空，无可用数据", vim.log.levels.WARN)
+    state.tree_data = {}
   end
 
-  -- 默认展开根节点
-  for _, root_node in ipairs(state.tree_data) do
-    state.expanded_nodes[root_node.id] = true
-
-    -- 如果是虚拟根节点，也默认展开其子节点
-    if root_node.type == "virtual_root" and root_node.children then
-      for _, child_node in ipairs(root_node.children) do
-        state.expanded_nodes[child_node.id] = true
-
-        -- 对于根分支节点，也默认展开其子节点
-        if child_node.type == "root_branch" and child_node.children then
-          for _, sub_child in ipairs(child_node.children) do
-            state.expanded_nodes[sub_child.id] = true
-
-            -- 对于子分支节点，也默认展开其子节点
-            if sub_child.type == "sub_branch" and sub_child.children then
-              for _, session_node in ipairs(sub_child.children) do
-                state.expanded_nodes[session_node.id] = true
-
-                -- 对于会话节点，也默认展开其子节点
-                if session_node.type == "session" and session_node.children then
-                  for _, round_node in ipairs(session_node.children) do
-                    state.expanded_nodes[round_node.id] = true
-                  end
-                end
-              end
-            end
-          end
-        end
+  -- 递归展开所有节点
+  local function expand_all_nodes(nodes)
+    for _, node in ipairs(nodes) do
+      state.expanded_nodes[node.id] = true
+      if node.children and #node.children > 0 then
+        expand_all_nodes(node.children)
       end
     end
   end
+  expand_all_nodes(state.tree_data)
 
   -- 触发数据加载完成事件
   vim.api.nvim_exec_autocmds("User", {
@@ -1125,81 +1064,123 @@ function M._select_node()
   end
 end
 
---- 新建子分支（内部使用）
+--- 新建子节点（n键）：在会话下新建对话轮次，或在根下新建会话
 function M._new_child_branch()
-  if state.selected_node_id then
-    -- 自动生成分支名称
-    local branch_name = M._generate_branch_name(state.selected_node_id)
+  local target_node_id = state.selected_node_id
+  
+  -- 如果没有选中节点，在虚拟根节点下创建（相当于创建新会话）
+  if not target_node_id then
+    -- 查找虚拟根节点ID
+    for _, root_node in ipairs(state.tree_data) do
+      if root_node.type == "virtual_root" then
+        target_node_id = root_node.id
+        break
+      end
+    end
+  end
+  
+  if not target_node_id then
+    print("无法找到目标节点", vim.log.levels.WARN)
+    return
+  end
 
-    -- 触发新建子分支事件
-    vim.api.nvim_exec_autocmds("User", {
-      pattern = "NeoAI:tree_node_new_child_creating",
-      data = { window_id = state.current_window_id, node_id = state.selected_node_id },
-    })
+  -- 触发新建子节点事件
+  vim.api.nvim_exec_autocmds("User", {
+    pattern = "NeoAI:tree_node_new_child_creating",
+    data = { window_id = state.current_window_id, node_id = target_node_id },
+  })
 
-    -- 获取树处理器并创建分支
+  -- 判断目标节点类型
+  local target_name = M._get_node_name_by_id(target_node_id) or ""
+  
+  if target_node_id == "virtual_root" or target_name == "所有会话" then
+    -- 在根下创建新会话
+    local session_mgr_loaded, session_mgr = pcall(require, "NeoAI.core.session.session_manager")
+    if session_mgr_loaded and session_mgr and session_mgr.is_initialized and session_mgr.is_initialized() then
+      local session_id = session_mgr.create_session("新会话")
+      if session_id then
+        print("新会话创建成功: " .. session_id, vim.log.levels.INFO)
+      else
+        print("新会话创建失败", vim.log.levels.ERROR)
+      end
+    else
+      print("会话管理器未初始化", vim.log.levels.ERROR)
+    end
+  elseif target_node_id:match("^session_") then
+    -- 需求3: 在会话下直接创建子分支（节点），而不是提示去聊天窗口
+    local branch_name = M._generate_branch_name(target_node_id)
     local tree_handlers = require("NeoAI.ui.handlers.tree_handlers")
-
-    -- 调试：打印选中的节点ID
-    print("调试：尝试创建子分支，选中节点ID: " .. (state.selected_node_id or "nil"))
-
-    local success = tree_handlers.create_branch(state.selected_node_id, branch_name)
-
+    local success = tree_handlers.create_branch(target_node_id, branch_name)
     if success then
       print("子分支创建成功: " .. branch_name, vim.log.levels.INFO)
-
-      -- 刷新树视图
-      M.refresh_tree()
     else
       print("子分支创建失败", vim.log.levels.ERROR)
     end
-
-    -- 触发新建子分支完成事件
-    vim.api.nvim_exec_autocmds("User", {
-      pattern = "NeoAI:tree_node_new_child_created",
-      data = { window_id = state.current_window_id, node_id = state.selected_node_id },
-    })
   else
-    print("请先选择一个节点", vim.log.levels.WARN)
+    -- 其他节点：使用 tree_handlers.create_branch 创建子分支
+    local branch_name = M._generate_branch_name(target_node_id)
+    local tree_handlers = require("NeoAI.ui.handlers.tree_handlers")
+    local success = tree_handlers.create_branch(target_node_id, branch_name)
+    if success then
+      print("子分支创建成功: " .. branch_name, vim.log.levels.INFO)
+    else
+      print("子分支创建失败", vim.log.levels.ERROR)
+    end
   end
+
+  -- 刷新树视图
+  M.refresh_tree()
+
+  -- 触发新建子节点完成事件
+  vim.api.nvim_exec_autocmds("User", {
+    pattern = "NeoAI:tree_node_new_child_created",
+    data = { window_id = state.current_window_id, node_id = target_node_id },
+  })
 end
 
---- 新建根分支（内部使用）
+--- 新建根节点/会话（N键）：创建新会话
 function M._new_root_branch()
-  -- 自动生成根分支名称
-  local branch_name = M._generate_root_branch_name()
-
-  -- 触发新建根分支事件
+  -- 触发新建根节点事件
   vim.api.nvim_exec_autocmds(
     "User",
     { pattern = "NeoAI:tree_node_new_root_creating", data = { window_id = state.current_window_id } }
   )
 
-  -- 获取树处理器并创建分支
-  local tree_handlers = require("NeoAI.ui.handlers.tree_handlers")
-  local success = tree_handlers.create_branch(nil, branch_name)
-
-  if success then
-    print("根分支创建成功: " .. branch_name, vim.log.levels.INFO)
-
-    -- 刷新树视图
-    M.refresh_tree()
+  -- 创建新会话
+  local session_mgr_loaded, session_mgr = pcall(require, "NeoAI.core.session.session_manager")
+  if session_mgr_loaded and session_mgr and session_mgr.is_initialized and session_mgr.is_initialized() then
+    local session_id = session_mgr.create_session("新会话")
+    if session_id then
+      print("新会话创建成功: " .. session_id, vim.log.levels.INFO)
+    else
+      print("新会话创建失败", vim.log.levels.ERROR)
+    end
   else
-    print("根分支创建失败", vim.log.levels.ERROR)
+    print("会话管理器未初始化", vim.log.levels.ERROR)
   end
 
-  -- 触发新建根分支完成事件
+  -- 刷新树视图
+  M.refresh_tree()
+
+  -- 触发新建根节点完成事件
   vim.api.nvim_exec_autocmds(
     "User",
     { pattern = "NeoAI:tree_node_new_root_created", data = { window_id = state.current_window_id } }
   )
 end
 
---- 删除节点（内部使用）
+--- 删除对话（d键）：删除轮次或消息节点
 function M._delete_node()
   if state.selected_node_id then
+    local node_id = state.selected_node_id
+    -- 只允许删除 round_ 和 msg_ 开头的节点（对话轮次和消息）
+    if not node_id:match("^round_") and not node_id:match("^msg_") then
+      print("d 键仅用于删除对话轮次或消息，请使用 D 删除会话/分支", vim.log.levels.WARN)
+      return
+    end
+
     -- 显示确认对话框
-    local confirm = vim.fn.confirm("确定要删除节点 '" .. state.selected_node_id .. "' 吗？", "&Yes\n&No", 2)
+    local confirm = vim.fn.confirm("确定要删除此对话吗？", "&Yes\n&No", 2)
     if confirm ~= 1 then
       return
     end
@@ -1207,40 +1188,44 @@ function M._delete_node()
     -- 触发删除节点事件
     vim.api.nvim_exec_autocmds("User", {
       pattern = "NeoAI:tree_node_deleting",
-      data = { window_id = state.current_window_id, node_id = state.selected_node_id },
+      data = { window_id = state.current_window_id, node_id = node_id },
     })
 
-    -- 获取树处理器并删除分支
-    local tree_handlers = require("NeoAI.ui.handlers.tree_handlers")
-    local success, err = tree_handlers.delete_branch(state.selected_node_id)
-
-    if success then
-      print("节点删除成功: " .. state.selected_node_id, vim.log.levels.INFO)
-
-      -- 刷新树视图
-      M.refresh_tree()
+    -- 从 tree_manager 删除节点
+    local tree_mgr_loaded, tree_mgr = pcall(require, "NeoAI.core.session.tree_manager")
+    if tree_mgr_loaded and tree_mgr and tree_mgr.is_initialized and tree_mgr.is_initialized() then
+      pcall(tree_mgr.delete_node, node_id)
+      print("对话删除成功", vim.log.levels.INFO)
     else
-      print("节点删除失败: " .. (err or "未知错误"), vim.log.levels.ERROR)
+      print("对话删除失败: 树管理器未初始化", vim.log.levels.ERROR)
     end
+
+    -- 刷新树视图
+    M.refresh_tree()
 
     -- 触发删除节点完成事件
     vim.api.nvim_exec_autocmds("User", {
       pattern = "NeoAI:tree_node_deleted",
-      data = { window_id = state.current_window_id, node_id = state.selected_node_id },
+      data = { window_id = state.current_window_id, node_id = node_id },
     })
   else
     print("请先选择一个节点", vim.log.levels.WARN)
   end
 end
 
---- 强制删除节点（内部使用）
+--- 删除分支/会话（D键）：删除会话或分支节点（包含所有子对话）
 function M._delete_node_force()
   if state.selected_node_id then
-    -- 显示确认对话框（更强烈的警告）
+    local node_id = state.selected_node_id
+    -- 需求2: 允许删除 session_、root_、node_ 开头的节点（会话和分支）
+    if not node_id:match("^session_") and not node_id:match("^root_") and not node_id:match("^node_") then
+      print("D 键仅用于删除会话或分支，请使用 d 删除对话轮次", vim.log.levels.WARN)
+      return
+    end
+
+    -- 显示确认对话框
     local confirm = vim.fn.confirm(
-      "⚠️  警告：确定要强制删除节点 '"
-        .. state.selected_node_id
-        .. "' 吗？\n这将删除所有子节点！",
+      "确定要删除 '" .. (M._get_node_name_by_id(node_id) or node_id) .. "' 吗？\n这将删除所有子对话！",
       "&Yes\n&No",
       2
     )
@@ -1251,26 +1236,26 @@ function M._delete_node_force()
     -- 触发强制删除节点事件
     vim.api.nvim_exec_autocmds("User", {
       pattern = "NeoAI:tree_node_force_deleting",
-      data = { window_id = state.current_window_id, node_id = state.selected_node_id },
+      data = { window_id = state.current_window_id, node_id = node_id },
     })
 
-    -- 获取树处理器并删除分支
+    -- 调用 tree_handlers.delete_branch 处理删除
     local tree_handlers = require("NeoAI.ui.handlers.tree_handlers")
-    local success, err = tree_handlers.delete_branch(state.selected_node_id)
+    local success, err = tree_handlers.delete_branch(node_id)
 
     if success then
-      print("节点强制删除成功: " .. state.selected_node_id, vim.log.levels.INFO)
-
-      -- 刷新树视图
-      M.refresh_tree()
+      print("删除成功: " .. node_id, vim.log.levels.INFO)
     else
-      print("节点强制删除失败: " .. (err or "未知错误"), vim.log.levels.ERROR)
+      print("删除失败: " .. (err or "未知错误"), vim.log.levels.ERROR)
     end
+
+    -- 刷新树视图
+    M.refresh_tree()
 
     -- 触发强制删除节点完成事件
     vim.api.nvim_exec_autocmds("User", {
       pattern = "NeoAI:tree_node_force_deleted",
-      data = { window_id = state.current_window_id, node_id = state.selected_node_id },
+      data = { window_id = state.current_window_id, node_id = node_id },
     })
   else
     print("请先选择一个节点", vim.log.levels.WARN)
@@ -1440,6 +1425,12 @@ function M.refresh()
   return true
 end
 
+--- 获取当前树数据
+--- @return table 树数据
+function M.get_tree_data()
+  return state.tree_data
+end
+
 --- 检查树窗口是否已打开
 --- @return boolean 是否已打开
 function M.is_open()
@@ -1483,108 +1474,123 @@ function M.select_node(node_id)
   return true
 end
 
+--- 获取节点在树中的路径编号（内部使用）
+--- 例如：根节点下第2个子节点的第3个子节点 -> "2-3"
+--- @param node_id string 节点ID
+--- @param tree_data table 树数据
+--- @return string 路径编号字符串
+function M._get_node_path_number(node_id, tree_data)
+  if not node_id or not tree_data then
+    return ""
+  end
+
+  -- 从目标节点向上查找父节点，并记录每层在兄弟节点中的序号
+  local path_parts = {}
+  local current_id = node_id
+
+  while current_id do
+    local parent_node = nil
+    local sibling_index = nil
+
+    -- 在树中查找当前节点的父节点及其在兄弟中的序号
+    local function find_parent_and_index(nodes, target_id)
+      for _, node in ipairs(nodes) do
+        if node.children then
+          for idx, child in ipairs(node.children) do
+            if child.id == target_id then
+              parent_node = node
+              sibling_index = idx
+              return true
+            end
+          end
+          -- 递归查找
+          if find_parent_and_index(node.children, target_id) then
+            return true
+          end
+        end
+      end
+      return false
+    end
+
+    if not find_parent_and_index(tree_data, current_id) then
+      break
+    end
+
+    if sibling_index then
+      table.insert(path_parts, 1, tostring(sibling_index))
+    end
+
+    -- 如果父节点是虚拟根节点，停止向上查找
+    if not parent_node or parent_node.type == "virtual_root" or parent_node.id == "virtual_root" then
+      break
+    end
+
+    current_id = parent_node.id
+  end
+
+  if #path_parts == 0 then
+    return ""
+  end
+
+  return table.concat(path_parts, "-")
+end
+
 --- 生成子分支名称
 --- @param parent_node_id string 父节点ID
 --- @return string 分支名称
 function M._generate_branch_name(parent_node_id)
-  -- 首先尝试使用树管理器
-  local tree_manager_loaded, tree_manager = pcall(require, "NeoAI.core.session.tree_manager")
-  if tree_manager_loaded and tree_manager then
-    -- 确保树管理器已初始化
-    if not tree_manager.is_initialized or not tree_manager.is_initialized() then
-      tree_manager.initialize({
-        event_bus = nil,
-        config = state.config,
-      })
-    end
-
-    -- 获取父节点信息
-    local parent_node = tree_manager.get_node(parent_node_id)
-    if parent_node then
-      -- 根据父节点类型生成分支名称
-      if parent_node.type == "root_branch" then
-        -- 根分支的子分支：子分支-编号
-        local child_count = parent_node.metadata.sub_branch_count or 0
-        return "子分支-" .. (child_count + 1)
-      elseif parent_node.type == "sub_branch" then
-        -- 子分支的子分支：子分支-编号
-        local child_count = parent_node.metadata.sub_branch_count or 0
-        return "子分支-" .. (child_count + 1)
-      elseif parent_node.type == "session" then
-        -- 会话节点不能创建子分支，但这里作为后备
-        return "会话分支-1"
-      end
-    end
-  end
-
-  -- 回退到旧的分支管理器
-  local branch_manager = require("NeoAI.core.session.branch_manager")
-
-  -- 获取父分支的子分支数量
+  -- 计算父节点已有的子节点数量
   local child_count = 0
-  if parent_node_id then
-    -- 获取父分支信息
-    local parent_branch = branch_manager.get_branch(parent_node_id)
-    if parent_branch and parent_branch.children then
-      child_count = #parent_branch.children
+  if state.tree_data then
+    local function count_children(nodes, target_id)
+      for _, node in ipairs(nodes) do
+        if node.id == target_id then
+          if node.children then
+            return #node.children
+          end
+          return 0
+        end
+        if node.children then
+          local result = count_children(node.children, target_id)
+          if result ~= nil then
+            return result
+          end
+        end
+      end
+      return nil
     end
+    child_count = count_children(state.tree_data, parent_node_id) or 0
   end
 
-  -- 生成分支名称：父分支名称 + 子分支编号
-  local parent_name = M._get_node_name_by_id(parent_node_id) or "分支"
-  local branch_number = child_count + 1
-
-  return parent_name .. "-" .. branch_number
+  -- 获取父节点的路径编号
+  local parent_path = M._get_node_path_number(parent_node_id, state.tree_data)
+  
+  -- 生成子节点名称：如果父节点有路径编号，则使用 父路径-子序号
+  local child_num = child_count + 1
+  if parent_path and parent_path ~= "" then
+    return "节点-" .. parent_path .. "-" .. child_num
+  else
+    return "节点-" .. child_num
+  end
 end
 
 --- 生成根分支名称
 --- @return string 根分支名称
 function M._generate_root_branch_name()
-  -- 首先尝试使用树管理器
-  local tree_manager_loaded, tree_manager = pcall(require, "NeoAI.core.session.tree_manager")
-  if tree_manager_loaded and tree_manager then
-    -- 确保树管理器已初始化
-    if not tree_manager.is_initialized or not tree_manager.is_initialized() then
-      tree_manager.initialize({
-        event_bus = nil,
-        config = state.config,
-      })
-    end
-
-    -- 获取所有根分支
-    local tree_structure = tree_manager.get_tree()
-    local root_count = 0
-
-    if tree_structure then
-      for _, node in ipairs(tree_structure) do
-        if node.type == "root_branch" then
-          root_count = root_count + 1
-        end
-      end
-    end
-
-    -- 生成根分支名称：根分支-编号
-    return "根分支-" .. (root_count + 1)
-  end
-
-  -- 回退到旧的分支管理器
-  local branch_manager = require("NeoAI.core.session.branch_manager")
-
-  -- 获取所有根分支数量
+  -- 计算虚拟根节点下已有的子节点数量
   local root_count = 0
-  local all_branches = branch_manager.list_branches()
-  if all_branches then
-    for _, branch in ipairs(all_branches) do
-      if not branch.parent_id then
+  if state.tree_data then
+    for _, node in ipairs(state.tree_data) do
+      if node.type == "virtual_root" and node.children then
+        root_count = #node.children
+      elseif node.type ~= "virtual_root" then
         root_count = root_count + 1
       end
     end
   end
 
-  -- 生成根分支名称：根分支 + 编号
-  local branch_number = root_count + 1
-
-  return "根分支-" .. branch_number
+  -- 生成根节点名称：根节点-编号
+  return "根节点-" .. (root_count + 1)
 end
 
 --- 测试树窗口创建

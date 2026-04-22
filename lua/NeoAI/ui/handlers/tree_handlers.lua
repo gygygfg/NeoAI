@@ -177,7 +177,7 @@ function M.handle_D()
 end
 
 --- 删除分支
---- @param branch_id string 分支ID
+--- @param branch_id string 节点ID（可能是分支ID或会话ID）
 --- @return boolean 是否删除成功
 --- @return string|nil 错误信息
 function M.delete_branch(branch_id)
@@ -189,10 +189,46 @@ function M.delete_branch(branch_id)
     return false, "分支ID不能为空"
   end
 
-  -- 获取分支管理器
-  local branch_manager = require("NeoAI.core.session.branch_manager")
+  -- 判断节点类型：如果是 session_ 开头的节点，从 session_manager 删除
+  if branch_id:match("^session_") then
+    -- 从 session_manager 删除会话
+    local session_mgr_loaded, session_mgr = pcall(require, "NeoAI.core.session.session_manager")
+    if session_mgr_loaded and session_mgr and session_mgr.is_initialized and session_mgr.is_initialized() then
+      local success, err = pcall(session_mgr.delete_session, branch_id)
+      if success then
+        -- 同时从 tree_manager 删除节点
+        local tree_mgr_loaded, tree_mgr = pcall(require, "NeoAI.core.session.tree_manager")
+        if tree_mgr_loaded and tree_mgr and tree_mgr.is_initialized and tree_mgr.is_initialized() then
+          pcall(tree_mgr.delete_node, branch_id)
+        end
+        -- 刷新树视图
+        local tree_window = require("NeoAI.ui.window.tree_window")
+        tree_window.refresh_tree()
+        return true
+      else
+        return false, err or "删除会话失败"
+      end
+    else
+      return false, "会话管理器未初始化"
+    end
+  end
 
-  -- 尝试删除分支
+  -- 判断节点类型：如果是 round_ 开头的节点，从 tree_manager 删除
+  if branch_id:match("^round_") or branch_id:match("^msg_") then
+    local tree_mgr_loaded, tree_mgr = pcall(require, "NeoAI.core.session.tree_manager")
+    if tree_mgr_loaded and tree_mgr and tree_mgr.is_initialized and tree_mgr.is_initialized() then
+      pcall(tree_mgr.delete_node, branch_id)
+      -- 刷新树视图
+      local tree_window = require("NeoAI.ui.window.tree_window")
+      tree_window.refresh_tree()
+      return true
+    else
+      return false, "树管理器未初始化"
+    end
+  end
+
+  -- 其他节点：尝试从分支管理器删除
+  local branch_manager = require("NeoAI.core.session.branch_manager")
   local success, err = pcall(branch_manager.delete_branch, branch_id)
 
   if success then
@@ -237,26 +273,44 @@ function M.create_branch(parent_branch_id, branch_name)
       node_id = tree_manager.create_root_branch(branch_name)
       print("✓ 树管理器创建根分支成功，节点ID: " .. node_id)
     else
-      -- 检查父节点类型
+      -- 检查父节点是否在 tree_manager 中存在
       local parent_node = tree_manager.get_node(parent_branch_id)
-      if parent_node then
-        if parent_node.type == "root_branch" or parent_node.type == "sub_branch" then
-          -- 创建子分支
-          node_id = tree_manager.create_sub_branch(parent_branch_id, branch_name)
-          print("✓ 树管理器创建子分支成功，节点ID: " .. node_id)
-        elseif parent_node.type == "session" then
-          -- 会话节点不能创建子分支
-          vim.notify("错误：会话节点不能创建子分支", vim.log.levels.ERROR)
-          return false
+      if not parent_node then
+        -- 如果父节点是 session_ 开头的，先同步到 tree_manager
+        if parent_branch_id:match("^session_") then
+          print("⚠️  会话节点 " .. parent_branch_id .. " 不在 tree_manager 中，尝试同步", vim.log.levels.WARN)
+          -- 在 tree_manager 中创建对应的会话节点
+          local session_mgr_loaded, session_mgr = pcall(require, "NeoAI.core.session.session_manager")
+          if session_mgr_loaded and session_mgr and session_mgr.is_initialized and session_mgr.is_initialized() then
+            local session_data = session_mgr.get_session(parent_branch_id)
+            if session_data then
+              -- 在 tree_manager 中创建会话节点
+              local new_session_id = tree_manager.create_root_branch(session_data.name or "会话")
+              print("✓ 在 tree_manager 中创建会话节点: " .. new_session_id, vim.log.levels.INFO)
+              -- 使用新创建的节点ID作为父节点
+              parent_branch_id = new_session_id
+            else
+              vim.notify("无法找到会话: " .. parent_branch_id, vim.log.levels.ERROR)
+              return false
+            end
+          else
+            vim.notify("会话管理器未初始化", vim.log.levels.ERROR)
+            return false
+          end
         else
-          vim.notify("错误：未知的父节点类型: " .. parent_node.type, vim.log.levels.ERROR)
-          return false
+          -- 其他类型的父节点，尝试从 history_tree 的树数据中重建
+          print("⚠️  父节点 " .. parent_branch_id .. " 不在 tree_manager 中，尝试重建", vim.log.levels.WARN)
+          local success = M._rebuild_parent_in_tree_manager(parent_branch_id, tree_manager)
+          if not success then
+            vim.notify("无法找到父节点: " .. parent_branch_id, vim.log.levels.ERROR)
+            return false
+          end
         end
-      else
-        -- 父节点不存在，尝试使用旧的分支管理器
-        print("⚠️  父节点不存在，回退到旧的分支管理器")
-        return M._create_branch_fallback(parent_branch_id, branch_name)
       end
+      
+      -- 任何节点下都可以创建子节点
+      node_id = tree_manager.create_sub_branch(parent_branch_id, branch_name)
+      print("✓ 树管理器创建子节点成功，节点ID: " .. node_id)
     end
 
     if node_id then
@@ -642,6 +696,112 @@ function M.get_keymaps()
     ["?"] = "帮助",
     ["q"] = "退出",
   }
+end
+
+--- 在 tree_manager 中重建父节点路径（内部使用）
+--- 当 tree_manager 中找不到父节点时，从 history_tree 的树数据中查找并重建
+--- @param node_id string 节点ID
+--- @param tree_manager table 树管理器实例
+--- @return boolean 是否重建成功
+function M._rebuild_parent_in_tree_manager(node_id, tree_manager)
+  -- 从 tree_window 获取当前树数据
+  local tree_window = require("NeoAI.ui.window.tree_window")
+  local tree_data = tree_window.get_tree_data and tree_window.get_tree_data()
+  
+  if not tree_data then
+    -- 尝试从 history_tree 获取
+    local history_tree_loaded, history_tree = pcall(require, "NeoAI.ui.components.history_tree")
+    if history_tree_loaded and history_tree then
+      tree_data = history_tree.get_tree_data()
+    end
+  end
+  
+  if not tree_data or #tree_data == 0 then
+    print("⚠️  无法获取树数据用于重建父节点", vim.log.levels.WARN)
+    return false
+  end
+  
+  -- 在树数据中查找节点及其祖先路径
+  local function find_node_path(nodes, target_id, path)
+    for _, node in ipairs(nodes) do
+      if node.id == target_id then
+        table.insert(path, node)
+        return true, path
+      end
+      if node.children and #node.children > 0 then
+        local found, result_path = find_node_path(node.children, target_id, path)
+        if found then
+          table.insert(result_path, node)
+          return true, result_path
+        end
+      end
+    end
+    return false, path
+  end
+  
+  local path = {}
+  local found = find_node_path(tree_data, node_id, path)
+  
+  if not found or #path == 0 then
+    print("⚠️  在树数据中找不到节点: " .. node_id, vim.log.levels.WARN)
+    return false
+  end
+  
+  -- 从根到目标节点重建路径（path 是从目标到根，需要反转）
+  -- path[1] = 目标节点, path[#path] = 根节点
+  -- 我们需要从根开始重建
+  local function reverse_table(t)
+    local reversed = {}
+    for i = #t, 1, -1 do
+      table.insert(reversed, t[i])
+    end
+    return reversed
+  end
+  
+  local reversed_path = reverse_table(path)
+  
+  -- 确保虚拟根节点存在
+  tree_manager._ensure_virtual_root()
+  
+  -- 遍历路径，确保每个节点都在 tree_manager 中
+  local parent_id = "virtual_root"
+  for _, path_node in ipairs(reversed_path) do
+    -- 跳过虚拟根节点
+    if path_node.type == "virtual_root" then
+      parent_id = "virtual_root"
+    else
+      -- 检查节点是否已在 tree_manager 中
+      local existing = tree_manager.get_node(path_node.id)
+      if not existing then
+        -- 节点不存在，需要创建
+        if parent_id == "virtual_root" then
+          -- 创建根分支
+          local new_id = tree_manager.create_root_branch(path_node.name)
+          print("✓ 重建根节点: " .. path_node.name .. " (ID: " .. new_id .. ")", vim.log.levels.INFO)
+          parent_id = new_id
+        else
+          -- 创建子分支
+          local new_id = tree_manager.create_sub_branch(parent_id, path_node.name)
+          print("✓ 重建子节点: " .. path_node.name .. " (ID: " .. new_id .. ")", vim.log.levels.INFO)
+          parent_id = new_id
+        end
+      else
+        parent_id = path_node.id
+      end
+    end
+  end
+  
+  -- 检查目标节点现在是否在 tree_manager 中
+  local final_node = tree_manager.get_node(node_id)
+  if final_node then
+    print("✓ 父节点重建成功: " .. node_id, vim.log.levels.INFO)
+    return true
+  else
+    -- 如果重建后的 ID 不同（因为 tree_manager 使用自增计数器），
+    -- 返回最后创建的节点 ID 作为替代
+    print("⚠️  父节点重建后 ID 可能不同，使用最后创建的节点", vim.log.levels.WARN)
+    return parent_id ~= "virtual_root"
+  end
 end
 
 --- 更新配置

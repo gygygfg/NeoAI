@@ -562,10 +562,9 @@ function M._load_tree_data(session_id)
   -- 加载树状结构数据
   M._load_tree_structure(session_id)
 
-  -- 如果没有数据，使用模拟数据作为后备
+  -- 如果没有数据，保持空数据
   if #state.tree_data == 0 then
-    print("调试：树数据为空，加载后备数据", vim.log.levels.WARN)
-    M._load_fallback_data()
+    print("调试：树数据为空，无可用数据", vim.log.levels.WARN)
   end
 
   -- 默认展开虚拟根节点
@@ -645,9 +644,35 @@ function M._load_tree_structure(session_id)
     print("调试：无法加载树管理器模块: " .. tostring(tree_manager_loaded), vim.log.levels.WARN)
   end
 
-  -- 如果树管理器没有数据，生成示例数据
-  print("调试：生成示例数据", vim.log.levels.INFO)
-  M._load_example_data()
+  -- 如果树管理器没有数据，尝试从 session_manager 同步数据到树管理器
+  print("调试：树管理器没有数据，尝试从 session_manager 同步", vim.log.levels.INFO)
+  
+  -- 调用 tree_manager.sync_from_session_manager() 同步数据
+  if tree_manager.sync_from_session_manager then
+    pcall(tree_manager.sync_from_session_manager)
+    
+    -- 重新获取树结构
+    local retry_structure = tree_manager.get_tree()
+    if retry_structure and #retry_structure > 0 then
+      local has_real_nodes = false
+      for _, node in ipairs(retry_structure) do
+        if node.type == "virtual_root" and node.children and #node.children > 0 then
+          has_real_nodes = true
+          break
+        end
+      end
+      
+      if has_real_nodes then
+        print("调试：同步后树管理器有数据了", vim.log.levels.INFO)
+        state.tree_data = M._convert_tree_manager_nodes(retry_structure, session_id)
+        return
+      end
+    end
+  end
+  
+  -- 如果仍然没有数据，返回空
+  print("调试：树管理器没有数据，返回空", vim.log.levels.INFO)
+  state.tree_data = {}
 end
 
 --- 转换树管理器节点为历史树节点（内部使用）
@@ -706,225 +731,7 @@ function M._convert_tree_manager_nodes(tree_nodes, session_id)
   return result
 end
 
---- 加载示例数据（内部使用）
-function M._load_example_data()
-  print("调试：开始加载示例数据", vim.log.levels.INFO)
-  
-  -- 尝试从树管理器生成示例树
-  local tree_manager_loaded, tree_manager = pcall(require, "NeoAI.core.session.tree_manager")
-  if tree_manager_loaded and tree_manager then
-    print("调试：成功加载树管理器用于示例数据", vim.log.levels.INFO)
-    
-    -- 确保树管理器已初始化
-    if tree_manager.is_initialized and not tree_manager.is_initialized() then
-      print("调试：初始化树管理器用于示例数据", vim.log.levels.INFO)
-      local config = state.config or {}
-      tree_manager.initialize({
-        event_bus = nil,
-        config = config,
-      })
-    end
-    
-    -- 生成示例树
-    print("调试：调用 tree_manager.generate_example_tree()", vim.log.levels.INFO)
-    local example_tree = tree_manager.generate_example_tree()
-    
-    if example_tree and #example_tree > 0 then
-      print("调试：成功生成示例树，节点数量: " .. #example_tree, vim.log.levels.INFO)
-      state.tree_data = M._convert_tree_manager_nodes(example_tree, nil)
-      print("调试：示例数据转换完成，根节点数量: " .. #state.tree_data, vim.log.levels.INFO)
-      return
-    else
-      print("调试：无法生成示例树或返回空", vim.log.levels.WARN)
-    end
-  else
-    print("调试：无法加载树管理器用于示例数据", vim.log.levels.WARN)
-  end
 
-  -- 如果无法生成示例树，使用硬编码的示例数据
-  print("调试：使用硬编码的后备数据", vim.log.levels.INFO)
-  M._load_fallback_data()
-end
-
---- 加载后备数据（模拟数据）
-function M._load_fallback_data()
-  state.tree_data = {
-    {
-      id = "virtual_root",
-      name = "所有会话",
-      type = "virtual_root",
-      metadata = {
-        node_count = 2,
-        created_at = os.time(),
-        last_updated = os.time(),
-        is_virtual = true
-      },
-      children = {
-        {
-          id = "root_1",
-          name = "根节点-1",
-          type = "root_branch",
-          metadata = {
-            session_count = 1,
-            sub_branch_count = 2,
-            created_at = os.time() - 86400,
-            last_updated = os.time() - 43200
-          },
-          children = {
-            {
-              id = "sub_1_1",
-              name = "子节点1-1",
-              type = "sub_branch",
-              metadata = {
-                session_count = 1,
-                sub_branch_count = 1,
-                created_at = os.time() - 43200,
-                last_updated = os.time() - 21600
-              },
-              children = {
-                {
-                  id = "session_1",
-                  name = "会话1",
-                  type = "session",
-                  metadata = {
-                    message_count = 4,
-                    created_at = os.time() - 21600,
-                    last_updated = os.time() - 10800,
-                    conversation_rounds = {
-                      { round_number = 1, timestamp = os.time() - 21600 },
-                      { round_number = 2, timestamp = os.time() - 10800 }
-                    }
-                  },
-                  children = {
-                    {
-                      id = "round_session_1_1",
-                      name = "第1轮会话: 用户:你好，我想了解NeoAI的功能 AI:NeoAI是一个强大的AI助手",
-                      type = "conversation_round",
-                      metadata = {
-                        round_number = 1,
-                        message_count = 2,
-                        timestamp = os.time() - 21600,
-                        user_message = "你好，我想了解NeoAI的功能",
-                        ai_message = "NeoAI是一个强大的AI助手，可以帮助您完成各种任务。"
-                      },
-                      children = {
-                        {
-                          id = "msg_round_session_1_1_1",
-                          name = "[user] 你好，我想了解NeoAI的功能",
-                          type = "message",
-                          metadata = {
-                            role = "user",
-                            content = "你好，我想了解NeoAI的功能",
-                            round_number = 1,
-                            message_index = 1,
-                            timestamp = os.time() - 21600
-                          },
-                          children = nil
-                        },
-                        {
-                          id = "msg_round_session_1_1_2",
-                          name = "[assistant] NeoAI是一个强大的AI助手，可以帮助您完成各种任务。",
-                          type = "message",
-                          metadata = {
-                            role = "assistant",
-                            content = "NeoAI是一个强大的AI助手，可以帮助您完成各种任务。",
-                            round_number = 1,
-                            message_index = 2,
-                            timestamp = os.time() - 21500
-                          },
-                          children = nil
-                        }
-                      }
-                    },
-                    {
-                      id = "round_session_1_2",
-                      name = "第2轮会话: 用户:它能做什么？ AI:NeoAI可以回答问题、编写代码",
-                      type = "conversation_round",
-                      metadata = {
-                        round_number = 2,
-                        message_count = 2,
-                        timestamp = os.time() - 10800,
-                        user_message = "它能做什么？",
-                        ai_message = "NeoAI可以回答问题、编写代码、分析文档、协助调试等。"
-                      },
-                      children = {
-                        {
-                          id = "msg_round_session_1_2_1",
-                          name = "[user] 它能做什么？",
-                          type = "message",
-                          metadata = {
-                            role = "user",
-                            content = "它能做什么？",
-                            round_number = 2,
-                            message_index = 1,
-                            timestamp = os.time() - 10800
-                          },
-                          children = nil
-                        },
-                        {
-                          id = "msg_round_session_1_2_2",
-                          name = "[assistant] NeoAI可以回答问题、编写代码、分析文档、协助调试等。",
-                          type = "message",
-                          metadata = {
-                            role = "assistant",
-                            content = "NeoAI可以回答问题、编写代码、分析文档、协助调试等。",
-                            round_number = 2,
-                            message_index = 2,
-                            timestamp = os.time() - 10700
-                          },
-                          children = nil
-                        }
-                      }
-                    }
-                  }
-                },
-                {
-                  id = "sub_1_1_1",
-                  name = "子节点1-1-1",
-                  type = "sub_branch",
-                  metadata = {
-                    session_count = 0,
-                    sub_branch_count = 0,
-                    created_at = os.time() - 5400,
-                    last_updated = os.time() - 5400
-                  },
-                  children = {}
-                }
-              }
-            },
-            {
-              id = "sub_1_2",
-              name = "子节点1-2",
-              type = "sub_branch",
-              metadata = {
-                session_count = 0,
-                sub_branch_count = 0,
-                created_at = os.time() - 7200,
-                last_updated = os.time() - 7200
-              },
-              children = {}
-            }
-          }
-        },
-        {
-          id = "root_2",
-          name = "根节点-2",
-          type = "root_branch",
-          metadata = {
-            session_count = 0,
-            sub_branch_count = 0,
-            created_at = os.time() - 3600,
-            last_updated = os.time() - 3600
-          },
-          children = {}
-        }
-      }
-    }
-  }
-
-  -- 默认展开虚拟根节点
-  state.expanded_nodes["virtual_root"] = true
-end
 
 --- 更新配置
 --- @param new_config table 新配置

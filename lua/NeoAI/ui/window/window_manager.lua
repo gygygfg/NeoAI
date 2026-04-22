@@ -943,7 +943,7 @@ function M.render_tree(tree_data, tree_state, load_data_func, window_width)
   -- 添加分隔线和按键提示
   table.insert(content, "")
   table.insert(content, "---")
-  table.insert(content, "使用方向键导航，Enter 选择，n/N 新建分支，d/D 删除")
+  table.insert(content, "使用方向键导航，Enter 选择，n/N 新建节点，d/D 删除")
 
   print("调试：[window_manager] 渲染完成，内容行数: " .. #content, vim.log.levels.INFO)
   return content
@@ -1076,22 +1076,34 @@ function M._render_tree_node(content, node, depth, is_last, parent_prefix, tree_
   table.insert(content, line)
 
   -- 渲染子节点（如果展开）
+  -- 需求1: conversation_round 类型的节点不展开显示子消息，问答绑定在一行
+  -- 但如果有用户创建的子分支（node类型），仍然需要显示
   if tree_state.expanded_nodes and tree_state.expanded_nodes[node.id] and node.children then
-    local child_count = #node.children
-
-    -- 为子节点生成新的前缀
-    local child_parent_prefix = parent_prefix or ""
-    if depth > 0 then
-      if is_last then
-        child_parent_prefix = child_parent_prefix .. "    " -- 最后一个子节点，父节点是空格
-      else
-        child_parent_prefix = child_parent_prefix .. "│   " -- 不是最后一个子节点，父节点是竖线
+    -- 过滤子节点：跳过 message 类型的子节点（问答已在一行显示），但显示其他类型（如 node 子分支）
+    local visible_children = {}
+    for _, child in ipairs(node.children) do
+      if child.type ~= "message" then
+        table.insert(visible_children, child)
       end
     end
 
-    for i, child in ipairs(node.children) do
-      local child_is_last = (i == child_count)
-      M._render_tree_node(content, child, depth + 1, child_is_last, child_parent_prefix, tree_state, window_width)
+    if #visible_children > 0 then
+      local child_count = #visible_children
+
+      -- 为子节点生成新的前缀
+      local child_parent_prefix = parent_prefix or ""
+      if depth > 0 then
+        if is_last then
+          child_parent_prefix = child_parent_prefix .. "    " -- 最后一个子节点，父节点是空格
+        else
+          child_parent_prefix = child_parent_prefix .. "│   " -- 不是最后一个子节点，父节点是竖线
+        end
+      end
+
+      for i, child in ipairs(visible_children) do
+        local child_is_last = (i == child_count)
+        M._render_tree_node(content, child, depth + 1, child_is_last, child_parent_prefix, tree_state, window_width)
+      end
     end
   end
 end

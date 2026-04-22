@@ -587,28 +587,8 @@ end
 --- @param session_id string 会话ID
 function M._load_messages(session_id)
   -- 这里应该从会话管理器加载消息数据
-  -- 目前使用模拟数据
-  state.messages = {
-    {
-      role = "user",
-      content = "你好，请帮我写一个Lua函数",
-      timestamp = os.time() - 3600,
-    },
-    {
-      role = "assistant",
-      content = '当然！这是一个简单的Lua函数示例:\n\n```lua\nfunction greet(name)\n  return "Hello, " .. name .. "!"\nend\n```',
-      timestamp = os.time() - 3590,
-    },
-    {
-      role = "user",
-      content = "谢谢，这个函数很好用",
-      timestamp = os.time() - 1800,
-    },
-    {
-      role = "assistant",
-      content = "不客气！如果你需要更多帮助，请随时告诉我。",
-    },
-  }
+  -- 目前保持空数据
+  state.messages = {}
 end
 
 --- 异步加载消息数据（内部函数）
@@ -621,29 +601,8 @@ function M._load_messages_async(session_id, callback)
   async_worker.submit_task("load_chat_messages", function()
     -- 在后台线程中加载消息数据
     -- 这里应该从会话管理器加载消息数据
-    -- 目前使用模拟数据
-    local messages = {
-      {
-        role = "user",
-        content = "你好，请帮我写一个Lua函数",
-        timestamp = os.time() - 3600,
-      },
-      {
-        role = "assistant",
-        content = '当然！这是一个简单的Lua函数示例:\n\n```lua\nfunction greet(name)\n  return "Hello, " .. name .. "!"\nend\n```',
-        timestamp = os.time() - 3590,
-      },
-      {
-        role = "user",
-        content = "谢谢，这个函数很好用",
-        timestamp = os.time() - 1800,
-      },
-      {
-        role = "assistant",
-        content = "不客气！如果你需要更多帮助，请随时告诉我。",
-        timestamp = os.time() - 1790,
-      },
-    }
+    -- 目前保持空数据
+    local messages = {}
 
     return messages
   end, function(success, messages, error_msg)
@@ -728,6 +687,25 @@ function M.update_config(new_config)
   if state.current_window_id then
     M.set_keymaps()
     M.render_chat()
+  end
+end
+
+--- 更新聊天窗口标题
+--- @param title string 新标题
+function M.update_title(title)
+  if not state.current_window_id then
+    return
+  end
+
+  local win_handle = window_manager.get_window_win(state.current_window_id)
+  if not win_handle or not vim.api.nvim_win_is_valid(win_handle) then
+    return
+  end
+
+  -- 更新浮动窗口标题（Neovim 0.9+ 支持通过 nvim_win_set_config 更新 title）
+  local ok, err = pcall(vim.api.nvim_win_set_config, win_handle, { title = title })
+  if not ok then
+    -- 如果 nvim_win_set_config 不支持 title 参数（旧版本 Neovim），静默忽略
   end
 end
 
@@ -834,12 +812,54 @@ function M.add_message(role, content)
     { pattern = "NeoAI:message_added", data = { window_id = state.current_window_id, role = role, content = content } }
   )
 
+  -- 持久化消息到 session_manager 和 history_manager
+  M._persist_message(role, content)
+
   -- 如果窗口打开，更新显示
   if state.current_window_id then
     M.render_chat()
   end
 
   return true
+end
+
+--- 持久化消息到存储系统（内部函数）
+--- @param role string 角色 ('user' 或 'assistant')
+--- @param content string 消息内容
+function M._persist_message(role, content)
+  -- 保存到 session_manager 的 message_manager
+  local session_mgr_loaded, session_mgr = pcall(require, "NeoAI.core.session.session_manager")
+  if session_mgr_loaded and session_mgr and session_mgr.is_initialized and session_mgr.is_initialized() then
+    local current_session = session_mgr.get_current_session()
+    if current_session and current_session.current_branch then
+      local msg_mgr = session_mgr.get_message_manager()
+      if msg_mgr then
+        pcall(msg_mgr.add_message, msg_mgr, current_session.current_branch, role, content, {
+          timestamp = os.time(),
+          window_id = state.current_window_id,
+        })
+      end
+    end
+  end
+
+  -- 同步到 tree_manager，确保树视图能显示新消息
+  local tree_mgr_loaded, tree_mgr = pcall(require, "NeoAI.core.session.tree_manager")
+  if tree_mgr_loaded and tree_mgr and tree_mgr.is_initialized and tree_mgr.is_initialized() then
+    pcall(tree_mgr.sync_from_session_manager)
+  end
+
+  -- 保存到 history_manager
+  local history_mgr_loaded, history_mgr = pcall(require, "NeoAI.core.history_manager")
+  if history_mgr_loaded and history_mgr then
+    local current_session = history_mgr.get_current_session()
+    if not current_session then
+      pcall(history_mgr.create_session, "聊天会话")
+    end
+    pcall(history_mgr.add_message, role, content, {
+      timestamp = os.time(),
+      window_id = state.current_window_id,
+    })
+  end
 end
 
 --- 显示悬浮文本

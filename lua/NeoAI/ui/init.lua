@@ -65,9 +65,11 @@ function M.initialize(config)
   -- 初始化子模块
   window_manager.initialize(window_manager_config)
   input_handler.initialize(state.config.input or {})
-  history_tree.initialize(state.config.tree or {})
+  -- 传递完整配置给 history_tree，确保能访问 session.save_path
+  history_tree.initialize(state.config)
   reasoning_display.initialize(state.config.reasoning or {})
-  tree_window.initialize(state.config.tree_window or {})
+  -- 传递完整配置给 tree_window，确保能访问 session.save_path
+  tree_window.initialize(state.config)
   -- 传递完整配置给聊天窗口，确保虚拟输入框能访问键位配置
   chat_window.initialize(state.config)
 

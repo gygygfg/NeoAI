@@ -67,13 +67,12 @@ function M.create_root_branch(name)
   local node = {
     id = node_id,
     name = name or ("根节点-" .. node_counter),
-    type = NODE_TYPES.ROOT_BRANCH,
+    type = "node",
     parent_id = "virtual_root",
     created_at = os.time(),
     children = {},
     metadata = {
-      session_count = 0,
-      sub_branch_count = 0
+      child_count = 0
     }
   }
 
@@ -106,33 +105,29 @@ function M.create_sub_branch(parent_id, name)
     error("Parent node not found: " .. parent_id)
   end
 
-  -- 检查父节点类型
-  if parent.type ~= NODE_TYPES.ROOT_BRANCH and parent.type ~= NODE_TYPES.SUB_BRANCH then
-    error("Cannot create sub-branch under node type: " .. parent.type)
-  end
+  -- 任何节点都可以有子节点，移除类型检查
 
   -- 确保父节点的元数据存在
   if not parent.metadata then
     parent.metadata = {}
   end
-  -- 确保父节点的子分支计数字段存在
-  if parent.metadata.sub_branch_count == nil then
-    parent.metadata.sub_branch_count = 0
+  -- 确保父节点的子节点列表存在
+  if not parent.children then
+    parent.children = {}
   end
 
   node_counter = node_counter + 1
-  local node_id = "sub_" .. node_counter
+  local node_id = "node_" .. node_counter
 
   local node = {
     id = node_id,
-    name = name or ("子节点" .. M._get_node_path_string(parent_id) .. "-" .. (parent.metadata.sub_branch_count + 1)),
-    type = NODE_TYPES.SUB_BRANCH,
+    name = name or ("节点-" .. node_counter),
+    type = "node", -- 所有子节点统一为 node 类型
     parent_id = parent_id,
     created_at = os.time(),
     children = {},
     metadata = {
-      session_count = 0,
-      sub_branch_count = 0  -- 子分支也可以有子分支
+      child_count = 0
     }
   }
 
@@ -142,7 +137,10 @@ function M.create_sub_branch(parent_id, name)
   table.insert(parent.children, node_id)
 
   -- 更新父节点元数据
-  parent.metadata.sub_branch_count = parent.metadata.sub_branch_count + 1
+  if not parent.metadata.child_count then
+    parent.metadata.child_count = 0
+  end
+  parent.metadata.child_count = parent.metadata.child_count + 1
 
   -- 触发事件
   vim.api.nvim_exec_autocmds("User", { 
@@ -197,10 +195,7 @@ function M.create_session(parent_id, name, metadata)
     error("Parent node not found: " .. parent_id)
   end
 
-  -- 检查父节点类型
-  if parent.type ~= NODE_TYPES.ROOT_BRANCH and parent.type ~= NODE_TYPES.SUB_BRANCH then
-    error("Cannot create session under node type: " .. parent.type)
-  end
+  -- 任何节点都可以有 session 子节点，移除类型检查
 
   node_counter = node_counter + 1
   local node_id = "session_" .. node_counter
@@ -225,6 +220,9 @@ function M.create_session(parent_id, name, metadata)
   table.insert(parent.children, node_id)
 
   -- 更新父节点元数据
+  if parent.metadata.session_count == nil then
+    parent.metadata.session_count = 0
+  end
   parent.metadata.session_count = parent.metadata.session_count + 1
 
   -- 触发事件
@@ -270,13 +268,19 @@ function M.create_conversation_round(session_id, round_number, user_message, ai_
     ai_preview = ai_preview .. "..."
   end
 
+  -- 需求1: 轮次节点名称直接显示问答摘要在一行，不创建子消息节点
+  local user_short = user_message and user_message:gsub("\n", " "):sub(1, 30) or ""
+  local ai_short = ai_message and ai_message:gsub("\n", " "):sub(1, 30) or ""
+  if #user_short >= 30 then user_short = user_short .. "..." end
+  if #ai_short >= 30 then ai_short = ai_short .. "..." end
+
   local node = {
     id = node_id,
-    name = "第" .. round_number .. "轮会话: 用户:" .. user_preview .. " AI:" .. ai_preview,
+    name = "第" .. round_number .. "轮: 👤" .. user_short .. " | 🤖" .. ai_short,
     type = NODE_TYPES.CONVERSATION_ROUND,
     parent_id = session_id,
     created_at = os.time(),
-    children = {}, -- 对话轮次可以有消息作为子节点
+    children = {}, -- 不再创建子消息节点，问答绑定在一行
     metadata = {
       round_number = round_number,
       user_message = user_message,
@@ -302,14 +306,7 @@ function M.create_conversation_round(session_id, round_number, user_message, ai_
   session.metadata.message_count = (session.metadata.message_count or 0) + 2
   session.metadata.last_updated = os.time()
 
-  -- 创建消息子节点
-  if user_message then
-    M.create_message(node_id, "user", user_message, round_number, 1)
-  end
-  
-  if ai_message then
-    M.create_message(node_id, "assistant", ai_message, round_number, 2)
-  end
+  -- 需求1: 不再创建消息子节点，问答绑定在一行显示
 
   -- 触发事件
   vim.api.nvim_exec_autocmds("User", { 
@@ -525,9 +522,7 @@ function M.move_node(node_id, new_parent_id)
     error("Cannot move root branch")
   end
 
-  if new_parent.type == NODE_TYPES.SESSION or new_parent.type == NODE_TYPES.CONVERSATION_ROUND or new_parent.type == NODE_TYPES.MESSAGE then
-    error("Cannot move node under " .. new_parent.type)
-  end
+  -- 任何节点都可以有子节点，移除类型检查
 
   -- 从原父节点中移除
   if node.parent_id and tree_nodes[node.parent_id] then
@@ -587,35 +582,135 @@ function M.is_initialized()
   return state.initialized
 end
 
---- 生成示例树（用于测试）
---- @return table 示例树
-function M.generate_example_tree()
-  M.reset()
-  M.initialize({ event_bus = nil, config = {} })
-  
-  -- 创建根节点1
-  local root1 = M.create_root_branch("根节点-1")
-  
-  -- 创建子节点1-1
-  local sub1_1 = M.create_sub_branch(root1, "子节点1-1")
-  
-  -- 创建会话1
-  local session1 = M.create_session(sub1_1, "会话1")
-  
-  -- 创建对话轮次
-  M.create_conversation_round(session1, 1, "你好，我想了解NeoAI的功能", "NeoAI是一个强大的AI助手，可以帮助您完成各种任务。")
-  M.create_conversation_round(session1, 2, "它能做什么？", "NeoAI可以回答问题、编写代码、分析文档、协助调试等。")
-  
-  -- 创建子节点1-1-1（在第二轮会话下）
-  local sub1_1_1 = M.create_sub_branch(sub1_1, "子节点1-1-1")
-  
-  -- 创建子节点1-2
-  local sub1_2 = M.create_sub_branch(root1, "子节点1-2")
-  
-  -- 创建根节点2
-  local root2 = M.create_root_branch("根节点-2")
-  
-  return M.get_tree()
+--- 从会话管理器同步数据到树结构
+--- 遍历 session_manager 中的所有会话，在树中创建对应的节点
+function M.sync_from_session_manager()
+  if not state.initialized then
+    return
+  end
+
+  -- 获取会话管理器
+  local session_mgr_loaded, session_mgr = pcall(require, "NeoAI.core.session.session_manager")
+  if not session_mgr_loaded or not session_mgr or not session_mgr.is_initialized or not session_mgr.is_initialized() then
+    return
+  end
+
+  -- 获取所有会话
+  local sessions = session_mgr.list_sessions()
+  if not sessions or #sessions == 0 then
+    return
+  end
+
+  -- 确保虚拟根节点存在
+  M._ensure_virtual_root()
+
+  for _, session_info in ipairs(sessions) do
+    local session_id = session_info.id
+    
+    -- 检查是否已存在对应的树节点
+    local exists = false
+    for _, child_id in ipairs(tree_nodes["virtual_root"].children) do
+      if child_id == session_id then
+        exists = true
+        break
+      end
+    end
+
+    if not exists then
+      -- 创建树节点
+      local node = {
+        id = session_id,
+        name = session_info.name or ("会话-" .. session_id),
+        type = NODE_TYPES.SESSION,
+        parent_id = "virtual_root",
+        created_at = session_info.created_at or os.time(),
+        children = {},
+        metadata = {
+          message_count = (session_info.metadata and session_info.metadata.message_count) or 0,
+          last_updated = session_info.updated_at or os.time(),
+          conversation_rounds = {},
+        }
+      }
+
+      tree_nodes[session_id] = node
+      table.insert(tree_nodes["virtual_root"].children, session_id)
+      tree_nodes["virtual_root"].metadata.node_count = tree_nodes["virtual_root"].metadata.node_count + 1
+    end
+
+    -- 同步消息到对话轮次
+    local session_data = session_mgr.get_session(session_id)
+    if session_data and session_data.current_branch then
+      local msg_mgr = session_mgr.get_message_manager()
+      if msg_mgr then
+        local messages = msg_mgr.get_messages(session_data.current_branch, 1000000)
+        if messages and #messages > 0 then
+          -- 按轮次分组（每两条消息为一轮：user + assistant）
+          local round_number = 1
+          for i = 1, #messages, 2 do
+            local user_msg = messages[i]
+            local ai_msg = messages[i + 1]
+            
+            local round_id = "round_" .. session_id .. "_" .. round_number
+            
+            -- 检查轮次节点是否已存在
+            local round_exists = false
+            for _, child_id in ipairs(tree_nodes[session_id].children) do
+              if child_id == round_id then
+                round_exists = true
+                break
+              end
+            end
+
+            if not round_exists then
+              local user_preview = user_msg and user_msg.content and user_msg.content:sub(1, 20) or ""
+              local ai_preview = ai_msg and ai_msg.content and ai_msg.content:sub(1, 20) or ""
+              if #user_preview > 20 then user_preview = user_preview .. "..." end
+              if #ai_preview > 20 then ai_preview = ai_preview .. "..." end
+
+              -- 需求1: 轮次节点名称直接显示问答摘要在一行，不创建子消息节点
+              local user_short = user_msg and user_msg.content and user_msg.content:gsub("\n", " "):sub(1, 30) or ""
+              local ai_short = ai_msg and ai_msg.content and ai_msg.content:gsub("\n", " "):sub(1, 30) or ""
+              if #user_short >= 30 then user_short = user_short .. "..." end
+              if #ai_short >= 30 then ai_short = ai_short .. "..." end
+
+              local round_node = {
+                id = round_id,
+                name = "第" .. round_number .. "轮: 👤" .. user_short .. " | 🤖" .. ai_short,
+                type = NODE_TYPES.CONVERSATION_ROUND,
+                parent_id = session_id,
+                created_at = os.time(),
+                children = {}, -- 不再创建子消息节点
+                metadata = {
+                  round_number = round_number,
+                  user_message = user_msg and user_msg.content or "",
+                  ai_message = ai_msg and ai_msg.content or "",
+                  message_count = (user_msg and 1 or 0) + (ai_msg and 1 or 0),
+                  timestamp = os.time(),
+                }
+              }
+
+              tree_nodes[round_id] = round_node
+              table.insert(tree_nodes[session_id].children, round_id)
+              -- 不再创建消息子节点，问答绑定在一行显示
+
+              -- 更新会话元数据
+              if not tree_nodes[session_id].metadata.conversation_rounds then
+                tree_nodes[session_id].metadata.conversation_rounds = {}
+              end
+              table.insert(tree_nodes[session_id].metadata.conversation_rounds, {
+                round_number = round_number,
+                timestamp = os.time(),
+              })
+              tree_nodes[session_id].metadata.message_count = (tree_nodes[session_id].metadata.message_count or 0) + (user_msg and 1 or 0) + (ai_msg and 1 or 0)
+              tree_nodes[session_id].metadata.last_updated = os.time()
+            end
+
+            round_number = round_number + 1
+          end
+        end
+      end
+    end
+  end
 end
 
 return M
