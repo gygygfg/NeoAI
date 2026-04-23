@@ -304,7 +304,8 @@ local function clean_content_table(content_table)
 end
 
 --- @param filetype string 文件类型
-local function set_window_content_by_mode(window_info, content, filetype)
+--- @param window_type string|nil 窗口类型（可选，用于chat类型设置折叠）
+local function set_window_content_by_mode(window_info, content, filetype, window_type)
   if not window_info or not window_info.buf then
     return
   end
@@ -333,10 +334,38 @@ local function set_window_content_by_mode(window_info, content, filetype)
   if filetype then
     vim.api.nvim_set_option_value("filetype", filetype, { buf = buf })
   end
-  
-  -- 恢复缓冲区为只读状态
-  vim.api.nvim_set_option_value("modifiable", false, { buf = buf })
-  vim.api.nvim_set_option_value("readonly", true, { buf = buf })
+
+  -- chat类型窗口保持可修改（内联输入需要），并设置折叠选项
+  if window_type == "chat" then
+    vim.api.nvim_set_option_value("modifiable", true, { buf = buf })
+    vim.api.nvim_set_option_value("readonly", false, { buf = buf })
+    vim.api.nvim_set_option_value("modified", false, { buf = buf })
+    local win = window_info.win
+    if win and vim.api.nvim_win_is_valid(win) then
+      vim.api.nvim_set_option_value("foldmethod", "marker", { win = win })
+      vim.api.nvim_set_option_value("foldmarker", "{{{,}}}", { win = win })
+      vim.api.nvim_set_option_value("foldlevel", 0, { win = win })
+      vim.api.nvim_set_option_value("foldenable", true, { win = win })
+      -- 延迟刷新折叠，确保在 BufRead/BufNew 等自动命令之后执行
+      vim.defer_fn(function()
+        if vim.api.nvim_win_is_valid(win) then
+          pcall(vim.api.nvim_win_call, win, function()
+            -- 使用 setlocal 确保窗口本地设置覆盖全局设置
+            vim.cmd("setlocal foldmethod=marker")
+            vim.cmd("setlocal foldmarker={{{,}}}")
+            vim.cmd("setlocal foldlevel=0")
+            vim.cmd("setlocal foldenable")
+            -- 刷新折叠
+            vim.cmd("normal! zMzx")
+          end)
+        end
+      end, 10)
+    end
+  else
+    -- 恢复缓冲区为只读状态
+    vim.api.nvim_set_option_value("modifiable", false, { buf = buf })
+    vim.api.nvim_set_option_value("readonly", true, { buf = buf })
+  end
   -- 标记为未修改，避免保存警告
   vim.api.nvim_set_option_value("modified", false, { buf = buf })
 end
@@ -417,7 +446,9 @@ function M.create_window(window_type, options)
   vim.api.nvim_set_option_value("buftype", "nofile", { buf = window_info.buf })
   vim.api.nvim_set_option_value("swapfile", false, { buf = window_info.buf })
   vim.api.nvim_set_option_value("bufhidden", "hide", { buf = window_info.buf })
-  vim.api.nvim_set_option_value("filetype", "neoai_" .. window_type, { buf = window_info.buf })
+  -- chat类型使用markdown filetype以支持原生折叠
+  local ft = window_type == "chat" and "markdown" or "neoai_" .. window_type
+  vim.api.nvim_set_option_value("filetype", ft, { buf = window_info.buf })
   vim.api.nvim_set_option_value("modifiable", true, { buf = window_info.buf })
   vim.api.nvim_set_option_value("readonly", false, { buf = window_info.buf })
 
@@ -604,7 +635,8 @@ function M.set_window_content(window_id, content)
 
   -- 使用窗口模式管理器设置内容
   if window.window_info then
-    set_window_content_by_mode(window.window_info, content, "neoai_" .. window.type)
+    local ft = window.type == "chat" and "markdown" or "neoai_" .. window.type
+    set_window_content_by_mode(window.window_info, content, ft, window.type)
   else
     -- 向后兼容：旧方式设置内容
     local buf = window.buf
@@ -630,13 +662,38 @@ function M.set_window_content(window_id, content)
   -- 根据窗口类型设置缓冲区选项
   local window_type = window.type
   local buf = window.window_info and window.window_info.buf or window.buf
+  local win = window.window_info and window.window_info.win or window.win
 
-  if window_type == "tree" or window_type == "reasoning" or window_type == "chat" then
-    -- 树窗口、思考窗口和聊天窗口设置为只读
+  if window_type == "tree" or window_type == "reasoning" then
+    -- 树窗口和思考窗口设置为只读
     vim.api.nvim_set_option_value("modifiable", false, { buf = buf })
     vim.api.nvim_set_option_value("readonly", true, { buf = buf })
     -- 清除修改标志，避免退出时出现 "No write since last change" 错误
     vim.api.nvim_set_option_value("modified", false, { buf = buf })
+  elseif window_type == "chat" then
+    -- 聊天窗口保持可修改（内联输入需要）
+    vim.api.nvim_set_option_value("modifiable", true, { buf = buf })
+    vim.api.nvim_set_option_value("readonly", false, { buf = buf })
+    vim.api.nvim_set_option_value("modified", false, { buf = buf })
+    -- 确保折叠选项在每次设置内容后都重新生效
+    if win and vim.api.nvim_win_is_valid(win) then
+      vim.api.nvim_set_option_value("foldmethod", "marker", { win = win })
+      vim.api.nvim_set_option_value("foldmarker", "{{{,}}}", { win = win })
+      vim.api.nvim_set_option_value("foldlevel", 0, { win = win })
+      vim.api.nvim_set_option_value("foldenable", true, { win = win })
+      -- 延迟刷新折叠，确保在 BufRead/BufNew 等自动命令之后执行
+      vim.defer_fn(function()
+        if vim.api.nvim_win_is_valid(win) then
+          pcall(vim.api.nvim_win_call, win, function()
+            vim.cmd("setlocal foldmethod=marker")
+            vim.cmd("setlocal foldmarker={{{,}}}")
+            vim.cmd("setlocal foldlevel=0")
+            vim.cmd("setlocal foldenable")
+            vim.cmd("normal! zMzx")
+          end)
+        end
+      end, 10)
+    end
   else
     -- 其他窗口保持可修改
     vim.api.nvim_set_option_value("modifiable", true, { buf = buf })

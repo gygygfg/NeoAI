@@ -2,7 +2,7 @@ local M = {}
 local MODULE_NAME = "NeoAI.ui.window.chat_window"
 
 local window_manager = require("NeoAI.ui.window.window_manager")
-local virtual_input = require("NeoAI.ui.components.virtual_input")
+local virtual_input = require("NeoAI.ui.components.virtual_input") -- 内联输入模式
 local session_helper = require("NeoAI.utils.session_helper")
 
 -- 模块状态
@@ -130,16 +130,13 @@ function M.open(session_id, window_id, branch_id)
   -- 触发聊天框打开事件
   vim.api.nvim_exec_autocmds("User", { pattern = "NeoAI:chat_box_opened", data = { window_id = window_id } })
 
-  -- 调整窗口位置，确保不在屏幕最下方
-  M._adjust_window_position()
-
   -- 自动获取焦点
   M._focus_window()
 
-  -- 自动打开虚拟输入框
+  -- 打开浮动虚拟输入框
   vim.defer_fn(function()
-    M._open_virtual_input()
-  end, 100) -- 延迟100ms，确保窗口完全打开
+    M._open_float_input()
+  end, 100)
 
   return true
 end
@@ -232,17 +229,20 @@ function M._do_render_chat()
 
           if has_reasoning then
             -- 显示思考过程（使用 Neovim 原生折叠标记）
+            -- 折叠标记 {{{ 和 }}} 必须位于行首才能被 foldmethod=marker 识别
             table.insert(content, string.format("%s", role_prefix))
             table.insert(content, "")
-            table.insert(content, "🤔 思考过程 {{{ ")
+            -- 折叠标记在行首，后面的文本是折叠后显示的摘要
+            -- 注意：{{{ 必须位于行首，所以前面不能有任何字符
+            table.insert(content, "{{{ 🤔 思考过程")
 
-            -- 添加思考内容
+            -- 添加思考内容（缩进显示，4空格缩进使折叠后视觉效果更好）
             local reasoning_lines = vim.split(reasoning_content, "\n")
             for _, line in ipairs(reasoning_lines) do
-              table.insert(content, line)
+              table.insert(content, "    " .. line)
             end
 
-            table.insert(content, "}}} ")
+            table.insert(content, "}}}")
             table.insert(content, "")
 
             -- 显示正文内容
@@ -273,10 +273,7 @@ function M._do_render_chat()
         end
       end
 
-      -- 添加分隔线和输入提示
-      table.insert(content, "---")
-      table.insert(content, "按 'i' 进入插入模式输入消息")
-      table.insert(content, "按 'q' 退出聊天窗口")
+      -- 不添加分隔线和输入提示（由内联输入区域替代）
 
       return content
     end, function(success, content)
@@ -286,19 +283,33 @@ function M._do_render_chat()
           -- 设置窗口内容
           window_manager.set_window_content(state.current_window_id, content)
 
-          -- 调整窗口位置，确保不在屏幕最下方
-          M._adjust_window_position()
-
           -- 自动获取焦点
           M._focus_window()
 
-          -- 注意：虚拟输入框已经在 open() 函数中打开，这里不需要重复打开
+          -- 仅在非流式状态下打开浮动虚拟输入框
+          -- 流式过程中不打开，避免干扰用户查看输出
+          if not state.streaming.active then
+            M._open_float_input()
+          end
 
-          -- 将光标定位到输出位置（缓冲区末尾，即最新消息位置）
-          M._move_cursor_to_end()
-
-          -- 将光标移动到虚拟输入框窗口（不进入插入模式）
-          M._focus_virtual_input()
+          -- 确保折叠选项正确设置并刷新折叠
+          local win_handle = window_manager.get_window_win(state.current_window_id)
+          if win_handle and vim.api.nvim_win_is_valid(win_handle) then
+            local buf = vim.api.nvim_win_get_buf(win_handle)
+            -- 延迟设置折叠选项，确保在 BufRead/BufNew 等自动命令之后执行
+            vim.defer_fn(function()
+              if not vim.api.nvim_win_is_valid(win_handle) then return end
+              -- 使用 setlocal 确保窗口本地设置覆盖全局设置
+              pcall(vim.api.nvim_win_call, win_handle, function()
+                vim.cmd("setlocal foldmethod=marker")
+                vim.cmd("setlocal foldmarker={{{,}}}")
+                vim.cmd("setlocal foldlevel=0")
+                vim.cmd("setlocal foldenable")
+                -- 刷新折叠
+                vim.cmd("normal! zMzx")
+              end)
+            end, 10)
+          end
 
           -- 触发渲染完成事件
           vim.api.nvim_exec_autocmds(
@@ -355,10 +366,7 @@ function M.render_chat_async(callback)
       end
     end
 
-    -- 添加分隔线和输入提示
-    table.insert(content, "---")
-    table.insert(content, "按 'i' 进入插入模式输入消息")
-    table.insert(content, "按 'q' 退出聊天窗口")
+    -- 不添加分隔线和输入提示（由内联输入区域替代）
 
     return content
   end, function(success, content)
@@ -366,14 +374,12 @@ function M.render_chat_async(callback)
       -- 使用vim.schedule确保在合适的时机更新UI
       vim.schedule(function()
         window_manager.set_window_content(state.current_window_id, content)
-        -- 调整窗口位置，确保不在屏幕最下方
-        M._adjust_window_position()
         -- 自动获取焦点
         M._focus_window()
-        -- 打开虚拟输入框
-        vim.defer_fn(function()
-          M._open_virtual_input()
-        end, 50)
+        -- 仅在非流式状态下打开浮动虚拟输入框
+        if not state.streaming.active then
+          M._open_float_input()
+        end
       end)
 
       if callback then
@@ -555,160 +561,60 @@ function M._focus_window()
 end
 
 --- 调整窗口位置（内部函数）
---- 确保窗口不在屏幕最下方
+--- 已禁用：用户喜欢屏幕最下方的虚拟输入框
 function M._adjust_window_position()
-  if not state.current_window_id then
-    return
-  end
-
-  local win_handle = window_manager.get_window_win(state.current_window_id)
-  if not win_handle or not vim.api.nvim_win_is_valid(win_handle) then
-    return
-  end
-
-  -- 获取窗口配置
-  local win_config = vim.api.nvim_win_get_config(win_handle)
-  if not win_config or win_config.relative == "" then
-    -- 不是浮动窗口，不需要调整
-    return
-  end
-
-  -- 获取屏幕尺寸
-  local screen_height = vim.o.lines
-  local screen_width = vim.o.columns
-
-  -- 获取窗口尺寸
-  local win_height = win_config.height or 20
-  local win_width = win_config.width or 80
-
-  -- 获取当前位置
-  local current_row = win_config.row or 0
-
-  -- 检查窗口是否在屏幕底部（距离底部小于10%）
-  local bottom_threshold = screen_height * 0.9
-  if current_row + win_height > bottom_threshold then
-    -- 调整位置到屏幕中央偏上
-    local new_row = math.floor(screen_height * 0.2)
-    local new_col = math.floor((screen_width - win_width) / 2)
-
-    -- 更新窗口位置
-    win_config.row = new_row
-    win_config.col = new_col
-
-    -- 应用新的窗口配置
-    pcall(vim.api.nvim_win_set_config, win_handle, win_config)
-  end
+  -- 不执行任何操作，保持窗口在屏幕底部
 end
 
---- 打开虚拟输入框（内部函数）
-function M._open_virtual_input()
-  if not state.current_window_id then
-    return false
-  end
+--- 打开浮动虚拟输入框（内部函数）
+function M._open_float_input()
+  if not state.current_window_id then return end
+
+  -- 如果已激活，跳过
+  if virtual_input.is_active() then return end
 
   local win_handle = window_manager.get_window_win(state.current_window_id)
-  if not win_handle or not vim.api.nvim_win_is_valid(win_handle) then
-    return false
-  end
+  if not win_handle or not vim.api.nvim_win_is_valid(win_handle) then return end
 
-  -- 检查虚拟输入框是否已经打开
-  if virtual_input.is_active() then
-    print("⚠️  虚拟输入框已经打开，跳过重复打开")
-    return true
-  end
-
-  -- 打开虚拟输入框（不自动进入插入模式，光标移动到输入框上即可）
-  local success = virtual_input.open(win_handle, {
-    no_auto_insert = true,
+  -- 打开浮动虚拟输入框
+  virtual_input.open(win_handle, {
     placeholder = "输入消息...",
     on_submit = function(content)
-      -- 当用户提交消息时，通过聊天处理器发送消息
       if content and content ~= "" then
-        -- 获取聊天处理器
         local chat_handlers_loaded, chat_handlers = pcall(require, "NeoAI.ui.handlers.chat_handlers")
         if chat_handlers_loaded and chat_handlers then
-          -- 调用异步版本的 send_message 函数，避免界面卡住
-          -- 获取窗口句柄（数字）
-          local win_handle = window_manager.get_window_win(state.current_window_id)
           local success, result = chat_handlers.send_message(
             content,
             state.current_session_id or "default",
             "main",
-            state.current_window_id, -- 窗口ID字符串
-            true, -- 格式化消息
+            state.current_window_id,
+            true,
             function(async_success, async_result, async_error)
-              -- 异步回调函数 - 只处理消息发送结果，不处理AI响应
-              if async_success then
-                -- print("✓ 异步消息发送成功: " .. tostring(async_result))
-
-                -- 显示发送成功提示
-                -- M.show_floating_text("消息已发送", {
-                --   timeout = 1000,
-                --   position = "bottom",
-                -- })
-
-                -- AI响应将由事件监听器自动触发，不需要在这里处理
-              else
+              if not async_success then
                 print("✗ 异步消息发送失败: " .. tostring(async_error or async_result))
-
-                -- 显示错误提示
                 M.show_floating_text("发送消息失败: " .. tostring(async_error or async_result), {
-                  timeout = 3000,
-                  position = "center",
-                  border = "single",
+                  timeout = 3000, position = "center", border = "single",
                 })
               end
             end
           )
-
           if not success then
             print("⚠️  启动异步消息发送失败: " .. tostring(result))
-
-            -- 显示错误提示
             M.show_floating_text("启动发送失败: " .. tostring(result), {
-              timeout = 3000,
-              position = "center",
-              border = "single",
+              timeout = 3000, position = "center", border = "single",
             })
           else
-            print("✓ " .. tostring(result))
-
-            -- 显示发送成功提示
-            M.show_floating_text("消息发送中...", {
-              timeout = 1000,
-              position = "bottom",
-            })
+            M.show_floating_text("消息发送中...", { timeout = 1000, position = "bottom" })
           end
-        else
-          print("⚠️  无法加载聊天处理器")
-
-          -- 显示错误提示
-          M.show_floating_text("无法加载聊天处理器", {
-            timeout = 3000,
-            position = "center",
-            border = "single",
-          })
         end
       end
     end,
-    on_cancel = function()
-      -- 当用户取消时，不执行任何操作
-      -- 虚拟输入框保持打开状态
-    end,
-    on_change = function(content)
-      -- 可以在这里处理内容变化
-      -- print("内容变化:", content)
-    end,
+    on_cancel = function() end,
+    on_change = function(content) end,
   })
-
-  if success then
-    print("📝 虚拟输入框已打开")
-    return true
-  else
-    print("⚠️  无法打开虚拟输入框")
-    return false
-  end
 end
+
+--- 显示悬浮文本
 
 --- 加载消息数据（内部函数）
 --- @param session_id string 会话ID
@@ -736,15 +642,61 @@ function M._load_messages(session_id)
   end
 
   -- 使用 get_context_and_new_parent 获取上下文路径
+  -- 注意：get_context_and_new_parent 内部使用 get_messages，会解包 JSON 格式的 assistant 消息
+  -- 我们需要保留原始 JSON 格式以便渲染思考过程的折叠标记
   local context_msgs, _ = hm.get_context_and_new_parent(target_id)
   if #context_msgs > 0 then
-    state.messages = context_msgs
+    -- 重新从会话中获取原始消息，保留 JSON 格式
+    state.messages = M._load_raw_messages(target_id, hm)
     return
   end
 
   -- 如果上下文为空，直接获取该会话的消息
-  local msgs = hm.get_messages(target_id)
-  state.messages = msgs
+  -- 同样需要保留原始 JSON 格式
+  state.messages = M._load_raw_messages(target_id, hm)
+end
+
+--- 从历史管理器加载原始消息（保留 assistant 消息的 JSON 格式）
+--- @param session_id string 会话ID
+--- @param hm table 历史管理器实例
+--- @return table 消息列表
+function M._load_raw_messages(session_id, hm)
+  local messages = {}
+  
+  -- 获取上下文路径中的会话ID列表
+  local session = hm.get_session(session_id)
+  if not session then
+    return messages
+  end
+  
+  -- 遍历上下文路径
+  local current = session
+  for _ = 1, 100 do
+    -- 添加当前会话的消息（保留原始格式）
+    if current.user and current.user ~= "" then
+      table.insert(messages, { role = "user", content = current.user })
+    end
+    if current.assistant and current.assistant ~= "" then
+      -- 保留原始 assistant 内容（可能是 JSON 格式，也可能是纯文本）
+      table.insert(messages, { role = "assistant", content = current.assistant })
+    end
+    
+    -- 继续到子会话
+    local child_ids = current.child_ids or {}
+    if #child_ids == 0 then
+      break
+    elseif #child_ids == 1 then
+      current = hm.get_session(child_ids[1])
+      if not current then
+        break
+      end
+    else
+      -- 多个子会话，停止（这是分支点）
+      break
+    end
+  end
+  
+  return messages
 end
 
 --- 异步加载消息数据（内部函数）
@@ -802,8 +754,10 @@ function M.close()
     { pattern = "NeoAI:chat_box_closing", data = { window_id = state.current_window_id } }
   )
 
-  -- 关闭虚拟输入框（只在聊天界面关闭时才关闭，使用force模式）
-  virtual_input.close("force")
+  -- 关闭浮动虚拟输入框
+  if virtual_input.is_active() then
+    virtual_input.close()
+  end
 
   window_manager.close_window(state.current_window_id)
 
@@ -1063,44 +1017,39 @@ end
 --- @param role string 角色 ('user' 或 'assistant')
 --- @param content string 消息内容
 function M._persist_message(role, content)
-  --- 持久化消息到存储系统（内部函数）
-  --- @param role string 角色 ('user' 或 'assistant')
-  --- @param content string 消息内容
-  function M._persist_message(role, content)
-    local ok, hm = pcall(require, "NeoAI.core.history_manager")
-    if not ok or not hm.is_initialized() then
-      return
-    end
-    local session = hm.get_current_session()
-    if not session then
-      return
-    end
-    if role == "user" then
-      hm.add_round(session.id, content, "")
-    elseif role == "assistant" then
-      hm.update_last_assistant(session.id, content)
-    end
+  local ok, hm = pcall(require, "NeoAI.core.history_manager")
+  if not ok or not hm.is_initialized() then
+    return
+  end
+  local session = hm.get_current_session()
+  if not session then
+    return
+  end
+  if role == "user" then
+    hm.add_round(session.id, content, "")
+  elseif role == "assistant" then
+    hm.update_last_assistant(session.id, content)
   end
 
-  --- 更新已持久化的消息
-  --- @param role string 角色 ('user' 或 'assistant')
-  --- @param content string 新消息内容
-  function M._update_persisted_message(role, content)
-    local ok, hm = pcall(require, "NeoAI.core.history_manager")
-    if not ok or not hm.is_initialized() then
-      return
-    end
-    local session = hm.get_current_session()
-    if not session then
-      return
-    end
-    if role == "assistant" then
-      hm.update_last_assistant(session.id, content)
-    end
-  end
-
-  -- 3. 触发自动保存
+  -- 触发自动保存
   M._trigger_auto_save()
+end
+
+--- 更新已持久化的消息
+--- @param role string 角色 ('user' 或 'assistant')
+--- @param content string 新消息内容
+function M._update_persisted_message(role, content)
+  local ok, hm = pcall(require, "NeoAI.core.history_manager")
+  if not ok or not hm.is_initialized() then
+    return
+  end
+  local session = hm.get_current_session()
+  if not session then
+    return
+  end
+  if role == "assistant" then
+    hm.update_last_assistant(session.id, content)
+  end
 end
 
 --- 将光标移动到缓冲区末尾（最新消息位置）
@@ -1129,23 +1078,6 @@ function M._move_cursor_to_end()
     pcall(vim.api.nvim_win_call, win_handle, function()
       vim.cmd("normal! zb")
     end)
-  end
-end
-
---- 将光标移动到虚拟输入框窗口（不进入插入模式）
-function M._focus_virtual_input()
-  if not state.current_window_id then
-    return
-  end
-
-  -- 检查虚拟输入框是否激活
-  if not virtual_input.is_active() then
-    return
-  end
-
-  local input_win = virtual_input.get_window_id()
-  if input_win and vim.api.nvim_win_is_valid(input_win) then
-    pcall(vim.api.nvim_set_current_win, input_win)
   end
 end
 
@@ -1234,9 +1166,9 @@ function M._setup_event_listeners()
         return
       end
 
-      -- AI开始生成时关闭虚拟输入框
+      -- AI开始生成时关闭浮动输入框
       if virtual_input.is_active() then
-        virtual_input.close("force")
+        virtual_input.close()
       end
     end,
   })
@@ -1313,6 +1245,7 @@ function M._setup_event_listeners()
       end
 
       -- 关闭思考过程悬浮窗口
+      -- 思考内容已通过全量重渲染以折叠标记格式显示
       local reasoning_display = require("NeoAI.ui.components.reasoning_display")
       if reasoning_display.is_visible() then
         reasoning_display.close()
@@ -1330,15 +1263,10 @@ function M._setup_event_listeners()
       -- 全量重渲染
       M.render_chat()
 
-      -- 关闭虚拟输入框并重新打开（不进入插入模式）
-      if virtual_input.is_active() then
-        virtual_input.close("force")
-      end
+      -- AI正文输出结束后，打开浮动输入框并将光标移动过去
       vim.defer_fn(function()
-        M._open_virtual_input()
-        -- 将光标移动到虚拟输入框窗口
-        M._focus_virtual_input()
-      end, 200)
+        M._open_float_input()
+      end, 300)
     end,
   })
 
@@ -1420,20 +1348,13 @@ function M._setup_event_listeners()
         end
       end
 
-      -- 检测到正文输出（非思考内容），立即关闭思考过程悬浮窗口
-      -- 用户期望：思考结束后正文开始输出时，悬浮文本就关闭，而不是等所有输出结束
+      -- 检测到正文输出（非思考内容），关闭思考过程悬浮窗口
+      -- 思考过程不在此处流式追加，而是等生成完成后通过全量渲染一次性添加折叠文本
       if state.streaming.reasoning_active then
         state.streaming.reasoning_active = false
         state.streaming.reasoning_done = true
         local reasoning_display = require("NeoAI.ui.components.reasoning_display")
         if reasoning_display.is_visible() then
-          -- 将思考过程以折叠文本格式直接追加到聊天缓冲区
-          -- 让用户立即看到思考过程，而不是等到正文输出完成
-          local reasoning_text = state.streaming.reasoning_buffer or ""
-          if reasoning_text ~= "" then
-            local folded_text = "\n🤔 思考过程 {{{ " .. reasoning_text .. " \n}}} \n"
-            M._append_stream_chunk_to_buffer(folded_text)
-          end
           reasoning_display.close()
         end
       end
@@ -1575,11 +1496,9 @@ function M._setup_event_listeners()
         return
       end
 
-      -- 思考结束后：将悬浮窗口转换为折叠文本并关闭
+      -- 关闭思考过程悬浮窗口
+      -- 思考内容已通过 _finalize_streaming 的全量重渲染以折叠标记格式显示
       local reasoning_display = require("NeoAI.ui.components.reasoning_display")
-      if reasoning_text and reasoning_text ~= "" then
-        reasoning_display._convert_to_folded_text(reasoning_text)
-      end
       if reasoning_display.is_visible() then
         reasoning_display.close()
       end
@@ -1587,15 +1506,10 @@ function M._setup_event_listeners()
       -- 完成流式渲染
       M._finalize_streaming()
 
-      -- 关闭虚拟输入框并重新打开（不进入插入模式）
-      if virtual_input.is_active() then
-        virtual_input.close("force")
-      end
+      -- AI正文输出结束后，打开浮动输入框并将光标移动过去
       vim.defer_fn(function()
-        M._open_virtual_input()
-        -- 将光标移动到虚拟输入框窗口
-        M._focus_virtual_input()
-      end, 200)
+        M._open_float_input()
+      end, 300)
     end,
   })
 
@@ -1751,9 +1665,7 @@ function M._append_stream_chunk_to_buffer(chunk_content, content_type)
     end
   end
 
-  -- 恢复只读
-  pcall(vim.api.nvim_set_option_value, "readonly", true, { buf = buf })
-  pcall(vim.api.nvim_set_option_value, "modifiable", false, { buf = buf })
+  -- 不恢复只读（内联输入模式需要保持可修改）
   pcall(vim.api.nvim_set_option_value, "modified", false, { buf = buf })
 
   -- 滚动到底部显示最新内容

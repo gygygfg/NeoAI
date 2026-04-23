@@ -206,6 +206,21 @@ function M.refresh_tree()
 
   -- 异步重新加载数据并渲染
   M._load_tree_data_async(state.current_session_id, function()
+    -- 渲染前验证选中的节点是否仍然存在于树中
+    if state.selected_node_id then
+      local function node_exists(nodes, target_id)
+        for _, node in ipairs(nodes) do
+          if node.id == target_id then return true end
+          if node.children and #node.children > 0 then
+            if node_exists(node.children, target_id) then return true end
+          end
+        end
+        return false
+      end
+      if not node_exists(state.tree_data, state.selected_node_id) then
+        state.selected_node_id = nil
+      end
+    end
     M.render_tree(state.tree_data)
   end)
 end
@@ -912,6 +927,8 @@ function M._delete_node()
     return
   end
   hm.delete_session(node_id)
+  -- 清除选中状态，避免后续渲染时引用已删除的节点
+  state.selected_node_id = nil
   vim.notify("已删除会话", vim.log.levels.INFO)
   M.refresh_tree()
 end
@@ -947,7 +964,8 @@ function M._update_float_window()
       -- 移除换行符，确保是单行字符串
       status_text = status_text .. node_name:gsub("\n", " "):gsub("\r", " ")
     else
-      status_text = status_text .. state.selected_node_id
+      -- 节点名称获取失败（可能已被删除），显示为"无"
+      status_text = status_text .. "无"
     end
   else
     status_text = status_text .. "无"
@@ -1102,15 +1120,18 @@ function M.is_open()
 end
 
 --- 选择指定节点
---- @param node_id string 节点ID
+--- @param node_id string|nil 节点ID，传入 nil 清除选中状态
 --- @return boolean 是否成功
 function M.select_node(node_id)
   if not state.initialized then
     return false
   end
 
+  -- 清除选中状态
   if not node_id then
-    return false
+    state.selected_node_id = nil
+    M._update_status_line()
+    return true
   end
 
   -- 触发节点选择事件

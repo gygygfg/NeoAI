@@ -6,6 +6,8 @@ local M = {}
 local state = {
   initialized = false,
   config = nil,
+  -- 存储待写入的用户消息，key=session_id, value=user_message
+  pending_user_messages = {},
 }
 
 local function get_hm()
@@ -62,12 +64,19 @@ function M._trigger_ai_response(data)
     if not session then return end
 
     local context_msgs, _ = hm.get_context_and_new_parent(session.id)
-    if #context_msgs == 0 then return end
 
     local messages = {}
     for _, msg in ipairs(context_msgs) do
       table.insert(messages, { role = msg.role, content = msg.content })
     end
+
+    -- 将待写入的用户消息追加到上下文中（尚未写入历史文件）
+    local pending_msg = state.pending_user_messages[session.id]
+    if pending_msg then
+      table.insert(messages, { role = "user", content = pending_msg })
+    end
+
+    if #messages == 0 then return end
 
     local core_loaded, core = pcall(require, "NeoAI.core")
     if not core_loaded or not core then return end
@@ -82,9 +91,37 @@ function M._trigger_ai_response(data)
   end, 500)
 end
 
+--- 将待写入的用户消息和AI回复一起写入历史文件
+--- @param session_id string 会话ID
+--- @param assistant_content string AI回复内容
+--- @param usage table|nil token用量
+local function _flush_pending_round(session_id, assistant_content, usage)
+  local hm = get_hm()
+  if not hm then return end
+
+  local user_msg = state.pending_user_messages[session_id]
+  if not user_msg then
+    -- 没有待写入的用户消息，直接更新AI回复
+    local session = hm.get_session(session_id)
+    if session then
+      hm.update_last_assistant(session_id, assistant_content)
+      if usage and next(usage) then
+        hm.update_usage(session_id, usage)
+      end
+    end
+    return
+  end
+
+  -- 将用户消息和AI回复一起写入历史文件
+  hm.add_round(session_id, user_msg, assistant_content, usage)
+  -- 清理待写入队列
+  state.pending_user_messages[session_id] = nil
+end
+
 function M._handle_response_complete(data)
   local response = data.response
   local session_id = data.session_id
+  local usage = data.usage or {}
 
   local response_content = ""
   if type(response) == "string" then
@@ -97,18 +134,8 @@ function M._handle_response_complete(data)
 
   if response_content == "" then return end
 
-  local hm = get_hm()
-  if hm and session_id then
-    local session = hm.get_session(session_id)
-    if session and #session.rounds > 0 then
-      local last_round = session.rounds[#session.rounds]
-      if last_round.assistant == "" or last_round.assistant == nil then
-        hm.update_last_assistant(session_id, response_content)
-      else
-        hm.add_round(session_id, "", response_content)
-      end
-    end
-  end
+  -- 将用户消息和AI回复一起写入历史文件
+  _flush_pending_round(session_id, response_content, usage)
 
   local chat_window = require("NeoAI.ui.window.chat_window")
   if chat_window.is_available() then
@@ -161,17 +188,18 @@ function M._handle_stream_complete(data)
   local full_response = data.full_response
   local reasoning_text = data.reasoning_text
   local session_id = data.session_id
+  local usage = data.usage or {}
 
-  local hm = get_hm()
-  if hm and session_id and full_response then
-    local session = hm.get_session(session_id)
-    if session and #session.rounds > 0 then
-      local last_round = session.rounds[#session.rounds]
-      if last_round.assistant == "" or last_round.assistant == nil then
-        hm.update_last_assistant(session_id, full_response)
-      end
-    end
-  end
+  if not session_id or not full_response then return end
+
+  -- 将 content 和 reasoning_content 打包为 JSON 字符串
+  local assistant_json = vim.json.encode({
+    content = full_response,
+    reasoning_content = reasoning_text or "",
+  })
+
+  -- 将用户消息和AI回复一起写入历史文件
+  _flush_pending_round(session_id, assistant_json, usage)
 end
 
 function M.send_message(content, session_id, branch_id, window_id, format, callback)
@@ -200,13 +228,15 @@ function M.send_message(content, session_id, branch_id, window_id, format, callb
 
   local target_session_id = session.id
   local current_session = hm.get_session(session.id)
-  if current_session and #(current_session.child_ids or {}) > 0 then
+  if current_session and current_session.user ~= nil and current_session.user ~= "" and #(current_session.child_ids or {}) > 0 then
     local new_id = hm.create_session("分支-" .. current_session.name, false, session.id)
     hm.set_current_session(new_id)
     target_session_id = new_id
   end
 
-  hm.add_round(target_session_id, content, "")
+  -- 不立即写入历史文件，先保存用户消息到待写入队列
+  -- 等AI响应完成后，再将用户消息和AI回复一起写入
+  state.pending_user_messages[target_session_id] = content
 
   local chat_window = require("NeoAI.ui.window.chat_window")
   if chat_window.is_available() then
@@ -236,7 +266,10 @@ function M.get_message_count()
   if not hm then return 0 end
   local session = hm.get_current_session()
   if not session then return 0 end
-  return #(session.rounds or {}) * 2
+  local count = 0
+  if session.user and session.user ~= "" then count = count + 1 end
+  if session.assistant and session.assistant ~= "" then count = count + 1 end
+  return count
 end
 
 function M.update_config(new_config)

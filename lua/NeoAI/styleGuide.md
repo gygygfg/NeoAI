@@ -213,7 +213,7 @@ require("NeoAI").setup({
 - 初始创建空文件内容为 `[\n]`
 - 添加会话时覆写最后一行 `]` 为 `,新内容\n]`
 
-**会话对象结构**（无 `current_branch_id`、`branches` 字段）：
+**会话对象结构**（扁平结构，一轮对话一个会话，无 `rounds` 数组）：
 ```json
 {
   "id": "session_1",
@@ -222,19 +222,31 @@ require("NeoAI").setup({
   "updated_at": 1234567890,
   "is_root": true,
   "child_ids": ["session_2", "session_3"],
-  "rounds": [
-    { "user": "用户消息", "assistant": "AI回复", "timestamp": 1234567890 }
-  ]
+  "user": "用户消息",
+  "assistant": "{\"content\":\"AI回复\",\"reasoning_content\":\"思考文本\"}",
+  "timestamp": 1234567890,
+  "usage": {
+    "prompt_tokens": 24,
+    "completion_tokens": 770,
+    "total_tokens": 794
+  }
 }
 ```
+
+**字段说明**：
+- `user` — 用户消息文本
+- `assistant` — AI 回复的 JSON 字符串，包含 `content`（回复内容）和 `reasoning_content`（深度思考文本）
+- `timestamp` — 本轮对话的时间戳
+- `usage` — token 用量统计（从流式响应结束时的 `data.usage` 提取）
 
 **关键方法**：
 - `create_session(name, is_root, parent_id)` — 创建会话（根/子）
 - `get_session(session_id)` / `get_current_session()` — 获取会话
 - `set_current_session(session_id)` — 设置当前会话
 - `delete_session(session_id)` — 删除会话（递归删除子会话）
-- `add_round(session_id, user_msg, assistant_msg)` — 添加一轮对话
-- `update_last_assistant(session_id, content)` — 流式更新最后一轮AI回复
+- `add_round(session_id, user_msg, assistant_msg, usage)` — 添加一轮对话（直接设置 `user`/`assistant`/`timestamp`/`usage`）
+- `update_last_assistant(session_id, content)` — 流式更新当前会话的AI回复
+- `update_usage(session_id, usage)` — 更新当前会话的 token 用量
 - `get_messages(session_id)` — 展平为 role/content 列表
 - `get_root_sessions()` — 获取所有根会话
 - `get_tree()` — 获取树结构（先遍历根会话，再递归子会话）
@@ -608,27 +620,31 @@ vim.api.nvim_create_autocmd("User", {
 
 ### JSON 文件格式
 
-文件 `sessions.json` 是一个 JSON 数组，每行一个元素：
+文件 `sessions.json` 是一个 JSON 数组，每个元素是一个扁平会话（一轮对话一个会话）：
 
 ```json
 [
-{"id":"session_1","name":"根会话","created_at":1234567890,"updated_at":1234567890,"is_root":true,"child_ids":["session_2"],"rounds":[{"user":"你好","assistant":"你好！有什么可以帮助你的？","timestamp":1234567890}]},
-{"id":"session_2","name":"子会话-根会话","created_at":1234567891,"updated_at":1234567891,"is_root":false,"child_ids":[],"rounds":[]}
+{"id":"session_1","name":"根会话","created_at":1234567890,"updated_at":1234567890,"is_root":true,"child_ids":["session_2"],"user":"你好","assistant":"{\"content\":\"你好！有什么可以帮助你的？\",\"reasoning_content\":\"思考文本\"}","timestamp":1234567890,"usage":{"prompt_tokens":24,"completion_tokens":770,"total_tokens":794}},
+{"id":"session_2","name":"子会话-根会话","created_at":1234567891,"updated_at":1234567891,"is_root":false,"child_ids":[],"user":"","assistant":"","timestamp":null,"usage":{}}
 ]
 ```
 
+**注意**：`assistant` 字段存储的是 JSON 字符串（包含 `content` 和 `reasoning_content`），而非纯文本。`get_messages()` 会自动解析该 JSON 并提取 `content` 字段作为消息内容。
+
 ### 树渲染规则
 
-`history_manager.get_tree()` 返回的树结构：
+`history_manager.get_tree()` 返回的树结构（每个节点代表一轮对话）：
 
 ```
-根会话 A (round_count: 3)
-├── 子会话 B (round_count: 5)       ← 只有一个子会话，直接显示
+根会话 A (preview: "你好")
+├── 子会话 B (preview: "继续...")   ← 只有一个子会话，直接显示
 └── 📂 根会话 A (分支)              ← 多个子会话，自动生成虚拟节点
-    ├── 子会话 C (round_count: 2)
-    └── 子会话 D (round_count: 1)
-根会话 E (round_count: 0)           ← 无子会话，无子节点
+    ├── 子会话 C (preview: "请问...")
+    └── 子会话 D (preview: "帮我...")
+根会话 E (preview: "")             ← 无子会话，无子节点
 ```
+
+**注意**：树节点不再显示 `round_count`，改为显示 `preview`（用户消息的前 20 个字符预览）。
 
 ### 上下文路径规则
 

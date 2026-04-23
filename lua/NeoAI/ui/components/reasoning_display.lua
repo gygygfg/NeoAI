@@ -295,7 +295,8 @@ function M.update(content)
   end
 end
 
---- 将思考内容转换为折叠文本
+--- 将思考内容转换为 Neovim 原生折叠文本
+--- 使用 foldmethod=marker 和 foldmarker={{{,}}} 实现折叠
 --- @param reasoning_text string 思考内容
 --- @return string 折叠文本格式的字符串
 function M._convert_to_folded_text(reasoning_text)
@@ -306,17 +307,18 @@ function M._convert_to_folded_text(reasoning_text)
     return ""
   end
 
-  -- 创建折叠文本格式
-  local folded_text = "\n<details>\n<summary>🤔 思考过程 (点击展开)</summary>\n\n"
-  folded_text = folded_text .. reasoning_str
-  folded_text = folded_text .. "\n\n</details>\n"
+  -- 创建 Neovim 原生折叠文本格式
+  -- 折叠标记 {{{ 和 }}} 必须位于行首才能被 foldmethod=marker 识别
+  -- {{{ 前面不能有任何字符（包括空格）
+  local folded_text = ""
+  folded_text = folded_text .. "{{{ 🤔 思考过程" .. "\n"
 
-  -- 将折叠文本复制到剪贴板
-  vim.fn.setreg("+", folded_text)
-  vim.fn.setreg("*", folded_text)
+  -- 缩进思考内容
+  for _, line in ipairs(vim.split(reasoning_str, "\n")) do
+    folded_text = folded_text .. "  " .. line .. "\n"
+  end
 
-  -- 通知用户
-  vim.notify("思考过程已转换为折叠文本并复制到剪贴板", vim.log.levels.INFO)
+  folded_text = folded_text .. "}}}"
 
   return folded_text
 end

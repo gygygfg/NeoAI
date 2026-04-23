@@ -455,6 +455,7 @@ function M._handle_stream_end(generation_id, params)
   -- 获取完整的流式响应
   local full_response = state.stream_processor.get_full_response(generation_id)
   local reasoning_text = state.stream_processor.get_reasoning_text(generation_id)
+  local usage = state.stream_processor.get_usage(generation_id)
 
   -- 清理流式处理器
   state.stream_processor.end_stream(generation_id)
@@ -466,6 +467,7 @@ function M._handle_stream_end(generation_id, params)
       generation_id = generation_id,
       full_response = full_response,
       reasoning_text = reasoning_text,
+      usage = usage,
       session_id = session_id,
       window_id = window_id,
     },
@@ -476,6 +478,7 @@ function M._handle_stream_end(generation_id, params)
     session_id = session_id,
     window_id = window_id,
     reasoning_text = reasoning_text,
+    usage = usage,
   })
 end
 
@@ -504,6 +507,7 @@ function M._finalize_generation(generation_id, response_text, params)
 
   -- 获取思考内容（优先使用传入的参数，因为流式处理器可能已被清理）
   local reasoning_text = params.reasoning_text or state.stream_processor.get_reasoning_text(generation_id)
+  local usage = params.usage or {}
 
   -- 触发生成完成事件
   vim.api.nvim_exec_autocmds("User", {
@@ -512,6 +516,7 @@ function M._finalize_generation(generation_id, response_text, params)
       generation_id = generation_id,
       response = response_text or "",
       reasoning_text = reasoning_text or "",
+      usage = usage,
       session_id = session_id,
       window_id = window_id,
       duration = os.time() - generation.start_time,

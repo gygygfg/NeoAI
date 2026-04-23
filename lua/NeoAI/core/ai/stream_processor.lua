@@ -39,6 +39,7 @@ function M.start_stream(params)
     content_buffer = "",            -- 累积的普通内容
     reasoning_buffer = "",          -- 累积的思考内容
     tool_calls = {},                -- 累积的工具调用
+    usage = {},                     -- token 用量
     session_id = session_id,
     window_id = window_id,
     start_time = os.time(),
@@ -157,6 +158,7 @@ function M.process_chunk(params)
 
   -- 处理 usage 信息
   if data.usage then
+    processor.usage = data.usage
     result.usage = data.usage
   end
 
@@ -172,6 +174,17 @@ function M.get_full_response(generation_id)
     return ""
   end
   return processor.content_buffer or ""
+end
+
+--- 获取 usage 信息
+--- @param generation_id string 生成ID
+--- @return table usage 信息
+function M.get_usage(generation_id)
+  local processor = state.active_processors[generation_id]
+  if not processor then
+    return {}
+  end
+  return processor.usage or {}
 end
 
 --- 获取思考内容
@@ -202,10 +215,12 @@ function M.end_stream(generation_id)
   local processor = state.active_processors[generation_id]
   if processor then
     local duration = os.time() - processor.start_time
-    logger.debug(string.format(
-      "Stream ended (generation=%s): duration=%ds, content=%d chars, reasoning=%d chars",
-      generation_id, duration, #(processor.content_buffer or ""), #(processor.reasoning_buffer or "")
-    ))
+  logger.debug(string.format(
+    "Stream ended (generation=%s): duration=%ds, content=%d chars, reasoning=%d chars",
+    generation_id, duration, #(processor.content_buffer or ""), #(processor.reasoning_buffer or "")
+  ))
+  -- 清理前保存 usage
+  processor.usage = processor.usage or {}
     state.active_processors[generation_id] = nil
   end
 end

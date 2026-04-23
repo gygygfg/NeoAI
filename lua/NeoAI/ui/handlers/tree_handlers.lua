@@ -123,6 +123,8 @@ function M.handle_d()
   if confirm ~= 1 then return end
   hm.delete_session(selected_id)
   vim.notify("已删除会话", vim.log.levels.INFO)
+  -- 清除选中状态，避免后续渲染时引用已删除的节点
+  tree_window.select_node(nil)
   tree_window.refresh_tree()
 end
 
