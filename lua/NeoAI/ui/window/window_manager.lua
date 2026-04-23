@@ -109,6 +109,8 @@ local function create_float_window(options)
   vim.api.nvim_set_option_value("bufhidden", "hide", { buf = buf })
   vim.api.nvim_set_option_value("modifiable", false, { buf = buf })
   vim.api.nvim_set_option_value("readonly", true, { buf = buf })
+  -- 标记为未修改，避免保存警告
+  vim.api.nvim_set_option_value("modified", false, { buf = buf })
 
   -- 设置缓冲区名称（临时名称，后面会覆盖）
   vim.api.nvim_buf_set_name(buf, "neoai://float/temp")
@@ -331,6 +333,12 @@ local function set_window_content_by_mode(window_info, content, filetype)
   if filetype then
     vim.api.nvim_set_option_value("filetype", filetype, { buf = buf })
   end
+  
+  -- 恢复缓冲区为只读状态
+  vim.api.nvim_set_option_value("modifiable", false, { buf = buf })
+  vim.api.nvim_set_option_value("readonly", true, { buf = buf })
+  -- 标记为未修改，避免保存警告
+  vim.api.nvim_set_option_value("modified", false, { buf = buf })
 end
 
 --- 追加窗口内容
@@ -623,10 +631,12 @@ function M.set_window_content(window_id, content)
   local window_type = window.type
   local buf = window.window_info and window.window_info.buf or window.buf
 
-  if window_type == "tree" or window_type == "reasoning" then
-    -- 树窗口和思考窗口设置为只读
+  if window_type == "tree" or window_type == "reasoning" or window_type == "chat" then
+    -- 树窗口、思考窗口和聊天窗口设置为只读
     vim.api.nvim_set_option_value("modifiable", false, { buf = buf })
     vim.api.nvim_set_option_value("readonly", true, { buf = buf })
+    -- 清除修改标志，避免退出时出现 "No write since last change" 错误
+    vim.api.nvim_set_option_value("modified", false, { buf = buf })
   else
     -- 其他窗口保持可修改
     vim.api.nvim_set_option_value("modifiable", true, { buf = buf })

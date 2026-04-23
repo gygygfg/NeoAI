@@ -8,20 +8,20 @@ local function set_virtual_placeholder(buf_id, placeholder, show)
 
   -- 使用专门的命名空间用于虚拟文本
   local ns_id = vim.api.nvim_create_namespace("NeoAI_VirtualInput_Placeholder")
-  
+
   -- 清除之前的虚拟文本
   vim.api.nvim_buf_clear_namespace(buf_id, ns_id, 0, -1)
-  
+
   if show then
     -- 获取缓冲区内容
     local lines = vim.api.nvim_buf_get_lines(buf_id, 0, 1, false)
     local first_line = lines and lines[1] or ""
-    
+
     -- 只在缓冲区为空时显示占位符
     if first_line == "" then
       -- 设置虚拟文本占位符
       vim.api.nvim_buf_set_extmark(buf_id, ns_id, 0, 0, {
-        virt_text = {{placeholder, "Comment"}},
+        virt_text = { { placeholder, "Comment" } },
         virt_text_pos = "overlay",
         hl_mode = "combine",
         priority = 100, -- 高优先级，确保显示在最上层
@@ -114,10 +114,12 @@ function M.open(parent_window_id, options)
   end
 
   -- 设置缓冲区选项
-  vim.bo[state.buffer_id].buftype = "" -- 不使用 prompt 缓冲区
+  vim.bo[state.buffer_id].buftype = "nofile" -- 不关联文件
   vim.bo[state.buffer_id].bufhidden = "wipe"
   vim.bo[state.buffer_id].swapfile = false
   vim.bo[state.buffer_id].filetype = "markdown"
+  vim.bo[state.buffer_id].buflisted = false -- 不在:ls中显示
+  vim.bo[state.buffer_id].modified = false -- 标记为未修改
 
   -- 不再设置提示符，因为不使用 prompt 缓冲区
   -- if vim.fn.exists('*prompt_setprompt') == 1 then
@@ -126,7 +128,7 @@ function M.open(parent_window_id, options)
 
   -- 设置缓冲区内容
   vim.api.nvim_buf_set_lines(state.buffer_id, 0, -1, false, { state.content })
-  
+
   -- 根据内容是否为空来显示占位符
   if state.content == "" then
     set_virtual_placeholder(state.buffer_id, state.placeholder, true)
@@ -264,7 +266,7 @@ function M.submit()
   M.set_content("")
 
   -- 保持输入框打开
-  print("📝 消息已发送，输入框已清空")
+  -- print("📝 消息已发送，输入框已清空")
 end
 
 --- 回到正常模式（不关闭输入框）
@@ -332,7 +334,7 @@ function M.set_content(content)
 
     -- 设置缓冲区内容
     vim.api.nvim_buf_set_lines(state.buffer_id, 0, -1, false, { state.content })
-    
+
     -- 根据内容是否为空来显示或隐藏占位符
     if state.content == "" then
       set_virtual_placeholder(state.buffer_id, state.placeholder, true)
@@ -395,7 +397,7 @@ function M._get_keymaps()
         result.submit = chat_keymaps.send.normal.key
       end
     end
-    
+
     -- 获取其他按键
     if chat_keymaps.cancel then
       result.cancel = chat_keymaps.cancel.key
@@ -403,7 +405,7 @@ function M._get_keymaps()
     if chat_keymaps.clear then
       result.clear = chat_keymaps.clear.key
     end
-    
+
     -- 确保所有键位都有值
     for internal_name, default_key in pairs(default_keymaps) do
       if not result[internal_name] then
@@ -550,10 +552,10 @@ function M._setup_keymaps()
       local lines = vim.api.nvim_buf_get_lines(state.buffer_id, 0, -1, false)
       if #lines > 0 then
         local current_content = lines[1]
-        
+
         -- 更新 state.content
         state.content = current_content
-        
+
         -- 根据内容是否为空来更新虚拟占位符
         if current_content == "" then
           set_virtual_placeholder(state.buffer_id, state.placeholder, true)

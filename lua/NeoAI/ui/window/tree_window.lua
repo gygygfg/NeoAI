@@ -1357,6 +1357,8 @@ function M._update_float_window()
     -- 设置缓冲区为只读
     vim.api.nvim_set_option_value("modifiable", false, { buf = state.float_buf_id })
     vim.api.nvim_set_option_value("readonly", true, { buf = state.float_buf_id })
+    -- 标记为未修改，避免保存警告
+    vim.api.nvim_set_option_value("modified", false, { buf = state.float_buf_id })
   end
 end
 

@@ -75,15 +75,29 @@ function Worker:execute()
   -- 创建直接回调（作为备选）
   local direct_callback = execute_callback
   
-  -- 设置超时机制（5秒）
-  local timeout_timer = vim.loop.new_timer()
-  timeout_timer:start(5000, 0, vim.schedule_wrap(function()
-    if not callback_executed then
-      print("⚠️  异步任务超时，强制标记为失败")
-      execute_callback(false, nil, "任务执行超时")
+  -- 设置超时机制，根据任务类型设置不同的超时时间
+  local timeout_ms = 5000 -- 默认5秒
+  
+  -- 根据任务名称调整超时时间
+  if name and type(name) == "string" then
+    if name:match("ai_") or name:match("request") or name:match("response") or name:match("generate") then
+      -- AI相关任务需要更长的超时时间
+      timeout_ms = 60000 -- 60秒
+    elseif name:match("send_chat_message") or name:match("chat_message") then
+      -- 聊天消息发送任务需要中等超时时间
+      timeout_ms = 15000 -- 15秒
     end
-    timeout_timer:close()
-  end))
+  end
+  
+  local timeout_timer = vim.loop.new_timer()
+    timeout_timer:start(timeout_ms, 0, vim.schedule_wrap(function()
+      if not callback_executed then
+        local task_name = name or "unknown"
+        print("⚠️  异步任务超时，强制标记为失败 (任务: " .. tostring(task_name) .. ")")
+        execute_callback(false, nil, "任务执行超时 (" .. tostring(timeout_ms/1000) .. "秒)")
+      end
+      timeout_timer:close()
+    end))
 
   -- 使用vim.defer_fn在后台线程执行任务
   -- 添加额外的错误处理以确保稳定性

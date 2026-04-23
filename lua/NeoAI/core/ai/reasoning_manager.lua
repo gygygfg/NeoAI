@@ -1,4 +1,9 @@
+-- 思考过程管理
+-- 负责管理 AI 的思考过程，包括开始、追加、结束和格式化思考内容
 local M = {}
+
+-- 导入事件常量
+local event_constants = require("NeoAI.core.events.event_constants")
 
 -- 模块状态
 local state = {
@@ -23,14 +28,14 @@ function M.initialize(options)
   state.initialized = true
 
   -- 创建事件组
-  state.event_group = vim.api.nvim_create_augroup("NeoAIEvents", { clear = true })
+  state.event_group = vim.api.nvim_create_augroup("NeoAIReasoningEvents", { clear = true })
 
   -- 监听思考内容事件
   vim.api.nvim_create_autocmd("User", {
     group = state.event_group,
-    pattern = "reasoning_content",
+    pattern = event_constants.REASONING_CONTENT,
     callback = function(args)
-      local content = args.data and args.data[1] or ""
+      local content = args.data and args.data.reasoning_content or ""
       -- 自动开始思考过程
       if not state.reasoning_active then
         M.start_reasoning()
@@ -41,52 +46,37 @@ function M.initialize(options)
     desc = "处理思考内容",
   })
 
-  -- 监听思考块事件
-  vim.api.nvim_create_autocmd("User", {
-    group = state.event_group,
-    pattern = "reasoning_chunk",
-    callback = function(args)
-      local chunk = args.data and args.data[1] or ""
-      -- 自动开始思考过程
-      if not state.reasoning_active then
-        M.start_reasoning()
-      end
-
-      M.append_reasoning(chunk)
-    end,
-    desc = "处理思考块",
-  })
-
   -- 监听思考开始事件
   vim.api.nvim_create_autocmd("User", {
     group = state.event_group,
-    pattern = "reasoning_started",
+    pattern = event_constants.REASONING_STARTED,
     callback = function()
-      -- 触发UI显示事件
-      vim.api.nvim_exec_autocmds("User", {
-        pattern = "show_reasoning_display",
-      })
+      M.start_reasoning()
     end,
-    desc = "思考开始",
+    desc = "处理思考开始",
   })
 
   -- 监听思考完成事件
   vim.api.nvim_create_autocmd("User", {
     group = state.event_group,
-    pattern = "reasoning_finished",
-    callback = function(args)
-      local reasoning_text = args.data and args.data[1] or ""
-      -- 触发UI关闭事件
-      vim.api.nvim_exec_autocmds("User", {
-        pattern = "close_reasoning_display",
-        data = { reasoning_text },
-      })
+    pattern = event_constants.REASONING_COMPLETED,
+    callback = function()
+      M.finish_reasoning()
     end,
-    desc = "思考完成",
+    desc = "处理思考完成",
+  })
+
+  -- 触发配置加载事件
+  vim.api.nvim_exec_autocmds("User", {
+    pattern = event_constants.CONFIG_LOADED,
+    data = {
+      config = state.config,
+    },
   })
 end
 
 --- 开始思考过程
+--- @return nil
 function M.start_reasoning()
   if not state.initialized then
     return
@@ -97,18 +87,28 @@ function M.start_reasoning()
   end
 
   state.reasoning_active = true
-  state.reasoning_text = ""
   state.reasoning_start_time = os.time()
+  state.reasoning_text = ""
   state.reasoning_chunks = {}
 
-  -- 触发开始事件
+  -- 触发思考开始事件
   vim.api.nvim_exec_autocmds("User", {
-    pattern = "reasoning_started",
+    pattern = event_constants.REASONING_STARTED,
+  })
+
+  -- 触发日志事件
+  vim.api.nvim_exec_autocmds("User", {
+    pattern = event_constants.LOG_INFO,
+    data = {
+      message = "思考过程开始",
+      timestamp = state.reasoning_start_time,
+    },
   })
 end
 
 --- 追加思考内容
 --- @param content string 思考内容
+--- @return nil
 function M.append_reasoning(content)
   if not state.initialized then
     return
@@ -118,28 +118,37 @@ function M.append_reasoning(content)
     M.start_reasoning()
   end
 
-  -- 添加内容（确保 content 不是 nil）
-  local safe_content = content or ""
-
-  -- 确保 safe_content 是字符串类型
+  -- 确保内容是字符串
+  local safe_content = content
   if type(safe_content) ~= "string" then
     safe_content = tostring(safe_content)
   end
 
+  -- 添加到思考文本
   state.reasoning_text = state.reasoning_text .. safe_content
+
+  -- 添加到思考块列表
   table.insert(state.reasoning_chunks, {
     content = safe_content,
     timestamp = os.time(),
   })
 
-  -- 触发追加事件
+  -- 触发消息更新事件
   vim.api.nvim_exec_autocmds("User", {
-    pattern = "reasoning_appended",
-    data = { content, state.reasoning_text },
+    pattern = event_constants.MESSAGE_UPDATED,
+    data = {
+      message_id = "reasoning",
+      message = {
+        role = "assistant",
+        content = state.reasoning_text,
+        reasoning = true,
+      },
+    },
   })
 end
 
---- 完成思考过程
+--- 结束思考过程
+--- @return nil
 function M.finish_reasoning()
   if not state.initialized then
     return
@@ -152,29 +161,45 @@ function M.finish_reasoning()
   local reasoning_duration = os.time() - (state.reasoning_start_time or os.time())
   state.reasoning_active = false
 
-  -- 触发完成事件
+  -- 触发思考完成事件
   vim.api.nvim_exec_autocmds("User", {
-    pattern = "reasoning_finished",
-    data = { state.reasoning_text, reasoning_duration },
+    pattern = event_constants.REASONING_COMPLETED,
+    data = {
+      reasoning_text = state.reasoning_text,
+      duration = reasoning_duration,
+    },
   })
 
-  -- 清空思考内容
-  M.clear_reasoning()
+  -- 触发日志事件
+  vim.api.nvim_exec_autocmds("User", {
+    pattern = event_constants.LOG_INFO,
+    data = {
+      message = string.format(
+        "思考过程结束，时长：%d秒，内容长度：%d字符",
+        reasoning_duration,
+        #state.reasoning_text
+      ),
+      timestamp = os.time(),
+    },
+  })
+
+  -- 触发消息更新事件
+  vim.api.nvim_exec_autocmds("User", {
+    pattern = event_constants.MESSAGE_UPDATED,
+    data = {
+      message_id = "reasoning",
+      message = {
+        role = "assistant",
+        content = state.reasoning_text,
+        reasoning = true,
+        completed = true,
+      },
+    },
+  })
 end
 
---- 添加推理步骤（别名函数）
---- @param step string 推理步骤
-function M.add_step(step)
-  M.append_reasoning(step)
-end
-
---- 完成推理（别名函数）
-function M.complete_reasoning()
-  M.finish_reasoning()
-end
-
---- 获取推理内容
---- @return string 推理内容
+--- 获取思考内容
+--- @return string 思考文本
 function M.get_reasoning()
   return state.reasoning_text
 end
@@ -185,106 +210,150 @@ function M.get_reasoning_text()
   return state.reasoning_text
 end
 
---- 清空思考
+--- 清除思考内容
+--- @return nil
 function M.clear_reasoning()
+  if not state.initialized then
+    return
+  end
+
+  state.reasoning_active = false
   state.reasoning_text = ""
-  state.reasoning_chunks = {}
   state.reasoning_start_time = nil
+  state.reasoning_chunks = {}
+
+  -- 触发消息删除事件
+  vim.api.nvim_exec_autocmds("User", {
+    pattern = event_constants.MESSAGE_DELETED,
+    data = {
+      message_id = "reasoning",
+      message = {
+        role = "assistant",
+        content = "",
+        reasoning = true,
+      },
+    },
+  })
 end
 
---- 获取思考状态
---- @return table 思考状态
-function M.get_reasoning_state()
-  return {
-    active = state.reasoning_active,
-    text = state.reasoning_text,
-    start_time = state.reasoning_start_time,
-    duration = state.reasoning_start_time and (os.time() - state.reasoning_start_time) or 0,
-    chunk_count = #state.reasoning_chunks,
-  }
-end
-
---- 获取思考块列表
---- @return table 思考块列表
-function M.get_reasoning_chunks()
-  return vim.deepcopy(state.reasoning_chunks)
-end
-
---- 是否正在思考
---- @return boolean 是否正在思考
+--- 检查思考过程是否激活
+--- @return boolean 是否激活
 function M.is_reasoning_active()
   return state.reasoning_active
 end
 
 --- 获取思考摘要
 --- @param max_length number 最大长度
---- @return string 思考摘要
+--- @return string 摘要
 function M.get_reasoning_summary(max_length)
+  if not state.reasoning_text or state.reasoning_text == "" then
+    return ""
+  end
+
   max_length = max_length or 200
 
   if #state.reasoning_text <= max_length then
     return state.reasoning_text
   end
 
-  -- 简单截断
-  local summary = state.reasoning_text:sub(1, max_length) .. "..."
-
-  -- 尝试在句子边界截断
-  local last_period = summary:reverse():find("%.")
-  if last_period then
-    summary = summary:sub(1, max_length - last_period + 1) .. "..."
+  -- 截取前 max_length 个字符，并确保在完整单词处截断
+  local summary = state.reasoning_text:sub(1, max_length)
+  local last_space = summary:find("[%s%p]$")
+  if last_space then
+    summary = summary:sub(1, last_space - 1)
   end
 
-  return summary
+  return summary .. "..."
 end
 
---- 格式化思考内容为显示文本
---- @param reasoning_text_or_include_timestamps string|boolean 推理文本或是否包含时间戳
---- @return string 格式化后的文本
-function M.format_reasoning(reasoning_text_or_include_timestamps)
-  -- 处理字符串参数（推理文本）
+--- 格式化思考内容
+--- @param reasoning_text_or_include_timestamps string|boolean 思考文本或是否包含时间戳
+--- @param include_timestamps boolean 是否包含时间戳
+--- @return string 格式化后的思考文本
+function M.format_reasoning(reasoning_text_or_include_timestamps, include_timestamps)
+  local reasoning_text = state.reasoning_text
+  local use_timestamps = include_timestamps or false
+
+  -- 处理参数重载
   if type(reasoning_text_or_include_timestamps) == "string" then
-    local reasoning_text = reasoning_text_or_include_timestamps
-    if not reasoning_text or reasoning_text == "" then
-      return ""
-    end
-
-    local lines = {}
-    table.insert(lines, "=== 思考过程 ===")
-    table.insert(lines, "")
-    table.insert(lines, reasoning_text)
-    table.insert(lines, "")
-    table.insert(lines, "=== 思考结束 ===")
-
-    return table.concat(lines, "\n")
+    reasoning_text = reasoning_text_or_include_timestamps
+    use_timestamps = include_timestamps or false
+  elseif type(reasoning_text_or_include_timestamps) == "boolean" then
+    use_timestamps = reasoning_text_or_include_timestamps
   end
 
-  -- 处理布尔参数（是否包含时间戳）
-  local include_timestamps = reasoning_text_or_include_timestamps or false
-
-  if not state.reasoning_text or state.reasoning_text == "" then
+  if not reasoning_text or reasoning_text == "" then
     return ""
   end
 
-  if not include_timestamps or #state.reasoning_chunks == 0 then
-    return state.reasoning_text
+  if not use_timestamps then
+    return reasoning_text
   end
 
-  local lines = {}
-  table.insert(lines, "=== 思考过程 ===")
-  table.insert(lines, "")
-
-  local start_time = state.reasoning_start_time
+  -- 格式化带时间戳的思考内容
+  local formatted = ""
   for i, chunk in ipairs(state.reasoning_chunks) do
-    local time_offset = chunk.timestamp - start_time
-    local time_str = string.format("[+%ds]", time_offset)
-    table.insert(lines, time_str .. " " .. chunk.content)
+    local time_str = os.date("%H:%M:%S", chunk.timestamp)
+    formatted = formatted .. string.format("[%s] %s\n", time_str, chunk.content)
   end
 
-  table.insert(lines, "")
-  table.insert(lines, "=== 思考结束 ===")
-
-  return table.concat(lines, "\n")
+  return formatted
 end
 
+--- 获取思考状态
+--- @return table 状态信息
+function M.get_reasoning_state()
+  return {
+    active = state.reasoning_active,
+    text_length = #state.reasoning_text,
+    chunks_count = #state.reasoning_chunks,
+    start_time = state.reasoning_start_time,
+    duration = state.reasoning_start_time and (os.time() - state.reasoning_start_time) or 0,
+  }
+end
+
+--- 添加一次性监听器
+--- @param event_pattern string 事件模式
+--- @param callback function 回调函数
+function M.add_once_listener(event_pattern, callback)
+  if not state.initialized then
+    return
+  end
+
+  local listener_id = vim.api.nvim_create_autocmd("User", {
+    group = state.event_group,
+    pattern = event_pattern,
+    callback = function(args)
+      callback(args)
+      vim.api.nvim_del_autocmd(listener_id)
+      state.once_listeners[listener_id] = nil
+    end,
+    once = true,
+  })
+
+  state.once_listeners[listener_id] = true
+end
+
+--- 清理所有监听器
+function M.cleanup()
+  if state.event_group then
+    vim.api.nvim_del_augroup_by_id(state.event_group)
+    state.event_group = nil
+  end
+
+  -- 清理一次性监听器
+  for listener_id, _ in pairs(state.once_listeners) do
+    pcall(vim.api.nvim_del_autocmd, listener_id)
+  end
+  state.once_listeners = {}
+
+  state.initialized = false
+
+  -- 触发插件关闭事件
+  vim.api.nvim_exec_autocmds("User", {
+    pattern = event_constants.PLUGIN_SHUTDOWN,
+  })
+end
+
+--- 导出模块
 return M

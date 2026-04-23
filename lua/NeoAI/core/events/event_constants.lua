@@ -97,4 +97,13 @@ M.AI_RESPONSE_READY = "NeoAI:ai_response_ready"            -- AI 响应已准备
 M.AI_RESPONSE_RECEIVED = "NeoAI:ai_response_received"      -- AI 响应已接收到
 M.CHAT_INPUT_READY = "NeoAI:chat_input_ready"              -- 聊天输入已准备好
 
+-- 新增事件常量（支持重新设计的AI模块架构）
+M.REQUEST_BUILT = "NeoAI:request_built"                    -- 请求构建完成
+M.TOOL_RESULT_RECEIVED = "NeoAI:tool_result_received"      -- 工具结果接收（已存在，确保正确）
+M.TOOL_CALL_DETECTED = "NeoAI:tool_call_detected"          -- 工具调用检测到（已存在，确保正确）
+M.REASONING_CONTENT = "NeoAI:reasoning_content"            -- 思考内容到达（已存在，确保正确）
+M.STREAM_CHUNK = "NeoAI:stream_chunk"                      -- 流式数据块到达（已存在，确保正确）
+M.STREAM_COMPLETED = "NeoAI:stream_completed"              -- 流式处理完成（已存在，确保正确）
+M.SEND_MESSAGE = "NeoAI:send_message"                      -- 发送消息事件（已存在，确保正确）
+
 return M

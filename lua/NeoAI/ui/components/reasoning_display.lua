@@ -85,24 +85,46 @@ function M.show(content)
   state.content_buffer = tostring(content or "")
   state.is_visible = true
 
-  -- 创建窗口
+  -- 创建窗口（默认高度5，作为悬浮文本）
+  -- 明确指定 window_mode = "float"，确保使用浮动窗口模式
   local window_id = window_manager.create_window("reasoning", {
     title = "NeoAI 思考过程",
     width = state.config.width or 60,
-    height = state.config.height or 15,
+    height = state.config.height or 5,
     border = state.config.border or "rounded",
     style = "minimal",
     relative = "editor",
     row = state.position.y or 1,
     col = state.position.x or 1,
     zindex = 100,
+    window_mode = "float",
   })
 
   if not window_id then
+    print("⚠️ [reasoning_display] 创建思考过程悬浮窗口失败")
+    state.is_visible = false
     return
   end
 
   state.current_window_id = window_id
+  -- print("✓ [reasoning_display] 思考过程悬浮窗口已创建: " .. tostring(window_id))
+
+  -- 获取窗口信息，确保缓冲区可修改
+  local window_info = window_manager.get_window_info(window_id)
+  if window_info and window_info.buf and vim.api.nvim_buf_is_valid(window_info.buf) then
+    -- 确保缓冲区可修改
+    vim.api.nvim_set_option_value("modifiable", true, { buf = window_info.buf })
+    vim.api.nvim_set_option_value("readonly", false, { buf = window_info.buf })
+
+    -- 设置文件类型为 markdown，启用语法高亮
+    vim.api.nvim_set_option_value("filetype", "markdown", { buf = window_info.buf })
+
+    -- 设置窗口选项
+    if window_info.win and vim.api.nvim_win_is_valid(window_info.win) then
+      vim.api.nvim_set_option_value("wrap", true, { win = window_info.win })
+      vim.api.nvim_set_option_value("cursorline", true, { win = window_info.win })
+    end
+  end
 
   -- 设置窗口内容
   M._update_window_content()
@@ -113,7 +135,7 @@ function M.show(content)
   return window_id
 end
 
---- 追加思考内容
+--- 追加思考内容（增量追加，避免全量重写）
 --- @param content string 思考内容
 function M.append(content)
   if not state.initialized then
@@ -123,14 +145,87 @@ function M.append(content)
   -- 确保 content 是字符串
   local content_str = tostring(content or "")
 
+  if content_str == "" then
+    return
+  end
+
   if not state.is_visible or not state.current_window_id then
     -- 如果窗口不可见，先显示
     M.show(content_str)
     return
   end
 
+  -- 更新内容缓冲区
   state.content_buffer = state.content_buffer .. content_str
-  M._update_window_content()
+
+  -- 增量追加到缓冲区末尾，避免全量重写
+  local window_info = window_manager.get_window_info(state.current_window_id)
+  if not window_info then
+    return
+  end
+
+  local buf = window_info.buf
+  local win = window_info.win
+
+  if not buf or not vim.api.nvim_buf_is_valid(buf) then
+    return
+  end
+
+  -- 确保缓冲区可修改
+  pcall(vim.api.nvim_set_option_value, "modifiable", true, { buf = buf })
+  pcall(vim.api.nvim_set_option_value, "readonly", false, { buf = buf })
+
+  -- 获取当前缓冲区行数
+  local line_count = vim.api.nvim_buf_line_count(buf)
+
+  -- 检查数据块是否包含换行符
+  local has_newline = content_str:find("\n")
+
+  if has_newline then
+    -- 包含换行符：第一行追加到当前最后一行末尾，其余行作为新行插入
+    local lines = vim.split(content_str, "\n", { plain = true })
+    if #lines > 0 then
+      local last_line = ""
+      if line_count > 0 then
+        local current_lines = vim.api.nvim_buf_get_lines(buf, line_count - 1, line_count, false)
+        last_line = current_lines[1] or ""
+      end
+
+      local first_line = last_line .. (lines[1] or "")
+      local new_lines = { first_line }
+      for i = 2, #lines do
+        table.insert(new_lines, lines[i] or "")
+      end
+
+      if line_count > 0 then
+        pcall(vim.api.nvim_buf_set_lines, buf, line_count - 1, line_count, false, new_lines)
+      else
+        pcall(vim.api.nvim_buf_set_lines, buf, 0, -1, false, new_lines)
+      end
+    end
+  else
+    -- 不包含换行符：直接追加到当前最后一行末尾
+    if line_count > 0 then
+      local current_lines = vim.api.nvim_buf_get_lines(buf, line_count - 1, line_count, false)
+      local last_line = current_lines[1] or ""
+      pcall(vim.api.nvim_buf_set_lines, buf, line_count - 1, line_count, false, { last_line .. content_str })
+    else
+      pcall(vim.api.nvim_buf_set_lines, buf, 0, -1, false, { content_str })
+    end
+  end
+
+  -- 恢复只读
+  pcall(vim.api.nvim_set_option_value, "readonly", true, { buf = buf })
+  pcall(vim.api.nvim_set_option_value, "modifiable", false, { buf = buf })
+  pcall(vim.api.nvim_set_option_value, "modified", false, { buf = buf })
+
+  -- 滚动到底部
+  if win and vim.api.nvim_win_is_valid(win) then
+    local new_line_count = vim.api.nvim_buf_line_count(buf)
+    if new_line_count > 0 then
+      pcall(vim.api.nvim_win_set_cursor, win, { new_line_count, 0 })
+    end
+  end
 end
 
 --- 关闭显示
@@ -169,30 +264,46 @@ function M.hide()
 end
 
 --- 更新推理显示内容
+--- 如果新内容以旧内容开头，则只追加差异部分，避免全量重写
 --- @param content string 新的内容
 function M.update(content)
   if not state.initialized then
     return
   end
 
+  -- 确保 content 是字符串
+  local content_str = tostring(content or "")
+
   if not state.is_visible or not state.current_window_id then
-    M.show(content)
+    M.show(content_str)
     return
   end
 
-  -- 确保 content 是字符串
-  state.content_buffer = tostring(content or "")
-  M._update_window_content()
+  -- 检查新内容是否以旧内容开头（追加模式）
+  local old_content = state.content_buffer or ""
+  if content_str:sub(1, #old_content) == old_content then
+    -- 只追加差异部分
+    local diff = content_str:sub(#old_content + 1)
+    if diff ~= "" then
+      state.content_buffer = content_str
+      M.append(diff)
+    end
+  else
+    -- 内容不连续，全量更新
+    state.content_buffer = content_str
+    M._update_window_content()
+  end
 end
 
 --- 将思考内容转换为折叠文本
 --- @param reasoning_text string 思考内容
+--- @return string 折叠文本格式的字符串
 function M._convert_to_folded_text(reasoning_text)
   -- 确保 reasoning_text 是字符串
   local reasoning_str = tostring(reasoning_text or "")
 
   if reasoning_str == "" then
-    return
+    return ""
   end
 
   -- 创建折叠文本格式
@@ -206,6 +317,8 @@ function M._convert_to_folded_text(reasoning_text)
 
   -- 通知用户
   vim.notify("思考过程已转换为折叠文本并复制到剪贴板", vim.log.levels.INFO)
+
+  return folded_text
 end
 
 --- 异步将思考内容转换为折叠文本
@@ -230,7 +343,7 @@ function M._convert_to_folded_text_async(reasoning_text, callback)
     local folded_text = "\n<details>\n<summary>🤔 思考过程 (点击展开)</summary>\n\n"
     folded_text = folded_text .. reasoning_str
     folded_text = folded_text .. "\n\n</details>\n"
-    
+
     return folded_text
   end, function(success, folded_text, error_msg)
     if callback then
@@ -261,28 +374,43 @@ function M._update_window_content()
 
   -- 获取窗口信息
   local window_info = window_manager.get_window_info(state.current_window_id)
-  if not window_info or not window_info.buf then
+  if not window_info then
+    return
+  end
+
+  local buf = window_info.buf
+  local win = window_info.win
+
+  if not buf or not vim.api.nvim_buf_is_valid(buf) then
     return
   end
 
   -- 确保缓冲区可修改
-  vim.api.nvim_buf_set_option(window_info.buf, "modifiable", true)
-  vim.api.nvim_buf_set_option(window_info.buf, "readonly", false)
+  local ok, _ = pcall(vim.api.nvim_set_option_value, "modifiable", true, { buf = buf })
+  pcall(vim.api.nvim_set_option_value, "readonly", false, { buf = buf })
+
+  -- 清空缓冲区
+  pcall(vim.api.nvim_buf_set_lines, buf, 0, -1, false, {})
 
   -- 设置缓冲区内容
-  vim.api.nvim_buf_set_lines(window_info.buf, 0, -1, false, vim.split(state.content_buffer, "\n"))
-
-  -- 设置只读
-  vim.api.nvim_buf_set_option(window_info.buf, "readonly", true)
-  vim.api.nvim_buf_set_option(window_info.buf, "modifiable", false)
+  local lines = vim.split(state.content_buffer or "", "\n")
+  pcall(vim.api.nvim_buf_set_lines, buf, 0, -1, false, lines)
 
   -- 设置语法高亮
-  vim.api.nvim_buf_set_option(window_info.buf, "filetype", "markdown")
+  pcall(vim.api.nvim_set_option_value, "filetype", "markdown", { buf = buf })
+
+  -- 设置只读
+  pcall(vim.api.nvim_set_option_value, "readonly", true, { buf = buf })
+  pcall(vim.api.nvim_set_option_value, "modifiable", false, { buf = buf })
+  -- 标记为未修改，避免保存警告
+  pcall(vim.api.nvim_set_option_value, "modified", false, { buf = buf })
 
   -- 滚动到底部
-  local line_count = vim.api.nvim_buf_line_count(window_info.buf)
-  if line_count > 0 then
-    vim.api.nvim_win_set_cursor(window_info.win, { line_count, 0 })
+  if win and vim.api.nvim_win_is_valid(win) then
+    local line_count = vim.api.nvim_buf_line_count(buf)
+    if line_count > 0 then
+      pcall(vim.api.nvim_win_set_cursor, win, { line_count, 0 })
+    end
   end
 end
 

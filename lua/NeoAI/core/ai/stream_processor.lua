@@ -1,327 +1,236 @@
+-- 流式处理器（重写）
+-- 负责处理 AI 响应的流式数据，解析 SSE 格式，支持思考过程、工具调用和普通内容
+-- 与 http_client 配合使用，处理真正的 AI API 流式响应
 local M = {}
+
 local json = require("NeoAI.utils.json")
+local logger = require("NeoAI.utils.logger")
 
 -- 模块状态
 local state = {
   initialized = false,
   config = nil,
-  buffer = "",
-  reasoning_buffer = "",
-  in_reasoning = false,
+  active_processors = {}, -- 活跃的流式处理器
 }
 
 --- 初始化流式处理器
---- @param options table 配置选项，包含config字段
---- @return nil
+--- @param options table 配置选项
 function M.initialize(options)
   if state.initialized then
-    return
+    return M
   end
 
   state.config = options.config or {}
   state.initialized = true
+
+  logger.info("Stream processor initialized")
+  return M
 end
 
---- 处理流式数据块
---- @param chunk string 数据块
---- @return nil
-function M.process_chunk(chunk)
+--- 开始一个新的流式处理会话
+--- @param params table 参数
+function M.start_stream(params)
+  local generation_id = params.generation_id
+  local session_id = params.session_id
+  local window_id = params.window_id
+
+  state.active_processors[generation_id] = {
+    buffer = "",                    -- 原始缓冲区
+    content_buffer = "",            -- 累积的普通内容
+    reasoning_buffer = "",          -- 累积的思考内容
+    tool_calls = {},                -- 累积的工具调用
+    session_id = session_id,
+    window_id = window_id,
+    start_time = os.time(),
+    is_finished = false,
+  }
+
+  logger.debug(string.format("Stream started: generation=%s", generation_id))
+end
+
+--- 处理 SSE 数据块
+--- 接收来自 http_client 解析后的 JSON 数据
+--- @param params table 处理参数
+--- @return table|nil 处理结果
+function M.process_chunk(params)
   if not state.initialized then
-    vim.notify("流式处理器未初始化", vim.log.levels.WARN)
-    return
+    error("Stream processor not initialized")
   end
 
-  if not chunk or chunk == "" then
-    return
+  local generation_id = params.generation_id
+  local data = params.data  -- 已解析的 JSON 数据
+  local session_id = params.session_id
+  local window_id = params.window_id
+
+  local processor = state.active_processors[generation_id]
+  if not processor then
+    logger.warn(string.format("No active processor for generation %s", generation_id))
+    return nil
   end
 
-  -- 直接添加到缓冲区
-  state.buffer = state.buffer .. chunk
-
-  -- 尝试解析DeepSeek API格式
-  if chunk:match("^data: ") then
-    M._parse_deepseek_stream(chunk)
-  elseif chunk:match("^<reasoning>") or state.in_reasoning then -- 尝试解析特殊标记
-    M._handle_reasoning_chunk(chunk)
-  elseif chunk:match("^<tool_call>") then
-    M._handle_tool_call_chunk(chunk)
-  else
-    M._handle_content_chunk(chunk)
-  end
-end
-
---- 解析DeepSeek流式响应
---- @param chunk string 数据块
---- @return nil
-function M._parse_deepseek_stream(chunk)
-  -- 移除 "data: " 前缀
-  local json_str = chunk:gsub("^data: ", "")
-
-  -- 跳过 [DONE] 消息
-  if json_str == "[DONE]" then
-    return
+  if processor.is_finished then
+    return nil
   end
 
-  -- 解析JSON
-  local ok, data = pcall(json.decode, json_str)
-  if not ok or not data then
-    -- 只显示前100个字符，避免显示过长的错误信息
-    local error_preview = tostring(json_str):sub(1, 100)
-    if #tostring(json_str) > 100 then
-      error_preview = error_preview .. "..."
-    end
-    vim.notify("解析JSON失败: " .. error_preview, vim.log.levels.ERROR)
-    return
-  end
+  local result = {
+    content = nil,
+    reasoning_content = nil,
+    tool_calls = nil,
+    is_final = false,
+  }
 
-  -- 检查是否有思考内容
-  if data.choices and data.choices[1] and data.choices[1].delta then
-    local delta = data.choices[1].delta
+  -- 解析 SSE 数据
+  if data.choices and #data.choices > 0 then
+    local choice = data.choices[1]
 
-    -- 处理思考内容（只有当reasoning_content不为null且不为空字符串时）
-    if delta.reasoning_content ~= nil and delta.reasoning_content ~= "" then
-      M.handle_reasoning(delta.reasoning_content)
-    end
-    
-    -- 处理普通内容（只有当content不为null且不为空字符串时）
-    if delta.content ~= nil and delta.content ~= "" then
-      M.handle_content(delta.content)
-    end
-    
-    -- 处理工具调用
-    if delta.tool_calls then
-      M.handle_tool_call(delta.tool_calls)
+    if choice.delta then
+      local delta = choice.delta
+
+      -- 处理思考内容（DeepSeek 格式）
+      if delta.reasoning_content ~= nil then
+        local rc = delta.reasoning_content
+        if rc ~= "" then
+          processor.reasoning_buffer = processor.reasoning_buffer .. rc
+          result.reasoning_content = rc
+        end
+      end
+
+      -- 处理普通内容
+      if delta.content ~= nil then
+        local content = delta.content
+        if content ~= "" then
+          processor.content_buffer = processor.content_buffer .. content
+          result.content = content
+        end
+      end
+
+      -- 处理工具调用（流式工具调用可能分多个块）
+      if delta.tool_calls then
+        for _, tc in ipairs(delta.tool_calls) do
+          local index = tc.index or 0
+          if not processor.tool_calls[index + 1] then
+            processor.tool_calls[index + 1] = {
+              id = tc.id or ("call_" .. tostring(os.time()) .. "_" .. tostring(index)),
+              type = tc.type or "function",
+              ["function"] = {
+                name = "",
+                arguments = "",
+              },
+            }
+          end
+
+          local existing = processor.tool_calls[index + 1]
+          if tc.id then existing.id = tc.id end
+          if tc.type then existing.type = tc.type end
+          if tc["function"] then
+            if tc["function"].name then
+              existing["function"].name = existing["function"].name .. tc["function"].name
+            end
+            if tc["function"].arguments then
+              existing["function"].arguments = existing["function"].arguments .. tc["function"].arguments
+            end
+          end
+        end
+
+        -- 只在有完整工具调用时返回
+        if #processor.tool_calls > 0 then
+          result.tool_calls = vim.deepcopy(processor.tool_calls)
+        end
+      end
     end
 
     -- 检查是否结束
-    if data.choices[1].finish_reason then
-      M.complete_stream()
+    if choice.finish_reason then
+      result.is_final = true
+      processor.is_finished = true
+
+      logger.debug(string.format(
+        "Stream finished (generation=%s): reason=%s, content_len=%d, reasoning_len=%d, tool_calls=%d",
+        generation_id,
+        choice.finish_reason,
+        #processor.content_buffer,
+        #processor.reasoning_buffer,
+        #processor.tool_calls
+      ))
     end
   end
+
+  -- 处理 usage 信息
+  if data.usage then
+    result.usage = data.usage
+  end
+
+  return result
 end
 
---- 处理思考内容
---- @param content any 思考内容
---- @return nil
-function M.handle_reasoning(content)
-  if not state.initialized then
-    return
+--- 获取完整的响应内容
+--- @param generation_id string 生成ID
+--- @return string 完整的响应文本
+function M.get_full_response(generation_id)
+  local processor = state.active_processors[generation_id]
+  if not processor then
+    return ""
   end
-
-  -- 确保 content 是字符串类型
-  local safe_content = content
-  if type(safe_content) ~= "string" then
-    safe_content = tostring(safe_content)
-  end
-
-  -- 直接发送思考内容，不处理缓冲区
-  vim.api.nvim_exec_autocmds("User", {
-    pattern = "reasoning_chunk",
-    data = { safe_content },
-  })
+  return processor.content_buffer or ""
 end
 
---- 处理内容输出
---- @param content any 内容
---- @return nil
-function M.handle_content(content)
-  if not state.initialized then
-    return
+--- 获取思考内容
+--- @param generation_id string 生成ID
+--- @return string 思考文本
+function M.get_reasoning_text(generation_id)
+  local processor = state.active_processors[generation_id]
+  if not processor then
+    return ""
   end
-
-  -- 确保 content 是字符串类型
-  local safe_content = content
-  if type(safe_content) ~= "string" then
-    safe_content = tostring(safe_content)
-  end
-
-  -- 直接触发内容事件，不处理缓冲区
-  vim.api.nvim_exec_autocmds("User", {
-    pattern = "content_chunk",
-    data = { safe_content },
-  })
+  return processor.reasoning_buffer or ""
 end
 
---- 处理工具调用
---- @param tool_call table 工具调用
---- @return nil
-function M.handle_tool_call(tool_call)
-  if not state.initialized then
-    return
+--- 获取工具调用
+--- @param generation_id string 生成ID
+--- @return table 工具调用列表
+function M.get_tool_calls(generation_id)
+  local processor = state.active_processors[generation_id]
+  if not processor then
+    return {}
   end
-
-  -- 触发工具调用事件
-  vim.api.nvim_exec_autocmds("User", {
-    pattern = "tool_call",
-    data = { tool_call },
-  })
+  return processor.tool_calls or {}
 end
 
---- 刷新缓冲区
---- @return nil
-function M.flush_buffer()
-  if not state.initialized then
-    return
-  end
-
-  -- 刷新内容缓冲区
-  if state.buffer ~= "" then
-    M._flush_content_buffer()
-  end
-
-  -- 刷新思考缓冲区
-  if state.reasoning_buffer ~= "" then
-    M._flush_reasoning_buffer()
+--- 结束流式处理
+--- @param generation_id string 生成ID
+function M.end_stream(generation_id)
+  local processor = state.active_processors[generation_id]
+  if processor then
+    local duration = os.time() - processor.start_time
+    logger.debug(string.format(
+      "Stream ended (generation=%s): duration=%ds, content=%d chars, reasoning=%d chars",
+      generation_id, duration, #(processor.content_buffer or ""), #(processor.reasoning_buffer or "")
+    ))
+    state.active_processors[generation_id] = nil
   end
 end
 
---- 处理流式数据（别名函数）
---- @param stream_data string|table 流式数据或session_id
---- @param data_chunks table|nil 数据块列表（可选）
---- @return nil
-function M.process_stream(stream_data, data_chunks)
-  if type(stream_data) == "string" and data_chunks == nil then
-    -- 单个数据块
-    M.process_chunk(stream_data)
-  elseif type(stream_data) == "string" and type(data_chunks) == "table" then
-    -- session_id + 数据块列表
-    for _, chunk in ipairs(data_chunks) do
-      M.process_chunk(chunk)
-    end
-  elseif type(stream_data) == "table" then
-    -- 数据块列表
-    for _, chunk in ipairs(stream_data) do
-      M.process_chunk(chunk)
-    end
-  end
-end
-
---- 处理数据块（别名函数）
---- @param chunk string 数据块
---- @return nil
-function M.handle_chunk(chunk)
-  M.process_chunk(chunk)
-end
-
---- 完成流处理
---- @param session_id string|nil 会话ID（可选）
---- @return nil
-function M.complete_stream(session_id)
-  M.flush_buffer()
-
-  -- 触发流完成事件
-  vim.api.nvim_exec_autocmds("User", {
-    pattern = "stream_completed",
-    data = { session_id },
-  })
-end
-
---- 获取缓冲区内容
---- @param session_id string|nil 会话ID（可选）
---- @return string 缓冲区内容
-function M.get_buffer(session_id)
-  -- 忽略session_id参数，返回当前缓冲区
-  return state.buffer
-end
-
---- 处理思考数据块（内部使用）
---- @param chunk string 数据块
---- @return nil
-function M._handle_reasoning_chunk(chunk)
-  -- 检查是否开始思考
-  if chunk:match("^<reasoning>") then
-    state.in_reasoning = true
-    chunk = chunk:gsub("^<reasoning>", "")
-  end
-
-  -- 检查是否结束思考
-  if chunk:match("</reasoning>$") then
-    state.in_reasoning = false
-    chunk = chunk:gsub("</reasoning>$", "")
-  end
-
-  -- 添加到思考缓冲区
-  state.reasoning_buffer = state.reasoning_buffer .. chunk
-
-  -- 如果不在思考模式中，刷新缓冲区
-  if not state.in_reasoning then
-    M._flush_reasoning_buffer()
-  end
-end
-
---- 处理工具调用数据块（内部使用）
---- @param chunk string 数据块
---- @return nil
-function M._handle_tool_call_chunk(chunk)
-  -- 提取工具调用内容
-  local tool_call_content = chunk:gsub("^<tool_call>", ""):gsub("</tool_call>$", "")
-
-  -- 尝试解析为JSON
-  local ok, tool_call = pcall(vim.json.decode, tool_call_content)
-  if ok and tool_call then
-    M.handle_tool_call(tool_call)
-  else
-    -- 如果不是JSON，作为普通内容处理
-    M._handle_content_chunk(chunk)
-  end
-end
-
---- 处理内容数据块（内部使用）
---- @param chunk string 数据块
---- @return nil
-function M._handle_content_chunk(chunk)
-  -- 如果没有特殊标记，直接处理
-  if not chunk:match("^<") then
-    M.handle_content(chunk)
-  end
-  -- 注意：内容已经在 process_chunk 函数中添加到了缓冲区
-end
-
---- 刷新思考缓冲区（内部使用）
---- @return nil
-function M._flush_reasoning_buffer()
-  if state.reasoning_buffer == "" then
-    return
-  end
-
-  M.handle_reasoning(state.reasoning_buffer)
-  state.reasoning_buffer = ""
-end
-
---- 刷新内容缓冲区（内部使用）
---- @return nil
-function M._flush_content_buffer()
-  if state.buffer == "" then
-    return
-  end
-
-  M.handle_content(state.buffer)
-  state.buffer = ""
-end
-
---- 获取缓冲区状态
---- @return table 缓冲区状态
-function M.get_buffer_state()
+--- 获取模块状态
+--- @return table 状态信息
+function M.get_state()
   return {
-    buffer = state.buffer,
-    reasoning_buffer = state.reasoning_buffer,
-    in_reasoning = state.in_reasoning,
     initialized = state.initialized,
+    active_processors_count = vim.tbl_count(state.active_processors),
+    config = state.config,
   }
 end
 
---- 清空缓冲区
---- @return nil
-function M.clear_buffer()
-  state.buffer = ""
-  state.reasoning_buffer = ""
-  state.in_reasoning = false
-end
+--- 关闭流式处理器
+function M.shutdown()
+  if not state.initialized then
+    return
+  end
 
---- 检查处理器是否已初始化
---- @return boolean 初始化状态
-function M.is_initialized()
-  return state.initialized
+  -- 清理所有活跃处理器
+  state.active_processors = {}
+  state.initialized = false
+
+  logger.info("Stream processor shutdown")
 end
 
 return M

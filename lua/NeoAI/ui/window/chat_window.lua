@@ -15,6 +15,17 @@ local state = {
   cursor_augroup = nil, -- 光标移动自动命令组
   last_render_time = 0, -- 上次渲染时间
   render_debounce_timer = nil, -- 防抖定时器
+
+  -- 流式渲染状态
+  streaming = {
+    active = false,
+    generation_id = nil,
+    message_index = nil, -- 当前正在流式更新的消息索引
+    content_buffer = "", -- 累积的流式内容
+    reasoning_buffer = "", -- 累积的思考内容
+    reasoning_active = false, -- 是否正在输出思考内容
+    reasoning_done = false, -- 思考内容是否已完成
+  },
 }
 
 --- 初始化聊天窗口
@@ -85,6 +96,14 @@ function M.open(session_id, window_id, branch_id)
   if buf then
     -- 设置缓冲区选项
     vim.api.nvim_set_option_value("filetype", "markdown", { buf = buf })
+    -- 确保buffer在:ls中可见但不会产生保存警告
+    vim.api.nvim_set_option_value("buflisted", true, { buf = buf })
+    vim.api.nvim_set_option_value("buftype", "nofile", { buf = buf })
+    vim.api.nvim_set_option_value("swapfile", false, { buf = buf })
+    vim.api.nvim_set_option_value("bufhidden", "hide", { buf = buf })
+    vim.api.nvim_set_option_value("modified", false, { buf = buf })
+    -- 设置缓冲区名称，便于识别
+    vim.api.nvim_buf_set_name(buf, "neoai://chat/" .. session_id)
   end
 
   if win_handle then
@@ -92,6 +111,11 @@ function M.open(session_id, window_id, branch_id)
     vim.api.nvim_set_option_value("wrap", true, { win = win_handle })
     vim.api.nvim_set_option_value("linebreak", true, { win = win_handle })
     vim.api.nvim_set_option_value("cursorline", true, { win = win_handle })
+    -- 折叠相关选项全部是窗口本地选项
+    vim.api.nvim_set_option_value("foldmethod", "marker", { win = win_handle })
+    vim.api.nvim_set_option_value("foldmarker", "{{{,}}}", { win = win_handle })
+    vim.api.nvim_set_option_value("foldlevel", 0, { win = win_handle })
+    vim.api.nvim_set_option_value("foldenable", true, { win = win_handle })
   end
 
   -- 触发窗口打开事件
@@ -207,28 +231,25 @@ function M._do_render_chat()
           end
 
           if has_reasoning then
-            -- 显示思考过程（折叠）
-            table.insert(content, string.format("%s 🤔 思考过程（点击展开）", role_prefix))
-            table.insert(content, "<details>")
-            table.insert(content, "<summary>思考过程</summary>")
+            -- 显示思考过程（使用 Neovim 原生折叠标记）
+            table.insert(content, string.format("%s", role_prefix))
             table.insert(content, "")
+            table.insert(content, "🤔 思考过程 {{{ ")
 
             -- 添加思考内容
             local reasoning_lines = vim.split(reasoning_content, "\n")
             for _, line in ipairs(reasoning_lines) do
-              table.insert(content, string.format("    %s", line))
+              table.insert(content, line)
             end
 
-            table.insert(content, "")
-            table.insert(content, "</details>")
+            table.insert(content, "}}} ")
             table.insert(content, "")
 
             -- 显示正文内容
             if main_content and main_content ~= "" then
-              table.insert(content, string.format("%s 📝 回答:", role_prefix))
               local main_lines = vim.split(main_content, "\n")
               for _, line in ipairs(main_lines) do
-                table.insert(content, string.format("    %s", line))
+                table.insert(content, line)
               end
             end
           else
@@ -272,6 +293,9 @@ function M._do_render_chat()
           M._focus_window()
 
           -- 注意：虚拟输入框已经在 open() 函数中打开，这里不需要重复打开
+
+          -- 将光标定位到输出位置（缓冲区末尾，即最新消息位置）
+          M._move_cursor_to_end()
 
           -- 触发渲染完成事件
           vim.api.nvim_exec_autocmds(
@@ -606,15 +630,20 @@ function M._open_virtual_input()
             content,
             state.current_session_id or "default",
             "main",
-            win_handle, -- 窗口句柄（数字）
+            state.current_window_id, -- 窗口ID字符串
             true, -- 格式化消息
             function(async_success, async_result, async_error)
-              -- 异步回调函数
+              -- 异步回调函数 - 只处理消息发送结果，不处理AI响应
               if async_success then
                 print("✓ 异步消息发送成功: " .. tostring(async_result))
 
-                -- 触发AI响应生成（如果需要）
-                -- 这里可以添加触发AI响应的逻辑
+                -- 显示发送成功提示
+                M.show_floating_text("消息已发送", {
+                  timeout = 1000,
+                  position = "bottom",
+                })
+
+                -- AI响应将由事件监听器自动触发，不需要在这里处理
               else
                 print("✗ 异步消息发送失败: " .. tostring(async_error or async_result))
 
@@ -882,17 +911,8 @@ function M.send_message(message, callback)
       return false, "无法添加用户消息"
     end
 
-    -- 触发统一的消息发送事件
-    vim.api.nvim_exec_autocmds("User", {
-      pattern = "NeoAI:message_sent",
-      data = {
-        message = message,
-        window_id = state.current_window_id,
-        session_id = state.current_session_id,
-        timestamp = os.time(),
-        role = "user",
-      },
-    })
+    -- 注意：不再在这里触发NeoAI:message_sent事件
+    -- 这个事件现在由chat_handlers统一触发，避免重复触发
 
     return true, "消息已发送"
   end, function(success, result, error_msg)
@@ -948,8 +968,9 @@ end
 --- 添加消息到聊天
 --- @param role string 角色 ('user' 或 'assistant')
 --- @param content string 消息内容
+--- @param opts table|nil 选项（allow_empty: 允许空内容用于流式占位符）
 --- @return boolean 是否成功
-function M.add_message(role, content)
+function M.add_message(role, content, opts)
   if not state.initialized then
     return false
   end
@@ -958,7 +979,8 @@ function M.add_message(role, content)
     return false
   end
 
-  if not content or vim.trim(content) == "" then
+  opts = opts or {}
+  if not opts.allow_empty and (not content or vim.trim(content) == "") then
     return false
   end
 
@@ -983,8 +1005,8 @@ function M.add_message(role, content)
   -- 持久化消息到 session_manager 和 history_manager
   M._persist_message(role, content)
 
-  -- 如果窗口打开，更新显示
-  if state.current_window_id then
+  -- 如果窗口打开，更新显示（除非指定跳过渲染）
+  if state.current_window_id and not opts.skip_render then
     M.render_chat()
   end
 
@@ -1037,6 +1059,35 @@ function M._persist_message(role, content)
 
   -- 触发自动保存
   M._trigger_auto_save()
+end
+
+--- 将光标移动到缓冲区末尾（最新消息位置）
+--- 在渲染完成后调用，方便用户查看最新输出
+function M._move_cursor_to_end()
+  if not state.current_window_id then
+    return
+  end
+
+  local win_handle = window_manager.get_window_win(state.current_window_id)
+  if not win_handle or not vim.api.nvim_win_is_valid(win_handle) then
+    return
+  end
+
+  local buf = window_manager.get_window_buf(state.current_window_id)
+  if not buf or not vim.api.nvim_buf_is_valid(buf) then
+    return
+  end
+
+  -- 获取缓冲区行数
+  local line_count = vim.api.nvim_buf_line_count(buf)
+  if line_count > 0 then
+    -- 将光标定位到最后一行
+    pcall(vim.api.nvim_win_set_cursor, win_handle, { line_count, 0 })
+    -- 滚动到光标位置
+    pcall(vim.api.nvim_win_call, win_handle, function()
+      vim.cmd("normal! zb")
+    end)
+  end
 end
 
 --- 显示悬浮文本
@@ -1112,19 +1163,19 @@ function M._setup_event_listeners()
 
   -- 监听AI响应已准备好事件（新的事件系统）
 
-  -- 监听AI响应已准备好事件（新的事件系统）
+  -- 监听AI生成完成事件（AI引擎触发的事件）
+  -- 流式完成后服务器会重新发送完整正文和token用量，用这个替换当前正文
   vim.api.nvim_create_autocmd("User", {
-    pattern = "NeoAI:ai_response_ready",
+    pattern = "NeoAI:generation_completed",
     callback = function(args)
-      print("📢 收到AI响应已准备好事件")
       local data = args.data or {}
       local response = data.response
       local window_id = data.window_id
       local session_id = data.session_id
+      local reasoning_text = data.reasoning_text
 
       -- 检查是否是当前窗口的消息
       if window_id and window_id ~= state.current_window_id then
-        print("⚠️  响应不是给当前窗口的，忽略")
         return
       end
 
@@ -1140,20 +1191,72 @@ function M._setup_event_listeners()
         response_content = tostring(response)
       end
 
-      -- 添加AI响应到聊天窗口
-      if response_content and response_content ~= "" then
-        print("➕ 添加AI响应到聊天窗口 (新事件系统)...")
-        local success = M.add_message("assistant", response_content)
-        if success then
-          print("✓ AI响应已添加到聊天窗口")
-          -- 重新渲染聊天窗口
-          M.render_chat()
-        else
-          print("✗ 添加AI响应失败")
-        end
-      else
-        print("⚠️  响应内容为空，无法添加")
+      if not response_content or response_content == "" then
+        return
       end
+
+      -- 用完整响应替换流式累积的内容（流式完成后服务器重新发送完整正文）
+      local message_index = state.streaming.message_index
+      if message_index and state.messages[message_index] then
+        if reasoning_text and reasoning_text ~= "" then
+          local combined = vim.json.encode({
+            reasoning_content = reasoning_text,
+            content = response_content,
+          })
+          state.messages[message_index].content = combined
+        else
+          state.messages[message_index].content = response_content
+        end
+        M._persist_message("assistant", response_content)
+      else
+        -- 查找并移除占位符消息
+        local placeholder_index = nil
+        for i = #state.messages, 1, -1 do
+          if state.messages[i].role == "assistant" and state.messages[i].content == "🤖 AI正在思考..." then
+            placeholder_index = i
+            break
+          end
+        end
+        if placeholder_index then
+          table.remove(state.messages, placeholder_index)
+        end
+        -- 添加完整响应
+        if reasoning_text and reasoning_text ~= "" then
+          local combined = vim.json.encode({
+            reasoning_content = reasoning_text,
+            content = response_content,
+          })
+          M.add_message("assistant", combined)
+        else
+          M.add_message("assistant", response_content)
+        end
+      end
+
+      -- 关闭思考过程悬浮窗口
+      local reasoning_display = require("NeoAI.ui.components.reasoning_display")
+      if reasoning_display.is_visible() then
+        reasoning_display.close()
+      end
+
+      -- 重置流式状态
+      state.streaming.active = false
+      state.streaming.generation_id = nil
+      state.streaming.message_index = nil
+      state.streaming.content_buffer = ""
+      state.streaming.reasoning_buffer = ""
+      state.streaming.reasoning_active = false
+      state.streaming.reasoning_done = false
+
+      -- 全量重渲染
+      M.render_chat()
+
+      -- 关闭虚拟输入框并重新打开
+      if virtual_input.is_active() then
+        virtual_input.close("force")
+      end
+      vim.defer_fn(function()
+        M._open_virtual_input()
+      end, 200)
     end,
   })
 
@@ -1178,7 +1281,151 @@ function M._setup_event_listeners()
     end,
   })
 
-  -- 监听AI流式响应事件
+  -- 流式数据块节流状态
+  local stream_throttle = {
+    buffer = "",
+    timer = nil,
+    pending = false,
+    interval_ms = 50, -- 每50ms批量处理一次
+  }
+
+  -- 监听AI引擎发出的标准流式数据块事件 (NeoAI:stream_chunk)
+  -- 这是AI引擎在流式请求中发出的标准事件
+  vim.api.nvim_create_autocmd("User", {
+    pattern = "NeoAI:stream_chunk",
+    callback = function(args)
+      local data = args.data or {}
+      local chunk = data.chunk
+      local generation_id = data.generation_id
+      local window_id = data.window_id
+
+      -- 检查是否是当前窗口
+      if window_id and window_id ~= state.current_window_id then
+        return
+      end
+
+      -- 提取块内容
+      local chunk_content = ""
+      if type(chunk) == "string" then
+        chunk_content = chunk
+      elseif type(chunk) == "table" and chunk.content then
+        chunk_content = chunk.content
+      elseif type(chunk) == "table" and chunk.text then
+        chunk_content = chunk.text
+      elseif type(chunk) == "table" and chunk.delta then
+        chunk_content = chunk.delta
+      else
+        chunk_content = tostring(chunk)
+      end
+
+      if not chunk_content or chunk_content == "" then
+        return
+      end
+
+      -- 初始化流式状态（如果是新的流式请求）
+      if not state.streaming.active or state.streaming.generation_id ~= generation_id then
+        state.streaming.active = true
+        state.streaming.generation_id = generation_id
+        state.streaming.content_buffer = ""
+        state.streaming.reasoning_buffer = ""
+        state.streaming.reasoning_active = false
+        state.streaming.reasoning_done = false
+
+        -- 添加AI占位符消息（允许空内容，跳过首次渲染）
+        local success = M.add_message("assistant", "", { allow_empty = true, skip_render = true })
+        if success then
+          state.streaming.message_index = #state.messages
+        end
+      end
+
+      -- 检测到正文输出（非思考内容），立即关闭思考过程悬浮窗口
+      -- 用户期望：思考结束后正文开始输出时，悬浮文本就关闭，而不是等所有输出结束
+      if state.streaming.reasoning_active then
+        state.streaming.reasoning_active = false
+        state.streaming.reasoning_done = true
+        local reasoning_display = require("NeoAI.ui.components.reasoning_display")
+        if reasoning_display.is_visible() then
+          -- 将思考过程以折叠文本格式直接追加到聊天缓冲区
+          -- 让用户立即看到思考过程，而不是等到正文输出完成
+          local reasoning_text = state.streaming.reasoning_buffer or ""
+          if reasoning_text ~= "" then
+            local folded_text = "\n🤔 思考过程 {{{ " .. reasoning_text .. " \n}}} \n"
+            M._append_stream_chunk_to_buffer(folded_text)
+          end
+          reasoning_display.close()
+        end
+      end
+
+      -- 累积内容到状态
+      state.streaming.content_buffer = state.streaming.content_buffer .. chunk_content
+
+      -- 节流处理：累积数据块，定时批量刷新到缓冲区
+      stream_throttle.buffer = stream_throttle.buffer .. chunk_content
+
+      if not stream_throttle.pending then
+        stream_throttle.pending = true
+        vim.defer_fn(function()
+          local batch = stream_throttle.buffer
+          stream_throttle.buffer = ""
+          stream_throttle.pending = false
+
+          if batch ~= "" then
+            M._append_stream_chunk_to_buffer(batch)
+          end
+        end, stream_throttle.interval_ms)
+      end
+    end,
+  })
+
+  -- 监听思考内容事件 (NeoAI:reasoning_content)
+  vim.api.nvim_create_autocmd("User", {
+    pattern = "NeoAI:reasoning_content",
+    callback = function(args)
+      local data = args.data or {}
+      local reasoning_content = data.reasoning_content
+      local generation_id = data.generation_id
+      local window_id = data.window_id
+
+      -- 检查是否是当前窗口
+      if window_id and window_id ~= state.current_window_id then
+        return
+      end
+
+      if not reasoning_content or reasoning_content == "" then
+        return
+      end
+
+      -- 初始化流式状态（如果是新的流式请求）
+      if not state.streaming.active or state.streaming.generation_id ~= generation_id then
+        state.streaming.active = true
+        state.streaming.generation_id = generation_id
+        state.streaming.content_buffer = ""
+        state.streaming.reasoning_buffer = ""
+        state.streaming.reasoning_active = true
+        state.streaming.reasoning_done = false
+
+        -- 添加AI占位符消息（允许空内容，跳过首次渲染）
+        local success = M.add_message("assistant", "", { allow_empty = true, skip_render = true })
+        if success then
+          state.streaming.message_index = #state.messages
+        end
+
+        -- 显示思考过程悬浮窗口
+        local reasoning_display = require("NeoAI.ui.components.reasoning_display")
+        reasoning_display.show("🤔 AI正在思考...")
+      end
+
+      -- 标记思考内容活跃
+      state.streaming.reasoning_active = true
+      state.streaming.reasoning_buffer = state.streaming.reasoning_buffer .. reasoning_content
+
+      -- 增量追加思考内容到悬浮窗口（避免全量重写）
+      local reasoning_display = require("NeoAI.ui.components.reasoning_display")
+      reasoning_display.append(reasoning_content)
+    end,
+  })
+
+  -- 监听旧的 ai_response_chunk 事件（兼容旧的事件流）
   vim.api.nvim_create_autocmd("User", {
     pattern = "NeoAI:ai_response_chunk",
     callback = function(args)
@@ -1200,14 +1447,29 @@ function M._setup_event_listeners()
         chunk_content = tostring(chunk)
       end
 
-      -- 对于流式响应，我们可以更新最后一条消息或显示进度
-      if chunk_content and chunk_content ~= "" then
-        -- 这里可以显示悬浮文本或更新最后一条消息
-        M.show_floating_text("AI正在思考... " .. chunk_content, {
-          timeout = 2000,
-          position = "bottom",
-        })
+      if not chunk_content or chunk_content == "" then
+        return
       end
+
+      -- 初始化流式状态（如果是新的流式请求）
+      if not state.streaming.active then
+        state.streaming.active = true
+        state.streaming.generation_id = generation_id
+        state.streaming.content_buffer = ""
+        state.streaming.reasoning_buffer = ""
+
+        -- 添加AI占位符消息（允许空内容，跳过首次渲染）
+        local success = M.add_message("assistant", "", { allow_empty = true, skip_render = true })
+        if success then
+          state.streaming.message_index = #state.messages
+        end
+      end
+
+      -- 累积内容
+      state.streaming.content_buffer = state.streaming.content_buffer .. chunk_content
+
+      -- 增量渲染
+      M._append_stream_chunk_to_buffer(chunk_content)
     end,
   })
 
@@ -1217,11 +1479,39 @@ function M._setup_event_listeners()
     callback = function(args)
       local data = args.data or {}
       local generation_id = data.generation_id
+      local full_response = data.full_response
+      local reasoning_text = data.reasoning_text
+      local window_id = data.window_id
 
-      print("✓ 流式生成完成 (ID: " .. tostring(generation_id) .. ")")
+      -- 检查是否是当前窗口的流式请求
+      if not state.streaming.active or state.streaming.generation_id ~= generation_id then
+        -- 即使流式状态不匹配，也尝试关闭 reasoning_display
+        local reasoning_display = require("NeoAI.ui.components.reasoning_display")
+        if reasoning_display.is_visible() then
+          reasoning_display.close()
+        end
+        return
+      end
 
-      -- 关闭悬浮文本
-      M.close_floating_text()
+      -- 思考结束后：将悬浮窗口转换为折叠文本并关闭
+      local reasoning_display = require("NeoAI.ui.components.reasoning_display")
+      if reasoning_text and reasoning_text ~= "" then
+        reasoning_display._convert_to_folded_text(reasoning_text)
+      end
+      if reasoning_display.is_visible() then
+        reasoning_display.close()
+      end
+
+      -- 完成流式渲染
+      M._finalize_streaming()
+
+      -- 关闭虚拟输入框并重新打开
+      if virtual_input.is_active() then
+        virtual_input.close("force")
+      end
+      vim.defer_fn(function()
+        M._open_virtual_input()
+      end, 200)
     end,
   })
 
@@ -1295,6 +1585,144 @@ function M.update_message(index, content)
   end
 
   return true
+end
+
+--- 追加流式数据块到缓冲区（增量渲染）
+--- 直接将数据块追加到聊天窗口缓冲区末尾，避免全量重渲染
+--- @param chunk_content string 数据块内容
+--- @param content_type string|nil 内容类型 ("reasoning" 或 "content")
+function M._append_stream_chunk_to_buffer(chunk_content, content_type)
+  if not state.current_window_id then
+    return
+  end
+
+  -- 更新消息列表中的累积内容
+  local message_index = state.streaming.message_index
+  if message_index and state.messages[message_index] then
+    local full_content = state.streaming.content_buffer or ""
+    local reasoning_text = state.streaming.reasoning_buffer or ""
+
+    if reasoning_text and reasoning_text ~= "" then
+      local combined = vim.json.encode({
+        reasoning_content = reasoning_text,
+        content = full_content,
+      })
+      state.messages[message_index].content = combined
+    else
+      state.messages[message_index].content = full_content
+    end
+  end
+
+  -- 增量追加到缓冲区末尾，避免全量重渲染
+  local buf = window_manager.get_window_buf(state.current_window_id)
+  if not buf or not vim.api.nvim_buf_is_valid(buf) then
+    return
+  end
+
+  -- 确保缓冲区可修改
+  pcall(vim.api.nvim_set_option_value, "modifiable", true, { buf = buf })
+  pcall(vim.api.nvim_set_option_value, "readonly", false, { buf = buf })
+
+  -- 获取当前缓冲区行数
+  local line_count = vim.api.nvim_buf_line_count(buf)
+
+  -- 检查数据块是否包含换行符
+  local has_newline = chunk_content:find("\n")
+
+  if has_newline then
+    -- 数据块包含换行符：按行分割，第一行追加到当前最后一行末尾，其余行作为新行插入
+    local lines = vim.split(chunk_content, "\n", { plain = true })
+    if #lines > 0 then
+      -- 获取当前最后一行内容
+      local last_line = ""
+      if line_count > 0 then
+        local current_lines = vim.api.nvim_buf_get_lines(buf, line_count - 1, line_count, false)
+        last_line = current_lines[1] or ""
+      end
+
+      -- 第一行追加到当前最后一行末尾
+      local first_line = last_line .. (lines[1] or "")
+
+      -- 剩余行作为新行插入（跳过空行）
+      local new_lines = { first_line }
+      for i = 2, #lines do
+        table.insert(new_lines, lines[i] or "")
+      end
+
+      -- 替换最后一行并追加剩余行
+      if line_count > 0 then
+        pcall(vim.api.nvim_buf_set_lines, buf, line_count - 1, line_count, false, new_lines)
+      else
+        pcall(vim.api.nvim_buf_set_lines, buf, 0, -1, false, new_lines)
+      end
+    end
+  else
+    -- 数据块不包含换行符：直接追加到当前最后一行末尾
+    if line_count > 0 then
+      local current_lines = vim.api.nvim_buf_get_lines(buf, line_count - 1, line_count, false)
+      local last_line = current_lines[1] or ""
+      pcall(vim.api.nvim_buf_set_lines, buf, line_count - 1, line_count, false, { last_line .. chunk_content })
+    else
+      pcall(vim.api.nvim_buf_set_lines, buf, 0, -1, false, { chunk_content })
+    end
+  end
+
+  -- 恢复只读
+  pcall(vim.api.nvim_set_option_value, "readonly", true, { buf = buf })
+  pcall(vim.api.nvim_set_option_value, "modifiable", false, { buf = buf })
+  pcall(vim.api.nvim_set_option_value, "modified", false, { buf = buf })
+
+  -- 滚动到底部显示最新内容
+  local win_handle = window_manager.get_window_win(state.current_window_id)
+  if win_handle and vim.api.nvim_win_is_valid(win_handle) then
+    local new_line_count = vim.api.nvim_buf_line_count(buf)
+    if new_line_count > 0 then
+      pcall(vim.api.nvim_win_set_cursor, win_handle, { new_line_count, 0 })
+    end
+  end
+end
+
+--- 完成流式渲染
+--- 将累积的流式内容临时保存到消息列表中，并触发全量重渲染
+--- 注意：流式完成后服务器会重新发送完整正文（通过 NeoAI:generation_completed 事件），
+--- 所以这里只做临时保存，最终内容由 generation_completed 事件处理替换
+function M._finalize_streaming()
+  if not state.streaming.active then
+    return
+  end
+
+  local message_index = state.streaming.message_index
+  local full_content = state.streaming.content_buffer or ""
+  local reasoning_text = state.streaming.reasoning_buffer or ""
+
+  -- 临时保存累积内容到消息列表（后续会被 generation_completed 的完整响应替换）
+  if message_index and state.messages[message_index] then
+    if reasoning_text and reasoning_text ~= "" then
+      local combined = vim.json.encode({
+        reasoning_content = reasoning_text,
+        content = full_content,
+      })
+      state.messages[message_index].content = combined
+    else
+      state.messages[message_index].content = full_content
+    end
+  end
+
+  -- 持久化消息
+  if full_content and full_content ~= "" then
+    M._persist_message("assistant", full_content)
+  end
+
+  -- 全量重渲染以确保一致性
+  M.render_chat()
+
+  -- 注意：不重置 message_index，保留供 generation_completed 事件使用
+  -- 重置其他状态
+  state.streaming.active = false
+  state.streaming.content_buffer = ""
+  state.streaming.reasoning_buffer = ""
+  state.streaming.reasoning_active = false
+  state.streaming.reasoning_done = false
 end
 
 return M
