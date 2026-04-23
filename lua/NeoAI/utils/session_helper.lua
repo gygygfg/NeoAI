@@ -110,14 +110,8 @@ function M.get_or_create_session(session_name)
   end
   
   local session_mgr = require("NeoAI.core.session.session_manager")
-  local current_session = session_mgr.get_current_session()
-  
-  if not current_session then
-    -- 创建新会话
-    local session_id = session_mgr.create_session(session_name or "聊天会话")
-    current_session = session_mgr.get_current_session()
-    print("✓ 创建新会话: " .. session_id)
-  end
+  -- 使用新的 get_or_create_current_session 方法，仅在需要时创建
+  local current_session = session_mgr.get_or_create_current_session(session_name or "聊天会话")
   
   return current_session
 end
@@ -209,6 +203,49 @@ function M.load_messages_from_session(limit)
   end
   
   local messages = msg_mgr.get_messages(current_session.current_branch, limit) or {}
+  
+  -- 转换消息格式
+  local formatted_messages = {}
+  for _, msg in ipairs(messages) do
+    table.insert(formatted_messages, {
+      role = msg.role,
+      content = msg.content,
+      timestamp = msg.timestamp or os.time(),
+    })
+  end
+  
+  return formatted_messages
+end
+
+--- 从会话管理器加载消息（按指定会话ID）
+--- @param session_id string 会话ID
+--- @param limit number 限制数量（可选，默认100）
+--- @return table 消息列表
+function M.load_messages_from_session_by_id(session_id, limit)
+  limit = limit or 100
+  
+  if not session_id then
+    return {}
+  end
+  
+  -- 确保会话管理器已初始化
+  if not M.ensure_session_manager() then
+    return {}
+  end
+  
+  local session_mgr = require("NeoAI.core.session.session_manager")
+  local session = session_mgr.get_session(session_id)
+  
+  if not session or not session.current_branch then
+    return {}
+  end
+  
+  local msg_mgr = session_mgr.get_message_manager()
+  if not msg_mgr then
+    return {}
+  end
+  
+  local messages = msg_mgr.get_messages(session.current_branch, limit) or {}
   
   -- 转换消息格式
   local formatted_messages = {}

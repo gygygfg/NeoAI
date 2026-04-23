@@ -314,60 +314,13 @@ function M.get_history_manager()
 end
 
 --- 获取配置管理器实例
+--- 直接使用 default_config.lua 的 API
 --- @return table 配置管理器实例
 function M.get_config_manager()
   if not state.initialized then
     error("工具系统未初始化")
   end
-
-  -- 创建一个简单的配置管理器包装器
-  local config_wrapper = {}
-  
-  function config_wrapper.get(key)
-    if not key then
-      return state.config
-    end
-    
-    -- 支持点分隔的键路径
-    local parts = vim.split(key, ".", { plain = true })
-    local value = state.config
-    
-    for _, part in ipairs(parts) do
-      if value and type(value) == "table" then
-        value = value[part]
-      else
-        return nil
-      end
-    end
-    
-    return value
-  end
-  
-  function config_wrapper.set(key, value)
-    -- 简单的设置实现
-    if not key then
-      return
-    end
-    
-    local parts = vim.split(key, ".", { plain = true })
-    local target = state.config
-    
-    for i = 1, #parts - 1 do
-      local part = parts[i]
-      if not target[part] or type(target[part]) ~= "table" then
-        target[part] = {}
-      end
-      target = target[part]
-    end
-    
-    target[parts[#parts]] = value
-  end
-  
-  function config_wrapper.get_all()
-    return state.config
-  end
-  
-  return config_wrapper
+  return require("NeoAI.default_config")
 end
 
 -- 导出模块

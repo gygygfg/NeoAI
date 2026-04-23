@@ -232,10 +232,6 @@ end
 --- @return table|nil 当前会话信息
 function M.get_current_session()
   if not current_session_id then
-    ensure_current_session()
-  end
-
-  if not current_session_id then
     return nil
   end
 
@@ -253,6 +249,19 @@ function M.set_current_session(session_id)
 
   -- 触发事件
   vim.api.nvim_exec_autocmds("User", { pattern = "NeoAI:session_changed", data = { session_id = session_id, session = sessions[session_id] } })
+end
+
+--- 获取或创建当前会话（仅在需要时创建）
+--- @param session_name string 会话名称（可选）
+--- @return table 当前会话
+function M.get_or_create_current_session(session_name)
+  if current_session_id and sessions[current_session_id] then
+    return M.get_session(current_session_id)
+  end
+
+  -- 没有当前会话，创建一个
+  local session_id = M.create_session(session_name or "default")
+  return M.get_session(session_id)
 end
 
 --- 列出所有会话
@@ -346,195 +355,79 @@ function M.get_data_operations()
   return data_operations
 end
 
---- 加载会话（内部使用）
-function M._load_sessions()
-  if not state.config.auto_save or not state.config.save_path then
-    return
-  end
+--- 从 sessions.json 加载单个会话（内部使用）
+--- @param session_id_str string 会话ID字符串
+--- @param session_data table 会话数据
+--- @param sessions_file string 文件路径
+local function load_session_from_json(session_id_str, session_data, sessions_file)
+  local session_id = "session_" .. session_id_str
+  local session = {
+    id = session_id,
+    name = session_data.name or ("会话 " .. session_id_str),
+    created_at = session_data.created_at or os.time(),
+    updated_at = session_data.updated_at or os.time(),
+    messages = {},
+    branches = {},
+    current_branch = nil,
+    metadata = { message_count = #(session_data.messages or {}) },
+  }
 
-  local save_path = state.config.save_path
-
-  -- 确保目录存在
-  if vim.fn.isdirectory(save_path) == 0 then
-    vim.fn.mkdir(save_path, "p")
-    return
-  end
-
-  -- 首先尝试加载 sessions.json 文件（新格式）
-  local sessions_file = save_path .. "/sessions.json"
-  if vim.fn.filereadable(sessions_file) == 1 then
-    local content = vim.fn.readfile(sessions_file)
-    if #content > 0 then
-      local success, all_sessions = pcall(vim.json.decode, table.concat(content, "\n"))
-      if success and all_sessions then
-        -- 加载所有会话
-        for session_id_str, session_data in pairs(all_sessions) do
-          -- 跳过 _graph 等非会话数据
-          if session_id_str ~= "_graph" and type(session_data) == "table" and session_data.messages ~= nil then
-            -- 转换会话数据格式
-            -- 使用一致的会话ID格式：session_<数字>
-            local session_id = "session_" .. session_id_str
-            local session = {
-              id = session_id,
-name = session_data.name or ("会话 " .. session_id_str),
-              created_at = session_data.created_at or os.time(),
-              updated_at = session_data.updated_at or os.time(),
-              messages = {},
-              branches = {},
-              current_branch = nil,
-              metadata = {
-                message_count = #(session_data.messages or {}),
-              },
-            }
-            
-            -- 使用保存时的分支ID，确保与消息中的 branch_id 一致
-            -- 优先使用保存的 current_branch_id
-            local branch_id = session_data.current_branch_id
-            if not branch_id or not session_data.branches or not session_data.branches[branch_id] then
-              -- 如果保存的分支ID无效，使用第一个可用的分支ID
-              if session_data.branches then
-                for bid, _ in pairs(session_data.branches) do
-                  branch_id = bid
-                  break
-                end
-              end
-            end
-            if not branch_id then
-              -- 创建默认分支
-              branch_id = branch_manager.create_branch("", "main")
-            else
-              -- 检查分支是否已在 branch_manager 中存在
-              local existing_branch = branch_manager.get_branch(branch_id)
-              if not existing_branch then
-                -- 分支不存在，直接创建（不通过 branch_manager.create_branch 以避免ID自增不匹配）
-                -- 手动在 branch_manager 中注册这个分支
-                local bm = branch_manager
-                -- 直接操作 branch_manager 的内部状态来创建分支
-                -- 由于 branch_manager 没有提供指定ID的API，我们通过 create_branch 创建
-                -- 然后重命名ID（这不太优雅，但能工作）
-                -- 更好的方式：直接使用保存的分支ID，不依赖 branch_manager 的计数器
-                local new_id = branch_manager.create_branch("", "main")
-                -- 如果新创建的ID与保存的ID不同，我们需要调整
-                -- 但消息的 branch_id 是保存时的值，所以消息会使用保存的 branch_id
-                -- 而会话的 current_branch 也使用保存的 branch_id
-                -- 所以这里我们直接使用保存的 branch_id，消息也会使用保存的 branch_id
-                -- 这样即使 branch_manager 中注册的分支ID不同，也不影响消息的存取
-                -- 因为 message_manager 是按 branch_id 存取消息的
-                branch_id = session_data.current_branch_id or new_id
-              end
-            end
-            session.branches = { [branch_id] = true }
-            session.current_branch = branch_id
-            
-            -- 恢复消息到 message_manager，使用保存时的 branch_id
-            for _, msg in ipairs(session_data.messages or {}) do
-              local msg_branch_id = msg.branch_id or branch_id
-              message_manager.add_message(
-                msg_branch_id,
-                msg.role or "user",
-                msg.content or "",
-                type(msg.metadata) == "table" and msg.metadata or {}
-              )
-            end
-            
-            sessions[session_id] = session
-            
-            -- 触发会话加载事件
-            vim.api.nvim_exec_autocmds("User", {
-              pattern = "NeoAI:session_loaded",
-              data = {
-                new_session_id = session_id,
-                filepath = sessions_file,
-                session = session
-              }
-            })
-            
-            -- 更新会话计数器
-            local session_num = tonumber(session_id_str)
-            if session_num and session_num > session_counter then
-              session_counter = session_num
-            end
-          end
-        end
-        
-        -- 如果成功加载了 sessions.json，就不需要加载单独的会话文件了
-        -- 检查 tree_manager 是否已有保存的树数据，如果没有则从 session_manager 同步
-        pcall(function()
-          local tree_mgr = require("NeoAI.core.session.tree_manager")
-          if tree_mgr.is_initialized and tree_mgr.is_initialized() then
-            -- 检查 tree_manager 是否已有数据（从 _tree_graph 加载的）
-            local tree_data = tree_mgr.get_tree()
-            local has_real_nodes = false
-            if tree_data then
-              for _, node in ipairs(tree_data) do
-                if node.type == "virtual_root" and node.children and #node.children > 0 then
-                  has_real_nodes = true
-                  break
-                end
-              end
-            end
-            -- 如果没有实际节点数据，从 session_manager 同步
-            if not has_real_nodes then
-              tree_mgr.sync_from_session_manager()
-            end
-          end
-        end)
-        return
+  local branch_id = session_data.current_branch_id
+  if not branch_id or not session_data.branches or not session_data.branches[branch_id] then
+    if session_data.branches then
+      for bid, _ in pairs(session_data.branches) do
+        branch_id = bid
+        break
       end
     end
   end
 
-  -- 向后兼容：加载单独的会话文件（旧格式）
-  local files = vim.fn.glob(save_path .. "/*.json", false, true)
-
-  for _, filepath in ipairs(files) do
-    -- 跳过 sessions.json 文件，因为我们已经处理过了
-    if not filepath:match("sessions%.json$") then
-      local content = vim.fn.readfile(filepath)
-      if #content > 0 then
-        local data = vim.json.decode(table.concat(content, "\n"))
-        if data and data.id then
-          -- 恢复消息到 message_manager
-          if data.messages then
-            for _, msg in ipairs(data.messages) do
-              message_manager.add_message(
-                msg.branch_id,
-                msg.role or "user",
-                msg.content or "",
-                type(msg.metadata) == "table" and msg.metadata or {}
-              )
-            end
-          end
-          -- 清除 messages 字段避免冗余
-          data.messages = nil
-          
-          sessions[data.id] = data
-          
-          -- 触发会话加载事件（旧格式）
-          vim.api.nvim_exec_autocmds("User", {
-            pattern = "NeoAI:session_loaded",
-            data = {
-              new_session_id = data.id,
-              filepath = filepath,
-              session = data
-            }
-          })
-
-          -- 更新会话计数器
-          local session_num = tonumber(data.id:match("session_(%d+)"))
-          if session_num and session_num > session_counter then
-            session_counter = session_num
-          end
-        end
+  -- 修复：为每个 session 创建独立的分支，避免多个 session 共享同一个分支
+  -- 如果分支不存在（如重置后），创建新分支并更新消息的 branch_id
+  if not branch_id then
+    branch_id = branch_manager.create_branch("", "main")
+  else
+    local existing_branch = branch_manager.get_branch(branch_id)
+    if not existing_branch then
+      -- 分支不存在，创建新分支
+      local new_branch_id = branch_manager.create_branch("", "main")
+      -- 更新消息中的 branch_id 为新分支
+      for _, msg in ipairs(session_data.messages or {}) do
+        msg.branch_id = new_branch_id
       end
+      branch_id = new_branch_id
     end
   end
 
-  -- 加载完成后同步到 tree_manager（仅当 tree_manager 没有保存的树数据时）
+  session.branches = { [branch_id] = true }
+  session.current_branch = branch_id
+
+  for _, msg in ipairs(session_data.messages or {}) do
+    local msg_branch_id = msg.branch_id or branch_id
+    message_manager.add_message(
+      msg_branch_id, msg.role or "user", msg.content or "",
+      type(msg.metadata) == "table" and msg.metadata or {}
+    )
+  end
+
+  sessions[session_id] = session
+
+  vim.api.nvim_exec_autocmds("User", {
+    pattern = "NeoAI:session_loaded",
+    data = { new_session_id = session_id, filepath = sessions_file, session = session }
+  })
+
+  local session_num = tonumber(session_id_str)
+  if session_num and session_num > session_counter then
+    session_counter = session_num
+  end
+end
+
+--- 同步到 tree_manager（内部使用）
+local function sync_tree_manager()
   pcall(function()
     local tree_mgr = require("NeoAI.core.session.tree_manager")
     if tree_mgr.is_initialized and tree_mgr.is_initialized() then
-      -- 检查 tree_manager 是否已有数据（从 _tree_graph 加载的）
       local tree_data = tree_mgr.get_tree()
       local has_real_nodes = false
       if tree_data then
@@ -545,14 +438,15 @@ name = session_data.name or ("会话 " .. session_id_str),
           end
         end
       end
-      -- 如果没有实际节点数据，从 session_manager 同步
       if not has_real_nodes then
         tree_mgr.sync_from_session_manager()
       end
     end
   end)
+end
 
-  -- 设置当前会话为最新的会话
+--- 设置最新会话为当前会话（内部使用）
+local function set_latest_session_as_current()
   local latest_session = nil
   local latest_time = 0
   for session_id, session in pairs(sessions) do
@@ -564,6 +458,69 @@ name = session_data.name or ("会话 " .. session_id_str),
   if latest_session then
     current_session_id = latest_session
   end
+end
+
+--- 加载会话（内部使用）
+function M._load_sessions()
+  if not state.config.auto_save or not state.config.save_path then
+    return
+  end
+
+  local save_path = state.config.save_path
+  if vim.fn.isdirectory(save_path) == 0 then
+    vim.fn.mkdir(save_path, "p")
+    return
+  end
+
+  -- 加载 sessions.json（新格式）
+  local sessions_file = save_path .. "/sessions.json"
+  if vim.fn.filereadable(sessions_file) == 1 then
+    local content = vim.fn.readfile(sessions_file)
+    if #content > 0 then
+      local success, all_sessions = pcall(vim.json.decode, table.concat(content, "\n"))
+      if success and all_sessions then
+        for session_id_str, session_data in pairs(all_sessions) do
+          if session_id_str ~= "_graph" and type(session_data) == "table" and session_data.messages ~= nil then
+            load_session_from_json(session_id_str, session_data, sessions_file)
+          end
+        end
+        sync_tree_manager()
+        return
+      end
+    end
+  end
+
+  -- 向后兼容：加载单独的会话文件（旧格式）
+  local files = vim.fn.glob(save_path .. "/*.json", false, true)
+  for _, filepath in ipairs(files) do
+    if not filepath:match("sessions%.json$") then
+      local content = vim.fn.readfile(filepath)
+      if #content > 0 then
+        local data = vim.json.decode(table.concat(content, "\n"))
+        if data and data.id then
+          for _, msg in ipairs(data.messages or {}) do
+            message_manager.add_message(
+              msg.branch_id, msg.role or "user", msg.content or "",
+              type(msg.metadata) == "table" and msg.metadata or {}
+            )
+          end
+          data.messages = nil
+          sessions[data.id] = data
+          vim.api.nvim_exec_autocmds("User", {
+            pattern = "NeoAI:session_loaded",
+            data = { new_session_id = data.id, filepath = filepath, session = data }
+          })
+          local session_num = tonumber(data.id:match("session_(%d+)"))
+          if session_num and session_num > session_counter then
+            session_counter = session_num
+          end
+        end
+      end
+    end
+  end
+
+  sync_tree_manager()
+  set_latest_session_as_current()
 end
 
 --- 检查是否已初始化

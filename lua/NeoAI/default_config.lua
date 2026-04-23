@@ -98,62 +98,14 @@ local state = {
 --- @param defaults table 默认配置表
 --- @return nil
 function M.initialize(defaults)
-  -- 如果已经初始化，直接返回
   if state.initialized then
     return
   end
 
-  -- 设置默认配置
   state.defaults = defaults or DEFAULT_CONFIG
-  -- 深度拷贝默认配置到当前配置
   state.config = vim.deepcopy(state.defaults)
   state.initialized = true
-
-  -- 确保必需的配置字段存在
-  M._ensure_required_fields()
 end
-
---- 确保必需的配置字段存在（内部函数）
---- 这个函数会检查并确保所有必需的配置字段都存在，如果不存在则使用默认值
-local function _ensure_required_fields()
-  -- 必需字段的定义
-  local required_fields = {
-    ai = {
-      api_key = "", -- AI API 密钥
-      model = "deepseek-reasoner", -- 使用的模型
-      temperature = 0.7, -- 温度参数，控制生成随机性
-      max_tokens = 4096, -- 最大token数
-      stream = true, -- 是否使用流式输出
-    },
-    ui = {
-      default_ui = "tree", -- 默认UI界面：tree(树状) 或 chat(聊天)
-      window_mode = "tab", -- 窗口模式：tab(标签页)、float(浮动)、split(分割)
-    },
-    session = {
-      auto_save = true, -- 是否自动保存会话
-      max_history_per_session = 100, -- 每个会话最大历史记录数
-    },
-  }
-
-  -- 确保顶层字段存在
-  for field, default_value in pairs(required_fields) do
-    if state.config[field] == nil then
-      state.config[field] = vim.deepcopy(default_value)
-    else
-      -- 如果字段是表，确保子字段存在
-      if type(default_value) == "table" then
-        for sub_field, sub_default in pairs(default_value) do
-          if state.config[field][sub_field] == nil then
-            state.config[field][sub_field] = sub_default
-          end
-        end
-      end
-    end
-  end
-end
-
--- 将内部函数公开给模块
-M._ensure_required_fields = _ensure_required_fields
 
 --- 获取配置值（支持点号路径）
 --- @param key string 配置键，可以是嵌套键，如 "ai.api_key"
@@ -227,7 +179,6 @@ end
 --- @return nil
 function M.reset()
   state.config = vim.deepcopy(state.defaults)
-  M._ensure_required_fields()
 end
 
 --- 验证配置的有效性
@@ -346,7 +297,6 @@ function M.import(filepath)
   -- 更新配置
   if data.config then
     state.config = data.config
-    M._ensure_required_fields()
   end
 
   return true, "导入成功"
@@ -624,16 +574,6 @@ function M.sanitize_config(config)
     if not vim.fn.isdirectory(path) then
       vim.fn.mkdir(path, "p")
     end
-  end
-
-  -- 清理API密钥
-  if config.ai and config.ai.api_key then
-    -- 可以在这里添加API密钥的加密或安全处理
-    -- 目前只是保留原样
-    -- 这里可以添加安全处理逻辑
-    -- 空块，保留用于未来扩展
-    -- 占位符，避免空块警告
-    local _ = config.ai.api_key
   end
 
   return config

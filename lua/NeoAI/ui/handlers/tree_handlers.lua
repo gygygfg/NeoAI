@@ -81,7 +81,7 @@ function M.initialize(event_bus, config)
   return true
 end
 
---- 处理回车（选择分支）
+--- 处理回车（选择分支/会话）
 function M.handle_enter()
   if not state.initialized then
     return
@@ -98,18 +98,89 @@ function M.handle_enter()
     return
   end
 
+  -- 判断节点类型
+  local is_session = selected_node_id:match("^session_")
+  local is_round = selected_node_id:match("^round_")
+  local is_branch = selected_node_id:match("^branch_") or selected_node_id:match("^root_") or selected_node_id:match("^node_")
+
+  -- 确定要打开的会话ID
+  local session_id = selected_node_id
+  local branch_id = "main"
+
+  if is_session then
+    -- 会话节点：直接使用该会话ID
+    session_id = selected_node_id
+  elseif is_round then
+    -- 对话轮次节点：需要找到所属的会话ID
+    -- 从 round_ 节点ID中提取会话ID（格式：round_sessionId_roundNumber）
+    local parts = vim.split(selected_node_id, "_")
+    if #parts >= 3 then
+      -- 格式为 round_session_1_1 -> parts = {"round", "session", "1", "1"}
+      -- 会话ID为 session_1
+      session_id = parts[2] .. "_" .. parts[3]
+    end
+  elseif is_branch then
+    -- 分支节点：尝试从 tree_window 的树数据中找到所属会话
+    local tree_data = tree_window.get_tree_data()
+    if tree_data then
+      local function find_session_for_node(nodes, target_id)
+        for _, node in ipairs(nodes) do
+          if node.id == target_id then
+            -- 当前节点就是目标，向上查找会话
+            return nil
+          end
+          if node.children then
+            for _, child in ipairs(node.children) do
+              if child.id == target_id then
+                -- 找到目标节点，返回父节点（如果是会话类型）
+                if node.type == "session" or node.id:match("^session_") then
+                  return node.id
+                end
+                -- 否则继续向上查找
+                return find_session_for_node({node}, target_id)
+              end
+              -- 递归查找更深层
+              local found = find_session_for_node(child.children or {}, target_id)
+              if found then
+                return found
+              end
+            end
+          end
+        end
+        return nil
+      end
+      local found_session = find_session_for_node(tree_data, selected_node_id)
+      if found_session then
+        session_id = found_session
+      end
+    end
+  end
+
+  -- 设置当前会话为选中的会话
+  local session_mgr_loaded, session_mgr = pcall(require, "NeoAI.core.session.session_manager")
+  if session_mgr_loaded and session_mgr and session_mgr.is_initialized and session_mgr.is_initialized() then
+    -- 检查会话是否存在
+    local session = session_mgr.get_session(session_id)
+    if session then
+      -- 设置当前会话
+      session_mgr.set_current_session(session_id)
+      vim.notify("切换到会话: " .. session_id, vim.log.levels.INFO)
+    else
+      vim.notify("会话不存在: " .. session_id, vim.log.levels.WARN)
+      return
+    end
+  end
+
   -- 获取UI模块
   local ui = require("NeoAI.ui")
 
   -- 关闭所有窗口（包括树窗口）
   ui.close_all_windows()
 
-  -- 根据节点ID打开聊天窗口
-  -- 节点ID可能是会话ID或分支ID
-  -- 这里假设节点ID就是会话ID，分支使用默认的"main"
-  ui.open_chat_ui(selected_node_id, "main")
+  -- 打开聊天窗口，传入正确的会话ID
+  ui.open_chat_ui(session_id, branch_id)
 
-  vim.notify("打开聊天窗口: " .. selected_node_id, vim.log.levels.INFO)
+  vim.notify("打开聊天窗口: " .. session_id, vim.log.levels.INFO)
 end
 
 --- 处理n键（新建子分支）

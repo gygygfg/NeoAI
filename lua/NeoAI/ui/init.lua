@@ -190,6 +190,7 @@ function M.open_chat_ui(session_id, branch_id)
     if success then
       state.windows.chat = chat_win_id
       state.current_ui_mode = "chat"
+      state.current_session_id = session_id -- 更新当前会话ID
 
       -- 设置聊天窗口的按键映射
       chat_window.set_keymaps(core.get_keymap_manager())
@@ -291,26 +292,30 @@ end
 
 --- 注册事件监听器（内部使用）
 function M._register_event_listeners()
+  -- 辅助函数：刷新树窗口（如果打开）
+  local function refresh_tree_if_open()
+    if state.current_ui_mode == "tree" and state.windows.tree then
+      tree_window.refresh_tree()
+    end
+  end
+
+  -- 辅助函数：刷新聊天窗口（如果打开）
+  local function refresh_chat_if_open()
+    if state.current_ui_mode == "chat" and state.windows.chat then
+      chat_window.render_chat()
+    end
+  end
+
   -- 监听会话事件
   vim.api.nvim_create_autocmd("User", {
     pattern = "NeoAI:session_created",
     callback = function(args)
       local data = args.data or {}
-      local session_id = data.session_id
-      local session = data.session
-      
-      -- 更新当前会话ID
-      state.current_session_id = session_id
-      
-      -- 如果聊天窗口打开，更新标题
+      state.current_session_id = data.session_id
       if state.current_ui_mode == "chat" and state.windows.chat then
-        chat_window.update_title(session.name or "新会话")
+        chat_window.update_title((data.session or {}).name or "新会话")
       end
-      
-      -- 如果树窗口打开，刷新树
-      if state.current_ui_mode == "tree" and state.windows.tree then
-        tree_window.refresh_tree()
-      end
+      refresh_tree_if_open()
     end,
   })
   
@@ -318,33 +323,11 @@ function M._register_event_listeners()
     pattern = "NeoAI:session_loaded",
     callback = function(args)
       local data = args.data or {}
-      local new_session_id = data.new_session_id
-      local session = data.session
-      
-      -- 更新当前会话ID
-      state.current_session_id = new_session_id
-      
-      -- 如果聊天窗口打开，更新标题
+      state.current_session_id = data.new_session_id
       if state.current_ui_mode == "chat" and state.windows.chat then
-        chat_window.update_title(session.name or "加载的会话")
+        chat_window.update_title((data.session or {}).name or "加载的会话")
       end
-      
-      -- 如果树窗口打开，刷新树
-      if state.current_ui_mode == "tree" and state.windows.tree then
-        tree_window.refresh_tree()
-      end
-    end,
-  })
-  
-  vim.api.nvim_create_autocmd("User", {
-    pattern = "NeoAI:session_saved",
-    callback = function(args)
-      local data = args.data or {}
-      local session_id = data.session_id
-      local filepath = data.filepath
-      
-      -- 可以在这里添加保存成功的提示或日志
-      -- print("会话已保存: " .. session_id .. " -> " .. filepath)
+      refresh_tree_if_open()
     end,
   })
   
@@ -352,17 +335,10 @@ function M._register_event_listeners()
     pattern = "NeoAI:session_deleted",
     callback = function(args)
       local data = args.data or {}
-      local session_id = data.session_id
-      
-      -- 如果删除的是当前会话，清空当前会话ID
-      if state.current_session_id == session_id then
+      if state.current_session_id == data.session_id then
         state.current_session_id = nil
       end
-      
-      -- 如果树窗口打开，刷新树
-      if state.current_ui_mode == "tree" and state.windows.tree then
-        tree_window.refresh_tree()
-      end
+      refresh_tree_if_open()
     end,
   })
   
@@ -370,85 +346,39 @@ function M._register_event_listeners()
     pattern = "NeoAI:session_changed",
     callback = function(args)
       local data = args.data or {}
-      local session_id = data.session_id
-      local session = data.session
-      
-      -- 更新当前会话ID
-      state.current_session_id = session_id
-      
-      -- 如果聊天窗口打开，更新标题和消息
+      state.current_session_id = data.session_id
+      local session = data.session or {}
       if state.current_ui_mode == "chat" and state.windows.chat then
         chat_window.update_title(session.name or "会话")
         chat_window.render_chat()
       end
-      
-      -- 如果树窗口打开，刷新树
-      if state.current_ui_mode == "tree" and state.windows.tree then
-        tree_window.refresh_tree()
-      end
+      refresh_tree_if_open()
     end,
   })
   
   -- 监听分支事件
   vim.api.nvim_create_autocmd("User", {
     pattern = "NeoAI:branch_created",
-    callback = function(args)
-      local data = args.data or {}
-      local branch_id = data.branch_id
-      local branch = data.branch
-      
-      -- 如果树窗口打开，刷新树
-      if state.current_ui_mode == "tree" and state.windows.tree then
-        tree_window.refresh_tree()
-      end
-    end,
+    callback = function() refresh_tree_if_open() end,
   })
   
   vim.api.nvim_create_autocmd("User", {
     pattern = "NeoAI:branch_switched",
-    callback = function(args)
-      local data = args.data or {}
-      local branch_id = data.branch_id
-      local old_branch_id = data.old_branch_id
-      
-      -- 如果聊天窗口打开，更新消息
-      if state.current_ui_mode == "chat" and state.windows.chat then
-        chat_window.render_chat()
-      end
-      
-      -- 如果树窗口打开，刷新树
-      if state.current_ui_mode == "tree" and state.windows.tree then
-        tree_window.refresh_tree()
-      end
+    callback = function()
+      refresh_chat_if_open()
+      refresh_tree_if_open()
     end,
   })
   
   vim.api.nvim_create_autocmd("User", {
     pattern = "NeoAI:branch_deleted",
-    callback = function(args)
-      local data = args.data or {}
-      local branch_id = data.branch_id
-      
-      -- 如果树窗口打开，刷新树
-      if state.current_ui_mode == "tree" and state.windows.tree then
-        tree_window.refresh_tree()
-      end
-    end,
+    callback = function() refresh_tree_if_open() end,
   })
   
   -- 监听消息事件
   vim.api.nvim_create_autocmd("User", {
     pattern = "NeoAI:message_added",
-    callback = function(args)
-      local data = args.data or {}
-      local message_id = data.message_id
-      local message = data.message
-      
-      -- 如果聊天窗口打开，更新消息显示
-      if state.current_ui_mode == "chat" and state.windows.chat then
-        chat_window.render_chat()
-      end
-    end,
+    callback = function() refresh_chat_if_open() end,
   })
 end
 
@@ -477,65 +407,24 @@ function M.switch_mode(mode)
 end
 
 --- 处理按键输入
+--- 按键映射已由 tree_window.set_keymaps() 和 chat_window.set_keymaps()
+--- 通过 keymap_manager 在缓冲区级别注册，此函数仅保留用于兼容
 --- @param key string 按键
 function M.handle_key_input(key)
   if not state.initialized then
     return
   end
 
-  -- 增加事件计数
   state.event_count = (state.event_count or 0) + 1
 
-  -- 记录事件处理
-  print(string.format("UI事件处理: 按键=%s, 计数=%d", key, state.event_count))
-
-  -- 如果没有当前UI模式，只记录事件但不处理
   if not state.current_ui_mode then
-    print("⚠️  没有当前UI模式，仅记录事件")
     return
   end
 
-  -- 避免无限递归，直接调用处理器而不通过handle_key_input
   if state.current_ui_mode == "tree" then
-    -- 直接调用树形视图处理器的内部处理逻辑
-    if key == "<CR>" then
-      tree_handlers.handle_enter()
-    elseif key == "n" then
-      tree_handlers.handle_n()
-    elseif key == "N" then
-      tree_handlers.handle_N()
-    elseif key == "d" then
-      tree_handlers.handle_d()
-    elseif key == "D" then
-      tree_handlers.handle_D()
-    elseif key == "r" then
-      tree_handlers.handle_refresh()
-    elseif key == "k" then
-      tree_handlers.handle_up()
-    elseif key == "j" then
-      tree_handlers.handle_down()
-    elseif key == "h" then
-      tree_handlers.handle_left()
-    elseif key == "l" then
-      tree_handlers.handle_right()
-    end
+    tree_handlers.handle_key(key)
   elseif state.current_ui_mode == "chat" then
-    -- 直接调用聊天处理器的内部处理逻辑
-    if key == "<CR>" then
-      chat_handlers.handle_enter()
-    elseif key == "<C-s>" then
-      chat_handlers.handle_ctrl_s()
-    elseif key == "<Esc>" then
-      chat_handlers.handle_escape()
-    elseif key == "<Tab>" then
-      chat_handlers.handle_tab()
-    elseif key == "r" then
-      chat_handlers.handle_regenerate()
-    elseif key == "<C-c>" then
-      chat_handlers.handle_stop_generation()
-    elseif key == "t" then
-      chat_handlers.handle_toggle_reasoning()
-    end
+    chat_handlers.handle_key(key)
   end
 end
 

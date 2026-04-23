@@ -802,9 +802,9 @@ function M._load_tree_data(session_id)
     print("调试：history_tree.refresh 函数不存在", vim.log.levels.WARN)
   end
 
-  -- 从 history_tree 获取树数据
-  print("调试：调用 history_tree.build_tree", vim.log.levels.INFO)
-  state.tree_data = history_tree.build_tree(session_id)
+  -- 从 history_tree 获取树数据（refresh 已加载数据，直接获取即可）
+  print("调试：调用 history_tree.get_tree_data", vim.log.levels.INFO)
+  state.tree_data = history_tree.get_tree_data()
 
   -- 调试：打印获取的树数据信息
   if state.tree_data then

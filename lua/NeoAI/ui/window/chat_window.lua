@@ -712,7 +712,17 @@ function M._load_messages(session_id)
   -- 清空当前消息
   state.messages = {}
 
-  -- 优先从会话管理器加载消息
+  -- 如果传入了 session_id，按指定会话ID加载消息
+  if session_id then
+    local session_messages = session_helper.load_messages_from_session_by_id(session_id, 100)
+    if #session_messages > 0 then
+      state.messages = session_messages
+      print("✓ 从会话管理器加载了 " .. #session_messages .. " 条消息 (会话: " .. session_id .. ")")
+      return
+    end
+  end
+
+  -- 没有指定会话ID或指定会话无消息，尝试从当前会话加载
   local session_messages = session_helper.load_messages_from_session(100)
   if #session_messages > 0 then
     state.messages = session_messages

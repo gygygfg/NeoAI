@@ -287,9 +287,9 @@ end
 --- @param session_id string 会话ID
 --- @param round_number number 轮次编号
 --- @param user_message string 用户消息
---- @param ai_message string AI回复
+--- @param ai_messages table|string AI回复（可以是字符串或消息列表）
 --- @return string 节点ID
-function M.create_conversation_round(session_id, round_number, user_message, ai_message)
+function M.create_conversation_round(session_id, round_number, user_message, ai_messages)
   if not state.initialized then
     error("Tree manager not initialized")
   end
@@ -303,23 +303,30 @@ function M.create_conversation_round(session_id, round_number, user_message, ai_
     error("Cannot create conversation round under node type: " .. session.type)
   end
 
+  -- 兼容旧接口：如果 ai_messages 是字符串，转为列表
+  if type(ai_messages) == "string" then
+    ai_messages = { ai_messages }
+  end
+  ai_messages = ai_messages or {}
+
   node_counter = node_counter + 1
   local node_id = "round_" .. session_id .. "_" .. round_number
 
-  -- 提取前几个字作为预览
-  local user_preview = user_message and user_message:sub(1, 20) or ""
-  local ai_preview = ai_message and ai_message:sub(1, 20) or ""
-  
-  if user_preview:len() > 20 then
-    user_preview = user_preview .. "..."
-  end
-  if ai_preview:len() > 20 then
-    ai_preview = ai_preview .. "..."
+  -- 合并所有 AI 消息内容
+  local ai_combined = ""
+  for _, ai_msg in ipairs(ai_messages) do
+    local content = type(ai_msg) == "string" and ai_msg or (ai_msg.content or "")
+    if content ~= "" then
+      if ai_combined ~= "" then
+        ai_combined = ai_combined .. "\n---\n"
+      end
+      ai_combined = ai_combined .. content
+    end
   end
 
-  -- 需求1: 轮次节点名称直接显示问答摘要在一行，不创建子消息节点
+  -- 生成预览文本
   local user_short = user_message and user_message:gsub("\n", " "):sub(1, 30) or ""
-  local ai_short = ai_message and ai_message:gsub("\n", " "):sub(1, 30) or ""
+  local ai_short = ai_combined ~= "" and ai_combined:gsub("\n", " "):sub(1, 30) or ""
   if #user_short >= 30 then user_short = user_short .. "..." end
   if #ai_short >= 30 then ai_short = ai_short .. "..." end
 
@@ -333,8 +340,8 @@ function M.create_conversation_round(session_id, round_number, user_message, ai_
     metadata = {
       round_number = round_number,
       user_message = user_message,
-      ai_message = ai_message,
-      message_count = 2, -- 用户和AI各一条
+      ai_message = ai_combined,
+      message_count = (user_message and 1 or 0) + #ai_messages,
       timestamp = os.time()
     }
   }
@@ -352,10 +359,8 @@ function M.create_conversation_round(session_id, round_number, user_message, ai_
     round_number = round_number,
     timestamp = os.time()
   })
-  session.metadata.message_count = (session.metadata.message_count or 0) + 2
+  session.metadata.message_count = (session.metadata.message_count or 0) + (user_message and 1 or 0) + #ai_messages
   session.metadata.last_updated = os.time()
-
-  -- 需求1: 不再创建消息子节点，问答绑定在一行显示
 
   -- 触发事件
   vim.api.nvim_exec_autocmds("User", { 
@@ -646,6 +651,82 @@ function M.is_initialized()
   return state.initialized
 end
 
+--- 保存对话轮次节点（内部使用）
+--- 以用户消息为轮次边界，合并该用户消息后的所有 assistant 消息
+--- @param session_id string 会话ID
+--- @param round_number number 轮次编号
+--- @param user_msg table 用户消息
+--- @param ai_messages table assistant消息列表（可能有多条，如工具调用）
+function M._save_conversation_round(session_id, round_number, user_msg, ai_messages)
+  local round_id = "round_" .. session_id .. "_" .. round_number
+  
+  -- 检查轮次节点是否已存在
+  local round_exists = false
+  if tree_nodes[session_id] then
+    for _, child_id in ipairs(tree_nodes[session_id].children) do
+      if child_id == round_id then
+        round_exists = true
+        break
+      end
+    end
+  end
+  
+  if round_exists then
+    return
+  end
+  
+  -- 合并所有 assistant 消息内容
+  local ai_combined = ""
+  for _, ai_msg in ipairs(ai_messages) do
+    if ai_msg.content and ai_msg.content ~= "" then
+      if ai_combined ~= "" then
+        ai_combined = ai_combined .. "\n---\n"
+      end
+      ai_combined = ai_combined .. ai_msg.content
+    end
+  end
+  
+  -- 生成预览文本
+  local user_short = user_msg and user_msg.content and user_msg.content:gsub("\n", " "):sub(1, 30) or ""
+  local ai_short = ai_combined ~= "" and ai_combined:gsub("\n", " "):sub(1, 30) or ""
+  if #user_short >= 30 then user_short = user_short .. "..." end
+  if #ai_short >= 30 then ai_short = ai_short .. "..." end
+  
+  local round_node = {
+    id = round_id,
+    name = "第" .. round_number .. "轮: 👤" .. user_short .. " | 🤖" .. ai_short,
+    type = NODE_TYPES.CONVERSATION_ROUND,
+    parent_id = session_id,
+    created_at = os.time(),
+    children = {},
+    metadata = {
+      round_number = round_number,
+      user_message = user_msg and user_msg.content or "",
+      ai_message = ai_combined,
+      message_count = (user_msg and 1 or 0) + #ai_messages,
+      timestamp = os.time(),
+    }
+  }
+  
+  tree_nodes[round_id] = round_node
+  if tree_nodes[session_id] then
+    table.insert(tree_nodes[session_id].children, round_id)
+  end
+  
+  -- 更新会话元数据
+  if tree_nodes[session_id] then
+    if not tree_nodes[session_id].metadata.conversation_rounds then
+      tree_nodes[session_id].metadata.conversation_rounds = {}
+    end
+    table.insert(tree_nodes[session_id].metadata.conversation_rounds, {
+      round_number = round_number,
+      timestamp = os.time(),
+    })
+    tree_nodes[session_id].metadata.message_count = (tree_nodes[session_id].metadata.message_count or 0) + (user_msg and 1 or 0) + #ai_messages
+    tree_nodes[session_id].metadata.last_updated = os.time()
+  end
+end
+
 --- 从会话管理器同步数据到树结构
 --- 遍历 session_manager 中的所有会话，在树中创建对应的节点
 function M.sync_from_session_manager()
@@ -706,72 +787,61 @@ function M.sync_from_session_manager()
     if session_data and session_data.current_branch then
       local msg_mgr = session_mgr.get_message_manager()
       if msg_mgr then
-        local messages = msg_mgr.get_messages(session_data.current_branch, 1000000)
-        if messages and #messages > 0 then
-          -- 按轮次分组（每两条消息为一轮：user + assistant）
-          local round_number = 1
-          for i = 1, #messages, 2 do
-            local user_msg = messages[i]
-            local ai_msg = messages[i + 1]
-            
-            local round_id = "round_" .. session_id .. "_" .. round_number
-            
-            -- 检查轮次节点是否已存在
-            local round_exists = false
-            for _, child_id in ipairs(tree_nodes[session_id].children) do
-              if child_id == round_id then
-                round_exists = true
-                break
-              end
+        -- 修复：确保每个 session 使用独立的分支获取消息
+        -- 如果多个 session 共享同一个分支，会导致内容重复
+        local session_branch_id = session_data.current_branch
+        
+        -- 检查当前分支是否被其他 session 共享
+        local branch_mgr = session_mgr.get_branch_manager()
+        local all_sessions = session_mgr.list_sessions()
+        local is_shared = false
+        for _, other in ipairs(all_sessions) do
+          if other.id ~= session_id then
+            local other_data = session_mgr.get_session(other.id)
+            if other_data and other_data.current_branch == session_branch_id then
+              is_shared = true
+              break
             end
-
-            if not round_exists then
-              local user_preview = user_msg and user_msg.content and user_msg.content:sub(1, 20) or ""
-              local ai_preview = ai_msg and ai_msg.content and ai_msg.content:sub(1, 20) or ""
-              if #user_preview > 20 then user_preview = user_preview .. "..." end
-              if #ai_preview > 20 then ai_preview = ai_preview .. "..." end
-
-              -- 需求1: 轮次节点名称直接显示问答摘要在一行，不创建子消息节点
-              local user_short = user_msg and user_msg.content and user_msg.content:gsub("\n", " "):sub(1, 30) or ""
-              local ai_short = ai_msg and ai_msg.content and ai_msg.content:gsub("\n", " "):sub(1, 30) or ""
-              if #user_short >= 30 then user_short = user_short .. "..." end
-              if #ai_short >= 30 then ai_short = ai_short .. "..." end
-
-              local round_node = {
-                id = round_id,
-                name = "第" .. round_number .. "轮: 👤" .. user_short .. " | 🤖" .. ai_short,
-                type = NODE_TYPES.CONVERSATION_ROUND,
-                parent_id = session_id,
-                created_at = os.time(),
-                children = {}, -- 不再创建子消息节点
-                metadata = {
-                  round_number = round_number,
-                  user_message = user_msg and user_msg.content or "",
-                  ai_message = ai_msg and ai_msg.content or "",
-                  message_count = (user_msg and 1 or 0) + (ai_msg and 1 or 0),
-                  timestamp = os.time(),
-                }
-              }
-
-              tree_nodes[round_id] = round_node
-              table.insert(tree_nodes[session_id].children, round_id)
-              -- 不再创建消息子节点，问答绑定在一行显示
-
-              -- 更新会话元数据
-              if not tree_nodes[session_id].metadata.conversation_rounds then
-                tree_nodes[session_id].metadata.conversation_rounds = {}
-              end
-              table.insert(tree_nodes[session_id].metadata.conversation_rounds, {
-                round_number = round_number,
-                timestamp = os.time(),
-              })
-              tree_nodes[session_id].metadata.message_count = (tree_nodes[session_id].metadata.message_count or 0) + (user_msg and 1 or 0) + (ai_msg and 1 or 0)
-              tree_nodes[session_id].metadata.last_updated = os.time()
-            end
-
-            round_number = round_number + 1
           end
         end
+        
+        -- 如果分支被共享，为当前 session 创建独立分支
+        if is_shared then
+          local new_branch_id = branch_mgr.create_branch("", "session_" .. session_id)
+          -- 更新 session 使用新分支
+          session_data.current_branch = new_branch_id
+          session_data.branches[new_branch_id] = true
+          session_branch_id = new_branch_id
+        end
+        
+        local messages = msg_mgr.get_messages(session_branch_id, 1000000)
+        if messages and #messages > 0 then
+          -- 按用户消息为轮次边界分组
+          -- 每条用户消息开始新的一轮，该用户消息之后的所有 assistant 消息都属于同一轮
+          local round_number = 1
+          local current_round_user_msg = nil
+          local current_round_ai_contents = {}
+          
+          for _, msg in ipairs(messages) do
+            if msg.role == "user" then
+              -- 遇到新的用户消息，先保存上一轮（如果有）
+              if current_round_user_msg then
+                M._save_conversation_round(session_id, round_number, current_round_user_msg, current_round_ai_contents)
+                round_number = round_number + 1
+              end
+              -- 开始新的一轮
+              current_round_user_msg = msg
+              current_round_ai_contents = {}
+            elseif msg.role == "assistant" and current_round_user_msg then
+              -- assistant 消息属于当前轮
+              table.insert(current_round_ai_contents, msg)
+            end
+          end
+          
+          -- 保存最后一轮
+          if current_round_user_msg then
+            M._save_conversation_round(session_id, round_number, current_round_user_msg, current_round_ai_contents)
+          end
       end
     end
   end
