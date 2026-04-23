@@ -639,13 +639,13 @@ function M._open_virtual_input()
             function(async_success, async_result, async_error)
               -- 异步回调函数 - 只处理消息发送结果，不处理AI响应
               if async_success then
-                print("✓ 异步消息发送成功: " .. tostring(async_result))
+                -- print("✓ 异步消息发送成功: " .. tostring(async_result))
 
                 -- 显示发送成功提示
-                M.show_floating_text("消息已发送", {
-                  timeout = 1000,
-                  position = "bottom",
-                })
+                -- M.show_floating_text("消息已发送", {
+                --   timeout = 1000,
+                --   position = "bottom",
+                -- })
 
                 -- AI响应将由事件监听器自动触发，不需要在这里处理
               else
@@ -713,37 +713,38 @@ end
 --- 加载消息数据（内部函数）
 --- @param session_id string 会话ID
 function M._load_messages(session_id)
-  -- 清空当前消息
   state.messages = {}
-
-  -- 如果传入了 session_id，按指定会话ID加载消息
-  if session_id then
-    local session_messages = session_helper.load_messages_from_session_by_id(session_id, 100)
-    if #session_messages > 0 then
-      state.messages = session_messages
-      print("✓ 从会话管理器加载了 " .. #session_messages .. " 条消息 (会话: " .. session_id .. ")")
-      return
+  local ok, hm = pcall(require, "NeoAI.core.history_manager")
+  if not ok or not hm.is_initialized() then
+    -- 尝试初始化
+    local config = state.config or {}
+    local save_path = config.session and config.session.save_path
+    if not save_path then
+      save_path = vim.fn.stdpath("cache") .. "/NeoAI"
     end
-    -- 指定会话无消息（新会话），保持空消息，不回退到当前会话
-    print("ℹ️  会话 " .. session_id .. " 没有消息，显示空聊天")
+    hm.initialize({ config = { save_path = save_path } })
+  end
+  -- 重新获取
+  ok, hm = pcall(require, "NeoAI.core.history_manager")
+  if not ok or not hm.is_initialized() then
     return
   end
 
-  -- 没有指定会话ID，尝试从当前会话加载
-  local session_messages = session_helper.load_messages_from_session(100)
-  if #session_messages > 0 then
-    state.messages = session_messages
-    print("✓ 从会话管理器加载了 " .. #session_messages .. " 条消息")
-  else
-    -- 如果会话管理器没有消息，从历史管理器加载
-    local history_messages = session_helper.load_messages_from_history(100)
-    if #history_messages > 0 then
-      state.messages = history_messages
-      print("✓ 从历史管理器加载了 " .. #history_messages .. " 条消息")
-    else
-      print("⚠️  没有找到历史消息")
-    end
+  local target_id = session_id or hm.get_current_session() and hm.get_current_session().id
+  if not target_id then
+    return
   end
+
+  -- 使用 get_context_and_new_parent 获取上下文路径
+  local context_msgs, _ = hm.get_context_and_new_parent(target_id)
+  if #context_msgs > 0 then
+    state.messages = context_msgs
+    return
+  end
+
+  -- 如果上下文为空，直接获取该会话的消息
+  local msgs = hm.get_messages(target_id)
+  state.messages = msgs
 end
 
 --- 异步加载消息数据（内部函数）
@@ -1062,64 +1063,39 @@ end
 --- @param role string 角色 ('user' 或 'assistant')
 --- @param content string 消息内容
 function M._persist_message(role, content)
-  -- 使用会话辅助模块保存消息
-  local success = session_helper.save_message_to_all(role, content, {
-    timestamp = os.time(),
-    window_id = state.current_window_id,
-  })
-
-  if success then
-    print("✓ 消息已持久化到所有管理器")
-  else
-    print("⚠️  消息持久化失败")
-  end
-
-  -- 触发自动保存
-  M._trigger_auto_save()
-end
-
---- 更新已持久化的消息（更新 message_manager 和 history_manager 中的最新一条同角色消息）
---- @param role string 角色 ('user' 或 'assistant')
---- @param content string 新消息内容
-function M._update_persisted_message(role, content)
-  -- 确保所有管理器已初始化
-  session_helper.ensure_session_manager()
-  session_helper.ensure_history_manager()
-
-  -- 1. 更新会话管理器中的最新一条同角色消息
-  local session_mgr = require("NeoAI.core.session.session_manager")
-  local current_session = session_mgr.get_current_session()
-  if current_session and current_session.current_branch then
-    local msg_mgr = session_mgr.get_message_manager()
-    if msg_mgr then
-      -- 获取该分支的所有消息
-      local branch_msgs = msg_mgr.get_messages(current_session.current_branch, 1000000)
-      -- 从后往前找最新一条同角色消息
-      for i = #branch_msgs, 1, -1 do
-        if branch_msgs[i].role == role then
-          local ok, err = pcall(msg_mgr.edit_message, branch_msgs[i].id, content)
-          if ok then
-            print("✓ 已更新会话管理器中的消息: " .. branch_msgs[i].id)
-          else
-            print("⚠️  更新会话管理器消息失败: " .. tostring(err))
-          end
-          break
-        end
-      end
+  --- 持久化消息到存储系统（内部函数）
+  --- @param role string 角色 ('user' 或 'assistant')
+  --- @param content string 消息内容
+  function M._persist_message(role, content)
+    local ok, hm = pcall(require, "NeoAI.core.history_manager")
+    if not ok or not hm.is_initialized() then
+      return
+    end
+    local session = hm.get_current_session()
+    if not session then
+      return
+    end
+    if role == "user" then
+      hm.add_round(session.id, content, "")
+    elseif role == "assistant" then
+      hm.update_last_assistant(session.id, content)
     end
   end
 
-  -- 2. 更新历史管理器中的最新一条同角色消息
-  local history_mgr = require("NeoAI.core.history_manager")
-  local history_session = history_mgr.get_current_session()
-  if history_session then
-    local history_msgs = history_session:get_messages(1000000)
-    for i = #history_msgs, 1, -1 do
-      if history_msgs[i].role == role then
-        history_session.messages[i].content = content
-        print("✓ 已更新历史管理器中的消息")
-        break
-      end
+  --- 更新已持久化的消息
+  --- @param role string 角色 ('user' 或 'assistant')
+  --- @param content string 新消息内容
+  function M._update_persisted_message(role, content)
+    local ok, hm = pcall(require, "NeoAI.core.history_manager")
+    if not ok or not hm.is_initialized() then
+      return
+    end
+    local session = hm.get_current_session()
+    if not session then
+      return
+    end
+    if role == "assistant" then
+      hm.update_last_assistant(session.id, content)
     end
   end
 

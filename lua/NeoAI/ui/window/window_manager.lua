@@ -890,41 +890,24 @@ function M.render_tree(tree_data, tree_state, load_data_func, window_width)
   if tree_data then
     tree_state.tree_data = tree_data
   end
-
   if #tree_state.tree_data == 0 and load_data_func then
     load_data_func(nil)
   end
-
   local content = {}
   table.insert(content, "=== NeoAI 会话树 ===")
   table.insert(content, "")
-
   if #tree_state.tree_data == 0 then
     table.insert(content, "暂无会话")
     table.insert(content, "按 N 创建新会话")
   else
     local root_count = #tree_state.tree_data
     for i, root_node in ipairs(tree_state.tree_data) do
-      local is_last = (i == root_count)
-      if root_node.type == "virtual_root" then
-        if root_node.children and #root_node.children > 0 then
-          local child_count = #root_node.children
-          for j, child in ipairs(root_node.children) do
-            M._render_tree_node(content, child, 0, j == child_count, "", tree_state, window_width)
-          end
-        else
-          table.insert(content, "暂无会话")
-          table.insert(content, "按 N 创建新会话")
-        end
-      else
-        M._render_tree_node(content, root_node, 0, is_last, "", tree_state, window_width)
-      end
+      M._render_tree_node(content, root_node, 0, i == root_count, "", tree_state, window_width, true)
     end
   end
-
   table.insert(content, "")
   table.insert(content, "---")
-  table.insert(content, "使用方向键导航，Enter 选择，n/N 新建节点，d/D 删除")
+  table.insert(content, "使用方向键导航，Enter 选择，n/N 新建节点，d 删除")
   return content
 end
 
@@ -936,113 +919,81 @@ end
 --- @param parent_prefix string 父节点的前缀
 --- @param tree_state table 树状态
 --- @param window_width number|nil 窗口宽度
-function M._render_tree_node(content, node, depth, is_last, parent_prefix, tree_state, window_width)
-  if not node then
-    return
-  end
+--- @param is_root boolean 是否是根节点
+function M._render_tree_node(content, node, depth, is_last, parent_prefix, tree_state, window_width, is_root)
+  if not node then return end
 
-  -- 生成当前节点的前缀
   local current_prefix = parent_prefix or ""
   local line_prefix = ""
-
-  if depth > 0 then
-    -- 使用文件树样式的连接符
+  if is_root then
+    -- 根节点：使用 └── 前缀（不带竖线）
     if is_last then
-      line_prefix = current_prefix .. "└── "
+      line_prefix = "└──"
     else
-      line_prefix = current_prefix .. "├── "
+      line_prefix = "├──"
     end
+  elseif depth > 0 then
+    if is_last then
+      line_prefix = current_prefix .. "└───"
+    else
+      line_prefix = current_prefix .. "├───"
+    end
+  end
+
+  local display_text
+  if node.is_round then
+    -- 轮次节点：显示消息预览
+    display_text = node.preview or "(空消息)"
   else
-    line_prefix = "" -- 根节点没有前缀
+    -- 会话节点：显示会话名称
+    display_text = node.name or "未命名"
   end
+  display_text = display_text:gsub("%b<>", " "):gsub("[%c%z]", " "):gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
+  if display_text == "" then display_text = "未命名" end
 
-  -- 清理节点名称中的二进制数据和控制字符
-  local cleaned_name = node.name
-  if cleaned_name then
-    cleaned_name = cleaned_name:gsub("%b<>", " "):gsub("[%c%z]", " "):gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
-    if cleaned_name == "" then
-      cleaned_name = "未命名节点"
-    end
+  local icon
+  if node.is_virtual then
+    icon = "📂 "
+  elseif node.is_round then
+    icon = "💬 "
   else
-    cleaned_name = "未命名节点"
-  end
-  
-  -- 生成节点行
-  local line = line_prefix .. cleaned_name
-  local metadata_str = ""
-  
-  if node.metadata then
-    if node.metadata.message_count then
-      -- 只显示消息数量，不显示括号和'消息'字样
-      metadata_str = metadata_str .. " (" .. tostring(node.metadata.message_count) .. ")"
-    end
-
-    if node.metadata.created_at then
-      local time_str = os.date("%H:%M", node.metadata.created_at)
-      metadata_str = metadata_str .. " [" .. time_str .. "]"
-    end
+    icon = ""  -- 会话节点不显示图标
   end
 
-  -- 如果提供了窗口宽度，进行截断
+  local line = line_prefix .. icon .. display_text
+
+  if node.round_count and node.round_count > 0 then
+    line = line .. "  (" .. node.round_count .. " 轮)"
+  end
+
   if window_width and window_width > 0 then
     local available_width = window_width - #line_prefix - 3
-    if available_width > 0 then
-      local total_length = #cleaned_name + #metadata_str
-      if total_length > available_width then
-        local name_available = available_width - 3
-        if #cleaned_name > name_available then
-          line = line_prefix .. safe_truncate(cleaned_name, name_available) .. "..."
-        else
-          local metadata_available = available_width - #cleaned_name
-          if #metadata_str > metadata_available then
-            if metadata_available >= 5 then
-              line = line_prefix .. cleaned_name .. safe_truncate(metadata_str, metadata_available - 3) .. "..."
-            else
-              line = line_prefix .. cleaned_name
-            end
-          else
-            line = line_prefix .. cleaned_name .. metadata_str
-          end
-        end
-      else
-        line = line_prefix .. cleaned_name .. metadata_str
-      end
+    if available_width > 0 and #line > available_width then
+      line = line_prefix .. safe_truncate(line:sub(#line_prefix + 1), available_width - 3) .. "..."
     end
-  else
-    line = line_prefix .. node.name .. metadata_str
   end
 
   table.insert(content, line)
 
-  -- 渲染子节点（如果展开）
-  -- 需求1: conversation_round 类型的节点不展开显示子消息，问答绑定在一行
-  -- 但如果有用户创建的子分支（node类型），仍然需要显示
-  if tree_state.expanded_nodes and tree_state.expanded_nodes[node.id] and node.children then
-    -- 过滤子节点：跳过 message 类型的子节点（问答已在一行显示），但显示其他类型（如 node 子分支）
-    local visible_children = {}
-    for _, child in ipairs(node.children) do
-      if child.type ~= "message" then
-        table.insert(visible_children, child)
+  if tree_state.expanded_nodes and tree_state.expanded_nodes[node.id] and node.children and #node.children > 0 then
+    local child_count = #node.children
+    local child_parent_prefix = parent_prefix or ""
+    if is_root then
+      -- 根节点的子节点前缀：根节点是最后一个时用空格，否则用竖线
+      if is_last then
+        child_parent_prefix = "    "
+      else
+        child_parent_prefix = "│   "
+      end
+    elseif depth > 0 then
+      if is_last then
+        child_parent_prefix = child_parent_prefix .. "    "
+      else
+        child_parent_prefix = child_parent_prefix .. "│   "
       end
     end
-
-    if #visible_children > 0 then
-      local child_count = #visible_children
-
-      -- 为子节点生成新的前缀
-      local child_parent_prefix = parent_prefix or ""
-      if depth > 0 then
-        if is_last then
-          child_parent_prefix = child_parent_prefix .. "    " -- 最后一个子节点，父节点是空格
-        else
-          child_parent_prefix = child_parent_prefix .. "│   " -- 不是最后一个子节点，父节点是竖线
-        end
-      end
-
-      for i, child in ipairs(visible_children) do
-        local child_is_last = (i == child_count)
-        M._render_tree_node(content, child, depth + 1, child_is_last, child_parent_prefix, tree_state, window_width)
-      end
+    for i, child in ipairs(node.children) do
+      M._render_tree_node(content, child, depth + 1, i == child_count, child_parent_prefix, tree_state, window_width, false)
     end
   end
 end
@@ -1059,7 +1010,7 @@ function M._get_node_name_by_id(node_id, tree_data)
   local function search_node(nodes)
     for _, node in ipairs(nodes) do
       if node.id == node_id then
-        return node.name
+        return node.preview or node.name
       end
 
       -- 递归搜索子节点

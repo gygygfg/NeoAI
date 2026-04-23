@@ -10,17 +10,17 @@ NeoAI/
 │
 ├── core/                       # 核心业务逻辑
 │   ├── init.lua                # 核心模块入口，协调子模块初始化
-│   ├── history_manager.lua     # 历史管理器（基于跳表，按时间排序会话）
+│   ├── history_manager.lua     # 历史管理器（JSON数组存储，树形会话结构）
 │   │
 │   ├── config/
 │   │   └── keymap_manager.lua  # 键位配置管理器
 │   │
-│   ├── session/                # 会话管理
-│   │   ├── session_manager.lua # 会话管理器（CRUD、持久化、防抖保存）
+│   ├── session/                # 旧版会话管理（已废弃，保留向后兼容）
+│   │   ├── session_manager.lua # 会话管理器
 │   │   ├── branch_manager.lua  # 分支管理
 │   │   ├── message_manager.lua # 消息管理
 │   │   ├── data_operations.lua # 数据操作工具
-│   │   └── tree_manager.lua    # 树形结构管理器（虚拟根节点 + 会话树）
+│   │   └── tree_manager.lua    # 树形结构管理器
 │   │
 │   ├── ai/                     # AI 交互
 │   │   ├── ai_engine.lua       # AI 引擎主入口（事件驱动，协调子模块）
@@ -44,13 +44,13 @@ NeoAI/
 │   │
 │   ├── components/             # UI 组件
 │   │   ├── input_handler.lua   # 输入处理器
-│   │   ├── history_tree.lua    # 历史树组件
+│   │   ├── history_tree.lua    # 历史树组件（基于 history_manager）
 │   │   ├── reasoning_display.lua# 思考过程显示
 │   │   └── virtual_input.lua   # 虚拟输入框组件
 │   │
 │   └── handlers/               # 事件处理器
-│       ├── tree_handlers.lua   # 树界面处理器
-│       └── chat_handlers.lua   # 聊天界面处理器
+│       ├── tree_handlers.lua   # 树界面处理器（基于 history_manager）
+│       └── chat_handlers.lua   # 聊天界面处理器（基于 history_manager）
 │
 ├── tools/                      # 工具系统
 │   ├── init.lua                # 工具模块入口
@@ -76,7 +76,7 @@ NeoAI/
 │   ├── skiplist.lua            # 跳表数据结构
 │   ├── async_worker.lua        # 异步工作器
 │   ├── debug_utils.lua         # 调试工具
-│   ├── session_helper.lua      # 会话辅助函数
+│   ├── session_helper.lua      # 会话辅助函数（基于 history_manager）
 │   ├── thread_utils.lua        # 线程工具
 │   └── tool_registry.lua       # 工具注册表（utils 层）
 │
@@ -119,12 +119,13 @@ default_config.sanitize_config(config)    ← 清理/补全配置（创建目录
     ▼
 core.initialize(config)                   ← 初始化核心模块
   ├── keymap_manager.initialize()         ← 键位配置
-  ├── session_manager.initialize()        ← 会话管理
+  ├── session_manager.initialize()        ← 旧版会话管理（向后兼容）
   ├── ai_engine.initialize()              ← AI 引擎
-  └── history_manager.initialize()        ← 历史管理器
+  └── history_manager.initialize()        ← 历史管理器（新版，唯一数据源）
     │
     ▼
 ui.initialize(config)                     ← 初始化 UI 模块
+  ├── history_manager.initialize()        ← 确保历史管理器已初始化
   ├── window_manager.initialize()         ← 窗口管理器
   ├── input_handler.initialize()
   ├── history_tree.initialize()
@@ -206,53 +207,64 @@ require("NeoAI").setup({
 - 初始化 `keymap_manager`, `session_manager`, `ai_engine`, `history_manager`
 - 提供 `get_session_manager()`, `get_ai_engine()`, `get_keymap_manager()`, `get_history_manager()`, `get_config_manager()`
 
-### `core/session/session_manager.lua` — 会话管理器
+### `core/history_manager.lua` — 历史管理器（新版，唯一数据源）
 
-- 会话 CRUD：`create_session()`, `get_session()`, `delete_session()`, `list_sessions()`
-- 当前会话管理：`get_current_session()`, `set_current_session()`
-- 自动保存：防抖 500ms 保存到 `sessions.json`
-- 加载时兼容新旧两种格式
-- 与 `tree_manager` 双向同步
+- 使用 JSON 数组文件存储，文件格式：`[\n{...},\n{...}\n]`
+- 初始创建空文件内容为 `[\n]`
+- 添加会话时覆写最后一行 `]` 为 `,新内容\n]`
 
-### `core/session/tree_manager.lua` — 树形结构管理器
+**会话对象结构**（无 `current_branch_id`、`branches` 字段）：
+```json
+{
+  "id": "session_1",
+  "name": "会话名称",
+  "created_at": 1234567890,
+  "updated_at": 1234567890,
+  "is_root": true,
+  "child_ids": ["session_2", "session_3"],
+  "rounds": [
+    { "user": "用户消息", "assistant": "AI回复", "timestamp": 1234567890 }
+  ]
+}
+```
 
-- 维护虚拟根节点 `virtual_root`，所有会话作为其子节点
-- 节点类型：`root_branch`, `sub_branch`, `session`, `conversation_round`, `message`
-- 对话轮次（`conversation_round`）将问答摘要显示在一行，不创建子消息节点
-- 树数据持久化到 `sessions.json` 的 `_tree_graph` 字段
-- `sync_from_session_manager()` — 从会话管理器同步数据
+**关键方法**：
+- `create_session(name, is_root, parent_id)` — 创建会话（根/子）
+- `get_session(session_id)` / `get_current_session()` — 获取会话
+- `set_current_session(session_id)` — 设置当前会话
+- `delete_session(session_id)` — 删除会话（递归删除子会话）
+- `add_round(session_id, user_msg, assistant_msg)` — 添加一轮对话
+- `update_last_assistant(session_id, content)` — 流式更新最后一轮AI回复
+- `get_messages(session_id)` — 展平为 role/content 列表
+- `get_root_sessions()` — 获取所有根会话
+- `get_tree()` — 获取树结构（先遍历根会话，再递归子会话）
+- `get_context_and_new_parent(session_id)` — 沿子会话链捋上下文
+- `cleanup_orphans()` — 清理未被引用的子会话
+- `rename_session(session_id, new_name)` — 重命名会话
 
-### `core/ai/ai_engine.lua` — AI 引擎
+**树结构生成规则**（`get_tree()`）：
+1. 先调用 `cleanup_orphans()` 清理孤儿
+2. 遍历所有 `is_root=true` 的会话
+3. 对每个会话递归构建子节点
+4. 如果某会话有多个子会话，自动生成虚拟分支节点（`__branch_xxx`，`is_virtual=true`，不存文件）
+5. 如果只有一个子会话，直接作为子节点
 
-- 事件驱动：监听 `NeoAI:send_message` 事件
-- 支持流式和非流式两种请求模式
-- 重试机制：最多 3 次，间隔 1 秒
-- 协调子模块：`request_builder`, `response_builder`, `stream_processor`, `reasoning_manager`, `tool_orchestrator`, `http_client`
-- 提供子模块功能接口（代理模式）
+**上下文路径规则**（`get_context_and_new_parent()`）：
+1. 从当前会话开始
+2. 如果无子会话 → 当前会话的消息作为上文，在此新开子会话
+3. 如果只有一个子会话 → 继续往下捋
+4. 如果有多个子会话 → 当前会话的消息作为上文，在此新开子会话
 
-### `core/ai/http_client.lua` — HTTP 客户端
+### `core/session/session_manager.lua` — 旧版会话管理器（已废弃）
 
-- 真正的 HTTP API 调用（非模拟）
-- 支持流式（SSE）和非流式请求
-- 请求取消支持
+- 保留向后兼容，新代码应使用 `history_manager`
+- 旧版数据格式：`{ "1": { id: 1, messages: [...], branches: {...}, current_branch_id: "..." } }`
+- 新版数据格式：`[{ id: "session_1", is_root: true, child_ids: [...], rounds: [...] }]`
 
-### `core/events/event_constants.lua` — 事件常量
+### `core/session/tree_manager.lua` — 旧版树形结构管理器（已废弃）
 
-所有事件名统一管理，按类别分组：
-
-| 类别 | 事件 | 说明 |
-|------|------|------|
-| AI 生成 | `NeoAI:generation_started/completed/error/cancelled` | 生成生命周期 |
-| 流式 | `NeoAI:stream_started/chunk/completed/error` | 流式数据处理 |
-| 推理 | `NeoAI:reasoning_started/content/completed` | 思考过程 |
-| 工具 | `NeoAI:tool_loop_started/finished`, `tool_execution_started/completed/error`, `tool_call_detected`, `tool_result_received` | 工具调用 |
-| 会话 | `NeoAI:session_created/reused/loaded/saved/deleted/changed` | 会话生命周期 |
-| 分支 | `NeoAI:branch_created/switched/deleted` | 分支管理 |
-| 消息 | `NeoAI:message_added/edited/deleted/updated/sent`, `messages_cleared/built` | 消息操作 |
-| UI | `NeoAI:chat_window_opened/closed`, `tree_window_opened/closed`, `window_mode_changed` | 窗口管理 |
-| 配置 | `NeoAI:config_loaded/changed` | 配置变更 |
-| 状态 | `NeoAI:plugin_initialized/shutdown` | 插件生命周期 |
-| 聊天流 | `NeoAI:user_message_ready/sending/sent`, `ai_response_ready/received`, `chat_input_ready` | 消息流解耦 |
+- 保留向后兼容
+- 新版树结构由 `history_manager.get_tree()` 直接生成
 
 ---
 
@@ -280,11 +292,10 @@ tree_window.set_keymaps(keymap_manager)       ← 设置按键映射
 ```
 
 树界面按键（由 `tree_window.set_keymaps()` 设置）：
-- `<CR>` — 选择节点/分支 → `tree_handlers.handle_enter()` → 关闭树 → 打开聊天
-- `n` — 新建子分支
-- `N` — 新建根分支
-- `d` — 删除对话
-- `D` — 删除分支
+- `<CR>` — 选择会话 → `tree_handlers.handle_enter()` → 打开聊天
+- `n` — 在当前会话下新建子会话
+- `N` — 新建根会话
+- `d` — 删除当前会话
 - `o` — 展开节点
 - `O` — 折叠节点
 
@@ -297,13 +308,19 @@ tree_window.set_keymaps(keymap_manager)       ← 设置按键映射
 input_handler.handle_input()                   ← 处理用户输入
     │
     ▼
-chat_handlers.handle_enter() / handle_ctrl_s() ← 发送消息
+chat_handlers.send_message(content)            ← 发送消息
+    │
+    ├── history_manager.get_or_create_current_session()
+    ├── history_manager.get_context_and_new_parent()  ← 获取上下文路径
+    ├── 如果当前会话有多个子会话 → 创建新子会话
+    ├── history_manager.add_round()             ← 保存用户消息
+    ├── chat_window.add_message("user", ...)    ← 更新UI
     │
     ▼
-触发 NeoAI:send_message 事件
+触发 NeoAI:message_sent 事件
     │
     ▼
-ai_engine.handle_send_message(data)            ← AI 引擎接收
+chat_handlers._trigger_ai_response()           ← 自动触发AI响应
     │
     ▼
 ai_engine.generate_response(messages, params)  ← 开始生成
@@ -328,7 +345,7 @@ NeoAI:send_message 事件
     ▼
 ai_engine.handle_send_message(data)
     │
-    ├── 从会话管理器获取消息历史
+    ├── 从 history_manager 获取消息历史
     ├── 添加用户消息
     ├── 触发 NeoAI:user_message_sent
     │
@@ -440,29 +457,39 @@ reasoning_display.close()                     ← 关闭窗口，转换为折叠
 
 ```
 保存（防抖 500ms）：
-    session_manager._save_sessions()
+    history_manager._save()
         │
         ▼
-    构建 sessions_json_data（按 session_N 编号索引）
+    收集所有会话为数组，按 created_at 排序
         │
         ▼
-    写入 sessions.json
+    逐行写入 JSON 数组文件：
+        [
+        {session_1_json},
+        {session_2_json},
+        ]
         │
         ▼
-    tree_manager._save_tree_data()
-        │
-        ▼
-    读取 sessions.json → 写入 _tree_graph 字段
+    最后一行始终是 "]"
 
 加载：
-    session_manager._load_sessions()
+    history_manager._load()
         │
         ▼
     读取 sessions.json
         │
-        ├── 恢复会话数据到 sessions 表
-        ├── 恢复消息到 message_manager
-        └── 同步到 tree_manager
+        ├── 空文件或 "[]" → 空会话列表
+        ├── 解析 JSON 数组
+        └── 转换为 id → session 映射
+
+孤儿清理：
+    history_manager.cleanup_orphans()
+        │
+        ▼
+    从所有根会话出发，标记所有可达会话
+        │
+        ▼
+    删除未被标记的会话
 ```
 
 ---
@@ -490,7 +517,7 @@ vim.api.nvim_create_autocmd("User", {
 
 ### 事件依赖链
 
-- **启动链**：`NeoAI:session_created` → `NeoAI:branch_created` → `NeoAI:message_added`
+- **启动链**：`NeoAI:session_created` → `NeoAI:round_added`
 - **AI 处理链**：`NeoAI:generation_started` → `NeoAI:stream_started` → `NeoAI:stream_chunk` → `NeoAI:stream_completed` → `NeoAI:generation_completed`
 - **工具调用链**：`NeoAI:tool_loop_started` → `NeoAI:tool_execution_started` → `NeoAI:tool_execution_completed` → `NeoAI:tool_loop_finished`
 - **窗口管理链**：`NeoAI:chat_window_opened` → `NeoAI:chat_window_closed`
@@ -571,6 +598,51 @@ vim.api.nvim_create_autocmd("User", {
 1. **事件驱动**：模块间通过 Neovim 原生事件通信，避免直接依赖
 2. **职责单一**：每个模块只负责一个领域的功能
 3. **配置集中**：所有配置在 `default_config.lua` 中统一管理
-4. **防抖持久化**：会话和树数据使用 500ms 防抖保存
-5. **向后兼容**：会话加载兼容新旧两种文件格式
+4. **防抖持久化**：会话数据使用 500ms 防抖保存
+5. **单一数据源**：`history_manager` 是唯一的会话数据源，旧版 `session_manager` 保留向后兼容
 6. **安全调用**：跨模块依赖使用 `pcall` 保护
+
+---
+
+## 会话数据结构详解
+
+### JSON 文件格式
+
+文件 `sessions.json` 是一个 JSON 数组，每行一个元素：
+
+```json
+[
+{"id":"session_1","name":"根会话","created_at":1234567890,"updated_at":1234567890,"is_root":true,"child_ids":["session_2"],"rounds":[{"user":"你好","assistant":"你好！有什么可以帮助你的？","timestamp":1234567890}]},
+{"id":"session_2","name":"子会话-根会话","created_at":1234567891,"updated_at":1234567891,"is_root":false,"child_ids":[],"rounds":[]}
+]
+```
+
+### 树渲染规则
+
+`history_manager.get_tree()` 返回的树结构：
+
+```
+根会话 A (round_count: 3)
+├── 子会话 B (round_count: 5)       ← 只有一个子会话，直接显示
+└── 📂 根会话 A (分支)              ← 多个子会话，自动生成虚拟节点
+    ├── 子会话 C (round_count: 2)
+    └── 子会话 D (round_count: 1)
+根会话 E (round_count: 0)           ← 无子会话，无子节点
+```
+
+### 上下文路径规则
+
+选中会话打开聊天时：
+
+```
+选中会话 A
+  │
+  ├── 无子会话 → A的消息作为上文，在A下新开子会话
+  │
+  ├── 一个子会话 B → 继续往下捋
+  │   ├── B无子会话 → A+B的消息作为上文，在B下新开子会话
+  │   ├── B一个子会话 C → 继续...
+  │   └── B多个子会话 → A+B的消息作为上文，在B下新开子会话
+  │
+  └── 多个子会话 → A的消息作为上文，在A下新开子会话
+```

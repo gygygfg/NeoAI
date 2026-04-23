@@ -11,7 +11,6 @@ local NODE_TYPES = {
 
 -- 树节点存储
 local tree_nodes = {}
-local node_counter = 0
 
 -- 模块状态
 local state = {
@@ -105,12 +104,11 @@ function M.create_root_branch(name)
     error("Tree manager not initialized")
   end
 
-  node_counter = node_counter + 1
-  local node_id = "root_" .. node_counter
+  local node_id = "root_" .. vim.fn.strftime("%Y%m%d%H%M%S") .. "_" .. math.random(1000, 9999)
 
   local node = {
     id = node_id,
-    name = name or ("根节点-" .. node_counter),
+    name = name or ("根节点-" .. os.date("%H:%M:%S")),
     type = "node",
     parent_id = "virtual_root",
     created_at = os.time(),
@@ -163,12 +161,11 @@ function M.create_sub_branch(parent_id, name)
     parent.children = {}
   end
 
-  node_counter = node_counter + 1
-  local node_id = "node_" .. node_counter
+  local node_id = "node_" .. vim.fn.strftime("%Y%m%d%H%M%S") .. "_" .. math.random(1000, 9999)
 
   local node = {
     id = node_id,
-    name = name or ("节点-" .. node_counter),
+    name = name or ("节点-" .. os.date("%H:%M:%S")),
     type = "node", -- 所有子节点统一为 node 类型
     parent_id = parent_id,
     created_at = os.time(),
@@ -247,12 +244,11 @@ function M.create_session(parent_id, name, metadata)
 
   -- 任何节点都可以有 session 子节点，移除类型检查
 
-  node_counter = node_counter + 1
-  local node_id = "session_" .. node_counter
+  local node_id = "session_" .. vim.fn.strftime("%Y%m%d%H%M%S") .. "_" .. math.random(1000, 9999)
 
   local node = {
     id = node_id,
-    name = name or ("会话-" .. node_counter),
+    name = name or ("会话-" .. os.date("%H:%M:%S")),
     type = NODE_TYPES.SESSION,
     parent_id = parent_id,
     created_at = os.time(),
@@ -313,7 +309,6 @@ function M.create_conversation_round(session_id, round_number, user_message, ai_
   end
   ai_messages = ai_messages or {}
 
-  node_counter = node_counter + 1
   local node_id = "round_" .. session_id .. "_" .. round_number
 
   -- 合并所有 AI 消息内容
@@ -403,7 +398,6 @@ function M.create_message(round_id, role, content, round_number, message_index)
     error("Cannot create message under node type: " .. round.type)
   end
 
-  node_counter = node_counter + 1
   local node_id = "msg_" .. round_id .. "_" .. message_index
 
   -- 提取前几个字作为预览
@@ -642,7 +636,6 @@ end
 --- 重置树管理器（主要用于测试）
 function M.reset()
   tree_nodes = {}
-  node_counter = 0
   state.initialized = false
   state.event_bus = nil
   state.config = nil
@@ -887,7 +880,7 @@ function M.sync_from_session_manager()
 end
 
 --- 保存树数据到文件（内部使用）
---- 将 tree_nodes 和 node_counter 保存到 sessions.json 的 _tree_graph 字段
+--- 将 tree_nodes 保存到 sessions.json 的 _tree_graph 字段
 function M._save_tree_data()
   if not state.config or not state.config.save_path then
     return
@@ -916,7 +909,6 @@ function M._save_tree_data()
 
   -- 构建树图数据
   local tree_graph = {
-    node_counter = node_counter,
     nodes = {},
     virtual_root_children = {}, -- 单独保存虚拟根节点的子节点ID列表
   }
@@ -975,11 +967,6 @@ function M._load_tree_data()
   local tree_graph = all_data["_tree_graph"]
   if not tree_graph or not tree_graph.nodes then
     return
-  end
-
-  -- 恢复节点计数器
-  if tree_graph.node_counter then
-    node_counter = tree_graph.node_counter
   end
 
   -- 确保虚拟根节点存在

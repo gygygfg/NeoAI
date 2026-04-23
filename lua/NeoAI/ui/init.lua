@@ -61,6 +61,15 @@ function M.initialize(config)
     window_manager_config.window_mode = state.config.ui.window_mode
   end
 
+  -- 初始化历史管理器
+  local ok, hm = pcall(require, "NeoAI.core.history_manager")
+  if ok then
+    hm.initialize({
+      config = state.config,
+      event_bus = nil,
+    })
+  end
+
   -- 设置事件处理器
   -- 初始化子模块
   window_manager.initialize(window_manager_config)
@@ -75,7 +84,7 @@ function M.initialize(config)
 
   tree_handlers.initialize(state.config.handlers or {})
   chat_handlers.initialize(state.config.handlers or {})
-  
+
   -- 注册事件监听器
   M._register_event_listeners()
 
@@ -90,15 +99,16 @@ function M.open_tree_ui()
   end
 
   -- 获取当前会话ID
-  -- UI层不应该直接调用核心模块，改为从状态或通过事件获取
-  local session_id = state.current_session_id or "default"
-
-  -- 如果状态中没有会话ID，尝试通过事件获取
-  if session_id == "default" and core and core.get_session_manager then
-    -- 这是向后兼容的代码，新架构应该通过事件通信
-    local session_manager = core.get_session_manager()
-    local current_session = session_manager and session_manager.get_current_session()
-    session_id = current_session and current_session.id or "default"
+  local ok, hm = pcall(require, "NeoAI.core.history_manager")
+  local session_id = state.current_session_id
+  if (not session_id or session_id == "default") and ok and hm.is_initialized() then
+    local current = hm.get_current_session()
+    if current then
+      session_id = current.id
+    end
+  end
+  if not session_id then
+    session_id = "default"
   end
 
   -- 只关闭已有的聊天窗口，保留树窗口
@@ -149,27 +159,24 @@ function M.open_chat_ui(session_id, branch_id)
     error("UI not initialized")
   end
 
-  -- 确保会话管理器已初始化
-  local session_manager = core.get_session_manager()
-  if not session_manager then
-    -- 尝试直接加载会话管理器
-    local success, loaded_session_manager = pcall(require, "NeoAI.core.session.session_manager")
-    if success then
-      session_manager = loaded_session_manager
-    end
+  -- 确保历史管理器已初始化
+  local ok, hm = pcall(require, "NeoAI.core.history_manager")
+  if ok and not hm.is_initialized() then
+    hm.initialize({ config = state.config })
   end
 
   -- 如果没有提供参数，使用默认值
   if not session_id then
-    session_id = state.current_session_id or "default"
-
-    -- 如果状态中没有会话ID，尝试通过事件获取
-    if session_id == "default" and core and core.get_session_manager then
-      -- 这是向后兼容的代码，新架构应该通过事件通信
-      local session_manager = core.get_session_manager()
-      local current_session = session_manager and session_manager.get_current_session()
-      session_id = current_session and current_session.id or "default"
+    session_id = state.current_session_id
+    if (not session_id or session_id == "default") and ok and hm.is_initialized() then
+      local current = hm.get_current_session()
+      if current then
+        session_id = current.id
+      end
     end
+  end
+  if not session_id then
+    session_id = "default"
   end
 
   if not branch_id then
@@ -324,7 +331,7 @@ function M._register_event_listeners()
       refresh_tree_if_open()
     end,
   })
-  
+
   vim.api.nvim_create_autocmd("User", {
     pattern = "NeoAI:session_loaded",
     callback = function(args)
@@ -336,7 +343,7 @@ function M._register_event_listeners()
       refresh_tree_if_open()
     end,
   })
-  
+
   vim.api.nvim_create_autocmd("User", {
     pattern = "NeoAI:session_deleted",
     callback = function(args)
@@ -347,7 +354,7 @@ function M._register_event_listeners()
       refresh_tree_if_open()
     end,
   })
-  
+
   vim.api.nvim_create_autocmd("User", {
     pattern = "NeoAI:session_changed",
     callback = function(args)
@@ -361,13 +368,15 @@ function M._register_event_listeners()
       refresh_tree_if_open()
     end,
   })
-  
+
   -- 监听分支事件
   vim.api.nvim_create_autocmd("User", {
     pattern = "NeoAI:branch_created",
-    callback = function() refresh_tree_if_open() end,
+    callback = function()
+      refresh_tree_if_open()
+    end,
   })
-  
+
   vim.api.nvim_create_autocmd("User", {
     pattern = "NeoAI:branch_switched",
     callback = function()
@@ -375,16 +384,20 @@ function M._register_event_listeners()
       refresh_tree_if_open()
     end,
   })
-  
+
   vim.api.nvim_create_autocmd("User", {
     pattern = "NeoAI:branch_deleted",
-    callback = function() refresh_tree_if_open() end,
+    callback = function()
+      refresh_tree_if_open()
+    end,
   })
-  
+
   -- 监听消息事件
   vim.api.nvim_create_autocmd("User", {
     pattern = "NeoAI:message_added",
-    callback = function() refresh_chat_if_open() end,
+    callback = function()
+      refresh_chat_if_open()
+    end,
   })
 end
 
@@ -408,7 +421,7 @@ function M.switch_mode(mode)
     M.open_tree_ui()
   elseif mode == "chat" then
     -- 需要会话和分支信息，这里使用当前或默认值
-    M.open_chat_ui()
+    M.open_chat_ui(state.current_session_id or "default", state.current_branch_id or "main")
   end
 end
 
