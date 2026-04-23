@@ -297,6 +297,9 @@ function M._do_render_chat()
           -- 将光标定位到输出位置（缓冲区末尾，即最新消息位置）
           M._move_cursor_to_end()
 
+          -- 将光标移动到虚拟输入框窗口（不进入插入模式）
+          M._focus_virtual_input()
+
           -- 触发渲染完成事件
           vim.api.nvim_exec_autocmds(
             "User",
@@ -614,8 +617,9 @@ function M._open_virtual_input()
     return true
   end
 
-  -- 打开虚拟输入框
+  -- 打开虚拟输入框（不自动进入插入模式，光标移动到输入框上即可）
   local success = virtual_input.open(win_handle, {
+    no_auto_insert = true,
     placeholder = "输入消息...",
     on_submit = function(content)
       -- 当用户提交消息时，通过聊天处理器发送消息
@@ -720,9 +724,12 @@ function M._load_messages(session_id)
       print("✓ 从会话管理器加载了 " .. #session_messages .. " 条消息 (会话: " .. session_id .. ")")
       return
     end
+    -- 指定会话无消息（新会话），保持空消息，不回退到当前会话
+    print("ℹ️  会话 " .. session_id .. " 没有消息，显示空聊天")
+    return
   end
 
-  -- 没有指定会话ID或指定会话无消息，尝试从当前会话加载
+  -- 没有指定会话ID，尝试从当前会话加载
   local session_messages = session_helper.load_messages_from_session(100)
   if #session_messages > 0 then
     state.messages = session_messages
@@ -1071,6 +1078,55 @@ function M._persist_message(role, content)
   M._trigger_auto_save()
 end
 
+--- 更新已持久化的消息（更新 message_manager 和 history_manager 中的最新一条同角色消息）
+--- @param role string 角色 ('user' 或 'assistant')
+--- @param content string 新消息内容
+function M._update_persisted_message(role, content)
+  -- 确保所有管理器已初始化
+  session_helper.ensure_session_manager()
+  session_helper.ensure_history_manager()
+
+  -- 1. 更新会话管理器中的最新一条同角色消息
+  local session_mgr = require("NeoAI.core.session.session_manager")
+  local current_session = session_mgr.get_current_session()
+  if current_session and current_session.current_branch then
+    local msg_mgr = session_mgr.get_message_manager()
+    if msg_mgr then
+      -- 获取该分支的所有消息
+      local branch_msgs = msg_mgr.get_messages(current_session.current_branch, 1000000)
+      -- 从后往前找最新一条同角色消息
+      for i = #branch_msgs, 1, -1 do
+        if branch_msgs[i].role == role then
+          local ok, err = pcall(msg_mgr.edit_message, branch_msgs[i].id, content)
+          if ok then
+            print("✓ 已更新会话管理器中的消息: " .. branch_msgs[i].id)
+          else
+            print("⚠️  更新会话管理器消息失败: " .. tostring(err))
+          end
+          break
+        end
+      end
+    end
+  end
+
+  -- 2. 更新历史管理器中的最新一条同角色消息
+  local history_mgr = require("NeoAI.core.history_manager")
+  local history_session = history_mgr.get_current_session()
+  if history_session then
+    local history_msgs = history_session:get_messages(1000000)
+    for i = #history_msgs, 1, -1 do
+      if history_msgs[i].role == role then
+        history_session.messages[i].content = content
+        print("✓ 已更新历史管理器中的消息")
+        break
+      end
+    end
+  end
+
+  -- 3. 触发自动保存
+  M._trigger_auto_save()
+end
+
 --- 将光标移动到缓冲区末尾（最新消息位置）
 --- 在渲染完成后调用，方便用户查看最新输出
 function M._move_cursor_to_end()
@@ -1097,6 +1153,23 @@ function M._move_cursor_to_end()
     pcall(vim.api.nvim_win_call, win_handle, function()
       vim.cmd("normal! zb")
     end)
+  end
+end
+
+--- 将光标移动到虚拟输入框窗口（不进入插入模式）
+function M._focus_virtual_input()
+  if not state.current_window_id then
+    return
+  end
+
+  -- 检查虚拟输入框是否激活
+  if not virtual_input.is_active() then
+    return
+  end
+
+  local input_win = virtual_input.get_window_id()
+  if input_win and vim.api.nvim_win_is_valid(input_win) then
+    pcall(vim.api.nvim_set_current_win, input_win)
   end
 end
 
@@ -1173,6 +1246,25 @@ function M._setup_event_listeners()
 
   -- 监听AI响应已准备好事件（新的事件系统）
 
+  -- 监听AI生成开始事件：关闭虚拟输入框
+  vim.api.nvim_create_autocmd("User", {
+    pattern = "NeoAI:generation_started",
+    callback = function(args)
+      local data = args.data or {}
+      local window_id = data.window_id
+
+      -- 检查是否是当前窗口的生成
+      if window_id and window_id ~= state.current_window_id then
+        return
+      end
+
+      -- AI开始生成时关闭虚拟输入框
+      if virtual_input.is_active() then
+        virtual_input.close("force")
+      end
+    end,
+  })
+
   -- 监听AI生成完成事件（AI引擎触发的事件）
   -- 流式完成后服务器会重新发送完整正文和token用量，用这个替换当前正文
   vim.api.nvim_create_autocmd("User", {
@@ -1208,16 +1300,18 @@ function M._setup_event_listeners()
       -- 用完整响应替换流式累积的内容（流式完成后服务器重新发送完整正文）
       local message_index = state.streaming.message_index
       if message_index and state.messages[message_index] then
+        local final_content
         if reasoning_text and reasoning_text ~= "" then
-          local combined = vim.json.encode({
+          final_content = vim.json.encode({
             reasoning_content = reasoning_text,
             content = response_content,
           })
-          state.messages[message_index].content = combined
         else
-          state.messages[message_index].content = response_content
+          final_content = response_content
         end
-        M._persist_message("assistant", response_content)
+        state.messages[message_index].content = final_content
+        -- 更新 message_manager 中的占位符消息（而不是添加新消息）
+        M._update_persisted_message("assistant", final_content)
       else
         -- 查找并移除占位符消息
         local placeholder_index = nil
@@ -1260,12 +1354,14 @@ function M._setup_event_listeners()
       -- 全量重渲染
       M.render_chat()
 
-      -- 关闭虚拟输入框并重新打开
+      -- 关闭虚拟输入框并重新打开（不进入插入模式）
       if virtual_input.is_active() then
         virtual_input.close("force")
       end
       vim.defer_fn(function()
         M._open_virtual_input()
+        -- 将光标移动到虚拟输入框窗口
+        M._focus_virtual_input()
       end, 200)
     end,
   })
@@ -1515,12 +1611,14 @@ function M._setup_event_listeners()
       -- 完成流式渲染
       M._finalize_streaming()
 
-      -- 关闭虚拟输入框并重新打开
+      -- 关闭虚拟输入框并重新打开（不进入插入模式）
       if virtual_input.is_active() then
         virtual_input.close("force")
       end
       vim.defer_fn(function()
         M._open_virtual_input()
+        -- 将光标移动到虚拟输入框窗口
+        M._focus_virtual_input()
       end, 200)
     end,
   })
@@ -1718,9 +1816,15 @@ function M._finalize_streaming()
     end
   end
 
-  -- 持久化消息
-  if full_content and full_content ~= "" then
-    M._persist_message("assistant", full_content)
+  -- 更新已持久化的占位符消息（而不是添加新消息）
+  if reasoning_text and reasoning_text ~= "" then
+    local combined = vim.json.encode({
+      reasoning_content = reasoning_text,
+      content = full_content,
+    })
+    M._update_persisted_message("assistant", combined)
+  elseif full_content and full_content ~= "" then
+    M._update_persisted_message("assistant", full_content)
   end
 
   -- 全量重渲染以确保一致性

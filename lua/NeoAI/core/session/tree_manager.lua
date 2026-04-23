@@ -6,7 +6,7 @@ local NODE_TYPES = {
   SUB_BRANCH = "sub_branch",
   SESSION = "session",
   CONVERSATION_ROUND = "conversation_round",
-  MESSAGE = "message"
+  MESSAGE = "message",
 }
 
 -- 树节点存储
@@ -32,13 +32,17 @@ local function debounce_save()
     state.save_debounce_timer = nil
   end
   state.save_debounce_timer = vim.loop.new_timer()
-  state.save_debounce_timer:start(500, 0, vim.schedule_wrap(function()
-    if state.save_debounce_timer then
-      state.save_debounce_timer:close()
-      state.save_debounce_timer = nil
-    end
-    M._save_tree_data()
-  end))
+  state.save_debounce_timer:start(
+    500,
+    0,
+    vim.schedule_wrap(function()
+      if state.save_debounce_timer then
+        state.save_debounce_timer:close()
+        state.save_debounce_timer = nil
+      end
+      M._save_tree_data()
+    end)
+  )
 end
 
 --- 初始化树管理器
@@ -51,7 +55,7 @@ function M.initialize(options)
   state.event_bus = options.event_bus
   state.config = options.config or {}
   state.initialized = true
-  
+
   -- 初始化虚拟根节点
   M._ensure_virtual_root()
 
@@ -60,12 +64,12 @@ function M.initialize(options)
   if not save_path and state.config.session then
     save_path = state.config.session.save_path
   end
-  
+
   -- 如果未提供 save_path，使用默认值
   if not save_path then
     save_path = vim.fn.stdpath("cache") .. "/NeoAI"
   end
-  
+
   -- 确保 save_path 在配置中可用
   state.config.save_path = save_path
 
@@ -87,8 +91,8 @@ function M._ensure_virtual_root()
       children = {},
       metadata = {
         node_count = 0,
-        is_virtual = true
-      }
+        is_virtual = true,
+      },
     }
   end
 end
@@ -112,20 +116,20 @@ function M.create_root_branch(name)
     created_at = os.time(),
     children = {},
     metadata = {
-      child_count = 0
-    }
+      child_count = 0,
+    },
   }
 
   tree_nodes[node_id] = node
-  
+
   -- 添加到虚拟根节点的子节点
   table.insert(tree_nodes["virtual_root"].children, node_id)
   tree_nodes["virtual_root"].metadata.node_count = tree_nodes["virtual_root"].metadata.node_count + 1
 
   -- 触发事件
-  vim.api.nvim_exec_autocmds("User", { 
-    pattern = "NeoAI:root_branch_created", 
-    data = { node_id, node } 
+  vim.api.nvim_exec_autocmds("User", {
+    pattern = "NeoAI:root_branch_created",
+    data = { node_id, node },
   })
 
   -- 自动保存
@@ -170,8 +174,8 @@ function M.create_sub_branch(parent_id, name)
     created_at = os.time(),
     children = {},
     metadata = {
-      child_count = 0
-    }
+      child_count = 0,
+    },
   }
 
   tree_nodes[node_id] = node
@@ -186,9 +190,9 @@ function M.create_sub_branch(parent_id, name)
   parent.metadata.child_count = parent.metadata.child_count + 1
 
   -- 触发事件
-  vim.api.nvim_exec_autocmds("User", { 
-    pattern = "NeoAI:sub_branch_created", 
-    data = { node_id, node, parent_id } 
+  vim.api.nvim_exec_autocmds("User", {
+    pattern = "NeoAI:sub_branch_created",
+    data = { node_id, node, parent_id },
   })
 
   -- 自动保存
@@ -205,10 +209,10 @@ function M._get_node_path_string(node_id)
   if not node then
     return ""
   end
-  
+
   local path_parts = {}
   local current = node
-  
+
   while current and current.parent_id and current.parent_id ~= "virtual_root" do
     local parent = tree_nodes[current.parent_id]
     if parent then
@@ -222,7 +226,7 @@ function M._get_node_path_string(node_id)
       break
     end
   end
-  
+
   return table.concat(path_parts, "-")
 end
 
@@ -256,8 +260,8 @@ function M.create_session(parent_id, name, metadata)
     metadata = metadata or {
       message_count = 0,
       last_updated = os.time(),
-      conversation_rounds = {}
-    }
+      conversation_rounds = {},
+    },
   }
 
   tree_nodes[node_id] = node
@@ -272,9 +276,9 @@ function M.create_session(parent_id, name, metadata)
   parent.metadata.session_count = parent.metadata.session_count + 1
 
   -- 触发事件
-  vim.api.nvim_exec_autocmds("User", { 
-    pattern = "NeoAI:session_created", 
-    data = { node_id, node, parent_id } 
+  vim.api.nvim_exec_autocmds("User", {
+    pattern = "NeoAI:session_created",
+    data = { node_id, node, parent_id },
   })
 
   -- 自动保存
@@ -315,7 +319,7 @@ function M.create_conversation_round(session_id, round_number, user_message, ai_
   -- 合并所有 AI 消息内容
   local ai_combined = ""
   for _, ai_msg in ipairs(ai_messages) do
-    local content = type(ai_msg) == "string" and ai_msg or (ai_msg.content or "")
+    local content = type(ai_msg) == "string" and ai_msg or (type(ai_msg) == "table" and (ai_msg.content or "") or "")
     if content ~= "" then
       if ai_combined ~= "" then
         ai_combined = ai_combined .. "\n---\n"
@@ -327,8 +331,12 @@ function M.create_conversation_round(session_id, round_number, user_message, ai_
   -- 生成预览文本
   local user_short = user_message and user_message:gsub("\n", " "):sub(1, 30) or ""
   local ai_short = ai_combined ~= "" and ai_combined:gsub("\n", " "):sub(1, 30) or ""
-  if #user_short >= 30 then user_short = user_short .. "..." end
-  if #ai_short >= 30 then ai_short = ai_short .. "..." end
+  if #user_short >= 30 then
+    user_short = user_short .. "..."
+  end
+  if #ai_short >= 30 then
+    ai_short = ai_short .. "..."
+  end
 
   local node = {
     id = node_id,
@@ -342,8 +350,8 @@ function M.create_conversation_round(session_id, round_number, user_message, ai_
       user_message = user_message,
       ai_message = ai_combined,
       message_count = (user_message and 1 or 0) + #ai_messages,
-      timestamp = os.time()
-    }
+      timestamp = os.time(),
+    },
   }
 
   tree_nodes[node_id] = node
@@ -357,15 +365,15 @@ function M.create_conversation_round(session_id, round_number, user_message, ai_
   end
   table.insert(session.metadata.conversation_rounds, {
     round_number = round_number,
-    timestamp = os.time()
+    timestamp = os.time(),
   })
   session.metadata.message_count = (session.metadata.message_count or 0) + (user_message and 1 or 0) + #ai_messages
   session.metadata.last_updated = os.time()
 
   -- 触发事件
-  vim.api.nvim_exec_autocmds("User", { 
-    pattern = "NeoAI:conversation_round_created", 
-    data = { node_id, node, session_id } 
+  vim.api.nvim_exec_autocmds("User", {
+    pattern = "NeoAI:conversation_round_created",
+    data = { node_id, node, session_id },
   })
 
   -- 自动保存
@@ -416,8 +424,8 @@ function M.create_message(round_id, role, content, round_number, message_index)
       content = content,
       round_number = round_number,
       message_index = message_index,
-      timestamp = os.time()
-    }
+      timestamp = os.time(),
+    },
   }
 
   tree_nodes[node_id] = node
@@ -426,9 +434,9 @@ function M.create_message(round_id, role, content, round_number, message_index)
   table.insert(round.children, node_id)
 
   -- 触发事件
-  vim.api.nvim_exec_autocmds("User", { 
-    pattern = "NeoAI:message_created", 
-    data = { node_id, node, round_id } 
+  vim.api.nvim_exec_autocmds("User", {
+    pattern = "NeoAI:message_created",
+    data = { node_id, node, round_id },
   })
 
   -- 自动保存
@@ -441,19 +449,19 @@ end
 --- @return table 树状结构
 function M.get_tree()
   M._ensure_virtual_root()
-  
+
   -- 从虚拟根节点开始构建树
   local virtual_root = tree_nodes["virtual_root"]
   if not virtual_root then
     return {}
   end
-  
+
   return { M._build_tree_node("virtual_root") }
 end
 
 --- 构建树节点（内部使用）
 --- @param node_id string 节点ID
---- @return table 树节点
+--- @return table|nil 树节点
 function M._build_tree_node(node_id)
   local node = tree_nodes[node_id]
   if not node then
@@ -466,7 +474,7 @@ function M._build_tree_node(node_id)
     type = node.type,
     created_at = node.created_at,
     metadata = vim.deepcopy(node.metadata),
-    children = {}
+    children = {},
   }
 
   -- 递归构建子节点
@@ -510,7 +518,7 @@ function M.delete_node(node_id)
     for i, child_id in ipairs(parent.children) do
       if child_id == node_id then
         table.remove(parent.children, i)
-        
+
         -- 更新父节点元数据
         if node.type == NODE_TYPES.SESSION then
           parent.metadata.session_count = math.max(0, parent.metadata.session_count - 1)
@@ -526,9 +534,10 @@ function M.delete_node(node_id)
               end
             end
           end
-          parent.metadata.message_count = math.max(0, (parent.metadata.message_count or 0) - (node.metadata.message_count or 0))
+          parent.metadata.message_count =
+            math.max(0, (parent.metadata.message_count or 0) - (node.metadata.message_count or 0))
         end
-        
+
         break
       end
     end
@@ -538,9 +547,9 @@ function M.delete_node(node_id)
   tree_nodes[node_id] = nil
 
   -- 触发事件
-  vim.api.nvim_exec_autocmds("User", { 
-    pattern = "NeoAI:node_deleted", 
-    data = { node_id, node.type } 
+  vim.api.nvim_exec_autocmds("User", {
+    pattern = "NeoAI:node_deleted",
+    data = { node_id, node.type },
   })
 
   -- 自动保存
@@ -560,9 +569,9 @@ function M.rename_node(node_id, new_name)
   node.name = new_name
 
   -- 触发事件
-  vim.api.nvim_exec_autocmds("User", { 
-    pattern = "NeoAI:node_renamed", 
-    data = { node_id, old_name, new_name } 
+  vim.api.nvim_exec_autocmds("User", {
+    pattern = "NeoAI:node_renamed",
+    data = { node_id, old_name, new_name },
   })
 
   -- 自动保存
@@ -596,14 +605,14 @@ function M.move_node(node_id, new_parent_id)
     for i, child_id in ipairs(old_parent.children) do
       if child_id == node_id then
         table.remove(old_parent.children, i)
-        
+
         -- 更新原父节点元数据
         if node.type == NODE_TYPES.SESSION then
           old_parent.metadata.session_count = math.max(0, old_parent.metadata.session_count - 1)
         elseif node.type == NODE_TYPES.SUB_BRANCH then
           old_parent.metadata.sub_branch_count = math.max(0, old_parent.metadata.sub_branch_count - 1)
         end
-        
+
         break
       end
     end
@@ -621,9 +630,9 @@ function M.move_node(node_id, new_parent_id)
   end
 
   -- 触发事件
-  vim.api.nvim_exec_autocmds("User", { 
-    pattern = "NeoAI:node_moved", 
-    data = { node_id, node.parent_id, new_parent_id } 
+  vim.api.nvim_exec_autocmds("User", {
+    pattern = "NeoAI:node_moved",
+    data = { node_id, node.parent_id, new_parent_id },
   })
 
   -- 自动保存
@@ -659,7 +668,7 @@ end
 --- @param ai_messages table assistant消息列表（可能有多条，如工具调用）
 function M._save_conversation_round(session_id, round_number, user_msg, ai_messages)
   local round_id = "round_" .. session_id .. "_" .. round_number
-  
+
   -- 检查轮次节点是否已存在
   local round_exists = false
   if tree_nodes[session_id] then
@@ -670,11 +679,11 @@ function M._save_conversation_round(session_id, round_number, user_msg, ai_messa
       end
     end
   end
-  
+
   if round_exists then
     return
   end
-  
+
   -- 合并所有 assistant 消息内容
   local ai_combined = ""
   for _, ai_msg in ipairs(ai_messages) do
@@ -685,13 +694,17 @@ function M._save_conversation_round(session_id, round_number, user_msg, ai_messa
       ai_combined = ai_combined .. ai_msg.content
     end
   end
-  
+
   -- 生成预览文本
   local user_short = user_msg and user_msg.content and user_msg.content:gsub("\n", " "):sub(1, 30) or ""
   local ai_short = ai_combined ~= "" and ai_combined:gsub("\n", " "):sub(1, 30) or ""
-  if #user_short >= 30 then user_short = user_short .. "..." end
-  if #ai_short >= 30 then ai_short = ai_short .. "..." end
-  
+  if #user_short >= 30 then
+    user_short = user_short .. "..."
+  end
+  if #ai_short >= 30 then
+    ai_short = ai_short .. "..."
+  end
+
   local round_node = {
     id = round_id,
     name = "第" .. round_number .. "轮: 👤" .. user_short .. " | 🤖" .. ai_short,
@@ -705,14 +718,14 @@ function M._save_conversation_round(session_id, round_number, user_msg, ai_messa
       ai_message = ai_combined,
       message_count = (user_msg and 1 or 0) + #ai_messages,
       timestamp = os.time(),
-    }
+    },
   }
-  
+
   tree_nodes[round_id] = round_node
   if tree_nodes[session_id] then
     table.insert(tree_nodes[session_id].children, round_id)
   end
-  
+
   -- 更新会话元数据
   if tree_nodes[session_id] then
     if not tree_nodes[session_id].metadata.conversation_rounds then
@@ -722,7 +735,9 @@ function M._save_conversation_round(session_id, round_number, user_msg, ai_messa
       round_number = round_number,
       timestamp = os.time(),
     })
-    tree_nodes[session_id].metadata.message_count = (tree_nodes[session_id].metadata.message_count or 0) + (user_msg and 1 or 0) + #ai_messages
+    tree_nodes[session_id].metadata.message_count = (tree_nodes[session_id].metadata.message_count or 0)
+      + (user_msg and 1 or 0)
+      + #ai_messages
     tree_nodes[session_id].metadata.last_updated = os.time()
   end
 end
@@ -736,7 +751,12 @@ function M.sync_from_session_manager()
 
   -- 获取会话管理器
   local session_mgr_loaded, session_mgr = pcall(require, "NeoAI.core.session.session_manager")
-  if not session_mgr_loaded or not session_mgr or not session_mgr.is_initialized or not session_mgr.is_initialized() then
+  if
+    not session_mgr_loaded
+    or not session_mgr
+    or not session_mgr.is_initialized
+    or not session_mgr.is_initialized()
+  then
     return
   end
 
@@ -751,7 +771,7 @@ function M.sync_from_session_manager()
 
   for _, session_info in ipairs(sessions) do
     local session_id = session_info.id
-    
+
     -- 检查是否已存在对应的树节点
     local exists = false
     for _, child_id in ipairs(tree_nodes["virtual_root"].children) do
@@ -774,7 +794,7 @@ function M.sync_from_session_manager()
           message_count = (session_info.metadata and session_info.metadata.message_count) or 0,
           last_updated = session_info.updated_at or os.time(),
           conversation_rounds = {},
-        }
+        },
       }
 
       tree_nodes[session_id] = node
@@ -784,13 +804,14 @@ function M.sync_from_session_manager()
 
     -- 同步消息到对话轮次
     local session_data = session_mgr.get_session(session_id)
+    print("调试：sync session " .. session_id .. " current_branch=" .. tostring(session_data and session_data.current_branch) .. " branches=" .. tostring(session_data and vim.inspect(session_data.branches)))
     if session_data and session_data.current_branch then
       local msg_mgr = session_mgr.get_message_manager()
       if msg_mgr then
         -- 修复：确保每个 session 使用独立的分支获取消息
         -- 如果多个 session 共享同一个分支，会导致内容重复
         local session_branch_id = session_data.current_branch
-        
+
         -- 检查当前分支是否被其他 session 共享
         local branch_mgr = session_mgr.get_branch_manager()
         local all_sessions = session_mgr.list_sessions()
@@ -804,7 +825,7 @@ function M.sync_from_session_manager()
             end
           end
         end
-        
+
         -- 如果分支被共享，为当前 session 创建独立分支
         if is_shared then
           local new_branch_id = branch_mgr.create_branch("", "session_" .. session_id)
@@ -813,15 +834,32 @@ function M.sync_from_session_manager()
           session_data.branches[new_branch_id] = true
           session_branch_id = new_branch_id
         end
-        
+
         local messages = msg_mgr.get_messages(session_branch_id, 1000000)
+        print("调试：sync session " .. session_id .. " branch=" .. session_branch_id .. " messages_count=" .. tostring(messages and #messages or 0))
         if messages and #messages > 0 then
+          -- 重新同步时，先清理该会话下所有旧的轮次节点
+          -- 因为轮次划分逻辑可能已变更（如从固定2条一轮改为按用户消息边界）
+          if tree_nodes[session_id] and tree_nodes[session_id].children then
+            local old_children = {}
+            for _, child_id in ipairs(tree_nodes[session_id].children) do
+              if child_id:match("^round_") then
+                tree_nodes[child_id] = nil
+              else
+                table.insert(old_children, child_id)
+              end
+            end
+            tree_nodes[session_id].children = old_children
+            tree_nodes[session_id].metadata.conversation_rounds = {}
+            tree_nodes[session_id].metadata.message_count = 0
+          end
+
           -- 按用户消息为轮次边界分组
           -- 每条用户消息开始新的一轮，该用户消息之后的所有 assistant 消息都属于同一轮
           local round_number = 1
           local current_round_user_msg = nil
           local current_round_ai_contents = {}
-          
+
           for _, msg in ipairs(messages) do
             if msg.role == "user" then
               -- 遇到新的用户消息，先保存上一轮（如果有）
@@ -837,11 +875,12 @@ function M.sync_from_session_manager()
               table.insert(current_round_ai_contents, msg)
             end
           end
-          
+
           -- 保存最后一轮
           if current_round_user_msg then
             M._save_conversation_round(session_id, round_number, current_round_user_msg, current_round_ai_contents)
           end
+        end
       end
     end
   end
@@ -967,3 +1006,4 @@ function M._load_tree_data()
 end
 
 return M
+

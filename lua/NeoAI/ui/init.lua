@@ -101,8 +101,11 @@ function M.open_tree_ui()
     session_id = current_session and current_session.id or "default"
   end
 
-  -- 关闭现有窗口
-  M.close_all_windows()
+  -- 只关闭已有的聊天窗口，保留树窗口
+  if state.windows.chat then
+    chat_window.close()
+    state.windows.chat = nil
+  end
 
   -- 先创建窗口
   local tree_win_id = window_manager.create_window("tree", {
@@ -173,10 +176,13 @@ function M.open_chat_ui(session_id, branch_id)
     branch_id = "main"
   end
 
-  -- 关闭现有窗口
-  M.close_all_windows()
+  -- 只关闭已有的树窗口，保留聊天窗口
+  if state.windows.tree then
+    tree_window.close()
+    state.windows.tree = nil
+  end
 
-  -- 先创建窗口
+  -- 先创建聊天窗口
   local chat_win_id = window_manager.create_window("chat", {
     title = "NeoAI 聊天",
     width = state.config.width or 80,

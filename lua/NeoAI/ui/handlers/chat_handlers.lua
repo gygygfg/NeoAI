@@ -550,18 +550,8 @@ function M.send_message(content, session_id, branch_id, window_id, format, callb
       return
     end
 
-    -- 聊天窗口发送成功，现在保存消息到所有管理器
-    local save_success = session_helper.save_message_to_all("user", content, {
-      timestamp = os.time(),
-      window_id = window_id,
-      formatted = format_message,
-    })
-
-    if save_success then
-      print("✓ 用户消息已保存到所有管理器")
-    else
-      print("⚠️  保存用户消息失败")
-    end
+    -- 注意：消息已在 chat_window.send_message 内部通过 add_message → _persist_message 保存
+    -- 这里不再重复保存，避免消息重复/分裂
 
     -- 触发消息已发送事件（在聊天窗口发送完成后触发）
     local event_pattern = format_message and "NeoAI:formatted_message_sent" or "NeoAI:message_sent"

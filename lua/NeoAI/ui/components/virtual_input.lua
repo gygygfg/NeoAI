@@ -186,9 +186,11 @@ function M.open(parent_window_id, options)
   -- 创建窗口大小变化监听器
   M._setup_window_resize_listener(parent_window_id)
 
-  -- 进入插入模式
+  -- 进入插入模式（除非指定不自动进入）
   vim.api.nvim_set_current_win(state.window_id)
-  vim.cmd("startinsert!")
+  if not options.no_auto_insert then
+    vim.cmd("startinsert!")
+  end
 
   return true
 end

@@ -174,8 +174,13 @@ function M.handle_enter()
   -- 获取UI模块
   local ui = require("NeoAI.ui")
 
-  -- 关闭所有窗口（包括树窗口）
-  ui.close_all_windows()
+  -- 不关闭树窗口，直接打开聊天窗口
+  -- 检查聊天窗口是否已打开
+  local chat_window = require("NeoAI.ui.window.chat_window")
+  if chat_window.is_open() then
+    -- 如果聊天窗口已打开，先关闭它再重新打开（切换会话）
+    chat_window.close()
+  end
 
   -- 打开聊天窗口，传入正确的会话ID
   ui.open_chat_ui(session_id, branch_id)
@@ -298,7 +303,17 @@ function M.delete_branch(branch_id)
     end
   end
 
-  -- 其他节点：尝试从分支管理器删除
+  -- 其他节点：尝试从 tree_manager 删除（普通节点只存在于 tree_nodes 中）
+  local tree_mgr_loaded, tree_mgr = pcall(require, "NeoAI.core.session.tree_manager")
+  if tree_mgr_loaded and tree_mgr and tree_mgr.is_initialized and tree_mgr.is_initialized() then
+    pcall(tree_mgr.delete_node, branch_id)
+    -- 刷新树视图
+    local tree_window = require("NeoAI.ui.window.tree_window")
+    tree_window.refresh_tree()
+    return true
+  end
+
+  -- 最后尝试从分支管理器删除
   local branch_manager = require("NeoAI.core.session.branch_manager")
   local success, err = pcall(branch_manager.delete_branch, branch_id)
 

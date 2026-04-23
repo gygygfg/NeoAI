@@ -359,9 +359,7 @@ function M.refresh(session_id)
     state.config.on_update(session_id, state.tree_data)
   end
 
-  if vim and vim.notify then
-    vim.notify("历史树已刷新", vim.log.levels.INFO)
-  end
+  -- vim.notify("历史树已刷新", vim.log.levels.INFO)
 end
 
 --- 获取指定行的节点
@@ -575,7 +573,16 @@ function M._load_tree_data(session_id)
   -- 调试：打印最终加载的树数据
   print("调试：最终树数据根节点数量: " .. #state.tree_data, vim.log.levels.INFO)
   for i, node in ipairs(state.tree_data) do
-    print("调试：最终根节点 " .. i .. ": " .. (node.name or "未命名") .. " (类型: " .. (node.type or "未知") .. ")", vim.log.levels.INFO)
+    print(
+      "调试：最终根节点 "
+        .. i
+        .. ": "
+        .. (node.name or "未命名")
+        .. " (类型: "
+        .. (node.type or "未知")
+        .. ")",
+      vim.log.levels.INFO
+    )
     if node.children then
       print("调试：  子节点数量: " .. #node.children, vim.log.levels.INFO)
     end
@@ -586,12 +593,12 @@ end
 --- @param session_id string 会话ID
 function M._load_tree_structure(session_id)
   print("调试：开始加载树状结构数据", vim.log.levels.INFO)
-  
+
   -- 尝试从树管理器加载数据
   local tree_manager_loaded, tree_manager = pcall(require, "NeoAI.core.session.tree_manager")
   if tree_manager_loaded and tree_manager then
     print("调试：成功加载树管理器模块", vim.log.levels.INFO)
-    
+
     -- 确保树管理器已初始化
     if tree_manager.is_initialized and not tree_manager.is_initialized() then
       print("调试：初始化树管理器", vim.log.levels.INFO)
@@ -607,10 +614,10 @@ function M._load_tree_structure(session_id)
     -- 获取树状结构
     print("调试：调用 tree_manager.get_tree()", vim.log.levels.INFO)
     local tree_structure = tree_manager.get_tree()
-    
+
     if tree_structure and #tree_structure > 0 then
       print("调试：从树管理器获取到树结构，节点数量: " .. #tree_structure, vim.log.levels.INFO)
-      
+
       -- 检查虚拟根节点是否有实际子节点
       local has_real_nodes = false
       for _, node in ipairs(tree_structure) do
@@ -628,7 +635,7 @@ function M._load_tree_structure(session_id)
           print("调试：发现非虚拟根节点: " .. node.type, vim.log.levels.INFO)
         end
       end
-      
+
       if has_real_nodes then
         -- 转换树管理器节点为历史树节点
         state.tree_data = M._convert_tree_manager_nodes(tree_structure, session_id)
@@ -646,11 +653,11 @@ function M._load_tree_structure(session_id)
 
   -- 如果树管理器没有数据，尝试从 session_manager 同步数据到树管理器
   print("调试：树管理器没有数据，尝试从 session_manager 同步", vim.log.levels.INFO)
-  
+
   -- 调用 tree_manager.sync_from_session_manager() 同步数据
   if tree_manager.sync_from_session_manager then
     pcall(tree_manager.sync_from_session_manager)
-    
+
     -- 重新获取树结构
     local retry_structure = tree_manager.get_tree()
     if retry_structure and #retry_structure > 0 then
@@ -661,7 +668,7 @@ function M._load_tree_structure(session_id)
           break
         end
       end
-      
+
       if has_real_nodes then
         print("调试：同步后树管理器有数据了", vim.log.levels.INFO)
         state.tree_data = M._convert_tree_manager_nodes(retry_structure, session_id)
@@ -669,7 +676,7 @@ function M._load_tree_structure(session_id)
       end
     end
   end
-  
+
   -- 如果仍然没有数据，返回空
   print("调试：树管理器没有数据，返回空", vim.log.levels.INFO)
   state.tree_data = {}
@@ -681,12 +688,15 @@ end
 --- @return table 历史树节点列表
 function M._convert_tree_manager_nodes(tree_nodes, session_id)
   print("调试：开始转换树管理器节点，输入节点数量: " .. #tree_nodes, vim.log.levels.INFO)
-  
+
   local result = {}
 
   for i, node in ipairs(tree_nodes) do
-    print("调试：转换节点 " .. i .. ": " .. (node.id or "未知ID") .. " (类型: " .. (node.type or "未知") .. ")", vim.log.levels.INFO)
-    
+    print(
+      "调试：转换节点 " .. i .. ": " .. (node.id or "未知ID") .. " (类型: " .. (node.type or "未知") .. ")",
+      vim.log.levels.INFO
+    )
+
     local converted_node = {
       id = node.id,
       name = node.name,
@@ -700,7 +710,7 @@ function M._convert_tree_manager_nodes(tree_nodes, session_id)
     if node.metadata then
       converted_node.metadata = vim.deepcopy(node.metadata)
     end
-    
+
     -- 设置元数据
     if not converted_node.metadata.created_at then
       converted_node.metadata.created_at = node.created_at or os.time()
@@ -730,8 +740,6 @@ function M._convert_tree_manager_nodes(tree_nodes, session_id)
   print("调试：节点转换完成，结果节点数量: " .. #result, vim.log.levels.INFO)
   return result
 end
-
-
 
 --- 更新配置
 --- @param new_config table 新配置
