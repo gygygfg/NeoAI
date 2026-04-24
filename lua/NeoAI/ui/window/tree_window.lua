@@ -183,12 +183,6 @@ function M._build_display_content()
     table.insert(content, "按 N 创建新会话")
   else
     for _, item in ipairs(state.flat_items) do
-      -- 跳过分隔符节点
-      if item.is_separator then
-        table.insert(content, "")
-        goto continue
-      end
-
       local line = ""
 
       -- 1. 根据缩进级别生成连接线
@@ -217,7 +211,6 @@ function M._build_display_content()
       end
 
       table.insert(content, line)
-      ::continue::
     end
   end
 
@@ -233,15 +226,10 @@ function M._build_line_to_session_map()
   -- 第0行是标题，第1行是空行，从第2行开始是节点
   local line = 2
   for _, item in ipairs(state.flat_items) do
-    if item.is_separator then
-      -- 分隔符渲染为空行
-      line = line + 1
-    else
-      if item.session_id then
-        map[line] = item.session_id
-      end
-      line = line + 1
+    if item.session_id then
+      map[line] = item.session_id
     end
+    line = line + 1
   end
   return map
 end

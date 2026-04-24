@@ -140,8 +140,8 @@ function M.build_flat_items()
       indent = parent_indent + sibling_count - sibling_index
     end
 
-    local is_last = (sibling_index == sibling_count)
     local has_children = #(session.child_ids or {}) > 0
+    local is_last = not has_children
 
     -- 计算连接符数组
     -- 前 depth 个元素基于 ancestor_is_last 决定是 "│  " 还是 "   "
@@ -209,22 +209,6 @@ function M.build_flat_items()
   -- 遍历每个根会话
   for i, rid in ipairs(root_ids) do
     dfs(rid, -1, 0, i, #root_ids, {})
-
-    -- 在根会话之间插入空行分隔
-    if i < #root_ids then
-      local separator = {
-        id = "__sep_" .. rid,
-        session_id = nil,
-        display_type = "separator",
-        display_text = "",
-        is_virtual = true,
-        is_separator = true,
-        is_last = true,
-        indent = 0,
-        connectors = {},
-      }
-      table.insert(flat_nodes, separator)
-    end
   end
 
   state.flat_items = flat_nodes
