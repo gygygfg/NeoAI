@@ -140,8 +140,8 @@ function M.render_tree()
         local line_map = M._build_line_to_session_map()
         for line, sid in pairs(line_map) do
           if sid == state.selected_session_id then
-            local cursor_line = line + 2
-            vim.api.nvim_win_set_cursor(win_handle, { cursor_line + 1, 0 })
+            -- line 是 0-based 绝对行号，nvim_win_set_cursor 需要 1-based
+            vim.api.nvim_win_set_cursor(win_handle, { line + 1, 0 })
             break
           end
         end
@@ -226,16 +226,18 @@ function M._build_display_content()
 end
 
 --- 构建行号到真实会话ID的映射
+--- 与 _build_display_content 的渲染逻辑保持一致：
+--- 第0行标题，第1行空行，之后每个 flat_items 项占一行（包括虚拟节点）
 function M._build_line_to_session_map()
   local map = {}
-  -- 第0行是标题，第1行是空行，从第2行开始是节点
+  -- 第0行是标题，第1行是空行，从第2行开始是 flat_items 的渲染行
   local line = 2
   for _, item in ipairs(state.flat_items) do
-    -- 跳过虚拟节点（无 session_id），且不占用行号计数
     if not item.is_virtual and item.session_id then
       map[line] = item.session_id
-      line = line + 1
     end
+    -- 每个 flat_items 项（包括虚拟节点）都占用一行
+    line = line + 1
   end
   return map
 end
@@ -489,7 +491,19 @@ function M._update_float_window()
     if ok and hm.is_initialized() then
       local session = hm.get_session(state.selected_session_id)
       if session then
-        status_text = status_text .. (session.name or "无")
+        -- 优先显示用户提问，提问为空时回退显示会话名称
+        local display_text = session.user or ""
+        if display_text == "" then
+          display_text = session.name or "无"
+        else
+          -- 截断过长文本
+          local one_line = display_text:gsub("\n", " "):gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
+          if #one_line > 60 then
+            one_line = one_line:sub(1, 60) .. "…"
+          end
+          display_text = one_line
+        end
+        status_text = status_text .. display_text
       else
         status_text = status_text .. "无"
       end
