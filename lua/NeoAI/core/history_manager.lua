@@ -10,10 +10,12 @@
 ---   is_root: true,
 ---   child_ids: [],
 ---   user: "用户消息",
----   assistant: '{"content":"...","reasoning_content":"..."}',
+---   assistant: ["{\"content\":\"...\",\"reasoning_content\":\"...\"}"],
 ---   timestamp: 1234567890,
 ---   usage: { prompt_tokens: 24, completion_tokens: 770, total_tokens: 794 }
 --- }
+--- assistant 字段为数组，每个元素是一轮 AI 回复的 JSON 字符串
+--- 支持工具调用时的多轮对话
 
 local M = {}
 
@@ -180,7 +182,7 @@ function M.create_session(name, is_root, parent_id)
     is_root = (parent_id == nil and is_root ~= false) or (is_root == true),
     child_ids = {},
     user = "",
-    assistant = "",
+    assistant = {},
     timestamp = nil,
     usage = {},
   }
@@ -267,7 +269,7 @@ end
 --- 添加一轮对话（扁平结构：直接设置 user/assistant/timestamp）
 --- @param session_id string 会话ID
 --- @param user_msg string 用户消息
---- @param assistant_msg string AI回复（JSON字符串，含 content 和 reasoning_content）
+--- @param assistant_msg string|table AI回复（JSON字符串或数组，含 content 和 reasoning_content）
 --- @param usage table|nil token用量
 --- @return table|nil
 function M.add_round(session_id, user_msg, assistant_msg, usage)
@@ -276,7 +278,14 @@ function M.add_round(session_id, user_msg, assistant_msg, usage)
     return nil
   end
   session.user = user_msg or ""
-  session.assistant = assistant_msg or ""
+  -- assistant 字段为数组，每个元素是一轮 AI 回复的 JSON 字符串
+  if type(assistant_msg) == "table" then
+    session.assistant = assistant_msg
+  elseif assistant_msg and assistant_msg ~= "" then
+    session.assistant = { assistant_msg }
+  else
+    session.assistant = {}
+  end
   session.timestamp = os.time()
   if usage and type(usage) == "table" then
     session.usage = usage
@@ -288,14 +297,47 @@ function M.add_round(session_id, user_msg, assistant_msg, usage)
 end
 
 --- 更新当前会话的AI回复（用于流式更新）
+--- 如果 content 是字符串，追加到 assistant 数组末尾
+--- 如果 content 是数组，直接替换 assistant 字段
 function M.update_last_assistant(session_id, content)
   local session = state.sessions[session_id]
   if not session then
     return
   end
-  session.assistant = content
+  if type(content) == "table" then
+    session.assistant = content
+  elseif content and content ~= "" then
+    -- 追加到数组末尾
+    if type(session.assistant) ~= "table" then
+      session.assistant = {}
+    end
+    table.insert(session.assistant, content)
+  end
   session.updated_at = os.time()
   debounce_save()
+end
+
+--- 追加一轮 assistant 回复到数组末尾（用于工具调用时的多轮对话）
+--- @param session_id string 会话ID
+--- @param assistant_entry string AI回复的JSON字符串
+--- @return boolean 是否成功
+function M.add_assistant_entry(session_id, assistant_entry)
+  local session = state.sessions[session_id]
+  if not session then
+    return false
+  end
+  if type(session.assistant) ~= "table" then
+    -- 兼容旧格式：如果是字符串，转为数组
+    if session.assistant and session.assistant ~= "" then
+      session.assistant = { session.assistant }
+    else
+      session.assistant = {}
+    end
+  end
+  table.insert(session.assistant, assistant_entry)
+  session.updated_at = os.time()
+  debounce_save()
+  return true
 end
 
 --- 更新当前会话的 usage 信息
@@ -310,6 +352,7 @@ function M.update_usage(session_id, usage)
 end
 
 --- 获取会话的所有消息（展平为 role/content 列表）
+--- assistant 字段为数组，每个元素是一轮 AI 回复的 JSON 字符串
 function M.get_messages(session_id)
   local session = state.sessions[session_id]
   if not session then
@@ -319,10 +362,20 @@ function M.get_messages(session_id)
   if session.user and session.user ~= "" then
     table.insert(msgs, { role = "user", content = session.user })
   end
-  if session.assistant and session.assistant ~= "" then
-    -- assistant 可能是 JSON 字符串（含 reasoning_content），也可能是纯文本
-    local content = session.assistant
-    local ok, parsed = pcall(vim.json.decode, session.assistant)
+  -- assistant 为数组，每个元素是一轮 AI 回复
+  local assistant_list = session.assistant
+  if type(assistant_list) ~= "table" then
+    -- 兼容旧格式：如果是字符串，转为数组
+    if assistant_list and assistant_list ~= "" then
+      assistant_list = { assistant_list }
+    else
+      assistant_list = {}
+    end
+  end
+  for _, entry in ipairs(assistant_list) do
+    local content = entry
+    -- 尝试解析 JSON 字符串（含 reasoning_content）
+    local ok, parsed = pcall(vim.json.decode, entry)
     if ok and type(parsed) == "table" and parsed.content then
       content = parsed.content
     end
@@ -414,51 +467,141 @@ function M.get_tree()
   local roots = M.get_root_sessions()
 
   local session_index = 0
-  local function build_node(session)
+  local function build_node(session, is_root)
     if not session then
       return nil
     end
     session_index = session_index + 1
-    local preview = ""
+
+    -- 构建轮次预览文本
+    local round_text = ""
     if session.user and session.user ~= "" then
-      local raw = session.user:gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
-      preview = raw:sub(1, 20)
-      if #raw > 20 then
-        preview = preview .. "…"
+      local user_preview = session.user:gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
+      if #user_preview > 20 then
+        user_preview = user_preview:sub(1, 20) .. "…"
+      end
+      round_text = "👤" .. user_preview
+    end
+    if session.assistant and (type(session.assistant) == "table" and #session.assistant > 0 or type(session.assistant) == "string" and session.assistant ~= "") then
+      local ai_text = ""
+      local last_entry = session.assistant
+      if type(session.assistant) == "table" and #session.assistant > 0 then
+        last_entry = session.assistant[#session.assistant]
+      end
+      local ok, parsed = pcall(vim.json.decode, last_entry)
+      if ok and type(parsed) == "table" and parsed.content then
+        ai_text = parsed.content
+      elseif type(last_entry) == "string" then
+        ai_text = last_entry
+      end
+      local ai_preview = ai_text:gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
+      if #ai_preview > 20 then
+        ai_preview = ai_preview:sub(1, 20) .. "…"
+      end
+      if round_text ~= "" then
+        round_text = round_text .. " | 🤖" .. ai_preview
+      else
+        round_text = "🤖" .. ai_preview
       end
     end
+
+    local child_ids = session.child_ids or {}
+
     local node = {
       id = session.id,
       name = "会话" .. session_index,
-      preview = preview,
+      preview = round_text,
+      round_count = 0,
       children = {},
     }
-    local child_ids = session.child_ids or {}
-    if #child_ids > 1 then
-      local branch_node = {
-        id = "__branch_" .. session.id,
-        name = session.name .. " (分支)",
-        is_virtual = true,
-        children = {},
-      }
-      for _, cid in ipairs(child_ids) do
-        local child_node = build_node(state.sessions[cid])
-        if child_node then
-          table.insert(branch_node.children, child_node)
+
+    if is_root then
+      -- 根节点：始终显示为会话名称，不合并轮次内容
+      -- 有子会话时，轮次内容作为轮次节点，子会话同级显示
+      if round_text ~= "" then
+        table.insert(node.children, {
+          id = session.id .. "_round",
+          name = round_text,
+          is_round = true,
+          preview = round_text,
+          children = {},
+        })
+        node.round_count = 1
+      end
+      if #child_ids > 1 then
+        -- 多个子会话：创建虚拟分支节点，子会话在虚拟分支下同级显示
+        local branch_node = {
+          id = "__branch_" .. session.id,
+          name = session.name .. " (分支)",
+          is_virtual = true,
+          children = {},
+        }
+        for _, cid in ipairs(child_ids) do
+          local child_node = build_node(state.sessions[cid], false)
+          if child_node then
+            table.insert(branch_node.children, child_node)
+          end
+        end
+        table.insert(node.children, branch_node)
+      else
+        -- 只有一个子会话：子会话直接作为子节点（同级显示）
+        for _, cid in ipairs(child_ids) do
+          local child_node = build_node(state.sessions[cid], false)
+          if child_node then
+            table.insert(node.children, child_node)
+          end
         end
       end
-      table.insert(node.children, branch_node)
-    elseif #child_ids == 1 then
-      local child_node = build_node(state.sessions[child_ids[1]])
-      if child_node then
-        table.insert(node.children, child_node)
+    else
+      -- 非根节点
+      if #child_ids == 0 then
+        -- 无子会话：直接用轮次内容作为节点名称
+        if round_text ~= "" then
+          node.name = round_text
+          node.round_count = 1
+        end
+      elseif #child_ids == 1 then
+        -- 只有一个子会话：链式展开，轮次内容作为节点名称，子会话直接作为子节点
+        if round_text ~= "" then
+          node.name = round_text
+          node.round_count = 1
+        end
+        local child_node = build_node(state.sessions[child_ids[1]], false)
+        if child_node then
+          table.insert(node.children, child_node)
+        end
+      else
+        -- 多个子会话：创建轮次节点 + 虚拟分支节点，子会话在虚拟分支下同级显示
+        if round_text ~= "" then
+          table.insert(node.children, {
+            id = session.id .. "_round",
+            name = round_text,
+            is_round = true,
+            preview = round_text,
+            children = {},
+          })
+          node.round_count = 1
+        end
+        local branch_node = {
+          id = "__branch_" .. session.id,
+          name = session.name .. " (分支)",
+          is_virtual = true,
+          children = {},
+        }
+        for _, cid in ipairs(child_ids) do
+          local child_node = build_node(state.sessions[cid], false)
+          if child_node then
+            table.insert(branch_node.children, child_node)
+          end
+        end
+        table.insert(node.children, branch_node)
       end
     end
     return node
   end
   local tree = {}
   for _, root in ipairs(roots) do
-    local node = build_node(root)
+    local node = build_node(root, true)
     if node then
       table.insert(tree, node)
     end
@@ -510,6 +653,20 @@ function M.get_context_and_new_parent(session_id)
   end
 
   return context_msgs, new_parent_id
+end
+
+--- 查找某个会话的父会话ID
+--- @param session_id string 子会话ID
+--- @return string|nil 父会话ID，如果没有父会话则返回nil
+function M.find_parent_session(session_id)
+  for _, s in pairs(state.sessions) do
+    for _, cid in ipairs(s.child_ids or {}) do
+      if cid == session_id then
+        return s.id
+      end
+    end
+  end
+  return nil
 end
 
 --- 检查是否已初始化

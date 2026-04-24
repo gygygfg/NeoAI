@@ -1000,9 +1000,9 @@ function M._render_tree_node(content, node, depth, is_last, parent_prefix, tree_
   local display_text
   if node.is_round then
     -- 轮次节点：显示消息预览
-    display_text = node.preview or "(空消息)"
+    display_text = node.name or "(空消息)"
   else
-    -- 会话节点：显示会话名称
+    -- 会话节点：只显示会话名称，不显示预览
     display_text = node.name or "未命名"
   end
   display_text = display_text:gsub("%b<>", " "):gsub("[%c%z]", " "):gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
@@ -1011,16 +1011,17 @@ function M._render_tree_node(content, node, depth, is_last, parent_prefix, tree_
   local icon
   if node.is_virtual then
     icon = "📂 "
-  elseif node.is_round then
-    icon = "💬 "
+  elseif node.children and #node.children > 0 then
+    icon = "📁 "  -- 有子节点的会话节点显示文件夹图标
   else
-    icon = ""  -- 会话节点不显示图标
+    icon = ""  -- 轮次节点和叶子节点不显示图标
   end
 
   local line = line_prefix .. icon .. display_text
 
-  if node.round_count and node.round_count > 0 then
-    line = line .. "  (" .. node.round_count .. " 轮)"
+  -- 只有有子节点的节点才显示轮数标记（无子节点时轮次内容已合并到名称中）
+  if node.round_count and node.round_count > 0 and node.children and #node.children > 0 then
+    line = line .. "  (" .. node.round_count .. "轮)"
   end
 
   if window_width and window_width > 0 then

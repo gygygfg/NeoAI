@@ -39,6 +39,16 @@ function M.handle_enter()
     return
   end
   local session = hm.get_session(selected_id)
+  -- 如果选中了轮次节点，自动使用其父会话ID
+  if not session and selected_id:match("^session_.+_round$") then
+    local parent_id = selected_id:match("^(session_.+)_round$")
+    if parent_id then
+      session = hm.get_session(parent_id)
+      if session then
+        selected_id = parent_id
+      end
+    end
+  end
   if not session then
     vim.notify("会话不存在: " .. selected_id, vim.log.levels.WARN)
     return
@@ -68,14 +78,27 @@ function M.handle_n()
   local hm = get_hm()
   if not hm then return end
   local session = hm.get_session(selected_id)
+  -- 如果选中了轮次节点，自动使用其父会话ID
+  if not session and selected_id:match("^session_.+_round$") then
+    local parent_id = selected_id:match("^(session_.+)_round$")
+    if parent_id then
+      session = hm.get_session(parent_id)
+      if session then
+        selected_id = parent_id
+      end
+    end
+  end
   if not session then
     vim.notify("会话不存在", vim.log.levels.WARN)
     return
   end
+  -- 在选中会话下创建新子会话
   local new_id = hm.create_session("子会话-" .. session.name, false, selected_id)
   vim.notify("已创建子会话: " .. new_id, vim.log.levels.INFO)
-  -- 自动打开新创建的会话
+  -- 设置当前会话为新创建的子会话
   hm.set_current_session(new_id)
+  -- 跳转到聊天界面，加载从根到选中会话的整条路径作为上文
+  -- 新子会话的上下文由 chat_window._load_messages 通过 _load_raw_messages 自动加载
   local ui = require("NeoAI.ui")
   local chat_window = require("NeoAI.ui.window.chat_window")
   if chat_window.is_open() then
@@ -115,6 +138,16 @@ function M.handle_d()
   local hm = get_hm()
   if not hm then return end
   local session = hm.get_session(selected_id)
+  -- 如果选中了轮次节点，自动使用其父会话ID
+  if not session and selected_id:match("^session_.+_round$") then
+    local parent_id = selected_id:match("^(session_.+)_round$")
+    if parent_id then
+      session = hm.get_session(parent_id)
+      if session then
+        selected_id = parent_id
+      end
+    end
+  end
   if not session then
     vim.notify("会话不存在", vim.log.levels.WARN)
     return

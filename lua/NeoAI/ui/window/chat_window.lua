@@ -657,6 +657,7 @@ function M._load_messages(session_id)
 end
 
 --- 从历史管理器加载原始消息（保留 assistant 消息的 JSON 格式）
+--- assistant 字段为数组，每个元素展开为一条 assistant 消息
 --- @param session_id string 会话ID
 --- @param hm table 历史管理器实例
 --- @return table 消息列表
@@ -676,9 +677,18 @@ function M._load_raw_messages(session_id, hm)
     if current.user and current.user ~= "" then
       table.insert(messages, { role = "user", content = current.user })
     end
-    if current.assistant and current.assistant ~= "" then
-      -- 保留原始 assistant 内容（可能是 JSON 格式，也可能是纯文本）
-      table.insert(messages, { role = "assistant", content = current.assistant })
+    -- assistant 为数组，每个元素是一轮 AI 回复
+    local assistant_list = current.assistant
+    if type(assistant_list) ~= "table" then
+      -- 兼容旧格式：如果是字符串，转为数组
+      if assistant_list and assistant_list ~= "" then
+        assistant_list = { assistant_list }
+      else
+        assistant_list = {}
+      end
+    end
+    for _, entry in ipairs(assistant_list) do
+      table.insert(messages, { role = "assistant", content = entry })
     end
     
     -- 继续到子会话
@@ -1026,7 +1036,7 @@ function M._persist_message(role, content)
     return
   end
   if role == "user" then
-    hm.add_round(session.id, content, "")
+    hm.add_round(session.id, content, {})
   elseif role == "assistant" then
     hm.update_last_assistant(session.id, content)
   end

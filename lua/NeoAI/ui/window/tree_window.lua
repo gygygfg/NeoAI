@@ -689,16 +689,6 @@ function M._build_line_to_node_map()
   local current_line = 0
 
   local function traverse_node(node)
-    -- 跳过虚拟根节点的显示（它只作为容器）
-    if node.type == "virtual_root" then
-      if state.expanded_nodes[node.id] and node.children then
-        for _, child in ipairs(node.children) do
-          traverse_node(child)
-        end
-      end
-      return
-    end
-
     -- 记录当前行的节点ID
     line_to_node[current_line] = node.id
     current_line = current_line + 1
@@ -857,9 +847,13 @@ function M._new_child_branch()
     vim.notify("请先选中一个会话", vim.log.levels.WARN)
     return
   end
-  -- 跳过虚拟分支节点
+  -- 跳过虚拟分支节点和轮次节点
   if target_node_id:match("^__branch_") then
     vim.notify("请选择具体的会话节点", vim.log.levels.WARN)
+    return
+  end
+  if target_node_id:match("_round$") then
+    vim.notify("请选择会话节点，而非对话轮次", vim.log.levels.WARN)
     return
   end
   local ok, hm = pcall(require, "NeoAI.core.history_manager")
@@ -908,8 +902,13 @@ function M._delete_node()
     return
   end
   local node_id = state.selected_node_id
+  -- 跳过虚拟分支节点和轮次节点
   if node_id:match("^__branch_") then
     vim.notify("不能删除虚拟分支节点", vim.log.levels.WARN)
+    return
+  end
+  if node_id:match("_round$") then
+    vim.notify("不能删除对话轮次节点", vim.log.levels.WARN)
     return
   end
   local ok, hm = pcall(require, "NeoAI.core.history_manager")
