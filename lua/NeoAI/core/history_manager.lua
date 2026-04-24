@@ -188,7 +188,7 @@ function M.create_session(name, is_root, parent_id)
   local id = generate_id()
   local session = {
     id = id,
-    name = name or "新会话",
+    name = name or "聊天会话",
     created_at = os.time(),
     updated_at = os.time(),
     is_root = (parent_id == nil and is_root ~= false) or (is_root == true),

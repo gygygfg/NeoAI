@@ -1,5 +1,6 @@
 --- 树窗口
---- 职责：静态渲染、格式化树结构显示
+--- 职责：直接渲染 history_tree 处理好的 flat_items 列表
+--- flat_items 已包含：虚拟节点、is_last、缩进级别、连接符数组
 
 local M = {}
 local window_manager = require("NeoAI.ui.window.window_manager")
@@ -10,7 +11,7 @@ local state = {
   config = nil,
   current_window_id = nil,
   current_session_id = nil,
-  tree_data = {},       -- 从 history_manager.get_tree() 获取的树结构（已包含虚拟节点）
+  flat_items = {},          -- 从 history_tree 获取的渲染列表
   selected_session_id = nil, -- 当前选中的真实会话ID
   cursor_augroup = nil,
   float_win_id = nil,
@@ -26,117 +27,6 @@ function M.initialize(config)
   end
   state.config = config or {}
   state.initialized = true
-end
-
---- 从扁平列表重建树结构
---- 使用 list_sessions() 获取所有会话，再通过 get_session() 获取 child_ids 重建父子关系
-local function rebuild_tree_from_list()
-  local ok, hm = pcall(require, "NeoAI.core.history_manager")
-  if not ok or not hm.is_initialized() then
-    return {}
-  end
-
-  local sessions = hm.list_sessions() or {}
-  if #sessions == 0 then
-    return {}
-  end
-
-  -- 第一步：构建 id -> session 映射，并获取完整会话对象
-  local session_map = {}
-  for _, s in ipairs(sessions) do
-    local full = hm.get_session(s.id)
-    if full then
-      session_map[s.id] = full
-    end
-  end
-
-  -- 第二步：构建轮次预览文本
-  local function build_round_text(session)
-    if not session then return "" end
-    local text = ""
-    if session.user and session.user ~= "" then
-      local user_preview = session.user:gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
-      if #user_preview > 20 then
-        user_preview = user_preview:sub(1, 20) .. "…"
-      end
-      text = "👤" .. user_preview
-    end
-    if session.assistant and (
-      (type(session.assistant) == "table" and #session.assistant > 0)
-      or (type(session.assistant) == "string" and session.assistant ~= "")
-    ) then
-      local ai_text = ""
-      local last_entry = session.assistant
-      if type(session.assistant) == "table" and #session.assistant > 0 then
-        last_entry = session.assistant[#session.assistant]
-      end
-      local ok2, parsed = pcall(vim.json.decode, last_entry)
-      if ok2 and type(parsed) == "table" and parsed.content then
-        ai_text = parsed.content
-      elseif type(last_entry) == "string" then
-        ai_text = last_entry
-      end
-      local ai_preview = ai_text:gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
-      if #ai_preview > 20 then
-        ai_preview = ai_preview:sub(1, 20) .. "…"
-      end
-      if text ~= "" then
-        text = text .. " | 🤖" .. ai_preview
-      else
-        text = "🤖" .. ai_preview
-      end
-    end
-    return text
-  end
-
-  -- 第三步：递归构建树节点
-  local function build_node(session)
-    if not session then return nil end
-    local round_text = build_round_text(session)
-    local node = {
-      id = session.id,
-      session_id = session.id,
-      name = session.name or "未命名",
-      round_text = round_text,
-      children = {},
-    }
-    for _, cid in ipairs(session.child_ids or {}) do
-      local child = session_map[cid]
-      if child then
-        local child_node = build_node(child)
-        if child_node then
-          table.insert(node.children, child_node)
-        end
-      end
-    end
-    return node
-  end
-
-  -- 第四步：只取根会话构建树
-  local tree = {}
-  for _, s in ipairs(sessions) do
-    if s.is_root then
-      local full = session_map[s.id]
-      if full then
-        local node = build_node(full)
-        if node then
-          table.insert(tree, node)
-        end
-      end
-    end
-  end
-
-  return tree
-end
-
---- 获取 history_manager 的树结构
-local function load_tree()
-  local ok, hm = pcall(require, "NeoAI.core.history_manager")
-  if not ok or not hm.is_initialized() then
-    return {}
-  end
-  -- 改为使用 list_sessions 重建树
-  return rebuild_tree_from_list()
 end
 
 --- 打开树窗口
@@ -205,12 +95,13 @@ end
 --- 异步加载树数据
 function M._load_and_render_async(callback)
   async_worker.submit_task("load_tree_data", function()
-    return load_tree()
-  end, function(success, tree)
-    if success and tree then
-      state.tree_data = tree
+    local history_tree = require("NeoAI.ui.components.history_tree")
+    return history_tree.build_flat_items()
+  end, function(success, items)
+    if success and items then
+      state.flat_items = items
     else
-      state.tree_data = {}
+      state.flat_items = {}
     end
     M.render_tree()
     if callback then
@@ -280,160 +171,53 @@ function M.render_tree()
   end
 end
 
---- 将原始会话树转换为带虚拟节点的显示树
---- 规则：
---- 1. 根会话 → 虚拟文件夹节点（📂 会话名），包含该会话的所有轮次和子会话
---- 2. 子会话的轮次直接扁平化到文件夹下（不创建中间会话节点）
---- 3. 只有当一个子会话有多个子会话（分支）时，才创建分支节点
-local function build_display_tree(raw_tree)
-  local display_tree = {}
-
-  -- 收集一个会话节点及其所有后代的轮次
-  local function collect_all_rounds(session_node)
-    local rounds = {}
-    if session_node.round_text and session_node.round_text ~= "" then
-      table.insert(rounds, {
-        id = session_node.id .. "_round",
-        session_id = session_node.session_id,
-        name = session_node.round_text,
-        is_round = true,
-        children = {},
-      })
-    end
-    for _, child in ipairs(session_node.children or {}) do
-      local child_rounds = collect_all_rounds(child)
-      for _, r in ipairs(child_rounds) do
-        table.insert(rounds, r)
-      end
-    end
-    return rounds
-  end
-
-  local function flatten_rounds(session_node, collected)
-    -- 收集当前会话的轮次
-    if session_node.round_text and session_node.round_text ~= "" then
-      table.insert(collected, {
-        id = session_node.id .. "_round",
-        session_id = session_node.session_id,
-        name = session_node.round_text,
-        is_round = true,
-        children = {},
-      })
-    end
-    -- 递归处理子会话
-    local child_ids = session_node.children or {}
-    if #child_ids == 1 then
-      -- 只有一个子会话：检查它是否有子会话
-      local only_child = child_ids[1]
-      if #(only_child.children or {}) > 0 then
-        -- 子会话有子会话：创建分支节点
-        local branch_rounds = collect_all_rounds(only_child)
-        if #branch_rounds > 0 then
-          table.insert(collected, {
-            id = "__branch_" .. only_child.id,
-            name = "分支",
-            is_virtual = true,
-            round_count = #branch_rounds,
-            children = branch_rounds,
-          })
-        end
-      else
-        -- 子会话没有子会话：链式扁平化
-        flatten_rounds(only_child, collected)
-      end
-    elseif #child_ids > 1 then
-      -- 多个子会话：分别处理每个子会话
-      for _, child in ipairs(child_ids) do
-        if #(child.children or {}) > 0 then
-          -- 该子会话有子会话：创建分支节点
-          local branch_rounds = collect_all_rounds(child)
-          if #branch_rounds > 0 then
-            table.insert(collected, {
-              id = "__branch_" .. child.id,
-              name = "分支",
-              is_virtual = true,
-              round_count = #branch_rounds,
-              children = branch_rounds,
-            })
-          end
-        else
-          -- 该子会话没有子会话：直接收集轮次（扁平化）
-          flatten_rounds(child, collected)
-        end
-      end
-    end
-  end
-
-  for _, root in ipairs(raw_tree) do
-    local root_children = {}
-    flatten_rounds(root, root_children)
-    if #root_children > 0 then
-      table.insert(display_tree, {
-        id = "__folder_" .. root.id,
-        session_id = root.session_id,
-        name = root.name,
-        is_virtual = true,
-        round_count = #root_children,
-        children = root_children,
-      })
-    end
-  end
-
-  return display_tree
-end
-
 --- 构建显示内容
+--- 根据 history_tree 的抽象节点数据做具体渲染
 function M._build_display_content()
   local content = {}
   table.insert(content, "=== NeoAI 会话树 ===")
   table.insert(content, "")
 
-  -- 将原始树转换为带虚拟节点的显示树
-  local display_tree = build_display_tree(state.tree_data)
-
-  if #display_tree == 0 then
+  if #state.flat_items == 0 then
     table.insert(content, "暂无会话")
     table.insert(content, "按 N 创建新会话")
   else
-    local function render_node(node, depth, is_last, prefix)
-      local line_prefix = prefix or ""
-      local icon = ""
-      local name = node.name or "未命名"
-
-      if node.is_virtual then
-        icon = "📂 "
-        if node.round_count and node.round_count > 0 then
-          name = name .. "  (" .. node.round_count .. "轮)"
-        end
-      elseif node.is_round then
-        -- 轮次节点，直接显示预览文本
+    for _, item in ipairs(state.flat_items) do
+      -- 跳过分隔符节点
+      if item.is_separator then
+        table.insert(content, "")
+        goto continue
       end
 
-      local connector = is_last and "└──" or "├──"
-      if depth == 0 then
-        table.insert(content, connector .. icon .. name)
+      local line = ""
+
+      -- 1. 根据缩进级别生成连接线
+      local indent = item.indent or 0
+      for i = 1, indent do
+        if item.connectors and item.connectors[i] then
+          line = line .. item.connectors[i]
+        else
+          line = line .. "│  "
+        end
+      end
+
+      -- 2. 根据 display_type 渲染前缀和文本
+      if item.display_type == "branch" then
+        if item.is_last then
+          line = line .. "└─ 📂 " .. item.display_text
+        else
+          line = line .. "├─ 📂 " .. item.display_text
+        end
       else
-        table.insert(content, line_prefix .. connector .. icon .. name)
-      end
-
-      if node.children and #node.children > 0 then
-        for i, child in ipairs(node.children) do
-          local child_prefix
-          if node.is_virtual and depth > 0 then
-            -- 非根虚拟节点（分支）的子节点：始终显示垂直线
-            child_prefix = line_prefix .. "│   "
-          elseif depth == 0 then
-            child_prefix = is_last and "    " or "│   "
-          else
-            child_prefix = line_prefix .. (is_last and "    " or "│   ")
-          end
-          render_node(child, depth + 1, i == #node.children, child_prefix)
+        if item.is_last then
+          line = line .. "└─ " .. item.display_text
+        else
+          line = line .. "├─ " .. item.display_text
         end
       end
-    end
 
-    for i, root in ipairs(display_tree) do
-      render_node(root, 0, i == #display_tree, "")
+      table.insert(content, line)
+      ::continue::
     end
   end
 
@@ -446,25 +230,19 @@ end
 --- 构建行号到真实会话ID的映射
 function M._build_line_to_session_map()
   local map = {}
-  local line = 0
-
-  local function traverse(node)
-    if node.session_id then
-      map[line] = node.session_id
-    end
-    line = line + 1
-    if node.children then
-      for _, child in ipairs(node.children) do
-        traverse(child)
+  -- 第0行是标题，第1行是空行，从第2行开始是节点
+  local line = 2
+  for _, item in ipairs(state.flat_items) do
+    if item.is_separator then
+      -- 分隔符渲染为空行
+      line = line + 1
+    else
+      if item.session_id then
+        map[line] = item.session_id
       end
+      line = line + 1
     end
   end
-
-  local display_tree = build_display_tree(state.tree_data)
-  for _, root in ipairs(display_tree) do
-    traverse(root)
-  end
-
   return map
 end
 
@@ -569,7 +347,7 @@ function M._update_selection_from_cursor()
 
   local line_map = M._build_line_to_session_map()
   for line, sid in pairs(line_map) do
-    if line + 2 == cursor_line then
+    if line == cursor_line then
       if state.selected_session_id ~= sid then
         state.selected_session_id = sid
         M._update_float_window()
@@ -643,7 +421,7 @@ function M._move_selection(direction)
     state.selected_session_id = line_map[new_line]
     local win_handle = window_manager.get_window_win(state.current_window_id)
     if win_handle and vim.api.nvim_win_is_valid(win_handle) then
-      local cursor_line = new_line + 2
+      local cursor_line = new_line
       vim.api.nvim_win_set_cursor(win_handle, { cursor_line + 1, 0 })
     end
     M._update_float_window()
@@ -665,7 +443,7 @@ function M.close()
   local win_handle = window_manager.get_window_win(state.current_window_id)
   if not win_handle or not vim.api.nvim_win_is_valid(win_handle) then
     state.current_window_id = nil
-    state.tree_data = {}
+    state.flat_items = {}
     state.selected_session_id = nil
     return
   end
@@ -685,7 +463,7 @@ function M.close()
 
   state.current_window_id = nil
   state.current_session_id = nil
-  state.tree_data = {}
+  state.flat_items = {}
   state.selected_session_id = nil
   state.float_win_id = nil
   state.float_buf_id = nil
@@ -839,7 +617,7 @@ end
 
 --- 获取树数据
 function M.get_tree_data()
-  return state.tree_data
+  return state.flat_items
 end
 
 return M
