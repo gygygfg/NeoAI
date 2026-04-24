@@ -467,7 +467,160 @@ function M.get_tree()
   local roots = M.get_root_sessions()
 
   local session_index = 0
-  local function build_node(session, is_root)
+
+  -- 前向声明，用于相互递归
+  local build_node
+
+  --- 构建会话节点：显示会话名称，轮次作为子节点
+  --- 如果会话有多个子会话，创建分支节点
+  local function build_session_node(session)
+    if not session then
+      return nil
+    end
+    session_index = session_index + 1
+
+    -- 构建该会话的轮次预览
+    local s_round_text = ""
+    if session.user and session.user ~= "" then
+      local user_preview = session.user:gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
+      if #user_preview > 20 then
+        user_preview = user_preview:sub(1, 20) .. "…"
+      end
+      s_round_text = "👤" .. user_preview
+    end
+    if
+      session.assistant
+      and (
+        type(session.assistant) == "table" and #session.assistant > 0
+        or type(session.assistant) == "string" and session.assistant ~= ""
+      )
+    then
+      local ai_text = ""
+      local last_entry = session.assistant
+      if type(session.assistant) == "table" and #session.assistant > 0 then
+        last_entry = session.assistant[#session.assistant]
+      end
+      local ok, parsed = pcall(vim.json.decode, last_entry)
+      if ok and type(parsed) == "table" and parsed.content then
+        ai_text = parsed.content
+      elseif type(last_entry) == "string" then
+        ai_text = last_entry
+      end
+      local ai_preview = ai_text:gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
+      if #ai_preview > 20 then
+        ai_preview = ai_preview:sub(1, 20) .. "…"
+      end
+      if s_round_text ~= "" then
+        s_round_text = s_round_text .. " | 🤖" .. ai_preview
+      else
+        s_round_text = "🤖" .. ai_preview
+      end
+    end
+
+    local s_child_ids = session.child_ids or {}
+    local session_children = {}
+
+    -- 添加会话自身的轮次
+    if s_round_text ~= "" then
+      table.insert(session_children, {
+        id = session.id .. "_round",
+        name = s_round_text,
+        is_round = true,
+        preview = s_round_text,
+        children = {},
+      })
+    end
+
+    if #s_child_ids == 1 then
+      -- 只有一个子会话：链式扁平化展开
+      local function collect_chain(s, collected)
+        local scids = s.child_ids or {}
+        for _, scid in ipairs(scids) do
+          local sc_session = state.sessions[scid]
+          if sc_session then
+            local sc_node = build_node(sc_session, false)
+            if sc_node then
+              table.insert(collected, sc_node)
+            end
+            collect_chain(sc_session, collected)
+          end
+        end
+      end
+      collect_chain(session, session_children)
+    elseif #s_child_ids > 1 then
+      -- 多个子会话：统一放在一个虚拟分支节点下
+      local branch_children = {}
+      for _, scid in ipairs(s_child_ids) do
+        local sc_session = state.sessions[scid]
+        if sc_session then
+          -- 子会话自身的轮次
+          local sc_node = build_node(sc_session, false)
+          if sc_node then
+            table.insert(branch_children, sc_node)
+          end
+          -- 链式收集子会话的子会话
+          local function collect_branch(s, collected)
+            local bscids = s.child_ids or {}
+            for _, bscid in ipairs(bscids) do
+              local bs_session = state.sessions[bscid]
+              if bs_session then
+                local bs_node = build_node(bs_session, false)
+                if bs_node then
+                  table.insert(collected, bs_node)
+                end
+                collect_branch(bs_session, collected)
+              end
+            end
+          end
+          collect_branch(sc_session, branch_children)
+        end
+      end
+      -- 计算分支总轮数
+      local branch_rounds = 0
+      for _, bc in ipairs(branch_children) do
+        if bc.is_round then
+          branch_rounds = branch_rounds + 1
+        elseif bc.round_count and bc.round_count > 0 then
+          branch_rounds = branch_rounds + bc.round_count
+        else
+          branch_rounds = branch_rounds + 1
+        end
+      end
+      if #branch_children > 0 then
+        local branch_node = {
+          id = "__branch_" .. session.id,
+          name = "分支",
+          is_virtual = true,
+          round_count = branch_rounds,
+          children = branch_children,
+        }
+        table.insert(session_children, branch_node)
+      end
+    end
+
+    -- 计算该会话的总轮数
+    local total_rounds = 0
+    for _, child in ipairs(session_children) do
+      if child.is_round then
+        total_rounds = total_rounds + 1
+      elseif child.round_count and child.round_count > 0 then
+        total_rounds = total_rounds + child.round_count
+      else
+        total_rounds = total_rounds + 1
+      end
+    end
+
+    local session_node = {
+      id = session.id,
+      name = "会话" .. session_index,
+      preview = s_round_text,
+      round_count = total_rounds,
+      children = session_children,
+    }
+    return session_node
+  end
+
+  build_node = function(session, is_root)
     if not session then
       return nil
     end
@@ -482,7 +635,13 @@ function M.get_tree()
       end
       round_text = "👤" .. user_preview
     end
-    if session.assistant and (type(session.assistant) == "table" and #session.assistant > 0 or type(session.assistant) == "string" and session.assistant ~= "") then
+    if
+      session.assistant
+      and (
+        type(session.assistant) == "table" and #session.assistant > 0
+        or type(session.assistant) == "string" and session.assistant ~= ""
+      )
+    then
       local ai_text = ""
       local last_entry = session.assistant
       if type(session.assistant) == "table" and #session.assistant > 0 then
@@ -516,34 +675,23 @@ function M.get_tree()
     }
 
     if is_root then
-      -- 根节点：创建虚拟文件夹节点，把自身和所有子会话都放进去
-      -- 先添加根节点自身的轮次内容
+      -- 根节点：创建虚拟文件夹节点，把子会话放进去
+      -- 根节点自身的轮次内容作为虚拟文件夹节点的 preview 显示，不单独作为子节点
       local root_children = {}
-      if round_text ~= "" then
-        table.insert(root_children, {
-          id = session.id .. "_round",
-          name = round_text,
-          is_round = true,
-          preview = round_text,
-          children = {},
-        })
-      end
-      -- 再收集所有链式子会话（扁平化展开）
-      local function collect_chain_children(session, collected)
-        local cids = session.child_ids or {}
-        for _, cid in ipairs(cids) do
-          local child_session = state.sessions[cid]
-          if child_session then
-            local child_node = build_node(child_session, false)
-            if child_node then
-              table.insert(collected, child_node)
-            end
-            -- 继续收集子会话的子会话（链式扁平化）
-            collect_chain_children(child_session, collected)
+
+      -- 为每个直接子会话创建会话节点
+      local cids = session.child_ids or {}
+      for _, cid in ipairs(cids) do
+        local child_session = state.sessions[cid]
+        if child_session then
+          -- 构建会话节点（显示会话名称，轮次作为子节点）
+          local session_node = build_session_node(child_session)
+          if session_node then
+            table.insert(root_children, session_node)
           end
         end
       end
-      collect_chain_children(session, root_children)
+
       -- 计算总轮数
       local total_rounds = 0
       for _, child in ipairs(root_children) do
@@ -567,10 +715,11 @@ function M.get_tree()
       return virtual_node
     else
       -- 非根节点：直接用轮次内容作为节点名称，不包含子节点
-      -- 子会话由父节点的 collect_chain_children 扁平化收集
+      -- 子会话由父节点的 build_session_node 收集
       if round_text ~= "" then
         node.name = round_text
         node.round_count = 1
+        node.is_round = true
       end
       -- 标记是否有子会话（用于渲染时显示文件夹图标）
       if #child_ids > 0 then
@@ -579,6 +728,7 @@ function M.get_tree()
     end
     return node
   end
+
   local tree = {}
   for _, root in ipairs(roots) do
     local node = build_node(root, true)

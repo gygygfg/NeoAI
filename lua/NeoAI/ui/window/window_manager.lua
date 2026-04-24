@@ -917,15 +917,17 @@ local function safe_truncate(str, max_len)
   local last_char = truncated:sub(-1)
   local byte = last_char:byte()
   
-  -- 如果最后一个字节是UTF-8多字节字符的中间字节（0x80-0xBF），则向前调整
-  if byte >= 0x80 and byte <= 0xBF then
+  -- 如果最后一个字节是UTF-8多字节字符的一部分（0x80以上），则向前调整到完整的字符边界
+  if byte and byte >= 0x80 then
     -- 向前查找完整的字符边界
-    for i = max_len - 1, 1, -1 do
+    for i = max_len, 1, -1 do
       local prev_byte = truncated:sub(i, i):byte()
-      -- 检查是否是UTF-8字符的起始字节
-      if prev_byte < 0x80 or prev_byte >= 0xC0 then
+      -- 检查是否是UTF-8字符的起始字节（0x00-0x7F 或 0xC0-0xFD）
+      if prev_byte and (prev_byte < 0x80 or prev_byte >= 0xC0) then
         -- 找到字符边界，截断到这里
-        truncated = truncated:sub(1, i)
+        if i < max_len then
+          truncated = truncated:sub(1, i)
+        end
         break
       end
     end
@@ -1013,7 +1015,13 @@ function M._render_tree_node(content, node, depth, is_last, parent_prefix, tree_
     icon = "📂 "
   end
 
-  local line = line_prefix .. icon .. display_text
+  -- 虚拟节点不显示连接线前缀，直接以图标开头（根节点除外）
+  local line
+  if node.is_virtual and not is_root then
+    line = current_prefix .. icon .. display_text
+  else
+    line = line_prefix .. icon .. display_text
+  end
 
   -- 显示轮数标记：根节点和有子节点的非轮次节点
   if node.round_count and node.round_count > 0 and not node.is_round then
@@ -1021,9 +1029,12 @@ function M._render_tree_node(content, node, depth, is_last, parent_prefix, tree_
   end
 
   if window_width and window_width > 0 then
-    local available_width = window_width - #line_prefix - 3
-    if available_width > 0 and #line > available_width then
-      line = line_prefix .. safe_truncate(line:sub(#line_prefix + 1), available_width - 3) .. "..."
+    local effective_prefix = node.is_virtual and current_prefix or line_prefix
+    if #line > window_width then
+      local max_text_len = window_width - #effective_prefix - 3
+      if max_text_len > 0 then
+        line = effective_prefix .. safe_truncate(line:sub(#effective_prefix + 1), max_text_len) .. "..."
+      end
     end
   end
 
@@ -1040,14 +1051,34 @@ function M._render_tree_node(content, node, depth, is_last, parent_prefix, tree_
         child_parent_prefix = "│   "
       end
     elseif depth > 0 then
-      if is_last then
+      -- 非根节点的子节点：在当前节点前缀基础上再加一级缩进
+      -- 对于虚拟节点（分支），子节点前缀基于分支节点自身的前缀（current_prefix）
+      -- 前 N-1 个子节点用 │ 连接线，最后一个子节点用空格（表示分支结束）
+      if node.is_virtual then
+        -- 虚拟节点的子节点前缀：基于 current_prefix（分支节点自身的前缀）
+        -- 子节点会根据自身的 is_last 来决定用 └─── 还是 ├───
+        -- 这里 child_parent_prefix 会被传给子节点作为 parent_prefix
+        child_parent_prefix = current_prefix
+      elseif is_last then
         child_parent_prefix = child_parent_prefix .. "    "
       else
         child_parent_prefix = child_parent_prefix .. "│   "
       end
     end
     for i, child in ipairs(node.children) do
-      M._render_tree_node(content, child, depth + 1, i == child_count, child_parent_prefix, tree_state, window_width, false)
+      local child_is_last = (i == child_count)
+      local child_prefix = child_parent_prefix
+      -- 对于虚拟节点（分支），根据子节点是否是最后一个来决定前缀
+      if node.is_virtual then
+        -- 前 N-1 个子节点用 │ 连接线，最后一个子节点用空格（表示分支结束）
+        -- 这样最后一个子节点会用 └─── 直接连接回分支节点
+        if child_is_last then
+          child_prefix = current_prefix
+        else
+          child_prefix = current_prefix .. "│   "
+        end
+      end
+      M._render_tree_node(content, child, depth + 1, child_is_last, child_prefix, tree_state, window_width, false)
     end
   end
 end

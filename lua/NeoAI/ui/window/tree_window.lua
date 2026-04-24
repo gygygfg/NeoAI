@@ -847,8 +847,8 @@ function M._new_child_branch()
     vim.notify("请先选中一个会话", vim.log.levels.WARN)
     return
   end
-  -- 跳过虚拟分支节点和轮次节点
-  if target_node_id:match("^__branch_") then
+  -- 跳过虚拟节点和轮次节点
+  if target_node_id:match("^__") then
     vim.notify("请选择具体的会话节点", vim.log.levels.WARN)
     return
   end
@@ -902,9 +902,9 @@ function M._delete_node()
     return
   end
   local node_id = state.selected_node_id
-  -- 跳过虚拟分支节点和轮次节点
-  if node_id:match("^__branch_") then
-    vim.notify("不能删除虚拟分支节点", vim.log.levels.WARN)
+  -- 跳过虚拟节点和轮次节点
+  if node_id:match("^__") then
+    vim.notify("不能删除虚拟节点", vim.log.levels.WARN)
     return
   end
   if node_id:match("_round$") then
