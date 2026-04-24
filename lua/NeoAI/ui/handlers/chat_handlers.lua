@@ -232,16 +232,19 @@ function M.send_message(content, session_id, branch_id, window_id, format, callb
   local current_session = hm.get_session(session.id)
   if current_session and current_session.user ~= nil and current_session.user ~= "" then
     -- 当前会话已有内容，创建新会话保存新的一轮
-    -- 新会话应该和当前会话同级（挂在同一个父会话下），而不是作为当前会话的子会话
-    -- 这样多个分支才能同级显示
-    local parent_id = hm.find_parent_session(session.id)
     local new_id
-    if parent_id then
-      -- 新会话挂在父会话下（和当前会话同级）
-      new_id = hm.create_session("分支-" .. current_session.name, false, parent_id)
+    if new_parent_id ~= session.id then
+      -- 选中了中间会话（链式结构），新会话添加到链尾作为子会话
+      new_id = hm.create_session("分支-" .. current_session.name, false, new_parent_id)
     else
-      -- 没有父会话（当前会话是根会话），挂在当前会话下
-      new_id = hm.create_session("分支-" .. current_session.name, false, session.id)
+      -- 选中了链尾或分支点，新会话和当前会话同级（分支）
+      local parent_id = hm.find_parent_session(session.id)
+      if parent_id then
+        new_id = hm.create_session("分支-" .. current_session.name, false, parent_id)
+      else
+        -- 没有父会话（当前会话是根会话），挂在当前会话下
+        new_id = hm.create_session("分支-" .. current_session.name, false, session.id)
+      end
     end
     hm.set_current_session(new_id)
     target_session_id = new_id

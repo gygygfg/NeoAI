@@ -1008,19 +1008,15 @@ function M._render_tree_node(content, node, depth, is_last, parent_prefix, tree_
   display_text = display_text:gsub("%b<>", " "):gsub("[%c%z]", " "):gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
   if display_text == "" then display_text = "未命名" end
 
-  local icon
+  local icon = ""
   if node.is_virtual then
     icon = "📂 "
-  elseif node.children and #node.children > 0 then
-    icon = "📁 "  -- 有子节点的会话节点显示文件夹图标
-  else
-    icon = ""  -- 轮次节点和叶子节点不显示图标
   end
 
   local line = line_prefix .. icon .. display_text
 
-  -- 只有有子节点的节点才显示轮数标记（无子节点时轮次内容已合并到名称中）
-  if node.round_count and node.round_count > 0 and node.children and #node.children > 0 then
+  -- 显示轮数标记：根节点和有子节点的非轮次节点
+  if node.round_count and node.round_count > 0 and not node.is_round then
     line = line .. "  (" .. node.round_count .. "轮)"
   end
 

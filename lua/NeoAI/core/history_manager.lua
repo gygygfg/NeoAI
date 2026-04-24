@@ -516,85 +516,65 @@ function M.get_tree()
     }
 
     if is_root then
-      -- 根节点：始终显示为会话名称，不合并轮次内容
-      -- 有子会话时，轮次内容作为轮次节点，子会话同级显示
+      -- 根节点：创建虚拟文件夹节点，把自身和所有子会话都放进去
+      -- 先添加根节点自身的轮次内容
+      local root_children = {}
       if round_text ~= "" then
-        table.insert(node.children, {
+        table.insert(root_children, {
           id = session.id .. "_round",
           name = round_text,
           is_round = true,
           preview = round_text,
           children = {},
         })
+      end
+      -- 再收集所有链式子会话（扁平化展开）
+      local function collect_chain_children(session, collected)
+        local cids = session.child_ids or {}
+        for _, cid in ipairs(cids) do
+          local child_session = state.sessions[cid]
+          if child_session then
+            local child_node = build_node(child_session, false)
+            if child_node then
+              table.insert(collected, child_node)
+            end
+            -- 继续收集子会话的子会话（链式扁平化）
+            collect_chain_children(child_session, collected)
+          end
+        end
+      end
+      collect_chain_children(session, root_children)
+      -- 计算总轮数
+      local total_rounds = 0
+      for _, child in ipairs(root_children) do
+        if child.is_round then
+          total_rounds = total_rounds + 1
+        elseif child.round_count and child.round_count > 0 then
+          total_rounds = total_rounds + child.round_count
+        else
+          total_rounds = total_rounds + 1
+        end
+      end
+      -- 创建虚拟文件夹节点，把根节点自身和所有子会话都放进去
+      local virtual_node = {
+        id = "__folder_" .. session.id,
+        name = session.name,
+        is_virtual = true,
+        round_count = total_rounds,
+        children = root_children,
+      }
+      -- 返回虚拟文件夹节点，替换原来的根节点
+      return virtual_node
+    else
+      -- 非根节点：直接用轮次内容作为节点名称，不包含子节点
+      -- 子会话由父节点的 collect_chain_children 扁平化收集
+      if round_text ~= "" then
+        node.name = round_text
         node.round_count = 1
       end
-      if #child_ids > 1 then
-        -- 多个子会话：创建虚拟分支节点，子会话在虚拟分支下同级显示
-        local branch_node = {
-          id = "__branch_" .. session.id,
-          name = session.name .. " (分支)",
-          is_virtual = true,
-          children = {},
-        }
-        for _, cid in ipairs(child_ids) do
-          local child_node = build_node(state.sessions[cid], false)
-          if child_node then
-            table.insert(branch_node.children, child_node)
-          end
-        end
-        table.insert(node.children, branch_node)
-      else
-        -- 只有一个子会话：子会话直接作为子节点（同级显示）
-        for _, cid in ipairs(child_ids) do
-          local child_node = build_node(state.sessions[cid], false)
-          if child_node then
-            table.insert(node.children, child_node)
-          end
-        end
-      end
-    else
-      -- 非根节点
-      if #child_ids == 0 then
-        -- 无子会话：直接用轮次内容作为节点名称
-        if round_text ~= "" then
-          node.name = round_text
-          node.round_count = 1
-        end
-      elseif #child_ids == 1 then
-        -- 只有一个子会话：链式展开，轮次内容作为节点名称，子会话直接作为子节点
-        if round_text ~= "" then
-          node.name = round_text
-          node.round_count = 1
-        end
-        local child_node = build_node(state.sessions[child_ids[1]], false)
-        if child_node then
-          table.insert(node.children, child_node)
-        end
-      else
-        -- 多个子会话：创建轮次节点 + 虚拟分支节点，子会话在虚拟分支下同级显示
-        if round_text ~= "" then
-          table.insert(node.children, {
-            id = session.id .. "_round",
-            name = round_text,
-            is_round = true,
-            preview = round_text,
-            children = {},
-          })
-          node.round_count = 1
-        end
-        local branch_node = {
-          id = "__branch_" .. session.id,
-          name = session.name .. " (分支)",
-          is_virtual = true,
-          children = {},
-        }
-        for _, cid in ipairs(child_ids) do
-          local child_node = build_node(state.sessions[cid], false)
-          if child_node then
-            table.insert(branch_node.children, child_node)
-          end
-        end
-        table.insert(node.children, branch_node)
+      -- 标记是否有子会话（用于渲染时显示文件夹图标）
+      if #child_ids > 0 then
+        node.has_children = true
       end
     end
     return node
