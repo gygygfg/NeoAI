@@ -1,4 +1,5 @@
 --- 树界面处理器
+--- 职责：光标移动时切换悬浮文本、快捷键注册/映射、指导 chat 界面获取对话链
 
 local M = {}
 
@@ -24,98 +25,74 @@ local function get_hm()
   return nil
 end
 
-function M.handle_enter()
-  if not state.initialized then
-    return
-  end
+--- 获取当前选中的会话ID（从 tree_window 状态中读取）
+local function get_selected_session_id()
   local tree_window = require("NeoAI.ui.window.tree_window")
-  local selected_id = tree_window.get_selected_node()
-  if not selected_id then
-    vim.notify("未选中任何节点", vim.log.levels.WARN)
-    return
-  end
-  if selected_id:match("^__branch_") then
-    vim.notify("请选择具体的会话节点", vim.log.levels.INFO)
-    return
-  end
+  return tree_window.get_selected_session_id()
+end
+
+--- 打开聊天界面并加载指定会话的对话链
+--- @param session_id string 会话ID
+local function open_chat_for_session(session_id)
   local hm = get_hm()
   if not hm then
     vim.notify("历史管理器未初始化", vim.log.levels.ERROR)
     return
   end
-  local session = hm.get_session(selected_id)
-  -- 如果选中了轮次节点，自动使用其父会话ID
-  if not session and selected_id:match("^session_.+_round$") then
-    local parent_id = selected_id:match("^(session_.+)_round$")
-    if parent_id then
-      session = hm.get_session(parent_id)
-      if session then
-        selected_id = parent_id
-      end
-    end
-  end
+  local session = hm.get_session(session_id)
   if not session then
-    vim.notify("会话不存在: " .. selected_id, vim.log.levels.WARN)
+    vim.notify("会话不存在: " .. session_id, vim.log.levels.WARN)
     return
   end
-  hm.set_current_session(selected_id)
+  hm.set_current_session(session_id)
   vim.notify("切换到会话: " .. session.name, vim.log.levels.INFO)
   local ui = require("NeoAI.ui")
   local chat_window = require("NeoAI.ui.window.chat_window")
   if chat_window.is_open() then
     chat_window.close()
   end
-  ui.open_chat_ui(selected_id, "main")
+  ui.open_chat_ui(session_id, "main")
 end
 
+--- 处理 Enter 键：选中节点并打开聊天
+function M.handle_enter()
+  if not state.initialized then
+    return
+  end
+  local session_id = get_selected_session_id()
+  if not session_id then
+    vim.notify("未选中任何会话节点", vim.log.levels.WARN)
+    return
+  end
+  open_chat_for_session(session_id)
+end
+
+--- 处理 n 键：在选中会话下创建子会话
 function M.handle_n()
   if not state.initialized then
     return
   end
-  local tree_window = require("NeoAI.ui.window.tree_window")
-  local selected_id = tree_window.get_selected_node()
-  if not selected_id then
+  local session_id = get_selected_session_id()
+  if not session_id then
     vim.notify("请先选中一个会话节点", vim.log.levels.WARN)
-    return
-  end
-  if selected_id:match("^__branch_") then
-    vim.notify("请选择具体的会话节点", vim.log.levels.WARN)
     return
   end
   local hm = get_hm()
   if not hm then
     return
   end
-  local session = hm.get_session(selected_id)
-  -- 如果选中了轮次节点，自动使用其父会话ID
-  if not session and selected_id:match("^session_.+_round$") then
-    local parent_id = selected_id:match("^(session_.+)_round$")
-    if parent_id then
-      session = hm.get_session(parent_id)
-      if session then
-        selected_id = parent_id
-      end
-    end
-  end
+  local session = hm.get_session(session_id)
   if not session then
     vim.notify("会话不存在", vim.log.levels.WARN)
     return
   end
-  -- 在选中会话下创建新子会话
-  local new_id = hm.create_session("子会话-" .. session.name, false, selected_id)
+  local new_id = hm.create_session("子会话-" .. session.name, false, session_id)
   vim.notify("已创建子会话: " .. new_id, vim.log.levels.INFO)
-  -- 设置当前会话为新创建的子会话
   hm.set_current_session(new_id)
-  -- 跳转到聊天界面，加载从根到选中会话的整条路径作为上文
-  -- 新子会话的上下文由 chat_window._load_messages 通过 _load_raw_messages 自动加载
-  local ui = require("NeoAI.ui")
-  local chat_window = require("NeoAI.ui.window.chat_window")
-  if chat_window.is_open() then
-    chat_window.close()
-  end
-  ui.open_chat_ui(new_id, "main")
+  open_chat_for_session(new_id)
 end
 
+--- 处理 N 键：创建新的根会话
 function M.handle_N()
   if not state.initialized then
     return
@@ -126,45 +103,25 @@ function M.handle_N()
   end
   local new_id = hm.create_session("新会话", true, nil)
   vim.notify("已创建根会话: " .. new_id, vim.log.levels.INFO)
-  -- 自动打开新创建的会话
   hm.set_current_session(new_id)
-  local ui = require("NeoAI.ui")
-  local chat_window = require("NeoAI.ui.window.chat_window")
-  if chat_window.is_open() then
-    chat_window.close()
-  end
-  ui.open_chat_ui(new_id, "main")
+  open_chat_for_session(new_id)
 end
 
+--- 处理 d 键：删除会话
 function M.handle_d()
   if not state.initialized then
     return
   end
-  local tree_window = require("NeoAI.ui.window.tree_window")
-  local selected_id = tree_window.get_selected_node()
-  if not selected_id then
-    vim.notify("未选中任何节点", vim.log.levels.WARN)
-    return
-  end
-  if selected_id:match("^__branch_") then
-    vim.notify("不能删除虚拟分支节点", vim.log.levels.WARN)
+  local session_id = get_selected_session_id()
+  if not session_id then
+    vim.notify("未选中任何会话节点", vim.log.levels.WARN)
     return
   end
   local hm = get_hm()
   if not hm then
     return
   end
-  local session = hm.get_session(selected_id)
-  -- 如果选中了轮次节点，自动使用其父会话ID
-  if not session and selected_id:match("^session_.+_round$") then
-    local parent_id = selected_id:match("^(session_.+)_round$")
-    if parent_id then
-      session = hm.get_session(parent_id)
-      if session then
-        selected_id = parent_id
-      end
-    end
-  end
+  local session = hm.get_session(session_id)
   if not session then
     vim.notify("会话不存在", vim.log.levels.WARN)
     return
@@ -174,13 +131,23 @@ function M.handle_d()
   if confirm ~= 1 then
     return
   end
-  hm.delete_session(selected_id)
+  hm.delete_session(session_id)
   vim.notify("已删除会话", vim.log.levels.INFO)
-  -- 清除选中状态，避免后续渲染时引用已删除的节点
-  tree_window.select_node(nil)
+  -- 刷新树窗口
+  local tree_window = require("NeoAI.ui.window.tree_window")
   tree_window.refresh_tree()
 end
 
+--- 处理光标移动：更新悬浮文本
+function M.handle_cursor_moved()
+  if not state.initialized then
+    return
+  end
+  local tree_window = require("NeoAI.ui.window.tree_window")
+  tree_window.update_float_window()
+end
+
+--- 按键分发
 function M.handle_key(key)
   if not state.initialized then
     return
@@ -197,44 +164,18 @@ function M.handle_key(key)
   end
 end
 
-function M.delete_branch(node_id)
-  local hm = get_hm()
-  if not hm then
-    return false, "历史管理器未初始化"
-  end
-  local ok, err = pcall(hm.delete_session, hm, node_id)
-  if ok then
-    local tree_win = require("NeoAI.ui.window.tree_window")
-    tree_win.refresh_tree()
-    return true
-  end
-  return false, err or "删除失败"
+--- 获取当前选中的会话ID（供外部调用）
+function M.get_selected_session_id()
+  return get_selected_session_id()
 end
 
-function M.create_branch(parent_id, name)
-  local hm = get_hm()
-  if not hm then
-    return false
-  end
-  local new_id = hm.create_session(name or "新分支", false, parent_id)
-  if new_id then
-    local tree_win = require("NeoAI.ui.window.tree_window")
-    tree_win.refresh_tree()
-    return true
-  end
-  return false
-end
-
-function M.get_selected_node()
-  local tree_window = require("NeoAI.ui.window.tree_window")
-  return tree_window.get_selected_node()
-end
-
+--- 刷新树
 function M.refresh_tree()
   local tree_window = require("NeoAI.ui.window.tree_window")
   tree_window.refresh_tree()
 end
 
+--- 更新配置
 function M.update_config(new_config)
   state.config = vim.tbl_extend("force", state.config, new_config or {})
 end

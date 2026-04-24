@@ -133,7 +133,7 @@ function M.open_tree_ui()
       state.current_ui_mode = "tree"
 
       -- 设置树窗口的按键映射
-      tree_window.set_keymaps(core.get_keymap_manager())
+      tree_window.set_keymaps()
 
       -- 聚焦树窗口
       window_manager.focus_window(tree_win_id)
@@ -212,7 +212,7 @@ function M.open_chat_ui(session_id, branch_id)
       state.current_session_id = session_id -- 更新当前会话ID
 
       -- 设置聊天窗口的按键映射
-      chat_window.set_keymaps(core.get_keymap_manager())
+      chat_window.set_keymaps()
 
       -- 聚焦聊天窗口
       window_manager.focus_window(chat_win_id)

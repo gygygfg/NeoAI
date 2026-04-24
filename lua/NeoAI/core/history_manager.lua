@@ -465,7 +465,9 @@ end
 --- @param session table 会话对象
 --- @return string 轮次预览文本
 local function build_round_text(session)
-  if not session then return "" end
+  if not session then
+    return ""
+  end
   local text = ""
   if session.user and session.user ~= "" then
     local user_preview = session.user:gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
@@ -512,6 +514,7 @@ end
 local function make_round_node(session, round_text)
   return {
     id = session.id .. "_round",
+    session_id = session.id,
     name = round_text,
     is_round = true,
     preview = round_text,
@@ -598,37 +601,32 @@ function M.get_context_and_new_parent(session_id)
     return {}, nil
   end
 
-  local context_msgs = {}
+  -- 从当前会话向上回溯到根，收集路径上的所有会话ID
+  local path_ids = {}
   local current = session
-  local new_parent_id = session_id
-
   for _ = 1, 100 do
-    local child_ids = current.child_ids or {}
-    if #child_ids == 0 then
-      local msgs = M.get_messages(current.id)
-      for _, m in ipairs(msgs) do
-        table.insert(context_msgs, m)
-      end
-      new_parent_id = current.id
-      break
-    elseif #child_ids == 1 then
-      local msgs = M.get_messages(current.id)
-      for _, m in ipairs(msgs) do
-        table.insert(context_msgs, m)
-      end
-      current = state.sessions[child_ids[1]]
-      if not current then
-        break
-      end
-    else
-      local msgs = M.get_messages(current.id)
-      for _, m in ipairs(msgs) do
-        table.insert(context_msgs, m)
-      end
-      new_parent_id = current.id
+    table.insert(path_ids, 1, current.id) -- 插入到开头，保持从根到当前顺序
+    local parent_id = M.find_parent_session(current.id)
+    if not parent_id then
+      break -- 没有父节点，说明已到根
+    end
+    current = state.sessions[parent_id]
+    if not current then
       break
     end
   end
+
+  -- 按从根到当前的顺序收集消息
+  local context_msgs = {}
+  for _, pid in ipairs(path_ids) do
+    local msgs = M.get_messages(pid)
+    for _, m in ipairs(msgs) do
+      table.insert(context_msgs, m)
+    end
+  end
+
+  -- 新会话挂在当前会话下
+  local new_parent_id = session_id
 
   return context_msgs, new_parent_id
 end

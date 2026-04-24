@@ -407,8 +407,7 @@ function M.refresh_chat()
 end
 
 --- 设置按键映射
---- @param keymap_manager table|nil 键位配置管理器
-function M.set_keymaps(keymap_manager)
+function M.set_keymaps()
   if not state.current_window_id then
     return
   end
@@ -424,26 +423,14 @@ function M.set_keymaps(keymap_manager)
     vim.api.nvim_buf_del_keymap(buf, "n", map.lhs)
   end
 
-  -- 获取键位配置
-  local keymaps = {}
-
-  if keymap_manager then
-    -- 从键位配置管理器获取
-    local chat_keymaps = keymap_manager.get_context_keymaps("chat")
-    if chat_keymaps then
-      -- 映射到内部键位名称，使用配置的值或默认值
-      keymaps = {
-        insert = chat_keymaps.insert and chat_keymaps.insert.key or "i",
-        quit = chat_keymaps.quit and chat_keymaps.quit.key or "q",
-        refresh = chat_keymaps.refresh and chat_keymaps.refresh.key or "r",
-        send = chat_keymaps.send and chat_keymaps.send.key or "<CR>",
-      }
-    else
-      keymaps = state.config.keymaps or M._get_default_keymaps()
-    end
-  else
-    keymaps = state.config.keymaps or M._get_default_keymaps()
-  end
+  -- 从合并后的配置中获取 chat 上下文键位
+  local chat_config = (state.config.keymaps or {}).chat or {}
+  local keymaps = {
+    insert = (chat_config.insert or {}).key or "i",
+    quit = (chat_config.quit or {}).key or "q",
+    refresh = (chat_config.refresh or {}).key or "r",
+    send = (chat_config.send or {}).normal and chat_config.send.normal.key or (chat_config.send or {}).key or "<CR>",
+  }
 
   -- 使用闭包创建局部函数引用，避免每次按键都调用 require
   -- 这些函数形成闭包，可以访问外部作用域的 M 模块
@@ -508,17 +495,6 @@ function M.set_keymaps(keymap_manager)
 
   -- 设置插入模式映射
   vim.keymap.set("i", "<Esc>", exit_insert_mode, { buffer = buf, noremap = true, silent = true })
-end
-
---- 获取默认键位配置
---- @return table 默认键位配置
-function M._get_default_keymaps()
-  return {
-    insert = "i",
-    quit = "q",
-    refresh = "r",
-    send = "<CR>",
-  }
 end
 
 --- 进入插入模式（内部函数）
@@ -663,24 +639,36 @@ end
 --- @return table 消息列表
 function M._load_raw_messages(session_id, hm)
   local messages = {}
-  
-  -- 获取上下文路径中的会话ID列表
-  local session = hm.get_session(session_id)
-  if not session then
+
+  -- 从当前会话向上回溯到根，收集路径上的所有会话ID
+  local path_ids = {}
+  local current = hm.get_session(session_id)
+  if not current then
     return messages
   end
-  
-  -- 遍历上下文路径
-  local current = session
   for _ = 1, 100 do
-    -- 添加当前会话的消息（保留原始格式）
-    if current.user and current.user ~= "" then
-      table.insert(messages, { role = "user", content = current.user })
+    table.insert(path_ids, 1, current.id) -- 插入到开头，保持从根到当前顺序
+    local parent_id = hm.find_parent_session(current.id)
+    if not parent_id then
+      break -- 没有父节点，说明已到根
     end
-    -- assistant 为数组，每个元素是一轮 AI 回复
-    local assistant_list = current.assistant
+    current = hm.get_session(parent_id)
+    if not current then
+      break
+    end
+  end
+
+  -- 按从根到当前的顺序收集消息（保留原始格式）
+  for _, pid in ipairs(path_ids) do
+    local s = hm.get_session(pid)
+    if not s then
+      break
+    end
+    if s.user and s.user ~= "" then
+      table.insert(messages, { role = "user", content = s.user })
+    end
+    local assistant_list = s.assistant
     if type(assistant_list) ~= "table" then
-      -- 兼容旧格式：如果是字符串，转为数组
       if assistant_list and assistant_list ~= "" then
         assistant_list = { assistant_list }
       else
@@ -690,22 +678,8 @@ function M._load_raw_messages(session_id, hm)
     for _, entry in ipairs(assistant_list) do
       table.insert(messages, { role = "assistant", content = entry })
     end
-    
-    -- 继续到子会话
-    local child_ids = current.child_ids or {}
-    if #child_ids == 0 then
-      break
-    elseif #child_ids == 1 then
-      current = hm.get_session(child_ids[1])
-      if not current then
-        break
-      end
-    else
-      -- 多个子会话，停止（这是分支点）
-      break
-    end
   end
-  
+
   return messages
 end
 
