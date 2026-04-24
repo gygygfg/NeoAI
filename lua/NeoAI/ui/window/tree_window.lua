@@ -28,13 +28,115 @@ function M.initialize(config)
   state.initialized = true
 end
 
+--- 从扁平列表重建树结构
+--- 使用 list_sessions() 获取所有会话，再通过 get_session() 获取 child_ids 重建父子关系
+local function rebuild_tree_from_list()
+  local ok, hm = pcall(require, "NeoAI.core.history_manager")
+  if not ok or not hm.is_initialized() then
+    return {}
+  end
+
+  local sessions = hm.list_sessions() or {}
+  if #sessions == 0 then
+    return {}
+  end
+
+  -- 第一步：构建 id -> session 映射，并获取完整会话对象
+  local session_map = {}
+  for _, s in ipairs(sessions) do
+    local full = hm.get_session(s.id)
+    if full then
+      session_map[s.id] = full
+    end
+  end
+
+  -- 第二步：构建轮次预览文本
+  local function build_round_text(session)
+    if not session then return "" end
+    local text = ""
+    if session.user and session.user ~= "" then
+      local user_preview = session.user:gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
+      if #user_preview > 20 then
+        user_preview = user_preview:sub(1, 20) .. "…"
+      end
+      text = "👤" .. user_preview
+    end
+    if session.assistant and (
+      (type(session.assistant) == "table" and #session.assistant > 0)
+      or (type(session.assistant) == "string" and session.assistant ~= "")
+    ) then
+      local ai_text = ""
+      local last_entry = session.assistant
+      if type(session.assistant) == "table" and #session.assistant > 0 then
+        last_entry = session.assistant[#session.assistant]
+      end
+      local ok2, parsed = pcall(vim.json.decode, last_entry)
+      if ok2 and type(parsed) == "table" and parsed.content then
+        ai_text = parsed.content
+      elseif type(last_entry) == "string" then
+        ai_text = last_entry
+      end
+      local ai_preview = ai_text:gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
+      if #ai_preview > 20 then
+        ai_preview = ai_preview:sub(1, 20) .. "…"
+      end
+      if text ~= "" then
+        text = text .. " | 🤖" .. ai_preview
+      else
+        text = "🤖" .. ai_preview
+      end
+    end
+    return text
+  end
+
+  -- 第三步：递归构建树节点
+  local function build_node(session)
+    if not session then return nil end
+    local round_text = build_round_text(session)
+    local node = {
+      id = session.id,
+      session_id = session.id,
+      name = session.name or "未命名",
+      round_text = round_text,
+      children = {},
+    }
+    for _, cid in ipairs(session.child_ids or {}) do
+      local child = session_map[cid]
+      if child then
+        local child_node = build_node(child)
+        if child_node then
+          table.insert(node.children, child_node)
+        end
+      end
+    end
+    return node
+  end
+
+  -- 第四步：只取根会话构建树
+  local tree = {}
+  for _, s in ipairs(sessions) do
+    if s.is_root then
+      local full = session_map[s.id]
+      if full then
+        local node = build_node(full)
+        if node then
+          table.insert(tree, node)
+        end
+      end
+    end
+  end
+
+  return tree
+end
+
 --- 获取 history_manager 的树结构
 local function load_tree()
   local ok, hm = pcall(require, "NeoAI.core.history_manager")
   if not ok or not hm.is_initialized() then
     return {}
   end
-  return hm.get_tree() or {}
+  -- 改为使用 list_sessions 重建树
+  return rebuild_tree_from_list()
 end
 
 --- 打开树窗口
@@ -178,13 +280,118 @@ function M.render_tree()
   end
 end
 
+--- 将原始会话树转换为带虚拟节点的显示树
+--- 规则：
+--- 1. 根会话 → 虚拟文件夹节点（📂 会话名），包含该会话的所有轮次和子会话
+--- 2. 子会话的轮次直接扁平化到文件夹下（不创建中间会话节点）
+--- 3. 只有当一个子会话有多个子会话（分支）时，才创建分支节点
+local function build_display_tree(raw_tree)
+  local display_tree = {}
+
+  -- 收集一个会话节点及其所有后代的轮次
+  local function collect_all_rounds(session_node)
+    local rounds = {}
+    if session_node.round_text and session_node.round_text ~= "" then
+      table.insert(rounds, {
+        id = session_node.id .. "_round",
+        session_id = session_node.session_id,
+        name = session_node.round_text,
+        is_round = true,
+        children = {},
+      })
+    end
+    for _, child in ipairs(session_node.children or {}) do
+      local child_rounds = collect_all_rounds(child)
+      for _, r in ipairs(child_rounds) do
+        table.insert(rounds, r)
+      end
+    end
+    return rounds
+  end
+
+  local function flatten_rounds(session_node, collected)
+    -- 收集当前会话的轮次
+    if session_node.round_text and session_node.round_text ~= "" then
+      table.insert(collected, {
+        id = session_node.id .. "_round",
+        session_id = session_node.session_id,
+        name = session_node.round_text,
+        is_round = true,
+        children = {},
+      })
+    end
+    -- 递归处理子会话
+    local child_ids = session_node.children or {}
+    if #child_ids == 1 then
+      -- 只有一个子会话：检查它是否有子会话
+      local only_child = child_ids[1]
+      if #(only_child.children or {}) > 0 then
+        -- 子会话有子会话：创建分支节点
+        local branch_rounds = collect_all_rounds(only_child)
+        if #branch_rounds > 0 then
+          table.insert(collected, {
+            id = "__branch_" .. only_child.id,
+            name = "分支",
+            is_virtual = true,
+            round_count = #branch_rounds,
+            children = branch_rounds,
+          })
+        end
+      else
+        -- 子会话没有子会话：链式扁平化
+        flatten_rounds(only_child, collected)
+      end
+    elseif #child_ids > 1 then
+      -- 多个子会话：分别处理每个子会话
+      for _, child in ipairs(child_ids) do
+        if #(child.children or {}) > 0 then
+          -- 该子会话有子会话：创建分支节点
+          local branch_rounds = collect_all_rounds(child)
+          if #branch_rounds > 0 then
+            table.insert(collected, {
+              id = "__branch_" .. child.id,
+              name = "分支",
+              is_virtual = true,
+              round_count = #branch_rounds,
+              children = branch_rounds,
+            })
+          end
+        else
+          -- 该子会话没有子会话：直接收集轮次（扁平化）
+          flatten_rounds(child, collected)
+        end
+      end
+    end
+  end
+
+  for _, root in ipairs(raw_tree) do
+    local root_children = {}
+    flatten_rounds(root, root_children)
+    if #root_children > 0 then
+      table.insert(display_tree, {
+        id = "__folder_" .. root.id,
+        session_id = root.session_id,
+        name = root.name,
+        is_virtual = true,
+        round_count = #root_children,
+        children = root_children,
+      })
+    end
+  end
+
+  return display_tree
+end
+
 --- 构建显示内容
 function M._build_display_content()
   local content = {}
   table.insert(content, "=== NeoAI 会话树 ===")
   table.insert(content, "")
 
-  if #state.tree_data == 0 then
+  -- 将原始树转换为带虚拟节点的显示树
+  local display_tree = build_display_tree(state.tree_data)
+
+  if #display_tree == 0 then
     table.insert(content, "暂无会话")
     table.insert(content, "按 N 创建新会话")
   else
@@ -210,20 +417,23 @@ function M._build_display_content()
       end
 
       if node.children and #node.children > 0 then
-        local child_prefix
-        if depth == 0 then
-          child_prefix = is_last and "    " or "│   "
-        else
-          child_prefix = line_prefix .. (is_last and "    " or "│   ")
-        end
         for i, child in ipairs(node.children) do
+          local child_prefix
+          if node.is_virtual and depth > 0 then
+            -- 非根虚拟节点（分支）的子节点：始终显示垂直线
+            child_prefix = line_prefix .. "│   "
+          elseif depth == 0 then
+            child_prefix = is_last and "    " or "│   "
+          else
+            child_prefix = line_prefix .. (is_last and "    " or "│   ")
+          end
           render_node(child, depth + 1, i == #node.children, child_prefix)
         end
       end
     end
 
-    for i, root in ipairs(state.tree_data) do
-      render_node(root, 0, i == #state.tree_data, "")
+    for i, root in ipairs(display_tree) do
+      render_node(root, 0, i == #display_tree, "")
     end
   end
 
@@ -250,7 +460,8 @@ function M._build_line_to_session_map()
     end
   end
 
-  for _, root in ipairs(state.tree_data) do
+  local display_tree = build_display_tree(state.tree_data)
+  for _, root in ipairs(display_tree) do
     traverse(root)
   end
 

@@ -24,7 +24,101 @@ function M._load_tree_data()
     state.tree_data = {}
     return
   end
-  state.tree_data = history_mgr.get_tree() or {}
+
+  -- 使用 list_sessions 获取扁平列表，再通过 get_session 重建树
+  local sessions = history_mgr.list_sessions() or {}
+  if #sessions == 0 then
+    state.tree_data = {}
+    return
+  end
+
+  -- 构建 id -> 完整会话 映射
+  local session_map = {}
+  for _, s in ipairs(sessions) do
+    local full = history_mgr.get_session(s.id)
+    if full then
+      session_map[s.id] = full
+    end
+  end
+
+  -- 构建轮次预览
+  local function build_round_text(session)
+    if not session then return "" end
+    local text = ""
+    if session.user and session.user ~= "" then
+      local user_preview = session.user:gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
+      if #user_preview > 20 then
+        user_preview = user_preview:sub(1, 20) .. "…"
+      end
+      text = "👤" .. user_preview
+    end
+    if session.assistant and (
+      (type(session.assistant) == "table" and #session.assistant > 0)
+      or (type(session.assistant) == "string" and session.assistant ~= "")
+    ) then
+      local ai_text = ""
+      local last_entry = session.assistant
+      if type(session.assistant) == "table" and #session.assistant > 0 then
+        last_entry = session.assistant[#session.assistant]
+      end
+      local ok2, parsed = pcall(vim.json.decode, last_entry)
+      if ok2 and type(parsed) == "table" and parsed.content then
+        ai_text = parsed.content
+      elseif type(last_entry) == "string" then
+        ai_text = last_entry
+      end
+      local ai_preview = ai_text:gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
+      if #ai_preview > 20 then
+        ai_preview = ai_preview:sub(1, 20) .. "…"
+      end
+      if text ~= "" then
+        text = text .. " | 🤖" .. ai_preview
+      else
+        text = "🤖" .. ai_preview
+      end
+    end
+    return text
+  end
+
+  -- 递归构建树节点
+  local function build_node(session)
+    if not session then return nil end
+    local round_text = build_round_text(session)
+    local node = {
+      id = session.id,
+      session_id = session.id,
+      name = session.name or "未命名",
+      round_text = round_text,
+      children = {},
+    }
+    for _, cid in ipairs(session.child_ids or {}) do
+      local child = session_map[cid]
+      if child then
+        local child_node = build_node(child)
+        if child_node then
+          table.insert(node.children, child_node)
+        end
+      end
+    end
+    return node
+  end
+
+  -- 只取根会话
+  local tree = {}
+  for _, s in ipairs(sessions) do
+    if s.is_root then
+      local full = session_map[s.id]
+      if full then
+        local node = build_node(full)
+        if node then
+          table.insert(tree, node)
+        end
+      end
+    end
+  end
+
+  state.tree_data = tree
+
   local function expand_all(nodes)
     for _, node in ipairs(nodes) do
       state.expanded_nodes[node.id] = true

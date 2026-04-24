@@ -557,70 +557,33 @@ local function make_round_node(session, round_text)
 end
 
 --- 获取树结构（用于渲染）
---- 树结构规则：
---- 1. 根会话 → 虚拟文件夹节点（📂 会话名），包含该会话的所有轮次
---- 2. 子会话的轮次直接扁平化到根文件夹下（不创建中间会话节点）
---- 3. 只有当一个子会话有多个子会话（分支）时，才创建分支节点
+--- 返回原始会话树形结构，不创建虚拟节点
+--- 每个节点包含：id, session_id, name, children, round_text
 function M.get_tree()
   M.cleanup_orphans()
   local roots = M.get_root_sessions()
 
-  local function collect_rounds(session, collected)
-    -- 收集当前会话的轮次
+  local function build_session_node(session)
     local round_text = build_round_text(session)
-    if round_text ~= "" then
-      table.insert(collected, make_round_node(session, round_text))
-    end
-    -- 递归收集子会话的轮次
-    local child_ids = session.child_ids or {}
-    if #child_ids == 1 then
-      -- 只有一个子会话：链式扁平化，直接收集子会话的轮次
-      local child = state.sessions[child_ids[1]]
+    local node = {
+      id = session.id,
+      session_id = session.id,
+      name = session.name,
+      round_text = round_text,
+      children = {},
+    }
+    for _, cid in ipairs(session.child_ids or {}) do
+      local child = state.sessions[cid]
       if child then
-        collect_rounds(child, collected)
-      end
-    elseif #child_ids > 1 then
-      -- 多个子会话：创建分支节点
-      local branch_children = {}
-      for _, cid in ipairs(child_ids) do
-        local child = state.sessions[cid]
-        if child then
-          local child_rounds = {}
-          collect_rounds(child, child_rounds)
-          for _, r in ipairs(child_rounds) do
-            table.insert(branch_children, r)
-          end
-        end
-      end
-      if #branch_children > 0 then
-        local branch_node = {
-          id = "__branch_" .. session.id,
-          name = "分支",
-          is_virtual = true,
-          round_count = #branch_children,
-          children = branch_children,
-        }
-        table.insert(collected, branch_node)
+        table.insert(node.children, build_session_node(child))
       end
     end
+    return node
   end
 
   local tree = {}
   for _, root in ipairs(roots) do
-    local root_children = {}
-    collect_rounds(root, root_children)
-
-    if #root_children > 0 then
-      local folder_node = {
-        id = "__folder_" .. root.id,
-        session_id = root.id,
-        name = root.name,
-        is_virtual = true,
-        round_count = #root_children,
-        children = root_children,
-      }
-      table.insert(tree, folder_node)
-    end
+    table.insert(tree, build_session_node(root))
   end
   return tree
 end
