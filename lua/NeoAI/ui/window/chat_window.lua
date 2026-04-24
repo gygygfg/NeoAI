@@ -311,6 +311,11 @@ function M._do_render_chat()
             end, 10)
           end
 
+          -- 延迟执行滚动，确保在 set_window_content 内部的折叠刷新之后
+          vim.defer_fn(function()
+            M._scroll_to_end_with_offset()
+          end, 50)
+
           -- 触发渲染完成事件
           vim.api.nvim_exec_autocmds(
             "User",
@@ -1038,7 +1043,10 @@ end
 
 --- 将光标移动到缓冲区末尾（最新消息位置）
 --- 在渲染完成后调用，方便用户查看最新输出
-function M._move_cursor_to_end()
+--- 滚动到缓冲区末尾，使最后一行位于窗口底部上方指定行数处
+--- @param offset number|nil 距离底部的行数偏移，默认15
+function M._scroll_to_end_with_offset(offset)
+  offset = offset or 15
   if not state.current_window_id then
     return
   end
@@ -1053,16 +1061,22 @@ function M._move_cursor_to_end()
     return
   end
 
-  -- 获取缓冲区行数
   local line_count = vim.api.nvim_buf_line_count(buf)
   if line_count > 0 then
-    -- 将光标定位到最后一行
     pcall(vim.api.nvim_win_set_cursor, win_handle, { line_count, 0 })
-    -- 滚动到光标位置
     pcall(vim.api.nvim_win_call, win_handle, function()
-      vim.cmd("normal! zb")
+      vim.cmd('normal! zb')
+      if offset > 0 then
+        vim.cmd(string.format('normal! %d<C-y>', offset))
+      end
     end)
   end
+end
+
+--- 将光标移动到缓冲区末尾（最新消息位置）
+--- 在渲染完成后调用，方便用户查看最新输出
+function M._move_cursor_to_end()
+  M._scroll_to_end_with_offset()
 end
 
 --- 显示悬浮文本
@@ -1652,14 +1666,8 @@ function M._append_stream_chunk_to_buffer(chunk_content, content_type)
   -- 不恢复只读（内联输入模式需要保持可修改）
   pcall(vim.api.nvim_set_option_value, "modified", false, { buf = buf })
 
-  -- 滚动到底部显示最新内容
-  local win_handle = window_manager.get_window_win(state.current_window_id)
-  if win_handle and vim.api.nvim_win_is_valid(win_handle) then
-    local new_line_count = vim.api.nvim_buf_line_count(buf)
-    if new_line_count > 0 then
-      pcall(vim.api.nvim_win_set_cursor, win_handle, { new_line_count, 0 })
-    end
-  end
+  -- 滚动使最后一行位于窗口底部上方10行处
+  M._scroll_to_end_with_offset()
 end
 
 --- 完成流式渲染

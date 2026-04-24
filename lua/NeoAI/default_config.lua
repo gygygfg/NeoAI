@@ -29,6 +29,12 @@ local DEFAULT_CONFIG = {
       border = "FloatBorder",
       text = "Normal",
     },
+    tree = {
+      foldenable = false,
+      foldmethod = "manual",
+      foldcolumn = "0",
+      foldlevel = 99,
+    },
   },
   -- 键位配置
   keymaps = {

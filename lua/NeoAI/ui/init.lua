@@ -82,7 +82,7 @@ function M.initialize(config)
   -- 传递完整配置给聊天窗口，确保虚拟输入框能访问键位配置
   chat_window.initialize(state.config)
 
-  tree_handlers.initialize(state.config.handlers or {})
+  tree_handlers.initialize(state.config)
   chat_handlers.initialize(state.config.handlers or {})
 
   -- 注册事件监听器

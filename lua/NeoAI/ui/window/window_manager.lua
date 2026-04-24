@@ -4,6 +4,9 @@ local M = {}
 local windows = {}
 local window_counter = 0
 
+-- 悬浮窗口存储 { [main_buf] = { win_id, buf_id, visible } }
+local float_windows = {}
+
 -- 模块状态
 local state = {
   initialized = false,
@@ -455,6 +458,54 @@ function M.create_window(window_type, options)
   -- 设置缓冲区名称，使其能在 :ls 命令中显示
   local buffer_name = "neoai://" .. window_type .. "/" .. window_id
   vim.api.nvim_buf_set_name(window_info.buf, buffer_name)
+
+  -- 为 chat 和 tree 类型窗口注册 BufLeave/BufEnter 自动命令，管理悬浮窗口
+  if window_type == "chat" or window_type == "tree" then
+    local buf = window_info.buf
+    local augroup = "NeoAIFloatWindow_" .. window_id
+    pcall(vim.api.nvim_del_augroup_by_name, augroup)
+    local group = vim.api.nvim_create_augroup(augroup, { clear = true })
+
+    -- BufLeave：延迟检测新 buffer，确认不是悬浮窗口才隐藏
+    vim.api.nvim_create_autocmd("BufLeave", {
+      group = group,
+      buffer = buf,
+      callback = function()
+        vim.defer_fn(function()
+          -- 延迟后检查当前聚焦的 buffer 是否是悬浮窗口
+          local current_buf = vim.api.nvim_get_current_buf()
+          if current_buf and vim.api.nvim_buf_is_valid(current_buf) then
+            local ok, is_float = pcall(vim.api.nvim_buf_get_var, current_buf, "neoai_float_window")
+            if ok and is_float then
+              -- 当前 buffer 是悬浮窗口，不隐藏
+              return
+            end
+          end
+          M.hide_float_window(buf)
+        end, 50)
+      end,
+      desc = "隐藏 " .. window_type .. " 悬浮窗口",
+    })
+
+    -- BufEnter：重新进入 buffer 时显示悬浮窗口并刷新内容
+    vim.api.nvim_create_autocmd("BufEnter", {
+      group = group,
+      buffer = buf,
+      callback = function()
+        M.show_float_window(buf)
+        -- 触发对应窗口模块刷新悬浮内容
+        if window_type == "tree" then
+          local ok, tw = pcall(require, "NeoAI.ui.window.tree_window")
+          if ok and tw and tw.update_float_window then
+            tw.update_float_window()
+          end
+        elseif window_type == "chat" then
+          -- chat 的悬浮文本由 show_floating_text 管理，不需要额外刷新
+        end
+      end,
+      desc = "显示 " .. window_type .. " 悬浮窗口",
+    })
+  end
 
   -- 触发窗口创建事件
   local event_name = "NeoAI:" .. window_type .. "_window_opened"
@@ -1081,6 +1132,77 @@ function M._get_node_name_by_id(node_id, tree_data)
   end
 
   return search_node(tree_data)
+end
+
+--- 注册悬浮窗口
+--- 供 tree_window/chat_window 在创建悬浮窗口时调用
+--- @param main_buf number 主窗口的 buffer 句柄
+--- @param float_win_id number 悬浮窗口的 window 句柄
+--- @param float_buf_id number 悬浮窗口的 buffer 句柄
+function M.register_float_window(main_buf, float_win_id, float_buf_id)
+  float_windows[main_buf] = {
+    win_id = float_win_id,
+    buf_id = float_buf_id,
+    visible = true,
+  }
+  -- 给悬浮窗口 buffer 打标记
+  if float_buf_id and vim.api.nvim_buf_is_valid(float_buf_id) then
+    vim.api.nvim_buf_set_var(float_buf_id, "neoai_float_window", true)
+  end
+end
+
+--- 显示悬浮窗口
+--- @param main_buf number 主窗口的 buffer 句柄
+function M.show_float_window(main_buf)
+  local fw = float_windows[main_buf]
+  if not fw or fw.visible then
+    return
+  end
+  if fw.win_id and vim.api.nvim_win_is_valid(fw.win_id) then
+    -- 恢复保存的窗口配置
+    if fw.saved_config then
+      pcall(vim.api.nvim_win_set_config, fw.win_id, fw.saved_config)
+    end
+    fw.visible = true
+  end
+end
+
+--- 隐藏悬浮窗口
+--- @param main_buf number 主窗口的 buffer 句柄
+function M.hide_float_window(main_buf)
+  local fw = float_windows[main_buf]
+  if not fw or not fw.visible then
+    return
+  end
+  if fw.win_id and vim.api.nvim_win_is_valid(fw.win_id) then
+    -- 保存当前窗口配置
+    fw.saved_config = vim.api.nvim_win_get_config(fw.win_id)
+    -- 将悬浮窗口移出屏幕，而不是关闭（保留状态以便重新显示）
+    vim.api.nvim_win_set_config(fw.win_id, {
+      relative = "editor",
+      row = -1000,
+      col = -1000,
+      width = 1,
+      height = 1,
+    })
+    fw.visible = false
+  end
+end
+
+--- 注销悬浮窗口
+--- @param main_buf number 主窗口的 buffer 句柄
+function M.unregister_float_window(main_buf)
+  local fw = float_windows[main_buf]
+  if not fw then
+    return
+  end
+  if fw.win_id and vim.api.nvim_win_is_valid(fw.win_id) then
+    vim.api.nvim_win_close(fw.win_id, true)
+  end
+  if fw.buf_id and vim.api.nvim_buf_is_valid(fw.buf_id) then
+    vim.api.nvim_buf_delete(fw.buf_id, { force = true })
+  end
+  float_windows[main_buf] = nil
 end
 
 return M

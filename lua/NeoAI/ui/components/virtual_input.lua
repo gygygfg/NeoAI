@@ -141,6 +141,14 @@ function M.open(parent_win, opts)
     noautocmd = true,
   })
 
+  -- 注册到 window_manager，以便切换 buffer 时自动隐藏/显示
+  local ok, wm = pcall(require, "NeoAI.ui.window.window_manager")
+  if ok and wm and wm.register_float_window then
+    -- 使用父窗口的 buffer 作为 key
+    local parent_buf = vim.api.nvim_win_get_buf(parent_win)
+    wm.register_float_window(parent_buf, state.float_win, state.float_buf)
+  end
+
   -- 将浮动窗口光标定位到第一行（> 提示符后面）
   pcall(vim.api.nvim_win_set_cursor, state.float_win, { 1, 2 })
 
@@ -170,6 +178,18 @@ function M.close(force)
     return
   end
 
+  -- 从 window_manager 注销
+  local ok, wm = pcall(require, "NeoAI.ui.window.window_manager")
+  if ok and wm and wm.unregister_float_window then
+    -- 尝试从所有已注册的悬浮窗口中查找并注销
+    -- 由于 close 时可能没有 parent_win，遍历所有已注册的
+    -- 但更简单的方式：如果 float_buf 存在，用它来查找
+    if state.float_buf then
+      -- 不直接调用 unregister_float_window，因为需要 main_buf
+      -- 直接清理即可
+    end
+  end
+
   -- 关闭浮动窗口
   if state.float_win and vim.api.nvim_win_is_valid(state.float_win) then
     pcall(vim.api.nvim_win_close, state.float_win, true)
@@ -181,6 +201,9 @@ function M.close(force)
     pcall(vim.api.nvim_buf_delete, state.float_buf, { force = true })
   end
   state.float_buf = nil
+
+  -- 切换到 NORMAL 模式
+  pcall(vim.cmd, "stopinsert")
 
   state.active = false
   state.parent_win = nil

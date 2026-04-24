@@ -65,6 +65,18 @@ local function trigger_event(name, data)
   pcall(vim.api.nvim_exec_autocmds, "User", { pattern = name, data = data or {} })
 end
 
+--- 向 child_ids 添加唯一元素（去重）
+--- @param ids table child_ids 数组
+--- @param id string 要添加的ID
+local function add_unique_child(ids, id)
+  for _, existing in ipairs(ids) do
+    if existing == id then
+      return
+    end
+  end
+  table.insert(ids, id)
+end
+
 --- 生成会话ID
 local function generate_id()
   local max_num = 0
@@ -192,7 +204,7 @@ function M.create_session(name, is_root, parent_id)
     state.sessions[parent_id].updated_at = os.time()
   end
   state.current_session_id = id
-  debounce_save()
+  -- 不在创建时保存，等 add_round（会话完成一轮对话）时才保存
   trigger_event("NeoAI:session_created", { session_id = id, session = session })
   return id
 end
@@ -233,34 +245,56 @@ function M.get_or_create_current_session(name)
 end
 
 --- 删除会话
+--- 删除会话时，将其 child_ids 上提到父节点下，而不是删除子会话
+--- 确保 child_ids 元素唯一
 function M.delete_session(session_id)
   local session = state.sessions[session_id]
   if not session then
     return false
   end
+
+  -- 找到父节点，将被删除会话的子会话上提到父节点下
+  local parent_id = nil
   for _, s in pairs(state.sessions) do
     for i, cid in ipairs(s.child_ids) do
       if cid == session_id then
+        parent_id = s.id
         table.remove(s.child_ids, i)
         s.updated_at = os.time()
         break
       end
     end
+    if parent_id then
+      break
+    end
   end
-  local function delete_children(ids)
-    for _, cid in ipairs(ids) do
-      local child = state.sessions[cid]
+
+  -- 将被删除会话的子会话上提到父节点下
+  if parent_id and state.sessions[parent_id] then
+    for _, child_id in ipairs(session.child_ids or {}) do
+      local child = state.sessions[child_id]
       if child then
-        delete_children(child.child_ids or {})
-        state.sessions[cid] = nil
+        child.is_root = false
+        add_unique_child(state.sessions[parent_id].child_ids, child_id)
+      end
+    end
+    state.sessions[parent_id].updated_at = os.time()
+  elseif not parent_id then
+    -- 没有父节点（根节点被删除），子会话提升为根会话
+    for _, child_id in ipairs(session.child_ids or {}) do
+      local child = state.sessions[child_id]
+      if child then
+        child.is_root = true
       end
     end
   end
-  delete_children(session.child_ids or {})
+
+  -- 删除会话本身
   state.sessions[session_id] = nil
   if state.current_session_id == session_id then
     state.current_session_id = nil
   end
+
   debounce_save()
   trigger_event("NeoAI:session_deleted", { session_id = session_id })
   return true
@@ -579,6 +613,7 @@ function M.get_tree()
     if #root_children > 0 then
       local folder_node = {
         id = "__folder_" .. root.id,
+        session_id = root.id,
         name = root.name,
         is_virtual = true,
         round_count = #root_children,
@@ -625,10 +660,43 @@ function M.get_context_and_new_parent(session_id)
     end
   end
 
-  -- 新会话挂在当前会话下
-  local new_parent_id = session_id
+  -- 确定新会话应该挂在哪个会话下
+  -- 规则：从选中会话沿子会话链向下走，找到链尾或分支点
+  -- - 如果选中会话有唯一子会话链，则沿链向下找到链尾作为 new_parent_id
+  -- - 如果选中会话有多个子会话（分支点），则选中会话本身作为分支点
+  -- - 如果选中会话无子会话（链尾），则选中会话本身作为 new_parent_id
+  local new_parent_id = M._find_chain_tail_or_branch(session_id)
 
   return context_msgs, new_parent_id
+end
+
+--- 沿子会话链向下找到链尾或分支点
+--- @param session_id string 起始会话ID
+--- @return string 链尾或分支点的会话ID
+function M._find_chain_tail_or_branch(session_id)
+  local current = state.sessions[session_id]
+  if not current then
+    return session_id
+  end
+
+  for _ = 1, 100 do
+    local child_ids = current.child_ids or {}
+    if #child_ids == 0 then
+      -- 无子会话：当前节点就是链尾
+      return current.id
+    elseif #child_ids == 1 then
+      -- 唯一子会话：继续沿链向下
+      current = state.sessions[child_ids[1]]
+      if not current then
+        return session_id
+      end
+    else
+      -- 多个子会话：当前节点就是分支点
+      return current.id
+    end
+  end
+
+  return current and current.id or session_id
 end
 
 --- 查找某个会话的父会话ID
@@ -643,6 +711,106 @@ function M.find_parent_session(session_id)
     end
   end
   return nil
+end
+
+--- 向上查找最近的父分支节点
+--- 分支节点定义为 child_ids >= 2 的节点
+--- 如果找到根节点仍未找到分支节点，则返回根节点
+--- @param session_id string 起始会话ID
+--- @return string|nil 分支节点ID，nil表示无父节点（本身就是根）
+function M.find_nearest_branch_parent(session_id)
+  local current_id = session_id
+  local branch_parent_id = nil
+
+  for _ = 1, 100 do
+    local parent_id = M.find_parent_session(current_id)
+    if not parent_id then
+      -- 已到根节点，没有父节点
+      break
+    end
+    local parent = state.sessions[parent_id]
+    if parent and #(parent.child_ids or {}) >= 2 then
+      -- 找到分支节点
+      branch_parent_id = parent_id
+      break
+    end
+    current_id = parent_id
+  end
+
+  return branch_parent_id
+end
+
+--- 删除从分支节点到选中节点的整条链
+--- 从选中节点向上回溯到分支节点（不含分支节点本身），删除路径上的所有会话
+--- 如果选中节点本身就是根节点（无父节点），则删除整个根会话
+--- @param session_id string 选中会话ID
+--- @return boolean 是否成功
+function M.delete_chain_to_branch(session_id)
+  local session = state.sessions[session_id]
+  if not session then
+    return false
+  end
+
+  -- 找到最近的父分支节点
+  local branch_parent_id = M.find_nearest_branch_parent(session_id)
+
+  if not branch_parent_id then
+    -- 没有父节点，说明选中节点是根节点，直接删除整个根会话
+    return M.delete_session(session_id)
+  end
+
+  -- 从选中节点向上回溯到分支节点，收集路径上的所有会话ID（不含分支节点本身）
+  local chain_ids = {}
+  local current_id = session_id
+  for _ = 1, 100 do
+    if current_id == branch_parent_id then
+      break
+    end
+    table.insert(chain_ids, current_id)
+    local parent_id = M.find_parent_session(current_id)
+    if not parent_id then
+      break
+    end
+    current_id = parent_id
+  end
+
+  -- 从分支节点的 child_ids 中移除链首节点
+  local branch_parent = state.sessions[branch_parent_id]
+  if branch_parent then
+    local chain_head_id = chain_ids[#chain_ids] -- 链中离分支节点最近的节点
+    for i, cid in ipairs(branch_parent.child_ids or {}) do
+      if cid == chain_head_id then
+        table.remove(branch_parent.child_ids, i)
+        branch_parent.updated_at = os.time()
+        break
+      end
+    end
+  end
+
+  -- 删除链上的所有会话（从叶子到根方向删除）
+  -- 每个被删除会话的子会话上提到分支节点下
+  for _, cid in ipairs(chain_ids) do
+    local s = state.sessions[cid]
+    if s then
+      -- 将被删除会话的子会话上提到分支节点下
+      for _, child_id in ipairs(s.child_ids or {}) do
+        local child = state.sessions[child_id]
+        if child then
+          child.is_root = false
+          add_unique_child(branch_parent.child_ids, child_id)
+        end
+      end
+      -- 删除会话
+      state.sessions[cid] = nil
+      if state.current_session_id == cid then
+        state.current_session_id = nil
+      end
+    end
+  end
+
+  debounce_save()
+  trigger_event("NeoAI:session_deleted", { session_id = session_id })
+  return true
 end
 
 --- 检查是否已初始化

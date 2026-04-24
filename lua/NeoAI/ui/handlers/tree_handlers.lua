@@ -126,13 +126,61 @@ function M.handle_d()
     vim.notify("会话不存在", vim.log.levels.WARN)
     return
   end
-  local confirm =
-    vim.fn.confirm("确定要删除 '" .. session.name .. "' 吗？\n子会话也会被删除！", "&Yes\n&No", 2)
+  hm.delete_session(session_id)
+  vim.notify("已删除会话: " .. session.name, vim.log.levels.INFO)
+  -- 刷新树窗口
+  local tree_window = require("NeoAI.ui.window.tree_window")
+  tree_window.refresh_tree()
+end
+
+--- 处理 D 键：删除整条对话链
+--- 找到选中节点的最近父分支节点，删除从分支点到选中节点的整条链
+function M.handle_D()
+  if not state.initialized then
+    return
+  end
+  local session_id = get_selected_session_id()
+  if not session_id then
+    vim.notify("未选中任何会话节点", vim.log.levels.WARN)
+    return
+  end
+  local hm = get_hm()
+  if not hm then
+    return
+  end
+  local session = hm.get_session(session_id)
+  if not session then
+    vim.notify("会话不存在", vim.log.levels.WARN)
+    return
+  end
+
+  -- 查找最近的父分支节点
+  local branch_parent_id = hm.find_nearest_branch_parent(session_id)
+
+  -- 构建确认信息
+  local confirm_msg
+  if not branch_parent_id then
+    -- 无父节点，删除整个根会话
+    confirm_msg = "确定要删除根会话 '" .. session.name .. "' 及其所有子会话吗？"
+  else
+    local branch_parent = hm.get_session(branch_parent_id)
+    local branch_name = branch_parent and branch_parent.name or branch_parent_id
+    confirm_msg = "确定要删除从分支 '" .. branch_name .. "' 到 '" .. session.name .. "' 的整条对话链吗？"
+  end
+
+  local confirm = vim.fn.confirm(confirm_msg, "&Yes\n&No", 2)
   if confirm ~= 1 then
     return
   end
-  hm.delete_session(session_id)
-  vim.notify("已删除会话", vim.log.levels.INFO)
+
+  -- 删除整条链
+  local ok = hm.delete_chain_to_branch(session_id)
+  if ok then
+    vim.notify("已删除对话链", vim.log.levels.INFO)
+  else
+    vim.notify("删除失败", vim.log.levels.ERROR)
+  end
+
   -- 刷新树窗口
   local tree_window = require("NeoAI.ui.window.tree_window")
   tree_window.refresh_tree()
@@ -157,6 +205,7 @@ function M.handle_key(key)
     ["n"] = M.handle_n,
     ["N"] = M.handle_N,
     ["d"] = M.handle_d,
+    ["D"] = M.handle_D,
   }
   local handler = handlers[key]
   if handler then

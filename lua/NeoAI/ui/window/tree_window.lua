@@ -65,10 +65,17 @@ function M.open(session_id, window_id)
   local buf = window_manager.get_window_buf(window_id)
   local win_handle = window_manager.get_window_win(window_id)
 
+  -- 应用折叠配置
+  local tree_config = (state.config.ui or {}).tree or {}
+
   if buf then
     vim.api.nvim_set_option_value("filetype", "markdown", { buf = buf })
+    vim.api.nvim_set_option_value("foldmethod", tree_config.foldmethod or "manual", { win = win_handle })
+    vim.api.nvim_set_option_value("foldcolumn", tree_config.foldcolumn or "0", { win = win_handle })
+    vim.api.nvim_set_option_value("foldlevel", tree_config.foldlevel or 99, { win = win_handle })
   end
   if win_handle then
+    vim.api.nvim_set_option_value("foldenable", tree_config.foldenable ~= false, { win = win_handle })
     vim.api.nvim_set_option_value("wrap", false, { win = win_handle })
     vim.api.nvim_set_option_value("linebreak", false, { win = win_handle })
     vim.api.nvim_set_option_value("cursorline", true, { win = win_handle })
@@ -285,6 +292,7 @@ function M.set_keymaps(keymap_manager)
     new_child = (tree_config.new_child or {}).key or "n",
     new_root = (tree_config.new_root or {}).key or "N",
     delete = (tree_config.delete_dialog or {}).key or "d",
+    delete_branch = (tree_config.delete_branch or {}).key or "D",
     quit = "q",
     refresh = "r",
   }
@@ -298,6 +306,7 @@ function M.set_keymaps(keymap_manager)
     [keymaps.new_child] = function() handlers.handle_n() end,
     [keymaps.new_root] = function() handlers.handle_N() end,
     [keymaps.delete] = function() handlers.handle_d() end,
+    [keymaps.delete_branch] = function() handlers.handle_D() end,
     [keymaps.quit] = function() M.close() end,
     [keymaps.refresh] = function() M.refresh_tree() end,
   }
@@ -519,6 +528,9 @@ function M._update_float_window()
   local relative_col = main_width - float_width - 2
   local relative_row = 1
 
+  -- 获取主窗口的 buffer 句柄
+  local main_buf = window_manager.get_window_buf(state.current_window_id)
+
   if not state.float_win_id or not vim.api.nvim_win_is_valid(state.float_win_id) then
     state.float_buf_id = vim.api.nvim_create_buf(false, true)
     vim.api.nvim_set_option_value("buflisted", false, { buf = state.float_buf_id })
@@ -542,6 +554,11 @@ function M._update_float_window()
     vim.api.nvim_set_option_value("cursorline", false, { win = state.float_win_id })
     vim.api.nvim_set_option_value("number", false, { win = state.float_win_id })
     vim.api.nvim_set_option_value("signcolumn", "no", { win = state.float_win_id })
+
+    -- 注册到 window_manager，以便切换 buffer 时自动隐藏/显示
+    if main_buf then
+      window_manager.register_float_window(main_buf, state.float_win_id, state.float_buf_id)
+    end
   else
     vim.api.nvim_win_set_config(state.float_win_id, {
       relative = "win",
@@ -565,6 +582,11 @@ end
 
 --- 关闭悬浮窗口
 function M._close_float_window()
+  -- 从 window_manager 注销
+  local main_buf = state.current_window_id and window_manager.get_window_buf(state.current_window_id)
+  if main_buf then
+    window_manager.unregister_float_window(main_buf)
+  end
   if state.float_win_id and vim.api.nvim_win_is_valid(state.float_win_id) then
     vim.api.nvim_win_close(state.float_win_id, true)
     state.float_win_id = nil
