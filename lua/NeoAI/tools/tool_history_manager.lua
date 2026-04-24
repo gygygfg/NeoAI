@@ -184,32 +184,29 @@ function M._cleanup_sessions()
 end
 
 --- 导出所有会话历史到文件
+--- 委托给 core/history_manager 实现
 --- @param filepath string 导出文件路径
---- @return boolean 导出是否成功
---- @return string|nil 如果失败，返回错误信息
+--- @return boolean, string|nil 导出是否成功，错误信息
 function M.export_sessions(filepath)
-  -- 准备导出数据
+  local ok, hm = pcall(require, "NeoAI.core.history_manager")
+  if ok and hm.export_sessions then
+    return hm.export_sessions(filepath)
+  end
+  -- 回退：使用本地实现
   local data = {
-    sessions = state.sessions, -- 会话数据
-    config = state.config, -- 配置数据
-    export_time = os.time(), -- 导出时间戳
+    sessions = state.sessions,
+    config = state.config,
+    export_time = os.time(),
   }
-
-  -- 将数据转换为JSON格式
   local content = vim.json.encode(data)
-
-  -- 使用pcall安全地执行文件操作
   local success, err = pcall(function()
     local file = io.open(filepath, "w")
     if not file then
       error("无法打开文件: " .. filepath)
     end
-
     file:write(content)
     file:close()
   end)
-
-  -- 返回操作结果
   if success then
     return true
   else
@@ -218,40 +215,35 @@ function M.export_sessions(filepath)
 end
 
 --- 从文件导入会话历史
+--- 委托给 core/history_manager 实现
 --- @param filepath string 导入文件路径
---- @return boolean 导入是否成功
---- @return string|nil 如果失败，返回错误信息
+--- @return boolean, string|nil 导入是否成功，错误信息
 function M.import_sessions(filepath)
-  -- 使用pcall安全地读取和解析文件
+  local ok, hm = pcall(require, "NeoAI.core.history_manager")
+  if ok and hm.import_sessions then
+    return hm.import_sessions(filepath)
+  end
+  -- 回退：使用本地实现
   local success, data = pcall(function()
     local file = io.open(filepath, "r")
     if not file then
       error("无法打开文件: " .. filepath)
     end
-
     local content = file:read("*a")
     file:close()
     return vim.json.decode(content)
   end)
-
-  -- 如果文件读取或解析失败，返回错误
   if not success then
     return false, data
   end
-
-  -- 导入会话数据
   if data.sessions then
     state.sessions = data.sessions
   end
-
-  -- 导入配置数据（合并到现有配置）
   if data.config then
     for key, value in pairs(data.config) do
       state.config[key] = value
     end
   end
-
-  -- 导入成功
   return true, nil
 end
 

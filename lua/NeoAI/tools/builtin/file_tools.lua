@@ -1,79 +1,12 @@
 -- Lua文件操作工具模块
 -- 提供文件读取、写入、查找、搜索等常用功能
--- 修复了原代码中的逻辑错误，并添加了详细中文注释
+-- 复用 NeoAI.utils.file_utils 的底层实现
 local M = {}
 
--- 本地辅助函数区域 ------------------------------------------------------
-
--- 读取文件内容的本地函数
--- @param path string 文件路径
--- @return string|nil, string|nil 成功返回内容，失败返回nil和错误信息
-local function read_file_content(path)
-  -- 打开文件，使用只读模式
-  local file, err = io.open(path, "r")
-  if not file then
-    -- 修复：原代码此处有缩进问题，return语句提前返回
-    -- 现在正确返回nil和错误信息
-    return nil, err
-  end
-
-  -- 读取文件全部内容
-  local content = file:read("*a")
-
-  -- 关闭文件
-  file:close()
-
-  -- 返回读取到的内容
-  return content
-end
-
--- 写入文件内容的本地函数
--- @param path string 文件路径
--- @param content string 要写入的内容
--- @param append boolean 是否为追加模式，默认为false（覆盖模式）
--- @return boolean, string|nil 成功返回true，失败返回false和错误信息
-local function write_file_content(path, content, append)
-  -- 决定文件打开模式：追加或覆盖
-  local mode = append and "a" or "w"
-
-  -- 打开文件
-  local file, err = io.open(path, mode)
-  if not file then
-    -- 修复：返回false和错误信息，而不是直接返回false
-    return false, err
-  end
-
-  -- 写入内容
-  file:write(content)
-
-  -- 关闭文件
-  file:close()
-
-  -- 写入成功
-  return true
-end
-
--- 检查文件或目录是否存在
--- @param path string 文件或目录路径
--- @return boolean 是否存在
-local function file_exists(path)
-  local file = io.open(path, "r")
-  if file then
-    file:close()
-    return true
-  end
-  return false
-end
-
--- 创建目录（包括父目录）
--- @param path string 目录路径
--- @return boolean 是否创建成功
-local function create_directory(path)
-  -- 使用mkdir -p命令创建目录（包括不存在的父目录）
-  -- 2>/dev/null 将错误信息重定向到空设备，不显示
-  local cmd = 'mkdir -p "' .. path .. '" 2>/dev/null'
-  local result = os.execute(cmd)
-  return result == 0 or result == true
+-- 复用 file_utils 模块
+local function get_file_utils()
+  local ok, fu = pcall(require, "NeoAI.utils.file_utils")
+  return ok and fu or nil
 end
 
 -- 公开API函数区域 ------------------------------------------------------
@@ -87,14 +20,23 @@ function M.read_file(args)
     return "错误: 需要文件路径"
   end
 
-  local path = args.path
-  local content, error_msg = read_file_content(path)
-
-  if content then
-    return content
-  else
-    return "错误: " .. (error_msg or "无法读取文件")
+  local fu = get_file_utils()
+  if fu then
+    local content, err = fu.read_file(args.path)
+    if content then
+      return content
+    end
+    return "错误: " .. (err or "无法读取文件")
   end
+
+  -- 回退：直接读取
+  local file, err = io.open(args.path, "r")
+  if not file then
+    return "错误: " .. (err or "无法读取文件")
+  end
+  local content = file:read("*a")
+  file:close()
+  return content
 end
 
 --- 写入文件内容
@@ -106,14 +48,21 @@ function M.write_file(args)
     return false
   end
 
-  local path = args.path
-  local content = args.content
-  local append = args.append or false -- 默认为覆盖模式
+  local fu = get_file_utils()
+  if fu then
+    local ok, _ = fu.write_file(args.path, args.content, args.append or false)
+    return ok == true
+  end
 
-  local success, error_msg = write_file_content(path, content, append)
-
-  -- 返回写入结果
-  return success
+  -- 回退：直接写入
+  local mode = args.append and "a" or "w"
+  local file, err = io.open(args.path, mode)
+  if not file then
+    return false
+  end
+  file:write(args.content)
+  file:close()
+  return true
 end
 
 --- 列出目录中的文件
@@ -208,7 +157,16 @@ function M.file_exists(args)
   if not args or not args.path then
     return false
   end
-  return file_exists(args.path)
+  local fu = get_file_utils()
+  if fu then
+    return fu.exists(args.path)
+  end
+  local file = io.open(args.path, "r")
+  if file then
+    file:close()
+    return true
+  end
+  return false
 end
 
 --- 创建目录
@@ -219,18 +177,16 @@ function M.create_directory(args)
     return false
   end
 
-  local path = args.path
-  local parents = args.parents ~= false -- 默认为true，创建父目录
-
-  if parents then
-    -- 创建目录（包括父目录）
-    return create_directory(path)
-  else
-    -- 只创建最后一级目录（父目录必须存在）
-    local cmd = 'mkdir "' .. path .. '" 2>/dev/null'
-    local result = os.execute(cmd)
-    return result == 0 or result == true
+  local fu = get_file_utils()
+  if fu then
+    local ok, _ = fu.mkdir(args.path)
+    return ok == true
   end
+
+  -- 回退：直接创建
+  local cmd = 'mkdir -p "' .. args.path .. '" 2>/dev/null'
+  local result = os.execute(cmd)
+  return result == 0 or result == true
 end
 
 --- 获取所有可用的文件操作工具
@@ -425,7 +381,56 @@ function M.get_tools()
         write = true,
       },
     },
+    {
+      name = "ensure_dir",
+      description = "确保目录存在，如果不存在则创建",
+      func = M.ensure_dir,
+      parameters = {
+        type = "object",
+        properties = {
+          path = {
+            type = "string",
+            description = "目录路径",
+          },
+          parents = {
+            type = "boolean",
+            description = "是否创建父目录",
+            default = true,
+          },
+        },
+        required = { "path" },
+      },
+      returns = {
+        type = "boolean",
+        description = "是否成功",
+      },
+      category = "file",
+      permissions = {
+        write = true,
+      },
+    },
   }
+end
+
+--- 确保目录存在（从 file_utils_tools.lua 合并）
+--- @param args table|nil 参数
+--- @return boolean 是否成功
+function M.ensure_dir(args)
+  if not args or not args.path then
+    return false
+  end
+
+  local fu = get_file_utils()
+  if fu then
+    local ok, _ = fu.mkdir(args.path)
+    return ok == true
+  end
+
+  -- 回退：直接创建
+  local path = args.path:gsub("/+$", "")
+  local cmd = 'mkdir -p "' .. path .. '" 2>/dev/null'
+  local result = os.execute(cmd)
+  return result == 0 or result == true
 end
 
 -- 模块测试用例 ------------------------------------------------------

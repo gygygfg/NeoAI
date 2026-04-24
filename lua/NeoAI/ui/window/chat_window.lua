@@ -3,7 +3,6 @@ local MODULE_NAME = "NeoAI.ui.window.chat_window"
 
 local window_manager = require("NeoAI.ui.window.window_manager")
 local virtual_input = require("NeoAI.ui.components.virtual_input") -- 内联输入模式
-local session_helper = require("NeoAI.utils.session_helper")
 
 -- 模块状态
 local state = {
@@ -39,9 +38,6 @@ function M.initialize(config)
 
   -- 初始化虚拟输入组件
   virtual_input.initialize(config)
-
-  -- 初始化会话辅助模块
-  session_helper.initialize(config)
 
   -- 注册AI响应事件监听器
   M._setup_event_listeners()

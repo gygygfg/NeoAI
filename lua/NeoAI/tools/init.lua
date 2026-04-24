@@ -243,15 +243,6 @@ function M._load_builtin_tools()
     end
   end
 
-  -- 加载文件工具（确保目录存在）
-  local file_utils_tools = require("NeoAI.tools.builtin.file_utils_tools")
-  if file_utils_tools and file_utils_tools.get_tools then
-    local tools = file_utils_tools.get_tools()
-    for _, tool in ipairs(tools) do
-      M.register_tool(tool)
-    end
-  end
-
   -- 加载日志工具
   local log_tools = require("NeoAI.tools.builtin.log_tools")
   if log_tools and log_tools.get_tools then

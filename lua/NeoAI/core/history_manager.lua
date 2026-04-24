@@ -794,4 +794,63 @@ function M._test_reset()
   end
 end
 
+--- 导出所有会话到文件
+--- @param filepath string 导出文件路径
+--- @return boolean, string|nil 导出是否成功，错误信息
+function M.export_sessions(filepath)
+  local data = {
+    sessions = {},
+    export_time = os.time(),
+  }
+  for _, session in pairs(state.sessions) do
+    table.insert(data.sessions, session)
+  end
+
+  local content = vim.json.encode(data)
+  local success, err = pcall(function()
+    local file = io.open(filepath, "w")
+    if not file then
+      error("无法打开文件: " .. filepath)
+    end
+    file:write(content)
+    file:close()
+  end)
+
+  if success then
+    return true
+  else
+    return false, err
+  end
+end
+
+--- 从文件导入会话
+--- @param filepath string 导入文件路径
+--- @return boolean, string|nil 导入是否成功，错误信息
+function M.import_sessions(filepath)
+  local success, data = pcall(function()
+    local file = io.open(filepath, "r")
+    if not file then
+      error("无法打开文件: " .. filepath)
+    end
+    local content = file:read("*a")
+    file:close()
+    return vim.json.decode(content)
+  end)
+
+  if not success then
+    return false, data
+  end
+
+  if data.sessions then
+    for _, session in ipairs(data.sessions) do
+      if session and session.id then
+        state.sessions[session.id] = session
+      end
+    end
+  end
+
+  debounce_save()
+  return true, nil
+end
+
 return M

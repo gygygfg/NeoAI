@@ -520,6 +520,53 @@ function M.table_map(tbl, func)
   return M.map(tbl, func)
 end
 
+--- 深拷贝表（从 common.lua 迁移）
+-- 递归地复制表及其所有嵌套子表
+-- @param tbl table 要拷贝的表
+-- @return table 深拷贝后的表
+function M.deep_copy(tbl)
+  if type(tbl) ~= "table" then
+    return tbl
+  end
+  local result = {}
+  for k, v in pairs(tbl) do
+    if type(v) == "table" then
+      result[k] = M.deep_copy(v)
+    else
+      result[k] = v
+    end
+  end
+  return result
+end
+
+--- 深度合并表（从 common.lua 迁移）
+-- 递归地合并两个表，如果键对应的值都是表，则继续合并
+-- @param t1 table 目标表
+-- @param t2 table 源表
+-- @return table 合并后的表
+function M.deep_merge(t1, t2)
+  if type(t1) ~= "table" or type(t2) ~= "table" then
+    return t2 or t1
+  end
+  local result = M.deep_copy(t1)
+  for k, v in pairs(t2) do
+    if type(v) == "table" and type(result[k]) == "table" then
+      result[k] = M.deep_merge(result[k], v)
+    else
+      result[k] = v
+    end
+  end
+  return result
+end
+
+--- 合并多个表（从 common.lua 迁移，merge_tables 别名）
+-- 将多个表合并为一个表，后面的表会覆盖前面表的相同键
+-- @param ... table 要合并的表
+-- @return table 合并后的新表
+function M.merge_tables(...)
+  return M.merge(...)
+end
+
 -- 测试代码
 local function run_tests()
   print("=== 测试表操作工具库 ===")
@@ -655,7 +702,7 @@ local function run_tests()
 end
 
 -- 如果直接运行此文件，则执行测试
-if arg and arg[0]:match("table_utils%.lua$") then
+if arg and arg[0] and arg[0]:match("table_utils%.lua$") then
   run_tests()
 end
 

@@ -1,14 +1,24 @@
 local M = {}
 
---- 深拷贝表
+-- 表操作函数委托给 table_utils.lua
+local function get_table_utils()
+  local ok, tu = pcall(require, "NeoAI.utils.table_utils")
+  return ok and tu or nil
+end
+
+--- 深拷贝表（委托给 table_utils.lua）
 -- 递归地复制表及其所有嵌套子表
 -- @param tbl table 要拷贝的表
 -- @return table 深拷贝后的表
 function M.deep_copy(tbl)
+  local tu = get_table_utils()
+  if tu and tu.deep_copy then
+    return tu.deep_copy(tbl)
+  end
+  -- 回退实现
   if type(tbl) ~= "table" then
     return tbl
   end
-
   local result = {}
   for k, v in pairs(tbl) do
     if type(v) == "table" then
@@ -17,20 +27,23 @@ function M.deep_copy(tbl)
       result[k] = v
     end
   end
-
   return result
 end
 
---- 深度合并表
+--- 深度合并表（委托给 table_utils.lua）
 -- 递归地合并两个表，如果键对应的值都是表，则继续合并
 -- @param t1 table 目标表
 -- @param t2 table 源表
 -- @return table 合并后的表
 function M.deep_merge(t1, t2)
+  local tu = get_table_utils()
+  if tu and tu.deep_merge then
+    return tu.deep_merge(t1, t2)
+  end
+  -- 回退实现
   if type(t1) ~= "table" or type(t2) ~= "table" then
     return t2 or t1
   end
-
   local result = M.deep_copy(t1)
   for k, v in pairs(t2) do
     if type(v) == "table" and type(result[k]) == "table" then
@@ -39,7 +52,6 @@ function M.deep_merge(t1, t2)
       result[k] = v
     end
   end
-
   return result
 end
 
@@ -295,12 +307,16 @@ function M.check_type(value, expected_type)
   end
 end
 
---- 合并表（deep_merge的别名）
+--- 合并表（deep_merge的别名，委托给 table_utils.lua）
 -- 提供更直观的函数名
 -- @param t1 table 目标表
 -- @param t2 table 源表
 -- @return table 合并后的表
 function M.merge_tables(t1, t2)
+  local tu = get_table_utils()
+  if tu and tu.merge_tables then
+    return tu.merge_tables(t1, t2)
+  end
   return M.deep_merge(t1, t2)
 end
 

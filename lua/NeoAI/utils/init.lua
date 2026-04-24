@@ -7,7 +7,6 @@ local modules = {
   "table_utils",
   "file_utils",
   "logger",
-  "tool_registry",
 }
 
 -- 存储已加载的模块

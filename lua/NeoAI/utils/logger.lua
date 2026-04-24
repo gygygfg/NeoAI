@@ -495,6 +495,51 @@ local function test_logger()
   print("=== 测试完成 ===")
 end
 
+-- ============================================================
+-- 以下功能从 debug_utils.lua 合并而来
+-- ============================================================
+
+--- 检查是否启用详细输出
+--- @return boolean 是否启用详细输出
+function M.is_verbose_enabled()
+  return state.config and state.config.verbose == true
+end
+
+--- 检查是否启用调试打印
+--- @return boolean 是否启用调试打印
+function M.is_print_debug_enabled()
+  return state.config and state.config.print_debug == true
+end
+
+--- 条件输出函数 - 只在详细模式启用时输出
+--- @param message string 消息内容
+--- @param level string|number 日志级别（可选）
+function M.verbose(message, level)
+  if not M.is_verbose_enabled() then
+    return
+  end
+  local log_level = level or vim.log.levels.INFO
+  vim.notify("[NeoAI] " .. message, log_level)
+end
+
+--- 条件打印函数 - 只在调试打印启用时输出到控制台
+--- @param ... any 要打印的内容
+function M.debug_print(...)
+  if not M.is_print_debug_enabled() then
+    return
+  end
+  local args = { ... }
+  local output = {}
+  for i, arg in ipairs(args) do
+    if type(arg) == "table" then
+      table.insert(output, vim.inspect(arg))
+    else
+      table.insert(output, tostring(arg))
+    end
+  end
+  print("[NeoAI Debug]", table.concat(output, " "))
+end
+
 -- 如果直接运行此文件，执行测试
 if arg and arg[0] and arg[0]:match("logger%.lua$") then
   test_logger()
