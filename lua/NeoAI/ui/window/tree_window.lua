@@ -195,22 +195,27 @@ function M._build_display_content()
         end
       end
 
-      -- 2. 根据 display_type 渲染前缀和文本
-      if item.display_type == "branch" then
-        if item.is_last then
-          line = line .. "└─ 📂 " .. item.display_text
-        else
-          line = line .. "├─ 📂 " .. item.display_text
-        end
+      -- 2. 虚拟节点：渲染为 "📂 聊天会话"
+      if item.is_virtual then
+        line = line .. "📂 聊天会话"
+        table.insert(content, line)
       else
-        if item.is_last then
-          line = line .. "└─ " .. item.display_text
+        -- 3. 根据 display_type 渲染前缀和文本
+        if item.display_type == "branch" then
+          if item.is_last then
+            line = line .. "└─ 📂 " .. item.display_text
+          else
+            line = line .. "├─ 📂 " .. item.display_text
+          end
         else
-          line = line .. "├─ " .. item.display_text
+          if item.is_last then
+            line = line .. "└─ " .. item.display_text
+          else
+            line = line .. "├─ " .. item.display_text
+          end
         end
+        table.insert(content, line)
       end
-
-      table.insert(content, line)
     end
   end
 
@@ -226,10 +231,11 @@ function M._build_line_to_session_map()
   -- 第0行是标题，第1行是空行，从第2行开始是节点
   local line = 2
   for _, item in ipairs(state.flat_items) do
-    if item.session_id then
+    -- 跳过虚拟节点（无 session_id），且不占用行号计数
+    if not item.is_virtual and item.session_id then
       map[line] = item.session_id
+      line = line + 1
     end
-    line = line + 1
   end
   return map
 end

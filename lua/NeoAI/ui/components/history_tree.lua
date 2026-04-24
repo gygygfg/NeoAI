@@ -135,7 +135,7 @@ function M.build_flat_items()
     -- 分支时，子节点缩进递增
     local indent
     if parent_indent == -1 then
-      indent = 0
+      indent = 1
     else
       indent = parent_indent + sibling_count - sibling_index
     end
@@ -162,6 +162,7 @@ function M.build_flat_items()
     -- 判断节点类型
     local has_content = session.user and session.user ~= ""
     local is_branch = has_children and not has_content
+    local is_multi_child = #(session.child_ids or {}) >= 2
     local display_type = is_branch and "branch" or "leaf"
 
     -- 构建显示文本
@@ -188,6 +189,29 @@ function M.build_flat_items()
     }
     table.insert(flat_nodes, node)
 
+    -- 在分支节点后面插入虚拟节点（与父节点同级）
+    -- 当 child_ids 有多个（>=2）时，也插入虚拟节点
+    if is_branch or is_multi_child then
+      local virtual_connectors = {}
+      for i = 1, indent do
+        if i <= depth then
+          if ancestor_is_last and ancestor_is_last[i] then
+            virtual_connectors[i] = "   "
+          else
+            virtual_connectors[i] = "│  "
+          end
+        else
+          virtual_connectors[i] = "   "
+        end
+      end
+      local virtual_node = {
+        is_virtual = true,
+        indent = indent,
+        connectors = virtual_connectors,
+      }
+      table.insert(flat_nodes, virtual_node)
+    end
+
     -- 递归处理子会话
     local child_ids = session.child_ids or {}
     if #child_ids > 0 then
@@ -208,6 +232,15 @@ function M.build_flat_items()
 
   -- 遍历每个根会话
   for i, rid in ipairs(root_ids) do
+    -- 在根节点前面插入虚拟节点（indent=0，connectors 填充一个空格占位）
+    local root_virtual_connectors = { "   " }
+    local root_virtual_node = {
+      is_virtual = true,
+      indent = 0,
+      connectors = root_virtual_connectors,
+    }
+    table.insert(flat_nodes, root_virtual_node)
+
     dfs(rid, -1, 0, i, #root_ids, {})
   end
 
