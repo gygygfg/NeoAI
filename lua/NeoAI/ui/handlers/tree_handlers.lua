@@ -1,5 +1,4 @@
 --- 树界面处理器
---- 基于新的 history_manager
 
 local M = {}
 
@@ -9,7 +8,9 @@ local state = {
 }
 
 function M.initialize(config)
-  if state.initialized then return true end
+  if state.initialized then
+    return true
+  end
   state.config = config or {}
   state.initialized = true
   return true
@@ -17,12 +18,16 @@ end
 
 local function get_hm()
   local ok, hm = pcall(require, "NeoAI.core.history_manager")
-  if ok and hm.is_initialized() then return hm end
+  if ok and hm.is_initialized() then
+    return hm
+  end
   return nil
 end
 
 function M.handle_enter()
-  if not state.initialized then return end
+  if not state.initialized then
+    return
+  end
   local tree_window = require("NeoAI.ui.window.tree_window")
   local selected_id = tree_window.get_selected_node()
   if not selected_id then
@@ -64,7 +69,9 @@ function M.handle_enter()
 end
 
 function M.handle_n()
-  if not state.initialized then return end
+  if not state.initialized then
+    return
+  end
   local tree_window = require("NeoAI.ui.window.tree_window")
   local selected_id = tree_window.get_selected_node()
   if not selected_id then
@@ -76,7 +83,9 @@ function M.handle_n()
     return
   end
   local hm = get_hm()
-  if not hm then return end
+  if not hm then
+    return
+  end
   local session = hm.get_session(selected_id)
   -- 如果选中了轮次节点，自动使用其父会话ID
   if not session and selected_id:match("^session_.+_round$") then
@@ -108,9 +117,13 @@ function M.handle_n()
 end
 
 function M.handle_N()
-  if not state.initialized then return end
+  if not state.initialized then
+    return
+  end
   local hm = get_hm()
-  if not hm then return end
+  if not hm then
+    return
+  end
   local new_id = hm.create_session("新会话", true, nil)
   vim.notify("已创建根会话: " .. new_id, vim.log.levels.INFO)
   -- 自动打开新创建的会话
@@ -124,7 +137,9 @@ function M.handle_N()
 end
 
 function M.handle_d()
-  if not state.initialized then return end
+  if not state.initialized then
+    return
+  end
   local tree_window = require("NeoAI.ui.window.tree_window")
   local selected_id = tree_window.get_selected_node()
   if not selected_id then
@@ -136,7 +151,9 @@ function M.handle_d()
     return
   end
   local hm = get_hm()
-  if not hm then return end
+  if not hm then
+    return
+  end
   local session = hm.get_session(selected_id)
   -- 如果选中了轮次节点，自动使用其父会话ID
   if not session and selected_id:match("^session_.+_round$") then
@@ -152,8 +169,11 @@ function M.handle_d()
     vim.notify("会话不存在", vim.log.levels.WARN)
     return
   end
-  local confirm = vim.fn.confirm("确定要删除 '" .. session.name .. "' 吗？\n子会话也会被删除！", "&Yes\n&No", 2)
-  if confirm ~= 1 then return end
+  local confirm =
+    vim.fn.confirm("确定要删除 '" .. session.name .. "' 吗？\n子会话也会被删除！", "&Yes\n&No", 2)
+  if confirm ~= 1 then
+    return
+  end
   hm.delete_session(selected_id)
   vim.notify("已删除会话", vim.log.levels.INFO)
   -- 清除选中状态，避免后续渲染时引用已删除的节点
@@ -162,7 +182,9 @@ function M.handle_d()
 end
 
 function M.handle_key(key)
-  if not state.initialized then return end
+  if not state.initialized then
+    return
+  end
   local handlers = {
     ["<CR>"] = M.handle_enter,
     ["n"] = M.handle_n,
@@ -170,12 +192,16 @@ function M.handle_key(key)
     ["d"] = M.handle_d,
   }
   local handler = handlers[key]
-  if handler then handler() end
+  if handler then
+    handler()
+  end
 end
 
 function M.delete_branch(node_id)
   local hm = get_hm()
-  if not hm then return false, "历史管理器未初始化" end
+  if not hm then
+    return false, "历史管理器未初始化"
+  end
   local ok, err = pcall(hm.delete_session, hm, node_id)
   if ok then
     local tree_win = require("NeoAI.ui.window.tree_window")
@@ -187,7 +213,9 @@ end
 
 function M.create_branch(parent_id, name)
   local hm = get_hm()
-  if not hm then return false end
+  if not hm then
+    return false
+  end
   local new_id = hm.create_session(name or "新分支", false, parent_id)
   if new_id then
     local tree_win = require("NeoAI.ui.window.tree_window")

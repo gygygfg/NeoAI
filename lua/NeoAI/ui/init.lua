@@ -165,18 +165,24 @@ function M.open_chat_ui(session_id, branch_id)
     hm.initialize({ config = state.config })
   end
 
-  -- 如果没有提供参数，使用默认值
-  if not session_id then
-    session_id = state.current_session_id
-    if (not session_id or session_id == "default") and ok and hm.is_initialized() then
-      local current = hm.get_current_session()
-      if current then
-        session_id = current.id
+  -- 如果没有传入 session_id（从 :NeoAIOpen 或快捷键直接打开），
+  -- 强制创建一个新的根会话，这样每次打开都是全新的根分支
+  if not session_id or session_id == "default" then
+    if ok and hm.is_initialized() then
+      session_id = hm.create_session("聊天会话", true, nil)
+    else
+      -- 回退：使用当前会话ID
+      session_id = state.current_session_id
+      if (not session_id or session_id == "default") and ok and hm.is_initialized() then
+        local current = hm.get_current_session()
+        if current then
+          session_id = current.id
+        end
+      end
+      if not session_id then
+        session_id = "default"
       end
     end
-  end
-  if not session_id then
-    session_id = "default"
   end
 
   if not branch_id then

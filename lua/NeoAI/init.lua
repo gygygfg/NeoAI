@@ -229,20 +229,9 @@ function M.open_neoai()
     error("NeoAI not initialized. Call setup() first.")
   end
 
-  -- 根据配置选择默认打开的界面
-  local default_ui = "tree"
-  if state.config and state.config.ui and state.config.ui.default_ui then
-    default_ui = state.config.ui.default_ui
-  end
-
-  if default_ui == "tree" then
-    state.ui.open_tree_ui()
-  elseif default_ui == "chat" then
-    state.ui.open_chat_ui()
-  else
-    -- 默认回退到树界面
-    state.ui.open_tree_ui()
-  end
+  -- 直接打开聊天界面，每次打开都会创建新的根会话
+  -- 不传 session_id 参数，由 open_chat_ui 自动创建新根会话
+  state.ui.open_chat_ui()
 end
 
 --- 关闭所有界面

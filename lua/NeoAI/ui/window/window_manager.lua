@@ -983,102 +983,72 @@ function M._render_tree_node(content, node, depth, is_last, parent_prefix, tree_
   if not node then return end
 
   local current_prefix = parent_prefix or ""
-  local line_prefix = ""
-  if is_root then
-    -- 根节点：使用 └── 前缀（不带竖线）
-    if is_last then
-      line_prefix = "└──"
-    else
-      line_prefix = "├──"
-    end
-  elseif depth > 0 then
-    if is_last then
-      line_prefix = current_prefix .. "└───"
-    else
-      line_prefix = current_prefix .. "├───"
-    end
-  end
 
-  local display_text
-  if node.is_round then
-    -- 轮次节点：显示消息预览
-    display_text = node.name or "(空消息)"
-  else
-    -- 会话节点：只显示会话名称，不显示预览
-    display_text = node.name or "未命名"
-  end
-  display_text = display_text:gsub("%b<>", " "):gsub("[%c%z]", " "):gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
-  if display_text == "" then display_text = "未命名" end
-
-  local icon = ""
-  if node.is_virtual then
-    icon = "📂 "
-  end
-
-  -- 虚拟节点不显示连接线前缀，直接以图标开头（根节点除外）
+  -- 构建当前行的前缀和内容
   local line
-  if node.is_virtual and not is_root then
-    line = current_prefix .. icon .. display_text
+  if is_root then
+    -- 根节点：使用 └──/├── 前缀
+    local prefix = is_last and "└──" or "├──"
+    local icon = node.is_virtual and "📂 " or ""
+    line = prefix .. icon .. (node.name or "未命名")
+    if node.round_count and node.round_count > 0 then
+      line = line .. "  (" .. node.round_count .. "轮)"
+    end
+  elseif node.is_virtual then
+    -- 虚拟节点（分支）：不显示连接线，直接以图标开头
+    line = current_prefix .. "📂 " .. (node.name or "分支")
+    if node.round_count and node.round_count > 0 then
+      line = line .. "  (" .. node.round_count .. "轮)"
+    end
   else
-    line = line_prefix .. icon .. display_text
+    -- 普通节点或轮次节点：使用 ├───/└─── 前缀
+    local prefix = is_last and "└───" or "├───"
+    line = current_prefix .. prefix .. (node.name or "未命名")
   end
 
-  -- 显示轮数标记：根节点和有子节点的非轮次节点
-  if node.round_count and node.round_count > 0 and not node.is_round then
-    line = line .. "  (" .. node.round_count .. "轮)"
-  end
+  -- 清理显示文本
+  line = line:gsub("%b<>", " "):gsub("[%c%z]", " "):gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
+  if line == "" then line = "未命名" end
 
-  if window_width and window_width > 0 then
-    local effective_prefix = node.is_virtual and current_prefix or line_prefix
-    if #line > window_width then
-      local max_text_len = window_width - #effective_prefix - 3
-      if max_text_len > 0 then
-        line = effective_prefix .. safe_truncate(line:sub(#effective_prefix + 1), max_text_len) .. "..."
-      end
+  if window_width and window_width > 0 and #line > window_width then
+    local effective_prefix = node.is_virtual and current_prefix or (is_root and (is_last and "└──" or "├──") or current_prefix .. (is_last and "└───" or "├───"))
+    local max_text_len = window_width - #effective_prefix - 3
+    if max_text_len > 0 then
+      line = effective_prefix .. safe_truncate(line:sub(#effective_prefix + 1), max_text_len) .. "..."
     end
   end
 
   table.insert(content, line)
 
+  -- 渲染子节点
   if tree_state.expanded_nodes and tree_state.expanded_nodes[node.id] and node.children and #node.children > 0 then
     local child_count = #node.children
-    local child_parent_prefix = parent_prefix or ""
+
+    -- 计算子节点的 parent_prefix
+    local child_parent_prefix
     if is_root then
-      -- 根节点的子节点前缀：根节点是最后一个时用空格，否则用竖线
+      -- 根节点的子节点：缩进一级
+      child_parent_prefix = is_last and "    " or "│   "
+    elseif node.is_virtual then
+      -- 虚拟节点的子节点：在虚拟节点自身前缀基础上再缩进一级
+      -- 虚拟节点不显示连接线，所以子节点需要额外缩进
       if is_last then
-        child_parent_prefix = "    "
+        child_parent_prefix = current_prefix .. "    "
       else
-        child_parent_prefix = "│   "
+        child_parent_prefix = current_prefix .. "│   "
       end
-    elseif depth > 0 then
-      -- 非根节点的子节点：在当前节点前缀基础上再加一级缩进
-      -- 对于虚拟节点（分支），子节点前缀基于分支节点自身的前缀（current_prefix）
-      -- 前 N-1 个子节点用 │ 连接线，最后一个子节点用空格（表示分支结束）
-      if node.is_virtual then
-        -- 虚拟节点的子节点前缀：基于 current_prefix（分支节点自身的前缀）
-        -- 子节点会根据自身的 is_last 来决定用 └─── 还是 ├───
-        -- 这里 child_parent_prefix 会被传给子节点作为 parent_prefix
-        child_parent_prefix = current_prefix
-      elseif is_last then
-        child_parent_prefix = child_parent_prefix .. "    "
+    else
+      -- 普通节点的子节点：在父节点前缀基础上再缩进一级
+      if is_last then
+        child_parent_prefix = current_prefix .. "    "
       else
-        child_parent_prefix = child_parent_prefix .. "│   "
+        child_parent_prefix = current_prefix .. "│   "
       end
     end
+
     for i, child in ipairs(node.children) do
       local child_is_last = (i == child_count)
-      local child_prefix = child_parent_prefix
-      -- 对于虚拟节点（分支），根据子节点是否是最后一个来决定前缀
-      if node.is_virtual then
-        -- 前 N-1 个子节点用 │ 连接线，最后一个子节点用空格（表示分支结束）
-        -- 这样最后一个子节点会用 └─── 直接连接回分支节点
-        if child_is_last then
-          child_prefix = current_prefix
-        else
-          child_prefix = current_prefix .. "│   "
-        end
-      end
-      M._render_tree_node(content, child, depth + 1, child_is_last, child_prefix, tree_state, window_width, false)
+      M._render_tree_node(content, child, depth + 1, child_is_last, child_parent_prefix, tree_state, window_width, false)
     end
   end
 end
