@@ -1,11 +1,10 @@
 local M = {}
 
-local keymap_manager = require("NeoAI.core.config.keymap_manager")
 local session_manager = require("NeoAI.core.session.session_manager")
 local ai_engine = require("NeoAI.core.ai.ai_engine")
 local history_manager = require("NeoAI.core.history_manager")
 
--- 模块状态
+-- 模块状态（不维护 config，直接使用主 init.lua 传入的合并后配置）
 local state = {
   initialized = false,
   config = nil,
@@ -14,6 +13,9 @@ local state = {
   event_bus = nil,
   keymap_mgr = nil,
 }
+
+-- 保存主 init.lua 传入的合并后配置引用
+local merged_config = nil
 
 --- 初始化核心模块
 --- @param core_config table 核心配置
@@ -26,32 +28,31 @@ function M.initialize(core_config)
   -- 不再使用event_bus兼容层，直接使用Neovim原生事件系统
   state.event_bus = nil
 
-  -- 初始化键位配置管理器
+  -- 初始化键位配置管理器（按需加载，避免模块加载时过早创建实例）
+  local keymap_manager = require("NeoAI.core.config.keymap_manager")
   state.keymap_mgr = keymap_manager
 
-  -- 从传入的配置获取键位配置（主init.lua已经完成配置合并）
-  local keymaps_config = (core_config or {}).keymaps or {}
-
-  -- 初始化键位管理器，传递完整的键位配置
-  state.keymap_mgr.initialize(keymaps_config)
+  -- 直接传入完整配置，各子模块自己取需要的部分
+  state.keymap_mgr.initialize(core_config)
 
   -- 初始化会话管理器
   state.session_mgr = session_manager.initialize({
-    config = (core_config or {}).session or {},
+    config = core_config,
   })
 
   -- 初始化AI引擎
   state.ai_engine = ai_engine.initialize({
-    config = (core_config or {}).ai or {},
+    config = core_config,
     session_manager = state.session_mgr,
   })
 
   -- 初始化历史管理器
   history_manager.initialize({
-    config = (core_config or {}).session or {},
+    config = core_config,
   })
 
-  state.config = core_config
+  -- 保存合并后配置的引用（由主 init.lua 传入，已合并用户配置）
+  merged_config = core_config
   state.initialized = true
 
   return M
@@ -79,14 +80,14 @@ end
 
 -- 注意：get_event_bus函数已被移除，请直接使用Neovim原生事件系统
 
---- 获取配置管理器
---- 直接使用 default_config.lua 的 API
---- @return table 配置管理器
-function M.get_config_manager()
+--- 获取合并后的完整配置
+--- 直接返回主 init.lua 传入的合并后配置引用
+--- @return table 合并后的完整配置
+function M.get_config()
   if not state.initialized then
     error("Core not initialized")
   end
-  return require("NeoAI.default_config")
+  return merged_config
 end
 
 --- 获取键位配置管理器

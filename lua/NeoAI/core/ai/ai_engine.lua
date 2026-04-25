@@ -49,7 +49,9 @@ function M.initialize(options)
   end
 
   -- 从选项参数中提取并存储必要的组件
-  state.config = options.config or {}
+  -- 传入的是完整配置，从中提取 ai 部分
+  local full_config = options.config or {}
+  state.config = full_config.ai or {}
   state.session_manager = options.session_manager
 
   -- 初始化所有子模块
@@ -561,6 +563,7 @@ function M.handle_ai_response(generation_id, response, params)
   local response_content = ""
   local reasoning_content = nil
   local tool_calls = {}
+  local usage = {}
 
   if response.choices and #response.choices > 0 then
     local choice = response.choices[1]
@@ -618,11 +621,17 @@ function M.handle_ai_response(generation_id, response, params)
     end
   end
 
+  -- 提取 usage 信息
+  if response.usage then
+    usage = response.usage
+  end
+
   -- 完成生成
   M._finalize_generation(generation_id, response_content, {
     session_id = session_id,
     window_id = window_id,
     reasoning_text = reasoning_content,
+    usage = usage,
   })
 end
 
@@ -672,11 +681,12 @@ function M.handle_stream_completed(data)
     return
   end
 
-  -- 使用统一的结束处理
+  -- 使用统一的结束处理（传入 usage，避免被 _handle_stream_end 中的第二次调用覆盖）
   M._finalize_generation(generation_id, full_response, {
     session_id = session_id,
     window_id = window_id,
     reasoning_text = data.reasoning_text,
+    usage = data.usage or {},
   })
 end
 

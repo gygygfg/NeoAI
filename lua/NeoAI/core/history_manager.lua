@@ -511,8 +511,6 @@ end
 --- 构建轮次预览文本（辅助函数）
 --- @param session table 会话对象
 --- @return string 轮次预览文本
---- @param session table 会话对象
---- @return string 轮次预览文本
 function M.build_round_text(session)
   if not session then
     return ""
@@ -578,21 +576,6 @@ function M.build_round_text(session)
     text = "🤖" .. ai_text
   end
   return text
-end
-
---- 创建轮次节点（辅助函数）
---- @param session table 会话对象
---- @param round_text string 轮次预览文本
---- @return table 轮次节点
-local function make_round_node(session, round_text)
-  return {
-    id = session.id .. "_round",
-    session_id = session.id,
-    name = round_text,
-    is_round = true,
-    preview = round_text,
-    children = {},
-  }
 end
 
 --- 获取树结构（用于渲染）

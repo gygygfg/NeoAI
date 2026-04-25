@@ -29,7 +29,7 @@ function M.initialize(config)
   })
 
   vim.api.nvim_create_autocmd("User", {
-    pattern = "NeoAI:ai_response_complete",
+    pattern = "NeoAI:generation_completed",
     callback = function(args)
       M._handle_response_complete(args.data or {})
     end,
@@ -123,6 +123,7 @@ function M._handle_response_complete(data)
   local response = data.response
   local session_id = data.session_id
   local usage = data.usage or {}
+  local reasoning_text = data.reasoning_text or ""
 
   local response_content = ""
   if type(response) == "string" then
@@ -135,31 +136,17 @@ function M._handle_response_complete(data)
 
   if response_content == "" then return end
 
+  -- 如果有思考内容，将 content 和 reasoning_content 打包为 JSON 字符串
+  if reasoning_text and reasoning_text ~= "" then
+    local assistant_json = vim.json.encode({
+      content = response_content,
+      reasoning_content = reasoning_text,
+    })
+    response_content = assistant_json
+  end
+
   -- 将用户消息和AI回复一起写入历史文件
   _flush_pending_round(session_id, response_content, usage)
-
-  local chat_window = require("NeoAI.ui.window.chat_window")
-  if chat_window.is_available() then
-    local messages = chat_window.get_messages()
-    if messages and #messages > 0 then
-      local last_ai_idx = nil
-      for i = #messages, 1, -1 do
-        if messages[i].role == "assistant" then
-          last_ai_idx = i
-          break
-        end
-      end
-      if last_ai_idx then
-        messages[last_ai_idx].content = response_content
-        chat_window.set_messages(messages)
-        chat_window.render_chat()
-      else
-        chat_window.add_message("assistant", response_content)
-      end
-    else
-      chat_window.add_message("assistant", response_content)
-    end
-  end
 end
 
 function M._handle_stream_chunk(data)

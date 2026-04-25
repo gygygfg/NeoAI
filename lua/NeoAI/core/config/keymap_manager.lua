@@ -9,9 +9,11 @@ local current_keymaps = {}
 local config_file_path = vim.fn.stdpath("config") .. "/neoai_keymaps.json"
 
 --- 初始化键位管理器
---- @param merged_keymaps table 已合并的键位配置（主init.lua已完成配置合并）
-function M.initialize(merged_keymaps)
-  -- 设置默认配置为传入的已合并配置
+--- @param config table 完整配置（主init.lua已完成配置合并），从中提取 keymaps 部分
+function M.initialize(config)
+  -- 从完整配置中提取键位配置部分
+  local merged_keymaps = (config or {}).keymaps or {}
+  -- 设置默认配置
   DEFAULT_KEYMAPS = vim.deepcopy(merged_keymaps)
 
   -- 加载配置

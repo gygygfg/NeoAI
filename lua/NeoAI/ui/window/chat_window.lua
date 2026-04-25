@@ -15,6 +15,11 @@ local state = {
   last_render_time = 0, -- 上次渲染时间
   render_debounce_timer = nil, -- 防抖定时器
 
+  -- 最近一次生成的 token 用量信息
+  last_usage = nil,
+  -- token 用量虚拟文本的 extmark id，用于清理旧虚拟文本
+  usage_extmark_id = nil,
+
   -- 流式渲染状态
   streaming = {
     active = false,
@@ -122,6 +127,11 @@ function M.open(session_id, window_id, branch_id)
 
   -- 渲染聊天内容
   M.render_chat()
+
+  -- 渲染完成后添加 token 用量信息
+  vim.defer_fn(function()
+    M._update_usage_virt_text()
+  end, 500)
 
   -- 触发聊天框打开事件
   vim.api.nvim_exec_autocmds("User", { pattern = "NeoAI:chat_box_opened", data = { window_id = window_id } })
@@ -621,6 +631,14 @@ function M._load_messages(session_id)
   -- 使用 get_context_and_new_parent 获取上下文路径
   -- 注意：get_context_and_new_parent 内部使用 get_messages，会解包 JSON 格式的 assistant 消息
   -- 我们需要保留原始 JSON 格式以便渲染思考过程的折叠标记
+  -- 加载当前会话的 usage 信息
+  local current_session = hm.get_session(target_id)
+  if current_session and current_session.usage and next(current_session.usage) then
+    state.last_usage = current_session.usage
+  else
+    state.last_usage = nil
+  end
+
   local context_msgs, _ = hm.get_context_and_new_parent(target_id)
   if #context_msgs > 0 then
     -- 重新从会话中获取原始消息，保留 JSON 格式
@@ -755,6 +773,8 @@ function M.close()
   state.current_window_id = nil
   state.current_session_id = nil
   state.messages = {}
+  state.last_usage = nil
+  state.usage_extmark_id = nil
 
   -- 触发窗口关闭事件
   vim.api.nvim_exec_autocmds(
@@ -767,6 +787,86 @@ function M.close()
     "User",
     { pattern = "NeoAI:chat_box_closed", data = { window_id = state.current_window_id } }
   )
+end
+
+--- 在 AI 回复末尾行添加 token 用量虚拟文本
+--- 使用 nvim_buf_set_extmark 的 virt_text 特性，不修改缓冲区内容
+function M._update_usage_virt_text()
+  -- 流式进行中不显示用量信息，等流式完成后的全量重渲染再显示
+  if state.streaming.active then
+    return
+  end
+  if not state.current_window_id or not state.last_usage or not next(state.last_usage) then
+    return
+  end
+
+  local win_handle = window_manager.get_window_win(state.current_window_id)
+  if not win_handle or not vim.api.nvim_win_is_valid(win_handle) then
+    return
+  end
+
+  local buf = vim.api.nvim_win_get_buf(win_handle)
+  if not buf or not vim.api.nvim_buf_is_valid(buf) then
+    return
+  end
+
+  -- 获取或创建命名空间
+  local ns_id = vim.api.nvim_create_namespace("NeoAIUsage")
+
+  -- 清理旧的虚拟文本
+  if state.usage_extmark_id then
+    pcall(vim.api.nvim_buf_del_extmark, buf, ns_id, state.usage_extmark_id)
+    state.usage_extmark_id = nil
+  end
+
+  -- 构建用量文本
+  local usage = state.last_usage
+  local prompt_tokens = usage.prompt_tokens or usage.promptTokens or usage.input_tokens or usage.inputTokens or 0
+  local completion_tokens = usage.completion_tokens or usage.completionTokens or usage.output_tokens or usage.outputTokens or 0
+  local total_tokens = usage.total_tokens or usage.totalTokens or (prompt_tokens + completion_tokens)
+
+  local reasoning_tokens = 0
+  if usage.completion_tokens_details and type(usage.completion_tokens_details) == "table" then
+    reasoning_tokens = usage.completion_tokens_details.reasoning_tokens or 0
+  end
+
+  local usage_text
+  if reasoning_tokens and reasoning_tokens > 0 then
+    usage_text = string.format("📊 Token 用量: 输入 %d · 输出 %d (思考 %d) · 总计 %d", prompt_tokens, completion_tokens, reasoning_tokens, total_tokens)
+  else
+    usage_text = string.format("📊 Token 用量: 输入 %d · 输出 %d · 总计 %d", prompt_tokens, completion_tokens, total_tokens)
+  end
+
+  -- 先确保缓冲区可修改，在 AI 回复末尾追加分隔线
+  pcall(vim.api.nvim_set_option_value, "modifiable", true, { buf = buf })
+  pcall(vim.api.nvim_set_option_value, "readonly", false, { buf = buf })
+
+  local line_count = vim.api.nvim_buf_line_count(buf)
+  -- 检查最后一行是否已经是分隔线，避免重复追加
+  local last_line_content = ""
+  if line_count > 0 then
+    local lines = vim.api.nvim_buf_get_lines(buf, line_count - 1, line_count, false)
+    last_line_content = (lines[1] or ""):match("^%s*(.-)%s*$")
+  end
+
+  if last_line_content ~= "─" then
+    -- 追加分隔线
+    vim.api.nvim_buf_set_lines(buf, line_count, line_count, false, {"─", ""})
+    line_count = vim.api.nvim_buf_line_count(buf)
+  end
+
+  -- 在分隔线下一行（空行）写入用量文本（直接写入缓冲区，支持自动换行）
+  -- 同时用 extmark 的 hl_group 设置整行颜色
+  local usage_line = line_count - 1  -- 空行
+  vim.api.nvim_buf_set_lines(buf, usage_line, usage_line + 1, false, {usage_text})
+  -- 用 extmark 给这一行设置高亮颜色
+  state.usage_extmark_id = vim.api.nvim_buf_set_extmark(buf, ns_id, usage_line, 0, {
+    hl_group = "Comment",
+    hl_eol = true,
+  })
+
+  -- 恢复缓冲区状态
+  pcall(vim.api.nvim_set_option_value, "modified", false, { buf = buf })
 end
 
 --- 更新配置
@@ -1177,6 +1277,7 @@ function M._setup_event_listeners()
       local window_id = data.window_id
       local session_id = data.session_id
       local reasoning_text = data.reasoning_text
+      local usage = data.usage or {}
 
       -- 检查是否是当前窗口的消息
       if window_id and window_id ~= state.current_window_id then
@@ -1226,16 +1327,21 @@ function M._setup_event_listeners()
         if placeholder_index then
           table.remove(state.messages, placeholder_index)
         end
-        -- 添加完整响应
+        -- 添加完整响应（跳过渲染，由后面的 render_chat 统一处理）
         if reasoning_text and reasoning_text ~= "" then
           local combined = vim.json.encode({
             reasoning_content = reasoning_text,
             content = response_content,
           })
-          M.add_message("assistant", combined)
+          M.add_message("assistant", combined, { skip_render = true })
         else
-          M.add_message("assistant", response_content)
+          M.add_message("assistant", response_content, { skip_render = true })
         end
+      end
+
+      -- 保存 token 用量信息（在渲染之前保存，确保 _update_usage_virt_text 能读取到）
+      if usage and next(usage) then
+        state.last_usage = usage
       end
 
       -- 关闭思考过程悬浮窗口
@@ -1257,10 +1363,15 @@ function M._setup_event_listeners()
       -- 全量重渲染
       M.render_chat()
 
+      -- 等待渲染和折叠操作全部完成后，添加 token 用量信息
+      vim.defer_fn(function()
+        M._update_usage_virt_text()
+      end, 500)
+
       -- AI正文输出结束后，打开浮动输入框并将光标移动过去
       vim.defer_fn(function()
         M._open_float_input()
-      end, 300)
+      end, 600)
     end,
   })
 

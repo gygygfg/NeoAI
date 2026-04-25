@@ -205,7 +205,7 @@ require("NeoAI").setup({
 ### `core/init.lua` — 核心模块入口
 
 - 初始化 `keymap_manager`, `session_manager`, `ai_engine`, `history_manager`
-- 提供 `get_session_manager()`, `get_ai_engine()`, `get_keymap_manager()`, `get_history_manager()`, `get_config_manager()`
+- 提供 `get_session_manager()`, `get_ai_engine()`, `get_keymap_manager()`, `get_history_manager()`, `get_config()`
 
 ### `core/history_manager.lua` — 历史管理器（新版，唯一数据源）
 
