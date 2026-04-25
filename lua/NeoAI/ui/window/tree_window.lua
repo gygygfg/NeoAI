@@ -3,6 +3,7 @@
 --- flat_items 已包含：虚拟节点、is_last、缩进级别、连接符数组
 
 local M = {}
+local Events = require("NeoAI.core.events.event_constants")
 local window_manager = require("NeoAI.ui.window.window_manager")
 local async_worker = require("NeoAI.utils.async_worker")
 
@@ -50,7 +51,7 @@ function M.open(session_id, window_id)
   state.selected_session_id = nil
 
   vim.api.nvim_exec_autocmds("User", {
-    pattern = "NeoAI:window_opening",
+pattern = Events.WINDOW_OPENING,
     data = { window_id = window_id, window_type = "tree" },
   })
 
@@ -74,7 +75,7 @@ function M.open(session_id, window_id)
   end
 
   vim.api.nvim_exec_autocmds("User", {
-    pattern = "NeoAI:window_opened",
+pattern = Events.WINDOW_OPENED,
     data = { window_id = window_id },
   })
 
@@ -85,7 +86,7 @@ function M.open(session_id, window_id)
   end)
 
   vim.api.nvim_exec_autocmds("User", {
-    pattern = "NeoAI:tree_window_opened",
+pattern = Events.TREE_WINDOW_OPENED,
     data = { window_id = window_id },
   })
 
@@ -132,7 +133,7 @@ function M.render_tree()
 
   local ok, err = pcall(function()
     vim.api.nvim_exec_autocmds("User", {
-      pattern = "NeoAI:tree_rendering_start",
+pattern = Events.TREE_RENDERING_START,
       data = { window_id = state.current_window_id },
     })
 
@@ -156,11 +157,11 @@ function M.render_tree()
     M._update_selection_from_cursor()
 
     vim.api.nvim_exec_autocmds("User", {
-      pattern = "NeoAI:rendering_complete",
+pattern = Events.RENDERING_COMPLETE,
       data = { window_id = state.current_window_id },
     })
     vim.api.nvim_exec_autocmds("User", {
-      pattern = "NeoAI:tree_rendering_complete",
+pattern = Events.TREE_RENDERING_COMPLETE,
       data = { window_id = state.current_window_id },
     })
   end)
@@ -454,7 +455,7 @@ function M.close()
   end
 
   vim.api.nvim_exec_autocmds("User", {
-    pattern = "NeoAI:window_closing",
+pattern = Events.WINDOW_CLOSING,
     data = { window_id = state.current_window_id },
   })
 
@@ -474,7 +475,7 @@ function M.close()
   state.float_buf_id = nil
 
   vim.api.nvim_exec_autocmds("User", {
-    pattern = "NeoAI:window_closed",
+pattern = Events.WINDOW_CLOSED,
     data = { window_id = state.current_window_id },
   })
 end

@@ -5,6 +5,7 @@ local M = {}
 
 -- 导入工具
 local logger = require("NeoAI.utils.logger")
+local Events = require("NeoAI.core.events.event_constants")
 
 -- 模块内部状态
 local state = {
@@ -97,8 +98,8 @@ function M.process_response(response_data)
   end
 
   -- 触发响应构建完成事件
-  vim.api.nvim_exec_autocmds("User", {
-    pattern = "NeoAI:response_built",
+vim.api.nvim_exec_autocmds("User", {
+    pattern = Events.RESPONSE_BUILT,
     data = {
       generation_id = generation_id,
       content = response_content,

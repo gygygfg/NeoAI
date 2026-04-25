@@ -8,6 +8,7 @@ local history_tree = require("NeoAI.ui.components.history_tree")
 local reasoning_display = require("NeoAI.ui.components.reasoning_display")
 local tree_handlers = require("NeoAI.ui.handlers.tree_handlers")
 local chat_handlers = require("NeoAI.ui.handlers.chat_handlers")
+local Events = require("NeoAI.core.events.event_constants")
 
 -- 核心模块引用（延迟加载）
 local core
@@ -140,7 +141,7 @@ function M.open_tree_ui()
 
       -- 触发树窗口打开事件
       vim.api.nvim_exec_autocmds("User", {
-        pattern = "NeoAI:tree_window_opened",
+        pattern = Events.TREE_WINDOW_OPENED,
         data = { session_id, "main" },
       })
     else
@@ -219,7 +220,7 @@ function M.open_chat_ui(session_id, branch_id)
 
       -- 触发聊天窗口打开事件
       vim.api.nvim_exec_autocmds("User", {
-        pattern = "NeoAI:chat_window_opened",
+        pattern = Events.CHAT_WINDOW_OPENED,
         data = { session_id, branch_id },
       })
     else
@@ -327,7 +328,7 @@ function M._register_event_listeners()
 
   -- 监听会话事件
   vim.api.nvim_create_autocmd("User", {
-    pattern = "NeoAI:session_created",
+    pattern = Events.SESSION_CREATED,
     callback = function(args)
       local data = args.data or {}
       state.current_session_id = data.session_id
@@ -339,7 +340,7 @@ function M._register_event_listeners()
   })
 
   vim.api.nvim_create_autocmd("User", {
-    pattern = "NeoAI:session_loaded",
+    pattern = Events.SESSION_LOADED,
     callback = function(args)
       local data = args.data or {}
       state.current_session_id = data.new_session_id
@@ -351,7 +352,7 @@ function M._register_event_listeners()
   })
 
   vim.api.nvim_create_autocmd("User", {
-    pattern = "NeoAI:session_deleted",
+    pattern = Events.SESSION_DELETED,
     callback = function(args)
       local data = args.data or {}
       if state.current_session_id == data.session_id then
@@ -362,7 +363,7 @@ function M._register_event_listeners()
   })
 
   vim.api.nvim_create_autocmd("User", {
-    pattern = "NeoAI:session_changed",
+    pattern = Events.SESSION_CHANGED,
     callback = function(args)
       local data = args.data or {}
       state.current_session_id = data.session_id
@@ -377,14 +378,14 @@ function M._register_event_listeners()
 
   -- 监听分支事件
   vim.api.nvim_create_autocmd("User", {
-    pattern = "NeoAI:branch_created",
+    pattern = Events.BRANCH_CREATED,
     callback = function()
       refresh_tree_if_open()
     end,
   })
 
   vim.api.nvim_create_autocmd("User", {
-    pattern = "NeoAI:branch_switched",
+    pattern = Events.BRANCH_SWITCHED,
     callback = function()
       refresh_chat_if_open()
       refresh_tree_if_open()
@@ -392,7 +393,7 @@ function M._register_event_listeners()
   })
 
   vim.api.nvim_create_autocmd("User", {
-    pattern = "NeoAI:branch_deleted",
+    pattern = Events.BRANCH_DELETED,
     callback = function()
       refresh_tree_if_open()
     end,
@@ -400,7 +401,7 @@ function M._register_event_listeners()
 
   -- 监听消息事件
   vim.api.nvim_create_autocmd("User", {
-    pattern = "NeoAI:message_added",
+    pattern = Events.MESSAGE_ADDED,
     callback = function()
       refresh_chat_if_open()
     end,
@@ -522,7 +523,7 @@ function M.update_current_session_id(session_id)
 
   -- 触发会话更新事件，通知其他模块
   vim.api.nvim_exec_autocmds("User", {
-    pattern = "NeoAI:ui_session_updated",
+    pattern = Events.UI_SESSION_UPDATED,
     data = { session_id = session_id },
   })
 end

@@ -3,6 +3,7 @@ local M = {}
 local branch_manager = require("NeoAI.core.session.branch_manager")
 local message_manager = require("NeoAI.core.session.message_manager")
 local data_operations = require("NeoAI.core.session.data_operations")
+local Events = require("NeoAI.core.events.event_constants")
 
 -- 会话存储
 local sessions = {}
@@ -86,11 +87,11 @@ function M.initialize(options)
   state.autocmd_ids = {}
   
   local autocmd_patterns = {
-    "NeoAI:message_added",
-    "NeoAI:message_edited",
-    "NeoAI:message_updated",
-    "NeoAI:message_deleted",
-    "NeoAI:messages_cleared",
+    Events.MESSAGE_ADDED,
+    Events.MESSAGE_EDITED,
+    Events.MESSAGE_UPDATED,
+    Events.MESSAGE_DELETED,
+    Events.MESSAGES_CLEARED,
   }
   
   for _, pattern in ipairs(autocmd_patterns) do
@@ -140,7 +141,7 @@ local function ensure_current_session()
       -- 触发事件
       vim.api.nvim_exec_autocmds(
         "User",
-        { pattern = "NeoAI:session_reused", data = { session_id = current_session_id, session = empty_session } }
+        { pattern = Events.SESSION_REUSED, data = { session_id = current_session_id, session = empty_session } }
       )
     else
       -- 创建默认会话
@@ -162,7 +163,7 @@ local function ensure_current_session()
       -- 触发事件
       vim.api.nvim_exec_autocmds(
         "User",
-        { pattern = "NeoAI:session_created", data = { session_id = current_session_id, session = sessions[current_session_id] } }
+        { pattern = Events.SESSION_CREATED, data = { session_id = current_session_id, session = sessions[current_session_id] } }
       )
     end
   end
@@ -200,7 +201,7 @@ function M.create_session(name)
   session.branches[branch_id] = true
 
   -- 触发事件
-  vim.api.nvim_exec_autocmds("User", { pattern = "NeoAI:session_created", data = { session_id = session_id, session = session } })
+  vim.api.nvim_exec_autocmds("User", { pattern = Events.SESSION_CREATED, data = { session_id = session_id, session = session } })
 
   -- 自动保存
   debounce_save()
@@ -248,7 +249,7 @@ function M.set_current_session(session_id)
   current_session_id = session_id
 
   -- 触发事件
-  vim.api.nvim_exec_autocmds("User", { pattern = "NeoAI:session_changed", data = { session_id = session_id, session = sessions[session_id] } })
+  vim.api.nvim_exec_autocmds("User", { pattern = Events.SESSION_CHANGED, data = { session_id = session_id, session = sessions[session_id] } })
 end
 
 --- 获取或创建当前会话（仅在需要时创建）
@@ -319,7 +320,7 @@ function M.delete_session(session_id)
   end
 
   -- 触发事件
-  vim.api.nvim_exec_autocmds("User", { pattern = "NeoAI:session_deleted", data = { session_id = session_id } })
+  vim.api.nvim_exec_autocmds("User", { pattern = Events.SESSION_DELETED, data = { session_id = session_id } })
 
   -- 自动保存
   debounce_save()
@@ -413,7 +414,7 @@ local function load_session_from_json(session_id_str, session_data, sessions_fil
   sessions[session_id] = session
 
   vim.api.nvim_exec_autocmds("User", {
-    pattern = "NeoAI:session_loaded",
+    pattern = Events.SESSION_LOADED,
     data = { new_session_id = session_id, filepath = sessions_file, session = session }
   })
 
@@ -507,7 +508,7 @@ function M._load_sessions()
           data.messages = nil
           sessions[data.id] = data
           vim.api.nvim_exec_autocmds("User", {
-            pattern = "NeoAI:session_loaded",
+            pattern = Events.SESSION_LOADED,
             data = { new_session_id = data.id, filepath = filepath, session = data }
           })
           local session_num = tonumber(data.id:match("session_(%d+)"))
@@ -608,7 +609,7 @@ function M._save_sessions()
 
     -- 触发会话保存事件
     vim.api.nvim_exec_autocmds("User", {
-      pattern = "NeoAI:session_saved",
+      pattern = Events.SESSION_SAVED,
       data = {
         session_id = session_id,
         filepath = save_path .. "/sessions.json",

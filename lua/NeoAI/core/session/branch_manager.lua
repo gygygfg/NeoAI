@@ -1,5 +1,7 @@
 local M = {}
 
+local Events = require("NeoAI.core.events.event_constants")
+
 -- 分支存储
 local branches = {}
 local branch_counter = 0
@@ -56,7 +58,7 @@ function M.create_branch(parent_id, name)
   current_branch_id = branch_id
 
   -- 触发事件
-  vim.api.nvim_exec_autocmds("User", { pattern = "NeoAI:branch_created", data = { branch_id, branch } })
+vim.api.nvim_exec_autocmds("User", { pattern = Events.BRANCH_CREATED, data = { branch_id, branch } })
 
   return branch_id
 end
@@ -72,7 +74,7 @@ function M.switch_branch(branch_id)
   current_branch_id = branch_id
 
   -- 触发事件
-  vim.api.nvim_exec_autocmds("User", { pattern = "NeoAI:branch_switched", data = { branch_id, old_branch_id } })
+vim.api.nvim_exec_autocmds("User", { pattern = Events.BRANCH_SWITCHED, data = { branch_id, old_branch_id } })
 end
 
 --- 获取分支树
@@ -130,7 +132,7 @@ function M.delete_branch(branch_id)
   end
 
   -- 触发事件
-  vim.api.nvim_exec_autocmds("User", { pattern = "NeoAI:branch_deleted", data = { branch_id } })
+vim.api.nvim_exec_autocmds("User", { pattern = Events.BRANCH_DELETED, data = { branch_id } })
 end
 
 --- 获取当前分支

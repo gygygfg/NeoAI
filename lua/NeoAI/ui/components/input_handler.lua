@@ -1,5 +1,7 @@
 local M = {}
 
+local Events = require("NeoAI.core.events.event_constants")
+
 -- 模块状态
 local state = {
   initialized = false,
@@ -64,7 +66,7 @@ function M.send_message(content, window_id, session_id)
 
   -- 触发聊天输入已准备好事件
   vim.api.nvim_exec_autocmds("User", {
-    pattern = "NeoAI:chat_input_ready",
+pattern = Events.CHAT_INPUT_READY,
     data = {
       message = content,
       window_id = window_id,

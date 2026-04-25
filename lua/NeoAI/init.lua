@@ -261,7 +261,7 @@ function M.get_ai_engine()
   return state.core.get_ai_engine()
 end
 
---- 获取工具系统
+-- 获取工具系统
 --- @return table 工具系统
 function M.get_tools()
   if not state.tools then

@@ -3,6 +3,7 @@ local MODULE_NAME = "NeoAI.ui.window.chat_window"
 
 local window_manager = require("NeoAI.ui.window.window_manager")
 local virtual_input = require("NeoAI.ui.components.virtual_input") -- 内联输入模式
+local Events = require("NeoAI.core.events.event_constants")
 
 -- 模块状态
 local state = {
@@ -87,7 +88,7 @@ function M.open(session_id, window_id, branch_id)
   -- 触发窗口打开事件
   vim.api.nvim_exec_autocmds(
     "User",
-    { pattern = "NeoAI:window_opening", data = { window_id = window_id, window_type = "chat" } }
+    { pattern = Events.WINDOW_OPENING, data = { window_id = window_id, window_type = "chat" } }
   )
 
   -- 获取缓冲区并设置选项
@@ -120,7 +121,7 @@ function M.open(session_id, window_id, branch_id)
   end
 
   -- 触发窗口打开事件
-  vim.api.nvim_exec_autocmds("User", { pattern = "NeoAI:window_opened", data = { window_id = window_id } })
+  vim.api.nvim_exec_autocmds("User", { pattern = Events.WINDOW_OPENED, data = { window_id = window_id } })
 
   -- 加载消息数据
   M._load_messages(session_id)
@@ -134,7 +135,7 @@ function M.open(session_id, window_id, branch_id)
   end, 500)
 
   -- 触发聊天框打开事件
-  vim.api.nvim_exec_autocmds("User", { pattern = "NeoAI:chat_box_opened", data = { window_id = window_id } })
+  vim.api.nvim_exec_autocmds("User", { pattern = Events.CHAT_BOX_OPENED, data = { window_id = window_id } })
 
   -- 自动获取焦点
   M._focus_window()
@@ -192,7 +193,7 @@ function M._do_render_chat()
     -- 触发开始渲染对话事件
     vim.api.nvim_exec_autocmds(
       "User",
-      { pattern = "NeoAI:dialogue_rendering_start", data = { window_id = state.current_window_id } }
+      { pattern = Events.DIALOGUE_RENDERING_START, data = { window_id = state.current_window_id } }
     )
 
     -- 使用异步工作器在后台构建内容
@@ -294,7 +295,8 @@ function M._do_render_chat()
 
           -- 仅在非流式状态下打开浮动虚拟输入框
           -- 流式过程中不打开，避免干扰用户查看输出
-          if not state.streaming.active then
+          -- 注意：生成完成后的渲染由 GENERATION_COMPLETED 回调统一处理滚动和打开输入框
+          if not state.streaming.active and not state.last_usage then
             M._open_float_input()
           end
 
@@ -304,7 +306,9 @@ function M._do_render_chat()
             local buf = vim.api.nvim_win_get_buf(win_handle)
             -- 延迟设置折叠选项，确保在 BufRead/BufNew 等自动命令之后执行
             vim.defer_fn(function()
-              if not vim.api.nvim_win_is_valid(win_handle) then return end
+              if not vim.api.nvim_win_is_valid(win_handle) then
+                return
+              end
               -- 使用 setlocal 确保窗口本地设置覆盖全局设置
               pcall(vim.api.nvim_win_call, win_handle, function()
                 vim.cmd("setlocal foldmethod=marker")
@@ -318,20 +322,23 @@ function M._do_render_chat()
           end
 
           -- 延迟执行滚动，确保在 set_window_content 内部的折叠刷新之后
-          vim.defer_fn(function()
-            M._scroll_to_end_with_offset()
-          end, 50)
+          -- 注意：生成完成后的渲染由 GENERATION_COMPLETED 回调统一处理滚动
+          if not state.last_usage then
+            vim.defer_fn(function()
+              M._scroll_to_end_with_offset()
+            end, 50)
+          end
 
           -- 触发渲染完成事件
           vim.api.nvim_exec_autocmds(
             "User",
-            { pattern = "NeoAI:rendering_complete", data = { window_id = state.current_window_id } }
+            { pattern = Events.RENDERING_COMPLETE, data = { window_id = state.current_window_id } }
           )
 
           -- 触发对话渲染完成事件
           vim.api.nvim_exec_autocmds(
             "User",
-            { pattern = "NeoAI:dialogue_rendering_complete", data = { window_id = state.current_window_id } }
+            { pattern = Events.DIALOGUE_RENDERING_COMPLETE, data = { window_id = state.current_window_id } }
           )
         else
           print("❌ 聊天内容渲染失败")
@@ -555,13 +562,19 @@ end
 
 --- 打开浮动虚拟输入框（内部函数）
 function M._open_float_input()
-  if not state.current_window_id then return end
+  if not state.current_window_id then
+    return
+  end
 
   -- 如果已激活，跳过
-  if virtual_input.is_active() then return end
+  if virtual_input.is_active() then
+    return
+  end
 
   local win_handle = window_manager.get_window_win(state.current_window_id)
-  if not win_handle or not vim.api.nvim_win_is_valid(win_handle) then return end
+  if not win_handle or not vim.api.nvim_win_is_valid(win_handle) then
+    return
+  end
 
   -- 打开浮动虚拟输入框
   virtual_input.open(win_handle, {
@@ -580,7 +593,9 @@ function M._open_float_input()
               if not async_success then
                 print("✗ 异步消息发送失败: " .. tostring(async_error or async_result))
                 M.show_floating_text("发送消息失败: " .. tostring(async_error or async_result), {
-                  timeout = 3000, position = "center", border = "single",
+                  timeout = 3000,
+                  position = "center",
+                  border = "single",
                 })
               end
             end
@@ -588,7 +603,9 @@ function M._open_float_input()
           if not success then
             print("⚠️  启动异步消息发送失败: " .. tostring(result))
             M.show_floating_text("启动发送失败: " .. tostring(result), {
-              timeout = 3000, position = "center", border = "single",
+              timeout = 3000,
+              position = "center",
+              border = "single",
             })
           else
             M.show_floating_text("消息发送中...", { timeout = 1000, position = "bottom" })
@@ -748,13 +765,13 @@ function M.close()
   -- 触发窗口关闭前事件
   vim.api.nvim_exec_autocmds(
     "User",
-    { pattern = "NeoAI:window_closing", data = { window_id = state.current_window_id } }
+    { pattern = Events.WINDOW_CLOSING, data = { window_id = state.current_window_id } }
   )
 
   -- 触发聊天框关闭事件
   vim.api.nvim_exec_autocmds(
     "User",
-    { pattern = "NeoAI:chat_box_closing", data = { window_id = state.current_window_id } }
+    { pattern = Events.CHAT_BOX_CLOSING, data = { window_id = state.current_window_id } }
   )
 
   -- 关闭浮动虚拟输入框
@@ -777,15 +794,12 @@ function M.close()
   state.usage_extmark_id = nil
 
   -- 触发窗口关闭事件
-  vim.api.nvim_exec_autocmds(
-    "User",
-    { pattern = "NeoAI:window_closed", data = { window_id = state.current_window_id } }
-  )
+  vim.api.nvim_exec_autocmds("User", { pattern = Events.WINDOW_CLOSED, data = { window_id = state.current_window_id } })
 
   -- 触发聊天框关闭完成事件
   vim.api.nvim_exec_autocmds(
     "User",
-    { pattern = "NeoAI:chat_box_closed", data = { window_id = state.current_window_id } }
+    { pattern = Events.CHAT_BOX_CLOSED, data = { window_id = state.current_window_id } }
   )
 end
 
@@ -822,7 +836,11 @@ function M._update_usage_virt_text()
   -- 构建用量文本
   local usage = state.last_usage
   local prompt_tokens = usage.prompt_tokens or usage.promptTokens or usage.input_tokens or usage.inputTokens or 0
-  local completion_tokens = usage.completion_tokens or usage.completionTokens or usage.output_tokens or usage.outputTokens or 0
+  local completion_tokens = usage.completion_tokens
+    or usage.completionTokens
+    or usage.output_tokens
+    or usage.outputTokens
+    or 0
   local total_tokens = usage.total_tokens or usage.totalTokens or (prompt_tokens + completion_tokens)
 
   local reasoning_tokens = 0
@@ -832,9 +850,20 @@ function M._update_usage_virt_text()
 
   local usage_text
   if reasoning_tokens and reasoning_tokens > 0 then
-    usage_text = string.format("📊 Token 用量: 输入 %d · 输出 %d (思考 %d) · 总计 %d", prompt_tokens, completion_tokens, reasoning_tokens, total_tokens)
+    usage_text = string.format(
+      "📊 Token 用量: 输入 %d · 输出 %d (思考 %d) · 总计 %d",
+      prompt_tokens,
+      completion_tokens,
+      reasoning_tokens,
+      total_tokens
+    )
   else
-    usage_text = string.format("📊 Token 用量: 输入 %d · 输出 %d · 总计 %d", prompt_tokens, completion_tokens, total_tokens)
+    usage_text = string.format(
+      "📊 Token 用量: 输入 %d · 输出 %d · 总计 %d",
+      prompt_tokens,
+      completion_tokens,
+      total_tokens
+    )
   end
 
   -- 先确保缓冲区可修改，在 AI 回复末尾追加分隔线
@@ -851,14 +880,14 @@ function M._update_usage_virt_text()
 
   if last_line_content ~= "─" then
     -- 追加分隔线
-    vim.api.nvim_buf_set_lines(buf, line_count, line_count, false, {"─", ""})
+    vim.api.nvim_buf_set_lines(buf, line_count, line_count, false, { "─", "" })
     line_count = vim.api.nvim_buf_line_count(buf)
   end
 
   -- 在分隔线下一行（空行）写入用量文本（直接写入缓冲区，支持自动换行）
   -- 同时用 extmark 的 hl_group 设置整行颜色
-  local usage_line = line_count - 1  -- 空行
-  vim.api.nvim_buf_set_lines(buf, usage_line, usage_line + 1, false, {usage_text})
+  local usage_line = line_count - 1 -- 空行
+  vim.api.nvim_buf_set_lines(buf, usage_line, usage_line + 1, false, { usage_text })
   -- 用 extmark 给这一行设置高亮颜色
   state.usage_extmark_id = vim.api.nvim_buf_set_extmark(buf, ns_id, usage_line, 0, {
     hl_group = "Comment",
@@ -1009,7 +1038,7 @@ function M.send_message_sync(message)
 
   -- 触发统一的消息发送事件
   vim.api.nvim_exec_autocmds("User", {
-    pattern = "NeoAI:message_sent",
+    pattern = Events.MESSAGE_SENT,
     data = {
       message = message,
       window_id = state.current_window_id,
@@ -1044,7 +1073,7 @@ function M.add_message(role, content, opts)
   -- 触发消息添加事件
   vim.api.nvim_exec_autocmds(
     "User",
-    { pattern = "NeoAI:message_adding", data = { window_id = state.current_window_id, role = role, content = content } }
+    { pattern = Events.MESSAGE_ADDING, data = { window_id = state.current_window_id, role = role, content = content } }
   )
 
   table.insert(state.messages, {
@@ -1056,7 +1085,7 @@ function M.add_message(role, content, opts)
   -- 触发消息添加完成事件
   vim.api.nvim_exec_autocmds(
     "User",
-    { pattern = "NeoAI:message_added", data = { window_id = state.current_window_id, role = role, content = content } }
+    { pattern = Events.MESSAGE_ADDED, data = { window_id = state.current_window_id, role = role, content = content } }
   )
 
   -- 持久化消息到 session_manager 和 history_manager
@@ -1142,7 +1171,7 @@ end
 --- 滚动到缓冲区末尾，使最后一行位于窗口底部上方指定行数处
 --- @param offset number|nil 距离底部的行数偏移，默认15
 function M._scroll_to_end_with_offset(offset)
-  offset = offset or 15
+  offset = offset or 10
   if not state.current_window_id then
     return
   end
@@ -1159,12 +1188,23 @@ function M._scroll_to_end_with_offset(offset)
 
   local line_count = vim.api.nvim_buf_line_count(buf)
   if line_count > 0 then
-    pcall(vim.api.nvim_win_set_cursor, win_handle, { line_count, 0 })
     pcall(vim.api.nvim_win_call, win_handle, function()
-      vim.cmd('normal! zb')
-      if offset > 0 then
-        vim.cmd(string.format('normal! %d<C-y>', offset))
+      -- 计算目标 topline：让最后一行位于窗口底部上方 offset 行处
+      -- 先获取窗口高度
+      local win_height = vim.api.nvim_win_get_height(win_handle)
+      -- 目标 topline = line_count - win_height + 1 + offset
+      -- 当 offset=0 时，最后一行刚好在窗口底部
+      -- 当 offset>0 时，最后一行在窗口底部上方 offset 行处
+      local target_topline = line_count - win_height + 1 + offset
+      if target_topline < 1 then
+        target_topline = 1
       end
+      -- 使用 winrestview 设置 topline，不移动光标
+      local view = vim.fn.winsaveview()
+      view.topline = target_topline
+      vim.fn.winrestview(view)
+      -- 将光标移到末尾行（不改变视图）
+      pcall(vim.api.nvim_win_set_cursor, 0, { line_count, 0 })
     end)
   end
 end
@@ -1192,7 +1232,7 @@ function M.show_floating_text(text, opts)
 
   -- 触发显示悬浮文本事件
   vim.api.nvim_exec_autocmds("User", {
-    pattern = "NeoAI:floating_text_showing",
+    pattern = Events.FLOATING_TEXT_SHOWING,
     data = {
       window_id = state.current_window_id,
       text = text,
@@ -1204,7 +1244,7 @@ function M.show_floating_text(text, opts)
 
   -- 触发显示悬浮文本完成事件
   vim.api.nvim_exec_autocmds("User", {
-    pattern = "NeoAI:floating_text_shown",
+    pattern = Events.FLOATING_TEXT_SHOWN,
     data = {
       window_id = state.current_window_id,
       text = text,
@@ -1223,7 +1263,7 @@ function M.close_floating_text()
   -- 触发关闭悬浮文本事件
   vim.api.nvim_exec_autocmds(
     "User",
-    { pattern = "NeoAI:floating_text_closing", data = {
+    { pattern = Events.FLOATING_TEXT_CLOSING, data = {
       window_id = state.current_window_id,
     } }
   )
@@ -1233,7 +1273,7 @@ function M.close_floating_text()
   -- 触发关闭悬浮文本完成事件
   vim.api.nvim_exec_autocmds(
     "User",
-    { pattern = "NeoAI:floating_text_closed", data = {
+    { pattern = Events.FLOATING_TEXT_CLOSED, data = {
       window_id = state.current_window_id,
     } }
   )
@@ -1250,7 +1290,7 @@ function M._setup_event_listeners()
 
   -- 监听AI生成开始事件：关闭虚拟输入框
   vim.api.nvim_create_autocmd("User", {
-    pattern = "NeoAI:generation_started",
+    pattern = Events.GENERATION_STARTED,
     callback = function(args)
       local data = args.data or {}
       local window_id = data.window_id
@@ -1270,7 +1310,7 @@ function M._setup_event_listeners()
   -- 监听AI生成完成事件（AI引擎触发的事件）
   -- 流式完成后服务器会重新发送完整正文和token用量，用这个替换当前正文
   vim.api.nvim_create_autocmd("User", {
-    pattern = "NeoAI:generation_completed",
+    pattern = Events.GENERATION_COMPLETED,
     callback = function(args)
       local data = args.data or {}
       local response = data.response
@@ -1364,20 +1404,28 @@ function M._setup_event_listeners()
       M.render_chat()
 
       -- 等待渲染和折叠操作全部完成后，添加 token 用量信息
+      -- 然后滚动窗口，最后打开浮动输入框
       vim.defer_fn(function()
         M._update_usage_virt_text()
-      end, 500)
 
-      -- AI正文输出结束后，打开浮动输入框并将光标移动过去
-      vim.defer_fn(function()
-        M._open_float_input()
-      end, 600)
+        -- 用量显示完成后等100毫秒先滚动再打开虚拟输入框
+        vim.defer_fn(function()
+          -- 使用统一的 _scroll_to_end_with_offset 进行滚动
+          -- 打开浮动输入框（这可能会触发 WinEnter 等事件）
+          M._open_float_input()
+
+          -- 打开输入框后再次执行滚动，防止焦点切换导致滚动位置被重置
+          vim.defer_fn(function()
+            M._scroll_to_end_with_offset(10)
+          end, 100)
+        end, 100)
+      end, 50)
     end,
   })
 
   -- 监听消息发送事件（用于更新UI状态）
   vim.api.nvim_create_autocmd("User", {
-    pattern = "NeoAI:message_sent",
+    pattern = Events.MESSAGE_SENT,
     callback = function(args)
       -- print("📢 收到消息发送事件")
       local data = args.data or {}
@@ -1407,7 +1455,7 @@ function M._setup_event_listeners()
   -- 监听AI引擎发出的标准流式数据块事件 (NeoAI:stream_chunk)
   -- 这是AI引擎在流式请求中发出的标准事件
   vim.api.nvim_create_autocmd("User", {
-    pattern = "NeoAI:stream_chunk",
+    pattern = Events.STREAM_CHUNK,
     callback = function(args)
       local data = args.data or {}
       local chunk = data.chunk
@@ -1487,7 +1535,7 @@ function M._setup_event_listeners()
 
   -- 监听思考内容事件 (NeoAI:reasoning_content)
   vim.api.nvim_create_autocmd("User", {
-    pattern = "NeoAI:reasoning_content",
+    pattern = Events.REASONING_CONTENT,
     callback = function(args)
       local data = args.data or {}
       local reasoning_content = data.reasoning_content
@@ -1535,7 +1583,7 @@ function M._setup_event_listeners()
 
   -- 监听旧的 ai_response_chunk 事件（兼容旧的事件流）
   vim.api.nvim_create_autocmd("User", {
-    pattern = "NeoAI:ai_response_chunk",
+    pattern = Events.AI_RESPONSE_CHUNK,
     callback = function(args)
       local data = args.data or {}
       local chunk = data.chunk
@@ -1583,7 +1631,7 @@ function M._setup_event_listeners()
 
   -- 监听流式生成完成事件
   vim.api.nvim_create_autocmd("User", {
-    pattern = "NeoAI:stream_completed",
+    pattern = Events.STREAM_COMPLETED,
     callback = function(args)
       local data = args.data or {}
       local generation_id = data.generation_id
@@ -1620,7 +1668,7 @@ function M._setup_event_listeners()
 
   -- 监听生成取消事件
   vim.api.nvim_create_autocmd("User", {
-    pattern = "NeoAI:generation_cancelled",
+    pattern = Events.GENERATION_CANCELLED,
     callback = function(args)
       local data = args.data or {}
       local generation_id = data.generation_id

@@ -19,6 +19,8 @@
 
 local M = {}
 
+local Events = require("NeoAI.core.events.event_constants")
+
 local state = {
   initialized = false,
   config = nil,
@@ -218,7 +220,7 @@ function M.create_session(name, is_root, parent_id)
   end
   state.current_session_id = id
   -- 不在创建时保存，等 add_round（会话完成一轮对话）时才保存
-  trigger_event("NeoAI:session_created", { session_id = id, session = session })
+  trigger_event(Events.SESSION_CREATED, { session_id = id, session = session })
   return id
 end
 
@@ -244,7 +246,7 @@ function M.set_current_session(session_id)
     return false
   end
   state.current_session_id = session_id
-  trigger_event("NeoAI:session_changed", { session_id = session_id })
+  trigger_event(Events.SESSION_CHANGED, { session_id = session_id })
   return true
 end
 
@@ -309,7 +311,7 @@ function M.delete_session(session_id)
   end
 
   debounce_save()
-  trigger_event("NeoAI:session_deleted", { session_id = session_id })
+  trigger_event(Events.SESSION_DELETED, { session_id = session_id })
   return true
 end
 
@@ -339,7 +341,7 @@ function M.add_round(session_id, user_msg, assistant_msg, usage)
   end
   session.updated_at = os.time()
   debounce_save()
-  trigger_event("NeoAI:round_added", { session_id = session_id, session = session })
+  trigger_event(Events.ROUND_ADDED, { session_id = session_id, session = session })
   return session
 end
 
@@ -504,7 +506,7 @@ function M.cleanup_orphans()
   end
   if changed then
     debounce_save()
-    trigger_event("NeoAI:orphans_cleaned", {})
+    trigger_event(Events.ORPHANS_CLEANED, {})
   end
 end
 
@@ -794,7 +796,7 @@ function M.delete_chain_to_branch(session_id)
   end
 
   debounce_save()
-  trigger_event("NeoAI:session_deleted", { session_id = session_id })
+  trigger_event(Events.SESSION_DELETED, { session_id = session_id })
   return true
 end
 

@@ -3,6 +3,8 @@
 
 local M = {}
 
+local Events = require("NeoAI.core.events.event_constants")
+
 local state = {
   initialized = false,
   config = nil,
@@ -22,28 +24,28 @@ function M.initialize(config)
   state.initialized = true
 
   vim.api.nvim_create_autocmd("User", {
-    pattern = "NeoAI:message_sent",
+    pattern = Events.MESSAGE_SENT,
     callback = function(args)
       M._trigger_ai_response(args.data or {})
     end,
   })
 
   vim.api.nvim_create_autocmd("User", {
-    pattern = "NeoAI:generation_completed",
+    pattern = Events.GENERATION_COMPLETED,
     callback = function(args)
       M._handle_response_complete(args.data or {})
     end,
   })
 
   vim.api.nvim_create_autocmd("User", {
-    pattern = "NeoAI:stream_chunk",
+    pattern = Events.STREAM_CHUNK,
     callback = function(args)
       M._handle_stream_chunk(args.data or {})
     end,
   })
 
   vim.api.nvim_create_autocmd("User", {
-    pattern = "NeoAI:stream_completed",
+    pattern = Events.STREAM_COMPLETED,
     callback = function(args)
       M._handle_stream_complete(args.data or {})
     end,
@@ -238,7 +240,7 @@ function M.send_message(content, session_id, branch_id, window_id, format, callb
   end
 
   vim.api.nvim_exec_autocmds("User", {
-    pattern = "NeoAI:message_sent",
+    pattern = Events.MESSAGE_SENT,
     data = {
       session_id = target_session_id,
       window_id = window_id,

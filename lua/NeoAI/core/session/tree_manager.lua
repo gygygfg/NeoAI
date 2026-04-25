@@ -1,5 +1,7 @@
 local M = {}
 
+local Events = require("NeoAI.core.events.event_constants")
+
 -- 节点类型
 local NODE_TYPES = {
   ROOT_BRANCH = "root_branch",
@@ -125,8 +127,8 @@ function M.create_root_branch(name)
   tree_nodes["virtual_root"].metadata.node_count = tree_nodes["virtual_root"].metadata.node_count + 1
 
   -- 触发事件
-  vim.api.nvim_exec_autocmds("User", {
-    pattern = "NeoAI:root_branch_created",
+vim.api.nvim_exec_autocmds("User", {
+    pattern = Events.ROOT_BRANCH_CREATED,
     data = { node_id, node },
   })
 
@@ -187,8 +189,8 @@ function M.create_sub_branch(parent_id, name)
   parent.metadata.child_count = parent.metadata.child_count + 1
 
   -- 触发事件
-  vim.api.nvim_exec_autocmds("User", {
-    pattern = "NeoAI:sub_branch_created",
+vim.api.nvim_exec_autocmds("User", {
+    pattern = Events.SUB_BRANCH_CREATED,
     data = { node_id, node, parent_id },
   })
 
@@ -272,8 +274,8 @@ function M.create_session(parent_id, name, metadata)
   parent.metadata.session_count = parent.metadata.session_count + 1
 
   -- 触发事件
-  vim.api.nvim_exec_autocmds("User", {
-    pattern = "NeoAI:session_created",
+vim.api.nvim_exec_autocmds("User", {
+    pattern = Events.SESSION_CREATED,
     data = { node_id, node, parent_id },
   })
 
@@ -366,8 +368,8 @@ function M.create_conversation_round(session_id, round_number, user_message, ai_
   session.metadata.last_updated = os.time()
 
   -- 触发事件
-  vim.api.nvim_exec_autocmds("User", {
-    pattern = "NeoAI:conversation_round_created",
+vim.api.nvim_exec_autocmds("User", {
+    pattern = Events.CONVERSATION_ROUND_CREATED,
     data = { node_id, node, session_id },
   })
 
@@ -428,8 +430,8 @@ function M.create_message(round_id, role, content, round_number, message_index)
   table.insert(round.children, node_id)
 
   -- 触发事件
-  vim.api.nvim_exec_autocmds("User", {
-    pattern = "NeoAI:message_created",
+vim.api.nvim_exec_autocmds("User", {
+    pattern = Events.MESSAGE_CREATED,
     data = { node_id, node, round_id },
   })
 
@@ -541,8 +543,8 @@ function M.delete_node(node_id)
   tree_nodes[node_id] = nil
 
   -- 触发事件
-  vim.api.nvim_exec_autocmds("User", {
-    pattern = "NeoAI:node_deleted",
+vim.api.nvim_exec_autocmds("User", {
+    pattern = Events.NODE_DELETED,
     data = { node_id, node.type },
   })
 
@@ -563,8 +565,8 @@ function M.rename_node(node_id, new_name)
   node.name = new_name
 
   -- 触发事件
-  vim.api.nvim_exec_autocmds("User", {
-    pattern = "NeoAI:node_renamed",
+vim.api.nvim_exec_autocmds("User", {
+    pattern = Events.NODE_RENAMED,
     data = { node_id, old_name, new_name },
   })
 
@@ -624,8 +626,8 @@ function M.move_node(node_id, new_parent_id)
   end
 
   -- 触发事件
-  vim.api.nvim_exec_autocmds("User", {
-    pattern = "NeoAI:node_moved",
+vim.api.nvim_exec_autocmds("User", {
+    pattern = Events.NODE_MOVED,
     data = { node_id, node.parent_id, new_parent_id },
   })
 

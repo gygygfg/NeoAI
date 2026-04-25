@@ -1,6 +1,7 @@
 local M = {}
 
 local SkipList = require("NeoAI.utils.skiplist")
+local Events = require("NeoAI.core.events.event_constants")
 
 -- 消息存储：每个分支一个跳表，按时间序排列
 -- branch_messages[branch_id] = SkipList
@@ -94,7 +95,7 @@ function M.add_message(branch_id, role, content, metadata)
     skiplist_key = skiplist_key,
   }
 
-  vim.api.nvim_exec_autocmds("User", { pattern = "NeoAI:message_added", data = { message_id, message } })
+vim.api.nvim_exec_autocmds("User", { pattern = Events.MESSAGE_ADDED, data = { message_id, message } })
 
   return message_id
 end
@@ -144,7 +145,7 @@ function M.edit_message(message_id, content)
   message.content = content
   message.updated_at = os.time()
 
-  vim.api.nvim_exec_autocmds("User", { pattern = "NeoAI:message_edited", data = { message_id, old_content, content } })
+vim.api.nvim_exec_autocmds("User", { pattern = Events.MESSAGE_EDITED, data = { message_id, old_content, content } })
 end
 
 --- 更新消息字段
@@ -169,8 +170,8 @@ function M.update_message(message_id, updates)
   end
   message.updated_at = os.time()
 
-  vim.api.nvim_exec_autocmds("User", {
-    pattern = "NeoAI:message_updated",
+vim.api.nvim_exec_autocmds("User", {
+    pattern = Events.MESSAGE_UPDATED,
     data = { message_id = message_id, message = message }
   })
 
@@ -192,7 +193,7 @@ function M.delete_message(message_id)
   sl:delete(entry.skiplist_key)
   message_id_map[message_id] = nil
 
-  vim.api.nvim_exec_autocmds("User", { pattern = "NeoAI:message_deleted", data = { message_id, message } })
+vim.api.nvim_exec_autocmds("User", { pattern = Events.MESSAGE_DELETED, data = { message_id, message } })
 end
 
 --- 清空分支消息
@@ -211,7 +212,7 @@ function M.clear_messages(branch_id)
   end
   sl:clear()
 
-  vim.api.nvim_exec_autocmds("User", { pattern = "NeoAI:messages_cleared", data = { branch_id, deleted_ids } })
+vim.api.nvim_exec_autocmds("User", { pattern = Events.MESSAGES_CLEARED, data = { branch_id, deleted_ids } })
 end
 
 --- 获取消息数量

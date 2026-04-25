@@ -3,6 +3,7 @@ local M = {}
 local file_utils = require("NeoAI.utils.file_utils")
 local branch_manager = require("NeoAI.core.session.branch_manager")
 local message_manager = require("NeoAI.core.session.message_manager")
+local Events = require("NeoAI.core.events.event_constants")
 
 -- 模块状态
 local state = {
@@ -156,7 +157,7 @@ function M.backup_sessions()
   file_utils.write_file(backup_file, vim.json.encode(backup_data))
 
   -- 触发事件
-  vim.api.nvim_exec_autocmds("User", { pattern = "NeoAI:backup_created", data = { backup_file, #sessions } })
+vim.api.nvim_exec_autocmds("User", { pattern = Events.BACKUP_CREATED, data = { backup_file, #sessions } })
 
   return backup_file
 end
@@ -200,7 +201,7 @@ function M.restore_backup(backup_id)
   end
 
   -- 触发事件
-  vim.api.nvim_exec_autocmds("User", { pattern = "NeoAI:backup_restored", data = { backup_file, #restored_sessions } })
+vim.api.nvim_exec_autocmds("User", { pattern = Events.BACKUP_RESTORED, data = { backup_file, #restored_sessions } })
 
   return restored_sessions
 end
@@ -283,7 +284,7 @@ function M.save_session(session_id, filepath)
   local success = file_utils.write_file(filepath, vim.json.encode(export_data))
 
   if success and state.event_bus then
-    vim.api.nvim_exec_autocmds("User", { pattern = "NeoAI:session_saved", data = { session_id, filepath } })
+vim.api.nvim_exec_autocmds("User", { pattern = Events.SESSION_SAVED, data = { session_id, filepath } })
   end
 
   return success
@@ -314,7 +315,7 @@ function M.load_session(filepath)
   local new_session_id = M.import_session(import_data, "json")
 
   if new_session_id and state.event_bus then
-    vim.api.nvim_exec_autocmds("User", { pattern = "NeoAI:session_loaded", data = { new_session_id, filepath } })
+vim.api.nvim_exec_autocmds("User", { pattern = Events.SESSION_LOADED, data = { new_session_id, filepath } })
   end
 
   return new_session_id

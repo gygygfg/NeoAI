@@ -5,6 +5,7 @@ local M = {}
 -- 导入依赖模块
 local tool_registry = require("NeoAI.tools.tool_registry")
 local tool_validator = require("NeoAI.tools.tool_validator")
+local Events = require("NeoAI.core.events.event_constants")
 
 -- 检查 vim 模块是否可用，如果不可用则使用简单的深拷贝函数
 local function deep_copy(obj, seen)
@@ -112,7 +113,7 @@ function M.execute(tool_name, args)
   -- 触发工具执行开始事件
   if vim and vim.api and vim.api.nvim_exec_autocmds then
     vim.api.nvim_exec_autocmds("User", {
-      pattern = "NeoAI:tool_execution_started",
+      pattern = Events.TOOL_EXECUTION_STARTED,
       data = { tool_name = tool_name, args = args, start_time = start_time },
     })
   end
@@ -129,7 +130,7 @@ function M.execute(tool_name, args)
   -- 触发工具执行完成事件
   if vim and vim.api and vim.api.nvim_exec_autocmds then
     vim.api.nvim_exec_autocmds("User", {
-      pattern = "NeoAI:tool_execution_completed",
+      pattern = Events.TOOL_EXECUTION_COMPLETED,
       data = { tool_name = tool_name, args = args, result = result, duration = duration },
     })
   end
@@ -141,7 +142,7 @@ function M.execute(tool_name, args)
     -- 触发工具执行错误事件
     if vim and vim.api and vim.api.nvim_exec_autocmds then
       vim.api.nvim_exec_autocmds("User", {
-        pattern = "NeoAI:tool_execution_error",
+        pattern = Events.TOOL_EXECUTION_ERROR,
         data = { tool_name = tool_name, args = args, error_msg = full_error_msg, duration = duration },
       })
     end

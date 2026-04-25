@@ -1,5 +1,7 @@
 local M = {}
 
+local Events = require("NeoAI.core.events.event_constants")
+
 -- 窗口存储
 local windows = {}
 local window_counter = 0
@@ -508,11 +510,17 @@ function M.create_window(window_type, options)
   end
 
   -- 触发窗口创建事件
-  local event_name = "NeoAI:" .. window_type .. "_window_opened"
-  vim.api.nvim_exec_autocmds("User", {
-    pattern = event_name,
-    data = { window_id, window_type, merged_options },
-  })
+  local event_map = {
+    chat = Events.CHAT_WINDOW_OPENED,
+    tree = Events.TREE_WINDOW_OPENED,
+  }
+  local event_name = event_map[window_type]
+  if event_name then
+    vim.api.nvim_exec_autocmds("User", {
+      pattern = event_name,
+      data = { window_id = window_id, window_type = window_type, options = merged_options },
+    })
+  end
 
   return window_id
 end
@@ -541,11 +549,17 @@ function M.close_window(window_id)
   end
 
   -- 触发窗口关闭事件
-  local event_name = "NeoAI:" .. window.type .. "_window_closed"
-  vim.api.nvim_exec_autocmds("User", {
-    pattern = event_name,
-    data = { window_id, window.type },
-  })
+  local event_map = {
+    chat = Events.CHAT_WINDOW_CLOSED,
+    tree = Events.TREE_WINDOW_CLOSED,
+  }
+  local event_name = event_map[window.type]
+  if event_name then
+    vim.api.nvim_exec_autocmds("User", {
+      pattern = event_name,
+      data = { window_id = window_id, window_type = window.type },
+    })
+  end
 
   -- 从存储中移除
   windows[window_id] = nil
