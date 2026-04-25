@@ -40,7 +40,7 @@ function M.execute_tool_loop(params)
     error("Tool orchestrator not initialized")
   end
 
-  if #state.tools == 0 then
+  if not next(state.tools) then
     return nil
   end
 
@@ -204,7 +204,20 @@ function M.execute_tool(params)
     })
   end
 
-  return result or error_msg
+  local final_result = result or error_msg
+  if type(final_result) ~= "string" then
+    if type(final_result) == "table" then
+      local ok, encoded = pcall(vim.json.encode, final_result)
+      if ok then
+        final_result = encoded
+      else
+        final_result = vim.inspect(final_result)
+      end
+    else
+      final_result = tostring(final_result)
+    end
+  end
+  return final_result
 end
 
 --- 设置工具

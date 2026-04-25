@@ -136,7 +136,7 @@ function M.execute(tool_name, args)
   end
 
   -- 处理执行结果
-  if call_error then
+  if call_error and call_error ~= "" then
     local full_error_msg = "工具执行错误: " .. call_error
 
     -- 触发工具执行错误事件
@@ -315,26 +315,38 @@ function M.safe_call(func, args, max_retries, retry_delay)
     end
 
     local start_time = os.time()
-    local success, result = pcall(func, args)
-    local end_time = os.time()
-    local duration = end_time - start_time
-
-    if success then
-      -- 成功执行
-      return result, ""
-    else
-      -- 执行失败
-      last_error = result
-
-      -- 检查是否应该重试
+    -- 使用 select 捕获所有返回值，避免 pcall 只捕获第一个返回值
+    local success, result, err_msg = pcall(func, args)
+    -- 如果函数返回了多个值（如 return nil, "error msg"），pcall 只捕获前两个
+    -- 但我们可以通过检查 result 是否为 nil 且函数约定返回 nil, err 来判断
+    if not success then
+      -- pcall 捕获到异常（函数内部抛出的 error）
+      last_error = tostring(result)
       if attempt < max_retries then
-        -- 分析错误类型，决定是否重试
-        local should_retry = M._should_retry_error(result)
+        local should_retry = M._should_retry_error(last_error)
         if not should_retry then
           break
         end
       end
+    else
+      -- 函数正常执行完毕
+      -- 检查函数是否返回了错误（约定：返回 nil, error_msg）
+      if result == nil and err_msg ~= nil then
+        -- 函数返回了 nil, error_msg
+        last_error = tostring(err_msg)
+        if attempt < max_retries then
+          local should_retry = M._should_retry_error(last_error)
+          if not should_retry then
+            break
+          end
+        end
+      else
+        -- 函数执行成功，返回结果
+        return result, nil
+      end
     end
+    local end_time = os.time()
+    local duration = end_time - start_time
   end
 
   return nil, "安全调用失败: " .. (last_error or "未知错误")

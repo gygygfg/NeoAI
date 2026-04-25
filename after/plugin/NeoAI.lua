@@ -11,9 +11,9 @@ vim.api.nvim_create_autocmd("VimLeavePre", {
       return
     end
     
-    -- 尝试获取会话管理器
-    local session_mgr = core.get_session_manager()
-    if session_mgr then
+    -- 检查 core 是否已初始化（get_session_manager 在未初始化时会 error）
+    local ok, session_mgr = pcall(core.get_session_manager, core)
+    if ok and session_mgr then
       -- 记录日志（可选）
       vim.notify("NeoAI: 正在保存会话...", vim.log.levels.INFO)
       

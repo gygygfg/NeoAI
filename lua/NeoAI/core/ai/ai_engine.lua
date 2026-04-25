@@ -636,19 +636,60 @@ function M._handle_stream_end(generation_id, params)
       end
     end
 
-    -- 使用 vim.schedule 确保 nvim_exec_autocmds 在 jobstart 回调中安全执行
-    vim.schedule(function()
-      -- 触发工具调用检测事件，让 tool_orchestrator 处理
-      vim.api.nvim_exec_autocmds("User", {
-        pattern = event_constants.TOOL_CALL_DETECTED,
-        data = {
+    -- 检查工具是否启用
+    local tools_enabled = true
+    if state.full_config then
+      if state.full_config.tools and state.full_config.tools.enabled ~= nil then
+        tools_enabled = state.full_config.tools.enabled
+      elseif state.full_config.ai and state.full_config.ai.tools_enabled ~= nil then
+        tools_enabled = state.full_config.ai.tools_enabled
+      end
+    end
+
+    if tools_enabled then
+      -- 使用 vim.schedule 确保在 jobstart 回调中安全执行
+      -- execute_tool_loop 内部会触发 nvim_exec_autocmds 事件
+      vim.schedule(function()
+        local tool_results = state.tool_orchestrator.execute_tool_loop({
           generation_id = generation_id,
           tool_calls = tool_calls,
           session_id = session_id,
           window_id = window_id,
-        },
-      })
-    end)
+          options = params.options or {},
+        })
+
+        if tool_results and #tool_results > 0 then
+          -- 清理流式处理器（工具结果会触发新一轮生成，不需要触发 STREAM_COMPLETED）
+          state.stream_processor.end_stream(generation_id)
+
+          -- 触发工具结果接收事件
+          vim.api.nvim_exec_autocmds("User", {
+            pattern = event_constants.TOOL_RESULT_RECEIVED,
+            data = {
+              generation_id = generation_id,
+              tool_results = tool_results,
+              session_id = session_id,
+              window_id = window_id,
+            },
+          })
+        else
+          -- 工具执行无结果，触发 STREAM_COMPLETED 完成生成
+          state.stream_processor.end_stream(generation_id)
+          vim.api.nvim_exec_autocmds("User", {
+            pattern = event_constants.STREAM_COMPLETED,
+            data = {
+              generation_id = generation_id,
+              full_response = full_response,
+              reasoning_text = reasoning_text,
+              usage = usage,
+              session_id = session_id,
+              window_id = window_id,
+            },
+          })
+        end
+      end)
+      return  -- 由 vim.schedule 中的逻辑决定后续流程
+    end
   end
 
   -- 清理流式处理器
