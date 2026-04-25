@@ -12,7 +12,7 @@ local state = {
   config = nil,
   current_window_id = nil,
   current_session_id = nil,
-  flat_items = {},          -- 从 history_tree 获取的渲染列表
+  flat_items = {}, -- 从 history_tree 获取的渲染列表
   selected_session_id = nil, -- 当前选中的真实会话ID
   cursor_augroup = nil,
   float_win_id = nil,
@@ -51,7 +51,7 @@ function M.open(session_id, window_id)
   state.selected_session_id = nil
 
   vim.api.nvim_exec_autocmds("User", {
-pattern = Events.WINDOW_OPENING,
+    pattern = Events.WINDOW_OPENING,
     data = { window_id = window_id, window_type = "tree" },
   })
 
@@ -75,7 +75,7 @@ pattern = Events.WINDOW_OPENING,
   end
 
   vim.api.nvim_exec_autocmds("User", {
-pattern = Events.WINDOW_OPENED,
+    pattern = Events.WINDOW_OPENED,
     data = { window_id = window_id },
   })
 
@@ -86,7 +86,7 @@ pattern = Events.WINDOW_OPENED,
   end)
 
   vim.api.nvim_exec_autocmds("User", {
-pattern = Events.TREE_WINDOW_OPENED,
+    pattern = Events.TREE_WINDOW_OPENED,
     data = { window_id = window_id },
   })
 
@@ -133,7 +133,7 @@ function M.render_tree()
 
   local ok, err = pcall(function()
     vim.api.nvim_exec_autocmds("User", {
-pattern = Events.TREE_RENDERING_START,
+      pattern = Events.TREE_RENDERING_START,
       data = { window_id = state.current_window_id },
     })
 
@@ -143,7 +143,11 @@ pattern = Events.TREE_RENDERING_START,
 
     -- 恢复光标行号（直接记忆行号，不依赖 session_id）
     if saved_cursor_line then
-      local line_count = vim.api.nvim_buf_line_count(window_manager.get_window_buf(state.current_window_id))
+      local buf = window_manager.get_window_buf(state.current_window_id)
+      if not buf then
+        return
+      end
+      local line_count = vim.api.nvim_buf_line_count(buf)
       local target_line = math.min(saved_cursor_line, line_count)
       if target_line < 1 then
         target_line = 1
@@ -157,11 +161,11 @@ pattern = Events.TREE_RENDERING_START,
     M._update_selection_from_cursor()
 
     vim.api.nvim_exec_autocmds("User", {
-pattern = Events.RENDERING_COMPLETE,
+      pattern = Events.RENDERING_COMPLETE,
       data = { window_id = state.current_window_id },
     })
     vim.api.nvim_exec_autocmds("User", {
-pattern = Events.TREE_RENDERING_COMPLETE,
+      pattern = Events.TREE_RENDERING_COMPLETE,
       data = { window_id = state.current_window_id },
     })
   end)
@@ -244,7 +248,7 @@ function M._build_line_to_session_map()
   for line, item in ipairs(state.flat_items) do
     -- line 是 1-based 的 flat_items 索引，对应 buffer 行号 = line + 1（因为标题和空行占了2行）
     -- 但我们需要 0-based 的 buffer 行号，所以用 line + 1
-    local buf_line = line + 1  -- 0-based buffer 行号
+    local buf_line = line + 1 -- 0-based buffer 行号
     if not item.is_virtual and item.session_id then
       map[buf_line] = item.session_id
     end
@@ -295,15 +299,33 @@ function M.set_keymaps(keymap_manager)
   local handlers = require("NeoAI.ui.handlers.tree_handlers")
 
   local mapping = {
-    [keymaps.up] = function() M._move_selection("up") end,
-    [keymaps.down] = function() M._move_selection("down") end,
-    [keymaps.select] = function() handlers.handle_enter() end,
-    [keymaps.new_child] = function() handlers.handle_n() end,
-    [keymaps.new_root] = function() handlers.handle_N() end,
-    [keymaps.delete] = function() handlers.handle_d() end,
-    [keymaps.delete_branch] = function() handlers.handle_D() end,
-    [keymaps.quit] = function() M.close() end,
-    [keymaps.refresh] = function() M.refresh_tree() end,
+    [keymaps.up] = function()
+      M._move_selection("up")
+    end,
+    [keymaps.down] = function()
+      M._move_selection("down")
+    end,
+    [keymaps.select] = function()
+      handlers.handle_enter()
+    end,
+    [keymaps.new_child] = function()
+      handlers.handle_n()
+    end,
+    [keymaps.new_root] = function()
+      handlers.handle_N()
+    end,
+    [keymaps.delete] = function()
+      handlers.handle_d()
+    end,
+    [keymaps.delete_branch] = function()
+      handlers.handle_D()
+    end,
+    [keymaps.quit] = function()
+      M.close()
+    end,
+    [keymaps.refresh] = function()
+      M.refresh_tree()
+    end,
   }
 
   for key, callback in pairs(mapping) do
@@ -455,7 +477,7 @@ function M.close()
   end
 
   vim.api.nvim_exec_autocmds("User", {
-pattern = Events.WINDOW_CLOSING,
+    pattern = Events.WINDOW_CLOSING,
     data = { window_id = state.current_window_id },
   })
 
@@ -475,7 +497,7 @@ pattern = Events.WINDOW_CLOSING,
   state.float_buf_id = nil
 
   vim.api.nvim_exec_autocmds("User", {
-pattern = Events.WINDOW_CLOSED,
+    pattern = Events.WINDOW_CLOSED,
     data = { window_id = state.current_window_id },
   })
 end

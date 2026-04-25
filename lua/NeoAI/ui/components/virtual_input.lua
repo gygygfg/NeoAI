@@ -178,17 +178,8 @@ function M.close(force)
     return
   end
 
-  -- 从 window_manager 注销
-  local ok, wm = pcall(require, "NeoAI.ui.window.window_manager")
-  if ok and wm and wm.unregister_float_window then
-    -- 尝试从所有已注册的悬浮窗口中查找并注销
-    -- 由于 close 时可能没有 parent_win，遍历所有已注册的
-    -- 但更简单的方式：如果 float_buf 存在，用它来查找
-    if state.float_buf then
-      -- 不直接调用 unregister_float_window，因为需要 main_buf
-      -- 直接清理即可
-    end
-  end
+  -- 从 window_manager 注销（无需额外操作，后续会直接清理）
+  pcall(require, "NeoAI.ui.window.window_manager")
 
   -- 关闭浮动窗口
   if state.float_win and vim.api.nvim_win_is_valid(state.float_win) then
@@ -203,7 +194,14 @@ function M.close(force)
   state.float_buf = nil
 
   -- 切换到 NORMAL 模式
-  pcall(vim.cmd, "stopinsert")
+  pcall(function()
+    vim.cmd.stopinsert()
+  end)
+
+  -- 将焦点移回父窗口（chat 窗口）
+  if state.parent_win and vim.api.nvim_win_is_valid(state.parent_win) then
+    pcall(vim.api.nvim_set_current_win, state.parent_win)
+  end
 
   state.active = false
   state.parent_win = nil
@@ -397,19 +395,72 @@ function M._setup_float_keymaps()
     M._submit_float()
   end, { buffer = buf, noremap = true, silent = true, desc = "发送消息" })
 
-  -- 取消（Esc 退出插入模式时不关闭，再按一次 Esc 关闭）
-  vim.keymap.set("i", "<Esc>", function()
-    vim.cmd("stopinsert")
-  end, { buffer = buf, noremap = true, silent = true, desc = "退出插入模式" })
+  -- 不绑定 Esc 快捷键，让 Neovim 默认行为处理
+  -- 插入模式下按 Esc 会退出到 normal 模式
+  -- normal 模式下按 Esc 无特殊行为（用户可用 q 关闭聊天窗口）
 
-  vim.keymap.set("n", "<Esc>", function()
-    M.close()
-  end, { buffer = buf, noremap = true, silent = true, desc = "关闭输入框" })
+  -- i 在 normal 模式下进入插入模式
+  vim.keymap.set("n", "i", function()
+    if state.float_win and vim.api.nvim_win_is_valid(state.float_win) then
+      pcall(vim.api.nvim_set_current_win, state.float_win)
+      -- 将光标定位到 > 后面
+      pcall(vim.api.nvim_win_set_cursor, state.float_win, { 1, 2 })
+      vim.cmd("startinsert!")
+    end
+  end, { buffer = buf, noremap = true, silent = true, desc = "进入插入模式" })
 
   -- 清空输入
   vim.keymap.set("i", "<C-u>", function()
+    if not buf then
+      return
+    end
     vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "> " })
+    -- 重置光标位置到行首
+    vim.api.nvim_win_set_cursor(vim.api.nvim_get_current_win(), { 1, 2 })
   end, { buffer = buf, noremap = true, silent = true, desc = "清空输入" })
+
+  -- 在浮动输入框的 normal 模式下也绑定 chat 窗口的快捷键
+  -- 这样用户在输入框里按 q/r/m 等键也能操作聊天窗口
+  if buf then
+    M._bind_chat_keymaps_to_float(buf)
+  end
+end
+
+--- 将 chat 窗口的快捷键绑定到浮动输入框的 normal 模式
+--- 这样光标在输入框里时，按 q/r/m 等键也能操作聊天窗口
+--- @param buf number 浮动输入框 buffer
+function M._bind_chat_keymaps_to_float(buf)
+  if not buf or not vim.api.nvim_buf_is_valid(buf) then
+    return
+  end
+
+  -- 获取 chat 窗口模块
+  local ok, chat_window = pcall(require, "NeoAI.ui.window.chat_window")
+  if not ok or not chat_window then
+    return
+  end
+
+  -- 从 chat 窗口配置中获取快捷键
+  local chat_config = (state.config or {}).keymaps and state.config.keymaps.chat or {}
+
+  -- 定义需要绑定的快捷键及其对应的操作
+  local bindings = {
+    { key = (chat_config.quit or {}).key or "q", action = function() chat_window.close() end },
+    { key = (chat_config.refresh or {}).key or "r", action = function() chat_window.refresh_chat() end },
+    { key = (chat_config.switch_model or {}).key or "m", action = function() chat_window.show_model_selector() end },
+  }
+
+  -- 绑定快捷键到浮动输入框的 normal 模式
+  for _, binding in ipairs(bindings) do
+    vim.keymap.set("n", binding.key, function()
+      -- 先关闭浮动输入框，再执行 chat 窗口操作
+      -- 注意：有些操作（如 close）内部会关闭输入框，所以先检查
+      if binding.key ~= "q" then
+        M.close()
+      end
+      binding.action()
+    end, { buffer = buf, noremap = true, silent = true, desc = "Chat: " .. tostring(binding.key) })
+  end
 end
 
 --- 提交浮动输入框内容

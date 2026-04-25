@@ -16,6 +16,9 @@ local state = {
   last_render_time = 0, -- 上次渲染时间
   render_debounce_timer = nil, -- 防抖定时器
 
+  -- 当前场景内使用的模型候选索引（1-based）
+  current_model_index = 1,
+
   -- 最近一次生成的 token 用量信息
   last_usage = nil,
   -- token 用量虚拟文本的 extmark id，用于清理旧虚拟文本
@@ -134,6 +137,12 @@ function M.open(session_id, window_id, branch_id)
     M._update_usage_virt_text()
   end, 500)
 
+  -- 更新窗口标题显示模型信息
+  local model_label = M._get_current_model_label()
+  if model_label then
+    M.update_title(string.format("NeoAI 聊天 [%s]", model_label))
+  end
+
   -- 触发聊天框打开事件
   vim.api.nvim_exec_autocmds("User", { pattern = Events.CHAT_BOX_OPENED, data = { window_id = window_id } })
 
@@ -202,10 +211,15 @@ function M._do_render_chat()
     async_worker.submit_task("render_chat_content", function()
       local content = {}
 
-      -- 添加标题
+  -- 添加标题
       table.insert(content, "# NeoAI 聊天")
       table.insert(content, "")
       table.insert(content, string.format("会话: %s", state.current_session_id or "未知"))
+      -- 显示当前模型信息
+      local model_label = M._get_current_model_label()
+      if model_label then
+        table.insert(content, string.format("模型: %s", model_label))
+      end
       table.insert(content, "---")
       table.insert(content, "")
 
@@ -448,6 +462,7 @@ function M.set_keymaps()
     quit = (chat_config.quit or {}).key or "q",
     refresh = (chat_config.refresh or {}).key or "r",
     send = (chat_config.send or {}).normal and chat_config.send.normal.key or (chat_config.send or {}).key or "<CR>",
+    switch_model = (chat_config.switch_model or {}).key or "m",
   }
 
   -- 使用闭包创建局部函数引用，避免每次按键都调用 require
@@ -493,6 +508,10 @@ function M.set_keymaps()
     M._exit_insert_mode()
   end
 
+  local function switch_model()
+    M.show_model_selector()
+  end
+
   -- 设置按键映射（使用 vim.keymap.set 直接传递函数）
   for key, mapping in pairs(keymaps) do
     local callback = nil
@@ -504,6 +523,8 @@ function M.set_keymaps()
       callback = refresh_chat_window
     elseif key == "send" then
       callback = send_message
+    elseif key == "switch_model" then
+      callback = switch_model
     end
 
     if callback then
@@ -835,13 +856,18 @@ function M._update_usage_virt_text()
 
   -- 构建用量文本
   local usage = state.last_usage
-  local prompt_tokens = usage.prompt_tokens or usage.promptTokens or usage.input_tokens or usage.inputTokens or 0
-  local completion_tokens = usage.completion_tokens
+  if not usage then
+    return
+  end
+
+  local prompt_tokens = (usage.prompt_tokens or usage.promptTokens or usage.input_tokens or usage.inputTokens) or 0
+  local completion_tokens = (
+    usage.completion_tokens
     or usage.completionTokens
     or usage.output_tokens
     or usage.outputTokens
-    or 0
-  local total_tokens = usage.total_tokens or usage.totalTokens or (prompt_tokens + completion_tokens)
+  ) or 0
+  local total_tokens = (usage.total_tokens or usage.totalTokens) or (prompt_tokens + completion_tokens)
 
   local reasoning_tokens = 0
   if usage.completion_tokens_details and type(usage.completion_tokens_details) == "table" then
@@ -931,6 +957,7 @@ function M.update_title(title)
   if not ok then
     -- 如果 nvim_win_set_config 不支持 title 参数（旧版本 Neovim），静默忽略
     -- 空块：兼容旧版本 Neovim
+    -- luacheck: ignore
   end
 end
 
@@ -1417,7 +1444,7 @@ function M._setup_event_listeners()
           -- 打开输入框后再次执行滚动，防止焦点切换导致滚动位置被重置
           vim.defer_fn(function()
             M._scroll_to_end_with_offset(10)
-          end, 100)
+          end, 200)
         end, 100)
       end, 50)
     end,
@@ -1872,6 +1899,119 @@ function M._finalize_streaming()
   state.streaming.reasoning_buffer = ""
   state.streaming.reasoning_active = false
   state.streaming.reasoning_done = false
+end
+
+--- 获取当前使用的模型标签
+--- @return string|nil 模型标签，如 "deepseek/deepseek-chat"
+function M._get_current_model_label()
+  local default_config = require("NeoAI.default_config")
+  local models = default_config.get_available_models("chat")
+  for _, m in ipairs(models) do
+    if m.index == state.current_model_index then
+      return m.label
+    end
+  end
+  return nil
+end
+
+--- 获取当前使用的模型候选索引
+--- @return number 当前模型索引（1-based）
+function M.get_current_model_index()
+  return state.current_model_index or 1
+end
+
+--- 显示模型选择器（浮动窗口菜单）
+--- 列出当前场景（chat）内所有有 API key 的模型候选，用户选择后切换
+function M.show_model_selector()
+  if not state.current_window_id then
+    return
+  end
+
+  local default_config = require("NeoAI.default_config")
+  local models = default_config.get_available_models("chat")
+
+  if #models == 0 then
+    vim.notify("[NeoAI] 没有可用的模型（请检查 API key 配置）", vim.log.levels.WARN)
+    return
+  end
+
+  -- 构建选择菜单项
+  local items = {}
+  for _, m in ipairs(models) do
+    local indicator = (m.index == state.current_model_index) and "✓ " or "  "
+    table.insert(items, string.format("%s%s", indicator, m.label))
+  end
+
+  -- 获取当前模型名用于提示
+  local current_label = "未知"
+  for _, m in ipairs(models) do
+    if m.index == state.current_model_index then
+      current_label = m.label
+      break
+    end
+  end
+
+  vim.ui.select(items, {
+    prompt = "选择 AI 模型 (当前: " .. current_label .. ")",
+    format_item = function(item)
+      return item
+    end,
+  }, function(choice, idx)
+    if choice and idx then
+      local selected = models[idx]
+      if selected and selected.index ~= state.current_model_index then
+        M.switch_to_model(selected.index)
+      end
+    end
+  end)
+end
+
+--- 切换到当前场景内的指定模型候选
+--- @param model_index number 模型候选索引（1-based）
+function M.switch_to_model(model_index)
+  if not model_index or model_index == state.current_model_index then
+    return
+  end
+
+  local default_config = require("NeoAI.default_config")
+  local models = default_config.get_available_models("chat")
+
+  -- 查找目标模型
+  local target = nil
+  for _, m in ipairs(models) do
+    if m.index == model_index then
+      target = m
+      break
+    end
+  end
+
+  if not target then
+    vim.notify("[NeoAI] 无效的模型索引: " .. tostring(model_index), vim.log.levels.WARN)
+    return
+  end
+
+  local old_index = state.current_model_index
+  state.current_model_index = model_index
+
+  -- 更新聊天窗口标题
+  M.update_title(string.format("NeoAI 聊天 [%s]", target.label))
+
+  -- 重新渲染聊天内容（标题区域会显示新模型）
+  M.render_chat()
+
+  -- 触发模型切换事件
+  vim.api.nvim_exec_autocmds("User", {
+    pattern = Events.MODEL_SWITCHED,
+    data = {
+      old_index = old_index,
+      new_index = model_index,
+      provider = target.provider,
+      model_name = target.model_name,
+      window_id = state.current_window_id,
+    },
+  })
+
+  vim.notify(string.format("[NeoAI] 已切换到模型: %s", target.label), vim.log.levels.INFO)
 end
 
 return M

@@ -15,11 +15,12 @@ local http_client = require("NeoAI.core.ai.http_client")
 local logger = require("NeoAI.utils.logger")
 local event_constants = require("NeoAI.core.events.event_constants")
 local json = require("NeoAI.utils.json")
+local default_config = require("NeoAI.default_config")
 
 -- 模块内部状态
 local state = {
   initialized = false,
-  config = {},
+  full_config = {}, -- 完整配置（含 ai, ui, session 等所有字段）
   is_generating = false,
   current_generation_id = nil,
   tools = {},
@@ -48,43 +49,38 @@ function M.initialize(options)
     return M
   end
 
-  -- 从选项参数中提取并存储必要的组件
-  -- 传入的是完整配置，从中提取 ai 部分
-  local full_config = options.config or {}
-  state.config = full_config.ai or {}
+  -- 存储完整配置（含 ai, ui, session 等所有字段）
+  -- 各子模块在每次生成时根据场景获取解析后的配置
+  state.full_config = options.config or {}
   state.session_manager = options.session_manager
 
-  -- 初始化所有子模块
+  -- 初始化所有子模块（传入完整配置，子模块自行取需要的部分）
   state.request_builder.initialize({
-    config = state.config,
+    config = state.full_config,
   })
 
   state.response_builder.initialize({
-    config = state.config,
+    config = state.full_config,
     session_manager = state.session_manager,
   })
 
   state.reasoning_manager.initialize({
-    config = state.config,
+    config = state.full_config,
   })
 
   state.tool_orchestrator.initialize({
-    config = state.config,
+    config = state.full_config,
     session_manager = state.session_manager,
-    max_iterations = state.config.max_tool_iterations or 10,
+    max_iterations = (state.full_config.ai or {}).max_tool_iterations or 10,
   })
 
   state.stream_processor.initialize({
-    config = state.config,
+    config = state.full_config,
   })
 
-  -- 初始化 HTTP 客户端（真正的 AI API 调用）
+  -- HTTP 客户端在每次请求时动态获取 base_url/api_key，此处仅初始化空状态
   state.http_client.initialize({
-    config = {
-      base_url = state.config.base_url,
-      api_key = state.config.api_key,
-      timeout = state.config.timeout or 60000,
-    },
+    config = {},
   })
 
   -- 设置事件监听器
@@ -190,14 +186,102 @@ function M.handle_send_message(data)
   })
 end
 
+--- 根据场景名称解析 AI 配置
+--- 使用 default_config.get_preset(scenario) 获取完整的解析配置
+--- @param scenario string 场景名称
+--- @return table 解析后的 AI 配置（含 base_url, api_key, model, temperature 等）
+local function resolve_scenario_config(scenario)
+  -- 优先使用 default_config 的 get_preset 方法
+  if default_config and default_config.get_preset then
+    local preset = default_config.get_preset(scenario)
+    if preset and preset.base_url and preset.api_key then
+      return preset
+    end
+  end
+
+  -- 回退：从完整配置中手动解析
+  local ai_config = state.full_config.ai or {}
+  local scenarios = ai_config.scenarios or {}
+  local entry = scenarios[scenario]
+
+  if not entry then
+    -- 尝试使用默认场景
+    local default_scenario = ai_config.default or "chat"
+    entry = scenarios[default_scenario]
+  end
+
+  if not entry then
+    return {}
+  end
+
+  -- 手动解析（兼容旧格式）
+  local candidate
+  if type(entry) == "table" then
+    if entry[1] == nil or type(entry[1]) ~= "table" then
+      candidate = entry
+    else
+      candidate = entry[1]
+    end
+  end
+
+  if not candidate then
+    return {}
+  end
+
+  local provider_name = candidate.provider or "deepseek"
+  local provider = (ai_config.providers or {})[provider_name]
+
+  local result = {}
+  if provider then
+    result.base_url = provider.base_url
+    result.api_key = provider.api_key
+  end
+  for k, v in pairs(candidate) do
+    result[k] = v
+  end
+  if not result.stream then result.stream = ai_config.stream end
+  if not result.timeout then result.timeout = ai_config.timeout end
+  if not result.system_prompt then result.system_prompt = ai_config.system_prompt end
+
+  return result
+end
+
 --- 生成 AI 响应
---- 使用真正的 HTTP 客户端调用 AI API，支持流式和非流式模式
+-- 使用真正的 HTTP 客户端调用 AI API，支持流式和非流式模式
+-- 根据 params.model_index 从场景候选列表中选取对应的 AI 配置
 --- @param messages table 消息列表
---- @param params table 生成参数
+--- @param params table 生成参数（含 model_index, session_id, window_id, options 等）
 function M.generate_response(messages, params)
   local session_id = params.session_id
   local window_id = params.window_id
   local options = params.options or {}
+
+  -- 根据 model_index 从 get_available_models 获取对应的提供商和模型名
+  local model_index = params.model_index or 1
+  local ai_preset = {}
+  if default_config and default_config.get_available_models then
+    local models = default_config.get_available_models("chat")
+    local target = models[model_index]
+    if target then
+      -- 从完整配置中查找提供商定义
+      local ai_config = state.full_config.ai or {}
+      local providers = ai_config.providers or {}
+      local provider_def = providers[target.provider]
+      if provider_def then
+        ai_preset.base_url = provider_def.base_url
+        ai_preset.api_key = provider_def.api_key
+      end
+      ai_preset.provider = target.provider
+      ai_preset.model_name = target.model_name
+      ai_preset.model = target.model_name
+      ai_preset.stream = true
+      ai_preset.timeout = 60000
+    end
+  end
+  if not ai_preset.base_url or not ai_preset.api_key then
+    -- 回退到 resolve_scenario_config
+    ai_preset = resolve_scenario_config("chat")
+  end
 
   -- 生成唯一ID
   local generation_id = tostring(os.time()) .. "_" .. math.random(1000, 9999)
@@ -208,16 +292,23 @@ function M.generate_response(messages, params)
     session_id = session_id,
     window_id = window_id,
     options = options,
+    model_index = model_index,
+    ai_preset = ai_preset,
     retry_count = 0,
   }
 
   -- 格式化消息
   local formatted_messages = state.request_builder.format_messages(messages)
 
-  -- 构建请求
+  -- 构建请求（传入解析后的 AI 配置覆盖默认值）
   local request = state.request_builder.build_request({
     messages = formatted_messages,
-    options = options,
+    options = vim.tbl_extend("force", options, {
+      model = ai_preset.model_name or options.model,
+      temperature = ai_preset.temperature or options.temperature,
+      max_tokens = ai_preset.max_tokens or options.max_tokens,
+      stream = ai_preset.stream ~= false,
+    }),
     session_id = session_id,
     generation_id = generation_id,
   })
@@ -272,10 +363,14 @@ function M._send_non_stream_request(generation_id, request, params)
     return
   end
 
-  -- 发送请求到 AI API
+  -- 发送请求到 AI API（传入解析后的 base_url/api_key/timeout）
+  local ai_preset = generation and generation.ai_preset or {}
   local response, err = state.http_client.send_request({
     request = request,
     generation_id = generation_id,
+    base_url = ai_preset.base_url,
+    api_key = ai_preset.api_key,
+    timeout = ai_preset.timeout,
   })
 
   if err then
@@ -341,11 +436,16 @@ function M._send_stream_request(generation_id, request, params)
     window_id = window_id,
   })
 
-  -- 发送流式请求
+  -- 发送流式请求（传入解析后的 base_url/api_key/timeout）
+  local generation = state.active_generations[generation_id]
+  local ai_preset = generation and generation.ai_preset or {}
   state.http_client.send_stream_request(
     {
       request = request,
       generation_id = generation_id,
+      base_url = ai_preset.base_url,
+      api_key = ai_preset.api_key,
+      timeout = ai_preset.timeout,
     },
     -- on_chunk: 处理每个数据块
     function(data)
@@ -660,10 +760,11 @@ function M.handle_tool_result(data)
   -- 更新活跃生成的消息
   generation.messages = messages
 
-  -- 继续生成响应
+  -- 继续生成响应（沿用原始模型索引）
   M.generate_response(messages, {
     session_id = session_id,
     window_id = window_id,
+    model_index = generation.model_index,
     options = options,
   })
 end

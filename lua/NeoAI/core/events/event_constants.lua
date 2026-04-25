@@ -101,6 +101,10 @@ M.FLOATING_TEXT_SHOWN = "NeoAI:floating_text_shown" -- 悬浮文本已显示
 M.FLOATING_TEXT_CLOSING = "NeoAI:floating_text_closing" -- 悬浮文本正在关闭
 M.FLOATING_TEXT_CLOSED = "NeoAI:floating_text_closed" -- 悬浮文本已关闭
 
+-- ==================== 模型切换事件 ====================
+-- 使用位置: chat_window.lua, chat_handlers.lua
+M.MODEL_SWITCHED = "NeoAI:model_switched" -- 模型已切换
+
 -- ==================== 配置事件 ====================
 -- 使用位置: reasoning_manager.lua
 M.CONFIG_LOADED = "NeoAI:config_loaded" -- 配置已加载

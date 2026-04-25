@@ -85,9 +85,17 @@ function M._trigger_ai_response(data)
     local ai_engine = core.get_ai_engine()
     if not ai_engine then return end
 
+    -- 获取当前聊天窗口使用的模型索引
+    local model_index = 1
+    local chat_window_ok, chat_window = pcall(require, "NeoAI.ui.window.chat_window")
+    if chat_window_ok and chat_window.get_current_model_index then
+      model_index = chat_window.get_current_model_index() or 1
+    end
+
     ai_engine.generate_response(messages, {
       session_id = session.id,
       window_id = window_id,
+      model_index = model_index,
       stream = state.config and state.config.stream ~= false,
     })
   end, 500)

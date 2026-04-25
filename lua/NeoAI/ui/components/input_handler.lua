@@ -66,7 +66,7 @@ function M.send_message(content, window_id, session_id)
 
   -- 触发聊天输入已准备好事件
   vim.api.nvim_exec_autocmds("User", {
-pattern = Events.CHAT_INPUT_READY,
+    pattern = Events.CHAT_INPUT_READY,
     data = {
       message = content,
       window_id = window_id,
@@ -178,4 +178,3 @@ M._handle_insert_input = _handle_insert_input
 M._handle_normal_input = _handle_normal_input
 
 return M
-

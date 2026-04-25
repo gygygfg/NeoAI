@@ -962,10 +962,10 @@ local function safe_truncate(str, max_len)
   if #str <= max_len then
     return str
   end
-  
+
   -- 清理字符串中的控制字符和二进制数据
   local cleaned_str = str:gsub("[%c%z]", ""):gsub("%b<>", "")
-  
+
   -- 如果清理后的字符串更短，使用清理后的版本
   if #cleaned_str < #str then
     str = cleaned_str
@@ -973,15 +973,15 @@ local function safe_truncate(str, max_len)
       return str
     end
   end
-  
+
   -- 尝试找到合适的截断点
   local truncated = str:sub(1, max_len)
-  
+
   -- 检查最后一个字符是否是中文字符的一部分
   -- 中文字符在UTF-8中占用3个字节，如果截断位置在字符中间，会显示乱码
   local last_char = truncated:sub(-1)
   local byte = last_char:byte()
-  
+
   -- 如果最后一个字节是UTF-8多字节字符的一部分（0x80以上），则向前调整到完整的字符边界
   if byte and byte >= 0x80 then
     -- 向前查找完整的字符边界
@@ -997,10 +997,10 @@ local function safe_truncate(str, max_len)
       end
     end
   end
-  
+
   -- 移除可能残留的二进制标记
   truncated = truncated:gsub("%b<>", "")
-  
+
   return truncated
 end
 
@@ -1045,7 +1045,9 @@ end
 --- @param window_width number|nil 窗口宽度
 --- @param is_root boolean 是否是根节点
 function M._render_tree_node(content, node, depth, is_last, parent_prefix, tree_state, window_width, is_root)
-  if not node then return end
+  if not node then
+    return
+  end
 
   local current_prefix = parent_prefix or ""
 
@@ -1073,10 +1075,16 @@ function M._render_tree_node(content, node, depth, is_last, parent_prefix, tree_
 
   -- 清理显示文本
   line = line:gsub("%b<>", " "):gsub("[%c%z]", " "):gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
-  if line == "" then line = "未命名" end
+  if line == "" then
+    line = "未命名"
+  end
 
   if window_width and window_width > 0 and #line > window_width then
-    local effective_prefix = node.is_virtual and current_prefix or (is_root and (is_last and "└──" or "├──") or current_prefix .. (is_last and "└───" or "├───"))
+    local effective_prefix = node.is_virtual and current_prefix
+      or (
+        is_root and (is_last and "└──" or "├──")
+        or current_prefix .. (is_last and "└───" or "├───")
+      )
     local max_text_len = window_width - #effective_prefix - 3
     if max_text_len > 0 then
       line = effective_prefix .. safe_truncate(line:sub(#effective_prefix + 1), max_text_len) .. "..."
@@ -1113,7 +1121,16 @@ function M._render_tree_node(content, node, depth, is_last, parent_prefix, tree_
 
     for i, child in ipairs(node.children) do
       local child_is_last = (i == child_count)
-      M._render_tree_node(content, child, depth + 1, child_is_last, child_parent_prefix, tree_state, window_width, false)
+      M._render_tree_node(
+        content,
+        child,
+        depth + 1,
+        child_is_last,
+        child_parent_prefix,
+        tree_state,
+        window_width,
+        false
+      )
     end
   end
 end

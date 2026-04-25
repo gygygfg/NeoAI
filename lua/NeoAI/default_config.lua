@@ -3,14 +3,155 @@ local M = {}
 -- 默认配置
 local DEFAULT_CONFIG = {
   -- AI配置
+  -- 支持多家AI提供商，按场景（窗口命名、聊天、思考、编码、工具执行、子agent）分配不同预设
   ai = {
-    base_url = "https://api.deepseek.com/chat/completions",
-    api_key = os.getenv("DEEPSEEK_API_KEY") or "",
-    model = "deepseek-reasoner",
-    temperature = 0.7,
-    max_tokens = 4096,
+    -- 默认使用的预设名称
+    default = "balanced",
+
+    -- 提供商定义
+    providers = {
+      deepseek = {
+        base_url = "https://api.deepseek.com/chat/completions",
+        api_key = os.getenv("DEEPSEEK_API_KEY") or "",
+        models = { "deepseek-chat", "deepseek-reasoner" },
+      },
+      openai = {
+        base_url = "https://api.openai.com/v1/chat/completions",
+        api_key = os.getenv("OPENAI_API_KEY") or "",
+        models = { "gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "gpt-3.5-turbo" },
+      },
+      anthropic = {
+        base_url = "https://api.anthropic.com/v1/messages",
+        api_key = os.getenv("ANTHROPIC_API_KEY") or "",
+        models = { "claude-sonnet-4-20250514", "claude-3-5-sonnet-20241022", "claude-3-5-haiku-20241022" },
+      },
+      google = {
+        base_url = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+        api_key = os.getenv("GOOGLE_API_KEY") or "",
+        models = { "gemini-2.0-flash", "gemini-2.0-flash-lite", "gemini-1.5-pro", "gemini-1.5-flash" },
+      },
+      groq = {
+        base_url = "https://api.groq.com/openai/v1/chat/completions",
+        api_key = os.getenv("GROQ_API_KEY") or "",
+        models = { "llama-3.3-70b-versatile", "llama-3.1-8b-instant", "mixtral-8x7b-32768" },
+      },
+      together = {
+        base_url = "https://api.together.xyz/v1/chat/completions",
+        api_key = os.getenv("TOGETHER_API_KEY") or "",
+        models = { "meta-llama/Llama-3.3-70B-Instruct-Turbo", "mistralai/Mixtral-8x22B-Instruct-v0.1" },
+      },
+      openrouter = {
+        base_url = "https://openrouter.ai/api/v1/chat/completions",
+        api_key = os.getenv("OPENROUTER_API_KEY") or "",
+        models = { "openai/gpt-4o", "anthropic/claude-sonnet-4-20250514", "google/gemini-2.0-flash-001" },
+      },
+      siliconflow = {
+        base_url = "https://api.siliconflow.cn/v1/chat/completions",
+        api_key = os.getenv("SILICONFLOW_API_KEY") or "",
+        models = { "deepseek-ai/DeepSeek-V3", "deepseek-ai/DeepSeek-R1", "Qwen/Qwen2.5-72B-Instruct" },
+      },
+      moonshot = {
+        base_url = "https://api.moonshot.cn/v1/chat/completions",
+        api_key = os.getenv("MOONSHOT_API_KEY") or "",
+        models = { "moonshot-v1-8k", "moonshot-v1-32k", "moonshot-v1-128k" },
+      },
+      zhipu = {
+        base_url = "https://open.bigmodel.cn/api/paas/v4/chat/completions",
+        api_key = os.getenv("ZHIPU_API_KEY") or "",
+        models = { "glm-4-plus", "glm-4-air", "glm-4-flash" },
+      },
+      baidu = {
+        base_url = "https://aip.baidubce.com/rpc/2.0/ai_custom/v1/wenxinworkshop/chat/completions",
+        api_key = os.getenv("BAIDU_API_KEY") or "",
+        models = { "ernie-4.0-8k", "ernie-3.5-8k" },
+      },
+      aliyun = {
+        base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
+        api_key = os.getenv("ALIYUN_API_KEY") or "",
+        models = { "qwen-plus", "qwen-turbo", "qwen-max" },
+      },
+      stepfun = {
+        base_url = "https://api.stepfun.com/v1/chat/completions",
+        api_key = os.getenv("STEPFUN_API_KEY") or "",
+        models = { "step-2-16k", "step-1-8k", "step-1-flash" },
+      },
+    },
+
+    -- 场景配置：分为窗口命名用、聊天用、思考问题用、编写代码用、执行工具用、子agent用
+    -- 每个场景可指定多个 AI 候选（数组），按顺序尝试；也可只传一个（单元素表）
+    -- 每个候选为 key-value 表：{ provider = '', model_name = '', ... }
+    scenarios = {
+      -- 窗口命名用：快速低延迟
+      naming = {
+        {
+          provider = "deepseek",
+          model_name = "deepseek-chat",
+          temperature = 0.3,
+          max_tokens = 512,
+          stream = true,
+          timeout = 15000,
+        },
+      },
+      -- 聊天用：平衡速度与质量
+      chat = {
+        {
+          provider = "deepseek",
+          model_name = "deepseek-chat",
+          temperature = 0.7,
+          max_tokens = 4096,
+          stream = true,
+          timeout = 60000,
+        },
+      },
+      -- 思考问题用：深度推理
+      reasoning = {
+        {
+          provider = "deepseek",
+          model_name = "deepseek-reasoner",
+          temperature = 0.7,
+          max_tokens = 8192,
+          stream = true,
+          timeout = 120000,
+        },
+      },
+      -- 编写代码用：高质量代码生成
+      coding = {
+        {
+          provider = "deepseek",
+          model_name = "deepseek-reasoner",
+          temperature = 0.2,
+          max_tokens = 8192,
+          stream = true,
+          timeout = 120000,
+        },
+      },
+      -- 执行工具用：快速响应
+      tools = {
+        {
+          provider = "deepseek",
+          model_name = "deepseek-chat",
+          temperature = 0.3,
+          max_tokens = 1024,
+          stream = true,
+          timeout = 30000,
+        },
+      },
+      -- 子agent用
+      agent = {
+        {
+          provider = "deepseek",
+          model_name = "deepseek-reasoner",
+          temperature = 0.7,
+          max_tokens = 4096,
+          stream = true,
+          timeout = 60000,
+        },
+      },
+    },
+
+    -- 全局默认值（当预设中未指定时使用）
     stream = true,
-    timeout = 60000, -- HTTP请求超时时间（毫秒）
+    timeout = 60000,
     system_prompt = "你是一个AI编程助手，帮助用户解决编程问题。",
   },
   -- UI配置
@@ -64,6 +205,7 @@ local DEFAULT_CONFIG = {
       scroll_up = { key = "<C-u>", desc = "向上滚动" },
       scroll_down = { key = "<C-d>", desc = "向下滚动" },
       toggle_reasoning = { key = "r", desc = "切换思考过程显示" },
+      switch_model = { key = "m", desc = "切换模型" },
       newline = { key = "<C-CR>", desc = "新建行" },
       clear = { key = "<C-u>", desc = "清空输入" },
     },
@@ -206,23 +348,73 @@ function M.validate()
 
   -- 验证 AI 配置
   if state.config.ai then
-    -- 检查 max_tokens
-    if type(state.config.ai.max_tokens) ~= "number" or state.config.ai.max_tokens <= 0 then
-      return false, "ai.max_tokens 必须是正数"
+    -- 检查 providers
+    if state.config.ai.providers then
+      for name, provider in pairs(state.config.ai.providers) do
+        if type(provider) ~= "table" then
+          return false, string.format("ai.providers.%s 必须是表", name)
+        end
+        if provider.base_url and type(provider.base_url) ~= "string" then
+          return false, string.format("ai.providers.%s.base_url 必须是字符串", name)
+        end
+        if provider.api_key and type(provider.api_key) ~= "string" then
+          return false, string.format("ai.providers.%s.api_key 必须是字符串", name)
+        end
+      end
     end
 
-    -- 检查 temperature
-    if
-      type(state.config.ai.temperature) ~= "number"
-      or state.config.ai.temperature < 0
-      or state.config.ai.temperature > 2
-    then
-      return false, "ai.temperature 必须在 0 到 2 之间"
-    end
-
-    -- 检查 model
-    if state.config.ai.model and type(state.config.ai.model) ~= "string" then
-      return false, "ai.model 必须是字符串"
+    -- 检查 scenarios
+    if state.config.ai.scenarios then
+      local valid_scenarios = { "naming", "chat", "reasoning", "coding", "tools", "agent" }
+      for name, entry in pairs(state.config.ai.scenarios) do
+        if not vim.tbl_contains(valid_scenarios, name) then
+          return false, string.format("ai.scenarios.%s 不是有效的场景名称", name)
+        end
+        if type(entry) ~= "table" then
+          return false, string.format("ai.scenarios.%s 必须是表", name)
+        end
+        -- 判断是单元素表还是数组
+        if entry[1] == nil or type(entry[1]) ~= "table" then
+          -- 单元素表：{ provider = '', model_name = '', ... }
+          if entry.provider and type(entry.provider) ~= "string" then
+            return false, string.format("ai.scenarios.%s.provider 必须是字符串", name)
+          end
+          if entry.model_name and type(entry.model_name) ~= "string" then
+            return false, string.format("ai.scenarios.%s.model_name 必须是字符串", name)
+          end
+          if
+            entry.temperature
+            and (type(entry.temperature) ~= "number" or entry.temperature < 0 or entry.temperature > 2)
+          then
+            return false, string.format("ai.scenarios.%s.temperature 必须在 0 到 2 之间", name)
+          end
+          if entry.max_tokens and (type(entry.max_tokens) ~= "number" or entry.max_tokens <= 0) then
+            return false, string.format("ai.scenarios.%s.max_tokens 必须是正数", name)
+          end
+        else
+          -- 数组：{ { provider = '', ... }, { provider = '', ... } }
+          for i, candidate in ipairs(entry) do
+            if type(candidate) ~= "table" then
+              return false, string.format("ai.scenarios.%s[%d] 必须是表", name, i)
+            end
+            if candidate.provider and type(candidate.provider) ~= "string" then
+              return false, string.format("ai.scenarios.%s[%d].provider 必须是字符串", name, i)
+            end
+            if candidate.model_name and type(candidate.model_name) ~= "string" then
+              return false, string.format("ai.scenarios.%s[%d].model_name 必须是字符串", name, i)
+            end
+            if
+              candidate.temperature
+              and (type(candidate.temperature) ~= "number" or candidate.temperature < 0 or candidate.temperature > 2)
+            then
+              return false, string.format("ai.scenarios.%s[%d].temperature 必须在 0 到 2 之间", name, i)
+            end
+            if candidate.max_tokens and (type(candidate.max_tokens) ~= "number" or candidate.max_tokens <= 0) then
+              return false, string.format("ai.scenarios.%s[%d].max_tokens 必须是正数", name, i)
+            end
+          end
+        end
+      end
     end
   end
 
@@ -308,6 +500,93 @@ function M.import(filepath)
   return true, "导入成功"
 end
 
+--- 解析单个 AI 候选配置，合并提供商信息
+--- @param candidate table 候选配置：{ provider = '', model_name = '', ... }
+--- @param ai_config table ai 配置
+--- @return table|nil 完整的 AI 配置
+local function resolve_candidate(candidate, ai_config)
+  if type(candidate) ~= "table" then
+    return nil
+  end
+
+  local provider_name = candidate.provider or "deepseek"
+  local model_name = candidate.model_name or ""
+  local provider = ai_config.providers and ai_config.providers[provider_name]
+  local result = {}
+
+  -- 从提供商获取 base_url 和 api_key
+  if provider then
+    result.base_url = provider.base_url
+    result.api_key = provider.api_key
+  end
+
+  -- 复制候选的所有字段
+  for k, v in pairs(candidate) do
+    result[k] = v
+  end
+
+  -- 从全局默认获取未设置的字段
+  if not result.stream then
+    result.stream = ai_config.stream
+  end
+  if not result.timeout then
+    result.timeout = ai_config.timeout
+  end
+  if not result.system_prompt then
+    result.system_prompt = ai_config.system_prompt
+  end
+
+  return result
+end
+
+--- 获取指定场景的 AI 候选列表
+--- 每个场景可配置多个候选（数组），按顺序返回；也可只传一个（单元素表）
+--- @param scenario string 场景名称："naming", "chat", "reasoning", "coding", "tools", "agent"
+--- @return table 候选配置列表（每个元素为完整的 AI 配置），如果场景不存在则返回空表
+function M.get_scenario_candidates(scenario)
+  -- 如果 state.config 未初始化，回退到 DEFAULT_CONFIG
+  local config_source = state.initialized and state.config or DEFAULT_CONFIG
+  local ai_config = config_source.ai
+  if not ai_config or not ai_config.scenarios then
+    return {}
+  end
+
+  local entry = ai_config.scenarios[scenario]
+  if not entry then
+    return {}
+  end
+
+  local candidates = {}
+
+  if type(entry) == "table" then
+    if entry[1] == nil or type(entry[1]) ~= "table" then
+      -- 单元素表：{ provider = '', model_name = '', ... }
+      local resolved = resolve_candidate(entry, ai_config)
+      if resolved then
+        table.insert(candidates, resolved)
+      end
+    else
+      -- 数组：{ { provider = '', ... }, { provider = '', ... } }
+      for _, candidate in ipairs(entry) do
+        local resolved = resolve_candidate(candidate, ai_config)
+        if resolved then
+          table.insert(candidates, resolved)
+        end
+      end
+    end
+  end
+
+  return candidates
+end
+
+--- 获取指定场景的第一个可用 AI 配置（快捷方式）
+--- @param scenario string 场景名称
+--- @return table|nil 完整的 AI 配置
+function M.get_preset(scenario)
+  local candidates = M.get_scenario_candidates(scenario)
+  return candidates[1] or nil
+end
+
 --- 获取配置摘要
 --- 返回一个包含配置概要信息的字符串
 --- @return string 配置摘要
@@ -316,12 +595,39 @@ function M.get_summary()
 
   -- 遍历所有配置
   for key, value in pairs(state.config) do
-    if key == "ai" and value.api_key then
-      -- 对 API 密钥进行脱敏处理
-      if value.api_key and #value.api_key > 0 then
-        summary[#summary + 1] = "ai.api_key: [已设置]"
-      else
-        summary[#summary + 1] = "ai.api_key: [未设置]"
+    if key == "ai" then
+      summary[#summary + 1] = "ai:"
+      -- 显示默认预设
+      summary[#summary + 1] = "  default: " .. (value.default or "balanced")
+      -- 显示提供商（脱敏 API key）
+      if value.providers then
+        summary[#summary + 1] = "  providers:"
+        for name, provider in pairs(value.providers) do
+          local key_status = (provider.api_key and #provider.api_key > 0) and "[已设置]" or "[未设置]"
+          summary[#summary + 1] = string.format("    %s: %s, api_key: %s", name, provider.base_url or "?", key_status)
+        end
+      end
+      -- 显示场景配置
+      if value.scenarios then
+        summary[#summary + 1] = "  scenarios:"
+        for name, entry in pairs(value.scenarios) do
+          if type(entry) == "table" then
+            if entry[1] == nil or type(entry[1]) ~= "table" then
+              -- 单元素表
+              summary[#summary + 1] =
+                string.format("    %s: provider=%s, model=%s", name, entry.provider or "?", entry.model_name or "?")
+            else
+              -- 数组
+              local parts = {}
+              for _, c in ipairs(entry) do
+                if type(c) == "table" then
+                  table.insert(parts, (c.provider or "?") .. "/" .. (c.model_name or "?"))
+                end
+              end
+              summary[#summary + 1] = string.format("    %s: [%s]", name, table.concat(parts, ", "))
+            end
+          end
+        end
       end
     else
       -- 其他配置项
@@ -350,27 +656,140 @@ function M.validate_config(config)
 
   -- 验证AI配置
   if config.ai then
-    if config.ai.model and type(config.ai.model) ~= "string" then
-      vim.notify("[NeoAI] ai.model must be a string. Using default.", vim.log.levels.WARN)
-      config.ai.model = nil
+    -- 验证 providers
+    if config.ai.providers then
+      if type(config.ai.providers) ~= "table" then
+        vim.notify("[NeoAI] ai.providers must be a table. Using default.", vim.log.levels.WARN)
+        config.ai.providers = nil
+      else
+        for name, provider in pairs(config.ai.providers) do
+          if type(provider) ~= "table" then
+            vim.notify(string.format("[NeoAI] ai.providers.%s must be a table. Ignoring.", name), vim.log.levels.WARN)
+            config.ai.providers[name] = nil
+          else
+            if provider.base_url and type(provider.base_url) ~= "string" then
+              vim.notify(
+                string.format("[NeoAI] ai.providers.%s.base_url must be a string. Ignoring.", name),
+                vim.log.levels.WARN
+              )
+              provider.base_url = nil
+            end
+            if provider.api_key and type(provider.api_key) ~= "string" then
+              vim.notify(
+                string.format("[NeoAI] ai.providers.%s.api_key must be a string. Ignoring.", name),
+                vim.log.levels.WARN
+              )
+              provider.api_key = nil
+            end
+          end
+        end
+      end
     end
 
-    if config.ai.api_key ~= nil and type(config.ai.api_key) ~= "string" then
-      vim.notify("[NeoAI] ai.api_key must be a string. Using default.", vim.log.levels.WARN)
-      config.ai.api_key = nil
-    end
-
-    if
-      config.ai.temperature
-      and (type(config.ai.temperature) ~= "number" or config.ai.temperature < 0 or config.ai.temperature > 2)
-    then
-      vim.notify("[NeoAI] ai.temperature must be a number between 0 and 2. Using default.", vim.log.levels.WARN)
-      config.ai.temperature = nil
-    end
-
-    if config.ai.max_tokens and (type(config.ai.max_tokens) ~= "number" or config.ai.max_tokens < 1) then
-      vim.notify("[NeoAI] ai.max_tokens must be a positive number. Using default.", vim.log.levels.WARN)
-      config.ai.max_tokens = nil
+    -- 验证 scenarios
+    if config.ai.scenarios then
+      if type(config.ai.scenarios) ~= "table" then
+        vim.notify("[NeoAI] ai.scenarios must be a table. Using default.", vim.log.levels.WARN)
+        config.ai.scenarios = nil
+      else
+        local valid_scenarios = { "naming", "chat", "reasoning", "coding", "tools", "agent" }
+        for name, entry in pairs(config.ai.scenarios) do
+          if not vim.tbl_contains(valid_scenarios, name) then
+            vim.notify(
+              string.format("[NeoAI] ai.scenarios.%s is not a valid scenario. Ignoring.", name),
+              vim.log.levels.WARN
+            )
+            config.ai.scenarios[name] = nil
+          elseif type(entry) ~= "table" then
+            vim.notify(string.format("[NeoAI] ai.scenarios.%s must be a table. Ignoring.", name), vim.log.levels.WARN)
+            config.ai.scenarios[name] = nil
+          elseif entry[1] == nil or type(entry[1]) ~= "table" then
+            -- 单元素表：{ provider = '', model_name = '', ... }
+            if entry.provider and type(entry.provider) ~= "string" then
+              vim.notify(
+                string.format("[NeoAI] ai.scenarios.%s.provider must be a string. Ignoring.", name),
+                vim.log.levels.WARN
+              )
+              entry.provider = nil
+            end
+            if entry.model_name and type(entry.model_name) ~= "string" then
+              vim.notify(
+                string.format("[NeoAI] ai.scenarios.%s.model_name must be a string. Ignoring.", name),
+                vim.log.levels.WARN
+              )
+              entry.model_name = nil
+            end
+            if
+              entry.temperature
+              and (type(entry.temperature) ~= "number" or entry.temperature < 0 or entry.temperature > 2)
+            then
+              vim.notify(
+                string.format("[NeoAI] ai.scenarios.%s.temperature must be between 0 and 2. Ignoring.", name),
+                vim.log.levels.WARN
+              )
+              entry.temperature = nil
+            end
+            if entry.max_tokens and (type(entry.max_tokens) ~= "number" or entry.max_tokens < 1) then
+              vim.notify(
+                string.format("[NeoAI] ai.scenarios.%s.max_tokens must be a positive number. Ignoring.", name),
+                vim.log.levels.WARN
+              )
+              entry.max_tokens = nil
+            end
+          else
+            -- 数组：{ { provider = '', ... }, { provider = '', ... } }
+            for i, candidate in ipairs(entry) do
+              if type(candidate) ~= "table" then
+                vim.notify(
+                  string.format("[NeoAI] ai.scenarios.%s[%d] must be a table. Ignoring.", name, i),
+                  vim.log.levels.WARN
+                )
+                entry[i] = nil
+              else
+                if candidate.provider and type(candidate.provider) ~= "string" then
+                  vim.notify(
+                    string.format("[NeoAI] ai.scenarios.%s[%d].provider must be a string. Ignoring.", name, i),
+                    vim.log.levels.WARN
+                  )
+                  candidate.provider = nil
+                end
+                if candidate.model_name and type(candidate.model_name) ~= "string" then
+                  vim.notify(
+                    string.format("[NeoAI] ai.scenarios.%s[%d].model_name must be a string. Ignoring.", name, i),
+                    vim.log.levels.WARN
+                  )
+                  candidate.model_name = nil
+                end
+                if
+                  candidate.temperature
+                  and (
+                    type(candidate.temperature) ~= "number"
+                    or candidate.temperature < 0
+                    or candidate.temperature > 2
+                  )
+                then
+                  vim.notify(
+                    string.format("[NeoAI] ai.scenarios.%s[%d].temperature must be between 0 and 2. Ignoring.", name, i),
+                    vim.log.levels.WARN
+                  )
+                  candidate.temperature = nil
+                end
+                if candidate.max_tokens and (type(candidate.max_tokens) ~= "number" or candidate.max_tokens < 1) then
+                  vim.notify(
+                    string.format(
+                      "[NeoAI] ai.scenarios.%s[%d].max_tokens must be a positive number. Ignoring.",
+                      name,
+                      i
+                    ),
+                    vim.log.levels.WARN
+                  )
+                  candidate.max_tokens = nil
+                end
+              end
+            end
+          end
+        end
+      end
     end
   end
 
@@ -589,6 +1008,79 @@ end
 --- @return table 默认配置
 function M.get_default_config()
   return vim.deepcopy(DEFAULT_CONFIG)
+end
+
+--- 获取所有可用场景列表
+--- 返回每个场景的名称、提供商和模型名
+--- @return table 场景列表，每个元素为 { name, provider, model, label }
+function M.get_available_scenarios()
+  -- 如果 state.config 未初始化，回退到 DEFAULT_CONFIG
+  local config_source = state.initialized and state.config or DEFAULT_CONFIG
+  local ai_config = config_source.ai or {}
+  local scenarios = ai_config.scenarios or {}
+  local result = {}
+
+  for name, entry in pairs(scenarios) do
+    if type(entry) == "table" then
+      local provider_name, model
+      if entry[1] == nil or type(entry[1]) ~= "table" then
+        provider_name = entry.provider or "?"
+        model = entry.model_name or "?"
+      else
+        provider_name = entry[1].provider or "?"
+        model = entry[1].model_name or "?"
+      end
+      table.insert(result, {
+        name = name,
+        provider = provider_name,
+        model = model,
+        label = string.format("%s (%s/%s)", name, provider_name, model),
+      })
+    end
+  end
+
+  local priority = { "chat", "coding", "reasoning", "tools", "agent", "naming" }
+  table.sort(result, function(a, b)
+    local pa, pb = 0, 0
+    for i, p in ipairs(priority) do
+      if a.name == p then
+        pa = i
+      end
+      if b.name == p then
+        pb = i
+      end
+    end
+    return pa < pb
+  end)
+
+  return result
+end
+
+--- 获取所有可用的模型候选（遍历所有有 API key 的提供商的 models 字段）
+--- @param scenario string 场景名称（保留参数兼容，实际忽略）
+--- @return table 模型列表，每个元素为 { index, provider, model_name, label }
+function M.get_available_models(scenario)
+  local ai_config = (state.initialized and state.config or DEFAULT_CONFIG).ai or {}
+  local providers = ai_config.providers or {}
+  local result = {}
+  local index = 0
+
+  for provider_name, provider_def in pairs(providers) do
+    local has_key = provider_def and provider_def.api_key and #provider_def.api_key > 0
+    if has_key and provider_def.models and type(provider_def.models) == "table" then
+      for _, model_name in ipairs(provider_def.models) do
+        index = index + 1
+        table.insert(result, {
+          index = index,
+          provider = provider_name,
+          model_name = model_name,
+          label = string.format("%s/%s", provider_name, model_name),
+        })
+      end
+    end
+  end
+
+  return result
 end
 
 return M
