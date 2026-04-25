@@ -69,9 +69,7 @@ function M.initialize(options)
   -- 触发配置加载事件
   vim.api.nvim_exec_autocmds("User", {
     pattern = event_constants.CONFIG_LOADED,
-    data = {
-      config = state.config,
-    },
+    data = vim.json.encode({ config = state.config }),
   })
 end
 

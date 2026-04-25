@@ -256,30 +256,45 @@ function M.generate_response(messages, params)
   local window_id = params.window_id
   local options = params.options or {}
 
-  -- 根据 model_index 从 get_available_models 获取对应的提供商和模型名
+  -- 优先使用场景配置（scenarios）获取模型，确保用户配置的 model_name 生效
+  -- 回退策略：get_scenario_candidates > get_available_models > resolve_scenario_config
   local model_index = params.model_index or 1
   local ai_preset = {}
-  if default_config and default_config.get_available_models then
-    local models = default_config.get_available_models("chat")
-    local target = models[model_index]
+
+  -- 1. 优先从场景候选列表获取（尊重用户配置的 scenarios.chat.model_name）
+  if default_config and default_config.get_scenario_candidates then
+    local candidates = default_config.get_scenario_candidates("chat")
+    local target = candidates[model_index]
     if target then
-      -- 从完整配置中查找提供商定义
-      local ai_config = state.full_config.ai or {}
-      local providers = ai_config.providers or {}
-      local provider_def = providers[target.provider]
-      if provider_def then
-        ai_preset.base_url = provider_def.base_url
-        ai_preset.api_key = provider_def.api_key
-      end
-      ai_preset.provider = target.provider
-      ai_preset.model_name = target.model_name
-      ai_preset.model = target.model_name
-      ai_preset.stream = true
-      ai_preset.timeout = 60000
+      ai_preset = vim.deepcopy(target)
+      ai_preset.model = ai_preset.model_name
     end
   end
+
+  -- 2. 如果场景候选未获取到，回退到 get_available_models
   if not ai_preset.base_url or not ai_preset.api_key then
-    -- 回退到 resolve_scenario_config
+    if default_config and default_config.get_available_models then
+      local models = default_config.get_available_models("chat")
+      local target = models[model_index]
+      if target then
+        local ai_config = state.full_config.ai or {}
+        local providers = ai_config.providers or {}
+        local provider_def = providers[target.provider]
+        if provider_def then
+          ai_preset.base_url = provider_def.base_url
+          ai_preset.api_key = provider_def.api_key
+        end
+        ai_preset.provider = target.provider
+        ai_preset.model_name = target.model_name
+        ai_preset.model = target.model_name
+        ai_preset.stream = true
+        ai_preset.timeout = 60000
+      end
+    end
+  end
+
+  -- 3. 最终回退到 resolve_scenario_config
+  if not ai_preset.base_url or not ai_preset.api_key then
     ai_preset = resolve_scenario_config("chat")
   end
 

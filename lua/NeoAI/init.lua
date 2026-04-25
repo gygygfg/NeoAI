@@ -191,6 +191,9 @@ function M.setup(user_config)
   config = default_config.merge_defaults(config)
   config = default_config.sanitize_config(config)
 
+  -- 同步配置到 default_config 模块，确保 get_preset/get_scenario_candidates 使用合并后的配置
+  default_config.initialize(config)
+
   -- 添加调试信息，标记配置来源
   config._debug_source = "main_init_lua"
   config._debug_timestamp = os.time()

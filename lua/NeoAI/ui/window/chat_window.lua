@@ -1905,11 +1905,10 @@ end
 --- @return string|nil 模型标签，如 "deepseek/deepseek-chat"
 function M._get_current_model_label()
   local default_config = require("NeoAI.default_config")
-  local models = default_config.get_available_models("chat")
-  for _, m in ipairs(models) do
-    if m.index == state.current_model_index then
-      return m.label
-    end
+  local candidates = default_config.get_scenario_candidates("chat")
+  local target = candidates[state.current_model_index]
+  if target then
+    return string.format("%s/%s", target.provider or "?", target.model_name or "?")
   end
   return nil
 end
@@ -1921,34 +1920,32 @@ function M.get_current_model_index()
 end
 
 --- 显示模型选择器（浮动窗口菜单）
---- 列出当前场景（chat）内所有有 API key 的模型候选，用户选择后切换
+--- 列出当前场景（chat）内所有场景候选，用户选择后切换
 function M.show_model_selector()
   if not state.current_window_id then
     return
   end
 
   local default_config = require("NeoAI.default_config")
-  local models = default_config.get_available_models("chat")
+  local candidates = default_config.get_scenario_candidates("chat")
 
-  if #models == 0 then
-    vim.notify("[NeoAI] 没有可用的模型（请检查 API key 配置）", vim.log.levels.WARN)
+  if #candidates == 0 then
+    vim.notify("[NeoAI] 没有可用的场景候选（请检查 scenarios.chat 配置）", vim.log.levels.WARN)
     return
   end
 
   -- 构建选择菜单项
   local items = {}
-  for _, m in ipairs(models) do
-    local indicator = (m.index == state.current_model_index) and "✓ " or "  "
-    table.insert(items, string.format("%s%s", indicator, m.label))
+  for i, c in ipairs(candidates) do
+    local indicator = (i == state.current_model_index) and "✓ " or "  "
+    table.insert(items, string.format("%s%s/%s", indicator, c.provider or "?", c.model_name or "?"))
   end
 
   -- 获取当前模型名用于提示
   local current_label = "未知"
-  for _, m in ipairs(models) do
-    if m.index == state.current_model_index then
-      current_label = m.label
-      break
-    end
+  local current = candidates[state.current_model_index]
+  if current then
+    current_label = string.format("%s/%s", current.provider or "?", current.model_name or "?")
   end
 
   vim.ui.select(items, {
@@ -1957,11 +1954,8 @@ function M.show_model_selector()
       return item
     end,
   }, function(choice, idx)
-    if choice and idx then
-      local selected = models[idx]
-      if selected and selected.index ~= state.current_model_index then
-        M.switch_to_model(selected.index)
-      end
+    if choice and idx and idx ~= state.current_model_index then
+      M.switch_to_model(idx)
     end
   end)
 end
@@ -1974,17 +1968,10 @@ function M.switch_to_model(model_index)
   end
 
   local default_config = require("NeoAI.default_config")
-  local models = default_config.get_available_models("chat")
+  local candidates = default_config.get_scenario_candidates("chat")
 
   -- 查找目标模型
-  local target = nil
-  for _, m in ipairs(models) do
-    if m.index == model_index then
-      target = m
-      break
-    end
-  end
-
+  local target = candidates[model_index]
   if not target then
     vim.notify("[NeoAI] 无效的模型索引: " .. tostring(model_index), vim.log.levels.WARN)
     return
@@ -1994,7 +1981,7 @@ function M.switch_to_model(model_index)
   state.current_model_index = model_index
 
   -- 更新聊天窗口标题
-  M.update_title(string.format("NeoAI 聊天 [%s]", target.label))
+  M.update_title(string.format("NeoAI 聊天 [%s/%s]", target.provider or "?", target.model_name or "?"))
 
   -- 重新渲染聊天内容（标题区域会显示新模型）
   M.render_chat()

@@ -13,7 +13,7 @@ local DEFAULT_CONFIG = {
       deepseek = {
         base_url = "https://api.deepseek.com/chat/completions",
         api_key = os.getenv("DEEPSEEK_API_KEY") or "",
-        models = { "deepseek-chat", "deepseek-reasoner" },
+        models = { "deepseek-v4-flash", "deepseek-v4-pro" },
       },
       openai = {
         base_url = "https://api.openai.com/v1/chat/completions",
@@ -85,7 +85,7 @@ local DEFAULT_CONFIG = {
       naming = {
         {
           provider = "deepseek",
-          model_name = "deepseek-chat",
+          model_name = "deepseek-v4-flash",
           temperature = 0.3,
           max_tokens = 512,
           stream = true,
@@ -96,7 +96,7 @@ local DEFAULT_CONFIG = {
       chat = {
         {
           provider = "deepseek",
-          model_name = "deepseek-chat",
+          model_name = "deepseek-v4-flash",
           temperature = 0.7,
           max_tokens = 4096,
           stream = true,
@@ -107,7 +107,7 @@ local DEFAULT_CONFIG = {
       reasoning = {
         {
           provider = "deepseek",
-          model_name = "deepseek-reasoner",
+          model_name = "deepseek-v4-pro",
           temperature = 0.7,
           max_tokens = 8192,
           stream = true,
@@ -118,7 +118,7 @@ local DEFAULT_CONFIG = {
       coding = {
         {
           provider = "deepseek",
-          model_name = "deepseek-reasoner",
+          model_name = "deepseek-v4-pro",
           temperature = 0.2,
           max_tokens = 8192,
           stream = true,
@@ -129,7 +129,7 @@ local DEFAULT_CONFIG = {
       tools = {
         {
           provider = "deepseek",
-          model_name = "deepseek-chat",
+          model_name = "deepseek-v4-flash",
           temperature = 0.3,
           max_tokens = 1024,
           stream = true,
@@ -140,7 +140,7 @@ local DEFAULT_CONFIG = {
       agent = {
         {
           provider = "deepseek",
-          model_name = "deepseek-reasoner",
+          model_name = "deepseek-v4-pro",
           temperature = 0.7,
           max_tokens = 4096,
           stream = true,
@@ -969,23 +969,87 @@ function M.validate_config(config)
 end
 
 --- 合并默认配置（兼容旧版本）
+--- 以默认配置为模板，只允许覆盖默认配置中已存在的字段路径
 --- @param config table 用户配置
 --- @return table 合并后的配置
 function M.merge_defaults(config)
   local result = vim.deepcopy(DEFAULT_CONFIG)
 
-  -- 深度合并配置
-  local function deep_merge(target, source)
+  if not config or next(config) == nil then
+    return result
+  end
+
+  -- 只合并默认配置中已存在的字段路径
+  local function merge_known_paths(target, source, path)
     for k, v in pairs(source) do
-      if type(v) == "table" and type(target[k]) == "table" then
-        deep_merge(target[k], v)
+      local current_path = path .. "." .. tostring(k)
+
+      -- 目标中不存在该字段，跳过
+      if target[k] == nil then
+        goto continue
+      end
+
+      -- 特殊处理 scenarios
+      if k == "scenarios" and type(v) == "table" and type(target[k]) == "table" then
+        for scenario_name, scenario_entry in pairs(v) do
+          if type(scenario_entry) == "table" and type(target[k][scenario_name]) == "table" then
+            local default_entry = target[k][scenario_name]
+            if scenario_entry[1] == nil or type(scenario_entry[1]) ~= "table" then
+              -- 单元素表格式：用默认条目的第一个候选为基础，合并用户字段
+              if default_entry[1] and type(default_entry[1]) == "table" then
+                local merged = vim.deepcopy(default_entry[1])
+                for field, field_val in pairs(scenario_entry) do
+                  if
+                    merged[field] ~= nil
+                    or field == "provider"
+                    or field == "model_name"
+                    or field == "temperature"
+                    or field == "max_tokens"
+                    or field == "stream"
+                    or field == "timeout"
+                  then
+                    merged[field] = field_val
+                  end
+                end
+                target[k][scenario_name] = merged
+              else
+                for field, field_val in pairs(scenario_entry) do
+                  if target[k][scenario_name][field] ~= nil then
+                    target[k][scenario_name][field] = field_val
+                  end
+                end
+              end
+            else
+              -- 数组格式：对每个候选进行字段级合并
+              for i, candidate in ipairs(scenario_entry) do
+                if default_entry[i] and type(default_entry[i]) == "table" then
+                  local merged = vim.deepcopy(default_entry[i])
+                  for field, field_val in pairs(candidate) do
+                    if merged[field] ~= nil then
+                      merged[field] = field_val
+                    end
+                  end
+                  target[k][scenario_name][i] = merged
+                else
+                  target[k][scenario_name][i] = vim.deepcopy(candidate)
+                end
+              end
+            end
+          end
+        end
+      elseif type(v) == "table" and type(target[k]) == "table" then
+        -- 递归合并子表
+        merge_known_paths(target[k], v, current_path)
       else
+        -- 标量值，直接覆盖
         target[k] = v
       end
+
+      ::continue::
     end
   end
 
-  deep_merge(result, config or {})
+  merge_known_paths(result, config, "")
   return result
 end
 
