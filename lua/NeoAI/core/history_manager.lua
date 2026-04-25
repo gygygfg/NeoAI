@@ -89,6 +89,19 @@ local function generate_id()
   return "session_" .. (max_num + 1)
 end
 
+-- 使用 Neovim 内置函数截断 UTF-8 字符串
+local function truncate_utf8(str, max_len)
+  if not str or str == "" then
+    return str
+  end
+  local positions = vim.str_utf_pos(str)
+  if #positions <= max_len then
+    return str
+  end
+  local byte_pos = positions[max_len + 1] - 1
+  return str:sub(1, byte_pos)
+end
+
 --- 初始化
 function M.initialize(options)
   if state.initialized then
@@ -498,17 +511,16 @@ end
 --- 构建轮次预览文本（辅助函数）
 --- @param session table 会话对象
 --- @return string 轮次预览文本
-local function build_round_text(session)
+--- @param session table 会话对象
+--- @return string 轮次预览文本
+function M.build_round_text(session)
   if not session then
     return ""
   end
-  local text = ""
+  local user_text = ""
+  local ai_text = ""
   if session.user and session.user ~= "" then
-    local user_preview = session.user:gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
-    if #user_preview > 20 then
-      user_preview = user_preview:sub(1, 20) .. "…"
-    end
-    text = "👤" .. user_preview
+    user_text = session.user:gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
   end
   if
     session.assistant
@@ -517,26 +529,53 @@ local function build_round_text(session)
       or type(session.assistant) == "string" and session.assistant ~= ""
     )
   then
-    local ai_text = ""
     local last_entry = session.assistant
     if type(session.assistant) == "table" and #session.assistant > 0 then
       last_entry = session.assistant[#session.assistant]
     end
-    local ok, parsed = pcall(vim.json.decode, last_entry)
-    if ok and type(parsed) == "table" and parsed.content then
-      ai_text = parsed.content
+    if type(last_entry) == "table" and last_entry.content then
+      ai_text = last_entry.content
     elseif type(last_entry) == "string" then
-      ai_text = last_entry
+      local ok, parsed = pcall(vim.json.decode, last_entry)
+      if ok and type(parsed) == "table" and parsed.content then
+        ai_text = parsed.content
+      else
+        ai_text = last_entry
+      end
     end
-    local ai_preview = ai_text:gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
-    if #ai_preview > 20 then
-      ai_preview = ai_preview:sub(1, 20) .. "…"
+    ai_text = ai_text:gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
+  end
+  -- 构建显示文本
+  local text = ""
+  if user_text ~= "" and ai_text ~= "" then
+    -- 1. 用户截断到15字符
+    local user_len = #user_text
+    if user_len > 15 then
+      user_text = truncate_utf8(user_text, 15) .. "…"
+      user_len = 15
     end
-    if text ~= "" then
-      text = text .. " | 🤖" .. ai_preview
-    else
-      text = "🤖" .. ai_preview
+    -- 2. 加上用户emoji
+    text = "👤" .. user_text
+    -- 3. AI截断使总长（不含emoji）不超过20
+    local max_ai = 20 - user_len
+    if max_ai < 0 then
+      max_ai = 0
     end
+    if #ai_text > max_ai then
+      ai_text = truncate_utf8(ai_text, max_ai) .. "…"
+    end
+    -- 4. 加上AI emoji
+    text = text .. " | 🤖" .. ai_text
+  elseif user_text ~= "" then
+    if #user_text > 20 then
+      user_text = truncate_utf8(user_text, 20) .. "…"
+    end
+    text = "👤" .. user_text
+  elseif ai_text ~= "" then
+    if #ai_text > 20 then
+      ai_text = truncate_utf8(ai_text, 20) .. "…"
+    end
+    text = "🤖" .. ai_text
   end
   return text
 end
@@ -564,7 +603,7 @@ function M.get_tree()
   local roots = M.get_root_sessions()
 
   local function build_session_node(session)
-    local round_text = build_round_text(session)
+    local round_text = M.build_round_text(session)
     local node = {
       id = session.id,
       session_id = session.id,

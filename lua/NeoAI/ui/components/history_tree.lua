@@ -20,61 +20,13 @@ function M.initialize(config)
   state.initialized = true
 end
 
---- 构建轮次预览文本
+--- 引用 history_manager 的 build_round_text
 local function build_round_text(session)
-  if not session then
-    return ""
+  local ok, hm = pcall(require, "NeoAI.core.history_manager")
+  if ok and hm.build_round_text then
+    return hm.build_round_text(session)
   end
-  local text = ""
-  if session.user and session.user ~= "" then
-    local user_preview = session.user:gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
-    if #user_preview > 20 then
-      user_preview = user_preview:sub(1, 20) .. "…"
-    end
-    text = "👤" .. user_preview
-  end
-  if
-    session.assistant
-    and (
-      (type(session.assistant) == "table" and #session.assistant > 0)
-      or (type(session.assistant) == "string" and session.assistant ~= "")
-    )
-  then
-    local ai_text = ""
-    local last_entry = session.assistant
-    if type(session.assistant) == "table" and #session.assistant > 0 then
-      last_entry = session.assistant[#session.assistant]
-    end
-    -- 尝试解析 JSON 字符串
-    if type(last_entry) == "string" then
-      local ok2, parsed = pcall(vim.json.decode, last_entry)
-      if ok2 and type(parsed) == "table" then
-        -- 可能是 {content="..."} 或 [{content="..."}, ...]
-        if parsed.content then
-          ai_text = parsed.content
-        elseif #parsed > 0 and type(parsed[1]) == "table" and parsed[1].content then
-          ai_text = parsed[1].content
-        else
-          ai_text = last_entry
-        end
-      else
-        -- 不是 JSON，直接使用字符串
-        ai_text = last_entry
-      end
-    elseif type(last_entry) == "table" and last_entry.content then
-      ai_text = last_entry.content
-    end
-    local ai_preview = ai_text:gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
-    if #ai_preview > 20 then
-      ai_preview = ai_preview:sub(1, 20) .. "…"
-    end
-    if text ~= "" then
-      text = text .. " | 🤖" .. ai_preview
-    else
-      text = "🤖" .. ai_preview
-    end
-  end
-  return text
+  return ""
 end
 
 --- 从 history_manager 获取扁平会话列表，构建渲染列表
