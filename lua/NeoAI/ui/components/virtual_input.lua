@@ -98,12 +98,11 @@ function M.open(parent_win, opts)
   state.on_change = opts.on_change
   state.parent_win = parent_win
   state.mode = "float"
-  state.input_line_count = math.max(5, 1)
+  state.input_line_count = math.max(3, 1)
 
   -- 创建独立的浮动输入框 buffer
   state.float_buf = vim.api.nvim_create_buf(false, true)
   vim.api.nvim_set_option_value("filetype", "NeoAIInput", { buf = state.float_buf })
-  -- 使用 nofile 类型，避免 E37 未保存错误
   vim.api.nvim_set_option_value("buftype", "nofile", { buf = state.float_buf })
   vim.api.nvim_set_option_value("bufhidden", "wipe", { buf = state.float_buf })
   vim.api.nvim_set_option_value("swapfile", false, { buf = state.float_buf })
@@ -116,16 +115,54 @@ function M.open(parent_win, opts)
   local parent_config = vim.api.nvim_win_get_config(parent_win)
   local parent_width = parent_config.width or 80
   local parent_col = parent_config.col or 0
+  local parent_row = parent_config.row or 0
+  local parent_height = parent_config.height or 20
+  local screen_height = vim.o.lines
 
-  -- 输入框尺寸（最小5行）
-  local input_height = math.max(5, 1)
+  -- 输入框高度：固定 5 行
+  local input_height = 5
   local input_width = parent_width
 
-  -- 放在屏幕最底部，与父窗口同宽同列
-  -- 不改变父窗口大小，输入框覆盖在父窗口底部
-  local screen_height = vim.o.lines
-  local row = screen_height - input_height - 1
+  -- 计算 chat 窗口底部到屏幕底部的剩余空间
+  -- nvim_win_get_config 返回的 row 是窗口左上角（含 border），0-based
+  -- height 是内容区域高度（不含 border）
+  -- chat 窗口底部（含 border）= parent_row + parent_height + 1
+  -- screen_height (vim.o.lines) 是 1-based，转 0-based 需减 1
+  -- 剩余空间 = 屏幕最后一行(0-based) - chat 窗口底部(含 border)
+  -- 输入框放在 chat 窗口正下方（紧贴 border），需要 input_height + 2 行（含自身 border）
+  local chat_bottom = parent_row + parent_height + 1
+  local space_below = (screen_height - 1) - chat_bottom
+
+  -- 输入框总高度（含 border）= input_height + 2
+  local input_total_height = input_height + 2
+
+  -- 如果底部空间不足，抬升 chat 窗口
+  local adjusted_parent_row = parent_row
+  if space_below < input_total_height then
+    local lift = input_total_height - space_below
+    adjusted_parent_row = math.max(0, parent_row - lift)
+
+    -- 保存原始配置，关闭时恢复
+    state._saved_parent_config = {
+      row = parent_row,
+    }
+
+    -- 抬升 chat 窗口
+    parent_config.row = adjusted_parent_row
+    pcall(vim.api.nvim_win_set_config, parent_win, parent_config)
+  end
+
+  -- 输入框位置：紧贴 chat 窗口底部 border 下方
+  -- row 是输入框左上角（含 border），放在 chat 窗口 border 正下方
+  local row = adjusted_parent_row + parent_height + 2
   local col = parent_col
+
+  -- 确保输入框整体不超出屏幕底部
+  -- 输入框底部（含 border）= row + input_height + 1
+  local input_bottom = row + input_height + 1
+  if input_bottom > screen_height - 1 then
+    row = math.max(0, (screen_height - 1) - (input_height + 1))
+  end
 
   -- 创建浮动窗口
   state.float_win = vim.api.nvim_open_win(state.float_buf, true, {
@@ -144,7 +181,6 @@ function M.open(parent_win, opts)
   -- 注册到 window_manager，以便切换 buffer 时自动隐藏/显示
   local ok, wm = pcall(require, "NeoAI.ui.window.window_manager")
   if ok and wm and wm.register_float_window then
-    -- 使用父窗口的 buffer 作为 key
     local parent_buf = vim.api.nvim_win_get_buf(parent_win)
     wm.register_float_window(parent_buf, state.float_win, state.float_buf)
   end
@@ -155,7 +191,6 @@ function M.open(parent_win, opts)
   -- 设置窗口选项
   vim.api.nvim_set_option_value("wrap", true, { win = state.float_win })
   vim.api.nvim_set_option_value("cursorline", true, { win = state.float_win })
-  -- 隐藏模式提示符（-- INSERT --），浮动输入框不需要显示
   vim.api.nvim_set_option_value("showmode", false, { scope = "local" })
 
   -- 设置按键映射
@@ -192,6 +227,14 @@ function M.close(force)
     pcall(vim.api.nvim_buf_delete, state.float_buf, { force = true })
   end
   state.float_buf = nil
+
+  -- 恢复父窗口位置（如果之前抬升过）
+  if state._saved_parent_config and state.parent_win and vim.api.nvim_win_is_valid(state.parent_win) then
+    local parent_config = vim.api.nvim_win_get_config(state.parent_win)
+    parent_config.row = state._saved_parent_config.row
+    pcall(vim.api.nvim_win_set_config, state.parent_win, parent_config)
+    state._saved_parent_config = nil
+  end
 
   -- 切换到 NORMAL 模式
   pcall(function()
@@ -395,9 +438,24 @@ function M._setup_float_keymaps()
     M._submit_float()
   end, { buffer = buf, noremap = true, silent = true, desc = "发送消息" })
 
-  -- 不绑定 Esc 快捷键，让 Neovim 默认行为处理
-  -- 插入模式下按 Esc 会退出到 normal 模式
-  -- normal 模式下按 Esc 无特殊行为（用户可用 q 关闭聊天窗口）
+  -- 取消生成（Esc）- 仅在 AI 正在生成时有效
+  vim.keymap.set("i", "<Esc>", function()
+    local ok, ai_engine = pcall(require, "NeoAI.core.ai.ai_engine")
+    if ok and ai_engine and ai_engine.is_generating() then
+      ai_engine.cancel_generation()
+    else
+      -- 没有正在生成的任务，退出插入模式
+      vim.cmd("stopinsert")
+    end
+  end, { buffer = buf, noremap = true, silent = true, desc = "取消生成或退出插入模式" })
+
+  -- normal 模式下按 Esc 也尝试取消生成
+  vim.keymap.set("n", "<Esc>", function()
+    local ok, ai_engine = pcall(require, "NeoAI.core.ai.ai_engine")
+    if ok and ai_engine and ai_engine.is_generating() then
+      ai_engine.cancel_generation()
+    end
+  end, { buffer = buf, noremap = true, silent = true, desc = "取消生成" })
 
   -- i 在 normal 模式下进入插入模式
   vim.keymap.set("n", "i", function()
@@ -445,9 +503,24 @@ function M._bind_chat_keymaps_to_float(buf)
 
   -- 定义需要绑定的快捷键及其对应的操作
   local bindings = {
-    { key = (chat_config.quit or {}).key or "q", action = function() chat_window.close() end },
-    { key = (chat_config.refresh or {}).key or "r", action = function() chat_window.refresh_chat() end },
-    { key = (chat_config.switch_model or {}).key or "m", action = function() chat_window.show_model_selector() end },
+    {
+      key = (chat_config.quit or {}).key or "q",
+      action = function()
+        chat_window.close()
+      end,
+    },
+    {
+      key = (chat_config.refresh or {}).key or "r",
+      action = function()
+        chat_window.refresh_chat()
+      end,
+    },
+    {
+      key = (chat_config.switch_model or {}).key or "m",
+      action = function()
+        chat_window.show_model_selector()
+      end,
+    },
   }
 
   -- 绑定快捷键到浮动输入框的 normal 模式
@@ -527,11 +600,16 @@ function M._setup_keymaps()
     end
   end, { buffer = buf, noremap = true, silent = true, desc = "发送消息" })
 
-  -- 退出插入模式
+  -- 退出插入模式或取消生成
   vim.keymap.set("i", "<Esc>", function()
-    vim.cmd("stopinsert")
-    M._update_placeholder()
-  end, { buffer = buf, noremap = true, silent = true, desc = "退出插入模式" })
+    local ok, ai_engine = pcall(require, "NeoAI.core.ai.ai_engine")
+    if ok and ai_engine and ai_engine.is_generating() then
+      ai_engine.cancel_generation()
+    else
+      vim.cmd("stopinsert")
+      M._update_placeholder()
+    end
+  end, { buffer = buf, noremap = true, silent = true, desc = "取消生成或退出插入模式" })
 
   -- 取消输入
   vim.keymap.set("i", "<C-c>", function()

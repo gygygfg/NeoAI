@@ -149,6 +149,9 @@ function M.open(session_id, window_id, branch_id)
   -- 自动获取焦点
   M._focus_window()
 
+  -- 设置按键映射
+  M.set_keymaps()
+
   -- 打开浮动虚拟输入框
   vim.defer_fn(function()
     M._open_float_input()
@@ -211,7 +214,7 @@ function M._do_render_chat()
     async_worker.submit_task("render_chat_content", function()
       local content = {}
 
-  -- 添加标题
+      -- 添加标题
       table.insert(content, "# NeoAI 聊天")
       table.insert(content, "")
       table.insert(content, string.format("会话: %s", state.current_session_id or "未知"))
@@ -307,13 +310,6 @@ function M._do_render_chat()
           -- 自动获取焦点
           M._focus_window()
 
-          -- 仅在非流式状态下打开浮动虚拟输入框
-          -- 流式过程中不打开，避免干扰用户查看输出
-          -- 注意：生成完成后的渲染由 GENERATION_COMPLETED 回调统一处理滚动和打开输入框
-          if not state.streaming.active and not state.last_usage then
-            M._open_float_input()
-          end
-
           -- 确保折叠选项正确设置并刷新折叠
           local win_handle = window_manager.get_window_win(state.current_window_id)
           if win_handle and vim.api.nvim_win_is_valid(win_handle) then
@@ -335,11 +331,18 @@ function M._do_render_chat()
             end, 10)
           end
 
-          -- 延迟执行滚动，确保在 set_window_content 内部的折叠刷新之后
-          -- 注意：生成完成后的渲染由 GENERATION_COMPLETED 回调统一处理滚动
+          -- 先滚动到底部，再打开浮动输入框（确保滚动在抢焦点之前执行）
+          -- 注意：生成完成后的渲染由 GENERATION_COMPLETED 回调统一处理滚动和打开输入框
           if not state.last_usage then
+            -- 延迟执行滚动，确保在 set_window_content 内部的折叠刷新之后
             vim.defer_fn(function()
               M._scroll_to_end_with_offset()
+
+              -- 滚动完成后，再打开浮动虚拟输入框
+              -- 流式过程中不打开，避免干扰用户查看输出
+              if not state.streaming.active then
+                M._open_float_input()
+              end
             end, 50)
           end
 
@@ -463,6 +466,7 @@ function M.set_keymaps()
     refresh = (chat_config.refresh or {}).key or "r",
     send = (chat_config.send or {}).normal and chat_config.send.normal.key or (chat_config.send or {}).key or "<CR>",
     switch_model = (chat_config.switch_model or {}).key or "m",
+    cancel = (chat_config.cancel or {}).key or "<Esc>",
   }
 
   -- 使用闭包创建局部函数引用，避免每次按键都调用 require
@@ -512,6 +516,13 @@ function M.set_keymaps()
     M.show_model_selector()
   end
 
+  local function cancel_generation()
+    local ok, ai_engine = pcall(require, "NeoAI.core.ai.ai_engine")
+    if ok and ai_engine then
+      ai_engine.cancel_generation()
+    end
+  end
+
   -- 设置按键映射（使用 vim.keymap.set 直接传递函数）
   for key, mapping in pairs(keymaps) do
     local callback = nil
@@ -525,6 +536,8 @@ function M.set_keymaps()
       callback = send_message
     elseif key == "switch_model" then
       callback = switch_model
+    elseif key == "cancel" then
+      callback = cancel_generation
     end
 
     if callback then
@@ -532,8 +545,15 @@ function M.set_keymaps()
     end
   end
 
-  -- 设置插入模式映射
-  vim.keymap.set("i", "<Esc>", exit_insert_mode, { buffer = buf, noremap = true, silent = true })
+  -- 设置插入模式映射（Esc：取消生成或退出插入模式）
+  vim.keymap.set("i", "<Esc>", function()
+    local ok, ai_engine = pcall(require, "NeoAI.core.ai.ai_engine")
+    if ok and ai_engine and ai_engine.is_generating() then
+      ai_engine.cancel_generation()
+    else
+      exit_insert_mode()
+    end
+  end, { buffer = buf, noremap = true, silent = true, desc = "取消生成或退出插入模式" })
 end
 
 --- 进入插入模式（内部函数）
@@ -795,7 +815,7 @@ function M.close()
     { pattern = Events.CHAT_BOX_CLOSING, data = { window_id = state.current_window_id } }
   )
 
-  -- 关闭浮动虚拟输入框
+  -- 关闭浮动虚拟输入框（所有模式下关闭聊天窗口时都关闭输入框）
   if virtual_input.is_active() then
     virtual_input.close()
   end
@@ -1196,9 +1216,22 @@ end
 --- 将光标移动到缓冲区末尾（最新消息位置）
 --- 在渲染完成后调用，方便用户查看最新输出
 --- 滚动到缓冲区末尾，使最后一行位于窗口底部上方指定行数处
---- @param offset number|nil 距离底部的行数偏移，默认15
+--- float 模式下虚拟输入框是独立浮动窗口，不占用 chat 窗口空间，无需留偏移
+--- 其他模式（inline/tab/split）需要留出内联输入区域的空间
+--- @param offset number|nil 距离底部的行数偏移，nil 时根据窗口模式自动计算
 function M._scroll_to_end_with_offset(offset)
-  offset = offset or 10
+  if offset == nil then
+    -- 根据窗口模式动态计算 offset
+    local mode = window_manager.get_current_mode()
+    if mode == "float" then
+      offset = 0 -- float 模式：虚拟输入框独立，不占 chat 窗口空间
+    else
+      -- 其他模式：内联输入需要留空间，取虚拟输入框行数 + 5 行余量
+      local vi = require("NeoAI.ui.components.virtual_input")
+      local input_lines = vi.get_input_line_count()
+      offset = (input_lines or 3) + 5
+    end
+  end
   if not state.current_window_id then
     return
   end
@@ -1230,8 +1263,8 @@ function M._scroll_to_end_with_offset(offset)
       local view = vim.fn.winsaveview()
       view.topline = target_topline
       vim.fn.winrestview(view)
-      -- 将光标移到末尾行（不改变视图）
-      pcall(vim.api.nvim_win_set_cursor, 0, { line_count, 0 })
+      -- 将光标移到末尾行（使用 win_handle 而非 0，避免焦点在浮动窗口时操作错误）
+      pcall(vim.api.nvim_win_set_cursor, win_handle, { line_count, 0 })
     end)
   end
 end
@@ -1434,7 +1467,7 @@ function M._setup_event_listeners()
       -- 使用单层 defer_fn 减少延迟
       vim.defer_fn(function()
         M._update_usage_virt_text()
-        M._scroll_to_end_with_offset(10)
+        M._scroll_to_end_with_offset()
         M._open_float_input()
 
         -- 确保光标在浮动输入框并进入插入模式
@@ -1867,8 +1900,32 @@ function M._append_stream_chunk_to_buffer(chunk_content, content_type)
   -- 不恢复只读（内联输入模式需要保持可修改）
   pcall(vim.api.nvim_set_option_value, "modified", false, { buf = buf })
 
-  -- 滚动使最后一行位于窗口底部上方10行处
-  M._scroll_to_end_with_offset()
+  -- 检查光标是否在缓冲区末尾附近（最后5行内），如果是则自动跟随滚动
+  local win_handle = window_manager.get_window_win(state.current_window_id)
+  local should_follow = false
+  if win_handle and vim.api.nvim_win_is_valid(win_handle) then
+    local cursor = vim.api.nvim_win_get_cursor(win_handle)
+    local cursor_line = cursor[1]
+    local total_lines = vim.api.nvim_buf_line_count(buf)
+    if total_lines - cursor_line <= 5 then
+      should_follow = true
+    end
+  end
+
+  if should_follow then
+    -- 滚动使最后一行位于窗口底部上方10行处
+    M._scroll_to_end_with_offset()
+
+    -- 将光标移动到最新追加的内容末尾（新行的行尾）
+    local new_line_count = vim.api.nvim_buf_line_count(buf)
+    if new_line_count > 0 then
+      if win_handle and vim.api.nvim_win_is_valid(win_handle) then
+        local last_line_content = vim.api.nvim_buf_get_lines(buf, new_line_count - 1, new_line_count, false)[1] or ""
+        local last_col = #last_line_content
+        pcall(vim.api.nvim_win_set_cursor, win_handle, { new_line_count, last_col })
+      end
+    end
+  end
 end
 
 --- 完成流式渲染

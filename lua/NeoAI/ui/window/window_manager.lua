@@ -167,33 +167,67 @@ local function create_split_window(options)
   local split_size = nil
 
   -- 根据选项决定分割方向
+  -- split_direction: 'left' 表示 chat/tree 在左侧, 'right' 表示在右侧
+  -- 默认 'right'（兼容旧行为：vsplit 后新窗口在右侧）
+  local direction = "right"
   if options and options.split_direction then
-    if options.split_direction == "horizontal" then
-      split_cmd = "split"
-    elseif options.split_direction == "vertical" then
-      split_cmd = "vsplit"
+    direction = options.split_direction
+  end
+
+  if direction == "left" then
+    -- 左侧打开：先 vsplit，然后移动新窗口到左侧
+    split_cmd = "vsplit"
+  else
+    -- 右侧打开（默认）：标准 vsplit，新窗口在右侧
+    split_cmd = "vsplit"
+  end
+
+  -- 设置分割大小
+  -- size > 1 表示绝对列数，< 1 表示比例（如 0.3 表示 30%）
+  if options and options.split_size then
+    if options.split_size > 1 then
+      -- 绝对列数
+      split_size = tostring(options.split_size)
+    elseif options.split_size > 0 then
+      -- 比例：计算实际列数
+      local total_width = vim.o.columns
+      local ratio_width = math.floor(total_width * options.split_size)
+      split_size = tostring(ratio_width)
     end
   end
-  -- 设置分割大小
-  if options and options.split_size then
-    split_size = options.split_size
-  end
+
+  -- 先创建独立 buffer，避免 vsplit 共享 buffer 导致内容显示在两边
+  local buf = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_set_option_value("buftype", "nofile", { buf = buf })
+  vim.api.nvim_set_option_value("swapfile", false, { buf = buf })
+  vim.api.nvim_set_option_value("bufhidden", "hide", { buf = buf })
+  vim.api.nvim_set_option_value("modifiable", false, { buf = buf })
+  vim.api.nvim_set_option_value("readonly", true, { buf = buf })
+  vim.api.nvim_set_option_value("buflisted", true, { buf = buf })
+
   -- 执行分割命令
   if split_size then
     vim.cmd(split_cmd .. " " .. split_size)
   else
     vim.cmd(split_cmd)
   end
-  -- 获取当前窗口和缓冲区
-  local win = vim.api.nvim_get_current_win()
-  local buf = vim.api.nvim_get_current_buf()
 
-  -- 设置缓冲区选项
-  vim.api.nvim_set_option_value("buftype", "nofile", { buf = buf })
-  vim.api.nvim_set_option_value("swapfile", false, { buf = buf })
-  vim.api.nvim_set_option_value("bufhidden", "hide", { buf = buf })
-  vim.api.nvim_set_option_value("modifiable", false, { buf = buf })
-  vim.api.nvim_set_option_value("readonly", true, { buf = buf })
+  -- 获取当前窗口（新 split 出来的窗口）
+  local win = vim.api.nvim_get_current_win()
+
+  -- 如果方向为 left，需要将新窗口移到左侧
+  if direction == "left" then
+    -- 获取当前窗口编号
+    local win_number = vim.api.nvim_win_get_number(win)
+    -- 使用 wincmd H 将窗口移到最左侧
+    vim.api.nvim_set_current_win(win)
+    vim.cmd("wincmd H")
+    -- 重新获取窗口句柄（wincmd H 后窗口可能变化）
+    win = vim.api.nvim_get_current_win()
+  end
+
+  -- 将独立 buffer 设置到 split 窗口，这样只有这个窗口显示聊天内容
+  vim.api.nvim_win_set_buf(win, buf)
 
   -- 设置缓冲区名称（临时名称，后面会覆盖）
   vim.api.nvim_buf_set_name(buf, "neoai://split/temp")
@@ -429,6 +463,26 @@ function M.create_window(window_type, options)
 
   -- 根据窗口模式创建窗口
   local window_mode = merged_options.window_mode or state.current_mode
+
+  -- 如果是 split 模式，根据窗口类型从配置中读取对应的 split 方向
+  if window_mode == "split" then
+    local ui_config = state.config
+    local split_config = merged_options.split or (ui_config and ui_config.split) or {}
+    if not merged_options.split_direction then
+      -- 根据窗口类型选择对应的方向配置
+      if window_type == "chat" then
+        merged_options.split_direction = split_config.chat_direction or "right"
+      elseif window_type == "tree" then
+        merged_options.split_direction = split_config.tree_direction or "right"
+      else
+        merged_options.split_direction = "right"
+      end
+    end
+    if not merged_options.split_size then
+      merged_options.split_size = split_config.size
+    end
+  end
+
   local window_info = create_window_by_mode(window_mode, merged_options)
 
   if not window_info then

@@ -183,6 +183,14 @@ local DEFAULT_CONFIG = {
       border = "FloatBorder",
       text = "Normal",
     },
+    split = {
+      -- 分割大小（列数或百分比）
+      size = 80,
+      -- chat 窗口分割方向: 'left' 在左侧, 'right' 在右侧
+      chat_direction = "right",
+      -- tree 窗口分割方向: 'left' 在左侧, 'right' 在右侧
+      tree_direction = "right",
+    },
     tree = {
       foldenable = false,
       foldmethod = "manual",
@@ -232,7 +240,7 @@ local DEFAULT_CONFIG = {
   -- 会话配置
   session = {
     auto_save = true,
-    auto_naming = false, -- 是否自动命名会话
+    auto_naming = true, -- 是否自动命名会话
     save_path = vim.fn.stdpath("cache") .. "/NeoAI",
     max_history_per_session = 1000,
   },
@@ -443,6 +451,33 @@ function M.validate()
     if state.config.ui.window_mode and not vim.tbl_contains(valid_modes, state.config.ui.window_mode) then
       return false, "ui.window_mode 必须是 'float', 'tab' 或 'split'"
     end
+
+    -- 验证 split 配置
+    if state.config.ui.split then
+      local valid_directions = { "left", "right" }
+      if
+        state.config.ui.split.chat_direction
+        and not vim.tbl_contains(valid_directions, state.config.ui.split.chat_direction)
+      then
+        return false, "ui.split.chat_direction 必须是 'left' 或 'right'"
+      end
+      if
+        state.config.ui.split.tree_direction
+        and not vim.tbl_contains(valid_directions, state.config.ui.split.tree_direction)
+      then
+        return false, "ui.split.tree_direction 必须是 'left' 或 'right'"
+      end
+      if
+        state.config.ui.split.size
+        and (
+          type(state.config.ui.split.size) ~= "number"
+          or (state.config.ui.split.size > 1 and state.config.ui.split.size < 10)
+          or state.config.ui.split.size <= 0
+        )
+      then
+        return false, "ui.split.size 必须是 >1 的列数或 0~1 之间的比例"
+      end
+    end
   end
 
   -- 验证会话配置
@@ -623,7 +658,8 @@ function M.get_summary()
         for name, provider in pairs(value.providers) do
           local key_status = (provider.api_key and #provider.api_key > 0) and "[已设置]" or "[未设置]"
           local api_type = provider.api_type or "openai"
-          summary[#summary + 1] = string.format("    %s: %s, api_type=%s, api_key: %s", name, provider.base_url or "?", api_type, key_status)
+          summary[#summary + 1] =
+            string.format("    %s: %s, api_type=%s, api_key: %s", name, provider.base_url or "?", api_type, key_status)
         end
       end
       -- 显示场景配置
@@ -850,6 +886,41 @@ function M.validate_config(config)
       if config.ui.window.height and (type(config.ui.window.height) ~= "number" or config.ui.window.height < 5) then
         vim.notify("[NeoAI] ui.window.height must be a number >= 5. Using default.", vim.log.levels.WARN)
         config.ui.window.height = nil
+      end
+    end
+
+    -- 验证 split 配置
+    if config.ui.split then
+      if config.ui.split.chat_direction then
+        local valid_directions = { "left", "right" }
+        if not vim.tbl_contains(valid_directions, config.ui.split.chat_direction) then
+          vim.notify(
+            string.format("[NeoAI] ui.split.chat_direction must be one of: left, right. Using default."),
+            vim.log.levels.WARN
+          )
+          config.ui.split.chat_direction = nil
+        end
+      end
+      if config.ui.split.tree_direction then
+        local valid_directions = { "left", "right" }
+        if not vim.tbl_contains(valid_directions, config.ui.split.tree_direction) then
+          vim.notify(
+            string.format("[NeoAI] ui.split.tree_direction must be one of: left, right. Using default."),
+            vim.log.levels.WARN
+          )
+          config.ui.split.tree_direction = nil
+        end
+      end
+      if
+        config.ui.split.size
+        and (
+          type(config.ui.split.size) ~= "number"
+          or (config.ui.split.size > 1 and config.ui.split.size < 10)
+          or config.ui.split.size <= 0
+        )
+      then
+        vim.notify("[NeoAI] ui.split.size must be >1 (columns) or 0~1 (ratio). Using default.", vim.log.levels.WARN)
+        config.ui.split.size = nil
       end
     end
   end

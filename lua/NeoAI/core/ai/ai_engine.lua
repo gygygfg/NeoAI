@@ -970,6 +970,12 @@ function M.cancel_generation()
   -- logger.info(string.format("Generation cancelled: id=%s", generation_id or "unknown"))
 end
 
+--- 检查是否正在生成
+--- @return boolean
+function M.is_generating()
+  return state.is_generating
+end
+
 --- 设置引擎可用的工具函数
 --- @param tools table 工具函数表
 function M.set_tools(tools)
