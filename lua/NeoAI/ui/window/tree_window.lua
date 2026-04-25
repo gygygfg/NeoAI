@@ -116,6 +116,13 @@ function M.render_tree()
     return
   end
 
+  -- 保存当前光标行号（1-based），用于渲染后恢复
+  local saved_cursor_line = nil
+  local win_handle = window_manager.get_window_win(state.current_window_id)
+  if win_handle and vim.api.nvim_win_is_valid(win_handle) then
+    saved_cursor_line = vim.api.nvim_win_get_cursor(win_handle)[1]
+  end
+
   -- 禁用光标监听
   if state.cursor_augroup then
     pcall(vim.api.nvim_del_augroup_by_id, state.cursor_augroup)
@@ -133,20 +140,20 @@ function M.render_tree()
 
     window_manager.set_window_content(state.current_window_id, content)
 
-    -- 恢复选中光标位置
-    if state.selected_session_id then
-      local win_handle = window_manager.get_window_win(state.current_window_id)
+    -- 恢复光标行号（直接记忆行号，不依赖 session_id）
+    if saved_cursor_line then
+      local line_count = vim.api.nvim_buf_line_count(window_manager.get_window_buf(state.current_window_id))
+      local target_line = math.min(saved_cursor_line, line_count)
+      if target_line < 1 then
+        target_line = 1
+      end
       if win_handle and vim.api.nvim_win_is_valid(win_handle) then
-        local line_map = M._build_line_to_session_map()
-        for line, sid in pairs(line_map) do
-          if sid == state.selected_session_id then
-            -- line 是 0-based 绝对行号，nvim_win_set_cursor 需要 1-based
-            vim.api.nvim_win_set_cursor(win_handle, { line + 1, 0 })
-            break
-          end
-        end
+        vim.api.nvim_win_set_cursor(win_handle, { target_line, 0 })
       end
     end
+
+    -- 根据光标位置更新 selected_session_id
+    M._update_selection_from_cursor()
 
     vim.api.nvim_exec_autocmds("User", {
       pattern = "NeoAI:rendering_complete",
@@ -231,13 +238,15 @@ end
 function M._build_line_to_session_map()
   local map = {}
   -- 第0行是标题，第1行是空行，从第2行开始是 flat_items 的渲染行
-  local line = 2
-  for _, item in ipairs(state.flat_items) do
+  -- 注意：flat_items 中的每个元素（包括虚拟节点）都占用一行
+  -- 所以 line 必须为每个 flat_items 项递增，不能跳过虚拟节点
+  for line, item in ipairs(state.flat_items) do
+    -- line 是 1-based 的 flat_items 索引，对应 buffer 行号 = line + 1（因为标题和空行占了2行）
+    -- 但我们需要 0-based 的 buffer 行号，所以用 line + 1
+    local buf_line = line + 1  -- 0-based buffer 行号
     if not item.is_virtual and item.session_id then
-      map[line] = item.session_id
+      map[buf_line] = item.session_id
     end
-    -- 每个 flat_items 项（包括虚拟节点）都占用一行
-    line = line + 1
   end
   return map
 end
