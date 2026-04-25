@@ -11,66 +11,79 @@ local DEFAULT_CONFIG = {
     -- 提供商定义
     providers = {
       deepseek = {
+        api_type = "openai",
         base_url = "https://api.deepseek.com/chat/completions",
         api_key = os.getenv("DEEPSEEK_API_KEY") or "",
         models = { "deepseek-v4-flash", "deepseek-v4-pro" },
       },
       openai = {
+        api_type = "openai",
         base_url = "https://api.openai.com/v1/chat/completions",
         api_key = os.getenv("OPENAI_API_KEY") or "",
         models = { "gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "gpt-3.5-turbo" },
       },
       anthropic = {
+        api_type = "anthropic",
         base_url = "https://api.anthropic.com/v1/messages",
         api_key = os.getenv("ANTHROPIC_API_KEY") or "",
         models = { "claude-sonnet-4-20250514", "claude-3-5-sonnet-20241022", "claude-3-5-haiku-20241022" },
       },
       google = {
-        base_url = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+        api_type = "google",
+        base_url = "https://generativelanguage.googleapis.com/v1beta/models",
         api_key = os.getenv("GOOGLE_API_KEY") or "",
         models = { "gemini-2.0-flash", "gemini-2.0-flash-lite", "gemini-1.5-pro", "gemini-1.5-flash" },
       },
       groq = {
+        api_type = "openai",
         base_url = "https://api.groq.com/openai/v1/chat/completions",
         api_key = os.getenv("GROQ_API_KEY") or "",
         models = { "llama-3.3-70b-versatile", "llama-3.1-8b-instant", "mixtral-8x7b-32768" },
       },
       together = {
+        api_type = "openai",
         base_url = "https://api.together.xyz/v1/chat/completions",
         api_key = os.getenv("TOGETHER_API_KEY") or "",
         models = { "meta-llama/Llama-3.3-70B-Instruct-Turbo", "mistralai/Mixtral-8x22B-Instruct-v0.1" },
       },
       openrouter = {
+        api_type = "openai",
         base_url = "https://openrouter.ai/api/v1/chat/completions",
         api_key = os.getenv("OPENROUTER_API_KEY") or "",
         models = { "openai/gpt-4o", "anthropic/claude-sonnet-4-20250514", "google/gemini-2.0-flash-001" },
       },
       siliconflow = {
+        api_type = "openai",
         base_url = "https://api.siliconflow.cn/v1/chat/completions",
         api_key = os.getenv("SILICONFLOW_API_KEY") or "",
         models = { "deepseek-ai/DeepSeek-V3", "deepseek-ai/DeepSeek-R1", "Qwen/Qwen2.5-72B-Instruct" },
       },
       moonshot = {
+        api_type = "openai",
         base_url = "https://api.moonshot.cn/v1/chat/completions",
         api_key = os.getenv("MOONSHOT_API_KEY") or "",
         models = { "moonshot-v1-8k", "moonshot-v1-32k", "moonshot-v1-128k" },
       },
       zhipu = {
+        api_type = "openai",
         base_url = "https://open.bigmodel.cn/api/paas/v4/chat/completions",
         api_key = os.getenv("ZHIPU_API_KEY") or "",
         models = { "glm-4-plus", "glm-4-air", "glm-4-flash" },
       },
       baidu = {
+        api_type = "openai",
         base_url = "https://aip.baidubce.com/rpc/2.0/ai_custom/v1/wenxinworkshop/chat/completions",
         api_key = os.getenv("BAIDU_API_KEY") or "",
         models = { "ernie-4.0-8k", "ernie-3.5-8k" },
       },
       aliyun = {
+        api_type = "openai",
         base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
         api_key = os.getenv("ALIYUN_API_KEY") or "",
         models = { "qwen-plus", "qwen-turbo", "qwen-max" },
       },
       stepfun = {
+        api_type = "openai",
         base_url = "https://api.stepfun.com/v1/chat/completions",
         api_key = os.getenv("STEPFUN_API_KEY") or "",
         models = { "step-2-16k", "step-1-8k", "step-1-flash" },
@@ -81,14 +94,14 @@ local DEFAULT_CONFIG = {
     -- 每个场景可指定多个 AI 候选（数组），按顺序尝试；也可只传一个（单元素表）
     -- 每个候选为 key-value 表：{ provider = '', model_name = '', ... }
     scenarios = {
-      -- 窗口命名用：快速低延迟
+      -- 窗口命名用：快速低延迟，使用非推理模型避免 reasoning_content 占用 token
       naming = {
         {
           provider = "deepseek",
-          model_name = "deepseek-v4-flash",
+          model_name = "deepseek-chat",
           temperature = 0.3,
-          max_tokens = 512,
-          stream = true,
+          max_tokens = 50,
+          stream = false,
           timeout = 15000,
         },
       },
@@ -219,6 +232,7 @@ local DEFAULT_CONFIG = {
   -- 会话配置
   session = {
     auto_save = true,
+    auto_naming = false, -- 是否自动命名会话
     save_path = vim.fn.stdpath("cache") .. "/NeoAI",
     max_history_per_session = 1000,
   },
@@ -514,10 +528,14 @@ local function resolve_candidate(candidate, ai_config)
   local provider = ai_config.providers and ai_config.providers[provider_name]
   local result = {}
 
-  -- 从提供商获取 base_url 和 api_key
+  -- 从提供商获取 base_url、api_key 和 api_type
   if provider then
     result.base_url = provider.base_url
     result.api_key = provider.api_key
+    -- 如果候选没有显式指定 api_type，从提供商配置继承
+    if not result.api_type then
+      result.api_type = provider.api_type or "openai"
+    end
   end
 
   -- 复制候选的所有字段
@@ -604,7 +622,8 @@ function M.get_summary()
         summary[#summary + 1] = "  providers:"
         for name, provider in pairs(value.providers) do
           local key_status = (provider.api_key and #provider.api_key > 0) and "[已设置]" or "[未设置]"
-          summary[#summary + 1] = string.format("    %s: %s, api_key: %s", name, provider.base_url or "?", key_status)
+          local api_type = provider.api_type or "openai"
+          summary[#summary + 1] = string.format("    %s: %s, api_type=%s, api_key: %s", name, provider.base_url or "?", api_type, key_status)
         end
       end
       -- 显示场景配置
@@ -1138,7 +1157,8 @@ function M.get_available_models(scenario)
           index = index,
           provider = provider_name,
           model_name = model_name,
-          label = string.format("%s/%s", provider_name, model_name),
+          api_type = provider_def.api_type or "openai",
+          label = string.format("%s/%s [%s]", provider_name, model_name, provider_def.api_type or "openai"),
         })
       end
     end

@@ -44,6 +44,7 @@ function M.start_stream(params)
     window_id = window_id,
     start_time = os.time(),
     is_finished = false,
+    is_reasoning_model = false,     -- 是否为思考模型（检测到 reasoning_content 时标记）
   }
 
   logger.debug(string.format("Stream started: generation=%s", generation_id))
@@ -87,7 +88,13 @@ function M.process_chunk(params)
     if choice.delta then
       local delta = choice.delta
 
+      -- 检测是否为思考模型（首次出现 reasoning_content 时标记）
+      if delta.reasoning_content ~= nil and delta.reasoning_content ~= "" then
+        processor.is_reasoning_model = true
+      end
+
       -- 处理思考内容（DeepSeek 格式）
+      -- 注意：思考模型可能在输出 reasoning_content 后，在同一 delta 中同时输出 tool_calls
       if delta.reasoning_content ~= nil then
         local rc = delta.reasoning_content
         if rc ~= "" then
@@ -106,6 +113,7 @@ function M.process_chunk(params)
       end
 
       -- 处理工具调用（流式工具调用可能分多个块）
+      -- 思考模型也可能输出 tool_calls（如 DeepSeek-V3 带 reasoning 模式）
       if delta.tool_calls then
         for _, tc in ipairs(delta.tool_calls) do
           local index = tc.index or 0
@@ -199,6 +207,7 @@ function M.get_reasoning_text(generation_id)
 end
 
 --- 获取工具调用
+--- 确保返回的工具调用使用标准 function 字段名（兼容 func 旧格式）
 --- @param generation_id string 生成ID
 --- @return table 工具调用列表
 function M.get_tool_calls(generation_id)
@@ -206,7 +215,15 @@ function M.get_tool_calls(generation_id)
   if not processor then
     return {}
   end
-  return processor.tool_calls or {}
+  local raw_calls = processor.tool_calls or {}
+  -- 确保每个工具调用使用标准 function 字段名
+  for _, tc in ipairs(raw_calls) do
+    if tc.func and not tc["function"] then
+      tc["function"] = tc.func
+      tc.func = nil
+    end
+  end
+  return raw_calls
 end
 
 --- 结束流式处理

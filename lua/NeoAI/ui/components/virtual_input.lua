@@ -624,6 +624,26 @@ function M._get_keymaps()
   return default_keymaps
 end
 
+--- 聚焦浮动输入框并进入插入模式
+--- 在 AI 生成完成后调用，确保光标回到输入框
+function M.focus_and_insert()
+  if not state.active or state.mode ~= "float" then
+    return
+  end
+  if not state.float_win or not vim.api.nvim_win_is_valid(state.float_win) then
+    return
+  end
+
+  -- 将当前窗口设为浮动输入框
+  pcall(vim.api.nvim_set_current_win, state.float_win)
+
+  -- 将光标定位到 > 后面
+  pcall(vim.api.nvim_win_set_cursor, state.float_win, { 1, 2 })
+
+  -- 进入插入模式
+  vim.cmd("startinsert!")
+end
+
 --- 是否激活
 function M.is_active()
   return state.active

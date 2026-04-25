@@ -1430,22 +1430,18 @@ function M._setup_event_listeners()
       -- 全量重渲染
       M.render_chat()
 
-      -- 等待渲染和折叠操作全部完成后，添加 token 用量信息
-      -- 然后滚动窗口，最后打开浮动输入框
+      -- 渲染完成后，添加 token 用量信息、滚动窗口、打开输入框
+      -- 使用单层 defer_fn 减少延迟
       vim.defer_fn(function()
         M._update_usage_virt_text()
+        M._scroll_to_end_with_offset(10)
+        M._open_float_input()
 
-        -- 用量显示完成后等100毫秒先滚动再打开虚拟输入框
-        vim.defer_fn(function()
-          -- 使用统一的 _scroll_to_end_with_offset 进行滚动
-          -- 打开浮动输入框（这可能会触发 WinEnter 等事件）
-          M._open_float_input()
-
-          -- 打开输入框后再次执行滚动，防止焦点切换导致滚动位置被重置
-          vim.defer_fn(function()
-            M._scroll_to_end_with_offset(10)
-          end, 200)
-        end, 100)
+        -- 确保光标在浮动输入框并进入插入模式
+        local vi = require("NeoAI.ui.components.virtual_input")
+        if vi.is_active() then
+          vi.focus_and_insert()
+        end
       end, 50)
     end,
   })
@@ -1677,19 +1673,19 @@ function M._setup_event_listeners()
       end
 
       -- 关闭思考过程悬浮窗口
-      -- 思考内容已通过 _finalize_streaming 的全量重渲染以折叠标记格式显示
       local reasoning_display = require("NeoAI.ui.components.reasoning_display")
       if reasoning_display.is_visible() then
         reasoning_display.close()
       end
 
-      -- 完成流式渲染
-      M._finalize_streaming()
-
-      -- AI正文输出结束后，打开浮动输入框并将光标移动过去
-      vim.defer_fn(function()
-        M._open_float_input()
-      end, 300)
+      -- 流式数据已完成，但完整响应和全量渲染由 GENERATION_COMPLETED 事件处理
+      -- 这里只做状态清理，不触发全量渲染（避免重复渲染）
+      -- 注意：不重置 message_index，保留供 GENERATION_COMPLETED 事件使用
+      state.streaming.active = false
+      state.streaming.content_buffer = ""
+      state.streaming.reasoning_buffer = ""
+      state.streaming.reasoning_active = false
+      state.streaming.reasoning_done = false
     end,
   })
 
@@ -1709,6 +1705,29 @@ function M._setup_event_listeners()
         border = "single",
       })
     end,
+  })
+
+  -- 监听会话重命名事件（自动命名完成后），更新当前 chat buffer 名称
+  vim.api.nvim_create_autocmd("User", {
+    pattern = Events.SESSION_RENAMED,
+    callback = function(args)
+      local data = args.data or {}
+      local session_id = data.session_id
+      local name = data.name
+
+      -- 只处理当前聊天窗口的会话
+      if not session_id or session_id ~= state.current_session_id then
+        return
+      end
+
+      -- 更新 buffer 名称，添加会话名称后缀
+      local buf = window_manager.get_window_buf(state.current_window_id)
+      if buf and vim.api.nvim_buf_is_valid(buf) then
+        local new_name = "neoai://chat/" .. session_id .. " - " .. (name or "")
+        pcall(vim.api.nvim_buf_set_name, buf, new_name)
+      end
+    end,
+    desc = "自动命名后更新 chat buffer 名称",
   })
 end
 

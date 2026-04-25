@@ -85,12 +85,28 @@ function M.open(session_id, window_id)
     M._update_float_window()
   end)
 
+  -- 监听会话重命名事件，自动刷新树
+  vim.api.nvim_create_autocmd("User", {
+    pattern = Events.SESSION_RENAMED,
+    callback = function()
+      if state.current_window_id then
+        M.refresh_tree()
+      end
+    end,
+    desc = "会话重命名后刷新树",
+  })
+
   vim.api.nvim_exec_autocmds("User", {
     pattern = Events.TREE_WINDOW_OPENED,
     data = { window_id = window_id },
   })
 
   return true
+end
+
+--- 对未命名的会话触发自动命名（已移至 history_manager，通过 config.auto_naming 控制）
+local function _auto_name_unamed_sessions()
+  -- 不再在此处触发自动命名，统一由 history_manager 的 add_round 处理
 end
 
 --- 异步加载树数据
@@ -105,6 +121,8 @@ function M._load_and_render_async(callback)
       state.flat_items = {}
     end
     M.render_tree()
+    -- 渲染完成后，对未命名的会话触发自动命名
+    _auto_name_unamed_sessions()
     if callback then
       callback()
     end

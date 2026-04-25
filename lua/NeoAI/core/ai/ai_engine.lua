@@ -378,7 +378,7 @@ function M._send_non_stream_request(generation_id, request, params)
     return
   end
 
-  -- 发送请求到 AI API（传入解析后的 base_url/api_key/timeout）
+  -- 发送请求到 AI API（传入解析后的 base_url/api_key/timeout/api_type）
   local ai_preset = generation and generation.ai_preset or {}
   local response, err = state.http_client.send_request({
     request = request,
@@ -386,6 +386,8 @@ function M._send_non_stream_request(generation_id, request, params)
     base_url = ai_preset.base_url,
     api_key = ai_preset.api_key,
     timeout = ai_preset.timeout,
+    api_type = ai_preset.api_type or "openai",
+    provider_config = ai_preset,
   })
 
   if err then
@@ -451,9 +453,33 @@ function M._send_stream_request(generation_id, request, params)
     window_id = window_id,
   })
 
-  -- 发送流式请求（传入解析后的 base_url/api_key/timeout）
+  -- 发送流式请求（传入解析后的 base_url/api_key/timeout/api_type）
   local generation = state.active_generations[generation_id]
   local ai_preset = generation and generation.ai_preset or {}
+
+  -- 如果 ai_preset 中的 base_url 或 api_key 为空，尝试重新获取配置
+  -- 这通常发生在重试时，generation 存在但 ai_preset 中的配置丢失
+  if not ai_preset.base_url or not ai_preset.api_key then
+    if generation and generation.model_index then
+      local candidates = default_config.get_scenario_candidates("chat")
+      local target = candidates[generation.model_index]
+      if target then
+        ai_preset = vim.deepcopy(target)
+        ai_preset.model = ai_preset.model_name
+        -- 更新 generation 中的 ai_preset，避免后续重试再次丢失
+        generation.ai_preset = ai_preset
+      end
+    end
+    if not ai_preset.base_url or not ai_preset.api_key then
+      local fallback = resolve_scenario_config("chat")
+      if fallback.base_url and fallback.api_key then
+        ai_preset = fallback
+        if generation then
+          generation.ai_preset = ai_preset
+        end
+      end
+    end
+  end
   state.http_client.send_stream_request(
     {
       request = request,
@@ -461,6 +487,8 @@ function M._send_stream_request(generation_id, request, params)
       base_url = ai_preset.base_url,
       api_key = ai_preset.api_key,
       timeout = ai_preset.timeout,
+      api_type = ai_preset.api_type or "openai",
+      provider_config = ai_preset,
     },
     -- on_chunk: 处理每个数据块
     function(data)
@@ -521,45 +549,48 @@ function M._handle_stream_chunk(generation_id, data, params)
     return
   end
 
-  -- 处理思考内容
-  if result.reasoning_content then
-    vim.api.nvim_exec_autocmds("User", {
-      pattern = event_constants.REASONING_CONTENT,
-      data = {
-        generation_id = generation_id,
-        reasoning_content = result.reasoning_content,
-        session_id = session_id,
-        window_id = window_id,
-      },
-    })
-  end
+  -- 使用 vim.schedule 确保 nvim_exec_autocmds 在 jobstart 回调中安全执行
+  vim.schedule(function()
+    -- 处理思考内容
+    if result.reasoning_content then
+      vim.api.nvim_exec_autocmds("User", {
+        pattern = event_constants.REASONING_CONTENT,
+        data = {
+          generation_id = generation_id,
+          reasoning_content = result.reasoning_content,
+          session_id = session_id,
+          window_id = window_id,
+        },
+      })
+    end
 
-  -- 处理普通内容
-  if result.content then
-    vim.api.nvim_exec_autocmds("User", {
-      pattern = event_constants.STREAM_CHUNK,
-      data = {
-        generation_id = generation_id,
-        chunk = result.content,
-        session_id = session_id,
-        window_id = window_id,
-        is_final = false,
-      },
-    })
-  end
+    -- 处理普通内容
+    if result.content then
+      vim.api.nvim_exec_autocmds("User", {
+        pattern = event_constants.STREAM_CHUNK,
+        data = {
+          generation_id = generation_id,
+          chunk = result.content,
+          session_id = session_id,
+          window_id = window_id,
+          is_final = false,
+        },
+      })
+    end
 
-  -- 处理工具调用
-  if result.tool_calls and #result.tool_calls > 0 then
-    vim.api.nvim_exec_autocmds("User", {
-      pattern = event_constants.TOOL_CALL_DETECTED,
-      data = {
-        generation_id = generation_id,
-        tool_calls = result.tool_calls,
-        session_id = session_id,
-        window_id = window_id,
-      },
-    })
-  end
+    -- 处理工具调用
+    if result.tool_calls and #result.tool_calls > 0 then
+      vim.api.nvim_exec_autocmds("User", {
+        pattern = event_constants.TOOL_CALL_DETECTED,
+        data = {
+          generation_id = generation_id,
+          tool_calls = result.tool_calls,
+          session_id = session_id,
+          window_id = window_id,
+        },
+      })
+    end
+  end)
 end
 
 --- 处理流式请求结束
@@ -573,30 +604,52 @@ function M._handle_stream_end(generation_id, params)
   local full_response = state.stream_processor.get_full_response(generation_id)
   local reasoning_text = state.stream_processor.get_reasoning_text(generation_id)
   local usage = state.stream_processor.get_usage(generation_id)
+  local tool_calls = state.stream_processor.get_tool_calls(generation_id)
+
+  -- 检查是否有未处理的工具调用（思考模型可能在流式结束时才完成工具调用累积）
+  if tool_calls and #tool_calls > 0 then
+    -- DeepSeek Thinking Mode: 保存 reasoning_content 到活跃生成中
+    -- 以便在 handle_tool_result 中回传给后续请求
+    if reasoning_text and reasoning_text ~= "" then
+      local gen = state.active_generations[generation_id]
+      if gen then
+        gen.last_reasoning_content = reasoning_text
+      end
+    end
+
+    -- 使用 vim.schedule 确保 nvim_exec_autocmds 在 jobstart 回调中安全执行
+    vim.schedule(function()
+      -- 触发工具调用检测事件，让 tool_orchestrator 处理
+      vim.api.nvim_exec_autocmds("User", {
+        pattern = event_constants.TOOL_CALL_DETECTED,
+        data = {
+          generation_id = generation_id,
+          tool_calls = tool_calls,
+          session_id = session_id,
+          window_id = window_id,
+        },
+      })
+    end)
+  end
 
   -- 清理流式处理器
   state.stream_processor.end_stream(generation_id)
 
-  -- 触发流式完成事件
-  vim.api.nvim_exec_autocmds("User", {
-    pattern = event_constants.STREAM_COMPLETED,
-    data = {
-      generation_id = generation_id,
-      full_response = full_response,
-      reasoning_text = reasoning_text,
-      usage = usage,
-      session_id = session_id,
-      window_id = window_id,
-    },
-  })
-
-  -- 完成生成（传入 reasoning_text，因为 stream_processor 已被清理）
-  M._finalize_generation(generation_id, full_response, {
-    session_id = session_id,
-    window_id = window_id,
-    reasoning_text = reasoning_text,
-    usage = usage,
-  })
+  -- 使用 vim.schedule 确保 nvim_exec_autocmds 在 jobstart 回调中安全执行
+  vim.schedule(function()
+    -- 触发流式完成事件（由 handle_stream_completed 统一处理 _finalize_generation）
+    vim.api.nvim_exec_autocmds("User", {
+      pattern = event_constants.STREAM_COMPLETED,
+      data = {
+        generation_id = generation_id,
+        full_response = full_response,
+        reasoning_text = reasoning_text,
+        usage = usage,
+        session_id = session_id,
+        window_id = window_id,
+      },
+    })
+  end)
 end
 
 --- 完成生成（通用结束处理）
@@ -615,15 +668,22 @@ function M._finalize_generation(generation_id, response_text, params)
   local messages = generation.messages
 
   -- 添加助手响应到消息历史
-  table.insert(messages, {
+  -- DeepSeek Thinking Mode: 如果有 reasoning_content，必须保留在消息中
+  -- 当有工具调用时，后续请求必须完整回传 reasoning_content
+  local assistant_msg = {
     role = "assistant",
     content = response_text or "",
     timestamp = os.time(),
     window_id = window_id,
-  })
+  }
 
-  -- 获取思考内容（优先使用传入的参数，因为流式处理器可能已被清理）
-  local reasoning_text = params.reasoning_text or state.stream_processor.get_reasoning_text(generation_id)
+  -- 如果有 reasoning_content，附加到消息中以便工具调用上下文链
+  if params.reasoning_text and params.reasoning_text ~= "" then
+    assistant_msg.reasoning_content = params.reasoning_text
+  end
+
+  table.insert(messages, assistant_msg)
+
   local usage = params.usage or {}
 
   -- 触发生成完成事件
@@ -632,7 +692,7 @@ function M._finalize_generation(generation_id, response_text, params)
     data = {
       generation_id = generation_id,
       response = response_text or "",
-      reasoning_text = reasoning_text or "",
+      reasoning_text = params.reasoning_text or "",
       usage = usage,
       session_id = session_id,
       window_id = window_id,
@@ -690,11 +750,13 @@ function M.handle_ai_response(generation_id, response, params)
       end
 
       -- 提取思考内容（非流式模式：不触发 REASONING_CONTENT 事件，避免打开悬浮窗）
+      -- 注意：思考模型可能同时返回 reasoning_content 和 tool_calls
       if choice.message.reasoning_content then
         reasoning_content = choice.message.reasoning_content
       end
 
       -- 提取工具调用
+      -- 思考模型（如 DeepSeek-R1）也可能返回 tool_calls
       if choice.message.tool_calls and #choice.message.tool_calls > 0 then
         tool_calls = choice.message.tool_calls
 
@@ -705,14 +767,35 @@ function M.handle_ai_response(generation_id, response, params)
             tool_calls = tool_calls,
             session_id = session_id,
             window_id = window_id,
+            reasoning_content = reasoning_content, -- 传递思考内容，供工具编排器使用
           },
         })
       end
     end
   end
 
+  -- 检查工具是否启用（从完整配置中读取）
+  -- 优先检查顶层 tools.enabled，再回退到 ai.tools_enabled
+  local tools_enabled = true
+  if state.full_config then
+    if state.full_config.tools and state.full_config.tools.enabled ~= nil then
+      tools_enabled = state.full_config.tools.enabled
+    elseif state.full_config.ai and state.full_config.ai.tools_enabled ~= nil then
+      tools_enabled = state.full_config.ai.tools_enabled
+    end
+  end
+
   -- 如果有工具调用，交给工具编排器处理
-  if #tool_calls > 0 and state.config.tools_enabled ~= false then
+  if #tool_calls > 0 and tools_enabled then
+    -- DeepSeek Thinking Mode: 将 reasoning_content 保存到活跃生成中，
+    -- 以便在 handle_tool_result 中回传给后续请求
+    if reasoning_content and reasoning_content ~= "" then
+      local gen = state.active_generations[generation_id]
+      if gen then
+        gen.last_reasoning_content = reasoning_content
+      end
+    end
+
     local tool_results = state.tool_orchestrator.execute_tool_loop({
       generation_id = generation_id,
       tool_calls = tool_calls,
@@ -767,9 +850,24 @@ function M.handle_tool_result(data)
   local messages = generation.messages
   local options = generation.options or {}
 
+  -- DeepSeek Thinking Mode: 获取上一轮的 reasoning_content
+  local last_reasoning = generation.last_reasoning_content
+
   -- 添加工具调用结果到消息历史
   for _, tool_result in ipairs(tool_results or {}) do
     messages = state.request_builder.add_tool_call_to_history(messages, tool_result.tool_call, tool_result.result)
+  end
+
+  -- DeepSeek Thinking Mode: 如果有 reasoning_content，将其附加到助手消息中
+  -- 工具调用轮次必须维护 reasoning_content 的完整传递链
+  if last_reasoning and last_reasoning ~= "" then
+    -- 找到最后一条 assistant 消息（刚由 add_tool_call_to_history 添加的）
+    for i = #messages, 1, -1 do
+      if messages[i].role == "assistant" and messages[i].tool_calls then
+        messages[i].reasoning_content = last_reasoning
+        break
+      end
+    end
   end
 
   -- 更新活跃生成的消息
@@ -796,7 +894,6 @@ function M.handle_stream_completed(data)
     logger.warn(string.format("No active generation found for stream completion: %s", generation_id))
     return
   end
-
   -- 使用统一的结束处理（传入 usage，避免被 _handle_stream_end 中的第二次调用覆盖）
   M._finalize_generation(generation_id, full_response, {
     session_id = session_id,
@@ -1131,6 +1228,101 @@ end
 --- 流式处理器接口
 function M.process_chunk(chunk)
   return state.stream_processor.process_chunk(chunk)
+end
+
+--- 自动命名会话
+--- 根据会话的用户消息内容，使用 AI 生成简短有意义的会话名称
+--- 使用 http_client.send_request 替代直接 curl 调用
+--- @param session_id string 会话ID
+--- @param user_msg string 用户消息内容
+--- @param callback function|nil 命名完成后的回调 (success: boolean, name_or_error: string)
+function M.auto_name_session(session_id, user_msg, callback)
+  if not state.initialized then
+    if callback then callback(false, "AI engine not initialized") end
+    return
+  end
+
+  if not user_msg or user_msg == "" then
+    if callback then callback(false, "无用户消息") end
+    return
+  end
+
+  -- 截取前 200 个字符作为命名依据
+  local naming_text = user_msg:sub(1, 200)
+
+  -- 异步调用 AI 进行命名
+  vim.schedule(function()
+    -- 获取 naming 场景配置
+    local naming_preset = resolve_scenario_config("naming")
+    if not naming_preset or not naming_preset.base_url or not naming_preset.api_key then
+      -- 回退到 chat 场景
+      naming_preset = resolve_scenario_config("chat")
+    end
+    if not naming_preset or not naming_preset.base_url or not naming_preset.api_key then
+      if callback then callback(false, "未配置 AI 提供商") end
+      return
+    end
+
+    -- 构建命名请求
+    local system_prompt = "你是一个会话命名助手。根据用户的第一条消息，生成一个简短（不超过20个字符）且有意义的会话名称。只返回名称本身，不要加引号、标点或解释。"
+    local messages = {
+      { role = "system", content = system_prompt },
+      { role = "user", content = "请为以下对话生成一个简短的名称：" .. naming_text },
+    }
+
+    local request = {
+      model = naming_preset.model_name or naming_preset.model or "",
+      messages = messages,
+      temperature = 0.3,
+      max_tokens = 50,
+      stream = false,
+    }
+
+    -- 使用 http_client.send_request 发送请求
+    local generation_id = "naming_" .. session_id .. "_" .. tostring(os.time())
+    local response, err = state.http_client.send_request({
+      request = request,
+      generation_id = generation_id,
+      base_url = naming_preset.base_url,
+      api_key = naming_preset.api_key,
+      timeout = naming_preset.timeout or 10000,
+      api_type = naming_preset.api_type or "openai",
+      provider_config = naming_preset,
+    })
+
+    if err then
+      if callback then callback(false, "命名请求失败: " .. tostring(err)) end
+      return
+    end
+
+    if not response or not response.choices or #response.choices == 0 then
+      if callback then callback(false, "命名响应无效") end
+      return
+    end
+
+    local msg = response.choices[1].message
+    local name = msg.content or ""
+    -- 如果 content 为空但 reasoning_content 有值（推理模型），使用 reasoning_content
+    if name == "" and msg.reasoning_content then
+      name = msg.reasoning_content
+    end
+    -- 清理名称：去除首尾空白、引号、标点
+    name = name:gsub("^[%s\"'「『]+(.-)[%s\"'」』]+$", "%1")
+    name = name:gsub("^%s*(.-)%s*$", "%1")
+    name = name:gsub("[。，！？、；：]$", "")
+
+    -- 限制长度
+    if #name > 30 then
+      name = name:sub(1, 30) .. "…"
+    end
+
+    if name == "" then
+      if callback then callback(false, "生成的名称无效") end
+      return
+    end
+
+    if callback then callback(true, name) end
+  end)
 end
 
 --- 导出模块

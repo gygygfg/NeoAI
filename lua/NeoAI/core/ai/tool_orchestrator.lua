@@ -65,6 +65,7 @@ function M.execute_tool_loop(params)
       tool_calls = tool_calls,
       session_id = session_id,
       window_id = window_id,
+      is_reasoning_model = params.is_reasoning_model or false,
     },
   })
 
@@ -113,13 +114,15 @@ function M.execute_tool(params)
   local session_id = params.session_id
   local window_id = params.window_id
 
-  if not tool_call or not tool_call["function"] then
+  -- 兼容两种字段名：function（OpenAI 标准）和 func（旧格式）
+  local tool_func = tool_call["function"] or tool_call.func
+  if not tool_call or not tool_func then
     logger.warn(string.format("Invalid tool call for generation %s", generation_id))
     return nil
   end
 
-  local tool_name = tool_call["function"].name
-  local arguments_str = tool_call["function"].arguments
+  local tool_name = tool_func.name
+  local arguments_str = tool_func.arguments
 
   -- 解析参数
   local arguments = {}
@@ -224,12 +227,14 @@ function M.extract_tool_calls(response)
 
   if choice.message and choice.message.tool_calls then
     for _, tool_call in ipairs(choice.message.tool_calls) do
+      -- 兼容两种字段名：function（OpenAI 标准）和 func（旧格式）
+      local tool_func = tool_call["function"] or tool_call.func
       table.insert(tool_calls, {
         id = tool_call.id,
         type = tool_call.type,
         ["function"] = {
-          name = tool_call["function"].name,
-          arguments = tool_call["function"].arguments,
+          name = tool_func and tool_func.name or "",
+          arguments = tool_func and tool_func.arguments or "",
         },
       })
     end
@@ -303,11 +308,13 @@ end
 --- @param tool_call table 工具调用
 --- @return boolean 是否有效
 function M.validate_tool_use(tool_call)
-  if not tool_call or not tool_call["function"] then
+  -- 兼容两种字段名：function（OpenAI 标准）和 func（旧格式）
+  local tool_func = tool_call["function"] or tool_call.func
+  if not tool_call or not tool_func then
     return false
   end
 
-  local tool_name = tool_call["function"].name
+  local tool_name = tool_func.name
   return state.tools[tool_name] ~= nil
 end
 

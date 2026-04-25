@@ -118,10 +118,26 @@ function M.build_flat_items()
     local display_type = is_branch and "branch" or "leaf"
 
     -- 构建显示文本
+    -- 优先显示会话名称（如果不是默认名称），否则显示轮次预览
+    local default_names = {"聊天会话", "新会话", "子会话", "分支", "会话"}
+    local is_default_name = false
+    if session.name then
+      for _, dn in ipairs(default_names) do
+        if session.name == dn or session.name:find("^" .. dn) then
+          is_default_name = true
+          break
+        end
+      end
+    end
+
     local display_text
     if is_branch then
       display_text = "聊天会话分支"
+    elseif session.name and not is_default_name then
+      -- 有自定义名称，直接显示名称
+      display_text = session.name
     else
+      -- 默认名称，显示轮次预览
       display_text = build_round_text(session)
       if display_text == "" then
         display_text = session.name or "未命名"

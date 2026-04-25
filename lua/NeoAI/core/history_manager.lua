@@ -118,6 +118,7 @@ function M.initialize(options)
     state.config.session = nil
   end
   state.config.auto_save = state.config.auto_save ~= false
+  state.config.auto_naming = state.config.auto_naming ~= false
   state.sessions = {}
   state.current_session_id = nil
   M._load()
@@ -342,6 +343,12 @@ function M.add_round(session_id, user_msg, assistant_msg, usage)
   session.updated_at = os.time()
   debounce_save()
   trigger_event(Events.ROUND_ADDED, { session_id = session_id, session = session })
+
+  -- 自动命名会话（异步，不阻塞），可通过配置关闭
+  if state.config.auto_naming ~= false then
+    M.auto_name_session(session_id)
+  end
+
   return session
 end
 
@@ -798,6 +805,66 @@ function M.delete_chain_to_branch(session_id)
   debounce_save()
   trigger_event(Events.SESSION_DELETED, { session_id = session_id })
   return true
+end
+
+--- 自动命名会话（使用 naming 场景的 AI 模型）
+--- 根据会话的用户消息内容，生成简短有意义的会话名称
+--- @param session_id string 会话ID
+--- @param callback function|nil 命名完成后的回调
+function M.auto_name_session(session_id, callback)
+  local session = state.sessions[session_id]
+  if not session then
+    if callback then
+      callback(false, "会话不存在")
+    end
+    return
+  end
+
+  -- 如果会话已有用户自定义名称（非默认名称），跳过
+  local default_names = { "聊天会话", "新会话", "子会话", "分支", "会话" }
+  local is_default = false
+  for _, dn in ipairs(default_names) do
+    if session.name == dn or session.name:find("^" .. dn) then
+      is_default = true
+      break
+    end
+  end
+  if not is_default then
+    if callback then
+      callback(true, session.name)
+    end
+    return
+  end
+
+  -- 获取用户消息作为命名依据
+  local user_msg = session.user or ""
+  if user_msg == "" then
+    if callback then
+      callback(false, "无用户消息")
+    end
+    return
+  end
+
+  -- 异步调用 AI 引擎进行命名
+  -- vim.notify("[NeoAI] 开始自动命名会话: " .. session_id .. " user_msg=" .. user_msg:sub(1, 30), vim.log.levels.INFO)
+
+  -- 调用 ai_engine.auto_name_session 完成命名请求
+  local ai_engine = require("NeoAI.core.ai.ai_engine")
+  ai_engine.auto_name_session(session_id, user_msg, function(success, name_or_error)
+    if success then
+      -- 更新会话名称
+      M.rename_session(session_id, name_or_error)
+      -- vim.notify("[NeoAI] 会话已自动命名: " .. name_or_error, vim.log.levels.INFO)
+      trigger_event(Events.SESSION_RENAMED, { session_id = session_id, name = name_or_error })
+      if callback then
+        callback(true, name_or_error)
+      end
+    else
+      if callback then
+        callback(false, name_or_error)
+      end
+    end
+  end)
 end
 
 --- 检查是否已初始化

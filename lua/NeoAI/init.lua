@@ -207,6 +207,26 @@ function M.setup(user_config)
   -- 初始化工具系统
   state.tools = tools.initialize(config.tools or {})
 
+  -- 将工具注册表中的工具传递给 AI 引擎，使工具定义能注入到请求中
+  local ai_engine = state.core.get_ai_engine()
+  if ai_engine and ai_engine.set_tools then
+    local registered_tools = state.tools.get_tools()
+    -- 将工具列表转换为 { tool_name = { func = ..., description = ..., parameters = ... } } 格式
+    local tools_map = {}
+    for _, tool_def in ipairs(registered_tools) do
+      tools_map[tool_def.name] = {
+        func = tool_def.func,
+        description = tool_def.description or "",
+        parameters = tool_def.parameters or {
+          type = "object",
+          properties = {},
+          required = {},
+        },
+      }
+    end
+    ai_engine.set_tools(tools_map)
+  end
+
   state.config = config
   state.initialized = true
 

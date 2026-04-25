@@ -1,9 +1,11 @@
 -- HTTP 客户端模块
 -- 负责发送 HTTP 请求到 AI API 服务，支持流式和非流式请求
+-- 支持多种 API 格式：openai、anthropic、google 等
 local M = {}
 
 local logger = require("NeoAI.utils.logger")
 local json = require("NeoAI.utils.json")
+local request_adapter = require("NeoAI.core.ai.request_adapter")
 
 -- 模块状态
 local state = {
@@ -40,6 +42,8 @@ function M.send_request(params)
   local base_url = params.base_url or state.config.base_url
   local api_key = params.api_key or state.config.api_key
   local timeout = params.timeout or state.config.timeout or 60000
+  local api_type = params.api_type or "openai"
+  local provider_config = params.provider_config or {}
 
   if not api_key or api_key == "" then
     return nil, "API key not configured. Set DEEPSEEK_API_KEY environment variable or configure ai.api_key"
@@ -49,21 +53,36 @@ function M.send_request(params)
     return nil, "API base URL not configured"
   end
 
-  -- 构建 curl 命令
-  local request_body = json.encode(request)
+  -- 使用适配器转换请求体
+  local transformed_request = request_adapter.transform_request(request, api_type, provider_config)
+  local request_body = json.encode(transformed_request)
   local temp_file = vim.fn.tempname()
 
+  -- 使用适配器获取请求头
+  local headers = request_adapter.get_headers(api_key, api_type)
+
+  -- 构建 curl 命令
   local curl_args = {
     "-s",
     "-X", "POST",
     base_url,
     "-H", "Content-Type: application/json",
-    "-H", "Authorization: Bearer " .. api_key,
+  }
+
+  -- 添加 API 特定的请求头
+  for header_name, header_value in pairs(headers) do
+    if header_name ~= "Content-Type" then
+      table.insert(curl_args, "-H")
+      table.insert(curl_args, header_name .. ": " .. header_value)
+    end
+  end
+
+  vim.list_extend(curl_args, {
     "-d", request_body,
     "--connect-timeout", tostring(math.floor(timeout / 1000)),
     "--max-time", tostring(math.floor(timeout / 1000)),
     "-o", temp_file,
-  }
+  })
 
   -- 记录请求信息
   logger.debug(string.format(
@@ -71,14 +90,18 @@ function M.send_request(params)
     base_url, generation_id, request.model or "unknown", tostring(request.stream)
   ))
 
-  -- 执行 curl 命令
-  local cmd = "curl " .. table.concat(curl_args, " ")
-  local ok, exit_code, stdout, stderr = M._run_command(cmd)
+  -- 执行 curl 命令（使用列表形式避免 shell 转义问题）
+  local curl_cmd = vim.list_extend({ "curl" }, curl_args)
+  local ok, result = pcall(vim.fn.system, curl_cmd)
+  local exit_code = vim.v.shell_error
 
   if not ok or exit_code ~= 0 then
     -- 清理临时文件
     pcall(vim.fn.delete, temp_file)
-    local err_msg = stderr or "curl command failed with exit code: " .. tostring(exit_code)
+    local err_msg = "curl command failed with exit code: " .. tostring(exit_code)
+    if not ok then
+      err_msg = tostring(result)
+    end
     logger.error(string.format("HTTP request failed (generation=%s): %s", generation_id, err_msg))
     return nil, err_msg
   end
@@ -105,7 +128,10 @@ function M.send_request(params)
     return nil, err_msg
   end
 
-  return response, nil
+  -- 使用适配器转换响应为统一格式
+  local unified_response = request_adapter.transform_response(response, api_type)
+
+  return unified_response, nil
 end
 
 --- 发送流式请求到 AI API
@@ -125,6 +151,8 @@ function M.send_stream_request(params, on_chunk, on_complete, on_error)
   local base_url = params.base_url or state.config.base_url
   local api_key = params.api_key or state.config.api_key
   local timeout = params.timeout or state.config.timeout or 60000
+  local api_type = params.api_type or "openai"
+  local provider_config = params.provider_config or {}
 
   if not api_key or api_key == "" then
     if on_error then on_error("API key not configured") end
@@ -139,7 +167,9 @@ function M.send_stream_request(params, on_chunk, on_complete, on_error)
   -- 确保请求启用流式
   request.stream = true
 
-  local request_body = json.encode(request)
+  -- 使用适配器转换请求体
+  local transformed_request = request_adapter.transform_request(request, api_type, provider_config)
+  local request_body = json.encode(transformed_request)
   local temp_file = vim.fn.tempname()
   state.request_counter = state.request_counter + 1
   local request_id = "req_" .. tostring(state.request_counter) .. "_" .. tostring(os.time())
@@ -149,6 +179,8 @@ function M.send_stream_request(params, on_chunk, on_complete, on_error)
     generation_id = generation_id,
     temp_file = temp_file,
     cancelled = false,
+    has_error = false,  -- API 错误标志
+    buffer = "",  -- SSE 行缓冲区，处理跨块的行
   }
 
   logger.debug(string.format(
@@ -156,65 +188,156 @@ function M.send_stream_request(params, on_chunk, on_complete, on_error)
     base_url, generation_id, request_id
   ))
 
-  -- 使用 vim.fn.jobstart 或 vim.system 进行异步请求
-  -- 优先使用 vim.system (Neovim 0.10+)
-  local job_id
+  -- jobstart 的 on_stdout/on_stderr/on_exit 回调在 Neovim 主事件循环中运行
+  -- 但 vim.api.nvim_exec_autocmds 不能在 jobstart 回调中直接调用
+  -- 需要使用 vim.schedule 将事件触发推迟到主循环的下一个迭代
 
-  -- 使用 vim.schedule 包装回调，避免在 fast event context 中触发事件
-  local function safe_on_chunk(data)
-    if on_chunk then
-      vim.schedule(function()
-        on_chunk(data)
-      end)
-    end
-  end
-
-  local function safe_on_complete()
-    if on_complete then
-      vim.schedule(function()
-        on_complete()
-      end)
-    end
-  end
-
-  local function safe_on_error(err_msg)
-    if on_error then
-      vim.schedule(function()
-        on_error(err_msg)
-      end)
-    end
-  end
-
-  local function handle_stdout_line(line)
-    if state.active_requests[request_id] and state.active_requests[request_id].cancelled then
+  -- 处理一行 SSE 数据
+  local function process_sse_line(line)
+    if line == "" then
       return
     end
 
-    if line and line ~= "" then
-      -- 处理 SSE 数据行
-      if line:match("^data: ") then
-        local data_str = line:gsub("^data: ", "")
+    -- 处理 SSE 数据行
+    if line:match("^data: ") then
+      local data_str = line:gsub("^data: ", "")
 
-        -- 检查是否为结束标记
-        if data_str == "[DONE]" then
+      -- 检查是否为结束标记
+      if data_str == "[DONE]" then
+        return
+      end
+
+      -- 解析 JSON
+      local ok, data = pcall(json.decode, data_str)
+      if ok and data then
+        -- 检查 API 错误
+        if data.error then
+          local err_msg = data.error.message or json.encode(data.error)
+          -- 设置错误标志，防止 handle_complete 调用 on_complete
+          local req = state.active_requests[request_id]
+          if req then
+            req.has_error = true
+          end
+          if on_error then
+            on_error("API error: " .. err_msg)
+          end
           return
         end
-
-        -- 解析 JSON
-        local ok, data = pcall(json.decode, data_str)
-        if ok and data then
-          safe_on_chunk(data)
+        -- 使用适配器转换流式响应块为统一格式
+        local unified_data = request_adapter.transform_response(data, api_type)
+        if on_chunk then
+          -- 直接调用 on_chunk，on_chunk 内部会使用 vim.schedule 处理 nvim_exec_autocmds
+          -- 避免在 process_sse_line 中嵌套 vim.schedule，确保数据块按顺序处理
+          on_chunk(unified_data)
+        end
+      end
+    elseif api_type == "anthropic" then
+      -- Anthropic 流式格式：event: + data: 行
+      -- 尝试解析纯 JSON 行（兼容处理）
+      local ok, data = pcall(json.decode, line)
+      if ok and data then
+        -- 检查 API 错误
+        if data.error then
+          local err_msg = data.error.message or json.encode(data.error)
+          local req = state.active_requests[request_id]
+          if req then
+            req.has_error = true
+          end
+          if on_error then
+            on_error("API error: " .. err_msg)
+          end
+          return
+        end
+        local unified_data = request_adapter.transform_response(data, api_type)
+        if on_chunk then
+          on_chunk(unified_data)
+        end
+      end
+    else
+      -- 非 SSE 格式行：尝试解析为 JSON（可能是 API 错误响应）
+      local ok, data = pcall(json.decode, line)
+      if ok and data and data.error then
+        local err_msg = data.error.message or json.encode(data.error)
+        local req = state.active_requests[request_id]
+        if req then
+          req.has_error = true
+        end
+        if on_error then
+          on_error("API error: " .. err_msg)
         end
       end
     end
   end
 
+  -- 处理从 jobstart 收到的 stdout 数据块
+  -- jobstart 的 on_stdout 回调传入的 data 是按 \n 分割的数组
+  -- 如果数据以 \n 结尾，最后一个元素是空字符串 ""
+  -- 如果数据不以 \n 结尾，最后一个元素是不完整的行
+  -- 需要维护一个缓冲区来拼接跨块的完整行
+  local function handle_stdout_data(data_lines)
+    local req = state.active_requests[request_id]
+    if not req or req.cancelled then
+      return
+    end
+
+    local n = #data_lines
+    if n == 0 then
+      return
+    end
+
+    -- 判断最后一行是否为空（表示数据以 \n 结尾）
+    local ends_with_newline = (data_lines[n] == "")
+
+    -- 确定实际的行数（排除末尾的空字符串）
+    local actual_line_count = ends_with_newline and (n - 1) or n
+
+    for i = 1, actual_line_count do
+      local line = data_lines[i]
+
+      -- 如果是第一行，拼接缓冲区中上一块的不完整行
+      if i == 1 and req.buffer ~= "" then
+        line = req.buffer .. (line or "")
+        req.buffer = ""
+      end
+
+      -- 处理完整的行
+      process_sse_line(line or "")
+    end
+
+    -- 如果数据不以 \n 结尾，最后一部分是不完整的行，存入缓冲区
+    if not ends_with_newline and n >= 1 then
+      local last_part = data_lines[n]
+      if last_part ~= nil and last_part ~= "" then
+        req.buffer = (req.buffer or "") .. last_part
+      end
+    end
+  end
+
   local function handle_complete()
-    if state.active_requests[request_id] then
+    -- 处理缓冲区中剩余的数据
+    local req = state.active_requests[request_id]
+    if req and req.buffer ~= "" then
+      process_sse_line(req.buffer)
+    end
+
+    -- 重新获取 req（process_sse_line 可能已经修改了它）
+    req = state.active_requests[request_id]
+    local has_error = req and req.has_error
+
+    if req then
       state.active_requests[request_id] = nil
     end
 
-    safe_on_complete()
+    -- 如果有 API 错误，不调用 on_complete，避免空响应
+    if has_error then
+      return
+    end
+
+    -- on_complete 内部会使用 vim.schedule 触发事件，所以这里直接调用
+    -- 避免双重 vim.schedule 嵌套导致延迟
+    if on_complete then
+      on_complete()
+    end
   end
 
   local function handle_error(err_msg)
@@ -223,8 +346,14 @@ function M.send_stream_request(params, on_chunk, on_complete, on_error)
     end
 
     logger.error(string.format("Stream request error (generation=%s): %s", generation_id, err_msg))
-    safe_on_error(err_msg)
+    -- on_error 内部会使用 vim.schedule 触发事件，所以这里直接调用
+    if on_error then
+      on_error(err_msg)
+    end
   end
+
+  -- 使用适配器获取请求头
+  local headers = request_adapter.get_headers(api_key, api_type)
 
   -- 构建 curl 参数
   local args = {
@@ -232,21 +361,29 @@ function M.send_stream_request(params, on_chunk, on_complete, on_error)
     "-X", "POST",
     base_url,
     "-H", "Content-Type: application/json",
-    "-H", "Authorization: Bearer " .. api_key,
+  }
+
+  -- 添加 API 特定的请求头
+  for header_name, header_value in pairs(headers) do
+    if header_name ~= "Content-Type" then
+      table.insert(args, "-H")
+      table.insert(args, header_name .. ": " .. header_value)
+    end
+  end
+
+  vim.list_extend(args, {
     "-d", request_body,
     "--connect-timeout", tostring(math.floor(timeout / 1000)),
     "--max-time", tostring(math.floor(timeout / 1000)),
-  }
+  })
 
   -- 使用 vim.fn.jobstart 进行异步流式请求
   -- vim.system 的 stdout:read 回调在 Neovim 中可能不实时触发流式数据
   -- vim.fn.jobstart 的 on_stdout 回调能可靠地处理流式 stdout 行
   local job_opts = {
     on_stdout = function(_, data)
-      if data then
-        for _, line in ipairs(data) do
-          handle_stdout_line(line)
-        end
+      if data and #data > 0 then
+        handle_stdout_data(data)
       end
     end,
     on_stderr = function(_, data)

@@ -37,19 +37,8 @@ function M.initialize(config)
     end,
   })
 
-  vim.api.nvim_create_autocmd("User", {
-    pattern = Events.STREAM_CHUNK,
-    callback = function(args)
-      M._handle_stream_chunk(args.data or {})
-    end,
-  })
-
-  vim.api.nvim_create_autocmd("User", {
-    pattern = Events.STREAM_COMPLETED,
-    callback = function(args)
-      M._handle_stream_complete(args.data or {})
-    end,
-  })
+  -- STREAM_CHUNK 和 STREAM_COMPLETED 由 chat_window.lua 统一处理 UI 渲染
+  -- chat_handlers 只负责业务逻辑（写入历史），通过 GENERATION_COMPLETED 事件处理
 
   return true
 end
@@ -57,13 +46,19 @@ end
 function M._trigger_ai_response(data)
   local window_id = data.window_id
   local role = data.role or "user"
-  if role ~= "user" then return end
+  if role ~= "user" then
+    return
+  end
 
   vim.defer_fn(function()
     local hm = get_hm()
-    if not hm then return end
+    if not hm then
+      return
+    end
     local session = hm.get_current_session()
-    if not session then return end
+    if not session then
+      return
+    end
 
     local context_msgs, _ = hm.get_context_and_new_parent(session.id)
 
@@ -78,12 +73,18 @@ function M._trigger_ai_response(data)
       table.insert(messages, { role = "user", content = pending_msg })
     end
 
-    if #messages == 0 then return end
+    if #messages == 0 then
+      return
+    end
 
     local core_loaded, core = pcall(require, "NeoAI.core")
-    if not core_loaded or not core then return end
+    if not core_loaded or not core then
+      return
+    end
     local ai_engine = core.get_ai_engine()
-    if not ai_engine then return end
+    if not ai_engine then
+      return
+    end
 
     -- 获取当前聊天窗口使用的模型索引
     local model_index = 1
@@ -92,11 +93,24 @@ function M._trigger_ai_response(data)
       model_index = chat_window.get_current_model_index() or 1
     end
 
+    -- 检查工具是否启用（从完整配置中读取）
+    local tools_enabled = true
+    local core_ok, core_mod = pcall(require, "NeoAI.core")
+    if core_ok then
+      local full_config = core_mod.get_config()
+      if full_config and full_config.tools then
+        tools_enabled = full_config.tools.enabled ~= false
+      end
+    end
+
     ai_engine.generate_response(messages, {
       session_id = session.id,
       window_id = window_id,
       model_index = model_index,
       stream = state.config and state.config.stream ~= false,
+      options = {
+        tools_enabled = tools_enabled,
+      },
     })
   end, 500)
 end
@@ -159,48 +173,6 @@ function M._handle_response_complete(data)
   _flush_pending_round(session_id, response_content, usage)
 end
 
-function M._handle_stream_chunk(data)
-  local chunk = data.chunk
-  local window_id = data.window_id
-
-  local chunk_content = ""
-  if type(chunk) == "string" then
-    chunk_content = chunk
-  elseif type(chunk) == "table" and chunk.content then
-    chunk_content = chunk.content
-  elseif type(chunk) == "table" and chunk.delta then
-    chunk_content = chunk.delta
-  else
-    chunk_content = tostring(chunk)
-  end
-
-  if chunk_content == "" then return end
-
-  local chat_window = require("NeoAI.ui.window.chat_window")
-  if not chat_window.is_available() then return end
-
-  chat_window._append_stream_chunk_to_buffer(chunk_content)
-end
-
-function M._handle_stream_complete(data)
-  local full_response = data.full_response
-  local reasoning_text = data.reasoning_text
-  local session_id = data.session_id
-  local usage = data.usage or {}
-
-  if not session_id or not full_response then return end
-
-  -- 将 content 和 reasoning_content 打包为 JSON 字符串
-  local assistant_json = vim.json.encode({
-    content = full_response,
-    reasoning_content = reasoning_text or "",
-  })
-
-  -- 将用户消息和AI回复一起写入历史文件
-  -- assistant 字段为数组，传入包含一个元素的数组
-  _flush_pending_round(session_id, assistant_json, usage)
-end
-
 function M.send_message(content, session_id, branch_id, window_id, format, callback)
   if not state.initialized then
     if callback then callback(false, "聊天处理器未初始化") end
@@ -241,6 +213,8 @@ function M.send_message(content, session_id, branch_id, window_id, format, callb
   -- 不立即写入历史文件，先保存用户消息到待写入队列
   -- 等AI响应完成后，再将用户消息和AI回复一起写入
   state.pending_user_messages[target_session_id] = content
+
+  -- 自动命名已移至 add_round 中，通过 config.auto_naming 控制
 
   local chat_window = require("NeoAI.ui.window.chat_window")
   if chat_window.is_available() then

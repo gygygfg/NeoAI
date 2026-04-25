@@ -90,6 +90,8 @@ function M.handle_n()
   vim.notify("已创建子会话: " .. new_id, vim.log.levels.INFO)
   hm.set_current_session(new_id)
   open_chat_for_session(new_id)
+  -- 触发自动命名
+  hm.auto_name_session(new_id)
 end
 
 --- 处理 N 键：创建新的根会话
@@ -105,6 +107,8 @@ function M.handle_N()
   vim.notify("已创建根会话: " .. new_id, vim.log.levels.INFO)
   hm.set_current_session(new_id)
   open_chat_for_session(new_id)
+  -- 触发自动命名
+  hm.auto_name_session(new_id)
 end
 
 --- 处理 d 键：删除会话

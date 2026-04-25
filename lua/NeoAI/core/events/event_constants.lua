@@ -42,6 +42,7 @@ M.SESSION_LOADED = "NeoAI:session_loaded" -- 会话加载
 M.SESSION_SAVED = "NeoAI:session_saved" -- 会话保存
 M.SESSION_DELETED = "NeoAI:session_deleted" -- 会话删除
 M.SESSION_CHANGED = "NeoAI:session_changed" -- 当前会话切换
+M.SESSION_RENAMED = "NeoAI:session_renamed" -- 会话重命名
 
 -- ==================== 分支事件 ====================
 -- 使用位置: ui/init.lua, branch_manager.lua
