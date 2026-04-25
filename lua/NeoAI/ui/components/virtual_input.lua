@@ -438,23 +438,22 @@ function M._setup_float_keymaps()
     M._submit_float()
   end, { buffer = buf, noremap = true, silent = true, desc = "发送消息" })
 
-  -- 取消生成（Esc）- 仅在 AI 正在生成时有效
+  -- 取消生成（Esc）
+  local Events = require("NeoAI.core.events.event_constants")
   vim.keymap.set("i", "<Esc>", function()
-    local ok, ai_engine = pcall(require, "NeoAI.core.ai.ai_engine")
-    if ok and ai_engine and ai_engine.is_generating() then
-      ai_engine.cancel_generation()
-    else
-      -- 没有正在生成的任务，退出插入模式
-      vim.cmd("stopinsert")
-    end
+    vim.api.nvim_exec_autocmds("User", {
+      pattern = Events.CANCEL_GENERATION,
+      data = {},
+    })
+    vim.cmd("stopinsert")
   end, { buffer = buf, noremap = true, silent = true, desc = "取消生成或退出插入模式" })
 
   -- normal 模式下按 Esc 也尝试取消生成
   vim.keymap.set("n", "<Esc>", function()
-    local ok, ai_engine = pcall(require, "NeoAI.core.ai.ai_engine")
-    if ok and ai_engine and ai_engine.is_generating() then
-      ai_engine.cancel_generation()
-    end
+    vim.api.nvim_exec_autocmds("User", {
+      pattern = Events.CANCEL_GENERATION,
+      data = {},
+    })
   end, { buffer = buf, noremap = true, silent = true, desc = "取消生成" })
 
   -- i 在 normal 模式下进入插入模式
@@ -601,14 +600,14 @@ function M._setup_keymaps()
   end, { buffer = buf, noremap = true, silent = true, desc = "发送消息" })
 
   -- 退出插入模式或取消生成
+  local Events = require("NeoAI.core.events.event_constants")
   vim.keymap.set("i", "<Esc>", function()
-    local ok, ai_engine = pcall(require, "NeoAI.core.ai.ai_engine")
-    if ok and ai_engine and ai_engine.is_generating() then
-      ai_engine.cancel_generation()
-    else
-      vim.cmd("stopinsert")
-      M._update_placeholder()
-    end
+    vim.api.nvim_exec_autocmds("User", {
+      pattern = Events.CANCEL_GENERATION,
+      data = {},
+    })
+    vim.cmd("stopinsert")
+    M._update_placeholder()
   end, { buffer = buf, noremap = true, silent = true, desc = "取消生成或退出插入模式" })
 
   -- 取消输入

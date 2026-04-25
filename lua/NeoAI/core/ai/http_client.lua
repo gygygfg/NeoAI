@@ -341,8 +341,17 @@ function M.send_stream_request(params, on_chunk, on_complete, on_error)
   end
 
   local function handle_error(err_msg)
-    if state.active_requests[request_id] then
+    local req = state.active_requests[request_id]
+    if req then
+      -- 如果请求已被取消，忽略错误
+      if req.cancelled then
+        state.active_requests[request_id] = nil
+        return
+      end
       state.active_requests[request_id] = nil
+    else
+      -- 请求已不存在（已被 cancel_request 移除），说明已被取消，忽略错误
+      return
     end
 
     logger.error(string.format("Stream request error (generation=%s): %s", generation_id, err_msg))
@@ -397,8 +406,16 @@ function M.send_stream_request(params, on_chunk, on_complete, on_error)
     on_exit = function(_, exit_code, _)
       if exit_code == 0 then
         handle_complete()
-      elseif not state.active_requests[request_id] or not state.active_requests[request_id].cancelled then
-        handle_error("Process exited with code: " .. tostring(exit_code))
+      else
+        -- 检查请求是否已被取消（cancel_request 会从 active_requests 中移除）
+        local req = state.active_requests[request_id]
+        if not req then
+          -- 请求已被取消或已不存在，忽略退出码错误
+          return
+        end
+        if not req.cancelled then
+          handle_error("Process exited with code: " .. tostring(exit_code))
+        end
       end
     end,
   }

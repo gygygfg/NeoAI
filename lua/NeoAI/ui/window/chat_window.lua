@@ -517,10 +517,10 @@ function M.set_keymaps()
   end
 
   local function cancel_generation()
-    local ok, ai_engine = pcall(require, "NeoAI.core.ai.ai_engine")
-    if ok and ai_engine then
-      ai_engine.cancel_generation()
-    end
+    vim.api.nvim_exec_autocmds("User", {
+      pattern = Events.CANCEL_GENERATION,
+      data = {},
+    })
   end
 
   -- 设置按键映射（使用 vim.keymap.set 直接传递函数）
@@ -547,12 +547,11 @@ function M.set_keymaps()
 
   -- 设置插入模式映射（Esc：取消生成或退出插入模式）
   vim.keymap.set("i", "<Esc>", function()
-    local ok, ai_engine = pcall(require, "NeoAI.core.ai.ai_engine")
-    if ok and ai_engine and ai_engine.is_generating() then
-      ai_engine.cancel_generation()
-    else
-      exit_insert_mode()
-    end
+    vim.api.nvim_exec_autocmds("User", {
+      pattern = Events.CANCEL_GENERATION,
+      data = {},
+    })
+    exit_insert_mode()
   end, { buffer = buf, noremap = true, silent = true, desc = "取消生成或退出插入模式" })
 end
 
@@ -1728,6 +1727,19 @@ function M._setup_event_listeners()
     callback = function(args)
       local data = args.data or {}
       local generation_id = data.generation_id
+
+      -- 关闭思考过程悬浮窗口
+      local reasoning_display = require("NeoAI.ui.components.reasoning_display")
+      if reasoning_display.is_visible() then
+        reasoning_display.close()
+      end
+
+      -- 清理流式状态
+      state.streaming.active = false
+      state.streaming.content_buffer = ""
+      state.streaming.reasoning_buffer = ""
+      state.streaming.reasoning_active = false
+      state.streaming.reasoning_done = false
 
       print("⚠️  AI生成已取消 (ID: " .. tostring(generation_id) .. ")")
 

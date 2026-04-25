@@ -124,6 +124,14 @@ function M.setup_event_listeners()
     end,
   })
 
+  -- 监听取消生成事件
+  state.event_listeners.cancel_generation = vim.api.nvim_create_autocmd("User", {
+    pattern = event_constants.CANCEL_GENERATION,
+    callback = function()
+      M.cancel_generation()
+    end,
+  })
+
   logger.debug("Event listeners setup completed")
 end
 
@@ -255,6 +263,9 @@ function M.generate_response(messages, params)
   local session_id = params.session_id
   local window_id = params.window_id
   local options = params.options or {}
+
+  -- 设置生成状态
+  state.is_generating = true
 
   -- 优先使用场景配置（scenarios）获取模型，确保用户配置的 model_name 生效
   -- 回退策略：get_scenario_candidates > get_available_models > resolve_scenario_config
@@ -391,6 +402,10 @@ function M._send_non_stream_request(generation_id, request, params)
   })
 
   if err then
+    -- 如果生成已被取消，忽略错误
+    if not state.is_generating or not state.active_generations[generation_id] then
+      return
+    end
     -- 检查是否需要重试
     if generation.retry_count < state.max_retries then
       generation.retry_count = generation.retry_count + 1
@@ -508,6 +523,10 @@ function M._send_stream_request(generation_id, request, params)
     end,
     -- on_error: 流式请求出错
     function(err)
+      -- 如果生成已被取消，忽略错误
+      if not state.is_generating or not state.active_generations[generation_id] then
+        return
+      end
       local generation = state.active_generations[generation_id]
       if generation and generation.retry_count < state.max_retries then
         generation.retry_count = generation.retry_count + 1
@@ -970,11 +989,7 @@ function M.cancel_generation()
   -- logger.info(string.format("Generation cancelled: id=%s", generation_id or "unknown"))
 end
 
---- 检查是否正在生成
---- @return boolean
-function M.is_generating()
-  return state.is_generating
-end
+
 
 --- 设置引擎可用的工具函数
 --- @param tools table 工具函数表

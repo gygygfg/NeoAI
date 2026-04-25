@@ -10,6 +10,7 @@ M.GENERATION_STARTED = "NeoAI:generation_started" -- AI 开始生成响应
 M.GENERATION_COMPLETED = "NeoAI:generation_completed" -- AI 生成完成（含完整响应）
 M.GENERATION_ERROR = "NeoAI:generation_error" -- AI 生成出错
 M.GENERATION_CANCELLED = "NeoAI:generation_cancelled" -- AI 生成被取消
+M.CANCEL_GENERATION = "NeoAI:cancel_generation" -- 请求取消当前生成
 
 -- ==================== 流式处理事件 ====================
 -- 使用位置: ai_engine.lua, chat_window.lua, chat_handlers.lua
