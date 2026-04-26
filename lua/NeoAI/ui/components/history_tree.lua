@@ -93,13 +93,18 @@ function M.build_flat_items()
     end
 
     local has_children = #(session.child_ids or {}) > 0
-    local is_last = not has_children
+    local is_last = (sibling_index == sibling_count)
 
     -- 计算连接符数组
-    -- 前 depth 个元素基于 ancestor_is_last 决定是 "│  " 还是 "   "
-    -- 从 depth+1 到 indent 的元素用 "   "
+    -- 对于每个深度层级 i（1-based）：
+    --   如果 i <= depth：根据 ancestor_is_last[i] 决定是 "   " 还是 "│  "
+    --   如果 i > depth：根据 is_last 决定
+    --     如果 is_last（最后一个兄弟），后面没有更多兄弟了，用 "   "
+    --     否则用 "│  "（后面还有兄弟）
+    -- 注意：connectors 数组长度至少为 depth（祖先层级数），不足部分用空格填充
+    local connectors_len = math.max(indent, depth)
     local connectors = {}
-    for i = 1, indent do
+    for i = 1, connectors_len do
       if i <= depth then
         if ancestor_is_last and ancestor_is_last[i] then
           connectors[i] = "   "
@@ -107,7 +112,12 @@ function M.build_flat_items()
           connectors[i] = "│  "
         end
       else
-        connectors[i] = "   "
+        -- i > depth：这些是当前节点之后的层级，根据 is_last 决定
+        if is_last then
+          connectors[i] = "   "
+        else
+          connectors[i] = "│  "
+        end
       end
     end
 
@@ -160,8 +170,9 @@ function M.build_flat_items()
     -- 在分支节点后面插入虚拟节点（与父节点同级）
     -- 当 child_ids 有多个（>=2）时，也插入虚拟节点
     if is_branch or is_multi_child then
+      local virtual_connectors_len = math.max(indent, depth)
       local virtual_connectors = {}
-      for i = 1, indent do
+      for i = 1, virtual_connectors_len do
         if i <= depth then
           if ancestor_is_last and ancestor_is_last[i] then
             virtual_connectors[i] = "   "
@@ -169,7 +180,12 @@ function M.build_flat_items()
             virtual_connectors[i] = "│  "
           end
         else
-          virtual_connectors[i] = "   "
+          -- i > depth：根据 is_last 决定
+          if is_last then
+            virtual_connectors[i] = "   "
+          else
+            virtual_connectors[i] = "│  "
+          end
         end
       end
       local virtual_node = {
@@ -200,8 +216,20 @@ function M.build_flat_items()
 
   -- 遍历每个根会话
   for i, rid in ipairs(root_ids) do
-    -- 在根节点前面插入虚拟节点（indent=0，connectors 填充一个空格占位）
-    local root_virtual_connectors = { "   " }
+    -- 在根节点前面插入虚拟节点（indent=0）
+    -- 第一个根虚拟节点前面不需要连接符（树的开始）
+    -- 非最后一个根节点，虚拟节点前面需要 │  来连接后续的根节点
+    local root_virtual_connectors = {}
+    if i == 1 then
+      -- 第一个根虚拟节点，前面不需要连接符
+      root_virtual_connectors[1] = "   "
+    elseif i == #root_ids then
+      -- 最后一个根虚拟节点，前面不需要连接符（下面没有更多根节点了）
+      root_virtual_connectors[1] = "   "
+    else
+      -- 中间的根虚拟节点，前面需要 │  连接后续根节点
+      root_virtual_connectors[1] = "│  "
+    end
     local root_virtual_node = {
       is_virtual = true,
       indent = 0,

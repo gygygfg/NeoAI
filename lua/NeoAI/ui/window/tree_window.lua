@@ -212,16 +212,20 @@ function M._build_display_content()
     table.insert(content, "暂无会话")
     table.insert(content, "按 N 创建新会话")
   else
-    for _, item in ipairs(state.flat_items) do
+    for idx, item in ipairs(state.flat_items) do
       local line = ""
 
       -- 1. 根据缩进级别生成连接线
       local indent = item.indent or 0
-      for i = 1, indent do
+      -- 使用 connectors 数组的实际长度，确保祖先层级的连接符都能渲染
+      -- 当 indent 为 0 时，不渲染任何连接符（顶级节点）
+      local connector_count = item.connectors and #item.connectors or indent
+      local loop_end = (indent == 0) and 0 or math.max(indent, connector_count)
+      for i = 1, loop_end do
         if item.connectors and item.connectors[i] then
           line = line .. item.connectors[i]
         else
-          line = line .. "│  "
+          line = line .. "   "
         end
       end
 
@@ -230,7 +234,7 @@ function M._build_display_content()
         line = line .. "📂 聊天会话"
         table.insert(content, line)
       else
-        -- 3. 根据 display_type 渲染前缀和文本
+        -- 3. 根据 display_type 和 is_last 渲染前缀
         if item.display_type == "branch" then
           if item.is_last then
             line = line .. "└─ 📂 " .. item.display_text
