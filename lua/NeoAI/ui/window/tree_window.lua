@@ -234,15 +234,15 @@ function M._build_display_content()
         line = line .. "📂 聊天会话"
         table.insert(content, line)
       else
-        -- 3. 根据 display_type 和 is_last 渲染前缀
+        -- 3. 根据 display_type 和 is_last_session 渲染前缀
         if item.display_type == "branch" then
-          if item.is_last then
+          if item.is_last_session then
             line = line .. "└─ 📂 " .. item.display_text
           else
             line = line .. "├─ 📂 " .. item.display_text
           end
         else
-          if item.is_last then
+          if item.is_last_session then
             line = line .. "└─ " .. item.display_text
           else
             line = line .. "├─ " .. item.display_text

@@ -8,7 +8,7 @@ local M = {}
 local state = {
   initialized = false,
   config = nil,
-  flat_items = {}, -- 最终渲染列表，每个元素是 { id, session_id, name, indent, connectors, is_last, ... }
+  flat_items = {}, -- 最终渲染列表，每个元素是 { id, session_id, name, indent, connectors, is_last_session, is_last_branch, ... }
   selected_node_id = nil,
 }
 
@@ -92,14 +92,17 @@ function M.build_flat_items()
       indent = parent_indent + sibling_count - sibling_index
     end
 
-    local has_children = #(session.child_ids or {}) > 0
-    local is_last = (sibling_index == sibling_count)
+    local child_ids = session.child_ids or {}
+    local has_children = #child_ids > 0
+    local is_last_session = #child_ids == 0  -- child_ids 是否为空数组，决定 └─/├─
+    local is_last_branch = (sibling_index == sibling_count)  -- 当前节点是否是兄弟中的最后一个（决定连接符 │）
+    local sibling_is_last = is_last_branch
 
     -- 计算连接符数组
     -- 对于每个深度层级 i（1-based）：
     --   如果 i <= depth：根据 ancestor_is_last[i] 决定是 "   " 还是 "│  "
-    --   如果 i > depth：根据 is_last 决定
-    --     如果 is_last（最后一个兄弟），后面没有更多兄弟了，用 "   "
+    --   如果 i > depth：根据 sibling_is_last 决定
+    --     如果 sibling_is_last（最后一个兄弟），后面没有更多兄弟了，用 "   "
     --     否则用 "│  "（后面还有兄弟）
     -- 注意：connectors 数组长度至少为 depth（祖先层级数），不足部分用空格填充
     local connectors_len = math.max(indent, depth)
@@ -112,8 +115,8 @@ function M.build_flat_items()
           connectors[i] = "│  "
         end
       else
-        -- i > depth：这些是当前节点之后的层级，根据 is_last 决定
-        if is_last then
+        -- i > depth：这些是当前节点之后的层级，根据 sibling_is_last 决定
+        if sibling_is_last then
           connectors[i] = "   "
         else
           connectors[i] = "│  "
@@ -161,7 +164,8 @@ function M.build_flat_items()
       display_text = display_text,
       is_virtual = false,
       is_separator = false,
-      is_last = is_last,
+      is_last_session = is_last_session,
+      is_last_branch = is_last_branch,
       indent = indent,
       connectors = connectors,
     }
@@ -180,8 +184,8 @@ function M.build_flat_items()
             virtual_connectors[i] = "│  "
           end
         else
-          -- i > depth：根据 is_last 决定
-          if is_last then
+          -- i > depth：根据 sibling_is_last 决定
+          if sibling_is_last then
             virtual_connectors[i] = "   "
           else
             virtual_connectors[i] = "│  "
@@ -206,7 +210,7 @@ function M.build_flat_items()
           child_ancestor_is_last[i] = ancestor_is_last[i]
         end
       end
-      child_ancestor_is_last[depth + 1] = is_last
+      child_ancestor_is_last[depth + 1] = sibling_is_last
 
       for i, cid in ipairs(child_ids) do
         dfs(cid, indent, depth + 1, i, #child_ids, child_ancestor_is_last)

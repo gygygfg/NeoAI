@@ -45,6 +45,24 @@ function M.initialize(config)
     end,
   })
 
+  -- 监听取消生成事件，清理待写入队列和空会话
+  vim.api.nvim_create_autocmd("User", {
+    pattern = Events.GENERATION_CANCELLED,
+    callback = function()
+      local hm = get_hm()
+      if not hm then return end
+      -- 遍历所有待写入队列，清理空会话
+      for sid, _ in pairs(state.pending_user_messages) do
+        local session = hm.get_session(sid)
+        if session and (not session.user or session.user == "") and (not session.assistant or #session.assistant == 0) then
+          hm.delete_session(sid)
+        end
+      end
+      -- 清空待写入队列
+      state.pending_user_messages = {}
+    end,
+  })
+
   -- STREAM_CHUNK 和 STREAM_COMPLETED 由 chat_window.lua 统一处理 UI 渲染
   -- chat_handlers 只负责业务逻辑（写入历史），通过 GENERATION_COMPLETED 事件处理
 
