@@ -56,6 +56,27 @@ function M.send_request(params)
   -- 使用适配器转换请求体
   local transformed_request = request_adapter.transform_request(request, api_type, provider_config)
   local request_body = json.encode(transformed_request)
+  -- 调试：检查请求体中是否包含 reasoning_content
+  if request_body:find("reasoning_content") then
+    print("[http_client] 请求体包含 reasoning_content")
+    -- 打印消息部分的 JSON 前300字符
+    local msg_start = request_body:find('"messages"')
+    if msg_start then
+      print("[http_client] 消息JSON前300字: " .. request_body:sub(msg_start, msg_start + 300))
+    end
+  else
+    print("[http_client] 请求体不包含 reasoning_content!")
+    -- 打印消息列表中的角色和字段
+    if transformed_request.messages then
+      for i, msg in ipairs(transformed_request.messages) do
+        local fields = {}
+        for k, _ in pairs(msg) do
+          table.insert(fields, k)
+        end
+        print("  消息 #" .. i .. " role=" .. (msg.role or "nil") .. " fields=" .. table.concat(fields, ","))
+      end
+    end
+  end
   local temp_file = vim.fn.tempname()
 
   -- 调试：打印工具信息
@@ -98,7 +119,7 @@ function M.send_request(params)
     "--connect-timeout",
     tostring(math.floor(timeout / 1000)),
     "--max-time",
-    tostring(math.floor(timeout / 1000)),
+    "0",
     "-o",
     temp_file,
   })
@@ -437,13 +458,28 @@ function M.send_stream_request(params, on_chunk, on_complete, on_error)
     end
   end
 
+  -- 将请求体写入临时文件，避免参数列表过长（E903: argument list too long）
+  local write_ok, write_err = pcall(function()
+    local result = vim.fn.writefile({ request_body }, temp_file)
+    if result == -1 then
+      error("Failed to write temp file: " .. temp_file)
+    end
+  end)
+  if not write_ok then
+    state.active_requests[request_id] = nil
+    if on_error then
+      on_error("Failed to write request body to temp file: " .. tostring(write_err))
+    end
+    return nil
+  end
+
   vim.list_extend(args, {
-    "-d",
-    request_body,
+    "--data-binary",
+    "@" .. temp_file,
     "--connect-timeout",
     tostring(math.floor(timeout / 1000)),
     "--max-time",
-    tostring(math.floor(timeout / 1000)),
+    "0",
   })
 
   -- 使用 vim.fn.jobstart 进行异步流式请求
@@ -464,6 +500,8 @@ function M.send_stream_request(params, on_chunk, on_complete, on_error)
       end
     end,
     on_exit = function(_, exit_code, _)
+      -- 清理临时文件
+      pcall(vim.fn.delete, temp_file)
       if exit_code == 0 then
         handle_complete()
       else
@@ -495,6 +533,11 @@ function M.cancel_request(request_id)
 
   local req = state.active_requests[request_id]
   req.cancelled = true
+
+  -- 清理临时文件
+  if req.temp_file then
+    pcall(vim.fn.delete, req.temp_file)
+  end
 
   -- 尝试取消 job
   if req.job_id then

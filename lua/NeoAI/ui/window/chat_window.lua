@@ -327,38 +327,68 @@ function M._do_render_chat()
       -- 使用 vim.schedule 确保在主线程执行，避免阻塞
       vim.schedule(function()
         if success and content then
+          -- 在设置内容前保存光标所在行号，用于渲染后推算新光标位置
+          -- 同时判断光标是否在缓冲区末尾附近（最后5行内）
+          -- 注意：这个判断必须在 set_window_content 之前完成，使用旧的总行数
+          -- 如果在 set_window_content 之后判断，新内容增加了行数会导致误判
+          local saved_cursor_lnum = nil
+          local saved_cursor_col = 0
+          local cursor_near_end = false
+          local win_handle = window_manager.get_window_win(state.current_window_id)
+          if win_handle and vim.api.nvim_win_is_valid(win_handle) then
+            local cursor = vim.api.nvim_win_get_cursor(win_handle)
+            saved_cursor_lnum = cursor[1]
+            saved_cursor_col = cursor[2]
+            local buf = vim.api.nvim_win_get_buf(win_handle)
+            local total_lines = vim.api.nvim_buf_line_count(buf)
+            if total_lines - saved_cursor_lnum <= 5 then
+              cursor_near_end = true
+            end
+          end
+
           -- 设置窗口内容
           window_manager.set_window_content(state.current_window_id, content)
 
           -- 自动获取焦点
           M._focus_window()
 
-          -- 确保折叠选项正确设置并刷新折叠
-          local win_handle = window_manager.get_window_win(state.current_window_id)
-          if win_handle and vim.api.nvim_win_is_valid(win_handle) then
-            local buf = vim.api.nvim_win_get_buf(win_handle)
-            -- 延迟设置折叠选项，确保在 BufRead/BufNew 等自动命令之后执行
-            vim.defer_fn(function()
-              if not vim.api.nvim_win_is_valid(win_handle) then
-                return
-              end
-              -- 使用 setlocal 确保窗口本地设置覆盖全局设置
-              pcall(vim.api.nvim_win_call, win_handle, function()
-                vim.cmd("setlocal foldmethod=marker")
-                vim.cmd("setlocal foldmarker={{{,}}}")
-                vim.cmd("setlocal foldlevel=0")
-                vim.cmd("setlocal foldenable")
-                -- 刷新折叠
-                vim.cmd("normal! zMzx")
-              end)
-            end, 10)
-          end
+          -- 延迟恢复光标位置并处理滚动，确保在 set_window_content 内部的 zMzx（10ms）之后执行
+          -- 将光标恢复和滚动合并到同一个 defer_fn 中，避免时序竞争
+          vim.defer_fn(function()
+            local win = window_manager.get_window_win(state.current_window_id)
+            if not win or not vim.api.nvim_win_is_valid(win) then
+              return
+            end
+            local buf = vim.api.nvim_win_get_buf(win)
+            local new_line_count = vim.api.nvim_buf_line_count(buf)
 
-          -- 先滚动到底部，再打开浮动输入框（确保滚动在抢焦点之前执行）
-          -- 注意：生成完成后的渲染由 GENERATION_COMPLETED 回调统一处理滚动和打开输入框
-          if not state.last_usage then
-            -- 延迟执行滚动，确保在 set_window_content 内部的折叠刷新之后
-            vim.defer_fn(function()
+            if saved_cursor_lnum then
+              local new_lnum
+              if cursor_near_end then
+                -- 刷新前光标在最后5行之内，恢复到最末尾
+                new_lnum = new_line_count
+              else
+                -- 不在最后5行之内，恢复到原位置（取较小值避免越界）
+                new_lnum = math.min(saved_cursor_lnum, new_line_count)
+              end
+              -- 获取该行内容，确保列不越界
+              local lines = vim.api.nvim_buf_get_lines(buf, new_lnum - 1, new_lnum, false)
+              local col = math.min(saved_cursor_col, #(lines[1] or ""))
+              pcall(vim.api.nvim_win_set_cursor, win, { new_lnum, col })
+            end
+
+            -- 判断是否需要滚动到底部：
+            -- 1. 工具调用活跃时（state.tool_display.active），不强制滚动，避免长折叠文本把页面顶到上面
+            -- 2. 如果用户光标在末尾附近（最后5行内），自动跟随滚动
+            -- 3. 生成完成后的渲染由 GENERATION_COMPLETED 回调统一处理滚动和打开输入框
+            local should_scroll = false
+            if not state.last_usage and not state.tool_display.active then
+              if cursor_near_end then
+                should_scroll = true
+              end
+            end
+
+            if should_scroll then
               M._scroll_to_end_with_offset()
 
               -- 滚动完成后，再打开浮动虚拟输入框
@@ -366,8 +396,8 @@ function M._do_render_chat()
               if not state.streaming.active then
                 M._open_float_input()
               end
-            end, 50)
-          end
+            end
+          end, 50)
 
           -- 触发渲染完成事件
           vim.api.nvim_exec_autocmds(
@@ -1282,23 +1312,14 @@ function M._scroll_to_end_with_offset(offset)
 
   local line_count = vim.api.nvim_buf_line_count(buf)
   if line_count > 0 then
+    -- 设置光标到末尾行行尾，Neovim 会自动滚动视图使光标行可见
+    local last_line_content = vim.api.nvim_buf_get_lines(buf, line_count - 1, line_count, false)[1] or ""
+    local last_col = #last_line_content
+    pcall(vim.api.nvim_win_set_cursor, win_handle, { line_count, last_col })
+
+    -- 使用 normal! z 让光标行位于窗口底部（z 命令将当前行移到窗口底部）
     pcall(vim.api.nvim_win_call, win_handle, function()
-      -- 计算目标 topline：让最后一行位于窗口底部上方 offset 行处
-      -- 先获取窗口高度
-      local win_height = vim.api.nvim_win_get_height(win_handle)
-      -- 目标 topline = line_count - win_height + 1 + offset
-      -- 当 offset=0 时，最后一行刚好在窗口底部
-      -- 当 offset>0 时，最后一行在窗口底部上方 offset 行处
-      local target_topline = line_count - win_height + 1 + offset
-      if target_topline < 1 then
-        target_topline = 1
-      end
-      -- 使用 winrestview 设置 topline，不移动光标
-      local view = vim.fn.winsaveview()
-      view.topline = target_topline
-      vim.fn.winrestview(view)
-      -- 将光标移到末尾行（使用 win_handle 而非 0，避免焦点在浮动窗口时操作错误）
-      pcall(vim.api.nvim_win_set_cursor, win_handle, { line_count, 0 })
+      vim.cmd("normal! z")
     end)
   end
 end
@@ -1698,9 +1719,56 @@ function M._setup_event_listeners()
       state.streaming.reasoning_active = true
       state.streaming.reasoning_buffer = state.streaming.reasoning_buffer .. reasoning_content
 
-      -- 增量追加思考内容到悬浮窗口（避免全量重写）
-      local reasoning_display = require("NeoAI.ui.components.reasoning_display")
-      reasoning_display.append(reasoning_content)
+      -- 如果工具调用悬浮窗口处于活跃状态，也更新其中的思考内容
+      if state.tool_display.active then
+        -- 在工具调用悬浮窗口中追加思考内容
+        -- 查找 "🤔 思考过程:" 标记，如果存在则更新其内容
+        local reasoning_marker = "🤔 思考过程:\n"
+        local marker_pos = state.tool_display.buffer:find(reasoning_marker)
+        if marker_pos then
+          -- 找到思考过程区域，更新内容
+          local reasoning_start = marker_pos + #reasoning_marker
+          local reasoning_end = state.tool_display.buffer:find("\n\n🔧 工具调用", reasoning_start)
+          if not reasoning_end then
+            reasoning_end = #state.tool_display.buffer
+          end
+          -- 截取思考内容的前 200 个字符作为摘要
+          local reasoning_summary = state.streaming.reasoning_buffer or ""
+          if #reasoning_summary > 200 then
+            reasoning_summary = reasoning_summary:sub(1, 200) .. "..."
+          end
+          -- 重新构建思考内容区域
+          local new_reasoning_section = ""
+          for _, line in ipairs(vim.split(reasoning_summary, "\n")) do
+            new_reasoning_section = new_reasoning_section .. "  " .. line .. "\n"
+          end
+          -- 替换旧内容
+          local before = state.tool_display.buffer:sub(1, reasoning_start - 1)
+          local after = state.tool_display.buffer:sub(reasoning_end)
+          state.tool_display.buffer = before .. new_reasoning_section .. after
+        else
+          -- 没有思考过程区域，在工具调用列表前插入
+          local tool_marker = "🔧 工具调用中...\n"
+          local tool_pos = state.tool_display.buffer:find(tool_marker)
+          if tool_pos then
+            local reasoning_summary = state.streaming.reasoning_buffer or ""
+            if #reasoning_summary > 200 then
+              reasoning_summary = reasoning_summary:sub(1, 200) .. "..."
+            end
+            local new_section = "🤔 思考过程:\n"
+            for _, line in ipairs(vim.split(reasoning_summary, "\n")) do
+              new_section = new_section .. "  " .. line .. "\n"
+            end
+            new_section = new_section .. "\n"
+            state.tool_display.buffer = new_section .. state.tool_display.buffer
+          end
+        end
+        M._update_tool_display()
+      else
+        -- 没有工具调用，正常显示在 reasoning_display 悬浮窗口
+        local reasoning_display = require("NeoAI.ui.components.reasoning_display")
+        reasoning_display.append(reasoning_content)
+      end
     end,
   })
 
@@ -1789,13 +1857,14 @@ function M._setup_event_listeners()
     end,
   })
 
-  -- 监听工具循环开始事件：显示工具调用悬浮窗口
+  -- 监听工具循环开始事件：显示工具调用悬浮窗口（含思考过程）
   vim.api.nvim_create_autocmd("User", {
     pattern = Events.TOOL_LOOP_STARTED,
     callback = function(args)
       local data = args.data or {}
       local window_id = data.window_id
       local tool_calls = data.tool_calls or {}
+      local is_reasoning_model = data.is_reasoning_model or false
 
       -- 检查是否是当前窗口
       if window_id and window_id ~= state.current_window_id then
@@ -1812,8 +1881,26 @@ function M._setup_event_listeners()
       state.tool_display.results = {}
       state.tool_display.show_time = vim.loop.now() -- 记录显示开始时间
 
-      -- 构建初始显示内容
-      local initial_text = "🔧 工具调用中...\n"
+      -- 构建初始显示内容：包含思考过程和工具调用
+      local initial_text = ""
+
+      -- 如果有思考内容，先显示思考过程
+      local reasoning_buffer = state.streaming.reasoning_buffer or ""
+      if reasoning_buffer ~= "" then
+        -- 截取思考内容的前 200 个字符作为摘要
+        local reasoning_summary = reasoning_buffer
+        if #reasoning_summary > 200 then
+          reasoning_summary = reasoning_summary:sub(1, 200) .. "..."
+        end
+        initial_text = initial_text .. "🤔 思考过程:\n"
+        -- 缩进显示思考内容
+        for _, line in ipairs(vim.split(reasoning_summary, "\n")) do
+          initial_text = initial_text .. "  " .. line .. "\n"
+        end
+        initial_text = initial_text .. "\n"
+      end
+
+      initial_text = initial_text .. "🔧 工具调用中...\n"
       for _, tc in ipairs(tool_calls) do
         local tool_func = tc["function"] or tc.func or {}
         local tool_name = tool_func.name or "unknown"
@@ -1822,7 +1909,7 @@ function M._setup_event_listeners()
 
       state.tool_display.buffer = initial_text
 
-      -- 创建或更新悬浮窗口
+      -- 创建或更新悬浮窗口（根据内容动态调整高度）
       M._show_tool_display()
     end,
   })
@@ -2222,11 +2309,15 @@ function M._show_tool_display()
     M._close_tool_display()
   end
 
+  -- 根据内容动态计算窗口高度
+  local content_lines = vim.split(state.tool_display.buffer or "", "\n")
+  local dynamic_height = math.max(5, math.min(#content_lines + 2, 20)) -- 最小5行，最大20行
+
   -- 使用 window_manager 创建浮动窗口
   local win_id = window_manager.create_window("tool_display", {
     title = "🔧 工具调用",
     width = state.config.width and math.min(state.config.width - 4, 80) or 60,
-    height = 8,
+    height = dynamic_height,
     border = "rounded",
     style = "minimal",
     relative = "editor",

@@ -375,6 +375,7 @@ local function set_window_content_by_mode(window_info, content, filetype, window
   end
 
   -- chat类型窗口保持可修改（内联输入需要），并设置折叠选项
+  -- 注意：不在此处执行 zMzx 折叠刷新，由调用方（如 _do_render_chat）统一处理
   if window_type == "chat" then
     vim.api.nvim_set_option_value("modifiable", true, { buf = buf })
     vim.api.nvim_set_option_value("readonly", false, { buf = buf })
@@ -385,20 +386,6 @@ local function set_window_content_by_mode(window_info, content, filetype, window
       vim.api.nvim_set_option_value("foldmarker", "{{{,}}}", { win = win })
       vim.api.nvim_set_option_value("foldlevel", 0, { win = win })
       vim.api.nvim_set_option_value("foldenable", true, { win = win })
-      -- 延迟刷新折叠，确保在 BufRead/BufNew 等自动命令之后执行
-      vim.defer_fn(function()
-        if vim.api.nvim_win_is_valid(win) then
-          pcall(vim.api.nvim_win_call, win, function()
-            -- 使用 setlocal 确保窗口本地设置覆盖全局设置
-            vim.cmd("setlocal foldmethod=marker")
-            vim.cmd("setlocal foldmarker={{{,}}}")
-            vim.cmd("setlocal foldlevel=0")
-            vim.cmd("setlocal foldenable")
-            -- 刷新折叠
-            vim.cmd("normal! zMzx")
-          end)
-        end
-      end, 10)
     end
   else
     -- 恢复缓冲区为只读状态

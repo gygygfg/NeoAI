@@ -71,7 +71,7 @@ function M.initialize(options)
   state.tool_orchestrator.initialize({
     config = state.full_config,
     session_manager = state.session_manager,
-    max_iterations = (state.full_config.ai or {}).max_tool_iterations or 10,
+
   })
 
   state.stream_processor.initialize({
@@ -165,6 +165,9 @@ function M.handle_send_message(data)
 
   -- 设置生成状态
   state.is_generating = true
+
+  -- 重置工具迭代计数（用户新消息开始时归零）
+  state.tool_orchestrator.reset_iteration()
 
   -- 从会话管理器获取消息历史
   local messages = {}
@@ -488,6 +491,21 @@ function M._send_stream_request(generation_id, request, params)
     session_id = session_id,
     window_id = window_id,
   })
+
+  -- 调试：检查 messages 的完整结构
+  -- if request.messages then
+  --   print("[ai_engine] 消息总数: " .. #request.messages)
+  --   for i, msg in ipairs(request.messages) do
+  --     local has_rc = msg.reasoning_content and "yes" or "no"
+  --     local has_tc = msg.tool_calls and "yes" or "no"
+  --     local content_preview = ""
+  --     if msg.content then
+  --       content_preview = msg.content:sub(1, 50)
+  --     end
+  --     print(string.format("  #%d role=%s content=[%s] reasoning=%s tool_calls=%s",
+  --       i, msg.role, content_preview, has_rc, has_tc))
+  --   end
+  -- end
 
   -- 发送流式请求（传入解析后的 base_url/api_key/timeout/api_type）
   local generation = state.active_generations[generation_id]
@@ -986,14 +1004,14 @@ function M.handle_tool_result(data)
     messages = state.request_builder.add_tool_call_to_history(messages, tool_result.tool_call, tool_result.result)
   end
 
-  -- DeepSeek Thinking Mode: 如果有 reasoning_content，将其附加到助手消息中
-  -- 工具调用轮次必须维护 reasoning_content 的完整传递链
+  -- DeepSeek Thinking Mode: 将 reasoning_content 附加到所有带 tool_calls 的 assistant 消息上
+  -- DeepSeek API 要求：在 thinking mode 下，包含 tool_calls 的 assistant 消息必须同时包含 reasoning_content
   if last_reasoning and last_reasoning ~= "" then
-    -- 找到最后一条 assistant 消息（刚由 add_tool_call_to_history 添加的）
+    -- print("[ai_engine] last_reasoning 长度=" .. #last_reasoning .. " 前50字=" .. last_reasoning:sub(1, 50))
     for i = #messages, 1, -1 do
       if messages[i].role == "assistant" and messages[i].tool_calls then
         messages[i].reasoning_content = last_reasoning
-        break
+        -- print("[ai_engine] 已将 reasoning_content 附加到消息 #" .. i)
       end
     end
   end
@@ -1020,11 +1038,13 @@ function M.handle_tool_result(data)
     -- 插入 system 提示，要求 AI 总结已完成的工作
     table.insert(filtered_messages, {
       role = "system",
-      content = "工具调用循环已结束。请根据所有工具执行的结果，对已完成的工作进行总结，然后返回最终结果给用户。总结应包括：完成了哪些任务、关键发现或结果、以及后续建议（如有）。"
+      content = "工具调用循环已结束。请根据所有工具执行的结果，对已完成的工作进行总结，然后返回最终结果给用户。总结应包括：完成了哪些任务、关键发现或结果、以及后续建议（如有）。",
     })
     -- 重置 stop_requested 标志，避免后续循环再次触发总结
     state.tool_orchestrator.reset_stop_requested()
   end
+
+
 
   -- 继续生成响应（沿用原始模型索引）
   -- 保持原始 stream 配置，不强制切换非流式
@@ -1173,6 +1193,8 @@ function M.process_query(query, options)
 
   -- 每次新的用户查询开始时重置 first_request，确保 stop_tool_loop 在第一轮被排除
   state.request_builder.reset_first_request()
+  -- 重置工具迭代计数
+  state.tool_orchestrator.reset_iteration()
 
   -- 构建消息
   local messages = {
