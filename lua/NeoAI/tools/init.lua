@@ -36,7 +36,7 @@ function M.initialize(tools_config)
 
   -- 初始化历史管理器
   tool_history_manager.initialize(state.config)
-  
+
   -- 初始化配置（如果需要的话）
   -- 注意：tools_config 应该是已经处理好的配置，所以这里不需要再次初始化
 

@@ -1844,6 +1844,7 @@ function M._setup_event_listeners()
       state.tool_display.active = true
       state.tool_display.buffer = ""
       state.tool_display.results = {}
+      state.tool_display.show_time = vim.loop.now() -- 记录显示开始时间
 
       -- 构建初始显示内容
       local initial_text = "🔧 工具调用中...\n"
@@ -1880,10 +1881,8 @@ function M._setup_event_listeners()
       -- 更新悬浮窗口：将 ⏳ 改为 🔄
       -- 转义 tool_name 中的特殊字符（如 _、. 等）
       local escaped_name = tool_name:gsub("([%.%+%-%*%?%[%]%^%$%(%)%%])", "%%%1")
-      state.tool_display.buffer = state.tool_display.buffer:gsub(
-        "  ⏳ " .. escaped_name,
-        "  🔄 " .. tool_name .. " (执行中...)"
-      )
+      state.tool_display.buffer =
+        state.tool_display.buffer:gsub("  ⏳ " .. escaped_name, "  🔄 " .. tool_name .. " (执行中...)")
       M._update_tool_display()
     end,
   })
@@ -1926,10 +1925,8 @@ function M._setup_event_listeners()
       )
       if replaced == state.tool_display.buffer then
         -- 如果替换失败，尝试替换 ⏳ 状态
-        state.tool_display.buffer = state.tool_display.buffer:gsub(
-          "  ⏳ " .. escaped_name,
-          "  ✅ " .. tool_name .. " (" .. duration .. "s)"
-        )
+        state.tool_display.buffer =
+          state.tool_display.buffer:gsub("  ⏳ " .. escaped_name, "  ✅ " .. tool_name .. " (" .. duration .. "s)")
       else
         state.tool_display.buffer = replaced
       end
@@ -1954,8 +1951,20 @@ function M._setup_event_listeners()
         return
       end
 
-      -- 关闭悬浮窗口
-      M._close_tool_display()
+      -- 计算悬浮窗已显示时长，确保最小显示1500ms
+      local elapsed = vim.loop.now() - (state.tool_display.show_time or 0)
+      local min_display_ms = 1500
+      local delay = math.max(0, min_display_ms - elapsed)
+
+      if delay > 0 then
+        -- 不足最小显示时间，延迟关闭
+        vim.defer_fn(function()
+          M._close_tool_display()
+        end, delay)
+      else
+        -- 已超过最小显示时间，立即关闭
+        M._close_tool_display()
+      end
 
       -- 将工具调用结果转换为折叠文本并添加到消息列表
       -- 注意：跳过持久化（skip_persist=true），因为工具调用数据已由 chat_handlers
