@@ -305,6 +305,12 @@ function M.send_message(content, session_id, branch_id, window_id, format, callb
   -- 等AI响应完成后，再将用户消息和AI回复一起写入
   state.pending_user_messages[target_session_id] = content
 
+  -- 用户发送消息时触发自动保存
+  local hm_module = require("NeoAI.core.history_manager")
+  if hm_module and hm_module._save then
+    hm_module._save()
+  end
+
   -- 自动命名已移至 add_round 中，通过 config.auto_naming 控制
 
   local chat_window = require("NeoAI.ui.window.chat_window")

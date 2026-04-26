@@ -13,6 +13,8 @@ local state = {
   tools = {},
   tool_definitions = {}, -- 工具定义，用于构建工具列表
   tool_call_counter = 0, -- 添加计数器避免ID重复
+  first_request = true, -- 标记是否为第一次请求（第一次排除 stop_tool_loop，后续请求才包含）
+  stop_tool_name = "stop_tool_loop", -- 结束循环的工具名称
 }
 
 --- 初始化请求构建器
@@ -122,7 +124,7 @@ function M.build_request(params)
       stream = false, -- FIM 补全不支持流式
     }
   else
-  -- 聊天补全模式（默认）
+    -- 聊天补全模式（默认）
     local use_stream = options.stream
     if use_stream == nil then
       use_stream = true
@@ -183,9 +185,60 @@ function M.build_request(params)
       tools_enabled = state.config.tools_enabled
     end
 
+    -- 第一次请求排除 stop_tool_loop 工具，避免 AI 在第一轮就结束循环
+    -- 后续请求（AI 返回工具调用后）才包含 stop_tool_loop
+    local is_first_request = state.first_request
+    if is_first_request then
+      state.first_request = false
+    end
+
     if tools_enabled and #state.tool_definitions > 0 then
-      request.tools = state.tool_definitions
-      request.tool_choice = "auto" -- 让模型自动选择工具
+      -- 检测是否为 reasoner 模型（如 deepseek-reasoner），它们不支持工具调用
+      local model_name = (options.model or state.config.model or ""):lower()
+      local is_reasoner = model_name:find("reasoner") ~= nil
+
+      if is_reasoner then
+        -- reasoner 模型不支持工具调用，跳过
+      else
+        -- 选择要包含的工具：第一次请求排除 stop_tool_loop，后续请求包含所有
+        local tools_to_use = state.tool_definitions
+        if is_first_request then
+          -- 第一次请求：过滤掉 stop_tool_loop 工具
+          tools_to_use = {}
+          for _, td in ipairs(state.tool_definitions) do
+            if td["function"] and td["function"].name ~= state.stop_tool_name then
+              table.insert(tools_to_use, td)
+            end
+          end
+        end
+
+        -- DeepSeek 思考模式下的工具调用需要 strict 模式
+        -- 参考文档：https://api-docs.deepseek.com/api/tool-calls
+        -- 从 DeepSeek-V3.2 开始支持思考模式下的工具调用，需要：
+        -- 1. 使用 Beta 端点 https://api.deepseek.com/beta
+        -- 2. 在 tools 中设置 strict: true
+        if reasoning_enabled then
+          -- 思考模式下，为所有工具定义添加 strict: true
+          local strict_tools = {}
+          for _, td in ipairs(tools_to_use) do
+            local strict_td = vim.deepcopy(td)
+            if strict_td["function"] then
+              strict_td["function"].strict = true
+              -- strict 模式下，parameters 必须包含 additionalProperties: false
+              if strict_td["function"].parameters then
+                strict_td["function"].parameters.additionalProperties = false
+              end
+            end
+            table.insert(strict_tools, strict_td)
+          end
+          request.tools = strict_tools
+        else
+          request.tools = tools_to_use
+        end
+        request.tool_choice = "auto" -- 让模型自动选择工具
+      end
+    else
+      -- 工具未启用或无工具定义，跳过
     end
   end
 
@@ -209,12 +262,14 @@ function M.build_request(params)
     },
   })
 
-  logger.debug(string.format(
-    "Request built for generation %s with %d messages, %d tools",
-    generation_id,
-    #messages,
-    #state.tool_definitions
-  ))
+  logger.debug(
+    string.format(
+      "Request built for generation %s with %d messages, %d tools",
+      generation_id,
+      #messages,
+      #state.tool_definitions
+    )
+  )
 
   return request
 end
@@ -298,12 +353,14 @@ end
 function M.build_tool_call_message(tool_name, arguments, tool_call_id)
   state.tool_call_counter = state.tool_call_counter + 1
   local id = tool_call_id
-    or "call_"
+    or (
+      "call_"
       .. tostring(os.time())
       .. "_"
       .. tostring(state.tool_call_counter)
       .. "_"
       .. tostring(math.random(1000, 9999))
+    )
 
   return {
     role = "assistant",
@@ -512,11 +569,19 @@ function M.get_status()
   }
 end
 
+--- 重置首次请求标记
+-- 每次新的用户对话轮次开始时调用，确保 stop_tool_loop 在第一轮被排除
+function M.reset_first_request()
+  state.first_request = true
+  logger.debug("Request builder first_request reset")
+end
+
 --- 重置模块状态
 function M.reset()
   state.tools = {}
   state.tool_definitions = {}
   state.tool_call_counter = 0
+  state.first_request = true
   logger.debug("Request builder reset")
 end
 

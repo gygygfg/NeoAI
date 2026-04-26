@@ -153,6 +153,45 @@ function M.process_chunk(params)
       end
     end
 
+    -- 处理非流式格式的工具调用（当 finish_reason 为 tool_calls 时）
+    -- DeepSeek 的流式响应中，最后一个数据块可能包含 choice.message.tool_calls
+    -- 而不是 choice.delta.tool_calls
+    if choice.message and choice.message.tool_calls then
+      for _, tc in ipairs(choice.message.tool_calls) do
+        local index = tc.index or 0
+        if not processor.tool_calls[index + 1] then
+          local safe_id = tc.id
+          if not safe_id or safe_id == "" then
+            safe_id = "call_" .. tostring(os.time()) .. "_" .. tostring(index)
+          end
+          processor.tool_calls[index + 1] = {
+            id = safe_id,
+            type = tc.type or "function",
+            ["function"] = {
+              name = "",
+              arguments = "",
+            },
+          }
+        end
+
+        local existing = processor.tool_calls[index + 1]
+        if tc.id then existing.id = tc.id end
+        if tc.type then existing.type = tc.type end
+        if tc["function"] then
+          if tc["function"].name then
+            existing["function"].name = tc["function"].name
+          end
+          if tc["function"].arguments then
+            existing["function"].arguments = tc["function"].arguments
+          end
+        end
+      end
+
+      if #processor.tool_calls > 0 then
+        result.tool_calls = vim.deepcopy(processor.tool_calls)
+      end
+    end
+
     -- 检查是否结束
     if choice.finish_reason then
       result.is_final = true

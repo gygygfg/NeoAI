@@ -58,15 +58,30 @@ function M.send_request(params)
   local request_body = json.encode(transformed_request)
   local temp_file = vim.fn.tempname()
 
+  -- 调试：打印工具信息
+  -- if request.tools and #request.tools > 0 then
+  --   local tool_names = {}
+  --   for _, t in ipairs(request.tools) do
+  --     if t["function"] then
+  --       table.insert(tool_names, t["function"].name)
+  --     end
+  --   end
+  --   print("[http_client] 非流式请求包含 " .. #request.tools .. " 个工具: " .. table.concat(tool_names, ", "))
+  -- else
+  --   print("[http_client] 非流式请求不包含工具定义")
+  -- end
+
   -- 使用适配器获取请求头
   local headers = request_adapter.get_headers(api_key, api_type)
 
   -- 构建 curl 命令
   local curl_args = {
     "-s",
-    "-X", "POST",
+    "-X",
+    "POST",
     base_url,
-    "-H", "Content-Type: application/json",
+    "-H",
+    "Content-Type: application/json",
   }
 
   -- 添加 API 特定的请求头
@@ -78,17 +93,39 @@ function M.send_request(params)
   end
 
   vim.list_extend(curl_args, {
-    "-d", request_body,
-    "--connect-timeout", tostring(math.floor(timeout / 1000)),
-    "--max-time", tostring(math.floor(timeout / 1000)),
-    "-o", temp_file,
+    "-d",
+    request_body,
+    "--connect-timeout",
+    tostring(math.floor(timeout / 1000)),
+    "--max-time",
+    tostring(math.floor(timeout / 1000)),
+    "-o",
+    temp_file,
   })
 
   -- 记录请求信息
-  logger.debug(string.format(
-    "Sending request to %s (generation=%s, model=%s, stream=%s)",
-    base_url, generation_id, request.model or "unknown", tostring(request.stream)
-  ))
+  logger.debug(
+    string.format(
+      "Sending request to %s (generation=%s, model=%s, stream=%s)",
+      base_url,
+      generation_id,
+      request.model or "unknown",
+      tostring(request.stream)
+    )
+  )
+
+  -- 调试：打印工具信息
+  -- if request.tools and #request.tools > 0 then
+  --   local tool_names = {}
+  --   for _, t in ipairs(request.tools) do
+  --     if t["function"] then
+  --       table.insert(tool_names, t["function"].name)
+  --     end
+  --   end
+  --   print("[http_client] 流式请求包含 " .. #request.tools .. " 个工具: " .. table.concat(tool_names, ", "))
+  -- else
+  --   print("[http_client] 流式请求不包含工具定义")
+  -- end
 
   -- 执行 curl 命令（使用列表形式避免 shell 转义问题）
   local curl_cmd = vim.list_extend({ "curl" }, curl_args)
@@ -142,7 +179,9 @@ end
 --- @return string|nil request_id 请求ID，可用于取消
 function M.send_stream_request(params, on_chunk, on_complete, on_error)
   if not state.initialized then
-    if on_error then on_error("HTTP client not initialized") end
+    if on_error then
+      on_error("HTTP client not initialized")
+    end
     return nil
   end
 
@@ -155,12 +194,16 @@ function M.send_stream_request(params, on_chunk, on_complete, on_error)
   local provider_config = params.provider_config or {}
 
   if not api_key or api_key == "" then
-    if on_error then on_error("API key not configured") end
+    if on_error then
+      on_error("API key not configured")
+    end
     return nil
   end
 
   if not base_url or base_url == "" then
-    if on_error then on_error("API base URL not configured") end
+    if on_error then
+      on_error("API base URL not configured")
+    end
     return nil
   end
 
@@ -179,14 +222,13 @@ function M.send_stream_request(params, on_chunk, on_complete, on_error)
     generation_id = generation_id,
     temp_file = temp_file,
     cancelled = false,
-    has_error = false,  -- API 错误标志
-    buffer = "",  -- SSE 行缓冲区，处理跨块的行
+    has_error = false, -- API 错误标志
+    buffer = "", -- SSE 行缓冲区，处理跨块的行
   }
 
-  logger.debug(string.format(
-    "Sending stream request to %s (generation=%s, request_id=%s)",
-    base_url, generation_id, request_id
-  ))
+  logger.debug(
+    string.format("Sending stream request to %s (generation=%s, request_id=%s)", base_url, generation_id, request_id)
+  )
 
   -- jobstart 的 on_stdout/on_stderr/on_exit 回调在 Neovim 主事件循环中运行
   -- 但 vim.api.nvim_exec_autocmds 不能在 jobstart 回调中直接调用
@@ -223,6 +265,19 @@ function M.send_stream_request(params, on_chunk, on_complete, on_error)
           end
           return
         end
+        -- 调试：检查工具调用
+        -- if data.choices and data.choices[1] then
+        --   local choice = data.choices[1]
+        --   if choice.delta and choice.delta.tool_calls then
+        --     print("[http_client] SSE 数据块包含 delta.tool_calls: " .. #choice.delta.tool_calls .. " 个")
+        --   end
+        --   if choice.message and choice.message.tool_calls then
+        --     print("[http_client] SSE 数据块包含 message.tool_calls: " .. #choice.message.tool_calls .. " 个")
+        --   end
+        --   if choice.finish_reason then
+        --     print("[http_client] SSE 数据块 finish_reason: " .. choice.finish_reason)
+        --   end
+        -- end
         -- 使用适配器转换流式响应块为统一格式
         local unified_data = request_adapter.transform_response(data, api_type)
         if on_chunk then
@@ -366,10 +421,12 @@ function M.send_stream_request(params, on_chunk, on_complete, on_error)
 
   -- 构建 curl 参数
   local args = {
-    "-sN",  -- -s: silent, -N: no-buffer (streaming)
-    "-X", "POST",
+    "-sN", -- -s: silent, -N: no-buffer (streaming)
+    "-X",
+    "POST",
     base_url,
-    "-H", "Content-Type: application/json",
+    "-H",
+    "Content-Type: application/json",
   }
 
   -- 添加 API 特定的请求头
@@ -381,9 +438,12 @@ function M.send_stream_request(params, on_chunk, on_complete, on_error)
   end
 
   vim.list_extend(args, {
-    "-d", request_body,
-    "--connect-timeout", tostring(math.floor(timeout / 1000)),
-    "--max-time", tostring(math.floor(timeout / 1000)),
+    "-d",
+    request_body,
+    "--connect-timeout",
+    tostring(math.floor(timeout / 1000)),
+    "--max-time",
+    tostring(math.floor(timeout / 1000)),
   })
 
   -- 使用 vim.fn.jobstart 进行异步流式请求
@@ -420,7 +480,7 @@ function M.send_stream_request(params, on_chunk, on_complete, on_error)
     end,
   }
 
-  local job_id = vim.fn.jobstart({"curl", unpack(args)}, job_opts)
+  local job_id = vim.fn.jobstart({ "curl", unpack(args) }, job_opts)
   state.active_requests[request_id].job_id = job_id
 
   return request_id
@@ -496,7 +556,9 @@ end
 function M._read_file(filepath)
   local ok, content = pcall(function()
     local file = io.open(filepath, "r")
-    if not file then return nil end
+    if not file then
+      return nil
+    end
     local data = file:read("*a")
     file:close()
     return data

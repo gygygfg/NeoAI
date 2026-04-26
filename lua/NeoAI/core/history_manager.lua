@@ -370,7 +370,6 @@ function M.update_last_assistant(session_id, content)
     table.insert(session.assistant, content)
   end
   session.updated_at = os.time()
-  debounce_save()
 end
 
 --- 追加一轮 assistant 回复到数组末尾（用于工具调用时的多轮对话）
@@ -392,7 +391,6 @@ function M.add_assistant_entry(session_id, assistant_entry)
   end
   table.insert(session.assistant, assistant_entry)
   session.updated_at = os.time()
-  debounce_save()
   return true
 end
 
@@ -424,7 +422,6 @@ function M.add_tool_result(session_id, tool_name, arguments, result)
   end
   table.insert(session.assistant, entry)
   session.updated_at = os.time()
-  debounce_save()
   return true
 end
 
@@ -436,7 +433,6 @@ function M.update_usage(session_id, usage)
   end
   session.usage = usage
   session.updated_at = os.time()
-  debounce_save()
 end
 
 --- 获取会话的所有消息（展平为 role/content 列表）

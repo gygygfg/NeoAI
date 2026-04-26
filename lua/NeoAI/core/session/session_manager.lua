@@ -77,16 +77,15 @@ function M.initialize(options)
     M._load_sessions()
   end
 
-  -- 监听消息相关事件，触发自动保存
-  -- 使用 Neovim 原生事件系统
+  -- 监听高级事件，触发自动保存
+  -- 只在用户发送、工具完成、AI生成完成/取消时触发保存
   state.autocmd_ids = {}
   
   local autocmd_patterns = {
-    Events.MESSAGE_ADDED,
-    Events.MESSAGE_EDITED,
-    Events.MESSAGE_UPDATED,
-    Events.MESSAGE_DELETED,
-    Events.MESSAGES_CLEARED,
+    Events.GENERATION_COMPLETED,
+    Events.GENERATION_CANCELLED,
+    Events.GENERATION_ERROR,
+    Events.TOOL_RESULT_RECEIVED,
   }
   
   for _, pattern in ipairs(autocmd_patterns) do

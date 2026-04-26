@@ -42,10 +42,13 @@ end
 function M.register_tool(tool_def)
   -- 注意：在初始化过程中也可以调用此函数
 
+  -- print("[NeoAI.tools.init] register_tool 开始: " .. (tool_def and tool_def.name or "nil"))
+
   -- 验证工具定义的合法性
   local valid, error_msg = tool_validator.validate_tool(tool_def)
   if not valid then
     local error_level = vim.log.levels and vim.log.levels.ERROR or "ERROR"
+    print("[NeoAI.tools.init] 工具验证失败: " .. tool_def.name .. " - " .. error_msg)
     vim.notify("工具验证失败: " .. error_msg, error_level)
     return false
   end
@@ -59,84 +62,126 @@ function M.register_tool(tool_def)
   if not success then
     -- 注册过程中发生异常
     local error_level = vim.log.levels and vim.log.levels.ERROR or "ERROR"
+    print("[NeoAI.tools.init] 工具注册异常: " .. tool_def.name .. " - " .. tostring(reg_result))
     vim.notify("工具注册异常: " .. reg_result, error_level)
     return false
   elseif reg_result == false then
     -- 注册失败但没有抛出异常（例如工具已存在等情况）
     local warn_level = vim.log.levels and vim.log.levels.WARN or "WARN"
+    print("[NeoAI.tools.init] 工具注册失败（已存在）: " .. tool_def.name)
     vim.notify("工具注册失败: " .. tool_def.name, warn_level)
     return false
   end
 
   -- 注册成功
+  -- print("[NeoAI.tools.init] 工具注册成功: " .. tool_def.name)
   return true
 end
 
 --- 获取所有已注册的工具列表
 function M.get_tools()
-  if not initialized then error("工具系统未初始化") end
+  if not initialized then
+    error("工具系统未初始化")
+  end
   return tool_registry.list()
 end
 
 --- 执行指定工具
 function M.execute_tool(tool_name, args)
-  if not initialized then error("工具系统未初始化") end
-  return tool_executor.execute(tool_name, args)
+  if not initialized then
+    print("[NeoAI.tools.init] execute_tool 失败: 工具系统未初始化")
+    error("工具系统未初始化")
+  end
+  local result = tool_executor.execute(tool_name, args)
+  print("[NeoAI.tools.init] execute_tool 结束: " .. tool_name)
+  return result
 end
 
 --- 注销指定工具
 function M.unregister_tool(tool_name)
-  if not initialized then error("工具系统未初始化") end
-  return tool_registry.unregister(tool_name)
+  if not initialized then
+    print("[NeoAI.tools.init] unregister_tool 失败: 工具系统未初始化")
+    error("工具系统未初始化")
+  end
+  print("[NeoAI.tools.init] unregister_tool: " .. tool_name)
+  local result = tool_registry.unregister(tool_name)
+  print("[NeoAI.tools.init] unregister_tool 结果: " .. tostring(result))
+  return result
 end
 
 --- 获取指定工具的定义
 function M.get_tool(tool_name)
-  if not initialized then error("工具系统未初始化") end
-  return tool_registry.get(tool_name)
+  if not initialized then
+    print("[NeoAI.tools.init] get_tool 失败: 工具系统未初始化")
+    error("工具系统未初始化")
+  end
+  print("[NeoAI.tools.init] get_tool: " .. tool_name)
+  local tool = tool_registry.get(tool_name)
+  print("[NeoAI.tools.init] get_tool 结果: " .. (tool and "找到" or "未找到"))
+  return tool
 end
 
 --- 验证工具参数
 function M.validate_tool_args(tool_name, args)
-  if not initialized then error("工具系统未初始化") end
+  if not initialized then
+    print("[NeoAI.tools.init] validate_tool_args 失败: 工具系统未初始化")
+    error("工具系统未初始化")
+  end
+  print("[NeoAI.tools.init] validate_tool_args: " .. tool_name)
   local tool = tool_registry.get(tool_name)
   if not tool then
+    print("[NeoAI.tools.init] validate_tool_args: 工具不存在 - " .. tool_name)
     return false, "工具不存在: " .. tool_name
   end
-  return tool_validator.validate_parameters(tool.parameters, args)
+  local valid, err = tool_validator.validate_parameters(tool.parameters, args)
+  print("[NeoAI.tools.init] validate_tool_args 结果: valid=" .. tostring(valid) .. ", err=" .. tostring(err))
+  return valid, err
 end
 
 --- 重新加载所有工具
 function M.reload_tools()
-  if not initialized then error("工具系统未初始化") end
+  if not initialized then
+    print("[NeoAI.tools.init] reload_tools 失败: 工具系统未初始化")
+    error("工具系统未初始化")
+  end
+  print("[NeoAI.tools.init] 开始重新加载所有工具...")
   tool_registry.clear()
   builtin_tools_loaded = false
   local config = require("NeoAI.core.state").get_config()
   local tools_config = (config and config.tools) or {}
   if tools_config.builtin ~= false then
+    print("[NeoAI.tools.init] 重新加载内置工具")
     M._load_builtin_tools()
   end
   if tools_config.external and #tools_config.external > 0 then
+    print("[NeoAI.tools.init] 重新加载外部工具")
     M._load_external_tools(tools_config.external)
   end
+  print("[NeoAI.tools.init] 工具重新加载完成")
   vim.notify("工具重新加载完成", vim.log.levels.INFO)
 end
 
 --- 获取已注册工具的数量
 function M.get_tool_count()
-  if not initialized then error("工具系统未初始化") end
+  if not initialized then
+    error("工具系统未初始化")
+  end
   return #tool_registry.list()
 end
 
 --- 搜索工具
 function M.search_tools(query)
-  if not initialized then error("工具系统未初始化") end
+  if not initialized then
+    error("工具系统未初始化")
+  end
   local all_tools = tool_registry.list()
   local results = {}
   query = query:lower()
   for _, tool in ipairs(all_tools) do
-    if tool.name:lower():find(query, 1, true)
-      or (tool.description and tool.description:lower():find(query, 1, true)) then
+    if
+      tool.name:lower():find(query, 1, true)
+      or (tool.description and tool.description:lower():find(query, 1, true))
+    then
       table.insert(results, tool)
     end
   end
@@ -146,6 +191,7 @@ end
 --- 加载内置工具（内部使用）
 function M._load_builtin_tools()
   if builtin_tools_loaded then
+    print("[NeoAI.tools.init] 内置工具已加载，跳过")
     return
   end
 
@@ -153,15 +199,19 @@ function M._load_builtin_tools()
     "NeoAI.tools.builtin.file_tools",
     "NeoAI.tools.builtin.general_tools",
     "NeoAI.tools.builtin.log_tools",
+    "NeoAI.tools.builtin.stop_tool",
   }
 
   for _, mod_path in ipairs(modules) do
+    -- print("[NeoAI.tools.init] 加载模块: " .. mod_path)
     local ok, mod = pcall(require, mod_path)
     if ok and mod and mod.get_tools then
       local tools = mod.get_tools()
       for _, tool in ipairs(tools) do
         M.register_tool(tool)
       end
+    else
+      print("[NeoAI.tools.init] 模块加载失败: " .. mod_path .. ", ok=" .. tostring(ok))
     end
   end
 
@@ -170,7 +220,7 @@ end
 
 --- 加载外部工具（内部使用）
 function M._load_external_tools(external_tools)
-  for _, tool_config in ipairs(external_tools) do
+  for i, tool_config in ipairs(external_tools) do
     if tool_config.path then
       local ok, tool_module = pcall(require, tool_config.path)
       if ok and tool_module and tool_module.get_tools then
@@ -178,8 +228,11 @@ function M._load_external_tools(external_tools)
         for _, tool in ipairs(tools) do
           M.register_tool(tool)
         end
+      else
+        print("[NeoAI.tools.init] 外部模块加载失败: " .. tostring(tool_config.path))
       end
     elseif tool_config.definition then
+      print("[NeoAI.tools.init] 注册外部工具定义: " .. (tool_config.definition.name or "unnamed"))
       M.register_tool(tool_config.definition)
     end
   end
@@ -187,7 +240,10 @@ end
 
 --- 更新工具系统配置
 function M.update_config(new_config)
-  if not initialized then return end
+  if not initialized then
+    print("[NeoAI.tools.init] update_config 跳过: 未初始化")
+    return
+  end
   local config = require("NeoAI.core.state").get_config()
   local tools_config = (config and config.tools) or {}
   local merged = vim.tbl_extend("force", tools_config, new_config or {})
@@ -199,7 +255,9 @@ end
 
 --- 获取历史管理器实例
 function M.get_history_manager()
-  if not initialized then error("工具系统未初始化") end
+  if not initialized then
+    error("工具系统未初始化")
+  end
   return tool_history_manager
 end
 

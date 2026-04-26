@@ -124,6 +124,14 @@ function M.setup_event_listeners()
     end,
   })
 
+  -- 监听工具循环停止请求事件
+  state.event_listeners.tool_loop_stop_requested = vim.api.nvim_create_autocmd("User", {
+    pattern = event_constants.TOOL_LOOP_STOP_REQUESTED,
+    callback = function()
+      state.tool_orchestrator.request_stop()
+    end,
+  })
+
   -- 监听取消生成事件
   state.event_listeners.cancel_generation = vim.api.nvim_create_autocmd("User", {
     pattern = event_constants.CANCEL_GENERATION,
@@ -247,9 +255,15 @@ local function resolve_scenario_config(scenario)
   for k, v in pairs(candidate) do
     result[k] = v
   end
-  if not result.stream then result.stream = ai_config.stream end
-  if not result.timeout then result.timeout = ai_config.timeout end
-  if not result.system_prompt then result.system_prompt = ai_config.system_prompt end
+  if not result.stream then
+    result.stream = ai_config.stream
+  end
+  if not result.timeout then
+    result.timeout = ai_config.timeout
+  end
+  if not result.system_prompt then
+    result.system_prompt = ai_config.system_prompt
+  end
 
   return result
 end
@@ -654,18 +668,52 @@ function M._handle_stream_end(generation_id, params)
     end
 
     if tools_enabled then
+      -- 手动深拷贝 tool_calls，避免引用问题
+      local tool_calls_copy = {}
+      for i, tc in ipairs(tool_calls) do
+        tool_calls_copy[i] = {
+          id = tc.id,
+          type = tc.type,
+          ["function"] = {
+            name = tc["function"].name,
+            arguments = tc["function"].arguments,
+          },
+        }
+      end
       -- 使用 vim.schedule 确保在 jobstart 回调中安全执行
       -- execute_tool_loop 内部会触发 nvim_exec_autocmds 事件
+      -- 注意：execute_tool_loop 是用 function M.execute_tool_loop(params) 定义的，没有 self 参数
       vim.schedule(function()
-        local tool_results = state.tool_orchestrator.execute_tool_loop({
+        local ok, tool_results = pcall(state.tool_orchestrator.execute_tool_loop, {
           generation_id = generation_id,
-          tool_calls = tool_calls,
+          tool_calls = tool_calls_copy,
           session_id = session_id,
           window_id = window_id,
           options = params.options or {},
         })
 
-        if tool_results and #tool_results > 0 then
+        if not ok then
+          -- 工具执行崩溃，记录错误并触发 STREAM_COMPLETED 完成生成
+          logger.error(
+            string.format(
+              "Tool execution crashed in stream end for generation %s: %s",
+              generation_id,
+              tostring(tool_results)
+            )
+          )
+          state.stream_processor.end_stream(generation_id)
+          vim.api.nvim_exec_autocmds("User", {
+            pattern = event_constants.STREAM_COMPLETED,
+            data = {
+              generation_id = generation_id,
+              full_response = full_response,
+              reasoning_text = reasoning_text,
+              usage = usage,
+              session_id = session_id,
+              window_id = window_id,
+            },
+          })
+        elseif tool_results and #tool_results > 0 then
           -- 清理流式处理器（工具结果会触发新一轮生成，不需要触发 STREAM_COMPLETED）
           state.stream_processor.end_stream(generation_id)
 
@@ -695,7 +743,7 @@ function M._handle_stream_end(generation_id, params)
           })
         end
       end)
-      return  -- 由 vim.schedule 中的逻辑决定后续流程
+      return -- 由 vim.schedule 中的逻辑决定后续流程
     end
   end
 
@@ -873,7 +921,7 @@ function M.handle_ai_response(generation_id, response, params)
       end
     end
 
-    local tool_results = state.tool_orchestrator.execute_tool_loop({
+    local ok, tool_results = pcall(state.tool_orchestrator.execute_tool_loop, {
       generation_id = generation_id,
       tool_calls = tool_calls,
       session_id = session_id,
@@ -881,7 +929,10 @@ function M.handle_ai_response(generation_id, response, params)
       options = options,
     })
 
-    if tool_results and #tool_results > 0 then
+    if not ok then
+      -- 工具执行崩溃，记录错误并继续完成生成
+      logger.error(string.format("Tool execution crashed for generation %s: %s", generation_id, tostring(tool_results)))
+    elseif tool_results and #tool_results > 0 then
       -- 触发工具结果接收事件
       vim.api.nvim_exec_autocmds("User", {
         pattern = event_constants.TOOL_RESULT_RECEIVED,
@@ -961,6 +1012,20 @@ function M.handle_tool_result(data)
   end
   generation.messages = filtered_messages
 
+  -- 检查是否因 stop_tool_loop 而停止工具循环
+  -- 如果是，在继续请求 AI 之前插入一条 system 提示，要求 AI 对已完成的工作进行总结
+  local stop_requested = state.tool_orchestrator.is_stop_requested()
+  if stop_requested then
+    logger.info("stop_tool_loop 已调用，插入总结提示，要求 AI 对已完成工作进行总结")
+    -- 插入 system 提示，要求 AI 总结已完成的工作
+    table.insert(filtered_messages, {
+      role = "system",
+      content = "工具调用循环已结束。请根据所有工具执行的结果，对已完成的工作进行总结，然后返回最终结果给用户。总结应包括：完成了哪些任务、关键发现或结果、以及后续建议（如有）。"
+    })
+    -- 重置 stop_requested 标志，避免后续循环再次触发总结
+    state.tool_orchestrator.reset_stop_requested()
+  end
+
   -- 继续生成响应（沿用原始模型索引）
   -- 保持原始 stream 配置，不强制切换非流式
   -- request_builder 中会检测消息中是否包含 tool 角色，自动处理
@@ -1019,6 +1084,12 @@ function M.handle_generation_error(generation_id, error_msg)
   state.is_generating = false
   state.current_generation_id = nil
 
+  -- 生成出错时触发自动保存
+  local hm_ok, hm = pcall(require, "NeoAI.core.history_manager")
+  if hm_ok and hm and hm._save then
+    hm._save()
+  end
+
   -- logger.error(string.format("Generation error: id=%s, error=%s", generation_id, error_msg))
 end
 
@@ -1058,10 +1129,14 @@ function M.cancel_generation()
   state.is_generating = false
   state.current_generation_id = nil
 
+  -- 取消生成时触发自动保存
+  local hm_ok, hm = pcall(require, "NeoAI.core.history_manager")
+  if hm_ok and hm and hm._save then
+    hm._save()
+  end
+
   -- logger.info(string.format("Generation cancelled: id=%s", generation_id or "unknown"))
 end
-
-
 
 --- 设置引擎可用的工具函数
 --- @param tools table 工具函数表
@@ -1095,6 +1170,9 @@ function M.process_query(query, options)
   if not state.initialized then
     error("AI engine not initialized")
   end
+
+  -- 每次新的用户查询开始时重置 first_request，确保 stop_tool_loop 在第一轮被排除
+  state.request_builder.reset_first_request()
 
   -- 构建消息
   local messages = {
@@ -1331,12 +1409,16 @@ end
 --- @param callback function|nil 命名完成后的回调 (success: boolean, name_or_error: string)
 function M.auto_name_session(session_id, user_msg, callback)
   if not state.initialized then
-    if callback then callback(false, "AI engine not initialized") end
+    if callback then
+      callback(false, "AI engine not initialized")
+    end
     return
   end
 
   if not user_msg or user_msg == "" then
-    if callback then callback(false, "无用户消息") end
+    if callback then
+      callback(false, "无用户消息")
+    end
     return
   end
 
@@ -1352,12 +1434,15 @@ function M.auto_name_session(session_id, user_msg, callback)
       naming_preset = resolve_scenario_config("chat")
     end
     if not naming_preset or not naming_preset.base_url or not naming_preset.api_key then
-      if callback then callback(false, "未配置 AI 提供商") end
+      if callback then
+        callback(false, "未配置 AI 提供商")
+      end
       return
     end
 
     -- 构建命名请求
-    local system_prompt = "你是一个会话命名助手。根据用户的第一条消息，生成一个简短（不超过20个字符）且有意义的会话名称。只返回名称本身，不要加引号、标点或解释。"
+    local system_prompt =
+      "你是一个会话命名助手。根据用户的第一条消息，生成一个简短（不超过20个字符）且有意义的会话名称。只返回名称本身，不要加引号、标点或解释。"
     local messages = {
       { role = "system", content = system_prompt },
       { role = "user", content = "请为以下对话生成一个简短的名称：" .. naming_text },
@@ -1384,12 +1469,16 @@ function M.auto_name_session(session_id, user_msg, callback)
     })
 
     if err then
-      if callback then callback(false, "命名请求失败: " .. tostring(err)) end
+      if callback then
+        callback(false, "命名请求失败: " .. tostring(err))
+      end
       return
     end
 
     if not response or not response.choices or #response.choices == 0 then
-      if callback then callback(false, "命名响应无效") end
+      if callback then
+        callback(false, "命名响应无效")
+      end
       return
     end
 
@@ -1410,11 +1499,15 @@ function M.auto_name_session(session_id, user_msg, callback)
     end
 
     if name == "" then
-      if callback then callback(false, "生成的名称无效") end
+      if callback then
+        callback(false, "生成的名称无效")
+      end
       return
     end
 
-    if callback then callback(true, name) end
+    if callback then
+      callback(true, name)
+    end
   end)
 end
 

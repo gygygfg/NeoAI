@@ -118,21 +118,32 @@ local function _list_files(args)
       end
     end
   else
-    local find_cmd = "find " .. vim.fn.shellescape(dir) .. " -type f"
-    if not recursive then
-      find_cmd = find_cmd .. " -maxdepth 1"
-    end
-    if pattern ~= "*" then
-      find_cmd = find_cmd .. " -name " .. vim.fn.shellescape(pattern)
-    end
-    find_cmd = find_cmd .. " 2>/dev/null"
+    local ls_cmd = "ls"
     if recursive then
-      find_cmd = find_cmd .. " | head -100"
+      ls_cmd = ls_cmd .. " -laR"
+    else
+      ls_cmd = ls_cmd .. " -la"
     end
-    local output = vim.fn.systemlist(find_cmd)
+    ls_cmd = ls_cmd .. " --format=single-column --time-style=long-iso " .. vim.fn.shellescape(dir) .. " 2>/dev/null"
+    local output = vim.fn.systemlist(ls_cmd)
     if vim.v.shell_error == 0 then
+      local current_dir = ""
       for _, line in ipairs(output) do
-        table.insert(files, line)
+        if line:match("^$") then
+          -- skip
+        elseif line:match(":$") then
+          current_dir = line:gsub(":$", "")
+        elseif line ~= "." and line ~= ".." then
+          if pattern == "*" or line:match(vim.pesc(pattern):gsub("%%%*", ".*"):gsub("%%%?", ".")) then
+            local full_path
+            if recursive and current_dir ~= "" then
+              full_path = current_dir .. "/" .. line
+            else
+              full_path = dir .. "/" .. line
+            end
+            table.insert(files, full_path)
+          end
+        end
       end
     end
   end

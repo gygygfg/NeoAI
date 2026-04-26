@@ -11,7 +11,9 @@ local define_tool = require("NeoAI.tools.builtin.tool_helpers").define_tool
 -- ============================================================================
 
 local function _log_message(args)
+  print("[log_tools] log_message 开始, level=" .. tostring(args and args.level or "info"))
   if not args or not args.message then
+    print("[log_tools] log_message 结束: 缺少消息")
     return false
   end
 
@@ -30,6 +32,7 @@ local function _log_message(args)
   end
 
   vim.notify("[NeoAI Tool] " .. message, vim_level)
+  print("[log_tools] log_message 结束: 成功")
   return true
 end
 
@@ -60,6 +63,7 @@ M.log_message = define_tool({
 -- ============================================================================
 
 local function _get_log_levels(args)
+  print("[log_tools] get_log_levels")
   return { "info", "warn", "error", "debug" }
 end
 

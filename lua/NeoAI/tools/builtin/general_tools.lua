@@ -10,7 +10,9 @@ local define_tool = require("NeoAI.tools.builtin.tool_helpers").define_tool
 -- ============================================================================
 
 local function _merge_tables(args)
+  print("[general_tools] merge_tables 开始")
   if not args or not args.tables then
+    print("[general_tools] merge_tables 结束: 无参数")
     return {}
   end
 
@@ -18,9 +20,11 @@ local function _merge_tables(args)
   local mode = args.mode or "force"
 
   if #tables == 0 then
+    print("[general_tools] merge_tables 结束: 空表")
     return {}
   end
 
+  print("[general_tools] merge_tables: " .. #tables .. " 个表, mode=" .. mode)
   local result = {}
   for i, tbl in ipairs(tables) do
     if type(tbl) == "table" then
@@ -38,6 +42,7 @@ local function _merge_tables(args)
     end
   end
 
+  print("[general_tools] merge_tables 结束")
   return result
 end
 
@@ -72,7 +77,9 @@ M.merge_tables = define_tool({
 -- ============================================================================
 
 local function _table_contains(args)
+  print("[general_tools] table_contains 开始")
   if not args or not args.table or not args.value then
+    print("[general_tools] table_contains 结束: 缺少参数")
     return false
   end
 
@@ -80,23 +87,28 @@ local function _table_contains(args)
   local value = args.value
 
   if type(tbl) ~= "table" then
+    print("[general_tools] table_contains 结束: 不是表")
     return false
   end
 
   local value_str = tostring(value)
+  print("[general_tools] table_contains: 查找 " .. value_str)
 
   for _, v in ipairs(tbl) do
     if tostring(v) == value_str then
+      print("[general_tools] table_contains: 找到")
       return true
     end
   end
 
   for k, v in pairs(tbl) do
     if tostring(v) == value_str then
+      print("[general_tools] table_contains: 找到")
       return true
     end
   end
 
+  print("[general_tools] table_contains: 未找到")
   return false
 end
 
@@ -122,7 +134,9 @@ M.table_contains = define_tool({
 -- ============================================================================
 
 local function _starts_with(args)
+  print("[general_tools] starts_with 开始")
   if not args or not args.str or not args.prefix then
+    print("[general_tools] starts_with 结束: 缺少参数")
     return false
   end
 
@@ -135,7 +149,9 @@ local function _starts_with(args)
     prefix = prefix:lower()
   end
 
-  return str:sub(1, #prefix) == prefix
+  local result = str:sub(1, #prefix) == prefix
+  print("[general_tools] starts_with 结束: " .. tostring(result))
+  return result
 end
 
 M.starts_with = define_tool({

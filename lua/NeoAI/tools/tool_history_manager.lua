@@ -58,9 +58,12 @@ end
 --- @param session table 会话数据表
 --- @return number 返回新会话在列表中的索引（位置）
 function M.add_session(session)
+  print("[tool_history_manager] add_session: id=" .. tostring(session and session.id or "nil"))
+
   -- 如果会话没有ID，生成一个唯一ID
   if not session.id then
     session.id = "session_" .. os.time() .. "_" .. math.random(1000, 9999)
+    print("[tool_history_manager] add_session: 生成新ID=" .. session.id)
   end
 
   -- 设置时间戳
@@ -69,6 +72,7 @@ function M.add_session(session)
 
   -- 将会话添加到列表
   table.insert(state.sessions, session)
+  print("[tool_history_manager] add_session: 当前会话数=" .. #state.sessions)
 
   -- 清理旧会话，确保不超过最大数量限制
   M._cleanup_sessions()
@@ -80,6 +84,7 @@ end
 --- 获取所有会话的副本
 --- @return table 返回会话列表的深拷贝副本
 function M.get_sessions()
+  print("[tool_history_manager] get_sessions: " .. #state.sessions .. " 个会话")
   -- 使用深拷贝防止外部修改影响内部状态
   return vim.deepcopy(state.sessions)
 end
@@ -94,14 +99,17 @@ end
 --- @param session_id string 会话的唯一标识符
 --- @return table|nil 找到则返回会话的副本，否则返回nil
 function M.get_session(session_id)
+  print("[tool_history_manager] get_session: " .. tostring(session_id))
   -- 遍历所有会话查找匹配的ID
   for _, session in ipairs(state.sessions) do
     if session.id == session_id then
+      print("[tool_history_manager] get_session: 找到会话")
       -- 返回深拷贝，防止外部修改
       return vim.deepcopy(session)
     end
   end
 
+  print("[tool_history_manager] get_session: 未找到")
   -- 未找到返回nil
   return nil
 end
@@ -111,6 +119,7 @@ end
 --- @param updates table 包含更新字段的表
 --- @return boolean 成功返回true，失败返回false
 function M.update_session(session_id, updates)
+  print("[tool_history_manager] update_session: " .. tostring(session_id))
   -- 遍历查找目标会话
   for _, session in ipairs(state.sessions) do
     if session.id == session_id then
@@ -121,10 +130,12 @@ function M.update_session(session_id, updates)
 
       -- 更新修改时间
       session.updated_at = os.time()
+      print("[tool_history_manager] update_session: 成功")
       return true -- 更新成功
     end
   end
 
+  print("[tool_history_manager] update_session: 未找到会话")
   return false -- 未找到会话，更新失败
 end
 
@@ -132,15 +143,18 @@ end
 --- @param session_id string 要删除的会话ID
 --- @return boolean 成功删除返回true，否则返回false
 function M.delete_session(session_id)
+  print("[tool_history_manager] delete_session: " .. tostring(session_id))
   -- 遍历查找目标会话
   for i, session in ipairs(state.sessions) do
     if session.id == session_id then
       -- 从数组中移除该会话
       table.remove(state.sessions, i)
+      print("[tool_history_manager] delete_session: 成功")
       return true -- 删除成功
     end
   end
 
+  print("[tool_history_manager] delete_session: 未找到")
   return false -- 未找到会话，删除失败
 end
 
@@ -172,6 +186,9 @@ function M._cleanup_sessions()
     return
   end
 
+  local excess = #state.sessions - state.max_sessions
+  print("[tool_history_manager] _cleanup_sessions: 清理 " .. excess .. " 个旧会话")
+
   -- 按创建时间升序排序（最早的在前）
   table.sort(state.sessions, function(a, b)
     return a.created_at < b.created_at
@@ -181,6 +198,8 @@ function M._cleanup_sessions()
   while #state.sessions > state.max_sessions do
     table.remove(state.sessions, 1)
   end
+
+  print("[tool_history_manager] _cleanup_sessions: 完成，当前会话数=" .. #state.sessions)
 end
 
 --- 导出所有会话历史到文件
@@ -188,11 +207,14 @@ end
 --- @param filepath string 导出文件路径
 --- @return boolean, string|nil 导出是否成功，错误信息
 function M.export_sessions(filepath)
+  print("[tool_history_manager] export_sessions: " .. tostring(filepath))
   local ok, hm = pcall(require, "NeoAI.core.history_manager")
   if ok and hm.export_sessions then
+    print("[tool_history_manager] export_sessions: 委托给 core.history_manager")
     return hm.export_sessions(filepath)
   end
   -- 回退：使用本地实现
+  print("[tool_history_manager] export_sessions: 使用本地实现")
   local data = {
     sessions = state.sessions,
     config = state.config,
@@ -208,8 +230,10 @@ function M.export_sessions(filepath)
     file:close()
   end)
   if success then
+    print("[tool_history_manager] export_sessions: 成功")
     return true
   else
+    print("[tool_history_manager] export_sessions: 失败 - " .. tostring(err))
     return false, err
   end
 end
@@ -219,11 +243,14 @@ end
 --- @param filepath string 导入文件路径
 --- @return boolean, string|nil 导入是否成功，错误信息
 function M.import_sessions(filepath)
+  print("[tool_history_manager] import_sessions: " .. tostring(filepath))
   local ok, hm = pcall(require, "NeoAI.core.history_manager")
   if ok and hm.import_sessions then
+    print("[tool_history_manager] import_sessions: 委托给 core.history_manager")
     return hm.import_sessions(filepath)
   end
   -- 回退：使用本地实现
+  print("[tool_history_manager] import_sessions: 使用本地实现")
   local success, data = pcall(function()
     local file = io.open(filepath, "r")
     if not file then
@@ -234,16 +261,19 @@ function M.import_sessions(filepath)
     return vim.json.decode(content)
   end)
   if not success then
+    print("[tool_history_manager] import_sessions: 失败 - " .. tostring(data))
     return false, data
   end
   if data.sessions then
     state.sessions = data.sessions
+    print("[tool_history_manager] import_sessions: 导入 " .. #data.sessions .. " 个会话")
   end
   if data.config then
     for key, value in pairs(data.config) do
       state.config[key] = value
     end
   end
+  print("[tool_history_manager] import_sessions: 成功")
   return true, nil
 end
 

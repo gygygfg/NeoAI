@@ -165,7 +165,7 @@ local DEFAULT_CONFIG = {
     -- 全局默认值（当预设中未指定时使用）
     stream = true,
     timeout = 60000,
-    system_prompt = "你是一个AI编程助手，帮助用户解决编程问题。",
+    system_prompt = "你是一个AI编程助手，帮助用户解决编程问题。"
   },
   -- UI配置
   ui = {
@@ -217,7 +217,7 @@ local DEFAULT_CONFIG = {
     },
     chat = {
       send = {
-        insert = { key = "<CR>", desc = "发送消息" },
+        insert = { key = "<C-s>", desc = "发送消息" },
         normal = { key = "<CR>", desc = "发送消息" },
       },
       cancel = { key = "<Esc>", desc = "取消生成" },
@@ -753,10 +753,14 @@ function M._validate_and_clean(config)
 
   -- 验证会话配置
   if config.session then
-    if config.session.max_history_per_session
+    if
+      config.session.max_history_per_session
       and (type(config.session.max_history_per_session) ~= "number" or config.session.max_history_per_session < 1)
     then
-      vim.notify("[NeoAI] session.max_history_per_session must be a positive number. Using default.", vim.log.levels.WARN)
+      vim.notify(
+        "[NeoAI] session.max_history_per_session must be a positive number. Using default.",
+        vim.log.levels.WARN
+      )
       config.session.max_history_per_session = nil
     end
   end
@@ -791,7 +795,10 @@ function M._validate_ai_config(ai_config)
     local valid_scenarios = { "naming", "chat", "reasoning", "coding", "tools", "agent" }
     for name, entry in pairs(ai_config.scenarios) do
       if not vim.tbl_contains(valid_scenarios, name) then
-        vim.notify(string.format("[NeoAI] ai.scenarios.%s is not a valid scenario. Ignoring.", name), vim.log.levels.WARN)
+        vim.notify(
+          string.format("[NeoAI] ai.scenarios.%s is not a valid scenario. Ignoring.", name),
+          vim.log.levels.WARN
+        )
         ai_config.scenarios[name] = nil
       elseif type(entry) ~= "table" then
         vim.notify(string.format("[NeoAI] ai.scenarios.%s must be a table. Ignoring.", name), vim.log.levels.WARN)
@@ -865,8 +872,15 @@ function M._merge_with_defaults(config)
               if default_entry[1] and type(default_entry[1]) == "table" then
                 local merged = vim.deepcopy(default_entry[1])
                 for field, field_val in pairs(scenario_entry) do
-                  if merged[field] ~= nil or field == "provider" or field == "model_name"
-                    or field == "temperature" or field == "max_tokens" or field == "stream" or field == "timeout" then
+                  if
+                    merged[field] ~= nil
+                    or field == "provider"
+                    or field == "model_name"
+                    or field == "temperature"
+                    or field == "max_tokens"
+                    or field == "stream"
+                    or field == "timeout"
+                  then
                     merged[field] = field_val
                   end
                 end

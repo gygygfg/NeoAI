@@ -66,8 +66,6 @@ function M.initialize(config)
   state.max_history_size = config.max_history_size or 100
   state.execution_history = {}
   state.initialized = true
-
-  -- vim.notify("工具执行器初始化完成")
 end
 
 --- 执行工具
@@ -76,35 +74,45 @@ end
 --- @return any 执行结果
 function M.execute(tool_name, args)
   if not state.initialized then
+    print("[tool_executor] execute 失败: 未初始化")
     error("工具执行器未初始化，请先调用 M.initialize(config)")
   end
 
   if not tool_name then
+    print("[tool_executor] execute 失败: 工具名称为空")
     error("工具名称是必需的")
   end
+
+  print("[tool_executor] execute 开始: " .. tool_name)
 
   -- 获取工具定义
   local tool = tool_registry.get(tool_name)
   if not tool then
     local error_msg = "工具不存在: " .. tool_name
+    print("[tool_executor] execute 失败: " .. error_msg)
     M._record_execution(tool_name, args, nil, error_msg)
     return error_msg
   end
+  print("[tool_executor] 找到工具定义: " .. tool_name)
 
   -- 验证参数
   local valid, error_msg = M.validate_args(tool, args)
   if not valid then
+    print("[tool_executor] 参数验证失败: " .. (error_msg or "未知错误"))
     M._record_execution(tool_name, args, nil, error_msg)
     return error_msg
   end
+  print("[tool_executor] 参数验证通过")
 
   -- 检查权限
   if tool.permissions then
     local has_permission, perm_error = tool_validator.check_permissions(tool)
     if not has_permission then
+      print("[tool_executor] 权限检查失败: " .. (perm_error or "无权限"))
       M._record_execution(tool_name, args, nil, perm_error)
       return perm_error
     end
+    print("[tool_executor] 权限检查通过")
   end
 
   -- 记录开始时间
@@ -122,10 +130,14 @@ function M.execute(tool_name, args)
   local max_retries = state.config.max_retries or 0
   local retry_delay = state.config.retry_delay or 1
 
+  print("[tool_executor] 调用 safe_call: max_retries=" .. max_retries .. ", retry_delay=" .. retry_delay)
+
   -- 安全调用工具函数
   local result, call_error = M.safe_call(tool.func, args, max_retries, retry_delay)
   local end_time = os.time()
   local duration = end_time - start_time
+
+  print("[tool_executor] safe_call 返回: result=" .. tostring(result) .. ", error=" .. tostring(call_error))
 
   -- 触发工具执行完成事件
   if vim and vim.api and vim.api.nvim_exec_autocmds then
@@ -138,6 +150,7 @@ function M.execute(tool_name, args)
   -- 处理执行结果
   if call_error and call_error ~= "" then
     local full_error_msg = "工具执行错误: " .. call_error
+    print("[tool_executor] 执行错误: " .. full_error_msg)
 
     -- 触发工具执行错误事件
     if vim and vim.api and vim.api.nvim_exec_autocmds then
@@ -153,10 +166,12 @@ function M.execute(tool_name, args)
 
   -- 格式化结果
   local formatted_result = M.format_result(result)
+  print("[tool_executor] 执行成功, 结果长度=" .. #tostring(formatted_result))
 
   -- 记录执行历史
   M._record_execution(tool_name, args, formatted_result, nil, duration)
 
+  print("[tool_executor] execute 结束: " .. tool_name)
   return formatted_result
 end
 
@@ -174,16 +189,20 @@ end
 --- @return boolean, string|nil 是否有效，错误信息（成功时为nil）
 function M.validate_args(tool, args)
   if not tool then
+    print("[tool_executor] validate_args: 工具定义无效")
     return false, "工具定义无效"
   end
 
   -- 如果没有参数定义，接受任何参数
   if not tool.parameters then
+    print("[tool_executor] validate_args: 无参数定义，接受任何参数")
     return true, ""
   end
 
   -- 使用工具验证器验证参数
-  return tool_validator.validate_parameters(tool.parameters, args)
+  local valid, err = tool_validator.validate_parameters(tool.parameters, args)
+  print("[tool_executor] validate_args: valid=" .. tostring(valid) .. ", err=" .. tostring(err))
+  return valid, err
 end
 
 --- 格式化结果
@@ -191,29 +210,39 @@ end
 --- @return string 格式化后的结果
 function M.format_result(result)
   if result == nil then
+    print("[tool_executor] format_result: nil -> 'null'")
     return "null"
   end
 
   local result_type = type(result)
+  print("[tool_executor] format_result: type=" .. result_type)
 
   if result_type == "string" then
+    print("[tool_executor] format_result: 字符串, 长度=" .. #result)
     return result
   elseif result_type == "number" or result_type == "boolean" then
-    return tostring(result)
+    local str = tostring(result)
+    print("[tool_executor] format_result: " .. result_type .. " -> " .. str)
+    return str
   elseif result_type == "table" then
     -- 尝试转换为JSON
     local json_encode = vim and vim.json and vim.json.encode
     if json_encode then
       local ok, json = pcall(json_encode, result)
       if ok then
+        print("[tool_executor] format_result: table -> JSON, 长度=" .. #json)
         return json
       end
     end
 
     -- 如果无法转换为JSON，使用简单的表格表示
-    return M._table_to_string(result)
+    local str = M._table_to_string(result)
+    print("[tool_executor] format_result: table -> string, 长度=" .. #str)
+    return str
   else
-    return tostring(result)
+    local str = tostring(result)
+    print("[tool_executor] format_result: " .. result_type .. " -> " .. str)
+    return str
   end
 end
 
@@ -249,6 +278,8 @@ end
 --- @param error_msg string 错误信息
 --- @return string 格式化后的错误信息
 function M.handle_error(error_msg)
+  print("[tool_executor] handle_error: " .. error_msg)
+
   -- 分析错误类型
   local error_type = "未知错误"
 
@@ -274,6 +305,7 @@ function M.handle_error(error_msg)
     M._log_error(detailed_error)
   end
 
+  print("[tool_executor] handle_error 返回: " .. detailed_error)
   return detailed_error
 end
 
@@ -300,6 +332,7 @@ end
 --- @return any, string|nil 执行结果，错误信息（成功时为nil）
 function M.safe_call(func, args, max_retries, retry_delay)
   if not func then
+    print("[tool_executor] safe_call: 函数为空")
     return nil, "函数不能为空"
   end
 
@@ -310,11 +343,13 @@ function M.safe_call(func, args, max_retries, retry_delay)
 
   for attempt = 0, max_retries do
     if attempt > 0 then
+      print("[tool_executor] safe_call: 第 " .. attempt .. " 次重试...")
       -- 重试前等待
       sleep(retry_delay)
     end
 
     local start_time = os.time()
+    print("[tool_executor] safe_call: 调用函数 (attempt=" .. attempt .. ")")
     -- 使用 select 捕获所有返回值，避免 pcall 只捕获第一个返回值
     local success, result, err_msg = pcall(func, args)
     -- 如果函数返回了多个值（如 return nil, "error msg"），pcall 只捕获前两个
@@ -322,8 +357,10 @@ function M.safe_call(func, args, max_retries, retry_delay)
     if not success then
       -- pcall 捕获到异常（函数内部抛出的 error）
       last_error = tostring(result)
+      print("[tool_executor] safe_call: pcall 异常 - " .. last_error)
       if attempt < max_retries then
         local should_retry = M._should_retry_error(last_error)
+        print("[tool_executor] safe_call: 是否重试? " .. tostring(should_retry))
         if not should_retry then
           break
         end
@@ -334,14 +371,17 @@ function M.safe_call(func, args, max_retries, retry_delay)
       if result == nil and err_msg ~= nil then
         -- 函数返回了 nil, error_msg
         last_error = tostring(err_msg)
+        print("[tool_executor] safe_call: 函数返回错误 - " .. last_error)
         if attempt < max_retries then
           local should_retry = M._should_retry_error(last_error)
+          print("[tool_executor] safe_call: 是否重试? " .. tostring(should_retry))
           if not should_retry then
             break
           end
         end
       else
         -- 函数执行成功，返回结果
+        print("[tool_executor] safe_call: 执行成功")
         return result, nil
       end
     end
@@ -349,6 +389,7 @@ function M.safe_call(func, args, max_retries, retry_delay)
     local duration = end_time - start_time
   end
 
+  print("[tool_executor] safe_call: 最终失败 - " .. (last_error or "未知错误"))
   return nil, "安全调用失败: " .. (last_error or "未知错误")
 end
 
@@ -375,10 +416,12 @@ function M._should_retry_error(error_msg)
 
   for _, error_pattern in ipairs(non_retryable_errors) do
     if string.find(error_msg, error_pattern) then
+      print("[tool_executor] _should_retry_error: 匹配到不可重试模式 '" .. error_pattern .. "'，不重试")
       return false
     end
   end
 
+  print("[tool_executor] _should_retry_error: 可重试")
   return true
 end
 
@@ -391,6 +434,7 @@ function M.cleanup()
   -- 清理执行历史
   if #state.execution_history > state.max_history_size then
     local excess = #state.execution_history - state.max_history_size
+    print("[tool_executor] cleanup: 清理 " .. excess .. " 条旧记录")
     for i = 1, excess do
       table.remove(state.execution_history, 1)
     end
@@ -489,17 +533,28 @@ end
 --- @param error_msg string|nil 错误信息
 --- @param duration number|nil 执行时长
 function M._record_execution(tool_name, args, result, error_msg, duration)
+  local success = error_msg == nil
+  print(
+    "[tool_executor] _record_execution: "
+      .. tool_name
+      .. ", success="
+      .. tostring(success)
+      .. ", duration="
+      .. tostring(duration)
+  )
+
   local record = {
     tool_name = tool_name,
     args = vim_deepcopy(args),
     result = result,
     error = error_msg,
-    success = error_msg == nil,
+    success = success,
     timestamp = os.time(),
     duration = duration or 0,
   }
 
   table.insert(state.execution_history, record)
+  print("[tool_executor] 历史记录数: " .. #state.execution_history)
 
   -- 清理旧记录
   M.cleanup()
@@ -510,15 +565,18 @@ end
 --- @return table 执行结果列表
 function M.batch_execute(executions)
   if not state.initialized then
+    print("[tool_executor] batch_execute 失败: 未初始化")
     error("工具执行器未初始化")
   end
 
+  print("[tool_executor] batch_execute: " .. #executions .. " 个任务")
   local results = {}
 
-  for _, exec in ipairs(executions) do
+  for i, exec in ipairs(executions) do
     local tool_name = exec[1]
     local args = exec[2] or {}
 
+    print("[tool_executor] batch_execute #" .. i .. ": " .. tool_name)
     local result = M.execute(tool_name, args)
     table.insert(results, {
       tool_name = tool_name,
@@ -527,6 +585,7 @@ function M.batch_execute(executions)
     })
   end
 
+  print("[tool_executor] batch_execute 完成")
   return results
 end
 
@@ -536,21 +595,28 @@ end
 --- @param callback function 回调函数
 function M.execute_async(tool_name, args, callback)
   if not state.initialized then
+    print("[tool_executor] execute_async 失败: 未初始化")
     error("工具执行器未初始化")
   end
 
   if not callback or type(callback) ~= "function" then
+    print("[tool_executor] execute_async 失败: 缺少回调函数")
     error("回调函数是必需的")
   end
+
+  print("[tool_executor] execute_async: " .. tool_name)
 
   -- 在后台执行
   if vim and vim.schedule then
     vim.schedule(function()
+      print("[tool_executor] execute_async vim.schedule 开始执行")
       local result = M.execute(tool_name, args)
+      print("[tool_executor] execute_async 执行完成，调用回调")
       callback(result)
     end)
   else
     -- 如果没有 vim.schedule，直接同步执行
+    print("[tool_executor] execute_async 同步执行")
     local result = M.execute(tool_name, args)
     callback(result)
   end
@@ -560,11 +626,14 @@ end
 --- @param new_config table 新配置
 function M.update_config(new_config)
   if not state.initialized then
+    print("[tool_executor] update_config 跳过: 未初始化")
     return
   end
 
+  print("[tool_executor] update_config")
   state.config = vim.tbl_extend("force", state.config, new_config or {})
   state.max_history_size = state.config.max_history_size or state.max_history_size
+  print("[tool_executor] update_config 完成")
 end
 
 -- 测试函数

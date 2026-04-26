@@ -22,7 +22,7 @@ function M.initialize(config)
   -- 尝试从文件加载保存的配置
   M.load_keymaps()
 
-  vim.notify("[NeoAI] 键位配置管理器已初始化", vim.log.levels.INFO)
+  -- vim.notify("[NeoAI] 键位配置管理器已初始化", vim.log.levels.INFO)
 end
 
 --- 加载已合并的键位配置

@@ -14,6 +14,7 @@ local state = {
   tools = {}, -- 注册的工具表，键为工具名，值为工具定义
   max_iterations = 10, -- 最大工具调用迭代次数
   current_iteration = 0, -- 当前迭代次数
+  stop_requested = false, -- 是否请求停止工具循环
 }
 
 --- 初始化工具编排器
@@ -37,10 +38,18 @@ end
 --- @return table|nil 工具结果列表
 function M.execute_tool_loop(params)
   if not state.initialized then
+    print("[tool_orchestrator] execute_tool_loop 失败: 未初始化")
     error("Tool orchestrator not initialized")
   end
 
   if not next(state.tools) then
+    print("[tool_orchestrator] execute_tool_loop: 无可用工具，跳过")
+    -- 调试：列出所有已注册的工具
+    local tool_names = {}
+    for name, _ in pairs(state.tools) do
+      table.insert(tool_names, name)
+    end
+    print("[tool_orchestrator] 已注册工具: " .. (#tool_names > 0 and table.concat(tool_names, ", ") or "无"))
     return nil
   end
 
@@ -51,10 +60,12 @@ function M.execute_tool_loop(params)
   local options = params.options or {}
 
   if #tool_calls == 0 then
+    print("[tool_orchestrator] execute_tool_loop: 无工具调用，跳过")
     return nil
   end
 
   state.current_iteration = 0
+  state.stop_requested = false
   local tool_results = {}
 
   -- 触发工具循环开始事件
@@ -69,10 +80,14 @@ function M.execute_tool_loop(params)
     },
   })
 
-  -- logger.info(string.format("Tool loop started for generation %s: %d tool calls", generation_id, #tool_calls))
-
   -- 执行每个工具调用
-  for _, tool_call in ipairs(tool_calls) do
+  for i, tool_call in ipairs(tool_calls) do
+    -- 检查是否收到停止请求
+    if state.stop_requested then
+      logger.info(string.format("Tool loop stop requested, stopping after %d tools executed", state.current_iteration))
+      break
+    end
+
     local result = M.execute_tool({
       generation_id = generation_id,
       tool_call = tool_call,
@@ -80,12 +95,15 @@ function M.execute_tool_loop(params)
       window_id = window_id,
     })
 
-    if result then
-      table.insert(tool_results, {
-        tool_call = tool_call,
-        result = result,
-      })
-    end
+    -- if result then
+    --   print("[tool_orchestrator] 工具 #" .. i .. " 结果长度=" .. #tostring(result))
+    --   table.insert(tool_results, {
+    --     tool_call = tool_call,
+    --     result = result,
+    --   })
+    -- else
+    --   print("[tool_orchestrator] 工具 #" .. i .. " 返回空结果")
+    -- end
   end
 
   -- 触发工具循环结束事件
@@ -99,8 +117,6 @@ function M.execute_tool_loop(params)
       window_id = window_id,
     },
   })
-
-  -- logger.info(string.format("Tool loop finished for generation %s: %d results", generation_id, #tool_results))
 
   return tool_results
 end
@@ -117,12 +133,15 @@ function M.execute_tool(params)
   -- 兼容两种字段名：function（OpenAI 标准）和 func（旧格式）
   local tool_func = tool_call["function"] or tool_call.func
   if not tool_call or not tool_func then
+    print("[tool_orchestrator] execute_tool: 无效的工具调用")
     logger.warn(string.format("Invalid tool call for generation %s", generation_id))
     return nil
   end
 
   local tool_name = tool_func.name
   local arguments_str = tool_func.arguments
+
+  -- print("[tool_orchestrator] execute_tool: " .. tool_name .. " (generation=" .. tostring(generation_id) .. ")")
 
   -- 解析参数
   local arguments = {}
@@ -131,6 +150,7 @@ function M.execute_tool(params)
     if ok and parsed then
       arguments = parsed
     else
+      print("[tool_orchestrator] 参数解析失败: " .. arguments_str)
       logger.warn(string.format("Failed to parse arguments for tool %s: %s", tool_name, arguments_str))
     end
   end
@@ -164,14 +184,17 @@ function M.execute_tool(params)
       result = tool_result
     else
       error_msg = tostring(tool_result)
+      print("[tool_orchestrator] 工具执行失败: " .. error_msg)
       logger.error(string.format("Tool execution error for %s: %s", tool_name, error_msg))
     end
   else
     error_msg = string.format("Tool not found: %s", tool_name)
+    print("[tool_orchestrator] " .. error_msg)
     logger.warn(error_msg)
   end
 
   local duration = os.time() - start_time
+  -- print("[tool_orchestrator] 执行耗时: " .. duration .. "s")
 
   -- 触发工具执行完成事件
   if error_msg then
@@ -217,6 +240,7 @@ function M.execute_tool(params)
       final_result = tostring(final_result)
     end
   end
+  print("[tool_orchestrator] execute_tool 返回, 长度=" .. #final_result)
   return final_result
 end
 
@@ -224,6 +248,10 @@ end
 --- @param tools table 工具表
 function M.set_tools(tools)
   state.tools = tools or {}
+  local count = 0
+  for _ in pairs(state.tools) do
+    count = count + 1
+  end
   logger.debug(string.format("Tool orchestrator tools set: %d tools available", vim.tbl_count(state.tools)))
 end
 
@@ -232,6 +260,7 @@ end
 --- @return table 工具调用列表
 function M.extract_tool_calls(response)
   if not response or not response.choices or #response.choices == 0 then
+    print("[tool_orchestrator] extract_tool_calls: 无响应或空 choices")
     return {}
   end
 
@@ -239,20 +268,26 @@ function M.extract_tool_calls(response)
   local choice = response.choices[1]
 
   if choice.message and choice.message.tool_calls then
+    print("[tool_orchestrator] extract_tool_calls: 发现 " .. #choice.message.tool_calls .. " 个工具调用")
     for _, tool_call in ipairs(choice.message.tool_calls) do
       -- 兼容两种字段名：function（OpenAI 标准）和 func（旧格式）
       local tool_func = tool_call["function"] or tool_call.func
+      local name = tool_func and tool_func.name or ""
+      print("[tool_orchestrator] extract_tool_calls: 工具 " .. name)
       table.insert(tool_calls, {
         id = tool_call.id,
         type = tool_call.type,
         ["function"] = {
-          name = tool_func and tool_func.name or "",
+          name = name,
           arguments = tool_func and tool_func.arguments or "",
         },
       })
     end
+  else
+    print("[tool_orchestrator] extract_tool_calls: 消息中无 tool_calls")
   end
 
+  print("[tool_orchestrator] extract_tool_calls: 返回 " .. #tool_calls .. " 个")
   return tool_calls
 end
 
@@ -261,13 +296,16 @@ end
 --- @return table 上下文消息
 function M.build_context(tool_results)
   if not tool_results or #tool_results == 0 then
+    print("[tool_orchestrator] build_context: 无工具结果")
     return {}
   end
 
+  print("[tool_orchestrator] build_context: " .. #tool_results .. " 个结果")
   local context_messages = {}
 
-  for _, result in ipairs(tool_results) do
+  for i, result in ipairs(tool_results) do
     if result.tool_call and result.result then
+      print("[tool_orchestrator] build_context #" .. i .. ": 添加 assistant + tool 消息")
       table.insert(context_messages, {
         role = "assistant",
         tool_calls = { result.tool_call },
@@ -277,6 +315,7 @@ function M.build_context(tool_results)
       local safe_id = result.tool_call.id
       if not safe_id or safe_id == "" then
         safe_id = "call_" .. tostring(os.time()) .. "_" .. tostring(math.random(10000, 99999))
+        print("[tool_orchestrator] build_context: 生成 fallback ID: " .. safe_id)
         logger.warn(string.format("build_context: tool_call.id is nil or empty, generated fallback: %s", safe_id))
       end
 
@@ -285,9 +324,12 @@ function M.build_context(tool_results)
         tool_call_id = safe_id,
         content = M.format_tool_result(result.result) or "",
       })
+    else
+      print("[tool_orchestrator] build_context #" .. i .. ": 跳过（缺少 tool_call 或 result）")
     end
   end
 
+  print("[tool_orchestrator] build_context: 返回 " .. #context_messages .. " 条消息")
   return context_messages
 end
 
@@ -310,6 +352,29 @@ end
 function M.should_continue(tool_results)
   -- 简单实现：如果有工具结果就继续
   return tool_results and #tool_results > 0
+end
+
+--- 请求停止工具调用循环
+--- 当 AI 认为任务已完成时，调用此方法触发循环结束
+function M.request_stop()
+  print("[tool_orchestrator] request_stop: 请求停止工具循环")
+  state.stop_requested = true
+  logger.info("Tool loop stop requested")
+end
+
+--- 检查是否已请求停止
+--- @return boolean 是否已请求停止
+function M.is_stop_requested()
+  return state.stop_requested
+end
+
+--- 重置停止请求标志
+--- 在 handle_tool_result 中处理完 stop_tool_loop 后调用，
+--- 避免后续循环再次触发总结提示
+function M.reset_stop_requested()
+  print("[tool_orchestrator] reset_stop_requested: 重置停止请求标志")
+  state.stop_requested = false
+  logger.info("Tool loop stop request flag reset")
 end
 
 --- 获取当前迭代次数
@@ -393,8 +458,11 @@ end
 --- 关闭工具编排器
 function M.shutdown()
   if not state.initialized then
+    print("[tool_orchestrator] shutdown: 未初始化，跳过")
     return
   end
+
+  print("[tool_orchestrator] shutdown: 关闭工具编排器")
 
   -- 清理工具
   state.tools = {}
@@ -403,6 +471,7 @@ function M.shutdown()
   state.initialized = false
   state.current_iteration = 0
 
+  print("[tool_orchestrator] shutdown 完成")
   logger.info("Tool orchestrator shutdown")
 end
 

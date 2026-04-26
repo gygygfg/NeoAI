@@ -202,6 +202,7 @@ end
 --- @return boolean, string|nil 是否有效，错误信息（成功时为nil）
 function M.validate_parameters(schema, params)
   if not schema then
+    print("[tool_validator] validate_parameters: 无模式定义，接受任何参数")
     return true, nil -- 没有模式，接受任何参数
   end
 
@@ -210,13 +211,17 @@ function M.validate_parameters(schema, params)
   end
 
   if type(params) ~= "table" then
+    print("[tool_validator] validate_parameters: 参数不是表")
     return false, "参数必须是表"
   end
+
+  print("[tool_validator] validate_parameters: 开始验证")
 
   -- 验证必需字段
   if schema.required then
     for _, req_field in ipairs(schema.required) do
       if params[req_field] == nil then
+        print("[tool_validator] validate_parameters: 缺少必需字段 - " .. req_field)
         return false, "缺少必需字段: " .. req_field
       end
     end
@@ -231,17 +236,20 @@ function M.validate_parameters(schema, params)
         -- 有模式定义，验证参数
         local valid, error_msg = M._validate_value(param_value, prop_schema)
         if not valid then
+          print("[tool_validator] validate_parameters: 参数 '" .. param_name .. "' 无效: " .. error_msg)
           return false, "参数 '" .. param_name .. "' 无效: " .. error_msg
         end
       else
         -- 没有模式定义，检查是否允许额外属性
         if schema.additionalProperties == false then
+          print("[tool_validator] validate_parameters: 不允许额外属性 - " .. param_name)
           return false, "不允许额外属性: " .. param_name
         end
       end
     end
   end
 
+  print("[tool_validator] validate_parameters: 验证通过")
   return true, nil
 end
 
@@ -294,16 +302,17 @@ end
 --- @return boolean, string|nil 是否有权限，错误信息（成功时为nil）
 function M.check_permissions(tool)
   if not tool or not tool.permissions then
+    print("[tool_validator] check_permissions: 无权限限制，通过")
     return true, nil -- 没有权限限制
   end
 
+  print("[tool_validator] check_permissions: 检查工具权限")
   local permissions = tool.permissions
 
   -- 检查读取权限
   if permissions.read then
-    -- 这里可以实现具体的权限检查逻辑
-    -- 目前只是简单检查
     if permissions.read == "restricted" then
+      print("[tool_validator] check_permissions: 读取权限受限")
       return false, "没有读取权限"
     end
   end
@@ -311,6 +320,7 @@ function M.check_permissions(tool)
   -- 检查写入权限
   if permissions.write then
     if permissions.write == "restricted" then
+      print("[tool_validator] check_permissions: 写入权限受限")
       return false, "没有写入权限"
     end
   end
@@ -318,6 +328,7 @@ function M.check_permissions(tool)
   -- 检查执行权限
   if permissions.execute then
     if permissions.execute == "restricted" then
+      print("[tool_validator] check_permissions: 执行权限受限")
       return false, "没有执行权限"
     end
   end
@@ -325,6 +336,7 @@ function M.check_permissions(tool)
   -- 检查网络权限
   if permissions.network then
     if permissions.network == "restricted" then
+      print("[tool_validator] check_permissions: 网络权限受限")
       return false, "没有网络访问权限"
     end
   end
@@ -332,10 +344,12 @@ function M.check_permissions(tool)
   -- 检查文件系统权限
   if permissions.filesystem then
     if permissions.filesystem == "restricted" then
+      print("[tool_validator] check_permissions: 文件系统权限受限")
       return false, "没有文件系统访问权限"
     end
   end
 
+  print("[tool_validator] check_permissions: 权限检查通过")
   return true, nil
 end
 
@@ -344,15 +358,18 @@ end
 --- @return boolean, string|nil 是否有效，错误信息（成功时为nil）
 function M.validate_tool(tool)
   if not tool then
+    print("[tool_validator] validate_tool: 工具定义为空")
     return false, "工具定义不能为空"
   end
 
   -- 检查必需字段
   if not tool.name or type(tool.name) ~= "string" then
+    print("[tool_validator] validate_tool: 名称无效")
     return false, "工具名称必须是字符串"
   end
 
   if not tool.func or type(tool.func) ~= "function" then
+    print("[tool_validator] validate_tool: 函数无效")
     return false, "工具函数必须是函数"
   end
 
@@ -360,6 +377,7 @@ function M.validate_tool(tool)
   if tool.parameters then
     local valid, error_msg = M.validate_schema(tool.parameters)
     if not valid then
+      print("[tool_validator] validate_tool: 参数模式无效 - " .. error_msg)
       return false, "参数模式无效: " .. error_msg
     end
   end
@@ -368,6 +386,7 @@ function M.validate_tool(tool)
   if tool.returns then
     local valid, error_msg = M.validate_schema(tool.returns)
     if not valid then
+      print("[tool_validator] validate_tool: 返回类型模式无效 - " .. error_msg)
       return false, "返回类型模式无效: " .. error_msg
     end
   end
@@ -375,6 +394,7 @@ function M.validate_tool(tool)
   -- 验证权限（如果存在）
   if tool.permissions then
     if type(tool.permissions) ~= "table" then
+      print("[tool_validator] validate_tool: 权限类型无效")
       return false, "权限必须是表"
     end
   end
@@ -388,12 +408,16 @@ end
 --- @return table 验证结果 {valid = boolean, error = string}
 function M.validate_tool_call(tool_call, tool_registry)
   if not tool_call or not tool_call.name then
+    print("[tool_validator] validate_tool_call: 缺少工具名称")
     return { valid = false, error = "工具调用缺少名称" }
   end
+
+  print("[tool_validator] validate_tool_call: " .. tool_call.name)
 
   -- 检查工具是否存在
   local tool = tool_registry[tool_call.name] or tool_registry.get_tool and tool_registry.get_tool(tool_call.name)
   if not tool then
+    print("[tool_validator] validate_tool_call: 工具不存在 - " .. tool_call.name)
     return { valid = false, error = "工具不存在: " .. tool_call.name }
   end
 
@@ -404,6 +428,7 @@ function M.validate_tool_call(tool_call, tool_registry)
   if tool.parameters and tool.parameters.required then
     for _, required_param in ipairs(tool.parameters.required) do
       if arguments[required_param] == nil then
+        print("[tool_validator] validate_tool_call: 缺少必需参数 - " .. required_param)
         return { valid = false, error = "缺少必需参数: " .. required_param }
       end
     end
@@ -417,10 +442,13 @@ function M.validate_tool_call(tool_call, tool_registry)
         -- 基本类型检查
         local param_type = param_schema.type
         if param_type == "string" and type(value) ~= "string" then
+          print("[tool_validator] validate_tool_call: 参数类型错误 - " .. param_name)
           return { valid = false, error = "参数类型错误: " .. param_name .. " 应为字符串" }
         elseif param_type == "number" and type(value) ~= "number" then
+          print("[tool_validator] validate_tool_call: 参数类型错误 - " .. param_name)
           return { valid = false, error = "参数类型错误: " .. param_name .. " 应为数字" }
         elseif param_type == "boolean" and type(value) ~= "boolean" then
+          print("[tool_validator] validate_tool_call: 参数类型错误 - " .. param_name)
           return { valid = false, error = "参数类型错误: " .. param_name .. " 应为布尔值" }
         end
 
@@ -435,6 +463,7 @@ function M.validate_tool_call(tool_call, tool_registry)
           end
 
           if not valid then
+            print("[tool_validator] validate_tool_call: 枚举值无效 - " .. param_name)
             return {
               valid = false,
               error = "参数值无效: " .. param_name .. " 应为 " .. table.concat(param_schema.enum, ", "),
@@ -445,6 +474,7 @@ function M.validate_tool_call(tool_call, tool_registry)
     end
   end
 
+  print("[tool_validator] validate_tool_call: 验证通过")
   return { valid = true }
 end
 
@@ -453,18 +483,22 @@ end
 --- @return boolean, string|nil 是否成功，错误信息（成功时为nil）
 function M.update_config(new_config)
   if not state.initialized then
+    print("[tool_validator] update_config 失败: 未初始化")
     return false, "验证器未初始化"
   end
 
   if type(new_config) ~= "table" then
+    print("[tool_validator] update_config 失败: 配置不是表")
     return false, "配置必须是表"
   end
 
+  print("[tool_validator] update_config")
   -- 合并配置
   for k, v in pairs(new_config) do
     state.config[k] = v
   end
 
+  print("[tool_validator] update_config 完成")
   return true, "配置更新成功"
 end
 
