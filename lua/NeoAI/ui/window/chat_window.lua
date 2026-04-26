@@ -2472,8 +2472,8 @@ end
 --- @return string|nil 模型标签，如 "deepseek/deepseek-chat"
 function M._get_current_model_label()
   local default_config = require("NeoAI.default_config")
-  local candidates = default_config.get_scenario_candidates("chat")
-  local target = candidates[state.current_model_index]
+  local models = default_config.get_available_models("chat")
+  local target = models[state.current_model_index]
   if target then
     return string.format("%s/%s", target.provider or "?", target.model_name or "?")
   end
@@ -2494,23 +2494,23 @@ function M.show_model_selector()
   end
 
   local default_config = require("NeoAI.default_config")
-  local candidates = default_config.get_scenario_candidates("chat")
+  local models = default_config.get_available_models("chat")
 
-  if #candidates == 0 then
-    vim.notify("[NeoAI] 没有可用的场景候选（请检查 scenarios.chat 配置）", vim.log.levels.WARN)
+  if #models == 0 then
+    vim.notify("[NeoAI] 没有可用的模型（请检查 API key 配置）", vim.log.levels.WARN)
     return
   end
 
   -- 构建选择菜单项
   local items = {}
-  for i, c in ipairs(candidates) do
+  for i, m in ipairs(models) do
     local indicator = (i == state.current_model_index) and "✓ " or "  "
-    table.insert(items, string.format("%s%s/%s", indicator, c.provider or "?", c.model_name or "?"))
+    table.insert(items, string.format("%s%s/%s", indicator, m.provider or "?", m.model_name or "?"))
   end
 
   -- 获取当前模型名用于提示
   local current_label = "未知"
-  local current = candidates[state.current_model_index]
+  local current = models[state.current_model_index]
   if current then
     current_label = string.format("%s/%s", current.provider or "?", current.model_name or "?")
   end
@@ -2535,10 +2535,10 @@ function M.switch_to_model(model_index)
   end
 
   local default_config = require("NeoAI.default_config")
-  local candidates = default_config.get_scenario_candidates("chat")
+  local models = default_config.get_available_models("chat")
 
   -- 查找目标模型
-  local target = candidates[model_index]
+  local target = models[model_index]
   if not target then
     vim.notify("[NeoAI] 无效的模型索引: " .. tostring(model_index), vim.log.levels.WARN)
     return
