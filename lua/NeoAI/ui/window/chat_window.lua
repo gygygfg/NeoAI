@@ -42,6 +42,11 @@ local state = {
     buffer = "", -- 累积的工具调用内容
     results = {}, -- 所有工具调用结果，用于生成折叠文本
   },
+
+  -- 工具调用循环进行中标志
+  -- 在 TOOL_LOOP_STARTED 中设为 true，在 GENERATION_COMPLETED 中设为 false
+  -- 用于阻止工具循环过程中打开虚拟输入框
+  tool_loop_in_progress = false,
 }
 
 --- 初始化聊天窗口
@@ -643,6 +648,12 @@ function M._open_float_input()
 
   -- 如果已激活，跳过
   if virtual_input.is_active() then
+    return
+  end
+
+  -- 工具调用循环进行中时不打开虚拟输入框
+  -- 避免在工具循环过程中（TOOL_LOOP_FINISHED 之后、新一轮生成开始前）误开输入框
+  if state.tool_loop_in_progress then
     return
   end
 
@@ -1532,6 +1543,9 @@ function M._setup_event_listeners()
       state.streaming.reasoning_active = false
       state.streaming.reasoning_done = false
 
+      -- 标记工具调用循环已结束（最终 AI 回复完成）
+      state.tool_loop_in_progress = false
+
       -- 全量重渲染
       M.render_chat()
 
@@ -1859,6 +1873,15 @@ function M._setup_event_listeners()
         return
       end
 
+      -- 工具调用开始意味着思考已经结束，关闭思考过程悬浮窗口
+      local reasoning_display = require("NeoAI.ui.components.reasoning_display")
+      if reasoning_display.is_visible() then
+        reasoning_display.close()
+      end
+
+      -- 标记工具调用循环正在进行中（阻止打开虚拟输入框）
+      state.tool_loop_in_progress = true
+
       -- 重置工具调用状态
       state.tool_display.active = true
       state.tool_display.buffer = ""
@@ -2007,9 +2030,21 @@ function M._setup_event_listeners()
       -- 注意：跳过持久化（skip_persist=true），因为工具调用数据已由 chat_handlers
       -- 通过 add_tool_result 保存到历史文件。折叠文本只是 UI 显示用的，不需要重复保存。
       if #state.tool_display.results > 0 then
-        local folded_text = M._build_tool_folded_text(state.tool_display.results)
+        -- 将思考过程也包含到折叠文本中
+        local reasoning_text = state.streaming.reasoning_buffer or ""
+        local folded_text = M._build_tool_folded_text(state.tool_display.results, reasoning_text)
         M.add_message("assistant", folded_text, { skip_render = true, skip_persist = true })
       end
+
+      -- 重置流式状态（工具循环结束后，新一轮生成开始前）
+      -- 避免 UI 认为上一轮的思考还没有结束
+      state.streaming.active = false
+      state.streaming.generation_id = nil
+      state.streaming.message_index = nil
+      state.streaming.content_buffer = ""
+      state.streaming.reasoning_buffer = ""
+      state.streaming.reasoning_active = false
+      state.streaming.reasoning_done = false
 
       -- 重置工具调用状态
       state.tool_display.active = false
@@ -2037,6 +2072,9 @@ function M._setup_event_listeners()
       state.streaming.reasoning_buffer = ""
       state.streaming.reasoning_active = false
       state.streaming.reasoning_done = false
+
+      -- 标记工具调用循环已结束（取消时也重置）
+      state.tool_loop_in_progress = false
 
       print("⚠️  AI生成已取消 (ID: " .. tostring(generation_id) .. ")")
 
@@ -2376,13 +2414,27 @@ end
 
 --- 构建工具调用结果的折叠文本
 --- @param results table 工具调用结果列表
+--- @param reasoning_text string|nil 思考过程文本
 --- @return string 折叠文本格式的字符串
-function M._build_tool_folded_text(results)
+function M._build_tool_folded_text(results, reasoning_text)
   if not results or #results == 0 then
     return ""
   end
 
-  local folded_text = "{{{ 🔧 工具调用"
+  local folded_text = ""
+
+  -- 如果有思考过程，先添加思考过程的折叠区域
+  if reasoning_text and reasoning_text ~= "" then
+    folded_text = folded_text .. "{{{ 🤔 思考过程"
+    local reasoning_lines = vim.split(reasoning_text, "\n")
+    for _, line in ipairs(reasoning_lines) do
+      folded_text = folded_text .. "\n    " .. line
+    end
+    folded_text = folded_text .. "\n}}}"
+    folded_text = folded_text .. "\n\n"
+  end
+
+  folded_text = folded_text .. "{{{ 🔧 工具调用"
 
   for _, r in ipairs(results) do
     local args_str = vim.inspect(r.arguments or {})
