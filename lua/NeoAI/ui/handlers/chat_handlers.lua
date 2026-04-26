@@ -37,6 +37,14 @@ function M.initialize(config)
     end,
   })
 
+  -- 监听工具调用结果事件，将工具调用结果写入历史文件
+  vim.api.nvim_create_autocmd("User", {
+    pattern = Events.TOOL_RESULT_RECEIVED,
+    callback = function(args)
+      M._handle_tool_result(args.data or {})
+    end,
+  })
+
   -- STREAM_CHUNK 和 STREAM_COMPLETED 由 chat_window.lua 统一处理 UI 渲染
   -- chat_handlers 只负责业务逻辑（写入历史），通过 GENERATION_COMPLETED 事件处理
 
@@ -138,9 +146,74 @@ local function _flush_pending_round(session_id, assistant_content, usage)
 
   -- 将用户消息和AI回复一起写入历史文件
   -- assistant 字段为数组，每个元素是一轮 AI 回复
-  hm.add_round(session_id, user_msg, { assistant_content }, usage)
+  -- 注意：如果已有工具调用条目（通过 add_tool_result 保存），必须保留它们
+  -- 不能直接用 { assistant_content } 覆盖，否则工具调用数据会丢失
+  local existing_session = hm.get_session(session_id)
+  local existing_assistant = {}
+  if existing_session and type(existing_session.assistant) == "table" and #existing_session.assistant > 0 then
+    -- 保留已有的 assistant 条目（如工具调用结果），追加新的 AI 回复
+    existing_assistant = vim.deepcopy(existing_session.assistant)
+    table.insert(existing_assistant, assistant_content)
+  else
+    existing_assistant = { assistant_content }
+  end
+  hm.add_round(session_id, user_msg, existing_assistant, usage)
   -- 清理待写入队列
   state.pending_user_messages[session_id] = nil
+end
+
+--- 处理工具调用结果，将工具调用信息写入历史文件
+--- @param data table 事件数据
+function M._handle_tool_result(data)
+  local generation_id = data.generation_id
+  local tool_results = data.tool_results or {}
+  local session_id = data.session_id
+  local window_id = data.window_id
+
+  if not session_id or #tool_results == 0 then
+    return
+  end
+
+  local hm = get_hm()
+  if not hm then return end
+
+  -- 获取当前会话（如果没有 session_id，使用当前会话）
+  local target_session_id = session_id
+  local session = hm.get_session(target_session_id)
+  if not session then
+    local current = hm.get_current_session()
+    if current then
+      target_session_id = current.id
+    else
+      return
+    end
+  end
+
+  -- 将每个工具调用结果写入历史
+  for _, tr in ipairs(tool_results) do
+    local tool_call = tr.tool_call or {}
+    local result = tr.result or ""
+
+    -- 兼容两种字段名：function（OpenAI 标准）和 func（旧格式）
+    local tool_func = tool_call["function"] or tool_call.func or {}
+    local tool_name = tool_func.name or "unknown"
+    local arguments_str = tool_func.arguments or "{}"
+
+    -- 解析参数
+    local arguments = {}
+    local ok, parsed = pcall(vim.json.decode, arguments_str)
+    if ok and parsed then
+      arguments = parsed
+    end
+
+    -- 将结果截断到合理长度，避免历史文件过大
+    local result_str = tostring(result or "")
+    if #result_str > 500 then
+      result_str = result_str:sub(1, 500) .. "\n... [truncated, total " .. #result_str .. " chars]"
+    end
+
+    hm.add_tool_result(target_session_id, tool_name, arguments, result_str)
+  end
 end
 
 function M._handle_response_complete(data)

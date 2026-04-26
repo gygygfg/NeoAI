@@ -185,6 +185,23 @@ function M.open(parent_win, opts)
     wm.register_float_window(parent_buf, state.float_win, state.float_buf)
   end
 
+  -- 设置自动命令：当在浮动输入框执行 Ex 命令时，自动将焦点切回 chat 主窗口
+  -- 避免 :q / :e / :b 等命令在浮动输入框的 buffer 上执行
+  local float_augroup = "NeoAIFloatInputCmd_" .. tostring(state.float_buf)
+  pcall(vim.api.nvim_del_augroup_by_name, float_augroup)
+  local group = vim.api.nvim_create_augroup(float_augroup, { clear = true })
+  vim.api.nvim_create_autocmd("CmdlineEnter", {
+    group = group,
+    buffer = state.float_buf,
+    callback = function()
+      -- 将焦点切回 chat 主窗口，使 Ex 命令在 chat 窗口的 buffer 上执行
+      if state.parent_win and vim.api.nvim_win_is_valid(state.parent_win) then
+        pcall(vim.api.nvim_set_current_win, state.parent_win)
+      end
+    end,
+    desc = "浮动输入框执行命令时切回 chat 主窗口",
+  })
+
   -- 将浮动窗口光标定位到第一行（> 提示符后面）
   pcall(vim.api.nvim_win_set_cursor, state.float_win, { 1, 2 })
 
@@ -211,6 +228,12 @@ end
 function M.close(force)
   if not state.active then
     return
+  end
+
+  -- 清理 CmdlineEnter 自动命令
+  if state.float_buf then
+    local float_augroup = "NeoAIFloatInputCmd_" .. tostring(state.float_buf)
+    pcall(vim.api.nvim_del_augroup_by_name, float_augroup)
   end
 
   -- 从 window_manager 注销（无需额外操作，后续会直接清理）

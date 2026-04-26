@@ -34,6 +34,14 @@ local state = {
     reasoning_active = false, -- 是否正在输出思考内容
     reasoning_done = false, -- 思考内容是否已完成
   },
+
+  -- 工具调用悬浮显示状态
+  tool_display = {
+    active = false,
+    window_id = nil,
+    buffer = "", -- 累积的工具调用内容
+    results = {}, -- 所有工具调用结果，用于生成折叠文本
+  },
 }
 
 --- 初始化聊天窗口
@@ -251,7 +259,22 @@ function M._do_render_chat()
             end
           end
 
-          if has_reasoning then
+          -- 检查是否是工具调用折叠文本
+          local is_tool_call = false
+          if msg.role == "assistant" and type(msg.content) == "string" then
+            local trimmed = vim.trim(msg.content)
+            if trimmed:find("^{{{%s*🔧 工具调用") then
+              is_tool_call = true
+            end
+          end
+
+          if is_tool_call then
+            -- 工具调用折叠文本：不加 AI 标记，直接显示
+            local msg_lines = vim.split(main_content, "\n")
+            for _, line in ipairs(msg_lines) do
+              table.insert(content, line)
+            end
+          elseif has_reasoning then
             -- 显示思考过程（使用 Neovim 原生折叠标记）
             -- 折叠标记 {{{ 和 }}} 必须位于行首才能被 foldmethod=marker 识别
             table.insert(content, string.format("%s", role_prefix))
@@ -751,9 +774,53 @@ function M._load_raw_messages(session_id, hm)
         assistant_list = {}
       end
     end
-    for _, entry in ipairs(assistant_list) do
-      table.insert(messages, { role = "assistant", content = entry })
+    -- 收集连续的 tool_call 条目，合并为折叠文本块
+    local tool_call_buffer = {}
+    local function flush_tool_calls()
+      if #tool_call_buffer == 0 then
+        return
+      end
+      local folded_text = "{{{ 🔧 工具调用"
+      for _, tc in ipairs(tool_call_buffer) do
+        local args_str = vim.inspect(tc.arguments or {})
+        if #args_str > 100 then
+          args_str = args_str:sub(1, 100) .. "..."
+        end
+        local result_raw = tc.result
+        local result_str = ""
+        if type(result_raw) == "table" then
+          local ok, encoded = pcall(vim.json.encode, result_raw)
+          if ok then
+            result_str = encoded
+          else
+            result_str = vim.inspect(result_raw)
+          end
+        else
+          result_str = tostring(result_raw or "")
+        end
+        if #result_str > 200 then
+          result_str = result_str:sub(1, 200) .. "\n    ... [truncated, total " .. #result_str .. " chars]"
+        end
+        result_str = result_str:gsub("\n", "\n    ")
+        folded_text = folded_text .. "\n  🔧 " .. (tc.tool_name or "unknown")
+        folded_text = folded_text .. "\n    参数: " .. args_str
+        folded_text = folded_text .. "\n    结果: " .. result_str
+      end
+      folded_text = folded_text .. "\n}}}"
+      table.insert(messages, { role = "assistant", content = folded_text })
+      tool_call_buffer = {}
     end
+
+    for _, entry in ipairs(assistant_list) do
+      local ok, parsed = pcall(vim.json.decode, entry)
+      if ok and type(parsed) == "table" and parsed.type == "tool_call" then
+        table.insert(tool_call_buffer, parsed)
+      else
+        flush_tool_calls()
+        table.insert(messages, { role = "assistant", content = entry })
+      end
+    end
+    flush_tool_calls()
   end
 
   return messages
@@ -1134,8 +1201,10 @@ function M.add_message(role, content, opts)
     { pattern = Events.MESSAGE_ADDED, data = { window_id = state.current_window_id, role = role, content = content } }
   )
 
-  -- 持久化消息到 session_manager 和 history_manager
-  M._persist_message(role, content)
+  -- 持久化消息到 session_manager 和 history_manager（除非指定跳过）
+  if not opts.skip_persist then
+    M._persist_message(role, content)
+  end
 
   -- 如果窗口打开，更新显示（除非指定跳过渲染）
   if state.current_window_id and not opts.skip_render then
@@ -1415,26 +1484,59 @@ function M._setup_event_listeners()
         -- 更新 message_manager 中的占位符消息（而不是添加新消息）
         M._update_persisted_message("assistant", final_content)
       else
-        -- 查找并移除占位符消息
-        local placeholder_index = nil
+        -- 检查是否已有工具调用折叠文本（通过 TOOL_LOOP_FINISHED 添加的）
+        -- 如果有，说明这是工具调用后的最终 AI 回复，只需更新最后一条消息
+        local has_tool_call = false
         for i = #state.messages, 1, -1 do
-          if state.messages[i].role == "assistant" and state.messages[i].content == "🤖 AI正在思考..." then
-            placeholder_index = i
-            break
+          local msg = state.messages[i]
+          if msg.role == "assistant" and msg.content then
+            local trimmed = vim.trim(msg.content)
+            if trimmed:find("^{{{%s*🔧 工具调用") then
+              has_tool_call = true
+              break
+            end
           end
         end
-        if placeholder_index then
-          table.remove(state.messages, placeholder_index)
-        end
-        -- 添加完整响应（跳过渲染，由后面的 render_chat 统一处理）
-        if reasoning_text and reasoning_text ~= "" then
-          local combined = vim.json.encode({
-            reasoning_content = reasoning_text,
-            content = response_content,
+
+        if has_tool_call then
+          -- 工具调用场景：不通过 add_message 添加新消息（避免 _persist_message 重复保存）
+          -- 直接将 AI 回复追加到 state.messages 末尾
+          local final_content
+          if reasoning_text and reasoning_text ~= "" then
+            final_content = vim.json.encode({
+              reasoning_content = reasoning_text,
+              content = response_content,
+            })
+          else
+            final_content = response_content
+          end
+          table.insert(state.messages, {
+            role = "assistant",
+            content = final_content,
+            timestamp = os.time(),
           })
-          M.add_message("assistant", combined, { skip_render = true })
         else
-          M.add_message("assistant", response_content, { skip_render = true })
+          -- 查找并移除占位符消息
+          local placeholder_index = nil
+          for i = #state.messages, 1, -1 do
+            if state.messages[i].role == "assistant" and state.messages[i].content == "🤖 AI正在思考..." then
+              placeholder_index = i
+              break
+            end
+          end
+          if placeholder_index then
+            table.remove(state.messages, placeholder_index)
+          end
+          -- 添加完整响应（跳过渲染，由后面的 render_chat 统一处理）
+          if reasoning_text and reasoning_text ~= "" then
+            local combined = vim.json.encode({
+              reasoning_content = reasoning_text,
+              content = response_content,
+            })
+            M.add_message("assistant", combined, { skip_render = true })
+          else
+            M.add_message("assistant", response_content, { skip_render = true })
+          end
         end
       end
 
@@ -1721,6 +1823,155 @@ function M._setup_event_listeners()
     end,
   })
 
+  -- 监听工具循环开始事件：显示工具调用悬浮窗口
+  vim.api.nvim_create_autocmd("User", {
+    pattern = Events.TOOL_LOOP_STARTED,
+    callback = function(args)
+      local data = args.data or {}
+      local window_id = data.window_id
+      local tool_calls = data.tool_calls or {}
+
+      -- 检查是否是当前窗口
+      if window_id and window_id ~= state.current_window_id then
+        return
+      end
+
+      if #tool_calls == 0 then
+        return
+      end
+
+      -- 重置工具调用状态
+      state.tool_display.active = true
+      state.tool_display.buffer = ""
+      state.tool_display.results = {}
+
+      -- 构建初始显示内容
+      local initial_text = "🔧 工具调用中...\n"
+      for _, tc in ipairs(tool_calls) do
+        local tool_func = tc["function"] or tc.func or {}
+        local tool_name = tool_func.name or "unknown"
+        initial_text = initial_text .. "  ⏳ " .. tool_name .. "\n"
+      end
+
+      state.tool_display.buffer = initial_text
+
+      -- 创建或更新悬浮窗口
+      M._show_tool_display()
+    end,
+  })
+
+  -- 监听单个工具执行开始事件：更新悬浮窗口状态
+  vim.api.nvim_create_autocmd("User", {
+    pattern = Events.TOOL_EXECUTION_STARTED,
+    callback = function(args)
+      local data = args.data or {}
+      local window_id = data.window_id
+      local tool_name = data.tool_name
+
+      -- 检查是否是当前窗口
+      if window_id and window_id ~= state.current_window_id then
+        return
+      end
+
+      if not state.tool_display.active then
+        return
+      end
+
+      -- 更新悬浮窗口：将 ⏳ 改为 🔄
+      -- 转义 tool_name 中的特殊字符（如 _、. 等）
+      local escaped_name = tool_name:gsub("([%.%+%-%*%?%[%]%^%$%(%)%%])", "%%%1")
+      state.tool_display.buffer = state.tool_display.buffer:gsub(
+        "  ⏳ " .. escaped_name,
+        "  🔄 " .. tool_name .. " (执行中...)"
+      )
+      M._update_tool_display()
+    end,
+  })
+
+  -- 监听单个工具执行完成事件：更新悬浮窗口状态
+  vim.api.nvim_create_autocmd("User", {
+    pattern = Events.TOOL_EXECUTION_COMPLETED,
+    callback = function(args)
+      local data = args.data or {}
+      local window_id = data.window_id
+      local tool_name = data.tool_name
+      local arguments = data.arguments or {}
+      local result = data.result or ""
+      local duration = data.duration or 0
+
+      -- 检查是否是当前窗口
+      if window_id and window_id ~= state.current_window_id then
+        return
+      end
+
+      if not state.tool_display.active then
+        return
+      end
+
+      -- 保存结果用于生成折叠文本
+      table.insert(state.tool_display.results, {
+        tool_name = tool_name,
+        arguments = arguments,
+        result = result,
+        duration = duration,
+      })
+
+      -- 更新悬浮窗口：将 🔄 改为 ✅
+      local escaped_name = tool_name:gsub("([%.%+%-%*%?%[%]%^%$%(%)%%])", "%%%1")
+
+      -- 先尝试替换 🔄 状态
+      local replaced = state.tool_display.buffer:gsub(
+        "  🔄 " .. escaped_name .. " %(执行中%.%.%.%)",
+        "  ✅ " .. tool_name .. " (" .. duration .. "s)"
+      )
+      if replaced == state.tool_display.buffer then
+        -- 如果替换失败，尝试替换 ⏳ 状态
+        state.tool_display.buffer = state.tool_display.buffer:gsub(
+          "  ⏳ " .. escaped_name,
+          "  ✅ " .. tool_name .. " (" .. duration .. "s)"
+        )
+      else
+        state.tool_display.buffer = replaced
+      end
+      M._update_tool_display()
+    end,
+  })
+
+  -- 监听工具循环结束事件：关闭悬浮窗口，将工具调用结果转换为折叠文本
+  vim.api.nvim_create_autocmd("User", {
+    pattern = Events.TOOL_LOOP_FINISHED,
+    callback = function(args)
+      local data = args.data or {}
+      local window_id = data.window_id
+      local tool_results = data.tool_results or {}
+
+      -- 检查是否是当前窗口
+      if window_id and window_id ~= state.current_window_id then
+        return
+      end
+
+      if not state.tool_display.active then
+        return
+      end
+
+      -- 关闭悬浮窗口
+      M._close_tool_display()
+
+      -- 将工具调用结果转换为折叠文本并添加到消息列表
+      -- 注意：跳过持久化（skip_persist=true），因为工具调用数据已由 chat_handlers
+      -- 通过 add_tool_result 保存到历史文件。折叠文本只是 UI 显示用的，不需要重复保存。
+      if #state.tool_display.results > 0 then
+        local folded_text = M._build_tool_folded_text(state.tool_display.results)
+        M.add_message("assistant", folded_text, { skip_render = true, skip_persist = true })
+      end
+
+      -- 重置工具调用状态
+      state.tool_display.active = false
+      state.tool_display.buffer = ""
+      state.tool_display.results = {}
+    end,
+  })
+
   -- 监听生成取消事件
   vim.api.nvim_create_autocmd("User", {
     pattern = Events.GENERATION_CANCELLED,
@@ -1987,6 +2238,132 @@ function M._finalize_streaming()
   state.streaming.reasoning_buffer = ""
   state.streaming.reasoning_active = false
   state.streaming.reasoning_done = false
+end
+
+--- 显示工具调用悬浮窗口
+function M._show_tool_display()
+  -- 如果已有窗口，先关闭
+  if state.tool_display.window_id then
+    M._close_tool_display()
+  end
+
+  -- 使用 window_manager 创建浮动窗口
+  local win_id = window_manager.create_window("tool_display", {
+    title = "🔧 工具调用",
+    width = state.config.width and math.min(state.config.width - 4, 80) or 60,
+    height = 8,
+    border = "rounded",
+    style = "minimal",
+    relative = "editor",
+    row = 1,
+    col = 1,
+    zindex = 100,
+    window_mode = "float",
+  })
+
+  if not win_id then
+    return
+  end
+
+  state.tool_display.window_id = win_id
+
+  -- 设置窗口内容
+  local window_info = window_manager.get_window_info(win_id)
+  if window_info and window_info.buf and vim.api.nvim_buf_is_valid(window_info.buf) then
+    vim.api.nvim_set_option_value("modifiable", true, { buf = window_info.buf })
+    vim.api.nvim_set_option_value("filetype", "markdown", { buf = window_info.buf })
+
+    local lines = vim.split(state.tool_display.buffer or "", "\n")
+    vim.api.nvim_buf_set_lines(window_info.buf, 0, -1, false, lines)
+
+    vim.api.nvim_set_option_value("readonly", true, { buf = window_info.buf })
+    vim.api.nvim_set_option_value("modifiable", false, { buf = window_info.buf })
+
+    -- 设置按键映射
+    vim.keymap.set("n", "q", "<Cmd>lua require('NeoAI.ui.window.chat_window')._close_tool_display()<CR>", {
+      buffer = window_info.buf,
+      desc = "关闭工具调用窗口",
+      silent = true,
+      noremap = true,
+    })
+    vim.keymap.set("n", "<Esc>", "<Cmd>lua require('NeoAI.ui.window.chat_window')._close_tool_display()<CR>", {
+      buffer = window_info.buf,
+      desc = "关闭工具调用窗口",
+      silent = true,
+      noremap = true,
+    })
+  end
+end
+
+--- 更新工具调用悬浮窗口内容
+function M._update_tool_display()
+  if not state.tool_display.window_id then
+    return
+  end
+
+  local window_info = window_manager.get_window_info(state.tool_display.window_id)
+  if not window_info or not window_info.buf or not vim.api.nvim_buf_is_valid(window_info.buf) then
+    return
+  end
+
+  local buf = window_info.buf
+  vim.api.nvim_set_option_value("modifiable", true, { buf = buf })
+
+  local lines = vim.split(state.tool_display.buffer or "", "\n")
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+
+  vim.api.nvim_set_option_value("readonly", true, { buf = buf })
+  vim.api.nvim_set_option_value("modifiable", false, { buf = buf })
+end
+
+--- 关闭工具调用悬浮窗口
+function M._close_tool_display()
+  if state.tool_display.window_id then
+    window_manager.close_window(state.tool_display.window_id)
+    state.tool_display.window_id = nil
+  end
+end
+
+--- 构建工具调用结果的折叠文本
+--- @param results table 工具调用结果列表
+--- @return string 折叠文本格式的字符串
+function M._build_tool_folded_text(results)
+  if not results or #results == 0 then
+    return ""
+  end
+
+  local folded_text = "{{{ 🔧 工具调用"
+
+  for _, r in ipairs(results) do
+    local args_str = vim.inspect(r.arguments or {})
+    if #args_str > 100 then
+      args_str = args_str:sub(1, 100) .. "..."
+    end
+    local result_raw = r.result
+    local result_str = ""
+    if type(result_raw) == "table" then
+      local ok, encoded = pcall(vim.json.encode, result_raw)
+      if ok then
+        result_str = encoded
+      else
+        result_str = vim.inspect(result_raw)
+      end
+    else
+      result_str = tostring(result_raw or "")
+    end
+    if #result_str > 200 then
+      result_str = result_str:sub(1, 200) .. "\n    ... [truncated, total " .. #result_str .. " chars]"
+    end
+    result_str = result_str:gsub("\n", "\n    ")
+
+    folded_text = folded_text .. "\n  🔧 " .. r.tool_name
+    folded_text = folded_text .. "\n    参数: " .. args_str
+    folded_text = folded_text .. "\n    结果: " .. result_str
+  end
+
+  folded_text = folded_text .. "\n}}}"
+
+  return folded_text
 end
 
 --- 获取当前使用的模型标签

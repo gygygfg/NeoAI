@@ -69,7 +69,7 @@ function M.execute_tool_loop(params)
     },
   })
 
-  logger.info(string.format("Tool loop started for generation %s: %d tool calls", generation_id, #tool_calls))
+  -- logger.info(string.format("Tool loop started for generation %s: %d tool calls", generation_id, #tool_calls))
 
   -- 执行每个工具调用
   for _, tool_call in ipairs(tool_calls) do
@@ -100,7 +100,7 @@ function M.execute_tool_loop(params)
     },
   })
 
-  logger.info(string.format("Tool loop finished for generation %s: %d results", generation_id, #tool_results))
+  -- logger.info(string.format("Tool loop finished for generation %s: %d results", generation_id, #tool_results))
 
   return tool_results
 end

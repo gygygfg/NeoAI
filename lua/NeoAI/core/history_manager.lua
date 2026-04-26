@@ -396,6 +396,38 @@ function M.add_assistant_entry(session_id, assistant_entry)
   return true
 end
 
+--- 记录工具调用结果到历史（作为 assistant 条目追加）
+--- @param session_id string 会话ID
+--- @param tool_name string 工具名称
+--- @param arguments table 工具参数
+--- @param result string 工具执行结果
+--- @return boolean 是否成功
+function M.add_tool_result(session_id, tool_name, arguments, result)
+  local session = state.sessions[session_id]
+  if not session then
+    return false
+  end
+  -- 构建工具调用结果的 JSON 条目
+  local entry = vim.json.encode({
+    type = "tool_call",
+    tool_name = tool_name,
+    arguments = arguments,
+    result = result,
+    timestamp = os.time(),
+  })
+  if type(session.assistant) ~= "table" then
+    if session.assistant and session.assistant ~= "" then
+      session.assistant = { session.assistant }
+    else
+      session.assistant = {}
+    end
+  end
+  table.insert(session.assistant, entry)
+  session.updated_at = os.time()
+  debounce_save()
+  return true
+end
+
 --- 更新当前会话的 usage 信息
 function M.update_usage(session_id, usage)
   local session = state.sessions[session_id]
@@ -430,12 +462,32 @@ function M.get_messages(session_id)
   end
   for _, entry in ipairs(assistant_list) do
     local content = entry
-    -- 尝试解析 JSON 字符串（含 reasoning_content）
+    local msg_type = "assistant"
+    -- 尝试解析 JSON 字符串（含 reasoning_content 或 tool_call）
     local ok, parsed = pcall(vim.json.decode, entry)
-    if ok and type(parsed) == "table" and parsed.content then
-      content = parsed.content
+    if ok and type(parsed) == "table" then
+      if parsed.type == "tool_call" then
+        -- 工具调用结果：构建可读的显示文本
+        local args_str = vim.inspect(parsed.arguments or {})
+        if #args_str > 200 then
+          args_str = args_str:sub(1, 200) .. "..."
+        end
+        local result_str = tostring(parsed.result or "")
+        if #result_str > 300 then
+          result_str = result_str:sub(1, 300) .. "\n... [truncated]"
+        end
+        content = string.format(
+          "🔧 工具调用: %s\n参数: %s\n结果: %s",
+          parsed.tool_name or "unknown",
+          args_str,
+          result_str
+        )
+        msg_type = "tool_result"
+      elseif parsed.content then
+        content = parsed.content
+      end
     end
-    table.insert(msgs, { role = "assistant", content = content })
+    table.insert(msgs, { role = msg_type, content = content })
   end
   return msgs
 end
@@ -544,8 +596,13 @@ function M.build_round_text(session)
       ai_text = last_entry.content
     elseif type(last_entry) == "string" then
       local ok, parsed = pcall(vim.json.decode, last_entry)
-      if ok and type(parsed) == "table" and parsed.content then
-        ai_text = parsed.content
+      if ok and type(parsed) == "table" then
+        if parsed.content then
+          ai_text = parsed.content
+        elseif parsed.type == "tool_call" then
+          -- 工具调用结果：显示工具名称
+          ai_text = "🔧 " .. (parsed.tool_name or "工具调用")
+        end
       else
         ai_text = last_entry
       end
