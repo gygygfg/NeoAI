@@ -13,7 +13,6 @@ local session_counter = 0
 -- 模块状态
 local state = {
   initialized = false,
-  event_bus = nil,
   config = nil,
   save_debounce_timer = nil, -- 保存防抖定时器
   autocmd_ids = {}, -- 自动命令ID列表
@@ -48,7 +47,6 @@ function M.initialize(options)
     return M
   end
 
-  state.event_bus = options.event_bus
   state.config = options.config or {}
   
   -- 处理 session 配置
@@ -63,17 +61,14 @@ function M.initialize(options)
 
   -- 初始化子模块
   branch_manager.initialize({
-    event_bus = state.event_bus,
     config = state.config,
   })
 
   message_manager.initialize({
-    event_bus = state.event_bus,
     config = state.config,
   })
 
   data_operations.initialize({
-    event_bus = state.event_bus,
     config = state.config,
   })
 
@@ -536,7 +531,6 @@ function M.reset()
   current_session_id = nil
   session_counter = 0
   state.initialized = false
-  state.event_bus = nil
   state.config = nil
   if state.save_debounce_timer then
     state.save_debounce_timer:stop()

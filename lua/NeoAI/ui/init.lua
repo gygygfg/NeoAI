@@ -9,18 +9,15 @@ local reasoning_display = require("NeoAI.ui.components.reasoning_display")
 local tree_handlers = require("NeoAI.ui.handlers.tree_handlers")
 local chat_handlers = require("NeoAI.ui.handlers.chat_handlers")
 local Events = require("NeoAI.core.events.event_constants")
-
--- 核心模块引用（延迟加载）
-local core
+local state_manager = require("NeoAI.core.state")
 
 -- 模块状态
 local state = {
   initialized = false,
-  config = nil,
   windows = {},
-  current_ui_mode = nil, -- 'tree' 或 'chat'
-  current_session_id = nil, -- 当前会话ID
-  event_count = 0, -- 事件处理计数
+  current_ui_mode = nil,
+  current_session_id = nil,
+  event_count = 0,
 }
 
 --- 初始化UI模块
@@ -31,60 +28,21 @@ function M.initialize(config)
     return M
   end
 
-  state.config = config or {}
-
-  -- 延迟加载核心模块（如果存在），但UI模块不应该直接依赖核心模块
-  -- 改为通过事件通信，这里只保留必要的接口
-  local success, loaded_core = pcall(require, "NeoAI.core")
-  if success then
-    core = loaded_core
-  else
-    -- 创建最小化的核心接口，UI模块不应该直接调用核心业务逻辑
-    core = {
-      -- 只提供UI层需要的接口，不包含业务逻辑
-      get_keymap_manager = function()
-        -- 键位配置是UI层需要的
-        return {
-          get_keymaps = function()
-            return {}
-          end,
-        }
-      end,
-    }
-    print("⚠️  核心模块未找到，UI模块使用最小化接口")
-  end
-
   -- 准备窗口管理器配置
-  local window_manager_config = state.config.window or {}
-
-  -- 如果配置中有窗口模式，传递给窗口管理器
-  if state.config.ui and state.config.ui.window_mode then
-    window_manager_config.window_mode = state.config.ui.window_mode
+  local window_config = vim.deepcopy(config.window or {})
+  if config.ui and config.ui.window_mode then
+    window_config.window_mode = config.ui.window_mode
   end
 
-  -- 初始化历史管理器
-  local ok, hm = pcall(require, "NeoAI.core.history_manager")
-  if ok then
-    hm.initialize({
-      config = state.config,
-      event_bus = nil,
-    })
-  end
-
-  -- 设置事件处理器
   -- 初始化子模块
-  window_manager.initialize(window_manager_config)
-  input_handler.initialize(state.config.input or {})
-  -- 传递完整配置给 history_tree，确保能访问 session.save_path
-  history_tree.initialize(state.config)
-  reasoning_display.initialize(state.config.reasoning or {})
-  -- 传递完整配置给 tree_window，确保能访问 session.save_path
-  tree_window.initialize(state.config)
-  -- 传递完整配置给聊天窗口，确保虚拟输入框能访问键位配置
-  chat_window.initialize(state.config)
-
-  tree_handlers.initialize(state.config)
-  chat_handlers.initialize(state.config.handlers or {})
+  window_manager.initialize(window_config)
+  input_handler.initialize(config.input or {})
+  history_tree.initialize(config)
+  reasoning_display.initialize(config.reasoning or {})
+  tree_window.initialize(config)
+  chat_window.initialize(config)
+  tree_handlers.initialize(config)
+  chat_handlers.initialize(config.handlers or {})
 
   -- 注册事件监听器
   M._register_event_listeners()
@@ -99,10 +57,12 @@ function M.open_tree_ui()
     error("UI not initialized")
   end
 
+  local config = state_manager.get_config()
+
   -- 获取当前会话ID
-  local ok, hm = pcall(require, "NeoAI.core.history_manager")
+  local hm = require("NeoAI.core.history_manager")
   local session_id = state.current_session_id
-  if (not session_id or session_id == "default") and ok and hm.is_initialized() then
+  if (not session_id or session_id == "default") and hm.is_initialized() then
     local current = hm.get_current_session()
     if current then
       session_id = current.id
@@ -121,9 +81,9 @@ function M.open_tree_ui()
   -- 先创建窗口
   local tree_win_id = window_manager.create_window("tree", {
     title = "NeoAI 会话树",
-    width = state.config.width or 60,
-    height = state.config.height or 25,
-    border = state.config.border or "rounded",
+    width = config.width or 60,
+    height = config.height or 25,
+    border = config.border or "rounded",
   })
 
   if tree_win_id then
@@ -160,29 +120,15 @@ function M.open_chat_ui(session_id, branch_id)
     error("UI not initialized")
   end
 
-  -- 确保历史管理器已初始化
-  local ok, hm = pcall(require, "NeoAI.core.history_manager")
-  if ok and not hm.is_initialized() then
-    hm.initialize({ config = state.config })
-  end
+  local config = state_manager.get_config()
+  local hm = require("NeoAI.core.history_manager")
 
-  -- 如果没有传入 session_id（从 :NeoAIOpen 或快捷键直接打开），
-  -- 强制创建一个新的根会话，这样每次打开都是全新的根分支
+  -- 如果没有传入 session_id，强制创建新的根会话
   if not session_id or session_id == "default" then
-    if ok and hm.is_initialized() then
+    if hm.is_initialized() then
       session_id = hm.create_session("聊天会话", true, nil)
     else
-      -- 回退：使用当前会话ID
-      session_id = state.current_session_id
-      if (not session_id or session_id == "default") and ok and hm.is_initialized() then
-        local current = hm.get_current_session()
-        if current then
-          session_id = current.id
-        end
-      end
-      if not session_id then
-        session_id = "default"
-      end
+      session_id = state.current_session_id or "default"
     end
   end
 
@@ -190,18 +136,18 @@ function M.open_chat_ui(session_id, branch_id)
     branch_id = "main"
   end
 
-  -- 只关闭已有的树窗口，保留聊天窗口
+  -- 只关闭已有的树窗口
   if state.windows.tree then
     tree_window.close()
     state.windows.tree = nil
   end
 
-  -- 先创建聊天窗口
+  -- 创建聊天窗口
   local chat_win_id = window_manager.create_window("chat", {
     title = "NeoAI 聊天",
-    width = state.config.width or 80,
-    height = state.config.height or 20,
-    border = state.config.border or "rounded",
+    width = config.width or 80,
+    height = config.height or 20,
+    border = config.border or "rounded",
   })
 
   if chat_win_id then
@@ -461,19 +407,16 @@ function M.update_config(new_config)
     return
   end
 
-  state.config = vim.tbl_extend("force", state.config, new_config or {})
+  local config = state_manager.get_config()
+  local merged = vim.tbl_extend("force", config, new_config or {})
 
-  -- 更新子模块配置
-  local window_manager_config = state.config.window or {}
-  -- 如果配置中有窗口模式，传递给窗口管理器
-  if state.config.window_mode then
-    window_manager_config.window_mode = state.config.window_mode
+  local window_config = merged.window or {}
+  if merged.window_mode then
+    window_config.window_mode = merged.window_mode
   end
 
-  window_manager.update_config(window_manager_config)
-  input_handler.update_config(state.config.input or {})
-
-  -- 刷新当前界面
+  window_manager.update_config(window_config)
+  input_handler.update_config(merged.input or {})
   M.refresh_current_ui()
 end
 

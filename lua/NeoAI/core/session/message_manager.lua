@@ -17,7 +17,6 @@ local message_id_map = {}
 
 local state = {
   initialized = false,
-  event_bus = nil,
   config = nil,
 }
 
@@ -43,7 +42,6 @@ end
 
 function M.initialize(options)
   if state.initialized then return end
-  state.event_bus = options.event_bus
   state.config = options.config or {}
   state.initialized = true
 end
@@ -269,7 +267,6 @@ function M.reset()
   timestamp_counter = 0
   message_id_map = {}
   state.initialized = false
-  state.event_bus = nil
   state.config = nil
   return true
 end

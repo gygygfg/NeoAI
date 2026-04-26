@@ -1,0 +1,7 @@
+{
+  "model": "deepseek-v4-pro",
+  "prompt": "def fibonacci(n):",
+  "suffix": "    return result",
+  "max_tokens": 64,
+  "stream": false
+}

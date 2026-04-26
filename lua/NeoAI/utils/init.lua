@@ -18,9 +18,9 @@ function M.initialize()
     local ok, module = pcall(require, "NeoAI.utils." .. module_name)
     if ok then
       loaded_modules[module_name] = module
-      -- 将模块函数合并到主表中
+      -- 将模块函数合并到主表中（不覆盖 M 自身已定义的函数）
       for func_name, func in pairs(module) do
-        if type(func) == "function" then
+        if type(func) == "function" and M[func_name] == nil then
           M[func_name] = func
         end
       end
@@ -40,7 +40,10 @@ end
 
 --- 重新加载所有模块
 function M.reload()
-  loaded_modules = {}
+  -- 清空已加载模块表（注意：不能使用 loaded_modules = {}，这会创建局部变量）
+  for k in pairs(loaded_modules) do
+    loaded_modules[k] = nil
+  end
   M.initialize()
 end
 

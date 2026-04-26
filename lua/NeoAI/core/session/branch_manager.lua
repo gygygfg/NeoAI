@@ -10,7 +10,6 @@ local current_branch_id = nil
 -- 模块状态
 local state = {
   initialized = false,
-  event_bus = nil,
   config = nil,
 }
 
@@ -21,7 +20,6 @@ function M.initialize(options)
     return
   end
 
-  state.event_bus = options.event_bus
   state.config = options.config or {}
   state.initialized = true
 end
@@ -200,7 +198,6 @@ function M.reset()
   branch_counter = 0
   current_branch_id = nil
   state.initialized = false
-  state.event_bus = nil
   state.config = nil
 
   return true

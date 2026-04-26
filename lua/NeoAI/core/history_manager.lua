@@ -482,7 +482,7 @@ function M.get_messages(session_id)
           args_str,
           result_str
         )
-        msg_type = "tool_result"
+        msg_type = "tool"
       elseif parsed.content then
         content = parsed.content
       end

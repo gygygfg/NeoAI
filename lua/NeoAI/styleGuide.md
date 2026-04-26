@@ -12,6 +12,8 @@ NeoAI/
 │   ├── init.lua                # 核心模块入口，协调子模块初始化
 │   ├── history_manager.lua     # 历史管理器（JSON数组存储，树形会话结构）
 │   │
+|   ├── state.lua               # 统一状态管理器（集中管理共享状态）
+|   │
 │   ├── config/
 │   │   └── keymap_manager.lua  # 键位配置管理器
 │   │
@@ -25,6 +27,7 @@ NeoAI/
 │   ├── ai/                     # AI 交互
 │   │   ├── ai_engine.lua       # AI 引擎主入口（事件驱动，协调子模块）
 │   │   ├── http_client.lua     # HTTP 客户端（流式/非流式请求）
+│   │   ├── request_adapter.lua # 请求适配器（多 API 提供商格式转换）
 │   │   ├── request_builder.lua # 请求构建器（格式化消息、添加工具信息）
 │   │   ├── response_builder.lua# 响应构建器（异步处理、上下文构建）
 │   │   ├── stream_processor.lua# 流式处理器（解析 SSE 数据块）
@@ -61,32 +64,20 @@ NeoAI/
 │   │
 │   └── builtin/                # 内置工具
 │       ├── file_tools.lua      # 文件操作工具
-│       ├── file_utils_tools.lua# 文件工具函数
 │       ├── general_tools.lua   # 通用工具
-│       └── log_tools.lua       # 日志工具
+│       ├── log_tools.lua       # 日志工具
+│       └── tool_helpers.lua    # 工具定义辅助模块（define_tool）
 │
 ├── utils/                      # 工具库
-│   ├── init.lua                # 工具模块入口（自动加载所有子模块）
+│   ├── init.lua                # 工具模块入口（自动加载 5 个子模块）
 │   ├── common.lua              # 通用工具函数（深拷贝等）
-│   ├── text_utils.lua          # 文本处理
 │   ├── table_utils.lua         # 表操作
 │   ├── file_utils.lua          # 文件操作
 │   ├── logger.lua              # 日志系统
 │   ├── json.lua                # JSON 编解码
 │   ├── skiplist.lua            # 跳表数据结构
 │   ├── async_worker.lua        # 异步工作器
-│   ├── debug_utils.lua         # 调试工具
-│   ├── session_helper.lua      # 会话辅助函数（基于 history_manager）
-│   ├── thread_utils.lua        # 线程工具
-│   └── tool_registry.lua       # 工具注册表（utils 层）
-│
-├── examples/                   # 示例代码
-│   ├── debug_example.lua
-│   ├── multithread_optimization.lua
-│   ├── native_events.lua
-│   ├── thread_usage.lua
-│   ├── threaded_test_demo.lua
-│   └── ui_multithread_example.lua
+│   └── thread_utils.lua        # 线程工具
 │
 ├── docs/                       # 文档
 │   ├── AI_RESPONSE_FLOW.md
@@ -112,20 +103,17 @@ NeoAI/
 用户调用 setup(config)
     │
     ▼
-default_config.validate_config(config)    ← 验证用户配置合法性
-default_config.merge_defaults(config)     ← 合并默认配置
-default_config.sanitize_config(config)    ← 清理/补全配置（创建目录等）
+default_config.process_config(config)     ← 一步完成：验证 → 合并 → 清理 → 初始化
     │
     ▼
 core.initialize(config)                   ← 初始化核心模块
+  ├── state_manager.initialize(config)    ← 统一状态管理器
   ├── keymap_manager.initialize()         ← 键位配置
-  ├── session_manager.initialize()        ← 旧版会话管理（向后兼容）
   ├── ai_engine.initialize()              ← AI 引擎
-  └── history_manager.initialize()        ← 历史管理器（新版，唯一数据源）
+  └── history_manager.initialize()        ← 历史管理器（唯一数据源）
     │
     ▼
 ui.initialize(config)                     ← 初始化 UI 模块
-  ├── history_manager.initialize()        ← 确保历史管理器已初始化
   ├── window_manager.initialize()         ← 窗口管理器
   ├── input_handler.initialize()
   ├── history_tree.initialize()
@@ -141,14 +129,30 @@ tools.initialize(config.tools)            ← 初始化工具系统
   ├── tool_executor.initialize()
   ├── tool_validator.initialize()
   ├── tool_history_manager.initialize()
-  └── _load_builtin_tools()               ← 加载内置工具
+  ├── _load_builtin_tools()               ← 加载内置工具
+  └── _load_external_tools()              ← 加载外部工具（可选）
+    │
+    ▼
+ai_engine.set_tools(tools_map)           ← 将工具注册表注入 AI 引擎
+    │
+    ▼
+async_worker.initialize()               ← 初始化异步工作器
     │
     ▼
 register_commands()                       ← 注册 :NeoAIOpen 等命令
-register_global_keymaps()                 ← 注册全局快捷键
+  ├── :NeoAIOpen                          ← 打开主界面
+  ├── :NeoAIClose                         ← 关闭所有界面
+  ├── :NeoAITree                          ← 打开树界面
+  ├── :NeoAIChat                          ← 打开聊天界面
+  ├── :NeoAIKeymaps                       ← 显示键位配置
+  └── :NeoAIChatStatus                    ← 显示聊天窗口状态
     │
     ▼
-async_worker.initialize()                 ← 初始化异步工作器
+register_global_keymaps()                 ← 注册全局快捷键
+  ├── open_tree                           ← 打开树界面
+  ├── open_chat                           ← 打开聊天界面
+  ├── close_all                           ← 关闭所有窗口
+  └── toggle_ui                           ← 切换 UI 显示
 ```
 
 ### 配置示例
@@ -189,23 +193,38 @@ require("NeoAI").setup({
 
 - 维护插件全局状态（`state` 表）
 - `setup(user_config)` — 初始化所有模块、注册命令和快捷键
+  - 初始化顺序：`default_config` → `core` → `ui` → `tools` → 工具注入 AI 引擎 → `async_worker` → 注册命令 → 注册快捷键
 - 提供对外接口：`open_neoai()`, `close_all()`, `get_session_manager()`, `get_ai_engine()`, `get_tools()`, `get_keymap_manager()`
 - 注册命令：`:NeoAIOpen`, `:NeoAIClose`, `:NeoAITree`, `:NeoAIChat`, `:NeoAIKeymaps`, `:NeoAIChatStatus`
+- 注册全局快捷键：`open_tree`, `open_chat`, `close_all`, `toggle_ui`（由 `config.keymaps.global` 配置）
+- 工具系统初始化后，将工具注册表注入 AI 引擎（`ai_engine.set_tools(tools_map)`），使工具定义能注入到请求中
 
 ### `default_config.lua` — 配置管理
 
-- 定义 `DEFAULT_CONFIG` 默认配置表
-- `validate_config(config)` — 验证用户配置合法性
-- `merge_defaults(config)` — 深度合并用户配置与默认配置
-- `sanitize_config(config)` — 清理配置（创建保存目录等）
-- `get(key)`, `set(key, value)` — 点号路径配置存取
-- `validate()` — 完整配置验证
-- `export()`, `import()` — 配置导入导出
+|- 定义 `DEFAULT_CONFIG` 默认配置表
+|- `process_config(config)` — **一步完成**：验证 → 合并 → 清理 → 初始化（替代旧的 validate_config + merge_defaults + sanitize_config）
+|- `get(key)`, `set(key, value)` — 点号路径配置存取
+|- `validate()` — 完整配置验证
+|- `export()`, `import()` — 配置导入导出
+|- `get_preset(scenario)` / `get_scenario_candidates(scenario)` — 获取场景 AI 配置
+|- `get_available_models()` / `get_available_scenarios()` — 获取可用模型/场景列表
 
 ### `core/init.lua` — 核心模块入口
 
-- 初始化 `keymap_manager`, `session_manager`, `ai_engine`, `history_manager`
-- 提供 `get_session_manager()`, `get_ai_engine()`, `get_keymap_manager()`, `get_history_manager()`, `get_config()`
+|- 初始化 `keymap_manager`, `ai_engine`, `history_manager`（旧版 `session_manager` 已废弃）
+|- 所有模块间通信通过 Neovim 原生事件系统（`nvim_exec_autocmds`/`nvim_create_autocmd`）
+|- 提供 `get_ai_engine()`, `get_keymap_manager()`, `get_history_manager()`, `get_config()`
+|- `get_config()` 通过 `state_manager.get_config()` 获取配置，不再维护独立配置引用
+|- `get_session_manager()` 保留向后兼容，返回 `nil`
+
+### `core/state.lua` — 统一状态管理器
+
+|- 集中管理所有模块的共享状态，消除分散在各 `init.lua` 中的重复 `state` 表
+|- `initialize(config)` — 初始化状态，保存配置引用
+|- `get_config()` — 获取完整配置
+|- `get_config_value(key, default)` — 点号路径配置存取
+|- `is_initialized()` — 检查是否已初始化
+|- 各模块通过 `state_manager.get_config()` 获取配置，不再各自维护 `state.config`
 
 ### `core/history_manager.lua` — 历史管理器（新版，唯一数据源）
 
@@ -214,6 +233,7 @@ require("NeoAI").setup({
 - 添加会话时覆写最后一行 `]` 为 `,新内容\n]`
 
 **会话对象结构**（扁平结构，一轮对话一个会话，无 `rounds` 数组）：
+
 ```json
 {
   "id": "session_1",
@@ -234,12 +254,14 @@ require("NeoAI").setup({
 ```
 
 **字段说明**：
+
 - `user` — 用户消息文本
 - `assistant` — AI 回复的 JSON 字符串数组，每个元素是一轮 AI 回复，包含 `content`（回复内容）和 `reasoning_content`（深度思考文本）。支持工具调用时的多轮对话
 - `timestamp` — 本轮对话的时间戳
 - `usage` — token 用量统计（从流式响应结束时的 `data.usage` 提取）
 
 **关键方法**：
+
 - `create_session(name, is_root, parent_id)` — 创建会话（根/子），自动将新会话ID添加到父会话的 `child_ids`
 - `get_session(session_id)` / `get_current_session()` — 获取会话
 - `set_current_session(session_id)` — 设置当前会话
@@ -257,6 +279,7 @@ require("NeoAI").setup({
 - `rename_session(session_id, new_name)` — 重命名会话
 
 **树结构生成规则**（`get_tree()`）：
+
 1. 先调用 `cleanup_orphans()` 清理孤儿
 2. 遍历所有 `is_root=true` 的会话
 3. 对每个会话递归构建子节点
@@ -264,6 +287,7 @@ require("NeoAI").setup({
 5. 如果只有一个子会话，直接作为子节点
 
 **上下文路径规则**（`get_context_and_new_parent()`）：
+
 1. 从当前会话开始
 2. 如果无子会话 → 当前会话的消息作为上文，在此新开子会话
 3. 如果只有一个子会话 → 继续往下捋
@@ -274,11 +298,13 @@ require("NeoAI").setup({
 - 保留向后兼容，新代码应使用 `history_manager`
 - 旧版数据格式：`{ "1": { id: 1, messages: [...], branches: {...}, current_branch_id: "..." } }`
 - 新版数据格式：`[{ id: "session_1", is_root: true, child_ids: [...], rounds: [...] }]`
+- 已移除 `event_bus` 兼容层，子模块初始化不再传递 `event_bus` 参数
 
 ### `core/session/tree_manager.lua` — 旧版树形结构管理器（已废弃）
 
 - 保留向后兼容
 - 新版树结构由 `history_manager.get_tree()` 直接生成
+- 已移除 `event_bus` 兼容层
 
 ---
 
@@ -306,6 +332,7 @@ tree_window.set_keymaps(keymap_manager)       ← 设置按键映射
 ```
 
 树界面按键（由 `tree_window.set_keymaps()` 设置）：
+
 - `<CR>` — 选择会话 → `tree_handlers.handle_enter()` → 打开聊天
 - `n` — 在当前会话下新建子会话（分支）：
   1. 获取当前光标选中的会话
@@ -356,6 +383,7 @@ AI响应完成后：
 ```
 
 聊天界面按键（由 `chat_window.set_keymaps()` 设置）：
+
 - `<CR>` — 发送消息
 - `<Esc>` — 取消生成
 - `e` — 编辑消息
@@ -466,11 +494,11 @@ reasoning_display.close()                     ← 关闭窗口，转换为折叠
 
 支持三种窗口模式，由 `ui.window_mode` 配置：
 
-| 模式 | 创建方式 | 关闭方式 | 适用场景 |
-|------|----------|----------|----------|
-| `float` | `nvim_open_win` 浮动窗口 | `nvim_win_close` | 临时交互 |
-| `tab` | `tabnew` 新标签页 | `tabclose` | 长时间工作 |
-| `split` | `vsplit`/`split` 分割 | `nvim_win_close` | 并排查看 |
+| 模式    | 创建方式                 | 关闭方式         | 适用场景   |
+| ------- | ------------------------ | ---------------- | ---------- |
+| `float` | `nvim_open_win` 浮动窗口 | `nvim_win_close` | 临时交互   |
+| `tab`   | `tabnew` 新标签页        | `tabclose`       | 长时间工作 |
+| `split` | `vsplit`/`split` 分割    | `nvim_win_close` | 并排查看   |
 
 ### 7. 虚拟输入框
 
@@ -613,23 +641,24 @@ vim.api.nvim_create_autocmd("User", {
 
 ## 错误处理
 
-| 错误类型 | 触发事件 | 处理方式 |
-|----------|----------|----------|
-| 请求错误 | `NeoAI:generation_error` | 最多重试 3 次，间隔 1 秒 |
-| 流式错误 | `NeoAI:stream_error` | 最多重试 3 次 |
-| 工具执行错误 | `NeoAI:tool_execution_error` | 返回错误结果给模型 |
-| 网络错误 | `NeoAI:generation_error` | 自动重试 |
+| 错误类型     | 触发事件                     | 处理方式                 |
+| ------------ | ---------------------------- | ------------------------ |
+| 请求错误     | `NeoAI:generation_error`     | 最多重试 3 次，间隔 1 秒 |
+| 流式错误     | `NeoAI:stream_error`         | 最多重试 3 次            |
+| 工具执行错误 | `NeoAI:tool_execution_error` | 返回错误结果给模型       |
+| 网络错误     | `NeoAI:generation_error`     | 自动重试                 |
 
 ---
 
 ## 设计原则
 
-1. **事件驱动**：模块间通过 Neovim 原生事件通信，避免直接依赖
+1. **事件驱动**：模块间通过 Neovim 原生事件系统（`nvim_exec_autocmds`/`nvim_create_autocmd`）通信，避免直接依赖，已移除旧 `event_bus` 兼容层
 2. **职责单一**：每个模块只负责一个领域的功能
-3. **配置集中**：所有配置在 `default_config.lua` 中统一管理
-4. **防抖持久化**：会话数据使用 500ms 防抖保存
-5. **单一数据源**：`history_manager` 是唯一的会话数据源，旧版 `session_manager` 保留向后兼容
-6. **安全调用**：跨模块依赖使用 `pcall` 保护
+3. **配置集中**：所有配置在 `default_config.lua` 中统一管理，`process_config()` 一步完成验证→合并→清理→初始化
+4. **状态统一**：`core/state.lua` 集中管理共享状态，各模块不再维护独立 `state` 表
+5. **防抖持久化**：会话数据使用 500ms 防抖保存
+6. **单一数据源**：`history_manager` 是唯一的会话数据源，旧版 `session_manager` 保留向后兼容
+7. **安全调用**：跨模块依赖使用 `pcall` 保护
 
 ---
 
@@ -641,8 +670,36 @@ vim.api.nvim_create_autocmd("User", {
 
 ```json
 [
-{"id":"session_1","name":"根会话","created_at":1234567890,"updated_at":1234567890,"is_root":true,"child_ids":["session_2"],"user":"你好","assistant":["{\"content\":\"你好！有什么可以帮助你的？\",\"reasoning_content\":\"思考文本\"}"],"timestamp":1234567890,"usage":{"prompt_tokens":24,"completion_tokens":770,"total_tokens":794}},
-{"id":"session_2","name":"子会话-根会话","created_at":1234567891,"updated_at":1234567891,"is_root":false,"child_ids":[],"user":"","assistant":[],"timestamp":null,"usage":{}}
+  {
+    "id": "session_1",
+    "name": "根会话",
+    "created_at": 1234567890,
+    "updated_at": 1234567890,
+    "is_root": true,
+    "child_ids": ["session_2"],
+    "user": "你好",
+    "assistant": [
+      "{\"content\":\"你好！有什么可以帮助你的？\",\"reasoning_content\":\"思考文本\"}"
+    ],
+    "timestamp": 1234567890,
+    "usage": {
+      "prompt_tokens": 24,
+      "completion_tokens": 770,
+      "total_tokens": 794
+    }
+  },
+  {
+    "id": "session_2",
+    "name": "子会话-根会话",
+    "created_at": 1234567891,
+    "updated_at": 1234567891,
+    "is_root": false,
+    "child_ids": [],
+    "user": "",
+    "assistant": [],
+    "timestamp": null,
+    "usage": {}
+  }
 ]
 ```
 
@@ -653,34 +710,48 @@ vim.api.nvim_create_autocmd("User", {
 `history_manager.get_tree()` 返回的树结构（每个节点代表一轮对话）：
 
 ```
-会话1 (👤你好 | 🤖你好...)          ← 无子会话，直接显示轮次内容
-├── 会话2 (👤继续... | 🤖好的...)   ← 只有一个子会话，合并显示（不创建轮次节点）
-│   └── 会话3 (👤请问...)           ← 只有一个子会话，继续合并
-└── 📂 会话1 (分支)                 ← 多个子会话，自动生成虚拟分支节点
-    ├── 会话4 (👤帮我...)           ← 分支下的子会话
-    └── 会话5 (👤另一个问题...)     ← 分支下的子会话
-根会话2 (👤新话题)                  ← 无子会话，直接显示轮次内容
+=== NeoAI 会话树 ===
+
+📂 聊天会话
+│  ├─ 👤你好 | 🤖你好！有什么可以帮你的吗？无…
+│  📂 聊天会话
+│  │  └─ 👤给我讲一个笑话… | 🤖为什么程序…
+│  └─ 👤给我讲一个故事…
+📂 聊天会话
+   └─ 👤你是谁 | 🤖你好！我是 Claud…
+
 ```
 
-**渲染规则**：
-- `child_ids == 0`：轮次内容直接作为节点名称显示
-- `child_ids == 1`：轮次内容作为当前节点名称，子会话直接作为子节点（合并显示，不创建轮次节点）
-- `child_ids > 1`：轮次内容作为子节点显示，再创建虚拟分支节点（`__branch_xxx`，`is_virtual=true`，不存文件）
-- 树节点显示轮次预览（用户消息和AI回复的前 20 个字符）
+**渲染规则**（由 `history_tree.lua` 实现）：
+
+- `get_tree()` 返回**原始树结构**，不创建虚拟节点
+  - 每个节点包含：`id`, `session_id`, `name`, `round_text`, `children`
+  - 递归构建：从根会话开始，遍历 `child_ids` 递归添加子节点
+- 树节点显示轮次预览（`build_round_text()` 生成，用户消息和AI回复的前 20 个字符）
+- 虚拟分支节点（`__branch_xxx`，`is_virtual=true`）由 UI 层 `history_tree.lua` 在渲染时创建，不存文件
 
 ### 上下文路径规则
 
-选中会话打开聊天时：
+`get_context_and_new_parent(session_id)` 的实现逻辑：
 
 ```
 选中会话 A
   │
-  ├── 无子会话 → A的消息作为上文，在A下新开子会话
+  ├── 第一步：从 A 向上回溯到根，收集路径上所有会话的消息
+  │   （按从根到 A 的顺序，作为上下文消息列表）
   │
-  ├── 一个子会话 B → 继续往下捋
-  │   ├── B无子会话 → A+B的消息作为上文，在B下新开子会话
-  │   ├── B一个子会话 C → 继续...
-  │   └── B多个子会话 → A+B的消息作为上文，在B下新开子会话
+  ├── 第二步：从 A 沿子会话链向下走，确定新会话的挂载点
+  │   ├── A 无子会话（链尾）→ A 本身作为 new_parent_id
+  │   ├── A 有唯一子会话 B → 继续沿链向下
+  │   │   ├── B 无子会话（链尾）→ B 作为 new_parent_id
+  │   │   ├── B 有唯一子会话 C → 继续...
+  │   │   └── B 有多个子会话（分支点）→ B 作为 new_parent_id
+  │   └── A 有多个子会话（分支点）→ A 本身作为 new_parent_id
   │
-  └── 多个子会话 → A的消息作为上文，在A下新开子会话
+  └── 返回：context_msgs（从根到 A 的所有消息）, new_parent_id（挂载点）
 ```
+
+**关键区别**：
+
+- 上下文消息**从根到选中会话**整条路径收集，而非仅选中会话本身
+- 新会话挂载点**沿子会话链向下**寻找链尾或分支点，而非在选中会话下直接创建

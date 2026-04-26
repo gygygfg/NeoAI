@@ -104,62 +104,84 @@ function M.build_request(params)
     or tostring(os.time()) .. "_" .. tostring(math.random(1000, 9999)) .. "_" .. tostring(state.tool_call_counter)
 
   -- 构建基础请求
-  local request = {
-    model = options.model or state.config.model or "gpt-4",
-    messages = messages,
-    max_tokens = options.max_tokens or state.config.max_tokens or 2000,
-    stream = options.stream ~= false, -- 默认启用流式
-  }
+  -- 支持两种模式：
+  --   1. "chat"（默认）：使用 /chat/completions 格式，messages 数组
+  --   2. "fim"：使用 /completions 格式，prompt + suffix（Fill-in-the-Middle）
+  local mode = options.mode or "chat"
+  local request
 
-  -- 添加思考启用配置 - 修正格式
-  local reasoning_enabled
-  if options.reasoning_enabled ~= nil then
-    reasoning_enabled = options.reasoning_enabled
+  if mode == "fim" then
+    -- FIM 补全模式：使用 prompt + suffix 格式
+    -- 参考 DeepSeek FIM API: https://api-docs.deepseek.com/api/fim-completions
+    -- 注意：FIM 模式使用 /completions 端点而非 /chat/completions
+    request = {
+      model = options.model or state.config.model or "gpt-4",
+      prompt = options.prompt or "",
+      suffix = options.suffix or "",
+      max_tokens = options.max_tokens or state.config.max_tokens or 64,
+      stream = false, -- FIM 补全不支持流式
+    }
   else
-    reasoning_enabled = state.config.reasoning_enabled
+    -- 聊天补全模式（默认）
+    request = {
+      model = options.model or state.config.model or "gpt-4",
+      messages = messages,
+      max_tokens = options.max_tokens or state.config.max_tokens or 2000,
+      stream = options.stream ~= false, -- 默认启用流式
+    }
   end
 
-  -- DeepSeek Thinking Mode: 将 thinking 参数放入 extra_body
-  -- 不支持参数：temperature、top_p、presence_penalty、frequency_penalty
-  -- 设置这些参数不会报错，但也不会生效
-  if reasoning_enabled then
-    -- 映射 effort 级别
-    -- low/medium -> high, xhigh -> max
-    local raw_effort = options.reasoning_effort or state.config.reasoning_effort or "high"
-    local effort_map = {
-      low = "high",
-      medium = "high",
-      high = "high",
-      xhigh = "max",
-      max = "max",
-    }
-    local thinking_effort = effort_map[raw_effort] or "high"
+  -- FIM 补全模式不支持 thinking/reasoning 参数，直接跳过
+  if mode ~= "fim" then
+    -- 添加思考启用配置
+    local reasoning_enabled
+    if options.reasoning_enabled ~= nil then
+      reasoning_enabled = options.reasoning_enabled
+    else
+      reasoning_enabled = state.config.reasoning_enabled
+    end
 
-    request.extra_body = {
-      thinking = {
-        enabled = true,
-        effort = thinking_effort,
-      },
-    }
-  else
-    -- 非思考模式：可以设置 temperature 等参数
-    request.temperature = options.temperature or state.config.temperature or 0.7
+    -- DeepSeek Thinking Mode: 将 thinking 和 reasoning_effort 参数放入 extra_body
+    if reasoning_enabled then
+      local raw_effort = options.reasoning_effort or state.config.reasoning_effort or "high"
+      local effort_map = {
+        low = "low",
+        medium = "low",
+        high = "high",
+        xhigh = "max",
+        max = "max",
+      }
+      local thinking_effort = effort_map[raw_effort] or "high"
+
+      request.extra_body = {
+        thinking = {
+          type = "enabled",
+        },
+        reasoning_effort = thinking_effort,
+      }
+    else
+      -- 非思考模式：可以设置 temperature 等参数
+      request.temperature = options.temperature or state.config.temperature or 0.7
+    end
   end
 
   -- 添加工具定义（如果启用了工具）
-  -- 优先级：options.tools_enabled > state.config.tools.enabled > state.config.tools_enabled
-  local tools_enabled
-  if options.tools_enabled ~= nil then
-    tools_enabled = options.tools_enabled
-  elseif state.config.tools and state.config.tools.enabled ~= nil then
-    tools_enabled = state.config.tools.enabled
-  else
-    tools_enabled = state.config.tools_enabled
-  end
+  -- FIM 补全模式不支持工具调用
+  if mode ~= "fim" then
+    -- 优先级：options.tools_enabled > state.config.tools.enabled > state.config.tools_enabled
+    local tools_enabled
+    if options.tools_enabled ~= nil then
+      tools_enabled = options.tools_enabled
+    elseif state.config.tools and state.config.tools.enabled ~= nil then
+      tools_enabled = state.config.tools.enabled
+    else
+      tools_enabled = state.config.tools_enabled
+    end
 
-  if tools_enabled and #state.tool_definitions > 0 then
-    request.tools = state.tool_definitions
-    request.tool_choice = "auto" -- 让模型自动选择工具
+    if tools_enabled and #state.tool_definitions > 0 then
+      request.tools = state.tool_definitions
+      request.tool_choice = "auto" -- 让模型自动选择工具
+    end
   end
 
   -- 添加会话上下文

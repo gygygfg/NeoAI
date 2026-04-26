@@ -591,15 +591,6 @@ function M.close_window(window_id)
   -- 使用窗口模式管理器关闭窗口
   if window.window_info then
     close_window_by_mode(window.window_info)
-  else
-    -- 向后兼容：旧方式关闭窗口
-    if vim.api.nvim_win_is_valid(window.win) then
-      vim.api.nvim_win_close(window.win, true)
-    end
-
-    if vim.api.nvim_buf_is_valid(window.buf) then
-      vim.api.nvim_buf_delete(window.buf, { force = true })
-    end
   end
 
   -- 触发窗口关闭事件
@@ -692,11 +683,6 @@ function M.focus_window(window_id)
   -- 使用窗口模式管理器聚焦窗口
   if window.window_info then
     focus_window_by_mode(window.window_info)
-  else
-    -- 向后兼容：旧方式聚焦窗口
-    if vim.api.nvim_win_is_valid(window.win) then
-      vim.api.nvim_set_current_win(window.win)
-    end
   end
 end
 
@@ -756,26 +742,6 @@ function M.set_window_content(window_id, content)
   if window.window_info then
     local ft = window.type == "chat" and "markdown" or "neoai_" .. window.type
     set_window_content_by_mode(window.window_info, content, ft, window.type)
-  else
-    -- 向后兼容：旧方式设置内容
-    local buf = window.buf
-    if not vim.api.nvim_buf_is_valid(buf) then
-      return
-    end
-    -- 确保缓冲区可修改
-    vim.api.nvim_set_option_value("modifiable", true, { buf = buf })
-    vim.api.nvim_set_option_value("readonly", false, { buf = buf })
-
-    -- 清空缓冲区
-    vim.api.nvim_buf_set_lines(buf, 0, -1, false, {})
-
-    -- 设置内容
-    if type(content) == "table" then
-      vim.api.nvim_buf_set_lines(buf, 0, -1, false, content)
-    else
-      local lines = vim.split(content, "\n")
-      vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
-    end
   end
 
   -- 根据窗口类型设置缓冲区选项
@@ -833,17 +799,6 @@ function M.append_window_content(window_id, content)
   -- 使用窗口模式管理器追加内容
   if window.window_info then
     append_window_content_by_mode(window.window_info, content)
-  else
-    -- 向后兼容：旧方式追加内容
-    local buf = window.buf
-    if not vim.api.nvim_buf_is_valid(buf) then
-      return
-    end
-
-    local lines = vim.split(content, "\n")
-    local line_count = vim.api.nvim_buf_line_count(buf)
-
-    vim.api.nvim_buf_set_lines(buf, line_count, line_count, false, lines)
   end
 end
 

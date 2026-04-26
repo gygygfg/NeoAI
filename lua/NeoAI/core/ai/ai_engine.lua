@@ -809,10 +809,20 @@ function M.handle_ai_response(generation_id, response, params)
         response_content = choice.message.content
       end
 
-      -- 提取思考内容（非流式模式：不触发 REASONING_CONTENT 事件，避免打开悬浮窗）
+      -- 提取思考内容
       -- 注意：思考模型可能同时返回 reasoning_content 和 tool_calls
       if choice.message.reasoning_content then
         reasoning_content = choice.message.reasoning_content
+        -- 非流式模式：触发 REASONING_CONTENT 事件，让 UI 显示推理内容
+        vim.api.nvim_exec_autocmds("User", {
+          pattern = event_constants.REASONING_CONTENT,
+          data = {
+            generation_id = generation_id,
+            reasoning_content = reasoning_content,
+            session_id = session_id,
+            window_id = window_id,
+          },
+        })
       end
 
       -- 提取工具调用

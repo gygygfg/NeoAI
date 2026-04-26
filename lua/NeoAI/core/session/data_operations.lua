@@ -8,7 +8,6 @@ local Events = require("NeoAI.core.events.event_constants")
 -- 模块状态
 local state = {
   initialized = false,
-  event_bus = nil,
   config = nil,
 }
 
@@ -19,7 +18,6 @@ function M.initialize(options)
     return
   end
 
-  state.event_bus = options.event_bus
   state.config = options.config or {}
   state.initialized = true
 end
@@ -283,8 +281,8 @@ function M.save_session(session_id, filepath)
 
   local success = file_utils.write_file(filepath, vim.json.encode(export_data))
 
-  if success and state.event_bus then
-vim.api.nvim_exec_autocmds("User", { pattern = Events.SESSION_SAVED, data = { session_id, filepath } })
+  if success then
+    vim.api.nvim_exec_autocmds("User", { pattern = Events.SESSION_SAVED, data = { session_id, filepath } })
   end
 
   return success
@@ -314,8 +312,8 @@ function M.load_session(filepath)
 
   local new_session_id = M.import_session(import_data, "json")
 
-  if new_session_id and state.event_bus then
-vim.api.nvim_exec_autocmds("User", { pattern = Events.SESSION_LOADED, data = { new_session_id, filepath } })
+  if new_session_id then
+    vim.api.nvim_exec_autocmds("User", { pattern = Events.SESSION_LOADED, data = { new_session_id, filepath } })
   end
 
   return new_session_id
@@ -324,7 +322,6 @@ end
 --- 重置数据操作模块（主要用于测试）
 function M.reset()
   state.initialized = false
-  state.event_bus = nil
   state.config = nil
 
   return true

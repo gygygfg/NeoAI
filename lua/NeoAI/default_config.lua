@@ -701,356 +701,62 @@ function M.is_complete()
   return valid
 end
 
---- 验证用户配置（兼容旧版本）
+--- 处理用户配置：验证 → 合并 → 清理，一步完成
+--- 替代旧的 validate_config + merge_defaults + sanitize_config 三步流程
+--- @param user_config table 用户配置
+--- @return table 处理后的完整配置
+function M.process_config(user_config)
+  local config = user_config or {}
+
+  -- 1. 验证并清理用户配置中的无效字段
+  config = M._validate_and_clean(config)
+
+  -- 2. 合并到默认配置
+  local result = M._merge_with_defaults(config)
+
+  -- 3. 初始化状态管理器
+  M.initialize(result)
+
+  -- 4. 确保保存目录存在
+  if result.session and result.session.save_path then
+    local path = result.session.save_path
+    if vim.fn.isdirectory(path) == 0 then
+      vim.fn.mkdir(path, "p")
+    end
+  end
+
+  return result
+end
+
+--- 验证并清理用户配置中的无效字段（内部函数）
 --- @param config table 用户配置
---- @return table 验证后的配置
-function M.validate_config(config)
-  if not config then
+--- @return table 清理后的配置
+function M._validate_and_clean(config)
+  if not config or next(config) == nil then
     return {}
   end
 
-  -- 验证AI配置
+  -- 验证 AI 配置
   if config.ai then
-    -- 验证 providers
-    if config.ai.providers then
-      if type(config.ai.providers) ~= "table" then
-        vim.notify("[NeoAI] ai.providers must be a table. Using default.", vim.log.levels.WARN)
-        config.ai.providers = nil
-      else
-        for name, provider in pairs(config.ai.providers) do
-          if type(provider) ~= "table" then
-            vim.notify(string.format("[NeoAI] ai.providers.%s must be a table. Ignoring.", name), vim.log.levels.WARN)
-            config.ai.providers[name] = nil
-          else
-            if provider.base_url and type(provider.base_url) ~= "string" then
-              vim.notify(
-                string.format("[NeoAI] ai.providers.%s.base_url must be a string. Ignoring.", name),
-                vim.log.levels.WARN
-              )
-              provider.base_url = nil
-            end
-            if provider.api_key and type(provider.api_key) ~= "string" then
-              vim.notify(
-                string.format("[NeoAI] ai.providers.%s.api_key must be a string. Ignoring.", name),
-                vim.log.levels.WARN
-              )
-              provider.api_key = nil
-            end
-          end
-        end
-      end
-    end
-
-    -- 验证 scenarios
-    if config.ai.scenarios then
-      if type(config.ai.scenarios) ~= "table" then
-        vim.notify("[NeoAI] ai.scenarios must be a table. Using default.", vim.log.levels.WARN)
-        config.ai.scenarios = nil
-      else
-        local valid_scenarios = { "naming", "chat", "reasoning", "coding", "tools", "agent" }
-        for name, entry in pairs(config.ai.scenarios) do
-          if not vim.tbl_contains(valid_scenarios, name) then
-            vim.notify(
-              string.format("[NeoAI] ai.scenarios.%s is not a valid scenario. Ignoring.", name),
-              vim.log.levels.WARN
-            )
-            config.ai.scenarios[name] = nil
-          elseif type(entry) ~= "table" then
-            vim.notify(string.format("[NeoAI] ai.scenarios.%s must be a table. Ignoring.", name), vim.log.levels.WARN)
-            config.ai.scenarios[name] = nil
-          elseif entry[1] == nil or type(entry[1]) ~= "table" then
-            -- 单元素表：{ provider = '', model_name = '', ... }
-            if entry.provider and type(entry.provider) ~= "string" then
-              vim.notify(
-                string.format("[NeoAI] ai.scenarios.%s.provider must be a string. Ignoring.", name),
-                vim.log.levels.WARN
-              )
-              entry.provider = nil
-            end
-            if entry.model_name and type(entry.model_name) ~= "string" then
-              vim.notify(
-                string.format("[NeoAI] ai.scenarios.%s.model_name must be a string. Ignoring.", name),
-                vim.log.levels.WARN
-              )
-              entry.model_name = nil
-            end
-            if
-              entry.temperature
-              and (type(entry.temperature) ~= "number" or entry.temperature < 0 or entry.temperature > 2)
-            then
-              vim.notify(
-                string.format("[NeoAI] ai.scenarios.%s.temperature must be between 0 and 2. Ignoring.", name),
-                vim.log.levels.WARN
-              )
-              entry.temperature = nil
-            end
-            if entry.max_tokens and (type(entry.max_tokens) ~= "number" or entry.max_tokens < 1) then
-              vim.notify(
-                string.format("[NeoAI] ai.scenarios.%s.max_tokens must be a positive number. Ignoring.", name),
-                vim.log.levels.WARN
-              )
-              entry.max_tokens = nil
-            end
-          else
-            -- 数组：{ { provider = '', ... }, { provider = '', ... } }
-            for i, candidate in ipairs(entry) do
-              if type(candidate) ~= "table" then
-                vim.notify(
-                  string.format("[NeoAI] ai.scenarios.%s[%d] must be a table. Ignoring.", name, i),
-                  vim.log.levels.WARN
-                )
-                entry[i] = nil
-              else
-                if candidate.provider and type(candidate.provider) ~= "string" then
-                  vim.notify(
-                    string.format("[NeoAI] ai.scenarios.%s[%d].provider must be a string. Ignoring.", name, i),
-                    vim.log.levels.WARN
-                  )
-                  candidate.provider = nil
-                end
-                if candidate.model_name and type(candidate.model_name) ~= "string" then
-                  vim.notify(
-                    string.format("[NeoAI] ai.scenarios.%s[%d].model_name must be a string. Ignoring.", name, i),
-                    vim.log.levels.WARN
-                  )
-                  candidate.model_name = nil
-                end
-                if
-                  candidate.temperature
-                  and (
-                    type(candidate.temperature) ~= "number"
-                    or candidate.temperature < 0
-                    or candidate.temperature > 2
-                  )
-                then
-                  vim.notify(
-                    string.format("[NeoAI] ai.scenarios.%s[%d].temperature must be between 0 and 2. Ignoring.", name, i),
-                    vim.log.levels.WARN
-                  )
-                  candidate.temperature = nil
-                end
-                if candidate.max_tokens and (type(candidate.max_tokens) ~= "number" or candidate.max_tokens < 1) then
-                  vim.notify(
-                    string.format(
-                      "[NeoAI] ai.scenarios.%s[%d].max_tokens must be a positive number. Ignoring.",
-                      name,
-                      i
-                    ),
-                    vim.log.levels.WARN
-                  )
-                  candidate.max_tokens = nil
-                end
-              end
-            end
-          end
-        end
-      end
-    end
+    M._validate_ai_config(config.ai)
   end
 
-  -- 验证UI配置
+  -- 验证 UI 配置
   if config.ui then
-    -- 验证默认UI
-    if config.ui.default_ui then
-      local valid_uis = { "tree", "chat" }
-      if not vim.tbl_contains(valid_uis, config.ui.default_ui) then
-        vim.notify(
-          string.format("[NeoAI] ui.default_ui must be one of: tree, chat. Using default.", config.ui.default_ui),
-          vim.log.levels.WARN
-        )
-        config.ui.default_ui = nil
-      end
-    end
-
-    -- 验证窗口模式
-    if config.ui.window_mode then
-      local valid_modes = { "float", "tab", "split" }
-      if not vim.tbl_contains(valid_modes, config.ui.window_mode) then
-        vim.notify(
-          string.format(
-            "[NeoAI] ui.window_mode must be one of: float, tab, split. Using default.",
-            config.ui.window_mode
-          ),
-          vim.log.levels.WARN
-        )
-        config.ui.window_mode = nil
-      end
-    end
-
-    if config.ui.window then
-      if config.ui.window.width and (type(config.ui.window.width) ~= "number" or config.ui.window.width < 10) then
-        vim.notify("[NeoAI] ui.window.width must be a number >= 10. Using default.", vim.log.levels.WARN)
-        config.ui.window.width = nil
-      end
-
-      if config.ui.window.height and (type(config.ui.window.height) ~= "number" or config.ui.window.height < 5) then
-        vim.notify("[NeoAI] ui.window.height must be a number >= 5. Using default.", vim.log.levels.WARN)
-        config.ui.window.height = nil
-      end
-    end
-
-    -- 验证 split 配置
-    if config.ui.split then
-      if config.ui.split.chat_direction then
-        local valid_directions = { "left", "right" }
-        if not vim.tbl_contains(valid_directions, config.ui.split.chat_direction) then
-          vim.notify(
-            string.format("[NeoAI] ui.split.chat_direction must be one of: left, right. Using default."),
-            vim.log.levels.WARN
-          )
-          config.ui.split.chat_direction = nil
-        end
-      end
-      if config.ui.split.tree_direction then
-        local valid_directions = { "left", "right" }
-        if not vim.tbl_contains(valid_directions, config.ui.split.tree_direction) then
-          vim.notify(
-            string.format("[NeoAI] ui.split.tree_direction must be one of: left, right. Using default."),
-            vim.log.levels.WARN
-          )
-          config.ui.split.tree_direction = nil
-        end
-      end
-      if
-        config.ui.split.size
-        and (
-          type(config.ui.split.size) ~= "number"
-          or (config.ui.split.size > 1 and config.ui.split.size < 10)
-          or config.ui.split.size <= 0
-        )
-      then
-        vim.notify("[NeoAI] ui.split.size must be >1 (columns) or 0~1 (ratio). Using default.", vim.log.levels.WARN)
-        config.ui.split.size = nil
-      end
-    end
+    M._validate_ui_config(config.ui)
   end
 
-  -- 验证键位配置（现在在顶层）
+  -- 验证键位配置
   if config.keymaps then
-    local valid_contexts = { "global", "tree", "chat", "virtual_input" }
-    for context, keymap_table in pairs(config.keymaps) do
-      -- 检查上下文是否有效
-      if not vim.tbl_contains(valid_contexts, context) then
-        vim.notify(
-          string.format(
-            "[NeoAI] Invalid keymap context: %s. Valid contexts are: global, tree, chat, virtual_input. Using default.",
-            context
-          ),
-          vim.log.levels.WARN
-        )
-        config.keymaps[context] = nil
-      else
-        -- 检查键位表是否为table
-        if type(keymap_table) ~= "table" then
-          vim.notify(string.format("[NeoAI] keymaps.%s must be a table. Using default.", context), vim.log.levels.WARN)
-          config.keymaps[context] = nil
-        else
-          -- 验证每个键位配置
-          for action, key_config in pairs(keymap_table) do
-            -- 特殊处理 send 配置（它本身是一个包含 insert 和 normal 的表）
-            if action == "send" then
-              if type(key_config) ~= "table" then
-                vim.notify(
-                  string.format(
-                    "[NeoAI] keymaps.%s.send must be a table with insert and normal fields. Using default.",
-                    context
-                  ),
-                  vim.log.levels.WARN
-                )
-                keymap_table[action] = nil
-              else
-                -- 验证 insert 配置
-                if key_config.insert then
-                  if type(key_config.insert) ~= "table" then
-                    vim.notify(
-                      string.format(
-                        "[NeoAI] keymaps.%s.send.insert must be a table with key and desc fields. Using default.",
-                        context
-                      ),
-                      vim.log.levels.WARN
-                    )
-                    key_config.insert = nil
-                  else
-                    if not key_config.insert.key or type(key_config.insert.key) ~= "string" then
-                      vim.notify(
-                        string.format("[NeoAI] keymaps.%s.send.insert.key must be a string. Using default.", context),
-                        vim.log.levels.WARN
-                      )
-                      key_config.insert = nil
-                    end
-                  end
-                end
-
-                -- 验证 normal 配置
-                if key_config.normal then
-                  if type(key_config.normal) ~= "table" then
-                    vim.notify(
-                      string.format(
-                        "[NeoAI] keymaps.%s.send.normal must be a table with key and desc fields. Using default.",
-                        context
-                      ),
-                      vim.log.levels.WARN
-                    )
-                    key_config.normal = nil
-                  else
-                    if not key_config.normal.key or type(key_config.normal.key) ~= "string" then
-                      vim.notify(
-                        string.format("[NeoAI] keymaps.%s.send.normal.key must be a string. Using default.", context),
-                        vim.log.levels.WARN
-                      )
-                      key_config.normal = nil
-                    end
-                  end
-                end
-              end
-            else
-              -- 处理其他普通键位配置
-              if type(key_config) ~= "table" then
-                vim.notify(
-                  string.format(
-                    "[NeoAI] keymaps.%s.%s must be a table with key and desc fields. Using default.",
-                    context,
-                    action
-                  ),
-                  vim.log.levels.WARN
-                )
-                keymap_table[action] = nil
-              else
-                -- 检查key字段是否存在且为字符串
-                if not key_config.key or type(key_config.key) ~= "string" then
-                  vim.notify(
-                    string.format("[NeoAI] keymaps.%s.%s.key must be a string. Using default.", context, action),
-                    vim.log.levels.WARN
-                  )
-                  keymap_table[action] = nil
-                end
-
-                -- 检查desc字段是否存在且为字符串（可选）
-                if key_config.desc and type(key_config.desc) ~= "string" then
-                  vim.notify(
-                    string.format("[NeoAI] keymaps.%s.%s.desc must be a string. Ignoring desc.", context, action),
-                    vim.log.levels.WARN
-                  )
-                  key_config.desc = nil
-                end
-              end
-            end
-          end
-        end
-      end
-    end
+    M._validate_keymap_config(config.keymaps)
   end
 
   -- 验证会话配置
   if config.session then
-    if
-      config.session.max_history_per_session
+    if config.session.max_history_per_session
       and (type(config.session.max_history_per_session) ~= "number" or config.session.max_history_per_session < 1)
     then
-      vim.notify(
-        "[NeoAI] session.max_history_per_session must be a positive number. Using default.",
-        vim.log.levels.WARN
-      )
+      vim.notify("[NeoAI] session.max_history_per_session must be a positive number. Using default.", vim.log.levels.WARN)
       config.session.max_history_per_session = nil
     end
   end
@@ -1058,59 +764,115 @@ function M.validate_config(config)
   return config
 end
 
---- 合并默认配置（兼容旧版本）
---- 以默认配置为模板，只允许覆盖默认配置中已存在的字段路径
+--- 验证 AI 配置
+function M._validate_ai_config(ai_config)
+  -- 验证 providers
+  if ai_config.providers then
+    if type(ai_config.providers) ~= "table" then
+      vim.notify("[NeoAI] ai.providers must be a table. Using default.", vim.log.levels.WARN)
+      ai_config.providers = nil
+      return
+    end
+    for name, provider in pairs(ai_config.providers) do
+      if type(provider) ~= "table" then
+        vim.notify(string.format("[NeoAI] ai.providers.%s must be a table. Ignoring.", name), vim.log.levels.WARN)
+        ai_config.providers[name] = nil
+      end
+    end
+  end
+
+  -- 验证 scenarios
+  if ai_config.scenarios then
+    if type(ai_config.scenarios) ~= "table" then
+      vim.notify("[NeoAI] ai.scenarios must be a table. Using default.", vim.log.levels.WARN)
+      ai_config.scenarios = nil
+      return
+    end
+    local valid_scenarios = { "naming", "chat", "reasoning", "coding", "tools", "agent" }
+    for name, entry in pairs(ai_config.scenarios) do
+      if not vim.tbl_contains(valid_scenarios, name) then
+        vim.notify(string.format("[NeoAI] ai.scenarios.%s is not a valid scenario. Ignoring.", name), vim.log.levels.WARN)
+        ai_config.scenarios[name] = nil
+      elseif type(entry) ~= "table" then
+        vim.notify(string.format("[NeoAI] ai.scenarios.%s must be a table. Ignoring.", name), vim.log.levels.WARN)
+        ai_config.scenarios[name] = nil
+      end
+    end
+  end
+end
+
+--- 验证 UI 配置
+function M._validate_ui_config(ui_config)
+  local valid_uis = { "tree", "chat" }
+  if ui_config.default_ui and not vim.tbl_contains(valid_uis, ui_config.default_ui) then
+    vim.notify("[NeoAI] ui.default_ui must be one of: tree, chat. Using default.", vim.log.levels.WARN)
+    ui_config.default_ui = nil
+  end
+
+  local valid_modes = { "float", "tab", "split" }
+  if ui_config.window_mode and not vim.tbl_contains(valid_modes, ui_config.window_mode) then
+    vim.notify("[NeoAI] ui.window_mode must be one of: float, tab, split. Using default.", vim.log.levels.WARN)
+    ui_config.window_mode = nil
+  end
+
+  if ui_config.window then
+    if ui_config.window.width and (type(ui_config.window.width) ~= "number" or ui_config.window.width < 10) then
+      vim.notify("[NeoAI] ui.window.width must be a number >= 10. Using default.", vim.log.levels.WARN)
+      ui_config.window.width = nil
+    end
+    if ui_config.window.height and (type(ui_config.window.height) ~= "number" or ui_config.window.height < 5) then
+      vim.notify("[NeoAI] ui.window.height must be a number >= 5. Using default.", vim.log.levels.WARN)
+      ui_config.window.height = nil
+    end
+  end
+end
+
+--- 验证键位配置
+function M._validate_keymap_config(keymaps)
+  local valid_contexts = { "global", "tree", "chat", "virtual_input" }
+  for context, keymap_table in pairs(keymaps) do
+    if not vim.tbl_contains(valid_contexts, context) then
+      vim.notify(string.format("[NeoAI] Invalid keymap context: %s. Using default.", context), vim.log.levels.WARN)
+      keymaps[context] = nil
+    elseif type(keymap_table) ~= "table" then
+      vim.notify(string.format("[NeoAI] keymaps.%s must be a table. Using default.", context), vim.log.levels.WARN)
+      keymaps[context] = nil
+    end
+  end
+end
+
+--- 合并用户配置到默认配置（内部函数）
 --- @param config table 用户配置
 --- @return table 合并后的配置
-function M.merge_defaults(config)
+function M._merge_with_defaults(config)
   local result = vim.deepcopy(DEFAULT_CONFIG)
 
   if not config or next(config) == nil then
     return result
   end
 
-  -- 只合并默认配置中已存在的字段路径
   local function merge_known_paths(target, source, path)
     for k, v in pairs(source) do
-      local current_path = path .. "." .. tostring(k)
-
-      -- 目标中不存在该字段，跳过
       if target[k] == nil then
         goto continue
       end
 
-      -- 特殊处理 scenarios
       if k == "scenarios" and type(v) == "table" and type(target[k]) == "table" then
         for scenario_name, scenario_entry in pairs(v) do
           if type(scenario_entry) == "table" and type(target[k][scenario_name]) == "table" then
             local default_entry = target[k][scenario_name]
             if scenario_entry[1] == nil or type(scenario_entry[1]) ~= "table" then
-              -- 单元素表格式：用默认条目的第一个候选为基础，合并用户字段
               if default_entry[1] and type(default_entry[1]) == "table" then
                 local merged = vim.deepcopy(default_entry[1])
                 for field, field_val in pairs(scenario_entry) do
-                  if
-                    merged[field] ~= nil
-                    or field == "provider"
-                    or field == "model_name"
-                    or field == "temperature"
-                    or field == "max_tokens"
-                    or field == "stream"
-                    or field == "timeout"
-                  then
+                  if merged[field] ~= nil or field == "provider" or field == "model_name"
+                    or field == "temperature" or field == "max_tokens" or field == "stream" or field == "timeout" then
                     merged[field] = field_val
                   end
                 end
                 target[k][scenario_name] = merged
-              else
-                for field, field_val in pairs(scenario_entry) do
-                  if target[k][scenario_name][field] ~= nil then
-                    target[k][scenario_name][field] = field_val
-                  end
-                end
               end
             else
-              -- 数组格式：对每个候选进行字段级合并
               for i, candidate in ipairs(scenario_entry) do
                 if default_entry[i] and type(default_entry[i]) == "table" then
                   local merged = vim.deepcopy(default_entry[i])
@@ -1128,10 +890,8 @@ function M.merge_defaults(config)
           end
         end
       elseif type(v) == "table" and type(target[k]) == "table" then
-        -- 递归合并子表
         merge_known_paths(target[k], v, current_path)
       else
-        -- 标量值，直接覆盖
         target[k] = v
       end
 
@@ -1143,18 +903,22 @@ function M.merge_defaults(config)
   return result
 end
 
---- 清理配置（兼容旧版本）
---- @param config table 配置
---- @return table 清理后的配置
+--- 保留旧接口兼容（内部调用 process_config）
+function M.validate_config(config)
+  return M._validate_and_clean(config)
+end
+
+function M.merge_defaults(config)
+  return M._merge_with_defaults(config)
+end
+
 function M.sanitize_config(config)
-  -- 确保必要的路径存在
   if config.session and config.session.save_path then
     local path = config.session.save_path
-    if not vim.fn.isdirectory(path) then
+    if vim.fn.isdirectory(path) == 0 then
       vim.fn.mkdir(path, "p")
     end
   end
-
   return config
 end
 

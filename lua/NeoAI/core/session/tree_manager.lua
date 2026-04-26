@@ -17,7 +17,6 @@ local tree_nodes = {}
 -- 模块状态
 local state = {
   initialized = false,
-  event_bus = nil,
   config = nil,
   save_debounce_timer = nil, -- 保存防抖定时器
 }
@@ -53,7 +52,6 @@ function M.initialize(options)
     return
   end
 
-  state.event_bus = options.event_bus
   state.config = options.config or {}
   state.initialized = true
 
@@ -639,7 +637,6 @@ end
 function M.reset()
   tree_nodes = {}
   state.initialized = false
-  state.event_bus = nil
   state.config = nil
 end
 
