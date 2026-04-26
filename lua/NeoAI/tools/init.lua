@@ -4,7 +4,6 @@ local M = {}
 local tool_registry = require("NeoAI.tools.tool_registry")
 local tool_executor = require("NeoAI.tools.tool_executor")
 local tool_validator = require("NeoAI.tools.tool_validator")
-local tool_history_manager = require("NeoAI.tools.tool_history_manager")
 
 local initialized = false
 local builtin_tools_loaded = false
@@ -22,7 +21,6 @@ function M.initialize(tools_config)
   tool_registry.initialize(config)
   tool_executor.initialize(config)
   tool_validator.initialize(config)
-  tool_history_manager.initialize(config)
 
   if config.builtin ~= false then
     M._load_builtin_tools()
@@ -195,23 +193,46 @@ function M._load_builtin_tools()
     return
   end
 
-  local modules = {
-    "NeoAI.tools.builtin.file_tools",
-    "NeoAI.tools.builtin.general_tools",
-    "NeoAI.tools.builtin.log_tools",
-    "NeoAI.tools.builtin.stop_tool",
-  }
+  -- 根据当前脚本路径动态计算 builtin 目录
+  -- debug.getinfo(1).source 返回 @/path/to/init.lua
+  local script_path = debug.getinfo(1).source:match("^@(.+)$")
+  if not script_path then
+    print("[NeoAI.tools.init] 无法获取脚本路径")
+    builtin_tools_loaded = true
+    return
+  end
+  local builtin_dir = script_path:match("^(.+/)lua/NeoAI/tools/init%.lua$")
+      and script_path:match("^(.+/)lua/NeoAI/tools/init%.lua$") .. "lua/NeoAI/tools/builtin"
+    or nil
 
-  for _, mod_path in ipairs(modules) do
-    -- print("[NeoAI.tools.init] 加载模块: " .. mod_path)
-    local ok, mod = pcall(require, mod_path)
-    if ok and mod and mod.get_tools then
-      local tools = mod.get_tools()
-      for _, tool in ipairs(tools) do
-        M.register_tool(tool)
+  if not builtin_dir then
+    print("[NeoAI.tools.init] 无法计算 builtin 目录路径")
+    builtin_tools_loaded = true
+    return
+  end
+
+  local handle = vim.loop.fs_scandir(builtin_dir)
+  if not handle then
+    print("[NeoAI.tools.init] 无法打开 builtin 目录: " .. builtin_dir)
+    builtin_tools_loaded = true
+    return
+  end
+
+  while true do
+    local name, type = vim.loop.fs_scandir_next(handle)
+    if not name then
+      break
+    end
+    if type == "file" and name:match("%.lua$") then
+      local mod_name = name:gsub("%.lua$", "")
+      local ok, mod = pcall(require, "NeoAI.tools.builtin." .. mod_name)
+      if ok and mod and mod.get_tools then
+        local tools = mod.get_tools()
+        for _, tool in ipairs(tools) do
+          M.register_tool(tool)
+        end
       end
-    else
-      print("[NeoAI.tools.init] 模块加载失败: " .. mod_path .. ", ok=" .. tostring(ok))
+      -- 没有 get_tools 的模块（如 tool_helpers.lua）直接跳过，不报错
     end
   end
 
@@ -250,15 +271,14 @@ function M.update_config(new_config)
   tool_registry.update_config(merged)
   tool_executor.update_config(merged)
   tool_validator.update_config(merged)
-  tool_history_manager.update_config(merged)
 end
 
---- 获取历史管理器实例
+--- 获取历史管理器实例（委托给 core.history_manager）
 function M.get_history_manager()
   if not initialized then
     error("工具系统未初始化")
   end
-  return tool_history_manager
+  return require("NeoAI.core.history_manager")
 end
 
 return M

@@ -16,40 +16,80 @@ end
 -- ============================================================================
 
 local function _read_file(args)
-  if not args or not args.path then
+  if not args then
     return "错误: 需要文件路径"
   end
 
-  local fu = get_file_utils()
-  if fu then
-    local content, err = fu.read_file(args.path)
-    if content then
-      return content
-    end
-    return "错误: " .. (err or "无法读取文件")
+  -- 支持 paths（列表）和 path（单个路径）两种参数
+  local paths = args.paths or {}
+  if args.path and type(args.path) == "string" then
+    table.insert(paths, args.path)
   end
 
-  local file, err = io.open(args.path, "r")
-  if not file then
-    return "错误: " .. (err or "无法读取文件")
+  if #paths == 0 then
+    return "错误: 需要文件路径列表或单个文件路径"
   end
-  local content = file:read("*a")
-  file:close()
-  return content
+
+  local fu = get_file_utils()
+  local results = {}
+
+  for _, filepath in ipairs(paths) do
+    local content, err
+    if fu then
+      content, err = fu.read_file(filepath)
+    else
+      local file, io_err = io.open(filepath, "r")
+      if file then
+        content = file:read("*a")
+        file:close()
+      else
+        err = io_err or "无法读取文件"
+      end
+    end
+
+    if content then
+      local lines = {}
+      local line_num = 1
+      for line in content:gmatch("[^\n]+") do
+        table.insert(lines, string.format("%4d | %s", line_num, line))
+        line_num = line_num + 1
+      end
+      -- 处理文件末尾可能没有换行符的情况
+      if content:sub(-1) == "\n" then
+        table.insert(lines, string.format("%4d |", line_num))
+      end
+      table.insert(results, string.format("=== %s ===\n%s", filepath, table.concat(lines, "\n")))
+    else
+      table.insert(results, string.format("=== %s ===\n错误: %s", filepath, err or "无法读取文件"))
+    end
+  end
+
+  return table.concat(results, "\n\n")
 end
 
 M.read_file = define_tool({
   name = "read_file",
-  description = "读取文件内容",
+  description = "读取一个或多个文件的内容，返回带行号的结果",
   func = _read_file,
   parameters = {
     type = "object",
     properties = {
-      path = { type = "string", description = "文件路径" },
+      paths = {
+        type = "array",
+        items = { type = "string" },
+        description = "文件路径列表（与 path 二选一）",
+      },
+      path = {
+        type = "string",
+        description = "单个文件路径（与 paths 二选一）",
+      },
     },
-    required = { "path" },
+    oneOf = {
+      { required = { "paths" } },
+      { required = { "path" } },
+    },
   },
-  returns = { type = "string", description = "文件内容" },
+  returns = { type = "string", description = "带行号的文件内容" },
   category = "file",
   permissions = { read = true },
 })
@@ -102,46 +142,60 @@ M.write_file = define_tool({
 -- ============================================================================
 
 local function _list_files(args)
-  local dir = args.dir or "."
+  if not args then
+    return {}
+  end
+
+  -- 支持 dirs（列表）和 dir（单个）两种参数
+  local dirs = args.dirs or {}
+  if args.dir and type(args.dir) == "string" then
+    table.insert(dirs, args.dir)
+  end
+  if #dirs == 0 then
+    table.insert(dirs, ".")
+  end
+
   local pattern = args.pattern or "*"
   local recursive = args.recursive or false
   local files = {}
 
-  if vim.fn.has("win32") == 1 or vim.fn.has("win64") == 1 then
-    local dir_cmd = "dir " .. (recursive and "/s " or "") .. "/b /a:-d " .. vim.fn.shellescape(dir) .. " 2>nul"
-    local output = vim.fn.systemlist(dir_cmd)
-    if vim.v.shell_error == 0 then
-      for _, line in ipairs(output) do
-        if pattern == "*" or line:match(vim.pesc(pattern):gsub("%%%*", ".*"):gsub("%%%?", ".")) then
-          table.insert(files, line)
+  for _, dir in ipairs(dirs) do
+    if vim.fn.has("win32") == 1 or vim.fn.has("win64") == 1 then
+      local dir_cmd = "dir " .. (recursive and "/s " or "") .. "/b /a:-d " .. vim.fn.shellescape(dir) .. " 2>nul"
+      local output = vim.fn.systemlist(dir_cmd)
+      if vim.v.shell_error == 0 then
+        for _, line in ipairs(output) do
+          if pattern == "*" or line:match(vim.pesc(pattern):gsub("%%%*", ".*"):gsub("%%%?", ".")) then
+            table.insert(files, line)
+          end
         end
       end
-    end
-  else
-    local ls_cmd = "ls"
-    if recursive then
-      ls_cmd = ls_cmd .. " -laR"
     else
-      ls_cmd = ls_cmd .. " -la"
-    end
-    ls_cmd = ls_cmd .. " --format=single-column --time-style=long-iso " .. vim.fn.shellescape(dir) .. " 2>/dev/null"
-    local output = vim.fn.systemlist(ls_cmd)
-    if vim.v.shell_error == 0 then
-      local current_dir = ""
-      for _, line in ipairs(output) do
-        if line:match("^$") then
+      local ls_cmd = "ls"
+      if recursive then
+        ls_cmd = ls_cmd .. " -laR"
+      else
+        ls_cmd = ls_cmd .. " -la"
+      end
+      ls_cmd = ls_cmd .. " --format=single-column --time-style=long-iso " .. vim.fn.shellescape(dir) .. " 2>/dev/null"
+      local output = vim.fn.systemlist(ls_cmd)
+      if vim.v.shell_error == 0 then
+        local current_dir = ""
+        for _, line in ipairs(output) do
+          if line:match("^$") then
           -- skip
-        elseif line:match(":$") then
-          current_dir = line:gsub(":$", "")
-        elseif line ~= "." and line ~= ".." then
-          if pattern == "*" or line:match(vim.pesc(pattern):gsub("%%%*", ".*"):gsub("%%%?", ".")) then
-            local full_path
-            if recursive and current_dir ~= "" then
-              full_path = current_dir .. "/" .. line
-            else
-              full_path = dir .. "/" .. line
+          elseif line:match(":$") then
+            current_dir = line:gsub(":$", "")
+          elseif line ~= "." and line ~= ".." then
+            if pattern == "*" or line:match(vim.pesc(pattern):gsub("%%%*", ".*"):gsub("%%%?", ".")) then
+              local full_path
+              if recursive and current_dir ~= "" then
+                full_path = current_dir .. "/" .. line
+              else
+                full_path = dir .. "/" .. line
+              end
+              table.insert(files, full_path)
             end
-            table.insert(files, full_path)
           end
         end
       end
@@ -158,7 +212,12 @@ M.list_files = define_tool({
   parameters = {
     type = "object",
     properties = {
-      dir = { type = "string", description = "目录路径", default = "." },
+      dir = { type = "string", description = "单个目录路径（与 dirs 二选一）", default = "." },
+      dirs = {
+        type = "array",
+        items = { type = "string" },
+        description = "目录路径列表（与 dir 二选一）",
+      },
       pattern = { type = "string", description = "文件模式（如 *.txt）", default = "*" },
       recursive = { type = "boolean", description = "是否递归查找", default = false },
     },
@@ -222,7 +281,7 @@ M.search_files = define_tool({
     properties = {
       pattern = { type = "string", description = "搜索模式" },
       dir = { type = "string", description = "搜索目录", default = "." },
-      file_pattern = { type = "string", description = "文件模式（如 *.lua）", default = "*" },
+      file_pattern = { type = "string", description = "文件模式（如 *.py）", default = "*" },
       case_sensitive = { type = "boolean", description = "是否区分大小写", default = false },
     },
     required = { "pattern" },
@@ -248,33 +307,72 @@ M.search_files = define_tool({
 -- ============================================================================
 
 local function _file_exists(args)
-  if not args or not args.path then
-    return false
+  if not args then
+    return {}
   end
+
+  -- 支持 paths（列表）和 path（单个）两种参数
+  local paths = args.paths or {}
+  if args.path and type(args.path) == "string" then
+    table.insert(paths, args.path)
+  end
+
+  if #paths == 0 then
+    return {}
+  end
+
   local fu = get_file_utils()
-  if fu then
-    return fu.exists(args.path)
+  local results = {}
+
+  for _, p in ipairs(paths) do
+    local exists
+    if fu then
+      exists = fu.exists(p)
+    else
+      local file = io.open(p, "r")
+      if file then
+        file:close()
+        exists = true
+      else
+        exists = false
+      end
+    end
+    table.insert(results, { path = p, exists = exists })
   end
-  local file = io.open(args.path, "r")
-  if file then
-    file:close()
-    return true
-  end
-  return false
+
+  return results
 end
 
 M.file_exists = define_tool({
   name = "file_exists",
-  description = "检查文件或目录是否存在",
+  description = "检查一个或多个文件或目录是否存在",
   func = _file_exists,
   parameters = {
     type = "object",
     properties = {
-      path = { type = "string", description = "路径" },
+      path = { type = "string", description = "单个路径（与 paths 二选一）" },
+      paths = {
+        type = "array",
+        items = { type = "string" },
+        description = "路径列表（与 path 二选一）",
+      },
     },
-    required = { "path" },
+    oneOf = {
+      { required = { "paths" } },
+      { required = { "path" } },
+    },
   },
-  returns = { type = "boolean", description = "是否存在" },
+  returns = {
+    type = "array",
+    items = {
+      type = "object",
+      properties = {
+        path = { type = "string" },
+        exists = { type = "boolean" },
+      },
+    },
+    description = "路径存在状态列表",
+  },
   category = "file",
   permissions = { read = true },
 })
@@ -284,34 +382,70 @@ M.file_exists = define_tool({
 -- ============================================================================
 
 local function _create_directory(args)
-  if not args or not args.path then
-    return false
+  if not args then
+    return {}
+  end
+
+  -- 支持 paths（列表）和 path（单个）两种参数
+  local paths = args.paths or {}
+  if args.path and type(args.path) == "string" then
+    table.insert(paths, args.path)
+  end
+
+  if #paths == 0 then
+    return {}
   end
 
   local fu = get_file_utils()
-  if fu then
-    local ok, _ = fu.mkdir(args.path)
-    return ok == true
+  local results = {}
+
+  for _, p in ipairs(paths) do
+    local ok
+    if fu then
+      local success, _ = fu.mkdir(p)
+      ok = success == true
+    else
+      local cmd = 'mkdir -p "' .. p .. '" 2>/dev/null'
+      local result = os.execute(cmd)
+      ok = result == 0 or result == true
+    end
+    table.insert(results, { path = p, success = ok })
   end
 
-  local cmd = 'mkdir -p "' .. args.path .. '" 2>/dev/null'
-  local result = os.execute(cmd)
-  return result == 0 or result == true
+  return results
 end
 
 M.create_directory = define_tool({
   name = "create_directory",
-  description = "创建目录",
+  description = "创建一个或多个目录",
   func = _create_directory,
   parameters = {
     type = "object",
     properties = {
-      path = { type = "string", description = "目录路径" },
+      path = { type = "string", description = "单个目录路径（与 paths 二选一）" },
+      paths = {
+        type = "array",
+        items = { type = "string" },
+        description = "目录路径列表（与 path 二选一）",
+      },
       parents = { type = "boolean", description = "是否创建父目录", default = true },
     },
-    required = { "path" },
+    oneOf = {
+      { required = { "paths" } },
+      { required = { "path" } },
+    },
   },
-  returns = { type = "boolean", description = "是否创建成功" },
+  returns = {
+    type = "array",
+    items = {
+      type = "object",
+      properties = {
+        path = { type = "string" },
+        success = { type = "boolean" },
+      },
+    },
+    description = "目录创建结果列表",
+  },
   category = "file",
   permissions = { write = true },
 })
@@ -321,35 +455,149 @@ M.create_directory = define_tool({
 -- ============================================================================
 
 local function _ensure_dir(args)
-  if not args or not args.path then
-    return false
+  if not args then
+    return {}
+  end
+
+  -- 支持 paths（列表）和 path（单个）两种参数
+  local paths = args.paths or {}
+  if args.path and type(args.path) == "string" then
+    table.insert(paths, args.path)
+  end
+
+  if #paths == 0 then
+    return {}
   end
 
   local fu = get_file_utils()
-  if fu then
-    local ok, _ = fu.mkdir(args.path)
-    return ok == true
+  local results = {}
+
+  for _, p in ipairs(paths) do
+    local ok
+    if fu then
+      local success, _ = fu.mkdir(p)
+      ok = success == true
+    else
+      local clean_path = p:gsub("/+$", "")
+      local cmd = 'mkdir -p "' .. clean_path .. '" 2>/dev/null'
+      local result = os.execute(cmd)
+      ok = result == 0 or result == true
+    end
+    table.insert(results, { path = p, success = ok })
   end
 
-  local path = args.path:gsub("/+$", "")
-  local cmd = 'mkdir -p "' .. path .. '" 2>/dev/null'
-  local result = os.execute(cmd)
-  return result == 0 or result == true
+  return results
 end
 
 M.ensure_dir = define_tool({
   name = "ensure_dir",
-  description = "确保目录存在，如果不存在则创建",
+  description = "确保一个或多个目录存在，如果不存在则创建",
   func = _ensure_dir,
   parameters = {
     type = "object",
     properties = {
-      path = { type = "string", description = "目录路径" },
+      path = { type = "string", description = "单个目录路径（与 paths 二选一）" },
+      paths = {
+        type = "array",
+        items = { type = "string" },
+        description = "目录路径列表（与 path 二选一）",
+      },
       parents = { type = "boolean", description = "是否创建父目录", default = true },
     },
-    required = { "path" },
+    oneOf = {
+      { required = { "paths" } },
+      { required = { "path" } },
+    },
   },
-  returns = { type = "boolean", description = "是否成功" },
+  returns = {
+    type = "array",
+    items = {
+      type = "object",
+      properties = {
+        path = { type = "string" },
+        success = { type = "boolean" },
+      },
+    },
+    description = "目录确保结果列表",
+  },
+  category = "file",
+  permissions = { write = true },
+})
+
+-- ============================================================================
+-- 工具8: delete_file - 删除文件
+-- ============================================================================
+
+local function _delete_file(args)
+  if not args then
+    return {}
+  end
+
+  -- 支持 paths（列表）和 path（单个）两种参数
+  local paths = args.paths or {}
+  if args.path and type(args.path) == "string" then
+    table.insert(paths, args.path)
+  end
+
+  if #paths == 0 then
+    return {}
+  end
+
+  local results = {}
+
+  for _, p in ipairs(paths) do
+    local ok, err
+    local file = io.open(p, "r")
+    if file then
+      file:close()
+      local success = os.remove(p)
+      if success then
+        ok = true
+      else
+        ok = false
+        err = "无法删除文件"
+      end
+    else
+      ok = false
+      err = "文件不存在"
+    end
+    table.insert(results, { path = p, success = ok, error = err })
+  end
+
+  return results
+end
+
+M.delete_file = define_tool({
+  name = "delete_file",
+  description = "删除一个或多个文件",
+  func = _delete_file,
+  parameters = {
+    type = "object",
+    properties = {
+      path = { type = "string", description = "单个文件路径（与 paths 二选一）" },
+      paths = {
+        type = "array",
+        items = { type = "string" },
+        description = "文件路径列表（与 path 二选一）",
+      },
+    },
+    oneOf = {
+      { required = { "paths" } },
+      { required = { "path" } },
+    },
+  },
+  returns = {
+    type = "array",
+    items = {
+      type = "object",
+      properties = {
+        path = { type = "string" },
+        success = { type = "boolean" },
+        error = { type = "string", description = "失败时的错误信息" },
+      },
+    },
+    description = "文件删除结果列表",
+  },
   category = "file",
   permissions = { write = true },
 })

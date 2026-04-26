@@ -60,7 +60,6 @@ NeoAI/
 │   ├── tool_registry.lua       # 工具注册表
 │   ├── tool_executor.lua       # 工具执行器
 │   ├── tool_validator.lua      # 工具验证器
-│   ├── tool_history_manager.lua# 工具历史管理器
 │   │
 │   └── builtin/                # 内置工具
 │       ├── file_tools.lua      # 文件操作工具
@@ -128,7 +127,6 @@ tools.initialize(config.tools)            ← 初始化工具系统
   ├── tool_registry.initialize()
   ├── tool_executor.initialize()
   ├── tool_validator.initialize()
-  ├── tool_history_manager.initialize()
   ├── _load_builtin_tools()               ← 加载内置工具
   └── _load_external_tools()              ← 加载外部工具（可选）
     │
