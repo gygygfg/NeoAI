@@ -352,8 +352,7 @@ function M._do_render_chat()
           -- 自动获取焦点
           M._focus_window()
 
-          -- 延迟恢复光标位置并处理滚动，确保在 set_window_content 内部的 zMzx（10ms）之后执行
-          -- 将光标恢复和滚动合并到同一个 defer_fn 中，避免时序竞争
+          -- 延迟恢复光标位置并处理滚动
           vim.defer_fn(function()
             local win = window_manager.get_window_win(state.current_window_id)
             if not win or not vim.api.nvim_win_is_valid(win) then
@@ -362,42 +361,25 @@ function M._do_render_chat()
             local buf = vim.api.nvim_win_get_buf(win)
             local new_line_count = vim.api.nvim_buf_line_count(buf)
 
-            if saved_cursor_lnum then
-              local new_lnum
-              if cursor_near_end then
-                -- 刷新前光标在最后5行之内，恢复到最末尾
-                new_lnum = new_line_count
-              else
-                -- 不在最后5行之内，恢复到原位置（取较小值避免越界）
-                new_lnum = math.min(saved_cursor_lnum, new_line_count)
+            if cursor_near_end then
+              -- 刷新前光标在最后5行之内：设置光标到末尾行行尾
+              -- nvim_win_set_cursor 会自动调整视图使光标行可见
+              local last_line_content = vim.api.nvim_buf_get_lines(buf, new_line_count - 1, new_line_count, false)[1] or ""
+              local last_col = #last_line_content
+              pcall(vim.api.nvim_win_set_cursor, win, { new_line_count, last_col })
+
+              -- 打开浮动虚拟输入框
+              if not state.streaming.active then
+                M._open_float_input()
               end
-              -- 获取该行内容，确保列不越界
+            elseif saved_cursor_lnum then
+              -- 不在最后5行之内，恢复到原位置（取较小值避免越界）
+              local new_lnum = math.min(saved_cursor_lnum, new_line_count)
               local lines = vim.api.nvim_buf_get_lines(buf, new_lnum - 1, new_lnum, false)
               local col = math.min(saved_cursor_col, #(lines[1] or ""))
               pcall(vim.api.nvim_win_set_cursor, win, { new_lnum, col })
             end
-
-            -- 判断是否需要滚动到底部：
-            -- 1. 工具调用活跃时（state.tool_display.active），不强制滚动，避免长折叠文本把页面顶到上面
-            -- 2. 如果用户光标在末尾附近（最后5行内），自动跟随滚动
-            -- 3. 生成完成后的渲染由 GENERATION_COMPLETED 回调统一处理滚动和打开输入框
-            local should_scroll = false
-            if not state.last_usage and not state.tool_display.active then
-              if cursor_near_end then
-                should_scroll = true
-              end
-            end
-
-            if should_scroll then
-              M._scroll_to_end_with_offset()
-
-              -- 滚动完成后，再打开浮动虚拟输入框
-              -- 流式过程中不打开，避免干扰用户查看输出
-              if not state.streaming.active then
-                M._open_float_input()
-              end
-            end
-          end, 50)
+          end, 30)
 
           -- 触发渲染完成事件
           vim.api.nvim_exec_autocmds(
@@ -1312,14 +1294,16 @@ function M._scroll_to_end_with_offset(offset)
 
   local line_count = vim.api.nvim_buf_line_count(buf)
   if line_count > 0 then
-    -- 设置光标到末尾行行尾，Neovim 会自动滚动视图使光标行可见
-    local last_line_content = vim.api.nvim_buf_get_lines(buf, line_count - 1, line_count, false)[1] or ""
-    local last_col = #last_line_content
-    pcall(vim.api.nvim_win_set_cursor, win_handle, { line_count, last_col })
-
-    -- 使用 normal! z 让光标行位于窗口底部（z 命令将当前行移到窗口底部）
+    -- 只滚动视图让最后一行位于窗口底部，不移动光标
     pcall(vim.api.nvim_win_call, win_handle, function()
-      vim.cmd("normal! z")
+      local win_height = vim.api.nvim_win_get_height(win_handle)
+      local target_topline = line_count - win_height + 1 + offset
+      if target_topline < 1 then
+        target_topline = 1
+      end
+      local view = vim.fn.winsaveview()
+      view.topline = target_topline
+      vim.fn.winrestview(view)
     end)
   end
 end

@@ -753,18 +753,8 @@ function M.set_window_content(window_id, content)
       vim.api.nvim_set_option_value("foldmarker", "{{{,}}}", { win = win })
       vim.api.nvim_set_option_value("foldlevel", 0, { win = win })
       vim.api.nvim_set_option_value("foldenable", true, { win = win })
-      -- 延迟刷新折叠，确保在 BufRead/BufNew 等自动命令之后执行
-      vim.defer_fn(function()
-        if vim.api.nvim_win_is_valid(win) then
-          pcall(vim.api.nvim_win_call, win, function()
-            vim.cmd("setlocal foldmethod=marker")
-            vim.cmd("setlocal foldmarker={{{,}}}")
-            vim.cmd("setlocal foldlevel=0")
-            vim.cmd("setlocal foldenable")
-            vim.cmd("normal! zMzx")
-          end)
-        end
-      end, 10)
+      -- 折叠刷新由调用方（如 chat_window._do_render_chat）统一管理
+      -- 不在此处执行 zMzx，避免覆盖调用方的光标和视图设置
     end
   else
     -- 其他窗口保持可修改
