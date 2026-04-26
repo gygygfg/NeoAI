@@ -122,12 +122,17 @@ function M.build_request(params)
       stream = false, -- FIM 补全不支持流式
     }
   else
-    -- 聊天补全模式（默认）
+  -- 聊天补全模式（默认）
+    local use_stream = options.stream
+    if use_stream == nil then
+      use_stream = true
+    end
+
     request = {
       model = options.model or state.config.model or "gpt-4",
       messages = messages,
       max_tokens = options.max_tokens or state.config.max_tokens or 2000,
-      stream = options.stream ~= false, -- 默认启用流式
+      stream = use_stream,
     }
   end
 
@@ -246,8 +251,27 @@ function M.format_messages(messages)
       formatted_msg.tool_calls = msg.tool_calls
     end
 
-    if msg.tool_call_id then
-      formatted_msg.tool_call_id = msg.tool_call_id
+    -- 确保 tool 角色的消息必须有 tool_call_id，否则 API 会报错
+    -- 注意：来自历史记录（session:get_messages）的 tool 消息没有 tool_call_id
+    -- 这些消息只是用于显示，不能直接传给 API，否则会报 "tool must be a response to a preceding message with tool_calls"
+    -- 解决方案：将没有 tool_call_id 的 tool 消息转换为 user 角色消息
+    if msg.role == "tool" then
+      if msg.tool_call_id and msg.tool_call_id ~= "" then
+        formatted_msg.tool_call_id = msg.tool_call_id
+      else
+        -- 没有 tool_call_id 的 tool 消息来自历史记录，转换为 user 角色
+        -- 避免 API 报 "tool must be a response to a preceding message with tool_calls"
+        formatted_msg.role = "user"
+        logger.debug("tool message without tool_call_id converted to user role")
+      end
+      -- 确保 tool 消息有 content 字段（至少为空字符串）
+      if formatted_msg.content == nil then
+        formatted_msg.content = ""
+      end
+    else
+      if msg.tool_call_id then
+        formatted_msg.tool_call_id = msg.tool_call_id
+      end
     end
 
     if msg.name then
@@ -302,9 +326,16 @@ end
 --- @param tool_name string 工具名称（可选）
 --- @return table 工具结果消息
 function M.build_tool_result_message(tool_call_id, result, tool_name)
+  -- 确保 tool_call_id 不为 nil 或空字符串，否则 API 会报错
+  local safe_tool_call_id = tool_call_id
+  if not safe_tool_call_id or safe_tool_call_id == "" then
+    safe_tool_call_id = "call_" .. tostring(os.time()) .. "_" .. tostring(math.random(10000, 99999))
+    logger.warn(string.format("tool_call_id is nil or empty, generated fallback: %s", safe_tool_call_id))
+  end
+
   local message = {
     role = "tool",
-    tool_call_id = tool_call_id,
+    tool_call_id = safe_tool_call_id,
   }
 
   -- 处理结果内容
@@ -334,9 +365,18 @@ function M.add_tool_call_to_history(messages, tool_call, tool_result)
   -- 确保工具调用是有效的
   -- 兼容两种字段名：function（OpenAI 标准）和 func（旧格式）
   local tool_func = tool_call["function"] or tool_call.func
-  if not tool_call or not tool_call.id or not tool_func or not tool_func.name then
+  if not tool_call or not tool_func or not tool_func.name then
     logger.warn("无效的工具调用，无法添加到历史")
     return updated_messages
+  end
+
+  -- 确保 tool_call.id 存在，如果为 nil 则生成 fallback
+  local safe_id = tool_call.id
+  if not safe_id or safe_id == "" then
+    safe_id = "call_" .. tostring(os.time()) .. "_" .. tostring(math.random(10000, 99999))
+    logger.warn(string.format("tool_call.id is nil or empty, generated fallback: %s", safe_id))
+    -- 修复原始 tool_call 的 id，确保后续使用一致
+    tool_call.id = safe_id
   end
 
   -- 添加工具调用消息
@@ -346,7 +386,7 @@ function M.add_tool_call_to_history(messages, tool_call, tool_result)
   })
 
   -- 添加工具结果消息
-  table.insert(updated_messages, M.build_tool_result_message(tool_call.id, tool_result, tool_func.name))
+  table.insert(updated_messages, M.build_tool_result_message(safe_id, tool_result, tool_func.name))
 
   return updated_messages
 end

@@ -118,8 +118,13 @@ function M.process_chunk(params)
         for _, tc in ipairs(delta.tool_calls) do
           local index = tc.index or 0
           if not processor.tool_calls[index + 1] then
+            -- 确保 id 不为 nil 或空字符串，否则后续 API 调用会报错
+            local safe_id = tc.id
+            if not safe_id or safe_id == "" then
+              safe_id = "call_" .. tostring(os.time()) .. "_" .. tostring(index)
+            end
             processor.tool_calls[index + 1] = {
-              id = tc.id or ("call_" .. tostring(os.time()) .. "_" .. tostring(index)),
+              id = safe_id,
               type = tc.type or "function",
               ["function"] = {
                 name = "",

@@ -327,13 +327,20 @@ function M.generate_response(messages, params)
   local formatted_messages = state.request_builder.format_messages(messages)
 
   -- 构建请求（传入解析后的 AI 配置覆盖默认值）
+  -- stream 参数优先级：options.stream > ai_preset.stream > true（默认）
+  local stream_value
+  if options.stream ~= nil then
+    stream_value = options.stream
+  else
+    stream_value = ai_preset.stream ~= false
+  end
   local request = state.request_builder.build_request({
     messages = formatted_messages,
     options = vim.tbl_extend("force", options, {
       model = ai_preset.model_name or options.model,
       temperature = ai_preset.temperature or options.temperature,
       max_tokens = ai_preset.max_tokens or options.max_tokens,
-      stream = ai_preset.stream ~= false,
+      stream = stream_value,
     }),
     session_id = session_id,
     generation_id = generation_id,
@@ -941,14 +948,28 @@ function M.handle_tool_result(data)
   end
 
   -- 更新活跃生成的消息
-  generation.messages = messages
+  -- 过滤掉来自历史记录的旧 tool 消息（没有 tool_call_id），避免它们干扰 API 请求
+  -- 这些消息只是用于显示，不能直接传给 API
+  local filtered_messages = {}
+  for _, msg in ipairs(messages) do
+    if msg.role == "tool" and (not msg.tool_call_id or msg.tool_call_id == "") then
+      -- 跳过没有 tool_call_id 的旧 tool 消息（来自历史记录）
+      logger.debug("Filtering out old tool message without tool_call_id")
+    else
+      table.insert(filtered_messages, msg)
+    end
+  end
+  generation.messages = filtered_messages
 
   -- 继续生成响应（沿用原始模型索引）
+  -- 保持原始 stream 配置，不强制切换非流式
+  -- request_builder 中会检测消息中是否包含 tool 角色，自动处理
+  local tool_options = vim.deepcopy(options)
   M.generate_response(messages, {
     session_id = session_id,
     window_id = window_id,
     model_index = generation.model_index,
-    options = options,
+    options = tool_options,
   })
 end
 

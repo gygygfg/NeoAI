@@ -273,10 +273,17 @@ function M.build_context(tool_results)
         tool_calls = { result.tool_call },
       })
 
+      -- 确保 tool_call.id 存在，避免 API 验证错误
+      local safe_id = result.tool_call.id
+      if not safe_id or safe_id == "" then
+        safe_id = "call_" .. tostring(os.time()) .. "_" .. tostring(math.random(10000, 99999))
+        logger.warn(string.format("build_context: tool_call.id is nil or empty, generated fallback: %s", safe_id))
+      end
+
       table.insert(context_messages, {
         role = "tool",
-        tool_call_id = result.tool_call.id,
-        content = M.format_tool_result(result.result),
+        tool_call_id = safe_id,
+        content = M.format_tool_result(result.result) or "",
       })
     end
   end

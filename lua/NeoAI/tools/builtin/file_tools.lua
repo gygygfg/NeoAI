@@ -148,7 +148,7 @@ M.list_files = define_tool({
     type = "object",
     properties = {
       dir = { type = "string", description = "目录路径", default = "." },
-      pattern = { type = "string", description = "文件模式（如 *.lua）", default = "*" },
+      pattern = { type = "string", description = "文件模式（如 *.txt）", default = "*" },
       recursive = { type = "boolean", description = "是否递归查找", default = false },
     },
   },
@@ -355,7 +355,9 @@ function M.get_tools()
     end
   end
   -- 按名称排序
-  table.sort(tools, function(a, b) return a.name < b.name end)
+  table.sort(tools, function(a, b)
+    return a.name < b.name
+  end)
   return tools
 end
 
@@ -366,7 +368,10 @@ local function test_module()
   local test_file = "test_example.txt"
   print("1. 检查测试文件是否存在:", M.file_exists.func({ path = test_file }))
 
-  print("2. 写入测试文件:", M.write_file.func({ path = test_file, content = "测试内容\n第二行\n关键字" }))
+  print(
+    "2. 写入测试文件:",
+    M.write_file.func({ path = test_file, content = "测试内容\n第二行\n关键字" })
+  )
 
   local content = M.read_file.func({ path = test_file })
   local content_str = type(content) == "string" and content or ""
