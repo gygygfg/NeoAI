@@ -3,6 +3,8 @@
 --- flat_items 已包含：虚拟节点、is_last、缩进级别、连接符数组
 
 local M = {}
+
+local logger = require("NeoAI.utils.logger")
 local Events = require("NeoAI.core.events.event_constants")
 local window_manager = require("NeoAI.ui.window.window_manager")
 local async_worker = require("NeoAI.utils.async_worker")
@@ -116,7 +118,13 @@ function M._load_and_render_async(callback)
     return history_tree.build_flat_items()
   end, function(success, items)
     if success and items then
-      state.flat_items = items
+      -- items 可能是 JSON 字符串（auto_serialize 默认 true），需要反序列化
+      if type(items) == "string" then
+        local ok, decoded = pcall(vim.json.decode, items)
+        state.flat_items = ok and decoded or {}
+      else
+        state.flat_items = items
+      end
     else
       state.flat_items = {}
     end

@@ -1,5 +1,6 @@
 local M = {}
 
+local logger = require("NeoAI.utils.logger")
 local SkipList = require("NeoAI.utils.skiplist")
 local Events = require("NeoAI.core.events.event_constants")
 

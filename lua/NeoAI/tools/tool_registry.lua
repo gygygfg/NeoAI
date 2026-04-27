@@ -46,7 +46,7 @@ function M.register(tool)
 
   -- 检查工具是否已存在
   if tools[tool.name] then
-    logger.debug("[tool_registry] ⚠️ 工具已存在: " .. tool.name)
+    logger.debug("[tool_registry] 工具已存在(跳过): " .. tool.name)
     return false
   end
 

@@ -2,6 +2,7 @@
 --- 职责：初始化所有模块、注册命令和快捷键
 local M = {}
 
+local logger = require("NeoAI.utils.logger")
 local default_config = require("NeoAI.default_config")
 local core = require("NeoAI.core")
 local ui = require("NeoAI.ui")

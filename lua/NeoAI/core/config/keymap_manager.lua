@@ -1,5 +1,7 @@
 local M = {}
 
+local logger = require("NeoAI.utils.logger")
+
 -- 已合并的键位配置（由主init.lua传入，已完成默认和用户配置的合并）
 local DEFAULT_KEYMAPS = nil
 

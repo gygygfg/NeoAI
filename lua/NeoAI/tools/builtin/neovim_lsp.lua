@@ -130,47 +130,62 @@ local function find_symbol_via_lsp(filepath, symbol_name, bufnr)
   if bufnr == -1 then
     return nil
   end
-  local ok, responses = pcall(vim.lsp.buf_request_sync, bufnr, "textDocument/documentSymbol", {
-    textDocument = { uri = vim.uri_from_fname(abs_path) },
-  }, 3000)
 
-  if not ok or not responses then
-    return nil
-  end
+  -- 重试机制：最多尝试 3 次，每次等待 2 秒
+  for attempt = 1, 3 do
+    local ok, responses = pcall(vim.lsp.buf_request_sync, bufnr, "textDocument/documentSymbol", {
+      textDocument = { uri = vim.uri_from_fname(abs_path) },
+    }, 5000)
 
-  local function search_symbols(symbols, depth)
-    depth = depth or 0
-    if depth > 20 then
-      return nil
+    if ok and responses then
+      -- 检查是否有任何客户端返回了有效结果
+      local has_result = false
+      for _, response in pairs(responses) do
+        if type(response) == "table" then
+          -- buf_request_sync 返回 { [client_id] = { result = ..., err = ... } }
+          local result = response.result
+          if result ~= nil then
+            has_result = true
+            if type(result) == "table" and #result > 0 then
+              -- 搜索符号
+              local function search_symbols(symbols, depth)
+                depth = depth or 0
+                if depth > 20 then
+                  return nil
+                end
+                for _, sym in ipairs(symbols) do
+                  if sym.name == symbol_name then
+                    local range = sym.selectionRange or sym.range
+                    if range then
+                      return range.start.line, range.start.character
+                    end
+                  end
+                  if sym.children and #sym.children > 0 then
+                    local r, c = search_symbols(sym.children, depth + 1)
+                    if r then
+                      return r, c
+                    end
+                  end
+                end
+                return nil
+              end
+              local r, c = search_symbols(result)
+              if r then
+                return r, c
+              end
+            end
+          end
+        end
+      end
+      -- 如果有客户端响应但没有找到符号，直接返回（不再重试）
+      if has_result then
+        return nil
+      end
     end
-    for _, sym in ipairs(symbols) do
-      -- 精确匹配名称
-      if sym.name == symbol_name then
-        local range = sym.selectionRange or sym.range
-        if range then
-          return range.start.line, range.start.character
-        end
-      end
-      -- 递归搜索子符号
-      if sym.children and #sym.children > 0 then
-        local r, c = search_symbols(sym.children, depth + 1)
-        if r then
-          return r, c
-        end
-      end
-    end
-    return nil
-  end
 
-  for _, response in pairs(responses) do
-    if type(response) == "table" and response.result then
-      local result = response.result
-      if type(result) == "table" and #result > 0 then
-        local r, c = search_symbols(result)
-        if r then
-          return r, c
-        end
-      end
+    -- 等待后重试
+    if attempt < 3 then
+      vim.wait(2000, function() return false end, 50)
     end
   end
 
@@ -920,14 +935,21 @@ local function find_symbol_position(filepath, symbol_name, node_type, bufnr)
 end
 
 -- 执行 LSP 请求并等待结果
--- 使用 Neovim 0.12 的 buf_request_sync，单次请求，超时 3 秒
+-- 使用 Neovim 0.12 的 buf_request_sync，单次请求，超时 5 秒
+-- 如果第一次请求没有结果，重试一次
 local function lsp_request(bufnr, method, params)
-  local ok, responses = pcall(vim.lsp.buf_request_sync, bufnr, method, params, 3000)
-  if ok and responses then
-    for _, response in pairs(responses) do
-      if type(response) == "table" and response.result ~= nil then
-        return response.result
+  for attempt = 1, 2 do
+    local ok, responses = pcall(vim.lsp.buf_request_sync, bufnr, method, params, 5000)
+    if ok and responses then
+      for _, response in pairs(responses) do
+        if type(response) == "table" and response.result ~= nil then
+          return response.result
+        end
       end
+    end
+    -- 如果没有结果，等待后重试
+    if attempt < 2 then
+      vim.wait(1000, function() return false end, 50)
     end
   end
   return nil

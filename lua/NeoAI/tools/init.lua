@@ -1,6 +1,7 @@
 -- NeoAI 工具系统主模块
 local M = {}
 
+local logger = require("NeoAI.utils.logger")
 local tool_registry = require("NeoAI.tools.tool_registry")
 local tool_executor = require("NeoAI.tools.tool_executor")
 local tool_validator = require("NeoAI.tools.tool_validator")

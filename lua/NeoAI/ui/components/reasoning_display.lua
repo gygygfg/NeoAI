@@ -235,7 +235,22 @@ function M.close()
   end
 
   if state.current_window_id then
+    -- 先尝试通过 window_manager 关闭
     window_manager.close_window(state.current_window_id)
+
+    -- 强制检查窗口是否真的关闭了，如果没关闭则直接强制关闭
+    local win_info = window_manager.get_window_info(state.current_window_id)
+    if win_info then
+      -- window_manager 可能没找到窗口（已从 windows 表移除但窗口还在）
+      -- 尝试直接通过 win/buf 句柄关闭
+      if win_info.win and vim.api.nvim_win_is_valid(win_info.win) then
+        pcall(vim.api.nvim_win_close, win_info.win, true)
+      end
+      if win_info.buf and vim.api.nvim_buf_is_valid(win_info.buf) then
+        pcall(vim.api.nvim_buf_delete, win_info.buf, { force = true })
+      end
+    end
+
     state.current_window_id = nil
   end
 
@@ -435,10 +450,21 @@ function M._setup_keymaps()
   end
 
   -- 设置按键映射
+  -- 使用直接关闭窗口的方式，避免 require 路径问题
+  local function force_close()
+    if state.current_window_id then
+      local wm = require("NeoAI.ui.window.window_manager")
+      wm.close_window(state.current_window_id)
+      state.current_window_id = nil
+      state.content_buffer = ""
+      state.is_visible = false
+    end
+  end
+
   local keymaps = {
-    { "q", "<Cmd>lua require('NeoAI.ui.components.reasoning_display').close()<CR>", desc = "关闭窗口" },
-    { "<Esc>", "<Cmd>lua require('NeoAI.ui.components.reasoning_display').close()<CR>", desc = "关闭窗口" },
-    { "<C-c>", "<Cmd>lua require('NeoAI.ui.components.reasoning_display').close()<CR>", desc = "关闭窗口" },
+    { "q", force_close, desc = "关闭窗口" },
+    { "<Esc>", force_close, desc = "关闭窗口" },
+    { "<C-c>", force_close, desc = "关闭窗口" },
     {
       "yy",
       "<Cmd>lua require('NeoAI.ui.components.reasoning_display')._copy_to_clipboard()<CR>",

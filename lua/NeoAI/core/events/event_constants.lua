@@ -35,6 +35,7 @@ M.TOOL_EXECUTION_ERROR = "NeoAI:tool_execution_error" -- 单个工具执行出�
 M.TOOL_CALL_DETECTED = "NeoAI:tool_call_detected" -- 检测到工具调用
 M.TOOL_RESULT_RECEIVED = "NeoAI:tool_result_received" -- 工具结果已接收
 M.TOOL_LOOP_STOP_REQUESTED = "NeoAI:tool_loop_stop_requested" -- 请求停止工具调用循环
+M.TOOL_DISPLAY_CLOSED = "NeoAI:tool_display_closed" -- 工具调用悬浮窗已关闭
 
 -- ==================== 会话事件 ====================
 -- 使用位置: session_manager.lua, history_manager.lua, ui/init.lua

@@ -1,5 +1,6 @@
 local M = {}
 
+local logger = require("NeoAI.utils.logger")
 local Events = require("NeoAI.core.events.event_constants")
 
 -- 窗口存储
@@ -35,17 +36,27 @@ function M.block_lsp_for_buffer(buf, label)
   end
   -- 设置 buffer 变量标记，供外部 LSP 配置检查
   pcall(vim.api.nvim_buf_set_var, buf, "neoai_no_lsp", true)
-  -- 注册 FileType 自动命令，在 LSP 附加后立即分离
+  -- 禁用该 buffer 的诊断
+  pcall(vim.diagnostic.disable, buf)
+  -- 立即分离已附加的 LSP 客户端
+  local clients = vim.lsp.get_clients({ bufnr = buf })
+  for _, client in ipairs(clients) do
+    pcall(vim.lsp.buf_detach_client, buf, client.id)
+  end
+  -- 注册 BufEnter / FileType 自动命令，持续阻止 LSP 重新附加
   local augroup_name = "NeoAIBlockLSP_buf_" .. tostring(buf)
   pcall(vim.api.nvim_del_augroup_by_name, augroup_name)
   local group = vim.api.nvim_create_augroup(augroup_name, { clear = true })
-  vim.api.nvim_create_autocmd("FileType", {
+  vim.api.nvim_create_autocmd({ "BufEnter", "FileType", "InsertEnter", "TextChanged" }, {
     group = group,
     buffer = buf,
     callback = function()
       vim.defer_fn(function()
-        local clients = vim.lsp.get_clients({ bufnr = buf })
-        for _, client in ipairs(clients) do
+        -- 持续禁用诊断
+        pcall(vim.diagnostic.disable, buf)
+        -- 分离任何新附加的 LSP 客户端
+        local attached = vim.lsp.get_clients({ bufnr = buf })
+        for _, client in ipairs(attached) do
           pcall(vim.lsp.buf_detach_client, buf, client.id)
         end
       end, 10)
@@ -96,9 +107,15 @@ local function create_float_window(options)
   end
 
   -- 创建缓冲区
-  local buf = vim.api.nvim_create_buf(false, true)
-  -- 将缓冲区加入缓冲区列表
-  vim.api.nvim_set_option_value("buflisted", true, { buf = buf })
+  -- 对于 tool_display 和 reasoning 类型的临时悬浮窗口，使用匿名 buffer（不列在 buffer 列表）
+  -- 这样关闭或切换窗口时 buffer 会被自动销毁，避免与思考过程悬浮窗共用 buffer
+  local window_type_for_buf = options and options._window_type or ""
+  local is_temp_float = (window_type_for_buf == "tool_display" or window_type_for_buf == "reasoning")
+  local buf = vim.api.nvim_create_buf(false, is_temp_float)
+  if not is_temp_float then
+    -- 非临时悬浮窗口（如 chat、tree）将缓冲区加入缓冲区列表
+    vim.api.nvim_set_option_value("buflisted", true, { buf = buf })
+  end
 
   -- 创建浮动窗口
   local win_options = vim.deepcopy(merged_options)
@@ -131,7 +148,10 @@ local function create_float_window(options)
     end
   end
 
-  local win = vim.api.nvim_open_win(buf, true, filtered_options)
+  -- 对于 tool_display 和 reasoning 等临时悬浮窗口，创建时不获取焦点
+  -- 避免刷新内容时光标从聊天窗口跳转到悬浮窗
+  local should_focus = not is_temp_float
+  local win = vim.api.nvim_open_win(buf, should_focus, filtered_options)
 
   -- 设置窗口选项
   vim.api.nvim_set_option_value("winhl", "Normal:Normal,FloatBorder:FloatBorder", { win = win })
@@ -147,7 +167,10 @@ local function create_float_window(options)
   vim.api.nvim_set_option_value("modified", false, { buf = buf })
 
   -- 设置缓冲区名称（临时名称，后面会覆盖）
-  vim.api.nvim_buf_set_name(buf, "neoai://float/temp")
+  -- 对于匿名 buffer（tool_display/reasoning），跳过设置名称
+  if not is_temp_float then
+    vim.api.nvim_buf_set_name(buf, "neoai://float/temp")
+  end
 
   return {
     buf = buf,
@@ -415,6 +438,9 @@ local function set_window_content_by_mode(window_info, content, filetype, window
       vim.api.nvim_set_option_value("foldmarker", "{{{,}}}", { win = win })
       vim.api.nvim_set_option_value("foldlevel", 0, { win = win })
       vim.api.nvim_set_option_value("foldenable", true, { win = win })
+      -- 确保自动换行，避免长行超出窗口边界
+      vim.api.nvim_set_option_value("wrap", true, { win = win })
+      vim.api.nvim_set_option_value("linebreak", true, { win = win })
     end
   else
     -- 恢复缓冲区为只读状态
@@ -499,6 +525,9 @@ function M.create_window(window_type, options)
     end
   end
 
+  -- 将窗口类型注入到选项中，供 create_float_window 等内部函数使用
+  merged_options._window_type = window_type
+
   local window_info = create_window_by_mode(window_mode, merged_options)
 
   if not window_info then
@@ -520,7 +549,13 @@ function M.create_window(window_type, options)
   -- 设置缓冲区选项
   vim.api.nvim_set_option_value("buftype", "nofile", { buf = window_info.buf })
   vim.api.nvim_set_option_value("swapfile", false, { buf = window_info.buf })
-  vim.api.nvim_set_option_value("bufhidden", "hide", { buf = window_info.buf })
+  -- 对于 tool_display 和 reasoning 等临时悬浮窗口，关闭时自动删除 buffer
+  -- 避免与思考过程悬浮窗共用 buffer 导致内容混乱
+  if window_type == "tool_display" or window_type == "reasoning" then
+    vim.api.nvim_set_option_value("bufhidden", "delete", { buf = window_info.buf })
+  else
+    vim.api.nvim_set_option_value("bufhidden", "hide", { buf = window_info.buf })
+  end
   -- chat类型使用markdown filetype以支持原生折叠
   local ft = window_type == "chat" and "markdown" or "neoai_" .. window_type
   vim.api.nvim_set_option_value("filetype", ft, { buf = window_info.buf })
@@ -532,9 +567,13 @@ function M.create_window(window_type, options)
     M.block_lsp_for_buffer(window_info.buf, window_type .. " 界面")
   end
 
-  -- 设置缓冲区名称，使其能在 :ls 命令中显示
-  local buffer_name = "neoai://" .. window_type .. "/" .. window_id
-  vim.api.nvim_buf_set_name(window_info.buf, buffer_name)
+  -- 设置缓冲区名称
+  -- 对于 tool_display 和 reasoning 等临时悬浮窗口，buffer 是匿名的，不设置名称
+  -- 其他窗口（chat、tree）设置名称以便在 :ls 中识别
+  if window_type ~= "tool_display" and window_type ~= "reasoning" then
+    local buffer_name = "neoai://" .. window_type .. "/" .. window_id
+    vim.api.nvim_buf_set_name(window_info.buf, buffer_name)
+  end
 
   -- 为 chat 和 tree 类型窗口注册 BufLeave/BufEnter 自动命令，管理悬浮窗口
   if window_type == "chat" or window_type == "tree" then
@@ -787,6 +826,9 @@ function M.set_window_content(window_id, content)
       vim.api.nvim_set_option_value("foldmarker", "{{{,}}}", { win = win })
       vim.api.nvim_set_option_value("foldlevel", 0, { win = win })
       vim.api.nvim_set_option_value("foldenable", true, { win = win })
+      -- 确保自动换行，避免长行超出窗口边界
+      vim.api.nvim_set_option_value("wrap", true, { win = win })
+      vim.api.nvim_set_option_value("linebreak", true, { win = win })
       -- 折叠刷新由调用方（如 chat_window._do_render_chat）统一管理
       -- 不在此处执行 zMzx，避免覆盖调用方的光标和视图设置
     end

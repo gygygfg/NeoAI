@@ -2,6 +2,8 @@
 --- 集中管理所有模块的共享状态，消除分散在各 init.lua 中的重复状态表
 local M = {}
 
+local logger = require("NeoAI.utils.logger")
+
 local state = {
   initialized = false,
   config = nil,

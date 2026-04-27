@@ -44,8 +44,8 @@ local state = {
 --   max_file_size: 最大文件大小（字节）
 --   max_backups: 最大备份文件数量
 function M.initialize(config)
-  -- 如果已经初始化，直接返回
-  if state.initialized then
+  -- 如果已初始化且没有新配置，直接返回（避免自动初始化覆盖已有配置）
+  if state.initialized and not config then
     return
   end
 
@@ -296,21 +296,8 @@ function M._write_entry(entry)
     state.output:write(entry .. "\n")
     state.output:flush()
   else
-    -- 输出到标准输出
-    -- 修复：检查vim是否可用，如果不使用print输出
-    if vim and vim.notify then
-      local level = entry:match("%[([A-Z]+)%]")
-      if level == "ERROR" or level == "FATAL" then
-        vim.notify(entry, vim.log.levels.ERROR)
-      elseif level == "WARN" then
-        vim.notify(entry, vim.log.levels.WARN)
-      else
-        vim.notify(entry, vim.log.levels.INFO)
-      end
-    else
-      -- 如果没有vim，使用print输出到控制台
-      print(entry)
-    end
+    -- 静默输出到后台（使用 print 而非 vim.notify，避免弹通知）
+    print(entry)
   end
 end
 

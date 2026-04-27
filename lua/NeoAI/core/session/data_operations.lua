@@ -1,5 +1,6 @@
 local M = {}
 
+local logger = require("NeoAI.utils.logger")
 local file_utils = require("NeoAI.utils.file_utils")
 local branch_manager = require("NeoAI.core.session.branch_manager")
 local message_manager = require("NeoAI.core.session.message_manager")

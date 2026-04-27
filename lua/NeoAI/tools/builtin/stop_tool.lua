@@ -1,5 +1,7 @@
 -- 停止工具调用循环工具
 -- 当 AI 认为任务已完成时，调用此工具触发循环调用结束
+--
+-- 修复：同时取消正在进行的 AI 请求，防止循环卡死
 local M = {}
 
 local define_tool = require("NeoAI.tools.builtin.tool_helpers").define_tool
@@ -8,14 +10,16 @@ local event_constants = require("NeoAI.core.events.event_constants")
 local function _stop_tool_loop(args)
   local reason = args and args.reason or "任务已完成"
 
-  -- 触发停止工具循环事件
-  vim.api.nvim_exec_autocmds("User", {
-    pattern = event_constants.TOOL_LOOP_STOP_REQUESTED,
-    data = {
-      reason = reason,
-      timestamp = os.time(),
-    },
-  })
+  -- 取消正在进行的 AI 请求
+  -- cancel_generation() 内部会处理：
+  --   1. 取消所有 HTTP 请求
+  --   2. 调用 tool_orchestrator.request_stop() 设置 stop_requested
+  --   3. 触发 GENERATION_CANCELLED 事件
+  --   4. 清理 generation 状态
+  local ok, ai_engine = pcall(require, "NeoAI.core.ai.ai_engine")
+  if ok and ai_engine and ai_engine.cancel_generation then
+    ai_engine.cancel_generation()
+  end
 
   return string.format("工具调用循环已停止。原因: %s", reason)
 end

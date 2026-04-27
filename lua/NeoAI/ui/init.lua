@@ -1,5 +1,6 @@
 local M = {}
 
+local logger = require("NeoAI.utils.logger")
 local window_manager = require("NeoAI.ui.window.window_manager")
 local chat_window = require("NeoAI.ui.window.chat_window")
 local tree_window = require("NeoAI.ui.window.tree_window")
