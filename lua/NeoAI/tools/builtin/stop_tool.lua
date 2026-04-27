@@ -7,7 +7,6 @@ local event_constants = require("NeoAI.core.events.event_constants")
 
 local function _stop_tool_loop(args)
   local reason = args and args.reason or "任务已完成"
-  print("[stop_tool] stop_tool_loop 被调用, reason=" .. reason)
 
   -- 触发停止工具循环事件
   vim.api.nvim_exec_autocmds("User", {
@@ -18,7 +17,6 @@ local function _stop_tool_loop(args)
     },
   })
 
-  print("[stop_tool] stop_tool_loop 完成")
   return string.format("工具调用循环已停止。原因: %s", reason)
 end
 

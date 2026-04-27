@@ -1058,6 +1058,8 @@ function M.cancel_generation()
 
   if generation then
     http_client.cancel_all_requests()
+    -- 停止工具调用循环
+    tool_orchestrator.request_stop()
     vim.api.nvim_exec_autocmds("User", {
       pattern = event_constants.GENERATION_CANCELLED,
       data = { generation_id = generation_id, session_id = generation.session_id, window_id = generation.window_id },

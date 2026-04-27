@@ -892,6 +892,18 @@ function M.close()
     return
   end
 
+  -- 关闭窗口前停止后台工具循环和AI生成
+  -- 触发取消生成事件（ai_engine 监听此事件取消HTTP请求和工具循环）
+  vim.api.nvim_exec_autocmds("User", {
+    pattern = Events.CANCEL_GENERATION,
+    data = {},
+  })
+  -- 额外确保工具循环停止（当工具循环正在执行时，CANCEL_GENERATION 可能未覆盖）
+  local tool_orchestrator_ok, tool_orchestrator = pcall(require, "NeoAI.core.ai.tool_orchestrator")
+  if tool_orchestrator_ok and tool_orchestrator then
+    tool_orchestrator.request_stop()
+  end
+
   -- 触发窗口关闭前事件
   vim.api.nvim_exec_autocmds(
     "User",
@@ -1196,8 +1208,9 @@ function M.add_message(role, content, opts)
   end
 
   -- 如果窗口打开，更新显示（除非指定跳过渲染）
+  -- 使用增量追加方式，避免全量重渲染刷新界面
   if state.current_window_id and not opts.skip_render then
-    M.render_chat()
+    M._append_message_to_buffer(role, content)
   end
 
   return true
@@ -2162,6 +2175,60 @@ function M.update_message(index, content)
   end
 
   return true
+end
+
+--- 将单条消息增量追加到缓冲区末尾（避免全量重渲染）
+--- @param role string 角色 ('user' 或 'assistant')
+--- @param content string 消息内容
+function M._append_message_to_buffer(role, content)
+  if not state.current_window_id or not content then
+    return
+  end
+
+  local buf = window_manager.get_window_buf(state.current_window_id)
+  if not buf or not vim.api.nvim_buf_is_valid(buf) then
+    return
+  end
+
+  -- 确保缓冲区可修改
+  pcall(vim.api.nvim_set_option_value, "modifiable", true, { buf = buf })
+  pcall(vim.api.nvim_set_option_value, "readonly", false, { buf = buf })
+
+  -- 构建消息文本
+  local role_prefix = role == "user" and "👤 用户:" or "🤖 AI:"
+  local lines = {}
+
+  -- 检查是否是工具调用折叠文本
+  local trimmed = vim.trim(content)
+  if role == "assistant" and trimmed:find("^{{{") then
+    -- 工具调用折叠文本：不加 AI 标记，直接显示
+    local content_lines = vim.split(content, "\n")
+    for _, line in ipairs(content_lines) do
+      table.insert(lines, line)
+    end
+  else
+    -- 普通消息
+    local msg_lines = vim.split(content, "\n")
+    if #msg_lines > 0 then
+      table.insert(lines, string.format("%s %s", role_prefix, msg_lines[1]))
+      for i = 2, #msg_lines do
+        table.insert(lines, string.format("    %s", msg_lines[i]))
+      end
+    end
+  end
+
+  -- 追加空行
+  table.insert(lines, "")
+
+  -- 获取当前行数并追加
+  local line_count = vim.api.nvim_buf_line_count(buf)
+  vim.api.nvim_buf_set_lines(buf, line_count, line_count, false, lines)
+
+  -- 恢复缓冲区状态
+  pcall(vim.api.nvim_set_option_value, "modified", false, { buf = buf })
+
+  -- 滚动到末尾
+  M._scroll_to_end_with_offset()
 end
 
 --- 追加流式数据块到缓冲区（增量渲染）
