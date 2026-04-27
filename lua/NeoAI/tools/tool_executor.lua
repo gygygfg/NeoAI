@@ -7,6 +7,7 @@ local tool_registry = require("NeoAI.tools.tool_registry")
 local tool_validator = require("NeoAI.tools.tool_validator")
 local Events = require("NeoAI.core.events.event_constants")
 local json = require("NeoAI.utils.json")
+local thread_utils = require("NeoAI.utils.thread_utils")
 
 -- 递归解析参数中的 JSON 字符串字段
 -- 支持：
@@ -115,7 +116,7 @@ function M.initialize(config)
   state.initialized = true
 end
 
---- 执行工具
+--- 执行工具（同步模式）
 --- @param tool_name string 工具名称
 --- @param args table 工具参数
 --- @return any 执行结果
@@ -228,6 +229,210 @@ function M.execute(tool_name, args)
 
   print("[tool_executor] execute 结束: " .. tool_name)
   return formatted_result
+end
+
+--- 在后台线程中执行工具（使用 jobstart）
+--- @param tool_name string 工具名称
+--- @param args table 工具参数
+--- @param callback function|nil 回调函数，接收 (success, result_or_error)
+--- @return string|nil 任务 ID，失败返回 nil
+function M.execute_in_thread(tool_name, args, callback)
+  if not state.initialized then
+    print("[tool_executor] execute_in_thread 失败: 未初始化")
+    error("工具执行器未初始化")
+  end
+
+  if not tool_name then
+    print("[tool_executor] execute_in_thread 失败: 工具名称为空")
+    error("工具名称是必需的")
+  end
+
+  print("[tool_executor] execute_in_thread 开始: " .. tool_name)
+
+  -- 获取工具定义
+  local tool = tool_registry.get(tool_name)
+  if not tool then
+    local error_msg = "工具不存在: " .. tool_name
+    print("[tool_executor] execute_in_thread 失败: " .. error_msg)
+    M._record_execution(tool_name, args, nil, error_msg)
+    if callback then
+      callback(false, error_msg)
+    end
+    return nil
+  end
+
+  -- 预处理：解析 JSON 字符串参数
+  local resolved_args = resolve_json_args(args)
+
+  -- 验证参数
+  local valid, error_msg = M.validate_args(tool, resolved_args)
+  if not valid then
+    print("[tool_executor] 参数验证失败: " .. (error_msg or "未知错误"))
+    M._record_execution(tool_name, args, nil, error_msg)
+    if callback then
+      callback(false, error_msg)
+    end
+    return nil
+  end
+
+  -- 检查权限
+  if tool.permissions then
+    local has_permission, perm_error = tool_validator.check_permissions(tool)
+    if not has_permission then
+      print("[tool_executor] 权限检查失败: " .. (perm_error or "无权限"))
+      M._record_execution(tool_name, args, nil, perm_error)
+      if callback then
+        callback(false, perm_error)
+      end
+      return nil
+    end
+  end
+
+  -- 记录开始时间
+  local start_time = os.time()
+
+  -- 触发工具执行开始事件
+  if vim and vim.api and vim.api.nvim_exec_autocmds then
+    vim.api.nvim_exec_autocmds("User", {
+      pattern = Events.TOOL_EXECUTION_STARTED,
+      data = { tool_name = tool_name, args = args, start_time = start_time },
+    })
+  end
+
+  -- 生成任务 ID
+  local task_id = "thread_" .. tool_name .. "_" .. os.time() .. "_" .. math.random(1000, 9999)
+
+  -- 使用 thread_utils 在后台执行
+  thread_utils.run_in_background(
+    -- 后台任务函数
+    function()
+      local max_retries = state.config.max_retries or 0
+      local retry_delay = state.config.retry_delay or 1
+      return M.safe_call(tool.func, resolved_args, max_retries, retry_delay)
+    end,
+    -- 回调函数（在主线程执行）
+    function(success, result, error_msg)
+      local end_time = os.time()
+      local duration = end_time - start_time
+
+      if success then
+        local formatted_result = M.format_result(result)
+        print("[tool_executor] 线程执行成功: " .. tool_name)
+
+        -- 触发工具执行完成事件
+        if vim and vim.api and vim.api.nvim_exec_autocmds then
+          vim.api.nvim_exec_autocmds("User", {
+            pattern = Events.TOOL_EXECUTION_COMPLETED,
+            data = { tool_name = tool_name, args = args, result = formatted_result, duration = duration },
+          })
+        end
+
+        M._record_execution(tool_name, args, formatted_result, nil, duration)
+
+        if callback then
+          callback(true, formatted_result)
+        end
+      else
+        local full_error_msg = "工具执行错误: " .. (error_msg or "未知错误")
+        print("[tool_executor] 线程执行错误: " .. full_error_msg)
+
+        -- 触发工具执行错误事件
+        if vim and vim.api and vim.api.nvim_exec_autocmds then
+          vim.api.nvim_exec_autocmds("User", {
+            pattern = Events.TOOL_EXECUTION_ERROR,
+            data = { tool_name = tool_name, args = args, error_msg = full_error_msg, duration = duration },
+          })
+        end
+
+        M._record_execution(tool_name, args, nil, full_error_msg, duration)
+
+        if callback then
+          callback(false, M.handle_error(full_error_msg))
+        end
+      end
+    end
+  )
+
+  print("[tool_executor] execute_in_thread 已提交: " .. tool_name)
+  return task_id
+end
+
+--- 使用 jobstart 执行外部命令工具
+--- @param cmd string|table 命令或命令列表
+--- @param opts table 选项
+--- @param callback function|nil 回调函数
+--- @return number|nil job_id
+function M.execute_command(cmd, opts, callback)
+  opts = opts or {}
+
+  -- 确保 cmd 是 table 格式
+  if type(cmd) == "string" then
+    cmd = vim.fn.split(cmd, " ")
+  end
+
+  local timeout = opts.timeout or 30000 -- 默认 30 秒超时
+  local cwd = opts.cwd or vim.fn.getcwd()
+  local env = opts.env or {}
+
+  print("[tool_executor] execute_command: " .. table.concat(cmd, " "))
+
+  local job_id = vim.fn.jobstart(cmd, {
+    cwd = cwd,
+    env = env,
+
+    on_stdout = function(_, data)
+      if opts.on_stdout then
+        opts.on_stdout(data)
+      end
+    end,
+
+    on_stderr = function(_, data)
+      if opts.on_stderr then
+        opts.on_stderr(data)
+      end
+    end,
+
+    on_exit = function(_, exit_code)
+      print("[tool_executor] 命令退出，代码: " .. exit_code)
+      if callback then
+        callback(exit_code == 0, exit_code)
+      end
+    end,
+  })
+
+  if job_id <= 0 then
+    print("[tool_executor] 启动命令失败")
+    if callback then
+      callback(false, -1)
+    end
+    return nil
+  end
+
+  -- 设置超时
+  if timeout > 0 then
+    vim.defer_fn(function()
+      local job_info = vim.fn.job_info(job_id)
+      if job_info and job_info.status == "run" then
+        print("[tool_executor] 命令超时，停止 job_id=" .. job_id)
+        vim.fn.jobstop(job_id)
+        if callback then
+          callback(false, "timeout")
+        end
+      end
+    end, timeout)
+  end
+
+  return job_id
+end
+
+--- 停止正在执行的命令
+--- @param job_id number job ID
+function M.stop_command(job_id)
+  if not job_id then
+    return
+  end
+  print("[tool_executor] 停止命令: job_id=" .. job_id)
+  vim.fn.jobstop(job_id)
 end
 
 --- 执行工具（别名，用于兼容性）
@@ -644,7 +849,7 @@ function M.batch_execute(executions)
   return results
 end
 
---- 异步执行工具
+--- 异步执行工具（使用 thread_utils 在后台执行）
 --- @param tool_name string 工具名称
 --- @param args table 参数
 --- @param callback function 回调函数
@@ -661,20 +866,11 @@ function M.execute_async(tool_name, args, callback)
 
   print("[tool_executor] execute_async: " .. tool_name)
 
-  -- 在后台执行
-  if vim and vim.schedule then
-    vim.schedule(function()
-      print("[tool_executor] execute_async vim.schedule 开始执行")
-      local result = M.execute(tool_name, args)
-      print("[tool_executor] execute_async 执行完成，调用回调")
-      callback(result)
-    end)
-  else
-    -- 如果没有 vim.schedule，直接同步执行
-    print("[tool_executor] execute_async 同步执行")
-    local result = M.execute(tool_name, args)
+  -- 使用 execute_in_thread 在后台执行
+  M.execute_in_thread(tool_name, args, function(success, result)
+    print("[tool_executor] execute_async 执行完成，调用回调")
     callback(result)
-  end
+  end)
 end
 
 --- 更新配置
@@ -825,7 +1021,7 @@ function M._generate_example(tool)
         table.insert(lines, '  files = \'[{"filepath": "<文件路径>"}]\',')
       else
         local val_str = type(v) == "string" and v or tostring(v)
-        table.insert(lines, '  ' .. k .. ' = ' .. val_str .. ',')
+        table.insert(lines, "  " .. k .. " = " .. val_str .. ",")
       end
     end
     table.insert(lines, "})")
@@ -837,7 +1033,7 @@ function M._generate_example(tool)
   table.insert(lines, tool.name .. "({")
   for k, v in pairs(example) do
     local val_str = type(v) == "string" and v or tostring(v)
-    table.insert(lines, '  ' .. k .. ' = ' .. val_str .. ',')
+    table.insert(lines, "  " .. k .. " = " .. val_str .. ",")
   end
   table.insert(lines, "})")
   return table.concat(lines, "\n")

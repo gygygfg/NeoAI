@@ -129,11 +129,6 @@ function M.open(session_id, window_id, branch_id)
     vim.api.nvim_set_option_value("wrap", true, { win = win_handle })
     vim.api.nvim_set_option_value("linebreak", true, { win = win_handle })
     vim.api.nvim_set_option_value("cursorline", true, { win = win_handle })
-    -- 折叠相关选项全部是窗口本地选项
-    vim.api.nvim_set_option_value("foldmethod", "marker", { win = win_handle })
-    vim.api.nvim_set_option_value("foldmarker", "{{{,}}}", { win = win_handle })
-    vim.api.nvim_set_option_value("foldlevel", 0, { win = win_handle })
-    vim.api.nvim_set_option_value("foldenable", true, { win = win_handle })
   end
 
   -- 触发窗口打开事件
@@ -369,7 +364,8 @@ function M._do_render_chat()
             if cursor_near_end then
               -- 刷新前光标在最后5行之内：设置光标到末尾行行尾
               -- nvim_win_set_cursor 会自动调整视图使光标行可见
-              local last_line_content = vim.api.nvim_buf_get_lines(buf, new_line_count - 1, new_line_count, false)[1] or ""
+              local last_line_content = vim.api.nvim_buf_get_lines(buf, new_line_count - 1, new_line_count, false)[1]
+                or ""
               local last_col = #last_line_content
               pcall(vim.api.nvim_win_set_cursor, win, { new_line_count, last_col })
 
@@ -1774,7 +1770,7 @@ function M._setup_event_listeners()
             state.tool_display.buffer = new_section .. state.tool_display.buffer
           end
         end
-        M._update_tool_display()
+        -- 工具循环期间不刷新界面，等 TOOL_LOOP_FINISHED 时一次性刷新
       else
         -- 没有工具调用，正常显示在 reasoning_display 悬浮窗口
         local reasoning_display = require("NeoAI.ui.components.reasoning_display")
@@ -1951,12 +1947,11 @@ function M._setup_event_listeners()
         return
       end
 
-      -- 更新悬浮窗口：将 ⏳ 改为 🔄
+      -- 更新悬浮窗口：将 ⏳ 改为 🔄（仅更新数据，不刷新界面，等 TOOL_LOOP_FINISHED 时一次性刷新）
       -- 转义 tool_name 中的特殊字符（如 _、. 等）
       local escaped_name = tool_name:gsub("([%.%+%-%*%?%[%]%^%$%(%)%%])", "%%%1")
       state.tool_display.buffer =
         state.tool_display.buffer:gsub("  ⏳ " .. escaped_name, "  🔄 " .. tool_name .. " (执行中...)")
-      M._update_tool_display()
     end,
   })
 
@@ -1988,7 +1983,7 @@ function M._setup_event_listeners()
         duration = duration,
       })
 
-      -- 更新悬浮窗口：将 🔄 改为 ✅
+      -- 更新悬浮窗口：将 🔄 改为 ✅（仅更新数据，不刷新界面，等 TOOL_LOOP_FINISHED 时一次性刷新）
       local escaped_name = tool_name:gsub("([%.%+%-%*%?%[%]%^%$%(%)%%])", "%%%1")
 
       -- 先尝试替换 🔄 状态
@@ -2003,7 +1998,6 @@ function M._setup_event_listeners()
       else
         state.tool_display.buffer = replaced
       end
-      M._update_tool_display()
     end,
   })
 
@@ -2024,20 +2018,11 @@ function M._setup_event_listeners()
         return
       end
 
-      -- 计算悬浮窗已显示时长，确保最小显示1500ms
-      local elapsed = vim.loop.now() - (state.tool_display.show_time or 0)
-      local min_display_ms = 1500
-      local delay = math.max(0, min_display_ms - elapsed)
+      -- 一次性刷新悬浮窗口显示最终状态（所有工具执行完毕）
+      M._update_tool_display()
 
-      if delay > 0 then
-        -- 不足最小显示时间，延迟关闭
-        vim.defer_fn(function()
-          M._close_tool_display()
-        end, delay)
-      else
-        -- 已超过最小显示时间，立即关闭
-        M._close_tool_display()
-      end
+      -- 关闭工具调用悬浮窗
+      M._close_tool_display()
 
       -- 将工具调用结果转换为折叠文本并添加到消息列表
       -- 注意：跳过持久化（skip_persist=true），因为工具调用数据已由 chat_handlers
@@ -2591,7 +2576,9 @@ function M.show_model_selector()
     end
     vim.ui.select(items, {
       prompt = "选择 AI 模型 (当前: " .. current_label .. ")",
-      format_item = function(item) return item end,
+      format_item = function(item)
+        return item
+      end,
     }, function(choice, idx)
       if choice and idx and idx ~= state.current_model_index then
         M.switch_to_model(idx)
@@ -2615,7 +2602,9 @@ function M.show_model_selector()
 
   vim.ui.select(items, {
     prompt = "选择 AI 模型 (当前: " .. current_label .. ")",
-    format_item = function(item) return item end,
+    format_item = function(item)
+      return item
+    end,
   }, function(choice, idx)
     if choice and idx and idx ~= state.current_model_index then
       M.switch_to_model(idx)
