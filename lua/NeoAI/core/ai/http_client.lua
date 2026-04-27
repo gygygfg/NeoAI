@@ -102,7 +102,9 @@ function M.send_stream_request(params, on_chunk, on_complete, on_error)
   request.stream = true
   local transformed = request_adapter.transform_request(request, api_type, provider_config)
   local request_body = json.encode(transformed)
-  local temp_file = vim.fn.tempname()
+  -- 对短请求体（< 8KB）使用 --data-raw 避免临时文件 I/O
+  local use_temp_file = #request_body > 8192
+  local temp_file = use_temp_file and vim.fn.tempname() or nil
   state.request_counter = state.request_counter + 1
   local request_id = "req_" .. state.request_counter .. "_" .. os.time()
 
@@ -181,17 +183,22 @@ function M.send_stream_request(params, on_chunk, on_complete, on_error)
     if k ~= "Content-Type" then table.insert(args, "-H"); table.insert(args, k .. ": " .. v) end
   end
 
-  local ok, _ = pcall(function()
-    local r = vim.fn.writefile({ request_body }, temp_file)
-    if r == -1 then error("write failed") end
-  end)
-  if not ok then
-    state.active_requests[request_id] = nil
-    if on_error then on_error("Failed to write temp file") end; return nil
+  if use_temp_file then
+    local ok, _ = pcall(function()
+      local r = vim.fn.writefile({ request_body }, temp_file)
+      if r == -1 then error("write failed") end
+    end)
+    if not ok then
+      state.active_requests[request_id] = nil
+      if on_error then on_error("Failed to write temp file") end; return nil
+    end
+    vim.list_extend(args, { "--data-binary", "@" .. temp_file })
+  else
+    -- 短请求体直接通过 --data-raw 传递，避免临时文件 I/O
+    vim.list_extend(args, { "--data-raw", request_body })
   end
 
   vim.list_extend(args, {
-    "--data-binary", "@" .. temp_file,
     "--connect-timeout", tostring(math.floor(timeout / 1000)), "--max-time", "0",
   })
 
@@ -204,7 +211,7 @@ function M.send_stream_request(params, on_chunk, on_complete, on_error)
       end
     end,
     on_exit = function(_, exit_code, _)
-      pcall(vim.fn.delete, temp_file)
+      if temp_file then pcall(vim.fn.delete, temp_file) end
       if exit_code == 0 then handle_complete()
       else
         local req = state.active_requests[request_id]

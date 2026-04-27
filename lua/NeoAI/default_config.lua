@@ -1,3 +1,5 @@
+local logger = require("NeoAI.utils.logger")
+
 local M = {}
 
 -- 默认配置
@@ -165,7 +167,7 @@ local DEFAULT_CONFIG = {
     -- 全局默认值（当预设中未指定时使用）
     stream = true,
     timeout = 60000,
-    system_prompt = "你是一个AI编程助手，帮助用户解决编程问题。"
+    system_prompt = "你是一个AI编程助手，帮助用户解决编程问题。",
   },
   -- UI配置
   ui = {
@@ -250,6 +252,24 @@ local DEFAULT_CONFIG = {
     builtin = true,
     external = {},
   },
+  -- 日志配置
+  log = {
+    -- 日志级别: 'DEBUG', 'INFO', 'WARN', 'ERROR', 'FATAL'
+    level = "INFO",
+    -- 输出文件路径（可选，默认输出到 vim.notify）
+    output_path = nil,
+    -- 日志格式模板
+    format = "[{time}] [{level}] {message}",
+    -- 最大文件大小（字节），默认 10MB
+    max_file_size = 10485760,
+    -- 最大备份文件数量
+    max_backups = 5,
+    -- 是否启用详细输出（verbose 模式）
+    verbose = false,
+    -- 是否启用调试打印到控制台
+    print_debug = false,
+  },
+
   -- 测试配置
   test = {
     auto_test = false, -- 是否在启动后自动运行所有测试
@@ -717,7 +737,12 @@ function M.process_config(user_config)
   -- 3. 初始化状态管理器
   M.initialize(result)
 
-  -- 4. 确保保存目录存在
+  -- 4. 初始化日志器（传入合并后的日志配置）
+  if result.log then
+    logger.initialize(result.log)
+  end
+
+  -- 5. 确保保存目录存在
   if result.session and result.session.save_path then
     local path = result.session.save_path
     if vim.fn.isdirectory(path) == 0 then
@@ -749,6 +774,11 @@ function M._validate_and_clean(config)
   -- 验证键位配置
   if config.keymaps then
     M._validate_keymap_config(config.keymaps)
+  end
+
+  -- 验证日志配置
+  if config.log then
+    M._validate_log_config(config.log)
   end
 
   -- 验证会话配置
@@ -845,6 +875,35 @@ function M._validate_keymap_config(keymaps)
       vim.notify(string.format("[NeoAI] keymaps.%s must be a table. Using default.", context), vim.log.levels.WARN)
       keymaps[context] = nil
     end
+  end
+end
+
+--- 验证日志配置
+function M._validate_log_config(log_config)
+  local valid_levels = { "DEBUG", "INFO", "WARN", "ERROR", "FATAL" }
+  if log_config.level and not vim.tbl_contains(valid_levels, log_config.level:upper()) then
+    vim.notify("[NeoAI] log.level must be one of: DEBUG, INFO, WARN, ERROR, FATAL. Using default.", vim.log.levels.WARN)
+    log_config.level = nil
+  end
+
+  if log_config.max_file_size and (type(log_config.max_file_size) ~= "number" or log_config.max_file_size < 1024) then
+    vim.notify("[NeoAI] log.max_file_size must be a number >= 1024. Using default.", vim.log.levels.WARN)
+    log_config.max_file_size = nil
+  end
+
+  if log_config.max_backups and (type(log_config.max_backups) ~= "number" or log_config.max_backups < 0) then
+    vim.notify("[NeoAI] log.max_backups must be a non-negative number. Using default.", vim.log.levels.WARN)
+    log_config.max_backups = nil
+  end
+
+  if log_config.verbose ~= nil and type(log_config.verbose) ~= "boolean" then
+    vim.notify("[NeoAI] log.verbose must be a boolean. Using default.", vim.log.levels.WARN)
+    log_config.verbose = nil
+  end
+
+  if log_config.print_debug ~= nil and type(log_config.print_debug) ~= "boolean" then
+    vim.notify("[NeoAI] log.print_debug must be a boolean. Using default.", vim.log.levels.WARN)
+    log_config.print_debug = nil
   end
 end
 

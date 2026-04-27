@@ -77,6 +77,9 @@ function M.initialize(config)
     state.max_backups = config.max_backups
   end
 
+  -- 存储完整配置（供 is_verbose_enabled / is_print_debug_enabled 使用）
+  state.config = config
+
   state.initialized = true
 end
 

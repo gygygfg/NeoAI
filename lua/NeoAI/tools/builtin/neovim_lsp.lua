@@ -6,8 +6,176 @@ local M = {}
 
 local define_tool = require("NeoAI.tools.builtin.tool_helpers").define_tool
 
+-- 延迟清理队列：暂存 get_lsp_clients 返回的 cleanup 函数
+-- 在工具循环结束时统一执行，避免多次打开/关闭 LSP buffer
+local _deferred_cleanups = {}
+
+-- 监听 TOOL_LOOP_FINISHED 事件，在工具循环结束时统一清理延迟的 buffer
+local _cleanup_augroup = vim.api.nvim_create_augroup("NeoAILspDeferredCleanup", { clear = true })
+vim.api.nvim_create_autocmd("User", {
+  group = _cleanup_augroup,
+  pattern = "NeoAI:tool_loop_finished",
+  callback = function()
+    M.flush_deferred_cleanups()
+  end,
+})
+
 -- 检查 LSP 是否可用
 local lsp_available = false
+
+-- 标记 Tree-sitter 解析器是否已检查/安装
+local ts_parsers_checked = false
+
+-- 常用文件类型对应的 Tree-sitter 解析器名称
+local ft_to_ts_parser = {
+  lua = "lua",
+  python = "python",
+  javascript = "javascript",
+  typescript = "typescript",
+  javascriptreact = "tsx",
+  typescriptreact = "tsx",
+  go = "go",
+  rust = "rust",
+  java = "java",
+  c = "c",
+  cpp = "cpp",
+  ruby = "ruby",
+  php = "php",
+  json = "json",
+  yaml = "yaml",
+  markdown = "markdown",
+  bash = "bash",
+  sh = "bash",
+  zsh = "bash",
+  css = "css",
+  html = "html",
+  vue = "vue",
+  svelte = "svelte",
+  toml = "toml",
+  sql = "sql",
+  cmake = "cmake",
+  dockerfile = "dockerfile",
+  make = "make",
+  query = "query",
+  regex = "regex",
+}
+
+-- 自动安装 Tree-sitter 解析器（异步，非阻塞）
+-- 在模块加载时自动触发，仅执行一次
+local function ensure_ts_parsers()
+  if ts_parsers_checked then
+    return
+  end
+  ts_parsers_checked = true
+
+  local ok_ts, ts = pcall(require, "vim.treesitter")
+  if not ok_ts then
+    return
+  end
+
+  -- 检查 nvim-treesitter 插件是否可用（提供 TSInstallSync 命令）
+  local has_ts_install = pcall(function()
+    return vim.fn.exists(":TSInstallSync") == 2
+  end)
+
+  if not has_ts_install then
+    -- 使用 vim.treesitter.language.inspect 检查解析器是否真正安装
+    -- 注意：get_lang 只返回语言名称，不检查解析器文件是否存在
+    local ok_inspect, _ = pcall(ts.language.inspect, "lua")
+    if ok_inspect then
+      -- 至少有一个解析器可用，跳过安装
+      return
+    end
+
+    -- 尝试使用内置的 :TSInstall 命令（如果 nvim-treesitter 已加载）
+    local has_ts_install_cmd = pcall(function()
+      return vim.fn.exists(":TSInstall") == 2
+    end)
+    if not has_ts_install_cmd then
+      return
+    end
+  end
+
+  -- 检查并安装缺失的解析器
+  -- 使用 vim.schedule 异步执行，避免阻塞模块加载
+  vim.schedule(function()
+    local missing_parsers = {}
+    for _, parser_name in pairs(ft_to_ts_parser) do
+      -- 使用 inspect 检查解析器是否真正安装（而非 get_lang）
+      local ok, _ = pcall(ts.language.inspect, parser_name)
+      if not ok then
+        missing_parsers[parser_name] = true
+      end
+    end
+
+    if next(missing_parsers) then
+      local parser_list = vim.fn.keys(missing_parsers)
+      table.sort(parser_list)
+
+      -- 使用 TSInstallSync 批量安装（同步，但只在首次加载时执行一次）
+      pcall(vim.cmd, "TSInstallSync " .. table.concat(parser_list, " "))
+    end
+  end)
+end
+
+-- 使用 LSP documentSymbol 回退查找符号位置
+-- 当 Tree-sitter 不可用时，通过 LSP 的 documentSymbol 请求定位符号
+local function find_symbol_via_lsp(filepath, symbol_name, bufnr)
+  -- 获取绝对路径
+  local abs_path = vim.fn.fnamemodify(filepath, ":p")
+  -- 如果没有提供 bufnr，通过文件路径获取
+  if not bufnr or bufnr == -1 then
+    bufnr = vim.fn.bufnr(abs_path)
+  end
+  if bufnr == -1 then
+    return nil
+  end
+  local ok, responses = pcall(vim.lsp.buf_request_sync, bufnr, "textDocument/documentSymbol", {
+    textDocument = { uri = vim.uri_from_fname(abs_path) },
+  }, 3000)
+
+  if not ok or not responses then
+    return nil
+  end
+
+  local function search_symbols(symbols, depth)
+    depth = depth or 0
+    if depth > 20 then
+      return nil
+    end
+    for _, sym in ipairs(symbols) do
+      -- 精确匹配名称
+      if sym.name == symbol_name then
+        local range = sym.selectionRange or sym.range
+        if range then
+          return range.start.line, range.start.character
+        end
+      end
+      -- 递归搜索子符号
+      if sym.children and #sym.children > 0 then
+        local r, c = search_symbols(sym.children, depth + 1)
+        if r then
+          return r, c
+        end
+      end
+    end
+    return nil
+  end
+
+  for _, response in pairs(responses) do
+    if type(response) == "table" and response.result then
+      local result = response.result
+      if type(result) == "table" and #result > 0 then
+        local r, c = search_symbols(result)
+        if r then
+          return r, c
+        end
+      end
+    end
+  end
+
+  return nil
+end
 
 -- LSP 符号类型名称映射（兼容 Neovim 0.12，该版本没有 vim.lsp.symbol_kind_name）
 local symbol_kind_names = {
@@ -101,19 +269,24 @@ local function ensure_buf_loaded(filepath)
   return bufnr, cleanup, nil
 end
 
--- 检查 LSP 客户端是否支持格式化和悬停（本模块所需的核心能力）
+-- 检查 LSP 客户端是否支持悬停（本模块所需的核心能力）
+-- 大多数 LSP 操作（定义、引用、悬停、补全等）只需要 hoverProvider
+-- 格式化能力单独在 lsp_format 工具中检查
+--
+-- 注意：如果 server_capabilities 为 nil，说明客户端尚未完成初始化。
+-- 此时返回 true 以避免过滤掉刚启动的客户端，后续操作会等待初始化完成。
 local function client_has_required_capabilities(client)
   local caps = client.server_capabilities
   if not caps then
-    return false
+    -- 客户端尚未初始化完成，暂时视为可用（后续会等待初始化）
+    return true
   end
-  -- 需要同时支持格式化（documentFormattingProvider）和悬停（hoverProvider）
-  local has_format = caps.documentFormattingProvider == true or (type(caps.documentFormattingProvider) == "table")
+  -- 只需要悬停能力（hoverProvider），这是大多数 LSP 操作的基础
   local has_hover = caps.hoverProvider == true or (type(caps.hoverProvider) == "table")
-  return has_format and has_hover
+  return has_hover
 end
 
--- 从客户端列表中过滤出支持格式化和悬停的客户端
+-- 从客户端列表中过滤出支持悬停能力的客户端
 local function filter_qualified_clients(clients)
   if not clients then
     return {}
@@ -130,21 +303,64 @@ end
 -- 等待 LSP 客户端通过 LspAttach 事件 attach 到缓冲区
 -- 使用 vim.wait 处理事件循环，最多等待 timeout_ms 毫秒
 -- 返回过滤后的客户端列表，或 nil
--- 注意：LspAttach 回调中会筛选客户端，只有支持格式化和悬停的客户端才触发 done=true
-local function wait_for_lsp_attach(bufnr, timeout_ms)
+-- 如果提供了 expected_config，只返回与该配置名匹配的客户端
+-- 注意：LspAttach 回调中会筛选客户端，只有支持悬停能力的客户端才触发 done=true
+--
+-- 重要：此函数不应在 vim.schedule 回调中调用，因为 vim.wait 会阻塞事件循环。
+-- 如果需要在异步上下文中获取 LSP 客户端，请使用 get_lsp_clients_nonblocking。
+local function wait_for_lsp_attach(bufnr, timeout_ms, expected_config)
   timeout_ms = timeout_ms or 5000
   local clients = nil
   local done = false
 
+  -- 辅助函数：检查客户端是否与期望配置匹配
+  local function client_matches(client)
+    if not expected_config then
+      return true
+    end
+    return client.name == expected_config
+  end
+
   -- 先检查当前是否已有合格的客户端已 attach
   clients = filter_qualified_clients(vim.lsp.get_clients({ bufnr = bufnr }))
   if clients and #clients > 0 then
-    return clients
+    -- 只返回与期望配置匹配的客户端
+    local matched = {}
+    for _, client in ipairs(clients) do
+      if client_matches(client) then
+        table.insert(matched, client)
+      end
+    end
+    if #matched > 0 then
+      -- 等待客户端初始化完成（最多 8 秒）
+      -- 需要同时检查 client.initialized 和 server_capabilities 可用
+      local init_ok = vim.wait(8000, function()
+        for _, client in ipairs(matched) do
+          if client.initialized and client.server_capabilities then
+            return true
+          end
+        end
+        return false
+      end, 50)
+      if init_ok then
+        -- 再次过滤：只保留支持悬停能力的客户端
+        local qualified = filter_qualified_clients(matched)
+        if qualified and #qualified > 0 then
+          return qualified
+        end
+        return matched
+      end
+      -- 初始化超时，继续等待 LspAttach 事件
+    end
   end
 
   -- 创建一次性 autocmd 监听 LspAttach
-  -- 在回调中筛选：只有支持格式化和悬停的客户端才触发 done=true
+  -- 在回调中筛选：只有支持悬停能力的客户端才触发 done=true
   -- 这样可以避免 GitHub Copilot 等不支持的客户端触发回调
+  --
+  -- 注意：LspAttach 触发时，client.server_capabilities 可能尚未初始化完成。
+  -- 因此回调中不立即检查 capabilities，而是设置一个标志，
+  -- 由 vim.wait 的条件函数轮询检查 server_capabilities。
   local augroup = vim.api.nvim_create_augroup("NeoAILspWait_" .. bufnr, { clear = true })
   vim.api.nvim_create_autocmd("LspAttach", {
     group = augroup,
@@ -153,15 +369,27 @@ local function wait_for_lsp_attach(bufnr, timeout_ms)
     callback = function(args)
       -- 获取触发事件的客户端
       local client = vim.lsp.get_client_by_id(args.data and args.data.client_id)
-      if client and client_has_required_capabilities(client) then
+      if client then
+        -- 标记客户端已 attach，由 vim.wait 的条件函数轮询检查 server_capabilities
         done = true
       end
     end,
   })
 
-  -- 等待事件或超时
+  -- 等待事件或超时（事件驱动，不阻塞 UI）
+  -- 条件函数：等待客户端初始化完成且 server_capabilities 可用
   vim.wait(timeout_ms, function()
-    return done
+    if not done then
+      return false
+    end
+    -- 客户端已 attach，检查 server_capabilities 是否可用
+    local attached = vim.lsp.get_clients({ bufnr = bufnr })
+    for _, c in ipairs(attached) do
+      if c.server_capabilities and client_has_required_capabilities(c) then
+        return true
+      end
+    end
+    return false
   end, 50)
 
   -- 清理 autocmd
@@ -170,20 +398,41 @@ local function wait_for_lsp_attach(bufnr, timeout_ms)
   -- 再次检查客户端
   clients = filter_qualified_clients(vim.lsp.get_clients({ bufnr = bufnr }))
   if clients and #clients > 0 then
-    return clients
+    -- 只返回与期望配置匹配的客户端
+    local matched = {}
+    for _, client in ipairs(clients) do
+      if client_matches(client) then
+        table.insert(matched, client)
+      end
+    end
+    if #matched > 0 then
+      return matched
+    end
   end
 
   -- 也检查全局客户端
   local all_clients = vim.lsp.get_clients()
   if all_clients and #all_clients > 0 then
     for _, client in ipairs(all_clients) do
-      if client_has_required_capabilities(client) then
+      if client_has_required_capabilities(client) and client_matches(client) then
         local ok = pcall(vim.lsp.buf_attach_client, bufnr, client.id)
         if ok then
-          vim.wait(200)
+          -- 事件驱动等待，允许处理事件循环
+          vim.wait(200, function()
+            return false
+          end, 50)
           clients = filter_qualified_clients(vim.lsp.get_clients({ bufnr = bufnr }))
           if clients and #clients > 0 then
-            return clients
+            -- 只返回与期望配置匹配的客户端
+            local matched = {}
+            for _, c in ipairs(clients) do
+              if client_matches(c) then
+                table.insert(matched, c)
+              end
+            end
+            if #matched > 0 then
+              return matched
+            end
           end
         end
       end
@@ -193,280 +442,481 @@ local function wait_for_lsp_attach(bufnr, timeout_ms)
   return nil
 end
 
--- 获取文件对应的 LSP 客户端
--- 只返回同时支持格式化（formatting）和悬停（hover）的客户端
--- 如果文件没有关联的客户端，尝试通过 LspAttach 事件等待或直接启动
+-- 非阻塞版本的 get_lsp_clients
+-- 不调用 vim.wait，直接检查当前已 attach 的客户端
+-- 如果客户端尚未 attach，尝试通过 try_start_lsp 启动（不等待）
+-- 适用于在 vim.schedule 回调中调用
 -- 返回 clients, err, bufnr, cleanup
-local function get_lsp_clients(filepath)
+local function get_lsp_clients_nonblocking(filepath, defer_cleanup)
   local bufnr, cleanup, err = ensure_buf_loaded(filepath)
   if err then
     return nil, err, nil, nil
   end
 
+  -- 获取文件类型和对应的 LSP 配置名
+  local abs_path = vim.fn.fnamemodify(filepath, ":p")
+  local ft = vim.filetype.match({ filename = abs_path })
+  local ft_to_lsp_config = {
+    lua = "lua_ls",
+    python = "pyright",
+    javascript = "ts_ls",
+    typescript = "ts_ls",
+    javascriptreact = "ts_ls",
+    typescriptreact = "ts_ls",
+    go = "gopls",
+    rust = "rust_analyzer",
+    java = "jdtls",
+    c = "clangd",
+    cpp = "clangd",
+    ruby = "solargraph",
+    php = "intelephense",
+    json = "jsonls",
+    yaml = "yamlls",
+    markdown = "marksman",
+    bash = "bashls",
+    sh = "bashls",
+    zsh = "bashls",
+    css = "cssls",
+    html = "htmlls",
+    vue = "volar",
+    svelte = "svelte",
+  }
+  local expected_config = ft and ft_to_lsp_config[ft]
+
+  -- 辅助函数：检查客户端是否与文件类型匹配
+  local function client_matches_filetype(client)
+    if not expected_config then
+      return true
+    end
+    return client.name == expected_config
+  end
+
   -- 第一步：直接查找已 attach 到该缓冲区的客户端
   local clients = filter_qualified_clients(vim.lsp.get_clients({ bufnr = bufnr }))
   if clients and #clients > 0 then
-    return clients, nil, bufnr, cleanup
+    local matched_clients = {}
+    for _, client in ipairs(clients) do
+      if client_matches_filetype(client) then
+        table.insert(matched_clients, client)
+      end
+    end
+    if #matched_clients > 0 then
+      if defer_cleanup and cleanup then
+        table.insert(_deferred_cleanups, cleanup)
+        cleanup = nil
+      end
+      return matched_clients, nil, bufnr, cleanup
+    end
   end
 
-  -- 第二步：通过 LspAttach 事件等待 LSP 客户端 attach（最多 5 秒）
-  clients = wait_for_lsp_attach(bufnr, 5000)
-  if clients then
-    return clients, nil, bufnr, cleanup
-  end
-
-  -- 第三步：尝试通过文件类型推断并启动 LSP 服务器
-  -- 优先使用用户配置的 LSP 系统（如 lsp/init.lua 中的 start_server_with_config）
-  local abs_path = vim.fn.fnamemodify(filepath, ":p")
-  local ft = vim.filetype.match({ filename = abs_path })
-  if ft then
-    local ft_to_lsp_config = {
-      lua = "lua_ls",
-      python = "pyright",
-      javascript = "ts_ls",
-      typescript = "ts_ls",
-      javascriptreact = "ts_ls",
-      typescriptreact = "ts_ls",
-      go = "gopls",
-      rust = "rust_analyzer",
-      java = "jdtls",
-      c = "clangd",
-      cpp = "clangd",
-      ruby = "solargraph",
-      php = "intelephense",
-      json = "jsonls",
-      yaml = "yamlls",
-      markdown = "marksman",
-      bash = "bashls",
-      sh = "bashls",
-      zsh = "bashls",
-      css = "cssls",
-      html = "htmlls",
-      vue = "volar",
-      svelte = "svelte",
-    }
-    local config_name = ft_to_lsp_config[ft]
-    if config_name then
-      -- 方式 A：尝试通过用户配置的 LSP 系统启动（如 lsp/init.lua 中的 start_server_with_config）
-      -- 查找用户配置模块中是否有 start_server_with_config 函数
-      local user_lsp_ok, user_lsp = pcall(require, "lsp")
-      if user_lsp_ok and user_lsp.start_server_with_config then
-        local ok = user_lsp.start_server_with_config(config_name, bufnr)
-        if ok then
-          clients = wait_for_lsp_attach(bufnr, 5000)
-          if clients then
-            return clients, nil, bufnr, cleanup
-          end
-        end
+  -- 第二步：尝试启动 LSP 服务器（不等待）
+  if expected_config then
+    local started = try_start_lsp(expected_config, bufnr)
+    if started then
+      -- 不等待，直接返回 nil，让调用方决定是否重试
+      if cleanup then
+        cleanup()
       end
-
-      -- 方式 B：检查配置是否已通过 vim.lsp.config 注册
-      local configs = rawget(vim.lsp.config, "_configs")
-      if configs and configs[config_name] then
-        local ok, client_id = pcall(vim.lsp.start, config_name)
-        if ok and client_id then
-          clients = wait_for_lsp_attach(bufnr, 3000)
-          if clients then
-            return clients, nil, bufnr, cleanup
-          end
-        end
-      end
-
-      -- 方式 C：直接启动 LSP 服务器
-      local default_cmds = {
-        lua_ls = { "lua-language-server" },
-        pyright = { "pyright-langserver", "--stdio" },
-        ts_ls = { "typescript-language-server", "--stdio" },
-        html = { "vscode-html-language-server", "--stdio" },
-        cssls = { "vscode-css-language-server", "--stdio" },
-        jsonls = { "vscode-json-language-server", "--stdio" },
-        yamlls = { "yaml-language-server", "--stdio" },
-        bashls = { "bash-language-server", "start" },
-        clangd = { "clangd" },
-        gopls = { "gopls" },
-        rust_analyzer = { "rust-analyzer" },
-      }
-      local cmd = default_cmds[config_name]
-      if cmd then
-        local lsp_config = {
-          name = config_name,
-          cmd = cmd,
-          root_dir = vim.fn.getcwd(),
-        }
-        local ok, client_id = pcall(vim.lsp.start, lsp_config)
-        if ok and client_id then
-          clients = wait_for_lsp_attach(bufnr, 5000)
-          if clients then
-            return clients, nil, bufnr, cleanup
-          end
-        end
-      end
+      return nil, "LSP 客户端正在启动中，请稍后重试", nil, nil
     end
   end
 
   if cleanup then
     cleanup()
   end
-  return nil,
-    "文件 '" .. filepath .. "' 没有关联的 LSP 客户端（需要同时支持格式化和悬停功能）",
-    nil,
-    nil
+  return nil, "文件 '" .. filepath .. "' 没有关联的 LSP 客户端（需要支持悬停功能）", nil, nil
+end
+
+-- 获取文件对应的 LSP 客户端
+-- 尝试多种方式启动 LSP 服务器
+-- 返回 true/false
+local function try_start_lsp(config_name, bufnr)
+  -- 方式 1：用户配置的 LSP 系统（lsp/init.lua 中的 start_server_with_config）
+  local user_lsp_ok, user_lsp = pcall(require, "lsp")
+  if user_lsp_ok and user_lsp.start_server_with_config then
+    local ok = user_lsp.start_server_with_config(config_name, bufnr)
+    if ok then
+      return true
+    end
+  end
+
+  -- 方式 2：用户配置的 _server_configs（Neovim 0.12 内置 API 模式）
+  if user_lsp_ok and user_lsp._server_configs and user_lsp._server_configs[config_name] then
+    local config = user_lsp._server_configs[config_name]
+    local ok, client_id = pcall(vim.lsp.start, config)
+    if ok and client_id then
+      vim.lsp.buf_attach_client(bufnr, client_id)
+      return true
+    end
+  end
+
+  -- 方式 3：vim.lsp.config 注册的配置（Neovim 0.12 内置）
+  -- 在 Neovim 0.12 中，vim.lsp.config 可能是一个表或函数
+  -- 使用 pcall 安全访问
+  local configs_ok, configs = pcall(function()
+    if type(vim.lsp.config) == "table" then
+      -- 尝试直接访问配置
+      local c = rawget(vim.lsp.config, "_configs")
+      if c then return c end
+      -- 尝试通过 get 方法获取
+      if vim.lsp.config.get then
+        return vim.lsp.config.get(config_name)
+      end
+    end
+    return nil
+  end)
+  if configs_ok and configs then
+    local ok, client_id = pcall(vim.lsp.start, config_name)
+    if ok and client_id then
+      -- attach 到指定的缓冲区
+      pcall(vim.lsp.buf_attach_client, bufnr, client_id)
+      return true
+    end
+  end
+
+  -- 方式 4：nvim-lspconfig 插件
+  local lspconfig_ok, lspconfig = pcall(require, "lspconfig")
+  if lspconfig_ok and lspconfig[config_name] then
+    local ok, client_id = pcall(lspconfig[config_name].launch, lspconfig[config_name], bufnr)
+    if ok and client_id then
+      return true
+    end
+  end
+
+  -- 方式 5：mason-lspconfig 自动配置
+  local mason_lsp_ok, mason_lsp = pcall(require, "mason-lspconfig")
+  if mason_lsp_ok then
+    -- 尝试通过 mason 获取服务器路径并启动
+    local mason_registry_ok, mason_registry = pcall(require, "mason-registry")
+    if mason_registry_ok then
+      local pkg_ok, pkg = pcall(mason_registry.get_package, config_name)
+      if pkg_ok and pkg:is_installed() then
+        local install_path = pkg:get_install_path()
+        -- 尝试查找 mason 生成的包装脚本
+        local mason_bin = install_path .. "/"
+        if vim.fn.isdirectory(mason_bin) == 1 then
+          local cmd = { mason_bin .. config_name }
+          local lsp_config = {
+            name = config_name,
+            cmd = cmd,
+            root_dir = vim.fn.getcwd(),
+          }
+          local ok, client_id = pcall(vim.lsp.start, lsp_config)
+          if ok and client_id then
+            return true
+          end
+        end
+      end
+    end
+  end
+
+  -- 方式 6：直接启动（使用内置的默认命令）
+  local default_cmds = {
+    lua_ls = { "lua-language-server" },
+    pyright = { "pyright-langserver", "--stdio" },
+    ts_ls = { "typescript-language-server", "--stdio" },
+    html = { "vscode-html-language-server", "--stdio" },
+    cssls = { "vscode-css-language-server", "--stdio" },
+    jsonls = { "vscode-json-language-server", "--stdio" },
+    yamlls = { "yaml-language-server", "--stdio" },
+    bashls = { "bash-language-server", "start" },
+    clangd = { "clangd" },
+    gopls = { "gopls" },
+    rust_analyzer = { "rust-analyzer" },
+    htmlls = { "vscode-html-language-server", "--stdio" },
+    marksman = { "marksman" },
+    solargraph = { "solargraph", "stdio" },
+    intelephense = { "intelephense", "--stdio" },
+    jdtls = { "jdtls" },
+    volar = { "vue-language-server", "--stdio" },
+    svelte = { "svelte-language-server", "--stdio" },
+  }
+  local cmd = default_cmds[config_name]
+  if cmd then
+    -- 检查命令是否存在
+    if vim.fn.executable(cmd[1]) == 1 then
+      local lsp_config = {
+        name = config_name,
+        cmd = cmd,
+        root_dir = vim.fn.getcwd(),
+      }
+      local ok, client_id = pcall(vim.lsp.start, lsp_config)
+      if ok and client_id then
+        -- attach 到指定的缓冲区
+        pcall(vim.lsp.buf_attach_client, bufnr, client_id)
+        return true
+      end
+    end
+  end
+
+  return false
+end
+
+-- 获取文件对应的 LSP 客户端
+-- 只返回同时支持格式化（formatting）和悬停（hover）的客户端
+-- 如果文件没有关联的客户端，尝试通过多种方式启动
+-- 返回 clients, err, bufnr, cleanup
+-- 如果 defer_cleanup 为 true，cleanup 会延迟到工具循环结束时执行
+--
+-- 注意：此函数会调用 vim.wait（在 wait_for_lsp_attach 中），
+-- 如果在 vim.schedule/vim.defer_fn 回调中调用会阻塞主进程。
+-- 异步上下文中请使用 get_lsp_clients_nonblocking。
+local function get_lsp_clients(filepath, defer_cleanup)
+  local bufnr, cleanup, err = ensure_buf_loaded(filepath)
+  if err then
+    return nil, err, nil, nil
+  end
+
+  -- 获取文件类型和对应的 LSP 配置名
+  local abs_path = vim.fn.fnamemodify(filepath, ":p")
+  local ft = vim.filetype.match({ filename = abs_path })
+  local ft_to_lsp_config = {
+    lua = "lua_ls",
+    python = "pyright",
+    javascript = "ts_ls",
+    typescript = "ts_ls",
+    javascriptreact = "ts_ls",
+    typescriptreact = "ts_ls",
+    go = "gopls",
+    rust = "rust_analyzer",
+    java = "jdtls",
+    c = "clangd",
+    cpp = "clangd",
+    ruby = "solargraph",
+    php = "intelephense",
+    json = "jsonls",
+    yaml = "yamlls",
+    markdown = "marksman",
+    bash = "bashls",
+    sh = "bashls",
+    zsh = "bashls",
+    css = "cssls",
+    html = "htmlls",
+    vue = "volar",
+    svelte = "svelte",
+  }
+  local expected_config = ft and ft_to_lsp_config[ft]
+
+  -- 辅助函数：检查客户端是否与文件类型匹配
+  local function client_matches_filetype(client)
+    if not expected_config then
+      return true -- 无法推断文件类型，接受任何客户端
+    end
+    -- 检查客户端名称是否与期望的配置名匹配
+    return client.name == expected_config
+  end
+
+  -- 第一步：直接查找已 attach 到该缓冲区的客户端
+  local clients = filter_qualified_clients(vim.lsp.get_clients({ bufnr = bufnr }))
+  if clients and #clients > 0 then
+    -- 检查是否有与文件类型匹配的客户端
+    local matched_clients = {}
+    for _, client in ipairs(clients) do
+      if client_matches_filetype(client) then
+        table.insert(matched_clients, client)
+      end
+    end
+    if #matched_clients > 0 then
+      if defer_cleanup and cleanup then
+        table.insert(_deferred_cleanups, cleanup)
+        cleanup = nil
+      end
+      return matched_clients, nil, bufnr, cleanup
+    end
+  end
+
+  -- 第二步：尝试通过文件类型推断并启动 LSP 服务器
+  if expected_config then
+    -- 尝试多种方式启动 LSP 服务器
+    local started = try_start_lsp(expected_config, bufnr)
+    if started then
+      -- 启动后等待客户端 attach（使用 vim.wait，最多 8 秒）
+      -- 注意：如果在 vim.schedule 回调中调用，会阻塞主进程
+      clients = wait_for_lsp_attach(bufnr, 8000, expected_config)
+      if clients then
+        if defer_cleanup and cleanup then
+          table.insert(_deferred_cleanups, cleanup)
+          cleanup = nil
+        end
+        return clients, nil, bufnr, cleanup
+      end
+    end
+  end
+
+  -- 第三步：通过 LspAttach 事件等待 LSP 客户端 attach（最多 5 秒）
+  clients = wait_for_lsp_attach(bufnr, 5000, expected_config)
+  if clients then
+    if defer_cleanup and cleanup then
+      table.insert(_deferred_cleanups, cleanup)
+      cleanup = nil
+    end
+    return clients, nil, bufnr, cleanup
+  end
+
+  if cleanup then
+    cleanup()
+  end
+  return nil, "文件 '" .. filepath .. "' 没有关联的 LSP 客户端（需要支持悬停功能）", nil, nil
 end
 
 -- 使用 Tree-sitter 在文件中查找符号位置
+-- 如果 Tree-sitter 不可用，回退到 LSP documentSymbol
 -- 返回 { row, col } 或 nil
-local function find_symbol_position(filepath, symbol_name, node_type)
+-- 如果提供了 bufnr，则优先使用它进行 LSP documentSymbol 回退查找
+local function find_symbol_position(filepath, symbol_name, node_type, bufnr)
+  -- 先尝试 Tree-sitter
   local ok_ts, ts = pcall(require, "vim.treesitter")
-  if not ok_ts then
-    return nil, "Tree-sitter 不可用，无法定位符号"
-  end
-
-  local content, err = read_file_content(filepath)
-  if not content then
-    return nil, err
-  end
-
-  -- 推断语言
-  local abs_path = vim.fn.fnamemodify(filepath, ":p")
-  local ft = vim.filetype.match({ filename = abs_path })
-  if not ft then
-    return nil, "无法确定文件类型"
-  end
-  local ok_lang, lang = pcall(ts.language.get_lang, ft)
-  if not ok_lang or not lang then
-    return nil, "无法确定 Tree-sitter 语言"
-  end
-
-  local ok_parser, parser = pcall(ts.get_string_parser, content, lang)
-  if not ok_parser or not parser then
-    return nil, "无法创建解析器"
-  end
-
-  local ok_trees, trees = pcall(parser.parse, parser)
-  if not ok_trees or not trees or #trees == 0 then
-    return nil, "解析失败"
-  end
-
-  local root = trees[1]:root()
-
-  -- 需要跳过的节点类型（注释、字符串等，不包含有效符号）
-  local skip_types = {
-    comment = true,
-    string = true,
-    string_literal = true,
-    line_comment = true,
-    block_comment = true,
-  }
-
-  -- 递归遍历查找匹配的节点
-  -- 跳过根节点（如 chunk、program），因为根节点包含整个文件内容
-  local root_types = { chunk = true, program = true }
-
-  -- 检查符号名是否包含 '.'（如 "M.setup"、"table.insert"）
-  local symbol_parts = {}
-  local is_dotted = false
-  if symbol_name:find(".", 1, true) then
-    is_dotted = true
-    for part in symbol_name:gmatch("[^.]+") do
-      table.insert(symbol_parts, part)
-    end
-  end
-
-  local function search_node(node, depth, max_depth)
-    if not node or (max_depth and depth > max_depth) then
-      return nil
-    end
-
-    -- 跳过根节点类型，避免根节点包含整个文件内容导致返回 (0,0)
-    if root_types[node:type()] then
-      -- 直接搜索子节点
-      for i = 0, node:named_child_count() - 1 do
-        local child = node:named_child(i)
-        local r, c = search_node(child, depth + 1, max_depth)
-        if r then
-          return r, c
+  if ok_ts then
+    local content, err = read_file_content(filepath)
+    if content then
+      -- 推断语言
+      local abs_path = vim.fn.fnamemodify(filepath, ":p")
+      local ft = vim.filetype.match({ filename = abs_path })
+      if ft then
+        -- 使用 inspect 检查解析器是否真正安装
+        local ok_inspect, _ = pcall(ts.language.inspect, ft)
+        if not ok_inspect then
+          -- 解析器未安装，跳过 Tree-sitter 查找，直接回退到 LSP
+          return find_symbol_via_lsp(filepath, symbol_name, bufnr)
         end
-      end
-      return nil
-    end
+        local ok_lang, lang = pcall(ts.language.get_lang, ft)
+        if ok_lang and lang then
+          local ok_parser, parser = pcall(ts.get_string_parser, content, lang)
+          if ok_parser and parser then
+            local ok_trees, trees = pcall(parser.parse, parser)
+            if ok_trees and trees and #trees > 0 then
+              local root = trees[1]:root()
 
-    -- 跳过注释和字符串节点
-    if skip_types[node:type()] then
-      return nil
-    end
+              -- 需要跳过的节点类型（注释、字符串等，不包含有效符号）
+              local skip_types = {
+                comment = true,
+                string = true,
+                string_literal = true,
+                line_comment = true,
+                block_comment = true,
+              }
 
-    local text = vim.treesitter.get_node_text(node, content)
-    local node_type_match = true
-    if node_type and node:type() ~= node_type then
-      node_type_match = false
-    end
+              -- 递归遍历查找匹配的节点
+              -- 跳过根节点（如 chunk、program），因为根节点包含整个文件内容
+              local root_types = { chunk = true, program = true }
 
-    if node_type_match and text then
-      -- 策略一：精确匹配（text == symbol_name）
-      if text == symbol_name then
-        -- 查找子节点中精确匹配符号名的 identifier 节点
-        for i = 0, node:named_child_count() - 1 do
-          local child = node:named_child(i)
-          local child_text = vim.treesitter.get_node_text(child, content)
-          if child_text == symbol_name then
-            local sr, sc = child:range()
-            return sr, sc
+              -- 检查符号名是否包含 '.'（如 "M.setup"、"table.insert"）
+              local symbol_parts = {}
+              local is_dotted = false
+              if symbol_name:find(".", 1, true) then
+                is_dotted = true
+                for part in symbol_name:gmatch("[^.]+") do
+                  table.insert(symbol_parts, part)
+                end
+              end
+
+              local function search_node(node, depth, max_depth)
+                if not node or (max_depth and depth > max_depth) then
+                  return nil
+                end
+
+                -- 跳过根节点类型，避免根节点包含整个文件内容导致返回 (0,0)
+                if root_types[node:type()] then
+                  -- 直接搜索子节点
+                  for i = 0, node:named_child_count() - 1 do
+                    local child = node:named_child(i)
+                    local r, c = search_node(child, depth + 1, max_depth)
+                    if r then
+                      return r, c
+                    end
+                  end
+                  return nil
+                end
+
+                -- 跳过注释和字符串节点
+                if skip_types[node:type()] then
+                  return nil
+                end
+
+                local text = vim.treesitter.get_node_text(node, content)
+                local node_type_match = true
+                if node_type and node:type() ~= node_type then
+                  node_type_match = false
+                end
+
+                if node_type_match and text then
+                  -- 策略一：精确匹配（text == symbol_name）
+                  if text == symbol_name then
+                    -- 查找子节点中精确匹配符号名的 identifier 节点
+                    for i = 0, node:named_child_count() - 1 do
+                      local child = node:named_child(i)
+                      local child_text = vim.treesitter.get_node_text(child, content)
+                      if child_text == symbol_name then
+                        local sr, sc = child:range()
+                        return sr, sc
+                      end
+                    end
+                    local sr, sc = node:range()
+                    return sr, sc
+                  end
+
+                  -- 策略二：子串匹配（text 包含 symbol_name）
+                  if text:find(symbol_name, 1, true) then
+                    -- 优先查找子节点中精确匹配符号名的 identifier 节点
+                    for i = 0, node:named_child_count() - 1 do
+                      local child = node:named_child(i)
+                      local child_text = vim.treesitter.get_node_text(child, content)
+                      if child_text == symbol_name then
+                        local sr, sc = child:range()
+                        return sr, sc
+                      end
+                    end
+                    -- 如果没有找到精确匹配的子节点，返回当前节点的起始位置
+                    local sr, sc = node:range()
+                    return sr, sc
+                  end
+
+                  -- 策略三：带点符号名匹配（如 "M.setup" 匹配 field 节点 "M.setup"）
+                  if is_dotted and text == symbol_parts[#symbol_parts] then
+                    -- 当前节点文本等于最后一部分（如 "setup"），向上检查父节点链
+                    -- 对于 field 节点如 "M.setup"，子节点是 "M" 和 "setup"
+                    -- 我们直接检查当前节点的父节点是否包含完整的点号表达式
+                    local parent = node:parent()
+                    if parent then
+                      local parent_text = vim.treesitter.get_node_text(parent, content)
+                      if parent_text == symbol_name then
+                        local sr, sc = node:range()
+                        return sr, sc
+                      end
+                    end
+                  end
+                end
+
+                -- 优先搜索命名子节点
+                for i = 0, node:named_child_count() - 1 do
+                  local child = node:named_child(i)
+                  local r, c = search_node(child, depth + 1, max_depth)
+                  if r then
+                    return r, c
+                  end
+                end
+
+                return nil
+              end
+
+              local row, col = search_node(root, 0, 50)
+              if row then
+                return row, col
+              end
+            end
           end
         end
-        local sr, sc = node:range()
-        return sr, sc
-      end
-
-      -- 策略二：子串匹配（text 包含 symbol_name）
-      if text:find(symbol_name, 1, true) then
-        -- 优先查找子节点中精确匹配符号名的 identifier 节点
-        for i = 0, node:named_child_count() - 1 do
-          local child = node:named_child(i)
-          local child_text = vim.treesitter.get_node_text(child, content)
-          if child_text == symbol_name then
-            local sr, sc = child:range()
-            return sr, sc
-          end
-        end
-        -- 如果没有找到精确匹配的子节点，返回当前节点的起始位置
-        local sr, sc = node:range()
-        return sr, sc
-      end
-
-      -- 策略三：带点符号名匹配（如 "M.setup" 匹配 field 节点 "M.setup"）
-      if is_dotted and text == symbol_parts[#symbol_parts] then
-        -- 当前节点文本等于最后一部分（如 "setup"），向上检查父节点链
-        -- 对于 field 节点如 "M.setup"，子节点是 "M" 和 "setup"
-        -- 我们直接检查当前节点的父节点是否包含完整的点号表达式
-        local parent = node:parent()
-        if parent then
-          local parent_text = vim.treesitter.get_node_text(parent, content)
-          if parent_text == symbol_name then
-            local sr, sc = node:range()
-            return sr, sc
-          end
-        end
       end
     end
-
-    -- 优先搜索命名子节点
-    for i = 0, node:named_child_count() - 1 do
-      local child = node:named_child(i)
-      local r, c = search_node(child, depth + 1, max_depth)
-      if r then
-        return r, c
-      end
-    end
-
-    return nil
   end
 
-  local row, col = search_node(root, 0, 50)
-  if not row then
-    return nil, "未找到符号 '" .. symbol_name .. "' 在文件中的位置"
+  -- Tree-sitter 不可用或未找到符号，回退到 LSP documentSymbol
+  local row, col = find_symbol_via_lsp(filepath, symbol_name, bufnr)
+  if row then
+    return row, col
   end
 
-  return row, col
+  return nil, "未找到符号 '" .. symbol_name .. "' 在文件中的位置"
 end
 
 -- 执行 LSP 请求并等待结果
@@ -495,15 +945,14 @@ local function _lsp_hover(args)
     return { error = "需要 filepath（文件路径）参数" }
   end
 
-  local clients, err, bufnr, cleanup = get_lsp_clients(args.filepath)
+  local clients, err, bufnr, cleanup = get_lsp_clients(args.filepath, true)
   if err then
     return { filepath = args.filepath, error = err }
   end
-
   -- 通过符号名称定位
   local row, col
   if args.symbol then
-    row, col = find_symbol_position(args.filepath, args.symbol, args.node_type)
+    row, col = find_symbol_position(args.filepath, args.symbol, args.node_type, bufnr)
     if not row then
       if cleanup then
         cleanup()
@@ -576,14 +1025,14 @@ local function _lsp_definition(args)
     return { error = "需要 filepath（文件路径）参数" }
   end
 
-  local clients, err, bufnr, cleanup = get_lsp_clients(args.filepath)
+  local clients, err, bufnr, cleanup = get_lsp_clients(args.filepath, true)
   if err then
     return { filepath = args.filepath, error = err }
   end
 
   local row, col
   if args.symbol then
-    row, col = find_symbol_position(args.filepath, args.symbol, args.node_type)
+    row, col = find_symbol_position(args.filepath, args.symbol, args.node_type, bufnr)
     if not row then
       if cleanup then
         cleanup()
@@ -664,14 +1113,14 @@ local function _lsp_references(args)
     return { error = "需要 filepath（文件路径）参数" }
   end
 
-  local clients, err, bufnr, cleanup = get_lsp_clients(args.filepath)
+  local clients, err, bufnr, cleanup = get_lsp_clients(args.filepath, true)
   if err then
     return { filepath = args.filepath, error = err }
   end
 
   local row, col
   if args.symbol then
-    row, col = find_symbol_position(args.filepath, args.symbol, args.node_type)
+    row, col = find_symbol_position(args.filepath, args.symbol, args.node_type, bufnr)
     if not row then
       if cleanup then
         cleanup()
@@ -763,14 +1212,14 @@ local function _lsp_implementation(args)
     return { error = "需要 filepath（文件路径）参数" }
   end
 
-  local clients, err, bufnr, cleanup = get_lsp_clients(args.filepath)
+  local clients, err, bufnr, cleanup = get_lsp_clients(args.filepath, true)
   if err then
     return { filepath = args.filepath, error = err }
   end
 
   local row, col
   if args.symbol then
-    row, col = find_symbol_position(args.filepath, args.symbol, args.node_type)
+    row, col = find_symbol_position(args.filepath, args.symbol, args.node_type, bufnr)
     if not row then
       if cleanup then
         cleanup()
@@ -851,14 +1300,14 @@ local function _lsp_declaration(args)
     return { error = "需要 filepath（文件路径）参数" }
   end
 
-  local clients, err, bufnr, cleanup = get_lsp_clients(args.filepath)
+  local clients, err, bufnr, cleanup = get_lsp_clients(args.filepath, true)
   if err then
     return { filepath = args.filepath, error = err }
   end
 
   local row, col
   if args.symbol then
-    row, col = find_symbol_position(args.filepath, args.symbol, args.node_type)
+    row, col = find_symbol_position(args.filepath, args.symbol, args.node_type, bufnr)
     if not row then
       if cleanup then
         cleanup()
@@ -938,7 +1387,7 @@ local function _lsp_document_symbols(args)
     return { error = "需要 filepath（文件路径）参数" }
   end
 
-  local clients, err, bufnr, cleanup = get_lsp_clients(args.filepath)
+  local clients, err, bufnr, cleanup = get_lsp_clients(args.filepath, true)
   if err then
     return { filepath = args.filepath, error = err }
   end
@@ -1025,7 +1474,7 @@ local function _lsp_workspace_symbols(args)
     return { error = "需要 filepath（文件路径）参数来定位 LSP 客户端" }
   end
 
-  local clients, err, bufnr, cleanup = get_lsp_clients(args.filepath)
+  local clients, err, bufnr, cleanup = get_lsp_clients(args.filepath, true)
   if err then
     return { filepath = args.filepath, error = err }
   end
@@ -1097,7 +1546,7 @@ local function _lsp_code_action(args)
     return { error = "需要 filepath（文件路径）参数" }
   end
 
-  local clients, err, bufnr, cleanup = get_lsp_clients(args.filepath)
+  local clients, err, bufnr, cleanup = get_lsp_clients(args.filepath, true)
   if err then
     return { filepath = args.filepath, error = err }
   end
@@ -1105,7 +1554,7 @@ local function _lsp_code_action(args)
   -- 通过符号名称定位
   local row, col
   if args.symbol then
-    row, col = find_symbol_position(args.filepath, args.symbol, args.node_type)
+    row, col = find_symbol_position(args.filepath, args.symbol, args.node_type, bufnr)
     if not row then
       if cleanup then
         cleanup()
@@ -1207,14 +1656,14 @@ local function _lsp_rename(args)
     return { error = "需要 new_name（新名称）参数" }
   end
 
-  local clients, err, bufnr, cleanup = get_lsp_clients(args.filepath)
+  local clients, err, bufnr, cleanup = get_lsp_clients(args.filepath, true)
   if err then
     return { filepath = args.filepath, error = err }
   end
 
   local row, col
   if args.symbol then
-    row, col = find_symbol_position(args.filepath, args.symbol, args.node_type)
+    row, col = find_symbol_position(args.filepath, args.symbol, args.node_type, bufnr)
     if not row then
       if cleanup then
         cleanup()
@@ -1281,9 +1730,28 @@ local function _lsp_format(args)
     return { error = "需要 filepath（文件路径）参数" }
   end
 
-  local clients, err, bufnr, cleanup = get_lsp_clients(args.filepath)
+  local clients, err, bufnr, cleanup = get_lsp_clients(args.filepath, true)
   if err then
     return { filepath = args.filepath, error = err }
+  end
+
+  -- 单独检查客户端是否支持格式化能力
+  local has_format_client = false
+  for _, client in ipairs(clients) do
+    local caps = client.server_capabilities
+    if caps then
+      local has_format = caps.documentFormattingProvider == true or (type(caps.documentFormattingProvider) == "table")
+      if has_format then
+        has_format_client = true
+        break
+      end
+    end
+  end
+  if not has_format_client then
+    if cleanup then
+      cleanup()
+    end
+    return { filepath = args.filepath, error = "LSP 客户端不支持文档格式化（documentFormattingProvider）" }
   end
 
   local options = {}
@@ -1451,62 +1919,105 @@ local function _lsp_client_info(args)
     return { error = "LSP 不可用" }
   end
 
-  local clients = vim.lsp.get_clients()
-  if not clients or #clients == 0 then
-    return { error = "没有活跃的 LSP 客户端" }
+  -- 收集要查询的文件路径列表
+  local filepaths = {}
+  if args and args.filepath then
+    table.insert(filepaths, args.filepath)
+  end
+  if args and args.filepaths then
+    if type(args.filepaths) == "table" then
+      for _, fp in ipairs(args.filepaths) do
+        table.insert(filepaths, fp)
+      end
+    end
   end
 
-  local client_list = {}
-  local filtered_count = 0
-  for _, client in ipairs(clients) do
-    -- 过滤掉功能不完整的客户端（如仅支持 inline_completion 的 GitHub Copilot）
-    if not is_client_functionally_complete(client) then
-      filtered_count = filtered_count + 1
+  if #filepaths == 0 then
+    return { error = "需要 filepath（文件路径）或 filepaths（文件路径列表）参数" }
+  end
+
+  local file_results = {}
+  for _, filepath in ipairs(filepaths) do
+    local abs_path = vim.fn.fnamemodify(filepath, ":p")
+    -- 使用 ensure_buf_loaded 自动加载文件到缓冲区
+    local bufnr, cleanup, load_err = ensure_buf_loaded(filepath)
+    local file_entry = {
+      filepath = filepath,
+      clients = {},
+    }
+
+    if load_err then
+      file_entry.error = "文件加载失败: " .. load_err
     else
-      local info = {
-        name = client.name,
-        id = client.id,
-        root_dir = client.config and client.config.root_dir,
-        capabilities = client.server_capabilities and {
-          hover_provider = client.server_capabilities.hoverProvider,
-          definition_provider = client.server_capabilities.definitionProvider,
-          references_provider = client.server_capabilities.referencesProvider,
-          rename_provider = client.server_capabilities.renameProvider,
-          document_formatting_provider = client.server_capabilities.documentFormattingProvider,
-          code_action_provider = client.server_capabilities.codeActionProvider,
-          completion_provider = client.server_capabilities.completionProvider,
-          signature_help_provider = client.server_capabilities.signatureHelpProvider,
-          document_symbol_provider = client.server_capabilities.documentSymbolProvider,
-          workspace_symbol_provider = client.server_capabilities.workspaceSymbolProvider,
-          implementation_provider = client.server_capabilities.implementationProvider,
-          declaration_provider = client.server_capabilities.declarationProvider,
-          inline_completion = client.server_capabilities.inlineCompletionProvider,
-          document_color = client.server_capabilities.colorProvider,
-          semantic_tokens = client.server_capabilities.semanticTokensProvider,
-        },
-      }
-      table.insert(client_list, info)
+      local clients = vim.lsp.get_clients({ bufnr = bufnr })
+      if not clients or #clients == 0 then
+        file_entry.error = "该文件没有关联的 LSP 客户端"
+      else
+        local filtered_count = 0
+        for _, client in ipairs(clients) do
+          if not is_client_functionally_complete(client) then
+            filtered_count = filtered_count + 1
+          else
+            table.insert(file_entry.clients, {
+              name = client.name,
+              id = client.id,
+              root_dir = client.config and client.config.root_dir,
+              capabilities = client.server_capabilities and {
+                hover_provider = client.server_capabilities.hoverProvider,
+                definition_provider = client.server_capabilities.definitionProvider,
+                references_provider = client.server_capabilities.referencesProvider,
+                rename_provider = client.server_capabilities.renameProvider,
+                document_formatting_provider = client.server_capabilities.documentFormattingProvider,
+                code_action_provider = client.server_capabilities.codeActionProvider,
+                completion_provider = client.server_capabilities.completionProvider,
+                signature_help_provider = client.server_capabilities.signatureHelpProvider,
+                document_symbol_provider = client.server_capabilities.documentSymbolProvider,
+                workspace_symbol_provider = client.server_capabilities.workspaceSymbolProvider,
+                implementation_provider = client.server_capabilities.implementationProvider,
+                declaration_provider = client.server_capabilities.declarationProvider,
+                inline_completion = client.server_capabilities.inlineCompletionProvider,
+                document_color = client.server_capabilities.colorProvider,
+                semantic_tokens = client.server_capabilities.semanticTokensProvider,
+              },
+            })
+          end
+        end
+        file_entry.filtered_count = filtered_count
+      end
+    end
+
+    table.insert(file_results, file_entry)
+
+    -- 清理临时加载的缓冲区
+    if cleanup then
+      cleanup()
     end
   end
 
   return {
-    client_count = #client_list,
-    filtered_count = filtered_count,
-    clients = client_list,
+    file_count = #file_results,
+    files = file_results,
   }
 end
 
 M.lsp_client_info = define_tool({
   name = "lsp_client_info",
-  description = "获取当前所有活跃的 LSP 客户端信息，包括名称、根目录、支持的能力列表",
+  description = "获取指定文件或文件列表的 LSP 客户端信息，包括名称、根目录、支持的能力列表。必须提供 filepath（单个文件）或 filepaths（文件列表）参数。",
   func = _lsp_client_info,
   parameters = {
     type = "object",
-    properties = {},
+    properties = {
+      filepath = { type = "string", description = "文件路径（与 filepaths 二选一）" },
+      filepaths = {
+        type = "array",
+        items = { type = "string" },
+        description = "文件路径列表（与 filepath 二选一）",
+      },
+    },
   },
   returns = {
     type = "object",
-    description = "LSP 客户端信息列表",
+    description = "每个文件对应的 LSP 客户端信息列表",
   },
   category = "lsp",
   permissions = { read = true },
@@ -1525,14 +2036,14 @@ local function _lsp_signature_help(args)
     return { error = "需要 filepath（文件路径）参数" }
   end
 
-  local clients, err, bufnr, cleanup = get_lsp_clients(args.filepath)
+  local clients, err, bufnr, cleanup = get_lsp_clients(args.filepath, true)
   if err then
     return { filepath = args.filepath, error = err }
   end
 
   local row, col
   if args.symbol then
-    row, col = find_symbol_position(args.filepath, args.symbol, args.node_type)
+    row, col = find_symbol_position(args.filepath, args.symbol, args.node_type, bufnr)
     if not row then
       if cleanup then
         cleanup()
@@ -1620,14 +2131,14 @@ local function _lsp_completion(args)
     return { error = "需要 filepath（文件路径）参数" }
   end
 
-  local clients, err, bufnr, cleanup = get_lsp_clients(args.filepath)
+  local clients, err, bufnr, cleanup = get_lsp_clients(args.filepath, true)
   if err then
     return { filepath = args.filepath, error = err }
   end
 
   local row, col
   if args.symbol then
-    row, col = find_symbol_position(args.filepath, args.symbol, args.node_type)
+    row, col = find_symbol_position(args.filepath, args.symbol, args.node_type, bufnr)
     if not row then
       if cleanup then
         cleanup()
@@ -1716,14 +2227,14 @@ local function _lsp_type_definition(args)
     return { error = "需要 filepath（文件路径）参数" }
   end
 
-  local clients, err, bufnr, cleanup = get_lsp_clients(args.filepath)
+  local clients, err, bufnr, cleanup = get_lsp_clients(args.filepath, true)
   if err then
     return { filepath = args.filepath, error = err }
   end
 
   local row, col
   if args.symbol then
-    row, col = find_symbol_position(args.filepath, args.symbol, args.node_type)
+    row, col = find_symbol_position(args.filepath, args.symbol, args.node_type, bufnr)
     if not row then
       if cleanup then
         cleanup()
@@ -1787,6 +2298,21 @@ M.lsp_type_definition = define_tool({
   category = "lsp",
   permissions = { read = true },
 })
+
+-- 刷新延迟清理队列：执行所有暂存的 cleanup 函数并清空队列
+-- 在工具循环结束时自动调用，也可由外部手动调用
+function M.flush_deferred_cleanups()
+  for i = #_deferred_cleanups, 1, -1 do
+    local cleanup = _deferred_cleanups[i]
+    if cleanup then
+      pcall(cleanup)
+    end
+  end
+  _deferred_cleanups = {}
+end
+
+-- 模块加载时自动触发 Tree-sitter 解析器安装
+ensure_ts_parsers()
 
 -- get_tools() - 返回所有工具列表供注册
 function M.get_tools()

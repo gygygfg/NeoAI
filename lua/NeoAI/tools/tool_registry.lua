@@ -1,5 +1,6 @@
 -- 工具注册表模块
 -- 提供工具的注册、管理、查询等功能
+local logger = require("NeoAI.utils.logger")
 local M = {}
 
 -- 工具存储
@@ -33,26 +34,26 @@ end
 function M.register(tool)
   -- 检查模块是否已初始化
   if not state.initialized then
-    print("[tool_registry] register 失败: 未初始化")
+    logger.debug("[tool_registry] register 失败: 未初始化")
     error("工具注册表未初始化，请先调用M.initialize()")
   end
 
   -- 检查工具定义是否有效
   if not tool or not tool.name then
-    print("[tool_registry] ❌ 工具定义无效: 缺少名称")
+    logger.debug("[tool_registry] ❌ 工具定义无效: 缺少名称")
     return false
   end
 
   -- 检查工具是否已存在
   if tools[tool.name] then
-    print("[tool_registry] ⚠️ 工具已存在: " .. tool.name)
+    logger.debug("[tool_registry] ⚠️ 工具已存在: " .. tool.name)
     return false
   end
 
   -- 验证工具定义
   local valid, error_msg = M.validate_tool(tool)
   if not valid then
-    print("[tool_registry] ❌ 工具验证失败[" .. tool.name .. "]: " .. error_msg)
+    logger.debug("[tool_registry] ❌ 工具验证失败[" .. tool.name .. "]: " .. error_msg)
     return false
   end
 
@@ -67,7 +68,7 @@ function M.register(tool)
 
   table.insert(tool_categories[category], tool.name)
 
-  -- print("[tool_registry] ✅ 工具注册成功: " .. tool.name .. " (分类: " .. category .. ")")
+  -- logger.debug("[tool_registry] ✅ 工具注册成功: " .. tool.name .. " (分类: " .. category .. ")")
   return true
 end
 
@@ -76,15 +77,15 @@ end
 --- @return boolean 是否注销成功
 function M.unregister(tool_name)
   if not state.initialized then
-    print("[tool_registry] unregister 失败: 未初始化")
+    logger.debug("[tool_registry] unregister 失败: 未初始化")
     error("工具注册表未初始化")
   end
 
-  print("[tool_registry] unregister: " .. tool_name)
+  logger.debug("[tool_registry] unregister: " .. tool_name)
 
   -- 检查工具是否存在
   if not tools[tool_name] then
-    print("[tool_registry] unregister: 工具不存在 - " .. tool_name)
+    logger.debug("[tool_registry] unregister: 工具不存在 - " .. tool_name)
     return false
   end
 
@@ -108,7 +109,7 @@ function M.unregister(tool_name)
   -- 从工具存储中移除
   tools[tool_name] = nil
 
-  print("[tool_registry] unregister 成功: " .. tool_name)
+  logger.debug("[tool_registry] unregister 成功: " .. tool_name)
   return true
 end
 
@@ -117,12 +118,12 @@ end
 --- @return table|nil 工具定义的深拷贝，如果不存在则返回nil
 function M.get(tool_name)
   if not state.initialized then
-    print("[tool_registry] get 失败: 未初始化")
+    logger.debug("[tool_registry] get 失败: 未初始化")
     error("工具注册表未初始化")
   end
 
   local tool = tools[tool_name]
-  print("[tool_registry] get: " .. tool_name .. " -> " .. (tool and "找到" or "未找到"))
+  logger.debug("[tool_registry] get: " .. tool_name .. " -> " .. (tool and "找到" or "未找到"))
   return vim.deepcopy(tool) -- 返回深拷贝防止外部修改
 end
 
@@ -153,14 +154,14 @@ end
 --- @return table 工具列表（数组）
 function M.list(category)
   if not state.initialized then
-    print("[tool_registry] list 失败: 未初始化")
+    logger.debug("[tool_registry] list 失败: 未初始化")
     error("工具注册表未初始化")
   end
 
   if category then
     -- 返回特定分类的工具
     local category_tools = tool_categories[category] or {}
-    print("[tool_registry] list 分类 '" .. category .. "': " .. #category_tools .. " 个工具")
+    logger.debug("[tool_registry] list 分类 '" .. category .. "': " .. #category_tools .. " 个工具")
     local result = {}
     for _, tool_name in ipairs(category_tools) do
       table.insert(result, vim.deepcopy(tools[tool_name]))
@@ -259,20 +260,20 @@ end
 --- @return table 匹配的工具列表
 function M.search(query, search_fields)
   if not state.initialized then
-    print("[tool_registry] search 失败: 未初始化")
+    logger.debug("[tool_registry] search 失败: 未初始化")
     error("工具注册表未初始化")
   end
 
   -- 如果查询为空，则返回所有工具
   if not query or query == "" then
-    print("[tool_registry] search: 查询为空，返回所有工具")
+    logger.debug("[tool_registry] search: 查询为空，返回所有工具")
     return M.list()
   end
 
   query = query:lower() -- 转换为小写进行不区分大小写的搜索
   search_fields = search_fields or { "name", "description", "category" }
 
-  print("[tool_registry] search: '" .. query .. "' 在 " .. #search_fields .. " 个字段中搜索")
+  logger.debug("[tool_registry] search: '" .. query .. "' 在 " .. #search_fields .. " 个字段中搜索")
 
   local results = {}
   for _, tool in pairs(tools) do
@@ -297,14 +298,14 @@ function M.search(query, search_fields)
     return a.name < b.name
   end)
 
-  print("[tool_registry] search 结果: " .. #results .. " 个匹配")
+  logger.debug("[tool_registry] search 结果: " .. #results .. " 个匹配")
   return results
 end
 
 --- 清空注册表（保留初始化状态）
 function M.clear()
   if not state.initialized then
-    print("[tool_registry] clear 失败: 未初始化")
+    logger.debug("[tool_registry] clear 失败: 未初始化")
     error("工具注册表未初始化")
   end
 
@@ -312,10 +313,10 @@ function M.clear()
   for _ in pairs(tools) do
     count = count + 1
   end
-  print("[tool_registry] clear: 清空 " .. count .. " 个工具")
+  logger.debug("[tool_registry] clear: 清空 " .. count .. " 个工具")
   tools = {}
   tool_categories = {}
-  print("[tool_registry] clear 完成")
+  logger.debug("[tool_registry] clear 完成")
 end
 
 --- 重置注册表（用于测试）
@@ -332,12 +333,12 @@ end
 --- @return boolean 是否存在
 function M.exists(tool_name)
   if not state.initialized then
-    print("[tool_registry] exists 失败: 未初始化")
+    logger.debug("[tool_registry] exists 失败: 未初始化")
     error("工具注册表未初始化")
   end
 
   local found = tools[tool_name] ~= nil
-  print("[tool_registry] exists: " .. tool_name .. " -> " .. tostring(found))
+  logger.debug("[tool_registry] exists: " .. tool_name .. " -> " .. tostring(found))
   return found
 end
 
@@ -345,7 +346,7 @@ end
 --- @return number 工具总数
 function M.count()
   if not state.initialized then
-    print("[tool_registry] count 失败: 未初始化")
+    logger.debug("[tool_registry] count 失败: 未初始化")
     error("工具注册表未初始化")
   end
 
@@ -354,7 +355,7 @@ function M.count()
     count = count + 1
   end
 
-  print("[tool_registry] count: " .. count)
+  logger.debug("[tool_registry] count: " .. count)
   return count
 end
 

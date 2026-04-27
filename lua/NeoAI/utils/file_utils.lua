@@ -178,11 +178,9 @@ function M.mkdir(dir)
     return true
   end
 
-  -- 创建目录
-  local cmd = string.format('mkdir -p "%s"', dir)
-  local result = os.execute(cmd)
-
-  if result == 0 or result == true then
+  -- 创建目录（使用 vim.fn.mkdir，非阻塞）
+  local ok = vim.fn.mkdir(dir, "p")
+  if ok == 1 then
     return true
   else
     return nil, "创建目录失败"
@@ -386,17 +384,16 @@ function M.list_dir(dir, pattern)
   pattern = pattern or "*"
 
   local files = {}
-  local handle = io.popen(string.format('ls -1 "%s" 2>/dev/null', dir))
+  -- 使用 vim.fn.systemlist 替代 io.popen，非阻塞
+  local output = vim.fn.systemlist({ "ls", "-1", dir })
 
-  if handle then
-    for line in handle:lines() do
+  if vim.v.shell_error == 0 then
+    for _, line in ipairs(output) do
       -- 简单的模式匹配
       if pattern == "*" or line:match(pattern) then
         table.insert(files, line)
       end
     end
-
-    handle:close()
     return files
   else
     return nil, "无法列出目录"
@@ -415,15 +412,13 @@ function M.list_dir_recursive(dir, pattern)
   pattern = pattern or "*"
 
   local files = {}
-  local cmd = string.format('find "%s" -type f -name "%s" 2>/dev/null', dir, pattern)
-  local handle = io.popen(cmd)
+  -- 使用 vim.fn.systemlist 替代 io.popen，非阻塞
+  local output = vim.fn.systemlist({ "find", dir, "-type", "f", "-name", pattern })
 
-  if handle then
-    for line in handle:lines() do
+  if vim.v.shell_error == 0 then
+    for _, line in ipairs(output) do
       table.insert(files, line)
     end
-
-    handle:close()
     return files
   else
     return nil, "无法递归列出目录"

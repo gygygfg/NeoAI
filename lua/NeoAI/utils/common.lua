@@ -171,13 +171,20 @@ function M.default(value, default)
   return value
 end
 
---- 等待一段时间（同步）
--- 警告：这会阻塞当前线程
+--- 非阻塞等待（事件驱动）
+-- 使用 vim.wait 处理事件循环，不阻塞 UI
 -- @param ms number 毫秒数
+-- @param interval number 事件轮询间隔（毫秒），默认 50
 function M.sleep(ms)
-  local start = vim.loop.now()
-  while vim.loop.now() - start < ms do
-    -- 空循环等待
+  if vim.wait then
+    vim.wait(ms, function() return false end, math.min(ms, 50))
+  else
+    -- 回退：使用 vim.loop 定时器（非阻塞）
+    local timer = vim.loop.new_timer()
+    timer:start(ms, 0, vim.schedule_wrap(function()
+      timer:close()
+    end))
+    vim.wait(ms + 100, function() return false end, 50)
   end
 end
 
@@ -189,7 +196,34 @@ function M.sleep_async(ms, callback)
   vim.defer_fn(callback, ms)
 end
 
---- 重试函数
+--- 异步重试函数（基于回调，不阻塞主线程）
+-- 失败时自动重试指定次数
+-- @param func function 要重试的函数
+-- @param on_success function 成功回调 (result)
+-- @param on_failure function 失败回调 (error_msg)
+-- @param max_attempts number 最大尝试次数
+-- @param delay number 重试延迟（毫秒）
+function M.retry_async(func, on_success, on_failure, max_attempts, delay)
+  max_attempts = max_attempts or 3
+  delay = delay or 1000
+
+  local function attempt(n)
+    local ok, result = pcall(func)
+    if ok then
+      if on_success then on_success(result) end
+    else
+      if n < max_attempts then
+        vim.defer_fn(function() attempt(n + 1) end, delay)
+      else
+        if on_failure then on_failure("重试失败: " .. tostring(result)) end
+      end
+    end
+  end
+
+  attempt(1)
+end
+
+--- 重试函数（同步，但使用事件驱动等待）
 -- 失败时自动重试指定次数
 -- @param func function 要重试的函数
 -- @param max_attempts number 最大尝试次数

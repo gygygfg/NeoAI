@@ -588,6 +588,10 @@ function M._update_float_window()
     vim.api.nvim_set_option_value("modifiable", true, { buf = state.float_buf_id })
     vim.api.nvim_set_option_value("readonly", false, { buf = state.float_buf_id })
 
+    -- 阻止 LSP 附加到树窗口的悬浮状态窗口
+    local wm = require("NeoAI.ui.window.window_manager")
+    wm.block_lsp_for_buffer(state.float_buf_id, "树窗口悬浮状态")
+
     state.float_win_id = vim.api.nvim_open_win(state.float_buf_id, false, {
       relative = "win",
       win = main_win_handle,

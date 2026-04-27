@@ -25,6 +25,35 @@ local state = {
   available_modes = { "float", "tab", "split" },
 }
 
+--- 阻止 LSP 附加到指定 buffer
+--- 供 window_manager 内部和其他模块（tree_window、virtual_input 等）调用
+--- @param buf number buffer 句柄
+--- @param label string|nil 描述标签（用于自动命令描述）
+function M.block_lsp_for_buffer(buf, label)
+  if not buf or not vim.api.nvim_buf_is_valid(buf) then
+    return
+  end
+  -- 设置 buffer 变量标记，供外部 LSP 配置检查
+  pcall(vim.api.nvim_buf_set_var, buf, "neoai_no_lsp", true)
+  -- 注册 FileType 自动命令，在 LSP 附加后立即分离
+  local augroup_name = "NeoAIBlockLSP_buf_" .. tostring(buf)
+  pcall(vim.api.nvim_del_augroup_by_name, augroup_name)
+  local group = vim.api.nvim_create_augroup(augroup_name, { clear = true })
+  vim.api.nvim_create_autocmd("FileType", {
+    group = group,
+    buffer = buf,
+    callback = function()
+      vim.defer_fn(function()
+        local clients = vim.lsp.get_clients({ bufnr = buf })
+        for _, client in ipairs(clients) do
+          pcall(vim.lsp.buf_detach_client, buf, client.id)
+        end
+      end, 10)
+    end,
+    desc = "阻止 LSP 附加" .. (label and ("到 " .. label) or ""),
+  })
+end
+
 --- 初始化窗口管理器
 --- @param config table 配置
 function M.initialize(config)
@@ -497,6 +526,11 @@ function M.create_window(window_type, options)
   vim.api.nvim_set_option_value("filetype", ft, { buf = window_info.buf })
   vim.api.nvim_set_option_value("modifiable", true, { buf = window_info.buf })
   vim.api.nvim_set_option_value("readonly", false, { buf = window_info.buf })
+
+  -- chat、tree、reasoning、tool_display 等界面不允许打开任何 LSP 服务
+  if window_type == "chat" or window_type == "tree" or window_type == "reasoning" or window_type == "tool_display" then
+    M.block_lsp_for_buffer(window_info.buf, window_type .. " 界面")
+  end
 
   -- 设置缓冲区名称，使其能在 :ls 命令中显示
   local buffer_name = "neoai://" .. window_type .. "/" .. window_id

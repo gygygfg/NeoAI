@@ -211,10 +211,6 @@ function M.setup(user_config)
     ai_engine.set_tools(tools_map)
   end
 
-  -- 初始化异步工作器
-  local async_worker = require("NeoAI.utils.async_worker")
-  async_worker.initialize()
-
   -- 注册命令和快捷键
   register_commands()
   register_global_keymaps()

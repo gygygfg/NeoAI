@@ -151,7 +151,7 @@ M.read_file = define_tool({
 
 local function _write_file(args)
   if not args then
-    return {}
+    return "错误: 需要文件参数"
   end
 
   -- 支持 files（列表）和 file（单个）两种参数
@@ -161,7 +161,7 @@ local function _write_file(args)
   end
 
   if #files == 0 then
-    return {}
+    return "错误: 需要文件列表或单个文件参数"
   end
 
   local fu = get_file_utils()
@@ -262,7 +262,7 @@ M.write_file = define_tool({
 
 local function _list_files(args)
   if not args then
-    return {}
+    return "错误: 需要目录参数"
   end
 
   -- 支持 files（列表）和 file（单个）两种参数
@@ -271,8 +271,7 @@ local function _list_files(args)
     table.insert(file_specs, args.file)
   end
   if #file_specs == 0 then
-    -- 默认列出当前目录
-    file_specs = { {} }
+    return "错误: 需要目录列表或单个目录参数"
   end
 
   local files = {}
@@ -281,41 +280,45 @@ local function _list_files(args)
     local dir = spec.dir or "."
     local pattern = spec.pattern or "*"
     local recursive = spec.recursive or false
-    if vim.fn.has("win32") == 1 or vim.fn.has("win64") == 1 then
-      local dir_cmd = "dir " .. (recursive and "/s " or "") .. "/b /a:-d " .. vim.fn.shellescape(dir) .. " 2>nul"
-      local output = vim.fn.systemlist(dir_cmd)
-      if vim.v.shell_error == 0 then
-        for _, line in ipairs(output) do
-          if pattern == "*" or line:match(vim.pesc(pattern):gsub("%%%*", ".*"):gsub("%%%?", ".")) then
-            table.insert(files, line)
+
+    -- 使用 vim.fn.readdir 替代 systemlist，非阻塞且更高效
+    -- vim.fn.readdir 返回目录中的文件和子目录列表
+    local ok, entries = pcall(vim.fn.readdir, dir)
+    if ok and entries and #entries > 0 then
+      for _, entry in ipairs(entries) do
+        local full_path = dir .. "/" .. entry
+        -- 检查是否为文件（跳过目录）
+        local is_file = vim.fn.isdirectory(full_path) == 0
+        if is_file then
+          if pattern == "*" or entry:match(vim.pesc(pattern):gsub("%%%*", ".*"):gsub("%%%?", ".")) then
+            table.insert(files, full_path)
+          end
+        elseif recursive then
+          -- 递归处理子目录
+          local sub_results = M.list_files({ file = { dir = full_path, pattern = pattern, recursive = true } })
+          for _, sub_file in ipairs(sub_results) do
+            table.insert(files, sub_file)
           end
         end
       end
     else
-      local ls_cmd = "ls"
-      if recursive then
-        ls_cmd = ls_cmd .. " -laR"
-      else
-        ls_cmd = ls_cmd .. " -la"
-      end
-      ls_cmd = ls_cmd .. " --format=single-column --time-style=long-iso " .. vim.fn.shellescape(dir) .. " 2>/dev/null"
-      local output = vim.fn.systemlist(ls_cmd)
-      if vim.v.shell_error == 0 then
-        local current_dir = ""
-        for _, line in ipairs(output) do
-          if line:match("^$") then
-          -- skip
-          elseif line:match(":$") then
-            current_dir = line:gsub(":$", "")
-          elseif line ~= "." and line ~= ".." then
-            if pattern == "*" or line:match(vim.pesc(pattern):gsub("%%%*", ".*"):gsub("%%%?", ".")) then
-              local full_path
-              if recursive and current_dir ~= "" then
-                full_path = current_dir .. "/" .. line
-              else
-                full_path = dir .. "/" .. line
-              end
-              table.insert(files, full_path)
+      -- 回退：使用 vim.loop.fs_scandir（纯 Lua，非阻塞）
+      local handle = vim.loop.fs_scandir(dir)
+      if handle then
+        while true do
+          local name, type = vim.loop.fs_scandir_next(handle)
+          if not name then
+            break
+          end
+          if type == "file" then
+            if pattern == "*" or name:match(vim.pesc(pattern):gsub("%%%*", ".*"):gsub("%%%?", ".")) then
+              table.insert(files, dir .. "/" .. name)
+            end
+          elseif type == "directory" and recursive then
+            local sub_results =
+              M.list_files({ file = { dir = dir .. "/" .. name, pattern = pattern, recursive = true } })
+            for _, sub_file in ipairs(sub_results) do
+              table.insert(files, sub_file)
             end
           end
         end
@@ -333,7 +336,7 @@ M.list_files = define_tool({
   parameters = {
     type = "object",
     properties = {
-      files = {
+      dirs = {
         type = "array",
         items = {
           type = "object",
@@ -343,21 +346,21 @@ M.list_files = define_tool({
             recursive = { type = "boolean", description = "是否递归查找", default = false },
           },
         },
-        description = "目录参数列表（与 file 二选一）",
+        description = "目录参数列表（与 dir 二选一）",
       },
-      file = {
+      dir = {
         type = "object",
         properties = {
           dir = { type = "string", description = "目录路径", default = "." },
           pattern = { type = "string", description = "文件模式（如 *.txt）", default = "*" },
           recursive = { type = "boolean", description = "是否递归查找", default = false },
         },
-        description = "单个目录参数（与 files 二选一）",
+        description = "单个目录参数（与 dirs 二选一）",
       },
     },
     oneOf = {
-      { required = { "files" } },
-      { required = { "file" } },
+      { required = { "dirs" } },
+      { required = { "dir" } },
     },
   },
   returns = { type = "array", items = { type = "string" }, description = "文件路径列表" },
@@ -371,7 +374,7 @@ M.list_files = define_tool({
 
 local function _search_files(args)
   if not args then
-    return {}
+    return "错误: 需要搜索参数"
   end
 
   -- 支持 files（列表）和 file（单个）两种参数
@@ -382,7 +385,7 @@ local function _search_files(args)
 
   local pattern = args.pattern
   if not pattern and #file_specs == 0 then
-    return {}
+    return "错误: 需要搜索模式或文件参数"
   end
 
   -- 如果 file_specs 为空，使用默认参数
@@ -516,7 +519,7 @@ M.search_files = define_tool({
 
 local function _file_exists(args)
   if not args then
-    return {}
+    return "错误: 需要文件参数"
   end
 
   -- 支持 files（列表）和 file（单个）两种参数
@@ -526,7 +529,7 @@ local function _file_exists(args)
   end
 
   if #files == 0 then
-    return {}
+    return "错误: 需要文件列表或单个文件参数"
   end
 
   local fu = get_file_utils()
@@ -612,7 +615,7 @@ M.file_exists = define_tool({
 
 local function _create_directory(args)
   if not args then
-    return {}
+    return "错误: 需要目录参数"
   end
 
   -- 支持 files（列表）和 file（单个）两种参数
@@ -622,7 +625,7 @@ local function _create_directory(args)
   end
 
   if #files == 0 then
-    return {}
+    return "错误: 需要目录列表或单个目录参数"
   end
 
   local fu = get_file_utils()
@@ -640,9 +643,8 @@ local function _create_directory(args)
       local success, _ = fu.mkdir(filepath)
       ok = success == true
     else
-      local cmd = 'mkdir -p "' .. filepath .. '" 2>/dev/null'
-      local result = os.execute(cmd)
-      ok = result == 0 or result == true
+      -- 使用 vim.fn.mkdir 替代 os.execute，非阻塞
+      ok = vim.fn.mkdir(filepath, "p")
     end
     table.insert(results, { filepath = filepath, success = ok })
 
@@ -707,7 +709,7 @@ M.create_directory = define_tool({
 
 local function _ensure_dir(args)
   if not args then
-    return {}
+    return "错误: 需要目录参数"
   end
 
   -- 支持 files（列表）和 file（单个）两种参数
@@ -717,7 +719,7 @@ local function _ensure_dir(args)
   end
 
   if #files == 0 then
-    return {}
+    return "错误: 需要目录列表或单个目录参数"
   end
 
   local fu = get_file_utils()
@@ -735,10 +737,9 @@ local function _ensure_dir(args)
       local success, _ = fu.mkdir(filepath)
       ok = success == true
     else
+      -- 使用 vim.fn.mkdir 替代 os.execute，非阻塞
       local clean_path = filepath:gsub("/+$", "")
-      local cmd = 'mkdir -p "' .. clean_path .. '" 2>/dev/null'
-      local result = os.execute(cmd)
-      ok = result == 0 or result == true
+      ok = vim.fn.mkdir(clean_path, "p")
     end
     table.insert(results, { filepath = filepath, success = ok })
 
@@ -803,7 +804,7 @@ M.ensure_dir = define_tool({
 
 local function _delete_file(args)
   if not args then
-    return {}
+    return "错误: 需要文件参数"
   end
 
   -- 支持 files（列表）和 file（单个）两种参数
@@ -813,7 +814,7 @@ local function _delete_file(args)
   end
 
   if #files == 0 then
-    return {}
+    return "错误: 需要文件列表或单个文件参数"
   end
 
   local results = {}

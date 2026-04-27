@@ -47,6 +47,14 @@ local state = {
   -- 在 TOOL_LOOP_STARTED 中设为 true，在 GENERATION_COMPLETED 中设为 false
   -- 用于阻止工具循环过程中打开虚拟输入框
   tool_loop_in_progress = false,
+
+  -- 流式数据块节流状态
+  stream_throttle = {
+    buffer = "",
+    timer = nil,
+    pending = false,
+    interval_ms = 50, -- 每50ms批量处理一次
+  },
 }
 
 --- 初始化聊天窗口
@@ -179,8 +187,8 @@ function M.render_chat()
   if now - state.last_render_time < 100 then -- 100毫秒内不重复渲染
     -- 取消之前的定时器
     if state.render_debounce_timer then
-      state.render_debounce_timer:stop()
-      state.render_debounce_timer:close()
+      pcall(state.render_debounce_timer.stop, state.render_debounce_timer)
+      pcall(state.render_debounce_timer.close, state.render_debounce_timer)
       state.render_debounce_timer = nil
     end
 
@@ -190,8 +198,10 @@ function M.render_chat()
       100,
       0,
       vim.schedule_wrap(function()
-        state.render_debounce_timer:close()
-        state.render_debounce_timer = nil
+        if state.render_debounce_timer then
+          pcall(state.render_debounce_timer.close, state.render_debounce_timer)
+          state.render_debounce_timer = nil
+        end
         M._do_render_chat()
       end)
     )
@@ -888,6 +898,20 @@ function M.close()
     return
   end
 
+  -- 清理所有定时器（防止窗口关闭后定时器仍然运行）
+  if state.render_debounce_timer then
+    pcall(state.render_debounce_timer.stop, state.render_debounce_timer)
+    pcall(state.render_debounce_timer.close, state.render_debounce_timer)
+    state.render_debounce_timer = nil
+  end
+  if state.stream_throttle.timer then
+    pcall(state.stream_throttle.timer.stop, state.stream_throttle.timer)
+    pcall(state.stream_throttle.timer.close, state.stream_throttle.timer)
+    state.stream_throttle.timer = nil
+  end
+  state.stream_throttle.buffer = ""
+  state.stream_throttle.pending = false
+
   -- 关闭窗口前停止后台工具循环和AI生成
   -- 触发取消生成事件（ai_engine 监听此事件取消HTTP请求和工具循环）
   vim.api.nvim_exec_autocmds("User", {
@@ -1456,6 +1480,26 @@ function M._setup_event_listeners()
       end
 
       if not response_content or response_content == "" then
+        -- 响应内容为空（如 stop_tool_loop 后），仍然需要重置状态
+        -- 关闭工具调用悬浮窗
+        if state.tool_display.active then
+          M._close_tool_display()
+          state.tool_display.active = false
+          state.tool_display.buffer = ""
+          state.tool_display.results = {}
+        end
+        -- 重置流式状态
+        state.streaming.active = false
+        state.streaming.generation_id = nil
+        state.streaming.message_index = nil
+        state.streaming.content_buffer = ""
+        state.streaming.reasoning_buffer = ""
+        state.streaming.reasoning_active = false
+        state.streaming.reasoning_done = false
+        -- 标记工具调用循环已结束
+        state.tool_loop_in_progress = false
+        -- 全量重渲染
+        M.render_chat()
         return
       end
 
@@ -1543,6 +1587,23 @@ function M._setup_event_listeners()
         reasoning_display.close()
       end
 
+      -- 关闭工具调用悬浮窗（最终 AI 回复完成时清理）
+      if state.tool_display.active then
+        M._close_tool_display()
+        state.tool_display.active = false
+        state.tool_display.buffer = ""
+        state.tool_display.results = {}
+      end
+
+      -- 清理 stream_throttle 状态
+      if state.stream_throttle.timer then
+        state.stream_throttle.timer:stop()
+        state.stream_throttle.timer:close()
+        state.stream_throttle.timer = nil
+      end
+      state.stream_throttle.buffer = ""
+      state.stream_throttle.pending = false
+
       -- 重置流式状态
       state.streaming.active = false
       state.streaming.generation_id = nil
@@ -1594,14 +1655,6 @@ function M._setup_event_listeners()
       -- print("✓ " .. role .. "消息已发送: " .. (message or ""))
     end,
   })
-
-  -- 流式数据块节流状态
-  local stream_throttle = {
-    buffer = "",
-    timer = nil,
-    pending = false,
-    interval_ms = 50, -- 每50ms批量处理一次
-  }
 
   -- 监听AI引擎发出的标准流式数据块事件 (NeoAI:stream_chunk)
   -- 这是AI引擎在流式请求中发出的标准事件
@@ -1667,19 +1720,19 @@ function M._setup_event_listeners()
       state.streaming.content_buffer = state.streaming.content_buffer .. chunk_content
 
       -- 节流处理：累积数据块，定时批量刷新到缓冲区
-      stream_throttle.buffer = stream_throttle.buffer .. chunk_content
+      state.stream_throttle.buffer = state.stream_throttle.buffer .. chunk_content
 
-      if not stream_throttle.pending then
-        stream_throttle.pending = true
+      if not state.stream_throttle.pending then
+        state.stream_throttle.pending = true
         vim.defer_fn(function()
-          local batch = stream_throttle.buffer
-          stream_throttle.buffer = ""
-          stream_throttle.pending = false
+          local batch = state.stream_throttle.buffer
+          state.stream_throttle.buffer = ""
+          state.stream_throttle.pending = false
 
           if batch ~= "" then
             M._append_stream_chunk_to_buffer(batch)
           end
-        end, stream_throttle.interval_ms)
+        end, state.stream_throttle.interval_ms)
       end
     end,
   })
@@ -1878,6 +1931,15 @@ function M._setup_event_listeners()
         return
       end
 
+      -- 清理旧的 stream_throttle 定时器（防止定时器堆积）
+      if state.stream_throttle.timer then
+        state.stream_throttle.timer:stop()
+        state.stream_throttle.timer:close()
+        state.stream_throttle.timer = nil
+      end
+      state.stream_throttle.buffer = ""
+      state.stream_throttle.pending = false
+
       if #tool_calls == 0 then
         return
       end
@@ -2001,7 +2063,10 @@ function M._setup_event_listeners()
     end,
   })
 
-  -- 监听工具循环结束事件：关闭悬浮窗口，将工具调用结果转换为折叠文本
+  -- 监听工具循环结束事件：将工具调用结果转换为折叠文本
+  -- 注意：不关闭悬浮窗、不重置流式状态，因为 AI 可能立即发起新一轮工具调用
+  -- 悬浮窗和流式状态由 TOOL_LOOP_STARTED / STREAM_STARTED 事件管理
+  -- 最终清理在 GENERATION_COMPLETED 事件中完成
   vim.api.nvim_create_autocmd("User", {
     pattern = Events.TOOL_LOOP_FINISHED,
     callback = function(args)
@@ -2014,15 +2079,18 @@ function M._setup_event_listeners()
         return
       end
 
+      -- 清理 stream_throttle 定时器（防止定时器堆积）
+      if state.stream_throttle.timer then
+        state.stream_throttle.timer:stop()
+        state.stream_throttle.timer:close()
+        state.stream_throttle.timer = nil
+      end
+      state.stream_throttle.buffer = ""
+      state.stream_throttle.pending = false
+
       if not state.tool_display.active then
         return
       end
-
-      -- 一次性刷新悬浮窗口显示最终状态（所有工具执行完毕）
-      M._update_tool_display()
-
-      -- 关闭工具调用悬浮窗
-      M._close_tool_display()
 
       -- 将工具调用结果转换为折叠文本并添加到消息列表
       -- 注意：跳过持久化（skip_persist=true），因为工具调用数据已由 chat_handlers
@@ -2034,20 +2102,22 @@ function M._setup_event_listeners()
         M.add_message("assistant", folded_text, { skip_render = true, skip_persist = true })
       end
 
-      -- 重置流式状态（工具循环结束后，新一轮生成开始前）
-      -- 避免 UI 认为上一轮的思考还没有结束
-      state.streaming.active = false
-      state.streaming.generation_id = nil
-      state.streaming.message_index = nil
-      state.streaming.content_buffer = ""
-      state.streaming.reasoning_buffer = ""
-      state.streaming.reasoning_active = false
-      state.streaming.reasoning_done = false
+      -- 工具循环已结束，关闭工具调用悬浮窗
+      -- 如果 AI 发起新一轮工具调用，TOOL_LOOP_STARTED 会重新打开
+      -- 如果 AI 不再调用工具，GENERATION_COMPLETED 会做最终清理
+      if state.tool_display.active then
+        M._close_tool_display()
+        state.tool_display.active = false
+        state.tool_display.buffer = ""
+        state.tool_display.results = {}
+      end
 
-      -- 重置工具调用状态
-      state.tool_display.active = false
-      state.tool_display.buffer = ""
-      state.tool_display.results = {}
+      -- 标记工具调用循环已结束（允许打开虚拟输入框）
+      -- 注意：GENERATION_COMPLETED 事件中也会重置此标志，
+      -- 但如果 AI 只调用了工具没有生成文本（如 stop_tool_loop），
+      -- GENERATION_COMPLETED 的 response_content 可能为空导致跳过重置。
+      -- 所以这里必须重置，确保 UI 能正常响应。
+      state.tool_loop_in_progress = false
     end,
   })
 
@@ -2063,6 +2133,15 @@ function M._setup_event_listeners()
       if reasoning_display.is_visible() then
         reasoning_display.close()
       end
+
+      -- 清理 stream_throttle 定时器
+      if state.stream_throttle.timer then
+        state.stream_throttle.timer:stop()
+        state.stream_throttle.timer:close()
+        state.stream_throttle.timer = nil
+      end
+      state.stream_throttle.buffer = ""
+      state.stream_throttle.pending = false
 
       -- 清理流式状态
       state.streaming.active = false

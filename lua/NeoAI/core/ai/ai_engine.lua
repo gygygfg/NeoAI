@@ -41,6 +41,16 @@ local state = {
   retry_delay_ms = 1000,
 }
 
+-- 流式 reasoning 节流状态
+local _reasoning_throttle = {
+  timer = nil,
+  pending_content = "",
+  generation_id = nil,
+  processor = nil,
+  params = nil,
+  interval_ms = 80, -- 每 80ms 批量刷新一次 reasoning UI
+}
+
 -- ========== 初始化 ==========
 
 function M.initialize(options)
@@ -504,6 +514,17 @@ end
 
 --- 生成 AI 响应
 function M.generate_response(messages, params)
+  -- 清理 reasoning 节流状态，确保新一轮生成不受旧状态影响
+  if _reasoning_throttle.timer then
+    pcall(_reasoning_throttle.timer.stop, _reasoning_throttle.timer)
+    pcall(_reasoning_throttle.timer.close, _reasoning_throttle.timer)
+    _reasoning_throttle.timer = nil
+  end
+  _reasoning_throttle.pending_content = ""
+  _reasoning_throttle.generation_id = nil
+  _reasoning_throttle.processor = nil
+  _reasoning_throttle.params = nil
+
   local session_id = params.session_id
   local window_id = params.window_id
   local options = params.options or {}
@@ -568,6 +589,17 @@ end
 
 --- 非流式请求
 function M._send_non_stream_request(generation_id, request, params)
+  -- 清理 reasoning 节流状态，确保新一轮生成不受旧状态影响
+  if _reasoning_throttle.timer then
+    pcall(_reasoning_throttle.timer.stop, _reasoning_throttle.timer)
+    pcall(_reasoning_throttle.timer.close, _reasoning_throttle.timer)
+    _reasoning_throttle.timer = nil
+  end
+  _reasoning_throttle.pending_content = ""
+  _reasoning_throttle.generation_id = nil
+  _reasoning_throttle.processor = nil
+  _reasoning_throttle.params = nil
+
   local generation = state.active_generations[generation_id]
   if not generation then
     return
@@ -590,7 +622,10 @@ function M._send_non_stream_request(generation_id, request, params)
     end
     if generation.retry_count < state.max_retries then
       generation.retry_count = generation.retry_count + 1
-      vim.wait(state.retry_delay_ms)
+      -- 使用事件驱动等待，不阻塞主线程
+      vim.wait(state.retry_delay_ms, function()
+        return false
+      end, math.min(state.retry_delay_ms, 50))
       M._send_non_stream_request(generation_id, request, params)
       return
     end
@@ -647,7 +682,10 @@ function M._send_stream_request(generation_id, request, params)
     local g = state.active_generations[generation_id]
     if g and g.retry_count < state.max_retries then
       g.retry_count = g.retry_count + 1
-      vim.wait(state.retry_delay_ms)
+      -- 使用事件驱动等待，不阻塞主线程
+      vim.wait(state.retry_delay_ms, function()
+        return false
+      end, math.min(state.retry_delay_ms, 50))
       M._send_stream_request(generation_id, request, params)
       return
     end
@@ -671,49 +709,71 @@ function M._send_stream_request(generation_id, request, params)
   end)
 end
 
---- 处理流式数据块
+--- 处理流式数据块（带 reasoning 节流）
 function M._handle_stream_chunk(generation_id, data, processor, params)
   local result = process_stream_chunk(processor, data)
   if not result then
     return
   end
 
-  vim.schedule(function()
-    if result.reasoning_content then
-      vim.api.nvim_exec_autocmds("User", {
-        pattern = event_constants.REASONING_CONTENT,
-        data = {
-          generation_id = generation_id,
-          reasoning_content = result.reasoning_content,
-          session_id = processor.session_id,
-          window_id = processor.window_id,
-        },
-      })
+  -- 内容块：直接触发事件（已在主线程的 job 回调中运行，无需 vim.schedule）
+  if result.content then
+    vim.api.nvim_exec_autocmds("User", {
+      pattern = event_constants.STREAM_CHUNK,
+      data = {
+        generation_id = generation_id,
+        chunk = result.content,
+        session_id = processor.session_id,
+        window_id = processor.window_id,
+        is_final = false,
+      },
+    })
+  end
+
+  -- reasoning 内容：节流处理，避免高频 UI 更新堆积事件队列
+  if result.reasoning_content then
+    _reasoning_throttle.pending_content = _reasoning_throttle.pending_content .. result.reasoning_content
+    _reasoning_throttle.generation_id = generation_id
+    _reasoning_throttle.processor = processor
+    _reasoning_throttle.params = params
+
+    if not _reasoning_throttle.timer then
+      _reasoning_throttle.timer = vim.defer_fn(function()
+        local content = _reasoning_throttle.pending_content
+        local gid = _reasoning_throttle.generation_id
+        local proc = _reasoning_throttle.processor
+        local p = _reasoning_throttle.params
+        _reasoning_throttle.pending_content = ""
+        _reasoning_throttle.timer = nil
+
+        if content ~= "" then
+          vim.api.nvim_exec_autocmds("User", {
+            pattern = event_constants.REASONING_CONTENT,
+            data = {
+              generation_id = gid,
+              reasoning_content = content,
+              session_id = proc and proc.session_id,
+              window_id = proc and proc.window_id,
+            },
+          })
+        end
+      end, _reasoning_throttle.interval_ms)
     end
-    if result.content then
-      vim.api.nvim_exec_autocmds("User", {
-        pattern = event_constants.STREAM_CHUNK,
-        data = {
-          generation_id = generation_id,
-          chunk = result.content,
-          session_id = processor.session_id,
-          window_id = processor.window_id,
-          is_final = false,
-        },
-      })
-    end
-    if result.tool_calls and #result.tool_calls > 0 then
-      vim.api.nvim_exec_autocmds("User", {
-        pattern = event_constants.TOOL_CALL_DETECTED,
-        data = {
-          generation_id = generation_id,
-          tool_calls = result.tool_calls,
-          session_id = processor.session_id,
-          window_id = processor.window_id,
-        },
-      })
-    end
-  end)
+  end
+
+  -- tool_calls 检测：只触发事件通知 UI，不启动工具
+  -- 等待流式结束（_handle_stream_end）时 arguments 才完整
+  if result.tool_calls and #result.tool_calls > 0 then
+    vim.api.nvim_exec_autocmds("User", {
+      pattern = event_constants.TOOL_CALL_DETECTED,
+      data = {
+        generation_id = generation_id,
+        tool_calls = result.tool_calls,
+        session_id = processor.session_id,
+        window_id = processor.window_id,
+      },
+    })
+  end
 end
 
 --- 处理流式结束
@@ -723,12 +783,36 @@ function M._handle_stream_end(generation_id, processor, params)
   local usage = processor.usage or {}
   local tool_calls = processor.tool_calls or {}
 
-  if #tool_calls > 0 then
-    local gen = state.active_generations[generation_id]
-    if reasoning_text ~= "" and gen then
-      gen.last_reasoning_content = reasoning_text
-    end
+  -- 清理 reasoning 节流状态
+  if _reasoning_throttle.timer then
+    pcall(_reasoning_throttle.timer.stop, _reasoning_throttle.timer)
+    pcall(_reasoning_throttle.timer.close, _reasoning_throttle.timer)
+    _reasoning_throttle.timer = nil
+  end
+  _reasoning_throttle.pending_content = ""
+  _reasoning_throttle.generation_id = nil
+  _reasoning_throttle.processor = nil
+  _reasoning_throttle.params = nil
 
+  -- 保存 reasoning 到 generation 记录
+  local gen = state.active_generations[generation_id]
+  if reasoning_text ~= "" and gen then
+    gen.last_reasoning_content = reasoning_text
+  end
+
+  -- 清理 reasoning 节流状态（确保不残留到下一轮工具循环）
+  if _reasoning_throttle.timer then
+    pcall(_reasoning_throttle.timer.stop, _reasoning_throttle.timer)
+    pcall(_reasoning_throttle.timer.close, _reasoning_throttle.timer)
+    _reasoning_throttle.timer = nil
+  end
+  _reasoning_throttle.pending_content = ""
+  _reasoning_throttle.generation_id = nil
+  _reasoning_throttle.processor = nil
+  _reasoning_throttle.params = nil
+
+  -- 如果有 tool_calls，在流式结束时启动工具（此时 arguments 已完整）
+  if #tool_calls > 0 then
     local tools_enabled = true
     if state.full_config.tools and state.full_config.tools.enabled ~= nil then
       tools_enabled = state.full_config.tools.enabled
@@ -745,28 +829,27 @@ function M._handle_stream_end(generation_id, processor, params)
           ["function"] = { name = tc["function"].name, arguments = tc["function"].arguments },
         }
       end
-      vim.schedule(function()
-        local ok, results = pcall(tool_orchestrator.execute_tool_loop, {
-          generation_id = generation_id,
-          tool_calls = tc_copy,
-          session_id = processor.session_id,
-          window_id = processor.window_id,
-          options = params.options or {},
-        })
-        if not ok then
-          logger.error("Tool execution crashed: " .. tostring(results))
-          vim.api.nvim_exec_autocmds("User", {
-            pattern = event_constants.STREAM_COMPLETED,
-            data = {
-              generation_id = generation_id,
-              full_response = full_response,
-              reasoning_text = reasoning_text,
-              usage = usage,
-              session_id = processor.session_id,
-              window_id = processor.window_id,
-            },
+
+      -- 先启动工具循环（创建 state.round），再标记 AI 生成完成
+      -- 顺序很重要：execute_tool_loop 创建 round，mark_generation_completed 设置 generation_completed
+      tool_orchestrator.execute_tool_loop({
+        generation_id = generation_id,
+        tool_calls = tc_copy,
+        session_id = processor.session_id,
+        window_id = processor.window_id,
+        options = params.options or {},
+      }, function(success, results, error_msg)
+        if not success then
+          logger.error("Tool execution crashed: " .. tostring(error_msg))
+          -- 工具执行崩溃，直接完成生成
+          M._finalize_generation(generation_id, processor.content_buffer or "", {
+            session_id = processor.session_id,
+            window_id = processor.window_id,
+            reasoning_text = processor.reasoning_buffer or "",
+            usage = processor.usage or {},
           })
         elseif results and #results > 0 then
+          -- 工具全部完成 + AI 生成已完成 → 触发 TOOL_RESULT_RECEIVED
           vim.api.nvim_exec_autocmds("User", {
             pattern = event_constants.TOOL_RESULT_RECEIVED,
             data = {
@@ -777,36 +860,36 @@ function M._handle_stream_end(generation_id, processor, params)
             },
           })
         else
-          vim.api.nvim_exec_autocmds("User", {
-            pattern = event_constants.STREAM_COMPLETED,
-            data = {
-              generation_id = generation_id,
-              full_response = full_response,
-              reasoning_text = reasoning_text,
-              usage = usage,
-              session_id = processor.session_id,
-              window_id = processor.window_id,
-            },
+          -- 工具结果为空（如 stop_tool_loop 后），直接完成生成
+          M._finalize_generation(generation_id, processor.content_buffer or "", {
+            session_id = processor.session_id,
+            window_id = processor.window_id,
+            reasoning_text = processor.reasoning_buffer or "",
+            usage = processor.usage or {},
           })
         end
       end)
+
+      -- execute_tool_loop 已同步创建 state.round，现在标记 AI 生成完成
+      -- 如果工具已经执行完毕（同步完成），_check_round_complete 会立即触发回调
+      tool_orchestrator.mark_generation_completed(generation_id)
       return
     end
   end
 
-  vim.schedule(function()
-    vim.api.nvim_exec_autocmds("User", {
-      pattern = event_constants.STREAM_COMPLETED,
-      data = {
-        generation_id = generation_id,
-        full_response = full_response,
-        reasoning_text = reasoning_text,
-        usage = usage,
-        session_id = processor.session_id,
-        window_id = processor.window_id,
-      },
-    })
-  end)
+  -- 没有 tool_calls，直接完成生成
+  -- 直接触发事件，不通过 vim.schedule 包装，减少事件循环延迟
+  vim.api.nvim_exec_autocmds("User", {
+    pattern = event_constants.STREAM_COMPLETED,
+    data = {
+      generation_id = generation_id,
+      full_response = full_response,
+      reasoning_text = reasoning_text,
+      usage = usage,
+      session_id = processor.session_id,
+      window_id = processor.window_id,
+    },
+  })
 end
 
 --- 处理 AI 响应（非流式）
@@ -860,29 +943,64 @@ function M._handle_ai_response(generation_id, response, params)
     tools_enabled = state.full_config.ai.tools_enabled
   end
 
-  if #tool_calls > 0 and tools_enabled then
+  -- 清理 reasoning 节流状态（确保不残留到下一轮工具循环）
+  if _reasoning_throttle.timer then
+    pcall(_reasoning_throttle.timer.stop, _reasoning_throttle.timer)
+    pcall(_reasoning_throttle.timer.close, _reasoning_throttle.timer)
+    _reasoning_throttle.timer = nil
+  end
+  _reasoning_throttle.pending_content = ""
+  _reasoning_throttle.generation_id = nil
+  _reasoning_throttle.processor = nil
+  _reasoning_throttle.params = nil
+
+    if #tool_calls > 0 and tools_enabled then
     if reasoning_content and reasoning_content ~= "" then
       local gen = state.active_generations[generation_id]
       if gen then
         gen.last_reasoning_content = reasoning_content
       end
     end
-    local ok, results = pcall(tool_orchestrator.execute_tool_loop, {
+    -- 先启动工具循环（创建 state.round），再标记 AI 生成完成
+    tool_orchestrator.execute_tool_loop({
       generation_id = generation_id,
       tool_calls = tool_calls,
       session_id = session_id,
       window_id = window_id,
       options = options,
-    })
-    if not ok then
-      logger.error("Tool execution crashed: " .. tostring(results))
-    elseif results and #results > 0 then
-      vim.api.nvim_exec_autocmds("User", {
-        pattern = event_constants.TOOL_RESULT_RECEIVED,
-        data = { generation_id = generation_id, tool_results = results, session_id = session_id, window_id = window_id },
-      })
-      return
-    end
+    }, function(success, results, error_msg)
+      if not success then
+        logger.error("Tool execution crashed: " .. tostring(error_msg))
+        -- 工具执行崩溃，直接完成生成
+        M._finalize_generation(generation_id, response_content, {
+          session_id = session_id,
+          window_id = window_id,
+          reasoning_text = reasoning_content,
+          usage = usage,
+        })
+      elseif results and #results > 0 then
+        vim.api.nvim_exec_autocmds("User", {
+          pattern = event_constants.TOOL_RESULT_RECEIVED,
+          data = {
+            generation_id = generation_id,
+            tool_results = results,
+            session_id = session_id,
+            window_id = window_id,
+          },
+        })
+      else
+        -- 工具结果为空（如 stop_tool_loop 后），直接完成生成
+        M._finalize_generation(generation_id, response_content, {
+          session_id = session_id,
+          window_id = window_id,
+          reasoning_text = reasoning_content,
+          usage = usage,
+        })
+      end
+    end)
+    -- execute_tool_loop 已同步创建 state.round，现在标记 AI 生成完成
+    tool_orchestrator.mark_generation_completed(generation_id)
+    return
   end
 
   if response.usage then
@@ -907,13 +1025,29 @@ function M._finalize_generation(generation_id, response_text, params)
   local current_usage = params.usage or {}
   if current_usage and next(current_usage) then
     local acc = generation.accumulated_usage or {}
-    acc.prompt_tokens = (acc.prompt_tokens or 0) + (current_usage.prompt_tokens or current_usage.promptTokens or current_usage.input_tokens or current_usage.inputTokens or 0)
-    acc.completion_tokens = (acc.completion_tokens or 0) + (current_usage.completion_tokens or current_usage.completionTokens or current_usage.output_tokens or current_usage.outputTokens or 0)
+    acc.prompt_tokens = (acc.prompt_tokens or 0)
+      + (
+        current_usage.prompt_tokens
+        or current_usage.promptTokens
+        or current_usage.input_tokens
+        or current_usage.inputTokens
+        or 0
+      )
+    acc.completion_tokens = (acc.completion_tokens or 0)
+      + (
+        current_usage.completion_tokens
+        or current_usage.completionTokens
+        or current_usage.output_tokens
+        or current_usage.outputTokens
+        or 0
+      )
     acc.total_tokens = (acc.total_tokens or 0) + (current_usage.total_tokens or current_usage.totalTokens or 0)
     -- 累积 reasoning_tokens
     if current_usage.completion_tokens_details and type(current_usage.completion_tokens_details) == "table" then
       local rt = current_usage.completion_tokens_details.reasoning_tokens or 0
-      if not acc.completion_tokens_details then acc.completion_tokens_details = {} end
+      if not acc.completion_tokens_details then
+        acc.completion_tokens_details = {}
+      end
       acc.completion_tokens_details.reasoning_tokens = (acc.completion_tokens_details.reasoning_tokens or 0) + rt
     end
     generation.accumulated_usage = acc
@@ -950,14 +1084,29 @@ function M._finalize_generation(generation_id, response_text, params)
       state.session_manager._save_sessions()
     end
   end
+
+  -- 刷新 LSP 延迟清理队列（确保临时 buffer 被关闭）
+  local ok, lsp_module = pcall(require, "NeoAI.tools.builtin.neovim_lsp")
+  if ok and lsp_module and lsp_module.flush_deferred_cleanups then
+    lsp_module.flush_deferred_cleanups()
+  end
 end
 
 --- 处理工具结果
+--- 由 tool_orchestrator 在"所有工具完成 + AI 生成完成"时触发
 function M.handle_tool_result(data)
   local generation_id = data.generation_id
   local tool_results = data.tool_results
   local session_id = data.session_id
   local window_id = data.window_id
+
+  -- 注意：此时 state.is_generating 可能仍为 true（因为 _finalize_generation 尚未调用）
+  -- 这是正常的，因为工具结果需要触发新一轮 AI 生成
+  -- 只有在 AI 正在流式生成时才跳过（防止竞态）
+  if state.is_generating and state.current_generation_id ~= generation_id then
+    logger.warn("handle_tool_result: 其他 generation 正在生成中，跳过")
+    return
+  end
 
   local generation = state.active_generations[generation_id]
   if not generation then
@@ -999,6 +1148,9 @@ function M.handle_tool_result(data)
   end
 
   local tool_options = vim.deepcopy(options)
+  -- 重置 is_generating 状态，确保新一轮生成能正常启动
+  -- 注意：在工具循环中 is_generating 一直为 true，需要先重置
+  state.is_generating = false
   M.generate_response(messages, {
     session_id = session_id,
     window_id = window_id,
@@ -1046,10 +1198,27 @@ function M.handle_generation_error(generation_id, error_msg)
   if hm_ok and hm and hm._save then
     hm._save()
   end
+
+  -- 刷新 LSP 延迟清理队列
+  local ok_lsp, lsp_module = pcall(require, "NeoAI.tools.builtin.neovim_lsp")
+  if ok_lsp and lsp_module and lsp_module.flush_deferred_cleanups then
+    lsp_module.flush_deferred_cleanups()
+  end
 end
 
 --- 取消生成
 function M.cancel_generation()
+  -- 清理 reasoning 节流定时器
+  if _reasoning_throttle.timer then
+    pcall(_reasoning_throttle.timer.stop, _reasoning_throttle.timer)
+    pcall(_reasoning_throttle.timer.close, _reasoning_throttle.timer)
+    _reasoning_throttle.timer = nil
+  end
+  _reasoning_throttle.pending_content = ""
+  _reasoning_throttle.generation_id = nil
+  _reasoning_throttle.processor = nil
+  _reasoning_throttle.params = nil
+
   if not state.is_generating then
     return
   end
@@ -1076,6 +1245,12 @@ function M.cancel_generation()
   if hm_ok and hm and hm._save then
     hm._save()
   end
+
+  -- 刷新 LSP 延迟清理队列
+  local ok_lsp, lsp_module = pcall(require, "NeoAI.tools.builtin.neovim_lsp")
+  if ok_lsp and lsp_module and lsp_module.flush_deferred_cleanups then
+    lsp_module.flush_deferred_cleanups()
+  end
 end
 
 -- ========== 工具管理 ==========
@@ -1084,8 +1259,22 @@ function M.set_tools(tools)
   state.tools = tools or {}
   state.tool_definitions = {}
 
+  -- 注册工具到 tool_registry，使 tool_executor 能通过注册表找到工具
+  local tool_registry = require("NeoAI.tools.tool_registry")
+
   for name, def in pairs(state.tools) do
     if def.func then
+      -- 注册到 tool_registry
+      local tool_def = {
+        name = name,
+        func = def.func,
+        description = def.description or ("执行 " .. name .. " 操作"),
+        parameters = def.parameters,
+        category = def.category or "ai",
+      }
+      pcall(tool_registry.register, tool_def)
+
+      -- 构建 AI 工具定义（用于发送给 LLM）
       local tf = { name = name, description = def.description or ("执行 " .. name .. " 操作") }
       local params = def.parameters
       if params and type(params) == "table" then
@@ -1153,6 +1342,17 @@ function M.shutdown()
   if not state.initialized then
     return
   end
+  -- 清理 reasoning 节流定时器
+  if _reasoning_throttle.timer then
+    pcall(_reasoning_throttle.timer.stop, _reasoning_throttle.timer)
+    pcall(_reasoning_throttle.timer.close, _reasoning_throttle.timer)
+    _reasoning_throttle.timer = nil
+  end
+  _reasoning_throttle.pending_content = ""
+  _reasoning_throttle.generation_id = nil
+  _reasoning_throttle.processor = nil
+  _reasoning_throttle.params = nil
+
   if state.is_generating then
     M.cancel_generation()
   end
@@ -1331,8 +1531,8 @@ function M.estimate_request_tokens(request)
 end
 
 -- 工具编排器接口转发
-function M.execute_tool_loop(params)
-  return tool_orchestrator.execute_tool_loop(params)
+function M.execute_tool_loop(params, callback)
+  return tool_orchestrator.execute_tool_loop(params, callback)
 end
 function M.execute_tools(tc)
   return tool_orchestrator.execute_tools(tc)

@@ -108,6 +108,10 @@ function M.open(parent_win, opts)
   vim.api.nvim_set_option_value("swapfile", false, { buf = state.float_buf })
   vim.api.nvim_set_option_value("modified", false, { buf = state.float_buf })
 
+  -- 阻止 LSP 附加到浮动输入框
+  local wm = require("NeoAI.ui.window.window_manager")
+  wm.block_lsp_for_buffer(state.float_buf, "浮动输入框")
+
   -- 设置提示符
   vim.api.nvim_buf_set_lines(state.float_buf, 0, -1, false, { "> " })
 
