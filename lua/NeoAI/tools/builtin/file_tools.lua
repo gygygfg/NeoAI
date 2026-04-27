@@ -370,41 +370,73 @@ M.list_files = define_tool({
 -- ============================================================================
 
 local function _search_files(args)
-  if not args or not args.pattern then
+  if not args then
     return {}
   end
 
-  local pattern = args.pattern
-  local dir = args.dir or "."
-  local file_pattern = args.file_pattern or "*"
-  local case_sensitive = args.case_sensitive or false
-  local results = {}
-
-  local grep_cmd = "grep -n"
-  if not case_sensitive then
-    grep_cmd = grep_cmd .. " -i"
+  -- 支持 files（列表）和 file（单个）两种参数
+  local file_specs = args.files or {}
+  if args.file and type(args.file) == "table" then
+    table.insert(file_specs, args.file)
   end
 
-  local escaped_pattern = pattern:gsub("'", "'\"'\"'")
-  grep_cmd = grep_cmd .. " -- '" .. escaped_pattern .. "' "
+  local pattern = args.pattern
+  if not pattern and #file_specs == 0 then
+    return {}
+  end
 
-  local find_cmd = 'find "' .. dir .. '" -type f -name "' .. file_pattern .. '" 2>/dev/null | head -50'
-  local handle = io.popen(find_cmd)
+  -- 如果 file_specs 为空，使用默认参数
+  if #file_specs == 0 then
+    file_specs = { {} }
+  end
 
-  if handle then
-    for file in handle:lines() do
-      local search_handle = io.popen(grep_cmd .. '"' .. file .. '" 2>/dev/null')
-      if search_handle then
-        for line in search_handle:lines() do
-          local line_num, content = line:match("^(%d+):(.+)$")
-          if line_num and content then
-            table.insert(results, { file = file, line = tonumber(line_num), content = content })
+  local results = {}
+
+  for _, spec in ipairs(file_specs) do
+    local dir = spec.dir or "."
+    local file_pattern = spec.file_pattern or "*"
+    local case_sensitive = spec.case_sensitive
+    if case_sensitive == nil then
+      case_sensitive = false
+    end
+    local regex = spec.regex
+    if regex == nil then
+      regex = true -- 默认使用正则匹配
+    end
+    local search_pattern = spec.pattern or pattern
+    if not search_pattern then
+      goto continue
+    end
+
+    local grep_cmd = "grep -n"
+    if not case_sensitive then
+      grep_cmd = grep_cmd .. " -i"
+    end
+    if not regex then
+      grep_cmd = grep_cmd .. " -F" -- 固定字符串模式
+    end
+
+    local escaped_pattern = search_pattern:gsub("'", "'\"'\"'")
+    grep_cmd = grep_cmd .. " -- '" .. escaped_pattern .. "' "
+
+    local find_cmd = 'find "' .. dir .. '" -type f -name "' .. file_pattern .. '" 2>/dev/null'
+    local files_found = vim.fn.systemlist(find_cmd)
+
+    if vim.v.shell_error == 0 then
+      for _, file in ipairs(files_found) do
+        local search_output = vim.fn.systemlist(grep_cmd .. '"' .. file .. '" 2>/dev/null')
+        if vim.v.shell_error == 0 then
+          for _, line in ipairs(search_output) do
+            local line_num, content = line:match("^(%d+):(.+)$")
+            if line_num and content then
+              table.insert(results, { file = file, line = tonumber(line_num), content = content })
+            end
           end
         end
-        search_handle:close()
       end
     end
-    handle:close()
+
+    ::continue::
   end
 
   return results
@@ -412,17 +444,55 @@ end
 
 M.search_files = define_tool({
   name = "search_files",
-  description = "搜索文件内容",
+  description = "搜索文件内容，支持正则匹配和固定字符串匹配。可指定多个目录/文件模式进行搜索",
   func = _search_files,
   parameters = {
     type = "object",
     properties = {
-      pattern = { type = "string", description = "搜索模式" },
-      dir = { type = "string", description = "搜索目录", default = "." },
-      file_pattern = { type = "string", description = "文件模式（如 *.py）", default = "*" },
-      case_sensitive = { type = "boolean", description = "是否区分大小写", default = false },
+      pattern = { type = "string", description = "搜索模式（当 files 未指定时使用）" },
+      files = {
+        type = "array",
+        items = {
+          type = "object",
+          properties = {
+            dir = { type = "string", description = "搜索目录", default = "." },
+            pattern = { type = "string", description = "搜索模式（正则或固定字符串）" },
+            file_pattern = {
+              type = "string",
+              description = "文件通配符模式（如 *.py, *.lua）",
+              default = "*",
+            },
+            case_sensitive = { type = "boolean", description = "是否区分大小写", default = false },
+            regex = {
+              type = "boolean",
+              description = "是否使用正则匹配，false 则为固定字符串匹配",
+              default = true,
+            },
+          },
+        },
+        description = "搜索参数列表（与 file 二选一）",
+      },
+      file = {
+        type = "object",
+        properties = {
+          dir = { type = "string", description = "搜索目录", default = "." },
+          pattern = { type = "string", description = "搜索模式（正则或固定字符串）" },
+          file_pattern = { type = "string", description = "文件通配符模式（如 *.py, *.lua）", default = "*" },
+          case_sensitive = { type = "boolean", description = "是否区分大小写", default = false },
+          regex = {
+            type = "boolean",
+            description = "是否使用正则匹配，false 则为固定字符串匹配",
+            default = true,
+          },
+        },
+        description = "单个搜索参数（与 files 二选一）",
+      },
     },
-    required = { "pattern" },
+    oneOf = {
+      { required = { "pattern" } },
+      { required = { "files" } },
+      { required = { "file" } },
+    },
   },
   returns = {
     type = "array",
