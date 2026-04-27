@@ -39,6 +39,57 @@ local function detect_lang_from_filepath(filepath)
 end
 
 -- 读取文件内容
+-- 公共节点过滤函数：支持正则匹配 text，node_type 不匹配时回退到同类型节点
+-- 返回 filtered 和 fallback_used（是否使用了回退）
+local function filter_nodes(nodes, args)
+  local filtered = {}
+
+  -- 第一轮：精确匹配所有条件
+  for _, node in ipairs(nodes or {}) do
+    local matched = true
+    if args.node_type and node.type ~= args.node_type then
+      matched = false
+    end
+    if matched and args.text ~= nil then
+      -- 使用 Lua 的 string.find 做子串匹配（不区分大小写可选）
+      if not node.text:find(args.text, 1, true) then
+        matched = false
+      end
+    end
+    if matched and args.named ~= nil and node.named ~= args.named then
+      matched = false
+    end
+    if matched then
+      table.insert(filtered, node)
+    end
+  end
+
+  -- 如果指定了 node_type 但没有匹配到任何节点，回退到只按 text 和 named 过滤
+  if #filtered == 0 and args.node_type then
+    local fallback = {}
+    for _, node in ipairs(nodes or {}) do
+      local matched = true
+      if args.text ~= nil then
+        if not node.text:find(args.text, 1, true) then
+          matched = false
+        end
+      end
+      if matched and args.named ~= nil and node.named ~= args.named then
+        matched = false
+      end
+      if matched then
+        table.insert(fallback, node)
+      end
+    end
+    if #fallback > 0 then
+      return fallback, true
+    end
+  end
+
+  return filtered, false
+end
+
+-- 读取文件内容
 local function read_file_content(filepath)
   local abs_path = vim.fn.fnamemodify(filepath, ":p")
   local file, err = io.open(abs_path, "r")
@@ -446,23 +497,8 @@ local function _get_node_type(args)
     return { filepath = args.filepath, error = err or "解析结果为空" }
   end
 
-  -- 按属性过滤节点
-  local filtered = {}
-  for _, node in ipairs(result.nodes or {}) do
-    local matched = true
-    if args.node_type and node.type ~= args.node_type then
-      matched = false
-    end
-    if matched and args.text ~= nil and node.text ~= args.text then
-      matched = false
-    end
-    if matched and args.named ~= nil and node.named ~= args.named then
-      matched = false
-    end
-    if matched then
-      table.insert(filtered, node)
-    end
-  end
+  -- 使用公共过滤函数
+  local filtered, fallback = filter_nodes(result.nodes, args)
 
   if #filtered == 0 then
     return { filepath = args.filepath, error = "未找到匹配的节点" }
@@ -477,13 +513,17 @@ local function _get_node_type(args)
     end
   end
 
-  return {
+  local ret = {
     filepath = args.filepath,
     language = result and result.language,
     match_count = #filtered,
     node_types = types,
     nodes = filtered,
   }
+  if fallback then
+    ret.warning = "未找到指定 node_type '" .. (args.node_type or "") .. "' 的节点，已回退到同类型节点"
+  end
+  return ret
 end
 
 M.get_node_type = define_tool({
@@ -526,51 +566,60 @@ local function _get_node_range(args)
     return { filepath = args.filepath, error = err or "解析结果为空" }
   end
 
-  -- 按属性过滤节点
-  local filtered = {}
-  for _, node in ipairs(result.nodes or {}) do
-    local matched = true
-    if args.node_type and node.type ~= args.node_type then
-      matched = false
-    end
-    if matched and args.text ~= nil and node.text ~= args.text then
-      matched = false
-    end
-    if matched and args.named ~= nil and node.named ~= args.named then
-      matched = false
-    end
-    if matched then
-      table.insert(filtered, node)
-    end
-  end
+  -- 使用公共过滤函数
+  local filtered, fallback = filter_nodes(result.nodes, args)
 
   if #filtered == 0 then
     return { filepath = args.filepath, error = "未找到匹配的节点" }
   end
 
+  -- 读取文件内容（用于提取带行号的代码）
+  local file_lines = nil
+  if args.include_code then
+    local content, _ = read_file_content(args.filepath)
+    if content then
+      file_lines = vim.split(content, "\n", { plain = true })
+    end
+  end
+
   local ranges = {}
   for _, node in ipairs(filtered) do
-    table.insert(ranges, {
+    local entry = {
       type = node.type,
       text = node.text,
       start_row = node.start_row,
       start_col = node.start_col,
       end_row = node.end_row,
       end_col = node.end_col,
-    })
+    }
+
+    if args.include_code and file_lines then
+      local code_lines = {}
+      for line_num = node.start_row, node.end_row do
+        local line_content = file_lines[line_num + 1] or ""
+        table.insert(code_lines, string.format("%d: %s", line_num, line_content))
+      end
+      entry.code = table.concat(code_lines, "\n")
+    end
+
+    table.insert(ranges, entry)
   end
 
-  return {
+  local ret = {
     filepath = args.filepath,
     language = result and result.language,
     match_count = #filtered,
     ranges = ranges,
   }
+  if fallback then
+    ret.warning = "未找到指定 node_type '" .. (args.node_type or "") .. "' 的节点，已回退到同类型节点"
+  end
+  return ret
 end
 
 M.get_node_range = define_tool({
   name = "get_node_range",
-  description = "获取文件中匹配节点的范围信息（起始行/列、结束行/列），支持按 node_type、text、named 属性过滤",
+  description = "获取文件中匹配节点的范围信息（返回: 起始行/列、结束行/列），支持按 node_type、text、named 属性过滤，可选返回带行号的节点代码。查找函数与变量优先使用",
   func = _get_node_range,
   parameters = {
     type = "object",
@@ -579,12 +628,16 @@ M.get_node_range = define_tool({
       node_type = { type = "string", description = "节点类型过滤（可选），如 'function_definition'" },
       text = { type = "string", description = "节点文本过滤（可选）" },
       named = { type = "boolean", description = "是否为命名节点（可选）" },
+      include_code = {
+        type = "boolean",
+        description = "是否返回带行号的节点代码（可选，默认 false）",
+      },
     },
     required = { "filepath" },
   },
   returns = {
     type = "object",
-    description = "匹配节点的范围信息列表",
+    description = "匹配节点的范围信息列表，若 include_code 为 true 则每个节点包含 code 字段",
   },
   category = "treesitter",
   permissions = { read = true },
@@ -608,20 +661,8 @@ local function _is_named_node(args)
     return { filepath = args.filepath, error = err or "解析结果为空" }
   end
 
-  -- 按属性过滤节点
-  local filtered = {}
-  for _, node in ipairs(result.nodes or {}) do
-    local matched = true
-    if args.node_type and node.type ~= args.node_type then
-      matched = false
-    end
-    if matched and args.text ~= nil and node.text ~= args.text then
-      matched = false
-    end
-    if matched then
-      table.insert(filtered, node)
-    end
-  end
+  -- 使用公共过滤函数
+  local filtered, fallback = filter_nodes(result.nodes, args)
 
   if #filtered == 0 then
     return { filepath = args.filepath, error = "未找到匹配的节点" }
@@ -636,12 +677,16 @@ local function _is_named_node(args)
     })
   end
 
-  return {
+  local ret = {
     filepath = args.filepath,
     language = result and result.language,
     match_count = #filtered,
     nodes = named_info,
   }
+  if fallback then
+    ret.warning = "未找到指定 node_type '" .. (args.node_type or "") .. "' 的节点，已回退到同类型节点"
+  end
+  return ret
 end
 
 M.is_named_node = define_tool({
@@ -682,23 +727,12 @@ local function _find_parent_by_attrs(nodes, target_type, target_text, target_nam
       and parent.depth < child.depth
   end
 
-  -- 找到所有匹配的目标节点
-  local targets = {}
-  for _, node in ipairs(nodes) do
-    local matched = true
-    if target_type and node.type ~= target_type then
-      matched = false
-    end
-    if matched and target_text ~= nil and node.text ~= target_text then
-      matched = false
-    end
-    if matched and target_named ~= nil and node.named ~= target_named then
-      matched = false
-    end
-    if matched then
-      table.insert(targets, node)
-    end
-  end
+  -- 使用公共过滤函数
+  local targets, fallback = filter_nodes(nodes, {
+    node_type = target_type,
+    text = target_text,
+    named = target_named,
+  })
 
   if #targets == 0 then
     return nil, "未找到匹配的目标节点"
@@ -720,7 +754,7 @@ local function _find_parent_by_attrs(nodes, target_type, target_text, target_nam
     })
   end
 
-  return parents, nil
+  return parents, nil, fallback
 end
 
 local function _get_parent_node(args)
@@ -737,7 +771,7 @@ local function _get_parent_node(args)
     return { filepath = args.filepath, error = err or "解析结果为空" }
   end
 
-  local parents, perr = _find_parent_by_attrs(result.nodes or {}, args.node_type, args.text, args.named)
+  local parents, perr, fallback = _find_parent_by_attrs(result.nodes or {}, args.node_type, args.text, args.named)
   if perr or not parents then
     return { filepath = args.filepath, error = perr or "未找到父节点" }
   end
@@ -758,12 +792,16 @@ local function _get_parent_node(args)
     })
   end
 
-  return {
+  local ret = {
     filepath = args.filepath,
     language = result and result.language,
     match_count = #parent_info,
     parents = parent_info,
   }
+  if fallback then
+    ret.warning = "未找到指定 node_type '" .. (args.node_type or "") .. "' 的节点，已回退到同类型节点"
+  end
+  return ret
 end
 
 M.get_parent_node = define_tool({
@@ -806,23 +844,8 @@ local function _get_child_nodes(args)
     return { filepath = args.filepath, error = err or "解析结果为空" }
   end
 
-  -- 找到匹配的父节点
-  local filtered = {}
-  for _, node in ipairs(result.nodes or {}) do
-    local matched = true
-    if args.node_type and node.type ~= args.node_type then
-      matched = false
-    end
-    if matched and args.text ~= nil and node.text ~= args.text then
-      matched = false
-    end
-    if matched and args.named ~= nil and node.named ~= args.named then
-      matched = false
-    end
-    if matched then
-      table.insert(filtered, node)
-    end
-  end
+  -- 使用公共过滤函数
+  local filtered, fallback = filter_nodes(result.nodes, args)
 
   if #filtered == 0 then
     return { filepath = args.filepath, error = "未找到匹配的父节点" }
@@ -856,12 +879,16 @@ local function _get_child_nodes(args)
     })
   end
 
-  return {
+  local ret = {
     filepath = args.filepath,
     language = result and result.language,
     match_count = #children_info,
     children_info = children_info,
   }
+  if fallback then
+    ret.warning = "未找到指定 node_type '" .. (args.node_type or "") .. "' 的节点，已回退到同类型节点"
+  end
+  return ret
 end
 
 M.get_child_nodes = define_tool({
@@ -886,10 +913,7 @@ M.get_child_nodes = define_tool({
   permissions = { read = true },
 })
 
--- ============================================================================
 -- get_tools() - 返回所有工具列表供注册
--- ============================================================================
-
 function M.get_tools()
   if not check_ts() then
     return {}

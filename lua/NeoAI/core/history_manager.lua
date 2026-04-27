@@ -425,13 +425,40 @@ function M.add_tool_result(session_id, tool_name, arguments, result)
   return true
 end
 
---- 更新当前会话的 usage 信息
+--- 更新当前会话的 usage 信息（累积模式）
+--- 每次调用会将新用量累加到已有用量上
 function M.update_usage(session_id, usage)
   local session = state.sessions[session_id]
   if not session or not usage then
     return
   end
-  session.usage = usage
+  local existing = session.usage or {}
+  -- 累积各字段
+  local function acc(key, src_key)
+    local val = usage[src_key or key]
+    if val and type(val) == "number" then
+      existing[key] = (existing[key] or 0) + val
+    end
+  end
+  acc("prompt_tokens", "prompt_tokens")
+  acc("prompt_tokens", "promptTokens")
+  acc("prompt_tokens", "input_tokens")
+  acc("prompt_tokens", "inputTokens")
+  acc("completion_tokens", "completion_tokens")
+  acc("completion_tokens", "completionTokens")
+  acc("completion_tokens", "output_tokens")
+  acc("completion_tokens", "outputTokens")
+  acc("total_tokens", "total_tokens")
+  acc("total_tokens", "totalTokens")
+  -- 累积 reasoning_tokens
+  if usage.completion_tokens_details and type(usage.completion_tokens_details) == "table" then
+    local rt = usage.completion_tokens_details.reasoning_tokens or 0
+    if not existing.completion_tokens_details then
+      existing.completion_tokens_details = {}
+    end
+    existing.completion_tokens_details.reasoning_tokens = (existing.completion_tokens_details.reasoning_tokens or 0) + rt
+  end
+  session.usage = existing
   session.updated_at = os.time()
 end
 

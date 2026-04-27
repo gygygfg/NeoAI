@@ -1,491 +1,145 @@
 -- 工具调用编排器
--- 负责管理 AI 工具调用的循环执行，支持多轮工具调用和结果整合
+-- 负责管理 AI 工具调用的循环执行
 local M = {}
 
--- 导入工具
 local logger = require("NeoAI.utils.logger")
 local event_constants = require("NeoAI.core.events.event_constants")
 
--- 模块状态
 local state = {
-  initialized = false, -- 模块是否已初始化
-  config = nil, -- 配置表
-  session_manager = nil, -- 会话管理器
-  tools = {}, -- 注册的工具表，键为工具名，值为工具定义
-
-  current_iteration = 0, -- 当前迭代次数
-  stop_requested = false, -- 是否请求停止工具循环
+  initialized = false,
+  config = nil,
+  session_manager = nil,
+  tools = {},
+  current_iteration = 0,
+  stop_requested = false,
 }
 
---- 初始化工具编排器
---- @param options table 初始化选项
 function M.initialize(options)
-  if state.initialized then
-    return M
-  end
-
+  if state.initialized then return M end
   state.config = options.config or {}
   state.session_manager = options.session_manager
-
   state.initialized = true
-
-  logger.info("Tool orchestrator initialized")
   return M
 end
 
 --- 执行工具调用循环
---- @param params table 参数，包含generation_id、tool_calls等
---- @return table|nil 工具结果列表
 function M.execute_tool_loop(params)
-  if not state.initialized then
-    print("[tool_orchestrator] execute_tool_loop 失败: 未初始化")
-    error("Tool orchestrator not initialized")
-  end
+  if not state.initialized then error("Tool orchestrator not initialized") end
+  if not next(state.tools) then return nil end
 
-  if not next(state.tools) then
-    print("[tool_orchestrator] execute_tool_loop: 无可用工具，跳过")
-    -- 调试：列出所有已注册的工具
-    -- local tool_names = {}
-    -- for name, _ in pairs(state.tools) do
-    --   table.insert(tool_names, name)
-    -- end
-    -- print("[tool_orchestrator] 已注册工具: " .. (#tool_names > 0 and table.concat(tool_names, ", ") or "无"))
-    return nil
-  end
+  local tool_calls = params.tool_calls or {}
+  if #tool_calls == 0 then return nil end
 
   local generation_id = params.generation_id
-  local tool_calls = params.tool_calls or {}
   local session_id = params.session_id
   local window_id = params.window_id
   local options = params.options or {}
-
-  if #tool_calls == 0 then
-    print("[tool_orchestrator] execute_tool_loop: 无工具调用，跳过")
-    return nil
-  end
-
-  -- 仅在首次调用时初始化迭代计数，避免跨轮次计数被清零
-  -- 重置由 ai_engine 的 generate_response 在用户新消息开始时处理
-  if state.current_iteration == nil then
-    state.current_iteration = 0
-  end
   state.stop_requested = false
   local tool_results = {}
 
-  -- 触发工具循环开始事件
   vim.api.nvim_exec_autocmds("User", {
     pattern = event_constants.TOOL_LOOP_STARTED,
-    data = {
-      generation_id = generation_id,
-      tool_calls = tool_calls,
-      session_id = session_id,
-      window_id = window_id,
-      is_reasoning_model = params.is_reasoning_model or false,
-    },
+    data = { generation_id = generation_id, tool_calls = tool_calls, session_id = session_id, window_id = window_id },
   })
 
-  -- 执行每个工具调用
   for i, tool_call in ipairs(tool_calls) do
-    -- 递增迭代计数
     state.current_iteration = state.current_iteration + 1
-
-    -- 检查是否收到停止请求
-    if state.stop_requested then
-      logger.info(string.format("Tool loop stop requested, stopping after %d tools executed", state.current_iteration))
-      break
-    end
+    if state.stop_requested then break end
 
     local result = M.execute_tool({
-      generation_id = generation_id,
-      tool_call = tool_call,
-      session_id = session_id,
-      window_id = window_id,
+      generation_id = generation_id, tool_call = tool_call,
+      session_id = session_id, window_id = window_id,
     })
-
     if result then
-      -- print("[tool_orchestrator] 工具 #" .. i .. " 结果长度=" .. #tostring(result))
-      table.insert(tool_results, {
-        tool_call = tool_call,
-        result = result,
-      })
-    else
-      print("[tool_orchestrator] 工具 #" .. i .. " 返回空结果")
+      table.insert(tool_results, { tool_call = tool_call, result = result })
     end
   end
 
-  -- 触发工具循环结束事件
   vim.api.nvim_exec_autocmds("User", {
     pattern = event_constants.TOOL_LOOP_FINISHED,
-    data = {
-      generation_id = generation_id,
-      tool_results = tool_results,
-      iteration_count = state.current_iteration,
-      session_id = session_id,
-      window_id = window_id,
-    },
+    data = { generation_id = generation_id, tool_results = tool_results,
+             iteration_count = state.current_iteration, session_id = session_id, window_id = window_id },
   })
-
   return tool_results
 end
 
 --- 执行单个工具
---- @param params table 参数
---- @return any 工具执行结果
 function M.execute_tool(params)
-  local generation_id = params.generation_id
   local tool_call = params.tool_call
-  local session_id = params.session_id
-  local window_id = params.window_id
-
-  -- 兼容两种字段名：function（OpenAI 标准）和 func（旧格式）
   local tool_func = tool_call["function"] or tool_call.func
-  if not tool_call or not tool_func then
-    print("[tool_orchestrator] execute_tool: 无效的工具调用")
-    logger.warn(string.format("Invalid tool call for generation %s", generation_id))
-    return nil
-  end
+  if not tool_call or not tool_func then return nil end
 
   local tool_name = tool_func.name
   local arguments_str = tool_func.arguments
-
-  -- print("[tool_orchestrator] execute_tool: " .. tool_name .. " (generation=" .. tostring(generation_id) .. ")")
-
-  -- 解析参数
   local arguments = {}
   if arguments_str then
     local ok, parsed = pcall(vim.json.decode, arguments_str)
-    if ok and parsed then
-      arguments = parsed
-    else
-      print("[tool_orchestrator] 参数解析失败: " .. arguments_str)
-      logger.warn(string.format("Failed to parse arguments for tool %s: %s", tool_name, arguments_str))
-    end
+    if ok and parsed then arguments = parsed end
   end
 
-  -- 触发工具执行开始事件
   vim.api.nvim_exec_autocmds("User", {
     pattern = event_constants.TOOL_EXECUTION_STARTED,
-    data = {
-      generation_id = generation_id,
-      tool_call = tool_call,
-      tool_name = tool_name,
-      arguments = arguments,
-      session_id = session_id,
-      window_id = window_id,
-      start_time = os.time(),
-    },
+    data = { generation_id = params.generation_id, tool_call = tool_call, tool_name = tool_name,
+             arguments = arguments, session_id = params.session_id, window_id = params.window_id, start_time = os.time() },
   })
 
-  logger.debug(string.format("Executing tool %s for generation %s", tool_name, generation_id))
-
-  -- 查找并执行工具
   local tool_def = state.tools[tool_name]
-  local result = nil
-  local error_msg = nil
+  local result, error_msg = nil, nil
   local start_time = os.time()
 
   if tool_def and tool_def.func then
-    local success, tool_result = pcall(tool_def.func, arguments)
-
-    if success then
-      result = tool_result
-    else
-      error_msg = tostring(tool_result)
-      print("[tool_orchestrator] 工具执行失败: " .. error_msg)
-      logger.error(string.format("Tool execution error for %s: %s", tool_name, error_msg))
-    end
+    local success, r = pcall(tool_def.func, arguments)
+    if success then result = r else error_msg = tostring(r) end
   else
-    error_msg = string.format("Tool not found: %s", tool_name)
-    print("[tool_orchestrator] " .. error_msg)
-    logger.warn(error_msg)
+    error_msg = "Tool not found: " .. tool_name
   end
 
   local duration = os.time() - start_time
-  -- print("[tool_orchestrator] 执行耗时: " .. duration .. "s")
+  local evt = error_msg and event_constants.TOOL_EXECUTION_ERROR or event_constants.TOOL_EXECUTION_COMPLETED
+  local data = { generation_id = params.generation_id, tool_call = tool_call, tool_name = tool_name,
+                 arguments = arguments, session_id = params.session_id, window_id = params.window_id, duration = duration }
+  if error_msg then data.error_msg = error_msg else data.result = result end
+  vim.api.nvim_exec_autocmds("User", { pattern = evt, data = data })
 
-  -- 触发工具执行完成事件
-  if error_msg then
-    vim.api.nvim_exec_autocmds("User", {
-      pattern = event_constants.TOOL_EXECUTION_ERROR,
-      data = {
-        generation_id = generation_id,
-        tool_call = tool_call,
-        tool_name = tool_name,
-        arguments = arguments,
-        error_msg = error_msg,
-        session_id = session_id,
-        window_id = window_id,
-        duration = duration,
-      },
-    })
-  else
-    vim.api.nvim_exec_autocmds("User", {
-      pattern = event_constants.TOOL_EXECUTION_COMPLETED,
-      data = {
-        generation_id = generation_id,
-        tool_call = tool_call,
-        tool_name = tool_name,
-        arguments = arguments,
-        result = result,
-        session_id = session_id,
-        window_id = window_id,
-        duration = duration,
-      },
-    })
+  local final = result or error_msg
+  if type(final) ~= "string" then
+    if type(final) == "table" then
+      local ok, e = pcall(vim.json.encode, final); final = ok and e or vim.inspect(final)
+    else final = tostring(final) end
   end
-
-  local final_result = result or error_msg
-  if type(final_result) ~= "string" then
-    if type(final_result) == "table" then
-      local ok, encoded = pcall(vim.json.encode, final_result)
-      if ok then
-        final_result = encoded
-      else
-        final_result = vim.inspect(final_result)
-      end
-    else
-      final_result = tostring(final_result)
-    end
-  end
-  -- print("[tool_orchestrator] execute_tool 返回, 长度=" .. #final_result)
-  return final_result
+  return final
 end
 
---- 设置工具
---- @param tools table 工具表
 function M.set_tools(tools)
   state.tools = tools or {}
-  local count = 0
-  for _ in pairs(state.tools) do
-    count = count + 1
-  end
-  logger.debug(string.format("Tool orchestrator tools set: %d tools available", vim.tbl_count(state.tools)))
 end
 
---- 从响应中提取工具调用
---- @param response table AI响应
---- @return table 工具调用列表
-function M.extract_tool_calls(response)
-  if not response or not response.choices or #response.choices == 0 then
-    print("[tool_orchestrator] extract_tool_calls: 无响应或空 choices")
-    return {}
-  end
-
-  local tool_calls = {}
-  local choice = response.choices[1]
-
-  if choice.message and choice.message.tool_calls then
-    -- print("[tool_orchestrator] extract_tool_calls: 发现 " .. #choice.message.tool_calls .. " 个工具调用")
-    for _, tool_call in ipairs(choice.message.tool_calls) do
-      -- 兼容两种字段名：function（OpenAI 标准）和 func（旧格式）
-      local tool_func = tool_call["function"] or tool_call.func
-      local name = tool_func and tool_func.name or ""
-      -- print("[tool_orchestrator] extract_tool_calls: 工具 " .. name)
-      table.insert(tool_calls, {
-        id = tool_call.id,
-        type = tool_call.type,
-        ["function"] = {
-          name = name,
-          arguments = tool_func and tool_func.arguments or "",
-        },
-      })
-    end
-  else
-    print("[tool_orchestrator] extract_tool_calls: 消息中无 tool_calls")
-  end
-
-  -- print("[tool_orchestrator] extract_tool_calls: 返回 " .. #tool_calls .. " 个")
-  return tool_calls
-end
-
---- 构建工具调用上下文
---- @param tool_results table 工具结果列表
---- @return table 上下文消息
-function M.build_context(tool_results)
-  if not tool_results or #tool_results == 0 then
-    print("[tool_orchestrator] build_context: 无工具结果")
-    return {}
-  end
-
-  print("[tool_orchestrator] build_context: " .. #tool_results .. " 个结果")
-  local context_messages = {}
-
-  for i, result in ipairs(tool_results) do
-    if result.tool_call and result.result then
-      -- print("[tool_orchestrator] build_context #" .. i .. ": 添加 assistant + tool 消息")
-      table.insert(context_messages, {
-        role = "assistant",
-        tool_calls = { result.tool_call },
-      })
-
-      -- 确保 tool_call.id 存在，避免 API 验证错误
-      local safe_id = result.tool_call.id
-      if not safe_id or safe_id == "" then
-        safe_id = "call_" .. tostring(os.time()) .. "_" .. tostring(math.random(10000, 99999))
-        -- print("[tool_orchestrator] build_context: 生成 fallback ID: " .. safe_id)
-        logger.warn(string.format("build_context: tool_call.id is nil or empty, generated fallback: %s", safe_id))
-      end
-
-      table.insert(context_messages, {
-        role = "tool",
-        tool_call_id = safe_id,
-        content = M.format_tool_result(result.result) or "",
-      })
-    else
-      print("[tool_orchestrator] build_context #" .. i .. ": 跳过（缺少 tool_call 或 result）")
-    end
-  end
-
-  -- print("[tool_orchestrator] build_context: 返回 " .. #context_messages .. " 条消息")
-  return context_messages
-end
-
---- 格式化工具结果
---- @param result any 工具执行结果
---- @return string 格式化后的结果
-function M.format_tool_result(result)
-  if type(result) == "string" then
-    return result
-  elseif type(result) == "table" then
-    return vim.json.encode(result)
-  else
-    return tostring(result)
-  end
-end
-
---- 检查是否应该继续工具调用
---- @param tool_results table 工具结果列表
---- @return boolean 是否继续
-function M.should_continue(tool_results)
-  -- 简单实现：如果有工具结果就继续
-  return tool_results and #tool_results > 0
-end
-
---- 请求停止工具调用循环
---- 当 AI 认为任务已完成时，调用此方法触发循环结束
 function M.request_stop()
-  -- print("[tool_orchestrator] request_stop: 请求停止工具循环")
   state.stop_requested = true
-  logger.info("Tool loop stop requested")
 end
 
---- 检查是否已请求停止
---- @return boolean 是否已请求停止
 function M.is_stop_requested()
   return state.stop_requested
 end
 
---- 重置停止请求标志
---- 在 handle_tool_result 中处理完 stop_tool_loop 后调用，
---- 避免后续循环再次触发总结提示
 function M.reset_stop_requested()
-  -- print("[tool_orchestrator] reset_stop_requested: 重置停止请求标志")
   state.stop_requested = false
-  logger.info("Tool loop stop request flag reset")
 end
 
---- 获取当前迭代次数
---- @return number 当前迭代次数
 function M.get_current_iteration()
   return state.current_iteration or 0
 end
 
---- 重置迭代计数
---- 在每次用户新消息开始时调用，确保跨轮次计数从零开始
 function M.reset_iteration()
   state.current_iteration = 0
-  logger.debug("Tool iteration counter reset")
 end
 
---- 获取可用工具
---- @return table 工具表
 function M.get_tools()
   return state.tools
 end
 
---- 验证工具使用
---- @param tool_call table 工具调用
---- @return boolean 是否有效
-function M.validate_tool_use(tool_call)
-  -- 兼容两种字段名：function（OpenAI 标准）和 func（旧格式）
-  local tool_func = tool_call["function"] or tool_call.func
-  if not tool_call or not tool_func then
-    return false
-  end
-
-  local tool_name = tool_func.name
-  return state.tools[tool_name] ~= nil
-end
-
---- 选择工具
---- @param query string 查询
---- @param available_tools table 可用工具
---- @return table 选择的工具
-function M.select_tools(query, available_tools)
-  -- 简单实现：返回所有可用工具
-  return available_tools or state.tools
-end
-
---- 合并结果
---- @param results table 结果列表
---- @return any 合并后的结果
-function M.merge_results(results)
-  if not results or #results == 0 then
-    return nil
-  end
-
-  if #results == 1 then
-    return results[1]
-  end
-
-  -- 合并多个结果为字符串
-  local merged = ""
-  for i, result in ipairs(results) do
-    merged = merged .. string.format("Result %d: %s\n", i, tostring(result))
-  end
-
-  return merged
-end
-
---- 执行工具（兼容接口）
---- @param tool_call table 工具调用
---- @return any 工具执行结果
-function M.execute_tools(tool_call)
-  return M.execute_tool({
-    generation_id = "compat_" .. tostring(os.time()),
-    tool_call = tool_call,
-  })
-end
-
---- 获取模块状态
---- @return table 状态信息
-function M.get_state()
-  return {
-    initialized = state.initialized,
-    tools_count = vim.tbl_count(state.tools),
-    current_iteration = state.current_iteration,
-    config = state.config,
-  }
-end
-
---- 关闭工具编排器
 function M.shutdown()
-  if not state.initialized then
-    print("[tool_orchestrator] shutdown: 未初始化，跳过")
-    return
-  end
-
-  -- print("[tool_orchestrator] shutdown: 关闭工具编排器")
-
-  -- 清理工具
-  state.tools = {}
-
-  -- 重置状态
-  state.initialized = false
-  state.current_iteration = 0
-
-  logger.info("Tool orchestrator shutdown")
+  state.tools = {}; state.initialized = false; state.current_iteration = 0
 end
 
---- 导出模块
 return M

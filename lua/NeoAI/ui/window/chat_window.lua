@@ -2472,10 +2472,17 @@ end
 --- @return string|nil 模型标签，如 "deepseek/deepseek-chat"
 function M._get_current_model_label()
   local default_config = require("NeoAI.default_config")
-  local models = default_config.get_available_models("chat")
-  local target = models[state.current_model_index]
+  -- 优先从场景候选获取模型名（与发送消息时使用的配置一致）
+  local candidates = default_config.get_scenario_candidates("chat")
+  local target = candidates[state.current_model_index]
   if target then
     return string.format("%s/%s", target.provider or "?", target.model_name or "?")
+  end
+  -- 回退到 get_available_models
+  local models = default_config.get_available_models("chat")
+  local fallback = models[state.current_model_index]
+  if fallback then
+    return string.format("%s/%s", fallback.provider or "?", fallback.model_name or "?")
   end
   return nil
 end
@@ -2494,32 +2501,54 @@ function M.show_model_selector()
   end
 
   local default_config = require("NeoAI.default_config")
-  local models = default_config.get_available_models("chat")
+  -- 优先使用场景候选列表（与发送消息时使用的配置一致）
+  local candidates = default_config.get_scenario_candidates("chat")
 
-  if #models == 0 then
-    vim.notify("[NeoAI] 没有可用的模型（请检查 API key 配置）", vim.log.levels.WARN)
+  if #candidates == 0 then
+    -- 回退到 get_available_models
+    local models = default_config.get_available_models("chat")
+    if #models == 0 then
+      vim.notify("[NeoAI] 没有可用的模型（请检查 API key 配置）", vim.log.levels.WARN)
+      return
+    end
+    -- 构建选择菜单项（使用 get_available_models）
+    local items = {}
+    for i, m in ipairs(models) do
+      local indicator = (i == state.current_model_index) and "✓ " or "  "
+      table.insert(items, string.format("%s%s/%s", indicator, m.provider or "?", m.model_name or "?"))
+    end
+    local current_label = "未知"
+    local current = models[state.current_model_index]
+    if current then
+      current_label = string.format("%s/%s", current.provider or "?", current.model_name or "?")
+    end
+    vim.ui.select(items, {
+      prompt = "选择 AI 模型 (当前: " .. current_label .. ")",
+      format_item = function(item) return item end,
+    }, function(choice, idx)
+      if choice and idx and idx ~= state.current_model_index then
+        M.switch_to_model(idx)
+      end
+    end)
     return
   end
 
-  -- 构建选择菜单项
+  -- 构建选择菜单项（使用场景候选）
   local items = {}
-  for i, m in ipairs(models) do
+  for i, c in ipairs(candidates) do
     local indicator = (i == state.current_model_index) and "✓ " or "  "
-    table.insert(items, string.format("%s%s/%s", indicator, m.provider or "?", m.model_name or "?"))
+    table.insert(items, string.format("%s%s/%s", indicator, c.provider or "?", c.model_name or "?"))
   end
 
-  -- 获取当前模型名用于提示
   local current_label = "未知"
-  local current = models[state.current_model_index]
+  local current = candidates[state.current_model_index]
   if current then
     current_label = string.format("%s/%s", current.provider or "?", current.model_name or "?")
   end
 
   vim.ui.select(items, {
     prompt = "选择 AI 模型 (当前: " .. current_label .. ")",
-    format_item = function(item)
-      return item
-    end,
+    format_item = function(item) return item end,
   }, function(choice, idx)
     if choice and idx and idx ~= state.current_model_index then
       M.switch_to_model(idx)
@@ -2535,13 +2564,18 @@ function M.switch_to_model(model_index)
   end
 
   local default_config = require("NeoAI.default_config")
-  local models = default_config.get_available_models("chat")
+  -- 优先使用场景候选列表
+  local candidates = default_config.get_scenario_candidates("chat")
+  local target = candidates[model_index]
 
-  -- 查找目标模型
-  local target = models[model_index]
   if not target then
-    vim.notify("[NeoAI] 无效的模型索引: " .. tostring(model_index), vim.log.levels.WARN)
-    return
+    -- 回退到 get_available_models
+    local models = default_config.get_available_models("chat")
+    target = models[model_index]
+    if not target then
+      vim.notify("[NeoAI] 无效的模型索引: " .. tostring(model_index), vim.log.levels.WARN)
+      return
+    end
   end
 
   local old_index = state.current_model_index
@@ -2565,7 +2599,8 @@ function M.switch_to_model(model_index)
     },
   })
 
-  vim.notify(string.format("[NeoAI] 已切换到模型: %s", target.label), vim.log.levels.INFO)
+  local label = string.format("%s/%s", target.provider or "?", target.model_name or "?")
+  vim.notify(string.format("[NeoAI] 已切换到模型: %s", label), vim.log.levels.INFO)
 end
 
 return M

@@ -6,6 +6,53 @@ local M = {}
 local tool_registry = require("NeoAI.tools.tool_registry")
 local tool_validator = require("NeoAI.tools.tool_validator")
 local Events = require("NeoAI.core.events.event_constants")
+local json = require("NeoAI.utils.json")
+
+-- 递归解析参数中的 JSON 字符串字段
+-- 支持：
+--   1. 整个 args 是 JSON 字符串
+--   2. 某个字段值是 JSON 字符串（如 file = '{"filepath":"..."}'）
+--   3. 嵌套表中的 JSON 字符串
+--   4. 已经是表的保持不变
+local function resolve_json_args(args)
+  if args == nil then
+    return args
+  end
+
+  -- 如果整个 args 是 JSON 字符串，直接解析
+  if type(args) == "string" then
+    local ok, decoded = pcall(json.decode, args)
+    if ok and type(decoded) == "table" then
+      return resolve_json_args(decoded)
+    end
+    return args
+  end
+
+  if type(args) ~= "table" then
+    return args
+  end
+
+  local result = {}
+  for k, v in pairs(args) do
+    if type(v) == "string" then
+      -- 尝试解析 JSON 字符串
+      local ok, decoded = pcall(json.decode, v)
+      if ok then
+        -- 解析成功，递归处理解析结果
+        result[k] = resolve_json_args(decoded)
+      else
+        -- 不是 JSON 字符串，保持原样
+        result[k] = v
+      end
+    elseif type(v) == "table" then
+      -- 递归处理子表
+      result[k] = resolve_json_args(v)
+    else
+      result[k] = v
+    end
+  end
+  return result
+end
 
 -- 检查 vim 模块是否可用，如果不可用则使用简单的深拷贝函数
 local function deep_copy(obj, seen)
@@ -95,11 +142,19 @@ function M.execute(tool_name, args)
   end
   print("[tool_executor] 找到工具定义: " .. tool_name)
 
+  -- 预处理：解析 JSON 字符串参数
+  local resolved_args = resolve_json_args(args)
+
   -- 验证参数
-  local valid, error_msg = M.validate_args(tool, args)
+  local valid, error_msg = M.validate_args(tool, resolved_args)
   if not valid then
     print("[tool_executor] 参数验证失败: " .. (error_msg or "未知错误"))
     M._record_execution(tool_name, args, nil, error_msg)
+    -- 生成调用示例
+    local example = M._generate_example(tool)
+    if example then
+      return error_msg .. "\n\n调用示例:\n" .. example
+    end
     return error_msg
   end
   print("[tool_executor] 参数验证通过")
@@ -132,8 +187,8 @@ function M.execute(tool_name, args)
 
   print("[tool_executor] 调用 safe_call: max_retries=" .. max_retries .. ", retry_delay=" .. retry_delay)
 
-  -- 安全调用工具函数
-  local result, call_error = M.safe_call(tool.func, args, max_retries, retry_delay)
+  -- 安全调用工具函数（使用解析后的参数）
+  local result, call_error = M.safe_call(tool.func, resolved_args, max_retries, retry_delay)
   local end_time = os.time()
   local duration = end_time - start_time
 
@@ -726,6 +781,66 @@ local function test_module()
 
   vim.notify("\n=== 测试完成 ===")
   return true
+end
+
+--- 根据工具定义生成调用示例
+--- @param tool table 工具定义
+--- @return string|nil 调用示例字符串
+function M._generate_example(tool)
+  if not tool or not tool.parameters or not tool.parameters.properties then
+    return nil
+  end
+
+  local props = tool.parameters.properties
+  local required = tool.parameters.required or {}
+  local example = {}
+
+  for _, req in ipairs(required) do
+    local prop = props[req]
+    if prop then
+      if prop.type == "string" then
+        example[req] = '"<" .. req .. ">"'
+      elseif prop.type == "number" or prop.type == "integer" then
+        example[req] = 0
+      elseif prop.type == "boolean" then
+        example[req] = false
+      elseif prop.type == "array" then
+        example[req] = {}
+      elseif prop.type == "object" then
+        example[req] = {}
+      else
+        example[req] = '"<" .. req .. ">"'
+      end
+    end
+  end
+
+  -- 如果有 file 或 files 字段，展示 JSON 字符串格式
+  if example.file or example.files then
+    local lines = {}
+    table.insert(lines, tool.name .. "({")
+    for k, v in pairs(example) do
+      if k == "file" then
+        table.insert(lines, '  file = \'{"filepath": "<文件路径>"}\',')
+      elseif k == "files" then
+        table.insert(lines, '  files = \'[{"filepath": "<文件路径>"}]\',')
+      else
+        local val_str = type(v) == "string" and v or tostring(v)
+        table.insert(lines, '  ' .. k .. ' = ' .. val_str .. ',')
+      end
+    end
+    table.insert(lines, "})")
+    return table.concat(lines, "\n")
+  end
+
+  -- 普通格式
+  local lines = {}
+  table.insert(lines, tool.name .. "({")
+  for k, v in pairs(example) do
+    local val_str = type(v) == "string" and v or tostring(v)
+    table.insert(lines, '  ' .. k .. ' = ' .. val_str .. ',')
+  end
+  table.insert(lines, "})")
+  return table.concat(lines, "\n")
 end
 
 -- 导出测试函数

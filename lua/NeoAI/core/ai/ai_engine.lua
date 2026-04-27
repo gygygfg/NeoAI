@@ -1,216 +1,106 @@
--- AI 引擎主入口（重新设计）
--- 负责接收聊天事件信息，协调各个子模块工作
--- 使用真正的 HTTP 客户端调用 AI API，不再使用模拟响应
+-- AI 引擎（精简版）
+-- 合并原 ai_engine + request_builder + stream_processor + reasoning_manager + response_builder
 local M = {}
 
--- 导入子模块
-local request_builder = require("NeoAI.core.ai.request_builder")
-local reasoning_manager = require("NeoAI.core.ai.reasoning_manager")
-local tool_orchestrator = require("NeoAI.core.ai.tool_orchestrator")
-local stream_processor = require("NeoAI.core.ai.stream_processor")
-local response_builder = require("NeoAI.core.ai.response_builder")
-local http_client = require("NeoAI.core.ai.http_client")
-
--- 导入工具
 local logger = require("NeoAI.utils.logger")
 local event_constants = require("NeoAI.core.events.event_constants")
 local json = require("NeoAI.utils.json")
 local default_config = require("NeoAI.default_config")
 
--- 模块内部状态
+-- 子模块
+local http_client = require("NeoAI.core.ai.http_client")
+local tool_orchestrator = require("NeoAI.core.ai.tool_orchestrator")
+
+-- ========== 状态 ==========
+
+---@class SessionManager
+---@field get_session fun(id: string): table|nil
+---@field _save_sessions fun()
+---@field get_message_manager fun(): table
+---@field get_branch_manager fun(): table
+---@field list_sessions fun(): table
+
+---@class AIEngineState
+---@field session_manager SessionManager|nil
 local state = {
   initialized = false,
-  full_config = {}, -- 完整配置（含 ai, ui, session 等所有字段）
+  full_config = {},
   is_generating = false,
   current_generation_id = nil,
   tools = {},
+  tool_definitions = {},
+  tool_call_counter = 0,
+  first_request = true,
+  ---@type SessionManager|nil
   session_manager = nil,
   active_generations = {},
   event_listeners = {},
-
-  -- 子模块引用
-  request_builder = request_builder,
-  response_builder = response_builder,
-  reasoning_manager = reasoning_manager,
-  tool_orchestrator = tool_orchestrator,
-  stream_processor = stream_processor,
-  http_client = http_client,
 
   -- 重试配置
   max_retries = 3,
   retry_delay_ms = 1000,
 }
 
---- 初始化 AI 引擎
---- @param options table 初始化选项，包含配置和会话管理器
---- @return table 返回模块自身，支持链式调用
+-- ========== 初始化 ==========
+
 function M.initialize(options)
   if state.initialized then
     return M
   end
 
-  -- 存储完整配置（含 ai, ui, session 等所有字段）
-  -- 各子模块在每次生成时根据场景获取解析后的配置
   state.full_config = options.config or {}
   state.session_manager = options.session_manager
 
-  -- 初始化所有子模块（传入完整配置，子模块自行取需要的部分）
-  state.request_builder.initialize({
-    config = state.full_config,
-  })
+  http_client.initialize({ config = {} })
+  tool_orchestrator.initialize({ config = state.full_config, session_manager = state.session_manager })
 
-  state.response_builder.initialize({
-    config = state.full_config,
-    session_manager = state.session_manager,
-  })
-
-  state.reasoning_manager.initialize({
-    config = state.full_config,
-  })
-
-  state.tool_orchestrator.initialize({
-    config = state.full_config,
-    session_manager = state.session_manager,
-
-  })
-
-  state.stream_processor.initialize({
-    config = state.full_config,
-  })
-
-  -- HTTP 客户端在每次请求时动态获取 base_url/api_key，此处仅初始化空状态
-  state.http_client.initialize({
-    config = {},
-  })
-
-  -- 设置事件监听器
-  M.setup_event_listeners()
-
-  -- 标记引擎为已初始化状态
+  M._setup_event_listeners()
   state.initialized = true
 
-  -- 触发插件初始化完成事件
-  vim.api.nvim_exec_autocmds("User", {
-    pattern = event_constants.PLUGIN_INITIALIZED,
-  })
-
+  vim.api.nvim_exec_autocmds("User", { pattern = event_constants.PLUGIN_INITIALIZED })
   logger.info("AI engine initialized")
   return M
 end
 
---- 设置事件监听器
-function M.setup_event_listeners()
-  -- 监听发送消息事件
+-- ========== 事件监听 ==========
+
+function M._setup_event_listeners()
   state.event_listeners.send_message = vim.api.nvim_create_autocmd("User", {
     pattern = event_constants.SEND_MESSAGE,
     callback = function(args)
       M.handle_send_message(args.data)
     end,
   })
-
-  -- 监听工具执行完成事件
   state.event_listeners.tool_result_received = vim.api.nvim_create_autocmd("User", {
     pattern = event_constants.TOOL_RESULT_RECEIVED,
     callback = function(args)
       M.handle_tool_result(args.data)
     end,
   })
-
-  -- 监听流式处理完成事件
   state.event_listeners.stream_completed = vim.api.nvim_create_autocmd("User", {
     pattern = event_constants.STREAM_COMPLETED,
     callback = function(args)
       M.handle_stream_completed(args.data)
     end,
   })
-
-  -- 监听工具循环停止请求事件
   state.event_listeners.tool_loop_stop_requested = vim.api.nvim_create_autocmd("User", {
     pattern = event_constants.TOOL_LOOP_STOP_REQUESTED,
     callback = function()
-      state.tool_orchestrator.request_stop()
+      tool_orchestrator.request_stop()
     end,
   })
-
-  -- 监听取消生成事件
   state.event_listeners.cancel_generation = vim.api.nvim_create_autocmd("User", {
     pattern = event_constants.CANCEL_GENERATION,
     callback = function()
       M.cancel_generation()
     end,
   })
-
-  logger.debug("Event listeners setup completed")
 end
 
---- 处理发送消息事件
---- @param data table 事件数据
-function M.handle_send_message(data)
-  if not state.initialized then
-    logger.error("AI engine not initialized when handling send message")
-    return
-  end
+-- ========== 配置解析 ==========
 
-  if state.is_generating then
-    logger.warn("Already generating, ignoring new message")
-    return
-  end
-
-  local content = data.content
-  local session_id = data.session_id
-  local window_id = data.window_id
-  local options = data.options or {}
-
-  logger.debug(string.format("Handling send message: session=%s, window=%s", session_id or "nil", window_id or "nil"))
-
-  -- 设置生成状态
-  state.is_generating = true
-
-  -- 重置工具迭代计数（用户新消息开始时归零）
-  state.tool_orchestrator.reset_iteration()
-
-  -- 从会话管理器获取消息历史
-  local messages = {}
-  if state.session_manager and session_id and state.session_manager.get_session then
-    local session = state.session_manager.get_session(session_id)
-    if session and session.get_messages then
-      messages = session:get_messages() or {}
-    end
-  end
-
-  -- 添加用户消息
-  table.insert(messages, {
-    role = "user",
-    content = content,
-    timestamp = os.time(),
-    window_id = window_id,
-  })
-
-  -- 触发用户消息发送事件
-  vim.api.nvim_exec_autocmds("User", {
-    pattern = event_constants.USER_MESSAGE_SENT,
-    data = {
-      message = messages[#messages],
-      session_id = session_id,
-      window_id = window_id,
-      timestamp = os.time(),
-    },
-  })
-
-  -- 开始生成响应
-  M.generate_response(messages, {
-    session_id = session_id,
-    window_id = window_id,
-    options = options,
-  })
-end
-
---- 根据场景名称解析 AI 配置
---- 使用 default_config.get_preset(scenario) 获取完整的解析配置
---- @param scenario string 场景名称
---- @return table 解析后的 AI 配置（含 base_url, api_key, model, temperature 等）
+--- 获取场景的 AI 配置
 local function resolve_scenario_config(scenario)
-  -- 优先使用 default_config 的 get_preset 方法
   if default_config and default_config.get_preset then
     local preset = default_config.get_preset(scenario)
     if preset and preset.base_url and preset.api_key then
@@ -218,38 +108,20 @@ local function resolve_scenario_config(scenario)
     end
   end
 
-  -- 回退：从完整配置中手动解析
   local ai_config = state.full_config.ai or {}
   local scenarios = ai_config.scenarios or {}
-  local entry = scenarios[scenario]
-
-  if not entry then
-    -- 尝试使用默认场景
-    local default_scenario = ai_config.default or "chat"
-    entry = scenarios[default_scenario]
-  end
-
+  local entry = scenarios[scenario] or scenarios[ai_config.default or "chat"]
   if not entry then
     return {}
   end
 
-  -- 手动解析（兼容旧格式）
-  local candidate
-  if type(entry) == "table" then
-    if entry[1] == nil or type(entry[1]) ~= "table" then
-      candidate = entry
-    else
-      candidate = entry[1]
-    end
-  end
-
+  local candidate = type(entry) == "table" and (entry[1] or entry) or entry
   if not candidate then
     return {}
   end
 
   local provider_name = candidate.provider or "deepseek"
   local provider = (ai_config.providers or {})[provider_name]
-
   local result = {}
   if provider then
     result.base_url = provider.base_url
@@ -267,67 +139,380 @@ local function resolve_scenario_config(scenario)
   if not result.system_prompt then
     result.system_prompt = ai_config.system_prompt
   end
-
   return result
 end
 
---- 生成 AI 响应
--- 使用真正的 HTTP 客户端调用 AI API，支持流式和非流式模式
--- 根据 params.model_index 从场景候选列表中选取对应的 AI 配置
---- @param messages table 消息列表
---- @param params table 生成参数（含 model_index, session_id, window_id, options 等）
-function M.generate_response(messages, params)
-  local session_id = params.session_id
-  local window_id = params.window_id
-  local options = params.options or {}
+--- 获取模型配置（统一入口）
+local function get_model_config(model_index)
+  model_index = model_index or 1
+  local preset = {}
 
-  -- 设置生成状态
-  state.is_generating = true
-
-  -- 优先使用场景配置（scenarios）获取模型，确保用户配置的 model_name 生效
-  -- 回退策略：get_scenario_candidates > get_available_models > resolve_scenario_config
-  local model_index = params.model_index or 1
-  local ai_preset = {}
-
-  -- 1. 优先从场景候选列表获取（尊重用户配置的 scenarios.chat.model_name）
+  -- 1. 场景候选列表
   if default_config and default_config.get_scenario_candidates then
     local candidates = default_config.get_scenario_candidates("chat")
     local target = candidates[model_index]
     if target then
-      ai_preset = vim.deepcopy(target)
-      ai_preset.model = ai_preset.model_name
+      preset = vim.deepcopy(target)
+      preset.model = preset.model_name
     end
   end
 
-  -- 2. 如果场景候选未获取到，回退到 get_available_models
-  if not ai_preset.base_url or not ai_preset.api_key then
+  -- 2. get_available_models 回退
+  if not preset.base_url or not preset.api_key then
     if default_config and default_config.get_available_models then
       local models = default_config.get_available_models("chat")
       local target = models[model_index]
       if target then
-        local ai_config = state.full_config.ai or {}
-        local providers = ai_config.providers or {}
-        local provider_def = providers[target.provider]
-        if provider_def then
-          ai_preset.base_url = provider_def.base_url
-          ai_preset.api_key = provider_def.api_key
+        local providers = (state.full_config.ai or {}).providers or {}
+        local pdef = providers[target.provider]
+        if pdef then
+          preset.base_url = pdef.base_url
+          preset.api_key = pdef.api_key
         end
-        ai_preset.provider = target.provider
-        ai_preset.model_name = target.model_name
-        ai_preset.model = target.model_name
-        ai_preset.stream = true
-        ai_preset.timeout = 60000
+        preset.provider = target.provider
+        preset.model_name = target.model_name
+        preset.model = target.model_name
+        preset.stream = true
+        preset.timeout = 60000
       end
     end
   end
 
-  -- 3. 最终回退到 resolve_scenario_config
-  if not ai_preset.base_url or not ai_preset.api_key then
-    ai_preset = resolve_scenario_config("chat")
+  -- 3. 最终回退
+  if not preset.base_url or not preset.api_key then
+    preset = resolve_scenario_config("chat")
+  end
+  return preset
+end
+
+-- ========== 消息处理 ==========
+
+--- 格式化消息
+local function format_messages(messages)
+  if not messages then
+    return {}
+  end
+  local result = {}
+  for _, msg in ipairs(messages) do
+    local fm = { role = msg.role or "user" }
+    if msg.content then
+      fm.content = type(msg.content) == "table" and msg.content or tostring(msg.content)
+    end
+    if msg.tool_calls then
+      fm.tool_calls = msg.tool_calls
+    end
+    if msg.role == "tool" then
+      if msg.tool_call_id and msg.tool_call_id ~= "" then
+        fm.tool_call_id = msg.tool_call_id
+      else
+        fm.role = "user"
+      end
+      if fm.content == nil then
+        fm.content = ""
+      end
+    elseif msg.tool_call_id then
+      fm.tool_call_id = msg.tool_call_id
+    end
+    if msg.name then
+      fm.name = msg.name
+    end
+    if msg.reasoning_content then
+      fm.reasoning_content = msg.reasoning_content
+    end
+    table.insert(result, fm)
+  end
+  return result
+end
+
+--- 构建工具结果消息
+local function build_tool_result_message(tool_call_id, result, tool_name)
+  local safe_id = tool_call_id
+  if not safe_id or safe_id == "" then
+    safe_id = "call_" .. os.time() .. "_" .. math.random(10000, 99999)
+  end
+  local msg = { role = "tool", tool_call_id = safe_id, content = "" }
+  if type(result) == "string" then
+    msg.content = result
+  elseif result ~= nil then
+    msg.content = tostring(result)
+  end
+  if tool_name then
+    msg.name = tool_name
+  end
+  return msg
+end
+
+--- 添加工具调用到消息历史
+local function add_tool_call_to_history(messages, tool_call, tool_result)
+  local updated = vim.deepcopy(messages or {})
+  local tf = tool_call["function"] or tool_call.func
+  if not tool_call or not tf or not tf.name then
+    return updated
+  end
+  local safe_id = tool_call.id
+  if not safe_id or safe_id == "" then
+    safe_id = "call_" .. os.time() .. "_" .. math.random(10000, 99999)
+    tool_call.id = safe_id
+  end
+  table.insert(updated, { role = "assistant", tool_calls = { tool_call } })
+  table.insert(updated, build_tool_result_message(safe_id, tool_result, tf.name))
+  return updated
+end
+
+-- ========== 请求构建 ==========
+
+--- 构建 AI 请求体
+local function build_request(params)
+  local messages = params.messages or {}
+  local options = params.options or {}
+  local session_id = params.session_id
+  state.tool_call_counter = state.tool_call_counter + 1
+  local generation_id = params.generation_id
+    or (os.time() .. "_" .. math.random(1000, 9999) .. "_" .. state.tool_call_counter)
+
+  local mode = options.mode or "chat"
+  local request
+
+  if mode == "fim" then
+    request = {
+      model = options.model or "gpt-4",
+      prompt = options.prompt or "",
+      suffix = options.suffix or "",
+      max_tokens = options.max_tokens or 64,
+      stream = false,
+    }
+  else
+    local use_stream = options.stream
+    if use_stream == nil then
+      use_stream = true
+    end
+    request = {
+      model = options.model or "gpt-4",
+      messages = messages,
+      max_tokens = options.max_tokens or 2000,
+      stream = use_stream,
+    }
   end
 
-  -- 生成唯一ID
-  local generation_id = tostring(os.time()) .. "_" .. math.random(1000, 9999)
+  if mode ~= "fim" then
+    local reasoning_enabled = (options.reasoning_enabled ~= nil) and options.reasoning_enabled or false
+    if reasoning_enabled then
+      local raw_effort = options.reasoning_effort or "high"
+      local effort_map = { low = "low", medium = "low", high = "high", xhigh = "max", max = "max" }
+      request.extra_body = { thinking = { type = "enabled" }, reasoning_effort = effort_map[raw_effort] or "high" }
+    else
+      request.temperature = options.temperature or 0.7
+    end
+
+    -- 工具定义
+    local tools_enabled
+    if options.tools_enabled ~= nil then
+      tools_enabled = options.tools_enabled
+    elseif state.full_config.tools and state.full_config.tools.enabled ~= nil then
+      tools_enabled = state.full_config.tools.enabled
+    else
+      tools_enabled = state.full_config.ai and state.full_config.ai.tools_enabled
+    end
+
+    local is_first = state.first_request
+    if is_first then
+      state.first_request = false
+    end
+
+    if tools_enabled and #state.tool_definitions > 0 then
+      local model_name = (options.model or ""):lower()
+      if not model_name:find("reasoner") then
+        local tools_to_use = state.tool_definitions
+        if is_first then
+          tools_to_use = {}
+          for _, td in ipairs(state.tool_definitions) do
+            if td["function"] and td["function"].name ~= "stop_tool_loop" then
+              table.insert(tools_to_use, td)
+            end
+          end
+        end
+        if reasoning_enabled then
+          local strict_tools = {}
+          for _, td in ipairs(tools_to_use) do
+            local s = vim.deepcopy(td)
+            if s["function"] then
+              s["function"].strict = true
+              if s["function"].parameters then
+                s["function"].parameters.additionalProperties = false
+              end
+            end
+            table.insert(strict_tools, s)
+          end
+          request.tools = strict_tools
+        else
+          request.tools = tools_to_use
+        end
+        request.tool_choice = "auto"
+      end
+    end
+  end
+
+  if session_id then
+    request.session_id = session_id
+  end
+  request.generation_id = generation_id
+  return request
+end
+
+-- ========== 流式处理（内联） ==========
+
+local function create_stream_processor(generation_id, session_id, window_id)
+  return {
+    generation_id = generation_id,
+    content_buffer = "",
+    reasoning_buffer = "",
+    tool_calls = {},
+    usage = {},
+    session_id = session_id,
+    window_id = window_id,
+    start_time = os.time(),
+    is_finished = false,
+  }
+end
+
+local function process_stream_chunk(processor, data)
+  if processor.is_finished then
+    return nil
+  end
+  local result = { content = nil, reasoning_content = nil, tool_calls = nil, is_final = false }
+
+  if data.choices and #data.choices > 0 then
+    local choice = data.choices[1]
+    if choice.delta then
+      local delta = choice.delta
+      if delta.reasoning_content ~= nil and delta.reasoning_content ~= "" then
+        processor.reasoning_buffer = processor.reasoning_buffer .. delta.reasoning_content
+        result.reasoning_content = delta.reasoning_content
+      end
+      if delta.content ~= nil and delta.content ~= "" then
+        processor.content_buffer = processor.content_buffer .. delta.content
+        result.content = delta.content
+      end
+      if delta.tool_calls then
+        for _, tc in ipairs(delta.tool_calls) do
+          local idx = tc.index or 0
+          if not processor.tool_calls[idx + 1] then
+            local safe_id = tc.id or ("call_" .. os.time() .. "_" .. idx)
+            processor.tool_calls[idx + 1] =
+              { id = safe_id, type = tc.type or "function", ["function"] = { name = "", arguments = "" } }
+          end
+          local e = processor.tool_calls[idx + 1]
+          if tc.id then
+            e.id = tc.id
+          end
+          if tc.type then
+            e.type = tc.type
+          end
+          if tc["function"] then
+            if tc["function"].name then
+              e["function"].name = e["function"].name .. tc["function"].name
+            end
+            if tc["function"].arguments then
+              e["function"].arguments = e["function"].arguments .. tc["function"].arguments
+            end
+          end
+        end
+        if #processor.tool_calls > 0 then
+          result.tool_calls = vim.deepcopy(processor.tool_calls)
+        end
+      end
+    end
+    if choice.message and choice.message.tool_calls then
+      for _, tc in ipairs(choice.message.tool_calls) do
+        local idx = tc.index or 0
+        if not processor.tool_calls[idx + 1] then
+          local safe_id = tc.id or ("call_" .. os.time() .. "_" .. idx)
+          processor.tool_calls[idx + 1] =
+            { id = safe_id, type = tc.type or "function", ["function"] = { name = "", arguments = "" } }
+        end
+        local e = processor.tool_calls[idx + 1]
+        if tc.id then
+          e.id = tc.id
+        end
+        if tc.type then
+          e.type = tc.type
+        end
+        if tc["function"] then
+          if tc["function"].name then
+            e["function"].name = tc["function"].name
+          end
+          if tc["function"].arguments then
+            e["function"].arguments = tc["function"].arguments
+          end
+        end
+      end
+      if #processor.tool_calls > 0 then
+        result.tool_calls = vim.deepcopy(processor.tool_calls)
+      end
+    end
+    if choice.finish_reason then
+      result.is_final = true
+      processor.is_finished = true
+    end
+  end
+  if data.usage then
+    processor.usage = data.usage
+    result.usage = data.usage
+  end
+  return result
+end
+
+-- ========== 核心生成流程 ==========
+
+--- 处理发送消息事件
+function M.handle_send_message(data)
+  if not state.initialized then
+    logger.error("AI engine not initialized")
+    return
+  end
+  if state.is_generating then
+    logger.warn("Already generating")
+    return
+  end
+
+  local content = data.content
+  local session_id = data.session_id
+  local window_id = data.window_id
+  local options = data.options or {}
+
+  state.is_generating = true
+  tool_orchestrator.reset_iteration()
+  state.first_request = true
+
+  local messages = {}
+  if state.session_manager and session_id and state.session_manager.get_session then
+    local session = state.session_manager.get_session(session_id)
+    if session and session.get_messages then
+      messages = session:get_messages() or {}
+    end
+  end
+
+  table.insert(messages, { role = "user", content = content, timestamp = os.time(), window_id = window_id })
+
+  vim.api.nvim_exec_autocmds("User", {
+    pattern = event_constants.USER_MESSAGE_SENT,
+    data = { message = messages[#messages], session_id = session_id, window_id = window_id, timestamp = os.time() },
+  })
+
+  M.generate_response(messages, { session_id = session_id, window_id = window_id, options = options })
+end
+
+--- 生成 AI 响应
+function M.generate_response(messages, params)
+  local session_id = params.session_id
+  local window_id = params.window_id
+  local options = params.options or {}
+  state.is_generating = true
+
+  local model_index = params.model_index or 1
+  local ai_preset = get_model_config(model_index)
+
+  local generation_id = os.time() .. "_" .. math.random(1000, 9999)
   state.current_generation_id = generation_id
   state.active_generations[generation_id] = {
     start_time = os.time(),
@@ -338,84 +523,58 @@ function M.generate_response(messages, params)
     model_index = model_index,
     ai_preset = ai_preset,
     retry_count = 0,
+    accumulated_usage = {}, -- 累积各次工具循环的 token 用量
   }
 
-  -- 格式化消息
-  local formatted_messages = state.request_builder.format_messages(messages)
-
-  -- 构建请求（传入解析后的 AI 配置覆盖默认值）
-  -- stream 参数优先级：options.stream > ai_preset.stream > true（默认）
-  local stream_value
-  if options.stream ~= nil then
-    stream_value = options.stream
-  else
-    stream_value = ai_preset.stream ~= false
-  end
-  local request = state.request_builder.build_request({
-    messages = formatted_messages,
+  local formatted = format_messages(messages)
+  local stream_val = (options.stream ~= nil) and options.stream or (ai_preset.stream ~= false)
+  local request = build_request({
+    messages = formatted,
     options = vim.tbl_extend("force", options, {
       model = ai_preset.model_name or options.model,
       temperature = ai_preset.temperature or options.temperature,
       max_tokens = ai_preset.max_tokens or options.max_tokens,
-      stream = stream_value,
+      stream = stream_val,
     }),
     session_id = session_id,
     generation_id = generation_id,
   })
 
-  -- 触发生成开始事件
   vim.api.nvim_exec_autocmds("User", {
     pattern = event_constants.GENERATION_STARTED,
     data = {
       generation_id = generation_id,
-      formatted_messages = formatted_messages,
+      formatted_messages = formatted,
       request = request,
       session_id = session_id,
       window_id = window_id,
     },
   })
 
-  -- logger.info(string.format(
-  --   "Generation started: id=%s, messages=%d, tools=%s, stream=%s",
-  --   generation_id,
-  --   #formatted_messages,
-  --   request.tools and #request.tools or 0,
-  --   tostring(request.stream)
-  -- ))
-
-  -- 根据是否启用流式选择不同的请求方式
   if request.stream then
-    M._send_stream_request(generation_id, request, {
-      session_id = session_id,
-      window_id = window_id,
-      options = options,
-    })
+    M._send_stream_request(
+      generation_id,
+      request,
+      { session_id = session_id, window_id = window_id, options = options }
+    )
   else
-    M._send_non_stream_request(generation_id, request, {
-      session_id = session_id,
-      window_id = window_id,
-      options = options,
-    })
+    M._send_non_stream_request(
+      generation_id,
+      request,
+      { session_id = session_id, window_id = window_id, options = options }
+    )
   end
 end
 
---- 发送非流式请求
---- @param generation_id string 生成ID
---- @param request table 请求体
---- @param params table 参数
+--- 非流式请求
 function M._send_non_stream_request(generation_id, request, params)
-  local session_id = params.session_id
-  local window_id = params.window_id
-  local options = params.options or {}
   local generation = state.active_generations[generation_id]
-
   if not generation then
     return
   end
 
-  -- 发送请求到 AI API（传入解析后的 base_url/api_key/timeout/api_type）
-  local ai_preset = generation and generation.ai_preset or {}
-  local response, err = state.http_client.send_request({
+  local ai_preset = generation.ai_preset or {}
+  local response, err = http_client.send_request({
     request = request,
     generation_id = generation_id,
     base_url = ai_preset.base_url,
@@ -426,300 +585,176 @@ function M._send_non_stream_request(generation_id, request, params)
   })
 
   if err then
-    -- 如果生成已被取消，忽略错误
     if not state.is_generating or not state.active_generations[generation_id] then
       return
     end
-    -- 检查是否需要重试
     if generation.retry_count < state.max_retries then
       generation.retry_count = generation.retry_count + 1
-      logger.warn(
-        string.format(
-          "Request failed (generation=%s, attempt=%d/%d): %s. Retrying...",
-          generation_id,
-          generation.retry_count,
-          state.max_retries,
-          err
-        )
-      )
       vim.wait(state.retry_delay_ms)
       M._send_non_stream_request(generation_id, request, params)
       return
     end
-
     M.handle_generation_error(generation_id, err)
     return
   end
 
-  -- 检查 API 错误
-  if response.error then
-    local err_msg = response.error.message or json.encode(response.error)
+  if response and response.error then
+    local err_msg = response.error.message
+    if not err_msg then
+      pcall(function()
+        err_msg = json.encode(response.error)
+      end)
+    end
+    if not err_msg then
+      err_msg = "未知错误"
+    end
     M.handle_generation_error(generation_id, err_msg)
     return
   end
 
-  -- 处理响应
-  M.handle_ai_response(generation_id, response, {
-    session_id = session_id,
-    window_id = window_id,
-    options = options,
-  })
+  M._handle_ai_response(generation_id, response, params)
 end
 
---- 发送流式请求
---- @param generation_id string 生成ID
---- @param request table 请求体
---- @param params table 参数
+--- 流式请求
 function M._send_stream_request(generation_id, request, params)
   local session_id = params.session_id
   local window_id = params.window_id
   local options = params.options or {}
 
-  -- 触发流式开始事件
   vim.api.nvim_exec_autocmds("User", {
     pattern = event_constants.STREAM_STARTED,
-    data = {
-      generation_id = generation_id,
-      session_id = session_id,
-      window_id = window_id,
-    },
+    data = { generation_id = generation_id, session_id = session_id, window_id = window_id },
   })
 
-  -- 初始化流式处理器
-  state.stream_processor.start_stream({
-    generation_id = generation_id,
-    session_id = session_id,
-    window_id = window_id,
-  })
+  local processor = create_stream_processor(generation_id, session_id, window_id)
+  local gen = state.active_generations[generation_id]
+  if gen then
+    gen._stream_processor = processor
+  end
 
-  -- 调试：检查 messages 的完整结构
-  -- if request.messages then
-  --   print("[ai_engine] 消息总数: " .. #request.messages)
-  --   for i, msg in ipairs(request.messages) do
-  --     local has_rc = msg.reasoning_content and "yes" or "no"
-  --     local has_tc = msg.tool_calls and "yes" or "no"
-  --     local content_preview = ""
-  --     if msg.content then
-  --       content_preview = msg.content:sub(1, 50)
-  --     end
-  --     print(string.format("  #%d role=%s content=[%s] reasoning=%s tool_calls=%s",
-  --       i, msg.role, content_preview, has_rc, has_tc))
-  --   end
-  -- end
-
-  -- 发送流式请求（传入解析后的 base_url/api_key/timeout/api_type）
-  local generation = state.active_generations[generation_id]
-  local ai_preset = generation and generation.ai_preset or {}
-
-  -- 如果 ai_preset 中的 base_url 或 api_key 为空，尝试重新获取配置
-  -- 这通常发生在重试时，generation 存在但 ai_preset 中的配置丢失
+  local ai_preset = gen and gen.ai_preset or {}
   if not ai_preset.base_url or not ai_preset.api_key then
-    if generation and generation.model_index then
-      local candidates = default_config.get_scenario_candidates("chat")
-      local target = candidates[generation.model_index]
-      if target then
-        ai_preset = vim.deepcopy(target)
-        ai_preset.model = ai_preset.model_name
-        -- 更新 generation 中的 ai_preset，避免后续重试再次丢失
-        generation.ai_preset = ai_preset
-      end
-    end
-    if not ai_preset.base_url or not ai_preset.api_key then
-      local fallback = resolve_scenario_config("chat")
-      if fallback.base_url and fallback.api_key then
-        ai_preset = fallback
-        if generation then
-          generation.ai_preset = ai_preset
-        end
-      end
+    ai_preset = get_model_config(gen and gen.model_index or 1)
+    if gen then
+      gen.ai_preset = ai_preset
     end
   end
-  state.http_client.send_stream_request(
-    {
-      request = request,
-      generation_id = generation_id,
-      base_url = ai_preset.base_url,
-      api_key = ai_preset.api_key,
-      timeout = ai_preset.timeout,
-      api_type = ai_preset.api_type or "openai",
-      provider_config = ai_preset,
-    },
-    -- on_chunk: 处理每个数据块
-    function(data)
-      M._handle_stream_chunk(generation_id, data, {
-        session_id = session_id,
-        window_id = window_id,
-        options = options,
-      })
-    end,
-    -- on_complete: 流式请求完成
-    function()
-      M._handle_stream_end(generation_id, {
-        session_id = session_id,
-        window_id = window_id,
-        options = options,
-      })
-    end,
-    -- on_error: 流式请求出错
-    function(err)
-      -- 如果生成已被取消，忽略错误
-      if not state.is_generating or not state.active_generations[generation_id] then
-        return
-      end
-      local generation = state.active_generations[generation_id]
-      if generation and generation.retry_count < state.max_retries then
-        generation.retry_count = generation.retry_count + 1
-        logger.warn(
-          string.format(
-            "Stream request failed (generation=%s, attempt=%d/%d): %s. Retrying...",
-            generation_id,
-            generation.retry_count,
-            state.max_retries,
-            err
-          )
-        )
-        vim.wait(state.retry_delay_ms)
-        M._send_stream_request(generation_id, request, params)
-        return
-      end
-      M.handle_generation_error(generation_id, err)
+
+  local function retry_or_error(err)
+    if not state.is_generating or not state.active_generations[generation_id] then
+      return
     end
-  )
+    local g = state.active_generations[generation_id]
+    if g and g.retry_count < state.max_retries then
+      g.retry_count = g.retry_count + 1
+      vim.wait(state.retry_delay_ms)
+      M._send_stream_request(generation_id, request, params)
+      return
+    end
+    M.handle_generation_error(generation_id, err)
+  end
+
+  http_client.send_stream_request({
+    request = request,
+    generation_id = generation_id,
+    base_url = ai_preset.base_url,
+    api_key = ai_preset.api_key,
+    timeout = ai_preset.timeout,
+    api_type = ai_preset.api_type or "openai",
+    provider_config = ai_preset,
+  }, function(data)
+    M._handle_stream_chunk(generation_id, data, processor, params)
+  end, function()
+    M._handle_stream_end(generation_id, processor, params)
+  end, function(err)
+    retry_or_error(err)
+  end)
 end
 
 --- 处理流式数据块
---- @param generation_id string 生成ID
---- @param data table SSE 数据块
---- @param params table 参数
-function M._handle_stream_chunk(generation_id, data, params)
-  local session_id = params.session_id
-  local window_id = params.window_id
-
-  -- 使用 stream_processor 解析数据块
-  local result = state.stream_processor.process_chunk({
-    generation_id = generation_id,
-    data = data,
-    session_id = session_id,
-    window_id = window_id,
-  })
-
+function M._handle_stream_chunk(generation_id, data, processor, params)
+  local result = process_stream_chunk(processor, data)
   if not result then
     return
   end
 
-  -- 使用 vim.schedule 确保 nvim_exec_autocmds 在 jobstart 回调中安全执行
   vim.schedule(function()
-    -- 处理思考内容
     if result.reasoning_content then
       vim.api.nvim_exec_autocmds("User", {
         pattern = event_constants.REASONING_CONTENT,
         data = {
           generation_id = generation_id,
           reasoning_content = result.reasoning_content,
-          session_id = session_id,
-          window_id = window_id,
+          session_id = processor.session_id,
+          window_id = processor.window_id,
         },
       })
     end
-
-    -- 处理普通内容
     if result.content then
       vim.api.nvim_exec_autocmds("User", {
         pattern = event_constants.STREAM_CHUNK,
         data = {
           generation_id = generation_id,
           chunk = result.content,
-          session_id = session_id,
-          window_id = window_id,
+          session_id = processor.session_id,
+          window_id = processor.window_id,
           is_final = false,
         },
       })
     end
-
-    -- 处理工具调用
     if result.tool_calls and #result.tool_calls > 0 then
       vim.api.nvim_exec_autocmds("User", {
         pattern = event_constants.TOOL_CALL_DETECTED,
         data = {
           generation_id = generation_id,
           tool_calls = result.tool_calls,
-          session_id = session_id,
-          window_id = window_id,
+          session_id = processor.session_id,
+          window_id = processor.window_id,
         },
       })
     end
   end)
 end
 
---- 处理流式请求结束
---- @param generation_id string 生成ID
---- @param params table 参数
-function M._handle_stream_end(generation_id, params)
-  local session_id = params.session_id
-  local window_id = params.window_id
+--- 处理流式结束
+function M._handle_stream_end(generation_id, processor, params)
+  local full_response = processor.content_buffer or ""
+  local reasoning_text = processor.reasoning_buffer or ""
+  local usage = processor.usage or {}
+  local tool_calls = processor.tool_calls or {}
 
-  -- 获取完整的流式响应
-  local full_response = state.stream_processor.get_full_response(generation_id)
-  local reasoning_text = state.stream_processor.get_reasoning_text(generation_id)
-  local usage = state.stream_processor.get_usage(generation_id)
-  local tool_calls = state.stream_processor.get_tool_calls(generation_id)
-
-  -- 检查是否有未处理的工具调用（思考模型可能在流式结束时才完成工具调用累积）
-  if tool_calls and #tool_calls > 0 then
-    -- DeepSeek Thinking Mode: 保存 reasoning_content 到活跃生成中
-    -- 以便在 handle_tool_result 中回传给后续请求
-    if reasoning_text and reasoning_text ~= "" then
-      local gen = state.active_generations[generation_id]
-      if gen then
-        gen.last_reasoning_content = reasoning_text
-      end
+  if #tool_calls > 0 then
+    local gen = state.active_generations[generation_id]
+    if reasoning_text ~= "" and gen then
+      gen.last_reasoning_content = reasoning_text
     end
 
-    -- 检查工具是否启用
     local tools_enabled = true
-    if state.full_config then
-      if state.full_config.tools and state.full_config.tools.enabled ~= nil then
-        tools_enabled = state.full_config.tools.enabled
-      elseif state.full_config.ai and state.full_config.ai.tools_enabled ~= nil then
-        tools_enabled = state.full_config.ai.tools_enabled
-      end
+    if state.full_config.tools and state.full_config.tools.enabled ~= nil then
+      tools_enabled = state.full_config.tools.enabled
+    elseif state.full_config.ai and state.full_config.ai.tools_enabled ~= nil then
+      tools_enabled = state.full_config.ai.tools_enabled
     end
 
     if tools_enabled then
-      -- 手动深拷贝 tool_calls，避免引用问题
-      local tool_calls_copy = {}
+      local tc_copy = {}
       for i, tc in ipairs(tool_calls) do
-        tool_calls_copy[i] = {
+        tc_copy[i] = {
           id = tc.id,
           type = tc.type,
-          ["function"] = {
-            name = tc["function"].name,
-            arguments = tc["function"].arguments,
-          },
+          ["function"] = { name = tc["function"].name, arguments = tc["function"].arguments },
         }
       end
-      -- 使用 vim.schedule 确保在 jobstart 回调中安全执行
-      -- execute_tool_loop 内部会触发 nvim_exec_autocmds 事件
-      -- 注意：execute_tool_loop 是用 function M.execute_tool_loop(params) 定义的，没有 self 参数
       vim.schedule(function()
-        local ok, tool_results = pcall(state.tool_orchestrator.execute_tool_loop, {
+        local ok, results = pcall(tool_orchestrator.execute_tool_loop, {
           generation_id = generation_id,
-          tool_calls = tool_calls_copy,
-          session_id = session_id,
-          window_id = window_id,
+          tool_calls = tc_copy,
+          session_id = processor.session_id,
+          window_id = processor.window_id,
           options = params.options or {},
         })
-
         if not ok then
-          -- 工具执行崩溃，记录错误并触发 STREAM_COMPLETED 完成生成
-          logger.error(
-            string.format(
-              "Tool execution crashed in stream end for generation %s: %s",
-              generation_id,
-              tostring(tool_results)
-            )
-          )
-          state.stream_processor.end_stream(generation_id)
+          logger.error("Tool execution crashed: " .. tostring(results))
           vim.api.nvim_exec_autocmds("User", {
             pattern = event_constants.STREAM_COMPLETED,
             data = {
@@ -727,27 +762,21 @@ function M._handle_stream_end(generation_id, params)
               full_response = full_response,
               reasoning_text = reasoning_text,
               usage = usage,
-              session_id = session_id,
-              window_id = window_id,
+              session_id = processor.session_id,
+              window_id = processor.window_id,
             },
           })
-        elseif tool_results and #tool_results > 0 then
-          -- 清理流式处理器（工具结果会触发新一轮生成，不需要触发 STREAM_COMPLETED）
-          state.stream_processor.end_stream(generation_id)
-
-          -- 触发工具结果接收事件
+        elseif results and #results > 0 then
           vim.api.nvim_exec_autocmds("User", {
             pattern = event_constants.TOOL_RESULT_RECEIVED,
             data = {
               generation_id = generation_id,
-              tool_results = tool_results,
-              session_id = session_id,
-              window_id = window_id,
+              tool_results = results,
+              session_id = processor.session_id,
+              window_id = processor.window_id,
             },
           })
         else
-          -- 工具执行无结果，触发 STREAM_COMPLETED 完成生成
-          state.stream_processor.end_stream(generation_id)
           vim.api.nvim_exec_autocmds("User", {
             pattern = event_constants.STREAM_COMPLETED,
             data = {
@@ -755,22 +784,17 @@ function M._handle_stream_end(generation_id, params)
               full_response = full_response,
               reasoning_text = reasoning_text,
               usage = usage,
-              session_id = session_id,
-              window_id = window_id,
+              session_id = processor.session_id,
+              window_id = processor.window_id,
             },
           })
         end
       end)
-      return -- 由 vim.schedule 中的逻辑决定后续流程
+      return
     end
   end
 
-  -- 清理流式处理器
-  state.stream_processor.end_stream(generation_id)
-
-  -- 使用 vim.schedule 确保 nvim_exec_autocmds 在 jobstart 回调中安全执行
   vim.schedule(function()
-    -- 触发流式完成事件（由 handle_stream_completed 统一处理 _finalize_generation）
     vim.api.nvim_exec_autocmds("User", {
       pattern = event_constants.STREAM_COMPLETED,
       data = {
@@ -778,96 +802,18 @@ function M._handle_stream_end(generation_id, params)
         full_response = full_response,
         reasoning_text = reasoning_text,
         usage = usage,
-        session_id = session_id,
-        window_id = window_id,
+        session_id = processor.session_id,
+        window_id = processor.window_id,
       },
     })
   end)
 end
 
---- 完成生成（通用结束处理）
---- @param generation_id string 生成ID
---- @param response_text string 响应文本
---- @param params table 参数
-function M._finalize_generation(generation_id, response_text, params)
-  local session_id = params.session_id
-  local window_id = params.window_id
-  local generation = state.active_generations[generation_id]
-
-  if not generation then
-    return
-  end
-
-  local messages = generation.messages
-
-  -- 添加助手响应到消息历史
-  -- DeepSeek Thinking Mode: 如果有 reasoning_content，必须保留在消息中
-  -- 当有工具调用时，后续请求必须完整回传 reasoning_content
-  local assistant_msg = {
-    role = "assistant",
-    content = response_text or "",
-    timestamp = os.time(),
-    window_id = window_id,
-  }
-
-  -- 如果有 reasoning_content，附加到消息中以便工具调用上下文链
-  if params.reasoning_text and params.reasoning_text ~= "" then
-    assistant_msg.reasoning_content = params.reasoning_text
-  end
-
-  table.insert(messages, assistant_msg)
-
-  local usage = params.usage or {}
-
-  -- 触发生成完成事件
-  vim.api.nvim_exec_autocmds("User", {
-    pattern = event_constants.GENERATION_COMPLETED,
-    data = {
-      generation_id = generation_id,
-      response = response_text or "",
-      reasoning_text = params.reasoning_text or "",
-      usage = usage,
-      session_id = session_id,
-      window_id = window_id,
-      duration = os.time() - generation.start_time,
-    },
-  })
-
-  -- 清理活跃生成
-  state.active_generations[generation_id] = nil
-  state.is_generating = false
-  state.current_generation_id = nil
-
-  -- logger.info(string.format(
-  --   "Generation completed: id=%s, duration=%ds",
-  --   generation_id, os.time() - generation.start_time
-  -- ))
-
-  -- 保存会话
-  if
-    state.session_manager
-    and session_id
-    and state.session_manager.get_session
-    and state.session_manager.save_session
-  then
-    local session = state.session_manager.get_session(session_id)
-    if session then
-      state.session_manager.save_session(session_id)
-    end
-  end
-end
-
---- 处理AI响应（非流式）
---- 从真正的 API 响应中提取内容
---- @param generation_id string 生成ID
---- @param response table API响应
---- @param params table 参数
-function M.handle_ai_response(generation_id, response, params)
+--- 处理 AI 响应（非流式）
+function M._handle_ai_response(generation_id, response, params)
   local session_id = params.session_id
   local window_id = params.window_id
   local options = params.options or {}
-
-  -- 从 API 响应中提取内容
   local response_content = ""
   local reasoning_content = nil
   local tool_calls = {}
@@ -875,18 +821,12 @@ function M.handle_ai_response(generation_id, response, params)
 
   if response.choices and #response.choices > 0 then
     local choice = response.choices[1]
-
-    -- 提取消息内容
     if choice.message then
       if choice.message.content then
         response_content = choice.message.content
       end
-
-      -- 提取思考内容
-      -- 注意：思考模型可能同时返回 reasoning_content 和 tool_calls
       if choice.message.reasoning_content then
         reasoning_content = choice.message.reasoning_content
-        -- 非流式模式：触发 REASONING_CONTENT 事件，让 UI 显示推理内容
         vim.api.nvim_exec_autocmds("User", {
           pattern = event_constants.REASONING_CONTENT,
           data = {
@@ -897,12 +837,8 @@ function M.handle_ai_response(generation_id, response, params)
           },
         })
       end
-
-      -- 提取工具调用
-      -- 思考模型（如 DeepSeek-R1）也可能返回 tool_calls
       if choice.message.tool_calls and #choice.message.tool_calls > 0 then
         tool_calls = choice.message.tool_calls
-
         vim.api.nvim_exec_autocmds("User", {
           pattern = event_constants.TOOL_CALL_DETECTED,
           data = {
@@ -910,67 +846,48 @@ function M.handle_ai_response(generation_id, response, params)
             tool_calls = tool_calls,
             session_id = session_id,
             window_id = window_id,
-            reasoning_content = reasoning_content, -- 传递思考内容，供工具编排器使用
+            reasoning_content = reasoning_content,
           },
         })
       end
     end
   end
 
-  -- 检查工具是否启用（从完整配置中读取）
-  -- 优先检查顶层 tools.enabled，再回退到 ai.tools_enabled
   local tools_enabled = true
-  if state.full_config then
-    if state.full_config.tools and state.full_config.tools.enabled ~= nil then
-      tools_enabled = state.full_config.tools.enabled
-    elseif state.full_config.ai and state.full_config.ai.tools_enabled ~= nil then
-      tools_enabled = state.full_config.ai.tools_enabled
-    end
+  if state.full_config.tools and state.full_config.tools.enabled ~= nil then
+    tools_enabled = state.full_config.tools.enabled
+  elseif state.full_config.ai and state.full_config.ai.tools_enabled ~= nil then
+    tools_enabled = state.full_config.ai.tools_enabled
   end
 
-  -- 如果有工具调用，交给工具编排器处理
   if #tool_calls > 0 and tools_enabled then
-    -- DeepSeek Thinking Mode: 将 reasoning_content 保存到活跃生成中，
-    -- 以便在 handle_tool_result 中回传给后续请求
     if reasoning_content and reasoning_content ~= "" then
       local gen = state.active_generations[generation_id]
       if gen then
         gen.last_reasoning_content = reasoning_content
       end
     end
-
-    local ok, tool_results = pcall(state.tool_orchestrator.execute_tool_loop, {
+    local ok, results = pcall(tool_orchestrator.execute_tool_loop, {
       generation_id = generation_id,
       tool_calls = tool_calls,
       session_id = session_id,
       window_id = window_id,
       options = options,
     })
-
     if not ok then
-      -- 工具执行崩溃，记录错误并继续完成生成
-      logger.error(string.format("Tool execution crashed for generation %s: %s", generation_id, tostring(tool_results)))
-    elseif tool_results and #tool_results > 0 then
-      -- 触发工具结果接收事件
+      logger.error("Tool execution crashed: " .. tostring(results))
+    elseif results and #results > 0 then
       vim.api.nvim_exec_autocmds("User", {
         pattern = event_constants.TOOL_RESULT_RECEIVED,
-        data = {
-          generation_id = generation_id,
-          tool_results = tool_results,
-          session_id = session_id,
-          window_id = window_id,
-        },
+        data = { generation_id = generation_id, tool_results = results, session_id = session_id, window_id = window_id },
       })
       return
     end
   end
 
-  -- 提取 usage 信息
   if response.usage then
     usage = response.usage
   end
-
-  -- 完成生成
   M._finalize_generation(generation_id, response_content, {
     session_id = session_id,
     window_id = window_id,
@@ -979,76 +896,108 @@ function M.handle_ai_response(generation_id, response, params)
   })
 end
 
---- 处理工具执行结果
---- @param data table 事件数据
+--- 完成生成
+function M._finalize_generation(generation_id, response_text, params)
+  local generation = state.active_generations[generation_id]
+  if not generation then
+    return
+  end
+
+  -- 将本次 usage 累积到 accumulated_usage
+  local current_usage = params.usage or {}
+  if current_usage and next(current_usage) then
+    local acc = generation.accumulated_usage or {}
+    acc.prompt_tokens = (acc.prompt_tokens or 0) + (current_usage.prompt_tokens or current_usage.promptTokens or current_usage.input_tokens or current_usage.inputTokens or 0)
+    acc.completion_tokens = (acc.completion_tokens or 0) + (current_usage.completion_tokens or current_usage.completionTokens or current_usage.output_tokens or current_usage.outputTokens or 0)
+    acc.total_tokens = (acc.total_tokens or 0) + (current_usage.total_tokens or current_usage.totalTokens or 0)
+    -- 累积 reasoning_tokens
+    if current_usage.completion_tokens_details and type(current_usage.completion_tokens_details) == "table" then
+      local rt = current_usage.completion_tokens_details.reasoning_tokens or 0
+      if not acc.completion_tokens_details then acc.completion_tokens_details = {} end
+      acc.completion_tokens_details.reasoning_tokens = (acc.completion_tokens_details.reasoning_tokens or 0) + rt
+    end
+    generation.accumulated_usage = acc
+  end
+
+  local messages = generation.messages
+  local assistant_msg =
+    { role = "assistant", content = response_text or "", timestamp = os.time(), window_id = params.window_id }
+  if params.reasoning_text and params.reasoning_text ~= "" then
+    assistant_msg.reasoning_content = params.reasoning_text
+  end
+  table.insert(messages, assistant_msg)
+
+  vim.api.nvim_exec_autocmds("User", {
+    pattern = event_constants.GENERATION_COMPLETED,
+    data = {
+      generation_id = generation_id,
+      response = response_text or "",
+      reasoning_text = params.reasoning_text or "",
+      usage = generation.accumulated_usage or params.usage or {},
+      session_id = params.session_id,
+      window_id = params.window_id,
+      duration = os.time() - generation.start_time,
+    },
+  })
+
+  state.active_generations[generation_id] = nil
+  state.is_generating = false
+  state.current_generation_id = nil
+
+  if state.session_manager and params.session_id and state.session_manager.get_session then
+    local session = state.session_manager.get_session(params.session_id)
+    if session and state.session_manager._save_sessions then
+      state.session_manager._save_sessions()
+    end
+  end
+end
+
+--- 处理工具结果
 function M.handle_tool_result(data)
   local generation_id = data.generation_id
   local tool_results = data.tool_results
   local session_id = data.session_id
   local window_id = data.window_id
 
-  if not state.active_generations[generation_id] then
-    logger.warn(string.format("No active generation found for tool result: %s", generation_id))
+  local generation = state.active_generations[generation_id]
+  if not generation then
     return
   end
 
-  local generation = state.active_generations[generation_id]
   local messages = generation.messages
   local options = generation.options or {}
-
-  -- DeepSeek Thinking Mode: 获取上一轮的 reasoning_content
   local last_reasoning = generation.last_reasoning_content
 
-  -- 添加工具调用结果到消息历史
-  for _, tool_result in ipairs(tool_results or {}) do
-    messages = state.request_builder.add_tool_call_to_history(messages, tool_result.tool_call, tool_result.result)
+  for _, tr in ipairs(tool_results or {}) do
+    messages = add_tool_call_to_history(messages, tr.tool_call, tr.result)
   end
 
-  -- DeepSeek Thinking Mode: 将 reasoning_content 附加到所有带 tool_calls 的 assistant 消息上
-  -- DeepSeek API 要求：在 thinking mode 下，包含 tool_calls 的 assistant 消息必须同时包含 reasoning_content
   if last_reasoning and last_reasoning ~= "" then
-    -- print("[ai_engine] last_reasoning 长度=" .. #last_reasoning .. " 前50字=" .. last_reasoning:sub(1, 50))
     for i = #messages, 1, -1 do
       if messages[i].role == "assistant" and messages[i].tool_calls then
         messages[i].reasoning_content = last_reasoning
-        -- print("[ai_engine] 已将 reasoning_content 附加到消息 #" .. i)
       end
     end
   end
 
-  -- 更新活跃生成的消息
-  -- 过滤掉来自历史记录的旧 tool 消息（没有 tool_call_id），避免它们干扰 API 请求
-  -- 这些消息只是用于显示，不能直接传给 API
-  local filtered_messages = {}
+  local filtered = {}
   for _, msg in ipairs(messages) do
     if msg.role == "tool" and (not msg.tool_call_id or msg.tool_call_id == "") then
-      -- 跳过没有 tool_call_id 的旧 tool 消息（来自历史记录）
-      logger.debug("Filtering out old tool message without tool_call_id")
+      -- skip
     else
-      table.insert(filtered_messages, msg)
+      table.insert(filtered, msg)
     end
   end
-  generation.messages = filtered_messages
+  generation.messages = filtered
 
-  -- 检查是否因 stop_tool_loop 而停止工具循环
-  -- 如果是，在继续请求 AI 之前插入一条 system 提示，要求 AI 对已完成的工作进行总结
-  local stop_requested = state.tool_orchestrator.is_stop_requested()
-  if stop_requested then
-    logger.info("stop_tool_loop 已调用，插入总结提示，要求 AI 对已完成工作进行总结")
-    -- 插入 system 提示，要求 AI 总结已完成的工作
-    table.insert(filtered_messages, {
+  if tool_orchestrator.is_stop_requested() then
+    table.insert(filtered, {
       role = "system",
       content = "工具调用循环已结束。请根据所有工具执行的结果，对已完成的工作进行总结，然后返回最终结果给用户。总结应包括：完成了哪些任务、关键发现或结果、以及后续建议（如有）。",
     })
-    -- 重置 stop_requested 标志，避免后续循环再次触发总结
-    state.tool_orchestrator.reset_stop_requested()
+    tool_orchestrator.reset_stop_requested()
   end
 
-
-
-  -- 继续生成响应（沿用原始模型索引）
-  -- 保持原始 stream 配置，不强制切换非流式
-  -- request_builder 中会检测消息中是否包含 tool 角色，自动处理
   local tool_options = vim.deepcopy(options)
   M.generate_response(messages, {
     session_id = session_id,
@@ -1058,37 +1007,27 @@ function M.handle_tool_result(data)
   })
 end
 
---- 处理流式处理完成
---- @param data table 事件数据
+--- 处理流式完成
 function M.handle_stream_completed(data)
   local generation_id = data.generation_id
-  local full_response = data.full_response
-  local session_id = data.session_id
-  local window_id = data.window_id
-
   if not state.active_generations[generation_id] then
-    logger.warn(string.format("No active generation found for stream completion: %s", generation_id))
     return
   end
-  -- 使用统一的结束处理（传入 usage，避免被 _handle_stream_end 中的第二次调用覆盖）
-  M._finalize_generation(generation_id, full_response, {
-    session_id = session_id,
-    window_id = window_id,
+  M._finalize_generation(generation_id, data.full_response, {
+    session_id = data.session_id,
+    window_id = data.window_id,
     reasoning_text = data.reasoning_text,
     usage = data.usage or {},
   })
 end
 
 --- 处理生成错误
---- @param generation_id string 生成ID
---- @param error_msg string 错误信息
 function M.handle_generation_error(generation_id, error_msg)
   local generation = state.active_generations[generation_id]
   if not generation then
     return
   end
 
-  -- 触发生成错误事件
   vim.api.nvim_exec_autocmds("User", {
     pattern = event_constants.GENERATION_ERROR,
     data = {
@@ -1099,336 +1038,132 @@ function M.handle_generation_error(generation_id, error_msg)
     },
   })
 
-  -- 清理活跃生成
   state.active_generations[generation_id] = nil
   state.is_generating = false
   state.current_generation_id = nil
 
-  -- 生成出错时触发自动保存
   local hm_ok, hm = pcall(require, "NeoAI.core.history_manager")
   if hm_ok and hm and hm._save then
     hm._save()
   end
-
-  -- logger.error(string.format("Generation error: id=%s, error=%s", generation_id, error_msg))
 end
 
---- 取消当前正在进行的生成任务
+--- 取消生成
 function M.cancel_generation()
   if not state.is_generating then
     return
   end
-
   local generation_id = state.current_generation_id
   local generation = state.active_generations[generation_id]
 
   if generation then
-    -- 取消 HTTP 请求
-    state.http_client.cancel_all_requests()
-
-    -- 清理流式处理器
-    state.stream_processor.end_stream(generation_id)
-
-    -- 触发取消事件
+    http_client.cancel_all_requests()
     vim.api.nvim_exec_autocmds("User", {
       pattern = event_constants.GENERATION_CANCELLED,
-      data = {
-        generation_id = generation_id,
-        session_id = generation.session_id,
-        window_id = generation.window_id,
-      },
+      data = { generation_id = generation_id, session_id = generation.session_id, window_id = generation.window_id },
     })
-
-    -- 清理活跃生成
     if generation_id then
       state.active_generations[generation_id] = nil
     end
   end
 
-  -- 清理生成状态
   state.is_generating = false
   state.current_generation_id = nil
 
-  -- 取消生成时触发自动保存
   local hm_ok, hm = pcall(require, "NeoAI.core.history_manager")
   if hm_ok and hm and hm._save then
     hm._save()
   end
-
-  -- logger.info(string.format("Generation cancelled: id=%s", generation_id or "unknown"))
 end
 
---- 设置引擎可用的工具函数
---- @param tools table 工具函数表
+-- ========== 工具管理 ==========
+
 function M.set_tools(tools)
-  if not tools then
-    state.tools = {}
-    state.request_builder.set_tools({})
-    state.tool_orchestrator.set_tools({})
-    return
+  state.tools = tools or {}
+  state.tool_definitions = {}
+
+  for name, def in pairs(state.tools) do
+    if def.func then
+      local tf = { name = name, description = def.description or ("执行 " .. name .. " 操作") }
+      local params = def.parameters
+      if params and type(params) == "table" then
+        local has_props = false
+        if params.properties then
+          for _, _ in pairs(params.properties) do
+            has_props = true
+            break
+          end
+        end
+        if has_props then
+          local cp = { type = params.type or "object", properties = params.properties }
+          if params.required and type(params.required) == "table" and #params.required > 0 then
+            cp.required = params.required
+          end
+          tf.parameters = cp
+        end
+      end
+      table.insert(state.tool_definitions, { type = "function", ["function"] = tf })
+    end
   end
 
-  -- 存储工具
-  state.tools = tools
-
-  -- 设置到各个子模块
-  state.request_builder.set_tools(tools)
-  state.tool_orchestrator.set_tools(tools)
-
-  logger.debug(
-    string.format(
-      "AI engine tools set: %d tools available",
-      type(tools) == "table" and (tools[1] and #tools or vim.tbl_count(tools)) or 0
-    )
-  )
+  tool_orchestrator.set_tools(state.tools)
 end
 
---- 处理用户查询（便捷函数）
---- @param query string 用户输入的查询文本
---- @param options table 可选的生成参数
+-- ========== 公共接口 ==========
+
 function M.process_query(query, options)
   if not state.initialized then
     error("AI engine not initialized")
   end
+  state.first_request = true
+  tool_orchestrator.reset_iteration()
 
-  -- 每次新的用户查询开始时重置 first_request，确保 stop_tool_loop 在第一轮被排除
-  state.request_builder.reset_first_request()
-  -- 重置工具迭代计数
-  state.tool_orchestrator.reset_iteration()
-
-  -- 构建消息
-  local messages = {
-    {
-      role = "user",
-      content = query,
-    },
-  }
-
-  -- 触发用户消息发送事件
+  local messages = { { role = "user", content = query } }
   vim.api.nvim_exec_autocmds("User", {
     pattern = event_constants.USER_MESSAGE_SENT,
-    data = {
-      message = messages[1],
-      timestamp = os.time(),
-    },
+    data = { message = messages[1], timestamp = os.time() },
   })
-
-  -- 调用内部生成函数
-  return M.generate_response(messages, {
-    options = options,
-  })
+  return M.generate_response(messages, { options = options })
 end
 
---- 获取引擎的当前状态
---- @return table 返回包含状态信息的表
 function M.get_status()
   return {
     initialized = state.initialized,
     is_generating = state.is_generating,
     current_generation_id = state.current_generation_id,
     active_generations_count = vim.tbl_count(state.active_generations),
-    tools_available = state.tools and (state.tools[1] and #state.tools > 0 or vim.tbl_count(state.tools) > 0),
-    submodules = {
-      request_builder = state.request_builder.get_status and state.request_builder.get_status()
-        or { initialized = true },
-      response_builder = state.response_builder.get_state and state.response_builder.get_state()
-        or { initialized = true },
-      reasoning_manager = state.reasoning_manager.get_reasoning_state and state.reasoning_manager.get_reasoning_state()
-        or { active = false },
-      tool_orchestrator = {
-        current_iteration = state.tool_orchestrator.get_current_iteration
-            and state.tool_orchestrator.get_current_iteration()
-          or 0,
-        tools_count = state.tools and (state.tools[1] and #state.tools or vim.tbl_count(state.tools)) or 0,
-      },
-      http_client = state.http_client.get_state and state.http_client.get_state() or { initialized = false },
-    },
+    tools_available = next(state.tools) ~= nil,
+    tool_orchestrator = { current_iteration = tool_orchestrator.get_current_iteration() },
+    http_client = http_client.get_state(),
   }
 end
 
---- 清理事件监听器
 function M.cleanup_event_listeners()
-  for name, id in pairs(state.event_listeners) do
+  for _, id in pairs(state.event_listeners) do
     if id then
-      vim.api.nvim_del_autocmd(id)
+      pcall(vim.api.nvim_del_autocmd, id)
     end
   end
   state.event_listeners = {}
-  logger.debug("Event listeners cleaned up")
 end
 
---- 关闭 AI 引擎
 function M.shutdown()
   if not state.initialized then
     return
   end
-
-  -- 取消所有活跃的生成
   if state.is_generating then
     M.cancel_generation()
   end
-
-  -- 关闭 HTTP 客户端
-  state.http_client.shutdown()
-
-  -- 关闭流式处理器
-  state.stream_processor.shutdown()
-
-  -- 清理事件监听器
+  http_client.shutdown()
   M.cleanup_event_listeners()
-
-  -- 清理活跃生成
   state.active_generations = {}
-
-  -- 重置状态
   state.initialized = false
   state.is_generating = false
   state.current_generation_id = nil
-
-  logger.info("AI engine shutdown")
 end
 
--- ========== 子模块功能接口 ==========
+-- ========== 自动命名会话 ==========
 
---- 请求构建器接口
-function M.build_request(params)
-  return state.request_builder.build_request(params)
-end
-
-function M.format_messages(messages)
-  return state.request_builder.format_messages(messages)
-end
-
-function M.build_tool_call_message(tool_name, arguments, tool_call_id)
-  return state.request_builder.build_tool_call_message(tool_name, arguments, tool_call_id)
-end
-
-function M.build_tool_result_message(tool_call_id, result, tool_name)
-  return state.request_builder.build_tool_result_message(tool_call_id, result, tool_name)
-end
-
-function M.estimate_request_tokens(request)
-  return state.request_builder.estimate_request_tokens(request)
-end
-
---- 响应构建器接口
-function M.build_messages(history, query, options)
-  return state.response_builder.build_messages(history, query, options)
-end
-
-function M.format_tool_result(result)
-  return state.response_builder.format_tool_result(result)
-end
-
-function M.create_summary(messages, max_length)
-  return state.response_builder.create_summary(messages, max_length)
-end
-
-function M.compact_context(messages, max_tokens)
-  return state.response_builder.compact_context(messages, max_tokens)
-end
-
-function M.estimate_tokens(text)
-  return state.response_builder.estimate_tokens(text)
-end
-
-function M.estimate_message_tokens(messages)
-  return state.response_builder.estimate_message_tokens(messages)
-end
-
---- 思考管理器接口
-function M.start_reasoning()
-  return state.reasoning_manager.start_reasoning()
-end
-
-function M.append_reasoning(content)
-  return state.reasoning_manager.append_reasoning(content)
-end
-
-function M.finish_reasoning()
-  return state.reasoning_manager.finish_reasoning()
-end
-
-function M.get_reasoning()
-  return state.reasoning_manager.get_reasoning()
-end
-
-function M.get_reasoning_text()
-  return state.reasoning_manager.get_reasoning_text()
-end
-
-function M.clear_reasoning()
-  return state.reasoning_manager.clear_reasoning()
-end
-
-function M.is_reasoning_active()
-  return state.reasoning_manager.is_reasoning_active()
-end
-
-function M.get_reasoning_summary(max_length)
-  return state.reasoning_manager.get_reasoning_summary(max_length)
-end
-
-function M.format_reasoning(reasoning_text_or_include_timestamps, include_timestamps)
-  return state.reasoning_manager.format_reasoning(reasoning_text_or_include_timestamps, include_timestamps)
-end
-
---- 工具编排器接口
-function M.execute_tool_loop(messages)
-  return state.tool_orchestrator.execute_tool_loop(messages)
-end
-
-function M.execute_tools(messages_or_tool_calls)
-  return state.tool_orchestrator.execute_tools(messages_or_tool_calls)
-end
-
-function M.select_tools(query, available_tools)
-  return state.tool_orchestrator.select_tools(query, available_tools)
-end
-
-function M.merge_results(results)
-  return state.tool_orchestrator.merge_results(results)
-end
-
-function M.validate_tool_use(tool_call)
-  return state.tool_orchestrator.validate_tool_use(tool_call)
-end
-
-function M.extract_tool_calls(response)
-  return state.tool_orchestrator.extract_tool_calls(response)
-end
-
-function M.execute_tool(tool_call)
-  return state.tool_orchestrator.execute_tool(tool_call)
-end
-
-function M.build_context(tool_results)
-  return state.tool_orchestrator.build_context(tool_results)
-end
-
-function M.should_continue(tool_results)
-  return state.tool_orchestrator.should_continue(tool_results)
-end
-
-function M.get_current_iteration()
-  return state.tool_orchestrator.get_current_iteration()
-end
-
-function M.get_tools()
-  return state.tool_orchestrator.get_tools()
-end
-
---- 流式处理器接口
-function M.process_chunk(chunk)
-  return state.stream_processor.process_chunk(chunk)
-end
-
---- 自动命名会话
---- 根据会话的用户消息内容，使用 AI 生成简短有意义的会话名称
---- 使用 http_client.send_request 替代直接 curl 调用
---- @param session_id string 会话ID
---- @param user_msg string 用户消息内容
---- @param callback function|nil 命名完成后的回调 (success: boolean, name_or_error: string)
 function M.auto_name_session(session_id, user_msg, callback)
   if not state.initialized then
     if callback then
@@ -1436,7 +1171,6 @@ function M.auto_name_session(session_id, user_msg, callback)
     end
     return
   end
-
   if not user_msg or user_msg == "" then
     if callback then
       callback(false, "无用户消息")
@@ -1444,50 +1178,42 @@ function M.auto_name_session(session_id, user_msg, callback)
     return
   end
 
-  -- 截取前 200 个字符作为命名依据
   local naming_text = user_msg:sub(1, 200)
-
-  -- 异步调用 AI 进行命名
   vim.schedule(function()
-    -- 获取 naming 场景配置
-    local naming_preset = resolve_scenario_config("naming")
-    if not naming_preset or not naming_preset.base_url or not naming_preset.api_key then
-      -- 回退到 chat 场景
-      naming_preset = resolve_scenario_config("chat")
+    local preset = resolve_scenario_config("naming")
+    if not preset or not preset.base_url or not preset.api_key then
+      preset = resolve_scenario_config("chat")
     end
-    if not naming_preset or not naming_preset.base_url or not naming_preset.api_key then
+    if not preset or not preset.base_url or not preset.api_key then
       if callback then
         callback(false, "未配置 AI 提供商")
       end
       return
     end
 
-    -- 构建命名请求
-    local system_prompt =
-      "你是一个会话命名助手。根据用户的第一条消息，生成一个简短（不超过20个字符）且有意义的会话名称。只返回名称本身，不要加引号、标点或解释。"
-    local messages = {
-      { role = "system", content = system_prompt },
-      { role = "user", content = "请为以下对话生成一个简短的名称：" .. naming_text },
-    }
-
     local request = {
-      model = naming_preset.model_name or naming_preset.model or "",
-      messages = messages,
+      model = preset.model_name or preset.model or "",
+      messages = {
+        {
+          role = "system",
+          content = "你是一个会话命名助手。根据用户的第一条消息，生成一个简短（不超过20个字符）且有意义的会话名称。只返回名称本身，不要加引号、标点或解释。",
+        },
+        { role = "user", content = "请为以下对话生成一个简短的名称：" .. naming_text },
+      },
       temperature = 0.3,
       max_tokens = 50,
       stream = false,
     }
 
-    -- 使用 http_client.send_request 发送请求
-    local generation_id = "naming_" .. session_id .. "_" .. tostring(os.time())
-    local response, err = state.http_client.send_request({
+    local gid = "naming_" .. session_id .. "_" .. os.time()
+    local response, err = http_client.send_request({
       request = request,
-      generation_id = generation_id,
-      base_url = naming_preset.base_url,
-      api_key = naming_preset.api_key,
-      timeout = naming_preset.timeout or 10000,
-      api_type = naming_preset.api_type or "openai",
-      provider_config = naming_preset,
+      generation_id = gid,
+      base_url = preset.base_url,
+      api_key = preset.api_key,
+      timeout = preset.timeout or 10000,
+      api_type = preset.api_type or "openai",
+      provider_config = preset,
     })
 
     if err then
@@ -1496,7 +1222,6 @@ function M.auto_name_session(session_id, user_msg, callback)
       end
       return
     end
-
     if not response or not response.choices or #response.choices == 0 then
       if callback then
         callback(false, "命名响应无效")
@@ -1506,32 +1231,118 @@ function M.auto_name_session(session_id, user_msg, callback)
 
     local msg = response.choices[1].message
     local name = msg.content or ""
-    -- 如果 content 为空但 reasoning_content 有值（推理模型），使用 reasoning_content
     if name == "" and msg.reasoning_content then
       name = msg.reasoning_content
     end
-    -- 清理名称：去除首尾空白、引号、标点
     name = name:gsub("^[%s\"'「『]+(.-)[%s\"'」』]+$", "%1")
     name = name:gsub("^%s*(.-)%s*$", "%1")
     name = name:gsub("[。，！？、；：]$", "")
-
-    -- 限制长度
     if #name > 30 then
       name = name:sub(1, 30) .. "…"
     end
-
     if name == "" then
       if callback then
         callback(false, "生成的名称无效")
       end
       return
     end
-
     if callback then
       callback(true, name)
     end
   end)
 end
 
---- 导出模块
+-- ========== 兼容接口 ==========
+
+function M.build_request(params)
+  return build_request(params)
+end
+function M.format_messages(msgs)
+  return format_messages(msgs)
+end
+function M.build_tool_result_message(id, r, n)
+  return build_tool_result_message(id, r, n)
+end
+function M.add_tool_call_to_history(msgs, tc, tr)
+  return add_tool_call_to_history(msgs, tc, tr)
+end
+function M.reset_first_request()
+  state.first_request = true
+end
+
+function M.estimate_tokens(text)
+  if not text or text == "" then
+    return 0
+  end
+  return math.ceil(#text / 4)
+end
+
+function M.estimate_message_tokens(messages)
+  if not messages then
+    return 0
+  end
+  local total = 0
+  for _, msg in ipairs(messages) do
+    total = total + 3
+    if msg.content then
+      total = total + M.estimate_tokens(msg.content)
+    end
+    if msg.role then
+      total = total + M.estimate_tokens(msg.role)
+    end
+    if msg.name then
+      total = total + M.estimate_tokens(msg.name)
+    end
+  end
+  return total
+end
+
+function M.estimate_request_tokens(request)
+  if not request then
+    return 0
+  end
+  local total = 0
+  if request.messages then
+    for _, msg in ipairs(request.messages) do
+      if msg.content then
+        if type(msg.content) == "string" then
+          local cc = 0
+          for _ in msg.content:gmatch("[\228-\233][\128-\191][\128-\191]") do
+            cc = cc + 1
+          end
+          local ec = #msg.content - cc * 3
+          total = total + math.ceil(cc * 1.5) + math.ceil(ec / 4)
+        elseif type(msg.content) == "table" then
+          local ok, s = pcall(vim.json.encode, msg.content)
+          total = total + (ok and math.ceil(#s / 4) or 100)
+        end
+      end
+    end
+  end
+  if request.tools then
+    for _, t in ipairs(request.tools) do
+      local ok, s = pcall(vim.json.encode, t)
+      total = total + (ok and math.ceil(#s / 4) or 50)
+    end
+  end
+  return total
+end
+
+-- 工具编排器接口转发
+function M.execute_tool_loop(params)
+  return tool_orchestrator.execute_tool_loop(params)
+end
+function M.execute_tools(tc)
+  return tool_orchestrator.execute_tools(tc)
+end
+function M.execute_tool(params)
+  return tool_orchestrator.execute_tool(params)
+end
+function M.get_current_iteration()
+  return tool_orchestrator.get_current_iteration()
+end
+function M.get_tools()
+  return tool_orchestrator.get_tools()
+end
+
 return M

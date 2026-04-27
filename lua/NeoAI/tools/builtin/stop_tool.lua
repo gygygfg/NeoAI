@@ -24,7 +24,7 @@ end
 
 M.stop_tool_loop = define_tool({
   name = "stop_tool_loop",
-  description = "停止工具调用循环。当 AI 认为当前任务已经完成、不再需要继续调用工具时，调用此工具来结束工具调用循环。调用后 AI 将返回最终结果给用户。",
+  description = "停止工具调用循环。当你认为当前任务已经完成、不再需要继续调用工具时，调用此工具来结束工具调用循环。",
   func = _stop_tool_loop,
   parameters = {
     type = "object",
