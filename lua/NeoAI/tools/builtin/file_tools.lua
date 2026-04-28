@@ -152,7 +152,8 @@ local function _read_file(args, on_success, on_error)
     return (not f.start or f.start == 1) and (not f["end"] or f["end"] == -1)
   end
 
-  -- 从语法树节点中提取顶层结构（class、function、struct 等），返回结构概览文本
+  -- 从语法树节点中提取文件结构概览（支持嵌套层级显示）
+  -- 注意：文件过长提示已在 check_done 中统一处理，此处不再重复
   local function build_structure_overview(filepath, tree_result)
     local overview_lines = {}
     table.insert(
@@ -161,7 +162,7 @@ local function _read_file(args, on_success, on_error)
     )
     table.insert(overview_lines, "=" .. string.rep("=", 60))
 
-    -- 需要提取的顶层结构节点类型
+    -- 需要提取的结构节点类型映射
     local structure_types = {
       function_definition = "function",
       method_definition = "method",
@@ -171,50 +172,64 @@ local function _read_file(args, on_success, on_error)
       interface_declaration = "interface",
       enum_declaration = "enum",
       module_definition = "module",
-      table_constructor = "table",
-      assignment_statement = "assignment",
-      variable_declaration = "variable",
     }
 
+    -- 从节点文本中提取有意义的名称
+    local function extract_name(node)
+      local text = node.text:match("^[^\n]+") or node.text
+      if node.type == "function_definition" or node.type == "method_definition" then
+        -- Python: def name(...):
+        local py_name = text:match("def%s+([%w_]+)%s*%(")
+        if py_name then return py_name end
+        -- Lua: function name(...)
+        local lua_name = text:match("function%s+([%w_.:]+)")
+        if lua_name then return lua_name end
+        -- JS/TS: function name(...) / name = function(...)
+        local js_name = text:match("function%s+([%w_]+)")
+        if js_name then return js_name end
+        local js_arrow = text:match("([%w_]+)%s*=%s*function")
+        if js_arrow then return js_arrow end
+        local js_arrow2 = text:match("([%w_]+)%s*=%s*%(")
+        if js_arrow2 then return js_arrow2 end
+      elseif node.type == "class_definition" or node.type == "class_declaration" then
+        -- Python: class Name(...):
+        local py_class = text:match("class%s+([%w_]+)")
+        if py_class then return py_class end
+        -- JS/TS: class Name {...}
+        local js_class = text:match("class%s+([%w_]+)")
+        if js_class then return js_class end
+        -- Lua: ClassName = {}
+        local lua_class = text:match("([%w_]+)%s*=%s*")
+        if lua_class then return lua_class end
+      end
+      return text
+    end
+
+    -- 按深度层级过滤并排序节点
+    -- 只保留深度 <= 4 的结构节点（顶层 + 两层嵌套 + 三层嵌套）
     local structures = {}
     for _, node in ipairs(tree_result.nodes) do
       local label = structure_types[node.type]
-      if label and node.depth <= 2 then
-        -- 提取名称：取文本的第一行或完整文本
-        local name = node.text:match("^[^\n]+") or node.text
-        -- 对 function/class 等，尝试提取更精确的名称
-        if node.type == "function_definition" or node.type == "method_definition" then
-          local func_name = node.text:match("function%s+([%w_.:]+)")
-          if func_name then
-            name = func_name
-          end
-        elseif node.type == "class_definition" or node.type == "class_declaration" then
-          local class_name = node.text:match("class%s+([%w_]+)")
-          if class_name then
-            name = class_name
-          end
-        elseif node.type == "assignment_statement" then
-          local var_name = node.text:match("([%w_]+)%s*=")
-          if var_name then
-            name = var_name
-          end
-        end
+      if label and node.depth <= 4 then
+        local name = extract_name(node)
         table.insert(structures, {
           label = label,
           name = name,
+          depth = node.depth,
           start_row = node.start_row,
           end_row = node.end_row,
         })
       end
     end
 
+    -- 如果没有找到结构节点，回退到深度 <= 2 的所有命名节点
     if #structures == 0 then
-      -- 没有找到结构节点，使用深度 <= 1 的所有命名节点
       for _, node in ipairs(tree_result.nodes) do
-        if node.depth <= 1 and node.named then
+        if node.depth <= 2 and node.named then
           table.insert(structures, {
             label = node.type,
-            name = node.text:match("^[^\n]+") or node.text,
+            name = (node.text:match("^[^\n]+") or node.text):sub(1, 60),
+            depth = node.depth,
             start_row = node.start_row,
             end_row = node.end_row,
           })
@@ -222,18 +237,18 @@ local function _read_file(args, on_success, on_error)
       end
     end
 
-    for _, s in ipairs(structures) do
-      local line_range = string.format("行 %d-%d", s.start_row + 1, s.end_row + 1)
-      table.insert(overview_lines, string.format("  [%s] %s (%s)", s.label, s.name, line_range))
-    end
+    -- 按深度和起始行排序
+    table.sort(structures, function(a, b)
+      if a.depth ~= b.depth then return a.depth < b.depth end
+      return a.start_row < b.start_row
+    end)
 
-    table.insert(overview_lines, "")
-    table.insert(
-      overview_lines,
-      "⚠️ 文件过长（超过 500 行），未读取完整内容。请使用 files 参数指定 start/end 行范围读取需要的部分。"
-    )
-    table.insert(overview_lines, "示例：")
-    table.insert(overview_lines, [[{ files = { { filepath = "]] .. filepath .. [[", start = 1, end = 100 } } }]])
+    -- 生成带缩进的层级显示
+    for _, s in ipairs(structures) do
+      local indent = string.rep("  ", s.depth)
+      local line_range = string.format("行 %d-%d", s.start_row + 1, s.end_row + 1)
+      table.insert(overview_lines, string.format("%s[%s] %s (%s)", indent, s.label, s.name, line_range))
+    end
 
     return table.concat(overview_lines, "\n")
   end
@@ -243,19 +258,39 @@ local function _read_file(args, on_success, on_error)
   local pending = #files
 
   local warned = false
+  -- 标记是否已生成结构概览（大文件）
+  local has_structure_overview = false
   local function check_done()
     pending = pending - 1
     if pending <= 0 then
       local output = table.concat(results, "\n\n")
-      -- 如果使用了标准参数，附加警告
+      -- 收集所有需要显示的提示信息
+      local notices = {}
+      -- 简化参数警告
       if not warned and args.filepath and type(args.filepath) == "string" then
         warned = true
-        local example = [[{
+        table.insert(notices, "⚠️ 警告：你使用了简化参数格式调用 'read_file'。")
+        table.insert(notices, "虽然操作已执行，但建议使用标准参数格式以确保兼容性。")
+        table.insert(notices, "正确调用示例：")
+        table.insert(notices, [[{
   files = {
     { filepath = "/path/to/file", start = 1, end = -1 }
   }
-}]]
-        output = warn_simple_args("read_file", example) .. "\n\n" .. output
+}]])
+      end
+      -- 文件过长提示（当结果中包含结构概览时附加）
+      if has_structure_overview then
+        if #notices > 0 then
+          table.insert(notices, "")
+        end
+        table.insert(notices, "⚠️ 文件过长（超过 500 行），仅显示文件结构概览。")
+        table.insert(notices, "如需读取完整内容，请使用 files 参数指定 start/end 行范围。")
+        table.insert(notices, "示例：")
+        table.insert(notices, [[{ files = { { filepath = "/path/to/file", start = 1, end = 100 } } }]])
+      end
+      -- 合并提示信息到输出
+      if #notices > 0 then
+        output = table.concat(notices, "\n") .. "\n\n" .. output
       end
       if on_success then
         on_success(output)
@@ -293,6 +328,7 @@ local function _read_file(args, on_success, on_error)
               if tree_result and tree_result.nodes and #tree_result.nodes > 0 then
                 local overview = build_structure_overview(filepath, tree_result)
                 table.insert(results, overview)
+                has_structure_overview = true
               else
                 -- Tree-sitter 解析成功但无节点，回退到完整读取
                 local output_lines = {}

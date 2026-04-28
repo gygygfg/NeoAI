@@ -1572,6 +1572,9 @@ end
 -- 不会阻塞主线程，适合在 vim.schedule 回调中调用
 -- 注意：LSP 协议中，某些请求（如 hover）在没有信息时返回 nil 是正常行为
 -- 超时（回调未被调用）才表示客户端未就绪，此时会返回错误信息
+--
+-- 多客户端处理：当有多个 LSP 客户端时，等待所有客户端响应，
+-- 优先返回非空结果（有内容的），如果都为空则返回第一个结果
 local function lsp_request_async(bufnr, method, params, callback)
   if not bufnr or not method then
     if callback then
@@ -1582,30 +1585,68 @@ local function lsp_request_async(bufnr, method, params, callback)
 
   local done = false
   local timer = vim.uv.new_timer()
+  local responses = {}  -- 收集所有客户端的响应
+  local pending_clients = 0
 
   -- 使用 buf_request 非阻塞发送请求
   local ok, result_or_err = pcall(vim.lsp.buf_request, bufnr, method, params, function(err, result, ctx)
     if done then
       return
     end
-    done = true
 
-    -- 取消超时定时器
-    if timer and not timer:is_closing() then
-      timer:stop()
-      timer:close()
+    -- 收集响应
+    table.insert(responses, { err = err, result = result, ctx = ctx })
+
+    -- 如果有非空结果，立即返回
+    if not err and result ~= nil then
+      if type(result) ~= "table" or #result > 0 then
+        done = true
+        if timer and not timer:is_closing() then
+          timer:stop()
+          timer:close()
+        end
+        if callback then
+          callback(result, nil)
+        end
+        return
+      end
     end
 
-    if err then
-      if callback then
-        callback(nil, tostring(err))
-      end
-    else
-      -- result 可能为 nil（LSP 协议允许，如 hover 无信息时返回 null）
-      -- 直接透传给回调，让调用方自行判断
-      if callback then
-        callback(result, nil)
-      end
+    -- 等待所有客户端响应后再决定
+    -- 注意：buf_request 会为每个客户端调用一次回调
+    -- 我们无法直接知道客户端总数，所以用超时兜底
+    -- 如果已经有响应且等待 500ms 没有新响应，就使用已有结果
+    if #responses == 1 then
+      -- 第一个响应到达，启动短等待让其他客户端有机会响应
+      vim.defer_fn(function()
+        if done then
+          return
+        end
+        done = true
+        if timer and not timer:is_closing() then
+          timer:stop()
+          timer:close()
+        end
+        -- 在所有响应中找非空结果
+        for _, r in ipairs(responses) do
+          if not r.err and r.result ~= nil then
+            if callback then
+              callback(r.result, nil)
+            end
+            return
+          end
+        end
+        -- 都为空，返回第一个结果
+        if #responses > 0 then
+          if callback then
+            callback(responses[1].result, responses[1].err)
+          end
+        else
+          if callback then
+            callback(nil, "所有 LSP 客户端返回空")
+          end
+        end
+      end, 500)
     end
   end)
 
@@ -1620,9 +1661,8 @@ local function lsp_request_async(bufnr, method, params, callback)
     return
   end
 
-  -- 设置超时保护（8秒）
-  -- 超时表示回调未被调用，说明客户端未响应
-  timer:start(8000, 0, function()
+  -- 设置超时保护（15秒，给多客户端更多时间）
+  timer:start(15000, 0, function()
     vim.schedule(function()
       if done then
         return
@@ -1631,8 +1671,23 @@ local function lsp_request_async(bufnr, method, params, callback)
       if not timer:is_closing() then
         timer:close()
       end
-      if callback then
-        callback(nil, "LSP 请求超时（8秒）: " .. method)
+      -- 超时时，在所有已收到的响应中找非空结果
+      for _, r in ipairs(responses) do
+        if not r.err and r.result ~= nil then
+          if callback then
+            callback(r.result, nil)
+          end
+          return
+        end
+      end
+      if #responses > 0 then
+        if callback then
+          callback(responses[1].result, responses[1].err)
+        end
+      else
+        if callback then
+          callback(nil, "LSP 请求超时（15秒）: " .. method)
+        end
       end
     end)
   end)
@@ -2260,9 +2315,158 @@ local function _lsp_document_symbols(args, on_success, on_error)
     end
 
     local retry_count = 0
-    local max_retries = 2
+    local max_retries = 1
+    local request_active = false
+
+    -- 使用 Tree-sitter 直接解析文件结构作为 LSP documentSymbol 的替代
+    -- 当 LSP 返回空结果时，用 Tree-sitter 获取符号列表
+    -- 不依赖 neovim_tree 模块，直接使用 vim.treesitter API
+    local function get_symbols_via_treesitter(filepath, callback)
+      local ok_ts, ts = pcall(require, "vim.treesitter")
+      if not ok_ts then
+        if callback then callback(nil) end
+        return
+      end
+
+      -- 读取文件内容
+      local abs_path = vim.fn.fnamemodify(filepath, ":p")
+      local fd, open_err = vim.uv.fs_open(abs_path, "r", 438)
+      if not fd then
+        if callback then callback(nil) end
+        return
+      end
+      local stat, _ = vim.uv.fs_fstat(fd)
+      if not stat then
+        vim.uv.fs_close(fd)
+        if callback then callback(nil) end
+        return
+      end
+      local content, _ = vim.uv.fs_read(fd, stat.size, 0)
+      vim.uv.fs_close(fd)
+      if not content then
+        if callback then callback(nil) end
+        return
+      end
+
+      -- 推断语言
+      local ext = vim.fn.fnamemodify(abs_path, ":e"):lower()
+      local ext_to_lang = {
+        py = "python", lua = "lua", js = "javascript", ts = "typescript",
+        jsx = "tsx", tsx = "tsx", go = "go", rs = "rust",
+        java = "java", c = "c", cpp = "cpp", rb = "ruby",
+        php = "php", json = "json", yaml = "yaml", yml = "yaml",
+        md = "markdown", sh = "bash", bash = "bash", css = "css",
+        html = "html", vue = "vue", svelte = "svelte", toml = "toml",
+        sql = "sql",
+      }
+      local lang = ext_to_lang[ext]
+      if not lang then
+        if callback then callback(nil) end
+        return
+      end
+
+      -- 检查解析器是否可用
+      local ok_inspect, _ = pcall(ts.language.inspect, lang)
+      if not ok_inspect then
+        if callback then callback(nil) end
+        return
+      end
+
+      -- 解析
+      local ok_parser, parser = pcall(ts.get_string_parser, content, lang)
+      if not ok_parser or not parser then
+        if callback then callback(nil) end
+        return
+      end
+      local ok_trees, trees = pcall(parser.parse, parser)
+      if not ok_trees or not trees or #trees == 0 then
+        if callback then callback(nil) end
+        return
+      end
+
+      local root = trees[1]:root()
+
+      -- 递归遍历节点，提取结构信息
+      local symbols = {}
+      local seen = {}
+
+      -- Python 的节点类型
+      local structure_types = {
+        class_definition = 5,      -- Class
+        function_definition = 12,  -- Function
+      }
+
+      -- 需要跳过的节点类型（注释、字符串等，不包含有效符号）
+      local skip_types = {
+        comment = true,
+        string = true,
+        string_literal = true,
+        line_comment = true,
+        block_comment = true,
+      }
+
+      local function traverse(node, depth)
+        if not node or depth > 6 then
+          return
+        end
+
+        local node_type = node:type()
+
+        -- 跳过注释和字符串节点（及其子节点）
+        if skip_types[node_type] then
+          return
+        end
+
+        local kind = structure_types[node_type]
+
+        if kind then
+          local text = vim.treesitter.get_node_text(node, content)
+          local name = text:match("^[^\n]+") or text
+
+          -- 提取名称
+          if node_type == "function_definition" then
+            local fn = text:match("def%s+([%w_]+)")
+            if fn then name = fn end
+          elseif node_type == "class_definition" then
+            local cls = text:match("class%s+([%w_]+)")
+            if cls then name = cls end
+          end
+
+          -- 只保留能提取到有效名称的符号
+          if name and name ~= "" then
+            local sr, sc, er, ec = node:range()
+            local key = node_type .. ":" .. name .. ":" .. sr
+            if not seen[key] then
+              seen[key] = true
+              table.insert(symbols, {
+                name = name,
+                kind = kind,
+                kind_name = safe_symbol_kind_name(kind),
+                range = {
+                  start = { line = sr, character = sc },
+                  ["end"] = { line = er, character = ec },
+                },
+                depth = depth,
+              })
+            end
+          end
+        end
+
+        for i = 0, node:named_child_count() - 1 do
+          traverse(node:named_child(i), depth + 1)
+        end
+      end
+
+      traverse(root, 0)
+
+      if callback then callback(symbols) end
+    end
 
     local function do_document_symbol_request()
+      if request_active then
+        return
+      end
+      request_active = true
       retry_count = retry_count + 1
 
       lsp_request_async(bufnr, "textDocument/documentSymbol", {
@@ -2278,9 +2482,30 @@ local function _lsp_document_symbols(args, on_success, on_error)
           return
         end
 
-        -- 空结果时重试（LSP 可能尚未完成索引）
+        -- LSP 返回空结果时，使用 Tree-sitter 作为 fallback
         if (not result or (type(result) == "table" and #result == 0)) and retry_count < max_retries then
-          vim.defer_fn(do_document_symbol_request, 1500)
+          -- 异步尝试 Tree-sitter
+          get_symbols_via_treesitter(args.filepath, function(ts_symbols)
+            if ts_symbols and #ts_symbols > 0 then
+              if cleanup then
+                cleanup()
+              end
+              if on_success then
+                on_success({
+                  filepath = args.filepath,
+                  symbol_count = #ts_symbols,
+                  symbols = ts_symbols,
+                  _source = "treesitter",
+                  _note = "LSP 未返回符号，使用 Tree-sitter 语法分析结果。",
+                })
+              end
+              return
+            end
+
+            -- Tree-sitter 也失败，重试 LSP
+            request_active = false
+            vim.defer_fn(do_document_symbol_request, 2000)
+          end)
           return
         end
 
@@ -2289,13 +2514,29 @@ local function _lsp_document_symbols(args, on_success, on_error)
         end
 
         if not result or (type(result) == "table" and #result == 0) then
-          if on_success then
-            on_success({
-              filepath = args.filepath,
-              symbol_count = 0,
-              symbols = {},
-            })
-          end
+          -- 最终 fallback：尝试 Tree-sitter
+          get_symbols_via_treesitter(args.filepath, function(ts_symbols)
+            if ts_symbols and #ts_symbols > 0 then
+              if on_success then
+                on_success({
+                  filepath = args.filepath,
+                  symbol_count = #ts_symbols,
+                  symbols = ts_symbols,
+                  _source = "treesitter",
+                  _note = "LSP 未返回符号，使用 Tree-sitter 语法分析结果。",
+                })
+              end
+            else
+              if on_success then
+                on_success({
+                  filepath = args.filepath,
+                  symbol_count = 0,
+                  symbols = {},
+                  _note = "LSP 和 Tree-sitter 均未找到符号。",
+                })
+              end
+            end
+          end)
           return
         end
 
