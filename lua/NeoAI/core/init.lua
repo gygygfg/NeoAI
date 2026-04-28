@@ -3,7 +3,7 @@ local M = {}
 local logger = require("NeoAI.utils.logger")
 local ai_engine = require("NeoAI.core.ai.ai_engine")
 local history_manager = require("NeoAI.core.history_manager")
-local state_manager = require("NeoAI.core.state")
+local state_manager = require("NeoAI.core.config.state")
 
 local initialized = false
 
@@ -15,9 +15,9 @@ function M.initialize(config)
     return M
   end
 
-  -- 初始化键位配置管理器
-  local keymap_manager = require("NeoAI.core.config.keymap_manager")
-  keymap_manager.initialize(config)
+  -- 初始化配置模块（含键位配置管理器和状态管理器）
+  local config_module = require("NeoAI.core.config")
+  config_module.initialize(config)
 
   -- 初始化 AI 引擎
   ai_engine.initialize({
@@ -27,6 +27,10 @@ function M.initialize(config)
 
   -- 初始化历史管理器（唯一数据源）
   history_manager.initialize({ config = config })
+
+  -- 初始化聊天服务（前后端分离的后端入口）
+  local chat_service = require("NeoAI.core.ai.chat_service")
+  chat_service.initialize({ config = config })
 
   initialized = true
   return M

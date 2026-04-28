@@ -1,7 +1,19 @@
--- Lua文件操作工具模块
--- 提供文件读取、写入、查找、搜索等常用功能
--- 每个工具的定义（名称、描述、参数、实现）集中在一起，方便修改
+-- Lua文件操作工具模块（回调模式）
+-- 所有工具使用回调模式异步执行，不阻塞主线程
+-- 工具函数签名：func(args, on_success, on_error)
 local M = {}
+
+-- 标准参数警告辅助函数
+-- 当模型使用简化参数（如直接传 filepath 字符串）时，返回警告并附上正确调用示例
+local function warn_simple_args(tool_name, example)
+  local msg = string.format(
+    "⚠️ 警告：你使用了简化参数格式调用 '%s'。\n" ..
+    "虽然操作已执行，但建议使用标准参数格式以确保兼容性。\n" ..
+    "正确调用示例：\n%s",
+    tool_name, example
+  )
+  return msg
+end
 
 local define_tool = require("NeoAI.tools.builtin.tool_helpers").define_tool
 
@@ -12,892 +24,940 @@ local function get_file_utils()
 end
 
 -- ============================================================================
--- 工具 read_file - 读取文件内容
+-- vim.uv 异步 I/O 辅助函数（回调模式）
 -- ============================================================================
 
-local function _read_file(args)
+local function uv_read_file(filepath, on_success, on_error)
+  vim.uv.fs_open(filepath, "r", 438, function(open_err, fd)
+    if open_err or not fd then
+      if on_error then on_error(open_err or "无法打开文件") end
+      return
+    end
+    vim.uv.fs_fstat(fd, function(stat_err, stat)
+      if stat_err or not stat then
+        vim.uv.fs_close(fd)
+        if on_error then on_error(stat_err or "无法获取文件信息") end
+        return
+      end
+      vim.uv.fs_read(fd, stat.size, 0, function(read_err, data)
+        vim.uv.fs_close(fd)
+        if read_err or not data then
+          if on_error then on_error(read_err or "无法读取文件") end
+          return
+        end
+        if on_success then on_success(data) end
+      end)
+    end)
+  end)
+end
+
+local function uv_write_file(filepath, content, append, on_success, on_error)
+  local flags = append and "a" or "w"
+  vim.uv.fs_open(filepath, flags, 438, function(open_err, fd)
+    if open_err or not fd then
+      if on_error then on_error(open_err or "无法打开文件") end
+      return
+    end
+    vim.uv.fs_write(fd, content, 0, function(write_err, written)
+      vim.uv.fs_close(fd)
+      if write_err or not written then
+        if on_error then on_error(write_err or "无法写入文件") end
+        return
+      end
+      if on_success then on_success(true) end
+    end)
+  end)
+end
+
+local function uv_exists(filepath, on_success)
+  vim.uv.fs_stat(filepath, function(_, stat)
+    if on_success then on_success(stat ~= nil) end
+  end)
+end
+
+local function uv_delete_file(filepath, on_success, on_error)
+  vim.uv.fs_unlink(filepath, function(err)
+    if err then
+      if on_error then on_error(err or "无法删除文件") end
+      return
+    end
+    if on_success then on_success(true) end
+  end)
+end
+
+local function uv_mkdir_p(filepath, on_success, on_error)
+  vim.uv.fs_mkdir(filepath, 493, true, function(err)
+    if err then
+      if on_error then on_error(err or "无法创建目录") end
+      return
+    end
+    if on_success then on_success(true) end
+  end)
+end
+
+-- ============================================================================
+-- 工具 read_file
+-- ============================================================================
+
+local function _read_file(args, on_success, on_error)
   if not args then
-    return "错误: 需要文件参数"
+    if on_error then on_error("需要文件参数") end
+    return
   end
 
-  -- 支持 files（列表）和 file（单个）两种参数
   local files = args.files or {}
   if args.file and type(args.file) == "table" then
     table.insert(files, args.file)
   end
-
+  -- 支持标准参数：直接传 filepath 字符串
+  if args.filepath and type(args.filepath) == "string" then
+    table.insert(files, { filepath = args.filepath, start = args.start, ["end"] = args.end_line or args["end"] })
+  end
   if #files == 0 then
-    return "错误: 需要文件列表或单个文件参数"
+    if on_error then on_error("需要文件列表或单个文件参数") end
+    return
   end
 
   local fu = get_file_utils()
   local results = {}
+  local pending = #files
+
+  local warned = false
+  local function check_done()
+    pending = pending - 1
+    if pending <= 0 then
+      local output = table.concat(results, "\n\n")
+      -- 如果使用了标准参数，附加警告
+      if not warned and args.filepath and type(args.filepath) == "string" then
+        warned = true
+        local example = [[{
+  files = {
+    { filepath = "/path/to/file", start = 1, end = -1 }
+  }
+}]]
+        output = warn_simple_args("read_file", example) .. "\n\n" .. output
+      end
+      if on_success then on_success(output) end
+    end
+  end
 
   for _, f in ipairs(files) do
     local filepath = f.filepath
     if not filepath then
-      table.insert(results, string.format("=== (未知文件) ===\n错误: 缺少 filepath 字段"))
-      goto continue
-    end
-
-    local content, err
-    if fu then
-      content, err = fu.read_file(filepath)
+      table.insert(results, "=== (未知文件) ===\n错误: 缺少 filepath 字段")
+      check_done()
     else
-      local file, io_err = io.open(filepath, "r")
-      if file then
-        content = file:read("*a")
-        file:close()
+      local function on_content(content)
+        local start_line = f.start or 1
+        local end_line = f["end"] or -1
+        local all_lines = {}
+        for line in content:gmatch("[^\n]+") do
+          table.insert(all_lines, line)
+        end
+        local total_lines = #all_lines
+        if content:sub(-1) == "\n" then
+          total_lines = total_lines + 1
+        end
+        if start_line < 1 then start_line = 1 end
+        if end_line < 0 or end_line > total_lines then end_line = total_lines end
+        if start_line > end_line then
+          table.insert(results, string.format("=== %s ===\n错误: 起始行(%d)大于结束行(%d)", filepath, start_line, end_line))
+          check_done()
+          return
+        end
+        local output_lines = {}
+        for i = start_line, end_line do
+          local line_content = all_lines[i] or ""
+          table.insert(output_lines, string.format("%4d | %s", i, line_content))
+        end
+        local header = string.format("=== %s === (行 %d-%d, 共 %d 行)", filepath, start_line, end_line, total_lines)
+        table.insert(results, header .. "\n" .. table.concat(output_lines, "\n"))
+        check_done()
+      end
+
+      local function on_read_err(err)
+        table.insert(results, string.format("=== %s ===\n错误: %s", filepath, err or "无法读取文件"))
+        check_done()
+      end
+
+      if fu then
+        local content, err = fu.read_file(filepath)
+        if content then on_content(content) else on_read_err(err) end
       else
-        err = io_err or "无法读取文件"
+        uv_read_file(filepath, on_content, on_read_err)
       end
     end
-
-    if not content then
-      table.insert(results, string.format("=== %s ===\n错误: %s", filepath, err or "无法读取文件"))
-      goto continue
-    end
-
-    -- 解析行范围
-    local start_line = f.start or 1
-    local end_line = f["end"] or -1 -- -1 表示读取到末尾
-
-    -- 将内容按行分割
-    local all_lines = {}
-    for line in content:gmatch("[^\n]+") do
-      table.insert(all_lines, line)
-    end
-    -- 处理文件末尾换行符
-    local total_lines = #all_lines
-    if content:sub(-1) == "\n" then
-      total_lines = total_lines + 1
-    end
-
-    -- 规范化行号
-    if start_line < 1 then
-      start_line = 1
-    end
-    if end_line < 0 or end_line > total_lines then
-      end_line = total_lines
-    end
-    if start_line > end_line then
-      table.insert(
-        results,
-        string.format("=== %s ===\n错误: 起始行(%d)大于结束行(%d)", filepath, start_line, end_line)
-      )
-      goto continue
-    end
-
-    -- 提取指定行范围
-    local output_lines = {}
-    for i = start_line, end_line do
-      local line_content = all_lines[i] or ""
-      table.insert(output_lines, string.format("%4d | %s", i, line_content))
-    end
-
-    local header = string.format("=== %s === (行 %d-%d, 共 %d 行)", filepath, start_line, end_line, total_lines)
-    table.insert(results, header .. "\n" .. table.concat(output_lines, "\n"))
-
-    ::continue::
   end
-
-  return table.concat(results, "\n\n")
 end
 
 M.read_file = define_tool({
   name = "read_file",
-  description = "读取一个或多个文件的指定行范围，返回带行号的结果。每个文件可指定 filepath（必填）、start（起始行，默认1）、end（结束行，默认末尾）",
-  func = _read_file,
+  description = "读取一个或多个文件的指定行范围，返回带行号的结果",
+  func = _read_file, async = true,
   parameters = {
     type = "object",
     properties = {
-      files = {
-        type = "array",
-        items = {
-          type = "object",
-          properties = {
-            filepath = { type = "string", description = "文件路径（必填）" },
-            start = { type = "number", description = "起始行号，从1开始，默认1" },
-            ["end"] = { type = "number", description = "结束行号，-1或省略表示读取到末尾" },
-          },
-          required = { "filepath" },
-        },
-        description = "文件参数列表（与 file 二选一）",
-      },
-      file = {
-        type = "object",
-        properties = {
-          filepath = { type = "string", description = "文件路径（必填）" },
-          start = { type = "number", description = "起始行号，从1开始，默认1" },
-          ["end"] = { type = "number", description = "结束行号，-1或省略表示读取到末尾" },
-        },
-        required = { "filepath" },
-        description = "单个文件参数（与 files 二选一）",
-      },
+      files = { type = "array", items = { type = "object", properties = { filepath = { type = "string", description = "文件路径（必填）" }, start = { type = "number", description = "起始行号，从1开始，默认1" }, ["end"] = { type = "number", description = "结束行号，-1或省略表示读取到末尾" } }, required = { "filepath" } }, description = "文件参数列表（与 file 二选一）" },
+      file = { type = "object", properties = { filepath = { type = "string", description = "文件路径（必填）" }, start = { type = "number", description = "起始行号，从1开始，默认1" }, ["end"] = { type = "number", description = "结束行号，-1或省略表示读取到末尾" } }, required = { "filepath" }, description = "单个文件参数（与 files 二选一）" },
+      filepath = { type = "string", description = "（简化参数）文件路径，使用此参数时会自动转换为标准格式并附带警告" },
+      start = { type = "number", description = "（简化参数）起始行号，需配合 filepath 使用" },
+      end_line = { type = "number", description = "（简化参数）结束行号，需配合 filepath 使用" },
     },
-    oneOf = {
-      { required = { "files" } },
-      { required = { "file" } },
-    },
+    oneOf = { { required = { "files" } }, { required = { "file" } }, { required = { "filepath" } } },
   },
   returns = { type = "string", description = "带行号的文件内容" },
-  category = "file",
-  permissions = { read = true },
+  category = "file", permissions = { read = true },
 })
 
 -- ============================================================================
--- 工具2: write_file - 写入文件内容
+-- 工具 write_file
 -- ============================================================================
 
-local function _write_file(args)
+local function _write_file(args, on_success, on_error)
   if not args then
-    return "错误: 需要文件参数"
+    if on_error then on_error("需要文件参数") end
+    return
   end
-
-  -- 支持 files（列表）和 file（单个）两种参数
   local files = args.files or {}
   if args.file and type(args.file) == "table" then
     table.insert(files, args.file)
   end
-
-  if #files == 0 then
-    return "错误: 需要文件列表或单个文件参数"
+  -- 支持标准参数：直接传 filepath 和 content 字符串
+  local used_simple = false
+  if args.filepath and type(args.filepath) == "string" and args.content then
+    table.insert(files, { filepath = args.filepath, content = args.content, append = args.append })
+    used_simple = true
   end
-
+  if #files == 0 then
+    if on_error then on_error("需要文件列表或单个文件参数") end
+    return
+  end
   local fu = get_file_utils()
   local results = {}
-
+  local pending = #files
+  local function check_done()
+    pending = pending - 1
+    if pending <= 0 then
+      if used_simple then
+        local example = [[{
+  files = {
+    { filepath = "/path/to/file", content = "文件内容", append = false }
+  }
+}]]
+        table.insert(results, 1, { _warning = warn_simple_args("write_file", example) })
+      end
+      if on_success then on_success(results) end
+    end
+  end
   for _, f in ipairs(files) do
     local filepath = f.filepath
     local content = f.content
     if not filepath or not content then
-      table.insert(
-        results,
-        { filepath = filepath or "(未知)", success = false, error = "缺少 filepath 或 content 字段" }
-      )
-      goto continue
-    end
-
-    local append = f.append or false
-    local ok
-
-    if fu then
-      local success, _ = fu.write_file(filepath, content, append)
-      ok = success == true
+      table.insert(results, { filepath = filepath or "(未知)", success = false, error = "缺少 filepath 或 content 字段" })
+      check_done()
     else
-      local mode = append and "a" or "w"
-      local file, err = io.open(filepath, mode)
-      if not file then
-        table.insert(results, { filepath = filepath, success = false, error = err or "无法打开文件" })
-        goto continue
+      local append = f.append or false
+      local function on_write_ok()
+        table.insert(results, { filepath = filepath, success = true })
+        check_done()
       end
-      file:write(content)
-      file:close()
-      ok = true
+      local function on_write_err(err)
+        table.insert(results, { filepath = filepath, success = false, error = err or "无法写入文件" })
+        check_done()
+      end
+      if fu then
+        local success, _ = fu.write_file(filepath, content, append)
+        if success == true then on_write_ok() else on_write_err("写入失败") end
+      else
+        uv_write_file(filepath, content, append, on_write_ok, on_write_err)
+      end
     end
-
-    table.insert(results, { filepath = filepath, success = ok })
-
-    ::continue::
   end
-
-  return results
 end
 
 M.write_file = define_tool({
   name = "write_file",
   description = "写入一个或多个文件的内容，支持覆盖和追加模式",
-  func = _write_file,
+  func = _write_file, async = true,
   parameters = {
     type = "object",
     properties = {
-      files = {
-        type = "array",
-        items = {
-          type = "object",
-          properties = {
-            filepath = { type = "string", description = "文件路径（必填）" },
-            content = { type = "string", description = "要写入的内容（必填）" },
-            append = { type = "boolean", description = "是否追加模式，false 为覆盖", default = false },
-          },
-          required = { "filepath", "content" },
-        },
-        description = "文件参数列表（与 file 二选一）",
-      },
-      file = {
-        type = "object",
-        properties = {
-          filepath = { type = "string", description = "文件路径（必填）" },
-          content = { type = "string", description = "要写入的内容（必填）" },
-          append = { type = "boolean", description = "是否追加模式，false 为覆盖", default = false },
-        },
-        required = { "filepath", "content" },
-        description = "单个文件参数（与 files 二选一）",
-      },
+      files = { type = "array", items = { type = "object", properties = { filepath = { type = "string", description = "文件路径（必填）" }, content = { type = "string", description = "要写入的内容（必填）" }, append = { type = "boolean", description = "是否追加模式，false 为覆盖", default = false } }, required = { "filepath", "content" } }, description = "文件参数列表（与 file 二选一）" },
+      file = { type = "object", properties = { filepath = { type = "string", description = "文件路径（必填）" }, content = { type = "string", description = "要写入的内容（必填）" }, append = { type = "boolean", description = "是否追加模式，false 为覆盖", default = false } }, required = { "filepath", "content" }, description = "单个文件参数（与 files 二选一）" },
+      filepath = { type = "string", description = "（简化参数）文件路径，需配合 content 使用，使用时会附带警告" },
+      content = { type = "string", description = "（简化参数）要写入的内容，需配合 filepath 使用" },
+      append = { type = "boolean", description = "（简化参数）是否追加模式", default = false },
     },
-    oneOf = {
-      { required = { "files" } },
-      { required = { "file" } },
-    },
+    oneOf = { { required = { "files" } }, { required = { "file" } }, { required = { "filepath", "content" } } },
   },
-  returns = {
-    type = "array",
-    items = {
-      type = "object",
-      properties = {
-        filepath = { type = "string" },
-        success = { type = "boolean" },
-        error = { type = "string", description = "失败时的错误信息" },
-      },
-    },
-    description = "写入结果列表",
-  },
-  category = "file",
-  permissions = { write = true },
+  returns = { type = "array", items = { type = "object", properties = { filepath = { type = "string" }, success = { type = "boolean" }, error = { type = "string", description = "失败时的错误信息" } } }, description = "写入结果列表" },
+  category = "file", permissions = { write = true },
 })
 
 -- ============================================================================
--- 工具3: list_files - 列出目录中的文件
+-- 工具 list_files
 -- ============================================================================
 
-local function _list_files(args)
-  if not args then
-    return "错误: 需要目录参数"
-  end
+-- 将 glob 模式转换为 Lua 模式匹配
+local function glob_to_lua_pattern(glob)
+  if glob == "*" then return nil end -- nil 表示匹配所有
+  -- 转义特殊字符，再将 * 和 ? 转换为 Lua 模式
+  local p = vim.pesc(glob)
+  p = p:gsub("%%%*", ".*"):gsub("%%%?", ".")
+  return p
+end
 
-  -- 支持 files（列表）和 file（单个）两种参数
+-- 扫描单个目录（非递归），使用 fs_opendir + fs_readdir
+-- fs_scandir_next 的回调在 headless 模式下不触发，所以用 fs_readdir 替代
+local function scan_dir_flat(dir, pattern, all_results, done_callback)
+  vim.uv.fs_opendir(dir, function(opendir_err, dir_handle)
+    if opendir_err or not dir_handle then
+      if done_callback then done_callback() end
+      return
+    end
+
+    local lua_pattern = glob_to_lua_pattern(pattern)
+
+    local function read_all_entries()
+      vim.uv.fs_readdir(dir_handle, function(readdir_err, entries)
+        if readdir_err then
+          vim.uv.fs_closedir(dir_handle)
+          if done_callback then done_callback() end
+          return
+        end
+
+        if not entries then
+          vim.uv.fs_closedir(dir_handle)
+          if done_callback then done_callback() end
+          return
+        end
+
+        for _, entry in ipairs(entries) do
+          if entry.type == "file" then
+            if lua_pattern == nil or entry.name:match(lua_pattern) then
+              table.insert(all_results, dir .. "/" .. entry.name)
+            end
+          end
+        end
+
+        read_all_entries()
+      end)
+    end
+
+    read_all_entries()
+  end)
+end
+
+-- 递归扫描目录（使用 vim.uv.fs_opendir + fs_readdir + fs_closedir）
+-- 返回所有匹配文件的完整路径列表
+local function scan_dir_recursive(dir, pattern, all_results, done_callback)
+  vim.uv.fs_opendir(dir, function(opendir_err, dir_handle)
+    if opendir_err or not dir_handle then
+      if done_callback then done_callback() end
+      return
+    end
+
+    local lua_pattern = glob_to_lua_pattern(pattern)
+    local subdirs = {}
+
+    -- 循环读取所有批次
+    local function read_all_entries()
+      vim.uv.fs_readdir(dir_handle, function(readdir_err, entries)
+        if readdir_err then
+          vim.uv.fs_closedir(dir_handle)
+          if done_callback then done_callback() end
+          return
+        end
+
+        -- entries 为 nil 表示读取完毕
+        if not entries then
+          vim.uv.fs_closedir(dir_handle)
+          -- 处理子目录
+          if #subdirs == 0 then
+            if done_callback then done_callback() end
+            return
+          end
+          local pending_subdirs = #subdirs
+          local subdir_done = function()
+            pending_subdirs = pending_subdirs - 1
+            if pending_subdirs <= 0 then
+              if done_callback then done_callback() end
+            end
+          end
+          for _, subdir in ipairs(subdirs) do
+            scan_dir_recursive(subdir, pattern, all_results, subdir_done)
+          end
+          return
+        end
+
+        -- 处理当前批次
+        for _, entry in ipairs(entries) do
+          local name = entry.name
+          local typ = entry.type
+          local full_path = dir .. "/" .. name
+
+          if typ == "file" then
+            if lua_pattern == nil or name:match(lua_pattern) then
+              table.insert(all_results, full_path)
+            end
+          elseif typ == "directory" then
+            if name ~= "." and name ~= ".." then
+              table.insert(subdirs, full_path)
+            end
+          end
+        end
+
+        -- 继续读取下一批
+        read_all_entries()
+      end)
+    end
+
+    read_all_entries()
+  end)
+end
+
+local function _list_files(args, on_success, on_error)
+  if not args then
+    if on_error then on_error("需要目录参数") end
+    return
+  end
   local file_specs = args.files or {}
   if args.file and type(args.file) == "table" then
     table.insert(file_specs, args.file)
   end
-  if #file_specs == 0 then
-    return "错误: 需要目录列表或单个目录参数"
+  -- 支持标准参数：直接传 dir/pattern/recursive 字符串
+  local used_simple = false
+  if args.dir and type(args.dir) == "string" then
+    table.insert(file_specs, { dir = args.dir, pattern = args.pattern or "*", recursive = args.recursive or false })
+    used_simple = true
   end
-
-  local files = {}
-
+  if #file_specs == 0 then
+    if on_error then on_error("需要目录列表或单个目录参数") end
+    return
+  end
+  local all_files = {}
+  local pending = #file_specs
+  local function check_done()
+    pending = pending - 1
+    if pending <= 0 then
+      if used_simple then
+        local example = [[{
+  dirs = {
+    { dir = "/path/to/dir", pattern = "*.lua", recursive = true }
+  }
+}]]
+        table.insert(all_files, 1, warn_simple_args("list_files", example))
+      end
+      if on_success then on_success(all_files) end
+    end
+  end
   for _, spec in ipairs(file_specs) do
     local dir = spec.dir or "."
     local pattern = spec.pattern or "*"
     local recursive = spec.recursive or false
 
-    -- 使用 vim.fn.readdir 替代 systemlist，非阻塞且更高效
-    -- vim.fn.readdir 返回目录中的文件和子目录列表
-    local ok, entries = pcall(vim.fn.readdir, dir)
-    if ok and entries and #entries > 0 then
-      for _, entry in ipairs(entries) do
-        local full_path = dir .. "/" .. entry
-        -- 检查是否为文件（跳过目录）
-        local is_file = vim.fn.isdirectory(full_path) == 0
-        if is_file then
-          if pattern == "*" or entry:match(vim.pesc(pattern):gsub("%%%*", ".*"):gsub("%%%?", ".")) then
-            table.insert(files, full_path)
-          end
-        elseif recursive then
-          -- 递归处理子目录
-          local sub_results = M.list_files({ file = { dir = full_path, pattern = pattern, recursive = true } })
-          for _, sub_file in ipairs(sub_results) do
-            table.insert(files, sub_file)
-          end
-        end
-      end
+    if recursive then
+      -- 递归模式：使用 scan_dir_recursive
+      scan_dir_recursive(dir, pattern, all_files, check_done)
     else
-      -- 回退：使用 vim.loop.fs_scandir（纯 Lua，非阻塞）
-      local handle = vim.loop.fs_scandir(dir)
-      if handle then
-        while true do
-          local name, type = vim.loop.fs_scandir_next(handle)
-          if not name then
-            break
-          end
-          if type == "file" then
-            if pattern == "*" or name:match(vim.pesc(pattern):gsub("%%%*", ".*"):gsub("%%%?", ".")) then
-              table.insert(files, dir .. "/" .. name)
-            end
-          elseif type == "directory" and recursive then
-            local sub_results =
-              M.list_files({ file = { dir = dir .. "/" .. name, pattern = pattern, recursive = true } })
-            for _, sub_file in ipairs(sub_results) do
-              table.insert(files, sub_file)
-            end
-          end
-        end
-      end
+      -- 非递归模式：使用 fs_opendir + fs_readdir（fs_scandir_next 在 headless 模式下回调不触发）
+      scan_dir_flat(dir, pattern, all_files, check_done)
     end
   end
-
-  return files
 end
 
 M.list_files = define_tool({
   name = "list_files",
   description = "列出一个或多个目录中的文件，支持模式匹配和递归查找",
-  func = _list_files,
+  func = _list_files, async = true,
   parameters = {
     type = "object",
     properties = {
-      dirs = {
-        type = "array",
-        items = {
-          type = "object",
-          properties = {
-            dir = { type = "string", description = "目录路径", default = "." },
-            pattern = { type = "string", description = "文件模式（如 *.txt）", default = "*" },
-            recursive = { type = "boolean", description = "是否递归查找", default = false },
-          },
-        },
-        description = "目录参数列表（与 dir 二选一）",
-      },
-      dir = {
-        type = "object",
-        properties = {
-          dir = { type = "string", description = "目录路径", default = "." },
-          pattern = { type = "string", description = "文件模式（如 *.txt）", default = "*" },
-          recursive = { type = "boolean", description = "是否递归查找", default = false },
-        },
-        description = "单个目录参数（与 dirs 二选一）",
-      },
+      dirs = { type = "array", items = { type = "object", properties = { dir = { type = "string", description = "目录路径", default = "." }, pattern = { type = "string", description = "文件模式（如 *.txt）", default = "*" }, recursive = { type = "boolean", description = "是否递归查找", default = false } } }, description = "目录参数列表（与 dir 二选一）" },
+      dir = { type = "object", properties = { dir = { type = "string", description = "目录路径", default = "." }, pattern = { type = "string", description = "文件模式（如 *.txt）", default = "*" }, recursive = { type = "boolean", description = "是否递归查找", default = false } }, description = "单个目录参数（与 dirs 二选一）" },
+      dir = { type = "string", description = "（简化参数）目录路径，使用时会附带警告" },
+      pattern = { type = "string", description = "（简化参数）文件模式，需配合 dir 使用", default = "*" },
+      recursive = { type = "boolean", description = "（简化参数）是否递归查找", default = false },
     },
-    oneOf = {
-      { required = { "dirs" } },
-      { required = { "dir" } },
-    },
+    oneOf = { { required = { "dirs" } }, { required = { "dir" } } },
   },
   returns = { type = "array", items = { type = "string" }, description = "文件路径列表" },
-  category = "file",
-  permissions = { read = true },
+  category = "file", permissions = { read = true },
 })
 
 -- ============================================================================
--- 工具4: search_files - 搜索文件内容
+-- 工具 search_files
 -- ============================================================================
 
-local function _search_files(args)
+local function _search_files(args, on_success, on_error)
   if not args then
-    return "错误: 需要搜索参数"
+    if on_error then on_error("需要搜索参数") end
+    return
   end
-
-  -- 支持 files（列表）和 file（单个）两种参数
   local file_specs = args.files or {}
   if args.file and type(args.file) == "table" then
     table.insert(file_specs, args.file)
   end
-
+  -- 支持标准参数：直接传 pattern/dir 等字符串
+  local used_simple = false
+  if args.pattern and type(args.pattern) == "string" and not args.files and not args.file then
+    table.insert(file_specs, {
+      dir = args.dir or ".",
+      pattern = args.pattern,
+      file_pattern = args.file_pattern or "*",
+      case_sensitive = args.case_sensitive or false,
+      regex = args.regex or true,
+    })
+    used_simple = true
+  end
   local pattern = args.pattern
   if not pattern and #file_specs == 0 then
-    return "错误: 需要搜索模式或文件参数"
+    if on_error then on_error("需要搜索模式或文件参数") end
+    return
   end
-
-  -- 如果 file_specs 为空，使用默认参数
   if #file_specs == 0 then
     file_specs = { {} }
   end
-
-  local results = {}
-
+  local all_results = {}
+  local pending = #file_specs
+  local function check_done()
+    pending = pending - 1
+    if pending <= 0 then
+      if used_simple then
+        local example = [[{
+  files = {
+    {
+      dir = ".",
+      pattern = "search_text",
+      file_pattern = "*.lua",
+      case_sensitive = false,
+      regex = true
+    }
+  }
+}]]
+        table.insert(all_results, 1, { _warning = warn_simple_args("search_files", example) })
+      end
+      if on_success then on_success(all_results) end
+    end
+  end
   for _, spec in ipairs(file_specs) do
     local dir = spec.dir or "."
     local file_pattern = spec.file_pattern or "*"
     local case_sensitive = spec.case_sensitive
-    if case_sensitive == nil then
-      case_sensitive = false
-    end
+    if case_sensitive == nil then case_sensitive = false end
     local regex = spec.regex
-    if regex == nil then
-      regex = true -- 默认使用正则匹配
-    end
+    if regex == nil then regex = true end
     local search_pattern = spec.pattern or pattern
     if not search_pattern then
-      goto continue
-    end
-
-    local grep_cmd = "grep -n"
-    if not case_sensitive then
-      grep_cmd = grep_cmd .. " -i"
-    end
-    if not regex then
-      grep_cmd = grep_cmd .. " -F" -- 固定字符串模式
-    end
-
-    local escaped_pattern = search_pattern:gsub("'", "'\"'\"'")
-    grep_cmd = grep_cmd .. " -- '" .. escaped_pattern .. "' "
-
-    local find_cmd = 'find "' .. dir .. '" -type f -name "' .. file_pattern .. '" 2>/dev/null'
-    local files_found = vim.fn.systemlist(find_cmd)
-
-    if vim.v.shell_error == 0 then
-      for _, file in ipairs(files_found) do
-        local search_output = vim.fn.systemlist(grep_cmd .. '"' .. file .. '" 2>/dev/null')
-        if vim.v.shell_error == 0 then
-          for _, line in ipairs(search_output) do
-            local line_num, content = line:match("^(%d+):(.+)$")
-            if line_num and content then
-              table.insert(results, { file = file, line = tonumber(line_num), content = content })
-            end
-          end
+      check_done()
+    else
+      local grep_args = { "-n" }
+      if not case_sensitive then table.insert(grep_args, "-i") end
+      if not regex then table.insert(grep_args, "-F") end
+      table.insert(grep_args, "--")
+      table.insert(grep_args, search_pattern)
+      vim.uv.fs_scandir(dir, function(scandir_err, scandir_handle)
+        if scandir_err or not scandir_handle then
+          check_done()
+          return
         end
-      end
+        local files_found = {}
+        local function collect_files()
+          vim.uv.fs_scandir_next(scandir_handle, function(next_err, name, entry_type)
+            if next_err or not name then
+              local grep_pending = #files_found
+              if grep_pending == 0 then
+                check_done()
+                return
+              end
+              for _, file in ipairs(files_found) do
+                local full_cmd_list = { "grep" }
+                for _, arg in ipairs(grep_args) do
+                  table.insert(full_cmd_list, arg)
+                end
+                table.insert(full_cmd_list, file)
+                local stdout_data = {}
+                local handle = vim.uv.spawn("grep", {
+                  args = vim.list_slice(full_cmd_list, 2),
+                  stdio = { nil, nil, nil },
+                }, function(code)
+                  if code == 0 then
+                    local output = table.concat(stdout_data, "")
+                    for line in output:gmatch("[^\n]+") do
+                      local line_num, content = line:match("^(%d+):(.+)$")
+                      if line_num and content then
+                        table.insert(all_results, { file = file, line = tonumber(line_num), content = content })
+                      end
+                    end
+                  end
+                  grep_pending = grep_pending - 1
+                  if grep_pending <= 0 then check_done() end
+                end)
+                if handle then
+                  local stdout = vim.uv.new_pipe()
+                  handle:stdio(1, stdout)
+                  stdout:read_start(function(err, data)
+                    if data then table.insert(stdout_data, data) end
+                  end)
+                else
+                  grep_pending = grep_pending - 1
+                  if grep_pending <= 0 then check_done() end
+                end
+              end
+              return
+            end
+            if entry_type == "file" then
+              if file_pattern == "*" or name:match(vim.pesc(file_pattern):gsub("%%%*", ".*"):gsub("%%%?", ".")) then
+                table.insert(files_found, dir .. "/" .. name)
+              end
+            end
+            collect_files()
+          end)
+        end
+        collect_files()
+      end)
     end
-
-    ::continue::
   end
-
-  return results
 end
 
 M.search_files = define_tool({
   name = "search_files",
-  description = "搜索文件内容，支持正则匹配和固定字符串匹配。可指定多个目录/文件模式进行搜索",
-  func = _search_files,
+  description = "搜索文件内容，支持正则匹配和固定字符串匹配",
+  func = _search_files, async = true,
   parameters = {
     type = "object",
     properties = {
       pattern = { type = "string", description = "搜索模式（当 files 未指定时使用）" },
-      files = {
-        type = "array",
-        items = {
-          type = "object",
-          properties = {
-            dir = { type = "string", description = "搜索目录", default = "." },
-            pattern = { type = "string", description = "搜索模式（正则或固定字符串）" },
-            file_pattern = {
-              type = "string",
-              description = "文件通配符模式（如 *.py, *.lua）",
-              default = "*",
-            },
-            case_sensitive = { type = "boolean", description = "是否区分大小写", default = false },
-            regex = {
-              type = "boolean",
-              description = "是否使用正则匹配，false 则为固定字符串匹配",
-              default = true,
-            },
-          },
-        },
-        description = "搜索参数列表（与 file 二选一）",
-      },
-      file = {
-        type = "object",
-        properties = {
-          dir = { type = "string", description = "搜索目录", default = "." },
-          pattern = { type = "string", description = "搜索模式（正则或固定字符串）" },
-          file_pattern = { type = "string", description = "文件通配符模式（如 *.py, *.lua）", default = "*" },
-          case_sensitive = { type = "boolean", description = "是否区分大小写", default = false },
-          regex = {
-            type = "boolean",
-            description = "是否使用正则匹配，false 则为固定字符串匹配",
-            default = true,
-          },
-        },
-        description = "单个搜索参数（与 files 二选一）",
-      },
+      files = { type = "array", items = { type = "object", properties = { dir = { type = "string", description = "搜索目录", default = "." }, pattern = { type = "string", description = "搜索模式" }, file_pattern = { type = "string", description = "文件通配符模式", default = "*" }, case_sensitive = { type = "boolean", description = "是否区分大小写", default = false }, regex = { type = "boolean", description = "是否使用正则匹配", default = true } } }, description = "搜索参数列表（与 file 二选一）" },
+      file = { type = "object", properties = { dir = { type = "string", description = "搜索目录", default = "." }, pattern = { type = "string", description = "搜索模式" }, file_pattern = { type = "string", description = "文件通配符模式", default = "*" }, case_sensitive = { type = "boolean", description = "是否区分大小写", default = false }, regex = { type = "boolean", description = "是否使用正则匹配", default = true } }, description = "单个搜索参数（与 files 二选一）" },
+      dir = { type = "string", description = "（简化参数）搜索目录", default = "." },
+      file_pattern = { type = "string", description = "（简化参数）文件通配符模式", default = "*" },
+      case_sensitive = { type = "boolean", description = "（简化参数）是否区分大小写", default = false },
+      regex = { type = "boolean", description = "（简化参数）是否使用正则匹配", default = true },
     },
-    oneOf = {
-      { required = { "pattern" } },
-      { required = { "files" } },
-      { required = { "file" } },
-    },
+    oneOf = { { required = { "pattern" } }, { required = { "files" } }, { required = { "file" } } },
   },
-  returns = {
-    type = "array",
-    items = {
-      type = "object",
-      properties = {
-        file = { type = "string" },
-        line = { type = "number" },
-        content = { type = "string" },
-      },
-    },
-    description = "匹配结果列表",
-  },
-  category = "file",
-  permissions = { read = true },
+  returns = { type = "array", items = { type = "object", properties = { file = { type = "string" }, line = { type = "number" }, content = { type = "string" } } }, description = "匹配结果列表" },
+  category = "file", permissions = { read = true },
 })
 
 -- ============================================================================
--- 工具5: file_exists - 检查文件或目录是否存在
+-- 工具 file_exists
 -- ============================================================================
 
-local function _file_exists(args)
+local function _file_exists(args, on_success, on_error)
   if not args then
-    return "错误: 需要文件参数"
+    if on_error then on_error("需要文件参数") end
+    return
   end
-
-  -- 支持 files（列表）和 file（单个）两种参数
   local files = args.files or {}
   if args.file and type(args.file) == "table" then
     table.insert(files, args.file)
   end
-
-  if #files == 0 then
-    return "错误: 需要文件列表或单个文件参数"
+  -- 支持标准参数：直接传 filepath 字符串
+  local used_simple = false
+  if args.filepath and type(args.filepath) == "string" then
+    table.insert(files, { filepath = args.filepath })
+    used_simple = true
   end
-
+  if #files == 0 then
+    if on_error then on_error("需要文件列表或单个文件参数") end
+    return
+  end
   local fu = get_file_utils()
   local results = {}
-
+  local pending = #files
+  local function check_done()
+    pending = pending - 1
+    if pending <= 0 then
+      if used_simple then
+        local example = [[{
+  files = {
+    { filepath = "/path/to/file" }
+  }
+}]]
+        table.insert(results, 1, { filepath = "_warning", exists = false, _warning = warn_simple_args("file_exists", example) })
+      end
+      if on_success then on_success(results) end
+    end
+  end
   for _, f in ipairs(files) do
     local filepath = f.filepath
     if not filepath then
       table.insert(results, { filepath = "(未知)", exists = false })
-      goto continue
-    end
-
-    local exists
-    if fu then
-      exists = fu.exists(filepath)
+      check_done()
     else
-      local file = io.open(filepath, "r")
-      if file then
-        file:close()
-        exists = true
+      local function on_exists(exists)
+        table.insert(results, { filepath = filepath, exists = exists })
+        check_done()
+      end
+      if fu then
+        on_exists(fu.exists(filepath))
       else
-        exists = false
+        uv_exists(filepath, on_exists)
       end
     end
-    table.insert(results, { filepath = filepath, exists = exists })
-
-    ::continue::
   end
-
-  return results
 end
 
 M.file_exists = define_tool({
   name = "file_exists",
   description = "检查一个或多个文件或目录是否存在",
-  func = _file_exists,
+  func = _file_exists, async = true,
   parameters = {
     type = "object",
     properties = {
-      files = {
-        type = "array",
-        items = {
-          type = "object",
-          properties = {
-            filepath = { type = "string", description = "文件或目录路径（必填）" },
-          },
-          required = { "filepath" },
-        },
-        description = "路径参数列表（与 file 二选一）",
-      },
-      file = {
-        type = "object",
-        properties = {
-          filepath = { type = "string", description = "文件或目录路径（必填）" },
-        },
-        required = { "filepath" },
-        description = "单个路径参数（与 files 二选一）",
-      },
+      files = { type = "array", items = { type = "object", properties = { filepath = { type = "string", description = "文件或目录路径（必填）" } }, required = { "filepath" } }, description = "路径参数列表（与 file 二选一）" },
+      file = { type = "object", properties = { filepath = { type = "string", description = "文件或目录路径（必填）" } }, required = { "filepath" }, description = "单个路径参数（与 files 二选一）" },
+      filepath = { type = "string", description = "（简化参数）文件或目录路径，使用时会附带警告" },
     },
-    oneOf = {
-      { required = { "files" } },
-      { required = { "file" } },
-    },
+    oneOf = { { required = { "files" } }, { required = { "file" } }, { required = { "filepath" } } },
   },
-  returns = {
-    type = "array",
-    items = {
-      type = "object",
-      properties = {
-        filepath = { type = "string" },
-        exists = { type = "boolean" },
-      },
-    },
-    description = "路径存在状态列表",
-  },
-  category = "file",
-  permissions = { read = true },
+  returns = { type = "array", items = { type = "object", properties = { filepath = { type = "string" }, exists = { type = "boolean" } } }, description = "路径存在状态列表" },
+  category = "file", permissions = { read = true },
 })
 
 -- ============================================================================
--- 工具6: create_directory - 创建目录
+-- 工具 create_directory
 -- ============================================================================
 
-local function _create_directory(args)
+local function _create_directory(args, on_success, on_error)
   if not args then
-    return "错误: 需要目录参数"
+    if on_error then on_error("需要目录参数") end
+    return
   end
-
-  -- 支持 files（列表）和 file（单个）两种参数
   local files = args.files or {}
   if args.file and type(args.file) == "table" then
     table.insert(files, args.file)
   end
-
-  if #files == 0 then
-    return "错误: 需要目录列表或单个目录参数"
+  -- 支持标准参数：直接传 filepath 字符串
+  local used_simple = false
+  if args.filepath and type(args.filepath) == "string" then
+    table.insert(files, { filepath = args.filepath, parents = args.parents })
+    used_simple = true
   end
-
+  if #files == 0 then
+    if on_error then on_error("需要目录列表或单个目录参数") end
+    return
+  end
   local fu = get_file_utils()
   local results = {}
-
+  local pending = #files
+  local function check_done()
+    pending = pending - 1
+    if pending <= 0 then
+      if used_simple then
+        local example = [[{
+  files = {
+    { filepath = "/path/to/dir", parents = true }
+  }
+}]]
+        table.insert(results, 1, { filepath = "_warning", success = false, _warning = warn_simple_args("create_directory", example) })
+      end
+      if on_success then on_success(results) end
+    end
+  end
   for _, f in ipairs(files) do
     local filepath = f.filepath
     if not filepath then
       table.insert(results, { filepath = "(未知)", success = false })
-      goto continue
-    end
-
-    local ok
-    if fu then
-      local success, _ = fu.mkdir(filepath)
-      ok = success == true
+      check_done()
     else
-      -- 使用 vim.fn.mkdir 替代 os.execute，非阻塞
-      ok = vim.fn.mkdir(filepath, "p")
+      local function on_created(ok)
+        table.insert(results, { filepath = filepath, success = ok })
+        check_done()
+      end
+      if fu then
+        local success, _ = fu.mkdir(filepath)
+        on_created(success == true)
+      else
+        uv_mkdir_p(filepath, function() on_created(true) end, function() on_created(false) end)
+      end
     end
-    table.insert(results, { filepath = filepath, success = ok })
-
-    ::continue::
   end
-
-  return results
 end
 
 M.create_directory = define_tool({
   name = "create_directory",
   description = "创建一个或多个目录",
-  func = _create_directory,
+  func = _create_directory, async = true,
   parameters = {
     type = "object",
     properties = {
-      files = {
-        type = "array",
-        items = {
-          type = "object",
-          properties = {
-            filepath = { type = "string", description = "目录路径（必填）" },
-            parents = { type = "boolean", description = "是否创建父目录", default = true },
-          },
-          required = { "filepath" },
-        },
-        description = "目录参数列表（与 file 二选一）",
-      },
-      file = {
-        type = "object",
-        properties = {
-          filepath = { type = "string", description = "目录路径（必填）" },
-          parents = { type = "boolean", description = "是否创建父目录", default = true },
-        },
-        required = { "filepath" },
-        description = "单个目录参数（与 files 二选一）",
-      },
+      files = { type = "array", items = { type = "object", properties = { filepath = { type = "string", description = "目录路径（必填）" }, parents = { type = "boolean", description = "是否创建父目录", default = true } }, required = { "filepath" } }, description = "目录参数列表（与 file 二选一）" },
+      file = { type = "object", properties = { filepath = { type = "string", description = "目录路径（必填）" }, parents = { type = "boolean", description = "是否创建父目录", default = true } }, required = { "filepath" }, description = "单个目录参数（与 files 二选一）" },
+      filepath = { type = "string", description = "（简化参数）目录路径，使用时会附带警告" },
+      parents = { type = "boolean", description = "（简化参数）是否创建父目录", default = true },
     },
-    oneOf = {
-      { required = { "files" } },
-      { required = { "file" } },
-    },
+    oneOf = { { required = { "files" } }, { required = { "file" } }, { required = { "filepath" } } },
   },
-  returns = {
-    type = "array",
-    items = {
-      type = "object",
-      properties = {
-        filepath = { type = "string" },
-        success = { type = "boolean" },
-      },
-    },
-    description = "目录创建结果列表",
-  },
-  category = "file",
-  permissions = { write = true },
+  returns = { type = "array", items = { type = "object", properties = { filepath = { type = "string" }, success = { type = "boolean" } } }, description = "目录创建结果列表" },
+  category = "file", permissions = { write = true },
 })
 
 -- ============================================================================
--- 工具7: ensure_dir - 确保目录存在
+-- 工具 ensure_dir
 -- ============================================================================
 
-local function _ensure_dir(args)
+local function _ensure_dir(args, on_success, on_error)
   if not args then
-    return "错误: 需要目录参数"
+    if on_error then on_error("需要目录参数") end
+    return
   end
-
-  -- 支持 files（列表）和 file（单个）两种参数
   local files = args.files or {}
   if args.file and type(args.file) == "table" then
     table.insert(files, args.file)
   end
-
-  if #files == 0 then
-    return "错误: 需要目录列表或单个目录参数"
+  -- 支持标准参数：直接传 filepath 字符串
+  local used_simple = false
+  if args.filepath and type(args.filepath) == "string" then
+    table.insert(files, { filepath = args.filepath, parents = args.parents })
+    used_simple = true
   end
-
+  if #files == 0 then
+    if on_error then on_error("需要目录列表或单个目录参数") end
+    return
+  end
   local fu = get_file_utils()
   local results = {}
-
+  local pending = #files
+  local function check_done()
+    pending = pending - 1
+    if pending <= 0 then
+      if used_simple then
+        local example = [[{
+  files = {
+    { filepath = "/path/to/dir", parents = true }
+  }
+}]]
+        table.insert(results, 1, { filepath = "_warning", success = false, _warning = warn_simple_args("ensure_dir", example) })
+      end
+      if on_success then on_success(results) end
+    end
+  end
   for _, f in ipairs(files) do
     local filepath = f.filepath
     if not filepath then
       table.insert(results, { filepath = "(未知)", success = false })
-      goto continue
-    end
-
-    local ok
-    if fu then
-      local success, _ = fu.mkdir(filepath)
-      ok = success == true
+      check_done()
     else
-      -- 使用 vim.fn.mkdir 替代 os.execute，非阻塞
       local clean_path = filepath:gsub("/+$", "")
-      ok = vim.fn.mkdir(clean_path, "p")
+      local function on_ensured(ok)
+        table.insert(results, { filepath = filepath, success = ok })
+        check_done()
+      end
+      if fu then
+        local success, _ = fu.mkdir(clean_path)
+        on_ensured(success == true)
+      else
+        uv_mkdir_p(clean_path, function() on_ensured(true) end, function() on_ensured(false) end)
+      end
     end
-    table.insert(results, { filepath = filepath, success = ok })
-
-    ::continue::
   end
-
-  return results
 end
 
 M.ensure_dir = define_tool({
   name = "ensure_dir",
   description = "确保一个或多个目录存在，如果不存在则创建",
-  func = _ensure_dir,
+  func = _ensure_dir, async = true,
   parameters = {
     type = "object",
     properties = {
-      files = {
-        type = "array",
-        items = {
-          type = "object",
-          properties = {
-            filepath = { type = "string", description = "目录路径（必填）" },
-            parents = { type = "boolean", description = "是否创建父目录", default = true },
-          },
-          required = { "filepath" },
-        },
-        description = "目录参数列表（与 file 二选一）",
-      },
-      file = {
-        type = "object",
-        properties = {
-          filepath = { type = "string", description = "目录路径（必填）" },
-          parents = { type = "boolean", description = "是否创建父目录", default = true },
-        },
-        required = { "filepath" },
-        description = "单个目录参数（与 files 二选一）",
-      },
+      files = { type = "array", items = { type = "object", properties = { filepath = { type = "string", description = "目录路径（必填）" }, parents = { type = "boolean", description = "是否创建父目录", default = true } }, required = { "filepath" } }, description = "目录参数列表（与 file 二选一）" },
+      file = { type = "object", properties = { filepath = { type = "string", description = "目录路径（必填）" }, parents = { type = "boolean", description = "是否创建父目录", default = true } }, required = { "filepath" }, description = "单个目录参数（与 files 二选一）" },
+      filepath = { type = "string", description = "（简化参数）目录路径，使用时会附带警告" },
+      parents = { type = "boolean", description = "（简化参数）是否创建父目录", default = true },
     },
-    oneOf = {
-      { required = { "files" } },
-      { required = { "file" } },
-    },
+    oneOf = { { required = { "files" } }, { required = { "file" } }, { required = { "filepath" } } },
   },
-  returns = {
-    type = "array",
-    items = {
-      type = "object",
-      properties = {
-        filepath = { type = "string" },
-        success = { type = "boolean" },
-      },
-    },
-    description = "目录确保结果列表",
-  },
-  category = "file",
-  permissions = { write = true },
+  returns = { type = "array", items = { type = "object", properties = { filepath = { type = "string" }, success = { type = "boolean" } } }, description = "目录确保结果列表" },
+  category = "file", permissions = { write = true },
 })
 
 -- ============================================================================
--- 工具8: delete_file - 删除文件
+-- 工具 delete_file
 -- ============================================================================
 
-local function _delete_file(args)
+local function _delete_file(args, on_success, on_error)
   if not args then
-    return "错误: 需要文件参数"
+    if on_error then on_error("需要文件参数") end
+    return
   end
-
-  -- 支持 files（列表）和 file（单个）两种参数
   local files = args.files or {}
   if args.file and type(args.file) == "table" then
     table.insert(files, args.file)
   end
-
-  if #files == 0 then
-    return "错误: 需要文件列表或单个文件参数"
+  -- 支持标准参数：直接传 filepath 字符串
+  local used_simple = false
+  if args.filepath and type(args.filepath) == "string" then
+    table.insert(files, { filepath = args.filepath })
+    used_simple = true
   end
-
+  if #files == 0 then
+    if on_error then on_error("需要文件列表或单个文件参数") end
+    return
+  end
   local results = {}
-
+  local pending = #files
+  local function check_done()
+    pending = pending - 1
+    if pending <= 0 then
+      if used_simple then
+        local example = [[{
+  files = {
+    { filepath = "/path/to/file" }
+  }
+}]]
+        table.insert(results, 1, { filepath = "_warning", success = false, _warning = warn_simple_args("delete_file", example) })
+      end
+      if on_success then on_success(results) end
+    end
+  end
   for _, f in ipairs(files) do
     local filepath = f.filepath
     if not filepath then
       table.insert(results, { filepath = "(未知)", success = false, error = "缺少 filepath 字段" })
-      goto continue
-    end
-
-    local ok, err
-    local file = io.open(filepath, "r")
-    if file then
-      file:close()
-      local success = os.remove(filepath)
-      if success then
-        ok = true
-      else
-        ok = false
-        err = "无法删除文件"
-      end
+      check_done()
     else
-      ok = false
-      err = "文件不存在"
+      uv_exists(filepath, function(exists)
+        if not exists then
+          table.insert(results, { filepath = filepath, success = false, error = "文件不存在" })
+          check_done()
+          return
+        end
+        uv_delete_file(filepath,
+          function()
+            table.insert(results, { filepath = filepath, success = true })
+            check_done()
+          end,
+          function(err)
+            table.insert(results, { filepath = filepath, success = false, error = err or "无法删除文件" })
+            check_done()
+          end
+        )
+      end)
     end
-    table.insert(results, { filepath = filepath, success = ok, error = err })
-
-    ::continue::
   end
-
-  return results
 end
 
 M.delete_file = define_tool({
   name = "delete_file",
   description = "删除一个或多个文件",
-  func = _delete_file,
+  func = _delete_file, async = true,
   parameters = {
     type = "object",
     properties = {
-      files = {
-        type = "array",
-        items = {
-          type = "object",
-          properties = {
-            filepath = { type = "string", description = "文件路径（必填）" },
-          },
-          required = { "filepath" },
-        },
-        description = "文件参数列表（与 file 二选一）",
-      },
-      file = {
-        type = "object",
-        properties = {
-          filepath = { type = "string", description = "文件路径（必填）" },
-        },
-        required = { "filepath" },
-        description = "单个文件参数（与 files 二选一）",
-      },
+      files = { type = "array", items = { type = "object", properties = { filepath = { type = "string", description = "文件路径（必填）" } }, required = { "filepath" } }, description = "文件参数列表（与 file 二选一）" },
+      file = { type = "object", properties = { filepath = { type = "string", description = "文件路径（必填）" } }, required = { "filepath" }, description = "单个文件参数（与 files 二选一）" },
+      filepath = { type = "string", description = "（简化参数）文件路径，使用时会附带警告" },
     },
-    oneOf = {
-      { required = { "files" } },
-      { required = { "file" } },
-    },
+    oneOf = { { required = { "files" } }, { required = { "file" } }, { required = { "filepath" } } },
   },
-  returns = {
-    type = "array",
-    items = {
-      type = "object",
-      properties = {
-        filepath = { type = "string" },
-        success = { type = "boolean" },
-        error = { type = "string", description = "失败时的错误信息" },
-      },
-    },
-    description = "文件删除结果列表",
-  },
-  category = "file",
-  permissions = { write = true },
+  returns = { type = "array", items = { type = "object", properties = { filepath = { type = "string" }, success = { type = "boolean" }, error = { type = "string", description = "失败时的错误信息" } } }, description = "文件删除结果列表" },
+  category = "file", permissions = { write = true },
 })
 
--- get_tools() - 返回所有工具列表供注册
+-- get_tools()
 function M.get_tools()
   local tools = {}
   for _, v in pairs(M) do
@@ -905,10 +965,7 @@ function M.get_tools()
       table.insert(tools, v)
     end
   end
-  -- 按名称排序
-  table.sort(tools, function(a, b)
-    return a.name < b.name
-  end)
+  table.sort(tools, function(a, b) return a.name < b.name end)
   return tools
 end
 

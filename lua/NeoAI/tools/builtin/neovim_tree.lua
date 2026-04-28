@@ -23,22 +23,153 @@ local function check_ts()
   return false
 end
 
--- 从文件路径推断语言（使用 vim.filetype.match + vim.treesitter.language.get_lang）
+-- 扩展名到 Tree-sitter 解析器名称的直接映射
+-- 避免在 fast event 上下文中调用 vim.filetype.match（内部调用 getenv）
+local ext_to_parser = {
+  [".lua"] = "lua", [".py"] = "python", [".js"] = "javascript", [".ts"] = "typescript",
+  [".jsx"] = "tsx", [".tsx"] = "tsx", [".go"] = "go", [".rs"] = "rust",
+  [".java"] = "java", [".c"] = "c", [".cpp"] = "cpp", [".h"] = "c", [".hpp"] = "cpp",
+  [".rb"] = "ruby", [".php"] = "php", [".json"] = "json", [".yaml"] = "yaml", [".yml"] = "yaml",
+  [".md"] = "markdown", [".sh"] = "bash", [".bash"] = "bash", [".zsh"] = "bash",
+  [".css"] = "css", [".html"] = "html", [".htm"] = "html",
+  [".vue"] = "vue", [".svelte"] = "svelte", [".toml"] = "toml", [".sql"] = "sql",
+  [".cmake"] = "cmake", [".mk"] = "make",
+  [".query"] = "query", [".regex"] = "regex",
+}
+
+-- 从文件路径推断语言（使用扩展名映射，避免在 fast event 上下文中调用 vim.filetype.match）
+-- 从文件路径推断 Tree-sitter 解析器名称（使用扩展名映射，避免在 fast event 中调用 vim.filetype.match）
 local function detect_lang_from_filepath(filepath)
-  local abs_path = vim.fn.fnamemodify(filepath, ":p")
-  local ft = vim.filetype.match({ filename = abs_path })
-  if not ft then
-    return nil
+  local ext = vim.fn.fnamemodify(filepath, ":e")
+  if ext and ext ~= "" then
+    ext = "." .. ext:lower()
+    local parser = ext_to_parser[ext]
+    if parser then
+      return parser
+    end
   end
-  ---@diagnostic disable-next-line: undefined-field, need-check-nil
-  local ok, lang = pcall(ts.language.get_lang, ft)
-  if ok and lang then
-    return lang
+
+  -- 尝试匹配完整文件名（如 Makefile、Dockerfile）
+  local basename = vim.fn.fnamemodify(filepath, ":t")
+  if basename == "Makefile" then
+    return "make"
   end
+  if basename == "Dockerfile" or basename:match("^Dockerfile%.[a-zA-Z]+$") then
+    return "dockerfile"
+  end
+
   return nil
 end
 
--- 读取文件内容
+--- 检查并自动安装 Tree-sitter 解析器（回调模式）
+--- 如果解析器未安装，尝试通过 nvim-treesitter 安装
+--- @param lang string 语言名称
+--- @param on_success function 安装成功或已存在时回调
+--- @param on_error function 安装失败时回调
+local function ensure_parser_installed(lang, on_success, on_error)
+  -- 检查解析器是否已安装
+  local ok_inspect, _ = pcall(ts.language.inspect, lang)
+  if ok_inspect then
+    if on_success then on_success() end
+    return
+  end
+
+  -- 尝试通过 nvim-treesitter 安装
+  -- 优先使用 vim.treesitter.language.add（Neovim 0.12 内置 API）
+  local has_language_add = pcall(function()
+    return type(vim.treesitter.language.add) == "function"
+  end)
+
+  if has_language_add then
+    -- 使用内置 API 添加/安装语言
+    local ok_add, add_err = pcall(vim.treesitter.language.add, lang)
+    if ok_add then
+      -- 安装后再次检查
+      local ok2, _ = pcall(ts.language.inspect, lang)
+      if ok2 then
+        if on_success then on_success() end
+        return
+      end
+    end
+    -- 如果内置 API 失败，回退到命令方式
+  end
+
+  -- 尝试通过 :TSInstallSync 命令
+  local has_ts_install = pcall(function()
+    return vim.fn.exists(":TSInstallSync") == 2
+  end)
+
+  if has_ts_install then
+    local ok, err = pcall(vim.cmd, "TSInstallSync " .. lang)
+    if ok then
+      local ok2, _ = pcall(ts.language.inspect, lang)
+      if ok2 then
+        if on_success then on_success() end
+        return
+      end
+    end
+    -- 失败，继续尝试其他方式
+  end
+
+  -- 尝试通过 :TSInstall 命令（异步）
+  local has_ts_install_async = pcall(function()
+    return vim.fn.exists(":TSInstall") == 2
+  end)
+
+  if has_ts_install_async then
+    vim.cmd("TSInstall " .. lang)
+    vim.defer_fn(function()
+      local ok2, _ = pcall(ts.language.inspect, lang)
+      if ok2 then
+        if on_success then on_success() end
+      else
+        -- 最后尝试使用内置 API 的 require 方式
+        local ok_require, _ = pcall(function()
+          require("vim.treesitter.language").add(lang)
+        end)
+        if ok_require then
+          local ok3, _ = pcall(ts.language.inspect, lang)
+          if ok3 then
+            if on_success then on_success() end
+            return
+          end
+        end
+        if on_error then on_error("Tree-sitter 解析器 " .. lang .. " 正在后台安装，请稍后重试") end
+      end
+    end, 3000)
+    return
+  end
+
+  if on_error then on_error("未找到 nvim-treesitter 插件，无法自动安装解析器: " .. lang) end
+end
+
+-- 异步读取文件内容（回调模式）
+-- 使用 vim.uv 异步 I/O，不阻塞主线程
+local function read_file_content_async(filepath, on_success, on_error)
+  local abs_path = vim.fn.fnamemodify(filepath, ":p")
+  vim.uv.fs_open(abs_path, "r", 438, function(open_err, fd)
+    if open_err or not fd then
+      if on_error then on_error("无法读取文件: " .. (open_err or "未知错误")) end
+      return
+    end
+    vim.uv.fs_fstat(fd, function(stat_err, stat)
+      if stat_err or not stat then
+        vim.uv.fs_close(fd)
+        if on_error then on_error("无法读取文件: " .. (stat_err or "无法获取文件信息")) end
+        return
+      end
+      vim.uv.fs_read(fd, stat.size, 0, function(read_err, data)
+        vim.uv.fs_close(fd)
+        if read_err or not data then
+          if on_error then on_error("无法读取文件: " .. (read_err or "未知错误")) end
+          return
+        end
+        if on_success then on_success(data) end
+      end)
+    end)
+  end)
+end
+
 -- 公共节点过滤函数：支持正则匹配 text，node_type 不匹配时回退到同类型节点
 -- 返回 filtered 和 fallback_used（是否使用了回退）
 local function filter_nodes(nodes, args)
@@ -89,16 +220,55 @@ local function filter_nodes(nodes, args)
   return filtered, false
 end
 
--- 读取文件内容
-local function read_file_content(filepath)
-  local abs_path = vim.fn.fnamemodify(filepath, ":p")
-  local file, err = io.open(abs_path, "r")
-  if not file then
-    return nil, "无法读取文件: " .. (err or "未知错误")
-  end
-  local content = file:read("*a")
-  file:close()
-  return content, nil
+-- 解析文件内容并返回语法树（回调模式）
+-- 自动检测语言并安装缺失的解析器
+-- 注意：read_file_content_async 的回调在 vim.uv fast event 上下文中执行，
+-- 因此所有回调需要用 vim.schedule 切换到主线程
+local function parse_file_content_async(filepath, max_depth, on_success, on_error)
+  read_file_content_async(filepath, function(content)
+    vim.schedule(function()
+      local lang = detect_lang_from_filepath(filepath)
+      if not lang then
+        if on_error then on_error("无法确定文件语言") end
+        return
+      end
+
+      -- 确保解析器已安装
+      ensure_parser_installed(lang, function()
+        local ok, parser = pcall(ts.get_string_parser, content, lang)
+        if not ok or not parser then
+          if on_error then on_error("无法为语言 '" .. lang .. "' 创建解析器") end
+          return
+        end
+
+        local ok2, trees = pcall(parser.parse, parser)
+        if not ok2 or not trees or #trees == 0 then
+          if on_error then on_error("解析失败") end
+          return
+        end
+
+        local root = trees[1]:root()
+        local nodes = _traverse_node(root, content, 0, max_depth or 3)
+
+        if on_success then
+          on_success({
+            filepath = filepath,
+            language = lang,
+            line_count = #vim.split(content, "\n", { plain = true }),
+            root_type = root:type(),
+            node_count = #nodes,
+            nodes = nodes,
+          })
+        end
+      end, function(err)
+        if on_error then on_error(err) end
+      end)
+    end)
+  end, function(err)
+    vim.schedule(function()
+      if on_error then on_error(err) end
+    end)
+  end)
 end
 
 -- 递归遍历节点树，返回扁平化的节点信息列表
@@ -176,12 +346,18 @@ local function parse_file_content(filepath, max_depth)
 end
 
 -- ============================================================================
--- 工具 parse_file - 解析文件并返回语法树
+-- 工具 parse_file - 解析文件并返回语法树（回调模式）
 -- ============================================================================
 
-local function _parse_file(args)
+local function _parse_file(args, on_success, on_error)
   if not check_ts() then
-    return { error = "Tree-sitter 不可用（需要 Neovim >= 0.5）" }
+    if on_error then on_error("Tree-sitter 不可用（需要 Neovim >= 0.5）") end
+    return
+  end
+
+  if not args then
+    if on_error then on_error("需要参数") end
+    return
   end
 
   local max_depth = args.max_depth or 3
@@ -189,33 +365,53 @@ local function _parse_file(args)
   -- 处理 filepaths 列表
   if args.filepaths and #args.filepaths > 0 then
     local results = {}
-    for _, fp in ipairs(args.filepaths) do
-      local r, err = parse_file_content(fp, max_depth)
-      if err then
-        table.insert(results, { filepath = fp, error = err })
-      else
-        table.insert(results, r)
+    local pending = #args.filepaths
+    local has_error = false
+
+    local function check_done()
+      if has_error then return end
+      pending = pending - 1
+      if pending <= 0 then
+        if on_success then on_success(results) end
       end
     end
-    return results
+
+    for _, fp in ipairs(args.filepaths) do
+      parse_file_content_async(fp, max_depth,
+        function(r)
+          table.insert(results, r)
+          check_done()
+        end,
+        function(err)
+          table.insert(results, { filepath = fp, error = err })
+          check_done()
+        end
+      )
+    end
+    return
   end
 
   -- 处理单个 filepath
   if args.filepath then
-    local result, err = parse_file_content(args.filepath, max_depth)
-    if err then
-      return { filepath = args.filepath, error = err }
-    end
-    return result
+    parse_file_content_async(args.filepath, max_depth,
+      function(result)
+        if on_success then on_success(result) end
+      end,
+      function(err)
+        if on_error then on_error(err) end
+      end
+    )
+    return
   end
 
-  return { error = "需要 filepath（文件路径）或 filepaths（路径列表）参数" }
+  if on_error then on_error("需要 filepath（文件路径）或 filepaths（路径列表）参数") end
 end
 
 M.parse_file = define_tool({
   name = "parse_file",
-  description = "解析文件并返回 Tree-sitter 语法树节点信息，支持 filepath（单个文件路径）和 filepaths（路径列表）参数",
+  description = "解析文件并返回 Tree-sitter 语法树节点信息，支持 filepath（单个文件路径）和 filepaths（路径列表）参数。如果解析器未安装，会自动尝试安装。",
   func = _parse_file,
+  async = true,
   parameters = {
     type = "object",
     properties = {
@@ -241,17 +437,15 @@ M.parse_file = define_tool({
 })
 
 -- ============================================================================
--- 工具 query_captures - 使用查询模式捕获节点
+-- 工具 query_captures - 使用查询模式捕获节点（回调模式）
 -- ============================================================================
 
 local function _query_captures_for_source(source_text, lang, query_string)
-  ---@diagnostic disable-next-line: undefined-field, need-check-nil
   local ok, query = pcall(ts.query.parse, lang, query_string)
   if not ok then
     return nil, "查询语法错误: " .. tostring(query)
   end
 
-  ---@diagnostic disable-next-line: undefined-field, need-check-nil
   local ok2, parser = pcall(ts.get_string_parser, source_text, lang)
   if not ok2 or not parser then
     return nil, "无法为语言 '" .. lang .. "' 创建解析器"
@@ -290,51 +484,55 @@ local function _query_captures_for_source(source_text, lang, query_string)
     query = query_string,
     capture_count = #captures,
     captures = captures,
-  },
-    nil
+  }, nil
 end
 
-local function _query_captures(args)
+local function _query_captures(args, on_success, on_error)
   if not check_ts() then
-    return { error = "Tree-sitter 不可用（需要 Neovim >= 0.5）" }
+    if on_error then on_error("Tree-sitter 不可用（需要 Neovim >= 0.5）") end
+    return
   end
 
   if not args or not args.query or not args.filepath then
-    return { error = "需要 query（查询字符串）和 filepath（文件路径）参数" }
+    if on_error then on_error("需要 query（查询字符串）和 filepath（文件路径）参数") end
+    return
   end
 
   local query_string = args.query
 
-  local content, err = read_file_content(args.filepath)
-  if not content then
-    return { filepath = args.filepath, error = err }
-  end
+  read_file_content_async(args.filepath, function(content)
+    local lang = detect_lang_from_filepath(args.filepath)
+    if not lang then
+      if on_error then on_error("无法确定文件语言") end
+      return
+    end
 
-  local lang = detect_lang_from_filepath(args.filepath)
-  if not lang then
-    return { filepath = args.filepath, error = "无法确定文件语言" }
-  end
-
-  local result, qerr = _query_captures_for_source(content, lang, query_string)
-  if qerr then
-    return { filepath = args.filepath, error = qerr }
-  end
-  result.filepath = args.filepath
-  return result
+    ensure_parser_installed(lang, function()
+      local result, qerr = _query_captures_for_source(content, lang, query_string)
+      if qerr then
+        if on_error then on_error(qerr) end
+        return
+      end
+      result.filepath = args.filepath
+      if on_success then on_success(result) end
+    end, function(err)
+      if on_error then on_error(err) end
+    end)
+  end, function(err)
+    if on_error then on_error(err) end
+  end)
 end
 
 M.query_captures = define_tool({
   name = "query_captures",
-  description = "使用 Tree-sitter 查询模式捕获文件中语法树节点，支持自定义查询字符串",
+  description = "使用 Tree-sitter 查询模式捕获文件中语法树节点，支持自定义查询字符串。如果解析器未安装，会自动尝试安装。",
   func = _query_captures,
+  async = true,
   parameters = {
     type = "object",
     properties = {
       query = { type = "string", description = "Tree-sitter 查询字符串，如 '((function_definition) @func)'" },
-      filepath = {
-        type = "string",
-        description = "文件路径",
-      },
+      filepath = { type = "string", description = "文件路径" },
     },
     required = { "query", "filepath" },
   },
@@ -347,125 +545,123 @@ M.query_captures = define_tool({
 })
 
 -- ============================================================================
--- 工具 get_node_at_position - 获取文件中指定位置的语法树节点
+-- 工具 get_node_at_position - 获取文件中指定位置的语法树节点（回调模式）
 -- ============================================================================
 
-local function _get_node_at_position(args)
+local function _get_node_at_position(args, on_success, on_error)
   if not check_ts() then
-    return { error = "Tree-sitter 不可用（需要 Neovim >= 0.5）" }
+    if on_error then on_error("Tree-sitter 不可用（需要 Neovim >= 0.5）") end
+    return
   end
 
   if not args or not args.filepath then
-    return { error = "需要 filepath（文件路径）参数" }
+    if on_error then on_error("需要 filepath（文件路径）参数") end
+    return
   end
 
   local filepath = args.filepath
-  local row = args.row
-  local col = args.col
+  local target_row = args.row or 0
+  local target_col = args.col or 0
 
-  local content, err = read_file_content(filepath)
-  if not content then
-    return { filepath = filepath, error = err }
-  end
-
-  local lang = detect_lang_from_filepath(filepath)
-  if not lang then
-    return { filepath = filepath, error = "无法确定文件语言" }
-  end
-
-  ---@diagnostic disable-next-line: undefined-field, need-check-nil
-  local ok, parser = pcall(ts.get_string_parser, content, lang)
-  if not ok or not parser then
-    return { filepath = filepath, error = "无法为语言 '" .. lang .. "' 创建解析器" }
-  end
-
-  local ok2, trees = pcall(parser.parse, parser)
-  if not ok2 or not trees or #trees == 0 then
-    return { filepath = filepath, error = "解析失败" }
-  end
-
-  local root = trees[1]:root()
-
-  local target_row = row or 0
-  local target_col = col or 0
-
-  -- 在语法树中查找指定位置的节点
-  local function find_node_at_pos(node, r, c)
-    if not node then
-      return nil
+  read_file_content_async(filepath, function(content)
+    local lang = detect_lang_from_filepath(filepath)
+    if not lang then
+      if on_error then on_error("无法确定文件语言") end
+      return
     end
-    local sr, sc, er, ec = node:range()
-    if r >= sr and r <= er and (r > sr or c >= sc) and (r < er or c <= ec) then
-      for i = 0, node:named_child_count() - 1 do
-        local child = node:named_child(i)
-        local found = find_node_at_pos(child, r, c)
-        if found then
-          return found
-        end
+
+    ensure_parser_installed(lang, function()
+      local ok, parser = pcall(ts.get_string_parser, content, lang)
+      if not ok or not parser then
+        if on_error then on_error("无法为语言 '" .. lang .. "' 创建解析器") end
+        return
       end
-      return node
-    end
-    return nil
-  end
 
-  local target_node = find_node_at_pos(root, target_row, target_col)
-  if not target_node then
-    return { filepath = filepath, error = "未找到该位置的节点" }
-  end
+      local ok2, trees = pcall(parser.parse, parser)
+      if not ok2 or not trees or #trees == 0 then
+        if on_error then on_error("解析失败") end
+        return
+      end
 
-  local text = vim.treesitter.get_node_text(target_node, content)
-  local sr, sc, er, ec = target_node:range()
+      local root = trees[1]:root()
 
-  -- 获取父节点链
-  local ancestors = {}
-  local current = target_node:parent()
-  while current do
-    table.insert(ancestors, {
-      type = current:type(),
-      text = vim.treesitter.get_node_text(current, content),
-    })
-    current = current:parent()
-  end
+      -- 在语法树中查找指定位置的节点
+      local function find_node_at_pos(node, r, c)
+        if not node then return nil end
+        local sr, sc, er, ec = node:range()
+        if r >= sr and r <= er and (r > sr or c >= sc) and (r < er or c <= ec) then
+          for i = 0, node:named_child_count() - 1 do
+            local child = node:named_child(i)
+            local found = find_node_at_pos(child, r, c)
+            if found then return found end
+          end
+          return node
+        end
+        return nil
+      end
 
-  -- 获取子节点
-  local children = {}
-  local child_count = target_node:named_child_count()
-  for i = 0, child_count - 1 do
-    local child = target_node:named_child(i)
-    table.insert(children, {
-      type = child:type(),
-      text = vim.treesitter.get_node_text(child, content),
-    })
-  end
+      local target_node = find_node_at_pos(root, target_row, target_col)
+      if not target_node then
+        if on_error then on_error("未找到该位置的节点") end
+        return
+      end
 
-  return {
-    filepath = filepath,
-    position = { row = target_row, col = target_col },
-    node = {
-      type = target_node:type(),
-      text = text,
-      named = target_node:named(),
-      start_row = sr,
-      start_col = sc,
-      end_row = er,
-      end_col = ec,
-    },
-    ancestors = ancestors,
-    children = children,
-  }
+      local text = vim.treesitter.get_node_text(target_node, content)
+      local sr, sc, er, ec = target_node:range()
+
+      -- 获取父节点链
+      local ancestors = {}
+      local current = target_node:parent()
+      while current do
+        table.insert(ancestors, {
+          type = current:type(),
+          text = vim.treesitter.get_node_text(current, content),
+        })
+        current = current:parent()
+      end
+
+      -- 获取子节点
+      local children = {}
+      local child_count = target_node:named_child_count()
+      for i = 0, child_count - 1 do
+        local child = target_node:named_child(i)
+        table.insert(children, {
+          type = child:type(),
+          text = vim.treesitter.get_node_text(child, content),
+        })
+      end
+
+      if on_success then
+        on_success({
+          filepath = filepath,
+          position = { row = target_row, col = target_col },
+          node = {
+            type = target_node:type(),
+            text = text,
+            named = target_node:named(),
+            start_row = sr, start_col = sc, end_row = er, end_col = ec,
+          },
+          ancestors = ancestors,
+          children = children,
+        })
+      end
+    end, function(err)
+      if on_error then on_error(err) end
+    end)
+  end, function(err)
+    if on_error then on_error(err) end
+  end)
 end
 
 M.get_node_at_position = define_tool({
   name = "get_node_at_position",
-  description = "获取文件中指定位置（行、列）的 Tree-sitter 语法树节点，包含父节点链和子节点信息",
+  description = "获取文件中指定位置（行、列）的 Tree-sitter 语法树节点，包含父节点链和子节点信息。如果解析器未安装，会自动尝试安装。",
   func = _get_node_at_position,
+  async = true,
   parameters = {
     type = "object",
     properties = {
-      filepath = {
-        type = "string",
-        description = "文件路径",
-      },
+      filepath = { type = "string", description = "文件路径" },
       row = { type = "number", description = "行号（0-based，默认 0）" },
       col = { type = "number", description = "列号（0-based，默认 0）" },
     },
@@ -480,56 +676,71 @@ M.get_node_at_position = define_tool({
 })
 
 -- ============================================================================
--- 工具 get_node_type - 获取节点类型
+-- 辅助函数：在 parse_file_content_async 回调中处理过滤和响应
+-- 所有 get_node_* 工具共享此模式
 -- ============================================================================
 
-local function _get_node_type(args)
+--- 在 parse_file_content_async 回调中执行过滤并返回结果
+--- @param args table 工具参数
+--- @param on_success function 成功回调
+--- @param on_error function 失败回调
+--- @param build_response function 构建响应函数 (result, filtered, fallback) -> table
+local function _with_parsed_tree(args, on_success, on_error, build_response)
   if not check_ts() then
-    return { error = "Tree-sitter 不可用（需要 Neovim >= 0.5）" }
+    if on_error then on_error("Tree-sitter 不可用（需要 Neovim >= 0.5）") end
+    return
   end
-
   if not args or not args.filepath then
-    return { error = "需要 filepath（文件路径）参数" }
+    if on_error then on_error("需要 filepath（文件路径）参数") end
+    return
   end
 
-  local result, err = parse_file_content(args.filepath, -1)
-  if err or not result then
-    return { filepath = args.filepath, error = err or "解析结果为空" }
-  end
-
-  -- 使用公共过滤函数
-  local filtered, fallback = filter_nodes(result.nodes, args)
-
-  if #filtered == 0 then
-    return { filepath = args.filepath, error = "未找到匹配的节点" }
-  end
-
-  local types = {}
-  local seen = {}
-  for _, node in ipairs(filtered) do
-    if not seen[node.type] then
-      seen[node.type] = true
-      table.insert(types, node.type)
+  parse_file_content_async(args.filepath, -1, function(result)
+    local filtered, fallback = filter_nodes(result.nodes, args)
+    if #filtered == 0 then
+      if on_error then on_error("未找到匹配的节点") end
+      return
     end
-  end
+    local ret = build_response(result, filtered, fallback)
+    if on_success then on_success(ret) end
+  end, function(err)
+    if on_error then on_error(err or "解析结果为空") end
+  end)
+end
 
-  local ret = {
-    filepath = args.filepath,
-    language = result and result.language,
-    match_count = #filtered,
-    node_types = types,
-    nodes = filtered,
-  }
-  if fallback then
-    ret.warning = "未找到指定 node_type '" .. (args.node_type or "") .. "' 的节点，已回退到同类型节点"
-  end
-  return ret
+-- ============================================================================
+-- 工具 get_node_type - 获取节点类型（回调模式）
+-- ============================================================================
+
+local function _get_node_type(args, on_success, on_error)
+  _with_parsed_tree(args, on_success, on_error, function(result, filtered, fallback)
+    local types = {}
+    local seen = {}
+    for _, node in ipairs(filtered) do
+      if not seen[node.type] then
+        seen[node.type] = true
+        table.insert(types, node.type)
+      end
+    end
+    local ret = {
+      filepath = args.filepath,
+      language = result.language,
+      match_count = #filtered,
+      node_types = types,
+      nodes = filtered,
+    }
+    if fallback then
+      ret.warning = "未找到指定 node_type '" .. (args.node_type or "") .. "' 的节点，已回退到同类型节点"
+    end
+    return ret
+  end)
 end
 
 M.get_node_type = define_tool({
   name = "get_node_type",
-  description = "获取文件中匹配节点的类型信息，支持按 node_type、text、named 属性过滤",
+  description = "获取文件中匹配节点的类型信息，支持按 node_type、text、named 属性过滤。如果解析器未安装，会自动尝试安装。",
   func = _get_node_type,
+  async = true,
   parameters = {
     type = "object",
     properties = {
@@ -540,87 +751,90 @@ M.get_node_type = define_tool({
     },
     required = { "filepath" },
   },
-  returns = {
-    type = "object",
-    description = "匹配节点的类型信息列表",
-  },
+  returns = { type = "object", description = "匹配节点的类型信息列表" },
   category = "treesitter",
   permissions = { read = true },
 })
 
 -- ============================================================================
--- 工具 get_node_range - 获取节点范围
+-- 工具 get_node_range - 获取节点范围（回调模式）
 -- ============================================================================
 
-local function _get_node_range(args)
+local function _get_node_range(args, on_success, on_error)
   if not check_ts() then
-    return { error = "Tree-sitter 不可用（需要 Neovim >= 0.5）" }
+    if on_error then on_error("Tree-sitter 不可用（需要 Neovim >= 0.5）") end
+    return
   end
-
   if not args or not args.filepath then
-    return { error = "需要 filepath（文件路径）参数" }
+    if on_error then on_error("需要 filepath（文件路径）参数") end
+    return
   end
 
-  local result, err = parse_file_content(args.filepath, -1)
-  if err or not result then
-    return { filepath = args.filepath, error = err or "解析结果为空" }
-  end
-
-  -- 使用公共过滤函数
-  local filtered, fallback = filter_nodes(result.nodes, args)
-
-  if #filtered == 0 then
-    return { filepath = args.filepath, error = "未找到匹配的节点" }
-  end
-
-  -- 读取文件内容（用于提取带行号的代码）
-  local file_lines = nil
-  if args.include_code then
-    local content, _ = read_file_content(args.filepath)
-    if content then
-      file_lines = vim.split(content, "\n", { plain = true })
+  parse_file_content_async(args.filepath, -1, function(result)
+    local filtered, fallback = filter_nodes(result.nodes, args)
+    if #filtered == 0 then
+      if on_error then on_error("未找到匹配的节点") end
+      return
     end
-  end
 
-  local ranges = {}
-  for _, node in ipairs(filtered) do
-    local entry = {
-      type = node.type,
-      text = node.text,
-      start_row = node.start_row,
-      start_col = node.start_col,
-      end_row = node.end_row,
-      end_col = node.end_col,
-    }
-
-    if args.include_code and file_lines then
-      local code_lines = {}
-      for line_num = node.start_row, node.end_row do
-        local line_content = file_lines[line_num + 1] or ""
-        table.insert(code_lines, string.format("%d: %s", line_num, line_content))
+    -- 如果需要 include_code，异步读取文件内容
+    if args.include_code then
+      read_file_content_async(args.filepath, function(content)
+        local file_lines = vim.split(content, "\n", { plain = true })
+        local ranges = {}
+        for _, node in ipairs(filtered) do
+          local entry = {
+            type = node.type, text = node.text,
+            start_row = node.start_row, start_col = node.start_col,
+            end_row = node.end_row, end_col = node.end_col,
+          }
+          local code_lines = {}
+          for line_num = node.start_row, node.end_row do
+            local line_content = file_lines[line_num + 1] or ""
+            table.insert(code_lines, string.format("%d: %s", line_num, line_content))
+          end
+          entry.code = table.concat(code_lines, "\n")
+          table.insert(ranges, entry)
+        end
+        local ret = {
+          filepath = args.filepath, language = result.language,
+          match_count = #filtered, ranges = ranges,
+        }
+        if fallback then
+          ret.warning = "未找到指定 node_type '" .. (args.node_type or "") .. "' 的节点，已回退到同类型节点"
+        end
+        if on_success then on_success(ret) end
+      end, function(err)
+        if on_error then on_error(err) end
+      end)
+    else
+      local ranges = {}
+      for _, node in ipairs(filtered) do
+        table.insert(ranges, {
+          type = node.type, text = node.text,
+          start_row = node.start_row, start_col = node.start_col,
+          end_row = node.end_row, end_col = node.end_col,
+        })
       end
-      entry.code = table.concat(code_lines, "\n")
+      local ret = {
+        filepath = args.filepath, language = result.language,
+        match_count = #filtered, ranges = ranges,
+      }
+      if fallback then
+        ret.warning = "未找到指定 node_type '" .. (args.node_type or "") .. "' 的节点，已回退到同类型节点"
+      end
+      if on_success then on_success(ret) end
     end
-
-    table.insert(ranges, entry)
-  end
-
-  local ret = {
-    filepath = args.filepath,
-    language = result and result.language,
-    match_count = #filtered,
-    ranges = ranges,
-  }
-  if fallback then
-    ret.warning = "未找到指定 node_type '" .. (args.node_type or "") .. "' 的节点，已回退到同类型节点"
-  end
-  return ret
+  end, function(err)
+    if on_error then on_error(err or "解析结果为空") end
+  end)
 end
 
 M.get_node_range = define_tool({
   name = "get_node_range",
-  description = "获取文件中匹配节点的范围信息（返回: 起始行/列、结束行/列），支持按 node_type、text、named 属性过滤，可选返回带行号的节点代码。查找函数与变量优先使用",
+  description = "获取文件中匹配节点的范围信息（返回: 起始行/列、结束行/列），支持按 node_type、text、named 属性过滤，可选返回带行号的节点代码。如果解析器未安装，会自动尝试安装。",
   func = _get_node_range,
+  async = true,
   parameters = {
     type = "object",
     properties = {
@@ -628,71 +842,41 @@ M.get_node_range = define_tool({
       node_type = { type = "string", description = "节点类型过滤（可选），如 'function_definition'" },
       text = { type = "string", description = "节点文本过滤（可选）" },
       named = { type = "boolean", description = "是否为命名节点（可选）" },
-      include_code = {
-        type = "boolean",
-        description = "是否返回带行号的节点代码（可选，默认 false）",
-      },
+      include_code = { type = "boolean", description = "是否返回带行号的节点代码（可选，默认 false）" },
     },
     required = { "filepath" },
   },
-  returns = {
-    type = "object",
-    description = "匹配节点的范围信息列表，若 include_code 为 true 则每个节点包含 code 字段",
-  },
+  returns = { type = "object", description = "匹配节点的范围信息列表" },
   category = "treesitter",
   permissions = { read = true },
 })
 
 -- ============================================================================
--- 工具 is_named_node - 检查是否为命名节点
+-- 工具 is_named_node - 检查是否为命名节点（回调模式）
 -- ============================================================================
 
-local function _is_named_node(args)
-  if not check_ts() then
-    return { error = "Tree-sitter 不可用（需要 Neovim >= 0.5）" }
-  end
-
-  if not args or not args.filepath then
-    return { error = "需要 filepath（文件路径）参数" }
-  end
-
-  local result, err = parse_file_content(args.filepath, -1)
-  if err or not result then
-    return { filepath = args.filepath, error = err or "解析结果为空" }
-  end
-
-  -- 使用公共过滤函数
-  local filtered, fallback = filter_nodes(result.nodes, args)
-
-  if #filtered == 0 then
-    return { filepath = args.filepath, error = "未找到匹配的节点" }
-  end
-
-  local named_info = {}
-  for _, node in ipairs(filtered) do
-    table.insert(named_info, {
-      type = node.type,
-      text = node.text,
-      named = node.named,
-    })
-  end
-
-  local ret = {
-    filepath = args.filepath,
-    language = result and result.language,
-    match_count = #filtered,
-    nodes = named_info,
-  }
-  if fallback then
-    ret.warning = "未找到指定 node_type '" .. (args.node_type or "") .. "' 的节点，已回退到同类型节点"
-  end
-  return ret
+local function _is_named_node(args, on_success, on_error)
+  _with_parsed_tree(args, on_success, on_error, function(result, filtered, fallback)
+    local named_info = {}
+    for _, node in ipairs(filtered) do
+      table.insert(named_info, { type = node.type, text = node.text, named = node.named })
+    end
+    local ret = {
+      filepath = args.filepath, language = result.language,
+      match_count = #filtered, nodes = named_info,
+    }
+    if fallback then
+      ret.warning = "未找到指定 node_type '" .. (args.node_type or "") .. "' 的节点，已回退到同类型节点"
+    end
+    return ret
+  end)
 end
 
 M.is_named_node = define_tool({
   name = "is_named_node",
-  description = "检查文件中匹配节点是否为命名节点，支持按 node_type、text 属性过滤",
+  description = "检查文件中匹配节点是否为命名节点，支持按 node_type、text 属性过滤。如果解析器未安装，会自动尝试安装。",
   func = _is_named_node,
+  async = true,
   parameters = {
     type = "object",
     properties = {
@@ -702,23 +886,16 @@ M.is_named_node = define_tool({
     },
     required = { "filepath" },
   },
-  returns = {
-    type = "object",
-    description = "匹配节点的命名状态信息",
-  },
+  returns = { type = "object", description = "匹配节点的命名状态信息" },
   category = "treesitter",
   permissions = { read = true },
 })
 
 -- ============================================================================
--- 工具 get_parent_node - 获取父节点
+-- 工具 get_parent_node - 获取父节点（回调模式）
 -- ============================================================================
 
--- 递归查找节点的父节点（基于节点属性匹配）
 local function _find_parent_by_attrs(nodes, target_type, target_text, target_named)
-  -- 构建父子关系映射：子节点 -> 父节点
-  -- 由于 parse_file_content 返回的是扁平列表，我们需要重新构建树
-  -- 这里采用简单策略：在扁平列表中，父节点是范围包含子节点的最近上层节点
   local function is_parent_of(parent, child)
     return parent.start_row <= child.start_row
       and parent.end_row >= child.end_row
@@ -727,11 +904,8 @@ local function _find_parent_by_attrs(nodes, target_type, target_text, target_nam
       and parent.depth < child.depth
   end
 
-  -- 使用公共过滤函数
   local targets, fallback = filter_nodes(nodes, {
-    node_type = target_type,
-    text = target_text,
-    named = target_named,
+    node_type = target_type, text = target_text, named = target_named,
   })
 
   if #targets == 0 then
@@ -748,66 +922,58 @@ local function _find_parent_by_attrs(nodes, target_type, target_text, target_nam
         end
       end
     end
-    table.insert(parents, {
-      target = target,
-      parent = parent,
-    })
+    table.insert(parents, { target = target, parent = parent })
   end
 
   return parents, nil, fallback
 end
 
-local function _get_parent_node(args)
+local function _get_parent_node(args, on_success, on_error)
   if not check_ts() then
-    return { error = "Tree-sitter 不可用（需要 Neovim >= 0.5）" }
+    if on_error then on_error("Tree-sitter 不可用（需要 Neovim >= 0.5）") end
+    return
   end
-
   if not args or not args.filepath then
-    return { error = "需要 filepath（文件路径）参数" }
+    if on_error then on_error("需要 filepath（文件路径）参数") end
+    return
   end
 
-  local result, err = parse_file_content(args.filepath, -1)
-  if err or not result then
-    return { filepath = args.filepath, error = err or "解析结果为空" }
-  end
-
-  local parents, perr, fallback = _find_parent_by_attrs(result.nodes or {}, args.node_type, args.text, args.named)
-  if perr or not parents then
-    return { filepath = args.filepath, error = perr or "未找到父节点" }
-  end
-
-  local parent_info = {}
-  for _, item in ipairs(parents) do
-    table.insert(parent_info, {
-      target_node = item.target,
-      parent_node = item.parent and {
-        type = item.parent.type,
-        text = item.parent.text,
-        start_row = item.parent.start_row,
-        start_col = item.parent.start_col,
-        end_row = item.parent.end_row,
-        end_col = item.parent.end_col,
-        depth = item.parent.depth,
-      } or nil,
-    })
-  end
-
-  local ret = {
-    filepath = args.filepath,
-    language = result and result.language,
-    match_count = #parent_info,
-    parents = parent_info,
-  }
-  if fallback then
-    ret.warning = "未找到指定 node_type '" .. (args.node_type or "") .. "' 的节点，已回退到同类型节点"
-  end
-  return ret
+  parse_file_content_async(args.filepath, -1, function(result)
+    local parents, perr, fallback = _find_parent_by_attrs(result.nodes or {}, args.node_type, args.text, args.named)
+    if perr or not parents then
+      if on_error then on_error(perr or "未找到父节点") end
+      return
+    end
+    local parent_info = {}
+    for _, item in ipairs(parents) do
+      table.insert(parent_info, {
+        target_node = item.target,
+        parent_node = item.parent and {
+          type = item.parent.type, text = item.parent.text,
+          start_row = item.parent.start_row, start_col = item.parent.start_col,
+          end_row = item.parent.end_row, end_col = item.parent.end_col,
+          depth = item.parent.depth,
+        } or nil,
+      })
+    end
+    local ret = {
+      filepath = args.filepath, language = result.language,
+      match_count = #parent_info, parents = parent_info,
+    }
+    if fallback then
+      ret.warning = "未找到指定 node_type '" .. (args.node_type or "") .. "' 的节点，已回退到同类型节点"
+    end
+    if on_success then on_success(ret) end
+  end, function(err)
+    if on_error then on_error(err or "解析结果为空") end
+  end)
 end
 
 M.get_parent_node = define_tool({
   name = "get_parent_node",
-  description = "获取文件中匹配节点的父节点信息，支持按 node_type、text、named 属性过滤目标节点",
+  description = "获取文件中匹配节点的父节点信息，支持按 node_type、text、named 属性过滤目标节点。如果解析器未安装，会自动尝试安装。",
   func = _get_parent_node,
+  async = true,
   parameters = {
     type = "object",
     properties = {
@@ -818,83 +984,54 @@ M.get_parent_node = define_tool({
     },
     required = { "filepath" },
   },
-  returns = {
-    type = "object",
-    description = "匹配节点的父节点信息",
-  },
+  returns = { type = "object", description = "匹配节点的父节点信息" },
   category = "treesitter",
   permissions = { read = true },
 })
 
 -- ============================================================================
--- 工具 get_child_nodes - 获取子节点列表
+-- 工具 get_child_nodes - 获取子节点列表（回调模式）
 -- ============================================================================
 
-local function _get_child_nodes(args)
-  if not check_ts() then
-    return { error = "Tree-sitter 不可用（需要 Neovim >= 0.5）" }
-  end
-
-  if not args or not args.filepath then
-    return { error = "需要 filepath（文件路径）参数" }
-  end
-
-  local result, err = parse_file_content(args.filepath, -1)
-  if err or not result then
-    return { filepath = args.filepath, error = err or "解析结果为空" }
-  end
-
-  -- 使用公共过滤函数
-  local filtered, fallback = filter_nodes(result.nodes, args)
-
-  if #filtered == 0 then
-    return { filepath = args.filepath, error = "未找到匹配的父节点" }
-  end
-
-  -- 对每个匹配的父节点，找到其直接子节点
-  -- 直接子节点：范围被父节点包含，且深度 = 父节点深度 + 1
-  local children_info = {}
-  for _, parent in ipairs(filtered) do
-    local children = {}
-    for _, candidate in ipairs(result.nodes) do
-      if
-        candidate.depth == parent.depth + 1
-        and candidate.start_row >= parent.start_row
-        and candidate.end_row <= parent.end_row
-      then
-        table.insert(children, candidate)
+local function _get_child_nodes(args, on_success, on_error)
+  _with_parsed_tree(args, on_success, on_error, function(result, filtered, fallback)
+    local children_info = {}
+    for _, parent in ipairs(filtered) do
+      local children = {}
+      for _, candidate in ipairs(result.nodes) do
+        if candidate.depth == parent.depth + 1
+          and candidate.start_row >= parent.start_row
+          and candidate.end_row <= parent.end_row
+        then
+          table.insert(children, candidate)
+        end
       end
+      table.insert(children_info, {
+        parent = {
+          type = parent.type, text = parent.text,
+          start_row = parent.start_row, start_col = parent.start_col,
+          end_row = parent.end_row, end_col = parent.end_col,
+        },
+        child_count = #children,
+        children = children,
+      })
     end
-    table.insert(children_info, {
-      parent = {
-        type = parent.type,
-        text = parent.text,
-        start_row = parent.start_row,
-        start_col = parent.start_col,
-        end_row = parent.end_row,
-        end_col = parent.end_col,
-      },
-      child_count = #children,
-      children = children,
-    })
-  end
-
-  local ret = {
-    filepath = args.filepath,
-    language = result and result.language,
-    match_count = #children_info,
-    children_info = children_info,
-  }
-  if fallback then
-    ret.warning = "未找到指定 node_type '" .. (args.node_type or "") .. "' 的节点，已回退到同类型节点"
-  end
-  return ret
+    local ret = {
+      filepath = args.filepath, language = result.language,
+      match_count = #children_info, children_info = children_info,
+    }
+    if fallback then
+      ret.warning = "未找到指定 node_type '" .. (args.node_type or "") .. "' 的节点，已回退到同类型节点"
+    end
+    return ret
+  end)
 end
 
 M.get_child_nodes = define_tool({
   name = "get_child_nodes",
-  description = "获取文件中匹配节点的直接子节点列表，支持按 node_type、text、named 属性过滤父节点",
+  description = "获取文件中匹配节点的直接子节点列表，支持按 node_type、text、named 属性过滤父节点。如果解析器未安装，会自动尝试安装。",
   func = _get_child_nodes,
+  async = true,
   parameters = {
     type = "object",
     properties = {
@@ -905,10 +1042,7 @@ M.get_child_nodes = define_tool({
     },
     required = { "filepath" },
   },
-  returns = {
-    type = "object",
-    description = "匹配父节点的子节点列表",
-  },
+  returns = { type = "object", description = "匹配父节点的子节点列表" },
   category = "treesitter",
   permissions = { read = true },
 })

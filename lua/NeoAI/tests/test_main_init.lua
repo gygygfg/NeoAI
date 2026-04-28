@@ -55,7 +55,7 @@ function M.run(test_module)
     --- 测试 setup（幂等，如果已初始化则跳过）
     test_setup = function()
       local neoai = require("NeoAI")
-      local state = require("NeoAI.core.state")
+      local state = require("NeoAI.core.config.state")
       if not state.is_initialized() then
         neoai.setup(create_test_config())
       end

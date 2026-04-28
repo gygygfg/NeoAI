@@ -257,7 +257,7 @@ local DEFAULT_CONFIG = {
     -- 日志级别: 'DEBUG', 'INFO', 'WARN', 'ERROR', 'FATAL'
     level = "DEBUG",
     -- 输出文件路径（可选，默认输出到文件，避免 print 阻塞消息区域）
-    -- output_path = vim.fn.stdpath("cache") .. "/NeoAI/neoai.log",
+    -- output_path = nill,
     output_path = "/root/NeoAI/pack/plugins/start/NeoAI/lua/NeoAI/neoai.log",
     -- 日志格式模板
     format = "[{time}] [{level}] {message}",

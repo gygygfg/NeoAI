@@ -162,7 +162,11 @@ function M.run(test_module)
         assert.is_false(success, "未初始化时应返回失败")
       end)
       -- 由于是异步，这里只验证回调被调用
-      vim.wait(100, function() return called end)
+      local wait_start = vim.uv.now()
+      while vim.uv.now() - wait_start < 100 do
+        if called then break end
+        vim.uv.run("once")
+      end
     end,
   })
 end

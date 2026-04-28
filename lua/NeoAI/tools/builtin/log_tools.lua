@@ -1,20 +1,19 @@
--- NeoAI 日志工具模块
+-- NeoAI 日志工具模块（回调模式）
 -- 提供日志记录功能
--- 每个工具的定义（名称、描述、参数、实现）集中在一起，方便修改
+-- 工具函数签名：func(args, on_success, on_error)
 
 local M = {}
 
 local define_tool = require("NeoAI.tools.builtin.tool_helpers").define_tool
 
 -- ============================================================================
--- 工具1: log_message - 记录日志消息
+-- 工具1: log_message - 记录日志消息（回调模式）
 -- ============================================================================
 
-local function _log_message(args)
-  -- print("[log_tools] log_message 开始, level=" .. tostring(args and args.level or "info"))
+local function _log_message(args, on_success, on_error)
   if not args or not args.message then
-    -- print("[log_tools] log_message 结束: 缺少消息")
-    return false
+    if on_error then on_error("缺少消息参数") end
+    return
   end
 
   local message = args.message
@@ -32,14 +31,15 @@ local function _log_message(args)
   end
 
   vim.notify("[NeoAI Tool] " .. message, vim_level)
-  -- print("[log_tools] log_message 结束: 成功")
-  return true
+
+  if on_success then on_success(true) end
 end
 
 M.log_message = define_tool({
   name = "log_message",
   description = "记录日志消息",
   func = _log_message,
+  async = true,
   parameters = {
     type = "object",
     properties = {
@@ -59,17 +59,18 @@ M.log_message = define_tool({
 })
 
 -- ============================================================================
--- 工具2: get_log_levels - 获取可用的日志级别
+-- 工具2: get_log_levels - 获取可用的日志级别（回调模式）
 -- ============================================================================
 
-local function _get_log_levels(args)
-  return { "info", "warn", "error", "debug" }
+local function _get_log_levels(args, on_success, on_error)
+  if on_success then on_success({ "info", "warn", "error", "debug" }) end
 end
 
 M.get_log_levels = define_tool({
   name = "get_log_levels",
   description = "获取可用的日志级别",
   func = _get_log_levels,
+  async = true,
   parameters = {
     type = "object",
     properties = {},

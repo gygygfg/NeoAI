@@ -1,6 +1,6 @@
--- Lua通用工具模块
+-- Lua通用工具模块（回调模式）
 -- 提供表格操作、字符串处理等常用工具函数
--- 每个工具的定义（名称、描述、参数、实现）集中在一起，方便修改
+-- 工具函数签名：func(args, on_success, on_error)
 local M = {}
 
 local define_tool = require("NeoAI.tools.builtin.tool_helpers").define_tool

@@ -82,7 +82,7 @@ function M.get_merged_config()
   neoai.setup(M.test_config)
 
   -- 获取合并后的配置
-  local state = require("NeoAI.core.state")
+local state = require("NeoAI.core.config.state")
   return state.get_config()
 end
 

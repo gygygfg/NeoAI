@@ -11,6 +11,11 @@ local state = {
   config = {},
   active_requests = {},
   request_counter = 0,
+
+  -- 请求去重缓存：key = generation_id, value = { body_hash, timestamp }
+  -- 防止同一 generation_id 的相同请求体被重复发送
+  _request_dedup = {},
+  _dedup_ttl_ms = 3000, -- 3 秒内相同的请求视为重复
 }
 
 function M.initialize(options)
@@ -32,6 +37,23 @@ function M.send_request(params)
   local api_type = params.api_type or "openai"
   local provider_config = params.provider_config or {}
 
+  -- 请求去重：检查同一 generation_id 的相同请求体是否已被发送
+  if generation_id then
+    local now = os.time() * 1000
+    local dedup_key = generation_id .. "_" .. api_type
+    local cached = state._request_dedup[dedup_key]
+    if cached then
+      -- 计算当前请求体的哈希
+      local body_for_hash = vim.json.encode(request or {})
+      local current_hash = vim.fn.sha256(body_for_hash)
+      if cached.hash == current_hash and (now - cached.timestamp) < state._dedup_ttl_ms then
+        logger.debug("[http_client] 请求去重: 跳过重复的流式请求, generation_id=" .. tostring(generation_id))
+        if on_complete then on_complete() end
+        return nil
+      end
+    end
+  end
+
   if not api_key or api_key == "" then
     return nil, "API key not configured"
   end
@@ -41,6 +63,7 @@ function M.send_request(params)
 
   local transformed = request_adapter.transform_request(request, api_type, provider_config)
   local request_body = json.encode(transformed)
+  logger.debug("[http_client] 非流式请求: " .. base_url .. " | body=" .. request_body:sub(1, 2000) .. (request_body:len() > 2000 and "...[truncated]" or ""))
   local temp_file = vim.fn.tempname()
   local headers = request_adapter.get_headers(api_key, api_type)
 
@@ -69,10 +92,26 @@ function M.send_request(params)
   pcall(vim.fn.delete, temp_file)
   if not content or content == "" then return nil, "Empty response" end
 
+  logger.debug("[http_client] 非流式响应: " .. base_url .. " | body=" .. content:sub(1, 2000) .. (content:len() > 2000 and "...[truncated]" or ""))
+
   local ok, response = pcall(json.decode, content)
-  if not ok then return nil, "JSON parse failed" end
+  if not ok then
+    logger.debug("[http_client] JSON 解析失败: " .. (content:sub(1, 500)))
+    return nil, "JSON parse failed"
+  end
   if response.error then
+    logger.debug("[http_client] API 错误: " .. (response.error.message or json.encode(response.error)))
     return nil, response.error.message or json.encode(response.error)
+  end
+
+  -- 更新去重缓存
+  if generation_id then
+    local dedup_key = generation_id .. "_" .. api_type .. "_nonstream"
+    local body_for_hash = vim.json.encode(request or {})
+    state._request_dedup[dedup_key] = {
+      hash = vim.fn.sha256(body_for_hash),
+      timestamp = os.time() * 1000,
+    }
   end
 
   return request_adapter.transform_response(response, api_type), nil
@@ -93,15 +132,32 @@ function M.send_stream_request(params, on_chunk, on_complete, on_error)
   local provider_config = params.provider_config or {}
 
   if not api_key or api_key == "" then
-    if on_error then on_error("API key not configured") end; return nil
+    return nil, "API key not configured"
   end
   if not base_url or base_url == "" then
-    if on_error then on_error("API base URL not configured") end; return nil
+    return nil, "API base URL not configured"
+  end
+
+  -- 请求去重：检查同一 generation_id 的相同请求体是否已被发送
+  if generation_id then
+    local now = os.time() * 1000
+    local dedup_key = generation_id .. "_" .. api_type .. "_stream"
+    local cached = state._request_dedup[dedup_key]
+    if cached then
+      local body_for_hash = vim.json.encode(request or {})
+      local current_hash = vim.fn.sha256(body_for_hash)
+      if cached.hash == current_hash and (now - cached.timestamp) < state._dedup_ttl_ms then
+        logger.debug("[http_client] 请求去重: 跳过重复的流式请求, generation_id=" .. tostring(generation_id))
+        if on_complete then on_complete() end
+        return nil
+      end
+    end
   end
 
   request.stream = true
   local transformed = request_adapter.transform_request(request, api_type, provider_config)
   local request_body = json.encode(transformed)
+  logger.debug("[http_client] 流式请求: " .. base_url .. " | body=" .. request_body:sub(1, 2000) .. (request_body:len() > 2000 and "...[truncated]" or ""))
   -- 对短请求体（< 8KB）使用 --data-raw 避免临时文件 I/O
   local use_temp_file = #request_body > 8192
   local temp_file = use_temp_file and vim.fn.tempname() or nil
@@ -113,6 +169,16 @@ function M.send_stream_request(params, on_chunk, on_complete, on_error)
     cancelled = false, has_error = false, buffer = "",
   }
 
+  -- 更新去重缓存
+  if generation_id then
+    local dedup_key = generation_id .. "_" .. api_type .. "_stream"
+    local body_for_hash = vim.json.encode(request or {})
+    state._request_dedup[dedup_key] = {
+      hash = vim.fn.sha256(body_for_hash),
+      timestamp = os.time() * 1000,
+    }
+  end
+
   local function process_sse_line(line)
     if line == "" then return end
     local data_str = line:match("^data: (.*)")
@@ -120,6 +186,7 @@ function M.send_stream_request(params, on_chunk, on_complete, on_error)
       if data_str == "[DONE]" then return end
       local ok, data = pcall(json.decode, data_str)
       if ok and data then
+        logger.debug("[http_client] 流式数据块: " .. data_str:sub(1, 500) .. (data_str:len() > 500 and "...[truncated]" or ""))
         if data.error then
           local req = state.active_requests[request_id]
           if req then req.has_error = true end
@@ -165,6 +232,7 @@ function M.send_stream_request(params, on_chunk, on_complete, on_error)
     req = state.active_requests[request_id]
     local has_error = req and req.has_error
     if req then state.active_requests[request_id] = nil end
+    logger.debug("[http_client] 流式请求完成: " .. base_url .. " | has_error=" .. tostring(has_error))
     if not has_error and on_complete then on_complete() end
   end
 
@@ -174,6 +242,7 @@ function M.send_stream_request(params, on_chunk, on_complete, on_error)
       if req.cancelled then state.active_requests[request_id] = nil; return end
       state.active_requests[request_id] = nil
     else return end
+    logger.debug("[http_client] 流式请求错误: " .. base_url .. " | error=" .. err_msg)
     if on_error then on_error(err_msg) end
   end
 
@@ -235,6 +304,8 @@ end
 function M.cancel_all_requests()
   for id, _ in pairs(state.active_requests) do M.cancel_request(id) end
   state.active_requests = {}
+  -- 清理去重缓存
+  state._request_dedup = {}
 end
 
 function M.get_state()

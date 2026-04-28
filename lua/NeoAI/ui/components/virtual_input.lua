@@ -217,12 +217,17 @@ function M.open(parent_win, opts)
   -- 设置按键映射
   M._setup_float_keymaps()
 
-  -- 延时 50ms 后移动光标到输入框并进入插入模式
+  -- 延迟聚焦到输入框，确保在 _do_render_chat 的异步回调（set_window_content、_focus_window 等）执行完后才设置焦点
+  -- 避免被 _do_render_chat 中的操作抢走焦点
   vim.defer_fn(function()
     if state.float_win and vim.api.nvim_win_is_valid(state.float_win) then
-      vim.cmd("startinsert!")
+      pcall(function()
+        vim.api.nvim_set_current_win(state.float_win)
+        vim.api.nvim_win_set_cursor(state.float_win, { 1, 2 })
+        vim.cmd("startinsert!")
+      end)
     end
-  end, 50)
+  end, 10)
 
   state.active = true
   return true
@@ -263,15 +268,16 @@ function M.close(force)
     state._saved_parent_config = nil
   end
 
-  -- 切换到 NORMAL 模式
-  pcall(function()
-    vim.cmd.stopinsert()
-  end)
-
-  -- 将焦点移回父窗口（chat 窗口）
+  -- 先将焦点移回父窗口（chat 窗口），然后再退出插入模式
+  -- 顺序很重要：先切窗口确保 stopinsert 在正确的上下文中执行
   if state.parent_win and vim.api.nvim_win_is_valid(state.parent_win) then
     pcall(vim.api.nvim_set_current_win, state.parent_win)
   end
+
+  -- 切换到 NORMAL 模式（在父窗口上下文中执行，确保正确退出）
+  pcall(function()
+    vim.cmd.stopinsert()
+  end)
 
   state.active = false
   state.parent_win = nil
@@ -465,23 +471,10 @@ function M._setup_float_keymaps()
     M._submit_float()
   end, { buffer = buf, noremap = true, silent = true, desc = "发送消息" })
 
-  -- 取消生成（Esc）
-  local Events = require("NeoAI.core.events.event_constants")
+  -- Esc：退出插入模式回到 normal 模式（不关闭输入框）
   vim.keymap.set("i", "<Esc>", function()
-    vim.api.nvim_exec_autocmds("User", {
-      pattern = Events.CANCEL_GENERATION,
-      data = {},
-    })
     vim.cmd("stopinsert")
-  end, { buffer = buf, noremap = true, silent = true, desc = "取消生成或退出插入模式" })
-
-  -- normal 模式下按 Esc 也尝试取消生成
-  vim.keymap.set("n", "<Esc>", function()
-    vim.api.nvim_exec_autocmds("User", {
-      pattern = Events.CANCEL_GENERATION,
-      data = {},
-    })
-  end, { buffer = buf, noremap = true, silent = true, desc = "取消生成" })
+  end, { buffer = buf, noremap = true, silent = true, desc = "退出插入模式" })
 
   -- i 在 normal 模式下进入插入模式
   vim.keymap.set("n", "i", function()
@@ -564,7 +557,7 @@ end
 
 --- 提交浮动输入框内容
 function M._submit_float()
-  if not state.active or not state.float_buf then
+  if not state.active or not state.float_buf or not vim.api.nvim_buf_is_valid(state.float_buf) then
     return
   end
 
@@ -585,7 +578,9 @@ function M._submit_float()
   end
 
   -- 清空输入并恢复提示符
-  vim.api.nvim_buf_set_lines(state.float_buf, 0, -1, false, { "> " })
+  if state.float_buf and vim.api.nvim_buf_is_valid(state.float_buf) then
+    vim.api.nvim_buf_set_lines(state.float_buf, 0, -1, false, { "> " })
+  end
 
   -- 重新聚焦输入框
   if state.float_win and vim.api.nvim_win_is_valid(state.float_win) then
@@ -627,7 +622,7 @@ function M._setup_keymaps()
   end, { buffer = buf, noremap = true, silent = true, desc = "发送消息" })
 
   -- 退出插入模式或取消生成
-  local Events = require("NeoAI.core.events.event_constants")
+  local Events = require("NeoAI.core.events")
   vim.keymap.set("i", "<Esc>", function()
     vim.api.nvim_exec_autocmds("User", {
       pattern = Events.CANCEL_GENERATION,
@@ -738,14 +733,15 @@ function M.focus_and_insert()
     return
   end
 
-  -- 将当前窗口设为浮动输入框
-  pcall(vim.api.nvim_set_current_win, state.float_win)
-
-  -- 将光标定位到 > 后面
-  pcall(vim.api.nvim_win_set_cursor, state.float_win, { 1, 2 })
-
-  -- 进入插入模式
-  vim.cmd("startinsert!")
+  -- 延迟聚焦，确保在异步回调（如 _do_render_chat 的 set_window_content）执行完后才设置焦点
+  vim.defer_fn(function()
+    if not state.float_win or not vim.api.nvim_win_is_valid(state.float_win) then
+      return
+    end
+    pcall(vim.api.nvim_set_current_win, state.float_win)
+    pcall(vim.api.nvim_win_set_cursor, state.float_win, { 1, 2 })
+    vim.cmd("startinsert!")
+  end, 10)
 end
 
 --- 是否激活

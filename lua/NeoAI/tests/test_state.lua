@@ -1,4 +1,4 @@
---- 测试: core/state.lua
+--- 测试: core/config/state.lua
 --- 测试统一状态管理器的初始化、配置获取、重置等功能
 local M = {}
 
@@ -13,7 +13,7 @@ function M.run(test_module)
   return test.run_tests({
     --- 测试 initialize 和 is_initialized
     test_initialize = function()
-      local state = require("NeoAI.core.state")
+      local state = require("NeoAI.core.config.state")
       state._test_reset()
 
       assert.is_false(state.is_initialized(), "重置后应未初始化")
@@ -23,7 +23,7 @@ function M.run(test_module)
 
     --- 测试 get_config
     test_get_config = function()
-      local state = require("NeoAI.core.state")
+      local state = require("NeoAI.core.config.state")
       state._test_reset()
 
       state.initialize({ key1 = "val1", key2 = { nested = true } })
@@ -34,7 +34,7 @@ function M.run(test_module)
 
     --- 测试 get_config_value（点号路径）
     test_get_config_value = function()
-      local state = require("NeoAI.core.state")
+      local state = require("NeoAI.core.config.state")
       state._test_reset()
 
       state.initialize({
@@ -59,7 +59,7 @@ function M.run(test_module)
 
     --- 测试重复初始化
     test_double_initialize = function()
-      local state = require("NeoAI.core.state")
+      local state = require("NeoAI.core.config.state")
       state._test_reset()
 
       state.initialize({ version = 1 })
@@ -70,7 +70,7 @@ function M.run(test_module)
 
     --- 测试 _test_reset
     test_reset = function()
-      local state = require("NeoAI.core.state")
+      local state = require("NeoAI.core.config.state")
       state._test_reset()
 
       assert.is_false(state.is_initialized())
@@ -79,7 +79,7 @@ function M.run(test_module)
 
     --- 测试 get_config_value 返回完整配置
     test_get_config_value_no_key = function()
-      local state = require("NeoAI.core.state")
+      local state = require("NeoAI.core.config.state")
       state._test_reset()
 
       state.initialize({ foo = "bar" })

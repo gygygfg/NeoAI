@@ -1,4 +1,4 @@
---- 测试: core/events/event_constants.lua
+--- 测试: core/events.lua
 --- 验证所有事件常量定义正确、无重复、命名规范
 local M = {}
 
@@ -13,7 +13,7 @@ function M.run(test_module)
   return test.run_tests({
     --- 测试所有常量已定义且为字符串
     test_all_constants_are_strings = function()
-      local Events = require("NeoAI.core.events.event_constants")
+      local Events = require("NeoAI.core.events")
       for name, value in pairs(Events) do
         assert.is_true(type(value) == "string",
           string.format("常量 %s 应为字符串, 实际为 %s", name, type(value)))
@@ -22,7 +22,7 @@ function M.run(test_module)
 
     --- 测试所有常量以 "NeoAI:" 开头
     test_all_constants_have_prefix = function()
-      local Events = require("NeoAI.core.events.event_constants")
+      local Events = require("NeoAI.core.events")
       for name, value in pairs(Events) do
         assert.is_true(string.find(value, "^NeoAI:") ~= nil,
           string.format("常量 %s 的值 '%s' 应以 'NeoAI:' 开头", name, value))
@@ -31,7 +31,7 @@ function M.run(test_module)
 
     --- 测试无重复值
     test_no_duplicate_values = function()
-      local Events = require("NeoAI.core.events.event_constants")
+      local Events = require("NeoAI.core.events")
       local seen = {}
       for name, value in pairs(Events) do
         if seen[value] then
@@ -43,7 +43,7 @@ function M.run(test_module)
 
     --- 测试关键常量存在
     test_key_constants_exist = function()
-      local Events = require("NeoAI.core.events.event_constants")
+      local Events = require("NeoAI.core.events")
       local required = {
         "GENERATION_STARTED", "GENERATION_COMPLETED", "GENERATION_ERROR",
         "STREAM_STARTED", "STREAM_CHUNK", "STREAM_COMPLETED",
@@ -62,7 +62,7 @@ function M.run(test_module)
 
     --- 测试常量命名规范（大写+下划线）
     test_naming_convention = function()
-      local Events = require("NeoAI.core.events.event_constants")
+      local Events = require("NeoAI.core.events")
       for name, _ in pairs(Events) do
         assert.is_true(string.match(name, "^[A-Z][A-Z0-9_]*$") ~= nil,
           string.format("常量名 '%s' 不符合大写+下划线规范", name))
@@ -71,7 +71,7 @@ function M.run(test_module)
 
     --- 测试常量数量
     test_constant_count = function()
-      local Events = require("NeoAI.core.events.event_constants")
+      local Events = require("NeoAI.core.events")
       local count = 0
       for _ in pairs(Events) do
         count = count + 1

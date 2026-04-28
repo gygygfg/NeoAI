@@ -5,7 +5,7 @@
 local M = {}
 
 local logger = require("NeoAI.utils.logger")
-local Events = require("NeoAI.core.events.event_constants")
+local Events = require("NeoAI.core.events")
 local window_manager = require("NeoAI.ui.window.window_manager")
 local async_worker = require("NeoAI.utils.async_worker")
 
@@ -268,19 +268,11 @@ function M._build_display_content()
 end
 
 --- 构建行号到真实会话ID的映射
---- 与 _build_display_content 的渲染逻辑保持一致：
---- 第0行标题，第1行空行，之后每个 flat_items 项占一行（包括虚拟节点）
 function M._build_line_to_session_map()
   local map = {}
-  -- 第0行是标题，第1行是空行，从第2行开始是 flat_items 的渲染行
-  -- 注意：flat_items 中的每个元素（包括虚拟节点）都占用一行
-  -- 所以 line 必须为每个 flat_items 项递增，不能跳过虚拟节点
   for line, item in ipairs(state.flat_items) do
-    -- line 是 1-based 的 flat_items 索引，对应 buffer 行号 = line + 1（因为标题和空行占了2行）
-    -- 但我们需要 0-based 的 buffer 行号，所以用 line + 1
-    local buf_line = line + 1 -- 0-based buffer 行号
     if not item.is_virtual and item.session_id then
-      map[buf_line] = item.session_id
+      map[line + 1] = item.session_id
     end
   end
   return map
@@ -426,65 +418,39 @@ end
 --- 移动选中
 function M._move_selection(direction)
   local line_map = M._build_line_to_session_map()
-  local total_lines = 0
-  for _ in pairs(line_map) do
-    total_lines = total_lines + 1
-  end
-  if total_lines == 0 then
-    return
-  end
+  local sorted = {}
+  for line, _ in pairs(line_map) do table.insert(sorted, line) end
+  table.sort(sorted)
+  if #sorted == 0 then return end
 
-  -- 找到当前选中的行号
-  local current_line = nil
+  local current = nil
   for line, sid in pairs(line_map) do
-    if sid == state.selected_session_id then
-      current_line = line
-      break
-    end
+    if sid == state.selected_session_id then current = line; break end
   end
-
-  -- 构建有序行号列表
-  local sorted_lines = {}
-  for line, _ in pairs(line_map) do
-    table.insert(sorted_lines, line)
-  end
-  table.sort(sorted_lines)
 
   local new_line
-  if current_line == nil then
-    new_line = sorted_lines[1]
+  if not current then
+    new_line = sorted[1]
   elseif direction == "up" then
-    for i = #sorted_lines, 1, -1 do
-      if sorted_lines[i] < current_line then
-        new_line = sorted_lines[i]
-        break
-      end
+    for i = #sorted, 1, -1 do
+      if sorted[i] < current then new_line = sorted[i]; break end
     end
-    if not new_line then
-      new_line = sorted_lines[#sorted_lines] -- 循环到末尾
-    end
+    new_line = new_line or sorted[#sorted]
   elseif direction == "down" then
-    for i = 1, #sorted_lines do
-      if sorted_lines[i] > current_line then
-        new_line = sorted_lines[i]
-        break
-      end
+    for i = 1, #sorted do
+      if sorted[i] > current then new_line = sorted[i]; break end
     end
-    if not new_line then
-      new_line = sorted_lines[1] -- 循环到开头
-    end
+    new_line = new_line or sorted[1]
   end
 
   if new_line then
     state.selected_session_id = line_map[new_line]
-    local win_handle = window_manager.get_window_win(state.current_window_id)
-    if win_handle and vim.api.nvim_win_is_valid(win_handle) then
-      local cursor_line = new_line
-      vim.api.nvim_win_set_cursor(win_handle, { cursor_line + 1, 0 })
+    local win = window_manager.get_window_win(state.current_window_id)
+    if win and vim.api.nvim_win_is_valid(win) then
+      vim.api.nvim_win_set_cursor(win, { new_line + 1, 0 })
     end
     M._update_float_window()
-    local handlers = require("NeoAI.ui.handlers.tree_handlers")
-    handlers.handle_cursor_moved()
+    require("NeoAI.ui.handlers.tree_handlers").handle_cursor_moved()
   end
 end
 

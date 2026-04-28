@@ -7,7 +7,7 @@ local default_config = require("NeoAI.default_config")
 local core = require("NeoAI.core")
 local ui = require("NeoAI.ui")
 local tools = require("NeoAI.tools")
-local state_manager = require("NeoAI.core.state")
+local state_manager = require("NeoAI.core.config.state")
 
 -- 模块引用（初始化后赋值）
 local core_ref

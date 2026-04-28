@@ -20,7 +20,7 @@
 local M = {}
 
 local logger = require("NeoAI.utils.logger")
-local Events = require("NeoAI.core.events.event_constants")
+local Events = require("NeoAI.core.events")
 
 local state = {
   initialized = false,

@@ -3,7 +3,7 @@
 local M = {}
 
 local logger = require("NeoAI.utils.logger")
-local event_constants = require("NeoAI.core.events.event_constants")
+local event_constants = require("NeoAI.core.events")
 local json = require("NeoAI.utils.json")
 local default_config = require("NeoAI.default_config")
 
@@ -193,12 +193,54 @@ end
 
 -- ========== 消息处理 ==========
 
---- 格式化消息
+--- 格式化消息（带多层去重）
+--- 去重规则：
+--- 1. 连续相同的 user 消息只保留最后一条
+--- 2. 连续相同的 assistant 消息只保留最后一条
+--- 3. 未匹配的 tool_call_id 添加占位消息（已有）
 local function format_messages(messages)
   if not messages then
     return {}
   end
+
+  -- 第一步：预去重，移除连续重复的消息
+  local deduped = {}
+  for _, msg in ipairs(messages) do
+    local last = deduped[#deduped]
+    if last and last.role == msg.role and last.role ~= "tool" then
+      -- 对于 user 和 assistant 消息，检查内容是否相同
+      local last_content = type(last.content) == "string" and last.content or ""
+      local msg_content = type(msg.content) == "string" and msg.content or ""
+      if last_content == msg_content then
+        -- 跳过重复消息
+        goto continue
+      end
+    end
+    -- 对于 tool 消息，检查 tool_call_id 是否重复
+    if last and last.role == "tool" and msg.role == "tool" then
+      if last.tool_call_id == msg.tool_call_id then
+        goto continue
+      end
+    end
+    table.insert(deduped, msg)
+    ::continue::
+  end
+
+  -- 使用去重后的消息列表
+  messages = deduped
+
   local result = {}
+  -- 收集所有 tool_call_id（来自 assistant 消息的 tool_calls）
+  local expected_tool_call_ids = {} ---@type table<string,boolean>
+  for _, msg in ipairs(messages) do
+    if msg.tool_calls then
+      for _, tc in ipairs(msg.tool_calls) do
+        if tc.id and tc.id ~= "" then
+          expected_tool_call_ids[tc.id] = true
+        end
+      end
+    end
+  end
   for _, msg in ipairs(messages) do
     local fm = { role = msg.role or "user" }
     if msg.content then
@@ -210,6 +252,8 @@ local function format_messages(messages)
     if msg.role == "tool" then
       if msg.tool_call_id and msg.tool_call_id ~= "" then
         fm.tool_call_id = msg.tool_call_id
+        -- 从期望列表中移除已匹配的 tool_call_id
+        expected_tool_call_ids[msg.tool_call_id] = nil
       else
         fm.role = "user"
       end
@@ -226,6 +270,14 @@ local function format_messages(messages)
       fm.reasoning_content = msg.reasoning_content
     end
     table.insert(result, fm)
+  end
+  -- 检查是否有未匹配的 tool_call_id（assistant 的 tool_calls 没有对应的 tool 消息）
+  local missing_ids = vim.tbl_keys(expected_tool_call_ids)
+  if #missing_ids > 0 then
+    -- logger.warn("[format_messages] 发现 " .. #missing_ids .. " 个未匹配的 tool_call_id，添加占位 tool 消息: " .. table.concat(missing_ids, ", "))
+    for _, id in ipairs(missing_ids) do
+      table.insert(result, { role = "tool", tool_call_id = id, content = "[工具结果缺失]" })
+    end
   end
   return result
 end
@@ -596,6 +648,10 @@ function M._send_non_stream_request(generation_id, request, params)
   _reasoning_throttle.processor = nil
   _reasoning_throttle.params = nil
 
+  -- 防御性检查：确保 active_generations 表存在
+  if not state.active_generations then
+    return
+  end
   local generation = state.active_generations[generation_id]
   if not generation then
     return
@@ -613,7 +669,7 @@ function M._send_non_stream_request(generation_id, request, params)
   })
 
   if err then
-    if not state.is_generating or not state.active_generations[generation_id] then
+    if not state.is_generating or not state.active_generations or not state.active_generations[generation_id] then
       return
     end
     if generation.retry_count < state.max_retries then
@@ -651,7 +707,14 @@ function M._send_stream_request(generation_id, request, params)
   local window_id = params.window_id
   local options = params.options or {}
 
-  logger.debug("[ai_engine] _send_stream_request: generation_id=" .. tostring(generation_id) .. ", session_id=" .. tostring(session_id) .. ", is_tool_loop=" .. tostring(params.is_tool_loop))
+  logger.debug(
+    "[ai_engine] _send_stream_request: generation_id="
+      .. tostring(generation_id)
+      .. ", session_id="
+      .. tostring(session_id)
+      .. ", is_tool_loop="
+      .. tostring(params.is_tool_loop)
+  )
 
   vim.api.nvim_exec_autocmds("User", {
     pattern = event_constants.STREAM_STARTED,
@@ -659,6 +722,10 @@ function M._send_stream_request(generation_id, request, params)
   })
 
   local processor = create_stream_processor(generation_id, session_id, window_id)
+  -- 防御性检查：确保 active_generations 表存在
+  if not state.active_generations then
+    state.active_generations = {}
+  end
   local gen = state.active_generations[generation_id]
   if gen then
     gen._stream_processor = processor
@@ -674,13 +741,18 @@ function M._send_stream_request(generation_id, request, params)
   end
 
   if not ai_preset.base_url or not ai_preset.api_key then
-    logger.error("[ai_engine] _send_stream_request: 无法获取有效的 AI 配置，base_url=" .. tostring(ai_preset.base_url) .. ", api_key=" .. tostring(ai_preset.api_key and "***" or nil))
+    logger.error(
+      "[ai_engine] _send_stream_request: 无法获取有效的 AI 配置，base_url="
+        .. tostring(ai_preset.base_url)
+        .. ", api_key="
+        .. tostring(ai_preset.api_key and "***" or nil)
+    )
     M.handle_generation_error(generation_id, "AI 配置无效：缺少 base_url 或 api_key")
     return
   end
 
   local function retry_or_error(err)
-    if not state.is_generating or not state.active_generations[generation_id] then
+    if not state.is_generating or not state.active_generations or not state.active_generations[generation_id] then
       return
     end
     local g = state.active_generations[generation_id]
@@ -1216,16 +1288,51 @@ function M.handle_tool_result(data)
   local accumulated_usage = data.accumulated_usage or {}
   local last_reasoning = data.last_reasoning
 
-  logger.debug("[ai_engine] handle_tool_result: 会话=" .. tostring(session_id) .. ", generation_id=" .. tostring(generation_id) .. ", is_final_round=" .. tostring(is_final_round) .. ", 消息数=" .. tostring(#(messages or {})))
+  logger.debug(
+    "[ai_engine] handle_tool_result: 会话="
+      .. tostring(session_id)
+      .. ", generation_id="
+      .. tostring(generation_id)
+      .. ", is_final_round="
+      .. tostring(is_final_round)
+      .. ", 消息数="
+      .. tostring(#(messages or {}))
+  )
 
   if not messages or #messages == 0 then
     logger.warn("handle_tool_result: 消息为空，跳过")
     return
   end
 
+  -- 消息去重：移除连续重复的 tool 消息（防止 tool_call_id 未匹配导致叠加）
+  local cleaned_messages = {}
+  for _, msg in ipairs(messages) do
+    local last = cleaned_messages[#cleaned_messages]
+    if last and last.role == "tool" and msg.role == "tool" and last.tool_call_id == msg.tool_call_id then
+      -- 跳过重复的 tool 消息
+      goto skip_msg
+    end
+    if last and last.role == "assistant" and msg.role == "assistant" then
+      local last_content = type(last.content) == "string" and last.content or ""
+      local msg_content = type(msg.content) == "string" and msg.content or ""
+      if last_content == msg_content and not last.tool_calls and not msg.tool_calls then
+        goto skip_msg
+      end
+    end
+    table.insert(cleaned_messages, msg)
+    ::skip_msg::
+  end
+  messages = cleaned_messages
+
   -- 如果已有其他 generation 在生成中，跳过（防止竞态）
   if state.is_generating and state.current_generation_id ~= generation_id then
-    logger.warn("handle_tool_result: 其他 generation 正在生成中，跳过 (current=" .. tostring(state.current_generation_id) .. ", expected=" .. tostring(generation_id) .. ")")
+    logger.warn(
+      "handle_tool_result: 其他 generation 正在生成中，跳过 (current="
+        .. tostring(state.current_generation_id)
+        .. ", expected="
+        .. tostring(generation_id)
+        .. ")"
+    )
     return
   end
 
@@ -1246,6 +1353,19 @@ function M.handle_tool_result(data)
   state.is_generating = true
   state.current_generation_id = generation_id
 
+  -- 防御性检查：确保 active_generations 表存在（防止竞态条件或模块重载导致 nil）
+  if not state.active_generations then
+    state.active_generations = {}
+  end
+
+  -- 防御性检查：如果 generation_id 为 nil，跳过处理（防止竞态条件导致崩溃）
+  if not generation_id then
+    logger.warn("handle_tool_result: generation_id 为 nil，跳过")
+    state.is_generating = false
+    state.current_generation_id = nil
+    return
+  end
+
   -- 更新或创建 generation 记录
   if not state.active_generations[generation_id] then
     state.active_generations[generation_id] = {
@@ -1262,12 +1382,33 @@ function M.handle_tool_result(data)
     }
   else
     local gen = state.active_generations[generation_id]
-    gen.messages = messages
-    gen.options = options
-    gen.ai_preset = ai_preset  -- 修复：更新 ai_preset，确保后续 HTTP 请求使用正确的配置
-    gen.model_index = model_index
-    gen.accumulated_usage = accumulated_usage
-    gen.last_reasoning_content = last_reasoning
+    if not gen then
+      -- 竞态条件：generation 记录已被清理（如 cancel_generation），重新创建
+      logger.warn(
+        "handle_tool_result: generation 记录已被清理，重新创建 (generation_id="
+          .. tostring(generation_id)
+          .. ")"
+      )
+      state.active_generations[generation_id] = {
+        start_time = os.time(),
+        messages = messages,
+        session_id = session_id,
+        window_id = window_id,
+        options = options,
+        model_index = model_index,
+        ai_preset = ai_preset,
+        retry_count = 0,
+        accumulated_usage = accumulated_usage,
+        last_reasoning_content = last_reasoning,
+      }
+    else
+      gen.messages = messages
+      gen.options = options
+      gen.ai_preset = ai_preset -- 修复：更新 ai_preset，确保后续 HTTP 请求使用正确的配置
+      gen.model_index = model_index
+      gen.accumulated_usage = accumulated_usage
+      gen.last_reasoning_content = last_reasoning
+    end
   end
 
   -- 构建并发送 AI 请求
@@ -1307,17 +1448,21 @@ function M.handle_tool_result(data)
   })
 
   if request.stream then
-    M._send_stream_request(
-      generation_id,
-      request,
-      { session_id = session_id, window_id = window_id, options = options, is_tool_loop = true, is_final_round = is_final_round }
-    )
+    M._send_stream_request(generation_id, request, {
+      session_id = session_id,
+      window_id = window_id,
+      options = options,
+      is_tool_loop = true,
+      is_final_round = is_final_round,
+    })
   else
-    M._send_non_stream_request(
-      generation_id,
-      request,
-      { session_id = session_id, window_id = window_id, options = options, is_tool_loop = true, is_final_round = is_final_round }
-    )
+    M._send_non_stream_request(generation_id, request, {
+      session_id = session_id,
+      window_id = window_id,
+      options = options,
+      is_tool_loop = true,
+      is_final_round = is_final_round,
+    })
   end
 end
 

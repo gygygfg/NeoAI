@@ -172,19 +172,14 @@ function M.default(value, default)
 end
 
 --- 非阻塞等待（事件驱动）
--- 使用 vim.wait 处理事件循环，不阻塞 UI
+-- 使用 vim.uv.run('once') 处理事件循环，不阻塞 UI
+-- 注意：不使用 vim.wait，因为 vim.wait 会阻塞 Neovim 事件循环
+-- 导致 curl job 的 on_stdout/on_exit 回调无法被处理
 -- @param ms number 毫秒数
--- @param interval number 事件轮询间隔（毫秒），默认 50
 function M.sleep(ms)
-  if vim.wait then
-    vim.wait(ms, function() return false end, math.min(ms, 50))
-  else
-    -- 回退：使用 vim.loop 定时器（非阻塞）
-    local timer = vim.loop.new_timer()
-    timer:start(ms, 0, vim.schedule_wrap(function()
-      timer:close()
-    end))
-    vim.wait(ms + 100, function() return false end, 50)
+  local start = vim.uv.now()
+  while vim.uv.now() - start < ms do
+    vim.uv.run("once")
   end
 end
 
