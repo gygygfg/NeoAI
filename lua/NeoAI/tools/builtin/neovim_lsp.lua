@@ -2779,7 +2779,8 @@ local function _lsp_client_info(args)
     if load_err then
       file_entry.error = "文件加载失败: " .. load_err
     else
-      local clients = vim.lsp.get_clients({ bufnr = bufnr })
+      -- 使用 LspAttach 事件等待 LSP 客户端 attach 到缓冲区（最多等待 30 秒）
+      local clients = wait_for_lsp_attach(bufnr, 30000)
       if not clients or #clients == 0 then
         file_entry.error = "该文件没有关联的 LSP 客户端"
       else
@@ -3227,7 +3228,6 @@ local function _lsp_service_info()
   return {
     service_type = _lsp_service_type or "unknown",
     mason_installed = mason_names,
-    active_formal_clients = active_info,
     available_formal_servers = available,
   }
 end

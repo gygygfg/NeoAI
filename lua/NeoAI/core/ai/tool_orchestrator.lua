@@ -276,6 +276,9 @@ end
 
 -- ========== 循环调度 ==========
 
+-- 全局 ESC 停止监听器 ID（在循环开始时注册，结束时清理）
+local _stop_listener_id = nil
+
 function M.start_async_loop(params)
   if not params then return end
   if not state.initialized then
@@ -305,6 +308,28 @@ function M.start_async_loop(params)
   fire_loop_started(ss, params.tool_calls)
 
   ss.current_iteration = 1
+
+  -- 注册全局 ESC 停止监听器（仅在循环开始时注册一次）
+  -- 确保工具调用和循环过程中按 ESC 能立即停止
+  if not _stop_listener_id then
+    _stop_listener_id = vim.api.nvim_create_autocmd("User", {
+      pattern = event_constants.CANCEL_GENERATION,
+      callback = function()
+        -- 停止所有会话的工具循环
+        for sid, _ in pairs(state.sessions) do
+          local s = state.sessions[sid]
+          if s then
+            s.stop_requested = true
+            s.active_tool_calls = {}
+          end
+        end
+        -- 清理所有活跃的 HTTP 请求
+        local http_client = require("NeoAI.core.ai.http_client")
+        http_client.cancel_all_requests()
+      end,
+    })
+  end
+
   M._execute_tools(session_id, params.tool_calls or {})
 end
 
@@ -590,6 +615,20 @@ end
 function M._finish_loop(session_id, success, result)
   local ss = state.sessions[session_id]
   if not ss then return end
+
+  -- 检查是否所有会话都已空闲，如果是则清理全局 ESC 监听器
+  local all_idle = true
+  for _, s in pairs(state.sessions) do
+    if s.phase ~= "idle" then
+      all_idle = false
+      break
+    end
+  end
+  if all_idle and _stop_listener_id then
+    pcall(vim.api.nvim_del_autocmd, _stop_listener_id)
+    _stop_listener_id = nil
+  end
+
   if ss.on_complete == nil then return end
 
   local on_complete = ss.on_complete
@@ -646,6 +685,12 @@ function M.is_stop_requested(session_id)
   if session_id then
     local ss = state.sessions[session_id]
     return ss and ss.stop_requested or false
+  end
+  -- 无 session_id 时检查所有 session
+  for _, ss in pairs(state.sessions) do
+    if ss.stop_requested then
+      return true
+    end
   end
   return false
 end
@@ -709,6 +754,11 @@ end
 -- ========== 关闭清理 ==========
 
 function M.shutdown()
+  -- 清理全局 ESC 停止监听器
+  if _stop_listener_id then
+    pcall(vim.api.nvim_del_autocmd, _stop_listener_id)
+    _stop_listener_id = nil
+  end
   for session_id, _ in pairs(state.sessions) do
     M.unregister_session(session_id)
   end

@@ -426,7 +426,7 @@ function M.set_window_content(window_id, content)
     vim.api.nvim_set_option_value("modified", false, { buf = buf })
     local win = wi.win
     if win and vim.api.nvim_win_is_valid(win) then
-      for _, opt in ipairs({ { "foldmethod", "marker" }, { "foldmarker", "{{{,}}}" }, { "foldlevel", 0 }, { "foldenable", true }, { "wrap", true }, { "linebreak", true } }) do
+for _, opt in ipairs({ { "foldmethod", "marker" }, { "foldmarker", "{{{,}}}" }, { "foldlevel", 0 }, { "foldenable", true }, { "wrap", true }, { "linebreak", true } }) do
         vim.api.nvim_set_option_value(opt[1], opt[2], { win = win })
       end
     end

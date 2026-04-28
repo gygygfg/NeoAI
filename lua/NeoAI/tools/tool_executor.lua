@@ -185,12 +185,26 @@ function M.execute_async(tool_name, args, on_success, on_error)
       on_error_wrapper(tostring(call_err))
     end
   else
-    local ok, result_or_err = pcall(tool.func, resolved_args)
-    if ok then
-      on_success_wrapper(result_or_err)
-    else
-      on_error_wrapper(tostring(result_or_err))
-    end
+    -- 同步工具：通过 vim.schedule 执行，避免阻塞主线程导致停止快捷键无效
+    -- 同时检查 stop_requested 状态，支持提前取消
+    vim.schedule(function()
+      -- 使用 pcall 延迟加载，避免循环依赖（tool_orchestrator 引用了 tool_executor）
+      local orc_ok, tool_orc = pcall(require, "NeoAI.core.ai.tool_orchestrator")
+      if orc_ok and tool_orc.is_stop_requested() then
+        on_error_wrapper("工具执行已取消")
+        return
+      end
+      local ok, result_or_err = pcall(tool.func, resolved_args)
+      if orc_ok and tool_orc.is_stop_requested() then
+        on_error_wrapper("工具执行已取消")
+        return
+      end
+      if ok then
+        on_success_wrapper(result_or_err)
+      else
+        on_error_wrapper(tostring(result_or_err))
+      end
+    end)
   end
 end
 

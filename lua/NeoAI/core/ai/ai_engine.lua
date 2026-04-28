@@ -1530,8 +1530,10 @@ function M.cancel_generation()
   local generation_id = state.current_generation_id
   local generation = state.active_generations[generation_id]
 
+  -- 无论是否有 generation 记录，都执行取消操作
+  http_client.cancel_all_requests()
+
   if generation then
-    http_client.cancel_all_requests()
     -- 停止工具调用循环
     tool_orchestrator.request_stop(generation.session_id)
     vim.api.nvim_exec_autocmds("User", {
@@ -1542,10 +1544,20 @@ function M.cancel_generation()
       state.active_generations[generation_id] = nil
     end
   else
-    -- 没有 active_generation 记录，但仍然取消所有 HTTP 请求
-    http_client.cancel_all_requests()
-    -- 停止所有会话的工具循环
+    -- 没有 active_generation 记录，但仍然停止所有会话的工具循环
     tool_orchestrator.request_stop()
+    -- 仍然触发取消事件，让界面更新状态
+    vim.api.nvim_exec_autocmds("User", {
+      pattern = event_constants.GENERATION_CANCELLED,
+      data = { generation_id = nil, session_id = nil, window_id = nil },
+    })
+  end
+
+  -- 检查是否有活跃的工具循环，有则显示通知
+  local tool_orc = require("NeoAI.core.ai.tool_orchestrator")
+  local has_active_loop = tool_orc.is_executing()
+  if state.is_generating or has_active_loop then
+    vim.notify("[NeoAI] 已停止生成", vim.log.levels.INFO)
   end
 
   state.is_generating = false

@@ -220,6 +220,43 @@ local function filter_nodes(nodes, args)
   return filtered, false
 end
 
+-- 递归遍历节点树，返回扁平化的节点信息列表
+local function _traverse_node(node, source, depth, max_depth)
+  if not node then
+    return {}
+  end
+
+  local results = {}
+  local sr, sc, er, ec = node:range()
+  local text = vim.treesitter.get_node_text(node, source)
+
+  table.insert(results, {
+    type = node:type(),
+    named = node:named(),
+    start_row = sr,
+    start_col = sc,
+    end_row = er,
+    end_col = ec,
+    text = text,
+    depth = depth,
+  })
+
+  if max_depth and max_depth >= 0 and depth >= max_depth then
+    return results
+  end
+
+  local child_count = node:named_child_count()
+  for i = 0, child_count - 1 do
+    local child = node:named_child(i)
+    local child_results = _traverse_node(child, source, depth + 1, max_depth)
+    for _, r in ipairs(child_results) do
+      table.insert(results, r)
+    end
+  end
+
+  return results
+end
+
 -- 解析文件内容并返回语法树（回调模式）
 -- 自动检测语言并安装缺失的解析器
 -- 注意：read_file_content_async 的回调在 vim.uv fast event 上下文中执行，
@@ -269,43 +306,6 @@ local function parse_file_content_async(filepath, max_depth, on_success, on_erro
       if on_error then on_error(err) end
     end)
   end)
-end
-
--- 递归遍历节点树，返回扁平化的节点信息列表
-local function _traverse_node(node, source, depth, max_depth)
-  if not node then
-    return {}
-  end
-
-  local results = {}
-  local sr, sc, er, ec = node:range()
-  local text = vim.treesitter.get_node_text(node, source)
-
-  table.insert(results, {
-    type = node:type(),
-    named = node:named(),
-    start_row = sr,
-    start_col = sc,
-    end_row = er,
-    end_col = ec,
-    text = text,
-    depth = depth,
-  })
-
-  if max_depth and max_depth >= 0 and depth >= max_depth then
-    return results
-  end
-
-  local child_count = node:named_child_count()
-  for i = 0, child_count - 1 do
-    local child = node:named_child(i)
-    local child_results = _traverse_node(child, source, depth + 1, max_depth)
-    for _, r in ipairs(child_results) do
-      table.insert(results, r)
-    end
-  end
-
-  return results
 end
 
 -- 解析文件内容并返回语法树

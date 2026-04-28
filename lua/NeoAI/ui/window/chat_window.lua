@@ -307,9 +307,9 @@ function M.open(session_id, window_id, branch_id)
     vim.api.nvim_set_option_value("swapfile", false, { buf = buf })
     vim.api.nvim_set_option_value("bufhidden", "hide", { buf = buf })
     vim.api.nvim_set_option_value("modified", false, { buf = buf })
-    -- 启用折叠标记，使 <<< 和 >>> 折叠标记生效（避免与 JSON 中的 {} 冲突）
+    -- 启用折叠标记，使用 {{{ 和 }}} 作为折叠标记
     vim.api.nvim_set_option_value("foldmethod", "marker", { win = win_handle })
-    vim.api.nvim_set_option_value("foldmarker", "<<<,>>>", { win = win_handle })
+    vim.api.nvim_set_option_value("foldmarker", "{{{,}}}", { win = win_handle })
     -- 默认展开所有折叠
     vim.api.nvim_set_option_value("foldlevel", 99, { win = win_handle })
     -- 设置缓冲区名称，便于识别
@@ -2020,7 +2020,7 @@ function M._setup_event_listeners()
       if state.tool_display.active then
         local results = state.tool_display.results or {}
         if #results > 0 or state.tool_display.buffer ~= "" then
-          local folded_text = "{{{ 🔧 工具调用"
+          local folded_text = ""
           if #results > 0 then
             local blocks = {}
             for _, r in ipairs(results) do
@@ -2031,17 +2031,16 @@ function M._setup_event_listeners()
                   and (pcall(vim.json.encode, r.result) and vim.json.encode(r.result) or vim.inspect(r.result))
                 or tostring(r.result or "")
               result_str = result_str:gsub("\n", "\n    ")
-            local block = "<<< " .. icon .. " " .. (r.tool_name or "unknown") .. duration_str
-                .. "\n    参数: " .. args_str
-                .. "\n    结果: " .. result_str
-                .. "\n>>>"
+              local block = "{{{ " .. icon .. " " .. (r.tool_name or "unknown") .. duration_str
+                  .. "\n    参数: " .. args_str
+                  .. "\n    结果: " .. result_str
+                  .. "\n}}}"
               table.insert(blocks, block)
             end
             folded_text = table.concat(blocks, "\n")
           else
-            folded_text = folded_text .. "\n  ❌ 所有工具调用均失败"
+            folded_text = "{{{ 🔧 工具调用\n  ❌ 所有工具调用均失败\n}}}"
           end
-          folded_text = folded_text .. "\n}}}"
 
           table.insert(state.messages, { role = "assistant", content = folded_text, timestamp = os.time() })
           state.tool_display.folded_saved = true
@@ -2475,12 +2474,12 @@ function M._build_tool_folded_text(results, reasoning_text)
 
   -- 如果有思考过程，先添加思考过程的折叠区域
   if reasoning_text and reasoning_text ~= "" then
-    folded_text = folded_text .. "<<< 🤔 思考过程"
+    folded_text = folded_text .. "{{{ 🤔 思考过程"
     local reasoning_lines = vim.split(reasoning_text, "\n")
     for _, line in ipairs(reasoning_lines) do
       folded_text = folded_text .. "\n    " .. line
     end
-    folded_text = folded_text .. "\n>>>"
+    folded_text = folded_text .. "\n}}}"
     folded_text = folded_text .. "\n\n"
   end
 
@@ -2503,10 +2502,10 @@ function M._build_tool_folded_text(results, reasoning_text)
     end
     result_str = result_str:gsub("\n", "\n    ")
 
-    local block = "<<< " .. icon .. " " .. (r.tool_name or "unknown") .. duration_str
+    local block = "{{{ " .. icon .. " " .. (r.tool_name or "unknown") .. duration_str
       .. "\n    参数: " .. args_str
       .. "\n    结果: " .. result_str
-      .. "\n>>>"
+      .. "\n}}}"
     table.insert(blocks, block)
   end
   folded_text = table.concat(blocks, "\n")
