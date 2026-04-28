@@ -26,15 +26,39 @@ end
 -- 扩展名到 Tree-sitter 解析器名称的直接映射
 -- 避免在 fast event 上下文中调用 vim.filetype.match（内部调用 getenv）
 local ext_to_parser = {
-  [".lua"] = "lua", [".py"] = "python", [".js"] = "javascript", [".ts"] = "typescript",
-  [".jsx"] = "tsx", [".tsx"] = "tsx", [".go"] = "go", [".rs"] = "rust",
-  [".java"] = "java", [".c"] = "c", [".cpp"] = "cpp", [".h"] = "c", [".hpp"] = "cpp",
-  [".rb"] = "ruby", [".php"] = "php", [".json"] = "json", [".yaml"] = "yaml", [".yml"] = "yaml",
-  [".md"] = "markdown", [".sh"] = "bash", [".bash"] = "bash", [".zsh"] = "bash",
-  [".css"] = "css", [".html"] = "html", [".htm"] = "html",
-  [".vue"] = "vue", [".svelte"] = "svelte", [".toml"] = "toml", [".sql"] = "sql",
-  [".cmake"] = "cmake", [".mk"] = "make",
-  [".query"] = "query", [".regex"] = "regex",
+  [".lua"] = "lua",
+  [".py"] = "python",
+  [".js"] = "javascript",
+  [".ts"] = "typescript",
+  [".jsx"] = "tsx",
+  [".tsx"] = "tsx",
+  [".go"] = "go",
+  [".rs"] = "rust",
+  [".java"] = "java",
+  [".c"] = "c",
+  [".cpp"] = "cpp",
+  [".h"] = "c",
+  [".hpp"] = "cpp",
+  [".rb"] = "ruby",
+  [".php"] = "php",
+  [".json"] = "json",
+  [".yaml"] = "yaml",
+  [".yml"] = "yaml",
+  [".md"] = "markdown",
+  [".sh"] = "bash",
+  [".bash"] = "bash",
+  [".zsh"] = "bash",
+  [".css"] = "css",
+  [".html"] = "html",
+  [".htm"] = "html",
+  [".vue"] = "vue",
+  [".svelte"] = "svelte",
+  [".toml"] = "toml",
+  [".sql"] = "sql",
+  [".cmake"] = "cmake",
+  [".mk"] = "make",
+  [".query"] = "query",
+  [".regex"] = "regex",
 }
 
 -- 从文件路径推断语言（使用扩展名映射，避免在 fast event 上下文中调用 vim.filetype.match）
@@ -70,7 +94,9 @@ local function ensure_parser_installed(lang, on_success, on_error)
   -- 检查解析器是否已安装
   local ok_inspect, _ = pcall(ts.language.inspect, lang)
   if ok_inspect then
-    if on_success then on_success() end
+    if on_success then
+      on_success()
+    end
     return
   end
 
@@ -87,7 +113,9 @@ local function ensure_parser_installed(lang, on_success, on_error)
       -- 安装后再次检查
       local ok2, _ = pcall(ts.language.inspect, lang)
       if ok2 then
-        if on_success then on_success() end
+        if on_success then
+          on_success()
+        end
         return
       end
     end
@@ -104,7 +132,9 @@ local function ensure_parser_installed(lang, on_success, on_error)
     if ok then
       local ok2, _ = pcall(ts.language.inspect, lang)
       if ok2 then
-        if on_success then on_success() end
+        if on_success then
+          on_success()
+        end
         return
       end
     end
@@ -121,7 +151,9 @@ local function ensure_parser_installed(lang, on_success, on_error)
     vim.defer_fn(function()
       local ok2, _ = pcall(ts.language.inspect, lang)
       if ok2 then
-        if on_success then on_success() end
+        if on_success then
+          on_success()
+        end
       else
         -- 最后尝试使用内置 API 的 require 方式
         local ok_require, _ = pcall(function()
@@ -130,17 +162,23 @@ local function ensure_parser_installed(lang, on_success, on_error)
         if ok_require then
           local ok3, _ = pcall(ts.language.inspect, lang)
           if ok3 then
-            if on_success then on_success() end
+            if on_success then
+              on_success()
+            end
             return
           end
         end
-        if on_error then on_error("Tree-sitter 解析器 " .. lang .. " 正在后台安装，请稍后重试") end
+        if on_error then
+          on_error("Tree-sitter 解析器 " .. lang .. " 正在后台安装，请稍后重试")
+        end
       end
     end, 3000)
     return
   end
 
-  if on_error then on_error("未找到 nvim-treesitter 插件，无法自动安装解析器: " .. lang) end
+  if on_error then
+    on_error("未找到 nvim-treesitter 插件，无法自动安装解析器: " .. lang)
+  end
 end
 
 -- 异步读取文件内容（回调模式）
@@ -149,22 +187,30 @@ local function read_file_content_async(filepath, on_success, on_error)
   local abs_path = vim.fn.fnamemodify(filepath, ":p")
   vim.uv.fs_open(abs_path, "r", 438, function(open_err, fd)
     if open_err or not fd then
-      if on_error then on_error("无法读取文件: " .. (open_err or "未知错误")) end
+      if on_error then
+        on_error("无法读取文件: " .. (open_err or "未知错误"))
+      end
       return
     end
     vim.uv.fs_fstat(fd, function(stat_err, stat)
       if stat_err or not stat then
         vim.uv.fs_close(fd)
-        if on_error then on_error("无法读取文件: " .. (stat_err or "无法获取文件信息")) end
+        if on_error then
+          on_error("无法读取文件: " .. (stat_err or "无法获取文件信息"))
+        end
         return
       end
       vim.uv.fs_read(fd, stat.size, 0, function(read_err, data)
         vim.uv.fs_close(fd)
         if read_err or not data then
-          if on_error then on_error("无法读取文件: " .. (read_err or "未知错误")) end
+          if on_error then
+            on_error("无法读取文件: " .. (read_err or "未知错误"))
+          end
           return
         end
-        if on_success then on_success(data) end
+        if on_success then
+          on_success(data)
+        end
       end)
     end)
   end)
@@ -266,7 +312,9 @@ local function parse_file_content_async(filepath, max_depth, on_success, on_erro
     vim.schedule(function()
       local lang = detect_lang_from_filepath(filepath)
       if not lang then
-        if on_error then on_error("无法确定文件语言") end
+        if on_error then
+          on_error("无法确定文件语言")
+        end
         return
       end
 
@@ -274,13 +322,17 @@ local function parse_file_content_async(filepath, max_depth, on_success, on_erro
       ensure_parser_installed(lang, function()
         local ok, parser = pcall(ts.get_string_parser, content, lang)
         if not ok or not parser then
-          if on_error then on_error("无法为语言 '" .. lang .. "' 创建解析器") end
+          if on_error then
+            on_error("无法为语言 '" .. lang .. "' 创建解析器")
+          end
           return
         end
 
         local ok2, trees = pcall(parser.parse, parser)
         if not ok2 or not trees or #trees == 0 then
-          if on_error then on_error("解析失败") end
+          if on_error then
+            on_error("解析失败")
+          end
           return
         end
 
@@ -298,12 +350,16 @@ local function parse_file_content_async(filepath, max_depth, on_success, on_erro
           })
         end
       end, function(err)
-        if on_error then on_error(err) end
+        if on_error then
+          on_error(err)
+        end
       end)
     end)
   end, function(err)
     vim.schedule(function()
-      if on_error then on_error(err) end
+      if on_error then
+        on_error(err)
+      end
     end)
   end)
 end
@@ -351,12 +407,16 @@ end
 
 local function _parse_file(args, on_success, on_error)
   if not check_ts() then
-    if on_error then on_error("Tree-sitter 不可用（需要 Neovim >= 0.5）") end
+    if on_error then
+      on_error("Tree-sitter 不可用（需要 Neovim >= 0.5）")
+    end
     return
   end
 
   if not args then
-    if on_error then on_error("需要参数") end
+    if on_error then
+      on_error("需要参数")
+    end
     return
   end
 
@@ -369,42 +429,46 @@ local function _parse_file(args, on_success, on_error)
     local has_error = false
 
     local function check_done()
-      if has_error then return end
+      if has_error then
+        return
+      end
       pending = pending - 1
       if pending <= 0 then
-        if on_success then on_success(results) end
+        if on_success then
+          on_success(results)
+        end
       end
     end
 
     for _, fp in ipairs(args.filepaths) do
-      parse_file_content_async(fp, max_depth,
-        function(r)
-          table.insert(results, r)
-          check_done()
-        end,
-        function(err)
-          table.insert(results, { filepath = fp, error = err })
-          check_done()
-        end
-      )
+      parse_file_content_async(fp, max_depth, function(r)
+        table.insert(results, r)
+        check_done()
+      end, function(err)
+        table.insert(results, { filepath = fp, error = err })
+        check_done()
+      end)
     end
     return
   end
 
   -- 处理单个 filepath
   if args.filepath then
-    parse_file_content_async(args.filepath, max_depth,
-      function(result)
-        if on_success then on_success(result) end
-      end,
-      function(err)
-        if on_error then on_error(err) end
+    parse_file_content_async(args.filepath, max_depth, function(result)
+      if on_success then
+        on_success(result)
       end
-    )
+    end, function(err)
+      if on_error then
+        on_error(err)
+      end
+    end)
     return
   end
 
-  if on_error then on_error("需要 filepath（文件路径）或 filepaths（路径列表）参数") end
+  if on_error then
+    on_error("需要 filepath（文件路径）或 filepaths（路径列表）参数")
+  end
 end
 
 M.parse_file = define_tool({
@@ -484,17 +548,22 @@ local function _query_captures_for_source(source_text, lang, query_string)
     query = query_string,
     capture_count = #captures,
     captures = captures,
-  }, nil
+  },
+    nil
 end
 
 local function _query_captures(args, on_success, on_error)
   if not check_ts() then
-    if on_error then on_error("Tree-sitter 不可用（需要 Neovim >= 0.5）") end
+    if on_error then
+      on_error("Tree-sitter 不可用（需要 Neovim >= 0.5）")
+    end
     return
   end
 
   if not args or not args.query or not args.filepath then
-    if on_error then on_error("需要 query（查询字符串）和 filepath（文件路径）参数") end
+    if on_error then
+      on_error("需要 query（查询字符串）和 filepath（文件路径）参数")
+    end
     return
   end
 
@@ -503,23 +572,33 @@ local function _query_captures(args, on_success, on_error)
   read_file_content_async(args.filepath, function(content)
     local lang = detect_lang_from_filepath(args.filepath)
     if not lang then
-      if on_error then on_error("无法确定文件语言") end
+      if on_error then
+        on_error("无法确定文件语言")
+      end
       return
     end
 
     ensure_parser_installed(lang, function()
       local result, qerr = _query_captures_for_source(content, lang, query_string)
       if qerr then
-        if on_error then on_error(qerr) end
+        if on_error then
+          on_error(qerr)
+        end
         return
       end
       result.filepath = args.filepath
-      if on_success then on_success(result) end
+      if on_success then
+        on_success(result)
+      end
     end, function(err)
-      if on_error then on_error(err) end
+      if on_error then
+        on_error(err)
+      end
     end)
   end, function(err)
-    if on_error then on_error(err) end
+    if on_error then
+      on_error(err)
+    end
   end)
 end
 
@@ -550,12 +629,16 @@ M.query_captures = define_tool({
 
 local function _get_node_at_position(args, on_success, on_error)
   if not check_ts() then
-    if on_error then on_error("Tree-sitter 不可用（需要 Neovim >= 0.5）") end
+    if on_error then
+      on_error("Tree-sitter 不可用（需要 Neovim >= 0.5）")
+    end
     return
   end
 
   if not args or not args.filepath then
-    if on_error then on_error("需要 filepath（文件路径）参数") end
+    if on_error then
+      on_error("需要 filepath（文件路径）参数")
+    end
     return
   end
 
@@ -566,20 +649,26 @@ local function _get_node_at_position(args, on_success, on_error)
   read_file_content_async(filepath, function(content)
     local lang = detect_lang_from_filepath(filepath)
     if not lang then
-      if on_error then on_error("无法确定文件语言") end
+      if on_error then
+        on_error("无法确定文件语言")
+      end
       return
     end
 
     ensure_parser_installed(lang, function()
       local ok, parser = pcall(ts.get_string_parser, content, lang)
       if not ok or not parser then
-        if on_error then on_error("无法为语言 '" .. lang .. "' 创建解析器") end
+        if on_error then
+          on_error("无法为语言 '" .. lang .. "' 创建解析器")
+        end
         return
       end
 
       local ok2, trees = pcall(parser.parse, parser)
       if not ok2 or not trees or #trees == 0 then
-        if on_error then on_error("解析失败") end
+        if on_error then
+          on_error("解析失败")
+        end
         return
       end
 
@@ -587,13 +676,17 @@ local function _get_node_at_position(args, on_success, on_error)
 
       -- 在语法树中查找指定位置的节点
       local function find_node_at_pos(node, r, c)
-        if not node then return nil end
+        if not node then
+          return nil
+        end
         local sr, sc, er, ec = node:range()
         if r >= sr and r <= er and (r > sr or c >= sc) and (r < er or c <= ec) then
           for i = 0, node:named_child_count() - 1 do
             local child = node:named_child(i)
             local found = find_node_at_pos(child, r, c)
-            if found then return found end
+            if found then
+              return found
+            end
           end
           return node
         end
@@ -602,7 +695,9 @@ local function _get_node_at_position(args, on_success, on_error)
 
       local target_node = find_node_at_pos(root, target_row, target_col)
       if not target_node then
-        if on_error then on_error("未找到该位置的节点") end
+        if on_error then
+          on_error("未找到该位置的节点")
+        end
         return
       end
 
@@ -639,17 +734,24 @@ local function _get_node_at_position(args, on_success, on_error)
             type = target_node:type(),
             text = text,
             named = target_node:named(),
-            start_row = sr, start_col = sc, end_row = er, end_col = ec,
+            start_row = sr,
+            start_col = sc,
+            end_row = er,
+            end_col = ec,
           },
           ancestors = ancestors,
           children = children,
         })
       end
     end, function(err)
-      if on_error then on_error(err) end
+      if on_error then
+        on_error(err)
+      end
     end)
   end, function(err)
-    if on_error then on_error(err) end
+    if on_error then
+      on_error(err)
+    end
   end)
 end
 
@@ -687,24 +789,34 @@ M.get_node_at_position = define_tool({
 --- @param build_response function 构建响应函数 (result, filtered, fallback) -> table
 local function _with_parsed_tree(args, on_success, on_error, build_response)
   if not check_ts() then
-    if on_error then on_error("Tree-sitter 不可用（需要 Neovim >= 0.5）") end
+    if on_error then
+      on_error("Tree-sitter 不可用（需要 Neovim >= 0.5）")
+    end
     return
   end
   if not args or not args.filepath then
-    if on_error then on_error("需要 filepath（文件路径）参数") end
+    if on_error then
+      on_error("需要 filepath（文件路径）参数")
+    end
     return
   end
 
   parse_file_content_async(args.filepath, -1, function(result)
     local filtered, fallback = filter_nodes(result.nodes, args)
     if #filtered == 0 then
-      if on_error then on_error("未找到匹配的节点") end
+      if on_error then
+        on_error("未找到匹配的节点")
+      end
       return
     end
     local ret = build_response(result, filtered, fallback)
-    if on_success then on_success(ret) end
+    if on_success then
+      on_success(ret)
+    end
   end, function(err)
-    if on_error then on_error(err or "解析结果为空") end
+    if on_error then
+      on_error(err or "解析结果为空")
+    end
   end)
 end
 
@@ -730,7 +842,9 @@ local function _get_node_type(args, on_success, on_error)
       nodes = filtered,
     }
     if fallback then
-      ret.warning = "未找到指定 node_type '" .. (args.node_type or "") .. "' 的节点，已回退到同类型节点"
+      ret.warning = "未找到指定 node_type '"
+        .. (args.node_type or "")
+        .. "' 的节点，已回退到同类型节点"
     end
     return ret
   end)
@@ -762,18 +876,24 @@ M.get_node_type = define_tool({
 
 local function _get_node_range(args, on_success, on_error)
   if not check_ts() then
-    if on_error then on_error("Tree-sitter 不可用（需要 Neovim >= 0.5）") end
+    if on_error then
+      on_error("Tree-sitter 不可用（需要 Neovim >= 0.5）")
+    end
     return
   end
   if not args or not args.filepath then
-    if on_error then on_error("需要 filepath（文件路径）参数") end
+    if on_error then
+      on_error("需要 filepath（文件路径）参数")
+    end
     return
   end
 
   parse_file_content_async(args.filepath, -1, function(result)
     local filtered, fallback = filter_nodes(result.nodes, args)
     if #filtered == 0 then
-      if on_error then on_error("未找到匹配的节点") end
+      if on_error then
+        on_error("未找到匹配的节点")
+      end
       return
     end
 
@@ -784,9 +904,12 @@ local function _get_node_range(args, on_success, on_error)
         local ranges = {}
         for _, node in ipairs(filtered) do
           local entry = {
-            type = node.type, text = node.text,
-            start_row = node.start_row, start_col = node.start_col,
-            end_row = node.end_row, end_col = node.end_col,
+            type = node.type,
+            text = node.text,
+            start_row = node.start_row,
+            start_col = node.start_col,
+            end_row = node.end_row,
+            end_col = node.end_col,
           }
           local code_lines = {}
           for line_num = node.start_row, node.end_row do
@@ -797,36 +920,55 @@ local function _get_node_range(args, on_success, on_error)
           table.insert(ranges, entry)
         end
         local ret = {
-          filepath = args.filepath, language = result.language,
-          match_count = #filtered, ranges = ranges,
+          filepath = args.filepath,
+          language = result.language,
+          match_count = #filtered,
+          ranges = ranges,
         }
         if fallback then
-          ret.warning = "未找到指定 node_type '" .. (args.node_type or "") .. "' 的节点，已回退到同类型节点"
+          ret.warning = "未找到指定 node_type '"
+            .. (args.node_type or "")
+            .. "' 的节点，已回退到同类型节点"
         end
-        if on_success then on_success(ret) end
+        if on_success then
+          on_success(ret)
+        end
       end, function(err)
-        if on_error then on_error(err) end
+        if on_error then
+          on_error(err)
+        end
       end)
     else
       local ranges = {}
       for _, node in ipairs(filtered) do
         table.insert(ranges, {
-          type = node.type, text = node.text,
-          start_row = node.start_row, start_col = node.start_col,
-          end_row = node.end_row, end_col = node.end_col,
+          type = node.type,
+          text = node.text,
+          start_row = node.start_row,
+          start_col = node.start_col,
+          end_row = node.end_row,
+          end_col = node.end_col,
         })
       end
       local ret = {
-        filepath = args.filepath, language = result.language,
-        match_count = #filtered, ranges = ranges,
+        filepath = args.filepath,
+        language = result.language,
+        match_count = #filtered,
+        ranges = ranges,
       }
       if fallback then
-        ret.warning = "未找到指定 node_type '" .. (args.node_type or "") .. "' 的节点，已回退到同类型节点"
+        ret.warning = "未找到指定 node_type '"
+          .. (args.node_type or "")
+          .. "' 的节点，已回退到同类型节点"
       end
-      if on_success then on_success(ret) end
+      if on_success then
+        on_success(ret)
+      end
     end
   end, function(err)
-    if on_error then on_error(err or "解析结果为空") end
+    if on_error then
+      on_error(err or "解析结果为空")
+    end
   end)
 end
 
@@ -842,7 +984,10 @@ M.get_node_range = define_tool({
       node_type = { type = "string", description = "节点类型过滤（可选），如 'function_definition'" },
       text = { type = "string", description = "节点文本过滤（可选）" },
       named = { type = "boolean", description = "是否为命名节点（可选）" },
-      include_code = { type = "boolean", description = "是否返回带行号的节点代码（可选，默认 false）" },
+      include_code = {
+        type = "boolean",
+        description = "是否返回带行号的节点代码（可选，默认 false）",
+      },
     },
     required = { "filepath" },
   },
@@ -862,11 +1007,15 @@ local function _is_named_node(args, on_success, on_error)
       table.insert(named_info, { type = node.type, text = node.text, named = node.named })
     end
     local ret = {
-      filepath = args.filepath, language = result.language,
-      match_count = #filtered, nodes = named_info,
+      filepath = args.filepath,
+      language = result.language,
+      match_count = #filtered,
+      nodes = named_info,
     }
     if fallback then
-      ret.warning = "未找到指定 node_type '" .. (args.node_type or "") .. "' 的节点，已回退到同类型节点"
+      ret.warning = "未找到指定 node_type '"
+        .. (args.node_type or "")
+        .. "' 的节点，已回退到同类型节点"
     end
     return ret
   end)
@@ -905,7 +1054,9 @@ local function _find_parent_by_attrs(nodes, target_type, target_text, target_nam
   end
 
   local targets, fallback = filter_nodes(nodes, {
-    node_type = target_type, text = target_text, named = target_named,
+    node_type = target_type,
+    text = target_text,
+    named = target_named,
   })
 
   if #targets == 0 then
@@ -930,18 +1081,24 @@ end
 
 local function _get_parent_node(args, on_success, on_error)
   if not check_ts() then
-    if on_error then on_error("Tree-sitter 不可用（需要 Neovim >= 0.5）") end
+    if on_error then
+      on_error("Tree-sitter 不可用（需要 Neovim >= 0.5）")
+    end
     return
   end
   if not args or not args.filepath then
-    if on_error then on_error("需要 filepath（文件路径）参数") end
+    if on_error then
+      on_error("需要 filepath（文件路径）参数")
+    end
     return
   end
 
   parse_file_content_async(args.filepath, -1, function(result)
     local parents, perr, fallback = _find_parent_by_attrs(result.nodes or {}, args.node_type, args.text, args.named)
     if perr or not parents then
-      if on_error then on_error(perr or "未找到父节点") end
+      if on_error then
+        on_error(perr or "未找到父节点")
+      end
       return
     end
     local parent_info = {}
@@ -949,23 +1106,34 @@ local function _get_parent_node(args, on_success, on_error)
       table.insert(parent_info, {
         target_node = item.target,
         parent_node = item.parent and {
-          type = item.parent.type, text = item.parent.text,
-          start_row = item.parent.start_row, start_col = item.parent.start_col,
-          end_row = item.parent.end_row, end_col = item.parent.end_col,
+          type = item.parent.type,
+          text = item.parent.text,
+          start_row = item.parent.start_row,
+          start_col = item.parent.start_col,
+          end_row = item.parent.end_row,
+          end_col = item.parent.end_col,
           depth = item.parent.depth,
         } or nil,
       })
     end
     local ret = {
-      filepath = args.filepath, language = result.language,
-      match_count = #parent_info, parents = parent_info,
+      filepath = args.filepath,
+      language = result.language,
+      match_count = #parent_info,
+      parents = parent_info,
     }
     if fallback then
-      ret.warning = "未找到指定 node_type '" .. (args.node_type or "") .. "' 的节点，已回退到同类型节点"
+      ret.warning = "未找到指定 node_type '"
+        .. (args.node_type or "")
+        .. "' 的节点，已回退到同类型节点"
     end
-    if on_success then on_success(ret) end
+    if on_success then
+      on_success(ret)
+    end
   end, function(err)
-    if on_error then on_error(err or "解析结果为空") end
+    if on_error then
+      on_error(err or "解析结果为空")
+    end
   end)
 end
 
@@ -999,7 +1167,8 @@ local function _get_child_nodes(args, on_success, on_error)
     for _, parent in ipairs(filtered) do
       local children = {}
       for _, candidate in ipairs(result.nodes) do
-        if candidate.depth == parent.depth + 1
+        if
+          candidate.depth == parent.depth + 1
           and candidate.start_row >= parent.start_row
           and candidate.end_row <= parent.end_row
         then
@@ -1008,20 +1177,27 @@ local function _get_child_nodes(args, on_success, on_error)
       end
       table.insert(children_info, {
         parent = {
-          type = parent.type, text = parent.text,
-          start_row = parent.start_row, start_col = parent.start_col,
-          end_row = parent.end_row, end_col = parent.end_col,
+          type = parent.type,
+          text = parent.text,
+          start_row = parent.start_row,
+          start_col = parent.start_col,
+          end_row = parent.end_row,
+          end_col = parent.end_col,
         },
         child_count = #children,
         children = children,
       })
     end
     local ret = {
-      filepath = args.filepath, language = result.language,
-      match_count = #children_info, children_info = children_info,
+      filepath = args.filepath,
+      language = result.language,
+      match_count = #children_info,
+      children_info = children_info,
     }
     if fallback then
-      ret.warning = "未找到指定 node_type '" .. (args.node_type or "") .. "' 的节点，已回退到同类型节点"
+      ret.warning = "未找到指定 node_type '"
+        .. (args.node_type or "")
+        .. "' 的节点，已回退到同类型节点"
     end
     return ret
   end)
@@ -1048,6 +1224,12 @@ M.get_child_nodes = define_tool({
 })
 
 -- get_tools() - 返回所有工具列表供注册
+-- 导出 parse_file_content_async 供 file_tools 等模块使用
+-- 用于在读取大文件时获取语法树结构概览
+function M.parse_file_content_async(filepath, max_depth, on_success, on_error)
+  parse_file_content_async(filepath, max_depth, on_success, on_error)
+end
+
 function M.get_tools()
   if not check_ts() then
     return {}

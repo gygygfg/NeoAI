@@ -26,36 +26,27 @@ local state = {
 
 -- ========== 辅助函数 ==========
 
---- 创建一次性 TOOL_DISPLAY_CLOSED 监听器
---- 监听器触发后执行回调，5 秒超时后强制执行
---- 注意：此函数可能被 fast event 上下文调用，因此使用 vim.schedule 延迟 autocmd 创建
+--- 强制刷新 UI（在工具循环的关键节点调用）
+local function force_ui_refresh()
+  pcall(vim.cmd.redraw)
+end
+
+--- 等待 TOOL_DISPLAY_CLOSED 事件后执行回调
+--- 优化：移除 5 秒超时等待，直接通过 vim.schedule 执行回调
+--- TOOL_DISPLAY_CLOSED 由 chat_window 在 TOOL_LOOP_FINISHED 回调中触发
+--- 由于 fire_loop_finished 在调用此函数之前已触发，事件可能已错过
+--- 因此直接执行回调，不再等待事件
 local function once_display_closed(session_id, callback)
-  -- 使用 vim.schedule 确保不在 fast event 上下文中创建 autocmd
   vim.schedule(function()
-    local autocmd_id = vim.api.nvim_create_autocmd("User", {
-      pattern = event_constants.TOOL_DISPLAY_CLOSED,
-      once = true,
-      callback = function(args)
-        local data = args.data or {}
-        if data.session_id ~= session_id then return end
-        logger.debug("[tool_orchestrator] 收到 TOOL_DISPLAY_CLOSED")
-        callback()
-      end,
-    })
-    vim.defer_fn(function()
-      local ok, exists = pcall(vim.api.nvim_get_autocmds, { id = autocmd_id })
-      if ok and exists and #exists > 0 then
-        pcall(vim.api.nvim_del_autocmd, autocmd_id)
-        logger.debug("[tool_orchestrator] 超时未收到 TOOL_DISPLAY_CLOSED，强制执行")
-        callback()
-      end
-    end, 5000)
+    force_ui_refresh()
+    callback()
   end)
 end
 
 --- 触发 TOOL_LOOP_FINISHED 事件
 --- 使用 pcall 保护，避免在 fast event 上下文中调用失败
 local function fire_loop_finished(ss)
+  if not ss then return end
   local ok, err = pcall(vim.api.nvim_exec_autocmds, "User", {
     pattern = event_constants.TOOL_LOOP_FINISHED,
     data = {
@@ -86,6 +77,7 @@ end
 --- 触发 TOOL_LOOP_STARTED 事件
 --- 使用 pcall 保护，避免在 fast event 上下文中调用失败
 local function fire_loop_started(ss, tool_calls)
+  if not ss then return end
   local ok, err = pcall(vim.api.nvim_exec_autocmds, "User", {
     pattern = event_constants.TOOL_LOOP_STARTED,
     data = {
@@ -115,6 +107,7 @@ end
 --- 触发 TOOL_RESULT_RECEIVED 事件
 --- 使用 pcall 保护，避免在 fast event 上下文中调用失败
 local function fire_tool_result_received(ss, is_final_round)
+  if not ss then return end
   local ok, err = pcall(vim.api.nvim_exec_autocmds, "User", {
     pattern = event_constants.TOOL_RESULT_RECEIVED,
     data = {
@@ -339,13 +332,23 @@ function M._execute_tools(session_id, tool_calls)
   local ss = state.sessions[session_id]
   if not ss then return end
 
+  -- 如果已请求停止，跳过所有工具执行
+  if ss.stop_requested then
+    return
+  end
+
   if #tool_calls == 0 then
+    -- 即使没有工具调用也刷新 UI，确保生成状态可见
+    force_ui_refresh()
     vim.schedule(function() M._request_generation(session_id) end)
     return
   end
 
   ss.phase = "waiting_tools"
   ss.active_tool_calls = {}
+
+  -- 强制刷新 UI，让用户看到工具执行开始
+  force_ui_refresh()
 
   for _, tc in ipairs(tool_calls) do
     M._execute_single_tool(session_id, tc)
@@ -355,6 +358,11 @@ end
 function M._execute_single_tool(session_id, tool_call)
   local ss = state.sessions[session_id]
   if not ss or not tool_call then return end
+
+  -- 如果已请求停止，跳过工具执行
+  if ss.stop_requested then
+    return
+  end
 
   local tool_func = tool_call["function"] or tool_call.func
   if not tool_func then return end
@@ -420,22 +428,26 @@ function M._on_tools_complete(session_id)
   if ss.stop_requested then
     ss.phase = "idle"
     ss._tools_complete_in_progress = false
-    vim.schedule(function() M._request_summary_round(session_id) end)
+    force_ui_refresh()
+    M._request_summary_round(session_id)
     return
   end
 
   if ss.phase == "waiting_tools" then
     ss.phase = "waiting_model"
     ss._tools_complete_in_progress = false
-    once_display_closed(session_id, function()
-      vim.schedule(function() M._request_generation(session_id) end)
-    end)
+    force_ui_refresh()
     fire_loop_finished(ss)
+    once_display_closed(session_id, function()
+      M._request_generation(session_id)
+    end)
   elseif ss.phase == "round_complete" then
     ss._tools_complete_in_progress = false
-    vim.schedule(function() M._proceed_to_next_round(session_id) end)
+    force_ui_refresh()
+    M._proceed_to_next_round(session_id)
   else
     ss._tools_complete_in_progress = false
+    force_ui_refresh()
   end
 end
 
@@ -447,7 +459,7 @@ function M._check_round_complete(session_id)
 
   if ss.stop_requested then
     ss.phase = "idle"
-    vim.schedule(function() M._request_summary_round(session_id) end)
+    M._request_summary_round(session_id)
     return
   end
 
@@ -455,7 +467,7 @@ function M._check_round_complete(session_id)
     if active_count == 0 then
       if ss._proceed_in_progress then return end
       ss.phase = "round_complete"
-      vim.schedule(function() M._proceed_to_next_round(session_id) end)
+      M._proceed_to_next_round(session_id)
     else
       ss.phase = "round_complete"
     end
@@ -470,6 +482,7 @@ function M._proceed_to_next_round(session_id)
   if ss._proceed_in_progress then return end
   ss._proceed_in_progress = true
 
+  force_ui_refresh()
   ss.phase = "idle"
   ss.active_tool_calls = {}
 
@@ -491,14 +504,14 @@ function M._proceed_to_next_round(session_id)
   ss.phase = "waiting_model"
   ss._proceed_in_progress = false
 
-  vim.schedule(function() M._request_generation(session_id) end)
+  M._request_generation(session_id)
 end
 
 -- ========== 请求 AI 生成 ==========
 
 function M._request_generation(session_id)
   local ss = state.sessions[session_id]
-  if not ss then return end
+  if not ss or ss.stop_requested then return end
   fire_tool_result_received(ss, false)
 end
 
@@ -585,14 +598,13 @@ function M.on_generation_complete(data)
   -- 关闭旧悬浮窗，打开新悬浮窗并执行工具
   ss.current_iteration = ss.current_iteration + 1
 
+  fire_loop_finished(ss)
   once_display_closed(session_id, function()
     local s = state.sessions[session_id]
     if not s then return end
     fire_loop_started(s, tool_calls)
     M._execute_tools(session_id, tool_calls)
   end)
-
-  fire_loop_finished(ss)
 end
 
 function M._add_tool_result_to_messages(session_id, tool_call_id, tool_name, result)
@@ -615,6 +627,9 @@ end
 function M._finish_loop(session_id, success, result)
   local ss = state.sessions[session_id]
   if not ss then return end
+
+  -- 循环结束，强制刷新 UI
+  force_ui_refresh()
 
   -- 检查是否所有会话都已空闲，如果是则清理全局 ESC 监听器
   local all_idle = true

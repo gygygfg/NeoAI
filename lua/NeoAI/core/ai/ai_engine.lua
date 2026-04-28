@@ -1530,12 +1530,18 @@ function M.cancel_generation()
   local generation_id = state.current_generation_id
   local generation = state.active_generations[generation_id]
 
-  -- 无论是否有 generation 记录，都执行取消操作
+  -- 先设置停止标志，再取消 HTTP 请求
+  -- 顺序很重要：先设置 stop_requested，确保回调执行时能检测到停止状态
+  if generation then
+    tool_orchestrator.request_stop(generation.session_id)
+  else
+    tool_orchestrator.request_stop()
+  end
+
+  -- 取消所有 HTTP 请求（jobstop 会触发 on_exit 回调，但此时 stop_requested 已设置）
   http_client.cancel_all_requests()
 
   if generation then
-    -- 停止工具调用循环
-    tool_orchestrator.request_stop(generation.session_id)
     vim.api.nvim_exec_autocmds("User", {
       pattern = event_constants.GENERATION_CANCELLED,
       data = { generation_id = generation_id, session_id = generation.session_id, window_id = generation.window_id },
@@ -1544,8 +1550,6 @@ function M.cancel_generation()
       state.active_generations[generation_id] = nil
     end
   else
-    -- 没有 active_generation 记录，但仍然停止所有会话的工具循环
-    tool_orchestrator.request_stop()
     -- 仍然触发取消事件，让界面更新状态
     vim.api.nvim_exec_autocmds("User", {
       pattern = event_constants.GENERATION_CANCELLED,
@@ -1638,7 +1642,7 @@ function M.process_query(query, options)
   local messages = { { role = "user", content = query } }
   vim.api.nvim_exec_autocmds("User", {
     pattern = event_constants.USER_MESSAGE_SENT,
-    data = { message = messages[1], timestamp = os.time() },
+    data = { message = messages[1], session_id = options and options.session_id, timestamp = os.time() },
   })
   return M.generate_response(messages, { options = options })
 end

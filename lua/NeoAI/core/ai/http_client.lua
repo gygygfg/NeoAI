@@ -228,8 +228,16 @@ function M.send_stream_request(params, on_chunk, on_complete, on_error)
 
   local function handle_complete()
     local req = state.active_requests[request_id]
-    if req and req.buffer ~= "" then process_sse_line(req.buffer) end
-    req = state.active_requests[request_id]
+    if not req then
+      -- 请求已被取消（cancel_request 已清理），不再触发回调
+      logger.debug("[http_client] 流式请求完成但已被取消，跳过回调")
+      return
+    end
+    if req.cancelled then
+      state.active_requests[request_id] = nil
+      return
+    end
+    if req.buffer ~= "" then process_sse_line(req.buffer) end
     local has_error = req and req.has_error
     if req then state.active_requests[request_id] = nil end
     logger.debug("[http_client] 流式请求完成: " .. base_url .. " | has_error=" .. tostring(has_error))
@@ -281,9 +289,14 @@ function M.send_stream_request(params, on_chunk, on_complete, on_error)
     end,
     on_exit = function(_, exit_code, _)
       if temp_file then pcall(vim.fn.delete, temp_file) end
+      -- 检查请求是否已被取消（按 ESC 时），避免已取消的请求继续触发回调
+      local req = state.active_requests[request_id]
+      if req and req.cancelled then
+        state.active_requests[request_id] = nil
+        return
+      end
       if exit_code == 0 then handle_complete()
       else
-        local req = state.active_requests[request_id]
         if req and not req.cancelled then handle_error("exit: " .. exit_code) end
       end
     end,

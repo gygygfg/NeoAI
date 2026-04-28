@@ -63,6 +63,13 @@ function M.initialize(config)
   state.max_history_size = config.max_history_size or 100
   state.execution_history = {}
   state.initialized = true
+
+  -- 预加载内置工具模块，触发它们的初始化逻辑
+  -- file_tools: 无显式初始化，但预加载 file_utils 依赖
+  -- neovim_lsp: ensure_lsp_init() + ensure_ts_parsers() 在模块顶层自动执行
+  -- neovim_tree: 惰性检查，无需预初始化
+  pcall(require, "NeoAI.tools.builtin.file_tools")
+  pcall(require, "NeoAI.tools.builtin.neovim_lsp")
 end
 
 -- ========== 核心执行 ==========
@@ -86,7 +93,7 @@ function M.execute_async(tool_name, args, on_success, on_error)
     M._record_execution(tool_name, args, nil, err)
     fire_event(
       event_constants.TOOL_EXECUTION_ERROR,
-      { tool_name = tool_name, args = args, error_msg = err, duration = 0 }
+      { tool_name = tool_name, args = args, error_msg = err, duration = 0, session_id = args and args.session_id }
     )
     if on_error then
       on_error(err)
@@ -105,7 +112,7 @@ function M.execute_async(tool_name, args, on_success, on_error)
     M._record_execution(tool_name, args, nil, full_msg)
     fire_event(
       event_constants.TOOL_EXECUTION_ERROR,
-      { tool_name = tool_name, args = args, error_msg = full_msg, duration = 0 }
+      { tool_name = tool_name, args = args, error_msg = full_msg, duration = 0, session_id = args and args.session_id }
     )
     if on_error then
       on_error(full_msg)
@@ -120,7 +127,7 @@ function M.execute_async(tool_name, args, on_success, on_error)
       M._record_execution(tool_name, args, nil, err)
       fire_event(
         event_constants.TOOL_EXECUTION_ERROR,
-        { tool_name = tool_name, args = args, error_msg = err, duration = 0 }
+        { tool_name = tool_name, args = args, error_msg = err, duration = 0, session_id = args and args.session_id }
       )
       if on_error then
         on_error(err)
@@ -129,25 +136,34 @@ function M.execute_async(tool_name, args, on_success, on_error)
     end
   end
 
-  fire_event(event_constants.TOOL_EXECUTION_STARTED, { tool_name = tool_name, args = args, start_time = start_time })
+  fire_event(event_constants.TOOL_EXECUTION_STARTED, {
+    tool_name = tool_name,
+    args = args,
+    start_time = start_time,
+    session_id = args and args.session_id,
+  })
 
   local function on_success_wrapper(result)
     local duration = os.time() - start_time
     local formatted = M.format_result(result)
     -- fire_event 可能被 fast event 上下文调用，用 pcall 保护
-    local ok, err = pcall(
-      fire_event,
-      event_constants.TOOL_EXECUTION_COMPLETED,
-      { tool_name = tool_name, args = args, result = formatted, duration = duration }
-    )
+    local ok, err = pcall(fire_event, event_constants.TOOL_EXECUTION_COMPLETED, {
+      tool_name = tool_name,
+      args = args,
+      result = formatted,
+      duration = duration,
+      session_id = args and args.session_id,
+    })
     if not ok then
       -- fast event 上下文中 nvim_exec_autocmds 会失败，用 vim.schedule 重试
       vim.schedule(function()
-        pcall(
-          fire_event,
-          event_constants.TOOL_EXECUTION_COMPLETED,
-          { tool_name = tool_name, args = args, result = formatted, duration = duration }
-        )
+        pcall(fire_event, event_constants.TOOL_EXECUTION_COMPLETED, {
+          tool_name = tool_name,
+          args = args,
+          result = formatted,
+          duration = duration,
+          session_id = args and args.session_id,
+        })
       end)
     end
     M._record_execution(tool_name, args, formatted, nil, duration)
@@ -159,18 +175,22 @@ function M.execute_async(tool_name, args, on_success, on_error)
   local function on_error_wrapper(err_msg)
     local duration = os.time() - start_time
     local full_err = "工具执行错误: " .. (err_msg or "未知错误")
-    local ok, err = pcall(
-      fire_event,
-      event_constants.TOOL_EXECUTION_ERROR,
-      { tool_name = tool_name, args = args, error_msg = full_err, duration = duration }
-    )
+    local ok, err = pcall(fire_event, event_constants.TOOL_EXECUTION_ERROR, {
+      tool_name = tool_name,
+      args = args,
+      error_msg = full_err,
+      duration = duration,
+      session_id = args and args.session_id,
+    })
     if not ok then
       vim.schedule(function()
-        pcall(
-          fire_event,
-          event_constants.TOOL_EXECUTION_ERROR,
-          { tool_name = tool_name, args = args, error_msg = full_err, duration = duration }
-        )
+        pcall(fire_event, event_constants.TOOL_EXECUTION_ERROR, {
+          tool_name = tool_name,
+          args = args,
+          error_msg = full_err,
+          duration = duration,
+          session_id = args and args.session_id,
+        })
       end)
     end
     M._record_execution(tool_name, args, nil, full_err, duration)

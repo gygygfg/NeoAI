@@ -206,19 +206,69 @@ local function is_formal_server_name(_name)
 end
 
 -- 通过 Mason 查找已安装服务器的启动命令
+-- 返回完整的命令数组（包含参数），或 nil
 local function find_mason_server_cmd(config_name)
   local servers = get_mason_installed_servers()
   for _, info in ipairs(servers) do
     if info.lsp_name == config_name or info.mason_name == config_name then
       local install_path = info.install_path
       if install_path then
-        local candidates = {
-          install_path .. "/" .. config_name,
-          install_path .. "/bin/" .. config_name,
-          install_path .. "/" .. info.mason_name,
-          install_path .. "/bin/" .. info.mason_name,
+        -- 先检查 bin 目录下的常见可执行文件
+        local bin_dir = install_path .. "/bin/"
+        local mason_name = info.mason_name
+        -- Mason 包名到实际可执行文件名的映射
+        local executable_map = {
+          pyright = { "pyright-langserver", "--stdio" },
+          ["typescript-language-server"] = { "typescript-language-server", "--stdio" },
+          ["html-lsp"] = { "vscode-html-language-server", "--stdio" },
+          ["css-lsp"] = { "vscode-css-language-server", "--stdio" },
+          ["json-lsp"] = { "vscode-json-language-server", "--stdio" },
+          ["yaml-language-server"] = { "yaml-language-server", "--stdio" },
+          ["bash-language-server"] = { "bash-language-server", "start" },
+          ["lua-language-server"] = { "lua-language-server" },
+          ["rust-analyzer"] = { "rust-analyzer" },
         }
-        for _, candidate in ipairs(candidates) do
+        -- 优先使用映射表
+        local mapped = executable_map[mason_name] or executable_map[config_name]
+        if mapped then
+          local full_cmd = {}
+          for _, part in ipairs(mapped) do
+            if part == full_cmd[1] or #full_cmd == 0 then
+              table.insert(full_cmd, bin_dir .. part)
+            else
+              table.insert(full_cmd, part)
+            end
+          end
+          if vim.fn.executable(full_cmd[1]) == 1 then
+            return full_cmd
+          end
+          -- 也检查不带 bin/ 前缀的路径
+          local alt_cmd = {}
+          for _, part in ipairs(mapped) do
+            if #alt_cmd == 0 then
+              table.insert(alt_cmd, install_path .. "/" .. part)
+            else
+              table.insert(alt_cmd, part)
+            end
+          end
+          if vim.fn.executable(alt_cmd[1]) == 1 then
+            return alt_cmd
+          end
+        end
+
+        -- 通用回退：尝试 bin 目录下各种可能的可执行文件名
+        local candidate_names = {
+          config_name,
+          mason_name,
+          config_name:gsub("_", "-"),
+          mason_name:gsub("_", "-"),
+          config_name .. "-language-server",
+          mason_name .. "-language-server",
+          config_name:gsub("_", "-") .. "-language-server",
+          "vscode-" .. config_name:gsub("_", "-") .. "-language-server",
+        }
+        for _, name in ipairs(candidate_names) do
+          local candidate = bin_dir .. name
           if vim.fn.executable(candidate) == 1 then
             return { candidate }
           end
@@ -355,9 +405,10 @@ local function ensure_ts_parsers()
   end)
 end
 
--- 使用 LSP documentSymbol 回退查找符号位置
+-- 使用 LSP documentSymbol 回退查找符号位置（异步回调模式）
 -- 当 Tree-sitter 不可用时，通过 LSP 的 documentSymbol 请求定位符号
-local function find_symbol_via_lsp(filepath, symbol_name, bufnr)
+-- 回调模式：callback(row, col, err)
+local function find_symbol_via_lsp_async(filepath, symbol_name, bufnr, callback)
   -- 获取绝对路径
   local abs_path = vim.fn.fnamemodify(filepath, ":p")
   -- 如果没有提供 bufnr，通过文件路径获取
@@ -365,70 +416,79 @@ local function find_symbol_via_lsp(filepath, symbol_name, bufnr)
     bufnr = vim.fn.bufnr(abs_path)
   end
   if bufnr == -1 then
-    return nil
+    if callback then
+      callback(nil, nil, "文件未加载到缓冲区")
+    end
+    return
   end
 
-  -- 重试机制：最多尝试 3 次，每次等待 2 秒
-  for attempt = 1, 3 do
-    local ok, responses = pcall(vim.lsp.buf_request_sync, bufnr, "textDocument/documentSymbol", {
-      textDocument = { uri = vim.uri_from_fname(abs_path) },
-    }, 5000)
+  local attempt_count = 0
+  local max_attempts = 3
 
-    if ok and responses then
-      -- 检查是否有任何客户端返回了有效结果
-      local has_result = false
-      for _, response in pairs(responses) do
-        if type(response) == "table" then
-          -- buf_request_sync 返回 { [client_id] = { result = ..., err = ... } }
-          local result = response.result
-          if result ~= nil then
-            has_result = true
-            if type(result) == "table" and #result > 0 then
-              -- 搜索符号
-              local function search_symbols(symbols, depth)
-                depth = depth or 0
-                if depth > 20 then
-                  return nil
-                end
-                for _, sym in ipairs(symbols) do
-                  if sym.name == symbol_name then
-                    local range = sym.selectionRange or sym.range
-                    if range then
-                      return range.start.line, range.start.character
-                    end
-                  end
-                  if sym.children and #sym.children > 0 then
-                    local r, c = search_symbols(sym.children, depth + 1)
-                    if r then
-                      return r, c
-                    end
-                  end
-                end
-                return nil
+  local function do_request()
+    attempt_count = attempt_count + 1
+
+    lsp_request_async(bufnr, "textDocument/documentSymbol", {
+      textDocument = { uri = vim.uri_from_fname(abs_path) },
+    }, function(result, req_err)
+      if req_err then
+        if attempt_count < max_attempts then
+          -- 重试前等待 1 秒
+          vim.defer_fn(do_request, 1000)
+          return
+        end
+        if callback then
+          callback(nil, nil, req_err)
+        end
+        return
+      end
+
+      if result and type(result) == "table" and #result > 0 then
+        -- 搜索符号
+        local function search_symbols(symbols, depth)
+          depth = depth or 0
+          if depth > 20 then
+            return nil
+          end
+          for _, sym in ipairs(symbols) do
+            if sym.name == symbol_name then
+              local range = sym.selectionRange or sym.range
+              if range then
+                return range.start.line, range.start.character
               end
-              local r, c = search_symbols(result)
+            end
+            if sym.children and #sym.children > 0 then
+              local r, c = search_symbols(sym.children, depth + 1)
               if r then
                 return r, c
               end
             end
           end
+          return nil
+        end
+        local r, c = search_symbols(result)
+        if r then
+          if callback then
+            callback(r, c, nil)
+          end
+          return
         end
       end
-      -- 如果有客户端响应但没有找到符号，直接返回（不再重试）
-      if has_result then
-        return nil
-      end
-    end
 
-    -- 等待后重试
-    if attempt < 3 then
-      vim.wait(2000, function()
-        return false
-      end, 50)
-    end
+      -- 有结果但未找到符号，或结果为空
+      if attempt_count < max_attempts then
+        -- 空结果可能是 LSP 尚未完成索引，重试
+        vim.defer_fn(do_request, 1000)
+        return
+      end
+
+      if callback then
+        callback(nil, nil, nil)
+      end
+    end)
   end
 
-  return nil
+  do_request()
 end
 
 -- LSP 符号类型名称映射（兼容 Neovim 0.12，该版本没有 vim.lsp.symbol_kind_name）
@@ -633,7 +693,8 @@ local function wait_for_lsp_attach(bufnr, timeout_ms, expected_config)
       local client_id = args.data and args.data.client_id
       local client = client_id and vim.lsp.get_client_by_id(client_id)
       -- 只接受正式 LSP 客户端（排除 Copilot 等非正式服务）
-      if client and is_formal_lsp_client(client) then
+      -- 同时检查客户端名称是否与期望配置匹配（如果提供了 expected_config）
+      if client and is_formal_lsp_client(client) and client_matches(client) then
         done = true
       end
     end,
@@ -782,7 +843,8 @@ local function wait_for_lsp_attach_async(bufnr, callback, timeout_ms, expected_c
     callback = function(args)
       local client_id = args.data and args.data.client_id
       local client = client_id and vim.lsp.get_client_by_id(client_id)
-      if client and is_formal_lsp_client(client) then
+      -- 只接受正式 LSP 客户端，且客户端名称与期望配置匹配（如果提供了 expected_config）
+      if client and is_formal_lsp_client(client) and client_matches(client) then
         attached = true
       end
     end,
@@ -839,6 +901,147 @@ local function wait_for_lsp_attach_async(bufnr, callback, timeout_ms, expected_c
       end
     end)
   end)
+end
+
+-- 获取文件对应的 LSP 客户端
+-- 尝试多种方式启动 LSP 服务器（通用实现，自适应所有 LSP 配置）
+-- 返回 true/false
+local function try_start_lsp(config_name, bufnr)
+  -- 跳过非正式服务器
+  if not is_formal_server_name(config_name) then
+    return false
+  end
+
+  ensure_lsp_init()
+
+  -- 方式 1：尝试通过用户自定义 LSP 模块启动
+  -- 遍历常见自定义模块名，看是否有启动能力
+  local custom_modules = { "lsp", "lspconfig", "lsp_config", "lsp-config" }
+  for _, mod_name in ipairs(custom_modules) do
+    local ok, mod = pcall(require, mod_name)
+    if ok and type(mod) == "table" then
+      -- 方式 1a：start_server_with_config 方法
+      if mod.start_server_with_config then
+        local started = mod.start_server_with_config(config_name, bufnr)
+        if started then
+          return true
+        end
+      end
+      -- 方式 1b：_server_configs 表（Neovim 0.12 内置 API 模式）
+      if mod._server_configs and mod._server_configs[config_name] then
+        local cfg = mod._server_configs[config_name]
+        local ok_id, client_id = pcall(vim.lsp.start, cfg)
+        if ok_id and client_id then
+          pcall(vim.lsp.buf_attach_client, bufnr, client_id)
+          return true
+        end
+      end
+    end
+  end
+
+  -- 方式 2：vim.lsp.config 注册的配置（Neovim 0.12 内置）
+  local configs_ok = pcall(function()
+    if type(vim.lsp.config) == "table" then
+      if vim.lsp.config.get then
+        local c = vim.lsp.config.get(config_name)
+        if c then
+          return true
+        end
+      end
+    end
+    return false
+  end)
+  if configs_ok then
+    local ok_id, client_id = pcall(vim.lsp.start, config_name)
+    if ok_id and client_id then
+      pcall(vim.lsp.buf_attach_client, bufnr, client_id)
+      return true
+    end
+  end
+
+  -- 方式 3：nvim-lspconfig 插件
+  local lspconfig_ok, lspconfig = pcall(require, "lspconfig")
+  if lspconfig_ok and lspconfig[config_name] then
+    -- 尝试 launch（部分版本支持）
+    local ok_launch, client_id = pcall(lspconfig[config_name].launch, lspconfig[config_name], bufnr)
+    if ok_launch and client_id then
+      return true
+    end
+    -- 尝试通过 manager 启动（较新版本）
+    if lspconfig[config_name].manager then
+      local ok_mgr = pcall(lspconfig[config_name].manager.try_add, bufnr)
+      if ok_mgr then
+        return true
+      end
+    end
+  end
+
+  -- 方式 4：Mason 已安装的服务器
+  local mason_cmd = find_mason_server_cmd(config_name)
+  if mason_cmd then
+    local lsp_config = {
+      name = config_name,
+      cmd = mason_cmd,
+      root_dir = vim.fn.getcwd(),
+    }
+    local ok_id, client_id = pcall(vim.lsp.start, lsp_config)
+    if ok_id and client_id then
+      pcall(vim.lsp.buf_attach_client, bufnr, client_id)
+      return true
+    end
+  end
+
+  -- 方式 5：直接启动（通过 config_name 推断可执行文件名）
+  -- 生成多种可能的命令变体
+  local cmd_variants = {}
+  -- 特殊映射（常见 LSP 服务器的标准命令）
+  local special_cmds = {
+    lua_ls = { "lua-language-server" },
+    pyright = { "pyright-langserver", "--stdio" },
+    ts_ls = { "typescript-language-server", "--stdio" },
+    html = { "vscode-html-language-server", "--stdio" },
+    cssls = { "vscode-css-language-server", "--stdio" },
+    jsonls = { "vscode-json-language-server", "--stdio" },
+    yamlls = { "yaml-language-server", "--stdio" },
+    bashls = { "bash-language-server", "start" },
+    clangd = { "clangd" },
+    gopls = { "gopls" },
+    rust_analyzer = { "rust-analyzer" },
+    marksman = { "marksman" },
+    solargraph = { "solargraph", "stdio" },
+    intelephense = { "intelephense", "--stdio" },
+    jdtls = { "jdtls" },
+    volar = { "vue-language-server", "--stdio" },
+    svelte = { "svelte-language-server", "--stdio" },
+    htmlls = { "vscode-html-language-server", "--stdio" },
+  }
+  if special_cmds[config_name] then
+    table.insert(cmd_variants, special_cmds[config_name])
+  end
+  -- 通用推断
+  local dashed = config_name:gsub("_", "-")
+  table.insert(cmd_variants, { config_name })
+  table.insert(cmd_variants, { dashed })
+  table.insert(cmd_variants, { dashed .. "-language-server" })
+  table.insert(cmd_variants, { dashed .. "-langserver", "--stdio" })
+  table.insert(cmd_variants, { "vscode-" .. dashed .. "-language-server", "--stdio" })
+
+  for _, cmd in ipairs(cmd_variants) do
+    if cmd[1] and vim.fn.executable(cmd[1]) == 1 then
+      local lsp_config = {
+        name = config_name,
+        cmd = cmd,
+        root_dir = vim.fn.getcwd(),
+      }
+      local ok_id, client_id = pcall(vim.lsp.start, lsp_config)
+      if ok_id and client_id then
+        pcall(vim.lsp.buf_attach_client, bufnr, client_id)
+        return true
+      end
+    end
+  end
+
+  return false
 end
 
 -- 非阻塞版本的 get_lsp_clients
@@ -1039,147 +1242,6 @@ local function get_lsp_clients_async(filepath, callback, defer_cleanup)
 end
 
 -- 获取文件对应的 LSP 客户端
--- 尝试多种方式启动 LSP 服务器（通用实现，自适应所有 LSP 配置）
--- 返回 true/false
-local function try_start_lsp(config_name, bufnr)
-  -- 跳过非正式服务器
-  if not is_formal_server_name(config_name) then
-    return false
-  end
-
-  ensure_lsp_init()
-
-  -- 方式 1：尝试通过用户自定义 LSP 模块启动
-  -- 遍历常见自定义模块名，看是否有启动能力
-  local custom_modules = { "lsp", "lspconfig", "lsp_config", "lsp-config" }
-  for _, mod_name in ipairs(custom_modules) do
-    local ok, mod = pcall(require, mod_name)
-    if ok and type(mod) == "table" then
-      -- 方式 1a：start_server_with_config 方法
-      if mod.start_server_with_config then
-        local started = mod.start_server_with_config(config_name, bufnr)
-        if started then
-          return true
-        end
-      end
-      -- 方式 1b：_server_configs 表（Neovim 0.12 内置 API 模式）
-      if mod._server_configs and mod._server_configs[config_name] then
-        local cfg = mod._server_configs[config_name]
-        local ok_id, client_id = pcall(vim.lsp.start, cfg)
-        if ok_id and client_id then
-          pcall(vim.lsp.buf_attach_client, bufnr, client_id)
-          return true
-        end
-      end
-    end
-  end
-
-  -- 方式 2：vim.lsp.config 注册的配置（Neovim 0.12 内置）
-  local configs_ok = pcall(function()
-    if type(vim.lsp.config) == "table" then
-      if vim.lsp.config.get then
-        local c = vim.lsp.config.get(config_name)
-        if c then
-          return true
-        end
-      end
-    end
-    return false
-  end)
-  if configs_ok then
-    local ok_id, client_id = pcall(vim.lsp.start, config_name)
-    if ok_id and client_id then
-      pcall(vim.lsp.buf_attach_client, bufnr, client_id)
-      return true
-    end
-  end
-
-  -- 方式 3：nvim-lspconfig 插件
-  local lspconfig_ok, lspconfig = pcall(require, "lspconfig")
-  if lspconfig_ok and lspconfig[config_name] then
-    -- 尝试 launch（部分版本支持）
-    local ok_launch, client_id = pcall(lspconfig[config_name].launch, lspconfig[config_name], bufnr)
-    if ok_launch and client_id then
-      return true
-    end
-    -- 尝试通过 manager 启动（较新版本）
-    if lspconfig[config_name].manager then
-      local ok_mgr = pcall(lspconfig[config_name].manager.try_add, bufnr)
-      if ok_mgr then
-        return true
-      end
-    end
-  end
-
-  -- 方式 4：Mason 已安装的服务器
-  local mason_cmd = find_mason_server_cmd(config_name)
-  if mason_cmd then
-    local lsp_config = {
-      name = config_name,
-      cmd = mason_cmd,
-      root_dir = vim.fn.getcwd(),
-    }
-    local ok_id, client_id = pcall(vim.lsp.start, lsp_config)
-    if ok_id and client_id then
-      pcall(vim.lsp.buf_attach_client, bufnr, client_id)
-      return true
-    end
-  end
-
-  -- 方式 5：直接启动（通过 config_name 推断可执行文件名）
-  -- 生成多种可能的命令变体
-  local cmd_variants = {}
-  -- 特殊映射（常见 LSP 服务器的标准命令）
-  local special_cmds = {
-    lua_ls = { "lua-language-server" },
-    pyright = { "pyright-langserver", "--stdio" },
-    ts_ls = { "typescript-language-server", "--stdio" },
-    html = { "vscode-html-language-server", "--stdio" },
-    cssls = { "vscode-css-language-server", "--stdio" },
-    jsonls = { "vscode-json-language-server", "--stdio" },
-    yamlls = { "yaml-language-server", "--stdio" },
-    bashls = { "bash-language-server", "start" },
-    clangd = { "clangd" },
-    gopls = { "gopls" },
-    rust_analyzer = { "rust-analyzer" },
-    marksman = { "marksman" },
-    solargraph = { "solargraph", "stdio" },
-    intelephense = { "intelephense", "--stdio" },
-    jdtls = { "jdtls" },
-    volar = { "vue-language-server", "--stdio" },
-    svelte = { "svelte-language-server", "--stdio" },
-    htmlls = { "vscode-html-language-server", "--stdio" },
-  }
-  if special_cmds[config_name] then
-    table.insert(cmd_variants, special_cmds[config_name])
-  end
-  -- 通用推断
-  local dashed = config_name:gsub("_", "-")
-  table.insert(cmd_variants, { config_name })
-  table.insert(cmd_variants, { dashed })
-  table.insert(cmd_variants, { dashed .. "-language-server" })
-  table.insert(cmd_variants, { dashed .. "-langserver", "--stdio" })
-  table.insert(cmd_variants, { "vscode-" .. dashed .. "-language-server", "--stdio" })
-
-  for _, cmd in ipairs(cmd_variants) do
-    if cmd[1] and vim.fn.executable(cmd[1]) == 1 then
-      local lsp_config = {
-        name = config_name,
-        cmd = cmd,
-        root_dir = vim.fn.getcwd(),
-      }
-      local ok_id, client_id = pcall(vim.lsp.start, lsp_config)
-      if ok_id and client_id then
-        pcall(vim.lsp.buf_attach_client, bufnr, client_id)
-        return true
-      end
-    end
-  end
-
-  return false
-end
-
--- 获取文件对应的 LSP 客户端
 -- 只返回同时支持格式化（formatting）和悬停（hover）的客户端
 -- 如果文件没有关联的客户端，尝试通过多种方式启动
 -- 返回 clients, err, bufnr, cleanup
@@ -1286,11 +1348,18 @@ local function get_lsp_clients(filepath, defer_cleanup)
   return nil, "文件 '" .. filepath .. "' 没有关联的 LSP 客户端（需要支持悬停功能）", nil, nil
 end
 
--- 使用 Tree-sitter 在文件中查找符号位置
+-- 使用 Tree-sitter 在文件中查找符号位置（异步回调模式）
 -- 如果 Tree-sitter 不可用，回退到 LSP documentSymbol
--- 返回 { row, col } 或 nil
+-- 回调模式：callback(row, col, err)
 -- 如果提供了 bufnr，则优先使用它进行 LSP documentSymbol 回退查找
-local function find_symbol_position(filepath, symbol_name, node_type, bufnr)
+--
+-- 搜索策略（按优先级）：
+--   1. 精确匹配 identifier 节点（最精确）
+--   2. 精确匹配任意节点（次精确）
+--   3. 子串匹配 identifier 节点（避免误匹配如 "__main__" 匹配 "main"）
+--   4. 带点符号名匹配（如 "M.setup"）
+--   5. LSP documentSymbol 回退
+local function find_symbol_position_async(filepath, symbol_name, node_type, bufnr, callback)
   -- 先尝试 Tree-sitter
   local ok_ts, ts = pcall(require, "vim.treesitter")
   if ok_ts then
@@ -1304,7 +1373,8 @@ local function find_symbol_position(filepath, symbol_name, node_type, bufnr)
         local ok_inspect, _ = pcall(ts.language.inspect, ft)
         if not ok_inspect then
           -- 解析器未安装，跳过 Tree-sitter 查找，直接回退到 LSP
-          return find_symbol_via_lsp(filepath, symbol_name, bufnr)
+          find_symbol_via_lsp_async(filepath, symbol_name, bufnr, callback)
+          return
         end
         local ok_lang, lang = pcall(ts.language.get_lang, ft)
         if ok_lang and lang then
@@ -1324,8 +1394,8 @@ local function find_symbol_position(filepath, symbol_name, node_type, bufnr)
               }
 
               -- 递归遍历查找匹配的节点
-              -- 跳过根节点（如 chunk、program），因为根节点包含整个文件内容
-              local root_types = { chunk = true, program = true }
+              -- 跳过根节点（如 chunk、program、module），因为根节点包含整个文件内容
+              local root_types = { chunk = true, program = true, module = true }
 
               -- 检查符号名是否包含 '.'（如 "M.setup"、"table.insert"）
               local symbol_parts = {}
@@ -1337,27 +1407,25 @@ local function find_symbol_position(filepath, symbol_name, node_type, bufnr)
                 end
               end
 
+              -- 存储最佳匹配结果（优先选择 identifier 节点）
+              local best_match = nil
+
               local function search_node(node, depth, max_depth)
                 if not node or (max_depth and depth > max_depth) then
-                  return nil
+                  return
                 end
 
-                -- 跳过根节点类型，避免根节点包含整个文件内容导致返回 (0,0)
+                -- 跳过根节点类型
                 if root_types[node:type()] then
-                  -- 直接搜索子节点
                   for i = 0, node:named_child_count() - 1 do
-                    local child = node:named_child(i)
-                    local r, c = search_node(child, depth + 1, max_depth)
-                    if r then
-                      return r, c
-                    end
+                    search_node(node:named_child(i), depth + 1, max_depth)
                   end
-                  return nil
+                  return
                 end
 
                 -- 跳过注释和字符串节点
                 if skip_types[node:type()] then
-                  return nil
+                  return
                 end
 
                 local text = vim.treesitter.get_node_text(node, content)
@@ -1367,68 +1435,99 @@ local function find_symbol_position(filepath, symbol_name, node_type, bufnr)
                 end
 
                 if node_type_match and text then
-                  -- 策略一：精确匹配（text == symbol_name）
+                  local node_is_identifier = node:type() == "identifier"
+
+                  -- 策略一：精确匹配 identifier 节点（最精确）
+                  if node_is_identifier and text == symbol_name then
+                    local sr, sc = node:range()
+                    best_match = { row = sr, col = sc, priority = 1 }
+                    return
+                  end
+
+                  -- 策略二：精确匹配任意节点
                   if text == symbol_name then
-                    -- 查找子节点中精确匹配符号名的 identifier 节点
+                    -- 查找子节点中精确匹配的 identifier
                     for i = 0, node:named_child_count() - 1 do
                       local child = node:named_child(i)
                       local child_text = vim.treesitter.get_node_text(child, content)
-                      if child_text == symbol_name then
+                      if child:type() == "identifier" and child_text == symbol_name then
                         local sr, sc = child:range()
-                        return sr, sc
+                        best_match = { row = sr, col = sc, priority = 1 }
+                        return
                       end
                     end
-                    local sr, sc = node:range()
-                    return sr, sc
+                    -- 没有 identifier 子节点，使用当前节点
+                    if not best_match or best_match.priority > 2 then
+                      local sr, sc = node:range()
+                      best_match = { row = sr, col = sc, priority = 2 }
+                    end
+                    return
                   end
 
-                  -- 策略二：子串匹配（text 包含 symbol_name）
+                  -- 策略三：子串匹配 identifier 节点（避免误匹配如 "__main__" 匹配 "main"）
+                  if node_is_identifier and text:find(symbol_name, 1, true) then
+                    if not best_match or best_match.priority > 3 then
+                      local sr, sc = node:range()
+                      best_match = { row = sr, col = sc, priority = 3 }
+                    end
+                    return
+                  end
+
+                  -- 策略四：子串匹配任意节点（仅在没有 identifier 匹配时使用）
                   if text:find(symbol_name, 1, true) then
-                    -- 优先查找子节点中精确匹配符号名的 identifier 节点
+                    -- 优先查找子节点中精确匹配的 identifier
                     for i = 0, node:named_child_count() - 1 do
                       local child = node:named_child(i)
                       local child_text = vim.treesitter.get_node_text(child, content)
-                      if child_text == symbol_name then
+                      if child:type() == "identifier" and child_text == symbol_name then
                         local sr, sc = child:range()
-                        return sr, sc
+                        if not best_match or best_match.priority > 3 then
+                          best_match = { row = sr, col = sc, priority = 3 }
+                        end
+                        return
                       end
                     end
-                    -- 如果没有找到精确匹配的子节点，返回当前节点的起始位置
-                    local sr, sc = node:range()
-                    return sr, sc
+                    -- 没有 identifier 子节点，使用当前节点（低优先级）
+                    if not best_match or best_match.priority > 4 then
+                      local sr, sc = node:range()
+                      best_match = { row = sr, col = sc, priority = 4 }
+                    end
+                    return
                   end
 
-                  -- 策略三：带点符号名匹配（如 "M.setup" 匹配 field 节点 "M.setup"）
+                  -- 策略五：带点符号名匹配（如 "M.setup" 匹配 field 节点 "M.setup"）
                   if is_dotted and text == symbol_parts[#symbol_parts] then
-                    -- 当前节点文本等于最后一部分（如 "setup"），向上检查父节点链
-                    -- 对于 field 节点如 "M.setup"，子节点是 "M" 和 "setup"
-                    -- 我们直接检查当前节点的父节点是否包含完整的点号表达式
                     local parent = node:parent()
                     if parent then
                       local parent_text = vim.treesitter.get_node_text(parent, content)
                       if parent_text == symbol_name then
                         local sr, sc = node:range()
-                        return sr, sc
+                        if not best_match or best_match.priority > 3 then
+                          best_match = { row = sr, col = sc, priority = 3 }
+                        end
+                        return
                       end
                     end
                   end
                 end
 
-                -- 优先搜索命名子节点
+                -- 递归搜索子节点
                 for i = 0, node:named_child_count() - 1 do
-                  local child = node:named_child(i)
-                  local r, c = search_node(child, depth + 1, max_depth)
-                  if r then
-                    return r, c
+                  search_node(node:named_child(i), depth + 1, max_depth)
+                  if best_match and best_match.priority == 1 then
+                    -- 已找到最高优先级匹配，提前终止
+                    return
                   end
                 end
-
-                return nil
               end
 
-              local row, col = search_node(root, 0, 50)
-              if row then
-                return row, col
+              search_node(root, 0, 50)
+
+              if best_match then
+                if callback then
+                  callback(best_match.row, best_match.col, nil)
+                end
+                return
               end
             end
           end
@@ -1438,12 +1537,7 @@ local function find_symbol_position(filepath, symbol_name, node_type, bufnr)
   end
 
   -- Tree-sitter 不可用或未找到符号，回退到 LSP documentSymbol
-  local row, col = find_symbol_via_lsp(filepath, symbol_name, bufnr)
-  if row then
-    return row, col
-  end
-
-  return nil, "未找到符号 '" .. symbol_name .. "' 在文件中的位置"
+  find_symbol_via_lsp_async(filepath, symbol_name, bufnr, callback)
 end
 
 -- 执行 LSP 请求并等待结果
@@ -1476,6 +1570,8 @@ end
 -- 使用 vim.lsp.buf_request（非阻塞）替代 buf_request_sync
 -- 回调模式：callback(result, error_msg)
 -- 不会阻塞主线程，适合在 vim.schedule 回调中调用
+-- 注意：LSP 协议中，某些请求（如 hover）在没有信息时返回 nil 是正常行为
+-- 超时（回调未被调用）才表示客户端未就绪，此时会返回错误信息
 local function lsp_request_async(bufnr, method, params, callback)
   if not bufnr or not method then
     if callback then
@@ -1485,15 +1581,10 @@ local function lsp_request_async(bufnr, method, params, callback)
   end
 
   local done = false
-  local result_value = nil
-  local error_value = nil
   local timer = vim.uv.new_timer()
 
   -- 使用 buf_request 非阻塞发送请求
-  -- vim.lsp.buf_request 返回 request_id (number)，如果失败则抛出错误
-  -- pcall 返回 (ok, request_id_or_error)
   local ok, result_or_err = pcall(vim.lsp.buf_request, bufnr, method, params, function(err, result, ctx)
-    -- 这个回调在主线程中执行
     if done then
       return
     end
@@ -1506,17 +1597,12 @@ local function lsp_request_async(bufnr, method, params, callback)
     end
 
     if err then
-      error_value = tostring(err)
       if callback then
-        callback(nil, error_value)
-      end
-    elseif result == nil then
-      error_value = "LSP 请求无响应"
-      if callback then
-        callback(nil, error_value)
+        callback(nil, tostring(err))
       end
     else
-      result_value = result
+      -- result 可能为 nil（LSP 协议允许，如 hover 无信息时返回 null）
+      -- 直接透传给回调，让调用方自行判断
       if callback then
         callback(result, nil)
       end
@@ -1524,7 +1610,6 @@ local function lsp_request_async(bufnr, method, params, callback)
   end)
 
   if not ok then
-    -- pcall 失败（buf_request 抛出错误）
     done = true
     if timer and not timer:is_closing() then
       timer:close()
@@ -1535,11 +1620,8 @@ local function lsp_request_async(bufnr, method, params, callback)
     return
   end
 
-  -- buf_request 成功，result_or_err 是 request_id
-  -- 注意：即使没有客户端 attach，buf_request 也不会报错，只是不会调用回调
-  -- 超时定时器会处理这种情况
-
   -- 设置超时保护（8秒）
+  -- 超时表示回调未被调用，说明客户端未响应
   timer:start(8000, 0, function()
     vim.schedule(function()
       if done then
@@ -1590,42 +1672,57 @@ local function _lsp_hover(args, on_success, on_error)
       return
     end
 
-    local row, col = find_symbol_position(args.filepath, args.symbol, args.node_type, bufnr)
-    if not row then
-      if cleanup then
-        cleanup()
-      end
-      if on_error then
-        on_error("未找到符号 '" .. args.symbol .. "' 在文件中的位置")
-      end
-      return
-    end
-
-    -- 使用 lsp_request_async 非阻塞发送 LSP 请求
-    lsp_request_async(bufnr, "textDocument/hover", {
-      textDocument = { uri = vim.uri_from_fname(vim.fn.fnamemodify(args.filepath, ":p")) },
-      position = { line = row, character = col },
-    }, function(result, req_err)
-      if cleanup then
-        cleanup()
-      end
-
-      if req_err or not result then
+    find_symbol_position_async(args.filepath, args.symbol, args.node_type, bufnr, function(row, col, find_err)
+      if not row then
+        if cleanup then
+          cleanup()
+        end
         if on_error then
-          on_error(req_err or "未找到符号 '" .. args.symbol .. "' 的悬停信息")
+          on_error(find_err or "未找到符号 '" .. args.symbol .. "' 在文件中的位置")
         end
         return
       end
 
-      if on_success then
-        on_success({
-          filepath = args.filepath,
-          symbol = args.symbol,
-          position = { row = row, col = col },
-          contents = result.contents,
-          range = result.range,
-        })
-      end
+      -- 使用 lsp_request_async 非阻塞发送 LSP 请求
+      lsp_request_async(bufnr, "textDocument/hover", {
+        textDocument = { uri = vim.uri_from_fname(vim.fn.fnamemodify(args.filepath, ":p")) },
+        position = { line = row, character = col },
+      }, function(result, req_err)
+        if cleanup then
+          cleanup()
+        end
+
+        if req_err then
+          if on_error then
+            on_error(req_err)
+          end
+          return
+        end
+
+        if not result then
+          if on_success then
+            on_success({
+              filepath = args.filepath,
+              symbol = args.symbol,
+              position = { row = row, col = col },
+              contents = nil,
+              found = false,
+            })
+          end
+          return
+        end
+
+        if on_success then
+          on_success({
+            filepath = args.filepath,
+            symbol = args.symbol,
+            position = { row = row, col = col },
+            contents = result.contents,
+            range = result.range,
+            found = true,
+          })
+        end
+      end)
     end)
   end, true)
 end
@@ -1684,49 +1781,63 @@ local function _lsp_definition(args, on_success, on_error)
       return
     end
 
-    local row, col = find_symbol_position(args.filepath, args.symbol, args.node_type, bufnr)
-    if not row then
-      if cleanup then
-        cleanup()
-      end
-      if on_error then
-        on_error("未找到符号 '" .. args.symbol .. "' 在文件中的位置")
-      end
-      return
-    end
-
-    lsp_request_async(bufnr, "textDocument/definition", {
-      textDocument = { uri = vim.uri_from_fname(vim.fn.fnamemodify(args.filepath, ":p")) },
-      position = { line = row, character = col },
-    }, function(result, req_err)
-      if cleanup then
-        cleanup()
-      end
-
-      if req_err or not result or (type(result) == "table" and #result == 0) then
+    find_symbol_position_async(args.filepath, args.symbol, args.node_type, bufnr, function(row, col, find_err)
+      if not row then
+        if cleanup then
+          cleanup()
+        end
         if on_error then
-          on_error(req_err or "未找到符号 '" .. args.symbol .. "' 的定义")
+          on_error(find_err or "未找到符号 '" .. args.symbol .. "' 在文件中的位置")
         end
         return
       end
 
-      local locations = {}
-      for _, loc in ipairs(result) do
-        table.insert(locations, {
-          uri = loc.uri or loc.targetUri,
-          filename = loc.filename or (loc.uri and vim.uri_to_fname(loc.uri)),
-          range = loc.range or loc.targetRange,
-        })
-      end
+      lsp_request_async(bufnr, "textDocument/definition", {
+        textDocument = { uri = vim.uri_from_fname(vim.fn.fnamemodify(args.filepath, ":p")) },
+        position = { line = row, character = col },
+      }, function(result, req_err)
+        if cleanup then
+          cleanup()
+        end
 
-      if on_success then
-        on_success({
-          filepath = args.filepath,
-          symbol = args.symbol,
-          position = { row = row, col = col },
-          locations = locations,
-        })
-      end
+        if req_err then
+          if on_error then
+            on_error(req_err)
+          end
+          return
+        end
+
+        if not result or (type(result) == "table" and #result == 0) then
+          if on_success then
+            on_success({
+              filepath = args.filepath,
+              symbol = args.symbol,
+              position = { row = row, col = col },
+              locations = {},
+              found = false,
+            })
+          end
+          return
+        end
+
+        local locations = {}
+        for _, loc in ipairs(result) do
+          table.insert(locations, {
+            uri = loc.uri or loc.targetUri,
+            filename = loc.filename or (loc.uri and vim.uri_to_fname(loc.uri)),
+            range = loc.range or loc.targetRange,
+          })
+        end
+
+        if on_success then
+          on_success({
+            filepath = args.filepath,
+            symbol = args.symbol,
+            position = { row = row, col = col },
+            locations = locations,
+          })
+        end
+      end)
     end)
   end, true)
 end
@@ -1786,56 +1897,71 @@ local function _lsp_references(args, on_success, on_error)
       return
     end
 
-    local row, col = find_symbol_position(args.filepath, args.symbol, args.node_type, bufnr)
-    if not row then
-      if cleanup then
-        cleanup()
-      end
-      if on_error then
-        on_error("未找到符号 '" .. args.symbol .. "' 在文件中的位置")
-      end
-      return
-    end
-
-    local include_declaration = true
-    if args.include_declaration ~= nil then
-      include_declaration = args.include_declaration
-    end
-
-    lsp_request_async(bufnr, "textDocument/references", {
-      textDocument = { uri = vim.uri_from_fname(vim.fn.fnamemodify(args.filepath, ":p")) },
-      position = { line = row, character = col },
-      context = { includeDeclaration = include_declaration },
-    }, function(result, req_err)
-      if cleanup then
-        cleanup()
-      end
-
-      if req_err or not result or (type(result) == "table" and #result == 0) then
+    find_symbol_position_async(args.filepath, args.symbol, args.node_type, bufnr, function(row, col, find_err)
+      if not row then
+        if cleanup then
+          cleanup()
+        end
         if on_error then
-          on_error(req_err or "未找到符号 '" .. args.symbol .. "' 的引用")
+          on_error(find_err or "未找到符号 '" .. args.symbol .. "' 在文件中的位置")
         end
         return
       end
 
-      local references = {}
-      for _, ref in ipairs(result) do
-        table.insert(references, {
-          uri = ref.uri,
-          filename = ref.filename or (ref.uri and vim.uri_to_fname(ref.uri)),
-          range = ref.range,
-        })
+      local include_declaration = true
+      if args.include_declaration ~= nil then
+        include_declaration = args.include_declaration
       end
 
-      if on_success then
-        on_success({
-          filepath = args.filepath,
-          symbol = args.symbol,
-          position = { row = row, col = col },
-          reference_count = #references,
-          references = references,
-        })
-      end
+      lsp_request_async(bufnr, "textDocument/references", {
+        textDocument = { uri = vim.uri_from_fname(vim.fn.fnamemodify(args.filepath, ":p")) },
+        position = { line = row, character = col },
+        context = { includeDeclaration = include_declaration },
+      }, function(result, req_err)
+        if cleanup then
+          cleanup()
+        end
+
+        if req_err then
+          if on_error then
+            on_error(req_err)
+          end
+          return
+        end
+
+        if not result or (type(result) == "table" and #result == 0) then
+          if on_success then
+            on_success({
+              filepath = args.filepath,
+              symbol = args.symbol,
+              position = { row = row, col = col },
+              reference_count = 0,
+              references = {},
+              found = false,
+            })
+          end
+          return
+        end
+
+        local references = {}
+        for _, ref in ipairs(result) do
+          table.insert(references, {
+            uri = ref.uri,
+            filename = ref.filename or (ref.uri and vim.uri_to_fname(ref.uri)),
+            range = ref.range,
+          })
+        end
+
+        if on_success then
+          on_success({
+            filepath = args.filepath,
+            symbol = args.symbol,
+            position = { row = row, col = col },
+            reference_count = #references,
+            references = references,
+          })
+        end
+      end)
     end)
   end, true)
 end
@@ -1902,49 +2028,63 @@ local function _lsp_implementation(args, on_success, on_error)
       return
     end
 
-    local row, col = find_symbol_position(args.filepath, args.symbol, args.node_type, bufnr)
-    if not row then
-      if cleanup then
-        cleanup()
-      end
-      if on_error then
-        on_error("未找到符号 '" .. args.symbol .. "' 在文件中的位置")
-      end
-      return
-    end
-
-    lsp_request_async(bufnr, "textDocument/implementation", {
-      textDocument = { uri = vim.uri_from_fname(vim.fn.fnamemodify(args.filepath, ":p")) },
-      position = { line = row, character = col },
-    }, function(result, req_err)
-      if cleanup then
-        cleanup()
-      end
-
-      if req_err or not result or (type(result) == "table" and #result == 0) then
+    find_symbol_position_async(args.filepath, args.symbol, args.node_type, bufnr, function(row, col, find_err)
+      if not row then
+        if cleanup then
+          cleanup()
+        end
         if on_error then
-          on_error(req_err or "未找到符号 '" .. args.symbol .. "' 的实现")
+          on_error(find_err or "未找到符号 '" .. args.symbol .. "' 在文件中的位置")
         end
         return
       end
 
-      local locations = {}
-      for _, loc in ipairs(result) do
-        table.insert(locations, {
-          uri = loc.uri,
-          filename = loc.filename or (loc.uri and vim.uri_to_fname(loc.uri)),
-          range = loc.range,
-        })
-      end
+      lsp_request_async(bufnr, "textDocument/implementation", {
+        textDocument = { uri = vim.uri_from_fname(vim.fn.fnamemodify(args.filepath, ":p")) },
+        position = { line = row, character = col },
+      }, function(result, req_err)
+        if cleanup then
+          cleanup()
+        end
 
-      if on_success then
-        on_success({
-          filepath = args.filepath,
-          symbol = args.symbol,
-          position = { row = row, col = col },
-          locations = locations,
-        })
-      end
+        if req_err then
+          if on_error then
+            on_error(req_err)
+          end
+          return
+        end
+
+        if not result or (type(result) == "table" and #result == 0) then
+          if on_success then
+            on_success({
+              filepath = args.filepath,
+              symbol = args.symbol,
+              position = { row = row, col = col },
+              locations = {},
+              found = false,
+            })
+          end
+          return
+        end
+
+        local locations = {}
+        for _, loc in ipairs(result) do
+          table.insert(locations, {
+            uri = loc.uri,
+            filename = loc.filename or (loc.uri and vim.uri_to_fname(loc.uri)),
+            range = loc.range,
+          })
+        end
+
+        if on_success then
+          on_success({
+            filepath = args.filepath,
+            symbol = args.symbol,
+            position = { row = row, col = col },
+            locations = locations,
+          })
+        end
+      end)
     end)
   end, true)
 end
@@ -2007,49 +2147,63 @@ local function _lsp_declaration(args, on_success, on_error)
       return
     end
 
-    local row, col = find_symbol_position(args.filepath, args.symbol, args.node_type, bufnr)
-    if not row then
-      if cleanup then
-        cleanup()
-      end
-      if on_error then
-        on_error("未找到符号 '" .. args.symbol .. "' 在文件中的位置")
-      end
-      return
-    end
-
-    lsp_request_async(bufnr, "textDocument/declaration", {
-      textDocument = { uri = vim.uri_from_fname(vim.fn.fnamemodify(args.filepath, ":p")) },
-      position = { line = row, character = col },
-    }, function(result, req_err)
-      if cleanup then
-        cleanup()
-      end
-
-      if req_err or not result or (type(result) == "table" and #result == 0) then
+    find_symbol_position_async(args.filepath, args.symbol, args.node_type, bufnr, function(row, col, find_err)
+      if not row then
+        if cleanup then
+          cleanup()
+        end
         if on_error then
-          on_error(req_err or "未找到符号 '" .. args.symbol .. "' 的声明")
+          on_error(find_err or "未找到符号 '" .. args.symbol .. "' 在文件中的位置")
         end
         return
       end
 
-      local locations = {}
-      for _, loc in ipairs(result) do
-        table.insert(locations, {
-          uri = loc.uri,
-          filename = loc.filename or (loc.uri and vim.uri_to_fname(loc.uri)),
-          range = loc.range,
-        })
-      end
+      lsp_request_async(bufnr, "textDocument/declaration", {
+        textDocument = { uri = vim.uri_from_fname(vim.fn.fnamemodify(args.filepath, ":p")) },
+        position = { line = row, character = col },
+      }, function(result, req_err)
+        if cleanup then
+          cleanup()
+        end
 
-      if on_success then
-        on_success({
-          filepath = args.filepath,
-          symbol = args.symbol,
-          position = { row = row, col = col },
-          locations = locations,
-        })
-      end
+        if req_err then
+          if on_error then
+            on_error(req_err)
+          end
+          return
+        end
+
+        if not result or (type(result) == "table" and #result == 0) then
+          if on_success then
+            on_success({
+              filepath = args.filepath,
+              symbol = args.symbol,
+              position = { row = row, col = col },
+              locations = {},
+              found = false,
+            })
+          end
+          return
+        end
+
+        local locations = {}
+        for _, loc in ipairs(result) do
+          table.insert(locations, {
+            uri = loc.uri,
+            filename = loc.filename or (loc.uri and vim.uri_to_fname(loc.uri)),
+            range = loc.range,
+          })
+        end
+
+        if on_success then
+          on_success({
+            filepath = args.filepath,
+            symbol = args.symbol,
+            position = { row = row, col = col },
+            locations = locations,
+          })
+        end
+      end)
     end)
   end, true)
 end
@@ -2105,54 +2259,85 @@ local function _lsp_document_symbols(args, on_success, on_error)
       return
     end
 
-    lsp_request_async(bufnr, "textDocument/documentSymbol", {
-      textDocument = { uri = vim.uri_from_fname(vim.fn.fnamemodify(args.filepath, ":p")) },
-    }, function(result, req_err)
-      if cleanup then
-        cleanup()
-      end
+    local retry_count = 0
+    local max_retries = 2
 
-      if req_err or not result or (type(result) == "table" and #result == 0) then
-        if on_error then
-          on_error(req_err or "未找到文档符号")
+    local function do_document_symbol_request()
+      retry_count = retry_count + 1
+
+      lsp_request_async(bufnr, "textDocument/documentSymbol", {
+        textDocument = { uri = vim.uri_from_fname(vim.fn.fnamemodify(args.filepath, ":p")) },
+      }, function(result, req_err)
+        if req_err then
+          if cleanup then
+            cleanup()
+          end
+          if on_error then
+            on_error(req_err)
+          end
+          return
         end
-        return
-      end
 
-      local function flatten_symbols(symbols, depth)
-        depth = depth or 0
-        local flat = {}
-        for _, sym in ipairs(symbols) do
-          local entry = {
-            name = sym.name,
-            kind = sym.kind,
-            kind_name = safe_symbol_kind_name(sym.kind),
-            range = sym.range,
-            selection_range = sym.selectionRange,
-            detail = sym.detail,
-            depth = depth,
-          }
-          table.insert(flat, entry)
-          if sym.children and #sym.children > 0 then
-            local children = flatten_symbols(sym.children, depth + 1)
-            for _, child in ipairs(children) do
-              table.insert(flat, child)
+        -- 空结果时重试（LSP 可能尚未完成索引）
+        if (not result or (type(result) == "table" and #result == 0)) and retry_count < max_retries then
+          vim.defer_fn(do_document_symbol_request, 1500)
+          return
+        end
+
+        if cleanup then
+          cleanup()
+        end
+
+        if not result or (type(result) == "table" and #result == 0) then
+          if on_success then
+            on_success({
+              filepath = args.filepath,
+              symbol_count = 0,
+              symbols = {},
+            })
+          end
+          return
+        end
+
+        -- 处理符号结果
+        local function flatten_symbols(symbols, depth)
+          depth = depth or 0
+          local flat = {}
+          for _, sym in ipairs(symbols) do
+            local entry = {
+              name = sym.name,
+              kind = sym.kind,
+              kind_name = safe_symbol_kind_name(sym.kind),
+              range = sym.range,
+              selection_range = sym.selectionRange,
+              detail = sym.detail,
+              depth = depth,
+            }
+            table.insert(flat, entry)
+            if sym.children and #sym.children > 0 then
+              local children = flatten_symbols(sym.children, depth + 1)
+              for _, child in ipairs(children) do
+                table.insert(flat, child)
+              end
             end
           end
+          return flat
         end
-        return flat
-      end
 
-      local symbols = flatten_symbols(result)
+        local symbols = flatten_symbols(result)
 
-      if on_success then
-        on_success({
-          filepath = args.filepath,
-          symbol_count = #symbols,
-          symbols = symbols,
-        })
-      end
-    end)
+        if on_success then
+          on_success({
+            filepath = args.filepath,
+            symbol_count = #symbols,
+            symbols = symbols,
+          })
+        end
+      end)
+    end
+
+    -- 启动首次请求
+    do_document_symbol_request()
   end, true)
 end
 
@@ -2328,70 +2513,86 @@ local function _lsp_code_action(args, on_success, on_error)
       return
     end
 
-    -- 通过符号名称定位
-    local row, col
-    if args.symbol then
-      row, col = find_symbol_position(args.filepath, args.symbol, args.node_type, bufnr)
-      if not row then
+    -- 辅助函数：发送 codeAction 请求
+    local function send_code_action_request(row, col)
+      -- 获取该位置的诊断信息（用于 code action context）
+      local diagnostics = {}
+      if args.include_diagnostics ~= false then
+        diagnostics = vim.diagnostic.get(bufnr, { lnum = row })
+      end
+
+      lsp_request_async(bufnr, "textDocument/codeAction", {
+        textDocument = { uri = vim.uri_from_fname(vim.fn.fnamemodify(args.filepath, ":p")) },
+        range = {
+          start = { line = row, character = col },
+          ["end"] = { line = row, character = col + 1 },
+        },
+        context = {
+          diagnostics = diagnostics,
+          only = args.only,
+        },
+      }, function(result, req_err)
         if cleanup then
           cleanup()
         end
-        if on_error then
-          on_error("未找到符号 '" .. args.symbol .. "' 在文件中的位置")
+
+        if req_err then
+          if on_error then
+            on_error(req_err)
+          end
+          return
         end
-        return
-      end
+
+        if not result or (type(result) == "table" and #result == 0) then
+          if on_success then
+            on_success({
+              filepath = args.filepath,
+              symbol = args.symbol,
+              action_count = 0,
+              actions = {},
+            })
+          end
+          return
+        end
+
+        local actions = {}
+        for _, action in ipairs(result) do
+          table.insert(actions, {
+            title = action.title,
+            kind = action.kind,
+            is_preferred = action.isPreferred,
+          })
+        end
+
+        if on_success then
+          on_success({
+            filepath = args.filepath,
+            symbol = args.symbol,
+            action_count = #actions,
+            actions = actions,
+          })
+        end
+      end)
+    end
+
+    -- 通过符号名称定位
+    if args.symbol then
+      find_symbol_position_async(args.filepath, args.symbol, args.node_type, bufnr, function(row, col, find_err)
+        if not row then
+          if cleanup then
+            cleanup()
+          end
+          if on_error then
+            on_error(find_err or "未找到符号 '" .. args.symbol .. "' 在文件中的位置")
+          end
+          return
+        end
+
+        send_code_action_request(row, col)
+      end)
     else
-      row = 0
-      col = 0
+      send_code_action_request(0, 0)
     end
-
-    -- 获取该位置的诊断信息（用于 code action context）
-    local diagnostics = {}
-    if args.include_diagnostics ~= false then
-      diagnostics = vim.diagnostic.get(bufnr, { lnum = row })
-    end
-
-    lsp_request_async(bufnr, "textDocument/codeAction", {
-      textDocument = { uri = vim.uri_from_fname(vim.fn.fnamemodify(args.filepath, ":p")) },
-      range = {
-        start = { line = row, character = col },
-        ["end"] = { line = row, character = col + 1 },
-      },
-      context = {
-        diagnostics = diagnostics,
-        only = args.only,
-      },
-    }, function(result, req_err)
-      if cleanup then
-        cleanup()
-      end
-
-      if req_err or not result or (type(result) == "table" and #result == 0) then
-        if on_error then
-          on_error(req_err or "未找到该位置的代码操作")
-        end
-        return
-      end
-
-      local actions = {}
-      for _, action in ipairs(result) do
-        table.insert(actions, {
-          title = action.title,
-          kind = action.kind,
-          is_preferred = action.isPreferred,
-        })
-      end
-
-      if on_success then
-        on_success({
-          filepath = args.filepath,
-          symbol = args.symbol,
-          action_count = #actions,
-          actions = actions,
-        })
-      end
-    end)
   end, true)
 end
 
@@ -2466,41 +2667,56 @@ local function _lsp_rename(args, on_success, on_error)
       return
     end
 
-    local row, col = find_symbol_position(args.filepath, args.symbol, args.node_type, bufnr)
-    if not row then
-      if cleanup then
-        cleanup()
-      end
-      if on_error then
-        on_error("未找到符号 '" .. args.symbol .. "' 在文件中的位置")
-      end
-      return
-    end
-
-    lsp_request_async(bufnr, "textDocument/rename", {
-      textDocument = { uri = vim.uri_from_fname(vim.fn.fnamemodify(args.filepath, ":p")) },
-      position = { line = row, character = col },
-      newName = args.new_name,
-    }, function(result, req_err)
-      if cleanup then
-        cleanup()
-      end
-
-      if req_err then
+    find_symbol_position_async(args.filepath, args.symbol, args.node_type, bufnr, function(row, col, find_err)
+      if not row then
+        if cleanup then
+          cleanup()
+        end
         if on_error then
-          on_error(req_err)
+          on_error(find_err or "未找到符号 '" .. args.symbol .. "' 在文件中的位置")
         end
         return
       end
 
-      if on_success then
-        on_success({
-          filepath = args.filepath,
-          symbol = args.symbol,
-          new_name = args.new_name,
-          changes = result and result.changes,
-        })
-      end
+      lsp_request_async(bufnr, "textDocument/rename", {
+        textDocument = { uri = vim.uri_from_fname(vim.fn.fnamemodify(args.filepath, ":p")) },
+        position = { line = row, character = col },
+        newName = args.new_name,
+      }, function(result, req_err)
+        if cleanup then
+          cleanup()
+        end
+
+        if req_err then
+          if on_error then
+            on_error(req_err)
+          end
+          return
+        end
+
+        if not result then
+          if on_success then
+            on_success({
+              filepath = args.filepath,
+              symbol = args.symbol,
+              new_name = args.new_name,
+              changes = nil,
+              found = false,
+            })
+          end
+          return
+        end
+
+        if on_success then
+          on_success({
+            filepath = args.filepath,
+            symbol = args.symbol,
+            new_name = args.new_name,
+            changes = result.changes,
+            found = true,
+          })
+        end
+      end)
     end)
   end, true)
 end
@@ -2593,9 +2809,20 @@ local function _lsp_format(args, on_success, on_error)
         cleanup()
       end
 
-      if req_err or not result or (type(result) == "table" and #result == 0) then
+      if req_err then
         if on_error then
-          on_error(req_err or "格式化失败或无变更")
+          on_error(req_err)
+        end
+        return
+      end
+
+      if not result or (type(result) == "table" and #result == 0) then
+        if on_success then
+          on_success({
+            filepath = args.filepath,
+            formatted = false,
+            content = nil,
+          })
         end
         return
       end
@@ -2779,8 +3006,38 @@ local function _lsp_client_info(args)
     if load_err then
       file_entry.error = "文件加载失败: " .. load_err
     else
+      -- 获取文件类型并推断期望的 LSP 配置名
+      local ft = vim.filetype.match({ filename = abs_path })
+      local ft_to_lsp_config = {
+        lua = "lua_ls",
+        python = "pyright",
+        javascript = "ts_ls",
+        typescript = "ts_ls",
+        javascriptreact = "ts_ls",
+        typescriptreact = "ts_ls",
+        go = "gopls",
+        rust = "rust_analyzer",
+        java = "jdtls",
+        c = "clangd",
+        cpp = "clangd",
+        ruby = "solargraph",
+        php = "intelephense",
+        json = "jsonls",
+        yaml = "yamlls",
+        markdown = "marksman",
+        bash = "bashls",
+        sh = "bashls",
+        zsh = "bashls",
+        css = "cssls",
+        html = "htmlls",
+        vue = "volar",
+        svelte = "svelte",
+      }
+      local expected_config = ft and ft_to_lsp_config[ft]
+
       -- 使用 LspAttach 事件等待 LSP 客户端 attach 到缓冲区（最多等待 30 秒）
-      local clients = wait_for_lsp_attach(bufnr, 30000)
+      -- 传入 expected_config 只等待与该 filetype 匹配的客户端
+      local clients = wait_for_lsp_attach(bufnr, 30000, expected_config)
       if not clients or #clients == 0 then
         file_entry.error = "该文件没有关联的 LSP 客户端"
       else
@@ -2887,59 +3144,73 @@ local function _lsp_signature_help(args, on_success, on_error)
       return
     end
 
-    local row, col = find_symbol_position(args.filepath, args.symbol, args.node_type, bufnr)
-    if not row then
-      if cleanup then
-        cleanup()
-      end
-      if on_error then
-        on_error("未找到符号 '" .. args.symbol .. "' 在文件中的位置")
-      end
-      return
-    end
-
-    lsp_request_async(bufnr, "textDocument/signatureHelp", {
-      textDocument = { uri = vim.uri_from_fname(vim.fn.fnamemodify(args.filepath, ":p")) },
-      position = { line = row, character = col },
-    }, function(result, req_err)
-      if cleanup then
-        cleanup()
-      end
-
-      if req_err or not result then
+    find_symbol_position_async(args.filepath, args.symbol, args.node_type, bufnr, function(row, col, find_err)
+      if not row then
+        if cleanup then
+          cleanup()
+        end
         if on_error then
-          on_error(req_err or "未找到符号 '" .. args.symbol .. "' 的签名帮助")
+          on_error(find_err or "未找到符号 '" .. args.symbol .. "' 在文件中的位置")
         end
         return
       end
 
-      local signatures = {}
-      for _, sig in ipairs(result.signatures or {}) do
-        local params = {}
-        for _, param in ipairs(sig.parameters or {}) do
-          table.insert(params, {
-            label = param.label,
-            documentation = param.documentation,
+      lsp_request_async(bufnr, "textDocument/signatureHelp", {
+        textDocument = { uri = vim.uri_from_fname(vim.fn.fnamemodify(args.filepath, ":p")) },
+        position = { line = row, character = col },
+      }, function(result, req_err)
+        if cleanup then
+          cleanup()
+        end
+
+        if req_err then
+          if on_error then
+            on_error(req_err)
+          end
+          return
+        end
+
+        if not result then
+          if on_success then
+            on_success({
+              filepath = args.filepath,
+              symbol = args.symbol,
+              position = { row = row, col = col },
+              signatures = {},
+              found = false,
+            })
+          end
+          return
+        end
+
+        local signatures = {}
+        for _, sig in ipairs(result.signatures or {}) do
+          local params = {}
+          for _, param in ipairs(sig.parameters or {}) do
+            table.insert(params, {
+              label = param.label,
+              documentation = param.documentation,
+            })
+          end
+          table.insert(signatures, {
+            label = sig.label,
+            documentation = sig.documentation,
+            parameters = params,
+            active_parameter = sig.activeParameter,
           })
         end
-        table.insert(signatures, {
-          label = sig.label,
-          documentation = sig.documentation,
-          parameters = params,
-          active_parameter = sig.activeParameter,
-        })
-      end
 
-      if on_success then
-        on_success({
-          filepath = args.filepath,
-          symbol = args.symbol,
-          position = { row = row, col = col },
-          active_signature = result.activeSignature,
-          active_parameter = result.activeParameter,
-          signatures = signatures,
-        })
-      end
+        if on_success then
+          on_success({
+            filepath = args.filepath,
+            symbol = args.symbol,
+            position = { row = row, col = col },
+            active_signature = result.activeSignature,
+            active_parameter = result.activeParameter,
+            signatures = signatures,
+          })
+        end
+      end)
     end)
   end, true)
 end
@@ -2993,64 +3264,82 @@ local function _lsp_completion(args, on_success, on_error)
       return
     end
 
-    local row, col
-    if args.symbol then
-      row, col = find_symbol_position(args.filepath, args.symbol, args.node_type, bufnr)
-      if not row then
+    -- 辅助函数：发送 completion 请求
+    local function send_completion_request(row, col)
+      lsp_request_async(bufnr, "textDocument/completion", {
+        textDocument = { uri = vim.uri_from_fname(vim.fn.fnamemodify(args.filepath, ":p")) },
+        position = { line = row, character = col },
+        context = {
+          triggerKind = args.trigger_kind or 1,
+          triggerCharacter = args.trigger_character,
+        },
+      }, function(result, req_err)
         if cleanup then
           cleanup()
         end
-        if on_error then
-          on_error("未找到符号 '" .. args.symbol .. "' 在文件中的位置")
+
+        if req_err then
+          if on_error then
+            on_error(req_err)
+          end
+          return
         end
-        return
-      end
-    else
-      row = 0
-      col = 0
+
+        if not result or not result.items or #result.items == 0 then
+          if on_success then
+            on_success({
+              filepath = args.filepath,
+              position = { row = row, col = col },
+              is_incomplete = false,
+              item_count = 0,
+              items = {},
+            })
+          end
+          return
+        end
+
+        local items = {}
+        for _, item in ipairs(result.items) do
+          table.insert(items, {
+            label = item.label,
+            kind = item.kind,
+            detail = item.detail,
+            documentation = item.documentation,
+            insert_text = item.insertText,
+            insert_text_format = item.insertTextFormat,
+          })
+        end
+
+        if on_success then
+          on_success({
+            filepath = args.filepath,
+            position = { row = row, col = col },
+            is_incomplete = result.isIncomplete,
+            item_count = #items,
+            items = items,
+          })
+        end
+      end)
     end
 
-    lsp_request_async(bufnr, "textDocument/completion", {
-      textDocument = { uri = vim.uri_from_fname(vim.fn.fnamemodify(args.filepath, ":p")) },
-      position = { line = row, character = col },
-      context = {
-        triggerKind = args.trigger_kind or 1,
-        triggerCharacter = args.trigger_character,
-      },
-    }, function(result, req_err)
-      if cleanup then
-        cleanup()
-      end
-
-      if req_err or not result or not result.items or #result.items == 0 then
-        if on_error then
-          on_error(req_err or "未找到该位置的补全建议")
+    -- 通过符号名称定位
+    if args.symbol then
+      find_symbol_position_async(args.filepath, args.symbol, args.node_type, bufnr, function(row, col, find_err)
+        if not row then
+          if cleanup then
+            cleanup()
+          end
+          if on_error then
+            on_error(find_err or "未找到符号 '" .. args.symbol .. "' 在文件中的位置")
+          end
+          return
         end
-        return
-      end
 
-      local items = {}
-      for _, item in ipairs(result.items) do
-        table.insert(items, {
-          label = item.label,
-          kind = item.kind,
-          detail = item.detail,
-          documentation = item.documentation,
-          insert_text = item.insertText,
-          insert_text_format = item.insertTextFormat,
-        })
-      end
-
-      if on_success then
-        on_success({
-          filepath = args.filepath,
-          position = { row = row, col = col },
-          is_incomplete = result.isIncomplete,
-          item_count = #items,
-          items = items,
-        })
-      end
-    end)
+        send_completion_request(row, col)
+      end)
+    else
+      send_completion_request(0, 0)
+    end
   end, true)
 end
 
@@ -3114,49 +3403,63 @@ local function _lsp_type_definition(args, on_success, on_error)
       return
     end
 
-    local row, col = find_symbol_position(args.filepath, args.symbol, args.node_type, bufnr)
-    if not row then
-      if cleanup then
-        cleanup()
-      end
-      if on_error then
-        on_error("未找到符号 '" .. args.symbol .. "' 在文件中的位置")
-      end
-      return
-    end
-
-    lsp_request_async(bufnr, "textDocument/typeDefinition", {
-      textDocument = { uri = vim.uri_from_fname(vim.fn.fnamemodify(args.filepath, ":p")) },
-      position = { line = row, character = col },
-    }, function(result, req_err)
-      if cleanup then
-        cleanup()
-      end
-
-      if req_err or not result or (type(result) == "table" and #result == 0) then
+    find_symbol_position_async(args.filepath, args.symbol, args.node_type, bufnr, function(row, col, find_err)
+      if not row then
+        if cleanup then
+          cleanup()
+        end
         if on_error then
-          on_error(req_err or "未找到符号 '" .. args.symbol .. "' 的类型定义")
+          on_error(find_err or "未找到符号 '" .. args.symbol .. "' 在文件中的位置")
         end
         return
       end
 
-      local locations = {}
-      for _, loc in ipairs(result) do
-        table.insert(locations, {
-          uri = loc.uri,
-          filename = loc.filename or (loc.uri and vim.uri_to_fname(loc.uri)),
-          range = loc.range,
-        })
-      end
+      lsp_request_async(bufnr, "textDocument/typeDefinition", {
+        textDocument = { uri = vim.uri_from_fname(vim.fn.fnamemodify(args.filepath, ":p")) },
+        position = { line = row, character = col },
+      }, function(result, req_err)
+        if cleanup then
+          cleanup()
+        end
 
-      if on_success then
-        on_success({
-          filepath = args.filepath,
-          symbol = args.symbol,
-          position = { row = row, col = col },
-          locations = locations,
-        })
-      end
+        if req_err then
+          if on_error then
+            on_error(req_err)
+          end
+          return
+        end
+
+        if not result or (type(result) == "table" and #result == 0) then
+          if on_success then
+            on_success({
+              filepath = args.filepath,
+              symbol = args.symbol,
+              position = { row = row, col = col },
+              locations = {},
+              found = false,
+            })
+          end
+          return
+        end
+
+        local locations = {}
+        for _, loc in ipairs(result) do
+          table.insert(locations, {
+            uri = loc.uri,
+            filename = loc.filename or (loc.uri and vim.uri_to_fname(loc.uri)),
+            range = loc.range,
+          })
+        end
+
+        if on_success then
+          on_success({
+            filepath = args.filepath,
+            symbol = args.symbol,
+            position = { row = row, col = col },
+            locations = locations,
+          })
+        end
+      end)
     end)
   end, true)
 end

@@ -55,6 +55,22 @@ function M._setup_event_listeners()
       logger.warn("[chat_service] 生成错误: session=" .. tostring(data.session_id) .. ", error=" .. tostring(data.error_msg))
     end,
   })
+  -- 监听取消生成事件，确保停止传播到所有子模块
+  vim.api.nvim_create_autocmd("User", {
+    pattern = event_constants.CANCEL_GENERATION,
+    callback = function(args)
+      local data = args.data or {}
+      local session_id = data.session_id
+      logger.debug("[chat_service] 收到取消生成事件: session=" .. tostring(session_id))
+      -- 确保 AI 引擎和工具编排器都收到停止信号
+      ai_engine.cancel_generation()
+      -- 通知工具编排器停止所有工具调用
+      local ok, tool_orc = pcall(require, "NeoAI.core.ai.tool_orchestrator")
+      if ok and tool_orc then
+        tool_orc.request_stop(session_id)
+      end
+    end,
+  })
 end
 
 -- ========== 会话管理 ==========
@@ -295,7 +311,21 @@ end
 
 function M.cancel_generation()
   if not guard() then return end
+  -- 从 history_manager 获取当前 session_id
+  local current_session = history_manager.get_current_session()
+  local session_id = current_session and current_session.id or nil
+  -- 先触发取消事件，让所有监听器（包括 chat_service 自身的）都能响应
+  vim.api.nvim_exec_autocmds("User", {
+    pattern = event_constants.CANCEL_GENERATION,
+    data = { session_id = session_id },
+  })
+  -- 再直接调用 ai_engine 取消
   ai_engine.cancel_generation()
+  -- 通知工具编排器停止所有工具调用
+  local ok, tool_orc = pcall(require, "NeoAI.core.ai.tool_orchestrator")
+  if ok and tool_orc then
+    tool_orc.request_stop(session_id)
+  end
 end
 
 function M.get_engine_status()
