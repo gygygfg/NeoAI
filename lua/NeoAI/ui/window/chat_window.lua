@@ -262,107 +262,123 @@ function M.open(session_id, window_id, branch_id)
     error("Invalid window_id format. Must start with 'win_'")
   end
 
-  -- 如果已有窗口，先关闭
+  -- 如果已有窗口，先关闭（同步清理状态，不等待 defer_fn）
   if state.current_window_id then
-    M.close()
+    local old_id = state.current_window_id
+    -- 立即清理状态，防止后续操作冲突
+    state.closing = true
+    -- 触发取消生成事件
+    vim.api.nvim_exec_autocmds("User", { pattern = Events.CANCEL_GENERATION, data = {} })
+    -- 关闭窗口
+    window_manager.close_window(old_id)
+    -- 重置流式状态
+    reset_streaming_state()
+    reset_tool_display()
+    state.tool_loop_in_progress = false
+    state.current_window_id = nil
+    state.current_session_id = nil
+    state.messages = {}
+    state.last_usage = nil
+    state.usage_extmark_id = nil
+    state.closing = false
   end
 
-  -- 处理旧版本兼容：如果第二个参数是branch_id而不是window_id
+  -- 处理旧版本兼容
   if branch_id and type(branch_id) == "string" and branch_id:match("^win_") then
-    -- 旧版本调用方式：open(session_id, window_id)
     window_id = branch_id
     branch_id = "main"
   end
-
-  -- 重置 closing 标记（M.close() 设置了 state.closing = true）
-  -- 确保新窗口可以正常接收事件
-  state.closing = false
 
   state.current_window_id = window_id
   state.current_session_id = session_id
   state.messages = {}
 
-  -- 触发窗口打开事件
-  vim.api.nvim_exec_autocmds(
-    "User",
-    { pattern = Events.WINDOW_OPENING, data = { window_id = window_id, window_type = "chat" } }
-  )
-
-  -- 获取缓冲区并设置选项
+  -- 获取缓冲区并快速设置关键选项
   local buf = window_manager.get_window_buf(window_id)
   local win_handle = window_manager.get_window_win(window_id)
 
-  if buf then
-    -- 先禁用诊断和分离 LSP（在设置 filetype 之前）
-    pcall(vim.diagnostic.disable, buf)
-    local existing_clients = vim.lsp.get_clients({ bufnr = buf })
-    for _, client in ipairs(existing_clients) do
-      pcall(vim.lsp.buf_detach_client, buf, client.id)
+  if buf and vim.api.nvim_buf_is_valid(buf) then
+    -- 批量设置 buffer 选项（合并 API 调用）
+    local buf_opts = {
+      filetype = "neoai", buflisted = true, buftype = "nofile",
+      swapfile = false, bufhidden = "hide", modified = false,
+    }
+    for name, val in pairs(buf_opts) do
+      pcall(vim.api.nvim_set_option_value, name, val, { buf = buf })
     end
-
-    -- 在设置 filetype 之前先标记 buffer 为禁止 LSP
-    -- 确保 LSP 的 FileType autocmd 能检测到 neoai_no_lsp 变量并跳过
     pcall(vim.api.nvim_buf_set_var, buf, "neoai_no_lsp", true)
-
-    -- 设置缓冲区选项
-    -- 使用 neoai 作为文件类型，避免触发任何 LSP 服务器
-    vim.api.nvim_set_option_value("filetype", "neoai", { buf = buf })
-    -- 确保buffer在:ls中可见但不会产生保存警告
-    vim.api.nvim_set_option_value("buflisted", true, { buf = buf })
-    vim.api.nvim_set_option_value("buftype", "nofile", { buf = buf })
-    vim.api.nvim_set_option_value("swapfile", false, { buf = buf })
-    vim.api.nvim_set_option_value("bufhidden", "hide", { buf = buf })
-    vim.api.nvim_set_option_value("modified", false, { buf = buf })
-    -- 启用折叠标记，使用 {{{ 和 }}} 作为折叠标记
-    vim.api.nvim_set_option_value("foldmethod", "marker", { win = win_handle })
-    vim.api.nvim_set_option_value("foldmarker", "{{{,}}}", { win = win_handle })
-    -- 默认折叠所有折叠（新插入的 {{{...}}} 自动折叠）
-    vim.api.nvim_set_option_value("foldlevel", 0, { win = win_handle })
-    -- 设置缓冲区名称，便于识别
-    vim.api.nvim_buf_set_name(buf, "neoai://chat/" .. session_id)
-    -- 阻止 LSP 附加到聊天缓冲区
-    window_manager.block_lsp_for_buffer(buf, "chat_window")
-
-    -- 再次禁用诊断（确保 filetype 设置后没有重新启用）
     pcall(vim.diagnostic.disable, buf)
+    pcall(vim.api.nvim_buf_set_name, buf, "neoai://chat/" .. session_id)
   end
 
-  if win_handle then
-    -- 设置窗口选项
-    vim.api.nvim_set_option_value("wrap", true, { win = win_handle })
-    vim.api.nvim_set_option_value("linebreak", true, { win = win_handle })
-    vim.api.nvim_set_option_value("cursorline", true, { win = win_handle })
+  if win_handle and vim.api.nvim_win_is_valid(win_handle) then
+    -- 批量设置窗口选项
+    local win_opts = {
+      wrap = true, linebreak = true, cursorline = true,
+      foldmethod = "marker", foldmarker = "{{{,}}}", foldlevel = 0,
+    }
+    for name, val in pairs(win_opts) do
+      pcall(vim.api.nvim_set_option_value, name, val, { win = win_handle })
+    end
   end
+
+  -- 阻止 LSP（异步执行，不阻塞窗口显示）
+  vim.schedule(function()
+    if buf and vim.api.nvim_buf_is_valid(buf) then
+      window_manager.block_lsp_for_buffer(buf, "chat_window")
+    end
+  end)
 
   -- 触发窗口打开事件
   vim.api.nvim_exec_autocmds("User", { pattern = Events.WINDOW_OPENED, data = { window_id = window_id } })
 
-  -- 加载消息数据
-  M._load_messages(session_id)
-
-  -- 渲染聊天内容
-  M.render_chat()
-
-  -- 添加 token 用量信息
-  M._update_usage_virt_text()
-
-  -- 更新窗口标题显示模型信息
-  local model_label = M._get_current_model_label()
-  if model_label then
-    M.update_title(string.format("NeoAI 聊天 [%s]", model_label))
-  end
-
-  -- 触发聊天框打开事件
-  vim.api.nvim_exec_autocmds("User", { pattern = Events.CHAT_BOX_OPENED, data = { window_id = window_id } })
-
-  -- 自动获取焦点
-  M._focus_window()
-
   -- 设置按键映射
   M.set_keymaps()
 
-  -- 打开浮动虚拟输入框
-  M._open_float_input()
+  -- 获取焦点
+  M._focus_window()
+
+  -- 先显示一个简单的欢迎界面，让用户立即看到窗口
+  local welcome_content = {
+    "# NeoAI 聊天",
+    "",
+    "加载中...",
+    "",
+    "---",
+    "",
+  }
+  if buf and vim.api.nvim_buf_is_valid(buf) then
+    pcall(vim.api.nvim_set_option_value, "modifiable", true, { buf = buf })
+    pcall(vim.api.nvim_set_option_value, "readonly", false, { buf = buf })
+    pcall(vim.api.nvim_buf_set_lines, buf, 0, -1, false, welcome_content)
+    pcall(vim.api.nvim_set_option_value, "modified", false, { buf = buf })
+  end
+
+  -- 异步加载所有内容
+  vim.schedule(function()
+    if state.closing or state.current_window_id ~= window_id then return end
+
+    -- 加载消息数据
+    M._load_messages(session_id)
+
+    -- 渲染聊天内容
+    M.render_chat()
+
+    -- 添加 token 用量信息
+    M._update_usage_virt_text()
+
+    -- 更新窗口标题
+    local model_label = M._get_current_model_label()
+    if model_label then
+      M.update_title(string.format("NeoAI 聊天 [%s]", model_label))
+    end
+
+    -- 触发聊天框打开事件
+    vim.api.nvim_exec_autocmds("User", { pattern = Events.CHAT_BOX_OPENED, data = { window_id = window_id } })
+
+    -- 打开浮动虚拟输入框
+    M._open_float_input()
+  end)
 
   return true
 end
@@ -472,17 +488,17 @@ function M._render_single_message(msg, prev_role)
         table.insert(lines, mline)
       end
     end
-  else
-    -- 普通消息
+  elseif main_content and main_content ~= "" then
+    -- 普通消息（有实际内容）
     local msg_lines = vim.split(main_content, "\n")
     if #msg_lines > 0 then
       table.insert(lines, string.format("%s %s", role_prefix, msg_lines[1]))
       for i = 2, #msg_lines do
         table.insert(lines, string.format("    %s", msg_lines[i]))
       end
-    else
-      table.insert(lines, role_prefix)
     end
+  else
+    -- 空内容消息，跳过不渲染
   end
 
   table.insert(lines, "")
@@ -503,6 +519,24 @@ function M._do_render_chat()
       { pattern = Events.DIALOGUE_RENDERING_START, data = { window_id = state.current_window_id } }
     )
 
+    -- 消息为空时直接渲染简单内容，避免 async_worker 调度开销
+    if #state.messages == 0 then
+      local empty_content = {
+        "# NeoAI 聊天",
+        "",
+        string.format("会话: %s", state.current_session_id or "未知"),
+        "---",
+        "",
+        "暂无消息",
+        "输入消息开始聊天...",
+        "",
+        "---",
+        "",
+      }
+      M._apply_rendered_content(empty_content)
+      return
+    end
+
     -- 使用异步工作器在后台构建内容
     local async_worker = require("NeoAI.utils.async_worker")
 
@@ -521,18 +555,13 @@ function M._do_render_chat()
       table.insert(content, "")
 
       -- 消息区域
-      if #state.messages == 0 then
-        table.insert(content, "暂无消息")
-        table.insert(content, "输入消息开始聊天...")
-      else
-        local prev_role = nil
-        for _, msg in ipairs(state.messages) do
-          local msg_lines = M._render_single_message(msg, prev_role)
-          for _, line in ipairs(msg_lines) do
-            table.insert(content, line)
-          end
-          prev_role = msg.role
+      local prev_role = nil
+      for _, msg in ipairs(state.messages) do
+        local msg_lines = M._render_single_message(msg, prev_role)
+        for _, line in ipairs(msg_lines) do
+          table.insert(content, line)
         end
+        prev_role = msg.role
       end
 
       -- 在最后添加分割线，作为对话结束的标记
@@ -542,81 +571,91 @@ function M._do_render_chat()
       return content
     end, function(success, content)
       if success and content then
-        -- 保存光标位置
-        local saved_cursor_lnum = nil
-        local saved_cursor_col = 0
-        local cursor_near_end = false
-        local win_handle = window_manager.get_window_win(state.current_window_id)
-        if win_handle and vim.api.nvim_win_is_valid(win_handle) then
-          local cursor = vim.api.nvim_win_get_cursor(win_handle)
-          saved_cursor_lnum = cursor[1]
-          saved_cursor_col = cursor[2]
-          local buf = vim.api.nvim_win_get_buf(win_handle)
-          local total_lines = vim.api.nvim_buf_line_count(buf)
-          if total_lines - saved_cursor_lnum <= 5 then
-            cursor_near_end = true
-          end
-        end
-
-        -- 设置窗口内容（window_manager.set_window_content 内部会设置 foldlevel=0）
-        -- 先保存当前的 foldlevel，设置内容后恢复，避免重置用户已调整的折叠状态
-        local fold_win = window_manager.get_window_win(state.current_window_id)
-        local saved_foldlevel = nil
-        if fold_win and vim.api.nvim_win_is_valid(fold_win) then
-          saved_foldlevel = vim.api.nvim_get_option_value("foldlevel", { win = fold_win })
-        end
-        window_manager.set_window_content(state.current_window_id, content)
-        if fold_win and vim.api.nvim_win_is_valid(fold_win) and saved_foldlevel ~= nil then
-          vim.api.nvim_set_option_value("foldlevel", saved_foldlevel, { win = fold_win })
-        end
-
-        -- 自动获取焦点（如果虚拟输入框已激活，跳过，避免抢走输入框焦点）
-        if not virtual_input.is_active() then
-          M._focus_window()
-        end
-
-        -- 延迟恢复光标位置并处理滚动
-        vim.defer_fn(function()
-          local win = window_manager.get_window_win(state.current_window_id)
-          if not win or not vim.api.nvim_win_is_valid(win) then
-            return
-          end
-          local buf = vim.api.nvim_win_get_buf(win)
-          local new_line_count = vim.api.nvim_buf_line_count(buf)
-
-          -- 如果虚拟输入框已激活，跳过光标恢复，避免覆盖输入框的焦点
-          if virtual_input.is_active() then
-            return
-          end
-
-          if cursor_near_end then
-            local last_line_content = vim.api.nvim_buf_get_lines(buf, new_line_count - 1, new_line_count, false)[1] or ""
-            pcall(vim.api.nvim_win_set_cursor, win, { new_line_count, #last_line_content })
-            if not state.streaming.active then
-              M._open_float_input()
-            end
-          elseif saved_cursor_lnum then
-            local new_lnum = math.min(saved_cursor_lnum, new_line_count)
-            local lines = vim.api.nvim_buf_get_lines(buf, new_lnum - 1, new_lnum, false)
-            local col = math.min(saved_cursor_col, #(lines[1] or ""))
-            pcall(vim.api.nvim_win_set_cursor, win, { new_lnum, col })
-          end
-        end, 30)
-
-        -- 触发渲染完成事件
-        vim.api.nvim_exec_autocmds(
-          "User",
-          { pattern = Events.RENDERING_COMPLETE, data = { window_id = state.current_window_id } }
-        )
-        vim.api.nvim_exec_autocmds(
-          "User",
-          { pattern = Events.DIALOGUE_RENDERING_COMPLETE, data = { window_id = state.current_window_id } }
-        )
+        M._apply_rendered_content(content)
       else
         print("❌ 聊天内容渲染失败")
       end
     end, { auto_serialize = false })
   end)
+end
+
+--- 应用渲染后的内容到窗口（内部函数）
+--- 提取自 async_worker 回调，供空消息快速渲染复用
+--- @param content table 内容行列表
+function M._apply_rendered_content(content)
+  if not content or not state.current_window_id then return end
+
+  -- 检查 Neovim 是否正在退出
+  local ok_tp, tp = pcall(vim.api.nvim_get_current_tabpage)
+  if not ok_tp or not tp then return end
+
+  -- 保存光标位置
+  local saved_cursor_lnum = nil
+  local saved_cursor_col = 0
+  local cursor_near_end = false
+  local win_handle = window_manager.get_window_win(state.current_window_id)
+  if win_handle and vim.api.nvim_win_is_valid(win_handle) then
+    local cursor = vim.api.nvim_win_get_cursor(win_handle)
+    saved_cursor_lnum = cursor[1]
+    saved_cursor_col = cursor[2]
+    local buf = vim.api.nvim_win_get_buf(win_handle)
+    local total_lines = vim.api.nvim_buf_line_count(buf)
+    if total_lines - saved_cursor_lnum <= 5 then
+      cursor_near_end = true
+    end
+  end
+
+  -- 设置窗口内容
+  local fold_win = window_manager.get_window_win(state.current_window_id)
+  local saved_foldlevel = nil
+  if fold_win and vim.api.nvim_win_is_valid(fold_win) then
+    saved_foldlevel = vim.api.nvim_get_option_value("foldlevel", { win = fold_win })
+  end
+  window_manager.set_window_content(state.current_window_id, content)
+  if fold_win and vim.api.nvim_win_is_valid(fold_win) and saved_foldlevel ~= nil then
+    vim.api.nvim_set_option_value("foldlevel", saved_foldlevel, { win = fold_win })
+  end
+
+  -- 自动获取焦点（如果虚拟输入框已激活，跳过，避免抢走输入框焦点）
+  if not virtual_input.is_active() then
+    M._focus_window()
+  end
+
+  -- 延迟恢复光标位置并处理滚动
+  vim.defer_fn(function()
+    local ok_tp2, tp2 = pcall(vim.api.nvim_get_current_tabpage)
+    if not ok_tp2 or not tp2 then return end
+
+    local win = window_manager.get_window_win(state.current_window_id)
+    if not win or not vim.api.nvim_win_is_valid(win) then return end
+    local buf = vim.api.nvim_win_get_buf(win)
+    local new_line_count = vim.api.nvim_buf_line_count(buf)
+
+    if virtual_input.is_active() then return end
+
+    if cursor_near_end then
+      local last_line_content = vim.api.nvim_buf_get_lines(buf, new_line_count - 1, new_line_count, false)[1] or ""
+      pcall(vim.api.nvim_win_set_cursor, win, { new_line_count, #last_line_content })
+      if not state.streaming.active then
+        M._open_float_input()
+      end
+    elseif saved_cursor_lnum then
+      local new_lnum = math.min(saved_cursor_lnum, new_line_count)
+      local lines = vim.api.nvim_buf_get_lines(buf, new_lnum - 1, new_lnum, false)
+      local col = math.min(saved_cursor_col, #(lines[1] or ""))
+      pcall(vim.api.nvim_win_set_cursor, win, { new_lnum, col })
+    end
+  end, 30)
+
+  -- 触发渲染完成事件
+  vim.api.nvim_exec_autocmds("User", {
+    pattern = Events.RENDERING_COMPLETE,
+    data = { window_id = state.current_window_id },
+  })
+  vim.api.nvim_exec_autocmds("User", {
+    pattern = Events.DIALOGUE_RENDERING_COMPLETE,
+    data = { window_id = state.current_window_id },
+  })
 end
 
 --- 异步渲染聊天内容（非阻塞版本）
@@ -702,12 +741,6 @@ function M.set_keymaps()
   local buf = window_manager.get_window_buf(state.current_window_id)
   if not buf then
     return
-  end
-
-  -- 清除现有映射
-  local existing_maps = vim.api.nvim_buf_get_keymap(buf, "n")
-  for _, map in ipairs(existing_maps) do
-    vim.api.nvim_buf_del_keymap(buf, "n", map.lhs)
   end
 
   -- 从合并后的配置中获取 chat 上下文键位
@@ -831,6 +864,10 @@ function M._open_float_input()
     return
   end
 
+  -- 检查 Neovim 是否正在退出，避免在退出过程中打开新窗口导致死循环
+  local ok_tp, tp = pcall(vim.api.nvim_get_current_tabpage)
+  if not ok_tp or not tp then return end
+
   -- 如果已激活，跳过
   if virtual_input.is_active() then
     return
@@ -902,6 +939,18 @@ function M._load_messages(session_id)
   if not chat_service_ok or not chat_service then
     return
   end
+  -- 确保 chat_service 已初始化
+  if not chat_service.is_initialized() then
+    local config = {}
+    local core_ok, core_mod = pcall(require, "NeoAI.core")
+    if core_ok then
+      local ok_cfg, cfg = pcall(function() return core_mod.get_config() end)
+      if ok_cfg and cfg then
+        config = cfg
+      end
+    end
+    chat_service.initialize({ config = config })
+  end
 
   local target_id = session_id
   if not target_id then
@@ -922,7 +971,16 @@ function M._load_messages(session_id)
   end
 
   -- 通过后端获取原始消息（保留 JSON 格式）
-  state.messages = chat_service.get_raw_messages(target_id)
+  -- 使用 pcall 保护，避免 get_raw_messages 中的错误阻塞主线程
+  -- 注意：必须使用闭包包装，不能直接用 pcall(cs.method, cs, args) 方式
+  -- 因为 get_raw_messages 是用点号定义的 function M.get_raw_messages(session_id)
+  -- pcall(cs.method, cs, args) 等价于冒号调用 cs:method(args)，会导致参数错位
+  local ok, messages = pcall(function()
+    return chat_service.get_raw_messages(target_id)
+  end)
+  if ok and messages then
+    state.messages = messages
+  end
 end
 
 --- 异步加载消息数据（内部函数）
@@ -1008,6 +1066,19 @@ function M.close()
   -- 延迟执行窗口关闭，给异步回调（如 _request_summary_round 的 defer_fn）一点时间完成
   -- 避免异步回调在窗口关闭后访问已清理的状态导致错误
   vim.defer_fn(function()
+    -- 检查 Neovim 是否正在退出，如果是则跳过所有窗口操作
+    -- 避免在 Neovim 退出过程中操作已无效的窗口导致死循环
+    local is_exiting = false
+    pcall(function()
+      -- 尝试获取当前 tabpage，如果 Neovim 正在退出可能会失败
+      local tp = vim.api.nvim_get_current_tabpage()
+      if not tp then is_exiting = true end
+    end)
+    if is_exiting then
+      state.closing = false
+      return
+    end
+
     -- 使用局部变量 closing_window_id，不受 state.current_window_id 变化的影响
     local win_handle = window_manager.get_window_win(closing_window_id)
     if not win_handle or not vim.api.nvim_win_is_valid(win_handle) then
@@ -1087,11 +1158,11 @@ function M.close()
     state.closing = false
 
     -- 触发窗口关闭事件
-    vim.api.nvim_exec_autocmds("User", { pattern = Events.WINDOW_CLOSED, data = { window_id = closed_window_id } })
+    vim.api.nvim_exec_autocmds("User", { pattern = Events.WINDOW_CLOSED, data = { window_id = closing_window_id } })
 
     -- 触发聊天框关闭完成事件
-    vim.api.nvim_exec_autocmds("User", { pattern = Events.CHAT_BOX_CLOSED, data = { window_id = closed_window_id } })
-  end, 100) -- 100ms 延迟，给异步回调足够时间完成
+    vim.api.nvim_exec_autocmds("User", { pattern = Events.CHAT_BOX_CLOSED, data = { window_id = closing_window_id } })
+  end, 30) -- 30ms 延迟，给异步回调足够时间完成
 end
 
 --- 在 AI 回复末尾行添加 token 用量虚拟文本
@@ -1677,6 +1748,9 @@ function M._setup_event_listeners()
         end
       end
 
+      -- 将最终内容保存到 history_manager（确保包含折叠文本的完整内容被持久化）
+      M._save_final_content_to_history(data)
+
       -- 清理状态
       state.tool_display.folded_saved = false
       if has_tool_results then
@@ -1706,10 +1780,14 @@ function M._setup_event_listeners()
       end
 
       M._update_usage_virt_text()
-      M._scroll_to_end_with_offset()
-      M._open_float_input()
-      if virtual_input.is_active() then
-        virtual_input.focus_and_insert()
+      -- 仅在光标跟随模式下滚动和打开输入框
+      local generation_win = get_win()
+      if cursor_near_end(generation_win) then
+        M._scroll_to_end_with_offset()
+        M._open_float_input()
+        if virtual_input.is_active() then
+          virtual_input.focus_and_insert()
+        end
       end
     end,
   })
@@ -1788,6 +1866,10 @@ function M._setup_event_listeners()
         return
       end
 
+      -- 检查光标是否在末尾附近（决定是否显示悬浮窗）
+      local win = get_win()
+      local should_follow = cursor_near_end(win)
+
       if not state.streaming.active or state.streaming.generation_id ~= gid then
         state.streaming.active = true
         state.streaming.generation_id = gid
@@ -1800,17 +1882,23 @@ function M._setup_event_listeners()
           state.streaming.message_index = #state.messages
         end
         cancel_reasoning_timer()
-        local ok_rd, rd = pcall(require, "NeoAI.ui.components.reasoning_display")
-        if ok_rd then
-          rd.show("🤔 AI正在思考...")
+        -- 仅在光标跟随模式下显示思考过程悬浮窗
+        if should_follow then
+          local ok_rd, rd = pcall(require, "NeoAI.ui.components.reasoning_display")
+          if ok_rd then
+            rd.show("🤔 AI正在思考...")
+          end
         end
       end
 
       state.streaming.reasoning_active = true
       state.streaming.reasoning_buffer = state.streaming.reasoning_buffer .. rc
-      local ok_rd, rd = pcall(require, "NeoAI.ui.components.reasoning_display")
-      if ok_rd and rd.is_visible() then
-        rd.append(rc)
+      -- 仅在光标跟随模式下更新思考过程悬浮窗内容
+      if should_follow then
+        local ok_rd, rd = pcall(require, "NeoAI.ui.components.reasoning_display")
+        if ok_rd and rd.is_visible() then
+          rd.append(rc)
+        end
       end
       M._append_stream_chunk_to_buffer(rc, "reasoning")
     end,
@@ -2023,7 +2111,11 @@ function M._setup_event_listeners()
 
       -- 构建分组显示文本
       rebuild_tool_display_buffer()
-      M._show_tool_display()
+      -- 仅在光标跟随模式下显示工具调用悬浮窗
+      local win = get_win()
+      if cursor_near_end(win) then
+        M._show_tool_display()
+      end
     end,
   })
 
@@ -2040,7 +2132,10 @@ function M._setup_event_listeners()
         -- 使用工具包分组更新
         update_tool_in_pack(pack_name, data.tool_name, "executing", 0)
         rebuild_tool_display_buffer()
-        M._update_tool_display()
+        -- 仅在悬浮窗已显示时才更新
+        if state.tool_display.window_id then
+          M._update_tool_display()
+        end
       else
         -- 回退到旧方式
         update_tool_status(data.tool_name, "🔄", "(执行中...)")
@@ -2071,7 +2166,9 @@ function M._setup_event_listeners()
       if pack_name and state.tool_display.packs[pack_name] then
         update_tool_in_pack(pack_name, data.tool_name, "error", data.duration or 0)
         rebuild_tool_display_buffer()
-        M._update_tool_display()
+        if state.tool_display.window_id then
+          M._update_tool_display()
+        end
       else
         update_tool_status(data.tool_name, "❌", "(失败, " .. (data.duration or 0) .. "s)")
       end
@@ -2126,7 +2223,9 @@ function M._setup_event_listeners()
 
       -- 重建显示 buffer 并更新窗口
       rebuild_tool_display_buffer()
-      M._update_tool_display()
+      if state.tool_display.window_id then
+        M._update_tool_display()
+      end
     end,
   })
 
@@ -2152,7 +2251,9 @@ function M._setup_event_listeners()
       if pack_name and state.tool_display.packs[pack_name] then
         update_tool_in_pack(pack_name, data.tool_name, "completed", data.duration or 0)
         rebuild_tool_display_buffer()
-        M._update_tool_display()
+        if state.tool_display.window_id then
+          M._update_tool_display()
+        end
       else
         update_tool_status(data.tool_name, "✅", "(" .. (data.duration or 0) .. "s)")
       end
@@ -2503,12 +2604,27 @@ function M._append_stream_chunk_to_buffer(chunk_content, content_type)
     return
   end
 
-  -- 更新消息列表中的累积内容
+  -- 更新消息列表中的累积内容，并同步保存到历史文件
   local mi = state.streaming.message_index
   if mi and state.messages[mi] then
     local full = state.streaming.content_buffer or ""
     local rt = state.streaming.reasoning_buffer or ""
-    state.messages[mi].content = (rt ~= "") and vim.json.encode({ reasoning_content = rt, content = full }) or full
+    local new_content = (rt ~= "") and vim.json.encode({ reasoning_content = rt, content = full }) or full
+    state.messages[mi].content = new_content
+
+    -- 实时保存到 history_manager（节流：每 500ms 最多保存一次）
+    local now = vim.loop.now()
+    if not state._last_stream_save_time or now - state._last_stream_save_time >= 500 then
+      state._last_stream_save_time = now
+      local hm_ok, hm = pcall(require, "NeoAI.core.history_manager")
+      if hm_ok and hm.is_initialized() then
+        local session = hm.get_current_session()
+        if session then
+          hm.update_last_assistant(session.id, new_content)
+          hm._save()
+        end
+      end
+    end
   end
 
   local buf = get_buf()
@@ -3007,6 +3123,48 @@ function M.get_last_assistant_content()
     end
   end
   return nil
+end
+
+--- 将最终回复内容保存到 history_manager
+--- 在 GENERATION_COMPLETED 回调中调用，确保包含折叠文本的完整内容被持久化
+--- @param data table GENERATION_COMPLETED 事件数据
+function M._save_final_content_to_history(data)
+  local session_id = data.session_id
+  if not session_id then
+    return
+  end
+
+  local hm_ok, hm = pcall(require, "NeoAI.core.history_manager")
+  if not hm_ok or not hm.is_initialized() then
+    return
+  end
+
+  local final_content = M.get_last_assistant_content()
+  if not final_content or final_content == "" then
+    return
+  end
+
+  hm.update_last_assistant(session_id, final_content)
+
+  local usage = data.usage or {}
+  if usage and next(usage) then
+    hm.update_usage(session_id, usage)
+  end
+
+  hm._save()
+end
+
+--- 获取当前流式状态中的已生成内容
+--- 供 chat_handlers 在取消生成时获取已生成的思考过程和正文
+--- @return table|nil { reasoning_buffer: string, content_buffer: string }
+function M.get_streaming_content()
+  if not state.streaming.active and state.streaming.reasoning_buffer == "" and state.streaming.content_buffer == "" then
+    return nil
+  end
+  return {
+    reasoning_buffer = state.streaming.reasoning_buffer or "",
+    content_buffer = state.streaming.content_buffer or "",
+  }
 end
 
 return M

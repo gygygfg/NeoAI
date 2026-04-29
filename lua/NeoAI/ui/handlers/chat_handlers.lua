@@ -4,7 +4,7 @@
 --- 职责：
 ---   1. 接收用户输入，调用后端 chat_service.send_message()
 ---   2. 监听后端事件，更新前端状态
----   3. 管理待写入队列（等 AI 响应完成后一并写入历史）
+---   3. 每轮对话实时保存到历史文件（用户消息发送时立即保存，AI 回复流式更新时实时保存）
 
 local M = {}
 
@@ -13,8 +13,6 @@ local Events = require("NeoAI.core.events")
 local state = {
   initialized = false,
   config = nil,
-  -- 存储待写入的用户消息，key=session_id, value=user_message
-  pending_user_messages = {},
 }
 
 --- 获取后端聊天服务
@@ -26,11 +24,25 @@ local function get_chat_service()
   return nil
 end
 
---- 获取历史管理器（仅用于读取操作）
+--- 获取历史管理器
 local function get_hm()
   local ok, hm = pcall(require, "NeoAI.core.history_manager")
   if ok and hm.is_initialized() then return hm end
   return nil
+end
+
+--- 构建 assistant 内容（合并 reasoning 和正文）
+--- @param content_text string 正文内容
+--- @param reasoning_text string|nil 思考过程
+--- @return string
+local function build_assistant_content(content_text, reasoning_text)
+  if reasoning_text and reasoning_text ~= "" then
+    return vim.json.encode({
+      content = content_text or "",
+      reasoning_content = reasoning_text,
+    })
+  end
+  return content_text or ""
 end
 
 function M.initialize(config)
@@ -38,7 +50,7 @@ function M.initialize(config)
   state.config = config or {}
   state.initialized = true
 
-  -- 监听生成完成事件，写入历史
+  -- 监听生成完成事件，更新历史中的 AI 回复（最终完整内容）
   vim.api.nvim_create_autocmd("User", {
     pattern = Events.GENERATION_COMPLETED,
     callback = function(args)
@@ -54,55 +66,35 @@ function M.initialize(config)
     end,
   })
 
-  -- 监听取消生成事件，清理待写入队列和空会话
+  -- 监听取消生成事件：保存已生成的内容到历史文件
+  -- 注意：chat_window 的 GENERATION_CANCELLED 回调先执行，会调用 reset_streaming_state() 清空流式缓冲区
+  -- 所以这里改为从 chat_window.state.messages 中获取最后一条 assistant 消息的内容
   vim.api.nvim_create_autocmd("User", {
     pattern = Events.GENERATION_CANCELLED,
     callback = function()
       local hm = get_hm()
       if not hm then return end
-      for sid, _ in pairs(state.pending_user_messages) do
-        local session = hm.get_session(sid)
-        if session and (not session.user or session.user == "") and (not session.assistant or #session.assistant == 0) then
-          hm.delete_session(sid)
+
+      -- 从 chat_window 的 state.messages 中获取最后一条 assistant 消息的内容
+      -- chat_window 的 GENERATION_CANCELLED 回调已先执行，流式缓冲区已被清空
+      -- 但 state.messages 中的内容还在（reset_streaming_state 不清除 messages）
+      local chat_window_ok, chat_window = pcall(require, "NeoAI.ui.window.chat_window")
+      local assistant_content = nil
+      if chat_window_ok and chat_window.get_last_assistant_content then
+        assistant_content = chat_window.get_last_assistant_content()
+      end
+
+      if assistant_content and assistant_content ~= "" then
+        local session = hm.get_current_session()
+        if session then
+          hm.update_last_assistant(session.id, assistant_content)
+          hm._save()
         end
       end
-      state.pending_user_messages = {}
     end,
   })
 
   return true
-end
-
---- 将待写入的用户消息和AI回复一起写入历史文件
---- @param session_id string 会话ID
---- @param assistant_content string AI回复内容
---- @param usage table|nil token用量
-local function _flush_pending_round(session_id, assistant_content, usage)
-  local hm = get_hm()
-  if not hm then return end
-
-  local user_msg = state.pending_user_messages[session_id]
-  if not user_msg then
-    local session = hm.get_session(session_id)
-    if session then
-      hm.update_last_assistant(session_id, assistant_content)
-      if usage and next(usage) then
-        hm.update_usage(session_id, usage)
-      end
-    end
-    return
-  end
-
-  local existing_session = hm.get_session(session_id)
-  local existing_assistant = {}
-  if existing_session and type(existing_session.assistant) == "table" and #existing_session.assistant > 0 then
-    existing_assistant = vim.deepcopy(existing_session.assistant)
-    table.insert(existing_assistant, assistant_content)
-  else
-    existing_assistant = { assistant_content }
-  end
-  hm.add_round(session_id, user_msg, existing_assistant, usage)
-  state.pending_user_messages[session_id] = nil
 end
 
 --- 处理工具调用结果，写入历史
@@ -167,33 +159,28 @@ function M._handle_response_complete(data)
     response_content = tostring(response)
   end
 
-  if response_content == "" then return end
+  local hm = get_hm()
+  if not hm then return end
 
-  -- 优先使用 chat_window 中构建的 final_content（包含折叠文本如 {{{ }}}）
-  -- chat_window 的 GENERATION_COMPLETED 回调先执行，已将折叠文本保存到 state.messages
-  -- 这里读取它以确保历史中保存的是包含折叠文本的完整内容
-  local chat_window_ok, chat_window = pcall(require, "NeoAI.ui.window.chat_window")
-  local final_content = nil
-  if chat_window_ok and chat_window.get_last_assistant_content then
-    final_content = chat_window.get_last_assistant_content()
+  -- 注意：chat_window.lua 的 GENERATION_COMPLETED 回调（后执行）会负责保存包含折叠文本的最终内容
+  -- 这里只做基础保存（作为兜底），避免 chat_window 未初始化时丢失数据
+  -- 使用 response_content（AI 原始回复）而不是 get_last_assistant_content（可能还不包含折叠文本）
+  if reasoning_text and reasoning_text ~= "" then
+    local assistant_json = build_assistant_content(response_content, reasoning_text)
+    hm.update_last_assistant(session_id, assistant_json)
+  elseif response_content ~= "" then
+    hm.update_last_assistant(session_id, response_content)
   end
 
-  if final_content and final_content ~= "" then
-    -- 使用 chat_window 构建的包含折叠文本的内容
-    _flush_pending_round(session_id, final_content, usage)
-  elseif reasoning_text and reasoning_text ~= "" then
-    local assistant_json = vim.json.encode({
-      content = response_content,
-      reasoning_content = reasoning_text,
-    })
-    _flush_pending_round(session_id, assistant_json, usage)
-  else
-    _flush_pending_round(session_id, response_content, usage)
+  if usage and next(usage) then
+    hm.update_usage(session_id, usage)
   end
+
+  hm._save()
 end
 
 --- 发送消息（前端入口）
---- 通过后端 chat_service 发送消息
+--- 用户消息发送时立即写入历史文件，确保每轮对话实时保存
 --- @param content string 消息内容
 --- @param session_id string|nil 会话ID
 --- @param branch_id string|nil 分支ID（兼容旧版本）
@@ -217,7 +204,7 @@ function M.send_message(content, session_id, branch_id, window_id, format, callb
     return false, "后端聊天服务不可用"
   end
 
-  -- 1. 获取或创建会话（前端管理待写入队列）
+  -- 1. 获取或创建会话
   local hm = get_hm()
   if not hm then
     if callback then callback(false, "历史管理器未初始化") end
@@ -240,22 +227,18 @@ function M.send_message(content, session_id, branch_id, window_id, format, callb
     target_session_id = new_id
   end
 
-  -- 2. 保存用户消息到待写入队列
-  state.pending_user_messages[target_session_id] = content
+  -- 2. 用户消息立即写入历史文件（不再使用待写入队列）
+  -- 使用空字符串作为占位 assistant 内容，后续 AI 回复会通过 update_last_assistant 更新
+  hm.add_round(target_session_id, content, {}, {})
+  hm._save()
 
-  -- 3. 触发自动保存
-  local hm_module = require("NeoAI.core.history_manager")
-  if hm_module and hm_module._save then
-    hm_module._save()
-  end
-
-  -- 4. 通知 chat_window 添加用户消息
+  -- 3. 通知 chat_window 添加用户消息
   local chat_window = require("NeoAI.ui.window.chat_window")
   if chat_window.is_available() then
     chat_window.add_message("user", content)
   end
 
-  -- 5. 调用后端服务发送消息
+  -- 4. 调用后端服务发送消息
   local success, result = chat_service.send_message({
     content = content,
     session_id = target_session_id,
@@ -270,25 +253,6 @@ function M.send_message(content, session_id, branch_id, window_id, format, callb
   end
 
   return success, result
-end
-
-function M.send_message_sync(content, session_id, branch_id, window_id, format)
-  return M.send_message(content, session_id, branch_id, window_id, format)
-end
-
-function M.get_message_count()
-  local hm = get_hm()
-  if not hm then return 0 end
-  local session = hm.get_current_session()
-  if not session then return 0 end
-  local count = 0
-  if session.user and session.user ~= "" then count = count + 1 end
-  if session.assistant and session.assistant ~= "" then count = count + 1 end
-  return count
-end
-
-function M.update_config(new_config)
-  state.config = vim.tbl_extend("force", state.config, new_config or {})
 end
 
 return M

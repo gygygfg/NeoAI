@@ -16,9 +16,14 @@ function M.initialize(tools_config)
   tool_registry.initialize(config)
   tool_executor.initialize(config)
   tool_validator.initialize(config)
-  if config.builtin ~= false then M._load_builtin_tools() end
-  if config.external and #config.external > 0 then M._load_external_tools(config.external) end
   initialized = true
+  -- 延迟加载内置工具，不阻塞初始化流程
+  if config.builtin ~= false then
+    vim.schedule(function()
+      M._load_builtin_tools()
+    end)
+  end
+  if config.external and #config.external > 0 then M._load_external_tools(config.external) end
   return M
 end
 

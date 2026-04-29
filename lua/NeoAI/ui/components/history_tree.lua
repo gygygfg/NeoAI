@@ -253,8 +253,26 @@ function M.build_flat_items()
     end
   end
 
+  -- 过滤掉空的根会话（既没有 user 也没有 assistant 内容）
+  local non_empty_root_ids = {}
+  for _, rid in ipairs(root_ids) do
+    local session = session_map[rid]
+    if session then
+      local has_user = session.user and session.user ~= ""
+      local has_assistant = false
+      if session.assistant and type(session.assistant) == "table" and #session.assistant > 0 then
+        has_assistant = true
+      elseif session.assistant and type(session.assistant) == "string" and session.assistant ~= "" then
+        has_assistant = true
+      end
+      if has_user or has_assistant or #(session.child_ids or {}) > 0 then
+        table.insert(non_empty_root_ids, rid)
+      end
+    end
+  end
+
   -- 遍历每个根会话
-  for i, rid in ipairs(root_ids) do
+  for i, rid in ipairs(non_empty_root_ids) do
     -- 在根节点前面插入虚拟节点（indent=0）
     -- 第一个根虚拟节点前面不需要连接符（树的开始）
     -- 非最后一个根节点，虚拟节点前面需要 │  来连接后续的根节点
@@ -262,7 +280,7 @@ function M.build_flat_items()
     if i == 1 then
       -- 第一个根虚拟节点，前面不需要连接符
       root_virtual_connectors[1] = "   "
-    elseif i == #root_ids then
+    elseif i == #non_empty_root_ids then
       -- 最后一个根虚拟节点，前面不需要连接符（下面没有更多根节点了）
       root_virtual_connectors[1] = "   "
     else
@@ -276,7 +294,7 @@ function M.build_flat_items()
     }
     table.insert(flat_nodes, root_virtual_node)
 
-    dfs(rid, -1, 0, i, #root_ids, {})
+    dfs(rid, -1, 0, i, #non_empty_root_ids, {})
   end
 
   state.flat_items = flat_nodes

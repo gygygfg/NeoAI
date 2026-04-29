@@ -193,24 +193,26 @@ function M.setup(user_config)
   -- 初始化工具系统
   tools_ref = tools.initialize(config.tools or {})
 
-  -- 将工具注册表注入 AI 引擎
-  local ai_engine = core_ref.get_ai_engine()
-  if ai_engine and ai_engine.set_tools then
-    local registered_tools = tools_ref.get_tools()
-    local tools_map = {}
-    for _, tool_def in ipairs(registered_tools) do
-      tools_map[tool_def.name] = {
-        func = tool_def.func,
-        description = tool_def.description or "",
-        parameters = tool_def.parameters or {
-          type = "object",
-          properties = {},
-          required = {},
-        },
-      }
+  -- 延迟将工具注册表注入 AI 引擎（等异步加载的内置工具完成后）
+  vim.schedule(function()
+    local ai_engine = core_ref.get_ai_engine()
+    if ai_engine and ai_engine.set_tools then
+      local registered_tools = tools_ref.get_tools()
+      local tools_map = {}
+      for _, tool_def in ipairs(registered_tools) do
+        tools_map[tool_def.name] = {
+          func = tool_def.func,
+          description = tool_def.description or "",
+          parameters = tool_def.parameters or {
+            type = "object",
+            properties = {},
+            required = {},
+          },
+        }
+      end
+      ai_engine.set_tools(tools_map)
     end
-    ai_engine.set_tools(tools_map)
-  end
+  end)
 
   -- 注册命令和快捷键
   register_commands()

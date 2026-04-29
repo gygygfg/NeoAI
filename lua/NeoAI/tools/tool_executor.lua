@@ -202,7 +202,9 @@ function M.execute_async(tool_name, args, on_success, on_error, on_progress)
 
   local function on_error_wrapper(err_msg)
     local duration = os.time() - start_time
-    local full_err = "工具执行错误: " .. (err_msg or "未知错误")
+    -- err_msg 可能是 table（如 LSP 返回的错误对象），使用 tostring 安全转换
+    local err_str = type(err_msg) == "table" and vim.inspect(err_msg) or tostring(err_msg or "未知错误")
+    local full_err = "工具执行错误: " .. err_str
     local ok, err = pcall(fire_event, event_constants.TOOL_EXECUTION_ERROR, {
       tool_name = tool_name,
       pack_name = pack_name,

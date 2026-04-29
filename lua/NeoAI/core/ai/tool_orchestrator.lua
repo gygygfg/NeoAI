@@ -52,6 +52,10 @@ end
 --- 使用 pcall 保护，避免在 fast event 上下文中调用失败
 local function fire_loop_finished(ss)
   if not ss then return end
+  -- 检查 Neovim 是否正在退出，避免在退出过程中调度事件导致死循环
+  local ok_tp, tp = pcall(vim.api.nvim_get_current_tabpage)
+  if not ok_tp or not tp then return end
+
   local ok, err = pcall(vim.api.nvim_exec_autocmds, "User", {
     pattern = event_constants.TOOL_LOOP_FINISHED,
     data = {
@@ -63,6 +67,10 @@ local function fire_loop_finished(ss)
     },
   })
   if not ok then
+    -- 再次检查 Neovim 是否正在退出
+    local ok_tp2, tp2 = pcall(vim.api.nvim_get_current_tabpage)
+    if not ok_tp2 or not tp2 then return end
+
     -- fast event 上下文，用 vim.schedule 重试
     vim.schedule(function()
       pcall(vim.api.nvim_exec_autocmds, "User", {
@@ -83,6 +91,10 @@ end
 --- 使用 pcall 保护，避免在 fast event 上下文中调用失败
 local function fire_loop_started(ss, tool_calls)
   if not ss then return end
+  -- 检查 Neovim 是否正在退出
+  local ok_tp, tp = pcall(vim.api.nvim_get_current_tabpage)
+  if not ok_tp or not tp then return end
+
   local ok, err = pcall(vim.api.nvim_exec_autocmds, "User", {
     pattern = event_constants.TOOL_LOOP_STARTED,
     data = {
@@ -94,6 +106,9 @@ local function fire_loop_started(ss, tool_calls)
     },
   })
   if not ok then
+    local ok_tp2, tp2 = pcall(vim.api.nvim_get_current_tabpage)
+    if not ok_tp2 or not tp2 then return end
+
     vim.schedule(function()
       pcall(vim.api.nvim_exec_autocmds, "User", {
         pattern = event_constants.TOOL_LOOP_STARTED,
@@ -113,6 +128,10 @@ end
 --- 使用 pcall 保护，避免在 fast event 上下文中调用失败
 local function fire_tool_result_received(ss, is_final_round)
   if not ss then return end
+  -- 检查 Neovim 是否正在退出
+  local ok_tp, tp = pcall(vim.api.nvim_get_current_tabpage)
+  if not ok_tp or not tp then return end
+
   local ok, err = pcall(vim.api.nvim_exec_autocmds, "User", {
     pattern = event_constants.TOOL_RESULT_RECEIVED,
     data = {
@@ -130,6 +149,9 @@ local function fire_tool_result_received(ss, is_final_round)
     },
   })
   if not ok then
+    local ok_tp2, tp2 = pcall(vim.api.nvim_get_current_tabpage)
+    if not ok_tp2 or not tp2 then return end
+
     vim.schedule(function()
       pcall(vim.api.nvim_exec_autocmds, "User", {
         pattern = event_constants.TOOL_RESULT_RECEIVED,
@@ -599,6 +621,40 @@ function M._request_summary_round(session_id)
     logger.debug("[tool_orchestrator] _request_summary_round: 已请求停止，直接通知完成")
     ss.phase = "idle"
     ss._summary_in_progress = false
+
+    -- 先保存历史：将 ss.messages 中的工具调用结果持久化到 history_manager
+    -- 确保工具循环被停止后，用户消息和工具调用结果不会丢失
+    -- 注意：不要调用 hm._save()，history_manager 内部已有 debounce_save 机制
+    -- 直接调用 _save() 会触发 vim.fn.writefile()，可能引发 BufWrite 事件循环导致无限卡死
+    local hm_ok, hm = pcall(require, "NeoAI.core.history_manager")
+    if hm_ok and hm.is_initialized() then
+      -- 将 ss.messages 中的 tool 消息保存到 history_manager
+      for _, msg in ipairs(ss.messages or {}) do
+        if msg.role == "tool" and msg.name then
+          local arguments = {}
+          -- 尝试从之前的 assistant 消息中查找 tool_call 参数
+          for i = #ss.messages - 1, 1, -1 do
+            local prev = ss.messages[i]
+            if prev.role == "assistant" and prev.tool_calls then
+              for _, tc in ipairs(prev.tool_calls) do
+                if tc.id == msg.tool_call_id then
+                  local func = tc["function"] or tc.func or {}
+                  if func.arguments then
+                    local ok2, parsed = pcall(vim.json.decode, func.arguments)
+                    if ok2 and parsed then arguments = parsed end
+                  end
+                  break
+                end
+              end
+              break
+            end
+          end
+          hm.add_tool_result(session_id, msg.name, arguments, msg.content or "")
+        end
+      end
+      -- 不调用 hm._save()，避免触发文件写入事件循环
+    end
+
     -- 触发 GENERATION_COMPLETED 事件，让 UI 知道生成已结束
     local saved_gen_id = ss.generation_id
     local saved_window_id = ss.window_id
@@ -729,6 +785,33 @@ function M._add_tool_result_to_messages(session_id, tool_call_id, tool_name, res
   }
   if tool_name then tool_msg.name = tool_name end
   table.insert(ss.messages, tool_msg)
+
+  -- 同时持久化到 history_manager，确保工具调用结果保存到历史文件
+  -- 注意：不要在此处调用 hm._save()，history_manager 内部已有 debounce_save 机制
+  -- 直接调用 _save() 会触发 vim.fn.writefile()，可能引发 BufWrite 事件循环导致无限卡死
+  local ok, hm = pcall(require, "NeoAI.core.history_manager")
+  if ok and hm.is_initialized() then
+    local arguments = {}
+    -- 尝试从 ss.messages 中查找对应的 tool_call 参数
+    for i = #ss.messages - 1, 1, -1 do
+      local msg = ss.messages[i]
+      if msg.role == "assistant" and msg.tool_calls then
+        for _, tc in ipairs(msg.tool_calls) do
+          if tc.id == tool_call_id or tc.id == safe_id then
+            local func = tc["function"] or tc.func or {}
+            if func.arguments then
+              local ok2, parsed = pcall(vim.json.decode, func.arguments)
+              if ok2 and parsed then arguments = parsed end
+            end
+            break
+          end
+        end
+        break
+      end
+    end
+    hm.add_tool_result(session_id, tool_name or "unknown", arguments, result_str)
+    -- 不调用 hm._save()，避免触发文件写入事件循环
+  end
 end
 
 -- ========== 结束循环 ==========
@@ -808,6 +891,38 @@ function M._finish_loop(session_id, success, result)
     logger.debug("[tool_orchestrator] _finish_loop: 已请求停止，直接触发完成事件")
     ss._summary_in_progress = false
     ss.generation_id = nil
+
+    -- 先保存历史：将 ss.messages 中的工具调用结果持久化到 history_manager
+    -- 确保工具循环被停止后，用户消息和工具调用结果不会丢失
+    -- 注意：不要调用 hm._save()，history_manager 内部已有 debounce_save 机制
+    -- 直接调用 _save() 会触发 vim.fn.writefile()，可能引发 BufWrite 事件循环导致无限卡死
+    local hm_ok, hm = pcall(require, "NeoAI.core.history_manager")
+    if hm_ok and hm.is_initialized() then
+      for _, msg in ipairs(ss.messages or {}) do
+        if msg.role == "tool" and msg.name then
+          local arguments = {}
+          for i = #ss.messages - 1, 1, -1 do
+            local prev = ss.messages[i]
+            if prev.role == "assistant" and prev.tool_calls then
+              for _, tc in ipairs(prev.tool_calls) do
+                if tc.id == msg.tool_call_id then
+                  local func = tc["function"] or tc.func or {}
+                  if func.arguments then
+                    local ok2, parsed = pcall(vim.json.decode, func.arguments)
+                    if ok2 and parsed then arguments = parsed end
+                  end
+                  break
+                end
+              end
+              break
+            end
+          end
+          hm.add_tool_result(session_id, msg.name, arguments, msg.content or "")
+        end
+      end
+      -- 不调用 hm._save()，避免触发文件写入事件循环
+    end
+
     -- 触发 GENERATION_COMPLETED 事件，让 UI 知道生成已结束
     vim.schedule(function()
       pcall(vim.api.nvim_exec_autocmds, "User", {

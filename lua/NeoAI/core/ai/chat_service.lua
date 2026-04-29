@@ -192,6 +192,17 @@ function M.get_raw_messages(session_id)
       local ok, parsed = pcall(vim.json.decode, entry)
       if ok and type(parsed) == "table" and parsed.type == "tool_call" then
         table.insert(tool_call_buffer, parsed)
+      elseif ok and type(parsed) == "table" then
+        -- JSON 格式的 assistant 回复（含 reasoning_content 和/或 content）
+        -- 保留原始 JSON 字符串，让 _render_single_message 解析渲染
+        -- 只有当 content 和 reasoning_content 都为空时才跳过
+        local has_content = parsed.content and parsed.content ~= ""
+        local has_reasoning = parsed.reasoning_content and parsed.reasoning_content ~= ""
+        if has_content or has_reasoning then
+          flush_tool_calls()
+          table.insert(messages, { role = "assistant", content = entry })
+        end
+        -- content 和 reasoning_content 都为空时跳过
       else
         flush_tool_calls()
         table.insert(messages, { role = "assistant", content = entry })
@@ -252,19 +263,21 @@ function M.send_message(params)
     return false, "消息内容不能为空"
   end
 
-  -- 获取或创建会话
+  -- 使用传入的 session_id，如果未提供则获取或创建会话
   local hm = history_manager
-  local session = hm.get_or_create_current_session("聊天会话")
-  if not session then return false, "无法创建会话" end
+  local target_session_id = session_id
+  if not target_session_id then
+    local session = hm.get_or_create_current_session("聊天会话")
+    if not session then return false, "无法创建会话" end
+    target_session_id = session.id
 
-  local target_session_id = session.id
-
-  -- 如果当前会话已有内容，创建新分支会话
-  if session.user ~= nil and session.user ~= "" then
-    local _, new_parent_id = hm.get_context_and_new_parent(session.id)
-    local new_id = hm.create_session("分支-" .. (session.name or "会话"), false, new_parent_id)
-    hm.set_current_session(new_id)
-    target_session_id = new_id
+    -- 如果当前会话已有内容，创建新分支会话
+    if session.user ~= nil and session.user ~= "" then
+      local _, new_parent_id = hm.get_context_and_new_parent(session.id)
+      local new_id = hm.create_session("分支-" .. (session.name or "会话"), false, new_parent_id)
+      hm.set_current_session(new_id)
+      target_session_id = new_id
+    end
   end
 
   -- 保存用户消息到待写入队列
@@ -360,6 +373,10 @@ function M.save()
 end
 
 -- ========== 清理 ==========
+
+function M.is_initialized()
+  return state.initialized
+end
 
 function M.shutdown()
   if not guard() then return end

@@ -122,8 +122,10 @@ function M.initialize(options)
   state.config.auto_naming = state.config.auto_naming ~= false
   state.sessions = {}
   state.current_session_id = nil
-  M._load()
   state.initialized = true
+  -- 同步加载历史文件（vim.fn.readfile 和 vim.json.decode 本身就是同步操作）
+  -- 确保在初始化完成后数据立即可用，避免 tree 界面打开时数据未加载
+  M._load()
 end
 
 --- 加载会话数据
@@ -158,6 +160,8 @@ function M._load()
       state.sessions[session.id] = session
     end
   end
+  -- 触发会话加载完成事件，通知 UI 刷新
+  trigger_event(Events.SESSION_LOADED, {})
 end
 
 --- 保存会话数据到文件
@@ -181,9 +185,17 @@ function M._save()
   end
   local lines = {}
   table.insert(lines, "[")
-  for i, session in ipairs(arr) do
-    local json = vim.json.encode(session)
-    if i < #arr then
+  local valid_entries = {}
+  for _, session in ipairs(arr) do
+    local ok, json = pcall(vim.json.encode, session)
+    if ok and json then
+      table.insert(valid_entries, json)
+    else
+      logger.warn("[history_manager] 跳过无法序列化的会话: " .. (session.id or "unknown"))
+    end
+  end
+  for i, json in ipairs(valid_entries) do
+    if i < #valid_entries then
       table.insert(lines, json .. ",")
     else
       table.insert(lines, json)
@@ -354,7 +366,7 @@ function M.add_round(session_id, user_msg, assistant_msg, usage)
 end
 
 --- 更新当前会话的AI回复（用于流式更新）
---- 如果 content 是字符串，追加到 assistant 数组末尾
+--- 如果 content 是字符串，替换 assistant 数组的最后一条（如果存在），否则追加
 --- 如果 content 是数组，直接替换 assistant 字段
 function M.update_last_assistant(session_id, content)
   local session = state.sessions[session_id]
@@ -364,13 +376,18 @@ function M.update_last_assistant(session_id, content)
   if type(content) == "table" then
     session.assistant = content
   elseif content and content ~= "" then
-    -- 追加到数组末尾
+    -- 替换最后一条，而不是追加
     if type(session.assistant) ~= "table" then
       session.assistant = {}
     end
-    table.insert(session.assistant, content)
+    if #session.assistant > 0 then
+      session.assistant[#session.assistant] = content
+    else
+      table.insert(session.assistant, content)
+    end
   end
   session.updated_at = os.time()
+  debounce_save()
 end
 
 --- 追加一轮 assistant 回复到数组末尾（用于工具调用时的多轮对话）
@@ -407,13 +424,23 @@ function M.add_tool_result(session_id, tool_name, arguments, result)
     return false
   end
   -- 构建工具调用结果的 JSON 条目
-  local entry = vim.json.encode({
+  -- 使用 pcall 保护，避免 result 字符串含特殊字符导致编码失败
+  local entry
+  local ok_entry, encoded = pcall(vim.json.encode, {
     type = "tool_call",
     tool_name = tool_name,
     arguments = arguments,
     result = result,
     timestamp = os.time(),
   })
+  if ok_entry and encoded then
+    entry = encoded
+  else
+    -- 编码失败时使用安全字符串
+    local safe_result = tostring(result):gsub("[\128-\255]", "?"):gsub('"', "'"):gsub("\n", " "):gsub("\r", " ")
+    entry = '{"type":"tool_call","tool_name":' .. vim.json.encode(tool_name or "unknown") .. ',"arguments":{},' .. '"result":' .. vim.json.encode(safe_result) .. ',"timestamp":' .. os.time() .. '}'
+    logger.warn("[history_manager] add_tool_result JSON 编码失败，使用安全回退: " .. (tool_name or "unknown"))
+  end
   if type(session.assistant) ~= "table" then
     if session.assistant and session.assistant ~= "" then
       session.assistant = { session.assistant }
@@ -423,6 +450,7 @@ function M.add_tool_result(session_id, tool_name, arguments, result)
   end
   table.insert(session.assistant, entry)
   session.updated_at = os.time()
+  debounce_save()
   return true
 end
 

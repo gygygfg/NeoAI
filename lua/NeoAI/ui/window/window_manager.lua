@@ -19,26 +19,39 @@ local state = {
 
 -- ========== LSP 阻止 ==========
 
+local _blocked_buffers = {}
+
 function M.block_lsp_for_buffer(buf, label)
   if not buf or not vim.api.nvim_buf_is_valid(buf) then return end
+  -- 避免重复注册
+  if _blocked_buffers[buf] then return end
+  _blocked_buffers[buf] = true
+
   pcall(vim.api.nvim_buf_set_var, buf, "neoai_no_lsp", true)
   pcall(vim.diagnostic.disable, buf)
-  local clients = vim.lsp.get_clients({ bufnr = buf })
-  for _, client in ipairs(clients) do
-    pcall(vim.lsp.buf_detach_client, buf, client.id)
-  end
+  -- 使用 pcall 保护，避免在 Neovim 退出过程中调用 LSP API 出错
+  pcall(function()
+    local clients = vim.lsp.get_clients({ bufnr = buf })
+    for _, client in ipairs(clients) do
+      pcall(vim.lsp.buf_detach_client, buf, client.id)
+    end
+  end)
   local augroup_name = "NeoAIBlockLSP_buf_" .. tostring(buf)
   pcall(vim.api.nvim_del_augroup_by_name, augroup_name)
   local group = vim.api.nvim_create_augroup(augroup_name, { clear = true })
   vim.api.nvim_create_autocmd({ "BufEnter", "FileType", "InsertEnter", "TextChanged" }, {
     group = group, buffer = buf,
     callback = function()
-      vim.defer_fn(function()
-        pcall(vim.diagnostic.disable, buf)
+      -- 检查 Neovim 是否正在退出，避免在退出过程中调度 defer_fn 导致死循环
+      local ok, tp = pcall(vim.api.nvim_get_current_tabpage)
+      if not ok or not tp then return end
+
+      pcall(vim.diagnostic.disable, buf)
+      pcall(function()
         for _, client in ipairs(vim.lsp.get_clients({ bufnr = buf })) do
           pcall(vim.lsp.buf_detach_client, buf, client.id)
         end
-      end, 10)
+      end)
     end,
     desc = "阻止 LSP 附加" .. (label and ("到 " .. label) or ""),
   })
@@ -184,21 +197,25 @@ local function close_window_by_mode(window_info)
     end
   elseif id:match("^tab_") then
     if vim.api.nvim_win_is_valid(window_info.win) then
-      local tabpage = vim.api.nvim_win_get_tabpage(window_info.win)
-      local tabpages = vim.api.nvim_list_tabpages()
-      if #tabpages > 1 then
-        local tabpage_number = vim.api.nvim_tabpage_get_number(tabpage)
-        if tabpage_number then
-          vim.cmd("tabclose " .. tabpage_number)
-        else
-          for _, tp in ipairs(tabpages) do
-            if tp ~= tabpage then vim.api.nvim_set_current_tabpage(tp); break end
+      -- 使用 pcall 保护 tabclose，避免在 Neovim 退出过程中执行失败
+      pcall(function()
+        local tabpage = vim.api.nvim_win_get_tabpage(window_info.win)
+        local tabpages = vim.api.nvim_list_tabpages()
+        if #tabpages > 1 then
+          local tabpage_number = vim.api.nvim_tabpage_get_number(tabpage)
+          if tabpage_number then
+            vim.cmd("tabclose " .. tabpage_number)
+          else
+            for _, tp in ipairs(tabpages) do
+              if tp ~= tabpage then vim.api.nvim_set_current_tabpage(tp); break end
+            end
+            vim.cmd("tabclose")
           end
-          vim.cmd("tabclose")
+        else
+          -- 最后一个标签页，只删除 buffer 不关闭标签页
+          -- 避免在 Neovim 退出时触发额外的标签页切换事件
         end
-      else
-        vim.notify("[NeoAI] 不能关闭最后一个标签页", vim.log.levels.WARN)
-      end
+      end)
     end
     if vim.api.nvim_buf_is_valid(window_info.buf) then
       vim.api.nvim_buf_delete(window_info.buf, { force = true })
@@ -264,10 +281,14 @@ function M.create_window(window_type, options)
       group = group, buffer = buf,
       callback = function()
         vim.defer_fn(function()
+          -- 检查 Neovim 是否正在退出，避免在退出过程中操作窗口导致死循环
+          local ok, tp = pcall(vim.api.nvim_get_current_tabpage)
+          if not ok or not tp then return end
+
           local current_buf = vim.api.nvim_get_current_buf()
           if current_buf and vim.api.nvim_buf_is_valid(current_buf) then
-            local ok, is_float = pcall(vim.api.nvim_buf_get_var, current_buf, "neoai_float_window")
-            if ok and is_float then return end
+            local ok2, is_float = pcall(vim.api.nvim_buf_get_var, current_buf, "neoai_float_window")
+            if ok2 and is_float then return end
           end
           M.hide_float_window(buf)
         end, 50)
@@ -294,6 +315,14 @@ end
 function M.close_window(window_id)
   local window = windows[window_id]
   if not window then return end
+
+  -- 检查 Neovim 是否正在退出，避免在退出过程中操作窗口导致死循环
+  local ok_tp, tp = pcall(vim.api.nvim_get_current_tabpage)
+  if not ok_tp or not tp then
+    -- Neovim 正在退出，直接清理内部状态，不操作窗口
+    windows[window_id] = nil
+    return
+  end
 
   if window.window_info then close_window_by_mode(window.window_info) end
 
@@ -351,6 +380,12 @@ function M.focus_window(window_id)
 end
 
 function M.close_all()
+  -- 检查 Neovim 是否正在退出，如果是则直接清空状态不操作窗口
+  local ok_tp, tp = pcall(vim.api.nvim_get_current_tabpage)
+  if not ok_tp or not tp then
+    windows = {}
+    return
+  end
   for id, _ in pairs(windows) do M.close_window(id) end
   windows = {}
 end
@@ -426,8 +461,13 @@ function M.set_window_content(window_id, content)
     vim.api.nvim_set_option_value("modified", false, { buf = buf })
     local win = wi.win
     if win and vim.api.nvim_win_is_valid(win) then
-for _, opt in ipairs({ { "foldmethod", "marker" }, { "foldmarker", "{{{,}}}" }, { "foldlevel", 0 }, { "foldenable", true }, { "wrap", true }, { "linebreak", true } }) do
-        vim.api.nvim_set_option_value(opt[1], opt[2], { win = win })
+      -- 合并设置窗口选项，减少 API 调用次数
+      local win_opts = {
+        foldmethod = "marker", foldmarker = "{{{,}}}", foldlevel = 0,
+        foldenable = true, wrap = true, linebreak = true,
+      }
+      for name, val in pairs(win_opts) do
+        vim.api.nvim_set_option_value(name, val, { win = win })
       end
     end
   elseif window.type == "tree" or window.type == "reasoning" then

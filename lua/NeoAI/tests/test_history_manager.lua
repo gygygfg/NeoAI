@@ -233,7 +233,7 @@ function M.run(test_module)
       assert.is_true(#text > 0, "轮次文本不应为空")
     end,
 
-    --- 测试 update_last_assistant
+    --- 测试 update_last_assistant（替换语义：更新最后一条，而不是追加）
     test_update_last_assistant = function()
       local hm = require("NeoAI.core.history_manager")
       hm._test_reset()
@@ -244,7 +244,14 @@ function M.run(test_module)
       hm.update_last_assistant(id, '{"content":"回复2"}')
 
       local session = hm.get_session(id)
-      assert.is_true(#session.assistant >= 2, "应有至少 2 条 assistant 记录")
+      -- update_last_assistant 替换最后一条，所以 assistant 应该只有 1 条
+      assert.equal(1, #session.assistant, "update_last_assistant 应替换而不是追加")
+      -- 且内容应为更新后的值
+      local ok, parsed = pcall(vim.json.decode, session.assistant[1])
+      assert.is_true(ok, "assistant 内容应为有效 JSON")
+      if ok then
+        assert.equal("回复2", parsed.content, "assistant 内容应被更新")
+      end
     end,
 
     --- 测试 add_assistant_entry
