@@ -64,6 +64,10 @@ function M.initialize(options)
   http_client.initialize({ config = {} })
   tool_orchestrator.initialize({ config = state.full_config, session_manager = state.session_manager })
 
+  -- 初始化工具包管理模块
+  local tool_pack = require("NeoAI.tools.tool_pack")
+  tool_pack.initialize()
+
   M._setup_event_listeners()
   state.initialized = true
 

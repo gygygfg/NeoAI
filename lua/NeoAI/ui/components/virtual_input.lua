@@ -759,4 +759,57 @@ function M.get_input_line_count()
   return state.input_line_count
 end
 
+--- 重新定位浮动输入框（窗口大小变化时调用）
+function M.reposition()
+  if not state.active or state.mode ~= "float" then
+    return
+  end
+  if not state.float_win or not vim.api.nvim_win_is_valid(state.float_win) then
+    return
+  end
+  if not state.parent_win or not vim.api.nvim_win_is_valid(state.parent_win) then
+    return
+  end
+
+  local parent_config = vim.api.nvim_win_get_config(state.parent_win)
+  local parent_width = parent_config.width or 80
+  local parent_col = parent_config.col or 0
+  local parent_row = parent_config.row or 0
+  local parent_height = parent_config.height or 20
+  local screen_height = vim.o.lines
+
+  local input_height = 5
+  local input_width = parent_width
+
+  local chat_bottom = parent_row + parent_height + 1
+  local space_below = (screen_height - 1) - chat_bottom
+  local input_total_height = input_height + 2
+
+  -- 如果底部空间不足，抬升 chat 窗口
+  local adjusted_parent_row = parent_row
+  if space_below < input_total_height then
+    local lift = input_total_height - space_below
+    adjusted_parent_row = math.max(0, parent_row - lift)
+    parent_config.row = adjusted_parent_row
+    pcall(vim.api.nvim_win_set_config, state.parent_win, parent_config)
+  end
+
+  -- 输入框位置：紧贴 chat 窗口底部 border 下方
+  local row = adjusted_parent_row + parent_height + 2
+  local col = parent_col
+
+  -- 确保输入框整体不超出屏幕底部
+  local input_bottom = row + input_height + 1
+  if input_bottom > screen_height - 1 then
+    row = math.max(0, (screen_height - 1) - (input_height + 1))
+  end
+
+  local config = vim.api.nvim_win_get_config(state.float_win)
+  config.row = row
+  config.col = col
+  config.width = input_width
+  config.height = input_height
+  pcall(vim.api.nvim_win_set_config, state.float_win, config)
+end
+
 return M

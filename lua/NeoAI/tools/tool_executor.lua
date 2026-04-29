@@ -1,7 +1,8 @@
 -- NeoAI 工具执行器模块（事件驱动回调模式）
 -- 所有工具通过回调模式执行，不阻塞主线程
 --
--- 回调模式：func(args, on_success, on_error)
+-- 回调模式：func(args, on_success, on_error, on_progress)
+--   on_progress(substep_name, status, duration) -- 子步骤进度回调
 -- 同步模式（兼容）：func(args) -> result
 
 local M = {}
@@ -74,7 +75,7 @@ end
 
 -- ========== 核心执行 ==========
 
-function M.execute_async(tool_name, args, on_success, on_error)
+function M.execute_async(tool_name, args, on_success, on_error, on_progress)
   if not state.initialized then
     M.initialize({})
   end
@@ -136,8 +137,34 @@ function M.execute_async(tool_name, args, on_success, on_error)
     end
   end
 
+  -- 获取工具所属包名
+  local pack_name = nil
+  local tp_ok, tp = pcall(require, "NeoAI.tools.tool_pack")
+  if tp_ok then
+    pack_name = tp.get_pack_for_tool(tool_name)
+  end
+
+  -- 包装 on_progress 回调：同时发射事件和调用用户回调
+  local function progress_wrapper(substep_name, status, duration, detail)
+    -- 发射子步骤事件
+    pcall(fire_event, event_constants.TOOL_EXECUTION_SUBSTEP, {
+      tool_name = tool_name,
+      pack_name = pack_name,
+      substep_name = substep_name,
+      status = status, -- "pending" | "executing" | "completed" | "error"
+      duration = duration or 0,
+      detail = detail,
+      session_id = args and args.session_id,
+    })
+    -- 调用用户提供的 on_progress 回调
+    if on_progress then
+      pcall(on_progress, substep_name, status, duration, detail)
+    end
+  end
+
   fire_event(event_constants.TOOL_EXECUTION_STARTED, {
     tool_name = tool_name,
+    pack_name = pack_name,
     args = args,
     start_time = start_time,
     session_id = args and args.session_id,
@@ -149,6 +176,7 @@ function M.execute_async(tool_name, args, on_success, on_error)
     -- fire_event 可能被 fast event 上下文调用，用 pcall 保护
     local ok, err = pcall(fire_event, event_constants.TOOL_EXECUTION_COMPLETED, {
       tool_name = tool_name,
+      pack_name = pack_name,
       args = args,
       result = formatted,
       duration = duration,
@@ -177,6 +205,7 @@ function M.execute_async(tool_name, args, on_success, on_error)
     local full_err = "工具执行错误: " .. (err_msg or "未知错误")
     local ok, err = pcall(fire_event, event_constants.TOOL_EXECUTION_ERROR, {
       tool_name = tool_name,
+      pack_name = pack_name,
       args = args,
       error_msg = full_err,
       duration = duration,
@@ -200,7 +229,8 @@ function M.execute_async(tool_name, args, on_success, on_error)
   end
 
   if tool.async then
-    local ok, call_err = pcall(tool.func, resolved_args, on_success_wrapper, on_error_wrapper)
+    -- 异步工具：传入 on_progress 回调
+    local ok, call_err = pcall(tool.func, resolved_args, on_success_wrapper, on_error_wrapper, progress_wrapper)
     if not ok then
       on_error_wrapper(tostring(call_err))
     end

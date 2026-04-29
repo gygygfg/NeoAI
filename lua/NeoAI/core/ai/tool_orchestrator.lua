@@ -6,11 +6,16 @@
 --   waiting_tools - 等待工具执行完成
 --   waiting_model - 等待模型生成完成
 --   round_complete - 本轮所有操作已完成
+--
+-- 工具包支持：
+--   同一工具包内的多个工具调用会被分组并发执行
+--   UI 按包分组显示执行状态
 
 local M = {}
 
 local logger = require("NeoAI.utils.logger")
 local event_constants = require("NeoAI.core.events")
+local tool_pack = require("NeoAI.tools.tool_pack")
 
 -- ========== 状态 ==========
 
@@ -180,6 +185,10 @@ function M.initialize(options)
   state.tool_timeout_ms = (state.config.tool_timeout_ms or 30) * 1000
   state.max_iterations = state.config.max_tool_iterations or 20
   state.initialized = true
+
+  -- 初始化工具包管理模块
+  tool_pack.initialize()
+
   return M
 end
 
@@ -298,9 +307,10 @@ function M.start_async_loop(params)
   ss.accumulated_usage = {}
   ss.last_reasoning = nil
 
-  fire_loop_started(ss, params.tool_calls)
-
   ss.current_iteration = 1
+
+  -- 工具包分组信息已由 _execute_tools 中的 TOOL_LOOP_STARTED 事件携带
+  -- 这里不再调用 fire_loop_started，避免重复触发
 
   -- 注册全局 ESC 停止监听器（仅在循环开始时注册一次）
   -- 确保工具调用和循环过程中按 ESC 能立即停止
@@ -350,6 +360,31 @@ function M._execute_tools(session_id, tool_calls)
   -- 强制刷新 UI，让用户看到工具执行开始
   force_ui_refresh()
 
+  -- 按工具包分组，触发 PACK_STARTED 事件
+  local grouped = tool_pack.group_by_pack(tool_calls)
+  local pack_order = {}
+  for pack_name, _ in pairs(grouped) do
+    table.insert(pack_order, pack_name)
+  end
+  table.sort(pack_order, function(a, b)
+    return tool_pack.get_pack_order(a) < tool_pack.get_pack_order(b)
+  end)
+
+  -- 触发 TOOL_LOOP_STARTED 时附带包分组信息
+  vim.api.nvim_exec_autocmds("User", {
+    pattern = event_constants.TOOL_LOOP_STARTED,
+    data = {
+      generation_id = ss.generation_id,
+      tool_calls = tool_calls,
+      tool_packs = grouped,
+      pack_order = pack_order,
+      session_id = ss.session_id,
+      window_id = ss.window_id,
+      iteration = ss.current_iteration,
+    },
+  })
+
+  -- 所有工具并发执行（保持原有异步并发行为）
   for _, tc in ipairs(tool_calls) do
     M._execute_single_tool(session_id, tc)
   end
@@ -381,10 +416,14 @@ function M._execute_single_tool(session_id, tool_call)
   local tool_registry = require("NeoAI.tools.tool_registry")
   pcall(tool_registry.initialize, {})
 
+  -- 获取工具所属包名
+  local pack_name = tool_pack.get_pack_for_tool(tool_name)
+
   vim.api.nvim_exec_autocmds("User", {
     pattern = event_constants.TOOL_EXECUTION_STARTED,
     data = {
       tool_name = tool_name, arguments = arguments,
+      pack_name = pack_name,
       session_id = session_id, window_id = ss.window_id, generation_id = ss.generation_id,
     },
   })
@@ -411,9 +450,19 @@ function M._execute_single_tool(session_id, tool_call)
     end
   end
 
+  -- 创建 on_progress 回调，转发子步骤事件
+  local function on_progress(substep_name, status, duration, detail)
+    -- 子步骤事件已由 tool_executor 内部通过 fire_event 发射
+    -- 这里只需更新 UI（强制刷新）
+    vim.schedule(function()
+      pcall(vim.cmd.redraw)
+    end)
+  end
+
   tool_executor.execute_async(tool_name, arguments,
     function(result) on_result(result, false) end,
-    function(err) on_result(err, true) end
+    function(err) on_result(err, true) end,
+    on_progress
   )
 end
 
@@ -602,7 +651,7 @@ function M.on_generation_complete(data)
   once_display_closed(session_id, function()
     local s = state.sessions[session_id]
     if not s then return end
-    fire_loop_started(s, tool_calls)
+    -- TOOL_LOOP_STARTED 事件由 _execute_tools 内部触发（携带工具包分组信息）
     M._execute_tools(session_id, tool_calls)
   end)
 end
@@ -646,31 +695,30 @@ function M._finish_loop(session_id, success, result)
 
   if ss.on_complete == nil then return end
 
+  -- 保存回调，稍后使用
   local on_complete = ss.on_complete
-  local usage = ss.accumulated_usage or {}
+  local saved_usage = ss.accumulated_usage or {}
   local saved_generation_id = ss.generation_id
   local saved_window_id = ss.window_id
   local saved_reasoning = ss.last_reasoning or ""
 
-  fire_loop_finished(ss)
+  -- 触发一次总结轮次（不带工具），让 AI 根据工具执行结果进行总结
+  -- 注意：_request_summary_round 会通过 TOOL_RESULT_RECEIVED 事件触发 AI 生成
+  -- AI 生成完成后会调用 on_generation_complete，其中会再次调用 _finish_loop
+  -- 但此时 ss.on_complete 已被置为 nil，避免无限递归
+  ss.on_complete = nil
 
   ss.phase = "idle"
   ss.active_tool_calls = {}
   ss.current_iteration = 0
-  ss.generation_id = nil
-  ss.on_complete = nil
 
-  vim.schedule(function()
-    vim.api.nvim_exec_autocmds("User", {
-      pattern = event_constants.GENERATION_COMPLETED,
-      data = {
-        generation_id = saved_generation_id, response = result or "",
-        reasoning_text = saved_reasoning, usage = usage,
-        session_id = session_id, window_id = saved_window_id, duration = 0,
-      },
-    })
-    on_complete(success, result, usage)
-  end)
+  -- 先关闭工具显示（fire_loop_finished 由 _request_summary_round 内部触发）
+  -- 触发总结轮次，让 AI 根据工具结果生成最终回复
+  -- 总结完成后会通过 GENERATION_COMPLETED 事件通知 UI
+  M._request_summary_round(session_id)
+
+  -- 总结轮次已触发（内部已保存 generation_id 副本），现在可以安全清空
+  ss.generation_id = nil
 end
 
 -- ========== 停止控制 ==========

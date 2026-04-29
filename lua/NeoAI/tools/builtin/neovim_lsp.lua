@@ -405,6 +405,10 @@ local function ensure_ts_parsers()
   end)
 end
 
+-- lsp_request_async 的前向声明（实际定义在文件后面）
+-- 使用模块级变量避免闭包捕获问题
+local _lsp_request_async
+
 -- 使用 LSP documentSymbol 回退查找符号位置（异步回调模式）
 -- 当 Tree-sitter 不可用时，通过 LSP 的 documentSymbol 请求定位符号
 -- 回调模式：callback(row, col, err)
@@ -428,7 +432,7 @@ local function find_symbol_via_lsp_async(filepath, symbol_name, bufnr, callback)
   local function do_request()
     attempt_count = attempt_count + 1
 
-    lsp_request_async(bufnr, "textDocument/documentSymbol", {
+    _lsp_request_async(bufnr, "textDocument/documentSymbol", {
       textDocument = { uri = vim.uri_from_fname(abs_path) },
     }, function(result, req_err)
       if req_err then
@@ -624,149 +628,6 @@ end
 
 -- 等待 LSP 客户端通过 LspAttach 事件 attach 到缓冲区
 -- 使用 vim.wait 处理事件循环，最多等待 timeout_ms 毫秒
--- 返回过滤后的客户端列表，或 nil
--- 如果提供了 expected_config，只返回与该配置名匹配的客户端
--- 注意：LspAttach 回调中会筛选客户端，只有支持悬停能力的客户端才触发 done=true
---
--- 重要：此函数不应在 vim.schedule 回调中调用，因为 vim.wait 会阻塞事件循环。
--- 如果需要在异步上下文中获取 LSP 客户端，请使用 get_lsp_clients_nonblocking。
-local function wait_for_lsp_attach(bufnr, timeout_ms, expected_config)
-  timeout_ms = timeout_ms or 5000
-  local clients = nil
-  local done = false
-
-  -- 辅助函数：检查客户端是否与期望配置匹配
-  local function client_matches(client)
-    if not expected_config then
-      return true
-    end
-    return client.name == expected_config
-  end
-
-  -- 先检查当前是否已有合格的客户端已 attach
-  clients = filter_qualified_clients(vim.lsp.get_clients({ bufnr = bufnr }))
-  if clients and #clients > 0 then
-    -- 只返回与期望配置匹配的客户端
-    local matched = {}
-    for _, client in ipairs(clients) do
-      if client_matches(client) then
-        table.insert(matched, client)
-      end
-    end
-    if #matched > 0 then
-      -- 等待客户端初始化完成（最多 8 秒）
-      -- 使用 vim.wait，能处理所有 Neovim 事件
-      local init_ok = vim.wait(8000, function()
-        for _, client in ipairs(matched) do
-          if client.initialized and client.server_capabilities then
-            return true
-          end
-        end
-        return false
-      end, 50)
-      if init_ok then
-        -- 再次过滤：只保留支持悬停能力的客户端
-        local qualified = filter_qualified_clients(matched)
-        if qualified and #qualified > 0 then
-          return qualified
-        end
-        return matched
-      end
-      -- 初始化超时，继续等待 LspAttach 事件
-    end
-  end
-
-  -- 创建一次性 autocmd 监听 LspAttach
-  -- 在回调中筛选：只接受正式 LSP 客户端（排除 Copilot 等非正式服务）
-  -- 这样可以避免 GitHub Copilot 等非正式客户端触发回调
-  --
-  -- 注意：LspAttach 触发时，client.server_capabilities 可能尚未初始化完成。
-  -- 因此回调中不立即检查 capabilities，而是设置一个标志，
-  -- 由 vim.wait 的条件函数轮询检查 server_capabilities。
-  local augroup = vim.api.nvim_create_augroup("NeoAILspWait_" .. bufnr, { clear = true })
-  vim.api.nvim_create_autocmd("LspAttach", {
-    group = augroup,
-    buffer = bufnr,
-    once = true,
-    callback = function(args)
-      -- 获取触发事件的客户端
-      local client_id = args.data and args.data.client_id
-      local client = client_id and vim.lsp.get_client_by_id(client_id)
-      -- 只接受正式 LSP 客户端（排除 Copilot 等非正式服务）
-      -- 同时检查客户端名称是否与期望配置匹配（如果提供了 expected_config）
-      if client and is_formal_lsp_client(client) and client_matches(client) then
-        done = true
-      end
-    end,
-  })
-
-  -- 等待事件或超时（使用 vim.wait，能处理所有 Neovim 事件）
-  -- vim.wait 会在等待期间处理 autocmd、LSP 回调等所有事件
-  vim.wait(timeout_ms, function()
-    if not done then
-      return false
-    end
-    -- 客户端已 attach，检查 server_capabilities 是否可用
-    local attached = vim.lsp.get_clients({ bufnr = bufnr })
-    for _, c in ipairs(attached) do
-      if is_formal_lsp_client(c) and c.server_capabilities and client_has_required_capabilities(c) then
-        return true
-      end
-    end
-    return false
-  end, 50)
-
-  -- 清理 autocmd
-  pcall(vim.api.nvim_del_augroup_by_id, augroup)
-
-  -- 再次检查客户端
-  clients = filter_qualified_clients(vim.lsp.get_clients({ bufnr = bufnr }))
-  if clients and #clients > 0 then
-    -- 只返回与期望配置匹配的客户端
-    local matched = {}
-    for _, client in ipairs(clients) do
-      if client_matches(client) then
-        table.insert(matched, client)
-      end
-    end
-    if #matched > 0 then
-      return matched
-    end
-  end
-
-  -- 也检查全局客户端（只处理正式 LSP 服务）
-  local all_clients = vim.lsp.get_clients()
-  if all_clients and #all_clients > 0 then
-    for _, client in ipairs(all_clients) do
-      if is_formal_lsp_client(client) and client_has_required_capabilities(client) and client_matches(client) then
-        local ok = pcall(vim.lsp.buf_attach_client, bufnr, client.id)
-        if ok then
-          -- 等待客户端 attach（使用 vim.wait）
-          vim.wait(200, function()
-            local attached = filter_qualified_clients(vim.lsp.get_clients({ bufnr = bufnr }))
-            return #attached > 0
-          end, 20)
-          clients = filter_qualified_clients(vim.lsp.get_clients({ bufnr = bufnr }))
-          if clients and #clients > 0 then
-            -- 只返回与期望配置匹配的客户端
-            local matched = {}
-            for _, c in ipairs(clients) do
-              if client_matches(c) then
-                table.insert(matched, c)
-              end
-            end
-            if #matched > 0 then
-              return matched
-            end
-          end
-        end
-      end
-    end
-  end
-
-  return nil
-end
-
 -- 异步非阻塞版本的 wait_for_lsp_attach
 -- 使用 LspAttach 事件驱动 + 轮询定时器，不阻塞主线程
 -- 回调模式：callback(clients, err, bufnr)
@@ -794,31 +655,48 @@ local function wait_for_lsp_attach_async(bufnr, callback, timeout_ms, expected_c
       -- 使用轮询定时器等待初始化完成（不阻塞）
       local poll_timer = vim.uv.new_timer()
       local elapsed = 0
-      poll_timer:start(50, 50, function()
-        elapsed = elapsed + 50
-        vim.schedule(function()
-          if elapsed >= timeout_ms then
-            poll_timer:stop()
-            poll_timer:close()
-            -- 超时，返回已匹配的客户端（即使未初始化完成）
-            if callback then
-              callback(matched, nil, bufnr)
+      local timer_closed = false
+
+      local function safe_close_timer()
+        if timer_closed then
+          return
+        end
+        timer_closed = true
+        if poll_timer then
+          pcall(poll_timer.stop, poll_timer)
+          pcall(poll_timer.close, poll_timer)
+        end
+      end
+
+      if poll_timer then
+        poll_timer:start(50, 50, function()
+          elapsed = elapsed + 50
+          vim.schedule(function()
+            if timer_closed then
+              return
             end
-            return
-          end
-          for _, client in ipairs(matched) do
-            if client.initialized and client.server_capabilities then
-              poll_timer:stop()
-              poll_timer:close()
-              local qualified = filter_qualified_clients(matched)
+
+            if elapsed >= timeout_ms then
+              safe_close_timer()
+              -- 超时，返回已匹配的客户端（即使未初始化完成）
               if callback then
-                callback(qualified or matched, nil, bufnr)
+                callback(matched, nil, bufnr)
               end
               return
             end
-          end
+            for _, client in ipairs(matched) do
+              if client.initialized and client.server_capabilities then
+                safe_close_timer()
+                local qualified = filter_qualified_clients(matched)
+                if callback then
+                  callback(qualified or matched, nil, bufnr)
+                end
+                return
+              end
+            end
+          end)
         end)
-      end)
+      end -- if poll_timer
       return
     end
   end
@@ -853,54 +731,71 @@ local function wait_for_lsp_attach_async(bufnr, callback, timeout_ms, expected_c
   -- 轮询检查客户端是否已 attach 并初始化
   local poll_timer = vim.uv.new_timer()
   local elapsed = 0
-  poll_timer:start(100, 100, function()
-    elapsed = elapsed + 100
-    vim.schedule(function()
-      if elapsed >= timeout_ms then
-        poll_timer:stop()
-        poll_timer:close()
-        cleanup()
-        -- 超时，最后检查一次
-        local final_clients = filter_qualified_clients(vim.lsp.get_clients({ bufnr = bufnr }))
-        if final_clients and #final_clients > 0 then
-          local matched = {}
-          for _, c in ipairs(final_clients) do
-            if is_formal_lsp_client(c) and client_matches(c) then
-              table.insert(matched, c)
+  local timer_closed = false
+
+  local function safe_close_timer()
+    if timer_closed then
+      return
+    end
+    timer_closed = true
+    if poll_timer then
+      pcall(poll_timer.stop, poll_timer)
+      pcall(poll_timer.close, poll_timer)
+    end
+  end
+
+  if poll_timer then
+    poll_timer:start(100, 100, function()
+      elapsed = elapsed + 100
+      vim.schedule(function()
+        if timer_closed then
+          return
+        end
+
+        if elapsed >= timeout_ms then
+          safe_close_timer()
+          cleanup()
+          -- 超时，最后检查一次
+          local final_clients = filter_qualified_clients(vim.lsp.get_clients({ bufnr = bufnr }))
+          if final_clients and #final_clients > 0 then
+            local matched = {}
+            for _, c in ipairs(final_clients) do
+              if is_formal_lsp_client(c) and client_matches(c) then
+                table.insert(matched, c)
+              end
+            end
+            if #matched > 0 then
+              if callback then
+                callback(matched, nil, bufnr)
+              end
+              return
             end
           end
-          if #matched > 0 then
+          if callback then
+            callback(nil, "LSP 客户端连接超时", bufnr)
+          end
+          return
+        end
+
+        if not attached then
+          return
+        end
+
+        -- 客户端已 attach，检查 server_capabilities
+        local attached_clients = vim.lsp.get_clients({ bufnr = bufnr })
+        for _, c in ipairs(attached_clients) do
+          if is_formal_lsp_client(c) and c.server_capabilities and client_has_required_capabilities(c) then
+            safe_close_timer()
+            cleanup()
             if callback then
-              callback(matched, nil, bufnr)
+              callback({ c }, nil, bufnr)
             end
             return
           end
         end
-        if callback then
-          callback(nil, "LSP 客户端连接超时", bufnr)
-        end
-        return
-      end
-
-      if not attached then
-        return
-      end
-
-      -- 客户端已 attach，检查 server_capabilities
-      local attached_clients = vim.lsp.get_clients({ bufnr = bufnr })
-      for _, c in ipairs(attached_clients) do
-        if is_formal_lsp_client(c) and c.server_capabilities and client_has_required_capabilities(c) then
-          poll_timer:stop()
-          poll_timer:close()
-          cleanup()
-          if callback then
-            callback({ c }, nil, bufnr)
-          end
-          return
-        end
-      end
+      end)
     end)
-  end)
+  end -- if poll_timer
 end
 
 -- 获取文件对应的 LSP 客户端
@@ -1044,83 +939,6 @@ local function try_start_lsp(config_name, bufnr)
   return false
 end
 
--- 非阻塞版本的 get_lsp_clients
--- 不调用 vim.wait，直接检查当前已 attach 的客户端
--- 如果客户端尚未 attach，尝试通过 try_start_lsp 启动（不等待）
--- 适用于在 vim.schedule 回调中调用
--- 返回 clients, err, bufnr, cleanup
-local function get_lsp_clients_nonblocking(filepath, defer_cleanup)
-  local bufnr, cleanup, err = ensure_buf_loaded(filepath)
-  if err then
-    return nil, err, nil, nil
-  end
-
-  -- 获取文件类型和对应的 LSP 配置名
-  local abs_path = vim.fn.fnamemodify(filepath, ":p")
-  local ft = vim.filetype.match({ filename = abs_path })
-  local ft_to_lsp_config = {
-    lua = "lua_ls",
-    python = "pyright",
-    javascript = "ts_ls",
-    typescript = "ts_ls",
-    javascriptreact = "ts_ls",
-    typescriptreact = "ts_ls",
-    go = "gopls",
-    rust = "rust_analyzer",
-    java = "jdtls",
-    c = "clangd",
-    cpp = "clangd",
-    ruby = "solargraph",
-    php = "intelephense",
-    json = "jsonls",
-    yaml = "yamlls",
-    markdown = "marksman",
-    bash = "bashls",
-    sh = "bashls",
-    zsh = "bashls",
-    css = "cssls",
-    html = "htmlls",
-    vue = "volar",
-    svelte = "svelte",
-  }
-  local expected_config = ft and ft_to_lsp_config[ft]
-
-  -- 第一步：直接查找已 attach 到该缓冲区的客户端（只匹配正式 LSP 服务）
-  local clients = filter_qualified_clients(vim.lsp.get_clients({ bufnr = bufnr }))
-  if clients and #clients > 0 then
-    local matched_clients = {}
-    for _, client in ipairs(clients) do
-      if is_formal_lsp_client(client) and (not expected_config or client.name == expected_config) then
-        table.insert(matched_clients, client)
-      end
-    end
-    if #matched_clients > 0 then
-      if defer_cleanup and cleanup then
-        table.insert(_deferred_cleanups, cleanup)
-        return matched_clients, nil, bufnr, nil
-      end
-      return matched_clients, nil, bufnr, cleanup
-    end
-  end
-
-  -- 第二步：尝试启动 LSP 服务器（不等待）
-  if expected_config then
-    local started = try_start_lsp(expected_config, bufnr)
-    if started then
-      -- 不等待，直接返回 nil，让调用方决定是否重试
-      if cleanup then
-        cleanup()
-      end
-      return nil, "LSP 客户端正在启动中，请稍后重试", nil, nil
-    end
-  end
-
-  if cleanup then
-    cleanup()
-  end
-  return nil, "文件 '" .. filepath .. "' 没有关联的 LSP 客户端（需要支持悬停功能）", nil, nil
-end
-
 -- 完全非阻塞的 get_lsp_clients 异步版本
 -- 回调模式：callback(clients, err, bufnr, cleanup)
 -- 不会阻塞主线程，适合在 vim.schedule 回调中调用
@@ -1236,7 +1054,7 @@ local function get_lsp_clients_async(filepath, callback, defer_cleanup)
       if cleanup then
         cleanup()
       end
-      callback(nil, attach_err or "文件 '" .. filepath .. "' 没有关联的 LSP 客户端", nil, nil)
+      callback(nil, attach_err or ("文件 '" .. filepath .. "' 没有关联的 LSP 客户端"), nil, nil)
     end
   end, 5000, expected_config)
 end
@@ -1245,109 +1063,6 @@ end
 -- 只返回同时支持格式化（formatting）和悬停（hover）的客户端
 -- 如果文件没有关联的客户端，尝试通过多种方式启动
 -- 返回 clients, err, bufnr, cleanup
--- 如果 defer_cleanup 为 true，cleanup 会延迟到工具循环结束时执行
---
--- 注意：此函数会调用 vim.wait（在 wait_for_lsp_attach 中），
--- 如果在 vim.schedule/vim.defer_fn 回调中调用会阻塞主进程。
--- 异步上下文中请使用 get_lsp_clients_nonblocking。
-local function get_lsp_clients(filepath, defer_cleanup)
-  local bufnr, cleanup, err = ensure_buf_loaded(filepath)
-  if err then
-    return nil, err, nil, nil
-  end
-
-  -- 获取文件类型和对应的 LSP 配置名
-  local abs_path = vim.fn.fnamemodify(filepath, ":p")
-  local ft = vim.filetype.match({ filename = abs_path })
-  local ft_to_lsp_config = {
-    lua = "lua_ls",
-    python = "pyright",
-    javascript = "ts_ls",
-    typescript = "ts_ls",
-    javascriptreact = "ts_ls",
-    typescriptreact = "ts_ls",
-    go = "gopls",
-    rust = "rust_analyzer",
-    java = "jdtls",
-    c = "clangd",
-    cpp = "clangd",
-    ruby = "solargraph",
-    php = "intelephense",
-    json = "jsonls",
-    yaml = "yamlls",
-    markdown = "marksman",
-    bash = "bashls",
-    sh = "bashls",
-    zsh = "bashls",
-    css = "cssls",
-    html = "htmlls",
-    vue = "volar",
-    svelte = "svelte",
-  }
-  local expected_config = ft and ft_to_lsp_config[ft]
-
-  -- 辅助函数：检查客户端是否与文件类型匹配
-  local function client_matches_filetype(client)
-    if not expected_config then
-      return true -- 无法推断文件类型，接受任何客户端
-    end
-    -- 检查客户端名称是否与期望的配置名匹配
-    return client.name == expected_config
-  end
-
-  -- 第一步：直接查找已 attach 到该缓冲区的客户端（只匹配正式 LSP 服务）
-  local clients = filter_qualified_clients(vim.lsp.get_clients({ bufnr = bufnr }))
-  if clients and #clients > 0 then
-    -- 检查是否有与文件类型匹配的客户端
-    local matched_clients = {}
-    for _, client in ipairs(clients) do
-      if is_formal_lsp_client(client) and client_matches_filetype(client) then
-        table.insert(matched_clients, client)
-      end
-    end
-    if #matched_clients > 0 then
-      if defer_cleanup and cleanup then
-        table.insert(_deferred_cleanups, cleanup)
-        return matched_clients, nil, bufnr, nil
-      end
-      return matched_clients, nil, bufnr, cleanup
-    end
-  end
-
-  -- 第二步：尝试通过文件类型推断并启动 LSP 服务器
-  if expected_config then
-    -- 尝试多种方式启动 LSP 服务器
-    local started = try_start_lsp(expected_config, bufnr)
-    if started then
-      -- 启动后等待客户端 attach（使用 vim.wait，最多 8 秒）
-      -- 注意：如果在 vim.schedule 回调中调用，会阻塞主进程
-      local attached_clients = wait_for_lsp_attach(bufnr, 8000, expected_config)
-      if attached_clients then
-        if defer_cleanup and cleanup then
-          table.insert(_deferred_cleanups, cleanup)
-          return attached_clients, nil, bufnr, nil
-        end
-        return attached_clients, nil, bufnr, cleanup
-      end
-    end
-  end
-
-  -- 第三步：通过 LspAttach 事件等待 LSP 客户端 attach（最多 5 秒）
-  local attached_clients = wait_for_lsp_attach(bufnr, 5000, expected_config)
-  if attached_clients then
-    if defer_cleanup and cleanup then
-      table.insert(_deferred_cleanups, cleanup)
-      return attached_clients, nil, bufnr, nil
-    end
-    return attached_clients, nil, bufnr, cleanup
-  end
-
-  if cleanup then
-    cleanup()
-  end
-  return nil, "文件 '" .. filepath .. "' 没有关联的 LSP 客户端（需要支持悬停功能）", nil, nil
-end
-
 -- 使用 Tree-sitter 在文件中查找符号位置（异步回调模式）
 -- 如果 Tree-sitter 不可用，回退到 LSP documentSymbol
 -- 回调模式：callback(row, col, err)
@@ -1543,29 +1258,6 @@ end
 -- 执行 LSP 请求并等待结果
 -- 使用 Neovim 0.12 的 buf_request_sync，单次请求，超时 5 秒
 -- 如果第一次请求没有结果，重试一次
---
--- 注意：此函数会阻塞主线程（调用 vim.wait），
--- 请优先使用 lsp_request_async 进行非阻塞调用
-local function lsp_request(bufnr, method, params)
-  for attempt = 1, 2 do
-    local ok, responses = pcall(vim.lsp.buf_request_sync, bufnr, method, params, 5000)
-    if ok and responses then
-      for _, response in pairs(responses) do
-        if type(response) == "table" and response.result ~= nil then
-          return response.result
-        end
-      end
-    end
-    -- 如果没有结果，等待后重试
-    if attempt < 2 then
-      vim.wait(1000, function()
-        return false
-      end, 50)
-    end
-  end
-  return nil
-end
-
 -- LSP 请求的异步非阻塞版本
 -- 使用 vim.lsp.buf_request（非阻塞）替代 buf_request_sync
 -- 回调模式：callback(result, error_msg)
@@ -1575,6 +1267,12 @@ end
 --
 -- 多客户端处理：当有多个 LSP 客户端时，等待所有客户端响应，
 -- 优先返回非空结果（有内容的），如果都为空则返回第一个结果
+--
+-- 并发安全：每个请求使用独立的 request_id 标识，避免多个同时请求的回调混淆
+-- 使用 vim.lsp.buf_request 返回的 request_id 来区分不同请求的回调
+local _request_counter = 0
+local _pending_requests = {} -- 存储挂起的请求：request_id -> { done, timer, responses, callback, defer_timer }
+
 local function lsp_request_async(bufnr, method, params, callback)
   if not bufnr or not method then
     if callback then
@@ -1583,115 +1281,144 @@ local function lsp_request_async(bufnr, method, params, callback)
     return
   end
 
-  local done = false
-  local timer = vim.uv.new_timer()
-  local responses = {}  -- 收集所有客户端的响应
-  local pending_clients = 0
+  -- 生成唯一请求 ID
+  _request_counter = _request_counter + 1
+  local req_id = _request_counter
 
-  -- 使用 buf_request 非阻塞发送请求
-  local ok, result_or_err = pcall(vim.lsp.buf_request, bufnr, method, params, function(err, result, ctx)
-    if done then
+  -- 请求状态
+  local state = {
+    done = false,
+    timer = vim.uv.new_timer(),
+    responses = {},
+    callback = callback,
+    defer_timer = nil,
+  }
+  _pending_requests[req_id] = state
+
+  -- 安全清理函数
+  local function safe_cleanup()
+    if state.done then
       return
     end
+    state.done = true
+    if state.timer and not state.timer:is_closing() then
+      state.timer:stop()
+      state.timer:close()
+    end
+    if state.defer_timer then
+      state.defer_timer:stop()
+      state.defer_timer:close()
+      state.defer_timer = nil
+    end
+    _pending_requests[req_id] = nil
+  end
 
-    -- 收集响应
-    table.insert(responses, { err = err, result = result, ctx = ctx })
-
-    -- 如果有非空结果，立即返回
-    if not err and result ~= nil then
-      if type(result) ~= "table" or #result > 0 then
-        done = true
-        if timer and not timer:is_closing() then
-          timer:stop()
-          timer:close()
-        end
-        if callback then
-          callback(result, nil)
-        end
+  -- 使用 buf_request 非阻塞发送请求
+  -- 注意：vim.lsp.buf_request 返回的 request_id 可以用于取消请求
+  local ok, result_or_err = pcall(vim.lsp.buf_request, bufnr, method, params, function(err, result, ctx)
+    -- 使用 vim.schedule 确保回调在主事件循环中执行
+    vim.schedule(function()
+      if state.done then
         return
       end
-    end
 
-    -- 等待所有客户端响应后再决定
-    -- 注意：buf_request 会为每个客户端调用一次回调
-    -- 我们无法直接知道客户端总数，所以用超时兜底
-    -- 如果已经有响应且等待 500ms 没有新响应，就使用已有结果
-    if #responses == 1 then
-      -- 第一个响应到达，启动短等待让其他客户端有机会响应
-      vim.defer_fn(function()
-        if done then
+      -- 收集响应
+      table.insert(state.responses, { err = err, result = result, ctx = ctx })
+
+      -- 如果有非空结果，立即返回
+      if not err and result ~= nil then
+        if type(result) ~= "table" or #result > 0 then
+          local cb = state.callback
+          safe_cleanup()
+          if cb then
+            cb(result, nil)
+          end
           return
         end
-        done = true
-        if timer and not timer:is_closing() then
-          timer:stop()
-          timer:close()
+      end
+
+      -- 等待所有客户端响应后再决定
+      -- 第一个响应到达后，启动短等待让其他客户端有机会响应
+      if #state.responses == 1 then
+        if state.defer_timer then
+          state.defer_timer:stop()
+          state.defer_timer:close()
         end
-        -- 在所有响应中找非空结果
-        for _, r in ipairs(responses) do
-          if not r.err and r.result ~= nil then
-            if callback then
-              callback(r.result, nil)
+        state.defer_timer = vim.uv.new_timer()
+        state.defer_timer:start(500, 0, function()
+          vim.schedule(function()
+            if state.done then
+              return
             end
-            return
-          end
-        end
-        -- 都为空，返回第一个结果
-        if #responses > 0 then
-          if callback then
-            callback(responses[1].result, responses[1].err)
-          end
-        else
-          if callback then
-            callback(nil, "所有 LSP 客户端返回空")
-          end
-        end
-      end, 500)
-    end
+            local cb = state.callback
+            safe_cleanup()
+            -- 在所有响应中找非空结果
+            for _, r in ipairs(state.responses) do
+              if not r.err and r.result ~= nil then
+                if cb then
+                  cb(r.result, nil)
+                end
+                return
+              end
+            end
+            -- 都为空，返回第一个结果
+            if #state.responses > 0 then
+              if cb then
+                cb(state.responses[1].result, state.responses[1].err)
+              end
+            else
+              if cb then
+                cb(nil, "所有 LSP 客户端返回空")
+              end
+            end
+          end)
+        end)
+      end
+    end)
   end)
 
   if not ok then
-    done = true
-    if timer and not timer:is_closing() then
-      timer:close()
-    end
-    if callback then
-      callback(nil, "发送 LSP 请求失败: " .. tostring(result_or_err))
+    local cb = state.callback
+    safe_cleanup()
+    if cb then
+      cb(nil, "发送 LSP 请求失败: " .. tostring(result_or_err))
     end
     return
   end
 
   -- 设置超时保护（15秒，给多客户端更多时间）
-  timer:start(15000, 0, function()
+  state.timer:start(15000, 0, function()
     vim.schedule(function()
-      if done then
+      if state.done then
         return
       end
-      done = true
-      if not timer:is_closing() then
-        timer:close()
-      end
+      local cb = state.callback
+      safe_cleanup()
       -- 超时时，在所有已收到的响应中找非空结果
-      for _, r in ipairs(responses) do
+      for _, r in ipairs(state.responses) do
         if not r.err and r.result ~= nil then
-          if callback then
-            callback(r.result, nil)
+          if cb then
+            cb(r.result, nil)
           end
           return
         end
       end
-      if #responses > 0 then
-        if callback then
-          callback(responses[1].result, responses[1].err)
+      if #state.responses > 0 then
+        if cb then
+          cb(state.responses[1].result, state.responses[1].err)
         end
       else
-        if callback then
-          callback(nil, "LSP 请求超时（15秒）: " .. method)
+        if cb then
+          cb(nil, "LSP 请求超时（15秒）: " .. method)
         end
       end
     end)
   end)
 end
+
+-- 赋值给前向声明变量，供 find_symbol_via_lsp_async 等函数使用
+_lsp_request_async = lsp_request_async
+
 -- ============================================================================
 -- 工具 lsp_hover - 悬浮显示符号文档（回调模式）
 -- ============================================================================
@@ -1733,7 +1460,7 @@ local function _lsp_hover(args, on_success, on_error)
           cleanup()
         end
         if on_error then
-          on_error(find_err or "未找到符号 '" .. args.symbol .. "' 在文件中的位置")
+          on_error(find_err or ("未找到符号 '" .. args.symbol .. "' 在文件中的位置"))
         end
         return
       end
@@ -1842,7 +1569,7 @@ local function _lsp_definition(args, on_success, on_error)
           cleanup()
         end
         if on_error then
-          on_error(find_err or "未找到符号 '" .. args.symbol .. "' 在文件中的位置")
+          on_error(find_err or ("未找到符号 '" .. args.symbol .. "' 在文件中的位置"))
         end
         return
       end
@@ -1958,7 +1685,7 @@ local function _lsp_references(args, on_success, on_error)
           cleanup()
         end
         if on_error then
-          on_error(find_err or "未找到符号 '" .. args.symbol .. "' 在文件中的位置")
+          on_error(find_err or ("未找到符号 '" .. args.symbol .. "' 在文件中的位置"))
         end
         return
       end
@@ -2089,7 +1816,7 @@ local function _lsp_implementation(args, on_success, on_error)
           cleanup()
         end
         if on_error then
-          on_error(find_err or "未找到符号 '" .. args.symbol .. "' 在文件中的位置")
+          on_error(find_err or ("未找到符号 '" .. args.symbol .. "' 在文件中的位置"))
         end
         return
       end
@@ -2208,7 +1935,7 @@ local function _lsp_declaration(args, on_success, on_error)
           cleanup()
         end
         if on_error then
-          on_error(find_err or "未找到符号 '" .. args.symbol .. "' 在文件中的位置")
+          on_error(find_err or ("未找到符号 '" .. args.symbol .. "' 在文件中的位置"))
         end
         return
       end
@@ -2291,7 +2018,7 @@ M.lsp_declaration = define_tool({
 -- 工具 lsp_document_symbols - 获取文档符号列表
 -- ============================================================================
 
-local function _lsp_document_symbols(args, on_success, on_error)
+local function _lsp_document_symbols(args, on_success, on_error, on_progress)
   if not check_lsp() then
     if on_error then
       on_error("LSP 不可用")
@@ -2306,7 +2033,25 @@ local function _lsp_document_symbols(args, on_success, on_error)
     return
   end
 
+  if on_progress then
+    on_progress("加载文件到缓冲区", "executing", 0)
+  end
+
   get_lsp_clients_async(args.filepath, function(clients, err, bufnr, cleanup)
+    if err then
+      if on_progress then
+        on_progress("加载文件到缓冲区", "error", 0, err)
+      end
+      if on_error then
+        on_error(err)
+      end
+      return
+    end
+
+    if on_progress then
+      on_progress("加载文件到缓冲区", "completed", 0)
+      on_progress("获取LSP文档符号", "executing", 0)
+    end
     if err then
       if on_error then
         on_error(err)
@@ -2324,7 +2069,9 @@ local function _lsp_document_symbols(args, on_success, on_error)
     local function get_symbols_via_treesitter(filepath, callback)
       local ok_ts, ts = pcall(require, "vim.treesitter")
       if not ok_ts then
-        if callback then callback(nil) end
+        if callback then
+          callback(nil)
+        end
         return
       end
 
@@ -2332,55 +2079,87 @@ local function _lsp_document_symbols(args, on_success, on_error)
       local abs_path = vim.fn.fnamemodify(filepath, ":p")
       local fd, open_err = vim.uv.fs_open(abs_path, "r", 438)
       if not fd then
-        if callback then callback(nil) end
+        if callback then
+          callback(nil)
+        end
         return
       end
       local stat, _ = vim.uv.fs_fstat(fd)
       if not stat then
         vim.uv.fs_close(fd)
-        if callback then callback(nil) end
+        if callback then
+          callback(nil)
+        end
         return
       end
       local content, _ = vim.uv.fs_read(fd, stat.size, 0)
       vim.uv.fs_close(fd)
       if not content then
-        if callback then callback(nil) end
+        if callback then
+          callback(nil)
+        end
         return
       end
 
       -- 推断语言
       local ext = vim.fn.fnamemodify(abs_path, ":e"):lower()
       local ext_to_lang = {
-        py = "python", lua = "lua", js = "javascript", ts = "typescript",
-        jsx = "tsx", tsx = "tsx", go = "go", rs = "rust",
-        java = "java", c = "c", cpp = "cpp", rb = "ruby",
-        php = "php", json = "json", yaml = "yaml", yml = "yaml",
-        md = "markdown", sh = "bash", bash = "bash", css = "css",
-        html = "html", vue = "vue", svelte = "svelte", toml = "toml",
+        py = "python",
+        lua = "lua",
+        js = "javascript",
+        ts = "typescript",
+        jsx = "tsx",
+        tsx = "tsx",
+        go = "go",
+        rs = "rust",
+        java = "java",
+        c = "c",
+        cpp = "cpp",
+        rb = "ruby",
+        php = "php",
+        json = "json",
+        yaml = "yaml",
+        yml = "yaml",
+        md = "markdown",
+        sh = "bash",
+        bash = "bash",
+        css = "css",
+        html = "html",
+        vue = "vue",
+        svelte = "svelte",
+        toml = "toml",
         sql = "sql",
       }
       local lang = ext_to_lang[ext]
       if not lang then
-        if callback then callback(nil) end
+        if callback then
+          callback(nil)
+        end
         return
       end
 
       -- 检查解析器是否可用
       local ok_inspect, _ = pcall(ts.language.inspect, lang)
       if not ok_inspect then
-        if callback then callback(nil) end
+        if callback then
+          callback(nil)
+        end
         return
       end
 
       -- 解析
       local ok_parser, parser = pcall(ts.get_string_parser, content, lang)
       if not ok_parser or not parser then
-        if callback then callback(nil) end
+        if callback then
+          callback(nil)
+        end
         return
       end
       local ok_trees, trees = pcall(parser.parse, parser)
       if not ok_trees or not trees or #trees == 0 then
-        if callback then callback(nil) end
+        if callback then
+          callback(nil)
+        end
         return
       end
 
@@ -2392,8 +2171,8 @@ local function _lsp_document_symbols(args, on_success, on_error)
 
       -- Python 的节点类型
       local structure_types = {
-        class_definition = 5,      -- Class
-        function_definition = 12,  -- Function
+        class_definition = 5, -- Class
+        function_definition = 12, -- Function
       }
 
       -- 需要跳过的节点类型（注释、字符串等，不包含有效符号）
@@ -2426,10 +2205,14 @@ local function _lsp_document_symbols(args, on_success, on_error)
           -- 提取名称
           if node_type == "function_definition" then
             local fn = text:match("def%s+([%w_]+)")
-            if fn then name = fn end
+            if fn then
+              name = fn
+            end
           elseif node_type == "class_definition" then
             local cls = text:match("class%s+([%w_]+)")
-            if cls then name = cls end
+            if cls then
+              name = cls
+            end
           end
 
           -- 只保留能提取到有效名称的符号
@@ -2459,7 +2242,9 @@ local function _lsp_document_symbols(args, on_success, on_error)
 
       traverse(root, 0)
 
-      if callback then callback(symbols) end
+      if callback then
+        callback(symbols)
+      end
     end
 
     local function do_document_symbol_request()
@@ -2469,10 +2254,17 @@ local function _lsp_document_symbols(args, on_success, on_error)
       request_active = true
       retry_count = retry_count + 1
 
+      if on_progress then
+        on_progress("获取LSP文档符号", "executing", 0)
+      end
+
       lsp_request_async(bufnr, "textDocument/documentSymbol", {
         textDocument = { uri = vim.uri_from_fname(vim.fn.fnamemodify(args.filepath, ":p")) },
       }, function(result, req_err)
         if req_err then
+          if on_progress then
+            on_progress("获取LSP文档符号", "error", 0, req_err)
+          end
           if cleanup then
             cleanup()
           end
@@ -2484,9 +2276,15 @@ local function _lsp_document_symbols(args, on_success, on_error)
 
         -- LSP 返回空结果时，使用 Tree-sitter 作为 fallback
         if (not result or (type(result) == "table" and #result == 0)) and retry_count < max_retries then
+          if on_progress then
+            on_progress("获取LSP文档符号", "executing", 0, "LSP 返回空，尝试 Tree-sitter")
+          end
           -- 异步尝试 Tree-sitter
           get_symbols_via_treesitter(args.filepath, function(ts_symbols)
             if ts_symbols and #ts_symbols > 0 then
+              if on_progress then
+                on_progress("获取LSP文档符号", "completed", 0, "使用 Tree-sitter")
+              end
               if cleanup then
                 cleanup()
               end
@@ -2515,8 +2313,14 @@ local function _lsp_document_symbols(args, on_success, on_error)
 
         if not result or (type(result) == "table" and #result == 0) then
           -- 最终 fallback：尝试 Tree-sitter
+          if on_progress then
+            on_progress("获取LSP文档符号", "executing", 0, "LSP 无结果，尝试 Tree-sitter")
+          end
           get_symbols_via_treesitter(args.filepath, function(ts_symbols)
             if ts_symbols and #ts_symbols > 0 then
+              if on_progress then
+                on_progress("获取LSP文档符号", "completed", 0, "使用 Tree-sitter")
+              end
               if on_success then
                 on_success({
                   filepath = args.filepath,
@@ -2527,6 +2331,9 @@ local function _lsp_document_symbols(args, on_success, on_error)
                 })
               end
             else
+              if on_progress then
+                on_progress("获取LSP文档符号", "completed", 0, "未找到符号")
+              end
               if on_success then
                 on_success({
                   filepath = args.filepath,
@@ -2538,6 +2345,10 @@ local function _lsp_document_symbols(args, on_success, on_error)
             end
           end)
           return
+        end
+
+        if on_progress then
+          on_progress("获取LSP文档符号", "completed", 0)
         end
 
         -- 处理符号结果
@@ -2824,7 +2635,7 @@ local function _lsp_code_action(args, on_success, on_error)
             cleanup()
           end
           if on_error then
-            on_error(find_err or "未找到符号 '" .. args.symbol .. "' 在文件中的位置")
+            on_error(find_err or ("未找到符号 '" .. args.symbol .. "' 在文件中的位置"))
           end
           return
         end
@@ -2914,7 +2725,7 @@ local function _lsp_rename(args, on_success, on_error)
           cleanup()
         end
         if on_error then
-          on_error(find_err or "未找到符号 '" .. args.symbol .. "' 在文件中的位置")
+          on_error(find_err or ("未找到符号 '" .. args.symbol .. "' 在文件中的位置"))
         end
         return
       end
@@ -3013,14 +2824,35 @@ local function _lsp_format(args, on_success, on_error)
     end
 
     -- 单独检查客户端是否支持格式化能力
+    -- 注意：get_lsp_clients_async 返回的客户端只保证支持 hover，不一定支持 formatting
+    -- 所以需要在这里单独检查
     local has_format_client = false
+    local format_client = nil
     for _, client in ipairs(clients) do
       local caps = client.server_capabilities
       if caps then
         local has_format = caps.documentFormattingProvider == true or (type(caps.documentFormattingProvider) == "table")
         if has_format then
           has_format_client = true
+          format_client = client
           break
+        end
+      end
+    end
+    if not has_format_client then
+      -- 如果当前客户端不支持格式化，尝试查找其他已 attach 但未被 get_lsp_clients_async 返回的客户端
+      -- （因为 get_lsp_clients_async 只返回支持 hover 的客户端）
+      local all_clients = vim.lsp.get_clients({ bufnr = bufnr })
+      for _, client in ipairs(all_clients) do
+        local caps = client.server_capabilities
+        if caps then
+          local has_format = caps.documentFormattingProvider == true
+            or (type(caps.documentFormattingProvider) == "table")
+          if has_format then
+            has_format_client = true
+            format_client = client
+            break
+          end
         end
       end
     end
@@ -3212,9 +3044,12 @@ local function is_client_functionally_complete(client)
   return false
 end
 
-local function _lsp_client_info(args)
+local function _lsp_client_info(args, on_success, on_error, on_progress)
   if not check_lsp() then
-    return { error = "LSP 不可用" }
+    if on_error then
+      on_error("LSP 不可用")
+    end
+    return
   end
 
   -- 收集要查询的文件路径列表
@@ -3231,13 +3066,65 @@ local function _lsp_client_info(args)
   end
 
   if #filepaths == 0 then
-    return { error = "需要 filepath（文件路径）或 filepaths（文件路径列表）参数" }
+    if on_error then
+      on_error("需要 filepath（文件路径）或 filepaths（文件路径列表）参数")
+    end
+    return
   end
 
   local file_results = {}
-  for _, filepath in ipairs(filepaths) do
+  local current_index = 0
+  local total_files = #filepaths
+  local stopped = false
+
+  -- 检查是否已请求停止
+  local function is_stopped()
+    if stopped then
+      return true
+    end
+    local orc_ok, tool_orc = pcall(require, "NeoAI.core.ai.tool_orchestrator")
+    if orc_ok and tool_orc.is_stop_requested() then
+      stopped = true
+      return true
+    end
+    return false
+  end
+
+  -- 递归处理每个文件
+  local function process_next_file()
+    if is_stopped() then
+      -- 停止请求，返回已收集的结果
+      if on_success then
+        on_success({
+          file_count = #file_results,
+          files = file_results,
+          _stopped = true,
+          _note = "工具调用已停止，返回部分结果",
+        })
+      end
+      return
+    end
+
+    current_index = current_index + 1
+    if current_index > total_files then
+      -- 所有文件处理完毕
+      if on_success then
+        on_success({
+          file_count = #file_results,
+          files = file_results,
+        })
+      end
+      return
+    end
+
+    local filepath = filepaths[current_index]
     local abs_path = vim.fn.fnamemodify(filepath, ":p")
-    -- 使用 ensure_buf_loaded 自动加载文件到缓冲区
+
+    -- 子步骤1：保证文件在缓冲区
+    if on_progress then
+      on_progress(string.format("保证文件在buffer (%d/%d)", current_index, total_files), "executing", 0)
+    end
+
     local bufnr, cleanup, load_err = ensure_buf_loaded(filepath)
     local file_entry = {
       filepath = filepath,
@@ -3246,42 +3133,74 @@ local function _lsp_client_info(args)
 
     if load_err then
       file_entry.error = "文件加载失败: " .. load_err
-    else
-      -- 获取文件类型并推断期望的 LSP 配置名
-      local ft = vim.filetype.match({ filename = abs_path })
-      local ft_to_lsp_config = {
-        lua = "lua_ls",
-        python = "pyright",
-        javascript = "ts_ls",
-        typescript = "ts_ls",
-        javascriptreact = "ts_ls",
-        typescriptreact = "ts_ls",
-        go = "gopls",
-        rust = "rust_analyzer",
-        java = "jdtls",
-        c = "clangd",
-        cpp = "clangd",
-        ruby = "solargraph",
-        php = "intelephense",
-        json = "jsonls",
-        yaml = "yamlls",
-        markdown = "marksman",
-        bash = "bashls",
-        sh = "bashls",
-        zsh = "bashls",
-        css = "cssls",
-        html = "htmlls",
-        vue = "volar",
-        svelte = "svelte",
-      }
-      local expected_config = ft and ft_to_lsp_config[ft]
+      table.insert(file_results, file_entry)
+      if on_progress then
+        on_progress(string.format("保证文件在buffer (%d/%d)", current_index, total_files), "error", 0, load_err)
+      end
+      process_next_file()
+      return
+    end
 
-      -- 使用 LspAttach 事件等待 LSP 客户端 attach 到缓冲区（最多等待 30 秒）
-      -- 传入 expected_config 只等待与该 filetype 匹配的客户端
-      local clients = wait_for_lsp_attach(bufnr, 30000, expected_config)
+    if on_progress then
+      on_progress(string.format("保证文件在buffer (%d/%d)", current_index, total_files), "completed", 0)
+    end
+
+    -- 子步骤2：等待 LSP 服务加载
+    if on_progress then
+      on_progress(string.format("等待LSP服务加载 (%d/%d)", current_index, total_files), "executing", 0)
+    end
+
+    -- 获取文件类型并推断期望的 LSP 配置名
+    local ft = vim.filetype.match({ filename = abs_path })
+    local ft_to_lsp_config = {
+      lua = "lua_ls",
+      python = "pyright",
+      javascript = "ts_ls",
+      typescript = "ts_ls",
+      javascriptreact = "tsx",
+      typescriptreact = "tsx",
+      go = "gopls",
+      rust = "rust_analyzer",
+      java = "jdtls",
+      c = "clangd",
+      cpp = "clangd",
+      ruby = "solargraph",
+      php = "intelephense",
+      json = "jsonls",
+      yaml = "yamlls",
+      markdown = "marksman",
+      bash = "bashls",
+      sh = "bashls",
+      zsh = "bashls",
+      css = "cssls",
+      html = "htmlls",
+      vue = "volar",
+      svelte = "svelte",
+    }
+    local expected_config = ft and ft_to_lsp_config[ft]
+
+    -- 使用异步非阻塞版本等待 LSP attach
+    wait_for_lsp_attach_async(bufnr, function(clients, attach_err, _)
       if not clients or #clients == 0 then
-        file_entry.error = "该文件没有关联的 LSP 客户端"
+        file_entry.error = attach_err or "该文件没有关联的 LSP 客户端"
+        if on_progress then
+          on_progress(
+            string.format("等待LSP服务加载 (%d/%d)", current_index, total_files),
+            "error",
+            0,
+            file_entry.error
+          )
+        end
       else
+        if on_progress then
+          on_progress(string.format("等待LSP服务加载 (%d/%d)", current_index, total_files), "completed", 0)
+        end
+
+        -- 子步骤3：获取 LSP 服务信息
+        if on_progress then
+          on_progress(string.format("获取LSP服务信息 (%d/%d)", current_index, total_files), "executing", 0)
+        end
+
         local filtered_count = 0
         for _, client in ipairs(clients) do
           if not is_client_functionally_complete(client) then
@@ -3312,27 +3231,33 @@ local function _lsp_client_info(args)
           end
         end
         file_entry.filtered_count = filtered_count
+
+        if on_progress then
+          on_progress(string.format("获取LSP服务信息 (%d/%d)", current_index, total_files), "completed", 0)
+        end
       end
-    end
 
-    table.insert(file_results, file_entry)
+      table.insert(file_results, file_entry)
 
-    -- 清理临时加载的缓冲区
-    if cleanup then
-      cleanup()
-    end
+      -- 清理临时加载的缓冲区
+      if cleanup then
+        cleanup()
+      end
+
+      -- 处理下一个文件
+      process_next_file()
+    end, 30000, expected_config)
   end
 
-  return {
-    file_count = #file_results,
-    files = file_results,
-  }
+  -- 开始处理第一个文件
+  process_next_file()
 end
 
 M.lsp_client_info = define_tool({
   name = "lsp_client_info",
   description = "获取指定文件或文件列表的 LSP 客户端信息，包括名称、根目录、支持的能力列表。必须提供 filepath（单个文件）或 filepaths（文件列表）参数。",
   func = _lsp_client_info,
+  async = true,
   parameters = {
     type = "object",
     properties = {
@@ -3351,6 +3276,9 @@ M.lsp_client_info = define_tool({
   category = "lsp",
   permissions = { read = true },
 })
+
+-- send_signature_request 前向声明（实际定义在文件后面）
+local _send_signature_request
 
 -- ============================================================================
 -- 工具 lsp_signature_help - 获取签名帮助
@@ -3385,75 +3313,274 @@ local function _lsp_signature_help(args, on_success, on_error)
       return
     end
 
-    find_symbol_position_async(args.filepath, args.symbol, args.node_type, bufnr, function(row, col, find_err)
-      if not row then
-        if cleanup then
-          cleanup()
+    -- signatureHelp 需要在函数调用位置（如 `foo(` 或 `obj.method(`）而非定义位置
+    -- 因此我们使用 Tree-sitter 查找函数调用表达式（call_expression）的位置
+    -- 如果用户指定了 node_type，优先使用；否则默认查找 call_expression
+    local search_node_type = args.node_type or "call_expression"
+
+    -- 读取文件内容，使用 Tree-sitter 查找函数调用位置
+    local content, read_err = read_file_content(args.filepath)
+    if not content then
+      -- 无法读取文件，回退到 LSP documentSymbol 查找
+      find_symbol_via_lsp_async(args.filepath, args.symbol, bufnr, function(row, col, find_err)
+        if not row then
+          if cleanup then
+            cleanup()
+          end
+          if on_error then
+            on_error(find_err or ("未找到符号 '" .. args.symbol .. "' 在文件中的位置"))
+          end
+          return
         end
-        if on_error then
-          on_error(find_err or "未找到符号 '" .. args.symbol .. "' 在文件中的位置")
+        -- 使用找到的位置 + 1 列，模拟在函数名后的位置
+        _send_signature_request(bufnr, args, cleanup, on_success, on_error, row, col + 1)
+      end)
+      return
+    end
+
+    -- 使用 Tree-sitter 查找函数调用位置
+    local ok_ts, ts = pcall(require, "vim.treesitter")
+    if not ok_ts then
+      -- Tree-sitter 不可用，回退到 LSP documentSymbol
+      find_symbol_via_lsp_async(args.filepath, args.symbol, bufnr, function(row, col, find_err)
+        if not row then
+          if cleanup then
+            cleanup()
+          end
+          if on_error then
+            on_error(find_err or ("未找到符号 '" .. args.symbol .. "' 在文件中的位置"))
+          end
+          return
         end
+        _send_signature_request(bufnr, args, cleanup, on_success, on_error, row, col + 1)
+      end)
+      return
+    end
+
+    -- 推断语言
+    local abs_path = vim.fn.fnamemodify(args.filepath, ":p")
+    local ft = vim.filetype.match({ filename = abs_path })
+    if not ft then
+      -- 无法推断语言，回退
+      find_symbol_via_lsp_async(args.filepath, args.symbol, bufnr, function(row, col, find_err)
+        if not row then
+          if cleanup then
+            cleanup()
+          end
+          if on_error then
+            on_error(find_err or ("未找到符号 '" .. args.symbol .. "' 在文件中的位置"))
+          end
+          return
+        end
+        _send_signature_request(bufnr, args, cleanup, on_success, on_error, row, col + 1)
+      end)
+      return
+    end
+
+    -- 检查解析器是否可用
+    local ok_inspect, _ = pcall(ts.language.inspect, ft)
+    if not ok_inspect then
+      -- 解析器未安装，回退到 LSP documentSymbol
+      find_symbol_via_lsp_async(args.filepath, args.symbol, bufnr, function(row, col, find_err)
+        if not row then
+          if cleanup then
+            cleanup()
+          end
+          if on_error then
+            on_error(find_err or ("未找到符号 '" .. args.symbol .. "' 在文件中的位置"))
+          end
+          return
+        end
+        _send_signature_request(bufnr, args, cleanup, on_success, on_error, row, col + 1)
+      end)
+      return
+    end
+
+    local ok_lang, lang = pcall(ts.language.get_lang, ft)
+    if not ok_lang or not lang then
+      find_symbol_via_lsp_async(args.filepath, args.symbol, bufnr, function(row, col, find_err)
+        if not row then
+          if cleanup then
+            cleanup()
+          end
+          if on_error then
+            on_error(find_err or ("未找到符号 '" .. args.symbol .. "' 在文件中的位置"))
+          end
+          return
+        end
+        _send_signature_request(bufnr, args, cleanup, on_success, on_error, row, col + 1)
+      end)
+      return
+    end
+
+    local ok_parser, parser = pcall(ts.get_string_parser, content, lang)
+    if not ok_parser or not parser then
+      find_symbol_via_lsp_async(args.filepath, args.symbol, bufnr, function(row, col, find_err)
+        if not row then
+          if cleanup then
+            cleanup()
+          end
+          if on_error then
+            on_error(find_err or ("未找到符号 '" .. args.symbol .. "' 在文件中的位置"))
+          end
+          return
+        end
+        _send_signature_request(bufnr, args, cleanup, on_success, on_error, row, col + 1)
+      end)
+      return
+    end
+
+    local ok_trees, trees = pcall(parser.parse, parser)
+    if not ok_trees or not trees or #trees == 0 then
+      find_symbol_via_lsp_async(args.filepath, args.symbol, bufnr, function(row, col, find_err)
+        if not row then
+          if cleanup then
+            cleanup()
+          end
+          if on_error then
+            on_error(find_err or ("未找到符号 '" .. args.symbol .. "' 在文件中的位置"))
+          end
+          return
+        end
+        _send_signature_request(bufnr, args, cleanup, on_success, on_error, row, col + 1)
+      end)
+      return
+    end
+
+    local root = trees[1]:root()
+    local best_match = nil
+
+    -- 递归查找函数调用节点
+    local function search_call_node(node, depth, max_depth)
+      if not node or (max_depth and depth > max_depth) then
         return
       end
 
-      lsp_request_async(bufnr, "textDocument/signatureHelp", {
-        textDocument = { uri = vim.uri_from_fname(vim.fn.fnamemodify(args.filepath, ":p")) },
-        position = { line = row, character = col },
-      }, function(result, req_err)
-        if cleanup then
-          cleanup()
-        end
+      local node_type = node:type()
 
-        if req_err then
+      -- 查找 call_expression 或类似的函数调用节点
+      if
+        node_type == "call_expression"
+        or node_type == "call"
+        or node_type == "function_call"
+        or node_type == "method_call"
+        or node_type == search_node_type
+      then
+        local text = vim.treesitter.get_node_text(node, content) or ""
+        -- 检查调用表达式是否包含目标符号名
+        -- 例如: `foo(args)` 或 `obj.method(args)`
+        local call_start = text:find(args.symbol, 1, true)
+        if call_start then
+          -- 找到匹配的调用表达式，使用调用位置（左括号前）
+          local sr, sc, er, ec = node:range()
+          -- 查找左括号位置：在调用表达式中，左括号通常在函数名之后
+          -- 对于 `foo(args)`，位置在 `foo` 之后
+          -- 使用函数名长度来确定位置
+          local name_end_col = sc + #args.symbol
+          best_match = { row = sr, col = name_end_col }
+          return
+        end
+      end
+
+      -- 递归搜索子节点
+      for i = 0, node:named_child_count() - 1 do
+        search_call_node(node:named_child(i), depth + 1, max_depth)
+        if best_match then
+          return
+        end
+      end
+    end
+
+    search_call_node(root, 0, 50)
+
+    if best_match then
+      -- 找到函数调用位置，发送 signatureHelp 请求
+      _send_signature_request(bufnr, args, cleanup, on_success, on_error, best_match.row, best_match.col)
+    else
+      -- Tree-sitter 未找到调用位置，回退到 LSP documentSymbol 查找符号定义位置
+      -- 然后尝试在定义位置附近查找调用
+      find_symbol_via_lsp_async(args.filepath, args.symbol, bufnr, function(row, col, find_err)
+        if not row then
+          if cleanup then
+            cleanup()
+          end
           if on_error then
-            on_error(req_err)
+            on_error(
+              find_err
+                or (
+                  "未找到符号 '"
+                  .. args.symbol
+                  .. "' 在文件中的调用位置。注意：signatureHelp 需要在函数调用位置（如 `foo(` 或 `obj.method(`）而非定义位置。"
+                )
+            )
           end
           return
         end
-
-        if not result then
-          if on_success then
-            on_success({
-              filepath = args.filepath,
-              symbol = args.symbol,
-              position = { row = row, col = col },
-              signatures = {},
-              found = false,
-            })
-          end
-          return
-        end
-
-        local signatures = {}
-        for _, sig in ipairs(result.signatures or {}) do
-          local params = {}
-          for _, param in ipairs(sig.parameters or {}) do
-            table.insert(params, {
-              label = param.label,
-              documentation = param.documentation,
-            })
-          end
-          table.insert(signatures, {
-            label = sig.label,
-            documentation = sig.documentation,
-            parameters = params,
-            active_parameter = sig.activeParameter,
-          })
-        end
-
-        if on_success then
-          on_success({
-            filepath = args.filepath,
-            symbol = args.symbol,
-            position = { row = row, col = col },
-            active_signature = result.activeSignature,
-            active_parameter = result.activeParameter,
-            signatures = signatures,
-          })
-        end
+        -- 使用找到的定义位置 + 1 列，尝试发送请求
+        _send_signature_request(bufnr, args, cleanup, on_success, on_error, row, col + 1)
       end)
-    end)
+    end
   end, true)
+end
+
+-- 发送 signatureHelp 请求的辅助函数
+_send_signature_request = function(bufnr, args, cleanup, on_success, on_error, row, col)
+  lsp_request_async(bufnr, "textDocument/signatureHelp", {
+    textDocument = { uri = vim.uri_from_fname(vim.fn.fnamemodify(args.filepath, ":p")) },
+    position = { line = row, character = col },
+  }, function(result, req_err)
+    if cleanup then
+      cleanup()
+    end
+
+    if req_err then
+      if on_error then
+        on_error(req_err)
+      end
+      return
+    end
+
+    if not result then
+      if on_success then
+        on_success({
+          filepath = args.filepath,
+          symbol = args.symbol,
+          position = { row = row, col = col },
+          signatures = {},
+          found = false,
+        })
+      end
+      return
+    end
+
+    local signatures = {}
+    for _, sig in ipairs(result.signatures or {}) do
+      local params = {}
+      for _, param in ipairs(sig.parameters or {}) do
+        table.insert(params, {
+          label = param.label,
+          documentation = param.documentation,
+        })
+      end
+      table.insert(signatures, {
+        label = sig.label,
+        documentation = sig.documentation,
+        parameters = params,
+        active_parameter = sig.activeParameter,
+      })
+    end
+
+    if on_success then
+      on_success({
+        filepath = args.filepath,
+        symbol = args.symbol,
+        position = { row = row, col = col },
+        active_signature = result.activeSignature,
+        active_parameter = result.activeParameter,
+        signatures = signatures,
+      })
+    end
+  end)
 end
 
 M.lsp_signature_help = define_tool({
@@ -3571,7 +3698,7 @@ local function _lsp_completion(args, on_success, on_error)
             cleanup()
           end
           if on_error then
-            on_error(find_err or "未找到符号 '" .. args.symbol .. "' 在文件中的位置")
+            on_error(find_err or ("未找到符号 '" .. args.symbol .. "' 在文件中的位置"))
           end
           return
         end
@@ -3650,7 +3777,7 @@ local function _lsp_type_definition(args, on_success, on_error)
           cleanup()
         end
         if on_error then
-          on_error(find_err or "未找到符号 '" .. args.symbol .. "' 在文件中的位置")
+          on_error(find_err or ("未找到符号 '" .. args.symbol .. "' 在文件中的位置"))
         end
         return
       end
@@ -3743,43 +3870,75 @@ end
 -- 工具 lsp_service_info - 获取 LSP 服务信息
 -- ============================================================================
 
-local function _lsp_service_info()
+local function _lsp_service_info(args, on_success, on_error, on_progress)
   if not check_lsp() then
-    return { error = "LSP 不可用" }
+    if on_error then
+      on_error("LSP 不可用")
+    end
+    return
   end
 
-  ensure_lsp_init()
+  -- 使用 vim.schedule 异步执行，避免阻塞
+  vim.schedule(function()
+    if on_progress then
+      on_progress("检测LSP服务类型", "executing", 0)
+    end
 
-  local mason_servers = get_mason_installed_servers()
-  local mason_names = {}
-  for _, info in ipairs(mason_servers) do
-    table.insert(mason_names, info.mason_name)
-  end
+    ensure_lsp_init()
 
-  local active = get_active_formal_clients()
-  local active_info = {}
-  for _, c in ipairs(active) do
-    table.insert(active_info, {
-      name = c.name,
-      id = c.id,
-      initialized = c.initialized == true,
-      has_capabilities = c.server_capabilities ~= nil,
-    })
-  end
+    if on_progress then
+      on_progress("检测LSP服务类型", "completed", 0)
+      on_progress("获取Mason已安装服务器", "executing", 0)
+    end
 
-  local available = get_available_formal_servers()
+    local mason_servers = get_mason_installed_servers()
+    local mason_names = {}
+    for _, info in ipairs(mason_servers) do
+      table.insert(mason_names, info.mason_name)
+    end
 
-  return {
-    service_type = _lsp_service_type or "unknown",
-    mason_installed = mason_names,
-    available_formal_servers = available,
-  }
+    if on_progress then
+      on_progress("获取Mason已安装服务器", "completed", 0)
+      on_progress("获取活跃LSP客户端", "executing", 0)
+    end
+
+    local active = get_active_formal_clients()
+    local active_info = {}
+    for _, c in ipairs(active) do
+      table.insert(active_info, {
+        name = c.name,
+        id = c.id,
+        initialized = c.initialized == true,
+        has_capabilities = c.server_capabilities ~= nil,
+      })
+    end
+
+    if on_progress then
+      on_progress("获取活跃LSP客户端", "completed", 0)
+      on_progress("汇总可用服务器列表", "executing", 0)
+    end
+
+    local available = get_available_formal_servers()
+
+    if on_progress then
+      on_progress("汇总可用服务器列表", "completed", 0)
+    end
+
+    if on_success then
+      on_success({
+        service_type = _lsp_service_type or "unknown",
+        mason_installed = mason_names,
+        available_formal_servers = available,
+      })
+    end
+  end)
 end
 
 M.lsp_service_info = define_tool({
   name = "lsp_service_info",
   description = "获取当前 Neovim 的 LSP 服务信息，包括检测到的服务类型、Mason 已安装的服务器列表、当前活跃的正式 LSP 客户端列表",
   func = _lsp_service_info,
+  async = true,
   parameters = {
     type = "object",
     properties = {},

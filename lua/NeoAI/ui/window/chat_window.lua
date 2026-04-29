@@ -122,6 +122,11 @@ local state = {
     buffer = "", -- 累积的工具调用内容
     results = {}, -- 所有工具调用结果，用于生成折叠文本
     folded_saved = false, -- 标记折叠文本是否已保存到 state.messages（防止 TOOL_LOOP_FINISHED 写入后 GENERATION_COMPLETED 全量重渲染时丢失）
+    -- 工具包分组显示支持
+    packs = {}, -- { pack_name = { tools = { { name, status, duration, substeps = {} } }, order = n } }
+    pack_order = {}, -- 有序的包名列表
+    -- 子步骤显示支持
+    substeps = {}, -- { [tool_name] = { { name, status, duration, detail } } }
   },
 
   -- 工具调用循环进行中标志
@@ -194,6 +199,7 @@ local function reset_tool_display()
   state.tool_display.buffer = ""
   state.tool_display.results = {}
   state.tool_display.folded_saved = false
+  state.tool_display.substeps = {}
 end
 
 local function close_reasoning_display()
@@ -1093,6 +1099,7 @@ function M.close()
     state.tool_display._finished = false
     state.tool_display.folded_saved = false
     state.tool_display.window_id = nil
+    state.tool_display.substeps = {}
 
     -- 只有在 state.current_window_id 仍然是 closing_window_id 时才清理状态
     -- 防止 M.open() 已经设置了新的窗口，这里误清理
@@ -1890,6 +1897,71 @@ function M._setup_event_listeners()
     end,
   })
 
+  -- 辅助：更新工具包分组中的工具状态
+  local function update_tool_in_pack(pack_name, tool_name, status, duration)
+    local pack = state.tool_display.packs[pack_name]
+    if not pack then return end
+    for _, t in ipairs(pack.tools) do
+      if t.name == tool_name then
+        t.status = status
+        t.duration = duration
+        break
+      end
+    end
+  end
+
+  -- 辅助：根据工具包分组重建显示 buffer（含子步骤树形显示）
+  local function rebuild_tool_display_buffer()
+    local tool_pack = require("NeoAI.tools.tool_pack")
+    local text = "🔧 工具调用中...\n"
+    for _, pack_name in ipairs(state.tool_display.pack_order) do
+      local pack = state.tool_display.packs[pack_name]
+      if pack then
+        local icon = tool_pack.get_pack_icon(pack_name)
+        local display_name = tool_pack.get_pack_display_name(pack_name)
+        text = text .. "\n" .. icon .. " " .. display_name .. "\n"
+        for _, t in ipairs(pack.tools) do
+          local status_icon = "⏳"
+          local status_text = "等待中"
+          if t.status == "executing" then
+            status_icon = "🔄"
+            status_text = "执行中..."
+          elseif t.status == "completed" then
+            status_icon = "✅"
+            status_text = string.format("(%.1fs)", t.duration or 0)
+          elseif t.status == "error" then
+            status_icon = "❌"
+            status_text = string.format("(失败, %.1fs)", t.duration or 0)
+          end
+          text = text .. "  " .. status_icon .. " " .. t.name .. " " .. status_text .. "\n"
+
+          -- 显示子步骤（树形缩进）
+          local substeps = state.tool_display.substeps[t.name]
+          if substeps and #substeps > 0 then
+            for i, s in ipairs(substeps) do
+              local is_last = (i == #substeps)
+              local prefix = is_last and "    └── " or "    ├── "
+              local ss_icon = "⏳"
+              local ss_text = "等待中"
+              if s.status == "executing" then
+                ss_icon = "🔄"
+                ss_text = "执行中..."
+              elseif s.status == "completed" then
+                ss_icon = "✅"
+                ss_text = string.format("(%.1fs)", s.duration or 0)
+              elseif s.status == "error" then
+                ss_icon = "❌"
+                ss_text = string.format("(失败, %.1fs)", s.duration or 0)
+              end
+              text = text .. prefix .. ss_icon .. " " .. s.name .. " " .. ss_text .. "\n"
+            end
+          end
+        end
+      end
+    end
+    state.tool_display.buffer = text
+  end
+
   -- 辅助：更新工具显示 buffer 中的状态图标
   local function update_tool_status(tool_name, icon, suffix)
     local escaped = tool_name:gsub("([%.%+%-%*%?%[%]%^%$%(%)%%])", "%%%1")
@@ -1928,13 +2000,57 @@ function M._setup_event_listeners()
       state.tool_display.results = {}
       state.tool_display._finished = false
       state.tool_display.folded_saved = false
+      state.tool_display.packs = {}
+      state.tool_display.pack_order = {}
+      state.tool_display.substeps = {}
 
-      local text = "🔧 工具调用中...\n"
-      for _, tc in ipairs(tool_calls) do
-        local fn = tc["function"] or tc.func or {}
-        text = text .. "  ⏳ " .. (fn.name or "unknown") .. "\n"
+      -- 按工具包分组初始化
+      local tool_pack = require("NeoAI.tools.tool_pack")
+      local grouped = data.tool_packs or tool_pack.group_by_pack(tool_calls)
+      local pack_order = data.pack_order or {}
+
+      -- 初始化每个包的工具状态
+      for _, pack_name in ipairs(pack_order) do
+        local pack_tools = grouped[pack_name]
+        if pack_tools then
+          local tools_info = {}
+          for _, tc in ipairs(pack_tools) do
+            local fn = tc["function"] or tc.func or {}
+            table.insert(tools_info, {
+              name = fn.name or "unknown",
+              status = "pending",
+              duration = 0,
+            })
+          end
+          state.tool_display.packs[pack_name] = {
+            tools = tools_info,
+            order = tool_pack.get_pack_order(pack_name),
+          }
+          table.insert(state.tool_display.pack_order, pack_name)
+        end
       end
-      state.tool_display.buffer = text
+
+      -- 处理未分类的工具
+      local uncategorized = grouped["_uncategorized"]
+      if uncategorized then
+        local tools_info = {}
+        for _, tc in ipairs(uncategorized) do
+          local fn = tc["function"] or tc.func or {}
+          table.insert(tools_info, {
+            name = fn.name or "unknown",
+            status = "pending",
+            duration = 0,
+          })
+        end
+        state.tool_display.packs["_uncategorized"] = {
+          tools = tools_info,
+          order = 99,
+        }
+        table.insert(state.tool_display.pack_order, "_uncategorized")
+      end
+
+      -- 构建分组显示文本
+      rebuild_tool_display_buffer()
       M._show_tool_display()
     end,
   })
@@ -1946,7 +2062,17 @@ function M._setup_event_listeners()
       if state.closing or not is_current_window((args.data or {}).window_id) then
         return
       end
-      update_tool_status((args.data or {}).tool_name, "🔄", "(执行中...)")
+      local data = args.data or {}
+      local pack_name = data.pack_name
+      if pack_name and state.tool_display.packs[pack_name] then
+        -- 使用工具包分组更新
+        update_tool_in_pack(pack_name, data.tool_name, "executing", 0)
+        rebuild_tool_display_buffer()
+        M._update_tool_display()
+      else
+        -- 回退到旧方式
+        update_tool_status(data.tool_name, "🔄", "(执行中...)")
+      end
     end,
   })
 
@@ -1967,8 +2093,68 @@ function M._setup_event_listeners()
         result = "[失败] " .. (data.error_msg or "未知错误"),
         duration = data.duration or 0,
         is_error = true,
+        pack_name = data.pack_name,
       })
-      update_tool_status(data.tool_name, "❌", "(失败, " .. (data.duration or 0) .. "s)")
+      local pack_name = data.pack_name
+      if pack_name and state.tool_display.packs[pack_name] then
+        update_tool_in_pack(pack_name, data.tool_name, "error", data.duration or 0)
+        rebuild_tool_display_buffer()
+        M._update_tool_display()
+      else
+        update_tool_status(data.tool_name, "❌", "(失败, " .. (data.duration or 0) .. "s)")
+      end
+    end,
+  })
+
+  -- TOOL_EXECUTION_SUBSTEP：工具执行子步骤状态更新
+  vim.api.nvim_create_autocmd("User", {
+    pattern = Events.TOOL_EXECUTION_SUBSTEP,
+    callback = function(args)
+      if state.closing or not is_current_window((args.data or {}).window_id) then
+        return
+      end
+      if not state.tool_display.active then
+        return
+      end
+      local data = args.data or {}
+      local tool_name = data.tool_name
+      local substep_name = data.substep_name
+      local status = data.status or "pending"
+      local duration = data.duration or 0
+      local detail = data.detail
+
+      if not tool_name or not substep_name then
+        return
+      end
+
+      -- 更新子步骤状态
+      if not state.tool_display.substeps[tool_name] then
+        state.tool_display.substeps[tool_name] = {}
+      end
+
+      -- 查找或创建子步骤条目
+      local found = false
+      for _, s in ipairs(state.tool_display.substeps[tool_name]) do
+        if s.name == substep_name then
+          s.status = status
+          s.duration = duration
+          s.detail = detail
+          found = true
+          break
+        end
+      end
+      if not found then
+        table.insert(state.tool_display.substeps[tool_name], {
+          name = substep_name,
+          status = status,
+          duration = duration,
+          detail = detail,
+        })
+      end
+
+      -- 重建显示 buffer 并更新窗口
+      rebuild_tool_display_buffer()
+      M._update_tool_display()
     end,
   })
 
@@ -1988,8 +2174,16 @@ function M._setup_event_listeners()
         arguments = data.args or {},
         result = data.result or "",
         duration = data.duration or 0,
+        pack_name = data.pack_name,
       })
-      update_tool_status(data.tool_name, "✅", "(" .. (data.duration or 0) .. "s)")
+      local pack_name = data.pack_name
+      if pack_name and state.tool_display.packs[pack_name] then
+        update_tool_in_pack(pack_name, data.tool_name, "completed", data.duration or 0)
+        rebuild_tool_display_buffer()
+        M._update_tool_display()
+      else
+        update_tool_status(data.tool_name, "✅", "(" .. (data.duration or 0) .. "s)")
+      end
     end,
   })
 
@@ -2022,20 +2216,42 @@ function M._setup_event_listeners()
         if #results > 0 or state.tool_display.buffer ~= "" then
           local folded_text = ""
           if #results > 0 then
-            local blocks = {}
+            -- 按工具包分组构建折叠文本
+            local tool_pack = require("NeoAI.tools.tool_pack")
+            local pack_results = {}
+            local pack_order = {}
             for _, r in ipairs(results) do
-              local icon = r.is_error and "❌" or "✅"
-              local duration_str = r.duration and string.format(" (%.1fs)", r.duration) or ""
-              local args_str = vim.inspect(r.arguments or {})
-              local result_str = type(r.result) == "table"
-                  and (pcall(vim.json.encode, r.result) and vim.json.encode(r.result) or vim.inspect(r.result))
-                or tostring(r.result or "")
-              result_str = result_str:gsub("\n", "\n    ")
-              local block = "{{{ " .. icon .. " " .. (r.tool_name or "unknown") .. duration_str
-                  .. "\n    参数: " .. args_str
-                  .. "\n    结果: " .. result_str
-                  .. "\n}}}"
-              table.insert(blocks, block)
+              local pn = r.pack_name or "_uncategorized"
+              if not pack_results[pn] then
+                pack_results[pn] = {}
+                table.insert(pack_order, pn)
+              end
+              table.insert(pack_results[pn], r)
+            end
+            -- 按包顺序排序
+            table.sort(pack_order, function(a, b)
+              return tool_pack.get_pack_order(a) < tool_pack.get_pack_order(b)
+            end)
+
+            local blocks = {}
+            for _, pn in ipairs(pack_order) do
+              local pack_tools = pack_results[pn]
+              local pack_icon = tool_pack.get_pack_icon(pn)
+              local pack_name = tool_pack.get_pack_display_name(pn)
+              for _, r in ipairs(pack_tools) do
+                local icon = r.is_error and "❌" or "✅"
+                local duration_str = r.duration and string.format(" (%.1fs)", r.duration) or ""
+                local args_str = vim.inspect(r.arguments or {})
+                local result_str = type(r.result) == "table"
+                    and (pcall(vim.json.encode, r.result) and vim.json.encode(r.result) or vim.inspect(r.result))
+                  or tostring(r.result or "")
+                result_str = result_str:gsub("\n", "\n    ")
+                local block = "{{{ " .. pack_icon .. " " .. pack_name .. " - " .. icon .. " " .. (r.tool_name or "unknown") .. duration_str
+                    .. "\n    参数: " .. args_str
+                    .. "\n    结果: " .. result_str
+                    .. "\n}}}"
+                table.insert(blocks, block)
+              end
             end
             folded_text = table.concat(blocks, "\n")
           else
@@ -2104,6 +2320,43 @@ function M._setup_event_listeners()
         pcall(vim.api.nvim_buf_set_name, buf, "neoai://chat/" .. data.session_id .. " - " .. (data.name or ""))
       end
     end,
+  })
+
+  -- VimResized：窗口大小变化时动态调整工具调用悬浮窗和虚拟输入框位置
+  vim.api.nvim_create_autocmd("VimResized", {
+    callback = function()
+      -- 调整工具调用悬浮窗
+      if state.tool_display.window_id then
+        local window_info = window_manager.get_window_info(state.tool_display.window_id)
+        if window_info and window_info.win and vim.api.nvim_win_is_valid(window_info.win) then
+          local lines = vim.split(state.tool_display.buffer or "", "\n")
+          local dynamic_height = math.max(5, math.min(#lines + 2, 20))
+          local config = vim.api.nvim_win_get_config(window_info.win)
+          config.height = dynamic_height
+          local tool_row = 1
+          local ok, rd = pcall(require, "NeoAI.ui.components.reasoning_display")
+          if ok and rd.is_visible() then
+            local rwid = rd.get_window_id()
+            if rwid then
+              local rwin = window_manager.get_window_win(rwid)
+              if rwin and vim.api.nvim_win_is_valid(rwin) then
+                local rc = vim.api.nvim_win_get_config(rwin)
+                tool_row = (rc.row or 1) + (rc.height or 5) + 1
+              end
+            end
+          end
+          config.row = tool_row
+          pcall(vim.api.nvim_win_set_config, window_info.win, config)
+        end
+      end
+
+      -- 调整虚拟输入框位置
+      local vi = require("NeoAI.ui.components.virtual_input")
+      if vi.is_active() then
+        vi.reposition()
+      end
+    end,
+    desc = "窗口大小变化时调整工具调用悬浮窗和虚拟输入框位置",
   })
 end
 
@@ -2432,7 +2685,7 @@ function M._show_tool_display()
   end
 end
 
---- 更新工具调用悬浮窗口内容
+--- 更新工具调用悬浮窗口内容（同时动态调整高度和位置）
 function M._update_tool_display()
   if not state.tool_display.window_id then
     return
@@ -2451,6 +2704,29 @@ function M._update_tool_display()
 
   vim.api.nvim_set_option_value("readonly", true, { buf = buf })
   vim.api.nvim_set_option_value("modifiable", false, { buf = buf })
+
+  -- 动态调整窗口高度
+  local win = window_info.win
+  if win and vim.api.nvim_win_is_valid(win) then
+    local dynamic_height = math.max(5, math.min(#lines + 2, 20))
+    local config = vim.api.nvim_win_get_config(win)
+    config.height = dynamic_height
+    -- 重新计算 row：在 reasoning 窗口下方堆叠
+    local tool_row = 1
+    local ok, rd = pcall(require, "NeoAI.ui.components.reasoning_display")
+    if ok and rd.is_visible() then
+      local rwid = rd.get_window_id()
+      if rwid then
+        local rwin = window_manager.get_window_win(rwid)
+        if rwin and vim.api.nvim_win_is_valid(rwin) then
+          local rc = vim.api.nvim_win_get_config(rwin)
+          tool_row = (rc.row or 1) + (rc.height or 5) + 1
+        end
+      end
+    end
+    config.row = tool_row
+    pcall(vim.api.nvim_win_set_config, win, config)
+  end
 end
 
 --- 关闭工具调用悬浮窗口
@@ -2483,30 +2759,53 @@ function M._build_tool_folded_text(results, reasoning_text)
     folded_text = folded_text .. "\n\n"
   end
 
-  local blocks = {}
+  -- 按工具包分组
+  local tool_pack = require("NeoAI.tools.tool_pack")
+  local pack_results = {}
+  local pack_order = {}
   for _, r in ipairs(results) do
-    local icon = r.is_error and "❌" or "✅"
-    local duration_str = r.duration and string.format(" (%.1fs)", r.duration) or ""
-    local args_str = vim.inspect(r.arguments or {})
-    local result_raw = r.result
-    local result_str = ""
-    if type(result_raw) == "table" then
-      local ok, encoded = pcall(vim.json.encode, result_raw)
-      if ok then
-        result_str = encoded
-      else
-        result_str = vim.inspect(result_raw)
-      end
-    else
-      result_str = tostring(result_raw or "")
+    local pn = r.pack_name or "_uncategorized"
+    if not pack_results[pn] then
+      pack_results[pn] = {}
+      table.insert(pack_order, pn)
     end
-    result_str = result_str:gsub("\n", "\n    ")
+    table.insert(pack_results[pn], r)
+  end
+  table.sort(pack_order, function(a, b)
+    return tool_pack.get_pack_order(a) < tool_pack.get_pack_order(b)
+  end)
 
-    local block = "{{{ " .. icon .. " " .. (r.tool_name or "unknown") .. duration_str
-      .. "\n    参数: " .. args_str
-      .. "\n    结果: " .. result_str
-      .. "\n}}}"
-    table.insert(blocks, block)
+  local blocks = {}
+  for _, pn in ipairs(pack_order) do
+    local pack_tools = pack_results[pn]
+    local pack_icon = tool_pack.get_pack_icon(pn)
+    local pack_name = tool_pack.get_pack_display_name(pn)
+    for _, r in ipairs(pack_tools) do
+      local icon = r.is_error and "❌" or "✅"
+      local duration_str = r.duration and string.format(" (%.1fs)", r.duration) or ""
+      -- 将参数格式化为单行（压缩换行和缩进为空格）
+      local args_str = vim.inspect(r.arguments or {})
+      args_str = args_str:gsub("\n[ \t]*", " ")
+      local result_raw = r.result
+      local result_str = ""
+      if type(result_raw) == "table" then
+        local ok, encoded = pcall(vim.json.encode, result_raw)
+        if ok then
+          result_str = encoded
+        else
+          result_str = vim.inspect(result_raw)
+        end
+      else
+        result_str = tostring(result_raw or "")
+      end
+      result_str = result_str:gsub("\n", "\n    ")
+
+      local block = "{{{ " .. pack_icon .. " " .. pack_name .. " - " .. icon .. " " .. (r.tool_name or "unknown") .. duration_str
+        .. "\n    参数: " .. args_str
+        .. "\n    结果: " .. result_str
+        .. "\n}}}"
+      table.insert(blocks, block)
+    end
   end
   folded_text = table.concat(blocks, "\n")
 

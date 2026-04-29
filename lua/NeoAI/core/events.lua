@@ -32,6 +32,7 @@ M.TOOL_LOOP_FINISHED = "NeoAI:tool_loop_finished" -- 工具循环结束
 M.TOOL_EXECUTION_STARTED = "NeoAI:tool_execution_started" -- 单个工具开始执行
 M.TOOL_EXECUTION_COMPLETED = "NeoAI:tool_execution_completed" -- 单个工具执行完成
 M.TOOL_EXECUTION_ERROR = "NeoAI:tool_execution_error" -- 单个工具执行出错
+M.TOOL_EXECUTION_SUBSTEP = "NeoAI:tool_execution_substep" -- 工具执行过程中的子步骤状态更新
 M.TOOL_CALL_DETECTED = "NeoAI:tool_call_detected" -- 检测到工具调用
 M.TOOL_RESULT_RECEIVED = "NeoAI:tool_result_received" -- 工具结果已接收
 M.TOOL_LOOP_STOP_REQUESTED = "NeoAI:tool_loop_stop_requested" -- 请求停止工具调用循环
