@@ -728,9 +728,14 @@ local function _list_files(args, on_success, on_error)
   if args.file and type(args.file) == "table" then
     table.insert(file_specs, args.file)
   end
-  -- 支持标准参数：直接传 dir/pattern/recursive 字符串
+  -- 支持标准参数：直接传 dir_path/pattern/recursive 字符串
   local used_simple = false
-  if args.dir and type(args.dir) == "string" then
+  if args.dir_path and type(args.dir_path) == "string" then
+    table.insert(file_specs, { dir = args.dir_path, pattern = args.pattern or "*", recursive = args.recursive or false })
+    used_simple = true
+  end
+  -- 支持简化参数：dir 为字符串 + pattern + recursive
+  if type(args.dir) == "string" then
     table.insert(file_specs, { dir = args.dir, pattern = args.pattern or "*", recursive = args.recursive or false })
     used_simple = true
   end
@@ -748,7 +753,7 @@ local function _list_files(args, on_success, on_error)
       if used_simple then
         local example = [[{
   dirs = {
-    { dir = "/path/to/dir", pattern = "*.lua", recursive = true }
+    { dir = "/path/to/dir", pattern = "*.ts", recursive = true }
   }
 }]]
         table.insert(all_files, 1, warn_simple_args("list_files", example))
@@ -794,15 +799,10 @@ M.list_files = define_tool({
         description = "目录参数列表（与 dir 二选一）",
       },
       dir = {
-        type = "object",
-        properties = {
-          dir = { type = "string", description = "目录路径", default = "." },
-          pattern = { type = "string", description = "文件模式（如 *.txt）", default = "*" },
-          recursive = { type = "boolean", description = "是否递归查找", default = false },
-        },
-        description = "单个目录参数（与 dirs 二选一）",
+        type = "string",
+        description = "（简化参数）目录路径，使用时会附带警告，推荐使用 dirs 参数",
       },
-      dir = { type = "string", description = "（简化参数）目录路径，使用时会附带警告" },
+      dir_path = { type = "string", description = "（简化参数）目录路径，使用时会附带警告" },
       pattern = {
         type = "string",
         description = "（简化参数）文件模式，需配合 dir 使用",
@@ -856,9 +856,10 @@ local function _search_files(args, on_success, on_error)
   end
   local all_results = {}
   local pending = #file_specs
+  local completed = 0
   local function check_done()
-    pending = pending - 1
-    if pending <= 0 then
+    completed = completed + 1
+    if completed >= pending then
       if used_simple then
         local example = [[{
   files = {
@@ -893,13 +894,14 @@ local function _search_files(args, on_success, on_error)
     if not search_pattern then
       check_done()
     else
-      local grep_args = { "-n" }
+      local grep_args = {}
       if not case_sensitive then
         table.insert(grep_args, "-i")
       end
       if not regex then
         table.insert(grep_args, "-F")
       end
+      table.insert(grep_args, "-n")
       table.insert(grep_args, "--")
       table.insert(grep_args, search_pattern)
       vim.uv.fs_scandir(dir, function(scandir_err, scandir_handle)
@@ -908,23 +910,31 @@ local function _search_files(args, on_success, on_error)
           return
         end
         local files_found = {}
+        local scandir_done = false
+        local grep_running = 0
+        local function finalize_spec()
+          if scandir_done and grep_running == 0 then
+            check_done()
+          end
+        end
         local function collect_files()
           vim.uv.fs_scandir_next(scandir_handle, function(next_err, name, entry_type)
             if next_err or not name then
-              local grep_pending = #files_found
-              if grep_pending == 0 then
-                check_done()
+              scandir_done = true
+              if #files_found == 0 then
+                finalize_spec()
                 return
               end
               for _, file in ipairs(files_found) do
-                local full_cmd_list = { "grep" }
-                for _, arg in ipairs(grep_args) do
-                  table.insert(full_cmd_list, arg)
-                end
-                table.insert(full_cmd_list, file)
+                grep_running = grep_running + 1
                 local stdout_data = {}
+                local cmd_args = {}
+                for _, arg in ipairs(grep_args) do
+                  table.insert(cmd_args, arg)
+                end
+                table.insert(cmd_args, file)
                 local handle = vim.uv.spawn("grep", {
-                  args = vim.list_slice(full_cmd_list, 2),
+                  args = cmd_args,
                   stdio = { nil, nil, nil },
                 }, function(code)
                   if code == 0 then
@@ -936,10 +946,8 @@ local function _search_files(args, on_success, on_error)
                       end
                     end
                   end
-                  grep_pending = grep_pending - 1
-                  if grep_pending <= 0 then
-                    check_done()
-                  end
+                  grep_running = grep_running - 1
+                  finalize_spec()
                 end)
                 if handle then
                   local stdout = vim.uv.new_pipe()
@@ -950,17 +958,20 @@ local function _search_files(args, on_success, on_error)
                     end
                   end)
                 else
-                  grep_pending = grep_pending - 1
-                  if grep_pending <= 0 then
-                    check_done()
-                  end
+                  grep_running = grep_running - 1
+                  finalize_spec()
                 end
               end
               return
             end
             if entry_type == "file" then
-              if file_pattern == "*" or name:match(vim.pesc(file_pattern):gsub("%%%*", ".*"):gsub("%%%?", ".")) then
+              if file_pattern == "*" then
                 table.insert(files_found, dir .. "/" .. name)
+              else
+                local pattern_lua = file_pattern:gsub("%%", "%%%%"):gsub("[", "."):gsub("?", "."):gsub("*", ".*")
+                if name:match("^" .. pattern_lua .. "$") then
+                  table.insert(files_found, dir .. "/" .. name)
+                end
               end
             end
             collect_files()

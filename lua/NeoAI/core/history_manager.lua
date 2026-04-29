@@ -701,8 +701,10 @@ function M.get_tree()
 end
 
 --- 获取选中会话的上下文路径
---- 从当前会话向子会话捋，遇到多个子会话则在此新开子会话
---- 遇到无子会话的则把这条线作为上文
+--- 从根会话沿唯一子会话链到选中节点，
+--- 再从选中节点沿唯一子会话链向下走到末端（child_ids.length != 1），
+--- 整条路径上的所有会话作为上文。
+--- 末端节点作为新会话的父节点。
 --- @param session_id string 当前选中的会话ID
 --- @return table 上下文消息列表, string|nil 新会话应该挂在哪个会话下
 function M.get_context_and_new_parent(session_id)
@@ -711,11 +713,11 @@ function M.get_context_and_new_parent(session_id)
     return {}, nil
   end
 
-  -- 从当前会话向上回溯到根，收集路径上的所有会话ID
-  local path_ids = {}
+  -- 第一步：从选中节点向上回溯到根，收集路径上的所有会话ID
+  local upward_ids = {}
   local current = session
   for _ = 1, 100 do
-    table.insert(path_ids, 1, current.id) -- 插入到开头，保持从根到当前顺序
+    table.insert(upward_ids, 1, current.id) -- 插入到开头，保持从根到当前顺序
     local parent_id = M.find_parent_session(current.id)
     if not parent_id then
       break -- 没有父节点，说明已到根
@@ -726,7 +728,34 @@ function M.get_context_and_new_parent(session_id)
     end
   end
 
-  -- 按从根到当前的顺序收集消息
+  -- 第二步：从选中节点沿唯一子会话链向下走到末端
+  -- 末端定义为 child_ids.length != 1（分支点有多个子会话，链尾无子会话）
+  local downward_ids = {}
+  current = session
+  for _ = 1, 100 do
+    local child_ids = current.child_ids or {}
+    if #child_ids ~= 1 then
+      -- 分支点（多个子会话）或链尾（无子会话），停止（当前节点就是末端）
+      break
+    end
+    -- 唯一子会话链，继续向下
+    current = state.sessions[child_ids[1]]
+    if not current then
+      break
+    end
+    table.insert(downward_ids, current.id)
+  end
+
+  -- 合并路径：从根到选中节点 + 从选中节点子会话到末端
+  local path_ids = {}
+  for _, pid in ipairs(upward_ids) do
+    table.insert(path_ids, pid)
+  end
+  for _, pid in ipairs(downward_ids) do
+    table.insert(path_ids, pid)
+  end
+
+  -- 按从根到末端的顺序收集消息
   local context_msgs = {}
   for _, pid in ipairs(path_ids) do
     local msgs = M.get_messages(pid)
@@ -735,12 +764,8 @@ function M.get_context_and_new_parent(session_id)
     end
   end
 
-  -- 确定新会话应该挂在哪个会话下
-  -- 规则：从选中会话沿子会话链向下走，找到链尾或分支点
-  -- - 如果选中会话有唯一子会话链，则沿链向下找到链尾作为 new_parent_id
-  -- - 如果选中会话有多个子会话（分支点），则选中会话本身作为分支点
-  -- - 如果选中会话无子会话（链尾），则选中会话本身作为 new_parent_id
-  local new_parent_id = M._find_chain_tail_or_branch(session_id)
+  -- 末端节点作为新会话的父节点
+  local new_parent_id = path_ids[#path_ids]
 
   return context_msgs, new_parent_id
 end

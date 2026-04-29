@@ -777,11 +777,8 @@ local function wait_for_lsp_attach_async(bufnr, callback, timeout_ms, expected_c
           return
         end
 
-        if not attached then
-          return
-        end
-
-        -- 客户端已 attach，检查 server_capabilities
+        -- 即使 LspAttach 事件已错过（attached 为 false），
+        -- 也应直接检查已 attach 的客户端，避免依赖事件驱动
         local attached_clients = vim.lsp.get_clients({ bufnr = bufnr })
         for _, c in ipairs(attached_clients) do
           if is_formal_lsp_client(c) and c.server_capabilities and client_has_required_capabilities(c) then
@@ -792,6 +789,11 @@ local function wait_for_lsp_attach_async(bufnr, callback, timeout_ms, expected_c
             end
             return
           end
+        end
+
+        -- 如果 LspAttach 事件尚未触发，继续等待
+        if not attached then
+          return
         end
       end)
     end)
@@ -835,6 +837,8 @@ local function try_start_lsp(config_name, bufnr)
   end
 
   -- 方式 2：vim.lsp.config 注册的配置（Neovim 0.12 内置）
+  -- 注意：vim.lsp.start(config_name) 在 Neovim 0.12 中可能返回 true, nil
+  -- （启动成功但 client_id 为 nil），此时仍应视为启动成功
   local configs_ok = pcall(function()
     if type(vim.lsp.config) == "table" then
       if vim.lsp.config.get then
@@ -848,8 +852,11 @@ local function try_start_lsp(config_name, bufnr)
   end)
   if configs_ok then
     local ok_id, client_id = pcall(vim.lsp.start, config_name)
-    if ok_id and client_id then
-      pcall(vim.lsp.buf_attach_client, bufnr, client_id)
+    if ok_id then
+      if client_id then
+        pcall(vim.lsp.buf_attach_client, bufnr, client_id)
+      end
+      -- vim.lsp.start 返回 true 即表示启动成功（即使 client_id 为 nil）
       return true
     end
   end
@@ -1270,6 +1277,25 @@ end
 --
 -- 并发安全：每个请求使用独立的 request_id 标识，避免多个同时请求的回调混淆
 -- 使用 vim.lsp.buf_request 返回的 request_id 来区分不同请求的回调
+--
+-- LSP 方法名到对应能力字段的映射
+-- 用于在发送请求前检查客户端是否支持该方法，避免不必要的超时等待
+local method_to_capability = {
+  ["textDocument/declaration"] = "declarationProvider",
+  ["textDocument/definition"] = "definitionProvider",
+  ["textDocument/typeDefinition"] = "typeDefinitionProvider",
+  ["textDocument/implementation"] = "implementationProvider",
+  ["textDocument/references"] = "referencesProvider",
+  ["textDocument/hover"] = "hoverProvider",
+  ["textDocument/documentSymbol"] = "documentSymbolProvider",
+  ["textDocument/formatting"] = "documentFormattingProvider",
+  ["textDocument/codeAction"] = "codeActionProvider",
+  ["textDocument/rename"] = "renameProvider",
+  ["textDocument/signatureHelp"] = "signatureHelpProvider",
+  ["textDocument/completion"] = "completionProvider",
+  ["workspace/symbol"] = "workspaceSymbolProvider",
+}
+
 local _request_counter = 0
 local _pending_requests = {} -- 存储挂起的请求：request_id -> { done, timer, responses, callback, defer_timer }
 
@@ -1279,6 +1305,89 @@ local function lsp_request_async(bufnr, method, params, callback)
       callback(nil, "无效的 LSP 请求参数")
     end
     return
+  end
+
+  -- 检查客户端是否支持该 LSP 方法
+  -- 如果不支持，立即返回错误，避免等待 15 秒超时
+  -- 如果客户端的 server_capabilities 为 nil（尚未初始化），
+  -- 则异步等待其初始化完成后再检查
+  local cap_field = method_to_capability[method]
+  if cap_field then
+    local clients = vim.lsp.get_clients({ bufnr = bufnr })
+
+    -- 检查是否有客户端尚未初始化（server_capabilities 为 nil）
+    local has_uninitialized = false
+    for _, client in ipairs(clients) do
+      if not client.server_capabilities then
+        has_uninitialized = true
+        break
+      end
+    end
+
+    -- 如果有未初始化的客户端，异步等待其初始化完成
+    -- 初始化完成后重新调用自身（递归），继续执行后续逻辑
+    if has_uninitialized then
+      local wait_timer = vim.uv.new_timer()
+      local elapsed = 0
+      local timer_closed = false
+
+      local function safe_close_timer()
+        if timer_closed then
+          return
+        end
+        timer_closed = true
+        if wait_timer then
+          pcall(wait_timer.stop, wait_timer)
+          pcall(wait_timer.close, wait_timer)
+        end
+      end
+
+      if wait_timer then
+        wait_timer:start(100, 100, function()
+          elapsed = elapsed + 100
+          vim.schedule(function()
+            if timer_closed then
+              return
+            end
+
+            -- 检查所有客户端是否都已初始化
+            local all_initialized = true
+            for _, client in ipairs(clients) do
+              if not client.server_capabilities then
+                all_initialized = false
+                break
+              end
+            end
+
+            if all_initialized or elapsed >= 5000 then
+              safe_close_timer()
+              -- 初始化完成（或超时），重新调用自身继续执行
+              -- 此时能力检查会基于已初始化的 capabilities 进行
+              lsp_request_async(bufnr, method, params, callback)
+            end
+          end)
+        end)
+      end
+      return
+    end
+
+    local any_supported = false
+    for _, client in ipairs(clients) do
+      local caps = client.server_capabilities
+      if caps then
+        local cap_value = caps[cap_field]
+        if cap_value == true or type(cap_value) == "table" then
+          any_supported = true
+          break
+        end
+      end
+    end
+    if not any_supported and #clients > 0 then
+      if callback then
+        callback(nil, string.format('LSP 方法 "%s" 不被任何已连接的服务器支持', method))
+      end
+      return
+    end
   end
 
   -- 生成唯一请求 ID

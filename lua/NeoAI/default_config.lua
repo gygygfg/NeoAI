@@ -218,6 +218,9 @@ local DEFAULT_CONFIG = {
       collapse = { key = "O", desc = "折叠节点" },
     },
     chat = {
+      insert = { key = "i", desc = "进入插入模式" },
+      quit = { key = "q", desc = "关闭聊天窗口" },
+      refresh = { key = "r", desc = "刷新聊天窗口" },
       send = {
         insert = { key = "<C-s>", desc = "发送消息" },
         normal = { key = "<CR>", desc = "发送消息" },

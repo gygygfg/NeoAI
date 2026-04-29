@@ -210,21 +210,42 @@ function M.register_session(session_id, window_id)
       if not s then return end
 
       -- 累积 usage
+      -- 注意：总结轮次（_summary_in_progress）时，_finalize_generation 中
+      -- generation.accumulated_usage 已包含历史累积 + 当前轮次 usage，
+      -- 直接赋值给 s.accumulated_usage 即可，避免重复累加
       if data.usage and next(data.usage) then
-        local acc = s.accumulated_usage or {}
-        acc.prompt_tokens = (acc.prompt_tokens or 0) + (data.usage.prompt_tokens or data.usage.input_tokens or 0)
-        acc.completion_tokens = (acc.completion_tokens or 0) + (data.usage.completion_tokens or data.usage.output_tokens or 0)
-        acc.total_tokens = (acc.total_tokens or 0) + (data.usage.total_tokens or 0)
-        if data.usage.completion_tokens_details and type(data.usage.completion_tokens_details) == "table" then
-          local rt = data.usage.completion_tokens_details.reasoning_tokens or 0
-          if not acc.completion_tokens_details then acc.completion_tokens_details = {} end
-          acc.completion_tokens_details.reasoning_tokens = (acc.completion_tokens_details.reasoning_tokens or 0) + rt
+        if s._summary_in_progress then
+          -- 总结轮次：_finalize_generation 中的 accumulated_usage 已包含完整历史
+          s.accumulated_usage = vim.deepcopy(data.usage)
+        else
+          -- 普通轮次：逐轮累加 usage
+          local acc = s.accumulated_usage or {}
+          acc.prompt_tokens = (acc.prompt_tokens or 0) + (data.usage.prompt_tokens or data.usage.input_tokens or 0)
+          acc.completion_tokens = (acc.completion_tokens or 0) + (data.usage.completion_tokens or data.usage.output_tokens or 0)
+          acc.total_tokens = (acc.total_tokens or 0) + (data.usage.total_tokens or 0)
+          if data.usage.completion_tokens_details and type(data.usage.completion_tokens_details) == "table" then
+            local rt = data.usage.completion_tokens_details.reasoning_tokens or 0
+            if not acc.completion_tokens_details then acc.completion_tokens_details = {} end
+            acc.completion_tokens_details.reasoning_tokens = (acc.completion_tokens_details.reasoning_tokens or 0) + rt
+          end
+          s.accumulated_usage = acc
         end
-        s.accumulated_usage = acc
       end
       if data.reasoning_text and data.reasoning_text ~= "" then
         s.last_reasoning = data.reasoning_text
       end
+
+      -- 总结轮次完成：清理状态，不再触发 GENERATION_COMPLETED 事件
+      -- _finalize_generation 已触发 GENERATION_COMPLETED 事件，chat_window 已处理
+      if s._summary_in_progress then
+        s._summary_in_progress = false
+        s.phase = "idle"
+        s.active_tool_calls = {}
+        s.current_iteration = 0
+        s.generation_id = nil
+        return
+      end
+
       M._check_round_complete(session_id)
     end,
   }))
@@ -488,6 +509,11 @@ function M._on_tools_complete(session_id)
     force_ui_refresh()
     fire_loop_finished(ss)
     once_display_closed(session_id, function()
+      local s = state.sessions[session_id]
+      if not s or s.stop_requested then
+        logger.debug("[tool_orchestrator] _on_tools_complete: once_display_closed 回调中检测到 stop_requested，跳过 _request_generation")
+        return
+      end
       M._request_generation(session_id)
     end)
   elseif ss.phase == "round_complete" then
@@ -568,6 +594,30 @@ function M._request_summary_round(session_id)
   local ss = state.sessions[session_id]
   if not ss then return end
   if ss._summary_in_progress then return end
+  -- 如果已请求停止，直接通知 UI 生成完成（不发起新的 AI 请求）
+  if ss.stop_requested then
+    logger.debug("[tool_orchestrator] _request_summary_round: 已请求停止，直接通知完成")
+    ss.phase = "idle"
+    ss._summary_in_progress = false
+    -- 触发 GENERATION_COMPLETED 事件，让 UI 知道生成已结束
+    local saved_gen_id = ss.generation_id
+    local saved_window_id = ss.window_id
+    vim.schedule(function()
+      pcall(vim.api.nvim_exec_autocmds, "User", {
+        pattern = event_constants.GENERATION_COMPLETED,
+        data = {
+          generation_id = saved_gen_id,
+          response = "",
+          reasoning_text = ss.last_reasoning or "",
+          usage = ss.accumulated_usage or {},
+          session_id = session_id,
+          window_id = saved_window_id,
+          duration = 0,
+        },
+      })
+    end)
+    return
+  end
   ss._summary_in_progress = true
 
   -- 复制 messages 并添加系统提示
@@ -594,6 +644,11 @@ function M._request_summary_round(session_id)
   once_display_closed(session_id, function()
     local s = state.sessions[session_id]
     if not s then return end
+    -- 再次检查 stop_requested，防止在 once_display_closed 延迟执行期间停止信号已到达
+    if s.stop_requested then
+      logger.debug("[tool_orchestrator] _request_summary_round: once_display_closed 回调中检测到 stop_requested，跳过")
+      return
+    end
     vim.api.nvim_exec_autocmds("User", {
       pattern = event_constants.TOOL_RESULT_RECEIVED,
       data = {
@@ -651,6 +706,11 @@ function M.on_generation_complete(data)
   once_display_closed(session_id, function()
     local s = state.sessions[session_id]
     if not s then return end
+    -- 检查 stop_requested，防止在延迟执行期间停止信号已到达
+    if s.stop_requested then
+      logger.debug("[tool_orchestrator] on_generation_complete: once_display_closed 回调中检测到 stop_requested，跳过工具执行")
+      return
+    end
     -- TOOL_LOOP_STARTED 事件由 _execute_tools 内部触发（携带工具包分组信息）
     M._execute_tools(session_id, tool_calls)
   end)
@@ -693,7 +753,38 @@ function M._finish_loop(session_id, success, result)
     _stop_listener_id = nil
   end
 
-  if ss.on_complete == nil then return end
+  -- 第二次调用 _finish_loop（总结轮次完成时）：触发 GENERATION_COMPLETED 事件
+  -- 让 UI 更新用量提示和最终响应
+  if ss.on_complete == nil then
+    -- 保存当前数据用于事件
+    local saved_gen_id = ss.generation_id
+    local saved_win_id = ss.window_id
+    local saved_usage = ss.accumulated_usage or {}
+    local saved_reasoning = ss.last_reasoning or ""
+    local saved_result = result or ""
+
+    ss.phase = "idle"
+    ss.active_tool_calls = {}
+    ss.current_iteration = 0
+    ss.generation_id = nil
+
+    -- 触发 GENERATION_COMPLETED 事件，通知 UI 更新用量提示
+    vim.schedule(function()
+      pcall(vim.api.nvim_exec_autocmds, "User", {
+        pattern = event_constants.GENERATION_COMPLETED,
+        data = {
+          generation_id = saved_gen_id,
+          response = saved_result,
+          reasoning_text = saved_reasoning,
+          usage = saved_usage,
+          session_id = session_id,
+          window_id = saved_win_id,
+          duration = 0,
+        },
+      })
+    end)
+    return
+  end
 
   -- 保存回调，稍后使用
   local on_complete = ss.on_complete
@@ -711,6 +802,29 @@ function M._finish_loop(session_id, success, result)
   ss.phase = "idle"
   ss.active_tool_calls = {}
   ss.current_iteration = 0
+
+  -- 如果已请求停止，跳过总结轮次，直接触发完成事件
+  if ss.stop_requested then
+    logger.debug("[tool_orchestrator] _finish_loop: 已请求停止，直接触发完成事件")
+    ss._summary_in_progress = false
+    ss.generation_id = nil
+    -- 触发 GENERATION_COMPLETED 事件，让 UI 知道生成已结束
+    vim.schedule(function()
+      pcall(vim.api.nvim_exec_autocmds, "User", {
+        pattern = event_constants.GENERATION_COMPLETED,
+        data = {
+          generation_id = saved_generation_id,
+          response = result or "",
+          reasoning_text = saved_reasoning,
+          usage = saved_usage,
+          session_id = session_id,
+          window_id = saved_window_id,
+          duration = 0,
+        },
+      })
+    end)
+    return
+  end
 
   -- 先关闭工具显示（fire_loop_finished 由 _request_summary_round 内部触发）
   -- 触发总结轮次，让 AI 根据工具结果生成最终回复

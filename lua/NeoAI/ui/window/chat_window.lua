@@ -316,8 +316,8 @@ function M.open(session_id, window_id, branch_id)
     -- 启用折叠标记，使用 {{{ 和 }}} 作为折叠标记
     vim.api.nvim_set_option_value("foldmethod", "marker", { win = win_handle })
     vim.api.nvim_set_option_value("foldmarker", "{{{,}}}", { win = win_handle })
-    -- 默认展开所有折叠
-    vim.api.nvim_set_option_value("foldlevel", 99, { win = win_handle })
+    -- 默认折叠所有折叠（新插入的 {{{...}}} 自动折叠）
+    vim.api.nvim_set_option_value("foldlevel", 0, { win = win_handle })
     -- 设置缓冲区名称，便于识别
     vim.api.nvim_buf_set_name(buf, "neoai://chat/" .. session_id)
     -- 阻止 LSP 附加到聊天缓冲区
@@ -435,7 +435,9 @@ function M._render_single_message(msg, prev_role)
   if msg.role == "assistant" and raw_content:find("^{{{") then
     -- 折叠文本：直接显示，不加 AI 标记
     -- 按行分割，每行作为独立元素
-    for _, line in ipairs(vim.split(raw_content, "\n")) do
+    -- 先清理 \r 字符，确保换行符统一
+    local clean_content = raw_content:gsub("\r\n", "\n"):gsub("\r", "")
+    for _, line in ipairs(vim.split(clean_content, "\n")) do
       table.insert(lines, line)
     end
     table.insert(lines, "")
@@ -557,16 +559,15 @@ function M._do_render_chat()
         end
 
         -- 设置窗口内容（window_manager.set_window_content 内部会设置 foldlevel=0）
-        window_manager.set_window_content(state.current_window_id, content)
-
-        -- 重新设置 foldlevel=99（展开所有折叠），然后执行 zMzx 刷新折叠
-        -- window_manager.set_window_content 中设置了 foldlevel=0，我们需要覆盖它
+        -- 先保存当前的 foldlevel，设置内容后恢复，避免重置用户已调整的折叠状态
         local fold_win = window_manager.get_window_win(state.current_window_id)
+        local saved_foldlevel = nil
         if fold_win and vim.api.nvim_win_is_valid(fold_win) then
-          vim.api.nvim_set_option_value("foldlevel", 99, { win = fold_win })
-          pcall(vim.api.nvim_win_call, fold_win, function()
-            vim.cmd("normal! zMzx")
-          end)
+          saved_foldlevel = vim.api.nvim_get_option_value("foldlevel", { win = fold_win })
+        end
+        window_manager.set_window_content(state.current_window_id, content)
+        if fold_win and vim.api.nvim_win_is_valid(fold_win) and saved_foldlevel ~= nil then
+          vim.api.nvim_set_option_value("foldlevel", saved_foldlevel, { win = fold_win })
         end
 
         -- 自动获取焦点（如果虚拟输入框已激活，跳过，避免抢走输入框焦点）
@@ -589,10 +590,8 @@ function M._do_render_chat()
           end
 
           if cursor_near_end then
-            local last_line_content = vim.api.nvim_buf_get_lines(buf, new_line_count - 1, new_line_count, false)[1]
-              or ""
-            local last_col = #last_line_content
-            pcall(vim.api.nvim_win_set_cursor, win, { new_line_count, last_col })
+            local last_line_content = vim.api.nvim_buf_get_lines(buf, new_line_count - 1, new_line_count, false)[1] or ""
+            pcall(vim.api.nvim_win_set_cursor, win, { new_line_count, #last_line_content })
             if not state.streaming.active then
               M._open_float_input()
             end
@@ -717,7 +716,6 @@ function M.set_keymaps()
     insert = (chat_config.insert or {}).key or "i",
     quit = (chat_config.quit or {}).key or "q",
     refresh = (chat_config.refresh or {}).key or "r",
-    send = (chat_config.send or {}).normal and chat_config.send.normal.key or (chat_config.send or {}).key or "<CR>",
     switch_model = (chat_config.switch_model or {}).key or "m",
     cancel = (chat_config.cancel or {}).key or "<Esc>",
   }
@@ -735,30 +733,6 @@ function M.set_keymaps()
 
   local function refresh_chat_window()
     M.refresh_chat()
-  end
-
-  local function send_message()
-    if not state.current_window_id then
-      print("⚠️  聊天窗口未打开")
-      return
-    end
-
-    local chat_buf = window_manager.get_window_buf(state.current_window_id)
-    if not chat_buf then
-      print("⚠️  无法获取聊天窗口缓冲区")
-      return
-    end
-
-    -- 获取缓冲区最后一行内容
-    local lines = vim.api.nvim_buf_get_lines(chat_buf, 0, -1, false)
-    local last_line = lines[#lines] or ""
-
-    -- 如果最后一行不是空行，发送消息
-    if vim.trim(last_line) ~= "" then
-      M.send_message(last_line)
-    else
-      print("⚠️  消息内容不能为空")
-    end
   end
 
   local function exit_insert_mode()
@@ -785,8 +759,6 @@ function M.set_keymaps()
       callback = close_window
     elseif key == "refresh" then
       callback = refresh_chat_window
-    elseif key == "send" then
-      callback = send_message
     elseif key == "switch_model" then
       callback = switch_model
     elseif key == "cancel" then
@@ -2239,12 +2211,39 @@ function M._setup_event_listeners()
               local pack_icon = tool_pack.get_pack_icon(pn)
               local pack_name = tool_pack.get_pack_display_name(pn)
               for _, r in ipairs(pack_tools) do
-                local icon = r.is_error and "❌" or "✅"
                 local duration_str = r.duration and string.format(" (%.1fs)", r.duration) or ""
                 local args_str = vim.inspect(r.arguments or {})
+                -- 转义内容中的 {{{ 和 }}}，避免干扰 foldmethod=marker
+                args_str = args_str:gsub("}}}", "} } }"):gsub("{{{", "{ { {")
                 local result_str = type(r.result) == "table"
                     and (pcall(vim.json.encode, r.result) and vim.json.encode(r.result) or vim.inspect(r.result))
                   or tostring(r.result or "")
+                -- 清理 \r 字符，确保换行符统一
+                result_str = result_str:gsub("\r\n", "\n"):gsub("\r", "")
+                -- 当结果中包含 ⚠️ 警告：行时，折叠文本只保留警告信息，过滤掉正常结果
+                local lines = {}
+                for line in result_str:gmatch("[^\n]+") do
+                  table.insert(lines, line)
+                end
+                local has_warning = false
+                for _, line in ipairs(lines) do
+                  if line:match("^⚠️%s*警告：") then
+                    has_warning = true
+                    break
+                  end
+                end
+                local icon = r.is_error and "❌" or (has_warning and "⚠️" or "✅")
+                if has_warning then
+                  local warning_lines = {}
+                  for _, line in ipairs(lines) do
+                    if line:match("^⚠️%s*警告：") or line:match("^虽然操作已执行") or line:match("^正确调用示例") then
+                      table.insert(warning_lines, line)
+                    end
+                  end
+                  result_str = table.concat(warning_lines, "\n")
+                end
+                -- 转义内容中的 {{{ 和 }}}，避免干扰 foldmethod=marker
+                result_str = result_str:gsub("}}}", "} } }"):gsub("{{{", "{ { {")
                 result_str = result_str:gsub("\n", "\n    ")
                 local block = "{{{ " .. pack_icon .. " " .. pack_name .. " - " .. icon .. " " .. (r.tool_name or "unknown") .. duration_str
                     .. "\n    参数: " .. args_str
@@ -2264,17 +2263,47 @@ function M._setup_event_listeners()
           local buf = get_buf()
           if buf_valid(buf) then
             set_buf_modifiable(buf, true)
-            local lc = get_line_count(buf)
+            -- 在插入折叠文本前保存光标位置和总行数，用于判断光标是否在末尾附近
+            local win = get_win()
+            local cursor_before = win_valid(win) and vim.api.nvim_win_get_cursor(win) or nil
+            local lc_before = get_line_count(buf)
+
+            local lc = lc_before
             local lines = vim.split(folded_text, "\n")
             table.insert(lines, "")
             vim.api.nvim_buf_set_lines(buf, lc, lc, false, lines)
             vim.api.nvim_set_option_value("modified", false, { buf = buf })
-            -- 强制将光标移动到缓冲区末尾（自动滚动视图到底部）
+            -- 光标在后5行才跟随：延迟一帧等待 foldmethod=marker 渲染完成
             local new_lc = get_line_count(buf)
-            local win = get_win()
-            if win_valid(win) then
-              local last_line = get_last_line(buf)
-              pcall(vim.api.nvim_win_set_cursor, win, { new_lc, #last_line })
+            if win_valid(win) and cursor_before then
+              -- 用插入前的数据判断光标是否在末尾附近（避免折叠文本行数多导致误判）
+              if lc_before - cursor_before[1] <= 5 then
+                vim.defer_fn(function()
+                  if not win_valid(win) or not buf_valid(buf) then
+                    return
+                  end
+                  local current_lc = get_line_count(buf)
+                  -- 找到折叠文本结束位置：从末尾向上找第一个 }}} 行，光标跳到它的下一行
+                  local fold_end_line = current_lc
+                  for i = current_lc, 1, -1 do
+                    local line_content = vim.api.nvim_buf_get_lines(buf, i - 1, i, false)[1] or ""
+                    if line_content:match("^}}}") then
+                      fold_end_line = i + 1
+                      break
+                    end
+                  end
+                  if fold_end_line > current_lc then fold_end_line = current_lc end
+                  local target_line = vim.api.nvim_buf_get_lines(buf, fold_end_line - 1, fold_end_line, false)[1] or ""
+                  pcall(vim.api.nvim_win_set_cursor, win, { fold_end_line, #target_line })
+                  -- 滚动窗口使光标行位于窗口底部
+                  pcall(vim.api.nvim_win_call, win, function()
+                    local win_height = vim.api.nvim_win_get_height(win)
+                    local view = vim.fn.winsaveview()
+                    view.topline = math.max(1, fold_end_line - win_height + 1)
+                    vim.fn.winrestview(view)
+                  end)
+                end, 50)
+              end
             end
           end
         end
@@ -2330,7 +2359,8 @@ function M._setup_event_listeners()
         local window_info = window_manager.get_window_info(state.tool_display.window_id)
         if window_info and window_info.win and vim.api.nvim_win_is_valid(window_info.win) then
           local lines = vim.split(state.tool_display.buffer or "", "\n")
-          local dynamic_height = math.max(5, math.min(#lines + 2, 20))
+          local max_tool_height = math.max(5, math.floor(vim.o.lines / 2))
+          local dynamic_height = math.max(5, math.min(#lines + 2, max_tool_height))
           local config = vim.api.nvim_win_get_config(window_info.win)
           config.height = dynamic_height
           local tool_row = 1
@@ -2616,9 +2646,10 @@ function M._show_tool_display()
     M._close_tool_display()
   end
 
-  -- 根据内容动态计算窗口高度
+  -- 根据内容动态计算窗口高度（最大为窗口高度的一半）
   local content_lines = vim.split(state.tool_display.buffer or "", "\n")
-  local dynamic_height = math.max(5, math.min(#content_lines + 2, 20)) -- 最小5行，最大20行
+  local max_tool_height = math.max(5, math.floor(vim.o.lines / 2))
+  local dynamic_height = math.max(5, math.min(#content_lines + 2, max_tool_height))
 
   -- 计算窗口位置：如果 reasoning_display 可见，在它下方堆叠
   local tool_row = 1
@@ -2708,7 +2739,8 @@ function M._update_tool_display()
   -- 动态调整窗口高度
   local win = window_info.win
   if win and vim.api.nvim_win_is_valid(win) then
-    local dynamic_height = math.max(5, math.min(#lines + 2, 20))
+    local max_tool_height = math.max(5, math.floor(vim.o.lines / 2))
+    local dynamic_height = math.max(5, math.min(#lines + 2, max_tool_height))
     local config = vim.api.nvim_win_get_config(win)
     config.height = dynamic_height
     -- 重新计算 row：在 reasoning 窗口下方堆叠
@@ -2781,11 +2813,12 @@ function M._build_tool_folded_text(results, reasoning_text)
     local pack_icon = tool_pack.get_pack_icon(pn)
     local pack_name = tool_pack.get_pack_display_name(pn)
     for _, r in ipairs(pack_tools) do
-      local icon = r.is_error and "❌" or "✅"
       local duration_str = r.duration and string.format(" (%.1fs)", r.duration) or ""
       -- 将参数格式化为单行（压缩换行和缩进为空格）
       local args_str = vim.inspect(r.arguments or {})
       args_str = args_str:gsub("\n[ \t]*", " ")
+      -- 转义内容中的 {{{ 和 }}}，避免干扰 foldmethod=marker
+      args_str = args_str:gsub("}}}", "} } }"):gsub("{{{", "{ { {")
       local result_raw = r.result
       local result_str = ""
       if type(result_raw) == "table" then
@@ -2798,6 +2831,19 @@ function M._build_tool_folded_text(results, reasoning_text)
       else
         result_str = tostring(result_raw or "")
       end
+      -- 清理 result_str 中的 \r 字符，确保换行符统一
+      result_str = result_str:gsub("\r\n", "\n"):gsub("\r", "")
+      -- 检查结果中是否包含警告
+      local has_warning = false
+      for line in result_str:gmatch("[^\n]+") do
+        if line:match("^⚠️%s*警告：") then
+          has_warning = true
+          break
+        end
+      end
+      local icon = r.is_error and "❌" or (has_warning and "⚠️" or "✅")
+      -- 转义内容中的 {{{ 和 }}}，避免干扰 foldmethod=marker
+      result_str = result_str:gsub("}}}", "} } }"):gsub("{{{", "{ { {")
       result_str = result_str:gsub("\n", "\n    ")
 
       local block = "{{{ " .. pack_icon .. " " .. pack_name .. " - " .. icon .. " " .. (r.tool_name or "unknown") .. duration_str

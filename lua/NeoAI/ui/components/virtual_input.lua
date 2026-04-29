@@ -467,6 +467,25 @@ function M._setup_float_keymaps()
     M._submit_float()
   end, { buffer = buf, noremap = true, silent = true, desc = "发送消息" })
 
+  -- 换行（Shift+Enter）：在当前光标位置插入新行
+  vim.keymap.set("i", "<S-CR>", function()
+    if not state.float_buf or not vim.api.nvim_buf_is_valid(state.float_buf) then return end
+    local win = vim.api.nvim_get_current_win()
+    local cursor = vim.api.nvim_win_get_cursor(win)
+    local lnum = cursor[1]  -- 1-based
+    local col = cursor[2]   -- 0-based
+    local lines = vim.api.nvim_buf_get_lines(state.float_buf, 0, -1, false)
+    local current_line = lines[lnum] or ""
+    -- 将当前行在光标处拆分为两行
+    local before = current_line:sub(1, col)
+    local after = current_line:sub(col + 1)
+    lines[lnum] = before
+    table.insert(lines, lnum + 1, after)
+    vim.api.nvim_buf_set_lines(state.float_buf, 0, -1, false, lines)
+    -- 光标移到新行的行首
+    vim.api.nvim_win_set_cursor(win, { lnum + 1, 0 })
+  end, { buffer = buf, noremap = true, silent = true, desc = "换行" })
+
   vim.keymap.set("n", "<CR>", function()
     M._submit_float()
   end, { buffer = buf, noremap = true, silent = true, desc = "发送消息" })

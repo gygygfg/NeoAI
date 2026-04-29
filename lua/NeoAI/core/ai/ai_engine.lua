@@ -1292,6 +1292,13 @@ function M.handle_tool_result(data)
   local accumulated_usage = data.accumulated_usage or {}
   local last_reasoning = data.last_reasoning
 
+  -- 检查工具编排器是否已请求停止
+  local tool_orc = require("NeoAI.core.ai.tool_orchestrator")
+  if tool_orc.is_stop_requested(session_id) then
+    logger.debug("[ai_engine] handle_tool_result: 工具编排器已请求停止，跳过新一轮生成 (session=" .. tostring(session_id) .. ")")
+    return
+  end
+
   logger.debug(
     "[ai_engine] handle_tool_result: 会话="
       .. tostring(session_id)

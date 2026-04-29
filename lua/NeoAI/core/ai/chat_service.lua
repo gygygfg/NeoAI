@@ -55,20 +55,16 @@ function M._setup_event_listeners()
       logger.warn("[chat_service] 生成错误: session=" .. tostring(data.session_id) .. ", error=" .. tostring(data.error_msg))
     end,
   })
-  -- 监听取消生成事件，确保停止传播到所有子模块
+  -- 监听取消生成事件，仅用于日志记录
+  -- 实际的停止逻辑由 chat_service.cancel_generation() 统一处理
+  -- 避免在此处重复调用 ai_engine.cancel_generation() 和 tool_orc.request_stop()
+  -- 否则会导致停止逻辑执行两次，且顺序不可控
   vim.api.nvim_create_autocmd("User", {
     pattern = event_constants.CANCEL_GENERATION,
     callback = function(args)
       local data = args.data or {}
       local session_id = data.session_id
       logger.debug("[chat_service] 收到取消生成事件: session=" .. tostring(session_id))
-      -- 确保 AI 引擎和工具编排器都收到停止信号
-      ai_engine.cancel_generation()
-      -- 通知工具编排器停止所有工具调用
-      local ok, tool_orc = pcall(require, "NeoAI.core.ai.tool_orchestrator")
-      if ok and tool_orc then
-        tool_orc.request_stop(session_id)
-      end
     end,
   })
 end
@@ -134,8 +130,10 @@ function M.get_raw_messages(session_id)
   local session = hm.get_session(session_id)
   if not session then return {} end
 
-  -- 从当前会话向上回溯到根，收集路径上的所有会话ID
+  -- 从根到选中节点沿唯一子会话链向上回溯，再从选中节点沿唯一子会话链向下走到末端
+  -- 与 get_context_and_new_parent 保持一致，确保聊天窗口显示的消息与 AI 上下文一致
   local path_ids = {}
+  -- 第一步：从选中节点向上回溯到根
   local current = session
   for _ = 1, 100 do
     table.insert(path_ids, 1, current.id)
@@ -143,6 +141,15 @@ function M.get_raw_messages(session_id)
     if not parent_id then break end
     current = hm.get_session(parent_id)
     if not current then break end
+  end
+  -- 第二步：从选中节点沿唯一子会话链向下走到末端
+  current = session
+  for _ = 1, 100 do
+    local child_ids = current.child_ids or {}
+    if #child_ids ~= 1 then break end
+    current = hm.get_session(child_ids[1])
+    if not current then break end
+    table.insert(path_ids, current.id)
   end
 
   -- 按从根到当前的顺序收集消息
@@ -314,18 +321,25 @@ function M.cancel_generation()
   -- 从 history_manager 获取当前 session_id
   local current_session = history_manager.get_current_session()
   local session_id = current_session and current_session.id or nil
-  -- 先触发取消事件，让所有监听器（包括 chat_service 自身的）都能响应
-  vim.api.nvim_exec_autocmds("User", {
-    pattern = event_constants.CANCEL_GENERATION,
-    data = { session_id = session_id },
-  })
-  -- 再直接调用 ai_engine 取消
-  ai_engine.cancel_generation()
-  -- 通知工具编排器停止所有工具调用
+
+  -- 先通知工具编排器停止（设置 stop_requested 标志，阻止后续工具执行和新一轮生成）
   local ok, tool_orc = pcall(require, "NeoAI.core.ai.tool_orchestrator")
   if ok and tool_orc then
     tool_orc.request_stop(session_id)
   end
+
+  -- 再直接调用 ai_engine 取消（会取消 HTTP 请求并触发事件）
+  -- 注意：ai_engine.cancel_generation() 内部也会调用 tool_orchestrator.request_stop()
+  -- 但由于 request_stop 是幂等的（多次调用只设置一次 stop_requested），这是安全的
+  ai_engine.cancel_generation()
+
+  -- 最后触发取消事件，让 UI 监听器更新界面状态
+  -- 注意：CANCEL_GENERATION 事件的监听器中不应再调用 tool_orc.request_stop 或 ai_engine.cancel_generation
+  -- 否则会导致重复执行
+  vim.api.nvim_exec_autocmds("User", {
+    pattern = event_constants.CANCEL_GENERATION,
+    data = { session_id = session_id },
+  })
 end
 
 function M.get_engine_status()

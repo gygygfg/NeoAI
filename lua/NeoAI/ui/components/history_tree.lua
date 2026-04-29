@@ -82,6 +82,33 @@ function M.build_flat_items()
       return
     end
 
+    -- 跳过既没有 user 内容也没有 assistant 内容的空会话
+    -- 这些是 send_message 中创建但 AI 回复尚未完成的中间状态会话
+    local has_user_content = session.user and session.user ~= ""
+    local has_assistant_content = false
+    if session.assistant and type(session.assistant) == "table" and #session.assistant > 0 then
+      has_assistant_content = true
+    elseif session.assistant and type(session.assistant) == "string" and session.assistant ~= "" then
+      has_assistant_content = true
+    end
+    if not has_user_content and not has_assistant_content then
+      -- 空会话：不渲染自身，但递归处理子会话（如果有的话）
+      local child_ids = session.child_ids or {}
+      if #child_ids > 0 then
+        local child_ancestor_is_last = {}
+        if ancestor_is_last then
+          for i = 1, #ancestor_is_last do
+            child_ancestor_is_last[i] = ancestor_is_last[i]
+          end
+        end
+        child_ancestor_is_last[depth + 1] = (sibling_index == sibling_count)
+        for i, cid in ipairs(child_ids) do
+          dfs(cid, parent_indent, depth, i, #child_ids, child_ancestor_is_last)
+        end
+      end
+      return
+    end
+
     -- 缩进级别：父缩进 + 兄弟数 - 当前索引
     -- 单链时（sibling_count=1），子节点缩进 = 父缩进（同级别）
     -- 分支时，子节点缩进递增
@@ -125,7 +152,15 @@ function M.build_flat_items()
     end
 
     -- 判断节点类型
-    local has_content = session.user and session.user ~= ""
+    -- has_content: user 有内容，或 assistant 中有工具调用/回复内容
+    local has_user_content = session.user and session.user ~= ""
+    local has_assistant_content = false
+    if session.assistant and type(session.assistant) == "table" and #session.assistant > 0 then
+      has_assistant_content = true
+    elseif session.assistant and type(session.assistant) == "string" and session.assistant ~= "" then
+      has_assistant_content = true
+    end
+    local has_content = has_user_content or has_assistant_content
     local is_branch = has_children and not has_content
     local is_multi_child = #(session.child_ids or {}) >= 2
     local display_type = is_branch and "branch" or "leaf"
