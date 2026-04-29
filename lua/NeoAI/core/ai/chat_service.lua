@@ -175,8 +175,18 @@ function M.get_raw_messages(session_id)
           -- 尝试解析 JSON（含 reasoning_content 的 assistant 消息）
           local ok, parsed = pcall(vim.json.decode, entry)
           if ok and type(parsed) == "table" and parsed.type == "tool_call" then
-            -- 兼容旧格式：tool_call 以 JSON 字符串存储，直接跳过（已由新格式替代）
-            -- do nothing
+            -- 兼容旧格式：tool_call 以 JSON 字符串存储，构建折叠文本
+            local tool_name = parsed.tool_name or "unknown"
+            local args_str = vim.inspect(parsed.arguments or {})
+            if #args_str > 200 then args_str = args_str:sub(1, 200) .. "..." end
+            local result_str = tostring(parsed.result or "")
+            if #result_str > 300 then result_str = result_str:sub(1, 300) .. "\n... [truncated]" end
+            local folded_text = "{{{ 🔧 工具调用"
+              .. "\n  🔧 " .. tool_name
+              .. "\n    参数: " .. args_str
+              .. "\n    结果: " .. result_str
+              .. "\n}}}"
+            table.insert(messages, { role = "assistant", content = folded_text })
           elseif ok and type(parsed) == "table" then
             local has_content = parsed.content and parsed.content ~= ""
             local has_reasoning = parsed.reasoning_content and parsed.reasoning_content ~= ""
@@ -190,8 +200,18 @@ function M.get_raw_messages(session_id)
       elseif type(entry) == "table" then
         -- 原生 table 格式（新版存储格式）
         if entry.type == "tool_call" then
-          -- 兼容旧格式：原生 table 的 tool_call，跳过（已由折叠文本替代）
-          -- do nothing
+          -- 工具调用条目：构建可读文本，包含工具名称、参数和结果
+          local tool_name = entry.tool_name or "unknown"
+          local args_str = vim.inspect(entry.arguments or {})
+          if #args_str > 200 then args_str = args_str:sub(1, 200) .. "..." end
+          local result_str = type(entry.result) == "string" and entry.result or (pcall(vim.json.encode, entry.result) and vim.json.encode(entry.result) or tostring(entry.result or ""))
+          if #result_str > 300 then result_str = result_str:sub(1, 300) .. "\n... [truncated]" end
+          local folded_text = "{{{ 🔧 工具调用"
+            .. "\n  🔧 " .. tool_name
+            .. "\n    参数: " .. args_str
+            .. "\n    结果: " .. result_str
+            .. "\n}}}"
+          table.insert(messages, { role = "assistant", content = folded_text })
         elseif entry.content and entry.content ~= "" then
           if entry.reasoning_content and entry.reasoning_content ~= "" then
             local ok_json, json_str = pcall(vim.json.encode, entry)

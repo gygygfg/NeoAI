@@ -1783,7 +1783,19 @@ function M._setup_event_listeners()
       end
 
       -- 将最终内容保存到 history_manager（确保包含折叠文本的完整内容被持久化）
-      M._save_final_content_to_history(data)
+      -- 通过 HISTORY_SAVE_FINAL 事件通知 history_saver 异步保存
+      local final_entry = M._save_final_content_to_history(data)
+      if final_entry then
+        vim.api.nvim_exec_autocmds("User", {
+          pattern = "NeoAI:history_save_final",
+          data = {
+            session_id = data.session_id,
+            content = final_entry.content,
+            reasoning_content = final_entry.reasoning_content,
+            usage = data.usage or {},
+          },
+        })
+      end
 
       -- 清理状态
       state.tool_display.folded_saved = false
@@ -3185,18 +3197,14 @@ end
 
 --- 将最终回复内容保存到 history_manager
 --- 在 GENERATION_COMPLETED 回调中调用
---- 工具结果已在 _add_tool_result_to_messages 中实时持久化到 assistant 数组
---- 此处只追加最终 AI 回复（含折叠文本），不覆盖已有的工具调用条目
+--- 由 history_saver 模块通过事件监听统一处理（队列异步写入，保证原子性）
+--- 此函数仅负责构建最终内容字符串，不再直接调用 add_assistant_entry
 --- @param data table GENERATION_COMPLETED 事件数据
+--- @return string|nil 构建的最终内容（供 saver 使用），nil 表示无需保存
 function M._save_final_content_to_history(data)
   local session_id = data.session_id
   if not session_id then
-    return
-  end
-
-  local hm_ok, hm = pcall(require, "NeoAI.core.history_manager")
-  if not hm_ok or not hm.is_initialized() then
-    return
+    return nil
   end
 
   -- 获取最终回复内容（优先使用 state.messages 中的折叠文本）
@@ -3216,33 +3224,36 @@ function M._save_final_content_to_history(data)
   local has_tool_results = state.tool_display.active and #state.tool_display.results > 0
   local folded_saved = state.tool_display.folded_saved
 
+  -- 构建最终内容：优先从 state.messages 中获取已合并的完整内容（含折叠文本+AI回复）
   local final_content = response_content
   if has_tool_results or folded_saved then
-    local folded = M.get_last_assistant_content()
-    if folded and folded ~= "" then
-      final_content = folded
+    local last_assistant_content = M.get_last_assistant_content()
+    if last_assistant_content and last_assistant_content ~= "" then
+      -- 如果最后一条 assistant 内容以折叠文本开头，说明是工具调用折叠文本
+      -- 需要将 AI 回复合并到折叠文本后面
+      if last_assistant_content:match("^{{{") then
+        final_content = last_assistant_content .. "\n\n" .. response_content
+      else
+        final_content = last_assistant_content
+      end
+    elseif has_tool_results then
+      -- 如果 state.messages 中没有 assistant 消息，从 tool_display 构建折叠文本
+      local folded = M._build_tool_folded_text(state.tool_display.results, reasoning_text)
+      if folded ~= "" then
+        final_content = (response_content ~= "") and (folded .. "\n\n" .. response_content) or folded
+      end
     end
   end
 
   if final_content == "" and reasoning_text == "" then
-    return
+    return nil
   end
 
-  -- 构建含 reasoning 的原生 table（不再预编码为 JSON 字符串）
-  local assistant_entry
-  if reasoning_text ~= "" then
-    assistant_entry = {
-      content = final_content or "",
-      reasoning_content = reasoning_text,
-    }
-  else
-    assistant_entry = { content = final_content or "" }
-  end
-
-  -- 追加最终回复到 assistant 数组末尾，不覆盖已有的工具调用条目
-  hm.add_assistant_entry(session_id, assistant_entry)
-  hm.update_usage(session_id, data.usage or {})
-  hm._save()
+  -- 返回构建的最终内容，由 history_saver 通过事件监听统一保存
+  return {
+    content = final_content,
+    reasoning_content = reasoning_text,
+  }
 end
 
 --- 获取当前流式状态中的已生成内容

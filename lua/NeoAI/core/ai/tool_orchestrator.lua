@@ -472,6 +472,14 @@ function M._execute_single_tool(session_id, tool_call)
   })
 
   local tool_executor = require("NeoAI.tools.tool_executor")
+  -- 保存原始参数副本（不含注入的 _session_id / _tool_call_id），用于持久化
+  local original_arguments = {}
+  for k, v in pairs(arguments) do
+    if k ~= "_session_id" and k ~= "_tool_call_id" then
+      original_arguments[k] = v
+    end
+  end
+
   local function on_result(result, is_error)
     local s = state.sessions[session_id]
     if not s then return end
@@ -484,6 +492,10 @@ function M._execute_single_tool(session_id, tool_call)
 
     local result_str = is_error and ("[工具执行失败] " .. result) or result
     M._add_tool_result_to_messages(session_id, tool_call_id, tool_name, result_str)
+
+    -- 持久化工具调用参数和结果到 history_manager
+    -- 已通过 TOOL_EXECUTION_COMPLETED / TOOL_EXECUTION_ERROR 事件由 history_saver 统一处理
+    -- 此处不再直接调用 add_tool_result，避免重复保存
 
     s.active_tool_calls[tool_call_id] = nil
     local remaining = vim.tbl_count(s.active_tool_calls)
@@ -697,7 +709,13 @@ end
 function M.on_generation_complete(data)
   local session_id = data.session_id
   local ss = state.sessions[session_id]
-  if not ss or ss.generation_id ~= data.generation_id then return end
+  if not ss or ss.generation_id ~= data.generation_id then
+    -- 总结轮次时，ss.generation_id 可能已被清空，但 data.generation_id 仍有值
+    -- 此时通过 _summary_in_progress 标志来确认是否应该继续处理
+    if not (ss and ss._summary_in_progress) then
+      return
+    end
+  end
 
   local tool_calls = data.tool_calls or {}
   local content = data.content or ""
@@ -862,7 +880,12 @@ function M._finish_loop(session_id, success, result)
   M._request_summary_round(session_id)
 
   -- 总结轮次已触发（内部已保存 generation_id 副本），现在可以安全清空
-  ss.generation_id = nil
+  -- 注意：不能在此处清空 ss.generation_id，因为 _request_summary_round 中的
+  -- once_display_closed 回调是异步的（vim.schedule），on_generation_complete
+  -- 需要依赖 ss.generation_id 做匹配检查。
+  -- ss.generation_id 会在总结轮次完成后的 GENERATION_COMPLETED 回调中由
+  -- tool_orchestrator 的监听器清空（见 register_session 中的 _summary_in_progress 分支）
+  -- ss.generation_id = nil
 end
 
 -- ========== 停止控制 ==========

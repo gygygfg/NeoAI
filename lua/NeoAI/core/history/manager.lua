@@ -2,6 +2,7 @@
 --- 职责：会话数据的 CRUD 操作、消息管理
 --- 持久化委托给 history_persistence 模块
 --- 缓存委托给 history_cache 模块
+--- 会话保存委托给 history_saver 模块（事件驱动、队列异步写入）
 ---
 --- 会话结构（扁平结构，一轮对话一个会话）:
 --- {
@@ -23,6 +24,7 @@ local logger = require("NeoAI.utils.logger")
 local Events = require("NeoAI.core.events")
 local persistence = require("NeoAI.core.history.persistence")
 local cache = require("NeoAI.core.history.cache")
+local saver = require("NeoAI.core.history.saver")
 local shutdown_flag = require("NeoAI.core.shutdown_flag")
 
 -- ========== 状态 ==========
@@ -123,6 +125,9 @@ function M.initialize(options)
   -- 初始化缓存模块
   cache.initialize(get_sessions_ref, M.build_round_text)
 
+  -- 初始化会话历史保存器（事件驱动、队列异步写入）
+  saver.initialize(M)
+
   state.initialized = true
 
   -- 同步加载历史文件
@@ -167,10 +172,13 @@ function M._shutdown_and_save()
     end
   end)
 
-  -- 3. 清空 persistence 写入队列（避免异步回调在退出过程中执行）
+  -- 3. 刷新 saver 队列（等待所有待处理保存完成）
+  saver.shutdown_sync()
+
+  -- 4. 清空 persistence 写入队列（避免异步回调在退出过程中执行）
   persistence.flush_queue()
 
-  -- 4. 同步保存会话数据
+  -- 5. 同步保存会话数据
   persistence.sync_save(state.sessions)
 end
 
@@ -454,25 +462,19 @@ function M.add_assistant_entry(session_id, assistant_entry)
 end
 
 --- 记录工具调用结果到历史
+--- 同时保存结构化 table（完整数据）和折叠文本（UI 显示）
 function M.add_tool_result(session_id, tool_name, arguments, result)
   local session = state.sessions[session_id]
   if not session then return false end
 
-  local args_str = vim.inspect(arguments or {})
-  if #args_str > 100 then args_str = args_str:sub(1, 100) .. "..." end
-  local result_str = type(result) == "table"
-    and (pcall(vim.json.encode, result) and vim.json.encode(result) or vim.inspect(result))
-    or tostring(result or "")
-  if #result_str > 200 then
-    result_str = result_str:sub(1, 200) .. "\n    ... [truncated, total " .. #result_str .. " chars]"
-  end
-  result_str = result_str:gsub("\n", "\n    ")
-
-  local folded_text = "{{{ 🔧 工具调用"
-    .. "\n  🔧 " .. (tool_name or "unknown")
-    .. "\n    参数: " .. args_str
-    .. "\n    结果: " .. result_str
-    .. "\n}}}"
+  -- 构建结构化 tool_call 条目，保留完整数据
+  local tool_call_entry = {
+    type = "tool_call",
+    tool_name = tool_name or "unknown",
+    arguments = arguments or {},
+    result = result,
+    timestamp = os.time(),
+  }
 
   if type(session.assistant) ~= "table" then
     if session.assistant and session.assistant ~= "" then
@@ -482,33 +484,31 @@ function M.add_tool_result(session_id, tool_name, arguments, result)
     end
   end
 
+  -- 尝试合并到上一条 tool_call 条目（同一次工具调用多结果合并）
   local last_idx = #session.assistant
   local appended = false
   if last_idx and last_idx > 0 then
     local last_entry = session.assistant[last_idx]
-    if type(last_entry) == "string" and last_entry:match("^{{{.-" .. tool_name .. "}}}") then
-      local base = last_entry:sub(1, #last_entry - 3)
-      local new_entry = base
-        .. "\n  🔧 " .. (tool_name or "unknown")
-        .. "\n    参数: " .. args_str
-        .. "\n    结果: " .. result_str
-        .. "\n}}}"
-      session.assistant[last_idx] = new_entry
-      appended = true
-    elseif type(last_entry) == "string" and last_entry:match("^{{{") then
-      local base = last_entry:sub(1, #last_entry - 3)
-      local new_entry = base
-        .. "\n  🔧 " .. (tool_name or "unknown")
-        .. "\n    参数: " .. args_str
-        .. "\n    结果: " .. result_str
-        .. "\n}}}"
-      session.assistant[last_idx] = new_entry
+    -- 如果上一条也是同名的 tool_call，合并结果
+    if type(last_entry) == "table" and last_entry.type == "tool_call" and last_entry.tool_name == tool_call_entry.tool_name then
+      -- 将多个结果合并为数组
+      if not last_entry.results then
+        last_entry.results = { last_entry.result }
+        last_entry.result = nil
+      end
+      table.insert(last_entry.results, result)
+      -- 合并参数（如果不同）
+      if not last_entry.arguments_list then
+        last_entry.arguments_list = { last_entry.arguments }
+      end
+      table.insert(last_entry.arguments_list, arguments or {})
+      last_entry.timestamp = os.time()
       appended = true
     end
   end
 
   if not appended then
-    table.insert(session.assistant, folded_text)
+    table.insert(session.assistant, tool_call_entry)
   end
   session.updated_at = os.time()
 
@@ -583,13 +583,39 @@ function M.get_messages(session_id)
 
     if type(parsed) == "table" then
       if parsed.type == "tool_call" then
-        local args_str = vim.inspect(parsed.arguments or {})
-        if #args_str > 200 then args_str = args_str:sub(1, 200) .. "..." end
-        local result_str = tostring(parsed.result or "")
-        if #result_str > 300 then result_str = result_str:sub(1, 300) .. "\n... [truncated]" end
+        -- 支持新的结构化格式（含合并场景）
+        local tool_name = parsed.tool_name or "unknown"
+        local args_str
+        if parsed.arguments_list then
+          -- 合并场景：多个参数列表
+          local parts = {}
+          for i, args in ipairs(parsed.arguments_list) do
+            local s = vim.inspect(args or {})
+            if #s > 150 then s = s:sub(1, 150) .. "..." end
+            table.insert(parts, "  [" .. i .. "] " .. s)
+          end
+          args_str = table.concat(parts, "\n")
+        else
+          args_str = vim.inspect(parsed.arguments or {})
+          if #args_str > 200 then args_str = args_str:sub(1, 200) .. "..." end
+        end
+        local result_str
+        if parsed.results then
+          -- 合并场景：多个结果
+          local parts = {}
+          for i, res in ipairs(parsed.results) do
+            local s = type(res) == "string" and res or (pcall(vim.json.encode, res) and vim.json.encode(res) or vim.inspect(res))
+            if #s > 200 then s = s:sub(1, 200) .. "\n... [truncated]" end
+            table.insert(parts, "  [" .. i .. "] " .. s)
+          end
+          result_str = table.concat(parts, "\n")
+        else
+          result_str = tostring(parsed.result or "")
+          if #result_str > 300 then result_str = result_str:sub(1, 300) .. "\n... [truncated]" end
+        end
         content = string.format(
           "🔧 工具调用: %s\n参数: %s\n结果: %s",
-          parsed.tool_name or "unknown", args_str, result_str
+          tool_name, args_str, result_str
         )
         msg_type = "tool"
       elseif parsed.content then
@@ -950,6 +976,7 @@ function M._test_reset()
   state._is_shutting_down = false
   persistence._test_reset()
   cache._test_reset()
+  saver._test_reset()
 
   local test_file = "/tmp/neoai_test_sessions/sessions.json"
   if vim.fn.filereadable(test_file) == 1 then

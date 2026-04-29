@@ -1279,12 +1279,8 @@ function M._finalize_generation(generation_id, response_text, params)
   state.is_generating = false
   state.current_generation_id = nil
 
-  if state.session_manager and params.session_id and state.session_manager.get_session then
-    local session = state.session_manager.get_session(params.session_id)
-    if session and state.session_manager._save_sessions then
-      state.session_manager._save_sessions()
-    end
-  end
+  -- 会话历史保存已由 history_saver 通过事件监听统一处理
+  -- 此处不再直接调用 session_manager 保存
 
   -- 刷新 LSP 延迟清理队列（确保临时 buffer 被关闭）
   local ok, lsp_module = pcall(require, "NeoAI.tools.builtin.neovim_lsp")
