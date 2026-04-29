@@ -6,6 +6,7 @@ local logger = require("NeoAI.utils.logger")
 local event_constants = require("NeoAI.core.events")
 local json = require("NeoAI.utils.json")
 local default_config = require("NeoAI.default_config")
+local shutdown_flag = require("NeoAI.core.shutdown_flag")
 
 -- 子模块
 local http_client = require("NeoAI.core.ai.http_client")
@@ -935,6 +936,11 @@ function M._handle_stream_end(generation_id, processor, params)
       }
     end
 
+    -- 注意：不在此处保存 AI 回复到 history。
+    -- AI 回复（含工具调用折叠文本和思考过程）由 chat_window 的
+    -- _save_final_content_to_history 在 GENERATION_COMPLETED 事件中统一保存。
+    -- 工具调用结果由 tool_orchestrator 的 _add_tool_result_to_messages 实时保存。
+
     local gen = state.active_generations[generation_id]
     local messages = gen and gen.messages or {}
     local options = gen and gen.options or {}
@@ -1114,6 +1120,10 @@ function M._handle_ai_response(generation_id, response, params)
     -- 普通模式（非工具循环）：启动新的异步工具循环
     local gen = state.active_generations[generation_id]
     local messages = gen and gen.messages or {}
+
+    -- 注意：不在此处保存 AI 回复到 history。
+    -- 由 chat_window 的 _save_final_content_to_history 统一保存。
+
     local model_index = gen and gen.model_index or 1
     local ai_preset = gen and gen.ai_preset or {}
 
@@ -1246,13 +1256,19 @@ function M._finalize_generation(generation_id, response_text, params)
   end
   table.insert(messages, assistant_msg)
 
+  -- 确定最终 usage：优先使用 accumulated_usage（非空），否则使用 params.usage
+  local final_usage = generation.accumulated_usage
+  if not final_usage or not next(final_usage) then
+    final_usage = params.usage or {}
+  end
+
   vim.api.nvim_exec_autocmds("User", {
     pattern = event_constants.GENERATION_COMPLETED,
     data = {
       generation_id = generation_id,
       response = response_text or "",
       reasoning_text = params.reasoning_text or "",
-      usage = generation.accumulated_usage or params.usage or {},
+      usage = final_usage,
       session_id = params.session_id,
       window_id = params.window_id,
       duration = os.time() - generation.start_time,
@@ -1541,12 +1557,31 @@ function M.cancel_generation()
   local generation_id = state.current_generation_id
   local generation = state.active_generations[generation_id]
 
-  -- 先设置停止标志，再取消 HTTP 请求
-  -- 顺序很重要：先设置 stop_requested，确保回调执行时能检测到停止状态
-  if generation then
-    tool_orchestrator.request_stop(generation.session_id)
+  -- 直接设置所有会话的停止标志，不调用 request_stop
+  -- request_stop 会清空 active_tool_calls 并调度 _on_tools_complete，触发总结轮次
+  -- cancel_generation 是用户强制取消，不应该触发总结
+  local tool_orc = require("NeoAI.core.ai.tool_orchestrator")
+  if generation and generation.session_id then
+    local ss = tool_orc.get_session_state and tool_orc.get_session_state(generation.session_id)
+    if ss then
+      ss.stop_requested = true
+      ss.user_cancelled = true  -- 标记为用户取消，不触发总结
+      ss.active_tool_calls = {}
+    end
   else
-    tool_orchestrator.request_stop()
+    -- 没有 session_id 时，停止所有会话
+    -- 遍历 tool_orchestrator 中的所有会话
+    local all_sessions = tool_orc.get_all_session_ids and tool_orc.get_all_session_ids()
+    if all_sessions then
+      for _, sid in ipairs(all_sessions) do
+        local ss = tool_orc.get_session_state(sid)
+        if ss then
+          ss.stop_requested = true
+          ss.user_cancelled = true  -- 标记为用户取消，不触发总结
+          ss.active_tool_calls = {}
+        end
+      end
+    end
   end
 
   -- 取消所有 HTTP 请求（jobstop 会触发 on_exit 回调，但此时 stop_requested 已设置）

@@ -149,6 +149,12 @@ function M.set_output(path)
   -- 以追加模式打开文件
   local ok, file = pcall(io.open, path, "a")
   if ok and file then
+    -- 检查文件是否为空，如果是则写入 UTF-8 BOM 头
+    local size = file:seek("end")
+    if size == 0 then
+      file:write("\239\187\191") -- UTF-8 BOM
+      file:flush()
+    end
     state.output = file
   else
     -- 如果无法打开文件，回退到标准输出

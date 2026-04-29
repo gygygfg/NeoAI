@@ -460,18 +460,86 @@ function M._render_single_message(msg, prev_role)
     return lines
   end
 
+  -- 检查 msg 是否包含 tool_calls 字段（原生 table 结构）
+  if msg.role == "assistant" and msg.tool_calls and type(msg.tool_calls) == "table" and #msg.tool_calls > 0 then
+    -- 工具调用消息：显示工具调用信息
+    table.insert(lines, role_prefix .. " 🔧 工具调用:")
+    for _, tc in ipairs(msg.tool_calls) do
+      local func = tc["function"] or tc.func or {}
+      local tool_name = func.name or "unknown"
+      local args_str = ""
+      if func.arguments then
+        local ok, parsed = pcall(vim.json.decode, func.arguments)
+        if ok and parsed then
+          args_str = vim.inspect(parsed)
+          if #args_str > 100 then args_str = args_str:sub(1, 100) .. "..." end
+        else
+          args_str = func.arguments
+        end
+      end
+      table.insert(lines, string.format("    🔧 %s(%s)", tool_name, args_str))
+    end
+    -- 如果有 content，也显示
+    if raw_content and raw_content ~= "" then
+      table.insert(lines, "")
+      for _, mline in ipairs(vim.split(raw_content, "\n")) do
+        table.insert(lines, mline)
+      end
+    end
+    table.insert(lines, "")
+    return lines
+  end
+
   -- 尝试解析 JSON 格式（包含 reasoning_content 的 assistant 消息）
   local has_reasoning = false
   local reasoning_content = ""
   local main_content = raw_content
+  local has_tool_calls = false
 
   if msg.role == "assistant" then
     local json_ok, parsed = pcall(vim.json.decode, raw_content)
-    if json_ok and type(parsed) == "table" and parsed.reasoning_content and parsed.reasoning_content ~= "" then
-      has_reasoning = true
-      reasoning_content = parsed.reasoning_content
-      main_content = parsed.content or ""
+    if json_ok and type(parsed) == "table" then
+      if parsed.reasoning_content and parsed.reasoning_content ~= "" then
+        has_reasoning = true
+        reasoning_content = parsed.reasoning_content
+        main_content = parsed.content or ""
+      end
+      -- 检查 JSON 中是否包含 tool_calls
+      if parsed.tool_calls and type(parsed.tool_calls) == "table" and #parsed.tool_calls > 0 then
+        has_tool_calls = true
+      end
     end
+  end
+
+  if has_tool_calls then
+    -- 有工具调用的 JSON 格式消息
+    table.insert(lines, role_prefix .. " 🔧 工具调用:")
+    local json_ok, parsed = pcall(vim.json.decode, raw_content)
+    if json_ok and parsed and parsed.tool_calls then
+      for _, tc in ipairs(parsed.tool_calls) do
+        local func = tc["function"] or tc.func or {}
+        local tool_name = func.name or "unknown"
+        local args_str = ""
+        if func.arguments then
+          local ok2, parsed2 = pcall(vim.json.decode, func.arguments)
+          if ok2 and parsed2 then
+            args_str = vim.inspect(parsed2)
+            if #args_str > 100 then args_str = args_str:sub(1, 100) .. "..." end
+          else
+            args_str = func.arguments
+          end
+        end
+        table.insert(lines, string.format("    🔧 %s(%s)", tool_name, args_str))
+      end
+    end
+    if main_content and main_content ~= "" then
+      table.insert(lines, "")
+      for _, mline in ipairs(vim.split(main_content, "\n")) do
+        table.insert(lines, mline)
+      end
+    end
+    table.insert(lines, "")
+    return lines
   end
 
   if has_reasoning then
@@ -1233,27 +1301,15 @@ function M._update_usage_virt_text()
     )
   end
 
-  -- 先确保缓冲区可修改，在 AI 回复末尾追加分隔线
+  -- 先确保缓冲区可修改
   pcall(vim.api.nvim_set_option_value, "modifiable", true, { buf = buf })
   pcall(vim.api.nvim_set_option_value, "readonly", false, { buf = buf })
 
   local line_count = vim.api.nvim_buf_line_count(buf)
-  -- 检查最后一行是否已经是分隔线，避免重复追加
-  local last_line_content = ""
-  if line_count > 0 then
-    local lines = vim.api.nvim_buf_get_lines(buf, line_count - 1, line_count, false)
-    last_line_content = (lines[1] or ""):match("^%s*(.-)%s*$")
-  end
 
-  if last_line_content ~= "─" then
-    -- 追加分隔线
-    vim.api.nvim_buf_set_lines(buf, line_count, line_count, false, { "─", "" })
-    line_count = vim.api.nvim_buf_line_count(buf)
-  end
-
-  -- 在分隔线下一行（空行）写入用量文本（直接写入缓冲区，支持自动换行）
+  -- 在末尾追加用量文本（直接写入缓冲区，支持自动换行）
   -- 同时用 extmark 的 hl_group 设置整行颜色
-  local usage_line = line_count - 1 -- 空行
+  local usage_line = line_count
   vim.api.nvim_buf_set_lines(buf, usage_line, usage_line + 1, false, { usage_text })
   -- 用 extmark 给这一行设置高亮颜色
   state.usage_extmark_id = vim.api.nvim_buf_set_extmark(buf, ns_id, usage_line, 0, {
@@ -1438,31 +1494,9 @@ function M.add_message(role, content, opts)
 end
 
 --- 触发自动保存（内部函数）
+--- 由 history_manager 的防抖机制统一处理，不再单独调用
 function M._trigger_auto_save()
-  -- 直接调用会话管理器的内部保存函数
-  local session_mgr_loaded, session_mgr = pcall(require, "NeoAI.core.session.session_manager")
-  if session_mgr_loaded and session_mgr then
-    -- 使用pcall安全调用内部函数
-    pcall(function()
-      -- 检查是否有保存函数
-      if session_mgr._save_sessions then
-        session_mgr._save_sessions()
-      end
-    end)
-  end
-
-  -- 同时触发历史管理器的保存
-  local history_mgr_loaded, history_mgr = pcall(require, "NeoAI.core.history_manager")
-  if history_mgr_loaded and history_mgr then
-    pcall(function()
-      -- 检查历史管理器是否有保存函数
-      if history_mgr.save_sessions then
-        history_mgr.save_sessions()
-      elseif history_mgr._save_sessions then
-        history_mgr._save_sessions()
-      end
-    end)
-  end
+  -- 由 history_manager.mark_dirty 防抖机制统一处理
 end
 
 --- 持久化消息到存储系统（内部函数）
@@ -1646,7 +1680,7 @@ end
 
 local function find_folded_msg_idx()
   for i = #state.messages, 1, -1 do
-    if state.messages[i].role == "assistant" and (state.messages[i].content or ""):find("^{{{  🔧 工具调用") then
+    if state.messages[i].role == "assistant" and (state.messages[i].content or ""):find("^{{{") then
       return i
     end
   end
@@ -1768,11 +1802,14 @@ function M._setup_event_listeners()
         state.tool_display._finished = false
       end
       clear_stream_throttle()
+      -- 保存流式状态，用于判断是否需要增量更新
+      local had_stream_prefix = state.streaming.prefix_added or state.streaming.reasoning_prefix_added
       reset_streaming_state()
       state.tool_loop_in_progress = false
 
-      -- 增量更新
-      if not (state.streaming.prefix_added or state.streaming.reasoning_prefix_added) then
+      -- 增量更新：仅当没有流式数据时（非流式总结），才追加完整消息到缓冲区
+      -- 如果总结内容已通过流式方式追加，跳过以避免重复
+      if not had_stream_prefix then
         local last = state.messages[#state.messages]
         if last and last.role == "assistant" then
           M._append_message_to_buffer("assistant", last.content)
@@ -2412,6 +2449,8 @@ function M._setup_event_listeners()
       end
 
       close_reasoning_display()
+      -- 重置流式状态，确保后续总结轮次以正确的 "🤖 AI:" 前缀开始
+      reset_streaming_state()
       fire_event(Events.TOOL_DISPLAY_CLOSED, {
         window_id = data.window_id,
         session_id = data.session_id,
@@ -2609,19 +2648,21 @@ function M._append_stream_chunk_to_buffer(chunk_content, content_type)
   if mi and state.messages[mi] then
     local full = state.streaming.content_buffer or ""
     local rt = state.streaming.reasoning_buffer or ""
-    local new_content = (rt ~= "") and vim.json.encode({ reasoning_content = rt, content = full }) or full
-    state.messages[mi].content = new_content
+    local new_content = (rt ~= "") and { reasoning_content = rt, content = full } or { content = full }
+    state.messages[mi].content = (rt ~= "") and vim.json.encode({ reasoning_content = rt, content = full }) or full
 
-    -- 实时保存到 history_manager（节流：每 500ms 最多保存一次）
-    local now = vim.loop.now()
-    if not state._last_stream_save_time or now - state._last_stream_save_time >= 500 then
-      state._last_stream_save_time = now
-      local hm_ok, hm = pcall(require, "NeoAI.core.history_manager")
-      if hm_ok and hm.is_initialized() then
-        local session = hm.get_current_session()
-        if session then
-          hm.update_last_assistant(session.id, new_content)
-          hm._save()
+  -- 流式更新保存到 history_manager
+    -- 每 10 次更新触发一次防抖保存，确保流式内容不会丢失
+    local hm_ok, hm = pcall(require, "NeoAI.core.history_manager")
+    if hm_ok and hm.is_initialized() then
+      local session = hm.get_current_session()
+      if session then
+        hm.update_last_assistant(session.id, new_content)
+        -- 定期保存：每 10 次 chunk 触发一次防抖保存
+        state.streaming._save_counter = (state.streaming._save_counter or 0) + 1
+        if state.streaming._save_counter >= 10 then
+          state.streaming._save_counter = 0
+          hm._mark_dirty()
         end
       end
     end
@@ -2641,6 +2682,14 @@ function M._append_stream_chunk_to_buffer(chunk_content, content_type)
     -- 思考内容
     if not state.streaming.reasoning_prefix_added then
       state.streaming.reasoning_prefix_added = true
+      -- 在插入前缀前检查上一行是否为空行，确保新段落有换行
+      if lc > 0 then
+        local last = get_last_line(buf)
+        if last ~= "" and not last:match("^---") then
+          vim.api.nvim_buf_set_lines(buf, lc, lc, false, { "" })
+          lc = get_line_count(buf)
+        end
+      end
       vim.api.nvim_buf_set_lines(buf, lc, lc, false, { "🤖 AI: 🤔 思考过程:" })
       lc = get_line_count(buf)
     end
@@ -2673,6 +2722,15 @@ function M._append_stream_chunk_to_buffer(chunk_content, content_type)
   -- 正文内容
   if not state.streaming.prefix_added then
     state.streaming.prefix_added = true
+    -- 在插入 "🤖 AI:" 前先检查上一行是否为空行或分隔线，确保新段落有换行
+    if lc > 0 then
+      local last = get_last_line(buf)
+      if last ~= "" and not last:match("^---") then
+        -- 上一行有内容且不是分隔线，先插入空行再添加前缀
+        vim.api.nvim_buf_set_lines(buf, lc, lc, false, { "" })
+        lc = get_line_count(buf)
+      end
+    end
     vim.api.nvim_buf_set_lines(buf, lc, lc, false, { "🤖 AI:" })
     lc = get_line_count(buf)
   end
@@ -3126,7 +3184,9 @@ function M.get_last_assistant_content()
 end
 
 --- 将最终回复内容保存到 history_manager
---- 在 GENERATION_COMPLETED 回调中调用，确保包含折叠文本的完整内容被持久化
+--- 在 GENERATION_COMPLETED 回调中调用
+--- 工具结果已在 _add_tool_result_to_messages 中实时持久化到 assistant 数组
+--- 此处只追加最终 AI 回复（含折叠文本），不覆盖已有的工具调用条目
 --- @param data table GENERATION_COMPLETED 事件数据
 function M._save_final_content_to_history(data)
   local session_id = data.session_id
@@ -3139,18 +3199,49 @@ function M._save_final_content_to_history(data)
     return
   end
 
-  local final_content = M.get_last_assistant_content()
-  if not final_content or final_content == "" then
+  -- 获取最终回复内容（优先使用 state.messages 中的折叠文本）
+  local response = data.response
+  local reasoning_text = data.reasoning_text or ""
+
+  local response_content = ""
+  if type(response) == "string" then
+    response_content = response
+  elseif type(response) == "table" and response.content then
+    response_content = response.content
+  else
+    response_content = tostring(response)
+  end
+
+  -- 检查是否有工具调用结果，构建含折叠文本的最终回复
+  local has_tool_results = state.tool_display.active and #state.tool_display.results > 0
+  local folded_saved = state.tool_display.folded_saved
+
+  local final_content = response_content
+  if has_tool_results or folded_saved then
+    local folded = M.get_last_assistant_content()
+    if folded and folded ~= "" then
+      final_content = folded
+    end
+  end
+
+  if final_content == "" and reasoning_text == "" then
     return
   end
 
-  hm.update_last_assistant(session_id, final_content)
-
-  local usage = data.usage or {}
-  if usage and next(usage) then
-    hm.update_usage(session_id, usage)
+  -- 构建含 reasoning 的原生 table（不再预编码为 JSON 字符串）
+  local assistant_entry
+  if reasoning_text ~= "" then
+    assistant_entry = {
+      content = final_content or "",
+      reasoning_content = reasoning_text,
+    }
+  else
+    assistant_entry = { content = final_content or "" }
   end
 
+  -- 追加最终回复到 assistant 数组末尾，不覆盖已有的工具调用条目
+  hm.add_assistant_entry(session_id, assistant_entry)
+  hm.update_usage(session_id, data.usage or {})
   hm._save()
 end
 

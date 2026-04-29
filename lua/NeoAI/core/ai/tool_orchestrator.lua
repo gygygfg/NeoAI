@@ -16,6 +16,7 @@ local M = {}
 local logger = require("NeoAI.utils.logger")
 local event_constants = require("NeoAI.core.events")
 local tool_pack = require("NeoAI.tools.tool_pack")
+local shutdown_flag = require("NeoAI.core.shutdown_flag")
 
 -- ========== 状态 ==========
 
@@ -36,6 +37,18 @@ local function force_ui_refresh()
   pcall(vim.cmd.redraw)
 end
 
+--- 检查 Neovim 是否正在退出
+--- 使用统一的 shutdown_flag 模块
+local function is_shutting_down()
+  return shutdown_flag.is_set()
+end
+
+--- 设置退出标志（由 VimLeavePre 回调调用）
+--- 委托给统一的 shutdown_flag 模块
+function M.set_shutting_down()
+  shutdown_flag.set()
+end
+
 --- 等待 TOOL_DISPLAY_CLOSED 事件后执行回调
 --- 优化：移除 5 秒超时等待，直接通过 vim.schedule 执行回调
 --- TOOL_DISPLAY_CLOSED 由 chat_window 在 TOOL_LOOP_FINISHED 回调中触发
@@ -43,6 +56,8 @@ end
 --- 因此直接执行回调，不再等待事件
 local function once_display_closed(session_id, callback)
   vim.schedule(function()
+    -- 检查是否正在退出，避免在退出过程中执行回调导致卡死
+    if is_shutting_down() then return end
     force_ui_refresh()
     callback()
   end)
@@ -53,8 +68,7 @@ end
 local function fire_loop_finished(ss)
   if not ss then return end
   -- 检查 Neovim 是否正在退出，避免在退出过程中调度事件导致死循环
-  local ok_tp, tp = pcall(vim.api.nvim_get_current_tabpage)
-  if not ok_tp or not tp then return end
+  if is_shutting_down() then return end
 
   local ok, err = pcall(vim.api.nvim_exec_autocmds, "User", {
     pattern = event_constants.TOOL_LOOP_FINISHED,
@@ -68,11 +82,11 @@ local function fire_loop_finished(ss)
   })
   if not ok then
     -- 再次检查 Neovim 是否正在退出
-    local ok_tp2, tp2 = pcall(vim.api.nvim_get_current_tabpage)
-    if not ok_tp2 or not tp2 then return end
+    if is_shutting_down() then return end
 
     -- fast event 上下文，用 vim.schedule 重试
     vim.schedule(function()
+      if is_shutting_down() then return end
       pcall(vim.api.nvim_exec_autocmds, "User", {
         pattern = event_constants.TOOL_LOOP_FINISHED,
         data = {
@@ -92,8 +106,7 @@ end
 local function fire_loop_started(ss, tool_calls)
   if not ss then return end
   -- 检查 Neovim 是否正在退出
-  local ok_tp, tp = pcall(vim.api.nvim_get_current_tabpage)
-  if not ok_tp or not tp then return end
+  if is_shutting_down() then return end
 
   local ok, err = pcall(vim.api.nvim_exec_autocmds, "User", {
     pattern = event_constants.TOOL_LOOP_STARTED,
@@ -106,10 +119,10 @@ local function fire_loop_started(ss, tool_calls)
     },
   })
   if not ok then
-    local ok_tp2, tp2 = pcall(vim.api.nvim_get_current_tabpage)
-    if not ok_tp2 or not tp2 then return end
+    if is_shutting_down() then return end
 
     vim.schedule(function()
+      if is_shutting_down() then return end
       pcall(vim.api.nvim_exec_autocmds, "User", {
         pattern = event_constants.TOOL_LOOP_STARTED,
         data = {
@@ -129,8 +142,7 @@ end
 local function fire_tool_result_received(ss, is_final_round)
   if not ss then return end
   -- 检查 Neovim 是否正在退出
-  local ok_tp, tp = pcall(vim.api.nvim_get_current_tabpage)
-  if not ok_tp or not tp then return end
+  if is_shutting_down() then return end
 
   local ok, err = pcall(vim.api.nvim_exec_autocmds, "User", {
     pattern = event_constants.TOOL_RESULT_RECEIVED,
@@ -149,10 +161,10 @@ local function fire_tool_result_received(ss, is_final_round)
     },
   })
   if not ok then
-    local ok_tp2, tp2 = pcall(vim.api.nvim_get_current_tabpage)
-    if not ok_tp2 or not tp2 then return end
+    if is_shutting_down() then return end
 
     vim.schedule(function()
+      if is_shutting_down() then return end
       pcall(vim.api.nvim_exec_autocmds, "User", {
         pattern = event_constants.TOOL_RESULT_RECEIVED,
         data = {
@@ -193,6 +205,7 @@ local function create_session_state(session_id, window_id)
     accumulated_usage = {},
     last_reasoning = nil,
     stop_requested = false,
+    user_cancelled = false,  -- 用户主动取消标志，为 true 时不触发总结
     on_complete = nil,
     autocmd_ids = {},
   }
@@ -284,25 +297,11 @@ function M.register_session(session_id, window_id)
 
       s.stop_requested = true
 
-      -- 主动触发总结轮次：如果当前没有正在执行的工具，直接进入总结
-      -- 注意：使用 vim.schedule 延迟执行，避免在 autocmd 回调中嵌套调用
-      vim.schedule(function()
-        local ss = state.sessions[session_id]
-        if not ss or ss._summary_in_progress then return end
-
-        -- 检查是否有活跃的工具调用
-        local has_active = false
-        for _ in pairs(ss.active_tool_calls or {}) do
-          has_active = true
-          break
-        end
-
-        if not has_active then
-          -- 没有活跃工具，直接进入总结轮次
-          M._request_summary_round(session_id)
-        end
-        -- 如果有活跃工具，_on_tools_complete 会在工具完成后触发总结
-      end)
+      -- 注意：不在此处主动触发总结轮次。
+      -- stop_tool_loop 工具本身是一个工具调用，它的结果需要先显示在 UI 中。
+      -- 总结轮次由 _on_tools_complete 的 stop_requested 分支在工具结果
+      -- 显示完成后（once_display_closed）触发，确保 stop_tool_loop 的结果
+      -- 先展示给用户，然后 AI 再生成总结。
     end,
   }))
 
@@ -366,6 +365,7 @@ function M.start_async_loop(params)
           local s = state.sessions[sid]
           if s then
             s.stop_requested = true
+            s.user_cancelled = true  -- 标记为用户取消，不触发总结
             s.active_tool_calls = {}
           end
         end
@@ -502,6 +502,10 @@ function M._execute_single_tool(session_id, tool_call)
     end)
   end
 
+  -- 注入 session_id 到参数中，供 tool_executor 保存工具结果时使用
+  arguments._session_id = session_id
+  arguments._tool_call_id = tool_call_id
+
   tool_executor.execute_async(tool_name, arguments,
     function(result) on_result(result, false) end,
     function(err) on_result(err, true) end,
@@ -514,14 +518,26 @@ end
 function M._on_tools_complete(session_id)
   local ss = state.sessions[session_id]
   if not ss then return end
+  -- 退出时直接跳过，避免触发事件或发起 AI 请求导致死循环
+  if is_shutting_down() then return end
   if ss._tools_complete_in_progress then return end
   ss._tools_complete_in_progress = true
 
   if ss.stop_requested then
     ss.phase = "idle"
     ss._tools_complete_in_progress = false
+    -- 退出时直接跳过，不触发任何事件或总结
+    if is_shutting_down() then return end
+    -- 用户取消时也不触发总结，直接结束
+    if ss.user_cancelled then return end
     force_ui_refresh()
-    M._request_summary_round(session_id)
+    fire_loop_finished(ss)
+    once_display_closed(session_id, function()
+      local s = state.sessions[session_id]
+      if not s then return end
+      if is_shutting_down() then return end
+      M._request_summary_round(session_id)
+    end)
     return
   end
 
@@ -532,7 +548,10 @@ function M._on_tools_complete(session_id)
     fire_loop_finished(ss)
     once_display_closed(session_id, function()
       local s = state.sessions[session_id]
-      if not s or s.stop_requested then
+      if not s then return end
+      -- 检查是否正在退出，避免在退出过程中触发事件导致卡死
+      if is_shutting_down() then return end
+      if s.stop_requested then
         logger.debug("[tool_orchestrator] _on_tools_complete: once_display_closed 回调中检测到 stop_requested，跳过 _request_generation")
         return
       end
@@ -556,7 +575,10 @@ function M._check_round_complete(session_id)
 
   if ss.stop_requested then
     ss.phase = "idle"
-    M._request_summary_round(session_id)
+    -- 用户取消时不触发总结
+    if not ss.user_cancelled then
+      M._request_summary_round(session_id)
+    end
     return
   end
 
@@ -592,7 +614,10 @@ function M._proceed_to_next_round(session_id)
 
   if ss.stop_requested then
     ss._proceed_in_progress = false
-    M._request_summary_round(session_id)
+    -- 用户取消时不触发总结
+    if not ss.user_cancelled then
+      M._request_summary_round(session_id)
+    end
     return
   end
 
@@ -616,62 +641,9 @@ function M._request_summary_round(session_id)
   local ss = state.sessions[session_id]
   if not ss then return end
   if ss._summary_in_progress then return end
-  -- 如果已请求停止，直接通知 UI 生成完成（不发起新的 AI 请求）
-  if ss.stop_requested then
-    logger.debug("[tool_orchestrator] _request_summary_round: 已请求停止，直接通知完成")
-    ss.phase = "idle"
+  -- 退出时不发起总结轮次，避免死循环
+  if is_shutting_down() then
     ss._summary_in_progress = false
-
-    -- 先保存历史：将 ss.messages 中的工具调用结果持久化到 history_manager
-    -- 确保工具循环被停止后，用户消息和工具调用结果不会丢失
-    -- 注意：不要调用 hm._save()，history_manager 内部已有 debounce_save 机制
-    -- 直接调用 _save() 会触发 vim.fn.writefile()，可能引发 BufWrite 事件循环导致无限卡死
-    local hm_ok, hm = pcall(require, "NeoAI.core.history_manager")
-    if hm_ok and hm.is_initialized() then
-      -- 将 ss.messages 中的 tool 消息保存到 history_manager
-      for _, msg in ipairs(ss.messages or {}) do
-        if msg.role == "tool" and msg.name then
-          local arguments = {}
-          -- 尝试从之前的 assistant 消息中查找 tool_call 参数
-          for i = #ss.messages - 1, 1, -1 do
-            local prev = ss.messages[i]
-            if prev.role == "assistant" and prev.tool_calls then
-              for _, tc in ipairs(prev.tool_calls) do
-                if tc.id == msg.tool_call_id then
-                  local func = tc["function"] or tc.func or {}
-                  if func.arguments then
-                    local ok2, parsed = pcall(vim.json.decode, func.arguments)
-                    if ok2 and parsed then arguments = parsed end
-                  end
-                  break
-                end
-              end
-              break
-            end
-          end
-          hm.add_tool_result(session_id, msg.name, arguments, msg.content or "")
-        end
-      end
-      -- 不调用 hm._save()，避免触发文件写入事件循环
-    end
-
-    -- 触发 GENERATION_COMPLETED 事件，让 UI 知道生成已结束
-    local saved_gen_id = ss.generation_id
-    local saved_window_id = ss.window_id
-    vim.schedule(function()
-      pcall(vim.api.nvim_exec_autocmds, "User", {
-        pattern = event_constants.GENERATION_COMPLETED,
-        data = {
-          generation_id = saved_gen_id,
-          response = "",
-          reasoning_text = ss.last_reasoning or "",
-          usage = ss.accumulated_usage or {},
-          session_id = session_id,
-          window_id = saved_window_id,
-          duration = 0,
-        },
-      })
-    end)
     return
   end
   ss._summary_in_progress = true
@@ -700,11 +672,10 @@ function M._request_summary_round(session_id)
   once_display_closed(session_id, function()
     local s = state.sessions[session_id]
     if not s then return end
-    -- 再次检查 stop_requested，防止在 once_display_closed 延迟执行期间停止信号已到达
-    if s.stop_requested then
-      logger.debug("[tool_orchestrator] _request_summary_round: once_display_closed 回调中检测到 stop_requested，跳过")
-      return
-    end
+    -- 检查是否正在退出，避免在退出过程中触发事件导致卡死
+    if is_shutting_down() then return end
+    -- 注意：不检查 stop_requested。总结轮次是由 stop_tool 或循环结束触发的最终行为，
+    -- 即使 stop_requested 为 true 也应执行总结，否则 AI 不会生成最终回复。
     vim.api.nvim_exec_autocmds("User", {
       pattern = event_constants.TOOL_RESULT_RECEIVED,
       data = {
@@ -750,6 +721,7 @@ function M.on_generation_complete(data)
   end
   table.insert(ss.messages, assistant_msg)
 
+  -- 注意：中间过程的文本回复不单独保存到 history，由最终总结统一保存
   if is_final_round or #tool_calls == 0 or ss.current_iteration >= state.max_iterations then
     M._finish_loop(session_id, true, content)
     return
@@ -762,6 +734,8 @@ function M.on_generation_complete(data)
   once_display_closed(session_id, function()
     local s = state.sessions[session_id]
     if not s then return end
+    -- 检查是否正在退出，避免在退出过程中执行工具导致卡死
+    if is_shutting_down() then return end
     -- 检查 stop_requested，防止在延迟执行期间停止信号已到达
     if s.stop_requested then
       logger.debug("[tool_orchestrator] on_generation_complete: once_display_closed 回调中检测到 stop_requested，跳过工具执行")
@@ -786,32 +760,11 @@ function M._add_tool_result_to_messages(session_id, tool_call_id, tool_name, res
   if tool_name then tool_msg.name = tool_name end
   table.insert(ss.messages, tool_msg)
 
-  -- 同时持久化到 history_manager，确保工具调用结果保存到历史文件
-  -- 注意：不要在此处调用 hm._save()，history_manager 内部已有 debounce_save 机制
-  -- 直接调用 _save() 会触发 vim.fn.writefile()，可能引发 BufWrite 事件循环导致无限卡死
-  local ok, hm = pcall(require, "NeoAI.core.history_manager")
-  if ok and hm.is_initialized() then
-    local arguments = {}
-    -- 尝试从 ss.messages 中查找对应的 tool_call 参数
-    for i = #ss.messages - 1, 1, -1 do
-      local msg = ss.messages[i]
-      if msg.role == "assistant" and msg.tool_calls then
-        for _, tc in ipairs(msg.tool_calls) do
-          if tc.id == tool_call_id or tc.id == safe_id then
-            local func = tc["function"] or tc.func or {}
-            if func.arguments then
-              local ok2, parsed = pcall(vim.json.decode, func.arguments)
-              if ok2 and parsed then arguments = parsed end
-            end
-            break
-          end
-        end
-        break
-      end
-    end
-    hm.add_tool_result(session_id, tool_name or "unknown", arguments, result_str)
-    -- 不调用 hm._save()，避免触发文件写入事件循环
-  end
+  -- 工具结果实时持久化到 history_manager（由 tool_executor 统一保存）
+  -- tool_executor 的 on_success_wrapper/on_error_wrapper 中已调用 _save_tool_result_to_history
+  -- 此处不再重复保存，避免竞态和重复
+  -- 注意：_add_tool_result_to_messages 只负责将工具结果加入 ss.messages（AI 请求上下文）
+  -- 持久化由 tool_executor 集中处理
 end
 
 -- ========== 结束循环 ==========
@@ -852,20 +805,24 @@ function M._finish_loop(session_id, success, result)
     ss.generation_id = nil
 
     -- 触发 GENERATION_COMPLETED 事件，通知 UI 更新用量提示
-    vim.schedule(function()
-      pcall(vim.api.nvim_exec_autocmds, "User", {
-        pattern = event_constants.GENERATION_COMPLETED,
-        data = {
-          generation_id = saved_gen_id,
-          response = saved_result,
-          reasoning_text = saved_reasoning,
-          usage = saved_usage,
-          session_id = session_id,
-          window_id = saved_win_id,
-          duration = 0,
-        },
-      })
-    end)
+    -- 注意：这里使用 vim.schedule 但检查 is_shutting_down，如果正在退出则跳过
+    if not is_shutting_down() then
+      vim.schedule(function()
+        if is_shutting_down() then return end
+        pcall(vim.api.nvim_exec_autocmds, "User", {
+          pattern = event_constants.GENERATION_COMPLETED,
+          data = {
+            generation_id = saved_gen_id,
+            response = saved_result,
+            reasoning_text = saved_reasoning,
+            usage = saved_usage,
+            session_id = session_id,
+            window_id = saved_win_id,
+            duration = 0,
+          },
+        })
+      end)
+    end
     return
   end
 
@@ -876,6 +833,19 @@ function M._finish_loop(session_id, success, result)
   local saved_window_id = ss.window_id
   local saved_reasoning = ss.last_reasoning or ""
 
+  -- 用户取消时不触发总结，直接调用 on_complete 回调结束
+  if ss.user_cancelled then
+    ss.on_complete = nil
+    ss.phase = "idle"
+    ss.active_tool_calls = {}
+    ss.current_iteration = 0
+    ss.generation_id = nil
+    if on_complete then
+      vim.schedule(function() on_complete(true, result or "", saved_usage) end)
+    end
+    return
+  end
+
   -- 触发一次总结轮次（不带工具），让 AI 根据工具执行结果进行总结
   -- 注意：_request_summary_round 会通过 TOOL_RESULT_RECEIVED 事件触发 AI 生成
   -- AI 生成完成后会调用 on_generation_complete，其中会再次调用 _finish_loop
@@ -885,61 +855,6 @@ function M._finish_loop(session_id, success, result)
   ss.phase = "idle"
   ss.active_tool_calls = {}
   ss.current_iteration = 0
-
-  -- 如果已请求停止，跳过总结轮次，直接触发完成事件
-  if ss.stop_requested then
-    logger.debug("[tool_orchestrator] _finish_loop: 已请求停止，直接触发完成事件")
-    ss._summary_in_progress = false
-    ss.generation_id = nil
-
-    -- 先保存历史：将 ss.messages 中的工具调用结果持久化到 history_manager
-    -- 确保工具循环被停止后，用户消息和工具调用结果不会丢失
-    -- 注意：不要调用 hm._save()，history_manager 内部已有 debounce_save 机制
-    -- 直接调用 _save() 会触发 vim.fn.writefile()，可能引发 BufWrite 事件循环导致无限卡死
-    local hm_ok, hm = pcall(require, "NeoAI.core.history_manager")
-    if hm_ok and hm.is_initialized() then
-      for _, msg in ipairs(ss.messages or {}) do
-        if msg.role == "tool" and msg.name then
-          local arguments = {}
-          for i = #ss.messages - 1, 1, -1 do
-            local prev = ss.messages[i]
-            if prev.role == "assistant" and prev.tool_calls then
-              for _, tc in ipairs(prev.tool_calls) do
-                if tc.id == msg.tool_call_id then
-                  local func = tc["function"] or tc.func or {}
-                  if func.arguments then
-                    local ok2, parsed = pcall(vim.json.decode, func.arguments)
-                    if ok2 and parsed then arguments = parsed end
-                  end
-                  break
-                end
-              end
-              break
-            end
-          end
-          hm.add_tool_result(session_id, msg.name, arguments, msg.content or "")
-        end
-      end
-      -- 不调用 hm._save()，避免触发文件写入事件循环
-    end
-
-    -- 触发 GENERATION_COMPLETED 事件，让 UI 知道生成已结束
-    vim.schedule(function()
-      pcall(vim.api.nvim_exec_autocmds, "User", {
-        pattern = event_constants.GENERATION_COMPLETED,
-        data = {
-          generation_id = saved_generation_id,
-          response = result or "",
-          reasoning_text = saved_reasoning,
-          usage = saved_usage,
-          session_id = session_id,
-          window_id = saved_window_id,
-          duration = 0,
-        },
-      })
-    end)
-    return
-  end
 
   -- 先关闭工具显示（fire_loop_finished 由 _request_summary_round 内部触发）
   -- 触发总结轮次，让 AI 根据工具结果生成最终回复
@@ -1029,6 +944,23 @@ function M.reset_iteration(session_id)
   end
 end
 
+--- 获取会话状态（供外部模块直接操作，如 cancel_generation）
+--- @param session_id string
+--- @return table|nil
+function M.get_session_state(session_id)
+  return state.sessions[session_id]
+end
+
+--- 获取所有会话ID列表
+--- @return table string[]
+function M.get_all_session_ids()
+  local ids = {}
+  for sid, _ in pairs(state.sessions) do
+    table.insert(ids, sid)
+  end
+  return ids
+end
+
 function M.is_executing(session_id)
   if session_id then
     local ss = state.sessions[session_id]
@@ -1057,6 +989,45 @@ function M.shutdown()
   state.sessions = {}
   state.tools = {}
   state.initialized = false
+end
+
+--- 紧急清理（VimLeavePre 中使用）
+--- 比 shutdown 更激进：直接清空所有状态，不触发任何事件或回调
+function M.cleanup_all()
+  -- 清理全局 ESC 停止监听器
+  if _stop_listener_id then
+    pcall(vim.api.nvim_del_autocmd, _stop_listener_id)
+    _stop_listener_id = nil
+  end
+
+  -- 先设置所有会话的停止标志，防止任何回调继续执行
+  for _, ss in pairs(state.sessions) do
+    ss.stop_requested = true
+    ss.phase = "idle"
+    ss.active_tool_calls = {}
+    ss.current_iteration = 0
+    ss.generation_id = nil
+    ss._tools_complete_in_progress = false
+    ss._proceed_in_progress = false
+    ss._summary_in_progress = false
+  end
+
+  -- 取消所有 HTTP 请求
+  pcall(function()
+    local http_ok, http_client = pcall(require, "NeoAI.core.ai.http_client")
+    if http_ok and http_client and http_client.cancel_all_requests then
+      http_client.cancel_all_requests()
+    end
+  end)
+
+  -- 注销所有会话（删除 autocmd）
+  for session_id, _ in pairs(state.sessions) do
+    M.unregister_session(session_id)
+  end
+
+  -- 清空所有状态
+  state.sessions = {}
+  state.tools = {}
 end
 
 return M

@@ -11,7 +11,7 @@ local event_constants = require("NeoAI.core.events")
 local function _stop_tool_loop(args, on_success, on_error)
   local reason = args and args.reason or "任务已完成"
 
-  -- 取消正在进行的 AI 请求
+  -- 取消正在进行的 AI 请求，避免总结轮次与旧请求冲突
   local ok, ai_engine = pcall(require, "NeoAI.core.ai.ai_engine")
   if ok and ai_engine and ai_engine.cancel_generation then
     ai_engine.cancel_generation()

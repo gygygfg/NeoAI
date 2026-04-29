@@ -8,6 +8,7 @@ local logger = require("NeoAI.utils.logger")
 local event_constants = require("NeoAI.core.events")
 local ai_engine = require("NeoAI.core.ai.ai_engine")
 local history_manager = require("NeoAI.core.history_manager")
+local shutdown_flag = require("NeoAI.core.shutdown_flag")
 
 -- ========== 状态 ==========
 
@@ -154,29 +155,6 @@ function M.get_raw_messages(session_id)
 
   -- 按从根到当前的顺序收集消息
   local messages = {}
-  local tool_call_buffer = {}
-
-  local function flush_tool_calls()
-    if #tool_call_buffer == 0 then return end
-    local text = "{{{ 🔧 工具调用"
-    for _, tc in ipairs(tool_call_buffer) do
-      local args_str = vim.inspect(tc.arguments or {})
-      if #args_str > 100 then args_str = args_str:sub(1, 100) .. "..." end
-      local result_str = type(tc.result) == "table"
-        and (pcall(vim.json.encode, tc.result) and vim.json.encode(tc.result) or vim.inspect(tc.result))
-        or tostring(tc.result or "")
-      if #result_str > 200 then
-        result_str = result_str:sub(1, 200) .. "\n    ... [truncated, total " .. #result_str .. " chars]"
-      end
-      result_str = result_str:gsub("\n", "\n    ")
-      text = text .. "\n  🔧 " .. (tc.tool_name or "unknown")
-        .. "\n    参数: " .. args_str
-        .. "\n    结果: " .. result_str
-    end
-    text = text .. "\n}}}"
-    table.insert(messages, { role = "assistant", content = text })
-    tool_call_buffer = {}
-  end
 
   for _, pid in ipairs(path_ids) do
     local s = hm.get_session(pid)
@@ -189,26 +167,41 @@ function M.get_raw_messages(session_id)
       assistant_list = (assistant_list and assistant_list ~= "") and { assistant_list } or {}
     end
     for _, entry in ipairs(assistant_list) do
-      local ok, parsed = pcall(vim.json.decode, entry)
-      if ok and type(parsed) == "table" and parsed.type == "tool_call" then
-        table.insert(tool_call_buffer, parsed)
-      elseif ok and type(parsed) == "table" then
-        -- JSON 格式的 assistant 回复（含 reasoning_content 和/或 content）
-        -- 保留原始 JSON 字符串，让 _render_single_message 解析渲染
-        -- 只有当 content 和 reasoning_content 都为空时才跳过
-        local has_content = parsed.content and parsed.content ~= ""
-        local has_reasoning = parsed.reasoning_content and parsed.reasoning_content ~= ""
-        if has_content or has_reasoning then
-          flush_tool_calls()
+      if type(entry) == "string" then
+        -- 折叠文本（以 {{{ 开头）或普通文本
+        if entry:match("^{{{") then
           table.insert(messages, { role = "assistant", content = entry })
+        else
+          -- 尝试解析 JSON（含 reasoning_content 的 assistant 消息）
+          local ok, parsed = pcall(vim.json.decode, entry)
+          if ok and type(parsed) == "table" and parsed.type == "tool_call" then
+            -- 兼容旧格式：tool_call 以 JSON 字符串存储，直接跳过（已由新格式替代）
+            -- do nothing
+          elseif ok and type(parsed) == "table" then
+            local has_content = parsed.content and parsed.content ~= ""
+            local has_reasoning = parsed.reasoning_content and parsed.reasoning_content ~= ""
+            if has_content or has_reasoning then
+              table.insert(messages, { role = "assistant", content = entry })
+            end
+          else
+            table.insert(messages, { role = "assistant", content = entry })
+          end
         end
-        -- content 和 reasoning_content 都为空时跳过
-      else
-        flush_tool_calls()
-        table.insert(messages, { role = "assistant", content = entry })
+      elseif type(entry) == "table" then
+        -- 原生 table 格式（新版存储格式）
+        if entry.type == "tool_call" then
+          -- 兼容旧格式：原生 table 的 tool_call，跳过（已由折叠文本替代）
+          -- do nothing
+        elseif entry.content and entry.content ~= "" then
+          if entry.reasoning_content and entry.reasoning_content ~= "" then
+            local ok_json, json_str = pcall(vim.json.encode, entry)
+            table.insert(messages, { role = "assistant", content = ok_json and json_str or entry.content })
+          else
+            table.insert(messages, { role = "assistant", content = entry.content })
+          end
+        end
       end
     end
-    flush_tool_calls()
   end
 
   return messages
@@ -335,15 +328,10 @@ function M.cancel_generation()
   local current_session = history_manager.get_current_session()
   local session_id = current_session and current_session.id or nil
 
-  -- 先通知工具编排器停止（设置 stop_requested 标志，阻止后续工具执行和新一轮生成）
-  local ok, tool_orc = pcall(require, "NeoAI.core.ai.tool_orchestrator")
-  if ok and tool_orc then
-    tool_orc.request_stop(session_id)
-  end
-
-  -- 再直接调用 ai_engine 取消（会取消 HTTP 请求并触发事件）
-  -- 注意：ai_engine.cancel_generation() 内部也会调用 tool_orchestrator.request_stop()
-  -- 但由于 request_stop 是幂等的（多次调用只设置一次 stop_requested），这是安全的
+  -- 不调用 tool_orc.request_stop()，因为它会触发 TOOL_LOOP_STOP_REQUESTED 事件
+  -- 导致 tool_orchestrator 进入总结轮次
+  -- 用户取消生成时不应该触发总结，直接取消 HTTP 请求并设置停止标志即可
+  -- ai_engine.cancel_generation() 内部会直接设置 stop_requested 并取消 HTTP 请求
   ai_engine.cancel_generation()
 
   -- 最后触发取消事件，让 UI 监听器更新界面状态

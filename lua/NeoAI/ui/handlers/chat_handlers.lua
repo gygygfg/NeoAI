@@ -107,41 +107,9 @@ function M._handle_tool_result(data)
     return
   end
 
-  local hm = get_hm()
-  if not hm then return end
-
-  local target_session_id = session_id
-  local session = hm.get_session(target_session_id)
-  if not session then
-    local current = hm.get_current_session()
-    if current then
-      target_session_id = current.id
-    else
-      return
-    end
-  end
-
-  for _, tr in ipairs(tool_results) do
-    local tool_call = tr.tool_call or {}
-    local result = tr.result or ""
-
-    local tool_func = tool_call["function"] or tool_call.func or {}
-    local tool_name = tool_func.name or "unknown"
-    local arguments_str = tool_func.arguments or "{}"
-
-    local arguments = {}
-    local ok, parsed = pcall(vim.json.decode, arguments_str)
-    if ok and parsed then
-      arguments = parsed
-    end
-
-    local result_str = tostring(result or "")
-    if #result_str > 500 then
-      result_str = result_str:sub(1, 500) .. "\n... [truncated, total " .. #result_str .. " chars]"
-    end
-
-    hm.add_tool_result(target_session_id, tool_name, arguments, result_str)
-  end
+  -- 工具结果持久化已由 tool_executor 统一处理
+  -- 此处不再重复保存到 history_manager
+  -- 此函数仅保留用于兼容旧的事件处理逻辑
 end
 
 function M._handle_response_complete(data)
@@ -162,21 +130,9 @@ function M._handle_response_complete(data)
   local hm = get_hm()
   if not hm then return end
 
-  -- 注意：chat_window.lua 的 GENERATION_COMPLETED 回调（后执行）会负责保存包含折叠文本的最终内容
-  -- 这里只做基础保存（作为兜底），避免 chat_window 未初始化时丢失数据
-  -- 使用 response_content（AI 原始回复）而不是 get_last_assistant_content（可能还不包含折叠文本）
-  if reasoning_text and reasoning_text ~= "" then
-    local assistant_json = build_assistant_content(response_content, reasoning_text)
-    hm.update_last_assistant(session_id, assistant_json)
-  elseif response_content ~= "" then
-    hm.update_last_assistant(session_id, response_content)
-  end
-
-  if usage and next(usage) then
-    hm.update_usage(session_id, usage)
-  end
-
-  hm._save()
+  -- 由 chat_window.lua 的 _save_final_content_to_history 统一保存
+  -- 该函数在 GENERATION_COMPLETED 回调中后执行，使用原始 data 构建含 reasoning 的 JSON
+  -- 这里不再重复保存，避免竞态覆盖
 end
 
 --- 发送消息（前端入口）

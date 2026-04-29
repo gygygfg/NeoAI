@@ -218,6 +218,19 @@ function M.setup(user_config)
   register_commands()
   register_global_keymaps()
 
+  -- 退出事件由 history_manager 内部的 VimLeavePre 统一处理（同步保存）
+  -- 不要在 init.lua 中重复注册，避免退出时多次保存导致死锁
+  -- 同时避免在退出过程中调用 cancel_generation（会尝试取消 HTTP 请求和触发事件）
+
+  -- 注册文件编码自动命令
+  vim.api.nvim_create_autocmd("BufRead", {
+    pattern = { "*.log", "sessions.json" },
+    group = vim.api.nvim_create_augroup("NeoAIEncoding", { clear = true }),
+    callback = function()
+      vim.bo.fileencoding = "utf-8"
+    end,
+  })
+
   -- 自动运行测试
   M._auto_run_tests(config)
 

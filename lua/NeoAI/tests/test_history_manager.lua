@@ -246,11 +246,10 @@ function M.run(test_module)
       local session = hm.get_session(id)
       -- update_last_assistant 替换最后一条，所以 assistant 应该只有 1 条
       assert.equal(1, #session.assistant, "update_last_assistant 应替换而不是追加")
-      -- 且内容应为更新后的值
-      local ok, parsed = pcall(vim.json.decode, session.assistant[1])
-      assert.is_true(ok, "assistant 内容应为有效 JSON")
-      if ok then
-        assert.equal("回复2", parsed.content, "assistant 内容应被更新")
+      -- 且内容应为更新后的值（现在存储为原生 table）
+      assert.is_true(type(session.assistant[1]) == "table", "assistant 应为原生 table")
+      if type(session.assistant[1]) == "table" then
+        assert.equal("回复2", session.assistant[1].content, "assistant 内容应被更新")
       end
     end,
 

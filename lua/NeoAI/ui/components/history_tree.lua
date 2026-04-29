@@ -20,17 +20,34 @@ function M.initialize(config)
   state.initialized = true
 end
 
---- 引用 history_manager 的 build_round_text
+--- 引用 history_manager 的 build_round_text（带本地缓存）
+local _round_text_cache = {}
 local function build_round_text(session)
+  if not session or not session.id then
+    return ""
+  end
+  if _round_text_cache[session.id] ~= nil then
+    return _round_text_cache[session.id]
+  end
   local ok, hm = pcall(require, "NeoAI.core.history_manager")
   if ok and hm.build_round_text then
-    return hm.build_round_text(session)
+    local text = hm.build_round_text(session)
+    _round_text_cache[session.id] = text
+    return text
   end
   return ""
 end
 
+--- 清除本地 round_text 缓存
+local function clear_round_text_cache()
+  _round_text_cache = {}
+end
+
 --- 从 history_manager 获取扁平会话列表，构建渲染列表
 function M.build_flat_items()
+  -- 每次重建时清除缓存
+  clear_round_text_cache()
+
   local ok, hm = pcall(require, "NeoAI.core.history_manager")
   if not ok or not hm.is_initialized() then
     state.flat_items = {}

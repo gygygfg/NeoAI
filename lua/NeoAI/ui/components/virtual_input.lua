@@ -272,6 +272,16 @@ function M.close(force)
   -- 顺序很重要：先切窗口确保 stopinsert 在正确的上下文中执行
   if state.parent_win and vim.api.nvim_win_is_valid(state.parent_win) then
     pcall(vim.api.nvim_set_current_win, state.parent_win)
+
+    -- 将光标移到 chat 窗口 buffer 的最后一行末尾
+    local buf = vim.api.nvim_win_get_buf(state.parent_win)
+    if buf and vim.api.nvim_buf_is_valid(buf) then
+      local line_count = vim.api.nvim_buf_line_count(buf)
+      if line_count > 0 then
+        local last_line = vim.api.nvim_buf_get_lines(buf, line_count - 1, line_count, false)[1] or ""
+        pcall(vim.api.nvim_win_set_cursor, state.parent_win, { line_count, #last_line })
+      end
+    end
   end
 
   -- 切换到 NORMAL 模式（在父窗口上下文中执行，确保正确退出）
@@ -592,22 +602,19 @@ function M._submit_float()
   end
 
   -- 调用提交回调
+  -- 注意：on_submit 内部会触发 GENERATION_STARTED 事件，该事件的监听器会关闭虚拟输入框
+  -- 所以这里不再重新聚焦输入框，避免覆盖关闭效果
   if state.on_submit and type(state.on_submit) == "function" then
     state.on_submit(content)
   end
 
-  -- 清空输入并恢复提示符
-  if state.float_buf and vim.api.nvim_buf_is_valid(state.float_buf) then
-    vim.api.nvim_buf_set_lines(state.float_buf, 0, -1, false, { "> " })
-  end
-
-  -- 重新聚焦输入框
-  if state.float_win and vim.api.nvim_win_is_valid(state.float_win) then
-    pcall(vim.api.nvim_set_current_win, state.float_win)
-    -- 将光标定位到 >  后面
-    pcall(vim.api.nvim_win_set_cursor, state.float_win, { 1, 2 })
-    vim.cmd("startinsert!")
-  end
+  -- 提交后关闭输入框（如果 on_submit 是异步的且未触发 GENERATION_STARTED，这里确保关闭）
+  -- 使用 vim.schedule 延迟执行，让 GENERATION_STARTED 事件有机会先处理
+  vim.schedule(function()
+    if state.active and state.mode == "float" then
+      M.close()
+    end
+  end)
 end
 
 --- 设置内联按键映射

@@ -118,7 +118,6 @@ function M._load_and_render_async(callback)
     return history_tree.build_flat_items()
   end, function(success, items)
     if success and items then
-      -- items 可能是 JSON 字符串（auto_serialize 默认 true），需要反序列化
       if type(items) == "string" then
         local ok, decoded = pcall(vim.json.decode, items)
         state.flat_items = ok and decoded or {}
@@ -129,8 +128,6 @@ function M._load_and_render_async(callback)
       state.flat_items = {}
     end
     M.render_tree()
-    -- 渲染完成后，对未命名的会话触发自动命名
-    _auto_name_unamed_sessions()
     if callback then
       callback()
     end
