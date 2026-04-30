@@ -11,12 +11,18 @@ NeoAI/
 ├── core/                       # 核心业务逻辑
 │   ├── init.lua                # 核心模块入口，协调子模块初始化
 │   ├── events.lua              # 事件常量定义（统一管理所有事件名）
-│   ├── history_manager.lua     # 历史管理器（JSON数组存储，树形会话结构）
+│   ├── shutdown_flag.lua       # 全局关闭标志（避免退出时死锁）
 │   │
 │   ├── config/                 # 配置管理
 │   │   ├── init.lua            # 配置模块入口
 │   │   ├── keymap_manager.lua  # 键位配置管理器
 │   │   └── state.lua           # 统一状态管理器（集中管理共享状态）
+│   │
+│   ├── history/                # 历史管理（新版，替代旧 core/history_manager.lua）
+│   │   ├── manager.lua         # 会话数据 CRUD 操作、消息管理
+│   │   ├── persistence.lua     # 文件序列化/反序列化、写入队列、事务性保存
+│   │   ├── cache.lua           # 树结构缓存、列表缓存、round_text 缓存
+│   │   └── saver.lua           # 事件驱动的队列异步写入器（监听 AI 事件自动保存）
 │   │
 │   └── ai/                     # AI 交互
 │       ├── init.lua            # AI 模块入口
@@ -24,6 +30,7 @@ NeoAI/
 │       ├── chat_service.lua    # 后端聊天服务（前后端分离的后端入口）
 │       ├── http_client.lua     # HTTP 客户端（流式/非流式请求）
 │       ├── request_adapter.lua # 请求适配器（多 API 提供商格式转换）
+│       ├── response_retry.lua  # 响应重试模块（检测异常并触发重试）
 │       └── tool_orchestrator.lua# 工具调用编排器
 │
 ├── ui/                         # 用户界面
@@ -36,12 +43,12 @@ NeoAI/
 │   │
 │   ├── components/             # UI 组件
 │   │   ├── input_handler.lua   # 输入处理器
-│   │   ├── history_tree.lua    # 历史树组件（基于 history_manager）
+│   │   ├── history_tree.lua    # 历史树组件（基于 history/manager）
 │   │   ├── reasoning_display.lua# 思考过程显示
 │   │   └── virtual_input.lua   # 虚拟输入框组件
 │   │
 │   └── handlers/               # 事件处理器
-│       ├── tree_handlers.lua   # 树界面处理器（基于 history_manager）
+│       ├── tree_handlers.lua   # 树界面处理器（基于 history/manager）
 │       └── chat_handlers.lua   # 聊天界面处理器（通过 chat_service 与后端交互）
 │
 ├── tools/                      # 工具系统
@@ -49,6 +56,7 @@ NeoAI/
 │   ├── tool_registry.lua       # 工具注册表
 │   ├── tool_executor.lua       # 工具执行器
 │   ├── tool_validator.lua      # 工具验证器
+│   ├── tool_pack.lua           # 工具包管理（按 category 自动分组）
 │   │
 │   └── builtin/                # 内置工具
 │       ├── file_tools.lua      # 文件操作工具
@@ -113,10 +121,13 @@ NeoAI/
 default_config.process_config(config)     ← 一步完成：验证 → 合并 → 清理 → 初始化
     │
     ▼
+state_manager.initialize(config)          ← 初始化统一状态管理器（保存配置引用）
+    │
+    ▼
 core.initialize(config)                   ← 初始化核心模块
   ├── config_module.initialize(config)    ← 配置模块（含 keymap_manager + state）
   ├── ai_engine.initialize()              ← AI 引擎
-  ├── history_manager.initialize()        ← 历史管理器（唯一数据源）
+  ├── history_manager.initialize()        ← 历史管理器（唯一数据源，含 cache/persistence/saver）
   └── chat_service.initialize()           ← 后端聊天服务（前后端分离）
     │
     ▼
@@ -135,18 +146,15 @@ tools.initialize(config.tools)            ← 初始化工具系统
   ├── tool_registry.initialize()
   ├── tool_executor.initialize()
   ├── tool_validator.initialize()
-  ├── _load_builtin_tools()               ← 加载内置工具
+  ├── vim.schedule → _load_builtin_tools()  ← 延迟加载内置工具（不阻塞初始化）
   └── _load_external_tools()              ← 加载外部工具（可选）
     │
     ▼
-ai_engine.set_tools(tools_map)           ← 将工具注册表注入 AI 引擎
-    │
-    ▼
-async_worker.initialize()               ← 初始化异步工作器
+vim.schedule → ai_engine.set_tools(tools_map)  ← 延迟注入工具注册表到 AI 引擎
     │
     ▼
 register_commands()                       ← 注册 :NeoAIOpen 等命令
-  ├── :NeoAIOpen                          ← 打开主界面
+  ├── :NeoAIOpen                          ← 打开主界面（默认聊天）
   ├── :NeoAIClose                         ← 关闭所有界面
   ├── :NeoAITree                          ← 打开树界面
   ├── :NeoAIChat                          ← 打开聊天界面
@@ -160,6 +168,11 @@ register_global_keymaps()                 ← 注册全局快捷键
   ├── close_all                           ← 关闭所有窗口
   └── toggle_ui                           ← 切换 UI 显示
 ```
+
+**关键变更**：
+1. `state_manager.initialize(config)` 在 `core.initialize()` **之前**调用，确保所有模块可通过 `state_manager.get_config()` 获取配置
+2. 内置工具加载和工具注入 AI 引擎均使用 `vim.schedule` **延迟执行**，不阻塞主初始化流程
+3. 退出事件由 `history/manager.lua` 内部的 `VimLeavePre` 统一处理（同步保存），`init.lua` 不再重复注册
 
 ### 配置示例
 
@@ -199,11 +212,13 @@ require("NeoAI").setup({
 
 - 维护插件全局状态（`state` 表）
 - `setup(user_config)` — 初始化所有模块、注册命令和快捷键
-  - 初始化顺序：`default_config` → `core` → `ui` → `tools` → 工具注入 AI 引擎 → `async_worker` → 注册命令 → 注册快捷键
+  - 初始化顺序：`default_config` → `state_manager` → `core` → `ui` → `tools` → 延迟注入工具 → 注册命令 → 注册快捷键
 - 提供对外接口：`open_neoai()`, `close_all()`, `get_session_manager()`, `get_ai_engine()`, `get_tools()`, `get_keymap_manager()`
 - 注册命令：`:NeoAIOpen`, `:NeoAIClose`, `:NeoAITree`, `:NeoAIChat`, `:NeoAIKeymaps`, `:NeoAIChatStatus`
 - 注册全局快捷键：`open_tree`, `open_chat`, `close_all`, `toggle_ui`（由 `config.keymaps.global` 配置）
-- 工具系统初始化后，将工具注册表注入 AI 引擎（`ai_engine.set_tools(tools_map)`），使工具定义能注入到请求中
+- 工具系统初始化后，通过 `vim.schedule` 延迟将工具注册表注入 AI 引擎（`ai_engine.set_tools(tools_map)`）
+- 支持 `config.test.auto_test` 自动运行测试（VimEnter 后延迟执行）
+- 注册 `BufRead` 自动命令确保 `.log` 和 `sessions.json` 文件编码为 utf-8
 
 ### `default_config.lua` — 配置管理
 
@@ -217,7 +232,7 @@ require("NeoAI").setup({
 
 ### `core/init.lua` — 核心模块入口
 
-|- 初始化 `config_module`（含 keymap_manager + state）、`ai_engine`、`history_manager`、`chat_service`
+|- 初始化 `config_module`（含 keymap_manager + state）、`ai_engine`、`history_manager`（新版 history/）、`chat_service`
 |- 所有模块间通信通过 Neovim 原生事件系统（`nvim_exec_autocmds`/`nvim_create_autocmd`）
 |- 提供 `get_ai_engine()`, `get_keymap_manager()`, `get_history_manager()`, `get_config()`
 |- `get_config()` 通过 `state_manager.get_config()` 获取配置，不再维护独立配置引用
@@ -236,6 +251,13 @@ require("NeoAI").setup({
 |- `get_config_value(key, default)` — 点号路径配置存取
 |- `is_initialized()` — 检查是否已初始化
 |- 各模块通过 `state_manager.get_config()` 获取配置，不再各自维护 `state.config`
+
+### `core/shutdown_flag.lua` — 全局关闭标志
+
+|- 所有模块通过此模块检查 Neovim 是否正在关闭
+|- 在 `VimLeavePre` 中设置标志后，所有 `vim.schedule` 回调应检查此标志并立即返回
+|- 避免在退出过程中执行 Neovim API 调用导致卡死
+|- `set()`, `is_set()`, `reset()`（测试用）
 
 ### `core/events.lua` — 事件常量定义
 
@@ -261,11 +283,41 @@ require("NeoAI").setup({
 |  5. 事件分发（向后端模块广播事件，不直接通知 UI）
 |- `send_message(params)` 封装完整流程：获取/创建会话 → 构建上下文 → 调用 AI 引擎 → 通过事件通知前端
 
-### `core/history_manager.lua` — 历史管理器（新版，唯一数据源）
+### `core/ai/response_retry.lua` — 响应重试模块
+
+|- 检测 AI 响应异常（内容重复/截断/空响应）并触发重试
+|- 支持指数退避策略：1s, 2s, 4s, 8s, 16s
+|- `max_retries = 5`
+|- `is_summary_content(content)` — 判断 AI 返回的内容是否为总结性质（含总结类关键词时视为正常结束）
+|- `is_repeated_content(content)` — 检测内容重复
+|- `is_truncated_content(content)` — 检测内容截断
+
+### `core/history/` — 新版历史管理（替代旧 `core/history_manager.lua`）
+
+**拆分原则**：将旧版单一 `history_manager.lua` 拆分为四个职责清晰的子模块：
+
+| 模块 | 职责 | 关键方法 |
+|------|------|----------|
+| `manager.lua` | 会话 CRUD、消息管理、树结构生成 | `create_session`, `get_session`, `delete_session`, `add_round`, `get_tree`, `get_context_and_new_parent` |
+| `persistence.lua` | 文件序列化/反序列化、写入队列 | `serialize`, `deserialize`, `enqueue_write`, `flush` |
+| `cache.lua` | 树结构缓存、列表缓存、round_text 缓存 | `invalidate_all`, `invalidate_round_text`, `get_cached_tree`, `get_cached_list` |
+| `saver.lua` | 事件驱动的队列异步写入 | 监听 `GENERATION_COMPLETED` 等事件，自动触发保存 |
+
+**数据流**：
+```
+manager (CRUD) → cache (缓存) → persistence (序列化+文件写入)
+     ↑                                  ↓
+   saver (监听事件) ←──────────── persistence (文件读取→反序列化→manager)
+```
+
+### `core/history/manager.lua` — 历史管理器（新版，唯一数据源）
 
 - 使用 JSON 数组文件存储，文件格式：`[\n{...},\n{...}\n]`
 - 初始创建空文件内容为 `[\n]`
 - 添加会话时覆写最后一行 `]` 为 `,新内容\n]`
+- 持久化委托给 `history_persistence` 模块
+- 缓存委托给 `history_cache` 模块
+- 会话保存委托给 `history_saver` 模块（事件驱动、队列异步写入）
 
 **会话对象结构**（扁平结构，一轮对话一个会话，无 `rounds` 数组）：
 
@@ -328,11 +380,54 @@ require("NeoAI").setup({
 3. 如果只有一个子会话 → 继续往下捋
 4. 如果有多个子会话 → 当前会话的消息作为上文，在此新开子会话
 
+### `core/history/persistence.lua` — 历史持久化模块
+
+|- 文件序列化/反序列化
+|- 写入队列（FIFO），保证原子性和实时保存
+|- 使用 `async_worker` 的任务队列
+|- 防抖机制：300ms 内合并多次写入
+|- `serialize(sessions)` — 序列化所有会话为 JSON 字符串
+|- `deserialize()` — 从文件读取并反序列化
+|- `enqueue_write(type, data, callback)` — 将写入任务加入队列
+|- `flush()` — 强制刷新所有待处理写入
+
+### `core/history/cache.lua` — 历史缓存模块
+
+|- 树结构缓存、列表缓存、round_text 缓存
+|- 缓存失效由 `history_manager` 在数据变更时通知
+|- `invalidate_all()` — 标记所有缓存为脏
+|- `invalidate_round_text(session_id)` — 清除指定会话的 round_text 缓存
+|- `get_cached_tree()` / `get_cached_list()` — 获取缓存（脏时自动重建）
+
+### `core/history/saver.lua` — 会话历史保存器
+
+|- 通过事件监听收集会话数据，使用队列与异步写入保证原子性
+|- 监听的事件：
+|  - `GENERATION_COMPLETED`: AI 生成完成（含本轮 AI 数据）
+|  - `TOOL_EXECUTION_COMPLETED`: 工具执行完成
+|  - `TOOL_EXECUTION_ERROR`: 工具执行出错
+|  - `USER_MESSAGE_SENT`: 用户消息已发送
+|- 按会话分组去重合并，300ms 防抖
+|- 批量刷新定时器，定时处理队列中的保存任务
+
 ### `core/session/` — 旧版会话管理（已删除）
 
 - 旧版 `session_manager.lua`, `branch_manager.lua`, `message_manager.lua`, `data_operations.lua`, `tree_manager.lua` 已全部删除
-- 新代码统一使用 `history_manager.lua` 作为唯一数据源
-- 树结构由 `history_manager.get_tree()` 直接生成
+- 新代码统一使用 `core/history/manager.lua` 作为唯一数据源
+- 树结构由 `manager.get_tree()` 直接生成
+
+### `tools/tool_pack.lua` — 工具包管理模块
+
+|- 从 `builtin/*.lua` 模块动态扫描工具定义，根据工具的 `category` 字段自动分组
+|- 工具包定义：`pack_name`, `display_name`, `icon`, `tools`, `order`
+|- 分类配置：
+|  - `file` → "文件操作" 📁 (order 1)
+|  - `lsp` → "代码分析" 🔍 (order 2)
+|  - `treesitter` → "语法分析" 🌳 (order 3)
+|  - `log` → "日志" 📝 (order 4)
+|  - `system` → "系统" ⚙️ (order 5)
+|  - `uncategorized` → "工具调用" 🔧 (order 99)
+|- 内置工具加载完成后自动刷新工具包分组（`tool_pack.initialize()`）
 
 ---
 
@@ -402,7 +497,7 @@ ai_engine.generate_response(messages, params)  ← AI 引擎生成
 AI响应完成后（GENERATION_COMPLETED 事件）：
     ├── chat_handlers._handle_response_complete()  ← 前端监听事件
     │   ├── 将用户消息和AI回复一起写入历史文件
-    │   └── 自动触发防抖保存（500ms）
+    │   └── 自动触发防抖保存（由 history/saver.lua 处理，300ms）
     └── chat_window 更新 UI 显示
 ```
 
@@ -410,6 +505,7 @@ AI响应完成后（GENERATION_COMPLETED 事件）：
 - **前端**（`chat_handlers.lua`）：管理待写入队列、更新 UI、监听结果事件写入历史
 - **后端**（`chat_service.lua`）：会话管理、上下文构建、AI 生成调度
 - **通信方式**：前端调用 `chat_service.send_message()`，后端通过 `GENERATION_COMPLETED` 事件通知前端
+- **持久化**：由 `history/saver.lua` 通过事件驱动自动完成，前端无需手动调用保存
 
 聊天界面按键（由 `chat_window.set_keymaps()` 设置）：
 
@@ -542,14 +638,20 @@ reasoning_display.close()                     ← 关闭窗口，转换为折叠
 ### 8. 会话持久化
 
 ```
-保存（防抖 500ms）：
-    history_manager._save()
+保存流程（由 history/saver.lua 事件驱动）：
+    GENERATION_COMPLETED / TOOL_EXECUTION_COMPLETED 等事件
         │
         ▼
-    收集所有会话为数组，按 created_at 排序
+    saver 监听事件 → 加入保存队列（按会话分组，300ms 防抖）
         │
         ▼
-    逐行写入 JSON 数组文件：
+    persistence.enqueue_write("update", data)  ← 写入队列（FIFO）
+        │
+        ▼
+    async_worker 处理写入任务
+        │
+        ▼
+    序列化为 JSON 数组文件：
         [
         {session_1_json},
         {session_2_json},
@@ -558,8 +660,11 @@ reasoning_display.close()                     ← 关闭窗口，转换为折叠
         ▼
     最后一行始终是 "]"
 
-加载：
+加载流程：
     history_manager._load()
+        │
+        ▼
+    persistence.deserialize()
         │
         ▼
     读取 sessions.json
@@ -666,6 +771,15 @@ vim.api.nvim_create_autocmd("User", {
 }
 ```
 
+### 测试配置 (`config.test`)
+
+```lua
+{
+  auto_test = false,                -- 是否在 VimEnter 后自动运行测试
+  delay_ms = 1500,                  -- 延迟时间（毫秒）
+}
+```
+
 ---
 
 ## 错误处理
@@ -676,6 +790,7 @@ vim.api.nvim_create_autocmd("User", {
 | 流式错误     | `NeoAI:stream_error`         | 最多重试 3 次            |
 | 工具执行错误 | `NeoAI:tool_execution_error` | 返回错误结果给模型       |
 | 网络错误     | `NeoAI:generation_error`     | 自动重试                 |
+| 响应异常     | `NeoAI:generation_error`     | 指数退避重试（由 response_retry 处理） |
 
 ---
 
@@ -686,9 +801,12 @@ vim.api.nvim_create_autocmd("User", {
 3. **配置集中**：所有配置在 `default_config.lua` 中统一管理，`process_config()` 一步完成验证→合并→清理→初始化
 4. **状态统一**：`core/config/state.lua` 集中管理共享状态，各模块不再维护独立 `state` 表
 5. **前后端分离**：`core/ai/chat_service.lua` 作为统一后端入口，前端只调用 chat_service 的公开方法，不直接调用 ai_engine 或 history_manager
-6. **防抖持久化**：会话数据使用 500ms 防抖保存
-7. **单一数据源**：`history_manager` 是唯一的会话数据源，旧版 `session_manager` 已删除
+6. **防抖持久化**：会话数据使用 `history/saver.lua` 的 300ms 防抖保存（事件驱动）
+7. **单一数据源**：`core/history/manager.lua` 是唯一的会话数据源，旧版 `session_manager` 已删除
 8. **安全调用**：跨模块依赖使用 `pcall` 保护
+9. **延迟加载**：内置工具和工具注入 AI 引擎使用 `vim.schedule` 延迟执行，不阻塞主初始化流程
+10. **退出安全**：`core/shutdown_flag.lua` 统一管理关闭标志，避免退出时死锁
+11. **职责拆分**：历史管理拆分为 manager/cache/persistence/saver 四个子模块，各司其职
 
 ---
 
