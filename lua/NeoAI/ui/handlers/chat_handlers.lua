@@ -183,10 +183,11 @@ function M.send_message(content, session_id, branch_id, window_id, format, callb
     target_session_id = new_id
   end
 
-  -- 2. 用户消息立即写入历史文件（不再使用待写入队列）
+  -- 2. 用户消息写入内存（add_round 内部通过 _mark_dirty() 触发防抖保存）
   -- 使用空字符串作为占位 assistant 内容，后续 AI 回复会通过 update_last_assistant 更新
+  -- 注意：不在此处手动调用 _save()，避免在 assistant 数据尚未填充时写入不完整状态
+  -- saver 模块通过 MESSAGE_SENT 事件监听异步保存，保证数据完整性
   hm.add_round(target_session_id, content, {}, {})
-  hm._save()
 
   -- 3. 通知 chat_window 添加用户消息
   local chat_window = require("NeoAI.ui.window.chat_window")

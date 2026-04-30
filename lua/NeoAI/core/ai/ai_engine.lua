@@ -11,6 +11,7 @@ local shutdown_flag = require("NeoAI.core.shutdown_flag")
 -- 子模块
 local http_client = require("NeoAI.core.ai.http_client")
 local tool_orchestrator = require("NeoAI.core.ai.tool_orchestrator")
+local response_retry = require("NeoAI.core.ai.response_retry")
 
 -- ========== 状态 ==========
 
@@ -734,6 +735,7 @@ function M._send_stream_request(generation_id, request, params)
   local gen = state.active_generations[generation_id]
   if gen then
     gen._stream_processor = processor
+    gen._last_request = request  -- 保存请求体，供重试时使用
   end
 
   local ai_preset = gen and gen.ai_preset or {}
@@ -893,6 +895,75 @@ function M._handle_stream_end(generation_id, processor, params)
   _reasoning_throttle.generation_id = nil
   _reasoning_throttle.processor = nil
   _reasoning_throttle.params = nil
+
+  -- ===== 响应异常检测与重试 =====
+  local is_tool_loop = params and params.is_tool_loop
+  local is_final_round = params and params.is_final_round
+  local abnormal, reason = response_retry.detect_abnormal_response(full_response, tool_calls, {
+    is_tool_loop = is_tool_loop,
+    is_final_round = is_final_round,
+  })
+  if abnormal then
+    local gen = state.active_generations[generation_id]
+    if gen then
+      local retry_count = gen.retry_count or 0
+      if response_retry.can_retry(retry_count) then
+        local new_retry_count = retry_count + 1
+        gen.retry_count = new_retry_count
+        local delay = response_retry.get_retry_delay(new_retry_count)
+        logger.warn(string.format(
+          "[ai_engine] 检测到异常流式响应 (重试 %d/%d): %s, 延迟 %dms 后重试",
+          new_retry_count, response_retry.get_max_retries(), reason, delay
+        ))
+        -- 通知 UI 正在重试
+        vim.api.nvim_exec_autocmds("User", {
+          pattern = event_constants.GENERATION_RETRYING,
+          data = {
+            generation_id = generation_id,
+            retry_count = new_retry_count,
+            max_retries = response_retry.get_max_retries(),
+            reason = reason,
+            session_id = processor.session_id,
+            window_id = processor.window_id,
+          },
+        })
+        local saved_request = gen._last_request
+        if not saved_request then
+          -- 如果 request 未保存，从 generation 记录中重建
+          saved_request = gen._last_request
+        end
+        vim.defer_fn(function()
+          if saved_request then
+            M._send_stream_request(generation_id, saved_request, params)
+          else
+            -- 极端情况：没有保存的 request，通过 handle_tool_result 重新发起
+            logger.warn("[ai_engine] 流式重试: 未找到保存的 request，通过 handle_tool_result 重新发起")
+            local s = state.active_generations[generation_id]
+            if s then
+              M.handle_tool_result({
+                generation_id = generation_id,
+                session_id = s.session_id,
+                window_id = s.window_id,
+                messages = s.messages,
+                options = s.options,
+                model_index = s.model_index,
+                ai_preset = s.ai_preset,
+                is_final_round = false,
+                accumulated_usage = s.accumulated_usage,
+                last_reasoning = s.last_reasoning_content,
+              })
+            end
+          end
+        end, delay)
+        return
+      else
+        logger.warn(string.format(
+          "[ai_engine] 流式响应异常但重试已达上限 (%d/%d): %s",
+          retry_count, response_retry.get_max_retries(), reason
+        ))
+      end
+    end
+  end
 
   -- 检查是否在工具循环模式中
   local is_tool_loop = params and params.is_tool_loop
@@ -1072,6 +1143,50 @@ function M._handle_ai_response(generation_id, response, params)
             reasoning_content = reasoning_content,
           },
         })
+      end
+    end
+  end
+
+  -- ===== 响应异常检测与重试 =====
+  local is_tool_loop = params and params.is_tool_loop
+  local is_final_round = params and params.is_final_round
+  local abnormal, reason = response_retry.detect_abnormal_response(response_content, tool_calls, {
+    is_tool_loop = is_tool_loop,
+    is_final_round = is_final_round,
+  })
+  if abnormal then
+    local generation = state.active_generations[generation_id]
+    if generation then
+      local retry_count = generation.retry_count or 0
+      if response_retry.can_retry(retry_count) then
+        local new_retry_count = retry_count + 1
+        generation.retry_count = new_retry_count
+        local delay = response_retry.get_retry_delay(new_retry_count)
+        logger.warn(string.format(
+          "[ai_engine] 检测到异常响应 (重试 %d/%d): %s, 延迟 %dms 后重试",
+          new_retry_count, response_retry.get_max_retries(), reason, delay
+        ))
+        -- 通知 UI 正在重试
+        vim.api.nvim_exec_autocmds("User", {
+          pattern = event_constants.GENERATION_RETRYING,
+          data = {
+            generation_id = generation_id,
+            retry_count = new_retry_count,
+            max_retries = response_retry.get_max_retries(),
+            reason = reason,
+            session_id = params.session_id,
+            window_id = params.window_id,
+          },
+        })
+        vim.defer_fn(function()
+          M._send_non_stream_request(generation_id, request, params)
+        end, delay)
+        return
+      else
+        logger.warn(string.format(
+          "[ai_engine] 响应异常但重试已达上限 (%d/%d): %s",
+          retry_count, response_retry.get_max_retries(), reason
+        ))
       end
     end
   end

@@ -94,7 +94,7 @@ function M.execute_async(tool_name, args, on_success, on_error, on_progress)
     M._record_execution(tool_name, args, nil, err)
     fire_event(
       event_constants.TOOL_EXECUTION_ERROR,
-      { tool_name = tool_name, args = args, error_msg = err, duration = 0, session_id = args and args.session_id }
+      { tool_name = tool_name, args = args, error_msg = err, duration = 0, session_id = args and (args.session_id or args._session_id) }
     )
     if on_error then
       on_error(err)
@@ -113,7 +113,7 @@ function M.execute_async(tool_name, args, on_success, on_error, on_progress)
     M._record_execution(tool_name, args, nil, full_msg)
     fire_event(
       event_constants.TOOL_EXECUTION_ERROR,
-      { tool_name = tool_name, args = args, error_msg = full_msg, duration = 0, session_id = args and args.session_id }
+      { tool_name = tool_name, args = args, error_msg = full_msg, duration = 0, session_id = args and (args.session_id or args._session_id) }
     )
     if on_error then
       on_error(full_msg)
@@ -128,7 +128,7 @@ function M.execute_async(tool_name, args, on_success, on_error, on_progress)
       M._record_execution(tool_name, args, nil, err)
       fire_event(
         event_constants.TOOL_EXECUTION_ERROR,
-        { tool_name = tool_name, args = args, error_msg = err, duration = 0, session_id = args and args.session_id }
+        { tool_name = tool_name, args = args, error_msg = err, duration = 0, session_id = args and (args.session_id or args._session_id) }
       )
       if on_error then
         on_error(err)
@@ -154,7 +154,7 @@ function M.execute_async(tool_name, args, on_success, on_error, on_progress)
       status = status, -- "pending" | "executing" | "completed" | "error"
       duration = duration or 0,
       detail = detail,
-      session_id = args and args.session_id,
+      session_id = args and (args.session_id or args._session_id),
     })
     -- 调用用户提供的 on_progress 回调
     if on_progress then
@@ -167,7 +167,7 @@ function M.execute_async(tool_name, args, on_success, on_error, on_progress)
     pack_name = pack_name,
     args = args,
     start_time = start_time,
-    session_id = args and args.session_id,
+    session_id = args and (args.session_id or args._session_id),
   })
 
   local function on_success_wrapper(result)
@@ -180,7 +180,7 @@ function M.execute_async(tool_name, args, on_success, on_error, on_progress)
       args = args,
       result = formatted,
       duration = duration,
-      session_id = args and args.session_id,
+      session_id = args and (args.session_id or args._session_id),
     })
     if not ok then
       -- fast event 上下文中 nvim_exec_autocmds 会失败，用 vim.schedule 重试
@@ -190,7 +190,7 @@ function M.execute_async(tool_name, args, on_success, on_error, on_progress)
           args = args,
           result = formatted,
           duration = duration,
-          session_id = args and args.session_id,
+          session_id = args and (args.session_id or args._session_id),
         })
       end)
     end
@@ -211,7 +211,7 @@ function M.execute_async(tool_name, args, on_success, on_error, on_progress)
       args = args,
       error_msg = full_err,
       duration = duration,
-      session_id = args and args.session_id,
+      session_id = args and (args.session_id or args._session_id),
     })
     if not ok then
       vim.schedule(function()
@@ -220,7 +220,7 @@ function M.execute_async(tool_name, args, on_success, on_error, on_progress)
           args = args,
           error_msg = full_err,
           duration = duration,
-          session_id = args and args.session_id,
+          session_id = args and (args.session_id or args._session_id),
         })
       end)
     end
