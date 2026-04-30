@@ -450,15 +450,17 @@ local function _run_command(args, on_success, on_error, on_progress)
         local right_width = math.floor(tool_width / 2)
         local right_col = tool_col + tool_width - right_width
 
+        -- 右侧伪终端窗口：row 比左侧多 1（跳过左侧上边框），height 比左侧少 2（去掉上下边框占位）
         float_buf = vim.api.nvim_create_buf(false, true)
         float_win = vim.api.nvim_open_win(float_buf, false, {
           relative = "editor",
           width = right_width - 2,
           height = tool_height - 2,
           row = tool_row + 1,
-          col = right_col + 1,
-          style = "minimal",
-          border = "none",
+          col = right_col,
+          border = "rounded",
+          title = " 💻 " .. command:sub(1, 50) .. (command:len() > 50 and "..." or "") .. " ",
+          title_pos = "center",
           zindex = 101,
         })
 
@@ -477,7 +479,7 @@ local function _run_command(args, on_success, on_error, on_progress)
     -- 如果无法获取工具调用悬浮窗，创建一个独立的浮动窗口
     if not float_win or not vim.api.nvim_win_is_valid(float_win) then
       local width = math.min(session.pty_width + 2, math.floor(vim.o.columns * 0.8))
-      local height = math.min(session.pty_height + 2, math.floor(vim.o.lines * 0.4))
+      local height = math.min(session.pty_height * 2 + 2, math.floor(vim.o.lines * 0.6))
       local row = math.floor((vim.o.lines - height) / 2) + math.floor(vim.o.lines * 0.2)
       local col = math.floor((vim.o.columns - width) / 2)
 
@@ -488,16 +490,21 @@ local function _run_command(args, on_success, on_error, on_progress)
         height = height,
         row = row,
         col = col,
-        style = "minimal",
         border = "rounded",
         title = " 💻 " .. command:sub(1, 50) .. (command:len() > 50 and "..." or "") .. " ",
         title_pos = "center",
         zindex = 150,
+        noautocmd = true,
       })
     end
 
-    vim.api.nvim_set_option_value("winhl", "Normal:Normal,FloatBorder:FloatBorder", { win = float_win })
+    vim.api.nvim_set_option_value("winhl", "Normal:NormalFloat,FloatBorder:FloatBorder", { win = float_win })
     vim.api.nvim_set_option_value("winblend", 0, { win = float_win })
+
+    -- 强制刷新窗口以显示边框和标题
+    vim.api.nvim_win_call(float_win, function()
+      vim.cmd("redraw")
+    end)
 
     -- 保存窗口和 buffer 信息
     session.float_window_win = float_win
@@ -534,22 +541,25 @@ local function _run_command(args, on_success, on_error, on_progress)
         session.exit_signal = signal
         session.state = "finished"
 
-        vim.schedule(function()
-          cleanup()
+        -- 延迟 1.5 秒后关闭窗口并回调
+        vim.fn.timer_start(1500, function()
+          vim.schedule(function()
+            cleanup()
 
-          local result_obj = {
-            command = command,
-            exit_code = exit_code,
-            signal = signal,
-            stdout = table.concat(session.stdout_data, ""),
-            stderr = table.concat(session.stderr_data, ""),
-            session_id = session_id,
-            state = "finished",
-          }
+            local result_obj = {
+              command = command,
+              exit_code = exit_code,
+              signal = signal,
+              stdout = table.concat(session.stdout_data, ""),
+              stderr = table.concat(session.stderr_data, ""),
+              session_id = session_id,
+              state = "finished",
+            }
 
-          if on_success then
-            on_success(result_obj)
-          end
+            if on_success then
+              on_success(result_obj)
+            end
+          end)
         end)
       end,
     }
@@ -557,7 +567,17 @@ local function _run_command(args, on_success, on_error, on_progress)
     -- 切换到浮动窗口，然后在该窗口中启动伪终端
     local prev_win = vim.api.nvim_get_current_win()
     vim.api.nvim_set_current_win(float_win)
+    -- 使用 termopen 启动伪终端（LSP 标记为弃用但功能正常）
+    -- luacheck: ignore 122
     local job_id = vim.fn.termopen(command, term_opts)
+    -- termopen 会重置窗口配置（如 style=minimal），需要重新设置边框和标题
+    if float_win and vim.api.nvim_win_is_valid(float_win) then
+      vim.api.nvim_win_set_config(float_win, {
+        border = "rounded",
+        title = " 💻 " .. command:sub(1, 50) .. (command:len() > 50 and "..." or "") .. " ",
+        title_pos = "center",
+      })
+    end
     -- 切回之前的窗口
     if prev_win and vim.api.nvim_win_is_valid(prev_win) then
       vim.api.nvim_set_current_win(prev_win)
