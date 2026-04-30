@@ -29,7 +29,16 @@ local default_packs = {
     name = "file_tools",
     display_name = "文件操作",
     icon = "📁",
-    tools = { "read_file", "write_file", "list_files", "search_files", "file_exists", "create_directory", "ensure_dir", "delete_file" },
+    tools = {
+      "read_file",
+      "write_file",
+      "list_files",
+      "search_files",
+      "file_exists",
+      "create_directory",
+      "ensure_dir",
+      "delete_file",
+    },
     order = 1,
   },
   lsp_tools = {
@@ -37,10 +46,21 @@ local default_packs = {
     display_name = "代码分析",
     icon = "🔍",
     tools = {
-      "lsp_hover", "lsp_definition", "lsp_references", "lsp_implementation",
-      "lsp_declaration", "lsp_document_symbols", "lsp_workspace_symbols",
-      "lsp_code_action", "lsp_rename", "lsp_format", "lsp_diagnostics",
-      "lsp_client_info", "lsp_signature_help", "lsp_completion", "lsp_type_definition",
+      "lsp_hover",
+      "lsp_definition",
+      "lsp_references",
+      "lsp_implementation",
+      "lsp_declaration",
+      "lsp_document_symbols",
+      "lsp_workspace_symbols",
+      "lsp_code_action",
+      "lsp_rename",
+      "lsp_format",
+      "lsp_diagnostics",
+      "lsp_client_info",
+      "lsp_signature_help",
+      "lsp_completion",
+      "lsp_type_definition",
       "lsp_service_info",
     },
     order = 2,
@@ -50,9 +70,14 @@ local default_packs = {
     display_name = "语法分析",
     icon = "🌳",
     tools = {
-      "parse_file", "query_captures", "get_node_at_position",
-      "get_node_type", "get_node_range", "is_named_node",
-      "get_parent_node", "get_child_nodes",
+      "parse_file",
+      "query_tree",
+      "get_node_at_position",
+      "get_node_type",
+      "get_node_range",
+      "is_named_node",
+      "get_parent_node",
+      "get_child_nodes",
     },
     order = 3,
   },
@@ -130,14 +155,20 @@ end
 --- @param pack_name string
 --- @return string
 function M.get_pack_display_name(pack_name)
+  if pack_name == "_uncategorized" then
+    return "工具调用"
+  end
   local pack = packs[pack_name]
-  return pack and pack.display_name or pack_name or "未分类"
+  return pack and pack.display_name or pack_name or "工具调用"
 end
 
 --- 获取工具包图标
 --- @param pack_name string
 --- @return string
 function M.get_pack_icon(pack_name)
+  if pack_name == "_uncategorized" then
+    return "🔧"
+  end
   local pack = packs[pack_name]
   return pack and pack.icon or "🔧"
 end
@@ -160,7 +191,11 @@ function M.group_by_pack(tool_calls)
   local uncategorized = {}
 
   for _, tc in ipairs(tool_calls) do
-    local tool_name = tc.name or (tc.func and tc.func.name) or ""
+    -- 兼容多种工具调用格式：{ name = "xxx" }, { func = { name = "xxx" } }, { ["function"] = { name = "xxx" } }
+    local tool_name = tc.name
+      or (tc.func and tc.func.name)
+      or (tc["function"] and tc["function"].name)
+      or ""
     local pack_name = M.get_pack_for_tool(tool_name)
 
     if pack_name then

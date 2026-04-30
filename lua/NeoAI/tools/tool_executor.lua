@@ -187,6 +187,7 @@ function M.execute_async(tool_name, args, on_success, on_error, on_progress)
       vim.schedule(function()
         pcall(fire_event, event_constants.TOOL_EXECUTION_COMPLETED, {
           tool_name = tool_name,
+          pack_name = pack_name,
           args = args,
           result = formatted,
           duration = duration,
@@ -217,6 +218,7 @@ function M.execute_async(tool_name, args, on_success, on_error, on_progress)
       vim.schedule(function()
         pcall(fire_event, event_constants.TOOL_EXECUTION_ERROR, {
           tool_name = tool_name,
+          pack_name = pack_name,
           args = args,
           error_msg = full_err,
           duration = duration,

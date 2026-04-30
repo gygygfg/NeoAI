@@ -235,6 +235,7 @@ local function on_tool_execution_completed(data)
   local tool_name = data.tool_name
   local args = data.args
   local result = data.result
+  local pack_name = data.pack_name -- 工具包分类
 
   if not session_id or not tool_name then return end
 
@@ -253,7 +254,7 @@ local function on_tool_execution_completed(data)
   enqueue_save(session_id, function()
     local hm = state.history_manager
     if not hm or not hm.is_initialized() then return false, "history_manager 未初始化" end
-    hm.add_tool_result(session_id, tool_name, clean_args, result)
+    hm.add_tool_result(session_id, tool_name, clean_args, result, pack_name)
     return true
   end)
 end
@@ -264,6 +265,7 @@ local function on_tool_execution_error(data)
   local tool_name = data.tool_name
   local args = data.args
   local error_msg = data.error_msg
+  local pack_name = data.pack_name -- 工具包分类
 
   if not session_id or not tool_name then return end
 
@@ -281,7 +283,7 @@ local function on_tool_execution_error(data)
   enqueue_save(session_id, function()
     local hm = state.history_manager
     if not hm or not hm.is_initialized() then return false, "history_manager 未初始化" end
-    hm.add_tool_result(session_id, tool_name, clean_args, "[错误] " .. tostring(error_msg))
+    hm.add_tool_result(session_id, tool_name, clean_args, "[错误] " .. tostring(error_msg), pack_name)
     return true
   end)
 end

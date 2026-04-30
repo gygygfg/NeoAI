@@ -153,77 +153,16 @@ function M.get_raw_messages(session_id)
     table.insert(path_ids, current.id)
   end
 
-  -- 按从根到当前的顺序收集消息
+  -- 按从根到当前的顺序收集消息，复用 manager 的消息展平逻辑
   local messages = {}
-
   for _, pid in ipairs(path_ids) do
     local s = hm.get_session(pid)
     if not s then break end
-    if s.user and s.user ~= "" then
-      table.insert(messages, { role = "user", content = s.user })
-    end
-    local assistant_list = s.assistant
-    if type(assistant_list) ~= "table" then
-      assistant_list = (assistant_list and assistant_list ~= "") and { assistant_list } or {}
-    end
-    for _, entry in ipairs(assistant_list) do
-      if type(entry) == "string" then
-        -- 折叠文本（以 {{{ 开头）或普通文本
-        if entry:match("^{{{") then
-          table.insert(messages, { role = "assistant", content = entry })
-        else
-          -- 尝试解析 JSON（含 reasoning_content 的 assistant 消息）
-          local ok, parsed = pcall(vim.json.decode, entry)
-          if ok and type(parsed) == "table" and parsed.type == "tool_call" then
-            -- 兼容旧格式：tool_call 以 JSON 字符串存储，构建折叠文本
-            local tool_name = parsed.tool_name or "unknown"
-            local args_str = vim.inspect(parsed.arguments or {})
-            if #args_str > 200 then args_str = args_str:sub(1, 200) .. "..." end
-            local result_str = tostring(parsed.result or "")
-            if #result_str > 300 then result_str = result_str:sub(1, 300) .. "\n... [truncated]" end
-            local folded_text = "{{{ 🔧 工具调用"
-              .. "\n  🔧 " .. tool_name
-              .. "\n    参数: " .. args_str
-              .. "\n    结果: " .. result_str
-              .. "\n}}}"
-            table.insert(messages, { role = "assistant", content = folded_text })
-          elseif ok and type(parsed) == "table" then
-            local has_content = parsed.content and parsed.content ~= ""
-            local has_reasoning = parsed.reasoning_content and parsed.reasoning_content ~= ""
-            if has_content or has_reasoning then
-              table.insert(messages, { role = "assistant", content = entry })
-            end
-          else
-            table.insert(messages, { role = "assistant", content = entry })
-          end
-        end
-      elseif type(entry) == "table" then
-        -- 原生 table 格式（新版存储格式）
-        if entry.type == "tool_call" then
-          -- 工具调用条目：构建可读文本，包含工具名称、参数和结果
-          local tool_name = entry.tool_name or "unknown"
-          local args_str = vim.inspect(entry.arguments or {})
-          if #args_str > 200 then args_str = args_str:sub(1, 200) .. "..." end
-          local result_str = type(entry.result) == "string" and entry.result or (pcall(vim.json.encode, entry.result) and vim.json.encode(entry.result) or tostring(entry.result or ""))
-          if #result_str > 300 then result_str = result_str:sub(1, 300) .. "\n... [truncated]" end
-          local folded_text = "{{{ 🔧 工具调用"
-            .. "\n  🔧 " .. tool_name
-            .. "\n    参数: " .. args_str
-            .. "\n    结果: " .. result_str
-            .. "\n}}}"
-          table.insert(messages, { role = "assistant", content = folded_text })
-        elseif entry.content and entry.content ~= "" then
-          if entry.reasoning_content and entry.reasoning_content ~= "" then
-            local ok_json, json_str = pcall(vim.json.encode, entry)
-            table.insert(messages, { role = "assistant", content = ok_json and json_str or entry.content })
-          else
-            table.insert(messages, { role = "assistant", content = entry.content })
-          end
-        end
-      end
+    local session_msgs = hm._session_to_messages(s)
+    for _, msg in ipairs(session_msgs) do
+      table.insert(messages, msg)
     end
   end
-
   return messages
 end
 

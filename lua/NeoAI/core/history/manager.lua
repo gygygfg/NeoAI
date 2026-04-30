@@ -186,7 +186,23 @@ end
 function M._load()
   local loaded = persistence.load()
   state.sessions = loaded
-  trigger_event(Events.SESSION_LOADED, {})
+  -- 如果有已加载的会话，设置当前会话为最近更新的那个
+  local latest_id = nil
+  local latest_time = 0
+  for id, session in pairs(loaded) do
+    local t = session.updated_at or session.created_at or 0
+    if t > latest_time then
+      latest_time = t
+      latest_id = id
+    end
+  end
+  if latest_id then
+    state.current_session_id = latest_id
+  end
+  trigger_event(Events.SESSION_LOADED, {
+    session_count = vim.tbl_count(loaded),
+    latest_session_id = latest_id,
+  })
 end
 
 -- ========== 会话 CRUD ==========
@@ -463,7 +479,12 @@ end
 
 --- 记录工具调用结果到历史
 --- 同时保存结构化 table（完整数据）和折叠文本（UI 显示）
-function M.add_tool_result(session_id, tool_name, arguments, result)
+--- @param session_id string 会话ID
+--- @param tool_name string 工具名称
+--- @param arguments table 工具参数
+--- @param result string|table 工具执行结果
+--- @param pack_name string|nil 工具所属包名（如 "lsp_tools"、"file_tools"），nil 或 "_uncategorized" 表示未分类
+function M.add_tool_result(session_id, tool_name, arguments, result, pack_name)
   local session = state.sessions[session_id]
   if not session then return false end
 
@@ -473,6 +494,7 @@ function M.add_tool_result(session_id, tool_name, arguments, result)
     tool_name = tool_name or "unknown",
     arguments = arguments or {},
     result = result,
+    pack_name = pack_name, -- 保存工具包分类信息
     timestamp = os.time(),
   }
 
@@ -552,9 +574,10 @@ function M.update_usage(session_id, usage)
   session.updated_at = os.time()
 end
 
---- 获取会话的所有消息（展平为 role/content 列表）
-function M.get_messages(session_id)
-  local session = state.sessions[session_id]
+--- 将单个会话的消息展平为 role/content 列表（内部公共函数）
+--- @param session table 会话对象
+--- @return table { {role, content}, ... }
+function M._session_to_messages(session)
   if not session then return {} end
 
   local msgs = {}
@@ -583,41 +606,59 @@ function M.get_messages(session_id)
 
     if type(parsed) == "table" then
       if parsed.type == "tool_call" then
-        -- 支持新的结构化格式（含合并场景）
+        -- 工具调用条目：用 {{{ }}} 折叠标记包裹，格式与 TOOL_LOOP_FINISHED 一致
         local tool_name = parsed.tool_name or "unknown"
         local args_str
         if parsed.arguments_list then
-          -- 合并场景：多个参数列表
           local parts = {}
           for i, args in ipairs(parsed.arguments_list) do
-            local s = vim.inspect(args or {})
-            if #s > 150 then s = s:sub(1, 150) .. "..." end
-            table.insert(parts, "  [" .. i .. "] " .. s)
+            table.insert(parts, "  [" .. i .. "] " .. vim.inspect(args or {}))
           end
           args_str = table.concat(parts, "\n")
         else
           args_str = vim.inspect(parsed.arguments or {})
-          if #args_str > 200 then args_str = args_str:sub(1, 200) .. "..." end
         end
+        -- 转义内容中的 {{{ 和 }}}，避免干扰 foldmethod=marker
+        args_str = args_str:gsub("}}}", "} } }"):gsub("{{{", "{ { {")
         local result_str
         if parsed.results then
-          -- 合并场景：多个结果
           local parts = {}
           for i, res in ipairs(parsed.results) do
             local s = type(res) == "string" and res or (pcall(vim.json.encode, res) and vim.json.encode(res) or vim.inspect(res))
-            if #s > 200 then s = s:sub(1, 200) .. "\n... [truncated]" end
             table.insert(parts, "  [" .. i .. "] " .. s)
           end
           result_str = table.concat(parts, "\n")
         else
           result_str = tostring(parsed.result or "")
-          if #result_str > 300 then result_str = result_str:sub(1, 300) .. "\n... [truncated]" end
         end
-        content = string.format(
-          "🔧 工具调用: %s\n参数: %s\n结果: %s",
-          tool_name, args_str, result_str
-        )
-        msg_type = "tool"
+        -- 清理 \r 字符，确保换行符统一
+        result_str = result_str:gsub("\r\n", "\n"):gsub("\r", "")
+        -- 检查结果中是否包含警告
+        local has_warning = false
+        for line in result_str:gmatch("[^\n]+") do
+          if line:match("^⚠️%s*警告：") then
+            has_warning = true
+            break
+          end
+        end
+        local icon = parsed.is_error and "❌" or (has_warning and "⚠️" or "✅")
+        -- 转义内容中的 {{{ 和 }}}，避免干扰 foldmethod=marker
+        result_str = result_str:gsub("}}}", "} } }"):gsub("{{{", "{ { {")
+        result_str = result_str:gsub("\n", "\n    ")
+        local duration_str = parsed.duration and string.format(" (%.1fs)", parsed.duration) or ""
+        local pack_name = parsed.pack_name or "_uncategorized"
+        local pack_icon = "🔧"
+        local pack_display = "工具调用"
+        -- 尝试获取工具包信息
+        local ok_tp, tool_pack = pcall(require, "NeoAI.tools.tool_pack")
+        if ok_tp then
+          pack_icon = tool_pack.get_pack_icon(pack_name) or "🔧"
+          pack_display = tool_pack.get_pack_display_name(pack_name) or "工具调用"
+        end
+        content = "{{{ " .. pack_icon .. " " .. pack_display .. " - " .. icon .. " " .. tool_name .. duration_str
+          .. "\n    参数: " .. args_str
+          .. "\n    结果: " .. result_str
+          .. "\n}}}"
       elseif parsed.content then
         content = parsed.content
       end
@@ -625,6 +666,14 @@ function M.get_messages(session_id)
     table.insert(msgs, { role = msg_type, content = content })
   end
   return msgs
+end
+
+--- 获取会话的所有消息（展平为 role/content 列表）
+--- 委托给 _session_to_messages
+function M.get_messages(session_id)
+  local session = state.sessions[session_id]
+  if not session then return {} end
+  return M._session_to_messages(session)
 end
 
 -- ========== 上下文路径 ==========

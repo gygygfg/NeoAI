@@ -107,7 +107,18 @@ function M.open_chat_ui(session_id, branch_id)
   if not state.initialized then error("UI not initialized") end
   local hm = get_hm()
   if (not session_id or session_id == "default") and hm and hm.is_initialized() then
-    session_id = hm.create_session("聊天会话", true, nil)
+    -- 优先使用已有历史会话（最近更新的），而不是每次都创建新会话
+    local roots = hm.get_root_sessions()
+    if roots and #roots > 0 then
+      -- 使用最近更新的根会话
+      table.sort(roots, function(a, b)
+        return (a.updated_at or a.created_at or 0) > (b.updated_at or b.created_at or 0)
+      end)
+      session_id = roots[1].id
+      hm.set_current_session(session_id)
+    else
+      session_id = hm.create_session("聊天会话", true, nil)
+    end
   end
   session_id = session_id or state.current_session_id or "default"
   open_window("chat", session_id, branch_id or "main")
@@ -181,9 +192,18 @@ function M._register_event_listeners()
     pattern = Events.SESSION_LOADED,
     callback = function(args)
       local data = args.data or {}
-      state.current_session_id = data.new_session_id
+      if data.latest_session_id then
+        state.current_session_id = data.latest_session_id
+      end
       if state.current_ui_mode == "chat" and state.windows.chat then
-        chat_window.update_title((data.session or {}).name or "加载的会话")
+        local hm = get_hm()
+        if hm and hm.is_initialized() then
+          local session = hm.get_session(state.current_session_id)
+          if session then
+            chat_window.update_title(session.name or "加载的会话")
+            chat_window.render_chat()
+          end
+        end
       end
       refresh_tree()
     end,

@@ -868,6 +868,21 @@ function M._handle_stream_end(generation_id, processor, params)
   local usage = processor.usage or {}
   local tool_calls = processor.tool_calls or {}
 
+  -- 过滤掉流式截断导致的无效工具调用（name 为空或 arguments 为空的条目）
+  -- DeepSeek 等模型在流式过程中可能发送空的 tool_call 骨架，流式结束时需清理
+  local valid_tool_calls = {}
+  for _, tc in ipairs(tool_calls) do
+    local func = tc["function"] or tc.func
+    if func and func.name and func.name ~= "" then
+      local args = func.arguments
+      -- 跳过 arguments 为 nil 或空字符串的条目（流式截断导致）
+      if args ~= nil and args ~= "" then
+        table.insert(valid_tool_calls, tc)
+      end
+    end
+  end
+  tool_calls = valid_tool_calls
+
   -- 清理 reasoning 节流状态
   if _reasoning_throttle.timer then
     pcall(_reasoning_throttle.timer.stop, _reasoning_throttle.timer)
@@ -961,6 +976,8 @@ function M._handle_stream_end(generation_id, processor, params)
           "[ai_engine] 流式响应异常但重试已达上限 (%d/%d): %s",
           retry_count, response_retry.get_max_retries(), reason
         ))
+        -- 重试已达上限：不再重试，继续正常处理当前响应（包含 tool_calls）
+        -- 避免工具调用被丢弃导致 UI 不渲染且不保存
       end
     end
   end
@@ -1147,6 +1164,19 @@ function M._handle_ai_response(generation_id, response, params)
     end
   end
 
+  -- 过滤掉无效的工具调用（name 为空或 arguments 为空的条目）
+  local valid_tool_calls = {}
+  for _, tc in ipairs(tool_calls) do
+    local func = tc["function"] or tc.func
+    if func and func.name and func.name ~= "" then
+      local args = func.arguments
+      if args ~= nil and args ~= "" then
+        table.insert(valid_tool_calls, tc)
+      end
+    end
+  end
+  tool_calls = valid_tool_calls
+
   -- ===== 响应异常检测与重试 =====
   local is_tool_loop = params and params.is_tool_loop
   local is_final_round = params and params.is_final_round
@@ -1187,6 +1217,8 @@ function M._handle_ai_response(generation_id, response, params)
           "[ai_engine] 响应异常但重试已达上限 (%d/%d): %s",
           retry_count, response_retry.get_max_retries(), reason
         ))
+        -- 重试已达上限：不再重试，继续正常处理当前响应（包含 tool_calls）
+        -- 避免工具调用被丢弃导致 UI 不渲染且不保存
       end
     end
   end

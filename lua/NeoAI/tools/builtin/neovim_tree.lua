@@ -501,10 +501,10 @@ M.parse_file = define_tool({
 })
 
 -- ============================================================================
--- 工具 query_captures - 使用查询模式捕获节点（回调模式）
+-- 工具 query_tree - 使用查询模式捕获节点（回调模式）
 -- ============================================================================
 
-local function _query_captures_for_source(source_text, lang, query_string)
+local function _query_tree_for_source(source_text, lang, query_string)
   local ok, query = pcall(ts.query.parse, lang, query_string)
   if not ok then
     return nil, "查询语法错误: " .. tostring(query)
@@ -552,7 +552,7 @@ local function _query_captures_for_source(source_text, lang, query_string)
     nil
 end
 
-local function _query_captures(args, on_success, on_error)
+local function _query_tree(args, on_success, on_error)
   if not check_ts() then
     if on_error then
       on_error("Tree-sitter 不可用（需要 Neovim >= 0.5）")
@@ -579,7 +579,7 @@ local function _query_captures(args, on_success, on_error)
     end
 
     ensure_parser_installed(lang, function()
-      local result, qerr = _query_captures_for_source(content, lang, query_string)
+      local result, qerr = _query_tree_for_source(content, lang, query_string)
       if qerr then
         if on_error then
           on_error(qerr)
@@ -602,10 +602,10 @@ local function _query_captures(args, on_success, on_error)
   end)
 end
 
-M.query_captures = define_tool({
-  name = "query_captures",
+M.query_tree = define_tool({
+  name = "query_tree",
   description = "使用 Tree-sitter 查询模式捕获文件中语法树节点，支持自定义查询字符串。如果解析器未安装，会自动尝试安装。",
-  func = _query_captures,
+  func = _query_tree,
   async = true,
   parameters = {
     type = "object",

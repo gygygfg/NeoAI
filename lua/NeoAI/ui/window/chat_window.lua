@@ -344,8 +344,6 @@ function M.open(session_id, window_id, branch_id)
     "",
     "加载中...",
     "",
-    "---",
-    "",
   }
   if buf and vim.api.nvim_buf_is_valid(buf) then
     pcall(vim.api.nvim_set_option_value, "modifiable", true, { buf = buf })
@@ -547,8 +545,18 @@ function M._render_single_message(msg, prev_role)
     local reasoning_lines = vim.split(reasoning_content, "\n")
     -- AI 标志和思考过程标准直接连续，不换行
     table.insert(lines, role_prefix .. " 🤔 思考过程:")
-    for _, rline in ipairs(reasoning_lines) do
-      table.insert(lines, "    " .. rline)
+    -- 如果思考过程超过 200 个字符，使用折叠文本
+    local reasoning_text_combined = table.concat(reasoning_lines, " ")
+    if #reasoning_text_combined > 200 then
+      local preview = reasoning_text_combined:sub(1, 200)
+      table.insert(lines, "    " .. preview .. "...")
+      table.insert(lines, "    {{{ 点击展开完整思考过程")
+      table.insert(lines, "    " .. reasoning_text_combined)
+      table.insert(lines, "    }}}")
+    else
+      for _, rline in ipairs(reasoning_lines) do
+        table.insert(lines, "    " .. rline)
+      end
     end
     if main_content and main_content ~= "" then
       table.insert(lines, "")
@@ -593,12 +601,9 @@ function M._do_render_chat()
         "# NeoAI 聊天",
         "",
         string.format("会话: %s", state.current_session_id or "未知"),
-        "---",
         "",
         "暂无消息",
         "输入消息开始聊天...",
-        "",
-        "---",
         "",
       }
       M._apply_rendered_content(empty_content)
@@ -619,7 +624,6 @@ function M._do_render_chat()
       if model_label then
         table.insert(content, string.format("模型: %s", model_label))
       end
-      table.insert(content, "---")
       table.insert(content, "")
 
       -- 消息区域
@@ -631,10 +635,6 @@ function M._do_render_chat()
         end
         prev_role = msg.role
       end
-
-      -- 在最后添加分割线，作为对话结束的标记
-      table.insert(content, "---")
-      table.insert(content, "")
 
       return content
     end, function(success, content)
@@ -747,7 +747,6 @@ function M.render_chat_async(callback)
     table.insert(content, "# NeoAI 聊天")
     table.insert(content, "")
     table.insert(content, string.format("会话: %s", state.current_session_id or "未知"))
-    table.insert(content, "---")
     table.insert(content, "")
 
     -- 添加消息
@@ -2409,53 +2408,8 @@ function M._setup_event_listeners()
 
           table.insert(state.messages, { role = "assistant", content = folded_text, timestamp = os.time() })
           state.tool_display.folded_saved = true
-
-          local buf = get_buf()
-          if buf_valid(buf) then
-            set_buf_modifiable(buf, true)
-            -- 在插入折叠文本前保存光标位置和总行数，用于判断光标是否在末尾附近
-            local win = get_win()
-            local cursor_before = win_valid(win) and vim.api.nvim_win_get_cursor(win) or nil
-            local lc_before = get_line_count(buf)
-
-            local lc = lc_before
-            local lines = vim.split(folded_text, "\n")
-            table.insert(lines, "")
-            vim.api.nvim_buf_set_lines(buf, lc, lc, false, lines)
-            vim.api.nvim_set_option_value("modified", false, { buf = buf })
-            -- 光标在后5行才跟随：延迟一帧等待 foldmethod=marker 渲染完成
-            local new_lc = get_line_count(buf)
-            if win_valid(win) and cursor_before then
-              -- 用插入前的数据判断光标是否在末尾附近（避免折叠文本行数多导致误判）
-              if lc_before - cursor_before[1] <= 5 then
-                vim.defer_fn(function()
-                  if not win_valid(win) or not buf_valid(buf) then
-                    return
-                  end
-                  local current_lc = get_line_count(buf)
-                  -- 找到折叠文本结束位置：从末尾向上找第一个 }}} 行，光标跳到它的下一行
-                  local fold_end_line = current_lc
-                  for i = current_lc, 1, -1 do
-                    local line_content = vim.api.nvim_buf_get_lines(buf, i - 1, i, false)[1] or ""
-                    if line_content:match("^}}}") then
-                      fold_end_line = i + 1
-                      break
-                    end
-                  end
-                  if fold_end_line > current_lc then fold_end_line = current_lc end
-                  local target_line = vim.api.nvim_buf_get_lines(buf, fold_end_line - 1, fold_end_line, false)[1] or ""
-                  pcall(vim.api.nvim_win_set_cursor, win, { fold_end_line, #target_line })
-                  -- 滚动窗口使光标行位于窗口底部
-                  pcall(vim.api.nvim_win_call, win, function()
-                    local win_height = vim.api.nvim_win_get_height(win)
-                    local view = vim.fn.winsaveview()
-                    view.topline = math.max(1, fold_end_line - win_height + 1)
-                    vim.fn.winrestview(view)
-                  end)
-                end, 50)
-              end
-            end
-          end
+          -- 通过 _append_message_to_buffer 写入指定 buffer，确保经过 _render_single_message 格式化
+          M._append_message_to_buffer("assistant", folded_text)
         end
         close_tool_display()
       end
@@ -2628,6 +2582,13 @@ function M._append_message_to_buffer(role, content)
   -- 注意：不追加分割线，分割线只在 _do_render_chat 全量重渲染时添加
 
   pcall(vim.api.nvim_set_option_value, "modified", false, { buf = buf })
+  -- 移动光标到新追加内容的末尾
+  local win = window_manager.get_window_win(state.current_window_id)
+  if win and vim.api.nvim_win_is_valid(win) then
+    local new_line_count = vim.api.nvim_buf_line_count(buf)
+    local last_line = vim.api.nvim_buf_get_lines(buf, new_line_count - 1, new_line_count, false)[1] or ""
+    pcall(vim.api.nvim_win_set_cursor, win, { new_line_count, #last_line })
+  end
   M._scroll_to_end_with_offset()
 end
 

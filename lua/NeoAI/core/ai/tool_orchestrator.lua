@@ -837,6 +837,19 @@ function M.on_generation_complete(data)
   local content = data.content or ""
   local is_final_round = data.is_final_round or false
 
+  -- 过滤掉流式截断导致的无效工具调用（name 为空或 arguments 为空的条目）
+  local valid_tool_calls = {}
+  for _, tc in ipairs(tool_calls) do
+    local func = tc["function"] or tc.func
+    if func and func.name and func.name ~= "" then
+      local args = func.arguments
+      if args ~= nil and args ~= "" then
+        table.insert(valid_tool_calls, tc)
+      end
+    end
+  end
+  tool_calls = valid_tool_calls
+
   if ss.stop_requested then
     M._finish_loop(session_id, true, content)
     return
@@ -897,6 +910,8 @@ function M.on_generation_complete(data)
             reason
           )
         )
+        -- 重试已达上限：不再重试，继续正常处理当前工具调用
+        -- 避免工具调用被丢弃导致 UI 不渲染且不保存
       end
     end
   end

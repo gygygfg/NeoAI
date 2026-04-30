@@ -87,16 +87,19 @@ local function has_truncated_content(text)
     return true
   end
 
-  -- 检查是否以不完整的句子结束（以逗号、连字符、冒号结尾）
+  -- 检查是否以不完整的句子结束（以逗号、冒号、分号结尾）
+  -- 注意：不检测 "-"（连字符），因为 Markdown 列表项、日期等正常文本可能以 "-" 结尾
+  -- 同时不检测 "/" 和 "\\"，因为文件路径可能以这些字符结尾
   local last_char = text:sub(-1)
-  local incomplete_endings = { [","] = true, ["-"] = true, [":"] = true, [";"] = true, ["|"] = true, ["/"] = true, ["\\"] = true }
+  local incomplete_endings = { [","] = true, [":"] = true, [";"] = true, ["|"] = true }
   if incomplete_endings[last_char] then
     logger.debug("[response_retry] 检测到不完整结尾: '" .. last_char .. "'")
     return true
   end
 
-  -- 检查是否以不完整的 Markdown 语法结束
-  if text:match("%[.*$") or text:match("%(.*$") or text:match("!%[.*$") then
+  -- 检查是否以不完整的 Markdown 语法结束（仅检测结尾处未闭合的语法）
+  -- 注意：使用锚定到行尾的匹配，避免误判文本中正常出现的 "[" 或 "("
+  if text:match("%[%s*$") or text:match("%(%s*$") or text:match("!%[%s*$") then
     logger.debug("[response_retry] 检测到不完整的 Markdown 语法")
     return true
   end
@@ -105,7 +108,8 @@ local function has_truncated_content(text)
 end
 
 --- 检测工具调用是否异常
---- 策略：检查工具调用名称是否重复、参数是否为空等
+--- 策略：检查工具调用参数是否为空，以及是否存在完全相同的重复调用（同名+同参数）
+--- 注意：同名但不同参数的多次工具调用（如多次 read_file 读取不同文件）是正常行为，不视为异常
 --- @param tool_calls table 工具调用列表
 --- @return boolean 是否检测到异常
 local function has_abnormal_tool_calls(tool_calls)
@@ -113,28 +117,61 @@ local function has_abnormal_tool_calls(tool_calls)
     return false
   end
 
-  -- 检查是否有重复的工具调用名称
-  local seen_names = {}
-  for _, tc in ipairs(tool_calls) do
+  -- 检查是否有空参数的工具调用（仅检测真正为空的参数，不检测 JSON 空对象 "{}"）
+  for i, tc in ipairs(tool_calls) do
     local func = tc["function"] or tc.func
-    if func and func.name then
-      if seen_names[func.name] then
-        logger.debug("[response_retry] 检测到重复的工具调用: " .. func.name)
+    if func then
+      local args = func.arguments
+      local args_type = type(args)
+      local args_str = tostring(args)
+      -- 只检测真正为空的情况：nil、空字符串、或空 table
+      -- 注意："{}"（JSON 空对象）是合法参数，表示一个空参数对象
+      if args == nil then
+        logger.debug(string.format(
+          "[response_retry] 检测到空参数工具调用 #%d: name=%s, args=nil",
+          i, tostring(func.name)
+        ))
         return true
       end
-      seen_names[func.name] = true
+      if args_type == "string" and args == "" then
+        logger.debug(string.format(
+          "[response_retry] 检测到空参数工具调用 #%d: name=%s, args='' (空字符串)",
+          i, tostring(func.name)
+        ))
+        return true
+      end
+      if args_type == "table" and vim.tbl_isempty(args) then
+        logger.debug(string.format(
+          "[response_retry] 检测到空参数工具调用 #%d: name=%s, args={} (空 table)",
+          i, tostring(func.name)
+        ))
+        return true
+      end
     end
   end
 
-  -- 检查是否有空参数的工具调用
-  for _, tc in ipairs(tool_calls) do
+  -- 检查是否有完全相同的重复调用（同名 + 同参数）
+  -- 注意：仅同名但参数不同的多次调用（如多次 read_file 读取不同文件）是正常行为
+  local seen_signatures = {}
+  for i, tc in ipairs(tool_calls) do
     local func = tc["function"] or tc.func
-    if func then
-      local args = func.arguments or ""
-      if args == "" or args == "{}" then
-        logger.debug("[response_retry] 检测到空参数工具调用: " .. tostring(func.name))
+    if func and func.name then
+      local args = func.arguments
+      local args_str
+      if type(args) == "table" then
+        args_str = vim.inspect(args)
+      else
+        args_str = tostring(args or "")
+      end
+      local signature = func.name .. ":" .. args_str
+      if seen_signatures[signature] then
+        logger.debug(string.format(
+          "[response_retry] 检测到完全相同的重复工具调用 #%d: name=%s, signature=%s",
+          i, func.name, signature
+        ))
         return true
       end
+      seen_signatures[signature] = true
     end
   end
 
