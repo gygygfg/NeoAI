@@ -799,6 +799,9 @@ function M._request_summary_round(session_id)
     end
     -- 注意：不检查 stop_requested。总结轮次是由 stop_tool 或循环结束触发的最终行为，
     -- 即使 stop_requested 为 true 也应执行总结，否则 AI 不会生成最终回复。
+    -- 临时清除 stop_requested 标志，避免 ai_engine.handle_tool_result 跳过总结轮次的 AI 请求
+    local saved_stop_requested = s.stop_requested
+    s.stop_requested = false
     vim.api.nvim_exec_autocmds("User", {
       pattern = event_constants.TOOL_RESULT_RECEIVED,
       data = {
@@ -815,6 +818,8 @@ function M._request_summary_round(session_id)
         last_reasoning = saved.last_reasoning,
       },
     })
+    -- 恢复 stop_requested 标志
+    s.stop_requested = saved_stop_requested
   end)
 
   fire_loop_finished(ss)
@@ -1004,9 +1009,9 @@ function M.on_generation_complete(data)
           if is_shutting_down() then
             return
           end
-          -- 触发 GENERATION_COMPLETED 事件，通知 UI 更新
+          -- 触发 SUMMARY_COMPLETED 事件，通知 UI 更新（区别于普通生成完成）
           pcall(vim.api.nvim_exec_autocmds, "User", {
-            pattern = event_constants.GENERATION_COMPLETED,
+            pattern = event_constants.SUMMARY_COMPLETED,
             data = {
               generation_id = saved_gen_id,
               response = content,
@@ -1168,6 +1173,7 @@ function M._finish_loop(session_id, success, result)
   local saved_generation_id = ss.generation_id
   local saved_window_id = ss.window_id
   local saved_reasoning = ss.last_reasoning or ""
+  local saved_result = result or ""
 
   -- 用户取消时不触发总结，直接调用 on_complete 回调结束
   if ss.user_cancelled then
@@ -1178,7 +1184,38 @@ function M._finish_loop(session_id, success, result)
     ss.generation_id = nil
     if on_complete then
       vim.schedule(function()
-        on_complete(true, result or "", saved_usage)
+        on_complete(true, saved_result, saved_usage)
+      end)
+    end
+    return
+  end
+
+  -- 如果总结轮次已经在进行中（_summary_in_progress 为 true），
+  -- 说明 _on_tools_complete 的 stop_requested 路径已触发过 _request_summary_round，
+  -- 当前是 on_generation_complete 回调中总结轮次完成后的再次调用。
+  -- 此时直接触发 GENERATION_COMPLETED 事件，避免重复触发总结轮次。
+  if ss._summary_in_progress then
+    ss.on_complete = nil
+    ss.phase = "idle"
+    ss.active_tool_calls = {}
+    ss.current_iteration = 0
+    ss.generation_id = nil
+    ss._summary_in_progress = false
+    if not is_shutting_down() then
+      vim.schedule(function()
+        if is_shutting_down() then return end
+        pcall(vim.api.nvim_exec_autocmds, "User", {
+          pattern = event_constants.GENERATION_COMPLETED,
+          data = {
+            generation_id = saved_generation_id,
+            response = saved_result,
+            reasoning_text = saved_reasoning,
+            usage = saved_usage,
+            session_id = session_id,
+            window_id = saved_window_id,
+            duration = 0,
+          },
+        })
       end)
     end
     return

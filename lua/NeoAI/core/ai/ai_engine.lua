@@ -237,11 +237,16 @@ local function format_messages(messages)
 
   local result = {}
   -- 收集所有 tool_call_id（来自 assistant 消息的 tool_calls）
+  -- 对于没有 id 的 tool_call，生成占位 ID 并直接添加到消息中
   local expected_tool_call_ids = {} ---@type table<string,boolean>
   for _, msg in ipairs(messages) do
     if msg.tool_calls then
       for _, tc in ipairs(msg.tool_calls) do
         if tc.id and tc.id ~= "" then
+          expected_tool_call_ids[tc.id] = true
+        else
+          -- 为没有 id 的 tool_call 生成占位 ID，避免 API 报错
+          tc.id = "call_placeholder_" .. os.time() .. "_" .. math.random(10000, 99999)
           expected_tool_call_ids[tc.id] = true
         end
       end
@@ -875,8 +880,8 @@ function M._handle_stream_end(generation_id, processor, params)
     local func = tc["function"] or tc.func
     if func and func.name and func.name ~= "" then
       local args = func.arguments
-      -- 跳过 arguments 为 nil 或空字符串的条目（流式截断导致）
-      if args ~= nil and args ~= "" then
+      -- 跳过 arguments 为 nil、空字符串或空 JSON 对象 "{}" 的条目（流式截断导致）
+      if args ~= nil and args ~= "" and args ~= "{}" then
         table.insert(valid_tool_calls, tc)
       end
     end
@@ -994,8 +999,27 @@ function M._handle_stream_end(generation_id, processor, params)
           })
           return
         end
+        -- 总结轮次重试耗尽：直接触发错误，避免不完整的 tool_calls 污染消息历史
+        if is_final_round then
+          logger.warn("[ai_engine] 总结轮次重试已达上限，触发生成错误")
+          M.handle_generation_error(generation_id, "总结轮次重试耗尽: " .. tostring(reason))
+          return
+        end
         -- 其他异常：继续正常处理当前响应（包含 tool_calls）
         -- 避免工具调用被丢弃导致 UI 不渲染且不保存
+        -- 注意：此时 tool_calls 可能不完整（流式截断导致），后续 API 调用可能失败
+        -- 清理 tool_calls 中可能不完整的条目，避免污染消息历史
+        local cleaned_tool_calls = {}
+        for _, tc in ipairs(tool_calls) do
+          local func = tc["function"] or tc.func
+          if func and func.name and func.name ~= "" then
+            local args = func.arguments
+            if args and args ~= "" and args ~= "{}" then
+              table.insert(cleaned_tool_calls, tc)
+            end
+          end
+        end
+        tool_calls = cleaned_tool_calls
       end
     end
   end
@@ -1188,7 +1212,8 @@ function M._handle_ai_response(generation_id, response, params)
     local func = tc["function"] or tc.func
     if func and func.name and func.name ~= "" then
       local args = func.arguments
-      if args ~= nil and args ~= "" then
+      -- 跳过 arguments 为 nil、空字符串或空 JSON 对象 "{}" 的条目
+      if args ~= nil and args ~= "" and args ~= "{}" then
         table.insert(valid_tool_calls, tc)
       end
     end
@@ -1235,8 +1260,27 @@ function M._handle_ai_response(generation_id, response, params)
           "[ai_engine] 响应异常但重试已达上限 (%d/%d): %s",
           retry_count, response_retry.get_max_retries(), reason
         ))
-        -- 重试已达上限：不再重试，继续正常处理当前响应（包含 tool_calls）
+        -- 重试已达上限：不再重试
+        -- 总结轮次重试耗尽：直接触发错误，避免不完整的 tool_calls 污染消息历史
+        if is_final_round then
+          logger.warn("[ai_engine] 总结轮次重试已达上限，触发生成错误")
+          M.handle_generation_error(generation_id, "总结轮次重试耗尽: " .. tostring(reason))
+          return
+        end
+        -- 其他异常：继续正常处理当前响应（包含 tool_calls）
         -- 避免工具调用被丢弃导致 UI 不渲染且不保存
+        -- 清理 tool_calls 中可能不完整的条目，避免污染消息历史
+        local cleaned_tool_calls = {}
+        for _, tc in ipairs(tool_calls) do
+          local func = tc["function"] or tc.func
+          if func and func.name and func.name ~= "" then
+            local args = func.arguments
+            if args and args ~= "" and args ~= "{}" then
+              table.insert(cleaned_tool_calls, tc)
+            end
+          end
+        end
+        tool_calls = cleaned_tool_calls
       end
     end
   end
@@ -1749,9 +1793,16 @@ function M.cancel_generation()
   http_client.cancel_all_requests()
 
   if generation then
+    -- 获取累积用量信息，用于取消时保存到历史
+    local accumulated_usage = generation.accumulated_usage or {}
     vim.api.nvim_exec_autocmds("User", {
       pattern = event_constants.GENERATION_CANCELLED,
-      data = { generation_id = generation_id, session_id = generation.session_id, window_id = generation.window_id },
+      data = {
+        generation_id = generation_id,
+        session_id = generation.session_id,
+        window_id = generation.window_id,
+        usage = accumulated_usage,
+      },
     })
     if generation_id then
       state.active_generations[generation_id] = nil

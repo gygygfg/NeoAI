@@ -12,6 +12,7 @@ M.GENERATION_ERROR = "NeoAI:generation_error" -- AI 生成出错
 M.GENERATION_CANCELLED = "NeoAI:generation_cancelled" -- AI 生成被取消
 M.GENERATION_RETRYING = "NeoAI:generation_retrying" -- AI 生成正在重试（检测到异常响应）
 M.CANCEL_GENERATION = "NeoAI:cancel_generation" -- 请求取消当前生成
+M.SUMMARY_COMPLETED = "NeoAI:summary_completed" -- AI 总结完成（工具循环中 AI 自行返回总结内容，无需额外总结轮次）
 
 -- ==================== 流式处理事件 ====================
 -- 使用位置: ai_engine.lua, chat_window.lua, chat_handlers.lua

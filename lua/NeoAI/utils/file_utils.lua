@@ -1,5 +1,61 @@
 local M = {}
 
+-- ========== 后台 Buffer 缓存管理 ==========
+-- 跟踪由 file_utils 静默加载到后台 buffer 的文件
+-- 格式: { [abs_path] = true }
+-- 在会话界面关闭时统一清理
+local _loaded_buffers = {}
+
+--- 将文件异步加载到 Neovim 后台 buffer（静默，不打开窗口）
+--- 读取文件内容后调用，不阻塞当前流程
+--- @param path string 文件绝对路径
+local function async_load_to_buffer(path)
+  if not path or path == "" then
+    return
+  end
+  local abs_path = vim.fn.fnamemodify(path, ":p")
+  -- 如果已经在 buffer 中或已标记，跳过
+  if _loaded_buffers[abs_path] or vim.fn.bufnr(abs_path) ~= -1 then
+    return
+  end
+  _loaded_buffers[abs_path] = true
+  vim.schedule(function()
+    -- 再次检查，防止竞态
+    if vim.fn.bufnr(abs_path) ~= -1 then
+      return
+    end
+    local bufnr = vim.fn.bufadd(abs_path)
+    if bufnr and bufnr > 0 then
+      vim.fn.bufload(bufnr)
+    end
+  end)
+end
+
+--- 清理所有由 file_utils 加载到后台 buffer 的文件
+--- 在会话界面关闭时调用
+function M.cleanup_session_buffers()
+  for abs_path, _ in pairs(_loaded_buffers) do
+    local bufnr = vim.fn.bufnr(abs_path)
+    if bufnr ~= -1 and vim.api.nvim_buf_is_valid(bufnr) then
+      -- 只删除未被其他窗口引用的 buffer
+      local win_count = #vim.fn.win_findbuf(bufnr)
+      if win_count == 0 then
+        pcall(vim.api.nvim_buf_delete, bufnr, { force = true })
+      end
+    end
+  end
+  _loaded_buffers = {}
+end
+
+--- 获取当前跟踪的后台 buffer 数量
+function M.get_loaded_buffer_count()
+  local count = 0
+  for _, _ in pairs(_loaded_buffers) do
+    count = count + 1
+  end
+  return count
+end
+
 --- 读取文件
 --- @param path string 文件路径
 --- @return string|nil, string|nil 文件内容，错误时返回nil和错误信息
@@ -44,6 +100,9 @@ function M.read_file(path)
     end
   end
 
+  -- 读取成功后，异步将文件加载到后台 buffer
+  async_load_to_buffer(path)
+
   return content
 end
 
@@ -75,6 +134,9 @@ function M.write_file(path, content, append)
   if not success then
     return nil, "写入失败: " .. (write_err or "未知错误")
   end
+
+  -- 写入成功后，异步将文件加载到后台 buffer（确保 buffer 内容最新）
+  async_load_to_buffer(path)
 
   return true
 end
@@ -143,6 +205,8 @@ function M.exists(path)
     if file then
       file:close()
     end
+    -- 文件存在，异步加载到后台 buffer
+    async_load_to_buffer(path)
     return true
   end
 

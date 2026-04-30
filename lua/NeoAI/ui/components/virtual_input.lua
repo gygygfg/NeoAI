@@ -217,6 +217,33 @@ function M.open(parent_win, opts)
   -- 设置按键映射
   M._setup_float_keymaps()
 
+  -- 如果父窗口光标在底部附近，向上滚动使光标不被输入框遮挡
+  -- 输入框高度为 input_height + 2（含 border），需要确保光标上方有足够空间
+  if state.parent_win and vim.api.nvim_win_is_valid(state.parent_win) then
+    local parent_buf = vim.api.nvim_win_get_buf(state.parent_win)
+    local cursor = vim.api.nvim_win_get_cursor(state.parent_win)
+    local cursor_line = cursor[1]
+    local win_height = vim.api.nvim_win_get_height(state.parent_win)
+    local buf_line_count = vim.api.nvim_buf_line_count(parent_buf)
+
+    -- 计算需要预留的行数（输入框高度 + 2 行余量）
+    local reserved_lines = input_height + 2
+
+    -- 如果光标在窗口底部附近（光标行 + 预留行数 > 窗口高度），向上滚动
+    if cursor_line + reserved_lines > win_height then
+      local target_topline = math.max(1, cursor_line - win_height + reserved_lines + 1)
+      -- 确保不超出 buffer 范围
+      target_topline = math.min(target_topline, math.max(1, buf_line_count - win_height + 1))
+      pcall(vim.api.nvim_win_set_option, state.parent_win, "scrolloff", 0)
+      pcall(vim.api.nvim_win_call, state.parent_win, function()
+        vim.api.nvim_win_set_cursor(state.parent_win, { cursor_line, cursor[2] })
+        local view = vim.fn.winsaveview()
+        view.topline = target_topline
+        vim.fn.winrestview(view)
+      end)
+    end
+  end
+
   -- 延迟聚焦到输入框，确保在 _do_render_chat 的异步回调（set_window_content、_focus_window 等）执行完后才设置焦点
   -- 避免被 _do_render_chat 中的操作抢走焦点
   vim.defer_fn(function()

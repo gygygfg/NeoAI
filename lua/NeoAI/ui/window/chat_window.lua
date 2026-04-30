@@ -129,6 +129,11 @@ local state = {
     substeps = {}, -- { [tool_name] = { { name, status, duration, detail } } }
   },
 
+  -- 生成进行中标志
+  -- 在 GENERATION_STARTED 中设为 true，在 GENERATION_COMPLETED/GENERATION_CANCELLED 中设为 false
+  -- 用于阻止生成过程中打开虚拟输入框
+  generation_in_progress = false,
+
   -- 工具调用循环进行中标志
   -- 在 TOOL_LOOP_STARTED 中设为 true，在 GENERATION_COMPLETED 中设为 false
   -- 用于阻止工具循环过程中打开虚拟输入框
@@ -704,7 +709,7 @@ function M._apply_rendered_content(content)
     if cursor_near_end then
       local last_line_content = vim.api.nvim_buf_get_lines(buf, new_line_count - 1, new_line_count, false)[1] or ""
       pcall(vim.api.nvim_win_set_cursor, win, { new_line_count, #last_line_content })
-      if not state.streaming.active then
+      if not state.streaming.active and not state.generation_in_progress then
         M._open_float_input()
       end
     elseif saved_cursor_lnum then
@@ -770,8 +775,8 @@ function M.render_chat_async(callback)
       window_manager.set_window_content(state.current_window_id, content)
       -- 自动获取焦点
       M._focus_window()
-      -- 仅在非流式状态下打开浮动虚拟输入框
-      if not state.streaming.active then
+      -- 仅在非流式且无生成进行中时打开浮动虚拟输入框
+      if not state.streaming.active and not state.generation_in_progress then
         M._open_float_input()
       end
 
@@ -937,6 +942,11 @@ function M._open_float_input()
 
   -- 如果已激活，跳过
   if virtual_input.is_active() then
+    return
+  end
+
+  -- 生成进行中时不打开虚拟输入框
+  if state.generation_in_progress then
     return
   end
 
@@ -1222,6 +1232,13 @@ function M.close()
     end
     -- 清理 completed_generations，避免无限增长
     completed_generations = {}
+    -- 清理 file_utils 加载的后台 buffer
+    pcall(function()
+      local fu = require("NeoAI.utils.file_utils")
+      if fu.cleanup_session_buffers then
+        fu.cleanup_session_buffers()
+      end
+    end)
     state.closing = false
 
     -- 触发窗口关闭事件
@@ -1697,13 +1714,11 @@ end
 
 --- 设置事件监听器（内部函数）
 function M._setup_event_listeners()
-  -- GENERATION_STARTED：关闭虚拟输入框
+  -- GENERATION_STARTED：关闭虚拟输入框，标记生成进行中
   vim.api.nvim_create_autocmd("User", {
     pattern = Events.GENERATION_STARTED,
-    callback = function(args)
-      if not is_current_window((args.data or {}).window_id) then
-        return
-      end
+    callback = function()
+      state.generation_in_progress = true
       if virtual_input.is_active() then
         virtual_input.close()
       end
@@ -1817,6 +1832,7 @@ function M._setup_event_listeners()
       local had_stream_prefix = state.streaming.prefix_added or state.streaming.reasoning_prefix_added
       reset_streaming_state()
       state.tool_loop_in_progress = false
+      state.generation_in_progress = false
 
       -- 增量更新：仅当没有流式数据时（非流式总结），才追加完整消息到缓冲区
       -- 如果总结内容已通过流式方式追加，跳过以避免重复
@@ -1828,14 +1844,44 @@ function M._setup_event_listeners()
       end
 
       M._update_usage_virt_text()
-      -- 仅在光标跟随模式下滚动和打开输入框
-      local generation_win = get_win()
-      if cursor_near_end(generation_win) then
-        M._scroll_to_end_with_offset()
-        M._open_float_input()
-        if virtual_input.is_active() then
-          virtual_input.focus_and_insert()
-        end
+      -- 滚动到末尾并打开虚拟输入框
+      M._scroll_to_end_with_offset()
+      M._open_float_input()
+      if virtual_input.is_active() then
+        virtual_input.focus_and_insert()
+      end
+    end,
+  })
+
+  -- SUMMARY_COMPLETED：AI 总结完成（工具循环中 AI 自行返回总结内容）
+  vim.api.nvim_create_autocmd("User", {
+    pattern = Events.SUMMARY_COMPLETED,
+    callback = function(args)
+      if state.closing then
+        return
+      end
+      local data = args.data or {}
+      if not is_current_window(data.window_id) then
+        return
+      end
+
+      -- 保存用量信息
+      if data.usage and next(data.usage) then
+        state.last_usage = data.usage
+      end
+
+      -- 清理流式状态
+      clear_stream_throttle()
+      reset_streaming_state()
+      state.tool_loop_in_progress = false
+      state.generation_in_progress = false
+
+      -- 显示用量并打开虚拟输入框
+      M._update_usage_virt_text()
+      M._scroll_to_end_with_offset()
+      M._open_float_input()
+      if virtual_input.is_active() then
+        virtual_input.focus_and_insert()
       end
     end,
   })
@@ -2429,15 +2475,23 @@ function M._setup_event_listeners()
   -- GENERATION_CANCELLED：生成取消
   vim.api.nvim_create_autocmd("User", {
     pattern = Events.GENERATION_CANCELLED,
-    callback = function()
+    callback = function(args)
       if state.closing then
         return
+      end
+      -- 保存用量信息（如果有）
+      local data = args.data or {}
+      if data.usage and next(data.usage) then
+        state.last_usage = data.usage
       end
       cancel_reasoning_timer()
       close_reasoning_display()
       clear_stream_throttle()
       reset_streaming_state()
       state.tool_loop_in_progress = false
+      state.generation_in_progress = false
+      M._update_usage_virt_text()
+      M._open_float_input()
       M.show_floating_text("AI生成已取消", { timeout = 3000, position = "center", border = "single" })
     end,
   })
@@ -2714,16 +2768,19 @@ function M._append_stream_chunk_to_buffer(chunk_content, content_type)
 
   local lines = vim.split(chunk_content, "\n", { plain = true })
   for i, line in ipairs(lines) do
-    if i == 1 and line ~= "" then
-      if lc > 0 then
-        local last = get_last_line(buf)
-        local new_text = last == "🤖 AI:" and ("🤖 AI: " .. line) or (last == "" and line or last .. line)
-        vim.api.nvim_buf_set_lines(buf, lc - 1, lc, false, { new_text })
-      else
-        vim.api.nvim_buf_set_lines(buf, 0, -1, false, { line })
+    if i == 1 then
+      if line ~= "" then
+        if lc > 0 then
+          local last = get_last_line(buf)
+          local new_text = last == "🤖 AI:" and ("🤖 AI: " .. line) or (last == "" and line or last .. line)
+          vim.api.nvim_buf_set_lines(buf, lc - 1, lc, false, { new_text })
+        else
+          vim.api.nvim_buf_set_lines(buf, 0, -1, false, { line })
+        end
+        lc = get_line_count(buf)
       end
-      lc = get_line_count(buf)
-    elseif line ~= "" then
+      -- 第一行为空行时不做任何操作，后续非空行会作为新行追加
+    else
       vim.api.nvim_buf_set_lines(buf, lc, lc, false, { line })
       lc = get_line_count(buf)
     end

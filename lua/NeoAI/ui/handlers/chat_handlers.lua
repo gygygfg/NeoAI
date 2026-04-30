@@ -66,14 +66,34 @@ function M.initialize(config)
     end,
   })
 
-  -- 监听取消生成事件：保存已生成的内容到历史文件
+  -- 监听总结完成事件：保存用量信息到历史记录
+  vim.api.nvim_create_autocmd("User", {
+    pattern = Events.SUMMARY_COMPLETED,
+    callback = function(args)
+      local data = args.data or {}
+      local hm = get_hm()
+      if not hm then return end
+      if data.usage and next(data.usage) and data.session_id then
+        hm.update_usage(data.session_id, data.usage)
+        hm._mark_dirty()
+      end
+    end,
+  })
+
+  -- 监听取消生成事件：保存已生成的内容和用量到历史文件
   -- 注意：chat_window 的 GENERATION_CANCELLED 回调先执行，会调用 reset_streaming_state() 清空流式缓冲区
   -- 所以这里改为从 chat_window.state.messages 中获取最后一条 assistant 消息的内容
   vim.api.nvim_create_autocmd("User", {
     pattern = Events.GENERATION_CANCELLED,
-    callback = function()
+    callback = function(args)
       local hm = get_hm()
       if not hm then return end
+
+      -- 保存用量信息
+      local data = args.data or {}
+      if data.usage and next(data.usage) and data.session_id then
+        hm.update_usage(data.session_id, data.usage)
+      end
 
       -- 从 chat_window 的 state.messages 中获取最后一条 assistant 消息的内容
       -- chat_window 的 GENERATION_CANCELLED 回调已先执行，流式缓冲区已被清空
@@ -195,7 +215,7 @@ function M.send_message(content, session_id, branch_id, window_id, format, callb
     chat_window.add_message("user", content)
   end
 
-  -- 4. 调用后端服务发送消息
+  -- 4. 调用后端服务发送消息（内部会同步触发 GENERATION_STARTED 事件关闭输入框）
   local success, result = chat_service.send_message({
     content = content,
     session_id = target_session_id,
@@ -204,6 +224,12 @@ function M.send_message(content, session_id, branch_id, window_id, format, callb
       model_index = chat_window.get_current_model_index and chat_window.get_current_model_index() or 1,
     },
   })
+
+  -- 确保虚拟输入框已关闭（GENERATION_STARTED 事件可能因 window_id 不匹配等原因未触发关闭）
+  local virtual_input = require("NeoAI.ui.components.virtual_input")
+  if virtual_input.is_active() then
+    virtual_input.close()
+  end
 
   if callback then
     callback(success, result)

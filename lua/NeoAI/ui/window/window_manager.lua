@@ -15,6 +15,8 @@ local state = {
   },
   current_mode = "float",
   available_modes = { "float", "tab", "split" },
+  -- 保存每个 chat 窗口打开前当前窗口的 wrap 状态
+  saved_wrap_states = {},
 }
 
 -- ========== LSP 阻止 ==========
@@ -270,6 +272,18 @@ function M.create_window(window_type, options)
     vim.api.nvim_buf_set_name(window_info.buf, "neoai://" .. window_type .. "/" .. window_id)
   end
 
+  -- 打开 chat 窗口时保存当前窗口的 wrap 状态并启用自动换行
+  if window_type == "chat" then
+    local cur_win = vim.api.nvim_get_current_win()
+    if cur_win and vim.api.nvim_win_is_valid(cur_win) then
+      local saved = vim.api.nvim_get_option_value("wrap", { win = cur_win })
+      state.saved_wrap_states[window_id] = saved
+      -- 为 chat 窗口启用自动换行
+      vim.api.nvim_set_option_value("wrap", true, { win = window_info.win })
+      vim.api.nvim_set_option_value("linebreak", true, { win = window_info.win })
+    end
+  end
+
   -- 注册 BufLeave/BufEnter 管理悬浮窗口
   if vim.tbl_contains({ "chat", "tree" }, window_type) then
     local buf = window_info.buf
@@ -280,6 +294,17 @@ function M.create_window(window_type, options)
     vim.api.nvim_create_autocmd("BufLeave", {
       group = group, buffer = buf,
       callback = function()
+        -- 离开 chat 窗口时恢复之前窗口的 wrap 状态
+        if window_type == "chat" then
+          local saved = state.saved_wrap_states[window_id]
+          if saved ~= nil then
+            local ok_cur, cur_win = pcall(vim.api.nvim_get_current_win)
+            if ok_cur and cur_win and vim.api.nvim_win_is_valid(cur_win) then
+              vim.api.nvim_set_option_value("wrap", saved, { win = cur_win })
+            end
+          end
+        end
+
         vim.defer_fn(function()
           -- 检查 Neovim 是否正在退出，避免在退出过程中操作窗口导致死循环
           local ok, tp = pcall(vim.api.nvim_get_current_tabpage)
@@ -299,6 +324,15 @@ function M.create_window(window_type, options)
     vim.api.nvim_create_autocmd("BufEnter", {
       group = group, buffer = buf,
       callback = function()
+        -- 进入 chat 窗口时确保启用自动换行
+        if window_type == "chat" then
+          local win = window_info.win
+          if win and vim.api.nvim_win_is_valid(win) then
+            vim.api.nvim_set_option_value("wrap", true, { win = win })
+            vim.api.nvim_set_option_value("linebreak", true, { win = win })
+          end
+        end
+
         M.show_float_window(buf)
         if window_type == "tree" then
           local ok, tw = pcall(require, "NeoAI.ui.window.tree_window")
@@ -325,6 +359,19 @@ function M.close_window(window_id)
   end
 
   if window.window_info then close_window_by_mode(window.window_info) end
+
+  -- 关闭 chat 窗口后恢复之前保存的 wrap 状态
+  if window.type == "chat" then
+    local saved_wrap = state.saved_wrap_states[window_id]
+    if saved_wrap ~= nil then
+      -- 窗口关闭后，当前活跃窗口应该是之前所在的窗口，恢复其 wrap 状态
+      local ok_cur, cur_win = pcall(vim.api.nvim_get_current_win)
+      if ok_cur and cur_win and vim.api.nvim_win_is_valid(cur_win) then
+        vim.api.nvim_set_option_value("wrap", saved_wrap, { win = cur_win })
+      end
+    end
+    state.saved_wrap_states[window_id] = nil
+  end
 
   local event_map = { chat = Events.CHAT_WINDOW_CLOSED, tree = Events.TREE_WINDOW_CLOSED }
   local event_name = event_map[window.type]

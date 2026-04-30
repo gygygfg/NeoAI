@@ -39,11 +39,6 @@ local function get_filepath()
   return save_path .. "/sessions.json"
 end
 
---- 获取备份文件路径
-local function get_backup_filepath()
-  return get_filepath() .. ".bak"
-end
-
 -- ========== 序列化 ==========
 
 --- 序列化所有会话为 JSON 字符串
@@ -152,12 +147,7 @@ local function atomic_write(filepath, content)
 
   -- 重命名（原子操作）
   local rename_ok, rename_err = pcall(function()
-    -- 先备份原文件
-    local backup_path = get_backup_filepath()
-    if vim.fn.filereadable(filepath) == 1 then
-      vim.fn.rename(filepath, backup_path)
-    end
-    -- 重命名临时文件为目标文件
+    -- 直接重命名临时文件为目标文件（覆盖原文件）
     vim.fn.rename(tmp_path, filepath)
   end)
 
@@ -180,16 +170,9 @@ function M.load()
 
   -- 检查文件是否存在
   if vim.fn.filereadable(filepath) ~= 1 then
-    -- 尝试从备份恢复
-    local backup_path = get_backup_filepath()
-    if vim.fn.filereadable(backup_path) == 1 then
-      logger.warn("[history_persistence] 主文件不存在，从备份恢复")
-      vim.fn.copyfile(backup_path, filepath)
-    else
-      -- 创建空文件
-      write_file_sync(filepath, "[]")
-      return {}
-    end
+    -- 创建空文件
+    write_file_sync(filepath, "[]")
+    return {}
   end
 
   -- 读取文件
@@ -202,21 +185,7 @@ function M.load()
   -- 验证 JSON 完整性
   local ok, decoded = pcall(vim.json.decode, content)
   if not ok then
-    logger.warn("[history_persistence] JSON 解析失败，尝试从备份恢复")
-    local backup_path = get_backup_filepath()
-    if vim.fn.filereadable(backup_path) == 1 then
-      local backup_content = read_file_sync(backup_path)
-      if backup_content then
-        local ok2, decoded2 = pcall(vim.json.decode, backup_content)
-        if ok2 then
-          -- 恢复成功，覆盖主文件
-          write_file_sync(filepath, backup_content)
-          return M.deserialize(backup_content)
-        end
-      end
-    end
-    -- 备份也无效，返回空
-    logger.warn("[history_persistence] 备份也无效，返回空会话")
+    logger.warn("[history_persistence] JSON 解析失败，返回空会话")
     return {}
   end
 
@@ -318,12 +287,6 @@ function M.sync_save(sessions)
 
   local filepath = get_filepath()
   ensure_dir(filepath)
-
-  -- 先备份
-  local backup_path = get_backup_filepath()
-  if vim.fn.filereadable(filepath) == 1 then
-    pcall(vim.fn.copyfile, filepath, backup_path)
-  end
 
   -- 同步写入
   local ok, err = write_file_sync(filepath, content)
