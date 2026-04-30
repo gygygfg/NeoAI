@@ -16,21 +16,22 @@ function M.initialize(config)
   end
 
   -- 初始化配置模块（含键位配置管理器和状态管理器）
+  -- state_manager 已在 init.lua 的 setup() 中初始化，此处只需初始化 keymap_manager
   local config_module = require("NeoAI.core.config")
   config_module.initialize(config)
 
   -- 初始化 AI 引擎
+  -- 各子模块自行从 state_manager 读取配置，无需传递
   ai_engine.initialize({
-    config = config,
     session_manager = nil, -- 旧版 session_manager 已废弃，使用 history_manager
   })
 
   -- 初始化历史管理器（唯一数据源）
-  history_manager.initialize({ config = config })
+  history_manager.initialize()
 
   -- 初始化聊天服务（前后端分离的后端入口）
   local chat_service = require("NeoAI.core.ai.chat_service")
-  chat_service.initialize({ config = config })
+  chat_service.initialize()
 
   initialized = true
   return M

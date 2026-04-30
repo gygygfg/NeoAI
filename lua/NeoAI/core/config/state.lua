@@ -35,11 +35,18 @@ function M.get_config_value(key, default)
   end
   local keys = vim.split(key, ".", { plain = true })
   local value = state.config
-  for _, k in ipairs(keys) do
+  for i, k in ipairs(keys) do
     if type(value) ~= "table" then
       return default
     end
     value = value[k]
+    -- 如果是最后一个键，直接返回（允许 boolean/number/string 等非 table 类型）
+    if i == #keys then
+      if value == nil then
+        return default
+      end
+      return value
+    end
   end
   if value == nil then
     return default

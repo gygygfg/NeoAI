@@ -3,7 +3,7 @@
 local M = {}
 
 local logger = require("NeoAI.utils.logger")
-local default_config = require("NeoAI.default_config")
+local config_merger = require("NeoAI.core.config.merger")
 local core = require("NeoAI.core")
 local ui = require("NeoAI.ui")
 local tools = require("NeoAI.tools")
@@ -179,7 +179,7 @@ function M.setup(user_config)
   end
 
   -- 处理配置：验证 → 合并 → 清理，一步完成
-  local config = default_config.process_config(user_config)
+  local config = config_merger.process_config(user_config)
 
   -- 初始化统一状态管理器
   state_manager.initialize(config)

@@ -26,12 +26,12 @@ local persistence = require("NeoAI.core.history.persistence")
 local cache = require("NeoAI.core.history.cache")
 local saver = require("NeoAI.core.history.saver")
 local shutdown_flag = require("NeoAI.core.shutdown_flag")
+local state_manager = require("NeoAI.core.config.state")
 
 -- ========== 状态 ==========
 
 local state = {
   initialized = false,
-  config = nil,
   sessions = {},           -- { [id] = session }
   current_session_id = nil,
   _vimleave_hooked = false,
@@ -106,21 +106,23 @@ end
 function M.initialize(options)
   if state.initialized then return end
 
-  options = options or {}
-  state.config = vim.deepcopy(options.config or options or {})
-  if state.config.session and type(state.config.session) == "table" then
-    for k, v in pairs(state.config.session) do
-      state.config[k] = v
-    end
-    state.config.session = nil
-  end
-  state.config.auto_save = state.config.auto_save ~= false
-  state.config.auto_naming = state.config.auto_naming ~= false
   state.sessions = {}
   state.current_session_id = nil
 
+  -- 优先从统一状态管理器获取会话配置
+  -- 若 state_manager 未初始化（如测试环境），回退到 options.config
+  local full_config
+  if state_manager.is_initialized() then
+    full_config = state_manager.get_config() or {}
+  else
+    full_config = (options or {}).config or {}
+  end
+  local session_config = full_config.session or {}
+  local auto_save = session_config.auto_save ~= false
+  local auto_naming = session_config.auto_naming ~= false
+
   -- 初始化持久化模块
-  persistence.initialize({ config = state.config })
+  persistence.initialize({ config = session_config })
 
   -- 初始化缓存模块
   cache.initialize(get_sessions_ref, M.build_round_text)
@@ -396,7 +398,8 @@ function M.add_round(session_id, user_msg, assistant_msg, usage)
 
   trigger_event(Events.ROUND_ADDED, { session_id = session_id, session = session })
 
-  if state.config.auto_naming ~= false then
+  local auto_naming = state_manager.get_config_value("session.auto_naming") ~= false
+  if auto_naming then
     M.auto_name_session(session_id)
   end
 
@@ -942,7 +945,8 @@ end
 -- ========== 持久化 ==========
 
 function M._mark_dirty()
-  if not state.config.auto_save then return end
+  local auto_save = state_manager.get_config_value("session.auto_save") ~= false
+  if not auto_save then return end
   if state._is_shutting_down then return end
 
   persistence.debounced_save(function()
@@ -1019,7 +1023,6 @@ end
 
 function M._test_reset()
   state.initialized = false
-  state.config = nil
   state.sessions = {}
   state.current_session_id = nil
   state._is_shutting_down = false

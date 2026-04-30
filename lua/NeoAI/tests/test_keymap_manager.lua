@@ -34,10 +34,29 @@ function M.run(test_module)
   local assert = test.assert
   print("\n=== test_keymap_manager ===")
 
+  -- 每个测试前重置 keymap_manager 的内部状态
+  local function reset_km()
+    -- 重置 state_manager（测试环境），确保 keymap_manager 从参数 config 读取
+    local sm = require("NeoAI.core.config.state")
+    if sm.is_initialized() then
+      sm._test_reset()
+    end
+    -- 清除保存的 keymaps 文件，避免 load_keymaps 污染状态
+    local config_file = vim.fn.stdpath("config") .. "/neoai_keymaps.json"
+    local f = io.open(config_file, "r")
+    if f then
+      f:close()
+      os.remove(config_file)
+    end
+    -- 重新加载模块以重置 DEFAULT_KEYMAPS
+    package.loaded["NeoAI.core.config.keymap_manager"] = nil
+    return require("NeoAI.core.config.keymap_manager")
+  end
+
   return test.run_tests({
     --- 测试 initialize
     test_initialize = function()
-      local km = require("NeoAI.core.config.keymap_manager")
+      local km = reset_km()
       km.initialize(create_test_config())
 
       local contexts = km.get_available_contexts()
@@ -49,10 +68,8 @@ function M.run(test_module)
 
     --- 测试 get_keymap
     test_get_keymap = function()
-      local km = require("NeoAI.core.config.keymap_manager")
+      local km = reset_km()
       km.initialize(create_test_config())
-      -- 重置为默认，避免之前测试的污染
-      km.load_default_keymaps()
 
       local keymap = km.get_keymap("global", "open_tree")
       assert.not_nil(keymap, "应获取到键位")
@@ -70,7 +87,7 @@ function M.run(test_module)
 
     --- 测试 get_context_keymaps
     test_get_context_keymaps = function()
-      local km = require("NeoAI.core.config.keymap_manager")
+      local km = reset_km()
       km.initialize(create_test_config())
 
       local global_keymaps = km.get_context_keymaps("global")
@@ -86,7 +103,7 @@ function M.run(test_module)
 
     --- 测试 set_keymap
     test_set_keymap = function()
-      local km = require("NeoAI.core.config.keymap_manager")
+      local km = reset_km()
       km.initialize(create_test_config())
 
       local ok = km.set_keymap("global", "open_tree", "<leader>tt", "自定义打开树")
@@ -99,7 +116,7 @@ function M.run(test_module)
 
     --- 测试 reset_keymap
     test_reset_keymap = function()
-      local km = require("NeoAI.core.config.keymap_manager")
+      local km = reset_km()
       km.initialize(create_test_config())
 
       -- 先修改再重置

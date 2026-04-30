@@ -4,6 +4,7 @@ local logger = require("NeoAI.utils.logger")
 local window_manager = require("NeoAI.ui.window.window_manager")
 local virtual_input = require("NeoAI.ui.components.virtual_input")
 local Events = require("NeoAI.core.events")
+local state_manager = require("NeoAI.core.config.state")
 
 -- ========== 辅助函数（不依赖 state） ==========
 
@@ -81,7 +82,6 @@ end
 -- 模块状态
 local state = {
   initialized = false,
-  config = nil,
   current_window_id = nil, -- 当前聊天窗口的窗口ID
   current_session_id = nil, -- 当前聊天窗口关联的会话ID
   messages = {},
@@ -226,9 +226,9 @@ local function get_chat_service()
   return ok and cs or nil
 end
 
-local function get_default_config()
-  local ok, dc = pcall(require, "NeoAI.default_config")
-  return ok and dc or nil
+local function get_config_merger()
+  local ok, cm = pcall(require, "NeoAI.core.config.merger")
+  return ok and cm or nil
 end
 
 --- 初始化聊天窗口
@@ -237,7 +237,6 @@ function M.initialize(config)
   if state.initialized then
     return
   end
-  state.config = config or {}
   state.initialized = true
 
   -- 初始化虚拟输入组件
@@ -816,13 +815,15 @@ function M.set_keymaps()
   end
 
   -- 从合并后的配置中获取 chat 上下文键位
-  local chat_config = (state.config.keymaps or {}).chat or {}
+  -- 所有键位统一由 default_config.lua 定义，模块内部不提供任何 fallback 默认值
+  -- 从统一状态管理器获取键位配置
+  local chat_config = state_manager.get_config_value("keymaps.chat")
   local keymaps = {
-    insert = (chat_config.insert or {}).key or "i",
-    quit = (chat_config.quit or {}).key or "q",
-    refresh = (chat_config.refresh or {}).key or "r",
-    switch_model = (chat_config.switch_model or {}).key or "m",
-    cancel = (chat_config.cancel or {}).key or "<Esc>",
+    insert = chat_config.insert.key,
+    quit = chat_config.quit.key,
+    refresh = chat_config.refresh.key,
+    switch_model = chat_config.switch_model.key,
+    cancel = chat_config.cancel.key,
   }
 
   -- 使用闭包创建局部函数引用，避免每次按键都调用 require
@@ -1343,8 +1344,6 @@ function M.update_config(new_config)
   if not state.initialized then
     return
   end
-
-  state.config = vim.tbl_extend("force", state.config, new_config or {})
 
   -- 如果窗口打开，重新设置按键映射
   if state.current_window_id then
@@ -2954,7 +2953,7 @@ function M._show_tool_display()
   -- 使用 window_manager 创建浮动窗口
   local win_id = window_manager.create_window("tool_display", {
     title = "🔧 工具调用",
-    width = state.config.width and math.min(state.config.width - 4, 80) or 60,
+    width = state_manager.get_config_value("ui.window.width") and math.min(state_manager.get_config_value("ui.window.width") - 4, 80) or 60,
     height = dynamic_height,
     border = "rounded",
     style = "minimal",
@@ -2984,13 +2983,19 @@ function M._show_tool_display()
     vim.api.nvim_set_option_value("modifiable", false, { buf = window_info.buf })
 
     -- 设置按键映射
-    vim.keymap.set("n", "q", "<Cmd>lua require('NeoAI.ui.window.chat_window')._close_tool_display()<CR>", {
+    -- 从统一状态管理器获取键位配置
+    local chat_config = state_manager.get_config_value("keymaps.chat")
+    vim.keymap.set("n", chat_config.quit.key, function()
+      require('NeoAI.ui.window.chat_window')._close_tool_display()
+    end, {
       buffer = window_info.buf,
       desc = "关闭工具调用窗口",
       silent = true,
       noremap = true,
     })
-    vim.keymap.set("n", "<Esc>", "<Cmd>lua require('NeoAI.ui.window.chat_window')._close_tool_display()<CR>", {
+    vim.keymap.set("n", chat_config.cancel.key, function()
+      require('NeoAI.ui.window.chat_window')._close_tool_display()
+    end, {
       buffer = window_info.buf,
       desc = "关闭工具调用窗口",
       silent = true,
@@ -3144,15 +3149,15 @@ end
 --- 获取当前使用的模型标签
 --- @return string|nil 模型标签，如 "deepseek/deepseek-chat"
 function M._get_current_model_label()
-  local default_config = require("NeoAI.default_config")
+  local config_merger = require("NeoAI.core.config.merger")
   -- 优先从场景候选获取模型名（与发送消息时使用的配置一致）
-  local candidates = default_config.get_scenario_candidates("chat")
+  local candidates = config_merger.get_scenario_candidates("chat")
   local target = candidates[state.current_model_index]
   if target then
     return string.format("%s/%s", target.provider or "?", target.model_name or "?")
   end
   -- 回退到 get_available_models
-  local models = default_config.get_available_models("chat")
+  local models = config_merger.get_available_models("chat")
   local fallback = models[state.current_model_index]
   if fallback then
     return string.format("%s/%s", fallback.provider or "?", fallback.model_name or "?")
@@ -3173,13 +3178,13 @@ function M.show_model_selector()
     return
   end
 
-  local default_config = require("NeoAI.default_config")
+  local config_merger = require("NeoAI.core.config.merger")
   -- 优先使用场景候选列表（与发送消息时使用的配置一致）
-  local candidates = default_config.get_scenario_candidates("chat")
+  local candidates = config_merger.get_scenario_candidates("chat")
 
   if #candidates == 0 then
     -- 回退到 get_available_models
-    local models = default_config.get_available_models("chat")
+    local models = config_merger.get_available_models("chat")
     if #models == 0 then
       vim.notify("[NeoAI] 没有可用的模型（请检查 API key 配置）", vim.log.levels.WARN)
       return
@@ -3240,14 +3245,14 @@ function M.switch_to_model(model_index)
     return
   end
 
-  local default_config = require("NeoAI.default_config")
+  local config_merger = require("NeoAI.core.config.merger")
   -- 优先使用场景候选列表
-  local candidates = default_config.get_scenario_candidates("chat")
+  local candidates = config_merger.get_scenario_candidates("chat")
   local target = candidates[model_index]
 
   if not target then
     -- 回退到 get_available_models
-    local models = default_config.get_available_models("chat")
+    local models = config_merger.get_available_models("chat")
     target = models[model_index]
     if not target then
       vim.notify("[NeoAI] 无效的模型索引: " .. tostring(model_index), vim.log.levels.WARN)

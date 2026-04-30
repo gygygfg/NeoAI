@@ -2,13 +2,14 @@ local M = {}
 
 local logger = require("NeoAI.utils.logger")
 local Events = require("NeoAI.core.events")
+local state_manager = require("NeoAI.core.config.state")
 
 local windows = {}
 local window_counter = 0
 local float_windows = {}
 
 local state = {
-  initialized = false, config = nil,
+  initialized = false,
   default_options = {
     relative = "editor", style = "minimal", border = "rounded",
     title = "NeoAI", title_pos = "center", zindex = 50,
@@ -63,8 +64,7 @@ end
 
 function M.initialize(config)
   if state.initialized then return end
-  state.config = vim.tbl_extend("force", state.default_options, config or {})
-  state.current_mode = config and config.default_mode or "float"
+  state.current_mode = (config and config.window_mode) or "float"
   state.initialized = true
 
   vim.api.nvim_create_autocmd("LspAttach", {
@@ -232,7 +232,8 @@ function M.create_window(window_type, options)
 
   window_counter = window_counter + 1
   local window_id = "win_" .. tostring(os.time()) .. "_" .. window_counter
-  local merged = vim.tbl_extend("force", state.config, options or {})
+  local full_config = state_manager.get_config() or {}
+  local merged = vim.tbl_extend("force", full_config, options or {})
   merged.title = merged.title or ("NeoAI - " .. window_type)
 
   local mode = merged.window_mode or state.current_mode
@@ -584,7 +585,7 @@ end
 
 function M.update_config(new_config)
   if not state.initialized then return end
-  state.config = vim.tbl_extend("force", state.config, new_config or {})
+  -- 配置统一由 state_manager 管理，此处无需保存副本
 end
 
 -- ========== 悬浮窗口管理 ==========

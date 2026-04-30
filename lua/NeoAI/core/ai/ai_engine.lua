@@ -5,7 +5,8 @@ local M = {}
 local logger = require("NeoAI.utils.logger")
 local event_constants = require("NeoAI.core.events")
 local json = require("NeoAI.utils.json")
-local default_config = require("NeoAI.default_config")
+local config_merger = require("NeoAI.core.config.merger")
+local state_manager = require("NeoAI.core.config.state")
 local shutdown_flag = require("NeoAI.core.shutdown_flag")
 
 -- 子模块
@@ -26,7 +27,6 @@ local response_retry = require("NeoAI.core.ai.response_retry")
 ---@field session_manager SessionManager|nil
 local state = {
   initialized = false,
-  full_config = {},
   is_generating = false,
   current_generation_id = nil,
   tools = {},
@@ -60,11 +60,18 @@ function M.initialize(options)
     return M
   end
 
-  state.full_config = options.config or {}
   state.session_manager = options.session_manager
 
   http_client.initialize({ config = {} })
-  tool_orchestrator.initialize({ config = state.full_config, session_manager = state.session_manager })
+  -- 优先从统一状态管理器获取配置
+  -- 若 state_manager 未初始化（如测试环境），回退到 options.config
+  local full_config
+  if state_manager.is_initialized() then
+    full_config = state_manager.get_config()
+  else
+    full_config = (options or {}).config or {}
+  end
+  tool_orchestrator.initialize({ config = full_config, session_manager = state.session_manager })
 
   -- 初始化工具包管理模块
   local tool_pack = require("NeoAI.tools.tool_pack")
@@ -113,14 +120,15 @@ end
 
 --- 获取场景的 AI 配置
 local function resolve_scenario_config(scenario)
-  if default_config and default_config.get_preset then
-    local preset = default_config.get_preset(scenario)
+  if config_merger and config_merger.get_preset then
+    local preset = config_merger.get_preset(scenario)
     if preset and preset.base_url and preset.api_key then
       return preset
     end
   end
 
-  local ai_config = state.full_config.ai or {}
+  local full_config = state_manager.get_config()
+  local ai_config = (full_config and full_config.ai) or {}
   local scenarios = ai_config.scenarios or {}
   local entry = scenarios[scenario] or scenarios[ai_config.default or "chat"]
   if not entry then
@@ -160,8 +168,8 @@ local function get_model_config(model_index)
   local preset = {}
 
   -- 1. 场景候选列表
-  if default_config and default_config.get_scenario_candidates then
-    local candidates = default_config.get_scenario_candidates("chat")
+  if config_merger and config_merger.get_scenario_candidates then
+    local candidates = config_merger.get_scenario_candidates("chat")
     local target = candidates[model_index]
     if target then
       preset = vim.deepcopy(target)
@@ -171,11 +179,12 @@ local function get_model_config(model_index)
 
   -- 2. get_available_models 回退
   if not preset.base_url or not preset.api_key then
-    if default_config and default_config.get_available_models then
-      local models = default_config.get_available_models("chat")
+    if config_merger and config_merger.get_available_models then
+      local models = config_merger.get_available_models("chat")
       local target = models[model_index]
       if target then
-        local providers = (state.full_config.ai or {}).providers or {}
+        local full_config = state_manager.get_config()
+        local providers = (full_config and full_config.ai and full_config.ai.providers) or {}
         local pdef = providers[target.provider]
         if pdef then
           preset.base_url = pdef.base_url
@@ -377,10 +386,13 @@ local function build_request(params)
     local tools_enabled
     if options.tools_enabled ~= nil then
       tools_enabled = options.tools_enabled
-    elseif state.full_config.tools and state.full_config.tools.enabled ~= nil then
-      tools_enabled = state.full_config.tools.enabled
     else
-      tools_enabled = state.full_config.ai and state.full_config.ai.tools_enabled
+      local full_config = state_manager.get_config()
+      if full_config and full_config.tools and full_config.tools.enabled ~= nil then
+        tools_enabled = full_config.tools.enabled
+      elseif full_config and full_config.ai then
+        tools_enabled = full_config.ai.tools_enabled
+      end
     end
 
     local is_first = state.first_request
@@ -1030,10 +1042,11 @@ function M._handle_stream_end(generation_id, processor, params)
 
   -- 检查工具是否启用
   local tools_enabled = true
-  if state.full_config.tools and state.full_config.tools.enabled ~= nil then
-    tools_enabled = state.full_config.tools.enabled
-  elseif state.full_config.ai and state.full_config.ai.tools_enabled ~= nil then
-    tools_enabled = state.full_config.ai.tools_enabled
+  local full_config = state_manager.get_config()
+  if full_config and full_config.tools and full_config.tools.enabled ~= nil then
+    tools_enabled = full_config.tools.enabled
+  elseif full_config and full_config.ai then
+    tools_enabled = full_config.ai.tools_enabled
   end
 
   if #tool_calls > 0 and tools_enabled then
@@ -1286,10 +1299,11 @@ function M._handle_ai_response(generation_id, response, params)
   end
 
   local tools_enabled = true
-  if state.full_config.tools and state.full_config.tools.enabled ~= nil then
-    tools_enabled = state.full_config.tools.enabled
-  elseif state.full_config.ai and state.full_config.ai.tools_enabled ~= nil then
-    tools_enabled = state.full_config.ai.tools_enabled
+  local full_config = state_manager.get_config()
+  if full_config and full_config.tools and full_config.tools.enabled ~= nil then
+    tools_enabled = full_config.tools.enabled
+  elseif full_config and full_config.ai then
+    tools_enabled = full_config.ai.tools_enabled
   end
 
   -- 清理 reasoning 节流状态（确保不残留到下一轮工具循环）

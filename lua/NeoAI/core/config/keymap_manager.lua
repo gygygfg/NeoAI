@@ -1,6 +1,7 @@
 local M = {}
 
 local logger = require("NeoAI.utils.logger")
+local state_manager = require("NeoAI.core.config.state")
 
 -- 已合并的键位配置（由主init.lua传入，已完成默认和用户配置的合并）
 local DEFAULT_KEYMAPS = nil
@@ -13,8 +14,14 @@ local config_file_path = vim.fn.stdpath("config") .. "/neoai_keymaps.json"
 --- 初始化键位管理器
 --- @param config table 完整配置（主init.lua已完成配置合并），从中提取 keymaps 部分
 function M.initialize(config)
-  -- 从完整配置中提取键位配置部分
-  local merged_keymaps = (config or {}).keymaps or {}
+  -- 优先从统一状态管理器获取键位配置
+  -- 若 state_manager 未初始化（如测试环境），则回退到参数 config
+  local merged_keymaps
+  if state_manager.is_initialized() then
+    merged_keymaps = state_manager.get_config_value("keymaps") or {}
+  else
+    merged_keymaps = (config or {}).keymaps or {}
+  end
   -- 设置默认配置
   DEFAULT_KEYMAPS = vim.deepcopy(merged_keymaps)
 

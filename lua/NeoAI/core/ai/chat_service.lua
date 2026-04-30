@@ -9,12 +9,12 @@ local event_constants = require("NeoAI.core.events")
 local ai_engine = require("NeoAI.core.ai.ai_engine")
 local history_manager = require("NeoAI.core.history.manager")
 local shutdown_flag = require("NeoAI.core.shutdown_flag")
+local state_manager = require("NeoAI.core.config.state")
 
 -- ========== 状态 ==========
 
 local state = {
   initialized = false,
-  config = nil,
   pending_user_messages = {},
 }
 
@@ -32,7 +32,6 @@ end
 
 function M.initialize(options)
   if state.initialized then return M end
-  state.config = options.config or {}
   M._setup_event_listeners()
   state.initialized = true
   logger.info("[chat_service] 聊天服务初始化完成")
@@ -252,12 +251,9 @@ function M.send_message(params)
 
   -- 检查工具是否启用
   local tools_enabled = true
-  local core_ok, core_mod = pcall(require, "NeoAI.core")
-  if core_ok then
-    local full_config = core_mod.get_config()
-    if full_config and full_config.tools then
-      tools_enabled = full_config.tools.enabled ~= false
-    end
+  local full_config = state_manager.get_config()
+  if full_config and full_config.tools then
+    tools_enabled = full_config.tools.enabled ~= false
   end
 
   -- 调用 AI 引擎生成响应

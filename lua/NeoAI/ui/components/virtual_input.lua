@@ -1,9 +1,10 @@
 local M = {}
 
+local state_manager = require("NeoAI.core.config.state")
+
 -- 模块状态
 local state = {
   initialized = false,
-  config = nil,
   active = false,
   mode = nil, -- "inline" 或 "float"
   buf = nil, -- 聊天 buffer（内联模式）
@@ -26,7 +27,6 @@ function M.initialize(config)
   if state.initialized then
     return
   end
-  state.config = config or {}
   state.ns_id = vim.api.nvim_create_namespace("NeoAI_InlineInput")
   state.initialized = true
 end
@@ -492,6 +492,27 @@ function M.cancel()
   end
 end
 
+--- 在光标位置插入新行（换行辅助函数）
+local function _insert_newline()
+  if not state.float_buf or not vim.api.nvim_buf_is_valid(state.float_buf) then
+    return
+  end
+  local win = vim.api.nvim_get_current_win()
+  local cursor = vim.api.nvim_win_get_cursor(win)
+  local lnum = cursor[1] -- 1-based
+  local col = cursor[2] -- 0-based
+  local lines = vim.api.nvim_buf_get_lines(state.float_buf, 0, -1, false)
+  local current_line = lines[lnum] or ""
+  -- 将当前行在光标处拆分为两行
+  local before = current_line:sub(1, col)
+  local after = current_line:sub(col + 1)
+  lines[lnum] = before
+  table.insert(lines, lnum + 1, after)
+  vim.api.nvim_buf_set_lines(state.float_buf, 0, -1, false, lines)
+  -- 光标移到新行的行首
+  vim.api.nvim_win_set_cursor(win, { lnum + 1, 0 })
+end
+
 --- 设置浮动输入框按键映射
 function M._setup_float_keymaps()
   if not state.float_buf or not vim.api.nvim_buf_is_valid(state.float_buf) then
@@ -499,31 +520,20 @@ function M._setup_float_keymaps()
   end
   local buf = state.float_buf
 
-  -- 发送消息（Enter）
-  vim.keymap.set("i", "<CR>", function()
+  -- 从配置读取 send 键位（send.insert / send.normal 是 { key = "...", desc = "..." } 结构）
+  local send_config = state_manager.get_config_value("keymaps.chat.send")
+  local send_key = send_config and send_config.insert and send_config.insert.key or "<C-s>"
+  local normal_send_key = send_config and send_config.normal and send_config.normal.key or "<CR>"
+
+  -- 插入模式：send_key 发送，<CR> 换行
+  vim.keymap.set("i", send_key, function()
     M._submit_float()
   end, { buffer = buf, noremap = true, silent = true, desc = "发送消息" })
+  vim.keymap.set("i", "<CR>", _insert_newline, { buffer = buf, noremap = true, silent = true, desc = "换行" })
+  vim.keymap.set("i", "<S-CR>", _insert_newline, { buffer = buf, noremap = true, silent = true, desc = "换行" })
 
-  -- 换行（Shift+Enter）：在当前光标位置插入新行
-  vim.keymap.set("i", "<S-CR>", function()
-    if not state.float_buf or not vim.api.nvim_buf_is_valid(state.float_buf) then return end
-    local win = vim.api.nvim_get_current_win()
-    local cursor = vim.api.nvim_win_get_cursor(win)
-    local lnum = cursor[1]  -- 1-based
-    local col = cursor[2]   -- 0-based
-    local lines = vim.api.nvim_buf_get_lines(state.float_buf, 0, -1, false)
-    local current_line = lines[lnum] or ""
-    -- 将当前行在光标处拆分为两行
-    local before = current_line:sub(1, col)
-    local after = current_line:sub(col + 1)
-    lines[lnum] = before
-    table.insert(lines, lnum + 1, after)
-    vim.api.nvim_buf_set_lines(state.float_buf, 0, -1, false, lines)
-    -- 光标移到新行的行首
-    vim.api.nvim_win_set_cursor(win, { lnum + 1, 0 })
-  end, { buffer = buf, noremap = true, silent = true, desc = "换行" })
-
-  vim.keymap.set("n", "<CR>", function()
+  -- Normal 模式：normal_send_key 发送
+  vim.keymap.set("n", normal_send_key, function()
     M._submit_float()
   end, { buffer = buf, noremap = true, silent = true, desc = "发送消息" })
 
@@ -573,25 +583,30 @@ function M._bind_chat_keymaps_to_float(buf)
     return
   end
 
-  -- 从 chat 窗口配置中获取快捷键
-  local chat_config = (state.config or {}).keymaps and state.config.keymaps.chat or {}
+  -- 从统一状态管理器中获取快捷键配置
+  -- 所有键位统一由 default_config.lua 定义，模块内部不提供任何 fallback 默认值
+  local full_config = state_manager.get_config()
+  if not full_config or not full_config.keymaps or not full_config.keymaps.chat then
+    return
+  end
+  local chat_config = full_config.keymaps.chat
 
   -- 定义需要绑定的快捷键及其对应的操作
   local bindings = {
     {
-      key = (chat_config.quit or {}).key or "q",
+      key = chat_config.quit.key,
       action = function()
         chat_window.close()
       end,
     },
     {
-      key = (chat_config.refresh or {}).key or "r",
+      key = chat_config.refresh.key,
       action = function()
         chat_window.refresh_chat()
       end,
     },
     {
-      key = (chat_config.switch_model or {}).key or "m",
+      key = chat_config.switch_model.key,
       action = function()
         chat_window.show_model_selector()
       end,
@@ -651,28 +666,42 @@ function M._setup_keymaps()
   end
   local buf = state.buf
 
-  -- 获取键位配置
-  local keymaps = M._get_keymaps()
+  -- 从配置读取 send 键位（send.insert / send.normal 是 { key = "...", desc = "..." } 结构）
+  local send_config = state_manager.get_config_value("keymaps.chat.send")
+  local send_key = send_config and send_config.insert and send_config.insert.key or "<C-s>"
+  local normal_send_key = send_config and send_config.normal and send_config.normal.key or "<CR>"
 
-  -- 发送消息（Enter 键）- 仅在输入区域行按下时发送
-  vim.keymap.set("n", "<CR>", function()
-    -- 检查光标是否在输入区域
+  -- Normal 模式：normal_send_key 发送（仅在输入区域）
+  vim.keymap.set("n", normal_send_key, function()
     if M._cursor_in_input_area() then
       M.submit()
     else
-      -- 不在输入区域，执行默认行为（如果有）
       vim.cmd("normal! j")
     end
   end, { buffer = buf, noremap = true, silent = true, desc = "发送消息" })
 
-  vim.keymap.set("i", "<CR>", function()
+  -- 插入模式：send_key 发送，<CR> 换行
+  vim.keymap.set("i", send_key, function()
     if M._cursor_in_input_area() then
       M.submit()
     else
-      -- 不在输入区域，插入换行
       vim.api.nvim_put({ "" }, "c", false, true)
     end
   end, { buffer = buf, noremap = true, silent = true, desc = "发送消息" })
+  vim.keymap.set("i", "<CR>", function()
+    if M._cursor_in_input_area() then
+      vim.api.nvim_put({ "" }, "c", false, true)
+    else
+      vim.api.nvim_put({ "" }, "c", false, true)
+    end
+  end, { buffer = buf, noremap = true, silent = true, desc = "换行" })
+  vim.keymap.set("i", "<S-CR>", function()
+    if M._cursor_in_input_area() then
+      vim.api.nvim_put({ "" }, "c", false, true)
+    else
+      vim.api.nvim_put({ "" }, "c", false, true)
+    end
+  end, { buffer = buf, noremap = true, silent = true, desc = "换行" })
 
   -- 退出插入模式或取消生成
   local Events = require("NeoAI.core.events")
@@ -740,40 +769,15 @@ function M._setup_listeners()
 end
 
 --- 获取键位配置
+--- 所有键位统一由 default_config.lua 定义，模块内部不提供任何 fallback 默认值
 function M._get_keymaps()
-  local default_keymaps = {
-    normal_mode = "<CR>",
-    submit = "<C-s>",
-    cancel = "<Esc>",
-    clear = "<C-u>",
+  local chat_keymaps = state_manager.get_config_value("keymaps.chat")
+  return {
+    normal_mode = chat_keymaps.send.insert.key,
+    submit = chat_keymaps.send.normal.key,
+    cancel = chat_keymaps.cancel.key,
+    clear = chat_keymaps.clear.key,
   }
-
-  if state.config and state.config.keymaps and state.config.keymaps.chat then
-    local chat_keymaps = state.config.keymaps.chat
-    local result = {}
-    if chat_keymaps.send then
-      if chat_keymaps.send.insert then
-        result.normal_mode = chat_keymaps.send.insert.key
-      end
-      if chat_keymaps.send.normal then
-        result.submit = chat_keymaps.send.normal.key
-      end
-    end
-    if chat_keymaps.cancel then
-      result.cancel = chat_keymaps.cancel.key
-    end
-    if chat_keymaps.clear then
-      result.clear = chat_keymaps.clear.key
-    end
-    for internal_name, default_key in pairs(default_keymaps) do
-      if not result[internal_name] then
-        result[internal_name] = default_key
-      end
-    end
-    return result
-  end
-
-  return default_keymaps
 end
 
 --- 聚焦浮动输入框并进入插入模式

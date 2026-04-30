@@ -307,17 +307,18 @@ function M.set_keymaps(keymap_manager)
   end
 
   -- 从合并后的配置中获取 tree 上下文键位
-  local tree_config = (state.config.keymaps or {}).tree or {}
+  -- 所有键位统一由 default_config.lua 定义，模块内部不提供任何 fallback 默认值
+  local tree_config = state.config.keymaps.tree
   local keymaps = {
     up = "k",
     down = "j",
     left = "h",
     right = "l",
-    select = (tree_config.select or {}).key or "<CR>",
-    new_child = (tree_config.new_child or {}).key or "n",
-    new_root = (tree_config.new_root or {}).key or "N",
-    delete = (tree_config.delete_dialog or {}).key or "d",
-    delete_branch = (tree_config.delete_branch or {}).key or "D",
+    select = tree_config.select.key,
+    new_child = tree_config.new_child.key,
+    new_root = tree_config.new_root.key,
+    delete = tree_config.delete_dialog.key,
+    delete_branch = tree_config.delete_branch.key,
     quit = "q",
     refresh = "r",
   }
