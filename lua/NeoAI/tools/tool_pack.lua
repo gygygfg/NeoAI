@@ -18,8 +18,14 @@ local logger = require("NeoAI.utils.logger")
 
 -- ========== 工具包注册表 ==========
 
+--- @class ToolPack
+--- @field name string
+--- @field display_name string
+--- @field icon string
+--- @field tools string[]
+--- @field order number
+
 --- @type table<string, ToolPack>
---- ToolPack = { name: string, display_name: string, icon: string, tools: string[], order: number }
 local packs = {}
 
 -- ========== 分类配置 ==========
@@ -42,19 +48,27 @@ function M.initialize()
   packs = {}
 
   local builtin_dir = debug.getinfo(1).source:match("^@(.+)$")
-  if not builtin_dir then return end
+  if not builtin_dir then
+    return
+  end
 
   builtin_dir = builtin_dir:match("^(.+/)tool_pack%.lua$")
-  if not builtin_dir then return end
+  if not builtin_dir then
+    return
+  end
 
   builtin_dir = builtin_dir .. "builtin"
 
   local handle = vim.loop.fs_scandir(builtin_dir)
-  if not handle then return end
+  if not handle then
+    return
+  end
 
   while true do
     local name, type = vim.loop.fs_scandir_next(handle)
-    if not name then break end
+    if not name then
+      break
+    end
     if type == "file" and name:match("%.lua$") then
       local mod_name = name:gsub("%.lua$", "")
       local ok, mod = pcall(require, "NeoAI.tools.builtin." .. mod_name)
@@ -189,10 +203,7 @@ function M.group_by_pack(tool_calls)
   local uncategorized = {}
 
   for _, tc in ipairs(tool_calls) do
-    local tool_name = tc.name
-      or (tc.func and tc.func.name)
-      or (tc["function"] and tc["function"].name)
-      or ""
+    local tool_name = tc.name or (tc.func and tc.func.name) or (tc["function"] and tc["function"].name) or ""
     local pack_name = M.get_pack_for_tool(tool_name)
 
     if pack_name then
