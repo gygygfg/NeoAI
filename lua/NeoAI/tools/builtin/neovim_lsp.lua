@@ -838,7 +838,7 @@ local function try_start_lsp(config_name, bufnr)
 
   -- 方式 2：vim.lsp.config 注册的配置（Neovim 0.12 内置）
   -- 注意：vim.lsp.start(config_name) 在 Neovim 0.12 中可能返回 true, nil
-  -- （启动成功但 client_id 为 nil），此时仍应视为启动成功
+  -- （启动成功但 client_id 为 nil），此时需要验证客户端是否真的启动了
   local configs_ok = pcall(function()
     if type(vim.lsp.config) == "table" then
       if vim.lsp.config.get then
@@ -855,9 +855,27 @@ local function try_start_lsp(config_name, bufnr)
     if ok_id then
       if client_id then
         pcall(vim.lsp.buf_attach_client, bufnr, client_id)
+        return true
       end
-      -- vim.lsp.start 返回 true 即表示启动成功（即使 client_id 为 nil）
-      return true
+      -- vim.lsp.start 返回 true 但 client_id 为 nil
+      -- 需要验证客户端是否真的启动了：检查是否有新客户端出现
+      -- 等待一小段时间让客户端完成初始化
+      local before_count = #vim.lsp.get_clients()
+      vim.wait(2000, function()
+        return #vim.lsp.get_clients() > before_count
+      end, 100)
+      local after_clients = vim.lsp.get_clients()
+      if #after_clients > before_count then
+        -- 有新客户端出现，尝试 attach
+        for _, c in ipairs(after_clients) do
+          if c.name == config_name or not pcall(function() return before_count >= #vim.lsp.get_clients() end) then
+            pcall(vim.lsp.buf_attach_client, bufnr, c.id)
+          end
+        end
+        return true
+      end
+      -- 没有新客户端出现，启动失败
+      return false
     end
   end
 
@@ -1382,10 +1400,11 @@ local function lsp_request_async(bufnr, method, params, callback)
         end
       end
     end
-    if not any_supported and #clients > 0 then
+    if not any_supported then
       if callback then
-        -- 对 formatting 方法提供更友好的提示
-        if method == "textDocument/formatting" then
+        if #clients == 0 then
+          callback(nil, string.format('没有 LSP 客户端连接到缓冲区，无法发送请求 "%s"', method))
+        elseif method == "textDocument/formatting" then
           local client_names = {}
           for _, c in ipairs(clients) do
             table.insert(client_names, c.name)
@@ -3757,28 +3776,90 @@ local function _lsp_signature_help(args, on_success, on_error)
       -- 找到函数调用位置，发送 signatureHelp 请求
       _send_signature_request(bufnr, args, cleanup, on_success, on_error, best_match.row, best_match.col)
     else
-      -- Tree-sitter 未找到调用位置，回退到 LSP documentSymbol 查找符号定义位置
-      -- 然后尝试在定义位置附近查找调用
-      find_symbol_via_lsp_async(args.filepath, args.symbol, bufnr, function(row, col, find_err)
-        if not row then
-          if cleanup then
-            cleanup()
+      -- Tree-sitter 未找到调用位置（可能在定义位置查找而非调用位置）
+      -- 回退策略：在整个文件中搜索包含 `symbol(` 的文本行，
+      -- 这些行很可能是函数调用位置（如 `processor = JupyterProcessor(args.notebook)`）
+      -- 而不是定义位置（如 `class JupyterProcessor:` 或 `def __init__(self)`）
+      local fallback_row, fallback_col = nil, nil
+      local lines = vim.split(content, "\n")
+      for line_idx, line_text in ipairs(lines) do
+        -- 查找包含 `symbol(` 的行（函数调用模式）
+        local call_start = line_text:find(args.symbol .. "%s*%(")
+        if call_start then
+          -- 跳过定义位置（class/def 关键字开头的行）
+          local trimmed = line_text:match("^%s*(.-)%s*$")
+          if not trimmed:match("^class%s") and not trimmed:match("^def%s") and not trimmed:match("^function%s") then
+            fallback_row = line_idx - 1  -- 0-based
+            fallback_col = call_start - 1 + #args.symbol  -- 0-based，定位到函数名末尾
+            break
           end
-          if on_error then
-            on_error(
-              find_err
-                or (
-                  "未找到符号 '"
-                  .. args.symbol
-                  .. "' 在文件中的调用位置。注意：signatureHelp 需要在函数调用位置（如 `foo(` 或 `obj.method(`）而非定义位置。"
-                )
-            )
-          end
-          return
         end
-        -- 使用找到的定义位置 + 1 列，尝试发送请求
-        _send_signature_request(bufnr, args, cleanup, on_success, on_error, row, col + 1)
-      end)
+      end
+
+      if fallback_row then
+        -- 通过文本搜索找到调用位置
+        _send_signature_request(bufnr, args, cleanup, on_success, on_error, fallback_row, fallback_col)
+      else
+        -- 最终回退：尝试在整个文件中搜索所有 call_expression 节点
+        -- 使用更宽松的匹配策略
+        local function search_all_calls(node, depth, max_depth)
+          if not node or (max_depth and depth > max_depth) then
+            return
+          end
+          local node_type = node:type()
+          if node_type == "call_expression" or node_type == "call" or node_type == "function_call" or node_type == "method_call" then
+            local text = vim.treesitter.get_node_text(node, content) or ""
+            -- 使用更宽松的子串匹配
+            if text:find(args.symbol, 1, true) then
+              local sr, sc = node:range()
+              -- 检查是否在调用位置（左括号前）
+              local paren_pos = text:find("%(")
+              if paren_pos then
+                local name_end = sc + paren_pos - 1
+                if not best_match then
+                  best_match = { row = sr, col = name_end }
+                end
+                return
+              end
+            end
+          end
+          for i = 0, node:named_child_count() - 1 do
+            search_all_calls(node:named_child(i), depth + 1, max_depth)
+            if best_match then
+              return
+            end
+          end
+        end
+
+        search_all_calls(root, 0, 50)
+
+        if best_match then
+          _send_signature_request(bufnr, args, cleanup, on_success, on_error, best_match.row, best_match.col)
+        else
+          -- 完全回退：使用 LSP documentSymbol 查找定义位置
+          -- 注意：定义位置不是调用位置，LSP 可能无法返回签名信息
+          find_symbol_via_lsp_async(args.filepath, args.symbol, bufnr, function(row, col, find_err)
+            if not row then
+              if cleanup then
+                cleanup()
+              end
+              if on_error then
+                on_error(
+                  find_err
+                    or (
+                      "未找到符号 '"
+                      .. args.symbol
+                      .. "' 在文件中的调用位置。注意：signatureHelp 需要在函数调用位置（如 `foo(` 或 `obj.method(`）而非定义位置。"
+                    )
+                )
+              end
+              return
+            end
+            -- 使用找到的定义位置 + 1 列，尝试发送请求
+            _send_signature_request(bufnr, args, cleanup, on_success, on_error, row, col + 1)
+          end)
+        end
+      end
     end
   end, true)
 end
@@ -4094,7 +4175,7 @@ end
 
 M.lsp_type_definition = define_tool({
   name = "lsp_type_definition",
-  description = "获取文件中指定符号的类型定义位置，通过符号名称和可选的节点类型定位，返回类型定义所在的文件和位置范围。注意：仅适用于有静态类型系统的语言（如 TypeScript、Java、Go），Lua、Python、JavaScript 等动态类型语言通常无法提供类型定义信息。",
+  description = "获取文件中指定符号的类型定义位置，通过符号名称和可选的节点类型定位，返回类型定义所在的文件和位置范围",
   func = _lsp_type_definition,
   async = true,
   parameters = {

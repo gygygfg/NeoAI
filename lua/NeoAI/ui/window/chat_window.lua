@@ -1829,7 +1829,9 @@ function M._setup_event_listeners()
       end
       clear_stream_throttle()
       -- 保存流式状态，用于判断是否需要增量更新
-      local had_stream_prefix = state.streaming.prefix_added or state.streaming.reasoning_prefix_added
+      -- 注意：reasoning_done 为 true 表示思考过程折叠文本已通过 _append_reasoning_folded_to_buffer 追加到缓冲区
+      -- 此时即使 prefix_added 为 false（只有思考没有正文），也应视为已有流式内容，避免重复追加
+      local had_stream_prefix = state.streaming.prefix_added or state.streaming.reasoning_prefix_added or state.streaming.reasoning_done
       reset_streaming_state()
       state.tool_loop_in_progress = false
       state.generation_in_progress = false
@@ -1931,6 +1933,11 @@ function M._setup_event_listeners()
         if rt ~= "" and mi and state.messages[mi] then
           state.messages[mi].content = vim.json.encode({ reasoning_content = rt, content = "" })
         end
+        -- 思考过程完毕：将完整的思考过程以折叠文本格式追加到聊天缓冲区
+        -- 注意：此时悬浮窗已滚动显示完所有思考内容，关闭悬浮窗后将折叠文本写入缓冲区
+        if rt ~= "" then
+          M._append_reasoning_folded_to_buffer(rt)
+        end
         close_reasoning_display()
       end
 
@@ -1988,13 +1995,14 @@ function M._setup_event_listeners()
       state.streaming.reasoning_active = true
       state.streaming.reasoning_buffer = state.streaming.reasoning_buffer .. rc
       -- 仅在光标跟随模式下更新思考过程悬浮窗内容
+      -- 注意：思考过程只在悬浮窗中滚动显示，不追加到聊天缓冲区
+      -- 等思考过程完毕后，再以折叠文本格式一次性追加到聊天缓冲区
       if should_follow then
         local ok_rd, rd = pcall(require, "NeoAI.ui.components.reasoning_display")
         if ok_rd and rd.is_visible() then
           rd.append(rc)
         end
       end
-      M._append_stream_chunk_to_buffer(rc, "reasoning")
     end,
   })
 
@@ -2036,15 +2044,28 @@ function M._setup_event_listeners()
       end
 
       cancel_reasoning_timer()
+
+      -- 如果思考过程仍在进行中（从未收到正文 STREAM_CHUNK），在此处追加折叠文本
+      -- 正常情况下 reasoning→content 切换由 STREAM_CHUNK 回调处理
+      -- 但如果没有正文内容（只有思考过程），STREAM_CHUNK 不会触发切换逻辑
+      if state.streaming.reasoning_active then
+        local rt = state.streaming.reasoning_buffer or ""
+        if rt ~= "" then
+          state.streaming.reasoning_active = false
+          state.streaming.reasoning_done = true
+          M._append_reasoning_folded_to_buffer(rt)
+        end
+      end
+
       close_reasoning_display()
       completed_generations[gid] = true
 
       -- 只清理部分状态，保留 message_index 供 GENERATION_COMPLETED 使用
+      -- 注意：保留 reasoning_done 状态，供 GENERATION_COMPLETED 判断是否已追加思考过程折叠文本
+      -- GENERATION_COMPLETED 回调中计算 had_stream_prefix 后会由 reset_streaming_state() 统一重置
       state.streaming.active = false
       state.streaming.content_buffer = ""
       state.streaming.reasoning_buffer = ""
-      state.streaming.reasoning_active = false
-      state.streaming.reasoning_done = false
       state.streaming.prefix_added = false
       state.streaming.reasoning_prefix_added = false
       state.streaming.content_separator_added = false
@@ -2486,6 +2507,9 @@ function M._setup_event_listeners()
       end
       cancel_reasoning_timer()
       close_reasoning_display()
+      -- 关闭工具调用悬浮窗
+      close_tool_display()
+      reset_tool_display()
       clear_stream_throttle()
       reset_streaming_state()
       state.tool_loop_in_progress = false
@@ -2637,6 +2661,61 @@ function M._append_message_to_buffer(role, content)
 
   pcall(vim.api.nvim_set_option_value, "modified", false, { buf = buf })
   -- 移动光标到新追加内容的末尾
+  local win = window_manager.get_window_win(state.current_window_id)
+  if win and vim.api.nvim_win_is_valid(win) then
+    local new_line_count = vim.api.nvim_buf_line_count(buf)
+    local last_line = vim.api.nvim_buf_get_lines(buf, new_line_count - 1, new_line_count, false)[1] or ""
+    pcall(vim.api.nvim_win_set_cursor, win, { new_line_count, #last_line })
+  end
+  M._scroll_to_end_with_offset()
+end
+
+--- 将思考过程追加到聊天缓冲区末尾
+--- 在思考过程完成后调用
+--- 如果思考过程超过 200 个字符，使用折叠格式 {{{ ... }}}，否则直接显示
+--- @param reasoning_text string 完整的思考过程文本
+function M._append_reasoning_folded_to_buffer(reasoning_text)
+  if not state.current_window_id or not reasoning_text or reasoning_text == "" then
+    return
+  end
+
+  local buf = window_manager.get_window_buf(state.current_window_id)
+  if not buf or not vim.api.nvim_buf_is_valid(buf) then
+    return
+  end
+
+  pcall(vim.api.nvim_set_option_value, "modifiable", true, { buf = buf })
+  pcall(vim.api.nvim_set_option_value, "readonly", false, { buf = buf })
+
+  local line_count = vim.api.nvim_buf_line_count(buf)
+
+  -- 判断思考过程长度，决定是否使用折叠格式
+  local reasoning_combined = table.concat(vim.split(reasoning_text, "\n"), " ")
+  local use_folded = #reasoning_combined > 200
+
+  local output_lines = {}
+  if use_folded then
+    -- 折叠文本格式
+    table.insert(output_lines, "{{{ 🤔 思考过程")
+    for _, rline in ipairs(vim.split(reasoning_text, "\n")) do
+      table.insert(output_lines, "  " .. rline)
+    end
+    table.insert(output_lines, "}}}")
+  else
+    -- 直接显示，不加折叠
+    table.insert(output_lines, "🤖 AI: 🤔 思考过程:")
+    for _, rline in ipairs(vim.split(reasoning_text, "\n")) do
+      table.insert(output_lines, "    " .. rline)
+    end
+  end
+  table.insert(output_lines, "") -- 空行分隔
+
+  -- 追加到缓冲区末尾
+  vim.api.nvim_buf_set_lines(buf, line_count, line_count, false, output_lines)
+
+  pcall(vim.api.nvim_set_option_value, "modified", false, { buf = buf })
+
+  -- 滚动到末尾
   local win = window_manager.get_window_win(state.current_window_id)
   if win and vim.api.nvim_win_is_valid(win) then
     local new_line_count = vim.api.nvim_buf_line_count(buf)

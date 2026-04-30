@@ -2,9 +2,45 @@ local M = {}
 
 -- ========== 后台 Buffer 缓存管理 ==========
 -- 跟踪由 file_utils 静默加载到后台 buffer 的文件
--- 格式: { [abs_path] = true }
+-- 按访问顺序排列（最早使用的在队首，最近使用的在队尾）
 -- 在会话界面关闭时统一清理
-local _loaded_buffers = {}
+local _loaded_buffers = {} -- { [abs_path] = index_in_order }
+local _buffer_order = {} -- { abs_path1, abs_path2, ... } 队首最旧，队尾最新
+local MAX_LOADED_BUFFERS = 50
+
+--- 关闭并移除指定的后台 buffer
+--- @param abs_path string 文件绝对路径
+local function close_buffer(abs_path)
+  local bufnr = vim.fn.bufnr(abs_path)
+  if bufnr ~= -1 and vim.api.nvim_buf_is_valid(bufnr) then
+    local win_count = #vim.fn.win_findbuf(bufnr)
+    if win_count == 0 then
+      pcall(vim.api.nvim_buf_delete, bufnr, { force = true })
+    end
+  end
+  _loaded_buffers[abs_path] = nil
+end
+
+--- 淘汰最早使用的 buffer（超出数量限制时）
+local function evict_oldest()
+  while #_buffer_order > MAX_LOADED_BUFFERS do
+    local oldest = table.remove(_buffer_order, 1)
+    if oldest then
+      close_buffer(oldest)
+    end
+  end
+end
+
+--- 将文件标记为最近使用（移到队尾）
+--- @param abs_path string 文件绝对路径
+local function mark_recent(abs_path)
+  local idx = _loaded_buffers[abs_path]
+  if idx then
+    table.remove(_buffer_order, idx)
+    table.insert(_buffer_order, abs_path)
+    _loaded_buffers[abs_path] = #_buffer_order
+  end
+end
 
 --- 将文件异步加载到 Neovim 后台 buffer（静默，不打开窗口）
 --- 读取文件内容后调用，不阻塞当前流程
@@ -14,11 +50,26 @@ local function async_load_to_buffer(path)
     return
   end
   local abs_path = vim.fn.fnamemodify(path, ":p")
-  -- 如果已经在 buffer 中或已标记，跳过
-  if _loaded_buffers[abs_path] or vim.fn.bufnr(abs_path) ~= -1 then
+
+  -- 如果已在跟踪列表中，更新为最近使用
+  if _loaded_buffers[abs_path] then
+    mark_recent(abs_path)
     return
   end
-  _loaded_buffers[abs_path] = true
+
+  -- 如果文件已存在于 Neovim buffer 中，不重复加载
+  if vim.fn.bufnr(abs_path) ~= -1 then
+    return
+  end
+
+  -- 超过上限，淘汰最旧的
+  if #_buffer_order >= MAX_LOADED_BUFFERS then
+    evict_oldest()
+  end
+
+  -- 标记并异步加载
+  table.insert(_buffer_order, abs_path)
+  _loaded_buffers[abs_path] = #_buffer_order
   vim.schedule(function()
     -- 再次检查，防止竞态
     if vim.fn.bufnr(abs_path) ~= -1 then
@@ -34,26 +85,19 @@ end
 --- 清理所有由 file_utils 加载到后台 buffer 的文件
 --- 在会话界面关闭时调用
 function M.cleanup_session_buffers()
-  for abs_path, _ in pairs(_loaded_buffers) do
-    local bufnr = vim.fn.bufnr(abs_path)
-    if bufnr ~= -1 and vim.api.nvim_buf_is_valid(bufnr) then
-      -- 只删除未被其他窗口引用的 buffer
-      local win_count = #vim.fn.win_findbuf(bufnr)
-      if win_count == 0 then
-        pcall(vim.api.nvim_buf_delete, bufnr, { force = true })
-      end
+  for i = #_buffer_order, 1, -1 do
+    local abs_path = _buffer_order[i]
+    if abs_path then
+      close_buffer(abs_path)
     end
   end
   _loaded_buffers = {}
+  _buffer_order = {}
 end
 
 --- 获取当前跟踪的后台 buffer 数量
 function M.get_loaded_buffer_count()
-  local count = 0
-  for _, _ in pairs(_loaded_buffers) do
-    count = count + 1
-  end
-  return count
+  return #_buffer_order
 end
 
 --- 读取文件
