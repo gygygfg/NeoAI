@@ -12,6 +12,10 @@ local event_constants = require("NeoAI.core.events")
 
 local function _stop_tool_loop(args, on_success, on_error)
   local reason = args and args.reason or "任务已完成"
+  local generate_summary = true
+  if args and args.generate_summary ~= nil then
+    generate_summary = args.generate_summary
+  end
 
   -- 取消正在进行的 HTTP 请求（不调用 cancel_generation，避免设置 user_cancelled）
   local ok, http_client = pcall(require, "NeoAI.core.ai.http_client")
@@ -24,7 +28,7 @@ local function _stop_tool_loop(args, on_success, on_error)
   -- 注意：此工具本身在异步回调中执行，不在 fast event 上下文中，可以安全同步触发
   pcall(vim.api.nvim_exec_autocmds, "User", {
     pattern = event_constants.TOOL_LOOP_STOP_REQUESTED,
-    data = { reason = reason },
+    data = { reason = reason, generate_summary = generate_summary },
   })
 
   if on_success then
@@ -43,6 +47,10 @@ M.stop_tool_loop = define_tool({
       reason = {
         type = "string",
         description = "停止工具循环的原因说明，用于日志记录",
+      },
+      generate_summary = {
+        type = "boolean",
+        description = "是否生成总结，默认为 true。设为 false 时直接结束工具循环并显示用量信息，不生成 AI 总结",
       },
     },
     required = {},

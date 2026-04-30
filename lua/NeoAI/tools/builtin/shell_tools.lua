@@ -11,6 +11,104 @@ local define_tool = require("NeoAI.tools.builtin.tool_helpers").define_tool
 local sessions = {}
 local session_counter = 0
 
+-- ============================================================================
+-- 终端输出格式化
+-- ============================================================================
+
+-- 去除 ANSI 转义序列
+-- 匹配 CSI (Control Sequence Introducer) 序列: ESC [ 参数... 字母
+-- 以及 OSC 序列: ESC ] ... BEL/ST
+-- 以及其他常见终端控制序列
+local function strip_ansi(str)
+  -- 去除 CSI 序列: ESC [ <参数> <字母>
+  str = str:gsub("\27%[%d;%d;%d;%d;%d;%d;%d;%d;%d;%d*[mHfABCDJKlLPSu]", "")
+  str = str:gsub("\27%[%d;%d;%d;%d;%d;%d;%d;%d;%d*[mHfABCDJKlLPSu]", "")
+  str = str:gsub("\27%[%d;%d;%d;%d;%d;%d;%d;%d*[mHfABCDJKlLPSu]", "")
+  str = str:gsub("\27%[%d;%d;%d;%d;%d;%d;%d*[mHfABCDJKlLPSu]", "")
+  str = str:gsub("\27%[%d;%d;%d;%d;%d;%d*[mHfABCDJKlLPSu]", "")
+  str = str:gsub("\27%[%d;%d;%d;%d;%d*[mHfABCDJKlLPSu]", "")
+  str = str:gsub("\27%[%d;%d;%d;%d*[mHfABCDJKlLPSu]", "")
+  str = str:gsub("\27%[%d;%d;%d*[mHfABCDJKlLPSu]", "")
+  str = str:gsub("\27%[%d;%d*[mHfABCDJKlLPSu]", "")
+  str = str:gsub("\27%[%d*[mHfABCDJKlLPSu]", "")
+  -- 去除 CSI 其他格式: ESC [ ? <参数> <字母>
+  str = str:gsub("\27%[%?%d+;%d+;%d+;%d+;%d+[hl]", "")
+  str = str:gsub("\27%[%?%d+;%d+;%d+;%d+[hl]", "")
+  str = str:gsub("\27%[%?%d+;%d+;%d+[hl]", "")
+  str = str:gsub("\27%[%?%d+;%d+[hl]", "")
+  str = str:gsub("\27%[%?%d+[hl]", "")
+  -- 去除 OSC 序列: ESC ] ... BEL (\007) 或 ESC ] ... ST (ESC \)
+  str = str:gsub("\27%].-" .. "\007", "")
+  str = str:gsub("\27%].-" .. "\027\\", "")
+  -- 去除其他控制字符
+  str = str:gsub("[\007\008\013]", "")
+  -- 去除 SGR 重置序列
+  str = str:gsub("\27%(", ""):gsub("\27)", "")
+  return str
+end
+
+-- 折叠长路径：保留最后 2 个组件，前面的用 ... 替代
+-- 例如：/home/user/very/long/path/to/dir -> .../path/to/dir
+local function fold_path(path)
+  -- 去除末尾的路径分隔符
+  local p = path:gsub("/+$", "")
+  -- 按 / 分割
+  local parts = {}
+  for part in p:gmatch("[^/]+") do
+    table.insert(parts, part)
+  end
+  if #parts <= 2 then
+    return path
+  end
+  -- 保留最后 2 个组件
+  local last_two = {}
+  for i = #parts - 1, #parts do
+    table.insert(last_two, parts[i])
+  end
+  return ".../" .. table.concat(last_two, "/")
+end
+
+-- 检测一行是否是提示符行（以 $、#、❯、% 等结尾，或包含 @ 的主机名格式）
+local PROMPT_PATTERNS = {
+  "^[%w_%-]+@[%w_%-]+.+", -- user@host 格式
+  "^[%w_%-]+@.+",
+  "^[%w_%-]+.+",
+}
+
+-- 格式化终端输出：美化提示符、折叠路径
+local function format_terminal_output(raw_output)
+  -- 先去除 ANSI 转义
+  local cleaned = strip_ansi(raw_output)
+  if cleaned == "" then
+    return raw_output
+  end
+
+  local lines = {}
+  for line in cleaned:gmatch("[^\n]+") do
+    -- 去除行首尾空白
+    line = line:gsub("^%s+", ""):gsub("%s+$", "")
+    if line ~= "" then
+      -- 检测是否是提示符行
+      -- 提示符通常以 $、#、❯、% 结尾，或包含 @ 符号
+      local is_prompt = line:match("[%$#%%❯>]$") or line:match("@") or line:match("^~")
+      if is_prompt then
+        -- 对提示符中的路径进行折叠
+        -- 匹配 /path/to/dir 格式的路径
+        line = line:gsub("(/[%w_%-%.]+(?:/[%w_%-%.]+)+)", function(path)
+          return fold_path(path)
+        end)
+        -- 匹配 ~/path/to/dir 格式
+        line = line:gsub("(~/[%w_%-%.]+(?:/[%w_%-%.]+)+)", function(path)
+          return fold_path(path)
+        end)
+      end
+      table.insert(lines, line)
+    end
+  end
+
+  return table.concat(lines, "\n")
+end
+
 -- 伪终端配置
 local PTY_CONFIG = {
   -- 伪终端宽度和高度
@@ -120,6 +218,11 @@ local function _run_command(args, on_success, on_error, on_progress)
       vim.fn.timer_stop(session.waiting_timer)
     end
 
+    -- 清除左侧窗口同步 autocommand
+    if session.sync_augroup then
+      pcall(vim.api.nvim_del_augroup_by_name, session.sync_augroup)
+    end
+
     -- 如果还有作业在运行，尝试停止
     if session.job_id and vim.fn.jobwait({ session.job_id }, 0)[1] == -1 then
       vim.fn.jobstop(session.job_id)
@@ -132,11 +235,14 @@ local function _run_command(args, on_success, on_error, on_progress)
     if session.float_window_buf and vim.api.nvim_buf_is_valid(session.float_window_buf) then
       vim.api.nvim_buf_delete(session.float_window_buf, { force = true })
     end
-    -- 恢复工具调用悬浮窗的原始宽度
+    -- 恢复工具调用悬浮窗的原始宽度和边框
     if session._saved_tool_width and session._tool_display_win then
       local win = session._tool_display_win
       if vim.api.nvim_win_is_valid(win) then
-        pcall(vim.api.nvim_win_set_config, win, { width = session._saved_tool_width })
+        pcall(vim.api.nvim_win_set_config, win, {
+          width = session._saved_tool_width,
+          border = "rounded",
+        })
       end
     end
 
@@ -387,11 +493,13 @@ local function _run_command(args, on_success, on_error, on_progress)
       session.full_output = session.full_output .. data
     end
 
-    -- 更新进度 - 传递完整的实时输出
+    -- 更新进度 - 传递格式化后的终端输出
     if on_progress and not is_stderr then
-      -- 获取最后几行输出用于显示
+      -- 对完整输出进行终端格式化（去ANSI、美化提示符、折叠路径）
+      local formatted = format_terminal_output(session.full_output)
+      -- 获取最后几行用于显示
       local lines = {}
-      for line in (session.full_output .. ""):gmatch("[^\n]+") do
+      for line in (formatted .. ""):gmatch("[^\n]+") do
         table.insert(lines, line)
       end
       -- 最多显示最后 20 行
@@ -436,6 +544,7 @@ local function _run_command(args, on_success, on_error, on_progress)
     local tool_display_win_id = chat_window.get_tool_display_window_id()
 
     local float_buf, float_win
+    local right_border
     if tool_display_win_id then
       -- 在工具调用悬浮窗右侧创建子窗口
       local tool_win_info = require("NeoAI.ui.window.window_manager").get_window_info(tool_display_win_id)
@@ -448,17 +557,30 @@ local function _run_command(args, on_success, on_error, on_progress)
 
         -- 右侧子窗口宽度为工具调用悬浮窗的一半
         local right_width = math.floor(tool_width / 2)
-        local right_col = tool_col + tool_width - right_width
+        -- 左侧缩小 3 格（为右侧左边框和间距留空间），右侧位置不变
+        local left_width = tool_width - right_width - 3
+        local right_col = tool_col + tool_width - right_width + 2
 
         -- 右侧伪终端窗口：row 比左侧多 1（跳过左侧上边框），height 比左侧少 2（去掉上下边框占位）
+        -- 取消左边框（左上角、左边、左下角），与左侧窗口无缝贴合
+        right_border = {
+          { "─", "FloatBorder" }, -- 左上角
+          { "─", "FloatBorder" }, -- 上
+          { "╮", "FloatBorder" }, -- 右上角
+          { "│", "FloatBorder" }, -- 右
+          { "╯", "FloatBorder" }, -- 右下角
+          { "─", "FloatBorder" }, -- 下
+          { "─", "FloatBorder" }, -- 左下角
+          { " ", "FloatBorder" }, -- 左
+        }
         float_buf = vim.api.nvim_create_buf(false, true)
         float_win = vim.api.nvim_open_win(float_buf, false, {
           relative = "editor",
           width = right_width - 2,
-          height = tool_height - 2,
-          row = tool_row + 1,
+          height = tool_height,
+          row = tool_row,
           col = right_col,
-          border = "rounded",
+          border = right_border,
           title = " 💻 " .. command:sub(1, 50) .. (command:len() > 50 and "..." or "") .. " ",
           title_pos = "center",
           zindex = 101,
@@ -469,10 +591,56 @@ local function _run_command(args, on_success, on_error, on_progress)
         session._tool_display_win = tool_win_info.win
 
         -- 缩小工具调用悬浮窗左侧宽度，为右侧终端腾出空间
-        local left_width = tool_width - right_width
         vim.api.nvim_win_set_config(tool_win_info.win, {
           width = left_width,
         })
+
+        -- 修改左侧窗口边框：右上角 → ┬，右下角 → ┴（与右侧窗口拼接）
+        local left_border = {
+          { "╭", "FloatBorder" },
+          { "─", "FloatBorder" },
+          { "┬", "FloatBorder" },
+          { "│", "FloatBorder" },
+          { "┴", "FloatBorder" },
+          { "─", "FloatBorder" },
+          { "╰", "FloatBorder" },
+          { "│", "FloatBorder" },
+        }
+        vim.api.nvim_win_set_config(tool_win_info.win, {
+          border = left_border,
+        })
+
+        -- 监听左侧工具调用悬浮窗大小变化事件，动态同步右侧窗口
+        local sync_augroup = "NeoAIPTYSync_" .. session_id
+        vim.api.nvim_create_augroup(sync_augroup, { clear = true })
+        vim.api.nvim_create_autocmd("User", {
+          pattern = "NeoAI:tool_display_resized",
+          group = sync_augroup,
+          callback = function()
+            if not float_win or not vim.api.nvim_win_is_valid(float_win) then
+              return
+            end
+            if not tool_win_info.win or not vim.api.nvim_win_is_valid(tool_win_info.win) then
+              return
+            end
+            local cur_config = vim.api.nvim_win_get_config(tool_win_info.win)
+            local cur_height = cur_config.height or tool_height
+            local cur_row = cur_config.row or tool_row
+            local cur_width = cur_config.width or left_width
+            local cur_col = cur_config.col or tool_col
+            -- 右侧窗口在左侧右侧基础上右移 3 格
+            local new_right_col = cur_col + cur_width + 2
+            -- 同步右侧窗口（重新配置浮动窗口必须传入 relative）
+            vim.api.nvim_win_set_config(float_win, {
+              relative = "editor",
+              width = right_width - 2,
+              height = cur_height,
+              row = cur_row,
+              col = new_right_col,
+            })
+          end,
+        })
+        session.sync_augroup = sync_augroup
       end
     end
 
@@ -572,8 +740,19 @@ local function _run_command(args, on_success, on_error, on_progress)
     local job_id = vim.fn.termopen(command, term_opts)
     -- termopen 会重置窗口配置（如 style=minimal），需要重新设置边框和标题
     if float_win and vim.api.nvim_win_is_valid(float_win) then
+      local restore_border = right_border
+        or {
+          { "╭", "FloatBorder" },
+          { "─", "FloatBorder" },
+          { "╮", "FloatBorder" },
+          { "│", "FloatBorder" },
+          { "╯", "FloatBorder" },
+          { "─", "FloatBorder" },
+          { "╰", "FloatBorder" },
+          { "│", "FloatBorder" },
+        }
       vim.api.nvim_win_set_config(float_win, {
-        border = "rounded",
+        border = restore_border,
         title = " 💻 " .. command:sub(1, 50) .. (command:len() > 50 and "..." or "") .. " ",
         title_pos = "center",
       })

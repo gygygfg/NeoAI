@@ -227,6 +227,7 @@ local function create_session_state(session_id, window_id)
     last_reasoning = nil,
     stop_requested = false,
     user_cancelled = false, -- 用户主动取消标志，为 true 时不触发总结
+    _skip_summary = false, -- 跳过总结轮次标志（由 generate_summary=false 触发）
     _tool_retry_count = 0, -- 工具调用重试计数
     on_complete = nil,
     autocmd_ids = {},
@@ -339,6 +340,14 @@ function M.register_session(session_id, window_id)
         end
 
         s.stop_requested = true
+
+        -- 处理 generate_summary 标记：当为 false 时，标记为用户取消，跳过总结轮次
+        if data.generate_summary == false then
+          s.user_cancelled = true
+          s._skip_summary = true
+        else
+          s._skip_summary = false
+        end
 
         -- 注意：不在此处主动触发总结轮次。
         -- stop_tool_loop 工具本身是一个工具调用，它的结果需要先显示在 UI 中。
@@ -613,8 +622,43 @@ function M._on_tools_complete(session_id)
     if is_shutting_down() then
       return
     end
-    -- 用户取消时也不触发总结，直接结束
+    -- 用户取消或跳过总结时，触发 GENERATION_COMPLETED 事件显示用量，然后直接结束
     if ss.user_cancelled then
+      if ss._skip_summary then
+        -- 触发 GENERATION_COMPLETED 事件显示用量信息
+        local saved_usage = ss.accumulated_usage or {}
+        local saved_gen_id = ss.generation_id
+        local saved_win_id = ss.window_id
+        local saved_reasoning = ss.last_reasoning or ""
+        fire_loop_finished(ss)
+        once_display_closed(session_id, function()
+          local s = state.sessions[session_id]
+          if not s then
+            return
+          end
+          if is_shutting_down() then
+            return
+          end
+          pcall(vim.api.nvim_exec_autocmds, "User", {
+            pattern = event_constants.GENERATION_COMPLETED,
+            data = {
+              generation_id = saved_gen_id,
+              response = "",
+              reasoning_text = saved_reasoning,
+              usage = saved_usage,
+              session_id = session_id,
+              window_id = saved_win_id,
+              duration = 0,
+            },
+          })
+          -- 调用 on_complete 回调
+          if s.on_complete then
+            local cb = s.on_complete
+            s.on_complete = nil
+            cb(true, "", saved_usage)
+          end
+        end)
+      end
       return
     end
     fire_loop_finished(ss)
@@ -670,7 +714,7 @@ function M._check_round_complete(session_id)
 
   if ss.stop_requested then
     ss.phase = "idle"
-    -- 用户取消时不触发总结
+    -- 用户取消或跳过总结时不触发总结
     if not ss.user_cancelled then
       M._request_summary_round(session_id)
     end
@@ -727,9 +771,33 @@ function M._proceed_to_next_round(session_id)
 
   if ss.stop_requested then
     ss._proceed_in_progress = false
-    -- 用户取消时不触发总结
+    -- 用户取消或跳过总结时不触发总结
     if not ss.user_cancelled then
       M._request_summary_round(session_id)
+    elseif ss._skip_summary then
+      -- 跳过总结时触发 GENERATION_COMPLETED 事件显示用量
+      local saved_usage = ss.accumulated_usage or {}
+      local saved_gen_id = ss.generation_id
+      local saved_win_id = ss.window_id
+      local saved_reasoning = ss.last_reasoning or ""
+      local saved_result = ""
+      if not is_shutting_down() then
+        vim.schedule(function()
+          if is_shutting_down() then return end
+          pcall(vim.api.nvim_exec_autocmds, "User", {
+            pattern = event_constants.GENERATION_COMPLETED,
+            data = {
+              generation_id = saved_gen_id,
+              response = saved_result,
+              reasoning_text = saved_reasoning,
+              usage = saved_usage,
+              session_id = session_id,
+              window_id = saved_win_id,
+              duration = 0,
+            },
+          })
+        end)
+      end
     end
     return
   end
@@ -1175,13 +1243,33 @@ function M._finish_loop(session_id, success, result)
   local saved_reasoning = ss.last_reasoning or ""
   local saved_result = result or ""
 
-  -- 用户取消时不触发总结，直接调用 on_complete 回调结束
+  -- 用户取消时不触发总结，直接结束
   if ss.user_cancelled then
     ss.on_complete = nil
     ss.phase = "idle"
     ss.active_tool_calls = {}
     ss.current_iteration = 0
     ss.generation_id = nil
+    -- 跳过总结时触发 GENERATION_COMPLETED 事件显示用量
+    if ss._skip_summary then
+      if not is_shutting_down() then
+        vim.schedule(function()
+          if is_shutting_down() then return end
+          pcall(vim.api.nvim_exec_autocmds, "User", {
+            pattern = event_constants.GENERATION_COMPLETED,
+            data = {
+              generation_id = saved_generation_id,
+              response = saved_result,
+              reasoning_text = saved_reasoning,
+              usage = saved_usage,
+              session_id = session_id,
+              window_id = saved_window_id,
+              duration = 0,
+            },
+          })
+        end)
+      end
+    end
     if on_complete then
       vim.schedule(function()
         on_complete(true, saved_result, saved_usage)

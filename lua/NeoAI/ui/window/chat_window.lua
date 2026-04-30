@@ -2583,6 +2583,18 @@ function M._setup_event_listeners()
           end
           config.row = tool_row
           pcall(vim.api.nvim_win_set_config, window_info.win, config)
+
+          -- 触发大小变化事件，通知右侧伪终端窗口同步
+          vim.api.nvim_exec_autocmds("User", {
+            pattern = "NeoAI:tool_display_resized",
+            data = {
+              window_id = state.tool_display.window_id,
+              height = dynamic_height,
+              row = tool_row,
+              width = config.width,
+              col = config.col,
+            },
+          })
         end
       end
 
@@ -2974,11 +2986,22 @@ function M._show_tool_display()
   end
 
   -- 使用 window_manager 创建浮动窗口
+  -- 自定义边框：右上角用 ┬、右下角用 ┴（与右侧伪终端窗口拼接）
+  local tool_border = {
+    { "╭", "FloatBorder" },
+    { "─", "FloatBorder" },
+    { "┬", "FloatBorder" },  -- 右上角
+    { "│", "FloatBorder" },
+    { "┴", "FloatBorder" },  -- 右下角
+    { "─", "FloatBorder" },
+    { "╰", "FloatBorder" },
+    { "│", "FloatBorder" },
+  }
   local win_id = window_manager.create_window("tool_display", {
     title = "🔧 工具调用",
     width = state_manager.get_config_value("ui.window.width") and math.min(state_manager.get_config_value("ui.window.width") - 4, 80) or 60,
     height = dynamic_height,
-    border = "rounded",
+    border = tool_border,
     style = "minimal",
     relative = "editor",
     row = tool_row,
@@ -3069,6 +3092,18 @@ function M._update_tool_display()
     end
     config.row = tool_row
     pcall(vim.api.nvim_win_set_config, win, config)
+
+    -- 触发大小变化事件，通知右侧伪终端窗口同步
+    vim.api.nvim_exec_autocmds("User", {
+      pattern = "NeoAI:tool_display_resized",
+      data = {
+        window_id = state.tool_display.window_id,
+        height = dynamic_height,
+        row = tool_row,
+        width = config.width,
+        col = config.col,
+      },
+    })
   end
 end
 
