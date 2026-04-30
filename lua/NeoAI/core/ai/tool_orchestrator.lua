@@ -1330,6 +1330,253 @@ function M.reset_iteration(session_id)
   end
 end
 
+-- ========== 单次工具请求（不计入工具循环） ==========
+
+--- 执行一次非流式 AI 请求，只允许调用指定的工具，不计入工具循环
+--- 用于 shell 交互式命令的自动输入场景
+--- @param session_id string 会话 ID
+--- @param tool_name string 允许调用的工具名称（如 "send_input"）
+--- @param args table 工具参数
+--- @param callback function 回调函数，接收 (success, result)
+function M.execute_single_tool_request(session_id, tool_name, args, callback)
+  local ss = state.sessions[session_id]
+  if not ss then
+    if callback then
+      callback(false, "会话不存在")
+    end
+    return
+  end
+
+  -- 构建只包含指定工具的消息
+  -- 注意：过滤掉带 tool_calls 的 assistant 消息及其对应的 tool 消息，
+  -- 避免 API 报错 'assistant message with tool_calls must be followed by tool messages'
+  -- 或 'tool message without matching tool_calls'
+  local messages = {}
+  local skip_tool_call_ids = {}
+  for _, msg in ipairs(ss.messages or {}) do
+    -- 记录需要跳过的 tool_call_id
+    if msg.role == "assistant" and msg.tool_calls then
+      for _, tc in ipairs(msg.tool_calls) do
+        skip_tool_call_ids[tc.id or tc.tool_call_id] = true
+      end
+      goto continue
+    end
+    -- 跳过对应被过滤 assistant 消息的 tool 消息
+    if msg.role == "tool" and msg.tool_call_id and skip_tool_call_ids[msg.tool_call_id] then
+      goto continue
+    end
+    table.insert(messages, vim.deepcopy(msg))
+    ::continue::
+  end
+
+  -- 添加系统提示，要求 AI 使用指定工具
+  -- 提供完整的上下文：执行的命令、当前输出、以及明确的指令
+  local cmd_context = args.command or ""
+  local stdout_content = args.stdout or args.prompt or ""
+  local stderr_content = args.stderr or ""
+  local combined_output = stdout_content
+  if stderr_content and stderr_content ~= "" then
+    combined_output = combined_output .. "\n[stderr]\n" .. stderr_content
+  end
+
+  -- 分析最后几行输出，判断最可能的输入类型
+  local last_lines = {}
+  for line in (combined_output .. ""):gmatch("[^\n]+") do
+    table.insert(last_lines, line)
+    if #last_lines > 5 then
+      table.remove(last_lines, 1)
+    end
+  end
+  local last_line = last_lines[#last_lines] or ""
+
+  -- 根据最后一行内容推断输入类型
+  local input_guidance = ""
+  if last_line:match("[Yy]es/[Nn]o") or last_line:match("[Yy]/[Nn]") or last_line:match("%%[Y/n%%]") or last_line:match("%%[y/N%%]") then
+    input_guidance = "\n提示：命令正在询问 yes/no 确认，请根据上下文输入 'y' 或 'n'。"
+  elseif last_line:match("[Pp]assword:") then
+    input_guidance = "\n提示：命令正在询问密码，请输入密码。"
+  elseif last_line:match("[Ss]elect") or last_line:match("[Cc]hoose") or last_line:match("[Oo]ption") or last_line:match("[Nn]umber") or last_line:match("#%?[%s]*$") then
+    input_guidance = "\n提示：命令正在显示菜单选项，请根据选项列表输入对应的编号或关键字。"
+  elseif last_line:match("[Ee]nter your") or last_line:match("[Ii]nput your") or last_line:match("[Pp]lease enter") or last_line:match("[Pp]lease input") then
+    input_guidance = "\n提示：命令正在要求输入文本内容（如用户名、名称等），请输入合适的文本。"
+  elseif last_line:match("[Cc]ontinue") or last_line:match("[Pp]ress any key") or last_line:match("[Pp]ress Enter") then
+    input_guidance = "\n提示：命令正在等待按任意键继续，请直接发送空字符串或按 Enter。"
+  elseif last_line:match("> %s*$") or last_line:match(": %s*$") or last_line:match("#?%s*$") then
+    input_guidance = "\n提示：命令正在等待输入，请根据上下文输入合适的内容。"
+  end
+
+  local system_msg = {
+    role = "system",
+    content = string.format(
+      "你正在与一个交互式 shell 命令交互。命令当前正在等待输入。\n"
+        .. "执行的命令: %s\n\n"
+        .. "请仔细分析命令当前输出的**最后一行**，它指示了需要输入的内容类型。\n"
+        .. "1. 如果最后一行是 \"请输入你的名字:\"、\"Enter your name:\" 等，输入对应的文本内容（如用户名）\n"
+        .. "2. 如果最后一行是 \"y/n\"、\"Yes/No\" 等，输入 'y' 或 'n'\n"
+        .. "3. 如果最后一行是 \"Password:\"，输入密码\n"
+        .. "4. 如果最后一行是菜单选项（如 \"#?\"、\"Select\"），根据选项列表输入对应的编号\n"
+        .. "5. 如果命令已执行完毕或不需要继续执行，请调用 %s 工具并设置 stop=true 来终止进程\n\n"
+        .. "=== 命令当前输出 ===\n%s%s",
+      cmd_context,
+      tool_name,
+      combined_output,
+      input_guidance
+    ),
+  }
+  table.insert(messages, system_msg)
+
+  -- 构建工具定义（只包含允许调用的工具）
+  -- 优先从 tool_registry 获取（内置工具如 send_input 通过 registry 注册）
+  local tool_def = nil
+  local tool_registry = require("NeoAI.tools.tool_registry")
+  pcall(tool_registry.initialize, {})
+  local registered_tool = tool_registry.get(tool_name)
+  if registered_tool then
+    local tf = { name = registered_tool.name, description = registered_tool.description or ("执行 " .. registered_tool.name .. " 操作") }
+    if registered_tool.parameters and type(registered_tool.parameters) == "table" and registered_tool.parameters.properties then
+      local cp = { type = "object", properties = registered_tool.parameters.properties }
+      if registered_tool.parameters.required and type(registered_tool.parameters.required) == "table" and #registered_tool.parameters.required > 0 then
+        cp.required = registered_tool.parameters.required
+      end
+      tf.parameters = cp
+    end
+    tool_def = { type = "function", ["function"] = tf }
+  end
+
+  -- 回退：从 state.tools 查找
+  if not tool_def then
+    for _, t in ipairs(state.tools or {}) do
+      if t.name == tool_name then
+        local tf = { name = t.name, description = t.description or ("执行 " .. t.name .. " 操作") }
+        if t.parameters and type(t.parameters) == "table" and t.parameters.properties then
+          local cp = { type = "object", properties = t.parameters.properties }
+          if t.parameters.required and type(t.parameters.required) == "table" and #t.parameters.required > 0 then
+            cp.required = t.parameters.required
+          end
+          tf.parameters = cp
+        end
+        tool_def = { type = "function", ["function"] = tf }
+        break
+      end
+    end
+  end
+
+  if not tool_def then
+    if callback then
+      callback(false, "工具定义未找到: " .. tool_name)
+    end
+    return
+  end
+
+  -- 构建非流式请求
+  local ai_engine = require("NeoAI.core.ai.ai_engine")
+  local formatted = ai_engine.format_messages(messages)
+
+  local request = ai_engine.build_request({
+    messages = formatted,
+    options = vim.tbl_extend("force", ss.options or {}, {
+      model = (ss.ai_preset or {}).model_name or (ss.options or {}).model,
+      stream = false,
+      tools_enabled = true,
+    }),
+    session_id = session_id,
+    generation_id = "single_tool_" .. session_id .. "_" .. os.time(),
+  })
+
+  -- 只保留指定工具
+  request.tools = { tool_def }
+  -- 清除 build_request 可能设置的 tool_choice（如 "auto"），重新设置
+  request.tool_choice = nil
+
+  local http_client = require("NeoAI.core.ai.http_client")
+  local ai_preset = ss.ai_preset or {}
+  -- 使用指定工具模式
+  request.tool_choice = { type = "function", ["function"] = { name = tool_name } }
+
+  -- 构建 http_client 参数
+  local http_params = {
+    request = request,
+    generation_id = request.generation_id,
+    base_url = ai_preset.base_url,
+    api_key = ai_preset.api_key,
+    timeout = ai_preset.timeout or 30000,
+    api_type = ai_preset.api_type or "openai",
+    provider_config = ai_preset,
+  }
+  -- 如果调用方要求禁用思考模式，传递标记
+  if args and args._disable_reasoning then
+    http_params._disable_reasoning = true
+  end
+
+  -- 使用异步请求，避免阻塞主线程（否则 UI 更新和停止快捷键都会失效）
+  -- 回调函数在 jobstart 的 on_exit 中通过 vim.schedule 调用
+  local _callback = callback
+  http_client.send_request_async(http_params, function(response, err)
+    -- 检查会话是否已被停止
+    local current_ss = state.sessions[session_id]
+    if not current_ss or current_ss.stop_requested then
+      if _callback then
+        _callback(false, "会话已停止")
+      end
+      return
+    end
+
+    if err then
+      if _callback then
+        _callback(false, "AI 请求失败: " .. tostring(err))
+      end
+      return
+    end
+
+    if not response or not response.choices or #response.choices == 0 then
+      if _callback then
+        _callback(false, "AI 响应无效")
+      end
+      return
+    end
+
+    local choice = response.choices[1]
+    local message = choice.message or {}
+
+    -- 检查是否有工具调用
+    if message.tool_calls and #message.tool_calls > 0 then
+      local tc = message.tool_calls[1]
+      local func = tc["function"] or tc.func
+      if func and func.name == tool_name then
+        local ok, parsed_args = pcall(vim.json.decode, func.arguments)
+        if ok and parsed_args then
+          if _callback then
+            _callback(true, { action = "send_input", args = parsed_args })
+          end
+          return
+        end
+      end
+    end
+
+    -- 检查 AI 是否回复了 ABORT 或类似内容
+    local content = message.content or ""
+    if content:upper():match("ABORT") or content:upper():match("CANCEL") or content:upper():match("STOP") then
+      if _callback then
+        _callback(true, { action = "abort", reason = content })
+      end
+      return
+    end
+
+    -- 默认：将 AI 的文本回复作为输入内容
+    if content and content ~= "" then
+      if _callback then
+        _callback(true, { action = "send_input", args = { input = content } })
+      end
+      return
+    end
+
+    -- 无法决定时，安全地结束
+    if _callback then
+      _callback(true, { action = "abort", reason = "AI 无法决定输入内容" })
+    end
+  end)
+end
+
 --- 获取会话状态（供外部模块直接操作，如 cancel_generation）
 --- @param session_id string
 --- @return table|nil

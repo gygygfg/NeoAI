@@ -163,20 +163,50 @@ function M.execute_async(tool_name, args, on_success, on_error, on_progress)
   end
 
   -- 包装 on_progress 回调：同时发射事件和调用用户回调
+  -- 注意：on_progress 可能在 libuv 回调（fast event 上下文）中被调用
+  -- 此时 nvim_exec_autocmds 会失败（E5560），需要用 vim.schedule 保护
   local function progress_wrapper(substep_name, status, duration, detail)
+    -- 立即捕获当前值，避免 vim.schedule 闭包中引用被后续调用覆盖
+    local _tool_name = tool_name
+    local _pack_name = pack_name
+    local _substep_name = substep_name
+    local _status = status
+    local _duration = duration or 0
+    local _detail = detail
+    local _session_id = args and (args.session_id or args._session_id)
+
     -- 发射子步骤事件
-    pcall(fire_event, event_constants.TOOL_EXECUTION_SUBSTEP, {
-      tool_name = tool_name,
-      pack_name = pack_name,
-      substep_name = substep_name,
-      status = status, -- "pending" | "executing" | "completed" | "error"
-      duration = duration or 0,
-      detail = detail,
-      session_id = args and (args.session_id or args._session_id),
+    local ok, err = pcall(fire_event, event_constants.TOOL_EXECUTION_SUBSTEP, {
+      tool_name = _tool_name,
+      pack_name = _pack_name,
+      substep_name = _substep_name,
+      status = _status,
+      duration = _duration,
+      detail = _detail,
+      session_id = _session_id,
     })
+    if not ok then
+      -- fast event 上下文中 nvim_exec_autocmds 会失败，用 vim.schedule 重试
+      vim.schedule(function()
+        pcall(fire_event, event_constants.TOOL_EXECUTION_SUBSTEP, {
+          tool_name = _tool_name,
+          pack_name = _pack_name,
+          substep_name = _substep_name,
+          status = _status,
+          duration = _duration,
+          detail = _detail,
+          session_id = _session_id,
+        })
+      end)
+    end
     -- 调用用户提供的 on_progress 回调
     if on_progress then
-      pcall(on_progress, substep_name, status, duration, detail)
+      local ok2, err2 = pcall(on_progress, _substep_name, _status, _duration, _detail)
+      if not ok2 then
+        vim.schedule(function()
+          pcall(on_progress, _substep_name, _status, _duration, _detail)
+        end)
+      end
     end
   end
 

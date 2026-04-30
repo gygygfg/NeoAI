@@ -699,6 +699,11 @@ function M._send_non_stream_request(generation_id, request, params)
       generation.retry_count = generation.retry_count + 1
       -- 使用 vim.defer_fn 延迟重试，避免阻塞事件循环
       vim.defer_fn(function()
+        -- 检查是否已被取消
+        if not state.is_generating or not state.active_generations or not state.active_generations[generation_id] then
+          logger.warn("[ai_engine] _send_non_stream_request 重试已取消：用户按下了停止键或 generation 已失效")
+          return
+        end
         M._send_non_stream_request(generation_id, request, params)
       end, state.retry_delay_ms)
       return
@@ -785,6 +790,11 @@ function M._send_stream_request(generation_id, request, params)
       logger.debug("[ai_engine] _send_stream_request: 重试第 " .. g.retry_count .. " 次，错误=" .. tostring(err))
       -- 使用 vim.defer_fn 延迟重试，避免在 job 回调中调用 vim.wait 阻塞事件循环
       vim.defer_fn(function()
+        -- 检查是否已被取消（用户按停止键后，state.is_generating 会被设为 false）
+        if not state.is_generating or not state.active_generations or not state.active_generations[generation_id] then
+          logger.warn("[ai_engine] _send_stream_request 重试已取消：用户按下了停止键或 generation 已失效")
+          return
+        end
         M._send_stream_request(generation_id, request, params)
       end, state.retry_delay_ms)
       return
@@ -964,7 +974,41 @@ function M._handle_stream_end(generation_id, processor, params)
           -- 如果 request 未保存，从 generation 记录中重建
           saved_request = gen._last_request
         end
+
+        -- 如果是因为缺少 stop_tool_loop 而重试，在消息中插入提示
+        -- 告知 AI 必须调用 stop_tool_loop 工具来结束对话
+        if reason and reason:find("缺少 stop_tool_loop") then
+          local retry_prompt = "【系统提示】你刚刚直接返回了文本而没有调用 stop_tool_loop 工具。"
+            .. "在工具循环模式下，当你认为任务已完成时，必须调用 stop_tool_loop 工具来结束对话，"
+            .. "而不是直接返回文本。请调用 stop_tool_loop 工具来结束当前任务。"
+          if saved_request and saved_request.messages then
+            local inserted = false
+            -- 在最后一条 user 消息之后、最后一条 assistant 消息之前插入
+            for i = #saved_request.messages, 1, -1 do
+              if saved_request.messages[i].role == "user" then
+                table.insert(saved_request.messages, i + 1, {
+                  role = "system",
+                  content = retry_prompt,
+                })
+                inserted = true
+                break
+              end
+            end
+            if not inserted then
+              table.insert(saved_request.messages, {
+                role = "system",
+                content = retry_prompt,
+              })
+            end
+          end
+        end
+
         vim.defer_fn(function()
+          -- 检查是否已被取消（用户按停止键后，state.is_generating 会被设为 false）
+          if not state.is_generating or not state.active_generations or not state.active_generations[generation_id] then
+            logger.warn("[ai_engine] 流式重试已取消：用户按下了停止键或 generation 已失效")
+            return
+          end
           if saved_request then
             M._send_stream_request(generation_id, saved_request, params)
           else
@@ -1265,6 +1309,11 @@ function M._handle_ai_response(generation_id, response, params)
           },
         })
         vim.defer_fn(function()
+          -- 检查是否已被取消
+          if not state.is_generating or not state.active_generations or not state.active_generations[generation_id] then
+            logger.warn("[ai_engine] 非流式响应重试已取消：用户按下了停止键或 generation 已失效")
+            return
+          end
           M._send_non_stream_request(generation_id, request, params)
         end, delay)
         return
