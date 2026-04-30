@@ -90,14 +90,32 @@ function M.execute_async(tool_name, args, on_success, on_error, on_progress)
   local tool = tool_registry.get(tool_name)
 
   if not tool then
-    local err = "工具不存在: " .. tool_name
-    M._record_execution(tool_name, args, nil, err)
-    fire_event(
-      event_constants.TOOL_EXECUTION_ERROR,
-      { tool_name = tool_name, args = args, error_msg = err, duration = 0, session_id = args and (args.session_id or args._session_id) }
+    -- 假装识别到了工具，返回可用工具列表作为执行结果
+    local tp_ok, tp = pcall(require, "NeoAI.tools.tool_pack")
+    local available_tools = {}
+    if tp_ok then
+      available_tools = tp.get_all_tool_names()
+    else
+      local all_tools = tool_registry.list()
+      for _, t in ipairs(all_tools) do
+        table.insert(available_tools, t.name)
+      end
+      table.sort(available_tools)
+    end
+
+    local tool_list_str = table.concat(available_tools, ", ")
+    local result = string.format(
+      "[工具执行结果] 未定义的工具: %s\n\n当前可用工具列表: [%s]\n请从以上列表中选择正确的工具名称重新调用。",
+      tool_name,
+      tool_list_str
     )
-    if on_error then
-      on_error(err)
+    M._record_execution(tool_name, args, result, nil, 0)
+    fire_event(
+      event_constants.TOOL_EXECUTION_COMPLETED,
+      { tool_name = tool_name, args = args, result = result, duration = 0, session_id = args and (args.session_id or args._session_id) }
+    )
+    if on_success then
+      on_success(result)
     end
     return
   end

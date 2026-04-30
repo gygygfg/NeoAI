@@ -12,6 +12,62 @@ local config = {
   retry_delays = { 1000, 2000, 4000, 8000, 16000 }, -- 指数退避（毫秒）
 }
 
+-- ========== 总结内容检测 ==========
+
+--- 判断 AI 返回的内容是否为总结性质
+--- 当内容包含总结类关键词时，视为正常结束，不触发重试也不触发额外总结轮次
+--- @param content string AI 响应文本
+--- @return boolean 是否为总结内容
+function M.is_summary_content(content)
+  if not content or content == "" then
+    return false
+  end
+
+  -- 总结类关键词列表（不区分大小写）
+  local summary_keywords = {
+    "总结",
+    "汇总",
+    "概述",
+    "小结",
+    "综上所述",
+    "总而言之",
+    "任务完成",
+    "已完成",
+    "已完成的任务",
+    "最终结果",
+    "最终回复",
+    "以上是",
+    "以上就是",
+    "summary",
+    "summarize",
+    "summarise",
+    "in summary",
+    "in conclusion",
+    "to summarize",
+    "to sum up",
+    "all tasks completed",
+    "task completed",
+    "tasks completed",
+    "here is the summary",
+    "here's the summary",
+    "here are the results",
+    "here's the result",
+    "final result",
+    "final response",
+    "that's all",
+    "that is all",
+  }
+
+  local lower_content = content:lower()
+  for _, keyword in ipairs(summary_keywords) do
+    if lower_content:find(keyword, 1, true) then
+      return true
+    end
+  end
+
+  return false
+end
+
 -- ========== 异常检测 ==========
 
 --- 检测响应文本中是否存在重复段落
@@ -231,8 +287,12 @@ function M.detect_abnormal_response(content, tool_calls, opts)
       return true, "空响应：AI 未返回任何内容或工具调用"
     end
 
-    -- 有内容但无工具调用：AI 未通过 stop_tool_loop 结束对话，视为异常
+    -- 有内容但无工具调用：AI 未通过 stop_tool_loop 结束对话
+    -- 但如果内容本身就是总结性质（包含总结类关键词），视为正常结束，不重试
     if content and content ~= "" and (not tool_calls or #tool_calls == 0) then
+      if M.is_summary_content(content) then
+        return false, nil
+      end
       return true, "缺少 stop_tool_loop：AI 在工具循环中直接返回文本而未调用停止工具"
     end
 

@@ -29,7 +29,7 @@ local function build_round_text(session)
   if _round_text_cache[session.id] ~= nil then
     return _round_text_cache[session.id]
   end
-  local ok, hm = pcall(require, "NeoAI.core.history_manager")
+  local ok, hm = pcall(require, "NeoAI.core.history.manager")
   if ok and hm.build_round_text then
     local text = hm.build_round_text(session)
     _round_text_cache[session.id] = text
@@ -48,7 +48,7 @@ function M.build_flat_items()
   -- 每次重建时清除缓存
   clear_round_text_cache()
 
-  local ok, hm = pcall(require, "NeoAI.core.history_manager")
+  local ok, hm = pcall(require, "NeoAI.core.history.manager")
   if not ok or not hm.is_initialized() then
     state.flat_items = {}
     return {}

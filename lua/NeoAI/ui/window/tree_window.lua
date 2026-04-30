@@ -85,6 +85,8 @@ function M.open(session_id, window_id)
   M._load_and_render_async(function()
     M.set_keymaps()
     M._update_float_window()
+    -- 渲染完成后将光标移动到第一个有效节点行
+    M._move_cursor_to_first_node()
   end)
 
   -- 监听会话重命名事件，自动刷新树
@@ -212,6 +214,8 @@ function M._build_display_content()
   local content = {}
   table.insert(content, "=== NeoAI 会话树 ===")
   table.insert(content, "")
+  table.insert(content, "─────────────────────────────")
+  table.insert(content, "")
 
   if #state.flat_items == 0 then
     table.insert(content, "暂无会话")
@@ -269,7 +273,10 @@ function M._build_line_to_session_map()
   local map = {}
   for line, item in ipairs(state.flat_items) do
     if not item.is_virtual and item.session_id then
-      map[line + 1] = item.session_id
+      -- line 是 flat_items 中的索引（1-based），content 中前面有标题行 + 空行 + 分隔线 + 空行 = 4行
+      -- flat_items 第1行在 content 第5行（1-based），cursor_pos[1]=5 → cursor_line=4（0-based）
+      -- 所以 key = line + 3，匹配时 4 == 4 ✅
+      map[line + 3] = item.session_id
     end
   end
   return map
@@ -444,6 +451,7 @@ function M._move_selection(direction)
     state.selected_session_id = line_map[new_line]
     local win = window_manager.get_window_win(state.current_window_id)
     if win and vim.api.nvim_win_is_valid(win) then
+      -- new_line 来自 _build_line_to_session_map，key = line + 3（1-based），需要加1得到 content 中的实际行号
       vim.api.nvim_win_set_cursor(win, { new_line + 1, 0 })
     end
     M._update_float_window()
@@ -512,7 +520,7 @@ function M._update_float_window()
 
   local status_text = "当前选中: "
   if state.selected_session_id then
-    local ok, hm = pcall(require, "NeoAI.core.history_manager")
+    local ok, hm = pcall(require, "NeoAI.core.history.manager")
     if ok and hm.is_initialized() then
       local session = hm.get_session(state.selected_session_id)
       if session then
@@ -650,6 +658,32 @@ function M.refresh()
   end
   M.render_tree()
   return true
+end
+
+--- 将光标移动到第一个有效节点行
+function M._move_cursor_to_first_node()
+  if not state.current_window_id then
+    return
+  end
+  local line_map = M._build_line_to_session_map()
+  local sorted = {}
+  for line, _ in pairs(line_map) do
+    table.insert(sorted, line)
+  end
+  table.sort(sorted)
+  if #sorted == 0 then
+    return
+  end
+  local first_line = sorted[1]
+  local win_handle = window_manager.get_window_win(state.current_window_id)
+  if win_handle and vim.api.nvim_win_is_valid(win_handle) then
+    -- first_line 来自 _build_line_to_session_map，key = line + 3（1-based），需要加1得到 content 中的实际行号
+    vim.api.nvim_win_set_cursor(win_handle, { first_line + 1, 0 })
+    state.selected_session_id = line_map[first_line]
+    M._update_float_window()
+    local handlers = require("NeoAI.ui.handlers.tree_handlers")
+    handlers.handle_cursor_moved()
+  end
 end
 
 --- 获取树数据

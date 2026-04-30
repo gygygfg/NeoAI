@@ -976,7 +976,25 @@ function M._handle_stream_end(generation_id, processor, params)
           "[ai_engine] 流式响应异常但重试已达上限 (%d/%d): %s",
           retry_count, response_retry.get_max_retries(), reason
         ))
-        -- 重试已达上限：不再重试，继续正常处理当前响应（包含 tool_calls）
+        -- 重试已达上限：不再重试
+        -- 如果是在工具循环中且 AI 未调用 stop_tool_loop，强制结束循环
+        if is_tool_loop and reason and reason:find("缺少 stop_tool_loop") then
+          logger.warn("[ai_engine] 重试已达上限且 AI 未调用 stop_tool_loop，强制结束工具循环")
+          state.is_generating = false
+          state.current_generation_id = nil
+          state.active_generations[generation_id] = nil
+          tool_orchestrator.on_generation_complete({
+            generation_id = generation_id,
+            tool_calls = {},
+            content = full_response,
+            reasoning = reasoning_text,
+            usage = usage,
+            session_id = processor.session_id,
+            is_final_round = true,
+          })
+          return
+        end
+        -- 其他异常：继续正常处理当前响应（包含 tool_calls）
         -- 避免工具调用被丢弃导致 UI 不渲染且不保存
       end
     end
@@ -1671,7 +1689,7 @@ function M.handle_generation_error(generation_id, error_msg)
   state.is_generating = false
   state.current_generation_id = nil
 
-  local hm_ok, hm = pcall(require, "NeoAI.core.history_manager")
+  local hm_ok, hm = pcall(require, "NeoAI.core.history.manager")
   if hm_ok and hm and hm._save then
     hm._save()
   end
@@ -1756,7 +1774,7 @@ function M.cancel_generation()
   state.is_generating = false
   state.current_generation_id = nil
 
-  local hm_ok, hm = pcall(require, "NeoAI.core.history_manager")
+  local hm_ok, hm = pcall(require, "NeoAI.core.history.manager")
   if hm_ok and hm and hm._save then
     hm._save()
   end

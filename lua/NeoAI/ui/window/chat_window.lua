@@ -2626,7 +2626,7 @@ function M._append_stream_chunk_to_buffer(chunk_content, content_type)
 
   -- 流式更新保存到 history_manager
     -- 每 10 次更新触发一次防抖保存，确保流式内容不会丢失
-    local hm_ok, hm = pcall(require, "NeoAI.core.history_manager")
+    local hm_ok, hm = pcall(require, "NeoAI.core.history.manager")
     if hm_ok and hm.is_initialized() then
       local session = hm.get_current_session()
       if session then

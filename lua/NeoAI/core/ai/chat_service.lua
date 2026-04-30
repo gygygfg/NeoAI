@@ -7,7 +7,7 @@ local M = {}
 local logger = require("NeoAI.utils.logger")
 local event_constants = require("NeoAI.core.events")
 local ai_engine = require("NeoAI.core.ai.ai_engine")
-local history_manager = require("NeoAI.core.history_manager")
+local history_manager = require("NeoAI.core.history.manager")
 local shutdown_flag = require("NeoAI.core.shutdown_flag")
 
 -- ========== 状态 ==========

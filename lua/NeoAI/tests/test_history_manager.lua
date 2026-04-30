@@ -25,7 +25,7 @@ function M.run(test_module)
   return test.run_tests({
     --- 测试 initialize
     test_initialize = function()
-      local hm = require("NeoAI.core.history_manager")
+      local hm = require("NeoAI.core.history.manager")
       hm._test_reset()
 
       hm.initialize(create_test_config())
@@ -34,7 +34,7 @@ function M.run(test_module)
 
     --- 测试 create_session
     test_create_session = function()
-      local hm = require("NeoAI.core.history_manager")
+      local hm = require("NeoAI.core.history.manager")
       hm._test_reset()
       hm.initialize(create_test_config())
 
@@ -50,7 +50,7 @@ function M.run(test_module)
 
     --- 测试 create_session 带父节点
     test_create_session_with_parent = function()
-      local hm = require("NeoAI.core.history_manager")
+      local hm = require("NeoAI.core.history.manager")
       hm._test_reset()
       hm.initialize(create_test_config())
 
@@ -63,7 +63,7 @@ function M.run(test_module)
 
     --- 测试 get_current_session
     test_get_current_session = function()
-      local hm = require("NeoAI.core.history_manager")
+      local hm = require("NeoAI.core.history.manager")
       hm._test_reset()
       hm.initialize(create_test_config())
 
@@ -76,7 +76,7 @@ function M.run(test_module)
 
     --- 测试 set_current_session
     test_set_current_session = function()
-      local hm = require("NeoAI.core.history_manager")
+      local hm = require("NeoAI.core.history.manager")
       hm._test_reset()
       hm.initialize(create_test_config())
 
@@ -92,7 +92,7 @@ function M.run(test_module)
 
     --- 测试 get_or_create_current_session
     test_get_or_create_current_session = function()
-      local hm = require("NeoAI.core.history_manager")
+      local hm = require("NeoAI.core.history.manager")
       hm._test_reset()
       hm.initialize(create_test_config())
 
@@ -108,7 +108,7 @@ function M.run(test_module)
 
     --- 测试 add_round
     test_add_round = function()
-      local hm = require("NeoAI.core.history_manager")
+      local hm = require("NeoAI.core.history.manager")
       hm._test_reset()
       hm.initialize(create_test_config())
 
@@ -123,7 +123,7 @@ function M.run(test_module)
 
     --- 测试 get_messages
     test_get_messages = function()
-      local hm = require("NeoAI.core.history_manager")
+      local hm = require("NeoAI.core.history.manager")
       hm._test_reset()
       hm.initialize(create_test_config())
 
@@ -138,7 +138,7 @@ function M.run(test_module)
 
     --- 测试 delete_session
     test_delete_session = function()
-      local hm = require("NeoAI.core.history_manager")
+      local hm = require("NeoAI.core.history.manager")
       hm._test_reset()
       hm.initialize(create_test_config())
 
@@ -152,7 +152,7 @@ function M.run(test_module)
 
     --- 测试 rename_session
     test_rename_session = function()
-      local hm = require("NeoAI.core.history_manager")
+      local hm = require("NeoAI.core.history.manager")
       hm._test_reset()
       hm.initialize(create_test_config())
 
@@ -165,7 +165,7 @@ function M.run(test_module)
 
     --- 测试 get_root_sessions
     test_get_root_sessions = function()
-      local hm = require("NeoAI.core.history_manager")
+      local hm = require("NeoAI.core.history.manager")
       hm._test_reset()
       hm.initialize(create_test_config())
 
@@ -178,7 +178,7 @@ function M.run(test_module)
 
     --- 测试 list_sessions
     test_list_sessions = function()
-      local hm = require("NeoAI.core.history_manager")
+      local hm = require("NeoAI.core.history.manager")
       hm._test_reset()
       hm.initialize(create_test_config())
 
@@ -193,7 +193,7 @@ function M.run(test_module)
 
     --- 测试 get_tree
     test_get_tree = function()
-      local hm = require("NeoAI.core.history_manager")
+      local hm = require("NeoAI.core.history.manager")
       hm._test_reset()
       hm.initialize(create_test_config())
 
@@ -207,7 +207,7 @@ function M.run(test_module)
 
     --- 测试 find_parent_session
     test_find_parent_session = function()
-      local hm = require("NeoAI.core.history_manager")
+      local hm = require("NeoAI.core.history.manager")
       hm._test_reset()
       hm.initialize(create_test_config())
 
@@ -220,7 +220,7 @@ function M.run(test_module)
 
     --- 测试 build_round_text
     test_build_round_text = function()
-      local hm = require("NeoAI.core.history_manager")
+      local hm = require("NeoAI.core.history.manager")
       hm._test_reset()
       hm.initialize(create_test_config())
 
@@ -235,7 +235,7 @@ function M.run(test_module)
 
     --- 测试 update_last_assistant（替换语义：更新最后一条，而不是追加）
     test_update_last_assistant = function()
-      local hm = require("NeoAI.core.history_manager")
+      local hm = require("NeoAI.core.history.manager")
       hm._test_reset()
       hm.initialize(create_test_config())
 
@@ -255,7 +255,7 @@ function M.run(test_module)
 
     --- 测试 add_assistant_entry
     test_add_assistant_entry = function()
-      local hm = require("NeoAI.core.history_manager")
+      local hm = require("NeoAI.core.history.manager")
       hm._test_reset()
       hm.initialize(create_test_config())
 
@@ -269,7 +269,7 @@ function M.run(test_module)
 
     --- 测试 add_tool_result
     test_add_tool_result = function()
-      local hm = require("NeoAI.core.history_manager")
+      local hm = require("NeoAI.core.history.manager")
       hm._test_reset()
       hm.initialize(create_test_config())
 
@@ -283,7 +283,7 @@ function M.run(test_module)
 
     --- 测试 update_usage
     test_update_usage = function()
-      local hm = require("NeoAI.core.history_manager")
+      local hm = require("NeoAI.core.history.manager")
       hm._test_reset()
       hm.initialize(create_test_config())
 
@@ -297,7 +297,7 @@ function M.run(test_module)
 
     --- 测试 export_sessions 和 import_sessions
     test_export_import = function()
-      local hm = require("NeoAI.core.history_manager")
+      local hm = require("NeoAI.core.history.manager")
       hm._test_reset()
       hm.initialize(create_test_config())
 
@@ -324,7 +324,7 @@ function M.run(test_module)
 
     --- 测试 delete_chain_to_branch
     test_delete_chain_to_branch = function()
-      local hm = require("NeoAI.core.history_manager")
+      local hm = require("NeoAI.core.history.manager")
       hm._test_reset()
       hm.initialize(create_test_config())
 
@@ -344,7 +344,7 @@ function M.run(test_module)
 
     --- 测试 cleanup_orphans
     test_cleanup_orphans = function()
-      local hm = require("NeoAI.core.history_manager")
+      local hm = require("NeoAI.core.history.manager")
       hm._test_reset()
       hm.initialize(create_test_config())
 

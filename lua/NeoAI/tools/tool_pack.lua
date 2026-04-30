@@ -1,9 +1,9 @@
 -- 工具包管理模块
--- 将相关工具组织为"工具包"，支持批次并发执行和分组显示
+-- 从 ./builtin/*.lua 模块动态扫描工具定义，根据工具的 category 字段自动分组
 --
 -- 工具包定义：
---   pack_name: 包名（如 "file_tools"）
---   display_name: 显示名称（如 "文件操作"）
+--   pack_name: 包名（由 category 自动生成）
+--   display_name: 显示名称
 --   tools: 包内工具名列表
 --   icon: 显示图标
 --
@@ -22,92 +22,73 @@ local logger = require("NeoAI.utils.logger")
 --- ToolPack = { name: string, display_name: string, icon: string, tools: string[], order: number }
 local packs = {}
 
--- ========== 内置工具包定义 ==========
+-- ========== 分类配置 ==========
 
-local default_packs = {
-  file_tools = {
-    name = "file_tools",
-    display_name = "文件操作",
-    icon = "📁",
-    tools = {
-      "read_file",
-      "write_file",
-      "list_files",
-      "search_files",
-      "file_exists",
-      "create_directory",
-      "ensure_dir",
-      "delete_file",
-    },
-    order = 1,
-  },
-  lsp_tools = {
-    name = "lsp_tools",
-    display_name = "代码分析",
-    icon = "🔍",
-    tools = {
-      "lsp_hover",
-      "lsp_definition",
-      "lsp_references",
-      "lsp_implementation",
-      "lsp_declaration",
-      "lsp_document_symbols",
-      "lsp_workspace_symbols",
-      "lsp_code_action",
-      "lsp_rename",
-      "lsp_format",
-      "lsp_diagnostics",
-      "lsp_client_info",
-      "lsp_signature_help",
-      "lsp_completion",
-      "lsp_type_definition",
-      "lsp_service_info",
-    },
-    order = 2,
-  },
-  treesitter_tools = {
-    name = "treesitter_tools",
-    display_name = "语法分析",
-    icon = "🌳",
-    tools = {
-      "parse_file",
-      "query_tree",
-      "get_node_at_position",
-      "get_node_type",
-      "get_node_range",
-      "is_named_node",
-      "get_parent_node",
-      "get_child_nodes",
-    },
-    order = 3,
-  },
-  log_tools = {
-    name = "log_tools",
-    display_name = "日志",
-    icon = "📝",
-    tools = { "log_message", "get_log_levels" },
-    order = 4,
-  },
-  system_tools = {
-    name = "system_tools",
-    display_name = "系统",
-    icon = "⚙️",
-    tools = { "stop_tool_loop" },
-    order = 5,
-  },
+--- 分类显示配置
+--- key 为 category 值，value 为 { display_name, icon, order }
+local category_config = {
+  file = { display_name = "文件操作", icon = "📁", order = 1 },
+  lsp = { display_name = "代码分析", icon = "🔍", order = 2 },
+  treesitter = { display_name = "语法分析", icon = "🌳", order = 3 },
+  log = { display_name = "日志", icon = "📝", order = 4 },
+  system = { display_name = "系统", icon = "⚙️", order = 5 },
+  uncategorized = { display_name = "工具调用", icon = "🔧", order = 99 },
 }
 
 -- ========== 初始化 ==========
 
+--- 从 builtin 目录动态扫描工具，按 category 分组
 function M.initialize()
-  for name, def in pairs(default_packs) do
-    packs[name] = vim.deepcopy(def)
+  packs = {}
+
+  local builtin_dir = debug.getinfo(1).source:match("^@(.+)$")
+  if not builtin_dir then return end
+
+  builtin_dir = builtin_dir:match("^(.+/)tool_pack%.lua$")
+  if not builtin_dir then return end
+
+  builtin_dir = builtin_dir .. "builtin"
+
+  local handle = vim.loop.fs_scandir(builtin_dir)
+  if not handle then return end
+
+  while true do
+    local name, type = vim.loop.fs_scandir_next(handle)
+    if not name then break end
+    if type == "file" and name:match("%.lua$") then
+      local mod_name = name:gsub("%.lua$", "")
+      local ok, mod = pcall(require, "NeoAI.tools.builtin." .. mod_name)
+      if ok and mod and mod.get_tools then
+        local tools = mod.get_tools()
+        for _, tool in ipairs(tools) do
+          if tool.name and tool.func then
+            local cat = tool.category or "uncategorized"
+            if not packs[cat] then
+              local cfg = category_config[cat] or { display_name = cat, icon = "🔧", order = 99 }
+              packs[cat] = {
+                name = cat,
+                display_name = cfg.display_name,
+                icon = cfg.icon,
+                tools = {},
+                order = cfg.order,
+              }
+            end
+            table.insert(packs[cat].tools, tool.name)
+          end
+        end
+      end
+    end
+  end
+
+  -- 对每个包内的工具列表排序
+  for _, pack in pairs(packs) do
+    table.sort(pack.tools)
   end
 end
 
 -- ========== 注册/查询 ==========
 
---- 注册一个工具包
+--- 注册一个工具包（外部扩展用）
 --- @param pack_def table { name, display_name, icon, tools, order? }
 function M.register_pack(pack_def)
   if not pack_def or not pack_def.name then
@@ -181,6 +162,23 @@ function M.get_pack_tools(pack_name)
   return pack and vim.deepcopy(pack.tools) or {}
 end
 
+--- 获取所有已注册的工具名称列表（展平所有包）
+--- @return string[]
+function M.get_all_tool_names()
+  local names = {}
+  local seen = {}
+  for _, pack in pairs(packs) do
+    for _, tool_name in ipairs(pack.tools) do
+      if not seen[tool_name] then
+        seen[tool_name] = true
+        table.insert(names, tool_name)
+      end
+    end
+  end
+  table.sort(names)
+  return names
+end
+
 -- ========== 工具调用分组 ==========
 
 --- 将工具调用列表按包分组
@@ -191,7 +189,6 @@ function M.group_by_pack(tool_calls)
   local uncategorized = {}
 
   for _, tc in ipairs(tool_calls) do
-    -- 兼容多种工具调用格式：{ name = "xxx" }, { func = { name = "xxx" } }, { ["function"] = { name = "xxx" } }
     local tool_name = tc.name
       or (tc.func and tc.func.name)
       or (tc["function"] and tc["function"].name)
@@ -208,7 +205,6 @@ function M.group_by_pack(tool_calls)
     end
   end
 
-  -- 如果有未分类的工具，也加入结果
   if #uncategorized > 0 then
     grouped["_uncategorized"] = uncategorized
   end

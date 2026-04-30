@@ -5,7 +5,7 @@ local M = {}
 local state = { initialized = false, config = nil }
 
 local function get_hm()
-  local ok, hm = pcall(require, "NeoAI.core.history_manager")
+  local ok, hm = pcall(require, "NeoAI.core.history.manager")
   return ok and hm.is_initialized() and hm or nil
 end
 

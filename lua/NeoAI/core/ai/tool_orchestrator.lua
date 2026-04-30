@@ -837,6 +837,32 @@ function M.on_generation_complete(data)
   local content = data.content or ""
   local is_final_round = data.is_final_round or false
 
+  -- 累积当前轮次的 usage 到 ss.accumulated_usage
+  -- on_generation_complete 不是通过 GENERATION_COMPLETED 事件触发的，
+  -- 所以需要在这里手动处理 usage 累积，否则 ss.accumulated_usage 会丢失当前轮次的用量
+  local current_usage = data.usage or {}
+  if current_usage and next(current_usage) then
+    if ss._summary_in_progress then
+      -- 总结轮次：直接赋值（_finalize_generation 中的 accumulated_usage 已包含完整历史）
+      ss.accumulated_usage = vim.deepcopy(current_usage)
+    else
+      -- 普通轮次：逐轮累加
+      local acc = ss.accumulated_usage or {}
+      acc.prompt_tokens = (acc.prompt_tokens or 0) + (current_usage.prompt_tokens or current_usage.input_tokens or 0)
+      acc.completion_tokens = (acc.completion_tokens or 0)
+        + (current_usage.completion_tokens or current_usage.output_tokens or 0)
+      acc.total_tokens = (acc.total_tokens or 0) + (current_usage.total_tokens or 0)
+      if current_usage.completion_tokens_details and type(current_usage.completion_tokens_details) == "table" then
+        local rt = current_usage.completion_tokens_details.reasoning_tokens or 0
+        if not acc.completion_tokens_details then
+          acc.completion_tokens_details = {}
+        end
+        acc.completion_tokens_details.reasoning_tokens = (acc.completion_tokens_details.reasoning_tokens or 0) + rt
+      end
+      ss.accumulated_usage = acc
+    end
+  end
+
   -- 过滤掉流式截断导致的无效工具调用（name 为空或 arguments 为空的条目）
   local valid_tool_calls = {}
   for _, tc in ipairs(tool_calls) do
@@ -924,7 +950,7 @@ function M.on_generation_complete(data)
   -- 注意：is_final_round 时由总结轮次统一保存，此处不重复保存
   -- #tool_calls == 0 时也需要保存（AI 返回纯文本回复的中间轮次）
   if not is_final_round and ss.current_iteration < state.max_iterations then
-    local hm_ok, hm = pcall(require, "NeoAI.core.history_manager")
+    local hm_ok, hm = pcall(require, "NeoAI.core.history.manager")
     if hm_ok and hm.is_initialized() then
       local assistant_entry = { content = content }
       if data.reasoning and data.reasoning ~= "" then
@@ -940,6 +966,65 @@ function M.on_generation_complete(data)
     -- _finish_loop 会触发总结轮次，总结轮次会自己构建消息
     -- 如果先添加了带 tool_calls 的 assistant 消息，总结轮次的消息中就会包含
     -- 未匹配的 tool_call_id，导致 API 报错
+
+    -- 当 AI 返回的内容本身就是总结性质（包含总结类关键词）时，
+    -- 直接结束循环，不再触发额外的总结轮次，避免重复总结
+    if #tool_calls == 0 and content and content ~= "" then
+      if response_retry.is_summary_content(content) then
+        logger.debug("[tool_orchestrator] AI 返回内容为总结性质，直接结束循环，跳过总结轮次")
+        -- 保存当前 AI 响应到消息历史
+        local assistant_msg = {
+          role = "assistant",
+          content = content,
+          timestamp = os.time(),
+          window_id = ss.window_id,
+        }
+        if data.reasoning and data.reasoning ~= "" then
+          assistant_msg.reasoning_content = data.reasoning
+          ss.last_reasoning = data.reasoning
+        end
+        table.insert(ss.messages, assistant_msg)
+        -- 直接结束，不触发总结轮次
+        local saved_usage = ss.accumulated_usage or {}
+        local saved_reasoning = ss.last_reasoning or ""
+        local saved_win_id = ss.window_id
+        local saved_gen_id = ss.generation_id
+        local on_complete = ss.on_complete
+        ss.on_complete = nil
+        ss.phase = "idle"
+        ss.active_tool_calls = {}
+        ss.current_iteration = 0
+        ss.generation_id = nil
+        fire_loop_finished(ss)
+        once_display_closed(session_id, function()
+          local s = state.sessions[session_id]
+          if not s then
+            return
+          end
+          if is_shutting_down() then
+            return
+          end
+          -- 触发 GENERATION_COMPLETED 事件，通知 UI 更新
+          pcall(vim.api.nvim_exec_autocmds, "User", {
+            pattern = event_constants.GENERATION_COMPLETED,
+            data = {
+              generation_id = saved_gen_id,
+              response = content,
+              reasoning_text = saved_reasoning,
+              usage = saved_usage,
+              session_id = session_id,
+              window_id = saved_win_id,
+              duration = 0,
+            },
+          })
+          if on_complete then
+            on_complete(true, content, saved_usage)
+          end
+        end)
+        return
+      end
+    end
+
     M._finish_loop(session_id, true, content)
     return
   end

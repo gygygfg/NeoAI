@@ -123,6 +123,12 @@ function M._load_builtin_tools()
   end
 
   builtin_tools_loaded = true
+
+  -- 内置工具加载完成后，刷新 tool_pack 的工具包分组
+  local tp_ok, tp = pcall(require, "NeoAI.tools.tool_pack")
+  if tp_ok and tp.initialize then
+    tp.initialize()
+  end
 end
 
 function M._load_external_tools(external_tools)
@@ -154,7 +160,7 @@ end
 
 function M.get_history_manager()
   if not initialized then error("工具系统未初始化") end
-  return require("NeoAI.core.history_manager")
+  return require("NeoAI.core.history.manager")
 end
 
 return M

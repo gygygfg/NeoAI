@@ -26,7 +26,7 @@ end
 
 --- 获取历史管理器
 local function get_hm()
-  local ok, hm = pcall(require, "NeoAI.core.history_manager")
+  local ok, hm = pcall(require, "NeoAI.core.history.manager")
   if ok and hm.is_initialized() then return hm end
   return nil
 end

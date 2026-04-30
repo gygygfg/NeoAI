@@ -1384,7 +1384,22 @@ local function lsp_request_async(bufnr, method, params, callback)
     end
     if not any_supported and #clients > 0 then
       if callback then
-        callback(nil, string.format('LSP 方法 "%s" 不被任何已连接的服务器支持', method))
+        -- 对 formatting 方法提供更友好的提示
+        if method == "textDocument/formatting" then
+          local client_names = {}
+          for _, c in ipairs(clients) do
+            table.insert(client_names, c.name)
+          end
+          callback(nil, string.format(
+            "LSP 方法 'textDocument/formatting' 不被任何已连接的服务器支持。\\n" ..
+            "已连接客户端: %s\\n" ..
+            "提示: 当前 LSP 服务器不提供格式化功能。Pyright 是类型检查器，" ..
+            "不支持格式化。请安装 ruff、black 或 autopep8 等格式化工具。",
+            table.concat(client_names, ", ")
+          ))
+        else
+          callback(nil, string.format('LSP 方法 "%s" 不被任何已连接的服务器支持', method))
+        end
       end
       return
     end
@@ -2909,6 +2924,89 @@ M.lsp_rename = define_tool({
 -- 工具 lsp_format - 格式化代码
 -- ============================================================================
 
+-- 外部格式化工具配置（文件类型 -> { 命令, 参数 } 列表）
+-- 当 LSP 不支持格式化时，尝试使用这些外部工具
+local external_formatters = {
+  python = {
+    { cmd = "ruff", args = { "format", "--quiet" }, name = "ruff" },
+    { cmd = "black", args = { "--quiet" }, name = "black" },
+    { cmd = "autopep8", args = { "--in-place" }, name = "autopep8" },
+    { cmd = "yapf", args = { "--in-place" }, name = "yapf" },
+  },
+  lua = {
+    { cmd = "stylua", args = {}, name = "stylua" },
+  },
+  javascript = {
+    { cmd = "prettier", args = { "--write" }, name = "prettier" },
+  },
+  typescript = {
+    { cmd = "prettier", args = { "--write" }, name = "prettier" },
+  },
+  javascriptreact = {
+    { cmd = "prettier", args = { "--write" }, name = "prettier" },
+  },
+  typescriptreact = {
+    { cmd = "prettier", args = { "--write" }, name = "prettier" },
+  },
+  json = {
+    { cmd = "prettier", args = { "--write" }, name = "prettier" },
+  },
+  yaml = {
+    { cmd = "prettier", args = { "--write" }, name = "prettier" },
+  },
+  markdown = {
+    { cmd = "prettier", args = { "--write" }, name = "prettier" },
+  },
+  css = {
+    { cmd = "prettier", args = { "--write" }, name = "prettier" },
+  },
+  html = {
+    { cmd = "prettier", args = { "--write" }, name = "prettier" },
+  },
+  go = {
+    { cmd = "gofmt", args = { "-w" }, name = "gofmt" },
+  },
+  rust = {
+    { cmd = "rustfmt", args = {}, name = "rustfmt" },
+  },
+  sh = {
+    { cmd = "shfmt", args = { "-w" }, name = "shfmt" },
+  },
+  bash = {
+    { cmd = "shfmt", args = { "-w" }, name = "shfmt" },
+  },
+}
+
+-- 尝试使用外部格式化工具格式化文件
+-- 返回 true 表示成功，false 表示无可用工具
+local function try_external_formatter(filepath, ft)
+  local formatters = external_formatters[ft]
+  if not formatters then
+    return false, nil
+  end
+
+  local abs_path = vim.fn.fnamemodify(filepath, ":p")
+
+  for _, formatter in ipairs(formatters) do
+    if vim.fn.executable(formatter.cmd) == 1 then
+      local cmd_args = vim.deepcopy(formatter.args)
+      table.insert(cmd_args, abs_path)
+
+      -- 使用 systemlist 获取退出码：返回 { exit_code, output }
+      -- vim.fn.system 在 Neovim 中返回 (output, exit_code)
+      local ok, result_or_err = pcall(vim.fn.system, cmd_args)
+      if ok then
+        -- 检查 vim.v.shell_error 来判断命令是否成功
+        if vim.v.shell_error == 0 then
+          return true, formatter.name
+        end
+      end
+    end
+  end
+
+  return false, nil
+end
+
 local function _lsp_format(args, on_success, on_error)
   if not check_lsp() then
     if on_error then
@@ -2966,11 +3064,64 @@ local function _lsp_format(args, on_success, on_error)
       end
     end
     if not has_format_client then
+      -- LSP 不支持格式化，尝试回退到外部格式化工具
+      local abs_path = vim.fn.fnamemodify(args.filepath, ":p")
+      local ft = vim.filetype.match({ filename = abs_path })
+
+      local ok, tool_name = try_external_formatter(args.filepath, ft)
+      if ok then
+        if cleanup then
+          cleanup()
+        end
+        local content, _ = read_file_content(args.filepath)
+        if on_success then
+          on_success({
+            filepath = args.filepath,
+            formatted = true,
+            content = content,
+            _source = "external:" .. tool_name,
+            _note = string.format("使用外部工具 '%s' 格式化成功（LSP 不支持格式化）", tool_name),
+          })
+        end
+        return
+      end
+
+      -- 外部工具也不可用，提供详细的错误信息
       if cleanup then
         cleanup()
       end
       if on_error then
-        on_error("LSP 客户端不支持文档格式化（documentFormattingProvider）")
+        local attached_names = {}
+        for _, c in ipairs(vim.lsp.get_clients({ bufnr = bufnr })) do
+          table.insert(attached_names, c.name)
+        end
+        local client_list = #attached_names > 0 and table.concat(attached_names, ", ") or "无"
+
+        -- 列出可用的外部格式化工具
+        local available_tools = {}
+        local formatters = external_formatters[ft]
+        if formatters then
+          for _, f in ipairs(formatters) do
+            local installed = vim.fn.executable(f.cmd) == 1
+            table.insert(available_tools, string.format("  %s %s [%s]",
+              installed and "✓" or "✗", f.name, installed and "已安装" or "未安装"))
+          end
+        end
+        local tool_list = #available_tools > 0 and table.concat(available_tools, "\\n") or "  （该文件类型无可配置的外部格式化工具）"
+
+        local msg = string.format(
+          "LSP 客户端不支持文档格式化（documentFormattingProvider）。\\n" ..
+          "文件类型: %s\\n" ..
+          "已连接的 LSP 客户端: %s\\n\\n" ..
+          "外部格式化工具状态：\\n%s\\n\\n" ..
+          "建议：\\n" ..
+          "  1. 安装上述标记为 ✗ 的工具（如 pip install ruff）\\n" ..
+          "  2. 或使用支持格式化的 LSP 服务器（如 ruff 替代 pyright）",
+          ft or "未知",
+          client_list,
+          tool_list
+        )
+        on_error(msg)
       end
       return
     end

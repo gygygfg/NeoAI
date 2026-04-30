@@ -20,7 +20,7 @@ local state = {
 -- ========== 辅助 ==========
 
 local function get_hm()
-  local ok, hm = pcall(require, "NeoAI.core.history_manager")
+  local ok, hm = pcall(require, "NeoAI.core.history.manager")
   return ok and hm or nil
 end
 
@@ -107,18 +107,8 @@ function M.open_chat_ui(session_id, branch_id)
   if not state.initialized then error("UI not initialized") end
   local hm = get_hm()
   if (not session_id or session_id == "default") and hm and hm.is_initialized() then
-    -- 优先使用已有历史会话（最近更新的），而不是每次都创建新会话
-    local roots = hm.get_root_sessions()
-    if roots and #roots > 0 then
-      -- 使用最近更新的根会话
-      table.sort(roots, function(a, b)
-        return (a.updated_at or a.created_at or 0) > (b.updated_at or b.created_at or 0)
-      end)
-      session_id = roots[1].id
-      hm.set_current_session(session_id)
-    else
-      session_id = hm.create_session("聊天会话", true, nil)
-    end
+    -- 没有传入 session_id 时，总是创建新会话
+    session_id = hm.create_session("聊天会话", true, nil)
   end
   session_id = session_id or state.current_session_id or "default"
   open_window("chat", session_id, branch_id or "main")

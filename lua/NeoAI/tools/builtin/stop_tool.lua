@@ -2,7 +2,9 @@
 -- 当 AI 认为任务已完成时，调用此工具触发循环调用结束
 -- 工具函数签名：func(args, on_success, on_error)
 --
--- 修复：同时取消正在进行的 AI 请求，防止循环卡死
+-- 注意：不调用 ai_engine.cancel_generation()，因为该函数会设置 user_cancelled=true
+-- 导致 _on_tools_complete 跳过总结轮次，造成卡死。
+-- 只需设置 stop_requested 标志并清理 HTTP 请求即可。
 local M = {}
 
 local define_tool = require("NeoAI.tools.builtin.tool_helpers").define_tool
@@ -11,20 +13,19 @@ local event_constants = require("NeoAI.core.events")
 local function _stop_tool_loop(args, on_success, on_error)
   local reason = args and args.reason or "任务已完成"
 
-  -- 取消正在进行的 AI 请求，避免总结轮次与旧请求冲突
-  local ok, ai_engine = pcall(require, "NeoAI.core.ai.ai_engine")
-  if ok and ai_engine and ai_engine.cancel_generation then
-    ai_engine.cancel_generation()
+  -- 取消正在进行的 HTTP 请求（不调用 cancel_generation，避免设置 user_cancelled）
+  local ok, http_client = pcall(require, "NeoAI.core.ai.http_client")
+  if ok and http_client and http_client.cancel_all_requests then
+    http_client.cancel_all_requests()
   end
 
-  -- 触发 TOOL_LOOP_STOP_REQUESTED 事件，通知 tool_orchestrator 停止循环并进入总结
-  -- 使用 vim.schedule 确保不在 fast event 上下文中触发
-  vim.schedule(function()
-    pcall(vim.api.nvim_exec_autocmds, "User", {
-      pattern = event_constants.TOOL_LOOP_STOP_REQUESTED,
-      data = { reason = reason },
-    })
-  end)
+  -- 同步触发 TOOL_LOOP_STOP_REQUESTED 事件，确保 stop_requested 标志
+  -- 在 on_success 回调（_on_tools_complete）之前被设置
+  -- 注意：此工具本身在异步回调中执行，不在 fast event 上下文中，可以安全同步触发
+  pcall(vim.api.nvim_exec_autocmds, "User", {
+    pattern = event_constants.TOOL_LOOP_STOP_REQUESTED,
+    data = { reason = reason },
+  })
 
   if on_success then
     on_success(string.format("工具调用循环已停止。原因: %s", reason))

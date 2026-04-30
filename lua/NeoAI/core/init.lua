@@ -2,7 +2,7 @@ local M = {}
 
 local logger = require("NeoAI.utils.logger")
 local ai_engine = require("NeoAI.core.ai.ai_engine")
-local history_manager = require("NeoAI.core.history_manager")
+local history_manager = require("NeoAI.core.history.manager")
 local state_manager = require("NeoAI.core.config.state")
 
 local initialized = false
