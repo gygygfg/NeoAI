@@ -878,15 +878,72 @@ local function _run_command(args, on_success, on_error, on_progress)
             -- 空字符串：只发送回车
             send_input_to_pty("<enter>")
           else
-            -- AI 发送的是纯文本：先发送文本
-            send_input_to_pty(input_text)
+            -- AI 发送的是纯文本：先清空当前行，再发送文本（让内容渲染在终端中），再补发回车
+            -- 很多交互式命令（read -p、select 菜单等）在收到文本后还需要回车确认。
+            -- 通过单个 defer_fn 按顺序发送：清空行 -> 文本 -> 回车，避免轮询在补发回车前
+            -- 就检测到 waiting 并重复触发 AI 决策。
+            --
+            -- 注意：去除文本末尾的换行符/回车符，避免 AI 返回的文本自带换行时
+            -- 补发的回车导致多余字符留在 PTY 缓冲中，被后续 read 误读取。
+            local clean_text = input_text:gsub("[\r\n]+$", "")
 
-            -- 短暂延迟后检查是否还在等待输入，如果是则补发回车
+            -- 记录交互历史
+            table.insert(session.interaction_history, {
+              round = session.interaction_round,
+              input = input_text,
+              timestamp = os.time(),
+            })
+            if #session.interaction_history > 10 then
+              table.remove(session.interaction_history, 1)
+            end
+
+            -- 延迟发送：先发送文本（让内容渲染在终端中），再补发回车
             vim.defer_fn(function()
-              if session.state == "waiting" and session.is_waiting_for_input then
-                send_input_to_pty("<enter>")
+              if session.state == "finished" then
+                return
               end
-            end, 300)
+
+              -- 第1步：发送文本内容（PTY 终端会自动回显，用户能在浮动窗口中看到输入）
+              local data = resolve_key_sequences(clean_text)
+              pcall(function()
+                vim.fn.chansend(session.channel_id, data)
+              end)
+
+              -- 第2步：补发回车
+              pcall(function()
+                vim.fn.chansend(session.channel_id, "\r")
+              end)
+
+              -- 刷新浮动窗口，确保输入内容立即渲染显示
+              pcall(function()
+                vim.cmd("redraw")
+              end)
+
+              -- 更新状态
+              session.is_waiting_for_input = false
+              session.state = "running"
+
+              -- 清空多余输出：延迟等待命令处理完输入并输出新内容（如下一行提示），
+              -- 然后读取并丢弃这部分 buffer，只记录新位置。
+              -- 这样可以避免下次 waiting 时 AI 看到之前发送的文本回显等脏数据。
+              vim.defer_fn(function()
+                if session.state == "finished" then
+                  return
+                end
+                -- 读取当前 PTY buffer 并记录位置，丢弃其中的内容
+                -- 这样下次 waiting 触发 AI 决策时，从新位置开始读取
+                local full_buffer = read_pty_buffer_output()
+                if full_buffer ~= "" then
+                  session.last_buffer_pos = #full_buffer
+                end
+
+                -- 立即恢复轮询，不再延迟。由 handle_process_state 中的 waiting 确认机制
+                -- 来确保进程确实在稳定等待后才触发 AI 决策。
+                if session.process_monitor then
+                  session.process_monitor:resume_monitoring()
+                end
+              end, 300) -- 300ms 等待命令处理输入并输出新内容
+            end, 200)
           end
         else
           -- 没有输入字段，继续等待
@@ -946,24 +1003,76 @@ local function _run_command(args, on_success, on_error, on_progress)
         -- 进程首次进入等待状态
         session.is_waiting_for_input = true
         session.state = "waiting"
+        session._waiting_confirm_count = 0
 
-        -- 暂停轮询，等待 AI 输入决策
+        -- 暂停轮询
         if session.process_monitor then
           session.process_monitor:pause_monitoring()
         end
-      end
 
-      -- 短暂延迟，确保输出已刷新（给 termopen 时间将内容写入 buffer）
-      -- trigger_ai_input_decision 内部会进行增量读取，无需在此预先读取
-      vim.defer_fn(function()
-        trigger_ai_input_decision()
-      end, 200)
+        -- 启动确认计时器：每 150ms 检查一次进程状态
+        -- 连续多次检测到 waiting 后才触发 AI 决策
+        -- 如果中途进程退出 waiting，则取消
+        session._waiting_confirm_timer = vim.fn.timer_start(150, function()
+          if session.state == "finished" or session.state == "error" then
+            if session._waiting_confirm_timer and vim.fn.timer_info(session._waiting_confirm_timer)[1] then
+              vim.fn.timer_stop(session._waiting_confirm_timer)
+            end
+            session._waiting_confirm_timer = nil
+            return
+          end
+
+          -- 检查进程当前状态
+          local ok, current_state = pcall(session.process_monitor.check_process_state, session.process_monitor)
+          if not ok or not current_state then
+            return
+          end
+
+          if not current_state.is_waiting then
+            -- 进程已退出 waiting，取消确认
+            session._waiting_confirm_count = 0
+            if session._waiting_confirm_timer and vim.fn.timer_info(session._waiting_confirm_timer)[1] then
+              vim.fn.timer_stop(session._waiting_confirm_timer)
+            end
+            session._waiting_confirm_timer = nil
+            session.is_waiting_for_input = false
+            session.state = "running"
+            -- 恢复主轮询
+            if session.process_monitor then
+              session.process_monitor:resume_monitoring()
+            end
+            return
+          end
+
+          -- 仍在 waiting，增加计数
+          session._waiting_confirm_count = session._waiting_confirm_count + 1
+
+          if session._waiting_confirm_count >= 3 then
+            -- 连续 3 次确认 waiting（约 450ms），触发 AI 决策
+            if session._waiting_confirm_timer and vim.fn.timer_info(session._waiting_confirm_timer)[1] then
+              vim.fn.timer_stop(session._waiting_confirm_timer)
+            end
+            session._waiting_confirm_timer = nil
+
+            -- 触发 AI 决策
+            vim.defer_fn(function()
+              trigger_ai_input_decision()
+            end, 50)
+          end
+        end, { ["repeat"] = -1 })
+      end
     elseif not state.is_waiting and session.is_waiting_for_input then
       -- 进程退出等待状态
       session.is_waiting_for_input = false
       if session.state == "waiting" then
         session.state = "running"
       end
+      -- 取消 waiting 确认计时器
+      if session._waiting_confirm_timer and vim.fn.timer_info(session._waiting_confirm_timer)[1] then
+        vim.fn.timer_stop(session._waiting_confirm_timer)
+      end
+      session._waiting_confirm_timer = nil
+      session._waiting_confirm_count = 0
     end
   end
 

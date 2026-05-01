@@ -168,6 +168,9 @@ function M.open(parent_win, opts)
     row = math.max(0, (screen_height - 1) - (input_height + 1))
   end
 
+  -- 注册 VimResized 自动命令，窗口大小变化时重新定位输入框
+  M._setup_vimresized_autocmd()
+
   -- 创建浮动窗口
   state.float_win = vim.api.nvim_open_win(state.float_buf, true, {
     relative = "editor",
@@ -265,6 +268,9 @@ function M.close(force)
   if not state.active then
     return
   end
+
+  -- 清理 VimResized 自动命令
+  M._cleanup_vimresized_autocmd()
 
   -- 清理 CmdlineEnter 自动命令
   if state.float_buf then
@@ -867,6 +873,24 @@ function M.reposition()
   config.width = input_width
   config.height = input_height
   pcall(vim.api.nvim_win_set_config, state.float_win, config)
+end
+
+--- 注册 VimResized 自动命令
+function M._setup_vimresized_autocmd()
+  M._cleanup_vimresized_autocmd()
+  local group = vim.api.nvim_create_augroup("NeoAIVirtualInputVimResized", { clear = true })
+  vim.api.nvim_create_autocmd("VimResized", {
+    group = group,
+    callback = function()
+      M.reposition()
+    end,
+    desc = "窗口大小变化时重新定位浮动输入框",
+  })
+end
+
+--- 清理 VimResized 自动命令
+function M._cleanup_vimresized_autocmd()
+  pcall(vim.api.nvim_del_augroup_by_name, "NeoAIVirtualInputVimResized")
 end
 
 return M

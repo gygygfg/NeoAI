@@ -242,7 +242,8 @@ function M.create_session(name, is_root, parent_id)
   cache.invalidate_tree()
   cache.invalidate_list()
 
-  M._mark_dirty()
+  -- 注意：不在此处调用 _mark_dirty()，避免空会话被保存到历史文件
+  -- 只有 add_round（用户发送消息）时才触发保存
   trigger_event(Events.SESSION_CREATED, { session_id = id, session = session })
   return id
 end

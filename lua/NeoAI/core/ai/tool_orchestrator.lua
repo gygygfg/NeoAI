@@ -847,9 +847,10 @@ function M._request_summary_round(session_id)
   ss._summary_in_progress = true
 
   -- 复制 messages 并添加系统提示
+  -- 使用 vim.deepcopy 深拷贝，防止 format_messages 修改原始消息对象（如添加占位 tool_call_id）
   local messages = {}
   for _, msg in ipairs(ss.messages or {}) do
-    table.insert(messages, msg)
+    table.insert(messages, vim.deepcopy(msg))
   end
   table.insert(messages, {
     role = "system",
@@ -1687,7 +1688,7 @@ function M.execute_single_tool_request(session_id, tool_name, args, callback)
         -- 自动重试（最多 3 次）
         if retry_count < max_retries then
           retry_count = retry_count + 1
-          logger.warn("[tool_orchestrator] execute_single_tool_request 请求失败 (重试 %d/%d): %s", retry_count, max_retries, tostring(err))
+          logger.warn("[tool_orchestrator] execute_single_tool_request 请求失败 (重试 %d/%d): %s | request_model=%s | request_messages_count=%d", retry_count, max_retries, tostring(err), request.model or "nil", request.messages and #request.messages or 0)
           vim.defer_fn(do_request, retry_delay_ms)
           return
         end

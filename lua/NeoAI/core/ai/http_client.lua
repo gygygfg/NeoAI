@@ -832,127 +832,21 @@ function M.send_request_async(params, on_complete)
       end
 
       if response == nil then
-        -- JSON 解码返回 nil
-        -- 检查 content 是否以非 JSON 字符开头（如错误消息），避免将错误消息误判为空JSON
-        local trimmed = content:match("^%s*(.-)%s*$")
-        if trimmed and not (trimmed:find("^{%s*$") or trimmed:find("^%[%s*$") or trimmed:find("^null%s*$")) then
-          -- 内容不是有效的 JSON 结构（不是 {}、[] 或 null），可能是服务器返回的错误消息
-          logger.warn("[http_client] 异步请求返回非JSON内容，视为解析失败: content=%s (len=%d)", content:sub(1, 500), #content)
-          if on_complete then
-            vim.schedule(function()
-              on_complete(nil, "JSON parse failed: " .. content:sub(1, 200))
-            end)
-          end
-          return
+        -- JSON 解码返回 nil，直接视为解析失败
+        -- 输出完整原始数据以便排查
+        local raw_data_for_log = content:sub(1, 2000)
+        if #content > 2000 then
+          raw_data_for_log = raw_data_for_log .. "...[truncated, total=" .. #content .. "]"
         end
-
-        -- 内容看起来是空 JSON 对象/数组或 null 字面量
-        logger.warn("[http_client] 异步请求返回空JSON: content=%s (len=%d)", content:sub(1, 500), #content)
-
-        -- 自动修复：如果设置了强制 tool_choice，可能是 API 不支持，清除后重试
-        if request.tool_choice and type(request.tool_choice) == "table" and request.tool_choice.type == "function" then
-          logger.warn("[http_client] 异步请求返回空JSON，尝试清除 tool_choice 重试")
-          request.tool_choice = nil
-          local retry_transformed = request_adapter.transform_request(request, api_type, provider_config)
-          local retry_ok_encode, retry_body = pcall(json.encode, retry_transformed)
-          if retry_ok_encode and retry_body then
-            retry_body = M._sanitize_json_body(retry_body)
-          end
-          if retry_ok_encode then
-            local retry_temp = vim.fn.tempname()
-            local retry_args = { "-s", "-X", "POST", base_url, "-H", "Content-Type: application/json" }
-            for k, v in pairs(headers) do
-              if k ~= "Content-Type" then
-                table.insert(retry_args, "-H")
-                table.insert(retry_args, k .. ": " .. v)
-              end
-            end
-            vim.list_extend(retry_args, {
-              "-d",
-              retry_body,
-              "--connect-timeout",
-              tostring(math.floor(timeout / 1000)),
-              "--max-time",
-              "0",
-              "-o",
-              retry_temp,
-            })
-
-            local retry_job_id = vim.fn.jobstart({ "curl", unpack(retry_args) }, {
-              on_stderr = function(_, data)
-                if data and #data > 0 then
-                  local err = table.concat(data, "\n")
-                  if err ~= "" then
-                    logger.debug("[http_client] 异步重试请求 stderr: " .. err)
-                  end
-                end
-              end,
-              on_exit = function(_, retry_exit_code, _)
-                if retry_exit_code ~= 0 then
-                  pcall(vim.fn.delete, retry_temp)
-                  if on_complete then
-                    vim.schedule(function()
-                      on_complete(nil, "curl retry exit: " .. retry_exit_code)
-                    end)
-                  end
-                  return
-                end
-
-                local retry_content = M._read_file(retry_temp)
-                pcall(vim.fn.delete, retry_temp)
-
-                if not retry_content or retry_content == "" then
-                  if on_complete then
-                    vim.schedule(function()
-                      on_complete(nil, "Empty retry response")
-                    end)
-                  end
-                  return
-                end
-
-                local retry_ok2, retry_response = pcall(json.decode, retry_content)
-                if not retry_ok2 or not retry_response then
-                  if on_complete then
-                    vim.schedule(function()
-                      on_complete(nil, "Retry JSON parse failed")
-                    end)
-                  end
-                  return
-                end
-
-                if retry_response.error then
-                  if on_complete then
-                    vim.schedule(function()
-                      on_complete(nil, retry_response.error.message or json.encode(retry_response.error))
-                    end)
-                  end
-                  return
-                end
-
-                -- 更新去重缓存
-                if generation_id then
-                  local dedup_key = generation_id .. "_" .. api_type .. "_nonstream"
-                  local body_for_hash = vim.json.encode(request or {})
-                  state._request_dedup[dedup_key] = {
-                    hash = vim.fn.sha256(body_for_hash),
-                    timestamp = os.time() * 1000,
-                  }
-                end
-
-                if on_complete then
-                  vim.schedule(function()
-                    on_complete(request_adapter.transform_response(retry_response, api_type), nil)
-                  end)
-                end
-              end,
-            })
-            return
-          end
-        end
-
+        logger.warn(
+          "[http_client] 异步请求返回非JSON内容，视为解析失败: content=%s (len=%d) | raw_data=%s",
+          content:sub(1, 500),
+          #content,
+          raw_data_for_log
+        )
         if on_complete then
           vim.schedule(function()
-            on_complete(nil, "Empty JSON response")
+            on_complete(nil, "JSON parse failed: " .. content:sub(1, 200))
           end)
         end
         return

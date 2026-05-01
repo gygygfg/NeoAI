@@ -231,6 +231,8 @@ local function format_messages(messages)
   -- 注意：_build_tool_folded_text 中已对 {{{ 和 }}} 做了转义（} } }），所以不会嵌套
   -- 但折叠块内可能包含 } 字符（如 JSON 数据），所以不能用 [^}] 匹配
   -- 使用平衡匹配 %b{} 来匹配最外层的折叠块
+  -- 注意：不修改原始消息对象，创建新消息列表
+  local filtered_messages = {}
   for _, msg in ipairs(messages) do
     if msg.role == "assistant" and msg.content and type(msg.content) == "string" then
       local content = msg.content
@@ -253,24 +255,35 @@ local function format_messages(messages)
       local cleaned = table.concat(cleaned_lines, "\n")
       cleaned = vim.trim(cleaned)
       if cleaned ~= content then
-        msg.content = cleaned
+        -- 创建新消息对象，不修改原始 msg
+        local new_msg = vim.deepcopy(msg)
+        new_msg.content = cleaned
+        table.insert(filtered_messages, new_msg)
+      else
+        table.insert(filtered_messages, msg)
       end
+    else
+      table.insert(filtered_messages, msg)
     end
   end
+  messages = filtered_messages
 
   local result = {}
   -- 收集所有 tool_call_id（来自 assistant 消息的 tool_calls）
   -- 对于没有 id 的 tool_call，生成占位 ID 并直接添加到消息中
-  local expected_tool_call_ids = {} ---@type table<string,boolean>
+  -- 使用计数器跟踪每个 tool_call_id 的预期出现次数，避免重复 tool 消息导致匹配混乱
+  -- 注意：不修改原始消息对象（tc.id），使用深拷贝的 tool_calls 列表
+  local expected_tool_call_ids = {} ---@type table<string,number>
   for _, msg in ipairs(messages) do
     if msg.tool_calls then
       for _, tc in ipairs(msg.tool_calls) do
         if tc.id and tc.id ~= "" then
-          expected_tool_call_ids[tc.id] = true
+          expected_tool_call_ids[tc.id] = (expected_tool_call_ids[tc.id] or 0) + 1
         else
           -- 为没有 id 的 tool_call 生成占位 ID，避免 API 报错
-          tc.id = "call_placeholder_" .. os.time() .. "_" .. math.random(10000, 99999)
-          expected_tool_call_ids[tc.id] = true
+          -- 使用局部变量，不修改原始消息对象
+          local placeholder_id = "call_placeholder_" .. os.time() .. "_" .. math.random(10000, 99999)
+          expected_tool_call_ids[placeholder_id] = (expected_tool_call_ids[placeholder_id] or 0) + 1
         end
       end
     end
@@ -286,8 +299,13 @@ local function format_messages(messages)
     if msg.role == "tool" then
       if msg.tool_call_id and msg.tool_call_id ~= "" then
         fm.tool_call_id = msg.tool_call_id
-        -- 从期望列表中移除已匹配的 tool_call_id
-        expected_tool_call_ids[msg.tool_call_id] = nil
+        -- 从期望列表中递减已匹配的 tool_call_id 计数
+        if expected_tool_call_ids[msg.tool_call_id] then
+          expected_tool_call_ids[msg.tool_call_id] = expected_tool_call_ids[msg.tool_call_id] - 1
+          if expected_tool_call_ids[msg.tool_call_id] <= 0 then
+            expected_tool_call_ids[msg.tool_call_id] = nil
+          end
+        end
       else
         fm.role = "user"
       end
@@ -306,9 +324,14 @@ local function format_messages(messages)
     table.insert(result, fm)
   end
   -- 检查是否有未匹配的 tool_call_id（assistant 的 tool_calls 没有对应的 tool 消息）
-  local missing_ids = vim.tbl_keys(expected_tool_call_ids)
+  -- 使用计数器过滤：只保留计数 > 0 的 ID（值为 nil 的 key 已被删除）
+  local missing_ids = {}
+  for id, count in pairs(expected_tool_call_ids) do
+    if count and count > 0 then
+      table.insert(missing_ids, id)
+    end
+  end
   if #missing_ids > 0 then
-    -- logger.warn("[format_messages] 发现 " .. #missing_ids .. " 个未匹配的 tool_call_id，添加占位 tool 消息: " .. table.concat(missing_ids, ", "))
     for _, id in ipairs(missing_ids) do
       table.insert(result, { role = "tool", tool_call_id = id, content = "[工具结果缺失]" })
     end
@@ -961,9 +984,16 @@ function M._handle_stream_end(generation_id, processor, params)
         local new_retry_count = retry_count + 1
         gen.retry_count = new_retry_count
         local delay = response_retry.get_retry_delay(new_retry_count)
+        -- 输出原始响应内容以便排查
+        local raw_response_for_log = full_response and full_response:sub(1, 1000) or "nil"
+        if full_response and #full_response > 1000 then
+          raw_response_for_log = raw_response_for_log .. "...[truncated, total=" .. #full_response .. "]"
+        end
+        local tool_calls_count = tool_calls and #tool_calls or 0
         logger.warn(string.format(
-          "[ai_engine] 检测到异常流式响应 (重试 %d/%d): %s, 延迟 %dms 后重试",
-          new_retry_count, response_retry.get_max_retries(), reason, delay
+          "[ai_engine] 检测到异常流式响应 (重试 %d/%d): %s, 延迟 %dms 后重试 | full_response(前1000)=%s | tool_calls_count=%d",
+          new_retry_count, response_retry.get_max_retries(), reason, delay,
+          raw_response_for_log, tool_calls_count
         ))
         -- 通知 UI 正在重试
         vim.api.nvim_exec_autocmds("User", {
@@ -1029,7 +1059,12 @@ function M._handle_stream_end(generation_id, processor, params)
         vim.defer_fn(function()
           -- 检查是否已被取消（用户按停止键后，state.is_generating 会被设为 false）
           if not state.is_generating or not state.active_generations or not state.active_generations[generation_id] then
-            logger.warn("[ai_engine] 流式重试已取消：用户按下了停止键或 generation 已失效")
+            logger.warn(string.format(
+              "[ai_engine] 流式重试已取消：用户按下了停止键或 generation 已失效 | is_generating=%s | generation_exists=%s | generation_id=%s",
+              tostring(state.is_generating),
+              tostring(state.active_generations and state.active_generations[generation_id] ~= nil),
+              tostring(generation_id)
+            ))
             return
           end
           if saved_request then
@@ -1636,13 +1671,20 @@ function M.handle_tool_result(data)
     return
   end
 
-  -- 消息去重：移除连续重复的 tool 消息（防止 tool_call_id 未匹配导致叠加）
+  -- 消息去重：移除所有重复的 tool 消息（防止 tool_call_id 未匹配导致叠加）
+  -- 使用 seen_tool_ids 跟踪已出现的 tool_call_id，去重非连续的重复 tool 消息
   local cleaned_messages = {}
+  local seen_tool_ids = {} ---@type table<string,boolean>
   for _, msg in ipairs(messages) do
     local last = cleaned_messages[#cleaned_messages]
-    if last and last.role == "tool" and msg.role == "tool" and last.tool_call_id == msg.tool_call_id then
-      -- 跳过重复的 tool 消息
-      goto skip_msg
+    if msg.role == "tool" then
+      if msg.tool_call_id and seen_tool_ids[msg.tool_call_id] then
+        -- 跳过已出现过的 tool_call_id（无论是否连续）
+        goto skip_msg
+      end
+      if msg.tool_call_id then
+        seen_tool_ids[msg.tool_call_id] = true
+      end
     end
     if last and last.role == "assistant" and msg.role == "assistant" then
       local last_content = type(last.content) == "string" and last.content or ""
@@ -1655,6 +1697,26 @@ function M.handle_tool_result(data)
     ::skip_msg::
   end
   messages = cleaned_messages
+
+  -- 如果是最终轮次（总结轮次），移除末尾孤立的 tool 消息
+  -- 这些 tool 消息没有对应的 assistant tool_calls（assistant 消息已被过滤或移除）
+  -- 会导致 format_messages 添加 [工具结果缺失] 占位消息，影响 AI 响应
+  if is_final_round and #messages > 0 then
+    local last_msg = messages[#messages]
+    if last_msg.role == "tool" then
+      -- 检查倒数第二条消息是否为 assistant（带 tool_calls）
+      if #messages >= 2 then
+        local prev_msg = messages[#messages - 1]
+        if not (prev_msg.role == "assistant" and prev_msg.tool_calls) then
+          -- 倒数第二条不是带 tool_calls 的 assistant，移除孤立的 tool 消息
+          table.remove(messages)
+        end
+      else
+        -- 只有一条 tool 消息，移除它
+        table.remove(messages)
+      end
+    end
+  end
 
   -- 如果已有其他 generation 在生成中，跳过（防止竞态）
   if state.is_generating and state.current_generation_id ~= generation_id then
