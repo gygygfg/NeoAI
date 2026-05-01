@@ -109,12 +109,12 @@ function M._load_builtin_tools()
   if not handle then builtin_tools_loaded = true; return end
 
   while true do
-    local name, type = vim.loop.fs_scandir_next(handle)
+    local name, file_type = vim.loop.fs_scandir_next(handle)
     if not name then break end
-    if type == "file" and name:match("%.lua$") then
+    if file_type == "file" and name:match("%.lua$") then
       local mod_name = name:gsub("%.lua$", "")
       local ok, mod = pcall(require, "NeoAI.tools.builtin." .. mod_name)
-      if ok and mod and mod.get_tools then
+      if ok and type(mod) == "table" and mod.get_tools then
         for _, tool in ipairs(mod.get_tools()) do
           M.register_tool(tool)
         end

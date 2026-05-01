@@ -2129,28 +2129,7 @@ function M._setup_event_listeners()
               end
               -- 先渲染子步骤标题行
               text = text .. prefix .. ss_icon .. " " .. s.name .. " " .. ss_text .. "\n"
-              -- 再渲染 detail 内容（在标题行下方缩进显示），确保 detail 明确属于当前子步骤
-              if s.status == "executing" and s.detail and s.detail ~= "" then
-                local detail_lines = vim.split(s.detail, "\n")
-                -- shell 命令输出显示更多行（最多 20 行），且每行显示更长的内容
-                local max_preview_lines = 20
-                local max_line_length = 120
-                local start_idx = math.max(1, #detail_lines - max_preview_lines + 1)
-                for j = start_idx, #detail_lines do
-                  local line = detail_lines[j]
-                  if line and line ~= "" then
-                    -- 截断过长行
-                    if #line > max_line_length then
-                      line = line:sub(1, max_line_length) .. "..."
-                    end
-                    text = text .. "    " .. string.rep(" ", #prefix - 4) .. "│   " .. line .. "\n"
-                  end
-                end
-                -- 如果输出行数超过最大显示行数，显示提示
-                if #detail_lines > max_preview_lines then
-                  text = text .. "    " .. string.rep(" ", #prefix - 4) .. "│   ... (共 " .. #detail_lines .. " 行, 显示最后 " .. max_preview_lines .. " 行)\n"
-                end
-              end
+
             end
           end
         end

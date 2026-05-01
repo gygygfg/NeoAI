@@ -79,11 +79,27 @@ function M.execute_async(tool_name, args, on_success, on_error, on_progress)
   if not state.initialized then
     M.initialize({})
   end
+
+  -- 参数检查
   if not tool_name then
+    logger.warn("[tool_executor] execute_async: tool_name 为空")
     if on_error then
       on_error("工具名称是必需的")
     end
     return
+  end
+  if type(tool_name) ~= "string" then
+    logger.warn("[tool_executor] execute_async: tool_name 类型错误，期望 string，实际为 %s", type(tool_name))
+    if on_error then
+      on_error("工具名称必须是字符串")
+    end
+    return
+  end
+  if not on_success then
+    logger.warn("[tool_executor] execute_async: 工具 '%s' 的 on_success 回调为空", tool_name)
+  end
+  if not on_error then
+    logger.warn("[tool_executor] execute_async: 工具 '%s' 的 on_error 回调为空", tool_name)
   end
 
   local start_time = os.time()

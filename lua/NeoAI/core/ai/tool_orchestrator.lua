@@ -510,19 +510,32 @@ function M._execute_single_tool(session_id, tool_call)
 
   local tool_func = tool_call["function"] or tool_call.func
   if not tool_func then
+    logger.warn("[tool_orchestrator] _execute_single_tool: tool_call 缺少 function 字段, tool_call=" .. vim.inspect(tool_call))
     return
   end
 
   local tool_name = tool_func.name
+  if not tool_name or tool_name == "" then
+    logger.warn("[tool_orchestrator] _execute_single_tool: tool_func.name 为空, tool_func=" .. vim.inspect(tool_func))
+    return
+  end
+
   local arguments = {}
   if tool_func.arguments then
     local ok, parsed = pcall(vim.json.decode, tool_func.arguments)
-    if ok and parsed then
+    if ok and type(parsed) == "table" then
       arguments = parsed
+    else
+      logger.warn("[tool_orchestrator] _execute_single_tool: tool '%s' 的 arguments JSON 解析失败: %s", tool_name, tostring(tool_func.arguments))
     end
   end
 
-  local tool_call_id = tool_call.id or ("call_" .. os.time() .. "_" .. math.random(10000, 99999))
+  -- 使用计数器确保 tool_call_id 唯一，避免同一秒内多个工具调用 ID 冲突
+  if not M._tool_call_counter then
+    M._tool_call_counter = 0
+  end
+  M._tool_call_counter = M._tool_call_counter + 1
+  local tool_call_id = tool_call.id or ("call_" .. os.time() .. "_" .. M._tool_call_counter .. "_" .. math.random(10000, 99999))
   tool_call.id = tool_call_id
   ss.active_tool_calls[tool_call_id] = true
 
@@ -1427,6 +1440,25 @@ end
 --- @param args table 工具参数
 --- @param callback function 回调函数，接收 (success, result)
 function M.execute_single_tool_request(session_id, tool_name, args, callback)
+  -- 参数检查
+  if not session_id then
+    logger.warn("[tool_orchestrator] execute_single_tool_request: session_id 为空")
+    if callback then
+      callback(false, "session_id 为空")
+    end
+    return
+  end
+  if not tool_name or tool_name == "" then
+    logger.warn("[tool_orchestrator] execute_single_tool_request: tool_name 为空")
+    if callback then
+      callback(false, "tool_name 为空")
+    end
+    return
+  end
+  if not callback then
+    logger.warn("[tool_orchestrator] execute_single_tool_request: callback 为空，工具调用结果将无法返回")
+  end
+
   local ss = state.sessions[session_id]
   if not ss then
     if callback then
@@ -1481,13 +1513,13 @@ function M.execute_single_tool_request(session_id, tool_name, args, callback)
   local input_guidance = ""
   if last_line:match("[Yy]es/[Nn]o") or last_line:match("[Yy]/[Nn]") or last_line:match("%%[Y/n%%]") or last_line:match("%%[y/N%%]") then
     input_guidance = "\n提示：命令正在询问 yes/no 确认，请根据上下文输入 'y' 或 'n'。"
-  elseif last_line:match("[Pp]assword:") then
+  elseif last_line:match("[Pp]assword:") or last_line:match("密码:") then
     input_guidance = "\n提示：命令正在询问密码，请输入密码。"
   elseif last_line:match("[Ss]elect") or last_line:match("[Cc]hoose") or last_line:match("[Oo]ption") or last_line:match("[Nn]umber") or last_line:match("#%?[%s]*$") then
     input_guidance = "\n提示：命令正在显示菜单选项，请根据选项列表输入对应的编号或关键字。"
-  elseif last_line:match("[Ee]nter your") or last_line:match("[Ii]nput your") or last_line:match("[Pp]lease enter") or last_line:match("[Pp]lease input") then
+  elseif last_line:match("[Ee]nter your") or last_line:match("[Ii]nput your") or last_line:match("[Pp]lease enter") or last_line:match("[Pp]lease input") or last_line:match("请输入") then
     input_guidance = "\n提示：命令正在要求输入文本内容（如用户名、名称等），请输入合适的文本。"
-  elseif last_line:match("[Cc]ontinue") or last_line:match("[Pp]ress any key") or last_line:match("[Pp]ress Enter") then
+  elseif last_line:match("[Cc]ontinue") or last_line:match("[Pp]ress any key") or last_line:match("[Pp]ress Enter") or last_line:match("按 Enter 键继续") then
     input_guidance = "\n提示：命令正在等待按任意键继续，请直接发送空字符串或按 Enter。"
   elseif last_line:match("> %s*$") or last_line:match(": %s*$") or last_line:match("#?%s*$") then
     input_guidance = "\n提示：命令正在等待输入，请根据上下文输入合适的内容。"
@@ -1501,9 +1533,24 @@ function M.execute_single_tool_request(session_id, tool_name, args, callback)
         .. "请仔细分析命令当前输出的**最后一行**，它指示了需要输入的内容类型。\n"
         .. "1. 如果最后一行是 \"请输入你的名字:\"、\"Enter your name:\" 等，输入对应的文本内容（如用户名）\n"
         .. "2. 如果最后一行是 \"y/n\"、\"Yes/No\" 等，输入 'y' 或 'n'\n"
-        .. "3. 如果最后一行是 \"Password:\"，输入密码\n"
+        .. "3. 如果最后一行是 \"Password:\" 或包含 \"密码\"，输入密码\n"
         .. "4. 如果最后一行是菜单选项（如 \"#?\"、\"Select\"），根据选项列表输入对应的编号\n"
-        .. "5. 如果命令已执行完毕或不需要继续执行，请调用 %s 工具并设置 stop=true 来终止进程\n\n"
+        .. "5. 如果最后一行包含 \"按 Enter 键继续\"、\"Press Enter\" 等，发送 '<enter>' 即可（只发送回车键）\n"
+        .. "6. 如果需要选择菜单项（如上下方向键），使用 '<up>'、'<down>'、'<enter>' 等特殊按键标记\n"
+        .. "7. 如果需要中断命令（如 Ctrl+C），发送 '<ctrl_c>'\n"
+        .. "8. 如果命令已执行完毕或不需要继续执行，请调用 %s 工具并设置 stop=true 来终止进程\n\n"
+        .. "=== 特殊按键标记说明 ===\n"
+        .. "  <enter> - 回车确认（Enter 键）\n"
+        .. "  <up> - 上方向键\n"
+        .. "  <down> - 下方向键\n"
+        .. "  <left> - 左方向键\n"
+        .. "  <right> - 右方向键\n"
+        .. "  <ctrl_c> - Ctrl+C（中断）\n"
+        .. "  <ctrl_d> - Ctrl+D（EOF）\n"
+        .. "  <tab> - Tab 键\n"
+        .. "  <escape> - Escape 键\n"
+        .. "  <backspace> - Backspace 键\n"
+        .. "你可以组合使用这些标记，例如 '<down><down><enter>' 表示按两次下方向键后按回车。\n"
         .. "=== 命令当前输出 ===\n%s%s",
       cmd_context,
       tool_name,
@@ -1557,8 +1604,12 @@ function M.execute_single_tool_request(session_id, tool_name, args, callback)
   end
 
   -- 构建非流式请求
+  -- 注意：强制工具调用时禁用思考模式（DeepSeek 等 API 不支持思考模式下的强制工具调用）
   local ai_engine = require("NeoAI.core.ai.ai_engine")
   local formatted = ai_engine.format_messages(messages)
+
+  local http_client = require("NeoAI.core.ai.http_client")
+  local ai_preset = ss.ai_preset or {}
 
   local request = ai_engine.build_request({
     messages = formatted,
@@ -1566,20 +1617,25 @@ function M.execute_single_tool_request(session_id, tool_name, args, callback)
       model = (ss.ai_preset or {}).model_name or (ss.options or {}).model,
       stream = false,
       tools_enabled = true,
+      -- 强制工具调用时禁用思考模式
+      reasoning_enabled = false,
     }),
     session_id = session_id,
     generation_id = "single_tool_" .. session_id .. "_" .. os.time(),
   })
 
-  -- 只保留指定工具
+  -- 覆盖 build_request 可能从 state.tool_definitions 设置的 tools，只保留指定工具
   request.tools = { tool_def }
-  -- 清除 build_request 可能设置的 tool_choice（如 "auto"），重新设置
-  request.tool_choice = nil
-
-  local http_client = require("NeoAI.core.ai.http_client")
-  local ai_preset = ss.ai_preset or {}
-  -- 使用指定工具模式
+  -- 使用指定工具模式（强制调用指定工具）
   request.tool_choice = { type = "function", ["function"] = { name = tool_name } }
+  -- 防御性清除 extra_body 中的 thinking 字段（思考模式下不支持强制工具调用）
+  if request.extra_body and request.extra_body.thinking then
+    local thinking_type = type(request.extra_body.thinking) == "table" and request.extra_body.thinking.type or ""
+    if thinking_type == "enabled" then
+      request.extra_body.thinking.type = "disabled"
+    end
+    request.extra_body.reasoning_effort = nil
+  end
 
   -- 构建 http_client 参数
   local http_params = {
@@ -1591,6 +1647,14 @@ function M.execute_single_tool_request(session_id, tool_name, args, callback)
     api_type = ai_preset.api_type or "openai",
     provider_config = ai_preset,
   }
+
+  -- 调试日志：输出最终请求的 model 和 thinking 状态
+  local thinking_status = "unknown"
+  if request.extra_body and request.extra_body.thinking then
+    thinking_status = type(request.extra_body.thinking) == "table" and (request.extra_body.thinking.type or "no_type") or tostring(request.extra_body.thinking)
+  end
+  logger.debug("[tool_orchestrator] execute_single_tool_request 最终请求: model=%s, thinking.type=%s", request.model or "nil", thinking_status)
+
   -- 如果调用方要求禁用思考模式，传递标记
   if args and args._disable_reasoning then
     http_params._disable_reasoning = true
@@ -1599,70 +1663,94 @@ function M.execute_single_tool_request(session_id, tool_name, args, callback)
   -- 使用异步请求，避免阻塞主线程（否则 UI 更新和停止快捷键都会失效）
   -- 回调函数在 jobstart 的 on_exit 中通过 vim.schedule 调用
   local _callback = callback
-  http_client.send_request_async(http_params, function(response, err)
-    -- 检查会话是否已被停止
-    local current_ss = state.sessions[session_id]
-    if not current_ss or current_ss.stop_requested then
-      if _callback then
-        _callback(false, "会话已停止")
+  -- 重试计数器
+  local max_retries = 3
+  local retry_delay_ms = 1000
+  local retry_count = 0
+
+  local function do_request()
+    http_client.send_request_async(http_params, function(response, err)
+      -- 检查会话是否已被停止
+      local current_ss = state.sessions[session_id]
+      if not current_ss or current_ss.stop_requested then
+        if _callback then
+          _callback(false, "会话已停止")
+        end
+        return
       end
-      return
-    end
 
-    if err then
-      if _callback then
-        _callback(false, "AI 请求失败: " .. tostring(err))
-      end
-      return
-    end
-
-    if not response or not response.choices or #response.choices == 0 then
-      if _callback then
-        _callback(false, "AI 响应无效")
-      end
-      return
-    end
-
-    local choice = response.choices[1]
-    local message = choice.message or {}
-
-    -- 检查是否有工具调用
-    if message.tool_calls and #message.tool_calls > 0 then
-      local tc = message.tool_calls[1]
-      local func = tc["function"] or tc.func
-      if func and func.name == tool_name then
-        local ok, parsed_args = pcall(vim.json.decode, func.arguments)
-        if ok and parsed_args then
-          if _callback then
-            _callback(true, { action = "send_input", args = parsed_args })
-          end
+      if err then
+        -- 自动重试（最多 3 次）
+        if retry_count < max_retries then
+          retry_count = retry_count + 1
+          logger.warn("[tool_orchestrator] execute_single_tool_request 请求失败 (重试 %d/%d): %s", retry_count, max_retries, tostring(err))
+          vim.defer_fn(do_request, retry_delay_ms)
           return
         end
+        if _callback then
+          _callback(false, "AI 请求失败: " .. tostring(err))
+        end
+        return
       end
-    end
 
-    -- 检查 AI 是否回复了 ABORT 或类似内容
-    local content = message.content or ""
-    if content:upper():match("ABORT") or content:upper():match("CANCEL") or content:upper():match("STOP") then
+      if not response or not response.choices or #response.choices == 0 then
+        -- 自动重试
+        if retry_count < max_retries then
+          retry_count = retry_count + 1
+          logger.warn("[tool_orchestrator] execute_single_tool_request 响应无效 (重试 %d/%d)", retry_count, max_retries)
+          vim.defer_fn(do_request, retry_delay_ms)
+          return
+        end
+        if _callback then
+          _callback(false, "AI 响应无效")
+        end
+        return
+      end
+
+      local choice = response.choices[1]
+      local message = choice.message or {}
+
+      -- 检查是否有工具调用
+      if message.tool_calls and #message.tool_calls > 0 then
+        local tc = message.tool_calls[1]
+        local func = tc["function"] or tc.func
+        if func and func.name == tool_name then
+          local ok, parsed_args = pcall(vim.json.decode, func.arguments)
+          if ok and type(parsed_args) == "table" then
+            if _callback then
+              _callback(true, { action = "send_input", args = parsed_args })
+            end
+            return
+          end
+        end
+      end
+
+      -- 检查 AI 是否回复了 ABORT 或类似内容
+      local content = message.content or ""
+      if content:upper():match("ABORT") or content:upper():match("CANCEL") or content:upper():match("STOP") then
+        if _callback then
+          _callback(true, { action = "abort", reason = content })
+        end
+        return
+      end
+
+      -- 默认：将 AI 的文本回复作为输入内容
+      if content and content ~= "" then
+        if _callback then
+          _callback(true, { action = "send_input", args = { input = content } })
+        end
+        return
+      end
+
+      -- 无法决定时，安全地结束
       if _callback then
-        _callback(true, { action = "abort", reason = content })
+        _callback(true, { action = "abort", reason = "AI 无法决定输入内容" })
       end
-      return
-    end
+    end)
+  end
 
-    -- 默认：将 AI 的文本回复作为输入内容
-    if content and content ~= "" then
-      if _callback then
-        _callback(true, { action = "send_input", args = { input = content } })
-      end
-      return
-    end
-
-    -- 无法决定时，安全地结束
-    if _callback then
-      _callback(true, { action = "abort", reason = "AI 无法决定输入内容" })
-    end
-  end)
+  -- 发起首次请求
+  do_request()
 end
 
 --- 获取会话状态（供外部模块直接操作，如 cancel_generation）

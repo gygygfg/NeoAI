@@ -374,11 +374,43 @@ local function build_request(params)
 
   if mode ~= "fim" then
     local reasoning_enabled = (options.reasoning_enabled ~= nil) and options.reasoning_enabled or false
+
+    -- 获取当前模型名，用于后续可能的切换
+    local model_name = options.model or ""
+
     if reasoning_enabled then
       local raw_effort = options.reasoning_effort or "high"
       local effort_map = { low = "low", medium = "low", high = "high", xhigh = "max", max = "max" }
       request.extra_body = { thinking = { type = "enabled" }, reasoning_effort = effort_map[raw_effort] or "high" }
     else
+      request.temperature = options.temperature or 0.7
+      -- 新 DeepSeek API 默认启用思考模式，需要显式禁用以支持工具调用等功能
+      request.extra_body = { thinking = { type = "disabled" } }
+
+      -- deepseek-reasoner 是思考模式的模型名，禁用思考模式时应使用 deepseek-chat
+      -- 两者实际都是 deepseek-v4-flash
+      if model_name and type(model_name) == "string" and model_name:lower():find("reasoner") then
+        local new_model = model_name:gsub("reasoner", "chat"):gsub("re$", "")
+        if new_model == model_name then
+          new_model = "deepseek-chat"
+        end
+        request.model = new_model
+      end
+    end
+
+    -- 防御性检查：如果外部调用方已设置了强制工具调用（tool_choice 为 function 类型），
+    -- 则自动禁用思考模式。DeepSeek 等 API 在思考模式下不支持强制工具调用。
+    -- 注意：tool_choice 为 "auto" 或 "none" 时不处理。
+    -- 此检查必须在工具定义处理之前，因为工具定义处理可能会设置 tool_choice = "auto"
+    local has_forced_tool = (options.tool_choice and type(options.tool_choice) == "table" and options.tool_choice.type == "function")
+      or (params.tool_choice and type(params.tool_choice) == "table" and params.tool_choice.type == "function")
+    if has_forced_tool and request.extra_body and request.extra_body.thinking then
+      request.extra_body.thinking = nil
+      request.extra_body.reasoning_effort = nil
+      if not next(request.extra_body) then
+        request.extra_body = nil
+      end
+      -- 恢复 temperature（思考模式禁用后需要 temperature）
       request.temperature = options.temperature or 0.7
     end
 

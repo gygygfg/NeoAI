@@ -832,7 +832,7 @@ local function _search_files(args, on_success, on_error)
   if args.file and type(args.file) == "table" then
     table.insert(file_specs, args.file)
   end
-  -- 支持标准参数：直接传 pattern/dir 等字符串
+  -- 支持简化参数：直接传 pattern/dir 等字符串
   local used_simple = false
   if args.pattern and type(args.pattern) == "string" and not args.files and not args.file then
     table.insert(file_specs, {
@@ -856,10 +856,9 @@ local function _search_files(args, on_success, on_error)
   end
   local all_results = {}
   local pending = #file_specs
-  local completed = 0
   local function check_done()
-    completed = completed + 1
-    if completed >= pending then
+    pending = pending - 1
+    if pending <= 0 then
       if used_simple then
         local example = [[{
   files = {
@@ -894,7 +893,10 @@ local function _search_files(args, on_success, on_error)
     if not search_pattern then
       check_done()
     else
+      -- 构建 grep 命令参数
       local grep_args = {}
+      -- 递归搜索
+      table.insert(grep_args, "-r")
       if not case_sensitive then
         table.insert(grep_args, "-i")
       end
@@ -902,83 +904,84 @@ local function _search_files(args, on_success, on_error)
         table.insert(grep_args, "-F")
       end
       table.insert(grep_args, "-n")
+      -- 文件模式过滤（将 glob 转换为 grep 的 --include）
+      if file_pattern and file_pattern ~= "*" then
+        table.insert(grep_args, "--include")
+        table.insert(grep_args, file_pattern)
+      end
       table.insert(grep_args, "--")
       table.insert(grep_args, search_pattern)
-      vim.uv.fs_scandir(dir, function(scandir_err, scandir_handle)
-        if scandir_err or not scandir_handle then
-          check_done()
-          return
+      table.insert(grep_args, dir)
+
+      -- 使用 vim.uv.spawn 执行 grep -r
+      -- 创建 pipe 用于捕获 stdout 和 stderr
+      local stdout_pipe = vim.uv.new_pipe()
+      local stderr_pipe = vim.uv.new_pipe()
+      local stdout_data = {}
+      local stderr_data = {}
+
+      -- 在 spawn 时通过 stdio 数组传入 pipe
+      local handle = vim.uv.spawn("grep", {
+        args = grep_args,
+        stdio = { nil, stdout_pipe, stderr_pipe },
+      }, function(code)
+        -- 关闭 pipe
+        if not stdout_pipe:is_closing() then
+          stdout_pipe:read_stop()
+          stdout_pipe:close()
         end
-        local files_found = {}
-        local scandir_done = false
-        local grep_running = 0
-        local function finalize_spec()
-          if scandir_done and grep_running == 0 then
-            check_done()
+        if not stderr_pipe:is_closing() then
+          stderr_pipe:read_stop()
+          stderr_pipe:close()
+        end
+
+        if code == 0 then
+          -- 有匹配结果
+          local output = table.concat(stdout_data, "")
+          for line in output:gmatch("[^\n]+") do
+            -- grep -rn 输出格式: filepath:line_num:content
+            local file, line_num, content = line:match("^(.+):(%d+):(.+)$")
+            if file and line_num and content then
+              table.insert(all_results, { file = file, line = tonumber(line_num), content = content })
+            end
+          end
+        elseif code == 1 then
+          -- grep 返回 1 表示无匹配，不是错误
+        else
+          -- grep 返回 2+ 表示错误
+          local err_msg = table.concat(stderr_data, ""):gsub("^%s*(.-)%s*$", "%1")
+          if err_msg and err_msg ~= "" then
+            table.insert(all_results, {
+              _error = string.format("grep 搜索失败 (dir=%s, pattern=%s): %s", dir, search_pattern, err_msg),
+            })
           end
         end
-        local function collect_files()
-          vim.uv.fs_scandir_next(scandir_handle, function(next_err, name, entry_type)
-            if next_err or not name then
-              scandir_done = true
-              if #files_found == 0 then
-                finalize_spec()
-                return
-              end
-              for _, file in ipairs(files_found) do
-                grep_running = grep_running + 1
-                local stdout_data = {}
-                local cmd_args = {}
-                for _, arg in ipairs(grep_args) do
-                  table.insert(cmd_args, arg)
-                end
-                table.insert(cmd_args, file)
-                local handle = vim.uv.spawn("grep", {
-                  args = cmd_args,
-                  stdio = { nil, nil, nil },
-                }, function(code)
-                  if code == 0 then
-                    local output = table.concat(stdout_data, "")
-                    for line in output:gmatch("[^\n]+") do
-                      local line_num, content = line:match("^(%d+):(.+)$")
-                      if line_num and content then
-                        table.insert(all_results, { file = file, line = tonumber(line_num), content = content })
-                      end
-                    end
-                  end
-                  grep_running = grep_running - 1
-                  finalize_spec()
-                end)
-                if handle then
-                  local stdout = vim.uv.new_pipe()
-                  handle:stdio(1, stdout)
-                  stdout:read_start(function(err, data)
-                    if data then
-                      table.insert(stdout_data, data)
-                    end
-                  end)
-                else
-                  grep_running = grep_running - 1
-                  finalize_spec()
-                end
-              end
-              return
-            end
-            if entry_type == "file" then
-              if file_pattern == "*" then
-                table.insert(files_found, dir .. "/" .. name)
-              else
-                local pattern_lua = file_pattern:gsub("%%", "%%%%"):gsub("[", "."):gsub("?", "."):gsub("*", ".*")
-                if name:match("^" .. pattern_lua .. "$") then
-                  table.insert(files_found, dir .. "/" .. name)
-                end
-              end
-            end
-            collect_files()
-          end)
-        end
-        collect_files()
+        check_done()
       end)
+      if handle then
+        stdout_pipe:read_start(function(err, data)
+          if data then
+            table.insert(stdout_data, data)
+          end
+        end)
+        stderr_pipe:read_start(function(err, data)
+          if data then
+            table.insert(stderr_data, data)
+          end
+        end)
+      else
+        -- spawn 失败，清理 pipe
+        if not stdout_pipe:is_closing() then
+          stdout_pipe:close()
+        end
+        if not stderr_pipe:is_closing() then
+          stderr_pipe:close()
+        end
+        table.insert(all_results, {
+          _error = string.format("无法启动 grep 进程 (dir=%s, pattern=%s)", dir, search_pattern),
+        })
+        check_done()
+      end
     end
   end
 end

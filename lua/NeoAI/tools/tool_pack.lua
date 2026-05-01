@@ -65,14 +65,14 @@ function M.initialize()
   end
 
   while true do
-    local name, type = vim.loop.fs_scandir_next(handle)
+    local name, file_type = vim.loop.fs_scandir_next(handle)
     if not name then
       break
     end
-    if type == "file" and name:match("%.lua$") then
+    if file_type == "file" and name:match("%.lua$") then
       local mod_name = name:gsub("%.lua$", "")
       local ok, mod = pcall(require, "NeoAI.tools.builtin." .. mod_name)
-      if ok and mod and mod.get_tools then
+      if ok and type(mod) == "table" and mod.get_tools then
         local tools = mod.get_tools()
         for _, tool in ipairs(tools) do
           if tool.name and tool.func then
