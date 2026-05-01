@@ -18,23 +18,26 @@ local state = {
   _dedup_ttl_ms = 3000, -- 3 秒内相同的请求视为重复
 }
 
---- 清理 JSON 字符串中的非法 unicode 码点
--- Lua 的 json.encode 可能生成包含非法 unicode 码点的字符串（如 0xFFFE, 0xFFFF），
--- 这些码点在 JSON 规范中是不允许的，会导致 API 服务器解析失败。
--- 此函数使用模式匹配替换这些非法码点。
+--- 用 json.decode 验证并修复 JSON 字符串
+-- json.encode 可能生成包含非法 unicode 码点的字符串（如 \uFFFE, \uFFFF），
+-- 这些在 JSON 规范中不允许，会导致 API 服务器解析失败。
+-- 此函数将 json.encode 的输出重新喂给 json.decode，
+-- 由 json.lua 的解析器容忍/跳过非法字符，最大程度拼出有效 JSON，
+-- 然后再用 json.encode 重新编码为干净的字符串。
 function M._sanitize_json_body(body)
   if not body or body == "" then
     return body
   end
-  -- 替换常见的非法 unicode 码点：
-  -- \uFFFE, \uFFFF, 以及代理对范围 (\uD800-\uDFFF) 中的孤立码点
-  -- 这些在 JSON 字符串中是非法的
-  local sanitized = body:gsub("\\u[fF][fF][fF][eE]", "\\ufffd")
-  sanitized = sanitized:gsub("\\u[fF][fF][fF][fF]", "\\ufffd")
-  -- 替换孤立的代理对码点（\uD800-\uDFFF，但排除有效的代理对）
-  -- 注意：这只是一个简化的处理，完整的代理对验证更复杂
-  sanitized = sanitized:gsub("\\u[dD][89aAbBcCdDeEfF][0-9a-fA-F][0-9a-fA-F]", "\\ufffd")
-  return sanitized
+  local ok, decoded = pcall(json.decode, body)
+  if ok and decoded ~= nil then
+    -- json.lua 成功解析，用 json.encode 重新编码得到干净的 JSON
+    local ok2, reencoded = pcall(json.encode, decoded)
+    if ok2 and reencoded then
+      return reencoded
+    end
+  end
+  -- 解析失败或重新编码失败，返回原始 body（后续 curl 会报错，但至少不丢数据）
+  return body
 end
 
 function M.initialize(options)
@@ -212,6 +215,7 @@ function M.send_request(params)
       -- 重新构建请求体并重试
       local retry_transformed = request_adapter.transform_request(request, api_type, provider_config)
       local retry_body = json.encode(retry_transformed)
+      retry_body = M._sanitize_json_body(retry_body)
       local retry_temp = vim.fn.tempname()
       local retry_args = { "-s", "-X", "POST", base_url, "-H", "Content-Type: application/json" }
       for k, v in pairs(headers) do
@@ -712,6 +716,9 @@ function M.send_request_async(params, on_complete)
 
   local transformed = request_adapter.transform_request(request, api_type, provider_config)
   local ok_encode, request_body = pcall(json.encode, transformed)
+  if ok_encode and request_body then
+    request_body = M._sanitize_json_body(request_body)
+  end
   if not ok_encode then
     if on_complete then
       vim.schedule(function()
@@ -848,6 +855,9 @@ function M.send_request_async(params, on_complete)
           request.tool_choice = nil
           local retry_transformed = request_adapter.transform_request(request, api_type, provider_config)
           local retry_ok_encode, retry_body = pcall(json.encode, retry_transformed)
+          if retry_ok_encode and retry_body then
+            retry_body = M._sanitize_json_body(retry_body)
+          end
           if retry_ok_encode then
             local retry_temp = vim.fn.tempname()
             local retry_args = { "-s", "-X", "POST", base_url, "-H", "Content-Type: application/json" }
@@ -958,6 +968,9 @@ function M.send_request_async(params, on_complete)
           -- 重新构建请求体并重试
           local retry_transformed = request_adapter.transform_request(request, api_type, provider_config)
           local retry_ok_encode, retry_body = pcall(json.encode, retry_transformed)
+          if retry_ok_encode and retry_body then
+            retry_body = M._sanitize_json_body(retry_body)
+          end
           if retry_ok_encode then
             local retry_temp = vim.fn.tempname()
             local retry_args = { "-s", "-X", "POST", base_url, "-H", "Content-Type: application/json" }

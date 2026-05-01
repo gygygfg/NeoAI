@@ -17,10 +17,71 @@ local function get_logger()
   return logger
 end
 
--- 转义特殊字符
+-- 将 unicode 码点编码为 JSON 转义序列或 UTF-8 字节
+-- 非法码点（U+FFFE、U+FFFF、U+D800-U+DFFF 孤立代理对）替换为 U+FFFD
+local function code_point_to_json(cp)
+  -- 非法 unicode 码点，替换为 U+FFFD（替换字符）
+  if cp == 0xFFFE or cp == 0xFFFF or (cp >= 0xD800 and cp <= 0xDFFF) then
+    cp = 0xFFFD
+  end
+  -- 控制字符（除了 tab、换行、回车）用 \uXXXX 转义
+  if cp < 0x20 and cp ~= 0x09 and cp ~= 0x0A and cp ~= 0x0D then
+    return string.format("\\u%04x", cp)
+  end
+  -- 可打印字符直接输出为 UTF-8
+  if cp <= 0x7F then
+    return string.char(cp)
+  elseif cp <= 0x7FF then
+    return string.char(0xC0 + bit.rshift(cp, 6), 0x80 + bit.band(cp, 0x3F))
+  elseif cp <= 0xFFFF then
+    return string.char(0xE0 + bit.rshift(cp, 12), 0x80 + bit.band(bit.rshift(cp, 6), 0x3F), 0x80 + bit.band(cp, 0x3F))
+  else
+    return string.char(0xF0 + bit.rshift(cp, 18), 0x80 + bit.band(bit.rshift(cp, 12), 0x3F), 0x80 + bit.band(bit.rshift(cp, 6), 0x3F), 0x80 + bit.band(cp, 0x3F))
+  end
+end
+
+-- 解码 UTF-8 序列，返回码点列表和下一个位置
+-- 遇到非法 UTF-8 字节时，返回 nil 并跳过该字节
+local function decode_utf8(str, pos)
+  local byte = str:byte(pos)
+  if not byte then
+    return nil, pos
+  end
+  if byte < 0x80 then
+    return byte, pos + 1
+  elseif byte >= 0xC0 and byte < 0xE0 then
+    local b2 = str:byte(pos + 1)
+    if b2 and b2 >= 0x80 and b2 < 0xC0 then
+      return bit.lshift(bit.band(byte, 0x1F), 6) + bit.band(b2, 0x3F), pos + 2
+    end
+    return nil, pos + 1
+  elseif byte >= 0xE0 and byte < 0xF0 then
+    local b2 = str:byte(pos + 1)
+    local b3 = str:byte(pos + 2)
+    if b2 and b3 and b2 >= 0x80 and b2 < 0xC0 and b3 >= 0x80 and b3 < 0xC0 then
+      return bit.lshift(bit.band(byte, 0x0F), 12) + bit.lshift(bit.band(b2, 0x3F), 6) + bit.band(b3, 0x3F), pos + 3
+    end
+    return nil, pos + 1
+  elseif byte >= 0xF0 and byte < 0xF8 then
+    local b2 = str:byte(pos + 1)
+    local b3 = str:byte(pos + 2)
+    local b4 = str:byte(pos + 3)
+    if b2 and b3 and b4 and b2 >= 0x80 and b2 < 0xC0 and b3 >= 0x80 and b3 < 0xC0 and b4 >= 0x80 and b4 < 0xC0 then
+      return bit.lshift(bit.band(byte, 0x07), 18) + bit.lshift(bit.band(b2, 0x3F), 12) + bit.lshift(bit.band(b3, 0x3F), 6) + bit.band(b4, 0x3F), pos + 4
+    end
+    return nil, pos + 1
+  else
+    -- 非法首字节（0x80-0xBF 或 0xF8-0xFF）
+    return nil, pos + 1
+  end
+end
+
+-- 转义特殊字符，正确处理 UTF-8 编码
+-- 非法 unicode 码点（U+FFFE、U+FFFF、孤立代理对）替换为 U+FFFD
 local function escape_string(str)
-  local result = str:gsub('[\\"/\b\f\n\r\t]', {
-    ["\\"] = "\\\\",
+  -- 先转义 JSON 特殊字符
+  local escaped = str:gsub('[\\"/\b\f\n\r\t]', {
+    ["\\\\"] = "\\\\",
     ['"'] = '\\"',
     ["/"] = "\\/",
     ["\b"] = "\\b",
@@ -29,13 +90,18 @@ local function escape_string(str)
     ["\r"] = "\\r",
     ["\t"] = "\\t",
   })
-  local bytes = { result:byte(1, -1) }
   local parts = {}
-  for _, byte in ipairs(bytes) do
-    if byte < 0x20 and byte ~= 0x09 and byte ~= 0x0a and byte ~= 0x0d then
-      table.insert(parts, string.format("\\u%04x", byte))
+  local pos = 1
+  local len = #escaped
+  while pos <= len do
+    local cp, next_pos = decode_utf8(escaped, pos)
+    if cp then
+      table.insert(parts, code_point_to_json(cp))
+      pos = next_pos
     else
-      table.insert(parts, string.char(byte))
+      -- 非法 UTF-8 字节，替换为 U+FFFD
+      table.insert(parts, "\\ufffd")
+      pos = next_pos
     end
   end
   return table.concat(parts)
@@ -229,6 +295,10 @@ function M.decode(json_str)
                 end
               end
               if not handled then
+                -- 非法 unicode 码点（U+FFFE、U+FFFF、孤立的代理对）替换为 U+FFFD
+                if code_point == 0xFFFE or code_point == 0xFFFF or (code_point >= 0xD800 and code_point <= 0xDFFF) then
+                  code_point = 0xFFFD
+                end
                 local ch = ""
                 if code_point <= 0x7F then
                   ch = safe_char(code_point)
@@ -250,6 +320,9 @@ function M.decode(json_str)
                 end
                 if ch ~= "" then
                   table.insert(result, ch)
+                else
+                  -- safe_char 失败时也输出 U+FFFD
+                  table.insert(result, "\239\191\189") -- UTF-8 编码的 U+FFFD
                 end
               end
             end
