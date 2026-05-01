@@ -183,24 +183,33 @@ local function has_abnormal_tool_calls(tool_calls)
       -- 只检测真正为空的情况：nil、空字符串、或空 table
       -- 注意："{}"（JSON 空对象）是合法参数，表示一个空参数对象
       if args == nil then
-        logger.debug(string.format(
-          "[response_retry] 检测到空参数工具调用 #%d: name=%s, args=nil",
-          i, tostring(func.name)
-        ))
+        logger.debug(
+          string.format(
+            "[response_retry] 检测到空参数工具调用 #%d: name=%s, args=nil",
+            i,
+            tostring(func.name)
+          )
+        )
         return true
       end
       if args_type == "string" and args == "" then
-        logger.debug(string.format(
-          "[response_retry] 检测到空参数工具调用 #%d: name=%s, args='' (空字符串)",
-          i, tostring(func.name)
-        ))
+        logger.debug(
+          string.format(
+            "[response_retry] 检测到空参数工具调用 #%d: name=%s, args='' (空字符串)",
+            i,
+            tostring(func.name)
+          )
+        )
         return true
       end
       if args_type == "table" and vim.tbl_isempty(args) then
-        logger.debug(string.format(
-          "[response_retry] 检测到空参数工具调用 #%d: name=%s, args={} (空 table)",
-          i, tostring(func.name)
-        ))
+        logger.debug(
+          string.format(
+            "[response_retry] 检测到空参数工具调用 #%d: name=%s, args={} (空 table)",
+            i,
+            tostring(func.name)
+          )
+        )
         return true
       end
     end
@@ -221,10 +230,14 @@ local function has_abnormal_tool_calls(tool_calls)
       end
       local signature = func.name .. ":" .. args_str
       if seen_signatures[signature] then
-        logger.debug(string.format(
-          "[response_retry] 检测到完全相同的重复工具调用 #%d: name=%s, signature=%s",
-          i, func.name, signature
-        ))
+        logger.debug(
+          string.format(
+            "[response_retry] 检测到完全相同的重复工具调用 #%d: name=%s, signature=%s",
+            i,
+            func.name,
+            signature
+          )
+        )
         return true
       end
       seen_signatures[signature] = true
@@ -293,7 +306,7 @@ function M.detect_abnormal_response(content, tool_calls, opts)
       if M.is_summary_content(content) then
         return false, nil
       end
-      return true, "缺少 stop_tool_loop：AI 在工具循环中直接返回文本而未调用停止工具"
+      return true, "[retry] AI 在工具循环中直接返回文本而未调用停止工具"
     end
 
     -- 有工具调用但不包含 stop_tool_loop：正常继续循环

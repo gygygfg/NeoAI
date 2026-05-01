@@ -22,9 +22,7 @@ function M.initialize(config)
 
   -- 初始化 AI 引擎
   -- 各子模块自行从 state_manager 读取配置，无需传递
-  ai_engine.initialize({
-    session_manager = nil, -- 旧版 session_manager 已废弃，使用 history_manager
-  })
+  ai_engine.initialize({})
 
   -- 初始化历史管理器（唯一数据源）
   history_manager.initialize()

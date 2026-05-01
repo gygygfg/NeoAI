@@ -24,7 +24,6 @@ local response_retry = require("NeoAI.core.ai.response_retry")
 local state = {
   initialized = false,
   config = nil,
-  session_manager = nil,
   tools = {},
   max_iterations = 20,
   tool_timeout_ms = 30000,
@@ -241,7 +240,6 @@ function M.initialize(options)
     return M
   end
   state.config = options.config or {}
-  state.session_manager = options.session_manager
   state.tool_timeout_ms = (state.config.tool_timeout_ms or 30) * 1000
   state.max_iterations = state.config.max_tool_iterations or 20
   state.initialized = true
@@ -1024,6 +1022,12 @@ function M.on_generation_complete(data)
         )
         -- 重试已达上限：不再重试，继续正常处理当前工具调用
         -- 避免工具调用被丢弃导致 UI 不渲染且不保存
+        -- 空响应重试耗尽：触发错误，避免卡住
+        if reason and reason:find("空响应") then
+          logger.warn("[tool_orchestrator] 空响应重试已达上限，触发生成错误")
+          M._finish_loop(session_id, false, "AI 多次返回空响应")
+          return
+        end
       end
     end
   end

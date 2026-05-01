@@ -514,6 +514,8 @@ local function _run_command(args, on_success, on_error, on_progress)
     pty_height = args.pty_height or PTY_CONFIG.height,
     _cleaned_up = false, -- 防止重复清理的标志
     last_buffer_pos = 0, -- 上次已读取的 PTY buffer 位置（字节），用于增量读取
+    interaction_round = 0, -- 交互轮次计数，每次触发 AI 输入决策时递增
+    interaction_history = {}, -- 记录每次交互的输入内容，用于构建历史摘要
   }
 
   sessions[session_id] = session
@@ -560,40 +562,42 @@ local function _run_command(args, on_success, on_error, on_progress)
   end
 
   -- 剥离 ANSI 转义码
+  -- 注意：nvim_buf_get_lines 返回的已经是 Neovim 终端模拟器渲染后的纯文本
+  -- 此函数仅作为兜底，处理极少数可能残留的 ANSI 序列
   local function strip_ansi(text)
     if not text then
       return ""
     end
-    -- 移除 ANSI 控制序列：ESC[ 后跟任意数字和分号，以字母结尾
-    local cleaned = text:gsub("\027%[%d;%d+;%d+;%d+;%d+;%d+m", "")
-    cleaned = cleaned:gsub("\027%[%d;%d+;%d+;%d+;%d+m", "")
-    cleaned = cleaned:gsub("\027%[%d;%d+;%d+;%d+m", "")
-    cleaned = cleaned:gsub("\027%[%d;%d+;%d+m", "")
-    cleaned = cleaned:gsub("\027%[%d;%d+m", "")
-    cleaned = cleaned:gsub("\027%[%d+m", "")
-    cleaned = cleaned:gsub("\027%[%d;%d*[a-zA-Z]", "")
-    cleaned = cleaned:gsub("\027%[K", "") -- 清除到行尾
+    -- 移除所有 CSI 序列：ESC [ 可选? 可选数字 可选;数字... 以字母结尾
+    local cleaned = text
+    -- 模式1：ESC [ 字母（无参数，如 \027[H 光标归位）
+    cleaned = cleaned:gsub("\027%[[a-zA-Z]", "")
+    -- 模式2：ESC [ ? 字母（DEC私有模式，如 \027[?25l 隐藏光标）
+    -- 注意：? 在 Lua 模式匹配中是特殊字符，需要用 %? 转义
+    cleaned = cleaned:gsub("\027%[%?[a-zA-Z]", "")
+    -- 模式3：ESC [ 数字 字母（如 \027[2J 清屏、\027[K 清除到行尾）
     cleaned = cleaned:gsub("\027%[%d+[a-zA-Z]", "")
-    cleaned = cleaned:gsub("\027%[[;%d]*[Hf]", "") -- 光标定位
-    cleaned = cleaned:gsub("\027%[[;%d]*[r]", "") -- 设置滚动区域
-    cleaned = cleaned:gsub("\027%[s", "") -- 保存光标位置
-    cleaned = cleaned:gsub("\027%[u", "") -- 恢复光标位置
-    cleaned = cleaned:gsub("\027%[?%d+[hl]", "") -- DEC私有模式
-    cleaned = cleaned:gsub("\027%[%d+;%d+[Hf]", "") -- 光标移动到行列
-    cleaned = cleaned:gsub("\027%[%d+@", "") -- 插入字符
-    cleaned = cleaned:gsub("\027%[%d+P", "") -- 删除字符
-    cleaned = cleaned:gsub("\027%[%d+L", "") -- 插入行
-    cleaned = cleaned:gsub("\027%[%d+M", "") -- 删除行
-    cleaned = cleaned:gsub("\027%[%d+;%d+;%d+t", "") -- 窗口操作
-    cleaned = cleaned:gsub(
-      "\027%[%d+;%d+;%d+;%d+;%d+;%d+;%d+;%d+;%d+;%d+;%d+;%d+;%d+;%d+;%d+;%d+;%d+;%d+;%d+;%d+;%d+;%d+;%d+;%d+;%d+;%d+;%d+;%d+;%d+;%d+;%d+;%d+;%d+;%d+;%d+;%d+;%d+;%d+;%d+;%d+;%d+;%d+;%d+;%d+;%d+;%d+;%d+;%d+;%d+;%d+m",
-      ""
-    )
-    -- 最后用通用模式兜底
-    cleaned = cleaned:gsub(
-      "\027%[%d;%d*;%d*;%d*;%d*;%d*;%d*;%d*;%d*;%d*;%d*;%d*;%d*;%d*;%d*;%d*;%d*;%d*;%d*;%d*;%d*;%d*;%d*;%d*;%d*;%d*;%d*;%d*;%d*;%d*;%d*;%d*;%d*;%d*;%d*;%d*;%d*;%d*;%d*;%d*;%d*;%d*;%d*;%d*;%d*;%d*;%d*;%d*;%d*;%d*;%d*m",
-      ""
-    )
+    -- 模式4：ESC [ ? 数字 字母（DEC私有模式带参数）
+    cleaned = cleaned:gsub("\027%[%?%d+[a-zA-Z]", "")
+    -- 模式5：ESC [ 数字;数字;...;数字 字母（SGR等带分号序列）
+    -- 使用循环匹配 1 到 50 个分号
+    for num_semicolons = 50, 1, -1 do
+      local parts = {}
+      for _ = 1, num_semicolons + 1 do
+        table.insert(parts, "%d+")
+      end
+      cleaned = cleaned:gsub("\027%[" .. table.concat(parts, ";") .. "[a-zA-Z]", "")
+    end
+    -- 模式6：ESC [ ? 数字;数字;...;数字 字母（DEC私有模式带分号）
+    for num_semicolons = 50, 1, -1 do
+      local parts = {}
+      for _ = 1, num_semicolons + 1 do
+        table.insert(parts, "%d+")
+      end
+      cleaned = cleaned:gsub("\027%[%?" .. table.concat(parts, ";") .. "[a-zA-Z]", "")
+    end
+    -- 移除 OSC 序列（ESC] 开头）
+    cleaned = cleaned:gsub("\027%][^\007\027]*[\007\027\\]", "")
     return cleaned
   end
 
@@ -648,6 +652,17 @@ local function _run_command(args, on_success, on_error, on_progress)
     session.is_waiting_for_input = false
     session.state = "running"
 
+    -- 记录交互历史
+    table.insert(session.interaction_history, {
+      round = session.interaction_round,
+      input = input_text,
+      timestamp = os.time(),
+    })
+    -- 只保留最近 10 条
+    if #session.interaction_history > 10 then
+      table.remove(session.interaction_history, 1)
+    end
+
     -- 重置 buffer 位置，下次 waiting 时从最新位置开始增量读取
     -- 因为输入后终端会输出新内容（如回显、下一行提示等）
     local full_buffer = read_pty_buffer_output()
@@ -675,30 +690,40 @@ local function _run_command(args, on_success, on_error, on_progress)
     end
     ai_decision_pending = true
 
+    -- 增加交互轮次计数
+    session.interaction_round = session.interaction_round + 1
+
+    -- 构建历史摘要函数
+    local function build_interaction_summary()
+      local history = session.interaction_history
+      if #history == 0 then
+        return ""
+      end
+      local lines = { "\n=== 之前已发送的输入（供参考，避免重复选择） ===" }
+      for _, h in ipairs(history) do
+        lines[#lines + 1] = string.format('  第%d轮: 输入了 "%s"', h.round, h.input)
+      end
+      lines[#lines + 1] = "================================================\n"
+      return table.concat(lines, "\n")
+    end
+
     -- 调用AI决定输入内容
     -- 注意：PTY buffer 的读取放在 vim.schedule 回调内部，确保每次获取最新内容
     local tool_orchestrator = require("NeoAI.core.ai.tool_orchestrator")
     local chat_session_id = args._session_id
 
     vim.schedule(function()
-      -- 增量读取 PTY buffer：只获取上次读取之后的新增内容
-      -- 避免将整个历史输出（包括已处理过的交互轮次）传递给 AI，导致 AI 混淆
+      -- 读取完整的 PTY buffer 内容，让 AI 看到完整的菜单和选项
+      -- 注意：之前使用增量读取导致 AI 丢失上下文，输入无效选项
       local full_buffer = read_pty_buffer_output()
       if full_buffer == "" then
         full_buffer = session.full_output
       end
 
-      -- 计算新增内容
-      local new_content = ""
-      if #full_buffer > session.last_buffer_pos then
-        new_content = full_buffer:sub(session.last_buffer_pos + 1)
-      end
+      -- 使用完整的 buffer 内容
+      local new_content = full_buffer
+      -- 更新 last_buffer_pos 用于后续参考（不再用于增量截断）
       session.last_buffer_pos = #full_buffer
-
-      -- 如果新增内容为空，尝试使用完整 buffer
-      if new_content == "" then
-        new_content = full_buffer
-      end
 
       -- 清理特殊字符：移除空字符、控制字符等可能导致 JSON 序列化失败的内容
       -- 确保字符串可以被安全嵌入 JSON：转义反斜杠和双引号，修复无效 UTF-8 序列
@@ -756,6 +781,18 @@ local function _run_command(args, on_success, on_error, on_progress)
         return table.concat(result)
       end
 
+      -- 构建轮次信息和历史摘要（添加到 prompt 开头，让 AI 有上下文感知）
+      local round_info = ""
+      if session.interaction_round > 1 then
+        round_info = string.format(
+          "[注意] 这是第 %d 轮交互。如果看到与之前相同的菜单/提示，说明命令在循环执行。\n",
+          session.interaction_round
+        )
+        round_info = round_info
+          .. "如果已经完成了需要的操作，或者发现自己在重复选择相同的选项，请设置 stop=true 终止进程。\n"
+      end
+      local history_summary = build_interaction_summary()
+
       -- 限制传递给 AI 的输出大小（最大 50KB），只取最后部分
       local MAX_OUTPUT_LEN = 50 * 1024
       local prompt_output = sanitize_for_json(new_content)
@@ -774,9 +811,12 @@ local function _run_command(args, on_success, on_error, on_progress)
           .. stderr_output:sub(-MAX_OUTPUT_LEN)
       end
 
+      -- 将轮次信息和历史摘要添加到 prompt 开头
+      local enhanced_prompt = history_summary .. round_info .. prompt_output
+
       tool_orchestrator.execute_single_tool_request(chat_session_id, "send_input", {
-        prompt = prompt_output,
-        stdout = prompt_output,
+        prompt = enhanced_prompt,
+        stdout = enhanced_prompt,
         stderr = stderr_output,
         command = command,
         session_id = session_id,

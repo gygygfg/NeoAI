@@ -16,15 +16,6 @@ local response_retry = require("NeoAI.core.ai.response_retry")
 
 -- ========== 状态 ==========
 
----@class SessionManager
----@field get_session fun(id: string): table|nil
----@field _save_sessions fun()
----@field get_message_manager fun(): table
----@field get_branch_manager fun(): table
----@field list_sessions fun(): table
-
----@class AIEngineState
----@field session_manager SessionManager|nil
 local state = {
   initialized = false,
   is_generating = false,
@@ -33,8 +24,6 @@ local state = {
   tool_definitions = {},
   tool_call_counter = 0,
   first_request = true,
-  ---@type SessionManager|nil
-  session_manager = nil,
   active_generations = {},
   event_listeners = {},
 
@@ -60,8 +49,6 @@ function M.initialize(options)
     return M
   end
 
-  state.session_manager = options.session_manager
-
   http_client.initialize({ config = {} })
   -- 优先从统一状态管理器获取配置
   -- 若 state_manager 未初始化（如测试环境），回退到 options.config
@@ -71,7 +58,7 @@ function M.initialize(options)
   else
     full_config = (options or {}).config or {}
   end
-  tool_orchestrator.initialize({ config = full_config, session_manager = state.session_manager })
+  tool_orchestrator.initialize({ config = full_config })
 
   -- 初始化工具包管理模块
   local tool_pack = require("NeoAI.tools.tool_pack")
@@ -88,12 +75,6 @@ end
 -- ========== 事件监听 ==========
 
 function M._setup_event_listeners()
-  state.event_listeners.send_message = vim.api.nvim_create_autocmd("User", {
-    pattern = event_constants.SEND_MESSAGE,
-    callback = function(args)
-      M.handle_send_message(args.data)
-    end,
-  })
   state.event_listeners.tool_result_received = vim.api.nvim_create_autocmd("User", {
     pattern = event_constants.TOOL_RESULT_RECEIVED,
     callback = function(args)
@@ -243,6 +224,39 @@ local function format_messages(messages)
 
   -- 使用去重后的消息列表
   messages = deduped
+
+  -- 第二步：过滤 assistant 消息中的 UI 折叠文本（{{{ ... }}}）
+  -- 这些折叠文本是 chat_window 为 UI 显示而添加的，不应发送给 API
+  -- 折叠块格式：以 {{{ 开头，以 }}} 结尾，中间可能包含任意内容
+  -- 注意：_build_tool_folded_text 中已对 {{{ 和 }}} 做了转义（} } }），所以不会嵌套
+  -- 但折叠块内可能包含 } 字符（如 JSON 数据），所以不能用 [^}] 匹配
+  -- 使用平衡匹配 %b{} 来匹配最外层的折叠块
+  for _, msg in ipairs(messages) do
+    if msg.role == "assistant" and msg.content and type(msg.content) == "string" then
+      local content = msg.content
+      -- 只移除完整的折叠块（{{{ ... }}}），保留折叠块之外的内容
+      -- 策略：逐行扫描，跳过折叠块区域
+      local lines = vim.split(content, "\n")
+      local in_fold = false
+      local cleaned_lines = {}
+      for _, line in ipairs(lines) do
+        if line:find("^{{{") then
+          in_fold = true
+        end
+        if not in_fold then
+          table.insert(cleaned_lines, line)
+        end
+        if in_fold and line:find("^}}}") then
+          in_fold = false
+        end
+      end
+      local cleaned = table.concat(cleaned_lines, "\n")
+      cleaned = vim.trim(cleaned)
+      if cleaned ~= content then
+        msg.content = cleaned
+      end
+    end
+  end
 
   local result = {}
   -- 收集所有 tool_call_id（来自 assistant 消息的 tool_calls）
@@ -576,44 +590,6 @@ local function process_stream_chunk(processor, data)
 end
 
 -- ========== 核心生成流程 ==========
-
---- 处理发送消息事件
-function M.handle_send_message(data)
-  if not state.initialized then
-    logger.error("AI engine not initialized")
-    return
-  end
-  if state.is_generating then
-    logger.warn("Already generating")
-    return
-  end
-
-  local content = data.content
-  local session_id = data.session_id
-  local window_id = data.window_id
-  local options = data.options or {}
-
-  state.is_generating = true
-  tool_orchestrator.reset_iteration(session_id)
-  state.first_request = true
-
-  local messages = {}
-  if state.session_manager and session_id and state.session_manager.get_session then
-    local session = state.session_manager.get_session(session_id)
-    if session and session.get_messages then
-      messages = session:get_messages() or {}
-    end
-  end
-
-  table.insert(messages, { role = "user", content = content, timestamp = os.time(), window_id = window_id })
-
-  vim.api.nvim_exec_autocmds("User", {
-    pattern = event_constants.USER_MESSAGE_SENT,
-    data = { message = messages[#messages], session_id = session_id, window_id = window_id, timestamp = os.time() },
-  })
-
-  M.generate_response(messages, { session_id = session_id, window_id = window_id, options = options })
-end
 
 --- 生成 AI 响应
 function M.generate_response(messages, params)
@@ -1004,7 +980,22 @@ function M._handle_stream_end(generation_id, processor, params)
         local saved_request = gen._last_request
         if not saved_request then
           -- 如果 request 未保存，从 generation 记录中重建
-          saved_request = gen._last_request
+          local s = state.active_generations[generation_id]
+          if s and s.messages and #s.messages > 0 then
+            local formatted = format_messages(s.messages)
+            saved_request = build_request({
+              messages = formatted,
+              options = vim.tbl_extend("force", s.options or {}, {
+                model = (s.ai_preset and s.ai_preset.model_name) or (s.options and s.options.model),
+                temperature = (s.ai_preset and s.ai_preset.temperature) or (s.options and s.options.temperature),
+                max_tokens = (s.ai_preset and s.ai_preset.max_tokens) or (s.options and s.options.max_tokens),
+                stream = true,
+              }),
+              session_id = s.session_id,
+              generation_id = generation_id,
+            })
+            gen._last_request = saved_request
+          end
         end
 
         -- 如果是因为缺少 stop_tool_loop 而重试，在消息中插入提示
@@ -1042,12 +1033,28 @@ function M._handle_stream_end(generation_id, processor, params)
             return
           end
           if saved_request then
-            M._send_stream_request(generation_id, saved_request, params)
+            -- 释放生成状态，允许新一轮流式请求正常处理
+            state.is_generating = false
+            state.current_generation_id = nil
+            vim.defer_fn(function()
+              if not state.active_generations or not state.active_generations[generation_id] then
+                logger.warn("[ai_engine] 流式重试: generation 已失效，跳过")
+                return
+              end
+              M._send_stream_request(generation_id, saved_request, params)
+            end, 100)
           else
             -- 极端情况：没有保存的 request，通过 handle_tool_result 重新发起
             logger.warn("[ai_engine] 流式重试: 未找到保存的 request，通过 handle_tool_result 重新发起")
-            local s = state.active_generations[generation_id]
-            if s then
+            -- 先释放生成状态，防止 handle_tool_result 中的 state.is_generating 检查跳过重试
+            state.is_generating = false
+            state.current_generation_id = nil
+            vim.defer_fn(function()
+              local s = state.active_generations[generation_id]
+              if not s then
+                logger.warn("[ai_engine] 流式重试: generation 记录已不存在，跳过")
+                return
+              end
               M.handle_tool_result({
                 generation_id = generation_id,
                 session_id = s.session_id,
@@ -1060,7 +1067,7 @@ function M._handle_stream_end(generation_id, processor, params)
                 accumulated_usage = s.accumulated_usage,
                 last_reasoning = s.last_reasoning_content,
               })
-            end
+            end, 100)
           end
         end, delay)
         return
@@ -1091,6 +1098,12 @@ function M._handle_stream_end(generation_id, processor, params)
         if is_final_round then
           logger.warn("[ai_engine] 总结轮次重试已达上限，触发生成错误")
           M.handle_generation_error(generation_id, "总结轮次重试耗尽: " .. tostring(reason))
+          return
+        end
+        -- 空响应重试耗尽：直接触发错误，避免卡住
+        if reason and reason:find("空响应") then
+          logger.warn("[ai_engine] 空响应重试已达上限，触发生成错误")
+          M.handle_generation_error(generation_id, "AI 多次返回空响应: " .. tostring(reason))
           return
         end
         -- 其他异常：继续正常处理当前响应（包含 tool_calls）
@@ -1201,13 +1214,6 @@ function M._handle_stream_end(generation_id, processor, params)
         state.active_generations[generation_id] = nil
         state.is_generating = false
         state.current_generation_id = nil
-
-        if state.session_manager and processor.session_id and state.session_manager.get_session then
-          local session = state.session_manager.get_session(processor.session_id)
-          if session and state.session_manager._save_sessions then
-            state.session_manager._save_sessions()
-          end
-        end
 
         local ok, lsp_module = pcall(require, "NeoAI.tools.builtin.neovim_lsp")
         if ok and lsp_module and lsp_module.flush_deferred_cleanups then
@@ -1361,6 +1367,12 @@ function M._handle_ai_response(generation_id, response, params)
           M.handle_generation_error(generation_id, "总结轮次重试耗尽: " .. tostring(reason))
           return
         end
+        -- 空响应重试耗尽：直接触发错误，避免卡住
+        if reason and reason:find("空响应") then
+          logger.warn("[ai_engine] 非流式空响应重试已达上限，触发生成错误")
+          M.handle_generation_error(generation_id, "AI 多次返回空响应: " .. tostring(reason))
+          return
+        end
         -- 其他异常：继续正常处理当前响应（包含 tool_calls）
         -- 避免工具调用被丢弃导致 UI 不渲染且不保存
         -- 清理 tool_calls 中可能不完整的条目，避免污染消息历史
@@ -1466,13 +1478,6 @@ function M._handle_ai_response(generation_id, response, params)
         state.active_generations[generation_id] = nil
         state.is_generating = false
         state.current_generation_id = nil
-
-        if state.session_manager and session_id and state.session_manager.get_session then
-          local session = state.session_manager.get_session(session_id)
-          if session and state.session_manager._save_sessions then
-            state.session_manager._save_sessions()
-          end
-        end
 
         local ok, lsp_module = pcall(require, "NeoAI.tools.builtin.neovim_lsp")
         if ok and lsp_module and lsp_module.flush_deferred_cleanups then
