@@ -834,7 +834,12 @@ function M._send_stream_request(generation_id, request, params)
     M.handle_generation_error(generation_id, err)
   end
 
-  logger.debug("[ai_engine] _send_stream_request: 发起 HTTP 流式请求，base_url=" .. tostring(ai_preset.base_url))
+  local request_body_size = #(vim.json.encode(request or {}))
+  logger.debug(string.format(
+    "[ai_engine] _send_stream_request: generation_id=%s, base_url=%s, 请求体大小=%d bytes, is_tool_loop=%s, is_final_round=%s",
+    tostring(generation_id), tostring(ai_preset.base_url), request_body_size,
+    tostring(params and params.is_tool_loop), tostring(params and params.is_final_round)
+  ))
   http_client.send_stream_request({
     request = request,
     generation_id = generation_id,
@@ -925,6 +930,10 @@ function M._handle_stream_end(generation_id, processor, params)
   local reasoning_text = processor.reasoning_buffer or ""
   local usage = processor.usage or {}
   local tool_calls = processor.tool_calls or {}
+  logger.debug(string.format(
+    "[ai_engine] _handle_stream_end: generation_id=%s, content_buffer大小=%d, tool_calls数量=%d, is_finished=%s",
+    tostring(generation_id), #full_response, #tool_calls, tostring(processor.is_finished)
+  ))
 
   -- 过滤掉流式截断导致的无效工具调用（name 为空或 arguments 为空的条目）
   -- DeepSeek 等模型在流式过程中可能发送空的 tool_call 骨架，流式结束时需清理
@@ -980,6 +989,32 @@ function M._handle_stream_end(generation_id, processor, params)
     local gen = state.active_generations[generation_id]
     if gen then
       local retry_count = gen.retry_count or 0
+      logger.debug(string.format(
+        "[ai_engine] 异常响应详情: generation_id=%s, reason=%s, retry_count=%d, processor.start_time=%d, 耗时=%ds, processor.is_finished=%s, usage=%s",
+        tostring(generation_id), tostring(reason), retry_count,
+        processor.start_time or 0, os.time() - (processor.start_time or os.time()),
+        tostring(processor.is_finished),
+        vim.inspect(processor.usage or {})
+      ))
+      -- 工具循环模式下空响应：不重试，直接结束工具循环
+      -- DeepSeek 等 API 在处理复杂上下文时可能返回空 HTTP 200，重试无意义
+      if is_tool_loop and reason and reason:find("空响应") then
+        logger.warn("[ai_engine] 工具循环中检测到空响应，直接结束工具循环")
+        state.is_generating = false
+        state.current_generation_id = nil
+        state.active_generations[generation_id] = nil
+        tool_orchestrator.on_generation_complete({
+          generation_id = generation_id,
+          tool_calls = {},
+          content = full_response,
+          reasoning = reasoning_text,
+          usage = usage,
+          session_id = processor.session_id,
+          is_final_round = true,
+        })
+        return
+      end
+
       if response_retry.can_retry(retry_count) then
         local new_retry_count = retry_count + 1
         gen.retry_count = new_retry_count
@@ -1071,6 +1106,9 @@ function M._handle_stream_end(generation_id, processor, params)
             -- 释放生成状态，允许新一轮流式请求正常处理
             state.is_generating = false
             state.current_generation_id = nil
+            -- 清除去重缓存，防止重试请求被去重机制拦截（请求体相同导致直接回调 on_complete，再次触发空响应）
+            local http_client = require("NeoAI.core.ai.http_client")
+            http_client.clear_request_dedup(generation_id)
             vim.defer_fn(function()
               if not state.active_generations or not state.active_generations[generation_id] then
                 logger.warn("[ai_engine] 流式重试: generation 已失效，跳过")

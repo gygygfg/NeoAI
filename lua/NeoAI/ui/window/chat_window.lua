@@ -2437,28 +2437,7 @@ function M._setup_event_listeners()
                   or tostring(r.result or "")
                 -- 清理 \r 字符，确保换行符统一
                 result_str = result_str:gsub("\r\n", "\n"):gsub("\r", "")
-                -- 当结果中包含 ⚠️ 警告：行时，折叠文本只保留警告信息，过滤掉正常结果
-                local lines = {}
-                for line in result_str:gmatch("[^\n]+") do
-                  table.insert(lines, line)
-                end
-                local has_warning = false
-                for _, line in ipairs(lines) do
-                  if line:match("^⚠️%s*警告：") then
-                    has_warning = true
-                    break
-                  end
-                end
-                local icon = r.is_error and "❌" or (has_warning and "⚠️" or "✅")
-                if has_warning then
-                  local warning_lines = {}
-                  for _, line in ipairs(lines) do
-                    if line:match("^⚠️%s*警告：") or line:match("^虽然操作已执行") or line:match("^正确调用示例") then
-                      table.insert(warning_lines, line)
-                    end
-                  end
-                  result_str = table.concat(warning_lines, "\n")
-                end
+                local icon = r.is_error and "❌" or "✅"
                 -- 转义内容中的 {{{ 和 }}}，避免干扰 foldmethod=marker
                 result_str = result_str:gsub("}}}", "} } }"):gsub("{{{", "{ { {")
                 result_str = result_str:gsub("\n", "\n    ")

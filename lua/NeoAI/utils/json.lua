@@ -81,7 +81,7 @@ end
 local function escape_string(str)
   -- 先转义 JSON 特殊字符
   local escaped = str:gsub('[\\"/\b\f\n\r\t]', {
-    ["\\\\"] = "\\\\",
+    ["\\"] = "\\\\",
     ['"'] = '\\"',
     ["/"] = "\\/",
     ["\b"] = "\\b",

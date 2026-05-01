@@ -307,9 +307,9 @@ function M.send_stream_request(params, on_chunk, on_complete, on_error)
         logger.debug(
           "[http_client] 请求去重: 跳过重复的流式请求, generation_id=" .. tostring(generation_id)
         )
-        if on_complete then
-          on_complete()
-        end
+        -- 注意：不调用 on_complete！直接返回 nil。
+        -- on_complete 会触发 _handle_stream_end，而此时 processor 的 content_buffer 为空，
+        -- 会导致 "空响应" 重试误判。去重意味着请求已在处理中，无需额外回调。
         return nil
       end
     end
@@ -370,11 +370,19 @@ function M.send_stream_request(params, on_chunk, on_complete, on_error)
   request.stream = true
   local transformed = request_adapter.transform_request(request, api_type, provider_config)
   local request_body = json.encode(transformed)
+  request_body = M._sanitize_json_body(request_body)
+  logger.debug(string.format(
+    "[http_client] 流式请求体大小: generation_id=%s, 大小=%d bytes",
+    tostring(generation_id), #request_body
+  ))
   -- 对短请求体（< 8KB）使用 --data-raw 避免临时文件 I/O
   local use_temp_file = #request_body > 8192
   local temp_file = use_temp_file and vim.fn.tempname() or nil
   state.request_counter = state.request_counter + 1
   local request_id = "req_" .. state.request_counter .. "_" .. os.time()
+
+  -- 累计接收数据量
+  local total_received = 0
 
   state.active_requests[request_id] = {
     generation_id = generation_id,
@@ -398,15 +406,16 @@ function M.send_stream_request(params, on_chunk, on_complete, on_error)
     if line == "" then
       return
     end
-    local data_str = line:match("^data: (.*)")
+    local data_str = line:match("^data:%s*(.*)")
     if data_str then
       if data_str == "[DONE]" then
         return
       end
       local ok, data = pcall(json.decode, data_str)
       if ok and type(data) == "table" then
+        total_received = total_received + #data_str
         logger.debug(
-          "[http_client] 流式数据块: " .. data_str:sub(1, 500) .. (data_str:len() > 500 and "...[truncated]" or "")
+          "[http_client] 流式数据块: 大小=" .. #data_str .. " bytes, 累计=" .. total_received .. " bytes | " .. data_str:sub(1, 300) .. (data_str:len() > 300 and "...[truncated]" or "")
         )
         if data.error then
           local req = state.active_requests[request_id]
@@ -446,6 +455,15 @@ function M.send_stream_request(params, on_chunk, on_complete, on_error)
     if n == 0 then
       return
     end
+    -- 计算本次回调的数据总大小
+    local lines_size = 0
+    for _, line in ipairs(data_lines) do
+      lines_size = lines_size + #(line or "")
+    end
+    logger.debug(string.format(
+      "[http_client] handle_stdout: 行数=%d, 本次大小=%d bytes, buffer大小=%d bytes",
+      n, lines_size, #(req.buffer or "")
+    ))
     local ends_with_newline = data_lines[n] == ""
     local count = ends_with_newline and n - 1 or n
     for i = 1, count do
@@ -476,13 +494,17 @@ function M.send_stream_request(params, on_chunk, on_complete, on_error)
       return
     end
     if req.buffer ~= "" then
+      logger.debug(string.format("[http_client] handle_complete: 处理残留 buffer, 大小=%d, 内容前100=%s", #req.buffer, req.buffer:sub(1, 100)))
       process_sse_line(req.buffer)
     end
     local has_error = req and req.has_error
     if req then
       state.active_requests[request_id] = nil
     end
-    logger.debug("[http_client] 流式请求完成: " .. base_url .. " | has_error=" .. tostring(has_error))
+    logger.debug(string.format(
+      "[http_client] 流式请求完成: %s | has_error=%s | 总接收数据=%d bytes",
+      base_url, tostring(has_error), total_received
+    ))
     if not has_error and on_complete then
       on_complete()
     end
@@ -593,6 +615,21 @@ function M.cancel_request(request_id)
     pcall(vim.fn.jobstop, req.job_id)
   end
   state.active_requests[request_id] = nil
+end
+
+--- 清除指定 generation_id 的请求去重缓存
+--- 用于重试场景：防止重试请求因请求体相同被去重机制拦截
+--- @param generation_id string
+function M.clear_request_dedup(generation_id)
+  if not generation_id then
+    return
+  end
+  -- 清除所有与该 generation_id 相关的去重缓存
+  for key, _ in pairs(state._request_dedup) do
+    if key:find(generation_id, 1, true) then
+      state._request_dedup[key] = nil
+    end
+  end
 end
 
 function M.cancel_all_requests()
