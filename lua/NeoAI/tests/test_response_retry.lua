@@ -64,10 +64,10 @@ function M.run(test_module)
       local abnormal, reason = rr.detect_abnormal_response(content, nil, {})
       assert.is_true(abnormal, "未闭合代码块应视为异常")
 
-      -- 以逗号结尾
-      local content2 = "这是一段话，"
+      -- 以英文逗号结尾
+      local content2 = "这是一段话,"
       local abnormal2, reason2 = rr.detect_abnormal_response(content2, nil, {})
-      assert.is_true(abnormal2, "以逗号结尾应视为截断")
+      assert.is_true(abnormal2, "以英文逗号结尾应视为截断")
     end,
 
     --- 测试 detect_abnormal_response - 工具调用异常

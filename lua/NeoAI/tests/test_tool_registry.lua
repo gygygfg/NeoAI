@@ -1,10 +1,10 @@
---- 测试: tools/tool_registry.lua
---- 测试工具注册表的注册、注销、查询、搜索、分类等功能
+-- 测试: tools/tool_registry.lua
+-- 测试工具注册表的注册、注销、查询、搜索、分类等功能
 local M = {}
 
 local test
 
---- 创建一个测试工具定义
+-- 创建一个测试工具定义
 local function create_test_tool(name)
   return {
     name = name or "test_tool",
@@ -21,21 +21,21 @@ local function create_test_tool(name)
   }
 end
 
---- 运行所有测试
+-- 运行所有测试
 function M.run(test_module)
   test = test_module or require("NeoAI.tests")
   local assert = test.assert
   print("\n=== test_tool_registry ===")
 
   return test.run_tests({
-    --- 测试 initialize
+    -- 测试 initialize
     test_initialize = function()
       local tr = require("NeoAI.tools.tool_registry")
       tr.reset()
       tr.initialize({})
-    },
+    end,
 
-    --- 测试 register / get
+    -- 测试 register / get
     test_register_and_get = function()
       local tr = require("NeoAI.tools.tool_registry")
       tr.reset()
@@ -49,7 +49,7 @@ function M.run(test_module)
       assert.equal("my_tool", tool.name)
     end,
 
-    --- 测试 register 重复
+    -- 测试 register 重复
     test_register_duplicate = function()
       local tr = require("NeoAI.tools.tool_registry")
       tr.reset()
@@ -60,7 +60,7 @@ function M.run(test_module)
       assert.is_false(ok, "重复注册应返回 false")
     end,
 
-    --- 测试 register 无效工具
+    -- 测试 register 无效工具
     test_register_invalid = function()
       local tr = require("NeoAI.tools.tool_registry")
       tr.reset()
@@ -75,7 +75,7 @@ function M.run(test_module)
       assert.is_false(ok2, "无函数应注册失败")
     end,
 
-    --- 测试 unregister
+    -- 测试 unregister
     test_unregister = function()
       local tr = require("NeoAI.tools.tool_registry")
       tr.reset()
@@ -93,7 +93,7 @@ function M.run(test_module)
       assert.is_false(ok2, "不存在的工具注销应返回 false")
     end,
 
-    --- 测试 list
+    -- 测试 list
     test_list = function()
       local tr = require("NeoAI.tools.tool_registry")
       tr.reset()
@@ -106,7 +106,7 @@ function M.run(test_module)
       assert.is_true(#list >= 2, "应有至少2个工具")
     end,
 
-    --- 测试 list 按分类
+    -- 测试 list 按分类
     test_list_by_category = function()
       local tr = require("NeoAI.tools.tool_registry")
       tr.reset()
@@ -118,7 +118,7 @@ function M.run(test_module)
       assert.is_true(#list >= 1, "应有至少1个工具")
     end,
 
-    --- 测试 search
+    -- 测试 search
     test_search = function()
       local tr = require("NeoAI.tools.tool_registry")
       tr.reset()
@@ -143,7 +143,7 @@ function M.run(test_module)
       assert.is_true(#results >= 2, "应搜索到至少2个工具")
     end,
 
-    --- 测试 search 空查询
+    -- 测试 search 空查询
     test_search_empty = function()
       local tr = require("NeoAI.tools.tool_registry")
       tr.reset()
@@ -153,7 +153,7 @@ function M.run(test_module)
       assert.is_true(type(results) == "table")
     end,
 
-    --- 测试 get_categories
+    -- 测试 get_categories
     test_get_categories = function()
       local tr = require("NeoAI.tools.tool_registry")
       tr.reset()
@@ -164,7 +164,7 @@ function M.run(test_module)
       assert.contains(cats, "test_category")
     end,
 
-    --- 测试 get_category_tool_count
+    -- 测试 get_category_tool_count
     test_get_category_tool_count = function()
       local tr = require("NeoAI.tools.tool_registry")
       tr.reset()
@@ -175,7 +175,7 @@ function M.run(test_module)
       assert.is_true(count >= 1)
     end,
 
-    --- 测试 exists
+    -- 测试 exists
     test_exists = function()
       local tr = require("NeoAI.tools.tool_registry")
       tr.reset()
@@ -186,7 +186,7 @@ function M.run(test_module)
       assert.is_false(tr.exists("nonexistent"))
     end,
 
-    --- 测试 count
+    -- 测试 count
     test_count = function()
       local tr = require("NeoAI.tools.tool_registry")
       tr.reset()
@@ -198,7 +198,7 @@ function M.run(test_module)
       assert.equal(before + 1, after, "注册后计数应增加")
     end,
 
-    --- 测试 clear
+    -- 测试 clear
     test_clear = function()
       local tr = require("NeoAI.tools.tool_registry")
       tr.reset()
@@ -209,7 +209,7 @@ function M.run(test_module)
       assert.equal(nil, tr.get("clear_test"), "clear 后应不存在")
     end,
 
-    --- 测试 export_tool / import_tool
+    -- 测试 export_tool / import_tool
     test_export_import = function()
       local tr = require("NeoAI.tools.tool_registry")
       tr.reset()
@@ -220,12 +220,15 @@ function M.run(test_module)
       assert.not_nil(exported, "导出应成功")
       assert.equal("export_test", exported.name)
 
-      -- 导入
+      -- 导入（import_tool 内部调用 register，register 会检查工具名是否已存在）
+      -- 先清空已注册的工具，避免名称冲突
+      tr.clear()
+      tr.initialize({})
       local ok = tr.import_tool(exported, function() return "imported" end)
       assert.is_true(ok, "导入应成功")
     end,
 
-    --- 测试 get_all_tools
+    -- 测试 get_all_tools
     test_get_all_tools = function()
       local tr = require("NeoAI.tools.tool_registry")
       tr.reset()
@@ -236,7 +239,7 @@ function M.run(test_module)
       assert.not_nil(all.all_test)
     end,
 
-    --- 测试 get_tool（别名）
+    -- 测试 get_tool（别名）
     test_get_tool_alias = function()
       local tr = require("NeoAI.tools.tool_registry")
       tr.reset()
@@ -247,7 +250,7 @@ function M.run(test_module)
       assert.not_nil(tool)
     end,
 
-    --- 测试 update_config
+    -- 测试 update_config
     test_update_config = function()
       local tr = require("NeoAI.tools.tool_registry")
       tr.reset()
@@ -257,7 +260,7 @@ function M.run(test_module)
       -- 不应崩溃
     end,
 
-    --- 测试 reset
+    -- 测试 reset
     test_reset = function()
       local tr = require("NeoAI.tools.tool_registry")
       tr.reset()
