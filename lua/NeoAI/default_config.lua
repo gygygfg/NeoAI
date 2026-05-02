@@ -165,6 +165,9 @@ local DEFAULT_CONFIG = {
     -- 全局默认值（当预设中未指定时使用）
     stream = true,
     timeout = 60000,
+    -- 是否启用深度思考模式（如 DeepSeek 的 reasoning_content）
+    -- 开启后 AI 会在回答前展示推理过程，适用于复杂问题
+    reasoning_enabled = true,
     system_prompt = "你是一个AI编程助手，帮助用户解决编程问题。",
   },
   -- UI配置
@@ -250,11 +253,11 @@ local DEFAULT_CONFIG = {
   -- 日志配置
   log = {
     -- 日志级别: 'DEBUG', 'INFO', 'WARN', 'ERROR', 'FATAL'
-    -- level = "WARN",
-    level = "DEBUG",
+    level = "WARN",
+    -- level = "DEBUG",
     -- 输出文件路径（可选，默认输出到文件，避免 print 阻塞消息区域）
-    -- output_path = nill,
-    output_path = "/root/NeoAI/pack/plugins/start/NeoAI/lua/NeoAI/neoai.log",
+    output_path = nill,
+    -- output_path = "/root/NeoAI/pack/plugins/start/NeoAI/lua/NeoAI/neoai.log",
     -- 日志格式模板
     format = "[{time}] [{level}] {message}",
     -- 最大文件大小（字节），默认 10MB

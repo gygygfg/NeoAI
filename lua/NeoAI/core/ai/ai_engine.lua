@@ -649,7 +649,24 @@ function M.generate_response(messages, params)
     accumulated_usage = {}, -- 累积各次工具循环的 token 用量
   }
 
+  -- 注入 system_prompt：如果 ai_preset 有 system_prompt 且消息中还没有 system 消息，则添加到开头
+  -- 支持预设级别单独 system_prompt，未设置时使用全局 system_prompt
   local formatted = format_messages(messages)
+  if ai_preset.system_prompt and ai_preset.system_prompt ~= "" then
+    local has_system = false
+    for _, msg in ipairs(formatted) do
+      if msg.role == "system" then
+        has_system = true
+        break
+      end
+    end
+    if not has_system then
+      table.insert(formatted, 1, {
+        role = "system",
+        content = ai_preset.system_prompt,
+      })
+    end
+  end
   local stream_val = (options.stream ~= nil) and options.stream or (ai_preset.stream ~= false)
   local request = build_request({
     messages = formatted,

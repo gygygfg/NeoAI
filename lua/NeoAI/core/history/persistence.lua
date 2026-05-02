@@ -41,13 +41,28 @@ end
 
 -- ========== 序列化 ==========
 
+--- 判断会话是否为空（无有效对话内容）
+--- @param session table 会话对象
+--- @return boolean
+local function is_empty_session(session)
+  if not session then return true end
+  -- user 为空且 assistant 无内容即为空会话
+  if session.user and session.user ~= "" then return false end
+  local asst = session.assistant
+  if type(asst) == "table" and #asst > 0 then return false end
+  if type(asst) == "string" and asst ~= "" then return false end
+  return true
+end
+
 --- 序列化所有会话为 JSON 字符串
 --- @param sessions table 会话表 { [id] = session }
 --- @return string|nil JSON 字符串，失败返回 nil
 function M.serialize(sessions)
   local arr = {}
   for _, session in pairs(sessions) do
-    table.insert(arr, session)
+    if not is_empty_session(session) then
+      table.insert(arr, session)
+    end
   end
   table.sort(arr, function(a, b)
     return (a.updated_at or a.created_at or 0) < (b.updated_at or b.created_at or 0)

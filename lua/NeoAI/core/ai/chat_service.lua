@@ -256,13 +256,22 @@ function M.send_message(params)
     tools_enabled = full_config.tools.enabled ~= false
   end
 
+  -- 检查深度思考模式是否启用
+  local reasoning_enabled = false
+  if full_config and full_config.ai then
+    reasoning_enabled = full_config.ai.reasoning_enabled == true
+  end
+
   -- 调用 AI 引擎生成响应
   ai_engine.generate_response(messages, {
     session_id = target_session_id,
     window_id = window_id,
     model_index = options.model_index or 1,
     stream = options.stream ~= false,
-    options = { tools_enabled = tools_enabled },
+    options = {
+      tools_enabled = tools_enabled,
+      reasoning_enabled = reasoning_enabled,
+    },
   })
 
   -- 触发消息发送事件
