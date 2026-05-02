@@ -641,8 +641,8 @@ function M._session_to_messages(session)
         else
           result_str = tostring(parsed.result or "")
         end
-        -- 清理 \r 字符，确保换行符统一
-        result_str = result_str:gsub("\r\n", "\n"):gsub("\r", "")
+        -- 清理 JSON 编码后的 \r 字符，将 \r 渲染为换行
+        result_str = result_str:gsub("\\r\\n", "\n"):gsub("\\r", "\n")
         -- 检查结果中是否包含警告
         local has_warning = false
         for line in result_str:gmatch("[^\n]+") do
@@ -671,6 +671,14 @@ function M._session_to_messages(session)
           .. "\n}}}"
       elseif parsed.content then
         content = parsed.content
+        -- 如果包含 reasoning_content，将 content 编码为 JSON 格式
+        -- 这样 _render_single_message 可以解析并正确渲染思考过程
+        if parsed.reasoning_content and parsed.reasoning_content ~= "" then
+          content = vim.json.encode({
+            reasoning_content = parsed.reasoning_content,
+            content = parsed.content,
+          })
+        end
       end
     end
     table.insert(msgs, { role = msg_type, content = content })

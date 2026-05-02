@@ -453,8 +453,8 @@ function M._render_single_message(msg, prev_role)
   if msg.role == "assistant" and raw_content:find("^{{{") then
     -- 折叠文本：直接显示，不加 AI 标记
     -- 按行分割，每行作为独立元素
-    -- 先清理 \r 字符，确保换行符统一
-    local clean_content = raw_content:gsub("\r\n", "\n"):gsub("\r", "")
+    -- 先清理 \r 字符，将 \r 渲染为换行
+    local clean_content = raw_content:gsub("\r\n", "\n"):gsub("\r", "\n")
     for _, line in ipairs(vim.split(clean_content, "\n")) do
       table.insert(lines, line)
     end
@@ -547,17 +547,23 @@ function M._render_single_message(msg, prev_role)
   if has_reasoning then
     -- 有思考过程
     local reasoning_lines = vim.split(reasoning_content, "\n")
-    -- AI 标志和思考过程标准直接连续，不换行
-    table.insert(lines, role_prefix .. " 🤔 思考过程:")
-    -- 如果思考过程超过 200 个字符，使用折叠文本
+    -- 判断条件：与 _append_reasoning_folded_to_buffer 保持一致
+    -- 只有无正文且短思考（<200字符）才不折叠，否则一律折叠
+    local has_content = main_content and main_content ~= ""
     local reasoning_text_combined = table.concat(reasoning_lines, " ")
-    if #reasoning_text_combined > 200 then
-      local preview = reasoning_text_combined:sub(1, 200)
-      table.insert(lines, "    " .. preview .. "...")
-      table.insert(lines, "    {{{ 点击展开完整思考过程")
-      table.insert(lines, "    " .. reasoning_text_combined)
-      table.insert(lines, "    }}}")
+    local reasoning_short = #reasoning_text_combined < 200
+    local use_folded = has_content or not reasoning_short
+
+    if use_folded then
+      -- 折叠文本格式
+      table.insert(lines, "{{{ 🤔 思考过程")
+      for _, rline in ipairs(reasoning_lines) do
+        table.insert(lines, "  " .. rline)
+      end
+      table.insert(lines, "}}}")
     else
+      -- 无正文且思考短：直接显示
+      table.insert(lines, role_prefix .. " 🤔 思考过程:")
       for _, rline in ipairs(reasoning_lines) do
         table.insert(lines, "    " .. rline)
       end
@@ -1737,12 +1743,18 @@ function M._setup_event_listeners()
       local reasoning_text = data.reasoning_text or ""
       local usage = data.usage or {}
 
+      -- 即使 response_content 为空，如果有 reasoning_text，仍需继续处理
+      -- 因为 reasoning 已通过 _append_reasoning_folded_to_buffer 追加到缓冲区
+      local has_reasoning = reasoning_text ~= ""
       if not response_content or response_content == "" then
-        close_tool_display()
-        reset_tool_display()
-        reset_streaming_state()
-        state.tool_loop_in_progress = false
-        return
+        if not has_reasoning then
+          close_tool_display()
+          reset_tool_display()
+          reset_streaming_state()
+          state.tool_loop_in_progress = false
+          return
+        end
+        -- 只有 reasoning 没有正文：response_content 保持空字符串
       end
 
       local has_tool_results = state.tool_display.active and #state.tool_display.results > 0
@@ -1750,48 +1762,62 @@ function M._setup_event_listeners()
       local msg_idx = state.streaming.message_index
 
       -- 更新消息内容
+      -- 注意：思考过程已通过 _append_reasoning_folded_to_buffer 在 STREAM_CHUNK 或
+      -- STREAM_COMPLETED 事件中单独追加到聊天缓冲区。
+      -- 但 state.messages 中保存的内容需要包含 reasoning，以便全量重渲染时正确显示。
+      -- 如果 reasoning 已追加，state.messages 中的内容应保存为 JSON 格式（含 reasoning_content），
+      -- 这样 _render_single_message 可以正确解析并渲染。
+      -- 如果 reasoning 短且无正文（不折叠），则保存为 JSON 格式。
+      -- 如果 reasoning 折叠或有正文，则保存为 JSON 格式（_render_single_message 会处理折叠）。
+      local content_with_reasoning = response_content
+      if has_reasoning then
+        content_with_reasoning = vim.json.encode({
+          reasoning_content = reasoning_text,
+          content = response_content,
+        })
+      end
+
       if msg_idx and state.messages[msg_idx] then
         if folded_saved then
           local folded_idx = find_folded_msg_idx()
           if folded_idx then
-            state.messages[folded_idx].content = state.messages[folded_idx].content .. "\n\n" .. response_content
+            local append_content = has_reasoning
+              and content_with_reasoning
+              or response_content
+            state.messages[folded_idx].content = state.messages[folded_idx].content .. "\n\n" .. append_content
             if msg_idx ~= folded_idx then
               table.remove(state.messages, msg_idx)
             end
           else
-            state.messages[msg_idx].content = reasoning_text ~= ""
-                and vim.json.encode({ reasoning_content = reasoning_text, content = response_content })
-              or response_content
+            state.messages[msg_idx].content = content_with_reasoning
           end
         elseif has_tool_results then
-          local folded = M._build_tool_folded_text(state.tool_display.results, reasoning_text)
-          state.messages[msg_idx].content = (folded ~= "" and folded .. "\n\n" or "") .. response_content
+          local folded = M._build_tool_folded_text(state.tool_display.results)
+          state.messages[msg_idx].content = (folded ~= "" and folded .. "\n\n" or "") .. content_with_reasoning
         else
-          state.messages[msg_idx].content = reasoning_text ~= ""
-              and vim.json.encode({ reasoning_content = reasoning_text, content = response_content })
-            or response_content
+          state.messages[msg_idx].content = content_with_reasoning
         end
       else
         if folded_saved then
           local folded_idx = find_folded_msg_idx()
           if folded_idx then
-            state.messages[folded_idx].content = state.messages[folded_idx].content .. "\n\n" .. response_content
+            local append_content = has_reasoning
+              and content_with_reasoning
+              or response_content
+            state.messages[folded_idx].content = state.messages[folded_idx].content .. "\n\n" .. append_content
           else
-            table.insert(state.messages, { role = "assistant", content = response_content, timestamp = os.time() })
+            table.insert(state.messages, { role = "assistant", content = content_with_reasoning, timestamp = os.time() })
           end
         elseif has_tool_results then
-          local folded = M._build_tool_folded_text(state.tool_display.results, reasoning_text)
-          local final = (folded ~= "" and folded .. "\n\n" or "") .. response_content
+          local folded = M._build_tool_folded_text(state.tool_display.results)
+          local final = (folded ~= "" and folded .. "\n\n" or "") .. content_with_reasoning
           table.insert(state.messages, { role = "assistant", content = final, timestamp = os.time() })
         else
           local placeholder_idx = find_placeholder_idx()
           if placeholder_idx then
             table.remove(state.messages, placeholder_idx)
           end
-          local content = reasoning_text ~= ""
-              and vim.json.encode({ reasoning_content = reasoning_text, content = response_content })
-            or response_content
-          M.add_message("assistant", content, { skip_render = true })
+          M.add_message("assistant", content_with_reasoning, { skip_render = true })
         end
       end
 
@@ -2435,8 +2461,8 @@ function M._setup_event_listeners()
                 local result_str = type(r.result) == "table"
                     and (pcall(vim.json.encode, r.result) and vim.json.encode(r.result) or vim.inspect(r.result))
                   or tostring(r.result or "")
-                -- 清理 \r 字符，确保换行符统一
-                result_str = result_str:gsub("\r\n", "\n"):gsub("\r", "")
+                -- 清理 JSON 编码后的 \r 字符，将 \r 渲染为换行
+                result_str = result_str:gsub("\\r\\n", "\n"):gsub("\\r", "\n")
                 local icon = r.is_error and "❌" or "✅"
                 -- 转义内容中的 {{{ 和 }}}，避免干扰 foldmethod=marker
                 result_str = result_str:gsub("}}}", "} } }"):gsub("{{{", "{ { {")
@@ -2664,7 +2690,9 @@ end
 
 --- 将思考过程追加到聊天缓冲区末尾
 --- 在思考过程完成后调用
---- 如果思考过程超过 200 个字符，使用折叠格式 {{{ ... }}}，否则直接显示
+--- 逻辑：
+---   如果思考过程结束后没有正文（content_buffer 为空）且思考长度 < 200 字符，则不折叠直接显示
+---   否则（有正文或思考长度 >= 200 字符）使用折叠格式 {{{ ... }}}
 --- @param reasoning_text string 完整的思考过程文本
 function M._append_reasoning_folded_to_buffer(reasoning_text)
   if not state.current_window_id or not reasoning_text or reasoning_text == "" then
@@ -2681,9 +2709,14 @@ function M._append_reasoning_folded_to_buffer(reasoning_text)
 
   local line_count = vim.api.nvim_buf_line_count(buf)
 
-  -- 判断思考过程长度，决定是否使用折叠格式
+  -- 判断条件：
+  -- 1. 思考过程结束后是否有正文内容？
+  -- 2. 思考过程长度是否 < 200 字符？
+  -- 只有无正文且短思考才不折叠，否则一律折叠
+  local has_content = state.streaming.content_buffer and state.streaming.content_buffer ~= ""
   local reasoning_combined = table.concat(vim.split(reasoning_text, "\n"), " ")
-  local use_folded = #reasoning_combined > 200
+  local reasoning_short = #reasoning_combined < 200
+  local use_folded = has_content or not reasoning_short
 
   local output_lines = {}
   if use_folded then
@@ -2694,7 +2727,7 @@ function M._append_reasoning_folded_to_buffer(reasoning_text)
     end
     table.insert(output_lines, "}}}")
   else
-    -- 直接显示，不加折叠
+    -- 无正文且思考短：直接显示，不加折叠
     table.insert(output_lines, "🤖 AI: 🤔 思考过程:")
     for _, rline in ipairs(vim.split(reasoning_text, "\n")) do
       table.insert(output_lines, "    " .. rline)
@@ -2943,6 +2976,21 @@ function M._show_tool_display()
     end
   end
 
+  -- 计算工具调用窗口宽度：基于配置，留出右侧伪终端窗口的空间
+  local total_cols = vim.o.columns
+  -- 默认工具调用窗口占左侧 40%，最多 60 列
+  local tool_width = math.min(math.floor(total_cols * 0.4), 60)
+  local config_width = state_manager.get_config_value("ui.window.width")
+  if config_width then
+    tool_width = math.min(config_width, math.floor(total_cols * 0.5))
+  end
+  -- 确保右侧伪终端窗口至少有 40 列
+  local min_pty_width = 40
+  if tool_width + min_pty_width + 2 > total_cols then
+    tool_width = total_cols - min_pty_width - 2
+  end
+  tool_width = math.max(30, tool_width) -- 工具调用窗口最小 30 列
+
   -- 使用 window_manager 创建浮动窗口
   -- 自定义边框：右上角用 ┬、右下角用 ┴（与右侧伪终端窗口拼接）
   local tool_border = {
@@ -2957,7 +3005,7 @@ function M._show_tool_display()
   }
   local win_id = window_manager.create_window("tool_display", {
     title = "🔧 工具调用",
-    width = state_manager.get_config_value("ui.window.width") and math.min(state_manager.get_config_value("ui.window.width") - 4, 80) or 60,
+    width = tool_width,
     height = dynamic_height,
     border = tool_border,
     style = "minimal",
@@ -2973,6 +3021,18 @@ function M._show_tool_display()
   end
 
   state.tool_display.window_id = win_id
+
+  -- 触发事件通知右侧伪终端窗口调整布局
+  vim.api.nvim_exec_autocmds("User", {
+    pattern = "NeoAI:tool_display_resized",
+    data = {
+      window_id = win_id,
+      height = dynamic_height,
+      row = tool_row,
+      width = tool_width,
+      col = 1,
+    },
+  })
 
   -- 设置窗口内容
   local window_info = window_manager.get_window_info(win_id)
@@ -3079,30 +3139,28 @@ function M._close_tool_display()
   if state.tool_display.window_id then
     window_manager.close_window(state.tool_display.window_id)
     state.tool_display.window_id = nil
+
+    -- 通知右侧伪终端窗口恢复默认布局（工具调用窗口已关闭）
+    vim.api.nvim_exec_autocmds("User", {
+      pattern = "NeoAI:tool_display_closed",
+      data = {},
+    })
   end
 end
 
 --- 构建工具调用结果的折叠文本
 --- @param results table 工具调用结果列表
---- @param reasoning_text string|nil 思考过程文本
 --- @return string 折叠文本格式的字符串
-function M._build_tool_folded_text(results, reasoning_text)
+function M._build_tool_folded_text(results)
   if not results or #results == 0 then
     return ""
   end
 
   local folded_text = ""
 
-  -- 如果有思考过程，先添加思考过程的折叠区域
-  if reasoning_text and reasoning_text ~= "" then
-    folded_text = folded_text .. "{{{ 🤔 思考过程"
-    local reasoning_lines = vim.split(reasoning_text, "\n")
-    for _, line in ipairs(reasoning_lines) do
-      folded_text = folded_text .. "\n    " .. line
-    end
-    folded_text = folded_text .. "\n}}}"
-    folded_text = folded_text .. "\n\n"
-  end
+  -- 注意：思考过程不在此处添加，因为思考过程已通过 _append_reasoning_folded_to_buffer
+  -- 在 STREAM_CHUNK 或 STREAM_COMPLETED 事件中单独追加到聊天缓冲区。
+  -- 如果在此处重复添加，会导致思考过程在缓冲区中渲染两遍。
 
   -- 按工具包分组
   local tool_pack = require("NeoAI.tools.tool_pack")
@@ -3144,8 +3202,8 @@ function M._build_tool_folded_text(results, reasoning_text)
       else
         result_str = tostring(result_raw or "")
       end
-      -- 清理 result_str 中的 \r 字符，确保换行符统一
-      result_str = result_str:gsub("\r\n", "\n"):gsub("\r", "")
+      -- 清理 JSON 编码后的 \r 字符，将 \r 渲染为换行
+      result_str = result_str:gsub("\\r\\n", "\n"):gsub("\\r", "\n")
       -- 检查结果中是否包含警告
       local has_warning = false
       for line in result_str:gmatch("[^\n]+") do
@@ -3365,7 +3423,7 @@ function M._save_final_content_to_history(data)
       end
     elseif has_tool_results then
       -- 如果 state.messages 中没有 assistant 消息，从 tool_display 构建折叠文本
-      local folded = M._build_tool_folded_text(state.tool_display.results, reasoning_text)
+      local folded = M._build_tool_folded_text(state.tool_display.results)
       if folded ~= "" then
         final_content = (response_content ~= "") and (folded .. "\n\n" .. response_content) or folded
       end

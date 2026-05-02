@@ -1438,13 +1438,63 @@ end
 
 -- ========== 单次工具请求（不计入工具循环） ==========
 
+--- 临时注册一个工具到 tool_registry，供 execute_single_tool_request 使用
+--- 返回一个清理函数，调用后移除该工具
+--- @param tool_name string 工具名称
+--- @return function|nil 清理函数，调用后移除工具；注册失败返回 nil
+function M.register_tool_for_request(tool_name)
+  -- 从 shell_tools 模块获取工具定义
+  local ok, shell_tools = pcall(require, "NeoAI.tools.builtin.shell_tools")
+  if not ok or not shell_tools then
+    logger.warn("[tool_orchestrator] register_tool_for_request: 无法加载 shell_tools 模块")
+    return nil
+  end
+
+  local tool_def = shell_tools[tool_name]
+  if not tool_def or type(tool_def) ~= "table" or not tool_def.name or not tool_def.func then
+    logger.warn("[tool_orchestrator] register_tool_for_request: 工具 '%s' 未在 shell_tools 中找到", tool_name)
+    return nil
+  end
+
+  -- 注册到 tool_registry
+  local tool_registry = require("NeoAI.tools.tool_registry")
+  pcall(tool_registry.initialize, {})
+
+  -- 如果已存在，先移除再重新注册（确保使用最新定义）
+  if tool_registry.exists(tool_name) then
+    tool_registry.unregister(tool_name)
+  end
+
+  local ok2, err = pcall(tool_registry.register, tool_def)
+  if not ok2 then
+    logger.warn("[tool_orchestrator] register_tool_for_request: 注册工具 '%s' 失败: %s", tool_name, tostring(err))
+    return nil
+  end
+
+  logger.debug("[tool_orchestrator] register_tool_for_request: 已临时注册工具 '%s'", tool_name)
+
+  -- 返回清理函数
+  return function()
+    pcall(tool_registry.unregister, tool_name)
+    logger.debug("[tool_orchestrator] register_tool_for_request: 已移除临时工具 '%s'", tool_name)
+  end
+end
+
 --- 执行一次非流式 AI 请求，只允许调用指定的工具，不计入工具循环
 --- 用于 shell 交互式命令的自动输入场景
 --- @param session_id string 会话 ID
 --- @param tool_name string 允许调用的工具名称（如 "send_input"）
---- @param args table 工具参数
+--- @param args table 工具参数，支持以下字段：
+---   - fixed_args (可选): table，这些参数不会暴露给 AI 的工具定义，
+---     但在 AI 返回工具调用时会自动合并到参数中（用于程序自动注入的参数，如 session_id）
 --- @param callback function 回调函数，接收 (success, result)
 function M.execute_single_tool_request(session_id, tool_name, args, callback)
+  -- 提取 fixed_args（不暴露给 AI 的固定参数）
+  local fixed_args = args and args.fixed_args or {}
+  if args then
+    args.fixed_args = nil
+  end
+
   -- 参数检查
   if not session_id then
     logger.warn("[tool_orchestrator] execute_single_tool_request: session_id 为空")
@@ -1492,6 +1542,50 @@ function M.execute_single_tool_request(session_id, tool_name, args, callback)
     end
     table.insert(messages, vim.deepcopy(msg))
     ::continue::
+  end
+
+  -- 防御性修复：将过滤后仍可能存在的孤立 tool 消息转为 user 消息
+  -- 这些 tool 消息的 tool_call_id 在剩余消息中没有对应的 assistant tool_calls
+  -- 会导致 API 报错 'tool message without matching tool_calls'
+  do
+    -- 收集剩余 assistant 消息中声明的 tool_call_id
+    local remaining_tool_call_ids = {}
+    for _, msg in ipairs(messages) do
+      if msg.role == "assistant" and msg.tool_calls then
+        for _, tc in ipairs(msg.tool_calls) do
+          local tc_id = tc.id or tc.tool_call_id
+          if tc_id then
+            remaining_tool_call_ids[tc_id] = true
+          end
+        end
+      end
+    end
+    -- 将没有对应 tool_call_id 的 tool 消息转为 user
+    local fixed_count = 0
+    for _, msg in ipairs(messages) do
+      if msg.role == "tool" then
+        local is_orphan = false
+        if msg.tool_call_id and msg.tool_call_id ~= "" then
+          if not remaining_tool_call_ids[msg.tool_call_id] then
+            is_orphan = true
+          end
+        else
+          is_orphan = true
+        end
+        if is_orphan then
+          msg.role = "user"
+          msg.tool_call_id = nil
+          msg.name = nil
+          fixed_count = fixed_count + 1
+        end
+      end
+    end
+    if fixed_count > 0 then
+      logger.debug(
+        "[tool_orchestrator] execute_single_tool_request: 防御性修复 %d 条孤立 tool 消息",
+        fixed_count
+      )
+    end
   end
 
   -- 添加系统提示，要求 AI 使用指定工具
@@ -1566,17 +1660,35 @@ function M.execute_single_tool_request(session_id, tool_name, args, callback)
   table.insert(messages, system_msg)
 
   -- 构建工具定义（只包含允许调用的工具）
-  -- 优先从 tool_registry 获取（内置工具如 send_input 通过 registry 注册）
+  -- 从 tool_registry 获取。调用方需在使用前通过 register_tool_for_request
+  -- 临时注册 send_input、check_shell_timeout 等非公开工具。
   local tool_def = nil
   local tool_registry = require("NeoAI.tools.tool_registry")
   pcall(tool_registry.initialize, {})
   local registered_tool = tool_registry.get(tool_name)
+
   if registered_tool then
     local tf = { name = registered_tool.name, description = registered_tool.description or ("执行 " .. registered_tool.name .. " 操作") }
     if registered_tool.parameters and type(registered_tool.parameters) == "table" and registered_tool.parameters.properties then
-      local cp = { type = "object", properties = registered_tool.parameters.properties }
+      -- 复制 properties 并移除 fixed_args 中的字段（不暴露给 AI）
+      local filtered_properties = {}
+      for k, v in pairs(registered_tool.parameters.properties) do
+        if not fixed_args[k] then
+          filtered_properties[k] = vim.deepcopy(v)
+        end
+      end
+      local cp = { type = "object", properties = filtered_properties }
       if registered_tool.parameters.required and type(registered_tool.parameters.required) == "table" and #registered_tool.parameters.required > 0 then
-        cp.required = registered_tool.parameters.required
+        -- 同样过滤 required 中的 fixed_args 字段
+        local filtered_required = {}
+        for _, field in ipairs(registered_tool.parameters.required) do
+          if not fixed_args[field] then
+            table.insert(filtered_required, field)
+          end
+        end
+        if #filtered_required > 0 then
+          cp.required = filtered_required
+        end
       end
       tf.parameters = cp
     end
@@ -1589,9 +1701,25 @@ function M.execute_single_tool_request(session_id, tool_name, args, callback)
       if t.name == tool_name then
         local tf = { name = t.name, description = t.description or ("执行 " .. t.name .. " 操作") }
         if t.parameters and type(t.parameters) == "table" and t.parameters.properties then
-          local cp = { type = "object", properties = t.parameters.properties }
+          -- 复制 properties 并移除 fixed_args 中的字段（不暴露给 AI）
+          local filtered_properties = {}
+          for k, v in pairs(t.parameters.properties) do
+            if not fixed_args[k] then
+              filtered_properties[k] = vim.deepcopy(v)
+            end
+          end
+          local cp = { type = "object", properties = filtered_properties }
           if t.parameters.required and type(t.parameters.required) == "table" and #t.parameters.required > 0 then
-            cp.required = t.parameters.required
+            -- 同样过滤 required 中的 fixed_args 字段
+            local filtered_required = {}
+            for _, field in ipairs(t.parameters.required) do
+              if not fixed_args[field] then
+                table.insert(filtered_required, field)
+              end
+            end
+            if #filtered_required > 0 then
+              cp.required = filtered_required
+            end
           end
           tf.parameters = cp
         end
@@ -1722,6 +1850,10 @@ function M.execute_single_tool_request(session_id, tool_name, args, callback)
         if func and func.name == tool_name then
           local ok, parsed_args = pcall(vim.json.decode, func.arguments)
           if ok and type(parsed_args) == "table" then
+            -- 自动合并 fixed_args（程序注入的参数，AI 不可见）
+            for k, v in pairs(fixed_args) do
+              parsed_args[k] = v
+            end
             if _callback then
               _callback(true, { action = "send_input", args = parsed_args })
             end

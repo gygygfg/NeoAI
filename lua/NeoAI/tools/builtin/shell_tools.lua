@@ -70,6 +70,90 @@ local function get_screen_dimensions()
   return vim.o.columns, vim.o.lines
 end
 
+--- 检测工具调用悬浮窗的位置和尺寸
+--- 通过 chat_window 模块获取工具调用窗口的配置信息
+--- @return table|nil { width, height, row, col } 或 nil（无工具调用窗口时）
+local function get_tool_display_window_layout()
+  local ok, chat_window = pcall(require, "NeoAI.ui.window.chat_window")
+  if not ok then
+    return nil
+  end
+
+  local window_id = chat_window.get_tool_display_window_id()
+  if not window_id then
+    return nil
+  end
+
+  local ok2, window_manager = pcall(require, "NeoAI.ui.window.window_manager")
+  if not ok2 then
+    return nil
+  end
+
+  local win = window_manager.get_window_win(window_id)
+  if not win or not vim.api.nvim_win_is_valid(win) then
+    return nil
+  end
+
+  local config = vim.api.nvim_win_get_config(win)
+  if not config or not config.width or not config.height then
+    return nil
+  end
+
+  return {
+    width = config.width,
+    height = config.height,
+    row = config.row or 1,
+    col = config.col or 1,
+  }
+end
+
+--- 根据工具调用窗口布局动态调整伪终端窗口的位置和大小
+--- 伪终端窗口在工具调用窗口右侧对齐（顶部对齐、高度一致）
+local function update_pty_window_layout()
+  if not pty_float_window or not pty_float_window.win or not vim.api.nvim_win_is_valid(pty_float_window.win) then
+    return
+  end
+
+  local tool_layout = get_tool_display_window_layout()
+  if not tool_layout then
+    return
+  end
+
+  local total_cols, total_lines = get_screen_dimensions()
+
+  -- 工具调用窗口右侧起始列
+  local right_col = tool_layout.col + tool_layout.width + 1
+  -- 伪终端宽度：从工具窗口右侧到屏幕右边界
+  local right_width = total_cols - right_col - 1
+  if right_width < 20 then
+    right_width = 20
+    right_col = total_cols - right_width - 1
+  end
+
+  -- 顶部对齐，高度与工具调用窗口一致
+  local win_row = tool_layout.row
+  local win_height = tool_layout.height
+
+  -- 确保不超出屏幕底部（留底部状态栏空间）
+  if win_row + win_height > total_lines - 2 then
+    win_height = total_lines - 2 - win_row
+  end
+  if win_height < 5 then
+    win_height = 5
+  end
+
+  local config = vim.api.nvim_win_get_config(pty_float_window.win)
+  config.width = right_width
+  config.height = win_height
+  config.row = win_row
+  config.col = right_col
+  pcall(vim.api.nvim_win_set_config, pty_float_window.win, config)
+
+  -- 更新 PTY_CONFIG 供后续使用
+  PTY_CONFIG.width = right_width
+  PTY_CONFIG.height = win_height
+end
+
 --- 关闭 PTY 浮动窗口
 local function close_pty_float_window()
   if not pty_float_window then
@@ -83,10 +167,32 @@ local function close_pty_float_window()
     pcall(vim.api.nvim_buf_delete, pty_float_window.buf, { force = true })
   end
 
+  -- 清理自动命令组
+  local ok, _ = pcall(vim.api.nvim_del_augroup_by_name, "NeoAIPtySyncToolDisplay")
+
   pty_float_window = nil
 end
 
---- 创建右侧 PTY 浮动窗口
+-- 伪终端配置（必须在 create_pty_float_window 之前定义，因为该函数会引用它）
+local PTY_CONFIG = {
+  width = 80,
+  height = 24,
+  ansi = true,
+  env = vim.empty_dict(),
+  clear_env = false,
+  cwd = nil,
+  detach = false,
+  pty = true,
+  input = "pipe",
+  output = "pipe",
+  error = "pipe",
+  check_interval = 100, -- 状态检查间隔（毫秒）
+  max_wait_time = 30, -- 等待输入的最大时间（秒）
+  buffer_size = 1024 * 64, -- 64KB
+}
+
+--- 创建右侧 PTY 浮动窗口（与工具调用窗口构成竖直分屏）
+--- 优先检测工具调用窗口的位置，若存在则在其右侧对齐
 local function create_pty_float_window(session_id, pty_buf)
   -- 先关闭已有的 PTY 浮动窗口
   if pty_float_window then
@@ -94,17 +200,46 @@ local function create_pty_float_window(session_id, pty_buf)
   end
 
   local total_cols, total_lines = get_screen_dimensions()
-  local left_width = math.floor(total_cols / 2) - 1
-  local right_col = left_width + 2 -- 留 1 列间隙
-  local right_width = total_cols - right_col - 1
-  if right_width < 20 then
-    right_width = 20
-    right_col = total_cols - right_width - 1
+
+  -- 检测工具调用窗口的位置，用于计算右侧伪终端窗口的布局
+  local tool_layout = get_tool_display_window_layout()
+  local right_col, right_width, win_height, win_row
+
+  if tool_layout then
+    -- 工具调用窗口存在：在其右侧对齐，构成竖直分屏
+    local gap = 1 -- 两窗口之间的间隙
+    right_col = tool_layout.col + tool_layout.width + gap
+    right_width = total_cols - right_col - 1
+    if right_width < 20 then
+      right_width = 20
+      right_col = total_cols - right_width - 1
+    end
+    -- 顶部对齐，高度与工具调用窗口一致
+    win_height = tool_layout.height
+    -- 确保不超出屏幕底部（留底部状态栏空间）
+    if tool_layout.row + win_height > total_lines - 2 then
+      win_height = total_lines - 2 - tool_layout.row
+    end
+    if win_height < 5 then
+      win_height = 5
+    end
+    win_row = tool_layout.row
+  else
+    -- 没有工具调用窗口：默认占据右侧一半
+    local left_width = math.floor(total_cols / 2) - 1
+    right_col = left_width + 2
+    right_width = total_cols - right_col - 1
+    if right_width < 20 then
+      right_width = 20
+      right_col = total_cols - right_width - 1
+    end
+    win_height = total_lines - 2
+    win_row = 1
   end
 
-  -- 计算高度：从屏幕顶部到底部，留出底部状态栏空间
-  local win_height = total_lines - 2 -- 留底部 2 行
-  local win_row = 1
+  -- 保存当前 PTY 宽高供后续使用
+  PTY_CONFIG.width = right_width
+  PTY_CONFIG.height = win_height
 
   -- 创建浮动窗口
   local pty_border = {
@@ -169,26 +304,65 @@ local function create_pty_float_window(session_id, pty_buf)
     session_id = session_id,
   }
 
+  -- 注册工具调用窗口大小变化事件监听
+  -- 当工具调用窗口调整大小时，同步调整伪终端窗口
+  local ok_augroup, _ = pcall(vim.api.nvim_del_augroup_by_name, "NeoAIPtySyncToolDisplay")
+  local augroup = vim.api.nvim_create_augroup("NeoAIPtySyncToolDisplay", { clear = true })
+  vim.api.nvim_create_autocmd("User", {
+    group = augroup,
+    pattern = "NeoAI:tool_display_resized",
+    callback = function(event)
+      if not pty_float_window then
+        return
+      end
+
+      -- 从事件数据中获取工具调用窗口的新布局
+      local data = event.data or {}
+      local tool_layout = data.layout or data
+
+      local tool_width = tool_layout.width or 60
+      local tool_col = tool_layout.col or 1
+      local tool_height = tool_layout.height or 10
+      local tool_row = tool_layout.row or 1
+
+      local total_cols, total_lines = get_screen_dimensions()
+
+      -- 工具调用窗口右侧起始列
+      local gap = 1
+      local new_right_col = tool_col + tool_width + gap
+      local new_right_width = total_cols - new_right_col - 1
+      if new_right_width < 20 then
+        new_right_width = 20
+        new_right_col = total_cols - new_right_width - 1
+      end
+
+      -- 顶部对齐，高度与工具调用窗口一致
+      local new_height = tool_height
+      if tool_row + new_height > total_lines - 2 then
+        new_height = total_lines - 2 - tool_row
+      end
+      if new_height < 5 then
+        new_height = 5
+      end
+
+      local win = pty_float_window.win
+      if win and vim.api.nvim_win_is_valid(win) then
+        pcall(vim.api.nvim_win_set_config, win, {
+          relative = "editor",
+          width = new_right_width,
+          height = new_height,
+          row = tool_row,
+          col = new_right_col,
+        })
+        -- 更新 PTY_CONFIG 供后续使用
+        PTY_CONFIG.width = new_right_width
+        PTY_CONFIG.height = new_height
+      end
+    end,
+  })
+
   return win
 end
-
--- 伪终端配置
-local PTY_CONFIG = {
-  width = 80,
-  height = 24,
-  ansi = true,
-  env = vim.empty_dict(),
-  clear_env = false,
-  cwd = nil,
-  detach = false,
-  pty = true,
-  input = "pipe",
-  output = "pipe",
-  error = "pipe",
-  check_interval = 100, -- 状态检查间隔（毫秒）
-  max_wait_time = 30, -- 等待输入的最大时间（秒）
-  buffer_size = 1024 * 64, -- 64KB
-}
 
 -- 进程状态监控器
 local ProcessMonitor = {}
@@ -457,7 +631,7 @@ end
 -- ============================================================================
 -- 工具 run_command
 -- ============================================================================
--- 模块级别的辅助函数（供 _send_input 和超时监控使用）
+-- 模块级别的辅助函数（供 _send_input 和进程状态监控使用）
 -- ============================================================================
 
 -- 剥离 ANSI 转义码（模块级别版本）
@@ -521,7 +695,7 @@ local function _run_command(args, on_success, on_error, on_progress)
     return
   end
 
-  -- 超时设置，默认 30 秒
+  -- 超时时间，默认 30 秒
   local timeout_sec = args.timeout or 30
   -- 工作目录
   local cwd = args.cwd or vim.fn.getcwd()
@@ -552,12 +726,12 @@ local function _run_command(args, on_success, on_error, on_progress)
     start_time = vim.fn.reltime(),
     timeout_sec = timeout_sec,
     timeout_timer = nil,
-    -- 超时监控相关字段（独立于交互式输入决策）
-    timeout_monitor_timer = nil, -- 每30秒检查超时的定时器
-    timeout_monitor_active = false, -- 超时监控是否正在运行
+    -- 进程状态监控相关字段（独立于交互式输入决策）
+    timeout_monitor_timer = nil, -- 每30秒检查进程状态的定时器
+    timeout_monitor_active = false, -- 进程状态监控是否正在运行
     timeout_stop_reason = nil, -- AI 设置的终止原因
-    timeout_check_round = 0, -- 超时检查轮次
-    timeout_check_history = {}, -- 超时检查历史（仅记录时间和页面文本）
+    timeout_check_round = 0, -- 进程状态检查轮次
+    timeout_check_history = {}, -- 进程状态检查历史（仅记录输出长度）
     is_waiting_for_input = false,
     pending_input = nil,
     input_callback = nil,
@@ -589,13 +763,13 @@ local function _run_command(args, on_success, on_error, on_progress)
       vim.fn.timer_stop(session.timeout_timer)
     end
 
-    -- 停止超时监控定时器
+    -- 停止进程状态监控定时器
     if session.timeout_monitor_timer and vim.fn.timer_info(session.timeout_monitor_timer)[1] then
       vim.fn.timer_stop(session.timeout_monitor_timer)
       session.timeout_monitor_timer = nil
     end
     session.timeout_monitor_active = false
-    -- 清空超时检查历史（销毁独立线）
+    -- 清空进程状态检查历史
     session.timeout_check_history = {}
     session.timeout_check_round = 0
     session.timeout_stop_reason = nil
@@ -613,9 +787,9 @@ local function _run_command(args, on_success, on_error, on_progress)
   end
 
   -- ========================================================================
-  -- 超时监控（独立线，每30秒请求AI判断是否强制结束）
+  -- 进程状态监控（独立线，每30秒请求AI判断命令是否卡住或已完成）
   -- ========================================================================
-  -- 读取当前 PTY buffer 输出，用于传递给 AI 做超时判断
+  -- 读取当前 PTY buffer 输出，用于传递给 AI 做状态判断
   local function read_current_pty_output()
     local full_buffer = _module_read_pty_buffer_output()
     if full_buffer == "" then
@@ -624,7 +798,7 @@ local function _run_command(args, on_success, on_error, on_progress)
     return full_buffer
   end
 
-  -- 构建超时检查的独立消息（仅包含时间戳和页面文本，不加入会话历史）
+  -- 构建进程状态检查的独立消息（仅包含页面文本，不加入会话历史）
   local function build_timeout_check_message()
     local current_output = read_current_pty_output()
     -- 清理特殊字符
@@ -683,26 +857,37 @@ local function _run_command(args, on_success, on_error, on_progress)
         .. prompt_output:sub(-MAX_OUTPUT_LEN)
     end
 
-    -- 构建历史摘要（仅记录时间和页面文本长度）
+    -- 构建历史摘要（记录输出长度变化，用于判断输出是否在持续更新）
     local history_summary = ""
     if #session.timeout_check_history > 0 then
-      local lines = { "\n=== 超时检查历史记录 ===" }
+      local lines = { "\n=== 进程状态检查历史（输出长度变化趋势） ===" }
+      local prev_length = nil
       for _, h in ipairs(session.timeout_check_history) do
+        local delta = ""
+        if prev_length ~= nil then
+          local diff = h.output_length - prev_length
+          if diff > 0 then
+            delta = string.format(" (+%d 字节新数据)", diff)
+          elseif diff == 0 then
+            delta = " (无变化)"
+          end
+        end
         lines[#lines + 1] = string.format(
-          "  [%s] 检查轮次 #%d, 输出长度: %d 字节",
-          os.date("%H:%M:%S", h.timestamp),
+          "  检查 #%d, 输出长度: %d 字节%s",
           h.round,
-          h.output_length
+          h.output_length,
+          delta
         )
+        prev_length = h.output_length
       end
-      lines[#lines + 1] = "==========================\n"
+      lines[#lines + 1] = "========================================\n"
       history_summary = table.concat(lines, "\n")
     end
 
     return history_summary .. prompt_output
   end
 
-  -- 启动超时监控（每30秒检查一次）
+  -- 启动进程状态监控（每30秒检查一次，判断命令是否卡住或已完成）
   local function start_timeout_monitoring()
     if session.timeout_monitor_active then
       return
@@ -735,12 +920,15 @@ local function _run_command(args, on_success, on_error, on_progress)
         table.remove(session.timeout_check_history, 1)
       end
 
-      -- 构建独立消息（仅包含时间和页面文本）
+      -- 构建独立消息（仅包含页面文本）
       local timeout_prompt = build_timeout_check_message()
 
-      -- 调用 AI 判断是否需要强制结束
+    -- 调用 AI 判断命令是否卡住或已完成
       local tool_orchestrator = require("NeoAI.core.ai.tool_orchestrator")
       local chat_session_id = args._session_id
+
+      -- 临时注册 check_shell_timeout 工具
+      local cleanup_tool = tool_orchestrator.register_tool_for_request("check_shell_timeout")
 
       tool_orchestrator.execute_single_tool_request(chat_session_id, "check_shell_timeout", {
         prompt = timeout_prompt,
@@ -748,9 +936,15 @@ local function _run_command(args, on_success, on_error, on_progress)
         command = command,
         session_id = session_id,
         _disable_reasoning = true,
-        timeout_check_round = current_round,
-        elapsed_seconds = current_round * 30,
+        fixed_args = {
+          session_id = session_id,
+        },
       }, function(success, result)
+        -- 清理临时注册的工具
+        if cleanup_tool then
+          cleanup_tool()
+        end
+
         -- 如果会话已结束，忽略回调
         if session._cleaned_up or (session.state ~= "running" and session.state ~= "waiting") then
           return
@@ -767,12 +961,12 @@ local function _run_command(args, on_success, on_error, on_progress)
 
         if result.stop == true then
           should_stop = true
-          stop_reason = result.reason or "AI 判断命令执行时间过长"
+          stop_reason = result.reason or "AI 判断命令已卡住或已完成"
         end
         if result.args then
           if result.args.stop == true then
             should_stop = true
-            stop_reason = result.args.reason or result.reason or "AI 判断命令执行时间过长"
+            stop_reason = result.args.reason or result.reason or "AI 判断命令已卡住或已完成"
           end
         end
 
@@ -780,7 +974,7 @@ local function _run_command(args, on_success, on_error, on_progress)
           session.timeout_stop_reason = stop_reason
           session.state = "finished"
 
-          -- 停止超时监控定时器
+          -- 停止进程状态监控定时器
           if session.timeout_monitor_timer and vim.fn.timer_info(session.timeout_monitor_timer)[1] then
             vim.fn.timer_stop(session.timeout_monitor_timer)
             session.timeout_monitor_timer = nil
@@ -808,7 +1002,7 @@ local function _run_command(args, on_success, on_error, on_progress)
             stop_reason = stop_reason,
           }
 
-          -- 清空超时检查历史（销毁独立线）
+          -- 清空进程状态检查历史
           session.timeout_check_history = {}
           session.timeout_check_round = 0
 
@@ -974,6 +1168,9 @@ local function _run_command(args, on_success, on_error, on_progress)
     local tool_orchestrator = require("NeoAI.core.ai.tool_orchestrator")
     local chat_session_id = args._session_id
 
+    -- 临时注册 send_input 工具
+    local cleanup_tool = tool_orchestrator.register_tool_for_request("send_input")
+
     vim.schedule(function()
       -- 读取完整的 PTY buffer 内容，让 AI 看到完整的菜单和选项
       -- 注意：之前使用增量读取导致 AI 丢失上下文，输入无效选项
@@ -1084,7 +1281,15 @@ local function _run_command(args, on_success, on_error, on_progress)
         session_id = session_id,
         _disable_reasoning = true,
         process_state = session.process_monitor.last_state,
+        fixed_args = {
+          session_id = session_id,
+        },
       }, function(success, result)
+        -- 清理临时注册的工具
+        if cleanup_tool then
+          cleanup_tool()
+        end
+
         ai_decision_pending = false
 
         if session.state ~= "waiting" then
@@ -1525,7 +1730,7 @@ local function _run_command(args, on_success, on_error, on_progress)
       end
     end
 
-    -- 启动超时监控（每30秒请求AI判断是否强制结束）
+    -- 启动进程状态监控（每30秒检查命令是否卡住或已完成）
     start_timeout_monitoring()
 
     -- 延迟获取PID（给进程一些启动时间）
@@ -1554,7 +1759,7 @@ end
 
 M.run_command = define_tool({
   name = "run_command",
-  description = "执行 shell 命令并返回完整的执行结果。使用伪终端自动处理交互式输入，通过进程 PID 监控状态，无需手动调用 send_input。支持超时设置和工作目录指定。",
+  description = "执行 shell 命令并返回完整的执行结果。使用伪终端自动处理交互式输入，通过进程 PID 监控状态，无需手动调用 send_input。支持超时时间设置和工作目录指定。",
   func = _run_command,
   async = true,
   parameters = {
@@ -1606,8 +1811,8 @@ M.run_command = define_tool({
       session_id = { type = "string", description = "shell session ID" },
       state = { type = "string", description = "session 状态：finished | error" },
       message = { type = "string", description = "提示消息" },
-      stopped_by_timeout = { type = "boolean", description = "是否由超时监控强制终止" },
-      stop_reason = { type = "string", description = "终止原因（由超时监控设置）" },
+      stopped_by_timeout = { type = "boolean", description = "是否由进程状态监控强制终止" },
+      stop_reason = { type = "string", description = "终止原因（由进程状态监控设置）" },
     },
     description = "命令执行结果",
   },
@@ -1715,7 +1920,9 @@ local function _send_input(args, on_success, on_error, on_progress)
   end
 end
 
-M.send_input = define_tool({
+-- send_input 不通过 define_tool 注册，避免出现在工具列表中
+-- 由 tool_orchestrator 在需要时动态构建工具定义并调用
+M.send_input = {
   name = "send_input",
   description = "向正在等待输入的 shell session 发送输入内容（如用户名、密码、y/n 确认、菜单选项编号等）。支持使用特殊按键标记发送控制序列：<enter>（回车确认）、<up>/<down>/<left>/<right>（方向键）、<ctrl_c>（中断）、<ctrl_d>（EOF）、<tab>、<escape>、<backspace> 等。如果命令已完成或不需要继续执行，设置 stop=true 终止进程。",
   func = _send_input,
@@ -1723,10 +1930,6 @@ M.send_input = define_tool({
   parameters = {
     type = "object",
     properties = {
-      session_id = {
-        type = "string",
-        description = "run_command 返回的 session_id（必填）",
-      },
       input = {
         type = "string",
         description = "要发送的输入内容。支持特殊按键标记：<enter>（回车确认）、<up>/<down>/<left>/<right>（方向键）、<ctrl_c>（中断）、<ctrl_d>（EOF）、<tab>、<escape>、<backspace>。例如：'y' 发送 'y' 加回车；'<enter>' 只发送回车；'<down><enter>' 发送下键+回车；'<ctrl_c>' 发送 Ctrl+C。",
@@ -1749,10 +1952,10 @@ M.send_input = define_tool({
   },
   category = "system",
   permissions = { execute = true },
-})
+}
 
 -- ============================================================================
--- 工具 check_shell_timeout（超时监控专用，不加入会话历史）
+-- 工具 check_shell_timeout（进程状态监控专用，不加入会话历史）
 -- ============================================================================
 
 local function _check_shell_timeout(args, on_success, on_error, on_progress)
@@ -1785,9 +1988,9 @@ local function _check_shell_timeout(args, on_success, on_error, on_progress)
 
   if stop == true then
     -- 记录终止原因
-    session.timeout_stop_reason = reason or "AI 判断命令执行时间过长"
+    session.timeout_stop_reason = reason or "AI 判断命令已卡住或已完成"
 
-    -- 返回成功，由超时监控定时器的回调处理实际的终止逻辑
+    -- 返回成功，由进程状态监控定时器的回调处理实际的终止逻辑
     if on_success then
       on_success({
         session_id = session_id,
@@ -1802,27 +2005,26 @@ local function _check_shell_timeout(args, on_success, on_error, on_progress)
       on_success({
         session_id = session_id,
         stop = false,
-        message = "命令继续执行，将在30秒后再次检查",
+        message = "命令继续执行，将在30秒后再次检查状态"
       })
     end
   end
 end
 
-M.check_shell_timeout = define_tool({
+-- check_shell_timeout 不通过 define_tool 注册，避免出现在工具列表中
+-- 由 tool_orchestrator 在需要时动态构建工具定义并调用
+-- session_id 和 stdout/messages 参数由程序通过 fixed_args 自动注入，不暴露给 AI
+M.check_shell_timeout = {
   name = "check_shell_timeout",
-  description = "[超时监控专用] 检查当前正在执行的 shell 命令是否执行时间过长，判断是否需要强制结束。此工具由系统每30秒自动调用，不加入会话历史。如果命令已经完成或不需要继续执行，请设置 stop=true 并说明终止原因。",
+  description = "[进程监控专用] 检查当前正在执行的 shell 命令是否卡住或已完成，判断是否需要强制结束。只有当命令输出在连续多次检查中完全无变化（输出内容完全一致，没有任何新数据）、进程卡死无响应、或命令已完成但未退出时，才应设置 stop=true 终止进程。注意：即使命令预计需要很长时间才能完成，只要输出在持续更新（如进度条在前进），就不应终止。",
   func = _check_shell_timeout,
   async = true,
   parameters = {
     type = "object",
     properties = {
-      session_id = {
-        type = "string",
-        description = "run_command 返回的 session_id（必填）",
-      },
       stop = {
         type = "boolean",
-        description = "设为 true 时强制终止 shell 进程（命令执行时间过长或已完成时使用）",
+        description = "设为 true 时强制终止 shell 进程。仅当命令输出长时间无变化（卡住）、进程无响应、或命令已完成但未退出时才设置此值。"
       },
       reason = {
         type = "string",
@@ -1838,11 +2040,11 @@ M.check_shell_timeout = define_tool({
       reason = { type = "string", description = "终止原因（如有）" },
       message = { type = "string", description = "提示消息" },
     },
-    description = "超时检查结果",
+    description = "进程状态检查结果"
   },
   category = "system",
   permissions = { execute = true },
-})
+}
 
 -- ============================================================================
 -- 工具函数：获取所有session
@@ -1907,8 +2109,14 @@ end
 
 function M.get_tools()
   local tools = {}
+  -- 排除 send_input 和 check_shell_timeout，这两个工具不应暴露给 AI 直接调用
+  -- 由 tool_orchestrator 在需要时动态注入到工具列表中
+  local exclude = {
+    send_input = true,
+    check_shell_timeout = true,
+  }
   for _, v in pairs(M) do
-    if type(v) == "table" and v.name and v.func then
+    if type(v) == "table" and v.name and v.func and not exclude[v.name] then
       table.insert(tools, v)
     end
   end

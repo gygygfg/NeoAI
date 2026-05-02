@@ -439,7 +439,11 @@ local function build_request(params)
     -- 则自动禁用思考模式。DeepSeek 等 API 在思考模式下不支持强制工具调用。
     -- 注意：tool_choice 为 "auto" 或 "none" 时不处理。
     -- 此检查必须在工具定义处理之前，因为工具定义处理可能会设置 tool_choice = "auto"
-    local has_forced_tool = (options.tool_choice and type(options.tool_choice) == "table" and options.tool_choice.type == "function")
+    local has_forced_tool = (
+      options.tool_choice
+      and type(options.tool_choice) == "table"
+      and options.tool_choice.type == "function"
+    )
       or (params.tool_choice and type(params.tool_choice) == "table" and params.tool_choice.type == "function")
     if has_forced_tool and request.extra_body and request.extra_body.thinking then
       request.extra_body.thinking = nil
@@ -749,7 +753,9 @@ function M._send_non_stream_request(generation_id, request, params)
       vim.defer_fn(function()
         -- 检查是否已被取消
         if not state.is_generating or not state.active_generations or not state.active_generations[generation_id] then
-          logger.warn("[ai_engine] _send_non_stream_request 重试已取消：用户按下了停止键或 generation 已失效")
+          logger.warn(
+            "[ai_engine] _send_non_stream_request 重试已取消：用户按下了停止键或 generation 已失效"
+          )
           return
         end
         M._send_non_stream_request(generation_id, request, params)
@@ -805,7 +811,7 @@ function M._send_stream_request(generation_id, request, params)
   local gen = state.active_generations[generation_id]
   if gen then
     gen._stream_processor = processor
-    gen._last_request = request  -- 保存请求体，供重试时使用
+    gen._last_request = request -- 保存请求体，供重试时使用
   end
 
   local ai_preset = gen and gen.ai_preset or {}
@@ -840,7 +846,9 @@ function M._send_stream_request(generation_id, request, params)
       vim.defer_fn(function()
         -- 检查是否已被取消（用户按停止键后，state.is_generating 会被设为 false）
         if not state.is_generating or not state.active_generations or not state.active_generations[generation_id] then
-          logger.warn("[ai_engine] _send_stream_request 重试已取消：用户按下了停止键或 generation 已失效")
+          logger.warn(
+            "[ai_engine] _send_stream_request 重试已取消：用户按下了停止键或 generation 已失效"
+          )
           return
         end
         M._send_stream_request(generation_id, request, params)
@@ -852,11 +860,16 @@ function M._send_stream_request(generation_id, request, params)
   end
 
   local request_body_size = #(vim.json.encode(request or {}))
-  logger.debug(string.format(
-    "[ai_engine] _send_stream_request: generation_id=%s, base_url=%s, 请求体大小=%d bytes, is_tool_loop=%s, is_final_round=%s",
-    tostring(generation_id), tostring(ai_preset.base_url), request_body_size,
-    tostring(params and params.is_tool_loop), tostring(params and params.is_final_round)
-  ))
+  logger.debug(
+    string.format(
+      "[ai_engine] _send_stream_request: generation_id=%s, base_url=%s, 请求体大小=%d bytes, is_tool_loop=%s, is_final_round=%s",
+      tostring(generation_id),
+      tostring(ai_preset.base_url),
+      request_body_size,
+      tostring(params and params.is_tool_loop),
+      tostring(params and params.is_final_round)
+    )
+  )
   http_client.send_stream_request({
     request = request,
     generation_id = generation_id,
@@ -947,10 +960,15 @@ function M._handle_stream_end(generation_id, processor, params)
   local reasoning_text = processor.reasoning_buffer or ""
   local usage = processor.usage or {}
   local tool_calls = processor.tool_calls or {}
-  logger.debug(string.format(
-    "[ai_engine] _handle_stream_end: generation_id=%s, content_buffer大小=%d, tool_calls数量=%d, is_finished=%s",
-    tostring(generation_id), #full_response, #tool_calls, tostring(processor.is_finished)
-  ))
+  logger.debug(
+    string.format(
+      "[ai_engine] _handle_stream_end: generation_id=%s, content_buffer大小=%d, tool_calls数量=%d, is_finished=%s",
+      tostring(generation_id),
+      #full_response,
+      #tool_calls,
+      tostring(processor.is_finished)
+    )
+  )
 
   -- 过滤掉流式截断导致的无效工具调用（name 为空或 arguments 为空的条目）
   -- DeepSeek 等模型在流式过程中可能发送空的 tool_call 骨架，流式结束时需清理
@@ -1006,13 +1024,18 @@ function M._handle_stream_end(generation_id, processor, params)
     local gen = state.active_generations[generation_id]
     if gen then
       local retry_count = gen.retry_count or 0
-      logger.debug(string.format(
-        "[ai_engine] 异常响应详情: generation_id=%s, reason=%s, retry_count=%d, processor.start_time=%d, 耗时=%ds, processor.is_finished=%s, usage=%s",
-        tostring(generation_id), tostring(reason), retry_count,
-        processor.start_time or 0, os.time() - (processor.start_time or os.time()),
-        tostring(processor.is_finished),
-        vim.inspect(processor.usage or {})
-      ))
+      logger.debug(
+        string.format(
+          "[ai_engine] 异常响应详情: generation_id=%s, reason=%s, retry_count=%d, processor.start_time=%d, 耗时=%ds, processor.is_finished=%s, usage=%s",
+          tostring(generation_id),
+          tostring(reason),
+          retry_count,
+          processor.start_time or 0,
+          os.time() - (processor.start_time or os.time()),
+          tostring(processor.is_finished),
+          vim.inspect(processor.usage or {})
+        )
+      )
       -- 工具循环模式下空响应：不重试，直接结束工具循环
       -- DeepSeek 等 API 在处理复杂上下文时可能返回空 HTTP 200，重试无意义
       if is_tool_loop and reason and reason:find("空响应") then
@@ -1042,11 +1065,6 @@ function M._handle_stream_end(generation_id, processor, params)
           raw_response_for_log = raw_response_for_log .. "...[truncated, total=" .. #full_response .. "]"
         end
         local tool_calls_count = tool_calls and #tool_calls or 0
-        logger.warn(string.format(
-          "[ai_engine] 检测到异常流式响应 (重试 %d/%d): %s, 延迟 %dms 后重试 | full_response(前1000)=%s | tool_calls_count=%d",
-          new_retry_count, response_retry.get_max_retries(), reason, delay,
-          raw_response_for_log, tool_calls_count
-        ))
         -- 通知 UI 正在重试
         vim.api.nvim_exec_autocmds("User", {
           pattern = event_constants.GENERATION_RETRYING,
@@ -1111,12 +1129,14 @@ function M._handle_stream_end(generation_id, processor, params)
         vim.defer_fn(function()
           -- 检查是否已被取消（用户按停止键后，state.is_generating 会被设为 false）
           if not state.is_generating or not state.active_generations or not state.active_generations[generation_id] then
-            logger.warn(string.format(
-              "[ai_engine] 流式重试已取消：用户按下了停止键或 generation 已失效 | is_generating=%s | generation_exists=%s | generation_id=%s",
-              tostring(state.is_generating),
-              tostring(state.active_generations and state.active_generations[generation_id] ~= nil),
-              tostring(generation_id)
-            ))
+            logger.warn(
+              string.format(
+                "[ai_engine] 流式重试已取消：用户按下了停止键或 generation 已失效 | is_generating=%s | generation_exists=%s | generation_id=%s",
+                tostring(state.is_generating),
+                tostring(state.active_generations and state.active_generations[generation_id] ~= nil),
+                tostring(generation_id)
+              )
+            )
             return
           end
           if saved_request then
@@ -1162,10 +1182,14 @@ function M._handle_stream_end(generation_id, processor, params)
         end, delay)
         return
       else
-        logger.warn(string.format(
-          "[ai_engine] 流式响应异常但重试已达上限 (%d/%d): %s",
-          retry_count, response_retry.get_max_retries(), reason
-        ))
+        logger.warn(
+          string.format(
+            "[ai_engine] 流式响应异常但重试已达上限 (%d/%d): %s",
+            retry_count,
+            response_retry.get_max_retries(),
+            reason
+          )
+        )
         -- 重试已达上限：不再重试
         -- 如果是在工具循环中且 AI 未调用 stop_tool_loop，强制结束循环
         if is_tool_loop and reason and reason:find("缺少 stop_tool_loop") then
@@ -1420,10 +1444,15 @@ function M._handle_ai_response(generation_id, response, params)
         local new_retry_count = retry_count + 1
         generation.retry_count = new_retry_count
         local delay = response_retry.get_retry_delay(new_retry_count)
-        logger.warn(string.format(
-          "[ai_engine] 检测到异常响应 (重试 %d/%d): %s, 延迟 %dms 后重试",
-          new_retry_count, response_retry.get_max_retries(), reason, delay
-        ))
+        logger.warn(
+          string.format(
+            "[ai_engine] 检测到异常响应 (重试 %d/%d): %s, 延迟 %dms 后重试",
+            new_retry_count,
+            response_retry.get_max_retries(),
+            reason,
+            delay
+          )
+        )
         -- 通知 UI 正在重试
         vim.api.nvim_exec_autocmds("User", {
           pattern = event_constants.GENERATION_RETRYING,
@@ -1446,10 +1475,14 @@ function M._handle_ai_response(generation_id, response, params)
         end, delay)
         return
       else
-        logger.warn(string.format(
-          "[ai_engine] 响应异常但重试已达上限 (%d/%d): %s",
-          retry_count, response_retry.get_max_retries(), reason
-        ))
+        logger.warn(
+          string.format(
+            "[ai_engine] 响应异常但重试已达上限 (%d/%d): %s",
+            retry_count,
+            response_retry.get_max_retries(),
+            reason
+          )
+        )
         -- 重试已达上限：不再重试
         -- 总结轮次重试耗尽：直接触发错误，避免不完整的 tool_calls 污染消息历史
         if is_final_round then
@@ -1706,7 +1739,11 @@ function M.handle_tool_result(data)
   -- 检查工具编排器是否已请求停止
   local tool_orc = require("NeoAI.core.ai.tool_orchestrator")
   if tool_orc.is_stop_requested(session_id) then
-    logger.debug("[ai_engine] handle_tool_result: 工具编排器已请求停止，跳过新一轮生成 (session=" .. tostring(session_id) .. ")")
+    logger.debug(
+      "[ai_engine] handle_tool_result: 工具编排器已请求停止，跳过新一轮生成 (session="
+        .. tostring(session_id)
+        .. ")"
+    )
     return
   end
 
@@ -1987,7 +2024,7 @@ function M.cancel_generation()
     local ss = tool_orc.get_session_state and tool_orc.get_session_state(generation.session_id)
     if ss then
       ss.stop_requested = true
-      ss.user_cancelled = true  -- 标记为用户取消，不触发总结
+      ss.user_cancelled = true -- 标记为用户取消，不触发总结
       ss.active_tool_calls = {}
     end
   else
@@ -1999,7 +2036,7 @@ function M.cancel_generation()
         local ss = tool_orc.get_session_state(sid)
         if ss then
           ss.stop_requested = true
-          ss.user_cancelled = true  -- 标记为用户取消，不触发总结
+          ss.user_cancelled = true -- 标记为用户取消，不触发总结
           ss.active_tool_calls = {}
         end
       end

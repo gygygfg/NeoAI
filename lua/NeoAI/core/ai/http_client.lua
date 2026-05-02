@@ -24,6 +24,85 @@ local state = {
 -- 此函数将 json.encode 的输出重新喂给 json.decode，
 -- 由 json.lua 的解析器容忍/跳过非法字符，最大程度拼出有效 JSON，
 -- 然后再用 json.encode 重新编码为干净的字符串。
+--- 防御性修复：将调用了工具列表中没有的工具的 tool 消息转为 user 消息
+--- 当会话历史中包含之前工具循环中使用的工具结果（tool 消息），
+--- 但当前请求的工具列表中不包含该工具时，API 会报错。
+--- 此函数将这类孤立的 tool 消息转为 user 消息，避免 API 报错。
+--- @param request table 请求体（会被原地修改）
+function M._repair_orphan_tool_messages(request)
+  if not request or not request.messages or #request.messages == 0 then
+    return
+  end
+
+  -- 收集当前请求中可用的工具名
+  local available_tools = {}
+  if request.tools then
+    for _, td in ipairs(request.tools) do
+      local func = td["function"] or td.func
+      if func and func.name then
+        available_tools[func.name] = true
+      end
+    end
+  end
+
+  -- 如果没有工具定义，不需要修复
+  if not next(available_tools) then
+    return
+  end
+
+  -- 收集所有 assistant 消息中声明的 tool_call_id
+  local declared_tool_call_ids = {}
+  for _, msg in ipairs(request.messages) do
+    if msg.role == "assistant" and msg.tool_calls then
+      for _, tc in ipairs(msg.tool_calls) do
+        local tc_id = tc.id or tc.tool_call_id
+        if tc_id then
+          declared_tool_call_ids[tc_id] = true
+        end
+      end
+    end
+  end
+
+  local fixed_count = 0
+  for _, msg in ipairs(request.messages) do
+    if msg.role == "tool" then
+      -- 检查 tool 消息的 tool_call_id 是否在 assistant 的 tool_calls 中声明过
+      local is_orphan = false
+      if msg.tool_call_id and msg.tool_call_id ~= "" then
+        if not declared_tool_call_ids[msg.tool_call_id] then
+          is_orphan = true
+        end
+      else
+        -- 没有 tool_call_id 的 tool 消息也是孤立的
+        is_orphan = true
+      end
+
+      -- 额外检查：如果 tool 消息有 name 字段，检查该工具是否在可用工具列表中
+      if not is_orphan and msg.name and msg.name ~= "" then
+        if not available_tools[msg.name] then
+          -- tool_call_id 匹配但工具不在当前列表中，仍然视为孤立
+          -- 这种情况通常发生在不同工具循环之间
+          is_orphan = true
+        end
+      end
+
+      if is_orphan then
+        msg.role = "user"
+        msg.tool_call_id = nil
+        msg.name = nil
+        fixed_count = fixed_count + 1
+      end
+    end
+  end
+
+  if fixed_count > 0 then
+    logger.debug(
+      "[http_client] 防御性修复: 将 %d 条孤立 tool 消息转为 user 消息",
+      fixed_count
+    )
+  end
+end
+
 function M._sanitize_json_body(body)
   if not body or body == "" then
     return body
@@ -145,6 +224,10 @@ function M.send_request(params)
       logger.warn("[http_client] send_request: 设置了 tool_choice 但未提供 tools 定义，API 可能报错")
     end
   end
+
+  -- 防御性修复：将调用了工具列表中没有的工具的 tool 消息转为 user 消息
+  -- 避免 API 报错 'tool message without matching tool_calls' 或工具名不匹配
+  M._repair_orphan_tool_messages(request)
 
   local transformed = request_adapter.transform_request(request, api_type, provider_config)
   local request_body = json.encode(transformed)
@@ -750,6 +833,10 @@ function M.send_request_async(params, on_complete)
       )
     end
   end
+
+  -- 防御性修复：将调用了工具列表中没有的工具的 tool 消息转为 user 消息
+  -- 避免 API 报错 'tool message without matching tool_calls' 或工具名不匹配
+  M._repair_orphan_tool_messages(request)
 
   local transformed = request_adapter.transform_request(request, api_type, provider_config)
   local ok_encode, request_body = pcall(json.encode, transformed)
