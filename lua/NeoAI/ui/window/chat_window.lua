@@ -698,7 +698,7 @@ function M._apply_rendered_content(content)
   local ok_tp, tp = pcall(vim.api.nvim_get_current_tabpage)
   if not ok_tp or not tp then return end
 
-  -- 保存光标位置
+  -- 保存光标位置和窗口滚动状态
   local saved_cursor_lnum = nil
   local saved_cursor_col = 0
   local cursor_near_end = false
@@ -743,12 +743,21 @@ function M._apply_rendered_content(content)
     if virtual_input.is_active() then return end
 
     if cursor_near_end then
+      -- 插入前光标在后5行内：跳到最后一行，滚动到窗口最下边，允许工具调用悬浮窗
       local last_line_content = vim.api.nvim_buf_get_lines(buf, new_line_count - 1, new_line_count, false)[1] or ""
       pcall(vim.api.nvim_win_set_cursor, win, { new_line_count, #last_line_content })
+      -- 滚动到窗口最下边（最后一行在窗口底部）
+      pcall(vim.api.nvim_win_call, win, function()
+        local height = vim.api.nvim_win_get_height(win)
+        local view = vim.fn.winsaveview()
+        view.topline = math.max(1, new_line_count - height + 1)
+        vim.fn.winrestview(view)
+      end)
       if not state.streaming.active and not state.generation_in_progress then
         M._open_float_input()
       end
     elseif saved_cursor_lnum then
+      -- 插入前光标不在后5行内：保持原位置，禁止工具调用悬浮窗打开
       local new_lnum = math.min(saved_cursor_lnum, new_line_count)
       local lines = vim.api.nvim_buf_get_lines(buf, new_lnum - 1, new_lnum, false)
       local col = math.min(saved_cursor_col, #(lines[1] or ""))
@@ -1902,11 +1911,21 @@ function M._setup_event_listeners()
       end
 
       M._update_usage_virt_text()
-      -- 滚动到末尾并打开虚拟输入框
-      M._scroll_to_end_with_offset()
-      M._open_float_input()
-      if virtual_input.is_active() then
-        virtual_input.focus_and_insert()
+      -- 根据光标位置决定是否滚动到末尾和打开输入框
+      local gen_win = get_win()
+      if gen_win and vim.api.nvim_win_is_valid(gen_win) then
+        local gen_cursor = vim.api.nvim_win_get_cursor(gen_win)
+        local gen_buf = vim.api.nvim_win_get_buf(gen_win)
+        local gen_total = vim.api.nvim_buf_line_count(gen_buf)
+        if gen_total - gen_cursor[1] <= 5 then
+          -- 光标在后5行内：滚动到末尾并打开输入框
+          M._scroll_to_end_with_offset()
+          M._open_float_input()
+          if virtual_input.is_active() then
+            virtual_input.focus_and_insert()
+          end
+        end
+        -- 光标不在后5行内：不滚动，不打开输入框
       end
     end,
   })
@@ -1934,12 +1953,22 @@ function M._setup_event_listeners()
       state.tool_loop_in_progress = false
       state.generation_in_progress = false
 
-      -- 显示用量并打开虚拟输入框
       M._update_usage_virt_text()
-      M._scroll_to_end_with_offset()
-      M._open_float_input()
-      if virtual_input.is_active() then
-        virtual_input.focus_and_insert()
+      -- 根据光标位置决定是否滚动到末尾和打开输入框
+      local sum_win = get_win()
+      if sum_win and vim.api.nvim_win_is_valid(sum_win) then
+        local sum_cursor = vim.api.nvim_win_get_cursor(sum_win)
+        local sum_buf = vim.api.nvim_win_get_buf(sum_win)
+        local sum_total = vim.api.nvim_buf_line_count(sum_buf)
+        if sum_total - sum_cursor[1] <= 5 then
+          -- 光标在后5行内：滚动到末尾并打开输入框
+          M._scroll_to_end_with_offset()
+          M._open_float_input()
+          if virtual_input.is_active() then
+            virtual_input.focus_and_insert()
+          end
+        end
+        -- 光标不在后5行内：不滚动，不打开输入框
       end
     end,
   })
@@ -2290,10 +2319,13 @@ function M._setup_event_listeners()
 
       -- 构建分组显示文本
       rebuild_tool_display_buffer()
-      -- 仅在光标跟随模式下显示工具调用悬浮窗
+      -- 仅在光标在后5行内时才显示工具调用悬浮窗
       local win = get_win()
       if cursor_near_end(win) then
         M._show_tool_display()
+      else
+        -- 光标不在后5行内：禁止工具调用悬浮窗打开
+        state.tool_display.active = false
       end
     end,
   })
@@ -2558,7 +2590,17 @@ function M._setup_event_listeners()
       state.tool_loop_in_progress = false
       state.generation_in_progress = false
       M._update_usage_virt_text()
-      M._open_float_input()
+      -- 根据光标位置决定是否打开输入框
+      local cancel_win = get_win()
+      if cancel_win and vim.api.nvim_win_is_valid(cancel_win) then
+        local cancel_cursor = vim.api.nvim_win_get_cursor(cancel_win)
+        local cancel_buf = vim.api.nvim_win_get_buf(cancel_win)
+        local cancel_total = vim.api.nvim_buf_line_count(cancel_buf)
+        if cancel_total - cancel_cursor[1] <= 5 then
+          M._open_float_input()
+        end
+        -- 光标不在后5行内：不打开输入框
+      end
       M.show_floating_text("AI生成已取消", { timeout = 3000, position = "center", border = "single" })
     end,
   })
@@ -2715,14 +2757,49 @@ function M._append_message_to_buffer(role, content)
   -- 注意：不追加分割线，分割线只在 _do_render_chat 全量重渲染时添加
 
   pcall(vim.api.nvim_set_option_value, "modified", false, { buf = buf })
-  -- 移动光标到新追加内容的末尾
+
+  -- 保存光标状态，延迟执行光标跟随，等待 Neovim 完成折叠文本渲染（foldmethod=marker）
+  -- 避免折叠刷新导致光标先被吸上去
+  local saved_cursor_lnum = nil
+  local saved_cursor_col = 0
+  local was_near_end = false
   local win = window_manager.get_window_win(state.current_window_id)
   if win and vim.api.nvim_win_is_valid(win) then
     local new_line_count = vim.api.nvim_buf_line_count(buf)
-    local last_line = vim.api.nvim_buf_get_lines(buf, new_line_count - 1, new_line_count, false)[1] or ""
-    pcall(vim.api.nvim_win_set_cursor, win, { new_line_count, #last_line })
+    local cursor_before = vim.api.nvim_win_get_cursor(win)
+    local total_before = new_line_count - #lines
+    was_near_end = (total_before - cursor_before[1] <= 5)
+    saved_cursor_lnum = cursor_before[1]
+    saved_cursor_col = cursor_before[2]
   end
-  M._scroll_to_end_with_offset()
+
+  vim.defer_fn(function()
+    local ok_tp, tp = pcall(vim.api.nvim_get_current_tabpage)
+    if not ok_tp or not tp then return end
+
+    local d_win = window_manager.get_window_win(state.current_window_id)
+    if not d_win or not vim.api.nvim_win_is_valid(d_win) then return end
+    local d_buf = vim.api.nvim_win_get_buf(d_win)
+    local d_line_count = vim.api.nvim_buf_line_count(d_buf)
+
+    if was_near_end then
+      -- 插入前光标在后5行内：跳到最后一行，滚动到窗口最下边
+      local last_line = vim.api.nvim_buf_get_lines(d_buf, d_line_count - 1, d_line_count, false)[1] or ""
+      pcall(vim.api.nvim_win_set_cursor, d_win, { d_line_count, #last_line })
+      pcall(vim.api.nvim_win_call, d_win, function()
+        local height = vim.api.nvim_win_get_height(d_win)
+        local view = vim.fn.winsaveview()
+        view.topline = math.max(1, d_line_count - height + 1)
+        vim.fn.winrestview(view)
+      end)
+    elseif saved_cursor_lnum then
+      -- 插入前光标不在后5行内：保持原位置
+      local new_lnum = math.min(saved_cursor_lnum, d_line_count)
+      local lines = vim.api.nvim_buf_get_lines(d_buf, new_lnum - 1, new_lnum, false)
+      local col = math.min(saved_cursor_col, #(lines[1] or ""))
+      pcall(vim.api.nvim_win_set_cursor, d_win, { new_lnum, col })
+    end
+  end, 30)
 end
 
 --- 将思考过程追加到聊天缓冲区末尾
@@ -2777,14 +2854,48 @@ function M._append_reasoning_folded_to_buffer(reasoning_text)
 
   pcall(vim.api.nvim_set_option_value, "modified", false, { buf = buf })
 
-  -- 滚动到末尾
+  -- 延迟光标跟随，等待 Neovim 完成折叠文本渲染（foldmethod=marker）
+  -- 避免折叠刷新导致光标先被吸上去
+  local saved_cursor_lnum = nil
+  local saved_cursor_col = 0
+  local was_near_end = false
   local win = window_manager.get_window_win(state.current_window_id)
   if win and vim.api.nvim_win_is_valid(win) then
     local new_line_count = vim.api.nvim_buf_line_count(buf)
-    local last_line = vim.api.nvim_buf_get_lines(buf, new_line_count - 1, new_line_count, false)[1] or ""
-    pcall(vim.api.nvim_win_set_cursor, win, { new_line_count, #last_line })
+    local cursor_before = vim.api.nvim_win_get_cursor(win)
+    local total_before = new_line_count - #output_lines
+    was_near_end = (total_before - cursor_before[1] <= 5)
+    saved_cursor_lnum = cursor_before[1]
+    saved_cursor_col = cursor_before[2]
   end
-  M._scroll_to_end_with_offset()
+
+  vim.defer_fn(function()
+    local ok_tp, tp = pcall(vim.api.nvim_get_current_tabpage)
+    if not ok_tp or not tp then return end
+
+    local d_win = window_manager.get_window_win(state.current_window_id)
+    if not d_win or not vim.api.nvim_win_is_valid(d_win) then return end
+    local d_buf = vim.api.nvim_win_get_buf(d_win)
+    local d_line_count = vim.api.nvim_buf_line_count(d_buf)
+
+    if was_near_end then
+      -- 插入前光标在后5行内：跳到最后一行，滚动到窗口最下边
+      local last_line = vim.api.nvim_buf_get_lines(d_buf, d_line_count - 1, d_line_count, false)[1] or ""
+      pcall(vim.api.nvim_win_set_cursor, d_win, { d_line_count, #last_line })
+      pcall(vim.api.nvim_win_call, d_win, function()
+        local height = vim.api.nvim_win_get_height(d_win)
+        local view = vim.fn.winsaveview()
+        view.topline = math.max(1, d_line_count - height + 1)
+        vim.fn.winrestview(view)
+      end)
+    elseif saved_cursor_lnum then
+      -- 插入前光标不在后5行内：保持原位置
+      local new_lnum = math.min(saved_cursor_lnum, d_line_count)
+      local lines = vim.api.nvim_buf_get_lines(d_buf, new_lnum - 1, new_lnum, false)
+      local col = math.min(saved_cursor_col, #(lines[1] or ""))
+      pcall(vim.api.nvim_win_set_cursor, d_win, { new_lnum, col })
+    end
+  end, 30)
 end
 
 --- 在缓冲区末尾插入一个空行（处理换行符数据块）
@@ -2888,7 +2999,16 @@ function M._append_stream_chunk_to_buffer(chunk_content, content_type)
 
     vim.api.nvim_set_option_value("modified", false, { buf = buf })
     if follow then
-      move_cursor_to_end(win, buf)
+      -- 光标在后5行内：跳到最后并滚动到窗口最下边
+      local lc2 = get_line_count(buf)
+      local last_line = get_last_line(buf)
+      pcall(vim.api.nvim_win_set_cursor, win, { lc2, #last_line })
+      pcall(vim.api.nvim_win_call, win, function()
+        local height = vim.api.nvim_win_get_height(win)
+        local view = vim.fn.winsaveview()
+        view.topline = math.max(1, lc2 - height + 1)
+        vim.fn.winrestview(view)
+      end)
     end
     return
   end
@@ -2935,7 +3055,16 @@ function M._append_stream_chunk_to_buffer(chunk_content, content_type)
 
   vim.api.nvim_set_option_value("modified", false, { buf = buf })
   if follow then
-    move_cursor_to_end(win, buf)
+    -- 光标在后5行内：跳到最后并滚动到窗口最下边
+    local lc2 = get_line_count(buf)
+    local last_line = get_last_line(buf)
+    pcall(vim.api.nvim_win_set_cursor, win, { lc2, #last_line })
+    pcall(vim.api.nvim_win_call, win, function()
+      local height = vim.api.nvim_win_get_height(win)
+      local view = vim.fn.winsaveview()
+      view.topline = math.max(1, lc2 - height + 1)
+      vim.fn.winrestview(view)
+    end)
   end
 end
 

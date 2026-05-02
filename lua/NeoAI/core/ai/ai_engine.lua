@@ -991,13 +991,15 @@ function M._handle_stream_end(generation_id, processor, params)
 
   -- 过滤掉流式截断导致的无效工具调用（name 为空或 arguments 为空的条目）
   -- DeepSeek 等模型在流式过程中可能发送空的 tool_call 骨架，流式结束时需清理
+  -- 注意："{}"（空 JSON 对象）是合法参数，表示工具不需要参数（如 stop_tool_loop），不应过滤
   local valid_tool_calls = {}
   for _, tc in ipairs(tool_calls) do
     local func = tc["function"] or tc.func
     if func and func.name and func.name ~= "" then
       local args = func.arguments
-      -- 跳过 arguments 为 nil、空字符串或空 JSON 对象 "{}" 的条目（流式截断导致）
-      if args ~= nil and args ~= "" and args ~= "{}" then
+      -- 跳过 arguments 为 nil 或空字符串的条目（流式截断导致）
+      -- 保留 "{}"（空 JSON 对象），这是合法的空参数
+      if args ~= nil and args ~= "" then
         table.insert(valid_tool_calls, tc)
       end
     end
@@ -1435,13 +1437,15 @@ function M._handle_ai_response(generation_id, response, params)
   end
 
   -- 过滤掉无效的工具调用（name 为空或 arguments 为空的条目）
+  -- 注意："{}"（空 JSON 对象）是合法参数，表示工具不需要参数（如 stop_tool_loop），不应过滤
   local valid_tool_calls = {}
   for _, tc in ipairs(tool_calls) do
     local func = tc["function"] or tc.func
     if func and func.name and func.name ~= "" then
       local args = func.arguments
-      -- 跳过 arguments 为 nil、空字符串或空 JSON 对象 "{}" 的条目
-      if args ~= nil and args ~= "" and args ~= "{}" then
+      -- 跳过 arguments 为 nil 或空字符串的条目
+      -- 保留 "{}"（空 JSON 对象），这是合法的空参数
+      if args ~= nil and args ~= "" then
         table.insert(valid_tool_calls, tc)
       end
     end

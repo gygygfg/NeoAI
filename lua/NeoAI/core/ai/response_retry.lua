@@ -300,13 +300,10 @@ function M.detect_abnormal_response(content, tool_calls, opts)
       return true, "空响应：AI 未返回任何内容或工具调用"
     end
 
-    -- 有内容但无工具调用：AI 未通过 stop_tool_loop 结束对话
-    -- 但如果内容本身就是总结性质（包含总结类关键词），视为正常结束，不重试
+    -- 有内容但无工具调用：视为 AI 自动退出，不再重试
+    -- AI 可能认为任务已完成，直接返回文本回复
     if content and content ~= "" and (not tool_calls or #tool_calls == 0) then
-      if M.is_summary_content(content) then
-        return false, nil
-      end
-      return true, "[retry] AI 在工具循环中直接返回文本而未调用停止工具"
+      return false, nil
     end
 
     -- 有工具调用但不包含 stop_tool_loop：正常继续循环

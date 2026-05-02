@@ -520,9 +520,31 @@ function M._execute_single_tool(session_id, tool_call)
 
   local arguments = {}
   if tool_func.arguments then
-    local ok, parsed = pcall(vim.json.decode, tool_func.arguments)
+    -- 先对 arguments 字符串进行 URL 解码（AI 可能返回 URL 编码后的 JSON）
+    -- 例如 %22command%22: %22pwd%22 解码为 "command": "pwd"
+    local decoded_args_str = tool_func.arguments
+    local http_client = require("NeoAI.core.ai.http_client")
+    if type(decoded_args_str) == "string" and decoded_args_str:find("%%") then
+      decoded_args_str = http_client._decode_special_chars(decoded_args_str)
+    end
+
+    local ok, parsed = pcall(vim.json.decode, decoded_args_str)
     if ok and type(parsed) == "table" then
       arguments = parsed
+      -- 解码参数值中的 %%XX URL 编码（由 http_client._encode_special_chars 编码）
+      -- 注意：解码的是参数值本身，不是 JSON 字符串
+      for k, v in pairs(arguments) do
+        if type(v) == "string" then
+          arguments[k] = http_client._decode_special_chars(v)
+        end
+      end
+      -- 通用参数别名映射：将 cmd 自动转为 command
+      -- 某些工具（如 run_command）支持 cmd 作为 command 的别名
+      -- AI 可能使用 cmd 字段，但验证 schema 只认 command
+      if arguments.cmd ~= nil and arguments.command == nil then
+        arguments.command = arguments.cmd
+        arguments.cmd = nil
+      end
     else
       logger.warn("[tool_orchestrator] _execute_single_tool: tool '%s' 的 arguments JSON 解析失败: %s", tool_name, tostring(tool_func.arguments))
     end

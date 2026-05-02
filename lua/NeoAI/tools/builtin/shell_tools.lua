@@ -687,7 +687,12 @@ local function _run_command(args, on_success, on_error, on_progress)
     return
   end
 
-  local command = args.command or args.cmd
+  -- 支持 cmd 作为 command 的别名
+  if args.command == nil and args.cmd ~= nil then
+    args.command = args.cmd
+    args.cmd = nil
+  end
+  local command = args.command
   if not command or command == "" then
     if on_error then
       on_error("需要 command 参数")
@@ -872,12 +877,7 @@ local function _run_command(args, on_success, on_error, on_progress)
             delta = " (无变化)"
           end
         end
-        lines[#lines + 1] = string.format(
-          "  检查 #%d, 输出长度: %d 字节%s",
-          h.round,
-          h.output_length,
-          delta
-        )
+        lines[#lines + 1] = string.format("  检查 #%d, 输出长度: %d 字节%s", h.round, h.output_length, delta)
         prev_length = h.output_length
       end
       lines[#lines + 1] = "========================================\n"
@@ -923,7 +923,7 @@ local function _run_command(args, on_success, on_error, on_progress)
       -- 构建独立消息（仅包含页面文本）
       local timeout_prompt = build_timeout_check_message()
 
-    -- 调用 AI 判断命令是否卡住或已完成
+      -- 调用 AI 判断命令是否卡住或已完成
       local tool_orchestrator = require("NeoAI.core.ai.tool_orchestrator")
       local chat_session_id = args._session_id
 
@@ -2005,7 +2005,7 @@ local function _check_shell_timeout(args, on_success, on_error, on_progress)
       on_success({
         session_id = session_id,
         stop = false,
-        message = "命令继续执行，将在30秒后再次检查状态"
+        message = "命令继续执行，将在30秒后再次检查状态",
       })
     end
   end
@@ -2024,7 +2024,7 @@ M.check_shell_timeout = {
     properties = {
       stop = {
         type = "boolean",
-        description = "设为 true 时强制终止 shell 进程。仅当命令输出长时间无变化（卡住）、进程无响应、或命令已完成但未退出时才设置此值。"
+        description = "设为 true 时强制终止 shell 进程。仅当命令输出长时间无变化（卡住）、进程无响应、或命令已完成但未退出时才设置此值。",
       },
       reason = {
         type = "string",
@@ -2040,7 +2040,7 @@ M.check_shell_timeout = {
       reason = { type = "string", description = "终止原因（如有）" },
       message = { type = "string", description = "提示消息" },
     },
-    description = "进程状态检查结果"
+    description = "进程状态检查结果",
   },
   category = "system",
   permissions = { execute = true },
