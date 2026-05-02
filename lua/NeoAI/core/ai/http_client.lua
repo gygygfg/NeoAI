@@ -103,6 +103,123 @@ function M._repair_orphan_tool_messages(request)
   end
 end
 
+--- 将字符串中可能影响 JSON 解析的控制字符和非法 UTF-8 序列转义为 %%XX URL 编码
+-- 转义范围：控制字符（\\x00-\\x1F 除 \\n、\\r、\\t）和非法 UTF-8 字节
+-- @param str string 原始字符串
+-- @return string 编码后的字符串
+function M._encode_special_chars(str)
+  if not str or str == "" then
+    return str
+  end
+  local result = {}
+  local i = 1
+  while i <= #str do
+    local byte = str:byte(i)
+    if byte == 0x0A or byte == 0x0D or byte == 0x09 then
+      -- 保留换行、回车、制表符
+      result[#result + 1] = string.char(byte)
+      i = i + 1
+    elseif byte == 0x5C then
+      -- 反斜杠 \\：URL 编码为 %5C
+      result[#result + 1] = "%5C"
+      i = i + 1
+    elseif byte == 0x22 then
+      -- 双引号 "：URL 编码为 %22
+      result[#result + 1] = "%22"
+      i = i + 1
+    elseif byte < 0x20 then
+      -- 控制字符（\\x00-\\x1F 除 \\n\\r\\t）：URL 编码
+      result[#result + 1] = string.format("%%%02X", byte)
+      i = i + 1
+    elseif byte >= 0x80 then
+      -- 可能是 UTF-8 多字节字符，验证其合法性
+      local trailing = 0
+      if byte >= 0xF0 and byte <= 0xF4 then
+        trailing = 3
+      elseif byte >= 0xE0 then
+        trailing = 2
+      elseif byte >= 0xC2 then
+        trailing = 1
+      else
+        -- 非法首字节（0x80-0xBF 或 0xC0-0xC1 或 0xF5-0xFF）
+        result[#result + 1] = string.format("%%%02X", byte)
+        i = i + 1
+        goto continue
+      end
+      -- 检查后续字节是否有效（10xxxxxx 格式）
+      local valid = true
+      for j = 1, trailing do
+        local next_byte = str:byte(i + j)
+        if not next_byte or next_byte < 0x80 or next_byte > 0xBF then
+          valid = false
+          break
+        end
+      end
+      if valid then
+        -- 完整有效的 UTF-8 字符，保留
+        result[#result + 1] = str:sub(i, i + trailing)
+        i = i + trailing + 1
+      else
+        -- 非法 UTF-8 序列：将每个无效字节单独编码
+        for j = 1, trailing + 1 do
+          local b = str:byte(i + j - 1)
+          if b then
+            result[#result + 1] = string.format("%%%02X", b)
+          end
+        end
+        i = i + trailing + 1
+      end
+    else
+      -- ASCII 可打印字符，保留
+      result[#result + 1] = string.char(byte)
+      i = i + 1
+    end
+    ::continue::
+  end
+  return table.concat(result)
+end
+
+--- 将 %%XX URL 编码的字符串解码回原始字符
+-- @param str string URL 编码的字符串
+-- @return string 解码后的字符串
+function M._decode_special_chars(str)
+  if not str or str == "" then
+    return str
+  end
+  -- 解码 %%XX 格式的 URL 编码
+  -- 在 Lua 字符串中 "%%" 表示一个字面量 % 字符
+  -- 在 Lua 模式中 "%%" 匹配一个字面量 % 字符
+  -- 所以 "%%(%x%x)" 匹配 %XX 格式
+  local result = str:gsub("%%(%x%x)", function(hex)
+    return string.char(tonumber(hex, 16))
+  end)
+  return result
+end
+
+--- 递归遍历响应数据结构，对其中所有字符串字段进行特殊字符编码
+-- 处理 choices[].delta.content、choices[].delta.reasoning_content、
+-- choices[].delta.tool_calls[].function.arguments、
+-- choices[].message.content、choices[].message.reasoning_content、
+-- choices[].message.tool_calls[].function.arguments
+-- @param data table|string 响应数据
+-- @return table|string 编码后的数据
+function M._encode_response_strings(data)
+  if type(data) == "string" then
+    return M._encode_special_chars(data)
+  end
+  if type(data) ~= "table" then
+    return data
+  end
+  for k, v in pairs(data) do
+    if type(v) == "string" then
+      data[k] = M._encode_special_chars(v)
+    elseif type(v) == "table" then
+      M._encode_response_strings(v)
+    end
+  end
+  return data
+end
+
 function M._sanitize_json_body(body)
   if not body or body == "" then
     return body
@@ -332,7 +449,9 @@ function M.send_request(params)
           if retry_response.error then
             return nil, retry_response.error.message or json.encode(retry_response.error)
           end
-          return request_adapter.transform_response(retry_response, api_type), nil
+          local retry_unified = request_adapter.transform_response(retry_response, api_type)
+          M._encode_response_strings(retry_unified)
+          return retry_unified, nil
         end
       end
       return nil, "retry failed"
@@ -351,7 +470,9 @@ function M.send_request(params)
     }
   end
 
-  return request_adapter.transform_response(response, api_type), nil
+  local unified = request_adapter.transform_response(response, api_type)
+  M._encode_response_strings(unified)
+  return unified, nil
 end
 
 --- 发送流式请求
@@ -511,6 +632,8 @@ function M.send_stream_request(params, on_chunk, on_complete, on_error)
           return
         end
         local unified = request_adapter.transform_response(data, api_type)
+        -- 对响应内容中的控制字符和非法 UTF-8 进行 URL 编码
+        M._encode_response_strings(unified)
         if on_chunk then
           on_chunk(unified)
         end
@@ -1071,8 +1194,10 @@ function M.send_request_async(params, on_complete)
                 end
 
                 if on_complete then
+                  local retry_unified = request_adapter.transform_response(retry_response, api_type)
+                  M._encode_response_strings(retry_unified)
                   vim.schedule(function()
-                    on_complete(request_adapter.transform_response(retry_response, api_type), nil)
+                    on_complete(retry_unified, nil)
                   end)
                 end
               end,
@@ -1100,8 +1225,10 @@ function M.send_request_async(params, on_complete)
       end
 
       if on_complete then
+        local unified = request_adapter.transform_response(response, api_type)
+        M._encode_response_strings(unified)
         vim.schedule(function()
-          on_complete(request_adapter.transform_response(response, api_type), nil)
+          on_complete(unified, nil)
         end)
       end
     end,

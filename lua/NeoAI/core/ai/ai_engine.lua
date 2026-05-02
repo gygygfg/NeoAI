@@ -379,6 +379,25 @@ end
 --- 构建 AI 请求体
 local function build_request(params)
   local messages = params.messages or {}
+  -- 解码消息内容中的 %%XX URL 编码（由 http_client._encode_special_chars 编码的响应内容）
+  local http_client = require("NeoAI.core.ai.http_client")
+  for _, msg in ipairs(messages) do
+    if msg.content and type(msg.content) == "string" then
+      msg.content = http_client._decode_special_chars(msg.content)
+    end
+    if msg.reasoning_content and type(msg.reasoning_content) == "string" then
+      msg.reasoning_content = http_client._decode_special_chars(msg.reasoning_content)
+    end
+    -- 解码 tool_calls 中的 arguments
+    if msg.tool_calls and type(msg.tool_calls) == "table" then
+      for _, tc in ipairs(msg.tool_calls) do
+        local func = tc["function"] or tc.func
+        if func and func.arguments and type(func.arguments) == "string" then
+          func.arguments = http_client._decode_special_chars(func.arguments)
+        end
+      end
+    end
+  end
   local options = params.options or {}
   local session_id = params.session_id
   state.tool_call_counter = state.tool_call_counter + 1

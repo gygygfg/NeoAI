@@ -187,8 +187,8 @@ local function on_generation_completed(data)
       assistant_entry = { content = response }
     end
 
-    -- 追加到 assistant 数组末尾
-    hm.add_assistant_entry(session_id, assistant_entry)
+    -- 更新最后一条 assistant 条目（流式过程中已通过 update_last_assistant 创建）
+    hm.update_last_assistant(session_id, assistant_entry)
     hm.update_usage(session_id, usage)
     return true
   end)
@@ -222,8 +222,8 @@ local function on_history_save_final(data)
       assistant_entry = { content = content }
     end
 
-    -- 追加到 assistant 数组末尾
-    hm.add_assistant_entry(session_id, assistant_entry)
+    -- 更新最后一条 assistant 条目（流式过程中已通过 update_last_assistant 创建）
+    hm.update_last_assistant(session_id, assistant_entry)
     hm.update_usage(session_id, usage)
     return true
   end)

@@ -279,7 +279,13 @@ function M._format_entry(level, message)
   local time_str = os.date("%Y-%m-%d %H:%M:%S")
 
   -- 替换格式字符串中的占位符
-  local entry = state.format:gsub("{time}", time_str):gsub("{level}", level_name):gsub("{message}", message)
+  -- 使用 string.find + string.sub 手动替换，避免 message 中的特殊字符导致 gsub 错误
+  local entry = state.format
+  entry = entry:gsub("{time}", time_str)
+  entry = entry:gsub("{level}", level_name)
+  -- 对 message 中的 % 进行转义，防止 "invalid capture index" 错误
+  local safe_message = message:gsub("%%", "%%%%")
+  entry = entry:gsub("{message}", safe_message)
 
   return entry
 end

@@ -440,6 +440,12 @@ function M._render_single_message(msg, prev_role)
   local role_prefix = msg.role == "user" and "👤 用户:" or "🤖 AI:"
   local raw_content = msg.content or ""
 
+  -- 解码 %%XX URL 编码（由 http_client._encode_special_chars 编码的响应内容）
+  local http_client_ok, http_client = pcall(require, "NeoAI.core.ai.http_client")
+  if http_client_ok and http_client._decode_special_chars then
+    raw_content = http_client._decode_special_chars(raw_content)
+  end
+
   -- 每轮对话之间添加分割线（user 消息前，且不是第一条消息）
   -- 注意：只在最后一条消息前添加分割线，由 _do_render_chat 统一处理
   -- 这里不再添加，避免消息之间出现多余的分割线
@@ -2772,6 +2778,12 @@ end
 function M._append_stream_chunk_to_buffer(chunk_content, content_type)
   if not state.current_window_id then
     return
+  end
+
+  -- 解码 %%XX URL 编码（由 http_client._encode_special_chars 编码的响应内容）
+  local http_client_ok, http_client = pcall(require, "NeoAI.core.ai.http_client")
+  if http_client_ok and http_client._decode_special_chars then
+    chunk_content = http_client._decode_special_chars(chunk_content)
   end
 
   -- 更新消息列表中的累积内容，并同步保存到历史文件
