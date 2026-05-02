@@ -528,7 +528,7 @@ function M._update_float_window()
         -- 优先显示用户提问，提问为空时回退显示会话名称
         local display_text = session.user or ""
         if display_text == "" then
-          display_text = session.name or "无"
+          display_text = (session.name and session.name ~= "") and session.name or "无"
         else
           -- 截断过长文本
           local one_line = display_text:gsub("\n", " "):gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")

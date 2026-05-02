@@ -115,7 +115,7 @@ function M.initialize(options)
   if state_manager.is_initialized() then
     full_config = state_manager.get_config() or {}
   else
-    full_config = (options or {}).config or {}
+    full_config = (options or {}).config or (options or {})
   end
   local session_config = full_config.session or {}
   local auto_save = session_config.auto_save ~= false
@@ -218,9 +218,14 @@ function M.create_session(name, is_root, parent_id)
   if not state.initialized then error("History manager not initialized") end
 
   local id = generate_id()
+  -- 如果调用方显式传入了 name，直接使用；否则根据 auto_naming 决定默认值
+  if name == nil then
+    local auto_naming = state_manager.get_config_value("session.auto_naming") ~= false
+    name = auto_naming and "聊天会话" or ""
+  end
   local session = {
     id = id,
-    name = name or "聊天会话",
+    name = name,
     created_at = os.time(),
     updated_at = os.time(),
     is_root = (parent_id == nil and is_root ~= false) or (is_root == true),
@@ -273,7 +278,8 @@ function M.get_or_create_current_session(name)
   if state.current_session_id and state.sessions[state.current_session_id] then
     return state.sessions[state.current_session_id]
   end
-  local id = M.create_session(name or "聊天会话", true, nil)
+  -- 如果调用方传了 name，直接使用；否则让 create_session 根据 auto_naming 决定
+  local id = M.create_session(name, true, nil)
   return state.sessions[id]
 end
 
@@ -914,10 +920,12 @@ function M.auto_name_session(session_id, callback)
 
   local default_names = { "聊天会话", "新会话", "子会话", "分支", "会话" }
   local is_default = false
-  for _, dn in ipairs(default_names) do
-    if session.name == dn or session.name:find("^" .. dn) then
-      is_default = true
-      break
+  if session.name and session.name ~= "" then
+    for _, dn in ipairs(default_names) do
+      if session.name == dn or session.name:find("^" .. dn) then
+        is_default = true
+        break
+      end
     end
   end
   if not is_default then

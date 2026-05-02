@@ -55,7 +55,9 @@ function M.handle_n()
   if not sid then notify("请先选中一个会话节点", vim.log.levels.WARN); return end
   local session = hm.get_session(sid)
   if not session then notify("会话不存在", vim.log.levels.WARN); return end
-  local new_id = hm.create_session("子会话-" .. session.name, false, sid)
+  local auto_naming = require("NeoAI.core.config.state").get_config_value("session.auto_naming") ~= false
+  local child_name = auto_naming and ("子会话-" .. session.name) or ""
+  local new_id = hm.create_session(child_name, false, sid)
   notify("已创建子会话: " .. new_id)
   hm.set_current_session(new_id)
   open_chat_for_session(new_id)
@@ -66,7 +68,8 @@ function M.handle_N()
   if not state.initialized then return end
   local hm = get_hm()
   if not hm then return end
-  local new_id = hm.create_session("新会话", true, nil)
+  local auto_naming = require("NeoAI.core.config.state").get_config_value("session.auto_naming") ~= false
+  local new_id = hm.create_session(auto_naming and "新会话" or "", true, nil)
   notify("已创建根会话: " .. new_id)
   hm.set_current_session(new_id)
   open_chat_for_session(new_id)

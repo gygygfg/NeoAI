@@ -457,6 +457,53 @@ end
 -- ============================================================================
 -- 工具 run_command
 -- ============================================================================
+-- 模块级别的辅助函数（供 _send_input 和超时监控使用）
+-- ============================================================================
+
+-- 剥离 ANSI 转义码（模块级别版本）
+local function _module_strip_ansi(text)
+  if not text then
+    return ""
+  end
+  local cleaned = text
+  cleaned = cleaned:gsub("\027%%[[a-zA-Z]", "")
+  cleaned = cleaned:gsub("\027%%[%%?[a-zA-Z]", "")
+  cleaned = cleaned:gsub("\027%%[%%d+[a-zA-Z]", "")
+  cleaned = cleaned:gsub("\027%%[%%?%%d+[a-zA-Z]", "")
+  for num_semicolons = 50, 1, -1 do
+    local parts = {}
+    for _ = 1, num_semicolons + 1 do
+      table.insert(parts, "%%d+")
+    end
+    cleaned = cleaned:gsub("\027%%[" .. table.concat(parts, ";") .. "[a-zA-Z]", "")
+  end
+  for num_semicolons = 50, 1, -1 do
+    local parts = {}
+    for _ = 1, num_semicolons + 1 do
+      table.insert(parts, "%%d+")
+    end
+    cleaned = cleaned:gsub("\027%%[%%?" .. table.concat(parts, ";") .. "[a-zA-Z]", "")
+  end
+  cleaned = cleaned:gsub("\027%%][^\007\027]*[\007\027\\]", "")
+  return cleaned
+end
+
+-- 从 PTY buffer 中读取所有内容（模块级别版本）
+local function _module_read_pty_buffer_output()
+  if not pty_float_window then
+    return ""
+  end
+  if pty_float_window and pty_float_window.buf and vim.api.nvim_buf_is_valid(pty_float_window.buf) then
+    local ok, lines = pcall(vim.api.nvim_buf_get_lines, pty_float_window.buf, 0, -1, false)
+    if ok and lines then
+      local raw = table.concat(lines, "\n")
+      return _module_strip_ansi(raw)
+    end
+  end
+  return ""
+end
+
+-- ============================================================================
 
 local function _run_command(args, on_success, on_error, on_progress)
   if not args then
@@ -505,6 +552,12 @@ local function _run_command(args, on_success, on_error, on_progress)
     start_time = vim.fn.reltime(),
     timeout_sec = timeout_sec,
     timeout_timer = nil,
+    -- 超时监控相关字段（独立于交互式输入决策）
+    timeout_monitor_timer = nil, -- 每30秒检查超时的定时器
+    timeout_monitor_active = false, -- 超时监控是否正在运行
+    timeout_stop_reason = nil, -- AI 设置的终止原因
+    timeout_check_round = 0, -- 超时检查轮次
+    timeout_check_history = {}, -- 超时检查历史（仅记录时间和页面文本）
     is_waiting_for_input = false,
     pending_input = nil,
     input_callback = nil,
@@ -536,6 +589,17 @@ local function _run_command(args, on_success, on_error, on_progress)
       vim.fn.timer_stop(session.timeout_timer)
     end
 
+    -- 停止超时监控定时器
+    if session.timeout_monitor_timer and vim.fn.timer_info(session.timeout_monitor_timer)[1] then
+      vim.fn.timer_stop(session.timeout_monitor_timer)
+      session.timeout_monitor_timer = nil
+    end
+    session.timeout_monitor_active = false
+    -- 清空超时检查历史（销毁独立线）
+    session.timeout_check_history = {}
+    session.timeout_check_round = 0
+    session.timeout_stop_reason = nil
+
     -- 关闭 PTY 浮动窗口（pcall 保护，headless 模式下可能没有窗口）
     pcall(close_pty_float_window)
 
@@ -548,17 +612,215 @@ local function _run_command(args, on_success, on_error, on_progress)
     sessions[session_id] = nil
   end
 
-  -- 超时处理
-  local function setup_timeout()
-    session.timeout_timer = vim.fn.timer_start(timeout_sec * 1000, function()
-      if session.state == "running" or session.state == "waiting" then
-        session.state = "error"
-        cleanup()
-        if on_error then
-          on_error(string.format("命令执行超时（%d 秒）: %s", timeout_sec, command))
+  -- ========================================================================
+  -- 超时监控（独立线，每30秒请求AI判断是否强制结束）
+  -- ========================================================================
+  -- 读取当前 PTY buffer 输出，用于传递给 AI 做超时判断
+  local function read_current_pty_output()
+    local full_buffer = _module_read_pty_buffer_output()
+    if full_buffer == "" then
+      full_buffer = session.full_output
+    end
+    return full_buffer
+  end
+
+  -- 构建超时检查的独立消息（仅包含时间戳和页面文本，不加入会话历史）
+  local function build_timeout_check_message()
+    local current_output = read_current_pty_output()
+    -- 清理特殊字符
+    local function sanitize_for_json(text)
+      if not text then
+        return ""
+      end
+      local result = {}
+      local i = 1
+      while i <= #text do
+        local byte = text:byte(i)
+        if byte == 92 then
+          result[#result + 1] = "\\\\"
+          i = i + 1
+        elseif byte == 34 then
+          result[#result + 1] = '\\"'
+          i = i + 1
+        elseif byte >= 194 and byte <= 244 then
+          local trailing = 0
+          if byte >= 240 then
+            trailing = 3
+          elseif byte >= 224 then
+            trailing = 2
+          else
+            trailing = 1
+          end
+          local valid = true
+          for j = 1, trailing do
+            local next_byte = text:byte(i + j)
+            if not next_byte or next_byte < 128 or next_byte > 191 then
+              valid = false
+              break
+            end
+          end
+          if valid then
+            result[#result + 1] = text:sub(i, i + trailing)
+            i = i + trailing + 1
+          else
+            result[#result + 1] = string.char(byte)
+            i = i + 1
+          end
+        else
+          result[#result + 1] = string.char(byte)
+          i = i + 1
         end
       end
-    end)
+      return table.concat(result)
+    end
+
+    local MAX_OUTPUT_LEN = 50 * 1024
+    local prompt_output = sanitize_for_json(current_output)
+    if #prompt_output > MAX_OUTPUT_LEN then
+      prompt_output = "[输出过长，已截断前 "
+        .. (#prompt_output - MAX_OUTPUT_LEN)
+        .. " 字节]\n...\n"
+        .. prompt_output:sub(-MAX_OUTPUT_LEN)
+    end
+
+    -- 构建历史摘要（仅记录时间和页面文本长度）
+    local history_summary = ""
+    if #session.timeout_check_history > 0 then
+      local lines = { "\n=== 超时检查历史记录 ===" }
+      for _, h in ipairs(session.timeout_check_history) do
+        lines[#lines + 1] = string.format(
+          "  [%s] 检查轮次 #%d, 输出长度: %d 字节",
+          os.date("%H:%M:%S", h.timestamp),
+          h.round,
+          h.output_length
+        )
+      end
+      lines[#lines + 1] = "==========================\n"
+      history_summary = table.concat(lines, "\n")
+    end
+
+    return history_summary .. prompt_output
+  end
+
+  -- 启动超时监控（每30秒检查一次）
+  local function start_timeout_monitoring()
+    if session.timeout_monitor_active then
+      return
+    end
+    session.timeout_monitor_active = true
+
+    local CHECK_INTERVAL_MS = 30000 -- 30秒
+
+    session.timeout_monitor_timer = vim.fn.timer_start(CHECK_INTERVAL_MS, function()
+      -- 仅在 running 或 waiting 状态下检查
+      if session.state ~= "running" and session.state ~= "waiting" then
+        return
+      end
+      -- 如果正在等待 AI 输入决策，跳过本次检查（避免与交互式输入冲突）
+      if session.is_waiting_for_input then
+        return
+      end
+
+      session.timeout_check_round = session.timeout_check_round + 1
+      local current_round = session.timeout_check_round
+
+      -- 记录本次检查到历史
+      local current_output = read_current_pty_output()
+      table.insert(session.timeout_check_history, {
+        round = current_round,
+        timestamp = os.time(),
+        output_length = #current_output,
+      })
+      if #session.timeout_check_history > 20 then
+        table.remove(session.timeout_check_history, 1)
+      end
+
+      -- 构建独立消息（仅包含时间和页面文本）
+      local timeout_prompt = build_timeout_check_message()
+
+      -- 调用 AI 判断是否需要强制结束
+      local tool_orchestrator = require("NeoAI.core.ai.tool_orchestrator")
+      local chat_session_id = args._session_id
+
+      tool_orchestrator.execute_single_tool_request(chat_session_id, "check_shell_timeout", {
+        prompt = timeout_prompt,
+        stdout = timeout_prompt,
+        command = command,
+        session_id = session_id,
+        _disable_reasoning = true,
+        timeout_check_round = current_round,
+        elapsed_seconds = current_round * 30,
+      }, function(success, result)
+        -- 如果会话已结束，忽略回调
+        if session._cleaned_up or (session.state ~= "running" and session.state ~= "waiting") then
+          return
+        end
+
+        if not success then
+          -- 请求失败不终止，继续等待下次检查
+          return
+        end
+
+        -- 处理 AI 返回的 stop=true
+        local should_stop = false
+        local stop_reason = nil
+
+        if result.stop == true then
+          should_stop = true
+          stop_reason = result.reason or "AI 判断命令执行时间过长"
+        end
+        if result.args then
+          if result.args.stop == true then
+            should_stop = true
+            stop_reason = result.args.reason or result.reason or "AI 判断命令执行时间过长"
+          end
+        end
+
+        if should_stop then
+          session.timeout_stop_reason = stop_reason
+          session.state = "finished"
+
+          -- 停止超时监控定时器
+          if session.timeout_monitor_timer and vim.fn.timer_info(session.timeout_monitor_timer)[1] then
+            vim.fn.timer_stop(session.timeout_monitor_timer)
+            session.timeout_monitor_timer = nil
+          end
+          session.timeout_monitor_active = false
+
+          -- 停止进程
+          if session.job_id and vim.fn.jobwait({ session.job_id }, 0)[1] == -1 then
+            vim.fn.jobstop(session.job_id)
+          end
+
+          -- 关闭 PTY 浮动窗口
+          pcall(close_pty_float_window)
+
+          -- 返回结果（包含终止原因）
+          local result_obj = {
+            command = command,
+            exit_code = -1,
+            signal = nil,
+            stdout = table.concat(session.stdout_data, ""),
+            stderr = table.concat(session.stderr_data, ""),
+            session_id = session_id,
+            state = "finished",
+            stopped_by_timeout = true,
+            stop_reason = stop_reason,
+          }
+
+          -- 清空超时检查历史（销毁独立线）
+          session.timeout_check_history = {}
+          session.timeout_check_round = 0
+
+          session._cleaned_up = true
+          sessions[session_id] = nil
+
+          if on_success then
+            on_success(result_obj)
+          end
+        end
+      end)
+    end, { ["repeat"] = -1 })
   end
 
   -- 剥离 ANSI 转义码
@@ -1263,8 +1525,8 @@ local function _run_command(args, on_success, on_error, on_progress)
       end
     end
 
-    -- 设置超时
-    setup_timeout()
+    -- 启动超时监控（每30秒请求AI判断是否强制结束）
+    start_timeout_monitoring()
 
     -- 延迟获取PID（给进程一些启动时间）
     vim.defer_fn(function()
@@ -1344,6 +1606,8 @@ M.run_command = define_tool({
       session_id = { type = "string", description = "shell session ID" },
       state = { type = "string", description = "session 状态：finished | error" },
       message = { type = "string", description = "提示消息" },
+      stopped_by_timeout = { type = "boolean", description = "是否由超时监控强制终止" },
+      stop_reason = { type = "string", description = "终止原因（由超时监控设置）" },
     },
     description = "命令执行结果",
   },
@@ -1425,7 +1689,7 @@ local function _send_input(args, on_success, on_error, on_progress)
   session.is_waiting_for_input = false
 
   -- 重置 buffer 位置，下次 waiting 时从最新位置开始增量读取
-  local full_buffer = read_pty_buffer_output()
+  local full_buffer = _module_read_pty_buffer_output()
   if full_buffer ~= "" then
     session.last_buffer_pos = #full_buffer
   end
@@ -1482,6 +1746,99 @@ M.send_input = define_tool({
       message = { type = "string", description = "提示消息" },
     },
     description = "输入发送结果",
+  },
+  category = "system",
+  permissions = { execute = true },
+})
+
+-- ============================================================================
+-- 工具 check_shell_timeout（超时监控专用，不加入会话历史）
+-- ============================================================================
+
+local function _check_shell_timeout(args, on_success, on_error, on_progress)
+  if not args then
+    if on_error then
+      on_error("需要参数")
+    end
+    return
+  end
+
+  local session_id = args.session_id
+  if not session_id then
+    if on_error then
+      on_error("需要 session_id 参数")
+    end
+    return
+  end
+
+  local session = sessions[session_id]
+  if not session then
+    if on_error then
+      on_error(string.format("session '%s' 不存在或已结束", session_id))
+    end
+    return
+  end
+
+  -- 检查 AI 是否决定强制结束
+  local stop = args.stop
+  local reason = args.reason
+
+  if stop == true then
+    -- 记录终止原因
+    session.timeout_stop_reason = reason or "AI 判断命令执行时间过长"
+
+    -- 返回成功，由超时监控定时器的回调处理实际的终止逻辑
+    if on_success then
+      on_success({
+        session_id = session_id,
+        stop = true,
+        reason = session.timeout_stop_reason,
+        message = string.format("已记录终止请求，原因: %s", session.timeout_stop_reason),
+      })
+    end
+  else
+    -- 不终止，继续执行
+    if on_success then
+      on_success({
+        session_id = session_id,
+        stop = false,
+        message = "命令继续执行，将在30秒后再次检查",
+      })
+    end
+  end
+end
+
+M.check_shell_timeout = define_tool({
+  name = "check_shell_timeout",
+  description = "[超时监控专用] 检查当前正在执行的 shell 命令是否执行时间过长，判断是否需要强制结束。此工具由系统每30秒自动调用，不加入会话历史。如果命令已经完成或不需要继续执行，请设置 stop=true 并说明终止原因。",
+  func = _check_shell_timeout,
+  async = true,
+  parameters = {
+    type = "object",
+    properties = {
+      session_id = {
+        type = "string",
+        description = "run_command 返回的 session_id（必填）",
+      },
+      stop = {
+        type = "boolean",
+        description = "设为 true 时强制终止 shell 进程（命令执行时间过长或已完成时使用）",
+      },
+      reason = {
+        type = "string",
+        description = "终止原因说明。当 stop=true 时必填，用于记录为什么终止该命令",
+      },
+    },
+  },
+  returns = {
+    type = "object",
+    properties = {
+      session_id = { type = "string", description = "shell session ID" },
+      stop = { type = "boolean", description = "是否已请求终止" },
+      reason = { type = "string", description = "终止原因（如有）" },
+      message = { type = "string", description = "提示消息" },
+    },
+    description = "超时检查结果",
   },
   category = "system",
   permissions = { execute = true },

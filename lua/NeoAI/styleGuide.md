@@ -5,8 +5,9 @@
 ```
 NeoAI/
 ├── init.lua                    # 主入口文件：setup/命令注册/全局快捷键
-├── default_config.lua          # 默认配置定义、验证、合并、清理
+├── default_config.lua          # 默认配置定义（仅定义，不处理逻辑）
 ├── styleGuide.md               # 本文件：架构设计文档
+├── deepseek.md                 # DeepSeek API 参考文档
 │
 ├── core/                       # 核心业务逻辑
 │   ├── init.lua                # 核心模块入口，协调子模块初始化
@@ -14,11 +15,12 @@ NeoAI/
 │   ├── shutdown_flag.lua       # 全局关闭标志（避免退出时死锁）
 │   │
 │   ├── config/                 # 配置管理
-│   │   ├── init.lua            # 配置模块入口
+│   │   ├── init.lua            # 配置模块入口（统一导出子模块）
+│   │   ├── merger.lua          # 配置合并器（验证→合并→清理，一步完成）
 │   │   ├── keymap_manager.lua  # 键位配置管理器
 │   │   └── state.lua           # 统一状态管理器（集中管理共享状态）
 │   │
-│   ├── history/                # 历史管理（新版，替代旧 core/history_manager.lua）
+│   ├── history/                # 历史管理（替代旧 core/history_manager.lua）
 │   │   ├── manager.lua         # 会话数据 CRUD 操作、消息管理
 │   │   ├── persistence.lua     # 文件序列化/反序列化、写入队列、事务性保存
 │   │   ├── cache.lua           # 树结构缓存、列表缓存、round_text 缓存
@@ -64,11 +66,12 @@ NeoAI/
 │       ├── log_tools.lua       # 日志工具
 │       ├── neovim_lsp.lua      # LSP 工具
 │       ├── neovim_tree.lua     # 文件树工具
+│       ├── shell_tools.lua     # Shell 命令执行工具（伪终端+PID监控）
 │       ├── stop_tool.lua       # 停止工具循环
 │       └── tool_helpers.lua    # 工具定义辅助模块（define_tool）
 │
 ├── utils/                      # 工具库
-│   ├── init.lua                # 工具模块入口（自动加载 5 个子模块）
+│   ├── init.lua                # 工具模块入口（自动加载子模块）
 │   ├── common.lua              # 通用工具函数（深拷贝等）
 │   ├── table_utils.lua         # 表操作
 │   ├── file_utils.lua          # 文件操作
@@ -101,12 +104,18 @@ NeoAI/
     └── deepseek_responses/     # 测试响应数据
         ├── fetch_responses.sh
         ├── fim_completion.json
+        ├── fim_completion_request.json
         ├── list_models.json
         ├── non_streaming_no_reasoning.json
+        ├── non_streaming_no_reasoning_request.json
         ├── reasoning_non_stream.json
+        ├── reasoning_non_stream_request.json
         ├── reasoning_streaming.json
+        ├── reasoning_streaming_request.json
         ├── streaming_no_reasoning.json
+        ├── streaming_no_reasoning_request.json
         ├── tool_call.json
+        ├── tool_call_request.json
         └── user_balance.json
 ```
 
@@ -118,15 +127,15 @@ NeoAI/
 用户调用 setup(config)
     │
     ▼
-default_config.process_config(config)     ← 一步完成：验证 → 合并 → 清理 → 初始化
+config_merger.process_config(config)      ← 一步完成：验证 → 合并 → 清理 → 初始化日志
     │
     ▼
 state_manager.initialize(config)          ← 初始化统一状态管理器（保存配置引用）
     │
     ▼
 core.initialize(config)                   ← 初始化核心模块
-  ├── config_module.initialize(config)    ← 配置模块（含 keymap_manager + state）
-  ├── ai_engine.initialize()              ← AI 引擎
+  ├── config_module.initialize(config)    ← 配置模块（keymap_manager + state，state 幂等）
+  ├── ai_engine.initialize()              ← AI 引擎（从 state_manager 读取配置）
   ├── history_manager.initialize()        ← 历史管理器（唯一数据源，含 cache/persistence/saver）
   └── chat_service.initialize()           ← 后端聊天服务（前后端分离）
     │
@@ -147,6 +156,7 @@ tools.initialize(config.tools)            ← 初始化工具系统
   ├── tool_executor.initialize()
   ├── tool_validator.initialize()
   ├── vim.schedule → _load_builtin_tools()  ← 延迟加载内置工具（不阻塞初始化）
+  │   └── 完成后自动调用 tool_pack.initialize() 刷新工具包分组
   └── _load_external_tools()              ← 加载外部工具（可选）
     │
     ▼
@@ -167,37 +177,56 @@ register_global_keymaps()                 ← 注册全局快捷键
   ├── open_chat                           ← 打开聊天界面
   ├── close_all                           ← 关闭所有窗口
   └── toggle_ui                           ← 切换 UI 显示
+    │
+    ▼
+_auto_run_tests(config)                   ← 可选：VimEnter 后延迟运行测试
 ```
 
 **关键变更**：
-1. `state_manager.initialize(config)` 在 `core.initialize()` **之前**调用，确保所有模块可通过 `state_manager.get_config()` 获取配置
-2. 内置工具加载和工具注入 AI 引擎均使用 `vim.schedule` **延迟执行**，不阻塞主初始化流程
-3. 退出事件由 `history/manager.lua` 内部的 `VimLeavePre` 统一处理（同步保存），`init.lua` 不再重复注册
+1. `config_merger.process_config()` 在 `state_manager.initialize()` **之前**调用，一步完成验证→合并→清理→初始化日志
+2. `state_manager.initialize(config)` 在 `core.initialize()` **之前**调用，确保所有模块可通过 `state_manager.get_config()` 获取配置
+3. 内置工具加载和工具注入 AI 引擎均使用 `vim.schedule` **延迟执行**，不阻塞主初始化流程
+4. 退出事件由 `history/manager.lua` 内部的 `VimLeavePre` 统一处理（同步保存），`init.lua` 不再重复注册
+5. `config_module.initialize()` 中 `state.initialize()` 幂等，已初始化则跳过
 
-### 配置示例
+### 配置示例（多提供商架构）
 
 ```lua
 require("NeoAI").setup({
-  ui = {
-    default_ui = "chat",           -- 默认打开界面: "tree" | "chat"
-    window_mode = "split",          -- 窗口模式: "float" | "tab" | "split"
-    window = {
-      width = 100,
-      height = 30,
-      border = "single",
+  ai = {
+    default = "balanced",
+    providers = {
+      deepseek = {
+        api_type = "openai",
+        base_url = "https://api.deepseek.com/chat/completions",
+        api_key = os.getenv("DEEPSEEK_API_KEY"),
+        models = { "deepseek-v4-flash", "deepseek-v4-pro" },
+      },
+      openai = {
+        api_type = "openai",
+        base_url = "https://api.openai.com/v1/chat/completions",
+        api_key = os.getenv("OPENAI_API_KEY"),
+        models = { "gpt-4o", "gpt-4o-mini" },
+      },
+    },
+    scenarios = {
+      chat = {
+        { provider = "deepseek", model_name = "deepseek-v4-flash", temperature = 0.7 },
+      },
+      coding = {
+        { provider = "deepseek", model_name = "deepseek-v4-pro", temperature = 0.2 },
+      },
     },
   },
-  ai = {
-    model = "deepseek-reasoner",
-    api_key = os.getenv("DEEPSEEK_API_KEY"),
-    base_url = "https://api.deepseek.com/chat/completions",
-    temperature = 0.7,
-    max_tokens = 4096,
-    stream = true,
-    timeout = 60000,
+  ui = {
+    default_ui = "tree",
+    window_mode = "tab",
+    window = { width = 80, height = 20, border = "rounded" },
+    split = { size = 80, chat_direction = "right", tree_direction = "right" },
   },
   session = {
     auto_save = true,
+    auto_naming = true,
     save_path = vim.fn.stdpath("cache") .. "/NeoAI",
     max_history_per_session = 1000,
   },
@@ -210,25 +239,48 @@ require("NeoAI").setup({
 
 ### `init.lua` — 主入口
 
-- 维护插件全局状态（`state` 表）
 - `setup(user_config)` — 初始化所有模块、注册命令和快捷键
-  - 初始化顺序：`default_config` → `state_manager` → `core` → `ui` → `tools` → 延迟注入工具 → 注册命令 → 注册快捷键
+  - 初始化顺序：`config_merger.process_config` → `state_manager.initialize` → `core.initialize` → `ui.initialize` → `tools.initialize` → 延迟注入工具 → 注册命令 → 注册快捷键 → `_auto_run_tests`
 - 提供对外接口：`open_neoai()`, `close_all()`, `get_session_manager()`, `get_ai_engine()`, `get_tools()`, `get_keymap_manager()`
 - 注册命令：`:NeoAIOpen`, `:NeoAIClose`, `:NeoAITree`, `:NeoAIChat`, `:NeoAIKeymaps`, `:NeoAIChatStatus`
 - 注册全局快捷键：`open_tree`, `open_chat`, `close_all`, `toggle_ui`（由 `config.keymaps.global` 配置）
 - 工具系统初始化后，通过 `vim.schedule` 延迟将工具注册表注入 AI 引擎（`ai_engine.set_tools(tools_map)`）
 - 支持 `config.test.auto_test` 自动运行测试（VimEnter 后延迟执行）
 - 注册 `BufRead` 自动命令确保 `.log` 和 `sessions.json` 文件编码为 utf-8
+- 使用 `config_merger.process_config()` 替代直接调用 `default_config`，`default_config.lua` 只负责定义默认配置
 
-### `default_config.lua` — 配置管理
+### `default_config.lua` — 默认配置定义
 
-|- 定义 `DEFAULT_CONFIG` 默认配置表
-|- `process_config(config)` — **一步完成**：验证 → 合并 → 清理 → 初始化（替代旧的 validate_config + merge_defaults + sanitize_config）
-|- `get(key)`, `set(key, value)` — 点号路径配置存取
-|- `validate()` — 完整配置验证
-|- `export()`, `import()` — 配置导入导出
-|- `get_preset(scenario)` / `get_scenario_candidates(scenario)` — 获取场景 AI 配置
-|- `get_available_models()` / `get_available_scenarios()` — 获取可用模型/场景列表
+|- 定义 `DEFAULT_CONFIG` 默认配置表（仅定义，不处理逻辑）
+|- `get_default_config()` — 返回默认配置的深拷贝
+|- 配置结构：
+|  - `ai.providers` — 多提供商定义（deepseek/openai/anthropic/google/groq/together/openrouter/siliconflow/moonshot/zhipu/baidu/aliyun/stepfun）
+|  - `ai.scenarios` — 场景预设（naming/chat/reasoning/coding/tools/agent），每个场景可指定多个候选
+|  - `ui` — UI 配置（含 split 方向、tree 折叠选项）
+|  - `keymaps` — 键位配置（global/tree/chat 三种上下文）
+|  - `session` — 会话配置（含 auto_naming）
+|  - `tools` — 工具配置
+|  - `log` — 日志配置（级别/路径/格式/大小/备份数）
+|  - `test` — 测试配置
+
+### `core/config/merger.lua` — 配置合并器
+
+|- 职责：将用户配置与默认配置合并，生成完整配置
+|- `process_config(user_config)` — **一步完成**：验证 → 合并 → 清理 → 初始化日志（替代旧的 validate_config + merge_defaults + sanitize_config）
+|- `get_preset(scenario)` — 获取指定场景的第一个可用 AI 配置
+|- `get_scenario_candidates(scenario)` — 获取指定场景的 AI 候选列表
+|- `get_available_models()` — 获取所有可用模型（遍历所有提供商）
+|- 验证规则：
+|  - AI 配置：验证 providers 和 scenarios 结构，过滤无效场景名
+|  - UI 配置：验证 default_ui（tree/chat）、window_mode（float/tab/split）、窗口尺寸
+|  - 键位配置：验证上下文（global/tree/chat）
+|  - 日志配置：验证级别/文件大小/备份数/布尔值
+|  - 会话配置：验证 max_history_per_session 为正数
+|- 合并规则：
+|  - 数字/字符串/布尔值：用户值覆盖默认值
+|  - 表结构：保留默认表结构，递归合并内部字段
+|  - 新增字段（默认中没有的）：给出提示但不添加
+|  - scenarios 特殊处理：合并到默认场景候选的对应字段
 
 ### `core/init.lua` — 核心模块入口
 
@@ -454,7 +506,7 @@ tree_window.set_keymaps(keymap_manager)       ← 设置按键映射
 触发 NeoAI:tree_window_opened 事件
 ```
 
-树界面按键（由 `tree_window.set_keymaps()` 设置）：
+树界面按键（由 `tree_window.set_keymaps()` 设置，通过 `keymap_manager` 配置）：
 
 - `<CR>` — 选择会话 → `tree_handlers.handle_enter()` → 打开聊天
 - `n` — 在当前会话下新建子会话（分支）：
@@ -463,7 +515,8 @@ tree_window.set_keymaps(keymap_manager)       ← 设置按键映射
   3. 跳转到聊天界面
   4. 聊天界面自动加载从根到选中会话的整条路径作为上文（选中会话作为最后一轮上文）
 - `N` — 新建根会话
-- `d` — 删除当前会话
+- `d` — 删除对话（单个会话）
+- `D` — 删除分支（递归删除子会话）
 - `o` — 展开节点
 - `O` — 折叠节点
 
@@ -507,16 +560,20 @@ AI响应完成后（GENERATION_COMPLETED 事件）：
 - **通信方式**：前端调用 `chat_service.send_message()`，后端通过 `GENERATION_COMPLETED` 事件通知前端
 - **持久化**：由 `history/saver.lua` 通过事件驱动自动完成，前端无需手动调用保存
 
-聊天界面按键（由 `chat_window.set_keymaps()` 设置）：
+聊天界面按键（由 `chat_window.set_keymaps()` 设置，通过 `keymap_manager` 配置）：
 
-- `<CR>` — 发送消息
+- `i` — 进入插入模式
+- `q` — 关闭聊天窗口
+- `r` — 刷新聊天窗口
+- `<CR>`（普通模式） / `<C-s>`（插入模式） — 发送消息
 - `<Esc>` — 取消生成
 - `e` — 编辑消息
 - `dd` — 删除消息
 - `<C-u>` — 向上滚动
 - `<C-d>` — 向下滚动
 - `r` — 切换思考过程显示
-- `<C-CR>` — 新建行
+- `m` — 切换模型
+- `<CR>` — 新建行
 - `<C-u>` — 清空输入
 
 ### 3. AI 处理流程
@@ -721,14 +778,52 @@ vim.api.nvim_create_autocmd("User", {
 
 ```lua
 {
-  base_url = "https://api.deepseek.com/chat/completions",  -- API 地址
-  api_key = "",                                             -- API 密钥（从环境变量读取）
-  model = "deepseek-reasoner",                              -- 模型名称
-  temperature = 0.7,                                        -- 温度 (0-2)
-  max_tokens = 4096,                                        -- 最大 Token 数
-  stream = true,                                            -- 是否流式响应
-  timeout = 60000,                                          -- 超时时间（毫秒）
-  system_prompt = "你是一个AI编程助手...",                   -- 系统提示词
+  default = "balanced",             -- 默认使用的预设名称
+  providers = {                     -- 多提供商定义
+    deepseek = {
+      api_type = "openai",
+      base_url = "https://api.deepseek.com/chat/completions",
+      api_key = os.getenv("DEEPSEEK_API_KEY") or "",
+      models = { "deepseek-v4-flash", "deepseek-v4-pro" },
+    },
+    openai = {
+      api_type = "openai",
+      base_url = "https://api.openai.com/v1/chat/completions",
+      api_key = os.getenv("OPENAI_API_KEY") or "",
+      models = { "gpt-4o", "gpt-4o-mini" },
+    },
+    -- 还支持: anthropic, google, groq, together, openrouter,
+    -- siliconflow, moonshot, zhipu, baidu, aliyun, stepfun
+  },
+  scenarios = {                     -- 场景预设
+    naming = {                      -- 窗口命名：快速低延迟
+      { provider = "deepseek", model_name = "deepseek-chat",
+        temperature = 0.3, max_tokens = 50, stream = false, timeout = 15000 },
+    },
+    chat = {                        -- 聊天：平衡速度与质量
+      { provider = "deepseek", model_name = "deepseek-v4-flash",
+        temperature = 0.7, max_tokens = 4096, stream = true, timeout = 60000 },
+    },
+    reasoning = {                   -- 思考：深度推理
+      { provider = "deepseek", model_name = "deepseek-v4-pro",
+        temperature = 0.7, max_tokens = 8192, stream = true, timeout = 120000 },
+    },
+    coding = {                      -- 编码：高质量代码
+      { provider = "deepseek", model_name = "deepseek-v4-pro",
+        temperature = 0.2, max_tokens = 8192, stream = true, timeout = 120000 },
+    },
+    tools = {                       -- 工具执行：快速响应
+      { provider = "deepseek", model_name = "deepseek-v4-flash",
+        temperature = 0.3, max_tokens = 1024, stream = true, timeout = 30000 },
+    },
+    agent = {                       -- 子 agent
+      { provider = "deepseek", model_name = "deepseek-v4-pro",
+        temperature = 0.7, max_tokens = 4096, stream = true, timeout = 60000 },
+    },
+  },
+  stream = true,                    -- 全局默认：流式响应
+  timeout = 60000,                  -- 全局默认：超时时间（毫秒）
+  system_prompt = "你是一个AI编程助手...", -- 全局默认：系统提示词
 }
 ```
 
@@ -748,6 +843,17 @@ vim.api.nvim_create_autocmd("User", {
     border = "FloatBorder",
     text = "Normal",
   },
+  split = {                         -- 分割窗口配置
+    size = 80,                      -- 分割大小（列数或百分比）
+    chat_direction = "right",       -- chat 窗口分割方向
+    tree_direction = "right",       -- tree 窗口分割方向
+  },
+  tree = {                          -- 树窗口配置
+    foldenable = false,
+    foldmethod = "manual",
+    foldcolumn = "0",
+    foldlevel = 99,
+  },
 }
 ```
 
@@ -756,6 +862,7 @@ vim.api.nvim_create_autocmd("User", {
 ```lua
 {
   auto_save = true,                                         -- 自动保存
+  auto_naming = true,                                       -- 自动命名会话
   save_path = vim.fn.stdpath("cache") .. "/NeoAI",          -- 保存路径
   max_history_per_session = 1000,                           -- 每会话最大历史数
 }
@@ -768,6 +875,20 @@ vim.api.nvim_create_autocmd("User", {
   enabled = true,                   -- 是否启用工具系统
   builtin = true,                   -- 是否加载内置工具
   external = {},                    -- 外部工具列表
+}
+```
+
+### 日志配置 (`config.log`)
+
+```lua
+{
+  level = "WARN",                   -- 日志级别: DEBUG, INFO, WARN, ERROR, FATAL
+  output_path = "/path/to/neoai.log", -- 输出文件路径
+  format = "[{time}] [{level}] {message}", -- 日志格式模板
+  max_file_size = 10485760,         -- 最大文件大小（字节），默认 10MB
+  max_backups = 5,                  -- 最大备份文件数量
+  verbose = false,                  -- 是否启用详细输出
+  print_debug = false,              -- 是否启用调试打印到控制台
 }
 ```
 
@@ -798,15 +919,17 @@ vim.api.nvim_create_autocmd("User", {
 
 1. **事件驱动**：模块间通过 Neovim 原生事件系统（`nvim_exec_autocmds`/`nvim_create_autocmd`）通信，避免直接依赖
 2. **职责单一**：每个模块只负责一个领域的功能
-3. **配置集中**：所有配置在 `default_config.lua` 中统一管理，`process_config()` 一步完成验证→合并→清理→初始化
-4. **状态统一**：`core/config/state.lua` 集中管理共享状态，各模块不再维护独立 `state` 表
+3. **配置集中**：所有配置在 `default_config.lua` 中定义，`core/config/merger.lua` 的 `process_config()` 一步完成验证→合并→清理→初始化日志
+4. **状态统一**：`core/config/state.lua` 集中管理共享状态，各模块通过 `state_manager.get_config()` 获取配置
 5. **前后端分离**：`core/ai/chat_service.lua` 作为统一后端入口，前端只调用 chat_service 的公开方法，不直接调用 ai_engine 或 history_manager
-6. **防抖持久化**：会话数据使用 `history/saver.lua` 的 300ms 防抖保存（事件驱动）
+6. **防抖持久化**：会话数据使用 `history/saver.lua` 的 300ms 防抖保存（事件驱动），按会话分组去重合并
 7. **单一数据源**：`core/history/manager.lua` 是唯一的会话数据源，旧版 `session_manager` 已删除
 8. **安全调用**：跨模块依赖使用 `pcall` 保护
-9. **延迟加载**：内置工具和工具注入 AI 引擎使用 `vim.schedule` 延迟执行，不阻塞主初始化流程
+9. **延迟加载**：内置工具和工具注入 AI 引擎使用 `vim.schedule` 延迟执行，不阻塞主初始化流程；内置工具加载完成后自动刷新 tool_pack 分组
 10. **退出安全**：`core/shutdown_flag.lua` 统一管理关闭标志，避免退出时死锁
 11. **职责拆分**：历史管理拆分为 manager/cache/persistence/saver 四个子模块，各司其职
+12. **多提供商架构**：AI 配置支持多提供商（deepseek/openai/anthropic/google 等），通过场景预设（scenarios）按用途分配不同模型
+13. **配置合并器**：`core/config/merger.lua` 承担配置处理职责，`default_config.lua` 仅定义默认值，职责分离
 
 ---
 
@@ -903,3 +1026,9 @@ vim.api.nvim_create_autocmd("User", {
 
 - 上下文消息**从根到选中会话**整条路径收集，而非仅选中会话本身
 - 新会话挂载点**沿子会话链向下**寻找链尾或分支点，而非在选中会话下直接创建
+
+
+
+---
+
+*Last updated: 2026-05-02*

@@ -99,6 +99,27 @@ function M.run_all()
     "test_tools_init",
     "test_ui_init",
     "test_main_init",
+    -- 新增测试
+    "test_core_init",
+    "test_config_init",
+    "test_config_merger",
+    "test_chat_service",
+    "test_response_retry",
+    "test_tool_orchestrator",
+    "test_history_cache",
+    "test_history_persistence",
+    "test_history_saver",
+    "test_tool_registry",
+    "test_tool_executor",
+    "test_tool_validator",
+    "test_tool_pack",
+    "test_utils_common",
+    "test_utils_logger",
+    "test_utils_json",
+    "test_utils_table_utils",
+    "test_utils_file_utils",
+    "test_async_worker",
+    "test_http_client",
   }
 
   local results = { passed = 0, failed = 0, errors = {} }

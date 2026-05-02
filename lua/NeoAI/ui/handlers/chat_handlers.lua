@@ -198,7 +198,14 @@ function M.send_message(content, session_id, branch_id, window_id, format, callb
   local target_session_id = session.id
   local current_session = hm.get_session(session.id)
   if current_session and current_session.user ~= nil and current_session.user ~= "" then
-    local new_id = hm.create_session("分支-" .. current_session.name, false, new_parent_id)
+    local auto_naming = require("NeoAI.core.config.state").get_config_value("session.auto_naming") ~= false
+    local branch_name
+    if auto_naming then
+      branch_name = "分支-" .. current_session.name
+    else
+      branch_name = ""
+    end
+    local new_id = hm.create_session(branch_name, false, new_parent_id)
     hm.set_current_session(new_id)
     target_session_id = new_id
   end
