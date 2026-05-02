@@ -439,11 +439,36 @@ function M._render_single_message(msg, prev_role)
   local lines = {}
   local role_prefix = msg.role == "user" and "👤 用户:" or "🤖 AI:"
   local raw_content = msg.content or ""
+  -- 防御性检查：确保 raw_content 是字符串（_session_to_messages 可能返回 table）
+  if type(raw_content) ~= "string" then
+    local ok, encoded = pcall(vim.json.encode, raw_content)
+    raw_content = ok and encoded or tostring(raw_content)
+  end
 
   -- 解码 %%XX URL 编码（由 http_client._encode_special_chars 编码的响应内容）
+  -- 注意：必须先尝试 JSON 解析，再对字段值分别解码，
+  -- 因为直接对整个 JSON 字符串解码可能破坏 JSON 结构（如 \x00 空字符）
   local http_client_ok, http_client = pcall(require, "NeoAI.core.ai.http_client")
   if http_client_ok and http_client._decode_special_chars then
-    raw_content = http_client._decode_special_chars(raw_content)
+    -- 先尝试 JSON 解析
+    local json_ok, parsed = pcall(vim.json.decode, raw_content)
+    if json_ok and type(parsed) == "table" then
+      -- 对 JSON 字段值分别解码
+      if parsed.reasoning_content and type(parsed.reasoning_content) == "string" then
+        parsed.reasoning_content = http_client._decode_special_chars(parsed.reasoning_content)
+      end
+      if parsed.content and type(parsed.content) == "string" then
+        parsed.content = http_client._decode_special_chars(parsed.content)
+      end
+      -- 重新编码为 JSON 字符串
+      local ok_re, re_encoded = pcall(vim.json.encode, parsed)
+      if ok_re then
+        raw_content = re_encoded
+      end
+    else
+      -- 不是 JSON，直接对整个字符串解码
+      raw_content = http_client._decode_special_chars(raw_content)
+    end
   end
 
   -- 每轮对话之间添加分割线（user 消息前，且不是第一条消息）
@@ -1996,6 +2021,12 @@ function M._setup_event_listeners()
       local gid = data.generation_id
       if not rc or rc == "" or completed_generations[gid] then
         return
+      end
+
+      -- 解码 %%XX URL 编码（由 http_client._encode_special_chars 编码的响应内容）
+      local http_client_ok, http_client = pcall(require, "NeoAI.core.ai.http_client")
+      if http_client_ok and http_client._decode_special_chars then
+        rc = http_client._decode_special_chars(rc)
       end
 
       -- 检查光标是否在末尾附近（决定是否显示悬浮窗）

@@ -679,6 +679,12 @@ function M._session_to_messages(session)
             content = parsed.content,
           })
         end
+      elseif parsed.reasoning_content and parsed.reasoning_content ~= "" then
+        -- 只有 reasoning_content 没有 content 字段
+        content = vim.json.encode({
+          reasoning_content = parsed.reasoning_content,
+          content = "",
+        })
       end
     end
     table.insert(msgs, { role = msg_type, content = content })

@@ -295,16 +295,9 @@ function M.create_window(window_type, options)
     vim.api.nvim_create_autocmd("BufLeave", {
       group = group, buffer = buf,
       callback = function()
-        -- 离开 chat 窗口时恢复之前窗口的 wrap 状态
-        if window_type == "chat" then
-          local saved = state.saved_wrap_states[window_id]
-          if saved ~= nil then
-            local ok_cur, cur_win = pcall(vim.api.nvim_get_current_win)
-            if ok_cur and cur_win and vim.api.nvim_win_is_valid(cur_win) then
-              vim.api.nvim_set_option_value("wrap", saved, { win = cur_win })
-            end
-          end
-        end
+        -- 注意：不在此处修改任何窗口的 wrap 选项。
+        -- 离开 chat 窗口时修改 chat 窗口的 wrap 会导致 chat 窗口自动换行失效。
+        -- chat 窗口的 wrap 由 BufEnter 回调统一保证。
 
         vim.defer_fn(function()
           -- 检查 Neovim 是否正在退出，避免在退出过程中操作窗口导致死循环
