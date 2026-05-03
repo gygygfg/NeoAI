@@ -18,6 +18,7 @@ local event_constants = require("NeoAI.core.events")
 local tool_pack = require("NeoAI.tools.tool_pack")
 local shutdown_flag = require("NeoAI.core.shutdown_flag")
 local response_retry = require("NeoAI.core.ai.response_retry")
+local state_manager = require("NeoAI.core.config.state")
 
 -- ========== 状态 ==========
 
@@ -394,21 +395,37 @@ function M.start_async_loop(params)
   local session_id = params.session_id
   local window_id = params.window_id
 
+  -- 从协程共享表读取数据（如果存在）
+  local shared = state_manager.get_shared()
+  if shared then
+    session_id = session_id or shared.session_id
+    window_id = window_id or shared.window_id
+  end
+
   if not state.sessions[session_id] then
     M.register_session(session_id, window_id)
   end
 
   local ss = state.sessions[session_id]
-  ss.generation_id = params.generation_id
+  ss.generation_id = params.generation_id or shared.generation_id
   ss.current_iteration = 0
   ss.stop_requested = false
-  ss.messages = params.messages or {}
-  ss.options = params.options or {}
-  ss.model_index = params.model_index or 1
-  ss.ai_preset = params.ai_preset or {}
+  ss.messages = params.messages or shared.messages or {}
+  ss.options = params.options or shared.options or {}
+  ss.model_index = params.model_index or shared.model_index or 1
+  ss.ai_preset = params.ai_preset or shared.ai_preset or {}
   ss.on_complete = params.on_complete
   ss.accumulated_usage = {}
   ss.last_reasoning = nil
+
+  -- 更新 shared 表
+  shared.session_id = session_id
+  shared.window_id = window_id
+  shared.generation_id = ss.generation_id
+  shared.messages = ss.messages
+  shared.options = ss.options
+  shared.model_index = ss.model_index
+  shared.ai_preset = ss.ai_preset
 
   ss.current_iteration = 1
   ss._tool_retry_count = 0 -- 新循环开始时重置重试计数
@@ -501,6 +518,12 @@ function M._execute_single_tool(session_id, tool_call)
   local ss = state.sessions[session_id]
   if not ss or not tool_call then
     return
+  end
+
+  -- 从 shared 表同步 stop_requested
+  local shared = state_manager.get_shared()
+  if shared.stop_requested then
+    ss.stop_requested = true
   end
 
   -- 如果已请求停止，跳过工具执行
@@ -661,9 +684,10 @@ function M._on_tools_complete(session_id)
     if ss.user_cancelled then
       if ss._skip_summary then
         -- 触发 GENERATION_COMPLETED 事件显示用量信息
+        local shared = state_manager.get_shared()
         local saved_usage = ss.accumulated_usage or {}
-        local saved_gen_id = ss.generation_id
-        local saved_win_id = ss.window_id
+        local saved_gen_id = ss.generation_id or shared.generation_id
+        local saved_win_id = ss.window_id or shared.window_id
         local saved_reasoning = ss.last_reasoning or ""
         fire_loop_finished(ss)
         once_display_closed(session_id, function()

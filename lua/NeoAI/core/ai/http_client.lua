@@ -251,13 +251,21 @@ function M.send_request(params)
     return nil, "HTTP client not initialized"
   end
 
+  -- 优先从协程共享表读取参数
+  local shared = nil
+  pcall(function()
+    local sm = require("NeoAI.core.config.state")
+    shared = sm.get_shared()
+  end)
+  local ai_preset = shared and shared.ai_preset or {}
+
   local request = params.request
-  local generation_id = params.generation_id
-  local base_url = params.base_url or state.config.base_url
-  local api_key = params.api_key or state.config.api_key
-  local timeout = params.timeout or state.config.timeout or 60000
-  local api_type = params.api_type or "openai"
-  local provider_config = params.provider_config or {}
+  local generation_id = params.generation_id or (shared and shared.generation_id)
+  local base_url = params.base_url or ai_preset.base_url or state.config.base_url
+  local api_key = params.api_key or ai_preset.api_key or state.config.api_key
+  local timeout = params.timeout or ai_preset.timeout or state.config.timeout or 60000
+  local api_type = params.api_type or ai_preset.api_type or "openai"
+  local provider_config = params.provider_config or ai_preset or {}
 
   -- 请求去重：检查同一 generation_id 的相同请求体是否已被发送
   if generation_id then
@@ -484,13 +492,21 @@ function M.send_stream_request(params, on_chunk, on_complete, on_error)
     return nil
   end
 
+  -- 优先从协程共享表读取参数
+  local shared = nil
+  pcall(function()
+    local sm = require("NeoAI.core.config.state")
+    shared = sm.get_shared()
+  end)
+  local ai_preset = shared and shared.ai_preset or {}
+
   local request = params.request
-  local generation_id = params.generation_id
-  local base_url = params.base_url or state.config.base_url
-  local api_key = params.api_key or state.config.api_key
-  local timeout = params.timeout or state.config.timeout or 60000
-  local api_type = params.api_type or "openai"
-  local provider_config = params.provider_config or {}
+  local generation_id = params.generation_id or (shared and shared.generation_id)
+  local base_url = params.base_url or ai_preset.base_url or state.config.base_url
+  local api_key = params.api_key or ai_preset.api_key or state.config.api_key
+  local timeout = params.timeout or ai_preset.timeout or state.config.timeout or 60000
+  local api_type = params.api_type or ai_preset.api_type or "openai"
+  local provider_config = params.provider_config or ai_preset or {}
 
   if not api_key or api_key == "" then
     return nil, "API key not configured"
@@ -864,13 +880,21 @@ function M.send_request_async(params, on_complete)
     return nil
   end
 
+  -- 优先从协程共享表读取参数
+  local shared = nil
+  pcall(function()
+    local sm = require("NeoAI.core.config.state")
+    shared = sm.get_shared()
+  end)
+  local ai_preset = shared and shared.ai_preset or {}
+
   local request = params.request
-  local generation_id = params.generation_id
-  local base_url = params.base_url or state.config.base_url
-  local api_key = params.api_key or state.config.api_key
-  local timeout = params.timeout or state.config.timeout or 60000
-  local api_type = params.api_type or "openai"
-  local provider_config = params.provider_config or {}
+  local generation_id = params.generation_id or (shared and shared.generation_id)
+  local base_url = params.base_url or ai_preset.base_url or state.config.base_url
+  local api_key = params.api_key or ai_preset.api_key or state.config.api_key
+  local timeout = params.timeout or ai_preset.timeout or state.config.timeout or 60000
+  local api_type = params.api_type or ai_preset.api_type or "openai"
+  local provider_config = params.provider_config or ai_preset or {}
 
   if not api_key or api_key == "" then
     if on_complete then

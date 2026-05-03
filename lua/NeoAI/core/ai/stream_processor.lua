@@ -134,13 +134,21 @@ function M.push_reasoning_content(generation_id, content, processor, params)
       _reasoning_throttle.timer = nil
 
       if content ~= "" then
+        -- 优先从协程共享表读取 session_id/window_id
+        local shared = nil
+        pcall(function()
+          local sm = require("NeoAI.core.config.state")
+          shared = sm.get_shared()
+        end)
+        local sid = shared and shared.session_id or (proc and proc.session_id)
+        local wid = shared and shared.window_id or (proc and proc.window_id)
         vim.api.nvim_exec_autocmds("User", {
           pattern = event_constants.REASONING_CONTENT,
           data = {
             generation_id = gid,
             reasoning_content = content,
-            session_id = proc and proc.session_id,
-            window_id = proc and proc.window_id,
+            session_id = sid,
+            window_id = wid,
           },
         })
       end

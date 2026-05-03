@@ -306,15 +306,21 @@ function M.close(force)
   if state.parent_win and vim.api.nvim_win_is_valid(state.parent_win) then
     pcall(vim.api.nvim_set_current_win, state.parent_win)
 
-    -- 将光标移到 chat 窗口 buffer 的最后一行末尾
-    local buf = vim.api.nvim_win_get_buf(state.parent_win)
-    if buf and vim.api.nvim_buf_is_valid(buf) then
-      local line_count = vim.api.nvim_buf_line_count(buf)
-      if line_count > 0 then
-        local last_line = vim.api.nvim_buf_get_lines(buf, line_count - 1, line_count, false)[1] or ""
-        pcall(vim.api.nvim_win_set_cursor, state.parent_win, { line_count, #last_line })
+    -- 触发光标跟随：将光标跳到内容最后并滚动到窗口最底部
+    -- 使用 vim.schedule 延迟执行，确保在 stopinsert 和窗口切换完成后
+    vim.schedule(function()
+      local chat_window = require("NeoAI.ui.window.chat_window")
+      if chat_window then
+        -- 先检测光标是否在末尾附近，缓存结果
+        if chat_window._check_cursor_near_end then
+          chat_window._check_cursor_near_end()
+        end
+        -- 执行光标跟随（使用已缓存的结果）
+        if chat_window._do_cursor_follow then
+          chat_window._do_cursor_follow()
+        end
       end
-    end
+    end)
   end
 
   -- 切换到 NORMAL 模式（在父窗口上下文中执行，确保正确退出）

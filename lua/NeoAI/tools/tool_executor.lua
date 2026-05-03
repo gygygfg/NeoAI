@@ -39,8 +39,15 @@ local function resolve_json_args(args)
   local result = {}
   for k, v in pairs(args) do
     if type(v) == "string" then
-      local ok, decoded = pcall(json.decode, v)
-      result[k] = ok and resolve_json_args(decoded) or v
+      -- 只对 JSON 对象/数组字符串（以 { 或 [ 开头）进行解码
+      -- 避免将普通字符串（如 "所有22个工具"）误解析为 number
+      local trimmed = v:match("^%s*(.-)%s*$") or v
+      if trimmed:sub(1,1) == "{" or trimmed:sub(1,1) == "[" then
+        local ok, decoded = pcall(json.decode, v)
+        result[k] = ok and resolve_json_args(decoded) or v
+      else
+        result[k] = v
+      end
     elseif type(v) == "table" then
       result[k] = resolve_json_args(v)
     else

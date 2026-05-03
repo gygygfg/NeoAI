@@ -269,11 +269,13 @@ end
 --- 获取当前协程的全局共享表
 --- 协程内任意模块可直接调用，无需先获取 context 对象
 --- 如果不在协程中或没有上下文，返回一个临时空表（不会持久化）
+--- 注意：此函数在 Neovim 事件回调（autocmd、jobstart on_stdout/on_exit、
+--- vim.schedule、vim.defer_fn 等）中也会被调用，这些场景不在协程上下文中。
+--- 调用方应通过函数参数传递必要数据，get_shared 仅作为备选降级方案。
 --- @return table 共享表，读写直接操作此表即可
 function M.get_shared()
   local ctx = M.get_current_context()
   if not ctx then
-    logger.warn("[state] 不在协程上下文中，get_shared 返回临时空表")
     return {}
   end
   return ctx._shared

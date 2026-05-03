@@ -228,9 +228,123 @@ local function close_tool_display()
   end
 end
 
+-- 光标是否应该跟随的缓存值
+-- 在 buffer 内容变化之前由 _check_cursor_near_end 设置，_do_cursor_follow 读取
+-- 避免在内容变化后 foldmethod=marker 改变了光标位置导致误判
+local _should_follow_cached = false
+
+--- 格式化 table 为多行字符串，强制每个元素换行显示
+--- 避免 vim.inspect 将短数组合并为一行
+--- @param t table
+--- @param indent string 缩进前缀
+--- @return string
+local function _format_table_for_fold(t, indent)
+  indent = indent or ""
+  if type(t) == "string" then
+    -- 如果字符串包含换行，使用多行格式
+    if t:find("\n") then
+      local lines = vim.split(t, "\n")
+      local parts = {}
+      for _, line in ipairs(lines) do
+        table.insert(parts, indent .. "  " .. line)
+      end
+      return table.concat(parts, "\n")
+    end
+    return string.format("%q", t)
+  end
+  if type(t) ~= "table" then
+    return tostring(t)
+  end
+
+  -- 估算 table 大小：如果元素超过 500 个，回退到单行 JSON 格式
+  -- 避免生成超大折叠文本导致性能问题和界面卡顿
+  local count = 0
+  for _ in pairs(t) do
+    count = count + 1
+    if count > 500 then
+      -- 超过 500 个元素，使用 JSON 编码单行显示
+      local ok, encoded = pcall(vim.json.encode, t)
+      if ok then
+        return encoded
+      end
+      break
+    end
+  end
+
+  -- 判断是数组还是字典
+  local is_array = true
+  local max_key = 0
+  for k, _ in pairs(t) do
+    if type(k) ~= "number" or k <= 0 or math.floor(k) ~= k then
+      is_array = false
+      break
+    end
+    if k > max_key then
+      max_key = k
+    end
+  end
+  if is_array and max_key == #t then
+    -- 数组：每个元素换行
+    local parts = { "{" }
+    for i, v in ipairs(t) do
+      local val_str = _format_table_for_fold(v, indent .. "  ")
+      table.insert(parts, indent .. "  " .. val_str .. ",")
+    end
+    table.insert(parts, indent .. "}")
+    return table.concat(parts, "\n")
+  else
+    -- 字典：每个键值对换行
+    local parts = { "{" }
+    -- 排序键
+    local keys = {}
+    for k, _ in pairs(t) do
+      table.insert(keys, k)
+    end
+    table.sort(keys, function(a, b)
+      if type(a) == type(b) then return tostring(a) < tostring(b) end
+      return type(a) < type(b)
+    end)
+    for _, k in ipairs(keys) do
+      local v = t[k]
+      local key_str = type(k) == "string" and k or "[" .. tostring(k) .. "]"
+      local val_str = _format_table_for_fold(v, indent .. "  ")
+      table.insert(parts, indent .. "  " .. key_str .. " = " .. val_str .. ",")
+    end
+    table.insert(parts, indent .. "}")
+    return table.concat(parts, "\n")
+  end
+end
+
+--- 在 buffer 内容变化之前检测光标是否在末尾附近（后5行内）
+--- 调用方必须在修改 buffer 内容之前调用此函数，将结果缓存到 _should_follow_cached
+--- 这样即使内容变化后 foldmethod=marker 改变了光标位置，也能正确判断是否应该跟随
+local function _check_cursor_near_end()
+  if not state.current_window_id then
+    _should_follow_cached = false
+    return false
+  end
+  local win = window_manager.get_window_win(state.current_window_id)
+  if not win or not vim.api.nvim_win_is_valid(win) then
+    _should_follow_cached = false
+    return false
+  end
+  local cursor = vim.api.nvim_win_get_cursor(win)
+  local buf = vim.api.nvim_win_get_buf(win)
+  local total = vim.api.nvim_buf_line_count(buf)
+  _should_follow_cached = total - cursor[1] <= 5
+  -- 同步更新协程变量
+  state_manager.set_state("chat_window", "cursor_follow_mode", _should_follow_cached)
+  return _should_follow_cached
+end
+
 --- 执行光标跟随：将光标跳转到缓冲区末尾并滚动到窗口最底部
 --- 先追加一个空行到末尾（空行不在任何 {{{...}}} 折叠区域内），再将光标设置到空行上
+--- 插入空行前临时提高 foldlevel，防止 foldmethod=marker 将光标吸到折叠开始行
+--- 使用 _should_follow_cached 判断是否应该跟随（在 buffer 内容变化前已缓存）
 local function _do_cursor_follow()
+  if not _should_follow_cached then
+    return
+  end
   if not state.current_window_id then
     return
   end
@@ -247,10 +361,19 @@ local function _do_cursor_follow()
   if last_line == "}}}" then
     -- 最后一行是折叠结束标记 }}}，在它之后追加一个空行并将光标设置在空行上
     -- 这样光标在折叠区域之后的可视位置，不会被 foldmethod=marker 吸到折叠开始行
+    -- 插入空行前临时提高 foldlevel，防止 foldmethod=marker 在插入后立即将光标吸到折叠开始行
+    local saved_foldlevel = vim.api.nvim_get_option_value("foldlevel", { win = win })
+    vim.api.nvim_set_option_value("foldlevel", 999, { win = win })
     set_buf_modifiable(buf, true)
     vim.api.nvim_buf_set_lines(buf, lc, lc, false, { "" })
     lc = vim.api.nvim_buf_line_count(buf)
     pcall(vim.api.nvim_win_set_cursor, win, { lc, 0 })
+    -- 恢复 foldlevel，使用 vim.schedule 延迟恢复，确保光标已稳定
+    vim.schedule(function()
+      if win and vim.api.nvim_win_is_valid(win) then
+        vim.api.nvim_set_option_value("foldlevel", saved_foldlevel, { win = win })
+      end
+    end)
   else
     -- 普通内容：直接设置光标到最后一行末尾
     pcall(vim.api.nvim_win_set_cursor, win, { lc, #last_line })
@@ -263,20 +386,14 @@ end
 --- 安排光标跟随
 --- @param delay_ms number|nil 延迟毫秒数，默认 0（使用 vim.schedule 下一个 tick 执行）
 --- 内容写入后立即调用（delay_ms=0），工具调用悬浮窗打开后传 150ms
+--- 注意：调用方必须在修改 buffer 内容之前调用 _check_cursor_near_end() 缓存光标状态
+--- 此函数不再重新检测光标位置，直接使用 _should_follow_cached 缓存值
 local function _schedule_cursor_follow(delay_ms)
   if not state.current_window_id then
     return
   end
-  -- 检查光标是否在末尾附近（后5行内），更新光标跟随模式
-  local win = window_manager.get_window_win(state.current_window_id)
-  if win and vim.api.nvim_win_is_valid(win) then
-    local cursor = vim.api.nvim_win_get_cursor(win)
-    local buf = vim.api.nvim_win_get_buf(win)
-    local total = vim.api.nvim_buf_line_count(buf)
-    state_manager.set_state("chat_window", "cursor_follow_mode", total - cursor[1] <= 5)
-  end
-  if not state_manager.get_state("chat_window", "cursor_follow_mode") then
-    -- 光标不在后5行内，不跟随
+  if not _should_follow_cached then
+    -- 光标不在后5行内（已在 buffer 内容变化前检测并缓存），不跟随
     return
   end
   delay_ms = delay_ms or 0
@@ -305,10 +422,9 @@ local function _schedule_cursor_follow(delay_ms)
       end)
     )
   else
-    -- 立即模式：使用 vim.schedule 下一个 tick 执行
-    vim.schedule(function()
-      _do_cursor_follow()
-    end)
+    -- 立即模式：直接执行，不再通过 vim.schedule 延迟
+    -- 因为 _should_follow_cached 已在 buffer 内容变化前缓存，无需等待下一个 tick
+    _do_cursor_follow()
   end
 end
 
@@ -812,16 +928,19 @@ function M._apply_rendered_content(content)
     return
   end
 
-  -- 检查光标是否在末尾附近
+  -- 在 buffer 内容变化之前检测光标是否在末尾附近（后5行内）
+  -- 注意：必须在 set_window_content 之前检测，因为 foldmethod=marker 在内容变化后
+  -- 会改变光标的实际位置，导致变化后检测误判光标不在末尾
   local near_end = false
   local win_handle = window_manager.get_window_win(state.current_window_id)
   if win_handle and vim.api.nvim_win_is_valid(win_handle) then
     local cursor = vim.api.nvim_win_get_cursor(win_handle)
     local buf = vim.api.nvim_win_get_buf(win_handle)
     local total_lines = vim.api.nvim_buf_line_count(buf)
-    if total_lines - cursor[1] <= 5 then
-      near_end = true
-    end
+    near_end = total_lines - cursor[1] <= 5
+    -- 同步更新协程变量和模块局部缓存
+    _should_follow_cached = near_end
+    state_manager.set_state("chat_window", "cursor_follow_mode", near_end)
   end
 
   -- 设置窗口内容
@@ -840,7 +959,7 @@ function M._apply_rendered_content(content)
     M._focus_window()
   end
 
-  -- 使用防抖光标跟随
+  -- 使用防抖光标跟随（使用之前保存的 near_end 值，而不是重新检测）
   if near_end then
     _schedule_cursor_follow()
     if not state.streaming.active and not state.generation_in_progress then
@@ -2434,7 +2553,10 @@ function M._setup_event_listeners()
       rebuild_tool_display_buffer()
       -- 仅在光标在后5行内时才显示工具调用悬浮窗
       local win = get_win()
-      if cursor_near_end(win) then
+      local near_end = cursor_near_end(win)
+      -- 同步更新 _should_follow_cached 缓存变量
+      _should_follow_cached = near_end
+      if near_end then
         M._show_tool_display()
         -- 创建浮动窗口可能触发 WinNew/BufEnter 等自动命令，间接影响 chat 窗口的滚动位置
         -- 使用防抖光标跟随，延迟 150ms 后执行（创建浮动窗口的影响需要更长时间稳定）
@@ -2645,12 +2767,25 @@ function M._setup_event_listeners()
             local pack_name = tool_pack.get_pack_display_name(pn)
             for _, r in ipairs(pack_tools) do
               local duration_str = r.duration and string.format(" (%.1fs)", r.duration) or ""
-              local args_str = vim.inspect(r.arguments or {})
+              -- 格式化参数：使用 _format_table_for_fold 强制每个元素换行
+              local args_str = _format_table_for_fold(r.arguments or {})
               -- 转义内容中的 {{{ 和 }}}，避免干扰 foldmethod=marker
               args_str = args_str:gsub("}}}", "} } }"):gsub("{{{", "{ { {")
-              local result_str = type(r.result) == "table"
-                  and (pcall(vim.json.encode, r.result) and vim.json.encode(r.result) or vim.inspect(r.result))
-                or tostring(r.result or "")
+              -- 对参数做换行缩进处理
+              args_str = args_str:gsub("\n", "\n    ")
+              -- 格式化结果：使用 _format_table_for_fold 强制每个元素换行
+              -- 如果结果是 JSON 字符串，解码后格式化
+              local result_str
+              if type(r.result) == "table" then
+                result_str = _format_table_for_fold(r.result)
+              else
+                result_str = tostring(r.result or "")
+                -- 尝试 JSON 解码，成功则格式化显示
+                local json_ok, json_val = pcall(vim.json.decode, result_str)
+                if json_ok and type(json_val) == "table" then
+                  result_str = _format_table_for_fold(json_val)
+                end
+              end
               -- 清理 JSON 编码后的 \r 字符，将 \r 渲染为换行
               result_str = result_str:gsub("\\r\\n", "\n"):gsub("\\r", "\n")
               local icon = r.is_error and "❌" or "✅"
@@ -2764,6 +2899,10 @@ function M._setup_event_listeners()
           local dynamic_height = math.max(5, math.min(#lines + 2, max_tool_height))
           local config = vim.api.nvim_win_get_config(window_info.win)
           config.height = dynamic_height
+          -- 更新宽度为窗口的 80%，左右居中
+          local total_cols = vim.o.columns
+          config.width = math.floor(total_cols * 0.8)
+          config.col = math.floor((total_cols - config.width) / 2)
           local tool_row = 1
           local ok, rd = pcall(require, "NeoAI.ui.components.reasoning_display")
           if ok and rd.is_visible() then
@@ -2869,6 +3008,9 @@ function M._append_message_to_buffer(role, content)
     return
   end
 
+  -- 在修改 buffer 内容之前缓存光标位置
+  _check_cursor_near_end()
+
   pcall(vim.api.nvim_set_option_value, "modifiable", true, { buf = buf })
   pcall(vim.api.nvim_set_option_value, "readonly", false, { buf = buf })
 
@@ -2890,8 +3032,7 @@ function M._append_message_to_buffer(role, content)
 
   pcall(vim.api.nvim_set_option_value, "modified", false, { buf = buf })
 
-  -- 使用防抖光标跟随，延迟 150ms 后执行
-  -- 避免在折叠文本插入后立即移动光标被 foldmethod=marker 吸到折叠开始行
+  -- 执行光标跟随（使用已缓存的 _should_follow_cached 值）
   _schedule_cursor_follow()
 end
 
@@ -2942,13 +3083,15 @@ function M._append_reasoning_folded_to_buffer(reasoning_text)
   end
   table.insert(output_lines, "") -- 空行分隔
 
+  -- 在修改 buffer 内容之前缓存光标位置
+  _check_cursor_near_end()
+
   -- 追加到缓冲区末尾
   vim.api.nvim_buf_set_lines(buf, line_count, line_count, false, output_lines)
 
   pcall(vim.api.nvim_set_option_value, "modified", false, { buf = buf })
 
-  -- 使用防抖光标跟随，延迟 150ms 后执行
-  -- 避免在折叠文本插入后立即移动光标被 foldmethod=marker 吸到折叠开始行
+  -- 执行光标跟随（使用已缓存的 _should_follow_cached 值）
   _schedule_cursor_follow()
 end
 
@@ -2961,6 +3104,8 @@ function M._append_newline_to_buffer()
   if not buf or not vim.api.nvim_buf_is_valid(buf) then
     return
   end
+  -- 在修改 buffer 内容之前缓存光标位置
+  _check_cursor_near_end()
   pcall(vim.api.nvim_set_option_value, "modifiable", true, { buf = buf })
   pcall(vim.api.nvim_set_option_value, "readonly", false, { buf = buf })
   local line_count = vim.api.nvim_buf_line_count(buf)
@@ -2976,6 +3121,9 @@ function M._append_stream_chunk_to_buffer(chunk_content, content_type)
   if not state.current_window_id then
     return
   end
+
+  -- 在修改 buffer 内容之前缓存光标位置
+  _check_cursor_near_end()
 
   -- 解码 %%XX URL 编码（由 http_client._encode_special_chars 编码的响应内容）
   local http_client_ok, http_client = pcall(require, "NeoAI.core.ai.http_client")
@@ -3179,20 +3327,11 @@ function M._show_tool_display()
     end
   end
 
-  -- 计算工具调用窗口宽度：基于配置，留出右侧伪终端窗口的空间
+  -- 计算工具调用窗口宽度：窗口宽度的 80%，左右居中
   local total_cols = vim.o.columns
-  -- 默认工具调用窗口占左侧 40%，最多 60 列
-  local tool_width = math.min(math.floor(total_cols * 0.4), 60)
-  local config_width = state_manager.get_config_value("ui.window.width")
-  if config_width then
-    tool_width = math.min(config_width, math.floor(total_cols * 0.5))
-  end
-  -- 确保右侧伪终端窗口至少有 40 列
-  local min_pty_width = 40
-  if tool_width + min_pty_width + 2 > total_cols then
-    tool_width = total_cols - min_pty_width - 2
-  end
+  local tool_width = math.floor(total_cols * 0.8)
   tool_width = math.max(30, tool_width) -- 工具调用窗口最小 30 列
+  local tool_col = math.floor((total_cols - tool_width) / 2) -- 左右居中
 
   -- 使用 window_manager 创建浮动窗口
   -- 自定义边框：右上角用 ┬、右下角用 ┴（与右侧伪终端窗口拼接）
@@ -3214,7 +3353,7 @@ function M._show_tool_display()
     style = "minimal",
     relative = "editor",
     row = tool_row,
-    col = 1,
+    col = tool_col,
     zindex = 100,
     window_mode = "float",
   })
@@ -3291,13 +3430,17 @@ function M._update_tool_display()
   vim.api.nvim_set_option_value("readonly", true, { buf = buf })
   vim.api.nvim_set_option_value("modifiable", false, { buf = buf })
 
-  -- 动态调整窗口高度
+  -- 动态调整窗口高度和宽度
   local win = window_info.win
   if win and vim.api.nvim_win_is_valid(win) then
     local max_tool_height = math.max(5, math.floor(vim.o.lines / 2))
     local dynamic_height = math.max(5, math.min(#lines + 2, max_tool_height))
     local config = vim.api.nvim_win_get_config(win)
     config.height = dynamic_height
+    -- 更新宽度为窗口的 80%，左右居中
+    local total_cols = vim.o.columns
+    config.width = math.floor(total_cols * 0.8)
+    config.col = math.floor((total_cols - config.width) / 2)
     -- 重新计算 row：在 reasoning 窗口下方堆叠
     local tool_row = 1
     local ok, rd = pcall(require, "NeoAI.ui.components.reasoning_display")
@@ -3388,22 +3531,24 @@ function M._build_tool_folded_text(results)
     local pack_name = tool_pack.get_pack_display_name(pn)
     for _, r in ipairs(pack_tools) do
       local duration_str = r.duration and string.format(" (%.1fs)", r.duration) or ""
-      -- 将参数格式化为单行（压缩换行和缩进为空格）
-      local args_str = vim.inspect(r.arguments or {})
-      args_str = args_str:gsub("\n[ \t]*", " ")
+      -- 格式化参数：使用 _format_table_for_fold 强制每个元素换行
+      local args_str = _format_table_for_fold(r.arguments or {})
       -- 转义内容中的 {{{ 和 }}}，避免干扰 foldmethod=marker
       args_str = args_str:gsub("}}}", "} } }"):gsub("{{{", "{ { {")
+      -- 对参数也做换行缩进处理，与结果保持一致
+      args_str = args_str:gsub("\n", "\n    ")
       local result_raw = r.result
       local result_str = ""
       if type(result_raw) == "table" then
-        local ok, encoded = pcall(vim.json.encode, result_raw)
-        if ok then
-          result_str = encoded
-        else
-          result_str = vim.inspect(result_raw)
-        end
+        -- table 类型使用 _format_table_for_fold 强制每个元素换行
+        result_str = _format_table_for_fold(result_raw)
       else
         result_str = tostring(result_raw or "")
+        -- 尝试 JSON 解码，成功则格式化显示
+        local json_ok, json_val = pcall(vim.json.decode, result_str)
+        if json_ok and type(json_val) == "table" then
+          result_str = _format_table_for_fold(json_val)
+        end
       end
       -- 清理 JSON 编码后的 \r 字符，将 \r 渲染为换行
       result_str = result_str:gsub("\\r\\n", "\n"):gsub("\\r", "\n")
@@ -3665,6 +3810,17 @@ function M.get_streaming_content()
     reasoning_buffer = state.streaming.reasoning_buffer or "",
     content_buffer = state.streaming.content_buffer or "",
   }
+end
+
+-- 暴露内部函数供其他模块使用
+M._schedule_cursor_follow = _schedule_cursor_follow
+M._do_cursor_follow = _do_cursor_follow
+M._check_cursor_near_end = _check_cursor_near_end
+
+--- 设置光标跟随缓存变量（供 virtual_input 等外部模块调用）
+--- @param should boolean 是否应该跟随
+function M._set_cursor_follow_should(should)
+  _should_follow_cached = should
 end
 
 return M
