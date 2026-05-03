@@ -112,17 +112,6 @@ function M.run(test_module)
       assert.is_false(abnormal2, "最终轮次正常内容不应视为异常")
     end,
 
-    --- 测试 detect_abnormal_response - stop_tool_loop
-    test_detect_stop_tool = function()
-      local rr = require("NeoAI.core.ai.response_retry")
-
-      local tool_calls = {
-        { ["function"] = { name = "stop_tool_loop", arguments = "{}" } },
-      }
-      local abnormal, reason = rr.detect_abnormal_response("", tool_calls, { is_tool_loop = true })
-      assert.is_false(abnormal, "包含 stop_tool_loop 不应视为异常")
-    end,
-
     --- 测试 get_retry_delay
     test_get_retry_delay = function()
       local rr = require("NeoAI.core.ai.response_retry")

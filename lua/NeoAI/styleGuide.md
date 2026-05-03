@@ -67,7 +67,6 @@ NeoAI/
 │       ├── neovim_lsp.lua      # LSP 工具
 │       ├── neovim_tree.lua     # 文件树工具
 │       ├── shell_tools.lua     # Shell 命令执行工具（伪终端+PID监控）
-│       ├── stop_tool.lua       # 停止工具循环
 │       └── tool_helpers.lua    # 工具定义辅助模块（define_tool）
 │
 ├── utils/                      # 工具库

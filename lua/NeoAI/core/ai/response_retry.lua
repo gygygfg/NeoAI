@@ -276,38 +276,22 @@ function M.detect_abnormal_response(content, tool_calls, opts)
     return false, nil
   end
 
-  -- 工具循环模式：AI 必须通过 stop_tool_loop 工具来结束对话
+  -- 工具循环模式：AI 本轮不调用工具就算自动停止循环
+  -- 有内容但无工具调用：视为 AI 自动退出，不再重试
+  -- AI 可能认为任务已完成，直接返回文本回复
   if opts.is_tool_loop then
-    -- 检查是否包含 stop_tool_loop 工具调用（正常结束对话的标志）
-    local has_stop_tool = false
-    if tool_calls and #tool_calls > 0 then
-      for _, tc in ipairs(tool_calls) do
-        local func = tc["function"] or tc.func
-        if func and func.name == "stop_tool_loop" then
-          has_stop_tool = true
-          break
-        end
-      end
-    end
-
-    -- 包含 stop_tool_loop：正常结束对话，不重试
-    if has_stop_tool then
-      return false, nil
-    end
-
     -- 空内容且无工具调用：模型可能卡住，需要重试
     if (not content or content == "") and (not tool_calls or #tool_calls == 0) then
       return true, "空响应：AI 未返回任何内容或工具调用"
     end
 
     -- 有内容但无工具调用：视为 AI 自动退出，不再重试
-    -- AI 可能认为任务已完成，直接返回文本回复
+    -- AI 认为任务已完成，直接返回文本回复，停止循环
     if content and content ~= "" and (not tool_calls or #tool_calls == 0) then
       return false, nil
     end
 
-    -- 有工具调用但不包含 stop_tool_loop：正常继续循环
-    -- 但需检测工具调用本身是否异常
+    -- 有工具调用：正常继续循环，但需检测工具调用本身是否异常
     if tool_calls and #tool_calls > 0 then
       if has_abnormal_tool_calls(tool_calls) then
         return true, "工具调用异常：检测到重复或空参数的工具调用"

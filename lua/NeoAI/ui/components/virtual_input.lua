@@ -172,7 +172,7 @@ function M.open(parent_win, opts)
   M._setup_vimresized_autocmd()
 
   -- 创建浮动窗口
-  state.float_win = vim.api.nvim_open_win(state.float_buf, true, {
+  state.float_win = vim.api.nvim_open_win(state.float_buf, opts.auto_focus ~= false, {
     relative = "editor",
     width = input_width,
     height = input_height,
@@ -249,15 +249,24 @@ function M.open(parent_win, opts)
 
   -- 延迟聚焦到输入框，确保在 _do_render_chat 的异步回调（set_window_content、_focus_window 等）执行完后才设置焦点
   -- 避免被 _do_render_chat 中的操作抢走焦点
-  vim.defer_fn(function()
-    if state.float_win and vim.api.nvim_win_is_valid(state.float_win) then
-      pcall(function()
-        vim.api.nvim_set_current_win(state.float_win)
-        vim.api.nvim_win_set_cursor(state.float_win, { 1, 2 })
-        vim.cmd("startinsert!")
-      end)
-    end
-  end, 10)
+  if opts.auto_focus ~= false then
+    vim.defer_fn(function()
+      if state.float_win and vim.api.nvim_win_is_valid(state.float_win) then
+        pcall(function()
+          vim.api.nvim_set_current_win(state.float_win)
+          vim.api.nvim_win_set_cursor(state.float_win, { 1, 2 })
+          vim.cmd("startinsert!")
+        end)
+      end
+    end, 10)
+  else
+    -- auto_focus=false：确保焦点在父窗口，不进入 insert 模式
+    vim.defer_fn(function()
+      if state.parent_win and vim.api.nvim_win_is_valid(state.parent_win) then
+        pcall(vim.api.nvim_set_current_win, state.parent_win)
+      end
+    end, 10)
+  end
 
   state.active = true
   return true

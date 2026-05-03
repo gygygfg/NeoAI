@@ -231,7 +231,7 @@ end
 -- 光标是否应该跟随的缓存值
 -- 在 buffer 内容变化之前由 _check_cursor_near_end 设置，_do_cursor_follow 读取
 -- 避免在内容变化后 foldmethod=marker 改变了光标位置导致误判
-local _should_follow_cached = false
+local _should_follow_cached = true
 
 --- 格式化 table 为多行字符串，强制每个元素换行显示
 --- 避免 vim.inspect 将短数组合并为一行
@@ -313,6 +313,30 @@ local function _format_table_for_fold(t, indent)
     table.insert(parts, indent .. "}")
     return table.concat(parts, "\n")
   end
+end
+
+--- 截断过长的内容，限制在 200 行以内
+--- 如果超过 200 行，只保留前 200 行并添加截断提示
+--- 用于折叠文本中的结果渲染，避免超大折叠文本导致界面卡顿
+--- @param content string 原始内容
+--- @param max_lines number|nil 最大行数，默认 200
+--- @return string 截断后的内容
+local function _truncate_content_for_fold(content, max_lines)
+  max_lines = max_lines or 200
+  if not content or content == "" then
+    return content or ""
+  end
+  local lines = vim.split(content, "\n")
+  if #lines <= max_lines then
+    return content
+  end
+  local truncated = {}
+  for i = 1, max_lines do
+    table.insert(truncated, lines[i])
+  end
+  local remaining = #lines - max_lines
+  table.insert(truncated, string.format("... [已截断，剩余 %d 行未显示]", remaining))
+  return table.concat(truncated, "\n")
 end
 
 --- 在 buffer 内容变化之前检测光标是否在末尾附近（后5行内）
@@ -1215,6 +1239,7 @@ function M._open_float_input()
   -- 打开浮动虚拟输入框
   virtual_input.open(win_handle, {
     placeholder = "输入消息...",
+    auto_focus = _should_follow_cached,
     on_submit = function(content)
       if content and content ~= "" then
         local chat_handlers_loaded, chat_handlers = pcall(require, "NeoAI.ui.handlers.chat_handlers")
@@ -2129,21 +2154,18 @@ function M._setup_event_listeners()
       end
 
       M._update_usage_virt_text()
-      -- 根据光标位置决定是否滚动到末尾和打开输入框
-      local gen_win = get_win()
-      if gen_win and vim.api.nvim_win_is_valid(gen_win) then
-        local gen_cursor = vim.api.nvim_win_get_cursor(gen_win)
-        local gen_buf = vim.api.nvim_win_get_buf(gen_win)
-        local gen_total = vim.api.nvim_buf_line_count(gen_buf)
-        if gen_total - gen_cursor[1] <= 5 then
-          -- 光标在后5行内：滚动到末尾并打开输入框
-          M._scroll_to_end_with_offset()
-          M._open_float_input()
-          if virtual_input.is_active() then
-            virtual_input.focus_and_insert()
-          end
+      -- 先主动检测光标位置，确保 _should_follow_cached 是最新值
+      _check_cursor_near_end()
+      if _should_follow_cached then
+        -- 光标在末尾附近：执行跟随并打开输入框
+        _do_cursor_follow()
+        M._open_float_input()
+        if virtual_input.is_active() then
+          virtual_input.focus_and_insert()
         end
-        -- 光标不在后5行内：不滚动，不打开输入框
+      else
+        -- 光标不在末尾附近：打开输入框但不聚焦
+        M._open_float_input()
       end
     end,
   })
@@ -2172,21 +2194,18 @@ function M._setup_event_listeners()
       state.generation_in_progress = false
 
       M._update_usage_virt_text()
-      -- 根据光标位置决定是否滚动到末尾和打开输入框
-      local sum_win = get_win()
-      if sum_win and vim.api.nvim_win_is_valid(sum_win) then
-        local sum_cursor = vim.api.nvim_win_get_cursor(sum_win)
-        local sum_buf = vim.api.nvim_win_get_buf(sum_win)
-        local sum_total = vim.api.nvim_buf_line_count(sum_buf)
-        if sum_total - sum_cursor[1] <= 5 then
-          -- 光标在后5行内：滚动到末尾并打开输入框
-          M._scroll_to_end_with_offset()
-          M._open_float_input()
-          if virtual_input.is_active() then
-            virtual_input.focus_and_insert()
-          end
+      -- 先主动检测光标位置，确保 _should_follow_cached 是最新值
+      _check_cursor_near_end()
+      if _should_follow_cached then
+        -- 光标在末尾附近：执行跟随并打开输入框
+        _do_cursor_follow()
+        M._open_float_input()
+        if virtual_input.is_active() then
+          virtual_input.focus_and_insert()
         end
-        -- 光标不在后5行内：不滚动，不打开输入框
+      else
+        -- 光标不在末尾附近：打开输入框但不聚焦
+        M._open_float_input()
       end
     end,
   })
@@ -2788,6 +2807,8 @@ function M._setup_event_listeners()
               end
               -- 清理 JSON 编码后的 \r 字符，将 \r 渲染为换行
               result_str = result_str:gsub("\\r\\n", "\n"):gsub("\\r", "\n")
+              -- 截断超过 200 行的结果内容，避免超大折叠文本导致界面卡顿
+              result_str = _truncate_content_for_fold(result_str, 200)
               local icon = r.is_error and "❌" or "✅"
               -- 转义内容中的 {{{ 和 }}}，避免干扰 foldmethod=marker
               result_str = result_str:gsub("}}}", "} } }"):gsub("{{{", "{ { {")
@@ -2832,6 +2853,15 @@ function M._setup_event_listeners()
         generation_id = data.generation_id,
       })
       state.tool_loop_in_progress = false
+
+      -- 工具循环结束后，始终打开虚拟输入框
+      -- 注意：如果后续还有 GENERATION_COMPLETED 或 SUMMARY_COMPLETED 事件，
+      -- 这些事件的处理函数中也会尝试打开输入框，但 _open_float_input 内部有 is_active 检查，不会重复打开
+      M._open_float_input()
+      -- 仅在光标跟随模式开启（光标在末尾附近）时才聚焦输入框
+      if virtual_input.is_active() and _should_follow_cached then
+        virtual_input.focus_and_insert()
+      end
     end,
   })
 
@@ -3552,6 +3582,8 @@ function M._build_tool_folded_text(results)
       end
       -- 清理 JSON 编码后的 \r 字符，将 \r 渲染为换行
       result_str = result_str:gsub("\\r\\n", "\n"):gsub("\\r", "\n")
+      -- 截断超过 200 行的结果内容，避免超大折叠文本导致界面卡顿
+      result_str = _truncate_content_for_fold(result_str, 200)
       -- 检查结果中是否包含警告
       local has_warning = false
       for line in result_str:gmatch("[^\n]+") do

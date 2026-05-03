@@ -322,41 +322,6 @@ function M.register_session(session_id, window_id)
     })
   )
 
-  -- TOOL_LOOP_STOP_REQUESTED 监听器
-  table.insert(
-    ids,
-    vim.api.nvim_create_autocmd("User", {
-      pattern = event_constants.TOOL_LOOP_STOP_REQUESTED,
-      callback = function(args)
-        local data = args.data or {}
-        local target = data.session_id or session_id
-        if target ~= session_id then
-          return
-        end
-        local s = state.sessions[session_id]
-        if not s then
-          return
-        end
-
-        s.stop_requested = true
-
-        -- 处理 generate_summary 标记：当为 false 时，标记为用户取消，跳过总结轮次
-        if data.generate_summary == false then
-          s.user_cancelled = true
-          s._skip_summary = true
-        else
-          s._skip_summary = false
-        end
-
-        -- 注意：不在此处主动触发总结轮次。
-        -- stop_tool_loop 工具本身是一个工具调用，它的结果需要先显示在 UI 中。
-        -- 总结轮次由 _on_tools_complete 的 stop_requested 分支在工具结果
-        -- 显示完成后（once_display_closed）触发，确保 stop_tool_loop 的结果
-        -- 先展示给用户，然后 AI 再生成总结。
-      end,
-    })
-  )
-
   ss.autocmd_ids = ids
   state.sessions[session_id] = ss
 end
@@ -925,7 +890,7 @@ function M._request_summary_round(session_id)
     if is_shutting_down() then
       return
     end
-    -- 注意：不检查 stop_requested。总结轮次是由 stop_tool 或循环结束触发的最终行为，
+    -- 注意：不检查 stop_requested。总结轮次是由循环结束触发的最终行为，
     -- 即使 stop_requested 为 true 也应执行总结，否则 AI 不会生成最终回复。
     -- 临时清除 stop_requested 标志，避免 ai_engine.handle_tool_result 跳过总结轮次的 AI 请求
     local saved_stop_requested = s.stop_requested
@@ -1412,10 +1377,7 @@ function M.request_stop(session_id)
           M._on_tools_complete(session_id)
         end)
       end
-      vim.api.nvim_exec_autocmds("User", {
-        pattern = event_constants.TOOL_LOOP_STOP_REQUESTED,
-        data = { session_id = session_id },
-      })
+
     end
   else
     for sid, _ in pairs(state.sessions) do

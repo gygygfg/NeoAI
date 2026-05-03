@@ -292,10 +292,8 @@ function M.cancel_generation()
   local current_session = history_manager.get_current_session()
   local session_id = current_session and current_session.id or nil
 
-  -- 不调用 tool_orc.request_stop()，因为它会触发 TOOL_LOOP_STOP_REQUESTED 事件
-  -- 导致 tool_orchestrator 进入总结轮次
-  -- 用户取消生成时不应该触发总结，直接取消 HTTP 请求并设置停止标志即可
-  -- ai_engine.cancel_generation() 内部会直接设置 stop_requested 并取消 HTTP 请求
+  -- 直接取消 HTTP 请求并设置停止标志，不触发总结轮次
+  -- ai_engine.cancel_generation() 内部会设置 stop_requested 并取消 HTTP 请求
   ai_engine.cancel_generation()
 
   -- 最后触发取消事件，让 UI 监听器更新界面状态

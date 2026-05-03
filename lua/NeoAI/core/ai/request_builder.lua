@@ -276,14 +276,6 @@ function M.build_request(params)
       local model_lower = (options.model or ""):lower()
       if not model_lower:find("reasoner") then
         local tools_to_use = defs
-        if is_first then
-          tools_to_use = {}
-          for _, td in ipairs(defs) do
-            if td["function"] and td["function"].name ~= "stop_tool_loop" then
-              table.insert(tools_to_use, td)
-            end
-          end
-        end
         if reasoning_enabled then
           local strict_tools = {}
           for _, td in ipairs(tools_to_use) do

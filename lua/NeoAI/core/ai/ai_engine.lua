@@ -353,11 +353,6 @@ function _handle_stream_end(generation_id, processor, params)
         end, delay)
         return
       else
-        if is_tool_loop and reason and reason:find("缺少 stop_tool_loop") then
-          state.is_generating = false; state.current_generation_id = nil; state.active_generations[generation_id] = nil
-          tool_orchestrator.on_generation_complete({ generation_id = generation_id, tool_calls = {}, content = full_response, reasoning = reasoning_text, usage = usage, session_id = sid, is_final_round = true })
-          return
-        end
         if is_final_round then M.handle_generation_error(generation_id, "总结轮次重试耗尽: " .. tostring(reason)); return end
         if reason and reason:find("空响应") then M.handle_generation_error(generation_id, "AI 多次返回空响应: " .. tostring(reason)); return end
       end
