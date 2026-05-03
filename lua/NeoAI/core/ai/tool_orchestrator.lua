@@ -374,7 +374,9 @@ end
 -- ========== 循环调度 ==========
 
 -- 全局 ESC 停止监听器 ID（在循环开始时注册，结束时清理）
+-- 使用 local 声明，确保在闭包内私有
 local _stop_listener_id = nil
+
 
 function M.start_async_loop(params)
   if not params then

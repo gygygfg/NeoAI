@@ -1,5 +1,8 @@
 local M = {}
 
+-- LuaJIT/Lua 5.1 兼容：table.unpack 可能不存在
+local unpack_fn = table.unpack or unpack
+
 -- 表操作函数委托给 table_utils.lua
 local function get_table_utils()
   local ok, tu = pcall(require, "NeoAI.utils.table_utils")
@@ -90,7 +93,7 @@ function M.debounce(func, delay)
     end
 
     timer = vim.defer_fn(function()
-      func(table.unpack(args))
+      func(unpack_fn(args))
     end, delay)
   end
 end
@@ -111,7 +114,7 @@ function M.throttle(func, limit)
 
     if now - last_call >= limit then
       last_call = now
-      return func(table.unpack(args))
+      return func(unpack_fn(args))
     else
       -- 如果已经有定时器，取消它
       if timer then
@@ -121,7 +124,7 @@ function M.throttle(func, limit)
       -- 设置新的定时器
       timer = vim.defer_fn(function()
         last_call = vim.loop.now()
-        func(table.unpack(args))
+        func(unpack_fn(args))
       end, limit - (now - last_call))
     end
   end
@@ -260,7 +263,9 @@ function M.measure_time(func, ...)
   local duration_ms = (end_time - start_time) / 1000000
 
   if result[1] then
-    return table.unpack(result, 2), duration_ms
+    -- LuaJIT/Lua 5.1 兼容：table.unpack 可能不存在
+    local unpack_fn = table.unpack or unpack
+    return unpack_fn(result, 2), duration_ms
   else
     error(result[2])
   end

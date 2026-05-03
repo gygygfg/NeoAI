@@ -147,6 +147,13 @@ local state = {
     pending = false,
     interval_ms = 50, -- 每50ms批量处理一次
   },
+
+  -- 光标跟随防抖状态
+  -- 在 buffer 内容变化或工具调用悬浮窗打开时设置 pending，延迟后执行光标跳转
+  cursor_follow = {
+    pending = false,
+    timer = nil,
+  },
 }
 
 -- ========== 依赖 state 的辅助函数 ==========
@@ -221,6 +228,90 @@ local function close_tool_display()
   end
 end
 
+--- 执行光标跟随：将光标跳转到缓冲区末尾并滚动到窗口最底部
+--- 先追加一个空行到末尾（空行不在任何 {{{...}}} 折叠区域内），再将光标设置到空行上
+local function _do_cursor_follow()
+  if not state.current_window_id then
+    return
+  end
+  local win = window_manager.get_window_win(state.current_window_id)
+  if not win or not vim.api.nvim_win_is_valid(win) then
+    return
+  end
+  local buf = vim.api.nvim_win_get_buf(win)
+  if not buf or not vim.api.nvim_buf_is_valid(buf) then
+    return
+  end
+  local lc = vim.api.nvim_buf_line_count(buf)
+  local last_line = vim.api.nvim_buf_get_lines(buf, lc - 1, lc, false)[1] or ""
+  if last_line == "}}}" then
+    -- 最后一行是折叠结束标记 }}}，在它之后追加一个空行并将光标设置在空行上
+    -- 这样光标在折叠区域之后的可视位置，不会被 foldmethod=marker 吸到折叠开始行
+    set_buf_modifiable(buf, true)
+    vim.api.nvim_buf_set_lines(buf, lc, lc, false, { "" })
+    lc = vim.api.nvim_buf_line_count(buf)
+    pcall(vim.api.nvim_win_set_cursor, win, { lc, 0 })
+  else
+    -- 普通内容：直接设置光标到最后一行末尾
+    pcall(vim.api.nvim_win_set_cursor, win, { lc, #last_line })
+  end
+  pcall(vim.api.nvim_win_call, win, function()
+    vim.cmd("normal! zb")
+  end)
+end
+
+--- 安排光标跟随
+--- @param delay_ms number|nil 延迟毫秒数，默认 0（使用 vim.schedule 下一个 tick 执行）
+--- 内容写入后立即调用（delay_ms=0），工具调用悬浮窗打开后传 150ms
+local function _schedule_cursor_follow(delay_ms)
+  if not state.current_window_id then
+    return
+  end
+  -- 检查光标是否在末尾附近（后5行内），更新光标跟随模式
+  local win = window_manager.get_window_win(state.current_window_id)
+  if win and vim.api.nvim_win_is_valid(win) then
+    local cursor = vim.api.nvim_win_get_cursor(win)
+    local buf = vim.api.nvim_win_get_buf(win)
+    local total = vim.api.nvim_buf_line_count(buf)
+    state_manager.set_state("chat_window", "cursor_follow_mode", total - cursor[1] <= 5)
+  end
+  if not state_manager.get_state("chat_window", "cursor_follow_mode") then
+    -- 光标不在后5行内，不跟随
+    return
+  end
+  delay_ms = delay_ms or 0
+  if delay_ms > 0 then
+    -- 防抖模式：取消旧定时器，启动新定时器
+    state.cursor_follow.pending = true
+    if state.cursor_follow.timer then
+      pcall(state.cursor_follow.timer.stop, state.cursor_follow.timer)
+      pcall(state.cursor_follow.timer.close, state.cursor_follow.timer)
+      state.cursor_follow.timer = nil
+    end
+    state.cursor_follow.timer = vim.loop.new_timer()
+    state.cursor_follow.timer:start(
+      delay_ms,
+      0,
+      vim.schedule_wrap(function()
+        if not state.cursor_follow.pending then
+          return
+        end
+        state.cursor_follow.pending = false
+        if state.cursor_follow.timer then
+          pcall(state.cursor_follow.timer.close, state.cursor_follow.timer)
+          state.cursor_follow.timer = nil
+        end
+        _do_cursor_follow()
+      end)
+    )
+  else
+    -- 立即模式：使用 vim.schedule 下一个 tick 执行
+    vim.schedule(function()
+      _do_cursor_follow()
+    end)
+  end
+end
+
 local function get_chat_service()
   local ok, cs = pcall(require, "NeoAI.core.ai.chat_service")
   return ok and cs or nil
@@ -238,6 +329,11 @@ function M.initialize(config)
     return
   end
   state.initialized = true
+
+  -- 注册状态切片到 state_manager
+  state_manager.register_slice("chat_window", {
+    cursor_follow_mode = false, -- true=光标在末尾附近，buffer 变化时自动跳转到末尾
+  })
 
   -- 初始化虚拟输入组件
   virtual_input.initialize(config)
@@ -304,8 +400,12 @@ function M.open(session_id, window_id, branch_id)
   if buf and vim.api.nvim_buf_is_valid(buf) then
     -- 批量设置 buffer 选项（合并 API 调用）
     local buf_opts = {
-      filetype = "neoai", buflisted = true, buftype = "nofile",
-      swapfile = false, bufhidden = "hide", modified = false,
+      filetype = "neoai",
+      buflisted = true,
+      buftype = "nofile",
+      swapfile = false,
+      bufhidden = "hide",
+      modified = false,
     }
     for name, val in pairs(buf_opts) do
       pcall(vim.api.nvim_set_option_value, name, val, { buf = buf })
@@ -318,8 +418,12 @@ function M.open(session_id, window_id, branch_id)
   if win_handle and vim.api.nvim_win_is_valid(win_handle) then
     -- 批量设置窗口选项
     local win_opts = {
-      wrap = true, linebreak = true, cursorline = true,
-      foldmethod = "marker", foldmarker = "{{{,}}}", foldlevel = 0,
+      wrap = true,
+      linebreak = true,
+      cursorline = true,
+      foldmethod = "marker",
+      foldmarker = "{{{,}}}",
+      foldlevel = 0,
     }
     for name, val in pairs(win_opts) do
       pcall(vim.api.nvim_set_option_value, name, val, { win = win_handle })
@@ -358,7 +462,9 @@ function M.open(session_id, window_id, branch_id)
 
   -- 异步加载所有内容
   vim.schedule(function()
-    if state.closing or state.current_window_id ~= window_id then return end
+    if state.closing or state.current_window_id ~= window_id then
+      return
+    end
 
     -- 加载消息数据
     M._load_messages(session_id)
@@ -505,7 +611,9 @@ function M._render_single_message(msg, prev_role)
         local ok, parsed = pcall(vim.json.decode, func.arguments)
         if ok and parsed then
           args_str = vim.inspect(parsed)
-          if #args_str > 100 then args_str = args_str:sub(1, 100) .. "..." end
+          if #args_str > 100 then
+            args_str = args_str:sub(1, 100) .. "..."
+          end
         else
           args_str = func.arguments
         end
@@ -557,7 +665,9 @@ function M._render_single_message(msg, prev_role)
           local ok2, parsed2 = pcall(vim.json.decode, func.arguments)
           if ok2 and parsed2 then
             args_str = vim.inspect(parsed2)
-            if #args_str > 100 then args_str = args_str:sub(1, 100) .. "..." end
+            if #args_str > 100 then
+              args_str = args_str:sub(1, 100) .. "..."
+            end
           else
             args_str = func.arguments
           end
@@ -692,25 +802,25 @@ end
 --- 提取自 async_worker 回调，供空消息快速渲染复用
 --- @param content table 内容行列表
 function M._apply_rendered_content(content)
-  if not content or not state.current_window_id then return end
+  if not content or not state.current_window_id then
+    return
+  end
 
   -- 检查 Neovim 是否正在退出
   local ok_tp, tp = pcall(vim.api.nvim_get_current_tabpage)
-  if not ok_tp or not tp then return end
+  if not ok_tp or not tp then
+    return
+  end
 
-  -- 保存光标位置和窗口滚动状态
-  local saved_cursor_lnum = nil
-  local saved_cursor_col = 0
-  local cursor_near_end = false
+  -- 检查光标是否在末尾附近
+  local near_end = false
   local win_handle = window_manager.get_window_win(state.current_window_id)
   if win_handle and vim.api.nvim_win_is_valid(win_handle) then
     local cursor = vim.api.nvim_win_get_cursor(win_handle)
-    saved_cursor_lnum = cursor[1]
-    saved_cursor_col = cursor[2]
     local buf = vim.api.nvim_win_get_buf(win_handle)
     local total_lines = vim.api.nvim_buf_line_count(buf)
-    if total_lines - saved_cursor_lnum <= 5 then
-      cursor_near_end = true
+    if total_lines - cursor[1] <= 5 then
+      near_end = true
     end
   end
 
@@ -730,40 +840,13 @@ function M._apply_rendered_content(content)
     M._focus_window()
   end
 
-  -- 延迟恢复光标位置并处理滚动
-  vim.defer_fn(function()
-    local ok_tp2, tp2 = pcall(vim.api.nvim_get_current_tabpage)
-    if not ok_tp2 or not tp2 then return end
-
-    local win = window_manager.get_window_win(state.current_window_id)
-    if not win or not vim.api.nvim_win_is_valid(win) then return end
-    local buf = vim.api.nvim_win_get_buf(win)
-    local new_line_count = vim.api.nvim_buf_line_count(buf)
-
-    if virtual_input.is_active() then return end
-
-    if cursor_near_end then
-      -- 插入前光标在后5行内：跳到最后一行，滚动到窗口最下边，允许工具调用悬浮窗
-      local last_line_content = vim.api.nvim_buf_get_lines(buf, new_line_count - 1, new_line_count, false)[1] or ""
-      pcall(vim.api.nvim_win_set_cursor, win, { new_line_count, #last_line_content })
-      -- 滚动到窗口最下边（最后一行在窗口底部）
-      pcall(vim.api.nvim_win_call, win, function()
-        local height = vim.api.nvim_win_get_height(win)
-        local view = vim.fn.winsaveview()
-        view.topline = math.max(1, new_line_count - height + 1)
-        vim.fn.winrestview(view)
-      end)
-      if not state.streaming.active and not state.generation_in_progress then
-        M._open_float_input()
-      end
-    elseif saved_cursor_lnum then
-      -- 插入前光标不在后5行内：保持原位置，禁止工具调用悬浮窗打开
-      local new_lnum = math.min(saved_cursor_lnum, new_line_count)
-      local lines = vim.api.nvim_buf_get_lines(buf, new_lnum - 1, new_lnum, false)
-      local col = math.min(saved_cursor_col, #(lines[1] or ""))
-      pcall(vim.api.nvim_win_set_cursor, win, { new_lnum, col })
+  -- 使用防抖光标跟随
+  if near_end then
+    _schedule_cursor_follow()
+    if not state.streaming.active and not state.generation_in_progress then
+      M._open_float_input()
     end
-  end, 30)
+  end
 
   -- 触发渲染完成事件
   vim.api.nvim_exec_autocmds("User", {
@@ -985,7 +1068,9 @@ function M._open_float_input()
 
   -- 检查 Neovim 是否正在退出，避免在退出过程中打开新窗口导致死循环
   local ok_tp, tp = pcall(vim.api.nvim_get_current_tabpage)
-  if not ok_tp or not tp then return end
+  if not ok_tp or not tp then
+    return
+  end
 
   -- 如果已激活，跳过
   if virtual_input.is_active() then
@@ -1068,7 +1153,9 @@ function M._load_messages(session_id)
     local config = {}
     local core_ok, core_mod = pcall(require, "NeoAI.core")
     if core_ok then
-      local ok_cfg, cfg = pcall(function() return core_mod.get_config() end)
+      local ok_cfg, cfg = pcall(function()
+        return core_mod.get_config()
+      end)
       if ok_cfg and cfg then
         config = cfg
       end
@@ -1163,6 +1250,13 @@ function M.close()
   end
   state.stream_throttle.buffer = ""
   state.stream_throttle.pending = false
+  if state.cursor_follow.timer then
+    pcall(state.cursor_follow.timer.stop, state.cursor_follow.timer)
+    pcall(state.cursor_follow.timer.close, state.cursor_follow.timer)
+    state.cursor_follow.timer = nil
+  end
+  state.cursor_follow.pending = false
+  state_manager.set_state("chat_window", "cursor_follow_mode", false)
 
   -- 保存当前窗口ID到局部变量，供 defer_fn 使用
   -- 防止 defer_fn 执行时 state.current_window_id 已被 M.open() 修改
@@ -1196,7 +1290,9 @@ function M.close()
     pcall(function()
       -- 尝试获取当前 tabpage，如果 Neovim 正在退出可能会失败
       local tp = vim.api.nvim_get_current_tabpage()
-      if not tp then is_exiting = true end
+      if not tp then
+        is_exiting = true
+      end
     end)
     if is_exiting then
       state.closing = false
@@ -1534,11 +1630,13 @@ function M.add_message(role, content, opts)
     timestamp = os.time(),
   })
 
-  -- 触发消息添加完成事件
-  vim.api.nvim_exec_autocmds(
-    "User",
-    { pattern = Events.MESSAGE_ADDED, data = { window_id = state.current_window_id, role = role, content = content } }
-  )
+  -- 触发消息添加完成事件（除非指定跳过，用于流式场景避免触发全量重渲染）
+  if not opts.skip_event then
+    vim.api.nvim_exec_autocmds(
+      "User",
+      { pattern = Events.MESSAGE_ADDED, data = { window_id = state.current_window_id, role = role, content = content } }
+    )
+  end
 
   -- 持久化消息到 session_manager 和 history_manager（除非指定跳过）
   if not opts.skip_persist then
@@ -1821,9 +1919,7 @@ function M._setup_event_listeners()
         if folded_saved then
           local folded_idx = find_folded_msg_idx()
           if folded_idx then
-            local append_content = has_reasoning
-              and content_with_reasoning
-              or response_content
+            local append_content = has_reasoning and content_with_reasoning or response_content
             state.messages[folded_idx].content = state.messages[folded_idx].content .. "\n\n" .. append_content
             if msg_idx ~= folded_idx then
               table.remove(state.messages, msg_idx)
@@ -1841,12 +1937,13 @@ function M._setup_event_listeners()
         if folded_saved then
           local folded_idx = find_folded_msg_idx()
           if folded_idx then
-            local append_content = has_reasoning
-              and content_with_reasoning
-              or response_content
+            local append_content = has_reasoning and content_with_reasoning or response_content
             state.messages[folded_idx].content = state.messages[folded_idx].content .. "\n\n" .. append_content
           else
-            table.insert(state.messages, { role = "assistant", content = content_with_reasoning, timestamp = os.time() })
+            table.insert(
+              state.messages,
+              { role = "assistant", content = content_with_reasoning, timestamp = os.time() }
+            )
           end
         elseif has_tool_results then
           local folded = M._build_tool_folded_text(state.tool_display.results)
@@ -1857,7 +1954,7 @@ function M._setup_event_listeners()
           if placeholder_idx then
             table.remove(state.messages, placeholder_idx)
           end
-          M.add_message("assistant", content_with_reasoning, { skip_render = true })
+          M.add_message("assistant", content_with_reasoning, { skip_render = true, skip_event = true })
         end
       end
 
@@ -1896,7 +1993,9 @@ function M._setup_event_listeners()
       -- 保存流式状态，用于判断是否需要增量更新
       -- 注意：reasoning_done 为 true 表示思考过程折叠文本已通过 _append_reasoning_folded_to_buffer 追加到缓冲区
       -- 此时即使 prefix_added 为 false（只有思考没有正文），也应视为已有流式内容，避免重复追加
-      local had_stream_prefix = state.streaming.prefix_added or state.streaming.reasoning_prefix_added or state.streaming.reasoning_done
+      local had_stream_prefix = state.streaming.prefix_added
+        or state.streaming.reasoning_prefix_added
+        or state.streaming.reasoning_done
       reset_streaming_state()
       state.tool_loop_in_progress = false
       state.generation_in_progress = false
@@ -2002,7 +2101,7 @@ function M._setup_event_listeners()
         state.streaming.reasoning_buffer = ""
         state.streaming.reasoning_active = false
         state.streaming.reasoning_done = false
-        local ok = M.add_message("assistant", "", { allow_empty = true, skip_render = true })
+        local ok = M.add_message("assistant", "", { allow_empty = true, skip_render = true, skip_event = true })
         if ok then
           state.streaming.message_index = #state.messages
         end
@@ -2069,7 +2168,7 @@ function M._setup_event_listeners()
         state.streaming.reasoning_buffer = ""
         state.streaming.reasoning_active = true
         state.streaming.reasoning_done = false
-        local ok = M.add_message("assistant", "", { allow_empty = true, skip_render = true })
+        local ok = M.add_message("assistant", "", { allow_empty = true, skip_render = true, skip_event = true })
         if ok then
           state.streaming.message_index = #state.messages
         end
@@ -2112,7 +2211,7 @@ function M._setup_event_listeners()
         state.streaming.generation_id = data.generation_id
         state.streaming.content_buffer = ""
         state.streaming.reasoning_buffer = ""
-        local ok = M.add_message("assistant", "", { allow_empty = true, skip_render = true })
+        local ok = M.add_message("assistant", "", { allow_empty = true, skip_render = true, skip_event = true })
         if ok then
           state.streaming.message_index = #state.messages
         end
@@ -2166,7 +2265,9 @@ function M._setup_event_listeners()
   -- 辅助：更新工具包分组中的工具状态
   local function update_tool_in_pack(pack_name, tool_name, status, duration)
     local pack = state.tool_display.packs[pack_name]
-    if not pack then return end
+    if not pack then
+      return
+    end
     for _, t in ipairs(pack.tools) do
       if t.name == tool_name then
         t.status = status
@@ -2221,7 +2322,6 @@ function M._setup_event_listeners()
               end
               -- 先渲染子步骤标题行
               text = text .. prefix .. ss_icon .. " " .. s.name .. " " .. ss_text .. "\n"
-
             end
           end
         end
@@ -2260,7 +2360,20 @@ function M._setup_event_listeners()
       end
 
       clear_stream_throttle()
-      reset_streaming_state()
+      -- 注意：不调用 reset_streaming_state()，因为思考过程折叠文本已通过 _append_reasoning_folded_to_buffer
+      -- 追加到缓冲区，reasoning_done 需要保留，供 GENERATION_COMPLETED 判断 had_stream_prefix 使用。
+      -- 只清理流式缓冲区和 throttle，保留 reasoning_done 状态。
+      local s = state.streaming
+      s.active = false
+      s.generation_id = nil
+      s.message_index = nil
+      s.content_buffer = ""
+      s.reasoning_buffer = ""
+      s.reasoning_active = false
+      -- 不重置 reasoning_done：思考过程折叠文本已追加到缓冲区
+      s.prefix_added = false
+      s.reasoning_prefix_added = false
+      s.content_separator_added = false
       state.tool_loop_in_progress = true
 
       state.tool_display.active = true
@@ -2323,6 +2436,9 @@ function M._setup_event_listeners()
       local win = get_win()
       if cursor_near_end(win) then
         M._show_tool_display()
+        -- 创建浮动窗口可能触发 WinNew/BufEnter 等自动命令，间接影响 chat 窗口的滚动位置
+        -- 使用防抖光标跟随，延迟 150ms 后执行（创建浮动窗口的影响需要更长时间稳定）
+        _schedule_cursor_follow(150)
       else
         -- 光标不在后5行内：禁止工具调用悬浮窗打开
         state.tool_display.active = false
@@ -2361,10 +2477,9 @@ function M._setup_event_listeners()
       if state.closing or not is_current_window((args.data or {}).window_id) then
         return
       end
-      if not state.tool_display.active then
-        return
-      end
       local data = args.data or {}
+      -- 即使 tool_display.active 为 false（光标不在后5行），也要收集结果
+      -- 这样 TOOL_LOOP_FINISHED 才能生成折叠文本
       table.insert(state.tool_display.results, {
         tool_name = data.tool_name,
         arguments = data.args or {},
@@ -2373,6 +2488,9 @@ function M._setup_event_listeners()
         is_error = true,
         pack_name = data.pack_name,
       })
+      if not state.tool_display.active then
+        return
+      end
       local pack_name = data.pack_name
       if pack_name and state.tool_display.packs[pack_name] then
         update_tool_in_pack(pack_name, data.tool_name, "error", data.duration or 0)
@@ -2447,10 +2565,9 @@ function M._setup_event_listeners()
       if state.closing or not is_current_window((args.data or {}).window_id) then
         return
       end
-      if not state.tool_display.active then
-        return
-      end
       local data = args.data or {}
+      -- 即使 tool_display.active 为 false（光标不在后5行），也要收集结果
+      -- 这样 TOOL_LOOP_FINISHED 才能生成折叠文本
       table.insert(state.tool_display.results, {
         tool_name = data.tool_name,
         arguments = data.args or {},
@@ -2458,6 +2575,9 @@ function M._setup_event_listeners()
         duration = data.duration or 0,
         pack_name = data.pack_name,
       })
+      if not state.tool_display.active then
+        return
+      end
       local pack_name = data.pack_name
       if pack_name and state.tool_display.packs[pack_name] then
         update_tool_in_pack(pack_name, data.tool_name, "completed", data.duration or 0)
@@ -2495,64 +2615,76 @@ function M._setup_event_listeners()
 
       clear_stream_throttle()
 
-      if state.tool_display.active then
-        local results = state.tool_display.results or {}
-        if #results > 0 or state.tool_display.buffer ~= "" then
-          local folded_text = ""
-          if #results > 0 then
-            -- 按工具包分组构建折叠文本
-            local tool_pack = require("NeoAI.tools.tool_pack")
-            local pack_results = {}
-            local pack_order = {}
-            for _, r in ipairs(results) do
-              local pn = r.pack_name or "_uncategorized"
-              if not pack_results[pn] then
-                pack_results[pn] = {}
-                table.insert(pack_order, pn)
-              end
-              table.insert(pack_results[pn], r)
+      -- 即使 tool_display.active 为 false（光标不在后5行时被禁用），
+      -- 也必须生成折叠文本并写入缓冲区，否则工具调用结果会丢失
+      local results = state.tool_display.results or {}
+      if #results > 0 or state.tool_display.buffer ~= "" then
+        local folded_text = ""
+        if #results > 0 then
+          -- 按工具包分组构建折叠文本
+          local tool_pack = require("NeoAI.tools.tool_pack")
+          local pack_results = {}
+          local pack_order = {}
+          for _, r in ipairs(results) do
+            local pn = r.pack_name or "_uncategorized"
+            if not pack_results[pn] then
+              pack_results[pn] = {}
+              table.insert(pack_order, pn)
             end
-            -- 按包顺序排序
-            table.sort(pack_order, function(a, b)
-              return tool_pack.get_pack_order(a) < tool_pack.get_pack_order(b)
-            end)
-
-            local blocks = {}
-            for _, pn in ipairs(pack_order) do
-              local pack_tools = pack_results[pn]
-              local pack_icon = tool_pack.get_pack_icon(pn)
-              local pack_name = tool_pack.get_pack_display_name(pn)
-              for _, r in ipairs(pack_tools) do
-                local duration_str = r.duration and string.format(" (%.1fs)", r.duration) or ""
-                local args_str = vim.inspect(r.arguments or {})
-                -- 转义内容中的 {{{ 和 }}}，避免干扰 foldmethod=marker
-                args_str = args_str:gsub("}}}", "} } }"):gsub("{{{", "{ { {")
-                local result_str = type(r.result) == "table"
-                    and (pcall(vim.json.encode, r.result) and vim.json.encode(r.result) or vim.inspect(r.result))
-                  or tostring(r.result or "")
-                -- 清理 JSON 编码后的 \r 字符，将 \r 渲染为换行
-                result_str = result_str:gsub("\\r\\n", "\n"):gsub("\\r", "\n")
-                local icon = r.is_error and "❌" or "✅"
-                -- 转义内容中的 {{{ 和 }}}，避免干扰 foldmethod=marker
-                result_str = result_str:gsub("}}}", "} } }"):gsub("{{{", "{ { {")
-                result_str = result_str:gsub("\n", "\n    ")
-                local block = "{{{ " .. pack_icon .. " " .. pack_name .. " - " .. icon .. " " .. (r.tool_name or "unknown") .. duration_str
-                    .. "\n    参数: " .. args_str
-                    .. "\n    结果: " .. result_str
-                    .. "\n}}}"
-                table.insert(blocks, block)
-              end
-            end
-            folded_text = table.concat(blocks, "\n")
-          else
-            folded_text = "{{{ 🔧 工具调用\n  ❌ 所有工具调用均失败\n}}}"
+            table.insert(pack_results[pn], r)
           end
+          -- 按包顺序排序
+          table.sort(pack_order, function(a, b)
+            return tool_pack.get_pack_order(a) < tool_pack.get_pack_order(b)
+          end)
 
-          table.insert(state.messages, { role = "assistant", content = folded_text, timestamp = os.time() })
-          state.tool_display.folded_saved = true
-          -- 通过 _append_message_to_buffer 写入指定 buffer，确保经过 _render_single_message 格式化
-          M._append_message_to_buffer("assistant", folded_text)
+          local blocks = {}
+          for _, pn in ipairs(pack_order) do
+            local pack_tools = pack_results[pn]
+            local pack_icon = tool_pack.get_pack_icon(pn)
+            local pack_name = tool_pack.get_pack_display_name(pn)
+            for _, r in ipairs(pack_tools) do
+              local duration_str = r.duration and string.format(" (%.1fs)", r.duration) or ""
+              local args_str = vim.inspect(r.arguments or {})
+              -- 转义内容中的 {{{ 和 }}}，避免干扰 foldmethod=marker
+              args_str = args_str:gsub("}}}", "} } }"):gsub("{{{", "{ { {")
+              local result_str = type(r.result) == "table"
+                  and (pcall(vim.json.encode, r.result) and vim.json.encode(r.result) or vim.inspect(r.result))
+                or tostring(r.result or "")
+              -- 清理 JSON 编码后的 \r 字符，将 \r 渲染为换行
+              result_str = result_str:gsub("\\r\\n", "\n"):gsub("\\r", "\n")
+              local icon = r.is_error and "❌" or "✅"
+              -- 转义内容中的 {{{ 和 }}}，避免干扰 foldmethod=marker
+              result_str = result_str:gsub("}}}", "} } }"):gsub("{{{", "{ { {")
+              result_str = result_str:gsub("\n", "\n    ")
+              local block = "{{{ "
+                .. pack_icon
+                .. " "
+                .. pack_name
+                .. " - "
+                .. icon
+                .. " "
+                .. (r.tool_name or "unknown")
+                .. duration_str
+                .. "\n    参数: "
+                .. args_str
+                .. "\n    结果: "
+                .. result_str
+                .. "\n}}}"
+              table.insert(blocks, block)
+            end
+          end
+          folded_text = table.concat(blocks, "\n")
+        else
+          folded_text = "{{{ 🔧 工具调用\n  ❌ 所有工具调用均失败\n}}}"
         end
+
+        table.insert(state.messages, { role = "assistant", content = folded_text, timestamp = os.time() })
+        state.tool_display.folded_saved = true
+        -- 通过 _append_message_to_buffer 写入指定 buffer，确保经过 _render_single_message 格式化
+        M._append_message_to_buffer("assistant", folded_text)
+      end
+      if state.tool_display.active then
         close_tool_display()
       end
 
@@ -2758,48 +2890,9 @@ function M._append_message_to_buffer(role, content)
 
   pcall(vim.api.nvim_set_option_value, "modified", false, { buf = buf })
 
-  -- 保存光标状态，延迟执行光标跟随，等待 Neovim 完成折叠文本渲染（foldmethod=marker）
-  -- 避免折叠刷新导致光标先被吸上去
-  local saved_cursor_lnum = nil
-  local saved_cursor_col = 0
-  local was_near_end = false
-  local win = window_manager.get_window_win(state.current_window_id)
-  if win and vim.api.nvim_win_is_valid(win) then
-    local new_line_count = vim.api.nvim_buf_line_count(buf)
-    local cursor_before = vim.api.nvim_win_get_cursor(win)
-    local total_before = new_line_count - #lines
-    was_near_end = (total_before - cursor_before[1] <= 5)
-    saved_cursor_lnum = cursor_before[1]
-    saved_cursor_col = cursor_before[2]
-  end
-
-  vim.defer_fn(function()
-    local ok_tp, tp = pcall(vim.api.nvim_get_current_tabpage)
-    if not ok_tp or not tp then return end
-
-    local d_win = window_manager.get_window_win(state.current_window_id)
-    if not d_win or not vim.api.nvim_win_is_valid(d_win) then return end
-    local d_buf = vim.api.nvim_win_get_buf(d_win)
-    local d_line_count = vim.api.nvim_buf_line_count(d_buf)
-
-    if was_near_end then
-      -- 插入前光标在后5行内：跳到最后一行，滚动到窗口最下边
-      local last_line = vim.api.nvim_buf_get_lines(d_buf, d_line_count - 1, d_line_count, false)[1] or ""
-      pcall(vim.api.nvim_win_set_cursor, d_win, { d_line_count, #last_line })
-      pcall(vim.api.nvim_win_call, d_win, function()
-        local height = vim.api.nvim_win_get_height(d_win)
-        local view = vim.fn.winsaveview()
-        view.topline = math.max(1, d_line_count - height + 1)
-        vim.fn.winrestview(view)
-      end)
-    elseif saved_cursor_lnum then
-      -- 插入前光标不在后5行内：保持原位置
-      local new_lnum = math.min(saved_cursor_lnum, d_line_count)
-      local lines = vim.api.nvim_buf_get_lines(d_buf, new_lnum - 1, new_lnum, false)
-      local col = math.min(saved_cursor_col, #(lines[1] or ""))
-      pcall(vim.api.nvim_win_set_cursor, d_win, { new_lnum, col })
-    end
-  end, 30)
+  -- 使用防抖光标跟随，延迟 150ms 后执行
+  -- 避免在折叠文本插入后立即移动光标被 foldmethod=marker 吸到折叠开始行
+  _schedule_cursor_follow()
 end
 
 --- 将思考过程追加到聊天缓冲区末尾
@@ -2854,48 +2947,9 @@ function M._append_reasoning_folded_to_buffer(reasoning_text)
 
   pcall(vim.api.nvim_set_option_value, "modified", false, { buf = buf })
 
-  -- 延迟光标跟随，等待 Neovim 完成折叠文本渲染（foldmethod=marker）
-  -- 避免折叠刷新导致光标先被吸上去
-  local saved_cursor_lnum = nil
-  local saved_cursor_col = 0
-  local was_near_end = false
-  local win = window_manager.get_window_win(state.current_window_id)
-  if win and vim.api.nvim_win_is_valid(win) then
-    local new_line_count = vim.api.nvim_buf_line_count(buf)
-    local cursor_before = vim.api.nvim_win_get_cursor(win)
-    local total_before = new_line_count - #output_lines
-    was_near_end = (total_before - cursor_before[1] <= 5)
-    saved_cursor_lnum = cursor_before[1]
-    saved_cursor_col = cursor_before[2]
-  end
-
-  vim.defer_fn(function()
-    local ok_tp, tp = pcall(vim.api.nvim_get_current_tabpage)
-    if not ok_tp or not tp then return end
-
-    local d_win = window_manager.get_window_win(state.current_window_id)
-    if not d_win or not vim.api.nvim_win_is_valid(d_win) then return end
-    local d_buf = vim.api.nvim_win_get_buf(d_win)
-    local d_line_count = vim.api.nvim_buf_line_count(d_buf)
-
-    if was_near_end then
-      -- 插入前光标在后5行内：跳到最后一行，滚动到窗口最下边
-      local last_line = vim.api.nvim_buf_get_lines(d_buf, d_line_count - 1, d_line_count, false)[1] or ""
-      pcall(vim.api.nvim_win_set_cursor, d_win, { d_line_count, #last_line })
-      pcall(vim.api.nvim_win_call, d_win, function()
-        local height = vim.api.nvim_win_get_height(d_win)
-        local view = vim.fn.winsaveview()
-        view.topline = math.max(1, d_line_count - height + 1)
-        vim.fn.winrestview(view)
-      end)
-    elseif saved_cursor_lnum then
-      -- 插入前光标不在后5行内：保持原位置
-      local new_lnum = math.min(saved_cursor_lnum, d_line_count)
-      local lines = vim.api.nvim_buf_get_lines(d_buf, new_lnum - 1, new_lnum, false)
-      local col = math.min(saved_cursor_col, #(lines[1] or ""))
-      pcall(vim.api.nvim_win_set_cursor, d_win, { new_lnum, col })
-    end
-  end, 30)
+  -- 使用防抖光标跟随，延迟 150ms 后执行
+  -- 避免在折叠文本插入后立即移动光标被 foldmethod=marker 吸到折叠开始行
+  _schedule_cursor_follow()
 end
 
 --- 在缓冲区末尾插入一个空行（处理换行符数据块）
@@ -2912,6 +2966,7 @@ function M._append_newline_to_buffer()
   local line_count = vim.api.nvim_buf_line_count(buf)
   vim.api.nvim_buf_set_lines(buf, line_count, line_count, false, { "" })
   pcall(vim.api.nvim_set_option_value, "modified", false, { buf = buf })
+  _schedule_cursor_follow()
 end
 
 --- 追加流式数据块到缓冲区（增量渲染）
@@ -2936,7 +2991,7 @@ function M._append_stream_chunk_to_buffer(chunk_content, content_type)
     local new_content = (rt ~= "") and { reasoning_content = rt, content = full } or { content = full }
     state.messages[mi].content = (rt ~= "") and vim.json.encode({ reasoning_content = rt, content = full }) or full
 
-  -- 流式更新保存到 history_manager
+    -- 流式更新保存到 history_manager
     -- 每 10 次更新触发一次防抖保存，确保流式内容不会丢失
     local hm_ok, hm = pcall(require, "NeoAI.core.history.manager")
     if hm_ok and hm.is_initialized() then
@@ -2957,8 +3012,6 @@ function M._append_stream_chunk_to_buffer(chunk_content, content_type)
   if not buf_valid(buf) then
     return
   end
-  local win = get_win()
-  local follow = cursor_near_end(win)
 
   set_buf_modifiable(buf, true)
   local lc = get_line_count(buf)
@@ -2998,18 +3051,7 @@ function M._append_stream_chunk_to_buffer(chunk_content, content_type)
     end
 
     vim.api.nvim_set_option_value("modified", false, { buf = buf })
-    if follow then
-      -- 光标在后5行内：跳到最后并滚动到窗口最下边
-      local lc2 = get_line_count(buf)
-      local last_line = get_last_line(buf)
-      pcall(vim.api.nvim_win_set_cursor, win, { lc2, #last_line })
-      pcall(vim.api.nvim_win_call, win, function()
-        local height = vim.api.nvim_win_get_height(win)
-        local view = vim.fn.winsaveview()
-        view.topline = math.max(1, lc2 - height + 1)
-        vim.fn.winrestview(view)
-      end)
-    end
+    _schedule_cursor_follow()
     return
   end
 
@@ -3054,18 +3096,7 @@ function M._append_stream_chunk_to_buffer(chunk_content, content_type)
   end
 
   vim.api.nvim_set_option_value("modified", false, { buf = buf })
-  if follow then
-    -- 光标在后5行内：跳到最后并滚动到窗口最下边
-    local lc2 = get_line_count(buf)
-    local last_line = get_last_line(buf)
-    pcall(vim.api.nvim_win_set_cursor, win, { lc2, #last_line })
-    pcall(vim.api.nvim_win_call, win, function()
-      local height = vim.api.nvim_win_get_height(win)
-      local view = vim.fn.winsaveview()
-      view.topline = math.max(1, lc2 - height + 1)
-      vim.fn.winrestview(view)
-    end)
-  end
+  _schedule_cursor_follow()
 end
 
 --- 完成流式渲染
@@ -3168,9 +3199,9 @@ function M._show_tool_display()
   local tool_border = {
     { "╭", "FloatBorder" },
     { "─", "FloatBorder" },
-    { "┬", "FloatBorder" },  -- 右上角
+    { "┬", "FloatBorder" }, -- 右上角
     { "│", "FloatBorder" },
-    { "┴", "FloatBorder" },  -- 右下角
+    { "┴", "FloatBorder" }, -- 右下角
     { "─", "FloatBorder" },
     { "╰", "FloatBorder" },
     { "│", "FloatBorder" },
@@ -3222,7 +3253,7 @@ function M._show_tool_display()
     -- 从统一状态管理器获取键位配置
     local chat_config = state_manager.get_config_value("keymaps.chat")
     vim.keymap.set("n", chat_config.quit.key, function()
-      require('NeoAI.ui.window.chat_window')._close_tool_display()
+      require("NeoAI.ui.window.chat_window")._close_tool_display()
     end, {
       buffer = window_info.buf,
       desc = "关闭工具调用窗口",
@@ -3230,7 +3261,7 @@ function M._show_tool_display()
       noremap = true,
     })
     vim.keymap.set("n", chat_config.cancel.key, function()
-      require('NeoAI.ui.window.chat_window')._close_tool_display()
+      require("NeoAI.ui.window.chat_window")._close_tool_display()
     end, {
       buffer = window_info.buf,
       desc = "关闭工具调用窗口",
@@ -3389,9 +3420,19 @@ function M._build_tool_folded_text(results)
       result_str = result_str:gsub("}}}", "} } }"):gsub("{{{", "{ { {")
       result_str = result_str:gsub("\n", "\n    ")
 
-      local block = "{{{ " .. pack_icon .. " " .. pack_name .. " - " .. icon .. " " .. (r.tool_name or "unknown") .. duration_str
-        .. "\n    参数: " .. args_str
-        .. "\n    结果: " .. result_str
+      local block = "{{{ "
+        .. pack_icon
+        .. " "
+        .. pack_name
+        .. " - "
+        .. icon
+        .. " "
+        .. (r.tool_name or "unknown")
+        .. duration_str
+        .. "\n    参数: "
+        .. args_str
+        .. "\n    结果: "
+        .. result_str
         .. "\n}}}"
       table.insert(blocks, block)
     end

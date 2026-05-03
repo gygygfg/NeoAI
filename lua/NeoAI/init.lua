@@ -1,6 +1,6 @@
 --- NeoAI 主入口
 --- 职责：初始化所有模块、注册命令和快捷键
-local M = {}
+--- 闭包内私有状态：core_ref, ui_ref, tools_ref（初始化后赋值）
 
 local logger = require("NeoAI.utils.logger")
 local config_merger = require("NeoAI.core.config.merger")
@@ -9,10 +9,13 @@ local ui = require("NeoAI.ui")
 local tools = require("NeoAI.tools")
 local state_manager = require("NeoAI.core.config.state")
 
--- 模块引用（初始化后赋值）
+-- ========== 闭包内私有状态 ==========
 local core_ref
 local ui_ref
 local tools_ref
+
+-- ========== 公共接口 ==========
+local M = {}
 
 -- 内部函数：注册Neovim命令
 local function register_commands()

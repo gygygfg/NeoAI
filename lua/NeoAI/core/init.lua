@@ -1,27 +1,29 @@
-local M = {}
+--- NeoAI 核心模块入口
+--- 职责：初始化并统一导出核心子模块（AI引擎、历史管理器、聊天服务、键位管理器）
+--- 闭包内私有状态：initialized
 
 local logger = require("NeoAI.utils.logger")
 local ai_engine = require("NeoAI.core.ai.ai_engine")
 local history_manager = require("NeoAI.core.history.manager")
 local state_manager = require("NeoAI.core.config.state")
 
+-- ========== 闭包内私有状态 ==========
 local initialized = false
+
+-- ========== 公共接口 ==========
+local M = {}
 
 --- 初始化核心模块
 --- @param config table 完整配置
 --- @return table 核心模块实例
 function M.initialize(config)
-  if initialized then
-    return M
-  end
+  if initialized then return M end
 
   -- 初始化配置模块（含键位配置管理器和状态管理器）
-  -- state_manager 已在 init.lua 的 setup() 中初始化，此处只需初始化 keymap_manager
   local config_module = require("NeoAI.core.config")
   config_module.initialize(config)
 
-  -- 初始化 AI 引擎
-  -- 各子模块自行从 state_manager 读取配置，无需传递
+  -- 初始化 AI 引擎（各子模块自行从 state_manager 读取配置）
   ai_engine.initialize({})
 
   -- 初始化历史管理器（唯一数据源）

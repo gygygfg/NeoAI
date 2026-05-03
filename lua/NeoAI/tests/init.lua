@@ -120,7 +120,15 @@ function M.run_all()
     "test_utils_file_utils",
     "test_async_worker",
     "test_http_client",
+    "test_ai_init",
+    "test_request_adapter",
+    "test_request_builder",
+    "test_stream_processor",
   }
+
+  -- 确保 package.loaded 中已有本模块引用，避免测试文件内部
+  -- require("NeoAI.tests") 导致循环依赖
+  package.loaded["NeoAI.tests"] = M
 
   local results = { passed = 0, failed = 0, errors = {} }
 
@@ -133,6 +141,7 @@ function M.run_all()
       local filepath = base_dir .. "/" .. name .. ".lua"
       local test_mod = dofile(filepath)
       if test_mod and test_mod.run then
+        -- 传入 M 作为 test_module，避免测试文件内部调用 require("NeoAI.tests") 导致循环依赖
         local r = test_mod.run(M)
         if r then
           results.passed = results.passed + (r.passed or 0)

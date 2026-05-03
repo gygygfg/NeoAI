@@ -198,7 +198,8 @@ function M.run(test_module)
 
     --- 测试 get_default_keymaps
     test_get_default_keymaps = function()
-      local km = require("NeoAI.core.config.keymap_manager")
+      -- 使用 reset_km 确保 state_manager 未初始化（headless 模式兼容）
+      local km = reset_km()
       km.initialize(create_test_config())
 
       local defaults = km.get_default_keymaps()

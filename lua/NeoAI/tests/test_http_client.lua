@@ -152,6 +152,8 @@ function M.run()
     --- 测试 send_stream_request（无 API key 应返回错误）
     test_send_stream_request_no_key = function()
       local hc = require("NeoAI.core.ai.http_client")
+      -- 确保已初始化（headless 模式兼容）
+      hc.initialize({ config = {} })
 
       local request_id, err = hc.send_stream_request({
         request = { model = "test", messages = {}, stream = true },
@@ -219,7 +221,8 @@ function M.run()
       assert.equal(original, decoded, "编解码往返应一致")
 
       -- 2. 包含反斜杠和双引号（编码后应变化，但往返应一致）
-      local original2 = [[path	oile and "quoted" text]]
+      -- 注意：在 Lua 长字符串 [[...]] 中，\ 是字面量反斜杠
+      local original2 = [[path\to\file and "quoted" text]]
       local encoded2 = hc._encode_special_chars(original2)
       -- 验证反斜杠和双引号被编码
       assert.is_true(encoded2:find("%%5C") ~= nil, "反斜杠应编码为 %5C")

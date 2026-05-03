@@ -15,6 +15,11 @@ function M.run(test_module)
     --- 测试 initialize
     test_initialize = function()
       local ai_engine = require("NeoAI.core.ai.ai_engine")
+      -- 确保 state_manager 已初始化（headless 模式兼容）
+      local state_mgr = require("NeoAI.core.config.state")
+      if not state_mgr.is_initialized() then
+        state_mgr.initialize({})
+      end
       ai_engine.initialize({
         config = {
           ai = {
@@ -49,6 +54,11 @@ function M.run(test_module)
     --- 测试 set_tools
     test_set_tools = function()
       local ai_engine = require("NeoAI.core.ai.ai_engine")
+      -- 确保 state_manager 已初始化（headless 模式兼容）
+      local state = require("NeoAI.core.config.state")
+      if not state.is_initialized() then
+        state.initialize({})
+      end
       ai_engine.initialize({
         config = {
           ai = {
@@ -70,6 +80,10 @@ function M.run(test_module)
           },
         },
       })
+
+      -- 确保 tool_registry 已初始化
+      local tr = require("NeoAI.tools.tool_registry")
+      tr.initialize({})
 
       local test_tools = {
         test_tool = {
@@ -110,6 +124,11 @@ function M.run(test_module)
     --- 测试 cancel_generation
     test_cancel_generation = function()
       local ai_engine = require("NeoAI.core.ai.ai_engine")
+      -- 确保 state.active_generations 存在（headless 模式兼容）
+      local state_mgr = require("NeoAI.core.config.state")
+      if not state_mgr.is_initialized() then
+        state_mgr.initialize({})
+      end
       -- 未生成时取消不应崩溃
       ai_engine.cancel_generation()
     end,
@@ -117,6 +136,15 @@ function M.run(test_module)
     --- 测试 get_status
     test_get_status = function()
       local ai_engine = require("NeoAI.core.ai.ai_engine")
+      -- 确保 state_manager 已初始化（headless 模式兼容）
+      local state_mgr = require("NeoAI.core.config.state")
+      if not state_mgr.is_initialized() then
+        state_mgr.initialize({})
+      end
+      -- 确保 ai_engine 已初始化
+      if not ai_engine.get_status().initialized then
+        ai_engine.initialize({ config = {} })
+      end
       local status = ai_engine.get_status()
       assert.not_nil(status)
       assert.not_nil(status.initialized)
@@ -147,6 +175,11 @@ function M.run(test_module)
     --- 测试 shutdown
     test_shutdown = function()
       local ai_engine = require("NeoAI.core.ai.ai_engine")
+      -- 确保 state.active_generations 存在（headless 模式兼容）
+      local state_mgr = require("NeoAI.core.config.state")
+      if not state_mgr.is_initialized() then
+        state_mgr.initialize({})
+      end
       ai_engine.shutdown()
       -- 再次 shutdown 不应崩溃
       ai_engine.shutdown()

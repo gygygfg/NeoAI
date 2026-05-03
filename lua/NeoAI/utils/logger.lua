@@ -297,10 +297,16 @@ function M._write_entry(entry)
   -- 检查日志轮转（确保写入前文件大小合适）
   M.rotate()
 
-  -- 输出到文件
+  -- 输出到文件或自定义函数
   if state.output then
-    state.output:write(entry .. "\n")
-    state.output:flush()
+    if type(state.output) == "function" then
+      -- 自定义输出函数
+      state.output(entry)
+    else
+      -- 文件句柄
+      state.output:write(entry .. "\n")
+      state.output:flush()
+    end
   else
     -- 静默输出到后台（使用 print 而非 vim.notify，避免弹通知）
     print(entry)
