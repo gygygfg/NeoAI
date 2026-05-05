@@ -89,9 +89,7 @@ function M.reload_tools()
   if not initialized then error("工具系统未初始化") end
   tool_registry.clear()
   builtin_tools_loaded = false
-  local state = require("NeoAI.core.config.state")
-  local config = state.get_slice("config")
-  local tools_config = (config and config.tools) or {}
+  local tools_config = full_config.tools or {}
   if tools_config.builtin ~= false then M._load_builtin_tools() end
   if tools_config.external and #tools_config.external > 0 then M._load_external_tools(tools_config.external) end
   vim.notify("工具重新加载完成", vim.log.levels.INFO)
@@ -165,9 +163,7 @@ end
 
 function M.update_config(new_config)
   if not initialized then return end
-  local state = require("NeoAI.core.config.state")
-  local config = state.get_slice("config")
-  local tools_config = (config and config.tools) or {}
+  local tools_config = full_config.tools or {}
   local merged = vim.tbl_extend("force", tools_config, new_config or {})
   tool_registry.update_config(merged)
   tool_executor.update_config(merged)

@@ -97,9 +97,8 @@ function M.initialize(config)
 
   -- 应用审批配置覆盖
   -- 从合并后的完整配置中读取 tools.approval 并覆盖各工具的 approval 字段
-  local merger = require("NeoAI.core.config.merger")
-  local state_manager = require("NeoAI.core.config.state")
-  local full_config = state_manager.get_state("config", "data")
+  local tools_init = require("NeoAI.tools")
+  local full_config = tools_init.get_full_config()
   if full_config then
     local tr = require("NeoAI.tools.tool_registry")
     pcall(tr.apply_approval_config, full_config)

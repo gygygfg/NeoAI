@@ -9,7 +9,7 @@ local event_constants = require("NeoAI.core.events")
 local ai_engine = require("NeoAI.core.ai.ai_engine")
 local history_manager = require("NeoAI.core.history.manager")
 local shutdown_flag = require("NeoAI.core.shutdown_flag")
-local state_manager = require("NeoAI.core.config.state")
+
 
 -- ========== 状态 ==========
 
@@ -251,7 +251,8 @@ function M.send_message(params)
 
   -- 检查工具是否启用
   local tools_enabled = true
-  local full_config = state_manager.get_state("config", "data") or {}
+  local core = require("NeoAI.core")
+  local full_config = core.get_config() or {}
   if full_config and full_config.tools then
     tools_enabled = full_config.tools.enabled ~= false
   end

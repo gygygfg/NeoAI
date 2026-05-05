@@ -11,7 +11,10 @@ local M = {}
 
 local logger = require("NeoAI.utils.logger")
 local default_config_module = require("NeoAI.default_config")
-local state_manager = require("NeoAI.core.config.state")
+
+
+-- ========== 闭包内私有状态 ==========
+local _saved_config = nil
 
 -- ========== 枚举值定义 ==========
 
@@ -367,11 +370,18 @@ local function resolve_candidate(candidate, ai_config)
   return result
 end
 
+--- 设置配置（由 core/init.lua 初始化时调用）
+--- @param config table 完整配置
+function M.set_config(config)
+  _saved_config = config
+end
+
 --- 获取指定场景的 AI 候选列表
 --- @param scenario string 场景名称
+--- @param full_config table|nil 完整配置（可选，不传则使用保存的配置）
 --- @return table 候选配置列表
-function M.get_scenario_candidates(scenario)
-  local full_config = state_manager.get_state("config", "data") or {}
+function M.get_scenario_candidates(scenario, full_config)
+  full_config = full_config or _saved_config or {}
   local ai_config = full_config and full_config.ai
   if not ai_config or not ai_config.scenarios then
     return {}
@@ -412,9 +422,10 @@ end
 
 --- 获取所有可用的模型候选
 --- @param scenario string 场景名称（保留参数兼容，实际忽略）
+--- @param full_config table|nil 完整配置（可选，不传则使用保存的配置）
 --- @return table 模型列表
-function M.get_available_models(scenario)
-  local full_config = state_manager.get_state("config", "data") or {}
+function M.get_available_models(scenario, full_config)
+  full_config = full_config or _saved_config or {}
   local ai_config = (full_config and full_config.ai) or {}
   local providers = ai_config.providers or {}
   local result = {}

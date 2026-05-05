@@ -11,8 +11,7 @@ M.merger = require("NeoAI.core.config.merger")
 --- @param config table 完整配置
 function M.initialize(config)
   M.keymap_manager.initialize(config)
-  -- 注意：config 和 app 状态切片已在 init.lua 的 setup() 中注册
-  -- 此处不再重复注册，避免冗余的 WARN 日志
+  M.merger.set_config(config)
 end
 
 return M

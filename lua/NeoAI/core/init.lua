@@ -5,10 +5,9 @@
 local logger = require("NeoAI.utils.logger")
 local ai_engine = require("NeoAI.core.ai.ai_engine")
 local history_manager = require("NeoAI.core.history.manager")
-local state_manager = require("NeoAI.core.config.state")
-
 -- ========== 闭包内私有状态 ==========
 local initialized = false
+local _config = nil
 
 -- ========== 公共接口 ==========
 local M = {}
@@ -19,8 +18,9 @@ local M = {}
 function M.initialize(config)
   if initialized then return M end
 
-  -- 初始化配置模块（含键位配置管理器和状态管理器）
-  -- state.register_slice 已在 init.lua 中注册 config/app 切片，此处幂等
+  _config = config
+
+  -- 初始化配置模块（含键位配置管理器）
   local config_module = require("NeoAI.core.config")
   config_module.initialize(config)
 
@@ -56,10 +56,10 @@ function M.get_history_manager()
   return history_manager
 end
 
---- 获取配置（从 state_manager）
+--- 获取配置
 function M.get_config()
   if not initialized then error("Core not initialized") end
-  return state_manager.get_state("config", "data")
+  return _config
 end
 
 --- 获取会话管理器（旧版兼容）

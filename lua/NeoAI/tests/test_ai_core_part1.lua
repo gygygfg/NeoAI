@@ -11,10 +11,8 @@ function M.run(test_module)
   print("\n=== test_ai_core ===")
 
   local function setup_engine_config()
-    local state_mgr = require("NeoAI.core.config.state")
-    state_mgr._test_reset()
-    state_mgr.register_slice("config", { data = { ai = { default = "test", providers = { test = { api_type = "openai", base_url = "https://test.api.com", api_key = "sk-test", models = { "test-model" } } }, scenarios = { chat = { provider = "test", model_name = "test-model", temperature = 0.5, max_tokens = 100, stream = false, timeout = 5000 } } } } })
-    state_mgr.register_slice("ai_engine", { tools = {}, tool_definitions = {}, tool_call_counter = 0, first_request = true, active_generations = {} })
+    local merger = require("NeoAI.core.config.merger")
+    merger.set_config({ ai = { default = "test", providers = { test = { api_type = "openai", base_url = "https://test.api.com", api_key = "sk-test", models = { "test-model" } } }, scenarios = { chat = { provider = "test", model_name = "test-model", temperature = 0.5, max_tokens = 100, stream = false, timeout = 5000 } } } })
   end
 
   return test.run_tests({

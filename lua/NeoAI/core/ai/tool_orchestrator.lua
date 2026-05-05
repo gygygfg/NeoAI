@@ -18,9 +18,11 @@ local event_constants = require("NeoAI.core.events")
 local tool_pack = require("NeoAI.tools.tool_pack")
 local shutdown_flag = require("NeoAI.core.shutdown_flag")
 local response_retry = require("NeoAI.core.ai.response_retry")
-local state_manager = require("NeoAI.core.config.state")
+
 
 -- ========== 状态 ==========
+
+local _tools = {}
 
 local state = {
   initialized = false,
@@ -242,10 +244,7 @@ function M.initialize(options)
   state.max_iterations = state.config.max_tool_iterations or 20
   state.initialized = true
 
-  -- 注册状态切片
-  state_manager.register_slice("tool_orchestrator", {
-    tools = {},
-  })
+  _tools = {}
 
   -- 初始化工具包管理模块
   tool_pack.initialize()
@@ -1352,11 +1351,11 @@ end
 -- ========== 工具管理 ==========
 
 function M.set_tools(tools)
-  state_manager.set_state("tool_orchestrator", "tools", tools or {})
+  _tools = tools or {}
 end
 
 function M.get_tools()
-  return state_manager.get_state("tool_orchestrator", "tools") or {}
+  return _tools or {}
 end
 
 -- ========== 状态查询 ==========
@@ -1641,9 +1640,9 @@ function M.execute_single_tool_request(session_id, tool_name, args, callback)
     tool_def = { type = "function", ["function"] = tf }
   end
 
-  -- 回退：从切片 tools 查找
+  -- 回退：从闭包 tools 查找
   if not tool_def then
-    local tools = state_manager.get_state("tool_orchestrator", "tools") or {}
+    local tools = _tools or {}
     for _, t in ipairs(tools) do
       if t.name == tool_name then
         local tf = { name = t.name, description = t.description or ("执行 " .. t.name .. " 操作") }
@@ -1881,7 +1880,7 @@ function M.shutdown()
     M.unregister_session(session_id)
   end
   state.sessions = {}
-  state_manager.set_state("tool_orchestrator", "tools", {})
+  _tools = {}
   state.initialized = false
 end
 
@@ -1891,7 +1890,7 @@ function M._test_reset()
   state.sessions = {}
   state.config = {}
   state.max_iterations = 20
-  state_manager.set_state("tool_orchestrator", "tools", {})
+  _tools = {}
 end
 
 --- 紧急清理（VimLeavePre 中使用）
@@ -1930,7 +1929,7 @@ function M.cleanup_all()
 
   -- 清空所有状态
   state.sessions = {}
-  state_manager.set_state("tool_orchestrator", "tools", {})
+  _tools = {}
 end
 
 return M

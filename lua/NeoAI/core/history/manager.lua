@@ -26,7 +26,6 @@ local persistence = require("NeoAI.core.history.persistence")
 local cache = require("NeoAI.core.history.cache")
 local saver = require("NeoAI.core.history.saver")
 local shutdown_flag = require("NeoAI.core.shutdown_flag")
-local state_manager = require("NeoAI.core.config.state")
 local message_builder = require("NeoAI.core.history.message_builder")
 
 -- ========== 状态 ==========
@@ -38,6 +37,9 @@ local state = {
   _vimleave_hooked = false,
   _is_shutting_down = false,
 }
+
+-- 保存的完整配置引用
+local _config = nil
 
 -- ========== 辅助函数 ==========
 
@@ -110,9 +112,8 @@ function M.initialize(options)
   state.sessions = {}
   state.current_session_id = nil
 
-  -- 优先从统一状态管理器获取会话配置
-  -- 若 state_manager 未初始化（如测试环境），回退到 options.config
-  local full_config = state_manager.get_state("config", "data") or (options or {}).config or (options or {})
+  local full_config = (options or {}).config or {}
+  _config = full_config
   local session_config = full_config.session or {}
   local auto_save = session_config.auto_save ~= false
   local auto_naming = session_config.auto_naming ~= false
@@ -216,8 +217,7 @@ function M.create_session(name, is_root, parent_id)
   local id = generate_id()
   -- 如果调用方显式传入了 name，直接使用；否则根据 auto_naming 决定默认值
   if name == nil then
-    local full_config = state_manager.get_state("config", "data") or {}
-    local auto_naming = (full_config.session and full_config.session.auto_naming) ~= false
+    local auto_naming = (_config and _config.session and _config.session.auto_naming) ~= false
     name = auto_naming and "聊天会话" or ""
   end
   local session = {
@@ -402,8 +402,7 @@ function M.add_round(session_id, user_msg, assistant_msg, usage)
 
   trigger_event(Events.ROUND_ADDED, { session_id = session_id, session = session })
 
-  local full_config = state_manager.get_state("config", "data") or {}
-  local auto_naming = (full_config.session and full_config.session.auto_naming) ~= false
+  local auto_naming = (_config and _config.session and _config.session.auto_naming) ~= false
   if auto_naming then
     M.auto_name_session(session_id)
   end
@@ -802,8 +801,7 @@ end
 -- ========== 持久化 ==========
 
 function M._mark_dirty()
-  local full_config = state_manager.get_state("config", "data") or {}
-  local auto_save = (full_config.session and full_config.session.auto_save) ~= false
+  local auto_save = (_config and _config.session and _config.session.auto_save) ~= false
   if not auto_save then return end
   if state._is_shutting_down then return end
 

@@ -232,7 +232,8 @@ function M.create_window(window_type, options)
 
   window_counter = window_counter + 1
   local window_id = "win_" .. tostring(os.time()) .. "_" .. window_counter
-  local full_config = state_manager.get_state("config", "data") or {}
+  local core = require("NeoAI.core")
+  local full_config = core.get_config() or {}
   local merged = vim.tbl_extend("force", full_config, options or {})
   merged.title = merged.title or ("NeoAI - " .. window_type)
 
@@ -585,9 +586,8 @@ function M.is_neoai_window(win)
       return true
     end
   end
-  -- 检查通过状态切片注册的组件窗口（如 tool_approval 直接 nvim_open_win 创建的窗口）
-  local state_manager = require("NeoAI.core.config.state")
-  local tool_approval_win = state_manager.get_state("tool_approval", "win")
+  -- 检查 tool_approval 组件窗口
+  local tool_approval_win = require("NeoAI.ui.components.tool_approval").get_win_id()
   if tool_approval_win and tool_approval_win == win then
     return true
   end

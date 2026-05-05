@@ -1,6 +1,6 @@
 local M = {}
 
-local state_manager = require("NeoAI.core.config.state")
+local core = require("NeoAI.core")
 
 -- 模块状态
 local state = {
@@ -20,6 +20,8 @@ local state = {
   input_start_line = 0, -- 输入区域起始行号
   input_line_count = 3, -- 输入区域行数
   _updating = false, -- 防抖标志
+  _hidden = false, -- 是否被隐藏（而非关闭）
+  _parent_buf = nil, -- 父窗口的 buffer，用于 BufEnter 检测
 }
 
 --- 初始化
@@ -30,16 +32,7 @@ function M.initialize(config)
   state.ns_id = vim.api.nvim_create_namespace("NeoAI_InlineInput")
   state.initialized = true
 
-  -- 注册状态切片
-  state_manager.register_slice("virtual_input", {
-    active = false,
-    mode = nil,
-    buf = nil,
-    float_buf = nil,
-    float_win = nil,
-    parent_win = nil,
-    placeholder = "输入消息...",
-  })
+  -- 状态通过模块级 state 表管理，不注册全局状态切片
 end
 
 --- 激活内联输入模式
@@ -66,11 +59,7 @@ function M.activate(buf, opts)
   state.input_line_count = opts.input_line_count or 3
   state.active = true
 
-  -- 同步到状态切片
-  state_manager.set_state("virtual_input", "active", true)
-  state_manager.set_state("virtual_input", "mode", "inline")
-  state_manager.set_state("virtual_input", "buf", buf)
-  state_manager.set_state("virtual_input", "placeholder", state.placeholder)
+  -- 状态已通过模块级 state 表管理
 
   -- 设置 buffer 为可修改
   vim.api.nvim_set_option_value("modifiable", true, { buf = buf })
@@ -202,11 +191,13 @@ function M.open(parent_win, opts)
     noautocmd = true,
   })
 
+  -- 保存父窗口 buffer，用于 BufEnter 检测
+  state._parent_buf = vim.api.nvim_win_get_buf(parent_win)
+
   -- 注册到 window_manager，以便切换 buffer 时自动隐藏/显示
   local ok, wm = pcall(require, "NeoAI.ui.window.window_manager")
   if ok and wm and wm.register_float_window then
-    local parent_buf = vim.api.nvim_win_get_buf(parent_win)
-    wm.register_float_window(parent_buf, state.float_win, state.float_buf)
+    wm.register_float_window(state._parent_buf, state.float_win, state.float_buf)
   end
 
   -- 设置自动命令：当在浮动输入框执行 Ex 命令时，自动将焦点切回 chat 主窗口
@@ -229,8 +220,11 @@ function M.open(parent_win, opts)
   -- 将浮动窗口光标定位到第一行（> 提示符后面）
   pcall(vim.api.nvim_win_set_cursor, state.float_win, { 1, 2 })
 
-  -- 注册光标离开自动隐藏
-  M._setup_cursor_leave_autocmd()
+  -- 注册 buffer 隐藏监听器：当 chat 窗口 buffer 被隐藏到后台时，隐藏输入框
+  M._setup_bufhidden_autocmd()
+
+  -- 注册 BufEnter 监听器：当父窗口 buffer 重新成为当前 buffer 时，恢复显示输入框
+  M._setup_bufenter_autocmd()
 
   -- 设置窗口选项
   vim.api.nvim_set_option_value("wrap", true, { win = state.float_win })
@@ -290,14 +284,7 @@ function M.open(parent_win, opts)
 
   state.active = true
 
-  -- 同步到状态切片
-  state_manager.set_state("virtual_input", "active", true)
-  state_manager.set_state("virtual_input", "mode", "float")
-  state_manager.set_state("virtual_input", "buf", nil)
-  state_manager.set_state("virtual_input", "float_buf", state.float_buf)
-  state_manager.set_state("virtual_input", "float_win", state.float_win)
-  state_manager.set_state("virtual_input", "parent_win", state.parent_win)
-  state_manager.set_state("virtual_input", "placeholder", state.placeholder)
+  -- 状态已通过模块级 state 表管理
 
   return true
 end
@@ -311,8 +298,11 @@ function M.close(force)
   -- 清理 VimResized 自动命令
   M._cleanup_vimresized_autocmd()
 
-  -- 清理光标离开自动命令
-  M._cleanup_cursor_leave_autocmd()
+  -- 清理 buffer 隐藏自动命令
+  M._cleanup_bufhidden_autocmd()
+
+  -- 清理 BufEnter 自动命令
+  M._cleanup_bufenter_autocmd()
 
   -- 清理 CmdlineEnter 自动命令
   if state.float_buf then
@@ -374,13 +364,10 @@ function M.close(force)
   state.parent_win = nil
   state.mode = nil
   state._user_exited_insert = false
+  state._hidden = false
+  state._parent_buf = nil
 
-  -- 同步到状态切片
-  state_manager.set_state("virtual_input", "active", false)
-  state_manager.set_state("virtual_input", "mode", nil)
-  state_manager.set_state("virtual_input", "float_buf", nil)
-  state_manager.set_state("virtual_input", "float_win", nil)
-  state_manager.set_state("virtual_input", "parent_win", nil)
+  -- 状态已通过模块级 state 表管理
 end
 
 --- 停用输入模式（兼容旧接口）
@@ -414,10 +401,7 @@ function M.deactivate()
   state.input_start_line = 0
   state._user_exited_insert = false
 
-  -- 同步到状态切片
-  state_manager.set_state("virtual_input", "active", false)
-  state_manager.set_state("virtual_input", "mode", nil)
-  state_manager.set_state("virtual_input", "buf", nil)
+  -- 状态已通过模块级 state 表管理
 end
 
 --- 确保末尾有足够的空行
@@ -589,7 +573,8 @@ function M._setup_float_keymaps()
   local buf = state.float_buf
 
   -- 从配置读取 send 键位（send.insert / send.normal 是 { key = "...", desc = "..." } 结构）
-  local full_config = state_manager.get_state("config", "data") or {}
+  local core = require("NeoAI.core")
+  local full_config = core.get_config() or {}
   local send_config = full_config.keymaps and full_config.keymaps.chat and full_config.keymaps.chat.send
   local send_key = send_config and send_config.insert and send_config.insert.key or "<C-s>"
   local normal_send_key = send_config and send_config.normal and send_config.normal.key or "<CR>"
@@ -658,9 +643,10 @@ function M._bind_chat_keymaps_to_float(buf)
     return
   end
 
-  -- 从统一状态管理器中获取快捷键配置
+  -- 从配置中获取快捷键配置
   -- 所有键位统一由 default_config.lua 定义，模块内部不提供任何 fallback 默认值
-  local full_config = state_manager.get_state("config", "data") or {}
+  local core = require("NeoAI.core")
+  local full_config = core.get_config() or {}
   if not full_config or not full_config.keymaps or not full_config.keymaps.chat then
     return
   end
@@ -716,11 +702,11 @@ function M._bind_chat_keymaps_to_float(buf)
   for _, binding in ipairs(bindings) do
     for _, mode in ipairs(binding.modes or { "n" }) do
       vim.keymap.set(mode, binding.key, function()
-        -- 先关闭浮动输入框，再执行 chat 窗口操作
-        -- quit 操作内部会关闭输入框，所以不需要先 close
-        -- tool_approval 操作不需要关闭输入框，审批窗口是独立悬浮窗，输入框可保持打开
+        -- 先隐藏浮动输入框，再执行 chat 窗口操作
+        -- quit 操作内部会关闭输入框，所以不需要先 hide
+        -- tool_approval 操作不需要隐藏输入框，审批窗口是独立悬浮窗，输入框可保持打开
         if binding.key ~= quit_key and binding.key ~= tool_approval_key then
-          M.close()
+          M.hide()
         end
         binding.action()
       end, { buffer = buf, noremap = true, silent = true, desc = "Chat: " .. tostring(binding.key) })
@@ -752,11 +738,11 @@ function M._submit_float()
     state.on_submit(content)
   end
 
-  -- 提交后关闭输入框（如果 on_submit 是异步的且未触发 GENERATION_STARTED，这里确保关闭）
+  -- 提交后隐藏输入框（如果 on_submit 是异步的且未触发 GENERATION_STARTED，这里确保隐藏）
   -- 使用 vim.schedule 延迟执行，让 GENERATION_STARTED 事件有机会先处理
   vim.schedule(function()
     if state.active and state.mode == "float" then
-      M.close()
+      M.hide()
     end
   end)
 end
@@ -769,7 +755,7 @@ function M._setup_keymaps()
   local buf = state.buf
 
   -- 从配置读取 send 键位（send.insert / send.normal 是 { key = "...", desc = "..." } 结构）
-  local full_config = state_manager.get_state("config", "data") or {}
+  local full_config = core.get_config() or {}
   local send_config = full_config.keymaps and full_config.keymaps.chat and full_config.keymaps.chat.send
   local send_key = send_config and send_config.insert and send_config.insert.key or "<C-s>"
   local normal_send_key = send_config and send_config.normal and send_config.normal.key or "<CR>"
@@ -874,7 +860,7 @@ end
 --- 获取键位配置
 --- 所有键位统一由 default_config.lua 定义，模块内部不提供任何 fallback 默认值
 function M._get_keymaps()
-  local full_config = state_manager.get_state("config", "data") or {}
+  local full_config = core.get_config() or {}
   local chat_keymaps = full_config.keymaps and full_config.keymaps.chat or {}
   return {
     normal_mode = chat_keymaps.send.insert.key,
@@ -891,6 +877,12 @@ function M.focus_and_insert()
   if not state.active or state.mode ~= "float" then
     return
   end
+
+  -- 如果输入框被隐藏，先恢复显示
+  if state._hidden then
+    M.show()
+  end
+
   if not state.float_win or not vim.api.nvim_win_is_valid(state.float_win) then
     return
   end
@@ -928,6 +920,55 @@ end
 --- 获取输入区域行数
 function M.get_input_line_count()
   return state.input_line_count
+end
+
+--- 隐藏浮动输入框（不销毁，保留 buffer 和状态，切回来时恢复）
+function M.hide()
+  if not state.active or state.mode ~= "float" then
+    return
+  end
+  if state._hidden then
+    return
+  end
+  if not state.float_win or not vim.api.nvim_win_is_valid(state.float_win) then
+    return
+  end
+
+  -- 使用 window_manager 的 hide_float_window 将窗口移到屏幕外
+  local wm = require("NeoAI.ui.window.window_manager")
+  if state._parent_buf then
+    wm.hide_float_window(state._parent_buf)
+  end
+
+  state._hidden = true
+end
+
+--- 显示被隐藏的浮动输入框
+function M.show()
+  if not state.active or state.mode ~= "float" then
+    return false
+  end
+  if not state._hidden then
+    return false
+  end
+  if not state.float_win or not vim.api.nvim_win_is_valid(state.float_win) then
+    return false
+  end
+  if not state.parent_win or not vim.api.nvim_win_is_valid(state.parent_win) then
+    return false
+  end
+
+  -- 使用 window_manager 的 show_float_window 恢复窗口位置
+  local wm = require("NeoAI.ui.window.window_manager")
+  if state._parent_buf then
+    wm.show_float_window(state._parent_buf)
+  end
+
+  -- 重新定位确保位置正确
+  M.reposition()
+
+  state._hidden = false
+  return true
 end
 
 --- 重新定位浮动输入框（窗口大小变化时调用）
@@ -1012,84 +1053,77 @@ function M._cleanup_vimresized_autocmd()
   pcall(vim.api.nvim_del_augroup_by_name, "NeoAIVirtualInputVimResized")
 end
 
---- 注册光标离开自动隐藏
---- 当光标离开浮动输入框时，延迟 50ms 检测光标所在的 buffer
---- 如果目标 buffer 是当前 chat 窗口的 buffer（通过 app 状态切片中的 chat_buf 判断），则不收起
---- 否则自动关闭浮动输入框
-function M._setup_cursor_leave_autocmd()
-  M._cleanup_cursor_leave_autocmd()
-  local group = vim.api.nvim_create_augroup("NeoAIVirtualInputCursorLeave", { clear = true })
-  vim.api.nvim_create_autocmd("CursorMoved", {
+--- 注册 buffer 隐藏自动命令
+--- 当 chat 窗口的 buffer 被隐藏到后台时（如切换到其他 buffer），隐藏浮动输入框
+--- 切换到 tool_approval、reasoning_display 等内部浮动窗口时不会触发
+function M._setup_bufhidden_autocmd()
+  M._cleanup_bufhidden_autocmd()
+  if not state._parent_buf or not vim.api.nvim_buf_is_valid(state._parent_buf) then
+    return
+  end
+  local group = vim.api.nvim_create_augroup("NeoAIVirtualInputBufHidden", { clear = true })
+  vim.api.nvim_create_autocmd("BufHidden", {
     group = group,
+    buffer = state._parent_buf,
     callback = function()
-      -- 仅在浮动输入框激活时处理
+      -- 仅在浮动输入框激活且未隐藏时处理
       if not state.active or state.mode ~= "float" then
+        return
+      end
+      if state._hidden then
         return
       end
       if not state.float_win or not vim.api.nvim_win_is_valid(state.float_win) then
         return
       end
 
-      -- 快速检查：如果 tool_approval 正在打开或已激活，不处理此次 CursorMoved
-      -- tool_approval.open 在 nvim_open_win 之前就设置了 active=true，
-      -- 所以即使 nvim_open_win 触发了 CursorMoved，这里也能识别
-      if state_manager.get_state("tool_approval", "active") then
-        return
-      end
-
-      -- 获取当前光标所在的窗口
-      local current_win = vim.api.nvim_get_current_win()
-
-      -- 如果光标仍在浮动输入框内，不处理
-      if current_win == state.float_win then
-        return
-      end
-
-      -- 光标离开了浮动输入框，延迟 50ms 检测目标 buffer
-      vim.defer_fn(function()
-        -- 再次检查状态是否仍然有效
-        if not state.active or state.mode ~= "float" then
-          return
-        end
-        if not state.float_win or not vim.api.nvim_win_is_valid(state.float_win) then
-          return
-        end
-
-        -- 获取当前光标所在的窗口和 buffer
-        local target_win = vim.api.nvim_get_current_win()
-        local target_buf = vim.api.nvim_win_get_buf(target_win)
-
-        -- 如果光标回到了浮动输入框，不处理
-        if target_win == state.float_win then
-          return
-        end
-
-        -- 从 app 状态切片获取当前 chat 窗口的 buffer
-        local chat_buf = state_manager.get_state("app", "chat_buf")
-
-        -- 如果目标 buffer 是当前 chat 窗口的 buffer，不收起
-        if chat_buf and target_buf == chat_buf then
-          return
-        end
-
-        -- 检查目标窗口是否是 NeoAI 管理的内部窗口（如 reasoning_display、tool_approval 等）
-        -- 如果是，不收起浮动输入框，避免用户操作 NeoAI 内部窗口时输入框被关闭
-        local window_manager = require("NeoAI.ui.window.window_manager")
-        if window_manager.is_neoai_window(target_win) then
-          return
-        end
-
-        -- 否则关闭浮动输入框
-        M.close()
-      end, 50)
+      -- 隐藏浮动输入框（不销毁，切回来时恢复）
+      M.hide()
     end,
-    desc = "光标离开浮动输入框时自动隐藏",
+    desc = "chat 窗口 buffer 隐藏时隐藏浮动输入框",
   })
 end
 
---- 清理光标离开自动命令
-function M._cleanup_cursor_leave_autocmd()
-  pcall(vim.api.nvim_del_augroup_by_name, "NeoAIVirtualInputCursorLeave")
+--- 清理 buffer 隐藏自动命令
+function M._cleanup_bufhidden_autocmd()
+  pcall(vim.api.nvim_del_augroup_by_name, "NeoAIVirtualInputBufHidden")
+end
+
+--- 注册 BufEnter 自动命令
+--- 当父窗口 buffer 重新成为当前 buffer 时，恢复显示被隐藏的输入框
+function M._setup_bufenter_autocmd()
+  M._cleanup_bufenter_autocmd()
+  if not state._parent_buf or not vim.api.nvim_buf_is_valid(state._parent_buf) then
+    return
+  end
+  local group = vim.api.nvim_create_augroup("NeoAIVirtualInputBufEnter", { clear = true })
+  vim.api.nvim_create_autocmd("BufEnter", {
+    group = group,
+    buffer = state._parent_buf,
+    callback = function()
+      -- 仅在输入框被隐藏时处理
+      if not state._hidden then
+        return
+      end
+      if not state.active or state.mode ~= "float" then
+        return
+      end
+
+      -- 延迟恢复，确保窗口切换完成
+      vim.defer_fn(function()
+        if not state._hidden then
+          return
+        end
+        M.show()
+      end, 30)
+    end,
+    desc = "父窗口 buffer 重新激活时恢复浮动输入框",
+  })
+end
+
+--- 清理 BufEnter 自动命令
+function M._cleanup_bufenter_autocmd()
+  pcall(vim.api.nvim_del_augroup_by_name, "NeoAIVirtualInputBufEnter")
 end
 
 return M

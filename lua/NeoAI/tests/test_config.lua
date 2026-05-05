@@ -11,9 +11,8 @@ function M.run(test_module)
   print("\n=== test_config ===")
 
   local function setup_merger_state()
-    local state = require("NeoAI.core.config.state")
-    state._test_reset()
-    state.register_slice("config", { data = { ai = { providers = { test_provider = { api_type = "openai", base_url = "https://test.api.com", api_key = "sk-test", models = { "test-model" } } }, scenarios = { chat = { provider = "test_provider", model_name = "test-model", temperature = 0.5 } } } } })
+    local merger = require("NeoAI.core.config.merger")
+    merger.set_config({ ai = { providers = { test_provider = { api_type = "openai", base_url = "https://test.api.com", api_key = "sk-test", models = { "test-model" } } }, scenarios = { chat = { provider = "test_provider", model_name = "test-model", temperature = 0.5 } } } })
   end
 
   return test.run_tests({
@@ -96,45 +95,13 @@ function M.run(test_module)
       assert.equal(5, config.log.max_backups, "默认备份数应为 5")
     end,
 
-    -- ========== state ==========
-    test_state_register_slice = function()
-      local state = require("NeoAI.core.config.state")
-      state._test_reset()
-      assert.is_false(state.is_initialized(), "重置后应未初始化")
-      state.register_slice("app", { test_key = "test_value" })
-      assert.is_true(state.is_initialized(), "注册 app 切片后应返回 true")
-    end,
-
-    test_state_get_state = function()
-      local state = require("NeoAI.core.config.state")
-      state._test_reset()
-      state.register_slice("app", { key1 = "val1", key2 = { nested = true } })
-      assert.equal("val1", state.get_state("app", "key1"))
-      assert.is_true(state.get_state("app", "key2.nested"))
-    end,
-
-    test_state_get_state_value = function()
-      local state = require("NeoAI.core.config.state")
-      state._test_reset()
-      state.register_slice("app", { ai = { providers = { deepseek = { api_key = "sk-test" } } } })
-      assert.equal("sk-test", state.get_state("app", "ai.providers.deepseek.api_key"), "点号路径应能获取嵌套值")
-      assert.equal(nil, state.get_state("app", "ai.providers.nonexistent"), "不存在的路径应返回 nil")
-      assert.equal("default", state.get_state("app", "ai.providers.nonexistent", "default"), "应返回默认值")
-    end,
-
-    test_state_double_register = function()
-      local state = require("NeoAI.core.config.state")
-      state._test_reset()
-      state.register_slice("app", { version = 1 })
-      state.register_slice("app", { version = 2 })
-      assert.equal(1, state.get_state("app", "version"), "重复注册应被忽略")
-    end,
-
+    -- ========== state（协程上下文） ==========
     test_state_reset = function()
       local state = require("NeoAI.core.config.state")
       state._test_reset()
-      assert.is_false(state.is_initialized())
-      assert.equal(nil, state.get_state("app"))
+      -- 重置后 get_shared 应返回空表
+      local shared = state.get_shared()
+      assert.not_nil(shared, "get_shared 应返回表")
     end,
 
     -- ========== merger ==========

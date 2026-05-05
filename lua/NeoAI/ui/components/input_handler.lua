@@ -15,13 +15,7 @@ function M.initialize(config)
   state.config = config or {}
   state.initialized = true
 
-  -- 注册状态切片
-  state_manager.register_slice("input_handler", {
-    config = state.config,
-    current_mode = "normal",
-    input_buffer = "",
-    is_sending = false,
-  })
+  -- 状态通过模块级 state 表管理，不注册全局状态切片
 end
 
 function M.setup_keymaps() end

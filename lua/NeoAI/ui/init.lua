@@ -37,7 +37,7 @@ local function resolve_session_id(session_id)
 end
 
 local function open_window(window_type, session_id, branch_id)
-  local config = state_manager.get_state("config", "data") or {}
+  local config = state.full_config or {}
   local win_type_map = { tree = "tree", chat = "chat" }
   local titles = { tree = "NeoAI 会话树", chat = "NeoAI 聊天" }
 
@@ -216,7 +216,7 @@ end
 
 function M.update_config(new_config)
   if not state.initialized then return end
-  local config = state_manager.get_state("config", "data") or {}
+  local config = state.full_config or {}
   local merged = vim.tbl_extend("force", config, new_config or {})
   local window_config = merged.window or {}
   if merged.window_mode then window_config.window_mode = merged.window_mode end

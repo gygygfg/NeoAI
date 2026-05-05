@@ -8,29 +8,28 @@
 ---   tool_call_counter 是模块内部计数器，保留在闭包内
 
 local logger = require("NeoAI.utils.logger")
-local state_manager = require("NeoAI.core.config.state")
 local http_utils = require("NeoAI.core.ai.http_utils")
 
 -- ========== 闭包内私有状态 ==========
--- tool_definitions 和 first_request 已迁移到 state_manager 的 "ai_engine" 切片
--- 通过 get_tool_definitions() / get_first_request() 访问
+local _tool_definitions = {}
+local _first_request = true
 local tool_call_counter = 0
 
 -- ========== 辅助函数 ==========
 
---- 获取工具定义列表（从 state_manager 读取）
+--- 获取工具定义列表
 local function get_tool_definitions()
-  return state_manager.get_state("ai_engine", "tool_definitions") or {}
+  return _tool_definitions or {}
 end
 
 --- 获取首次请求标志
 local function get_first_request()
-  return state_manager.get_state("ai_engine", "first_request") ~= false
+  return _first_request ~= false
 end
 
 --- 设置首次请求标志
 local function set_first_request(val)
-  state_manager.set_state("ai_engine", "first_request", val)
+  _first_request = val
 end
 
 -- ========== 公共接口 ==========
@@ -165,15 +164,13 @@ function M.add_tool_call_to_history(messages, tool_call, tool_result)
 end
 
 --- 设置工具定义列表
---- 写入 state_manager 的 "ai_engine" 切片
 function M.set_tool_definitions(defs)
-  state_manager.set_state("ai_engine", "tool_definitions", defs or {})
+  _tool_definitions = defs or {}
 end
 
 --- 重置首次请求标志
---- 写入 state_manager 的 "ai_engine" 切片
 function M.reset_first_request()
-  state_manager.set_state("ai_engine", "first_request", true)
+  _first_request = true
 end
 
 --- 构建 AI 请求体
@@ -260,7 +257,8 @@ function M.build_request(params)
     if options.tools_enabled ~= nil then
       tools_enabled = options.tools_enabled
     else
-      local full_config = state_manager.get_state("config", "data") or {}
+      local core = require("NeoAI.core")
+      local full_config = core.get_config() or {}
       if full_config and full_config.tools and full_config.tools.enabled ~= nil then
         tools_enabled = full_config.tools.enabled
       elseif full_config and full_config.ai then

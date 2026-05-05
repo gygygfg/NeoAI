@@ -10,8 +10,8 @@ local logger = require("NeoAI.utils.logger")
 local event_constants = require("NeoAI.core.events")
 local json = require("NeoAI.utils.json")
 local config_merger = require("NeoAI.core.config.merger")
-local state_manager = require("NeoAI.core.config.state")
 local shutdown_flag = require("NeoAI.core.shutdown_flag")
+local state_manager = require("NeoAI.core.config.state")
 
 -- 子模块
 local http_client = require("NeoAI.core.ai.http_client")
@@ -21,10 +21,8 @@ local request_builder = require("NeoAI.core.ai.request_builder")
 local stream_processor = require("NeoAI.core.ai.stream_processor")
 
 -- ========== 闭包内私有状态 ==========
--- 注意：tools、tool_definitions、active_generations 等跨模块共享状态
--- 已迁移到 state_manager 的状态切片 "ai_engine" 中，
--- 通过 state_manager.get_state("ai_engine", "tools") 访问
--- 此处仅保留模块内部私有状态
+local _tools = {}           -- tools 映射表
+local _tool_definitions = {} -- tool 定义列表
 local state = {
   initialized = false,
   is_generating = false,
@@ -41,17 +39,8 @@ local M = {}
 function M.initialize(options)
   if state.initialized then return M end
 
-  -- 注册状态切片（幂等，已存在则跳过）
-  state_manager.register_slice("ai_engine", {
-    tools = {},
-    tool_definitions = {},
-    tool_call_counter = 0,
-    first_request = true,
-    active_generations = {},
-  })
-
   http_client.initialize({ config = {} })
-  local full_config = state_manager.get_state("config", "data") or (options or {}).config or {}
+  local full_config = (options or {}).config or {}
   tool_orchestrator.initialize({ config = full_config })
   local tool_pack = require("NeoAI.tools.tool_pack")
   tool_pack.initialize()
@@ -84,7 +73,8 @@ local function resolve_scenario_config(scenario)
     local preset = config_merger.get_preset(scenario)
     if preset and preset.base_url and preset.api_key then return preset end
   end
-  local full_config = state_manager.get_state("config", "data") or {}
+  local core = require("NeoAI.core")
+  local full_config = core.get_config() or {}
   local ai_config = (full_config and full_config.ai) or {}
   local scenarios = ai_config.scenarios or {}
   local entry = scenarios[scenario] or scenarios[ai_config.default or "chat"]
@@ -110,7 +100,8 @@ local function get_model_config(model_index)
     local models = config_merger.get_available_models("chat")
     local target = models[model_index]
     if target then
-      local full_config = state_manager.get_state("config", "data") or {}
+      local core = require("NeoAI.core")
+      local full_config = core.get_config() or {}
       local providers = (full_config and full_config.ai and full_config.ai.providers) or {}
       local pdef = providers[target.provider]
       if pdef then
@@ -390,7 +381,8 @@ function _handle_stream_end(generation_id, processor, params)
   local is_tool_loop = params and params.is_tool_loop
   local is_final_round = params and params.is_final_round
   local tools_enabled = true
-  local full_config = state_manager.get_state("config", "data")
+  local core = require("NeoAI.core")
+  local full_config = core.get_config() or {}
   if full_config and full_config.tools and full_config.tools.enabled ~= nil then tools_enabled = full_config.tools.enabled
   elseif full_config and full_config.ai then tools_enabled = full_config.ai.tools_enabled end
 
@@ -474,7 +466,8 @@ function _handle_ai_response(generation_id, response, params)
   end
 
   local tools_enabled = true
-  local full_config = state_manager.get_state("config", "data") or {}
+  local core = require("NeoAI.core")
+  local full_config = core.get_config() or {}
   if full_config and full_config.tools and full_config.tools.enabled ~= nil then tools_enabled = full_config.tools.enabled
   elseif full_config and full_config.ai then tools_enabled = full_config.ai.tools_enabled end
   stream_processor.clear_reasoning_throttle()
@@ -724,10 +717,11 @@ function M.set_tools(tools)
       table.insert(tool_defs, { type = "function", ["function"] = tf })
     end
   end
-  -- 写入 state_manager 的状态切片
-  state_manager.set_state("ai_engine", "tools", tools_map)
-  state_manager.set_state("ai_engine", "tool_definitions", tool_defs)
-  state_manager.set_state("tool_orchestrator", "tools", tools_map)
+  _tools = tools_map
+  _tool_definitions = tool_defs
+  -- 同步到 tool_orchestrator
+  local to = require("NeoAI.core.ai.tool_orchestrator")
+  to.set_tools(tools_map)
   request_builder.set_tool_definitions(tool_defs)
 end
 
@@ -742,7 +736,7 @@ function M.process_query(query, options)
 end
 
 function M.get_status()
-  local tools = state_manager.get_state("ai_engine", "tools") or {}
+  local tools = _tools or {}
   return { initialized = state.initialized, is_generating = state.is_generating, current_generation_id = state.current_generation_id, active_generations_count = vim.tbl_count(state.active_generations), tools_available = next(tools) ~= nil, tool_orchestrator = { current_iteration = tool_orchestrator.get_current_iteration() }, http_client = http_client.get_state(), submodules = { ai_engine = true, http_client = true, tool_orchestrator = true, request_builder = true, stream_processor = true } }
 end
 
@@ -794,7 +788,7 @@ function M.estimate_request_tokens(request) return request_builder.estimate_requ
 function M.start_async_loop(params) return tool_orchestrator.start_async_loop(params) end
 function M.on_generation_complete(data) return tool_orchestrator.on_generation_complete(data) end
 function M.get_current_iteration(session_id) return tool_orchestrator.get_current_iteration(session_id) end
-function M.get_tools() return state_manager.get_state("tool_orchestrator", "tools") or {} end
+function M.get_tools() return _tools or {} end
 function M.is_executing(session_id) return tool_orchestrator.is_executing(session_id) end
 function M.get_loop_status() return "deprecated" end
 function M.is_reasoning_active() return false end

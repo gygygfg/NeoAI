@@ -203,7 +203,8 @@ function M.send_message(content, session_id, branch_id, window_id, format, callb
   local target_session_id = session.id
   local current_session = hm.get_session(session.id)
   if current_session and current_session.user ~= nil and current_session.user ~= "" then
-    local full_config = require("NeoAI.core.config.state").get_state("config", "data") or {}
+    local core = require("NeoAI.core")
+    local full_config = core.get_config() or {}
     local auto_naming = (full_config.session and full_config.session.auto_naming) ~= false
     local branch_name
     if auto_naming then

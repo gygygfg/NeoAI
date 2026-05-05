@@ -79,11 +79,12 @@ local function fire_event(pattern, data)
   vim.api.nvim_exec_autocmds("User", { pattern = pattern, data = data or {} })
 end
 
--- 模块状态
+  -- 模块状态
 local state = {
   initialized = false,
   current_window_id = nil, -- 当前聊天窗口的窗口ID
   current_session_id = nil, -- 当前聊天窗口关联的会话ID
+  chat_buf = nil, -- 当前聊天窗口的 buffer 句柄（供 virtual_input 检测光标离开时使用）
   messages = {},
   cursor_augroup = nil, -- 光标移动自动命令组
   last_render_time = 0, -- 上次渲染时间
@@ -506,6 +507,7 @@ function M.open(session_id, window_id, branch_id)
     state.tool_loop_in_progress = false
     state.current_window_id = nil
     state.current_session_id = nil
+    state.chat_buf = nil
     state.messages = {}
     state.last_usage = nil
     state.usage_extmark_id = nil
@@ -543,8 +545,8 @@ function M.open(session_id, window_id, branch_id)
     pcall(vim.diagnostic.disable, buf)
     pcall(vim.api.nvim_buf_set_name, buf, "neoai://chat/" .. session_id)
 
-    -- 注册到状态切片，供虚拟输入框检测光标离开时使用
-    state_manager.set_state("app", "chat_buf", buf)
+    -- 保存到模块 state 表，供 virtual_input 检测光标离开时使用
+    state.chat_buf = buf
   end
 
   if win_handle and vim.api.nvim_win_is_valid(win_handle) then
@@ -1074,8 +1076,8 @@ function M.set_keymaps()
 
   -- 从合并后的配置中获取 chat 上下文键位
   -- 所有键位统一由 default_config.lua 定义，模块内部不提供任何 fallback 默认值
-  -- 从统一状态管理器获取键位配置
-  local full_config = state_manager.get_state("config", "data") or {}
+  local core = require("NeoAI.core")
+  local full_config = core.get_config() or {}
   local chat_config = full_config.keymaps and full_config.keymaps.chat or {}
   local keymaps = {
     insert = chat_config.insert.key,
@@ -1159,7 +1161,8 @@ function M.sync_keymaps_to_buf(target_buf, exclude_keys)
     return
   end
 
-  local full_config = state_manager.get_state("config", "data") or {}
+  local core = require("NeoAI.core")
+  local full_config = core.get_config() or {}
   local chat_config = full_config.keymaps and full_config.keymaps.chat or {}
   exclude_keys = exclude_keys or {}
 
@@ -1337,6 +1340,13 @@ function M._open_float_input()
   })
 end
 
+--- 获取当前聊天窗口的 buffer 句柄
+--- 供 virtual_input 检测光标离开时使用，替代全局状态切片
+--- @return number|nil
+function M.get_chat_buf()
+  return state.chat_buf
+end
+
 --- 显示悬浮文本
 
 --- 加载消息数据（内部函数）
@@ -1352,7 +1362,8 @@ function M._load_messages(session_id)
   end
   -- 确保 chat_service 已初始化
   if not chat_service.is_initialized() then
-    local config = state_manager.get_state("config", "data") or {}
+    local core = require("NeoAI.core")
+    local config = core.get_config() or {}
     chat_service.initialize({ config = config })
   end
 
@@ -1426,6 +1437,7 @@ function M.close()
     -- 窗口已关闭，清理状态但不触发事件
     state.current_window_id = nil
     state.current_session_id = nil
+    state.chat_buf = nil
     state.messages = {}
     return
   end
@@ -1562,6 +1574,7 @@ function M.close()
     if state.current_window_id == closing_window_id then
       state.current_window_id = nil
       state.current_session_id = nil
+      state.chat_buf = nil
       state.messages = {}
       state.last_usage = nil
       state.usage_extmark_id = nil
@@ -3468,8 +3481,8 @@ function M._show_tool_display()
     vim.api.nvim_set_option_value("modifiable", false, { buf = window_info.buf })
 
     -- 设置按键映射
-    -- 从统一状态管理器获取键位配置
-    local full_config = state_manager.get_state("config", "data") or {}
+    local core = require("NeoAI.core")
+    local full_config = core.get_config() or {}
     local chat_config = full_config.keymaps and full_config.keymaps.chat or {}
     vim.keymap.set("n", chat_config.quit.key, function()
       require("NeoAI.ui.window.chat_window")._close_tool_display()

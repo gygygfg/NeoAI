@@ -7,12 +7,13 @@ local config_merger = require("NeoAI.core.config.merger")
 local core = require("NeoAI.core")
 local ui = require("NeoAI.ui")
 local tools = require("NeoAI.tools")
-local state_manager = require("NeoAI.core.config.state")
+
 
 -- ========== 闭包内私有状态 ==========
 local core_ref
 local ui_ref
 local tools_ref
+local _config  -- 合并后的完整配置
 
 -- ========== 公共接口 ==========
 local M = {}
@@ -114,7 +115,7 @@ end
 
 -- 内部函数：注册全局快捷键
 local function register_global_keymaps()
-  local config = state_manager.get_state("config", "data") or {}
+  local config = core_ref and core_ref.get_config() or _config or {}
   if not config or not config.keymaps then
     return
   end
@@ -177,25 +178,21 @@ end
 --- @param user_config table 用户配置
 --- @return table 插件实例
 function M.setup(user_config)
-  if state_manager.is_initialized() then
+  if core_ref then
     return M
   end
 
   -- 处理配置：验证 → 合并 → 清理，一步完成
-  local config = config_merger.process_config(user_config)
-
-  -- 初始化统一状态管理器
-  state_manager.register_slice("config", { data = config })
-  state_manager.register_slice("app", { initialized = true })
+  _config = config_merger.process_config(user_config)
 
   -- 初始化核心模块
-  core_ref = core.initialize(config)
+  core_ref = core.initialize(_config)
 
   -- 初始化UI模块
-  ui_ref = ui.initialize(config)
+  ui_ref = ui.initialize(_config)
 
   -- 初始化工具系统（传入完整合并配置，tools 模块可从中提取 keymaps 等）
-  tools_ref = tools.initialize(config)
+  tools_ref = tools.initialize(_config)
 
   -- 延迟将工具注册表注入 AI 引擎（等异步加载的内置工具完成后）
   vim.schedule(function()
@@ -243,7 +240,7 @@ end
 
 --- 打开NeoAI主界面
 function M.open_neoai()
-  if not state_manager.is_initialized() then
+  if not core_ref then
     error("NeoAI not initialized. Call setup() first.")
   end
   ui_ref.open_chat_ui()

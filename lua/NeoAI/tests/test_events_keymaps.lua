@@ -11,15 +11,12 @@ function M.run(test_module)
   print("\n=== test_events_keymaps ===")
 
   local function init_km()
-    local state = require("NeoAI.core.config.state")
-    state._test_reset()
-    state.register_slice("config", { data = { keymaps = { global = { open_tree = { key = "<leader>at", desc = "打开树界面" }, open_chat = { key = "<leader>ac", desc = "打开聊天界面" }, close_all = { key = "<leader>aq", desc = "关闭所有窗口" } }, tree = { select = { key = "<CR>", desc = "选择节点" }, new_child = { key = "n", desc = "新建子分支" } }, chat = { send = { insert = { key = "<CR>", desc = "发送消息" }, normal = { key = "<CR>", desc = "发送消息" } }, cancel = { key = "<Esc>", desc = "取消生成" } } } } })
     -- 删除保存的 keymap 文件，避免影响测试
     local config_file = vim.fn.stdpath("config") .. "/neoai_keymaps.json"
     local f = io.open(config_file, "r")
     if f then f:close(); os.remove(config_file) end
     local km = require("NeoAI.core.config.keymap_manager")
-    km.initialize({ keymaps = {} })
+    km.initialize({ keymaps = { global = { open_tree = { key = "<leader>at", desc = "打开树界面" }, open_chat = { key = "<leader>ac", desc = "打开聊天界面" }, close_all = { key = "<leader>aq", desc = "关闭所有窗口" } }, tree = { select = { key = "<CR>", desc = "选择节点" }, new_child = { key = "n", desc = "新建子分支" } }, chat = { send = { insert = { key = "<CR>", desc = "发送消息" }, normal = { key = "<CR>", desc = "发送消息" } }, cancel = { key = "<Esc>", desc = "取消生成" } } } })
     return km
   end
 

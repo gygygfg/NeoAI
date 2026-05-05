@@ -139,18 +139,12 @@ function M.run(test_module)
       neoai.setup(create_integration_config())
 
       -- 验证初始化状态
-      local state = require("NeoAI.core.config.state")
-      assert.is_true(state.is_initialized(), "状态管理器应已初始化")
-
-      -- 验证配置已合并
-      local config = state.get_state("config", "data")
+      local core = require("NeoAI.core")
+      local config = core.get_config()
       assert.not_nil(config, "配置应存在")
       assert.equal("chat", config.ai.default, "默认场景应为 chat")
       assert.not_nil(config.ai.providers.deepseek, "deepseek 提供商应存在")
       assert.equal("deepseek-chat", config.ai.scenarios.chat.model_name)
-
-      -- 验证 app 切片
-      assert.is_true(state.get_state("app", "initialized"), "app 应标记为已初始化")
     end,
 
     -- ========== 2. 验证用户命令注册 ==========

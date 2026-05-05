@@ -28,13 +28,7 @@ function M.initialize(config)
   state.config = config or {}
   state.initialized = true
 
-  -- 注册状态切片
-  state_manager.register_slice("reasoning_display", {
-    config = state.config,
-    current_window_id = nil,
-    is_visible = false,
-    content_buffer = "",
-  })
+  -- 状态通过模块级 state 表管理，不注册全局状态切片
 
   -- 创建事件组
   local event_group = vim.api.nvim_create_augroup("NeoAIEvents", { clear = true })

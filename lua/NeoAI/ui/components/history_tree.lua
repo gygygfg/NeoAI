@@ -21,12 +21,7 @@ function M.initialize(config)
   state.config = config or {}
   state.initialized = true
 
-  -- 注册状态切片
-  state_manager.register_slice("history_tree", {
-    config = state.config,
-    flat_items = {},
-    selected_node_id = nil,
-  })
+  -- 状态通过模块级 state 表管理，不注册全局状态切片
 end
 
 --- 引用 history_manager 的 build_round_text（带本地缓存）
@@ -324,8 +319,6 @@ function M.build_flat_items()
   end
 
   state.flat_items = flat_nodes
-  -- 同步到状态切片
-  state_manager.set_state("history_tree", "flat_items", flat_nodes)
   return flat_nodes
 end
 
@@ -346,14 +339,11 @@ end
 function M.clear()
   state.flat_items = {}
   state.selected_node_id = nil
-  state_manager.set_state("history_tree", "flat_items", {})
-  state_manager.set_state("history_tree", "selected_node_id", nil)
 end
 
 --- 选中节点
 function M.select_node(node_id)
   state.selected_node_id = node_id
-  state_manager.set_state("history_tree", "selected_node_id", node_id)
 end
 
 --- 获取选中节点ID
