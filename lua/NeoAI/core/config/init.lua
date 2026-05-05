@@ -10,10 +10,9 @@ M.merger = require("NeoAI.core.config.merger")
 --- 初始化所有配置子模块
 --- @param config table 完整配置
 function M.initialize(config)
-  -- keymap_manager 从 state_manager 自行读取键位配置
   M.keymap_manager.initialize(config)
-  -- state_manager.initialize 幂等，已初始化则跳过
-  M.state.initialize(config)
+  -- 注意：config 和 app 状态切片已在 init.lua 的 setup() 中注册
+  -- 此处不再重复注册，避免冗余的 WARN 日志
 end
 
 return M

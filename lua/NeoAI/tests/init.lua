@@ -82,53 +82,35 @@ function M.get_merged_config()
   neoai.setup(M.test_config)
 
   -- 获取合并后的配置
-local state = require("NeoAI.core.config.state")
-  return state.get_config()
+  local state = require("NeoAI.core.config.state")
+  return state.get_state("config", "data")
 end
 
 --- 运行所有测试
 function M.run_all()
   local tests = {
-    "test_default_config",
-    "test_state",
-    "test_event_constants",
-    "test_keymap_manager",
-    "test_history_manager",
-    "test_ai_engine",
-    "test_utils_init",
-    "test_tools_init",
-    "test_ui_init",
-    "test_main_init",
-    -- 新增测试
-    "test_core_init",
-    "test_config_init",
-    "test_config_merger",
-    "test_chat_service",
-    "test_response_retry",
-    "test_tool_orchestrator",
-    "test_history_cache",
-    "test_history_persistence",
-    "test_history_saver",
-    "test_tool_registry",
-    "test_tool_executor",
-    "test_tool_validator",
-    "test_tool_pack",
-    "test_utils_common",
-    "test_utils_logger",
-    "test_utils_json",
-    "test_utils_table_utils",
-    "test_utils_file_utils",
-    "test_async_worker",
-    "test_http_client",
-    "test_ai_init",
-    "test_request_adapter",
-    "test_request_builder",
-    "test_stream_processor",
+    "test_init_modules",   -- 合并: config_init, core_init, ai_init, ui_init, tools_init, utils_init, main_init
+    "test_config",         -- 合并: default_config, state, config_merger
+    "test_history",        -- 合并: history_manager, history_cache, history_persistence, history_saver
+    "test_tools",          -- 合并: tool_registry, tool_executor, tool_validator, tool_pack
+    "test_utils",          -- 合并: utils_common, utils_logger, utils_json, utils_table_utils, utils_file_utils, async_worker
+    "test_events_keymaps", -- 合并: event_constants, keymap_manager
+    "test_ai_core_part1",  -- 合并: ai_engine, chat_service, response_retry
+    "test_ai_core_part2",  -- 合并: tool_orchestrator, request_adapter, request_builder, stream_processor
+    "test_http_client",    -- 包含特殊字符编码测试
+    "test_integration",    -- 端到端集成测试：完整 setup、真实 HTTP 请求、工具循环、命令注册
   }
 
   -- 确保 package.loaded 中已有本模块引用，避免测试文件内部
   -- require("NeoAI.tests") 导致循环依赖
   package.loaded["NeoAI.tests"] = M
+
+  -- 设置日志级别为 ERROR，避免测试过程中输出大量 DEBUG 日志
+  local logger = require("NeoAI.utils.logger")
+  logger.initialize({ level = "ERROR" })
+
+  -- 设置全局标志，禁止测试文件的自动运行代码执行
+  _G._NEOAI_TEST_RUNNING = true
 
   local results = { passed = 0, failed = 0, errors = {} }
 
@@ -136,6 +118,8 @@ function M.run_all()
   local info = debug.getinfo(1, "S")
   local base_dir = info.source:match("^@?(.*/)") or "."
   for _, name in ipairs(tests) do
+    -- 注意：不清理 NeoAI 模块缓存，因为测试文件依赖模块的初始化状态。
+    -- 每个测试文件通过 _test_reset() 自行管理内部状态。
     local ok, err = pcall(function()
       -- 使用 dofile 避免 require 的循环依赖
       local filepath = base_dir .. "/" .. name .. ".lua"
@@ -171,23 +155,21 @@ M.assert = {
   --- @param msg string|nil
   equal = function(expected, actual, msg)
     if expected ~= actual then
-      error(string.format(
-        "断言失败: %s\n  期望: %s\n  实际: %s",
-        msg or "值不相等",
-        vim.inspect(expected),
-        vim.inspect(actual)
-      ))
+      error(
+        string.format(
+          "断言失败: %s\n  期望: %s\n  实际: %s",
+          msg or "值不相等",
+          vim.inspect(expected),
+          vim.inspect(actual)
+        )
+      )
     end
   end,
 
   --- 断言不相等
   not_equal = function(expected, actual, msg)
     if expected == actual then
-      error(string.format(
-        "断言失败: %s\n  期望不等于: %s",
-        msg or "值不应相等",
-        vim.inspect(expected)
-      ))
+      error(string.format("断言失败: %s\n  期望不等于: %s", msg or "值不应相等", vim.inspect(expected)))
     end
   end,
 
@@ -208,7 +190,9 @@ M.assert = {
   --- 断言为 nil
   is_nil = function(value, msg)
     if value ~= nil then
-      error(string.format("断言失败: %s\n  期望为 nil, 实际为 %s", msg or "值应为 nil", vim.inspect(value)))
+      error(
+        string.format("断言失败: %s\n  期望为 nil, 实际为 %s", msg or "值应为 nil", vim.inspect(value))
+      )
     end
   end,
 
@@ -246,12 +230,14 @@ M.assert = {
       error(string.format("断言失败: %s\n  期望抛出错误, 但未抛出", msg or "应抛出错误"))
     end
     if expected_msg and not string.find(tostring(err), expected_msg, 1, true) then
-      error(string.format(
-        "断言失败: %s\n  期望错误包含: %s\n  实际错误: %s",
-        msg or "错误消息不匹配",
-        expected_msg,
-        tostring(err)
-      ))
+      error(
+        string.format(
+          "断言失败: %s\n  期望错误包含: %s\n  实际错误: %s",
+          msg or "错误消息不匹配",
+          expected_msg,
+          tostring(err)
+        )
+      )
     end
   end,
 }
@@ -276,7 +262,27 @@ end
 --- @return table { passed, failed, errors }
 function M.run_tests(tests)
   local results = { passed = 0, failed = 0, errors = {} }
-  for name, fn in pairs(tests) do
+  -- 使用数组格式（按定义顺序执行）或字典格式（按名称排序）
+  local ordered_tests = {}
+  if #tests > 0 then
+    -- 数组格式：{ { name = "test_name", fn = function() end }, ... }
+    for _, item in ipairs(tests) do
+      table.insert(ordered_tests, item)
+    end
+  else
+    -- 字典格式：{ test_name = function() end, ... }
+    local names = {}
+    for name, _ in pairs(tests) do
+      table.insert(names, name)
+    end
+    table.sort(names)
+    for _, name in ipairs(names) do
+      table.insert(ordered_tests, { name = name, fn = tests[name] })
+    end
+  end
+  for _, test_item in ipairs(ordered_tests) do
+    local name = test_item.name or "unnamed"
+    local fn = test_item.fn or test_item
     if M.test(name, fn) then
       results.passed = results.passed + 1
     else
@@ -300,4 +306,3 @@ if pcall(vim.api.nvim_buf_get_name, 0) then
 end
 
 return M
-

@@ -1,240 +1,28 @@
 -- HTTP 客户端模块
 -- 负责发送 HTTP 请求到 AI API 服务，支持流式和非流式请求
+
 local M = {}
 
 local logger = require("NeoAI.utils.logger")
 local json = require("NeoAI.utils.json")
 local request_adapter = require("NeoAI.core.ai.request_adapter")
+local http_utils = require("NeoAI.core.ai.http_utils")
 
 local state = {
   initialized = false,
   config = {},
   active_requests = {},
   request_counter = 0,
-
-  -- 请求去重缓存：key = generation_id, value = { body_hash, timestamp }
-  -- 防止同一 generation_id 的相同请求体被重复发送
-  _request_dedup = {},
-  _dedup_ttl_ms = 3000, -- 3 秒内相同的请求视为重复
 }
 
---- 用 json.decode 验证并修复 JSON 字符串
--- json.encode 可能生成包含非法 unicode 码点的字符串（如 \uFFFE, \uFFFF），
--- 这些在 JSON 规范中不允许，会导致 API 服务器解析失败。
--- 此函数将 json.encode 的输出重新喂给 json.decode，
--- 由 json.lua 的解析器容忍/跳过非法字符，最大程度拼出有效 JSON，
--- 然后再用 json.encode 重新编码为干净的字符串。
---- 防御性修复：将调用了工具列表中没有的工具的 tool 消息转为 user 消息
---- 当会话历史中包含之前工具循环中使用的工具结果（tool 消息），
---- 但当前请求的工具列表中不包含该工具时，API 会报错。
---- 此函数将这类孤立的 tool 消息转为 user 消息，避免 API 报错。
---- @param request table 请求体（会被原地修改）
-function M._repair_orphan_tool_messages(request)
-  if not request or not request.messages or #request.messages == 0 then
-    return
-  end
-
-  -- 收集当前请求中可用的工具名
-  local available_tools = {}
-  if request.tools then
-    for _, td in ipairs(request.tools) do
-      local func = td["function"] or td.func
-      if func and func.name then
-        available_tools[func.name] = true
-      end
-    end
-  end
-
-  -- 如果没有工具定义，不需要修复
-  if not next(available_tools) then
-    return
-  end
-
-  -- 收集所有 assistant 消息中声明的 tool_call_id
-  local declared_tool_call_ids = {}
-  for _, msg in ipairs(request.messages) do
-    if msg.role == "assistant" and msg.tool_calls then
-      for _, tc in ipairs(msg.tool_calls) do
-        local tc_id = tc.id or tc.tool_call_id
-        if tc_id then
-          declared_tool_call_ids[tc_id] = true
-        end
-      end
-    end
-  end
-
-  local fixed_count = 0
-  for _, msg in ipairs(request.messages) do
-    if msg.role == "tool" then
-      -- 检查 tool 消息的 tool_call_id 是否在 assistant 的 tool_calls 中声明过
-      local is_orphan = false
-      if msg.tool_call_id and msg.tool_call_id ~= "" then
-        if not declared_tool_call_ids[msg.tool_call_id] then
-          is_orphan = true
-        end
-      else
-        -- 没有 tool_call_id 的 tool 消息也是孤立的
-        is_orphan = true
-      end
-
-      -- 额外检查：如果 tool 消息有 name 字段，检查该工具是否在可用工具列表中
-      if not is_orphan and msg.name and msg.name ~= "" then
-        if not available_tools[msg.name] then
-          -- tool_call_id 匹配但工具不在当前列表中，仍然视为孤立
-          -- 这种情况通常发生在不同工具循环之间
-          is_orphan = true
-        end
-      end
-
-      if is_orphan then
-        msg.role = "user"
-        msg.tool_call_id = nil
-        msg.name = nil
-        fixed_count = fixed_count + 1
-      end
-    end
-  end
-
-  if fixed_count > 0 then
-    logger.debug(
-      "[http_client] 防御性修复: 将 %d 条孤立 tool 消息转为 user 消息",
-      fixed_count
-    )
-  end
-end
-
---- 将字符串中可能影响 JSON 解析的控制字符和非法 UTF-8 序列转义为 %%XX URL 编码
--- 转义范围：控制字符（\\x00-\\x1F 除 \\n、\\r、\\t）和非法 UTF-8 字节
--- @param str string 原始字符串
--- @return string 编码后的字符串
-function M._encode_special_chars(str)
-  if not str or str == "" then
-    return str
-  end
-  local result = {}
-  local i = 1
-  while i <= #str do
-    local byte = str:byte(i)
-    if byte == 0x0A or byte == 0x0D or byte == 0x09 then
-      -- 保留换行、回车、制表符
-      result[#result + 1] = string.char(byte)
-      i = i + 1
-    elseif byte == 0x5C then
-      -- 反斜杠 \\：URL 编码为 %5C
-      result[#result + 1] = "%5C"
-      i = i + 1
-    elseif byte == 0x22 then
-      -- 双引号 "：URL 编码为 %22
-      result[#result + 1] = "%22"
-      i = i + 1
-    elseif byte < 0x20 then
-      -- 控制字符（\\x00-\\x1F 除 \\n\\r\\t）：URL 编码
-      result[#result + 1] = string.format("%%%02X", byte)
-      i = i + 1
-    elseif byte >= 0x80 then
-      -- 可能是 UTF-8 多字节字符，验证其合法性
-      local trailing = 0
-      if byte >= 0xF0 and byte <= 0xF4 then
-        trailing = 3
-      elseif byte >= 0xE0 then
-        trailing = 2
-      elseif byte >= 0xC2 then
-        trailing = 1
-      else
-        -- 非法首字节（0x80-0xBF 或 0xC0-0xC1 或 0xF5-0xFF）
-        result[#result + 1] = string.format("%%%02X", byte)
-        i = i + 1
-        goto continue
-      end
-      -- 检查后续字节是否有效（10xxxxxx 格式）
-      local valid = true
-      for j = 1, trailing do
-        local next_byte = str:byte(i + j)
-        if not next_byte or next_byte < 0x80 or next_byte > 0xBF then
-          valid = false
-          break
-        end
-      end
-      if valid then
-        -- 完整有效的 UTF-8 字符，保留
-        result[#result + 1] = str:sub(i, i + trailing)
-        i = i + trailing + 1
-      else
-        -- 非法 UTF-8 序列：将每个无效字节单独编码
-        for j = 1, trailing + 1 do
-          local b = str:byte(i + j - 1)
-          if b then
-            result[#result + 1] = string.format("%%%02X", b)
-          end
-        end
-        i = i + trailing + 1
-      end
-    else
-      -- ASCII 可打印字符，保留
-      result[#result + 1] = string.char(byte)
-      i = i + 1
-    end
-    ::continue::
-  end
-  return table.concat(result)
-end
-
---- 将 %%XX URL 编码的字符串解码回原始字符
--- @param str string URL 编码的字符串
--- @return string 解码后的字符串
-function M._decode_special_chars(str)
-  if not str or str == "" then
-    return str
-  end
-  -- 解码 %%XX 格式的 URL 编码
-  -- 在 Lua 字符串中 "%%" 表示一个字面量 % 字符
-  -- 在 Lua 模式中 "%%" 匹配一个字面量 % 字符
-  -- 所以 "%%(%x%x)" 匹配 %XX 格式
-  local result = str:gsub("%%(%x%x)", function(hex)
-    return string.char(tonumber(hex, 16))
-  end)
-  return result
-end
-
---- 递归遍历响应数据结构，对其中所有字符串字段进行特殊字符编码
--- 处理 choices[].delta.content、choices[].delta.reasoning_content、
--- choices[].delta.tool_calls[].function.arguments、
--- choices[].message.content、choices[].message.reasoning_content、
--- choices[].message.tool_calls[].function.arguments
--- @param data table|string 响应数据
--- @return table|string 编码后的数据
-function M._encode_response_strings(data)
-  if type(data) == "string" then
-    return M._encode_special_chars(data)
-  end
-  if type(data) ~= "table" then
-    return data
-  end
-  for k, v in pairs(data) do
-    if type(v) == "string" then
-      data[k] = M._encode_special_chars(v)
-    elseif type(v) == "table" then
-      M._encode_response_strings(v)
-    end
-  end
-  return data
-end
-
-function M._sanitize_json_body(body)
-  if not body or body == "" then
-    return body
-  end
-  local ok, decoded = pcall(json.decode, body)
-  if ok and decoded ~= nil then
-    -- json.lua 成功解析，用 json.encode 重新编码得到干净的 JSON
-    local ok2, reencoded = pcall(json.encode, decoded)
-    if ok2 and reencoded then
-      return reencoded
-    end
-  end
-  -- 解析失败或重新编码失败，返回原始 body（后续 curl 会报错，但至少不丢数据）
-  return body
-end
+-- 委托给 http_utils 的 _encode_special_chars / _decode_special_chars
+-- 保持向后兼容
+M._encode_special_chars = http_utils.encode_special_chars
+M._decode_special_chars = http_utils.decode_special_chars
+M._encode_response_strings = http_utils.encode_response_strings
+M._sanitize_json_body = http_utils.sanitize_json_body
+M._repair_orphan_tool_messages = http_utils.repair_orphan_tool_messages
+M._read_file = http_utils.read_file
 
 function M.initialize(options)
   if state.initialized then
@@ -263,28 +51,12 @@ function M.send_request(params)
   local generation_id = params.generation_id or (shared and shared.generation_id)
   local base_url = params.base_url or ai_preset.base_url or state.config.base_url
   local api_key = params.api_key or ai_preset.api_key or state.config.api_key
-  local timeout = params.timeout or ai_preset.timeout or state.config.timeout or 60000
   local api_type = params.api_type or ai_preset.api_type or "openai"
   local provider_config = params.provider_config or ai_preset or {}
 
-  -- 请求去重：检查同一 generation_id 的相同请求体是否已被发送
-  if generation_id then
-    local now = os.time() * 1000
-    local dedup_key = generation_id .. "_" .. api_type
-    local cached = state._request_dedup[dedup_key]
-    if cached then
-      -- 计算当前请求体的哈希
-      local body_for_hash = vim.json.encode(request or {})
-      local current_hash = vim.fn.sha256(body_for_hash)
-      if cached.hash == current_hash and (now - cached.timestamp) < state._dedup_ttl_ms then
-        logger.debug(
-          "[http_client] 请求去重: 跳过重复的流式请求, generation_id=" .. tostring(generation_id)
-        )
-        -- send_request 是非流式请求，没有 on_complete 回调
-        -- 直接返回 nil 表示去重跳过
-        return nil
-      end
-    end
+  -- 请求去重
+  if generation_id and http_utils.check_dedup(generation_id, api_type, request) then
+    return nil
   end
 
   if not api_key or api_key == "" then
@@ -357,6 +129,14 @@ function M.send_request(params)
   local transformed = request_adapter.transform_request(request, api_type, provider_config)
   local request_body = json.encode(transformed)
   request_body = M._sanitize_json_body(request_body)
+  -- 调试：打印请求体中的 model 字段
+  local ok_body, decoded_body = pcall(json.decode, request_body)
+  if ok_body and decoded_body and decoded_body.model then
+    logger.debug(string.format(
+      "[http_client] 非流式请求 model=%s",
+      tostring(decoded_body.model)
+    ))
+  end
   logger.debug(
     "[http_client] 非流式请求: "
       .. base_url
@@ -377,10 +157,6 @@ function M.send_request(params)
   vim.list_extend(curl_args, {
     "-d",
     request_body,
-    "--connect-timeout",
-    tostring(math.floor(timeout / 1000)),
-    "--max-time",
-    tostring(math.floor(timeout / 1000) + 5), -- 总超时 = 连接超时 + 5秒
     "-o",
     temp_file,
   })
@@ -435,10 +211,6 @@ function M.send_request(params)
       vim.list_extend(retry_args, {
         "-d",
         retry_body,
-        "--connect-timeout",
-        tostring(math.floor(timeout / 1000)),
-        "--max-time",
-        "0",
         "-o",
         retry_temp,
       })
@@ -470,17 +242,112 @@ function M.send_request(params)
 
   -- 更新去重缓存
   if generation_id then
-    local dedup_key = generation_id .. "_" .. api_type .. "_nonstream"
-    local body_for_hash = vim.json.encode(request or {})
-    state._request_dedup[dedup_key] = {
-      hash = vim.fn.sha256(body_for_hash),
-      timestamp = os.time() * 1000,
-    }
+    http_utils.update_dedup(generation_id, api_type .. "_nonstream", request)
   end
 
   local unified = request_adapter.transform_response(response, api_type)
   M._encode_response_strings(unified)
   return unified, nil
+end
+
+--- 发送非流式请求（内部重试用，带 generation_id 保护）
+function M.send_request_retry(params, on_complete)
+  if not state.initialized then
+    if on_complete then on_complete(nil, "HTTP client not initialized") end
+    return nil
+  end
+
+  local shared = nil
+  pcall(function()
+    local sm = require("NeoAI.core.config.state")
+    shared = sm.get_shared()
+  end)
+  local ai_preset = shared and shared.ai_preset or {}
+
+  local request = params.request
+  local generation_id = params.generation_id or (shared and shared.generation_id)
+  local base_url = params.base_url or ai_preset.base_url or state.config.base_url
+  local api_key = params.api_key or ai_preset.api_key or state.config.api_key
+  local api_type = params.api_type or ai_preset.api_type or "openai"
+  local provider_config = params.provider_config or ai_preset or {}
+
+  if not api_key or api_key == "" then
+    if on_complete then on_complete(nil, "API key not configured") end
+    return nil
+  end
+  if not base_url or base_url == "" then
+    if on_complete then on_complete(nil, "API base URL not configured") end
+    return nil
+  end
+
+  -- 参数检查
+  if not request.messages or #request.messages == 0 then
+    logger.warn("[http_client] send_request_retry: request.messages 为空或不存在")
+  end
+  if not request.model or request.model == "" then
+    logger.warn("[http_client] send_request_retry: request.model 未设置")
+  end
+
+  -- 防御性修复
+  M._repair_orphan_tool_messages(request)
+
+  local transformed = request_adapter.transform_request(request, api_type, provider_config)
+  local request_body = json.encode(transformed)
+  request_body = M._sanitize_json_body(request_body)
+
+  local temp_file = vim.fn.tempname()
+  local headers = request_adapter.get_headers(api_key, api_type)
+
+  local curl_args = { "-s", "-X", "POST", base_url, "-H", "Content-Type: application/json" }
+  for k, v in pairs(headers) do
+    if k ~= "Content-Type" then
+      table.insert(curl_args, "-H")
+      table.insert(curl_args, k .. ": " .. v)
+    end
+  end
+  vim.list_extend(curl_args, {
+    "-d", request_body,
+    "-o", temp_file,
+  })
+
+  local cmd = vim.list_extend({ "curl" }, curl_args)
+  local ok, result = pcall(vim.fn.system, cmd)
+  local exit_code = vim.v.shell_error
+
+  if not ok or exit_code ~= 0 then
+    pcall(vim.fn.delete, temp_file)
+    if on_complete then on_complete(nil, "curl failed: " .. (ok and "exit " .. exit_code or tostring(result))) end
+    return nil
+  end
+
+  local content = M._read_file(temp_file)
+  pcall(vim.fn.delete, temp_file)
+  if not content or content == "" then
+    if on_complete then on_complete(nil, "Empty response") end
+    return nil
+  end
+
+  local ok, response = pcall(json.decode, content)
+  if not ok or type(response) ~= "table" then
+    if on_complete then on_complete(nil, "JSON parse failed") end
+    return nil
+  end
+
+  if response.error then
+    local err_msg = response.error.message or json.encode(response.error)
+    if on_complete then on_complete(nil, err_msg) end
+    return nil
+  end
+
+  -- 更新去重缓存（带 nil 保护）
+  if generation_id then
+    http_utils.update_dedup(generation_id, api_type .. "_nonstream", request)
+  end
+
+  local unified = request_adapter.transform_response(response, api_type)
+  M._encode_response_strings(unified)
+  if on_complete then on_complete(unified, nil) end
+  return nil
 end
 
 --- 发送流式请求
@@ -504,7 +371,6 @@ function M.send_stream_request(params, on_chunk, on_complete, on_error)
   local generation_id = params.generation_id or (shared and shared.generation_id)
   local base_url = params.base_url or ai_preset.base_url or state.config.base_url
   local api_key = params.api_key or ai_preset.api_key or state.config.api_key
-  local timeout = params.timeout or ai_preset.timeout or state.config.timeout or 60000
   local api_type = params.api_type or ai_preset.api_type or "openai"
   local provider_config = params.provider_config or ai_preset or {}
 
@@ -515,24 +381,9 @@ function M.send_stream_request(params, on_chunk, on_complete, on_error)
     return nil, "API base URL not configured"
   end
 
-  -- 请求去重：检查同一 generation_id 的相同请求体是否已被发送
-  if generation_id then
-    local now = os.time() * 1000
-    local dedup_key = generation_id .. "_" .. api_type .. "_stream"
-    local cached = state._request_dedup[dedup_key]
-    if cached then
-      local body_for_hash = vim.json.encode(request or {})
-      local current_hash = vim.fn.sha256(body_for_hash)
-      if cached.hash == current_hash and (now - cached.timestamp) < state._dedup_ttl_ms then
-        logger.debug(
-          "[http_client] 请求去重: 跳过重复的流式请求, generation_id=" .. tostring(generation_id)
-        )
-        -- 注意：不调用 on_complete！直接返回 nil。
-        -- on_complete 会触发 _handle_stream_end，而此时 processor 的 content_buffer 为空，
-        -- 会导致 "空响应" 重试误判。去重意味着请求已在处理中，无需额外回调。
-        return nil
-      end
-    end
+  -- 请求去重
+  if generation_id and http_utils.check_dedup(generation_id, api_type .. "_stream", request) then
+    return nil
   end
 
   -- 支持通过 params.tool_choice 覆盖 request 中的 tool_choice
@@ -591,6 +442,14 @@ function M.send_stream_request(params, on_chunk, on_complete, on_error)
   local transformed = request_adapter.transform_request(request, api_type, provider_config)
   local request_body = json.encode(transformed)
   request_body = M._sanitize_json_body(request_body)
+  -- 调试：打印请求体中的 model 字段
+  local ok_body, decoded_body = pcall(json.decode, request_body)
+  if ok_body and decoded_body and decoded_body.model then
+    logger.debug(string.format(
+      "[http_client] 流式请求 model=%s",
+      tostring(decoded_body.model)
+    ))
+  end
   logger.debug(string.format(
     "[http_client] 流式请求体大小: generation_id=%s, 大小=%d bytes",
     tostring(generation_id), #request_body
@@ -614,12 +473,7 @@ function M.send_stream_request(params, on_chunk, on_complete, on_error)
 
   -- 更新去重缓存
   if generation_id then
-    local dedup_key = generation_id .. "_" .. api_type .. "_stream"
-    local body_for_hash = vim.json.encode(request or {})
-    state._request_dedup[dedup_key] = {
-      hash = vim.fn.sha256(body_for_hash),
-      timestamp = os.time() * 1000,
-    }
+    http_utils.update_dedup(generation_id, api_type .. "_stream", request)
   end
 
   local function process_sse_line(line)
@@ -635,7 +489,7 @@ function M.send_stream_request(params, on_chunk, on_complete, on_error)
       if ok and type(data) == "table" then
         total_received = total_received + #data_str
         logger.debug(
-          "[http_client] 流式数据块: 大小=" .. #data_str .. " bytes, 累计=" .. total_received .. " bytes | " .. data_str:sub(1, 300) .. (data_str:len() > 300 and "...[truncated]" or "")
+          "[http_client] 流式数据块: 大小=" .. #data_str .. " bytes, 累计=" .. total_received .. " bytes | " .. data_str:sub(1, 1000) .. (data_str:len() > 1000 and "...[truncated]" or "")
         )
         if data.error then
           local req = state.active_requests[request_id]
@@ -716,7 +570,7 @@ function M.send_stream_request(params, on_chunk, on_complete, on_error)
       return
     end
     if req.buffer ~= "" then
-      logger.debug(string.format("[http_client] handle_complete: 处理残留 buffer, 大小=%d, 内容前100=%s", #req.buffer, req.buffer:sub(1, 100)))
+      logger.debug(string.format("[http_client] handle_complete: 处理残留 buffer, 大小=%d, 内容前500=%s", #req.buffer, req.buffer:sub(1, 500)))
       process_sse_line(req.buffer)
     end
     local has_error = req and req.has_error
@@ -778,12 +632,7 @@ function M.send_stream_request(params, on_chunk, on_complete, on_error)
     vim.list_extend(args, { "--data-raw", request_body })
   end
 
-  vim.list_extend(args, {
-    "--connect-timeout",
-    tostring(math.floor(timeout / 1000)),
-    "--max-time",
-    "0",
-  })
+  -- 不设置 curl 超时，由系统网络栈控制
 
   local job_id = vim.fn.jobstart({ "curl", unpack(args) }, {
     on_stdout = function(_, data)
@@ -843,15 +692,7 @@ end
 --- 用于重试场景：防止重试请求因请求体相同被去重机制拦截
 --- @param generation_id string
 function M.clear_request_dedup(generation_id)
-  if not generation_id then
-    return
-  end
-  -- 清除所有与该 generation_id 相关的去重缓存
-  for key, _ in pairs(state._request_dedup) do
-    if key:find(generation_id, 1, true) then
-      state._request_dedup[key] = nil
-    end
-  end
+  http_utils.clear_dedup(generation_id)
 end
 
 function M.cancel_all_requests()
@@ -859,8 +700,7 @@ function M.cancel_all_requests()
     M.cancel_request(id)
   end
   state.active_requests = {}
-  -- 清理去重缓存
-  state._request_dedup = {}
+  http_utils.clear_all_dedup()
 end
 
 function M.get_state()
@@ -892,7 +732,6 @@ function M.send_request_async(params, on_complete)
   local generation_id = params.generation_id or (shared and shared.generation_id)
   local base_url = params.base_url or ai_preset.base_url or state.config.base_url
   local api_key = params.api_key or ai_preset.api_key or state.config.api_key
-  local timeout = params.timeout or ai_preset.timeout or state.config.timeout or 60000
   local api_type = params.api_type or ai_preset.api_type or "openai"
   local provider_config = params.provider_config or ai_preset or {}
 
@@ -1019,10 +858,6 @@ function M.send_request_async(params, on_complete)
   vim.list_extend(curl_args, {
     "-d",
     request_body,
-    "--connect-timeout",
-    tostring(math.floor(timeout / 1000)),
-    "--max-time",
-    "0",
     "-o",
     temp_file,
   })
@@ -1148,10 +983,6 @@ function M.send_request_async(params, on_complete)
             vim.list_extend(retry_args, {
               "-d",
               retry_body,
-              "--connect-timeout",
-              tostring(math.floor(timeout / 1000)),
-              "--max-time",
-              "0",
               "-o",
               retry_temp,
             })
@@ -1209,12 +1040,7 @@ function M.send_request_async(params, on_complete)
 
                 -- 更新去重缓存
                 if generation_id then
-                  local dedup_key = generation_id .. "_" .. api_type .. "_nonstream"
-                  local body_for_hash = vim.json.encode(request or {})
-                  state._request_dedup[dedup_key] = {
-                    hash = vim.fn.sha256(body_for_hash),
-                    timestamp = os.time() * 1000,
-                  }
+                  http_utils.update_dedup(generation_id, api_type .. "_nonstream", request)
                 end
 
                 if on_complete then
@@ -1240,12 +1066,7 @@ function M.send_request_async(params, on_complete)
 
       -- 更新去重缓存
       if generation_id then
-        local dedup_key = generation_id .. "_" .. api_type .. "_nonstream"
-        local body_for_hash = vim.json.encode(request or {})
-        state._request_dedup[dedup_key] = {
-          hash = vim.fn.sha256(body_for_hash),
-          timestamp = os.time() * 1000,
-        }
+        http_utils.update_dedup(generation_id, api_type .. "_nonstream", request)
       end
 
       if on_complete then

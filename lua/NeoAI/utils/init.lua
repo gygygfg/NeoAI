@@ -3,7 +3,6 @@ local M = {}
 -- 自动加载所有工具模块
 local modules = {
   "common",
-  "text_utils",
   "table_utils",
   "file_utils",
   "logger",

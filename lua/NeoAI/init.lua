@@ -114,7 +114,7 @@ end
 
 -- 内部函数：注册全局快捷键
 local function register_global_keymaps()
-  local config = state_manager.get_config()
+  local config = state_manager.get_state("config", "data") or {}
   if not config or not config.keymaps then
     return
   end
@@ -185,7 +185,8 @@ function M.setup(user_config)
   local config = config_merger.process_config(user_config)
 
   -- 初始化统一状态管理器
-  state_manager.initialize(config)
+  state_manager.register_slice("config", { data = config })
+  state_manager.register_slice("app", { initialized = true })
 
   -- 初始化核心模块
   core_ref = core.initialize(config)
@@ -193,8 +194,8 @@ function M.setup(user_config)
   -- 初始化UI模块
   ui_ref = ui.initialize(config)
 
-  -- 初始化工具系统
-  tools_ref = tools.initialize(config.tools or {})
+  -- 初始化工具系统（传入完整合并配置，tools 模块可从中提取 keymaps 等）
+  tools_ref = tools.initialize(config)
 
   -- 延迟将工具注册表注入 AI 引擎（等异步加载的内置工具完成后）
   vim.schedule(function()
@@ -233,9 +234,6 @@ function M.setup(user_config)
       vim.bo.fileencoding = "utf-8"
     end,
   })
-
-  -- 自动运行测试
-  M._auto_run_tests(config)
 
   local info_level = vim.log.levels and vim.log.levels.INFO or "INFO"
   vim.notify("[NeoAI] 插件已初始化，命令和快捷键已注册", info_level)
@@ -280,49 +278,6 @@ end
 function M.get_keymap_manager()
   if not core_ref then error("Core not initialized") end
   return core_ref.get_keymap_manager()
-end
-
---- 自动运行测试（内部使用）
---- 根据配置在 VimEnter 后延迟执行所有测试
---- @param config table 完整配置
-function M._auto_run_tests(config)
-  local test_config = config and config.test
-  if not test_config or not test_config.auto_test then
-    return
-  end
-
-  local delay_ms = test_config.delay_ms or 1500
-
-  -- 注册 VimEnter 自动命令，延迟后运行测试
-  vim.api.nvim_create_autocmd("VimEnter", {
-    once = true,
-    callback = function()
-      vim.defer_fn(function()
-        local ok, tests = pcall(require, "NeoAI.tests")
-        if not ok then
-          vim.notify("[NeoAI] 测试模块未找到，跳过自动测试", vim.log.levels.WARN)
-          return
-        end
-
-        vim.notify("[NeoAI] 开始自动运行测试...", vim.log.levels.INFO)
-        local results = tests.run_all()
-
-        local msg = string.format(
-          "[NeoAI] 测试完成: %d 通过, %d 失败",
-          results.passed or 0,
-          results.failed or 0
-        )
-        if results.failed and results.failed > 0 then
-          vim.notify(msg, vim.log.levels.WARN)
-          for _, err in ipairs(results.errors or {}) do
-            vim.notify("  " .. err, vim.log.levels.WARN)
-          end
-        else
-          vim.notify(msg, vim.log.levels.INFO)
-        end
-      end, delay_ms)
-    end,
-  })
 end
 
 return M

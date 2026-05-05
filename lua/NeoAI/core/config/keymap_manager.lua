@@ -17,11 +17,8 @@ function M.initialize(config)
   -- 优先从统一状态管理器获取键位配置
   -- 若 state_manager 未初始化（如测试环境），则回退到参数 config
   local merged_keymaps
-  if state_manager.is_initialized() then
-    merged_keymaps = state_manager.get_config_value("keymaps") or {}
-  else
-    merged_keymaps = (config or {}).keymaps or {}
-  end
+  local full_config = state_manager.get_state("config", "data") or {}
+  merged_keymaps = (full_config.keymaps or (config or {}).keymaps) or {}
   -- 设置默认配置
   DEFAULT_KEYMAPS = vim.deepcopy(merged_keymaps)
 

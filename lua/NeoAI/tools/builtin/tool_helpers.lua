@@ -29,6 +29,7 @@ local M = {}
 --- @param opts.category? string 工具分类
 --- @param opts.permissions? table 权限声明
 --- @param opts.async? boolean 是否为回调模式（默认 false，即同步模式）
+--- @param opts.timeout? number 超时毫秒数，nil 表示使用全局默认，-1 表示无限等待
 --- @return table 工具定义表
 function M.define_tool(opts)
   vim.validate({
@@ -40,6 +41,7 @@ function M.define_tool(opts)
     returns = { opts.returns, "table", true },
     permissions = { opts.permissions, "table", true },
     async = { opts.async, "boolean", true },
+    timeout = { opts.timeout, "number", true },
   })
 
   return {
@@ -56,7 +58,9 @@ function M.define_tool(opts)
     },
     category = opts.category or "uncategorized",
     permissions = opts.permissions or {},
+    approval = opts.approval, -- 审批配置（保留 nil 表示使用默认行为）
     async = opts.async or false, -- 标记是否为回调模式
+    timeout = opts.timeout, -- 超时毫秒数，nil 使用全局默认，-1 无限等待
   }
 end
 

@@ -1730,8 +1730,29 @@ local function _run_command(args, on_success, on_error, on_progress)
       end
     end
 
-    -- 启动进程状态监控（每30秒检查命令是否卡住或已完成）
-    start_timeout_monitoring()
+    -- 启动进程状态监控
+    -- timeout_sec == -1 时启动 AI 循环检测是否卡住（无限等待），同时清除 tool_executor 设置的超时
+    -- 否则不启动 AI 循环，由 tool_executor 的超时控制，超时时间使用 timeout_sec
+    if timeout_sec == -1 then
+      -- 清除 tool_executor 设置的超时，避免与 AI 循环冲突
+      pcall(function()
+        local tool_executor = require("NeoAI.tools.tool_executor")
+        if args._tool_call_id then
+          tool_executor._clear_timeout(args._tool_call_id)
+        end
+      end)
+      start_timeout_monitoring()
+    elseif timeout_sec > 0 and args._tool_call_id then
+      -- 用 timeout_sec 更新 tool_executor 的超时时间
+      pcall(function()
+        local tool_executor = require("NeoAI.tools.tool_executor")
+        tool_executor._reset_timeout(args._tool_call_id, timeout_sec * 1000, function()
+          if on_error then
+            on_error(string.format("命令执行超时（%d 秒）", timeout_sec))
+          end
+        end)
+      end)
+    end
 
     -- 延迟获取PID（给进程一些启动时间）
     vim.defer_fn(function()
@@ -1775,9 +1796,9 @@ M.run_command = define_tool({
       },
       timeout = {
         type = "number",
-        description = "超时时间（秒），默认 30 秒",
+        description = "超时时间（秒），-1 表示无限等待（启动 AI 循环检测是否卡住），默认 30 秒",
         default = 30,
-      },
+      }
       cwd = {
         type = "string",
         description = "工作目录，默认为当前 Neovim 工作目录",
@@ -1818,6 +1839,7 @@ M.run_command = define_tool({
   },
   category = "system",
   permissions = { execute = true },
+  approval = { behavior = "require_user" },
 })
 
 -- ============================================================================

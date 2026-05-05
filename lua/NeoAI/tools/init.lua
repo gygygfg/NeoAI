@@ -9,13 +9,21 @@ local tool_validator = require("NeoAI.tools.tool_validator")
 
 local initialized = false
 local builtin_tools_loaded = false
+local full_config = {}  -- 合并后的完整配置
 
-function M.initialize(tools_config)
+--- 获取完整配置（供子模块使用，如 approval_handler 获取 keymaps）
+--- @return table
+function M.get_full_config()
+  return full_config
+end
+
+function M.initialize(config)
   if initialized then return M end
-  local config = tools_config or {}
-  tool_registry.initialize(config)
-  tool_executor.initialize(config)
-  tool_validator.initialize(config)
+  full_config = config or {}
+  local tools_config = config.tools or {}
+  tool_registry.initialize(tools_config)
+  tool_executor.initialize(tools_config)
+  tool_validator.initialize(tools_config)
   initialized = true
   -- 延迟加载内置工具，不阻塞初始化流程
   if config.builtin ~= false then
@@ -25,6 +33,12 @@ function M.initialize(tools_config)
   end
   if config.external and #config.external > 0 then M._load_external_tools(config.external) end
   return M
+end
+
+--- 检查工具系统是否已初始化
+--- @return boolean
+function M.is_initialized()
+  return initialized
 end
 
 function M.register_tool(tool_def)
@@ -75,7 +89,8 @@ function M.reload_tools()
   if not initialized then error("工具系统未初始化") end
   tool_registry.clear()
   builtin_tools_loaded = false
-  local config = require("NeoAI.core.config.state").get_config()
+  local state = require("NeoAI.core.config.state")
+  local config = state.get_slice("config")
   local tools_config = (config and config.tools) or {}
   if tools_config.builtin ~= false then M._load_builtin_tools() end
   if tools_config.external and #tools_config.external > 0 then M._load_external_tools(tools_config.external) end
@@ -150,7 +165,8 @@ end
 
 function M.update_config(new_config)
   if not initialized then return end
-  local config = require("NeoAI.core.config.state").get_config()
+  local state = require("NeoAI.core.config.state")
+  local config = state.get_slice("config")
   local tools_config = (config and config.tools) or {}
   local merged = vim.tbl_extend("force", tools_config, new_config or {})
   tool_registry.update_config(merged)

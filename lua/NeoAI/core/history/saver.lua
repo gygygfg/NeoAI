@@ -344,6 +344,12 @@ function M.initialize(history_manager)
   logger.debug("[history_saver] 初始化完成，已注册事件监听器")
 end
 
+--- 检查是否已初始化
+--- @return boolean
+function M.is_initialized()
+  return state.initialized
+end
+
 -- ========== 关闭 ==========
 
 function M.shutdown()

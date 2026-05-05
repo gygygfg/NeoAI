@@ -62,12 +62,6 @@ local _watcher_id_counter = 0
 -- ========== 协程上下文 ==========
 local _coroutine_contexts = {}
 
--- ========== 旧版兼容状态 ==========
-local _legacy_state = {
-  initialized = false,
-  config = nil,
-}
-
 -- ========== 状态切片 API ==========
 
 --- 注册一个状态切片
@@ -76,12 +70,12 @@ local _legacy_state = {
 --- @param initial_data table 初始数据
 function M.register_slice(slice_name, initial_data)
   if _slices[slice_name] then
-    logger.warn("[state] 状态切片 '%s' 已存在，跳过注册", slice_name)
+    logger.debug("[state] 状态切片 '%s' 已存在，跳过注册", slice_name)
     return
   end
   _slices[slice_name] = {
     data = initial_data or {},
-    watchers = {},  -- { [key] = { [watcher_id] = fn(new, old) } }
+    watchers = {}, -- { [key] = { [watcher_id] = fn(new, old) } }
   }
   table.insert(_slice_order, slice_name)
   logger.debug("[state] 注册状态切片: %s", slice_name)
@@ -102,22 +96,32 @@ end
 --- @return any
 function M.get_state(slice_name, key, default)
   local slice = _slices[slice_name]
-  if not slice then return default end
-  if not key then return slice.data end
+  if not slice then
+    return default
+  end
+  if not key then
+    return slice.data
+  end
   local keys = vim.split(key, ".", { plain = true })
   local value = slice.data
   for _, k in ipairs(keys) do
-    if type(value) ~= "table" then return default end
+    if type(value) ~= "table" then
+      return default
+    end
     value = value[k]
   end
-  if value == nil then return default end
+  if value == nil then
+    return default
+  end
   return value
 end
 
 --- 通知 watcher（内部函数，需在 set_state 之前定义）
 local function _notify_watchers(slice_name, key, new_val, old_val)
   local slice = _slices[slice_name]
-  if not slice or not slice.watchers[key] then return end
+  if not slice or not slice.watchers[key] then
+    return
+  end
   for _, cb in pairs(slice.watchers[key]) do
     pcall(cb, new_val, old_val)
   end
@@ -146,12 +150,16 @@ end
 --- @param value any
 function M.set_state_path(slice_name, key_path, value)
   local slice = _slices[slice_name]
-  if not slice then return false end
+  if not slice then
+    return false
+  end
   local keys = vim.split(key_path, ".", { plain = true })
   local target = slice.data
   for i = 1, #keys - 1 do
     local k = keys[i]
-    if type(target[k]) ~= "table" then target[k] = {} end
+    if type(target[k]) ~= "table" then
+      target[k] = {}
+    end
     target = target[k]
   end
   local last_key = keys[#keys]
@@ -166,7 +174,9 @@ end
 --- @param key string
 function M.del_state(slice_name, key)
   local slice = _slices[slice_name]
-  if not slice then return end
+  if not slice then
+    return
+  end
   local old_value = slice.data[key]
   slice.data[key] = nil
   _notify_watchers(slice_name, key, nil, old_value)
@@ -198,7 +208,9 @@ end
 --- @param watcher_id string
 function M.unwatch(slice_name, key, watcher_id)
   local slice = _slices[slice_name]
-  if not slice or not slice.watchers[key] then return end
+  if not slice or not slice.watchers[key] then
+    return
+  end
   slice.watchers[key][watcher_id] = nil
 end
 
@@ -229,7 +241,7 @@ function M.create_context(context_data)
     _data = context_data or {},
     _children = {},
     _parent = nil,
-    _shared = {},  -- 协程内全局共享表，所有模块可直接读写
+    _shared = {}, -- 协程内全局共享表，所有模块可直接读写
   }
 
   --- 获取上下文值
@@ -296,7 +308,9 @@ end
 function M.get_shared_value(key, default)
   local shared = M.get_shared()
   local v = shared[key]
-  if v == nil then return default end
+  if v == nil then
+    return default
+  end
   return v
 end
 
@@ -304,7 +318,9 @@ end
 --- @return table|nil
 function M.get_current_context()
   local co = coroutine.running()
-  if not co then return nil end
+  if not co then
+    return nil
+  end
   return _coroutine_contexts[co]
 end
 
@@ -334,51 +350,8 @@ function M.with_context(context, fn, ...)
   return result1, result2, result3
 end
 
--- ========== 旧版兼容接口 ==========
-
---- 初始化状态
---- @param config table 合并后的完整配置
-function M.initialize(config)
-  if _legacy_state.initialized then return end
-  _legacy_state.config = config
-  _legacy_state.initialized = true
-  -- 注册默认状态切片
-  M.register_slice("config", { data = config })
-  M.register_slice("app", { initialized = true })
-end
-
---- 获取配置
---- @return table 完整配置
-function M.get_config()
-  return _legacy_state.config
-end
-
---- 获取配置值（支持点号路径）
---- @param key string 配置键，如 "ai.scenarios.chat"
---- @param default any 默认值
---- @return any
-function M.get_config_value(key, default)
-  if not key then return _legacy_state.config end
-  local keys = vim.split(key, ".", { plain = true })
-  local value = _legacy_state.config
-  for _, k in ipairs(keys) do
-    if type(value) ~= "table" then return default end
-    value = value[k]
-  end
-  if value == nil then return default end
-  return value
-end
-
---- 检查是否已初始化
---- @return boolean
-function M.is_initialized()
-  return _legacy_state.initialized
-end
-
 --- 重置状态（测试用）
 function M._test_reset()
-  _legacy_state.initialized = false
-  _legacy_state.config = nil
   _slices = {}
   _slice_order = {}
   _watcher_id_counter = 0
@@ -394,6 +367,15 @@ function M.list_slices()
     table.insert(names, name)
   end
   return names
+end
+
+-- ========== 初始化状态检查 ==========
+
+--- 检查状态管理器是否已初始化
+--- 通过检查 app 切片是否存在来判断
+--- @return boolean
+function M.is_initialized()
+  return _slices["app"] ~= nil
 end
 
 return M

@@ -45,7 +45,7 @@ function M.run()
 
   local tests = {
     --- 测试 initialize
-    test_initialize = function()
+    test_aaa_initialize = function()
       local hc = require("NeoAI.core.ai.http_client")
       hc.initialize({ config = {} })
       -- 幂等初始化
@@ -403,7 +403,14 @@ function M.run()
   }
 
   local passed, failed = 0, 0
-  for name, fn in pairs(tests) do
+  -- 按名称排序执行，保证顺序一致
+  local ordered_names = {}
+  for name, _ in pairs(tests) do
+    table.insert(ordered_names, name)
+  end
+  table.sort(ordered_names)
+  for _, name in ipairs(ordered_names) do
+    local fn = tests[name]
     local ok, err = pcall(fn)
     if ok then
       print(string.format("  ✓ %s", name))
@@ -417,8 +424,8 @@ function M.run()
   return { passed = passed, failed = failed }
 end
 
--- 直接运行
-if pcall(vim.api.nvim_buf_get_name, 0) then
+-- 直接运行（仅在非 run_all 模式下）
+if not _G._NEOAI_TEST_RUNNING and pcall(vim.api.nvim_buf_get_name, 0) then
   M.run()
 end
 

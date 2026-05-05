@@ -356,8 +356,6 @@ local function _check_cursor_near_end()
   local buf = vim.api.nvim_win_get_buf(win)
   local total = vim.api.nvim_buf_line_count(buf)
   _should_follow_cached = total - cursor[1] <= 5
-  -- 同步更新协程变量
-  state_manager.set_state("chat_window", "cursor_follow_mode", _should_follow_cached)
   return _should_follow_cached
 end
 
@@ -469,11 +467,6 @@ function M.initialize(config)
     return
   end
   state.initialized = true
-
-  -- 注册状态切片到 state_manager
-  state_manager.register_slice("chat_window", {
-    cursor_follow_mode = false, -- true=光标在末尾附近，buffer 变化时自动跳转到末尾
-  })
 
   -- 初始化虚拟输入组件
   virtual_input.initialize(config)
@@ -692,28 +685,23 @@ function M._render_single_message(msg, prev_role)
   end
 
   -- 解码 %%XX URL 编码（由 http_client._encode_special_chars 编码的响应内容）
-  -- 注意：必须先尝试 JSON 解析，再对字段值分别解码，
-  -- 因为直接对整个 JSON 字符串解码可能破坏 JSON 结构（如 \x00 空字符）
-  local http_client_ok, http_client = pcall(require, "NeoAI.core.ai.http_client")
-  if http_client_ok and http_client._decode_special_chars then
-    -- 先尝试 JSON 解析
+  -- 使用 http_utils 替代 http_client 跨模块依赖
+  local http_utils_ok, http_utils = pcall(require, "NeoAI.core.ai.http_utils")
+  if http_utils_ok and http_utils.decode_special_chars then
     local json_ok, parsed = pcall(vim.json.decode, raw_content)
     if json_ok and type(parsed) == "table" then
-      -- 对 JSON 字段值分别解码
       if parsed.reasoning_content and type(parsed.reasoning_content) == "string" then
-        parsed.reasoning_content = http_client._decode_special_chars(parsed.reasoning_content)
+        parsed.reasoning_content = http_utils.decode_special_chars(parsed.reasoning_content)
       end
       if parsed.content and type(parsed.content) == "string" then
-        parsed.content = http_client._decode_special_chars(parsed.content)
+        parsed.content = http_utils.decode_special_chars(parsed.content)
       end
-      -- 重新编码为 JSON 字符串
       local ok_re, re_encoded = pcall(vim.json.encode, parsed)
       if ok_re then
         raw_content = re_encoded
       end
     else
-      -- 不是 JSON，直接对整个字符串解码
-      raw_content = http_client._decode_special_chars(raw_content)
+      raw_content = http_utils.decode_special_chars(raw_content)
     end
   end
 
@@ -962,9 +950,8 @@ function M._apply_rendered_content(content)
     local buf = vim.api.nvim_win_get_buf(win_handle)
     local total_lines = vim.api.nvim_buf_line_count(buf)
     near_end = total_lines - cursor[1] <= 5
-    -- 同步更新协程变量和模块局部缓存
+    -- 更新模块局部缓存
     _should_follow_cached = near_end
-    state_manager.set_state("chat_window", "cursor_follow_mode", near_end)
   end
 
   -- 设置窗口内容
@@ -1089,13 +1076,15 @@ function M.set_keymaps()
   -- 从合并后的配置中获取 chat 上下文键位
   -- 所有键位统一由 default_config.lua 定义，模块内部不提供任何 fallback 默认值
   -- 从统一状态管理器获取键位配置
-  local chat_config = state_manager.get_config_value("keymaps.chat")
+  local full_config = state_manager.get_state("config", "data") or {}
+  local chat_config = full_config.keymaps and full_config.keymaps.chat or {}
   local keymaps = {
     insert = chat_config.insert.key,
     quit = chat_config.quit.key,
     refresh = chat_config.refresh.key,
     switch_model = chat_config.switch_model.key,
     cancel = chat_config.cancel.key,
+    tool_approval = chat_config.tool_approval and chat_config.tool_approval.key or nil,
   }
 
   -- 使用闭包创建局部函数引用，避免每次按键都调用 require
@@ -1141,6 +1130,10 @@ function M.set_keymaps()
       callback = switch_model
     elseif key == "cancel" then
       callback = cancel_generation
+    elseif key == "tool_approval" then
+      callback = function()
+        M._open_tool_approval()
+      end
     end
 
     if callback then
@@ -1294,16 +1287,7 @@ function M._load_messages(session_id)
   end
   -- 确保 chat_service 已初始化
   if not chat_service.is_initialized() then
-    local config = {}
-    local core_ok, core_mod = pcall(require, "NeoAI.core")
-    if core_ok then
-      local ok_cfg, cfg = pcall(function()
-        return core_mod.get_config()
-      end)
-      if ok_cfg and cfg then
-        config = cfg
-      end
-    end
+    local config = state_manager.get_state("config", "data") or {}
     chat_service.initialize({ config = config })
   end
 
@@ -1400,7 +1384,7 @@ function M.close()
     state.cursor_follow.timer = nil
   end
   state.cursor_follow.pending = false
-  state_manager.set_state("chat_window", "cursor_follow_mode", false)
+
 
   -- 保存当前窗口ID到局部变量，供 defer_fn 使用
   -- 防止 defer_fn 执行时 state.current_window_id 已被 M.open() 修改
@@ -2289,10 +2273,10 @@ function M._setup_event_listeners()
         return
       end
 
-      -- 解码 %%XX URL 编码（由 http_client._encode_special_chars 编码的响应内容）
-      local http_client_ok, http_client = pcall(require, "NeoAI.core.ai.http_client")
-      if http_client_ok and http_client._decode_special_chars then
-        rc = http_client._decode_special_chars(rc)
+      -- 解码 %%XX URL 编码
+      local http_utils_ok, http_utils = pcall(require, "NeoAI.core.ai.http_utils")
+      if http_utils_ok and http_utils.decode_special_chars then
+        rc = http_utils.decode_special_chars(rc)
       end
 
       -- 检查光标是否在末尾附近（决定是否显示悬浮窗）
@@ -3155,10 +3139,10 @@ function M._append_stream_chunk_to_buffer(chunk_content, content_type)
   -- 在修改 buffer 内容之前缓存光标位置
   _check_cursor_near_end()
 
-  -- 解码 %%XX URL 编码（由 http_client._encode_special_chars 编码的响应内容）
-  local http_client_ok, http_client = pcall(require, "NeoAI.core.ai.http_client")
-  if http_client_ok and http_client._decode_special_chars then
-    chunk_content = http_client._decode_special_chars(chunk_content)
+  -- 解码 %%XX URL 编码
+  local http_utils_ok, http_utils = pcall(require, "NeoAI.core.ai.http_utils")
+  if http_utils_ok and http_utils.decode_special_chars then
+    chunk_content = http_utils.decode_special_chars(chunk_content)
   end
 
   -- 更新消息列表中的累积内容，并同步保存到历史文件
@@ -3420,7 +3404,8 @@ function M._show_tool_display()
 
     -- 设置按键映射
     -- 从统一状态管理器获取键位配置
-    local chat_config = state_manager.get_config_value("keymaps.chat")
+    local full_config = state_manager.get_state("config", "data") or {}
+    local chat_config = full_config.keymaps and full_config.keymaps.chat or {}
     vim.keymap.set("n", chat_config.quit.key, function()
       require("NeoAI.ui.window.chat_window")._close_tool_display()
     end, {
@@ -3619,21 +3604,87 @@ function M._build_tool_folded_text(results)
   return folded_text
 end
 
+--- 打开工具审批悬浮窗
+--- 从 tool_registry 获取所有工具，打开模糊匹配选择器
+--- 用户选中工具后，会触发 TOOL_APPROVED 事件，
+--- 并尝试通过 tool_executor 执行该工具（传入空参数让用户后续通过聊天输入参数）
+function M._open_tool_approval()
+  if not state.current_window_id then
+    return
+  end
+
+  -- 加载 tool_registry 获取所有工具
+  local ok, tool_registry = pcall(require, "NeoAI.tools.tool_registry")
+  if not ok or not tool_registry then
+    vim.notify("[NeoAI] 工具注册表不可用", vim.log.levels.WARN)
+    return
+  end
+
+  -- 确保初始化
+  pcall(tool_registry.initialize, {})
+
+  local all_tools = tool_registry.list()
+  if #all_tools == 0 then
+    vim.notify("[NeoAI] 没有可用的工具", vim.log.levels.INFO)
+    return
+  end
+
+  -- 格式化工具列表
+  local tools_for_select = {}
+  for _, tool in ipairs(all_tools) do
+    table.insert(tools_for_select, {
+      name = tool.name,
+      description = tool.description or "",
+      category = tool.category or "uncategorized",
+      raw = tool,
+    })
+  end
+
+  -- 打开工具审批悬浮窗
+  local tool_approval = require("NeoAI.ui.components.tool_approval")
+  tool_approval.open(tools_for_select, {
+    on_select = function(selected)
+      vim.notify(string.format("[NeoAI] 已选中工具: %s", selected.name), vim.log.levels.INFO)
+
+      -- 触发工具审批事件（供其他模块监听）
+      vim.api.nvim_exec_autocmds("User", {
+        pattern = Events.TOOL_APPROVED,
+        data = {
+          tool_name = selected.name,
+          tool = selected.raw,
+          window_id = state.current_window_id,
+          session_id = state.current_session_id,
+        },
+      })
+
+      -- 用户已通过审批窗口手动选择了工具，统一通过 execute_async 执行
+      -- 用户已手动选择即视为已审批，不需要重复检查 approval.behavior
+      local executor_ok, tool_executor = pcall(require, "NeoAI.tools.tool_executor")
+      if executor_ok and tool_executor then
+        tool_executor.execute_async(selected.name, {
+          _session_id = state.current_session_id,
+        }, function(result)
+          vim.notify(string.format("[NeoAI] 工具 '%s' 执行成功", selected.name), vim.log.levels.INFO)
+        end, function(err)
+          vim.notify(string.format("[NeoAI] 工具 '%s' 执行失败: %s", selected.name, err), vim.log.levels.WARN)
+        end)
+      end
+    end,
+    on_cancel = function()
+      vim.notify("[NeoAI] 工具审批已取消", vim.log.levels.INFO)
+    end,
+  })
+end
+
 --- 获取当前使用的模型标签
 --- @return string|nil 模型标签，如 "deepseek/deepseek-chat"
 function M._get_current_model_label()
   local config_merger = require("NeoAI.core.config.merger")
-  -- 优先从场景候选获取模型名（与发送消息时使用的配置一致）
-  local candidates = config_merger.get_scenario_candidates("chat")
-  local target = candidates[state.current_model_index]
+  -- 使用 get_available_models 获取所有可用模型
+  local models = config_merger.get_available_models("chat")
+  local target = models[state.current_model_index]
   if target then
     return string.format("%s/%s", target.provider or "?", target.model_name or "?")
-  end
-  -- 回退到 get_available_models
-  local models = config_merger.get_available_models("chat")
-  local fallback = models[state.current_model_index]
-  if fallback then
-    return string.format("%s/%s", fallback.provider or "?", fallback.model_name or "?")
   end
   return nil
 end
@@ -3652,49 +3703,23 @@ function M.show_model_selector()
   end
 
   local config_merger = require("NeoAI.core.config.merger")
-  -- 优先使用场景候选列表（与发送消息时使用的配置一致）
-  local candidates = config_merger.get_scenario_candidates("chat")
+  -- 使用 get_available_models 获取所有可用模型（所有提供商，所有模型）
+  local models = config_merger.get_available_models("chat")
 
-  if #candidates == 0 then
-    -- 回退到 get_available_models
-    local models = config_merger.get_available_models("chat")
-    if #models == 0 then
-      vim.notify("[NeoAI] 没有可用的模型（请检查 API key 配置）", vim.log.levels.WARN)
-      return
-    end
-    -- 构建选择菜单项（使用 get_available_models）
-    local items = {}
-    for i, m in ipairs(models) do
-      local indicator = (i == state.current_model_index) and "✓ " or "  "
-      table.insert(items, string.format("%s%s/%s", indicator, m.provider or "?", m.model_name or "?"))
-    end
-    local current_label = "未知"
-    local current = models[state.current_model_index]
-    if current then
-      current_label = string.format("%s/%s", current.provider or "?", current.model_name or "?")
-    end
-    vim.ui.select(items, {
-      prompt = "选择 AI 模型 (当前: " .. current_label .. ")",
-      format_item = function(item)
-        return item
-      end,
-    }, function(choice, idx)
-      if choice and idx and idx ~= state.current_model_index then
-        M.switch_to_model(idx)
-      end
-    end)
+  if #models == 0 then
+    vim.notify("[NeoAI] 没有可用的模型（请检查 API key 配置）", vim.log.levels.WARN)
     return
   end
 
-  -- 构建选择菜单项（使用场景候选）
+  -- 构建选择菜单项
   local items = {}
-  for i, c in ipairs(candidates) do
+  for i, m in ipairs(models) do
     local indicator = (i == state.current_model_index) and "✓ " or "  "
-    table.insert(items, string.format("%s%s/%s", indicator, c.provider or "?", c.model_name or "?"))
+    table.insert(items, string.format("%s%s/%s", indicator, m.provider or "?", m.model_name or "?"))
   end
 
   local current_label = "未知"
-  local current = candidates[state.current_model_index]
+  local current = models[state.current_model_index]
   if current then
     current_label = string.format("%s/%s", current.provider or "?", current.model_name or "?")
   end
@@ -3719,18 +3744,13 @@ function M.switch_to_model(model_index)
   end
 
   local config_merger = require("NeoAI.core.config.merger")
-  -- 优先使用场景候选列表
-  local candidates = config_merger.get_scenario_candidates("chat")
-  local target = candidates[model_index]
+  -- 使用 get_available_models 获取所有可用模型
+  local models = config_merger.get_available_models("chat")
+  local target = models[model_index]
 
   if not target then
-    -- 回退到 get_available_models
-    local models = config_merger.get_available_models("chat")
-    target = models[model_index]
-    if not target then
-      vim.notify("[NeoAI] 无效的模型索引: " .. tostring(model_index), vim.log.levels.WARN)
-      return
-    end
+    vim.notify("[NeoAI] 无效的模型索引: " .. tostring(model_index), vim.log.levels.WARN)
+    return
   end
 
   local old_index = state.current_model_index

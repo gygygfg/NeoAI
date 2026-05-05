@@ -9,6 +9,7 @@
 
 local logger = require("NeoAI.utils.logger")
 local state_manager = require("NeoAI.core.config.state")
+local http_utils = require("NeoAI.core.ai.http_utils")
 
 -- ========== 闭包内私有状态 ==========
 -- tool_definitions 和 first_request 已迁移到 state_manager 的 "ai_engine" 切片
@@ -181,20 +182,19 @@ function M.build_request(params)
   local options = params.options or {}
   local session_id = params.session_id
 
-  -- 解码消息中的 %%XX URL 编码
-  local http_client = require("NeoAI.core.ai.http_client")
+  -- 解码消息中的 %%XX URL 编码（使用 http_utils 替代 http_client 跨模块依赖）
   for _, msg in ipairs(messages) do
     if msg.content and type(msg.content) == "string" then
-      msg.content = http_client._decode_special_chars(msg.content)
+      msg.content = http_utils.decode_special_chars(msg.content)
     end
     if msg.reasoning_content and type(msg.reasoning_content) == "string" then
-      msg.reasoning_content = http_client._decode_special_chars(msg.reasoning_content)
+      msg.reasoning_content = http_utils.decode_special_chars(msg.reasoning_content)
     end
     if msg.tool_calls and type(msg.tool_calls) == "table" then
       for _, tc in ipairs(msg.tool_calls) do
         local func = tc["function"] or tc.func
         if func and func.arguments and type(func.arguments) == "string" then
-          func.arguments = http_client._decode_special_chars(func.arguments)
+          func.arguments = http_utils.decode_special_chars(func.arguments)
         end
       end
     end
@@ -260,7 +260,7 @@ function M.build_request(params)
     if options.tools_enabled ~= nil then
       tools_enabled = options.tools_enabled
     else
-      local full_config = state_manager.get_config()
+      local full_config = state_manager.get_state("config", "data") or {}
       if full_config and full_config.tools and full_config.tools.enabled ~= nil then
         tools_enabled = full_config.tools.enabled
       elseif full_config and full_config.ai then

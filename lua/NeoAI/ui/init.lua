@@ -10,11 +10,13 @@ local reasoning_display = require("NeoAI.ui.components.reasoning_display")
 local tree_handlers = require("NeoAI.ui.handlers.tree_handlers")
 local chat_handlers = require("NeoAI.ui.handlers.chat_handlers")
 local Events = require("NeoAI.core.events")
+local ui_events = require("NeoAI.ui.ui_events")
 local state_manager = require("NeoAI.core.config.state")
 
 local state = {
   initialized = false, windows = {}, current_ui_mode = nil,
   current_session_id = nil, event_count = 0,
+  full_config = {},  -- 合并后的完整配置
 }
 
 -- ========== 辅助 ==========
@@ -35,7 +37,7 @@ local function resolve_session_id(session_id)
 end
 
 local function open_window(window_type, session_id, branch_id)
-  local config = state_manager.get_config()
+  local config = state_manager.get_state("config", "data") or {}
   local win_type_map = { tree = "tree", chat = "chat" }
   local titles = { tree = "NeoAI 会话树", chat = "NeoAI 聊天" }
 
@@ -77,8 +79,15 @@ end
 
 -- ========== 初始化 ==========
 
+--- 获取完整配置（供子组件使用，如 tool_approval 获取 keymaps）
+--- @return table
+function M.get_full_config()
+  return state.full_config
+end
+
 function M.initialize(config)
   if state.initialized then return M end
+  state.full_config = config or {}
   local window_config = vim.deepcopy(config.window or {})
   if config.ui and config.ui.window_mode then window_config.window_mode = config.ui.window_mode end
 
@@ -169,82 +178,16 @@ end
 -- ========== 事件监听 ==========
 
 function M._register_event_listeners()
-  local function refresh_tree()
-    if state.current_ui_mode == "tree" and state.windows.tree then tree_window.refresh_tree() end
-  end
-  local function refresh_chat()
-    if state.current_ui_mode == "chat" and state.windows.chat then chat_window.render_chat() end
-  end
-
-  vim.api.nvim_create_autocmd("User", {
-    pattern = Events.SESSION_CREATED,
-    callback = function(args)
-      local data = args.data or {}
-      state.current_session_id = data.session_id
-      if state.current_ui_mode == "chat" and state.windows.chat then
-        chat_window.update_title((data.session or {}).name or "新会话")
-      end
-      refresh_tree()
+  ui_events.register_listeners(state, {
+    refresh_tree = function()
+      if state.current_ui_mode == "tree" and state.windows.tree then tree_window.refresh_tree() end
     end,
-  })
-
-  vim.api.nvim_create_autocmd("User", {
-    pattern = Events.SESSION_LOADED,
-    callback = function(args)
-      local data = args.data or {}
-      if data.latest_session_id then
-        state.current_session_id = data.latest_session_id
-      end
-      if state.current_ui_mode == "chat" and state.windows.chat then
-        local hm = get_hm()
-        if hm and hm.is_initialized() then
-          local session = hm.get_session(state.current_session_id)
-          if session then
-            chat_window.update_title(session.name or "加载的会话")
-            chat_window.render_chat()
-          end
-        end
-      end
-      refresh_tree()
+    refresh_chat = function()
+      if state.current_ui_mode == "chat" and state.windows.chat then chat_window.render_chat() end
     end,
-  })
-
-  vim.api.nvim_create_autocmd("User", {
-    pattern = Events.SESSION_DELETED,
-    callback = function(args)
-      if state.current_session_id == (args.data or {}).session_id then
-        state.current_session_id = nil
-      end
-      refresh_tree()
-    end,
-  })
-
-  vim.api.nvim_create_autocmd("User", {
-    pattern = Events.SESSION_CHANGED,
-    callback = function(args)
-      local data = args.data or {}
-      state.current_session_id = data.session_id
-      local session = data.session or {}
-      if state.current_ui_mode == "chat" and state.windows.chat then
-        chat_window.update_title(session.name or "会话")
-        chat_window.render_chat()
-      end
-      refresh_tree()
-    end,
-  })
-
-  for _, event in ipairs({ Events.BRANCH_CREATED, Events.BRANCH_DELETED }) do
-    vim.api.nvim_create_autocmd("User", { pattern = event, callback = refresh_tree })
-  end
-
-  vim.api.nvim_create_autocmd("User", {
-    pattern = Events.BRANCH_SWITCHED,
-    callback = function() refresh_chat(); refresh_tree() end,
-  })
-
-  vim.api.nvim_create_autocmd("User", {
-    pattern = Events.MESSAGE_ADDED,
-    callback = refresh_chat,
+    chat_window = chat_window,
+    tree_window = tree_window,
+    get_hm = get_hm,
   })
 end
 
@@ -273,7 +216,7 @@ end
 
 function M.update_config(new_config)
   if not state.initialized then return end
-  local config = state_manager.get_config()
+  local config = state_manager.get_state("config", "data") or {}
   local merged = vim.tbl_extend("force", config, new_config or {})
   local window_config = merged.window or {}
   if merged.window_mode then window_config.window_mode = merged.window_mode end

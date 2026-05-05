@@ -8,6 +8,10 @@ local define_tool = require("NeoAI.tools.builtin.tool_helpers").define_tool
 
 -- 检查 Tree-sitter 是否可用
 local ts_available = false
+---@class vim.treesitter
+---@field language table<string, any>
+---@field query table<string, any>
+---@field get_string_parser fun(source: string, lang: string): table
 local ts = nil
 
 local function check_ts()
@@ -92,6 +96,7 @@ end
 --- @param on_error function 安装失败时回调
 local function ensure_parser_installed(lang, on_success, on_error)
   -- 检查解析器是否已安装
+  ---@diagnostic disable-next-line: need-check-nil
   local ok_inspect, _ = pcall(ts.language.inspect, lang)
   if ok_inspect then
     if on_success then
@@ -111,6 +116,7 @@ local function ensure_parser_installed(lang, on_success, on_error)
     local ok_add, add_err = pcall(vim.treesitter.language.add, lang)
     if ok_add then
       -- 安装后再次检查
+      ---@diagnostic disable-next-line: need-check-nil
       local ok2, _ = pcall(ts.language.inspect, lang)
       if ok2 then
         if on_success then
@@ -128,8 +134,11 @@ local function ensure_parser_installed(lang, on_success, on_error)
   end)
 
   if has_ts_install then
-    local ok, err = pcall(vim.cmd, "TSInstallSync " .. lang)
+    local ok, err = pcall(function()
+      vim.cmd("TSInstallSync " .. lang)
+    end)
     if ok then
+      ---@diagnostic disable-next-line: need-check-nil
       local ok2, _ = pcall(ts.language.inspect, lang)
       if ok2 then
         if on_success then
@@ -149,6 +158,7 @@ local function ensure_parser_installed(lang, on_success, on_error)
   if has_ts_install_async then
     vim.cmd("TSInstall " .. lang)
     vim.defer_fn(function()
+      ---@diagnostic disable-next-line: need-check-nil
       local ok2, _ = pcall(ts.language.inspect, lang)
       if ok2 then
         if on_success then
@@ -160,6 +170,7 @@ local function ensure_parser_installed(lang, on_success, on_error)
           require("vim.treesitter.language").add(lang)
         end)
         if ok_require then
+          ---@diagnostic disable-next-line: need-check-nil
           local ok3, _ = pcall(ts.language.inspect, lang)
           if ok3 then
             if on_success then
@@ -320,6 +331,7 @@ local function parse_file_content_async(filepath, max_depth, on_success, on_erro
 
       -- 确保解析器已安装
       ensure_parser_installed(lang, function()
+        ---@diagnostic disable-next-line: need-check-nil
         local ok, parser = pcall(ts.get_string_parser, content, lang)
         if not ok or not parser then
           if on_error then
@@ -362,43 +374,6 @@ local function parse_file_content_async(filepath, max_depth, on_success, on_erro
       end
     end)
   end)
-end
-
--- 解析文件内容并返回语法树
-local function parse_file_content(filepath, max_depth)
-  local content, err = read_file_content(filepath)
-  if not content then
-    return nil, err
-  end
-
-  local lang = detect_lang_from_filepath(filepath)
-  if not lang then
-    return nil, "无法确定文件语言"
-  end
-
-  ---@diagnostic disable-next-line: undefined-field, need-check-nil
-  local ok, parser = pcall(ts.get_string_parser, content, lang)
-  if not ok or not parser then
-    return nil, "无法为语言 '" .. lang .. "' 创建解析器"
-  end
-
-  local ok2, trees = pcall(parser.parse, parser)
-  if not ok2 or not trees or #trees == 0 then
-    return nil, "解析失败"
-  end
-
-  local root = trees[1]:root()
-  local nodes = _traverse_node(root, content, 0, max_depth or 3)
-
-  return {
-    filepath = filepath,
-    language = lang,
-    line_count = #vim.split(content, "\n", { plain = true }),
-    root_type = root:type(),
-    node_count = #nodes,
-    nodes = nodes,
-  },
-    nil
 end
 
 -- ============================================================================
@@ -498,6 +473,7 @@ M.parse_file = define_tool({
   },
   category = "treesitter",
   permissions = { read = true },
+  approval = { behavior = "auto_approve" },
 })
 
 -- ============================================================================
@@ -505,11 +481,13 @@ M.parse_file = define_tool({
 -- ============================================================================
 
 local function _query_tree_for_source(source_text, lang, query_string)
+  ---@diagnostic disable-next-line: need-check-nil
   local ok, query = pcall(ts.query.parse, lang, query_string)
   if not ok then
     return nil, "查询语法错误: " .. tostring(query)
   end
 
+  ---@diagnostic disable-next-line: need-check-nil
   local ok2, parser = pcall(ts.get_string_parser, source_text, lang)
   if not ok2 or not parser then
     return nil, "无法为语言 '" .. lang .. "' 创建解析器"
@@ -621,6 +599,7 @@ M.query_tree = define_tool({
   },
   category = "treesitter",
   permissions = { read = true },
+  approval = { behavior = "auto_approve" },
 })
 
 -- ============================================================================
@@ -656,6 +635,7 @@ local function _get_node_at_position(args, on_success, on_error)
     end
 
     ensure_parser_installed(lang, function()
+      ---@diagnostic disable-next-line: need-check-nil
       local ok, parser = pcall(ts.get_string_parser, content, lang)
       if not ok or not parser then
         if on_error then
@@ -775,6 +755,7 @@ M.get_node_at_position = define_tool({
   },
   category = "treesitter",
   permissions = { read = true },
+  approval = { behavior = "auto_approve" },
 })
 
 -- ============================================================================
@@ -868,6 +849,7 @@ M.get_node_type = define_tool({
   returns = { type = "object", description = "匹配节点的类型信息列表" },
   category = "treesitter",
   permissions = { read = true },
+  approval = { behavior = "auto_approve" },
 })
 
 -- ============================================================================
@@ -994,6 +976,7 @@ M.get_node_range = define_tool({
   returns = { type = "object", description = "匹配节点的范围信息列表" },
   category = "treesitter",
   permissions = { read = true },
+  approval = { behavior = "auto_approve" },
 })
 
 -- ============================================================================
@@ -1038,6 +1021,7 @@ M.is_named_node = define_tool({
   returns = { type = "object", description = "匹配节点的命名状态信息" },
   category = "treesitter",
   permissions = { read = true },
+  approval = { behavior = "auto_approve" },
 })
 
 -- ============================================================================
@@ -1155,6 +1139,7 @@ M.get_parent_node = define_tool({
   returns = { type = "object", description = "匹配节点的父节点信息" },
   category = "treesitter",
   permissions = { read = true },
+  approval = { behavior = "auto_approve" },
 })
 
 -- ============================================================================
@@ -1221,6 +1206,7 @@ M.get_child_nodes = define_tool({
   returns = { type = "object", description = "匹配父节点的子节点列表" },
   category = "treesitter",
   permissions = { read = true },
+  approval = { behavior = "auto_approve" },
 })
 
 -- get_tools() - 返回所有工具列表供注册

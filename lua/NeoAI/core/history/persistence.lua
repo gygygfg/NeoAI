@@ -376,6 +376,12 @@ function M.initialize(options)
   logger.debug("[history_persistence] 初始化完成, save_path=" .. state.save_path)
 end
 
+--- 检查是否已初始化
+--- @return boolean
+function M.is_initialized()
+  return state.initialized
+end
+
 --- 设置关闭标志
 function M.set_shutting_down()
   state._is_shutting_down = true

@@ -232,7 +232,7 @@ function M.create_window(window_type, options)
 
   window_counter = window_counter + 1
   local window_id = "win_" .. tostring(os.time()) .. "_" .. window_counter
-  local full_config = state_manager.get_config() or {}
+  local full_config = state_manager.get_state("config", "data") or {}
   local merged = vim.tbl_extend("force", full_config, options or {})
   merged.title = merged.title or ("NeoAI - " .. window_type)
 

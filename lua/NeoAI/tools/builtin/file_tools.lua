@@ -3,18 +3,7 @@
 -- 工具函数签名：func(args, on_success, on_error)
 local M = {}
 
--- 标准参数警告辅助函数
--- 当模型使用简化参数（如直接传 filepath 字符串）时，返回警告并附上正确调用示例
-local function warn_simple_args(tool_name, example)
-  local msg = string.format(
-    "⚠️ 警告：你使用了简化参数格式调用 '%s'。\n"
-      .. "虽然操作已执行，但建议使用标准参数格式以确保兼容性。\n"
-      .. "正确调用示例：\n%s",
-    tool_name,
-    example
-  )
-  return msg
-end
+
 
 local define_tool = require("NeoAI.tools.builtin.tool_helpers").define_tool
 
@@ -107,17 +96,35 @@ local function uv_delete_file(filepath, on_success, on_error)
 end
 
 local function uv_mkdir_p(filepath, on_success, on_error)
-  vim.uv.fs_mkdir(filepath, 493, true, function(err)
-    if err then
-      if on_error then
-        on_error(err or "无法创建目录")
+  -- vim.uv.fs_mkdir 不支持 recursive 参数，需要手动递归创建父目录
+  local function mkdir_recursive(path)
+    vim.uv.fs_mkdir(path, 493, function(err)
+      if err then
+        if err == "EEXIST" then
+          -- 目录已存在，成功
+          if on_success then
+            on_success(true)
+          end
+          return
+        end
+        -- 可能是父目录不存在，尝试创建父目录
+        local parent = path:match("^(.*/)[^/]+$")
+        if parent and parent ~= path then
+          mkdir_recursive(parent)
+        else
+          if on_error then
+            on_error(err or "无法创建目录")
+          end
+        end
+      else
+        -- 创建成功
+        if on_success then
+          on_success(true)
+        end
       end
-      return
-    end
-    if on_success then
-      on_success(true)
-    end
-  end)
+    end)
+  end
+  mkdir_recursive(filepath)
 end
 
 -- ============================================================================
@@ -180,27 +187,43 @@ local function _read_file(args, on_success, on_error)
       if node.type == "function_definition" or node.type == "method_definition" then
         -- Python: def name(...):
         local py_name = text:match("def%s+([%w_]+)%s*%(")
-        if py_name then return py_name end
+        if py_name then
+          return py_name
+        end
         -- Lua: function name(...)
         local lua_name = text:match("function%s+([%w_.:]+)")
-        if lua_name then return lua_name end
+        if lua_name then
+          return lua_name
+        end
         -- JS/TS: function name(...) / name = function(...)
         local js_name = text:match("function%s+([%w_]+)")
-        if js_name then return js_name end
+        if js_name then
+          return js_name
+        end
         local js_arrow = text:match("([%w_]+)%s*=%s*function")
-        if js_arrow then return js_arrow end
+        if js_arrow then
+          return js_arrow
+        end
         local js_arrow2 = text:match("([%w_]+)%s*=%s*%(")
-        if js_arrow2 then return js_arrow2 end
+        if js_arrow2 then
+          return js_arrow2
+        end
       elseif node.type == "class_definition" or node.type == "class_declaration" then
         -- Python: class Name(...):
         local py_class = text:match("class%s+([%w_]+)")
-        if py_class then return py_class end
+        if py_class then
+          return py_class
+        end
         -- JS/TS: class Name {...}
         local js_class = text:match("class%s+([%w_]+)")
-        if js_class then return js_class end
+        if js_class then
+          return js_class
+        end
         -- Lua: ClassName = {}
         local lua_class = text:match("([%w_]+)%s*=%s*")
-        if lua_class then return lua_class end
+        if lua_class then
+          return lua_class
+        end
       end
       return text
     end
@@ -239,7 +262,9 @@ local function _read_file(args, on_success, on_error)
 
     -- 按深度和起始行排序
     table.sort(structures, function(a, b)
-      if a.depth ~= b.depth then return a.depth < b.depth end
+      if a.depth ~= b.depth then
+        return a.depth < b.depth
+      end
       return a.start_row < b.start_row
     end)
 
@@ -257,7 +282,6 @@ local function _read_file(args, on_success, on_error)
   local results = {}
   local pending = #files
 
-  local warned = false
   -- 标记是否已生成结构概览（大文件）
   local has_structure_overview = false
   local function check_done()
@@ -266,19 +290,7 @@ local function _read_file(args, on_success, on_error)
       local output = table.concat(results, "\n\n")
       -- 收集所有需要显示的提示信息
       local notices = {}
-      -- 简化参数警告
-      if not warned and args.filepath and type(args.filepath) == "string" then
-        warned = true
-        table.insert(notices, "⚠️ 警告：你使用了简化参数格式调用 'read_file'。")
-        table.insert(notices, "虽然操作已执行，但建议使用标准参数格式以确保兼容性。")
-        table.insert(notices, "正确调用示例：")
-        table.insert(notices, [[{
-  files = {
-    { filepath = "/path/to/file", start = 1, end = -1 }
-  }
-}]])
-      end
-      -- 文件过长提示（当结果中包含结构概览时附加）
+  -- 文件过长提示（当结果中包含结构概览时附加）
       if has_structure_overview then
         if #notices > 0 then
           table.insert(notices, "")
@@ -442,6 +454,7 @@ M.read_file = define_tool({
   returns = { type = "string", description = "带行号的文件内容" },
   category = "file",
   permissions = { read = true },
+  approval = { behavior = "auto_approve" },
 })
 
 -- ============================================================================
@@ -460,10 +473,8 @@ local function _write_file(args, on_success, on_error)
     table.insert(files, args.file)
   end
   -- 支持标准参数：直接传 filepath 和 content 字符串
-  local used_simple = false
   if args.filepath and type(args.filepath) == "string" and args.content then
     table.insert(files, { filepath = args.filepath, content = args.content, append = args.append })
-    used_simple = true
   end
   if #files == 0 then
     if on_error then
@@ -477,14 +488,6 @@ local function _write_file(args, on_success, on_error)
   local function check_done()
     pending = pending - 1
     if pending <= 0 then
-      if used_simple then
-        local example = [[{
-  files = {
-    { filepath = "/path/to/file", content = "文件内容", append = false }
-  }
-}]]
-        table.insert(results, 1, { _warning = warn_simple_args("write_file", example) })
-      end
       if on_success then
         on_success(results)
       end
@@ -729,15 +732,15 @@ local function _list_files(args, on_success, on_error)
     table.insert(file_specs, args.file)
   end
   -- 支持标准参数：直接传 dir_path/pattern/recursive 字符串
-  local used_simple = false
   if args.dir_path and type(args.dir_path) == "string" then
-    table.insert(file_specs, { dir = args.dir_path, pattern = args.pattern or "*", recursive = args.recursive or false })
-    used_simple = true
+    table.insert(
+      file_specs,
+      { dir = args.dir_path, pattern = args.pattern or "*", recursive = args.recursive or false }
+    )
   end
   -- 支持简化参数：dir 为字符串 + pattern + recursive
   if type(args.dir) == "string" then
     table.insert(file_specs, { dir = args.dir, pattern = args.pattern or "*", recursive = args.recursive or false })
-    used_simple = true
   end
   if #file_specs == 0 then
     if on_error then
@@ -750,14 +753,6 @@ local function _list_files(args, on_success, on_error)
   local function check_done()
     pending = pending - 1
     if pending <= 0 then
-      if used_simple then
-        local example = [[{
-  dirs = {
-    { dir = "/path/to/dir", pattern = "*.ts", recursive = true }
-  }
-}]]
-        table.insert(all_files, 1, warn_simple_args("list_files", example))
-      end
       if on_success then
         on_success(all_files)
       end
@@ -815,6 +810,7 @@ M.list_files = define_tool({
   returns = { type = "array", items = { type = "string" }, description = "文件路径列表" },
   category = "file",
   permissions = { read = true },
+  approval = { behavior = "auto_approve" },
 })
 
 -- ============================================================================
@@ -833,7 +829,6 @@ local function _search_files(args, on_success, on_error)
     table.insert(file_specs, args.file)
   end
   -- 支持简化参数：直接传 pattern/dir 等字符串
-  local used_simple = false
   if args.pattern and type(args.pattern) == "string" and not args.files and not args.file then
     table.insert(file_specs, {
       dir = args.dir or ".",
@@ -842,7 +837,6 @@ local function _search_files(args, on_success, on_error)
       case_sensitive = args.case_sensitive or false,
       regex = args.regex or true,
     })
-    used_simple = true
   end
   local pattern = args.pattern
   if not pattern and #file_specs == 0 then
@@ -859,20 +853,6 @@ local function _search_files(args, on_success, on_error)
   local function check_done()
     pending = pending - 1
     if pending <= 0 then
-      if used_simple then
-        local example = [[{
-  files = {
-    {
-      dir = ".",
-      pattern = "search_text",
-      file_pattern = "*.lua",
-      case_sensitive = false,
-      regex = true
-    }
-  }
-}]]
-        table.insert(all_results, 1, { _warning = warn_simple_args("search_files", example) })
-      end
       if on_success then
         on_success(all_results)
       end
@@ -920,20 +900,22 @@ local function _search_files(args, on_success, on_error)
       local stdout_data = {}
       local stderr_data = {}
 
+      -- 安全关闭 pipe 的辅助函数
+      local function safe_close_pipe(pipe)
+        if pipe and not pipe:is_closing() then
+          pipe:read_stop()
+          pipe:close()
+        end
+      end
+
       -- 在 spawn 时通过 stdio 数组传入 pipe
       local handle = vim.uv.spawn("grep", {
         args = grep_args,
         stdio = { nil, stdout_pipe, stderr_pipe },
       }, function(code)
         -- 关闭 pipe
-        if not stdout_pipe:is_closing() then
-          stdout_pipe:read_stop()
-          stdout_pipe:close()
-        end
-        if not stderr_pipe:is_closing() then
-          stderr_pipe:read_stop()
-          stderr_pipe:close()
-        end
+        safe_close_pipe(stdout_pipe)
+        safe_close_pipe(stderr_pipe)
 
         if code == 0 then
           -- 有匹配结果
@@ -959,24 +941,24 @@ local function _search_files(args, on_success, on_error)
         check_done()
       end)
       if handle then
-        stdout_pipe:read_start(function(err, data)
-          if data then
-            table.insert(stdout_data, data)
-          end
-        end)
-        stderr_pipe:read_start(function(err, data)
-          if data then
-            table.insert(stderr_data, data)
-          end
-        end)
+        if stdout_pipe then
+          stdout_pipe:read_start(function(err, data)
+            if data then
+              table.insert(stdout_data, data)
+            end
+          end)
+        end
+        if stderr_pipe then
+          stderr_pipe:read_start(function(err, data)
+            if data then
+              table.insert(stderr_data, data)
+            end
+          end)
+        end
       else
         -- spawn 失败，清理 pipe
-        if not stdout_pipe:is_closing() then
-          stdout_pipe:close()
-        end
-        if not stderr_pipe:is_closing() then
-          stderr_pipe:close()
-        end
+        safe_close_pipe(stdout_pipe)
+        safe_close_pipe(stderr_pipe)
         table.insert(all_results, {
           _error = string.format("无法启动 grep 进程 (dir=%s, pattern=%s)", dir, search_pattern),
         })
@@ -1037,6 +1019,7 @@ M.search_files = define_tool({
   },
   category = "file",
   permissions = { read = true },
+  approval = { behavior = "auto_approve" },
 })
 
 -- ============================================================================
@@ -1055,10 +1038,8 @@ local function _file_exists(args, on_success, on_error)
     table.insert(files, args.file)
   end
   -- 支持标准参数：直接传 filepath 字符串
-  local used_simple = false
   if args.filepath and type(args.filepath) == "string" then
     table.insert(files, { filepath = args.filepath })
-    used_simple = true
   end
   if #files == 0 then
     if on_error then
@@ -1072,18 +1053,6 @@ local function _file_exists(args, on_success, on_error)
   local function check_done()
     pending = pending - 1
     if pending <= 0 then
-      if used_simple then
-        local example = [[{
-  files = {
-    { filepath = "/path/to/file" }
-  }
-}]]
-        table.insert(
-          results,
-          1,
-          { filepath = "_warning", exists = false, _warning = warn_simple_args("file_exists", example) }
-        )
-      end
       if on_success then
         on_success(results)
       end
@@ -1142,6 +1111,7 @@ M.file_exists = define_tool({
   },
   category = "file",
   permissions = { read = true },
+  approval = { behavior = "auto_approve" },
 })
 
 -- ============================================================================
@@ -1160,10 +1130,8 @@ local function _create_directory(args, on_success, on_error)
     table.insert(files, args.file)
   end
   -- 支持标准参数：直接传 filepath 字符串
-  local used_simple = false
   if args.filepath and type(args.filepath) == "string" then
     table.insert(files, { filepath = args.filepath, parents = args.parents })
-    used_simple = true
   end
   if #files == 0 then
     if on_error then
@@ -1177,18 +1145,6 @@ local function _create_directory(args, on_success, on_error)
   local function check_done()
     pending = pending - 1
     if pending <= 0 then
-      if used_simple then
-        local example = [[{
-  files = {
-    { filepath = "/path/to/dir", parents = true }
-  }
-}]]
-        table.insert(
-          results,
-          1,
-          { filepath = "_warning", success = false, _warning = warn_simple_args("create_directory", example) }
-        )
-      end
       if on_success then
         on_success(results)
       end
@@ -1277,10 +1233,8 @@ local function _ensure_dir(args, on_success, on_error)
     table.insert(files, args.file)
   end
   -- 支持标准参数：直接传 filepath 字符串
-  local used_simple = false
   if args.filepath and type(args.filepath) == "string" then
     table.insert(files, { filepath = args.filepath, parents = args.parents })
-    used_simple = true
   end
   if #files == 0 then
     if on_error then
@@ -1294,18 +1248,6 @@ local function _ensure_dir(args, on_success, on_error)
   local function check_done()
     pending = pending - 1
     if pending <= 0 then
-      if used_simple then
-        local example = [[{
-  files = {
-    { filepath = "/path/to/dir", parents = true }
-  }
-}]]
-        table.insert(
-          results,
-          1,
-          { filepath = "_warning", success = false, _warning = warn_simple_args("ensure_dir", example) }
-        )
-      end
       if on_success then
         on_success(results)
       end
@@ -1395,10 +1337,8 @@ local function _delete_file(args, on_success, on_error)
     table.insert(files, args.file)
   end
   -- 支持标准参数：直接传 filepath 字符串
-  local used_simple = false
   if args.filepath and type(args.filepath) == "string" then
     table.insert(files, { filepath = args.filepath })
-    used_simple = true
   end
   if #files == 0 then
     if on_error then
@@ -1411,18 +1351,6 @@ local function _delete_file(args, on_success, on_error)
   local function check_done()
     pending = pending - 1
     if pending <= 0 then
-      if used_simple then
-        local example = [[{
-  files = {
-    { filepath = "/path/to/file" }
-  }
-}]]
-        table.insert(
-          results,
-          1,
-          { filepath = "_warning", success = false, _warning = warn_simple_args("delete_file", example) }
-        )
-      end
       if on_success then
         on_success(results)
       end

@@ -27,6 +27,7 @@ local cache = require("NeoAI.core.history.cache")
 local saver = require("NeoAI.core.history.saver")
 local shutdown_flag = require("NeoAI.core.shutdown_flag")
 local state_manager = require("NeoAI.core.config.state")
+local message_builder = require("NeoAI.core.history.message_builder")
 
 -- ========== 状态 ==========
 
@@ -111,23 +112,18 @@ function M.initialize(options)
 
   -- 优先从统一状态管理器获取会话配置
   -- 若 state_manager 未初始化（如测试环境），回退到 options.config
-  local full_config
-  if state_manager.is_initialized() then
-    full_config = state_manager.get_config() or {}
-  else
-    full_config = (options or {}).config or (options or {})
-  end
+  local full_config = state_manager.get_state("config", "data") or (options or {}).config or (options or {})
   local session_config = full_config.session or {}
   local auto_save = session_config.auto_save ~= false
   local auto_naming = session_config.auto_naming ~= false
 
-  -- 初始化持久化模块
+  -- 初始化持久化模块（幂等）
   persistence.initialize({ config = session_config })
 
-  -- 初始化缓存模块
+  -- 初始化缓存模块（幂等）
   cache.initialize(get_sessions_ref, M.build_round_text)
 
-  -- 初始化会话历史保存器（事件驱动、队列异步写入）
+  -- 初始化会话历史保存器（事件驱动、队列异步写入，幂等）
   saver.initialize(M)
 
   state.initialized = true
@@ -220,7 +216,8 @@ function M.create_session(name, is_root, parent_id)
   local id = generate_id()
   -- 如果调用方显式传入了 name，直接使用；否则根据 auto_naming 决定默认值
   if name == nil then
-    local auto_naming = state_manager.get_config_value("session.auto_naming") ~= false
+    local full_config = state_manager.get_state("config", "data") or {}
+    local auto_naming = (full_config.session and full_config.session.auto_naming) ~= false
     name = auto_naming and "聊天会话" or ""
   end
   local session = {
@@ -405,7 +402,8 @@ function M.add_round(session_id, user_msg, assistant_msg, usage)
 
   trigger_event(Events.ROUND_ADDED, { session_id = session_id, session = session })
 
-  local auto_naming = state_manager.get_config_value("session.auto_naming") ~= false
+  local full_config = state_manager.get_state("config", "data") or {}
+  local auto_naming = (full_config.session and full_config.session.auto_naming) ~= false
   if auto_naming then
     M.auto_name_session(session_id)
   end
@@ -585,111 +583,11 @@ function M.update_usage(session_id, usage)
 end
 
 --- 将单个会话的消息展平为 role/content 列表（内部公共函数）
+--- 委托给 message_builder.session_to_messages
 --- @param session table 会话对象
 --- @return table { {role, content}, ... }
 function M._session_to_messages(session)
-  if not session then return {} end
-
-  local msgs = {}
-  if session.user and session.user ~= "" then
-    table.insert(msgs, { role = "user", content = session.user })
-  end
-
-  local assistant_list = session.assistant
-  if type(assistant_list) ~= "table" then
-    assistant_list = (assistant_list and assistant_list ~= "") and { assistant_list } or {}
-  end
-
-  for _, entry in ipairs(assistant_list) do
-    local content = entry
-    local msg_type = "assistant"
-
-    local parsed = entry
-    if type(entry) == "string" then
-      local ok, decoded = pcall(vim.json.decode, entry)
-      if ok and type(decoded) == "table" then
-        parsed = decoded
-      else
-        parsed = nil
-      end
-    end
-
-    if type(parsed) == "table" then
-      if parsed.type == "tool_call" then
-        -- 工具调用条目：用 {{{ }}} 折叠标记包裹，格式与 TOOL_LOOP_FINISHED 一致
-        local tool_name = parsed.tool_name or "unknown"
-        local args_str
-        if parsed.arguments_list then
-          local parts = {}
-          for i, args in ipairs(parsed.arguments_list) do
-            table.insert(parts, "  [" .. i .. "] " .. vim.inspect(args or {}))
-          end
-          args_str = table.concat(parts, "\n")
-        else
-          args_str = vim.inspect(parsed.arguments or {})
-        end
-        -- 转义内容中的 {{{ 和 }}}，避免干扰 foldmethod=marker
-        args_str = args_str:gsub("}}}", "} } }"):gsub("{{{", "{ { {")
-        local result_str
-        if parsed.results then
-          local parts = {}
-          for i, res in ipairs(parsed.results) do
-            local s = type(res) == "string" and res or (pcall(vim.json.encode, res) and vim.json.encode(res) or vim.inspect(res))
-            table.insert(parts, "  [" .. i .. "] " .. s)
-          end
-          result_str = table.concat(parts, "\n")
-        else
-          result_str = tostring(parsed.result or "")
-        end
-        -- 清理 JSON 编码后的 \r 字符，将 \r 渲染为换行
-        result_str = result_str:gsub("\\r\\n", "\n"):gsub("\\r", "\n")
-        -- 检查结果中是否包含警告
-        local has_warning = false
-        for line in result_str:gmatch("[^\n]+") do
-          if line:match("^⚠️%s*警告：") then
-            has_warning = true
-            break
-          end
-        end
-        local icon = parsed.is_error and "❌" or (has_warning and "⚠️" or "✅")
-        -- 转义内容中的 {{{ 和 }}}，避免干扰 foldmethod=marker
-        result_str = result_str:gsub("}}}", "} } }"):gsub("{{{", "{ { {")
-        result_str = result_str:gsub("\n", "\n    ")
-        local duration_str = parsed.duration and string.format(" (%.1fs)", parsed.duration) or ""
-        local pack_name = parsed.pack_name or "_uncategorized"
-        local pack_icon = "🔧"
-        local pack_display = "工具调用"
-        -- 尝试获取工具包信息
-        local ok_tp, tool_pack = pcall(require, "NeoAI.tools.tool_pack")
-        if ok_tp then
-          pack_icon = tool_pack.get_pack_icon(pack_name) or "🔧"
-          pack_display = tool_pack.get_pack_display_name(pack_name) or "工具调用"
-        end
-        content = "{{{ " .. pack_icon .. " " .. pack_display .. " - " .. icon .. " " .. tool_name .. duration_str
-          .. "\n    参数: " .. args_str
-          .. "\n    结果: " .. result_str
-          .. "\n}}}"
-      elseif parsed.content then
-        content = parsed.content
-        -- 如果包含 reasoning_content，将 content 编码为 JSON 格式
-        -- 这样 _render_single_message 可以解析并正确渲染思考过程
-        if parsed.reasoning_content and parsed.reasoning_content ~= "" then
-          content = vim.json.encode({
-            reasoning_content = parsed.reasoning_content,
-            content = parsed.content,
-          })
-        end
-      elseif parsed.reasoning_content and parsed.reasoning_content ~= "" then
-        -- 只有 reasoning_content 没有 content 字段
-        content = vim.json.encode({
-          reasoning_content = parsed.reasoning_content,
-          content = "",
-        })
-      end
-    end
-    table.insert(msgs, { role = msg_type, content = content })
-  end
-  return msgs
+  return message_builder.session_to_messages(session)
 end
 
 --- 获取会话的所有消息（展平为 role/content 列表）
@@ -856,71 +754,7 @@ end
 -- ========== Round Text ==========
 
 function M.build_round_text(session)
-  if not session then return "" end
-
-  local user_text = ""
-  local ai_text = ""
-
-  if session.user and session.user ~= "" then
-    user_text = session.user:gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
-  end
-
-  if session.assistant and (
-    (type(session.assistant) == "table" and #session.assistant > 0) or
-    (type(session.assistant) == "string" and session.assistant ~= "")
-  ) then
-    local last_entry = session.assistant
-    if type(session.assistant) == "table" and #session.assistant > 0 then
-      last_entry = session.assistant[#session.assistant]
-    end
-
-    if type(last_entry) == "table" then
-      if last_entry.content then
-        ai_text = last_entry.content
-      elseif last_entry.type == "tool_call" then
-        ai_text = "🔧 " .. (last_entry.tool_name or "工具调用")
-      end
-    elseif type(last_entry) == "string" then
-      local ok, parsed = pcall(vim.json.decode, last_entry)
-      if ok and type(parsed) == "table" then
-        if parsed.content then
-          ai_text = parsed.content
-        elseif parsed.type == "tool_call" then
-          ai_text = "🔧 " .. (parsed.tool_name or "工具调用")
-        end
-      else
-        ai_text = last_entry
-      end
-    end
-    ai_text = ai_text:gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
-  end
-
-  local text = ""
-  if user_text ~= "" and ai_text ~= "" then
-    local user_len = #user_text
-    if user_len > 15 then
-      user_text = truncate_utf8(user_text, 15) .. "…"
-      user_len = 15
-    end
-    text = "👤" .. user_text
-    local max_ai = 20 - user_len
-    if max_ai < 0 then max_ai = 0 end
-    if #ai_text > max_ai then
-      ai_text = truncate_utf8(ai_text, max_ai) .. "…"
-    end
-    text = text .. " | 🤖" .. ai_text
-  elseif user_text ~= "" then
-    if #user_text > 20 then
-      user_text = truncate_utf8(user_text, 20) .. "…"
-    end
-    text = "👤" .. user_text
-  elseif ai_text ~= "" then
-    if #ai_text > 20 then
-      ai_text = truncate_utf8(ai_text, 20) .. "…"
-    end
-    text = "🤖" .. ai_text
-  end
-  return text
+  return message_builder.build_round_text(session)
 end
 
 -- ========== 自动命名 ==========
@@ -968,7 +802,8 @@ end
 -- ========== 持久化 ==========
 
 function M._mark_dirty()
-  local auto_save = state_manager.get_config_value("session.auto_save") ~= false
+  local full_config = state_manager.get_state("config", "data") or {}
+  local auto_save = (full_config.session and full_config.session.auto_save) ~= false
   if not auto_save then return end
   if state._is_shutting_down then return end
 

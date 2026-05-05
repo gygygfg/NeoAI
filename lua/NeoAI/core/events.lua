@@ -39,6 +39,8 @@ M.TOOL_CALL_DETECTED = "NeoAI:tool_call_detected" -- 检测到工具调用
 M.TOOL_RESULT_RECEIVED = "NeoAI:tool_result_received" -- 工具结果已接收
 M.TOOL_DISPLAY_CLOSED = "NeoAI:tool_display_closed" -- 工具调用悬浮窗已关闭
 M.TOOL_DISPLAY_RESIZED = "NeoAI:tool_display_resized" -- 工具调用悬浮窗大小/位置已变化
+M.TOOL_APPROVED = "NeoAI:tool_approved" -- 工具已审批通过
+M.TOOL_APPROVAL_CANCELLED = "NeoAI:tool_approval_cancelled" -- 工具审批已取消
 
 -- ==================== 会话事件 ====================
 -- 使用位置: session_manager.lua, history_manager.lua, ui/init.lua

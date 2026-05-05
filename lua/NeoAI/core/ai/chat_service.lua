@@ -251,7 +251,7 @@ function M.send_message(params)
 
   -- 检查工具是否启用
   local tools_enabled = true
-  local full_config = state_manager.get_config()
+  local full_config = state_manager.get_state("config", "data") or {}
   if full_config and full_config.tools then
     tools_enabled = full_config.tools.enabled ~= false
   end

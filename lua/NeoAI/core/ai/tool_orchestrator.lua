@@ -25,9 +25,7 @@ local state_manager = require("NeoAI.core.config.state")
 local state = {
   initialized = false,
   config = nil,
-  tools = {},
   max_iterations = 20,
-  tool_timeout_ms = 30000,
   sessions = {},
 }
 
@@ -241,9 +239,13 @@ function M.initialize(options)
     return M
   end
   state.config = options.config or {}
-  state.tool_timeout_ms = (state.config.tool_timeout_ms or 30) * 1000
   state.max_iterations = state.config.max_tool_iterations or 20
   state.initialized = true
+
+  -- 注册状态切片
+  state_manager.register_slice("tool_orchestrator", {
+    tools = {},
+  })
 
   -- 初始化工具包管理模块
   tool_pack.initialize()
@@ -508,39 +510,7 @@ function M._execute_single_tool(session_id, tool_call)
     return
   end
 
-  local arguments = {}
-  if tool_func.arguments then
-    -- 先对 arguments 字符串进行 URL 解码（AI 可能返回 URL 编码后的 JSON）
-    -- 例如 %22command%22: %22pwd%22 解码为 "command": "pwd"
-    local decoded_args_str = tool_func.arguments
-    local http_client = require("NeoAI.core.ai.http_client")
-    if type(decoded_args_str) == "string" and decoded_args_str:find("%%") then
-      decoded_args_str = http_client._decode_special_chars(decoded_args_str)
-    end
-
-    local ok, parsed = pcall(vim.json.decode, decoded_args_str)
-    if ok and type(parsed) == "table" then
-      arguments = parsed
-      -- 解码参数值中的 %%XX URL 编码（由 http_client._encode_special_chars 编码）
-      -- 注意：解码的是参数值本身，不是 JSON 字符串
-      for k, v in pairs(arguments) do
-        if type(v) == "string" then
-          arguments[k] = http_client._decode_special_chars(v)
-        end
-      end
-      -- 通用参数别名映射：将 cmd 自动转为 command
-      -- 某些工具（如 run_command）支持 cmd 作为 command 的别名
-      -- AI 可能使用 cmd 字段，但验证 schema 只认 command
-      if arguments.cmd ~= nil and arguments.command == nil then
-        arguments.command = arguments.cmd
-        arguments.cmd = nil
-      end
-    else
-      logger.warn("[tool_orchestrator] _execute_single_tool: tool '%s' 的 arguments JSON 解析失败: %s", tool_name, tostring(tool_func.arguments))
-    end
-  end
-
-  -- 使用计数器确保 tool_call_id 唯一，避免同一秒内多个工具调用 ID 冲突
+  -- 生成唯一 tool_call_id
   if not M._tool_call_counter then
     M._tool_call_counter = 0
   end
@@ -549,77 +519,45 @@ function M._execute_single_tool(session_id, tool_call)
   tool_call.id = tool_call_id
   ss.active_tool_calls[tool_call_id] = true
 
-  local tool_registry = require("NeoAI.tools.tool_registry")
-  pcall(tool_registry.initialize, {})
-
   -- 获取工具所属包名
   local pack_name = tool_pack.get_pack_for_tool(tool_name)
 
-  vim.api.nvim_exec_autocmds("User", {
-    pattern = event_constants.TOOL_EXECUTION_STARTED,
-    data = {
-      tool_name = tool_name,
-      arguments = arguments,
-      pack_name = pack_name,
-      session_id = session_id,
-      window_id = ss.window_id,
-      generation_id = ss.generation_id,
-    },
-  })
-
+  -- 委托给 tool_executor.execute_with_orchestrator
+  -- 参数规范化、URL 解码、别名映射、超时管理全部由 tool_executor 负责
   local tool_executor = require("NeoAI.tools.tool_executor")
-  -- 保存原始参数副本（不含注入的 _session_id / _tool_call_id），用于持久化
-  local original_arguments = {}
-  for k, v in pairs(arguments) do
-    if k ~= "_session_id" and k ~= "_tool_call_id" then
-      original_arguments[k] = v
-    end
-  end
 
-  local function on_result(result, is_error)
-    local s = state.sessions[session_id]
-    if not s then
-      return
-    end
+  tool_executor.execute_with_orchestrator(tool_name, tool_func.arguments, {
+    session_id = session_id,
+    window_id = ss.window_id,
+    generation_id = ss.generation_id,
+    tool_call_id = tool_call_id,
+    pack_name = pack_name,
+  }, {
+    on_result = function(success, result)
+      local s = state.sessions[session_id]
+      if not s then
+        return
+      end
 
-    if s.stop_requested then
+      if s.stop_requested then
+        s.active_tool_calls[tool_call_id] = nil
+        if vim.tbl_count(s.active_tool_calls) == 0 then
+          M._on_tools_complete(session_id)
+        end
+        return
+      end
+
+      local result_str = success and result or ("[工具执行失败] " .. result)
+      M._add_tool_result_to_messages(session_id, tool_call_id, tool_name, result_str)
+
       s.active_tool_calls[tool_call_id] = nil
-      if vim.tbl_count(s.active_tool_calls) == 0 then
+      local remaining = vim.tbl_count(s.active_tool_calls)
+
+      if remaining == 0 and s.phase ~= "round_complete" then
         M._on_tools_complete(session_id)
       end
-      return
-    end
-
-    local result_str = is_error and ("[工具执行失败] " .. result) or result
-    M._add_tool_result_to_messages(session_id, tool_call_id, tool_name, result_str)
-
-    -- 持久化工具调用参数和结果到 history_manager
-    -- 已通过 TOOL_EXECUTION_COMPLETED / TOOL_EXECUTION_ERROR 事件由 history_saver 统一处理
-    -- 此处不再直接调用 add_tool_result，避免重复保存
-
-    s.active_tool_calls[tool_call_id] = nil
-    local remaining = vim.tbl_count(s.active_tool_calls)
-
-    if remaining == 0 and s.phase ~= "round_complete" then
-      M._on_tools_complete(session_id)
-    end
-  end
-
-  -- 创建 on_progress 回调，转发子步骤事件
-  local function on_progress(substep_name, status, duration, detail)
-    -- 子步骤事件已由 tool_executor 内部通过 fire_event 发射
-    -- 这里只需更新 UI（强制刷新）
-  end
-
-  -- 注入 session_id 到参数中，供 tool_executor 保存工具结果时使用
-  arguments._session_id = session_id
-  arguments._tool_call_id = tool_call_id
-
-  tool_executor.execute_async(tool_name, arguments, function(result)
-    on_result(result, false)
-  end, function(err)
-    on_result(err, true)
-  end, on_progress)
+    end,
+  })
 end
 
 -- ========== 完成检查 ==========
@@ -647,42 +585,40 @@ function M._on_tools_complete(session_id)
     end
     -- 用户取消或跳过总结时，触发 GENERATION_COMPLETED 事件显示用量，然后直接结束
     if ss.user_cancelled then
-      if ss._skip_summary then
-        -- 触发 GENERATION_COMPLETED 事件显示用量信息
-        local shared = state_manager.get_shared()
-        local saved_usage = ss.accumulated_usage or {}
-        local saved_gen_id = ss.generation_id or shared.generation_id
-        local saved_win_id = ss.window_id or shared.window_id
-        local saved_reasoning = ss.last_reasoning or ""
-        fire_loop_finished(ss)
-        once_display_closed(session_id, function()
-          local s = state.sessions[session_id]
-          if not s then
-            return
-          end
-          if is_shutting_down() then
-            return
-          end
-          pcall(vim.api.nvim_exec_autocmds, "User", {
-            pattern = event_constants.GENERATION_COMPLETED,
-            data = {
-              generation_id = saved_gen_id,
-              response = "",
-              reasoning_text = saved_reasoning,
-              usage = saved_usage,
-              session_id = session_id,
-              window_id = saved_win_id,
-              duration = 0,
-            },
-          })
-          -- 调用 on_complete 回调
-          if s.on_complete then
-            local cb = s.on_complete
-            s.on_complete = nil
-            cb(true, "", saved_usage)
-          end
-        end)
-      end
+      -- 触发 GENERATION_COMPLETED 事件显示用量信息
+      local shared = state_manager.get_shared()
+      local saved_usage = ss.accumulated_usage or {}
+      local saved_gen_id = ss.generation_id or shared.generation_id
+      local saved_win_id = ss.window_id or shared.window_id
+      local saved_reasoning = ss.last_reasoning or ""
+      fire_loop_finished(ss)
+      once_display_closed(session_id, function()
+        local s = state.sessions[session_id]
+        if not s then
+          return
+        end
+        if is_shutting_down() then
+          return
+        end
+        pcall(vim.api.nvim_exec_autocmds, "User", {
+          pattern = event_constants.GENERATION_COMPLETED,
+          data = {
+            generation_id = saved_gen_id,
+            response = "",
+            reasoning_text = saved_reasoning,
+            usage = saved_usage,
+            session_id = session_id,
+            window_id = saved_win_id,
+            duration = 0,
+          },
+        })
+        -- 调用 on_complete 回调
+        if s.on_complete then
+          local cb = s.on_complete
+          s.on_complete = nil
+          cb(true, "", saved_usage)
+        end
+      end)
       return
     end
     fire_loop_finished(ss)
@@ -1416,11 +1352,11 @@ end
 -- ========== 工具管理 ==========
 
 function M.set_tools(tools)
-  state.tools = tools or {}
+  state_manager.set_state("tool_orchestrator", "tools", tools or {})
 end
 
 function M.get_tools()
-  return state.tools
+  return state_manager.get_state("tool_orchestrator", "tools") or {}
 end
 
 -- ========== 状态查询 ==========
@@ -1705,9 +1641,10 @@ function M.execute_single_tool_request(session_id, tool_name, args, callback)
     tool_def = { type = "function", ["function"] = tf }
   end
 
-  -- 回退：从 state.tools 查找
+  -- 回退：从切片 tools 查找
   if not tool_def then
-    for _, t in ipairs(state.tools or {}) do
+    local tools = state_manager.get_state("tool_orchestrator", "tools") or {}
+    for _, t in ipairs(tools) do
       if t.name == tool_name then
         local tf = { name = t.name, description = t.description or ("执行 " .. t.name .. " 操作") }
         if t.parameters and type(t.parameters) == "table" and t.parameters.properties then
@@ -1786,7 +1723,6 @@ function M.execute_single_tool_request(session_id, tool_name, args, callback)
     generation_id = request.generation_id,
     base_url = ai_preset.base_url,
     api_key = ai_preset.api_key,
-    timeout = ai_preset.timeout or 30000,
     api_type = ai_preset.api_type or "openai",
     provider_config = ai_preset,
   }
@@ -1945,8 +1881,17 @@ function M.shutdown()
     M.unregister_session(session_id)
   end
   state.sessions = {}
-  state.tools = {}
+  state_manager.set_state("tool_orchestrator", "tools", {})
   state.initialized = false
+end
+
+--- 重置（测试用）
+function M._test_reset()
+  state.initialized = false
+  state.sessions = {}
+  state.config = {}
+  state.max_iterations = 20
+  state_manager.set_state("tool_orchestrator", "tools", {})
 end
 
 --- 紧急清理（VimLeavePre 中使用）
@@ -1985,7 +1930,7 @@ function M.cleanup_all()
 
   -- 清空所有状态
   state.sessions = {}
-  state.tools = {}
+  state_manager.set_state("tool_orchestrator", "tools", {})
 end
 
 return M

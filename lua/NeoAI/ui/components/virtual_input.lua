@@ -542,7 +542,8 @@ function M._setup_float_keymaps()
   local buf = state.float_buf
 
   -- 从配置读取 send 键位（send.insert / send.normal 是 { key = "...", desc = "..." } 结构）
-  local send_config = state_manager.get_config_value("keymaps.chat.send")
+  local full_config = state_manager.get_state("config", "data") or {}
+  local send_config = full_config.keymaps and full_config.keymaps.chat and full_config.keymaps.chat.send
   local send_key = send_config and send_config.insert and send_config.insert.key or "<C-s>"
   local normal_send_key = send_config and send_config.normal and send_config.normal.key or "<CR>"
 
@@ -606,7 +607,7 @@ function M._bind_chat_keymaps_to_float(buf)
 
   -- 从统一状态管理器中获取快捷键配置
   -- 所有键位统一由 default_config.lua 定义，模块内部不提供任何 fallback 默认值
-  local full_config = state_manager.get_config()
+  local full_config = state_manager.get_state("config", "data") or {}
   if not full_config or not full_config.keymaps or not full_config.keymaps.chat then
     return
   end
@@ -688,7 +689,8 @@ function M._setup_keymaps()
   local buf = state.buf
 
   -- 从配置读取 send 键位（send.insert / send.normal 是 { key = "...", desc = "..." } 结构）
-  local send_config = state_manager.get_config_value("keymaps.chat.send")
+  local full_config = state_manager.get_state("config", "data") or {}
+  local send_config = full_config.keymaps and full_config.keymaps.chat and full_config.keymaps.chat.send
   local send_key = send_config and send_config.insert and send_config.insert.key or "<C-s>"
   local normal_send_key = send_config and send_config.normal and send_config.normal.key or "<CR>"
 
@@ -792,7 +794,8 @@ end
 --- 获取键位配置
 --- 所有键位统一由 default_config.lua 定义，模块内部不提供任何 fallback 默认值
 function M._get_keymaps()
-  local chat_keymaps = state_manager.get_config_value("keymaps.chat")
+  local full_config = state_manager.get_state("config", "data") or {}
+  local chat_keymaps = full_config.keymaps and full_config.keymaps.chat or {}
   return {
     normal_mode = chat_keymaps.send.insert.key,
     submit = chat_keymaps.send.normal.key,

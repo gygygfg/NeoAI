@@ -51,7 +51,7 @@ function M.initialize(options)
   })
 
   http_client.initialize({ config = {} })
-  local full_config = state_manager.is_initialized() and state_manager.get_config() or (options or {}).config or {}
+  local full_config = state_manager.get_state("config", "data") or (options or {}).config or {}
   tool_orchestrator.initialize({ config = full_config })
   local tool_pack = require("NeoAI.tools.tool_pack")
   tool_pack.initialize()
@@ -84,7 +84,7 @@ local function resolve_scenario_config(scenario)
     local preset = config_merger.get_preset(scenario)
     if preset and preset.base_url and preset.api_key then return preset end
   end
-  local full_config = state_manager.get_config()
+  local full_config = state_manager.get_state("config", "data") or {}
   local ai_config = (full_config and full_config.ai) or {}
   local scenarios = ai_config.scenarios or {}
   local entry = scenarios[scenario] or scenarios[ai_config.default or "chat"]
@@ -105,28 +105,52 @@ end
 local function get_model_config(model_index)
   model_index = model_index or 1
   local preset = {}
-  if config_merger and config_merger.get_scenario_candidates then
-    local candidates = config_merger.get_scenario_candidates("chat")
-    local target = candidates[model_index]
-    if target then preset = vim.deepcopy(target); preset.model = preset.model_name end
-  end
-  if not preset.base_url or not preset.api_key then
-    if config_merger and config_merger.get_available_models then
-      local models = config_merger.get_available_models("chat")
-      local target = models[model_index]
-      if target then
-        local full_config = state_manager.get_config()
-        local providers = (full_config and full_config.ai and full_config.ai.providers) or {}
-        local pdef = providers[target.provider]
-        if pdef then
-          preset.base_url = pdef.base_url; preset.api_key = pdef.api_key
-          preset.provider = target.provider; preset.model_name = target.model_name
-          preset.model = target.model_name; preset.stream = true; preset.timeout = 60000
+  -- 优先使用 get_available_models（与 UI 模型选择器使用的列表一致）
+  if config_merger and config_merger.get_available_models then
+    local models = config_merger.get_available_models("chat")
+    local target = models[model_index]
+    if target then
+      local full_config = state_manager.get_state("config", "data") or {}
+      local providers = (full_config and full_config.ai and full_config.ai.providers) or {}
+      local pdef = providers[target.provider]
+      if pdef then
+        preset.base_url = pdef.base_url; preset.api_key = pdef.api_key
+        preset.provider = target.provider; preset.model_name = target.model_name
+        preset.model = target.model_name
+        -- 从场景配置中继承 temperature/max_tokens 等参数
+        local candidates = config_merger.get_scenario_candidates("chat")
+        for _, c in ipairs(candidates) do
+          if c.provider == target.provider and c.model_name == target.model_name then
+            for k, v in pairs(c) do
+              if k ~= "provider" and k ~= "model_name" and k ~= "base_url" and k ~= "api_key" and k ~= "api_type" then
+                preset[k] = v
+              end
+            end
+            break
+          end
         end
+        if not preset.stream then preset.stream = true end
+        if not preset.timeout then preset.timeout = 60000 end
+        logger.debug("[ai_engine] get_model_config: 从可用模型列表获取 model_name=%s, provider=%s", tostring(preset.model_name), tostring(preset.provider))
       end
     end
   end
-  if not preset.base_url or not preset.api_key then preset = resolve_scenario_config("chat") end
+  if not preset.base_url or not preset.api_key then
+    -- 回退到场景候选
+    if config_merger and config_merger.get_scenario_candidates then
+      local candidates = config_merger.get_scenario_candidates("chat")
+      local target = candidates[model_index]
+      if target then
+        preset = vim.deepcopy(target); preset.model = preset.model_name
+        logger.debug("[ai_engine] get_model_config: 回退到场景候选 model_name=%s", tostring(preset.model_name))
+      end
+    end
+  end
+  if not preset.base_url or not preset.api_key then
+    preset = resolve_scenario_config("chat")
+    logger.debug("[ai_engine] get_model_config: 回退到 resolve_scenario_config, model_name=%s", tostring(preset.model_name))
+  end
+  logger.debug("[ai_engine] get_model_config 最终结果: model_name=%s, base_url=%s", tostring(preset.model_name), tostring(preset.base_url))
   return preset
 end
 
@@ -136,6 +160,7 @@ function M.generate_response(messages, params)
   local session_id = params.session_id; local window_id = params.window_id; local options = params.options or {}
   state.is_generating = true
   local model_index = params.model_index or 1; local ai_preset = get_model_config(model_index)
+  logger.debug("[ai_engine] generate_response: ai_preset.model_name=%s, options.model=%s", tostring(ai_preset.model_name), tostring(options.model))
   local generation_id = os.time() .. "_" .. math.random(1000, 9999)
   state.current_generation_id = generation_id
   state.active_generations[generation_id] = {
@@ -334,20 +359,32 @@ function _handle_stream_end(generation_id, processor, params)
           gen._last_request = saved_request
         end
         vim.defer_fn(function()
-          if not state.is_generating or not state.active_generations or not state.active_generations[generation_id] then return end
+          if not state.active_generations or not state.active_generations[generation_id] then return end
           if saved_request then
-            state.is_generating = false; state.current_generation_id = nil
             http_client.clear_request_dedup(generation_id)
             vim.defer_fn(function()
               if not state.active_generations or not state.active_generations[generation_id] then return end
               _send_stream_request(generation_id, saved_request, params)
             end, 100)
           else
-            state.is_generating = false; state.current_generation_id = nil
             vim.defer_fn(function()
               local s = state.active_generations[generation_id]
               if not s then return end
-              M.handle_tool_result({ generation_id = generation_id, session_id = s.session_id, window_id = s.window_id, messages = s.messages, options = s.options, model_index = s.model_index, ai_preset = s.ai_preset, is_final_round = false, accumulated_usage = s.accumulated_usage, last_reasoning = s.last_reasoning_content })
+              -- 重新构建请求，避免 handle_tool_result 依赖空消息
+              local formatted = request_builder.format_messages(s.messages or {})
+              local rebuilt_request = request_builder.build_request({
+                messages = formatted,
+                options = vim.tbl_extend("force", s.options or {}, {
+                  model = (s.ai_preset and s.ai_preset.model_name) or (s.options and s.options.model),
+                  temperature = (s.ai_preset and s.ai_preset.temperature) or (s.options and s.options.temperature),
+                  max_tokens = (s.ai_preset and s.ai_preset.max_tokens) or (s.options and s.options.max_tokens),
+                  stream = true,
+                }),
+                session_id = s.session_id,
+                generation_id = generation_id,
+              })
+              s._last_request = rebuilt_request
+              _send_stream_request(generation_id, rebuilt_request, params)
             end, 100)
           end
         end, delay)
@@ -362,14 +399,15 @@ function _handle_stream_end(generation_id, processor, params)
   local is_tool_loop = params and params.is_tool_loop
   local is_final_round = params and params.is_final_round
   local tools_enabled = true
-  local full_config = state_manager.get_config()
+  local full_config = state_manager.get_state("config", "data")
   if full_config and full_config.tools and full_config.tools.enabled ~= nil then tools_enabled = full_config.tools.enabled
   elseif full_config and full_config.ai then tools_enabled = full_config.ai.tools_enabled end
 
   if #tool_calls > 0 and tools_enabled then
     if is_tool_loop then
-      state.is_generating = false; state.current_generation_id = nil; state.active_generations[generation_id] = nil
+      state.is_generating = false; state.current_generation_id = nil
       tool_orchestrator.on_generation_complete({ generation_id = generation_id, tool_calls = tool_calls, content = full_response, reasoning = reasoning_text, usage = usage, session_id = sid, is_final_round = is_final_round or false })
+      state.active_generations[generation_id] = nil
       return
     end
     local gen = state.active_generations[generation_id]
@@ -378,7 +416,7 @@ function _handle_stream_end(generation_id, processor, params)
     local tc_msg = { role = "assistant", content = full_response or "", tool_calls = tool_calls, timestamp = os.time(), window_id = wid }
     if reasoning_text and reasoning_text ~= "" then tc_msg.reasoning_content = reasoning_text end
     table.insert(messages, tc_msg)
-    state.is_generating = false; state.current_generation_id = nil; state.active_generations[generation_id] = nil
+    state.is_generating = false; state.current_generation_id = nil
     tool_orchestrator.start_async_loop({ generation_id = generation_id, tool_calls = tool_calls, session_id = sid, window_id = wid, options = options, messages = messages, model_index = model_index, ai_preset = ai_preset, on_complete = function(success, result)
       if not success then logger.error("Tool loop failed: " .. tostring(result)) end
       state.active_generations[generation_id] = nil; state.is_generating = false; state.current_generation_id = nil
@@ -389,11 +427,13 @@ function _handle_stream_end(generation_id, processor, params)
   end
 
   if is_tool_loop then
-    state.is_generating = false; state.current_generation_id = nil; state.active_generations[generation_id] = nil
+    state.is_generating = false; state.current_generation_id = nil
     tool_orchestrator.on_generation_complete({ generation_id = generation_id, tool_calls = {}, content = full_response, reasoning = reasoning_text, usage = usage, session_id = sid, is_final_round = is_final_round or false })
+    state.active_generations[generation_id] = nil
   else
     state.is_generating = false; state.current_generation_id = nil
     vim.api.nvim_exec_autocmds("User", { pattern = event_constants.STREAM_COMPLETED, data = { generation_id = generation_id, full_response = full_response, reasoning_text = reasoning_text, usage = usage, session_id = sid, window_id = wid } })
+    state.active_generations[generation_id] = nil
   end
 end
 
@@ -443,7 +483,7 @@ function _handle_ai_response(generation_id, response, params)
   end
 
   local tools_enabled = true
-  local full_config = state_manager.get_config()
+  local full_config = state_manager.get_state("config", "data") or {}
   if full_config and full_config.tools and full_config.tools.enabled ~= nil then tools_enabled = full_config.tools.enabled
   elseif full_config and full_config.ai then tools_enabled = full_config.ai.tools_enabled end
   stream_processor.clear_reasoning_throttle()
@@ -452,8 +492,9 @@ function _handle_ai_response(generation_id, response, params)
 
   if #tool_calls > 0 and tools_enabled then
     if is_tool_loop then
-      state.is_generating = false; state.current_generation_id = nil; state.active_generations[generation_id] = nil
+      state.is_generating = false; state.current_generation_id = nil
       tool_orchestrator.on_generation_complete({ generation_id = generation_id, tool_calls = tool_calls, content = response_content, reasoning = reasoning_content, usage = response.usage or {}, session_id = session_id, is_final_round = is_final_round or false })
+      state.active_generations[generation_id] = nil
       return
     end
     local gen = state.active_generations[generation_id]
@@ -461,7 +502,7 @@ function _handle_ai_response(generation_id, response, params)
     local tc_msg = { role = "assistant", content = response_content or "", tool_calls = tool_calls, timestamp = os.time(), window_id = window_id }
     if reasoning_content and reasoning_content ~= "" then tc_msg.reasoning_content = reasoning_content end
     table.insert(messages, tc_msg)
-    state.is_generating = false; state.current_generation_id = nil; state.active_generations[generation_id] = nil
+    state.is_generating = false; state.current_generation_id = nil
     tool_orchestrator.start_async_loop({ generation_id = generation_id, tool_calls = tool_calls, session_id = session_id, window_id = window_id, options = options, messages = messages, model_index = model_index, ai_preset = ai_preset, on_complete = function(success, result)
       if not success then logger.error("Tool loop failed: " .. tostring(result)) end
       state.active_generations[generation_id] = nil; state.is_generating = false; state.current_generation_id = nil
@@ -473,8 +514,9 @@ function _handle_ai_response(generation_id, response, params)
 
   if response.usage then usage = response.usage end
   if is_tool_loop then
-    state.is_generating = false; state.current_generation_id = nil; state.active_generations[generation_id] = nil
+    state.is_generating = false; state.current_generation_id = nil
     tool_orchestrator.on_generation_complete({ generation_id = generation_id, tool_calls = {}, content = response_content, reasoning = reasoning_content, usage = usage, session_id = session_id, is_final_round = is_final_round or false })
+    state.active_generations[generation_id] = nil
   else
     _finalize_generation(generation_id, response_content, { session_id = session_id, window_id = window_id, reasoning_text = reasoning_content, usage = usage })
   end
@@ -694,8 +736,8 @@ function M.set_tools(tools)
   -- 写入 state_manager 的状态切片
   state_manager.set_state("ai_engine", "tools", tools_map)
   state_manager.set_state("ai_engine", "tool_definitions", tool_defs)
+  state_manager.set_state("tool_orchestrator", "tools", tools_map)
   request_builder.set_tool_definitions(tool_defs)
-  tool_orchestrator.set_tools(tools_map)
 end
 
 -- ========== 公共接口 ==========
@@ -761,7 +803,7 @@ function M.estimate_request_tokens(request) return request_builder.estimate_requ
 function M.start_async_loop(params) return tool_orchestrator.start_async_loop(params) end
 function M.on_generation_complete(data) return tool_orchestrator.on_generation_complete(data) end
 function M.get_current_iteration(session_id) return tool_orchestrator.get_current_iteration(session_id) end
-function M.get_tools() return tool_orchestrator.get_tools() end
+function M.get_tools() return state_manager.get_state("tool_orchestrator", "tools") or {} end
 function M.is_executing(session_id) return tool_orchestrator.is_executing(session_id) end
 function M.get_loop_status() return "deprecated" end
 function M.is_reasoning_active() return false end

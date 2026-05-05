@@ -159,8 +159,11 @@ end
 --- 清理 reasoning 节流状态
 function M.clear_reasoning_throttle()
   if _reasoning_throttle.timer then
-    pcall(_reasoning_throttle.timer.stop, _reasoning_throttle.timer)
-    pcall(_reasoning_throttle.timer.close, _reasoning_throttle.timer)
+    local timer = _reasoning_throttle.timer
+    pcall(function()
+      if timer:is_active() then timer:stop() end
+      if not timer:is_closing() then timer:close() end
+    end)
     _reasoning_throttle.timer = nil
   end
   _reasoning_throttle.pending_content = ""

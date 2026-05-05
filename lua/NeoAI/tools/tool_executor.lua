@@ -12,12 +12,21 @@ local tool_registry = require("NeoAI.tools.tool_registry")
 local tool_validator = require("NeoAI.tools.tool_validator")
 local event_constants = require("NeoAI.core.events")
 local json = require("NeoAI.utils.json")
+local approval_handler = require("NeoAI.tools.approval_handler")
 
 local state = {
   initialized = false,
   config = nil,
   execution_history = {},
   max_history_size = 100,
+}
+
+-- ========== 超时管理 ==========
+
+local timeout_state = {
+  timers = {},  -- tool_call_id -> timer
+  start_times = {},  -- tool_call_id -> os.time()
+  timeout_ms = 30000,  -- 默认 30 秒（会被 initialize 中的 config.tool_timeout_ms 覆盖）
 }
 
 -- ========== 辅助函数 ==========
@@ -71,6 +80,13 @@ function M.initialize(config)
   state.max_history_size = config.max_history_size or 100
   state.execution_history = {}
   state.initialized = true
+
+  -- 从配置读取工具调用超时（默认 30 秒）
+  timeout_state.timeout_ms = (config.tool_timeout_ms or 30) * 1000
+
+  -- 初始化 tool_validator（审批检查依赖它）
+  local tv = require("NeoAI.tools.tool_validator")
+  pcall(tv.initialize, config)
 
   -- 预加载内置工具模块，触发它们的初始化逻辑
   -- file_tools: 无显式初始化，但预加载 file_utils 依赖
@@ -185,20 +201,160 @@ function M.execute_async(tool_name, args, on_success, on_error, on_progress)
     pack_name = tp.get_pack_for_tool(tool_name)
   end
 
-  -- 包装 on_progress 回调：同时发射事件和调用用户回调
-  -- 注意：on_progress 可能在 libuv 回调（fast event 上下文）中被调用
-  -- 此时 nvim_exec_autocmds 会失败（E5560），需要用 vim.schedule 保护
+  -- ===== 工具审批检查 =====
+  -- 委托给 approval_handler
+  local check_ok, check_result = pcall(tool_validator.check_approval, tool_name, resolved_args, tool_registry)
+  local needs_user_approval = check_ok and check_result and check_result.behavior == "require_user"
+
+  if needs_user_approval then
+    local session_id = args and (args.session_id or args._session_id) or ""
+    approval_handler.enqueue({
+      tool_name = tool_name,
+      resolved_args = resolved_args,
+      raw_args = args,
+      on_success = on_success,
+      on_error = on_error,
+      on_progress = on_progress,
+      start_time = start_time,
+      pack_name = pack_name,
+      session_id = session_id,
+    })
+
+    fire_event(event_constants.TOOL_EXECUTION_STARTED, {
+      tool_name = tool_name,
+      pack_name = pack_name,
+      args = args,
+      start_time = start_time,
+      session_id = session_id,
+    })
+
+    if not approval_handler.is_showing() then
+      vim.schedule(function() approval_handler.process_queue() end)
+    end
+    return
+  end
+
+  -- ===== 发射 TOOL_EXECUTION_STARTED 事件 =====
+  -- 注意：如果需要用户审批，该事件已在审批检查分支中提前发射
+  -- 这里只在非审批路径发射
+  fire_event(event_constants.TOOL_EXECUTION_STARTED, {
+    tool_name = tool_name,
+    pack_name = pack_name,
+    args = args,
+    start_time = start_time,
+    session_id = args and (args.session_id or args._session_id),
+  })
+
+  -- 继续执行（提取为单独函数，供审批回调复用）
+  M._continue_execution(
+    tool_name, resolved_args, args,
+    on_success, on_error, on_progress,
+    start_time, pack_name
+  )
+end
+
+--- 继续执行工具（在审批通过后调用）
+--- 提取自 execute_async，供审批回调复用
+function M._continue_execution(tool_name, resolved_args, raw_args, on_success, on_error, on_progress, start_time, pack_name)
+  -- 检查会话是否仍然有效（防止审批通过后会话已超时或取消）
+  local session_id = raw_args and (raw_args.session_id or raw_args._session_id) or ""
+  if session_id and session_id ~= "" then
+    local orc_ok, tool_orc = pcall(require, "NeoAI.core.ai.tool_orchestrator")
+    if orc_ok then
+      -- 检查会话是否已被 unregister（会话不存在）
+      local session_state = tool_orc.get_session_state(session_id)
+      if session_state == nil then
+        if on_error then
+          on_error("工具执行已取消：会话已关闭")
+        end
+        return
+      end
+      -- 检查会话是否已请求停止
+      if tool_orc.is_stop_requested(session_id) then
+        if on_error then
+          on_error("工具执行已取消：会话已停止")
+        end
+        return
+      end
+    end
+  end
+
+  local tool = tool_registry.get(tool_name)
+  if not tool then
+    if on_error then
+      on_error("工具已不存在: " .. tool_name)
+    end
+    return
+  end
+
+  local function on_success_wrapper(result)
+    local duration = os.time() - start_time
+    local formatted = M.format_result(result)
+    local ok, err = pcall(fire_event, event_constants.TOOL_EXECUTION_COMPLETED, {
+      tool_name = tool_name,
+      pack_name = pack_name,
+      args = raw_args,
+      result = formatted,
+      duration = duration,
+      session_id = raw_args and (raw_args.session_id or raw_args._session_id),
+    })
+    if not ok then
+      vim.schedule(function()
+        pcall(fire_event, event_constants.TOOL_EXECUTION_COMPLETED, {
+          tool_name = tool_name,
+          pack_name = pack_name,
+          args = raw_args,
+          result = formatted,
+          duration = duration,
+          session_id = raw_args and (raw_args.session_id or raw_args._session_id),
+        })
+      end)
+    end
+    M._record_execution(tool_name, raw_args, formatted, nil, duration)
+    if on_success then
+      on_success(formatted)
+    end
+  end
+
+  local function on_error_wrapper(err_msg)
+    local duration = os.time() - start_time
+    local err_str = type(err_msg) == "table" and vim.inspect(err_msg) or tostring(err_msg or "未知错误")
+    local full_err = "工具执行错误: " .. err_str
+    local ok, err = pcall(fire_event, event_constants.TOOL_EXECUTION_ERROR, {
+      tool_name = tool_name,
+      pack_name = pack_name,
+      args = raw_args,
+      error_msg = full_err,
+      duration = duration,
+      session_id = raw_args and (raw_args.session_id or raw_args._session_id),
+    })
+    if not ok then
+      vim.schedule(function()
+        pcall(fire_event, event_constants.TOOL_EXECUTION_ERROR, {
+          tool_name = tool_name,
+          pack_name = pack_name,
+          args = raw_args,
+          error_msg = full_err,
+          duration = duration,
+          session_id = raw_args and (raw_args.session_id or raw_args._session_id),
+        })
+      end)
+    end
+    M._record_execution(tool_name, raw_args, nil, full_err, duration)
+    if on_error then
+      on_error(M.handle_error(full_err))
+    end
+  end
+
   local function progress_wrapper(substep_name, status, duration, detail)
-    -- 立即捕获当前值，避免 vim.schedule 闭包中引用被后续调用覆盖
     local _tool_name = tool_name
     local _pack_name = pack_name
     local _substep_name = substep_name
     local _status = status
     local _duration = duration or 0
     local _detail = detail
-    local _session_id = args and (args.session_id or args._session_id)
+    local _session_id = raw_args and (raw_args.session_id or raw_args._session_id)
 
-    -- 发射子步骤事件
     local ok, err = pcall(fire_event, event_constants.TOOL_EXECUTION_SUBSTEP, {
       tool_name = _tool_name,
       pack_name = _pack_name,
@@ -209,7 +365,6 @@ function M.execute_async(tool_name, args, on_success, on_error, on_progress)
       session_id = _session_id,
     })
     if not ok then
-      -- fast event 上下文中 nvim_exec_autocmds 会失败，用 vim.schedule 重试
       vim.schedule(function()
         pcall(fire_event, event_constants.TOOL_EXECUTION_SUBSTEP, {
           tool_name = _tool_name,
@@ -222,7 +377,6 @@ function M.execute_async(tool_name, args, on_success, on_error, on_progress)
         })
       end)
     end
-    -- 调用用户提供的 on_progress 回调
     if on_progress then
       local ok2, err2 = pcall(on_progress, _substep_name, _status, _duration, _detail)
       if not ok2 then
@@ -233,87 +387,13 @@ function M.execute_async(tool_name, args, on_success, on_error, on_progress)
     end
   end
 
-  fire_event(event_constants.TOOL_EXECUTION_STARTED, {
-    tool_name = tool_name,
-    pack_name = pack_name,
-    args = args,
-    start_time = start_time,
-    session_id = args and (args.session_id or args._session_id),
-  })
-
-  local function on_success_wrapper(result)
-    local duration = os.time() - start_time
-    local formatted = M.format_result(result)
-    -- fire_event 可能被 fast event 上下文调用，用 pcall 保护
-    local ok, err = pcall(fire_event, event_constants.TOOL_EXECUTION_COMPLETED, {
-      tool_name = tool_name,
-      pack_name = pack_name,
-      args = args,
-      result = formatted,
-      duration = duration,
-      session_id = args and (args.session_id or args._session_id),
-    })
-    if not ok then
-      -- fast event 上下文中 nvim_exec_autocmds 会失败，用 vim.schedule 重试
-      vim.schedule(function()
-        pcall(fire_event, event_constants.TOOL_EXECUTION_COMPLETED, {
-          tool_name = tool_name,
-          pack_name = pack_name,
-          args = args,
-          result = formatted,
-          duration = duration,
-          session_id = args and (args.session_id or args._session_id),
-        })
-      end)
-    end
-    M._record_execution(tool_name, args, formatted, nil, duration)
-    if on_success then
-      on_success(formatted)
-    end
-  end
-
-  local function on_error_wrapper(err_msg)
-    local duration = os.time() - start_time
-    -- err_msg 可能是 table（如 LSP 返回的错误对象），使用 tostring 安全转换
-    local err_str = type(err_msg) == "table" and vim.inspect(err_msg) or tostring(err_msg or "未知错误")
-    local full_err = "工具执行错误: " .. err_str
-    local ok, err = pcall(fire_event, event_constants.TOOL_EXECUTION_ERROR, {
-      tool_name = tool_name,
-      pack_name = pack_name,
-      args = args,
-      error_msg = full_err,
-      duration = duration,
-      session_id = args and (args.session_id or args._session_id),
-    })
-    if not ok then
-      vim.schedule(function()
-        pcall(fire_event, event_constants.TOOL_EXECUTION_ERROR, {
-          tool_name = tool_name,
-          pack_name = pack_name,
-          args = args,
-          error_msg = full_err,
-          duration = duration,
-          session_id = args and (args.session_id or args._session_id),
-        })
-      end)
-    end
-    M._record_execution(tool_name, args, nil, full_err, duration)
-    if on_error then
-      on_error(M.handle_error(full_err))
-    end
-  end
-
   if tool.async then
-    -- 异步工具：传入 on_progress 回调
     local ok, call_err = pcall(tool.func, resolved_args, on_success_wrapper, on_error_wrapper, progress_wrapper)
     if not ok then
       on_error_wrapper(tostring(call_err))
     end
   else
-    -- 同步工具：通过 vim.schedule 执行，避免阻塞主线程导致停止快捷键无效
-    -- 同时检查 stop_requested 状态，支持提前取消
     vim.schedule(function()
-      -- 使用 pcall 延迟加载，避免循环依赖（tool_orchestrator 引用了 tool_executor）
       local orc_ok, tool_orc = pcall(require, "NeoAI.core.ai.tool_orchestrator")
       if orc_ok and tool_orc.is_stop_requested() then
         on_error_wrapper("工具执行已取消")
@@ -335,7 +415,12 @@ end
 
 function M.execute(tool_name, args)
   local result, error_msg, done = nil, nil, false
-  local timeout_ms = (state.config and state.config.tool_timeout_ms) or 60000
+  local timeout_ms = timeout_state.timeout_ms
+  local elapsed_ms = 0
+  local poll_interval_ms = 50
+  local paused_during_wait = 0  -- 等待期间累计的暂停时长
+  local was_paused = false
+  local pause_check_start = nil
 
   M.execute_async(tool_name, args, function(res)
     result = res
@@ -348,9 +433,53 @@ function M.execute(tool_name, args)
   -- 使用 vim.wait 但超时时间可配置，且仅在主线程安全时调用
   -- 注意：如果在 vim.schedule 回调中调用此函数，vim.wait 会阻塞事件循环
   -- 建议优先使用 execute_async 进行非阻塞调用
-  vim.wait(timeout_ms, function()
-    return done
-  end, 10)
+  -- 增强版：感知审批暂停，暂停期间不计入超时
+  vim.wait(timeout_ms + 60000, function()  -- 多给 60 秒缓冲，实际超时由内部逻辑控制
+    if done then
+      return true
+    end
+
+    -- 检查审批暂停状态
+    local approval_handler = require("NeoAI.tools.approval_handler")
+    if approval_handler.is_paused() then
+      if not was_paused then
+        -- 刚进入暂停状态，记录开始时间
+        was_paused = true
+        pause_check_start = vim.loop.hrtime()
+      end
+      -- 暂停期间不累加 elapsed_ms
+      return false
+    else
+      if was_paused then
+        -- 刚从暂停恢复，累加暂停时长
+        if pause_check_start then
+          local pause_ns = vim.loop.hrtime() - pause_check_start
+          paused_during_wait = paused_during_wait + pause_ns
+        end
+        was_paused = false
+        pause_check_start = nil
+      end
+    end
+
+    -- 计算实际经过时间（扣除暂停时间）
+    local now = vim.loop.hrtime()
+    if not M._execute_start_time then
+      M._execute_start_time = now
+    end
+    local actual_elapsed_ns = now - M._execute_start_time - paused_during_wait
+    elapsed_ms = actual_elapsed_ns / 1000000
+
+    if elapsed_ms >= timeout_ms then
+      -- 超时，设置错误信息
+      error_msg = string.format("工具执行超时（%d 秒）", timeout_ms / 1000)
+      return true
+    end
+
+    return false
+  end, poll_interval_ms)
+
+  -- 清理起始时间
+  M._execute_start_time = nil
 
   if error_msg then
     return setmetatable({ _error = true, message = error_msg }, {
@@ -416,6 +545,19 @@ function M._table_to_string(tbl)
   end
   table.insert(parts, "}")
   return table.concat(parts, "\n")
+end
+
+-- ========== 审批队列处理 ==========
+
+--- 处理审批队列
+-- 审批队列处理已迁移到 approval_handler.lua
+-- 保留空函数引用以保持向后兼容
+function M._process_approval_queue()
+  approval_handler.process_queue()
+end
+
+function M._show_approval_dialog(item)
+  -- 已迁移到 approval_handler.lua
 end
 
 -- ========== 错误处理 ==========
@@ -490,6 +632,13 @@ function M.clear_history()
   state.execution_history = {}
 end
 
+-- ========== 审批队列管理 ==========
+
+--- 清空审批队列（委托给 approval_handler）
+function M.clear_approval_queue()
+  approval_handler.clear_queue()
+end
+
 -- ========== 配置 ==========
 
 function M.update_config(new_config)
@@ -498,6 +647,285 @@ function M.update_config(new_config)
   end
   state.config = vim.tbl_extend("force", state.config, new_config or {})
   state.max_history_size = state.config.max_history_size or state.max_history_size
+end
+
+--- 设置工具超时
+--- @param tool_call_id string 工具调用 ID
+--- @param timeout_ms number 超时毫秒数
+--- @param on_timeout function 超时回调
+function M._set_timeout(tool_call_id, timeout_ms, on_timeout)
+  if timeout_ms <= 0 then
+    return
+  end
+  -- 清除旧定时器
+  M._clear_timeout(tool_call_id)
+  timeout_state.start_times[tool_call_id] = vim.loop.hrtime()
+  timeout_state.timers[tool_call_id] = vim.defer_fn(function()
+    timeout_state.timers[tool_call_id] = nil
+    timeout_state.start_times[tool_call_id] = nil
+    if on_timeout then
+      pcall(on_timeout)
+    end
+  end, timeout_ms)
+end
+
+--- 清除工具超时
+--- @param tool_call_id string 工具调用 ID
+function M._clear_timeout(tool_call_id)
+  if timeout_state.timers[tool_call_id] then
+    local timer = timeout_state.timers[tool_call_id]
+    -- vim.defer_fn 返回的是 uv_timer_t 对象
+    -- 在 Neovim 0.10+ 中推荐使用 vim.uv 方法
+    pcall(function()
+      if timer:is_active() then timer:stop() end
+      if not timer:is_closing() then timer:close() end
+    end)
+    timeout_state.timers[tool_call_id] = nil
+  end
+  timeout_state.start_times[tool_call_id] = nil
+end
+
+--- 重置工具超时（清除旧超时，设置新超时）
+--- 供 run_command 在运行时根据 timeout 参数动态更新超时
+--- @param tool_call_id string 工具调用 ID
+--- @param timeout_ms number 新的超时毫秒数
+--- @param on_timeout function 超时回调
+function M._reset_timeout(tool_call_id, timeout_ms, on_timeout)
+  if timeout_ms <= 0 then
+    return
+  end
+  -- 清除旧定时器（保留 start_time）
+  if timeout_state.timers[tool_call_id] then
+    local timer = timeout_state.timers[tool_call_id]
+    pcall(function()
+      if timer:is_active() then timer:stop() end
+      if not timer:is_closing() then timer:close() end
+    end)
+    timeout_state.timers[tool_call_id] = nil
+  end
+  -- 设置新定时器
+  timeout_state.timers[tool_call_id] = vim.defer_fn(function()
+    timeout_state.timers[tool_call_id] = nil
+    timeout_state.start_times[tool_call_id] = nil
+    if on_timeout then
+      pcall(on_timeout)
+    end
+  end, timeout_ms)
+end
+
+--- 获取工具已执行时长（毫秒，扣除审批暂停时间）
+--- @param tool_call_id string 工具调用 ID
+--- @return number 已执行毫秒数
+function M._get_elapsed_ms(tool_call_id)
+  local start = timeout_state.start_times[tool_call_id]
+  if not start then
+    return 0
+  end
+  local now = vim.loop.hrtime()
+  local elapsed_ns = now - start
+  -- 扣除审批暂停时间
+  local approval_handler = require("NeoAI.tools.approval_handler")
+  local paused_sec = approval_handler.get_total_paused_duration()
+  local paused_ns = paused_sec * 1000000000
+  elapsed_ns = math.max(0, elapsed_ns - paused_ns)
+  return elapsed_ns / 1000000
+end
+
+-- ========== 参数规范化（从 tool_orchestrator 迁移） ==========
+
+local http_utils = require("NeoAI.core.ai.http_utils")
+
+--- 解析并规范化工具参数
+--- 包含 URL 解码、JSON 解析、别名映射、简化参数格式转换
+--- @param tool_name string 工具名称
+--- @param raw_arguments string|table 原始参数
+--- @return table, boolean 规范化后的参数，是否发生变更
+function M._normalize_arguments(tool_name, raw_arguments)
+  if not raw_arguments then
+    return {}, false
+  end
+
+  local arguments = {}
+  local changed = false
+
+  -- 如果是字符串，先尝试 JSON 解析
+  if type(raw_arguments) == "string" then
+    local decoded_args_str = raw_arguments
+    if decoded_args_str:find("%%") then
+      decoded_args_str = http_utils.decode_special_chars(decoded_args_str)
+    end
+    local ok, parsed = pcall(vim.json.decode, decoded_args_str)
+    if ok and type(parsed) == "table" then
+      arguments = parsed
+    else
+      logger.warn("[tool_executor] _normalize_arguments: 工具 '%s' 的 arguments JSON 解析失败: %s", tool_name, tostring(raw_arguments))
+      return { _raw = raw_arguments }, false
+    end
+  elseif type(raw_arguments) == "table" then
+    arguments = vim.deepcopy(raw_arguments)
+  else
+    return { _raw = tostring(raw_arguments) }, false
+  end
+
+  -- 解码参数值中的 %%XX URL 编码
+  for k, v in pairs(arguments) do
+    if type(v) == "string" then
+      arguments[k] = http_utils.decode_special_chars(v)
+    end
+  end
+
+  -- 通用参数规范化
+  local tool_registry = require("NeoAI.tools.tool_registry")
+  pcall(tool_registry.initialize, {})
+  local tool_def = tool_registry.get(tool_name)
+  if tool_def and tool_def.parameters and tool_def.parameters.properties then
+    local props = tool_def.parameters.properties
+
+    -- 1) 参数别名映射
+    for standard_name, _ in pairs(props) do
+      for arg_name, arg_value in pairs(arguments) do
+        if arg_name ~= standard_name and arg_value ~= nil then
+          if not props[arg_name] then
+            local alias_map = {
+              cmd = "command",
+              dir = "dirs",
+              file = "files",
+              fp = "filepath",
+              path = "filepath",
+              dir_path = "dirs",
+            }
+            if alias_map[arg_name] == standard_name then
+              arguments[standard_name] = arg_value
+              arguments[arg_name] = nil
+              changed = true
+              break
+            end
+          end
+        end
+      end
+    end
+
+    -- 2) 简化参数格式转换
+    local simple_to_standard = {
+      filepath = "files",
+      dir = "dirs",
+      dir_path = "dirs",
+    }
+    for simple_arg, standard_array in pairs(simple_to_standard) do
+      if arguments[simple_arg] ~= nil and not props[simple_arg] and props[standard_array] then
+        local item = {}
+        if standard_array == "files" then
+          item.filepath = arguments[simple_arg]
+          if arguments.start ~= nil then item.start = arguments.start; arguments.start = nil end
+          if arguments.end_line ~= nil then item["end"] = arguments.end_line; arguments.end_line = nil end
+          if arguments.content ~= nil then item.content = arguments.content; arguments.content = nil end
+          if arguments.append ~= nil then item.append = arguments.append; arguments.append = nil end
+          if arguments.parents ~= nil then item.parents = arguments.parents; arguments.parents = nil end
+          if arguments.pattern ~= nil then item.pattern = arguments.pattern; arguments.pattern = nil end
+          if arguments.recursive ~= nil then item.recursive = arguments.recursive; arguments.recursive = nil end
+        elseif standard_array == "dirs" then
+          item.dir = arguments[simple_arg]
+          if arguments.pattern ~= nil then item.pattern = arguments.pattern; arguments.pattern = nil end
+          if arguments.recursive ~= nil then item.recursive = arguments.recursive; arguments.recursive = nil end
+        end
+        arguments[standard_array] = { item }
+        arguments[simple_arg] = nil
+        changed = true
+        break
+      end
+    end
+  end
+
+  return arguments, changed
+end
+
+-- ========== 带编排的工具执行 ==========
+
+--- 供 tool_orchestrator 调用的工具执行接口
+--- 集中处理参数规范化、超时管理、事件发射
+--- @param tool_name string 工具名称
+--- @param raw_args string|table 原始参数（来自 AI 响应）
+--- @param session_context table 会话上下文 { session_id, window_id, generation_id, tool_call_id, pack_name }
+--- @param callbacks table 回调 { on_result(success, result), on_progress(substep_name, status, duration, detail) }
+function M.execute_with_orchestrator(tool_name, raw_args, session_context, callbacks)
+  callbacks = callbacks or {}
+  session_context = session_context or {}
+
+  -- 参数规范化
+  local arguments, args_changed = M._normalize_arguments(tool_name, raw_args)
+
+  -- 注入会话上下文
+  if session_context.session_id then
+    arguments._session_id = session_context.session_id
+  end
+  if session_context.tool_call_id then
+    arguments._tool_call_id = session_context.tool_call_id
+  end
+
+  -- 发射 TOOL_EXECUTION_STARTED 事件
+  fire_event(event_constants.TOOL_EXECUTION_STARTED, {
+    tool_name = tool_name,
+    arguments = arguments,
+    pack_name = session_context.pack_name,
+    session_id = session_context.session_id,
+    window_id = session_context.window_id,
+    generation_id = session_context.generation_id,
+  })
+
+  -- 从工具注册信息读取超时配置
+  -- timeout 字段：nil 使用全局默认（30 秒），-1 表示无限等待（如 run_command）
+  local tool_call_id = session_context.tool_call_id or ("call_" .. os.time() .. "_" .. math.random(10000, 99999))
+  local original_on_result = callbacks.on_result
+  local wrapped_on_success, wrapped_on_error
+
+  local tool_def = tool_registry.get(tool_name)
+  local tool_timeout = tool_def and tool_def.timeout
+  local timeout_ms
+  if tool_timeout == -1 then
+    timeout_ms = -1  -- 无限等待，不设超时
+  elseif tool_timeout ~= nil then
+    timeout_ms = tool_timeout  -- 工具自定义超时
+  else
+    timeout_ms = timeout_state.timeout_ms  -- 全局默认超时
+  end
+
+  if timeout_ms and timeout_ms > 0 then
+    M._set_timeout(tool_call_id, timeout_ms, function()
+      logger.warn("[tool_executor] 工具 '%s' 执行超时 (%dms)", tool_name, timeout_ms)
+      if callbacks.on_result then
+        callbacks.on_result(false, string.format("工具执行超时（%d 秒）", timeout_ms / 1000))
+      end
+    end)
+
+    -- 包装 on_success/on_error 以清除超时
+    wrapped_on_success = function(result)
+      M._clear_timeout(tool_call_id)
+      if original_on_result then
+        original_on_result(true, result)
+      end
+    end
+    wrapped_on_error = function(err)
+      M._clear_timeout(tool_call_id)
+      if original_on_result then
+        original_on_result(false, err)
+      end
+    end
+  else
+    -- 不设超时（timeout_ms 为 nil 或 -1）
+    wrapped_on_success = function(result)
+      if original_on_result then
+        original_on_result(true, result)
+      end
+    end
+    wrapped_on_error = function(err)
+      if original_on_result then
+        original_on_result(false, err)
+      end
+    end
+  end
+
+  -- 调用 execute_async
+  M.execute_async(tool_name, arguments, wrapped_on_success, wrapped_on_error, callbacks.on_progress)
 end
 
 -- ========== 示例生成 ==========

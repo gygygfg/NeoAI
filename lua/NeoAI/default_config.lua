@@ -98,11 +98,10 @@ local DEFAULT_CONFIG = {
       naming = {
         {
           provider = "deepseek",
-          model_name = "deepseek-chat",
+          model_name = "deepseek-v4-flash",
           temperature = 0.3,
           max_tokens = 50,
           stream = false,
-          timeout = 15000,
         },
       },
       -- 聊天用：平衡速度与质量
@@ -113,7 +112,6 @@ local DEFAULT_CONFIG = {
           temperature = 0.7,
           max_tokens = 4096,
           stream = true,
-          timeout = 60000,
         },
       },
       -- 思考问题用：深度推理
@@ -124,7 +122,6 @@ local DEFAULT_CONFIG = {
           temperature = 0.7,
           max_tokens = 8192,
           stream = true,
-          timeout = 120000,
         },
       },
       -- 编写代码用：高质量代码生成
@@ -135,7 +132,6 @@ local DEFAULT_CONFIG = {
           temperature = 0.2,
           max_tokens = 8192,
           stream = true,
-          timeout = 120000,
         },
       },
       -- 执行工具用：快速响应
@@ -146,7 +142,6 @@ local DEFAULT_CONFIG = {
           temperature = 0.3,
           max_tokens = 1024,
           stream = true,
-          timeout = 30000,
         },
       },
       -- 子agent用
@@ -157,14 +152,12 @@ local DEFAULT_CONFIG = {
           temperature = 0.7,
           max_tokens = 4096,
           stream = true,
-          timeout = 60000,
         },
       },
     },
 
     -- 全局默认值（当预设中未指定时使用）
     stream = true,
-    timeout = 60000,
     -- 是否启用深度思考模式（如 DeepSeek 的 reasoning_content）
     -- 开启后 AI 会在回答前展示推理过程，适用于复杂问题
     reasoning_enabled = true,
@@ -235,6 +228,13 @@ local DEFAULT_CONFIG = {
       switch_model = { key = "m", desc = "切换模型" },
       newline = { key = "<CR>", desc = "新建行" },
       clear = { key = "<C-u>", desc = "清空输入" },
+      tool_approval = { key = "<C-a>", desc = "工具审批" },
+      approval = {
+        confirm = { key = "<CR>", desc = "允许一次" },
+        confirm_all = { key = "A", desc = "允许所有" },
+        cancel = { key = "<Esc>", desc = "取消" },
+        cancel_with_reason = { key = "C", desc = "取消并说明" },
+      },
     },
   },
   -- 会话配置
@@ -253,11 +253,11 @@ local DEFAULT_CONFIG = {
   -- 日志配置
   log = {
     -- 日志级别: 'DEBUG', 'INFO', 'WARN', 'ERROR', 'FATAL'
-    level = "WARN",
-    -- level = "DEBUG",
+    -- level = "WARN",
+    level = "DEBUG",
     -- 输出文件路径（可选，默认输出到文件，避免 print 阻塞消息区域）
-    output_path = nill,
-    -- output_path = "/root/NeoAI/pack/plugins/start/NeoAI/lua/NeoAI/neoai.log",
+    -- output_path = nill,
+    output_path = "/root/NeoAI/pack/plugins/start/NeoAI/lua/NeoAI/neoai.log",
     -- 日志格式模板
     format = "[{time}] [{level}] {message}",
     -- 最大文件大小（字节），默认 10MB
