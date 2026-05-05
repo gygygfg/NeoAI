@@ -8,9 +8,9 @@
 --   │  参数:                                         │
 --   │    command: "ls -la"                            │
 --   │────────────────────────────────────────────────│
---   │ <CR> 允许一次                                   │
+--   │ ⏎ 允许一次                                     │
 --   │ A 允许所有                                      │
---   │ <Esc> 取消                                      │
+--   │ ⎋ 取消                                          │
 --   │ C 取消并说明                                    │
 --   ╰────────────────────────────────────────────────╯
 
@@ -33,13 +33,19 @@ local state = {
 
 -- 窗口尺寸
 local WIDTH = 66
-local MAX_HEIGHT = 24
-local MIN_HEIGHT = 12
 
--- 布局常量
-local HEADER_HEIGHT = 2     -- 标题行 + 空行
+-- 布局常量（均不含边框，边框由 nvim_open_win 的 border 选项额外占用 2 行）
+local HEADER_HEIGHT = 1     -- 标题行
 local SEPARATOR_HEIGHT = 1  -- 分隔线
-local FOOTER_HEIGHT = 5     -- 4个操作各占一行 + 1个空行
+local FOOTER_HEIGHT = 4     -- 4个操作各占一行
+
+-- 默认审批快捷键配置（当 ui_init.get_full_config() 返回空时的后备）
+local DEFAULT_APPROVAL_KEYMAPS = {
+  confirm = { key = "<CR>", desc = "允许一次" },
+  confirm_all = { key = "A", desc = "允许所有" },
+  cancel = { key = "<Esc>", desc = "取消" },
+  cancel_with_reason = { key = "C", desc = "取消并说明" },
+}
 
 --- 初始化
 function M.initialize()
@@ -83,9 +89,9 @@ function M.open(tools, opts)
   vim.api.nvim_set_option_value("modified", false, { buf = state.buf })
   vim.api.nvim_set_option_value("modifiable", true, { buf = state.buf })
 
-  -- 计算窗口尺寸
-  local content_height = M._calculate_content_height()
-  local total_height = math.max(MIN_HEIGHT, math.min(content_height, MAX_HEIGHT))
+  -- 计算窗口尺寸（nvim_open_win 的 height 不包含边框）
+  state.total_height = M._calculate_content_height()
+  local total_height = state.total_height
 
   local screen_width = vim.o.columns
   local screen_height = vim.o.lines
@@ -108,8 +114,19 @@ function M.open(tools, opts)
     title_pos = "center",
   })
 
+  -- 禁止滚动：内容刚好填满窗口，无多余行可滚动
   vim.api.nvim_set_option_value("cursorline", false, { win = state.win })
-  vim.api.nvim_set_option_value("wrap", true, { win = state.win })
+  vim.api.nvim_set_option_value("wrap", false, { win = state.win })
+  vim.api.nvim_set_option_value("number", false, { win = state.win })
+  vim.api.nvim_set_option_value("relativenumber", false, { win = state.win })
+  vim.api.nvim_set_option_value("signcolumn", "no", { win = state.win })
+  vim.api.nvim_set_option_value("foldcolumn", "0", { win = state.win })
+  vim.api.nvim_set_option_value("scrolloff", 0, { win = state.win })
+  vim.api.nvim_set_option_value("sidescrolloff", 0, { win = state.win })
+  vim.api.nvim_set_option_value("statuscolumn", "", { win = state.win })
+  -- 确保 buffer 内容刚好填满窗口，无多余空行
+  vim.api.nvim_set_option_value("endofline", false, { buf = state.buf })
+  vim.api.nvim_set_option_value("fixeol", false, { buf = state.buf })
 
   M._render()
   M._setup_keymaps()
@@ -153,29 +170,46 @@ function M.close()
   state.on_cancel = nil
 end
 
---- 计算内容高度
+--- 计算窗口高度（nvim_open_win 的 height 参数，不包含边框）
+--- 必须精确匹配 _render 实际写入的行数
 function M._calculate_content_height()
   local tool = state.tools[1]
   if not tool then
-    return HEADER_HEIGHT + SEPARATOR_HEIGHT + FOOTER_HEIGHT
+    return HEADER_HEIGHT + SEPARATOR_HEIGHT + FOOTER_HEIGHT + 2
   end
 
-  local info_lines = 2
+  -- 逐行计数，与 _render 中的 table.insert 顺序保持一致
+  local content_lines = 0
+
+  -- 工具名
+  content_lines = content_lines + 1
+  -- 描述（如果有）
+  if tool.description and tool.description ~= "" then
+    content_lines = content_lines + 1
+  end
+  -- 参数（如果有）
   if tool.args and type(tool.args) == "table" then
-    info_lines = info_lines + 1
+    content_lines = content_lines + 1  -- "参数:" 标题
     for k, v in pairs(tool.args) do
       if k ~= "_session_id" and k ~= "_tool_call_id" then
         local v_str = type(v) == "string" and v or vim.inspect(v)
-        info_lines = info_lines + 1 + math.floor(#v_str / (WIDTH - 6))
+        for _ in v_str:gmatch("[^\n]+") do
+          content_lines = content_lines + 1
+        end
       end
     end
   end
-
+  -- 队列提示（如果有）
   if #state.tools > 1 then
-    info_lines = info_lines + 1
+    content_lines = content_lines + 1
   end
+  -- 分隔线
+  content_lines = content_lines + 1
+  -- 4 个操作提示
+  content_lines = content_lines + 4
 
-  return HEADER_HEIGHT + info_lines + SEPARATOR_HEIGHT + FOOTER_HEIGHT
+  -- 直接返回内容行数（nvim_open_win 的 height 不包含边框）
+  return content_lines
 end
 
 --- 渲染内容
@@ -185,6 +219,7 @@ function M._render()
   end
 
   local lines = {}
+  local total_height = state.total_height or 10
   local win_width = WIDTH
   if state.win and vim.api.nvim_win_is_valid(state.win) then
     win_width = vim.api.nvim_win_get_width(state.win)
@@ -219,16 +254,23 @@ function M._render()
   -- 分隔线
   table.insert(lines, string.rep("─", win_width))
 
-  -- 底部操作提示（从 ui.init 获取 keymaps 配置）
+  -- 底部操作提示（从 ui.init 获取 keymaps 配置，无配置时使用默认值）
   local full_config = ui_init.get_full_config() or {}
-  local approval_config = ((full_config.keymaps or {}).chat or {}).approval or {}
+  local approval_config = ((full_config.keymaps or {}).chat or {}).approval or DEFAULT_APPROVAL_KEYMAPS
   local action_order = { "confirm", "confirm_all", "cancel", "cancel_with_reason" }
   for _, action in ipairs(action_order) do
     local cfg = approval_config[action]
     if cfg and cfg.key and cfg.key ~= "" then
       local label = cfg.desc or action
-      table.insert(lines, string.format(" %s %s", cfg.key, label))
+      local display_key = M._format_key(cfg.key)
+      table.insert(lines, string.format(" %s %s", display_key, label))
     end
+  end
+
+  -- 用空行填充至窗口大小，确保无多余行可滚动
+  local content_lines = total_height
+  while #lines < content_lines do
+    table.insert(lines, "")
   end
 
   vim.api.nvim_buf_set_lines(state.buf, 0, -1, false, lines)
@@ -267,6 +309,33 @@ function M._apply_highlights()
   end
 end
 
+--- 将 Neovim 按键表示转换为用户可读的显示符号
+--- @param key string Neovim 按键表示，如 "<CR>", "<Esc>", "A"
+--- @return string 用户可读的按键符号
+function M._format_key(key)
+  local key_map = {
+    ["<CR>"] = "⏎",
+    ["<Esc>"] = "⎋",
+    ["<Tab>"] = "⇥",
+    ["<S-Tab>"] = "⇤",
+    ["<BS>"] = "⌫",
+    ["<Space>"] = "␣",
+    ["<Up>"] = "↑",
+    ["<Down>"] = "↓",
+    ["<Left>"] = "←",
+    ["<Right>"] = "→",
+    ["<C-a>"] = "⌃A",
+    ["<C-c>"] = "⌃C",
+    ["<C-d>"] = "⌃D",
+    ["<C-u>"] = "⌃U",
+    ["<C-v>"] = "⌃V",
+    ["<C-x>"] = "⌃X",
+    ["<C-y>"] = "⌃Y",
+    ["<C-z>"] = "⌃Z",
+  }
+  return key_map[key] or key
+end
+
 --- 确认选择（允许一次）
 function M._confirm()
   if state._closing then
@@ -278,17 +347,17 @@ function M._confirm()
   local selected = state.tools[1]
   if selected and select_callback then
     local ok, err = pcall(select_callback, selected)
-    M.close()
     if not ok then
       vim.schedule(function()
         vim.notify("[NeoAI] 工具审批回调执行失败: " .. tostring(err), vim.log.levels.ERROR)
       end)
     end
-  else
     M.close()
+  else
     if cancel_callback then
       pcall(cancel_callback)
     end
+    M.close()
   end
 end
 
@@ -303,17 +372,17 @@ function M._confirm_all()
   local selected = state.tools[1]
   if selected and select_callback then
     local ok, err = pcall(select_callback, selected, { allow_all = true })
-    M.close()
     if not ok then
       vim.schedule(function()
-        vim.notify("[NeoAI] 工具审批回调执行失败: " .. tostring(err), vim.log.levels.ERROR)
+        vim.notify("[NeoAI] 工具审批取消回调执行失败: " .. tostring(err), vim.log.levels.ERROR)
       end)
     end
-  else
     M.close()
+  else
     if cancel_callback then
       pcall(cancel_callback)
     end
+    M.close()
   end
 end
 
@@ -322,12 +391,12 @@ function M._cancel_with_reason()
   if state._closing then
     return
   end
-  vim.ui.input({ prompt = "取消原因: " }, function(reason)
+  vim.ui.input({ prompt = "取消说明: " }, function(reason)
     if not reason or reason == "" then
-      reason = "用户未提供原因"
+      reason = "用户未提供说明"
     end
     local callback = state.on_cancel
-    M.close()
+    -- 先调用回调，再关闭窗口，避免 WinClosed autocmd 抢先执行
     if callback then
       local ok, err = pcall(callback, { reason = reason })
       if not ok then
@@ -336,6 +405,7 @@ function M._cancel_with_reason()
         end)
       end
     end
+    M.close()
   end)
 end
 
@@ -345,15 +415,16 @@ function M._cancel()
     return
   end
   local callback = state.on_cancel
-  M.close()
+  -- 先调用回调，再关闭窗口，避免 WinClosed autocmd 抢先执行
   if callback then
-    local ok, err = pcall(callback)
+    local ok, err = pcall(callback, { reason = "用户取消" })
     if not ok then
       vim.schedule(function()
         vim.notify("[NeoAI] 工具审批取消回调执行失败: " .. tostring(err), vim.log.levels.ERROR)
       end)
     end
   end
+  M.close()
 end
 
 --- 设置按键映射
@@ -363,9 +434,9 @@ function M._setup_keymaps()
   end
   local buf = state.buf
 
-  -- 从 ui.init 获取 keymaps 配置
+  -- 从 ui.init 获取 keymaps 配置（无配置时使用默认值）
   local full_config = ui_init.get_full_config() or {}
-  local approval_config = ((full_config.keymaps or {}).chat or {}).approval or {}
+  local approval_config = ((full_config.keymaps or {}).chat or {}).approval or DEFAULT_APPROVAL_KEYMAPS
 
   -- 动作映射表
   local actions = {

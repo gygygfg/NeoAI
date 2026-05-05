@@ -180,19 +180,10 @@ function M.generate_response(messages, params)
     ai_preset = ai_preset,
     options = options,
     messages = messages,
+    accumulated_usage = {},
+    stop_requested = false,
+    user_cancelled = false,
   })
-  -- 写入 shared 表
-  local shared = ctx:shared()
-  shared.session_id = session_id
-  shared.generation_id = generation_id
-  shared.window_id = window_id
-  shared.model_index = model_index
-  shared.ai_preset = ai_preset
-  shared.options = options
-  shared.messages = messages
-  shared.accumulated_usage = {}
-  shared.stop_requested = false
-  shared.user_cancelled = false
 
   local formatted = request_builder.format_messages(messages)
   if ai_preset.system_prompt and ai_preset.system_prompt ~= "" then

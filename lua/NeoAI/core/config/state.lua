@@ -234,25 +234,14 @@ end
 --- 上下文自动绑定到当前协程，协程结束时无需手动清理
 --- 每个协程自动拥有一个 _shared 共享表，协程内所有模块可直接读写
 ---
---- @param context_data table 初始上下文数据，如 { session_id = "...", tools = {...} }
+--- @param shared_data table|nil 初始共享数据，直接写入 _shared 表
 --- @return table context 上下文对象
-function M.create_context(context_data)
+function M.create_context(shared_data)
   local context = {
-    _data = context_data or {},
     _children = {},
     _parent = nil,
-    _shared = {}, -- 协程内全局共享表，所有模块可直接读写
+    _shared = shared_data or {}, -- 协程内全局共享表，初始数据直接写入
   }
-
-  --- 获取上下文值
-  function context:get(key, default)
-    return self._data[key] ~= nil and self._data[key] or default
-  end
-
-  --- 设置上下文值
-  function context:set(key, value)
-    self._data[key] = value
-  end
 
   --- 获取协程内全局共享表
   --- 协程内所有模块可直接通过此表读写共享状态，无需注册切片
@@ -261,11 +250,10 @@ function M.create_context(context_data)
     return self._shared
   end
 
-  --- 创建子上下文（继承父上下文的值，子上下文修改不影响父上下文）
-  --- 注意：子上下文共享同一个 _shared 表（父协程内的所有模块看到同一份共享数据）
-  function context:child(extra_data)
-    local child_data = vim.tbl_extend("keep", extra_data or {}, self._data)
-    local child_ctx = M.create_context(child_data)
+  --- 创建子上下文（共享同一个 _shared 表）
+  --- 父协程内的所有模块看到同一份共享数据
+  function context:child()
+    local child_ctx = M.create_context()
     child_ctx._parent = self
     -- 子上下文共享父上下文的 _shared 表
     child_ctx._shared = self._shared

@@ -228,11 +228,6 @@ local function close_tool_display()
   end
 end
 
--- 光标是否应该跟随的缓存值
--- 在 buffer 内容变化之前由 _check_cursor_near_end 设置，_do_cursor_follow 读取
--- 避免在内容变化后 foldmethod=marker 改变了光标位置导致误判
-local _should_follow_cached = true
-
 --- 格式化 table 为多行字符串，强制每个元素换行显示
 --- 避免 vim.inspect 将短数组合并为一行
 --- @param t table
@@ -340,31 +335,32 @@ local function _truncate_content_for_fold(content, max_lines)
 end
 
 --- 在 buffer 内容变化之前检测光标是否在末尾附近（后5行内）
---- 调用方必须在修改 buffer 内容之前调用此函数，将结果缓存到 _should_follow_cached
+--- 调用方必须在修改 buffer 内容之前调用此函数，将结果缓存到协程共享表
 --- 这样即使内容变化后 foldmethod=marker 改变了光标位置，也能正确判断是否应该跟随
 local function _check_cursor_near_end()
   if not state.current_window_id then
-    _should_follow_cached = false
+    state_manager.set_shared("should_follow", false)
     return false
   end
   local win = window_manager.get_window_win(state.current_window_id)
   if not win or not vim.api.nvim_win_is_valid(win) then
-    _should_follow_cached = false
+    state_manager.set_shared("should_follow", false)
     return false
   end
   local cursor = vim.api.nvim_win_get_cursor(win)
   local buf = vim.api.nvim_win_get_buf(win)
   local total = vim.api.nvim_buf_line_count(buf)
-  _should_follow_cached = total - cursor[1] <= 5
-  return _should_follow_cached
+  local near_end = total - cursor[1] <= 5
+  state_manager.set_shared("should_follow", near_end)
+  return near_end
 end
 
 --- 执行光标跟随：将光标跳转到缓冲区末尾并滚动到窗口最底部
 --- 先追加一个空行到末尾（空行不在任何 {{{...}}} 折叠区域内），再将光标设置到空行上
 --- 插入空行前临时提高 foldlevel，防止 foldmethod=marker 将光标吸到折叠开始行
---- 使用 _should_follow_cached 判断是否应该跟随（在 buffer 内容变化前已缓存）
+--- 使用协程共享表 should_follow 判断是否应该跟随（在 buffer 内容变化前已缓存）
 local function _do_cursor_follow()
-  if not _should_follow_cached then
+  if not state_manager.get_shared_value("should_follow", true) then
     return
   end
   if not state.current_window_id then
@@ -409,12 +405,12 @@ end
 --- @param delay_ms number|nil 延迟毫秒数，默认 0（使用 vim.schedule 下一个 tick 执行）
 --- 内容写入后立即调用（delay_ms=0），工具调用悬浮窗打开后传 150ms
 --- 注意：调用方必须在修改 buffer 内容之前调用 _check_cursor_near_end() 缓存光标状态
---- 此函数不再重新检测光标位置，直接使用 _should_follow_cached 缓存值
+--- 此函数不再重新检测光标位置，直接使用协程共享表 should_follow 缓存值
 local function _schedule_cursor_follow(delay_ms)
   if not state.current_window_id then
     return
   end
-  if not _should_follow_cached then
+  if not state_manager.get_shared_value("should_follow", true) then
     -- 光标不在后5行内（已在 buffer 内容变化前检测并缓存），不跟随
     return
   end
@@ -445,7 +441,7 @@ local function _schedule_cursor_follow(delay_ms)
     )
   else
     -- 立即模式：直接执行，不再通过 vim.schedule 延迟
-    -- 因为 _should_follow_cached 已在 buffer 内容变化前缓存，无需等待下一个 tick
+    -- 因为 should_follow 已在 buffer 内容变化前缓存，无需等待下一个 tick
     _do_cursor_follow()
   end
 end
@@ -950,8 +946,8 @@ function M._apply_rendered_content(content)
     local buf = vim.api.nvim_win_get_buf(win_handle)
     local total_lines = vim.api.nvim_buf_line_count(buf)
     near_end = total_lines - cursor[1] <= 5
-    -- 更新模块局部缓存
-    _should_follow_cached = near_end
+    -- 更新协程共享缓存
+    state_manager.set_shared("should_follow", near_end)
   end
 
   -- 设置窗口内容
@@ -1232,7 +1228,7 @@ function M._open_float_input()
   -- 打开浮动虚拟输入框
   virtual_input.open(win_handle, {
     placeholder = "输入消息...",
-    auto_focus = _should_follow_cached,
+    auto_focus = state_manager.get_shared_value("should_follow", true),
     on_submit = function(content)
       if content and content ~= "" then
         local chat_handlers_loaded, chat_handlers = pcall(require, "NeoAI.ui.handlers.chat_handlers")
@@ -2138,9 +2134,9 @@ function M._setup_event_listeners()
       end
 
       M._update_usage_virt_text()
-      -- 先主动检测光标位置，确保 _should_follow_cached 是最新值
+      -- 先主动检测光标位置，确保协程共享的 should_follow 是最新值
       _check_cursor_near_end()
-      if _should_follow_cached then
+      if state_manager.get_shared_value("should_follow", true) then
         -- 光标在末尾附近：执行跟随并打开输入框
         _do_cursor_follow()
         M._open_float_input()
@@ -2178,9 +2174,9 @@ function M._setup_event_listeners()
       state.generation_in_progress = false
 
       M._update_usage_virt_text()
-      -- 先主动检测光标位置，确保 _should_follow_cached 是最新值
+      -- 先主动检测光标位置，确保协程共享的 should_follow 是最新值
       _check_cursor_near_end()
-      if _should_follow_cached then
+      if state_manager.get_shared_value("should_follow", true) then
         -- 光标在末尾附近：执行跟随并打开输入框
         _do_cursor_follow()
         M._open_float_input()
@@ -2557,8 +2553,8 @@ function M._setup_event_listeners()
       -- 仅在光标在后5行内时才显示工具调用悬浮窗
       local win = get_win()
       local near_end = cursor_near_end(win)
-      -- 同步更新 _should_follow_cached 缓存变量
-      _should_follow_cached = near_end
+      -- 同步更新协程共享的 should_follow 缓存变量
+      state_manager.set_shared("should_follow", near_end)
       if near_end then
         M._show_tool_display()
         -- 创建浮动窗口可能触发 WinNew/BufEnter 等自动命令，间接影响 chat 窗口的滚动位置
@@ -2843,7 +2839,7 @@ function M._setup_event_listeners()
       -- 这些事件的处理函数中也会尝试打开输入框，但 _open_float_input 内部有 is_active 检查，不会重复打开
       M._open_float_input()
       -- 仅在光标跟随模式开启（光标在末尾附近）时才聚焦输入框
-      if virtual_input.is_active() and _should_follow_cached then
+      if virtual_input.is_active() and state_manager.get_shared_value("should_follow", true) then
         virtual_input.focus_and_insert()
       end
     end,
@@ -3046,7 +3042,7 @@ function M._append_message_to_buffer(role, content)
 
   pcall(vim.api.nvim_set_option_value, "modified", false, { buf = buf })
 
-  -- 执行光标跟随（使用已缓存的 _should_follow_cached 值）
+  -- 执行光标跟随（使用协程共享表 should_follow 缓存值）
   _schedule_cursor_follow()
 end
 
@@ -3105,7 +3101,7 @@ function M._append_reasoning_folded_to_buffer(reasoning_text)
 
   pcall(vim.api.nvim_set_option_value, "modified", false, { buf = buf })
 
-  -- 执行光标跟随（使用已缓存的 _should_follow_cached 值）
+  -- 执行光标跟随（使用协程共享表 should_follow 缓存值）
   _schedule_cursor_follow()
 end
 
@@ -3870,9 +3866,10 @@ M._do_cursor_follow = _do_cursor_follow
 M._check_cursor_near_end = _check_cursor_near_end
 
 --- 设置光标跟随缓存变量（供 virtual_input 等外部模块调用）
+--- 通过协程共享表写入，确保协程间隔离
 --- @param should boolean 是否应该跟随
 function M._set_cursor_follow_should(should)
-  _should_follow_cached = should
+  state_manager.set_shared("should_follow", should)
 end
 
 return M

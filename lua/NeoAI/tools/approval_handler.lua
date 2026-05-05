@@ -312,19 +312,20 @@ function M._show_approval_dialog(item)
       -- ===== 恢复计时：审批窗口已关闭 =====
       M.resume_timer()
 
-      local cancel_reason = extra_opts.reason or "用户未提供原因"
-      logger.debug("[approval_handler] 用户拒绝工具: %s，原因: %s", item.tool_name, cancel_reason)
+      local cancel_reason = extra_opts.reason or "用户未提供说明"
+      logger.debug("[approval_handler] 用户拒绝工具: %s，说明: %s", item.tool_name, cancel_reason)
       pcall(vim.api.nvim_exec_autocmds, "User", {
         pattern = event_constants.TOOL_APPROVAL_CANCELLED,
         data = {
           tool_name = item.tool_name,
           args = item.raw_args,
           session_id = item.session_id,
+          reason = cancel_reason,
         },
       })
 
       local duration = os.time() - item.start_time
-      local err_msg = "用户取消了工具执行: " .. item.tool_name
+      local err_msg = "用户取消了工具执行: " .. item.tool_name .. "，说明: " .. cancel_reason
       local ok_fire, _ = pcall(vim.api.nvim_exec_autocmds, "User", {
         pattern = event_constants.TOOL_EXECUTION_ERROR,
         data = {
