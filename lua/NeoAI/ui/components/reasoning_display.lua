@@ -2,6 +2,7 @@ local M = {}
 
 local logger = require("NeoAI.utils.logger")
 local window_manager = require("NeoAI.ui.window.window_manager")
+local state_manager = require("NeoAI.core.config.state")
 
 local function buf_valid(buf) return buf and vim.api.nvim_buf_is_valid(buf) end
 local function win_valid(win) return win and vim.api.nvim_win_is_valid(win) end
@@ -26,6 +27,14 @@ function M.initialize(config)
 
   state.config = config or {}
   state.initialized = true
+
+  -- 注册状态切片
+  state_manager.register_slice("reasoning_display", {
+    config = state.config,
+    current_window_id = nil,
+    is_visible = false,
+    content_buffer = "",
+  })
 
   -- 创建事件组
   local event_group = vim.api.nvim_create_augroup("NeoAIEvents", { clear = true })
@@ -467,6 +476,12 @@ function M._setup_keymaps()
       silent = true,
       noremap = true,
     })
+  end
+
+  -- 同步 chat 窗口的其他快捷键到 reasoning 悬浮窗（排除 reasoning 自己已注册的 quit 键）
+  local ok, chat_window = pcall(require, "NeoAI.ui.window.chat_window")
+  if ok and chat_window.sync_keymaps_to_buf then
+    chat_window.sync_keymaps_to_buf(window_info.buf, { "quit" })
   end
 end
 

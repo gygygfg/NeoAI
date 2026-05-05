@@ -1,6 +1,7 @@
 -- 输入处理器（保留兼容，实际输入由 virtual_input 组件处理）
 local M = {}
 local Events = require("NeoAI.core.events")
+local state_manager = require("NeoAI.core.config.state")
 
 local state = {
   initialized = false, config = nil,
@@ -13,6 +14,14 @@ function M.initialize(config)
   if state.initialized then return end
   state.config = config or {}
   state.initialized = true
+
+  -- 注册状态切片
+  state_manager.register_slice("input_handler", {
+    config = state.config,
+    current_mode = "normal",
+    input_buffer = "",
+    is_sending = false,
+  })
 end
 
 function M.setup_keymaps() end

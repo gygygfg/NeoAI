@@ -29,6 +29,17 @@ function M.initialize(config)
   end
   state.ns_id = vim.api.nvim_create_namespace("NeoAI_InlineInput")
   state.initialized = true
+
+  -- 注册状态切片
+  state_manager.register_slice("virtual_input", {
+    active = false,
+    mode = nil,
+    buf = nil,
+    float_buf = nil,
+    float_win = nil,
+    parent_win = nil,
+    placeholder = "输入消息...",
+  })
 end
 
 --- 激活内联输入模式
@@ -54,6 +65,12 @@ function M.activate(buf, opts)
   state.on_change = opts.on_change
   state.input_line_count = opts.input_line_count or 3
   state.active = true
+
+  -- 同步到状态切片
+  state_manager.set_state("virtual_input", "active", true)
+  state_manager.set_state("virtual_input", "mode", "inline")
+  state_manager.set_state("virtual_input", "buf", buf)
+  state_manager.set_state("virtual_input", "placeholder", state.placeholder)
 
   -- 设置 buffer 为可修改
   vim.api.nvim_set_option_value("modifiable", true, { buf = buf })
@@ -212,6 +229,9 @@ function M.open(parent_win, opts)
   -- 将浮动窗口光标定位到第一行（> 提示符后面）
   pcall(vim.api.nvim_win_set_cursor, state.float_win, { 1, 2 })
 
+  -- 注册光标离开自动隐藏
+  M._setup_cursor_leave_autocmd()
+
   -- 设置窗口选项
   vim.api.nvim_set_option_value("wrap", true, { win = state.float_win })
   vim.api.nvim_set_option_value("cursorline", true, { win = state.float_win })
@@ -269,6 +289,16 @@ function M.open(parent_win, opts)
   end
 
   state.active = true
+
+  -- 同步到状态切片
+  state_manager.set_state("virtual_input", "active", true)
+  state_manager.set_state("virtual_input", "mode", "float")
+  state_manager.set_state("virtual_input", "buf", nil)
+  state_manager.set_state("virtual_input", "float_buf", state.float_buf)
+  state_manager.set_state("virtual_input", "float_win", state.float_win)
+  state_manager.set_state("virtual_input", "parent_win", state.parent_win)
+  state_manager.set_state("virtual_input", "placeholder", state.placeholder)
+
   return true
 end
 
@@ -280,6 +310,9 @@ function M.close(force)
 
   -- 清理 VimResized 自动命令
   M._cleanup_vimresized_autocmd()
+
+  -- 清理光标离开自动命令
+  M._cleanup_cursor_leave_autocmd()
 
   -- 清理 CmdlineEnter 自动命令
   if state.float_buf then
@@ -340,6 +373,14 @@ function M.close(force)
   state.active = false
   state.parent_win = nil
   state.mode = nil
+  state._user_exited_insert = false
+
+  -- 同步到状态切片
+  state_manager.set_state("virtual_input", "active", false)
+  state_manager.set_state("virtual_input", "mode", nil)
+  state_manager.set_state("virtual_input", "float_buf", nil)
+  state_manager.set_state("virtual_input", "float_win", nil)
+  state_manager.set_state("virtual_input", "parent_win", nil)
 end
 
 --- 停用输入模式（兼容旧接口）
@@ -371,6 +412,12 @@ function M.deactivate()
   state.buf = nil
   state.placeholder_extmark_id = nil
   state.input_start_line = 0
+  state._user_exited_insert = false
+
+  -- 同步到状态切片
+  state_manager.set_state("virtual_input", "active", false)
+  state_manager.set_state("virtual_input", "mode", nil)
+  state_manager.set_state("virtual_input", "buf", nil)
 end
 
 --- 确保末尾有足够的空行
@@ -560,8 +607,14 @@ function M._setup_float_keymaps()
   end, { buffer = buf, noremap = true, silent = true, desc = "发送消息" })
 
   -- Esc：退出插入模式回到 normal 模式（不关闭输入框）
+  -- 设置标志，阻止后续 focus_and_insert 自动重新进入插入模式
   vim.keymap.set("i", "<Esc>", function()
+    state._user_exited_insert = true
     vim.cmd("stopinsert")
+    -- 延迟重置标志，给 focus_and_insert 一个机会检查
+    vim.defer_fn(function()
+      state._user_exited_insert = false
+    end, 100)
   end, { buffer = buf, noremap = true, silent = true, desc = "退出插入模式" })
 
   -- i 在 normal 模式下进入插入模式
@@ -620,31 +673,58 @@ function M._bind_chat_keymaps_to_float(buf)
       action = function()
         chat_window.close()
       end,
+      modes = { "n" },
     },
     {
       key = chat_config.refresh.key,
       action = function()
         chat_window.refresh_chat()
       end,
+      modes = { "n" },
     },
     {
       key = chat_config.switch_model.key,
       action = function()
         chat_window.show_model_selector()
       end,
+      modes = { "n" },
+    },
+    {
+      key = chat_config.tool_approval.key,
+      action = function()
+        chat_window._open_tool_approval()
+      end,
+      modes = { "n" },
+    },
+    {
+      key = chat_config.cancel.key,
+      action = function()
+        vim.api.nvim_exec_autocmds("User", {
+          pattern = require("NeoAI.core.events").CANCEL_GENERATION,
+          data = {},
+        })
+      end,
+      -- 仅在 Normal 模式绑定，插入模式中 <Esc> 由 _setup_float_keymaps 处理为 stopinsert
+      modes = { "n" },
     },
   }
 
-  -- 绑定快捷键到浮动输入框的 normal 模式
+  local quit_key = chat_config.quit.key
+  local tool_approval_key = chat_config.tool_approval and chat_config.tool_approval.key
+
+  -- 绑定快捷键到浮动输入框
   for _, binding in ipairs(bindings) do
-    vim.keymap.set("n", binding.key, function()
-      -- 先关闭浮动输入框，再执行 chat 窗口操作
-      -- 注意：有些操作（如 close）内部会关闭输入框，所以先检查
-      if binding.key ~= "q" then
-        M.close()
-      end
-      binding.action()
-    end, { buffer = buf, noremap = true, silent = true, desc = "Chat: " .. tostring(binding.key) })
+    for _, mode in ipairs(binding.modes or { "n" }) do
+      vim.keymap.set(mode, binding.key, function()
+        -- 先关闭浮动输入框，再执行 chat 窗口操作
+        -- quit 操作内部会关闭输入框，所以不需要先 close
+        -- tool_approval 操作不需要关闭输入框，审批窗口是独立悬浮窗，输入框可保持打开
+        if binding.key ~= quit_key and binding.key ~= tool_approval_key then
+          M.close()
+        end
+        binding.action()
+      end, { buffer = buf, noremap = true, silent = true, desc = "Chat: " .. tostring(binding.key) })
+    end
   end
 end
 
@@ -806,6 +886,7 @@ end
 
 --- 聚焦浮动输入框并进入插入模式
 --- 在 AI 生成完成后调用，确保光标回到输入框
+--- 如果用户主动按 <Esc> 退出了插入模式，则不再强制进入
 function M.focus_and_insert()
   if not state.active or state.mode ~= "float" then
     return
@@ -814,9 +895,18 @@ function M.focus_and_insert()
     return
   end
 
+  -- 如果用户主动退出了插入模式，不再强制进入
+  if state._user_exited_insert then
+    return
+  end
+
   -- 延迟聚焦，确保在异步回调（如 _do_render_chat 的 set_window_content）执行完后才设置焦点
   vim.defer_fn(function()
     if not state.float_win or not vim.api.nvim_win_is_valid(state.float_win) then
+      return
+    end
+    -- 再次检查，因为延迟期间用户可能又按了 <Esc>
+    if state._user_exited_insert then
       return
     end
     pcall(vim.api.nvim_set_current_win, state.float_win)
@@ -871,8 +961,19 @@ function M.reposition()
   if space_below < input_total_height then
     local lift = input_total_height - space_below
     adjusted_parent_row = math.max(0, parent_row - lift)
+
+    -- 保存原始 parent 位置（仅首次抬升时保存）
+    if not state._saved_parent_config then
+      state._saved_parent_config = { row = parent_row }
+    end
+
     parent_config.row = adjusted_parent_row
     pcall(vim.api.nvim_win_set_config, state.parent_win, parent_config)
+  elseif state._saved_parent_config then
+    -- 空间足够，恢复 parent 到原始位置（收起）
+    parent_config.row = state._saved_parent_config.row
+    pcall(vim.api.nvim_win_set_config, state.parent_win, parent_config)
+    state._saved_parent_config = nil
   end
 
   -- 输入框位置：紧贴 chat 窗口底部 border 下方
@@ -909,6 +1010,86 @@ end
 --- 清理 VimResized 自动命令
 function M._cleanup_vimresized_autocmd()
   pcall(vim.api.nvim_del_augroup_by_name, "NeoAIVirtualInputVimResized")
+end
+
+--- 注册光标离开自动隐藏
+--- 当光标离开浮动输入框时，延迟 50ms 检测光标所在的 buffer
+--- 如果目标 buffer 是当前 chat 窗口的 buffer（通过 app 状态切片中的 chat_buf 判断），则不收起
+--- 否则自动关闭浮动输入框
+function M._setup_cursor_leave_autocmd()
+  M._cleanup_cursor_leave_autocmd()
+  local group = vim.api.nvim_create_augroup("NeoAIVirtualInputCursorLeave", { clear = true })
+  vim.api.nvim_create_autocmd("CursorMoved", {
+    group = group,
+    callback = function()
+      -- 仅在浮动输入框激活时处理
+      if not state.active or state.mode ~= "float" then
+        return
+      end
+      if not state.float_win or not vim.api.nvim_win_is_valid(state.float_win) then
+        return
+      end
+
+      -- 快速检查：如果 tool_approval 正在打开或已激活，不处理此次 CursorMoved
+      -- tool_approval.open 在 nvim_open_win 之前就设置了 active=true，
+      -- 所以即使 nvim_open_win 触发了 CursorMoved，这里也能识别
+      if state_manager.get_state("tool_approval", "active") then
+        return
+      end
+
+      -- 获取当前光标所在的窗口
+      local current_win = vim.api.nvim_get_current_win()
+
+      -- 如果光标仍在浮动输入框内，不处理
+      if current_win == state.float_win then
+        return
+      end
+
+      -- 光标离开了浮动输入框，延迟 50ms 检测目标 buffer
+      vim.defer_fn(function()
+        -- 再次检查状态是否仍然有效
+        if not state.active or state.mode ~= "float" then
+          return
+        end
+        if not state.float_win or not vim.api.nvim_win_is_valid(state.float_win) then
+          return
+        end
+
+        -- 获取当前光标所在的窗口和 buffer
+        local target_win = vim.api.nvim_get_current_win()
+        local target_buf = vim.api.nvim_win_get_buf(target_win)
+
+        -- 如果光标回到了浮动输入框，不处理
+        if target_win == state.float_win then
+          return
+        end
+
+        -- 从 app 状态切片获取当前 chat 窗口的 buffer
+        local chat_buf = state_manager.get_state("app", "chat_buf")
+
+        -- 如果目标 buffer 是当前 chat 窗口的 buffer，不收起
+        if chat_buf and target_buf == chat_buf then
+          return
+        end
+
+        -- 检查目标窗口是否是 NeoAI 管理的内部窗口（如 reasoning_display、tool_approval 等）
+        -- 如果是，不收起浮动输入框，避免用户操作 NeoAI 内部窗口时输入框被关闭
+        local window_manager = require("NeoAI.ui.window.window_manager")
+        if window_manager.is_neoai_window(target_win) then
+          return
+        end
+
+        -- 否则关闭浮动输入框
+        M.close()
+      end, 50)
+    end,
+    desc = "光标离开浮动输入框时自动隐藏",
+  })
+end
+
+--- 清理光标离开自动命令
+function M._cleanup_cursor_leave_autocmd()
+  pcall(vim.api.nvim_del_augroup_by_name, "NeoAIVirtualInputCursorLeave")
 end
 
 return M

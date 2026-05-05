@@ -571,6 +571,29 @@ function M.set_mode(mode)
   end
 end
 
+--- 检查一个窗口是否是 NeoAI 管理的窗口
+--- 遍历内部 windows 表，检查目标窗口句柄是否在其中
+--- @param win number 窗口句柄
+--- @return boolean
+function M.is_neoai_window(win)
+  if not win or not vim.api.nvim_win_is_valid(win) then
+    return false
+  end
+  -- 检查 window_manager 内部注册的窗口
+  for _, w in pairs(windows) do
+    if w.win == win then
+      return true
+    end
+  end
+  -- 检查通过状态切片注册的组件窗口（如 tool_approval 直接 nvim_open_win 创建的窗口）
+  local state_manager = require("NeoAI.core.config.state")
+  local tool_approval_win = state_manager.get_state("tool_approval", "win")
+  if tool_approval_win and tool_approval_win == win then
+    return true
+  end
+  return false
+end
+
 function M.is_window_valid(window_info)
   return window_info and window_info.win and vim.api.nvim_win_is_valid(window_info.win)
     and window_info.buf and vim.api.nvim_buf_is_valid(window_info.buf)

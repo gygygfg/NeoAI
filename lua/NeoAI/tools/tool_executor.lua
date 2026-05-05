@@ -94,6 +94,16 @@ function M.initialize(config)
   -- neovim_tree: 惰性检查，无需预初始化
   pcall(require, "NeoAI.tools.builtin.file_tools")
   pcall(require, "NeoAI.tools.builtin.neovim_lsp")
+
+  -- 应用审批配置覆盖
+  -- 从合并后的完整配置中读取 tools.approval 并覆盖各工具的 approval 字段
+  local merger = require("NeoAI.core.config.merger")
+  local state_manager = require("NeoAI.core.config.state")
+  local full_config = state_manager.get_state("config", "data")
+  if full_config then
+    local tr = require("NeoAI.tools.tool_registry")
+    pcall(tr.apply_approval_config, full_config)
+  end
 end
 
 -- ========== 核心执行 ==========
@@ -204,7 +214,7 @@ function M.execute_async(tool_name, args, on_success, on_error, on_progress)
   -- ===== 工具审批检查 =====
   -- 委托给 approval_handler
   local check_ok, check_result = pcall(tool_validator.check_approval, tool_name, resolved_args, tool_registry)
-  local needs_user_approval = check_ok and check_result and check_result.behavior == "require_user"
+  local needs_user_approval = check_ok and check_result and check_result.auto_allow == false
 
   if needs_user_approval then
     local session_id = args and (args.session_id or args._session_id) or ""

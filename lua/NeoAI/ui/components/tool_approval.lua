@@ -17,6 +17,7 @@
 local M = {}
 
 local ui_init = require("NeoAI.ui.init")
+local state_manager = require("NeoAI.core.config.state")
 
 local state = {
   initialized = false,
@@ -54,6 +55,14 @@ function M.initialize()
   end
   state.ns_id = vim.api.nvim_create_namespace("NeoAIToolApproval")
   state.initialized = true
+
+  -- 注册状态切片
+  state_manager.register_slice("tool_approval", {
+    active = false,
+    buf = nil,
+    win = nil,
+    tools = {},
+  })
 end
 
 --- 打开工具审批悬浮窗
@@ -80,6 +89,13 @@ function M.open(tools, opts)
   state.on_select = opts.on_select
   state.on_cancel = opts.on_cancel
 
+  -- 在创建任何窗口之前先标记状态切片，让 virtual_input 的 CursorMoved 豁免逻辑能识别
+  -- 注意：此时还没有 win，但 active=true 已足够让 virtual_input 跳过关闭
+  state_manager.set_state("tool_approval", "active", true)
+  state_manager.set_state("tool_approval", "buf", nil)
+  state_manager.set_state("tool_approval", "win", nil)
+  state_manager.set_state("tool_approval", "tools", state.tools)
+
   -- 创建 buffer
   state.buf = vim.api.nvim_create_buf(false, true)
   vim.api.nvim_set_option_value("filetype", "neoai_tool_approval", { buf = state.buf })
@@ -102,7 +118,7 @@ function M.open(tools, opts)
     win_row = math.max(1, screen_height - total_height - 2)
   end
 
-  state.win = vim.api.nvim_open_win(state.buf, true, {
+  state.win = vim.api.nvim_open_win(state.buf, false, {
     relative = "editor",
     width = win_width,
     height = total_height,
@@ -113,6 +129,12 @@ function M.open(tools, opts)
     title = " Tool Approval ",
     title_pos = "center",
   })
+
+  -- 创建窗口后立即同步到状态切片，确保任何 CursorMoved 事件处理时状态已可用
+  state_manager.set_state("tool_approval", "active", true)
+  state_manager.set_state("tool_approval", "buf", state.buf)
+  state_manager.set_state("tool_approval", "win", state.win)
+  state_manager.set_state("tool_approval", "tools", state.tools)
 
   -- 禁止滚动：内容刚好填满窗口，无多余行可滚动
   vim.api.nvim_set_option_value("cursorline", false, { win = state.win })
@@ -131,14 +153,14 @@ function M.open(tools, opts)
   M._render()
   M._setup_keymaps()
 
+  state.active = true
+
   vim.schedule(function()
     if state.win and vim.api.nvim_win_is_valid(state.win) then
       vim.api.nvim_set_current_win(state.win)
       vim.cmd("stopinsert")
     end
   end)
-
-  state.active = true
 end
 
 --- 关闭悬浮窗
@@ -168,6 +190,12 @@ function M.close()
   state.tools = {}
   state.on_select = nil
   state.on_cancel = nil
+
+  -- 同步到状态切片
+  state_manager.set_state("tool_approval", "active", false)
+  state_manager.set_state("tool_approval", "buf", nil)
+  state_manager.set_state("tool_approval", "win", nil)
+  state_manager.set_state("tool_approval", "tools", {})
 end
 
 --- 计算窗口高度（nvim_open_win 的 height 参数，不包含边框）
@@ -466,6 +494,12 @@ function M._setup_keymaps()
   end
   if not has_ctrlc then
     vim.keymap.set("i", "<C-c>", M._cancel, { buffer = buf, noremap = true, silent = true, desc = "取消" })
+  end
+
+  -- 同步 chat 窗口的其他快捷键到审批悬浮窗（排除审批自己已注册的 confirm、cancel 等）
+  local ok, chat_window = pcall(require, "NeoAI.ui.window.chat_window")
+  if ok and chat_window.sync_keymaps_to_buf then
+    chat_window.sync_keymaps_to_buf(buf, { "cancel", "quit" })
   end
 end
 

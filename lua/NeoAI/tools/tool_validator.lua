@@ -34,28 +34,24 @@ end
 ---
 --- 审批流程：
 ---   1. 获取工具的审批配置（来自 tool_registry.get_approval_config）
----   2. 检查工具是否属于获取信息类（auto_approve）
+---   2. 检查 auto_allow：true 则自动通过
 ---   3. 检查参数是否在允许的参数组内
 ---   4. 检查文件路径是否在允许的目录内
----   5. 根据默认行为决定是否需要用户确认
 ---
 --- @param tool_name string 工具名称
 --- @param args table 工具参数
 --- @param tool_registry table 工具注册表实例
---- @return table { approved: boolean, reason: string, behavior: string }
+--- @return table { approved: boolean, reason: string, auto_allow: boolean }
 function M.check_approval(tool_name, args, tool_registry)
   if not state.initialized then
-    return { approved = true, reason = "验证器未初始化，默认通过", behavior = "auto_approve" }
+    return { approved = true, reason = "验证器未初始化，默认通过", auto_allow = true }
   end
 
   if not tool_name then
-    return { approved = true, reason = "工具名称为空，默认通过", behavior = "auto_approve" }
+    return { approved = true, reason = "工具名称为空，默认通过", auto_allow = true }
   end
 
   -- 获取审批配置
-  -- 使用 pcall 保护，防止 tool_registry 未初始化时抛出错误
-  -- 注意：必须使用匿名函数包装，不能直接 pcall(fn, self, args)，
-  -- 因为 get_approval_config 不是用 self 方式定义的，直接传 self 会覆盖 tool_name 参数
   local approval_config = nil
   if tool_registry and tool_registry.get_approval_config then
     local ok_config, config_result = pcall(function()
@@ -69,18 +65,19 @@ function M.check_approval(tool_name, args, tool_registry)
   end
 
   if not approval_config then
-    -- 没有审批配置，默认通过
-    return { approved = true, reason = "无审批配置，默认通过", behavior = "auto_approve" }
+    return { approved = true, reason = "无审批配置，默认通过", auto_allow = true }
   end
 
-  local behavior = approval_config.behavior or "auto_approve"
+  local auto_allow = approval_config.auto_allow
+  if auto_allow == nil then
+    auto_allow = true
+  end
   local allowed_dirs = approval_config.allowed_directories or {}
   local allowed_param_groups = approval_config.allowed_param_groups or {}
 
-  -- 如果行为是 auto_approve，直接通过
-  if behavior == "auto_approve" then
-    return { approved = true, reason = "工具配置为自动批准", behavior = "auto_approve" }
-  end
+  -- 如果 auto_allow 为 true，直接通过（跳过审批窗口）
+  -- 注意：即使 auto_allow=true，仍会执行参数安全检查（目录、参数组检查）
+  -- 安全检查不通过时，返回 approved=false 强制要求用户确认
 
   -- 获取工具定义，用于检查参数 schema
   local tool = nil
@@ -102,7 +99,7 @@ function M.check_approval(tool_name, args, tool_registry)
             return {
               approved = false,
               reason = string.format("参数 '%s' 的值 '%s' 不在允许的目录内", param_name, param_value),
-              behavior = "require_user",
+              auto_allow = false,
             }
           end
         end
@@ -124,7 +121,7 @@ function M.check_approval(tool_name, args, tool_registry)
                       param_name,
                       filepath
                     ),
-                    behavior = "require_user",
+                    auto_allow = false,
                   }
                 end
               end
@@ -148,19 +145,27 @@ function M.check_approval(tool_name, args, tool_registry)
               param_name,
               tostring(param_value)
             ),
-            behavior = "require_user",
+            auto_allow = false,
           }
         end
       end
     end
   end
 
-  -- 所有检查通过，但行为是 require_user，需要用户确认
-  -- 注意：approved=true 表示参数检查通过，behavior=require_user 表示需要用户交互确认
+  -- 所有检查通过
+  if auto_allow then
+    return {
+      approved = true,
+      reason = string.format("工具 '%s' 配置为自动允许", tool_name),
+      auto_allow = true,
+    }
+  end
+
+  -- auto_allow=false，需要用户确认
   return {
     approved = true,
-    reason = string.format("工具 '%s' 配置为需要用户审批", tool_name),
-    behavior = "require_user",
+    reason = string.format("工具 '%s' 需要用户审批", tool_name),
+    auto_allow = false,
   }
 end
 
@@ -171,7 +176,7 @@ end
 --- @return boolean
 function M._is_path_in_allowed_dirs(path, allowed_dirs, tool_registry)
   if not path or #allowed_dirs == 0 then
-    -- 没有配置允许目录，默认允许（由 behavior 控制）
+    -- 没有配置允许目录，默认允许（由 auto_allow 控制）
     return true
   end
 
@@ -208,7 +213,7 @@ end
 --- 每个工具的审批配置存储在协程共享变量的 approval_configs 表中
 --- 通过 state.get_shared() 读写，协程内所有模块共享
 --- @param tool_name string 工具名称
---- @param config table 审批配置 { behavior, allowed_directories, allowed_param_groups }
+--- @param config table 审批配置 { auto_allow, allowed_directories, allowed_param_groups }
 function M.set_tool_approval_config(tool_name, config)
   local state = require("NeoAI.core.config.state")
   local shared = state.get_shared()
@@ -488,8 +493,8 @@ function M.validate_tool(tool)
     return false, "审批配置必须是表"
   end
   if tool.approval then
-    if tool.approval.behavior and not vim.tbl_contains({ "auto_approve", "require_user" }, tool.approval.behavior) then
-      return false, "审批行为必须是 'auto_approve' 或 'require_user'"
+    if tool.approval.auto_allow ~= nil and type(tool.approval.auto_allow) ~= "boolean" then
+      return false, "auto_allow 必须是布尔值"
     end
     if tool.approval.allowed_directories and type(tool.approval.allowed_directories) ~= "table" then
       return false, "允许目录必须是列表"

@@ -542,6 +542,9 @@ function M.open(session_id, window_id, branch_id)
     pcall(vim.api.nvim_buf_set_var, buf, "neoai_no_lsp", true)
     pcall(vim.diagnostic.disable, buf)
     pcall(vim.api.nvim_buf_set_name, buf, "neoai://chat/" .. session_id)
+
+    -- 注册到状态切片，供虚拟输入框检测光标离开时使用
+    state_manager.set_state("app", "chat_buf", buf)
   end
 
   if win_handle and vim.api.nvim_win_is_valid(win_handle) then
@@ -1145,6 +1148,72 @@ function M.set_keymaps()
     })
     exit_insert_mode()
   end, { buffer = buf, noremap = true, silent = true, desc = "取消生成或退出插入模式" })
+end
+
+--- 将 chat 窗口的快捷键同步到指定 buffer（用于悬浮窗）
+--- 除了 exclude_keys 中列出的快捷键（悬浮窗自己已注册的），其他 chat 快捷键都同步过去
+--- @param target_buf number 目标 buffer 句柄
+--- @param exclude_keys table|nil 排除的键名列表，如 { "quit", "cancel" }
+function M.sync_keymaps_to_buf(target_buf, exclude_keys)
+  if not target_buf or not vim.api.nvim_buf_is_valid(target_buf) then
+    return
+  end
+
+  local full_config = state_manager.get_state("config", "data") or {}
+  local chat_config = full_config.keymaps and full_config.keymaps.chat or {}
+  exclude_keys = exclude_keys or {}
+
+  -- 构建排除集合
+  local excluded = {}
+  for _, k in ipairs(exclude_keys) do
+    excluded[k] = true
+  end
+
+  -- 定义所有可同步的快捷键（与 set_keymaps 保持一致）
+  local sync_actions = {
+    insert = function()
+      -- 在悬浮窗中按 insert 键：聚焦到 chat 窗口再进入插入模式
+      if state.current_window_id then
+        local chat_win = window_manager.get_window_win(state.current_window_id)
+        if chat_win and vim.api.nvim_win_is_valid(chat_win) then
+          vim.api.nvim_set_current_win(chat_win)
+          vim.api.nvim_command("startinsert")
+        end
+      end
+    end,
+    quit = function()
+      M.close()
+    end,
+    refresh = function()
+      M.refresh_chat()
+    end,
+    switch_model = function()
+      M.show_model_selector()
+    end,
+    cancel = function()
+      vim.api.nvim_exec_autocmds("User", {
+        pattern = Events.CANCEL_GENERATION,
+        data = {},
+      })
+    end,
+    tool_approval = function()
+      M._open_tool_approval()
+    end,
+  }
+
+  for key, callback in pairs(sync_actions) do
+    if not excluded[key] then
+      local mapping = chat_config[key] and chat_config[key].key
+      if mapping then
+        vim.keymap.set("n", mapping, callback, {
+          buffer = target_buf,
+          noremap = true,
+          silent = true,
+          desc = "[同步] " .. (chat_config[key].desc or key),
+        })
+      end
+    end
+  end
 end
 
 --- 进入插入模式（内部函数）
@@ -3418,6 +3487,9 @@ function M._show_tool_display()
       silent = true,
       noremap = true,
     })
+
+    -- 同步其他 chat 快捷键到 tool_display 悬浮窗（排除 quit 和 cancel，它们已由上面注册）
+    M.sync_keymaps_to_buf(window_info.buf, { "quit", "cancel" })
   end
 end
 
@@ -3600,23 +3672,20 @@ function M._build_tool_folded_text(results)
   return folded_text
 end
 
---- 打开工具审批悬浮窗
---- 从 tool_registry 获取所有工具，打开模糊匹配选择器
---- 用户选中工具后，会触发 TOOL_APPROVED 事件，
---- 并尝试通过 tool_executor 执行该工具（传入空参数让用户后续通过聊天输入参数）
+--- 打开修改审批配置悬浮窗
+--- 从 tool_registry 获取所有工具，通过 vim.ui.select 模糊匹配选择工具，
+--- 然后显示该工具在当前协程内的审批配置，允许用户修改 auto_allow
 function M._open_tool_approval()
   if not state.current_window_id then
     return
   end
 
-  -- 加载 tool_registry 获取所有工具
   local ok, tool_registry = pcall(require, "NeoAI.tools.tool_registry")
   if not ok or not tool_registry then
     vim.notify("[NeoAI] 工具注册表不可用", vim.log.levels.WARN)
     return
   end
 
-  -- 确保初始化
   pcall(tool_registry.initialize, {})
 
   local all_tools = tool_registry.list()
@@ -3625,51 +3694,347 @@ function M._open_tool_approval()
     return
   end
 
-  -- 格式化工具列表
-  local tools_for_select = {}
+  -- 构建选择项（按分类分组显示）
+  local items = {}
   for _, tool in ipairs(all_tools) do
-    table.insert(tools_for_select, {
+    local category = tool.category or "uncategorized"
+    table.insert(items, {
+      display = string.format("[%s] %s", category, tool.name),
       name = tool.name,
-      description = tool.description or "",
-      category = tool.category or "uncategorized",
       raw = tool,
     })
   end
+  table.sort(items, function(a, b)
+    return a.display < b.display
+  end)
 
-  -- 打开工具审批悬浮窗
-  local tool_approval = require("NeoAI.ui.components.tool_approval")
-  tool_approval.open(tools_for_select, {
-    on_select = function(selected)
-      vim.notify(string.format("[NeoAI] 已选中工具: %s", selected.name), vim.log.levels.INFO)
+  -- 第一步：模糊匹配选择工具
+  vim.ui.select(items, {
+    prompt = "选择要修改审批配置的工具:",
+    format_item = function(item)
+      return item.display
+    end,
+  }, function(selected)
+    if not selected then
+      return
+    end
 
-      -- 触发工具审批事件（供其他模块监听）
-      vim.api.nvim_exec_autocmds("User", {
-        pattern = Events.TOOL_APPROVED,
-        data = {
-          tool_name = selected.name,
-          tool = selected.raw,
-          window_id = state.current_window_id,
-          session_id = state.current_session_id,
-        },
-      })
+    -- 第二步：显示并修改该工具的协程内审批配置
+    M._show_approval_config_editor(selected.name, selected.raw)
+  end)
+end
 
-      -- 用户已通过审批窗口手动选择了工具，统一通过 execute_async 执行
-      -- 用户已手动选择即视为已审批，不需要重复检查 approval.behavior
-      local executor_ok, tool_executor = pcall(require, "NeoAI.tools.tool_executor")
-      if executor_ok and tool_executor then
-        tool_executor.execute_async(selected.name, {
-          _session_id = state.current_session_id,
-        }, function(result)
-          vim.notify(string.format("[NeoAI] 工具 '%s' 执行成功", selected.name), vim.log.levels.INFO)
-        end, function(err)
-          vim.notify(string.format("[NeoAI] 工具 '%s' 执行失败: %s", selected.name, err), vim.log.levels.WARN)
+--- 显示审批配置编辑器
+--- 展示工具当前协程内审批配置，让用户修改各字段
+--- 前端显示 behavior（require_user / auto_approve），后端存储 auto_allow（true / false）
+--- 支持修改：behavior, allowed_directories, allowed_param_groups
+--- @param tool_name string 工具名称
+--- @param tool table 工具定义
+function M._show_approval_config_editor(tool_name, tool)
+  local tool_validator = require("NeoAI.tools.tool_validator")
+  local tool_registry = require("NeoAI.tools.tool_registry")
+
+  -- 获取当前协程内审批配置（优先）和注册表中的默认配置
+  local coro_config = tool_validator.get_tool_approval_config(tool_name)
+  local registry_config = tool_registry.get_approval_config(tool_name)
+
+  -- 当前生效的配置（auto_allow 布尔值）
+  local current_auto_allow = nil
+  if coro_config and coro_config.auto_allow ~= nil then
+    current_auto_allow = coro_config.auto_allow
+  elseif registry_config and registry_config.auto_allow ~= nil then
+    current_auto_allow = registry_config.auto_allow
+  else
+    current_auto_allow = true
+  end
+
+  -- 当前允许目录和参数组
+  local current_allowed_directories = {}
+  if coro_config and coro_config.allowed_directories then
+    current_allowed_directories = vim.deepcopy(coro_config.allowed_directories)
+  elseif registry_config and registry_config.allowed_directories then
+    current_allowed_directories = vim.deepcopy(registry_config.allowed_directories)
+  end
+
+  local current_allowed_param_groups = {}
+  if coro_config and coro_config.allowed_param_groups then
+    current_allowed_param_groups = vim.deepcopy(coro_config.allowed_param_groups)
+  elseif registry_config and registry_config.allowed_param_groups then
+    current_allowed_param_groups = vim.deepcopy(registry_config.allowed_param_groups)
+  end
+
+  -- 前端显示辅助：auto_allow → behavior 文本
+  local function behavior_text(auto_allow)
+    if auto_allow then
+      return "auto_approve"
+    else
+      return "require_user"
+    end
+  end
+
+  -- 递归编辑菜单，支持修改多个字段
+  local function show_field_menu()
+    local dirs_str = #current_allowed_directories > 0
+      and table.concat(current_allowed_directories, ", ")
+      or "(空)"
+    local groups_str = ""
+    for k, v in pairs(current_allowed_param_groups) do
+      local vals = type(v) == "table" and table.concat(v, ", ") or tostring(v)
+      groups_str = groups_str .. k .. "=" .. vals .. " "
+    end
+    if groups_str == "" then
+      groups_str = "(空)"
+    end
+
+    local field_options = {
+      {
+        display = string.format("behavior: %s", behavior_text(current_auto_allow)),
+        field = "behavior",
+      },
+      {
+        display = string.format("allowed_directories: %s", dirs_str),
+        field = "allowed_directories",
+      },
+      {
+        display = string.format("allowed_param_groups: %s", groups_str),
+        field = "allowed_param_groups",
+      },
+      {
+        display = "✓ 保存并退出",
+        field = "__save__",
+      },
+    }
+
+    vim.ui.select(field_options, {
+      prompt = string.format("工具 [%s] 审批配置 - 选择要修改的字段:", tool_name),
+      format_item = function(item)
+        return item.display
+      end,
+    }, function(selected)
+      if not selected then
+        return
+      end
+
+      if selected.field == "__save__" then
+        -- 保存配置（后端存储 auto_allow 布尔值）
+        local save_config = {
+          auto_allow = current_auto_allow,
+          allowed_directories = current_allowed_directories,
+          allowed_param_groups = current_allowed_param_groups,
+        }
+        tool_validator.set_tool_approval_config(tool_name, save_config)
+
+        vim.notify(
+          string.format(
+            "[NeoAI] 工具 '%s' 协程内审批配置已更新",
+            tool_name
+          ),
+          vim.log.levels.INFO
+        )
+
+        pcall(vim.api.nvim_exec_autocmds, "User", {
+          pattern = Events.TOOL_APPROVAL_CONFIG_CHANGED,
+          data = {
+            tool_name = tool_name,
+            config = save_config,
+          },
+        })
+        return
+      end
+
+      -- 根据字段类型显示不同的编辑器
+      if selected.field == "behavior" then
+        local behavior_options = {
+          { display = "auto_approve - 自动批准（无需用户确认）", value = true },
+          { display = "require_user - 需要用户审批", value = false },
+        }
+        vim.ui.select(behavior_options, {
+          prompt = string.format(
+            "工具 [%s] 当前 behavior: %s",
+            tool_name,
+            behavior_text(current_auto_allow)
+          ),
+          format_item = function(item)
+            local marker = (item.value == current_auto_allow) and "✓ " or "  "
+            return marker .. item.display
+          end,
+        }, function(selected_behavior)
+          if selected_behavior ~= nil then
+            current_auto_allow = selected_behavior.value
+          end
+          show_field_menu()
+        end)
+
+      elseif selected.field == "allowed_directories" then
+        local dirs_options = {
+          { display = "添加目录", action = "add" },
+          { display = "删除目录", action = "remove" },
+          { display = "清空所有目录", action = "clear" },
+          { display = "返回上级菜单", action = "back" },
+        }
+        vim.ui.select(dirs_options, {
+          prompt = string.format(
+            "当前允许目录 (%d 个): %s",
+            #current_allowed_directories,
+            dirs_str
+          ),
+          format_item = function(item)
+            return item.display
+          end,
+        }, function(selected_action)
+          if not selected_action or selected_action.action == "back" then
+            show_field_menu()
+            return
+          end
+
+          if selected_action.action == "add" then
+            vim.ui.input({
+              prompt = "输入允许的目录路径（支持相对/绝对路径，多个用逗号分隔）: ",
+            }, function(input)
+              if input and input ~= "" then
+                for _, dir in ipairs(vim.split(input, ",")) do
+                  local trimmed = vim.trim(dir)
+                  if trimmed ~= "" then
+                    -- 去重
+                    local exists = false
+                    for _, d in ipairs(current_allowed_directories) do
+                      if d == trimmed then
+                        exists = true
+                        break
+                      end
+                    end
+                    if not exists then
+                      table.insert(current_allowed_directories, trimmed)
+                    end
+                  end
+                end
+              end
+              show_field_menu()
+            end)
+
+          elseif selected_action.action == "remove" then
+            if #current_allowed_directories == 0 then
+              vim.notify("[NeoAI] 没有可删除的目录", vim.log.levels.INFO)
+              show_field_menu()
+              return
+            end
+            local remove_options = {}
+            for _, dir in ipairs(current_allowed_directories) do
+              table.insert(remove_options, { display = dir, value = dir })
+            end
+            table.insert(remove_options, { display = "返回", value = "__back__" })
+            vim.ui.select(remove_options, {
+              prompt = "选择要删除的目录:",
+              format_item = function(item)
+                return item.display
+              end,
+            }, function(to_remove)
+              if to_remove and to_remove.value ~= "__back__" then
+                for i, dir in ipairs(current_allowed_directories) do
+                  if dir == to_remove.value then
+                    table.remove(current_allowed_directories, i)
+                    break
+                  end
+                end
+              end
+              show_field_menu()
+            end)
+
+          elseif selected_action.action == "clear" then
+            current_allowed_directories = {}
+            show_field_menu()
+          end
+        end)
+
+      elseif selected.field == "allowed_param_groups" then
+        local groups_options = {
+          { display = "添加参数组", action = "add" },
+          { display = "删除参数组", action = "remove" },
+          { display = "清空所有参数组", action = "clear" },
+          { display = "返回上级菜单", action = "back" },
+        }
+        vim.ui.select(groups_options, {
+          prompt = string.format(
+            "当前允许参数组: %s",
+            groups_str
+          ),
+          format_item = function(item)
+            return item.display
+          end,
+        }, function(selected_action)
+          if not selected_action or selected_action.action == "back" then
+            show_field_menu()
+            return
+          end
+
+          if selected_action.action == "add" then
+            -- 先输入参数名
+            vim.ui.input({
+              prompt = "输入参数名（如 command）: ",
+            }, function(param_name)
+              if not param_name or param_name == "" then
+                show_field_menu()
+                return
+              end
+              param_name = vim.trim(param_name)
+              -- 再输入允许的值
+              vim.ui.input({
+                prompt = string.format("输入参数 '%s' 的允许值（多个用逗号分隔）: ", param_name),
+              }, function(values_input)
+                if values_input and values_input ~= "" then
+                  local values = {}
+                  for _, v in ipairs(vim.split(values_input, ",")) do
+                    local trimmed = vim.trim(v)
+                    if trimmed ~= "" then
+                      table.insert(values, trimmed)
+                    end
+                  end
+                  if #values > 0 then
+                    current_allowed_param_groups[param_name] = values
+                  end
+                end
+                show_field_menu()
+              end)
+            end)
+
+          elseif selected_action.action == "remove" then
+            local keys = vim.tbl_keys(current_allowed_param_groups)
+            if #keys == 0 then
+              vim.notify("[NeoAI] 没有可删除的参数组", vim.log.levels.INFO)
+              show_field_menu()
+              return
+            end
+            local remove_options = {}
+            for _, k in ipairs(keys) do
+              local vals = type(current_allowed_param_groups[k]) == "table"
+                and table.concat(current_allowed_param_groups[k], ", ")
+                or tostring(current_allowed_param_groups[k])
+              table.insert(remove_options, { display = string.format("%s = [%s]", k, vals), value = k })
+            end
+            table.insert(remove_options, { display = "返回", value = "__back__" })
+            vim.ui.select(remove_options, {
+              prompt = "选择要删除的参数组:",
+              format_item = function(item)
+                return item.display
+              end,
+            }, function(to_remove)
+              if to_remove and to_remove.value ~= "__back__" then
+                current_allowed_param_groups[to_remove.value] = nil
+              end
+              show_field_menu()
+            end)
+
+          elseif selected_action.action == "clear" then
+            current_allowed_param_groups = {}
+            show_field_menu()
+          end
         end)
       end
-    end,
-    on_cancel = function()
-      vim.notify("[NeoAI] 工具审批已取消", vim.log.levels.INFO)
-    end,
-  })
+    end)
+  end
+
+  -- 开始编辑
+  show_field_menu()
 end
 
 --- 获取当前使用的模型标签

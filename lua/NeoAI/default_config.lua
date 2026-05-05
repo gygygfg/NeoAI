@@ -249,15 +249,33 @@ local DEFAULT_CONFIG = {
     enabled = true,
     builtin = true,
     external = {},
+
+    -- 工具审批配置
+    -- 用户可通过此配置覆盖各工具的审批行为
+    -- 默认行为：所有工具使用其自身注册时的 approval.auto_allow
+    -- 各工具可通过 tool_overrides 单独覆盖
+    approval = {
+      -- 默认是否自动允许（当工具未设置 auto_allow 时使用）
+      default_auto_allow = true,
+      -- 默认允许的目录列表（所有工具共享）
+      allowed_directories = {},
+      -- 默认允许的参数组（参数名 -> 允许的值列表）
+      allowed_param_groups = {},
+      -- 各工具单独审批配置覆盖
+      -- 键为工具名称，值为覆盖配置
+      -- 支持字段：auto_allow, allowed_directories, allowed_param_groups
+      --   auto_allow: true 表示自动允许（跳过审批窗口），false 表示需要用户审批
+      tool_overrides = {},
+    }
   },
   -- 日志配置
   log = {
     -- 日志级别: 'DEBUG', 'INFO', 'WARN', 'ERROR', 'FATAL'
-    -- level = "WARN",
-    level = "DEBUG",
+    level = "WARN",
+    -- level = "DEBUG",
     -- 输出文件路径（可选，默认输出到文件，避免 print 阻塞消息区域）
-    -- output_path = nill,
-    output_path = "/root/NeoAI/pack/plugins/start/NeoAI/lua/NeoAI/neoai.log",
+    output_path = nill,
+    -- output_path = "/root/NeoAI/pack/plugins/start/NeoAI/lua/NeoAI/neoai.log",
     -- 日志格式模板
     format = "[{time}] [{level}] {message}",
     -- 最大文件大小（字节），默认 10MB

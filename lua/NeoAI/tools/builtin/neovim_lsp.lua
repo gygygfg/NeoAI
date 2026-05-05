@@ -1672,7 +1672,7 @@ M.lsp_hover = define_tool({
   returns = { type = "object", description = "悬停信息，包含文档内容和位置范围" },
   category = "lsp",
   permissions = { read = true },
-  approval = { behavior = "auto_approve" },
+  approval = { auto_allow = true },
 })
 
 -- ============================================================================
@@ -1788,7 +1788,7 @@ M.lsp_definition = define_tool({
   returns = { type = "object", description = "定义位置信息列表" },
   category = "lsp",
   permissions = { read = true },
-  approval = { behavior = "auto_approve" },
+  approval = { auto_allow = true },
 })
 
 -- ============================================================================
@@ -1920,7 +1920,7 @@ M.lsp_references = define_tool({
   },
   category = "lsp",
   permissions = { read = true },
-  approval = { behavior = "auto_approve" },
+  approval = { auto_allow = true },
 })
 
 -- ============================================================================
@@ -2040,7 +2040,7 @@ M.lsp_implementation = define_tool({
   },
   category = "lsp",
   permissions = { read = true },
-  approval = { behavior = "auto_approve" },
+  approval = { auto_allow = true },
 })
 
 -- ============================================================================
@@ -2160,7 +2160,7 @@ M.lsp_declaration = define_tool({
   },
   category = "lsp",
   permissions = { read = true },
-  approval = { behavior = "auto_approve" },
+  approval = { auto_allow = true },
 })
 -- ============================================================================
 -- 工具 lsp_document_symbols - 获取文档符号列表
@@ -2559,7 +2559,7 @@ M.lsp_document_symbols = define_tool({
   },
   category = "lsp",
   permissions = { read = true },
-  approval = { behavior = "auto_approve" },
+  approval = { auto_allow = true },
 })
 
 -- ============================================================================
@@ -2685,7 +2685,7 @@ M.lsp_workspace_symbols = define_tool({
   },
   category = "lsp",
   permissions = { read = true },
-  approval = { behavior = "auto_approve" },
+  approval = { auto_allow = true },
 })
 
 -- ============================================================================
@@ -2827,7 +2827,7 @@ M.lsp_code_action = define_tool({
   },
   category = "lsp",
   permissions = { read = true },
-  approval = { behavior = "auto_approve" },
+  approval = { auto_allow = true },
 })
 
 -- ============================================================================
@@ -3294,7 +3294,7 @@ M.lsp_diagnostics = define_tool({
   },
   category = "lsp",
   permissions = { read = true },
-  approval = { behavior = "auto_approve" },
+  approval = { auto_allow = true },
 })
 
 -- ============================================================================
@@ -3563,7 +3563,7 @@ M.lsp_client_info = define_tool({
   },
   category = "lsp",
   permissions = { read = true },
-  approval = { behavior = "auto_approve" },
+  approval = { auto_allow = true },
 })
 
 -- send_signature_request 前向声明（实际定义在文件后面）
@@ -3954,7 +3954,7 @@ M.lsp_signature_help = define_tool({
   },
   category = "lsp",
   permissions = { read = true },
-  approval = { behavior = "auto_approve" },
+  approval = { auto_allow = true },
 })
 
 -- ============================================================================
@@ -4088,7 +4088,7 @@ M.lsp_completion = define_tool({
   },
   category = "lsp",
   permissions = { read = true },
-  approval = { behavior = "auto_approve" },
+  approval = { auto_allow = true },
 })
 
 -- ============================================================================
@@ -4205,7 +4205,7 @@ M.lsp_type_definition = define_tool({
   },
   category = "lsp",
   permissions = { read = true },
-  approval = { behavior = "auto_approve" },
+  approval = { auto_allow = true },
 })
 
 -- 刷新延迟清理队列：执行所有暂存的 cleanup 函数并清空队列
@@ -4303,7 +4303,7 @@ M.lsp_service_info = define_tool({
   },
   category = "lsp",
   permissions = { read = true },
-  approval = { behavior = "auto_approve" },
+  approval = { auto_allow = true },
 })
 
 -- 导出初始化信息供外部使用

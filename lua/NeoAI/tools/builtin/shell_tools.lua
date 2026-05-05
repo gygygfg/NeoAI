@@ -1839,7 +1839,7 @@ M.run_command = define_tool({
   },
   category = "system",
   permissions = { execute = true },
-  approval = { behavior = "require_user" },
+  approval = { auto_allow = false },
 })
 
 -- ============================================================================

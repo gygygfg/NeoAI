@@ -106,6 +106,15 @@ local TYPE_CONSTRAINTS = {
       enabled = { type = "boolean" },
       builtin = { type = "boolean" },
       external = { type = "table" },
+      approval = {
+        type = "table",
+        fields = {
+          default_auto_allow = { type = "boolean" },
+          allowed_directories = { type = "table", free_form = true },
+          allowed_param_groups = { type = "table", free_form = true },
+          tool_overrides = { type = "table", free_form = true },
+        },
+      },
     },
   },
   log = {
