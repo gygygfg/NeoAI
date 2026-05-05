@@ -1798,7 +1798,7 @@ M.run_command = define_tool({
         type = "number",
         description = "超时时间（秒），-1 表示无限等待（启动 AI 循环检测是否卡住），默认 30 秒",
         default = 30,
-      }
+      },
       cwd = {
         type = "string",
         description = "工作目录，默认为当前 Neovim 工作目录",
