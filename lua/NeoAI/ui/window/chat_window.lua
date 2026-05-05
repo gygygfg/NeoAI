@@ -155,6 +155,11 @@ local state = {
     pending = false,
     timer = nil,
   },
+
+  -- 光标跟随标志（存储在模块级 state 表，避免协程共享表跨协程访问问题）
+  -- true: 光标在末尾附近（后5行内），新内容写入时应自动跟随
+  -- false: 光标不在末尾附近，不跟随
+  should_follow = true,
 }
 
 -- ========== 依赖 state 的辅助函数 ==========
@@ -340,19 +345,19 @@ end
 --- 这样即使内容变化后 foldmethod=marker 改变了光标位置，也能正确判断是否应该跟随
 local function _check_cursor_near_end()
   if not state.current_window_id then
-    state_manager.set_shared("should_follow", false)
+    state.should_follow = false
     return false
   end
   local win = window_manager.get_window_win(state.current_window_id)
   if not win or not vim.api.nvim_win_is_valid(win) then
-    state_manager.set_shared("should_follow", false)
+    state.should_follow = false
     return false
   end
   local cursor = vim.api.nvim_win_get_cursor(win)
   local buf = vim.api.nvim_win_get_buf(win)
   local total = vim.api.nvim_buf_line_count(buf)
   local near_end = total - cursor[1] <= 5
-  state_manager.set_shared("should_follow", near_end)
+  state.should_follow = near_end
   return near_end
 end
 
@@ -361,7 +366,7 @@ end
 --- 插入空行前临时提高 foldlevel，防止 foldmethod=marker 将光标吸到折叠开始行
 --- 使用协程共享表 should_follow 判断是否应该跟随（在 buffer 内容变化前已缓存）
 local function _do_cursor_follow()
-  if not state_manager.get_shared_value("should_follow", true) then
+  if not state.should_follow then
     return
   end
   if not state.current_window_id then
@@ -411,7 +416,7 @@ local function _schedule_cursor_follow(delay_ms)
   if not state.current_window_id then
     return
   end
-  if not state_manager.get_shared_value("should_follow", true) then
+  if not state.should_follow then
     -- 光标不在后5行内（已在 buffer 内容变化前检测并缓存），不跟随
     return
   end
@@ -571,14 +576,22 @@ function M.open(session_id, window_id, branch_id)
     end
   end)
 
+  -- 设置光标移动监听（检测用户手动移动光标到非末尾位置时取消跟随）
+  M._setup_cursor_moved_listener()
+
   -- 触发窗口打开事件
   vim.api.nvim_exec_autocmds("User", { pattern = Events.WINDOW_OPENED, data = { window_id = window_id } })
 
   -- 设置按键映射
   M.set_keymaps()
 
-  -- 获取焦点
-  M._focus_window()
+  -- 获取焦点（仅在当前焦点不在其他非 NeoAI 窗口时聚焦）
+  local current_win = vim.api.nvim_get_current_win()
+  local current_buf = vim.api.nvim_win_get_buf(current_win)
+  local ok_ft, current_ft = pcall(vim.api.nvim_get_option_value, "filetype", { buf = current_buf })
+  if ok_ft and (current_ft == "neoai" or current_ft == "NeoAIInput") then
+    M._focus_window()
+  end
 
   -- 先显示一个简单的欢迎界面，让用户立即看到窗口
   local welcome_content = {
@@ -951,8 +964,8 @@ function M._apply_rendered_content(content)
     local buf = vim.api.nvim_win_get_buf(win_handle)
     local total_lines = vim.api.nvim_buf_line_count(buf)
     near_end = total_lines - cursor[1] <= 5
-    -- 更新协程共享缓存
-    state_manager.set_shared("should_follow", near_end)
+    -- 更新模块级 state 缓存
+    state.should_follow = near_end
   end
 
   -- 设置窗口内容
@@ -1299,10 +1312,20 @@ function M._open_float_input()
     return
   end
 
+  -- 检查当前焦点是否在 chat 窗口或输入框上
+  -- 如果焦点在其他非 NeoAI 窗口，打开输入框时不设置插入模式和焦点
+  local current_win = vim.api.nvim_get_current_win()
+  local current_buf = vim.api.nvim_win_get_buf(current_win)
+  local ok_ft, current_ft = pcall(vim.api.nvim_get_option_value, "filetype", { buf = current_buf })
+  local focus_on_chat = ok_ft and (current_ft == "neoai" or current_ft == "NeoAIInput" or current_win == win_handle)
+
+  -- 计算 auto_focus：光标在末尾附近 且 焦点在 chat 相关窗口
+  local auto_focus = state.should_follow and focus_on_chat
+
   -- 打开浮动虚拟输入框
   virtual_input.open(win_handle, {
     placeholder = "输入消息...",
-    auto_focus = state_manager.get_shared_value("should_follow", true),
+    auto_focus = auto_focus,
     on_submit = function(content)
       if content and content ~= "" then
         local chat_handlers_loaded, chat_handlers = pcall(require, "NeoAI.ui.handlers.chat_handlers")
@@ -2220,7 +2243,7 @@ function M._setup_event_listeners()
       M._update_usage_virt_text()
       -- 先主动检测光标位置，确保协程共享的 should_follow 是最新值
       _check_cursor_near_end()
-      if state_manager.get_shared_value("should_follow", true) then
+      if state.should_follow then
         -- 光标在末尾附近：执行跟随并打开输入框
         _do_cursor_follow()
         M._open_float_input()
@@ -2260,7 +2283,7 @@ function M._setup_event_listeners()
       M._update_usage_virt_text()
       -- 先主动检测光标位置，确保协程共享的 should_follow 是最新值
       _check_cursor_near_end()
-      if state_manager.get_shared_value("should_follow", true) then
+      if state.should_follow then
         -- 光标在末尾附近：执行跟随并打开输入框
         _do_cursor_follow()
         M._open_float_input()
@@ -2637,8 +2660,8 @@ function M._setup_event_listeners()
       -- 仅在光标在后5行内时才显示工具调用悬浮窗
       local win = get_win()
       local near_end = cursor_near_end(win)
-      -- 同步更新协程共享的 should_follow 缓存变量
-      state_manager.set_shared("should_follow", near_end)
+      -- 同步更新模块级 state.should_follow 缓存变量
+      state.should_follow = near_end
       if near_end then
         M._show_tool_display()
         -- 创建浮动窗口可能触发 WinNew/BufEnter 等自动命令，间接影响 chat 窗口的滚动位置
@@ -2923,7 +2946,7 @@ function M._setup_event_listeners()
       -- 这些事件的处理函数中也会尝试打开输入框，但 _open_float_input 内部有 is_active 检查，不会重复打开
       M._open_float_input()
       -- 仅在光标跟随模式开启（光标在末尾附近）时才聚焦输入框
-      if virtual_input.is_active() and state_manager.get_shared_value("should_follow", true) then
+      if virtual_input.is_active() and state.should_follow then
         virtual_input.focus_and_insert()
       end
     end,
@@ -3033,6 +3056,49 @@ function M._setup_event_listeners()
       end
     end,
     desc = "窗口大小变化时调整工具调用悬浮窗和虚拟输入框位置",
+  })
+end
+
+--- 设置光标移动监听
+--- 当用户在 chat 窗口中手动移动光标到非末尾位置时，取消自动光标跟随
+function M._setup_cursor_moved_listener()
+  -- 清理旧的自动命令组
+  if state.cursor_augroup then
+    pcall(vim.api.nvim_del_augroup_by_id, state.cursor_augroup)
+    state.cursor_augroup = nil
+  end
+
+  local win_handle = window_manager.get_window_win(state.current_window_id)
+  if not win_handle or not vim.api.nvim_win_is_valid(win_handle) then
+    return
+  end
+
+  local buf = vim.api.nvim_win_get_buf(win_handle)
+  if not buf or not vim.api.nvim_buf_is_valid(buf) then
+    return
+  end
+
+  state.cursor_augroup = vim.api.nvim_create_augroup("NeoAIChatCursorMoved", { clear = true })
+
+  vim.api.nvim_create_autocmd("CursorMoved", {
+    group = state.cursor_augroup,
+    buffer = buf,
+    callback = function()
+      -- 检查当前焦点是否在 chat 窗口
+      local current_win = vim.api.nvim_get_current_win()
+      if current_win ~= win_handle then
+        return
+      end
+
+      -- 检测光标是否在末尾附近（后5行内）
+      local cursor = vim.api.nvim_win_get_cursor(win_handle)
+      local total = vim.api.nvim_buf_line_count(buf)
+      local near_end = total - cursor[1] <= 5
+
+      -- 更新模块级 state 缓存
+      state.should_follow = near_end
+    end,
+    desc = "检测用户手动移动光标位置，更新光标跟随状态",
   })
 end
 
@@ -3883,10 +3949,9 @@ M._do_cursor_follow = _do_cursor_follow
 M._check_cursor_near_end = _check_cursor_near_end
 
 --- 设置光标跟随缓存变量（供 virtual_input 等外部模块调用）
---- 通过协程共享表写入，确保协程间隔离
 --- @param should boolean 是否应该跟随
 function M._set_cursor_follow_should(should)
-  state_manager.set_shared("should_follow", should)
+  state.should_follow = should
 end
 
 return M

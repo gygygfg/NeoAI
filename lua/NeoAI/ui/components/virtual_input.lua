@@ -893,6 +893,16 @@ function M.focus_and_insert()
     return
   end
 
+  -- 检查当前焦点是否在 chat 窗口或输入框上
+  -- 如果焦点在其他非 NeoAI 窗口，不抢焦点
+  local current_win = vim.api.nvim_get_current_win()
+  local current_buf = vim.api.nvim_win_get_buf(current_win)
+  local ok_ft, current_ft = pcall(vim.api.nvim_get_option_value, "filetype", { buf = current_buf })
+  local is_neoai_focused = ok_ft and (current_ft == "neoai" or current_ft == "NeoAIInput" or current_win == state.parent_win)
+  if not is_neoai_focused then
+    return
+  end
+
   -- 延迟聚焦，确保在异步回调（如 _do_render_chat 的 set_window_content）执行完后才设置焦点
   vim.defer_fn(function()
     if not state.float_win or not vim.api.nvim_win_is_valid(state.float_win) then
@@ -900,6 +910,14 @@ function M.focus_and_insert()
     end
     -- 再次检查，因为延迟期间用户可能又按了 <Esc>
     if state._user_exited_insert then
+      return
+    end
+    -- 再次检查焦点，因为延迟期间用户可能切换到了其他窗口
+    local current_win2 = vim.api.nvim_get_current_win()
+    local current_buf2 = vim.api.nvim_win_get_buf(current_win2)
+    local ok_ft2, current_ft2 = pcall(vim.api.nvim_get_option_value, "filetype", { buf = current_buf2 })
+    local is_neoai_focused2 = ok_ft2 and (current_ft2 == "neoai" or current_ft2 == "NeoAIInput" or current_win2 == state.parent_win)
+    if not is_neoai_focused2 then
       return
     end
     pcall(vim.api.nvim_set_current_win, state.float_win)
