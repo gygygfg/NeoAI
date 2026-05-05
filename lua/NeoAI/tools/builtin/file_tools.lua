@@ -454,7 +454,6 @@ M.read_file = define_tool({
   returns = { type = "string", description = "带行号的文件内容" },
   category = "file",
   permissions = { read = true },
-  approval = { auto_allow = true },
 })
 
 -- ============================================================================
@@ -810,7 +809,6 @@ M.list_files = define_tool({
   returns = { type = "array", items = { type = "string" }, description = "文件路径列表" },
   category = "file",
   permissions = { read = true },
-  approval = { auto_allow = true },
 })
 
 -- ============================================================================
@@ -1019,7 +1017,6 @@ M.search_files = define_tool({
   },
   category = "file",
   permissions = { read = true },
-  approval = { auto_allow = true },
 })
 
 -- ============================================================================
@@ -1111,7 +1108,6 @@ M.file_exists = define_tool({
   },
   category = "file",
   permissions = { read = true },
-  approval = { auto_allow = true },
 })
 
 -- ============================================================================

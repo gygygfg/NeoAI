@@ -473,7 +473,6 @@ M.parse_file = define_tool({
   },
   category = "treesitter",
   permissions = { read = true },
-  approval = { auto_allow = true },
 })
 
 -- ============================================================================
@@ -599,7 +598,6 @@ M.query_tree = define_tool({
   },
   category = "treesitter",
   permissions = { read = true },
-  approval = { auto_allow = true },
 })
 
 -- ============================================================================
@@ -755,7 +753,6 @@ M.get_node_at_position = define_tool({
   },
   category = "treesitter",
   permissions = { read = true },
-  approval = { auto_allow = true },
 })
 
 -- ============================================================================
@@ -849,7 +846,6 @@ M.get_node_type = define_tool({
   returns = { type = "object", description = "匹配节点的类型信息列表" },
   category = "treesitter",
   permissions = { read = true },
-  approval = { auto_allow = true },
 })
 
 -- ============================================================================
@@ -976,7 +972,6 @@ M.get_node_range = define_tool({
   returns = { type = "object", description = "匹配节点的范围信息列表" },
   category = "treesitter",
   permissions = { read = true },
-  approval = { auto_allow = true },
 })
 
 -- ============================================================================
@@ -1021,7 +1016,6 @@ M.is_named_node = define_tool({
   returns = { type = "object", description = "匹配节点的命名状态信息" },
   category = "treesitter",
   permissions = { read = true },
-  approval = { auto_allow = true },
 })
 
 -- ============================================================================
@@ -1139,7 +1133,6 @@ M.get_parent_node = define_tool({
   returns = { type = "object", description = "匹配节点的父节点信息" },
   category = "treesitter",
   permissions = { read = true },
-  approval = { auto_allow = true },
 })
 
 -- ============================================================================
@@ -1206,7 +1199,6 @@ M.get_child_nodes = define_tool({
   returns = { type = "object", description = "匹配父节点的子节点列表" },
   category = "treesitter",
   permissions = { read = true },
-  approval = { auto_allow = true },
 })
 
 -- get_tools() - 返回所有工具列表供注册

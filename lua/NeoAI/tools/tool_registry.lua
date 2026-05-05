@@ -2,6 +2,7 @@
 -- 提供工具的注册、管理、查询等功能
 
 local logger = require("NeoAI.utils.logger")
+local approval_state = require("NeoAI.tools.approval_state")
 local M = {}
 
 local tools = {}
@@ -41,7 +42,10 @@ end
 -- ========== 审批配置管理 ==========
 
 --- 获取工具的审批配置
---- 合并工具自身定义的审批设置和全局默认配置
+--- 优先级：
+---   1. approval_state 运行时配置（由 approval_config_editor 写入，所有模块共享）
+---   2. 工具自身定义的审批设置（注册时的 approval 字段）
+---   3. 全局默认配置
 --- 工具注册时可通过 approval 字段自定义：
 ---   approval.auto_allow - true（自动允许）或 false（需要用户审批）
 ---   approval.allowed_directories - 允许的目录列表
@@ -50,6 +54,13 @@ end
 --- @return table 审批配置 { auto_allow, allowed_directories, allowed_param_groups }
 function M.get_approval_config(tool_name)
   guard()
+
+  -- 优先级1：approval_state 运行时配置（所有模块共享同一变量）
+  local runtime_config = approval_state.get_tool_config(tool_name)
+  if runtime_config then
+    return vim.deepcopy(runtime_config)
+  end
+
   local tool = tools[tool_name]
   if not tool then
     -- 工具不存在时，返回全局默认配置
@@ -67,7 +78,7 @@ function M.get_approval_config(tool_name)
     return result
   end
 
-  -- 合并工具自定义审批配置和全局默认配置
+  -- 优先级2：合并工具自定义审批配置和全局默认配置
   local tool_approval = tool.approval or {}
   local config_approval = state.config.approval or {}
 

@@ -678,7 +678,8 @@ function M._bind_chat_keymaps_to_float(buf)
     {
       key = chat_config.tool_approval.key,
       action = function()
-        chat_window._open_tool_approval()
+        local ace = require("NeoAI.ui.components.approval_config_editor")
+        ace.open()
       end,
       modes = { "n" },
     },

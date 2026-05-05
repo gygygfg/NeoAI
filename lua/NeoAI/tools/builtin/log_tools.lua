@@ -56,7 +56,6 @@ M.log_message = define_tool({
   returns = { type = "boolean", description = "是否记录成功" },
   category = "log",
   permissions = {},
-  approval = { auto_allow = true },
 })
 
 -- ============================================================================
@@ -83,7 +82,6 @@ M.get_log_levels = define_tool({
   },
   category = "log",
   permissions = {},
-  approval = { auto_allow = true },
 })
 
 -- get_tools() - 返回所有工具列表供注册

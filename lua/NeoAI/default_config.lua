@@ -256,7 +256,7 @@ local DEFAULT_CONFIG = {
     -- 各工具可通过 tool_overrides 单独覆盖
     approval = {
       -- 默认是否自动允许（当工具未设置 auto_allow 时使用）
-      default_auto_allow = true,
+      default_auto_allow = false,
       -- 默认允许的目录列表（所有工具共享）
       allowed_directories = {},
       -- 默认允许的参数组（参数名 -> 允许的值列表）
@@ -265,8 +265,53 @@ local DEFAULT_CONFIG = {
       -- 键为工具名称，值为覆盖配置
       -- 支持字段：auto_allow, allowed_directories, allowed_param_groups
       --   auto_allow: true 表示自动允许（跳过审批窗口），false 表示需要用户审批
-      tool_overrides = {},
-    }
+      tool_overrides = {
+        -- ===== file_tools.lua =====
+        read_file = { auto_allow = true },
+        write_file = { auto_allow = false },
+        list_files = { auto_allow = true },
+        search_files = { auto_allow = true },
+        file_exists = { auto_allow = true },
+        create_directory = { auto_allow = false },
+        ensure_dir = { auto_allow = false },
+        delete_file = { auto_allow = false },
+
+        -- ===== log_tools.lua =====
+        log_message = { auto_allow = true },
+        get_log_levels = { auto_allow = true },
+
+        -- ===== neovim_tree.lua =====
+        parse_file = { auto_allow = true },
+        query_tree = { auto_allow = true },
+        get_node_at_position = { auto_allow = true },
+        get_node_type = { auto_allow = true },
+        get_node_range = { auto_allow = true },
+        is_named_node = { auto_allow = true },
+        get_parent_node = { auto_allow = true },
+        get_child_nodes = { auto_allow = true },
+
+        -- ===== neovim_lsp.lua =====
+        lsp_hover = { auto_allow = true },
+        lsp_definition = { auto_allow = true },
+        lsp_references = { auto_allow = true },
+        lsp_implementation = { auto_allow = true },
+        lsp_declaration = { auto_allow = true },
+        lsp_document_symbols = { auto_allow = true },
+        lsp_workspace_symbols = { auto_allow = true },
+        lsp_code_action = { auto_allow = true },
+        lsp_rename = { auto_allow = false },
+        lsp_format = { auto_allow = false },
+        lsp_diagnostics = { auto_allow = true },
+        lsp_client_info = { auto_allow = true },
+        lsp_signature_help = { auto_allow = true },
+        lsp_completion = { auto_allow = true },
+        lsp_type_definition = { auto_allow = true },
+        lsp_service_info = { auto_allow = true },
+
+        -- ===== shell_tools.lua =====
+        run_command = { auto_allow = false },
+      },
+    },
   },
   -- 日志配置
   log = {

@@ -18,7 +18,7 @@ local event_constants = require("NeoAI.core.events")
 local tool_pack = require("NeoAI.tools.tool_pack")
 local shutdown_flag = require("NeoAI.core.shutdown_flag")
 local response_retry = require("NeoAI.core.ai.response_retry")
-
+local state_manager = require("NeoAI.core.config.state")
 
 -- ========== 状态 ==========
 
@@ -100,50 +100,6 @@ local function fire_loop_finished(ss)
           iteration_count = ss.current_iteration,
           session_id = ss.session_id,
           window_id = ss.window_id,
-        },
-      })
-    end)
-  end
-end
-
---- 触发 TOOL_LOOP_STARTED 事件
---- 使用 pcall 保护，避免在 fast event 上下文中调用失败
-local function fire_loop_started(ss, tool_calls)
-  if not ss then
-    return
-  end
-  -- 检查 Neovim 是否正在退出
-  if is_shutting_down() then
-    return
-  end
-
-  local ok, err = pcall(vim.api.nvim_exec_autocmds, "User", {
-    pattern = event_constants.TOOL_LOOP_STARTED,
-    data = {
-      generation_id = ss.generation_id,
-      tool_calls = tool_calls or {},
-      session_id = ss.session_id,
-      window_id = ss.window_id,
-      iteration = ss.current_iteration,
-    },
-  })
-  if not ok then
-    if is_shutting_down() then
-      return
-    end
-
-    vim.schedule(function()
-      if is_shutting_down() then
-        return
-      end
-      pcall(vim.api.nvim_exec_autocmds, "User", {
-        pattern = event_constants.TOOL_LOOP_STARTED,
-        data = {
-          generation_id = ss.generation_id,
-          tool_calls = tool_calls or {},
-          session_id = ss.session_id,
-          window_id = ss.window_id,
-          iteration = ss.current_iteration,
         },
       })
     end)
@@ -344,7 +300,6 @@ end
 -- 使用 local 声明，确保在闭包内私有
 local _stop_listener_id = nil
 
-
 function M.start_async_loop(params)
   if not params then
     return
@@ -358,40 +313,30 @@ function M.start_async_loop(params)
     return
   end
 
+  -- 通过闭包捕获当前协程上下文（如果存在），供后续工具执行路径使用
+  -- 工具执行路径（_execute_tools → _execute_single_tool → execute_async）
+  -- 通过 vim.schedule 调度，不在协程上下文中，因此需要手动恢复
+  local coroutine_ctx = state_manager.get_current_context()
+
   local session_id = params.session_id
   local window_id = params.window_id
-
-  -- 从协程共享表读取数据（如果存在）
-  local shared = state_manager.get_shared()
-  if shared then
-    session_id = session_id or shared.session_id
-    window_id = window_id or shared.window_id
-  end
 
   if not state.sessions[session_id] then
     M.register_session(session_id, window_id)
   end
 
   local ss = state.sessions[session_id]
-  ss.generation_id = params.generation_id or shared.generation_id
+  ss.generation_id = params.generation_id
   ss.current_iteration = 0
   ss.stop_requested = false
-  ss.messages = params.messages or shared.messages or {}
-  ss.options = params.options or shared.options or {}
-  ss.model_index = params.model_index or shared.model_index or 1
-  ss.ai_preset = params.ai_preset or shared.ai_preset or {}
+  ss.messages = params.messages or {}
+  ss.options = params.options or {}
+  ss.model_index = params.model_index or 1
+  ss.ai_preset = params.ai_preset or {}
   ss.on_complete = params.on_complete
   ss.accumulated_usage = {}
   ss.last_reasoning = nil
-
-  -- 更新 shared 表
-  shared.session_id = session_id
-  shared.window_id = window_id
-  shared.generation_id = ss.generation_id
-  shared.messages = ss.messages
-  shared.options = ss.options
-  shared.model_index = ss.model_index
-  shared.ai_preset = ss.ai_preset
+  ss._coroutine_ctx = coroutine_ctx -- 保存协程上下文，供工具执行路径恢复
 
   ss.current_iteration = 1
   ss._tool_retry_count = 0 -- 新循环开始时重置重试计数
@@ -486,12 +431,6 @@ function M._execute_single_tool(session_id, tool_call)
     return
   end
 
-  -- 从 shared 表同步 stop_requested
-  local shared = state_manager.get_shared()
-  if shared.stop_requested then
-    ss.stop_requested = true
-  end
-
   -- 如果已请求停止，跳过工具执行
   if ss.stop_requested then
     return
@@ -499,7 +438,9 @@ function M._execute_single_tool(session_id, tool_call)
 
   local tool_func = tool_call["function"] or tool_call.func
   if not tool_func then
-    logger.warn("[tool_orchestrator] _execute_single_tool: tool_call 缺少 function 字段, tool_call=" .. vim.inspect(tool_call))
+    logger.warn(
+      "[tool_orchestrator] _execute_single_tool: tool_call 缺少 function 字段, tool_call=" .. vim.inspect(tool_call)
+    )
     return
   end
 
@@ -514,7 +455,8 @@ function M._execute_single_tool(session_id, tool_call)
     M._tool_call_counter = 0
   end
   M._tool_call_counter = M._tool_call_counter + 1
-  local tool_call_id = tool_call.id or ("call_" .. os.time() .. "_" .. M._tool_call_counter .. "_" .. math.random(10000, 99999))
+  local tool_call_id = tool_call.id
+    or ("call_" .. os.time() .. "_" .. M._tool_call_counter .. "_" .. math.random(10000, 99999))
   tool_call.id = tool_call_id
   ss.active_tool_calls[tool_call_id] = true
 
@@ -525,7 +467,11 @@ function M._execute_single_tool(session_id, tool_call)
   -- 参数规范化、URL 解码、别名映射、超时管理全部由 tool_executor 负责
   local tool_executor = require("NeoAI.tools.tool_executor")
 
-  tool_executor.execute_with_orchestrator(tool_name, tool_func.arguments, {
+  -- 在协程上下文中执行工具（如果存在保存的协程上下文）
+  -- 确保 tool_validator.check_approval → approval_handler.is_allow_all
+  -- 能正确读取当前协程的共享变量
+  local execute_fn = function()
+    tool_executor.execute_with_orchestrator(tool_name, tool_func.arguments, {
     session_id = session_id,
     window_id = ss.window_id,
     generation_id = ss.generation_id,
@@ -557,6 +503,13 @@ function M._execute_single_tool(session_id, tool_call)
       end
     end,
   })
+  end
+
+  if ss._coroutine_ctx then
+    state_manager.with_context(ss._coroutine_ctx, execute_fn)
+  else
+    execute_fn()
+  end
 end
 
 -- ========== 完成检查 ==========
@@ -585,10 +538,9 @@ function M._on_tools_complete(session_id)
     -- 用户取消或跳过总结时，触发 GENERATION_COMPLETED 事件显示用量，然后直接结束
     if ss.user_cancelled then
       -- 触发 GENERATION_COMPLETED 事件显示用量信息
-      local shared = state_manager.get_shared()
       local saved_usage = ss.accumulated_usage or {}
-      local saved_gen_id = ss.generation_id or shared.generation_id
-      local saved_win_id = ss.window_id or shared.window_id
+      local saved_gen_id = ss.generation_id
+      local saved_win_id = ss.window_id
       local saved_reasoning = ss.last_reasoning or ""
       fire_loop_finished(ss)
       once_display_closed(session_id, function()
@@ -742,7 +694,9 @@ function M._proceed_to_next_round(session_id)
       local saved_result = ""
       if not is_shutting_down() then
         vim.schedule(function()
-          if is_shutting_down() then return end
+          if is_shutting_down() then
+            return
+          end
           pcall(vim.api.nvim_exec_autocmds, "User", {
             pattern = event_constants.GENERATION_COMPLETED,
             data = {
@@ -1220,7 +1174,9 @@ function M._finish_loop(session_id, success, result)
     if ss._skip_summary then
       if not is_shutting_down() then
         vim.schedule(function()
-          if is_shutting_down() then return end
+          if is_shutting_down() then
+            return
+          end
           pcall(vim.api.nvim_exec_autocmds, "User", {
             pattern = event_constants.GENERATION_COMPLETED,
             data = {
@@ -1257,7 +1213,9 @@ function M._finish_loop(session_id, success, result)
     ss._summary_in_progress = false
     if not is_shutting_down() then
       vim.schedule(function()
-        if is_shutting_down() then return end
+        if is_shutting_down() then
+          return
+        end
         pcall(vim.api.nvim_exec_autocmds, "User", {
           pattern = event_constants.GENERATION_COMPLETED,
           data = {
@@ -1312,7 +1270,6 @@ function M.request_stop(session_id)
           M._on_tools_complete(session_id)
         end)
       end
-
     end
   else
     for sid, _ in pairs(state.sessions) do
@@ -1555,15 +1512,39 @@ function M.execute_single_tool_request(session_id, tool_name, args, callback)
 
   -- 根据最后一行内容推断输入类型
   local input_guidance = ""
-  if last_line:match("[Yy]es/[Nn]o") or last_line:match("[Yy]/[Nn]") or last_line:match("%%[Y/n%%]") or last_line:match("%%[y/N%%]") then
+  if
+    last_line:match("[Yy]es/[Nn]o")
+    or last_line:match("[Yy]/[Nn]")
+    or last_line:match("%%[Y/n%%]")
+    or last_line:match("%%[y/N%%]")
+  then
     input_guidance = "\n提示：命令正在询问 yes/no 确认，请根据上下文输入 'y' 或 'n'。"
   elseif last_line:match("[Pp]assword:") or last_line:match("密码:") then
     input_guidance = "\n提示：命令正在询问密码，请输入密码。"
-  elseif last_line:match("[Ss]elect") or last_line:match("[Cc]hoose") or last_line:match("[Oo]ption") or last_line:match("[Nn]umber") or last_line:match("#%?[%s]*$") then
-    input_guidance = "\n提示：命令正在显示菜单选项，请根据选项列表输入对应的编号或关键字。"
-  elseif last_line:match("[Ee]nter your") or last_line:match("[Ii]nput your") or last_line:match("[Pp]lease enter") or last_line:match("[Pp]lease input") or last_line:match("请输入") then
-    input_guidance = "\n提示：命令正在要求输入文本内容（如用户名、名称等），请输入合适的文本。"
-  elseif last_line:match("[Cc]ontinue") or last_line:match("[Pp]ress any key") or last_line:match("[Pp]ress Enter") or last_line:match("按 Enter 键继续") then
+  elseif
+    last_line:match("[Ss]elect")
+    or last_line:match("[Cc]hoose")
+    or last_line:match("[Oo]ption")
+    or last_line:match("[Nn]umber")
+    or last_line:match("#%?[%s]*$")
+  then
+    input_guidance =
+      "\n提示：命令正在显示菜单选项，请根据选项列表输入对应的编号或关键字。"
+  elseif
+    last_line:match("[Ee]nter your")
+    or last_line:match("[Ii]nput your")
+    or last_line:match("[Pp]lease enter")
+    or last_line:match("[Pp]lease input")
+    or last_line:match("请输入")
+  then
+    input_guidance =
+      "\n提示：命令正在要求输入文本内容（如用户名、名称等），请输入合适的文本。"
+  elseif
+    last_line:match("[Cc]ontinue")
+    or last_line:match("[Pp]ress any key")
+    or last_line:match("[Pp]ress Enter")
+    or last_line:match("按 Enter 键继续")
+  then
     input_guidance = "\n提示：命令正在等待按任意键继续，请直接发送空字符串或按 Enter。"
   elseif last_line:match("> %s*$") or last_line:match(": %s*$") or last_line:match("#?%s*$") then
     input_guidance = "\n提示：命令正在等待输入，请根据上下文输入合适的内容。"
@@ -1575,11 +1556,11 @@ function M.execute_single_tool_request(session_id, tool_name, args, callback)
       "你正在与一个交互式 shell 命令交互。命令当前正在等待输入。\n"
         .. "执行的命令: %s\n\n"
         .. "请仔细分析命令当前输出的**最后一行**，它指示了需要输入的内容类型。\n"
-        .. "1. 如果最后一行是 \"请输入你的名字:\"、\"Enter your name:\" 等，输入对应的文本内容（如用户名）\n"
+        .. '1. 如果最后一行是 "请输入你的名字:"、"Enter your name:" 等，输入对应的文本内容（如用户名）\n'
         .. "2. 如果最后一行是 \"y/n\"、\"Yes/No\" 等，输入 'y' 或 'n'\n"
-        .. "3. 如果最后一行是 \"Password:\" 或包含 \"密码\"，输入密码\n"
-        .. "4. 如果最后一行是菜单选项（如 \"#?\"、\"Select\"），根据选项列表输入对应的编号\n"
-        .. "5. 如果最后一行包含 \"按 Enter 键继续\"、\"Press Enter\" 等，发送 '<enter>' 即可（只发送回车键）\n"
+        .. '3. 如果最后一行是 "Password:" 或包含 "密码"，输入密码\n'
+        .. '4. 如果最后一行是菜单选项（如 "#?"、"Select"），根据选项列表输入对应的编号\n'
+        .. '5. 如果最后一行包含 "按 Enter 键继续"、"Press Enter" 等，发送 \'<enter>\' 即可（只发送回车键）\n'
         .. "6. 如果需要选择菜单项（如上下方向键），使用 '<up>'、'<down>'、'<enter>' 等特殊按键标记\n"
         .. "7. 如果需要中断命令（如 Ctrl+C），发送 '<ctrl_c>'\n"
         .. "8. 如果命令已执行完毕或不需要继续执行，请调用 %s 工具并设置 stop=true 来终止进程\n\n"
@@ -1613,8 +1594,15 @@ function M.execute_single_tool_request(session_id, tool_name, args, callback)
   local registered_tool = tool_registry.get(tool_name)
 
   if registered_tool then
-    local tf = { name = registered_tool.name, description = registered_tool.description or ("执行 " .. registered_tool.name .. " 操作") }
-    if registered_tool.parameters and type(registered_tool.parameters) == "table" and registered_tool.parameters.properties then
+    local tf = {
+      name = registered_tool.name,
+      description = registered_tool.description or ("执行 " .. registered_tool.name .. " 操作"),
+    }
+    if
+      registered_tool.parameters
+      and type(registered_tool.parameters) == "table"
+      and registered_tool.parameters.properties
+    then
       -- 复制 properties 并移除 fixed_args 中的字段（不暴露给 AI）
       local filtered_properties = {}
       for k, v in pairs(registered_tool.parameters.properties) do
@@ -1623,7 +1611,11 @@ function M.execute_single_tool_request(session_id, tool_name, args, callback)
         end
       end
       local cp = { type = "object", properties = filtered_properties }
-      if registered_tool.parameters.required and type(registered_tool.parameters.required) == "table" and #registered_tool.parameters.required > 0 then
+      if
+        registered_tool.parameters.required
+        and type(registered_tool.parameters.required) == "table"
+        and #registered_tool.parameters.required > 0
+      then
         -- 同样过滤 required 中的 fixed_args 字段
         local filtered_required = {}
         for _, field in ipairs(registered_tool.parameters.required) do
@@ -1729,9 +1721,14 @@ function M.execute_single_tool_request(session_id, tool_name, args, callback)
   -- 调试日志：输出最终请求的 model 和 thinking 状态
   local thinking_status = "unknown"
   if request.extra_body and request.extra_body.thinking then
-    thinking_status = type(request.extra_body.thinking) == "table" and (request.extra_body.thinking.type or "no_type") or tostring(request.extra_body.thinking)
+    thinking_status = type(request.extra_body.thinking) == "table" and (request.extra_body.thinking.type or "no_type")
+      or tostring(request.extra_body.thinking)
   end
-  logger.debug("[tool_orchestrator] execute_single_tool_request 最终请求: model=%s, thinking.type=%s", request.model or "nil", thinking_status)
+  logger.debug(
+    "[tool_orchestrator] execute_single_tool_request 最终请求: model=%s, thinking.type=%s",
+    request.model or "nil",
+    thinking_status
+  )
 
   -- 如果调用方要求禁用思考模式，传递标记
   if args and args._disable_reasoning then
@@ -1761,7 +1758,14 @@ function M.execute_single_tool_request(session_id, tool_name, args, callback)
         -- 自动重试（最多 3 次）
         if retry_count < max_retries then
           retry_count = retry_count + 1
-          logger.warn("[tool_orchestrator] execute_single_tool_request 请求失败 (重试 %d/%d): %s | request_model=%s | request_messages_count=%d", retry_count, max_retries, tostring(err), request.model or "nil", request.messages and #request.messages or 0)
+          logger.warn(
+            "[tool_orchestrator] execute_single_tool_request 请求失败 (重试 %d/%d): %s | request_model=%s | request_messages_count=%d",
+            retry_count,
+            max_retries,
+            tostring(err),
+            request.model or "nil",
+            request.messages and #request.messages or 0
+          )
           vim.defer_fn(do_request, retry_delay_ms)
           return
         end
@@ -1775,7 +1779,11 @@ function M.execute_single_tool_request(session_id, tool_name, args, callback)
         -- 自动重试
         if retry_count < max_retries then
           retry_count = retry_count + 1
-          logger.warn("[tool_orchestrator] execute_single_tool_request 响应无效 (重试 %d/%d)", retry_count, max_retries)
+          logger.warn(
+            "[tool_orchestrator] execute_single_tool_request 响应无效 (重试 %d/%d)",
+            retry_count,
+            max_retries
+          )
           vim.defer_fn(do_request, retry_delay_ms)
           return
         end

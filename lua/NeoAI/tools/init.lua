@@ -142,6 +142,13 @@ function M._load_builtin_tools()
   if tp_ok and tp.initialize then
     tp.initialize()
   end
+
+  -- 重新应用审批配置覆盖
+  -- 此时所有内置工具均已注册，确保用户配置的 tool_overrides 生效
+  if full_config and full_config.tools and full_config.tools.approval then
+    local tr = require("NeoAI.tools.tool_registry")
+    pcall(tr.apply_approval_config, full_config)
+  end
 end
 
 function M._load_external_tools(external_tools)

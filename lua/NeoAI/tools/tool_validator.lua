@@ -32,11 +32,10 @@ end
 --- 检查工具调用是否需要用户审批
 --- 返回审批结果，包含是否需要用户确认、以及审批原因
 ---
---- 审批流程：
----   1. 获取工具的审批配置（来自 tool_registry.get_approval_config）
----   2. 检查 auto_allow：true 则自动通过
----   3. 检查参数是否在允许的参数组内
----   4. 检查文件路径是否在允许的目录内
+--- 审批流程（三个条件平级）：
+---   1. 允许所有：用户已选择"允许所有"，直接跳过所有检查
+---   2. 路径安全 AND 参数安全：路径和参数都在安全范围内，无需弹窗
+---   3. 路径或参数不安全：根据 auto_allow 配置决定是否弹窗
 ---
 --- @param tool_name string 工具名称
 --- @param args table 工具参数
@@ -51,20 +50,22 @@ function M.check_approval(tool_name, args, tool_registry)
     return { approved = true, reason = "工具名称为空，默认通过", auto_allow = true }
   end
 
-  -- 获取审批配置
-  local approval_config = nil
-  if tool_registry and tool_registry.get_approval_config then
-    local ok_config, config_result = pcall(function()
-      return tool_registry.get_approval_config(tool_name)
-    end)
-    if ok_config then
-      approval_config = config_result
-    else
-      logger.warn("[tool_validator] check_approval: get_approval_config 失败: %s", tostring(config_result))
-    end
+  -- ===== 条件1：允许所有（覆盖一切） =====
+  local approval_handler = require("NeoAI.tools.approval_handler")
+  if approval_handler.is_allow_all(tool_name) then
+    return {
+      approved = true,
+      reason = string.format("工具 '%s' 已被用户允许所有（当前会话）", tool_name),
+      auto_allow = true,
+    }
   end
 
-  if not approval_config then
+  -- 获取审批配置（tool_registry.get_approval_config 已优先从 approval_state 读取）
+  local ok_config, approval_config = pcall(function()
+    return tool_registry.get_approval_config(tool_name)
+  end)
+  if not ok_config or not approval_config then
+    logger.warn("[tool_validator] check_approval: get_approval_config 失败: %s", tostring(approval_config))
     return { approved = true, reason = "无审批配置，默认通过", auto_allow = true }
   end
 
@@ -75,20 +76,18 @@ function M.check_approval(tool_name, args, tool_registry)
   local allowed_dirs = approval_config.allowed_directories or {}
   local allowed_param_groups = approval_config.allowed_param_groups or {}
 
-  -- 如果 auto_allow 为 true，直接通过（跳过审批窗口）
-  -- 注意：即使 auto_allow=true，仍会执行参数安全检查（目录、参数组检查）
-  -- 安全检查不通过时，返回 approved=false 强制要求用户确认
-
   -- 获取工具定义，用于检查参数 schema
   local tool = nil
   if tool_registry and tool_registry.get then
     tool = tool_registry.get(tool_name)
   end
 
-  -- 检查文件路径参数是否在允许的目录内
+  -- ===== 条件2：路径安全检查 =====
+  local path_safe = true
+  local path_violation = nil
+
   if tool and tool.parameters and tool.parameters.properties then
     for param_name, param_schema in pairs(tool.parameters.properties) do
-      -- 检查文件路径类型的参数
       if
         param_schema.type == "string"
         and (param_name:match("file") or param_name:match("dir") or param_name:match("path"))
@@ -96,16 +95,13 @@ function M.check_approval(tool_name, args, tool_registry)
         local param_value = args and args[param_name]
         if param_value and type(param_value) == "string" then
           if not M._is_path_in_allowed_dirs(param_value, allowed_dirs, tool_registry) then
-            return {
-              approved = false,
-              reason = string.format("参数 '%s' 的值 '%s' 不在允许的目录内", param_name, param_value),
-              auto_allow = false,
-            }
+            path_safe = false
+            path_violation = string.format("参数 '%s' 的值 '%s' 不在允许的目录内", param_name, param_value)
+            break
           end
         end
       end
 
-      -- 检查 files 数组参数中的 filepath 字段
       if param_schema.type == "array" and param_schema.items and param_schema.items.properties then
         local param_value = args and args[param_name]
         if param_value and type(param_value) == "table" then
@@ -114,57 +110,69 @@ function M.check_approval(tool_name, args, tool_registry)
               local filepath = item.filepath or item.dir or item.path
               if filepath and type(filepath) == "string" then
                 if not M._is_path_in_allowed_dirs(filepath, allowed_dirs, tool_registry) then
-                  return {
-                    approved = false,
-                    reason = string.format(
-                      "参数 '%s' 中的路径 '%s' 不在允许的目录内",
-                      param_name,
-                      filepath
-                    ),
-                    auto_allow = false,
-                  }
+                  path_safe = false
+                  path_violation = string.format(
+                    "参数 '%s' 中的路径 '%s' 不在允许的目录内",
+                    param_name,
+                    filepath
+                  )
+                  break
                 end
               end
             end
           end
+          if not path_safe then break end
         end
       end
     end
   end
 
-  -- 检查参数是否在允许的参数组内
+  -- ===== 条件3：参数安全检查 =====
+  local param_safe = true
+  local param_violation = nil
+
   if args and next(allowed_param_groups) then
     for param_name, param_value in pairs(args) do
       if allowed_param_groups[param_name] then
         local allowed_values = allowed_param_groups[param_name]
         if type(allowed_values) == "table" and not vim.tbl_contains(allowed_values, param_value) then
-          return {
-            approved = false,
-            reason = string.format(
-              "参数 '%s' 的值 '%s' 不在允许的值列表中",
-              param_name,
-              tostring(param_value)
-            ),
-            auto_allow = false,
-          }
+          param_safe = false
+          param_violation = string.format(
+            "参数 '%s' 的值 '%s' 不在允许的值列表中",
+            param_name,
+            tostring(param_value)
+          )
+          break
         end
       end
     end
   end
 
-  -- 所有检查通过
-  if auto_allow then
-    return {
-      approved = true,
-      reason = string.format("工具 '%s' 配置为自动允许", tool_name),
-      auto_allow = true,
-    }
+  -- ===== 综合判断 =====
+  -- 条件1（允许所有）已在最前面提前返回
+  -- 条件2（路径安全）和条件3（参数安全）都满足时，尊重 approval_config.auto_allow 配置
+  -- 即使用户配置了 auto_allow = false（需要审批），路径/参数安全也不应跳过审批
+  if path_safe and param_safe then
+    if auto_allow then
+      return {
+        approved = true,
+        reason = string.format("工具 '%s'：路径和参数均安全，且配置为自动允许", tool_name),
+        auto_allow = true,
+      }
+    else
+      return {
+        approved = false,
+        reason = string.format("工具 '%s'：路径和参数均安全，但配置为需要用户审批", tool_name),
+        auto_allow = false,
+      }
+    end
   end
 
-  -- auto_allow=false，需要用户确认
+  -- 路径或参数不安全，需要用户审批
+  local violation = path_violation or param_violation or "安全检查未通过"
   return {
-    approved = true,
-    reason = string.format("工具 '%s' 需要用户审批", tool_name),
+    approved = false,
+    reason = violation,
     auto_allow = false,
   }
 end
@@ -207,52 +215,34 @@ function M._is_path_in_allowed_dirs(path, allowed_dirs, tool_registry)
   return false
 end
 
--- ========== 协程内审批配置管理 ==========
+-- ========== 运行时审批配置管理（委托给 approval_state 共享变量） ==========
+-- 所有模块通过 approval_state 读写同一份配置，实现双向同步
 
---- 设置协程内工具的审批配置
---- 每个工具的审批配置存储在协程共享变量的 approval_configs 表中
---- 通过 state.get_shared() 读写，协程内所有模块共享
+local approval_state = require("NeoAI.tools.approval_state")
+
+--- 设置工具的运行时审批配置
 --- @param tool_name string 工具名称
 --- @param config table 审批配置 { auto_allow, allowed_directories, allowed_param_groups }
 function M.set_tool_approval_config(tool_name, config)
-  local state = require("NeoAI.core.config.state")
-  local shared = state.get_shared()
-  if not shared.approval_configs then
-    shared.approval_configs = {}
-  end
-  shared.approval_configs[tool_name] = config
+  approval_state.set_tool_config(tool_name, config)
 end
 
---- 获取协程内工具的审批配置
+--- 获取工具的运行时审批配置
 --- @param tool_name string 工具名称
 --- @return table|nil 审批配置
 function M.get_tool_approval_config(tool_name)
-  local state = require("NeoAI.core.config.state")
-  local shared = state.get_shared()
-  if not shared or not shared.approval_configs then
-    return nil
-  end
-  return shared.approval_configs[tool_name]
+  return approval_state.get_tool_config(tool_name)
 end
 
---- 获取所有协程内工具的审批配置
+--- 获取所有工具的运行时审批配置
 --- @return table
 function M.get_all_tool_approval_configs()
-  local state = require("NeoAI.core.config.state")
-  local shared = state.get_shared()
-  if not shared or not shared.approval_configs then
-    return {}
-  end
-  return shared.approval_configs
+  return approval_state.get_all_tool_configs()
 end
 
---- 清除协程内所有工具的审批配置
+--- 清除所有工具的运行时审批配置
 function M.clear_tool_approval_configs()
-  local state = require("NeoAI.core.config.state")
-  local shared = state.get_shared()
-  if shared then
-    shared.approval_configs = nil
-  end
+  approval_state.clear_tool_configs()
 end
 
 -- ========== 模式验证 ==========

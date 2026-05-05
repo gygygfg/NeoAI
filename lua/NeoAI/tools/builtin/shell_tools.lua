@@ -1839,7 +1839,6 @@ M.run_command = define_tool({
   },
   category = "system",
   permissions = { execute = true },
-  approval = { auto_allow = false },
 })
 
 -- ============================================================================

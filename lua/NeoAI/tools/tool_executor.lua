@@ -237,6 +237,35 @@ function M.execute_async(tool_name, args, on_success, on_error, on_progress)
       session_id = session_id,
     })
 
+    -- 注册暂停回调：审批窗口打开时暂停超时，关闭时恢复
+    local tool_call_id = args and args._tool_call_id or ("call_" .. os.time() .. "_" .. math.random(10000, 99999))
+    local unregister = approval_handler.register_pause_callback(function(is_paused)
+      if is_paused then
+        -- 暂停超时：停止定时器
+        M._clear_timeout(tool_call_id)
+      else
+        -- 恢复超时：重新设置定时器（用剩余时间）
+        local tool_def = tool_registry.get(tool_name)
+        local tool_timeout = tool_def and tool_def.timeout
+        local timeout_ms
+        if tool_timeout == -1 then
+          timeout_ms = -1
+        elseif tool_timeout ~= nil then
+          timeout_ms = tool_timeout
+        else
+          timeout_ms = timeout_state.timeout_ms
+        end
+        if timeout_ms and timeout_ms > 0 then
+          M._set_timeout(tool_call_id, timeout_ms, function()
+            logger.warn("[tool_executor] 工具 '%s' 执行超时 (%dms)", tool_name, timeout_ms)
+            if on_error then
+              on_error(string.format("工具执行超时（%d 秒）", timeout_ms / 1000))
+            end
+          end)
+        end
+      end
+    end)
+
     if not approval_handler.is_showing() then
       vim.schedule(function() approval_handler.process_queue() end)
     end
