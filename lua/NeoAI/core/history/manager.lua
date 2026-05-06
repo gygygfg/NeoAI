@@ -163,11 +163,37 @@ function M._shutdown_and_save()
     end
   end)
 
+  -- 1.5 清理子 agent（停止所有定时器，释放资源）
+  pcall(function()
+    local pe_ok, plan_executor = pcall(require, "NeoAI.tools.builtin.plan_executor")
+    if pe_ok and plan_executor and plan_executor.cleanup_all then
+      plan_executor.cleanup_all()
+    end
+  end)
+
+  -- 1.6 清理子 agent 引擎（清理 autocmd 监听器和 runner 状态）
+  pcall(function()
+    local sa_ok, sub_agent_engine = pcall(require, "NeoAI.core.ai.sub_agent_engine")
+    if sa_ok and sub_agent_engine and sub_agent_engine.cleanup_all then
+      sub_agent_engine.cleanup_all()
+    end
+  end)
+
   -- 2. 取消所有 HTTP 请求
   pcall(function()
     local http_ok, http_client = pcall(require, "NeoAI.core.ai.http_client")
     if http_ok and http_client and http_client.cancel_all_requests then
       http_client.cancel_all_requests()
+    end
+  end)
+
+  -- 2.5 清理 ai_engine 的活跃生成状态（防止 HTTP 回调触发死循环）
+  pcall(function()
+    local ae_ok, ai_engine = pcall(require, "NeoAI.core.ai.ai_engine")
+    if ae_ok and ai_engine then
+      if ai_engine.cleanup_all_generations then
+        ai_engine.cleanup_all_generations()
+      end
     end
   end)
 

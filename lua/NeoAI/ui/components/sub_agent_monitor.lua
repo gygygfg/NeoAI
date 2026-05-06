@@ -111,9 +111,14 @@ local function _content_hash(lines)
   return vim.fn.sha256(table.concat(lines, "\n"))
 end
 
---- 渲染窗口内容
+--- 渲染窗口内容（必须在主线程调用）
+--- 如果窗口不存在，自动创建
 local function _render()
-  if not state.window_id then return end
+  -- 如果窗口不存在，自动创建
+  if not state.window_id then
+    _create_window()
+    if not state.window_id then return end
+  end
 
   -- 从 plan_executor 获取最新的 agent 数据（使用同步接口）
   local ok, plan_executor = pcall(require, "NeoAI.tools.builtin.plan_executor")
@@ -125,11 +130,6 @@ local function _render()
   end
 
   local lines = _build_content(enriched)
-  local new_hash = _content_hash(lines)
-
-  -- 内容无变化则不刷新
-  if new_hash == state.last_content_hash then return end
-  state.last_content_hash = new_hash
 
   local wi = window_manager.get_window_info(state.window_id)
   if not wi or not buf_valid(wi.buf) or not win_valid(wi.win) then
@@ -148,15 +148,16 @@ local function _render()
   pcall(vim.api.nvim_win_set_cursor, wi.win, { 1, 0 })
 end
 
---- 显示监控悬浮窗
-function M.show()
-  if not state.initialized then return end
-
-  -- 如果已存在，直接刷新
-  if state.window_id then
+--- 安全渲染：通过 vim.schedule 将渲染调度到主线程执行
+function M._safe_render()
+  vim.schedule(function()
     _render()
-    return
-  end
+  end)
+end
+
+--- 创建监控窗口
+local function _create_window()
+  if state.window_id then return end
 
   -- 计算窗口尺寸
   local editor_width = vim.o.columns
@@ -195,23 +196,39 @@ function M.show()
     vim.keymap.set("n", "<Esc>", close, { buffer = buf, silent = true, noremap = true, desc = "关闭监控" })
   end
 
-  -- 首次渲染
-  _render()
-
   -- 启动定时刷新（每 1 秒刷新一次）
   if state.refresh_timer then
     vim.fn.timer_stop(state.refresh_timer)
   end
   state.refresh_timer = vim.fn.timer_start(1000, function()
-    if not state.is_visible or not state.window_id then
+    if not state.window_id then
       if state.refresh_timer then
         vim.fn.timer_stop(state.refresh_timer)
         state.refresh_timer = nil
       end
       return
     end
-    _render()
+    _safe_render()
   end, { ["repeat"] = -1 })
+end
+
+--- 显示监控悬浮窗
+function M.show()
+  if not state.initialized then return end
+
+  -- 如果窗口已存在，直接刷新
+  if state.window_id then
+    _render()
+    return
+  end
+
+  -- 创建窗口
+  _create_window()
+
+  -- 渲染内容
+  if state.window_id then
+    _render()
+  end
 end
 
 --- 关闭监控悬浮窗

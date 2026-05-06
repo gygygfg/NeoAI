@@ -283,9 +283,9 @@ function M.create_window(window_type, options)
     M.block_lsp_for_buffer(window_info.buf, window_type .. " 界面")
   end
 
-  if not vim.tbl_contains({ "tool_display", "reasoning" }, window_type) then
-    vim.api.nvim_buf_set_name(window_info.buf, "neoai://" .. window_type .. "/" .. window_id)
-  end
+  -- 为所有类型的窗口设置唯一 buf 名称，确保 buf 引用稳定
+  -- 避免在 vim.schedule 延迟执行时 buf 被回收或复用
+  vim.api.nvim_buf_set_name(window_info.buf, "neoai://" .. window_type .. "/" .. window_id)
 
   -- 打开 chat 窗口时保存当前窗口的 wrap 状态并启用自动换行
   if window_type == "chat" then

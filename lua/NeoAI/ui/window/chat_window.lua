@@ -2578,6 +2578,32 @@ function M._setup_event_listeners()
           end
           text = text .. "  " .. status_icon .. " " .. t.name .. " " .. status_text .. "\n"
 
+          -- 显示 AI 填入的参数（缩进显示）
+          if t.args and type(t.args) == "table" and next(t.args) then
+            for k, v in pairs(t.args) do
+              if k ~= "_session_id" and k ~= "_tool_call_id" then
+                local v_str = type(v) == "string" and v or vim.inspect(v)
+                -- 临时 URL 解码（仅用于显示）
+                v_str = vim.uri_decode(v_str)
+                -- 尝试将解码后的 JSON 字符串解析为 table 以格式化显示
+                if v_str:sub(1,1) == "{" or v_str:sub(1,1) == "[" then
+                  local ok, parsed = pcall(vim.json.decode, v_str)
+                  if ok and type(parsed) == "table" then
+                    v_str = vim.inspect(parsed, { indent = "", newline = "", separator = ", " })
+                  end
+                end
+                -- 截断到窗口宽度
+                local max_width = math.floor(vim.o.columns * 0.8) - 8
+                if #v_str > max_width then
+                  v_str = v_str:sub(1, max_width - 3) .. "..."
+                end
+                -- 多行值只取第一行
+                local first_line = v_str:match("([^\n]+)") or v_str
+                text = text .. "    " .. k .. ": " .. first_line .. "\n"
+              end
+            end
+          end
+
           -- 显示子步骤（树形缩进）
           local substeps = state.tool_display.substeps[t.name]
           if substeps and #substeps > 0 then
@@ -2673,10 +2699,25 @@ function M._setup_event_listeners()
           local tools_info = {}
           for _, tc in ipairs(pack_tools) do
             local fn = tc["function"] or tc.func or {}
+            -- 解析参数（仅 JSON 解析，不 URL 解码）
+            local args_display = {}
+            if fn.arguments then
+              if type(fn.arguments) == "string" then
+                local ok, parsed = pcall(vim.json.decode, fn.arguments)
+                if ok and type(parsed) == "table" then
+                  args_display = parsed
+                else
+                  args_display = { raw = fn.arguments }
+                end
+              elseif type(fn.arguments) == "table" then
+                args_display = fn.arguments
+              end
+            end
             table.insert(tools_info, {
               name = fn.name or "unknown",
               status = "pending",
               duration = 0,
+              args = args_display,
             })
           end
           state.tool_display.packs[pack_name] = {
@@ -2693,10 +2734,25 @@ function M._setup_event_listeners()
         local tools_info = {}
         for _, tc in ipairs(uncategorized) do
           local fn = tc["function"] or tc.func or {}
+          -- 解析参数
+          local args_display = {}
+          if fn.arguments then
+            if type(fn.arguments) == "string" then
+              local ok, parsed = pcall(vim.json.decode, fn.arguments)
+              if ok and type(parsed) == "table" then
+                args_display = parsed
+              else
+                args_display = { raw = fn.arguments }
+              end
+            elseif type(fn.arguments) == "table" then
+              args_display = fn.arguments
+            end
+          end
           table.insert(tools_info, {
             name = fn.name or "unknown",
             status = "pending",
             duration = 0,
+            args = args_display,
           })
         end
         state.tool_display.packs["_uncategorized"] = {
@@ -2714,7 +2770,11 @@ function M._setup_event_listeners()
       -- 同步更新模块级 state.should_follow 缓存变量
       state.should_follow = near_end
       if near_end then
-        M._show_tool_display()
+        -- 使用 vim.schedule 延迟创建窗口，避免在 autocmd 回调中直接调用 nvim_open_win
+        -- 导致嵌套 autocmd 干扰渲染
+        vim.schedule(function()
+          M._show_tool_display()
+        end)
         -- 创建浮动窗口可能触发 WinNew/BufEnter 等自动命令，间接影响 chat 窗口的滚动位置
         -- 使用防抖光标跟随，延迟 150ms 后执行（创建浮动窗口的影响需要更长时间稳定）
         _schedule_cursor_follow(150)
@@ -3587,42 +3647,8 @@ function M._show_tool_display()
     },
   })
 
-  -- 设置窗口内容
-  local window_info = window_manager.get_window_info(win_id)
-  if window_info and window_info.buf and vim.api.nvim_buf_is_valid(window_info.buf) then
-    vim.api.nvim_set_option_value("modifiable", true, { buf = window_info.buf })
-    vim.api.nvim_set_option_value("filetype", "markdown", { buf = window_info.buf })
-
-    local lines = vim.split(state.tool_display.buffer or "", "\n")
-    vim.api.nvim_buf_set_lines(window_info.buf, 0, -1, false, lines)
-
-    vim.api.nvim_set_option_value("readonly", true, { buf = window_info.buf })
-    vim.api.nvim_set_option_value("modifiable", false, { buf = window_info.buf })
-
-    -- 设置按键映射
-    local core = require("NeoAI.core")
-    local full_config = core.get_config() or {}
-    local chat_config = full_config.keymaps and full_config.keymaps.chat or {}
-    vim.keymap.set("n", chat_config.quit.key, function()
-      require("NeoAI.ui.window.chat_window")._close_tool_display()
-    end, {
-      buffer = window_info.buf,
-      desc = "关闭工具调用窗口",
-      silent = true,
-      noremap = true,
-    })
-    vim.keymap.set("n", chat_config.cancel.key, function()
-      require("NeoAI.ui.window.chat_window")._close_tool_display()
-    end, {
-      buffer = window_info.buf,
-      desc = "关闭工具调用窗口",
-      silent = true,
-      noremap = true,
-    })
-
-    -- 同步其他 chat 快捷键到 tool_display 悬浮窗（排除 quit 和 cancel，它们已由上面注册）
-    M.sync_keymaps_to_buf(window_info.buf, { "quit", "cancel" })
-  end
+  -- 通过 _update_tool_display 统一设置窗口内容和按键映射
+  M._update_tool_display()
 end
 
 --- 更新工具调用悬浮窗口内容（同时动态调整高度和位置）
@@ -3638,12 +3664,43 @@ function M._update_tool_display()
 
   local buf = window_info.buf
   vim.api.nvim_set_option_value("modifiable", true, { buf = buf })
+  vim.api.nvim_set_option_value("filetype", "markdown", { buf = buf })
 
   local lines = vim.split(state.tool_display.buffer or "", "\n")
   vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
 
   vim.api.nvim_set_option_value("readonly", true, { buf = buf })
   vim.api.nvim_set_option_value("modifiable", false, { buf = buf })
+
+  -- 设置按键映射（首次创建时设置，后续更新时跳过）
+  if not window_info._keymaps_set then
+    window_info._keymaps_set = true
+    local core = require("NeoAI.core")
+    local full_config = core.get_config() or {}
+    local chat_config = full_config.keymaps and full_config.keymaps.chat or {}
+    if chat_config.quit and chat_config.quit.key then
+      vim.keymap.set("n", chat_config.quit.key, function()
+        require("NeoAI.ui.window.chat_window")._close_tool_display()
+      end, {
+        buffer = buf,
+        desc = "关闭工具调用窗口",
+        silent = true,
+        noremap = true,
+      })
+    end
+    if chat_config.cancel and chat_config.cancel.key then
+      vim.keymap.set("n", chat_config.cancel.key, function()
+        require("NeoAI.ui.window.chat_window")._close_tool_display()
+      end, {
+        buffer = buf,
+        desc = "关闭工具调用窗口",
+        silent = true,
+        noremap = true,
+      })
+    end
+    -- 同步其他 chat 快捷键到 tool_display 悬浮窗（排除 quit 和 cancel）
+    M.sync_keymaps_to_buf(buf, { "quit", "cancel" })
+  end
 
   -- 动态调整窗口高度和宽度
   local win = window_info.win

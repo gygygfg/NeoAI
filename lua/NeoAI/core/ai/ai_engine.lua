@@ -398,17 +398,20 @@ function _handle_stream_end(generation_id, processor, params)
       -- 检测是否为子 agent 的工具调用
       local sub_agent_id = params and params._sub_agent_id
       if sub_agent_id then
-        local sub_agent_engine = require("NeoAI.core.ai.sub_agent_engine")
-        sub_agent_engine.on_generation_complete({
-          generation_id = generation_id,
-          tool_calls = tool_calls,
-          content = full_response,
-          reasoning = reasoning_text,
-          usage = usage,
-          session_id = sid,
-          is_final_round = is_final_round or false,
-          _sub_agent_id = sub_agent_id,
-        })
+        -- 退出时跳过子 agent 处理，防止死循环
+        if not shutdown_flag.is_set() then
+          local sub_agent_engine = require("NeoAI.core.ai.sub_agent_engine")
+          sub_agent_engine.on_generation_complete({
+            generation_id = generation_id,
+            tool_calls = tool_calls,
+            content = full_response,
+            reasoning = reasoning_text,
+            usage = usage,
+            session_id = sid,
+            is_final_round = is_final_round or false,
+            _sub_agent_id = sub_agent_id,
+          })
+        end
       else
         tool_orchestrator.on_generation_complete({ generation_id = generation_id, tool_calls = tool_calls, content = full_response, reasoning = reasoning_text, usage = usage, session_id = sid, is_final_round = is_final_round or false })
       end
@@ -436,18 +439,21 @@ function _handle_stream_end(generation_id, processor, params)
     -- 检测是否为子 agent 的完成事件
     local sub_agent_id = params and params._sub_agent_id
     if sub_agent_id then
-      -- 子 agent 完成：转发给 sub_agent_engine
-      local sub_agent_engine = require("NeoAI.core.ai.sub_agent_engine")
-      sub_agent_engine.on_generation_complete({
-        generation_id = generation_id,
-        tool_calls = tool_calls,
-        content = full_response,
-        reasoning = reasoning_text,
-        usage = usage,
-        session_id = sid,
-        is_final_round = is_final_round or false,
-        _sub_agent_id = sub_agent_id,
-      })
+      -- 退出时跳过子 agent 处理，防止死循环
+      if not shutdown_flag.is_set() then
+        -- 子 agent 完成：转发给 sub_agent_engine
+        local sub_agent_engine = require("NeoAI.core.ai.sub_agent_engine")
+        sub_agent_engine.on_generation_complete({
+          generation_id = generation_id,
+          tool_calls = tool_calls,
+          content = full_response,
+          reasoning = reasoning_text,
+          usage = usage,
+          session_id = sid,
+          is_final_round = is_final_round or false,
+          _sub_agent_id = sub_agent_id,
+        })
+      end
     else
       tool_orchestrator.on_generation_complete({ generation_id = generation_id, tool_calls = {}, content = full_response, reasoning = reasoning_text, usage = usage, session_id = sid, is_final_round = is_final_round or false })
     end
@@ -516,7 +522,25 @@ function _handle_ai_response(generation_id, response, params)
   if #tool_calls > 0 and tools_enabled then
     if is_tool_loop then
       state.is_generating = false; state.current_generation_id = nil
-      tool_orchestrator.on_generation_complete({ generation_id = generation_id, tool_calls = tool_calls, content = response_content, reasoning = reasoning_content, usage = response.usage or {}, session_id = session_id, is_final_round = is_final_round or false })
+      -- 检测是否为子 agent 的工具调用
+      local sub_agent_id = params and params._sub_agent_id
+      if sub_agent_id then
+        if not shutdown_flag.is_set() then
+          local sub_agent_engine = require("NeoAI.core.ai.sub_agent_engine")
+          sub_agent_engine.on_generation_complete({
+            generation_id = generation_id,
+            tool_calls = tool_calls,
+            content = response_content,
+            reasoning = reasoning_content,
+            usage = response.usage or {},
+            session_id = session_id,
+            is_final_round = is_final_round or false,
+            _sub_agent_id = sub_agent_id,
+          })
+        end
+      else
+        tool_orchestrator.on_generation_complete({ generation_id = generation_id, tool_calls = tool_calls, content = response_content, reasoning = reasoning_content, usage = response.usage or {}, session_id = session_id, is_final_round = is_final_round or false })
+      end
       state.active_generations[generation_id] = nil
       return
     end
@@ -541,17 +565,20 @@ function _handle_ai_response(generation_id, response, params)
     -- 检测是否为子 agent 的完成事件
     local sub_agent_id = params and params._sub_agent_id
     if sub_agent_id then
-      local sub_agent_engine = require("NeoAI.core.ai.sub_agent_engine")
-      sub_agent_engine.on_generation_complete({
-        generation_id = generation_id,
-        tool_calls = tool_calls,
-        content = response_content,
-        reasoning = reasoning_content,
-        usage = usage,
-        session_id = session_id,
-        is_final_round = is_final_round or false,
-        _sub_agent_id = sub_agent_id,
-      })
+      -- 退出时跳过子 agent 处理，防止死循环
+      if not shutdown_flag.is_set() then
+        local sub_agent_engine = require("NeoAI.core.ai.sub_agent_engine")
+        sub_agent_engine.on_generation_complete({
+          generation_id = generation_id,
+          tool_calls = tool_calls,
+          content = response_content,
+          reasoning = reasoning_content,
+          usage = usage,
+          session_id = session_id,
+          is_final_round = is_final_round or false,
+          _sub_agent_id = sub_agent_id,
+        })
+      end
     else
       tool_orchestrator.on_generation_complete({ generation_id = generation_id, tool_calls = {}, content = response_content, reasoning = reasoning_content, usage = usage, session_id = session_id, is_final_round = is_final_round or false })
     end
@@ -614,6 +641,8 @@ function M.handle_tool_result(data)
     local sa_generation_id = data.generation_id or ("sub_agent_" .. data._sub_agent_id .. "_" .. os.time())
 
     if tool_orchestrator.is_stop_requested(sa_session_id) then return end
+    -- 退出时跳过子 agent 请求，防止死循环
+    if shutdown_flag.is_set() then return end
     if not sa_messages or #sa_messages == 0 then return end
 
     -- 构建请求并直接发送
@@ -896,6 +925,13 @@ end
 function M.cleanup_event_listeners()
   for _, id in pairs(state.event_listeners) do if id then pcall(vim.api.nvim_del_autocmd, id) end end
   state.event_listeners = {}
+end
+
+--- 清理所有活跃的生成状态（退出时使用，防止回调死循环）
+function M.cleanup_all_generations()
+  state.is_generating = false
+  state.current_generation_id = nil
+  state.active_generations = {}
 end
 
 function M.shutdown()

@@ -19,7 +19,7 @@ local M = {}
 local define_tool = require("NeoAI.tools.builtin.tool_helpers").define_tool
 local logger = require("NeoAI.utils.logger")
 
--- 子 agent 监控悬浮窗（延迟加载）
+-- ========== 子 agent 监控悬浮窗（延迟加载）
 local _sub_agent_monitor = nil
 local function get_monitor()
   if not _sub_agent_monitor then
@@ -29,6 +29,30 @@ local function get_monitor()
     end
   end
   return _sub_agent_monitor
+end
+
+--- 触发监控悬浮窗刷新
+--- 如果窗口不存在，自动创建并显示
+--- 带防抖：500ms 内多次调用只会执行最后一次
+local _refresh_timer = nil
+local function _refresh_monitor()
+  local monitor = get_monitor()
+  if not monitor then
+    return
+  end
+
+  -- 防抖：清除之前的定时器
+  if _refresh_timer then
+    pcall(vim.fn.timer_stop, _refresh_timer)
+    _refresh_timer = nil
+  end
+
+  -- 延迟 500ms 执行，避免频繁刷新
+  _refresh_timer = vim.fn.timer_start(500, function()
+    _refresh_timer = nil
+    -- 直接调用 show（不在 vim.schedule 中），因为定时器回调已在主线程
+    pcall(monitor.show)
+  end, { ["repeat"] = 0 })
 end
 
 -- ========== 子 agent 会话管理 ==========
@@ -117,11 +141,8 @@ local function _create_sub_agent(args, on_success, on_error)
 
   sub_agent.timeout_timer = timeout_timer
 
-  -- 自动打开监控悬浮窗
-  local monitor = get_monitor()
-  if monitor and monitor.show then
-    monitor.show()
-  end
+  -- 刷新监控悬浮窗（直接调用，_refresh_monitor 内部会通过 pcall 保护）
+  _refresh_monitor()
 
   -- 返回创建结果
   local result = {
@@ -234,16 +255,8 @@ local function _finalize_sub_agent(sub_agent_id)
 
   sa.status = sa.status or "completed"
 
-  -- 通知监控悬浮窗刷新
-  local monitor = get_monitor()
-  if monitor and monitor.is_visible and monitor.is_visible() then
-    -- 通过 timer 延迟触发刷新，避免在回调中嵌套操作
-    vim.fn.timer_start(100, function()
-      if monitor.show then
-        monitor.show()
-      end
-    end, { ["repeat"] = 0 })
-  end
+  -- 刷新监控悬浮窗
+  _refresh_monitor()
 
   -- 触发完成回调
   if sa.on_complete then
@@ -479,6 +492,9 @@ function M.review_tool_call(sub_agent_id, tool_call)
   sa.tool_call_count = sa.tool_call_count + 1
   sa.last_tool_call = tool_name
 
+  -- 刷新监控
+  _refresh_monitor()
+
   return true, nil
 end
 
@@ -495,6 +511,8 @@ function M.record_result(sub_agent_id, result)
   if #sa.results > 50 then
     table.remove(sa.results, 1)
   end
+  -- 刷新监控
+  _refresh_monitor()
 end
 
 --- 记录子 agent 的错误
@@ -506,6 +524,8 @@ function M.record_error(sub_agent_id, error_msg)
     return
   end
   table.insert(sa.errors, error_msg)
+  -- 刷新监控
+  _refresh_monitor()
 end
 
 --- 记录子 agent 的对话消息
@@ -526,6 +546,8 @@ function M.record_message(sub_agent_id, role, content)
   if #sa.messages > 100 then
     table.remove(sa.messages, 1)
   end
+  -- 刷新监控
+  _refresh_monitor()
 end
 
 --- 获取子 agent 的完整上下文（供子 agent 初始化时使用）
@@ -598,6 +620,23 @@ function M.cleanup_completed_agents()
       M.cleanup_sub_agent(id)
     end
   end
+end
+
+--- 清理所有子 agent（包括运行中的），用于退出时紧急清理
+function M.cleanup_all()
+  for id, sa in pairs(sub_agents) do
+    -- 停止超时定时器
+    if sa.timeout_timer then
+      pcall(vim.fn.timer_stop, sa.timeout_timer)
+      sa.timeout_timer = nil
+    end
+    -- 标记为停止
+    sa.status = "rejected"
+    sa.summary = "系统退出，子 agent 被终止"
+  end
+  -- 清空所有子 agent 状态
+  sub_agents = {}
+  agent_counter = 0
 end
 
 -- ========== 工具注册 ==========

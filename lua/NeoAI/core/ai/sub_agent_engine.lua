@@ -354,6 +354,11 @@ function M._request_generation(sub_agent_id)
   local runner = sub_agent_runners[sub_agent_id]
   if not runner or runner.stop_requested then return end
 
+  -- 退出时跳过，防止死循环
+  if require("NeoAI.core.shutdown_flag").is_set() then
+    return
+  end
+
   -- 检查子 agent 是否应该继续
   if not plan_executor.should_continue(sub_agent_id) then
     M._finalize_sub_agent(sub_agent_id)
