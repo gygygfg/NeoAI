@@ -289,6 +289,8 @@ local DEFAULT_CONFIG = {
         is_named_node = { auto_allow = true },
         get_parent_node = { auto_allow = true },
         get_child_nodes = { auto_allow = true },
+        get_node_code = { auto_allow = true },
+        delete_node = { auto_allow = false },
 
         -- ===== neovim_lsp.lua =====
         lsp_hover = { auto_allow = true },
@@ -316,11 +318,11 @@ local DEFAULT_CONFIG = {
   -- 日志配置
   log = {
     -- 日志级别: 'DEBUG', 'INFO', 'WARN', 'ERROR', 'FATAL'
-    level = "WARN",
-    -- level = "DEBUG",
+    level = "DEBUG",
+    -- level = "WARN",
     -- 输出文件路径（可选，默认输出到文件，避免 print 阻塞消息区域）
-    output_path = nill,
-    -- output_path = "/root/NeoAI/pack/plugins/start/NeoAI/lua/NeoAI/neoai.log",
+    -- output_path = nil,
+    output_path = "/root/NeoAI/pack/plugins/start/NeoAI/lua/NeoAI/neoai.log",
     -- 日志格式模板
     format = "[{time}] [{level}] {message}",
     -- 最大文件大小（字节），默认 10MB

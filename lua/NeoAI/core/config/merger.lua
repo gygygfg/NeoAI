@@ -357,7 +357,7 @@ local function resolve_candidate(candidate, ai_config)
     result[k] = v
   end
 
-  if not result.stream then
+  if result.stream == nil then
     result.stream = ai_config.stream
   end
   if not result.timeout then

@@ -86,9 +86,9 @@ local function resolve_scenario_config(scenario)
   local result = {}
   if provider then result.base_url = provider.base_url; result.api_key = provider.api_key end
   for k, v in pairs(candidate) do result[k] = v end
-  if not result.stream then result.stream = ai_config.stream end
-  if not result.timeout then result.timeout = ai_config.timeout end
-  if not result.system_prompt then result.system_prompt = ai_config.system_prompt end
+  if result.stream == nil then result.stream = ai_config.stream end
+  if result.timeout == nil then result.timeout = ai_config.timeout end
+  if result.system_prompt == nil then result.system_prompt = ai_config.system_prompt end
   return result
 end
 
@@ -182,7 +182,12 @@ function M.generate_response(messages, params)
     for _, msg in ipairs(formatted) do if msg.role == "system" then has_system = true; break end end
     if not has_system then table.insert(formatted, 1, { role = "system", content = ai_preset.system_prompt }) end
   end
-  local stream_val = (options.stream ~= nil) and options.stream or (ai_preset.stream ~= false)
+  local stream_val
+  if options.stream ~= nil then
+    stream_val = options.stream
+  else
+    stream_val = (ai_preset.stream ~= false)
+  end
   local request = request_builder.build_request({
     messages = formatted,
     options = vim.tbl_extend("force", options, {
@@ -195,6 +200,7 @@ function M.generate_response(messages, params)
     data = { generation_id = generation_id, formatted_messages = formatted, request = request, session_id = session_id, window_id = window_id },
   })
 
+  -- 调试：打印 request.stream 值
   -- 在协程上下文中执行请求
   state_manager.with_context(ctx, function()
     if request.stream then
@@ -211,7 +217,7 @@ function _send_non_stream_request(generation_id, request, params)
   if not state.active_generations then return end
   local generation = state.active_generations[generation_id]
   if not generation then return end
-  local shared = state_manager.get_shared()
+  local shared = state_manager.get_shared() or {}
   local ai_preset = shared.ai_preset or generation.ai_preset or {}
   local response, err = http_client.send_request({
     request = request, generation_id = generation_id, base_url = ai_preset.base_url, api_key = ai_preset.api_key,
@@ -239,7 +245,7 @@ end
 
 -- ========== 流式请求 ==========
 function _send_stream_request(generation_id, request, params)
-  local shared = state_manager.get_shared()
+  local shared = state_manager.get_shared() or {}
   local session_id = shared.session_id or params.session_id
   local window_id = shared.window_id or params.window_id
   local options = shared.options or params.options or {}
@@ -285,9 +291,9 @@ end
 function _handle_stream_chunk(generation_id, data, processor, params)
   local result = stream_processor.process_chunk(processor, data)
   if not result then return end
-  local shared = state_manager.get_shared()
-  local sid = shared.session_id or processor.session_id
-  local wid = shared.window_id or processor.window_id
+  local shared = state_manager.get_shared() or {}
+  local sid = shared.session_id or processor.session_id or (params and params.session_id)
+  local wid = shared.window_id or processor.window_id or (params and params.window_id)
   if result.content then
     vim.api.nvim_exec_autocmds("User", {
       pattern = event_constants.STREAM_CHUNK,
@@ -314,9 +320,9 @@ function _handle_stream_end(generation_id, processor, params)
   local gen = state.active_generations[generation_id]
   if reasoning_text ~= "" and gen then gen.last_reasoning_content = reasoning_text end
 
-  local shared = state_manager.get_shared()
-  local sid = shared.session_id or processor.session_id
-  local wid = shared.window_id or processor.window_id
+  local shared = state_manager.get_shared() or {}
+  local sid = shared.session_id or processor.session_id or (params and params.session_id)
+  local wid = shared.window_id or processor.window_id or (params and params.window_id)
 
   local is_tool_loop = params and params.is_tool_loop
   local is_final_round = params and params.is_final_round
@@ -389,7 +395,23 @@ function _handle_stream_end(generation_id, processor, params)
   if #tool_calls > 0 and tools_enabled then
     if is_tool_loop then
       state.is_generating = false; state.current_generation_id = nil
-      tool_orchestrator.on_generation_complete({ generation_id = generation_id, tool_calls = tool_calls, content = full_response, reasoning = reasoning_text, usage = usage, session_id = sid, is_final_round = is_final_round or false })
+      -- 检测是否为子 agent 的工具调用
+      local sub_agent_id = params and params._sub_agent_id
+      if sub_agent_id then
+        local sub_agent_engine = require("NeoAI.core.ai.sub_agent_engine")
+        sub_agent_engine.on_generation_complete({
+          generation_id = generation_id,
+          tool_calls = tool_calls,
+          content = full_response,
+          reasoning = reasoning_text,
+          usage = usage,
+          session_id = sid,
+          is_final_round = is_final_round or false,
+          _sub_agent_id = sub_agent_id,
+        })
+      else
+        tool_orchestrator.on_generation_complete({ generation_id = generation_id, tool_calls = tool_calls, content = full_response, reasoning = reasoning_text, usage = usage, session_id = sid, is_final_round = is_final_round or false })
+      end
       state.active_generations[generation_id] = nil
       return
     end
@@ -411,7 +433,24 @@ function _handle_stream_end(generation_id, processor, params)
 
   if is_tool_loop then
     state.is_generating = false; state.current_generation_id = nil
-    tool_orchestrator.on_generation_complete({ generation_id = generation_id, tool_calls = {}, content = full_response, reasoning = reasoning_text, usage = usage, session_id = sid, is_final_round = is_final_round or false })
+    -- 检测是否为子 agent 的完成事件
+    local sub_agent_id = params and params._sub_agent_id
+    if sub_agent_id then
+      -- 子 agent 完成：转发给 sub_agent_engine
+      local sub_agent_engine = require("NeoAI.core.ai.sub_agent_engine")
+      sub_agent_engine.on_generation_complete({
+        generation_id = generation_id,
+        tool_calls = tool_calls,
+        content = full_response,
+        reasoning = reasoning_text,
+        usage = usage,
+        session_id = sid,
+        is_final_round = is_final_round or false,
+        _sub_agent_id = sub_agent_id,
+      })
+    else
+      tool_orchestrator.on_generation_complete({ generation_id = generation_id, tool_calls = {}, content = full_response, reasoning = reasoning_text, usage = usage, session_id = sid, is_final_round = is_final_round or false })
+    end
     state.active_generations[generation_id] = nil
   else
     state.is_generating = false; state.current_generation_id = nil
@@ -422,7 +461,7 @@ end
 
 -- ========== 非流式 AI 响应处理 ==========
 function _handle_ai_response(generation_id, response, params)
-  local shared = state_manager.get_shared()
+  local shared = state_manager.get_shared() or {}
   local session_id = shared.session_id or params.session_id
   local window_id = shared.window_id or params.window_id
   local options = shared.options or params.options or {}
@@ -499,7 +538,23 @@ function _handle_ai_response(generation_id, response, params)
   if response.usage then usage = response.usage end
   if is_tool_loop then
     state.is_generating = false; state.current_generation_id = nil
-    tool_orchestrator.on_generation_complete({ generation_id = generation_id, tool_calls = {}, content = response_content, reasoning = reasoning_content, usage = usage, session_id = session_id, is_final_round = is_final_round or false })
+    -- 检测是否为子 agent 的完成事件
+    local sub_agent_id = params and params._sub_agent_id
+    if sub_agent_id then
+      local sub_agent_engine = require("NeoAI.core.ai.sub_agent_engine")
+      sub_agent_engine.on_generation_complete({
+        generation_id = generation_id,
+        tool_calls = tool_calls,
+        content = response_content,
+        reasoning = reasoning_content,
+        usage = usage,
+        session_id = session_id,
+        is_final_round = is_final_round or false,
+        _sub_agent_id = sub_agent_id,
+      })
+    else
+      tool_orchestrator.on_generation_complete({ generation_id = generation_id, tool_calls = {}, content = response_content, reasoning = reasoning_content, usage = usage, session_id = session_id, is_final_round = is_final_round or false })
+    end
     state.active_generations[generation_id] = nil
   else
     _finalize_generation(generation_id, response_content, { session_id = session_id, window_id = window_id, reasoning_text = reasoning_content, usage = usage })
@@ -510,7 +565,7 @@ end
 function _finalize_generation(generation_id, response_text, params)
   local generation = state.active_generations[generation_id]
   if not generation then return end
-  local shared = state_manager.get_shared()
+  local shared = state_manager.get_shared() or {}
   local current_usage = params.usage or {}
   if current_usage and next(current_usage) then
     local acc = generation.accumulated_usage or {}
@@ -539,7 +594,102 @@ end
 
 -- ========== 处理工具结果 ==========
 function M.handle_tool_result(data)
-  local shared = state_manager.get_shared()
+  -- ===== 子 agent 请求：绕过 state.is_generating 检查 =====
+  -- 子 agent 使用独立的 generation_id（格式：sub_agent_<id>_<timestamp>），
+  -- 与主 agent 的 generation_id 不同，因此不会被 state.is_generating 阻塞。
+  -- 但子 agent 的 TOOL_RESULT_RECEIVED 事件也会触发此函数，
+  -- 需要直接转发给 sub_agent_engine，不经过主 agent 的生成流程。
+  if data._sub_agent_id then
+    local sub_agent_engine = require("NeoAI.core.ai.sub_agent_engine")
+    -- 子 agent 的请求直接发起 AI 生成，不经过主 agent 的状态管理
+    local sa_session_id = data.session_id
+    local sa_window_id = data.window_id
+    local sa_messages = data.messages or {}
+    local sa_options = data.options or {}
+    local sa_model_index = data.model_index or 1
+    local sa_ai_preset = data.ai_preset or {}
+    local sa_is_final_round = data.is_final_round or false
+    local sa_accumulated_usage = data.accumulated_usage or {}
+    local sa_last_reasoning = data.last_reasoning
+    local sa_generation_id = data.generation_id or ("sub_agent_" .. data._sub_agent_id .. "_" .. os.time())
+
+    if tool_orchestrator.is_stop_requested(sa_session_id) then return end
+    if not sa_messages or #sa_messages == 0 then return end
+
+    -- 构建请求并直接发送
+    local formatted = request_builder.format_messages(sa_messages)
+    local stream_val = (sa_options.stream ~= nil) and sa_options.stream or (sa_ai_preset.stream ~= false)
+    local request = request_builder.build_request({
+      messages = formatted,
+      options = vim.tbl_extend("force", sa_options, {
+        model = sa_ai_preset.model_name or sa_options.model,
+        temperature = sa_ai_preset.temperature or sa_options.temperature,
+        max_tokens = sa_ai_preset.max_tokens or sa_options.max_tokens,
+        stream = stream_val,
+      }),
+      session_id = sa_session_id,
+      generation_id = sa_generation_id,
+    })
+
+    -- 子 agent 请求不携带 tools（由 sub_agent_engine 管理工具循环）
+    request.tools = nil
+    request.tool_choice = nil
+
+    -- 创建独立的协程上下文（变量隔离）
+    local ctx = state_manager.create_context({
+      session_id = sa_session_id,
+      generation_id = sa_generation_id,
+      window_id = sa_window_id,
+      sub_agent_id = data._sub_agent_id,
+      messages = sa_messages,
+      options = sa_options,
+      model_index = sa_model_index,
+      ai_preset = sa_ai_preset,
+      accumulated_usage = sa_accumulated_usage,
+      last_reasoning = sa_last_reasoning,
+    })
+
+    -- 保存到 active_generations 供流式处理使用
+    if not state.active_generations then state.active_generations = {} end
+    state.active_generations[sa_generation_id] = {
+      start_time = os.time(),
+      messages = sa_messages,
+      session_id = sa_session_id,
+      window_id = sa_window_id,
+      options = sa_options,
+      model_index = sa_model_index,
+      ai_preset = sa_ai_preset,
+      retry_count = 0,
+      accumulated_usage = sa_accumulated_usage,
+      last_reasoning_content = sa_last_reasoning,
+      _sub_agent_id = data._sub_agent_id,
+    }
+
+    state_manager.with_context(ctx, function()
+      if request.stream then
+        _send_stream_request(sa_generation_id, request, {
+          session_id = sa_session_id,
+          window_id = sa_window_id,
+          options = sa_options,
+          is_tool_loop = true,
+          is_final_round = sa_is_final_round,
+          _sub_agent_id = data._sub_agent_id,
+        })
+      else
+        _send_non_stream_request(sa_generation_id, request, {
+          session_id = sa_session_id,
+          window_id = sa_window_id,
+          options = sa_options,
+          is_tool_loop = true,
+          is_final_round = sa_is_final_round,
+          _sub_agent_id = data._sub_agent_id,
+        })
+      end
+    end)
+    return
+  end
+
+  local shared = state_manager.get_shared() or {}
   local generation_id = data.generation_id or shared.generation_id
   local session_id = data.session_id or shared.session_id
   local window_id = data.window_id or shared.window_id
@@ -622,6 +772,9 @@ function M.handle_tool_result(data)
   local stream_val = (options.stream ~= nil) and options.stream or (ai_preset.stream ~= false)
   local request = request_builder.build_request({ messages = formatted, options = vim.tbl_extend("force", options, { model = ai_preset.model_name or options.model, temperature = ai_preset.temperature or options.temperature, max_tokens = ai_preset.max_tokens or options.max_tokens, stream = stream_val }), session_id = session_id, generation_id = generation_id })
   if is_final_round then request.tools = nil; request.tool_choice = nil end
+  -- 清除去重缓存，确保新请求不被去重机制拦截
+  -- 工具循环和总结轮次可能复用相同的 generation_id
+  http_client.clear_request_dedup(generation_id)
   vim.api.nvim_exec_autocmds("User", { pattern = event_constants.GENERATION_STARTED, data = { generation_id = generation_id, formatted_messages = formatted, request = request, session_id = session_id, window_id = window_id, is_tool_loop = true, is_final_round = is_final_round } })
   if request.stream then
     _send_stream_request(generation_id, request, { session_id = session_id, window_id = window_id, options = options, is_tool_loop = true, is_final_round = is_final_round })
@@ -634,7 +787,7 @@ end
 function M.handle_stream_completed(data)
   local generation_id = data.generation_id
   if not state.active_generations[generation_id] then return end
-  local shared = state_manager.get_shared()
+  local shared = state_manager.get_shared() or {}
   _finalize_generation(generation_id, data.full_response, {
     session_id = shared.session_id or data.session_id,
     window_id = shared.window_id or data.window_id,
@@ -646,7 +799,7 @@ end
 function M.handle_generation_error(generation_id, error_msg)
   local generation = state.active_generations[generation_id]
   if not generation then return end
-  local shared = state_manager.get_shared()
+  local shared = state_manager.get_shared() or {}
   vim.api.nvim_exec_autocmds("User", { pattern = event_constants.GENERATION_ERROR, data = { generation_id = generation_id, error_msg = error_msg, session_id = shared.session_id or generation.session_id, window_id = shared.window_id or generation.window_id } })
   state.active_generations[generation_id] = nil; state.is_generating = false; state.current_generation_id = nil
   local hm_ok, hm = pcall(require, "NeoAI.core.history.manager")
@@ -660,7 +813,7 @@ function M.cancel_generation()
   stream_processor.clear_reasoning_throttle()
   local generation_id = state.current_generation_id; local generation = state.active_generations[generation_id]
   -- 写入 shared 表，供协程内其他模块读取
-  local shared = state_manager.get_shared()
+  local shared = state_manager.get_shared() or {}
   shared.stop_requested = true
   shared.user_cancelled = true
 

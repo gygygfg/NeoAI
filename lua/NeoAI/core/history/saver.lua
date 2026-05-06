@@ -371,14 +371,15 @@ function M.shutdown_sync()
   M.flush_all()
 
   -- 等待所有 async_worker 完成（最多 3s）
-  local deadline = vim.loop.now() + 3000
-  while vim.loop.now() < deadline do
+  -- 使用 vim.uv.run('once') 替代 vim.wait，避免 headless 模式下事件循环阻塞
+  local deadline = vim.uv.now() + 3000
+  while vim.uv.now() < deadline do
     local has_pending = false
     for _, v in pairs(state._save_in_progress) do
       if v then has_pending = true; break end
     end
     if not has_pending then break end
-    vim.wait(50, function() return false end)
+    vim.uv.run("once")
   end
 
   -- 清理 autocmd

@@ -233,7 +233,8 @@ function M.create_window(window_type, options)
   window_counter = window_counter + 1
   local window_id = "win_" .. tostring(os.time()) .. "_" .. window_counter
   local core = require("NeoAI.core")
-  local full_config = core.get_config() or {}
+  local ok, full_config = pcall(core.get_config)
+  full_config = ok and full_config or {}
   local merged = vim.tbl_extend("force", full_config, options or {})
   merged.title = merged.title or ("NeoAI - " .. window_type)
 
@@ -251,9 +252,21 @@ function M.create_window(window_type, options)
     return nil
   end
 
+  -- 为 chat/tree 窗口创建协程上下文，协程内共享变量（如 session_id、window_id 等）
+  -- 每次打开窗口时重新创建，确保上下文隔离
+  local window_context = nil
+  if vim.tbl_contains({ "chat", "tree" }, window_type) then
+    window_context = state_manager.create_context({
+      window_id = window_id,
+      window_type = window_type,
+      created_at = os.time(),
+    })
+  end
+
   windows[window_id] = {
     id = window_id, type = window_type, buf = window_info.buf,
     win = window_info.win, options = merged, created_at = os.time(), window_info = window_info,
+    context = window_context,
   }
 
   -- 阻止 LSP
@@ -377,6 +390,9 @@ function M.close_window(window_id)
     })
   end
 
+  -- 清理窗口的协程上下文
+  window.context = nil
+
   windows[window_id] = nil
 end
 
@@ -446,6 +462,17 @@ end
 
 function M.get_window_type(window_id)
   return windows[window_id] and windows[window_id].type or nil
+end
+
+--- 获取窗口的协程上下文
+--- 每个 chat/tree 窗口在创建时都会生成一个新的协程上下文
+--- 协程内共享变量（如 session_id、window_id 等）通过此上下文隔离
+--- @param window_id string 窗口ID
+--- @return table|nil 上下文对象，非 chat/tree 窗口返回 nil
+function M.get_window_context(window_id)
+  local w = windows[window_id]
+  if not w then return nil end
+  return w.context
 end
 
 function M.find_windows_by_type(window_type)

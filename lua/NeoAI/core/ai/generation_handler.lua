@@ -4,7 +4,6 @@
 
 local logger = require("NeoAI.utils.logger")
 local event_constants = require("NeoAI.core.events")
-local state_manager = require("NeoAI.core.config.state")
 
 local M = {}
 

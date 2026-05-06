@@ -526,7 +526,7 @@ function M.open(session_id, window_id, branch_id)
   end
 
   state.current_window_id = window_id
-  state.current_session_id = session_id
+  state.current_session_id = session_id  -- 可能为 nil（用户尚未发送消息，会话未创建）
   state.messages = {}
 
   -- 获取缓冲区并快速设置关键选项
@@ -548,7 +548,7 @@ function M.open(session_id, window_id, branch_id)
     end
     pcall(vim.api.nvim_buf_set_var, buf, "neoai_no_lsp", true)
     pcall(vim.diagnostic.disable, buf)
-    pcall(vim.api.nvim_buf_set_name, buf, "neoai://chat/" .. session_id)
+pcall(vim.api.nvim_buf_set_name, buf, "neoai://chat/" .. (session_id or "new"))
 
     -- 保存到模块 state 表，供 virtual_input 检测光标离开时使用
     state.chat_buf = buf
@@ -593,6 +593,10 @@ function M.open(session_id, window_id, branch_id)
     M._focus_window()
   end
 
+  -- 获取窗口的协程上下文（由 window_manager.create_window 创建）
+  -- 后续所有协程内共享变量通过此上下文隔离
+  local ctx = window_manager.get_window_context(window_id)
+
   -- 先显示一个简单的欢迎界面，让用户立即看到窗口
   local welcome_content = {
     "# NeoAI 聊天",
@@ -613,26 +617,52 @@ function M.open(session_id, window_id, branch_id)
       return
     end
 
-    -- 加载消息数据
-    M._load_messages(session_id)
+    -- 在窗口的协程上下文中执行初始化操作
+    -- 确保协程内共享变量（如 session_id、window_id 等）正确隔离
+    local init_fn = function()
+      if session_id then
+        -- 有会话 ID：加载已有会话的消息
+        M._load_messages(session_id)
+        M.render_chat()
+        M._update_usage_virt_text()
+      else
+        -- 无会话 ID：新会话，显示欢迎界面
+        -- 会话将在用户第一次发送消息时由 chat_handlers.send_message 创建
+        local welcome = {
+          "# NeoAI 聊天",
+          "",
+          "新会话",
+          "",
+          "输入消息开始聊天...",
+          "",
+        }
+        local buf = window_manager.get_window_buf(window_id)
+        if buf and vim.api.nvim_buf_is_valid(buf) then
+          pcall(vim.api.nvim_set_option_value, "modifiable", true, { buf = buf })
+          pcall(vim.api.nvim_set_option_value, "readonly", false, { buf = buf })
+          pcall(vim.api.nvim_buf_set_lines, buf, 0, -1, false, welcome)
+          pcall(vim.api.nvim_set_option_value, "modified", false, { buf = buf })
+        end
+      end
 
-    -- 渲染聊天内容
-    M.render_chat()
+      -- 更新窗口标题
+      local model_label = M._get_current_model_label()
+      if model_label then
+        M.update_title(string.format("NeoAI 聊天 [%s]", model_label))
+      end
 
-    -- 添加 token 用量信息
-    M._update_usage_virt_text()
+      -- 触发聊天框打开事件
+      vim.api.nvim_exec_autocmds("User", { pattern = Events.CHAT_BOX_OPENED, data = { window_id = window_id } })
 
-    -- 更新窗口标题
-    local model_label = M._get_current_model_label()
-    if model_label then
-      M.update_title(string.format("NeoAI 聊天 [%s]", model_label))
+      -- 打开浮动虚拟输入框
+      M._open_float_input()
     end
 
-    -- 触发聊天框打开事件
-    vim.api.nvim_exec_autocmds("User", { pattern = Events.CHAT_BOX_OPENED, data = { window_id = window_id } })
-
-    -- 打开浮动虚拟输入框
-    M._open_float_input()
+    if ctx then
+      state_manager.with_context(ctx, init_fn)
+    else
+      init_fn()
+    end
   end)
 
   return true
@@ -1090,7 +1120,8 @@ function M.set_keymaps()
   -- 从合并后的配置中获取 chat 上下文键位
   -- 所有键位统一由 default_config.lua 定义，模块内部不提供任何 fallback 默认值
   local core = require("NeoAI.core")
-  local full_config = core.get_config() or {}
+  local ok, full_config = pcall(core.get_config)
+  full_config = ok and full_config or {}
   local chat_config = full_config.keymaps and full_config.keymaps.chat or {}
   local keymaps = {
     insert = chat_config.insert.key,
@@ -1176,7 +1207,8 @@ function M.sync_keymaps_to_buf(target_buf, exclude_keys)
   end
 
   local core = require("NeoAI.core")
-  local full_config = core.get_config() or {}
+  local ok, full_config = pcall(core.get_config)
+  full_config = ok and full_config or {}
   local chat_config = full_config.keymaps and full_config.keymaps.chat or {}
   exclude_keys = exclude_keys or {}
 
@@ -1328,11 +1360,30 @@ function M._open_float_input()
     auto_focus = auto_focus,
     on_submit = function(content)
       if content and content ~= "" then
+        -- 如果当前没有会话 ID（新打开的窗口，用户尚未发送过消息），
+        -- 先通过 history.manager 创建会话
+        local target_session_id = state.current_session_id
+        if not target_session_id then
+          local hm_ok, hm = pcall(require, "NeoAI.core.history.manager")
+          if hm_ok and hm.is_initialized() then
+            local session = hm.get_or_create_current_session("聊天会话")
+            if session then
+              target_session_id = session.id
+              -- 更新模块状态和 buffer 名称
+              state.current_session_id = target_session_id
+              local buf = window_manager.get_window_buf(state.current_window_id)
+              if buf and vim.api.nvim_buf_is_valid(buf) then
+                pcall(vim.api.nvim_buf_set_name, buf, "neoai://chat/" .. target_session_id)
+              end
+            end
+          end
+        end
+
         local chat_handlers_loaded, chat_handlers = pcall(require, "NeoAI.ui.handlers.chat_handlers")
         if chat_handlers_loaded and chat_handlers then
           local success, result = chat_handlers.send_message(
             content,
-            state.current_session_id or "default",
+            target_session_id,
             "main",
             state.current_window_id,
             true,

@@ -868,7 +868,12 @@ local function try_start_lsp(config_name, bufnr)
       if #after_clients > before_count then
         -- 有新客户端出现，尝试 attach
         for _, c in ipairs(after_clients) do
-          if c.name == config_name or not pcall(function() return before_count >= #vim.lsp.get_clients() end) then
+          if
+            c.name == config_name
+            or not pcall(function()
+              return before_count >= #vim.lsp.get_clients()
+            end)
+          then
             pcall(vim.lsp.buf_attach_client, bufnr, c.id)
           end
         end
@@ -1409,13 +1414,16 @@ local function lsp_request_async(bufnr, method, params, callback)
           for _, c in ipairs(clients) do
             table.insert(client_names, c.name)
           end
-          callback(nil, string.format(
-            "LSP 方法 'textDocument/formatting' 不被任何已连接的服务器支持。\\n" ..
-            "已连接客户端: %s\\n" ..
-            "提示: 当前 LSP 服务器不提供格式化功能。Pyright 是类型检查器，" ..
-            "不支持格式化。请安装 ruff、black 或 autopep8 等格式化工具。",
-            table.concat(client_names, ", ")
-          ))
+          callback(
+            nil,
+            string.format(
+              "LSP 方法 'textDocument/formatting' 不被任何已连接的服务器支持。\\n"
+                .. "已连接客户端: %s\\n"
+                .. "提示: 当前 LSP 服务器不提供格式化功能。Pyright 是类型检查器，"
+                .. "不支持格式化。请安装 ruff、black 或 autopep8 等格式化工具。",
+              table.concat(client_names, ", ")
+            )
+          )
         else
           callback(nil, string.format('LSP 方法 "%s" 不被任何已连接的服务器支持', method))
         end
@@ -1786,7 +1794,7 @@ M.lsp_definition = define_tool({
   },
   returns = { type = "object", description = "定义位置信息列表" },
   category = "lsp",
-  permissions = { read true },
+  permissions = { read = true },
 })
 
 -- ============================================================================
@@ -1917,7 +1925,7 @@ M.lsp_references = define_tool({
     description = "引用位置信息列表",
   },
   category = "lsp",
-  permissions = { read true },
+  permissions = { read = true },
 })
 
 -- ============================================================================
@@ -2036,7 +2044,7 @@ M.lsp_implementation = define_tool({
     description = "实现位置信息列表",
   },
   category = "lsp",
-  permissions = { read true },
+  permissions = { read = true },
 })
 
 -- ============================================================================
@@ -3122,20 +3130,28 @@ local function _lsp_format(args, on_success, on_error)
         if formatters then
           for _, f in ipairs(formatters) do
             local installed = vim.fn.executable(f.cmd) == 1
-            table.insert(available_tools, string.format("  %s %s [%s]",
-              installed and "✓" or "✗", f.name, installed and "已安装" or "未安装"))
+            table.insert(
+              available_tools,
+              string.format(
+                "  %s %s [%s]",
+                installed and "✓" or "✗",
+                f.name,
+                installed and "已安装" or "未安装"
+              )
+            )
           end
         end
-        local tool_list = #available_tools > 0 and table.concat(available_tools, "\\n") or "  （该文件类型无可配置的外部格式化工具）"
+        local tool_list = #available_tools > 0 and table.concat(available_tools, "\\n")
+          or "  （该文件类型无可配置的外部格式化工具）"
 
         local msg = string.format(
-          "LSP 客户端不支持文档格式化（documentFormattingProvider）。\\n" ..
-          "文件类型: %s\\n" ..
-          "已连接的 LSP 客户端: %s\\n\\n" ..
-          "外部格式化工具状态：\\n%s\\n\\n" ..
-          "建议：\\n" ..
-          "  1. 安装上述标记为 ✗ 的工具（如 pip install ruff）\\n" ..
-          "  2. 或使用支持格式化的 LSP 服务器（如 ruff 替代 pyright）",
+          "LSP 客户端不支持文档格式化（documentFormattingProvider）。\\n"
+            .. "文件类型: %s\\n"
+            .. "已连接的 LSP 客户端: %s\\n\\n"
+            .. "外部格式化工具状态：\\n%s\\n\\n"
+            .. "建议：\\n"
+            .. "  1. 安装上述标记为 ✗ 的工具（如 pip install ruff）\\n"
+            .. "  2. 或使用支持格式化的 LSP 服务器（如 ruff 替代 pyright）",
           ft or "未知",
           client_list,
           tool_list
@@ -3789,8 +3805,8 @@ local function _lsp_signature_help(args, on_success, on_error)
           -- 跳过定义位置（class/def 关键字开头的行）
           local trimmed = line_text:match("^%s*(.-)%s*$")
           if not trimmed:match("^class%s") and not trimmed:match("^def%s") and not trimmed:match("^function%s") then
-            fallback_row = line_idx - 1  -- 0-based
-            fallback_col = call_start - 1 + #args.symbol  -- 0-based，定位到函数名末尾
+            fallback_row = line_idx - 1 -- 0-based
+            fallback_col = call_start - 1 + #args.symbol -- 0-based，定位到函数名末尾
             break
           end
         end
@@ -3807,7 +3823,12 @@ local function _lsp_signature_help(args, on_success, on_error)
             return
           end
           local node_type = node:type()
-          if node_type == "call_expression" or node_type == "call" or node_type == "function_call" or node_type == "method_call" then
+          if
+            node_type == "call_expression"
+            or node_type == "call"
+            or node_type == "function_call"
+            or node_type == "method_call"
+          then
             local text = vim.treesitter.get_node_text(node, content) or ""
             -- 使用更宽松的子串匹配
             if text:find(args.symbol, 1, true) then

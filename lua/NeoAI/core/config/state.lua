@@ -23,6 +23,8 @@ local M = {}
 
 -- ========== 协程上下文 ==========
 local _coroutine_contexts = {}
+-- 非协程环境下的当前上下文（当 with_context 在非协程中被调用时使用）
+local _non_coroutine_context = nil
 
 -- ========== 事件触发辅助 ==========
 
@@ -71,8 +73,9 @@ end
 -- ========== 协程内全局共享表快捷 API ==========
 
 --- 获取当前协程的全局共享表
---- 如果不在协程中或没有上下文，返回一个临时空表（不会持久化）
---- @return table
+--- 如果不在协程中或没有上下文，返回 nil
+--- 调用方应处理 nil 情况，或使用 data 参数中的回退值
+--- @return table|nil
 function M.get_shared()
   local ctx = M.get_current_context()
   if not ctx then
@@ -82,19 +85,26 @@ function M.get_shared()
 end
 
 --- 设置协程内全局共享值（快捷方式）
+--- 如果不在协程上下文中，静默忽略
 --- @param key string
 --- @param value any
 function M.set_shared(key, value)
   local shared = M.get_shared()
-  shared[key] = value
+  if shared then
+    shared[key] = value
+  end
 end
 
 --- 获取协程内全局共享值（快捷方式）
+--- 如果不在协程上下文中，返回 default
 --- @param key string
 --- @param default any 默认值
 --- @return any
 function M.get_shared_value(key, default)
   local shared = M.get_shared()
+  if not shared then
+    return default
+  end
   local v = shared[key]
   if v == nil then
     return default
@@ -107,7 +117,7 @@ end
 function M.get_current_context()
   local co = coroutine.running()
   if not co then
-    return nil
+    return _non_coroutine_context
   end
   return _coroutine_contexts[co]
 end
@@ -119,9 +129,11 @@ end
 --- @return ... 函数返回值
 function M.with_context(context, fn, ...)
   local co = coroutine.running()
-  local prev_context = co and _coroutine_contexts[co] or nil
+  local prev_context = co and _coroutine_contexts[co] or _non_coroutine_context
   if co then
     _coroutine_contexts[co] = context
+  else
+    _non_coroutine_context = context
   end
   local ok, result1, result2, result3 = pcall(fn, ...)
   if co then
@@ -130,6 +142,8 @@ function M.with_context(context, fn, ...)
     else
       _coroutine_contexts[co] = nil
     end
+  else
+    _non_coroutine_context = prev_context
   end
   if not ok then
     error(result1)
@@ -140,6 +154,7 @@ end
 --- 重置状态（测试用）
 function M._test_reset()
   _coroutine_contexts = {}
+  _non_coroutine_context = nil
 end
 
 return M

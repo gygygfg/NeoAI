@@ -8,7 +8,7 @@ local test
 function M.run(test_module)
   test = test_module or require("NeoAI.tests")
   local assert = test.assert
-  print("\n=== test_config ===")
+  test._logger.info("\n=== test_config ===")
 
   local function setup_merger_state()
     local merger = require("NeoAI.core.config.merger")

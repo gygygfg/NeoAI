@@ -35,6 +35,31 @@ function M.clear_tool_configs()
   _state = {}
 end
 
+--- 设置工具允许全部通过（跳过审批）
+--- @param tool_name string 工具名称
+function M.set_allow_all(tool_name)
+  if not _state[tool_name] then
+    _state[tool_name] = {}
+  end
+  _state[tool_name].allow_all = true
+end
+
+--- 检查工具是否已设置允许全部通过
+--- @param tool_name string 工具名称
+--- @return boolean
+function M.is_allow_all(tool_name)
+  local config = _state[tool_name]
+  return config and config.allow_all == true
+end
+
+--- 清除工具的允许全部标志
+--- @param tool_name string 工具名称
+function M.clear_allow_all(tool_name)
+  if _state[tool_name] then
+    _state[tool_name].allow_all = nil
+  end
+end
+
 --- 重置所有状态
 function M.reset()
   _state = {}

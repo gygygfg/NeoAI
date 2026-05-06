@@ -468,53 +468,69 @@ function M.execute(tool_name, args)
     done = true
   end)
 
-  -- 使用 vim.wait 但超时时间可配置，且仅在主线程安全时调用
-  -- 注意：如果在 vim.schedule 回调中调用此函数，vim.wait 会阻塞事件循环
-  -- 建议优先使用 execute_async 进行非阻塞调用
-  -- 增强版：感知审批暂停，暂停期间不计入超时
-  vim.wait(timeout_ms + 60000, function()  -- 多给 60 秒缓冲，实际超时由内部逻辑控制
-    if done then
-      return true
-    end
+  -- 检测 headless 模式
+  -- 使用 vim.api.nvim_list_uis() 是最可靠的检测方式
+  -- 在 headless 模式下，nvim_list_uis() 返回空表 {}
+  -- 注意：vim.env.NVIM_HEADLESS 可能为 nil，vim.g.colors_name 可能被 colorscheme 插件设置
+  local uis = vim.api.nvim_list_uis()
+  local is_headless = #uis == 0 or vim.env.NVIM_HEADLESS == "1"
 
-    -- 检查审批暂停状态
-    local approval_handler = require("NeoAI.tools.approval_handler")
-    if approval_handler.is_paused() then
-      if not was_paused then
-        -- 刚进入暂停状态，记录开始时间
-        was_paused = true
-        pause_check_start = vim.loop.hrtime()
+  if is_headless then
+    -- headless 模式下使用 vim.wait（能正确处理 vim.schedule 回调）
+    -- vim.uv.run('once') 在 headless 模式下无法处理 vim.schedule 回调
+    local wait_timeout = timeout_ms + 30000
+    vim.wait(wait_timeout, function()
+      if done then
+        return true
       end
-      -- 暂停期间不累加 elapsed_ms
       return false
-    else
-      if was_paused then
-        -- 刚从暂停恢复，累加暂停时长
-        if pause_check_start then
-          local pause_ns = vim.loop.hrtime() - pause_check_start
-          paused_during_wait = paused_during_wait + pause_ns
-        end
-        was_paused = false
-        pause_check_start = nil
-      end
-    end
-
-    -- 计算实际经过时间（扣除暂停时间）
-    local now = vim.loop.hrtime()
-    if not M._execute_start_time then
-      M._execute_start_time = now
-    end
-    local actual_elapsed_ns = now - M._execute_start_time - paused_during_wait
-    elapsed_ms = actual_elapsed_ns / 1000000
-
-    if elapsed_ms >= timeout_ms then
-      -- 超时，设置错误信息
+    end, poll_interval_ms)
+    if not done and not error_msg then
       error_msg = string.format("工具执行超时（%d 秒）", timeout_ms / 1000)
-      return true
     end
+  else
+    -- 正常模式下使用 vim.wait
+    -- 增强版：感知审批暂停，暂停期间不计入超时
+    local wait_timeout = timeout_ms + 30000  -- 最多多给 30 秒缓冲
+    vim.wait(wait_timeout, function()
+      if done then
+        return true
+      end
 
-    return false
-  end, poll_interval_ms)
+      -- 检查审批暂停状态
+      local approval_handler = require("NeoAI.tools.approval_handler")
+      if approval_handler.is_paused() then
+        if not was_paused then
+          was_paused = true
+          pause_check_start = vim.loop.hrtime()
+        end
+        return false
+      else
+        if was_paused then
+          if pause_check_start then
+            local pause_ns = vim.loop.hrtime() - pause_check_start
+            paused_during_wait = paused_during_wait + pause_ns
+          end
+          was_paused = false
+          pause_check_start = nil
+        end
+      end
+
+      local now = vim.loop.hrtime()
+      if not M._execute_start_time then
+        M._execute_start_time = now
+      end
+      local actual_elapsed_ns = now - M._execute_start_time - paused_during_wait
+      elapsed_ms = actual_elapsed_ns / 1000000
+
+      if elapsed_ms >= timeout_ms then
+        error_msg = string.format("工具执行超时（%d 秒）", timeout_ms / 1000)
+        return true
+      end
+
+      return false
+    end, poll_interval_ms)
+  end
 
   -- 清理起始时间
   M._execute_start_time = nil

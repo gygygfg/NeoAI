@@ -3,9 +3,8 @@
 --- 职责：构建 AI API 请求体、格式化消息、构建工具结果消息
 ---
 --- 状态管理：
----   tool_definitions 和 first_request 存储在 state_manager 的 "ai_engine" 切片中
----   （由 ai_engine.set_tools() 统一管理），通过 state_manager 读写
----   tool_call_counter 是模块内部计数器，保留在闭包内
+---   tool_definitions、first_request、tool_call_counter 均为模块闭包内私有状态
+---   协程上下文共享数据（session_id、ai_preset 等）通过 state_manager 访问
 
 local logger = require("NeoAI.utils.logger")
 local http_utils = require("NeoAI.core.ai.http_utils")
@@ -258,7 +257,8 @@ function M.build_request(params)
       tools_enabled = options.tools_enabled
     else
       local core = require("NeoAI.core")
-      local full_config = core.get_config() or {}
+      local ok, full_config = pcall(core.get_config)
+      full_config = ok and full_config or {}
       if full_config and full_config.tools and full_config.tools.enabled ~= nil then
         tools_enabled = full_config.tools.enabled
       elseif full_config and full_config.ai then

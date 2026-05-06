@@ -8,7 +8,7 @@ local test
 function M.run(test_module)
   test = test_module or require("NeoAI.tests")
   local assert = test.assert
-  print("\n=== test_events_keymaps ===")
+  test._logger.info("\n=== test_events_keymaps ===")
 
   local function init_km()
     -- 删除保存的 keymap 文件，避免影响测试

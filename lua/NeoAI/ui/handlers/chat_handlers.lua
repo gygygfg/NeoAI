@@ -9,7 +9,6 @@
 local M = {}
 
 local Events = require("NeoAI.core.events")
-local state_manager = require("NeoAI.core.config.state")
 
 local state = {
   initialized = false,
@@ -122,9 +121,7 @@ end
 --- @param data table 事件数据
 function M._handle_tool_result(data)
   local tool_results = data.tool_results or {}
-  -- 优先从协程共享表读取 session_id
-  local shared = state_manager.get_shared()
-  local session_id = data.session_id or shared.session_id
+  local session_id = data.session_id
 
   if not session_id or #tool_results == 0 then
     return
@@ -137,9 +134,7 @@ end
 
 function M._handle_response_complete(data)
   local response = data.response
-  -- 优先从协程共享表读取 session_id
-  local shared = state_manager.get_shared()
-  local session_id = data.session_id or shared.session_id
+  local session_id = data.session_id
   local usage = data.usage or {}
   local reasoning_text = data.reasoning_text or ""
 

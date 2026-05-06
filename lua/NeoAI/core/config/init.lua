@@ -4,8 +4,8 @@
 local M = {}
 
 M.keymap_manager = require("NeoAI.core.config.keymap_manager")
-M.state = require("NeoAI.core.config.state")
 M.merger = require("NeoAI.core.config.merger")
+M.state = require("NeoAI.core.config.state")
 
 --- 初始化所有配置子模块
 --- @param config table 完整配置

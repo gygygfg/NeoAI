@@ -2,7 +2,6 @@ local M = {}
 
 local logger = require("NeoAI.utils.logger")
 local window_manager = require("NeoAI.ui.window.window_manager")
-local state_manager = require("NeoAI.core.config.state")
 
 local function buf_valid(buf) return buf and vim.api.nvim_buf_is_valid(buf) end
 local function win_valid(win) return win and vim.api.nvim_win_is_valid(win) end

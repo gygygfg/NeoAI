@@ -1,44 +1,15 @@
 --- NeoAI 测试入口
 --- 通过主 init.lua 导入，拿到合并后的测试配置
 --- 用法:
----   nvim --headless -c "lua dofile('/path/to/NeoAI/lua/NeoAI/tests/init.lua')"
+---   :NeoAITest
 ---
 --- 或运行单个测试文件:
----   nvim --headless -c "lua dofile('/path/to/NeoAI/lua/NeoAI/tests/test_default_config.lua')"
+---   :NeoAITest test_default_config
 
 local M = {}
 
 -- 测试配置（合并到默认配置上）
 M.test_config = {
-  ai = {
-    default = "test",
-    providers = {
-      test_provider = {
-        api_type = "openai",
-        base_url = "https://test.api.example.com/v1/chat/completions",
-        api_key = "test-api-key",
-        models = { "test-model-v1", "test-model-v2" },
-      },
-    },
-    scenarios = {
-      chat = {
-        provider = "test_provider",
-        model_name = "test-model-v1",
-        temperature = 0.5,
-        max_tokens = 100,
-        stream = false,
-        timeout = 5000,
-      },
-      coding = {
-        provider = "test_provider",
-        model_name = "test-model-v2",
-        temperature = 0.2,
-        max_tokens = 200,
-        stream = false,
-        timeout = 5000,
-      },
-    },
-  },
   ui = {
     default_ui = "chat",
     window_mode = "float",
@@ -64,6 +35,22 @@ M.test_config = {
       open_chat = { key = "<leader>cc", desc = "测试打开聊天" },
     },
   },
+  log = {
+    -- 日志级别: 'DEBUG', 'INFO', 'WARN', 'ERROR', 'FATAL'
+    level = "DEBUG",
+    -- 输出文件路径（可选，默认输出到文件，避免 print 阻塞消息区域）
+    output_path = "/root/NeoAI/pack/plugins/start/NeoAI/lua/NeoAI/neoai.log",
+    -- 日志格式模板
+    format = "[{time}] [{level}] {message}",
+    -- 最大文件大小（字节），默认 10MB
+    max_file_size = 10485760,
+    -- 最大备份文件数量
+    max_backups = 5,
+    -- 是否启用详细输出（verbose 模式）
+    verbose = true,
+    -- 是否启用调试打印到控制台
+    print_debug = false,
+  },
 }
 
 --- 获取合并后的完整配置
@@ -86,28 +73,44 @@ function M.get_merged_config()
   return state.get_state("config", "data")
 end
 
---- 运行所有测试
-function M.run_all()
-  local tests = {
-    "test_init_modules",   -- 合并: config_init, core_init, ai_init, ui_init, tools_init, utils_init, main_init
-    "test_config",         -- 合并: default_config, state, config_merger
-    "test_history",        -- 合并: history_manager, history_cache, history_persistence, history_saver
-    "test_tools",          -- 合并: tool_registry, tool_executor, tool_validator, tool_pack
-    "test_utils",          -- 合并: utils_common, utils_logger, utils_json, utils_table_utils, utils_file_utils, async_worker
+--- 运行所有测试（或指定测试）
+--- @param ... string|nil 要运行的测试名称列表（不带 test_ 前缀，如 "config"）
+function M.run_all(...)
+  local all_tests = {
+    "test_init_modules", -- 合并: config_init, core_init, ai_init, ui_init, tools_init, utils_init, main_init
+    "test_config", -- 合并: default_config, state, config_merger
+    "test_history", -- 合并: history_manager, history_cache, history_persistence, history_saver
+    "test_tools", -- 合并: tool_registry, tool_executor, tool_validator, tool_pack
+    "test_utils", -- 合并: utils_common, utils_logger, utils_json, utils_table_utils, utils_file_utils, async_worker
     "test_events_keymaps", -- 合并: event_constants, keymap_manager
-    "test_ai_core_part1",  -- 合并: ai_engine, chat_service, response_retry
-    "test_ai_core_part2",  -- 合并: tool_orchestrator, request_adapter, request_builder, stream_processor
-    "test_http_client",    -- 包含特殊字符编码测试
-    "test_integration",    -- 端到端集成测试：完整 setup、真实 HTTP 请求、工具循环、命令注册
+    "test_ai_core", -- 合并: ai_engine, chat_service, response_retry
+    "test_http_client", -- 包含特殊字符编码测试
+    "test_integration", -- 端到端集成测试：完整 setup、真实 HTTP 请求、工具循环、命令注册
   }
+
+  -- 如果传入了指定测试名称，只运行这些
+  local tests
+  if select("#", ...) > 0 then
+    tests = {}
+    for i = 1, select("#", ...) do
+      local name = select(i, ...)
+      -- 自动补全 test_ 前缀
+      if not name:match("^test_") then
+        name = "test_" .. name
+      end
+      table.insert(tests, name)
+    end
+  else
+    tests = all_tests
+  end
 
   -- 确保 package.loaded 中已有本模块引用，避免测试文件内部
   -- require("NeoAI.tests") 导致循环依赖
   package.loaded["NeoAI.tests"] = M
 
-  -- 设置日志级别为 ERROR，避免测试过程中输出大量 DEBUG 日志
+  -- 保存 logger 到模块，供 M.test 使用
   local logger = require("NeoAI.utils.logger")
-  logger.initialize({ level = "ERROR" })
+  M._logger = logger
 
   -- 设置全局标志，禁止测试文件的自动运行代码执行
   _G._NEOAI_TEST_RUNNING = true
@@ -117,6 +120,17 @@ function M.run_all()
   -- 获取当前脚本所在目录
   local info = debug.getinfo(1, "S")
   local base_dir = info.source:match("^@?(.*/)") or "."
+
+  -- 检测是否为 headless 模式
+  -- 使用 vim.api.nvim_list_uis() 是最可靠的检测方式
+  -- 在 headless 模式下，nvim_list_uis() 返回空表 {}
+  -- 注意：colors_name 可能被 colorscheme 插件设置，不能作为 headless 检测依据
+  local uis = vim.api.nvim_list_uis()
+  local is_headless = #uis == 0
+  if vim.env.NVIM_HEADLESS then
+    is_headless = true
+  end
+
   for _, name in ipairs(tests) do
     -- 注意：不清理 NeoAI 模块缓存，因为测试文件依赖模块的初始化状态。
     -- 每个测试文件通过 _test_reset() 自行管理内部状态。
@@ -141,6 +155,14 @@ function M.run_all()
     if not ok then
       results.failed = results.failed + 1
       table.insert(results.errors, "[" .. name .. "] " .. tostring(err))
+    end
+
+    -- 每个测试文件运行后，强制处理一次事件循环，避免 vim.schedule 回调堆积
+    -- 在 headless 模式下尤其重要
+    if is_headless then
+      vim.wait(10, function()
+        return false
+      end)
     end
   end
 
@@ -249,10 +271,10 @@ M.assert = {
 function M.test(name, fn)
   local ok, err = pcall(fn)
   if ok then
-    print(string.format("  ✓ %s", name))
+    M._logger.info(string.format("  ✓ %s", name))
     return true
   else
-    print(string.format("  ✗ %s: %s", name, tostring(err)))
+    M._logger.error(string.format("  ✗ %s: %s", name, tostring(err)))
     return false
   end
 end
@@ -291,18 +313,6 @@ function M.run_tests(tests)
     end
   end
   return results
-end
-
--- 如果直接运行此文件，执行所有测试
-if pcall(vim.api.nvim_buf_get_name, 0) then
-  local results = M.run_all()
-  print(string.format("\n测试结果: %d 通过, %d 失败", results.passed, results.failed))
-  if #results.errors > 0 then
-    print("失败的测试:")
-    for _, e in ipairs(results.errors) do
-      print("  " .. e)
-    end
-  end
 end
 
 return M

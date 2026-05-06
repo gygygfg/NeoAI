@@ -5,8 +5,6 @@
 
 local M = {}
 
-local state_manager = require("NeoAI.core.config.state")
-
 local state = {
   initialized = false,
   config = nil,

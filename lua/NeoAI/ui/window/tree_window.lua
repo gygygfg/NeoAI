@@ -8,6 +8,7 @@ local logger = require("NeoAI.utils.logger")
 local Events = require("NeoAI.core.events")
 local window_manager = require("NeoAI.ui.window.window_manager")
 local async_worker = require("NeoAI.utils.async_worker")
+local state_manager = require("NeoAI.core.config.state")
 
 local state = {
   initialized = false,
@@ -81,12 +82,25 @@ function M.open(session_id, window_id)
     data = { window_id = window_id },
   })
 
+  -- 获取窗口的协程上下文（由 window_manager.create_window 创建）
+  -- 后续所有协程内共享变量通过此上下文隔离
+  local ctx = window_manager.get_window_context(window_id)
+
   -- 异步加载并渲染
   M._load_and_render_async(function()
-    M.set_keymaps()
-    M._update_float_window()
-    -- 渲染完成后将光标移动到第一个有效节点行
-    M._move_cursor_to_first_node()
+    -- 在窗口的协程上下文中执行初始化操作
+    local init_fn = function()
+      M.set_keymaps()
+      M._update_float_window()
+      -- 渲染完成后将光标移动到第一个有效节点行
+      M._move_cursor_to_first_node()
+    end
+
+    if ctx then
+      state_manager.with_context(ctx, init_fn)
+    else
+      init_fn()
+    end
   end)
 
   -- 监听会话重命名事件，自动刷新树

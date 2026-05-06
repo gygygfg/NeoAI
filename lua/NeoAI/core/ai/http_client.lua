@@ -7,6 +7,7 @@ local logger = require("NeoAI.utils.logger")
 local json = require("NeoAI.utils.json")
 local request_adapter = require("NeoAI.core.ai.request_adapter")
 local http_utils = require("NeoAI.core.ai.http_utils")
+local state_manager = require("NeoAI.core.config.state")
 
 local state = {
   initialized = false,
@@ -40,11 +41,7 @@ function M.send_request(params)
   end
 
   -- 优先从协程共享表读取参数
-  local shared = nil
-  pcall(function()
-    local sm = require("NeoAI.core.config.state")
-    shared = sm.get_shared()
-  end)
+  local shared = state_manager.get_shared()
   local ai_preset = shared and shared.ai_preset or {}
 
   local request = params.request
@@ -257,11 +254,7 @@ function M.send_request_retry(params, on_complete)
     return nil
   end
 
-  local shared = nil
-  pcall(function()
-    local sm = require("NeoAI.core.config.state")
-    shared = sm.get_shared()
-  end)
+  local shared = state_manager.get_shared()
   local ai_preset = shared and shared.ai_preset or {}
 
   local request = params.request
@@ -360,11 +353,7 @@ function M.send_stream_request(params, on_chunk, on_complete, on_error)
   end
 
   -- 优先从协程共享表读取参数
-  local shared = nil
-  pcall(function()
-    local sm = require("NeoAI.core.config.state")
-    shared = sm.get_shared()
-  end)
+  local shared = state_manager.get_shared()
   local ai_preset = shared and shared.ai_preset or {}
 
   local request = params.request
@@ -721,11 +710,7 @@ function M.send_request_async(params, on_complete)
   end
 
   -- 优先从协程共享表读取参数
-  local shared = nil
-  pcall(function()
-    local sm = require("NeoAI.core.config.state")
-    shared = sm.get_shared()
-  end)
+  local shared = state_manager.get_shared()
   local ai_preset = shared and shared.ai_preset or {}
 
   local request = params.request

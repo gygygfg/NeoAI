@@ -448,7 +448,7 @@ end
 
 M.parse_file = define_tool({
   name = "parse_file",
-  description = "解析文件并返回 Tree-sitter 语法树节点信息，支持 filepath（单个文件路径）和 filepaths（路径列表）参数。如果解析器未安装，会自动尝试安装。",
+  description = "解析文件并返回 Tree-sitter 语法树节点信息，支持 filepath（单个文件路径）和 filepaths（路径列表）参数。",
   func = _parse_file,
   async = true,
   parameters = {
@@ -581,7 +581,7 @@ end
 
 M.query_tree = define_tool({
   name = "query_tree",
-  description = "使用 Tree-sitter 查询模式捕获文件中语法树节点，支持自定义查询字符串。如果解析器未安装，会自动尝试安装。",
+  description = "使用 Tree-sitter 查询模式捕获文件中语法树节点，支持自定义查询字符串。",
   func = _query_tree,
   async = true,
   parameters = {
@@ -735,7 +735,7 @@ end
 
 M.get_node_at_position = define_tool({
   name = "get_node_at_position",
-  description = "获取文件中指定位置（行、列）的 Tree-sitter 语法树节点，包含父节点链和子节点信息。如果解析器未安装，会自动尝试安装。",
+  description = "获取文件中指定位置（行、列）的 Tree-sitter 语法树节点，包含父节点链和子节点信息。",
   func = _get_node_at_position,
   async = true,
   parameters = {
@@ -830,7 +830,7 @@ end
 
 M.get_node_type = define_tool({
   name = "get_node_type",
-  description = "获取文件中匹配节点的类型信息，支持按 node_type、text、named 属性过滤。如果解析器未安装，会自动尝试安装。",
+  description = "获取文件中匹配节点的类型信息，支持按 node_type、text、named 属性过滤。",
   func = _get_node_type,
   async = true,
   parameters = {
@@ -952,7 +952,7 @@ end
 
 M.get_node_range = define_tool({
   name = "get_node_range",
-  description = "获取文件中匹配节点的范围信息（返回: 起始行/列、结束行/列），支持按 node_type、text、named 属性过滤，可选返回带行号的节点代码。如果解析器未安装，会自动尝试安装。",
+  description = "获取文件中匹配节点的范围信息（返回: 起始行/列、结束行/列），支持按 node_type、text、named 属性过滤，可选返回带行号的节点代码。",
   func = _get_node_range,
   async = true,
   parameters = {
@@ -1001,7 +1001,7 @@ end
 
 M.is_named_node = define_tool({
   name = "is_named_node",
-  description = "检查文件中匹配节点是否为命名节点，支持按 node_type、text 属性过滤。如果解析器未安装，会自动尝试安装。",
+  description = "检查文件中匹配节点是否为命名节点，支持按 node_type、text 属性过滤。",
   func = _is_named_node,
   async = true,
   parameters = {
@@ -1117,7 +1117,7 @@ end
 
 M.get_parent_node = define_tool({
   name = "get_parent_node",
-  description = "获取文件中匹配节点的父节点信息，支持按 node_type、text、named 属性过滤目标节点。如果解析器未安装，会自动尝试安装。",
+  description = "获取文件中匹配节点的父节点信息，支持按 node_type、text、named 属性过滤目标节点。",
   func = _get_parent_node,
   async = true,
   parameters = {
@@ -1183,7 +1183,7 @@ end
 
 M.get_child_nodes = define_tool({
   name = "get_child_nodes",
-  description = "获取文件中匹配节点的直接子节点列表，支持按 node_type、text、named 属性过滤父节点。如果解析器未安装，会自动尝试安装。",
+  description = "获取文件中匹配节点的直接子节点列表，支持按 node_type、text、named 属性过滤父节点。",
   func = _get_child_nodes,
   async = true,
   parameters = {
@@ -1199,6 +1199,382 @@ M.get_child_nodes = define_tool({
   returns = { type = "object", description = "匹配父节点的子节点列表" },
   category = "treesitter",
   permissions = { read = true },
+})
+
+-- ============================================================================
+-- 工具 get_node_code - 获取指定节点的源代码（回调模式）
+-- ============================================================================
+
+local function _get_node_code(args, on_success, on_error)
+  if not check_ts() then
+    if on_error then
+      on_error("Tree-sitter 不可用（需要 Neovim >= 0.5）")
+    end
+    return
+  end
+  if not args or not args.filepath then
+    if on_error then
+      on_error("需要 filepath（文件路径）参数")
+    end
+    return
+  end
+
+  parse_file_content_async(args.filepath, -1, function(result)
+    local filtered, fallback = filter_nodes(result.nodes, args)
+    if #filtered == 0 then
+      if on_error then
+        on_error("未找到匹配的节点")
+      end
+      return
+    end
+
+    -- 异步读取文件内容以提取精确的源代码
+    read_file_content_async(args.filepath, function(content)
+      local file_lines = vim.split(content, "\n", { plain = true })
+      local code_lines = {}
+      local first_node = filtered[1]
+      for line_num = first_node.start_row, first_node.end_row do
+        local line_content = file_lines[line_num + 1] or ""
+        if line_num == first_node.start_row and line_num == first_node.end_row then
+          line_content = line_content:sub(first_node.start_col + 1, first_node.end_col + 1)
+        elseif line_num == first_node.start_row then
+          line_content = line_content:sub(first_node.start_col + 1)
+        elseif line_num == first_node.end_row then
+          line_content = line_content:sub(1, first_node.end_col + 1)
+        end
+        table.insert(code_lines, line_content)
+      end
+
+      local ret = {
+        filepath = args.filepath,
+        language = result.language,
+        node_type = first_node.type,
+        start_row = first_node.start_row,
+        start_col = first_node.start_col,
+        end_row = first_node.end_row,
+        end_col = first_node.end_col,
+        code = table.concat(code_lines, "\n"),
+      }
+      if fallback then
+        ret.warning = "未找到指定 node_type '"
+          .. (args.node_type or "")
+          .. "' 的节点，已回退到同类型节点"
+      end
+      if on_success then
+        on_success(ret)
+      end
+    end, function(err)
+      if on_error then
+        on_error(err)
+      end
+    end)
+  end, function(err)
+    if on_error then
+      on_error(err or "解析结果为空")
+    end
+  end)
+end
+
+M.get_node_code = define_tool({
+  name = "get_node_code",
+  description = "获取文件中匹配节点的精确源代码，返回纯文本代码。支持按 node_type、text、named 属性过滤。",
+  func = _get_node_code,
+  async = true,
+  parameters = {
+    type = "object",
+    properties = {
+      filepath = { type = "string", description = "文件路径" },
+      node_type = { type = "string", description = "节点类型过滤（可选），如 'function_definition'" },
+      text = { type = "string", description = "节点文本过滤（可选）" },
+      named = { type = "boolean", description = "是否为命名节点（可选）" },
+    },
+    required = { "filepath" },
+  },
+  returns = { type = "object", description = "匹配节点的源代码（code 字段为纯文本）" },
+  category = "treesitter",
+  permissions = { read = true },
+})
+
+-- ============================================================================
+-- 工具 delete_node - 删除指定节点（回调模式）
+-- 仅支持删除有代码块结构的节点（函数、类、结构体等），防止误删表达式等细粒度节点
+-- ============================================================================
+
+-- 代码块结构节点类型白名单（各语言通用的结构节点）
+-- 只有这些类型的节点可以被删除，防止误删表达式、变量名等细粒度节点
+local block_node_types = {
+  -- 通用
+  function_definition = true,
+  class_definition = true,
+  class_declaration = true,
+  struct_specifier = true,
+  enum_specifier = true,
+  union_specifier = true,
+  interface_declaration = true,
+  type_declaration = true,
+  method_definition = true,
+  constructor_definition = true,
+  destructor_definition = true,
+  -- 控制流块
+  if_statement = true,
+  else_clause = true,
+  switch_statement = true,
+  case_statement = true,
+  for_statement = true,
+  while_statement = true,
+  do_statement = true,
+  try_statement = true,
+  catch_clause = true,
+  finally_clause = true,
+  -- 模块/命名空间
+  module = true,
+  program = true,
+  translation_unit = true,
+  -- 其他代码块
+  block = true,
+  body = true,
+  declaration = true,
+  template_declaration = true,
+  -- Lua
+  local_function_declaration = true,
+  -- Python
+  decorated_definition = true,
+  -- JavaScript/TypeScript
+  arrow_function = true,
+  generator_function = true,
+  export_statement = true,
+  lexical_declaration = true,
+  variable_declaration = true,
+  -- Go
+  func_declaration = true,
+  method_declaration = true,
+  -- Rust
+  impl_item = true,
+  trait_item = true,
+  -- 宏
+  macro_definition = true,
+  macro_invocation = true,
+}
+
+local function _delete_node(args, on_success, on_error)
+  if not check_ts() then
+    if on_error then
+      on_error("Tree-sitter 不可用（需要 Neovim >= 0.5）")
+    end
+    return
+  end
+  if not args or not args.filepath then
+    if on_error then
+      on_error("需要 filepath（文件路径）参数")
+    end
+    return
+  end
+
+  parse_file_content_async(args.filepath, -1, function(result)
+    local filtered, fallback = filter_nodes(result.nodes, args)
+    if #filtered == 0 then
+      if on_error then
+        on_error("未找到匹配的节点")
+      end
+      return
+    end
+
+    -- 检查节点是否可删除（必须是代码块结构节点）
+    local deletable = {}
+    local skipped = {}
+    for _, node in ipairs(filtered) do
+      if block_node_types[node.type] then
+        table.insert(deletable, node)
+      else
+        table.insert(skipped, node.type)
+      end
+    end
+
+    if #deletable == 0 then
+      local msg = "没有可删除的代码块结构节点。匹配到的节点类型（"
+        .. table.concat(skipped, ", ")
+        .. "）不是函数、类、结构体等代码块结构。请指定一个更具体的 node_type，如 'function_definition'"
+      if on_error then
+        on_error(msg)
+      end
+      return
+    end
+
+    if #skipped > 0 then
+      -- 有跳过的节点，在结果中给出提示
+    end
+
+    -- 异步读取文件内容
+    read_file_content_async(args.filepath, function(content)
+      local file_lines = vim.split(content, "\n", { plain = true })
+      local deletions = {}
+
+      for _, node in ipairs(filtered) do
+        local sr, sc, er, ec = node.start_row, node.start_col, node.end_row, node.end_col
+        local deleted_code = {}
+        for line_num = sr, er do
+          local line_content = file_lines[line_num + 1] or ""
+          if line_num == sr and line_num == er then
+            table.insert(deleted_code, line_content:sub(sc + 1, ec + 1))
+          elseif line_num == sr then
+            table.insert(deleted_code, line_content:sub(sc + 1))
+          elseif line_num == er then
+            table.insert(deleted_code, line_content:sub(1, ec + 1))
+          else
+            table.insert(deleted_code, line_content)
+          end
+        end
+        table.insert(deletions, {
+          type = node.type,
+          text = node.text,
+          start_row = sr,
+          start_col = sc,
+          end_row = er,
+          end_col = ec,
+          deleted_code = table.concat(deleted_code, "\n"),
+        })
+      end
+
+      -- 从后往前删除（避免行号偏移）
+      table.sort(deletions, function(a, b)
+        if a.start_row ~= b.start_row then
+          return a.start_row > b.start_row
+        end
+        return a.start_col > b.start_col
+      end)
+
+      local new_lines = {}
+      for i, line in ipairs(file_lines) do
+        table.insert(new_lines, line)
+      end
+
+      for _, del in ipairs(deletions) do
+        local sr, sc, er, ec = del.start_row, del.start_col, del.end_row, del.end_col
+        if sr == er then
+          -- 单行删除：从该行移除 sc..ec 范围
+          local line = new_lines[sr + 1]
+          if line then
+            local before = line:sub(1, sc)
+            local after = line:sub(ec + 2) or ""
+            new_lines[sr + 1] = before .. after
+          end
+        else
+          -- 多行删除
+          local first_line = new_lines[sr + 1]
+          local last_line = new_lines[er + 1]
+          if first_line and last_line then
+            local before = first_line:sub(1, sc)
+            local after = last_line:sub(ec + 2) or ""
+            new_lines[sr + 1] = before .. after
+            -- 移除中间行和末行
+            for r = er, sr + 1, -1 do
+              table.remove(new_lines, r + 1)
+            end
+          end
+        end
+      end
+
+      local new_content = table.concat(new_lines, "\n")
+
+      -- 写入文件
+      local fu_ok, fu = pcall(require, "NeoAI.tools.builtin.file_tools")
+      if fu_ok and fu and fu.write_file then
+        -- 使用 file_tools 的 write_file 写入
+        local write_ok = false
+        fu.write_file({ filepath = args.filepath, content = new_content }, function(res)
+          write_ok = true
+          local ret = {
+            filepath = args.filepath,
+            language = result.language,
+            deleted_count = #deletions,
+            deletions = deletions,
+          }
+          if fallback then
+            ret.warning = "未找到指定 node_type '"
+              .. (args.node_type or "")
+              .. "' 的节点，已回退到同类型节点"
+          end
+          if #skipped > 0 then
+            ret.skipped_types = skipped
+            ret.skipped_message = "以下节点类型不是代码块结构，已跳过: " .. table.concat(skipped, ", ")
+          end
+          if on_success then
+            on_success(ret)
+          end
+        end, function(err)
+          if on_error then
+            on_error("删除节点后写入文件失败: " .. (err or "未知错误"))
+          end
+        end)
+      else
+        -- 直接使用 vim.uv 写入
+        vim.uv.fs_open(args.filepath, "w", 438, function(open_err, fd)
+          if open_err or not fd then
+            if on_error then
+              on_error("无法打开文件写入: " .. (open_err or "未知错误"))
+            end
+            return
+          end
+          vim.uv.fs_write(fd, new_content, -1, nil, function(write_err, _)
+            vim.uv.fs_close(fd)
+            if write_err then
+              if on_error then
+                on_error("写入文件失败: " .. tostring(write_err))
+              end
+              return
+            end
+            local ret = {
+              filepath = args.filepath,
+              language = result.language,
+              deleted_count = #deletions,
+              deletions = deletions,
+            }
+            if fallback then
+              ret.warning = "未找到指定 node_type '"
+                .. (args.node_type or "")
+                .. "' 的节点，已回退到同类型节点"
+            end
+            if #skipped > 0 then
+              ret.skipped_types = skipped
+              ret.skipped_message = "以下节点类型不是代码块结构，已跳过: "
+                .. table.concat(skipped, ", ")
+            end
+            if on_success then
+              on_success(ret)
+            end
+          end)
+        end)
+      end
+    end, function(err)
+      if on_error then
+        on_error(err)
+      end
+    end)
+  end, function(err)
+    if on_error then
+      on_error(err or "解析结果为空")
+    end
+  end)
+end
+
+M.delete_node = define_tool({
+  name = "delete_node",
+  description = "删除文件中匹配的 Tree-sitter 语法树节点，支持按 node_type、text、named 属性过滤。删除后自动保存文件。",
+  func = _delete_node,
+  async = true,
+  parameters = {
+    type = "object",
+    properties = {
+      filepath = { type = "string", description = "文件路径" },
+      node_type = { type = "string", description = "节点类型过滤（可选），如 'function_definition'" },
+      text = { type = "string", description = "节点文本过滤（可选）" },
+      named = { type = "boolean", description = "是否为命名节点（可选）" },
+    },
+    required = { "filepath" },
+  },
+  returns = { type = "object", description = "删除结果，包含被删除的节点信息" },
+  category = "treesitter",
+  permissions = { write = true },
 })
 
 -- get_tools() - 返回所有工具列表供注册

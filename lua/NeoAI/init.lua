@@ -8,12 +8,11 @@ local core = require("NeoAI.core")
 local ui = require("NeoAI.ui")
 local tools = require("NeoAI.tools")
 
-
 -- ========== 闭包内私有状态 ==========
 local core_ref
 local ui_ref
 local tools_ref
-local _config  -- 合并后的完整配置
+local _config -- 合并后的完整配置
 
 -- ========== 公共接口 ==========
 local M = {}
@@ -96,6 +95,42 @@ local function register_commands()
     desc = "显示NeoAI键位配置",
   })
 
+  -- NeoAITest 命令：运行测试（懒加载 tests/init.lua）
+  vim.api.nvim_create_user_command("NeoAITest", function(opts)
+    local ok, tests = pcall(require, "NeoAI.tests")
+    if not ok then
+      vim.notify("[NeoAI] 测试模块加载失败: " .. tostring(tests), vim.log.levels.ERROR)
+      return
+    end
+    local args = opts.args
+    if args and args ~= "" then
+      local tests_to_run = {}
+      for arg in args:gmatch("%S+") do
+        table.insert(tests_to_run, arg)
+      end
+      local results = tests.run_all(table.unpack(tests_to_run))
+      print(string.format("\n测试结果: %d 通过, %d 失败", results.passed, results.failed))
+      if #results.errors > 0 then
+        print("失败的测试:")
+        for _, e in ipairs(results.errors) do
+          print("  " .. e)
+        end
+      end
+    else
+      local results = tests.run_all()
+      print(string.format("\n测试结果: %d 通过, %d 失败", results.passed, results.failed))
+      if #results.errors > 0 then
+        print("失败的测试:")
+        for _, e in ipairs(results.errors) do
+          print("  " .. e)
+        end
+      end
+    end
+  end, {
+    nargs = "*",
+    desc = "运行 NeoAI 测试（不带参数运行全部，带参数运行指定测试）",
+  })
+
   -- NeoAIChatStatus 命令：显示聊天窗口状态
   vim.api.nvim_create_user_command("NeoAIChatStatus", function()
     if ui_ref then
@@ -148,15 +183,21 @@ local function register_global_keymaps()
       -- 根据动作注册不同的功能
       if action == "open_tree" then
         vim.keymap.set("n", key, function()
-          if ui_ref then ui_ref.open_tree_ui() end
+          if ui_ref then
+            ui_ref.open_tree_ui()
+          end
         end, { desc = desc })
       elseif action == "open_chat" then
         vim.keymap.set("n", key, function()
-          if ui_ref then ui_ref.open_chat_ui() end
+          if ui_ref then
+            ui_ref.open_chat_ui()
+          end
         end, { desc = desc })
       elseif action == "close_all" then
         vim.keymap.set("n", key, function()
-          if ui_ref then ui_ref.close_all_windows() end
+          if ui_ref then
+            ui_ref.close_all_windows()
+          end
         end, { desc = desc })
       elseif action == "toggle_ui" then
         vim.keymap.set("n", key, function()
@@ -255,25 +296,33 @@ end
 
 --- 获取会话管理器
 function M.get_session_manager()
-  if not core_ref then error("Core not initialized") end
+  if not core_ref then
+    error("Core not initialized")
+  end
   return core_ref.get_session_manager()
 end
 
 --- 获取AI引擎
 function M.get_ai_engine()
-  if not core_ref then error("Core not initialized") end
+  if not core_ref then
+    error("Core not initialized")
+  end
   return core_ref.get_ai_engine()
 end
 
 --- 获取工具系统
 function M.get_tools()
-  if not tools_ref then error("Tools not initialized") end
+  if not tools_ref then
+    error("Tools not initialized")
+  end
   return tools_ref
 end
 
 --- 获取键位配置管理器
 function M.get_keymap_manager()
-  if not core_ref then error("Core not initialized") end
+  if not core_ref then
+    error("Core not initialized")
+  end
   return core_ref.get_keymap_manager()
 end
 

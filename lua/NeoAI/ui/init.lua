@@ -11,8 +11,6 @@ local tree_handlers = require("NeoAI.ui.handlers.tree_handlers")
 local chat_handlers = require("NeoAI.ui.handlers.chat_handlers")
 local Events = require("NeoAI.core.events")
 local ui_events = require("NeoAI.ui.ui_events")
-local state_manager = require("NeoAI.core.config.state")
-
 local state = {
   initialized = false, windows = {}, current_ui_mode = nil,
   current_session_id = nil, event_count = 0,
@@ -114,23 +112,9 @@ end
 
 function M.open_chat_ui(session_id, branch_id)
   if not state.initialized then error("UI not initialized") end
-  local hm = get_hm()
-  if (not session_id or session_id == "default") and hm and hm.is_initialized() then
-    -- 没有传入 session_id 时，使用当前会话（如果有且非空）或创建新会话
-    local current = hm.get_current_session()
-    if current and current.user and current.user ~= "" then
-      -- 当前会话已有消息，创建新分支会话
-      session_id = hm.create_session("聊天会话", true, nil)
-    elseif current then
-      -- 当前会话是空的（从未发送过消息），复用该会话 ID
-      session_id = current.id
-    else
-      -- 没有当前会话，创建新会话
-      session_id = hm.create_session("聊天会话", true, nil)
-    end
-  end
-  session_id = session_id or state.current_session_id or "default"
-  open_window("chat", session_id, branch_id or "main")
+  -- 不创建新会话，传入 nil 让 chat_window 在用户发送消息时才创建
+  -- 这样用户只是打开窗口看看而不发送消息时，不会产生空会话
+  open_window("chat", nil, branch_id or "main")
 end
 
 -- ========== 窗口管理 ==========

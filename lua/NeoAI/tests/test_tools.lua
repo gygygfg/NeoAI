@@ -4,6 +4,39 @@ local M = {}
 
 local test
 
+-- 检测是否为 headless 模式
+-- 使用 vim.api.nvim_list_uis() 是最可靠的检测方式
+-- 在 headless 模式下，nvim_list_uis() 返回空表 {}
+-- 注意：colors_name 可能被 colorscheme 插件设置，不能作为 headless 检测依据
+local function is_headless()
+  if vim.env.NVIM_HEADLESS then
+    return true
+  end
+  local uis = vim.api.nvim_list_uis()
+  if #uis == 0 then
+    return true
+  end
+  return false
+end
+
+-- 安全的等待函数
+-- 在 headless 模式下使用 vim.wait（能正确处理 vim.schedule 回调）
+-- 在 UI 模式下使用 vim.uv.run('once')（避免阻塞 UI）
+-- 注意：vim.uv.run('once') 无法处理 vim.schedule 回调，因此 headless 模式下必须使用 vim.wait
+local function safe_wait(timeout_ms, cond)
+  if is_headless() then
+    return vim.wait(timeout_ms, cond, 50)
+  end
+  local deadline = vim.uv.now() + timeout_ms
+  while vim.uv.now() < deadline do
+    if cond() then
+      return true
+    end
+    vim.uv.run("once")
+  end
+  return false
+end
+
 local function create_tool(name)
   return { name = name or "test_tool", description = "测试工具", func = function(args) return "ok" end, parameters = { type = "object", properties = { input = { type = "string", description = "输入" } }, required = {} }, category = "test_category" }
 end
@@ -12,7 +45,7 @@ end
 function M.run(test_module)
   test = test_module or require("NeoAI.tests")
   local assert = test.assert
-  print("\n=== test_tools ===")
+  test._logger.info("\n=== test_tools ===")
 
   return test.run_tests({
     -- ========== tool_registry ==========
@@ -193,10 +226,10 @@ function M.run(test_module)
       local tr = require("NeoAI.tools.tool_registry")
       tr.reset()
       tr.initialize({})
-      tr.register({ name = "async_test_tool", description = "异步测试", func = function(args) return "executed: " .. (args.input or "") end, parameters = { type = "object", properties = { input = { type = "string" } }, required = {} } })
+      tr.register({ name = "async_test_tool", description = "异步测试", func = function(args) return "executed: " .. (args.input or "") end, parameters = { type = "object", properties = { input = { type = "string" } }, required = {} }, approval = { auto_allow = true } })
       local result = nil
       te.execute_async("async_test_tool", { input = "hello" }, function(res) result = res end, function(err) result = "error: " .. err end)
-      vim.wait(500, function() return result ~= nil end)
+      safe_wait(500, function() return result ~= nil end)
       assert.not_nil(result, "异步执行应返回结果")
     end,
 
@@ -204,7 +237,7 @@ function M.run(test_module)
       local te = require("NeoAI.tools.tool_executor")
       local result = nil
       te.execute_async("nonexistent_tool", {}, function(res) result = res end, function(err) result = "error: " .. err end)
-      vim.wait(500, function() return result ~= nil end)
+      safe_wait(500, function() return result ~= nil end)
       assert.not_nil(result, "不存在的工具应返回提示信息")
     end,
 

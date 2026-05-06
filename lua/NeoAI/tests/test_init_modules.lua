@@ -8,7 +8,7 @@ local test
 function M.run(test_module)
   test = test_module or require("NeoAI.tests")
   local assert = test.assert
-  print("\n=== test_init_modules ===")
+  test._logger.info("\n=== test_init_modules ===")
 
   return test.run_tests({
     -- ========== core/config/init.lua ==========
@@ -168,6 +168,7 @@ function M.run(test_module)
 
     test_ui_reasoning_functions = function()
       local ui = require("NeoAI.ui")
+      ui.initialize({ reasoning = {} })
       ui.show_reasoning("测试思考内容")
       ui.append_reasoning("追加内容")
       ui.close_reasoning()
@@ -225,8 +226,8 @@ function M.run(test_module)
 
     test_tools_execute_tool = function()
       local tools = require("NeoAI.tools")
-      tools.initialize({ enabled = true, builtin = false })
-      tools.register_tool({ name = "exec_tool", description = "", func = function(args) return "执行结果: " .. (args and args.input or "") end, parameters = { type = "object", properties = { input = { type = "string" } }, required = {} } })
+      tools.initialize({ enabled = true, builtin = false, approval = { default_auto_allow = true } })
+      tools.register_tool({ name = "exec_tool", description = "", func = function(args) return "执行结果: " .. (args and args.input or "") end, parameters = { type = "object", properties = { input = { type = "string" } }, required = {} }, approval = { auto_allow = true } })
       local result = tools.execute_tool("exec_tool", { input = "hello" })
       assert.equal("执行结果: hello", result)
     end,

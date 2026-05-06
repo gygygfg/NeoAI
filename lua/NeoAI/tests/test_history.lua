@@ -8,7 +8,7 @@ local test
 function M.run(test_module)
   test = test_module or require("NeoAI.tests")
   local assert = test.assert
-  print("\n=== test_history ===")
+  test._logger.info("\n=== test_history ===")
 
   return test.run_tests({
     -- ========== manager ==========

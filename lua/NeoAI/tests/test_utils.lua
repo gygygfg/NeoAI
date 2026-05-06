@@ -4,11 +4,44 @@ local M = {}
 
 local test
 
+-- 检测是否为 headless 模式
+-- 使用 vim.api.nvim_list_uis() 是最可靠的检测方式
+-- 在 headless 模式下，nvim_list_uis() 返回空表 {}
+-- 注意：colors_name 可能被 colorscheme 插件设置，不能作为 headless 检测依据
+local function is_headless()
+  if vim.env.NVIM_HEADLESS then
+    return true
+  end
+  local uis = vim.api.nvim_list_uis()
+  if #uis == 0 then
+    return true
+  end
+  return false
+end
+
+-- 安全的等待函数
+-- 在 headless 模式下使用 vim.wait（能正确处理 vim.schedule 回调）
+-- 在 UI 模式下使用 vim.uv.run('once')（避免阻塞 UI）
+-- 注意：vim.uv.run('once') 无法处理 vim.schedule 回调，因此 headless 模式下必须使用 vim.wait
+local function safe_wait(timeout_ms, cond)
+  if is_headless() then
+    return vim.wait(timeout_ms, cond, 50)
+  end
+  local deadline = vim.uv.now() + timeout_ms
+  while vim.uv.now() < deadline do
+    if cond() then
+      return true
+    end
+    vim.uv.run("once")
+  end
+  return false
+end
+
 --- 运行所有测试
 function M.run(test_module)
   test = test_module or require("NeoAI.tests")
   local assert = test.assert
-  print("\n=== test_utils ===")
+  test._logger.info("\n=== test_utils ===")
 
   return test.run_tests({
     -- ========== common ==========
@@ -628,7 +661,7 @@ function M.run(test_module)
       local result = nil
       local id = aw.submit_task("test_task", function() return "task_result" end, function(success, res) result = res end)
       assert.is_true(id > 0, "应返回任务ID")
-      vim.wait(500, function() return result ~= nil end)
+      safe_wait(500, function() return result ~= nil end)
       assert.equal("task_result", result)
     end,
 
@@ -637,7 +670,7 @@ function M.run(test_module)
       aw.reset()
       local error_msg = nil
       aw.submit_task("fail_task", function() error("任务失败") end, function(success, res, err) error_msg = err end)
-      vim.wait(500, function() return error_msg ~= nil end)
+      safe_wait(500, function() return error_msg ~= nil end)
       assert.not_nil(error_msg, "应返回错误信息")
     end,
 
@@ -647,7 +680,7 @@ function M.run(test_module)
       local results = {}
       local ids = aw.submit_batch({ { name = "batch_1", task_func = function() return "r1" end, callback = function(s, r) results[1] = r end }, { name = "batch_2", task_func = function() return "r2" end, callback = function(s, r) results[2] = r end } })
       assert.is_true(#ids == 2, "应有2个任务ID")
-      vim.wait(500, function() return results[1] ~= nil and results[2] ~= nil end)
+      safe_wait(500, function() return results[1] ~= nil and results[2] ~= nil end)
       assert.equal("r1", results[1])
       assert.equal("r2", results[2])
     end,
@@ -659,7 +692,7 @@ function M.run(test_module)
       local status = aw.get_worker_status(id)
       assert.not_nil(status)
       assert.equal("status_test", status.name)
-      vim.wait(500, function() return aw.get_worker_status(id) == nil end)
+      safe_wait(500, function() return aw.get_worker_status(id) == nil end)
       local all = aw.get_all_worker_status()
       assert.is_true(type(all) == "table")
     end,
@@ -683,7 +716,7 @@ function M.run(test_module)
       local aw = require("NeoAI.utils.async_worker")
       aw.reset()
       aw.submit_task("cleanup_test", function() return "ok" end)
-      vim.wait(500, function() return aw.get_total_count() == 0 end)
+      safe_wait(500, function() return aw.get_total_count() == 0 end)
       aw.cleanup_completed()
     end,
 
@@ -699,7 +732,7 @@ function M.run(test_module)
       local aw = require("NeoAI.utils.async_worker")
       local result = nil
       aw.run_in_background(function(a, b) return a + b end, function(success, res) result = res end, 3, 4)
-      vim.wait(500, function() return result ~= nil end)
+      safe_wait(500, function() return result ~= nil end)
       assert.equal(7, result)
     end,
 
@@ -707,7 +740,7 @@ function M.run(test_module)
       local aw = require("NeoAI.utils.async_worker")
       local all_done = false
       aw.run_batch_tasks({ { func = function() return 1 end }, { func = function() return 2 end } }, function(success, results) all_done = true; assert.equal(1, results[1]); assert.equal(2, results[2]) end)
-      vim.wait(500, function() return all_done end)
+      safe_wait(500, function() return all_done end)
     end,
 
     test_async_thread_safe_callback = function()
@@ -716,7 +749,7 @@ function M.run(test_module)
       local safe_cb = aw.create_thread_safe_callback(function() called = true end)
       assert.not_nil(safe_cb)
       safe_cb()
-      vim.wait(100, function() return called end)
+      safe_wait(100, function() return called end)
       assert.is_true(called)
     end,
 
@@ -724,7 +757,7 @@ function M.run(test_module)
       local aw = require("NeoAI.utils.async_worker")
       local result = nil
       aw.compute_heavy_task(function() local sum = 0; for i = 1, 100 do sum = sum + i end; return sum end, function(success, res) result = res end)
-      vim.wait(500, function() return result ~= nil end)
+      safe_wait(500, function() return result ~= nil end)
       assert.equal(5050, result)
     end,
 
@@ -732,11 +765,11 @@ function M.run(test_module)
       local aw = require("NeoAI.utils.async_worker")
       local called = false
       aw.schedule_ui_update(function() called = true end, 10)
-      vim.wait(200, function() return called end)
+      safe_wait(200, function() return called end)
       assert.is_true(called)
       local called2 = false
       aw.batch_ui_updates({ function() called2 = true end })
-      vim.wait(100, function() return called2 end)
+      safe_wait(100, function() return called2 end)
     end,
 
     test_async_reset = function()

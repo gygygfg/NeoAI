@@ -1,7 +1,6 @@
 -- 输入处理器（保留兼容，实际输入由 virtual_input 组件处理）
 local M = {}
 local Events = require("NeoAI.core.events")
-local state_manager = require("NeoAI.core.config.state")
 
 local state = {
   initialized = false, config = nil,

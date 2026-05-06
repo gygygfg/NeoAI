@@ -3,6 +3,29 @@
 --- 注意：实际 HTTP 请求测试需要 API key 和网络连接，这里只测试逻辑层
 local M = {}
 
+-- 检测是否为 headless 模式
+local function is_headless()
+  if vim.env.NVIM_HEADLESS then
+    return true
+  end
+  if vim.fn.has("nvim-0.5") == 1 and vim.g.colors_name == nil and vim.o.termguicolors == false then
+    return true
+  end
+  return false
+end
+
+-- 安全的等待函数：使用 vim.uv.run('once') 处理事件循环
+local function safe_wait(timeout_ms, cond)
+  local deadline = vim.uv.now() + timeout_ms
+  while vim.uv.now() < deadline do
+    if cond() then
+      return true
+    end
+    vim.uv.run("once")
+  end
+  return false
+end
+
 -- 内联断言工具（避免依赖测试框架导致的循环依赖）
 local assert = {}
 function assert.equal(expected, actual, msg)
@@ -41,7 +64,9 @@ end
 function M.run()
   -- 清除 http_client 模块缓存，确保加载最新代码
   package.loaded["NeoAI.core.ai.http_client"] = nil
-  print("\n=== test_http_client ===")
+  local logger = require("NeoAI.utils.logger")
+  logger.initialize({ level = "ERROR" })
+  logger.info("\n=== test_http_client ===")
 
   local tests = {
     --- 测试 initialize
@@ -146,7 +171,7 @@ function M.run()
         assert.not_nil(err)
       end)
 
-      vim.wait(500, function() return called end)
+      safe_wait(500, function() return called end)
     end,
 
     --- 测试 send_stream_request（无 API key 应返回错误）
@@ -413,14 +438,14 @@ function M.run()
     local fn = tests[name]
     local ok, err = pcall(fn)
     if ok then
-      print(string.format("  ✓ %s", name))
+      logger.info(string.format("  ✓ %s", name))
       passed = passed + 1
     else
-      print(string.format("  ✗ %s: %s", name, tostring(err)))
+      logger.error(string.format("  ✗ %s: %s", name, tostring(err)))
       failed = failed + 1
     end
   end
-  print(string.format("\n测试结果: %d 通过, %d 失败", passed, failed))
+  logger.info(string.format("\n测试结果: %d 通过, %d 失败", passed, failed))
   return { passed = passed, failed = failed }
 end
 
