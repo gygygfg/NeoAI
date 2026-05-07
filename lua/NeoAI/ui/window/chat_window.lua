@@ -816,6 +816,9 @@ function M._render_single_message(msg, prev_role)
         has_reasoning = true
         reasoning_content = parsed.reasoning_content
         main_content = parsed.content or ""
+      elseif parsed.content and parsed.content ~= "" then
+        -- 只有 content 字段，没有 reasoning_content
+        main_content = parsed.content
       end
       -- 检查 JSON 中是否包含 tool_calls
       if parsed.tool_calls and type(parsed.tool_calls) == "table" and #parsed.tool_calls > 0 then

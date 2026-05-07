@@ -560,6 +560,18 @@ function M.get_sub_agent_context(sub_agent_id)
   }
 end
 
+--- 更新子 agent 的迭代计数（由 sub_agent_engine 调用）
+--- 在 _request_generation 中先调用此函数同步计数，再调用 should_continue
+--- @param sub_agent_id string
+--- @param count number 当前迭代次数
+function M.update_iteration_count(sub_agent_id, count)
+  local sa = sub_agents[sub_agent_id]
+  if not sa then
+    return
+  end
+  sa.iteration_count = count
+end
+
 --- 检查子 agent 是否应该继续执行
 --- @param sub_agent_id string
 --- @return boolean
@@ -577,8 +589,7 @@ function M.should_continue(sub_agent_id)
     M._finalize_sub_agent(sub_agent_id)
     return false
   end
-  -- 注意：迭代计数由子 agent 引擎（sub_agent_engine）统一管理
-  -- 此处不再递增 iteration_count，避免重复计数
+  -- 迭代计数由 sub_agent_engine 管理，通过 update_iteration_count 同步
   return true
 end
 
@@ -862,6 +873,15 @@ function M.get_tools()
     return a.name < b.name
   end)
   return tools
+end
+
+-- ========== 测试辅助接口 ==========
+
+--- 注入子 agent（测试用）
+--- @param sub_agent_id string
+--- @param agent table
+function M._test_inject_agent(sub_agent_id, agent)
+  sub_agents[sub_agent_id] = agent
 end
 
 return M

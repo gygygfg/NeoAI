@@ -110,6 +110,8 @@ function M.start_sub_agent_loop(sub_agent_id, tool_calls, session_context)
     -- 互斥锁，防止竞态
     _round_in_progress = false,
     _tools_complete_in_progress = false,
+    -- 去重：记录已处理的 generation_id，防止 vim.schedule 回调重复触发
+    _last_complete_gen_id = nil,
   }
 
   sub_agent_runners[sub_agent_id] = runner
@@ -297,6 +299,18 @@ function M._on_tools_complete(sub_agent_id)
     logger.warn("[sub_agent] _on_tools_complete: runner not found for %s", sub_agent_id)
     return
   end
+
+  -- 防止重复调用：多个工具并发执行时，每个工具的 on_result 回调都可能通过
+  -- vim.schedule 调用 _on_tools_complete。第一个回调执行 _request_generation
+  -- 后，队列中可能还有未执行的 vim.schedule 回调。这些回调会在当前调用返回后
+  -- 再次进入，导致重复的 AI 生成请求。
+  -- 通过记录当前 generation_id，如果同一 generation 的完成已被处理过则跳过。
+  local current_gen = runner.generation_id
+  if runner._last_complete_gen_id == current_gen then
+    logger.warn("[sub_agent] _on_tools_complete: duplicate call for gen %s, skipping", current_gen)
+    return
+  end
+
   if runner._tools_complete_in_progress then
     logger.warn("[sub_agent] _on_tools_complete: already in progress for %s", sub_agent_id)
     return
@@ -310,6 +324,7 @@ function M._on_tools_complete(sub_agent_id)
     return
   end
 
+  runner._last_complete_gen_id = current_gen
   runner._tools_complete_in_progress = false
   M._request_generation(sub_agent_id)
 end
@@ -347,7 +362,10 @@ function M._request_generation(sub_agent_id)
   -- 递增迭代计数
   runner.iteration_count = runner.iteration_count + 1
 
-  -- 同步到 plan_executor
+  -- 同步迭代计数到 plan_executor，确保 should_continue 检查正确的值
+  plan_executor.update_iteration_count(sub_agent_id, runner.iteration_count)
+
+  -- 检查是否应该继续
   if not plan_executor.should_continue(sub_agent_id) then
     M._finalize_sub_agent(sub_agent_id)
     return

@@ -89,14 +89,14 @@ function M.run(test_module)
       assert.not_nil(status_result, "状态结果不应为 nil")
       assert.equal(sub_agent_id, status_result.sub_agent_id)
 
-      -- 测试 list_sub_agents
+      -- 测试 get_sub_agent_status 不传 sub_agent_id 时列出所有
       local list_result = nil
-      call_tool(plan_executor.list_sub_agents, {},
+      call_tool(plan_executor.get_sub_agent_status, {},
         function(r) list_result = r end,
         function(e) list_result = { error = e } end
       )
       local ok3 = safe_wait(1000, function() return list_result ~= nil end)
-      assert.is_true(ok3, "list_sub_agents 应在 1 秒内回调")
+      assert.is_true(ok3, "get_sub_agent_status(列出所有) 应在 1 秒内回调")
       assert.not_nil(list_result, "列表结果不应为 nil")
       assert.is_true(list_result.count > 0, "应有子 agent")
 
@@ -210,14 +210,21 @@ function M.run(test_module)
       assert.is_true(ok)
       local sub_agent_id = result.sub_agent_id
 
-      -- 第一次 should_continue 应返回 true
-      assert.is_true(plan_executor.should_continue(sub_agent_id))
-      -- 第二次
-      assert.is_true(plan_executor.should_continue(sub_agent_id))
-      -- 第三次
-      assert.is_true(plan_executor.should_continue(sub_agent_id))
-      -- 第四次应返回 false（达到 max_iterations=3）
-      assert.is_false(plan_executor.should_continue(sub_agent_id))
+ -- should_continue 不递增计数，需要先通过 update_iteration_count 同步
+      -- 模拟 sub_agent_engine._request_generation 中的调用顺序：
+      --   1. runner.iteration_count = runner.iteration_count + 1
+      --   2. plan_executor.update_iteration_count(sub_agent_id, runner.iteration_count)
+      --   3. plan_executor.should_continue(sub_agent_id)
+      -- max_iterations=3，所以 iter=1,2 时返回 true，iter=3 时返回 false
+      for i = 1, 2 do
+        plan_executor.update_iteration_count(sub_agent_id, i)
+        local cont = plan_executor.should_continue(sub_agent_id)
+        assert.is_true(cont, string.format("iter=%d 应返回 true (max=3)", i))
+      end
+      -- iter=3 >= max=3，应返回 false
+      plan_executor.update_iteration_count(sub_agent_id, 3)
+      assert.is_false(plan_executor.should_continue(sub_agent_id),
+        "iter=3 应返回 false (>= max=3)")
 
       -- 验证状态变为 completed
       local agents = plan_executor.get_all_agents_data()
