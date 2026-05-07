@@ -193,21 +193,12 @@ function M.send_message(content, session_id, branch_id, window_id, format, callb
     return false, "无法创建会话"
   end
 
-  local context_msgs, new_parent_id = hm.get_context_and_new_parent(session.id)
-
   local target_session_id = session.id
   local current_session = hm.get_session(session.id)
   if current_session and current_session.user ~= nil and current_session.user ~= "" then
-    local core = require("NeoAI.core")
-    local full_config = core.get_config() or {}
-    local auto_naming = (full_config.session and full_config.session.auto_naming) ~= false
-    local branch_name
-    if auto_naming then
-      branch_name = "分支-" .. current_session.name
-    else
-      branch_name = ""
-    end
-    local new_id = hm.create_session(branch_name, false, new_parent_id)
+    -- 当前会话已有内容，创建分支会话（以当前会话为父节点）
+    -- 这样 get_context_and_new_parent 能沿父链回溯到根节点，获取完整历史消息
+    local new_id = hm.create_session("分支-" .. (current_session.name or "会话"), false, session.id)
     hm.set_current_session(new_id)
     target_session_id = new_id
   end

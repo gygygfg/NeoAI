@@ -1369,9 +1369,11 @@ function M._open_float_input()
         if not target_session_id then
           local hm_ok, hm = pcall(require, "NeoAI.core.history.manager")
           if hm_ok and hm.is_initialized() then
-            local session = hm.get_or_create_current_session("聊天会话")
-            if session then
-              target_session_id = session.id
+            -- 每次打开新窗口都创建全新的根会话，不复用已有会话
+            -- 这样用户发送消息时才真正创建会话，不会产生空会话文件
+            local session_id = hm.create_session("聊天会话", true, nil)
+            if session_id then
+              target_session_id = session_id
               -- 更新模块状态和 buffer 名称
               state.current_session_id = target_session_id
               local buf = window_manager.get_window_buf(state.current_window_id)
@@ -1379,6 +1381,11 @@ function M._open_float_input()
                 pcall(vim.api.nvim_buf_set_name, buf, "neoai://chat/" .. target_session_id)
               end
             end
+          end
+          -- 如果仍然没有 session ID，阻止提交
+          if not target_session_id then
+            vim.notify("[NeoAI] 无法创建会话，请检查 history.manager 状态", vim.log.levels.ERROR)
+            return
           end
         end
 
@@ -3574,6 +3581,11 @@ end
 
 --- 显示工具调用悬浮窗口
 function M._show_tool_display()
+  -- 如果工具循环已结束（_finished 为 true），不创建窗口
+  -- 避免 vim.schedule 延迟执行时 TOOL_LOOP_FINISHED 已触发但窗口还未创建导致的竞态
+  if state.tool_display._finished then
+    return
+  end
   -- 如果已有窗口，先关闭
   if state.tool_display.window_id then
     M._close_tool_display()

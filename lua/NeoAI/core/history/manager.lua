@@ -895,6 +895,39 @@ function M.import_sessions(filepath)
   return true, nil
 end
 
+-- ========== 外部变更检测 ==========
+
+--- 检查文件是否有变化（基于行号缓存）
+--- @return boolean
+function M.has_file_changed()
+  return persistence.has_file_changed()
+end
+
+--- 从文件重新加载会话数据（增量解析，只解析有变化的行）
+--- @return boolean 是否成功重新加载
+function M.reload_from_file()
+  if not state.initialized then
+    return false
+  end
+
+  local loaded = persistence.load()
+  if not loaded then
+    return false
+  end
+
+  state.sessions = loaded
+  cache.invalidate_all()
+
+  -- 触发事件通知 UI 刷新
+  trigger_event(Events.SESSION_LOADED, {
+    session_count = vim.tbl_count(loaded),
+    latest_session_id = state.current_session_id,
+  })
+
+  logger.debug("[history_manager] 已从文件重新加载会话数据")
+  return true
+end
+
 -- ========== 状态查询 ==========
 
 function M.is_initialized()

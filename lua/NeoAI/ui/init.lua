@@ -106,15 +106,23 @@ end
 
 function M.open_tree_ui()
   if not state.initialized then error("UI not initialized") end
+
+  -- 打开 tree 前检查文件是否有变化，有则重新加载
+  local hm = get_hm()
+  if hm and hm.is_initialized() and hm.has_file_changed() then
+    hm.reload_from_file()
+  end
+
   local session_id = resolve_session_id(state.current_session_id)
   open_window("tree", session_id)
 end
 
 function M.open_chat_ui(session_id, branch_id)
   if not state.initialized then error("UI not initialized") end
-  -- 不创建新会话，传入 nil 让 chat_window 在用户发送消息时才创建
+  -- 如果传入了 session_id（从 tree 选择会话），直接打开该会话加载历史消息
+  -- 否则不创建新会话，传入 nil 让 chat_window 在用户发送消息时才创建
   -- 这样用户只是打开窗口看看而不发送消息时，不会产生空会话
-  open_window("chat", nil, branch_id or "main")
+  open_window("chat", session_id, branch_id or "main")
 end
 
 -- ========== 窗口管理 ==========

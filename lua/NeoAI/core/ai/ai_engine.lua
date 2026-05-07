@@ -31,6 +31,8 @@ local state = {
   max_retries = 3,
   retry_delay_ms = 1000,
   active_generations = {},
+  -- 防止 cancel_generation 被重复执行（多次按停止键时只生效一次）
+  _cancel_processed = false,
 }
 
 -- ========== 初始化 ==========
@@ -148,6 +150,8 @@ end
 -- ========== 核心生成流程 ==========
 function M.generate_response(messages, params)
   stream_processor.clear_reasoning_throttle()
+  -- 新生成开始时重置停止标志，允许下次按停止键生效
+  state._cancel_processed = false
   local session_id = params.session_id; local window_id = params.window_id; local options = params.options or {}
   state.is_generating = true
   local model_index = params.model_index or 1; local ai_preset = get_model_config(model_index)
@@ -902,6 +906,13 @@ end
 
 -- ========== 取消生成 ==========
 function M.cancel_generation()
+  -- 幂等性保护：如果已经处理过停止请求，不再重复执行
+  -- 防止多次按停止键时重复触发 GENERATION_CANCELLED 事件、重复显示通知和追加用量行
+  if state._cancel_processed then
+    return
+  end
+  state._cancel_processed = true
+
   stream_processor.clear_reasoning_throttle()
   local generation_id = state.current_generation_id; local generation = state.active_generations[generation_id]
   -- 写入 shared 表，供协程内其他模块读取

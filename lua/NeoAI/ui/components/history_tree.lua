@@ -51,6 +51,9 @@ function M.build_flat_items()
   clear_round_text_cache()
 
   local ok, hm = pcall(require, "NeoAI.core.history.manager")
+  if ok and hm.is_initialized() and hm.has_file_changed() then
+    hm.reload_from_file()
+  end
   if not ok or not hm.is_initialized() then
     state.flat_items = {}
     return {}
@@ -145,13 +148,13 @@ function M.build_flat_items()
     local sibling_is_last = is_last_branch
 
     -- 计算连接符数组
-    -- 对于每个深度层级 i（1-based）：
+    -- connectors 数组长度 = indent（缩进级别数），每个元素对应一个层级的连接符
+    -- 对于每个层级 i（1-based）：
     --   如果 i <= depth：根据 ancestor_is_last[i] 决定是 "   " 还是 "│  "
     --   如果 i > depth：根据 sibling_is_last 决定
     --     如果 sibling_is_last（最后一个兄弟），后面没有更多兄弟了，用 "   "
     --     否则用 "│  "（后面还有兄弟）
-    -- 注意：connectors 数组长度至少为 depth（祖先层级数），不足部分用空格填充
-    local connectors_len = math.max(indent, depth)
+    local connectors_len = indent
     local connectors = {}
     for i = 1, connectors_len do
       if i <= depth then
@@ -228,7 +231,7 @@ function M.build_flat_items()
     -- 在分支节点后面插入虚拟节点（与父节点同级）
     -- 当 child_ids 有多个（>=2）时，也插入虚拟节点
     if is_branch or is_multi_child then
-      local virtual_connectors_len = math.max(indent, depth)
+      local virtual_connectors_len = indent
       local virtual_connectors = {}
       for i = 1, virtual_connectors_len do
         if i <= depth then

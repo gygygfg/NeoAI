@@ -222,10 +222,10 @@ function M.send_message(params)
     if not session then return false, "无法创建会话" end
     target_session_id = session.id
 
-    -- 如果当前会话已有内容，创建新分支会话
+    -- 如果当前会话已有内容，创建分支会话（以当前会话为父节点）
+    -- 这样 get_context_and_new_parent 能沿父链回溯到根节点，获取完整历史消息
     if session.user ~= nil and session.user ~= "" then
-      local _, new_parent_id = hm.get_context_and_new_parent(session.id)
-      local new_id = hm.create_session("分支-" .. (session.name or "会话"), false, new_parent_id)
+      local new_id = hm.create_session("分支-" .. (session.name or "会话"), false, session.id)
       hm.set_current_session(new_id)
       target_session_id = new_id
     end

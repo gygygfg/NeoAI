@@ -103,16 +103,7 @@ function M.open(session_id, window_id)
     end
   end)
 
-  -- 监听会话重命名事件，自动刷新树
-  vim.api.nvim_create_autocmd("User", {
-    pattern = Events.SESSION_RENAMED,
-    callback = function()
-      if state.current_window_id then
-        M.refresh_tree()
-      end
-    end,
-    desc = "会话重命名后刷新树",
-  })
+  -- 会话事件监听已统一在 ui_events.lua 中处理，此处不再重复注册
 
   vim.api.nvim_exec_autocmds("User", {
     pattern = Events.TREE_WINDOW_OPENED,
@@ -240,10 +231,9 @@ function M._build_display_content()
 
       -- 1. 根据缩进级别生成连接线
       local indent = item.indent or 0
-      -- 使用 connectors 数组的实际长度，确保祖先层级的连接符都能渲染
+      -- 使用 connectors 数组渲染连接符，数组长度 = indent
       -- 当 indent 为 0 时，不渲染任何连接符（顶级节点）
-      local connector_count = item.connectors and #item.connectors or indent
-      local loop_end = (indent == 0) and 0 or math.max(indent, connector_count)
+      local loop_end = indent
       for i = 1, loop_end do
         if item.connectors and item.connectors[i] then
           line = line .. item.connectors[i]

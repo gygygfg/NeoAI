@@ -1,5 +1,12 @@
 --- NeoAI 历史持久化模块
 --- 职责：文件序列化/反序列化、写入队列、事务性保存
+---
+--- 文件格式：每行一个会话，格式为 "id:json"
+--- 示例：
+---   session_1:{"id":"session_1","name":"...",...}
+---   session_2:{"id":"session_2","name":"...",...}
+---
+--- 行号缓存：读取时建立 id→行号 映射，下次只解析有变化的行
 --- 使用 async_worker 的任务队列，保证原子性和实时保存
 
 local M = {}
@@ -26,12 +33,17 @@ local state = {
 
   -- 退出标志
   _is_shutting_down = false,
+
+  -- 行号缓存：{ [id] = line_number }，1-based
+  _line_map = {},
+  -- 文件行数缓存（用于快速判断是否有新增行）
+  _file_line_count = 0,
 }
 
 -- ========== 配置 ==========
 
 --- 获取存储文件路径
-local function get_filepath()
+function M.get_filepath()
   local save_path = state.save_path
   if not save_path or save_path == "" then
     save_path = vim.fn.stdpath("cache") .. "/NeoAI"
@@ -46,7 +58,6 @@ end
 --- @return boolean
 local function is_empty_session(session)
   if not session then return true end
-  -- user 为空且 assistant 无内容即为空会话
   if session.user and session.user ~= "" then return false end
   local asst = session.assistant
   if type(asst) == "table" and #asst > 0 then return false end
@@ -54,9 +65,9 @@ local function is_empty_session(session)
   return true
 end
 
---- 序列化所有会话为 JSON 字符串
+--- 序列化所有会话为 "id:json\n" 格式
 --- @param sessions table 会话表 { [id] = session }
---- @return string|nil JSON 字符串，失败返回 nil
+--- @return string|nil 序列化字符串，失败返回 nil
 function M.serialize(sessions)
   local arr = {}
   for _, session in pairs(sessions) do
@@ -68,45 +79,120 @@ function M.serialize(sessions)
     return (a.updated_at or a.created_at or 0) < (b.updated_at or b.created_at or 0)
   end)
   if #arr == 0 then
-    return "[]"
+    return ""
   end
 
   local parts = {}
-  table.insert(parts, "[")
-  for i, session in ipairs(arr) do
+  for _, session in ipairs(arr) do
     local ok, json = pcall(vim.json.encode, session)
     if ok and json then
-      table.insert(parts, json)
-      if i < #arr then
-        table.insert(parts, ",")
-      end
+      -- 格式：id:json
+      table.insert(parts, session.id .. ":" .. json)
     else
       logger.warn("[history_persistence] 序列化跳过无效会话: " .. (session.id or "unknown"))
     end
   end
-  table.insert(parts, "]")
-  return table.concat(parts, "")
+  return table.concat(parts, "\n")
 end
 
---- 反序列化 JSON 字符串为会话表
---- @param content string JSON 字符串
+--- 从 "id:json" 行中提取 id
+--- @param line string 一行内容
+--- @return string|nil id，格式错误返回 nil
+local function extract_id_from_line(line)
+  if not line or line == "" then
+    return nil
+  end
+  local colon_pos = line:find(":", 1, true)
+  if not colon_pos then
+    return nil
+  end
+  return line:sub(1, colon_pos - 1)
+end
+
+--- 从 "id:json" 行中解析 session
+--- @param line string 一行内容
+--- @return table|nil session，解析失败返回 nil
+local function parse_session_from_line(line)
+  if not line or line == "" then
+    return nil
+  end
+  local colon_pos = line:find(":", 1, true)
+  if not colon_pos then
+    return nil
+  end
+  local json_str = line:sub(colon_pos + 1)
+  local ok, session = pcall(vim.json.decode, json_str)
+  if ok and type(session) == "table" and session.id then
+    return session
+  end
+  return nil
+end
+
+--- 反序列化（增量解析，只解析有变化的行）
+--- @param content string|nil 文件内容，nil 表示从文件重新读取
 --- @return table 会话表 { [id] = session }
 function M.deserialize(content)
   local sessions = {}
-  if not content or content == "" or content == "[" or content == "[]" then
-    return sessions
-  end
 
-  local ok, data = pcall(vim.json.decode, content)
-  if not ok or type(data) ~= "table" then
-    return sessions
-  end
-
-  for _, session in ipairs(data) do
-    if session and session.id then
-      sessions[session.id] = session
+  -- 读取文件内容
+  if content == nil then
+    local filepath = M.get_filepath()
+    if vim.fn.filereadable(filepath) ~= 1 then
+      state._line_map = {}
+      state._file_line_count = 0
+      return sessions
     end
+    local lines = vim.fn.readfile(filepath)
+    if not lines or #lines == 0 then
+      state._line_map = {}
+      state._file_line_count = 0
+      return sessions
+    end
+    content = table.concat(lines, "\n")
   end
+
+  if not content or content == "" then
+    state._line_map = {}
+    state._file_line_count = 0
+    return sessions
+  end
+
+  local lines = vim.split(content, "\n")
+  local new_line_count = #lines
+  local old_line_map = state._line_map
+  local new_line_map = {}
+
+  for line_num, line in ipairs(lines) do
+    local trimmed = vim.trim(line)
+    if trimmed == "" then
+      goto continue
+    end
+
+    local id = extract_id_from_line(trimmed)
+    if not id then
+      goto continue
+    end
+
+    new_line_map[id] = line_num
+
+    -- 检查缓存：如果该 id 的行号没变，且 session 已存在，跳过解析
+    if old_line_map[id] == line_num and state._sessions_cache and state._sessions_cache[id] then
+      sessions[id] = state._sessions_cache[id]
+    else
+      -- 行号变了或没有缓存，解析该行
+      local session = parse_session_from_line(trimmed)
+      if session then
+        sessions[id] = session
+      end
+    end
+    ::continue::
+  end
+
+  -- 更新缓存
+  state._line_map = new_line_map
+  state._file_line_count = new_line_count
+  state._sessions_cache = sessions
+
   return sessions
 end
 
@@ -121,18 +207,6 @@ local function ensure_dir(filepath)
   end
 end
 
---- 同步读取文件内容
---- @param filepath string 文件路径
---- @return string|nil 文件内容，失败返回 nil
-local function read_file_sync(filepath)
-  local ok, content = pcall(function()
-    local lines = vim.fn.readfile(filepath)
-    if not lines or #lines == 0 then return nil end
-    return table.concat(lines, "\n")
-  end)
-  return ok and content or nil
-end
-
 --- 同步写入文件内容
 --- @param filepath string 文件路径
 --- @param content string 内容
@@ -140,8 +214,13 @@ end
 local function write_file_sync(filepath, content)
   local ok, err = pcall(function()
     ensure_dir(filepath)
-    local lines = vim.split(content, "\n")
-    vim.fn.writefile(lines, filepath)
+    if content and content ~= "" then
+      local lines = vim.split(content, "\n")
+      vim.fn.writefile(lines, filepath)
+    else
+      -- 空内容写入空文件
+      vim.fn.writefile({}, filepath)
+    end
   end)
   if not ok then
     return false, tostring(err)
@@ -160,14 +239,11 @@ local function atomic_write(filepath, content)
     return false, "临时文件写入失败: " .. (err or "unknown")
   end
 
-  -- 重命名（原子操作）
   local rename_ok, rename_err = pcall(function()
-    -- 直接重命名临时文件为目标文件（覆盖原文件）
     vim.fn.rename(tmp_path, filepath)
   end)
 
   if not rename_ok then
-    -- 重命名失败，尝试清理临时文件
     pcall(vim.fn.delete, tmp_path)
     return false, "重命名失败: " .. tostring(rename_err)
   end
@@ -177,34 +253,78 @@ end
 
 -- ========== 加载 ==========
 
---- 从文件加载会话数据
+--- 从文件加载会话数据（总是重新读取文件，但增量解析）
 --- @return table 会话表 { [id] = session }
 function M.load()
-  local filepath = get_filepath()
+  local filepath = M.get_filepath()
   ensure_dir(filepath)
 
   -- 检查文件是否存在
   if vim.fn.filereadable(filepath) ~= 1 then
     -- 创建空文件
-    write_file_sync(filepath, "[]")
+    write_file_sync(filepath, "")
+    state._line_map = {}
+    state._file_line_count = 0
+    state._sessions_cache = {}
     return {}
   end
 
-  -- 读取文件
-  local content = read_file_sync(filepath)
-  if not content then
-    logger.warn("[history_persistence] 读取文件失败: " .. filepath)
+  -- 读取文件并增量解析
+  local lines = vim.fn.readfile(filepath)
+  if not lines or #lines == 0 then
+    state._line_map = {}
+    state._file_line_count = 0
+    state._sessions_cache = {}
     return {}
   end
 
-  -- 验证 JSON 完整性
-  local ok, decoded = pcall(vim.json.decode, content)
-  if not ok then
-    logger.warn("[history_persistence] JSON 解析失败，返回空会话")
-    return {}
-  end
-
+  local content = table.concat(lines, "\n")
   return M.deserialize(content)
+end
+
+--- 获取行号映射（用于外部快速判断是否有变化）
+--- @return table { [id] = line_number }
+function M.get_line_map()
+  return state._line_map
+end
+
+--- 获取文件行数
+--- @return number
+function M.get_file_line_count()
+  return state._file_line_count
+end
+
+--- 检查文件是否有变化（基于行号和行数）
+--- @return boolean
+function M.has_file_changed()
+  local filepath = M.get_filepath()
+  if vim.fn.filereadable(filepath) ~= 1 then
+    return vim.tbl_count(state._line_map) > 0
+  end
+
+  local lines = vim.fn.readfile(filepath)
+  local current_line_count = lines and #lines or 0
+
+  -- 行数不同，肯定有变化
+  if current_line_count ~= state._file_line_count then
+    return true
+  end
+
+  -- 检查每行的 id 前缀是否与缓存一致
+  for line_num, line in ipairs(lines or {}) do
+    local trimmed = vim.trim(line)
+    if trimmed ~= "" then
+      local id = extract_id_from_line(trimmed)
+      if id then
+        local cached_line = state._line_map[id]
+        if cached_line ~= line_num then
+          return true  -- id 出现在不同行，有变化
+        end
+      end
+    end
+  end
+
+  return false
 end
 
 -- ========== 写入队列（事务性） ==========
@@ -218,11 +338,10 @@ local function process_queue()
   state._write_in_progress = true
   local task = table.remove(state._write_queue, 1)
 
-  -- 使用 async_worker 异步执行写入
   async_worker.submit_task(
     "history_save_" .. task.id,
     function()
-      local filepath = get_filepath()
+      local filepath = M.get_filepath()
       ensure_dir(filepath)
       local ok, err = atomic_write(filepath, task.content)
       return ok, err
@@ -237,10 +356,8 @@ local function process_queue()
         end
       else
         logger.warn("[history_persistence] 保存失败: " .. (error_msg or "unknown"))
-        -- 失败时重试（最多 3 次）
         if (task.retry_count or 0) < 3 then
           task.retry_count = (task.retry_count or 0) + 1
-          -- 重新插入队列头部，稍后重试
           table.insert(state._write_queue, 1, task)
           logger.warn("[history_persistence] 重试保存 (" .. task.retry_count .. "/3)")
         else
@@ -251,7 +368,6 @@ local function process_queue()
         end
       end
 
-      -- 继续处理队列
       process_queue()
     end,
     { timeout_ms = 5000 }
@@ -275,7 +391,6 @@ function M.enqueue_save(type, content, callback)
   }
   table.insert(state._write_queue, task)
 
-  -- 如果队列中没有正在进行的写入，立即处理
   if not state._write_in_progress then
     process_queue()
   end
@@ -300,13 +415,11 @@ function M.sync_save(sessions)
     return false, "序列化失败"
   end
 
-  local filepath = get_filepath()
+  local filepath = M.get_filepath()
   ensure_dir(filepath)
 
-  -- 同步写入
   local ok, err = write_file_sync(filepath, content)
   if not ok then
-    -- 最后回退到 vim.fn.writefile
     local lines = vim.split(content, "\n")
     vim.fn.writefile(lines, filepath)
     return true, nil
@@ -326,7 +439,6 @@ function M.debounced_save(sessions_func, debounce_ms)
   debounce_ms = debounce_ms or 800
 
   if state._debounce_active then
-    -- 定时器已激活，更新超时时间
     if state._debounce_timer and not state._debounce_timer:is_closing() then
       state._debounce_timer:again()
     end
@@ -344,7 +456,6 @@ function M.debounced_save(sessions_func, debounce_ms)
       state._debounce_timer:stop()
     end
 
-    -- 获取最新会话数据并加入队列
     local sessions = sessions_func()
     local content = M.serialize(sessions)
     if content then
@@ -401,6 +512,9 @@ function M._test_reset()
   state._write_in_progress = false
   state._queue_counter = 0
   state._is_shutting_down = false
+  state._line_map = {}
+  state._file_line_count = 0
+  state._sessions_cache = {}
   if state._debounce_timer and not state._debounce_timer:is_closing() then
     state._debounce_timer:stop()
     state._debounce_timer:close()

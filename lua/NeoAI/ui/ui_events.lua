@@ -93,6 +93,18 @@ function M.register_listeners(state, callbacks)
     pattern = Events.MESSAGE_ADDED,
     callback = refresh_chat,
   })
+
+  -- 对话轮次添加后刷新树（用户在聊天中发送消息后，tree 自动更新）
+  vim.api.nvim_create_autocmd("User", {
+    pattern = Events.ROUND_ADDED,
+    callback = refresh_tree,
+  })
+
+  -- 会话重命名后刷新树
+  vim.api.nvim_create_autocmd("User", {
+    pattern = Events.SESSION_RENAMED,
+    callback = refresh_tree,
+  })
 end
 
 return M

@@ -28,7 +28,7 @@ function M.initialize(config)
   ai_engine.initialize({})
 
   -- 初始化历史管理器（唯一数据源，幂等）
-  history_manager.initialize()
+  history_manager.initialize({ config = config })
 
   -- 初始化聊天服务（前后端分离的后端入口，幂等）
   local chat_service = require("NeoAI.core.ai.chat_service")
