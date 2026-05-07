@@ -112,6 +112,83 @@ function M.handle_D()
   get_tree_window().refresh_tree()
 end
 
+--- 构建连接符前缀
+--- 正向遍历 flat_items，根据 is_last_branch 状态决定每层是否需要画 │
+--- @param flat_items table 平铺列表，每个元素有 indent, is_virtual, is_last_branch 字段
+--- @return table<string> 每个元素对应的前缀字符串
+function M.build_connectors(flat_items)
+  if not flat_items or #flat_items == 0 then
+    return {}
+  end
+
+  local n = #flat_items
+  local prefixes = {}
+  for i = 1, n do
+    prefixes[i] = ""
+  end
+
+  -- needs_line[level] = boolean，表示该层级是否需要画 │
+  local needs_line = {}
+
+  -- 正向遍历
+  for i = 1, n do
+    local item = flat_items[i]
+    local indent = item.indent or 0
+
+    local parts = {}
+    for level = 1, indent do
+      if level < indent then
+        -- 祖先层级：使用 needs_line
+        if needs_line[level] then
+          table.insert(parts, "│  ")
+        else
+          table.insert(parts, "   ")
+        end
+      else
+        -- 自身层级：虚拟节点用 needs_line，非虚拟节点根据 is_last_branch
+        if item.is_virtual then
+          if needs_line[level] then
+            table.insert(parts, "│  ")
+          else
+            table.insert(parts, "   ")
+          end
+        else
+          if not item.is_last_branch then
+            table.insert(parts, "│  ")
+          else
+            table.insert(parts, "   ")
+          end
+        end
+      end
+    end
+    prefixes[i] = table.concat(parts)
+
+    -- 更新 needs_line：当前节点的状态影响后续行
+    if not item.is_virtual then
+      needs_line[indent] = not item.is_last_branch
+    end
+  end
+
+  -- 特殊处理：根虚拟节点（indent==0）
+  -- 虚拟根节点画 │ 的条件：它前面最近的根节点（indent=1 的非虚拟节点）不是最后一个兄弟
+  for i, item in ipairs(flat_items) do
+    if item.is_virtual and item.indent == 0 then
+      if i ~= 1 then
+        for j = i - 1, 1, -1 do
+          if not flat_items[j].is_virtual and flat_items[j].indent == 1 then
+            if not flat_items[j].is_last_branch then
+              prefixes[i] = "│  "
+            end
+            break
+          end
+        end
+      end
+    end
+  end
+
+  return prefixes
+end
+
 function M.handle_cursor_moved()
   if state.initialized then get_tree_window().update_float_window() end
 end

@@ -147,30 +147,12 @@ function M.build_flat_items()
     local is_last_branch = (sibling_index == sibling_count)  -- 当前节点是否是兄弟中的最后一个（决定连接符 │）
     local sibling_is_last = is_last_branch
 
-    -- 计算连接符数组
-    -- connectors 数组长度 = indent（缩进级别数），每个元素对应一个层级的连接符
-    -- 对于每个层级 i（1-based）：
-    --   如果 i <= depth：根据 ancestor_is_last[i] 决定是 "   " 还是 "│  "
-    --   如果 i > depth：根据 sibling_is_last 决定
-    --     如果 sibling_is_last（最后一个兄弟），后面没有更多兄弟了，用 "   "
-    --     否则用 "│  "（后面还有兄弟）
+    -- 连接符数组：全部使用空格缩进，不做 │ 计算
+    -- tree_handlers.build_connectors 会反向遍历重新计算 │ 位置
     local connectors_len = indent
     local connectors = {}
     for i = 1, connectors_len do
-      if i <= depth then
-        if ancestor_is_last and ancestor_is_last[i] then
-          connectors[i] = "   "
-        else
-          connectors[i] = "│  "
-        end
-      else
-        -- i > depth：这些是当前节点之后的层级，根据 sibling_is_last 决定
-        if sibling_is_last then
-          connectors[i] = "   "
-        else
-          connectors[i] = "│  "
-        end
-      end
+      connectors[i] = "   "
     end
 
     -- 判断节点类型
@@ -234,20 +216,7 @@ function M.build_flat_items()
       local virtual_connectors_len = indent
       local virtual_connectors = {}
       for i = 1, virtual_connectors_len do
-        if i <= depth then
-          if ancestor_is_last and ancestor_is_last[i] then
-            virtual_connectors[i] = "   "
-          else
-            virtual_connectors[i] = "│  "
-          end
-        else
-          -- i > depth：根据 sibling_is_last 决定
-          if sibling_is_last then
-            virtual_connectors[i] = "   "
-          else
-            virtual_connectors[i] = "│  "
-          end
-        end
+        virtual_connectors[i] = "   "
       end
       local virtual_node = {
         is_virtual = true,
@@ -299,16 +268,7 @@ function M.build_flat_items()
     -- 第一个根虚拟节点前面不需要连接符（树的开始）
     -- 非最后一个根节点，虚拟节点前面需要 │  来连接后续的根节点
     local root_virtual_connectors = {}
-    if i == 1 then
-      -- 第一个根虚拟节点，前面不需要连接符
-      root_virtual_connectors[1] = "   "
-    elseif i == #non_empty_root_ids then
-      -- 最后一个根虚拟节点，前面不需要连接符（下面没有更多根节点了）
-      root_virtual_connectors[1] = "   "
-    else
-      -- 中间的根虚拟节点，前面需要 │  连接后续根节点
-      root_virtual_connectors[1] = "│  "
-    end
+    root_virtual_connectors[1] = "   "
     local root_virtual_node = {
       is_virtual = true,
       indent = 0,

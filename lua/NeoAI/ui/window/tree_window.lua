@@ -226,28 +226,19 @@ function M._build_display_content()
     table.insert(content, "暂无会话")
     table.insert(content, "按 N 创建新会话")
   else
+    -- 调用 tree_handlers.build_connectors 计算连接符前缀
+    local handlers = require("NeoAI.ui.handlers.tree_handlers")
+    local prefixes = handlers.build_connectors(state.flat_items)
+
     for idx, item in ipairs(state.flat_items) do
-      local line = ""
+      local line = prefixes[idx] or ""
 
-      -- 1. 根据缩进级别生成连接线
-      local indent = item.indent or 0
-      -- 使用 connectors 数组渲染连接符，数组长度 = indent
-      -- 当 indent 为 0 时，不渲染任何连接符（顶级节点）
-      local loop_end = indent
-      for i = 1, loop_end do
-        if item.connectors and item.connectors[i] then
-          line = line .. item.connectors[i]
-        else
-          line = line .. "   "
-        end
-      end
-
-      -- 2. 虚拟节点：渲染为 "📂 聊天会话"
+      -- 虚拟节点：渲染为 "📂 聊天会话"
       if item.is_virtual then
         line = line .. "📂 聊天会话"
         table.insert(content, line)
       else
-        -- 3. 根据 display_type 和 is_last_session 渲染前缀
+        -- 根据 display_type 和 is_last_session 渲染前缀
         if item.display_type == "branch" then
           if item.is_last_session then
             line = line .. "└─ 📂 " .. item.display_text
