@@ -500,12 +500,6 @@ function M._execute_single_tool(session_id, tool_call)
           local ok2, parsed_result = pcall(vim.json.decode, result_str)
           local sub_agent_id = parsed_result and parsed_result.sub_agent_id or nil
 
-          -- 构建子 agent 的初始消息（共享主 agent 创建前的上下文）
-          local sub_messages = {}
-          for _, msg in ipairs(s.messages or {}) do
-            table.insert(sub_messages, vim.deepcopy(msg))
-          end
-
           -- 记录子 agent 创建消息
           if sub_agent_id then
             plan_executor.record_message(sub_agent_id, "system", "子 agent 已创建，任务: " .. (args.task or ""))
@@ -519,7 +513,7 @@ function M._execute_single_tool(session_id, tool_call)
             -- 保存 on_summary 回调，用于接收子 agent 的总结
             local sub_agent_runner = {
               sub_agent_id = sub_agent_id,
-              messages = sub_messages,
+              messages = {}, -- 子 agent 不继承主 agent 的消息历史，只接收任务指令
               on_summary = function(summary)
                 -- 子 agent 完成时，将总结作为工具结果加入主 agent 消息
                 local s2 = state.sessions[session_id]
@@ -539,6 +533,13 @@ function M._execute_single_tool(session_id, tool_call)
                   window_id = s2.window_id,
                 })
 
+                -- 通知用户子 agent 执行完成
+                vim.notify(string.format("[NeoAI] 子 agent [%s] 执行完成", sub_agent_id), vim.log.levels.INFO)
+
+                -- 触发 UI 刷新，让用户看到总结消息
+                local chat_window = require("NeoAI.ui.window.chat_window")
+                pcall(chat_window.render_chat)
+
                 -- 清理子 agent 资源
                 plan_executor.cleanup_sub_agent(sub_agent_id)
               end,
@@ -553,7 +554,7 @@ function M._execute_single_tool(session_id, tool_call)
               sub_agent_engine.start_sub_agent_loop(sub_agent_id, {}, {
                 session_id = session_id,
                 window_id = ss.window_id,
-                messages = sub_messages,
+                messages = {}, -- 子 agent 不继承主 agent 的消息历史
                 options = ss.options,
                 model_index = ss.model_index,
                 ai_preset = ss.ai_preset,

@@ -312,17 +312,21 @@ local DEFAULT_CONFIG = {
 
         -- ===== shell_tools.lua =====
         run_command = { auto_allow = false },
+
+        create_sub_agent = { auto_allow = false },
+        get_sub_agent_status = { auto_allow = true },
+        cancel_sub_agent = { auto_allow = true },
       },
     },
   },
   -- 日志配置
   log = {
     -- 日志级别: 'DEBUG', 'INFO', 'WARN', 'ERROR', 'FATAL'
-    level = "DEBUG",
-    -- level = "WARN",
+    -- level = "DEBUG",
+    level = "WARN",
     -- 输出文件路径（可选，默认输出到文件，避免 print 阻塞消息区域）
-    -- output_path = nil,
-    output_path = "/root/NeoAI/pack/plugins/start/NeoAI/lua/NeoAI/neoai.log",
+    output_path = nil,
+    -- output_path = "/root/NeoAI/pack/plugins/start/NeoAI/lua/NeoAI/neoai.log",
     -- 日志格式模板
     format = "[{time}] [{level}] {message}",
     -- 最大文件大小（字节），默认 10MB

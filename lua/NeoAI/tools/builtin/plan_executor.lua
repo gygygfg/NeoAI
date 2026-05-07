@@ -50,6 +50,11 @@ local function _refresh_monitor()
   -- 延迟 500ms 执行，避免频繁刷新
   _refresh_timer = vim.fn.timer_start(500, function()
     _refresh_timer = nil
+    -- 如果审批窗口正在显示，跳过刷新避免冲突
+    local ok_approval, approval_handler = pcall(require, "NeoAI.tools.approval_handler")
+    if ok_approval and approval_handler.is_showing and approval_handler.is_showing() then
+      return
+    end
     -- 直接调用 show（不在 vim.schedule 中），因为定时器回调已在主线程
     pcall(monitor.show)
   end, { ["repeat"] = 0 })
@@ -101,6 +106,30 @@ local function _create_sub_agent(args, on_success, on_error)
   local max_iterations = boundaries.max_iterations or 10
   local timeout_sec = args.timeout or 120
 
+  -- 自动设置工具列表：如果未设置 allowed_tools，则自动使用主 agent 的所有可用工具
+  -- 注意：排除所有 agent 管理相关工具（创建、查看、取消子 agent），
+  -- 子 agent 不应该能创建其他子 agent 或管理自身生命周期
+  if allowed_tools == nil then
+    local ai_engine = require("NeoAI.core.ai.ai_engine")
+    local all_tools = ai_engine.get_tools() or {}
+    -- 需要排除的 agent 管理工具名称列表
+    local agent_tools = {
+      create_sub_agent = true,
+      get_sub_agent_status = true,
+      cancel_sub_agent = true,
+    }
+    local tool_names = {}
+    for name, _ in pairs(all_tools) do
+      if not agent_tools[name] then
+        table.insert(tool_names, "^" .. name .. "$")
+      end
+    end
+    if #tool_names > 0 then
+      boundaries.allowed_tools = tool_names
+      allowed_tools = tool_names
+    end
+  end
+
   -- 构建子 agent 状态
   local sub_agent = {
     id = sub_agent_id,
@@ -135,7 +164,7 @@ local function _create_sub_agent(args, on_success, on_error)
     if sa and sa.status == "running" then
       sa.status = "timeout"
       sa.summary = string.format("子 agent 执行超时（%d 秒）", timeout_sec)
-      _finalize_sub_agent(sub_agent_id)
+      M._finalize_sub_agent(sub_agent_id)
     end
   end, { ["repeat"] = 0 })
 
@@ -161,19 +190,43 @@ local function _create_sub_agent(args, on_success, on_error)
   }
 
   if on_success then
-    on_success(result)
+    vim.schedule(function()
+      on_success(result)
+    end)
   end
 end
 
---- 获取子 agent 执行状态
+--- 获取子 agent 执行状态或列出所有子 agent
+--- 如果传了 sub_agent_id 则查询单个，否则列出所有
 local function _get_sub_agent_status(args, on_success, on_error)
+  -- 未传 sub_agent_id：列出所有子 agent
   if not args or not args.sub_agent_id then
-    if on_error then
-      on_error("需要 sub_agent_id 参数")
+    local agents_list = {}
+    for id, sa in pairs(sub_agents) do
+      table.insert(agents_list, {
+        sub_agent_id = id,
+        task = sa.task:sub(1, 100),
+        status = sa.status,
+        tool_call_count = sa.tool_call_count,
+        iteration_count = sa.iteration_count,
+        created_at = sa.created_at,
+        max_tool_calls = sa.max_tool_calls,
+        max_iterations = sa.max_iterations,
+        last_tool_call = sa.last_tool_call,
+        rejected_calls = sa.rejected_calls,
+        summary = sa.summary,
+      })
+    end
+    table.sort(agents_list, function(a, b)
+      return a.created_at > b.created_at
+    end)
+    if on_success then
+      on_success({ agents = agents_list, count = #agents_list })
     end
     return
   end
 
+  -- 传了 sub_agent_id：查询单个
   local sa = sub_agents[args.sub_agent_id]
   if not sa then
     if on_error then
@@ -204,34 +257,28 @@ local function _get_sub_agent_status(args, on_success, on_error)
   end
 end
 
---- 列出所有子 agent
-local function _list_sub_agents(args, on_success, on_error)
-  local agents_list = {}
-  for id, sa in pairs(sub_agents) do
-    table.insert(agents_list, {
-      sub_agent_id = id,
-      task = sa.task:sub(1, 100), -- 截断长任务描述
-      status = sa.status,
-      tool_call_count = sa.tool_call_count,
-      iteration_count = sa.iteration_count,
-      created_at = sa.created_at,
-      max_tool_calls = sa.max_tool_calls,
-      max_iterations = sa.max_iterations,
-      last_tool_call = sa.last_tool_call,
-      rejected_calls = sa.rejected_calls,
-      summary = sa.summary,
-    })
-  end
-  table.sort(agents_list, function(a, b)
-    return a.created_at > b.created_at
-  end)
-
-  if on_success then
-    on_success({ agents = agents_list, count = #agents_list })
-  end
-end
-
 -- ========== 子 agent 生命周期管理 ==========
+
+--- 生成子 agent 执行总结
+--- @param sa table 子 agent 状态
+--- @return string 总结文本
+local function _generate_summary(sa)
+  local lines = {
+    string.format("【子 agent 执行总结】"),
+    string.format("ID: %s", sa.id),
+    string.format("任务: %s", sa.task),
+    string.format("状态: %s", sa.status),
+    string.format("执行时长: %d 秒", os.time() - sa.created_at),
+    string.format("工具调用次数: %d", sa.tool_call_count),
+    string.format("迭代轮次: %d", sa.iteration_count),
+  }
+
+  if #sa.approved_calls > 0 then
+    lines[#lines + 1] = string.format("已批准的工具调用: %d 次", #sa.approved_calls)
+  end
+
+  return table.concat(lines, "\n")
+end
 
 --- 结束子 agent 并生成总结
 --- 此函数由调度 agent 或子 agent 自身在完成时调用
@@ -266,61 +313,8 @@ local function _finalize_sub_agent(sub_agent_id)
   end
 end
 
---- 生成子 agent 执行总结
---- @param sa table 子 agent 状态
---- @return string 总结文本
-local function _generate_summary(sa)
-  local lines = {
-    string.format("【子 agent 执行总结】"),
-    string.format("ID: %s", sa.id),
-    string.format("任务: %s", sa.task),
-    string.format("状态: %s", sa.status),
-    string.format("执行时长: %d 秒", os.time() - sa.created_at),
-    string.format("工具调用次数: %d", sa.tool_call_count),
-    string.format("迭代轮次: %d", sa.iteration_count),
-  }
-
-  if #sa.approved_calls > 0 then
-    lines[#lines + 1] = string.format("已批准的工具调用: %d 次", #sa.approved_calls)
-  end
-
-  if #sa.rejected_calls > 0 then
-    lines[#lines + 1] = string.format("被驳回的工具调用: %d 次", #sa.rejected_calls)
-    for i, rc in ipairs(sa.rejected_calls) do
-      if i <= 5 then
-        lines[#lines + 1] = string.format("  - 工具: %s, 原因: %s", rc.tool_name or "未知", rc.reason or "无")
-      end
-    end
-    if #sa.rejected_calls > 5 then
-      lines[#lines + 1] = string.format("  ... 还有 %d 条被驳回记录", #sa.rejected_calls - 5)
-    end
-  end
-
-  if #sa.errors > 0 then
-    lines[#lines + 1] = string.format("执行错误: %d 次", #sa.errors)
-    for i, err in ipairs(sa.errors) do
-      if i <= 3 then
-        lines[#lines + 1] = string.format("  - %s", err)
-      end
-    end
-  end
-
-  if #sa.results > 0 then
-    lines[#lines + 1] = ""
-    lines[#lines + 1] = "=== 关键结果 ==="
-    for i, r in ipairs(sa.results) do
-      if i <= 10 then
-        local content = r:gsub("\n", " "):sub(1, 200)
-        lines[#lines + 1] = string.format("  %d. %s", i, content)
-      end
-    end
-    if #sa.results > 10 then
-      lines[#lines + 1] = string.format("  ... 还有 %d 条结果", #sa.results - 10)
-    end
-  end
-
-  return table.concat(lines, "\n")
-end
+-- 模块级别名，供 M.should_continue 等模块函数调用
+M._finalize_sub_agent = _finalize_sub_agent
 
 --- 取消子 agent
 local function _cancel_sub_agent(args, on_success, on_error)
@@ -580,10 +574,11 @@ function M.should_continue(sub_agent_id)
   if sa.iteration_count >= sa.max_iterations then
     sa.status = "completed"
     sa.summary = string.format("达到最大迭代轮次（%d 轮）", sa.max_iterations)
-    _finalize_sub_agent(sub_agent_id)
+    M._finalize_sub_agent(sub_agent_id)
     return false
   end
-  sa.iteration_count = sa.iteration_count + 1
+  -- 注意：迭代计数由子 agent 引擎（sub_agent_engine）统一管理
+  -- 此处不再递增 iteration_count，避免重复计数
   return true
 end
 
@@ -732,7 +727,11 @@ M.create_sub_agent = define_tool({
 
 M.get_sub_agent_status = define_tool({
   name = "get_sub_agent_status",
-  description = "获取子 agent 的执行状态和当前进度。可用于检查子 agent 是否完成、执行了哪些操作、是否有被驳回的调用等。",
+  description = [[获取子 agent 的执行状态和当前进度。
+- 传入 sub_agent_id：查询单个子 agent 的详细状态
+- 不传 sub_agent_id：列出所有子 agent 及其状态
+
+可用于检查子 agent 是否完成、执行了哪些操作、是否有被驳回的调用等。]],
   func = _get_sub_agent_status,
   async = true,
   parameters = {
@@ -740,14 +739,15 @@ M.get_sub_agent_status = define_tool({
     properties = {
       sub_agent_id = {
         type = "string",
-        description = "子 agent 的唯一 ID",
+        description = "子 agent 的唯一 ID（可选）。不传则列出所有子 agent。",
       },
     },
-    required = { "sub_agent_id" },
+    required = {},
   },
   returns = {
     type = "object",
     properties = {
+      -- 查询单个时的字段
       sub_agent_id = { type = "string", description = "子 agent ID" },
       task = { type = "string", description = "任务描述" },
       status = { type = "string", description = "当前状态：running | completed | rejected | timeout | error" },
@@ -762,25 +762,7 @@ M.get_sub_agent_status = define_tool({
       last_tool_call = { type = "string", description = "最近一次工具调用名称" },
       max_tool_calls = { type = "number", description = "最大工具调用次数" },
       max_iterations = { type = "number", description = "最大迭代轮次" },
-    },
-    description = "子 agent 状态信息",
-  },
-  category = "system",
-  permissions = { execute = true },
-})
-
-M.list_sub_agents = define_tool({
-  name = "list_sub_agents",
-  description = "列出所有子 agent 及其状态。",
-  func = _list_sub_agents,
-  async = true,
-  parameters = {
-    type = "object",
-    properties = {},
-  },
-  returns = {
-    type = "object",
-    properties = {
+      -- 列出全部时的字段
       agents = {
         type = "array",
         items = {
@@ -799,10 +781,11 @@ M.list_sub_agents = define_tool({
             summary = { type = "string" },
           },
         },
+        description = "子 agent 列表（不传 sub_agent_id 时返回）",
       },
-      count = { type = "number", description = "子 agent 总数" },
+      count = { type = "number", description = "子 agent 总数（不传 sub_agent_id 时返回）" },
     },
-    description = "子 agent 列表",
+    description = "子 agent 状态信息或列表",
   },
   category = "system",
   permissions = { execute = true },

@@ -162,6 +162,11 @@ function M.add_tool_call_to_history(messages, tool_call, tool_result)
   return updated
 end
 
+--- 获取工具定义列表
+function M.get_tool_definitions()
+  return _tool_definitions or {}
+end
+
 --- 设置工具定义列表
 function M.set_tool_definitions(defs)
   _tool_definitions = defs or {}

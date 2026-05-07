@@ -211,9 +211,16 @@ function M.execute_async(tool_name, args, on_success, on_error, on_progress)
   end
 
   -- ===== 工具审批检查 =====
-  -- 委托给 approval_handler
-  local check_ok, check_result = pcall(tool_validator.check_approval, tool_name, resolved_args, tool_registry)
-  local needs_user_approval = check_ok and check_result and check_result.auto_allow == false
+  -- 子 agent 的工具调用跳过审批：已通过 plan_executor.review_tool_call 边界审核
+  local resolved_args_check = resolved_args or {}
+  local is_sub_agent_call = resolved_args_check._sub_agent_id ~= nil
+
+  local needs_user_approval = false
+  if not is_sub_agent_call then
+    -- 委托给 approval_handler
+    local check_ok, check_result = pcall(tool_validator.check_approval, tool_name, resolved_args, tool_registry)
+    needs_user_approval = check_ok and check_result and check_result.auto_allow == false
+  end
 
   if needs_user_approval then
     local session_id = args and (args.session_id or args._session_id) or ""

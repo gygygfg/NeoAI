@@ -85,6 +85,7 @@ function M.run_all(...)
     "test_events_keymaps", -- 合并: event_constants, keymap_manager
     "test_ai_core", -- 合并: ai_engine, chat_service, response_retry
     "test_http_client", -- 包含特殊字符编码测试
+    "test_sub_agent", -- 子 agent 创建与管理测试
     "test_integration", -- 端到端集成测试：完整 setup、真实 HTTP 请求、工具循环、命令注册
   }
 

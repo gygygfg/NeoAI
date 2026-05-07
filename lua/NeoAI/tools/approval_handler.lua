@@ -391,15 +391,31 @@ function M._render_ui()
     table.insert(lines, "  工具: " .. (tool.name or "未知"))
     local desc = tool.description or ""
     if desc ~= "" then
-      table.insert(lines, "  描述: " .. desc)
+      local first = true
+      for line in desc:gmatch("[^\n]+") do
+        local safe_line = line:gsub("\r", "")
+        if first then
+          table.insert(lines, "  描述: " .. safe_line)
+          first = false
+        else
+          table.insert(lines, "        " .. safe_line)
+        end
+      end
     end
     if tool.args and type(tool.args) == "table" then
       table.insert(lines, "  参数:")
       for k, v in pairs(tool.args) do
         if k ~= "_session_id" and k ~= "_tool_call_id" then
           local v_str = type(v) == "string" and v or vim.inspect(v)
+          local first = true
           for line in v_str:gmatch("[^\n]+") do
-            table.insert(lines, "    " .. k .. ": " .. line)
+            local safe_line = line:gsub("\r", "")
+            if first then
+              table.insert(lines, "    " .. k .. ": " .. safe_line)
+              first = false
+            else
+              table.insert(lines, "         " .. safe_line)
+            end
           end
         end
       end

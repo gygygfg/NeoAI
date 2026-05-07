@@ -333,7 +333,18 @@ function _handle_stream_end(generation_id, processor, params)
       local retry_count = gen.retry_count or 0
       if is_tool_loop and reason and reason:find("空响应") then
         state.is_generating = false; state.current_generation_id = nil; state.active_generations[generation_id] = nil
-        tool_orchestrator.on_generation_complete({ generation_id = generation_id, tool_calls = {}, content = full_response, reasoning = reasoning_text, usage = usage, session_id = sid, is_final_round = true })
+        -- 检查是否为子 agent 的空响应，传入 _sub_agent_id 确保正确转发
+        local sub_agent_id = params and params._sub_agent_id
+        tool_orchestrator.on_generation_complete({
+          generation_id = generation_id,
+          tool_calls = {},
+          content = full_response,
+          reasoning = reasoning_text,
+          usage = usage,
+          session_id = sid,
+          is_final_round = true,
+          _sub_agent_id = sub_agent_id,
+        })
         return
       end
       if response_retry.can_retry(retry_count) then
@@ -622,11 +633,13 @@ end
 -- ========== 处理工具结果 ==========
 function M.handle_tool_result(data)
   -- ===== 子 agent 请求：绕过 state.is_generating 检查 =====
-  -- 子 agent 使用独立的 generation_id（格式：sub_agent_<id>_<timestamp>），
+  -- 子 agent 使用独立的 generation_id（格式：sub_agent_<id>_<timestamp>_<random>），
   -- 与主 agent 的 generation_id 不同，因此不会被 state.is_generating 阻塞。
   -- 但子 agent 的 TOOL_RESULT_RECEIVED 事件也会触发此函数，
   -- 需要直接转发给 sub_agent_engine，不经过主 agent 的生成流程。
   if data._sub_agent_id then
+    local logger = require("NeoAI.utils.logger")
+    logger.info("[sub_agent] handle_tool_result: id=%s, msgs=%d", data._sub_agent_id, #(data.messages or {}))
     local sub_agent_engine = require("NeoAI.core.ai.sub_agent_engine")
     -- 子 agent 的请求直接发起 AI 生成，不经过主 agent 的状态管理
     local sa_session_id = data.session_id
@@ -638,12 +651,21 @@ function M.handle_tool_result(data)
     local sa_is_final_round = data.is_final_round or false
     local sa_accumulated_usage = data.accumulated_usage or {}
     local sa_last_reasoning = data.last_reasoning
-    local sa_generation_id = data.generation_id or ("sub_agent_" .. data._sub_agent_id .. "_" .. os.time())
+    -- 使用随机后缀确保 generation_id 唯一
+    local sa_generation_id = data.generation_id or ("sub_agent_" .. data._sub_agent_id .. "_" .. os.time() .. "_" .. math.random(10000, 99999))
 
-    if tool_orchestrator.is_stop_requested(sa_session_id) then return end
+    -- 注意：不检查 tool_orchestrator.is_stop_requested
+    -- 子 agent 使用独立的 generation_id 和独立的工具循环，
+    -- 不应该被主 agent 的 stop_requested 状态影响
     -- 退出时跳过子 agent 请求，防止死循环
-    if shutdown_flag.is_set() then return end
-    if not sa_messages or #sa_messages == 0 then return end
+    if shutdown_flag.is_set() then
+      logger.warn("[sub_agent] handle_tool_result: shutdown_flag set for %s", data._sub_agent_id)
+      return
+    end
+    if not sa_messages or #sa_messages == 0 then
+      logger.warn("[sub_agent] handle_tool_result: empty messages for %s", data._sub_agent_id)
+      return
+    end
 
     -- 构建请求并直接发送
     local formatted = request_builder.format_messages(sa_messages)
@@ -660,9 +682,33 @@ function M.handle_tool_result(data)
       generation_id = sa_generation_id,
     })
 
-    -- 子 agent 请求不携带 tools（由 sub_agent_engine 管理工具循环）
-    request.tools = nil
-    request.tool_choice = nil
+    -- 子 agent 请求需要携带工具列表，让 AI 知道有哪些工具可用
+    -- 但只携带边界允许的工具（如果设置了 allowed_tools）
+    local plan_executor = require("NeoAI.tools.builtin.plan_executor")
+    local context = plan_executor.get_sub_agent_context(data._sub_agent_id)
+    local allowed_tools = context and context.boundaries and context.boundaries.allowed_tools or nil
+
+    if allowed_tools and #allowed_tools > 0 then
+      -- 只保留边界允许的工具
+      local all_defs = request_builder.get_tool_definitions() or {}
+      local filtered = {}
+      for _, def in ipairs(all_defs) do
+      local def_name = (def["function"] and def["function"].name) or def.name or ""
+        for _, pattern in ipairs(allowed_tools) do
+          if def_name:match(pattern) then
+            table.insert(filtered, def)
+            break
+          end
+        end
+      end
+      -- 即使 filtered 为空，也传递空表而非 nil，
+      -- 这样 AI 知道没有可用工具，不会尝试调用工具
+      request.tools = filtered
+    else
+      -- 没有边界限制，使用所有可用工具
+      request.tools = request_builder.get_tool_definitions() or {}
+    end
+    request.tool_choice = "auto"
 
     -- 创建独立的协程上下文（变量隔离）
     local ctx = state_manager.create_context({
@@ -830,6 +876,23 @@ function M.handle_generation_error(generation_id, error_msg)
   if not generation then return end
   local shared = state_manager.get_shared() or {}
   vim.api.nvim_exec_autocmds("User", { pattern = event_constants.GENERATION_ERROR, data = { generation_id = generation_id, error_msg = error_msg, session_id = shared.session_id or generation.session_id, window_id = shared.window_id or generation.window_id } })
+
+  -- 检测是否为子 agent 的生成错误，通知子 agent 引擎结束
+  local sub_agent_id = generation._sub_agent_id
+  if sub_agent_id then
+    local sub_agent_engine = require("NeoAI.core.ai.sub_agent_engine")
+    sub_agent_engine.on_generation_complete({
+      generation_id = generation_id,
+      tool_calls = {},
+      content = "[AI 生成错误] " .. error_msg,
+      reasoning = "",
+      usage = {},
+      session_id = generation.session_id,
+      is_final_round = true,
+      _sub_agent_id = sub_agent_id,
+    })
+  end
+
   state.active_generations[generation_id] = nil; state.is_generating = false; state.current_generation_id = nil
   local hm_ok, hm = pcall(require, "NeoAI.core.history.manager")
   if hm_ok and hm and hm._save then hm._save() end

@@ -114,6 +114,12 @@ end
 --- 渲染窗口内容（必须在主线程调用）
 --- 如果窗口不存在，自动创建
 local function _render()
+  -- 如果审批窗口正在显示，跳过渲染避免冲突
+  local ok_approval, approval_handler = pcall(require, "NeoAI.tools.approval_handler")
+  if ok_approval and approval_handler.is_showing and approval_handler.is_showing() then
+    return
+  end
+
   -- 如果窗口不存在，自动创建
   if not state.window_id then
     _create_window()
