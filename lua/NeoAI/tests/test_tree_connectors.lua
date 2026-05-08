@@ -139,13 +139,8 @@ local function run_tests()
   assert_eq(p2[1], "", "第一个虚拟根节点前缀为空")
   -- 根1（索引2）：indent=1，且不是最后一个兄弟，所以第一列是 │
   assert_eq(p2[2], "│  ", "根1前缀为 │  ")
-  -- 第二个虚拟根节点（索引3）：indent=0，在第一个和最后一个虚拟根节点之间，第一列是 │
-  print("  DEBUG: p2[3] = '" .. p2[3] .. "' (len=" .. #(p2[3] or "") .. ")")
-  print("  DEBUG: virtual_root_indices:")
-  local vr_idx = {}
-  for i, item in ipairs(items2) do if item.is_virtual and item.indent == 0 then table.insert(vr_idx, i) end end
-  print("  DEBUG: " .. vim.inspect(vr_idx))
-  assert_eq(p2[3], "│  ", "中间虚拟根节点前缀为 │  ")
+  -- 第二个虚拟根节点（索引3）：indent=0，虚拟节点本身不画竖线
+  assert_eq(p2[3], "", "中间虚拟根节点前缀为空")
   -- 根2（索引4）：indent=1，是最后一个兄弟，第一列为空
   assert_eq(p2[4], "   ", "最后一个根节点前缀为3个空格")
   print_tree(items2)

@@ -1,6 +1,6 @@
 --- 历史树组件
 --- 接收 history_manager 传来的扁平化数组，按深度优先排序，
---- 计算 is_last、缩进级别、连接符数组。
+--- 计算 is_last、缩进级别。
 --- 输出可直接渲染的列表。
 
 local M = {}
@@ -131,20 +131,19 @@ function M.build_flat_items()
       return
     end
 
-    -- 缩进级别：父缩进 + 兄弟数 - 当前索引
-    -- 单链时（sibling_count=1），子节点缩进 = 父缩进（同级别）
-    -- 分支时，子节点缩进递增
+    -- 缩进级别：父缩进为N，共m个子节点，第n个子节点缩进 = N + m - n
+    -- 第一个子节点缩进最多，最后一个子节点与父节点同级
     local indent
     if parent_indent == -1 then
       indent = 1
     else
-      indent = parent_indent + sibling_count - sibling_index
+      indent = math.max(1, parent_indent + sibling_count - sibling_index)
     end
 
     local child_ids = session.child_ids or {}
     local has_children = #child_ids > 0
-    local is_last_session = #child_ids == 0  -- child_ids 是否为空数组，决定 └─/├─
-    local is_last_branch = (sibling_index == sibling_count)  -- 当前节点是否是兄弟中的最后一个（决定连接符 │）
+    local is_last_session = not has_children -- 没有子节点即为最后一个会话（叶子节点），决定 └─/├─
+    local is_last_branch = (sibling_index == sibling_count) -- 当前节点是否是兄弟中的最后一个（决定连接符 │）
     local sibling_is_last = is_last_branch
 
     -- 连接符数组：全部使用空格缩进，不做 │ 计算
@@ -171,7 +170,7 @@ function M.build_flat_items()
 
     -- 构建显示文本
     -- 优先显示会话名称（如果不是默认名称且不为空），否则显示轮次预览
-    local default_names = {"聊天会话", "新会话", "子会话", "分支", "会话"}
+    local default_names = { "聊天会话", "新会话", "子会话", "分支", "会话" }
     local is_default_name = false
     if session.name and session.name ~= "" then
       for _, dn in ipairs(default_names) do
@@ -210,9 +209,9 @@ function M.build_flat_items()
     }
     table.insert(flat_nodes, node)
 
-    -- 在分支节点后面插入虚拟节点（与父节点同级）
-    -- 当 child_ids 有多个（>=2）时，也插入虚拟节点
-    if is_branch or is_multi_child then
+    -- 在有子节点的节点后面插入虚拟节点（与父节点同级）
+    -- 只有 child_ids > 1 的多分支节点才插入虚拟节点作为分支标题
+    if has_children and #child_ids > 1 then
       local virtual_connectors_len = indent
       local virtual_connectors = {}
       for i = 1, virtual_connectors_len do
@@ -272,6 +271,7 @@ function M.build_flat_items()
     local root_virtual_node = {
       is_virtual = true,
       indent = 0,
+      is_last_branch = (i == #non_empty_root_ids),
       connectors = root_virtual_connectors,
     }
     table.insert(flat_nodes, root_virtual_node)
