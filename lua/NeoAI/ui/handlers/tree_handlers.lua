@@ -168,7 +168,13 @@ function M.handle_D()
 end
 
 --- 构建连接符前缀
---- 正向遍历 flat_items，根据 is_last_branch 状态决定每层是否需要画 │
+--- 按根虚拟节点分组处理，每组内独立计算 needs_line
+--- 规则：
+---   1. 根虚拟节点之间用竖线连接（从最后一个虚拟根节点到第一个）
+---   2. 虚拟节点自身如果后面还有同级非虚拟节点，也需要画竖线
+---   3. 子节点从父级虚拟节点继承竖线状态
+---   4. 非虚拟节点根据 is_last_branch 决定自身层级是否画竖线
+---   5. 不更改缩进
 --- @param flat_items table 平铺列表，每个元素有 indent, is_virtual, is_last_branch 字段
 --- @return table<string> 每个元素对应的前缀字符串
 function M.build_connectors(flat_items)
@@ -182,50 +188,84 @@ function M.build_connectors(flat_items)
     prefixes[i] = ""
   end
 
-  -- needs_line[level] = boolean，表示该层级是否需要画 │
-  local needs_line = {}
-
-  -- 正向遍历
+  -- 按根虚拟节点分组
+  local groups = {}
+  local current_group = nil
   for i = 1, n do
     local item = flat_items[i]
-    local indent = item.indent or 0
+    if item.is_virtual and item.indent == 0 then
+      current_group = { start = i, items = {} }
+      table.insert(groups, current_group)
+    end
+    if current_group then
+      table.insert(current_group.items, i)
+    end
+  end
 
-    local parts = {}
-    for level = 1, indent do
-      if level < indent then
-        -- 祖先层级：使用 needs_line
-        if needs_line[level] then
+  -- 处理每个组
+  for g_idx, group in ipairs(groups) do
+    local is_last_group = (g_idx == #groups)
+    local g_items = group.items
+
+    -- 计算组内每个 level 的 needs_line
+    -- 从后往前遍历组内非虚拟节点，每个 level 由最后一个节点决定
+    local needs_line = {}
+    for idx = #g_items, 1, -1 do
+      local i = g_items[idx]
+      local item = flat_items[i]
+      local indent = item.indent or 0
+      if not item.is_virtual and needs_line[indent] == nil then
+        needs_line[indent] = not item.is_last_branch
+      end
+    end
+
+    -- 虚拟节点：如果后面有同级非虚拟节点，设置 needs_line
+    for _, idx in ipairs(g_items) do
+      local item = flat_items[idx]
+      if item.is_virtual and item.indent > 0 then
+        if needs_line[item.indent] == nil then
+          local has_next = false
+          for j = idx + 1, n do
+            local nj = flat_items[j]
+            if nj.indent < item.indent then
+              break
+            end
+            if nj.indent == item.indent and not nj.is_virtual then
+              has_next = true
+              break
+            end
+          end
+          needs_line[item.indent] = has_next
+        end
+      end
+    end
+
+    -- 默认值
+    for level = 1, 20 do
+      if needs_line[level] == nil then
+        needs_line[level] = false
+      end
+    end
+
+    -- 构建组内节点的前缀
+    for _, idx in ipairs(g_items) do
+      local item = flat_items[idx]
+      local indent = item.indent or 0
+
+      -- 非最后一个根组：所有层级强制竖线（确保子节点从父级继承竖线）
+      local force_all = (not is_last_group and indent >= 1)
+
+      local parts = {}
+      for level = 1, indent do
+        if force_all then
+          table.insert(parts, "│  ")
+        elseif needs_line[level] then
           table.insert(parts, "│  ")
         else
           table.insert(parts, "   ")
         end
-      else
-        -- 自身层级：虚拟节点用 needs_line，非虚拟节点根据 is_last_branch
-        if item.is_virtual then
-          if needs_line[level] then
-            table.insert(parts, "│  ")
-          else
-            table.insert(parts, "   ")
-          end
-        else
-          if not item.is_last_branch then
-            table.insert(parts, "│  ")
-          else
-            table.insert(parts, "   ")
-          end
-        end
       end
-    end
-    prefixes[i] = table.concat(parts)
-
-    -- 根虚拟节点：更新 needs_line[1]，控制后续根级别（indent=1）行的竖线
-    if item.is_virtual and indent == 0 then
-      needs_line[1] = not item.is_last_branch
-    end
-
-    -- 更新 needs_line：非虚拟节点的状态影响后续行
-    if not item.is_virtual then
-      needs_line[indent] = not item.is_last_branch
+      prefixes[idx] = table.concat(parts)
     end
   end
 
