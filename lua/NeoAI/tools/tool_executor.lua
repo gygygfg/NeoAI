@@ -27,6 +27,7 @@ local timeout_state = {
   timers = {}, -- tool_call_id -> timer
   start_times = {}, -- tool_call_id -> os.time()
   timeout_ms = 30000, -- 默认 30 秒（会被 initialize 中的 config.tool_timeout_ms 覆盖）
+  saved_timeouts = {}, -- tool_call_id -> { timeout_ms, on_timeout } 暂停时保存的原始超时信息
 }
 
 -- ========== 辅助函数 ==========
@@ -736,10 +737,16 @@ function M._set_timeout(tool_call_id, timeout_ms, on_timeout)
   end
   -- 清除旧定时器
   M._clear_timeout(tool_call_id)
+  -- 保存超时信息供 _resume_timeout 使用
+  timeout_state.saved_timeouts[tool_call_id] = {
+    timeout_ms = timeout_ms,
+    on_timeout = on_timeout,
+  }
   timeout_state.start_times[tool_call_id] = vim.loop.hrtime()
   timeout_state.timers[tool_call_id] = vim.defer_fn(function()
     timeout_state.timers[tool_call_id] = nil
     timeout_state.start_times[tool_call_id] = nil
+    timeout_state.saved_timeouts[tool_call_id] = nil
     if on_timeout then
       pcall(on_timeout)
     end
@@ -764,6 +771,68 @@ function M._clear_timeout(tool_call_id)
     timeout_state.timers[tool_call_id] = nil
   end
   timeout_state.start_times[tool_call_id] = nil
+  timeout_state.saved_timeouts[tool_call_id] = nil
+end
+
+--- 暂停工具超时（保留已过去的时间，停止定时器）
+--- 用于 shell 交互式命令等待 AI 输入时暂停超时
+--- @param tool_call_id string 工具调用 ID
+function M._pause_timeout(tool_call_id)
+  if not timeout_state.timers[tool_call_id] then
+    return
+  end
+  local timer = timeout_state.timers[tool_call_id]
+  pcall(function()
+    if timer:is_active() then
+      timer:stop()
+    end
+  end)
+end
+
+--- 恢复工具超时（重新启动定时器，使用剩余时间）
+--- 用于 shell 交互式命令收到 AI 输入后恢复超时
+--- @param tool_call_id string 工具调用 ID
+--- @param on_timeout function|nil 超时回调（不传则使用 saved_timeouts 中保存的回调）
+function M._resume_timeout(tool_call_id, on_timeout)
+  local saved = timeout_state.saved_timeouts[tool_call_id]
+  if not saved then
+    return
+  end
+  local start = timeout_state.start_times[tool_call_id]
+  if not start then
+    return
+  end
+  -- 关闭旧定时器
+  local timer = timeout_state.timers[tool_call_id]
+  if timer then
+    pcall(function()
+      if timer:is_active() then
+        timer:stop()
+      end
+      if not timer:is_closing() then
+        timer:close()
+      end
+    end)
+  end
+  -- 计算剩余时间
+  local now = vim.loop.hrtime()
+  local elapsed_ns = now - start
+  local elapsed_ms = elapsed_ns / 1e6
+  local remaining_ms = saved.timeout_ms - elapsed_ms
+  if remaining_ms <= 0 then
+    remaining_ms = 1
+  end
+  -- 使用传入的回调或保存的回调
+  local cb = on_timeout or saved.on_timeout
+  -- 创建新定时器
+  timeout_state.timers[tool_call_id] = vim.defer_fn(function()
+    timeout_state.timers[tool_call_id] = nil
+    timeout_state.start_times[tool_call_id] = nil
+    timeout_state.saved_timeouts[tool_call_id] = nil
+    if cb then
+      pcall(cb)
+    end
+  end, remaining_ms)
 end
 
 --- 重置工具超时（清除旧超时，设置新超时）

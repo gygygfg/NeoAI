@@ -421,7 +421,7 @@ function ProcessMonitor:check_process_state()
     table.insert(fields, field)
   end
 
-  local tty_nr = fields[4] -- 索引从0开始，所以tty是第7个字段
+  local tty_nr = fields[4] -- 索引从0开始，tty_nr是第5个字段（state=0, ppid=1, pgrp=2, session=3, tty_nr=4, tpgid=5, flags=6）
 
   -- 检查进程是否在等待终端输入
   local is_waiting = false
@@ -442,6 +442,7 @@ function ProcessMonitor:check_process_state()
           or wchan:match("n_tty_read")
           or wchan:match("wait_for_completion")
           or wchan:match("pipe_wait")
+          or wchan:match("pipe_read")
           or wchan:match("wait_woken")
         then
           -- 检查是否连接到终端
@@ -517,7 +518,12 @@ function ProcessMonitor:_find_child_waiting_for_input()
         wchan_file:close()
 
         if wchan then
-          if wchan:match("wait_woken") or wchan:match("tty_read") or wchan:match("n_tty_read") then
+          if
+            wchan:match("wait_woken")
+            or wchan:match("tty_read")
+            or wchan:match("n_tty_read")
+            or wchan:match("pipe_read")
+          then
             -- 检查子进程的 tty
             local stat_path = "/proc/" .. child_pid .. "/stat"
             local stat_file = io.open(stat_path, "r")
@@ -530,7 +536,7 @@ function ProcessMonitor:_find_child_waiting_for_input()
                 for field in stat_data:sub(close_paren + 2):gmatch("%S+") do
                   table.insert(fields, field)
                 end
-                local tty_nr = fields[4]
+                local tty_nr = fields[4] -- 索引从0开始，tty_nr是第5个字段
                 if tty_nr and tty_nr ~= "0" then
                   return child_pid
                 end
@@ -1108,6 +1114,14 @@ local function _run_command(args, on_success, on_error, on_progress)
     session.is_waiting_for_input = false
     session.state = "running"
 
+    -- 恢复 tool_executor 超时（AI 已发送输入，重新开始计时）
+    if args._tool_call_id then
+      pcall(function()
+        local tool_executor = require("NeoAI.tools.tool_executor")
+        tool_executor._resume_timeout(args._tool_call_id)
+      end)
+    end
+
     -- 记录交互历史
     table.insert(session.interaction_history, {
       round = session.interaction_round,
@@ -1477,6 +1491,14 @@ local function _run_command(args, on_success, on_error, on_progress)
           session.process_monitor:pause_monitoring()
         end
 
+        -- 暂停 tool_executor 超时，避免 AI 决策期间超时触发
+        if args._tool_call_id then
+          pcall(function()
+            local tool_executor = require("NeoAI.tools.tool_executor")
+            tool_executor._pause_timeout(args._tool_call_id)
+          end)
+        end
+
         -- 启动确认计时器：每 150ms 检查一次进程状态
         -- 连续多次检测到 waiting 后才触发 AI 决策
         -- 如果中途进程退出 waiting，则取消
@@ -1540,6 +1562,14 @@ local function _run_command(args, on_success, on_error, on_progress)
       end
       session._waiting_confirm_timer = nil
       session._waiting_confirm_count = 0
+
+      -- 恢复 tool_executor 超时（进程不再等待输入）
+      if args._tool_call_id then
+        pcall(function()
+          local tool_executor = require("NeoAI.tools.tool_executor")
+          tool_executor._resume_timeout(args._tool_call_id)
+        end)
+      end
     end
   end
 

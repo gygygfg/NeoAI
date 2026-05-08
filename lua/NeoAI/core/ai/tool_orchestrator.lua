@@ -1991,7 +1991,14 @@ function M.execute_single_tool_request(session_id, tool_name, args, callback)
         local tc = message.tool_calls[1]
         local func = tc["function"] or tc.func
         if func and func.name == tool_name then
-          local ok, parsed_args = pcall(vim.json.decode, func.arguments)
+          -- 解码 URL 编码的 arguments（http_client 的 encode_response_strings 会对所有字符串进行 URL 编码）
+          local raw_args_str = func.arguments or ""
+          local decoded_args = raw_args_str
+          if raw_args_str:find("%%") then
+            local http_utils = require("NeoAI.core.ai.http_utils")
+            decoded_args = http_utils.decode_special_chars(raw_args_str)
+          end
+          local ok, parsed_args = pcall(vim.json.decode, decoded_args)
           if ok and type(parsed_args) == "table" then
             -- 自动合并 fixed_args（程序注入的参数，AI 不可见）
             for k, v in pairs(fixed_args) do
