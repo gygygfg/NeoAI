@@ -2392,6 +2392,7 @@ function M._setup_event_listeners()
         state.streaming.reasoning_buffer = ""
         state.streaming.reasoning_active = false
         state.streaming.reasoning_done = false
+        state.streaming.message_start_line = nil
         local ok = M.add_message("assistant", "", { allow_empty = true, skip_render = true, skip_event = true })
         if ok then
           state.streaming.message_index = #state.messages
@@ -2442,12 +2443,6 @@ function M._setup_event_listeners()
         return
       end
 
-      -- 解码 %%XX URL 编码
-      local http_utils_ok, http_utils = pcall(require, "NeoAI.core.ai.http_utils")
-      if http_utils_ok and http_utils.decode_special_chars then
-        rc = http_utils.decode_special_chars(rc)
-      end
-
       -- 检查光标是否在末尾附近（决定是否显示悬浮窗）
       local win = get_win()
       local should_follow = cursor_near_end(win)
@@ -2459,6 +2454,7 @@ function M._setup_event_listeners()
         state.streaming.reasoning_buffer = ""
         state.streaming.reasoning_active = true
         state.streaming.reasoning_done = false
+        state.streaming.message_start_line = nil
         local ok = M.add_message("assistant", "", { allow_empty = true, skip_render = true, skip_event = true })
         if ok then
           state.streaming.message_index = #state.messages
@@ -2474,14 +2470,21 @@ function M._setup_event_listeners()
       end
 
       state.streaming.reasoning_active = true
+      -- reasoning_buffer 保持编码后的原始内容，与 content_buffer 一致
       state.streaming.reasoning_buffer = state.streaming.reasoning_buffer .. rc
       -- 仅在光标跟随模式下更新思考过程悬浮窗内容
       -- 注意：思考过程只在悬浮窗中滚动显示，不追加到聊天缓冲区
       -- 等思考过程完毕后，再以折叠文本格式一次性追加到聊天缓冲区
+      -- 解码 %%XX URL 编码（仅用于悬浮窗显示）
       if should_follow then
         local ok_rd, rd = pcall(require, "NeoAI.ui.components.reasoning_display")
         if ok_rd and rd.is_visible() then
-          rd.append(rc)
+          local http_utils_ok, http_utils = pcall(require, "NeoAI.core.ai.http_utils")
+          local display_text = rc
+          if http_utils_ok and http_utils.decode_special_chars then
+            display_text = http_utils.decode_special_chars(display_text)
+          end
+          rd.append(display_text)
         end
       end
     end,
@@ -2502,6 +2505,7 @@ function M._setup_event_listeners()
         state.streaming.generation_id = data.generation_id
         state.streaming.content_buffer = ""
         state.streaming.reasoning_buffer = ""
+        state.streaming.message_start_line = nil
         local ok = M.add_message("assistant", "", { allow_empty = true, skip_render = true, skip_event = true })
         if ok then
           state.streaming.message_index = #state.messages
@@ -3453,12 +3457,6 @@ end
 function M._append_stream_chunk_to_buffer(chunk_content, content_type)
   if not state.current_window_id then
     return
-  end
-
-  -- 解码 %%XX URL 编码
-  local http_utils_ok, http_utils = pcall(require, "NeoAI.core.ai.http_utils")
-  if http_utils_ok and http_utils.decode_special_chars then
-    chunk_content = http_utils.decode_special_chars(chunk_content)
   end
 
   -- 更新消息列表中的累积内容，并同步保存到历史文件

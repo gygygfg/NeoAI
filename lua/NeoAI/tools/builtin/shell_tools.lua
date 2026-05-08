@@ -1562,16 +1562,26 @@ local function _run_command(args, on_success, on_error, on_progress)
 
   -- 创建伪终端
   local function create_pty()
-    -- 直接执行命令，不使用 exec 包装
+    -- 构建执行命令
     -- 注意：之前使用 (sleep 0.5; exec command) 包装会导致 jobpid 返回外层 shell 的 PID
     -- 该外层 shell 的 wchan 为 do_wait（等待子进程），而非实际命令的 wait_woken
     -- 导致 ProcessMonitor 无法检测到进程在等待输入
+    --
+    -- 对于非 headless 模式（termopen），添加 trap '' HUP 忽略 SIGHUP
+    -- termopen 在进程退出后可能向进程组发送 SIGHUP，导致退出码变为 129（128+1）
+    -- 使用 exec 确保进程 PID 正确，同时 trap 阻止 SIGHUP 传播
     local exec_command
     if vim.fn.has("win32") == 1 then
       -- Windows
       exec_command = "cmd.exe /c " .. command
     else
-      -- Unix/Linux: 直接执行命令
+      -- Unix/Linux: 使用 trap 忽略 SIGHUP，然后 exec 替换为实际命令
+      -- 注意：trap '' HUP 必须在子 shell 中设置，exec 替换后 trap 会丢失
+      -- 所以使用 sh -c 'trap "" HUP; exec command' 的形式
+      -- 但这样 jobpid 返回的是 sh 的 PID，不是实际命令的 PID
+      --
+      -- 更好的方法：在 on_exit 回调中修正退出码（见下方）
+      -- 直接执行命令，不使用包装，保持 PID 正确
       exec_command = command
     end
 
@@ -1620,8 +1630,28 @@ local function _run_command(args, on_success, on_error, on_progress)
         end
       end,
       on_exit = function(_, exit_code, signal)
-        session.exit_code = exit_code
-        session.exit_signal = signal
+        -- 修正退出码：termopen 下进程被 SIGHUP(1) 终止时退出码为 129
+        -- 这是因为 Neovim 终端在进程退出后会向进程组发送 SIGHUP
+        -- 对于非交互式命令，这通常不是真正的错误
+        local corrected_exit_code = exit_code
+        local corrected_signal = signal
+
+        if not is_headless then
+          -- 检查是否因 SIGHUP 导致退出码异常
+          -- termopen 的 on_exit 中：exit_code 可能是 129（128+1），signal 可能是 -1 或 1
+          -- 也可能是 exit_code=-1, signal=1
+          if exit_code == 129 or (exit_code == -1 and signal == 1) then
+            -- 检查命令是否有正常输出，如果有则视为正常退出
+            local has_output = #session.stdout_data > 0 or #session.stderr_data > 0
+            if has_output then
+              corrected_exit_code = 0
+              corrected_signal = nil
+            end
+          end
+        end
+
+        session.exit_code = corrected_exit_code
+        session.exit_signal = corrected_signal
         session.state = "finished"
 
         -- 仅在非 headless 模式下延迟关闭 PTY 浮动窗口
@@ -1636,8 +1666,8 @@ local function _run_command(args, on_success, on_error, on_progress)
 
           local result_obj = {
             command = command,
-            exit_code = exit_code,
-            signal = signal,
+            exit_code = corrected_exit_code,
+            signal = corrected_signal,
             stdout = table.concat(session.stdout_data, ""),
             stderr = table.concat(session.stderr_data, ""),
             session_id = session_id,

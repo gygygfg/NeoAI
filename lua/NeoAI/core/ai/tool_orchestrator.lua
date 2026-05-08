@@ -468,7 +468,11 @@ function M._execute_single_tool(session_id, tool_call)
     local args = tool_func.arguments or {}
     if type(args) == "string" then
       local ok, parsed = pcall(vim.json.decode, args)
-      if ok and type(parsed) == "table" then args = parsed else args = {} end
+      if ok and type(parsed) == "table" then
+        args = parsed
+      else
+        args = {}
+      end
     end
 
     -- 通过 tool_executor 执行 create_sub_agent（创建子 agent 记录）
@@ -484,7 +488,9 @@ function M._execute_single_tool(session_id, tool_call)
     }, {
       on_result = function(success, result)
         local s = state.sessions[session_id]
-        if not s then return end
+        if not s then
+          return
+        end
 
         if s.stop_requested then
           s.active_tool_calls[tool_call_id] = nil
@@ -517,13 +523,12 @@ function M._execute_single_tool(session_id, tool_call)
               on_summary = function(summary)
                 -- 子 agent 完成时，将总结作为工具结果加入主 agent 消息
                 local s2 = state.sessions[session_id]
-                if not s2 then return end
+                if not s2 then
+                  return
+                end
 
-                local summary_msg = string.format(
-                  "【子 agent 执行完成】\n子 agent ID: %s\n\n%s",
-                  sub_agent_id,
-                  summary
-                )
+                local summary_msg =
+                  string.format("【子 agent 执行完成】\n子 agent ID: %s\n\n%s", sub_agent_id, summary)
 
                 -- 将总结作为 user 消息加入主 agent 上下文
                 table.insert(s2.messages, {
@@ -546,7 +551,9 @@ function M._execute_single_tool(session_id, tool_call)
             }
 
             -- 存储子 agent runner 引用
-            if not ss._sub_agent_runners then ss._sub_agent_runners = {} end
+            if not ss._sub_agent_runners then
+              ss._sub_agent_runners = {}
+            end
             ss._sub_agent_runners[sub_agent_id] = sub_agent_runner
 
             -- 启动子 agent 的工具循环（异步，不阻塞主 agent）
@@ -593,37 +600,37 @@ function M._execute_single_tool(session_id, tool_call)
   -- 能正确读取当前协程的共享变量
   local execute_fn = function()
     tool_executor.execute_with_orchestrator(tool_name, tool_func.arguments, {
-    session_id = session_id,
-    window_id = ss.window_id,
-    generation_id = ss.generation_id,
-    tool_call_id = tool_call_id,
-    pack_name = pack_name,
-  }, {
-    on_result = function(success, result)
-      local s = state.sessions[session_id]
-      if not s then
-        return
-      end
+      session_id = session_id,
+      window_id = ss.window_id,
+      generation_id = ss.generation_id,
+      tool_call_id = tool_call_id,
+      pack_name = pack_name,
+    }, {
+      on_result = function(success, result)
+        local s = state.sessions[session_id]
+        if not s then
+          return
+        end
 
-      if s.stop_requested then
+        if s.stop_requested then
+          s.active_tool_calls[tool_call_id] = nil
+          if vim.tbl_count(s.active_tool_calls) == 0 then
+            M._on_tools_complete(session_id)
+          end
+          return
+        end
+
+        local result_str = success and result or ("[工具执行失败] " .. result)
+        M._add_tool_result_to_messages(session_id, tool_call_id, tool_name, result_str)
+
         s.active_tool_calls[tool_call_id] = nil
-        if vim.tbl_count(s.active_tool_calls) == 0 then
+        local remaining = vim.tbl_count(s.active_tool_calls)
+
+        if remaining == 0 and s.phase ~= "round_complete" then
           M._on_tools_complete(session_id)
         end
-        return
-      end
-
-      local result_str = success and result or ("[工具执行失败] " .. result)
-      M._add_tool_result_to_messages(session_id, tool_call_id, tool_name, result_str)
-
-      s.active_tool_calls[tool_call_id] = nil
-      local remaining = vim.tbl_count(s.active_tool_calls)
-
-      if remaining == 0 and s.phase ~= "round_complete" then
-        M._on_tools_complete(session_id)
-      end
-    end,
-  })
+      end,
+    })
   end
 
   if ss._coroutine_ctx then

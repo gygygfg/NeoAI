@@ -311,7 +311,15 @@ local DEFAULT_CONFIG = {
         lsp_service_info = { auto_allow = true },
 
         -- ===== shell_tools.lua =====
-        run_command = { auto_allow = false },
+        run_command = {
+          auto_allow = false,
+          allowed_directories = { "./" },
+          allowed_param_groups = {
+            "ls",
+            "find",
+            "grep",
+          },
+        },
 
         create_sub_agent = { auto_allow = false },
         get_sub_agent_status = { auto_allow = true },

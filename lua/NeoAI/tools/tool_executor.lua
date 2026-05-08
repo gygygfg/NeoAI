@@ -24,9 +24,9 @@ local state = {
 -- ========== 超时管理 ==========
 
 local timeout_state = {
-  timers = {},  -- tool_call_id -> timer
-  start_times = {},  -- tool_call_id -> os.time()
-  timeout_ms = 30000,  -- 默认 30 秒（会被 initialize 中的 config.tool_timeout_ms 覆盖）
+  timers = {}, -- tool_call_id -> timer
+  start_times = {}, -- tool_call_id -> os.time()
+  timeout_ms = 30000, -- 默认 30 秒（会被 initialize 中的 config.tool_timeout_ms 覆盖）
 }
 
 -- ========== 辅助函数 ==========
@@ -51,7 +51,7 @@ local function resolve_json_args(args)
       -- 只对 JSON 对象/数组字符串（以 { 或 [ 开头）进行解码
       -- 避免将普通字符串（如 "所有22个工具"）误解析为 number
       local trimmed = v:match("^%s*(.-)%s*$") or v
-      if trimmed:sub(1,1) == "{" or trimmed:sub(1,1) == "[" then
+      if trimmed:sub(1, 1) == "{" or trimmed:sub(1, 1) == "[" then
         local ok, decoded = pcall(json.decode, v)
         result[k] = ok and resolve_json_args(decoded) or v
       else
@@ -158,10 +158,13 @@ function M.execute_async(tool_name, args, on_success, on_error, on_progress)
       tool_list_str
     )
     M._record_execution(tool_name, args, result, nil, 0)
-    fire_event(
-      event_constants.TOOL_EXECUTION_COMPLETED,
-      { tool_name = tool_name, args = args, result = result, duration = 0, session_id = args and (args.session_id or args._session_id) }
-    )
+    fire_event(event_constants.TOOL_EXECUTION_COMPLETED, {
+      tool_name = tool_name,
+      args = args,
+      result = result,
+      duration = 0,
+      session_id = args and (args.session_id or args._session_id),
+    })
     if on_success then
       on_success(result)
     end
@@ -177,10 +180,13 @@ function M.execute_async(tool_name, args, on_success, on_error, on_progress)
       full_msg = full_msg .. "\n\n调用示例:\n" .. example
     end
     M._record_execution(tool_name, args, nil, full_msg)
-    fire_event(
-      event_constants.TOOL_EXECUTION_ERROR,
-      { tool_name = tool_name, args = args, error_msg = full_msg, duration = 0, session_id = args and (args.session_id or args._session_id) }
-    )
+    fire_event(event_constants.TOOL_EXECUTION_ERROR, {
+      tool_name = tool_name,
+      args = args,
+      error_msg = full_msg,
+      duration = 0,
+      session_id = args and (args.session_id or args._session_id),
+    })
     if on_error then
       on_error(full_msg)
     end
@@ -192,10 +198,13 @@ function M.execute_async(tool_name, args, on_success, on_error, on_progress)
     if not has_perm then
       local err = perm_err or "无权限"
       M._record_execution(tool_name, args, nil, err)
-      fire_event(
-        event_constants.TOOL_EXECUTION_ERROR,
-        { tool_name = tool_name, args = args, error_msg = err, duration = 0, session_id = args and (args.session_id or args._session_id) }
-      )
+      fire_event(event_constants.TOOL_EXECUTION_ERROR, {
+        tool_name = tool_name,
+        args = args,
+        error_msg = err,
+        duration = 0,
+        session_id = args and (args.session_id or args._session_id),
+      })
       if on_error then
         on_error(err)
       end
@@ -274,7 +283,9 @@ function M.execute_async(tool_name, args, on_success, on_error, on_progress)
     end)
 
     if not approval_handler.is_showing() then
-      vim.schedule(function() approval_handler.process_queue() end)
+      vim.schedule(function()
+        approval_handler.process_queue()
+      end)
     end
     return
   end
@@ -291,16 +302,21 @@ function M.execute_async(tool_name, args, on_success, on_error, on_progress)
   })
 
   -- 继续执行（提取为单独函数，供审批回调复用）
-  M._continue_execution(
-    tool_name, resolved_args, args,
-    on_success, on_error, on_progress,
-    start_time, pack_name
-  )
+  M._continue_execution(tool_name, resolved_args, args, on_success, on_error, on_progress, start_time, pack_name)
 end
 
 --- 继续执行工具（在审批通过后调用）
 --- 提取自 execute_async，供审批回调复用
-function M._continue_execution(tool_name, resolved_args, raw_args, on_success, on_error, on_progress, start_time, pack_name)
+function M._continue_execution(
+  tool_name,
+  resolved_args,
+  raw_args,
+  on_success,
+  on_error,
+  on_progress,
+  start_time,
+  pack_name
+)
   -- 检查会话是否仍然有效（防止审批通过后会话已超时或取消）
   local session_id = raw_args and (raw_args.session_id or raw_args._session_id) or ""
   if session_id and session_id ~= "" then
@@ -463,7 +479,7 @@ function M.execute(tool_name, args)
   local timeout_ms = timeout_state.timeout_ms
   local elapsed_ms = 0
   local poll_interval_ms = 50
-  local paused_during_wait = 0  -- 等待期间累计的暂停时长
+  local paused_during_wait = 0 -- 等待期间累计的暂停时长
   local was_paused = false
   local pause_check_start = nil
 
@@ -498,7 +514,7 @@ function M.execute(tool_name, args)
   else
     -- 正常模式下使用 vim.wait
     -- 增强版：感知审批暂停，暂停期间不计入超时
-    local wait_timeout = timeout_ms + 30000  -- 最多多给 30 秒缓冲
+    local wait_timeout = timeout_ms + 30000 -- 最多多给 30 秒缓冲
     vim.wait(wait_timeout, function()
       if done then
         return true
@@ -738,8 +754,12 @@ function M._clear_timeout(tool_call_id)
     -- vim.defer_fn 返回的是 uv_timer_t 对象
     -- 在 Neovim 0.10+ 中推荐使用 vim.uv 方法
     pcall(function()
-      if timer:is_active() then timer:stop() end
-      if not timer:is_closing() then timer:close() end
+      if timer:is_active() then
+        timer:stop()
+      end
+      if not timer:is_closing() then
+        timer:close()
+      end
     end)
     timeout_state.timers[tool_call_id] = nil
   end
@@ -759,8 +779,12 @@ function M._reset_timeout(tool_call_id, timeout_ms, on_timeout)
   if timeout_state.timers[tool_call_id] then
     local timer = timeout_state.timers[tool_call_id]
     pcall(function()
-      if timer:is_active() then timer:stop() end
-      if not timer:is_closing() then timer:close() end
+      if timer:is_active() then
+        timer:stop()
+      end
+      if not timer:is_closing() then
+        timer:close()
+      end
     end)
     timeout_state.timers[tool_call_id] = nil
   end
@@ -809,6 +833,25 @@ function M._normalize_arguments(tool_name, raw_arguments)
   local arguments = {}
   local changed = false
 
+  -- ===== 工具名称别名映射 =====
+  -- 将 AI 输出的简写名称（如 read/write）映射为正式名称（如 read_file/write_file）
+  local tool_name_aliases = {
+    read = "read_file",
+    write = "write_file",
+    list = "list_files",
+    search = "search_files",
+    delete = "delete_file",
+    mkdir = "create_directory",
+    ensure_dir = "ensure_dir",
+    exists = "file_exists",
+  }
+  local mapped_name = tool_name_aliases[tool_name]
+  if mapped_name then
+    logger.debug("[tool_executor] _normalize_arguments: 工具名称别名映射: '%s' -> '%s'", tool_name, mapped_name)
+    tool_name = mapped_name
+    changed = true
+  end
+
   -- 如果是字符串，先尝试 JSON 解析
   if type(raw_arguments) == "string" then
     local decoded_args_str = raw_arguments
@@ -819,7 +862,11 @@ function M._normalize_arguments(tool_name, raw_arguments)
     if ok and type(parsed) == "table" then
       arguments = parsed
     else
-      logger.warn("[tool_executor] _normalize_arguments: 工具 '%s' 的 arguments JSON 解析失败: %s", tool_name, tostring(raw_arguments))
+      logger.warn(
+        "[tool_executor] _normalize_arguments: 工具 '%s' 的 arguments JSON 解析失败: %s",
+        tool_name,
+        tostring(raw_arguments)
+      )
       return { _raw = raw_arguments }, false
     end
   elseif type(raw_arguments) == "table" then
@@ -843,26 +890,23 @@ function M._normalize_arguments(tool_name, raw_arguments)
     local props = tool_def.parameters.properties
 
     -- 1) 参数别名映射
-    for standard_name, _ in pairs(props) do
-      for arg_name, arg_value in pairs(arguments) do
-        if arg_name ~= standard_name and arg_value ~= nil then
-          if not props[arg_name] then
-            local alias_map = {
-              cmd = "command",
-              dir = "dirs",
-              file = "files",
-              fp = "filepath",
-              path = "filepath",
-              dir_path = "dirs",
-            }
-            if alias_map[arg_name] == standard_name then
-              arguments[standard_name] = arg_value
-              arguments[arg_name] = nil
-              changed = true
-              break
-            end
-          end
-        end
+    -- 将 AI 常用的简写参数名映射到工具定义的标准参数名
+    -- 即使别名参数也存在于 props 中（如 run_command 同时有 command 和 cmd），
+    -- 也优先使用标准名称，确保必需字段验证通过
+    local alias_map = {
+      cmd = "command",
+      dir = "dirs",
+      file = "files",
+      fp = "filepath",
+      path = "filepath",
+      dir_path = "dirs",
+    }
+    for arg_name, arg_value in pairs(arguments) do
+      local standard_name = alias_map[arg_name]
+      if standard_name and props[standard_name] and arg_name ~= standard_name then
+        arguments[standard_name] = arg_value
+        arguments[arg_name] = nil
+        changed = true
       end
     end
 
@@ -877,17 +921,44 @@ function M._normalize_arguments(tool_name, raw_arguments)
         local item = {}
         if standard_array == "files" then
           item.filepath = arguments[simple_arg]
-          if arguments.start ~= nil then item.start = arguments.start; arguments.start = nil end
-          if arguments.end_line ~= nil then item["end"] = arguments.end_line; arguments.end_line = nil end
-          if arguments.content ~= nil then item.content = arguments.content; arguments.content = nil end
-          if arguments.append ~= nil then item.append = arguments.append; arguments.append = nil end
-          if arguments.parents ~= nil then item.parents = arguments.parents; arguments.parents = nil end
-          if arguments.pattern ~= nil then item.pattern = arguments.pattern; arguments.pattern = nil end
-          if arguments.recursive ~= nil then item.recursive = arguments.recursive; arguments.recursive = nil end
+          if arguments.start ~= nil then
+            item.start = arguments.start
+            arguments.start = nil
+          end
+          if arguments.end_line ~= nil then
+            item["end"] = arguments.end_line
+            arguments.end_line = nil
+          end
+          if arguments.content ~= nil then
+            item.content = arguments.content
+            arguments.content = nil
+          end
+          if arguments.append ~= nil then
+            item.append = arguments.append
+            arguments.append = nil
+          end
+          if arguments.parents ~= nil then
+            item.parents = arguments.parents
+            arguments.parents = nil
+          end
+          if arguments.pattern ~= nil then
+            item.pattern = arguments.pattern
+            arguments.pattern = nil
+          end
+          if arguments.recursive ~= nil then
+            item.recursive = arguments.recursive
+            arguments.recursive = nil
+          end
         elseif standard_array == "dirs" then
           item.dir = arguments[simple_arg]
-          if arguments.pattern ~= nil then item.pattern = arguments.pattern; arguments.pattern = nil end
-          if arguments.recursive ~= nil then item.recursive = arguments.recursive; arguments.recursive = nil end
+          if arguments.pattern ~= nil then
+            item.pattern = arguments.pattern
+            arguments.pattern = nil
+          end
+          if arguments.recursive ~= nil then
+            item.recursive = arguments.recursive
+            arguments.recursive = nil
+          end
         end
         arguments[standard_array] = { item }
         arguments[simple_arg] = nil
@@ -943,11 +1014,11 @@ function M.execute_with_orchestrator(tool_name, raw_args, session_context, callb
   local tool_timeout = tool_def and tool_def.timeout
   local timeout_ms
   if tool_timeout == -1 then
-    timeout_ms = -1  -- 无限等待，不设超时
+    timeout_ms = -1 -- 无限等待，不设超时
   elseif tool_timeout ~= nil then
-    timeout_ms = tool_timeout  -- 工具自定义超时
+    timeout_ms = tool_timeout -- 工具自定义超时
   else
-    timeout_ms = timeout_state.timeout_ms  -- 全局默认超时
+    timeout_ms = timeout_state.timeout_ms -- 全局默认超时
   end
 
   if timeout_ms and timeout_ms > 0 then
