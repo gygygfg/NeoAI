@@ -344,6 +344,56 @@ local function _truncate_content_for_fold(content, max_lines)
   return table.concat(truncated, "\n")
 end
 
+--- 格式化折叠文本 }}} 后的剩余内容（AI 总结正文）
+--- 处理 JSON 格式的 content/reasoning_content，返回格式化后的行列表
+--- @param content string 剩余内容文本
+--- @return table 格式化后的行列表
+local function _format_remaining_content(content)
+  if not content or content == "" then
+    return {}
+  end
+  local lines = {}
+  -- 尝试解析 JSON 格式
+  local json_ok, parsed = pcall(vim.json.decode, content)
+  if json_ok and type(parsed) == "table" then
+    local main_content = ""
+    if parsed.content ~= nil then
+      main_content = parsed.content
+    end
+    local reasoning_content = parsed.reasoning_content or ""
+    if type(main_content) ~= "string" then
+      local ok, encoded = pcall(vim.json.encode, main_content)
+      main_content = ok and encoded or tostring(main_content)
+    end
+    if type(reasoning_content) ~= "string" then
+      local ok, encoded = pcall(vim.json.encode, reasoning_content)
+      reasoning_content = ok and encoded or tostring(reasoning_content)
+    end
+    if reasoning_content ~= "" then
+      table.insert(lines, "🤖 AI: 🤔 思考过程:")
+      for _, rline in ipairs(vim.split(reasoning_content, "\n")) do
+        table.insert(lines, "    " .. rline)
+      end
+      table.insert(lines, "")
+    end
+    if main_content ~= "" then
+      local msg_lines = vim.split(main_content, "\n")
+      table.insert(lines, string.format("🤖 AI: %s", msg_lines[1]))
+      for i = 2, #msg_lines do
+        table.insert(lines, string.format("    %s", msg_lines[i]))
+      end
+    end
+  else
+    -- 非 JSON 格式，直接作为普通文本显示
+    local msg_lines = vim.split(content, "\n")
+    table.insert(lines, string.format("🤖 AI: %s", msg_lines[1]))
+    for i = 2, #msg_lines do
+      table.insert(lines, string.format("    %s", msg_lines[i]))
+    end
+  end
+  return lines
+end
+
 --- 在 buffer 内容变化之前检测光标是否在末尾附近（后5行内）
 --- 调用方必须在修改 buffer 内容之前调用此函数，将结果缓存到协程共享表
 --- 这样即使内容变化后 foldmethod=marker 改变了光标位置，也能正确判断是否应该跟随
@@ -768,8 +818,30 @@ function M._render_single_message(msg, prev_role)
     -- 按行分割，每行作为独立元素
     -- 先清理 \r 字符，将 \r 渲染为换行
     local clean_content = raw_content:gsub("\r\n", "\n"):gsub("\r", "\n")
-    for _, line in ipairs(vim.split(clean_content, "\n")) do
-      table.insert(lines, line)
+    -- 检测 }}} 后的剩余内容（AI 总结正文）
+    local fold_end = select(2, clean_content:find("}}}%s*"))
+    if fold_end then
+      -- 提取折叠部分（包含 }}} 及其后的空白）
+      local fold_part = clean_content:sub(1, fold_end)
+      for _, line in ipairs(vim.split(fold_part, "\n")) do
+        table.insert(lines, line)
+      end
+      -- 提取 }}} 后的剩余内容
+      local remaining = clean_content:sub(fold_end + 1)
+      remaining = remaining:gsub("^\n+", ""):gsub("\n+$", "")
+      if remaining and remaining ~= "" then
+        table.insert(lines, "")
+        -- 对剩余内容应用正常的消息格式化
+        local remaining_lines = _format_remaining_content(remaining)
+        for _, rline in ipairs(remaining_lines) do
+          table.insert(lines, rline)
+        end
+      end
+    else
+      -- 没有 }}}，按原逻辑处理
+      for _, line in ipairs(vim.split(clean_content, "\n")) do
+        table.insert(lines, line)
+      end
     end
     table.insert(lines, "")
     return lines
