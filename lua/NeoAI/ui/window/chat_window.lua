@@ -79,7 +79,7 @@ local function fire_event(pattern, data)
   vim.api.nvim_exec_autocmds("User", { pattern = pattern, data = data or {} })
 end
 
-  -- 模块状态
+-- 模块状态
 local state = {
   initialized = false,
   current_window_id = nil, -- 当前聊天窗口的窗口ID
@@ -114,6 +114,7 @@ local state = {
     reasoning_prefix_added = false, -- 是否已在缓冲区添加思考标记行（"🤔 思考过程:"）
     content_separator_added = false, -- 是否已在思考内容和正文之间添加分割线
     _reasoning_display_timer = nil, -- 延迟打开 reasoning_display 的定时器
+    message_start_line = nil, -- 当前流式消息在缓冲区中的起始行号（0-based），用于替换渲染
   },
 
   -- 工具调用悬浮显示状态
@@ -210,6 +211,7 @@ local function reset_streaming_state()
   s.prefix_added = false
   s.reasoning_prefix_added = false
   s.content_separator_added = false
+  s.message_start_line = nil
 end
 
 local function reset_tool_display()
@@ -302,7 +304,9 @@ local function _format_table_for_fold(t, indent)
       table.insert(keys, k)
     end
     table.sort(keys, function(a, b)
-      if type(a) == type(b) then return tostring(a) < tostring(b) end
+      if type(a) == type(b) then
+        return tostring(a) < tostring(b)
+      end
       return type(a) < type(b)
     end)
     for _, k in ipairs(keys) do
@@ -526,7 +530,7 @@ function M.open(session_id, window_id, branch_id)
   end
 
   state.current_window_id = window_id
-  state.current_session_id = session_id  -- 可能为 nil（用户尚未发送消息，会话未创建）
+  state.current_session_id = session_id -- 可能为 nil（用户尚未发送消息，会话未创建）
   state.messages = {}
 
   -- 获取缓冲区并快速设置关键选项
@@ -548,7 +552,7 @@ function M.open(session_id, window_id, branch_id)
     end
     pcall(vim.api.nvim_buf_set_var, buf, "neoai_no_lsp", true)
     pcall(vim.diagnostic.disable, buf)
-pcall(vim.api.nvim_buf_set_name, buf, "neoai://chat/" .. (session_id or "new"))
+    pcall(vim.api.nvim_buf_set_name, buf, "neoai://chat/" .. (session_id or "new"))
 
     -- 保存到模块 state 表，供 virtual_input 检测光标离开时使用
     state.chat_buf = buf
@@ -1548,7 +1552,6 @@ function M.close()
   end
   state.cursor_follow.pending = false
 
-
   -- 保存当前窗口ID到局部变量，供 defer_fn 使用
   -- 防止 defer_fn 执行时 state.current_window_id 已被 M.open() 修改
   local closing_window_id = state.current_window_id
@@ -2372,7 +2375,9 @@ function M._setup_event_listeners()
       local chunk_content = extract_response_content(chunk)
 
       if chunk_content == "\n" or chunk_content == "\r\n" then
-        M._append_newline_to_buffer()
+        -- 换行符：追加到 content_buffer 后重新渲染
+        state.streaming.content_buffer = state.streaming.content_buffer .. "\n"
+        M._append_stream_chunk_to_buffer("")
         return
       end
       if not chunk_content or chunk_content == "" then
@@ -2596,7 +2601,7 @@ function M._setup_event_listeners()
                 -- 临时 URL 解码（仅用于显示）
                 v_str = vim.uri_decode(v_str)
                 -- 尝试将解码后的 JSON 字符串解析为 table 以格式化显示
-                if v_str:sub(1,1) == "{" or v_str:sub(1,1) == "[" then
+                if v_str:sub(1, 1) == "{" or v_str:sub(1, 1) == "[" then
                   local ok, parsed = pcall(vim.json.decode, v_str)
                   if ok and type(parsed) == "table" then
                     v_str = vim.inspect(parsed, { indent = "", newline = "", separator = ", " })
@@ -2686,6 +2691,7 @@ function M._setup_event_listeners()
       s.prefix_added = false
       s.reasoning_prefix_added = false
       s.content_separator_added = false
+      s.message_start_line = nil
       state.tool_loop_in_progress = true
 
       state.tool_display.active = true
@@ -3317,6 +3323,84 @@ function M._append_message_to_buffer(role, content)
   _schedule_cursor_follow()
 end
 
+--- 替换缓冲区中指定消息的行（从起始行到末尾或到指定结束行）
+--- 用于流式渲染时更新已追加到缓冲区的消息内容
+--- @param start_line number 起始行号（0-based）
+--- @param lines table 新行列表
+--- @param end_line number|nil 结束行号（0-based），nil 表示替换到末尾
+local function _replace_message_in_buffer(start_line, lines, end_line)
+  local buf = get_buf()
+  if not buf_valid(buf) then
+    return
+  end
+  set_buf_modifiable(buf, true)
+  local lc = get_line_count(buf)
+  local replace_end = end_line or lc
+  -- 确保起始行有效
+  if start_line < 0 or start_line > lc then
+    return
+  end
+  -- 如果新行数比旧行数多，需要先扩展；如果少，需要先删除多余行
+  local old_count = replace_end - start_line
+  local new_count = #lines
+  if new_count > old_count then
+    -- 需要插入空行
+    local insert_count = new_count - old_count
+    local insert_lines = {}
+    for _ = 1, insert_count do
+      table.insert(insert_lines, "")
+    end
+    vim.api.nvim_buf_set_lines(buf, replace_end, replace_end, false, insert_lines)
+  elseif new_count < old_count then
+    -- 需要删除多余行
+    local delete_count = old_count - new_count
+    vim.api.nvim_buf_set_lines(buf, replace_end - delete_count, replace_end, false, {})
+  end
+  -- 写入新内容
+  vim.api.nvim_buf_set_lines(buf, start_line, start_line + new_count, false, lines)
+  vim.api.nvim_set_option_value("modified", false, { buf = buf })
+end
+
+--- 使用 _render_single_message 渲染当前流式消息并替换缓冲区中的对应行
+--- 统一流式渲染和历史渲染的显示格式
+--- 在流式 chunk 到达或思考过程完成时调用
+local function _render_streaming_message()
+  local mi = state.streaming.message_index
+  if not mi or not state.messages[mi] then
+    return
+  end
+  local msg = state.messages[mi]
+  -- 使用 _render_single_message 生成行列表
+  local prev_role = nil
+  if mi > 1 then
+    prev_role = state.messages[mi - 1].role
+  end
+  local lines = M._render_single_message(msg, prev_role)
+  if #lines == 0 then
+    return
+  end
+  local buf = get_buf()
+  if not buf_valid(buf) then
+    return
+  end
+  -- 在修改 buffer 内容之前缓存光标位置
+  _check_cursor_near_end()
+  local start_line = state.streaming.message_start_line
+  if start_line then
+    -- 已有起始行：替换从起始行到末尾的内容
+    _replace_message_in_buffer(start_line, lines)
+  else
+    -- 没有起始行：追加到缓冲区末尾
+    set_buf_modifiable(buf, true)
+    local lc = get_line_count(buf)
+    vim.api.nvim_buf_set_lines(buf, lc, lc, false, lines)
+    vim.api.nvim_set_option_value("modified", false, { buf = buf })
+    -- 记录起始行
+    state.streaming.message_start_line = lc
+  end
+  _schedule_cursor_follow()
+end
+
 --- 将思考过程追加到聊天缓冲区末尾
 --- 在思考过程完成后调用
 --- 逻辑：
@@ -3328,52 +3412,20 @@ function M._append_reasoning_folded_to_buffer(reasoning_text)
     return
   end
 
-  local buf = window_manager.get_window_buf(state.current_window_id)
-  if not buf or not vim.api.nvim_buf_is_valid(buf) then
-    return
+  -- 更新 state.messages 中的内容为 JSON 格式（含 reasoning_content）
+  -- 这样 _render_single_message 可以正确解析并渲染
+  local mi = state.streaming.message_index
+  local full_content = state.streaming.content_buffer or ""
+  local encoded = vim.json.encode({
+    reasoning_content = reasoning_text,
+    content = full_content,
+  })
+  if mi and state.messages[mi] then
+    state.messages[mi].content = encoded
   end
 
-  pcall(vim.api.nvim_set_option_value, "modifiable", true, { buf = buf })
-  pcall(vim.api.nvim_set_option_value, "readonly", false, { buf = buf })
-
-  local line_count = vim.api.nvim_buf_line_count(buf)
-
-  -- 判断条件：
-  -- 1. 思考过程结束后是否有正文内容？
-  -- 2. 思考过程长度是否 < 200 字符？
-  -- 只有无正文且短思考才不折叠，否则一律折叠
-  local has_content = state.streaming.content_buffer and state.streaming.content_buffer ~= ""
-  local reasoning_combined = table.concat(vim.split(reasoning_text, "\n"), " ")
-  local reasoning_short = #reasoning_combined < 200
-  local use_folded = has_content or not reasoning_short
-
-  local output_lines = {}
-  if use_folded then
-    -- 折叠文本格式
-    table.insert(output_lines, "{{{ 🤔 思考过程")
-    for _, rline in ipairs(vim.split(reasoning_text, "\n")) do
-      table.insert(output_lines, "  " .. rline)
-    end
-    table.insert(output_lines, "}}}")
-  else
-    -- 无正文且思考短：直接显示，不加折叠
-    table.insert(output_lines, "🤖 AI: 🤔 思考过程:")
-    for _, rline in ipairs(vim.split(reasoning_text, "\n")) do
-      table.insert(output_lines, "    " .. rline)
-    end
-  end
-  table.insert(output_lines, "") -- 空行分隔
-
-  -- 在修改 buffer 内容之前缓存光标位置
-  _check_cursor_near_end()
-
-  -- 追加到缓冲区末尾
-  vim.api.nvim_buf_set_lines(buf, line_count, line_count, false, output_lines)
-
-  pcall(vim.api.nvim_set_option_value, "modified", false, { buf = buf })
-
-  -- 执行光标跟随（使用协程共享表 should_follow 缓存值）
-  _schedule_cursor_follow()
+  -- 使用 _render_streaming_message 统一渲染（复用 _render_single_message）
+  _render_streaming_message()
 end
 
 --- 在缓冲区末尾插入一个空行（处理换行符数据块）
@@ -3402,9 +3454,6 @@ function M._append_stream_chunk_to_buffer(chunk_content, content_type)
   if not state.current_window_id then
     return
   end
-
-  -- 在修改 buffer 内容之前缓存光标位置
-  _check_cursor_near_end()
 
   -- 解码 %%XX URL 编码
   local http_utils_ok, http_utils = pcall(require, "NeoAI.core.ai.http_utils")
@@ -3437,95 +3486,8 @@ function M._append_stream_chunk_to_buffer(chunk_content, content_type)
     end
   end
 
-  local buf = get_buf()
-  if not buf_valid(buf) then
-    return
-  end
-
-  set_buf_modifiable(buf, true)
-  local lc = get_line_count(buf)
-
-  if content_type == "reasoning" then
-    -- 思考内容
-    if not state.streaming.reasoning_prefix_added then
-      state.streaming.reasoning_prefix_added = true
-      -- 在插入前缀前检查上一行是否为空行，确保新段落有换行
-      if lc > 0 then
-        local last = get_last_line(buf)
-        if last ~= "" and not last:match("^---") then
-          vim.api.nvim_buf_set_lines(buf, lc, lc, false, { "" })
-          lc = get_line_count(buf)
-        end
-      end
-      vim.api.nvim_buf_set_lines(buf, lc, lc, false, { "🤖 AI: 🤔 思考过程:" })
-      lc = get_line_count(buf)
-    end
-
-    local lines = vim.split(chunk_content, "\n", { plain = true })
-    for i, line in ipairs(lines) do
-      if i == 1 and line ~= "" then
-        if lc > 0 then
-          local last = get_last_line(buf)
-          local new_text = (last == "🤖 AI: 🤔 思考过程:") and ("🤖 AI: 🤔 思考过程: " .. line)
-            or (last .. line)
-          vim.api.nvim_buf_set_lines(buf, lc - 1, lc, false, { new_text })
-        else
-          vim.api.nvim_buf_set_lines(buf, 0, -1, false, { line })
-        end
-        lc = get_line_count(buf)
-      elseif line ~= "" then
-        vim.api.nvim_buf_set_lines(buf, lc, lc, false, { "    " .. line })
-        lc = get_line_count(buf)
-      end
-    end
-
-    vim.api.nvim_set_option_value("modified", false, { buf = buf })
-    _schedule_cursor_follow()
-    return
-  end
-
-  -- 正文内容
-  if not state.streaming.prefix_added then
-    state.streaming.prefix_added = true
-    -- 在插入 "🤖 AI:" 前先检查上一行是否为空行或分隔线，确保新段落有换行
-    if lc > 0 then
-      local last = get_last_line(buf)
-      if last ~= "" and not last:match("^---") then
-        -- 上一行有内容且不是分隔线，先插入空行再添加前缀
-        vim.api.nvim_buf_set_lines(buf, lc, lc, false, { "" })
-        lc = get_line_count(buf)
-      end
-    end
-    vim.api.nvim_buf_set_lines(buf, lc, lc, false, { "🤖 AI:" })
-    lc = get_line_count(buf)
-  end
-
-  if state.streaming.reasoning_done and not state.streaming.content_separator_added then
-    state.streaming.content_separator_added = true
-  end
-
-  local lines = vim.split(chunk_content, "\n", { plain = true })
-  for i, line in ipairs(lines) do
-    if i == 1 then
-      if line ~= "" then
-        if lc > 0 then
-          local last = get_last_line(buf)
-          local new_text = last == "🤖 AI:" and ("🤖 AI: " .. line) or (last == "" and line or last .. line)
-          vim.api.nvim_buf_set_lines(buf, lc - 1, lc, false, { new_text })
-        else
-          vim.api.nvim_buf_set_lines(buf, 0, -1, false, { line })
-        end
-        lc = get_line_count(buf)
-      end
-      -- 第一行为空行时不做任何操作，后续非空行会作为新行追加
-    else
-      vim.api.nvim_buf_set_lines(buf, lc, lc, false, { line })
-      lc = get_line_count(buf)
-    end
-  end
-
-  vim.api.nvim_set_option_value("modified", false, { buf = buf })
-  _schedule_cursor_follow()
+  -- 使用 _render_streaming_message 统一渲染（复用 _render_single_message）
+  _render_streaming_message()
 end
 
 --- 完成流式渲染
@@ -3875,8 +3837,6 @@ function M._build_tool_folded_text(results)
 
   return folded_text
 end
-
-
 
 --- 获取当前使用的模型标签
 --- @return string|nil 模型标签，如 "deepseek/deepseek-chat"

@@ -1087,62 +1087,60 @@ function M.on_generation_complete(data)
     -- 如果先添加了带 tool_calls 的 assistant 消息，总结轮次的消息中就会包含
     -- 未匹配的 tool_call_id，导致 API 报错
 
-    -- 当 AI 返回的内容本身就是总结性质（包含总结类关键词）时，
+    -- AI 返回纯文本回复（无工具调用），说明 AI 认为任务已完成
     -- 直接结束循环，不再触发额外的总结轮次，避免重复总结
     if #tool_calls == 0 and content and content ~= "" then
-      if response_retry.is_summary_content(content) then
-        logger.debug("[tool_orchestrator] AI 返回内容为总结性质，直接结束循环，跳过总结轮次")
-        -- 保存当前 AI 响应到消息历史
-        local assistant_msg = {
-          role = "assistant",
-          content = content,
-          timestamp = os.time(),
-          window_id = ss.window_id,
-        }
-        if data.reasoning and data.reasoning ~= "" then
-          assistant_msg.reasoning_content = data.reasoning
-          ss.last_reasoning = data.reasoning
-        end
-        table.insert(ss.messages, assistant_msg)
-        -- 直接结束，不触发总结轮次
-        local saved_usage = ss.accumulated_usage or {}
-        local saved_reasoning = ss.last_reasoning or ""
-        local saved_win_id = ss.window_id
-        local saved_gen_id = ss.generation_id
-        local on_complete = ss.on_complete
-        ss.on_complete = nil
-        ss.phase = "idle"
-        ss.active_tool_calls = {}
-        ss.current_iteration = 0
-        ss.generation_id = nil
-        fire_loop_finished(ss)
-        once_display_closed(session_id, function()
-          local s = state.sessions[session_id]
-          if not s then
-            return
-          end
-          if is_shutting_down() then
-            return
-          end
-          -- 触发 SUMMARY_COMPLETED 事件，通知 UI 更新（区别于普通生成完成）
-          pcall(vim.api.nvim_exec_autocmds, "User", {
-            pattern = event_constants.SUMMARY_COMPLETED,
-            data = {
-              generation_id = saved_gen_id,
-              response = content,
-              reasoning_text = saved_reasoning,
-              usage = saved_usage,
-              session_id = session_id,
-              window_id = saved_win_id,
-              duration = 0,
-            },
-          })
-          if on_complete then
-            on_complete(true, content, saved_usage)
-          end
-        end)
-        return
+      logger.debug("[tool_orchestrator] AI 返回纯文本回复，直接结束循环，跳过总结轮次")
+      -- 保存当前 AI 响应到消息历史
+      local assistant_msg = {
+        role = "assistant",
+        content = content,
+        timestamp = os.time(),
+        window_id = ss.window_id,
+      }
+      if data.reasoning and data.reasoning ~= "" then
+        assistant_msg.reasoning_content = data.reasoning
+        ss.last_reasoning = data.reasoning
       end
+      table.insert(ss.messages, assistant_msg)
+      -- 直接结束，不触发总结轮次
+      local saved_usage = ss.accumulated_usage or {}
+      local saved_reasoning = ss.last_reasoning or ""
+      local saved_win_id = ss.window_id
+      local saved_gen_id = ss.generation_id
+      local on_complete = ss.on_complete
+      ss.on_complete = nil
+      ss.phase = "idle"
+      ss.active_tool_calls = {}
+      ss.current_iteration = 0
+      ss.generation_id = nil
+      fire_loop_finished(ss)
+      once_display_closed(session_id, function()
+        local s = state.sessions[session_id]
+        if not s then
+          return
+        end
+        if is_shutting_down() then
+          return
+        end
+        -- 触发 GENERATION_COMPLETED 事件，通知 UI 更新
+        pcall(vim.api.nvim_exec_autocmds, "User", {
+          pattern = event_constants.GENERATION_COMPLETED,
+          data = {
+            generation_id = saved_gen_id,
+            response = content,
+            reasoning_text = saved_reasoning,
+            usage = saved_usage,
+            session_id = session_id,
+            window_id = saved_win_id,
+            duration = 0,
+          },
+        })
+        if on_complete then
+          on_complete(true, content, saved_usage)
+        end
+      end)
+      return
     end
 
     -- is_final_round 为 true 时：直接结束循环，不再触发 _finish_loop
