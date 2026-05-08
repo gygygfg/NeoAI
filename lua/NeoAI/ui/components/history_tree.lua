@@ -84,7 +84,7 @@ function M.build_flat_items()
   table.sort(root_ids, function(a, b)
     local sa = session_map[a]
     local sb = session_map[b]
-    return (sa and sa.created_at or 0) < (sb and sb.created_at or 0)
+    return (sa and sa.created_at or 0) > (sb and sb.created_at or 0)
   end)
 
   -- 深度优先遍历，收集扁平节点
@@ -261,22 +261,24 @@ function M.build_flat_items()
     end
   end
 
-  -- 遍历每个根会话
+  -- 遍历每个根会话（最新的根节点在最前面）
+  local root_count = #non_empty_root_ids
   for i, rid in ipairs(non_empty_root_ids) do
     -- 在根节点前面插入虚拟节点（indent=0）
     -- 第一个根虚拟节点前面不需要连接符（树的开始）
     -- 非最后一个根节点，虚拟节点前面需要 │  来连接后续的根节点
+    -- 最新的根节点（i=1）是最后一个分支
     local root_virtual_connectors = {}
     root_virtual_connectors[1] = "   "
     local root_virtual_node = {
       is_virtual = true,
       indent = 0,
-      is_last_branch = (i == #non_empty_root_ids),
+      is_last_branch = (i == 1),
       connectors = root_virtual_connectors,
     }
     table.insert(flat_nodes, root_virtual_node)
 
-    dfs(rid, -1, 0, i, #non_empty_root_ids, {})
+    dfs(rid, -1, 0, i, root_count, {})
   end
 
   state.flat_items = flat_nodes
