@@ -310,7 +310,13 @@ function _handle_stream_chunk(generation_id, data, processor, params)
   if result.tool_calls and #result.tool_calls > 0 then
     vim.api.nvim_exec_autocmds("User", {
       pattern = event_constants.TOOL_CALL_DETECTED,
-      data = { generation_id = generation_id, tool_calls = result.tool_calls, session_id = sid, window_id = wid },
+      data = {
+        generation_id = generation_id,
+        tool_calls = result.tool_calls,
+        tool_calls_delta = result.tool_calls_delta,
+        session_id = sid,
+        window_id = wid,
+      },
     })
   end
 end

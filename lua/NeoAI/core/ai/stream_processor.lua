@@ -39,7 +39,7 @@ end
 --- 流式场景中，每个数据块的 arguments 是部分 table，需要逐块合并
 function M.process_chunk(processor, data)
   if processor.is_finished then return nil end
-  local result = { content = nil, reasoning_content = nil, tool_calls = nil, is_final = false }
+  local result = { content = nil, reasoning_content = nil, tool_calls = nil, tool_calls_delta = nil, is_final = false }
 
   if data.choices and #data.choices > 0 then
     local choice = data.choices[1]
@@ -54,6 +54,8 @@ function M.process_chunk(processor, data)
         result.content = delta.content
       end
       if delta.tool_calls then
+        -- tool_calls_delta：当前 chunk 的原始增量数据（arguments 是原始片段）
+        result.tool_calls_delta = delta.tool_calls
         for _, tc in ipairs(delta.tool_calls) do
           local idx = tc.index or 0
           if not processor.tool_calls[idx + 1] then

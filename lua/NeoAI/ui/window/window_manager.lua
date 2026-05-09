@@ -751,4 +751,201 @@ function M._render_tree_node(content, node, depth, is_last, parent_prefix, tree_
   end
 end
 
+-- ========== 工具调用悬浮窗管理 ==========
+
+-- 每个 tool_display 窗口的私有状态（与 chat_window 的 state 隔离）
+local tool_displays = {} -- { [window_id] = { auto_scroll = true, buffer = "", _last_buffer = "" } }
+
+--- 打开 tool_display 悬浮窗
+--- @param opts table 选项
+---   title: string 窗口标题
+---   content: string 初始内容
+---   reasoning_display: table|nil reasoning_display 模块引用
+--- @return string|nil 窗口 ID
+function M.open_tool_display(opts)
+  opts = opts or {}
+  local title = opts.title or "🔧 工具调用"
+  local content = opts.content or ""
+  local content_lines = vim.split(content, "\n")
+
+  local max_height = math.max(5, math.floor(vim.o.lines / 2))
+  local dynamic_height = math.max(5, math.min(#content_lines + 2, max_height))
+
+  -- 计算窗口位置：如果 reasoning_display 可见，在它下方堆叠
+  local tool_row = 1
+  local rd = opts.reasoning_display
+  if rd and rd.is_visible and rd.is_visible() then
+    local rwid = rd.get_window_id and rd.get_window_id()
+    if rwid then
+      local rwin = M.get_window_win(rwid)
+      if rwin and pcall(vim.api.nvim_win_is_valid, rwin) then
+        local rc = vim.api.nvim_win_get_config(rwin)
+        tool_row = (rc.row or 1) + (rc.height or 5) + 1
+      end
+    end
+  end
+
+  local total_cols = vim.o.columns
+  local tool_width = math.floor(total_cols * 0.8)
+  tool_width = math.max(30, tool_width)
+  local tool_col = math.floor((total_cols - tool_width) / 2)
+
+  local tool_border = {
+    { "╭", "FloatBorder" }, { "─", "FloatBorder" }, { "┬", "FloatBorder" },
+    { "│", "FloatBorder" }, { "┴", "FloatBorder" }, { "─", "FloatBorder" },
+    { "╰", "FloatBorder" }, { "│", "FloatBorder" },
+  }
+
+  local win_id = M.create_window("tool_display", {
+    title = title, width = tool_width, height = dynamic_height,
+    border = tool_border, style = "minimal", relative = "editor",
+    row = tool_row, col = tool_col, zindex = 100, window_mode = "float",
+  })
+  if not win_id then return nil end
+
+  -- 初始化私有状态
+  tool_displays[win_id] = {
+    auto_scroll = true,
+    buffer = content,
+    _last_buffer = "",
+  }
+
+  -- 写入初始内容
+  local nvim_win = M.get_window_win(win_id)
+  local buf = M.get_window_buf(win_id)
+  if buf and pcall(vim.api.nvim_buf_is_valid, buf) then
+    vim.api.nvim_set_option_value("modifiable", true, { buf = buf })
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, content_lines)
+    vim.api.nvim_set_option_value("modifiable", false, { buf = buf })
+  end
+  if nvim_win and pcall(vim.api.nvim_win_is_valid, nvim_win) then
+    pcall(vim.api.nvim_set_option_value, "wrap", true, { win = nvim_win })
+    if buf and pcall(vim.api.nvim_buf_is_valid, buf) then
+      local line_count = vim.api.nvim_buf_line_count(buf)
+      pcall(vim.api.nvim_win_set_cursor, nvim_win, { line_count, 0 })
+    end
+  end
+
+  -- 注册 WinScrolled 监听：检测用户手动滚动
+  local augroup_name = "NeoAI_tool_scroll_" .. win_id
+  vim.api.nvim_create_augroup(augroup_name, { clear = true })
+  vim.api.nvim_create_autocmd("WinScrolled", {
+    group = augroup_name, buffer = buf,
+    callback = function()
+      local td = tool_displays[win_id]
+      if not td then return end
+      local win_ok, win_valid = pcall(vim.api.nvim_win_is_valid, nvim_win)
+      if not win_ok or not win_valid then return end
+      local buf_ok, buf_valid = pcall(vim.api.nvim_buf_is_valid, buf)
+      if not buf_ok or not buf_valid then return end
+      local cur_line = vim.api.nvim_win_get_cursor(nvim_win)[1]
+      local line_count = vim.api.nvim_buf_line_count(buf)
+      td.auto_scroll = (cur_line >= line_count)
+    end,
+  })
+
+  -- 触发事件通知右侧伪终端窗口调整布局
+  vim.api.nvim_exec_autocmds("User", {
+    pattern = "NeoAI:tool_display_resized",
+    data = { window_id = win_id, height = dynamic_height, row = tool_row, width = tool_width, col = 1 },
+  })
+
+  return win_id
+end
+
+--- 更新 tool_display 悬浮窗内容
+--- @param window_id string 窗口 ID
+--- @param content string 新内容
+function M.update_tool_display(window_id, content)
+  local td = tool_displays[window_id]
+  if not td then return end
+
+  -- 内容没变则跳过
+  if content == td._last_buffer then return end
+  td._last_buffer = content
+  td.buffer = content
+
+  local buf = M.get_window_buf(window_id)
+  if not buf or not pcall(vim.api.nvim_buf_is_valid, buf) then return end
+
+  local lines = vim.split(content, "\n")
+  vim.api.nvim_set_option_value("modifiable", true, { buf = buf })
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+  vim.api.nvim_set_option_value("modifiable", false, { buf = buf })
+
+  -- 自动滚动
+  if td.auto_scroll then
+    local nvim_win = M.get_window_win(window_id)
+    if nvim_win and pcall(vim.api.nvim_win_is_valid, nvim_win) then
+      local line_count = vim.api.nvim_buf_line_count(buf)
+      pcall(vim.api.nvim_win_set_cursor, nvim_win, { line_count, 0 })
+    end
+  end
+end
+
+--- 增量追加 tool_display 悬浮窗内容（只追加新增的文本到末尾）
+--- 先将 JSON 转义字符（\n、\t、\\ 等）渲染为可读格式，再按换行拆分插入
+--- @param window_id string 窗口 ID
+--- @param append_text string 要追加的文本
+function M.append_tool_display(window_id, append_text)
+  if not append_text or append_text == "" then return end
+  local td = tool_displays[window_id]
+  if not td then return end
+
+  local buf = M.get_window_buf(window_id)
+  if not buf or not pcall(vim.api.nvim_buf_is_valid, buf) then return end
+
+  -- 先将 JSON 转义字符渲染为可读格式
+  local display_text = append_text
+  display_text = display_text:gsub("\\n", "\n")
+  display_text = display_text:gsub("\\t", "\t")
+  display_text = display_text:gsub("\\\\", "\\")
+  display_text = display_text:gsub("\\\"", "\"")
+
+  local line_count = vim.api.nvim_buf_line_count(buf)
+  local last_line = vim.api.nvim_buf_get_lines(buf, line_count - 1, line_count, false)[1] or ""
+
+  -- 按真正换行拆分为多行
+  local parts = vim.split(display_text, "\n", { plain = true })
+
+  vim.api.nvim_set_option_value("modifiable", true, { buf = buf })
+  -- 第一段追加到最后一行的末尾
+  local new_last_line = last_line .. parts[1]
+  vim.api.nvim_buf_set_lines(buf, line_count - 1, line_count, false, { new_last_line })
+  -- 剩余部分作为新行插入
+  for i = 2, #parts do
+    vim.api.nvim_buf_set_lines(buf, line_count + i - 2, line_count + i - 2, false, { parts[i] })
+  end
+  vim.api.nvim_set_option_value("modifiable", false, { buf = buf })
+
+  -- 更新缓存（存原始文本，用于去重判断）
+  td.buffer = td.buffer .. append_text
+  td._last_buffer = td.buffer
+
+  -- 强制滚动到末尾（预览窗口不需要判断用户是否滚动过）
+  local nvim_win = M.get_window_win(window_id)
+  if nvim_win and pcall(vim.api.nvim_win_is_valid, nvim_win) then
+    local final_line_count = vim.api.nvim_buf_line_count(buf)
+    local final_last_line = vim.api.nvim_buf_get_lines(buf, final_line_count - 1, final_line_count, false)[1] or ""
+    pcall(vim.api.nvim_win_set_cursor, nvim_win, { final_line_count, #final_last_line })
+  end
+end
+
+--- 关闭 tool_display 悬浮窗
+--- @param window_id string 窗口 ID
+function M.close_tool_display(window_id)
+  if not window_id then return end
+  tool_displays[window_id] = nil
+  local augroup_name = "NeoAI_tool_scroll_" .. window_id
+  pcall(vim.api.nvim_del_augroup_by_name, augroup_name)
+  M.close_window(window_id)
+end
+
+--- 重置 tool_display 窗口的 auto_scroll 为 true
+--- @param window_id string 窗口 ID
+function M.reset_tool_display_scroll(window_id)
+  local td = tool_displays[window_id]
+  if td then td.auto_scroll = true end
+end
+
 return M
