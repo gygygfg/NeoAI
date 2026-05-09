@@ -183,21 +183,16 @@ function M.build_request(params)
   local options = params.options or {}
   local session_id = params.session_id
 
-  -- 解码消息中的 %%XX URL 编码（使用 http_utils 替代 http_client 跨模块依赖）
+  -- 解码消息中的 %%XX URL 编码
+  -- encode_response_strings 只编码控制字符和非法 UTF-8 字节，不再编码 " 和 \
+  -- 因此 content/reasoning_content 中的控制字符需要解码回原始值
+  -- tool_calls.arguments 中的 JSON 结构保持完整，无需解码
   for _, msg in ipairs(messages) do
-    if msg.content and type(msg.content) == "string" then
+    if msg.content and type(msg.content) == "string" and msg.content:find("%%") then
       msg.content = http_utils.decode_special_chars(msg.content)
     end
-    if msg.reasoning_content and type(msg.reasoning_content) == "string" then
+    if msg.reasoning_content and type(msg.reasoning_content) == "string" and msg.reasoning_content:find("%%") then
       msg.reasoning_content = http_utils.decode_special_chars(msg.reasoning_content)
-    end
-    if msg.tool_calls and type(msg.tool_calls) == "table" then
-      for _, tc in ipairs(msg.tool_calls) do
-        local func = tc["function"] or tc.func
-        if func and func.arguments and type(func.arguments) == "string" then
-          func.arguments = http_utils.decode_special_chars(func.arguments)
-        end
-      end
     end
   end
 

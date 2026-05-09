@@ -891,6 +891,78 @@ local http_utils = require("NeoAI.core.ai.http_utils")
 
 --- 解析并规范化工具参数
 --- 包含 URL 解码、JSON 解析、别名映射、简化参数格式转换
+--- 解析非标准格式的参数（按换行分割的 key: value 或 key = value 格式）
+--- 兼容 AI 输出参数顺序错乱或 JSON 解析失败的情况
+--- @param raw_arguments string 原始参数字符串
+--- @param props table 工具定义的属性名表
+--- @param tool_name string 工具名称（仅用于日志）
+--- @return table|nil 解析后的参数表，失败返回 nil
+function M._parse_nonstandard_arguments(raw_arguments, props, tool_name)
+  local arguments = {}
+  local lines = {}
+  for line in (raw_arguments .. ""):gmatch("[^\n]+") do
+    table.insert(lines, line)
+  end
+  if #lines == 0 then
+    return nil
+  end
+
+  local parsed_count = 0
+  for _, line in ipairs(lines) do
+    -- 跳过空行和注释行
+    local trimmed = line:match("^%s*(.-)%s*$") or ""
+    if trimmed == "" or trimmed:find("^[#/]+") then
+      goto continue
+    end
+
+    -- 尝试匹配 key: value 或 key = value 格式
+    -- 支持值带引号或不带引号
+    local k, v = trimmed:match("^([%w_]+)%s*[:=]%s*(.+)$")
+    if not k then
+      goto continue
+    end
+
+    -- 去除值首尾的引号（单引号或双引号）
+    v = v:match("^%s*['\"](.-)['\"]%s*$") or v:match("^%s*(.-)%s*$")
+
+    -- 尝试匹配工具定义的属性名（包括别名）
+    local matched_key = nil
+    if props[k] then
+      matched_key = k
+    else
+      local alias_map = {
+        cmd = "command",
+        dir = "dirs",
+        file = "files",
+        fp = "filepath",
+        path = "filepath",
+        dir_path = "dirs",
+      }
+      local std_name = alias_map[k]
+      if std_name and props[std_name] then
+        matched_key = std_name
+      end
+    end
+
+    if matched_key then
+      arguments[matched_key] = v
+      parsed_count = parsed_count + 1
+    end
+    ::continue::
+  end
+
+  if parsed_count > 0 then
+    logger.warn(
+      "[tool_executor] _parse_nonstandard_arguments: 工具 '%s' 使用非标准格式解析了 %d 个参数",
+      tool_name,
+      parsed_count
+    )
+    return arguments
+  end
+
+  return nil
+end
+
 --- @param tool_name string 工具名称
 --- @param raw_arguments string|table 原始参数
 --- @return table, boolean 规范化后的参数，是否发生变更
@@ -921,22 +993,87 @@ function M._normalize_arguments(tool_name, raw_arguments)
     changed = true
   end
 
-  -- 如果是字符串，先尝试 JSON 解析
+  -- 获取工具定义（用于后续参数名匹配和格式转换）
+  local tool_registry = require("NeoAI.tools.tool_registry")
+  pcall(tool_registry.initialize, {})
+  local tool_def = tool_registry.get(tool_name)
+  local props = tool_def and tool_def.parameters and tool_def.parameters.properties or {}
+
+  -- ===== 参数解析 =====
+  -- encode_response_strings 不再编码 " 和 \，因此 arguments 中的 JSON 结构保持完整。
+  -- 控制字符和非法 UTF-8 仍被编码为 %XX，在最后步骤统一解码。
+
   if type(raw_arguments) == "string" then
-    local decoded_args_str = raw_arguments
-    if decoded_args_str:find("%%") then
-      decoded_args_str = http_utils.decode_special_chars(decoded_args_str)
-    end
-    local ok, parsed = pcall(vim.json.decode, decoded_args_str)
+    -- 策略 1：直接 JSON 解析（标准路径）
+    local ok, parsed = pcall(vim.json.decode, raw_arguments)
     if ok and type(parsed) == "table" then
       arguments = parsed
+      changed = true
     else
-      logger.warn(
-        "[tool_executor] _normalize_arguments: 工具 '%s' 的 arguments JSON 解析失败: %s",
-        tool_name,
-        tostring(raw_arguments)
-      )
-      return { _raw = raw_arguments }, false
+      -- 策略 2：解码后重试 JSON 解析（兼容旧数据中的 %XX 编码）
+      if raw_arguments:find("%%") then
+        local decoded = http_utils.decode_special_chars(raw_arguments)
+        local ok2, parsed2 = pcall(vim.json.decode, decoded)
+        if ok2 and type(parsed2) == "table" then
+          arguments = parsed2
+          changed = true
+        end
+      end
+
+      if not arguments or not next(arguments) then
+        -- 策略 3：尝试修复被截断的 JSON
+        local fixed = raw_arguments:find("%%") and http_utils.decode_special_chars(raw_arguments) or raw_arguments
+        local repaired = false
+
+        if raw_arguments:find("%%22") then
+          local ok_check, _ = pcall(vim.json.decode, fixed)
+          if not ok_check then
+            local ends_with_quote = fixed:match('"$')
+            local ends_with_brace = fixed:match("}$")
+            if not ends_with_brace and not ends_with_quote then
+              fixed = fixed .. '"'
+              repaired = true
+            end
+            if not fixed:match("}$") then
+              local open_braces = select(2, fixed:gsub("{", ""))
+              local close_braces = select(2, fixed:gsub("}", ""))
+              if open_braces > close_braces then
+                fixed = fixed .. string.rep("}", open_braces - close_braces)
+                repaired = true
+              end
+            end
+          end
+        end
+
+        if repaired then
+          local ok3, parsed3 = pcall(vim.json.decode, fixed)
+          if ok3 and type(parsed3) == "table" then
+            logger.warn(
+              "[tool_executor] _normalize_arguments: 工具 '%s' 的 arguments JSON 被截断，已修复: %s",
+              tool_name,
+              tostring(raw_arguments):sub(1, 100)
+            )
+            arguments = parsed3
+            changed = true
+          end
+        end
+
+        -- 策略 4：按换行分割，解析非标准 key=value 格式
+        -- 兼容 AI 输出参数顺序错乱或非 JSON 格式的情况
+        if not arguments or not next(arguments) then
+          arguments = M._parse_nonstandard_arguments(raw_arguments, props, tool_name)
+          if arguments and next(arguments) then
+            changed = true
+          else
+            logger.warn(
+              "[tool_executor] _normalize_arguments: 工具 '%s' 的 arguments 解析失败（所有策略均无效）: %s",
+              tool_name,
+              tostring(raw_arguments):sub(1, 300)
+            )
+            return { _raw = raw_arguments }, false
+          end
+        end
+      end
     end
   elseif type(raw_arguments) == "table" then
     arguments = vim.deepcopy(raw_arguments)
@@ -944,20 +1081,29 @@ function M._normalize_arguments(tool_name, raw_arguments)
     return { _raw = tostring(raw_arguments) }, false
   end
 
-  -- 解码参数值中的 %%XX URL 编码
+  -- ===== 统一解码参数值中的 %%XX URL 编码 =====
+  -- 所有参数值中的 URL 编码在此统一解码
+  -- 注意：参数名（key）不会被编码，无需解码
   for k, v in pairs(arguments) do
-    if type(v) == "string" then
+    if type(v) == "string" and v:find("%%") then
       arguments[k] = http_utils.decode_special_chars(v)
+    elseif type(v) == "table" then
+      -- 递归解码嵌套 table 中的字符串
+      local function decode_table(tbl)
+        for tk, tv in pairs(tbl) do
+          if type(tv) == "string" and tv:find("%%") then
+            tbl[tk] = http_utils.decode_special_chars(tv)
+          elseif type(tv) == "table" then
+            decode_table(tv)
+          end
+        end
+      end
+      decode_table(v)
     end
   end
 
-  -- 通用参数规范化
-  local tool_registry = require("NeoAI.tools.tool_registry")
-  pcall(tool_registry.initialize, {})
-  local tool_def = tool_registry.get(tool_name)
+  -- ===== 通用参数规范化 =====
   if tool_def and tool_def.parameters and tool_def.parameters.properties then
-    local props = tool_def.parameters.properties
-
     -- 1) 参数别名映射
     -- 将 AI 常用的简写参数名映射到工具定义的标准参数名
     -- 即使别名参数也存在于 props 中（如 run_command 同时有 command 和 cmd），

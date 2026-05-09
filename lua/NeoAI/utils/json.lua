@@ -99,8 +99,12 @@ local function escape_string(str)
       table.insert(parts, code_point_to_json(cp))
       pos = next_pos
     else
-      -- 非法 UTF-8 字节，替换为 U+FFFD
-      table.insert(parts, "\\ufffd")
+      -- 非法 UTF-8 字节：用 \u00XX 转义原始字节值
+      -- 与 encode_special_chars 的 %XX 编码对应，但使用 JSON 标准的 \uXXXX 格式
+      local bad_byte = escaped:byte(pos)
+      if bad_byte then
+        table.insert(parts, string.format("\\u00%02x", bad_byte))
+      end
       pos = next_pos
     end
   end

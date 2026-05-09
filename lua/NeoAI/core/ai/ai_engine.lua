@@ -685,6 +685,8 @@ function M.handle_tool_result(data)
       session_id = sa_session_id,
       generation_id = sa_generation_id,
     })
+    -- 子 agent 工具循环中也不发送 max_tokens，避免 AI 输出被截断
+    request.max_tokens = nil
 
     -- 子 agent 请求需要携带工具列表，让 AI 知道有哪些工具可用
     -- 但只携带边界允许的工具（如果设置了 allowed_tools）
@@ -850,6 +852,8 @@ function M.handle_tool_result(data)
   local formatted = request_builder.format_messages(messages)
   local stream_val = (options.stream ~= nil) and options.stream or (ai_preset.stream ~= false)
   local request = request_builder.build_request({ messages = formatted, options = vim.tbl_extend("force", options, { model = ai_preset.model_name or options.model, temperature = ai_preset.temperature or options.temperature, max_tokens = ai_preset.max_tokens or options.max_tokens, stream = stream_val }), session_id = session_id, generation_id = generation_id })
+  -- 工具循环中不发送 max_tokens，避免 AI 输出被截断导致 tool_calls arguments 不完整
+  request.max_tokens = nil
   if is_final_round then request.tools = nil; request.tool_choice = nil end
   -- 清除去重缓存，确保新请求不被去重机制拦截
   -- 工具循环和总结轮次可能复用相同的 generation_id

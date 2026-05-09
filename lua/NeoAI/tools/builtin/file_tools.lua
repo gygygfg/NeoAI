@@ -495,7 +495,6 @@ M.write_file = define_tool({
     type = "object",
     properties = {
       filepath = { type = "string", description = "文件路径（必填）" },
-      content = { type = "string", description = "要写入的内容（可选，不填时默认追加模式）" },
       append = {
         type = "boolean",
         description = "是否追加模式，false 为覆盖，不填时默认追加模式",
@@ -509,6 +508,7 @@ M.write_file = define_tool({
         type = "number",
         description = "结束行号，用于替换指定行范围（需配合 start_line）",
       },
+      content = { type = "string", description = "要写入的内容（可选，不填时默认追加模式）" },
     },
     required = { "filepath" },
   },
@@ -826,9 +826,9 @@ M.search_files = define_tool({
     properties = {
       pattern = { type = "string", description = "搜索模式（必填）" },
       dir = { type = "string", description = "搜索目录", default = "." },
-      file_pattern = { type = "string", description = "文件通配符模式", default = "*" },
-      case_sensitive = { type = "boolean", description = "是否区分大小写", default = false },
       regex = { type = "boolean", description = "是否使用正则匹配", default = true },
+      case_sensitive = { type = "boolean", description = "是否区分大小写", default = false },
+      file_pattern = { type = "string", description = "文件通配符模式", default = "*" },
       max_results = {
         type = "number",
         description = "最大返回结果数，默认50",

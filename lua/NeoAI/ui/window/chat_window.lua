@@ -129,6 +129,14 @@ local state = {
     pack_order = {}, -- 有序的包名列表
     -- 子步骤显示支持
     substeps = {}, -- { [tool_name] = { { name, status, duration, detail } } }
+
+    -- 流式工具调用预览（在 TOOL_LOOP_STARTED 前提前显示）
+    streaming_preview = {
+      timer = nil, -- 2 秒延迟定时器
+      generation_id = nil, -- 当前流式 generation_id
+      tools = {}, -- { [tool_name] = { name, arguments (累积字符串), args_display (解析后的 table) } }
+      window_shown = false, -- 是否已提前打开悬浮窗
+    },
   },
 
   -- 生成进行中标志
@@ -220,6 +228,17 @@ local function reset_tool_display()
   state.tool_display.results = {}
   state.tool_display.folded_saved = false
   state.tool_display.substeps = {}
+
+  -- 清理流式工具预览状态
+  local preview = state.tool_display.streaming_preview
+  if preview.timer then
+    preview.timer:stop()
+    preview.timer:close()
+    preview.timer = nil
+  end
+  preview.generation_id = nil
+  preview.tools = {}
+  preview.window_shown = false
 end
 
 local function close_reasoning_display()
@@ -2357,6 +2376,17 @@ function M._setup_event_listeners()
         state.tool_display._finished = false
       end
       clear_stream_throttle()
+      -- 清理流式工具预览定时器（GENERATION_COMPLETED 时清理，避免残留）
+      local preview = state.tool_display.streaming_preview
+      if preview.timer then
+        preview.timer:stop()
+        preview.timer:close()
+        preview.timer = nil
+      end
+      preview.generation_id = nil
+      preview.tools = {}
+      preview.window_shown = false
+
       -- 保存流式状态，用于判断是否需要增量更新
       -- 注意：reasoning_done 为 true 表示思考过程折叠文本已通过 _append_reasoning_folded_to_buffer 追加到缓冲区
       -- 此时即使 prefix_added 为 false（只有思考没有正文），也应视为已有流式内容，避免重复追加
@@ -2404,6 +2434,17 @@ function M._setup_event_listeners()
       if not is_current_window(data.window_id) then
         return
       end
+
+      -- 清理流式工具预览状态（TOOL_LOOP_FINISHED 表示工具循环已结束）
+      local preview = state.tool_display.streaming_preview
+      if preview.timer then
+        preview.timer:stop()
+        preview.timer:close()
+        preview.timer = nil
+      end
+      preview.generation_id = nil
+      preview.tools = {}
+      preview.window_shown = false
 
       -- 保存用量信息
       if data.usage and next(data.usage) then
@@ -2738,6 +2779,154 @@ function M._setup_event_listeners()
     end
   end
 
+  -- 构建流式工具调用预览 buffer（从 TOOL_CALL_DETECTED 的累积数据生成）
+  -- 显示工具名称、实时累积的参数、加载动画
+  local function build_streaming_preview_buffer()
+    local preview = state.tool_display.streaming_preview
+    local tools = preview.tools or {}
+    if not next(tools) then
+      return "🔧 正在接收工具调用参数...\n"
+    end
+
+    local text = "🔧 工具调用（参数接收中...）\n"
+    for _, t in pairs(tools) do
+      text = text .. "\n  🔄 " .. t.name .. " (参数接收中...)\n"
+      -- 显示已累积的参数
+      if t.args_display and type(t.args_display) == "table" and next(t.args_display) then
+        for k, v in pairs(t.args_display) do
+          if k ~= "_session_id" and k ~= "_tool_call_id" then
+            local v_str = type(v) == "string" and v or vim.inspect(v)
+            v_str = vim.uri_decode(v_str)
+            local max_width = math.floor(vim.o.columns * 0.8) - 8
+            if #v_str > max_width then
+              v_str = v_str:sub(1, max_width - 3) .. "..."
+            end
+            local first_line = v_str:match("([^\n]+)") or v_str
+            text = text .. "    " .. k .. ": " .. first_line .. "\n"
+          end
+        end
+      end
+      -- 显示原始 JSON 片段（当参数无法解析为 table 时）
+      if t.arguments and t.arguments ~= "" then
+        local raw_preview = t.arguments:gsub("\n", " ")
+        local max_width = math.floor(vim.o.columns * 0.8) - 8
+        if #raw_preview > max_width then
+          raw_preview = raw_preview:sub(1, max_width - 3) .. "..."
+        end
+        text = text .. "    [原始参数] " .. raw_preview .. "\n"
+      end
+    end
+    return text
+  end
+
+  -- 尝试将累积的 arguments JSON 片段解析为 table，增量更新 args_display
+  local function try_parse_streaming_args(tool_entry)
+    local raw = tool_entry.arguments or ""
+    if raw == "" then
+      return
+    end
+    -- 尝试直接解析（可能不完整，但能解析的部分就是已接收到的完整字段）
+    local ok, parsed = pcall(vim.json.decode, raw)
+    if ok and type(parsed) == "table" then
+      tool_entry.args_display = parsed
+    end
+  end
+
+  -- TOOL_CALL_DETECTED：流式响应中检测到工具调用
+  vim.api.nvim_create_autocmd("User", {
+    pattern = Events.TOOL_CALL_DETECTED,
+    callback = function(args)
+      local data = args.data or {}
+      if not is_current_window(data.window_id) then
+        return
+      end
+
+      local tool_calls = data.tool_calls or {}
+      if #tool_calls == 0 then
+        return
+      end
+
+      local preview = state.tool_display.streaming_preview
+      local gen_id = data.generation_id
+
+      -- 如果 generation_id 变了（新的一次生成），重置预览状态
+      if preview.generation_id and preview.generation_id ~= gen_id then
+        if preview.timer then
+          preview.timer:stop()
+          preview.timer:close()
+          preview.timer = nil
+        end
+        preview.tools = {}
+        preview.window_shown = false
+      end
+      preview.generation_id = gen_id
+
+      -- 如果 TOOL_LOOP_STARTED 已经触发（工具循环已开始），不再处理流式预览
+      if state.tool_display.active then
+        return
+      end
+
+      -- 更新累积的工具调用数据
+      for _, tc in ipairs(tool_calls) do
+        local func = tc["function"] or tc.func or {}
+        local tool_name = func.name or ""
+        if tool_name ~= "" then
+          if not preview.tools[tool_name] then
+            preview.tools[tool_name] = {
+              name = tool_name,
+              arguments = "",
+              args_display = {},
+            }
+          end
+          -- 累积 arguments（流式 chunks 会不断追加）
+          if func.arguments then
+            preview.tools[tool_name].arguments = preview.tools[tool_name].arguments .. func.arguments
+            -- 尝试解析累积的参数
+            try_parse_streaming_args(preview.tools[tool_name])
+          end
+        end
+      end
+
+      -- 如果悬浮窗已提前打开，实时更新内容
+      if preview.window_shown and state.tool_display.window_id then
+        state.tool_display.buffer = build_streaming_preview_buffer()
+        M._update_tool_display()
+        return
+      end
+
+      -- 如果尚未打开悬浮窗，启动 2 秒延迟定时器
+      if not preview.timer then
+        preview.timer = vim.defer_fn(function()
+          -- 再次检查：如果 TOOL_LOOP_STARTED 已触发或窗口已关闭，跳过
+          if state.tool_display.active or state.tool_display._finished then
+            preview.timer = nil
+            return
+          end
+
+          -- 检查光标位置，仅在后 5 行内才显示
+          local win = get_win()
+          local near_end = cursor_near_end(win)
+          state.should_follow = near_end
+          if not near_end then
+            preview.timer = nil
+            return
+          end
+
+          -- 构建预览 buffer 并打开悬浮窗
+          state.tool_display.buffer = build_streaming_preview_buffer()
+          preview.window_shown = true
+
+          vim.schedule(function()
+            M._show_tool_display()
+            _schedule_cursor_follow(150)
+          end)
+
+          preview.timer = nil
+        end, 2000)
+      end
+    end,
+  })
+
   -- TOOL_LOOP_STARTED：工具循环开始
   vim.api.nvim_create_autocmd("User", {
     pattern = Events.TOOL_LOOP_STARTED,
@@ -2769,6 +2958,17 @@ function M._setup_event_listeners()
       s.content_separator_added = false
       s.message_start_line = nil
       state.tool_loop_in_progress = true
+
+      -- 清理流式工具预览状态（TOOL_LOOP_STARTED 表示流式已结束，预览不再需要）
+      local preview = state.tool_display.streaming_preview
+      if preview.timer then
+        preview.timer:stop()
+        preview.timer:close()
+        preview.timer = nil
+      end
+      preview.generation_id = nil
+      preview.tools = {}
+      preview.window_shown = false
 
       state.tool_display.active = true
       state.tool_display.buffer = ""
@@ -3033,6 +3233,17 @@ function M._setup_event_listeners()
       if not is_current_window(data.window_id) then
         return
       end
+
+      -- 清理流式工具预览状态
+      local preview = state.tool_display.streaming_preview
+      if preview.timer then
+        preview.timer:stop()
+        preview.timer:close()
+        preview.timer = nil
+      end
+      preview.generation_id = nil
+      preview.tools = {}
+      preview.window_shown = false
 
       if state.tool_display._finished then
         fire_event(Events.TOOL_DISPLAY_CLOSED, {

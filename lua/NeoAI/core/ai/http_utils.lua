@@ -77,12 +77,6 @@ function M.encode_special_chars(str)
     if byte == 0x0A or byte == 0x0D or byte == 0x09 then
       result[#result + 1] = string.char(byte)
       i = i + 1
-    elseif byte == 0x5C then
-      result[#result + 1] = "%5C"
-      i = i + 1
-    elseif byte == 0x22 then
-      result[#result + 1] = "%22"
-      i = i + 1
     elseif byte < 0x20 then
       result[#result + 1] = string.format("%%%02X", byte)
       i = i + 1

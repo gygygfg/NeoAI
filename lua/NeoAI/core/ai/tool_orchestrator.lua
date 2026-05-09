@@ -984,14 +984,33 @@ function M.on_generation_complete(data)
     end
   end
 
-  -- 过滤掉流式截断导致的无效工具调用（name 为空或 arguments 为空的条目）
+  -- 过滤掉流式截断导致的无效工具调用（name 为空、arguments 为空、或 arguments JSON 解析失败的条目）
+  -- encode_response_strings 不再编码 " 和 \，arguments 中的 JSON 结构保持完整，可直接解析
   local valid_tool_calls = {}
   for _, tc in ipairs(tool_calls) do
     local func = tc["function"] or tc.func
     if func and func.name and func.name ~= "" then
       local args = func.arguments
       if args ~= nil and args ~= "" then
-        table.insert(valid_tool_calls, tc)
+        -- 策略 1：直接 JSON 解析
+        local ok, parsed = pcall(vim.json.decode, args)
+        if not (ok and type(parsed) == "table") then
+          -- 策略 2：解码后重试（兼容旧数据中的 %XX 编码）
+          if type(args) == "string" and args:find("%%") then
+            local http_utils = require("NeoAI.core.ai.http_utils")
+            local decoded = http_utils.decode_special_chars(args)
+            ok, parsed = pcall(vim.json.decode, decoded)
+          end
+        end
+        if ok and type(parsed) == "table" then
+          table.insert(valid_tool_calls, tc)
+        else
+          logger.warn(
+            "[tool_orchestrator] on_generation_complete: 工具 '%s' 的 arguments JSON 解析失败，跳过该工具调用: %s",
+            func.name,
+            tostring(args):sub(1, 200)
+          )
+        end
       end
     end
   end
