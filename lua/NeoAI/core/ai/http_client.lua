@@ -6,7 +6,7 @@ local M = {}
 local logger = require("NeoAI.utils.logger")
 local json = require("NeoAI.utils.json")
 local request_adapter = require("NeoAI.core.ai.request_adapter")
-local http_utils = require("NeoAI.core.ai.http_utils")
+local http_utils = require("NeoAI.utils.http_utils")
 local state_manager = require("NeoAI.core.config.state")
 
 local state = {

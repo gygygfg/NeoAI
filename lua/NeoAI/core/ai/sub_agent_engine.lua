@@ -377,7 +377,7 @@ function M._request_generation(sub_agent_id)
   runner.generation_id = "sub_agent_" .. sub_agent_id .. "_" .. os.time() .. "_" .. math.random(10000, 99999)
   -- 清除旧的去重缓存，确保新请求不被忽略
   pcall(function()
-    require("NeoAI.core.ai.http_utils").clear_dedup(old_generation_id)
+require("NeoAI.utils.http_utils").clear_dedup(old_generation_id)
   end)
 
   -- 构建子 agent 的系统提示词

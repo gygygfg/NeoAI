@@ -997,7 +997,7 @@ function M.on_generation_complete(data)
         if not (ok and type(parsed) == "table") then
           -- 策略 2：解码后重试（兼容旧数据中的 %XX 编码）
           if type(args) == "string" and args:find("%%") then
-            local http_utils = require("NeoAI.core.ai.http_utils")
+            local http_utils = require("NeoAI.utils.http_utils")
             local decoded = http_utils.decode_special_chars(args)
             ok, parsed = pcall(vim.json.decode, decoded)
           end
@@ -2014,7 +2014,7 @@ function M.execute_single_tool_request(session_id, tool_name, args, callback)
           local raw_args_str = func.arguments or ""
           local decoded_args = raw_args_str
           if raw_args_str:find("%%") then
-            local http_utils = require("NeoAI.core.ai.http_utils")
+            local http_utils = require("NeoAI.utils.http_utils")
             decoded_args = http_utils.decode_special_chars(raw_args_str)
           end
           local ok, parsed_args = pcall(vim.json.decode, decoded_args)

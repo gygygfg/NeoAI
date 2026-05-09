@@ -65,7 +65,9 @@ end
 
 -- ========== URL 编码/解码 ==========
 
---- 将字符串中可能影响 JSON 解析的控制字符和非法 UTF-8 序列转义为 %%XX URL 编码
+--- 将字符串中可能影响 JSON 解析的字符转义为 %%XX URL 编码
+--- 编码范围：控制字符(<0x20)、反斜杠(0x5C)、双引号(0x22)、非法 UTF-8
+--- 这样编码后的字符串可直接嵌入 JSON 字符串值中，无需额外转义
 --- @param str string
 --- @return string
 function M.encode_special_chars(str)
@@ -74,8 +76,9 @@ function M.encode_special_chars(str)
   local i = 1
   while i <= #str do
     local byte = str:byte(i)
-    if byte == 0x0A or byte == 0x0D or byte == 0x09 then
-      result[#result + 1] = string.char(byte)
+    if byte == 0x22 or byte == 0x5C then
+      -- 编码双引号(")和反斜杠(\)，确保可安全嵌入 JSON
+      result[#result + 1] = string.format("%%%02X", byte)
       i = i + 1
     elseif byte < 0x20 then
       result[#result + 1] = string.format("%%%02X", byte)

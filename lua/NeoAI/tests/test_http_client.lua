@@ -264,10 +264,12 @@ function M.run()
       local decoded3 = hc._decode_special_chars(encoded3)
       assert.equal(original3, decoded3, "含控制字符的编解码往返应一致")
 
-      -- 4. 换行/回车/制表符应保留
+      -- 4. 换行/回车/制表符应编码为 %0A %0D %09
       local original4 = "line1\nline2\rline3\tindented"
       local encoded4 = hc._encode_special_chars(original4)
-      assert.equal(original4, encoded4, "\\n\\r\\t 应保留不变")
+      assert.is_true(encoded4:find("%%0A") ~= nil, "\\n 应编码为 %0A")
+      assert.is_true(encoded4:find("%%0D") ~= nil, "\\r 应编码为 %0D")
+      assert.is_true(encoded4:find("%%09") ~= nil, "\\t 应编码为 %09")
       local decoded4 = hc._decode_special_chars(encoded4)
       assert.equal(original4, decoded4, "含 \\n\\r\\t 的编解码往返应一致")
 
@@ -285,8 +287,8 @@ function M.run()
       assert.is_true(encoded6:find("%%22") ~= nil, "混合场景中双引号应编码")
       assert.is_true(encoded6:find("%%00") ~= nil, "混合场景中 \\x00 应编码")
       assert.is_true(encoded6:find("%%1F") ~= nil, "混合场景中 \\x1F 应编码")
-      assert.is_true(encoded6:find("\n") ~= nil, "混合场景中 \\n 应保留")
-      assert.is_true(encoded6:find("\t") ~= nil, "混合场景中 \\t 应保留")
+      assert.is_true(encoded6:find("%%0A") ~= nil, "混合场景中 \\n 应编码为 %0A")
+      assert.is_true(encoded6:find("%%09") ~= nil, "混合场景中 \\t 应编码为 %09")
       assert.is_true(encoded6:find("和中文") ~= nil, "混合场景中中文应保留")
       local decoded6 = hc._decode_special_chars(encoded6)
       assert.equal(original6, decoded6, "混合场景编解码往返应一致")
@@ -382,8 +384,8 @@ function M.run()
       assert.is_true(encoded_content:find("%%22") ~= nil, "双引号应编码为 %22")
       assert.is_true(encoded_content:find("%%00") ~= nil, "\\x00 应编码为 %00")
       assert.is_true(encoded_content:find("%%01") ~= nil, "\\x01 应编码为 %01")
-      assert.is_true(encoded_content:find("\n") ~= nil, "\\n 应保留")
-      assert.is_true(encoded_content:find("\t") ~= nil, "\\t 应保留")
+      assert.is_true(encoded_content:find("%%0A") ~= nil, "\\n 应编码为 %0A")
+      assert.is_true(encoded_content:find("%%09") ~= nil, "\\t 应编码为 %09")
       assert.is_true(encoded_content:find("文本") ~= nil, "中文应保留")
 
       -- 3. 模拟存储到 history_manager（编码后的内容存入持久化）
@@ -404,6 +406,8 @@ function M.run()
       assert.equal("思考过程包含\x00空字符", decoded_reasoning, "reasoning 编解码应一致")
 
       -- 7. 验证编码后的内容可以安全嵌入 JSON（不会破坏 JSON 结构）
+      -- 因为 \ 和 " 已被编码为 %5C 和 %22，控制字符已被编码为 %XX
+      -- 所以可以直接嵌入 JSON 字符串值中，无需额外转义
       local safe_for_json = '{"content":"' .. stored_content .. '"}'
       local ok, parsed = pcall(vim.json.decode, safe_for_json)
       assert.is_true(ok, "编码后的内容应能安全嵌入 JSON")

@@ -9,6 +9,7 @@
 local M = {}
 
 local Events = require("NeoAI.core.events")
+local state_manager = require("NeoAI.core.config.state")
 
 local state = {
   initialized = false,
@@ -29,6 +30,82 @@ local function get_hm()
   local ok, hm = pcall(require, "NeoAI.core.history.manager")
   if ok and hm.is_initialized() then return hm end
   return nil
+end
+
+-- ========== 光标跟随逻辑（通过协程共享表同步） ==========
+
+--- 检测光标是否在末尾附近（后5行内），结果写入协程共享表
+--- @param window_id string|nil 窗口ID，nil 时使用当前 chat 窗口
+--- @return boolean
+local function _check_cursor_near_end(window_id)
+  local wm = require("NeoAI.ui.window.window_manager")
+  local chat_window = require("NeoAI.ui.window.chat_window")
+  local target_win_id = window_id or (chat_window.get_current_window_id and chat_window.get_current_window_id())
+  if not target_win_id then
+    state_manager.set_shared("should_follow", false)
+    return false
+  end
+  local win = wm.get_window_win(target_win_id)
+  if not win or not vim.api.nvim_win_is_valid(win) then
+    state_manager.set_shared("should_follow", false)
+    return false
+  end
+  local cursor = vim.api.nvim_win_get_cursor(win)
+  local buf = vim.api.nvim_win_get_buf(win)
+  local total = vim.api.nvim_buf_line_count(buf)
+  local near_end = total - cursor[1] <= 5
+  state_manager.set_shared("should_follow", near_end)
+  return near_end
+end
+
+--- 执行光标跟随：将光标跳转到缓冲区末尾并滚动到窗口最底部
+--- 使用协程共享表 should_follow 判断是否应该跟随
+local function _do_cursor_follow()
+  local should = state_manager.get_shared_value("should_follow", false)
+  if not should then
+    return
+  end
+  local chat_window = require("NeoAI.ui.window.chat_window")
+  local wm = require("NeoAI.ui.window.window_manager")
+  local window_id = chat_window.get_current_window_id and chat_window.get_current_window_id()
+  if not window_id then return end
+  local win = wm.get_window_win(window_id)
+  if not win or not vim.api.nvim_win_is_valid(win) then return end
+  local buf = vim.api.nvim_win_get_buf(win)
+  if not buf or not vim.api.nvim_buf_is_valid(buf) then return end
+  local lc = vim.api.nvim_buf_line_count(buf)
+  local last_line = vim.api.nvim_buf_get_lines(buf, lc - 1, lc, false)[1] or ""
+  if last_line == "}}}" then
+    local saved_foldlevel = vim.api.nvim_get_option_value("foldlevel", { win = win })
+    vim.api.nvim_set_option_value("foldlevel", 999, { win = win })
+    pcall(vim.api.nvim_set_option_value, "modifiable", true, { buf = buf })
+    pcall(vim.api.nvim_set_option_value, "readonly", false, { buf = buf })
+    vim.api.nvim_buf_set_lines(buf, lc, lc, false, { "" })
+    lc = vim.api.nvim_buf_line_count(buf)
+    pcall(vim.api.nvim_win_set_cursor, win, { lc, 0 })
+    vim.schedule(function()
+      if win and vim.api.nvim_win_is_valid(win) then
+        vim.api.nvim_set_option_value("foldlevel", saved_foldlevel, { win = win })
+      end
+    end)
+  else
+    pcall(vim.api.nvim_win_set_cursor, win, { lc, #last_line })
+  end
+  pcall(vim.api.nvim_win_call, win, function()
+    vim.cmd("normal! zb")
+  end)
+end
+
+--- 更新协程共享表中的 should_follow 值
+--- @param value boolean
+function M.update_should_follow(value)
+  state_manager.set_shared("should_follow", value)
+end
+
+--- 获取协程共享表中的 should_follow 值
+--- @return boolean
+function M.get_should_follow()
+  return state_manager.get_shared_value("should_follow", true)
 end
 
 --- 构建 assistant 内容（合并 reasoning 和正文）

@@ -6,6 +6,20 @@ local virtual_input = require("NeoAI.ui.components.virtual_input")
 local Events = require("NeoAI.core.events")
 local state_manager = require("NeoAI.core.config.state")
 
+-- 模块级引用（避免函数内重复 require）
+local chat_handlers = require("NeoAI.ui.handlers.chat_handlers")
+local tool_pack = require("NeoAI.tools.tool_pack")
+local config_merger = require("NeoAI.core.config.merger")
+local async_worker = require("NeoAI.utils.async_worker")
+local core = require("NeoAI.core")
+local http_utils = require("NeoAI.utils.http_utils")
+local chat_service = require("NeoAI.core.ai.chat_service")
+local approval_config_editor = require("NeoAI.ui.components.approval_config_editor")
+local history_manager = require("NeoAI.core.history.manager")
+local tool_orchestrator = require("NeoAI.core.ai.tool_orchestrator")
+local reasoning_display = require("NeoAI.ui.components.reasoning_display")
+local file_utils = require("NeoAI.utils.file_utils")
+
 -- ========== 辅助函数（不依赖 state） ==========
 
 local function buf_valid(buf)
@@ -242,9 +256,8 @@ local function reset_tool_display()
 end
 
 local function close_reasoning_display()
-  local ok, rd = pcall(require, "NeoAI.ui.components.reasoning_display")
-  if ok and rd.is_visible() then
-    rd.close()
+  if reasoning_display.is_visible() then
+    reasoning_display.close()
   end
 end
 
@@ -419,11 +432,13 @@ end
 local function _check_cursor_near_end()
   if not state.current_window_id then
     state.should_follow = false
+    state_manager.set_shared("should_follow", false)
     return false
   end
   local win = window_manager.get_window_win(state.current_window_id)
   if not win or not vim.api.nvim_win_is_valid(win) then
     state.should_follow = false
+    state_manager.set_shared("should_follow", false)
     return false
   end
   local cursor = vim.api.nvim_win_get_cursor(win)
@@ -431,6 +446,7 @@ local function _check_cursor_near_end()
   local total = vim.api.nvim_buf_line_count(buf)
   local near_end = total - cursor[1] <= 5
   state.should_follow = near_end
+  state_manager.set_shared("should_follow", near_end)
   return near_end
 end
 
@@ -526,13 +542,14 @@ local function _schedule_cursor_follow(delay_ms)
 end
 
 local function get_chat_service()
-  local ok, cs = pcall(require, "NeoAI.core.ai.chat_service")
-  return ok and cs or nil
+  if chat_service and chat_service.is_initialized then
+    return chat_service
+  end
+  return nil
 end
 
 local function get_config_merger()
-  local ok, cm = pcall(require, "NeoAI.core.config.merger")
-  return ok and cm or nil
+  return config_merger
 end
 
 --- 初始化聊天窗口
@@ -693,6 +710,10 @@ function M.open(session_id, window_id, branch_id)
     -- 在窗口的协程上下文中执行初始化操作
     -- 确保协程内共享变量（如 session_id、window_id 等）正确隔离
     local init_fn = function()
+      -- 将 session_id 同步到协程共享表，供后续事件处理等场景使用
+      if session_id and ctx then
+        state_manager.set_shared("session_id", session_id)
+      end
       if session_id then
         -- 有会话 ID：加载已有会话的消息
         M._load_messages(session_id)
@@ -803,8 +824,7 @@ function M._render_single_message(msg, prev_role)
 
   -- 解码 %%XX URL 编码（由 http_client._encode_special_chars 编码的响应内容）
   -- 使用 http_utils 替代 http_client 跨模块依赖
-  local http_utils_ok, http_utils = pcall(require, "NeoAI.core.ai.http_utils")
-  if http_utils_ok and http_utils.decode_special_chars then
+  if http_utils.decode_special_chars then
     local json_ok, parsed = pcall(vim.json.decode, raw_content)
     if json_ok and type(parsed) == "table" then
       if parsed.reasoning_content and type(parsed.reasoning_content) == "string" then
@@ -1032,8 +1052,6 @@ function M._do_render_chat()
     end
 
     -- 使用异步工作器在后台构建内容
-    local async_worker = require("NeoAI.utils.async_worker")
-
     async_worker.submit_task("render_chat_content", function()
       local content = {}
 
@@ -1092,8 +1110,9 @@ function M._apply_rendered_content(content)
     local buf = vim.api.nvim_win_get_buf(win_handle)
     local total_lines = vim.api.nvim_buf_line_count(buf)
     near_end = total_lines - cursor[1] <= 5
-    -- 更新模块级 state 缓存
+    -- 更新模块级 state 缓存和协程共享表
     state.should_follow = near_end
+    state_manager.set_shared("should_follow", near_end)
   end
 
   -- 设置窗口内容
@@ -1107,13 +1126,13 @@ function M._apply_rendered_content(content)
     vim.api.nvim_set_option_value("foldlevel", saved_foldlevel, { win = fold_win })
   end
 
-  -- 自动获取焦点（如果虚拟输入框已激活，跳过，避免抢走输入框焦点）
-  if not virtual_input.is_active() then
-    M._focus_window()
-  end
-
-  -- 使用防抖光标跟随（使用之前保存的 near_end 值，而不是重新检测）
+  -- 仅在光标跟随（near_end=true）时获取焦点并打开输入框
+  -- 光标不跟随时（near_end=false），不抢焦点，保持用户当前工作状态
   if near_end then
+    -- 自动获取焦点（如果虚拟输入框已激活，跳过，避免抢走输入框焦点）
+    if not virtual_input.is_active() then
+      M._focus_window()
+    end
     _schedule_cursor_follow()
     if not state.streaming.active and not state.generation_in_progress then
       M._open_float_input()
@@ -1142,8 +1161,6 @@ function M.render_chat_async(callback)
   end
 
   -- 使用异步工作器
-  local async_worker = require("NeoAI.utils.async_worker")
-
   async_worker.submit_task("render_chat_async", function()
     -- 在后台线程中构建内容
     local content = {}
@@ -1173,11 +1190,26 @@ function M.render_chat_async(callback)
     if success and content then
       -- async_worker 内部已用 vim.schedule_wrap 包裹回调，无需额外 vim.schedule
       window_manager.set_window_content(state.current_window_id, content)
-      -- 自动获取焦点
-      M._focus_window()
-      -- 仅在非流式且无生成进行中时打开浮动虚拟输入框
-      if not state.streaming.active and not state.generation_in_progress then
-        M._open_float_input()
+
+      -- 检测光标是否在末尾附近，决定是否获取焦点和打开输入框
+      local win_handle = window_manager.get_window_win(state.current_window_id)
+      local near_end = false
+      if win_handle and vim.api.nvim_win_is_valid(win_handle) then
+        local cursor = vim.api.nvim_win_get_cursor(win_handle)
+        local buf = vim.api.nvim_win_get_buf(win_handle)
+        local total_lines = vim.api.nvim_buf_line_count(buf)
+        near_end = total_lines - cursor[1] <= 5
+      end
+
+      if near_end then
+        -- 自动获取焦点（如果虚拟输入框已激活，跳过，避免抢走输入框焦点）
+        if not virtual_input.is_active() then
+          M._focus_window()
+        end
+        -- 仅在非流式且无生成进行中时打开浮动虚拟输入框
+        if not state.streaming.active and not state.generation_in_progress then
+          M._open_float_input()
+        end
       end
 
       if callback then
@@ -1217,7 +1249,6 @@ function M.set_keymaps()
 
   -- 从合并后的配置中获取 chat 上下文键位
   -- 所有键位统一由 default_config.lua 定义，模块内部不提供任何 fallback 默认值
-  local core = require("NeoAI.core")
   local ok, full_config = pcall(core.get_config)
   full_config = ok and full_config or {}
   local chat_config = full_config.keymaps and full_config.keymaps.chat or {}
@@ -1275,8 +1306,7 @@ function M.set_keymaps()
       callback = cancel_generation
     elseif key == "tool_approval" then
       callback = function()
-        local ace = require("NeoAI.ui.components.approval_config_editor")
-        ace.open()
+        approval_config_editor.open()
       end
     end
 
@@ -1304,7 +1334,6 @@ function M.sync_keymaps_to_buf(target_buf, exclude_keys)
     return
   end
 
-  local core = require("NeoAI.core")
   local ok, full_config = pcall(core.get_config)
   full_config = ok and full_config or {}
   local chat_config = full_config.keymaps and full_config.keymaps.chat or {}
@@ -1344,8 +1373,7 @@ function M.sync_keymaps_to_buf(target_buf, exclude_keys)
       })
     end,
     tool_approval = function()
-      local ace = require("NeoAI.ui.components.approval_config_editor")
-      ace.open()
+      approval_config_editor.open()
     end,
   }
 
@@ -1449,8 +1477,21 @@ function M._open_float_input()
   local ok_ft, current_ft = pcall(vim.api.nvim_get_option_value, "filetype", { buf = current_buf })
   local focus_on_chat = ok_ft and (current_ft == "neoai" or current_ft == "NeoAIInput" or current_win == win_handle)
 
-  -- 计算 auto_focus：光标在末尾附近 且 焦点在 chat 相关窗口
-  local auto_focus = state.should_follow and focus_on_chat
+  -- 计算 auto_focus：光标在末尾附近且焦点在 chat 相关窗口
+  -- 优先从协程共享表读取（由 _check_cursor_near_end 在内容变化前缓存）
+  -- 如果共享表没有值（初始打开时），主动检测光标位置
+  local should_follow = state_manager.get_shared_value("should_follow", nil)
+  if should_follow == nil then
+    -- 初始打开时主动检测光标是否在末尾附近
+    local cursor = vim.api.nvim_win_get_cursor(win_handle)
+    local buf = vim.api.nvim_win_get_buf(win_handle)
+    local total_lines = vim.api.nvim_buf_line_count(buf)
+    should_follow = total_lines - cursor[1] <= 5
+    -- 缓存结果
+    state.should_follow = should_follow
+    state_manager.set_shared("should_follow", should_follow)
+  end
+  local auto_focus = should_follow and focus_on_chat
 
   -- 打开浮动虚拟输入框
   virtual_input.open(win_handle, {
@@ -1462,11 +1503,10 @@ function M._open_float_input()
         -- 先通过 history.manager 创建会话
         local target_session_id = state.current_session_id
         if not target_session_id then
-          local hm_ok, hm = pcall(require, "NeoAI.core.history.manager")
-          if hm_ok and hm.is_initialized() then
+          if history_manager.is_initialized() then
             -- 每次打开新窗口都创建全新的根会话，不复用已有会话
             -- 这样用户发送消息时才真正创建会话，不会产生空会话文件
-            local session_id = hm.create_session("聊天会话", true, nil)
+            local session_id = history_manager.create_session("聊天会话", true, nil)
             if session_id then
               target_session_id = session_id
               -- 更新模块状态和 buffer 名称
@@ -1484,35 +1524,32 @@ function M._open_float_input()
           end
         end
 
-        local chat_handlers_loaded, chat_handlers = pcall(require, "NeoAI.ui.handlers.chat_handlers")
-        if chat_handlers_loaded and chat_handlers then
-          local success, result = chat_handlers.send_message(
-            content,
-            target_session_id,
-            "main",
-            state.current_window_id,
-            true,
-            function(async_success, async_result, async_error)
-              if not async_success then
-                print("✗ 异步消息发送失败: " .. tostring(async_error or async_result))
-                M.show_floating_text("发送消息失败: " .. tostring(async_error or async_result), {
-                  timeout = 3000,
-                  position = "center",
-                  border = "single",
-                })
-              end
+        local success, result = chat_handlers.send_message(
+          content,
+          target_session_id,
+          "main",
+          state.current_window_id,
+          true,
+          function(async_success, async_result, async_error)
+            if not async_success then
+              print("✗ 异步消息发送失败: " .. tostring(async_error or async_result))
+              M.show_floating_text("发送消息失败: " .. tostring(async_error or async_result), {
+                timeout = 3000,
+                position = "center",
+                border = "single",
+              })
             end
-          )
-          if not success then
-            print("⚠️  启动异步消息发送失败: " .. tostring(result))
-            M.show_floating_text("启动发送失败: " .. tostring(result), {
-              timeout = 3000,
-              position = "center",
-              border = "single",
-            })
-          else
-            M.show_floating_text("消息发送中...", { timeout = 1000, position = "bottom" })
           end
+        )
+        if not success then
+          print("⚠️  启动异步消息发送失败: " .. tostring(result))
+          M.show_floating_text("启动发送失败: " .. tostring(result), {
+            timeout = 3000,
+            position = "center",
+            border = "single",
+          })
+        else
+          M.show_floating_text("消息发送中...", { timeout = 1000, position = "bottom" })
         end
       end
     end,
@@ -1528,6 +1565,12 @@ function M.get_chat_buf()
   return state.chat_buf
 end
 
+--- 获取当前聊天窗口ID
+--- @return string|nil
+function M.get_current_window_id()
+  return state.current_window_id
+end
+
 --- 显示悬浮文本
 
 --- 加载消息数据（内部函数）
@@ -1537,13 +1580,11 @@ function M._load_messages(session_id)
   state.messages = {}
 
   -- 通过后端 chat_service 获取数据
-  local chat_service_ok, chat_service = pcall(require, "NeoAI.core.ai.chat_service")
-  if not chat_service_ok or not chat_service then
+  if not chat_service or not chat_service.is_initialized then
     return
   end
   -- 确保 chat_service 已初始化
   if not chat_service.is_initialized() then
-    local core = require("NeoAI.core")
     local config = core.get_config() or {}
     chat_service.initialize({ config = config })
   end
@@ -1661,10 +1702,7 @@ function M.close()
 
   -- 额外确保工具循环停止：如果当前有活跃的工具循环但 cancel_generation 未能覆盖
   --（例如 state.current_generation_id 为 nil 但工具循环仍在运行）
-  local tool_orchestrator_ok, tool_orchestrator = pcall(require, "NeoAI.core.ai.tool_orchestrator")
-  if tool_orchestrator_ok and tool_orchestrator then
-    tool_orchestrator.request_stop(closing_session_id)
-  end
+  tool_orchestrator.request_stop(closing_session_id)
 
   -- 延迟执行窗口关闭，给异步回调（如 _request_summary_round 的 defer_fn）一点时间完成
   -- 避免异步回调在窗口关闭后访问已清理的状态导致错误
@@ -1712,8 +1750,7 @@ function M.close()
     end
 
     -- 关闭思考过程悬浮窗
-    local reasoning_display_ok, reasoning_display = pcall(require, "NeoAI.ui.components.reasoning_display")
-    if reasoning_display_ok and reasoning_display.is_visible() then
+    if reasoning_display.is_visible() then
       reasoning_display.close()
     end
 
@@ -1763,9 +1800,8 @@ function M.close()
     completed_generations = {}
     -- 清理 file_utils 加载的后台 buffer
     pcall(function()
-      local fu = require("NeoAI.utils.file_utils")
-      if fu.cleanup_session_buffers then
-        fu.cleanup_session_buffers()
+      if file_utils.cleanup_session_buffers then
+        file_utils.cleanup_session_buffers()
       end
     end)
     state.closing = false
@@ -1955,7 +1991,6 @@ function M.send_message(message, callback)
   end
 
   -- 使用异步工作器发送消息，避免阻塞界面
-  local async_worker = require("NeoAI.utils.async_worker")
 
   -- 提交异步任务
   local task_id = async_worker.submit_task("send_chat_message_window", function()
@@ -2049,8 +2084,7 @@ end
 --- @param role string 角色 ('user' 或 'assistant')
 --- @param content string 消息内容
 function M._persist_message(role, content)
-  local chat_service_ok, chat_service = pcall(require, "NeoAI.core.ai.chat_service")
-  if not chat_service_ok or not chat_service then
+  if not chat_service or not chat_service.get_current_session then
     return
   end
   local session = chat_service.get_current_session()
@@ -2072,8 +2106,7 @@ end
 --- @param role string 角色 ('user' 或 'assistant')
 --- @param content string 新消息内容
 function M._update_persisted_message(role, content)
-  local chat_service_ok, chat_service = pcall(require, "NeoAI.core.ai.chat_service")
-  if not chat_service_ok or not chat_service then
+  if not chat_service or not chat_service.get_current_session then
     return
   end
   local session = chat_service.get_current_session()
@@ -2409,6 +2442,8 @@ function M._setup_event_listeners()
       M._update_usage_virt_text()
       -- 先主动检测光标位置，确保协程共享的 should_follow 是最新值
       _check_cursor_near_end()
+      -- 注意：直接使用模块级 state.should_follow，避免通过协程共享表读取
+      -- 事件回调不在协程上下文中，state_manager.get_shared_value 会返回默认值
       if state.should_follow then
         -- 光标在末尾附近：执行跟随并打开输入框
         _do_cursor_follow()
@@ -2458,8 +2493,10 @@ function M._setup_event_listeners()
       state.generation_in_progress = false
 
       M._update_usage_virt_text()
-      -- 先主动检测光标位置，确保协程共享的 should_follow 是最新值
+      -- 先主动检测光标位置
       _check_cursor_near_end()
+      -- 注意：直接使用模块级 state.should_follow，避免通过协程共享表读取
+      -- 事件回调不在协程上下文中，state_manager.get_shared_value 会返回默认值
       if state.should_follow then
         -- 光标在末尾附近：执行跟随并打开输入框
         _do_cursor_follow()
@@ -2590,14 +2627,12 @@ function M._setup_event_listeners()
       -- 等思考过程完毕后，再以折叠文本格式一次性追加到聊天缓冲区
       -- 解码 %%XX URL 编码（仅用于悬浮窗显示）
       if should_follow then
-        local ok_rd, rd = pcall(require, "NeoAI.ui.components.reasoning_display")
-        if ok_rd and rd.is_visible() then
-          local http_utils_ok, http_utils = pcall(require, "NeoAI.core.ai.http_utils")
+        if reasoning_display.is_visible() then
           local display_text = rc
-          if http_utils_ok and http_utils.decode_special_chars then
+          if http_utils.decode_special_chars then
             display_text = http_utils.decode_special_chars(display_text)
           end
-          rd.append(display_text)
+          reasoning_display.append(display_text)
         end
       end
     end,
@@ -2687,7 +2722,6 @@ function M._setup_event_listeners()
 
   -- 辅助：根据工具包分组重建显示 buffer（含子步骤树形显示）
   local function rebuild_tool_display_buffer()
-    local tool_pack = require("NeoAI.tools.tool_pack")
     local text = "🔧 工具调用中...\n"
     for _, pack_name in ipairs(state.tool_display.pack_order) do
       local pack = state.tool_display.packs[pack_name]
@@ -2980,7 +3014,6 @@ function M._setup_event_listeners()
       state.tool_display.substeps = {}
 
       -- 按工具包分组初始化
-      local tool_pack = require("NeoAI.tools.tool_pack")
       local grouped = data.tool_packs or tool_pack.group_by_pack(tool_calls)
       local pack_order = data.pack_order or {}
 
@@ -3264,7 +3297,6 @@ function M._setup_event_listeners()
         local folded_text = ""
         if #results > 0 then
           -- 按工具包分组构建折叠文本
-          local tool_pack = require("NeoAI.tools.tool_pack")
           local pack_results = {}
           local pack_order = {}
           for _, r in ipairs(results) do
@@ -3360,7 +3392,8 @@ function M._setup_event_listeners()
       -- 这些事件的处理函数中也会尝试打开输入框，但 _open_float_input 内部有 is_active 检查，不会重复打开
       M._open_float_input()
       -- 仅在光标跟随模式开启（光标在末尾附近）时才聚焦输入框
-      if virtual_input.is_active() and state.should_follow then
+      local chat_handlers = require("NeoAI.ui.handlers.chat_handlers")
+      if virtual_input.is_active() and chat_handlers.get_should_follow() then
         virtual_input.focus_and_insert()
       end
     end,
@@ -3435,9 +3468,8 @@ function M._setup_event_listeners()
           config.width = math.floor(total_cols * 0.8)
           config.col = math.floor((total_cols - config.width) / 2)
           local tool_row = 1
-          local ok, rd = pcall(require, "NeoAI.ui.components.reasoning_display")
-          if ok and rd.is_visible() then
-            local rwid = rd.get_window_id()
+          if reasoning_display.is_visible() then
+            local rwid = reasoning_display.get_window_id()
             if rwid then
               local rwin = window_manager.get_window_win(rwid)
               if rwin and vim.api.nvim_win_is_valid(rwin) then
@@ -3464,9 +3496,8 @@ function M._setup_event_listeners()
       end
 
       -- 调整虚拟输入框位置
-      local vi = require("NeoAI.ui.components.virtual_input")
-      if vi.is_active() then
-        vi.reposition()
+      if virtual_input.is_active() then
+        virtual_input.reposition()
       end
     end,
     desc = "窗口大小变化时调整工具调用悬浮窗和虚拟输入框位置",
@@ -3841,7 +3872,6 @@ function M._show_tool_display()
 
   -- 计算窗口位置：如果 reasoning_display 可见，在它下方堆叠
   local tool_row = 1
-  local reasoning_display = require("NeoAI.ui.components.reasoning_display")
   if reasoning_display.is_visible() then
     local reasoning_win_id = reasoning_display.get_window_id()
     if reasoning_win_id then
@@ -3933,7 +3963,6 @@ function M._update_tool_display()
   -- 设置按键映射（首次创建时设置，后续更新时跳过）
   if not window_info._keymaps_set then
     window_info._keymaps_set = true
-    local core = require("NeoAI.core")
     local full_config = core.get_config() or {}
     local chat_config = full_config.keymaps and full_config.keymaps.chat or {}
     if chat_config.quit and chat_config.quit.key then
@@ -3973,9 +4002,8 @@ function M._update_tool_display()
     config.col = math.floor((total_cols - config.width) / 2)
     -- 重新计算 row：在 reasoning 窗口下方堆叠
     local tool_row = 1
-    local ok, rd = pcall(require, "NeoAI.ui.components.reasoning_display")
-    if ok and rd.is_visible() then
-      local rwid = rd.get_window_id()
+    if reasoning_display.is_visible() then
+      local rwid = reasoning_display.get_window_id()
       if rwid then
         local rwin = window_manager.get_window_win(rwid)
         if rwin and vim.api.nvim_win_is_valid(rwin) then
@@ -4039,7 +4067,6 @@ function M._build_tool_folded_text(results)
   -- 如果在此处重复添加，会导致思考过程在缓冲区中渲染两遍。
 
   -- 按工具包分组
-  local tool_pack = require("NeoAI.tools.tool_pack")
   local pack_results = {}
   local pack_order = {}
   for _, r in ipairs(results) do
@@ -4122,7 +4149,6 @@ end
 --- 获取当前使用的模型标签
 --- @return string|nil 模型标签，如 "deepseek/deepseek-chat"
 function M._get_current_model_label()
-  local config_merger = require("NeoAI.core.config.merger")
   -- 使用 get_available_models 获取所有可用模型
   local models = config_merger.get_available_models("chat")
   local target = models[state.current_model_index]
@@ -4145,7 +4171,6 @@ function M.show_model_selector()
     return
   end
 
-  local config_merger = require("NeoAI.core.config.merger")
   -- 使用 get_available_models 获取所有可用模型（所有提供商，所有模型）
   local models = config_merger.get_available_models("chat")
 
@@ -4186,7 +4211,6 @@ function M.switch_to_model(model_index)
     return
   end
 
-  local config_merger = require("NeoAI.core.config.merger")
   -- 使用 get_available_models 获取所有可用模型
   local models = config_merger.get_available_models("chat")
   local target = models[model_index]

@@ -1,6 +1,7 @@
 local M = {}
 
 local core = require("NeoAI.core")
+local wm = require("NeoAI.ui.window.window_manager")
 
 -- 模块状态
 local state = {
@@ -115,7 +116,6 @@ function M.open(parent_win, opts)
   vim.api.nvim_set_option_value("modified", false, { buf = state.float_buf })
 
   -- 阻止 LSP 附加到浮动输入框
-  local wm = require("NeoAI.ui.window.window_manager")
   wm.block_lsp_for_buffer(state.float_buf, "浮动输入框")
 
   -- 设置提示符
@@ -178,7 +178,9 @@ function M.open(parent_win, opts)
   M._setup_vimresized_autocmd()
 
   -- 创建浮动窗口
-  state.float_win = vim.api.nvim_open_win(state.float_buf, opts.auto_focus ~= false, {
+  -- enter 参数与 auto_focus 一致：auto_focus=false 时不进入窗口，避免抢焦点和触发 WinEnter/BufEnter 事件
+  local enter_window = opts.auto_focus ~= false
+  state.float_win = vim.api.nvim_open_win(state.float_buf, enter_window, {
     relative = "editor",
     width = input_width,
     height = input_height,
@@ -195,8 +197,7 @@ function M.open(parent_win, opts)
   state._parent_buf = vim.api.nvim_win_get_buf(parent_win)
 
   -- 注册到 window_manager，以便切换 buffer 时自动隐藏/显示
-  local ok, wm = pcall(require, "NeoAI.ui.window.window_manager")
-  if ok and wm and wm.register_float_window then
+  if wm.register_float_window then
     wm.register_float_window(state._parent_buf, state.float_win, state.float_buf)
   end
 
@@ -311,7 +312,6 @@ function M.close(force)
   end
 
   -- 从 window_manager 注销（无需额外操作，后续会直接清理）
-  pcall(require, "NeoAI.ui.window.window_manager")
 
   -- 关闭浮动窗口
   if state.float_win and vim.api.nvim_win_is_valid(state.float_win) then
@@ -573,7 +573,6 @@ function M._setup_float_keymaps()
   local buf = state.float_buf
 
   -- 从配置读取 send 键位（send.insert / send.normal 是 { key = "...", desc = "..." } 结构）
-  local core = require("NeoAI.core")
   local full_config = core.get_config() or {}
   local send_config = full_config.keymaps and full_config.keymaps.chat and full_config.keymaps.chat.send
   local send_key = send_config and send_config.insert and send_config.insert.key or "<C-s>"
@@ -645,7 +644,6 @@ function M._bind_chat_keymaps_to_float(buf)
 
   -- 从配置中获取快捷键配置
   -- 所有键位统一由 default_config.lua 定义，模块内部不提供任何 fallback 默认值
-  local core = require("NeoAI.core")
   local full_config = core.get_config() or {}
   if not full_config or not full_config.keymaps or not full_config.keymaps.chat then
     return
@@ -954,7 +952,6 @@ function M.hide()
   end
 
   -- 使用 window_manager 的 hide_float_window 将窗口移到屏幕外
-  local wm = require("NeoAI.ui.window.window_manager")
   if state._parent_buf then
     wm.hide_float_window(state._parent_buf)
   end
@@ -978,7 +975,6 @@ function M.show()
   end
 
   -- 使用 window_manager 的 show_float_window 恢复窗口位置
-  local wm = require("NeoAI.ui.window.window_manager")
   if state._parent_buf then
     wm.show_float_window(state._parent_buf)
   end

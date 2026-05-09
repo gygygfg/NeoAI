@@ -7,7 +7,7 @@
 ---   协程上下文共享数据（session_id、ai_preset 等）通过 state_manager 访问
 
 local logger = require("NeoAI.utils.logger")
-local http_utils = require("NeoAI.core.ai.http_utils")
+local http_utils = require("NeoAI.utils.http_utils")
 
 -- ========== 闭包内私有状态 ==========
 local _tool_definitions = {}

@@ -887,7 +887,7 @@ end
 
 -- ========== 参数规范化（从 tool_orchestrator 迁移） ==========
 
-local http_utils = require("NeoAI.core.ai.http_utils")
+local http_utils = require("NeoAI.utils.http_utils")
 
 --- 解析并规范化工具参数
 --- 包含 URL 解码、JSON 解析、别名映射、简化参数格式转换
