@@ -887,13 +887,10 @@ end
 
 -- ========== 参数规范化（从 tool_orchestrator 迁移） ==========
 
-local http_utils = require("NeoAI.utils.http_utils")
-
 --- 解析并规范化工具参数
---- 包含 URL 解码、JSON 解析、别名映射、简化参数格式转换
---- 解析非标准格式的参数（按换行分割的 key: value 或 key = value 格式）
---- 兼容 AI 输出参数顺序错乱或 JSON 解析失败的情况
---- @param raw_arguments string 原始参数字符串
+--- arguments 已在 http_client 中解析为 Lua table
+--- 包含别名映射、简化参数格式转换
+--- @param raw_arguments table|string 原始参数
 --- @param props table 工具定义的属性名表
 --- @param tool_name string 工具名称（仅用于日志）
 --- @return table|nil 解析后的参数表，失败返回 nil
@@ -1000,106 +997,57 @@ function M._normalize_arguments(tool_name, raw_arguments)
   local props = tool_def and tool_def.parameters and tool_def.parameters.properties or {}
 
   -- ===== 参数解析 =====
-  -- encode_response_strings 不再编码 " 和 \，因此 arguments 中的 JSON 结构保持完整。
-  -- 控制字符和非法 UTF-8 仍被编码为 %XX，在最后步骤统一解码。
+  -- arguments 已在 http_client 中解析为 Lua table，直接使用
 
-  if type(raw_arguments) == "string" then
-    -- 策略 1：直接 JSON 解析（标准路径）
+  if type(raw_arguments) == "table" then
+    arguments = vim.deepcopy(raw_arguments)
+  elseif type(raw_arguments) == "string" then
+    -- 防御性：如果仍为字符串（历史消息），尝试 JSON 解析
     local ok, parsed = pcall(vim.json.decode, raw_arguments)
     if ok and type(parsed) == "table" then
       arguments = parsed
       changed = true
     else
-      -- 策略 2：解码后重试 JSON 解析（兼容旧数据中的 %XX 编码）
-      if raw_arguments:find("%%") then
-        local decoded = http_utils.decode_special_chars(raw_arguments)
-        local ok2, parsed2 = pcall(vim.json.decode, decoded)
-        if ok2 and type(parsed2) == "table" then
-          arguments = parsed2
+      -- 尝试修复被截断的 JSON
+      local fixed = raw_arguments
+      local repaired = false
+      local ok_check, _ = pcall(vim.json.decode, fixed)
+      if not ok_check then
+        local ends_with_quote = fixed:match('"$')
+        local ends_with_brace = fixed:match("}$")
+        if not ends_with_brace and not ends_with_quote then
+          fixed = fixed .. '"'
+          repaired = true
+        end
+        if not fixed:match("}$") then
+          local open_braces = select(2, fixed:gsub("{", ""))
+          local close_braces = select(2, fixed:gsub("}", ""))
+          if open_braces > close_braces then
+            fixed = fixed .. string.rep("}", open_braces - close_braces)
+            repaired = true
+          end
+        end
+      end
+      if repaired then
+        local ok3, parsed3 = pcall(vim.json.decode, fixed)
+        if ok3 and type(parsed3) == "table" then
+          logger.warn("[tool_executor] 工具 '%s' 的 arguments JSON 被截断，已修复", tool_name)
+          arguments = parsed3
           changed = true
         end
       end
-
       if not arguments or not next(arguments) then
-        -- 策略 3：尝试修复被截断的 JSON
-        local fixed = raw_arguments:find("%%") and http_utils.decode_special_chars(raw_arguments) or raw_arguments
-        local repaired = false
-
-        if raw_arguments:find("%%22") then
-          local ok_check, _ = pcall(vim.json.decode, fixed)
-          if not ok_check then
-            local ends_with_quote = fixed:match('"$')
-            local ends_with_brace = fixed:match("}$")
-            if not ends_with_brace and not ends_with_quote then
-              fixed = fixed .. '"'
-              repaired = true
-            end
-            if not fixed:match("}$") then
-              local open_braces = select(2, fixed:gsub("{", ""))
-              local close_braces = select(2, fixed:gsub("}", ""))
-              if open_braces > close_braces then
-                fixed = fixed .. string.rep("}", open_braces - close_braces)
-                repaired = true
-              end
-            end
-          end
-        end
-
-        if repaired then
-          local ok3, parsed3 = pcall(vim.json.decode, fixed)
-          if ok3 and type(parsed3) == "table" then
-            logger.warn(
-              "[tool_executor] _normalize_arguments: 工具 '%s' 的 arguments JSON 被截断，已修复: %s",
-              tool_name,
-              tostring(raw_arguments):sub(1, 100)
-            )
-            arguments = parsed3
-            changed = true
-          end
-        end
-
-        -- 策略 4：按换行分割，解析非标准 key=value 格式
-        -- 兼容 AI 输出参数顺序错乱或非 JSON 格式的情况
-        if not arguments or not next(arguments) then
-          arguments = M._parse_nonstandard_arguments(raw_arguments, props, tool_name)
-          if arguments and next(arguments) then
-            changed = true
-          else
-            logger.warn(
-              "[tool_executor] _normalize_arguments: 工具 '%s' 的 arguments 解析失败（所有策略均无效）: %s",
-              tool_name,
-              tostring(raw_arguments):sub(1, 300)
-            )
-            return { _raw = raw_arguments }, false
-          end
+        arguments = M._parse_nonstandard_arguments(raw_arguments, props, tool_name)
+        if arguments and next(arguments) then
+          changed = true
+        else
+          logger.warn("[tool_executor] 工具 '%s' 的 arguments 解析失败: %s", tool_name, tostring(raw_arguments):sub(1, 300))
+          return { _raw = raw_arguments }, false
         end
       end
     end
-  elseif type(raw_arguments) == "table" then
-    arguments = vim.deepcopy(raw_arguments)
   else
     return { _raw = tostring(raw_arguments) }, false
-  end
-
-  -- ===== 统一解码参数值中的 %%XX URL 编码 =====
-  -- 所有参数值中的 URL 编码在此统一解码
-  -- 注意：参数名（key）不会被编码，无需解码
-  for k, v in pairs(arguments) do
-    if type(v) == "string" and v:find("%%") then
-      arguments[k] = http_utils.decode_special_chars(v)
-    elseif type(v) == "table" then
-      -- 递归解码嵌套 table 中的字符串
-      local function decode_table(tbl)
-        for tk, tv in pairs(tbl) do
-          if type(tv) == "string" and tv:find("%%") then
-            tbl[tk] = http_utils.decode_special_chars(tv)
-          elseif type(tv) == "table" then
-            decode_table(tv)
-          end
-        end
-      end
-      decode_table(v)
-    end
   end
 
   -- ===== 通用参数规范化 =====

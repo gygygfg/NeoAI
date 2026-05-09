@@ -117,32 +117,45 @@ function M.encode_special_chars(str)
   return table.concat(result)
 end
 
---- 将 %%XX URL 编码的字符串解码回原始字符
---- @param str string
---- @return string
-function M.decode_special_chars(str)
-  if not str or str == "" then return str end
-  return str:gsub("%%(%x%x)", function(hex)
-    return string.char(tonumber(hex, 16))
-  end)
-end
-
---- 递归遍历数据结构，对所有字符串字段进行特殊字符编码
---- @param data table|string
---- @return table|string
-function M.encode_response_strings(data)
-  if type(data) == "string" then
-    return M.encode_special_chars(data)
-  end
-  if type(data) ~= "table" then return data end
-  for k, v in pairs(data) do
-    if type(v) == "string" then
-      data[k] = M.encode_special_chars(v)
-    elseif type(v) == "table" then
-      M.encode_response_strings(v)
+--- 解析 tool_calls 中的 arguments 字段（从 JSON 字符串转为 Lua table）
+--- 在 json.decode 后立即调用，确保后续代码直接操作 Lua 表
+--- @param tool_calls table|nil 工具调用列表
+--- @return table 处理后的工具调用列表
+function M.parse_tool_call_arguments(tool_calls)
+  if not tool_calls or #tool_calls == 0 then return tool_calls or {} end
+  for _, tc in ipairs(tool_calls) do
+    local func = tc["function"] or tc.func
+    if func and func.arguments and type(func.arguments) == "string" then
+      local ok, parsed = pcall(vim.json.decode, func.arguments)
+      if ok and type(parsed) == "table" then
+        func.arguments = parsed
+      end
+      -- 如果解析失败，保留原始字符串
     end
   end
-  return data
+  return tool_calls
+end
+
+--- 解析响应中所有 tool_calls 的 arguments（递归处理 choices）
+--- @param response table 已解码的响应
+--- @return table 处理后的响应
+function M.parse_response_tool_calls(response)
+  if not response or type(response) ~= "table" then return response end
+  if response.choices then
+    for _, choice in ipairs(response.choices) do
+      if choice.delta and choice.delta.tool_calls then
+        M.parse_tool_call_arguments(choice.delta.tool_calls)
+      end
+      if choice.message and choice.message.tool_calls then
+        M.parse_tool_call_arguments(choice.message.tool_calls)
+      end
+    end
+  end
+  -- 处理顶层 tool_calls（某些非标准响应）
+  if response.tool_calls then
+    M.parse_tool_call_arguments(response.tool_calls)
+  end
+  return response
 end
 
 -- ========== JSON 清理 ==========

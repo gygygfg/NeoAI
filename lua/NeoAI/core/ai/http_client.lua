@@ -16,14 +16,32 @@ local state = {
   request_counter = 0,
 }
 
--- 委托给 http_utils 的 _encode_special_chars / _decode_special_chars
--- 保持向后兼容
-M._encode_special_chars = http_utils.encode_special_chars
-M._decode_special_chars = http_utils.decode_special_chars
-M._encode_response_strings = http_utils.encode_response_strings
+-- 委托给 http_utils 的函数
 M._sanitize_json_body = http_utils.sanitize_json_body
 M._repair_orphan_tool_messages = http_utils.repair_orphan_tool_messages
 M._read_file = http_utils.read_file
+M._parse_response_tool_calls = http_utils.parse_response_tool_calls
+
+--- 将请求体中所有 tool_calls 的 arguments 从 Lua table 编码为 JSON 字符串
+--- 系统内部使用 Lua table 操作数据，发送给 API 前需要将 arguments 转为 JSON 字符串
+--- @param body table 请求体（会被原地修改）
+function M._encode_tool_call_arguments(body)
+  if not body or type(body) ~= "table" then return end
+  if not body.messages then return end
+  for _, msg in ipairs(body.messages) do
+    if msg.tool_calls then
+      for _, tc in ipairs(msg.tool_calls) do
+        local func = tc["function"] or tc.func
+        if func and func.arguments and type(func.arguments) == "table" then
+          local ok, encoded = pcall(vim.json.encode, func.arguments)
+          if ok then
+            func.arguments = encoded
+          end
+        end
+      end
+    end
+  end
+end
 
 function M.initialize(options)
   if state.initialized then
@@ -124,6 +142,8 @@ function M.send_request(params)
   M._repair_orphan_tool_messages(request)
 
   local transformed = request_adapter.transform_request(request, api_type, provider_config)
+  -- 将 tool_calls.arguments 从 Lua table 编码为 JSON 字符串（API 要求字符串格式）
+  M._encode_tool_call_arguments(transformed)
   local request_body = json.encode(transformed)
   request_body = M._sanitize_json_body(request_body)
   -- 调试：打印请求体中的 model 字段
@@ -186,6 +206,10 @@ function M.send_request(params)
     logger.debug("[http_client] JSON 解析失败: " .. (content:sub(1, 500)))
     return nil, "JSON parse failed"
   end
+  -- 立即解析 tool_calls 中的 arguments 为 Lua table
+  if type(response) == "table" then
+    M._parse_response_tool_calls(response)
+  end
   if response.error then
     local err_msg = response.error.message or json.encode(response.error)
     logger.debug("[http_client] API 错误: " .. err_msg)
@@ -195,6 +219,7 @@ function M.send_request(params)
       request.tool_choice = nil
       -- 重新构建请求体并重试
       local retry_transformed = request_adapter.transform_request(request, api_type, provider_config)
+      M._encode_tool_call_arguments(retry_transformed)
       local retry_body = json.encode(retry_transformed)
       retry_body = M._sanitize_json_body(retry_body)
       local retry_temp = vim.fn.tempname()
@@ -226,8 +251,10 @@ function M.send_request(params)
           if retry_response.error then
             return nil, retry_response.error.message or json.encode(retry_response.error)
           end
+          if type(retry_response) == "table" then
+            M._parse_response_tool_calls(retry_response)
+          end
           local retry_unified = request_adapter.transform_response(retry_response, api_type)
-          M._encode_response_strings(retry_unified)
           return retry_unified, nil
         end
       end
@@ -243,7 +270,6 @@ function M.send_request(params)
   end
 
   local unified = request_adapter.transform_response(response, api_type)
-  M._encode_response_strings(unified)
   return unified, nil
 end
 
@@ -285,6 +311,7 @@ function M.send_request_retry(params, on_complete)
   M._repair_orphan_tool_messages(request)
 
   local transformed = request_adapter.transform_request(request, api_type, provider_config)
+  M._encode_tool_call_arguments(transformed)
   local request_body = json.encode(transformed)
   request_body = M._sanitize_json_body(request_body)
 
@@ -326,6 +353,9 @@ function M.send_request_retry(params, on_complete)
     return nil
   end
 
+  -- 立即解析 tool_calls 中的 arguments 为 Lua table
+  M._parse_response_tool_calls(response)
+
   if response.error then
     local err_msg = response.error.message or json.encode(response.error)
     if on_complete then on_complete(nil, err_msg) end
@@ -338,7 +368,6 @@ function M.send_request_retry(params, on_complete)
   end
 
   local unified = request_adapter.transform_response(response, api_type)
-  M._encode_response_strings(unified)
   if on_complete then on_complete(unified, nil) end
   return nil
 end
@@ -429,6 +458,8 @@ function M.send_stream_request(params, on_chunk, on_complete, on_error)
 
   request.stream = true
   local transformed = request_adapter.transform_request(request, api_type, provider_config)
+  -- 将 tool_calls.arguments 从 Lua table 编码为 JSON 字符串（API 要求字符串格式）
+  M._encode_tool_call_arguments(transformed)
   local request_body = json.encode(transformed)
   request_body = M._sanitize_json_body(request_body)
   -- 调试：打印请求体中的 model 字段
@@ -490,9 +521,9 @@ function M.send_stream_request(params, on_chunk, on_complete, on_error)
           end
           return
         end
+        -- 立即解析 tool_calls 中的 arguments 为 Lua table
+        M._parse_response_tool_calls(data)
         local unified = request_adapter.transform_response(data, api_type)
-        -- 对响应内容中的控制字符和非法 UTF-8 进行 URL 编码
-        M._encode_response_strings(unified)
         if on_chunk then
           on_chunk(unified)
         end
@@ -810,6 +841,7 @@ function M.send_request_async(params, on_complete)
   M._repair_orphan_tool_messages(request)
 
   local transformed = request_adapter.transform_request(request, api_type, provider_config)
+  M._encode_tool_call_arguments(transformed)
   local ok_encode, request_body = pcall(json.encode, transformed)
   if ok_encode and request_body then
     request_body = M._sanitize_json_body(request_body)
@@ -952,6 +984,7 @@ function M.send_request_async(params, on_complete)
           request.tool_choice = nil
           -- 重新构建请求体并重试
           local retry_transformed = request_adapter.transform_request(request, api_type, provider_config)
+          M._encode_tool_call_arguments(retry_transformed)
           local retry_ok_encode, retry_body = pcall(json.encode, retry_transformed)
           if retry_ok_encode and retry_body then
             retry_body = M._sanitize_json_body(retry_body)
@@ -1030,7 +1063,6 @@ function M.send_request_async(params, on_complete)
 
                 if on_complete then
                   local retry_unified = request_adapter.transform_response(retry_response, api_type)
-                  M._encode_response_strings(retry_unified)
                   vim.schedule(function()
                     on_complete(retry_unified, nil)
                   end)
@@ -1056,7 +1088,6 @@ function M.send_request_async(params, on_complete)
 
       if on_complete then
         local unified = request_adapter.transform_response(response, api_type)
-        M._encode_response_strings(unified)
         vim.schedule(function()
           on_complete(unified, nil)
         end)

@@ -7,7 +7,6 @@
 ---   协程上下文共享数据（session_id、ai_preset 等）通过 state_manager 访问
 
 local logger = require("NeoAI.utils.logger")
-local http_utils = require("NeoAI.utils.http_utils")
 
 -- ========== 闭包内私有状态 ==========
 local _tool_definitions = {}
@@ -100,7 +99,11 @@ function M.format_messages(messages)
   for _, msg in ipairs(messages) do
     local fm = { role = msg.role or "user" }
     if msg.content then fm.content = type(msg.content) == "table" and msg.content or tostring(msg.content) end
-    if msg.tool_calls then fm.tool_calls = msg.tool_calls end
+    if msg.tool_calls then
+      -- tool_calls 中的 arguments 在整个系统内部保持 Lua table 形式
+      -- http_client 发送前会统一编码为 JSON 字符串
+      fm.tool_calls = msg.tool_calls
+    end
     if msg.role == "tool" then
       if msg.tool_call_id and msg.tool_call_id ~= "" then
         fm.tool_call_id = msg.tool_call_id
@@ -183,18 +186,9 @@ function M.build_request(params)
   local options = params.options or {}
   local session_id = params.session_id
 
-  -- 解码消息中的 %%XX URL 编码
-  -- encode_response_strings 只编码控制字符和非法 UTF-8 字节，不再编码 " 和 \
-  -- 因此 content/reasoning_content 中的控制字符需要解码回原始值
-  -- tool_calls.arguments 中的 JSON 结构保持完整，无需解码
-  for _, msg in ipairs(messages) do
-    if msg.content and type(msg.content) == "string" and msg.content:find("%%") then
-      msg.content = http_utils.decode_special_chars(msg.content)
-    end
-    if msg.reasoning_content and type(msg.reasoning_content) == "string" and msg.reasoning_content:find("%%") then
-      msg.reasoning_content = http_utils.decode_special_chars(msg.reasoning_content)
-    end
-  end
+  -- 消息中的 content/reasoning_content 已直接来自 json.decode 的原始值
+  -- tool_calls.arguments 已在 http_client 中解析为 Lua table
+  -- 无需额外的 URL 解码
 
   tool_call_counter = tool_call_counter + 1
   local generation_id = params.generation_id

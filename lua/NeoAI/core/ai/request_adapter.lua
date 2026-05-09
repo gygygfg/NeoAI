@@ -139,13 +139,13 @@ M.register_adapter("anthropic", {
           end
 
           -- 添加 tool_use 块
+          -- arguments 已在 http_client 中解析为 Lua table
           for _, tc in ipairs(msg.tool_calls) do
             local tool_func = tc["function"] or tc.func
             local arguments = {}
             if tool_func and tool_func.arguments then
-              local ok, parsed = pcall(json.decode, tool_func.arguments)
-              if ok then
-                arguments = parsed
+              if type(tool_func.arguments) == "table" then
+                arguments = tool_func.arguments
               end
             end
 
@@ -261,10 +261,9 @@ M.register_adapter("anthropic", {
         if block.type == "text" then
           table.insert(text_parts, block.text or "")
         elseif block.type == "tool_use" then
-          local arguments_str = ""
-          if block.input then
-            local ok, encoded = pcall(json.encode, block.input)
-            arguments_str = ok and encoded or tostring(block.input)
+          local arguments_table = {}
+          if block.input and type(block.input) == "table" then
+            arguments_table = block.input
           end
 
           table.insert(tool_calls, {
@@ -272,7 +271,7 @@ M.register_adapter("anthropic", {
             type = "function",
             ["function"] = {
               name = block.name or "",
-              arguments = arguments_str,
+              arguments = arguments_table,
             },
           })
         end
@@ -407,13 +406,13 @@ M.register_adapter("google", {
           end
 
           -- 添加 functionCall
+          -- arguments 已在 http_client 中解析为 Lua table
           for _, tc in ipairs(msg.tool_calls) do
             local tool_func = tc["function"] or tc.func
             local args = {}
             if tool_func and tool_func.arguments then
-              local ok, parsed = pcall(json.decode, tool_func.arguments)
-              if ok then
-                args = parsed
+              if type(tool_func.arguments) == "table" then
+                args = tool_func.arguments
               end
             end
 
@@ -545,10 +544,9 @@ M.register_adapter("google", {
           if part.text then
             table.insert(text_parts, part.text)
           elseif part.functionCall then
-            local arguments_str = ""
-            if part.functionCall.args then
-              local ok, encoded = pcall(json.encode, part.functionCall.args)
-              arguments_str = ok and encoded or tostring(part.functionCall.args)
+            local arguments_table = {}
+            if part.functionCall.args and type(part.functionCall.args) == "table" then
+              arguments_table = part.functionCall.args
             end
 
             table.insert(tool_calls, {
@@ -556,7 +554,7 @@ M.register_adapter("google", {
               type = "function",
               ["function"] = {
                 name = part.functionCall.name or "",
-                arguments = arguments_str,
+                arguments = arguments_table,
               },
             })
           end

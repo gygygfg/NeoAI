@@ -35,6 +35,8 @@ function M.create_processor(generation_id, session_id, window_id)
 end
 
 --- 处理流式数据块
+--- 注意：tool_calls 中的 arguments 字段在 http_client 中已解析为 Lua table
+--- 流式场景中，每个数据块的 arguments 是部分 table，需要逐块合并
 function M.process_chunk(processor, data)
   if processor.is_finished then return nil end
   local result = { content = nil, reasoning_content = nil, tool_calls = nil, is_final = false }
@@ -58,7 +60,7 @@ function M.process_chunk(processor, data)
             local safe_id = tc.id or ("call_" .. os.time() .. "_" .. idx)
             processor.tool_calls[idx + 1] = {
               id = safe_id, type = tc.type or "function",
-              ["function"] = { name = "", arguments = "" },
+              ["function"] = { name = "", arguments = {} },
             }
           end
           local e = processor.tool_calls[idx + 1]
@@ -66,7 +68,24 @@ function M.process_chunk(processor, data)
           if tc.type then e.type = tc.type end
           if tc["function"] then
             if tc["function"].name then e["function"].name = e["function"].name .. tc["function"].name end
-            if tc["function"].arguments then e["function"].arguments = e["function"].arguments .. tc["function"].arguments end
+            -- arguments 在流式场景中可能是字符串片段（逐个字符传输）
+            -- 也可能是解析后的 Lua table（非流式或已解析的 chunk）
+            if tc["function"].arguments ~= nil then
+              if type(tc["function"].arguments) == "string" then
+                -- 流式场景：arguments 是逐个字符传输的 JSON 字符串片段
+                -- 需要拼接到累积的 arguments 字符串中
+                if type(e["function"].arguments) == "table" then
+                  -- 首次收到字符串参数，将初始空 table 转为空字符串
+                  e["function"].arguments = tc["function"].arguments
+                elseif type(e["function"].arguments) == "string" then
+                  e["function"].arguments = e["function"].arguments .. tc["function"].arguments
+                end
+              elseif type(tc["function"].arguments) == "table" then
+                for k, v in pairs(tc["function"].arguments) do
+                  e["function"].arguments[k] = v
+                end
+              end
+            end
           end
         end
         if #processor.tool_calls > 0 then result.tool_calls = vim.deepcopy(processor.tool_calls) end
@@ -79,7 +98,7 @@ function M.process_chunk(processor, data)
           local safe_id = tc.id or ("call_" .. os.time() .. "_" .. idx)
           processor.tool_calls[idx + 1] = {
             id = safe_id, type = tc.type or "function",
-            ["function"] = { name = "", arguments = "" },
+            ["function"] = { name = "", arguments = {} },
           }
         end
         local e = processor.tool_calls[idx + 1]
@@ -87,7 +106,20 @@ function M.process_chunk(processor, data)
         if tc.type then e.type = tc.type end
         if tc["function"] then
           if tc["function"].name then e["function"].name = tc["function"].name end
-          if tc["function"].arguments then e["function"].arguments = tc["function"].arguments end
+          -- arguments 在流式场景中可能是字符串片段
+          if tc["function"].arguments ~= nil then
+            if type(tc["function"].arguments) == "string" then
+              if type(e["function"].arguments) == "table" then
+                e["function"].arguments = tc["function"].arguments
+              elseif type(e["function"].arguments) == "string" then
+                e["function"].arguments = e["function"].arguments .. tc["function"].arguments
+              end
+            elseif type(tc["function"].arguments) == "table" then
+              for k, v in pairs(tc["function"].arguments) do
+                e["function"].arguments[k] = v
+              end
+            end
+          end
         end
       end
       if #processor.tool_calls > 0 then result.tool_calls = vim.deepcopy(processor.tool_calls) end
@@ -105,12 +137,21 @@ function M.process_chunk(processor, data)
 end
 
 --- 过滤无效工具调用（流式截断导致 name 为空或 arguments 为空）
+--- 同时将流式累积的字符串 arguments 解析为 Lua table
 function M.filter_valid_tool_calls(tool_calls)
   local valid = {}
   for _, tc in ipairs(tool_calls) do
     local func = tc["function"] or tc.func
     if func and func.name and func.name ~= "" then
       local args = func.arguments
+      -- 将流式累积的字符串 arguments 解析为 Lua table
+      if type(args) == "string" and args ~= "" then
+        local ok, parsed = pcall(vim.json.decode, args)
+        if ok and type(parsed) == "table" then
+          func.arguments = parsed
+          args = parsed
+        end
+      end
       if args ~= nil and args ~= "" then
         table.insert(valid, tc)
       end

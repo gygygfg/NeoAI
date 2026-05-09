@@ -12,7 +12,6 @@ local tool_pack = require("NeoAI.tools.tool_pack")
 local config_merger = require("NeoAI.core.config.merger")
 local async_worker = require("NeoAI.utils.async_worker")
 local core = require("NeoAI.core")
-local http_utils = require("NeoAI.utils.http_utils")
 local chat_service = require("NeoAI.core.ai.chat_service")
 local approval_config_editor = require("NeoAI.ui.components.approval_config_editor")
 local history_manager = require("NeoAI.core.history.manager")
@@ -822,25 +821,8 @@ function M._render_single_message(msg, prev_role)
     raw_content = ok and encoded or tostring(raw_content)
   end
 
-  -- 解码 %%XX URL 编码（由 http_client._encode_special_chars 编码的响应内容）
-  -- 使用 http_utils 替代 http_client 跨模块依赖
-  if http_utils.decode_special_chars then
-    local json_ok, parsed = pcall(vim.json.decode, raw_content)
-    if json_ok and type(parsed) == "table" then
-      if parsed.reasoning_content and type(parsed.reasoning_content) == "string" then
-        parsed.reasoning_content = http_utils.decode_special_chars(parsed.reasoning_content)
-      end
-      if parsed.content and type(parsed.content) == "string" then
-        parsed.content = http_utils.decode_special_chars(parsed.content)
-      end
-      local ok_re, re_encoded = pcall(vim.json.encode, parsed)
-      if ok_re then
-        raw_content = re_encoded
-      end
-    else
-      raw_content = http_utils.decode_special_chars(raw_content)
-    end
-  end
+  -- 响应内容已直接来自 json.decode，不再进行 %%XX URL 编码
+  -- 无需额外的解码操作
 
   -- 每轮对话之间添加分割线（user 消息前，且不是第一条消息）
   -- 注意：只在最后一条消息前添加分割线，由 _do_render_chat 统一处理
@@ -2625,14 +2607,10 @@ function M._setup_event_listeners()
       -- 仅在光标跟随模式下更新思考过程悬浮窗内容
       -- 注意：思考过程只在悬浮窗中滚动显示，不追加到聊天缓冲区
       -- 等思考过程完毕后，再以折叠文本格式一次性追加到聊天缓冲区
-      -- 解码 %%XX URL 编码（仅用于悬浮窗显示）
+      -- 响应内容已直接来自 json.decode，不再进行 %%XX URL 编码
       if should_follow then
         if reasoning_display.is_visible() then
-          local display_text = rc
-          if http_utils.decode_special_chars then
-            display_text = http_utils.decode_special_chars(display_text)
-          end
-          reasoning_display.append(display_text)
+          reasoning_display.append(rc)
         end
       end
     end,
@@ -2914,7 +2892,8 @@ function M._setup_event_listeners()
           end
           -- 累积 arguments（流式 chunks 会不断追加）
           if func.arguments then
-            preview.tools[tool_name].arguments = preview.tools[tool_name].arguments .. func.arguments
+            local args_str = type(func.arguments) == "table" and vim.json.encode(func.arguments) or func.arguments
+            preview.tools[tool_name].arguments = preview.tools[tool_name].arguments .. args_str
             -- 尝试解析累积的参数
             try_parse_streaming_args(preview.tools[tool_name])
           end

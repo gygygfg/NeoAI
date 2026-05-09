@@ -53,14 +53,12 @@ function M.get_sub_agent_id(tool_call)
   if not func then
     return nil
   end
+  -- arguments 已在 http_client 中解析为 Lua table
   local args = func.arguments or {}
-  if type(args) == "string" then
-    local ok, parsed = pcall(vim.json.decode, args)
-    if ok and type(parsed) == "table" then
-      args = parsed
-    end
+  if type(args) ~= "table" then
+    args = {}
   end
-  return args and args._sub_agent_id or nil
+  return args._sub_agent_id or nil
 end
 
 --- 标记工具调用属于某个子 agent（注入 _sub_agent_id）
@@ -70,14 +68,9 @@ function M.inject_sub_agent_id(tool_calls, sub_agent_id)
   for _, tc in ipairs(tool_calls) do
     local func = tc["function"] or tc.func
     if func then
+      -- arguments 已在 http_client 中解析为 Lua table
       local args = func.arguments
-      if type(args) == "string" then
-        local ok, parsed = pcall(vim.json.decode, args)
-        if ok and type(parsed) == "table" then
-          parsed._sub_agent_id = sub_agent_id
-          func.arguments = vim.json.encode(parsed)
-        end
-      elseif type(args) == "table" then
+      if type(args) == "table" then
         args._sub_agent_id = sub_agent_id
       end
     end
@@ -196,14 +189,10 @@ function M._execute_single_tool(sub_agent_id, tool_call)
   runner.active_tool_calls[tool_call_id] = true
 
   -- ===== 边界审核 =====
+  -- arguments 已在 http_client 中解析为 Lua table
   local args = func.arguments or {}
-  if type(args) == "string" then
-    local ok, parsed = pcall(vim.json.decode, args)
-    if ok and type(parsed) == "table" then
-      args = parsed
-    else
-      args = {}
-    end
+  if type(args) ~= "table" then
+    args = {}
   end
 
   local allowed, reason = M.review_tool_call(sub_agent_id, tool_name, args)

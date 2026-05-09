@@ -173,15 +173,13 @@ local function has_abnormal_tool_calls(tool_calls)
     return false
   end
 
-  -- 检查是否有空参数的工具调用（仅检测真正为空的参数，不检测 JSON 空对象 "{}"）
+  -- 检查是否有空参数的工具调用
+  -- arguments 已在 http_client 中解析为 Lua table
   for i, tc in ipairs(tool_calls) do
     local func = tc["function"] or tc.func
     if func then
       local args = func.arguments
-      local args_type = type(args)
-      local args_str = tostring(args)
-      -- 只检测真正为空的情况：nil、空字符串、或空 table
-      -- 注意："{}"（JSON 空对象）是合法参数，表示一个空参数对象
+      -- 只检测真正为空的情况：nil 或空 table
       if args == nil then
         logger.debug(
           string.format(
@@ -192,17 +190,7 @@ local function has_abnormal_tool_calls(tool_calls)
         )
         return true
       end
-      if args_type == "string" and args == "" then
-        logger.debug(
-          string.format(
-            "[response_retry] 检测到空参数工具调用 #%d: name=%s, args='' (空字符串)",
-            i,
-            tostring(func.name)
-          )
-        )
-        return true
-      end
-      if args_type == "table" and vim.tbl_isempty(args) then
+      if type(args) == "table" and vim.tbl_isempty(args) then
         logger.debug(
           string.format(
             "[response_retry] 检测到空参数工具调用 #%d: name=%s, args={} (空 table)",
@@ -217,17 +205,13 @@ local function has_abnormal_tool_calls(tool_calls)
 
   -- 检查是否有完全相同的重复调用（同名 + 同参数）
   -- 注意：仅同名但参数不同的多次调用（如多次 read_file 读取不同文件）是正常行为
+  -- arguments 已是 Lua table，直接使用 vim.inspect 生成签名
   local seen_signatures = {}
   for i, tc in ipairs(tool_calls) do
     local func = tc["function"] or tc.func
     if func and func.name then
       local args = func.arguments
-      local args_str
-      if type(args) == "table" then
-        args_str = vim.inspect(args)
-      else
-        args_str = tostring(args or "")
-      end
+      local args_str = (type(args) == "table") and vim.inspect(args) or tostring(args or "")
       local signature = func.name .. ":" .. args_str
       if seen_signatures[signature] then
         logger.debug(
