@@ -17,8 +17,8 @@ local approval_config_editor = require("NeoAI.ui.components.approval_config_edit
 local history_manager = require("NeoAI.core.history.manager")
 local tool_orchestrator = require("NeoAI.core.ai.tool_orchestrator")
 -- 所有悬浮窗组件通过 window_manager 和 window/components 管理
-local reasoning_display = require("NeoAI.ui.window.components.reasoning_display")
-local tool_display_component = require("NeoAI.ui.window.components.tool_display")
+local reasoning_display = require("NeoAI.ui.components.reasoning_display")
+local tool_display_component = require("NeoAI.ui.components.tool_display")
 local file_utils = require("NeoAI.utils.file_utils")
 
 -- ========== 辅助函数（不依赖 state） ==========
@@ -2884,43 +2884,10 @@ function M._setup_event_listeners()
       state.tool_display.streaming_preview.generation_id = gen_id
       state.tool_display.streaming_preview.tools = tool_display_component.get_streaming_preview_tools()
 
-      -- 有累积增量数据时，用节流定时器追加到悬浮窗
-      local preview = state.tool_display.streaming_preview
-      if preview._pending_append ~= "" and not state.tool_display.active and not state.tool_display._finished then
-        if preview.timer then
-          preview.timer:again(60)
-        else
-          preview.timer = vim.uv.new_timer()
-          preview.timer:start(
-            60,
-            0,
-            vim.schedule_wrap(function()
-              preview.timer:stop()
-              preview.timer:close()
-              preview.timer = nil
-              local text = preview._pending_append
-              preview._pending_append = ""
-              if text == "" or state.tool_display.active or state.tool_display._finished then
-                return
-              end
-              local win = get_win()
-              if not cursor_near_end(win) then
-                return
-              end
-              state.should_follow = true
-
-              if not preview.window_shown then
-                preview.window_shown = true
-                tool_display_component.show_preview()
-                state.tool_display.preview_window_id = tool_display_component.get_preview_window_id()
-                _schedule_cursor_follow(150)
-              elseif state.tool_display.preview_window_id then
-                tool_display_component.append_preview(text)
-              end
-            end)
-          )
-        end
-      end
+      -- 委托 tool_display_component 处理节流和预览窗口显示
+      -- 注意：_pending_append 由 tool_display_component.update_streaming_tools 内部累积
+      -- 不能直接检查 chat_window 本地状态的 _pending_append（两者不同步）
+      tool_display_component.schedule_preview_update()
     end,
   })
 

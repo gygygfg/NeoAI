@@ -1,22 +1,30 @@
 ---@module "NeoAI.ui.components.pty_terminal"
---- PTY 终端浮动窗口组件
---- 所有窗口创建/销毁均通过 window_manager 管理
---- 自动跟随工具调用悬浮窗布局变化
+--- PTY 终端浮动窗口组件（纯 UI 层）
+--- 负责 PTY 浮动窗口的创建、关闭、重新定位
+--- 提供同步接口，供后端将隐藏 termopen buffer 内容同步到前台浮动窗口
+---
+--- 后端逻辑（隐藏 buffer 创建、termopen 调用、进程管理）在 tools/builtin/shell_tools.lua
 
 local M = {}
 
 local window_manager = require("NeoAI.ui.window.window_manager")
 
+-- ============================================================================
+-- 内部状态
+-- ============================================================================
 local state = {
   initialized = false,
   config = nil,
-  window_id = nil, -- window_manager 管理的窗口 ID
+  window_id = nil, -- window_manager 管理的窗口 ID（前台浮动窗口）
   session_id = nil,
-  pty_buf = nil,
 }
 
 local function buf_valid(buf) return buf and vim.api.nvim_buf_is_valid(buf) end
 local function win_valid(win) return win and vim.api.nvim_win_is_valid(win) end
+
+-- ============================================================================
+-- 布局计算
+-- ============================================================================
 
 --- 获取屏幕尺寸
 local function get_screen_dimensions()
@@ -62,7 +70,60 @@ local function calculate_layout()
   return { width = right_width, height = win_height, row = win_row, col = right_col }
 end
 
---- 初始化
+-- ============================================================================
+-- ANSI 转义码清理
+-- ============================================================================
+
+--- 剥离 ANSI 转义码
+--- @param text string 原始文本
+--- @return string 清理后的纯文本
+function M.strip_ansi(text)
+  if not text then return "" end
+  local cleaned = text
+  cleaned = cleaned:gsub("\027%[[a-zA-Z]", "")
+  cleaned = cleaned:gsub("\027%[%?[a-zA-Z]", "")
+  cleaned = cleaned:gsub("\027%[%d+[a-zA-Z]", "")
+  cleaned = cleaned:gsub("\027%[%?%d+[a-zA-Z]", "")
+  for num_semicolons = 50, 1, -1 do
+    local parts = {}
+    for _ = 1, num_semicolons + 1 do
+      table.insert(parts, "%d+")
+    end
+    cleaned = cleaned:gsub("\027%[" .. table.concat(parts, ";") .. "[a-zA-Z]", "")
+  end
+  for num_semicolons = 50, 1, -1 do
+    local parts = {}
+    for _ = 1, num_semicolons + 1 do
+      table.insert(parts, "%d+")
+    end
+    cleaned = cleaned:gsub("\027%[%?" .. table.concat(parts, ";") .. "[a-zA-Z]", "")
+  end
+  cleaned = cleaned:gsub("\027%][^\007\027]*[\007\027\\]", "")
+  return cleaned
+end
+
+-- ============================================================================
+-- 前台/后台同步接口
+-- ============================================================================
+
+--- 将内容同步到前台浮动窗口
+--- 供后端在隐藏 buffer 内容变化时调用
+--- @param lines table 要同步的行列表
+function M.sync_content(lines)
+  if not state.window_id then return end
+  local front_buf = window_manager.get_window_buf(state.window_id)
+  if not front_buf or not buf_valid(front_buf) then return end
+  pcall(vim.api.nvim_set_option_value, "modifiable", true, { buf = front_buf })
+  pcall(vim.api.nvim_buf_set_lines, front_buf, 0, -1, false, lines)
+  pcall(vim.api.nvim_set_option_value, "modifiable", false, { buf = front_buf })
+end
+
+-- ============================================================================
+-- 初始化
+-- ============================================================================
+
+--- 初始化组件
+--- @param config table|nil 配置
 function M.initialize(config)
   if state.initialized then return end
   state.config = config or {}
@@ -80,16 +141,18 @@ function M.initialize(config)
   })
 end
 
---- 打开 PTY 终端窗口
+-- ============================================================================
+-- 窗口管理
+-- ============================================================================
+
+--- 打开 PTY 终端窗口（前台浮动窗口）
 --- @param session_id string 会话 ID
---- @param pty_buf number|nil 已有的 PTY buffer
---- @return number|nil 窗口句柄
-function M.open(session_id, pty_buf)
+--- @return table|nil { win = number, buf = number, window_id = string }
+function M.open(session_id)
   if not state.initialized then return nil end
   M.close()
 
   local layout = calculate_layout()
-  local total_cols, _ = get_screen_dimensions()
 
   local tool_border = {
     { "╭", "FloatBorder" }, { "─", "FloatBorder" }, { "╮", "FloatBorder" },
@@ -102,7 +165,6 @@ function M.open(session_id, pty_buf)
     width = layout.width, height = layout.height,
     border = tool_border, style = "minimal", relative = "editor",
     row = layout.row, col = layout.col, zindex = 150, window_mode = "float",
-    _pty_buf = pty_buf,
   })
 
   if not state.window_id then return nil end
@@ -122,7 +184,7 @@ function M.open(session_id, pty_buf)
     end, { buffer = buf, noremap = true, silent = true, desc = "关闭终端窗口" })
   end
 
-  return win
+  return { win = win, buf = buf, window_id = state.window_id }
 end
 
 --- 关闭 PTY 终端窗口
@@ -132,7 +194,6 @@ function M.close()
     state.window_id = nil
   end
   state.session_id = nil
-  state.pty_buf = nil
 end
 
 --- 重新定位（窗口大小变化时调用）
@@ -148,9 +209,28 @@ function M.reposition()
   })
 end
 
+--- 获取当前布局信息
+--- @return table|nil { width, height, row, col }
+function M.get_layout()
+  if not state.window_id then return nil end
+  local win = window_manager.get_window_win(state.window_id)
+  if not win or not win_valid(win) then return nil end
+  return vim.api.nvim_win_get_config(win)
+end
+
+-- ============================================================================
+-- 查询接口
+-- ============================================================================
+
 function M.is_open() return state.window_id ~= nil end
 function M.get_window_id() return state.window_id end
 function M.get_session_id() return state.session_id end
+function M.get_win() return state.window_id and window_manager.get_window_win(state.window_id) or nil end
+function M.get_buf() return state.window_id and window_manager.get_window_buf(state.window_id) or nil end
+
+-- ============================================================================
+-- 配置
+-- ============================================================================
 
 --- 更新配置
 function M.update_config(new_config)

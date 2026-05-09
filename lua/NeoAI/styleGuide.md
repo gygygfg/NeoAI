@@ -1165,6 +1165,289 @@ end)
 
 ---
 
+## 代码风格约定
+
+### 1. 模块结构
+
+每个 Lua 模块遵循统一的组织结构：
+
+```lua
+--- 模块描述（LuaDoc 风格）
+--- 职责：xxx
+
+local M = {}
+
+local xxx = require("NeoAI.module.xxx")  -- 依赖导入（按文件名排序）
+
+-- ========== 闭包内私有状态 ==========
+local state = {
+  initialized = false,
+  -- 其他状态字段
+}
+
+-- ========== 辅助函数 ==========
+
+local function _helper_func(...)
+  -- ...
+end
+
+-- ========== 初始化 ==========
+
+function M.initialize(options)
+  if state.initialized then return M end  -- 幂等保护
+  -- ...
+end
+
+-- ========== 公共 API ==========
+
+function M.public_func(...)
+  -- ...
+end
+
+return M
+```
+
+**规则**：
+- 文件顶部使用 `---` LuaDoc 注释描述模块职责
+- `local M =` 作为公共接口表
+- `require` 按模块名称字母顺序排列
+- 使用 `-- ========== 区域标题 ==========` 划分代码区域（等号数量与标题等长）
+- 私有状态放在模块级闭包变量中（`local state`，`local _xxx`）
+- 私有函数以下划线 `_` 或 `local function` 标识
+- 结尾 `return M`
+
+### 2. 命名规范
+
+| 类别 | 规范 | 示例 |
+|------|------|------|
+| 模块公共接口表 | `M` | `local M =` |
+| 公共函数 | 驼峰式 | `function M.generate_response()` |
+| 私有函数 | 下划线前缀 + 驼峰 | `local function _handle_stream_chunk()` |
+| 局部变量 | snake_case | `local session_id`, `local tool_name` |
+| 全局常量 | 大写+下划线 | `LOG_LEVELS`, `VALID_ENUMS` |
+| 事件常量 | 大写+下划线 | `GENERATION_STARTED`, `STREAM_CHUNK` |
+| 事件名模式串 | `NeoAI:xxx_xxx` | `"NeoAI:generation_started"` |
+| 闭包状态表 | `state` | `local state = { initialized = false }` |
+| 模块级私有变量 | `_` 前缀 | `local _tools =`, `local _config = nil` |
+| 布尔查询函数 | `is_xxx` / `has_xxx` | `is_initialized()`, `has_file_changed()` |
+
+### 3. LuaDoc 注释规范
+
+使用 emmyLua 风格的 `---` 注释，以下是标准格式：
+
+```lua
+--- 函数描述（简短说明功能）
+--- @param param1 type 参数1说明
+--- @param param2 type|nil 可选参数说明
+--- @return type 返回值说明
+function M.some_function(param1, param2)
+  -- ...
+end
+```
+
+**规则**：
+- 公共函数必须有 LuaDoc 注释
+- 参数类型使用 Lua 类型名（`string`, `number`, `boolean`, `table`, `function`, `nil`）
+- 复合类型用 `|` 分隔：`string|nil`
+- 表类型可标注字段：`table { key = type, ... }`
+- 私有函数可根据复杂程度选择性添加 LuaDoc
+- 内部辅助函数使用 `--` 单行注释
+
+### 4. 注释风格
+
+```lua
+-- 文件顶部：模块功能描述
+--- NeoAI 核心模块入口
+--- 职责：初始化并统一导出核心子模块
+
+-- 区域分隔：等号数量与标题等长
+-- ========== 初始化 ==========
+-- ========== 公共 API ==========
+-- ========== 会话 CRUD ==========
+
+-- 代码行内注释：描述逻辑意图
+local warn_level = vim.log.levels and vim.log.levels.WARN or "WARN"  -- 兼容性保护
+
+-- 重要注释：使用 --- 突出
+--- 注意：状态切片功能已移除，各模块使用自己的闭包 state 表管理内部状态
+
+-- TODO/FIXME 标记
+-- TODO: 后续需要优化性能
+-- FIXME: 此处存在边界情况未处理
+```
+
+### 5. 模块初始化模式
+
+所有需要初始化的模块遵循统一模式：
+
+```lua
+local state = { initialized = false, config = nil }
+
+function M.initialize(options)
+  if state.initialized then return M end  -- 幂等保护
+  state.config = options or {}
+  -- 初始化逻辑
+  state.initialized = true
+  return M
+end
+
+-- 守卫函数（可选）
+local function guard()
+  if not state.initialized then
+    error("模块未初始化，请先调用 M.initialize()")
+  end
+end
+```
+
+### 6. 错误处理
+
+```lua
+-- 跨模块调用使用 pcall 保护
+local ok, result = pcall(require, "NeoAI.some.module")
+if not ok then
+  logger.error("加载失败: " .. tostring(result))
+  return fallback_value
+end
+
+-- 用户通知使用 vim.notify
+vim.notify("[NeoAI] 消息内容", vim.log.levels.WARN)
+
+-- 日志记录
+logger.info("格式化消息: %s %d", string_var, num_var)
+logger.debug("[模块名] 调试信息")
+logger.error("错误信息: " .. tostring(err))
+```
+
+### 7. 工具模块约定
+
+每个内置工具模块遵循的约定：
+
+```lua
+-- 文件顶部描述
+-- Lua xxx 工具模块
+-- 工具函数签名：func(args, on_success, on_error)
+
+local M = {}
+
+local define_tool = require("NeoAI.tools.builtin.tool_helpers").define_tool
+
+-- 工具定义
+function M.get_tools()
+  return {
+    define_tool({
+      name = "tool_name",
+      description = "工具描述",
+      category = "file",  -- 分类：file/lsp/treesitter/log/system/plan
+      parameters = {
+        type = "object",
+        properties = {
+          param1 = { type = "string", description = "参数描述" },
+        },
+        required = { "param1" },
+      },
+      func = function(args, on_success, on_error)
+        -- 异步实现，通过回调返回结果
+      end,
+      approval = {
+        auto_allow = true,  -- true=自动允许，false=需用户审批
+      },
+    }),
+  }
+end
+
+return M
+```
+
+### 8. 事件定义与使用
+
+```lua
+-- core/events.lua 中统一定义
+local M = {}
+M.GENERATION_STARTED = "NeoAI:generation_started"
+-- 使用位置注释：-- 使用位置: ai_engine.lua, chat_window.lua
+
+-- 触发事件
+vim.api.nvim_exec_autocmds("User", {
+  pattern = Events.GENERATION_STARTED,
+  data = { session_id = sid, generation_id = gid },
+})
+
+-- 或使用辅助函数
+state_manager.fire_event(Events.GENERATION_STARTED, { session_id = sid })
+
+-- 监听事件
+vim.api.nvim_create_autocmd("User", {
+  pattern = Events.STREAM_CHUNK,
+  callback = function(args)
+    local data = args.data
+    -- 处理事件
+  end,
+})
+```
+
+### 9. 文件与目录命名
+
+| 类别 | 规范 | 示例 |
+|------|------|------|
+| 文件名 | snake_case | `ai_engine.lua`, `tool_registry.lua` |
+| 目录名 | 小写英文 | `core/`, `tools/`, `builtin/` |
+| 测试文件 | `test_` 前缀 | `test_ai_core.lua`, `test_tools.lua` |
+| 内置工具模块 | 语义化名称 | `file_tools.lua`, `shell_tools.lua` |
+| 配置文件 | 全小写 | `default_config.lua` |
+
+### 10. 异步回调模式
+
+工具和 I/O 操作使用回调模式，不阻塞主线程：
+
+```lua
+-- 异步工具函数签名
+-- func(args, on_success, on_error)
+
+local function my_tool(args, on_success, on_error)
+  vim.uv.fs_open(filepath, "r", 438, function(open_err, fd)
+    if open_err then
+      if on_error then on_error(open_err) end
+      return
+    end
+    -- 异步操作
+    if on_success then on_success(result) end
+  end)
+end
+```
+
+### 11. 模块间依赖原则
+
+```
+init.lua
+  ├── core/           ← 核心业务逻辑，不依赖 UI/tools
+  ├── ui/             ← UI 层，可依赖 core（通过 chat_service 间接）
+  ├── tools/          ← 工具系统，可依赖 core（通过 history_manager）
+  └── utils/          ← 工具库，不依赖任何其他模块
+```
+
+- `core/` 模块**不依赖** `ui/` 或 `tools/`
+- `ui/` 模块通过 `core/ai/chat_service` 与后端交互，不直接调用 `ai_engine` 或 `history_manager`
+- `tools/` 模块通过 `tool_registry` 注册，通过 `tool_executor` 执行
+- `utils/` 为纯工具函数，**不依赖**项目其他模块
+- 跨模块依赖统一使用 `pcall` 保护，避免加载失败导致崩溃
+
+### 12. 常用代码模式速查
+
+| 模式 | 代码 |
+|------|------|
+| 幂等初始化 | `if state.initialized then return M end` |
+| 守卫检查 | `if not state.initialized then error("...") end` |
+| 空表判断 | `if next(t) == nil then` |
+| 深拷贝 | `vim.deepcopy(obj)` |
+| 表合并 | `vim.tbl_extend("force", default, user)` |
+| 安全事件触发 | `pcall(vim.api.nvim_exec_autocmds, "User", { pattern = ..., data = ... })` |
+| 延迟执行 | `vim.schedule(function() ... end)` |
+| 字符串格式化 | `string.format("值: %s, 数量: %d", str, num)` |
+| 模块 require | `local xxx = require("NeoAI.模块路径")` |
+| 类型检查保护 | `vim.log.levels and vim.log.levels.WARN or "WARN"` |
+
+---
+
 ## 会话数据结构详解
 
 ### JSON 文件格式
@@ -1260,4 +1543,4 @@ end)
 
 ---
 
-*Last updated: 2026-05-09*
+*Last updated: 2026-06-16*

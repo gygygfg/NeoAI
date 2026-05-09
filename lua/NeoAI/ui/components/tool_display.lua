@@ -1,4 +1,4 @@
----@module "NeoAI.ui.window.components.tool_display"
+---@module "NeoAI.ui.components.tool_display"
 --- 工具调用悬浮窗组件
 --- 所有窗口创建/销毁均通过 window_manager 管理
 
@@ -251,11 +251,11 @@ local function _schedule_refresh()
   state._refresh_pending = true
   vim.schedule(function()
     state._refresh_pending = false
-    if not state.active then return end
+    if not state.active or not state.window_id then return end
     M._rebuild_buffer()
     M._sync_display()
     -- 检查是否所有工具都已完成，立即关闭
-    if M._all_tools_done() and state.window_id then
+    if M._all_tools_done() then
       M._close_display()
     end
   end)
@@ -311,7 +311,7 @@ function M.show_display()
   local tool_row = 1
 
   -- 检查 reasoning_display 是否可见，在它下方堆叠
-  local ok_rd, rd = pcall(require, "NeoAI.ui.window.components.reasoning_display")
+  local ok_rd, rd = pcall(require, "NeoAI.ui.components.reasoning_display")
   if ok_rd and rd.is_visible and rd.is_visible() then
     local rwid = rd.get_window_id and rd.get_window_id()
     if rwid then
@@ -366,6 +366,7 @@ end
 
 --- 关闭工具调用悬浮窗
 function M._close_display()
+  state.active = false
   if state.window_id then
     window_manager.close_window(state.window_id)
     state.window_id = nil
@@ -436,7 +437,7 @@ function M.show_preview()
   local tool_col = math.floor((total_cols - tool_width) / 2)
   local tool_row = 1
 
-  local ok_rd, rd = pcall(require, "NeoAI.ui.window.components.reasoning_display")
+  local ok_rd, rd = pcall(require, "NeoAI.ui.components.reasoning_display")
   if ok_rd and rd.is_visible and rd.is_visible() then
     local rwid = rd.get_window_id and rd.get_window_id()
     if rwid then
@@ -583,6 +584,23 @@ function M.schedule_preview_update()
   local preview = state.streaming_preview
   if preview._pending_append == "" or state.active or state._finished then return end
 
+  -- 检测光标是否在末尾附近，不在末尾附近时不显示预览窗口
+  local chat_window = require("NeoAI.ui.window.chat_window")
+  local win_id = chat_window.get_current_window_id()
+  if win_id then
+    local win_mgr = require("NeoAI.ui.window.window_manager")
+    local win = win_mgr.get_window_win(win_id)
+    if win and vim.api.nvim_win_is_valid(win) then
+      local cursor = vim.api.nvim_win_get_cursor(win)
+      local buf = vim.api.nvim_win_get_buf(win)
+      local total = vim.api.nvim_buf_line_count(buf)
+      if total - cursor[1] > 5 then
+        -- 光标不在末尾附近，不显示预览窗口，但保留累积数据
+        return
+      end
+    end
+  end
+
   if preview.timer then
     preview.timer:again(60)
   else
@@ -598,6 +616,9 @@ function M.schedule_preview_update()
       if not preview.window_shown then
         preview.window_shown = true
         M.show_preview()
+        -- 通知 chat_window 更新光标跟随状态
+        pcall(chat_window._set_cursor_follow_should, true)
+        pcall(chat_window._schedule_cursor_follow, 150)
       elseif state.preview_window_id then
         M.append_preview(text)
       end

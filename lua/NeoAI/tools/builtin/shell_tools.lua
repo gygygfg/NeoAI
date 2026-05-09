@@ -59,142 +59,16 @@ local sessions = {}
 local session_counter = 0
 
 -- ============================================================================
--- PTY 浮动窗口管理（通过 pty_terminal 组件）
+-- PTY 终端 UI 组件引用
 -- ============================================================================
--- 存储当前正在显示的 PTY 浮动窗口信息
--- 格式: { win_id = string, win = number, buf = number, session_id = string }
-local pty_float_window = nil
-
 --- 获取 pty_terminal 组件引用
-local function get_pty_terminal()
-  return require("NeoAI.ui.components.pty_terminal")
-end
+local pty_ui = require("NeoAI.ui.components.pty_terminal")
 
---- 获取屏幕尺寸信息
-local function get_screen_dimensions()
-  return vim.o.columns, vim.o.lines
-end
-
---- 检测工具调用悬浮窗的位置和尺寸
---- 通过 chat_window 模块获取工具调用窗口的配置信息
---- @return table|nil { width, height, row, col } 或 nil（无工具调用窗口时）
-local function get_tool_display_window_layout()
-  local ok, chat_window = pcall(require, "NeoAI.ui.window.chat_window")
-  if not ok then
-    return nil
-  end
-
-  local window_id = chat_window.get_tool_display_window_id()
-  if not window_id then
-    return nil
-  end
-
-  local ok2, window_manager = pcall(require, "NeoAI.ui.window.window_manager")
-  if not ok2 then
-    return nil
-  end
-
-  local win = window_manager.get_window_win(window_id)
-  if not win or not vim.api.nvim_win_is_valid(win) then
-    return nil
-  end
-
-  local config = vim.api.nvim_win_get_config(win)
-  if not config or not config.width or not config.height then
-    return nil
-  end
-
-  return {
-    width = config.width,
-    height = config.height,
-    row = config.row or 1,
-    col = config.col or 1,
-  }
-end
-
---- 根据工具调用窗口布局动态调整伪终端窗口的位置和大小
---- 伪终端窗口在工具调用窗口右侧对齐（顶部对齐、高度一致）
-local function update_pty_window_layout()
-  if not pty_float_window or not pty_float_window.win or not vim.api.nvim_win_is_valid(pty_float_window.win) then
-    return
-  end
-
-  local tool_layout = get_tool_display_window_layout()
-  if not tool_layout then
-    return
-  end
-
-  local total_cols, total_lines = get_screen_dimensions()
-
-  -- 工具调用窗口右侧起始列
-  local right_col = tool_layout.col + tool_layout.width + 1
-  -- 伪终端宽度：从工具窗口右侧到屏幕右边界
-  local right_width = total_cols - right_col - 1
-  if right_width < 20 then
-    right_width = 20
-    right_col = total_cols - right_width - 1
-  end
-
-  -- 顶部对齐，高度与工具调用窗口一致
-  local win_row = tool_layout.row
-  local win_height = tool_layout.height
-
-  -- 确保不超出屏幕底部（留底部状态栏空间）
-  if win_row + win_height > total_lines - 2 then
-    win_height = total_lines - 2 - win_row
-  end
-  if win_height < 5 then
-    win_height = 5
-  end
-
-  local config = vim.api.nvim_win_get_config(pty_float_window.win)
-  config.width = right_width
-  config.height = win_height
-  config.row = win_row
-  config.col = right_col
-  pcall(vim.api.nvim_win_set_config, pty_float_window.win, config)
-
-  -- 更新 PTY_CONFIG 供后续使用
-  PTY_CONFIG.width = right_width
-  PTY_CONFIG.height = win_height
-end
-
---- 关闭 PTY 浮动窗口
-local function close_pty_float_window()
-  local pty = get_pty_terminal()
-  pty.close()
-  pty_float_window = nil
-end
-
--- 伪终端配置（必须在 create_pty_float_window 之前定义，因为该函数会引用它）
+-- PTY 伪终端配置（仅后端参数，UI 相关配置由 pty_terminal 管理）
 local PTY_CONFIG = {
-  width = 80,
-  height = 24,
-  ansi = true,
-  env = vim.empty_dict(),
-  clear_env = false,
-  cwd = nil,
-  detach = false,
-  pty = true,
-  input = "pipe",
-  output = "pipe",
-  error = "pipe",
   check_interval = 100, -- 状态检查间隔（毫秒）
-  max_wait_time = 30, -- 等待输入的最大时间（秒）
   buffer_size = 1024 * 64, -- 64KB
 }
-
---- 创建右侧 PTY 浮动窗口（通过 pty_terminal 组件）
---- 优先检测工具调用窗口的位置，若存在则在其右侧对齐
-local function create_pty_float_window(session_id, pty_buf)
-  local pty = get_pty_terminal()
-  local win = pty.open(session_id, pty_buf)
-  if win then
-    -- 更新 PTY_CONFIG 宽高
-    local layout = require("NeoAI.ui.components.pty_terminal").reposition
-  end
-  return win
-end
 
 -- 进程状态监控器
 local ProcessMonitor = {}
@@ -472,48 +346,19 @@ end
 -- 模块级别的辅助函数（供 _send_input 和进程状态监控使用）
 -- ============================================================================
 
--- 剥离 ANSI 转义码（模块级别版本）
-local function _module_strip_ansi(text)
-  if not text then
-    return ""
-  end
-  local cleaned = text
-  cleaned = cleaned:gsub("\027%%[[a-zA-Z]", "")
-  cleaned = cleaned:gsub("\027%%[%%?[a-zA-Z]", "")
-  cleaned = cleaned:gsub("\027%%[%%d+[a-zA-Z]", "")
-  cleaned = cleaned:gsub("\027%%[%%?%%d+[a-zA-Z]", "")
-  for num_semicolons = 50, 1, -1 do
-    local parts = {}
-    for _ = 1, num_semicolons + 1 do
-      table.insert(parts, "%%d+")
-    end
-    cleaned = cleaned:gsub("\027%%[" .. table.concat(parts, ";") .. "[a-zA-Z]", "")
-  end
-  for num_semicolons = 50, 1, -1 do
-    local parts = {}
-    for _ = 1, num_semicolons + 1 do
-      table.insert(parts, "%%d+")
-    end
-    cleaned = cleaned:gsub("\027%%[%%?" .. table.concat(parts, ";") .. "[a-zA-Z]", "")
-  end
-  cleaned = cleaned:gsub("\027%%][^\007\027]*[\007\027\\]", "")
-  return cleaned
+-- 从隐藏 termopen buffer 中读取所有内容（含 ANSI 清理）
+-- 由于 _run_command 是异步的，session 在闭包中捕获，
+-- 此函数在 _run_command 内部定义，可以直接访问 session
+-- 模块级别的版本用于 _send_input（通过 session 参数获取隐藏 buffer）
+local function _read_hidden_buf_output(hidden_buf)
+  if not hidden_buf or not vim.api.nvim_buf_is_valid(hidden_buf) then return "" end
+  local ok, lines = pcall(vim.api.nvim_buf_get_lines, hidden_buf, 0, -1, false)
+  if not ok or not lines then return "" end
+  local raw = table.concat(lines, "\n")
+  return pty_ui.strip_ansi(raw)
 end
 
--- 从 PTY buffer 中读取所有内容（模块级别版本）
-local function _module_read_pty_buffer_output()
-  if not pty_float_window then
-    return ""
-  end
-  if pty_float_window and pty_float_window.buf and vim.api.nvim_buf_is_valid(pty_float_window.buf) then
-    local ok, lines = pcall(vim.api.nvim_buf_get_lines, pty_float_window.buf, 0, -1, false)
-    if ok and lines then
-      local raw = table.concat(lines, "\n")
-      return _module_strip_ansi(raw)
-    end
-  end
-  return ""
-end
+
 
 -- ============================================================================
 
@@ -580,8 +425,8 @@ local function _run_command(args, on_success, on_error, on_progress)
     input_callback = nil,
     exit_code = nil,
     exit_signal = nil,
-    pty_width = args.pty_width or PTY_CONFIG.width,
-    pty_height = args.pty_height or PTY_CONFIG.height,
+    pty_width = args.pty_width or 80,
+    pty_height = args.pty_height or 24,
     _cleaned_up = false, -- 防止重复清理的标志
     last_buffer_pos = 0, -- 上次已读取的 PTY buffer 位置（字节），用于增量读取
     interaction_round = 0, -- 交互轮次计数，每次触发 AI 输入决策时递增
@@ -617,8 +462,22 @@ local function _run_command(args, on_success, on_error, on_progress)
     session.timeout_check_round = 0
     session.timeout_stop_reason = nil
 
+    -- 停止同步定时器
+    if session._sync_timer then
+      if vim.fn.timer_info(session._sync_timer)[1] then
+        vim.fn.timer_stop(session._sync_timer)
+      end
+      session._sync_timer = nil
+    end
+
+    -- 删除隐藏 buffer
+    if session._hidden_buf and vim.api.nvim_buf_is_valid(session._hidden_buf) then
+      pcall(vim.api.nvim_buf_delete, session._hidden_buf, { force = true })
+    end
+    session._hidden_buf = nil
+
     -- 关闭 PTY 浮动窗口（pcall 保护，headless 模式下可能没有窗口）
-    pcall(close_pty_float_window)
+    pcall(pty_ui.close)
 
     -- 如果还有作业在运行，尝试停止
     if session.job_id and vim.fn.jobwait({ session.job_id }, 0)[1] == -1 then
@@ -632,9 +491,9 @@ local function _run_command(args, on_success, on_error, on_progress)
   -- ========================================================================
   -- 进程状态监控（独立线，每30秒请求AI判断命令是否卡住或已完成）
   -- ========================================================================
-  -- 读取当前 PTY buffer 输出，用于传递给 AI 做状态判断
+  -- 读取当前隐藏 buffer 输出，用于传递给 AI 做状态判断
   local function read_current_pty_output()
-    local full_buffer = _module_read_pty_buffer_output()
+    local full_buffer = _read_hidden_buf_output(session._hidden_buf)
     if full_buffer == "" then
       full_buffer = session.full_output
     end
@@ -825,7 +684,7 @@ local function _run_command(args, on_success, on_error, on_progress)
           end
 
           -- 关闭 PTY 浮动窗口
-          pcall(close_pty_float_window)
+          pcall(pty_ui.close)
 
           -- 返回结果（包含终止原因）
           local result_obj = {
@@ -855,63 +714,9 @@ local function _run_command(args, on_success, on_error, on_progress)
     end, { ["repeat"] = -1 })
   end
 
-  -- 剥离 ANSI 转义码
-  -- 注意：nvim_buf_get_lines 返回的已经是 Neovim 终端模拟器渲染后的纯文本
-  -- 此函数仅作为兜底，处理极少数可能残留的 ANSI 序列
-  local function strip_ansi(text)
-    if not text then
-      return ""
-    end
-    -- 移除所有 CSI 序列：ESC [ 可选? 可选数字 可选;数字... 以字母结尾
-    local cleaned = text
-    -- 模式1：ESC [ 字母（无参数，如 \027[H 光标归位）
-    cleaned = cleaned:gsub("\027%[[a-zA-Z]", "")
-    -- 模式2：ESC [ ? 字母（DEC私有模式，如 \027[?25l 隐藏光标）
-    -- 注意：? 在 Lua 模式匹配中是特殊字符，需要用 %? 转义
-    cleaned = cleaned:gsub("\027%[%?[a-zA-Z]", "")
-    -- 模式3：ESC [ 数字 字母（如 \027[2J 清屏、\027[K 清除到行尾）
-    cleaned = cleaned:gsub("\027%[%d+[a-zA-Z]", "")
-    -- 模式4：ESC [ ? 数字 字母（DEC私有模式带参数）
-    cleaned = cleaned:gsub("\027%[%?%d+[a-zA-Z]", "")
-    -- 模式5：ESC [ 数字;数字;...;数字 字母（SGR等带分号序列）
-    -- 使用循环匹配 1 到 50 个分号
-    for num_semicolons = 50, 1, -1 do
-      local parts = {}
-      for _ = 1, num_semicolons + 1 do
-        table.insert(parts, "%d+")
-      end
-      cleaned = cleaned:gsub("\027%[" .. table.concat(parts, ";") .. "[a-zA-Z]", "")
-    end
-    -- 模式6：ESC [ ? 数字;数字;...;数字 字母（DEC私有模式带分号）
-    for num_semicolons = 50, 1, -1 do
-      local parts = {}
-      for _ = 1, num_semicolons + 1 do
-        table.insert(parts, "%d+")
-      end
-      cleaned = cleaned:gsub("\027%[%?" .. table.concat(parts, ";") .. "[a-zA-Z]", "")
-    end
-    -- 移除 OSC 序列（ESC] 开头）
-    cleaned = cleaned:gsub("\027%][^\007\027]*[\007\027\\]", "")
-    return cleaned
-  end
-
-  -- 从 PTY buffer 中读取所有内容（解决 on_stdout 可能丢失无换行符数据的问题）
-  -- 直接返回整个 buffer 的纯文本内容
+  -- 从隐藏 termopen buffer 中读取所有内容
   local function read_pty_buffer_output()
-    -- 检查是否在 headless 模式（headless 模式下没有 PTY 浮动窗口）
-    if not pty_float_window then
-      return ""
-    end
-    -- 尝试从 PTY 浮动窗口的 buffer 中读取内容
-    if pty_float_window and pty_float_window.buf and vim.api.nvim_buf_is_valid(pty_float_window.buf) then
-      local ok, lines = pcall(vim.api.nvim_buf_get_lines, pty_float_window.buf, 0, -1, false)
-      if ok and lines then
-        local raw = table.concat(lines, "\n")
-        -- 去除 ANSI 转义码
-        return strip_ansi(raw)
-      end
-    end
-    return ""
+    return _read_hidden_buf_output(session._hidden_buf)
   end
 
   -- 发送输入到伪终端
@@ -1417,7 +1222,7 @@ local function _run_command(args, on_success, on_error, on_progress)
     else
       table.insert(session.stdout_data, data)
       -- 存储剥离 ANSI 码后的纯文本版本，用于传递给 AI
-      local clean_data = strip_ansi(data)
+      local clean_data = pty_ui.strip_ansi(data)
       session.full_output = session.full_output .. clean_data
     end
   end
@@ -1453,30 +1258,43 @@ local function _run_command(args, on_success, on_error, on_progress)
     local is_headless = #uis == 0
 
     -- 仅在非 headless 模式下创建 PTY 浮动窗口
-    local pty_win = nil
     if not is_headless then
-      pty_win = create_pty_float_window(session_id, nil)
-      if pty_win then
-        -- 将当前窗口切换到 PTY 浮动窗口，使 termopen 在其中创建终端
-        local ok, _ = pcall(vim.api.nvim_set_current_win, pty_win)
-        if not ok then
-          pty_win = nil
-        end
-      end
+      pty_ui.open(session_id)
     end
 
-    -- 配置伪终端选项
+    -- ================================================================
+    -- 创建隐藏 buffer 并在其上调用 termopen
+    -- ================================================================
+    -- 隐藏 buffer 永远是未修改的（modified=false），避免 termopen 的检查失败
+    -- 前台浮动窗口通过定时器同步隐藏 buffer 的内容
+    local hidden_buf = vim.api.nvim_create_buf(false, true)
+    vim.api.nvim_set_option_value("modified", false, { buf = hidden_buf })
+    vim.api.nvim_set_option_value("buftype", "nofile", { buf = hidden_buf })
+    vim.api.nvim_set_option_value("swapfile", false, { buf = hidden_buf })
+    vim.api.nvim_set_option_value("bufhidden", "hide", { buf = hidden_buf })
+
+    -- 保存当前窗口
+    local saved_win = vim.api.nvim_get_current_win()
+
+    -- 创建临时窗口使 termopen 能在隐藏 buffer 上运行
+    local temp_win = vim.api.nvim_open_win(hidden_buf, true, {
+      relative = "editor",
+      width = 1, height = 1,
+      row = -100, col = -100,
+      style = "minimal",
+      noautocmd = true,
+    })
+
+    -- termopen 选项
     local term_opts = {
       cwd = cwd,
-      env = PTY_CONFIG.env,
+      env = vim.empty_dict(),
       width = session.pty_width,
       height = session.pty_height,
-      pty = PTY_CONFIG.pty,
       on_stdout = function(_, data, _)
         if data then
           for _, line in ipairs(data) do
             if line then
-              -- 注意：不丢弃空行，因为 read -p 的提示信息可能以空行形式出现在伪终端输出中
               handle_output(line, false)
             end
           end
@@ -1492,18 +1310,19 @@ local function _run_command(args, on_success, on_error, on_progress)
         end
       end,
       on_exit = function(_, exit_code, signal)
-        -- 修正退出码：termopen 下进程被 SIGHUP(1) 终止时退出码为 129
-        -- 这是因为 Neovim 终端在进程退出后会向进程组发送 SIGHUP
-        -- 对于非交互式命令，这通常不是真正的错误
+        -- 停止同步定时器
+        if sync_timer then
+          if vim.fn.timer_info(sync_timer)[1] then
+            vim.fn.timer_stop(sync_timer)
+          end
+          sync_timer = nil
+        end
+
+        -- 修正退出码
         local corrected_exit_code = exit_code
         local corrected_signal = signal
-
         if not is_headless then
-          -- 检查是否因 SIGHUP 导致退出码异常
-          -- termopen 的 on_exit 中：exit_code 可能是 129（128+1），signal 可能是 -1 或 1
-          -- 也可能是 exit_code=-1, signal=1
           if exit_code == 129 or (exit_code == -1 and signal == 1) then
-            -- 检查命令是否有正常输出，如果有则视为正常退出
             local has_output = #session.stdout_data > 0 or #session.stderr_data > 0
             if has_output then
               corrected_exit_code = 0
@@ -1516,10 +1335,10 @@ local function _run_command(args, on_success, on_error, on_progress)
         session.exit_signal = corrected_signal
         session.state = "finished"
 
-        -- 仅在非 headless 模式下延迟关闭 PTY 浮动窗口
+        -- 延迟关闭 PTY 浮动窗口
         if not is_headless then
           vim.defer_fn(function()
-            close_pty_float_window()
+            pty_ui.close()
           end, 1500)
         end
 
@@ -1543,66 +1362,47 @@ local function _run_command(args, on_success, on_error, on_progress)
       end,
     }
 
-    -- 根据 headless 模式选择不同的启动方式
-    local job_id
-    if is_headless then
-      -- headless 模式：使用 jobstart 替代 termopen
-      local headless_opts = {
-        cwd = cwd,
-        env = PTY_CONFIG.env,
-        on_stdout = function(_, data, _)
-          if data then
-            for _, line in ipairs(data) do
-              if line then
-                handle_output(line, false)
-              end
-            end
-          end
-        end,
-        on_stderr = function(_, data, _)
-          if data and capture_stderr then
-            for _, line in ipairs(data) do
-              if line then
-                handle_output(line, true)
-              end
-            end
-          end
-        end,
-        on_exit = function(_, exit_code, signal)
-          session.exit_code = exit_code
-          session.exit_signal = signal
-          session.state = "finished"
+    ---@diagnostic disable-next-line: deprecated
+    local job_id = vim.fn.termopen(exec_command, term_opts)
 
-          vim.schedule(function()
-            cleanup()
-
-            local result_obj = {
-              command = command,
-              exit_code = exit_code,
-              signal = signal,
-              stdout = table.concat(session.stdout_data, ""),
-              stderr = table.concat(session.stderr_data, ""),
-              session_id = session_id,
-              state = "finished",
-            }
-
-            if on_success then
-              on_success(result_obj)
-            end
-          end)
-        end,
-      }
-      -- 在 headless 模式下直接执行命令
-      job_id = vim.fn.jobstart(exec_command, headless_opts)
-    else
-      -- GUI 模式：使用 termopen
-      ---@diagnostic disable-next-line: deprecated
-      job_id = vim.fn.termopen(exec_command, term_opts)
+    -- 关闭临时窗口
+    if temp_win and vim.api.nvim_win_is_valid(temp_win) then
+      vim.api.nvim_win_close(temp_win, true)
     end
+
+    -- 恢复原窗口
+    if saved_win and vim.api.nvim_win_is_valid(saved_win) then
+      pcall(vim.api.nvim_set_current_win, saved_win)
+    end
+
+    -- 启动同步定时器：将隐藏 buffer 内容同步到前台浮动窗口
+    local sync_timer = nil
+    if not is_headless and job_id and job_id > 0 then
+      local last_content = ""
+      sync_timer = vim.fn.timer_start(100, function()
+        if not hidden_buf or not vim.api.nvim_buf_is_valid(hidden_buf) then
+          if sync_timer and vim.fn.timer_info(sync_timer)[1] then
+            vim.fn.timer_stop(sync_timer)
+          end
+          sync_timer = nil
+          return
+        end
+        local ok, hidden_lines = pcall(vim.api.nvim_buf_get_lines, hidden_buf, 0, -1, false)
+        if not ok or not hidden_lines then return end
+        local current = table.concat(hidden_lines, "\n")
+        if current == last_content then return end
+        last_content = current
+        pty_ui.sync_content(hidden_lines)
+      end, { ["repeat"] = -1 })
+    end
+
+    -- 保存隐藏 buffer 和同步定时器到 session，供清理时使用
+    session._hidden_buf = hidden_buf
+    session._sync_timer = sync_timer
 
     if not job_id or job_id <= 0 then
       session.state = "error"
-      pcall(close_pty_float_window)
+      pcall(pty_ui.close)
       cleanup()
       if on_error then
         on_error("无法启动命令")
@@ -1615,12 +1415,7 @@ local function _run_command(args, on_success, on_error, on_progress)
     session.state = "running"
 
     -- 如果成功创建了 PTY 浮动窗口，更新其 buf 引用为 termopen 创建的终端 buffer
-    if not is_headless and pty_win and pty_float_window then
-      local ok, term_buf = pcall(vim.api.nvim_win_get_buf, pty_win)
-      if ok then
-        pty_float_window.buf = term_buf
-      end
-    end
+    -- pty_ui 内部通过 window_manager 管理 buf，无需手动更新
 
     -- 启动进程状态监控
     -- timeout_sec == -1 时启动 AI 循环检测是否卡住（无限等待），同时清除 tool_executor 设置的超时
@@ -1807,7 +1602,7 @@ local function _send_input(args, on_success, on_error, on_progress)
   session.is_waiting_for_input = false
 
   -- 重置 buffer 位置，下次 waiting 时从最新位置开始增量读取
-  local full_buffer = _module_read_pty_buffer_output()
+  local full_buffer = _read_hidden_buf_output(session._hidden_buf)
   if full_buffer ~= "" then
     session.last_buffer_pos = #full_buffer
   end
@@ -2010,7 +1805,7 @@ function M.stop_session(session_id)
   end
 
   -- 关闭 PTY 浮动窗口
-  close_pty_float_window()
+  pty_ui.close()
 
   sessions[session_id] = nil
   return true, "Session stopped"
