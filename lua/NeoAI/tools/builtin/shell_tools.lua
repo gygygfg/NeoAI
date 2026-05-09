@@ -59,11 +59,16 @@ local sessions = {}
 local session_counter = 0
 
 -- ============================================================================
--- PTY 浮动窗口管理
+-- PTY 浮动窗口管理（通过 pty_terminal 组件）
 -- ============================================================================
 -- 存储当前正在显示的 PTY 浮动窗口信息
 -- 格式: { win_id = string, win = number, buf = number, session_id = string }
 local pty_float_window = nil
+
+--- 获取 pty_terminal 组件引用
+local function get_pty_terminal()
+  return require("NeoAI.ui.components.pty_terminal")
+end
 
 --- 获取屏幕尺寸信息
 local function get_screen_dimensions()
@@ -156,20 +161,8 @@ end
 
 --- 关闭 PTY 浮动窗口
 local function close_pty_float_window()
-  if not pty_float_window then
-    return
-  end
-
-  if pty_float_window.win and vim.api.nvim_win_is_valid(pty_float_window.win) then
-    pcall(vim.api.nvim_win_close, pty_float_window.win, true)
-  end
-  if pty_float_window.buf and vim.api.nvim_buf_is_valid(pty_float_window.buf) then
-    pcall(vim.api.nvim_buf_delete, pty_float_window.buf, { force = true })
-  end
-
-  -- 清理自动命令组
-  local ok, _ = pcall(vim.api.nvim_del_augroup_by_name, "NeoAIPtySyncToolDisplay")
-
+  local pty = get_pty_terminal()
+  pty.close()
   pty_float_window = nil
 end
 
@@ -191,176 +184,15 @@ local PTY_CONFIG = {
   buffer_size = 1024 * 64, -- 64KB
 }
 
---- 创建右侧 PTY 浮动窗口（与工具调用窗口构成竖直分屏）
+--- 创建右侧 PTY 浮动窗口（通过 pty_terminal 组件）
 --- 优先检测工具调用窗口的位置，若存在则在其右侧对齐
 local function create_pty_float_window(session_id, pty_buf)
-  -- 先关闭已有的 PTY 浮动窗口
-  if pty_float_window then
-    close_pty_float_window()
+  local pty = get_pty_terminal()
+  local win = pty.open(session_id, pty_buf)
+  if win then
+    -- 更新 PTY_CONFIG 宽高
+    local layout = require("NeoAI.ui.components.pty_terminal").reposition
   end
-
-  local total_cols, total_lines = get_screen_dimensions()
-
-  -- 检测工具调用窗口的位置，用于计算右侧伪终端窗口的布局
-  local tool_layout = get_tool_display_window_layout()
-  local right_col, right_width, win_height, win_row
-
-  if tool_layout then
-    -- 工具调用窗口存在：在其右侧对齐，构成竖直分屏
-    local gap = 1 -- 两窗口之间的间隙
-    right_col = tool_layout.col + tool_layout.width + gap
-    right_width = total_cols - right_col - 1
-    if right_width < 20 then
-      right_width = 20
-      right_col = total_cols - right_width - 1
-    end
-    -- 顶部对齐，高度与工具调用窗口一致
-    win_height = tool_layout.height
-    -- 确保不超出屏幕底部（留底部状态栏空间）
-    if tool_layout.row + win_height > total_lines - 2 then
-      win_height = total_lines - 2 - tool_layout.row
-    end
-    if win_height < 5 then
-      win_height = 5
-    end
-    win_row = tool_layout.row
-  else
-    -- 没有工具调用窗口：默认占据右侧一半
-    local left_width = math.floor(total_cols / 2) - 1
-    right_col = left_width + 2
-    right_width = total_cols - right_col - 1
-    if right_width < 20 then
-      right_width = 20
-      right_col = total_cols - right_width - 1
-    end
-    win_height = total_lines - 2
-    win_row = 1
-  end
-
-  -- 保存当前 PTY 宽高供后续使用
-  PTY_CONFIG.width = right_width
-  PTY_CONFIG.height = win_height
-
-  -- 创建浮动窗口
-  local pty_border = {
-    { "╭", "FloatBorder" },
-    { "─", "FloatBorder" },
-    { "╮", "FloatBorder" },
-    { "│", "FloatBorder" },
-    { "╯", "FloatBorder" },
-    { "─", "FloatBorder" },
-    { "╰", "FloatBorder" },
-    { "│", "FloatBorder" },
-  }
-
-  local buf
-  if pty_buf and vim.api.nvim_buf_is_valid(pty_buf) then
-    buf = pty_buf
-  else
-    buf = vim.api.nvim_create_buf(false, true)
-    vim.api.nvim_set_option_value("buftype", "nofile", { buf = buf })
-    vim.api.nvim_set_option_value("swapfile", false, { buf = buf })
-    vim.api.nvim_set_option_value("bufhidden", "delete", { buf = buf })
-  end
-
-  local win = vim.api.nvim_open_win(buf, true, {
-    relative = "editor",
-    width = right_width,
-    height = win_height,
-    row = win_row,
-    col = right_col,
-    style = "minimal",
-    border = pty_border,
-    title = "💻 终端",
-    title_pos = "center",
-    zindex = 150,
-  })
-
-  if not win or not vim.api.nvim_win_is_valid(win) then
-    if not pty_buf then
-      pcall(vim.api.nvim_buf_delete, buf, { force = true })
-    end
-    return nil
-  end
-
-  vim.api.nvim_set_option_value("winhl", "Normal:Normal,FloatBorder:FloatBorder", { win = win })
-
-  -- 设置 PTY 窗口的按键映射（允许用户手动关闭）
-  local buf_keymaps = buf
-  vim.keymap.set("n", "q", function()
-    close_pty_float_window()
-  end, { buffer = buf_keymaps, noremap = true, silent = true, desc = "关闭终端窗口" })
-  vim.keymap.set("n", "<Esc>", function()
-    -- 只在非终端模式（normal模式）下按Esc关闭
-    local mode = vim.api.nvim_get_mode().mode
-    if mode == "n" then
-      close_pty_float_window()
-    end
-  end, { buffer = buf_keymaps, noremap = true, silent = true, desc = "关闭终端窗口" })
-
-  pty_float_window = {
-    win = win,
-    buf = buf,
-    session_id = session_id,
-  }
-
-  -- 注册工具调用窗口大小变化事件监听
-  -- 当工具调用窗口调整大小时，同步调整伪终端窗口
-  local ok_augroup, _ = pcall(vim.api.nvim_del_augroup_by_name, "NeoAIPtySyncToolDisplay")
-  local augroup = vim.api.nvim_create_augroup("NeoAIPtySyncToolDisplay", { clear = true })
-  vim.api.nvim_create_autocmd("User", {
-    group = augroup,
-    pattern = "NeoAI:tool_display_resized",
-    callback = function(event)
-      if not pty_float_window then
-        return
-      end
-
-      -- 从事件数据中获取工具调用窗口的新布局
-      local data = event.data or {}
-      local tool_layout = data.layout or data
-
-      local tool_width = tool_layout.width or 60
-      local tool_col = tool_layout.col or 1
-      local tool_height = tool_layout.height or 10
-      local tool_row = tool_layout.row or 1
-
-      local total_cols, total_lines = get_screen_dimensions()
-
-      -- 工具调用窗口右侧起始列
-      local gap = 1
-      local new_right_col = tool_col + tool_width + gap
-      local new_right_width = total_cols - new_right_col - 1
-      if new_right_width < 20 then
-        new_right_width = 20
-        new_right_col = total_cols - new_right_width - 1
-      end
-
-      -- 顶部对齐，高度与工具调用窗口一致
-      local new_height = tool_height
-      if tool_row + new_height > total_lines - 2 then
-        new_height = total_lines - 2 - tool_row
-      end
-      if new_height < 5 then
-        new_height = 5
-      end
-
-      local win = pty_float_window.win
-      if win and vim.api.nvim_win_is_valid(win) then
-        pcall(vim.api.nvim_win_set_config, win, {
-          relative = "editor",
-          width = new_right_width,
-          height = new_height,
-          row = tool_row,
-          col = new_right_col,
-        })
-        -- 更新 PTY_CONFIG 供后续使用
-        PTY_CONFIG.width = new_right_width
-        PTY_CONFIG.height = new_height
-      end
-    end,
-  })
-
   return win
 end
 

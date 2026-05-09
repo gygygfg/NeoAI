@@ -16,7 +16,9 @@ local chat_service = require("NeoAI.core.ai.chat_service")
 local approval_config_editor = require("NeoAI.ui.components.approval_config_editor")
 local history_manager = require("NeoAI.core.history.manager")
 local tool_orchestrator = require("NeoAI.core.ai.tool_orchestrator")
-local reasoning_display = require("NeoAI.ui.components.reasoning_display")
+-- 所有悬浮窗组件通过 window_manager 和 window/components 管理
+local reasoning_display = require("NeoAI.ui.window.components.reasoning_display")
+local tool_display_component = require("NeoAI.ui.window.components.tool_display")
 local file_utils = require("NeoAI.utils.file_utils")
 
 -- ========== 辅助函数（不依赖 state） ==========
@@ -245,42 +247,21 @@ local function reset_streaming_state()
 end
 
 local function reset_tool_display()
+  -- 通过 tool_display_component 统一管理
+  tool_display_component.reset()
+  -- 同步更新本地状态
   state.tool_display.active = false
   state.tool_display.buffer = ""
   state.tool_display.results = {}
   state.tool_display.folded_saved = false
   state.tool_display.substeps = {}
   state.tool_display._last_buffer = ""
-
-  -- 清理防抖定时器
-  if state.tool_display._debounce_timer then
-    state.tool_display._debounce_timer:stop()
-    state.tool_display._debounce_timer:close()
-    state.tool_display._debounce_timer = nil
-  end
-
-  -- 关闭工具调用悬浮窗
-  if state.tool_display.window_id then
-    window_manager.close_tool_display(state.tool_display.window_id)
-    state.tool_display.window_id = nil
-  end
-
-  -- 关闭实时参数悬浮窗
-  if state.tool_display.preview_window_id then
-    window_manager.close_tool_display(state.tool_display.preview_window_id)
-    state.tool_display.preview_window_id = nil
-  end
-
-  -- 清理流式工具预览状态
-  local preview = state.tool_display.streaming_preview
-  if preview.timer then
-    preview.timer:stop()
-    preview.timer:close()
-    preview.timer = nil
-  end
-  preview.generation_id = nil
-  preview.tools = {}
-  preview.window_shown = false
+  state.tool_display.window_id = nil
+  state.tool_display.preview_window_id = nil
+  state.tool_display.streaming_preview.timer = nil
+  state.tool_display.streaming_preview.generation_id = nil
+  state.tool_display.streaming_preview.tools = {}
+  state.tool_display.streaming_preview.window_shown = false
 end
 
 local function close_reasoning_display()
@@ -290,10 +271,9 @@ local function close_reasoning_display()
 end
 
 local function close_tool_display()
-  if state.tool_display.window_id then
-    window_manager.close_tool_display(state.tool_display.window_id)
-    state.tool_display.window_id = nil
-  end
+  -- 通过 tool_display_component 关闭
+  tool_display_component._close_display()
+  state.tool_display.window_id = nil
 end
 
 --- 格式化 table 为多行字符串，强制每个元素换行显示
@@ -1789,19 +1769,8 @@ function M.close()
     state.streaming.reasoning_prefix_added = false
     state.streaming.content_separator_added = false
     state.streaming._reasoning_display_timer = nil
-    -- 清理实时参数悬浮窗状态（窗口已由 window_manager.close_window 自动关闭）
-    local preview = state.tool_display.streaming_preview
-    if preview.timer then
-      preview.timer:stop()
-      preview.timer:close()
-      preview.timer = nil
-    end
-    preview.generation_id = nil
-    preview.tools = {}
-    preview.window_shown = false
-    preview.window_id = nil
-    preview._last_buffer = ""
-
+    -- 通过 tool_display_component 统一清理
+    tool_display_component.reset()
     state.tool_display.active = false
     state.tool_display.buffer = ""
     state.tool_display.results = {}
@@ -1809,6 +1778,12 @@ function M.close()
     state.tool_display.folded_saved = false
     state.tool_display.window_id = nil
     state.tool_display.substeps = {}
+    state.tool_display.preview_window_id = nil
+    state.tool_display.streaming_preview.timer = nil
+    state.tool_display.streaming_preview.generation_id = nil
+    state.tool_display.streaming_preview.tools = {}
+    state.tool_display.streaming_preview.window_shown = false
+    state.tool_display.streaming_preview._last_buffer = ""
 
     -- 只有在 state.current_window_id 仍然是 closing_window_id 时才清理状态
     -- 防止 M.open() 已经设置了新的窗口，这里误清理
@@ -2435,28 +2410,14 @@ function M._setup_event_listeners()
         state.tool_display._finished = false
       end
       clear_stream_throttle()
-      -- 清理流式工具预览定时器（GENERATION_COMPLETED 时清理，避免残留）
-      local preview = state.tool_display.streaming_preview
-      if preview.timer then
-        preview.timer:stop()
-        preview.timer:close()
-        preview.timer = nil
-      end
-      -- 关闭实时参数悬浮窗（工具循环开始，不再需要预览）
-      if preview.window_id then
-        window_manager.close_window(preview.window_id)
-        preview.window_id = nil
-      end
-      -- 关闭实时参数悬浮窗（工具循环开始，不再需要预览）
-      if preview.window_id then
-        window_manager.close_window(preview.window_id)
-        preview.window_id = nil
-      end
-      preview.generation_id = nil
-      preview.tools = {}
-      preview.window_shown = false
-      preview._last_buffer = ""
-      preview._last_buffer = ""
+      -- 通过 tool_display_component 清理流式工具预览状态
+      tool_display_component.clear_streaming_preview()
+      -- 同步更新本地状态
+      state.tool_display.streaming_preview.timer = nil
+      state.tool_display.streaming_preview.generation_id = nil
+      state.tool_display.streaming_preview.tools = {}
+      state.tool_display.streaming_preview.window_shown = false
+      state.tool_display.streaming_preview._last_buffer = ""
 
       -- 保存流式状态，用于判断是否需要增量更新
       -- 注意：reasoning_done 为 true 表示思考过程折叠文本已通过 _append_reasoning_folded_to_buffer 追加到缓冲区
@@ -2509,21 +2470,14 @@ function M._setup_event_listeners()
         return
       end
 
-      -- 清理流式工具预览状态
-      local preview = state.tool_display.streaming_preview
-      if preview.timer then
-        preview.timer:stop()
-        preview.timer:close()
-        preview.timer = nil
-      end
-      -- 关闭实时参数悬浮窗
-      if state.tool_display.preview_window_id then
-        window_manager.close_tool_display(state.tool_display.preview_window_id)
-        state.tool_display.preview_window_id = nil
-      end
-      preview.generation_id = nil
-      preview.tools = {}
-      preview.window_shown = false
+      -- 通过 tool_display_component 清理流式工具预览状态
+      tool_display_component.clear_streaming_preview()
+      -- 同步更新本地状态
+      state.tool_display.streaming_preview.timer = nil
+      state.tool_display.streaming_preview.generation_id = nil
+      state.tool_display.streaming_preview.tools = {}
+      state.tool_display.streaming_preview.window_shown = false
+      state.tool_display.preview_window_id = nil
 
       -- 保存用量信息
       if data.usage and next(data.usage) then
@@ -2659,10 +2613,7 @@ function M._setup_event_listeners()
         cancel_reasoning_timer()
         -- 仅在光标跟随模式下显示思考过程悬浮窗
         if should_follow then
-          local ok_rd, rd = pcall(require, "NeoAI.ui.components.reasoning_display")
-          if ok_rd then
-            rd.show("🤔 AI正在思考...")
-          end
+          reasoning_display.show("🤔 AI正在思考...")
         end
       end
 
@@ -2866,7 +2817,7 @@ function M._setup_event_listeners()
     -- 处理 \\ 为单个反斜杠
     str = str:gsub("\\\\", "\\")
     -- 处理 \" 为 "
-    str = str:gsub("\\\"", "\"")
+    str = str:gsub('\\"', '"')
     return str
   end
 
@@ -2904,6 +2855,7 @@ function M._setup_event_listeners()
   end
 
   -- TOOL_CALL_DETECTED：流式响应中检测到工具调用
+  -- 通过 tool_display_component 管理实时参数预览
   vim.api.nvim_create_autocmd("User", {
     pattern = Events.TOOL_CALL_DETECTED,
     callback = function(args)
@@ -2917,98 +2869,63 @@ function M._setup_event_listeners()
         return
       end
 
-      local preview = state.tool_display.streaming_preview
       local gen_id = data.generation_id
 
-      -- 如果 generation_id 变了（新的一次生成），重置预览状态
-      if preview.generation_id and preview.generation_id ~= gen_id then
-        if preview.timer then
-          preview.timer:stop()
-          preview.timer:close()
-          preview.timer = nil
-        end
-        preview.tools = {}
-        preview.window_shown = false
-        preview.window_id = nil
-        preview._last_buffer = ""
-        preview._pending_append = ""
-      elseif not preview.generation_id then
-        -- 首次生成，确保窗口 ID 已清理
-        preview.window_id = nil
-        preview._last_buffer = ""
-        preview._pending_append = ""
-      end
-      preview.generation_id = gen_id
-
       -- 如果 TOOL_LOOP_STARTED 已经触发（工具循环已开始），不再处理流式预览
-      -- 实时参数悬浮窗只在 TOOL_LOOP_STARTED 之前显示
       if state.tool_display.active then
         return
       end
 
-      -- 获取增量数据（当前 chunk 的原始 arguments 片段）
+      -- 通过 tool_display_component 更新流式工具数据
       local tool_calls_delta = data.tool_calls_delta or {}
+      tool_display_component.update_streaming_tools(tool_calls, tool_calls_delta, gen_id)
 
-      -- 更新累积的工具调用数据
-      for _, tc in ipairs(tool_calls) do
-        local func = tc["function"] or tc.func or {}
-        local tool_name = func.name or ""
-        if tool_name ~= "" then
-          if not preview.tools[tool_name] then
-            preview.tools[tool_name] = {
-              name = tool_name,
-              arguments = "",
-              args_display = {},
-            }
-          end
-          -- 用完整累积数据更新 arguments
-          if func.arguments then
-            local args_str = type(func.arguments) == "table" and vim.json.encode(func.arguments) or func.arguments
-            preview.tools[tool_name].arguments = args_str
-            try_parse_streaming_args(preview.tools[tool_name])
-          end
-        end
-      end
-
-      -- 从 tool_calls_delta 中提取当前 chunk 的原始 arguments 片段，累积到 _pending_append
-      for _, tc in ipairs(tool_calls_delta) do
-        local func = tc["function"] or tc.func or {}
-        if func.arguments and type(func.arguments) == "string" and func.arguments ~= "" then
-          preview._pending_append = preview._pending_append .. func.arguments
-        end
-      end
+      -- 同步更新本地状态
+      state.tool_display.streaming_preview.generation_id = gen_id
+      state.tool_display.streaming_preview.tools = tool_display_component.get_streaming_preview_tools()
 
       -- 有累积增量数据时，用节流定时器追加到悬浮窗
+      local preview = state.tool_display.streaming_preview
       if preview._pending_append ~= "" and not state.tool_display.active and not state.tool_display._finished then
         if preview.timer then
           preview.timer:again(60)
         else
           preview.timer = vim.uv.new_timer()
-          preview.timer:start(60, 0, vim.schedule_wrap(function()
-            preview.timer:stop()
-            preview.timer:close()
-            preview.timer = nil
-            local text = preview._pending_append
-            preview._pending_append = ""
-            if text == "" or state.tool_display.active or state.tool_display._finished then return end
-            local win = get_win()
-            if not cursor_near_end(win) then return end
-            state.should_follow = true
+          preview.timer:start(
+            60,
+            0,
+            vim.schedule_wrap(function()
+              preview.timer:stop()
+              preview.timer:close()
+              preview.timer = nil
+              local text = preview._pending_append
+              preview._pending_append = ""
+              if text == "" or state.tool_display.active or state.tool_display._finished then
+                return
+              end
+              local win = get_win()
+              if not cursor_near_end(win) then
+                return
+              end
+              state.should_follow = true
 
-            if not preview.window_shown then
-              preview.window_shown = true
-              M._show_tool_display(true)
-              _schedule_cursor_follow(150)
-            elseif state.tool_display.preview_window_id then
-              window_manager.append_tool_display(state.tool_display.preview_window_id, text)
-            end
-          end))
+              if not preview.window_shown then
+                preview.window_shown = true
+                tool_display_component.show_preview()
+                state.tool_display.preview_window_id = tool_display_component.get_preview_window_id()
+                _schedule_cursor_follow(150)
+              elseif state.tool_display.preview_window_id then
+                tool_display_component.append_preview(text)
+              end
+            end)
+          )
         end
       end
     end,
   })
 
   -- TOOL_LOOP_STARTED：工具循环开始
+  -- 通过 tool_display_component 管理工具调用悬浮窗
   vim.api.nvim_create_autocmd("User", {
     pattern = Events.TOOL_LOOP_STARTED,
     callback = function(args)
@@ -3023,9 +2940,6 @@ function M._setup_event_listeners()
       end
 
       clear_stream_throttle()
-      -- 注意：不调用 reset_streaming_state()，因为思考过程折叠文本已通过 _append_reasoning_folded_to_buffer
-      -- 追加到缓冲区，reasoning_done 需要保留，供 GENERATION_COMPLETED 判断 had_stream_prefix 使用。
-      -- 只清理流式缓冲区和 throttle，保留 reasoning_done 状态。
       local s = state.streaming
       s.active = false
       s.generation_id = nil
@@ -3033,136 +2947,50 @@ function M._setup_event_listeners()
       s.content_buffer = ""
       s.reasoning_buffer = ""
       s.reasoning_active = false
-      -- 不重置 reasoning_done：思考过程折叠文本已追加到缓冲区
       s.prefix_added = false
       s.reasoning_prefix_added = false
       s.content_separator_added = false
       s.message_start_line = nil
       state.tool_loop_in_progress = true
 
-      -- 清理流式工具预览状态（TOOL_LOOP_STARTED 表示流式已结束，预览不再需要）
-      local preview = state.tool_display.streaming_preview
-      if preview.timer then
-        preview.timer:stop()
-        preview.timer:close()
-        preview.timer = nil
-      end
-      -- 关闭实时参数悬浮窗
-      if state.tool_display.preview_window_id then
-        window_manager.close_tool_display(state.tool_display.preview_window_id)
-        state.tool_display.preview_window_id = nil
-      end
-      preview.generation_id = nil
-      preview.tools = {}
-      preview.window_shown = false
+      -- 通过 tool_display_component 清理流式预览并初始化工具包分组
+      tool_display_component.clear_streaming_preview()
+      tool_display_component.init_packs(tool_calls, data.pack_order or {})
+
+      -- 同步更新本地状态
+      state.tool_display.streaming_preview.timer = nil
+      state.tool_display.streaming_preview.generation_id = nil
+      state.tool_display.streaming_preview.tools = {}
+      state.tool_display.streaming_preview.window_shown = false
+      state.tool_display.preview_window_id = nil
 
       state.tool_display.active = true
-      state.tool_display.buffer = ""
+      state.tool_display.buffer = tool_display_component.get_buffer()
       state.tool_display.results = {}
       state.tool_display._finished = false
       state.tool_display.folded_saved = false
-      state.tool_display.packs = {}
-      state.tool_display.pack_order = {}
+      state.tool_display.packs = tool_display_component.get_packs()
+      state.tool_display.pack_order = tool_display_component.get_pack_order()
       state.tool_display.substeps = {}
 
-      -- 按工具包分组初始化
-      local grouped = data.tool_packs or tool_pack.group_by_pack(tool_calls)
-      local pack_order = data.pack_order or {}
-
-      -- 初始化每个包的工具状态
-      for _, pack_name in ipairs(pack_order) do
-        local pack_tools = grouped[pack_name]
-        if pack_tools then
-          local tools_info = {}
-          for _, tc in ipairs(pack_tools) do
-            local fn = tc["function"] or tc.func or {}
-            -- 解析参数（仅 JSON 解析，不 URL 解码）
-            local args_display = {}
-            if fn.arguments then
-              if type(fn.arguments) == "string" then
-                local ok, parsed = pcall(vim.json.decode, fn.arguments)
-                if ok and type(parsed) == "table" then
-                  args_display = parsed
-                else
-                  args_display = { raw = fn.arguments }
-                end
-              elseif type(fn.arguments) == "table" then
-                args_display = fn.arguments
-              end
-            end
-            table.insert(tools_info, {
-              name = fn.name or "unknown",
-              status = "pending",
-              duration = 0,
-              args = args_display,
-            })
-          end
-          state.tool_display.packs[pack_name] = {
-            tools = tools_info,
-            order = tool_pack.get_pack_order(pack_name),
-          }
-          table.insert(state.tool_display.pack_order, pack_name)
-        end
-      end
-
-      -- 处理未分类的工具
-      local uncategorized = grouped["_uncategorized"]
-      if uncategorized then
-        local tools_info = {}
-        for _, tc in ipairs(uncategorized) do
-          local fn = tc["function"] or tc.func or {}
-          -- 解析参数
-          local args_display = {}
-          if fn.arguments then
-            if type(fn.arguments) == "string" then
-              local ok, parsed = pcall(vim.json.decode, fn.arguments)
-              if ok and type(parsed) == "table" then
-                args_display = parsed
-              else
-                args_display = { raw = fn.arguments }
-              end
-            elseif type(fn.arguments) == "table" then
-              args_display = fn.arguments
-            end
-          end
-          table.insert(tools_info, {
-            name = fn.name or "unknown",
-            status = "pending",
-            duration = 0,
-            args = args_display,
-          })
-        end
-        state.tool_display.packs["_uncategorized"] = {
-          tools = tools_info,
-          order = 99,
-        }
-        table.insert(state.tool_display.pack_order, "_uncategorized")
-      end
-
-      -- 构建分组显示文本
-      rebuild_tool_display_buffer()
       -- 仅在光标在后5行内时才显示工具调用悬浮窗
       local win = get_win()
       local near_end = cursor_near_end(win)
-      -- 同步更新模块级 state.should_follow 缓存变量
       state.should_follow = near_end
       if near_end then
-        -- 使用 vim.schedule 延迟创建窗口，避免在 autocmd 回调中直接调用 nvim_open_win
-        -- 导致嵌套 autocmd 干扰渲染
         vim.schedule(function()
-          M._show_tool_display()
+          tool_display_component.show_display()
+          state.tool_display.window_id = tool_display_component.get_window_id()
         end)
-        -- 创建浮动窗口可能触发 WinNew/BufEnter 等自动命令，间接影响 chat 窗口的滚动位置
-        -- 使用防抖光标跟随，延迟 150ms 后执行（创建浮动窗口的影响需要更长时间稳定）
         _schedule_cursor_follow(150)
       else
-        -- 光标不在后5行内：禁止工具调用悬浮窗打开
         state.tool_display.active = false
       end
     end,
   })
 
   -- TOOL_EXECUTION_STARTED：工具开始执行
+  -- 通过 tool_display_component 管理
   vim.api.nvim_create_autocmd("User", {
     pattern = Events.TOOL_EXECUTION_STARTED,
     callback = function(args)
@@ -3172,16 +3000,7 @@ function M._setup_event_listeners()
       local data = args.data or {}
       local pack_name = data.pack_name
       if pack_name and state.tool_display.packs[pack_name] then
-        -- 使用工具包分组更新
-        update_tool_in_pack(pack_name, data.tool_name, "executing", 0)
-        rebuild_tool_display_buffer()
-        -- 仅在悬浮窗已显示时才更新
-        if state.tool_display.window_id then
-          M._update_tool_display()
-        end
-      else
-        -- 回退到旧方式
-        update_tool_status(data.tool_name, "🔄", "(执行中...)")
+        tool_display_component.update_tool_status(pack_name, data.tool_name, "executing", 0)
       end
     end,
   })
@@ -3194,8 +3013,7 @@ function M._setup_event_listeners()
         return
       end
       local data = args.data or {}
-      -- 即使 tool_display.active 为 false（光标不在后5行），也要收集结果
-      -- 这样 TOOL_LOOP_FINISHED 才能生成折叠文本
+      -- 收集结果（即使 tool_display.active 为 false）
       table.insert(state.tool_display.results, {
         tool_name = data.tool_name,
         arguments = data.args or {},
@@ -3204,18 +3022,13 @@ function M._setup_event_listeners()
         is_error = true,
         pack_name = data.pack_name,
       })
+      tool_display_component.add_result(state.tool_display.results[#state.tool_display.results])
       if not state.tool_display.active then
         return
       end
       local pack_name = data.pack_name
       if pack_name and state.tool_display.packs[pack_name] then
-        update_tool_in_pack(pack_name, data.tool_name, "error", data.duration or 0)
-        rebuild_tool_display_buffer()
-        if state.tool_display.window_id then
-          M._update_tool_display()
-        end
-      else
-        update_tool_status(data.tool_name, "❌", "(失败, " .. (data.duration or 0) .. "s)")
+        tool_display_component.update_tool_status(pack_name, data.tool_name, "error", data.duration or 0)
       end
     end,
   })
@@ -3231,46 +3044,17 @@ function M._setup_event_listeners()
         return
       end
       local data = args.data or {}
-      local tool_name = data.tool_name
-      local substep_name = data.substep_name
-      local status = data.status or "pending"
-      local duration = data.duration or 0
-      local detail = data.detail
-
-      if not tool_name or not substep_name then
+      if not data.tool_name or not data.substep_name then
         return
       end
 
-      -- 更新子步骤状态
-      if not state.tool_display.substeps[tool_name] then
-        state.tool_display.substeps[tool_name] = {}
-      end
-
-      -- 查找或创建子步骤条目
-      local found = false
-      for _, s in ipairs(state.tool_display.substeps[tool_name]) do
-        if s.name == substep_name then
-          s.status = status
-          s.duration = duration
-          s.detail = detail
-          found = true
-          break
-        end
-      end
-      if not found then
-        table.insert(state.tool_display.substeps[tool_name], {
-          name = substep_name,
-          status = status,
-          duration = duration,
-          detail = detail,
-        })
-      end
-
-      -- 重建显示 buffer 并更新窗口
-      rebuild_tool_display_buffer()
-      if state.tool_display.window_id then
-        M._update_tool_display()
-      end
+      tool_display_component.update_substep(
+        data.tool_name,
+        data.substep_name,
+        data.status or "pending",
+        data.duration or 0,
+        data.detail
+      )
     end,
   })
 
@@ -3282,8 +3066,7 @@ function M._setup_event_listeners()
         return
       end
       local data = args.data or {}
-      -- 即使 tool_display.active 为 false（光标不在后5行），也要收集结果
-      -- 这样 TOOL_LOOP_FINISHED 才能生成折叠文本
+      -- 收集结果
       table.insert(state.tool_display.results, {
         tool_name = data.tool_name,
         arguments = data.args or {},
@@ -3291,18 +3074,13 @@ function M._setup_event_listeners()
         duration = data.duration or 0,
         pack_name = data.pack_name,
       })
+      tool_display_component.add_result(state.tool_display.results[#state.tool_display.results])
       if not state.tool_display.active then
         return
       end
       local pack_name = data.pack_name
       if pack_name and state.tool_display.packs[pack_name] then
-        update_tool_in_pack(pack_name, data.tool_name, "completed", data.duration or 0)
-        rebuild_tool_display_buffer()
-        if state.tool_display.window_id then
-          M._update_tool_display()
-        end
-      else
-        update_tool_status(data.tool_name, "✅", "(" .. (data.duration or 0) .. "s)")
+        tool_display_component.update_tool_status(pack_name, data.tool_name, "completed", data.duration or 0)
       end
     end,
   })
@@ -3319,22 +3097,14 @@ function M._setup_event_listeners()
         return
       end
 
-      -- 清理流式工具预览状态
-      local preview = state.tool_display.streaming_preview
-      if preview.timer then
-        preview.timer:stop()
-        preview.timer:close()
-        preview.timer = nil
-      end
-      -- 关闭实时参数悬浮窗
-      if state.tool_display.preview_window_id then
-        window_manager.close_tool_display(state.tool_display.preview_window_id)
-        state.tool_display.preview_window_id = nil
-      end
-      preview.generation_id = nil
-      preview.tools = {}
-      preview.window_shown = false
-      preview._pending_append = ""
+      -- 通过 tool_display_component 清理流式预览
+      tool_display_component.clear_streaming_preview()
+      state.tool_display.streaming_preview.timer = nil
+      state.tool_display.streaming_preview.generation_id = nil
+      state.tool_display.streaming_preview.tools = {}
+      state.tool_display.streaming_preview.window_shown = false
+      state.tool_display.streaming_preview._pending_append = ""
+      state.tool_display.preview_window_id = nil
 
       if state.tool_display._finished then
         fire_event(Events.TOOL_DISPLAY_CLOSED, {
@@ -3348,97 +3118,24 @@ function M._setup_event_listeners()
 
       clear_stream_throttle()
 
-      -- 即使 tool_display.active 为 false（光标不在后5行时被禁用），
-      -- 也必须生成折叠文本并写入缓冲区，否则工具调用结果会丢失
+      -- 生成折叠文本并写入缓冲区
       local results = state.tool_display.results or {}
       if #results > 0 or state.tool_display.buffer ~= "" then
-        local folded_text = ""
-        if #results > 0 then
-          -- 按工具包分组构建折叠文本
-          local pack_results = {}
-          local pack_order = {}
-          for _, r in ipairs(results) do
-            local pn = r.pack_name or "_uncategorized"
-            if not pack_results[pn] then
-              pack_results[pn] = {}
-              table.insert(pack_order, pn)
-            end
-            table.insert(pack_results[pn], r)
-          end
-          -- 按包顺序排序
-          table.sort(pack_order, function(a, b)
-            return tool_pack.get_pack_order(a) < tool_pack.get_pack_order(b)
-          end)
-
-          local blocks = {}
-          for _, pn in ipairs(pack_order) do
-            local pack_tools = pack_results[pn]
-            local pack_icon = tool_pack.get_pack_icon(pn)
-            local pack_name = tool_pack.get_pack_display_name(pn)
-            for _, r in ipairs(pack_tools) do
-              local duration_str = r.duration and string.format(" (%.1fs)", r.duration) or ""
-              -- 格式化参数：使用 _format_table_for_fold 强制每个元素换行
-              local args_str = _format_table_for_fold(r.arguments or {})
-              -- 转义内容中的 {{{ 和 }}}，避免干扰 foldmethod=marker
-              args_str = args_str:gsub("}}}", "} } }"):gsub("{{{", "{ { {")
-              -- 对参数做换行缩进处理
-              args_str = args_str:gsub("\n", "\n    ")
-              -- 格式化结果：使用 _format_table_for_fold 强制每个元素换行
-              -- 如果结果是 JSON 字符串，解码后格式化
-              local result_str
-              if type(r.result) == "table" then
-                result_str = _format_table_for_fold(r.result)
-              else
-                result_str = tostring(r.result or "")
-                -- 尝试 JSON 解码，成功则格式化显示
-                local json_ok, json_val = pcall(vim.json.decode, result_str)
-                if json_ok and type(json_val) == "table" then
-                  result_str = _format_table_for_fold(json_val)
-                end
-              end
-              -- 清理 JSON 编码后的 \r 字符，将 \r 渲染为换行
-              result_str = result_str:gsub("\\r\\n", "\n"):gsub("\\r", "\n")
-              -- 截断超过 200 行的结果内容，避免超大折叠文本导致界面卡顿
-              result_str = _truncate_content_for_fold(result_str, 200)
-              local icon = r.is_error and "❌" or "✅"
-              -- 转义内容中的 {{{ 和 }}}，避免干扰 foldmethod=marker
-              result_str = result_str:gsub("}}}", "} } }"):gsub("{{{", "{ { {")
-              result_str = result_str:gsub("\n", "\n    ")
-              local block = "{{{ "
-                .. pack_icon
-                .. " "
-                .. pack_name
-                .. " - "
-                .. icon
-                .. " "
-                .. (r.tool_name or "unknown")
-                .. duration_str
-                .. "\n    参数: "
-                .. args_str
-                .. "\n    结果: "
-                .. result_str
-                .. "\n}}}"
-              table.insert(blocks, block)
-            end
-          end
-          folded_text = table.concat(blocks, "\n")
-        else
+        local folded_text = tool_display_component.build_folded_text()
+        if folded_text == "" then
           folded_text = "{{{ 🔧 工具调用\n  ❌ 所有工具调用均失败\n}}}"
         end
 
         table.insert(state.messages, { role = "assistant", content = folded_text, timestamp = os.time() })
         state.tool_display.folded_saved = true
-        -- 通过 _append_message_to_buffer 写入指定 buffer，确保经过 _render_single_message 格式化
         M._append_message_to_buffer("assistant", folded_text)
       end
       if state.tool_display.active then
         close_tool_display()
       end
 
-      -- 重置工具显示状态，确保下一轮 TOOL_CALL_DETECTED 能正常打开实时参数悬浮窗
       state.tool_display.active = false
       close_reasoning_display()
-      -- 重置流式状态，确保后续总结轮次以正确的 "🤖 AI:" 前缀开始
       reset_streaming_state()
       fire_event(Events.TOOL_DISPLAY_CLOSED, {
         window_id = data.window_id,
@@ -3447,11 +3144,7 @@ function M._setup_event_listeners()
       })
       state.tool_loop_in_progress = false
 
-      -- 工具循环结束后，始终打开虚拟输入框
-      -- 注意：如果后续还有 GENERATION_COMPLETED 或 SUMMARY_COMPLETED 事件，
-      -- 这些事件的处理函数中也会尝试打开输入框，但 _open_float_input 内部有 is_active 检查，不会重复打开
       M._open_float_input()
-      -- 仅在光标跟随模式开启（光标在末尾附近）时才聚焦输入框
       local chat_handlers = require("NeoAI.ui.handlers.chat_handlers")
       if virtual_input.is_active() and chat_handlers.get_should_follow() then
         virtual_input.focus_and_insert()
@@ -3512,6 +3205,7 @@ function M._setup_event_listeners()
   })
 
   -- VimResized：窗口大小变化时动态调整工具调用悬浮窗和虚拟输入框位置
+  -- 通过 tool_display_component 和 window_manager 管理
   vim.api.nvim_create_autocmd("VimResized", {
     callback = function()
       -- 调整工具调用悬浮窗
@@ -3523,7 +3217,6 @@ function M._setup_event_listeners()
           local dynamic_height = math.max(5, math.min(#lines + 2, max_tool_height))
           local config = vim.api.nvim_win_get_config(window_info.win)
           config.height = dynamic_height
-          -- 更新宽度为窗口的 80%，左右居中
           local total_cols = vim.o.columns
           config.width = math.floor(total_cols * 0.8)
           config.col = math.floor((total_cols - config.width) / 2)
@@ -3541,7 +3234,6 @@ function M._setup_event_listeners()
           config.row = tool_row
           pcall(vim.api.nvim_win_set_config, window_info.win, config)
 
-          -- 触发大小变化事件，通知右侧伪终端窗口同步
           vim.api.nvim_exec_autocmds("User", {
             pattern = "NeoAI:tool_display_resized",
             data = {
@@ -3913,53 +3605,27 @@ function M._finalize_streaming()
   state.streaming.content_separator_added = false
 end
 
---- 防抖更新工具调用悬浮窗内容
-local function _debounce_update_tool_display()
-  if state.tool_display._debounce_timer then
-    state.tool_display._debounce_timer:stop()
-    state.tool_display._debounce_timer:close()
-    state.tool_display._debounce_timer = nil
-  end
-  state.tool_display._debounce_timer = vim.defer_fn(function()
-    state.tool_display._debounce_timer = nil
-    if state.tool_display.window_id then
-      window_manager.update_tool_display(state.tool_display.window_id, state.tool_display.buffer)
-    end
-  end, 50)
-end
-
---- 显示工具调用悬浮窗口
+--- 显示工具调用悬浮窗口（委托给 tool_display_component）
 --- @param is_preview boolean 是否为实时参数预览窗口
 function M._show_tool_display(is_preview)
   if is_preview then
-    if state.tool_display.preview_window_id then return end
-    local content = M.build_streaming_preview_buffer()
-    local win_id = window_manager.open_tool_display({
-      title = "🔧 参数接收中...",
-      content = content,
-      reasoning_display = reasoning_display,
-    })
-    if win_id then
-      state.tool_display.preview_window_id = win_id
+    if state.tool_display.preview_window_id then
+      return
     end
+    tool_display_component.show_preview()
+    state.tool_display.preview_window_id = tool_display_component.get_preview_window_id()
   else
-    if state.tool_display.window_id then return end
-    local win_id = window_manager.open_tool_display({
-      title = "🔧 工具调用",
-      content = state.tool_display.buffer,
-      reasoning_display = reasoning_display,
-    })
-    if win_id then
-      state.tool_display.window_id = win_id
+    if state.tool_display.window_id then
+      return
     end
+    tool_display_component.show_display()
+    state.tool_display.window_id = tool_display_component.get_window_id()
   end
 end
 
---- 更新工具调用悬浮窗内容（防抖）
+--- 更新工具调用悬浮窗内容（委托给 tool_display_component）
 function M._update_tool_display()
-  if state.tool_display.window_id then
-    _debounce_update_tool_display()
-  end
+  tool_display_component.update_display()
 end
 
 --- 获取工具调用悬浮窗的窗口ID
@@ -3973,113 +3639,15 @@ end
 
 --- 关闭工具调用悬浮窗口
 function M._close_tool_display()
-  if state.tool_display.window_id then
-    window_manager.close_tool_display(state.tool_display.window_id)
-    state.tool_display.window_id = nil
-    if state.tool_display._debounce_timer then
-      state.tool_display._debounce_timer:stop()
-      state.tool_display._debounce_timer:close()
-      state.tool_display._debounce_timer = nil
-    end
-    vim.api.nvim_exec_autocmds("User", {
-      pattern = "NeoAI:tool_display_closed",
-      data = {},
-    })
-  end
+  tool_display_component._close_display()
+  state.tool_display.window_id = nil
 end
 
---- 构建工具调用结果的折叠文本
+--- 构建工具调用结果的折叠文本（委托给 tool_display_component）
 --- @param results table 工具调用结果列表
 --- @return string 折叠文本格式的字符串
 function M._build_tool_folded_text(results)
-  if not results or #results == 0 then
-    return ""
-  end
-
-  local folded_text = ""
-
-  -- 注意：思考过程不在此处添加，因为思考过程已通过 _append_reasoning_folded_to_buffer
-  -- 在 STREAM_CHUNK 或 STREAM_COMPLETED 事件中单独追加到聊天缓冲区。
-  -- 如果在此处重复添加，会导致思考过程在缓冲区中渲染两遍。
-
-  -- 按工具包分组
-  local pack_results = {}
-  local pack_order = {}
-  for _, r in ipairs(results) do
-    local pn = r.pack_name or "_uncategorized"
-    if not pack_results[pn] then
-      pack_results[pn] = {}
-      table.insert(pack_order, pn)
-    end
-    table.insert(pack_results[pn], r)
-  end
-  table.sort(pack_order, function(a, b)
-    return tool_pack.get_pack_order(a) < tool_pack.get_pack_order(b)
-  end)
-
-  local blocks = {}
-  for _, pn in ipairs(pack_order) do
-    local pack_tools = pack_results[pn]
-    local pack_icon = tool_pack.get_pack_icon(pn)
-    local pack_name = tool_pack.get_pack_display_name(pn)
-    for _, r in ipairs(pack_tools) do
-      local duration_str = r.duration and string.format(" (%.1fs)", r.duration) or ""
-      -- 格式化参数：使用 _format_table_for_fold 强制每个元素换行
-      local args_str = _format_table_for_fold(r.arguments or {})
-      -- 转义内容中的 {{{ 和 }}}，避免干扰 foldmethod=marker
-      args_str = args_str:gsub("}}}", "} } }"):gsub("{{{", "{ { {")
-      -- 对参数也做换行缩进处理，与结果保持一致
-      args_str = args_str:gsub("\n", "\n    ")
-      local result_raw = r.result
-      local result_str = ""
-      if type(result_raw) == "table" then
-        -- table 类型使用 _format_table_for_fold 强制每个元素换行
-        result_str = _format_table_for_fold(result_raw)
-      else
-        result_str = tostring(result_raw or "")
-        -- 尝试 JSON 解码，成功则格式化显示
-        local json_ok, json_val = pcall(vim.json.decode, result_str)
-        if json_ok and type(json_val) == "table" then
-          result_str = _format_table_for_fold(json_val)
-        end
-      end
-      -- 清理 JSON 编码后的 \r 字符，将 \r 渲染为换行
-      result_str = result_str:gsub("\\r\\n", "\n"):gsub("\\r", "\n")
-      -- 截断超过 200 行的结果内容，避免超大折叠文本导致界面卡顿
-      result_str = _truncate_content_for_fold(result_str, 200)
-      -- 检查结果中是否包含警告
-      local has_warning = false
-      for line in result_str:gmatch("[^\n]+") do
-        if line:match("^⚠️%s*警告：") then
-          has_warning = true
-          break
-        end
-      end
-      local icon = r.is_error and "❌" or (has_warning and "⚠️" or "✅")
-      -- 转义内容中的 {{{ 和 }}}，避免干扰 foldmethod=marker
-      result_str = result_str:gsub("}}}", "} } }"):gsub("{{{", "{ { {")
-      result_str = result_str:gsub("\n", "\n    ")
-
-      local block = "{{{ "
-        .. pack_icon
-        .. " "
-        .. pack_name
-        .. " - "
-        .. icon
-        .. " "
-        .. (r.tool_name or "unknown")
-        .. duration_str
-        .. "\n    参数: "
-        .. args_str
-        .. "\n    结果: "
-        .. result_str
-        .. "\n}}}"
-      table.insert(blocks, block)
-    end
-  end
-  folded_text = table.concat(blocks, "\n")
-
-  return folded_text
+  return tool_display_component.build_folded_text()
 end
 
 --- 获取当前使用的模型标签
