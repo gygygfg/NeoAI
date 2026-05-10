@@ -116,23 +116,7 @@ NeoAI/
     ├── test_user_data.lua      # 用户数据处理测试
     ├── test_user_data2.lua     # 用户数据处理测试 2
     ├── test_user_data3.lua     # 用户数据处理测试 3
-    ├── test_tree_connectors.lua# 树连接器测试
-    └── deepseek_responses/     # 测试响应数据
-        ├── fetch_responses.sh
-        ├── fim_completion.json
-        ├── fim_completion_request.json
-        ├── list_models.json
-        ├── non_streaming_no_reasoning.json
-        ├── non_streaming_no_reasoning_request.json
-        ├── reasoning_non_stream.json
-        ├── reasoning_non_stream_request.json
-        ├── reasoning_streaming.json
-        ├── reasoning_streaming_request.json
-        ├── streaming_no_reasoning.json
-        ├── streaming_no_reasoning_request.json
-        ├── tool_call.json
-        ├── tool_call_request.json
-        └── user_balance.json
+    └── test_tree_connectors.lua# 树连接器测试
 ```
 
 ---

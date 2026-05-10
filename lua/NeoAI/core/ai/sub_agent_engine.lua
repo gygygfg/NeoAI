@@ -1,19 +1,12 @@
--- 子 agent 执行引擎
--- 负责管理子 agent 的独立工具循环生命周期
+-- 子 agent 生命周期管理器
+-- 职责：
+--   1. 管理子 agent 的生命周期（创建、完成、清理）
+--   2. 审核子 agent 的工具调用边界（委托给 plan_executor）
+--   3. 构建子 agent 的系统提示词
+--   4. 处理子 agent 的 AI 生成请求
 --
--- 工作机制：
---   1. tool_orchestrator 检测到 create_sub_agent 工具调用时，委托给本模块
---   2. 本模块创建独立的协程上下文（变量隔离），启动子 agent 工具循环
---   3. 每次工具调用前通过 plan_executor.review_tool_call() 审核边界
---   4. 子 agent 结束后自动生成执行总结
---   5. 总结通过 tool_orchestrator 的消息系统返回给主 agent
---
--- 修复说明（2026-05-07）：
---   - 简化状态机：移除 _check_round_complete（GENERATION_COMPLETED 监听器），
---     改为纯回调驱动（_on_tools_complete → _request_generation → on_generation_complete）
---   - 修复竞态条件：使用 _round_in_progress 互斥锁防止重复进入
---   - 修复空工具调用结束逻辑：AI 返回无工具调用时正常结束
---   - 修复迭代计数不一致：统一使用 runner.iteration_count
+-- 工具循环控制已统一由 tool_orchestrator 管理
+-- sub_agent_engine 不再维护独立的循环控制逻辑
 
 local M = {}
 
@@ -21,6 +14,7 @@ local logger = require("NeoAI.utils.logger")
 local state_manager = require("NeoAI.core.config.state")
 local event_constants = require("NeoAI.core.events")
 local plan_executor = require("NeoAI.tools.builtin.plan_executor")
+local request_builder = require("NeoAI.core.ai.request_builder")
 
 -- ========== 子 agent 执行状态 ==========
 
@@ -29,7 +23,7 @@ local sub_agent_runners = {} -- sub_agent_id -> runner state
 -- ========== 工具调用审核 ==========
 
 --- 审核子 agent 的工具调用是否超出边界
---- 由 tool_executor 在每次工具执行前调用
+--- 由 tool_orchestrator._execute_single_tool 在每次工具执行前调用
 --- @param sub_agent_id string
 --- @param tool_name string
 --- @param args table
@@ -42,317 +36,131 @@ function M.review_tool_call(sub_agent_id, tool_name, args)
   return plan_executor.review_tool_call(sub_agent_id, tool_call)
 end
 
---- 检查工具调用是否属于某个子 agent
---- @param tool_call table 工具调用对象
---- @return string|nil sub_agent_id
-function M.get_sub_agent_id(tool_call)
-  if not tool_call then
-    return nil
-  end
-  local func = tool_call["function"] or tool_call.func
-  if not func then
-    return nil
-  end
-  -- arguments 已在 http_client 中解析为 Lua table
-  local args = func.arguments or {}
-  if type(args) ~= "table" then
-    args = {}
-  end
-  return args._sub_agent_id or nil
-end
-
---- 标记工具调用属于某个子 agent（注入 _sub_agent_id）
---- @param tool_calls table 工具调用列表
---- @param sub_agent_id string
-function M.inject_sub_agent_id(tool_calls, sub_agent_id)
-  for _, tc in ipairs(tool_calls) do
-    local func = tc["function"] or tc.func
-    if func then
-      -- arguments 已在 http_client 中解析为 Lua table
-      local args = func.arguments
-      if type(args) == "table" then
-        args._sub_agent_id = sub_agent_id
-      end
-    end
-  end
-end
-
 -- ========== 子 agent 工具循环 ==========
 
 --- 启动子 agent 的工具循环
---- 在独立的协程上下文中执行，变量与主 agent 隔离
+--- 注册子 agent 会话到 tool_orchestrator，然后通过 TOOL_RESULT_RECEIVED 事件触发 AI 生成
 --- @param sub_agent_id string
 --- @param tool_calls table 子 agent 首次返回的工具调用列表
 --- @param session_context table 会话上下文
 function M.start_sub_agent_loop(sub_agent_id, tool_calls, session_context)
   logger.debug("[sub_agent] start_sub_agent_loop: id=%s, tool_calls=%d", sub_agent_id, #(tool_calls or {}))
-  local runner = {
-    sub_agent_id = sub_agent_id,
-    session_id = session_context.session_id,
-    window_id = session_context.window_id,
-    generation_id = "sub_agent_" .. sub_agent_id .. "_" .. os.time() .. "_" .. math.random(10000, 99999),
+
+  local tool_orchestrator = require("NeoAI.core.ai.tool_orchestrator")
+
+  -- 注册子 agent 会话到 tool_orchestrator
+  tool_orchestrator.register_sub_agent_session(sub_agent_id, session_context.session_id, session_context.window_id, {
     messages = session_context.messages or {},
     options = session_context.options or {},
     model_index = session_context.model_index or 1,
     ai_preset = session_context.ai_preset or {},
     on_summary = session_context.on_summary,
-    iteration_count = 0,
-    max_iterations = 20,
-    stop_requested = false,
-    active_tool_calls = {},
-    -- 互斥锁，防止竞态
-    _round_in_progress = false,
-    _tools_complete_in_progress = false,
-    -- 去重：记录已处理的 generation_id，防止 vim.schedule 回调重复触发
-    _last_complete_gen_id = nil,
-  }
-
-  sub_agent_runners[sub_agent_id] = runner
+  })
 
   -- 注入子 agent ID 到工具调用
   M.inject_sub_agent_id(tool_calls, sub_agent_id)
 
-  -- 启动第一轮：执行工具或直接请求 AI 生成
-  M._execute_tools(sub_agent_id, tool_calls)
-end
+  -- 构建子 agent 的系统提示词
+  local context = plan_executor.get_sub_agent_context(sub_agent_id)
+  local system_prompt = _build_sub_agent_system_prompt(context)
 
--- ========== 工具执行 ==========
-
-function M._execute_tools(sub_agent_id, tool_calls)
-  local runner = sub_agent_runners[sub_agent_id]
-  if not runner then
-    logger.warn("[sub_agent] _execute_tools: runner not found for %s", sub_agent_id)
-    return
-  end
-  if runner.stop_requested then
-    logger.warn("[sub_agent] _execute_tools: stop_requested for %s", sub_agent_id)
-    return
-  end
-
-  -- 过滤无效工具调用
-  local valid_tool_calls = {}
-  for _, tc in ipairs(tool_calls or {}) do
-    local func = tc["function"] or tc.func
-    if func and func.name and func.name ~= "" then
-      local args = func.arguments
-      if args ~= nil and args ~= "" then
-        table.insert(valid_tool_calls, tc)
-      end
-    end
-  end
-  tool_calls = valid_tool_calls
-
-  if #tool_calls == 0 then
-    -- 检查是否没有任何可用工具（allowed_tools 为空列表）
-    -- 如果是，直接结束子 agent，避免 AI 反复尝试调用被驳回的工具
-    local context = plan_executor.get_sub_agent_context(sub_agent_id)
-    local allowed_tools = context and context.boundaries and context.boundaries.allowed_tools
-    if allowed_tools ~= nil and #allowed_tools == 0 then
-      plan_executor.record_error(sub_agent_id, "没有允许的工具可用，子 agent 无法执行任何操作")
-      M._finalize_sub_agent(sub_agent_id)
-      return
-    end
-    -- 没有工具调用，直接请求 AI 生成
-    M._request_generation(sub_agent_id)
-    return
-  end
-
-  runner.active_tool_calls = {}
-
-  -- 并发执行所有工具
-  for _, tc in ipairs(tool_calls) do
-    M._execute_single_tool(sub_agent_id, tc)
-  end
-end
-
-function M._execute_single_tool(sub_agent_id, tool_call)
-  local runner = sub_agent_runners[sub_agent_id]
-  if not runner or not tool_call or runner.stop_requested then
-    return
-  end
-
-  local func = tool_call["function"] or tool_call.func
-  if not func or not func.name then
-    return
-  end
-
-  local tool_name = func.name
-
-  -- 生成唯一 tool_call_id
-  if not M._tool_call_counter then
-    M._tool_call_counter = 0
-  end
-  M._tool_call_counter = M._tool_call_counter + 1
-  local tool_call_id = tool_call.id
-    or ("sub_call_" .. os.time() .. "_" .. M._tool_call_counter .. "_" .. math.random(10000, 99999))
-  tool_call.id = tool_call_id
-  runner.active_tool_calls[tool_call_id] = true
-
-  -- ===== 边界审核 =====
-  -- arguments 已在 http_client 中解析为 Lua table
-  local args = func.arguments or {}
-  if type(args) ~= "table" then
-    args = {}
-  end
-
-  local allowed, reason = M.review_tool_call(sub_agent_id, tool_name, args)
-  if not allowed then
-    -- 被调度 agent 驳回
-    runner.active_tool_calls[tool_call_id] = nil
-    plan_executor.record_error(sub_agent_id, string.format("工具 '%s' 被驳回: %s", tool_name, reason))
-
-    -- 将驳回信息作为工具结果返回给 AI
-    -- 明确告诉 AI 不要重试此工具，避免陷入驳回-重试死循环
-    local result_str = string.format(
-      "[调度 agent 驳回] 工具 '%s' 的调用被拒绝。原因: %s\n此工具不在你的允许列表中，请不要再尝试调用它。请使用其他允许的工具继续完成任务，或直接返回文本说明任务无法完成。",
-      tool_name,
-      reason
-    )
-    M._add_tool_result_to_messages(sub_agent_id, tool_call_id, tool_name, result_str)
-
-    local remaining = vim.tbl_count(runner.active_tool_calls)
-    if remaining == 0 then
-      -- 使用 vim.schedule 延迟调用，避免在 _execute_tools 遍历期间同步触发重入
-      vim.schedule(function()
-        M._on_tools_complete(sub_agent_id)
-      end)
-    end
-    return
-  end
-
-  -- ===== 通过审核，执行工具 =====
-  local tool_executor = require("NeoAI.tools.tool_executor")
-
-  -- 创建子 agent 独立的协程上下文（变量隔离）
-  local ctx = state_manager.create_context({
-    session_id = runner.session_id,
-    generation_id = runner.generation_id,
-    window_id = runner.window_id,
-    sub_agent_id = sub_agent_id,
+  -- 构建消息列表
+  local messages = {}
+  table.insert(messages, {
+    role = "system",
+    content = system_prompt,
+  })
+  table.insert(messages, {
+    role = "user",
+    content = string.format(
+      "请执行以下任务：%s\n\n请使用可用的工具来完成此任务。完成任务后，请说明结果。",
+      context and context.task or ""
+    ),
   })
 
-  state_manager.with_context(ctx, function()
-    tool_executor.execute_with_orchestrator(tool_name, func.arguments, {
-      session_id = runner.session_id,
-      window_id = runner.window_id,
-      generation_id = runner.generation_id,
-      tool_call_id = tool_call_id,
-      pack_name = "sub_agent_" .. sub_agent_id,
-    }, {
-      on_result = function(success, result)
-        local r = sub_agent_runners[sub_agent_id]
-        if not r then
-          return
-        end
+  -- 生成唯一的 generation_id
+  local generation_id = "sub_agent_" .. sub_agent_id .. "_" .. os.time() .. "_" .. math.random(10000, 99999)
 
-        if r.stop_requested then
-          r.active_tool_calls[tool_call_id] = nil
-          if vim.tbl_count(r.active_tool_calls) == 0 then
-            M._on_tools_complete(sub_agent_id)
-          end
-          return
-        end
-
-        local result_str = success and result or ("[工具执行失败] " .. result)
-
-        -- 记录执行结果
-        if success then
-          plan_executor.record_result(sub_agent_id, string.format("[%s] %s", tool_name, result_str:sub(1, 500)))
-        else
-          plan_executor.record_error(sub_agent_id, string.format("[%s] %s", tool_name, result_str))
-        end
-
-        M._add_tool_result_to_messages(sub_agent_id, tool_call_id, tool_name, result_str)
-
-        r.active_tool_calls[tool_call_id] = nil
-        local remaining = vim.tbl_count(r.active_tool_calls)
-
-        if remaining == 0 then
-          -- 使用 vim.schedule 延迟调用，避免在工具执行回调中同步触发重入
-          vim.schedule(function()
-            M._on_tools_complete(sub_agent_id)
-          end)
-        end
-      end,
-    })
-  end)
+  -- 通过 TOOL_RESULT_RECEIVED 事件触发 AI 生成
+  -- 携带 _sub_agent_id 标记，让 ai_engine.handle_tool_result 知道这是子 agent 请求
+  vim.api.nvim_exec_autocmds("User", {
+    pattern = event_constants.TOOL_RESULT_RECEIVED,
+    data = {
+      generation_id = generation_id,
+      tool_results = {},
+      session_id = session_context.session_id,
+      window_id = session_context.window_id,
+      messages = messages,
+      options = session_context.options or {},
+      model_index = session_context.model_index or 1,
+      ai_preset = session_context.ai_preset or {},
+      is_final_round = false,
+      accumulated_usage = {},
+      last_reasoning = nil,
+      _sub_agent_id = sub_agent_id,
+    },
+  })
 end
 
--- ========== 完成检查 ==========
+-- ========== 子 agent 完成处理 ==========
 
---- 所有工具执行完成后的回调
---- 触发下一轮 AI 生成
-function M._on_tools_complete(sub_agent_id)
+--- 结束子 agent 并触发总结回调
+--- 由 tool_orchestrator._finish_loop 在子 agent 循环结束时调用
+--- @param sub_agent_id string
+--- @param result string|nil 最终结果
+function M._finalize_sub_agent(sub_agent_id, result)
   local runner = sub_agent_runners[sub_agent_id]
   if not runner then
-    logger.warn("[sub_agent] _on_tools_complete: runner not found for %s", sub_agent_id)
     return
   end
 
-  -- 防止重复调用：多个工具并发执行时，每个工具的 on_result 回调都可能通过
-  -- vim.schedule 调用 _on_tools_complete。第一个回调执行 _request_generation
-  -- 后，队列中可能还有未执行的 vim.schedule 回调。这些回调会在当前调用返回后
-  -- 再次进入，导致重复的 AI 生成请求。
-  -- 通过记录当前 generation_id，如果同一 generation 的完成已被处理过则跳过。
-  local current_gen = runner.generation_id
-  if runner._last_complete_gen_id == current_gen then
-    logger.warn("[sub_agent] _on_tools_complete: duplicate call for gen %s, skipping", current_gen)
-    return
+  -- 标记子 agent 完成
+  plan_executor._finalize_sub_agent(sub_agent_id)
+
+  -- 获取执行总结
+  local summary = plan_executor.get_summary(sub_agent_id) or result or "子 agent 执行完成，但未生成总结"
+
+  -- 通过回调返回总结给主 agent
+  if runner.on_summary then
+    local cb = runner.on_summary
+    runner.on_summary = nil
+    pcall(cb, summary)
   end
 
-  if runner._tools_complete_in_progress then
-    logger.warn("[sub_agent] _on_tools_complete: already in progress for %s", sub_agent_id)
-    return
-  end
-  logger.info("[sub_agent] _on_tools_complete: id=%s", sub_agent_id)
-  runner._tools_complete_in_progress = true
+  -- 清理 runner
+  sub_agent_runners[sub_agent_id] = nil
 
-  if runner.stop_requested then
-    runner._tools_complete_in_progress = false
-    M._finalize_sub_agent(sub_agent_id)
-    return
-  end
-
-  runner._last_complete_gen_id = current_gen
-  runner._tools_complete_in_progress = false
-  M._request_generation(sub_agent_id)
+  -- 注销 tool_orchestrator 中的子 agent 会话
+  local tool_orchestrator = require("NeoAI.core.ai.tool_orchestrator")
+  tool_orchestrator.unregister_sub_agent_session(sub_agent_id)
 end
 
--- ========== 请求 AI 生成 ==========
+-- ========== AI 生成请求 ==========
 
+--- 发起子 agent 的 AI 生成请求
+--- 由 tool_orchestrator._request_generation 在子 agent 需要下一轮生成时调用
+--- @param sub_agent_id string
 function M._request_generation(sub_agent_id)
-  local runner = sub_agent_runners[sub_agent_id]
-  if not runner then
-    logger.warn("[sub_agent] _request_generation: runner not found for %s", sub_agent_id)
+  local tool_orchestrator = require("NeoAI.core.ai.tool_orchestrator")
+  local ss = tool_orchestrator.get_session_state(sub_agent_id)
+  if not ss or ss.stop_requested then
     return
   end
-  if runner.stop_requested then
-    logger.warn("[sub_agent] _request_generation: stop_requested for %s", sub_agent_id)
-    return
-  end
-  logger.info(
-    "[sub_agent] _request_generation: id=%s, iter=%d, max=%d",
-    sub_agent_id,
-    runner.iteration_count,
-    runner.max_iterations
-  )
 
-  -- 退出时跳过，防止死循环
+  -- 退出时跳过
   if require("NeoAI.core.shutdown_flag").is_set() then
     return
   end
 
   -- 检查迭代上限
-  if runner.iteration_count >= runner.max_iterations then
-    M._finalize_sub_agent(sub_agent_id)
+  local max_iter = ss.max_iterations or 10
+  if ss.current_iteration >= max_iter then
+    M._finalize_sub_agent(sub_agent_id, "达到最大迭代轮次")
     return
   end
 
-  -- 递增迭代计数
-  runner.iteration_count = runner.iteration_count + 1
-
-  -- 同步迭代计数到 plan_executor，确保 should_continue 检查正确的值
-  plan_executor.update_iteration_count(sub_agent_id, runner.iteration_count)
+  -- 同步迭代计数到 plan_executor
+  plan_executor.update_iteration_count(sub_agent_id, ss.current_iteration + 1)
 
   -- 检查是否应该继续
   if not plan_executor.should_continue(sub_agent_id) then
@@ -360,19 +168,16 @@ function M._request_generation(sub_agent_id)
     return
   end
 
-  -- 生成新的 generation_id，避免 HTTP 客户端去重机制阻塞后续轮次
-  -- 同一个 generation_id 的重复请求会被 http_utils.check_dedup 忽略（TTL=3s）
-  local old_generation_id = runner.generation_id
-  runner.generation_id = "sub_agent_" .. sub_agent_id .. "_" .. os.time() .. "_" .. math.random(10000, 99999)
-  -- 清除旧的去重缓存，确保新请求不被忽略
+  -- 生成新的 generation_id
+  local old_generation_id = ss.generation_id
+  ss.generation_id = "sub_agent_" .. sub_agent_id .. "_" .. os.time() .. "_" .. math.random(10000, 99999)
   pcall(function()
-require("NeoAI.utils.http_utils").clear_dedup(old_generation_id)
+    require("NeoAI.utils.http_utils").clear_dedup(old_generation_id)
   end)
 
   -- 构建子 agent 的系统提示词
   local context = plan_executor.get_sub_agent_context(sub_agent_id)
   if not context then
-    logger.warn("[sub_agent] _request_generation: context not found for %s, finalizing", sub_agent_id)
     M._finalize_sub_agent(sub_agent_id)
     return
   end
@@ -380,28 +185,25 @@ require("NeoAI.utils.http_utils").clear_dedup(old_generation_id)
 
   -- 构建消息列表
   local messages = {}
-  -- 系统提示词放在最前面
   table.insert(messages, {
     role = "system",
     content = system_prompt,
   })
-  -- 从 runner 中获取子 agent 的消息历史
-  -- 注意：过滤掉末尾孤立的 assistant 消息（带 tool_calls 但后续没有 tool 消息），
-  -- 这种情况可能发生在子 agent 初始消息中包含了主 agent 的最后一条 assistant 消息
-  local runner_msgs = runner.messages or {}
-  -- 深拷贝一份，避免修改原始 runner.messages
+
+  -- 从 ss.messages 中获取子 agent 的消息历史
+  local runner_msgs = ss.messages or {}
   local filtered_msgs = {}
   for _, msg in ipairs(runner_msgs) do
     table.insert(filtered_msgs, vim.deepcopy(msg))
   end
-  -- 检查最后一条消息是否为带 tool_calls 的 assistant 消息
+
+  -- 检查并移除末尾孤立的 assistant 消息
   local last_msg = filtered_msgs[#filtered_msgs]
   local has_trailing_tool_calls = last_msg
     and last_msg.role == "assistant"
     and last_msg.tool_calls
     and #last_msg.tool_calls > 0
   if has_trailing_tool_calls then
-    -- 检查倒数第二条消息是否为匹配的 tool 消息
     local has_following_tool = false
     if #filtered_msgs >= 2 then
       local second_last = filtered_msgs[#filtered_msgs - 1]
@@ -415,19 +217,15 @@ require("NeoAI.utils.http_utils").clear_dedup(old_generation_id)
       end
     end
     if not has_following_tool then
-      -- 移除最后一条孤立的 assistant 消息
       table.remove(filtered_msgs)
     end
   end
+
   for _, msg in ipairs(filtered_msgs) do
     table.insert(messages, msg)
   end
 
-  -- 检查是否需要添加 user 消息来触发 AI 生成
-  -- 条件：过滤后只有 system 提示词（没有 user/assistant/tool 消息）
-  -- 这种情况可能发生在：
-  --   1. 首次请求且 runner.messages 为空
-  --   2. runner.messages 中所有消息都被过滤掉（如只有孤立 assistant 消息）
+  -- 检查是否需要添加 user 消息
   local has_non_system = false
   for _, msg in ipairs(messages) do
     if msg.role ~= "system" then
@@ -439,30 +237,47 @@ require("NeoAI.utils.http_utils").clear_dedup(old_generation_id)
     table.insert(messages, {
       role = "user",
       content = string.format(
-        "请执行以下任务：%s\n\n请使用可用的工具来完成此任务。完成任务后，请说明结果。",
+        "请继续执行以下任务：%s\n\n请使用可用的工具来完成此任务。",
         context.task
       ),
     })
   end
 
-  -- 触发 TOOL_RESULT_RECEIVED 事件，让 AI 生成下一轮回复
+  -- 触发 TOOL_RESULT_RECEIVED 事件
   vim.api.nvim_exec_autocmds("User", {
     pattern = event_constants.TOOL_RESULT_RECEIVED,
     data = {
-      generation_id = runner.generation_id,
+      generation_id = ss.generation_id,
       tool_results = {},
-      session_id = runner.session_id,
-      window_id = runner.window_id,
+      session_id = ss._parent_session_id or sub_agent_id,
+      window_id = ss.window_id,
       messages = messages,
-      options = runner.options,
-      model_index = runner.model_index,
-      ai_preset = runner.ai_preset,
+      options = ss.options,
+      model_index = ss.model_index,
+      ai_preset = ss.ai_preset,
       is_final_round = false,
-      accumulated_usage = runner.accumulated_usage or {},
-      last_reasoning = runner.last_reasoning,
+      accumulated_usage = ss.accumulated_usage or {},
+      last_reasoning = ss.last_reasoning,
       _sub_agent_id = sub_agent_id,
     },
   })
+end
+
+-- ========== 辅助函数 ==========
+
+--- 注入子 agent ID 到工具调用
+--- @param tool_calls table
+--- @param sub_agent_id string
+function M.inject_sub_agent_id(tool_calls, sub_agent_id)
+  for _, tc in ipairs(tool_calls or {}) do
+    local func = tc["function"] or tc.func
+    if func then
+      local args = func.arguments
+      if type(args) == "table" then
+        args._sub_agent_id = sub_agent_id
+      end
+    end
+  end
 end
 
 --- 构建子 agent 系统提示词
@@ -530,184 +345,17 @@ function _build_sub_agent_system_prompt(context)
   return prompt
 end
 
--- ========== 消息管理 ==========
-
-function M._add_tool_result_to_messages(sub_agent_id, tool_call_id, tool_name, result)
-  local runner = sub_agent_runners[sub_agent_id]
-  if not runner then
-    return
-  end
-
-  local safe_id = tool_call_id or ("sub_call_" .. os.time() .. "_" .. math.random(10000, 99999))
-  local result_str = type(result) == "string" and result
-    or (result ~= nil and pcall(vim.json.encode, result) and vim.json.encode(result) or tostring(result))
-    or ""
-
-  local tool_msg = {
-    role = "tool",
-    tool_call_id = safe_id,
-    content = result_str,
-    timestamp = os.time(),
-    window_id = runner.window_id,
-  }
-  if tool_name then
-    tool_msg.name = tool_name
-  end
-  table.insert(runner.messages, tool_msg)
-
-  plan_executor.record_message(sub_agent_id, "tool", result_str:sub(1, 500))
-end
-
--- ========== 子 agent 完成处理 ==========
-
-function M._finalize_sub_agent(sub_agent_id)
-  local runner = sub_agent_runners[sub_agent_id]
-  if not runner then
-    return
-  end
-
-  -- 标记子 agent 完成
-  plan_executor._finalize_sub_agent(sub_agent_id)
-
-  -- 获取执行总结
-  local summary = plan_executor.get_summary(sub_agent_id) or "子 agent 执行完成，但未生成总结"
-
-  -- 通过回调返回总结给主 agent
-  if runner.on_summary then
-    local cb = runner.on_summary
-    runner.on_summary = nil
-    pcall(cb, summary)
-  end
-
-  -- 清理 runner
-  sub_agent_runners[sub_agent_id] = nil
-end
-
 -- ========== 停止控制 ==========
 
 function M.request_stop(sub_agent_id)
-  local runner = sub_agent_runners[sub_agent_id]
-  if runner then
-    runner.stop_requested = true
-    if next(runner.active_tool_calls) ~= nil then
-      runner.active_tool_calls = {}
-      vim.schedule(function()
-        M._on_tools_complete(sub_agent_id)
-      end)
-    end
-  end
+  local tool_orchestrator = require("NeoAI.core.ai.tool_orchestrator")
+  tool_orchestrator.request_stop(sub_agent_id)
 end
 
 function M.is_running(sub_agent_id)
-  local runner = sub_agent_runners[sub_agent_id]
-  return runner ~= nil and not runner.stop_requested
-end
-
--- ========== AI 生成完成回调 ==========
-
---- 由 ai_engine 在子 agent 的 AI 生成完成后调用
---- @param data table 包含 tool_calls, content, generation_id, session_id, _sub_agent_id 等
-function M.on_generation_complete(data)
-  local sub_agent_id = data._sub_agent_id
-  if not sub_agent_id then
-    logger.warn("[sub_agent] on_generation_complete: no sub_agent_id")
-    return
-  end
-
-  local runner = sub_agent_runners[sub_agent_id]
-  if not runner then
-    logger.warn("[sub_agent] on_generation_complete: runner not found for %s", sub_agent_id)
-    return
-  end
-  if runner.stop_requested then
-    logger.warn("[sub_agent] on_generation_complete: stop_requested for %s", sub_agent_id)
-    return
-  end
-
-  -- 互斥锁：防止 _round_in_progress 为 true 时重复进入
-  if runner._round_in_progress then
-    logger.warn("[sub_agent] on_generation_complete: round in progress for %s", sub_agent_id)
-    return
-  end
-  logger.info(
-    "[sub_agent] on_generation_complete: id=%s, tool_calls=%d, content_len=%d",
-    sub_agent_id,
-    #(data.tool_calls or {}),
-    #(data.content or "")
-  )
-  runner._round_in_progress = true
-
-  -- 同步 runner 的 generation_id 为当前完成轮的 ID
-  -- 确保后续 _request_generation 使用正确的 generation_id
-  if data.generation_id then
-    runner.generation_id = data.generation_id
-  end
-
-  local tool_calls = data.tool_calls or {}
-  local content = data.content or ""
-
-  -- 过滤无效工具调用
-  local valid_tool_calls = {}
-  for _, tc in ipairs(tool_calls) do
-    local func = tc["function"] or tc.func
-    if func and func.name and func.name ~= "" then
-      local args = func.arguments
-      if args ~= nil and args ~= "" then
-        table.insert(valid_tool_calls, tc)
-      end
-    end
-  end
-  tool_calls = valid_tool_calls
-
-  -- 记录 AI 回复（包含 tool_calls，确保消息历史完整性）
-  if content and content ~= "" then
-    plan_executor.record_message(sub_agent_id, "assistant", content)
-    local assistant_msg = {
-      role = "assistant",
-      content = content,
-      timestamp = os.time(),
-      window_id = runner.window_id,
-    }
-    -- 保存 tool_calls 到 assistant 消息，避免 tool 消息成为孤立消息
-    if #tool_calls > 0 then
-      assistant_msg.tool_calls = tool_calls
-    end
-    table.insert(runner.messages, assistant_msg)
-  elseif #tool_calls > 0 then
-    -- 即使 content 为空，也要保存带 tool_calls 的 assistant 消息
-    plan_executor.record_message(sub_agent_id, "assistant", "")
-    table.insert(runner.messages, {
-      role = "assistant",
-      content = "",
-      tool_calls = tool_calls,
-      timestamp = os.time(),
-      window_id = runner.window_id,
-    })
-  end
-
-  -- 注入子 agent ID 到工具调用
-  M.inject_sub_agent_id(tool_calls, sub_agent_id)
-
-  -- 判断是否应该结束
-  local should_finalize = false
-
-  if #tool_calls == 0 then
-    -- AI 返回纯文本回复，没有工具调用 → 子 agent 完成
-    should_finalize = true
-  elseif runner.iteration_count >= runner.max_iterations then
-    -- 达到最大迭代次数
-    should_finalize = true
-  end
-
-  if should_finalize then
-    runner._round_in_progress = false
-    M._finalize_sub_agent(sub_agent_id)
-    return
-  end
-
-  -- 继续工具循环
-  runner._round_in_progress = false
-  M._execute_tools(sub_agent_id, tool_calls)
+  local tool_orchestrator = require("NeoAI.core.ai.tool_orchestrator")
+  local ss = tool_orchestrator.get_session_state(sub_agent_id)
+  return ss ~= nil and not ss.stop_requested
 end
 
 -- ========== 清理 ==========

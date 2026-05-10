@@ -7,3 +7,4 @@ output.txt
 *.log
 !lua/NeoAI/tests/
 !lua/NeoAI/tests/*.lua
+./lua/NeoAI/tests/deepseek_responses/

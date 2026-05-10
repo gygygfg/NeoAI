@@ -1,5 +1,5 @@
--- 循环调用管理器（事件驱动架构）
--- 负责管理 AI 工具调用的循环执行
+-- 统一的工具循环引擎（事件驱动架构）
+-- 负责管理主 agent 和子 agent 的工具调用循环执行
 --
 -- 阶段定义：
 --   idle          - 空闲状态
@@ -10,6 +10,11 @@
 -- 工具包支持：
 --   同一工具包内的多个工具调用会被分组并发执行
 --   UI 按包分组显示执行状态
+--
+-- 子 agent 支持：
+--   通过 _sub_agent_id 区分主 agent 和子 agent 的会话
+--   子 agent 拥有独立的会话状态（消息、迭代计数、停止标志）
+--   所有工具执行的循环控制统一由本模块管理
 
 local M = {}
 
@@ -19,7 +24,6 @@ local tool_pack = require("NeoAI.tools.tool_pack")
 local shutdown_flag = require("NeoAI.core.shutdown_flag")
 local response_retry = require("NeoAI.core.ai.response_retry")
 local state_manager = require("NeoAI.core.config.state")
-local sub_agent_engine = require("NeoAI.core.ai.sub_agent_engine")
 local plan_executor = require("NeoAI.tools.builtin.plan_executor")
 
 -- ========== 状态 ==========
@@ -30,7 +34,8 @@ local state = {
   initialized = false,
   config = nil,
   max_iterations = 20,
-  sessions = {},
+  sessions = {},            -- 主 agent 会话
+  sub_agent_sessions = {},  -- 子 agent 会话（sub_agent_id -> session state）
 }
 
 -- ========== 辅助函数 ==========
@@ -236,15 +241,10 @@ function M.register_session(session_id, window_id)
         end
 
         -- 累积 usage
-        -- 注意：总结轮次（_summary_in_progress）时，_finalize_generation 中
-        -- generation.accumulated_usage 已包含历史累积 + 当前轮次 usage，
-        -- 直接赋值给 s.accumulated_usage 即可，避免重复累加
         if data.usage and next(data.usage) then
           if s._summary_in_progress then
-            -- 总结轮次：_finalize_generation 中的 accumulated_usage 已包含完整历史
             s.accumulated_usage = vim.deepcopy(data.usage)
           else
-            -- 普通轮次：逐轮累加 usage
             local acc = s.accumulated_usage or {}
             acc.prompt_tokens = (acc.prompt_tokens or 0) + (data.usage.prompt_tokens or data.usage.input_tokens or 0)
             acc.completion_tokens = (acc.completion_tokens or 0)
@@ -265,8 +265,7 @@ function M.register_session(session_id, window_id)
           s.last_reasoning = data.reasoning_text
         end
 
-        -- 总结轮次完成：清理状态，不再触发 GENERATION_COMPLETED 事件
-        -- _finalize_generation 已触发 GENERATION_COMPLETED 事件，chat_window 已处理
+        -- 总结轮次完成：清理状态
         if s._summary_in_progress then
           s._summary_in_progress = false
           s.phase = "idle"
@@ -296,6 +295,56 @@ function M.unregister_session(session_id)
   state.sessions[session_id] = nil
 end
 
+-- ========== 子 agent 会话管理 ==========
+
+--- 注册子 agent 会话到 tool_orchestrator
+--- 子 agent 使用独立的会话状态（消息、迭代计数、停止标志）
+--- @param sub_agent_id string
+--- @param session_id string 所属主 agent 的 session_id
+--- @param window_id number|nil
+--- @param params table 初始参数 { messages, options, model_index, ai_preset, on_summary }
+function M.register_sub_agent_session(sub_agent_id, session_id, window_id, params)
+  if state.sub_agent_sessions[sub_agent_id] then
+    return
+  end
+
+  local ss = create_session_state(sub_agent_id, window_id)
+  ss._is_sub_agent = true
+  ss._parent_session_id = session_id
+  ss.messages = params.messages or {}
+  ss.options = params.options or {}
+  ss.model_index = params.model_index or 1
+  ss.ai_preset = params.ai_preset or {}
+  ss._on_summary = params.on_summary
+  ss.max_iterations = params.max_iterations or 10
+
+  state.sub_agent_sessions[sub_agent_id] = ss
+end
+
+--- 注销子 agent 会话
+--- @param sub_agent_id string
+function M.unregister_sub_agent_session(sub_agent_id)
+  local ss = state.sub_agent_sessions[sub_agent_id]
+  if not ss then
+    return
+  end
+  for _, id in ipairs(ss.autocmd_ids or {}) do
+    pcall(vim.api.nvim_del_autocmd, id)
+  end
+  state.sub_agent_sessions[sub_agent_id] = nil
+end
+
+--- 获取会话状态（支持主 agent 和子 agent）
+--- @param id string session_id 或 sub_agent_id
+--- @param is_sub_agent boolean|nil
+--- @return table|nil
+function M._get_session(id, is_sub_agent)
+  if is_sub_agent then
+    return state.sub_agent_sessions[id]
+  end
+  return state.sessions[id]
+end
+
 -- ========== 循环调度 ==========
 
 -- 全局 ESC 停止监听器 ID（在循环开始时注册，结束时清理）
@@ -316,18 +365,34 @@ function M.start_async_loop(params)
   end
 
   -- 通过闭包捕获当前协程上下文（如果存在），供后续工具执行路径使用
-  -- 工具执行路径（_execute_tools → _execute_single_tool → execute_async）
-  -- 通过 vim.schedule 调度，不在协程上下文中，因此需要手动恢复
   local coroutine_ctx = state_manager.get_current_context()
 
   local session_id = params.session_id
   local window_id = params.window_id
+  local sub_agent_id = params._sub_agent_id
+  local is_sub_agent = sub_agent_id ~= nil
 
-  if not state.sessions[session_id] then
-    M.register_session(session_id, window_id)
+  -- 确定会话 ID 和会话存储
+  local sid = is_sub_agent and sub_agent_id or session_id
+  local sessions_table = is_sub_agent and state.sub_agent_sessions or state.sessions
+
+  if not sessions_table[sid] then
+    if is_sub_agent then
+      -- 子 agent 会话应由 register_sub_agent_session 预先注册
+      logger.warn("[tool_orchestrator] start_async_loop: 子 agent 会话 %s 未注册，自动创建", sid)
+      M.register_sub_agent_session(sub_agent_id, session_id, window_id, {
+        messages = params.messages or {},
+        options = params.options or {},
+        model_index = params.model_index or 1,
+        ai_preset = params.ai_preset or {},
+        on_summary = params.on_summary,
+      })
+    else
+      M.register_session(session_id, window_id)
+    end
   end
 
-  local ss = state.sessions[session_id]
+  local ss = sessions_table[sid]
   ss.generation_id = params.generation_id
   ss.current_iteration = 0
   ss.stop_requested = false
@@ -338,26 +403,30 @@ function M.start_async_loop(params)
   ss.on_complete = params.on_complete
   ss.accumulated_usage = {}
   ss.last_reasoning = nil
-  ss._coroutine_ctx = coroutine_ctx -- 保存协程上下文，供工具执行路径恢复
+  ss._coroutine_ctx = coroutine_ctx
+  ss._is_sub_agent = is_sub_agent
+  ss._parent_session_id = is_sub_agent and session_id or nil
 
   ss.current_iteration = 1
-  ss._tool_retry_count = 0 -- 新循环开始时重置重试计数
-
-  -- 工具包分组信息已由 _execute_tools 中的 TOOL_LOOP_STARTED 事件携带
-  -- 这里不再调用 fire_loop_started，避免重复触发
+  ss._tool_retry_count = 0
 
   -- 注册全局 ESC 停止监听器（仅在循环开始时注册一次）
-  -- 确保工具调用和循环过程中按 ESC 能立即停止
   if not _stop_listener_id then
     _stop_listener_id = vim.api.nvim_create_autocmd("User", {
       pattern = event_constants.CANCEL_GENERATION,
       callback = function()
-        -- 停止所有会话的工具循环
-        for sid, _ in pairs(state.sessions) do
-          local s = state.sessions[sid]
+        -- 停止所有主 agent 会话
+        for sid, s in pairs(state.sessions) do
           if s then
             s.stop_requested = true
-            s.user_cancelled = true -- 标记为用户取消，不触发总结
+            s.user_cancelled = true
+            s.active_tool_calls = {}
+          end
+        end
+        -- 停止所有子 agent 会话
+        for sid, s in pairs(state.sub_agent_sessions) do
+          if s then
+            s.stop_requested = true
             s.active_tool_calls = {}
           end
         end
@@ -368,13 +437,14 @@ function M.start_async_loop(params)
     })
   end
 
-  M._execute_tools(session_id, params.tool_calls or {})
+  M._execute_tools(sid, params.tool_calls or {}, is_sub_agent)
 end
 
 -- ========== 工具执行 ==========
 
-function M._execute_tools(session_id, tool_calls)
-  local ss = state.sessions[session_id]
+function M._execute_tools(session_id, tool_calls, is_sub_agent)
+  local sessions_table = is_sub_agent and state.sub_agent_sessions or state.sessions
+  local ss = sessions_table[session_id]
   if not ss then
     return
   end
@@ -385,12 +455,25 @@ function M._execute_tools(session_id, tool_calls)
   end
 
   if #tool_calls == 0 then
-    -- 即使没有工具调用也刷新 UI，确保生成状态可见
     vim.schedule(function()
-      M._request_generation(session_id)
+      M._request_generation(session_id, is_sub_agent)
     end)
     return
   end
+
+  -- 调试日志：追踪 _execute_tools 调用
+  local tool_names = {}
+  for _, tc in ipairs(tool_calls) do
+    local func = tc["function"] or tc.func
+    table.insert(tool_names, func and func.name or "unknown")
+  end
+  require("NeoAI.utils.logger").debug("[DEBUG_DUP] _execute_tools: session=%s, tools=%s, phase=%s, iter=%d, stack=%s",
+    tostring(session_id),
+    table.concat(tool_names, ","),
+    tostring(ss.phase),
+    ss.current_iteration or 0,
+    debug.traceback()
+  )
 
   ss.phase = "waiting_tools"
   ss.active_tool_calls = {}
@@ -423,12 +506,13 @@ function M._execute_tools(session_id, tool_calls)
 
   -- 所有工具并发执行（保持原有异步并发行为）
   for _, tc in ipairs(tool_calls) do
-    M._execute_single_tool(session_id, tc)
+    M._execute_single_tool(session_id, tc, is_sub_agent)
   end
 end
 
-function M._execute_single_tool(session_id, tool_call)
-  local ss = state.sessions[session_id]
+function M._execute_single_tool(session_id, tool_call, is_sub_agent)
+  local sessions_table = is_sub_agent and state.sub_agent_sessions or state.sessions
+  local ss = sessions_table[session_id]
   if not ss or not tool_call then
     return
   end
@@ -452,6 +536,15 @@ function M._execute_single_tool(session_id, tool_call)
     return
   end
 
+  -- 调试日志：追踪 _execute_single_tool 调用
+  require("NeoAI.utils.logger").debug("[DEBUG_DUP] _execute_single_tool: session=%s, tool=%s, tool_call_id=%s, active_count=%d, stack=%s",
+    tostring(session_id),
+    tostring(tool_name),
+    tostring(tool_call.id or "nil"),
+    vim.tbl_count(ss.active_tool_calls or {}),
+    debug.traceback()
+  )
+
   -- 生成唯一 tool_call_id
   if not M._tool_call_counter then
     M._tool_call_counter = 0
@@ -462,16 +555,37 @@ function M._execute_single_tool(session_id, tool_call)
   tool_call.id = tool_call_id
   ss.active_tool_calls[tool_call_id] = true
 
-  -- ===== 检测子 agent 工具调用 =====
-  if tool_name == "create_sub_agent" then
-    -- 将 create_sub_agent 委托给子 agent 引擎处理
-    -- arguments 已在 http_client 中解析为 Lua table
+  -- ===== 子 agent 工具调用边界审核 =====
+  if is_sub_agent then
+    local args = tool_func.arguments or {}
+    if type(args) ~= "table" then
+      args = {}
+    end
+    local sub_agent_engine = require("NeoAI.core.ai.sub_agent_engine")
+    local allowed, reason = sub_agent_engine.review_tool_call(session_id, tool_name, args)
+    if not allowed then
+      local result_str = string.format(
+        "[调度 agent 驳回] 工具 '%s' 的调用被拒绝。原因: %s\n此工具不在你的允许列表中，请不要再尝试调用它。请使用其他允许的工具继续完成任务，或直接返回文本说明任务无法完成。",
+        tool_name,
+        reason
+      )
+      M._add_tool_result_to_messages(session_id, tool_call_id, tool_name, result_str, is_sub_agent)
+      ss.active_tool_calls[tool_call_id] = nil
+      local remaining = vim.tbl_count(ss.active_tool_calls)
+      if remaining == 0 then
+        M._on_tools_complete(session_id, is_sub_agent)
+      end
+      return
+    end
+  end
+
+  -- ===== 检测 create_sub_agent 工具调用（仅主 agent） =====
+  if tool_name == "create_sub_agent" and not is_sub_agent then
     local args = tool_func.arguments or {}
     if type(args) ~= "table" then
       args = {}
     end
 
-    -- 通过 tool_executor 执行 create_sub_agent（创建子 agent 记录）
     local tool_executor = require("NeoAI.tools.tool_executor")
     local pack_name = tool_pack.get_pack_for_tool(tool_name)
 
@@ -483,7 +597,7 @@ function M._execute_single_tool(session_id, tool_call)
       pack_name = pack_name,
     }, {
       on_result = function(success, result)
-        local s = state.sessions[session_id]
+        local s = sessions_table[session_id]
         if not s then
           return
         end
@@ -491,42 +605,39 @@ function M._execute_single_tool(session_id, tool_call)
         if s.stop_requested then
           s.active_tool_calls[tool_call_id] = nil
           if vim.tbl_count(s.active_tool_calls) == 0 then
-            M._on_tools_complete(session_id)
+            M._on_tools_complete(session_id, is_sub_agent)
           end
           return
         end
 
         if success and result then
-          -- 解析创建结果，获取 sub_agent_id
           local result_str = type(result) == "string" and result or ""
           local ok2, parsed_result = pcall(vim.json.decode, result_str)
           local sub_agent_id = parsed_result and parsed_result.sub_agent_id or nil
 
-          -- 记录子 agent 创建消息
           if sub_agent_id then
             plan_executor.record_message(sub_agent_id, "system", "子 agent 已创建，任务: " .. (args.task or ""))
           end
 
-          -- 将创建结果加入主 agent 消息
-          M._add_tool_result_to_messages(session_id, tool_call_id, tool_name, result_str)
+          M._add_tool_result_to_messages(session_id, tool_call_id, tool_name, result_str, is_sub_agent)
 
-          -- 如果成功创建了子 agent，启动子 agent 的工具循环
           if sub_agent_id then
-            -- 保存 on_summary 回调，用于接收子 agent 的总结
-            local sub_agent_runner = {
-              sub_agent_id = sub_agent_id,
-              messages = {}, -- 子 agent 不继承主 agent 的消息历史，只接收任务指令
+            -- 注册子 agent 会话到 tool_orchestrator
+            M.register_sub_agent_session(sub_agent_id, session_id, ss.window_id, {
+              messages = {},
+              options = ss.options,
+              model_index = ss.model_index,
+              ai_preset = ss.ai_preset,
               on_summary = function(summary)
-                -- 子 agent 完成时，将总结作为工具结果加入主 agent 消息
-                local s2 = state.sessions[session_id]
+                local s2 = sessions_table[session_id]
                 if not s2 then
                   return
                 end
 
-                local summary_msg =
-                  string.format("【子 agent 执行完成】\n子 agent ID: %s\n\n%s", sub_agent_id, summary)
+                local summary_msg = string.format(
+                  "【子 agent 执行完成】\n子 agent ID: %s\n\n%s", sub_agent_id, summary
+                )
 
-                -- 将总结作为 user 消息加入主 agent 上下文
                 table.insert(s2.messages, {
                   role = "user",
                   content = summary_msg,
@@ -534,66 +645,50 @@ function M._execute_single_tool(session_id, tool_call)
                   window_id = s2.window_id,
                 })
 
-                -- 通知用户子 agent 执行完成
                 vim.notify(string.format("[NeoAI] 子 agent [%s] 执行完成", sub_agent_id), vim.log.levels.INFO)
 
-                -- 触发 UI 刷新，让用户看到总结消息
                 local chat_window = require("NeoAI.ui.window.chat_window")
                 pcall(chat_window.render_chat)
 
-                -- 清理子 agent 资源
                 plan_executor.cleanup_sub_agent(sub_agent_id)
+                M.unregister_sub_agent_session(sub_agent_id)
               end,
-            }
-
-            -- 存储子 agent runner 引用
-            if not ss._sub_agent_runners then
-              ss._sub_agent_runners = {}
-            end
-            ss._sub_agent_runners[sub_agent_id] = sub_agent_runner
+              max_iterations = (args.boundaries and args.boundaries.max_iterations) or 10,
+            })
 
             -- 启动子 agent 的工具循环（异步，不阻塞主 agent）
             vim.schedule(function()
+              local sub_agent_engine = require("NeoAI.core.ai.sub_agent_engine")
               sub_agent_engine.start_sub_agent_loop(sub_agent_id, {}, {
                 session_id = session_id,
                 window_id = ss.window_id,
-                messages = {}, -- 子 agent 不继承主 agent 的消息历史
+                messages = {},
                 options = ss.options,
                 model_index = ss.model_index,
                 ai_preset = ss.ai_preset,
-                on_summary = sub_agent_runner.on_summary,
+                on_summary = nil, -- 由 tool_orchestrator 的 on_summary 处理
               })
             end)
           end
         else
-          -- create_sub_agent 失败
           local err_msg = type(result) == "string" and result or "创建子 agent 失败"
-          M._add_tool_result_to_messages(session_id, tool_call_id, tool_name, err_msg)
+          M._add_tool_result_to_messages(session_id, tool_call_id, tool_name, err_msg, is_sub_agent)
         end
 
         s.active_tool_calls[tool_call_id] = nil
         local remaining = vim.tbl_count(s.active_tool_calls)
         if remaining == 0 and s.phase ~= "round_complete" then
-          M._on_tools_complete(session_id)
+          M._on_tools_complete(session_id, is_sub_agent)
         end
       end,
     })
     return
   end
 
-  -- ===== 检测子 agent 的其他工具调用（由子 agent 引擎处理） =====
-  -- 这些工具调用已被 sub_agent_engine 拦截，不会到达这里
-
-  -- 获取工具所属包名
+  -- ===== 普通工具执行 =====
   local pack_name = tool_pack.get_pack_for_tool(tool_name)
-
-  -- 委托给 tool_executor.execute_with_orchestrator
-  -- 参数规范化、URL 解码、别名映射、超时管理全部由 tool_executor 负责
   local tool_executor = require("NeoAI.tools.tool_executor")
 
-  -- 在协程上下文中执行工具（如果存在保存的协程上下文）
-  -- 确保 tool_validator.check_approval → approval_handler.is_allow_all
-  -- 能正确读取当前协程的共享变量
   local execute_fn = function()
     tool_executor.execute_with_orchestrator(tool_name, tool_func.arguments, {
       session_id = session_id,
@@ -603,7 +698,7 @@ function M._execute_single_tool(session_id, tool_call)
       pack_name = pack_name,
     }, {
       on_result = function(success, result)
-        local s = state.sessions[session_id]
+        local s = sessions_table[session_id]
         if not s then
           return
         end
@@ -611,19 +706,19 @@ function M._execute_single_tool(session_id, tool_call)
         if s.stop_requested then
           s.active_tool_calls[tool_call_id] = nil
           if vim.tbl_count(s.active_tool_calls) == 0 then
-            M._on_tools_complete(session_id)
+            M._on_tools_complete(session_id, is_sub_agent)
           end
           return
         end
 
         local result_str = success and result or ("[工具执行失败] " .. result)
-        M._add_tool_result_to_messages(session_id, tool_call_id, tool_name, result_str)
+        M._add_tool_result_to_messages(session_id, tool_call_id, tool_name, result_str, is_sub_agent)
 
         s.active_tool_calls[tool_call_id] = nil
         local remaining = vim.tbl_count(s.active_tool_calls)
 
         if remaining == 0 and s.phase ~= "round_complete" then
-          M._on_tools_complete(session_id)
+          M._on_tools_complete(session_id, is_sub_agent)
         end
       end,
     })
@@ -638,8 +733,9 @@ end
 
 -- ========== 完成检查 ==========
 
-function M._on_tools_complete(session_id)
-  local ss = state.sessions[session_id]
+function M._on_tools_complete(session_id, is_sub_agent)
+  local sessions_table = is_sub_agent and state.sub_agent_sessions or state.sessions
+  local ss = sessions_table[session_id]
   if not ss then
     return
   end
@@ -647,12 +743,28 @@ function M._on_tools_complete(session_id)
   if is_shutting_down() then
     return
   end
+
+  -- 调试日志：追踪 _on_tools_complete 调用
+  require("NeoAI.utils.logger").debug("[DEBUG_DUP] _on_tools_complete: session=%s, phase=%s, iter=%d, _tools_complete_in_progress=%s, active_count=%d, stack=%s",
+    tostring(session_id),
+    tostring(ss.phase),
+    ss.current_iteration or 0,
+    tostring(ss._tools_complete_in_progress),
+    vim.tbl_count(ss.active_tool_calls or {}),
+    debug.traceback()
+  )
+
   if ss._tools_complete_in_progress then
     return
   end
   ss._tools_complete_in_progress = true
 
   if ss.stop_requested then
+    -- 停止时关闭工具调用悬浮窗
+    pcall(function()
+      local tool_display = require("NeoAI.ui.components.tool_display")
+      tool_display._close_display()
+    end)
     ss.phase = "idle"
     ss._tools_complete_in_progress = false
     -- 退出时直接跳过，不触发任何事件或总结
@@ -668,7 +780,7 @@ function M._on_tools_complete(session_id)
       local saved_reasoning = ss.last_reasoning or ""
       fire_loop_finished(ss)
       once_display_closed(session_id, function()
-        local s = state.sessions[session_id]
+        local s = sessions_table[session_id]
         if not s then
           return
         end
@@ -687,7 +799,6 @@ function M._on_tools_complete(session_id)
             duration = 0,
           },
         })
-        -- 调用 on_complete 回调
         if s.on_complete then
           local cb = s.on_complete
           s.on_complete = nil
@@ -698,28 +809,29 @@ function M._on_tools_complete(session_id)
     end
     fire_loop_finished(ss)
     once_display_closed(session_id, function()
-      local s = state.sessions[session_id]
+      local s = sessions_table[session_id]
       if not s then
         return
       end
       if is_shutting_down() then
         return
       end
-      M._request_summary_round(session_id)
+      M._request_summary_round(session_id, is_sub_agent)
     end)
     return
   end
 
   if ss.phase == "waiting_tools" then
     ss.phase = "waiting_model"
-    ss._tools_complete_in_progress = false
     fire_loop_finished(ss)
     once_display_closed(session_id, function()
-      local s = state.sessions[session_id]
+      local s = sessions_table[session_id]
       if not s then
         return
       end
-      -- 检查是否正在退出，避免在退出过程中触发事件导致卡死
+      -- 在回调内部重置 _tools_complete_in_progress，防止在异步调度期间
+      -- 被第二次 _on_tools_complete 调用绕过保护
+      s._tools_complete_in_progress = false
       if is_shutting_down() then
         return
       end
@@ -729,18 +841,19 @@ function M._on_tools_complete(session_id)
         )
         return
       end
-      M._request_generation(session_id)
+      M._request_generation(session_id, is_sub_agent)
     end)
   elseif ss.phase == "round_complete" then
     ss._tools_complete_in_progress = false
-    M._proceed_to_next_round(session_id)
+    M._proceed_to_next_round(session_id, is_sub_agent)
   else
     ss._tools_complete_in_progress = false
   end
 end
 
-function M._check_round_complete(session_id)
-  local ss = state.sessions[session_id]
+function M._check_round_complete(session_id, is_sub_agent)
+  local sessions_table = is_sub_agent and state.sub_agent_sessions or state.sessions
+  local ss = sessions_table[session_id]
   if not ss then
     return
   end
@@ -748,10 +861,14 @@ function M._check_round_complete(session_id)
   local active_count = vim.tbl_count(ss.active_tool_calls)
 
   if ss.stop_requested then
+    -- 停止时关闭工具调用悬浮窗
+    pcall(function()
+      local tool_display = require("NeoAI.ui.components.tool_display")
+      tool_display._close_display()
+    end)
     ss.phase = "idle"
-    -- 用户取消或跳过总结时不触发总结
     if not ss.user_cancelled then
-      M._request_summary_round(session_id)
+      M._request_summary_round(session_id, is_sub_agent)
     end
     return
   end
@@ -763,32 +880,37 @@ function M._check_round_complete(session_id)
         return
       end
       ss.phase = "round_complete"
-      M._proceed_to_next_round(session_id)
+      M._proceed_to_next_round(session_id, is_sub_agent)
     else
-      -- 模型先完成，但工具还在执行中：
-      -- 将 phase 设回 waiting_tools，等待工具完成后由 _on_tools_complete 处理
-      -- 避免 _on_tools_complete 跳过 fire_loop_finished → once_display_closed → _request_generation 的正常流程
       ss.phase = "waiting_tools"
     end
   elseif ss.phase == "waiting_tools" then
-    -- 工具先完成，模型后完成（正常路径）
-    -- _on_tools_complete 已将 phase 设为 waiting_model
-    -- 此时 active_count 应为 0，直接进入下一轮
     if active_count == 0 then
       if ss._proceed_in_progress then
         return
       end
       ss.phase = "round_complete"
-      M._proceed_to_next_round(session_id)
+      M._proceed_to_next_round(session_id, is_sub_agent)
     end
   end
 end
 
-function M._proceed_to_next_round(session_id)
-  local ss = state.sessions[session_id]
+function M._proceed_to_next_round(session_id, is_sub_agent)
+  local sessions_table = is_sub_agent and state.sub_agent_sessions or state.sessions
+  local ss = sessions_table[session_id]
   if not ss then
     return
   end
+
+  -- 调试日志：追踪 _proceed_to_next_round 调用
+  require("NeoAI.utils.logger").debug("[DEBUG_DUP] _proceed_to_next_round: session=%s, phase=%s, iter=%d, _proceed_in_progress=%s, stack=%s",
+    tostring(session_id),
+    tostring(ss.phase),
+    ss.current_iteration or 0,
+    tostring(ss._proceed_in_progress),
+    debug.traceback()
+  )
+
   if ss._proceed_in_progress then
     return
   end
@@ -797,20 +919,24 @@ function M._proceed_to_next_round(session_id)
   ss.phase = "idle"
   ss.active_tool_calls = {}
 
-  if ss.current_iteration >= state.max_iterations then
+  local max_iter = ss.max_iterations or state.max_iterations
+  if ss.current_iteration >= max_iter then
     ss._proceed_in_progress = false
     fire_loop_finished(ss)
-    M._finish_loop(session_id, true, "已达到最大迭代次数")
+    M._finish_loop(session_id, true, "已达到最大迭代次数", is_sub_agent)
     return
   end
 
   if ss.stop_requested then
+    -- 停止时关闭工具调用悬浮窗
+    pcall(function()
+      local tool_display = require("NeoAI.ui.components.tool_display")
+      tool_display._close_display()
+    end)
     ss._proceed_in_progress = false
-    -- 用户取消或跳过总结时不触发总结
     if not ss.user_cancelled then
-      M._request_summary_round(session_id)
+      M._request_summary_round(session_id, is_sub_agent)
     elseif ss._skip_summary then
-      -- 跳过总结时触发 GENERATION_COMPLETED 事件显示用量
       local saved_usage = ss.accumulated_usage or {}
       local saved_gen_id = ss.generation_id
       local saved_win_id = ss.window_id
@@ -844,21 +970,38 @@ function M._proceed_to_next_round(session_id)
   ss.phase = "waiting_model"
   ss._proceed_in_progress = false
 
-  M._request_generation(session_id)
+  -- 使用 vim.schedule 异步执行 _request_generation，防止 handle_tool_result
+  -- 的同步回调导致递归调用 _proceed_to_next_round，造成工具被重复执行
+  vim.schedule(function()
+    local s = sessions_table[session_id]
+    if not s or s.stop_requested then
+      return
+    end
+    M._request_generation(session_id, is_sub_agent)
+  end)
 end
 
 -- ========== 请求 AI 生成 ==========
 
-function M._request_generation(session_id)
-  local ss = state.sessions[session_id]
+function M._request_generation(session_id, is_sub_agent)
+  local sessions_table = is_sub_agent and state.sub_agent_sessions or state.sessions
+  local ss = sessions_table[session_id]
   if not ss or ss.stop_requested then
     return
   end
-  fire_tool_result_received(ss, false)
+
+  if is_sub_agent then
+    -- 子 agent 请求：传递 _sub_agent_id 标记
+    local sub_agent_engine = require("NeoAI.core.ai.sub_agent_engine")
+    sub_agent_engine._request_generation(session_id)
+  else
+    fire_tool_result_received(ss, false)
+  end
 end
 
-function M._request_summary_round(session_id)
-  local ss = state.sessions[session_id]
+function M._request_summary_round(session_id, is_sub_agent)
+  local sessions_table = is_sub_agent and state.sub_agent_sessions or state.sessions
+  local ss = sessions_table[session_id]
   if not ss then
     return
   end
@@ -895,36 +1038,39 @@ function M._request_summary_round(session_id)
   }
 
   once_display_closed(session_id, function()
-    local s = state.sessions[session_id]
+    local s = sessions_table[session_id]
     if not s then
       return
     end
-    -- 检查是否正在退出，避免在退出过程中触发事件导致卡死
     if is_shutting_down() then
       return
     end
-    -- 注意：不检查 stop_requested。总结轮次是由循环结束触发的最终行为，
-    -- 即使 stop_requested 为 true 也应执行总结，否则 AI 不会生成最终回复。
-    -- 临时清除 stop_requested 标志，避免 ai_engine.handle_tool_result 跳过总结轮次的 AI 请求
     local saved_stop_requested = s.stop_requested
     s.stop_requested = false
+
+    local event_data = {
+      generation_id = saved.generation_id,
+      tool_results = {},
+      session_id = session_id,
+      window_id = saved.window_id,
+      messages = saved.messages,
+      options = saved.options,
+      model_index = saved.model_index,
+      ai_preset = saved.ai_preset,
+      is_final_round = true,
+      accumulated_usage = saved.accumulated_usage,
+      last_reasoning = saved.last_reasoning,
+    }
+
+    -- 子 agent 总结轮次：传递 _sub_agent_id
+    if is_sub_agent then
+      event_data._sub_agent_id = session_id
+    end
+
     vim.api.nvim_exec_autocmds("User", {
       pattern = event_constants.TOOL_RESULT_RECEIVED,
-      data = {
-        generation_id = saved.generation_id,
-        tool_results = {},
-        session_id = session_id,
-        window_id = saved.window_id,
-        messages = saved.messages,
-        options = saved.options,
-        model_index = saved.model_index,
-        ai_preset = saved.ai_preset,
-        is_final_round = true,
-        accumulated_usage = saved.accumulated_usage,
-        last_reasoning = saved.last_reasoning,
-      },
+      data = event_data,
     })
-    -- 恢复 stop_requested 标志
     s.stop_requested = saved_stop_requested
   end)
 
@@ -934,17 +1080,13 @@ end
 -- ========== 外部回调 ==========
 
 function M.on_generation_complete(data)
-  -- ===== 子 agent 的 AI 生成完成 =====
-  if data._sub_agent_id then
-    sub_agent_engine.on_generation_complete(data)
-    return
-  end
+  local sub_agent_id = data._sub_agent_id
+  local is_sub_agent = sub_agent_id ~= nil
+  local sessions_table = is_sub_agent and state.sub_agent_sessions or state.sessions
+  local session_id = is_sub_agent and sub_agent_id or data.session_id
 
-  local session_id = data.session_id
-  local ss = state.sessions[session_id]
+  local ss = sessions_table[session_id]
   if not ss or ss.generation_id ~= data.generation_id then
-    -- 总结轮次时，ss.generation_id 可能已被清空，但 data.generation_id 仍有值
-    -- 此时通过 _summary_in_progress 标志来确认是否应该继续处理
     if not (ss and ss._summary_in_progress) then
       return
     end
@@ -954,16 +1096,12 @@ function M.on_generation_complete(data)
   local content = data.content or ""
   local is_final_round = data.is_final_round or false
 
-  -- 累积当前轮次的 usage 到 ss.accumulated_usage
-  -- on_generation_complete 不是通过 GENERATION_COMPLETED 事件触发的，
-  -- 所以需要在这里手动处理 usage 累积，否则 ss.accumulated_usage 会丢失当前轮次的用量
+  -- 累积 usage
   local current_usage = data.usage or {}
   if current_usage and next(current_usage) then
     if ss._summary_in_progress then
-      -- 总结轮次：直接赋值（_finalize_generation 中的 accumulated_usage 已包含完整历史）
       ss.accumulated_usage = vim.deepcopy(current_usage)
     else
-      -- 普通轮次：逐轮累加
       local acc = ss.accumulated_usage or {}
       acc.prompt_tokens = (acc.prompt_tokens or 0) + (current_usage.prompt_tokens or current_usage.input_tokens or 0)
       acc.completion_tokens = (acc.completion_tokens or 0)
@@ -980,8 +1118,7 @@ function M.on_generation_complete(data)
     end
   end
 
-  -- 过滤掉流式截断导致的无效工具调用（name 为空、arguments 为空或空 table）
-  -- arguments 已在 http_client 中解析为 Lua table，直接验证 table 不为空即可
+  -- 过滤无效工具调用
   local valid_tool_calls = {}
   for _, tc in ipairs(tool_calls) do
     local func = tc["function"] or tc.func
@@ -1000,13 +1137,19 @@ function M.on_generation_complete(data)
   end
   tool_calls = valid_tool_calls
 
+  -- 子 agent 完成：AI 返回纯文本回复（无工具调用）
+  if is_sub_agent and #tool_calls == 0 then
+    local sub_agent_engine = require("NeoAI.core.ai.sub_agent_engine")
+    sub_agent_engine._finalize_sub_agent(sub_agent_id, content)
+    return
+  end
+
   if ss.stop_requested then
-    M._finish_loop(session_id, true, content)
+    M._finish_loop(session_id, true, content, is_sub_agent)
     return
   end
 
   -- ===== 工具调用异常检测与重试 =====
-  -- 仅在非最终轮次时检测（总结轮次不重试）
   if not is_final_round then
     local abnormal, reason = response_retry.detect_abnormal_response(content, tool_calls, {
       is_tool_loop = true,
@@ -1027,7 +1170,6 @@ function M.on_generation_complete(data)
             delay
           )
         )
-        -- 通知 UI 正在重试
         vim.api.nvim_exec_autocmds("User", {
           pattern = event_constants.GENERATION_RETRYING,
           data = {
@@ -1040,7 +1182,6 @@ function M.on_generation_complete(data)
             layer = "tool_orchestrator",
           },
         })
-        -- 移除最后一条 assistant 消息（包含异常工具调用），然后重新请求
         if #ss.messages > 0 then
           local last_msg = ss.messages[#ss.messages]
           if last_msg.role == "assistant" and last_msg.tool_calls then
@@ -1048,7 +1189,7 @@ function M.on_generation_complete(data)
           end
         end
         vim.defer_fn(function()
-          M._request_generation(session_id)
+          M._request_generation(session_id, is_sub_agent)
         end, delay)
         return
       else
@@ -1060,26 +1201,20 @@ function M.on_generation_complete(data)
             reason
           )
         )
-        -- 重试已达上限：不再重试，继续正常处理当前工具调用
-        -- 避免工具调用被丢弃导致 UI 不渲染且不保存
-        -- 空响应重试耗尽：触发错误，避免卡住
         if reason and reason:find("空响应") then
           logger.warn("[tool_orchestrator] 空响应重试已达上限，触发生成错误")
-          M._finish_loop(session_id, false, "AI 多次返回空响应")
+          M._finish_loop(session_id, false, "AI 多次返回空响应", is_sub_agent)
           return
         end
       end
     end
   end
-  -- 重置工具调用重试计数（正常响应时清零）
   if ss then
     ss._tool_retry_count = 0
   end
 
-  -- 将中间轮次的 AI 回复保存到 history_manager（确保多轮工具调用的完整历史被持久化）
-  -- 注意：is_final_round 时由总结轮次统一保存，此处不重复保存
-  -- #tool_calls == 0 时也需要保存（AI 返回纯文本回复的中间轮次）
-  if not is_final_round and ss.current_iteration < state.max_iterations then
+  -- 中间轮次保存到 history_manager（仅主 agent）
+  if not is_sub_agent and not is_final_round and ss.current_iteration < state.max_iterations then
     local hm_ok, hm = pcall(require, "NeoAI.core.history.manager")
     if hm_ok and hm.is_initialized() then
       local assistant_entry = { content = content }
@@ -1091,17 +1226,11 @@ function M.on_generation_complete(data)
     end
   end
 
-  if is_final_round or #tool_calls == 0 or ss.current_iteration >= state.max_iterations then
-    -- 不将当前 AI 响应（可能包含 tool_calls）添加到 ss.messages
-    -- _finish_loop 会触发总结轮次，总结轮次会自己构建消息
-    -- 如果先添加了带 tool_calls 的 assistant 消息，总结轮次的消息中就会包含
-    -- 未匹配的 tool_call_id，导致 API 报错
-
-    -- AI 返回纯文本回复（无工具调用），说明 AI 认为任务已完成
-    -- 直接结束循环，不再触发额外的总结轮次，避免重复总结
+  local max_iter = ss.max_iterations or state.max_iterations
+  if is_final_round or #tool_calls == 0 or ss.current_iteration >= max_iter then
+    -- AI 返回纯文本回复，直接结束（不触发总结轮次）
     if #tool_calls == 0 and content and content ~= "" then
       logger.debug("[tool_orchestrator] AI 返回纯文本回复，直接结束循环，跳过总结轮次")
-      -- 保存当前 AI 响应到消息历史
       local assistant_msg = {
         role = "assistant",
         content = content,
@@ -1113,7 +1242,7 @@ function M.on_generation_complete(data)
         ss.last_reasoning = data.reasoning
       end
       table.insert(ss.messages, assistant_msg)
-      -- 直接结束，不触发总结轮次
+
       local saved_usage = ss.accumulated_usage or {}
       local saved_reasoning = ss.last_reasoning or ""
       local saved_win_id = ss.window_id
@@ -1126,14 +1255,13 @@ function M.on_generation_complete(data)
       ss.generation_id = nil
       fire_loop_finished(ss)
       once_display_closed(session_id, function()
-        local s = state.sessions[session_id]
+        local s = sessions_table[session_id]
         if not s then
           return
         end
         if is_shutting_down() then
           return
         end
-        -- 触发 GENERATION_COMPLETED 事件，通知 UI 更新
         pcall(vim.api.nvim_exec_autocmds, "User", {
           pattern = event_constants.GENERATION_COMPLETED,
           data = {
@@ -1153,10 +1281,50 @@ function M.on_generation_complete(data)
       return
     end
 
-    -- is_final_round 为 true 时：直接结束循环，不再触发 _finish_loop
-    -- _finish_loop 会触发 _request_summary_round 再次发起总结轮次，
-    -- 导致总结轮次完成后再次进入 on_generation_complete → _finish_loop 的循环
-    -- 直接保存当前 AI 响应到消息历史，触发 SUMMARY_COMPLETED 事件后结束
+    -- is_final_round 或达到最大迭代次数：直接结束，不触发总结轮次
+    -- 工具循环完成后 AI 已返回最终回复，无需额外总结请求
+    if #tool_calls == 0 and (not content or content == "") then
+      -- 空响应：直接结束
+      logger.debug("[tool_orchestrator] AI 返回空响应，直接结束循环")
+      local saved_usage = ss.accumulated_usage or {}
+      local saved_reasoning = ss.last_reasoning or ""
+      local saved_win_id = ss.window_id
+      local saved_gen_id = ss.generation_id
+      local on_complete = ss.on_complete
+      ss.on_complete = nil
+      ss.phase = "idle"
+      ss.active_tool_calls = {}
+      ss.current_iteration = 0
+      ss.generation_id = nil
+      fire_loop_finished(ss)
+      once_display_closed(session_id, function()
+        local s = sessions_table[session_id]
+        if not s then
+          return
+        end
+        if is_shutting_down() then
+          return
+        end
+        pcall(vim.api.nvim_exec_autocmds, "User", {
+          pattern = event_constants.GENERATION_COMPLETED,
+          data = {
+            generation_id = saved_gen_id,
+            response = "",
+            reasoning_text = saved_reasoning,
+            usage = saved_usage,
+            session_id = session_id,
+            window_id = saved_win_id,
+            duration = 0,
+          },
+        })
+        if on_complete then
+          on_complete(true, "", saved_usage)
+        end
+      end)
+      return
+    end
+
+    -- is_final_round
     if is_final_round then
       local assistant_msg = {
         role = "assistant",
@@ -1184,7 +1352,7 @@ function M.on_generation_complete(data)
 
       fire_loop_finished(ss)
       once_display_closed(session_id, function()
-        local s = state.sessions[session_id]
+        local s = sessions_table[session_id]
         if not s then
           return
         end
@@ -1210,12 +1378,11 @@ function M.on_generation_complete(data)
       return
     end
 
-    -- 非最终轮次（#tool_calls == 0 或达到最大迭代次数）：触发 _finish_loop
-    M._finish_loop(session_id, true, content)
+    M._finish_loop(session_id, true, content, is_sub_agent)
     return
   end
 
-  -- 将 AI 响应加入消息历史（仅当需要继续工具循环时）
+  -- 继续工具循环
   local assistant_msg = {
     role = "assistant",
     content = content,
@@ -1231,33 +1398,30 @@ function M.on_generation_complete(data)
   end
   table.insert(ss.messages, assistant_msg)
 
-  -- 关闭旧悬浮窗，打开新悬浮窗并执行工具
   ss.current_iteration = ss.current_iteration + 1
 
   fire_loop_finished(ss)
   once_display_closed(session_id, function()
-    local s = state.sessions[session_id]
+    local s = sessions_table[session_id]
     if not s then
       return
     end
-    -- 检查是否正在退出，避免在退出过程中执行工具导致卡死
     if is_shutting_down() then
       return
     end
-    -- 检查 stop_requested，防止在延迟执行期间停止信号已到达
     if s.stop_requested then
       logger.debug(
         "[tool_orchestrator] on_generation_complete: once_display_closed 回调中检测到 stop_requested，跳过工具执行"
       )
       return
     end
-    -- TOOL_LOOP_STARTED 事件由 _execute_tools 内部触发（携带工具包分组信息）
-    M._execute_tools(session_id, tool_calls)
+    M._execute_tools(session_id, tool_calls, is_sub_agent)
   end)
 end
 
-function M._add_tool_result_to_messages(session_id, tool_call_id, tool_name, result)
-  local ss = state.sessions[session_id]
+function M._add_tool_result_to_messages(session_id, tool_call_id, tool_name, result, is_sub_agent)
+  local sessions_table = is_sub_agent and state.sub_agent_sessions or state.sessions
+  local ss = sessions_table[session_id]
   if not ss then
     return
   end
@@ -1288,15 +1452,27 @@ end
 
 -- ========== 结束循环 ==========
 
-function M._finish_loop(session_id, success, result)
-  local ss = state.sessions[session_id]
+function M._finish_loop(session_id, success, result, is_sub_agent)
+  local sessions_table = is_sub_agent and state.sub_agent_sessions or state.sessions
+  local ss = sessions_table[session_id]
   if not ss then
     return
   end
 
-  -- 循环结束，强制刷新 UI
+  -- 循环结束，关闭工具调用悬浮窗
+  pcall(function()
+    local tool_display = require("NeoAI.ui.components.tool_display")
+    tool_display._close_display()
+  end)
 
-  -- 检查是否所有会话都已空闲，如果是则清理全局 ESC 监听器
+  -- 子 agent 完成：直接结束，不触发总结轮次
+  if is_sub_agent then
+    local sub_agent_engine = require("NeoAI.core.ai.sub_agent_engine")
+    sub_agent_engine._finalize_sub_agent(session_id, result or "")
+    return
+  end
+
+  -- 检查是否所有会话都已空闲
   local all_idle = true
   for _, s in pairs(state.sessions) do
     if s.phase ~= "idle" then
@@ -1309,10 +1485,8 @@ function M._finish_loop(session_id, success, result)
     _stop_listener_id = nil
   end
 
-  -- 第二次调用 _finish_loop（总结轮次完成时）：触发 GENERATION_COMPLETED 事件
-  -- 让 UI 更新用量提示和最终响应
+  -- 第二次调用 _finish_loop（总结轮次完成时）
   if ss.on_complete == nil then
-    -- 保存当前数据用于事件
     local saved_gen_id = ss.generation_id
     local saved_win_id = ss.window_id
     local saved_usage = ss.accumulated_usage or {}
@@ -1324,8 +1498,6 @@ function M._finish_loop(session_id, success, result)
     ss.current_iteration = 0
     ss.generation_id = nil
 
-    -- 触发 GENERATION_COMPLETED 事件，通知 UI 更新用量提示
-    -- 注意：这里使用 vim.schedule 但检查 is_shutting_down，如果正在退出则跳过
     if not is_shutting_down() then
       vim.schedule(function()
         if is_shutting_down() then
@@ -1348,7 +1520,6 @@ function M._finish_loop(session_id, success, result)
     return
   end
 
-  -- 保存回调，稍后使用
   local on_complete = ss.on_complete
   local saved_usage = ss.accumulated_usage or {}
   local saved_generation_id = ss.generation_id
@@ -1356,14 +1527,12 @@ function M._finish_loop(session_id, success, result)
   local saved_reasoning = ss.last_reasoning or ""
   local saved_result = result or ""
 
-  -- 用户取消时不触发总结，直接结束
   if ss.user_cancelled then
     ss.on_complete = nil
     ss.phase = "idle"
     ss.active_tool_calls = {}
     ss.current_iteration = 0
     ss.generation_id = nil
-    -- 跳过总结时触发 GENERATION_COMPLETED 事件显示用量
     if ss._skip_summary then
       if not is_shutting_down() then
         vim.schedule(function()
@@ -1393,10 +1562,6 @@ function M._finish_loop(session_id, success, result)
     return
   end
 
-  -- 如果总结轮次已经在进行中（_summary_in_progress 为 true），
-  -- 说明 _on_tools_complete 的 stop_requested 路径已触发过 _request_summary_round，
-  -- 当前是 on_generation_complete 回调中总结轮次完成后的再次调用。
-  -- 此时直接触发 GENERATION_COMPLETED 事件，避免重复触发总结轮次。
   if ss._summary_in_progress then
     ss.on_complete = nil
     ss.phase = "idle"
@@ -1426,41 +1591,27 @@ function M._finish_loop(session_id, success, result)
     return
   end
 
-  -- 触发一次总结轮次（不带工具），让 AI 根据工具执行结果进行总结
-  -- 注意：_request_summary_round 会通过 TOOL_RESULT_RECEIVED 事件触发 AI 生成
-  -- AI 生成完成后会调用 on_generation_complete，其中会再次调用 _finish_loop
-  -- 但此时 ss.on_complete 已被置为 nil，避免无限递归
   ss.on_complete = nil
-
   ss.phase = "idle"
   ss.active_tool_calls = {}
   ss.current_iteration = 0
 
-  -- 先关闭工具显示（fire_loop_finished 由 _request_summary_round 内部触发）
-  -- 触发总结轮次，让 AI 根据工具结果生成最终回复
-  -- 总结完成后会通过 GENERATION_COMPLETED 事件通知 UI
-  M._request_summary_round(session_id)
-
-  -- 总结轮次已触发（内部已保存 generation_id 副本），现在可以安全清空
-  -- 注意：不能在此处清空 ss.generation_id，因为 _request_summary_round 中的
-  -- once_display_closed 回调是异步的（vim.schedule），on_generation_complete
-  -- 需要依赖 ss.generation_id 做匹配检查。
-  -- ss.generation_id 会在总结轮次完成后的 GENERATION_COMPLETED 回调中由
-  -- tool_orchestrator 的监听器清空（见 register_session 中的 _summary_in_progress 分支）
-  -- ss.generation_id = nil
+  -- 工具循环自然结束，不再触发总结轮次
+  -- 总结由 AI 在工具循环中自行完成
 end
 
 -- ========== 停止控制 ==========
 
 function M.request_stop(session_id)
   if session_id then
-    local ss = state.sessions[session_id]
+    -- 同时检查主 agent 和子 agent 会话
+    local ss = state.sessions[session_id] or state.sub_agent_sessions[session_id]
     if ss then
       ss.stop_requested = true
       if next(ss.active_tool_calls) ~= nil then
         ss.active_tool_calls = {}
         vim.schedule(function()
-          M._on_tools_complete(session_id)
+          M._on_tools_complete(session_id, ss._is_sub_agent)
         end)
       end
     end
@@ -1468,16 +1619,23 @@ function M.request_stop(session_id)
     for sid, _ in pairs(state.sessions) do
       M.request_stop(sid)
     end
+    for sid, _ in pairs(state.sub_agent_sessions) do
+      M.request_stop(sid)
+    end
   end
 end
 
 function M.is_stop_requested(session_id)
   if session_id then
-    local ss = state.sessions[session_id]
+    local ss = state.sessions[session_id] or state.sub_agent_sessions[session_id]
     return ss and ss.stop_requested or false
   end
-  -- 无 session_id 时检查所有 session
   for _, ss in pairs(state.sessions) do
+    if ss.stop_requested then
+      return true
+    end
+  end
+  for _, ss in pairs(state.sub_agent_sessions) do
     if ss.stop_requested then
       return true
     end
@@ -1487,12 +1645,15 @@ end
 
 function M.reset_stop_requested(session_id)
   if session_id then
-    local ss = state.sessions[session_id]
+    local ss = state.sessions[session_id] or state.sub_agent_sessions[session_id]
     if ss then
       ss.stop_requested = false
     end
   else
     for _, ss in pairs(state.sessions) do
+      ss.stop_requested = false
+    end
+    for _, ss in pairs(state.sub_agent_sessions) do
       ss.stop_requested = false
     end
   end
@@ -2041,14 +2202,17 @@ end
 --- @param session_id string
 --- @return table|nil
 function M.get_session_state(session_id)
-  return state.sessions[session_id]
+  return state.sessions[session_id] or state.sub_agent_sessions[session_id]
 end
 
---- 获取所有会话ID列表
+--- 获取所有会话ID列表（包括子 agent）
 --- @return table string[]
 function M.get_all_session_ids()
   local ids = {}
   for sid, _ in pairs(state.sessions) do
+    table.insert(ids, sid)
+  end
+  for sid, _ in pairs(state.sub_agent_sessions) do
     table.insert(ids, sid)
   end
   return ids
@@ -2056,7 +2220,7 @@ end
 
 function M.is_executing(session_id)
   if session_id then
-    local ss = state.sessions[session_id]
+    local ss = state.sessions[session_id] or state.sub_agent_sessions[session_id]
     if not ss then
       return false
     end
@@ -2067,13 +2231,17 @@ function M.is_executing(session_id)
       return true
     end
   end
+  for _, ss in pairs(state.sub_agent_sessions) do
+    if ss.phase == "waiting_tools" or ss.phase == "waiting_model" then
+      return true
+    end
+  end
   return false
 end
 
 -- ========== 关闭清理 ==========
 
 function M.shutdown()
-  -- 清理全局 ESC 停止监听器
   if _stop_listener_id then
     pcall(vim.api.nvim_del_autocmd, _stop_listener_id)
     _stop_listener_id = nil
@@ -2081,7 +2249,11 @@ function M.shutdown()
   for session_id, _ in pairs(state.sessions) do
     M.unregister_session(session_id)
   end
+  for sub_agent_id, _ in pairs(state.sub_agent_sessions) do
+    M.unregister_sub_agent_session(sub_agent_id)
+  end
   state.sessions = {}
+  state.sub_agent_sessions = {}
   _tools = {}
   state.initialized = false
 end
@@ -2090,21 +2262,19 @@ end
 function M._test_reset()
   state.initialized = false
   state.sessions = {}
+  state.sub_agent_sessions = {}
   state.config = {}
   state.max_iterations = 20
   _tools = {}
 end
 
 --- 紧急清理（VimLeavePre 中使用）
---- 比 shutdown 更激进：直接清空所有状态，不触发任何事件或回调
 function M.cleanup_all()
-  -- 清理全局 ESC 停止监听器
   if _stop_listener_id then
     pcall(vim.api.nvim_del_autocmd, _stop_listener_id)
     _stop_listener_id = nil
   end
 
-  -- 先设置所有会话的停止标志，防止任何回调继续执行
   for _, ss in pairs(state.sessions) do
     ss.stop_requested = true
     ss.phase = "idle"
@@ -2115,8 +2285,17 @@ function M.cleanup_all()
     ss._proceed_in_progress = false
     ss._summary_in_progress = false
   end
+  for _, ss in pairs(state.sub_agent_sessions) do
+    ss.stop_requested = true
+    ss.phase = "idle"
+    ss.active_tool_calls = {}
+    ss.current_iteration = 0
+    ss.generation_id = nil
+    ss._tools_complete_in_progress = false
+    ss._proceed_in_progress = false
+    ss._summary_in_progress = false
+  end
 
-  -- 取消所有 HTTP 请求
   pcall(function()
     local http_ok, http_client = pcall(require, "NeoAI.core.ai.http_client")
     if http_ok and http_client and http_client.cancel_all_requests then
@@ -2124,13 +2303,15 @@ function M.cleanup_all()
     end
   end)
 
-  -- 注销所有会话（删除 autocmd）
   for session_id, _ in pairs(state.sessions) do
     M.unregister_session(session_id)
   end
+  for sub_agent_id, _ in pairs(state.sub_agent_sessions) do
+    M.unregister_sub_agent_session(sub_agent_id)
+  end
 
-  -- 清空所有状态
   state.sessions = {}
+  state.sub_agent_sessions = {}
   _tools = {}
 end
 

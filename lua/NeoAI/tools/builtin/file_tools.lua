@@ -134,7 +134,7 @@ local function _read_file(args, on_success, on_error)
   end
 
   local filepath = args.filepath
-  local start_line = args.start or 1
+  local start_line = args.start_line or args.start or 1
   local end_line = args.end_line or args["end"] or -1
   local is_full_file = (start_line == 1) and (end_line == -1)
 
@@ -260,8 +260,8 @@ local function _read_file(args, on_success, on_error)
           if tree_result and tree_result.nodes and #tree_result.nodes > 0 then
             local overview = build_structure_overview(filepath, tree_result)
             local notices = "⚠️ 文件过长（超过 500 行），仅显示文件结构概览。\n"
-              .. "如需读取完整内容，请指定 start/end_line 行范围。\n"
-              .. '示例：{ filepath = "/path/to/file", start = 1, end_line = 100 }\n\n'
+              .. "如需读取完整内容，请指定 start_line/end_line 行范围。\n"
+              .. '示例：{ filepath = "/path/to/file", start_line = 1, end_line = 100 }\n\n'
             if on_success then
               on_success(notices .. overview)
             end
@@ -338,7 +338,7 @@ M.read_file = define_tool({
     type = "object",
     properties = {
       filepath = { type = "string", description = "文件路径（必填）" },
-      start = { type = "number", description = "起始行号，从1开始，默认1" },
+      start_line = { type = "number", description = "起始行号，从1开始，默认1" },
       end_line = { type = "number", description = "结束行号，-1或省略表示读取到末尾" },
     },
     required = { "filepath" },
@@ -375,6 +375,14 @@ local function _edit_file(args, on_success, on_error)
   end
   local start_line = args.start_line
   local end_line = args.end_line
+
+  -- append=false 时必须提供 start_line 和 end_line
+  if not append and (not start_line or not end_line) then
+    if on_error then
+      on_error("覆盖模式(append=false)必须提供 start_line 和 end_line 参数")
+    end
+    return
+  end
 
   -- 行范围替换模式：读取文件，替换指定行范围，再写回
   if start_line and end_line then
@@ -448,8 +456,32 @@ local function _edit_file(args, on_success, on_error)
     end
 
     local function on_read_err(err)
-      if on_error then
-        on_error(string.format("读取文件失败 %s: %s", filepath, err or "无法读取文件"))
+      -- append=false 且有行范围时，文件不存在则直接创建
+      if not append then
+        local function on_write_ok()
+          if on_success then
+            on_success({ filepath = filepath, success = true })
+          end
+        end
+        local function on_write_err(write_err)
+          if on_error then
+            on_error(string.format("创建文件失败 %s: %s", filepath, write_err or "无法创建文件"))
+          end
+        end
+        if fu then
+          local success, _ = fu.write_file(filepath, content, false)
+          if success == true then
+            on_write_ok()
+          else
+            on_write_err("写入失败")
+          end
+        else
+          uv_write_file(filepath, content, false, on_write_ok, on_write_err)
+        end
+      else
+        if on_error then
+          on_error(string.format("读取文件失败 %s: %s", filepath, err or "无法读取文件"))
+        end
       end
     end
 

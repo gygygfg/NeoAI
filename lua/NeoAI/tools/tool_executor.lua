@@ -21,6 +21,52 @@ local state = {
   max_history_size = 100,
 }
 
+-- ========== 工具名称别名映射 ==========
+-- 将 AI 输出的简写名称映射为正式工具名称
+-- 格式：正式工具名 = { 别名列表 }
+local tool_name_aliases = {
+  read_file = { "read", "cat", "show", "view" },
+  edit_file = { "write", "edit", "modify", "update" },
+  list_files = { "list", "ls", "dir" },
+  search_files = { "search", "grep", "find", "locate" },
+  delete_file = { "delete", "rm", "remove", "unlink" },
+  create_directory = { "mkdir", "md", "mkdirp" },
+  ensure_dir = { "ensure_dir" },
+  file_exists = { "exists" },
+  run_command = { "cmd" },
+}
+
+-- ========== 参数别名映射 ==========
+-- 将 AI 常用的简写参数名映射到工具定义的标准参数名
+-- 统一管理，避免两处重复定义
+local param_alias_map = {
+  -- 参数别名: 正式工具名 = { 别名列表 }
+  command = { "cmd" },
+  dirs = { "dir", "dir_path" },
+  filepath = { "file", "files", "fp", "path", "filespath" },
+  -- 参数名重命名（start/end 统一为 start_line/end_line 以规避 Lua 关键字）
+  start_line = { "start" },
+  end_line = { "end" },
+}
+
+-- 构建别名→正式名的反向查找表
+local alias_to_tool_name = {}
+
+-- 构建参数别名→正式名的反向查找表
+local alias_to_param_name = {}
+for tool_name, aliases in pairs(tool_name_aliases) do
+  for _, alias in ipairs(aliases) do
+    alias_to_tool_name[alias] = tool_name
+  end
+end
+
+-- 构建参数别名反向查找表
+for std_name, aliases in pairs(param_alias_map) do
+  for _, alias in ipairs(aliases) do
+    alias_to_param_name[alias] = std_name
+  end
+end
+
 -- ========== 超时管理 ==========
 
 local timeout_state = {
@@ -927,15 +973,7 @@ function M._parse_nonstandard_arguments(raw_arguments, props, tool_name)
     if props[k] then
       matched_key = k
     else
-      local alias_map = {
-        cmd = "command",
-        dir = "dirs",
-        file = "files",
-        fp = "filepath",
-        path = "filepath",
-        dir_path = "dirs",
-      }
-      local std_name = alias_map[k]
+      local std_name = param_alias_map[k]
       if std_name and props[std_name] then
         matched_key = std_name
       end
@@ -971,19 +1009,8 @@ function M._normalize_arguments(tool_name, raw_arguments)
   local arguments = {}
   local changed = false
 
-  -- ===== 工具名称别名映射 =====
-  -- 将 AI 输出的简写名称（如 read/write）映射为正式名称（如 read_file/edit_file）
-  local tool_name_aliases = {
-    read = "read_file",
-    write = "edit_file",
-    list = "list_files",
-    search = "search_files",
-    delete = "delete_file",
-    mkdir = "create_directory",
-    ensure_dir = "ensure_dir",
-    exists = "file_exists",
-  }
-  local mapped_name = tool_name_aliases[tool_name]
+  -- ===== 工具名称别名映射（使用模块级反向查找表） =====
+  local mapped_name = alias_to_tool_name[tool_name]
   if mapped_name then
     logger.debug("[tool_executor] _normalize_arguments: 工具名称别名映射: '%s' -> '%s'", tool_name, mapped_name)
     tool_name = mapped_name
@@ -1060,17 +1087,16 @@ function M._normalize_arguments(tool_name, raw_arguments)
     -- 将 AI 常用的简写参数名映射到工具定义的标准参数名
     -- 即使别名参数也存在于 props 中（如 run_command 同时有 command 和 cmd），
     -- 也优先使用标准名称，确保必需字段验证通过
-    local alias_map = {
-      cmd = "command",
-      dir = "dirs",
-      file = "files",
-      fp = "filepath",
-      path = "filepath",
-      dir_path = "dirs",
-    }
+    -- 注意：跳过数组标准名（filepath/dirs）的别名，这些由步骤2的简化格式转换处理
+    local array_standard_names = { filepath = true, dirs = true }
     for arg_name, arg_value in pairs(arguments) do
-      local standard_name = alias_map[arg_name]
-      if standard_name and props[standard_name] and arg_name ~= standard_name then
+      local standard_name = alias_to_param_name[arg_name]
+      if
+        standard_name
+        and not array_standard_names[standard_name]
+        and props[standard_name]
+        and arg_name ~= standard_name
+      then
         arguments[standard_name] = arg_value
         arguments[arg_name] = nil
         changed = true
@@ -1078,56 +1104,34 @@ function M._normalize_arguments(tool_name, raw_arguments)
     end
 
     -- 2) 简化参数格式转换
-    local simple_to_standard = {
-      filepath = "files",
-      dir = "dirs",
-      dir_path = "dirs",
-    }
-    for simple_arg, standard_array in pairs(simple_to_standard) do
-      if arguments[simple_arg] ~= nil and not props[simple_arg] and props[standard_array] then
+    -- 当 AI 传入的简化参数名（如 file/files）映射到标准数组参数（filepath）时，
+    -- 且该参数在工具定义中不存在、但对应的数组参数存在时，触发简化格式转换
+    -- 例如：file="foo.lua" → filepath={{filepath="foo.lua"}}
+    for simple_arg, arg_value in pairs(arguments) do
+      local standard_name = alias_to_param_name[simple_arg]
+      if standard_name and array_standard_names[standard_name] and not props[simple_arg] and props[standard_name] then
         local item = {}
-        if standard_array == "files" then
-          item.filepath = arguments[simple_arg]
-          if arguments.start ~= nil then
-            item.start = arguments.start
-            arguments.start = nil
+        if standard_name == "filepath" then
+          item.filepath = arg_value
+          -- 从 arguments 中继承相关字段到 item
+          local inherit_fields = { "start_line", "end_line", "content", "append", "parents", "pattern", "recursive" }
+          for _, field in ipairs(inherit_fields) do
+            if arguments[field] ~= nil then
+              item[field] = arguments[field]
+              arguments[field] = nil
+            end
           end
-          if arguments.end_line ~= nil then
-            item["end"] = arguments.end_line
-            arguments.end_line = nil
-          end
-          if arguments.content ~= nil then
-            item.content = arguments.content
-            arguments.content = nil
-          end
-          if arguments.append ~= nil then
-            item.append = arguments.append
-            arguments.append = nil
-          end
-          if arguments.parents ~= nil then
-            item.parents = arguments.parents
-            arguments.parents = nil
-          end
-          if arguments.pattern ~= nil then
-            item.pattern = arguments.pattern
-            arguments.pattern = nil
-          end
-          if arguments.recursive ~= nil then
-            item.recursive = arguments.recursive
-            arguments.recursive = nil
-          end
-        elseif standard_array == "dirs" then
-          item.dir = arguments[simple_arg]
-          if arguments.pattern ~= nil then
-            item.pattern = arguments.pattern
-            arguments.pattern = nil
-          end
-          if arguments.recursive ~= nil then
-            item.recursive = arguments.recursive
-            arguments.recursive = nil
+        elseif standard_name == "dirs" then
+          item.dir = arg_value
+          local inherit_fields = { "pattern", "recursive" }
+          for _, field in ipairs(inherit_fields) do
+            if arguments[field] ~= nil then
+              item[field] = arguments[field]
+              arguments[field] = nil
+            end
           end
         end
-        arguments[standard_array] = { item }
+        arguments[standard_name] = { item }
         arguments[simple_arg] = nil
         changed = true
         break

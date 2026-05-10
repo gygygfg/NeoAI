@@ -415,14 +415,20 @@ function _handle_stream_end(generation_id, processor, params)
 
   if #tool_calls > 0 and tools_enabled then
     if is_tool_loop then
+      -- 调试日志
+      require("NeoAI.utils.logger").debug("[DEBUG_DUP] _handle_stream_end: is_tool_loop=true, tool_calls=%d, _tool_loop_processed=%s",
+        #tool_calls, tostring(params and params._tool_loop_processed))
+      -- 防止 on_generation_complete 内部的同步回调导致重复执行
+      if params and params._tool_loop_processed then
+        return
+      end
+      if params then params._tool_loop_processed = true end
       state.is_generating = false; state.current_generation_id = nil
       -- 检测是否为子 agent 的工具调用
       local sub_agent_id = params and params._sub_agent_id
       if sub_agent_id then
-        -- 退出时跳过子 agent 处理，防止死循环
         if not shutdown_flag.is_set() then
-          local sub_agent_engine = require("NeoAI.core.ai.sub_agent_engine")
-          sub_agent_engine.on_generation_complete({
+          tool_orchestrator.on_generation_complete({
             generation_id = generation_id,
             tool_calls = tool_calls,
             content = full_response,
@@ -456,15 +462,20 @@ function _handle_stream_end(generation_id, processor, params)
   end
 
   if is_tool_loop then
+    -- 调试日志
+    require("NeoAI.utils.logger").debug("[DEBUG_DUP] _handle_stream_end: is_tool_loop=true (no tools), _tool_loop_processed=%s",
+      tostring(params and params._tool_loop_processed))
+    -- 防止第一个分支（#tool_calls > 0）执行后，同步回调导致再次进入此分支
+    if params and params._tool_loop_processed then
+      return
+    end
+    if params then params._tool_loop_processed = true end
     state.is_generating = false; state.current_generation_id = nil
     -- 检测是否为子 agent 的完成事件
     local sub_agent_id = params and params._sub_agent_id
     if sub_agent_id then
-      -- 退出时跳过子 agent 处理，防止死循环
       if not shutdown_flag.is_set() then
-        -- 子 agent 完成：转发给 sub_agent_engine
-        local sub_agent_engine = require("NeoAI.core.ai.sub_agent_engine")
-        sub_agent_engine.on_generation_complete({
+        tool_orchestrator.on_generation_complete({
           generation_id = generation_id,
           tool_calls = tool_calls,
           content = full_response,
@@ -542,13 +553,17 @@ function _handle_ai_response(generation_id, response, params)
 
   if #tool_calls > 0 and tools_enabled then
     if is_tool_loop then
+      -- 防止 on_generation_complete 内部的同步回调导致重复执行
+      if params and params._tool_loop_processed then
+        return
+      end
+      if params then params._tool_loop_processed = true end
       state.is_generating = false; state.current_generation_id = nil
       -- 检测是否为子 agent 的工具调用
       local sub_agent_id = params and params._sub_agent_id
       if sub_agent_id then
         if not shutdown_flag.is_set() then
-          local sub_agent_engine = require("NeoAI.core.ai.sub_agent_engine")
-          sub_agent_engine.on_generation_complete({
+          tool_orchestrator.on_generation_complete({
             generation_id = generation_id,
             tool_calls = tool_calls,
             content = response_content,
@@ -582,14 +597,17 @@ function _handle_ai_response(generation_id, response, params)
 
   if response.usage then usage = response.usage end
   if is_tool_loop then
+    -- 防止第一个分支（#tool_calls > 0）执行后，同步回调导致再次进入此分支
+    if params and params._tool_loop_processed then
+      return
+    end
+    if params then params._tool_loop_processed = true end
     state.is_generating = false; state.current_generation_id = nil
     -- 检测是否为子 agent 的完成事件
     local sub_agent_id = params and params._sub_agent_id
     if sub_agent_id then
-      -- 退出时跳过子 agent 处理，防止死循环
       if not shutdown_flag.is_set() then
-        local sub_agent_engine = require("NeoAI.core.ai.sub_agent_engine")
-        sub_agent_engine.on_generation_complete({
+        tool_orchestrator.on_generation_complete({
           generation_id = generation_id,
           tool_calls = tool_calls,
           content = response_content,
@@ -828,6 +846,17 @@ function M.handle_tool_result(data)
     end
   end
 
+  -- 调试日志：追踪 handle_tool_result 调用
+  require("NeoAI.utils.logger").debug("[DEBUG_DUP] handle_tool_result: gen_id=%s, session=%s, is_generating=%s, cur_gen_id=%s, is_final_round=%s, msgs=%d, stack=%s",
+    tostring(generation_id),
+    tostring(session_id),
+    tostring(state.is_generating),
+    tostring(state.current_generation_id),
+    tostring(is_final_round),
+    #messages,
+    debug.traceback()
+  )
+
   if state.is_generating and state.current_generation_id ~= generation_id then return end
   if state.is_generating and state.current_generation_id == generation_id then return end
   if is_final_round and state.is_generating then state.is_generating = false; state.current_generation_id = nil end
@@ -891,11 +920,11 @@ function M.handle_generation_error(generation_id, error_msg)
   local shared = state_manager.get_shared() or {}
   vim.api.nvim_exec_autocmds("User", { pattern = event_constants.GENERATION_ERROR, data = { generation_id = generation_id, error_msg = error_msg, session_id = shared.session_id or generation.session_id, window_id = shared.window_id or generation.window_id } })
 
-  -- 检测是否为子 agent 的生成错误，通知子 agent 引擎结束
+  -- 检测是否为子 agent 的生成错误，通知 tool_orchestrator 结束
   local sub_agent_id = generation._sub_agent_id
   if sub_agent_id then
-    local sub_agent_engine = require("NeoAI.core.ai.sub_agent_engine")
-    sub_agent_engine.on_generation_complete({
+    local tool_orchestrator = require("NeoAI.core.ai.tool_orchestrator")
+    tool_orchestrator.on_generation_complete({
       generation_id = generation_id,
       tool_calls = {},
       content = "[AI 生成错误] " .. error_msg,

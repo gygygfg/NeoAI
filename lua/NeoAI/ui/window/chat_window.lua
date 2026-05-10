@@ -2907,6 +2907,18 @@ function M._setup_event_listeners()
       end
 
       clear_stream_throttle()
+
+      -- 在清空流式状态之前，先保存思考过程内容并追加到缓冲区
+      -- 因为 TOOL_LOOP_STARTED 会在 STREAM_COMPLETED 之前触发（当 AI 返回工具调用时）
+      -- 如果不提前保存，思考过程折叠文本会丢失
+      local saved_reasoning = state.streaming.reasoning_buffer or ""
+      local saved_message_index = state.streaming.message_index
+      if saved_reasoning ~= "" and saved_message_index then
+        state.streaming.reasoning_active = false
+        state.streaming.reasoning_done = true
+        M._append_reasoning_folded_to_buffer(saved_reasoning)
+      end
+
       local s = state.streaming
       s.active = false
       s.generation_id = nil
@@ -3093,9 +3105,24 @@ function M._setup_event_listeners()
           folded_text = "{{{ 🔧 工具调用\n  ❌ 所有工具调用均失败\n}}}"
         end
 
-        table.insert(state.messages, { role = "assistant", content = folded_text, timestamp = os.time() })
-        state.tool_display.folded_saved = true
-        M._append_message_to_buffer("assistant", folded_text)
+        -- 查找是否已有折叠消息，有则更新，无则插入（避免每次迭代累积多条）
+        local existing_idx = nil
+        for i = #state.messages, 1, -1 do
+          if state.messages[i].role == "assistant" and (state.messages[i].content or ""):find("^{{{") then
+            existing_idx = i
+            break
+          end
+        end
+        if existing_idx then
+          state.messages[existing_idx].content = folded_text
+        else
+          table.insert(state.messages, { role = "assistant", content = folded_text, timestamp = os.time() })
+        end
+        -- 仅在第一次写入缓冲区，后续迭代只更新 state.messages
+        if not state.tool_display.folded_saved then
+          state.tool_display.folded_saved = true
+          M._append_message_to_buffer("assistant", folded_text)
+        end
       end
       if state.tool_display.active then
         close_tool_display()
@@ -3763,9 +3790,11 @@ function M._save_final_content_to_history(data)
     local last_assistant_content = M.get_last_assistant_content()
     if last_assistant_content and last_assistant_content ~= "" then
       -- 如果最后一条 assistant 内容以折叠文本开头，说明是工具调用折叠文本
-      -- 需要将 AI 回复合并到折叠文本后面
+      -- 注意：在 GENERATION_COMPLETED 回调中，折叠文本可能已被追加了 AI 回复
+      -- （state.messages[folded_idx].content = folded_text .. "\n\n" .. append_content）
+      -- 所以直接使用 last_assistant_content 即可，无需再次追加 response_content
       if last_assistant_content:match("^{{{") then
-        final_content = last_assistant_content .. "\n\n" .. response_content
+        final_content = last_assistant_content
       else
         final_content = last_assistant_content
       end

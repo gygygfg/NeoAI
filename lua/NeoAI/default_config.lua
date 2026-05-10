@@ -316,6 +316,7 @@ local DEFAULT_CONFIG = {
           allowed_directories = { "./" },
           allowed_param_groups = {
             "ls",
+            "wc",
             "find",
             "grep",
           },

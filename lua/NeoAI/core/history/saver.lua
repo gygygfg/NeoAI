@@ -160,6 +160,8 @@ end
 --- 事件数据包含本轮完整的 AI 回复（含 reasoning）
 --- 注意：如果后续有 HISTORY_SAVE_FINAL 事件（含 UI 构建的折叠文本），
 --- 此事件保存的内容会被覆盖。HISTORY_SAVE_FINAL 优先。
+--- 修复：检查会话最后一条 assistant 内容是否已包含折叠文本（{{{ 开头），
+--- 如果是，说明 HISTORY_SAVE_FINAL 已保存含折叠文本的完整内容，跳过此次保存。
 local function on_generation_completed(data)
   local session_id = data.session_id
   local response = data.response or ""
@@ -175,6 +177,24 @@ local function on_generation_completed(data)
 
     local session = hm.get_session(session_id)
     if not session then return false, "会话不存在: " .. session_id end
+
+    -- 检查最后一条 assistant 内容是否已包含折叠文本
+    -- 如果是，说明 HISTORY_SAVE_FINAL 已保存含折叠文本的完整内容，跳过此次保存
+    -- 避免覆盖 HISTORY_SAVE_FINAL 保存的含折叠文本的内容
+    if type(session.assistant) == "table" and #session.assistant > 0 then
+      local last_entry = session.assistant[#session.assistant]
+      local last_content = ""
+      if type(last_entry) == "table" then
+        last_content = last_entry.content or ""
+      elseif type(last_entry) == "string" then
+        last_content = last_entry
+      end
+      if type(last_content) == "string" and last_content:match("^{{{") then
+        -- 最后一条内容已包含折叠文本，只更新 usage，不覆盖内容
+        hm.update_usage(session_id, usage)
+        return true
+      end
+    end
 
     -- 构建含 reasoning 的 assistant 条目
     local assistant_entry
