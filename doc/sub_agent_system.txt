@@ -1,0 +1,185 @@
+*NeoAI-sub_agent.txt*  Sub-Agent System Reference
+
+==============================================================================
+Sub-Agent System Overview                               *NeoAI-sub-agent-overview*
+
+The sub-agent system enables complex task decomposition. The main AI agent can
+create sub-agents to handle specific subtasks independently. Each sub-agent
+has its own tool loop, message history, and boundary constraints.
+
+==============================================================================
+Architecture                                            *NeoAI-sub-agent-arch*
+
+Components:
+  - sub_agent_engine.lua: Lifecycle management, boundary enforcement
+  - tool_orchestrator.lua: Sub-agent tool loop management
+  - plan_executor.lua: Task planning and execution tracking
+
+Flow:
+>
+  Main Agent
+      |
+      |-- create_sub_agent(task, boundaries)
+      |
+      v
+  sub_agent_engine.start_sub_agent_loop()
+      |
+      |-- Creates independent tool loop
+      |-- Registers with tool_orchestrator
+      |
+      v
+  Sub-Agent Tool Loop
+      |
+      |-- AI generates tool calls
+      |-- sub_agent_engine.review_tool_call() checks boundaries
+      |-- Allowed: Tool executes
+      |-- Rejected: Tool blocked, AI notified
+      |-- Loop continues until task complete
+      |
+      v
+  sub_agent_engine._finalize_sub_agent()
+      |
+      |-- Summary returned to main agent via callback
+      |-- Cleanup resources
+<
+
+==============================================================================
+Creating a Sub-Agent                                   *NeoAI-sub-agent-create*
+
+The main agent uses the create_sub_agent tool:
+
+>
+    create_sub_agent({
+        task = "Search for TODO comments in src/ and summarize",
+        boundaries = {
+            description = "Only search files in src/ directory",
+            allowed_tools = { "search_files", "read_file", "log_message" },
+            allowed_commands = { "grep", "find" },
+            allowed_files = {},
+            allowed_directories = { "./src" },
+            max_tool_calls = 20,
+            max_iterations = 10,
+        },
+        context = {
+            project_type = "lua",
+            focus_area = "unfinished tasks",
+        },
+    })
+<
+
+==============================================================================
+Boundary Enforcement                                 *NeoAI-sub-agent-boundary*
+
+Boundaries are enforced by sub_agent_engine.review_tool_call():
+
+Allowed tools:
+  - Regex patterns matching tool names
+  - Example: { "search_files", "read_file" }
+  - Tools not in list are rejected
+
+Allowed commands:
+  - Shell commands permitted via run_command
+  - Example: { "grep", "find" }
+
+Allowed files:
+  - Specific file paths permitted
+  - Empty = no file restrictions beyond directories
+
+Allowed directories:
+  - Directory paths where operations are permitted
+  - Example: { "./src" }
+
+Max tool calls:
+  - Maximum number of tool calls per sub-agent
+  - Prevents runaway execution
+
+Max iterations:
+  - Maximum tool loop iterations
+  - Default: 10
+
+Rejection response:
+  - When a tool call is rejected, the sub-agent receives:
+    "[调度 agent 驳回] 工具 'X' 的调用被拒绝。原因: ..."
+  - The sub-agent is instructed to try other allowed tools
+  - Repeated rejections of the same tool are prevented
+
+==============================================================================
+Sub-Agent Lifecycle                                    *NeoAI-sub-agent-lifecycle*
+
+1. Creation:
+   - Main agent calls create_sub_agent tool
+   - tool_orchestrator._execute_single_tool() detects create_sub_agent
+   - plan_executor creates sub-agent context
+   - sub_agent_engine.start_sub_agent_loop() begins
+
+2. Execution:
+   - Sub-agent gets system prompt with task and boundaries
+   - Independent tool loop managed by tool_orchestrator
+   - Each tool call reviewed by sub_agent_engine.review_tool_call()
+   - Results accumulated in sub-agent's message history
+
+3. Completion:
+   - Sub-agent returns text response (no tool calls)
+   - sub_agent_engine._finalize_sub_agent() called
+   - Summary callback returns result to main agent
+   - Main agent receives: "【子 agent 执行完成】\n子 agent ID: ...\n\n[summary]"
+
+4. Cleanup:
+   - plan_executor.cleanup_sub_agent() removes context
+   - tool_orchestrator.unregister_sub_agent_session() cleans up
+   - All timers and autocmds removed
+
+==============================================================================
+Sub-Agent System Prompt                                *NeoAI-sub-agent-prompt*
+
+The sub-agent receives a system prompt that includes:
+
+>
+    你是一个子 agent，由主 agent 创建来执行特定的子任务。
+
+    === 你的任务 ===
+    [task description]
+
+    === 工作边界 ===
+    边界描述: [boundary description]
+    允许的工具: [tool list]
+    允许的命令: [command list]
+    允许的文件: [file list]
+    允许的目录: [directory list]
+    最大工具调用次数: [number]
+
+    === 额外上下文 ===
+    [context key-value pairs]
+
+    === 执行规则 ===
+    1. 你拥有独立的工具调用循环
+    2. 所有工具调用都会经过调度 agent 审核
+    3. 被驳回的工具不要再次尝试
+    4. 使用其他允许的工具继续
+    5. 完成后明确说明结果
+<
+
+==============================================================================
+Sub-Agent vs Main Agent                               *NeoAI-sub-agent-vs-main*
+
+| Aspect          | Main Agent                    | Sub-Agent                          |
+|-----------------|-------------------------------|------------------------------------|
+| Creation        | Plugin startup                | Created by main agent              |
+| Tool loop       | Managed by tool_orchestrator  | Managed by tool_orchestrator       |
+| Tool approval   | User approval (configurable)  | Boundary enforcement only          |
+| Message history | Full conversation             | Task-specific messages             |
+| Stop control    | User ESC key                  | Main agent cancel_sub_agent        |
+| Completion      | Final response to user        | Summary callback to main agent     |
+| Cleanup         | VimLeavePre                   | After summary callback             |
+
+==============================================================================
+Sub-Agent Monitor                                     *NeoAI-sub-agent-monitor*
+
+The sub_agent_monitor.lua component displays:
+  - Active sub-agent count
+  - Each sub-agent's status (running, completed, error)
+  - Current tool being executed
+  - Iteration count
+
+==============================================================================
+vim:tw=78:ts=8:ft=help:norl:

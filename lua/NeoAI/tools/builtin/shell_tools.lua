@@ -63,6 +63,8 @@ local session_counter = 0
 -- ============================================================================
 --- 获取 pty_terminal 组件引用
 local pty_ui = require("NeoAI.ui.components.pty_terminal")
+-- 初始化 PTY 终端 UI 组件（确保浮动窗口可创建）
+pty_ui.initialize()
 
 -- PTY 伪终端配置（仅后端参数，UI 相关配置由 pty_terminal 管理）
 local PTY_CONFIG = {
@@ -351,14 +353,16 @@ end
 -- 此函数在 _run_command 内部定义，可以直接访问 session
 -- 模块级别的版本用于 _send_input（通过 session 参数获取隐藏 buffer）
 local function _read_hidden_buf_output(hidden_buf)
-  if not hidden_buf or not vim.api.nvim_buf_is_valid(hidden_buf) then return "" end
+  if not hidden_buf or not vim.api.nvim_buf_is_valid(hidden_buf) then
+    return ""
+  end
   local ok, lines = pcall(vim.api.nvim_buf_get_lines, hidden_buf, 0, -1, false)
-  if not ok or not lines then return "" end
+  if not ok or not lines then
+    return ""
+  end
   local raw = table.concat(lines, "\n")
   return pty_ui.strip_ansi(raw)
 end
-
-
 
 -- ============================================================================
 
@@ -631,7 +635,6 @@ local function _run_command(args, on_success, on_error, on_progress)
         prompt = timeout_prompt,
         stdout = timeout_prompt,
         command = command,
-        session_id = session_id,
         _disable_reasoning = true,
         fixed_args = {
           session_id = session_id,
@@ -929,7 +932,6 @@ local function _run_command(args, on_success, on_error, on_progress)
         stdout = enhanced_prompt,
         stderr = stderr_output,
         command = command,
-        session_id = session_id,
         _disable_reasoning = true,
         process_state = session.process_monitor.last_state,
         fixed_args = {
@@ -1279,8 +1281,10 @@ local function _run_command(args, on_success, on_error, on_progress)
     -- 创建临时窗口使 termopen 能在隐藏 buffer 上运行
     local temp_win = vim.api.nvim_open_win(hidden_buf, true, {
       relative = "editor",
-      width = 1, height = 1,
-      row = -100, col = -100,
+      width = 1,
+      height = 1,
+      row = -100,
+      col = -100,
       style = "minimal",
       noautocmd = true,
     })
@@ -1388,9 +1392,13 @@ local function _run_command(args, on_success, on_error, on_progress)
           return
         end
         local ok, hidden_lines = pcall(vim.api.nvim_buf_get_lines, hidden_buf, 0, -1, false)
-        if not ok or not hidden_lines then return end
+        if not ok or not hidden_lines then
+          return
+        end
         local current = table.concat(hidden_lines, "\n")
-        if current == last_content then return end
+        if current == last_content then
+          return
+        end
         last_content = current
         pty_ui.sync_content(hidden_lines)
       end, { ["repeat"] = -1 })

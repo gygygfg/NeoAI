@@ -73,36 +73,16 @@ end
 --- @param tool_name string 工具名称
 --- @param tool table 工具定义
 function M._show_editor(tool_name, tool)
-  local tool_registry = require("NeoAI.tools.tool_registry")
+  -- 从 approval_state 读取配置（静态配置 + 运行时修改均存储于此）
+  local config = approval_state.get_tool_config(tool_name) or {}
 
-  -- 从 approval_state 读取运行时配置（所有模块共享），回退到注册表默认配置
-  local runtime_config = approval_state.get_tool_config(tool_name)
-  local registry_config = tool_registry.get_approval_config(tool_name)
-
-  -- 当前生效的配置（auto_allow 布尔值）
-  local current_auto_allow = nil
-  if runtime_config and runtime_config.auto_allow ~= nil then
-    current_auto_allow = runtime_config.auto_allow
-  elseif registry_config and registry_config.auto_allow ~= nil then
-    current_auto_allow = registry_config.auto_allow
-  else
+  -- 当前生效的配置
+  local current_auto_allow = config.auto_allow
+  if current_auto_allow == nil then
     current_auto_allow = true
   end
-
-  -- 当前允许目录和参数组
-  local current_allowed_directories = {}
-  if runtime_config and runtime_config.allowed_directories then
-    current_allowed_directories = vim.deepcopy(runtime_config.allowed_directories)
-  elseif registry_config and registry_config.allowed_directories then
-    current_allowed_directories = vim.deepcopy(registry_config.allowed_directories)
-  end
-
-  local current_allowed_param_groups = {}
-  if runtime_config and runtime_config.allowed_param_groups then
-    current_allowed_param_groups = vim.deepcopy(runtime_config.allowed_param_groups)
-  elseif registry_config and registry_config.allowed_param_groups then
-    current_allowed_param_groups = vim.deepcopy(registry_config.allowed_param_groups)
-  end
+  local current_allowed_directories = vim.deepcopy(config.allowed_directories or {})
+  local current_allowed_param_groups = vim.deepcopy(config.allowed_param_groups or {})
 
   -- 前端显示辅助：auto_allow → behavior 文本
   local function behavior_text(auto_allow)

@@ -108,10 +108,12 @@ end
 local approval_state = require("NeoAI.tools.approval_state")
 
 --- 将工具标记为"允许所有"
+--- 同时设置 auto_allow=true，确保 approval_config_editor 也能看到变更
 --- @param tool_name string 工具名称
 function M.set_allow_all(tool_name)
   local config = approval_state.get_tool_config(tool_name) or {}
   config.allow_all = true
+  config.auto_allow = true
   approval_state.set_tool_config(tool_name, config)
 end
 

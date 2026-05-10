@@ -1,0 +1,195 @@
+*NeoAI-ui_system.txt*  UI System Reference
+
+==============================================================================
+UI System Overview                                        *NeoAI-ui-overview*
+
+The UI system provides two main interfaces: Tree UI for session management
+and Chat UI for AI conversation. Both use floating windows managed by the
+window manager. Components are modular and event-driven.
+
+==============================================================================
+Module Structure                                           *NeoAI-ui-modules*
+
+ui/init.lua:
+  UI module entry point and orchestrator
+  - initialize(config): Setup all UI sub-modules
+  - open_tree_ui(): Open tree interface
+  - open_chat_ui(session_id, branch_id): Open chat interface
+  - close_all_windows(): Close all UI windows
+  - switch_mode(mode): Switch between tree and chat
+  - handle_key_input(key): Route key to active handler
+  - show_reasoning(content) / append_reasoning(content): Reasoning display
+  - refresh_current_ui(): Refresh active window
+
+ui/ui_events.lua:
+  UI event listeners registration
+  - register_listeners(state, refs): Set up autocmd listeners for UI events
+
+ui/window/window_manager.lua:
+  Window creation and management
+  - initialize(config): Setup window configuration
+  - create_window(window_type, opts): Create floating window
+  - close_window(window_id): Close specific window
+  - close_all(): Close all managed windows
+  - focus_window(window_id): Focus a window
+  - get_window_win(window_id): Get Neovim window handle
+
+ui/window/chat_window.lua:
+  Chat window rendering and interaction
+  - initialize(config): Setup chat window state
+  - open(session_id, window_id): Open chat for session
+  - close(): Close chat window
+  - render_chat(): Render conversation messages
+  - set_keymaps(): Set chat window keymaps
+  - show_status(): Display chat status info
+  - sync_keymaps_to_buf(buf, actions): Sync keymaps to external buffer
+
+ui/window/tree_window.lua:
+  Tree window rendering and interaction
+  - initialize(config): Setup tree window state
+  - open(session_id, window_id): Open tree for session
+  - close(): Close tree window
+  - refresh_tree(): Refresh tree display
+  - set_keymaps(): Set tree window keymaps
+
+ui/components/history_tree.lua:
+  Tree data structure for session display
+  - initialize(config): Setup tree component
+  - get_flat_items(session_id): Get flattened tree items for rendering
+  - handle_select(): Handle node selection
+
+ui/components/input_handler.lua:
+  Input handling for chat
+  - initialize(config): Setup input handler
+  - handle_input(): Process user input
+
+ui/components/reasoning_display.lua:
+  Reasoning content display
+  - initialize(config): Setup reasoning display
+  - show(content): Show reasoning in floating window
+  - append(content): Append to reasoning display
+  - close(): Close reasoning display
+
+ui/components/tool_display.lua:
+  Tool execution display
+  - Shows tool execution status in floating window
+  - Groups tools by pack for organized display
+  - Updates in real-time as tools execute
+
+ui/components/virtual_input.lua:
+  Virtual input component for chat
+  - Manages the input buffer at the bottom of chat window
+
+ui/components/pty_terminal.lua:
+  PTY terminal component
+  - Manages terminal emulator for shell commands
+
+ui/components/sub_agent_monitor.lua:
+  Sub-agent execution monitor
+  - Displays sub-agent status and progress
+
+ui/components/approval_config_editor.lua:
+  Tool approval configuration editor
+  - UI for modifying approval settings at runtime
+
+ui/handlers/chat_handlers.lua:
+  Chat window key handlers
+  - handle_key(key): Route key to appropriate action
+  - Manages send, cancel, edit, delete, scroll, etc.
+
+ui/handlers/tree_handlers.lua:
+  Tree window key handlers
+  - handle_key(key): Route key to appropriate action
+  - Manages select, create, delete, expand, collapse, etc.
+
+==============================================================================
+Window Management                                        *NeoAI-window-mgmt*
+
+Window modes:
+  - float: Independent floating window
+  - tab: New tab page
+  - split: Vertical split layout
+
+Window creation:
+  1. window_manager.create_window() creates floating window
+  2. chat_window.open() or tree_window.open() renders content
+  3. Keymaps are set via set_keymaps()
+  4. Window focused via window_manager.focus_window()
+
+Window lifecycle:
+  - Opening: WINDOW_OPENING -> WINDOW_OPENED
+  - Closing: WINDOW_CLOSING -> WINDOW_CLOSED
+  - Only one window type active at a time (tree or chat)
+  - Opening one closes the other
+
+==============================================================================
+Chat Window Rendering                                   *NeoAI-chat-render*
+
+The chat window displays:
+  1. Session header (session name, model info)
+  2. Conversation messages (user + AI)
+  3. Tool execution results (collapsible)
+  4. Input area at bottom
+
+Rendering flow:
+  1. render_chat() called on events or user action
+  2. Gets messages from chat_service.get_raw_messages()
+  3. Formats messages with role icons, timestamps
+  4. Writes to buffer with proper highlights
+  5. Auto-scrolls to bottom
+
+Message display:
+  - User messages: Role icon + content
+  - AI messages: Role icon + content + optional reasoning
+  - Tool calls: Collapsible fold ({{{ ... }}})
+  - Usage info: Token counts at end of generation
+
+==============================================================================
+Tree Window Rendering                                   *NeoAI-tree-render*
+
+The tree window displays:
+  1. Session tree with expandable/collapsible nodes
+  2. Virtual nodes for visual structure
+  3. Connection characters for tree lines
+
+Rendering flow:
+  1. refresh_tree() called on events
+  2. Gets flat_items from history_tree component
+  3. Renders with indentation and tree connection characters
+  4. Highlights current selection
+
+Tree operations:
+  - Select: Opens chat for selected session
+  - New child: Creates child session under selected
+  - New root: Creates new root session
+  - Delete dialog: Deletes single conversation
+  - Delete branch: Deletes chain up to branch point
+  - Expand/Collapse: Toggle child visibility
+
+==============================================================================
+UI Event Integration                                    *NeoAI-ui-events*
+
+The UI listens to these key events:
+
+From AI engine:
+  - STREAM_CHUNK: Update message content in real-time
+  - REASONING_CONTENT: Show reasoning in floating window
+  - GENERATION_COMPLETED: Finalize message display
+  - GENERATION_ERROR: Show error message
+  - GENERATION_CANCELLED: Stop streaming display
+
+From tool system:
+  - TOOL_LOOP_STARTED: Show tool execution display
+  - TOOL_EXECUTION_STARTED: Update tool status
+  - TOOL_EXECUTION_COMPLETED: Show tool result
+  - TOOL_EXECUTION_ERROR: Show tool error
+  - TOOL_LOOP_FINISHED: Close tool display
+
+From history manager:
+  - SESSION_CREATED: Refresh tree
+  - SESSION_DELETED: Refresh tree
+  - SESSION_RENAMED: Refresh tree
+  - ROUND_ADDED: Refresh tree and chat
+
+==============================================================================
+vim:tw=78:ts=8:ft=help:norl:

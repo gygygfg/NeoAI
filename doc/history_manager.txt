@@ -1,0 +1,184 @@
+*NeoAI-history_manager.txt*  History Manager Reference
+
+==============================================================================
+History Manager Overview                                *NeoAI-history-overview*
+
+The history manager manages session data with a flat session structure.
+Sessions form a tree via child_ids, enabling branching conversations.
+Persistence is handled by a debounced, event-driven save system.
+
+==============================================================================
+Module Structure                                       *NeoAI-history-modules*
+
+history/manager.lua:
+  Session CRUD, tree management, message management
+  - create_session(name, is_root, parent_id): Create session
+  - get_session(session_id): Get session by ID
+  - get_current_session(): Get current session
+  - set_current_session(session_id): Switch current session
+  - delete_session(session_id): Delete session (reparents children)
+  - rename_session(session_id, new_name): Rename session
+  - add_round(session_id, user_msg, assistant_msg, usage): Add conversation round
+  - update_last_assistant(session_id, content): Update streaming response
+  - add_tool_result(session_id, tool_name, arguments, result): Log tool result
+  - get_messages(session_id): Get flattened message list
+  - get_context_and_new_parent(session_id): Get context path for AI
+  - find_parent_session(session_id): Find parent in tree
+  - delete_chain_to_branch(session_id): Delete chain up to branch point
+  - cleanup_orphans(): Remove unreachable sessions
+  - auto_name_session(session_id): AI-powered session naming
+  - export_sessions(filepath) / import_sessions(filepath): Export/import
+  - has_file_changed() / reload_from_file(): External change detection
+
+history/cache.lua:
+  Caching for round text, tree structure, and session list
+  - get_round_text(session_id): Cached formatted round text
+  - get_tree(): Cached tree structure
+  - get_list(): Cached session list
+  - invalidate_round_text(session_id): Invalidate specific cache
+  - invalidate_all(): Clear all caches
+
+history/persistence.lua:
+  File I/O with debounced saves
+  - initialize(options): Setup save path and debounce
+  - load(): Load sessions from file
+  - serialize(sessions): Convert sessions to JSON
+  - debounced_save(get_sessions_fn): Debounced async save
+  - enqueue_save(type, content): Queue save operation
+  - sync_save(sessions): Synchronous save (for VimLeavePre)
+  - flush_queue(): Clear pending saves
+
+history/saver.lua:
+  Event-driven async save queue
+  - initialize(history_manager): Setup event listeners
+  - shutdown_sync(): Flush queue synchronously on shutdown
+  - _test_reset(): Reset for testing
+
+history/message_builder.lua:
+  Session-to-messages conversion
+  - session_to_messages(session): Convert session to role/content list
+  - build_round_text(session): Build display text for session
+
+==============================================================================
+Session Structure                                       *NeoAI-session-struct*
+
+>
+    {
+        id = "session_1",          -- Unique ID (session_N)
+        name = "Session name",     -- Display name (auto-named or user-set)
+        created_at = 1234567890,   -- Creation timestamp
+        updated_at = 1234567890,   -- Last update timestamp
+        is_root = true,            -- Root session in tree
+        child_ids = { "session_2" }, -- Child session IDs (branching)
+        user = "User message",     -- Last user message text
+        assistant = {              -- Array of assistant entries
+            { content = "AI response", reasoning_content = "..." },
+            { type = "tool_call", tool_name = "read_file", arguments = {...}, result = "..." },
+        },
+        timestamp = 1234567890,    -- Last message timestamp
+        usage = {                  -- Token usage (accumulated)
+            prompt_tokens = 24,
+            completion_tokens = 770,
+            total_tokens = 794,
+            completion_tokens_details = { reasoning_tokens = 100 },
+        }
+    }
+<
+
+Assistant entry types:
+  - { content = "text" }: Normal AI text response
+  - { content = "text", reasoning_content = "..." }: AI response with reasoning
+  - { type = "tool_call", tool_name, arguments, result }: Tool execution record
+  - { type = "tool_call", tool_name, results = {...}, arguments_list = {...} }: Merged tool calls
+
+==============================================================================
+Session Tree Management                                *NeoAI-session-tree*
+
+Sessions form a tree structure:
+
+>
+    session_1 (root)  <- "How do I use Neovim?"
+      ├── session_2  <- "Explain buffers"
+      │     └── session_4  <- "Explain windows too"
+      └── session_3  <- "Explain plugins"
+<
+
+Tree operations:
+  - create_session(name, true, nil): Create root session
+  - create_session(name, false, parent_id): Create child (branch)
+  - delete_session(id): Remove session, reparent children to parent
+  - delete_chain_to_branch(id): Delete chain up to branch point
+  - get_root_sessions(): Get all root sessions (sorted by update time)
+  - get_tree(): Get full tree structure (cached)
+
+Context path resolution (get_context_and_new_parent):
+  - Walk up from session to root via unique child chains
+  - Walk down from session to leaf via unique child chains
+  - Collect all messages along the path
+  - This ensures AI has full conversation context
+
+==============================================================================
+Persistence System                                     *NeoAI-persistence*
+
+Save location:
+  - Default: stdpath("cache") .. "/NeoAI/sessions.json"
+  - Configurable via session.save_path
+
+Save triggers:
+  - add_round(): User sends a message
+  - add_tool_result(): Tool execution completes
+  - delete_session(): Session deleted
+  - rename_session(): Session renamed
+  - VimLeavePre: Synchronous save (via shutdown_flag)
+
+Save mechanism:
+  - debounced_save(): Debounces by 500ms (configurable)
+  - enqueue_save(): Event-driven queue (saver.lua)
+  - sync_save(): Direct synchronous write (for shutdown)
+
+External change detection:
+  - has_file_changed(): Check if file was modified externally
+  - reload_from_file(): Re-read sessions from file
+  - Uses line count caching for efficient detection
+
+==============================================================================
+Auto-Naming                                            *NeoAI-auto-naming*
+
+When auto_naming = true:
+  1. User sends first message in a session
+  2. history_manager.add_round() triggers auto_name_session()
+  3. Checks if session name is a default name ("聊天会话", "新会话", etc.)
+  4. If default, calls ai_engine.auto_name_session()
+  5. AI generates a short name (<=20 chars) from the user message
+  6. Session is renamed via rename_session()
+  7. SESSION_RENAMED event is fired
+
+==============================================================================
+Export/Import                                           *NeoAI-export-import*
+
+Export format (JSON):
+>
+    {
+        "sessions": [
+            { "id": "session_1", "name": "...", "user": "...", ... }
+        ],
+        "export_time": 1234567890
+    }
+<
+
+Commands:
+  - :NeoAIExport [path]  Export sessions to JSON
+  - :NeoAIImport [path]  Import sessions from JSON
+
+==============================================================================
+Orphan Cleanup                                        *NeoAI-orphan-cleanup*
+
+cleanup_orphans() removes sessions not reachable from any root session:
+  1. Mark all root sessions and their descendants as referenced
+  2. Remove all unreferenced sessions
+  3. Trigger ORPHANS_CLEANED event
+  4. Invalidate all caches
+  5. Mark dirty for persistence
+
+==============================================================================
+vim:tw=78:ts=8:ft=help:norl:

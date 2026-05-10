@@ -376,131 +376,9 @@ local function _edit_file(args, on_success, on_error)
   local start_line = args.start_line
   local end_line = args.end_line
 
-  -- append=false 时必须提供 start_line 和 end_line
-  if not append and (not start_line or not end_line) then
-    if on_error then
-      on_error("覆盖模式(append=false)必须提供 start_line 和 end_line 参数")
-    end
-    return
-  end
-
-  -- 行范围替换模式：读取文件，替换指定行范围，再写回
-  if start_line and end_line then
-    local fu = get_file_utils()
-
-    local function do_range_replace(file_content)
-      local lines = vim.split(file_content, "\n", { plain = true })
-      if #lines > 0 and lines[#lines] == "" then
-        table.remove(lines)
-      end
-      local total = #lines
-
-      if start_line < 1 then
-        start_line = 1
-      end
-      if end_line > total then
-        end_line = total
-      end
-      if start_line > end_line then
-        if on_error then
-          on_error(string.format("起始行(%d)大于结束行(%d)", start_line, end_line))
-        end
-        return
-      end
-
-      -- 构建新内容：保留 start_line 之前的部分 + 新内容 + 保留 end_line 之后的部分
-      local before = {}
-      for i = 1, start_line - 1 do
-        table.insert(before, lines[i])
-      end
-      local after = {}
-      for i = end_line + 1, total do
-        table.insert(after, lines[i])
-      end
-
-      local new_lines = {}
-      if #before > 0 then
-        table.insert(new_lines, table.concat(before, "\n"))
-      end
-      table.insert(new_lines, content)
-      if #after > 0 then
-        table.insert(new_lines, table.concat(after, "\n"))
-      end
-      local new_content = table.concat(new_lines, "\n")
-      -- 如果原文件末尾有换行，保持
-      if file_content:sub(-1) == "\n" then
-        new_content = new_content .. "\n"
-      end
-
-      local function on_write_ok()
-        if on_success then
-          on_success({ filepath = filepath, success = true })
-        end
-      end
-      local function on_write_err(err)
-        if on_error then
-          on_error(string.format("写入文件失败 %s: %s", filepath, err or "无法写入文件"))
-        end
-      end
-
-      if fu then
-        local success, _ = fu.write_file(filepath, new_content, false)
-        if success == true then
-          on_write_ok()
-        else
-          on_write_err("写入失败")
-        end
-      else
-        uv_write_file(filepath, new_content, false, on_write_ok, on_write_err)
-      end
-    end
-
-    local function on_read_err(err)
-      -- append=false 且有行范围时，文件不存在则直接创建
-      if not append then
-        local function on_write_ok()
-          if on_success then
-            on_success({ filepath = filepath, success = true })
-          end
-        end
-        local function on_write_err(write_err)
-          if on_error then
-            on_error(string.format("创建文件失败 %s: %s", filepath, write_err or "无法创建文件"))
-          end
-        end
-        if fu then
-          local success, _ = fu.write_file(filepath, content, false)
-          if success == true then
-            on_write_ok()
-          else
-            on_write_err("写入失败")
-          end
-        else
-          uv_write_file(filepath, content, false, on_write_ok, on_write_err)
-        end
-      else
-        if on_error then
-          on_error(string.format("读取文件失败 %s: %s", filepath, err or "无法读取文件"))
-        end
-      end
-    end
-
-    if fu then
-      local file_content, err = fu.read_file(filepath)
-      if file_content then
-        do_range_replace(file_content)
-      else
-        on_read_err(err)
-      end
-    else
-      uv_read_file(filepath, do_range_replace, on_read_err)
-    end
-    return
-  end
-
-  -- 普通写入模式（覆盖/追加）
   local fu = get_file_utils()
 
+  -- 通用写回调
   local function on_write_ok()
     if on_success then
       on_success({ filepath = filepath, success = true })
@@ -513,16 +391,144 @@ local function _edit_file(args, on_success, on_error)
     end
   end
 
-  if fu then
-    local success, _ = fu.write_file(filepath, content, append)
-    if success == true then
-      on_write_ok()
+  -- 直接写入内容到文件的函数
+  local function write_content(content_to_write)
+    if fu then
+      local success, _ = fu.write_file(filepath, content_to_write, false)
+      if success == true then
+        on_write_ok()
+      else
+        on_write_err("写入失败")
+      end
     else
-      on_write_err("写入失败")
+      uv_write_file(filepath, content_to_write, false, on_write_ok, on_write_err)
     end
-  else
-    uv_write_file(filepath, content, append, on_write_ok, on_write_err)
   end
+
+  -- 先检查文件是否存在
+  local function check_exists_and_proceed()
+    local function on_exists(exists)
+      if not exists then
+        -- 文件不存在，直接创建并返回警告
+        local warning = string.format(
+          "⚠️ 警告：文件 '%s' 不存在，已自动创建。\n"
+            .. "请确认文件路径是否正确，或使用 create_directory 先创建目录。",
+          filepath
+        )
+        write_content(content)
+        if on_success then
+          -- 将警告信息附加到返回值中
+          on_success({ filepath = filepath, success = true, warning = warning })
+        end
+        return
+      end
+      -- 文件存在，继续原有逻辑
+      -- append=false 时必须提供 start_line 和 end_line
+      if not append and (not start_line or not end_line) then
+        if on_error then
+          on_error("覆盖模式(append=false)必须提供 start_line 和 end_line 参数")
+        end
+        return
+      end
+
+      -- 行范围替换模式：读取文件，替换指定行范围，再写回
+      if start_line and end_line then
+        local function do_range_replace(file_content)
+          local lines = vim.split(file_content, "\n", { plain = true })
+          if #lines > 0 and lines[#lines] == "" then
+            table.remove(lines)
+          end
+          local total = #lines
+
+          if start_line < 1 then
+            start_line = 1
+          end
+          if end_line > total then
+            end_line = total
+          end
+          if start_line > end_line then
+            if on_error then
+              on_error(string.format("起始行(%d)大于结束行(%d)", start_line, end_line))
+            end
+            return
+          end
+
+          -- 构建新内容：保留 start_line 之前的部分 + 新内容 + 保留 end_line 之后的部分
+          local before = {}
+          for i = 1, start_line - 1 do
+            table.insert(before, lines[i])
+          end
+          local after = {}
+          for i = end_line + 1, total do
+            table.insert(after, lines[i])
+          end
+
+          local new_lines = {}
+          if #before > 0 then
+            table.insert(new_lines, table.concat(before, "\n"))
+          end
+          table.insert(new_lines, content)
+          if #after > 0 then
+            table.insert(new_lines, table.concat(after, "\n"))
+          end
+          local new_content = table.concat(new_lines, "\n")
+          -- 如果原文件末尾有换行，保持
+          if file_content:sub(-1) == "\n" then
+            new_content = new_content .. "\n"
+          end
+
+          if fu then
+            local success, _ = fu.write_file(filepath, new_content, false)
+            if success == true then
+              on_write_ok()
+            else
+              on_write_err("写入失败")
+            end
+          else
+            uv_write_file(filepath, new_content, false, on_write_ok, on_write_err)
+          end
+        end
+
+        if fu then
+          local file_content, err = fu.read_file(filepath)
+          if file_content then
+            do_range_replace(file_content)
+          else
+            if on_error then
+              on_error(string.format("读取文件失败 %s: %s", filepath, err or "无法读取文件"))
+            end
+          end
+        else
+          uv_read_file(filepath, do_range_replace, function(err)
+            if on_error then
+              on_error(string.format("读取文件失败 %s: %s", filepath, err or "无法读取文件"))
+            end
+          end)
+        end
+        return
+      end
+
+      -- 普通写入模式（覆盖/追加）
+      if fu then
+        local success, _ = fu.write_file(filepath, content, append)
+        if success == true then
+          on_write_ok()
+        else
+          on_write_err("写入失败")
+        end
+      else
+        uv_write_file(filepath, content, append, on_write_ok, on_write_err)
+      end
+    end
+
+    if fu then
+      on_exists(fu.exists(filepath))
+    else
+      uv_exists(filepath, on_exists)
+    end
+  end
+
+  check_exists_and_proceed()
 end
 
 M.edit_file = define_tool({

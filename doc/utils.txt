@@ -1,0 +1,88 @@
+*NeoAI-utils.txt*  Utility Modules Reference
+
+==============================================================================
+Utility Modules Overview                                *NeoAI-utils-overview*
+
+The utils directory provides shared utility functions used across all modules.
+
+==============================================================================
+Module List                                             *NeoAI-utils-modules*
+
+utils/init.lua:
+  Entry point, exports all utility modules
+
+utils/logger.lua:
+  Logging system
+  - initialize(config): Setup logger with config
+  - debug(msg, ...): DEBUG level log
+  - info(msg, ...): INFO level log
+  - warn(msg, ...): WARN level log
+  - error(msg, ...): ERROR level log
+  - fatal(msg, ...): FATAL level log
+  - Log levels: DEBUG, INFO, WARN, ERROR, FATAL
+  - Output: file (configurable path) or default
+  - Format: "[{time}] [{level}] {message}"
+  - File rotation: max_file_size, max_backups
+
+utils/json.lua:
+  JSON utilities
+  - encode(value): Encode Lua value to JSON string
+  - decode(json_str): Decode JSON string to Lua value
+  - Wraps vim.json with error handling
+
+utils/http_utils.lua:
+  HTTP utilities
+  - sanitize_json_body(body): Clean JSON body
+  - repair_orphan_tool_messages(request): Fix tool message issues
+  - parse_response_tool_calls(response): Parse tool calls from response
+  - check_dedup(generation_id, api_type, request): Request dedup check
+  - update_dedup(generation_id, api_type, request): Update dedup cache
+  - clear_dedup(generation_id): Clear dedup for retry
+  - clear_all_dedup(): Clear all dedup caches
+  - read_file(filepath): Read file contents
+
+utils/file_utils.lua:
+  File utilities
+  - read_file(filepath): Read file with encoding detection
+  - write_file(filepath, content): Write file
+  - file_exists(filepath): Check file existence
+  - Other file operations used by file_tools
+
+utils/common.lua:
+  Common utility functions
+  - General-purpose helpers
+
+utils/async_worker.lua:
+  Async worker utilities
+  - Schedule and manage async operations
+  - Used by UI for non-blocking rendering
+
+utils/table_utils.lua:
+  Table manipulation utilities
+  - Deep copy
+  - Merge
+  - Filter
+  - Map
+  - Other table operations
+
+utils/skiplist.lua:
+  Skip list data structure
+  - Used for efficient ordered data access
+
+==============================================================================
+Logger Configuration                                   *NeoAI-logger-config*
+
+>
+    log = {
+        level = "WARN",           -- DEBUG, INFO, WARN, ERROR, FATAL
+        output_path = nil,        -- File path (nil = default)
+        format = "[{time}] [{level}] {message}",
+        max_file_size = 10485760, -- 10MB
+        max_backups = 5,
+        verbose = false,
+        print_debug = false,
+    }
+<
+
+==============================================================================
+vim:tw=78:ts=8:ft=help:norl:

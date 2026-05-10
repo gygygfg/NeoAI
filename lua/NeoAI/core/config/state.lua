@@ -26,6 +26,10 @@ local _coroutine_contexts = {}
 -- 非协程环境下的当前上下文（当 with_context 在非协程中被调用时使用）
 local _non_coroutine_context = nil
 
+-- ========== 全局共享表（跨协程共享） ==========
+-- 用于存储需要在不同协程间共享的配置数据，如审批配置
+local _global_shared = {}
+
 -- ========== 事件触发辅助 ==========
 
 --- 触发 Neovim User 事件（封装 pcall 保护）
@@ -151,10 +155,39 @@ function M.with_context(context, fn, ...)
   return result1, result2, result3
 end
 
+-- ========== 全局共享表 API（跨协程共享） ==========
+
+--- 获取全局共享表
+--- 与 get_shared() 不同，此表在所有协程间共享
+--- @return table
+function M.get_global_shared()
+  return _global_shared
+end
+
+--- 设置全局共享值
+--- @param key string
+--- @param value any
+function M.set_global(key, value)
+  _global_shared[key] = value
+end
+
+--- 获取全局共享值
+--- @param key string
+--- @param default any 默认值
+--- @return any
+function M.get_global(key, default)
+  local v = _global_shared[key]
+  if v == nil then
+    return default
+  end
+  return v
+end
+
 --- 重置状态（测试用）
 function M._test_reset()
   _coroutine_contexts = {}
   _non_coroutine_context = nil
+  _global_shared = {}
 end
 
 return M

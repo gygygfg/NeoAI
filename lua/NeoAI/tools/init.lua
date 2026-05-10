@@ -87,6 +87,9 @@ end
 
 function M.reload_tools()
   if not initialized then error("工具系统未初始化") end
+  -- 清除审批配置初始化标记，允许重新写入
+  local approval_state = require("NeoAI.tools.approval_state")
+  approval_state.clear_initialized()
   tool_registry.clear()
   builtin_tools_loaded = false
   local tools_config = full_config.tools or {}

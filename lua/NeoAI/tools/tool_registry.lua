@@ -9,15 +9,6 @@ local tools = {}
 local tool_categories = {}
 local state = { initialized = false, config = nil }
 
--- ========== 审批配置默认值 ==========
--- 注意：审批行为（auto_allow）由各工具在注册时自行设置，此处不设默认值
-local DEFAULT_APPROVAL = {
-  -- 允许的目录列表（相对于工作目录的路径模式）
-  allowed_directories = {},
-  -- 允许的参数组（参数名 -> 允许的值列表）
-  allowed_param_groups = {},
-}
-
 local function guard()
   if not state.initialized then
     error("工具注册表未初始化，请先调用 M.initialize()")
@@ -30,146 +21,47 @@ end
 --- @return string 工作目录路径
 function M.get_work_dir()
   guard()
-  -- 优先通过 git 获取工作目录
   local git_toplevel = vim.fn.system("git rev-parse --show-toplevel 2>/dev/null"):gsub("%s+$", "")
   if git_toplevel and git_toplevel ~= "" and vim.v.shell_error == 0 then
     return git_toplevel
   end
-  -- 回退到 Neovim 当前工作目录
   return vim.fn.getcwd()
 end
 
 -- ========== 审批配置管理 ==========
 
 --- 获取工具的审批配置
+--- 统一从 approval_state 读取（静态配置 + 运行时修改均存储于此）
 --- 优先级：
----   1. approval_state 运行时配置（由 approval_config_editor 写入，所有模块共享）
----   2. 工具自身定义的审批设置（注册时的 approval 字段）
----   3. 全局默认配置
---- 工具注册时可通过 approval 字段自定义：
----   approval.auto_allow - true（自动允许）或 false（需要用户审批）
----   approval.allowed_directories - 允许的目录列表
----   approval.allowed_param_groups - 允许的参数组
+---   1. 工具级配置（由 approval_state.initialize_from_config 或 approval_config_editor 写入）
+---   2. 全局默认配置
+---   3. 工具注册时的 approval 字段（兜底）
 --- @param tool_name string 工具名称
---- @return table 审批配置 { auto_allow, allowed_directories, allowed_param_groups }
+--- @return table { auto_allow?, allowed_directories?, allowed_param_groups? }
 function M.get_approval_config(tool_name)
   guard()
 
-  -- 优先级1：approval_state 运行时配置（所有模块共享同一变量）
-  local runtime_config = approval_state.get_tool_config(tool_name)
-  if runtime_config then
-    return vim.deepcopy(runtime_config)
+  -- 从 approval_state 获取（已包含工具级和全局默认配置的合并）
+  local config = approval_state.get_tool_config(tool_name)
+  if config then
+    return vim.deepcopy(config)
   end
 
+  -- 兜底：工具注册时的 approval 字段
   local tool = tools[tool_name]
-  if not tool then
-    -- 工具不存在时，返回全局默认配置
-    local config_approval = state.config.approval or {}
-    local result = vim.deepcopy(DEFAULT_APPROVAL)
-    if config_approval.default_auto_allow ~= nil then
-      result.auto_allow = config_approval.default_auto_allow
-    end
-    if config_approval.allowed_directories then
-      result.allowed_directories = config_approval.allowed_directories
-    end
-    if config_approval.allowed_param_groups then
-      result.allowed_param_groups = config_approval.allowed_param_groups
-    end
-    return result
+  if tool and tool.approval then
+    return vim.deepcopy(tool.approval)
   end
 
-  -- 优先级2：合并工具自定义审批配置和全局默认配置
-  local tool_approval = tool.approval or {}
-  local config_approval = state.config.approval or {}
-
-  local result = {
-    auto_allow = (tool_approval.auto_allow ~= nil) and tool_approval.auto_allow
-      or config_approval.default_auto_allow,
-    allowed_directories = tool_approval.allowed_directories
-      or config_approval.allowed_directories
-      or DEFAULT_APPROVAL.allowed_directories,
-    allowed_param_groups = tool_approval.allowed_param_groups
-      or config_approval.allowed_param_groups
-      or DEFAULT_APPROVAL.allowed_param_groups,
-  }
-
-  return result
+  return {}
 end
 
---- 设置全局审批配置
---- @param approval_config table 审批配置
----   approval_config.default_auto_allow - boolean
----   approval_config.allowed_directories - string[] 允许的目录列表
----   approval_config.allowed_param_groups - table 允许的参数组
-function M.set_approval_config(approval_config)
-  guard()
-  if not state.config.approval then
-    state.config.approval = {}
-  end
-  if approval_config.default_auto_allow ~= nil then
-    state.config.approval.default_auto_allow = approval_config.default_auto_allow
-  end
-  if approval_config.allowed_directories then
-    state.config.approval.allowed_directories = approval_config.allowed_directories
-  end
-  if approval_config.allowed_param_groups then
-    state.config.approval.allowed_param_groups = approval_config.allowed_param_groups
-  end
-end
-
---- 从合并后的完整配置中应用审批配置
---- 遍历 tools.approval.tool_overrides，覆盖各工具的 approval 字段
---- 同时设置全局默认审批配置
+--- 从合并后的完整配置中初始化审批配置
+--- 委托给 approval_state.initialize_from_config
 --- @param full_config table 合并后的完整配置（来自 merger.process_config）
 function M.apply_approval_config(full_config)
   guard()
-  if not full_config or not full_config.tools or not full_config.tools.approval then
-    return
-  end
-
-  local approval_cfg = full_config.tools.approval
-
-  -- 设置全局默认审批配置
-  local global_config = {}
-  if approval_cfg.default_auto_allow ~= nil then
-    global_config.default_auto_allow = approval_cfg.default_auto_allow
-  end
-  if approval_cfg.allowed_directories then
-    global_config.allowed_directories = approval_cfg.allowed_directories
-  end
-  if approval_cfg.allowed_param_groups then
-    global_config.allowed_param_groups = approval_cfg.allowed_param_groups
-  end
-  M.set_approval_config(global_config)
-
-  -- 应用各工具单独覆盖配置
-  local tool_overrides = approval_cfg.tool_overrides or {}
-  for tool_name, override in pairs(tool_overrides) do
-    if type(override) == "table" and tools[tool_name] then
-      local tool = tools[tool_name]
-
-      -- 合并覆盖配置到工具的 approval 字段
-      if not tool.approval then
-        tool.approval = {}
-      end
-
-      if override.auto_allow ~= nil then
-        tool.approval.auto_allow = override.auto_allow
-      end
-      if override.allowed_directories ~= nil then
-        tool.approval.allowed_directories = override.allowed_directories
-      end
-      if override.allowed_param_groups ~= nil then
-        tool.approval.allowed_param_groups = override.allowed_param_groups
-      end
-
-      logger.debug(
-        "[tool_registry] 应用工具 '%s' 的审批覆盖配置: auto_allow=%s",
-        tool_name,
-        tostring(tool.approval.auto_allow)
-      )
-    end
-  end
+  approval_state.initialize_from_config(full_config)
 end
 
 function M.initialize(config)
@@ -177,10 +69,6 @@ function M.initialize(config)
     return
   end
   state.config = config or {}
-  -- 初始化审批配置
-  if not state.config.approval then
-    state.config.approval = vim.deepcopy(DEFAULT_APPROVAL)
-  end
   tools = {}
   tool_categories = {}
   state.initialized = true

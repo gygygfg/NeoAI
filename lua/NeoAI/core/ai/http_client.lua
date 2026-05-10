@@ -1063,6 +1063,8 @@ function M.send_request_async(params, on_complete)
 
                 if on_complete then
                   local retry_unified = request_adapter.transform_response(retry_response, api_type)
+                  -- 解析 tool_calls 中的 arguments（从 JSON 字符串转为 Lua table）
+                  M._parse_response_tool_calls(retry_unified)
                   vim.schedule(function()
                     on_complete(retry_unified, nil)
                   end)
@@ -1088,6 +1090,8 @@ function M.send_request_async(params, on_complete)
 
       if on_complete then
         local unified = request_adapter.transform_response(response, api_type)
+        -- 解析 tool_calls 中的 arguments（从 JSON 字符串转为 Lua table）
+        M._parse_response_tool_calls(unified)
         vim.schedule(function()
           on_complete(unified, nil)
         end)

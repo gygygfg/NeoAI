@@ -1,0 +1,273 @@
+*NeoAI-configuration.txt*  NeoAI Configuration Reference
+
+==============================================================================
+Configuration Reference                                *NeoAI-config-reference*
+
+The configuration is managed by:
+  - default_config.lua: Default values
+  - merger.lua: Validation and merging of user config with defaults
+  - keymap_manager.lua: Keymap CRUD and persistence
+  - state.lua: Coroutine context state manager
+
+==============================================================================
+Full Configuration Example                              *NeoAI-config-example*
+
+>
+    require('NeoAI').setup({
+        -- AI configuration
+        ai = {
+            default = "balanced",
+            providers = {
+                deepseek = {
+                    api_type = "openai",
+                    base_url = "https://api.deepseek.com/chat/completions",
+                    api_key = os.getenv("DEEPSEEK_API_KEY"),
+                    models = { "deepseek-v4-flash", "deepseek-v4-pro" },
+                },
+                openai = {
+                    api_type = "openai",
+                    base_url = "https://api.openai.com/v1/chat/completions",
+                    api_key = os.getenv("OPENAI_API_KEY"),
+                    models = { "gpt-4o", "gpt-4o-mini" },
+                },
+                anthropic = {
+                    api_type = "anthropic",
+                    base_url = "https://api.anthropic.com/v1/messages",
+                    api_key = os.getenv("ANTHROPIC_API_KEY"),
+                    models = { "claude-sonnet-4-20250514" },
+                },
+                google = {
+                    api_type = "google",
+                    base_url = "https://generativelanguage.googleapis.com/v1beta/models",
+                    api_key = os.getenv("GOOGLE_API_KEY"),
+                    models = { "gemini-2.0-flash" },
+                },
+                -- See default_config.lua for all supported providers
+            },
+            scenarios = {
+                naming = {
+                    { provider = "deepseek", model_name = "deepseek-v4-flash",
+                      temperature = 0.3, max_tokens = 50, stream = false }
+                },
+                chat = {
+                    { provider = "deepseek", model_name = "deepseek-v4-flash",
+                      temperature = 0.7, max_tokens = 4096, stream = true }
+                },
+                reasoning = {
+                    { provider = "deepseek", model_name = "deepseek-v4-pro",
+                      temperature = 0.7, max_tokens = 8192, stream = true }
+                },
+                coding = {
+                    { provider = "deepseek", model_name = "deepseek-v4-pro",
+                      temperature = 0.2, max_tokens = 8192, stream = true }
+                },
+                tools = {
+                    { provider = "deepseek", model_name = "deepseek-v4-flash",
+                      temperature = 0.3, max_tokens = 1024, stream = true }
+                },
+                agent = {
+                    { provider = "deepseek", model_name = "deepseek-v4-pro",
+                      temperature = 0.7, max_tokens = 4096, stream = true }
+                },
+            },
+            reasoning_enabled = true,
+            system_prompt = "You are an AI coding assistant.",
+        },
+
+        -- UI configuration
+        ui = {
+            default_ui = "tree",  -- 'tree' or 'chat'
+            window_mode = "tab",  -- 'float', 'tab', or 'split'
+            window = {
+                width = 80,
+                height = 20,
+                border = "rounded",
+            },
+            colors = {
+                background = "Normal",
+                border = "FloatBorder",
+                text = "Normal",
+            },
+            split = {
+                size = 80,
+                chat_direction = "right",
+                tree_direction = "right",
+            },
+            tree = {
+                foldenable = false,
+                foldmethod = "manual",
+                foldcolumn = "0",
+                foldlevel = 99,
+            },
+        },
+
+        -- Session configuration
+        session = {
+            auto_save = true,
+            auto_naming = true,
+            save_path = vim.fn.stdpath("cache") .. "/NeoAI",
+            max_history_per_session = 1000,
+        },
+
+        -- Tool configuration
+        tools = {
+            enabled = true,
+            builtin = true,
+            external = {},
+            approval = {
+                default_auto_allow = false,
+                allowed_directories = {},
+                allowed_param_groups = {},
+                tool_overrides = {
+                    read_file = { auto_allow = true },
+                    edit_file = { auto_allow = false },
+                    list_files = { auto_allow = true },
+                    search_files = { auto_allow = true },
+                    file_exists = { auto_allow = true },
+                    create_directory = { auto_allow = false },
+                    ensure_dir = { auto_allow = false },
+                    delete_file = { auto_allow = false },
+                    log_message = { auto_allow = true },
+                    get_log_levels = { auto_allow = true },
+                    -- treesitter tools: all auto_allow = true
+                    -- LSP tools: all auto_allow = true except rename/format
+                    run_command = {
+                        auto_allow = false,
+                        allowed_directories = { "./" },
+                        allowed_param_groups = { "ls", "wc", "find", "grep" },
+                    },
+                    create_sub_agent = { auto_allow = false },
+                    get_sub_agent_status = { auto_allow = true },
+                    cancel_sub_agent = { auto_allow = true },
+                },
+            },
+        },
+
+        -- Logging configuration
+        log = {
+            level = "WARN",  -- DEBUG, INFO, WARN, ERROR, FATAL
+            format = "[{time}] [{level}] {message}",
+            max_file_size = 10485760,
+            max_backups = 5,
+            verbose = false,
+            print_debug = false,
+        },
+
+        -- Test configuration
+        test = {
+            auto_test = false,
+            delay_ms = 1500,
+        },
+    })
+<
+
+==============================================================================
+Configuration Validation                                    *NeoAI-config-validate*
+
+The merger.lua module validates user configuration:
+
+Type checking:
+  - Each field is checked against expected Lua types
+  - Mismatched types are rejected with a warning notification
+  - Rejected fields fall back to default values
+
+Enum validation:
+  - ui.default_ui: "tree", "chat"
+  - ui.window_mode: "float", "tab", "split"
+  - log.level: "DEBUG", "INFO", "WARN", "ERROR", "FATAL"
+
+Range validation:
+  - window.width >= 10
+  - window.height >= 5
+  - split.size >= 10
+  - max_history_per_session >= 1
+  - log.max_file_size >= 1024
+  - log.max_backups >= 0
+  - test.delay_ms >= 0
+
+Free-form tables (no strict validation):
+  - ai.providers: Provider definitions
+  - ai.scenarios: Scenario configurations
+  - keymaps: Keymap configurations
+  - tools.approval.tool_overrides: Tool-specific approval overrides
+
+==============================================================================
+Keymap Configuration                                        *NeoAI-keymaps*
+
+Keymap configuration is managed by keymap_manager.lua:
+
+Global keymaps:
+>
+    open_tree = { key = "<leader>at", desc = "打开树界面" }
+    open_chat = { key = "<leader>ac", desc = "打开聊天界面" }
+    close_all = { key = "<leader>aq", desc = "关闭所有窗口" }
+    toggle_ui = { key = "<leader>aa", desc = "切换UI显示" }
+<
+
+Tree window keymaps:
+>
+    select = { key = "<CR>", desc = "选择节点/分支" }
+    new_child = { key = "n", desc = "新建子分支" }
+    new_root = { key = "N", desc = "新建根分支" }
+    delete_dialog = { key = "d", desc = "删除对话" }
+    delete_branch = { key = "D", desc = "删除分支" }
+    expand = { key = "o", desc = "展开节点" }
+    collapse = { key = "O", desc = "折叠节点" }
+<
+
+Chat window keymaps:
+>
+    insert = { key = "i", desc = "进入插入模式" }
+    quit = { key = "q", desc = "关闭聊天窗口" }
+    refresh = { key = "r", desc = "刷新聊天窗口" }
+    send = { insert = "<C-s>", normal = "<CR>" }
+    cancel = { key = "<Esc>", desc = "取消生成" }
+    edit = { key = "e", desc = "编辑消息" }
+    delete = { key = "dd", desc = "删除消息" }
+    scroll_up = { key = "<C-u>", desc = "向上滚动" }
+    scroll_down = { key = "<C-d>", desc = "向下滚动" }
+    toggle_reasoning = { key = "r", desc = "切换思考过程显示" }
+    switch_model = { key = "m", desc = "切换模型" }
+    newline = { key = "<CR>", desc = "新建行" }
+    clear = { key = "<C-u>", desc = "清空输入" }
+    tool_approval = { key = "<C-a>", desc = "工具审批" }
+    approval = {
+        confirm = { key = "<CR>", desc = "允许一次" }
+        confirm_all = { key = "A", desc = "允许所有" }
+        cancel = { key = "<Esc>", desc = "取消" }
+        cancel_with_reason = { key = "C", desc = "取消并说明" }
+    }
+<
+
+Keymap persistence:
+  - Keymaps are saved to stdpath("config") .. "/neoai_keymaps.json"
+  - Only non-default keymaps are saved
+  - Loaded on initialization via keymap_manager.load_keymaps()
+
+==============================================================================
+Config Module Architecture                               *NeoAI-config-modules*
+
+config/init.lua:
+  Entry point, initializes all config sub-modules
+
+config/merger.lua:
+  - process_config(user_config): Validate, merge, and return complete config
+  - get_scenario_candidates(scenario): Get AI candidates for a scenario
+  - get_preset(scenario): Get first available AI preset
+  - get_available_models(): Get all models with valid API keys
+
+config/keymap_manager.lua:
+  - initialize(config): Load default keymaps and persisted overrides
+  - get_keymap(context, action): Get keymap for specific action
+  - set_keymap(context, action, key, desc): Set custom keymap
+  - save_keymaps() / load_keymaps(): Persist to JSON file
+  - export_formatted(): Return formatted keymap display
+
+config/state.lua:
+  - create_context(ctx): Create coroutine-local context
+  - with_context(ctx, fn): Execute function within context
+  - get_shared(): Get shared state for current coroutine
+  - get_current_context(): Get current coroutine context
+
+==============================================================================
+vim:tw=78:ts=8:ft=help:norl:

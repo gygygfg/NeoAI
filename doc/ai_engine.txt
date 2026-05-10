@@ -1,0 +1,216 @@
+*NeoAI-ai_engine.txt*  AI Engine Architecture
+
+==============================================================================
+AI Engine Module Reference                               *NeoAI-ai-engine-ref*
+
+The AI engine is the core generation orchestrator. It manages the complete
+lifecycle of AI interactions: request building, HTTP communication, stream
+processing, tool orchestration, and response retry.
+
+==============================================================================
+Module Structure                                           *NeoAI-ai-modules*
+
+ai/init.lua:
+  Entry point, exports all AI sub-modules
+
+ai/ai_engine.lua:
+  Central orchestrator for AI generation flow
+  - generate_response(messages, params): Main entry point
+  - process_query(query, options): Simplified query interface
+  - cancel_generation(): Stop current generation
+  - handle_tool_result(data): Process tool execution results
+  - auto_name_session(session_id, user_msg, callback): AI-powered naming
+  - set_tools(tools): Register tool definitions with AI engine
+
+ai/chat_service.lua:
+  Backend service for chat operations
+  - send_message(params): Send user message, trigger AI generation
+  - cancel_generation(): Cancel current generation
+  - Session CRUD delegation to history_manager
+  - Message management (get_raw_messages, add_round, etc.)
+
+ai/http_client.lua:
+  HTTP client for AI API communication
+  - send_request(params): Synchronous non-streaming request
+  - send_stream_request(params, on_chunk, on_complete, on_error): Streaming
+  - send_request_async(params, on_complete): Async non-streaming
+  - cancel_request(request_id): Cancel specific request
+  - cancel_all_requests(): Cancel all active requests
+
+ai/request_builder.lua:
+  Builds AI API request payloads
+  - build_request(params): Construct request with messages, tools, options
+  - format_messages(messages): Deduplicate, filter, and format messages
+  - build_tool_result_message(tool_call_id, result, tool_name): Tool result msg
+  - estimate_tokens(text): Token estimation
+
+ai/request_adapter.lua:
+  Multi-provider request/response format adapter
+  - Registered adapters: openai, anthropic, google
+  - transform_request(request, api_type, provider_config): Convert to native format
+  - transform_response(response, api_type): Convert from native to unified format
+  - get_headers(api_key, api_type): Get HTTP headers for provider
+
+ai/stream_processor.lua:
+  Streaming response processing
+  - create_processor(generation_id, session_id, window_id): Create processor
+  - process_chunk(processor, data): Process single stream chunk
+  - filter_valid_tool_calls(tool_calls): Remove invalid/truncated tool calls
+  - push_reasoning_content(): Throttled reasoning content dispatch
+  - clear_reasoning_throttle(): Clean up throttle state
+
+ai/response_retry.lua:
+  Abnormal response detection and retry logic
+  - detect_abnormal_response(content, tool_calls, opts): Detect issues
+  - is_summary_content(content): Check if response is summary
+  - can_retry(retry_count): Check retry limit
+  - get_retry_delay(retry_count): Exponential backoff (1s, 2s, 4s, 8s, 16s)
+
+ai/tool_orchestrator.lua:
+  Unified tool loop engine (event-driven)
+  - start_async_loop(params): Start tool execution loop
+  - on_generation_complete(data): Handle AI response in tool loop
+  - execute_single_tool_request(): One-shot tool request (for shell input)
+  - Session lifecycle: register/unregister sessions and sub-agent sessions
+
+ai/sub_agent_engine.lua:
+  Sub-agent lifecycle manager
+  - start_sub_agent_loop(sub_agent_id, tool_calls, session_context): Start
+  - review_tool_call(sub_agent_id, tool_name, args): Boundary enforcement
+  - _request_generation(sub_agent_id): Request next AI generation
+  - _finalize_sub_agent(sub_agent_id, result): Clean up sub-agent
+
+ai/session_manager.lua:
+  Tool loop session state factory
+  - create_session_state(session_id, window_id): Create state object
+  - reset_session_state(ss): Reset state (preserve id/win)
+  - is_executing_phase(ss): Check if in execution phase
+  - all_idle(sessions): Check if all sessions idle
+
+ai/generation_handler.lua:
+  Generation completion utilities
+  - accumulate_usage(accumulated, current_usage): Merge usage stats
+  - build_assistant_message(content, reasoning_text, window_id, tool_calls)
+  - fire_generation_completed(params): Trigger completion event
+  - fire_generation_error(params): Trigger error event
+  - fire_generation_cancelled(params): Trigger cancel event
+
+==============================================================================
+Generation Flow                                           *NeoAI-gen-flow*
+
+1. User sends message via chat_service.send_message()
+2. chat_service gets context messages from history_manager
+3. chat_service calls ai_engine.generate_response(messages, params)
+4. ai_engine resolves scenario config via config_merger
+5. request_builder.build_request() constructs the API request
+6. http_client sends request (streaming or non-streaming)
+7. For streaming: stream_processor processes chunks in real-time
+   - Content chunks dispatched via STREAM_CHUNK event
+   - Reasoning content dispatched via REASONING_CONTENT (throttled)
+   - Tool calls accumulated in processor.tool_calls
+8. On stream end: response_retry detects abnormal responses
+   - Abnormal: retry with exponential backoff
+   - Normal: dispatch to tool_orchestrator or finalize
+9. If tool calls detected: tool_orchestrator.start_async_loop()
+10. Tool loop: execute tools -> request next AI generation -> repeat
+11. On completion: GENERATION_COMPLETED event fired
+
+==============================================================================
+Tool Loop Flow                                             *NeoAI-tool-loop*
+
+1. AI returns tool_calls in response
+2. ai_engine._handle_stream_end detects tool_calls
+3. tool_orchestrator.start_async_loop() begins
+4. _execute_tools() groups tools by pack and executes concurrently
+5. Each tool goes through:
+   a. tool_executor.execute_with_orchestrator()
+   b. Parameter normalization (alias mapping)
+   c. Approval check (approval_handler)
+   d. Actual execution with timeout
+   e. Result added to session messages
+6. When all tools complete: _on_tools_complete()
+7. fire_tool_result_received() triggers next AI generation
+8. AI generates next response with tool results in context
+9. Loop continues until AI returns text-only response or max iterations
+
+==============================================================================
+Multi-Provider Support                                   *NeoAI-provider-support*
+
+Supported providers and their api_type:
+
+  deepseek    - openai (OpenAI-compatible API)
+  openai      - openai
+  anthropic   - anthropic (Anthropic Messages API)
+  google      - google (Gemini API)
+  groq        - openai
+  together    - openai
+  openrouter  - openai
+  siliconflow - openai
+  moonshot    - openai
+  zhipu       - openai
+  baidu       - openai
+  aliyun      - openai
+  stepfun     - openai
+
+Each provider can define multiple models. The request_adapter transforms
+requests and responses between the unified internal format and each
+provider's native format.
+
+==============================================================================
+Reasoning Mode                                            *NeoAI-reasoning-mode*
+
+When reasoning_enabled = true:
+  - extra_body.thinking = { type = "enabled" } is sent to API
+  - reasoning_effort controls depth: "low", "high", "max"
+  - AI reasoning content is displayed via REASONING_CONTENT event
+  - stream_processor throttles reasoning content updates (80ms interval)
+  - reasoning_display component shows reasoning in a floating window
+
+When reasoning_enabled = false:
+  - extra_body.thinking = { type = "disabled" } is sent
+  - DeepSeek reasoner models are auto-switched to chat models
+  - Forced tool calls (tool_choice = function) disable reasoning mode
+
+==============================================================================
+Error Handling & Retry                                   *NeoAI-error-retry*
+
+response_retry.lua detects these abnormal responses:
+
+Content issues:
+  - Repeated lines/paragraphs
+  - Duplicate headers (## Title)
+  - Long identical lines (>50 chars)
+  - Unclosed code blocks (```)
+  - Incomplete endings (trailing comma, colon, semicolon)
+
+Tool call issues:
+  - Empty arguments (nil or empty table)
+  - Duplicate tool calls (same name + same arguments)
+
+Retry strategy:
+  - Max 5 retries
+  - Exponential backoff: 1s, 2s, 4s, 8s, 16s
+  - Summary rounds also retry on empty response
+  - Tool loop empty responses trigger immediate end (no retry)
+
+==============================================================================
+HTTP Client Details                                      *NeoAI-http-client*
+
+Request methods:
+  - send_request(): Synchronous curl via vim.fn.system
+  - send_stream_request(): Streaming curl via vim.fn.jobstart
+  - send_request_async(): Async curl via vim.fn.jobstart
+
+Streaming implementation:
+  - SSE (Server-Sent Events) parsing
+  - Buffer management for partial lines
+  - Tool call arguments accumulated as JSON strings, parsed on completion
+  - Request deduplication via http_utils
+
+Error recovery:
+  - Auto-retry on tool_choice not supported (clear tool_choice)
+  - Auto-switch from reasoner to chat model for forced tool calls
+  - Request cancellation via jobstop
+
+==============================================================================
+vim:tw=78:ts=8:ft=help:norl:

@@ -1,0 +1,134 @@
+*NeoAI-shutdown_flow.txt*  Shutdown and Graceful Exit
+
+==============================================================================
+Graceful Shutdown Overview                            *NeoAI-shutdown-overview*
+
+NeoAI implements a comprehensive graceful shutdown system to prevent
+deadlocks and data loss when Neovim exits. The system is built around a
+unified shutdown_flag module that all components check before performing
+Neovim API calls.
+
+==============================================================================
+Shutdown Flag Module                                  *NeoAI-shutdown-flag*
+
+core/shutdown_flag.lua:
+  - set(): Set shutdown flag (called by VimLeavePre)
+  - is_set(): Check if shutting down
+  - reset(): Reset for testing
+
+All vim.schedule callbacks and deferred functions check shutdown_flag.is_set()
+before executing Neovim API calls. This prevents:
+  - Deadlocks from API calls during teardown
+  - Recursive event loops
+  - Crashes from invalid window/buffer handles
+
+==============================================================================
+Shutdown Sequence                                     *NeoAI-shutdown-sequence*
+
+VimLeavePre triggers this sequence:
+
+1. history_manager._shutdown_and_save():
+   a. Set shutdown_flag
+   b. Set persistence shutting_down flag
+   c. Notify tool_orchestrator to shut down
+   d. Clean up all sub-agents (plan_executor.cleanup_all())
+   e. Clean up sub-agent engine (sub_agent_engine.cleanup_all())
+   f. Cancel all HTTP requests (http_client.cancel_all_requests())
+   g. Clean up AI engine generations (ai_engine.cleanup_all_generations())
+   h. Flush saver queue (saver.shutdown_sync())
+   i. Flush persistence queue (persistence.flush_queue())
+   j. Sync save sessions (persistence.sync_save())
+
+2. after/plugin/NeoAI.lua VimLeavePre:
+   - Legacy auto-save (currently no-op, handled by history_manager)
+
+==============================================================================
+Component Cleanup                                     *NeoAI-component-cleanup*
+
+tool_orchestrator.cleanup_all():
+  - Remove global ESC stop listener
+  - Set all sessions to stop_requested
+  - Set all phases to idle
+  - Clear active_tool_calls
+  - Cancel all HTTP requests
+  - Unregister all sessions and sub-agent sessions
+
+ai_engine.cleanup_all_generations():
+  - Set is_generating = false
+  - Clear current_generation_id
+  - Clear active_generations table
+
+sub_agent_engine.cleanup_all():
+  - Set all runners to stop_requested
+  - Clear sub_agent_runners table
+
+plan_executor.cleanup_all():
+  - Stop all timers
+  - Clear all sub-agent contexts
+
+http_client.cancel_all_requests():
+  - Cancel all active curl jobs
+  - Delete temp files
+  - Clear dedup cache
+
+==============================================================================
+Preventing Deadlocks                                 *NeoAI-deadlock-prevention*
+
+Key patterns used throughout the codebase:
+
+1. shutdown_flag check before vim.schedule:
+>
+    if shutdown_flag.is_set() then return end
+    vim.schedule(function()
+        if shutdown_flag.is_set() then return end
+        -- Neovim API calls
+    end)
+<
+
+2. pcall protection for all event firing:
+>
+    local ok, err = pcall(vim.api.nvim_exec_autocmds, "User", {
+        pattern = event_constants.SOME_EVENT,
+        data = { ... },
+    })
+    if not ok then
+        if shutdown_flag.is_set() then return end
+        vim.schedule(function()
+            if shutdown_flag.is_set() then return end
+            pcall(vim.api.nvim_exec_autocmds, "User", { ... })
+        end)
+    end
+<
+
+3. Guard checks in tool_orchestrator callbacks:
+>
+    if is_shutting_down() then return end
+<
+
+4. Session state cleanup in _finish_loop:
+   - Set phase to idle
+   - Clear active_tool_calls
+   - Set current_iteration to 0
+   - Set generation_id to nil
+
+==============================================================================
+Data Persistence on Shutdown                         *NeoAI-shutdown-persist*
+
+The save sequence ensures no data loss:
+
+1. saver.shutdown_sync():
+   - Process remaining save queue items
+   - Wait for all pending writes to complete
+   - Clear the queue
+
+2. persistence.flush_queue():
+   - Discard any remaining queued saves
+   - Prevent async callbacks during teardown
+
+3. persistence.sync_save():
+   - Direct synchronous file write
+   - Uses io.open() instead of vim.fn.writefile()
+   - No debounce, no callbacks
+
+==============================================================================
+vim:tw=78:ts=8:ft=help:norl:

@@ -1,0 +1,134 @@
+*NeoAI-overview.txt*  NeoAI Plugin Overview
+
+==============================================================================
+NeoAI - AI-Powered Neovim Plugin                               *NeoAI-overview*
+
+NeoAI is an AI-powered chat plugin for Neovim that integrates AI assistants
+directly into your editor. It features a dual-UI design (tree + chat),
+multi-provider AI support, a comprehensive tool execution system, sub-agent
+decomposition, and session history with branching.
+
+==============================================================================
+Core Features                                                  *NeoAI-features*
+
+1. Dual UI Modes
+   - Tree UI: Session tree with branching, expand/collapse, CRUD operations
+   - Chat UI: AI conversation with streaming, reasoning display, tool display
+
+2. Multi-Provider AI
+   - DeepSeek, OpenAI, Anthropic, Google, Groq, Together, OpenRouter
+   - Chinese providers: SiliconFlow, Moonshot, Zhipu, Baidu, Aliyun, StepFun
+   - Scenario-based model selection (chat, reasoning, coding, tools, agent)
+
+3. Streaming Generation
+   - Real-time content display
+   - Reasoning content display (e.g., DeepSeek reasoning_content)
+   - Cancel generation support
+
+4. Tool System
+   - Built-in tools: file operations, LSP, treesitter, shell, logging
+   - Tool approval workflow with auto-allow configuration
+   - Tool pack grouping for organized display
+   - External tool support
+
+5. Sub-Agent System
+   - Create sub-agents for complex task decomposition
+   - Boundary enforcement (allowed tools, files, directories)
+   - Independent tool loops per sub-agent
+   - Summary callback to parent agent
+
+6. Session History
+   - Branching session tree
+   - Auto-naming via AI
+   - Auto-save with debounced persistence
+   - Export/import sessions
+   - External file change detection and reload
+
+7. Graceful Shutdown
+   - Unified shutdown_flag module
+   - Cleanup of HTTP requests, tool loops, sub-agents
+   - Sync save on VimLeavePre
+
+==============================================================================
+Architecture Overview                                      *NeoAI-architecture*
+
+Project structure:
+>
+    NeoAI.lua                    -- Entry point
+    after/plugin/NeoAI.lua       -- Auto commands
+    lua/NeoAI/
+      init.lua                   -- Main module: setup, commands, keymaps
+      default_config.lua         -- Default configuration
+      core/                      -- Core business logic
+        init.lua                 -- Core module initializer
+        events.lua               -- Event constants
+        shutdown_flag.lua        -- Global shutdown flag
+        config/                  -- Configuration management
+        ai/                      -- AI engine and sub-modules
+        history/                 -- Session history management
+      ui/                        -- User interface
+        init.lua                 -- UI module initializer
+        window/                  -- Window management
+        components/              -- UI components
+        handlers/                -- Key handlers
+      tools/                     -- Tool system
+        init.lua                 -- Tool system entry
+        builtin/                 -- Built-in tool implementations
+      utils/                     -- Utilities
+      tests/                     -- Test suite
+<
+
+Key architectural principles:
+  - Event-driven: Components communicate via Neovim User autocommands
+  - Coroutine context: State manager provides coroutine-local shared state
+  - Graceful shutdown: Unified shutdown_flag module prevents deadlocks
+  - Modular tools: Built-in tools loaded lazily, external tools supported
+  - Decoupled UI/backend: chat_service acts as backend, UI renders independently
+
+==============================================================================
+Installation                                                *NeoAI-installation*
+
+Using lazy.nvim:
+>
+    {
+        '/root/NeoAI',
+        config = function()
+            require('NeoAI').setup()
+        end
+    }
+<
+
+==============================================================================
+Quick Start                                                  *NeoAI-quick-start*
+
+Basic usage:
+>
+    :NeoAIOpen          " Open default UI (configured in default_ui)
+    :NeoAIChat          " Open chat interface
+    :NeoAITree          " Open tree interface
+    :NeoAIClose         " Close all NeoAI windows
+    :NeoAIKeymaps       " Show current keymap configuration
+    :NeoAITest          " Run tests
+    :NeoAIChatStatus    " Show chat window status
+<
+
+==============================================================================
+Commands                                                      *NeoAI-commands*
+
+:NeoAIOpen              Open NeoAI main interface (default UI mode)
+
+:NeoAIChat              Open chat interface directly
+
+:NeoAITree              Open tree interface directly
+
+:NeoAIClose             Close all NeoAI windows
+
+:NeoAIKeymaps           Display current keymap configuration in a floating window
+
+:NeoAITest [test_names] Run tests. Without arguments runs all tests.
+                        With arguments runs specific tests by name.
+
+:NeoAIChatStatus        Show chat window status information
+
+==============================================================================
+vim:tw=78:ts=8:ft=help:norl:
