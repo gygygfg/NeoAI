@@ -972,10 +972,10 @@ function M._normalize_arguments(tool_name, raw_arguments)
   local changed = false
 
   -- ===== 工具名称别名映射 =====
-  -- 将 AI 输出的简写名称（如 read/write）映射为正式名称（如 read_file/write_file）
+  -- 将 AI 输出的简写名称（如 read/write）映射为正式名称（如 read_file/edit_file）
   local tool_name_aliases = {
     read = "read_file",
-    write = "write_file",
+    write = "edit_file",
     list = "list_files",
     search = "search_files",
     delete = "delete_file",
@@ -1041,7 +1041,11 @@ function M._normalize_arguments(tool_name, raw_arguments)
         if arguments and next(arguments) then
           changed = true
         else
-          logger.warn("[tool_executor] 工具 '%s' 的 arguments 解析失败: %s", tool_name, tostring(raw_arguments):sub(1, 300))
+          logger.warn(
+            "[tool_executor] 工具 '%s' 的 arguments 解析失败: %s",
+            tool_name,
+            tostring(raw_arguments):sub(1, 300)
+          )
           return { _raw = raw_arguments }, false
         end
       end

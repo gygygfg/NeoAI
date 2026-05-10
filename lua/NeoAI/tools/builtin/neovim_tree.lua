@@ -1478,10 +1478,10 @@ local function _delete_node(args, on_success, on_error)
 
       -- 写入文件
       local fu_ok, fu = pcall(require, "NeoAI.tools.builtin.file_tools")
-      if fu_ok and fu and fu.write_file then
-        -- 使用 file_tools 的 write_file 写入
+      if fu_ok and fu and fu.edit_file then
+        -- 使用 file_tools 的 edit_file 写入
         local write_ok = false
-        fu.write_file({ filepath = args.filepath, content = new_content }, function(res)
+        fu.edit_file({ filepath = args.filepath, content = new_content }, function(res)
           write_ok = true
           local ret = {
             filepath = args.filepath,

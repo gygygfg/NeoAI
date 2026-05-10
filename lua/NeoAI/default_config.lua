@@ -268,7 +268,7 @@ local DEFAULT_CONFIG = {
       tool_overrides = {
         -- ===== file_tools.lua =====
         read_file = { auto_allow = true },
-        write_file = { auto_allow = false },
+        edit_file = { auto_allow = false },
         list_files = { auto_allow = true },
         search_files = { auto_allow = true },
         file_exists = { auto_allow = true },

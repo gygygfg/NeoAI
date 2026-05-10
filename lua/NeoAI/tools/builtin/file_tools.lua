@@ -349,10 +349,10 @@ M.read_file = define_tool({
 })
 
 -- ============================================================================
--- 工具 write_file
+-- 工具 edit_file
 -- ============================================================================
 
-local function _write_file(args, on_success, on_error)
+local function _edit_file(args, on_success, on_error)
   if not args or not args.filepath then
     if on_error then
       on_error("需要 filepath 参数")
@@ -361,7 +361,14 @@ local function _write_file(args, on_success, on_error)
   end
 
   local filepath = args.filepath
-  local content = args.content or ""
+  local content = args.content
+  if content ~= nil then
+    if type(content) ~= "string" then
+      content = tostring(content)
+    end
+  else
+    content = ""
+  end
   local append = args.append
   if append == nil then
     append = true
@@ -486,10 +493,10 @@ local function _write_file(args, on_success, on_error)
   end
 end
 
-M.write_file = define_tool({
-  name = "write_file",
-  description = "写入文件内容，支持覆盖和追加模式",
-  func = _write_file,
+M.edit_file = define_tool({
+  name = "edit_file",
+  description = "修改文件内容，修改某行到某行的内容，尽量减少对原文件的改动",
+  func = _edit_file,
   async = true,
   parameters = {
     type = "object",
@@ -497,8 +504,7 @@ M.write_file = define_tool({
       filepath = { type = "string", description = "文件路径（必填）" },
       append = {
         type = "boolean",
-        description = "是否追加模式，false 为覆盖，不填时默认追加模式",
-        default = false,
+        description = "是否追加模式，false 为覆盖（必填）",
       },
       start_line = {
         type = "number",
@@ -510,7 +516,7 @@ M.write_file = define_tool({
       },
       content = { type = "string", description = "要写入的内容（可选，不填时默认追加模式）" },
     },
-    required = { "filepath" },
+    required = { "filepath", "append" },
   },
   returns = {
     type = "object",
