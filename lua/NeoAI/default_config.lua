@@ -322,6 +322,7 @@ local DEFAULT_CONFIG = {
           },
         },
 
+        -- ===== plan_executor.lua =====
         create_sub_agent = { auto_allow = false },
         get_sub_agent_status = { auto_allow = true },
         cancel_sub_agent = { auto_allow = true },

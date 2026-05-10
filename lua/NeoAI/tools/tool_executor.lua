@@ -568,7 +568,6 @@ function M.execute(tool_name, args)
       end
 
       -- 检查审批暂停状态
-      local approval_handler = require("NeoAI.tools.approval_handler")
       if approval_handler.is_paused() then
         if not was_paused then
           was_paused = true
@@ -924,7 +923,6 @@ function M._get_elapsed_ms(tool_call_id)
   local now = vim.loop.hrtime()
   local elapsed_ns = now - start
   -- 扣除审批暂停时间
-  local approval_handler = require("NeoAI.tools.approval_handler")
   local paused_sec = approval_handler.get_total_paused_duration()
   local paused_ns = paused_sec * 1000000000
   elapsed_ns = math.max(0, elapsed_ns - paused_ns)
@@ -1018,7 +1016,6 @@ function M._normalize_arguments(tool_name, raw_arguments)
   end
 
   -- 获取工具定义（用于后续参数名匹配和格式转换）
-  local tool_registry = require("NeoAI.tools.tool_registry")
   pcall(tool_registry.initialize, {})
   local tool_def = tool_registry.get(tool_name)
   local props = tool_def and tool_def.parameters and tool_def.parameters.properties or {}

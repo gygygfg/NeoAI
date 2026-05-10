@@ -73,6 +73,16 @@ function M.check_approval(tool_name, args, tool_registry)
   if auto_allow == nil then
     auto_allow = true
   end
+
+  -- ===== auto_allow 优先级最高：直接允许通过，跳过所有检查 =====
+  if auto_allow then
+    return {
+      approved = true,
+      reason = string.format("工具 '%s'：配置为自动允许，跳过安全检查", tool_name),
+      auto_allow = true,
+    }
+  end
+
   local allowed_dirs = approval_config.allowed_directories or {}
   local allowed_param_groups = approval_config.allowed_param_groups or {}
 
@@ -111,17 +121,16 @@ function M.check_approval(tool_name, args, tool_registry)
               if filepath and type(filepath) == "string" then
                 if not M._is_path_in_allowed_dirs(filepath, allowed_dirs, tool_registry) then
                   path_safe = false
-                  path_violation = string.format(
-                    "参数 '%s' 中的路径 '%s' 不在允许的目录内",
-                    param_name,
-                    filepath
-                  )
+                  path_violation =
+                    string.format("参数 '%s' 中的路径 '%s' 不在允许的目录内", param_name, filepath)
                   break
                 end
               end
             end
           end
-          if not path_safe then break end
+          if not path_safe then
+            break
+          end
         end
       end
     end
@@ -133,16 +142,39 @@ function M.check_approval(tool_name, args, tool_registry)
 
   if args and next(allowed_param_groups) then
     for param_name, param_value in pairs(args) do
-      if allowed_param_groups[param_name] then
-        local allowed_values = allowed_param_groups[param_name]
-        if type(allowed_values) == "table" and not vim.tbl_contains(allowed_values, param_value) then
-          param_safe = false
-          param_violation = string.format(
-            "参数 '%s' 的值 '%s' 不在允许的值列表中",
-            param_name,
-            tostring(param_value)
-          )
-          break
+      local allowed_values = allowed_param_groups[param_name]
+      if allowed_values then
+        if type(allowed_values) == "table" then
+          -- 检查值是否在允许列表中
+          if not vim.tbl_contains(allowed_values, param_value) then
+            param_safe = false
+            param_violation =
+              string.format("参数 '%s' 的值 '%s' 不在允许的值列表中", param_name, tostring(param_value))
+            break
+          end
+        end
+      elseif tool_name == "run_command" and (param_name == "command" or param_name == "cmd") then
+        -- run_command 专用：从命令字符串中提取主命令，检查是否在 allowed_param_groups 中
+        -- allowed_param_groups 配置为扁平列表（如 {"ls", "wc", "find", "grep"}）
+        local main_cmd = M._extract_main_command(param_value)
+        if main_cmd then
+          -- 扁平列表：所有值都是允许的命令名
+          local found = false
+          for _, allowed_cmd in pairs(allowed_param_groups) do
+            if type(allowed_cmd) == "string" and main_cmd == allowed_cmd then
+              found = true
+              break
+            end
+          end
+          if not found then
+            param_safe = false
+            param_violation = string.format(
+              "命令 '%s' 的主命令 '%s' 不在允许的命令列表中",
+              tostring(param_value),
+              main_cmd
+            )
+            break
+          end
         end
       end
     end
@@ -150,22 +182,14 @@ function M.check_approval(tool_name, args, tool_registry)
 
   -- ===== 综合判断 =====
   -- 条件1（允许所有）已在最前面提前返回
-  -- 条件2（路径安全）和条件3（参数安全）都满足时，尊重 approval_config.auto_allow 配置
-  -- 即使用户配置了 auto_allow = false（需要审批），路径/参数安全也不应跳过审批
+  -- auto_allow=true 已在前面提前返回，走到这里时 auto_allow 一定为 false
+  -- 条件2（路径安全）和条件3（参数安全）都满足时，需要用户审批
   if path_safe and param_safe then
-    if auto_allow then
-      return {
-        approved = true,
-        reason = string.format("工具 '%s'：路径和参数均安全，且配置为自动允许", tool_name),
-        auto_allow = true,
-      }
-    else
-      return {
-        approved = false,
-        reason = string.format("工具 '%s'：路径和参数均安全，但配置为需要用户审批", tool_name),
-        auto_allow = false,
-      }
-    end
+    return {
+      approved = false,
+      reason = string.format("工具 '%s'：路径和参数均安全，但配置为需要用户审批", tool_name),
+      auto_allow = false,
+    }
   end
 
   -- 路径或参数不安全，需要用户审批
@@ -175,6 +199,107 @@ function M.check_approval(tool_name, args, tool_registry)
     reason = violation,
     auto_allow = false,
   }
+end
+
+--- 从 shell 命令字符串中提取主命令
+--- 按 shell 运算符（&&、||、|、;）分割后取第一个非空部分，
+--- 再按空白字符分割取第一个 token 作为主命令。
+--- 跳过 cd 等引导命令（cd 只是切换目录，不是实际执行的主命令）。
+--- 括号内的命令会被递归提取（如 { echo hello; } 提取 echo）。
+--- @param command string shell 命令字符串
+--- @return string|nil 主命令名称，提取失败返回 nil
+function M._extract_main_command(command)
+  if not command or type(command) ~= "string" or command == "" then
+    return nil
+  end
+
+  -- 跳过引导命令列表（这些命令只是设置上下文，不是实际执行的主命令）
+  local LEADING_COMMANDS = {
+    cd = true,
+    pushd = true,
+    popd = true,
+    export = true,
+    source = true,
+    ["."] = true, -- source 的别名
+  }
+
+  -- 从字符串中提取第一个命令 token
+  local function extract_first_token(text)
+    -- 去除首尾空白
+    local trimmed = text:match("^%s*(.-)%s*$") or text
+    if trimmed == "" then
+      return nil
+    end
+
+    -- 检查是否以括号开头
+    local first_char = trimmed:sub(1, 1)
+    if first_char == "{" or first_char == "(" then
+      -- 括号内的命令：找到匹配的闭合括号，提取括号内的内容
+      local close = first_char == "{" and "}" or ")"
+      local depth = 1
+      local i = 2
+      while i <= #trimmed and depth > 0 do
+        if trimmed:sub(i, i) == first_char then
+          depth = depth + 1
+        elseif trimmed:sub(i, i) == close then
+          depth = depth - 1
+        end
+        i = i + 1
+      end
+      -- 提取括号内的内容并递归解析
+      local inner = trimmed:sub(2, i - 2)
+      return extract_first_token(inner)
+    end
+
+    -- 按空白分割取第一个 token
+    local first_token = trimmed:match("^%s*(%S+)")
+    if not first_token then
+      return nil
+    end
+
+    -- 去除路径前缀（如 ./ls → ls，/usr/bin/ls → ls）
+    local cmd_name = first_token:match("([^/]+)$")
+    return cmd_name or first_token
+  end
+
+  -- 按 shell 运算符分割，取第一个非空段
+  -- 注意：先按 &&、||、|、; 分割（按优先级从高到低）
+  -- 使用 gmatch 按 [^&|;]+ 分割
+  local first_segment = nil
+  for part in command:gmatch("[^&|;]+") do
+    local trimmed = part:match("^%s*(.-)%s*$") or part
+    if trimmed ~= "" then
+      first_segment = trimmed
+      break
+    end
+  end
+
+  if not first_segment then
+    return nil
+  end
+
+  -- 从第一个段中提取主命令
+  local cmd = extract_first_token(first_segment)
+
+  -- 如果主命令是 cd 等引导命令，尝试取下一个段
+  if cmd and LEADING_COMMANDS[cmd] then
+    -- first_segment 已按 shell 运算符分割，不包含 && | ; 等
+    -- 需要从原始 command 中跳过 cd 部分，取下一个段
+    -- 例如 "cd /tmp && ls -la" -> 跳过 "cd /tmp && "，取 "ls"
+    -- 例如 "cd /tmp; ls" -> 跳过 "cd /tmp; "，取 "ls"
+    -- 从原始 command 中移除 cd 及其参数，然后重新提取
+    local after_cd = command:match("^%s*" .. cmd .. "%s+%S+%s*[&|;]+%s*(.*)$")
+    if after_cd and after_cd ~= "" then
+      local next_cmd = extract_first_token(after_cd)
+      if next_cmd then
+        return next_cmd
+      end
+    end
+    -- 如果 cd 后没有其他命令（如只有 cd /tmp），返回 nil
+    return nil
+  end
+
+  return cmd
 end
 
 --- 检查路径是否在允许的目录内
