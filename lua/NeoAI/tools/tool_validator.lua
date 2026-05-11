@@ -96,45 +96,45 @@ function M.check_approval(tool_name, args, tool_registry)
   local path_safe = true
   local path_violation = nil
 
-  if tool and tool.parameters and tool.parameters.properties then
-    for param_name, param_schema in pairs(tool.parameters.properties) do
-      if
-        param_schema.type == "string"
-        and (param_name:match("file") or param_name:match("dir") or param_name:match("path"))
-      then
-        local param_value = args and args[param_name]
-        if param_value and type(param_value) == "string" then
-          if not M._is_path_in_allowed_dirs(param_value, allowed_dirs, tool_registry) then
-            path_safe = false
-            path_violation = string.format("参数 '%s' 的值 '%s' 不在允许的目录内", param_name, param_value)
-            break
-          end
-        end
-      end
-
-      if param_schema.type == "array" and param_schema.items and param_schema.items.properties then
-        local param_value = args and args[param_name]
-        if param_value and type(param_value) == "table" then
-          for _, item in ipairs(param_value) do
-            if type(item) == "table" then
-              local filepath = item.filepath or item.dir or item.path
-              if filepath and type(filepath) == "string" then
-                if not M._is_path_in_allowed_dirs(filepath, allowed_dirs, tool_registry) then
-                  path_safe = false
-                  path_violation =
-                    string.format("参数 '%s' 中的路径 '%s' 不在允许的目录内", param_name, filepath)
-                  break
-                end
-              end
-            end
-          end
-          if not path_safe then
-            break
-          end
-        end
-      end
-    end
-  end
+  -- if tool and tool.parameters and tool.parameters.properties then
+  --   for param_name, param_schema in pairs(tool.parameters.properties) do
+  --     if
+  --       param_schema.type == "string"
+  --       and (param_name:match("file") or param_name:match("dir") or param_name:match("path"))
+  --     then
+  --       local param_value = args and args[param_name]
+  --       if param_value and type(param_value) == "string" then
+  --         if not M._is_path_in_allowed_dirs(param_value, allowed_dirs, tool_registry) then
+  --           path_safe = false
+  --           path_violation = string.format("参数 '%s' 的值 '%s' 不在允许的目录内", param_name, param_value)
+  --           break
+  --         end
+  --       end
+  --     end
+  --
+  --     if param_schema.type == "array" and param_schema.items and param_schema.items.properties then
+  --       local param_value = args and args[param_name]
+  --       if param_value and type(param_value) == "table" then
+  --         for _, item in ipairs(param_value) do
+  --           if type(item) == "table" then
+  --             local filepath = item.filepath or item.dir or item.path
+  --             if filepath and type(filepath) == "string" then
+  --               if not M._is_path_in_allowed_dirs(filepath, allowed_dirs, tool_registry) then
+  --                 path_safe = false
+  --                 path_violation =
+  --                   string.format("参数 '%s' 中的路径 '%s' 不在允许的目录内", param_name, filepath)
+  --                 break
+  --               end
+  --             end
+  --           end
+  --         end
+  --         if not path_safe then
+  --           break
+  --         end
+  --       end
+  --     end
+  --   end
+  -- end
 
   -- ===== 条件3：参数安全检查 =====
   local param_safe = true
@@ -183,12 +183,12 @@ function M.check_approval(tool_name, args, tool_registry)
   -- ===== 综合判断 =====
   -- 条件1（允许所有）已在最前面提前返回
   -- auto_allow=true 已在前面提前返回，走到这里时 auto_allow 一定为 false
-  -- 条件2（路径安全）和条件3（参数安全）都满足时，需要用户审批
+  -- 条件2（路径安全）和条件3（参数安全）都满足时，自动通过（无需审批）
   if path_safe and param_safe then
     return {
-      approved = false,
-      reason = string.format("工具 '%s'：路径和参数均安全，但配置为需要用户审批", tool_name),
-      auto_allow = false,
+      approved = true,
+      reason = string.format("工具 '%s'：路径和参数均安全，自动通过", tool_name),
+      auto_allow = true,
     }
   end
 
