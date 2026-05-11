@@ -71,7 +71,12 @@ function M.check_approval(tool_name, args, tool_registry)
 
   local auto_allow = approval_config.auto_allow
   if auto_allow == nil then
-    auto_allow = true
+    -- 检查全局默认配置（字段名为 default_auto_allow）
+    if approval_config.default_auto_allow ~= nil then
+      auto_allow = approval_config.default_auto_allow
+    else
+      auto_allow = true
+    end
   end
 
   -- ===== auto_allow 优先级最高：直接允许通过，跳过所有检查 =====
@@ -183,13 +188,42 @@ function M.check_approval(tool_name, args, tool_registry)
   -- ===== 综合判断 =====
   -- 条件1（允许所有）已在最前面提前返回
   -- auto_allow=true 已在前面提前返回，走到这里时 auto_allow 一定为 false
-  -- 条件2（路径安全）和条件3（参数安全）都满足时，自动通过（无需审批）
+  -- 对于 run_command：路径和参数都安全且无输出重定向时自动通过
+  -- 对于其他工具：即使路径和参数安全，只要 auto_allow=false 就需要审批
   if path_safe and param_safe then
-    return {
-      approved = true,
-      reason = string.format("工具 '%s'：路径和参数均安全，自动通过", tool_name),
-      auto_allow = true,
-    }
+    if tool_name == "run_command" then
+      -- run_command 专用：检测命令中是否包含输出重定向（>、>>、&> 等）
+      -- auto_allow 优先级更高，能走到这里说明 auto_allow=false
+      -- 但即使 auto_allow=false，如果命令安全且无重定向，也自动通过
+      local has_redirect = false
+      local cmd_value = args and (args.command or args.cmd)
+      if cmd_value and type(cmd_value) == "string" then
+        if cmd_value:match(">>?") or cmd_value:match(">&?") or cmd_value:match("%d+>") then
+          has_redirect = true
+        end
+      end
+      if has_redirect then
+        -- run_command 包含输出重定向（>、>> 等），需要审批
+        return {
+          approved = false,
+          reason = "命令包含输出重定向，需要用户审批",
+          auto_allow = false,
+        }
+      end
+      -- run_command：路径和参数安全且无重定向时自动通过
+      return {
+        approved = true,
+        reason = string.format("工具 '%s'：路径和参数均安全，自动通过", tool_name),
+        auto_allow = true,
+      }
+    else
+      -- 其他工具：auto_allow=false 时需要审批
+      return {
+        approved = false,
+        reason = string.format("工具 '%s'：需要用户审批", tool_name),
+        auto_allow = false,
+      }
+    end
   end
 
   -- 路径或参数不安全，需要用户审批

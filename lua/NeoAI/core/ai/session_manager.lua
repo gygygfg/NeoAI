@@ -21,8 +21,7 @@ function M.create_session_state(session_id, window_id)
     phase = "idle",
     _tools_complete_in_progress = false,
     _proceed_in_progress = false,
-    _summary_in_progress = false,
-    active_tool_calls = {},
+    active_tool_calls = {}
     current_iteration = 0,
     messages = {},
     options = {},
@@ -32,7 +31,6 @@ function M.create_session_state(session_id, window_id)
     last_reasoning = nil,
     stop_requested = false,
     user_cancelled = false,
-    _skip_summary = false,
     _tool_retry_count = 0,
     on_complete = nil,
     autocmd_ids = {},
@@ -46,7 +44,6 @@ function M.reset_session_state(ss)
   ss.phase = "idle"
   ss._tools_complete_in_progress = false
   ss._proceed_in_progress = false
-  ss._summary_in_progress = false
   ss.active_tool_calls = {}
   ss.current_iteration = 0
   ss.messages = {}
@@ -57,7 +54,6 @@ function M.reset_session_state(ss)
   ss.last_reasoning = nil
   ss.stop_requested = false
   ss.user_cancelled = false
-  ss._skip_summary = false
   ss._tool_retry_count = 0
   ss.on_complete = nil
 end

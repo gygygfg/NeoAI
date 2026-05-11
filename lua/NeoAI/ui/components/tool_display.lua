@@ -606,6 +606,7 @@ function M.schedule_preview_update()
   else
     preview.timer = vim.uv.new_timer()
     preview.timer:start(60, 0, vim.schedule_wrap(function()
+      if not preview.timer then return end
       preview.timer:stop()
       preview.timer:close()
       preview.timer = nil

@@ -696,6 +696,13 @@ local function wait_for_lsp_attach_async(bufnr, callback, timeout_ms, expected_c
             end
           end)
         end)
+      else
+        -- poll_timer 创建失败，立即返回已匹配的客户端
+        vim.schedule(function()
+          if callback then
+            callback(matched, nil, bufnr)
+          end
+        end)
       end -- if poll_timer
       return
     end
@@ -796,6 +803,14 @@ local function wait_for_lsp_attach_async(bufnr, callback, timeout_ms, expected_c
           return
         end
       end)
+    end)
+  else
+    -- poll_timer 创建失败，立即通过 vim.schedule 返回错误
+    vim.schedule(function()
+      cleanup()
+      if callback then
+        callback(nil, "LSP 等待定时器创建失败", bufnr)
+      end
     end)
   end -- if poll_timer
 end

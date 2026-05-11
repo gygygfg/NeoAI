@@ -94,6 +94,18 @@ local function fire_event(pattern, data)
   vim.api.nvim_exec_autocmds("User", { pattern = pattern, data = data or {} })
 end
 
+--- 验证 buffer 是否为 NeoAI 聊天 buffer
+--- 防止在窗口关闭后异步回调将内容写入到其他 buffer
+--- @param buf number|nil buffer 句柄
+--- @return boolean
+local function _is_chat_buffer(buf)
+  if not buf_valid(buf) then
+    return false
+  end
+  local ok, ft = pcall(vim.api.nvim_get_option_value, "filetype", { buf = buf })
+  return ok and ft == "neoai"
+end
+
 -- 模块状态
 local state = {
   initialized = false,
@@ -1695,7 +1707,7 @@ function M.close()
   --（例如 state.current_generation_id 为 nil 但工具循环仍在运行）
   tool_orchestrator.request_stop(closing_session_id)
 
-  -- 延迟执行窗口关闭，给异步回调（如 _request_summary_round 的 defer_fn）一点时间完成
+  -- 延迟执行窗口关闭，给异步回调一点时间完成
   -- 避免异步回调在窗口关闭后访问已清理的状态导致错误
   vim.defer_fn(function()
     -- 检查 Neovim 是否正在退出，如果是则跳过所有窗口操作
@@ -2435,66 +2447,12 @@ function M._setup_event_listeners()
       if not had_stream_prefix then
         local last = state.messages[#state.messages]
         if last and last.role == "assistant" then
-          M._append_message_to_buffer("assistant", last.content)
+          M._append_message_to_buffer("assistant", last.content, data.window_id)
         end
       end
 
       M._update_usage_virt_text()
       -- 先主动检测光标位置，确保协程共享的 should_follow 是最新值
-      _check_cursor_near_end()
-      -- 注意：直接使用模块级 state.should_follow，避免通过协程共享表读取
-      -- 事件回调不在协程上下文中，state_manager.get_shared_value 会返回默认值
-      if state.should_follow then
-        -- 光标在末尾附近：执行跟随并打开输入框
-        _do_cursor_follow()
-        M._open_float_input()
-        if virtual_input.is_active() then
-          virtual_input.focus_and_insert()
-        end
-      else
-        -- 光标不在末尾附近：打开输入框但不聚焦
-        M._open_float_input()
-      end
-    end,
-  })
-
-  -- SUMMARY_COMPLETED：AI 总结完成（工具循环中 AI 自行返回总结内容）
-  vim.api.nvim_create_autocmd("User", {
-    pattern = Events.SUMMARY_COMPLETED,
-    callback = function(args)
-      if state.closing then
-        return
-      end
-      local data = args.data or {}
-      if not is_current_window(data.window_id) then
-        return
-      end
-
-      -- 通过 tool_display_component 清理流式工具预览状态
-      tool_display_component.clear_streaming_preview()
-      -- 同步更新本地状态
-      state.tool_display.streaming_preview.timer = nil
-      state.tool_display.streaming_preview.generation_id = nil
-      state.tool_display.streaming_preview.tools = {}
-      state.tool_display.streaming_preview.window_shown = false
-      state.tool_display.preview_window_id = nil
-
-      -- 保存用量信息
-      if data.usage and next(data.usage) then
-        state.last_usage = data.usage
-      end
-
-      -- 重置工具显示状态，确保下一轮 TOOL_CALL_DETECTED 能正常打开实时参数悬浮窗
-      state.tool_display.active = false
-      state.tool_display._finished = false
-      -- 清理流式状态
-      clear_stream_throttle()
-      reset_streaming_state()
-      state.tool_loop_in_progress = false
-      state.generation_in_progress = false
-
-      M._update_usage_virt_text()
-      -- 先主动检测光标位置
       _check_cursor_near_end()
       -- 注意：直接使用模块级 state.should_follow，避免通过协程共享表读取
       -- 事件回调不在协程上下文中，state_manager.get_shared_value 会返回默认值
@@ -2563,13 +2521,13 @@ function M._setup_event_listeners()
         -- 思考过程完毕：将完整的思考过程以折叠文本格式追加到聊天缓冲区
         -- 注意：此时悬浮窗已滚动显示完所有思考内容，关闭悬浮窗后将折叠文本写入缓冲区
         if rt ~= "" then
-          M._append_reasoning_folded_to_buffer(rt)
+          M._append_reasoning_folded_to_buffer(rt, data.window_id)
         end
         close_reasoning_display()
       end
 
       state.streaming.content_buffer = state.streaming.content_buffer .. chunk_content
-      M._append_stream_chunk_to_buffer(chunk_content)
+      M._append_stream_chunk_to_buffer(chunk_content, nil, data.window_id)
     end,
   })
 
@@ -2654,7 +2612,7 @@ function M._setup_event_listeners()
         end
       end
       state.streaming.content_buffer = state.streaming.content_buffer .. chunk_content
-      M._append_stream_chunk_to_buffer(chunk_content)
+      M._append_stream_chunk_to_buffer(chunk_content, nil, data.window_id)
     end,
   })
 
@@ -2680,7 +2638,7 @@ function M._setup_event_listeners()
         if rt ~= "" then
           state.streaming.reasoning_active = false
           state.streaming.reasoning_done = true
-          M._append_reasoning_folded_to_buffer(rt)
+          M._append_reasoning_folded_to_buffer(rt, data.window_id)
         end
       end
 
@@ -3121,7 +3079,7 @@ function M._setup_event_listeners()
         -- 仅在第一次写入缓冲区，后续迭代只更新 state.messages
         if not state.tool_display.folded_saved then
           state.tool_display.folded_saved = true
-          M._append_message_to_buffer("assistant", folded_text)
+          M._append_message_to_buffer("assistant", folded_text, data.window_id)
         end
       end
       if state.tool_display.active then
@@ -3349,13 +3307,20 @@ end
 --- 将单条消息增量追加到缓冲区末尾（避免全量重渲染）
 --- @param role string 角色 ('user' 或 'assistant')
 --- @param content string 消息内容
-function M._append_message_to_buffer(role, content)
-  if not state.current_window_id or not content then
+--- @param window_id string|nil 可选，指定目标窗口 ID，默认使用 state.current_window_id
+function M._append_message_to_buffer(role, content, window_id)
+  local target_window_id = window_id or state.current_window_id
+  if not target_window_id or not content then
     return
   end
 
-  local buf = window_manager.get_window_buf(state.current_window_id)
+  local buf = window_manager.get_window_buf(target_window_id)
   if not buf or not vim.api.nvim_buf_is_valid(buf) then
+    return
+  end
+
+  -- 验证 buffer 是 neoai 类型，防止写入到非聊天 buffer
+  if not _is_chat_buffer(buf) then
     return
   end
 
@@ -3397,6 +3362,12 @@ local function _replace_message_in_buffer(start_line, lines, end_line)
   if not buf_valid(buf) then
     return
   end
+
+  -- 验证 buffer 是 neoai 类型，防止窗口关闭后写入其他 buffer
+  if not _is_chat_buffer(buf) then
+    return
+  end
+
   set_buf_modifiable(buf, true)
   local lc = get_line_count(buf)
   local replace_end = end_line or lc
@@ -3428,7 +3399,8 @@ end
 --- 使用 _render_single_message 渲染当前流式消息并替换缓冲区中的对应行
 --- 统一流式渲染和历史渲染的显示格式
 --- 在流式 chunk 到达或思考过程完成时调用
-local function _render_streaming_message()
+--- @param window_id string|nil 可选，指定目标窗口 ID，默认使用 state.current_window_id
+local function _render_streaming_message(window_id)
   local mi = state.streaming.message_index
   if not mi or not state.messages[mi] then
     return
@@ -3443,10 +3415,17 @@ local function _render_streaming_message()
   if #lines == 0 then
     return
   end
-  local buf = get_buf()
+  local target_window_id = window_id or state.current_window_id
+  local buf = target_window_id and window_manager.get_window_buf(target_window_id) or get_buf()
   if not buf_valid(buf) then
     return
   end
+
+  -- 验证 buffer 是 neoai 类型，防止窗口关闭后写入其他 buffer
+  if not _is_chat_buffer(buf) then
+    return
+  end
+
   -- 在修改 buffer 内容之前缓存光标位置
   _check_cursor_near_end()
   local start_line = state.streaming.message_start_line
@@ -3471,7 +3450,8 @@ end
 ---   如果思考过程结束后没有正文（content_buffer 为空）且思考长度 < 200 字符，则不折叠直接显示
 ---   否则（有正文或思考长度 >= 200 字符）使用折叠格式 {{{ ... }}}
 --- @param reasoning_text string 完整的思考过程文本
-function M._append_reasoning_folded_to_buffer(reasoning_text)
+--- @param window_id string|nil 可选，指定目标窗口 ID，默认使用 state.current_window_id
+function M._append_reasoning_folded_to_buffer(reasoning_text, window_id)
   if not state.current_window_id or not reasoning_text or reasoning_text == "" then
     return
   end
@@ -3489,7 +3469,7 @@ function M._append_reasoning_folded_to_buffer(reasoning_text)
   end
 
   -- 使用 _render_streaming_message 统一渲染（复用 _render_single_message）
-  _render_streaming_message()
+  _render_streaming_message(window_id)
 end
 
 --- 在缓冲区末尾插入一个空行（处理换行符数据块）
@@ -3499,6 +3479,11 @@ function M._append_newline_to_buffer()
   end
   local buf = window_manager.get_window_buf(state.current_window_id)
   if not buf or not vim.api.nvim_buf_is_valid(buf) then
+    return
+  end
+
+  -- 验证 buffer 是 neoai 类型，防止窗口关闭后写入其他 buffer
+  if not _is_chat_buffer(buf) then
     return
   end
   -- 在修改 buffer 内容之前缓存光标位置
@@ -3514,8 +3499,10 @@ end
 --- 追加流式数据块到缓冲区（增量渲染）
 --- @param chunk_content string 数据块内容
 --- @param content_type string|nil 内容类型 ("reasoning" 或 "content")
-function M._append_stream_chunk_to_buffer(chunk_content, content_type)
-  if not state.current_window_id then
+--- @param window_id string|nil 可选，指定目标窗口 ID，默认使用 state.current_window_id
+function M._append_stream_chunk_to_buffer(chunk_content, content_type, window_id)
+  local target_window_id = window_id or state.current_window_id
+  if not target_window_id then
     return
   end
 
@@ -3545,7 +3532,7 @@ function M._append_stream_chunk_to_buffer(chunk_content, content_type)
   end
 
   -- 使用 _render_streaming_message 统一渲染（复用 _render_single_message）
-  _render_streaming_message()
+  _render_streaming_message(window_id)
 end
 
 --- 完成流式渲染

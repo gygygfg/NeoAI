@@ -49,32 +49,33 @@ local function async_load_to_buffer(path)
   if not path or path == "" then
     return
   end
-  local abs_path = vim.fn.fnamemodify(path, ":p")
-
-  -- 如果已在跟踪列表中，更新为最近使用
-  if _loaded_buffers[abs_path] then
-    mark_recent(abs_path)
-    return
-  end
-
-  -- 如果文件已存在于 Neovim buffer 中，不重复加载
-  if vim.fn.bufnr(abs_path) ~= -1 then
-    return
-  end
-
-  -- 超过上限，淘汰最旧的
-  if #_buffer_order >= MAX_LOADED_BUFFERS then
-    evict_oldest()
-  end
-
-  -- 标记并异步加载
-  table.insert(_buffer_order, abs_path)
-  _loaded_buffers[abs_path] = #_buffer_order
+  -- 将所有 Neovim API 调用延迟到主循环执行，避免 fast event 上下文中的 E5560 错误
   vim.schedule(function()
-    -- 再次检查，防止竞态
+    local abs_path = vim.fn.fnamemodify(path, ":p")
+    if not abs_path or abs_path == "" then
+      return
+    end
+
+    -- 如果已在跟踪列表中，更新为最近使用
+    if _loaded_buffers[abs_path] then
+      mark_recent(abs_path)
+      return
+    end
+
+    -- 超过上限，淘汰最旧的
+    if #_buffer_order >= MAX_LOADED_BUFFERS then
+      evict_oldest()
+    end
+
+    -- 检查文件是否已存在于 Neovim buffer 中
     if vim.fn.bufnr(abs_path) ~= -1 then
       return
     end
+
+    -- 标记并异步加载
+    table.insert(_buffer_order, abs_path)
+    _loaded_buffers[abs_path] = #_buffer_order
+
     local bufnr = vim.fn.bufadd(abs_path)
     if bufnr and bufnr > 0 then
       vim.fn.bufload(bufnr)

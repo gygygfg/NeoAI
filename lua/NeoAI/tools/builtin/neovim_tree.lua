@@ -547,31 +547,33 @@ local function _query_tree(args, on_success, on_error)
   local query_string = args.query
 
   read_file_content_async(args.filepath, function(content)
-    local lang = detect_lang_from_filepath(args.filepath)
-    if not lang then
-      if on_error then
-        on_error("无法确定文件语言")
-      end
-      return
-    end
-
-    ensure_parser_installed(lang, function()
-      local result, qerr = _query_tree_for_source(content, lang, query_string)
-      if qerr then
+    vim.schedule(function()
+      local lang = detect_lang_from_filepath(args.filepath)
+      if not lang then
         if on_error then
-          on_error(qerr)
+          on_error("无法确定文件语言")
         end
         return
       end
-      result.filepath = args.filepath
-      if on_success then
-        on_success(result)
-      end
-    end, function(err)
-      if on_error then
-        on_error(err)
-      end
-    end)
+
+      ensure_parser_installed(lang, function()
+        local result, qerr = _query_tree_for_source(content, lang, query_string)
+        if qerr then
+          if on_error then
+            on_error(qerr)
+          end
+          return
+        end
+        result.filepath = args.filepath
+        if on_success then
+          on_success(result)
+        end
+      end, function(err)
+        if on_error then
+          on_error(err)
+        end
+      end)
+    end)  -- end vim.schedule
   end, function(err)
     if on_error then
       on_error(err)
@@ -624,108 +626,110 @@ local function _get_node_at_position(args, on_success, on_error)
   local target_col = args.col or 0
 
   read_file_content_async(filepath, function(content)
-    local lang = detect_lang_from_filepath(filepath)
-    if not lang then
-      if on_error then
-        on_error("无法确定文件语言")
-      end
-      return
-    end
-
-    ensure_parser_installed(lang, function()
-      ---@diagnostic disable-next-line: need-check-nil
-      local ok, parser = pcall(ts.get_string_parser, content, lang)
-      if not ok or not parser then
+    vim.schedule(function()
+      local lang = detect_lang_from_filepath(filepath)
+      if not lang then
         if on_error then
-          on_error("无法为语言 '" .. lang .. "' 创建解析器")
+          on_error("无法确定文件语言")
         end
         return
       end
 
-      local ok2, trees = pcall(parser.parse, parser)
-      if not ok2 or not trees or #trees == 0 then
-        if on_error then
-          on_error("解析失败")
+      ensure_parser_installed(lang, function()
+        ---@diagnostic disable-next-line: need-check-nil
+        local ok, parser = pcall(ts.get_string_parser, content, lang)
+        if not ok or not parser then
+          if on_error then
+            on_error("无法为语言 '" .. lang .. "' 创建解析器")
+          end
+          return
         end
-        return
-      end
 
-      local root = trees[1]:root()
+        local ok2, trees = pcall(parser.parse, parser)
+        if not ok2 or not trees or #trees == 0 then
+          if on_error then
+            on_error("解析失败")
+          end
+          return
+        end
 
-      -- 在语法树中查找指定位置的节点
-      local function find_node_at_pos(node, r, c)
-        if not node then
+        local root = trees[1]:root()
+
+        -- 在语法树中查找指定位置的节点
+        local function find_node_at_pos(node, r, c)
+          if not node then
+            return nil
+          end
+          local sr, sc, er, ec = node:range()
+          if r >= sr and r <= er and (r > sr or c >= sc) and (r < er or c <= ec) then
+            for i = 0, node:named_child_count() - 1 do
+              local child = node:named_child(i)
+              local found = find_node_at_pos(child, r, c)
+              if found then
+                return found
+              end
+            end
+            return node
+          end
           return nil
         end
-        local sr, sc, er, ec = node:range()
-        if r >= sr and r <= er and (r > sr or c >= sc) and (r < er or c <= ec) then
-          for i = 0, node:named_child_count() - 1 do
-            local child = node:named_child(i)
-            local found = find_node_at_pos(child, r, c)
-            if found then
-              return found
-            end
+
+        local target_node = find_node_at_pos(root, target_row, target_col)
+        if not target_node then
+          if on_error then
+            on_error("未找到该位置的节点")
           end
-          return node
+          return
         end
-        return nil
-      end
 
-      local target_node = find_node_at_pos(root, target_row, target_col)
-      if not target_node then
+        local text = vim.treesitter.get_node_text(target_node, content)
+        local sr, sc, er, ec = target_node:range()
+
+        -- 获取父节点链
+        local ancestors = {}
+        local current = target_node:parent()
+        while current do
+          table.insert(ancestors, {
+            type = current:type(),
+            text = vim.treesitter.get_node_text(current, content),
+          })
+          current = current:parent()
+        end
+
+        -- 获取子节点
+        local children = {}
+        local child_count = target_node:named_child_count()
+        for i = 0, child_count - 1 do
+          local child = target_node:named_child(i)
+          table.insert(children, {
+            type = child:type(),
+            text = vim.treesitter.get_node_text(child, content),
+          })
+        end
+
+        if on_success then
+          on_success({
+            filepath = filepath,
+            position = { row = target_row, col = target_col },
+            node = {
+              type = target_node:type(),
+              text = text,
+              named = target_node:named(),
+              start_row = sr,
+              start_col = sc,
+              end_row = er,
+              end_col = ec,
+            },
+            ancestors = ancestors,
+            children = children,
+          })
+        end
+      end, function(err)
         if on_error then
-          on_error("未找到该位置的节点")
+          on_error(err)
         end
-        return
-      end
-
-      local text = vim.treesitter.get_node_text(target_node, content)
-      local sr, sc, er, ec = target_node:range()
-
-      -- 获取父节点链
-      local ancestors = {}
-      local current = target_node:parent()
-      while current do
-        table.insert(ancestors, {
-          type = current:type(),
-          text = vim.treesitter.get_node_text(current, content),
-        })
-        current = current:parent()
-      end
-
-      -- 获取子节点
-      local children = {}
-      local child_count = target_node:named_child_count()
-      for i = 0, child_count - 1 do
-        local child = target_node:named_child(i)
-        table.insert(children, {
-          type = child:type(),
-          text = vim.treesitter.get_node_text(child, content),
-        })
-      end
-
-      if on_success then
-        on_success({
-          filepath = filepath,
-          position = { row = target_row, col = target_col },
-          node = {
-            type = target_node:type(),
-            text = text,
-            named = target_node:named(),
-            start_row = sr,
-            start_col = sc,
-            end_row = er,
-            end_col = ec,
-          },
-          ancestors = ancestors,
-          children = children,
-        })
-      end
-    end, function(err)
-      if on_error then
-        on_error(err)
-      end
-    end)
+      end)
+  end)  -- end vim.schedule
   end, function(err)
     if on_error then
       on_error(err)
@@ -1481,7 +1485,7 @@ local function _delete_node(args, on_success, on_error)
       if fu_ok and fu and fu.edit_file then
         -- 使用 file_tools 的 edit_file 写入
         local write_ok = false
-        fu.edit_file({ filepath = args.filepath, content = new_content }, function(res)
+        fu.edit_file.func({ filepath = args.filepath, content = new_content }, function(res)
           write_ok = true
           local ret = {
             filepath = args.filepath,

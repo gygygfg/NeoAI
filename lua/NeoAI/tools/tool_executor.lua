@@ -30,7 +30,7 @@ local tool_name_aliases = {
   list_files = { "list", "ls", "dir" },
   search_files = { "search", "grep", "find", "locate" },
   delete_file = { "delete", "rm", "remove", "unlink" },
-  create_directory = { "mkdir", "md", "mkdirp" },
+  create_directory = { "mkdir", "md", "mkdirp", "mk_dir" },
   ensure_dir = { "ensure_dir" },
   file_exists = { "exists" },
   run_command = { "cmd" },
@@ -329,11 +329,6 @@ function M.execute_async(tool_name, args, on_success, on_error, on_progress)
       end
     end)
 
-    if not approval_handler.is_showing() then
-      vim.schedule(function()
-        approval_handler.process_queue()
-      end)
-    end
     return
   end
 
@@ -994,6 +989,18 @@ function M._parse_nonstandard_arguments(raw_arguments, props, tool_name)
   end
 
   return nil
+end
+
+--- 规范化工具名称（别名映射）
+--- 供 tool_orchestrator 在工具执行前调用
+--- @param tool_name string 原始工具名称
+--- @return string|nil, boolean 规范化后的工具名称，是否发生变更
+function M._normalize_tool_name(tool_name)
+  local mapped_name = alias_to_tool_name[tool_name]
+  if mapped_name then
+    return mapped_name, true
+  end
+  return tool_name, false
 end
 
 --- @param tool_name string 工具名称

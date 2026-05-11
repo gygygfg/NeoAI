@@ -171,7 +171,7 @@ function M.run(test_module)
       assert.not_nil(sid)
 
       local events, ids = {}, {}
-      for _, name in ipairs({ "NeoAI:generation_completed", "NeoAI:generation_error", "NeoAI:summary_completed",
+      for _, name in ipairs({ "NeoAI:generation_completed", "NeoAI:generation_error",
         "NeoAI:tool_loop_started", "NeoAI:tool_execution_completed" }) do
         local id = vim.api.nvim_create_autocmd("User", {
           pattern = name, callback = function() events[name] = (events[name] or 0) + 1 end,
@@ -187,14 +187,12 @@ function M.run(test_module)
       safe_wait(90000, function()
         return (events["NeoAI:generation_completed"] or 0) > 0
             or (events["NeoAI:generation_error"] or 0) > 0
-            or (events["NeoAI:summary_completed"] or 0) > 0
       end)
       for _, id in ipairs(ids) do pcall(vim.api.nvim_del_autocmd, id) end
 
       local gen_ok = (events["NeoAI:generation_completed"] or 0) > 0
       local gen_err = (events["NeoAI:generation_error"] or 0) > 0
-      local summary = (events["NeoAI:summary_completed"] or 0) > 0
-      assert.is_true(gen_ok or gen_err or summary, "应至少触发完成/错误/总结事件")
+      assert.is_true(gen_ok or gen_err, "应至少触发完成或错误事件")
 
       if (events["NeoAI:tool_loop_started"] or 0) > 0 then
         assert.is_true((events["NeoAI:tool_execution_completed"] or 0) > 0, "工具循环开始后应有工具执行完成事件")

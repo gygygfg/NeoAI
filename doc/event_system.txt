@@ -18,7 +18,6 @@ AI Generation Events:
   GENERATION_CANCELLED     "NeoAI:generation_cancelled"
   GENERATION_RETRYING      "NeoAI:generation_retrying"
   CANCEL_GENERATION        "NeoAI:cancel_generation"
-  SUMMARY_COMPLETED        "NeoAI:summary_completed"
 
 Stream Processing Events:
   STREAM_STARTED           "NeoAI:stream_started"

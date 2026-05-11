@@ -67,6 +67,34 @@ function _setup_event_listeners()
     pattern = event_constants.CANCEL_GENERATION,
     callback = function() M.cancel_generation() end,
   })
+  state.event_listeners.tool_calls_ready = vim.api.nvim_create_autocmd("User", {
+    pattern = event_constants.TOOL_CALLS_READY,
+    callback = function(args)
+      local data = args.data
+      if not data or not data.generation_id then
+        return
+      end
+      local gen = state.active_generations[data.generation_id]
+      if not gen then
+        return
+      end
+      local processor = gen._stream_processor
+      if not processor or not processor._json_complete then
+        return
+      end
+      -- Trigger B 触发：工具调用 JSON 已完整，结束流式处理
+      logger.debug("[ai_engine] Trigger B 事件触发：工具调用 JSON 已完整，结束流式处理")
+      -- 从协程共享表获取 params（_handle_stream_end 内部会设 _stream_end_handled 防重入）
+      local shared = state_manager.get_shared() or {}
+      local params = {
+        session_id = data.session_id or shared.session_id,
+        window_id = data.window_id or shared.window_id,
+        is_tool_loop = processor.is_tool_loop or false,
+        _sub_agent_id = shared._sub_agent_id,
+      }
+      _handle_stream_end(data.generation_id, processor, params)
+    end,
+  })
 end
 
 -- ========== 配置解析 ==========
@@ -257,7 +285,7 @@ function _send_stream_request(generation_id, request, params)
     pattern = event_constants.STREAM_STARTED,
     data = { generation_id = generation_id, session_id = session_id, window_id = window_id },
   })
-  local processor = stream_processor.create_processor(generation_id, session_id, window_id)
+  local processor = stream_processor.create_processor(generation_id, session_id, window_id, params and params.is_tool_loop)
   if not state.active_generations then state.active_generations = {} end
   local gen = state.active_generations[generation_id]
   if gen then gen._stream_processor = processor; gen._last_request = request end
@@ -277,6 +305,8 @@ function _send_stream_request(generation_id, request, params)
       g.retry_count = g.retry_count + 1
       vim.defer_fn(function()
         if not state.is_generating or not state.active_generations or not state.active_generations[generation_id] then return end
+        -- 清除去重缓存，避免重试请求被去重机制拦截
+        http_client.clear_request_dedup(generation_id)
         _send_stream_request(generation_id, request, params)
       end, state.retry_delay_ms)
       return
@@ -293,6 +323,51 @@ end
 
 -- ========== 流式处理 ==========
 function _handle_stream_chunk(generation_id, data, processor, params)
+  -- 如果处理器已标记完成（Trigger A/B 已触发），跳过后续处理
+  if processor.is_finished then
+    return
+  end
+
+  -- 处理空闲超时标记
+  if data._idle_timeout then
+    logger.debug("[ai_engine] 收到空闲超时标记: generation_id=%s, 尝试格式化工具调用", generation_id)
+    local finalized = stream_processor.try_finalize_tool_calls(processor)
+    if finalized then
+      -- 格式化成功，视为 AI 传输完成
+      logger.debug("[ai_engine] 空闲超时后成功格式化 %d 个工具调用，视为传输完成", #finalized)
+      -- 将格式化后的工具调用写回 processor
+      processor.tool_calls = finalized
+      -- 设置 is_finished 标志，让 _handle_stream_end 正常处理
+      processor.is_finished = true
+      -- 触发 _handle_stream_end
+      _handle_stream_end(generation_id, processor, params)
+    else
+      -- 格式化失败，JSON 不完整，需要重试
+      logger.debug("[ai_engine] 空闲超时后格式化工具调用失败，重新请求 AI")
+      -- 清除去重缓存，确保重试请求不被拦截
+      http_client.clear_request_dedup(generation_id)
+      -- 获取保存的请求并重新发送
+      local gen = state.active_generations[generation_id]
+      if gen and gen._last_request then
+        local saved_request = gen._last_request
+        -- 递增重试计数
+        gen.retry_count = (gen.retry_count or 0) + 1
+        -- 延迟 500ms 后重试
+        vim.defer_fn(function()
+          if not state.active_generations or not state.active_generations[generation_id] then
+            return
+          end
+          logger.debug("[ai_engine] 空闲超时重试: generation_id=%s, retry_count=%d",
+            generation_id, gen.retry_count)
+          _send_stream_request(generation_id, saved_request, params)
+        end, 500)
+      else
+        logger.warn("[ai_engine] 空闲超时但找不到保存的请求，无法重试")
+      end
+    end
+    return
+  end
+
   local result = stream_processor.process_chunk(processor, data)
   if not result then return end
   local shared = state_manager.get_shared() or {}
@@ -319,9 +394,32 @@ function _handle_stream_chunk(generation_id, data, processor, params)
       },
     })
   end
+
+  -- ===== 双触发逻辑：Trigger A 标记工具调用已就绪，立即结束流式处理 =====
+  if result._tool_calls_ready then
+    logger.debug("[ai_engine] Trigger A 触发：工具调用 JSON 已完整，提前结束流式处理")
+    -- 清理 Trigger B 定时器（互斥）
+    stream_processor._cancel_trigger_b(processor)
+    -- 立即触发流式结束处理（_handle_stream_end 内部会设 _stream_end_handled 防重入）
+    _handle_stream_end(generation_id, processor, params)
+    return
+  end
 end
 
 function _handle_stream_end(generation_id, processor, params)
+  -- 防重入：如果已经处理过结束，跳过
+  if processor._stream_end_handled then
+    logger.debug("[ai_engine] _handle_stream_end 防重入跳过: generation_id=%s", generation_id)
+    -- 补充更新 usage 数据（第二次调用可能包含完整的 token 用量信息）
+    if processor.usage and next(processor.usage) then
+      local gen = state.active_generations[generation_id]
+      if gen then
+        gen.accumulated_usage = processor.usage
+      end
+    end
+    return
+  end
+  processor._stream_end_handled = true
   local full_response = processor.content_buffer or ""
   local reasoning_text = processor.reasoning_buffer or ""
   local usage = processor.usage or {}
@@ -335,8 +433,7 @@ function _handle_stream_end(generation_id, processor, params)
   local wid = shared.window_id or processor.window_id or (params and params.window_id)
 
   local is_tool_loop = params and params.is_tool_loop
-  local is_final_round = params and params.is_final_round
-  local abnormal, reason = response_retry.detect_abnormal_response(full_response, tool_calls, { is_tool_loop = is_tool_loop, is_final_round = is_final_round })
+  local abnormal, reason = response_retry.detect_abnormal_response(full_response, tool_calls, { is_tool_loop = is_tool_loop })
   if abnormal then
     local gen = state.active_generations[generation_id]
     if gen then
@@ -352,7 +449,6 @@ function _handle_stream_end(generation_id, processor, params)
           reasoning = reasoning_text,
           usage = usage,
           session_id = sid,
-          is_final_round = true,
           _sub_agent_id = sub_agent_id,
         })
         return
@@ -399,14 +495,12 @@ function _handle_stream_end(generation_id, processor, params)
         end, delay)
         return
       else
-        if is_final_round then M.handle_generation_error(generation_id, "总结轮次重试耗尽: " .. tostring(reason)); return end
         if reason and reason:find("空响应") then M.handle_generation_error(generation_id, "AI 多次返回空响应: " .. tostring(reason)); return end
       end
     end
   end
 
   local is_tool_loop = params and params.is_tool_loop
-  local is_final_round = params and params.is_final_round
   local tools_enabled = true
   local core = require("NeoAI.core")
   local full_config = core.get_config() or {}
@@ -435,12 +529,11 @@ function _handle_stream_end(generation_id, processor, params)
             reasoning = reasoning_text,
             usage = usage,
             session_id = sid,
-            is_final_round = is_final_round or false,
             _sub_agent_id = sub_agent_id,
           })
         end
       else
-        tool_orchestrator.on_generation_complete({ generation_id = generation_id, tool_calls = tool_calls, content = full_response, reasoning = reasoning_text, usage = usage, session_id = sid, is_final_round = is_final_round or false })
+        tool_orchestrator.on_generation_complete({ generation_id = generation_id, tool_calls = tool_calls, content = full_response, reasoning = reasoning_text, usage = usage, session_id = sid })
       end
       state.active_generations[generation_id] = nil
       return
@@ -482,12 +575,11 @@ function _handle_stream_end(generation_id, processor, params)
           reasoning = reasoning_text,
           usage = usage,
           session_id = sid,
-          is_final_round = is_final_round or false,
           _sub_agent_id = sub_agent_id,
         })
       end
     else
-      tool_orchestrator.on_generation_complete({ generation_id = generation_id, tool_calls = {}, content = full_response, reasoning = reasoning_text, usage = usage, session_id = sid, is_final_round = is_final_round or false })
+      tool_orchestrator.on_generation_complete({ generation_id = generation_id, tool_calls = {}, content = full_response, reasoning = reasoning_text, usage = usage, session_id = sid })
     end
     state.active_generations[generation_id] = nil
   else
@@ -520,8 +612,8 @@ function _handle_ai_response(generation_id, response, params)
   end
   tool_calls = stream_processor.filter_valid_tool_calls(tool_calls)
 
-  local is_tool_loop = params and params.is_tool_loop; local is_final_round = params and params.is_final_round
-  local abnormal, reason = response_retry.detect_abnormal_response(response_content, tool_calls, { is_tool_loop = is_tool_loop, is_final_round = is_final_round })
+  local is_tool_loop = params and params.is_tool_loop
+  local abnormal, reason = response_retry.detect_abnormal_response(response_content, tool_calls, { is_tool_loop = is_tool_loop })
   if abnormal then
     local generation = state.active_generations[generation_id]
     if generation then
@@ -536,7 +628,6 @@ function _handle_ai_response(generation_id, response, params)
         end, delay)
         return
       else
-        if is_final_round then M.handle_generation_error(generation_id, "总结轮次重试耗尽: " .. tostring(reason)); return end
         if reason and reason:find("空响应") then M.handle_generation_error(generation_id, "AI 多次返回空响应: " .. tostring(reason)); return end
       end
     end
@@ -549,7 +640,7 @@ function _handle_ai_response(generation_id, response, params)
   elseif full_config and full_config.ai then tools_enabled = full_config.ai.tools_enabled end
   stream_processor.clear_reasoning_throttle()
 
-  local is_tool_loop = params and params.is_tool_loop; local is_final_round = params and params.is_final_round
+  local is_tool_loop = params and params.is_tool_loop
 
   if #tool_calls > 0 and tools_enabled then
     if is_tool_loop then
@@ -570,12 +661,11 @@ function _handle_ai_response(generation_id, response, params)
             reasoning = reasoning_content,
             usage = response.usage or {},
             session_id = session_id,
-            is_final_round = is_final_round or false,
             _sub_agent_id = sub_agent_id,
           })
         end
       else
-        tool_orchestrator.on_generation_complete({ generation_id = generation_id, tool_calls = tool_calls, content = response_content, reasoning = reasoning_content, usage = response.usage or {}, session_id = session_id, is_final_round = is_final_round or false })
+        tool_orchestrator.on_generation_complete({ generation_id = generation_id, tool_calls = tool_calls, content = response_content, reasoning = reasoning_content, usage = response.usage or {}, session_id = session_id })
       end
       state.active_generations[generation_id] = nil
       return
@@ -614,12 +704,11 @@ function _handle_ai_response(generation_id, response, params)
           reasoning = reasoning_content,
           usage = usage,
           session_id = session_id,
-          is_final_round = is_final_round or false,
           _sub_agent_id = sub_agent_id,
         })
       end
     else
-      tool_orchestrator.on_generation_complete({ generation_id = generation_id, tool_calls = {}, content = response_content, reasoning = reasoning_content, usage = usage, session_id = session_id, is_final_round = is_final_round or false })
+      tool_orchestrator.on_generation_complete({ generation_id = generation_id, tool_calls = {}, content = response_content, reasoning = reasoning_content, usage = usage, session_id = session_id })
     end
     state.active_generations[generation_id] = nil
   else
@@ -676,7 +765,6 @@ function M.handle_tool_result(data)
     local sa_options = data.options or {}
     local sa_model_index = data.model_index or 1
     local sa_ai_preset = data.ai_preset or {}
-    local sa_is_final_round = data.is_final_round or false
     local sa_accumulated_usage = data.accumulated_usage or {}
     local sa_last_reasoning = data.last_reasoning
     -- 使用随机后缀确保 generation_id 唯一
@@ -777,7 +865,6 @@ function M.handle_tool_result(data)
           window_id = sa_window_id,
           options = sa_options,
           is_tool_loop = true,
-          is_final_round = sa_is_final_round,
           _sub_agent_id = data._sub_agent_id,
         })
       else
@@ -786,7 +873,6 @@ function M.handle_tool_result(data)
           window_id = sa_window_id,
           options = sa_options,
           is_tool_loop = true,
-          is_final_round = sa_is_final_round,
           _sub_agent_id = data._sub_agent_id,
         })
       end
@@ -802,7 +888,6 @@ function M.handle_tool_result(data)
   local options = data.options or shared.options or {}
   local model_index = data.model_index or shared.model_index or 1
   local ai_preset = data.ai_preset or shared.ai_preset or {}
-  local is_final_round = data.is_final_round or false
   local accumulated_usage = data.accumulated_usage or shared.accumulated_usage or {}
   local last_reasoning = data.last_reasoning or shared.last_reasoning
 
@@ -820,46 +905,17 @@ function M.handle_tool_result(data)
   end
   messages = cleaned
 
-  if is_final_round and #messages > 0 then
-    -- 修复：当 is_final_round=true 时，如果最后一条消息是 tool 类型，
-    -- 且倒数第二条是带 tool_calls 的 assistant 消息，
-    -- 需要同时移除 assistant 消息（因为它的 tool_calls 没有对应的 tool 响应了）
-    -- 否则 API 会报错："An assistant message with 'tool_calls' must be followed by tool messages"
-    local last_msg = messages[#messages]
-    if last_msg.role == "tool" then
-      if #messages >= 2 then
-        local prev_msg = messages[#messages - 1]
-        if prev_msg.role == "assistant" and prev_msg.tool_calls then
-          -- 同时移除 assistant 消息和 tool 消息
-          table.remove(messages) -- 移除 tool 消息
-          table.remove(messages) -- 移除 assistant 消息
-        else
-          table.remove(messages) -- 只移除 tool 消息
-        end
-      else
-        table.remove(messages) -- 只有一条 tool 消息，直接移除
-      end
-    elseif last_msg.role == "assistant" and last_msg.tool_calls then
-      -- 如果最后一条消息是带 tool_calls 的 assistant 消息（没有对应的 tool 响应），
-      -- 也需要移除，避免 API 报错
-      table.remove(messages)
-    end
-  end
-
   -- 调试日志：追踪 handle_tool_result 调用
-  require("NeoAI.utils.logger").debug("[DEBUG_DUP] handle_tool_result: gen_id=%s, session=%s, is_generating=%s, cur_gen_id=%s, is_final_round=%s, msgs=%d, stack=%s",
+  require("NeoAI.utils.logger").debug("[DEBUG_DUP] handle_tool_result: gen_id=%s, session=%s, is_generating=%s, cur_gen_id=%s, msgs=%d, stack=%s",
     tostring(generation_id),
     tostring(session_id),
     tostring(state.is_generating),
     tostring(state.current_generation_id),
-    tostring(is_final_round),
     #messages,
     debug.traceback()
   )
 
   if state.is_generating and state.current_generation_id ~= generation_id then return end
-  if state.is_generating and state.current_generation_id == generation_id then return end
-  if is_final_round and state.is_generating then state.is_generating = false; state.current_generation_id = nil end
 
   state.is_generating = true; state.current_generation_id = generation_id
   if not state.active_generations then state.active_generations = {} end
@@ -889,15 +945,14 @@ function M.handle_tool_result(data)
   local request = request_builder.build_request({ messages = formatted, options = vim.tbl_extend("force", options, { model = ai_preset.model_name or options.model, temperature = ai_preset.temperature or options.temperature, max_tokens = ai_preset.max_tokens or options.max_tokens, stream = stream_val }), session_id = session_id, generation_id = generation_id })
   -- 工具循环中不发送 max_tokens，避免 AI 输出被截断导致 tool_calls arguments 不完整
   request.max_tokens = nil
-  if is_final_round then request.tools = nil; request.tool_choice = nil end
   -- 清除去重缓存，确保新请求不被去重机制拦截
   -- 工具循环和总结轮次可能复用相同的 generation_id
   http_client.clear_request_dedup(generation_id)
-  vim.api.nvim_exec_autocmds("User", { pattern = event_constants.GENERATION_STARTED, data = { generation_id = generation_id, formatted_messages = formatted, request = request, session_id = session_id, window_id = window_id, is_tool_loop = true, is_final_round = is_final_round } })
+  vim.api.nvim_exec_autocmds("User", { pattern = event_constants.GENERATION_STARTED, data = { generation_id = generation_id, formatted_messages = formatted, request = request, session_id = session_id, window_id = window_id, is_tool_loop = true } })
   if request.stream then
-    _send_stream_request(generation_id, request, { session_id = session_id, window_id = window_id, options = options, is_tool_loop = true, is_final_round = is_final_round })
+    _send_stream_request(generation_id, request, { session_id = session_id, window_id = window_id, options = options, is_tool_loop = true })
   else
-    _send_non_stream_request(generation_id, request, { session_id = session_id, window_id = window_id, options = options, is_tool_loop = true, is_final_round = is_final_round })
+    _send_non_stream_request(generation_id, request, { session_id = session_id, window_id = window_id, options = options, is_tool_loop = true })
   end
 end
 
@@ -931,7 +986,6 @@ function M.handle_generation_error(generation_id, error_msg)
       reasoning = "",
       usage = {},
       session_id = generation.session_id,
-      is_final_round = true,
       _sub_agent_id = sub_agent_id,
     })
   end

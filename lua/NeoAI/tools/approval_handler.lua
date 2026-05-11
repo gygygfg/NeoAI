@@ -58,16 +58,43 @@ local DEFAULT_APPROVAL_KEYMAPS = {
   cancel_with_reason = { key = "C", desc = "取消并说明" },
 }
 
--- ========== 审批队列管理 ==========
+-- ========== 审批队列管理（事件驱动） ==========
+
+-- 审批队列为模块内局部变量，保证原子性
+-- 所有操作通过事件 TOOL_APPROVAL_QUEUED 驱动，避免并发竞态
+
+--- 初始化事件监听（惰性初始化，仅在首次入队时注册）
+local _event_listener_registered = false
+local function _ensure_event_listener()
+  if _event_listener_registered then
+    return
+  end
+  _event_listener_registered = true
+
+  -- 监听审批入队事件，自动触发队列处理
+  vim.api.nvim_create_autocmd("User", {
+    pattern = event_constants.TOOL_APPROVAL_QUEUED,
+    callback = function()
+      M.process_queue()
+    end,
+  })
+end
 
 --- 将工具加入审批队列
 --- @param item table { tool_name, resolved_args, raw_args, on_success, on_error, on_progress, start_time, pack_name, session_id }
 function M.enqueue(item)
+  _ensure_event_listener()
   table.insert(state.approval_queue, item)
+  -- 发射事件驱动队列处理
+  pcall(vim.api.nvim_exec_autocmds, "User", {
+    pattern = event_constants.TOOL_APPROVAL_QUEUED,
+    data = { queue_size = #state.approval_queue },
+  })
 end
 
 --- 处理审批队列
 --- 从队列头部取出一个待审批的工具，显示审批窗口
+--- 由事件 TOOL_APPROVAL_QUEUED 驱动，避免轮询
 function M.process_queue()
   if state.approval_showing then
     return
@@ -82,6 +109,7 @@ function M.process_queue()
   if not item or not item.tool_name then
     state.approval_showing = false
     logger.warn("[approval_handler] 审批队列项无效，跳过")
+    -- 继续处理下一个
     vim.schedule(function()
       M.process_queue()
     end)
@@ -699,11 +727,33 @@ function M._show_approval_dialog(item)
       M.resume_timer()
 
       if extra_opts and extra_opts.allow_all then
-        approval_state.set_allow_all(item.tool_name)
+        M.set_allow_all(item.tool_name)
         logger.debug(
           "[approval_handler] 允许所有：已将工具 '%s' 加入 approval_state 的 allow_all_tools 集合",
           item.tool_name
         )
+
+        -- 自动审批队列中所有同类型的工具
+        local remaining = {}
+        for _, qitem in ipairs(state.approval_queue) do
+          if qitem.tool_name == item.tool_name then
+            logger.debug("[approval_handler] 自动审批同类型工具: %s", qitem.tool_name)
+            local tool_executor = require("NeoAI.tools.tool_executor")
+            tool_executor._continue_execution(
+              qitem.tool_name,
+              qitem.resolved_args,
+              qitem.raw_args,
+              qitem.on_success,
+              qitem.on_error,
+              qitem.on_progress,
+              qitem.start_time,
+              qitem.pack_name
+            )
+          else
+            table.insert(remaining, qitem)
+          end
+        end
+        state.approval_queue = remaining
       end
 
       -- 清理暂停回调（审批完成后不再需要暂停/恢复超时）

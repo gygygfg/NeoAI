@@ -190,15 +190,11 @@ local function has_abnormal_tool_calls(tool_calls)
         )
         return true
       end
+      -- 空 table {} 是合法参数（如 git_status、get_log_levels 等工具不需要参数），不视为异常
+      -- 仅 args 为 nil 时才视为异常
       if type(args) == "table" and vim.tbl_isempty(args) then
-        logger.debug(
-          string.format(
-            "[response_retry] 检测到空参数工具调用 #%d: name=%s, args={} (空 table)",
-            i,
-            tostring(func.name)
-          )
-        )
-        return true
+        -- 不视为异常，允许继续执行
+        -- 这些工具可能确实不需要参数
       end
     end
   end
@@ -236,29 +232,10 @@ end
 --- @param tool_calls table|nil 工具调用列表
 --- @param opts table|nil 可选参数
 ---   - is_tool_loop boolean 是否在工具循环模式中
----   - is_final_round boolean 是否是最终轮次（总结轮次）
 --- @return boolean 是否异常
 --- @return string|nil 异常原因
 function M.detect_abnormal_response(content, tool_calls, opts)
   opts = opts or {}
-
-  -- 最终轮次（总结轮次）：AI 应返回文本总结，不检测空内容
-  -- 但仍检测内容重复和截断
-  if opts.is_final_round then
-    if content and content ~= "" then
-      if has_repeated_content(content) then
-        return true, "内容重复：检测到重复段落或标题"
-      end
-      if has_truncated_content(content) then
-        return true, "内容截断：检测到不完整的结尾"
-      end
-    end
-    -- 总结轮次中空内容+无工具调用是异常
-    if (not content or content == "") and (not tool_calls or #tool_calls == 0) then
-      return true, "总结轮次空响应：AI 未返回任何内容"
-    end
-    return false, nil
-  end
 
   -- 工具循环模式：AI 本轮不调用工具就算自动停止循环
   -- 有内容但无工具调用：视为 AI 自动退出，不再重试

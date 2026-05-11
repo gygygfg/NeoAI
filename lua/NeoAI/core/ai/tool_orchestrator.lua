@@ -33,7 +33,6 @@ local _tools = {}
 local state = {
   initialized = false,
   config = nil,
-  max_iterations = 20,
   sessions = {},            -- 主 agent 会话
   sub_agent_sessions = {},  -- 子 agent 会话（sub_agent_id -> session state）
 }
@@ -115,7 +114,7 @@ end
 
 --- 触发 TOOL_RESULT_RECEIVED 事件
 --- 使用 pcall 保护，避免在 fast event 上下文中调用失败
-local function fire_tool_result_received(ss, is_final_round)
+local function fire_tool_result_received(ss)
   if not ss then
     return
   end
@@ -135,7 +134,6 @@ local function fire_tool_result_received(ss, is_final_round)
       options = ss.options,
       model_index = ss.model_index,
       ai_preset = ss.ai_preset,
-      is_final_round = is_final_round or false,
       accumulated_usage = ss.accumulated_usage,
       last_reasoning = ss.last_reasoning,
     },
@@ -160,7 +158,6 @@ local function fire_tool_result_received(ss, is_final_round)
           options = ss.options,
           model_index = ss.model_index,
           ai_preset = ss.ai_preset,
-          is_final_round = is_final_round or false,
           accumulated_usage = ss.accumulated_usage,
           last_reasoning = ss.last_reasoning,
         },
@@ -179,7 +176,6 @@ local function create_session_state(session_id, window_id)
     phase = "idle",
     _tools_complete_in_progress = false,
     _proceed_in_progress = false,
-    _summary_in_progress = false,
     active_tool_calls = {},
     current_iteration = 0,
     messages = {},
@@ -189,8 +185,7 @@ local function create_session_state(session_id, window_id)
     accumulated_usage = {},
     last_reasoning = nil,
     stop_requested = false,
-    user_cancelled = false, -- 用户主动取消标志，为 true 时不触发总结
-    _skip_summary = false, -- 跳过总结轮次标志（由 generate_summary=false 触发）
+    user_cancelled = false, -- 用户主动取消标志
     _tool_retry_count = 0, -- 工具调用重试计数
     on_complete = nil,
     autocmd_ids = {},
@@ -204,7 +199,6 @@ function M.initialize(options)
     return M
   end
   state.config = options.config or {}
-  state.max_iterations = state.config.max_tool_iterations or 20
   state.initialized = true
 
   _tools = {}
@@ -242,37 +236,23 @@ function M.register_session(session_id, window_id)
 
         -- 累积 usage
         if data.usage and next(data.usage) then
-          if s._summary_in_progress then
-            s.accumulated_usage = vim.deepcopy(data.usage)
-          else
-            local acc = s.accumulated_usage or {}
-            acc.prompt_tokens = (acc.prompt_tokens or 0) + (data.usage.prompt_tokens or data.usage.input_tokens or 0)
-            acc.completion_tokens = (acc.completion_tokens or 0)
-              + (data.usage.completion_tokens or data.usage.output_tokens or 0)
-            acc.total_tokens = (acc.total_tokens or 0) + (data.usage.total_tokens or 0)
-            if data.usage.completion_tokens_details and type(data.usage.completion_tokens_details) == "table" then
-              local rt = data.usage.completion_tokens_details.reasoning_tokens or 0
-              if not acc.completion_tokens_details then
-                acc.completion_tokens_details = {}
-              end
-              acc.completion_tokens_details.reasoning_tokens = (acc.completion_tokens_details.reasoning_tokens or 0)
-                + rt
+          local acc = s.accumulated_usage or {}
+          acc.prompt_tokens = (acc.prompt_tokens or 0) + (data.usage.prompt_tokens or data.usage.input_tokens or 0)
+          acc.completion_tokens = (acc.completion_tokens or 0)
+            + (data.usage.completion_tokens or data.usage.output_tokens or 0)
+          acc.total_tokens = (acc.total_tokens or 0) + (data.usage.total_tokens or 0)
+          if data.usage.completion_tokens_details and type(data.usage.completion_tokens_details) == "table" then
+            local rt = data.usage.completion_tokens_details.reasoning_tokens or 0
+            if not acc.completion_tokens_details then
+              acc.completion_tokens_details = {}
             end
-            s.accumulated_usage = acc
+            acc.completion_tokens_details.reasoning_tokens = (acc.completion_tokens_details.reasoning_tokens or 0)
+              + rt
           end
+          s.accumulated_usage = acc
         end
         if data.reasoning_text and data.reasoning_text ~= "" then
           s.last_reasoning = data.reasoning_text
-        end
-
-        -- 总结轮次完成：清理状态
-        if s._summary_in_progress then
-          s._summary_in_progress = false
-          s.phase = "idle"
-          s.active_tool_calls = {}
-          s.current_iteration = 0
-          s.generation_id = nil
-          return
         end
 
         M._check_round_complete(session_id)
@@ -454,6 +434,9 @@ function M._execute_tools(session_id, tool_calls, is_sub_agent)
     return
   end
 
+  require("NeoAI.utils.logger").debug("[DEBUG_DUP] _execute_tools 进入: session=%s, tool_calls=%d, phase=%s",
+    tostring(session_id), #tool_calls, tostring(ss and ss.phase))
+
   if #tool_calls == 0 then
     vim.schedule(function()
       M._request_generation(session_id, is_sub_agent)
@@ -534,6 +517,94 @@ function M._execute_single_tool(session_id, tool_call, is_sub_agent)
   if not tool_name or tool_name == "" then
     logger.warn("[tool_orchestrator] _execute_single_tool: tool_func.name 为空, tool_func=" .. vim.inspect(tool_func))
     return
+  end
+
+  -- ===== 工具名称修正（别名映射 + 模糊匹配） =====
+  local tool_executor = require("NeoAI.tools.tool_executor")
+  local tool_registry = require("NeoAI.tools.tool_registry")
+  -- ===== 工具名称和参数规范化（别名映射 + 模糊匹配） =====
+  -- 不检查工具是否存在，直接对工具名称和参数做规范化
+  -- 规范化后更新 ss.messages 中的记录，确保上下文和历史一致
+  local original_tool_name = tool_name
+  local tool_def = tool_registry.get(tool_name)
+  local tool_name_changed = false
+
+  -- 1) 别名映射
+  local normalized_name, _ = tool_executor._normalize_tool_name(tool_name)
+  if normalized_name and normalized_name ~= tool_name then
+    tool_name = normalized_name
+    tool_def = tool_registry.get(tool_name)
+    tool_name_changed = true
+    logger.warn("[tool_orchestrator] 工具名称别名修正: '%s' -> '%s'", original_tool_name, tool_name)
+  end
+
+  -- 2) 模糊匹配（别名映射未命中时）
+  if not tool_def then
+    local all_tools = tool_registry.list()
+    local all_names = {}
+    for _, t in ipairs(all_tools) do
+      table.insert(all_names, t.name)
+    end
+    local best_match = M._fuzzy_match_tool(original_tool_name, all_names)
+    if best_match then
+      tool_name = best_match
+      tool_def = tool_registry.get(tool_name)
+      tool_name_changed = true
+      logger.warn("[tool_orchestrator] 工具名称模糊匹配修正: '%s' -> '%s'", original_tool_name, tool_name)
+    end
+  end
+
+  -- 如果工具名称发生变化，更新 ss.messages 中的记录
+  if tool_name_changed then
+    -- 更新 tool_call 中的工具名称
+    tool_func.name = tool_name
+    -- 更新 ss.messages 中所有 assistant 消息的 tool_calls
+    if ss.messages then
+      for i = #ss.messages, 1, -1 do
+        local msg = ss.messages[i]
+        if msg.role == "assistant" and msg.tool_calls then
+          local updated = false
+          for _, tc in ipairs(msg.tool_calls) do
+            local tc_func = tc["function"] or tc.func
+            if tc_func and tc_func.name == original_tool_name then
+              tc_func.name = tool_name
+              updated = true
+            end
+          end
+          if updated then
+            logger.debug("[tool_orchestrator] 已更新 assistant 消息中工具名称: '%s' -> '%s'", original_tool_name, tool_name)
+          end
+        end
+      end
+    end
+  end
+
+  -- 3) 参数规范化
+  if tool_def and tool_func.arguments then
+    local normalized_args, args_changed = tool_executor._normalize_arguments(tool_name, tool_func.arguments)
+    if args_changed then
+      tool_func.arguments = normalized_args
+      logger.warn("[tool_orchestrator] 工具 '%s' 参数已规范化", tool_name)
+      -- 更新 ss.messages 中的参数
+      if ss.messages then
+        for i = #ss.messages, 1, -1 do
+          local msg = ss.messages[i]
+          if msg.role == "assistant" and msg.tool_calls then
+            local updated = false
+            for _, tc in ipairs(msg.tool_calls) do
+              local tc_func = tc["function"] or tc.func
+              if tc_func and tc_func.name == tool_name then
+                tc_func.arguments = normalized_args
+                updated = true
+              end
+            end
+            if updated then
+              logger.debug("[tool_orchestrator] 已更新 assistant 消息中工具 '%s' 的参数", tool_name)
+            end
+          end
+        end
+      end
+    end
   end
 
   -- 调试日志：追踪 _execute_single_tool 调用
@@ -808,16 +879,6 @@ function M._on_tools_complete(session_id, is_sub_agent)
       return
     end
     fire_loop_finished(ss)
-    once_display_closed(session_id, function()
-      local s = sessions_table[session_id]
-      if not s then
-        return
-      end
-      if is_shutting_down() then
-        return
-      end
-      M._request_summary_round(session_id, is_sub_agent)
-    end)
     return
   end
 
@@ -867,9 +928,6 @@ function M._check_round_complete(session_id, is_sub_agent)
       tool_display._close_display()
     end)
     ss.phase = "idle"
-    if not ss.user_cancelled then
-      M._request_summary_round(session_id, is_sub_agent)
-    end
     return
   end
 
@@ -919,14 +977,6 @@ function M._proceed_to_next_round(session_id, is_sub_agent)
   ss.phase = "idle"
   ss.active_tool_calls = {}
 
-  local max_iter = ss.max_iterations or state.max_iterations
-  if ss.current_iteration >= max_iter then
-    ss._proceed_in_progress = false
-    fire_loop_finished(ss)
-    M._finish_loop(session_id, true, "已达到最大迭代次数", is_sub_agent)
-    return
-  end
-
   if ss.stop_requested then
     -- 停止时关闭工具调用悬浮窗
     pcall(function()
@@ -934,34 +984,6 @@ function M._proceed_to_next_round(session_id, is_sub_agent)
       tool_display._close_display()
     end)
     ss._proceed_in_progress = false
-    if not ss.user_cancelled then
-      M._request_summary_round(session_id, is_sub_agent)
-    elseif ss._skip_summary then
-      local saved_usage = ss.accumulated_usage or {}
-      local saved_gen_id = ss.generation_id
-      local saved_win_id = ss.window_id
-      local saved_reasoning = ss.last_reasoning or ""
-      local saved_result = ""
-      if not is_shutting_down() then
-        vim.schedule(function()
-          if is_shutting_down() then
-            return
-          end
-          pcall(vim.api.nvim_exec_autocmds, "User", {
-            pattern = event_constants.GENERATION_COMPLETED,
-            data = {
-              generation_id = saved_gen_id,
-              response = saved_result,
-              reasoning_text = saved_reasoning,
-              usage = saved_usage,
-              session_id = session_id,
-              window_id = saved_win_id,
-              duration = 0,
-            },
-          })
-        end)
-      end
-    end
     return
   end
 
@@ -995,86 +1017,8 @@ function M._request_generation(session_id, is_sub_agent)
     local sub_agent_engine = require("NeoAI.core.ai.sub_agent_engine")
     sub_agent_engine._request_generation(session_id)
   else
-    fire_tool_result_received(ss, false)
+    fire_tool_result_received(ss)
   end
-end
-
-function M._request_summary_round(session_id, is_sub_agent)
-  local sessions_table = is_sub_agent and state.sub_agent_sessions or state.sessions
-  local ss = sessions_table[session_id]
-  if not ss then
-    return
-  end
-  if ss._summary_in_progress then
-    return
-  end
-  -- 退出时不发起总结轮次，避免死循环
-  if is_shutting_down() then
-    ss._summary_in_progress = false
-    return
-  end
-  ss._summary_in_progress = true
-
-  -- 复制 messages 并添加系统提示
-  -- 使用 vim.deepcopy 深拷贝，防止 format_messages 修改原始消息对象（如添加占位 tool_call_id）
-  local messages = {}
-  for _, msg in ipairs(ss.messages or {}) do
-    table.insert(messages, vim.deepcopy(msg))
-  end
-  table.insert(messages, {
-    role = "system",
-    content = "工具调用循环已结束。请根据所有工具执行的结果，对已完成的工作进行总结，然后返回最终结果给用户。总结应包括：完成了哪些任务、关键发现或结果、以及后续建议（如有）。",
-  })
-
-  local saved = {
-    generation_id = ss.generation_id,
-    window_id = ss.window_id,
-    messages = messages,
-    options = ss.options,
-    model_index = ss.model_index,
-    ai_preset = ss.ai_preset,
-    accumulated_usage = ss.accumulated_usage,
-    last_reasoning = ss.last_reasoning,
-  }
-
-  once_display_closed(session_id, function()
-    local s = sessions_table[session_id]
-    if not s then
-      return
-    end
-    if is_shutting_down() then
-      return
-    end
-    local saved_stop_requested = s.stop_requested
-    s.stop_requested = false
-
-    local event_data = {
-      generation_id = saved.generation_id,
-      tool_results = {},
-      session_id = session_id,
-      window_id = saved.window_id,
-      messages = saved.messages,
-      options = saved.options,
-      model_index = saved.model_index,
-      ai_preset = saved.ai_preset,
-      is_final_round = true,
-      accumulated_usage = saved.accumulated_usage,
-      last_reasoning = saved.last_reasoning,
-    }
-
-    -- 子 agent 总结轮次：传递 _sub_agent_id
-    if is_sub_agent then
-      event_data._sub_agent_id = session_id
-    end
-
-    vim.api.nvim_exec_autocmds("User", {
-      pattern = event_constants.TOOL_RESULT_RECEIVED,
-      data = event_data,
-    })
-    s.stop_requested = saved_stop_requested
-  end)
-
-  fire_loop_finished(ss)
 end
 
 -- ========== 外部回调 ==========
@@ -1085,24 +1029,29 @@ function M.on_generation_complete(data)
   local sessions_table = is_sub_agent and state.sub_agent_sessions or state.sessions
   local session_id = is_sub_agent and sub_agent_id or data.session_id
 
+  require("NeoAI.utils.logger").debug("[DEBUG_DUP] on_generation_complete 进入: session=%s, gen_id=%s, data.gen_id=%s, tool_calls=%d, ss=%s",
+    tostring(session_id),
+    tostring(sessions_table[session_id] and sessions_table[session_id].generation_id),
+    tostring(data.generation_id),
+    #(data.tool_calls or {}),
+    tostring(sessions_table[session_id] ~= nil))
+
   local ss = sessions_table[session_id]
   if not ss or ss.generation_id ~= data.generation_id then
-    if not (ss and ss._summary_in_progress) then
-      return
-    end
+    require("NeoAI.utils.logger").debug("[DEBUG_DUP] on_generation_complete 提前返回: ss=%s, ss.gen_id=%s, data.gen_id=%s",
+      tostring(ss ~= nil),
+      tostring(ss and ss.generation_id),
+      tostring(data.generation_id))
+    return
   end
 
   local tool_calls = data.tool_calls or {}
   local content = data.content or ""
-  local is_final_round = data.is_final_round or false
 
   -- 累积 usage
   local current_usage = data.usage or {}
   if current_usage and next(current_usage) then
-    if ss._summary_in_progress then
-      ss.accumulated_usage = vim.deepcopy(current_usage)
-    else
-      local acc = ss.accumulated_usage or {}
+    local acc = ss.accumulated_usage or {}
       acc.prompt_tokens = (acc.prompt_tokens or 0) + (current_usage.prompt_tokens or current_usage.input_tokens or 0)
       acc.completion_tokens = (acc.completion_tokens or 0)
         + (current_usage.completion_tokens or current_usage.output_tokens or 0)
@@ -1116,7 +1065,6 @@ function M.on_generation_complete(data)
       end
       ss.accumulated_usage = acc
     end
-  end
 
   -- 过滤无效工具调用
   local valid_tool_calls = {}
@@ -1124,7 +1072,8 @@ function M.on_generation_complete(data)
     local func = tc["function"] or tc.func
     if func and func.name and func.name ~= "" then
       local args = func.arguments
-      if args ~= nil and type(args) == "table" and next(args) ~= nil then
+      -- 空 table {}（vim.empty_dict()）是无参数工具的合法参数，不应跳过
+      if args ~= nil and type(args) == "table" and (next(args) ~= nil or vim.tbl_isempty(args)) then
         table.insert(valid_tool_calls, tc)
       else
         logger.warn(
@@ -1150,11 +1099,9 @@ function M.on_generation_complete(data)
   end
 
   -- ===== 工具调用异常检测与重试 =====
-  if not is_final_round then
-    local abnormal, reason = response_retry.detect_abnormal_response(content, tool_calls, {
-      is_tool_loop = true,
-      is_final_round = false,
-    })
+  local abnormal, reason = response_retry.detect_abnormal_response(content, tool_calls, {
+    is_tool_loop = true,
+  })
     if abnormal then
       local retry_count = ss._tool_retry_count or 0
       if response_retry.can_retry(retry_count) then
@@ -1208,13 +1155,12 @@ function M.on_generation_complete(data)
         end
       end
     end
-  end
   if ss then
     ss._tool_retry_count = 0
   end
 
   -- 中间轮次保存到 history_manager（仅主 agent）
-  if not is_sub_agent and not is_final_round and ss.current_iteration < state.max_iterations then
+  if not is_sub_agent then
     local hm_ok, hm = pcall(require, "NeoAI.core.history.manager")
     if hm_ok and hm.is_initialized() then
       local assistant_entry = { content = content }
@@ -1226,8 +1172,7 @@ function M.on_generation_complete(data)
     end
   end
 
-  local max_iter = ss.max_iterations or state.max_iterations
-  if is_final_round or #tool_calls == 0 or ss.current_iteration >= max_iter then
+  if #tool_calls == 0 then
     -- AI 返回纯文本回复，直接结束（不触发总结轮次）
     if #tool_calls == 0 and content and content ~= "" then
       logger.debug("[tool_orchestrator] AI 返回纯文本回复，直接结束循环，跳过总结轮次")
@@ -1281,8 +1226,6 @@ function M.on_generation_complete(data)
       return
     end
 
-    -- is_final_round 或达到最大迭代次数：直接结束，不触发总结轮次
-    -- 工具循环完成后 AI 已返回最终回复，无需额外总结请求
     if #tool_calls == 0 and (not content or content == "") then
       -- 空响应：直接结束
       logger.debug("[tool_orchestrator] AI 返回空响应，直接结束循环")
@@ -1319,60 +1262,6 @@ function M.on_generation_complete(data)
         })
         if on_complete then
           on_complete(true, "", saved_usage)
-        end
-      end)
-      return
-    end
-
-    -- is_final_round
-    if is_final_round then
-      local assistant_msg = {
-        role = "assistant",
-        content = content,
-        timestamp = os.time(),
-        window_id = ss.window_id,
-      }
-      if data.reasoning and data.reasoning ~= "" then
-        assistant_msg.reasoning_content = data.reasoning
-        ss.last_reasoning = data.reasoning
-      end
-      table.insert(ss.messages, assistant_msg)
-
-      local saved_usage = ss.accumulated_usage or {}
-      local saved_reasoning = ss.last_reasoning or ""
-      local saved_win_id = ss.window_id
-      local saved_gen_id = ss.generation_id
-      local on_complete = ss.on_complete
-      ss.on_complete = nil
-      ss.phase = "idle"
-      ss.active_tool_calls = {}
-      ss.current_iteration = 0
-      ss.generation_id = nil
-      ss._summary_in_progress = false
-
-      fire_loop_finished(ss)
-      once_display_closed(session_id, function()
-        local s = sessions_table[session_id]
-        if not s then
-          return
-        end
-        if is_shutting_down() then
-          return
-        end
-        pcall(vim.api.nvim_exec_autocmds, "User", {
-          pattern = event_constants.SUMMARY_COMPLETED,
-          data = {
-            generation_id = saved_gen_id,
-            response = content,
-            reasoning_text = saved_reasoning,
-            usage = saved_usage,
-            session_id = session_id,
-            window_id = saved_win_id,
-            duration = 0,
-          },
-        })
-        if on_complete then
-          on_complete(true, content, saved_usage)
         end
       end)
       return
@@ -1417,6 +1306,129 @@ function M.on_generation_complete(data)
     end
     M._execute_tools(session_id, tool_calls, is_sub_agent)
   end)
+end
+
+--- 计算两个字符串的编辑距离（Levenshtein）
+--- @param s1 string
+--- @param s2 string
+--- @return number
+local function _levenshtein(s1, s2)
+  local len1 = #s1
+  local len2 = #s2
+  local matrix = {}
+  for i = 0, len1 do
+    matrix[i] = { [0] = i }
+  end
+  for j = 0, len2 do
+    matrix[0][j] = j
+  end
+  for i = 1, len1 do
+    for j = 1, len2 do
+      local cost = s1:sub(i, i) == s2:sub(j, j) and 0 or 1
+      matrix[i][j] = math.min(
+        matrix[i - 1][j] + 1,
+        matrix[i][j - 1] + 1,
+        matrix[i - 1][j - 1] + cost
+      )
+    end
+  end
+  return matrix[len1][len2]
+end
+
+--- 模糊匹配工具名称
+--- 当模型调用了不存在的工具时，尝试找到最相似的工具
+--- @param input string 模型输入的工具名称
+--- @param all_names string[] 所有可用工具名称列表
+--- @return string|nil 最匹配的工具名称，或 nil
+function M._fuzzy_match_tool(input, all_names)
+  if not input or not all_names or #all_names == 0 then
+    return nil
+  end
+
+  local input_lower = input:lower()
+
+  -- 1) 精确匹配（忽略大小写）
+  for _, name in ipairs(all_names) do
+    if name:lower() == input_lower then
+      return name
+    end
+  end
+
+  -- 2) 前缀匹配
+  local prefix_matches = {}
+  for _, name in ipairs(all_names) do
+    if name:lower():find(input_lower, 1, true) == 1 then
+      table.insert(prefix_matches, name)
+    elseif input_lower:find(name:lower(), 1, true) == 1 then
+      table.insert(prefix_matches, name)
+    end
+  end
+  if #prefix_matches == 1 then
+    return prefix_matches[1]
+  end
+
+  -- 3) 子串匹配
+  local substr_matches = {}
+  for _, name in ipairs(all_names) do
+    if name:lower():find(input_lower, 1, true) then
+      table.insert(substr_matches, name)
+    end
+  end
+  if #substr_matches == 1 then
+    return substr_matches[1]
+  end
+
+  -- 4) 单词匹配（按 _ 或 - 分割）
+  local input_parts = {}
+  for part in input_lower:gmatch("[%w_]+") do
+    table.insert(input_parts, part)
+  end
+  local best_score = 0
+  local best_name = nil
+  for _, name in ipairs(all_names) do
+    local name_lower = name:lower()
+    local score = 0
+    for _, part in ipairs(input_parts) do
+      if name_lower == part then
+        score = score + 10
+      elseif name_lower:find(part, 1, true) then
+        score = score + 5
+      end
+    end
+    if score > best_score then
+      best_score = score
+      best_name = name
+    end
+  end
+
+  if best_score > 0 then
+    return best_name
+  end
+
+  -- 5) 编辑距离匹配（处理拼写错误）
+  local best_dist = math.huge
+  local best_dist_name = nil
+  local input_len = #input_lower
+  for _, name in ipairs(all_names) do
+    local name_lower = name:lower()
+    -- 只考虑长度差异不超过 50% 的
+    local len_diff = math.abs(#name_lower - input_len)
+    if len_diff <= math.max(#name_lower, input_len) * 0.5 then
+      local dist = _levenshtein(input_lower, name_lower)
+      -- 编辑距离不超过名称长度的 40%
+      local max_len = math.max(#name_lower, input_len)
+      if dist <= max_len * 0.4 and dist < best_dist then
+        best_dist = dist
+        best_dist_name = name
+      end
+    end
+  end
+
+  if best_dist_name then
+    return best_dist_name
+  end
+
+  return nil
 end
 
 function M._add_tool_result_to_messages(session_id, tool_call_id, tool_name, result, is_sub_agent)
@@ -1485,7 +1497,7 @@ function M._finish_loop(session_id, success, result, is_sub_agent)
     _stop_listener_id = nil
   end
 
-  -- 第二次调用 _finish_loop（总结轮次完成时）
+  -- 第二次调用 _finish_loop（on_complete 已被消费）
   if ss.on_complete == nil then
     local saved_gen_id = ss.generation_id
     local saved_win_id = ss.window_id
@@ -1527,77 +1539,42 @@ function M._finish_loop(session_id, success, result, is_sub_agent)
   local saved_reasoning = ss.last_reasoning or ""
   local saved_result = result or ""
 
-  if ss.user_cancelled then
-    ss.on_complete = nil
-    ss.phase = "idle"
-    ss.active_tool_calls = {}
-    ss.current_iteration = 0
-    ss.generation_id = nil
-    if ss._skip_summary then
-      if not is_shutting_down() then
-        vim.schedule(function()
-          if is_shutting_down() then
-            return
-          end
-          pcall(vim.api.nvim_exec_autocmds, "User", {
-            pattern = event_constants.GENERATION_COMPLETED,
-            data = {
-              generation_id = saved_generation_id,
-              response = saved_result,
-              reasoning_text = saved_reasoning,
-              usage = saved_usage,
-              session_id = session_id,
-              window_id = saved_window_id,
-              duration = 0,
-            },
-          })
-        end)
-      end
-    end
-    if on_complete then
-      vim.schedule(function()
-        on_complete(true, saved_result, saved_usage)
-      end)
-    end
-    return
-  end
-
-  if ss._summary_in_progress then
-    ss.on_complete = nil
-    ss.phase = "idle"
-    ss.active_tool_calls = {}
-    ss.current_iteration = 0
-    ss.generation_id = nil
-    ss._summary_in_progress = false
-    if not is_shutting_down() then
-      vim.schedule(function()
-        if is_shutting_down() then
-          return
-        end
-        pcall(vim.api.nvim_exec_autocmds, "User", {
-          pattern = event_constants.GENERATION_COMPLETED,
-          data = {
-            generation_id = saved_generation_id,
-            response = saved_result,
-            reasoning_text = saved_reasoning,
-            usage = saved_usage,
-            session_id = session_id,
-            window_id = saved_window_id,
-            duration = 0,
-          },
-        })
-      end)
-    end
-    return
-  end
-
   ss.on_complete = nil
   ss.phase = "idle"
   ss.active_tool_calls = {}
   ss.current_iteration = 0
+  ss.generation_id = nil
 
-  -- 工具循环自然结束，不再触发总结轮次
-  -- 总结由 AI 在工具循环中自行完成
+  -- 调用 on_complete 回调，通知调用方循环已结束
+  if on_complete then
+    vim.schedule(function()
+      if is_shutting_down() then
+        return
+      end
+      on_complete(true, saved_result, saved_usage)
+    end)
+  end
+
+  -- 触发 GENERATION_COMPLETED 事件
+  if not is_shutting_down() then
+    vim.schedule(function()
+      if is_shutting_down() then
+        return
+      end
+      pcall(vim.api.nvim_exec_autocmds, "User", {
+        pattern = event_constants.GENERATION_COMPLETED,
+        data = {
+          generation_id = saved_generation_id,
+          response = saved_result,
+          reasoning_text = saved_reasoning,
+          usage = saved_usage,
+          session_id = session_id,
+          window_id = saved_window_id,
+          duration = 0,
+        },
+      })
+    end)
+  end
 end
 
 -- ========== 停止控制 ==========
@@ -2264,7 +2241,6 @@ function M._test_reset()
   state.sessions = {}
   state.sub_agent_sessions = {}
   state.config = {}
-  state.max_iterations = 20
   _tools = {}
 end
 
@@ -2283,7 +2259,6 @@ function M.cleanup_all()
     ss.generation_id = nil
     ss._tools_complete_in_progress = false
     ss._proceed_in_progress = false
-    ss._summary_in_progress = false
   end
   for _, ss in pairs(state.sub_agent_sessions) do
     ss.stop_requested = true
@@ -2293,7 +2268,6 @@ function M.cleanup_all()
     ss.generation_id = nil
     ss._tools_complete_in_progress = false
     ss._proceed_in_progress = false
-    ss._summary_in_progress = false
   end
 
   pcall(function()

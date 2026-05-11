@@ -483,12 +483,77 @@ function M.send_stream_request(params, on_chunk, on_complete, on_error)
   -- 累计接收数据量
   local total_received = 0
 
+  -- 空闲超时检测：30 秒无数据时尝试格式化工具调用
+  -- 如果格式化成功则视为传输完成，否则触发重试
+  local IDLE_TIMEOUT_MS = 30000
+  local idle_timer = nil
+  local stream_processor = require("NeoAI.core.ai.stream_processor")
+
+  -- 将 idle_timer 存入 active_requests，方便 cancel_request 清理
+  local function set_idle_timer(timer)
+    local r = state.active_requests[request_id]
+    if r then
+      r.idle_timer = timer
+    end
+  end
+
+  local function reset_idle_timer()
+    if idle_timer then
+      idle_timer:stop()
+      idle_timer:close()
+      idle_timer = nil
+    end
+  end
+
+  local function start_idle_timer()
+    reset_idle_timer()
+    idle_timer = vim.uv.new_timer()
+    set_idle_timer(idle_timer)
+    idle_timer:start(IDLE_TIMEOUT_MS, 0, vim.schedule_wrap(function()
+      local req = state.active_requests[request_id]
+      if not req or req.cancelled or req.has_error then
+        return
+      end
+
+      -- 检查是否已有 tool_calls 在累积中
+      -- 通过 on_chunk 回调获取 processor 状态
+      logger.debug("[http_client] 流式请求空闲超时 (%dms): request_id=%s, generation_id=%s",
+        IDLE_TIMEOUT_MS, request_id, tostring(generation_id))
+
+      -- 尝试通过 on_chunk 传递的 processor 获取当前 tool_calls 状态
+      -- 由于 processor 在 ai_engine 中管理，这里无法直接访问
+      -- 但我们可以利用 stream_processor 的 try_finalize_tool_calls
+      -- 注意：这里无法直接获取 processor，因为它在 ai_engine 中创建
+      -- 所以我们需要通过另一种方式：检查是否有 tool_calls_delta 累积
+
+      -- 实际上，我们需要在 ai_engine 层面处理这个问题
+      -- 在 http_client 层面，我们只能触发一个特殊回调
+      -- 让上层（ai_engine）决定是完成还是重试
+
+      -- 方案：触发一个特殊的空闲超时回调
+      -- 如果 on_chunk 回调存在，发送一个标记数据让上层处理
+      if on_chunk then
+        -- 发送一个特殊的空闲超时标记
+        local timeout_marker = {
+          _idle_timeout = true,
+          generation_id = generation_id,
+        }
+        on_chunk(timeout_marker)
+      end
+
+      -- 注意：不在这里清理请求，让上层决定如何处理
+      -- 如果上层决定完成，会调用 on_complete
+      -- 如果上层决定重试，会调用 on_error
+    end))
+  end
+
   state.active_requests[request_id] = {
     generation_id = generation_id,
     temp_file = temp_file,
     cancelled = false,
     has_error = false,
     buffer = "",
+    idle_timer = nil,
   }
 
   -- 更新去重缓存
@@ -551,6 +616,8 @@ function M.send_stream_request(params, on_chunk, on_complete, on_error)
     if n == 0 then
       return
     end
+    -- 收到数据时重置空闲超时定时器
+    start_idle_timer()
     -- 计算本次回调的数据总大小
     local lines_size = 0
     for _, line in ipairs(data_lines) do
@@ -579,6 +646,8 @@ function M.send_stream_request(params, on_chunk, on_complete, on_error)
   end
 
   local function handle_complete()
+    -- 清理空闲超时定时器
+    reset_idle_timer()
     local req = state.active_requests[request_id]
     if not req then
       -- 请求已被取消（cancel_request 已清理），不再触发回调
@@ -607,6 +676,8 @@ function M.send_stream_request(params, on_chunk, on_complete, on_error)
   end
 
   local function handle_error(err_msg)
+    -- 清理空闲超时定时器
+    reset_idle_timer()
     local req = state.active_requests[request_id]
     if req then
       if req.cancelled then
@@ -675,6 +746,11 @@ function M.send_stream_request(params, on_chunk, on_complete, on_error)
       -- 检查请求是否已被取消（按 ESC 时），避免已取消的请求继续触发回调
       local req = state.active_requests[request_id]
       if req and req.cancelled then
+        -- 清理空闲超时定时器
+        if req.idle_timer then
+          pcall(function() req.idle_timer:stop(); req.idle_timer:close() end)
+          req.idle_timer = nil
+        end
         state.active_requests[request_id] = nil
         return
       end
@@ -699,6 +775,14 @@ function M.cancel_request(request_id)
     return
   end
   req.cancelled = true
+  -- 清理空闲超时定时器
+  if req.idle_timer then
+    pcall(function()
+      req.idle_timer:stop()
+      req.idle_timer:close()
+    end)
+    req.idle_timer = nil
+  end
   if req.temp_file then
     pcall(vim.fn.delete, req.temp_file)
   end
@@ -711,6 +795,24 @@ end
 --- 清除指定 generation_id 的请求去重缓存
 --- 用于重试场景：防止重试请求因请求体相同被去重机制拦截
 --- @param generation_id string
+--- 取消指定 generation_id 的所有活跃请求
+--- 用于双触发机制：Trigger A 触发后取消仍在进行的 HTTP 请求
+--- @param generation_id string
+function M.cancel_request_by_generation(generation_id)
+  if not generation_id then
+    return
+  end
+  local ids_to_cancel = {}
+  for request_id, req in pairs(state.active_requests) do
+    if req.generation_id == generation_id then
+      table.insert(ids_to_cancel, request_id)
+    end
+  end
+  for _, request_id in ipairs(ids_to_cancel) do
+    M.cancel_request(request_id)
+  end
+end
+
 function M.clear_request_dedup(generation_id)
   http_utils.clear_dedup(generation_id)
 end

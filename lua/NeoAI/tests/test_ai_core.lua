@@ -375,18 +375,6 @@ function M.run(test_module)
       assert.equal(nil, reason)
     end,
 
-    test_retry_detect_final_round = function()
-      local rr = require("NeoAI.core.ai.response_retry")
-      assert.is_true(
-        rr.detect_abnormal_response("", nil, { is_final_round = true }),
-        "最终轮次空内容应视为异常"
-      )
-      assert.is_false(
-        rr.detect_abnormal_response("任务完成，总结如上。", nil, { is_final_round = true }),
-        "最终轮次正常内容不应视为异常"
-      )
-    end,
-
     test_retry_delays = function()
       local rr = require("NeoAI.core.ai.response_retry")
       assert.equal(0, rr.get_retry_delay(0))
