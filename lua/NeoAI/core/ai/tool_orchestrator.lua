@@ -1072,6 +1072,25 @@ function M.on_generation_complete(data)
     local func = tc["function"] or tc.func
     if func and func.name and func.name ~= "" then
       local args = func.arguments
+      -- 尝试修复 arguments：如果是字符串，尝试 JSON 解析
+      if type(args) == "string" then
+        local ok, parsed = pcall(vim.json.decode, args)
+        if ok and type(parsed) == "table" then
+          func.arguments = parsed
+          args = parsed
+          logger.warn(
+            "[tool_orchestrator] on_generation_complete: 工具 '%s' 的 arguments 为字符串，已解析为 table",
+            func.name
+          )
+        else
+          logger.warn(
+            "[tool_orchestrator] on_generation_complete: 工具 '%s' 的 arguments 为无效 JSON 字符串，跳过该工具调用: %s",
+            func.name,
+            tostring(args):sub(1, 200)
+          )
+          goto continue
+        end
+      end
       -- 空 table {}（vim.empty_dict()）是无参数工具的合法参数，不应跳过
       if args ~= nil and type(args) == "table" and (next(args) ~= nil or vim.tbl_isempty(args)) then
         table.insert(valid_tool_calls, tc)
@@ -1083,6 +1102,7 @@ function M.on_generation_complete(data)
         )
       end
     end
+    ::continue::
   end
   tool_calls = valid_tool_calls
 
@@ -1173,9 +1193,9 @@ function M.on_generation_complete(data)
   end
 
   if #tool_calls == 0 then
-    -- AI 返回纯文本回复，直接结束（不触发总结轮次）
+    -- AI 返回纯文本回复，直接结束循环
     if #tool_calls == 0 and content and content ~= "" then
-      logger.debug("[tool_orchestrator] AI 返回纯文本回复，直接结束循环，跳过总结轮次")
+      logger.debug("[tool_orchestrator] AI 返回纯文本回复，直接结束循环")
       local assistant_msg = {
         role = "assistant",
         content = content,

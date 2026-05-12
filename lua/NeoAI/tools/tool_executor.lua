@@ -1204,15 +1204,31 @@ function M.execute_with_orchestrator(tool_name, raw_args, session_context, callb
       end
     end)
 
-    -- 包装 on_success/on_error 以清除超时
+    -- 注册审批暂停/恢复回调，确保等待审批时不计入超时
+    local ah = require("NeoAI.tools.approval_handler")
+    local unregister_pause = ah.register_pause_callback(function(is_paused)
+      if is_paused then
+        M._pause_timeout(tool_call_id)
+      else
+        M._resume_timeout(tool_call_id)
+      end
+    end)
+
+    -- 包装 on_success/on_error 以清除超时和暂停回调
     wrapped_on_success = function(result)
       M._clear_timeout(tool_call_id)
+      if unregister_pause then
+        pcall(unregister_pause)
+      end
       if original_on_result then
         original_on_result(true, result)
       end
     end
     wrapped_on_error = function(err)
       M._clear_timeout(tool_call_id)
+      if unregister_pause then
+        pcall(unregister_pause)
+      end
       if original_on_result then
         original_on_result(false, err)
       end

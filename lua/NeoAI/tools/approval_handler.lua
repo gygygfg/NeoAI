@@ -710,6 +710,9 @@ function M._show_approval_dialog(item)
   -- ===== 暂停计时：审批窗口即将打开 =====
   M.pause_timer()
 
+  -- 标记是否需要处理下一个队列项（在 WinClosed 中执行）
+  local pending_process_queue = false
+
   local open_ok, open_err = pcall(M._open_ui, tools_for_approval, {
     on_select = function(selected, extra_opts)
       extra_opts = extra_opts or {}
@@ -778,7 +781,8 @@ function M._show_approval_dialog(item)
             logger.warn("[approval_handler] on_success 回调执行失败: %s", tostring(err_call))
           end
         end
-        M.process_queue()
+        -- 工具执行完成后，通过 WinClosed 处理下一个队列项
+        pending_process_queue = true
       end
       local wrapped_on_error = function(err)
         if item.on_error then
@@ -787,7 +791,8 @@ function M._show_approval_dialog(item)
             logger.warn("[approval_handler] on_error 回调执行失败: %s", tostring(err_call))
           end
         end
-        M.process_queue()
+        -- 工具执行出错后，通过 WinClosed 处理下一个队列项
+        pending_process_queue = true
       end
 
       tool_executor._continue_execution(
@@ -867,7 +872,8 @@ function M._show_approval_dialog(item)
           end)
         end
       end
-      M.process_queue()
+      -- 取消后通过 WinClosed 处理下一个队列项
+      pending_process_queue = true
     end,
   })
 
@@ -888,6 +894,15 @@ function M._show_approval_dialog(item)
       once = true,
       callback = function()
       if approval_closed then
+        -- 窗口已被 on_select/on_cancel 主动关闭
+        -- 注意：WinClosed 在 nvim_win_close 期间同步触发，此时 _close_ui() 尚未完成清理
+        -- 使用 vim.schedule 延迟到 _close_ui() 完全执行完毕后，再处理下一个队列项
+        -- 这避免了新窗口被 _close_ui() 的后续清理误关闭
+        if pending_process_queue then
+          vim.schedule(function()
+            M.process_queue()
+          end)
+        end
         return
       end
       approval_closed = true
@@ -916,7 +931,9 @@ function M._show_approval_dialog(item)
             end)
           end
         end
-        M.process_queue()
+        vim.schedule(function()
+          M.process_queue()
+        end)
       end,
     })
   end

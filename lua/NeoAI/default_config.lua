@@ -331,6 +331,16 @@ local DEFAULT_CONFIG = {
         create_sub_agent = { auto_allow = false },
         get_sub_agent_status = { auto_allow = true },
         cancel_sub_agent = { auto_allow = true },
+        --
+        -- ===== git_tools.lua =====
+        git_diff = { auto_allow = true },
+        git_log = { auto_allow = true },
+        git_status = { auto_allow = true },
+        git_commit_detail = { auto_allow = true },
+        git_rollback = { auto_allow = false },
+        git_file_history = { auto_allow = true },
+        git_branch = { auto_allow = true },
+        git_auto_commit_config = { auto_allow = true },
       },
     },
   },
