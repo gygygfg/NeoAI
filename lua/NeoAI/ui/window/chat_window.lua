@@ -2988,6 +2988,8 @@ function M._setup_event_listeners()
         vim.schedule(function()
           tool_display_component.show_display()
           state.tool_display.window_id = tool_display_component.get_window_id()
+          -- 如果悬浮窗已存在（上一轮未关闭），立即同步新内容
+          tool_display_component._sync_display()
         end)
         _schedule_cursor_follow(150)
       else
@@ -3082,6 +3084,22 @@ function M._setup_event_listeners()
     end,
   })
 
+  -- TOOL_EXECUTION_ALL_COMPLETED：本轮所有工具执行完毕，更新悬浮窗显示完成状态
+  vim.api.nvim_create_autocmd("User", {
+    pattern = Events.TOOL_EXECUTION_ALL_COMPLETED,
+    callback = function(args)
+      if state.closing or not is_current_window((args.data or {}).window_id) then
+        return
+      end
+      if not state.tool_display.active then
+        return
+      end
+      -- 触发 tool_display 重建 buffer（_rebuild_buffer 中 _all_tools_done 为 true 时会显示等待状态）
+      tool_display_component._rebuild_buffer()
+      tool_display_component._sync_display()
+    end,
+  })
+
   -- TOOL_EXECUTION_COMPLETED：工具执行成功
   vim.api.nvim_create_autocmd("User", {
     pattern = Events.TOOL_EXECUTION_COMPLETED,
@@ -3127,6 +3145,10 @@ function M._setup_event_listeners()
   })
 
   -- TOOL_LOOP_FINISHED：工具循环结束
+  -- is_round_end=true 时：关闭悬浮窗、写入折叠文本
+  --   由工具完成触发时（AI 还在输出）：不重置 tool_loop_in_progress，不打开输入框
+  --   由 AI 完成触发时：重置 tool_loop_in_progress，打开输入框
+  -- is_round_end=false 时：不关闭悬浮窗，不写入折叠文本
   vim.api.nvim_create_autocmd("User", {
     pattern = Events.TOOL_LOOP_FINISHED,
     callback = function(args)
@@ -3138,6 +3160,8 @@ function M._setup_event_listeners()
         return
       end
 
+      local is_round_end = data.is_round_end == true
+
       -- 通过 tool_display_component 清理流式预览
       tool_display_component.clear_streaming_preview()
       state.tool_display.streaming_preview.timer = nil
@@ -3146,6 +3170,13 @@ function M._setup_event_listeners()
       state.tool_display.streaming_preview.window_shown = false
       state.tool_display.streaming_preview._pending_append = ""
       state.tool_display.preview_window_id = nil
+
+      if not is_round_end then
+        -- 非本轮结束（下一轮开始前）：不关闭悬浮窗，不写入折叠文本
+        return
+      end
+
+      -- ===== 本轮结束：关闭悬浮窗、写入折叠文本 =====
 
       if state.tool_display._finished then
         -- 即使 _finished=true，如果 results 有新增，更新 state.messages 和 buffer 中的折叠文本
@@ -3238,13 +3269,21 @@ function M._setup_event_listeners()
         session_id = data.session_id,
         generation_id = data.generation_id,
       })
-      state.tool_loop_in_progress = false
 
-      M._open_float_input()
-      local chat_handlers = require("NeoAI.ui.handlers.chat_handlers")
-      if virtual_input.is_active() and chat_handlers.get_should_follow() then
-        virtual_input.focus_and_insert()
+      -- 根据触发来源决定后续行为
+      -- trigger_source="tools_complete"：工具完成触发，AI 还在输出
+      --   不重置 tool_loop_in_progress，不打开输入框（由后续 GENERATION_COMPLETED 处理）
+      -- trigger_source="ai_complete"：AI 完成触发
+      --   重置 tool_loop_in_progress，打开输入框
+      if data.trigger_source == "ai_complete" then
+        state.tool_loop_in_progress = false
+        M._open_float_input()
+        local chat_handlers = require("NeoAI.ui.handlers.chat_handlers")
+        if virtual_input.is_active() and chat_handlers.get_should_follow() then
+          virtual_input.focus_and_insert()
+        end
       end
+      -- tools_complete 触发时不操作，由后续 GENERATION_COMPLETED 处理
     end,
   })
 

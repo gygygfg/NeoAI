@@ -641,8 +641,29 @@ end
 --- 重建显示 buffer
 --- 已完成（completed/error）的工具行自动移除，只显示未完成或正在执行的工具
 function M._rebuild_buffer()
+  -- 所有工具完成时更新 buffer 显示完成状态，保留工具列表供用户查看
+  -- 由 TOOL_LOOP_FINISHED(is_round_end=true) 事件统一负责关闭悬浮窗
   if M._all_tools_done() then
-    state.buffer = ""
+    local text = "🔧 工具调用完成，等待 AI 响应...\n"
+    for _, pack_name in ipairs(state.pack_order) do
+      local pack = state.packs[pack_name]
+      if not pack then break end
+
+      local icon = tool_pack.get_pack_icon(pack_name)
+      local display_name = tool_pack.get_pack_display_name(pack_name)
+      text = text .. "\n" .. icon .. " " .. display_name .. "\n"
+      for _, t in ipairs(pack.tools) do
+        local status_icon = "✅"
+        local status_text = string.format("(%.1fs)", t.duration or 0)
+        if t.status == "error" then
+          status_icon = "❌"
+          status_text = string.format("(失败, %.1fs)", t.duration or 0)
+        end
+        text = text .. "  " .. status_icon .. " " .. t.name .. " " .. status_text .. "\n"
+      end
+    end
+    text = text .. "\n⏳ 等待 AI 处理工具结果..."
+    state.buffer = text
     return
   end
 

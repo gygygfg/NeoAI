@@ -68,7 +68,10 @@ end
 
 --- 触发 TOOL_LOOP_FINISHED 事件
 --- 使用 pcall 保护，避免在 fast event 上下文中调用失败
-local function fire_loop_finished(ss)
+--- @param ss table 会话状态
+--- @param is_round_end boolean|nil 是否为本轮真正结束（所有工具和 AI 都完成）
+--- @param trigger_source string|nil 触发来源："tools_complete"（工具完成）、"ai_complete"（AI 完成）
+local function fire_loop_finished(ss, is_round_end, trigger_source)
   if not ss then
     return
   end
@@ -85,6 +88,8 @@ local function fire_loop_finished(ss)
       iteration_count = ss.current_iteration,
       session_id = ss.session_id,
       window_id = ss.window_id,
+      is_round_end = is_round_end == true,
+      trigger_source = trigger_source or "tools_complete",
     },
   })
   if not ok then
@@ -106,6 +111,7 @@ local function fire_loop_finished(ss)
           iteration_count = ss.current_iteration,
           session_id = ss.session_id,
           window_id = ss.window_id,
+          is_round_end = is_round_end == true,
         },
       })
     end)
@@ -815,6 +821,20 @@ function M._on_tools_complete(session_id, is_sub_agent)
     return
   end
 
+  -- 触发 TOOL_EXECUTION_ALL_COMPLETED 事件，通知 tool_display 所有工具执行完毕
+  -- 让悬浮窗显示"等待 AI 响应..."状态
+  if not is_shutting_down() then
+    pcall(vim.api.nvim_exec_autocmds, "User", {
+      pattern = event_constants.TOOL_EXECUTION_ALL_COMPLETED,
+      data = {
+        generation_id = ss.generation_id,
+        session_id = ss.session_id,
+        window_id = ss.window_id,
+        iteration = ss.current_iteration,
+      },
+    })
+  end
+
   -- 调试日志：追踪 _on_tools_complete 调用
   require("NeoAI.utils.logger").debug("[DEBUG_DUP] _on_tools_complete: session=%s, phase=%s, iter=%d, _tools_complete_in_progress=%s, active_count=%d, stack=%s",
     tostring(session_id),
@@ -844,7 +864,7 @@ function M._on_tools_complete(session_id, is_sub_agent)
       local saved_gen_id = ss.generation_id
       local saved_win_id = ss.window_id
       local saved_reasoning = ss.last_reasoning or ""
-      fire_loop_finished(ss)
+      fire_loop_finished(ss, true, "tools_complete")
       once_display_closed(session_id, function()
         local s = sessions_table[session_id]
         if not s then
@@ -873,13 +893,14 @@ function M._on_tools_complete(session_id, is_sub_agent)
       end)
       return
     end
-    fire_loop_finished(ss)
+    fire_loop_finished(ss, true, "tools_complete")
     return
   end
 
   if ss.phase == "waiting_tools" then
     ss.phase = "waiting_model"
-    fire_loop_finished(ss)
+    -- 工具执行完毕不关闭悬浮窗，等待 AI 输出完成后统一关闭
+    fire_loop_finished(ss, false, "tools_complete")
     once_display_closed(session_id, function()
       local s = sessions_table[session_id]
       if not s then
@@ -972,7 +993,7 @@ function M._proceed_to_next_round(session_id, is_sub_agent)
     return
   end
 
-  fire_loop_finished(ss)
+  fire_loop_finished(ss, false, "tools_complete")
   ss.current_iteration = ss.current_iteration + 1
   ss.phase = "waiting_model"
   ss._proceed_in_progress = false
@@ -1203,7 +1224,7 @@ function M.on_generation_complete(data)
       ss.active_tool_calls = {}
       ss.current_iteration = 0
       ss.generation_id = nil
-      fire_loop_finished(ss)
+      fire_loop_finished(ss, true, "ai_complete")
       once_display_closed(session_id, function()
         local s = sessions_table[session_id]
         if not s then
@@ -1246,7 +1267,7 @@ function M.on_generation_complete(data)
       ss.active_tool_calls = {}
       ss.current_iteration = 0
       ss.generation_id = nil
-      fire_loop_finished(ss)
+      fire_loop_finished(ss, true, "ai_complete")
       once_display_closed(session_id, function()
         local s = sessions_table[session_id]
         if not s then
@@ -1296,7 +1317,7 @@ function M.on_generation_complete(data)
 
   ss.current_iteration = ss.current_iteration + 1
 
-  fire_loop_finished(ss)
+  fire_loop_finished(ss, false, "ai_complete")
   once_display_closed(session_id, function()
     local s = sessions_table[session_id]
     if not s then
