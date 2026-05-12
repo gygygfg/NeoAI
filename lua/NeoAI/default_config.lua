@@ -250,6 +250,10 @@ local DEFAULT_CONFIG = {
     builtin = true,
     external = {},
 
+    git = {
+      auto_commit = false,
+    },
+
     -- 工具审批配置
     -- 用户可通过此配置覆盖各工具的审批行为
     -- 默认行为：所有工具使用其自身注册时的 approval.auto_allow
