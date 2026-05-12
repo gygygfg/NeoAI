@@ -831,11 +831,6 @@ function M._on_tools_complete(session_id, is_sub_agent)
   ss._tools_complete_in_progress = true
 
   if ss.stop_requested then
-    -- 停止时关闭工具调用悬浮窗
-    pcall(function()
-      local tool_display = require("NeoAI.ui.components.tool_display")
-      tool_display._close_display()
-    end)
     ss.phase = "idle"
     ss._tools_complete_in_progress = false
     -- 退出时直接跳过，不触发任何事件或总结
@@ -922,11 +917,6 @@ function M._check_round_complete(session_id, is_sub_agent)
   local active_count = vim.tbl_count(ss.active_tool_calls)
 
   if ss.stop_requested then
-    -- 停止时关闭工具调用悬浮窗
-    pcall(function()
-      local tool_display = require("NeoAI.ui.components.tool_display")
-      tool_display._close_display()
-    end)
     ss.phase = "idle"
     return
   end
@@ -978,11 +968,6 @@ function M._proceed_to_next_round(session_id, is_sub_agent)
   ss.active_tool_calls = {}
 
   if ss.stop_requested then
-    -- 停止时关闭工具调用悬浮窗
-    pcall(function()
-      local tool_display = require("NeoAI.ui.components.tool_display")
-      tool_display._close_display()
-    end)
     ss._proceed_in_progress = false
     return
   end
@@ -1195,7 +1180,7 @@ function M.on_generation_complete(data)
   if #tool_calls == 0 then
     -- AI 返回纯文本回复，直接结束循环
     if #tool_calls == 0 and content and content ~= "" then
-      logger.debug("[tool_orchestrator] AI 返回纯文本回复，直接结束循环")
+      logger.debug("[tool_orchestrator] AI 返回纯文本回复，直接结束循环，跳过总结轮次")
       local assistant_msg = {
         role = "assistant",
         content = content,
@@ -1227,11 +1212,13 @@ function M.on_generation_complete(data)
         if is_shutting_down() then
           return
         end
+        -- 触发 GENERATION_COMPLETED 事件但传入空 response，
+        -- 这样 chat_window 不会渲染 AI 总结文本，但会显示用量和弹出输入框
         pcall(vim.api.nvim_exec_autocmds, "User", {
           pattern = event_constants.GENERATION_COMPLETED,
           data = {
             generation_id = saved_gen_id,
-            response = content,
+            response = "",
             reasoning_text = saved_reasoning,
             usage = saved_usage,
             session_id = session_id,
@@ -1490,12 +1477,6 @@ function M._finish_loop(session_id, success, result, is_sub_agent)
   if not ss then
     return
   end
-
-  -- 循环结束，关闭工具调用悬浮窗
-  pcall(function()
-    local tool_display = require("NeoAI.ui.components.tool_display")
-    tool_display._close_display()
-  end)
 
   -- 子 agent 完成：直接结束，不触发总结轮次
   if is_sub_agent then

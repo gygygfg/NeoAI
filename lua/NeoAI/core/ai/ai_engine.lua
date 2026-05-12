@@ -67,6 +67,8 @@ function _setup_event_listeners()
     pattern = event_constants.CANCEL_GENERATION,
     callback = function() M.cancel_generation() end,
   })
+  -- TOOL_CALLS_READY 事件监听器（保留但不再触发提前结束）
+  -- 流式接收将持续到 finish_reason 到达，不再由双触发机制提前结束
   state.event_listeners.tool_calls_ready = vim.api.nvim_create_autocmd("User", {
     pattern = event_constants.TOOL_CALLS_READY,
     callback = function(args)
@@ -79,20 +81,11 @@ function _setup_event_listeners()
         return
       end
       local processor = gen._stream_processor
-      if not processor or not processor._json_complete then
+      if not processor then
         return
       end
-      -- Trigger B 触发：工具调用 JSON 已完整，结束流式处理
-      logger.debug("[ai_engine] Trigger B 事件触发：工具调用 JSON 已完整，结束流式处理")
-      -- 从协程共享表获取 params（_handle_stream_end 内部会设 _stream_end_handled 防重入）
-      local shared = state_manager.get_shared() or {}
-      local params = {
-        session_id = data.session_id or shared.session_id,
-        window_id = data.window_id or shared.window_id,
-        is_tool_loop = processor.is_tool_loop or false,
-        _sub_agent_id = shared._sub_agent_id,
-      }
-      _handle_stream_end(data.generation_id, processor, params)
+      -- 仅记录日志，不再触发提前结束
+      logger.debug("[ai_engine] TOOL_CALLS_READY 事件到达（不再触发提前结束，等待 finish_reason）")
     end,
   })
 end
@@ -323,47 +316,25 @@ end
 
 -- ========== 流式处理 ==========
 function _handle_stream_chunk(generation_id, data, processor, params)
-  -- 如果处理器已标记完成（Trigger A/B 已触发），跳过后续处理
+  -- 如果处理器已标记完成（finish_reason 已到达），只处理 usage 数据
   if processor.is_finished then
+    local result = stream_processor.process_chunk(processor, data)
+    if result and result.usage then
+      local gen = state.active_generations[generation_id]
+      if gen then
+        gen.accumulated_usage = result.usage
+      end
+    end
     return
   end
 
-  -- 处理空闲超时标记
+  -- 处理空闲超时标记（不再提前结束流式接收，仅记录日志）
   if data._idle_timeout then
-    logger.debug("[ai_engine] 收到空闲超时标记: generation_id=%s, 尝试格式化工具调用", generation_id)
     local finalized = stream_processor.try_finalize_tool_calls(processor)
     if finalized then
-      -- 格式化成功，视为 AI 传输完成
-      logger.debug("[ai_engine] 空闲超时后成功格式化 %d 个工具调用，视为传输完成", #finalized)
-      -- 将格式化后的工具调用写回 processor
-      processor.tool_calls = finalized
-      -- 设置 is_finished 标志，让 _handle_stream_end 正常处理
-      processor.is_finished = true
-      -- 触发 _handle_stream_end
-      _handle_stream_end(generation_id, processor, params)
+      logger.debug("[ai_engine] 空闲超时但工具调用已完整，等待 finish_reason 确认: %d 个工具调用", #finalized)
     else
-      -- 格式化失败，JSON 不完整，需要重试
-      logger.debug("[ai_engine] 空闲超时后格式化工具调用失败，重新请求 AI")
-      -- 清除去重缓存，确保重试请求不被拦截
-      http_client.clear_request_dedup(generation_id)
-      -- 获取保存的请求并重新发送
-      local gen = state.active_generations[generation_id]
-      if gen and gen._last_request then
-        local saved_request = gen._last_request
-        -- 递增重试计数
-        gen.retry_count = (gen.retry_count or 0) + 1
-        -- 延迟 500ms 后重试
-        vim.defer_fn(function()
-          if not state.active_generations or not state.active_generations[generation_id] then
-            return
-          end
-          logger.debug("[ai_engine] 空闲超时重试: generation_id=%s, retry_count=%d",
-            generation_id, gen.retry_count)
-          _send_stream_request(generation_id, saved_request, params)
-        end, 500)
-      else
-        logger.warn("[ai_engine] 空闲超时但找不到保存的请求，无法重试")
-      end
+      logger.debug("[ai_engine] 空闲超时但工具调用不完整，继续等待后续数据")
     end
     return
   end
@@ -395,15 +366,9 @@ function _handle_stream_chunk(generation_id, data, processor, params)
     })
   end
 
-  -- ===== 双触发逻辑：Trigger A 标记工具调用已就绪，立即结束流式处理 =====
-  if result._tool_calls_ready then
-    logger.debug("[ai_engine] Trigger A 触发：工具调用 JSON 已完整，提前结束流式处理")
-    -- 清理 Trigger B 定时器（互斥）
-    stream_processor._cancel_trigger_b(processor)
-    -- 立即触发流式结束处理（_handle_stream_end 内部会设 _stream_end_handled 防重入）
-    _handle_stream_end(generation_id, processor, params)
-    return
-  end
+  -- ===== 工具调用累积（不提前结束流式接收） =====
+  -- AI 可能在一轮中输出多个工具调用，流式接收将持续到 finish_reason 到达
+  -- 所有工具调用参数会在 stream_processor 中持续累积拼接
 end
 
 function _handle_stream_end(generation_id, processor, params)

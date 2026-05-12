@@ -33,12 +33,9 @@ function M.create_processor(generation_id, session_id, window_id, is_tool_loop)
     is_tool_loop = is_tool_loop or false,
     start_time = os.time(),
     is_finished = false,
-    -- 双触发机制状态
+    -- 工具调用累积状态（用于调试和完整性检查）
     _json_depth = 0,           -- 当前 JSON 嵌套深度（{+1, }-1）
-    _json_depth_changed = false, -- 深度是否曾发生过变化（防止空字符串误触发）
-    _json_complete = false,    -- JSON 是否已完成（depth=0 且解析成功）
-    _trigger_b_timer = nil,    -- Trigger B 定时器
-    _trigger_b_scheduled = false, -- 是否已调度 Trigger B
+    _json_depth_changed = false, -- 深度是否曾发生过变化
   }
 end
 
@@ -46,8 +43,16 @@ end
 --- 注意：tool_calls 中的 arguments 字段在 http_client 中已解析为 Lua table
 --- 流式场景中，每个数据块的 arguments 是部分 table，需要逐块合并
 function M.process_chunk(processor, data)
-  if processor.is_finished then return nil end
   local result = { content = nil, reasoning_content = nil, tool_calls = nil, tool_calls_delta = nil, is_final = false }
+
+  -- 如果已标记完成，只处理 usage 数据（某些 API 在 finish_reason 后发送 usage）
+  if processor.is_finished then
+    if data.usage then
+      processor.usage = data.usage
+      result.usage = data.usage
+    end
+    return result
+  end
 
   if data.choices and #data.choices > 0 then
     local choice = data.choices[1]
@@ -143,8 +148,6 @@ function M.process_chunk(processor, data)
     if choice.finish_reason then
       result.is_final = true
       processor.is_finished = true
-      -- 流式正常结束，清理 Trigger B
-      M._cancel_trigger_b(processor)
     end
   end
   if data.usage then
@@ -152,35 +155,10 @@ function M.process_chunk(processor, data)
     result.usage = data.usage
   end
 
-  -- ===== 双触发逻辑：检查 JSON 深度并尝试提前完成工具调用 =====
+  -- ===== 工具调用累积日志（仅调试用，不打断流式接收） =====
   if result.tool_calls_delta and #result.tool_calls_delta > 0 then
-    -- Trigger A：接收到数据时立即检查
-    if M._check_json_depth_zero(processor) then
-      -- 深度为 0 但深度从未变化过（如空字符串占位），不触发，等待后续数据
-      if not processor._json_depth_changed then
-        M._schedule_trigger_b(processor)
-      else
-        -- 深度为 0 且深度曾变化过，尝试格式化
-        local finalized = M.try_finalize_tool_calls(processor)
-        if finalized then
-          -- 直接触发结束，让 ai_engine 处理已累积的工具调用
-          -- 如果后续还有工具调用数据到达，它们会被 http_client 缓冲
-          -- 并在下一轮工具循环中被处理
-          processor._json_complete = true
-          processor.tool_calls = finalized
-          processor.is_finished = true
-          M._cancel_trigger_b(processor)
-          -- 在 result 中标记提前完成，让 ai_engine 知道可以结束
-          result._tool_calls_ready = true
-          logger.debug("[stream_processor] Trigger A: JSON 深度为0且解析成功，提前完成工具调用")
-        else
-          -- 深度为 0 但格式化失败，仍需调度 Trigger B 等待后续数据
-          M._schedule_trigger_b(processor)
-        end
-      end
-    else
-      -- JSON 深度不为 0，调度 Trigger B（延迟检查）
-      M._schedule_trigger_b(processor)
+    if M._check_json_depth_zero(processor) and processor._json_depth_changed then
+      logger.debug("[stream_processor] 工具调用 JSON 深度为0，等待 finish_reason")
     end
   end
 
@@ -280,77 +258,8 @@ function M._check_json_depth_zero(processor)
   return processor._json_depth == 0
 end
 
---- 调度 Trigger B：在下一个事件循环 tick 中检查 JSON 是否完成
---- 与 Trigger A 互斥——如果 Trigger A 已标记完成，Trigger B 会跳过
---- @param processor table 流式处理器实例
-function M._schedule_trigger_b(processor)
-  if not processor or processor._trigger_b_scheduled or processor._json_complete then
-    return
-  end
-  processor._trigger_b_scheduled = true
-  processor._trigger_b_timer = vim.defer_fn(function()
-    if not processor or processor._json_complete or processor.is_finished then
-      return
-    end
-    processor._trigger_b_scheduled = false
-    processor._trigger_b_timer = nil
-
-    -- Trigger B：接收到数据后检查 JSON 是否完成
-    logger.debug("[stream_processor] Trigger B: 延迟检查 JSON 深度=%d, depth_changed=%s, is_finished=%s",
-      processor._json_depth, tostring(processor._json_depth_changed), tostring(processor.is_finished))
-    
-    -- 如果 processor 已被 finish_reason 标记为完成，不触发提前结束
-    if processor.is_finished then
-      logger.debug("[stream_processor] Trigger B: processor 已标记完成（finish_reason 已到达），跳过")
-      return
-    end
-    
-    if M._check_json_depth_zero(processor) and processor._json_depth_changed then
-      local finalized = M.try_finalize_tool_calls(processor)
-      if finalized then
-        -- 直接触发结束，让 ai_engine 处理已累积的工具调用
-        processor._json_complete = true
-        processor.tool_calls = finalized
-        processor.is_finished = true
-        logger.debug("[stream_processor] Trigger B: JSON 深度为0且解析成功，提前完成工具调用")
-        -- 触发 TOOL_CALLS_READY 事件，通知 ai_engine 结束流式处理
-        pcall(vim.api.nvim_exec_autocmds, "User", {
-          pattern = event_constants.TOOL_CALLS_READY,
-          data = {
-            generation_id = processor.generation_id,
-            session_id = processor.session_id,
-            window_id = processor.window_id,
-          },
-        })
-      end
-    end
-  end, 0)
-end
-
---- 取消 Trigger B 定时器
---- @param processor table 流式处理器实例
-function M._cancel_trigger_b(processor)
-  if not processor then
-    return
-  end
-  if processor._trigger_b_timer then
-    pcall(function()
-      if processor._trigger_b_timer:is_active() then
-        processor._trigger_b_timer:stop()
-      end
-      if not processor._trigger_b_timer:is_closing() then
-        processor._trigger_b_timer:close()
-      end
-    end)
-    processor._trigger_b_timer = nil
-  end
-  processor._trigger_b_scheduled = false
-end
-
 --- 尝试格式化当前累积的工具调用 arguments
---- 在流式超时后调用：如果所有工具调用的 arguments JSON 都能成功解析，
---- 则视为 AI 传输完成，返回格式化后的 tool_calls
---- 如果解析失败（JSON 不完整），返回 nil 表示需要重试
+--- 在流式结束后调用：将所有工具调用的 arguments 从字符串解析为 Lua table
 --- @param processor table 流式处理器实例
 --- @return table|nil 格式化成功的 tool_calls，或 nil
 function M.try_finalize_tool_calls(processor)
@@ -362,13 +271,13 @@ function M.try_finalize_tool_calls(processor)
   for _, tc in ipairs(processor.tool_calls) do
     local func = tc["function"] or tc.func
     if not func or not func.name or func.name == "" then
-      -- 工具名称为空，无法完成
+      -- 工具名称为空，跳过（可能是不完整的流式片段）
+      logger.debug("[stream_processor] try_finalize_tool_calls: 跳过名称为空的工具调用")
       return nil
     end
 
     local args = func.arguments
     if type(args) == "string" and args ~= "" then
-      -- 尝试解析累积的 JSON 字符串
       local ok, parsed = pcall(vim.json.decode, args)
       if ok and type(parsed) == "table" then
         func.arguments = parsed
@@ -381,13 +290,9 @@ function M.try_finalize_tool_calls(processor)
       end
     end
 
-    -- 检查 arguments 是否有效
     if args == nil then
       logger.debug("[stream_processor] try_finalize_tool_calls: 工具 '%s' 的 arguments 为 nil", func.name)
       return nil
-    end
-    if type(args) == "table" and not next(args) and not vim.tbl_isempty(args) then
-      -- 空 table {} 是合法参数（无参数工具），允许通过
     end
 
     table.insert(finalized, tc)
@@ -416,23 +321,21 @@ function M.clear_reasoning_throttle()
   _reasoning_throttle.params = nil
 end
 
---- 清理处理器中的双触发状态（包括 Trigger B 定时器）
+--- 清理处理器中的工具调用状态
 --- @param processor table|nil 流式处理器实例
 function M.clear_dual_trigger_state(processor)
   if not processor then
     return
   end
-  M._cancel_trigger_b(processor)
   processor._json_depth = 0
   processor._json_depth_changed = false
-  processor._json_complete = false
 end
 
---- 检查处理器是否已通过双触发机制提前完成
+--- 检查处理器是否已完成（兼容接口）
 --- @param processor table 流式处理器实例
 --- @return boolean
 function M.is_tool_calls_ready(processor)
-  return processor and processor._json_complete and not processor.is_finished
+  return processor and processor.is_finished
 end
 
 return M

@@ -254,10 +254,8 @@ local function _schedule_refresh()
     if not state.active or not state.window_id then return end
     M._rebuild_buffer()
     M._sync_display()
-    -- 检查是否所有工具都已完成，立即关闭
-    if M._all_tools_done() then
-      M._close_display()
-    end
+    -- 不再自动关闭悬浮窗，由 TOOL_LOOP_FINISHED 事件统一负责关闭
+    -- 避免在 TOOL_EXECUTION_COMPLETED 回调更新折叠文本时因 window_id 为 nil 而失败
   end)
 end
 
@@ -655,7 +653,8 @@ function M._rebuild_buffer()
       break
     end
 
-    -- 检查该包是否有未完成的工具
+    -- 显示所有工具（包括已完成的），让用户看到完整的工具调用列表
+    -- 不再跳过已完成的工具包
     local has_active = false
     for _, t in ipairs(pack.tools) do
       if t.status ~= "completed" and t.status ~= "error" then
@@ -663,18 +662,12 @@ function M._rebuild_buffer()
         break
       end
     end
-    if not has_active then
-      goto continue_pack
-    end
 
     local icon = tool_pack.get_pack_icon(pack_name)
     local display_name = tool_pack.get_pack_display_name(pack_name)
     text = text .. "\n" .. icon .. " " .. display_name .. "\n"
     for _, t in ipairs(pack.tools) do
-      if t.status == "completed" or t.status == "error" then
-        goto next_tool
-      end
-
+      -- 不再跳过已完成的工具，显示所有工具的状态
       local status_icon = "⏳"
       local status_text = "等待中"
       if t.status == "executing" then
@@ -721,9 +714,7 @@ function M._rebuild_buffer()
           text = text .. prefix .. ss_icon .. " " .. s.name .. " " .. ss_text .. "\n"
         end
       end
-      ::next_tool::
     end
-    ::continue_pack::
   end
   state.buffer = text
 end

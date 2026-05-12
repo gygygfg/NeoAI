@@ -446,6 +446,8 @@ local function _format_remaining_content(content)
   return lines
 end
 
+--- 更新 buffer 中已有的折叠文本内容
+--- 找到 buffer 中第一个 {{{ 到最后一个 }}} 的范围，替换为新的折叠文本
 --- 在 buffer 内容变化之前检测光标是否在末尾附近（后5行内）
 --- 调用方必须在修改 buffer 内容之前调用此函数，将结果缓存到协程共享表
 --- 这样即使内容变化后 foldmethod=marker 改变了光标位置，也能正确判断是否应该跟随
@@ -559,6 +561,74 @@ local function _schedule_cursor_follow(delay_ms)
     -- 因为 should_follow 已在 buffer 内容变化前缓存，无需等待下一个 tick
     _do_cursor_follow()
   end
+end
+
+--- 更新 buffer 中已有的折叠文本内容
+--- 找到 buffer 中第一个 {{{ 到最后一个 }}} 的范围，替换为新的折叠文本
+--- @param folded_text string 新的折叠文本
+--- @param window_id string|nil 可选，指定目标窗口 ID
+local function _update_folded_text_in_buffer(folded_text, window_id)
+  local target_window_id = window_id or state.current_window_id
+  if not target_window_id or not folded_text or folded_text == "" then
+    return
+  end
+
+  local buf = window_manager.get_window_buf(target_window_id)
+  if not buf or not vim.api.nvim_buf_is_valid(buf) then
+    return
+  end
+
+  if not _is_chat_buffer(buf) then
+    return
+  end
+
+  -- 查找 buffer 中第一个 {{{ 和最后一个 }}}
+  local lc = vim.api.nvim_buf_line_count(buf)
+  local start_line = nil
+  local end_line = nil
+  for i = 0, lc - 1 do
+    local line = vim.api.nvim_buf_get_lines(buf, i, i + 1, false)[1] or ""
+    if not start_line and line:find("^{{{") then
+      start_line = i
+    end
+    if line == "}}}" then
+      end_line = i
+    end
+  end
+
+  if start_line == nil or end_line == nil then
+    return
+  end
+
+  -- 使用 _render_single_message 生成新的折叠文本行
+  local msg = { role = "assistant", content = folded_text }
+  local new_lines = M._render_single_message(msg, nil)
+  if #new_lines == 0 then
+    return
+  end
+
+  -- 在修改 buffer 内容之前缓存光标位置
+  _check_cursor_near_end()
+  set_buf_modifiable(buf, true)
+
+  -- 替换从 start_line 到 end_line+1（包含 }}} 行）的内容
+  local old_count = end_line + 1 - start_line
+  local new_count = #new_lines
+  if new_count > old_count then
+    local insert_count = new_count - old_count
+    local insert_lines = {}
+    for _ = 1, insert_count do
+      table.insert(insert_lines, "")
+    end
+    vim.api.nvim_buf_set_lines(buf, end_line + 1, end_line + 1, false, insert_lines)
+  elseif new_count < old_count then
+    local delete_count = old_count - new_count
+    vim.api.nvim_buf_set_lines(buf, end_line + 1 - delete_count, end_line + 1, false, {})
+  end
+  vim.api.nvim_buf_set_lines(buf, start_line, start_line + new_count, false, new_lines)
+  vim.api.nvim_set_option_value("modified", false, { buf = buf })
+
+  _schedule_cursor_follow()
 end
 
 local function get_chat_service()
@@ -2960,6 +3030,23 @@ function M._setup_event_listeners()
         pack_name = data.pack_name,
       })
       tool_display_component.add_result(state.tool_display.results[#state.tool_display.results])
+
+      -- 如果折叠文本已写入 buffer，每次工具完成时更新 buffer 中的折叠文本
+      if state.tool_display.folded_saved then
+        local folded_text = tool_display_component.build_folded_text()
+        if folded_text ~= "" then
+          -- 更新 state.messages 中的折叠文本
+          for i = #state.messages, 1, -1 do
+            if state.messages[i].role == "assistant" and (state.messages[i].content or ""):find("^{{{") then
+              state.messages[i].content = folded_text
+              break
+            end
+          end
+          -- 更新 buffer 中的折叠文本
+          _update_folded_text_in_buffer(folded_text, data.window_id)
+        end
+      end
+
       if not state.tool_display.active then
         return
       end
@@ -3012,6 +3099,23 @@ function M._setup_event_listeners()
         pack_name = data.pack_name,
       })
       tool_display_component.add_result(state.tool_display.results[#state.tool_display.results])
+
+      -- 如果折叠文本已写入 buffer，每次工具完成时更新 buffer 中的折叠文本
+      if state.tool_display.folded_saved then
+        local folded_text = tool_display_component.build_folded_text()
+        if folded_text ~= "" then
+          -- 更新 state.messages 中的折叠文本
+          for i = #state.messages, 1, -1 do
+            if state.messages[i].role == "assistant" and (state.messages[i].content or ""):find("^{{{") then
+              state.messages[i].content = folded_text
+              break
+            end
+          end
+          -- 更新 buffer 中的折叠文本
+          _update_folded_text_in_buffer(folded_text, data.window_id)
+        end
+      end
+
       if not state.tool_display.active then
         return
       end
@@ -3044,6 +3148,30 @@ function M._setup_event_listeners()
       state.tool_display.preview_window_id = nil
 
       if state.tool_display._finished then
+        -- 即使 _finished=true，如果 results 有新增，更新 state.messages 和 buffer 中的折叠文本
+        -- 但不重新追加新消息（避免重复），只更新已有内容
+        local results = state.tool_display.results or {}
+        if #results > 0 then
+          local folded_text = tool_display_component.build_folded_text()
+          if folded_text ~= "" then
+            -- 更新 state.messages 中的折叠文本
+            for i = #state.messages, 1, -1 do
+              if state.messages[i].role == "assistant" and (state.messages[i].content or ""):find("^{{{") then
+                state.messages[i].content = folded_text
+                break
+              end
+            end
+            -- 更新 buffer 中已有的折叠文本（如果之前已写入 buffer）
+            if state.tool_display.folded_saved then
+              _update_folded_text_in_buffer(folded_text, data.window_id)
+            end
+          end
+        end
+        -- 确保悬浮窗关闭
+        if state.tool_display.active then
+          close_tool_display()
+        end
+        state.tool_display.active = false
         fire_event(Events.TOOL_DISPLAY_CLOSED, {
           window_id = data.window_id,
           session_id = data.session_id,
@@ -3055,10 +3183,18 @@ function M._setup_event_listeners()
 
       clear_stream_throttle()
 
+      -- 调试日志：打印 results 数量
+      local debug_results = state.tool_display.results or {}
+      require("NeoAI.utils.logger").debug("[TOOL_LOOP_FINISHED] results count=%d, folded_saved=%s", #debug_results, tostring(state.tool_display.folded_saved))
+      for _, dr in ipairs(debug_results) do
+        require("NeoAI.utils.logger").debug("[TOOL_LOOP_FINISHED]   tool=%s, pack=%s", dr.tool_name or "nil", dr.pack_name or "nil")
+      end
+
       -- 生成折叠文本并写入缓冲区
       local results = state.tool_display.results or {}
       if #results > 0 or state.tool_display.buffer ~= "" then
         local folded_text = tool_display_component.build_folded_text()
+        require("NeoAI.utils.logger").debug("[TOOL_LOOP_FINISHED] folded_text length=%d, contains %d {{{ blocks", #folded_text, select(2, folded_text:gsub("{{{", "")))
         if folded_text == "" then
           folded_text = "{{{ 🔧 工具调用\n  ❌ 所有工具调用均失败\n}}}"
         end
@@ -3088,7 +3224,15 @@ function M._setup_event_listeners()
 
       state.tool_display.active = false
       close_reasoning_display()
+      -- 记录折叠文本是否已通过 _append_message_to_buffer 写入缓冲区
+      -- 必须在 reset_streaming_state 之前读取，因为 reset_streaming_state 会重置 streaming 状态
+      local folded_already_appended = state.tool_display.folded_saved
       reset_streaming_state()
+      -- 如果折叠文本已写入缓冲区，设置 prefix_added 标记
+      -- 这样后续 GENERATION_COMPLETED 回调中 had_stream_prefix 为 true，避免重复追加
+      if folded_already_appended then
+        state.streaming.prefix_added = true
+      end
       fire_event(Events.TOOL_DISPLAY_CLOSED, {
         window_id = data.window_id,
         session_id = data.session_id,
