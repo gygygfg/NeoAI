@@ -193,6 +193,8 @@ local function create_session_state(session_id, window_id)
     stop_requested = false,
     user_cancelled = false, -- 用户主动取消标志
     _tool_retry_count = 0, -- 工具调用重试计数
+    _generation_completed = false, -- GENERATION_COMPLETED 事件是否已到达
+    _tools_all_completed = false, -- TOOL_EXECUTION_ALL_COMPLETED 事件是否已到达
     on_complete = nil,
     autocmd_ids = {},
   }
@@ -395,6 +397,9 @@ function M.start_async_loop(params)
 
   ss.current_iteration = 1
   ss._tool_retry_count = 0
+  -- start_async_loop 由 ai_engine 在 AI 生成完成后调用，标记 AI 生成已完成
+  ss._generation_completed = true
+  ss._tools_all_completed = false
 
   -- 注册全局 ESC 停止监听器（仅在循环开始时注册一次）
   if not _stop_listener_id then
@@ -835,6 +840,9 @@ function M._on_tools_complete(session_id, is_sub_agent)
     })
   end
 
+  -- 标记 TOOL_EXECUTION_ALL_COMPLETED 已到达
+  ss._tools_all_completed = true
+
   -- 调试日志：追踪 _on_tools_complete 调用
   require("NeoAI.utils.logger").debug("[DEBUG_DUP] _on_tools_complete: session=%s, phase=%s, iter=%d, _tools_complete_in_progress=%s, active_count=%d, stack=%s",
     tostring(session_id),
@@ -853,6 +861,8 @@ function M._on_tools_complete(session_id, is_sub_agent)
   if ss.stop_requested then
     ss.phase = "idle"
     ss._tools_complete_in_progress = false
+    ss._generation_completed = false
+    ss._tools_all_completed = false
     -- 退出时直接跳过，不触发任何事件或总结
     if is_shutting_down() then
       return
@@ -914,15 +924,17 @@ function M._on_tools_complete(session_id, is_sub_agent)
       end
       if s.stop_requested then
         logger.debug(
-          "[tool_orchestrator] _on_tools_complete: once_display_closed 回调中检测到 stop_requested，跳过 _request_generation"
+          "[tool_orchestrator] _on_tools_complete: once_display_closed 回调中检测到 stop_requested，跳过 _check_round_complete"
         )
         return
       end
-      M._request_generation(session_id, is_sub_agent)
+      -- 工具全部完成，检查是否两个事件都已到达，决定是否开启下一轮
+      M._check_round_complete(session_id, is_sub_agent)
     end)
   elseif ss.phase == "round_complete" then
     ss._tools_complete_in_progress = false
-    M._proceed_to_next_round(session_id, is_sub_agent)
+    -- 本轮已完成，由 _check_round_complete 决定是否开启下一轮
+    M._check_round_complete(session_id, is_sub_agent)
   else
     ss._tools_complete_in_progress = false
   end
@@ -935,33 +947,45 @@ function M._check_round_complete(session_id, is_sub_agent)
     return
   end
 
-  local active_count = vim.tbl_count(ss.active_tool_calls)
-
   if ss.stop_requested then
     ss.phase = "idle"
     return
   end
 
-  if ss.phase == "waiting_model" then
-    if active_count == 0 then
-      -- 模型先完成，工具也已全部完成：直接触发下一轮
-      if ss._proceed_in_progress then
-        return
-      end
-      ss.phase = "round_complete"
-      M._proceed_to_next_round(session_id, is_sub_agent)
-    else
-      ss.phase = "waiting_tools"
-    end
-  elseif ss.phase == "waiting_tools" then
-    if active_count == 0 then
-      if ss._proceed_in_progress then
-        return
-      end
-      ss.phase = "round_complete"
-      M._proceed_to_next_round(session_id, is_sub_agent)
-    end
+  -- 双事件等待机制：必须 GENERATION_COMPLETED 和 TOOL_EXECUTION_ALL_COMPLETED 都到达
+  -- 才能开启下一轮 AI 请求
+  if not ss._generation_completed or not ss._tools_all_completed then
+    -- 其中一个事件尚未到达，继续等待
+    require("NeoAI.utils.logger").debug(
+      "[tool_orchestrator] _check_round_complete: 等待双事件到达, session=%s, gen_completed=%s, tools_completed=%s, phase=%s",
+      tostring(session_id),
+      tostring(ss._generation_completed),
+      tostring(ss._tools_all_completed),
+      tostring(ss.phase)
+    )
+    return
   end
+
+  -- 两个事件都已到达，重置标志并进入下一轮
+  ss._generation_completed = false
+  ss._tools_all_completed = false
+
+  -- 如果还有活跃的工具调用（AI 刚返回工具调用，工具尚未执行），不进入下一轮
+  if vim.tbl_count(ss.active_tool_calls) > 0 then
+    require("NeoAI.utils.logger").debug(
+      "[tool_orchestrator] _check_round_complete: 还有活跃工具调用, 跳过下一轮, session=%s, active_count=%d",
+      tostring(session_id),
+      vim.tbl_count(ss.active_tool_calls)
+    )
+    return
+  end
+
+  if ss._proceed_in_progress then
+    return
+  end
+
+  ss.phase = "round_complete"
+  M._proceed_to_next_round(session_id, is_sub_agent)
 end
 
 function M._proceed_to_next_round(session_id, is_sub_agent)
@@ -1050,6 +1074,11 @@ function M.on_generation_complete(data)
       tostring(data.generation_id))
     return
   end
+
+  -- 标记 AI 生成已完成（用于双事件等待机制）
+  ss._generation_completed = true
+  -- AI 生成完成时也检查是否两个事件都已到达，若工具已先完成则立即进入下一轮
+  M._check_round_complete(session_id, is_sub_agent)
 
   local tool_calls = data.tool_calls or {}
   local content = data.content or ""
@@ -1200,6 +1229,9 @@ function M.on_generation_complete(data)
 
   if #tool_calls == 0 then
     -- AI 返回纯文本回复，直接结束循环
+    -- 重置 _tools_all_completed 标志，防止 _finish_loop 触发的 GENERATION_COMPLETED
+    -- 事件监听器中的 _check_round_complete 错误地进入下一轮
+    ss._tools_all_completed = false
     if #tool_calls == 0 and content and content ~= "" then
       logger.debug("[tool_orchestrator] AI 返回纯文本回复，直接结束循环，跳过总结轮次")
       local assistant_msg = {
@@ -1531,6 +1563,8 @@ function M._finish_loop(session_id, success, result, is_sub_agent)
     ss.active_tool_calls = {}
     ss.current_iteration = 0
     ss.generation_id = nil
+    ss._generation_completed = false
+    ss._tools_all_completed = false
 
     if not is_shutting_down() then
       vim.schedule(function()
@@ -1566,6 +1600,8 @@ function M._finish_loop(session_id, success, result, is_sub_agent)
   ss.active_tool_calls = {}
   ss.current_iteration = 0
   ss.generation_id = nil
+  ss._generation_completed = false
+  ss._tools_all_completed = false
 
   -- 调用 on_complete 回调，通知调用方循环已结束
   if on_complete then

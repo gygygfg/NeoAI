@@ -274,6 +274,7 @@ local function reset_tool_display()
   state.tool_display.streaming_preview.generation_id = nil
   state.tool_display.streaming_preview.tools = {}
   state.tool_display.streaming_preview.window_shown = false
+  state.tool_display.message_index = nil
 end
 
 local function close_reasoning_display()
@@ -2979,18 +2980,22 @@ function M._setup_event_listeners()
       state.tool_display.packs = tool_display_component.get_packs()
       state.tool_display.pack_order = tool_display_component.get_pack_order()
       state.tool_display.substeps = {}
+      -- 保存 message_index，供 TOOL_EXECUTION_COMPLETED 写入折叠文本时使用
+      -- 因为 TOOL_LOOP_STARTED 清空了 state.streaming.message_index
+      state.tool_display.message_index = saved_message_index
 
       -- 仅在光标在后5行内时才显示工具调用悬浮窗
+      -- 注意：必须同步创建悬浮窗，不能使用 vim.schedule 异步执行
+      -- 否则 TOOL_EXECUTION_ALL_COMPLETED 可能在悬浮窗创建前触发
+      -- 导致 close_tool_display() 因 window_id 为 nil 而无法关闭
       local win = get_win()
       local near_end = cursor_near_end(win)
       state.should_follow = near_end
       if near_end then
-        vim.schedule(function()
-          tool_display_component.show_display()
-          state.tool_display.window_id = tool_display_component.get_window_id()
-          -- 如果悬浮窗已存在（上一轮未关闭），立即同步新内容
-          tool_display_component._sync_display()
-        end)
+        tool_display_component.show_display()
+        state.tool_display.window_id = tool_display_component.get_window_id()
+        -- 如果悬浮窗已存在（上一轮未关闭），立即同步新内容
+        tool_display_component._sync_display()
         _schedule_cursor_follow(150)
       else
         state.tool_display.active = false
@@ -3014,7 +3019,7 @@ function M._setup_event_listeners()
     end,
   })
 
-  -- TOOL_EXECUTION_ERROR：工具执行失败
+  -- TOOL_EXECUTION_ERROR：工具执行失败，立即将错误结果以折叠文本合并到流式消息中
   vim.api.nvim_create_autocmd("User", {
     pattern = Events.TOOL_EXECUTION_ERROR,
     callback = function(args)
@@ -3022,30 +3027,45 @@ function M._setup_event_listeners()
         return
       end
       local data = args.data or {}
-      -- 收集结果（即使 tool_display.active 为 false）
-      table.insert(state.tool_display.results, {
+      -- 收集结果
+      local result_entry = {
         tool_name = data.tool_name,
         arguments = data.args or {},
         result = "[失败] " .. (data.error_msg or "未知错误"),
         duration = data.duration or 0,
         is_error = true,
         pack_name = data.pack_name,
-      })
-      tool_display_component.add_result(state.tool_display.results[#state.tool_display.results])
+      }
+      table.insert(state.tool_display.results, result_entry)
+      tool_display_component.add_result(result_entry)
 
-      -- 如果折叠文本已写入 buffer，每次工具完成时更新 buffer 中的折叠文本
-      if state.tool_display.folded_saved then
+      -- 立即生成当前所有已完成工具的折叠文本，合并到流式消息中
+      -- 优先使用 state.streaming.message_index（第一轮工具循环，流式状态未清空）
+      -- 其次使用 state.tool_display.message_index（后续轮次，TOOL_LOOP_STARTED 已保存）
+      local mi = state.streaming.message_index or state.tool_display.message_index
+      if mi and state.messages[mi] then
         local folded_text = tool_display_component.build_folded_text()
         if folded_text ~= "" then
-          -- 更新 state.messages 中的折叠文本
-          for i = #state.messages, 1, -1 do
-            if state.messages[i].role == "assistant" and (state.messages[i].content or ""):find("^{{{") then
-              state.messages[i].content = folded_text
-              break
-            end
+          local current_content = state.messages[mi].content or ""
+          local reasoning_text = ""
+          local body_text = current_content
+          local json_ok, parsed = pcall(vim.json.decode, current_content)
+          if json_ok and type(parsed) == "table" and parsed.reasoning_content then
+            reasoning_text = parsed.reasoning_content
+            body_text = parsed.content or ""
           end
-          -- 更新 buffer 中的折叠文本
-          _update_folded_text_in_buffer(folded_text, data.window_id)
+          local new_content
+          if reasoning_text ~= "" then
+            new_content = vim.json.encode({
+              reasoning_content = reasoning_text,
+              content = folded_text .. "\n\n" .. body_text,
+            })
+          else
+            new_content = folded_text .. "\n\n" .. body_text
+          end
+          state.messages[mi].content = new_content
+          state.tool_display.folded_saved = true
+          M._render_streaming_message(data.window_id)
         end
       end
 
@@ -3084,7 +3104,7 @@ function M._setup_event_listeners()
     end,
   })
 
-  -- TOOL_EXECUTION_ALL_COMPLETED：本轮所有工具执行完毕，更新悬浮窗显示完成状态
+  -- TOOL_EXECUTION_ALL_COMPLETED：本轮所有工具执行完毕，关闭工具调用悬浮窗
   vim.api.nvim_create_autocmd("User", {
     pattern = Events.TOOL_EXECUTION_ALL_COMPLETED,
     callback = function(args)
@@ -3094,13 +3114,17 @@ function M._setup_event_listeners()
       if not state.tool_display.active then
         return
       end
-      -- 触发 tool_display 重建 buffer（_rebuild_buffer 中 _all_tools_done 为 true 时会显示等待状态）
-      tool_display_component._rebuild_buffer()
-      tool_display_component._sync_display()
+      -- 立即关闭工具调用悬浮窗，保留 results 等数据供 TOOL_LOOP_FINISHED 使用
+      -- 设置 active=false 和 window_id=nil，让后续事件跳过悬浮窗操作
+      -- 重置 _finished=false，确保 TOOL_LOOP_FINISHED(is_round_end=true) 能正常进入折叠文本写入分支
+      tool_display_component._close_display()
+      state.tool_display.active = false
+      state.tool_display.window_id = nil
+      state.tool_display._finished = false
     end,
   })
 
-  -- TOOL_EXECUTION_COMPLETED：工具执行成功
+  -- TOOL_EXECUTION_COMPLETED：工具执行成功，立即将结果以折叠文本合并到流式消息中
   vim.api.nvim_create_autocmd("User", {
     pattern = Events.TOOL_EXECUTION_COMPLETED,
     callback = function(args)
@@ -3108,29 +3132,48 @@ function M._setup_event_listeners()
         return
       end
       local data = args.data or {}
-      -- 收集结果
-      table.insert(state.tool_display.results, {
+      -- 收集结果到 tool_display_component（供 build_folded_text 使用）
+      local result_entry = {
         tool_name = data.tool_name,
         arguments = data.args or {},
         result = data.result or "",
         duration = data.duration or 0,
         pack_name = data.pack_name,
-      })
-      tool_display_component.add_result(state.tool_display.results[#state.tool_display.results])
+      }
+      table.insert(state.tool_display.results, result_entry)
+      tool_display_component.add_result(result_entry)
 
-      -- 如果折叠文本已写入 buffer，每次工具完成时更新 buffer 中的折叠文本
-      if state.tool_display.folded_saved then
+      -- 立即生成当前所有已完成工具的折叠文本，合并到流式消息中
+      -- 优先使用 state.streaming.message_index（第一轮工具循环，流式状态未清空）
+      -- 其次使用 state.tool_display.message_index（后续轮次，TOOL_LOOP_STARTED 已保存）
+      local mi = state.streaming.message_index or state.tool_display.message_index
+      if mi and state.messages[mi] then
         local folded_text = tool_display_component.build_folded_text()
         if folded_text ~= "" then
-          -- 更新 state.messages 中的折叠文本
-          for i = #state.messages, 1, -1 do
-            if state.messages[i].role == "assistant" and (state.messages[i].content or ""):find("^{{{") then
-              state.messages[i].content = folded_text
-              break
-            end
+          -- 获取当前消息的原始内容（可能包含 reasoning_content）
+          local current_content = state.messages[mi].content or ""
+          local reasoning_text = ""
+          local body_text = current_content
+          -- 尝试解析 JSON 格式（含 reasoning_content）
+          local json_ok, parsed = pcall(vim.json.decode, current_content)
+          if json_ok and type(parsed) == "table" and parsed.reasoning_content then
+            reasoning_text = parsed.reasoning_content
+            body_text = parsed.content or ""
           end
-          -- 更新 buffer 中的折叠文本
-          _update_folded_text_in_buffer(folded_text, data.window_id)
+          -- 将折叠文本插入到 reasoning 和 body 之间
+          local new_content
+          if reasoning_text ~= "" then
+            new_content = vim.json.encode({
+              reasoning_content = reasoning_text,
+              content = folded_text .. "\n\n" .. body_text,
+            })
+          else
+            new_content = folded_text .. "\n\n" .. body_text
+          end
+          state.messages[mi].content = new_content
+          state.tool_display.folded_saved = true
+          -- 通过 _render_streaming_message 重新渲染当前消息
+          M._render_streaming_message(data.window_id)
         end
       end
 
@@ -3176,83 +3219,12 @@ function M._setup_event_listeners()
         return
       end
 
-      -- ===== 本轮结束：关闭悬浮窗、写入折叠文本 =====
-
-      if state.tool_display._finished then
-        -- 即使 _finished=true，如果 results 有新增，更新 state.messages 和 buffer 中的折叠文本
-        -- 但不重新追加新消息（避免重复），只更新已有内容
-        local results = state.tool_display.results or {}
-        if #results > 0 then
-          local folded_text = tool_display_component.build_folded_text()
-          if folded_text ~= "" then
-            -- 更新 state.messages 中的折叠文本
-            for i = #state.messages, 1, -1 do
-              if state.messages[i].role == "assistant" and (state.messages[i].content or ""):find("^{{{") then
-                state.messages[i].content = folded_text
-                break
-              end
-            end
-            -- 更新 buffer 中已有的折叠文本（如果之前已写入 buffer）
-            if state.tool_display.folded_saved then
-              _update_folded_text_in_buffer(folded_text, data.window_id)
-            end
-          end
-        end
-        -- 确保悬浮窗关闭
-        if state.tool_display.active then
-          close_tool_display()
-        end
-        state.tool_display.active = false
-        fire_event(Events.TOOL_DISPLAY_CLOSED, {
-          window_id = data.window_id,
-          session_id = data.session_id,
-          generation_id = data.generation_id,
-        })
-        return
-      end
-      state.tool_display._finished = true
+      -- ===== 本轮结束：清理状态，折叠文本已在 TOOL_EXECUTION_COMPLETED 中逐工具写入 =====
 
       clear_stream_throttle()
-
-      -- 调试日志：打印 results 数量
-      local debug_results = state.tool_display.results or {}
-      require("NeoAI.utils.logger").debug("[TOOL_LOOP_FINISHED] results count=%d, folded_saved=%s", #debug_results, tostring(state.tool_display.folded_saved))
-      for _, dr in ipairs(debug_results) do
-        require("NeoAI.utils.logger").debug("[TOOL_LOOP_FINISHED]   tool=%s, pack=%s", dr.tool_name or "nil", dr.pack_name or "nil")
-      end
-
-      -- 生成折叠文本并写入缓冲区
-      local results = state.tool_display.results or {}
-      if #results > 0 or state.tool_display.buffer ~= "" then
-        local folded_text = tool_display_component.build_folded_text()
-        require("NeoAI.utils.logger").debug("[TOOL_LOOP_FINISHED] folded_text length=%d, contains %d {{{ blocks", #folded_text, select(2, folded_text:gsub("{{{", "")))
-        if folded_text == "" then
-          folded_text = "{{{ 🔧 工具调用\n  ❌ 所有工具调用均失败\n}}}"
-        end
-
-        -- 查找是否已有折叠消息，有则更新，无则插入（避免每次迭代累积多条）
-        local existing_idx = nil
-        for i = #state.messages, 1, -1 do
-          if state.messages[i].role == "assistant" and (state.messages[i].content or ""):find("^{{{") then
-            existing_idx = i
-            break
-          end
-        end
-        if existing_idx then
-          state.messages[existing_idx].content = folded_text
-        else
-          table.insert(state.messages, { role = "assistant", content = folded_text, timestamp = os.time() })
-        end
-        -- 仅在第一次写入缓冲区，后续迭代只更新 state.messages
-        if not state.tool_display.folded_saved then
-          state.tool_display.folded_saved = true
-          M._append_message_to_buffer("assistant", folded_text, data.window_id)
-        end
-      end
       if state.tool_display.active then
         close_tool_display()
       end
-
       state.tool_display.active = false
       close_reasoning_display()
       -- 记录折叠文本是否已通过 _append_message_to_buffer 写入缓冲区
@@ -3584,7 +3556,9 @@ end
 --- 在流式 chunk 到达或思考过程完成时调用
 --- @param window_id string|nil 可选，指定目标窗口 ID，默认使用 state.current_window_id
 local function _render_streaming_message(window_id)
-  local mi = state.streaming.message_index
+  -- 优先使用 state.streaming.message_index（第一轮工具循环，流式状态未清空）
+  -- 其次使用 state.tool_display.message_index（后续轮次，TOOL_LOOP_STARTED 已保存）
+  local mi = state.streaming.message_index or state.tool_display.message_index
   if not mi or not state.messages[mi] then
     return
   end
@@ -3626,6 +3600,9 @@ local function _render_streaming_message(window_id)
   end
   _schedule_cursor_follow()
 end
+
+-- 暴露给事件回调使用（事件回调闭包中 local function 不可见）
+M._render_streaming_message = _render_streaming_message
 
 --- 将思考过程追加到聊天缓冲区末尾
 --- 在思考过程完成后调用
