@@ -1257,32 +1257,6 @@ function M.on_generation_complete(data)
       ss.current_iteration = 0
       ss.generation_id = nil
       fire_loop_finished(ss, true, "ai_complete")
-      once_display_closed(session_id, function()
-        local s = sessions_table[session_id]
-        if not s then
-          return
-        end
-        if is_shutting_down() then
-          return
-        end
-        -- 触发 GENERATION_COMPLETED 事件但传入空 response，
-        -- 这样 chat_window 不会渲染 AI 总结文本，但会显示用量和弹出输入框
-        pcall(vim.api.nvim_exec_autocmds, "User", {
-          pattern = event_constants.GENERATION_COMPLETED,
-          data = {
-            generation_id = saved_gen_id,
-            response = "",
-            reasoning_text = saved_reasoning,
-            usage = saved_usage,
-            session_id = session_id,
-            window_id = saved_win_id,
-            duration = 0,
-          },
-        })
-        if on_complete then
-          on_complete(true, content, saved_usage)
-        end
-      end)
       return
     end
 
@@ -1576,7 +1550,7 @@ function M._finish_loop(session_id, success, result, is_sub_agent)
           data = {
             generation_id = saved_gen_id,
             response = saved_result,
-            reasoning_text = saved_reasoning,
+            reasoning_text = "",
             usage = saved_usage,
             session_id = session_id,
             window_id = saved_win_id,
@@ -1624,7 +1598,7 @@ function M._finish_loop(session_id, success, result, is_sub_agent)
         data = {
           generation_id = saved_generation_id,
           response = saved_result,
-          reasoning_text = saved_reasoning,
+          reasoning_text = "",
           usage = saved_usage,
           session_id = session_id,
           window_id = saved_window_id,

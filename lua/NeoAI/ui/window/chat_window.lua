@@ -3231,9 +3231,10 @@ function M._setup_event_listeners()
       -- trigger_source="tools_complete"：工具完成触发，AI 还在输出
       --   不重置 tool_loop_in_progress，不打开输入框（由后续 GENERATION_COMPLETED 处理）
       -- trigger_source="ai_complete"：AI 完成触发
-      --   重置 tool_loop_in_progress，打开输入框
+      --   重置 tool_loop_in_progress，重置 generation_in_progress，打开输入框
       if data.trigger_source == "ai_complete" then
         state.tool_loop_in_progress = false
+        state.generation_in_progress = false
         M._open_float_input()
         local chat_handlers = require("NeoAI.ui.handlers.chat_handlers")
         if virtual_input.is_active() and chat_handlers.get_should_follow() then
