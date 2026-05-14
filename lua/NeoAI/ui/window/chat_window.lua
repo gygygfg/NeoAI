@@ -165,6 +165,12 @@ local state = {
     -- 上次更新的 buffer 内容缓存，用于增量更新
     _last_buffer = "",
 
+    -- 工具调用阶段的 AI 正文缓存（独立于折叠文本，防止重复）
+    -- 在 TOOL_LOOP_STARTED 时初始化为 ""
+    -- 在 TOOL_EXECUTION_COMPLETED/ERROR 中保持不变（只更新折叠文本）
+    -- 在 GENERATION_COMPLETED 中更新为 AI 回复内容
+    _body_cache = "",
+
     -- 流式工具调用预览（在 TOOL_LOOP_STARTED 前提前显示）
     streaming_preview = {
       timer = nil, -- 节流定时器
@@ -266,6 +272,7 @@ local function reset_tool_display()
   state.tool_display.buffer = ""
   state.tool_display.results = {}
   state.tool_display.folded_saved = false
+  state.tool_display._body_cache = ""
   state.tool_display.substeps = {}
   state.tool_display._last_buffer = ""
   state.tool_display.window_id = nil
@@ -1857,6 +1864,7 @@ function M.close()
     state.tool_display.active = false
     state.tool_display.buffer = ""
     state.tool_display.results = {}
+    state.tool_display._body_cache = ""
     state.tool_display._finished = false
     state.tool_display.folded_saved = false
     state.tool_display.window_id = nil
@@ -2661,32 +2669,6 @@ function M._setup_event_listeners()
     end,
   })
 
-  -- AI_RESPONSE_CHUNK：兼容旧事件
-  vim.api.nvim_create_autocmd("User", {
-    pattern = Events.AI_RESPONSE_CHUNK,
-    callback = function(args)
-      local data = args.data or {}
-      local chunk_content = extract_response_content(data.chunk)
-      if not chunk_content or chunk_content == "" then
-        return
-      end
-
-      if not state.streaming.active then
-        state.streaming.active = true
-        state.streaming.generation_id = data.generation_id
-        state.streaming.content_buffer = ""
-        state.streaming.reasoning_buffer = ""
-        state.streaming.message_start_line = nil
-        local ok = M.add_message("assistant", "", { allow_empty = true, skip_render = true, skip_event = true })
-        if ok then
-          state.streaming.message_index = #state.messages
-        end
-      end
-      state.streaming.content_buffer = state.streaming.content_buffer .. chunk_content
-      M._append_stream_chunk_to_buffer(chunk_content, nil, data.window_id)
-    end,
-  })
-
   -- STREAM_COMPLETED：流式完成
   vim.api.nvim_create_autocmd("User", {
     pattern = Events.STREAM_COMPLETED,
@@ -2975,6 +2957,7 @@ function M._setup_event_listeners()
       state.tool_display.active = true
       state.tool_display.buffer = tool_display_component.get_buffer()
       state.tool_display.results = {}
+      state.tool_display._body_cache = ""
       state.tool_display._finished = false
       state.tool_display.folded_saved = false
       state.tool_display.packs = tool_display_component.get_packs()
@@ -3048,11 +3031,11 @@ function M._setup_event_listeners()
         if folded_text ~= "" then
           local current_content = state.messages[mi].content or ""
           local reasoning_text = ""
-          local body_text = current_content
+          -- 使用 _body_cache 作为正文内容，避免从 content 中提取导致折叠文本重复
+          local body_text = state.tool_display._body_cache or ""
           local json_ok, parsed = pcall(vim.json.decode, current_content)
           if json_ok and type(parsed) == "table" and parsed.reasoning_content then
             reasoning_text = parsed.reasoning_content
-            body_text = parsed.content or ""
           end
           local new_content
           if reasoning_text ~= "" then
@@ -3153,12 +3136,14 @@ function M._setup_event_listeners()
           -- 获取当前消息的原始内容（可能包含 reasoning_content）
           local current_content = state.messages[mi].content or ""
           local reasoning_text = ""
-          local body_text = current_content
+          -- 使用 _body_cache 作为正文内容，避免从 content 中提取导致折叠文本重复
+          -- _body_cache 在 TOOL_LOOP_STARTED 时初始化为 ""，在工具执行阶段保持不变
+          -- 只有 AI 回复内容（非折叠文本）应该作为 body 内容
+          local body_text = state.tool_display._body_cache or ""
           -- 尝试解析 JSON 格式（含 reasoning_content）
           local json_ok, parsed = pcall(vim.json.decode, current_content)
           if json_ok and type(parsed) == "table" and parsed.reasoning_content then
             reasoning_text = parsed.reasoning_content
-            body_text = parsed.content or ""
           end
           -- 将折叠文本插入到 reasoning 和 body 之间
           local new_content

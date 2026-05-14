@@ -18,7 +18,7 @@ M.CANCEL_GENERATION = "NeoAI:cancel_generation" -- 请求取消当前生成
 M.STREAM_STARTED = "NeoAI:stream_started" -- 流式请求开始
 M.STREAM_CHUNK = "NeoAI:stream_chunk" -- 流式数据块到达
 M.STREAM_COMPLETED = "NeoAI:stream_completed" -- 流式处理完成
-M.STREAM_ERROR = "NeoAI:stream_error" -- 流式处理出错（当前未使用）
+M.STREAM_ERROR = "NeoAI:stream_error" -- 流式处理出错
 
 -- ==================== 推理/思考事件 ====================
 -- 使用位置: ai_engine.lua, reasoning_manager.lua, chat_window.lua
@@ -80,8 +80,8 @@ M.MESSAGE_DELETED = "NeoAI:message_deleted" -- 消息已删除
 M.MESSAGE_UPDATED = "NeoAI:message_updated" -- 消息已更新
 M.MESSAGE_SENT = "NeoAI:message_sent" -- 消息已发送
 M.MESSAGES_CLEARED = "NeoAI:messages_cleared" -- 消息已清空
-M.MESSAGES_BUILT = "NeoAI:messages_built" -- 消息已构建（当前未使用）
-M.FORMATTED_MESSAGE_SENT = "NeoAI:formatted_message_sent" -- 格式化消息已发送（当前未使用）
+M.MESSAGES_BUILT = "NeoAI:messages_built" -- 消息已构建
+M.FORMATTED_MESSAGE_SENT = "NeoAI:formatted_message_sent" -- 格式化消息已发送
 
 -- ==================== 窗口/UI 事件 ====================
 -- 使用位置: chat_window.lua, ui/init.lua, window_manager.lua
@@ -89,7 +89,7 @@ M.CHAT_WINDOW_OPENED = "NeoAI:chat_window_opened" -- 聊天窗口打开
 M.CHAT_WINDOW_CLOSED = "NeoAI:chat_window_closed" -- 聊天窗口关闭
 M.TREE_WINDOW_OPENED = "NeoAI:tree_window_opened" -- 树窗口打开
 M.TREE_WINDOW_CLOSED = "NeoAI:tree_window_closed" -- 树窗口关闭
-M.WINDOW_MODE_CHANGED = "NeoAI:window_mode_changed" -- 窗口模式切换（当前未使用）
+M.WINDOW_MODE_CHANGED = "NeoAI:window_mode_changed" -- 窗口模式切换
 M.WINDOW_OPENING = "NeoAI:window_opening" -- 窗口正在打开（chat_window.lua）
 M.WINDOW_OPENED = "NeoAI:window_opened" -- 窗口已打开（chat_window.lua）
 M.WINDOW_CLOSING = "NeoAI:window_closing" -- 窗口正在关闭（chat_window.lua）
@@ -120,7 +120,7 @@ M.MODEL_SWITCHED = "NeoAI:model_switched" -- 模型已切换
 -- ==================== 配置事件 ====================
 -- 使用位置: reasoning_manager.lua
 M.CONFIG_LOADED = "NeoAI:config_loaded" -- 配置已加载
-M.CONFIG_CHANGED = "NeoAI:config_changed" -- 配置已变更（当前未使用）
+M.CONFIG_CHANGED = "NeoAI:config_changed" -- 配置已变更
 
 -- ==================== 插件状态事件 ====================
 -- 使用位置: ai_engine.lua, reasoning_manager.lua
@@ -142,13 +142,11 @@ M.REQUEST_BUILT = "NeoAI:request_built" -- 请求构建完成
 
 -- ==================== 日志事件 ====================
 -- 使用位置: reasoning_manager.lua
-M.LOG_DEBUG = "NeoAI:log_debug" -- 调试日志（当前未使用）
+M.LOG_DEBUG = "NeoAI:log_debug" -- 调试日志
 M.LOG_INFO = "NeoAI:log_info" -- 信息日志
-M.LOG_WARN = "NeoAI:log_warn" -- 警告日志（当前未使用）
-M.LOG_ERROR = "NeoAI:log_error" -- 错误日志（当前未使用）
-M.AI_RESPONSE_CHUNK = "NeoAI:ai_response_chunk" -- AI 响应块（兼容旧事件流）
-M.AI_RESPONSE_COMPLETE = "NeoAI:ai_response_complete" -- AI 响应完成（当前未使用）
-M.AI_RESPONSE_ERROR = "NeoAI:ai_response_error" -- AI 响应错误（当前未使用）
+M.LOG_WARN = "NeoAI:log_warn" -- 警告日志
+M.LOG_ERROR = "NeoAI:log_error" -- 错误日志
+-- AI_RESPONSE_CHUNK、AI_RESPONSE_COMPLETE、AI_RESPONSE_ERROR 已删除，统一使用 STREAM_CHUNK/STREAM_COMPLETED/STREAM_ERROR
 
 -- ==================== 自定义/命令事件 ====================
 -- 使用位置: ai_engine.lua

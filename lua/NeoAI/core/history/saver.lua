@@ -35,12 +35,11 @@ local function enqueue_save(session_id, save_fn)
 
   local entry = state._save_queue[session_id]
   if not entry then
-    entry = { pending = true, save_fn = save_fn, timer = nil }
+    entry = { pending = true, save_fns = {}, timer = nil }
     state._save_queue[session_id] = entry
-  else
-    -- 已有待处理任务，更新 save_fn（取最新数据）
-    entry.save_fn = save_fn
   end
+  -- 追加保存函数到列表（不覆盖），确保多个工具结果都能被保存
+  table.insert(entry.save_fns, save_fn)
 
   -- 启动防抖定时器（300ms 内合并多次写入）
   if entry.timer and not entry.timer:is_closing() then
@@ -76,21 +75,30 @@ function M._flush_session(session_id)
     entry.timer:close()
   end
 
-  -- 通过 async_worker 异步执行保存
+  -- 通过 async_worker 异步执行所有待处理的保存函数
   async_worker.submit_task(
     "history_save_" .. session_id,
     function()
-      local ok, result = pcall(entry.save_fn)
-      if ok then return result end
-      return nil, tostring(result)
+      local all_ok = true
+      local last_error = nil
+      for _, fn in ipairs(entry.save_fns) do
+        local ok, result = pcall(fn)
+        if not ok then
+          all_ok = false
+          last_error = tostring(result)
+          logger.warn("[history_saver] 会话保存子任务失败: session=" .. session_id .. ", error=" .. tostring(result))
+        end
+      end
+      if all_ok then return true end
+      return nil, last_error or "保存失败"
     end,
     function(success, result, error_msg)
       state._save_in_progress[session_id] = nil
 
       if not success then
         logger.warn("[history_saver] 会话保存失败: session=" .. session_id .. ", error=" .. tostring(error_msg))
-        -- 重试：重新入队
-        if entry.retry_count or 0 < 3 then
+        -- 重试：重新入队所有保存函数
+        if (entry.retry_count or 0) < 3 then
           entry.retry_count = (entry.retry_count or 0) + 1
           state._save_queue[session_id] = entry
           logger.warn("[history_saver] 重试保存 (" .. entry.retry_count .. "/3)")
@@ -145,10 +153,11 @@ local function on_user_message_sent(data)
     -- 确保会话存在
     local session = hm.get_session(session_id)
     if not session then
-      hm.set_current_session(session_id)
-      session = hm.get_or_create_current_session()
+      -- 会话应已由 chat_service.send_message 创建，若不存在则说明状态异常
+      -- 直接返回失败，避免产生重复会话
+      logger.warn("[history_saver] 会话不存在，跳过保存: session=" .. session_id)
+      return false, "会话不存在: " .. session_id
     end
-    if not session then return false, "无法创建会话: " .. session_id end
 
     -- 保存用户消息
     hm.add_round(session_id, content, "", {})
