@@ -26,8 +26,12 @@ M._parse_response_tool_calls = http_utils.parse_response_tool_calls
 --- 系统内部使用 Lua table 操作数据，发送给 API 前需要将 arguments 转为 JSON 字符串
 --- @param body table 请求体（会被原地修改）
 function M._encode_tool_call_arguments(body)
-  if not body or type(body) ~= "table" then return end
-  if not body.messages then return end
+  if not body or type(body) ~= "table" then
+    return
+  end
+  if not body.messages then
+    return
+  end
   for _, msg in ipairs(body.messages) do
     if msg.tool_calls then
       for _, tc in ipairs(msg.tool_calls) do
@@ -146,13 +150,24 @@ function M.send_request(params)
   M._encode_tool_call_arguments(transformed)
   local request_body = json.encode(transformed)
   request_body = M._sanitize_json_body(request_body)
+  logger.debug(
+    string.format(
+      "[http_client] 原始请求数据: generation_id=%s, api_type=%s, base_url=%s, body_len=%d",
+      tostring(generation_id),
+      tostring(api_type),
+      tostring(base_url),
+      #request_body
+    )
+  )
+  logger.debug(
+    "[http_client] 原始请求体: "
+      .. request_body:sub(1, 3000)
+      .. (request_body:len() > 3000 and "...[truncated]" or "")
+  )
   -- 调试：打印请求体中的 model 字段
   local ok_body, decoded_body = pcall(json.decode, request_body)
   if ok_body and decoded_body and decoded_body.model then
-    logger.debug(string.format(
-      "[http_client] 非流式请求 model=%s",
-      tostring(decoded_body.model)
-    ))
+    logger.debug(string.format("[http_client] 非流式请求 model=%s", tostring(decoded_body.model)))
   end
   logger.debug(
     "[http_client] 非流式请求: "
@@ -276,7 +291,9 @@ end
 --- 发送非流式请求（内部重试用，带 generation_id 保护）
 function M.send_request_retry(params, on_complete)
   if not state.initialized then
-    if on_complete then on_complete(nil, "HTTP client not initialized") end
+    if on_complete then
+      on_complete(nil, "HTTP client not initialized")
+    end
     return nil
   end
 
@@ -291,11 +308,15 @@ function M.send_request_retry(params, on_complete)
   local provider_config = params.provider_config or ai_preset or {}
 
   if not api_key or api_key == "" then
-    if on_complete then on_complete(nil, "API key not configured") end
+    if on_complete then
+      on_complete(nil, "API key not configured")
+    end
     return nil
   end
   if not base_url or base_url == "" then
-    if on_complete then on_complete(nil, "API base URL not configured") end
+    if on_complete then
+      on_complete(nil, "API base URL not configured")
+    end
     return nil
   end
 
@@ -314,6 +335,20 @@ function M.send_request_retry(params, on_complete)
   M._encode_tool_call_arguments(transformed)
   local request_body = json.encode(transformed)
   request_body = M._sanitize_json_body(request_body)
+  logger.debug(
+    string.format(
+      "[http_client] 原始请求数据(send_request_retry): generation_id=%s, api_type=%s, base_url=%s, body_len=%d",
+      tostring(generation_id),
+      tostring(api_type),
+      tostring(base_url),
+      #request_body
+    )
+  )
+  logger.debug(
+    "[http_client] 原始请求体(send_request_retry): "
+      .. request_body:sub(1, 3000)
+      .. (request_body:len() > 3000 and "...[truncated]" or "")
+  )
 
   local temp_file = vim.fn.tempname()
   local headers = request_adapter.get_headers(api_key, api_type)
@@ -326,8 +361,10 @@ function M.send_request_retry(params, on_complete)
     end
   end
   vim.list_extend(curl_args, {
-    "-d", request_body,
-    "-o", temp_file,
+    "-d",
+    request_body,
+    "-o",
+    temp_file,
   })
 
   local cmd = vim.list_extend({ "curl" }, curl_args)
@@ -336,20 +373,26 @@ function M.send_request_retry(params, on_complete)
 
   if not ok or exit_code ~= 0 then
     pcall(vim.fn.delete, temp_file)
-    if on_complete then on_complete(nil, "curl failed: " .. (ok and "exit " .. exit_code or tostring(result))) end
+    if on_complete then
+      on_complete(nil, "curl failed: " .. (ok and "exit " .. exit_code or tostring(result)))
+    end
     return nil
   end
 
   local content = M._read_file(temp_file)
   pcall(vim.fn.delete, temp_file)
   if not content or content == "" then
-    if on_complete then on_complete(nil, "Empty response") end
+    if on_complete then
+      on_complete(nil, "Empty response")
+    end
     return nil
   end
 
   local ok, response = pcall(json.decode, content)
   if not ok or type(response) ~= "table" then
-    if on_complete then on_complete(nil, "JSON parse failed") end
+    if on_complete then
+      on_complete(nil, "JSON parse failed")
+    end
     return nil
   end
 
@@ -358,7 +401,9 @@ function M.send_request_retry(params, on_complete)
 
   if response.error then
     local err_msg = response.error.message or json.encode(response.error)
-    if on_complete then on_complete(nil, err_msg) end
+    if on_complete then
+      on_complete(nil, err_msg)
+    end
     return nil
   end
 
@@ -368,7 +413,9 @@ function M.send_request_retry(params, on_complete)
   end
 
   local unified = request_adapter.transform_response(response, api_type)
-  if on_complete then on_complete(unified, nil) end
+  if on_complete then
+    on_complete(unified, nil)
+  end
   return nil
 end
 
@@ -462,18 +509,32 @@ function M.send_stream_request(params, on_chunk, on_complete, on_error)
   M._encode_tool_call_arguments(transformed)
   local request_body = json.encode(transformed)
   request_body = M._sanitize_json_body(request_body)
+  logger.debug(
+    string.format(
+      "[http_client] 原始请求数据(send_stream_request): generation_id=%s, api_type=%s, base_url=%s, body_len=%d",
+      tostring(generation_id),
+      tostring(api_type),
+      tostring(base_url),
+      #request_body
+    )
+  )
+  logger.debug(
+    "[http_client] 原始请求体(send_stream_request): "
+      .. request_body:sub(1, 3000)
+      .. (request_body:len() > 3000 and "...[truncated]" or "")
+  )
   -- 调试：打印请求体中的 model 字段
   local ok_body, decoded_body = pcall(json.decode, request_body)
   if ok_body and decoded_body and decoded_body.model then
-    logger.debug(string.format(
-      "[http_client] 流式请求 model=%s",
-      tostring(decoded_body.model)
-    ))
+    logger.debug(string.format("[http_client] 流式请求 model=%s", tostring(decoded_body.model)))
   end
-  logger.debug(string.format(
-    "[http_client] 流式请求体大小: generation_id=%s, 大小=%d bytes",
-    tostring(generation_id), #request_body
-  ))
+  logger.debug(
+    string.format(
+      "[http_client] 流式请求体大小: generation_id=%s, 大小=%d bytes",
+      tostring(generation_id),
+      #request_body
+    )
+  )
   -- 对短请求体（< 8KB）使用 --data-raw 避免临时文件 I/O
   local use_temp_file = #request_body > 8192
   local temp_file = use_temp_file and vim.fn.tempname() or nil
@@ -509,42 +570,50 @@ function M.send_stream_request(params, on_chunk, on_complete, on_error)
     reset_idle_timer()
     idle_timer = vim.uv.new_timer()
     set_idle_timer(idle_timer)
-    idle_timer:start(IDLE_TIMEOUT_MS, 0, vim.schedule_wrap(function()
-      local req = state.active_requests[request_id]
-      if not req or req.cancelled or req.has_error then
-        return
-      end
+    idle_timer:start(
+      IDLE_TIMEOUT_MS,
+      0,
+      vim.schedule_wrap(function()
+        local req = state.active_requests[request_id]
+        if not req or req.cancelled or req.has_error then
+          return
+        end
 
-      -- 检查是否已有 tool_calls 在累积中
-      -- 通过 on_chunk 回调获取 processor 状态
-      logger.debug("[http_client] 流式请求空闲超时 (%dms): request_id=%s, generation_id=%s",
-        IDLE_TIMEOUT_MS, request_id, tostring(generation_id))
+        -- 检查是否已有 tool_calls 在累积中
+        -- 通过 on_chunk 回调获取 processor 状态
+        logger.debug(
+          "[http_client] 流式请求空闲超时 (%dms): request_id=%s, generation_id=%s",
+          IDLE_TIMEOUT_MS,
+          request_id,
+          tostring(generation_id)
+        )
 
-      -- 尝试通过 on_chunk 传递的 processor 获取当前 tool_calls 状态
-      -- 由于 processor 在 ai_engine 中管理，这里无法直接访问
-      -- 但我们可以利用 stream_processor 的 try_finalize_tool_calls
-      -- 注意：这里无法直接获取 processor，因为它在 ai_engine 中创建
-      -- 所以我们需要通过另一种方式：检查是否有 tool_calls_delta 累积
+        -- 尝试通过 on_chunk 传递的 processor 获取当前 tool_calls 状态
+        -- 由于 processor 在 ai_engine 中管理，这里无法直接访问
+        -- 但我们可以利用 stream_processor 的 try_finalize_tool_calls
+        -- 注意：这里无法直接获取 processor，因为它在 ai_engine 中创建
+        -- 所以我们需要通过另一种方式：检查是否有 tool_calls_delta 累积
 
-      -- 实际上，我们需要在 ai_engine 层面处理这个问题
-      -- 在 http_client 层面，我们只能触发一个特殊回调
-      -- 让上层（ai_engine）决定是完成还是重试
+        -- 实际上，我们需要在 ai_engine 层面处理这个问题
+        -- 在 http_client 层面，我们只能触发一个特殊回调
+        -- 让上层（ai_engine）决定是完成还是重试
 
-      -- 方案：触发一个特殊的空闲超时回调
-      -- 如果 on_chunk 回调存在，发送一个标记数据让上层处理
-      if on_chunk then
-        -- 发送一个特殊的空闲超时标记
-        local timeout_marker = {
-          _idle_timeout = true,
-          generation_id = generation_id,
-        }
-        on_chunk(timeout_marker)
-      end
+        -- 方案：触发一个特殊的空闲超时回调
+        -- 如果 on_chunk 回调存在，发送一个标记数据让上层处理
+        if on_chunk then
+          -- 发送一个特殊的空闲超时标记
+          local timeout_marker = {
+            _idle_timeout = true,
+            generation_id = generation_id,
+          }
+          on_chunk(timeout_marker)
+        end
 
-      -- 注意：不在这里清理请求，让上层决定如何处理
-      -- 如果上层决定完成，会调用 on_complete
-      -- 如果上层决定重试，会调用 on_error
-    end))
+        -- 注意：不在这里清理请求，让上层决定如何处理
+        -- 如果上层决定完成，会调用 on_complete
+        -- 如果上层决定重试，会调用 on_error
+      end)
+    )
   end
 
   state.active_requests[request_id] = {
@@ -574,7 +643,13 @@ function M.send_stream_request(params, on_chunk, on_complete, on_error)
       if ok and type(data) == "table" then
         total_received = total_received + #data_str
         logger.debug(
-          "[http_client] 流式数据块: 大小=" .. #data_str .. " bytes, 累计=" .. total_received .. " bytes | " .. data_str:sub(1, 1000) .. (data_str:len() > 1000 and "...[truncated]" or "")
+          "[http_client] 流式数据块: 大小="
+            .. #data_str
+            .. " bytes, 累计="
+            .. total_received
+            .. " bytes | "
+            .. data_str:sub(1, 1000)
+            .. (data_str:len() > 1000 and "...[truncated]" or "")
         )
         if data.error then
           local req = state.active_requests[request_id]
@@ -623,10 +698,14 @@ function M.send_stream_request(params, on_chunk, on_complete, on_error)
     for _, line in ipairs(data_lines) do
       lines_size = lines_size + #(line or "")
     end
-    logger.debug(string.format(
-      "[http_client] handle_stdout: 行数=%d, 本次大小=%d bytes, buffer大小=%d bytes",
-      n, lines_size, #(req.buffer or "")
-    ))
+    logger.debug(
+      string.format(
+        "[http_client] handle_stdout: 行数=%d, 本次大小=%d bytes, buffer大小=%d bytes",
+        n,
+        lines_size,
+        #(req.buffer or "")
+      )
+    )
     local ends_with_newline = data_lines[n] == ""
     local count = ends_with_newline and n - 1 or n
     for i = 1, count do
@@ -659,17 +738,27 @@ function M.send_stream_request(params, on_chunk, on_complete, on_error)
       return
     end
     if req.buffer ~= "" then
-      logger.debug(string.format("[http_client] handle_complete: 处理残留 buffer, 大小=%d, 内容前500=%s", #req.buffer, req.buffer:sub(1, 500)))
+      logger.debug(
+        string.format(
+          "[http_client] handle_complete: 处理残留 buffer, 大小=%d, 内容前500=%s",
+          #req.buffer,
+          req.buffer:sub(1, 500)
+        )
+      )
       process_sse_line(req.buffer)
     end
     local has_error = req and req.has_error
     if req then
       state.active_requests[request_id] = nil
     end
-    logger.debug(string.format(
-      "[http_client] 流式请求完成: %s | has_error=%s | 总接收数据=%d bytes",
-      base_url, tostring(has_error), total_received
-    ))
+    logger.debug(
+      string.format(
+        "[http_client] 流式请求完成: %s | has_error=%s | 总接收数据=%d bytes",
+        base_url,
+        tostring(has_error),
+        total_received
+      )
+    )
     if not has_error and on_complete then
       on_complete()
     end
@@ -748,7 +837,10 @@ function M.send_stream_request(params, on_chunk, on_complete, on_error)
       if req and req.cancelled then
         -- 清理空闲超时定时器
         if req.idle_timer then
-          pcall(function() req.idle_timer:stop(); req.idle_timer:close() end)
+          pcall(function()
+            req.idle_timer:stop()
+            req.idle_timer:close()
+          end)
           req.idle_timer = nil
         end
         state.active_requests[request_id] = nil
@@ -947,6 +1039,20 @@ function M.send_request_async(params, on_complete)
   local ok_encode, request_body = pcall(json.encode, transformed)
   if ok_encode and request_body then
     request_body = M._sanitize_json_body(request_body)
+    logger.debug(
+      string.format(
+        "[http_client] 原始请求数据(send_request_async): generation_id=%s, api_type=%s, base_url=%s, body_len=%d",
+        tostring(generation_id),
+        tostring(api_type),
+        tostring(base_url),
+        #request_body
+      )
+    )
+    logger.debug(
+      "[http_client] 原始请求体(send_request_async): "
+        .. request_body:sub(1, 3000)
+        .. (request_body:len() > 3000 and "...[truncated]" or "")
+    )
   end
   if not ok_encode then
     if on_complete then

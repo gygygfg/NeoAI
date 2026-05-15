@@ -42,6 +42,17 @@ function M.is_initialized()
 end
 
 function M.register_tool(tool_def)
+  -- 检查工具是否被禁用（通过 tool_overrides 中的 enable 字段）
+  local tools_config = full_config.tools or {}
+  local approval_cfg = tools_config.approval or {}
+  local tool_overrides = approval_cfg.tool_overrides or {}
+  local override = tool_overrides[tool_def.name]
+  if override and override.enable == false then
+    local logger = require("NeoAI.utils.logger")
+    logger.debug("[tools.init] 工具已被禁用，跳过注册: " .. tool_def.name)
+    return false
+  end
+
   local valid, error_msg = tool_validator.validate_tool(tool_def)
   if not valid then
     vim.notify("工具验证失败: " .. error_msg, vim.log.levels.ERROR)

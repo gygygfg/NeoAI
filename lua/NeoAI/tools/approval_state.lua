@@ -67,6 +67,8 @@ function M.initialize_from_config(full_config)
   end
 
   -- 应用各工具单独覆盖配置
+  -- 注意：tool_overrides 中的 enable 字段由 tools/init.lua 的 register_tool 消费，
+  -- 用于控制工具是否注册到工具列表，此处不处理 enable 字段
   local tool_overrides = approval_cfg.tool_overrides or {}
   for tool_name, override in pairs(tool_overrides) do
     if type(override) == "table" then
