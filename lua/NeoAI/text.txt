@@ -1,0 +1,3 @@
+Hello, NeoAI! This is a test file.
+Line 2: Testing file operations.
+Line 3: File tools working correctly!

@@ -20,21 +20,15 @@ local function is_headless()
 end
 
 -- 安全的等待函数
--- 在 headless 模式下使用 vim.wait（能正确处理 vim.schedule 回调）
--- 在 UI 模式下使用 vim.uv.run('once')（避免阻塞 UI）
--- 注意：vim.uv.run('once') 无法处理 vim.schedule 回调，因此 headless 模式下必须使用 vim.wait
+-- 在 headless 模式下使用 vim.uv.run('once') 循环来处理 vim.defer_fn 回调
+-- 同时定期调用 vim.wait(1) 来处理 vim.schedule 回调
+-- 注意：vim.wait 能处理 vim.schedule 回调，但不能处理 vim.defer_fn 回调
+-- 而 vim.uv.run('once') 能处理 vim.defer_fn 回调，但不能处理 vim.schedule 回调
 local function safe_wait(timeout_ms, cond)
-  if is_headless() then
-    return vim.wait(timeout_ms, cond, 50)
-  end
-  local deadline = vim.uv.now() + timeout_ms
-  while vim.uv.now() < deadline do
-    if cond() then
-      return true
-    end
-    vim.uv.run("once")
-  end
-  return false
+  -- vim.wait 可以同时处理 vim.schedule 和 vim.defer_fn 回调
+  -- 在 headless 和非 headless 模式下都使用 vim.wait
+  -- 注意：vim.uv.run('once') 不能处理 vim.defer_fn 回调
+  return vim.wait(timeout_ms, cond, 1)
 end
 
 local function create_tool(name)
@@ -45,6 +39,11 @@ end
 function M.run(test_module)
   test = test_module or require("NeoAI.tests")
   local assert = test.assert
+  -- 确保 _logger 可用（直接 dofile 运行时可能为 nil）
+  if not test._logger then
+    local logger = require("NeoAI.utils.logger")
+    test._logger = logger
+  end
   test._logger.info("\n=== test_tools ===")
 
   return test.run_tests({

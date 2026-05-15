@@ -5,8 +5,8 @@ local plan_executor = require("NeoAI.tools.builtin.plan_executor")
 local sub_agent_engine = require("NeoAI.core.ai.sub_agent_engine")
 
 -- 初始化 AI engine（注册事件监听器）
-local ai_engine = require("NeoAI.core.ai.ai_engine")
-pcall(ai_engine.initialize, {})
+local engine = require("NeoAI.core.ai.engine")
+pcall(engine.initialize, {})
 
 -- 先清理
 plan_executor.cleanup_all()

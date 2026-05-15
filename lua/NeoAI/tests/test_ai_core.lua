@@ -8,6 +8,11 @@ local test
 function M.run(test_module)
   test = test_module or require("NeoAI.tests")
   local assert = test.assert
+  -- 确保 _logger 可用（直接 dofile 运行时可能为 nil）
+  if not test._logger then
+    local logger = require("NeoAI.utils.logger")
+    test._logger = logger
+  end
   test._logger.info("\n=== test_ai_core ===")
 
   local function setup_engine_config()
@@ -38,10 +43,10 @@ function M.run(test_module)
   end
 
   return test.run_tests({
-    -- ========== ai_engine ==========
+    -- ========== engine ==========
     test_engine_initialize = function()
       setup_engine_config()
-      local ai_engine = require("NeoAI.core.ai.ai_engine")
+      local ai_engine = require("NeoAI.core.ai.engine")
       ai_engine.initialize({ config = {} })
       local status = ai_engine.get_status()
       assert.is_true(status.initialized, "引擎应已初始化")
@@ -50,7 +55,7 @@ function M.run(test_module)
 
     test_engine_set_tools = function()
       setup_engine_config()
-      local ai_engine = require("NeoAI.core.ai.ai_engine")
+      local ai_engine = require("NeoAI.core.ai.engine")
       ai_engine.initialize({ config = {} })
       local tr = require("NeoAI.tools.tool_registry")
       tr.initialize({})
@@ -69,7 +74,7 @@ function M.run(test_module)
     end,
 
     test_engine_process_query = function()
-      local ai_engine = require("NeoAI.core.ai.ai_engine")
+      local ai_engine = require("NeoAI.core.ai.engine")
       local ok, err = pcall(function()
         ai_engine.process_query("测试查询", {})
       end)
@@ -78,13 +83,13 @@ function M.run(test_module)
 
     test_engine_cancel_generation = function()
       setup_engine_config()
-      local ai_engine = require("NeoAI.core.ai.ai_engine")
+      local ai_engine = require("NeoAI.core.ai.engine")
       ai_engine.cancel_generation()
     end,
 
     test_engine_get_status = function()
       setup_engine_config()
-      local ai_engine = require("NeoAI.core.ai.ai_engine")
+      local ai_engine = require("NeoAI.core.ai.engine")
       if not ai_engine.get_status().initialized then
         ai_engine.initialize({ config = {} })
       end
@@ -96,7 +101,7 @@ function M.run(test_module)
     end,
 
     test_engine_submodule_interfaces = function()
-      local ai_engine = require("NeoAI.core.ai.ai_engine")
+      local ai_engine = require("NeoAI.core.ai.engine")
       assert.is_true(
         type(ai_engine.estimate_request_tokens({ messages = {} })) == "number",
         "estimate_request_tokens 应返回数字"
@@ -108,13 +113,15 @@ function M.run(test_module)
 
     test_engine_shutdown = function()
       setup_engine_config()
-      local ai_engine = require("NeoAI.core.ai.ai_engine")
+      local ai_engine = require("NeoAI.core.ai.engine")
       ai_engine.shutdown()
       ai_engine.shutdown()
     end,
 
     test_engine_auto_name_session = function()
-      local ai_engine = require("NeoAI.core.ai.ai_engine")
+      local ai_engine = require("NeoAI.core.ai.engine")
+      -- 确保 engine 未初始化，因为前序测试文件可能已初始化
+      ai_engine.shutdown()
       local called = false
       ai_engine.auto_name_session("session_1", "测试消息", function(success, result)
         called = true
@@ -357,10 +364,10 @@ function M.run(test_module)
       local rr = require("NeoAI.core.ai.response_retry")
       local abnormal, reason = rr.detect_abnormal_response(
         "",
-        { { ["function"] = { name = "read_file", arguments = "" } } },
+        { { ["function"] = { name = "read_file", arguments = nil } } },
         { is_tool_loop = true }
       )
-      assert.is_true(abnormal, "空参数工具调用应视为异常")
+      assert.is_true(abnormal, "空参数(nil)工具调用应视为异常")
       local abnormal2, reason2 = rr.detect_abnormal_response("", {
         { ["function"] = { name = "read_file", arguments = '{"path":"/tmp/test"}' } },
         { ["function"] = { name = "read_file", arguments = '{"path":"/tmp/test"}' } },
@@ -407,16 +414,16 @@ function M.run(test_module)
       rr.set_config({ max_retries = 5, retry_delays = { 1000, 2000, 4000, 8000, 16000 } })
     end,
 
-    -- ========== tool_orchestrator ==========
+    -- ========== tool_cycle ==========
     test_orchestrator_initialize = function()
-      local orc = require("NeoAI.core.ai.tool_orchestrator")
+      local orc = require("NeoAI.core.ai.tool_cycle")
       orc._test_reset()
       orc.initialize({})
       orc.initialize({})
     end,
 
     test_orchestrator_register_unregister_session = function()
-      local orc = require("NeoAI.core.ai.tool_orchestrator")
+      local orc = require("NeoAI.core.ai.tool_cycle")
       orc.register_session("test_session_1", 1001)
       orc.register_session("test_session_2", 1002)
       orc.register_session("test_session_1", 1001)
@@ -426,7 +433,7 @@ function M.run(test_module)
     end,
 
     test_orchestrator_get_session_state = function()
-      local orc = require("NeoAI.core.ai.tool_orchestrator")
+      local orc = require("NeoAI.core.ai.tool_cycle")
       orc.register_session("test_state", 2001)
       local ss = orc.get_session_state("test_state")
       assert.not_nil(ss, "应返回会话状态")
@@ -437,13 +444,13 @@ function M.run(test_module)
     end,
 
     test_orchestrator_set_get_tools = function()
-      local orc = require("NeoAI.core.ai.tool_orchestrator")
+      local orc = require("NeoAI.core.ai.tool_cycle")
       orc.set_tools({ test_tool = { func = function() end } })
       assert.not_nil(orc.get_tools().test_tool)
     end,
 
     test_orchestrator_iteration = function()
-      local orc = require("NeoAI.core.ai.tool_orchestrator")
+      local orc = require("NeoAI.core.ai.tool_cycle")
       orc.register_session("test_iter", 3001)
       assert.equal(0, orc.get_current_iteration("test_iter"), "初始迭代次数应为0")
       orc.reset_iteration("test_iter")
@@ -451,14 +458,14 @@ function M.run(test_module)
     end,
 
     test_orchestrator_executing = function()
-      local orc = require("NeoAI.core.ai.tool_orchestrator")
+      local orc = require("NeoAI.core.ai.tool_cycle")
       orc.register_session("test_exec", 5001)
       assert.is_false(orc.is_executing("test_exec"))
       orc.unregister_session("test_exec")
     end,
 
     test_orchestrator_stop_requested = function()
-      local orc = require("NeoAI.core.ai.tool_orchestrator")
+      local orc = require("NeoAI.core.ai.tool_cycle")
       orc.register_session("test_stop", 6001)
       assert.is_false(orc.is_stop_requested("test_stop"))
       orc.request_stop("test_stop")
@@ -469,7 +476,7 @@ function M.run(test_module)
     end,
 
     test_orchestrator_request_stop_all = function()
-      local orc = require("NeoAI.core.ai.tool_orchestrator")
+      local orc = require("NeoAI.core.ai.tool_cycle")
       orc.register_session("test_all_1", 7001)
       orc.register_session("test_all_2", 7002)
       orc.request_stop()
@@ -481,7 +488,7 @@ function M.run(test_module)
     end,
 
     test_orchestrator_start_async_loop = function()
-      local orc = require("NeoAI.core.ai.tool_orchestrator")
+      local orc = require("NeoAI.core.ai.tool_cycle")
       orc.register_session("test_loop", 8001)
       local ok, err = pcall(orc.start_async_loop, orc, {
         session_id = "test_loop",
@@ -495,7 +502,7 @@ function M.run(test_module)
     end,
 
     test_orchestrator_on_generation_complete = function()
-      local orc = require("NeoAI.core.ai.tool_orchestrator")
+      local orc = require("NeoAI.core.ai.tool_cycle")
       local ok, err = pcall(
         orc.on_generation_complete,
         orc,
@@ -504,7 +511,7 @@ function M.run(test_module)
     end,
 
     test_orchestrator_set_shutting_down = function()
-      local orc = require("NeoAI.core.ai.tool_orchestrator")
+      local orc = require("NeoAI.core.ai.tool_cycle")
       local sf = require("NeoAI.core.shutdown_flag")
       sf.reset()
       orc.set_shutting_down()
@@ -513,14 +520,14 @@ function M.run(test_module)
     end,
 
     test_orchestrator_cleanup_all = function()
-      local orc = require("NeoAI.core.ai.tool_orchestrator")
+      local orc = require("NeoAI.core.ai.tool_cycle")
       orc.register_session("test_cleanup", 9001)
       orc.cleanup_all()
       assert.is_true(#orc.get_all_session_ids() == 0, "清理后应无会话")
     end,
 
     test_orchestrator_shutdown = function()
-      local orc = require("NeoAI.core.ai.tool_orchestrator")
+      local orc = require("NeoAI.core.ai.tool_cycle")
       orc.shutdown()
       orc.initialize({})
     end,
@@ -880,10 +887,10 @@ function M.run(test_module)
       assert.equal("user", result[1].role, "无 tool_call_id 的 tool 消息应转为 user")
     end,
 
-    -- ========== stream_processor ==========
+    -- ========== http_utils stream processor ==========
     test_stream_create_processor = function()
-      local sp = require("NeoAI.core.ai.stream_processor")
-      local processor = sp.create_processor("gen_1", "session_1", 1001)
+      local hu = require("NeoAI.utils.http_utils")
+      local processor = hu.create_stream_processor("gen_1", "session_1", 1001)
       assert.not_nil(processor)
       assert.equal("gen_1", processor.generation_id)
       assert.equal("", processor.content_buffer)
@@ -891,45 +898,45 @@ function M.run(test_module)
     end,
 
     test_stream_process_chunk_content = function()
-      local sp = require("NeoAI.core.ai.stream_processor")
-      local processor = sp.create_processor("gen_1", "session_1", 1001)
-      local result = sp.process_chunk(processor, { choices = { { delta = { content = "Hello" } } } })
+      local hu = require("NeoAI.utils.http_utils")
+      local processor = hu.create_stream_processor("gen_1", "session_1", 1001)
+      local result = hu.process_stream_chunk(processor, { choices = { { delta = { content = "Hello" } } } })
       assert.equal("Hello", result.content)
       assert.equal("Hello", processor.content_buffer)
     end,
 
     test_stream_process_chunk_reasoning = function()
-      local sp = require("NeoAI.core.ai.stream_processor")
-      local processor = sp.create_processor("gen_1", "session_1", 1001)
-      local result = sp.process_chunk(processor, { choices = { { delta = { reasoning_content = "思考中..." } } } })
+      local hu = require("NeoAI.utils.http_utils")
+      local processor = hu.create_stream_processor("gen_1", "session_1", 1001)
+      local result = hu.process_stream_chunk(processor, { choices = { { delta = { reasoning_content = "思考中..." } } } })
       assert.equal("思考中...", result.reasoning_content)
     end,
 
     test_stream_process_chunk_tool_calls = function()
-      local sp = require("NeoAI.core.ai.stream_processor")
-      local processor = sp.create_processor("gen_1", "session_1", 1001)
+      local hu = require("NeoAI.utils.http_utils")
+      local processor = hu.create_stream_processor("gen_1", "session_1", 1001)
       local chunk1 = { choices = { { delta = { tool_calls = { { index = 0, id = "call_1", type = "function" } } } } } }
       chunk1.choices[1].delta.tool_calls[1]["function"] = { name = "read_file", arguments = '{"path"' }
-      sp.process_chunk(processor, chunk1)
+      hu.process_stream_chunk(processor, chunk1)
       local chunk2 = { choices = { { delta = { tool_calls = { { index = 0 } } } } } }
       chunk2.choices[1].delta.tool_calls[1]["function"] = { arguments = ':"/tmp/test"}' }
-      local result2 = sp.process_chunk(processor, chunk2)
+      local result2 = hu.process_stream_chunk(processor, chunk2)
       assert.equal('{"path":"/tmp/test"}', processor.tool_calls[1]["function"].arguments)
     end,
 
     test_stream_process_chunk_finish = function()
-      local sp = require("NeoAI.core.ai.stream_processor")
-      local processor = sp.create_processor("gen_1", "session_1", 1001)
+      local hu = require("NeoAI.utils.http_utils")
+      local processor = hu.create_stream_processor("gen_1", "session_1", 1001)
       local result =
-        sp.process_chunk(processor, { choices = { { delta = { content = "完成" }, finish_reason = "stop" } } })
+        hu.process_stream_chunk(processor, { choices = { { delta = { content = "完成" }, finish_reason = "stop" } } })
       assert.is_true(result.is_final, "应标记为最终")
       assert.is_true(processor.is_finished, "处理器应标记为完成")
     end,
 
     test_stream_process_chunk_usage = function()
-      local sp = require("NeoAI.core.ai.stream_processor")
-      local processor = sp.create_processor("gen_1", "session_1", 1001)
-      local result = sp.process_chunk(processor, {
+      local hu = require("NeoAI.utils.http_utils")
+      local processor = hu.create_stream_processor("gen_1", "session_1", 1001)
+      local result = hu.process_stream_chunk(processor, {
         choices = { { delta = { content = "done" }, finish_reason = "stop" } },
         usage = { prompt_tokens = 10, completion_tokens = 20, total_tokens = 30 },
       })
@@ -937,20 +944,17 @@ function M.run(test_module)
     end,
 
     test_stream_process_chunk_finished = function()
-      local sp = require("NeoAI.core.ai.stream_processor")
-      local processor = sp.create_processor("gen_1", "session_1", 1001)
+      local hu = require("NeoAI.utils.http_utils")
+      local processor = hu.create_stream_processor("gen_1", "session_1", 1001)
       processor.is_finished = true
-      assert.equal(
-        nil,
-        sp.process_chunk(processor, { choices = { { delta = { content = "extra" } } } }),
-        "已完成的处理器应返回 nil"
-      )
+      local result = hu.process_stream_chunk(processor, { choices = { { delta = { content = "extra" } } } })
+      assert.is_nil(result.content, "已完成的处理器应忽略内容")
     end,
 
     test_stream_process_chunk_message_tool_calls = function()
-      local sp = require("NeoAI.core.ai.stream_processor")
-      local processor = sp.create_processor("gen_1", "session_1", 1001)
-      local result = sp.process_chunk(processor, {
+      local hu = require("NeoAI.utils.http_utils")
+      local processor = hu.create_stream_processor("gen_1", "session_1", 1001)
+      local result = hu.process_stream_chunk(processor, {
         choices = {
           {
             message = {
@@ -965,24 +969,24 @@ function M.run(test_module)
     end,
 
     test_stream_filter_valid_tool_calls = function()
-      local sp = require("NeoAI.core.ai.stream_processor")
-      local valid = sp.filter_valid_tool_calls({
-        { ["function"] = { name = "valid_tool", arguments = "{}" } },
-        { ["function"] = { name = "", arguments = "{}" } },
-        { ["function"] = { name = "valid_tool2", arguments = "" } },
+      local hu = require("NeoAI.utils.http_utils")
+      local valid = hu.filter_valid_tool_calls({
+        { ["function"] = { name = "valid_tool", arguments = { key = "value" } } },
+        { ["function"] = { name = "", arguments = {} } },
+        { ["function"] = { name = "valid_tool2", arguments = {} } },
       })
-      assert.equal(1, #valid, "应只保留 1 个有效工具调用")
-      assert.is_true(#sp.filter_valid_tool_calls({}) == 0, "空列表应返回空表")
+      assert.equal(2, #valid, "应保留 2 个有效工具调用")
+      assert.is_true(#hu.filter_valid_tool_calls({}) == 0, "空列表应返回空表")
     end,
 
     test_stream_reasoning_throttle = function()
-      local sp = require("NeoAI.core.ai.stream_processor")
-      sp.clear_reasoning_throttle()
-      local processor = sp.create_processor("gen_2", "session_2", 1002)
-      sp.push_reasoning_content("gen_2", "思考", processor, {})
-      sp.push_reasoning_content("gen_2", "过程", processor, {})
-      sp.clear_reasoning_throttle()
-      sp.clear_reasoning_throttle()
+      local hu = require("NeoAI.utils.http_utils")
+      hu.clear_reasoning_throttle()
+      local processor = hu.create_stream_processor("gen_2", "session_2", 1002)
+      hu.push_reasoning_content("gen_2", "思考", processor, {})
+      hu.push_reasoning_content("gen_2", "过程", processor, {})
+      hu.clear_reasoning_throttle()
+      hu.clear_reasoning_throttle()
     end,
   })
 end

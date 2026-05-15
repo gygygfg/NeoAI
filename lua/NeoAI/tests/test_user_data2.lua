@@ -1,4 +1,11 @@
 --- 用用户实际数据测试 build_connectors（修正版）
+local logger = require("NeoAI.utils.logger")
+logger.initialize({
+  level = "DEBUG",
+  output_path = "/tmp/neoai_test_user_data2.log",
+  print_debug = false,
+})
+
 local function build_connectors(flat_items)
   if not flat_items or #flat_items == 0 then
     return {}
@@ -87,5 +94,5 @@ local items = {
 local prefixes = build_connectors(items)
 local lines = render(items, prefixes)
 for _, l in ipairs(lines) do
-  print(l)
+  logger.info(l)
 end

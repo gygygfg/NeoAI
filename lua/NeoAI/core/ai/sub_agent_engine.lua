@@ -5,7 +5,7 @@
 --   3. 构建子 agent 的系统提示词
 --   4. 处理子 agent 的 AI 生成请求
 --
--- 工具循环控制已统一由 tool_orchestrator 管理
+-- 工具循环控制已统一由 tool_cycle 管理
 -- sub_agent_engine 不再维护独立的循环控制逻辑
 
 local M = {}
@@ -14,7 +14,7 @@ local logger = require("NeoAI.utils.logger")
 local state_manager = require("NeoAI.core.config.state")
 local event_constants = require("NeoAI.core.events")
 local plan_executor = require("NeoAI.tools.builtin.plan_executor")
-local request_builder = require("NeoAI.core.ai.request_builder")
+local request_handler = require("NeoAI.core.ai.request_handler")
 
 -- ========== 子 agent 执行状态 ==========
 
@@ -23,7 +23,7 @@ local sub_agent_runners = {} -- sub_agent_id -> runner state
 -- ========== 工具调用审核 ==========
 
 --- 审核子 agent 的工具调用是否超出边界
---- 由 tool_orchestrator._execute_single_tool 在每次工具执行前调用
+--- 由 tool_cycle._execute_single_tool 在每次工具执行前调用
 --- @param sub_agent_id string
 --- @param tool_name string
 --- @param args table
@@ -39,17 +39,17 @@ end
 -- ========== 子 agent 工具循环 ==========
 
 --- 启动子 agent 的工具循环
---- 注册子 agent 会话到 tool_orchestrator，然后通过 TOOL_RESULT_RECEIVED 事件触发 AI 生成
+--- 注册子 agent 会话到 tool_cycle，然后通过 TOOL_RESULT_RECEIVED 事件触发 AI 生成
 --- @param sub_agent_id string
 --- @param tool_calls table 子 agent 首次返回的工具调用列表
 --- @param session_context table 会话上下文
 function M.start_sub_agent_loop(sub_agent_id, tool_calls, session_context)
   logger.debug("[sub_agent] start_sub_agent_loop: id=%s, tool_calls=%d", sub_agent_id, #(tool_calls or {}))
 
-  local tool_orchestrator = require("NeoAI.core.ai.tool_orchestrator")
+  local tool_cycle = require("NeoAI.core.ai.tool_cycle")
 
-  -- 注册子 agent 会话到 tool_orchestrator
-  tool_orchestrator.register_sub_agent_session(sub_agent_id, session_context.session_id, session_context.window_id, {
+  -- 注册子 agent 会话到 tool_cycle
+  tool_cycle.register_sub_agent_session(sub_agent_id, session_context.session_id, session_context.window_id, {
     messages = session_context.messages or {},
     options = session_context.options or {},
     model_index = session_context.model_index or 1,
@@ -104,7 +104,7 @@ end
 -- ========== 子 agent 完成处理 ==========
 
 --- 结束子 agent 并触发总结回调
---- 由 tool_orchestrator._finish_loop 在子 agent 循环结束时调用
+--- 由 tool_cycle._finish_loop 在子 agent 循环结束时调用
 --- @param sub_agent_id string
 --- @param result string|nil 最终结果
 function M._finalize_sub_agent(sub_agent_id, result)
@@ -129,19 +129,19 @@ function M._finalize_sub_agent(sub_agent_id, result)
   -- 清理 runner
   sub_agent_runners[sub_agent_id] = nil
 
-  -- 注销 tool_orchestrator 中的子 agent 会话
-  local tool_orchestrator = require("NeoAI.core.ai.tool_orchestrator")
-  tool_orchestrator.unregister_sub_agent_session(sub_agent_id)
+  -- 注销 tool_cycle 中的子 agent 会话
+  local tool_cycle = require("NeoAI.core.ai.tool_cycle")
+  tool_cycle.unregister_sub_agent_session(sub_agent_id)
 end
 
 -- ========== AI 生成请求 ==========
 
 --- 发起子 agent 的 AI 生成请求
---- 由 tool_orchestrator._request_generation 在子 agent 需要下一轮生成时调用
+--- 由 tool_cycle._request_generation 在子 agent 需要下一轮生成时调用
 --- @param sub_agent_id string
 function M._request_generation(sub_agent_id)
-  local tool_orchestrator = require("NeoAI.core.ai.tool_orchestrator")
-  local ss = tool_orchestrator.get_session_state(sub_agent_id)
+  local tool_cycle = require("NeoAI.core.ai.tool_cycle")
+  local ss = tool_cycle.get_session_state(sub_agent_id)
   if not ss or ss.stop_requested then
     return
   end
@@ -346,13 +346,13 @@ end
 -- ========== 停止控制 ==========
 
 function M.request_stop(sub_agent_id)
-  local tool_orchestrator = require("NeoAI.core.ai.tool_orchestrator")
-  tool_orchestrator.request_stop(sub_agent_id)
+  local tool_cycle = require("NeoAI.core.ai.tool_cycle")
+  tool_cycle.request_stop(sub_agent_id)
 end
 
 function M.is_running(sub_agent_id)
-  local tool_orchestrator = require("NeoAI.core.ai.tool_orchestrator")
-  local ss = tool_orchestrator.get_session_state(sub_agent_id)
+  local tool_cycle = require("NeoAI.core.ai.tool_cycle")
+  local ss = tool_cycle.get_session_state(sub_agent_id)
   return ss ~= nil and not ss.stop_requested
 end
 

@@ -33,6 +33,11 @@ local state = {
   format = "[{time}] [{level}] {message}", -- 日志格式
   max_file_size = 10485760, -- 最大文件大小：10MB
   max_backups = 5, -- 最大备份文件数量
+  -- 标记哪些字段是用户通过 setter 显式设置的，initialize 不应覆盖
+  _explicit = {
+    level = false,
+    output_path = false,
+  },
 }
 
 --- 初始化日志器
@@ -51,14 +56,14 @@ function M.initialize(config)
 
   config = config or {}
 
-  -- 设置日志级别
-  if config.level then
+  -- 设置日志级别（仅当用户未通过 set_level 显式设置时）
+  if config.level and not state._explicit.level then
     local level_name = config.level:upper()
     state.level = LOG_LEVELS[level_name] or LOG_LEVELS.INFO
   end
 
-  -- 设置输出路径
-  if config.output_path then
+  -- 设置输出路径（仅当用户未通过 set_output 显式设置时）
+  if config.output_path and not state._explicit.output_path then
     M.set_output(config.output_path)
   end
 
@@ -123,6 +128,8 @@ function M.set_level(level)
 
   local level_name = level:upper()
   state.level = LOG_LEVELS[level_name] or LOG_LEVELS.INFO
+  -- 标记为显式设置，initialize 不应覆盖
+  state._explicit.level = true
 end
 
 --- 设置输出路径
@@ -136,6 +143,7 @@ function M.set_output(path)
 
     state.output = nil
     state.output_path = nil
+    state._explicit.output_path = false
     return
   end
 
@@ -147,15 +155,22 @@ function M.set_output(path)
   state.output_path = path
 
   -- 以追加模式打开文件
+  -- 使用 "a" 模式，之后通过 setvbuf("no") 禁用缓冲
+  -- 这样每次 write 直接写入内核缓冲区，避免 timeout 杀进程时数据丢失
   local ok, file = pcall(io.open, path, "a")
   if ok and file then
     state.output = file
+    -- 禁用文件缓冲：每次 write 立即写入内核（而非等到缓冲区满或 fflush）
+    -- 关键修复：防止 timeout 杀进程时 C 库 stdio 缓冲区中的数据丢失
+    pcall(file.setvbuf, file, "no")
   else
     -- 如果无法打开文件，回退到标准输出
     state.output = nil
     state.output_path = nil
     M.error("无法打开日志文件: " .. tostring(path))
   end
+  -- 标记为显式设置，initialize 不应覆盖
+  state._explicit.output_path = true
 end
 
 --- 调试级别日志
@@ -305,11 +320,16 @@ function M._write_entry(entry)
     else
       -- 文件句柄
       state.output:write(entry .. "\n")
+      -- 每次写入后立即刷新，确保数据从 Lua 缓冲区写入 C 库缓冲区
       state.output:flush()
     end
   else
-    -- 静默输出到后台（使用 print 而非 vim.notify，避免弹通知）
-    print(entry)
+    -- 没有文件输出时，使用 vim.notify 而非 print，避免污染控制台
+    if vim and vim.notify then
+      vim.notify(entry, vim.log.levels.DEBUG)
+    else
+      print(entry)
+    end
   end
 end
 

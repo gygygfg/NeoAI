@@ -110,8 +110,8 @@ local function _create_sub_agent(args, on_success, on_error)
   -- 注意：排除所有 agent 管理相关工具（创建、查看、取消子 agent），
   -- 子 agent 不应该能创建其他子 agent 或管理自身生命周期
   if allowed_tools == nil then
-    local ai_engine = require("NeoAI.core.ai.ai_engine")
-    local all_tools = ai_engine.get_tools() or {}
+    local tool_cycle = require("NeoAI.core.ai.tool_cycle")
+    local all_tools = tool_cycle.get_tools() or {}
     -- 需要排除的 agent 管理工具名称列表
     local agent_tools = {
       create_sub_agent = true,

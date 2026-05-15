@@ -625,7 +625,7 @@ local function _run_command(args, on_success, on_error, on_progress)
       local timeout_prompt = build_timeout_check_message()
 
       -- 调用 AI 判断命令是否卡住或已完成
-      local tool_orchestrator = require("NeoAI.core.ai.tool_orchestrator")
+      local tool_orchestrator = require("NeoAI.core.ai.tool_cycle")
       local chat_session_id = args._session_id
 
       -- 临时注册 check_shell_timeout 工具
@@ -819,7 +819,7 @@ local function _run_command(args, on_success, on_error, on_progress)
 
     -- 调用AI决定输入内容
     -- 注意：PTY buffer 的读取放在 vim.schedule 回调内部，确保每次获取最新内容
-    local tool_orchestrator = require("NeoAI.core.ai.tool_orchestrator")
+    local tool_orchestrator = require("NeoAI.core.ai.tool_cycle")
     local chat_session_id = args._session_id
 
     -- 临时注册 send_input 工具

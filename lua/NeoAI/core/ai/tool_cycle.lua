@@ -1,5 +1,5 @@
 -- 统一的工具循环引擎（事件驱动架构）
--- 负责管理主 agent 和子 agent 的工具调用循环执行
+-- 职责：管理主 agent 和子 agent 的工具调用循环执行
 --
 -- 阶段定义：
 --   idle          - 空闲状态
@@ -15,6 +15,11 @@
 --   通过 _sub_agent_id 区分主 agent 和子 agent 的会话
 --   子 agent 拥有独立的会话状态（消息、迭代计数、停止标志）
 --   所有工具执行的循环控制统一由本模块管理
+--
+-- 不在此模块的职责：
+--   - 工具名称模糊匹配 → tool_executor._normalize_tool_name
+--   - 单次工具请求 → tool_executor.execute_single_tool_request
+--   - 工具注册 → tool_registry
 
 local M = {}
 
@@ -22,7 +27,7 @@ local logger = require("NeoAI.utils.logger")
 local event_constants = require("NeoAI.core.events")
 local tool_pack = require("NeoAI.tools.tool_pack")
 local shutdown_flag = require("NeoAI.core.shutdown_flag")
-local response_retry = require("NeoAI.core.ai.response_retry")
+local request_handler = require("NeoAI.core.ai.request_handler")
 local state_manager = require("NeoAI.core.config.state")
 local plan_executor = require("NeoAI.tools.builtin.plan_executor")
 
@@ -33,8 +38,8 @@ local _tools = {}
 local state = {
   initialized = false,
   config = nil,
-  sessions = {},            -- 主 agent 会话
-  sub_agent_sessions = {},  -- 子 agent 会话（sub_agent_id -> session state）
+  sessions = {}, -- 主 agent 会话
+  sub_agent_sessions = {}, -- 子 agent 会话（sub_agent_id -> session state）
 }
 
 -- ========== 辅助函数 ==========
@@ -57,13 +62,13 @@ end
 --- 由于 fire_loop_finished 在调用此函数之前已触发，事件可能已错过
 --- 因此直接执行回调，不再等待事件
 local function once_display_closed(session_id, callback)
-  vim.schedule(function()
-    -- 检查是否正在退出，避免在退出过程中执行回调导致卡死
-    if is_shutting_down() then
-      return
-    end
-    callback()
-  end)
+  -- 直接执行回调，不再使用 vim.schedule 延迟
+  -- 之前的 vim.schedule 是为了等待 TOOL_DISPLAY_CLOSED 事件
+  -- 但现在该事件已不再使用，直接执行回调可以减少工具循环的延迟
+  if is_shutting_down() then
+    return
+  end
+  callback()
 end
 
 --- 触发 TOOL_LOOP_FINISHED 事件
@@ -254,8 +259,7 @@ function M.register_session(session_id, window_id)
             if not acc.completion_tokens_details then
               acc.completion_tokens_details = {}
             end
-            acc.completion_tokens_details.reasoning_tokens = (acc.completion_tokens_details.reasoning_tokens or 0)
-              + rt
+            acc.completion_tokens_details.reasoning_tokens = (acc.completion_tokens_details.reasoning_tokens or 0) + rt
           end
           s.accumulated_usage = acc
         end
@@ -264,6 +268,29 @@ function M.register_session(session_id, window_id)
         end
 
         M._check_round_complete(session_id)
+      end,
+    })
+  )
+
+  -- TOOL_LOOP_FINISHED 监听器（统一处理进入 idle 状态）
+  table.insert(
+    ids,
+    vim.api.nvim_create_autocmd("User", {
+      pattern = event_constants.TOOL_LOOP_FINISHED,
+      callback = function(args)
+        local data = args.data
+        if data.session_id ~= session_id then
+          return
+        end
+        if not data.is_round_end then
+          return
+        end
+        local s = state.sessions[session_id]
+        if not s then
+          return
+        end
+        -- 统一由事件驱动进入 idle 状态
+        s.phase = "idle"
       end,
     })
   )
@@ -305,6 +332,30 @@ function M.register_sub_agent_session(sub_agent_id, session_id, window_id, param
   ss.ai_preset = params.ai_preset or {}
   ss._on_summary = params.on_summary
   ss.max_iterations = params.max_iterations or 10
+
+  -- 为子 agent 注册 TOOL_LOOP_FINISHED 监听器（统一 idle 状态管理）
+  local ids = {}
+  table.insert(
+    ids,
+    vim.api.nvim_create_autocmd("User", {
+      pattern = event_constants.TOOL_LOOP_FINISHED,
+      callback = function(args)
+        local data = args.data
+        if data.session_id ~= sub_agent_id then
+          return
+        end
+        if not data.is_round_end then
+          return
+        end
+        local s = state.sub_agent_sessions[sub_agent_id]
+        if not s then
+          return
+        end
+        s.phase = "idle"
+      end,
+    })
+  )
+  ss.autocmd_ids = ids
 
   state.sub_agent_sessions[sub_agent_id] = ss
 end
@@ -401,6 +452,27 @@ function M.start_async_loop(params)
   ss._generation_completed = true
   ss._tools_all_completed = false
 
+  -- 首次进入工具循环时（非工具循环重入），插入 assistant 消息（带 tool_calls）
+  -- 确保 tool 结果消息前面有对应的 assistant 消息，避免 API 报错
+  -- "Messages with role 'tool' must be a response to a preceding message with 'tool_calls'"
+  if params.tool_calls and #params.tool_calls > 0 then
+    local last_msg = ss.messages[#ss.messages]
+    if not last_msg or last_msg.role ~= "assistant" or not last_msg.tool_calls then
+      local assistant_msg = {
+        role = "assistant",
+        content = params.content or "",
+        timestamp = os.time(),
+        window_id = ss.window_id,
+      }
+      if params.reasoning and params.reasoning ~= "" then
+        assistant_msg.reasoning_content = params.reasoning
+        ss.last_reasoning = params.reasoning
+      end
+      assistant_msg.tool_calls = params.tool_calls
+      table.insert(ss.messages, assistant_msg)
+    end
+  end
+
   -- 注册全局 ESC 停止监听器（仅在循环开始时注册一次）
   if not _stop_listener_id then
     _stop_listener_id = vim.api.nvim_create_autocmd("User", {
@@ -422,8 +494,8 @@ function M.start_async_loop(params)
           end
         end
         -- 清理所有活跃的 HTTP 请求
-        local http_client = require("NeoAI.core.ai.http_client")
-        http_client.cancel_all_requests()
+        local http_utils = require("NeoAI.utils.http_utils")
+        http_utils.cancel_all_requests()
       end,
     })
   end
@@ -445,8 +517,12 @@ function M._execute_tools(session_id, tool_calls, is_sub_agent)
     return
   end
 
-  require("NeoAI.utils.logger").debug("[DEBUG_DUP] _execute_tools 进入: session=%s, tool_calls=%d, phase=%s",
-    tostring(session_id), #tool_calls, tostring(ss and ss.phase))
+  require("NeoAI.utils.logger").debug(
+    "[DEBUG_DUP] _execute_tools 进入: session=%s, tool_calls=%d, phase=%s",
+    tostring(session_id),
+    #tool_calls,
+    tostring(ss and ss.phase)
+  )
 
   if #tool_calls == 0 then
     vim.schedule(function()
@@ -461,7 +537,8 @@ function M._execute_tools(session_id, tool_calls, is_sub_agent)
     local func = tc["function"] or tc.func
     table.insert(tool_names, func and func.name or "unknown")
   end
-  require("NeoAI.utils.logger").debug("[DEBUG_DUP] _execute_tools: session=%s, tools=%s, phase=%s, iter=%d, stack=%s",
+  require("NeoAI.utils.logger").debug(
+    "[DEBUG_DUP] _execute_tools: session=%s, tools=%s, phase=%s, iter=%d, stack=%s",
     tostring(session_id),
     table.concat(tool_names, ","),
     tostring(ss.phase),
@@ -583,7 +660,11 @@ function M._execute_single_tool(session_id, tool_call, is_sub_agent)
             end
           end
           if updated then
-            logger.debug("[tool_orchestrator] 已更新 assistant 消息中工具名称: '%s' -> '%s'", original_tool_name, tool_name)
+            logger.debug(
+              "[tool_orchestrator] 已更新 assistant 消息中工具名称: '%s' -> '%s'",
+              original_tool_name,
+              tool_name
+            )
           end
         end
       end
@@ -619,7 +700,8 @@ function M._execute_single_tool(session_id, tool_call, is_sub_agent)
   end
 
   -- 调试日志：追踪 _execute_single_tool 调用
-  require("NeoAI.utils.logger").debug("[DEBUG_DUP] _execute_single_tool: session=%s, tool=%s, tool_call_id=%s, active_count=%d, stack=%s",
+  require("NeoAI.utils.logger").debug(
+    "[DEBUG_DUP] _execute_single_tool: session=%s, tool=%s, tool_call_id=%s, active_count=%d, stack=%s",
     tostring(session_id),
     tostring(tool_name),
     tostring(tool_call.id or "nil"),
@@ -716,9 +798,8 @@ function M._execute_single_tool(session_id, tool_call, is_sub_agent)
                   return
                 end
 
-                local summary_msg = string.format(
-                  "【子 agent 执行完成】\n子 agent ID: %s\n\n%s", sub_agent_id, summary
-                )
+                local summary_msg =
+                  string.format("【子 agent 执行完成】\n子 agent ID: %s\n\n%s", sub_agent_id, summary)
 
                 table.insert(s2.messages, {
                   role = "user",
@@ -844,7 +925,8 @@ function M._on_tools_complete(session_id, is_sub_agent)
   ss._tools_all_completed = true
 
   -- 调试日志：追踪 _on_tools_complete 调用
-  require("NeoAI.utils.logger").debug("[DEBUG_DUP] _on_tools_complete: session=%s, phase=%s, iter=%d, _tools_complete_in_progress=%s, active_count=%d, stack=%s",
+  require("NeoAI.utils.logger").debug(
+    "[DEBUG_DUP] _on_tools_complete: session=%s, phase=%s, iter=%d, _tools_complete_in_progress=%s, active_count=%d, stack=%s",
     tostring(session_id),
     tostring(ss.phase),
     ss.current_iteration or 0,
@@ -859,7 +941,6 @@ function M._on_tools_complete(session_id, is_sub_agent)
   ss._tools_complete_in_progress = true
 
   if ss.stop_requested then
-    ss.phase = "idle"
     ss._tools_complete_in_progress = false
     ss._generation_completed = false
     ss._tools_all_completed = false
@@ -948,7 +1029,7 @@ function M._check_round_complete(session_id, is_sub_agent)
   end
 
   if ss.stop_requested then
-    ss.phase = "idle"
+    -- idle 状态由 TOOL_LOOP_FINISHED 监听器统一设置
     return
   end
 
@@ -996,7 +1077,8 @@ function M._proceed_to_next_round(session_id, is_sub_agent)
   end
 
   -- 调试日志：追踪 _proceed_to_next_round 调用
-  require("NeoAI.utils.logger").debug("[DEBUG_DUP] _proceed_to_next_round: session=%s, phase=%s, iter=%d, _proceed_in_progress=%s, stack=%s",
+  require("NeoAI.utils.logger").debug(
+    "[DEBUG_DUP] _proceed_to_next_round: session=%s, phase=%s, iter=%d, _proceed_in_progress=%s, stack=%s",
     tostring(session_id),
     tostring(ss.phase),
     ss.current_iteration or 0,
@@ -1059,26 +1141,25 @@ function M.on_generation_complete(data)
   local sessions_table = is_sub_agent and state.sub_agent_sessions or state.sessions
   local session_id = is_sub_agent and sub_agent_id or data.session_id
 
-  require("NeoAI.utils.logger").debug("[DEBUG_DUP] on_generation_complete 进入: session=%s, gen_id=%s, data.gen_id=%s, tool_calls=%d, ss=%s",
+  require("NeoAI.utils.logger").debug(
+    "[DEBUG_DUP] on_generation_complete 进入: session=%s, gen_id=%s, data.gen_id=%s, tool_calls=%d, ss=%s",
     tostring(session_id),
     tostring(sessions_table[session_id] and sessions_table[session_id].generation_id),
     tostring(data.generation_id),
     #(data.tool_calls or {}),
-    tostring(sessions_table[session_id] ~= nil))
+    tostring(sessions_table[session_id] ~= nil)
+  )
 
   local ss = sessions_table[session_id]
   if not ss or ss.generation_id ~= data.generation_id then
-    require("NeoAI.utils.logger").debug("[DEBUG_DUP] on_generation_complete 提前返回: ss=%s, ss.gen_id=%s, data.gen_id=%s",
+    require("NeoAI.utils.logger").debug(
+      "[DEBUG_DUP] on_generation_complete 提前返回: ss=%s, ss.gen_id=%s, data.gen_id=%s",
       tostring(ss ~= nil),
       tostring(ss and ss.generation_id),
-      tostring(data.generation_id))
+      tostring(data.generation_id)
+    )
     return
   end
-
-  -- 标记 AI 生成已完成（用于双事件等待机制）
-  ss._generation_completed = true
-  -- AI 生成完成时也检查是否两个事件都已到达，若工具已先完成则立即进入下一轮
-  M._check_round_complete(session_id, is_sub_agent)
 
   local tool_calls = data.tool_calls or {}
   local content = data.content or ""
@@ -1087,19 +1168,19 @@ function M.on_generation_complete(data)
   local current_usage = data.usage or {}
   if current_usage and next(current_usage) then
     local acc = ss.accumulated_usage or {}
-      acc.prompt_tokens = (acc.prompt_tokens or 0) + (current_usage.prompt_tokens or current_usage.input_tokens or 0)
-      acc.completion_tokens = (acc.completion_tokens or 0)
-        + (current_usage.completion_tokens or current_usage.output_tokens or 0)
-      acc.total_tokens = (acc.total_tokens or 0) + (current_usage.total_tokens or 0)
-      if current_usage.completion_tokens_details and type(current_usage.completion_tokens_details) == "table" then
-        local rt = current_usage.completion_tokens_details.reasoning_tokens or 0
-        if not acc.completion_tokens_details then
-          acc.completion_tokens_details = {}
-        end
-        acc.completion_tokens_details.reasoning_tokens = (acc.completion_tokens_details.reasoning_tokens or 0) + rt
+    acc.prompt_tokens = (acc.prompt_tokens or 0) + (current_usage.prompt_tokens or current_usage.input_tokens or 0)
+    acc.completion_tokens = (acc.completion_tokens or 0)
+      + (current_usage.completion_tokens or current_usage.output_tokens or 0)
+    acc.total_tokens = (acc.total_tokens or 0) + (current_usage.total_tokens or 0)
+    if current_usage.completion_tokens_details and type(current_usage.completion_tokens_details) == "table" then
+      local rt = current_usage.completion_tokens_details.reasoning_tokens or 0
+      if not acc.completion_tokens_details then
+        acc.completion_tokens_details = {}
       end
-      ss.accumulated_usage = acc
+      acc.completion_tokens_details.reasoning_tokens = (acc.completion_tokens_details.reasoning_tokens or 0) + rt
     end
+    ss.accumulated_usage = acc
+  end
 
   -- 过滤无效工具调用
   local valid_tool_calls = {}
@@ -1154,62 +1235,62 @@ function M.on_generation_complete(data)
   end
 
   -- ===== 工具调用异常检测与重试 =====
-  local abnormal, reason = response_retry.detect_abnormal_response(content, tool_calls, {
+  local abnormal, reason = request_handler.detect_abnormal_response(content, tool_calls, {
     is_tool_loop = true,
   })
-    if abnormal then
-      local retry_count = ss._tool_retry_count or 0
-      if response_retry.can_retry(retry_count) then
-        local new_retry_count = retry_count + 1
-        ss._tool_retry_count = new_retry_count
-        local delay = response_retry.get_retry_delay(new_retry_count)
-        logger.warn(
-          string.format(
-            "[tool_orchestrator] 检测到异常工具调用 (重试 %d/%d): %s, 延迟 %dms 后重试",
-            new_retry_count,
-            response_retry.get_max_retries(),
-            reason,
-            delay
-          )
+  if abnormal then
+    local retry_count = ss._tool_retry_count or 0
+    if request_handler.can_retry(retry_count) then
+      local new_retry_count = retry_count + 1
+      ss._tool_retry_count = new_retry_count
+      local delay = request_handler.get_retry_delay(new_retry_count)
+      logger.warn(
+        string.format(
+          "[tool_orchestrator] 检测到异常工具调用 (重试 %d/%d): %s, 延迟 %dms 后重试",
+          new_retry_count,
+          request_handler.get_max_retries(),
+          reason,
+          delay
         )
-        vim.api.nvim_exec_autocmds("User", {
-          pattern = event_constants.GENERATION_RETRYING,
-          data = {
-            generation_id = ss.generation_id,
-            retry_count = new_retry_count,
-            max_retries = response_retry.get_max_retries(),
-            reason = reason,
-            session_id = session_id,
-            window_id = ss.window_id,
-            layer = "tool_orchestrator",
-          },
-        })
-        if #ss.messages > 0 then
-          local last_msg = ss.messages[#ss.messages]
-          if last_msg.role == "assistant" and last_msg.tool_calls then
-            table.remove(ss.messages)
-          end
-        end
-        vim.defer_fn(function()
-          M._request_generation(session_id, is_sub_agent)
-        end, delay)
-        return
-      else
-        logger.warn(
-          string.format(
-            "[tool_orchestrator] 工具调用异常但重试已达上限 (%d/%d): %s",
-            retry_count,
-            response_retry.get_max_retries(),
-            reason
-          )
-        )
-        if reason and reason:find("空响应") then
-          logger.warn("[tool_orchestrator] 空响应重试已达上限，触发生成错误")
-          M._finish_loop(session_id, false, "AI 多次返回空响应", is_sub_agent)
-          return
+      )
+      vim.api.nvim_exec_autocmds("User", {
+        pattern = event_constants.GENERATION_RETRYING,
+        data = {
+          generation_id = ss.generation_id,
+          retry_count = new_retry_count,
+          max_retries = request_handler.get_max_retries(),
+          reason = reason,
+          session_id = session_id,
+          window_id = ss.window_id,
+          layer = "tool_orchestrator",
+        },
+      })
+      if #ss.messages > 0 then
+        local last_msg = ss.messages[#ss.messages]
+        if last_msg.role == "assistant" and last_msg.tool_calls then
+          table.remove(ss.messages)
         end
       end
+      vim.defer_fn(function()
+        M._request_generation(session_id, is_sub_agent)
+      end, delay)
+      return
+    else
+      logger.warn(
+        string.format(
+          "[tool_orchestrator] 工具调用异常但重试已达上限 (%d/%d): %s",
+          retry_count,
+          request_handler.get_max_retries(),
+          reason
+        )
+      )
+      if reason and reason:find("空响应") then
+        logger.warn("[tool_orchestrator] 空响应重试已达上限，触发生成错误")
+        M._finish_loop(session_id, false, "AI 多次返回空响应", is_sub_agent)
+        return
+      end
     end
+  end
   if ss then
     ss._tool_retry_count = 0
   end
@@ -1252,7 +1333,7 @@ function M.on_generation_complete(data)
       local saved_gen_id = ss.generation_id
       local on_complete = ss.on_complete
       ss.on_complete = nil
-      ss.phase = "idle"
+      -- idle 状态由 TOOL_LOOP_FINISHED 监听器统一设置
       ss.active_tool_calls = {}
       ss.current_iteration = 0
       ss.generation_id = nil
@@ -1269,7 +1350,7 @@ function M.on_generation_complete(data)
       local saved_gen_id = ss.generation_id
       local on_complete = ss.on_complete
       ss.on_complete = nil
-      ss.phase = "idle"
+      -- idle 状态由 TOOL_LOOP_FINISHED 监听器统一设置
       ss.active_tool_calls = {}
       ss.current_iteration = 0
       ss.generation_id = nil
@@ -1323,6 +1404,10 @@ function M.on_generation_complete(data)
 
   ss.current_iteration = ss.current_iteration + 1
 
+  -- 标记 AI 生成已完成（用于双事件等待机制）
+  -- 注意：必须在工具执行前设置，这样工具完成后 _check_round_complete 才能检测到两个事件都已到达
+  ss._generation_completed = true
+
   fire_loop_finished(ss, false, "ai_complete")
   once_display_closed(session_id, function()
     local s = sessions_table[session_id]
@@ -1342,6 +1427,7 @@ function M.on_generation_complete(data)
   end)
 end
 
+--- @deprecated 已移至 tool_executor
 --- 计算两个字符串的编辑距离（Levenshtein）
 --- @param s1 string
 --- @param s2 string
@@ -1359,18 +1445,16 @@ local function _levenshtein(s1, s2)
   for i = 1, len1 do
     for j = 1, len2 do
       local cost = s1:sub(i, i) == s2:sub(j, j) and 0 or 1
-      matrix[i][j] = math.min(
-        matrix[i - 1][j] + 1,
-        matrix[i][j - 1] + 1,
-        matrix[i - 1][j - 1] + cost
-      )
+      matrix[i][j] = math.min(matrix[i - 1][j] + 1, matrix[i][j - 1] + 1, matrix[i - 1][j - 1] + cost)
     end
   end
   return matrix[len1][len2]
 end
 
+--- @deprecated 已移至 tool_executor._normalize_tool_name
 --- 模糊匹配工具名称
 --- 当模型调用了不存在的工具时，尝试找到最相似的工具
+--- 新代码请使用 tool_executor._normalize_tool_name()
 --- @param input string 模型输入的工具名称
 --- @param all_names string[] 所有可用工具名称列表
 --- @return string|nil 最匹配的工具名称，或 nil
@@ -1525,6 +1609,9 @@ function M._finish_loop(session_id, success, result, is_sub_agent)
     _stop_listener_id = nil
   end
 
+  -- 先触发 TOOL_LOOP_FINISHED（is_round_end=true），由监听器统一设置 idle 状态
+  fire_loop_finished(ss, true, "tools_complete")
+
   -- 第二次调用 _finish_loop（on_complete 已被消费）
   if ss.on_complete == nil then
     local saved_gen_id = ss.generation_id
@@ -1533,7 +1620,7 @@ function M._finish_loop(session_id, success, result, is_sub_agent)
     local saved_reasoning = ss.last_reasoning or ""
     local saved_result = result or ""
 
-    ss.phase = "idle"
+    -- idle 状态由 TOOL_LOOP_FINISHED 监听器统一设置
     ss.active_tool_calls = {}
     ss.current_iteration = 0
     ss.generation_id = nil
@@ -1570,7 +1657,7 @@ function M._finish_loop(session_id, success, result, is_sub_agent)
   local saved_result = result or ""
 
   ss.on_complete = nil
-  ss.phase = "idle"
+  -- idle 状态由 TOOL_LOOP_FINISHED 监听器统一设置
   ss.active_tool_calls = {}
   ss.current_iteration = 0
   ss.generation_id = nil
@@ -1703,8 +1790,10 @@ end
 
 -- ========== 单次工具请求（不计入工具循环） ==========
 
+--- @deprecated 已移至 tool_executor.register_tool_for_request
 --- 临时注册一个工具到 tool_registry，供 execute_single_tool_request 使用
 --- 返回一个清理函数，调用后移除该工具
+--- 新代码请使用 tool_executor.register_tool_for_request()
 --- @param tool_name string 工具名称
 --- @return function|nil 清理函数，调用后移除工具；注册失败返回 nil
 function M.register_tool_for_request(tool_name)
@@ -1745,8 +1834,10 @@ function M.register_tool_for_request(tool_name)
   end
 end
 
+--- @deprecated 已移至 tool_executor.execute_single_tool_request
 --- 执行一次非流式 AI 请求，只允许调用指定的工具，不计入工具循环
 --- 用于 shell 交互式命令的自动输入场景
+--- 新代码请使用 tool_executor.execute_single_tool_request()
 --- @param session_id string 会话 ID
 --- @param tool_name string 允许调用的工具名称（如 "send_input"）
 --- @param args table 工具参数，支持以下字段：
@@ -2039,13 +2130,13 @@ function M.execute_single_tool_request(session_id, tool_name, args, callback)
 
   -- 构建非流式请求
   -- 注意：强制工具调用时禁用思考模式（DeepSeek 等 API 不支持思考模式下的强制工具调用）
-  local ai_engine = require("NeoAI.core.ai.ai_engine")
-  local formatted = ai_engine.format_messages(messages)
+  local request_handler = require("NeoAI.core.ai.request_handler")
+  local formatted = request_handler.format_messages(messages)
 
-  local http_client = require("NeoAI.core.ai.http_client")
+  local http_utils = require("NeoAI.utils.http_utils")
   local ai_preset = ss.ai_preset or {}
 
-  local request = ai_engine.build_request({
+  local request = request_handler.build_request({
     messages = formatted,
     options = vim.tbl_extend("force", ss.options or {}, {
       model = (ss.ai_preset or {}).model_name or (ss.options or {}).model,
@@ -2071,7 +2162,7 @@ function M.execute_single_tool_request(session_id, tool_name, args, callback)
     request.extra_body.reasoning_effort = nil
   end
 
-  -- 构建 http_client 参数
+  -- 构建 http_utils 参数
   local http_params = {
     request = request,
     generation_id = request.generation_id,
@@ -2107,7 +2198,7 @@ function M.execute_single_tool_request(session_id, tool_name, args, callback)
   local retry_count = 0
 
   local function do_request()
-    http_client.send_request_async(http_params, function(response, err)
+    http_utils.send_request_async(http_params, function(response, err)
       -- 检查会话是否已被停止
       local current_ss = state.sessions[session_id]
       if not current_ss or current_ss.stop_requested then
@@ -2303,9 +2394,9 @@ function M.cleanup_all()
   end
 
   pcall(function()
-    local http_ok, http_client = pcall(require, "NeoAI.core.ai.http_client")
-    if http_ok and http_client and http_client.cancel_all_requests then
-      http_client.cancel_all_requests()
+    local http_ok, http_utils = pcall(require, "NeoAI.utils.http_utils")
+    if http_ok and http_utils and http_utils.cancel_all_requests then
+      http_utils.cancel_all_requests()
     end
   end)
 

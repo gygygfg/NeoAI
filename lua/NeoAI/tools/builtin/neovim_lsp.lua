@@ -3392,7 +3392,7 @@ local function _lsp_client_info(args, on_success, on_error, on_progress)
     if stopped then
       return true
     end
-    local orc_ok, tool_orc = pcall(require, "NeoAI.core.ai.tool_orchestrator")
+    local orc_ok, tool_orc = pcall(require, "NeoAI.core.ai.tool_cycle")
     if orc_ok and tool_orc.is_stop_requested() then
       stopped = true
       return true

@@ -15,7 +15,7 @@ local core = require("NeoAI.core")
 local chat_service = require("NeoAI.core.ai.chat_service")
 local approval_config_editor = require("NeoAI.ui.components.approval_config_editor")
 local history_manager = require("NeoAI.core.history.manager")
-local tool_orchestrator = require("NeoAI.core.ai.tool_orchestrator")
+local tool_cycle = require("NeoAI.core.ai.tool_cycle")
 -- 所有悬浮窗组件通过 window_manager 和 window/components 管理
 local reasoning_display = require("NeoAI.ui.components.reasoning_display")
 local tool_display_component = require("NeoAI.ui.components.tool_display")
@@ -1775,7 +1775,7 @@ function M.close()
 
   -- 关闭窗口前停止后台工具循环和AI生成
   -- 触发取消生成事件（ai_engine 监听此事件取消HTTP请求和工具循环）
-  -- ai_engine.cancel_generation() 内部会调用 tool_orchestrator.request_stop()
+  -- ai_engine.cancel_generation() 内部会调用 tool_cycle.request_stop()
   vim.api.nvim_exec_autocmds("User", {
     pattern = Events.CANCEL_GENERATION,
     data = {},
@@ -1783,7 +1783,7 @@ function M.close()
 
   -- 额外确保工具循环停止：如果当前有活跃的工具循环但 cancel_generation 未能覆盖
   --（例如 state.current_generation_id 为 nil 但工具循环仍在运行）
-  tool_orchestrator.request_stop(closing_session_id)
+  tool_cycle.request_stop(closing_session_id)
 
   -- 延迟执行窗口关闭，给异步回调一点时间完成
   -- 避免异步回调在窗口关闭后访问已清理的状态导致错误

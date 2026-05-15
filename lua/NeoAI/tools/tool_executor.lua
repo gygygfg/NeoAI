@@ -362,7 +362,7 @@ function M._continue_execution(
   -- 检查会话是否仍然有效（防止审批通过后会话已超时或取消）
   local session_id = raw_args and (raw_args.session_id or raw_args._session_id) or ""
   if session_id and session_id ~= "" then
-    local orc_ok, tool_orc = pcall(require, "NeoAI.core.ai.tool_orchestrator")
+    local orc_ok, tool_orc = pcall(require, "NeoAI.core.ai.tool_cycle")
     if orc_ok then
       -- 检查会话是否已被 unregister（会话不存在）
       local session_state = tool_orc.get_session_state(session_id)
@@ -497,7 +497,7 @@ function M._continue_execution(
     end
   else
     vim.schedule(function()
-      local orc_ok, tool_orc = pcall(require, "NeoAI.core.ai.tool_orchestrator")
+      local orc_ok, tool_orc = pcall(require, "NeoAI.core.ai.tool_cycle")
       if orc_ok and tool_orc.is_stop_requested() then
         on_error_wrapper("工具执行已取消")
         return
@@ -783,14 +783,21 @@ function M._set_timeout(tool_call_id, timeout_ms, on_timeout)
     on_timeout = on_timeout,
   }
   timeout_state.start_times[tool_call_id] = vim.loop.hrtime()
-  timeout_state.timers[tool_call_id] = vim.defer_fn(function()
+  -- 使用 vim.uv.new_timer 替代 vim.defer_fn，确保可取消
+  local timer = vim.uv.new_timer()
+  timeout_state.timers[tool_call_id] = timer
+  timer:start(timeout_ms, 0, vim.schedule_wrap(function()
+    -- 安全检查：如果定时器已被清除（_clear_timeout 已调用），跳过执行
+    if timeout_state.timers[tool_call_id] ~= timer then
+      return
+    end
     timeout_state.timers[tool_call_id] = nil
     timeout_state.start_times[tool_call_id] = nil
     timeout_state.saved_timeouts[tool_call_id] = nil
     if on_timeout then
       pcall(on_timeout)
     end
-  end, timeout_ms)
+  end))
 end
 
 --- 清除工具超时
@@ -865,14 +872,19 @@ function M._resume_timeout(tool_call_id, on_timeout)
   -- 使用传入的回调或保存的回调
   local cb = on_timeout or saved.on_timeout
   -- 创建新定时器
-  timeout_state.timers[tool_call_id] = vim.defer_fn(function()
+  local new_timer = vim.uv.new_timer()
+  timeout_state.timers[tool_call_id] = new_timer
+  new_timer:start(remaining_ms, 0, vim.schedule_wrap(function()
+    if timeout_state.timers[tool_call_id] ~= new_timer then
+      return
+    end
     timeout_state.timers[tool_call_id] = nil
     timeout_state.start_times[tool_call_id] = nil
     timeout_state.saved_timeouts[tool_call_id] = nil
     if cb then
       pcall(cb)
     end
-  end, remaining_ms)
+  end))
 end
 
 --- 重置工具超时（清除旧超时，设置新超时）
@@ -898,13 +910,18 @@ function M._reset_timeout(tool_call_id, timeout_ms, on_timeout)
     timeout_state.timers[tool_call_id] = nil
   end
   -- 设置新定时器
-  timeout_state.timers[tool_call_id] = vim.defer_fn(function()
+  local new_timer = vim.uv.new_timer()
+  timeout_state.timers[tool_call_id] = new_timer
+  new_timer:start(timeout_ms, 0, vim.schedule_wrap(function()
+    if timeout_state.timers[tool_call_id] ~= new_timer then
+      return
+    end
     timeout_state.timers[tool_call_id] = nil
     timeout_state.start_times[tool_call_id] = nil
     if on_timeout then
       pcall(on_timeout)
     end
-  end, timeout_ms)
+  end))
 end
 
 --- 获取工具已执行时长（毫秒，扣除审批暂停时间）
@@ -927,7 +944,7 @@ end
 -- ========== 参数规范化（从 tool_orchestrator 迁移） ==========
 
 --- 解析并规范化工具参数
---- arguments 已在 http_client 中解析为 Lua table
+--- arguments 已在 http_utils 中解析为 Lua table
 --- 包含别名映射、简化参数格式转换
 --- @param raw_arguments table|string 原始参数
 --- @param props table 工具定义的属性名表
@@ -1028,7 +1045,7 @@ function M._normalize_arguments(tool_name, raw_arguments)
   local props = tool_def and tool_def.parameters and tool_def.parameters.properties or {}
 
   -- ===== 参数解析 =====
-  -- arguments 已在 http_client 中解析为 Lua table，直接使用
+  -- arguments 已在 http_utils 中解析为 Lua table，直接使用
 
   if type(raw_arguments) == "table" then
     arguments = vim.deepcopy(raw_arguments)

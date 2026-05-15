@@ -20,30 +20,45 @@ local function is_headless()
 end
 
 -- 安全的等待函数
--- 在 headless 模式下使用 vim.wait（能正确处理 vim.schedule 回调）
--- 在 UI 模式下使用 vim.uv.run('once')（避免阻塞 UI）
--- 注意：vim.uv.run('once') 无法处理 vim.schedule 回调，因此 headless 模式下必须使用 vim.wait
+-- 在 headless 模式下使用 vim.uv.run('once') 循环来处理 vim.defer_fn 回调
+-- 同时定期调用 vim.wait(1) 来处理 vim.schedule 回调
+-- 注意：vim.wait 能处理 vim.schedule 回调，但不能处理 vim.defer_fn 回调
+-- 而 vim.uv.run('once') 能处理 vim.defer_fn 回调，但不能处理 vim.schedule 回调
 local function safe_wait(timeout_ms, cond)
-  if is_headless() then
-    return vim.wait(timeout_ms, cond, 50)
-  end
-  local deadline = vim.uv.now() + timeout_ms
-  while vim.uv.now() < deadline do
-    if cond() then
-      return true
-    end
-    vim.uv.run("once")
-  end
-  return false
+  -- vim.wait 可以同时处理 vim.schedule 和 vim.defer_fn 回调
+  -- 在 headless 和非 headless 模式下都使用 vim.wait
+  -- 注意：vim.uv.run('once') 不能处理 vim.defer_fn 回调
+  return vim.wait(timeout_ms, cond, 1)
 end
 
 --- 运行所有测试
 function M.run(test_module)
   test = test_module or require("NeoAI.tests")
   local assert = test.assert
+  -- 确保 _logger 可用（直接 dofile 运行时可能为 nil）
+  if not test._logger then
+    local logger = require("NeoAI.utils.logger")
+    test._logger = logger
+  end
+  -- 保存 logger 状态，测试结束后恢复
+  local logger = require("NeoAI.utils.logger")
+  local _saved_log_path = logger.get_output_path()
+  local _saved_log_level = logger.get_level()
   test._logger.info("\n=== test_utils ===")
 
-  return test.run_tests({
+  local results = test.run_tests({
+    -- ========== common ==========
+    test_common_deep_copy = function()
+      local utils = require("NeoAI.utils")
+      local original = { a = 1, b = { c = 2, d = { e = 3 } } }
+      local copy = utils.deep_copy(original)
+      assert.equal(original.a, copy.a)
+      assert.equal(original.b.c, copy.b.c)
+      copy.b.c = 100
+      assert.equal(2, original.b.c)
+      assert.equal(42, utils.deep_copy(42))
+      assert.equal("hello", utils.deep_copy("hello"))
+    end,
     -- ========== common ==========
     test_common_deep_copy = function()
       local utils = require("NeoAI.utils")
@@ -149,11 +164,16 @@ function M.run(test_module)
     -- ========== logger ==========
     test_logger_initialize = function()
       local logger = require("NeoAI.utils.logger")
+      -- 保存当前输出路径，测试后恢复
+      local saved_path = logger.get_output_path()
       logger.initialize({ level = "DEBUG" })
+      if saved_path then logger.set_output(saved_path) end
     end,
 
     test_logger_level = function()
       local logger = require("NeoAI.utils.logger")
+      -- 保存当前输出路径，测试后恢复
+      local saved_path = logger.get_output_path()
       logger.set_level("DEBUG")
       assert.equal("DEBUG", logger.get_level())
       logger.set_level("INFO")
@@ -162,10 +182,15 @@ function M.run(test_module)
       assert.equal("WARN", logger.get_level())
       logger.set_level("INVALID")
       assert.equal("INFO", logger.get_level(), "无效级别应回退到 INFO")
+      if saved_path then logger.set_output(saved_path) end
     end,
 
     test_logger_methods = function()
       local logger = require("NeoAI.utils.logger")
+      -- 使用临时文件，不污染主日志
+      local saved_path = logger.get_output_path()
+      local tmp_path = "/tmp/neoai_test_log_methods.log"
+      logger.set_output(tmp_path)
       logger.set_level("DEBUG")
       logger.debug("调试消息")
       logger.info("信息消息")
@@ -174,69 +199,100 @@ function M.run(test_module)
       logger.fatal("致命错误")
       logger.info("用户 %s 登录", "张三")
       logger.warn("重试 %d/%d", 1, 3)
+      logger.set_output(nil)
+      os.remove(tmp_path)
+      if saved_path then logger.set_output(saved_path) end
     end,
 
     test_logger_output = function()
       local logger = require("NeoAI.utils.logger")
-      local test_path = "/tmp/neoai_test_log.log"
+      local saved_path = logger.get_output_path()
+      local test_path = "/tmp/neoai_test_log_output.log"
       logger.set_output(test_path)
       assert.equal(test_path, logger.get_output_path())
       logger.info("测试写入文件")
       logger.set_output(nil)
       assert.equal(nil, logger.get_output_path())
+      os.remove(test_path)
+      if saved_path then logger.set_output(saved_path) end
     end,
 
     test_logger_clear = function()
       local logger = require("NeoAI.utils.logger")
+      -- 使用临时文件测试 clear，不污染主日志
+      local saved_path = logger.get_output_path()
+      local tmp_path = "/tmp/neoai_test_log_clear.log"
+      logger.set_output(tmp_path)
+      logger.info("写入一些内容")
       logger.clear()
+      logger.info("清空后的内容")
+      logger.set_output(nil)
+      os.remove(tmp_path)
+      if saved_path then logger.set_output(saved_path) end
     end,
 
     test_logger_stats = function()
       local logger = require("NeoAI.utils.logger")
+      local saved_path = logger.get_output_path()
       local stats = logger.get_stats()
       assert.not_nil(stats)
       assert.not_nil(stats.level)
       assert.not_nil(stats.initialized)
+      if saved_path then logger.set_output(saved_path) end
     end,
 
     test_logger_create_child = function()
       local logger = require("NeoAI.utils.logger")
+      local saved_path = logger.get_output_path()
       local child = logger.create_child("TestModule")
       assert.not_nil(child)
       assert.is_true(type(child.info) == "function")
       child.info("子日志器测试")
+      if saved_path then logger.set_output(saved_path) end
     end,
 
     test_logger_exception = function()
       local logger = require("NeoAI.utils.logger")
+      local saved_path = logger.get_output_path()
       logger.exception("测试异常信息", "测试上下文")
+      if saved_path then logger.set_output(saved_path) end
     end,
 
     test_logger_verbose_and_debug = function()
       local logger = require("NeoAI.utils.logger")
+      local saved_path = logger.get_output_path()
       logger.initialize({ verbose = true, print_debug = true })
       assert.is_true(logger.is_verbose_enabled())
       assert.is_true(logger.is_print_debug_enabled())
       logger.verbose("详细消息")
       logger.debug_print("调试", "打印")
       logger.initialize({ verbose = false, print_debug = false })
+      if saved_path then logger.set_output(saved_path) end
     end,
 
     test_logger_custom_output = function()
       local logger = require("NeoAI.utils.logger")
+      local saved_path = logger.get_output_path()
       local last_message = nil
       logger.set_custom_output(function(msg) last_message = msg end)
       logger.info("自定义输出测试")
       logger.set_output(nil)
+      if saved_path then logger.set_output(saved_path) end
     end,
 
     test_logger_rotate = function()
       local logger = require("NeoAI.utils.logger")
+      local saved_path = logger.get_output_path()
       local test_path = "/tmp/neoai_test_rotate.log"
       logger.set_output(test_path)
       logger.initialize({ level = "DEBUG", output_path = test_path, max_file_size = 100, max_backups = 2 })
       for i = 1, 50 do logger.info("测试轮转消息 #" .. i) end
       logger.set_output(nil)
+      os.remove(test_path)
+      -- 先恢复 max_file_size，再恢复 output_path
+      -- 防止恢复 output_path 后因 max_file_size 过小触发 rotate() 轮转主日志
+      logger.initialize({ max_file_size = 10485760, max_backups = 5 })
+      if saved_path then logger.set_output(saved_path) end
     end,
 
     -- ========== json ==========
@@ -778,6 +834,20 @@ function M.run(test_module)
       assert.equal(0, aw.get_total_count())
     end,
   })
+
+  -- 恢复 logger 状态
+  -- 注意：先恢复 max_file_size，再恢复 output_path
+  -- 防止 test_logger_rotate 将 max_file_size 设为 100 后，
+  -- 恢复 output_path 时触发 rotate() 轮转 neoai.log
+  logger.initialize({ max_file_size = 10485760, max_backups = 5 })
+  if _saved_log_path then
+    logger.set_output(_saved_log_path)
+  end
+  if _saved_log_level then
+    logger.set_level(_saved_log_level)
+  end
+
+  return results
 end
 
 -- 直接运行（仅在非 run_all 模式下）

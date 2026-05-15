@@ -3,7 +3,7 @@
 --- 闭包内私有状态：initialized
 
 local logger = require("NeoAI.utils.logger")
-local ai_engine = require("NeoAI.core.ai.ai_engine")
+local engine = require("NeoAI.core.ai.engine")
 local history_manager = require("NeoAI.core.history.manager")
 -- ========== 闭包内私有状态 ==========
 local initialized = false
@@ -25,7 +25,7 @@ function M.initialize(config)
   config_module.initialize(config)
 
   -- 初始化 AI 引擎（各子模块自行从 state_manager 读取配置）
-  ai_engine.initialize({})
+  engine.initialize({})
 
   -- 初始化历史管理器（唯一数据源，幂等）
   history_manager.initialize({ config = config })
@@ -39,9 +39,9 @@ function M.initialize(config)
 end
 
 --- 获取 AI 引擎
-function M.get_ai_engine()
+function M.get_engine()
   if not initialized then error("Core not initialized") end
-  return ai_engine
+  return engine
 end
 
 --- 获取键位配置管理器

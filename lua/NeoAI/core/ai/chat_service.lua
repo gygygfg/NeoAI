@@ -1,12 +1,17 @@
 --- NeoAI 聊天服务（后端）
 --- 前后端分离架构中的后端服务层
---- 职责：会话管理、消息历史管理、AI 生成请求调度、事件分发
+--- 职责：会话管理、消息历史管理、AI 生成请求调度、事件分发、自动命名会话
+---
+--- 依赖关系：
+---   - 会话管理 → history_manager
+---   - AI 生成 → engine（仅触发生成，不参与生成流程编排）
+---   - 自动命名 → http_utils + config_merger
 
 local M = {}
 
 local logger = require("NeoAI.utils.logger")
 local event_constants = require("NeoAI.core.events")
-local ai_engine = require("NeoAI.core.ai.ai_engine")
+local engine = require("NeoAI.core.ai.engine")
 local history_manager = require("NeoAI.core.history.manager")
 local shutdown_flag = require("NeoAI.core.shutdown_flag")
 
@@ -60,7 +65,7 @@ function M._setup_event_listeners()
   })
   -- 监听取消生成事件，仅用于日志记录
   -- 实际的停止逻辑由 chat_service.cancel_generation() 统一处理
-  -- 避免在此处重复调用 ai_engine.cancel_generation() 和 tool_orc.request_stop()
+  -- 避免在此处重复调用 engine.cancel_generation() 和 tool_orc.request_stop()
   -- 否则会导致停止逻辑执行两次，且顺序不可控
   vim.api.nvim_create_autocmd("User", {
     pattern = event_constants.CANCEL_GENERATION,
@@ -321,7 +326,7 @@ function M.send_message(params)
   end
 
   -- 调用 AI 引擎生成响应
-  ai_engine.generate_response(messages, {
+  engine.generate_response(messages, {
     session_id = target_session_id,
     window_id = window_id,
     model_index = options.model_index or 1,
@@ -355,11 +360,11 @@ function M.cancel_generation()
   local session_id = current_session and current_session.id or nil
 
   -- 直接取消 HTTP 请求并设置停止标志，不触发总结轮次
-  -- ai_engine.cancel_generation() 内部会设置 stop_requested 并取消 HTTP 请求
-  ai_engine.cancel_generation()
+  -- engine.cancel_generation() 内部会设置 stop_requested 并取消 HTTP 请求
+  engine.cancel_generation()
 
   -- 最后触发取消事件，让 UI 监听器更新界面状态
-  -- 注意：CANCEL_GENERATION 事件的监听器中不应再调用 tool_orc.request_stop 或 ai_engine.cancel_generation
+  -- 注意：CANCEL_GENERATION 事件的监听器中不应再调用 tool_orc.request_stop 或 engine.cancel_generation
   -- 否则会导致重复执行
   vim.api.nvim_exec_autocmds("User", {
     pattern = event_constants.CANCEL_GENERATION,
@@ -371,7 +376,7 @@ function M.get_engine_status()
   if not guard() then
     return { initialized = false }
   end
-  return ai_engine.get_status()
+  return engine.get_status()
 end
 
 function M.switch_model(model_index)
@@ -379,6 +384,98 @@ function M.switch_model(model_index)
     return
   end
   logger.info("[chat_service] 模型切换: index=" .. tostring(model_index))
+end
+
+-- ========== 自动命名会话 ==========
+
+--- 根据用户消息自动生成会话名称
+--- 使用 AI 命名场景配置，回退到聊天场景配置
+--- @param session_id string 会话 ID
+--- @param user_msg string 用户消息
+--- @param callback function 回调 (success, name)
+function M.auto_name_session(session_id, user_msg, callback)
+  if not guard() then
+    if callback then callback(false, "聊天服务未初始化") end
+    return
+  end
+  if not user_msg or user_msg == "" then
+    if callback then callback(false, "无用户消息") end
+    return
+  end
+  local naming_text = user_msg:sub(1, 200)
+  local http_utils = require("NeoAI.utils.http_utils")
+  local config_merger = require("NeoAI.core.config.merger")
+  vim.schedule(function()
+    local preset = nil
+    if config_merger and config_merger.get_preset then
+      preset = config_merger.get_preset("naming")
+    end
+    if not preset or not preset.base_url or not preset.api_key then
+      local core = require("NeoAI.core")
+      local full_config = core.get_config() or {}
+      local ai_config = (full_config and full_config.ai) or {}
+      local scenarios = ai_config.scenarios or {}
+      local entry = scenarios["naming"] or scenarios[ai_config.default or "chat"]
+      if entry then
+        local candidate = type(entry) == "table" and (entry[1] or entry) or entry
+        local provider_name = candidate.provider or "deepseek"
+        local provider = (ai_config.providers or {})[provider_name]
+        if provider then
+          preset = {
+            base_url = provider.base_url,
+            api_key = provider.api_key,
+            model_name = candidate.model_name or candidate.model,
+            timeout = candidate.timeout or 10000,
+            api_type = candidate.api_type or "openai",
+          }
+        end
+      end
+    end
+    if not preset or not preset.base_url or not preset.api_key then
+      if callback then callback(false, "未配置 AI 提供商") end
+      return
+    end
+    local response, err = http_utils.send_request({
+      request = {
+        model = preset.model_name or "",
+        messages = {
+          { role = "system", content = "你是一个会话命名助手。根据用户的第一条消息，生成一个简短（不超过20个字符）且有意义的会话名称。只返回名称本身，不要加引号、标点或解释。" },
+          { role = "user", content = "请为以下对话生成一个简短的名称：" .. naming_text },
+        },
+        temperature = 0.3,
+        max_tokens = 50,
+        stream = false,
+      },
+      generation_id = "naming_" .. session_id .. "_" .. os.time(),
+      base_url = preset.base_url,
+      api_key = preset.api_key,
+      timeout = preset.timeout or 10000,
+      api_type = preset.api_type or "openai",
+      provider_config = preset,
+    })
+    if err then
+      if callback then callback(false, "命名请求失败: " .. tostring(err)) end
+      return
+    end
+    if not response or not response.choices or #response.choices == 0 then
+      if callback then callback(false, "命名响应无效") end
+      return
+    end
+    local msg = response.choices[1].message
+    local name = msg.content or ""
+    if name == "" and msg.reasoning_content then
+      name = msg.reasoning_content
+    end
+    name = name:gsub("^[%s\"'「『]+(.-)[%s\"'」』]+$", "%1"):gsub("^%s*(.-)%s*$", "%1"):gsub("[。，！？、；：]$", "")
+    if #name > 30 then
+      name = name:sub(1, 30) .. "…"
+    end
+    if name == "" then
+      if callback then callback(false, "生成的名称无效") end
+      return
+    end
+    if callback then callback(true, name) end
+  end)
 end
 
 -- ========== 历史持久化 ==========

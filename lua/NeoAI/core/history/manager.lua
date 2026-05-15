@@ -152,7 +152,7 @@ function M._shutdown_and_save()
 
   -- 1. 通知工具编排器关闭（清理所有会话状态和 autocmd）
   pcall(function()
-    local orc_ok, tool_orc = pcall(require, "NeoAI.core.ai.tool_orchestrator")
+    local orc_ok, tool_orc = pcall(require, "NeoAI.core.ai.tool_cycle")
     if orc_ok and tool_orc then
       if tool_orc.set_shutting_down then
         tool_orc.set_shutting_down()
@@ -181,18 +181,18 @@ function M._shutdown_and_save()
 
   -- 2. 取消所有 HTTP 请求
   pcall(function()
-    local http_ok, http_client = pcall(require, "NeoAI.core.ai.http_client")
-    if http_ok and http_client and http_client.cancel_all_requests then
-      http_client.cancel_all_requests()
+    local http_ok, http_utils = pcall(require, "NeoAI.utils.http_utils")
+    if http_ok and http_utils and http_utils.cancel_all_requests then
+      http_utils.cancel_all_requests()
     end
   end)
 
-  -- 2.5 清理 ai_engine 的活跃生成状态（防止 HTTP 回调触发死循环）
+  -- 2.5 清理 engine 的活跃生成状态（防止 HTTP 回调触发死循环）
   pcall(function()
-    local ae_ok, ai_engine = pcall(require, "NeoAI.core.ai.ai_engine")
-    if ae_ok and ai_engine then
-      if ai_engine.cleanup_all_generations then
-        ai_engine.cleanup_all_generations()
+    local ae_ok, engine = pcall(require, "NeoAI.core.ai.engine")
+    if ae_ok and engine then
+      if engine.cleanup_all_generations then
+        engine.cleanup_all_generations()
       end
     end
   end)
@@ -812,8 +812,8 @@ function M.auto_name_session(session_id, callback)
     return
   end
 
-  local ai_engine = require("NeoAI.core.ai.ai_engine")
-  ai_engine.auto_name_session(session_id, user_msg, function(success, name_or_error)
+  local chat_service = require("NeoAI.core.ai.chat_service")
+  chat_service.auto_name_session(session_id, user_msg, function(success, name_or_error)
     if success then
       M.rename_session(session_id, name_or_error)
       trigger_event(Events.SESSION_RENAMED, { session_id = session_id, name = name_or_error })

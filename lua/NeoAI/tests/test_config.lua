@@ -8,6 +8,11 @@ local test
 function M.run(test_module)
   test = test_module or require("NeoAI.tests")
   local assert = test.assert
+  -- 确保 _logger 可用（直接 dofile 运行时可能为 nil）
+  if not test._logger then
+    local logger = require("NeoAI.utils.logger")
+    test._logger = logger
+  end
   test._logger.info("\n=== test_config ===")
 
   local function setup_merger_state()
@@ -90,7 +95,7 @@ function M.run(test_module)
 
     test_default_config_log = function()
       local config = require("NeoAI.default_config").get_default_config()
-      assert.equal("DEBUG", config.log.level, "默认日志级别应为 DEBUG")
+      assert.equal("WARN", config.log.level, "默认日志级别应为 WARN")
       assert.equal(10485760, config.log.max_file_size, "默认最大文件大小应为 10MB")
       assert.equal(5, config.log.max_backups, "默认备份数应为 5")
     end,
@@ -152,8 +157,8 @@ function M.run(test_module)
 
     test_merger_log_level_validation = function()
       local merger = require("NeoAI.core.config.merger")
-      assert.equal("DEBUG", merger.process_config({ log = { level = "INVALID" } }).log.level, "无效日志级别应使用默认值")
-      assert.equal("DEBUG", merger.process_config({ log = { level = "debug" } }).log.level, "小写日志级别应使用默认值")
+      assert.equal("WARN", merger.process_config({ log = { level = "INVALID" } }).log.level, "无效日志级别应使用默认值")
+      assert.equal("WARN", merger.process_config({ log = { level = "debug" } }).log.level, "小写日志级别应使用默认值")
     end,
 
     test_merger_unknown_field_ignored = function()
@@ -214,7 +219,7 @@ function M.run(test_module)
       assert.equal(80, result.ui.window.width)
       assert.equal(20, result.ui.window.height)
       assert.equal(1000, result.session.max_history_per_session)
-      assert.equal("DEBUG", result.log.level)
+      assert.equal("WARN", result.log.level)
     end,
   })
 end

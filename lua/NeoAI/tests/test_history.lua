@@ -8,6 +8,11 @@ local test
 function M.run(test_module)
   test = test_module or require("NeoAI.tests")
   local assert = test.assert
+  -- 确保 _logger 可用（直接 dofile 运行时可能为 nil）
+  if not test._logger then
+    local logger = require("NeoAI.utils.logger")
+    test._logger = logger
+  end
   test._logger.info("\n=== test_history ===")
 
   return test.run_tests({
@@ -293,16 +298,17 @@ function M.run(test_module)
       local sessions = { session_1 = { id = "session_1", name = "测试", user = "你好", assistant = {}, created_at = 100, updated_at = 100 } }
       local json = p.serialize(sessions)
       assert.is_true(type(json) == "string" and #json > 0, "序列化应返回非空字符串")
-      assert.equal("[]", p.serialize({}), "空表应序列化为 []")
+      assert.equal("", p.serialize({}), "空表应序列化为空字符串")
     end,
 
     test_persistence_deserialize = function()
       local p = require("NeoAI.core.history.persistence")
-      local json = '[{"id":"session_1","name":"测试","user":"你好","assistant":[],"created_at":100,"updated_at":100}]'
-      assert.equal("session_1", p.deserialize(json).session_1.id)
-      assert.is_true(next(p.deserialize("[]")) == nil, "空 JSON 应返回空表")
-      assert.is_true(next(p.deserialize("invalid")) == nil, "无效 JSON 应返回空表")
-      assert.is_true(next(p.deserialize(nil)) == nil)
+      p._test_reset()
+      local json = "session_1:{\"id\":\"session_1\",\"name\":\"测试\",\"user\":\"你好\",\"assistant\":[],\"created_at\":100,\"updated_at\":100}"
+      local result = p.deserialize(json)
+      assert.not_nil(result.session_1, "应解析出 session_1")
+      assert.equal("session_1", result.session_1.id)
+      assert.is_true(next(p.deserialize("")) == nil, "空字符串应返回空表")
     end,
 
     test_persistence_roundtrip = function()

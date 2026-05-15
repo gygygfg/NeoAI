@@ -163,11 +163,24 @@ local function _enum_str(enum)
   return table.concat(enum, ", ")
 end
 
---- 通知用户配置错误
+-- 收集所有配置错误，一次性提示
+local _config_errors = {}
+
+--- 收集配置错误（延迟提示）
 --- @param path string 字段路径
 --- @param msg string 错误描述
-local function _notify_error(path, msg)
-  vim.notify("[NeoAI] 配置项 " .. path .. " " .. msg .. "，已使用默认值", vim.log.levels.WARN)
+local function _collect_error(path, msg)
+  table.insert(_config_errors, "配置项 " .. path .. " " .. msg .. "，已使用默认值")
+end
+
+--- 输出所有收集到的配置错误
+local function _flush_errors()
+  if #_config_errors == 0 then
+    return
+  end
+  local msg = "[NeoAI] 配置存在以下问题：\n  " .. table.concat(_config_errors, "\n  ")
+  vim.notify(msg, vim.log.levels.WARN)
+  _config_errors = {}
 end
 
 -- ========== 校验 + 合并（整合逻辑）==========
@@ -193,25 +206,25 @@ local function _validate_value(value, constraint, path)
   if type(value) ~= expected_type then
     local actual = _type_name(type(value))
     local expected = _type_name(expected_type)
-    _notify_error(path, string.format("类型错误：期望 %s，实际为 %s", expected, actual))
+    _collect_error(path, string.format("类型错误：期望 %s，实际为 %s", expected, actual))
     return false
   end
 
   -- 枚举值检查
   if constraint.enum and not vim.tbl_contains(constraint.enum, value) then
-    _notify_error(path, string.format("值 '%s' 无效，可选值：%s", tostring(value), _enum_str(constraint.enum)))
+    _collect_error(path, string.format("值 '%s' 无效，可选值：%s", tostring(value), _enum_str(constraint.enum)))
     return false
   end
 
   -- 最小值检查
   if constraint.min ~= nil and type(value) == "number" and value < constraint.min then
-    _notify_error(path, string.format("值 %s 过小，最小值为 %s", tostring(value), tostring(constraint.min)))
+    _collect_error(path, string.format("值 %s 过小，最小值为 %s", tostring(value), tostring(constraint.min)))
     return false
   end
 
   -- 最大值检查
   if constraint.max ~= nil and type(value) == "number" and value > constraint.max then
-    _notify_error(path, string.format("值 %s 过大，最大值为 %s", tostring(value), tostring(constraint.max)))
+    _collect_error(path, string.format("值 %s 过大，最大值为 %s", tostring(value), tostring(constraint.max)))
     return false
   end
 
@@ -236,7 +249,7 @@ local function _validate_and_merge(default, user, constraint, path)
 
     -- 如果该字段在默认配置中不存在，提示未知字段
     if default[k] == nil then
-      _notify_error(current_path, "未知配置项")
+      _collect_error(current_path, "未知配置项")
       goto continue
     end
 
@@ -261,6 +274,11 @@ local function _validate_and_merge(default, user, constraint, path)
           -- 空表保护：跳过空表覆盖，保留默认值
           if type(sub_v) == "table" and next(sub_v) == nil and type(default[k][sub_k]) == "table" and next(default[k][sub_k]) ~= nil then
             -- 跳过
+          elseif type(sub_v) == "table" and type(default[k][sub_k]) == "table" then
+            -- 子值也是表：递归合并，保留默认值中未覆盖的字段
+            for inner_k, inner_v in pairs(sub_v) do
+              default[k][sub_k][inner_k] = vim.deepcopy(inner_v)
+            end
           else
             default[k][sub_k] = vim.deepcopy(sub_v)
           end
@@ -307,7 +325,10 @@ function M.process_config(user_config)
     _validate_and_merge(result, config, { type = "table", fields = TYPE_CONSTRAINTS }, "")
   end
 
-  -- 3. 确保日志目录存在
+  -- 3. 一次性输出所有配置错误
+  _flush_errors()
+
+  -- 4. 确保日志目录存在
   if result.log and result.log.output_path then
     local log_dir = vim.fn.fnamemodify(result.log.output_path, ":h")
     if vim.fn.isdirectory(log_dir) == 0 then
@@ -428,21 +449,69 @@ function M.get_available_models(scenario, full_config)
   full_config = full_config or _saved_config or {}
   local ai_config = (full_config and full_config.ai) or {}
   local providers = ai_config.providers or {}
+
+  -- 收集场景配置中指定的模型（优先排在前面）
+  local scenario_models = {}
+  local seen = {}
+  if scenario and ai_config.scenarios and ai_config.scenarios[scenario] then
+    local entry = ai_config.scenarios[scenario]
+    local candidates = {}
+    if type(entry) == "table" then
+      if entry[1] == nil or type(entry[1]) ~= "table" then
+        candidates = { entry }
+      else
+        candidates = entry
+      end
+    end
+    for _, c in ipairs(candidates) do
+      local p = c.provider or "deepseek"
+      local m = c.model_name or ""
+      local key = p .. "/" .. m
+      if not seen[key] then
+        seen[key] = true
+        table.insert(scenario_models, { provider = p, model_name = m })
+      end
+    end
+  end
+
   local result = {}
   local index = 0
 
+  -- 先插入场景配置中指定的模型
+  for _, sm in ipairs(scenario_models) do
+    local provider_def = providers[sm.provider]
+    if provider_def then
+      local has_key = provider_def.api_key and #provider_def.api_key > 0
+      if has_key then
+        index = index + 1
+        table.insert(result, {
+          index = index,
+          provider = sm.provider,
+          model_name = sm.model_name,
+          api_type = provider_def.api_type or "openai",
+          label = string.format("%s/%s [%s]", sm.provider, sm.model_name, provider_def.api_type or "openai"),
+        })
+      end
+    end
+  end
+
+  -- 再插入其他所有模型（跳过已在场景配置中出现过的）
   for provider_name, provider_def in pairs(providers) do
     local has_key = provider_def and provider_def.api_key and #provider_def.api_key > 0
     if has_key and provider_def.models and type(provider_def.models) == "table" then
       for _, model_name in ipairs(provider_def.models) do
-        index = index + 1
-        table.insert(result, {
-          index = index,
-          provider = provider_name,
-          model_name = model_name,
-          api_type = provider_def.api_type or "openai",
-          label = string.format("%s/%s [%s]", provider_name, model_name, provider_def.api_type or "openai"),
-        })
+        local key = provider_name .. "/" .. model_name
+        if not seen[key] then
+          seen[key] = true
+          index = index + 1
+          table.insert(result, {
+            index = index,
+            provider = provider_name,
+            model_name = model_name,
+            api_type = provider_def.api_type or "openai",
+            label = string.format("%s/%s [%s]", provider_name, model_name, provider_def.api_type or "openai"),
+          })
+        end
       end
     end
   end

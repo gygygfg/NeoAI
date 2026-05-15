@@ -348,11 +348,11 @@ local DEFAULT_CONFIG = {
   -- 日志配置
   log = {
     -- 日志级别: 'DEBUG', 'INFO', 'WARN', 'ERROR', 'FATAL'
-    -- level = "DEBUG",
-    level = "WARN",
+    level = "DEBUG",
+    -- level = "WARN",
     -- 输出文件路径（可选，默认输出到文件，避免 print 阻塞消息区域）
-    output_path = nil,
-    -- output_path = "/root/NeoAI/lua/NeoAI/neoai.log",
+    -- output_path = nil,
+    output_path = "/root/NeoAI/lua/NeoAI/neoai.log",
     -- 日志格式模板
     format = "[{time}] [{level}] {message}",
     -- 最大文件大小（字节），默认 10MB
@@ -363,12 +363,6 @@ local DEFAULT_CONFIG = {
     verbose = false,
     -- 是否启用调试打印到控制台
     print_debug = false,
-  },
-
-  -- 测试配置
-  test = {
-    auto_test = false, -- 是否在启动后自动运行所有测试
-    delay_ms = 1500, -- 延迟毫秒数（VimEnter后1500毫秒）
   },
 }
 

@@ -7,15 +7,10 @@ local function is_headless()
 end
 
 local function safe_wait(timeout_ms, cond)
-  if is_headless() then
-    return vim.wait(timeout_ms, cond, 50)
-  end
-  local deadline = vim.uv.now() + timeout_ms
-  while vim.uv.now() < deadline do
-    if cond() then return true end
-    vim.uv.run("once")
-  end
-  return false
+  -- vim.wait 可以同时处理 vim.schedule 和 vim.defer_fn 回调
+  -- 在 headless 和非 headless 模式下都使用 vim.wait
+  -- 注意：vim.uv.run('once') 不能处理 vim.defer_fn 回调
+  return vim.wait(timeout_ms, cond, 1)
 end
 
 -- 辅助函数：调用 define_tool 返回的 table 中的 func
@@ -30,6 +25,11 @@ end
 function M.run(test_module)
   local test = test_module or require("NeoAI.tests")
   local assert = test.assert
+  -- 确保 _logger 可用（直接 dofile 运行时可能为 nil）
+  if not test._logger then
+    local logger = require("NeoAI.utils.logger")
+    test._logger = logger
+  end
   test._logger.info("\n=== test_sub_agent ===")
 
   return test.run_tests({

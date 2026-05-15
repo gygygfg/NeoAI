@@ -3,6 +3,13 @@
 ---
 --- 运行：nvim --headless -c "lua dofile('/root/NeoAI/pack/plugins/start/NeoAI/lua/NeoAI/tests/test_tree_connectors.lua')" -c "qa"
 
+local logger = require("NeoAI.utils.logger")
+logger.initialize({
+  level = "DEBUG",
+  output_path = "/tmp/neoai_test_tree_connectors.log",
+  print_debug = false,
+})
+
 -- 引用 tree_handlers 中的 build_connectors（反向遍历版本）
 local function build_connectors(flat_items)
   local ok, handlers = pcall(require, "NeoAI.ui.handlers.tree_handlers")
@@ -100,23 +107,24 @@ local function print_tree(flat_items)
   local prefixes = build_connectors(flat_items)
   local lines = render(flat_items, prefixes)
   for _, l in ipairs(lines) do
-    print(l)
+    logger.info(l)
   end
 end
 
 local function assert_eq(got, expected, msg)
   if got ~= expected then
-    print("  ❌ FAIL: " .. (msg or ""))
-    print("     expected: '" .. tostring(expected) .. "'")
-    print("     got:      '" .. tostring(got) .. "'")
+    logger.error("  ❌ FAIL: " .. (msg or ""))
+    logger.error("     expected: '" .. tostring(expected) .. "'")
+    logger.error("     got:      '" .. tostring(got) .. "'")
     os.exit(1)
   else
-    print("  ✅ PASS: " .. (msg or ""))
+    logger.info("  ✅ PASS: " .. (msg or ""))
   end
 end
 
 local function run_tests()
-  print("\n===== 测试 1: 单根无分支 =====")
+  logger.info("===== 测试 1: 单根无分支 =====")
+  logger.info("")
   -- 1个虚拟根节点 + 1个根节点
   local items1 = {
     { is_virtual = true, indent = 0 },
@@ -127,7 +135,8 @@ local function run_tests()
   assert_eq(p1[2], "   ", "单根节点前缀为3个空格")
   print_tree(items1)
 
-  print("\n===== 测试 2: 两个根节点 =====")
+  logger.info("===== 测试 2: 两个根节点 =====")
+  logger.info("")
   local items2 = {
     { is_virtual = true, indent = 0 },
     { is_virtual = false, indent = 1, is_last_session = true, is_last_branch = false, display_text = "根1" },
@@ -145,7 +154,8 @@ local function run_tests()
   assert_eq(p2[4], "   ", "最后一个根节点前缀为3个空格")
   print_tree(items2)
 
-  print("\n===== 测试 3: 单根带子节点 =====")
+  logger.info("===== 测试 3: 单根带子节点 =====")
+  logger.info("")
   local items3 = {
     { is_virtual = true, indent = 0 },
     { is_virtual = false, indent = 1, is_last_session = false, is_last_branch = true, display_text = "根1" },
@@ -160,7 +170,8 @@ local function run_tests()
   assert_eq(p3[3], "      ", "子1 indent=2 应有2列（6个空格）")
   print_tree(items3)
 
-  print("\n===== 测试 4: 单根带分支 =====")
+  logger.info("===== 测试 4: 单根带分支 =====")
+  logger.info("")
   local items4 = {
     { is_virtual = true, indent = 0 },
     { is_virtual = false, indent = 1, is_last_session = true, is_last_branch = true, display_text = "根1" },
@@ -170,7 +181,8 @@ local function run_tests()
   local p4 = build_connectors(items4)
   print_tree(items4)
 
-  print("\n===== 测试 5: 根有两个子节点 =====")
+  logger.info("===== 测试 5: 根有两个子节点 =====")
+  logger.info("")
   local items5 = {
     { is_virtual = true, indent = 0 },
     { is_virtual = false, indent = 1, is_last_session = false, is_last_branch = true, display_text = "根1" },
@@ -180,7 +192,8 @@ local function run_tests()
   local p5 = build_connectors(items5)
   print_tree(items5)
 
-  print("\n===== 测试 6: 复杂多根多分支 =====")
+  logger.info("===== 测试 6: 复杂多根多分支 =====")
+  logger.info("")
   local items6 = {
     { is_virtual = true, indent = 0 },
     { is_virtual = false, indent = 1, is_last_session = false, is_last_branch = false, display_text = "根1" },
@@ -197,7 +210,7 @@ local function run_tests()
   local p6 = build_connectors(items6)
   print_tree(items6)
 
-  print("\n===== 全部测试通过! =====")
+  logger.info("===== 全部测试通过! =====")
 end
 
 run_tests()

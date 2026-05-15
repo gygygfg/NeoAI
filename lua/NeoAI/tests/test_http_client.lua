@@ -1,5 +1,5 @@
---- 测试: core/ai/http_client.lua
---- 测试 HTTP 客户端的初始化、请求构建、状态管理等功能
+--- 测试: utils/http_utils.lua
+--- 测试 HTTP 工具函数的初始化、请求构建、状态管理、特殊字符编解码等功能
 --- 注意：实际 HTTP 请求测试需要 API key 和网络连接，这里只测试逻辑层
 local M = {}
 
@@ -14,16 +14,11 @@ local function is_headless()
   return false
 end
 
--- 安全的等待函数：使用 vim.uv.run('once') 处理事件循环
+-- 安全的等待函数：使用 vim.wait 处理事件循环
+-- vim.wait 可以同时处理 vim.schedule 和 vim.defer_fn 回调
+-- 注意：vim.uv.run('once') 不能处理 vim.defer_fn 回调
 local function safe_wait(timeout_ms, cond)
-  local deadline = vim.uv.now() + timeout_ms
-  while vim.uv.now() < deadline do
-    if cond() then
-      return true
-    end
-    vim.uv.run("once")
-  end
-  return false
+  return vim.wait(timeout_ms, cond, 1)
 end
 
 -- 内联断言工具（避免依赖测试框架导致的循环依赖）
@@ -62,8 +57,8 @@ end
 
 --- 运行所有测试
 function M.run()
-  -- 清除 http_client 模块缓存，确保加载最新代码
-  package.loaded["NeoAI.core.ai.http_client"] = nil
+  -- 清除 http_utils 模块缓存，确保加载最新代码
+  package.loaded["NeoAI.utils.http_utils"] = nil
   local logger = require("NeoAI.utils.logger")
   logger.initialize({ level = "ERROR" })
   logger.info("\n=== test_http_client ===")
@@ -71,7 +66,7 @@ function M.run()
   local tests = {
     --- 测试 initialize
     test_aaa_initialize = function()
-      local hc = require("NeoAI.core.ai.http_client")
+      local hc = require("NeoAI.utils.http_utils")
       hc.initialize({ config = {} })
       -- 幂等初始化
       hc.initialize({ config = {} })
@@ -79,7 +74,7 @@ function M.run()
 
     --- 测试 get_state
     test_get_state = function()
-      local hc = require("NeoAI.core.ai.http_client")
+      local hc = require("NeoAI.utils.http_utils")
       local state = hc.get_state()
       assert.not_nil(state, "应返回状态")
       assert.not_nil(state.initialized)
@@ -89,24 +84,24 @@ function M.run()
 
     --- 测试 _sanitize_json_body
     test_sanitize_json_body = function()
-      local hc = require("NeoAI.core.ai.http_client")
+      local hc = require("NeoAI.utils.http_utils")
 
       -- 有效 JSON
-      local result = hc._sanitize_json_body('{"key":"value"}')
+      local result = hc.sanitize_json_body('{"key":"value"}')
       assert.equal('{"key":"value"}', result)
 
       -- 空字符串
-      local result2 = hc._sanitize_json_body("")
+      local result2 = hc.sanitize_json_body("")
       assert.equal("", result2)
 
       -- nil
-      local result3 = hc._sanitize_json_body(nil)
+      local result3 = hc.sanitize_json_body(nil)
       assert.equal(nil, result3)
     end,
 
     --- 测试 clear_request_dedup
     test_clear_request_dedup = function()
-      local hc = require("NeoAI.core.ai.http_client")
+      local hc = require("NeoAI.utils.http_utils")
 
       -- nil generation_id
       hc.clear_request_dedup(nil)
@@ -117,14 +112,14 @@ function M.run()
 
     --- 测试 cancel_all_requests
     test_cancel_all_requests = function()
-      local hc = require("NeoAI.core.ai.http_client")
+      local hc = require("NeoAI.utils.http_utils")
       hc.cancel_all_requests()
       -- 不应崩溃
     end,
 
     --- 测试 send_request（无 API key 应返回错误）
     test_send_request_no_key = function()
-      local hc = require("NeoAI.core.ai.http_client")
+      local hc = require("NeoAI.utils.http_utils")
 
       local response, err = hc.send_request({
         request = { model = "test", messages = {} },
@@ -140,7 +135,7 @@ function M.run()
 
     --- 测试 send_request 无 base_url
     test_send_request_no_url = function()
-      local hc = require("NeoAI.core.ai.http_client")
+      local hc = require("NeoAI.utils.http_utils")
 
       local response, err = hc.send_request({
         request = { model = "test", messages = {} },
@@ -156,7 +151,7 @@ function M.run()
 
     --- 测试 send_request_async（无 API key 应返回错误）
     test_send_request_async_no_key = function()
-      local hc = require("NeoAI.core.ai.http_client")
+      local hc = require("NeoAI.utils.http_utils")
 
       local called = false
       local request_id = hc.send_request_async({
@@ -176,7 +171,7 @@ function M.run()
 
     --- 测试 send_stream_request（无 API key 应返回错误）
     test_send_stream_request_no_key = function()
-      local hc = require("NeoAI.core.ai.http_client")
+      local hc = require("NeoAI.utils.http_utils")
       -- 确保已初始化（headless 模式兼容）
       hc.initialize({ config = {} })
 
@@ -194,10 +189,10 @@ function M.run()
 
     --- 测试 _read_file
     test_read_file = function()
-      local hc = require("NeoAI.core.ai.http_client")
+      local hc = require("NeoAI.utils.http_utils")
 
       -- 不存在的文件
-      local content = hc._read_file("/tmp/nonexistent_http_test_file.txt")
+      local content = hc.read_file("/tmp/nonexistent_http_test_file.txt")
       assert.equal(nil, content)
 
       -- 存在的文件
@@ -208,7 +203,7 @@ function M.run()
         f:close()
       end
 
-      local content2 = hc._read_file(test_path)
+      local content2 = hc.read_file(test_path)
       assert.equal("test content", content2)
 
       os.remove(test_path)
@@ -216,7 +211,7 @@ function M.run()
 
     --- 测试 cancel_request
     test_cancel_request = function()
-      local hc = require("NeoAI.core.ai.http_client")
+      local hc = require("NeoAI.utils.http_utils")
 
       -- 取消不存在的请求不应崩溃
       hc.cancel_request("nonexistent_request_id")
@@ -224,7 +219,7 @@ function M.run()
 
     --- 测试 shutdown
     test_shutdown = function()
-      local hc = require("NeoAI.core.ai.http_client")
+      local hc = require("NeoAI.utils.http_utils")
       hc.shutdown()
 
       local state = hc.get_state()
@@ -234,55 +229,43 @@ function M.run()
       hc.initialize({ config = {} })
     end,
 
-    --- 测试 _encode_special_chars / _decode_special_chars 编解码一致性
-    test_encode_decode_roundtrip = function()
-      local hc = require("NeoAI.core.ai.http_client")
+    --- 测试 encode_special_chars 编码功能
+    test_encode_special_chars = function()
+      local hc = require("NeoAI.utils.http_utils")
 
       -- 1. 普通 ASCII 文本（不含特殊字符，编码后应不变）
       local original = "Hello, World!"
-      local encoded = hc._encode_special_chars(original)
+      local encoded = hc.encode_special_chars(original)
       assert.equal(original, encoded, "纯 ASCII 不应被编码")
-      local decoded = hc._decode_special_chars(encoded)
-      assert.equal(original, decoded, "编解码往返应一致")
 
-      -- 2. 包含反斜杠和双引号（编码后应变化，但往返应一致）
-      -- 注意：在 Lua 长字符串 [[...]] 中，\ 是字面量反斜杠
-      local original2 = [[path\to\file and "quoted" text]]
-      local encoded2 = hc._encode_special_chars(original2)
-      -- 验证反斜杠和双引号被编码
+      -- 2. 包含反斜杠和双引号
+      local original2 = "path\\to\\file and \"quoted\" text"
+      local encoded2 = hc.encode_special_chars(original2)
       assert.is_true(encoded2:find("%%5C") ~= nil, "反斜杠应编码为 %5C")
       assert.is_true(encoded2:find("%%22") ~= nil, "双引号应编码为 %22")
-      local decoded2 = hc._decode_special_chars(encoded2)
-      assert.equal(original2, decoded2, "含 \\ 和 \" 的编解码往返应一致")
 
       -- 3. 控制字符
       local original3 = "text\x00with\x01control\x1Fchars"
-      local encoded3 = hc._encode_special_chars(original3)
+      local encoded3 = hc.encode_special_chars(original3)
       assert.is_true(encoded3:find("%%00") ~= nil, "\\x00 应编码为 %00")
       assert.is_true(encoded3:find("%%01") ~= nil, "\\x01 应编码为 %01")
       assert.is_true(encoded3:find("%%1F") ~= nil, "\\x1F 应编码为 %1F")
-      local decoded3 = hc._decode_special_chars(encoded3)
-      assert.equal(original3, decoded3, "含控制字符的编解码往返应一致")
 
       -- 4. 换行/回车/制表符应编码为 %0A %0D %09
       local original4 = "line1\nline2\rline3\tindented"
-      local encoded4 = hc._encode_special_chars(original4)
+      local encoded4 = hc.encode_special_chars(original4)
       assert.is_true(encoded4:find("%%0A") ~= nil, "\\n 应编码为 %0A")
       assert.is_true(encoded4:find("%%0D") ~= nil, "\\r 应编码为 %0D")
       assert.is_true(encoded4:find("%%09") ~= nil, "\\t 应编码为 %09")
-      local decoded4 = hc._decode_special_chars(encoded4)
-      assert.equal(original4, decoded4, "含 \\n\\r\\t 的编解码往返应一致")
 
       -- 5. 有效 UTF-8 中文
       local original5 = "你好，世界！"
-      local encoded5 = hc._encode_special_chars(original5)
+      local encoded5 = hc.encode_special_chars(original5)
       assert.equal(original5, encoded5, "有效 UTF-8 中文应保留不变")
-      local decoded5 = hc._decode_special_chars(encoded5)
-      assert.equal(original5, decoded5, "中文编解码往返应一致")
 
       -- 6. 混合场景
       local original6 = "path\\to\\file\"with\"ctrl\x00chars\nnewline\ttab\x1Fsep和中文"
-      local encoded6 = hc._encode_special_chars(original6)
+      local encoded6 = hc.encode_special_chars(original6)
       assert.is_true(encoded6:find("%%5C") ~= nil, "混合场景中反斜杠应编码")
       assert.is_true(encoded6:find("%%22") ~= nil, "混合场景中双引号应编码")
       assert.is_true(encoded6:find("%%00") ~= nil, "混合场景中 \\x00 应编码")
@@ -290,35 +273,52 @@ function M.run()
       assert.is_true(encoded6:find("%%0A") ~= nil, "混合场景中 \\n 应编码为 %0A")
       assert.is_true(encoded6:find("%%09") ~= nil, "混合场景中 \\t 应编码为 %09")
       assert.is_true(encoded6:find("和中文") ~= nil, "混合场景中中文应保留")
-      local decoded6 = hc._decode_special_chars(encoded6)
-      assert.equal(original6, decoded6, "混合场景编解码往返应一致")
 
       -- 7. 空字符串和 nil
-      assert.equal("", hc._encode_special_chars(""), "空字符串编码应返回空")
-      assert.equal(nil, hc._encode_special_chars(nil), "nil 编码应返回 nil")
-      assert.equal("", hc._decode_special_chars(""), "空字符串解码应返回空")
-      assert.equal(nil, hc._decode_special_chars(nil), "nil 解码应返回 nil")
+      assert.equal("", hc.encode_special_chars(""), "空字符串编码应返回空")
+      assert.equal(nil, hc.encode_special_chars(nil), "nil 编码应返回 nil")
     end,
 
-    --- 测试 _encode_response_strings 递归编码
-    test_encode_response_strings = function()
-      local hc = require("NeoAI.core.ai.http_client")
+    --- 测试 parse_tool_call_arguments 工具调用参数解析
+    test_parse_tool_call_arguments = function()
+      local hc = require("NeoAI.utils.http_utils")
 
-      -- 模拟流式响应结构
-      local stream_response = {
+      -- 1. 有效工具调用
+      local tool_calls = {
+        {
+          id = "call_1",
+          type = "function",
+          ["function"] = {
+            name = "read_file",
+            arguments = '{"filepath":"/tmp/test.txt"}',
+          },
+        },
+      }
+      local result = hc.parse_tool_call_arguments(tool_calls)
+      assert.equal("table", type(result[1]["function"].arguments), "arguments 应解析为 table")
+      assert.equal("/tmp/test.txt", result[1]["function"].arguments.filepath)
+
+      -- 2. 空列表
+      assert.is_true(#hc.parse_tool_call_arguments({}) == 0, "空列表应返回空表")
+      assert.is_true(#hc.parse_tool_call_arguments(nil) == 0, "nil 应返回空表")
+    end,
+
+    --- 测试 parse_response_tool_calls 响应工具调用解析
+    test_parse_response_tool_calls = function()
+      local hc = require("NeoAI.utils.http_utils")
+
+      -- 1. 带 choices 的响应
+      local response = {
         choices = {
           {
-            delta = {
-              content = "hello \"world\" and path\\to\\file",
-              reasoning_content = "思考\x00过程",
+            message = {
               tool_calls = {
                 {
-                  index = 0,
                   id = "call_1",
                   type = "function",
                   ["function"] = {
                     name = "test_tool",
-                    arguments = '{"key":"value\\with\\backslash"}',
+                    arguments = '{"key":"value"}',
                   },
                 },
               },
@@ -326,108 +326,223 @@ function M.run()
           },
         },
       }
+      local result = hc.parse_response_tool_calls(response)
+      assert.equal("table", type(result.choices[1].message.tool_calls[1]["function"].arguments))
 
-      hc._encode_response_strings(stream_response)
-
-      -- 验证 content 中的双引号和反斜杠被编码
-      local content = stream_response.choices[1].delta.content
-      assert.is_true(content:find("%%22") ~= nil, "content 中的双引号应编码")
-      assert.is_true(content:find("%%5C") ~= nil, "content 中的反斜杠应编码")
-
-      -- 验证 reasoning_content 中的控制字符被编码
-      local reasoning = stream_response.choices[1].delta.reasoning_content
-      assert.is_true(reasoning:find("%%00") ~= nil, "reasoning 中的 \\x00 应编码")
-
-      -- 验证 tool_calls arguments 中的反斜杠被编码
-      local args = stream_response.choices[1].delta.tool_calls[1]["function"].arguments
-      assert.is_true(args:find("%%5C") ~= nil, "arguments 中的反斜杠应编码")
-
-      -- 验证解码后还原
-      local decoded_content = hc._decode_special_chars(content)
-      assert.equal("hello \"world\" and path\\to\\file", decoded_content)
-
-      local decoded_reasoning = hc._decode_special_chars(reasoning)
-      assert.equal("思考\x00过程", decoded_reasoning)
-
-      local decoded_args = hc._decode_special_chars(args)
-      assert.equal('{"key":"value\\with\\backslash"}', decoded_args)
+      -- 2. 无 choices 的响应
+      assert.equal(nil, hc.parse_response_tool_calls(nil))
     end,
 
-    --- 测试完整流程：模拟 API 响应 → 编码 → 存储 → 解码发送 → 解码渲染
-    test_full_flow_simulation = function()
-      local hc = require("NeoAI.core.ai.http_client")
+    --- 测试 repair_orphan_tool_messages 防御性修复
+    test_repair_orphan_tool_messages = function()
+      local hc = require("NeoAI.utils.http_utils")
 
-      -- 1. 模拟 API 原始响应（包含会影响 JSON 的特殊字符）
-      local raw_api_response = {
-        id = "chatcmpl-123",
-        object = "chat.completion.chunk",
-        created = 1234567890,
-        model = "test-model",
-        choices = {
+      -- 1. 无孤立消息
+      local request = {
+        messages = {
+          { role = "user", content = "hello" },
+        },
+      }
+      hc.repair_orphan_tool_messages(request)
+      assert.equal("user", request.messages[1].role)
+
+      -- 2. 空请求
+      hc.repair_orphan_tool_messages({})
+      hc.repair_orphan_tool_messages(nil)
+
+      -- 3. 无 tools 定义时不修改
+      local request2 = {
+        messages = {
+          { role = "tool", tool_call_id = "orphan_1", content = "result" },
+        },
+      }
+      hc.repair_orphan_tool_messages(request2)
+      assert.equal("tool", request2.messages[1].role, "无 tools 定义时不修改")
+    end,
+
+    --- 测试 encode_tool_call_arguments 工具调用参数编码
+    test_encode_tool_call_arguments = function()
+      local hc = require("NeoAI.utils.http_utils")
+
+      -- 1. 有效参数
+      local body = {
+        messages = {
           {
-            index = 0,
-            delta = {
-              content = "这是包含反斜杠\\和双引号\"以及控制字符\x00\x01的文本\n第二行\t制表符",
-              reasoning_content = "思考过程包含\x00空字符",
+            tool_calls = {
+              {
+                ["function"] = {
+                  name = "test_tool",
+                  arguments = { key = "value" },
+                },
+              },
             },
-            finish_reason = nil,
           },
         },
       }
+      hc.encode_tool_call_arguments(body)
+      assert.equal("string", type(body.messages[1].tool_calls[1]["function"].arguments))
 
-      -- 2. 模拟 http_client 收到响应后的编码步骤
-      hc._encode_response_strings(raw_api_response)
+      -- 2. nil 和空表
+      hc.encode_tool_call_arguments(nil)
+      hc.encode_tool_call_arguments({})
+    end,
 
-      -- 验证编码结果
-      local encoded_content = raw_api_response.choices[1].delta.content
-      assert.is_true(encoded_content:find("%%5C") ~= nil, "反斜杠应编码为 %5C")
-      assert.is_true(encoded_content:find("%%22") ~= nil, "双引号应编码为 %22")
-      assert.is_true(encoded_content:find("%%00") ~= nil, "\\x00 应编码为 %00")
-      assert.is_true(encoded_content:find("%%01") ~= nil, "\\x01 应编码为 %01")
-      assert.is_true(encoded_content:find("%%0A") ~= nil, "\\n 应编码为 %0A")
-      assert.is_true(encoded_content:find("%%09") ~= nil, "\\t 应编码为 %09")
-      assert.is_true(encoded_content:find("文本") ~= nil, "中文应保留")
+    --- 测试 create_stream_processor 流式处理器创建
+    test_create_stream_processor = function()
+      local hc = require("NeoAI.utils.http_utils")
+      local processor = hc.create_stream_processor("gen_1", "session_1", 1001)
+      assert.not_nil(processor)
+      assert.equal("gen_1", processor.generation_id)
+      assert.equal("", processor.content_buffer)
+      assert.is_false(processor.is_finished)
 
-      -- 3. 模拟存储到 history_manager（编码后的内容存入持久化）
-      local stored_content = encoded_content
-      local stored_reasoning = raw_api_response.choices[1].delta.reasoning_content
+      -- 带 is_tool_loop 参数
+      local processor2 = hc.create_stream_processor("gen_2", "session_2", 1002, true)
+      assert.is_true(processor2.is_tool_loop)
+    end,
 
-      -- 4. 模拟发送给 API 时解码（build_request 中的逻辑）
-      local decoded_for_send = hc._decode_special_chars(stored_content)
-      local expected_original = "这是包含反斜杠\\和双引号\"以及控制字符\x00\x01的文本\n第二行\t制表符"
-      assert.equal(expected_original, decoded_for_send, "发送时解码应还原原始内容")
+    --- 测试 process_stream_chunk 流式数据块处理
+    test_process_stream_chunk = function()
+      local hc = require("NeoAI.utils.http_utils")
+      local processor = hc.create_stream_processor("gen_1", "session_1", 1001)
 
-      -- 5. 模拟渲染时解码（_render_single_message 中的逻辑）
-      local decoded_for_render = hc._decode_special_chars(stored_content)
-      assert.equal(expected_original, decoded_for_render, "渲染时解码应还原原始内容")
+      -- 1. 内容块
+      local result = hc.process_stream_chunk(processor, { choices = { { delta = { content = "Hello" } } } })
+      assert.equal("Hello", result.content)
+      assert.equal("Hello", processor.content_buffer)
 
-      -- 6. 验证 reasoning 的编解码
-      local decoded_reasoning = hc._decode_special_chars(stored_reasoning)
-      assert.equal("思考过程包含\x00空字符", decoded_reasoning, "reasoning 编解码应一致")
+      -- 2. 已完成处理器
+      processor.is_finished = true
+      local result2 = hc.process_stream_chunk(processor, { choices = { { delta = { content = "extra" } } } })
+      assert.is_nil(result2.content, "已完成处理器应忽略内容")
+      processor.is_finished = false
 
-      -- 7. 验证编码后的内容可以安全嵌入 JSON（不会破坏 JSON 结构）
-      -- 因为 \ 和 " 已被编码为 %5C 和 %22，控制字符已被编码为 %XX
-      -- 所以可以直接嵌入 JSON 字符串值中，无需额外转义
-      local safe_for_json = '{"content":"' .. stored_content .. '"}'
-      local ok, parsed = pcall(vim.json.decode, safe_for_json)
-      assert.is_true(ok, "编码后的内容应能安全嵌入 JSON")
-      assert.not_nil(parsed, "JSON 解析结果不应为 nil")
-      if ok and parsed then
-        -- JSON 解码后得到的是原始内容（因为 vim.json.decode 会解析转义）
-        -- 验证 JSON 中的内容与编码前一致
-        assert.equal(stored_content, parsed.content, "JSON 中的内容应与编码后一致")
+      -- 3. 工具调用块
+      local processor2 = hc.create_stream_processor("gen_2", "session_2", 1002)
+      local chunk = { choices = { { delta = { tool_calls = { { index = 0, id = "call_1", type = "function", ["function"] = { name = "read_file", arguments = '{"path":"/tmp/test"}' } } } } } } }
+      local result3 = hc.process_stream_chunk(processor2, chunk)
+      assert.is_true(#result3.tool_calls > 0)
+
+      -- 4. finish_reason
+      local result4 = hc.process_stream_chunk(processor2, { choices = { { delta = {}, finish_reason = "stop" } } })
+      assert.is_true(result4.is_final)
+      assert.is_true(processor2.is_finished)
+
+      -- 5. usage
+      local result5 = hc.process_stream_chunk(processor2, { usage = { prompt_tokens = 10, completion_tokens = 20 } })
+      assert.equal(10, result5.usage.prompt_tokens)
+    end,
+
+    --- 测试 filter_valid_tool_calls 工具调用过滤
+    test_filter_valid_tool_calls = function()
+      local hc = require("NeoAI.utils.http_utils")
+
+      -- 1. 有效工具调用
+      local valid = hc.filter_valid_tool_calls({
+        { ["function"] = { name = "valid_tool", arguments = { key = "value" } } },
+        { ["function"] = { name = "", arguments = {} } },
+        { ["function"] = { name = "valid_tool2", arguments = {} } },
+      })
+      assert.equal(2, #valid, "应保留 2 个有效工具调用")
+
+      -- 2. 空列表
+      assert.is_true(#hc.filter_valid_tool_calls({}) == 0)
+    end,
+
+    --- 测试 try_finalize_tool_calls 工具调用最终化
+    test_try_finalize_tool_calls = function()
+      local hc = require("NeoAI.utils.http_utils")
+
+      -- 1. 完整工具调用
+      local processor = hc.create_stream_processor("gen_1", "session_1", 1001)
+      processor.tool_calls = {
+        {
+          id = "call_1",
+          type = "function",
+          ["function"] = {
+            name = "test_tool",
+            arguments = '{"key":"value"}',
+          },
+        },
+      }
+      local result = hc.try_finalize_tool_calls(processor)
+      assert.not_nil(result, "完整工具调用应最终化成功")
+      assert.equal("table", type(result[1]["function"].arguments))
+
+      -- 2. 空处理器
+      assert.is_nil(hc.try_finalize_tool_calls(hc.create_stream_processor("gen_2", "s", 1002)))
+
+      -- 3. 名称为空的工具调用
+      local processor2 = hc.create_stream_processor("gen_3", "s", 1003)
+      processor2.tool_calls = {
+        { id = "call_2", type = "function", ["function"] = { name = "", arguments = "{}" } },
+      }
+      assert.is_nil(hc.try_finalize_tool_calls(processor2))
+    end,
+
+    --- 测试 reasoning 节流功能
+    test_reasoning_throttle = function()
+      local hc = require("NeoAI.utils.http_utils")
+      hc.clear_reasoning_throttle()
+      local processor = hc.create_stream_processor("gen_1", "session_1", 1001)
+      hc.push_reasoning_content("gen_1", "思考", processor, {})
+      hc.push_reasoning_content("gen_1", "过程", processor, {})
+      hc.clear_reasoning_throttle()
+      hc.clear_reasoning_throttle()  -- 幂等
+    end,
+
+    --- 测试 is_tool_calls_ready
+    test_is_tool_calls_ready = function()
+      local hc = require("NeoAI.utils.http_utils")
+      local processor = hc.create_stream_processor("gen_1", "s", 1001)
+      assert.is_false(hc.is_tool_calls_ready(processor))
+      processor.is_finished = true
+      assert.is_true(hc.is_tool_calls_ready(processor))
+      assert.is_false(hc.is_tool_calls_ready(nil))
+    end,
+
+    --- 测试 clear_dual_trigger_state
+    test_clear_dual_trigger_state = function()
+      local hc = require("NeoAI.utils.http_utils")
+      local processor = hc.create_stream_processor("gen_1", "s", 1001)
+      processor._json_depth = 5
+      hc.clear_dual_trigger_state(processor)
+      assert.equal(0, processor._json_depth)
+      hc.clear_dual_trigger_state(nil)  -- 不应崩溃
+    end,
+
+    --- 测试 build_curl_args
+    test_build_curl_args = function()
+      local hc = require("NeoAI.utils.http_utils")
+      local args = hc.build_curl_args({
+        url = "https://api.test.com",
+        method = "POST",
+        headers = { ["Authorization"] = "Bearer test" },
+        body = '{"key":"value"}',
+      })
+      assert.is_true(#args > 0)
+      local has_url = false
+      for _, a in ipairs(args) do
+        if a == "https://api.test.com" then has_url = true; break end
       end
+      assert.is_true(has_url, "curl args 应包含 URL")
+    end,
 
-      -- 8. 验证包含反斜杠的 tool_calls.arguments 也能安全嵌入 JSON
-      local raw_arguments = '{"file":"C:\\\\Users\\\\test","query":"hello\"world"}'
-      local encoded_arguments = hc._encode_special_chars(raw_arguments)
-      local json_with_args = '{"arguments":"' .. encoded_arguments .. '"}'
-      local ok2, parsed2 = pcall(vim.json.decode, json_with_args)
-      assert.is_true(ok2, "编码后的 arguments 应能安全嵌入 JSON")
-      if ok2 and parsed2 then
-        local decoded_args = hc._decode_special_chars(parsed2.arguments)
-        assert.equal(raw_arguments, decoded_args, "arguments 编解码往返应一致")
-      end
+    --- 测试 parse_sse_line
+    test_parse_sse_line = function()
+      local hc = require("NeoAI.utils.http_utils")
+
+      -- 1. 有效 SSE 行
+      local data = hc.parse_sse_line("data: {\"key\":\"value\"}")
+      assert.not_nil(data)
+      assert.equal("value", data.key)
+
+      -- 2. [DONE] 标记
+      assert.is_nil(hc.parse_sse_line("data: [DONE]"))
+
+      -- 3. 空行
+      assert.is_nil(hc.parse_sse_line(""))
+      assert.is_nil(hc.parse_sse_line(nil))
     end,
   }
 

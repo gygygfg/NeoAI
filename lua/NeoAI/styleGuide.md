@@ -31,7 +31,6 @@ NeoAI/
 │       ├── ai_engine.lua       # AI 引擎（事件驱动，协调子模块）
 │       ├── chat_service.lua    # 后端聊天服务（前后端分离的后端入口）
 │       ├── http_client.lua     # HTTP 客户端（流式/非流式请求）
-│       ├── http_utils.lua      # HTTP 工具函数（请求去重、URL 编码等）
 │       ├── request_adapter.lua # 请求适配器（多 API 提供商格式转换）
 │       ├── request_builder.lua # 请求构建器（构建 API 请求体、格式化消息）
 │       ├── response_retry.lua  # 响应重试模块（检测异常并触发重试）
@@ -89,7 +88,8 @@ NeoAI/
 │   ├── logger.lua              # 日志系统
 │   ├── json.lua                # JSON 编解码
 │   ├── skiplist.lua            # 跳表数据结构
-│   ├── async_worker.lua        # 异步工作器（含 thread_utils 内联功能）
+│   ├── http_utils.lua          # HTTP 工具函数（请求去重、URL 编码等）
+│   └── async_worker.lua        # 异步工作器（含 thread_utils 内联功能）
 │
 ├── docs/                       # 文档
 │   ├── AI_RESPONSE_FLOW.md

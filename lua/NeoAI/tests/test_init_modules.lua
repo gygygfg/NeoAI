@@ -8,6 +8,11 @@ local test
 function M.run(test_module)
   test = test_module or require("NeoAI.tests")
   local assert = test.assert
+  -- 确保 _logger 可用（直接 dofile 运行时可能为 nil）
+  if not test._logger then
+    local logger = require("NeoAI.utils.logger")
+    test._logger = logger
+  end
   test._logger.info("\n=== test_init_modules ===")
 
   return test.run_tests({
@@ -50,9 +55,9 @@ function M.run(test_module)
       sf.reset()
     end,
 
-    test_core_get_ai_engine = function()
+    test_core_get_engine = function()
       local core = require("NeoAI.core")
-      local ok, engine = pcall(core.get_ai_engine, core)
+      local ok, engine = pcall(core.get_engine, core)
       if ok and engine then
         assert.is_true(type(engine.get_status) == "function")
       end
@@ -85,10 +90,10 @@ function M.run(test_module)
     -- ========== core/ai/init.lua ==========
     test_ai_init_exports = function()
       local ai = require("NeoAI.core.ai")
-      assert.not_nil(ai.ai_engine, "应导出 ai_engine")
-      assert.not_nil(ai.http_client, "应导出 http_client")
+      assert.not_nil(ai.engine, "应导出 engine")
+      assert.not_nil(ai.http_utils, "应导出 http_utils")
       assert.not_nil(ai.request_adapter, "应导出 request_adapter")
-      assert.not_nil(ai.tool_orchestrator, "应导出 tool_orchestrator")
+      assert.not_nil(ai.tool_cycle, "应导出 tool_cycle")
       assert.not_nil(ai.chat_service, "应导出 chat_service")
     end,
 

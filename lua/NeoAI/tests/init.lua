@@ -8,69 +8,22 @@
 
 local M = {}
 
--- 测试配置（合并到默认配置上）
-M.test_config = {
-  ui = {
-    default_ui = "chat",
-    window_mode = "float",
-    window = {
-      width = 60,
-      height = 15,
-      border = "none",
-    },
-  },
-  session = {
-    auto_save = false,
-    auto_naming = false,
-    save_path = "/tmp/neoai_test_sessions",
-    max_history_per_session = 50,
-  },
-  tools = {
-    enabled = false,
-    builtin = false,
-  },
-  keymaps = {
-    global = {
-      open_tree = { key = "<leader>tt", desc = "测试打开树" },
-      open_chat = { key = "<leader>cc", desc = "测试打开聊天" },
-    },
-  },
-  log = {
-    -- 日志级别: 'DEBUG', 'INFO', 'WARN', 'ERROR', 'FATAL'
-    level = "DEBUG",
-    -- 输出文件路径（可选，默认输出到文件，避免 print 阻塞消息区域）
-    output_path = "/root/NeoAI/pack/plugins/start/NeoAI/lua/NeoAI/neoai.log",
-    -- 日志格式模板
-    format = "[{time}] [{level}] {message}",
-    -- 最大文件大小（字节），默认 10MB
-    max_file_size = 10485760,
-    -- 最大备份文件数量
-    max_backups = 5,
-    -- 是否启用详细输出（verbose 模式）
-    verbose = true,
-    -- 是否启用调试打印到控制台
-    print_debug = false,
-  },
-}
-
---- 获取合并后的完整配置
---- 先加载主 init.lua 的 setup 流程，再覆盖测试配置
---- @return table 合并后的完整配置
+--- 获取当前 Neovim 实例中已加载的 NeoAI 配置
+--- 直接使用当前配置，不创建自定义测试配置
+--- @return table 当前已加载的完整配置
 function M.get_merged_config()
-  -- 加载主模块
-  local ok, neoai = pcall(require, "NeoAI")
-  if not ok then
-    -- 如果主模块加载失败（如无 Neovim 环境），直接使用 default_config
-    local default_config = require("NeoAI.default_config")
-    return default_config.process_config(M.test_config)
+  local ok, core = pcall(require, "NeoAI.core")
+  if ok then
+    -- 安全地获取配置，不触发 error
+    local config_ok, config = pcall(core.get_config, core)
+    if config_ok and config then
+      return config
+    end
   end
 
-  -- 调用主模块的 setup（会合并配置）
-  neoai.setup(M.test_config)
-
-  -- 获取合并后的配置
-  local state = require("NeoAI.core.config.state")
-  return state.get_state("config", "data")
+  -- 如果 core 未初始化（如无 Neovim 环境），尝试直接加载默认配置
+  local default_config = require("NeoAI.default_config")
+  return default_config.get_default_config()
 end
 
 --- 运行所有测试（或指定测试）
@@ -111,6 +64,18 @@ function M.run_all(...)
 
   -- 保存 logger 到模块，供 M.test 使用
   local logger = require("NeoAI.utils.logger")
+  -- 获取当前配置中的日志输出路径
+  local config = M.get_merged_config()
+  local log_path = (config and config.log and config.log.output_path) or "/root/NeoAI/lua/NeoAI/neoai.log"
+  -- 使用当前配置的日志级别，确保所有级别的日志都被记录
+  local log_level = (config and config.log and config.log.level) or "DEBUG"
+  -- 将日志路径和级别保存到全局变量，供测试文件重置 logger 时使用
+  -- 某些测试（如 test_integration）会清空 NeoAI 模块缓存导致 logger 被重新加载
+  _G._NEOAI_TEST_LOG_PATH = log_path
+  _G._NEOAI_TEST_LOG_LEVEL = log_level
+  -- 立即设置文件输出，确保日志写入文件而非控制台
+  logger.set_output(log_path)
+  logger.set_level(log_level)
   M._logger = logger
 
   -- 设置全局标志，禁止测试文件的自动运行代码执行
@@ -133,6 +98,14 @@ function M.run_all(...)
   end
 
   for _, name in ipairs(tests) do
+    -- 每个测试文件运行前，确保 logger 状态正确
+    local pre_logger = require("NeoAI.utils.logger")
+    pre_logger.initialize({ max_file_size = 10485760, max_backups = 5 })
+    pre_logger.set_output(nil)
+    pre_logger.set_output(_G._NEOAI_TEST_LOG_PATH or log_path)
+    pre_logger.set_level(_G._NEOAI_TEST_LOG_LEVEL or log_level)
+    M._logger = pre_logger
+
     -- 注意：不清理 NeoAI 模块缓存，因为测试文件依赖模块的初始化状态。
     -- 每个测试文件通过 _test_reset() 自行管理内部状态。
     local ok, err = pcall(function()
@@ -142,6 +115,8 @@ function M.run_all(...)
       if test_mod and test_mod.run then
         -- 传入 M 作为 test_module，避免测试文件内部调用 require("NeoAI.tests") 导致循环依赖
         local r = test_mod.run(M)
+        -- 重置日志级别，防止测试文件内部的 setup 调用改变日志级别
+        logger.set_level(log_level)
         if r then
           results.passed = results.passed + (r.passed or 0)
           results.failed = results.failed + (r.failed or 0)
@@ -158,6 +133,23 @@ function M.run_all(...)
       table.insert(results.errors, "[" .. name .. "] " .. tostring(err))
     end
 
+    -- 每个测试文件运行后，重新确保 logger 有文件输出和级别
+    -- 防止测试代码（如 logger.set_output(nil)、merger.process_config、clean_package_cache）破坏设置
+    -- 即使 logger 模块被重新 require，也要重新设置
+    local current_logger = require("NeoAI.utils.logger")
+    local restore_path = _G._NEOAI_TEST_LOG_PATH or log_path
+    local restore_level = _G._NEOAI_TEST_LOG_LEVEL or log_level
+    -- 先恢复 max_file_size 和 max_backups，再恢复 output_path
+    -- 防止 test_logger_rotate 修改后，恢复 output_path 时触发 rotate() 轮转 neoai.log
+    current_logger.initialize({ max_file_size = 10485760, max_backups = 5 })
+    -- 强制重置：先关闭再重新打开，确保文件句柄有效
+    current_logger.set_output(nil)
+    current_logger.set_output(restore_path)
+    current_logger.set_level(restore_level)
+    M._logger = current_logger
+    -- 验证：直接写入一条日志确认文件可写
+    current_logger.debug(string.format("[logger恢复] %s 测试完成", name))
+
     -- 每个测试文件运行后，强制处理一次事件循环，避免 vim.schedule 回调堆积
     -- 在 headless 模式下尤其重要
     if is_headless then
@@ -165,6 +157,19 @@ function M.run_all(...)
         return false
       end)
     end
+  end
+
+  -- 写入测试结果汇总统计到日志文件
+  -- 无论通过 run_all 直接调用还是通过 NeoAITest 命令调用，都能记录
+  local summary_logger = require("NeoAI.utils.logger")
+  local summary = string.format("测试结果: %d 通过, %d 失败", results.passed, results.failed)
+  summary_logger.info(summary)
+  if #results.errors > 0 then
+    local error_msgs = {}
+    for _, e in ipairs(results.errors) do
+      table.insert(error_msgs, e)
+    end
+    summary_logger.warn("失败的测试:\n  " .. table.concat(error_msgs, "\n  "))
   end
 
   return results

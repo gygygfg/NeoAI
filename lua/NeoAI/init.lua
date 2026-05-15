@@ -109,21 +109,25 @@ local function register_commands()
         table.insert(tests_to_run, arg)
       end
       local results = tests.run_all(table.unpack(tests_to_run))
-      print(string.format("\n测试结果: %d 通过, %d 失败", results.passed, results.failed))
+      -- 汇总统计已由 tests.run_all 写入日志文件，此处仅通过 vim.notify 显示到消息区域
+      vim.notify(string.format("测试结果: %d 通过, %d 失败", results.passed, results.failed), vim.log.levels.INFO)
       if #results.errors > 0 then
-        print("失败的测试:")
+        local error_msgs = {}
         for _, e in ipairs(results.errors) do
-          print("  " .. e)
+          table.insert(error_msgs, e)
         end
+        vim.notify("失败的测试:\n  " .. table.concat(error_msgs, "\n  "), vim.log.levels.WARN)
       end
     else
       local results = tests.run_all()
-      print(string.format("\n测试结果: %d 通过, %d 失败", results.passed, results.failed))
+      -- 汇总统计已由 tests.run_all 写入日志文件，此处仅通过 vim.notify 显示到消息区域
+      vim.notify(string.format("测试结果: %d 通过, %d 失败", results.passed, results.failed), vim.log.levels.INFO)
       if #results.errors > 0 then
-        print("失败的测试:")
+        local error_msgs = {}
         for _, e in ipairs(results.errors) do
-          print("  " .. e)
+          table.insert(error_msgs, e)
         end
+        vim.notify("失败的测试:\n  " .. table.concat(error_msgs, "\n  "), vim.log.levels.WARN)
       end
     end
   end, {
@@ -235,25 +239,41 @@ function M.setup(user_config)
   -- 初始化工具系统（传入完整合并配置，tools 模块可从中提取 keymaps 等）
   tools_ref = tools.initialize(_config)
 
-  -- 延迟将工具注册表注入 AI 引擎（等异步加载的内置工具完成后）
+  -- 延迟将工具注册表注入 tool_cycle 和 request_handler（等异步加载的内置工具完成后）
   vim.schedule(function()
-    local ai_engine = core_ref.get_ai_engine()
-    if ai_engine and ai_engine.set_tools then
-      local registered_tools = tools_ref.get_tools()
-      local tools_map = {}
-      for _, tool_def in ipairs(registered_tools) do
-        tools_map[tool_def.name] = {
-          func = tool_def.func,
-          description = tool_def.description or "",
-          parameters = tool_def.parameters or {
-            type = "object",
-            properties = {},
-            required = {},
-          },
-        }
+    local tool_cycle = require("NeoAI.core.ai.tool_cycle")
+    local request_handler = require("NeoAI.core.ai.request_handler")
+    local registered_tools = tools_ref.get_tools()
+    local tools_map = {}
+    local tool_defs = {}
+    for _, tool_def in ipairs(registered_tools) do
+      tools_map[tool_def.name] = {
+        func = tool_def.func,
+        description = tool_def.description or "",
+        parameters = tool_def.parameters or {
+          type = "object",
+          properties = {},
+          required = {},
+        },
+      }
+      -- 构建 AI 请求用的工具定义格式
+      local tf = { name = tool_def.name, description = tool_def.description or ("执行 " .. tool_def.name .. " 操作") }
+      local params = tool_def.parameters
+      if params and type(params) == "table" then
+        local has_props = false
+        if params.properties then for _,_ in pairs(params.properties) do has_props = true; break end end
+        if has_props then
+          local cp = { type = params.type or "object", properties = params.properties }
+          if params.required and type(params.required) == "table" and #params.required > 0 then
+            cp.required = params.required
+          end
+          tf.parameters = cp
+        end
       end
-      ai_engine.set_tools(tools_map)
+      table.insert(tool_defs, { type = "function", ["function"] = tf })
     end
+    tool_cycle.set_tools(tools_map)
+    request_handler.set_tool_definitions(tool_defs)
   end)
 
   -- 注册命令和快捷键
@@ -307,7 +327,7 @@ function M.get_ai_engine()
   if not core_ref then
     error("Core not initialized")
   end
-  return core_ref.get_ai_engine()
+  return core_ref.get_engine()
 end
 
 --- 获取工具系统

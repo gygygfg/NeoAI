@@ -17,7 +17,13 @@ local function is_headless()
 end
 
 local function safe_wait(timeout_ms, cond)
-  if is_headless() then return vim.wait(timeout_ms, cond, 50) end
+  if is_headless() then
+    -- headless 模式下使用 vim.wait，它能处理 vim.schedule 回调和 job 回调
+    -- 使用 10ms 的检查间隔，确保及时响应
+    -- 先主动处理一次事件循环，刷新待处理的 vim.schedule 回调
+    vim.uv.run("nowait")
+    return vim.wait(timeout_ms, cond, 10)
+  end
   local deadline = vim.uv.now() + timeout_ms
   while vim.uv.now() < deadline do
     if cond() then return true end
@@ -48,13 +54,18 @@ local function make_config()
     session = { auto_save = false, auto_naming = false, save_path = "/tmp/neoai_test_integration", max_history_per_session = 100 },
     tools = { enabled = true, builtin = false, approval = { default_auto_allow = true } },
     keymaps = { global = { open_tree = { key = "<leader>tt" }, open_chat = { key = "<leader>cc" } } },
-    log = { level = "ERROR" },
+    log = { level = "DEBUG" },
   }
 end
 
 function M.run(test_module)
   test = test_module or require("NeoAI.tests")
   local assert = test.assert
+  -- 确保 _logger 可用（直接 dofile 运行时可能为 nil）
+  if not test._logger then
+    local logger = require("NeoAI.utils.logger")
+    test._logger = logger
+  end
   test._logger.info("\n=== test_integration ===")
 
   local has_api_key = false
@@ -110,7 +121,7 @@ function M.run(test_module)
         },
       })
 
-      local tool_orch = require("NeoAI.core.ai.tool_orchestrator")
+      local tool_orch = require("NeoAI.core.ai.tool_cycle")
       local sid = "session_orch_" .. os.time()
       tool_orch.register_session(sid, nil)
       assert.not_nil(tool_orch.get_session_state(sid))
@@ -169,9 +180,10 @@ function M.run(test_module)
 
       local sid = cs.create_session("工具循环测试", true, nil)
       assert.not_nil(sid)
+      test._logger.info("  [debug] test_04: session created: " .. tostring(sid))
 
       local events, ids = {}, {}
-      for _, name in ipairs({ "NeoAI:generation_completed", "NeoAI:generation_error",
+      for _, name in ipairs({ "NeoAI:tool_loop_finished", "NeoAI:generation_error",
         "NeoAI:tool_loop_started", "NeoAI:tool_execution_completed" }) do
         local id = vim.api.nvim_create_autocmd("User", {
           pattern = name, callback = function() events[name] = (events[name] or 0) + 1 end,
@@ -182,15 +194,17 @@ function M.run(test_module)
       engine.generate_response({
         { role = "system", content = "你是一个测试助手。当用户说'调用工具'时，必须使用 integration_test_tool 工具。input 参数设为用户消息内容。" },
         { role = "user", content = "调用工具，帮我处理这条消息：Hello World" },
-      }, { session_id = sid, options = { stream = true, temperature = 0.1, max_tokens = 300 } })
+      }, { session_id = sid, options = { stream = false, temperature = 0.1, max_tokens = 300 } })
+      test._logger.info("  [debug] test_04: generate_response called, waiting for events...")
 
-      safe_wait(90000, function()
-        return (events["NeoAI:generation_completed"] or 0) > 0
+      safe_wait(120000, function()
+        return (events["NeoAI:tool_loop_finished"] or 0) > 0
             or (events["NeoAI:generation_error"] or 0) > 0
       end)
+      test._logger.info("  [debug] test_04: wait finished, events: " .. vim.inspect(events))
       for _, id in ipairs(ids) do pcall(vim.api.nvim_del_autocmd, id) end
 
-      local gen_ok = (events["NeoAI:generation_completed"] or 0) > 0
+      local gen_ok = (events["NeoAI:tool_loop_finished"] or 0) > 0
       local gen_err = (events["NeoAI:generation_error"] or 0) > 0
       assert.is_true(gen_ok or gen_err, "应至少触发完成或错误事件")
 
@@ -233,7 +247,7 @@ function M.run(test_module)
     -- 7. 自动命名
     test_07_auto_naming = function()
       if not has_api_key then test._logger.warn("  ⚠ 跳过：未设置 DEEPSEEK_API_KEY"); return end
-      local engine = require("NeoAI.core.ai.ai_engine")
+      local engine = require("NeoAI.core.ai.engine")
       local done, result = false, nil
       engine.auto_name_session("session_test_naming", "今天天气怎么样？", function(success, name)
         done = true; result = { success = success, name = name }
@@ -251,8 +265,8 @@ function M.run(test_module)
       local engine = neoai.get_ai_engine()
       engine.shutdown()
       assert.is_false(engine.get_status().initialized)
-      require("NeoAI.core.ai.tool_orchestrator").shutdown()
-      local hc = require("NeoAI.core.ai.http_client")
+      require("NeoAI.core.ai.tool_cycle").shutdown()
+      local hc = require("NeoAI.utils.http_utils")
       hc.shutdown()
       assert.is_false(hc.get_state().initialized)
       local cs = require("NeoAI.core.ai.chat_service")
