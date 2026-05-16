@@ -156,6 +156,26 @@ local function _type_name(t)
   return names[t] or tostring(t)
 end
 
+--- 判断 table 是否为数组（连续数字索引）
+--- @param t table
+--- @return boolean
+local function _is_array(t)
+  if type(t) ~= "table" then
+    return false
+  end
+  local count = #t
+  if count == 0 then
+    return false
+  end
+  -- 检查是否所有数字键 1..count 都存在，且无非数字键
+  for k in pairs(t) do
+    if type(k) ~= "number" or k < 1 or k > count or math.floor(k) ~= k then
+      return false
+    end
+  end
+  return true
+end
+
 --- 格式化枚举值列表（用于提示信息）
 --- @param enum table 枚举值数组
 --- @return string
@@ -275,9 +295,19 @@ local function _validate_and_merge(default, user, constraint, path)
           if type(sub_v) == "table" and next(sub_v) == nil and type(default[k][sub_k]) == "table" and next(default[k][sub_k]) ~= nil then
             -- 跳过
           elseif type(sub_v) == "table" and type(default[k][sub_k]) == "table" then
-            -- 子值也是表：递归合并，保留默认值中未覆盖的字段
-            for inner_k, inner_v in pairs(sub_v) do
-              default[k][sub_k][inner_k] = vim.deepcopy(inner_v)
+            -- 判断默认子值是否为数组
+            if _is_array(default[k][sub_k]) and not _is_array(sub_v) then
+              -- 默认值是数组（如 scenarios.chat = { { ... } }），
+              -- 用户传入的是非数组表（如 { model_name = "xxx" }），
+              -- 应将用户字段合并到数组的第一个元素中
+              for inner_k, inner_v in pairs(sub_v) do
+                default[k][sub_k][1][inner_k] = vim.deepcopy(inner_v)
+              end
+            else
+              -- 子值也是表：递归合并，保留默认值中未覆盖的字段
+              for inner_k, inner_v in pairs(sub_v) do
+                default[k][sub_k][inner_k] = vim.deepcopy(inner_v)
+              end
             end
           else
             default[k][sub_k] = vim.deepcopy(sub_v)
