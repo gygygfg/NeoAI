@@ -1413,7 +1413,7 @@ local function _delete_node(args, on_success, on_error)
       local file_lines = vim.split(content, "\n", { plain = true })
       local deletions = {}
 
-      for _, node in ipairs(filtered) do
+      for _, node in ipairs(deletable) do
         local sr, sc, er, ec = node.start_row, node.start_col, node.end_row, node.end_col
         local deleted_code = {}
         for line_num = sr, er do
@@ -1475,85 +1475,71 @@ local function _delete_node(args, on_success, on_error)
               table.remove(new_lines, r + 1)
             end
           end
-        end
       end
 
-      local new_content = table.concat(new_lines, "\n")
 
-      -- 写入文件
-      local fu_ok, fu = pcall(require, "NeoAI.tools.builtin.file_tools")
-      if fu_ok and fu and fu.edit_file then
-        -- 使用 file_tools 的 edit_file 写入
-        local write_ok = false
-        fu.edit_file.func({ filepath = args.filepath, content = new_content }, function(res)
-          write_ok = true
-          local ret = {
-            filepath = args.filepath,
-            language = result.language,
-            deleted_count = #deletions,
-            deletions = deletions,
-          }
-          if fallback then
-            ret.warning = "未找到指定 node_type '"
-              .. (args.node_type or "")
-              .. "' 的节点，已回退到同类型节点"
-          end
-          if #skipped > 0 then
-            ret.skipped_types = skipped
-            ret.skipped_message = "以下节点类型不是代码块结构，已跳过: " .. table.concat(skipped, ", ")
-          end
-          if on_success then
-            on_success(ret)
-          end
-        end, function(err)
+      -- 使用 Neovim API 直接修改文件缓冲区
+      local abs_path = vim.fn.fnamemodify(args.filepath, ":p")
+      local bufnr = vim.fn.bufnr(abs_path)
+      local was_loaded = true
+
+      if bufnr == -1 then
+        -- 文件未打开，创建隐藏缓冲区并加载
+        bufnr = vim.fn.bufadd(abs_path)
+        if bufnr == 0 then
           if on_error then
-            on_error("删除节点后写入文件失败: " .. (err or "未知错误"))
+            on_error("无法为文件创建缓冲区: " .. abs_path)
           end
-        end)
-      else
-        -- 直接使用 vim.uv 写入
-        vim.uv.fs_open(args.filepath, "w", 438, function(open_err, fd)
-          if open_err or not fd then
-            if on_error then
-              on_error("无法打开文件写入: " .. (open_err or "未知错误"))
-            end
-            return
-          end
-          vim.uv.fs_write(fd, new_content, -1, nil, function(write_err, _)
-            vim.uv.fs_close(fd)
-            if write_err then
-              if on_error then
-                on_error("写入文件失败: " .. tostring(write_err))
-              end
-              return
-            end
-            local ret = {
-              filepath = args.filepath,
-              language = result.language,
-              deleted_count = #deletions,
-              deletions = deletions,
-            }
-            if fallback then
-              ret.warning = "未找到指定 node_type '"
-                .. (args.node_type or "")
-                .. "' 的节点，已回退到同类型节点"
-            end
-            if #skipped > 0 then
-              ret.skipped_types = skipped
-              ret.skipped_message = "以下节点类型不是代码块结构，已跳过: "
-                .. table.concat(skipped, ", ")
-            end
-            if on_success then
-              on_success(ret)
-            end
-          end)
-        end)
+          return
+        end
+        vim.fn.bufload(bufnr)
+        was_loaded = false
+      end
+
+      -- 用 nvim_buf_set_lines 替换缓冲区全部内容
+      vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, new_lines)
+
+      -- 写入磁盘
+      local save_ok, save_err = pcall(vim.api.nvim_buf_call, bufnr, function()
+        vim.cmd("write!")
+      end)
+
+      -- 清理临时加载的缓冲区（不留下隐藏缓冲区）
+      if not was_loaded and vim.api.nvim_buf_is_valid(bufnr) then
+        pcall(vim.api.nvim_buf_delete, bufnr, { force = true })
+      end
+
+      if not save_ok then
+        if on_error then
+          on_error("保存文件失败: " .. tostring(save_err))
+        end
+        return
+      end
+
+      local ret = {
+        filepath = args.filepath,
+        language = result.language,
+        deleted_count = #deletions,
+        deletions = deletions,
+      }
+      if fallback then
+        ret.warning = "未找到指定 node_type '"
+          .. (args.node_type or "")
+          .. "' 的节点，已回退到同类型节点"
+      end
+      if #skipped > 0 then
+        ret.skipped_types = skipped
+        ret.skipped_message = "以下节点类型不是代码块结构，已跳过: " .. table.concat(skipped, ", ")
+      end
+      if on_success then
+        on_success(ret)
       end
     end, function(err)
       if on_error then
         on_error(err)
       end
     end)
+
   end, function(err)
     if on_error then
       on_error(err or "解析结果为空")

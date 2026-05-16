@@ -371,7 +371,10 @@ local function _edit_file(args, on_success, on_error)
   end
   local append = args.append
   if append == nil then
-    append = true
+    if on_error then
+      on_error("必须提供 append 参数（追加模式为 true，覆盖模式为 false）")
+    end
+    return
   end
   local start_line = args.start_line
   local end_line = args.end_line

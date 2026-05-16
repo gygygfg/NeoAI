@@ -1599,6 +1599,7 @@ function M.on_generation_complete(data)
       local saved_reasoning = ss.last_reasoning or ""
       local saved_win_id = ss.window_id
       local saved_gen_id = ss.generation_id
+      local saved_content = content
       local on_complete = ss.on_complete
       ss.on_complete = nil
       -- idle 状态由 TOOL_LOOP_FINISHED 监听器统一设置
@@ -1606,6 +1607,31 @@ function M.on_generation_complete(data)
       ss.current_iteration = 0
       ss.generation_id = nil
       fire_loop_finished(ss, true, "ai_complete")
+      -- 触发 GENERATION_COMPLETED 事件显示调用用量
+      once_display_closed(session_id, function()
+        local s = sessions_table[session_id]
+        if not s then
+          return
+        end
+        if is_shutting_down() then
+          return
+        end
+        pcall(vim.api.nvim_exec_autocmds, "User", {
+          pattern = event_constants.GENERATION_COMPLETED,
+          data = {
+            generation_id = saved_gen_id,
+            response = saved_content,
+            reasoning_text = saved_reasoning,
+            usage = saved_usage,
+            session_id = session_id,
+            window_id = saved_win_id,
+            duration = 0,
+          },
+        })
+        if on_complete then
+          on_complete(true, saved_content, saved_usage)
+        end
+      end)
       return
     end
 
