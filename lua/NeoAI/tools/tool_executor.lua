@@ -786,18 +786,22 @@ function M._set_timeout(tool_call_id, timeout_ms, on_timeout)
   -- 使用 vim.uv.new_timer 替代 vim.defer_fn，确保可取消
   local timer = vim.uv.new_timer()
   timeout_state.timers[tool_call_id] = timer
-  timer:start(timeout_ms, 0, vim.schedule_wrap(function()
-    -- 安全检查：如果定时器已被清除（_clear_timeout 已调用），跳过执行
-    if timeout_state.timers[tool_call_id] ~= timer then
-      return
-    end
-    timeout_state.timers[tool_call_id] = nil
-    timeout_state.start_times[tool_call_id] = nil
-    timeout_state.saved_timeouts[tool_call_id] = nil
-    if on_timeout then
-      pcall(on_timeout)
-    end
-  end))
+  timer:start(
+    timeout_ms,
+    0,
+    vim.schedule_wrap(function()
+      -- 安全检查：如果定时器已被清除（_clear_timeout 已调用），跳过执行
+      if timeout_state.timers[tool_call_id] ~= timer then
+        return
+      end
+      timeout_state.timers[tool_call_id] = nil
+      timeout_state.start_times[tool_call_id] = nil
+      timeout_state.saved_timeouts[tool_call_id] = nil
+      if on_timeout then
+        pcall(on_timeout)
+      end
+    end)
+  )
 end
 
 --- 清除工具超时
@@ -874,17 +878,21 @@ function M._resume_timeout(tool_call_id, on_timeout)
   -- 创建新定时器
   local new_timer = vim.uv.new_timer()
   timeout_state.timers[tool_call_id] = new_timer
-  new_timer:start(remaining_ms, 0, vim.schedule_wrap(function()
-    if timeout_state.timers[tool_call_id] ~= new_timer then
-      return
-    end
-    timeout_state.timers[tool_call_id] = nil
-    timeout_state.start_times[tool_call_id] = nil
-    timeout_state.saved_timeouts[tool_call_id] = nil
-    if cb then
-      pcall(cb)
-    end
-  end))
+  new_timer:start(
+    remaining_ms,
+    0,
+    vim.schedule_wrap(function()
+      if timeout_state.timers[tool_call_id] ~= new_timer then
+        return
+      end
+      timeout_state.timers[tool_call_id] = nil
+      timeout_state.start_times[tool_call_id] = nil
+      timeout_state.saved_timeouts[tool_call_id] = nil
+      if cb then
+        pcall(cb)
+      end
+    end)
+  )
 end
 
 --- 重置工具超时（清除旧超时，设置新超时）
@@ -912,16 +920,20 @@ function M._reset_timeout(tool_call_id, timeout_ms, on_timeout)
   -- 设置新定时器
   local new_timer = vim.uv.new_timer()
   timeout_state.timers[tool_call_id] = new_timer
-  new_timer:start(timeout_ms, 0, vim.schedule_wrap(function()
-    if timeout_state.timers[tool_call_id] ~= new_timer then
-      return
-    end
-    timeout_state.timers[tool_call_id] = nil
-    timeout_state.start_times[tool_call_id] = nil
-    if on_timeout then
-      pcall(on_timeout)
-    end
-  end))
+  new_timer:start(
+    timeout_ms,
+    0,
+    vim.schedule_wrap(function()
+      if timeout_state.timers[tool_call_id] ~= new_timer then
+        return
+      end
+      timeout_state.timers[tool_call_id] = nil
+      timeout_state.start_times[tool_call_id] = nil
+      if on_timeout then
+        pcall(on_timeout)
+      end
+    end)
+  )
 end
 
 --- 获取工具已执行时长（毫秒，扣除审批暂停时间）
@@ -1158,6 +1170,79 @@ function M._normalize_arguments(tool_name, raw_arguments)
         break
       end
     end
+
+    -- 3) 类型自动修复
+    -- 当 AI 传入的参数类型与工具定义不匹配时，尝试自动转换
+    -- 例如：filepath=12345 → filepath="12345"
+    for arg_name, arg_value in pairs(arguments) do
+      local prop_schema = props[arg_name]
+      if prop_schema and prop_schema.type then
+        local expected_type = prop_schema.type
+        local actual_type = type(arg_value)
+        if actual_type ~= expected_type then
+          local converted = false
+          if expected_type == "string" and (actual_type == "number" or actual_type == "boolean") then
+            arguments[arg_name] = tostring(arg_value)
+            converted = true
+          elseif expected_type == "number" and actual_type == "string" then
+            local num = tonumber(arg_value)
+            if num ~= nil then
+              arguments[arg_name] = num
+              converted = true
+            end
+          elseif expected_type == "boolean" and actual_type == "string" then
+            local lower = arg_value:lower()
+            if lower == "true" or lower == "1" or lower == "yes" then
+              arguments[arg_name] = true
+              converted = true
+            elseif lower == "false" or lower == "0" or lower == "no" then
+              arguments[arg_name] = false
+              converted = true
+            end
+          elseif expected_type == "array" and actual_type == "string" then
+            -- 尝试将逗号分隔的字符串转为数组
+            local items = vim.split(arg_value, ",", { plain = true })
+            for i, item in ipairs(items) do
+              items[i] = item:match("^%s*(.-)%s*$") or item
+            end
+            arguments[arg_name] = items
+            converted = true
+          end
+          if converted then
+            logger.debug(
+              "[tool_executor] 类型自动修复: 参数 '%s' 从 %s 转为 %s (值: %s -> %s)",
+              arg_name,
+              actual_type,
+              expected_type,
+              tostring(arg_value),
+              tostring(arguments[arg_name])
+            )
+            changed = true
+          end
+        end
+      end
+    end
+
+    -- 4) 清理额外参数
+    -- 当工具定义中 additionalProperties=false 时，移除不在定义中的参数
+    -- 避免因多余参数导致验证失败
+    if tool_def.parameters.additionalProperties == false then
+      local known_keys = {}
+      for prop_name, _ in pairs(props) do
+        known_keys[prop_name] = true
+      end
+      -- 也保留内部使用的特殊参数
+      known_keys["_session_id"] = true
+      known_keys["_tool_call_id"] = true
+      known_keys["_raw"] = true
+      for arg_name, _ in pairs(arguments) do
+        if not known_keys[arg_name] then
+          arguments[arg_name] = nil
+          changed = true
+          logger.debug("[tool_executor] 清理额外参数: '%s' 不在工具定义中，已移除", arg_name)
+        end
+      end
+    end
   end
 
   return arguments, changed
@@ -1266,6 +1351,9 @@ function M.execute_with_orchestrator(tool_name, raw_args, session_context, callb
 
   -- 调用 execute_async
   M.execute_async(tool_name, arguments, wrapped_on_success, wrapped_on_error, callbacks.on_progress)
+
+  -- 返回规范化后的参数（供调用方保存到会话）
+  return arguments
 end
 
 -- ========== 示例生成 ==========
