@@ -109,10 +109,19 @@ function M.format_messages(messages)
   end
   for _, msg in ipairs(messages) do
     local fm = { role = msg.role or "user" }
-    if msg.content then fm.content = type(msg.content) == "table" and msg.content or tostring(msg.content) end
-    if msg.tool_calls then
-      -- tool_calls 中的 arguments 在整个系统内部保持 Lua table 形式
-      -- http_utils 发送前会统一编码为 JSON 字符串
+    -- 处理 content 可能是 table 格式（含 reasoning_content 和 content 字段）的情况
+    if msg.content then
+      if type(msg.content) == "table" then
+        -- 提取 table 中的 content 字段（字符串）作为 API 请求的 content
+        fm.content = msg.content.content or ""
+        -- 如果有 reasoning_content，提取为独立字段
+        if msg.content.reasoning_content then
+          fm.reasoning_content = msg.content.reasoning_content
+        end
+      else
+        fm.content = tostring(msg.content)
+      end
+    end
       fm.tool_calls = msg.tool_calls
     end
     if msg.role == "tool" then
