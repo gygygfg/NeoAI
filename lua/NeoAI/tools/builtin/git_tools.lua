@@ -58,9 +58,9 @@ function _git_auto_mod._resolve_git_root(cwd)
   return state.git_root, nil
 end
 
---- 检测 git 是否可用
+--- 检测 git 是否可用（使用 git status 检查，同时验证是否在 git 仓库中）
 function _git_auto_mod._check_git()
-  local ok = pcall(vim.fn.system, "git --version 2>/dev/null")
+  local ok = pcall(vim.fn.system, "git status 2>/dev/null")
   if vim.v.shell_error == 0 then
     state.git_available = true
     -- 获取 git 根目录
@@ -837,10 +837,7 @@ local function _git_diff(args, on_success, on_error)
   local diff_filepath = args and args.filepath
   local cwd = args and args.cwd
 
-  -- 先确保 git_auto 已初始化
-  if not _git_auto_mod.is_git_available() and not pcall(_git_auto_mod.get_status) then
-    pcall(_git_auto_mod.initialize, {})
-  end
+
 
   local result = _git_auto_mod.get_diff(diff_filepath, cwd)
   if result then
@@ -888,7 +885,7 @@ local function _git_log(args, on_success, on_error)
   local max_count = args and args.max_count or 20
   local cwd = args and args.cwd
 
-  pcall(_git_auto_mod.initialize, {})
+
 
   local result = _git_auto_mod.get_log(max_count, cwd)
   if result then
@@ -936,7 +933,7 @@ M.git_log = define_tool({
 local function _git_status(args, on_success, on_error)
   local cwd = args and args.cwd
 
-  pcall(_git_auto_mod.initialize, {})
+
 
   local result = _git_auto_mod.get_status(cwd)
   if on_success then
@@ -980,7 +977,7 @@ local function _git_commit_detail(args, on_success, on_error)
 
   local cwd = args and args.cwd
 
-  pcall(_git_auto_mod.initialize, {})
+
 
   local result = _git_auto_mod.get_commit_detail(args.commit_hash, cwd)
   if result then
@@ -1035,7 +1032,7 @@ local function _git_rollback(args, on_success, on_error)
 
   local cwd = args and args.cwd
 
-  pcall(_git_auto_mod.initialize, {})
+
 
   local filepath = args.filepath
   local ok, err = _git_auto_mod.rollback(args.commit_hash, filepath, cwd)
@@ -1101,7 +1098,7 @@ local function _git_file_history(args, on_success, on_error)
 
   local cwd = args and args.cwd
 
-  pcall(_git_auto_mod.initialize, {})
+
 
   local result = _git_auto_mod.get_file_history(args.filepath, cwd)
   if on_success then
@@ -1143,7 +1140,7 @@ M.git_file_history = define_tool({
 local function _git_branch(args, on_success, on_error)
   local cwd = args and args.cwd
 
-  pcall(_git_auto_mod.initialize, {})
+
 
   if not _git_auto_mod.is_git_available() then
     if on_error then
@@ -1253,8 +1250,15 @@ M.git_auto_commit_config = define_tool({
 -- ============================================================================
 -- get_tools()
 -- ============================================================================
-
 function M.get_tools()
+  -- 初始化时先检查 git 是否可用，不可用则不注册任何工具
+  if not state.initialized then
+    _git_auto_mod.initialize({})
+  end
+  if not state.git_available then
+    return {}
+  end
+
   local tools = {}
   for _, v in pairs(M) do
     if type(v) == "table" and v.name and v.func then
@@ -1266,5 +1270,6 @@ function M.get_tools()
   end)
   return tools
 end
+
 
 return M
