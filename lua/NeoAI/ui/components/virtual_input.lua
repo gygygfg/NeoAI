@@ -338,20 +338,26 @@ function M.close(force)
   if state.parent_win and vim.api.nvim_win_is_valid(state.parent_win) then
     pcall(vim.api.nvim_set_current_win, state.parent_win)
 
-    -- 触发光标跟随：将光标跳到内容最后并滚动到窗口最底部
-    -- 使用 vim.schedule 延迟执行，确保在 stopinsert 和窗口切换完成后
+    -- 强制将光标跳转到 buffer 最后一行并滚动到窗口最底部
+    -- 不管光标跟随配置是否开启，关闭输入框时始终跳到底部
     vim.schedule(function()
-      local chat_window = require("NeoAI.ui.window.chat_window")
-      if chat_window then
-        -- 先检测光标是否在末尾附近，缓存结果
-        if chat_window._check_cursor_near_end then
-          chat_window._check_cursor_near_end()
-        end
-        -- 执行光标跟随（使用已缓存的结果）
-        if chat_window._do_cursor_follow then
-          chat_window._do_cursor_follow()
-        end
+      if not state.parent_win or not vim.api.nvim_win_is_valid(state.parent_win) then
+        return
       end
+      local parent_buf = vim.api.nvim_win_get_buf(state.parent_win)
+      if not parent_buf or not vim.api.nvim_buf_is_valid(parent_buf) then
+        return
+      end
+      local last_line = vim.api.nvim_buf_line_count(parent_buf)
+      -- 将光标跳到最后一行行首
+      pcall(vim.api.nvim_win_set_cursor, state.parent_win, { last_line, 0 })
+      -- 滚动到窗口最底部
+      pcall(vim.api.nvim_win_call, state.parent_win, function()
+        local view = vim.fn.winsaveview()
+        local win_height = vim.api.nvim_win_get_height(state.parent_win)
+        view.topline = math.max(1, last_line - win_height + 1)
+        vim.fn.winrestview(view)
+      end)
     end)
   end
 

@@ -1467,12 +1467,28 @@ function M.on_generation_complete(data)
             func.name
           )
         else
-          logger.warn(
-            "[tool_orchestrator] on_generation_complete: 工具 '%s' 的 arguments 为无效 JSON 字符串，跳过该工具调用: %s",
-            func.name,
-            tostring(args):sub(1, 200)
-          )
-          goto continue
+          -- 容错：create_sub_agent 的 arguments 不是 JSON 时，将纯文本作为 task 参数
+          if func.name == "create_sub_agent" and type(args) == "string" and args ~= "" then
+            local text = args
+            -- 清理前导标点符号和代码块标记
+            text = text:gsub("^[%s。，,%-.]*", "")
+            text = text:gsub("```[a-z]*\n?", "")
+            text = text:gsub("\n```%s*$", "")
+            func.arguments = { task = text }
+            args = func.arguments
+            logger.warn(
+              "[tool_orchestrator] 工具 '%s' 的 arguments 为无效 JSON，已将纯文本作为 task 参数: %s",
+              func.name,
+              tostring(text):sub(1, 100)
+            )
+          else
+            logger.warn(
+              "[tool_orchestrator] on_generation_complete: 工具 '%s' 的 arguments 为无效 JSON 字符串，跳过该工具调用: %s",
+              func.name,
+              tostring(args):sub(1, 200)
+            )
+            goto continue
+          end
         end
       end
       -- 空 table {}（vim.empty_dict()）是无参数工具的合法参数，不应跳过
@@ -1577,6 +1593,56 @@ function M.on_generation_complete(data)
   end
 
   if #tool_calls == 0 then
+    -- 检测：AI 本意是调用工具但所有工具调用因 arguments 解析失败被跳过
+    -- 此时应触发重试，让 AI 重新生成正确的工具调用
+    local original_tool_count = #(data.tool_calls or {})
+    if original_tool_count > 0 then
+      logger.warn(
+        "[tool_orchestrator] AI 返回了 %d 个工具调用但全部因参数无效被跳过，触发重试",
+        original_tool_count
+      )
+      local retry_count = ss._tool_retry_count or 0
+      if request_handler.can_retry(retry_count) then
+        local new_retry_count = retry_count + 1
+        ss._tool_retry_count = new_retry_count
+        local delay = request_handler.get_retry_delay(new_retry_count)
+        logger.warn(
+          "[tool_orchestrator] 无效工具调用重试 (%d/%d): 延迟 %dms 后重试",
+          new_retry_count,
+          request_handler.get_max_retries(),
+          delay
+        )
+        vim.api.nvim_exec_autocmds("User", {
+          pattern = event_constants.GENERATION_RETRYING,
+          data = {
+            generation_id = ss.generation_id,
+            retry_count = new_retry_count,
+            max_retries = request_handler.get_max_retries(),
+            reason = "所有工具调用因参数无效被跳过",
+            session_id = session_id,
+            window_id = ss.window_id,
+            layer = "tool_orchestrator",
+          },
+        })
+        if #ss.messages > 0 then
+          local last_msg = ss.messages[#ss.messages]
+          if last_msg.role == "assistant" and last_msg.tool_calls then
+            table.remove(ss.messages)
+          end
+        end
+        vim.defer_fn(function()
+          M._request_generation(session_id, is_sub_agent)
+        end, delay)
+        return
+      else
+        logger.warn(
+          "[tool_orchestrator] 无效工具调用重试已达上限 (%d/%d)",
+          retry_count,
+          request_handler.get_max_retries()
+        )
+      end
+    end
+
     -- AI 返回纯文本回复，直接结束循环
     -- 重置 _tools_all_completed 标志，防止 _finish_loop 触发的 GENERATION_COMPLETED
     -- 事件监听器中的 _check_round_complete 错误地进入下一轮

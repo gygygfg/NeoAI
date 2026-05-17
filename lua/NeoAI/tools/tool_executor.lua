@@ -74,6 +74,7 @@ local timeout_state = {
   start_times = {}, -- tool_call_id -> os.time()
   timeout_ms = 30000, -- 默认 30 秒（会被 initialize 中的 config.tool_timeout_ms 覆盖）
   saved_timeouts = {}, -- tool_call_id -> { timeout_ms, on_timeout } 暂停时保存的原始超时信息
+  paused_elapsed = {}, -- tool_call_id -> number 暂停时已过去的毫秒数（用于暂停/恢复时正确计算剩余时间）
 }
 
 -- ========== 辅助函数 ==========
@@ -304,28 +305,18 @@ function M.execute_async(tool_name, args, on_success, on_error, on_progress)
     local tool_call_id = args and args._tool_call_id or ("call_" .. os.time() .. "_" .. math.random(10000, 99999))
     local unregister = approval_handler.register_pause_callback(function(is_paused)
       if is_paused then
-        -- 暂停超时：停止定时器
-        M._clear_timeout(tool_call_id)
+        -- 暂停超时：停止定时器，保留已过去的时间
+        M._pause_timeout(tool_call_id)
       else
-        -- 恢复超时：重新设置定时器（用剩余时间）
-        local tool_def = tool_registry.get(tool_name)
-        local tool_timeout = tool_def and tool_def.timeout
-        local timeout_ms
-        if tool_timeout == -1 then
-          timeout_ms = -1
-        elseif tool_timeout ~= nil then
-          timeout_ms = tool_timeout
-        else
-          timeout_ms = timeout_state.timeout_ms
-        end
-        if timeout_ms and timeout_ms > 0 then
-          M._set_timeout(tool_call_id, timeout_ms, function()
-            logger.warn("[tool_executor] 工具 '%s' 执行超时 (%dms)", tool_name, timeout_ms)
-            if on_error then
-              on_error(string.format("工具执行超时（%d 秒）", timeout_ms / 1000))
-            end
-          end)
-        end
+        -- 恢复超时：用剩余时间重新启动定时器
+        M._resume_timeout(tool_call_id, function()
+          local saved = timeout_state.saved_timeouts[tool_call_id]
+          local timeout_ms = saved and saved.timeout_ms or timeout_state.timeout_ms
+          logger.warn("[tool_executor] 工具 '%s' 执行超时 (%dms)", tool_name, timeout_ms)
+          if on_error then
+            on_error(string.format("工具执行超时（%d 秒）", timeout_ms / 1000))
+          end
+        end)
       end
     end)
 
@@ -783,6 +774,8 @@ function M._set_timeout(tool_call_id, timeout_ms, on_timeout)
     on_timeout = on_timeout,
   }
   timeout_state.start_times[tool_call_id] = vim.loop.hrtime()
+  -- 初始化暂停累积时间
+  timeout_state.paused_elapsed[tool_call_id] = 0
   -- 使用 vim.uv.new_timer 替代 vim.defer_fn，确保可取消
   local timer = vim.uv.new_timer()
   timeout_state.timers[tool_call_id] = timer
@@ -823,14 +816,26 @@ function M._clear_timeout(tool_call_id)
   end
   timeout_state.start_times[tool_call_id] = nil
   timeout_state.saved_timeouts[tool_call_id] = nil
+  timeout_state.paused_elapsed[tool_call_id] = nil
 end
 
 --- 暂停工具超时（保留已过去的时间，停止定时器）
 --- 用于 shell 交互式命令等待 AI 输入时暂停超时
+--- 以及审批暂停时暂停超时
 --- @param tool_call_id string 工具调用 ID
 function M._pause_timeout(tool_call_id)
   if not timeout_state.timers[tool_call_id] then
     return
+  end
+  -- 计算并保存已过去的时间
+  local start = timeout_state.start_times[tool_call_id]
+  if start then
+    local now = vim.loop.hrtime()
+    local elapsed_ns = now - start
+    local elapsed_ms = elapsed_ns / 1e6
+    timeout_state.paused_elapsed[tool_call_id] = (timeout_state.paused_elapsed[tool_call_id] or 0) + elapsed_ms
+    -- 更新 start_times 为当前时间，使得多次暂停/恢复时累计正确
+    timeout_state.start_times[tool_call_id] = now
   end
   local timer = timeout_state.timers[tool_call_id]
   pcall(function()
@@ -865,14 +870,19 @@ function M._resume_timeout(tool_call_id, on_timeout)
       end
     end)
   end
-  -- 计算剩余时间
+  -- 计算剩余时间（考虑暂停期间累积的已用时间）
   local now = vim.loop.hrtime()
   local elapsed_ns = now - start
   local elapsed_ms = elapsed_ns / 1e6
-  local remaining_ms = saved.timeout_ms - elapsed_ms
+  -- 加上暂停前已累积的已用时间
+  local paused_elapsed = timeout_state.paused_elapsed[tool_call_id] or 0
+  local total_elapsed_ms = elapsed_ms + paused_elapsed
+  local remaining_ms = saved.timeout_ms - total_elapsed_ms
   if remaining_ms <= 0 then
     remaining_ms = 1
   end
+  -- 清除已保存的暂停已用时间（本次恢复后重新开始计时）
+  timeout_state.paused_elapsed[tool_call_id] = nil
   -- 使用传入的回调或保存的回调
   local cb = on_timeout or saved.on_timeout
   -- 创建新定时器
@@ -917,6 +927,8 @@ function M._reset_timeout(tool_call_id, timeout_ms, on_timeout)
     end)
     timeout_state.timers[tool_call_id] = nil
   end
+  -- 重置超时意味着重新开始计时，清除暂停累积时间
+  timeout_state.paused_elapsed[tool_call_id] = nil
   -- 设置新定时器
   local new_timer = vim.uv.new_timer()
   timeout_state.timers[tool_call_id] = new_timer

@@ -373,6 +373,9 @@ local function _edit_file(args, on_success, on_error)
 
   local fu = get_file_utils()
 
+  -- on_write_err 是 on_error 的别名，供内部闭包使用
+  local on_write_err = on_error
+
   -- 通用写回调：写入成功后尝试获取 LSP 诊断信息
   local function on_write_ok()
     local result = { filepath = filepath, success = true }
@@ -505,16 +508,27 @@ local function _edit_file(args, on_success, on_error)
   local function check_exists_and_proceed()
     local function on_exists(exists)
       if not exists then
-        -- 文件不存在，直接创建并返回警告
+        -- 文件不存在，直接创建并返回警告（不走 on_write_ok 路径，避免重复回调）
         local warning = string.format(
           "⚠️ 警告：文件 '%s' 不存在，已自动创建。\n"
             .. "请确认文件路径是否正确，或使用 create_directory 先创建目录。",
           filepath
         )
-        write_content(content)
-        if on_success then
-          -- 将警告信息附加到返回值中
-          on_success({ filepath = filepath, success = true, warning = warning })
+        -- 直接写文件，不触发 on_write_ok/on_write_err
+        local function write_and_return()
+          if on_success then
+            on_success({ filepath = filepath, success = true, warning = warning })
+          end
+        end
+        if fu then
+          local ok, _ = fu.write_file(filepath, content, false)
+          if ok then
+            write_and_return()
+          else
+            if on_error then on_error("写入失败") end
+          end
+        else
+          uv_write_file(filepath, content, false, write_and_return, on_error)
         end
         return
       end

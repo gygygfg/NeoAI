@@ -636,6 +636,9 @@ local function _update_folded_text_in_buffer(folded_text, window_id)
   vim.api.nvim_buf_set_lines(buf, start_line, start_line + new_count, false, new_lines)
   vim.api.nvim_set_option_value("modified", false, { buf = buf })
 
+  -- 折叠新插入的 {{{ ... }}} 折叠区域
+  _fold_new_markers(buf, new_lines)
+
   _schedule_cursor_follow()
 end
 
@@ -3087,7 +3090,9 @@ function M._setup_event_listeners()
     end,
   })
 
-  -- TOOL_EXECUTION_ALL_COMPLETED：本轮所有工具执行完毕，关闭工具调用悬浮窗
+  -- TOOL_EXECUTION_ALL_COMPLETED：本轮所有工具执行完毕，直接关闭工具调用悬浮窗
+  -- 工具完成后不显示"等待 AI 响应..."状态，直接关闭悬浮窗
+  -- 等 AI 返回新的工具调用时，由 TOOL_LOOP_STARTED 重新创建悬浮窗
   vim.api.nvim_create_autocmd("User", {
     pattern = Events.TOOL_EXECUTION_ALL_COMPLETED,
     callback = function(args)
@@ -3097,7 +3102,7 @@ function M._setup_event_listeners()
       if not state.tool_display.active then
         return
       end
-      -- 立即关闭工具调用悬浮窗，保留 results 等数据供 TOOL_LOOP_FINISHED 使用
+      -- 直接关闭工具调用悬浮窗，保留 results 等数据供 TOOL_LOOP_FINISHED 使用
       -- 设置 active=false 和 window_id=nil，让后续事件跳过悬浮窗操作
       -- 重置 _finished=false，确保 TOOL_LOOP_FINISHED(is_round_end=true) 能正常进入折叠文本写入分支
       tool_display_component._close_display()
@@ -3445,6 +3450,54 @@ function M.update_message(index, content)
   return true
 end
 
+--- 折叠新插入的 {{{ ... }}} 折叠区域
+--- 在写入包含折叠标记的内容后调用，确保新插入的折叠文本默认折叠
+--- @param buf number buffer 句柄
+--- @param lines table 刚写入的行列表
+local function _fold_new_markers(buf, lines)
+  if not buf_valid(buf) then
+    return
+  end
+  -- 检查新写入的行中是否包含折叠开始标记 {{{（在行首）
+  local has_fold_start = false
+  for _, line in ipairs(lines) do
+    if line:find("^{{{") then
+      has_fold_start = true
+      break
+    end
+  end
+  if not has_fold_start then
+    return
+  end
+  -- 使用 vim.schedule 延迟执行，确保内容已完全写入
+  vim.schedule(function()
+    if not buf_valid(buf) then
+      return
+    end
+    -- 获取当前窗口
+    local win = get_win()
+    if not win or not vim.api.nvim_win_is_valid(win) then
+      return
+    end
+    -- 通过 API 触发 Neovim 重新计算 marker 折叠
+    -- 方法：临时切换 foldmethod 再恢复，强制 Neovim 重新扫描 marker
+    -- 设置 foldlevel=0 确保新 marker 区域默认折叠
+    local saved_level = vim.api.nvim_get_option_value("foldlevel", { win = win })
+    local saved_method = vim.api.nvim_get_option_value("foldmethod", { win = win })
+    vim.api.nvim_set_option_value("foldlevel", 0, { win = win })
+    -- 临时切换到 manual 再切回 marker，强制 Neovim 重新扫描所有 marker 行
+    vim.api.nvim_set_option_value("foldmethod", "manual", { win = win })
+    vim.api.nvim_set_option_value("foldmethod", "marker", { win = win })
+    -- 恢复原 foldlevel，新 marker 区域会保持折叠状态
+    vim.schedule(function()
+      if win and vim.api.nvim_win_is_valid(win) then
+        vim.api.nvim_set_option_value("foldlevel", saved_level, { win = win })
+        vim.api.nvim_set_option_value("foldmethod", saved_method, { win = win })
+      end
+    end)
+  end)
+end
+
 --- 将单条消息增量追加到缓冲区末尾（避免全量重渲染）
 --- @param role string 角色 ('user' 或 'assistant')
 --- @param content string 消息内容
@@ -3488,6 +3541,9 @@ function M._append_message_to_buffer(role, content, window_id)
   -- 注意：不追加分割线，分割线只在 _do_render_chat 全量重渲染时添加
 
   pcall(vim.api.nvim_set_option_value, "modified", false, { buf = buf })
+
+  -- 折叠新插入的 {{{ ... }}} 折叠区域
+  _fold_new_markers(buf, lines)
 
   -- 执行光标跟随（使用协程共享表 should_follow 缓存值）
   _schedule_cursor_follow()
@@ -3584,6 +3640,8 @@ local function _render_streaming_message(window_id)
     -- 记录起始行
     state.streaming.message_start_line = lc
   end
+  -- 折叠新插入的 {{{ ... }}} 折叠区域
+  _fold_new_markers(buf, lines)
   _schedule_cursor_follow()
 end
 

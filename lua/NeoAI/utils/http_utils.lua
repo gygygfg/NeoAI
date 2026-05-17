@@ -1322,8 +1322,10 @@ function M.send_stream_request(params, on_chunk, on_complete, on_error)
           end
           return
         end
-        -- 立即解析 tool_calls 中的 arguments 为 Lua table
-        M.parse_response_tool_calls(data)
+        -- 流式处理中不对 tool_calls 的 arguments 进行 JSON 解码
+        -- 流式片段中的 arguments 是 JSON 编码的字符串片段（如 \"、\\n），
+        -- 提前解码会破坏 JSON 结构（例如 \" 解码为 " 后与前后片段拼接会形成无效 JSON）
+        -- 等到流式结束后在 filter_valid_tool_calls 中统一解码
         local unified = request_handler.transform_response(data, api_type)
         if on_chunk then
           on_chunk(unified)
