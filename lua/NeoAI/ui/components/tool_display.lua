@@ -169,9 +169,12 @@ function M.reset()
   preview.tools = {}
   preview.window_shown = false
 end
-
 --- 初始化工具包分组
 function M.init_packs(tool_calls, pack_order)
+  -- 确保关闭上一轮残留的工具调用悬浮窗
+  -- 防止因组件 state 和 chat_window state 不同步导致 show_display() 提前返回
+  M._close_display()
+
   -- 清理上一轮残留状态
   if state._debounce_timer then
     state._debounce_timer:stop()
@@ -188,7 +191,6 @@ function M.init_packs(tool_calls, pack_order)
   state.packs = {}
   state.pack_order = {}
   state.substeps = {}
-
   local grouped = tool_pack.group_by_pack(tool_calls)
   local order = pack_order or {}
 
