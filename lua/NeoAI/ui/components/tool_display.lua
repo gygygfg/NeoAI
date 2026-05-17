@@ -371,6 +371,11 @@ function M._close_display()
     window_manager.close_window(state.window_id)
     state.window_id = nil
   end
+  -- 同步关闭实时参数预览窗口
+  if state.preview_window_id then
+    window_manager.close_window(state.preview_window_id)
+    state.preview_window_id = nil
+  end
   if state._debounce_timer then
     state._debounce_timer:stop()
     state._debounce_timer:close()
@@ -378,8 +383,6 @@ function M._close_display()
   end
   state._refresh_pending = false
   vim.api.nvim_exec_autocmds("User", { pattern = "NeoAI:tool_display_closed", data = {} })
-end
-
 --- 直接同步写入 buffer 到悬浮窗
 function M._sync_display()
   if not state.window_id then return end
