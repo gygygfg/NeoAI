@@ -383,6 +383,7 @@ function M._close_display()
   end
   state._refresh_pending = false
   vim.api.nvim_exec_autocmds("User", { pattern = "NeoAI:tool_display_closed", data = {} })
+end
 --- 直接同步写入 buffer 到悬浮窗
 function M._sync_display()
   if not state.window_id then return end
