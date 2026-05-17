@@ -381,16 +381,108 @@ local function _edit_file(args, on_success, on_error)
 
   local fu = get_file_utils()
 
-  -- 通用写回调
+  -- 通用写回调：写入成功后尝试获取 LSP 诊断信息
   local function on_write_ok()
-    if on_success then
-      on_success({ filepath = filepath, success = true })
-    end
-  end
+    local result = { filepath = filepath, success = true }
 
-  local function on_write_err(err)
-    if on_error then
-      on_error(string.format("写入文件失败 %s: %s", filepath, err or "无法写入文件"))
+    -- 尝试通过 LSP 获取更改后文件的诊断信息
+    local ok_lsp, lsp_mod = pcall(require, "NeoAI.tools.builtin.neovim_lsp")
+    if ok_lsp and lsp_mod and lsp_mod.lsp_diagnostics and lsp_mod.lsp_diagnostics.func then
+      -- 重新加载/加载缓冲区以确保内容是最新的
+      local abs_path = vim.fn.fnamemodify(filepath, ":p")
+      local bufnr = vim.fn.bufnr(abs_path)
+      if bufnr ~= -1 then
+        pcall(vim.api.nvim_buf_call, bufnr, function()
+          vim.cmd("edit!")
+        end)
+      else
+        bufnr = vim.fn.bufadd(abs_path)
+        vim.fn.bufload(bufnr)
+      end
+
+      -- 通过 LSP DiagnosticChanged 事件等待诊断（最多 10 秒）
+      local max_wait = 10000
+      local timeout_timer = vim.loop.new_timer()
+      local debounce_timer = vim.loop.new_timer()
+      local au_id = nil
+      local finalized = false
+
+      -- 最终获取诊断并返回结果
+      local function finalize()
+        if finalized then
+          return
+        end
+        finalized = true
+
+        -- 清理 autocmd 和计时器
+        if au_id then
+          pcall(vim.api.nvim_del_autocmd, au_id)
+          au_id = nil
+        end
+        if timeout_timer then
+          timeout_timer:stop()
+          timeout_timer:close()
+        end
+        if debounce_timer then
+          debounce_timer:stop()
+          debounce_timer:close()
+        end
+
+        -- 异步调用 _lsp_diagnostics，结果通过回调获取
+        local ok_pcall, call_err = pcall(lsp_mod.lsp_diagnostics.func, { filepath = filepath },
+          function(diag_result)
+            -- 成功获取诊断
+            if diag_result and not diag_result.error then
+              result.diagnostics = diag_result.diagnostics or {}
+              result.diagnostic_count = diag_result.diagnostic_count or 0
+            end
+            if on_success then
+              on_success(result)
+            end
+          end,
+          function(err_msg)
+            -- 获取诊断失败，仍然返回写入结果（不含诊断）
+            log_message("warn", "edit_file 诊断获取失败: " .. tostring(err_msg))
+            if on_success then
+              on_success(result)
+            end
+          end
+        )
+        if not ok_pcall then
+          -- pcall 本身的错误（如函数不存在等）
+          if on_success then
+            on_success(result)
+          end
+        end
+      end
+
+      -- DiagnosticChanged 回调：收到诊断后 debounce 500ms，等待可能来自多个 LSP 源的后续诊断
+      local function on_diag_changed(args)
+        if not args or not args.buf or args.buf ~= bufnr then
+          return
+        end
+        -- 重置 debounce 计时器，每次新诊断到达都重新等待 500ms
+        debounce_timer:stop()
+        debounce_timer:start(500, 0, vim.schedule_wrap(function()
+          finalize()
+        end))
+      end
+
+      -- 创建 DiagnosticChanged autocmd（仅监听目标 buffer）
+      au_id = vim.api.nvim_create_autocmd("DiagnosticChanged", {
+        buffer = bufnr,
+        callback = on_diag_changed,
+      })
+
+      -- 超时计时器（10 秒兜底）
+      timeout_timer:start(max_wait, 0, vim.schedule_wrap(function()
+        finalize()
+      end))
+    else
+      -- LSP 不可用，直接返回写入结果
+      if on_success then
+        on_success(result)
+      end
     end
   end
 
@@ -561,8 +653,19 @@ M.edit_file = define_tool({
   },
   returns = {
     type = "object",
-    properties = { filepath = { type = "string" }, success = { type = "boolean" } },
-    description = "写入结果",
+    properties = {
+      filepath = { type = "string" },
+      success = { type = "boolean" },
+      diagnostics = {
+        type = "array",
+        description = "修改后文件的 LSP 诊断信息列表（如有），每项包含 severity, message, source, code, lnum, col 等字段",
+      },
+      diagnostic_count = {
+        type = "number",
+        description = "诊断信息条数",
+      },
+    },
+    description = "写入结果，包含文件路径、是否成功。写入成功后异步等待 LSP 诊断（最多 10 秒），诊断到达后随返回值一起返回",
   },
   category = "file",
   permissions = { write = true },

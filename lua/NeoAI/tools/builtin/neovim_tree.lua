@@ -6,26 +6,59 @@ local M = {}
 
 local define_tool = require("NeoAI.tools.builtin.tool_helpers").define_tool
 
--- 检查 Tree-sitter 是否可用
-local ts_available = false
----@class vim.treesitter
----@field language table<string, any>
----@field query table<string, any>
----@field get_string_parser fun(source: string, lang: string): table
-local ts = nil
-
-local function check_ts()
-  if ts_available then
-    return true
-  end
-  local ok, loaded = pcall(require, "vim.treesitter")
-  if ok then
-    ts = loaded
-    ts_available = true
-    return true
-  end
-  return false
-end
+local block_node_types = {
+  -- 通用
+  function_definition = true,
+  class_definition = true,
+  class_declaration = true,
+  struct_specifier = true,
+  enum_specifier = true,
+  union_specifier = true,
+  interface_declaration = true,
+  type_declaration = true,
+  method_definition = true,
+  constructor_definition = true,
+  destructor_definition = true,
+  -- 控制流块
+  if_statement = true,
+  else_clause = true,
+  switch_statement = true,
+  case_statement = true,
+  for_statement = true,
+  while_statement = true,
+  do_statement = true,
+  try_statement = true,
+  catch_clause = true,
+  finally_clause = true,
+  -- 模块/命名空间
+  module = true,
+  program = true,
+  translation_unit = true,
+  -- 其他代码块
+  block = true,
+  body = true,
+  declaration = true,
+  template_declaration = true,
+  -- Lua
+  local_function_declaration = true,
+  -- Python
+  decorated_definition = true,
+  -- JavaScript/TypeScript
+  arrow_function = true,
+  generator_function = true,
+  export_statement = true,
+  lexical_declaration = true,
+  variable_declaration = true,
+  -- Go
+  func_declaration = true,
+  method_declaration = true,
+  -- Rust
+  impl_item = true,
+  trait_item = true,
+  -- 宏
+  macro_definition = true,
+  macro_invocation = true,
+}
 
 -- 扩展名到 Tree-sitter 解析器名称的直接映射
 -- 避免在 fast event 上下文中调用 vim.filetype.match（内部调用 getenv）
@@ -64,6 +97,24 @@ local ext_to_parser = {
   [".query"] = "query",
   [".regex"] = "regex",
 }
+-- 检查 Tree-sitter 是否可用
+local ts_available = false
+---@class vim.treesitter
+---@field get_string_parser fun(source: string, lang: string): table
+local ts = nil
+
+local function check_ts()
+  if ts_available then
+    return true
+  end
+  local ok, loaded = pcall(require, "vim.treesitter")
+  if ok then
+    ts = loaded
+    ts_available = true
+    return true
+  end
+  return false
+end
 
 -- 从文件路径推断语言（使用扩展名映射，避免在 fast event 上下文中调用 vim.filetype.match）
 -- 从文件路径推断 Tree-sitter 解析器名称（使用扩展名映射，避免在 fast event 中调用 vim.filetype.match）
@@ -573,7 +624,7 @@ local function _query_tree(args, on_success, on_error)
           on_error(err)
         end
       end)
-    end)  -- end vim.schedule
+    end) -- end vim.schedule
   end, function(err)
     if on_error then
       on_error(err)
@@ -729,7 +780,7 @@ local function _get_node_at_position(args, on_success, on_error)
           on_error(err)
         end
       end)
-  end)  -- end vim.schedule
+    end) -- end vim.schedule
   end, function(err)
     if on_error then
       on_error(err)
@@ -1306,60 +1357,6 @@ M.get_node_code = define_tool({
 
 -- 代码块结构节点类型白名单（各语言通用的结构节点）
 -- 只有这些类型的节点可以被删除，防止误删表达式、变量名等细粒度节点
-local block_node_types = {
-  -- 通用
-  function_definition = true,
-  class_definition = true,
-  class_declaration = true,
-  struct_specifier = true,
-  enum_specifier = true,
-  union_specifier = true,
-  interface_declaration = true,
-  type_declaration = true,
-  method_definition = true,
-  constructor_definition = true,
-  destructor_definition = true,
-  -- 控制流块
-  if_statement = true,
-  else_clause = true,
-  switch_statement = true,
-  case_statement = true,
-  for_statement = true,
-  while_statement = true,
-  do_statement = true,
-  try_statement = true,
-  catch_clause = true,
-  finally_clause = true,
-  -- 模块/命名空间
-  module = true,
-  program = true,
-  translation_unit = true,
-  -- 其他代码块
-  block = true,
-  body = true,
-  declaration = true,
-  template_declaration = true,
-  -- Lua
-  local_function_declaration = true,
-  -- Python
-  decorated_definition = true,
-  -- JavaScript/TypeScript
-  arrow_function = true,
-  generator_function = true,
-  export_statement = true,
-  lexical_declaration = true,
-  variable_declaration = true,
-  -- Go
-  func_declaration = true,
-  method_declaration = true,
-  -- Rust
-  impl_item = true,
-  trait_item = true,
-  -- 宏
-  macro_definition = true,
-  macro_invocation = true,
-}
-
 local function _delete_node(args, on_success, on_error)
   if not check_ts() then
     if on_error then
@@ -1404,9 +1401,7 @@ local function _delete_node(args, on_success, on_error)
       return
     end
 
-    if #skipped > 0 then
-      -- 有跳过的节点，在结果中给出提示
-    end
+    -- 跳过的节点会在最终结果中通过 skipped_types 字段提示
 
     -- 异步读取文件内容
     read_file_content_async(args.filepath, function(content)
@@ -1475,8 +1470,8 @@ local function _delete_node(args, on_success, on_error)
               table.remove(new_lines, r + 1)
             end
           end
+        end
       end
-
 
       -- 使用 Neovim API 直接修改文件缓冲区
       local abs_path = vim.fn.fnamemodify(args.filepath, ":p")
@@ -1534,12 +1529,7 @@ local function _delete_node(args, on_success, on_error)
       if on_success then
         on_success(ret)
       end
-    end, function(err)
-      if on_error then
-        on_error(err)
-      end
     end)
-
   end, function(err)
     if on_error then
       on_error(err or "解析结果为空")

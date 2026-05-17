@@ -1756,13 +1756,28 @@ local function _lsp_definition(args, on_success, on_error)
         end
 
         if not result or (type(result) == "table" and #result == 0) then
+          -- LSP 返回空结果：符号可能在当前位置定义（如 lua_ls 在定义位置查询时返回空）。
+          -- 将 Tree-sitter 找到的位置作为自引用定义返回，避免 found=false 误导。
+          local locations = {}
+          if row and col then
+            local abs_path = vim.fn.fnamemodify(args.filepath, ":p")
+            table.insert(locations, {
+              uri = vim.uri_from_fname(abs_path),
+              filename = abs_path,
+              range = {
+                start = { line = row, character = col },
+                ["end"] = { line = row, character = col + #args.symbol },
+              },
+            })
+          end
           if on_success then
             on_success({
               filepath = args.filepath,
               symbol = args.symbol,
               position = { row = row, col = col },
-              locations = {},
-              found = false,
+              locations = locations,
+              found = #locations > 0,
+              _note = (#locations > 0) and "LSP 未返回额外定义位置（符号在当前位置定义）" or nil,
             })
           end
           return
@@ -3249,57 +3264,71 @@ M.lsp_format = define_tool({
 -- 工具 lsp_diagnostics - 获取诊断信息
 -- ============================================================================
 
-local function _lsp_diagnostics(args)
+-- lsp_diagnostics：异步版本，接受 on_success/on_error 回调
+local function _lsp_diagnostics(args, on_success, on_error)
   if not check_lsp() then
-    return { error = "LSP 不可用" }
+    if on_error then
+      on_error("LSP 不可用")
+    end
+    return
   end
 
   if not args or not args.filepath then
-    return { error = "需要 filepath（文件路径）参数" }
+    if on_error then
+      on_error("需要 filepath 参数")
+    end
+    return
   end
 
-  local bufnr, cleanup, err = ensure_buf_loaded(args.filepath)
-  if err then
-    return { filepath = args.filepath, error = err }
-  end
+  -- 使用 vim.schedule 确保异步执行，不阻塞调用方
+  vim.schedule(function()
+    local bufnr, cleanup, err = ensure_buf_loaded(args.filepath)
+    if err then
+      if on_error then
+        on_error(err)
+      end
+      return
+    end
 
-  local diagnostics = vim.diagnostic.get(bufnr, {
-    severity = args.severity and { min = args.severity },
-  })
-
-  if cleanup then
-    cleanup()
-  end
-
-  if not diagnostics or #diagnostics == 0 then
-    return { filepath = args.filepath, diagnostic_count = 0, diagnostics = {} }
-  end
-
-  local results = {}
-  for _, d in ipairs(diagnostics) do
-    table.insert(results, {
-      severity = d.severity,
-      message = d.message,
-      source = d.source,
-      code = d.code,
-      lnum = d.lnum,
-      col = d.col,
-      end_lnum = d.end_lnum,
-      end_col = d.end_col,
+    local diagnostics = vim.diagnostic.get(bufnr, {
+      severity = args.severity and { min = args.severity },
     })
-  end
 
-  return {
-    filepath = args.filepath,
-    diagnostic_count = #results,
-    diagnostics = results,
-  }
+    if cleanup then
+      cleanup()
+    end
+
+    local results = {}
+    if diagnostics then
+      for _, d in ipairs(diagnostics) do
+        table.insert(results, {
+          message = d.message,
+          severity = d.severity, -- 1=Error,2=Warn,3=Info,4=Hint
+          source = d.source,
+          code = d.code,
+          lnum = d.lnum and d.lnum + 1 or nil, -- 转为 1-based
+          end_lnum = d.end_lnum and d.end_lnum + 1 or nil,
+          col = d.col and d.col + 1 or nil,
+          end_col = d.end_col and d.end_col + 1 or nil,
+          bufnr = d.bufnr,
+        })
+      end
+    end
+
+    if on_success then
+      on_success({
+        filepath = args.filepath,
+        diagnostic_count = #results,
+        diagnostics = results,
+      })
+    end
+  end)
 end
-
 M.lsp_diagnostics = define_tool({
   name = "lsp_diagnostics",
   description = "获取文件中所有 LSP 诊断信息（错误、警告、提示等），支持按严重程度过滤",
   func = _lsp_diagnostics,
+  async = true,
   parameters = {
     type = "object",
     properties = {
