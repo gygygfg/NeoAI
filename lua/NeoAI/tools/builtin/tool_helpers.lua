@@ -64,4 +64,20 @@ function M.define_tool(opts)
   }
 end
 
+-- 路径解析：展开 ~ 为家目录，将相对路径转为绝对路径
+-- 供所有工具模块统一使用
+function M.resolve_path(path)
+  if not path or path == "" then
+    return path
+  end
+  -- 展开 ~ 和 ~user 为家目录
+  local expanded = vim.fn.expand(path)
+  -- 如果是相对路径（不以 / 开头），转为绝对路径
+  if not vim.startswith(expanded, "/") then
+    expanded = vim.fn.getcwd() .. "/" .. expanded
+  end
+  -- 规范化路径，移除 ./ 和 ../ 等
+  return vim.fn.fnamemodify(expanded, ":p")
+end
+
 return M

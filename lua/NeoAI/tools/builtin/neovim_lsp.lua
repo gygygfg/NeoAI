@@ -5,6 +5,7 @@
 local M = {}
 
 local define_tool = require("NeoAI.tools.builtin.tool_helpers").define_tool
+local resolve_path = require("NeoAI.tools.builtin.tool_helpers").resolve_path
 
 -- ============================================================================
 -- 通用 LSP 服务检测与初始化（自适应所有配置，不硬编码）
@@ -1604,6 +1605,8 @@ local function _lsp_hover(args, on_success, on_error)
     return
   end
 
+  args.filepath = resolve_path(args.filepath)
+
   if not args.symbol then
     if on_error then
       on_error("需要 symbol（符号名称）参数来定位")
@@ -1714,6 +1717,7 @@ local function _lsp_definition(args, on_success, on_error)
     end
     return
   end
+  args.filepath = resolve_path(args.filepath)
   if not args.symbol then
     if on_error then
       on_error("需要 symbol（符号名称）参数来定位")

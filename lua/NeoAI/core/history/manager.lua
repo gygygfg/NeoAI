@@ -85,18 +85,13 @@ local function truncate_utf8(str, max_len)
 end
 
 --- 查找 assistant 数组中最后一条 AI 回复条目的索引
+--- 条目统一为 Lua table，不再支持 JSON 字符串
 local function find_last_assistant_entry_index(assistant_list)
   if type(assistant_list) ~= "table" then return nil end
   for i = #assistant_list, 1, -1 do
     local entry = assistant_list[i]
     if type(entry) == "table" then
       if entry.type ~= "tool_call" then
-        return i
-      end
-    elseif type(entry) == "string" then
-      -- 兼容旧格式（预编码的 JSON 字符串）
-      local ok, parsed = pcall(vim.json.decode, entry)
-      if not ok or type(parsed) ~= "table" or parsed.type ~= "tool_call" then
         return i
       end
     end
@@ -408,12 +403,8 @@ function M.add_round(session_id, user_msg, assistant_msg, usage)
       session.assistant = assistant_msg
     end
   elseif assistant_msg and assistant_msg ~= "" then
-    local ok, parsed = pcall(vim.json.decode, assistant_msg)
-    if ok and type(parsed) == "table" then
-      session.assistant = { parsed }
-    else
-      session.assistant = { { content = assistant_msg } }
-    end
+    -- assistant_msg 应为 table，但兼容字符串（包装为 { content = ... }）
+    session.assistant = { { content = assistant_msg } }
   end
   session.timestamp = os.time()
   if usage and type(usage) == "table" then
@@ -452,17 +443,12 @@ function M.update_last_assistant(session_id, content, flush)
       table.insert(session.assistant, content)
     end
   elseif content and content ~= "" then
+    -- content 应为 table，但兼容字符串（包装为 { content = ... }）
     if type(session.assistant) ~= "table" then
       session.assistant = {}
     end
     local last_ai_idx = find_last_assistant_entry_index(session.assistant)
-    local entry
-    local ok, parsed = pcall(vim.json.decode, content)
-    if ok and type(parsed) == "table" then
-      entry = parsed
-    else
-      entry = { content = content }
-    end
+    local entry = { content = content }
     if last_ai_idx then
       session.assistant[last_ai_idx] = entry
     else
@@ -494,17 +480,11 @@ function M.add_assistant_entry(session_id, assistant_entry)
     end
   end
 
-  if type(assistant_entry) == "string" then
-    local ok, parsed = pcall(vim.json.decode, assistant_entry)
-    if ok and type(parsed) == "table" then
-      table.insert(session.assistant, parsed)
-    elseif assistant_entry:match("^{{{") then
-      table.insert(session.assistant, assistant_entry)
-    else
-      table.insert(session.assistant, { content = assistant_entry })
-    end
-  else
+  if type(assistant_entry) == "table" then
     table.insert(session.assistant, assistant_entry)
+  elseif type(assistant_entry) == "string" and assistant_entry ~= "" then
+    -- 兼容旧格式：字符串包装为 { content = ... }
+    table.insert(session.assistant, { content = assistant_entry })
   end
   session.updated_at = os.time()
   return true

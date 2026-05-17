@@ -5,6 +5,7 @@
 local M = {}
 
 local define_tool = require("NeoAI.tools.builtin.tool_helpers").define_tool
+local resolve_path = require("NeoAI.tools.builtin.tool_helpers").resolve_path
 
 local block_node_types = {
   -- 通用
@@ -458,6 +459,18 @@ local function _parse_file(args, on_success, on_error)
 
   local max_depth = args.max_depth or 3
 
+  -- 解析 filepaths 列表中的路径
+  if args.filepaths and #args.filepaths > 0 then
+    local resolved_filepaths = {}
+    for _, fp in ipairs(args.filepaths) do
+      table.insert(resolved_filepaths, resolve_path(fp))
+    end
+    args.filepaths = resolved_filepaths
+  end
+
+  -- 解析单个 filepath
+  local filepath = args.filepath and resolve_path(args.filepath) or nil
+
   -- 处理 filepaths 列表
   if args.filepaths and #args.filepaths > 0 then
     local results = {}
@@ -498,8 +511,8 @@ local function _parse_file(args, on_success, on_error)
   end
 
   -- 处理单个 filepath
-  if args.filepath then
-    parse_file_content_async(args.filepath, max_depth, function(result)
+  if filepath then
+    parse_file_content_async(filepath, max_depth, function(result)
       if result and result.nodes then
         local filtered = {}
         for _, n in ipairs(result.nodes) do
@@ -604,9 +617,12 @@ local function _query_tree_for_source(source_text, lang, query_string)
     query = query_string,
     capture_count = #captures,
     captures = captures,
-  },
-    nil
+  }
 end
+
+-- ============================================================================
+-- 工具 query_tree - 使用 Tree-sitter 查询模式捕获节点（回调模式）
+-- ============================================================================
 
 local function _query_tree(args, on_success, on_error)
   if not check_ts() then
@@ -624,10 +640,11 @@ local function _query_tree(args, on_success, on_error)
   end
 
   local query_string = args.query
+  local filepath = resolve_path(args.filepath)
 
-  read_file_content_async(args.filepath, function(content)
+  read_file_content_async(filepath, function(content)
     vim.schedule(function()
-      local lang = detect_lang_from_filepath(args.filepath)
+      local lang = detect_lang_from_filepath(filepath)
       if not lang then
         if on_error then
           on_error("无法确定文件语言")
@@ -643,7 +660,7 @@ local function _query_tree(args, on_success, on_error)
           end
           return
         end
-        result.filepath = args.filepath
+        result.filepath = filepath
         if on_success then
           on_success(result)
         end
@@ -700,7 +717,7 @@ local function _get_node_at_position(args, on_success, on_error)
     return
   end
 
-  local filepath = args.filepath
+  local filepath = resolve_path(args.filepath)
   local target_row = args.row or 0
   local target_col = args.col or 0
 
@@ -815,7 +832,6 @@ local function _get_node_at_position(args, on_success, on_error)
     end
   end)
 end
-
 M.get_node_at_position = define_tool({
   name = "get_node_at_position",
   description = "获取文件中指定位置（行、列）的 Tree-sitter 语法树节点，包含父节点链和子节点信息。",
@@ -862,7 +878,8 @@ local function _with_parsed_tree(args, on_success, on_error, build_response)
     return
   end
 
-  parse_file_content_async(args.filepath, -1, function(result)
+  local filepath = resolve_path(args.filepath)
+  parse_file_content_async(filepath, -1, function(result)
     local filtered, fallback = filter_nodes(result.nodes, args)
     if #filtered == 0 then
       if on_error then
@@ -949,7 +966,10 @@ local function _get_node_range(args, on_success, on_error)
     return
   end
 
-  parse_file_content_async(args.filepath, -1, function(result)
+
+  local filepath = resolve_path(args.filepath)
+
+  parse_file_content_async(filepath, -1, function(result)
     local filtered, fallback = filter_nodes(result.nodes, args)
     if #filtered == 0 then
       if on_error then
@@ -960,7 +980,7 @@ local function _get_node_range(args, on_success, on_error)
 
     -- 如果需要 include_code，异步读取文件内容
     if args.include_code then
-      read_file_content_async(args.filepath, function(content)
+      read_file_content_async(filepath, function(content)
         local file_lines = vim.split(content, "\n", { plain = true })
         local ranges = {}
         for _, node in ipairs(filtered) do
@@ -1154,7 +1174,9 @@ local function _get_parent_node(args, on_success, on_error)
     return
   end
 
-  parse_file_content_async(args.filepath, -1, function(result)
+  local filepath = resolve_path(args.filepath)
+
+  parse_file_content_async(filepath, -1, function(result)
     local parents, perr, fallback = _find_parent_by_attrs(result.nodes or {}, args.node_type, args.text, args.named)
     if perr or not parents then
       if on_error then
@@ -1178,7 +1200,7 @@ local function _get_parent_node(args, on_success, on_error)
       })
     end
     local ret = {
-      filepath = args.filepath,
+      filepath = filepath,
       language = result.language,
       match_count = #parent_info,
       parents = parent_info,
@@ -1302,7 +1324,10 @@ local function _get_node_code(args, on_success, on_error)
     return
   end
 
-  parse_file_content_async(args.filepath, -1, function(result)
+
+  local filepath = resolve_path(args.filepath)
+
+  parse_file_content_async(filepath, -1, function(result)
     local filtered, fallback = filter_nodes(result.nodes, args)
     if #filtered == 0 then
       if on_error then
@@ -1312,7 +1337,7 @@ local function _get_node_code(args, on_success, on_error)
     end
 
     -- 异步读取文件内容以提取精确的源代码
-    read_file_content_async(args.filepath, function(content)
+    read_file_content_async(filepath, function(content)
       local file_lines = vim.split(content, "\n", { plain = true })
       local code_lines = {}
       local first_node = filtered[1]
@@ -1329,7 +1354,7 @@ local function _get_node_code(args, on_success, on_error)
       end
 
       local ret = {
-        filepath = args.filepath,
+        filepath = filepath,
         language = result.language,
         node_type = first_node.type,
         start_row = first_node.start_row,
@@ -1399,7 +1424,10 @@ local function _delete_node(args, on_success, on_error)
     return
   end
 
-  parse_file_content_async(args.filepath, -1, function(result)
+
+  local filepath = resolve_path(args.filepath)
+
+  parse_file_content_async(filepath, -1, function(result)
     local filtered, fallback = filter_nodes(result.nodes, args)
     if #filtered == 0 then
       if on_error then
@@ -1432,7 +1460,7 @@ local function _delete_node(args, on_success, on_error)
     -- 跳过的节点会在最终结果中通过 skipped_types 字段提示
 
     -- 异步读取文件内容
-    read_file_content_async(args.filepath, function(content)
+    read_file_content_async(filepath, function(content)
       local file_lines = vim.split(content, "\n", { plain = true })
       local deletions = {}
 
@@ -1502,7 +1530,7 @@ local function _delete_node(args, on_success, on_error)
       end
 
       -- 使用 Neovim API 直接修改文件缓冲区
-      local abs_path = vim.fn.fnamemodify(args.filepath, ":p")
+      local abs_path = filepath
       local bufnr = vim.fn.bufnr(abs_path)
       local was_loaded = true
 

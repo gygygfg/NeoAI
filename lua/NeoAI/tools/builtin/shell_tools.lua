@@ -4,6 +4,7 @@
 local M = {}
 
 local define_tool = require("NeoAI.tools.builtin.tool_helpers").define_tool
+local resolve_path = require("NeoAI.tools.builtin.tool_helpers").resolve_path
 
 -- ============================================================================
 -- 特殊按键映射表
@@ -389,8 +390,8 @@ local function _run_command(args, on_success, on_error, on_progress)
 
   -- 超时时间，默认 30 秒
   local timeout_sec = args.timeout or 30
-  -- 工作目录
-  local cwd = args.cwd or vim.fn.getcwd()
+  -- 工作目录，支持 ~ 和相对路径
+  local cwd = args.cwd and resolve_path(args.cwd) or vim.fn.getcwd()
   -- 是否捕获 stderr（默认 true）
   local capture_stderr = true
   if args.capture_stderr ~= nil then

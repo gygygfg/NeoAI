@@ -79,14 +79,14 @@ local timeout_state = {
 
 -- ========== 辅助函数 ==========
 
-local function resolve_json_args(args)
+local function resolve_json_args(args, param_schemas)
   if args == nil then
     return args
   end
   if type(args) == "string" then
     local ok, decoded = pcall(json.decode, args)
     if ok and type(decoded) == "table" then
-      return resolve_json_args(decoded)
+      return resolve_json_args(decoded, param_schemas)
     end
     return args
   end
@@ -96,17 +96,23 @@ local function resolve_json_args(args)
   local result = {}
   for k, v in pairs(args) do
     if type(v) == "string" then
-      -- 只对 JSON 对象/数组字符串（以 { 或 [ 开头）进行解码
-      -- 避免将普通字符串（如 "所有22个工具"）误解析为 number
-      local trimmed = v:match("^%s*(.-)%s*$") or v
-      if trimmed:sub(1, 1) == "{" or trimmed:sub(1, 1) == "[" then
-        local ok, decoded = pcall(json.decode, v)
-        result[k] = ok and resolve_json_args(decoded) or v
-      else
+      -- 检查参数 schema：如果声明为 string 类型，则绝不进行 JSON 自动解码
+      -- 避免将用户传入的原始字符串（如文件内容）误解析为 table
+      local schema = param_schemas and param_schemas[k]
+      if schema and schema.type == "string" then
         result[k] = v
+      else
+        -- 只对 JSON 对象/数组字符串（以 { 或 [ 开头）进行解码
+        local trimmed = v:match("^%s*(.-)%s*$") or v
+        if trimmed:sub(1, 1) == "{" or trimmed:sub(1, 1) == "[" then
+          local ok, decoded = pcall(json.decode, v)
+          result[k] = ok and resolve_json_args(decoded, param_schemas) or v
+        else
+          result[k] = v
+        end
       end
     elseif type(v) == "table" then
-      result[k] = resolve_json_args(v)
+      result[k] = resolve_json_args(v, param_schemas)
     else
       result[k] = v
     end
@@ -219,7 +225,7 @@ function M.execute_async(tool_name, args, on_success, on_error, on_progress)
     return
   end
 
-  local resolved_args = resolve_json_args(args)
+  local resolved_args = resolve_json_args(args, tool.parameters)
   local valid, error_msg = M.validate_args(tool, resolved_args)
   if not valid then
     local full_msg = error_msg or "未知错误"

@@ -1,6 +1,13 @@
 --- NeoAI 消息构建器
 --- 职责：将会话数据展平为 role/content 消息列表、构建 round text
 --- 从 history/manager.lua 提取，减轻其负担
+---
+--- 注意：assistant 条目统一使用 Lua table 格式，不再使用 JSON 字符串。
+--- 条目结构：
+---   { content = "...", reasoning_content = "..." }  -- 普通 AI 回复（含可选的思考过程）
+---   { type = "tool_call", tool_name = "...", arguments = {}, result = "..." }  -- 工具调用
+---   "{{{...}}}"  -- 折叠文本（纯字符串，用于兼容旧数据）
+--- 写入/读取文件时由 persistence 模块统一做 JSON 编解码。
 
 local M = {}
 
@@ -9,6 +16,10 @@ local M = {}
 --- 将单个会话的消息展平为 role/content 列表
 --- @param session table 会话对象
 --- @return table { {role, content}, ... }
+--- content 字段：
+---   - 普通消息：纯字符串
+---   - 含思考过程的消息：{ reasoning_content = "...", content = "..." }（Lua table）
+---   - 折叠文本："{{{...}}}"（纯字符串）
 function M.session_to_messages(session)
   if not session then return {} end
 
@@ -23,38 +34,52 @@ function M.session_to_messages(session)
   end
 
   for _, entry in ipairs(assistant_list) do
-    local content = entry
-    local parsed = entry
-    if type(entry) == "string" then
-      local ok, decoded = pcall(vim.json.decode, entry)
-      if ok and type(decoded) == "table" then
-        parsed = decoded
-      else
-        parsed = nil
-      end
+    -- 统一转为 Lua table
+    local parsed = M._normalize_entry(entry)
+    if not parsed then
+      goto continue
     end
 
-    if type(parsed) == "table" then
-      if parsed.type == "tool_call" then
-        content = M._build_tool_call_text(parsed)
-      elseif parsed.content then
-        content = parsed.content
-        if parsed.reasoning_content and parsed.reasoning_content ~= "" then
-          content = vim.json.encode({
-            reasoning_content = parsed.reasoning_content,
-            content = parsed.content,
-          })
-        end
-      elseif parsed.reasoning_content and parsed.reasoning_content ~= "" then
-        content = vim.json.encode({
-          reasoning_content = parsed.reasoning_content,
-          content = "",
-        })
-      end
+    local content
+    if parsed.type == "tool_call" then
+      content = M._build_tool_call_text(parsed)
+    elseif parsed.reasoning_content and parsed.reasoning_content ~= "" then
+      -- 含思考过程：返回 table，由调用方决定如何渲染
+      content = {
+        reasoning_content = parsed.reasoning_content,
+        content = parsed.content or "",
+      }
+    else
+      content = parsed.content or ""
     end
     table.insert(msgs, { role = "assistant", content = content })
+    ::continue::
   end
   return msgs
+end
+
+--- 将 assistant 条目统一规范化为 Lua table
+--- 兼容旧数据格式（JSON 字符串、纯字符串等）
+--- @param entry any assistant 条目
+--- @return table|nil 规范化的 table，nil 表示无效条目
+function M._normalize_entry(entry)
+  if type(entry) == "table" then
+    -- 已经是 table，直接使用
+    return entry
+  end
+
+  if type(entry) ~= "string" or entry == "" then
+    return nil
+  end
+
+  -- 尝试 JSON 解码（兼容旧格式：预编码的 JSON 字符串）
+  local ok, parsed = pcall(vim.json.decode, entry)
+  if ok and type(parsed) == "table" then
+    return parsed
+  end
+
+  -- 纯字符串：包装为 { content = entry }
+  return { content = entry }
 end
 
 --- 构建工具调用折叠文本
@@ -146,23 +171,16 @@ function M.build_round_text(session)
       last_entry = session.assistant[#session.assistant]
     end
 
-    if type(last_entry) == "table" then
-      if last_entry.content then
-        ai_text = last_entry.content
-      elseif last_entry.type == "tool_call" then
-        ai_text = "🔧 " .. (last_entry.tool_name or "工具调用")
+    -- 统一规范化
+    local parsed = M._normalize_entry(last_entry)
+    if parsed then
+      if parsed.content then
+        ai_text = parsed.content
+      elseif parsed.type == "tool_call" then
+        ai_text = "🔧 " .. (parsed.tool_name or "工具调用")
       end
     elseif type(last_entry) == "string" then
-      local ok, parsed = pcall(vim.json.decode, last_entry)
-      if ok and type(parsed) == "table" then
-        if parsed.content then
-          ai_text = parsed.content
-        elseif parsed.type == "tool_call" then
-          ai_text = "🔧 " .. (parsed.tool_name or "工具调用")
-        end
-      else
-        ai_text = last_entry
-      end
+      ai_text = last_entry
     end
     ai_text = ai_text:gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
   end

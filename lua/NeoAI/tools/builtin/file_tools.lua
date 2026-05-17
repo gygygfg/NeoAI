@@ -15,6 +15,9 @@ local function get_file_utils()
   return ok and fu or nil
 end
 
+-- 引用 tool_helpers 的路径解析函数
+local resolve_path = require("NeoAI.tools.builtin.tool_helpers").resolve_path
+
 -- ============================================================================
 -- vim.uv 异步 I/O 辅助函数（回调模式）
 -- ============================================================================
@@ -137,7 +140,7 @@ local function _read_file(args, on_success, on_error)
     return
   end
 
-  local filepath = args.filepath
+  local filepath = resolve_path(args.filepath)
   local start_line = args.start_line or args.start or 1
   local end_line = args.end_line or args["end"] or -1
   local is_full_file = (start_line == 1) and (end_line == -1)
@@ -352,7 +355,7 @@ local function _edit_file(args, on_success, on_error)
     return
   end
 
-  local filepath = args.filepath
+  local filepath = resolve_path(args.filepath)
   local content = args.content
   if content ~= nil then
     if type(content) ~= "string" then
@@ -525,7 +528,9 @@ local function _edit_file(args, on_success, on_error)
           if ok then
             write_and_return()
           else
-            if on_error then on_error("写入失败") end
+            if on_error then
+              on_error("写入失败")
+            end
           end
         else
           uv_write_file(filepath, content, false, write_and_return, on_error)
@@ -822,7 +827,7 @@ local function _list_files(args, on_success, on_error)
     return
   end
 
-  local dir = args.dir
+  local dir = resolve_path(args.dir)
   local pattern = args.pattern or "*"
   local recursive = args.recursive or false
   local max_results = args.max_results
@@ -880,7 +885,7 @@ local function _search_files(args, on_success, on_error)
     return
   end
 
-  local dir = args.dir or "."
+  local dir = resolve_path(args.dir or ".")
   local file_pattern = args.file_pattern or "*"
   local case_sensitive = args.case_sensitive
   if case_sensitive == nil then
@@ -1026,7 +1031,7 @@ local function _file_exists(args, on_success, on_error)
     return
   end
 
-  local filepath = args.filepath
+  local filepath = resolve_path(args.filepath)
   local fu = get_file_utils()
 
   local function on_exists(exists)
@@ -1075,7 +1080,7 @@ local function _create_directory(args, on_success, on_error)
     return
   end
 
-  local filepath = args.filepath
+  local filepath = resolve_path(args.filepath)
   local fu = get_file_utils()
 
   local function on_created(ok)
@@ -1136,7 +1141,7 @@ local function _ensure_dir(args, on_success, on_error)
     return
   end
 
-  local filepath = args.filepath:gsub("/+$", "")
+  local filepath = resolve_path(args.filepath):gsub("/+$", "")
   local fu = get_file_utils()
 
   local function on_ensured(ok)
@@ -1197,7 +1202,7 @@ local function _delete_file(args, on_success, on_error)
     return
   end
 
-  local filepath = args.filepath
+  local filepath = resolve_path(args.filepath)
 
   uv_exists(filepath, function(exists)
     if not exists then

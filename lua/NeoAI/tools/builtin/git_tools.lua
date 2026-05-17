@@ -5,6 +5,7 @@
 local M = {}
 
 local define_tool = require("NeoAI.tools.builtin.tool_helpers").define_tool
+local resolve_path = require("NeoAI.tools.builtin.tool_helpers").resolve_path
 
 -- ============================================================================
 -- 以下代码内联自 git_auto.lua
@@ -836,8 +837,12 @@ end
 local function _git_diff(args, on_success, on_error)
   local diff_filepath = args and args.filepath
   local cwd = args and args.cwd
-
-
+  if diff_filepath then
+    diff_filepath = resolve_path(diff_filepath)
+  end
+  if cwd then
+    cwd = resolve_path(cwd)
+  end
 
   local result = _git_auto_mod.get_diff(diff_filepath, cwd)
   if result then
@@ -884,8 +889,9 @@ M.git_diff = define_tool({
 local function _git_log(args, on_success, on_error)
   local max_count = args and args.max_count or 20
   local cwd = args and args.cwd
-
-
+  if cwd then
+    cwd = resolve_path(cwd)
+  end
 
   local result = _git_auto_mod.get_log(max_count, cwd)
   if result then
@@ -932,8 +938,9 @@ M.git_log = define_tool({
 
 local function _git_status(args, on_success, on_error)
   local cwd = args and args.cwd
-
-
+  if cwd then
+    cwd = resolve_path(cwd)
+  end
 
   local result = _git_auto_mod.get_status(cwd)
   if on_success then
@@ -976,8 +983,9 @@ local function _git_commit_detail(args, on_success, on_error)
   end
 
   local cwd = args and args.cwd
-
-
+  if cwd then
+    cwd = resolve_path(cwd)
+  end
 
   local result = _git_auto_mod.get_commit_detail(args.commit_hash, cwd)
   if result then
@@ -1031,10 +1039,15 @@ local function _git_rollback(args, on_success, on_error)
   end
 
   local cwd = args and args.cwd
-
-
+  if cwd then
+    cwd = resolve_path(cwd)
+  end
 
   local filepath = args.filepath
+  if filepath then
+    filepath = resolve_path(filepath)
+  end
+
   local ok, err = _git_auto_mod.rollback(args.commit_hash, filepath, cwd)
   if ok then
     if on_success then
@@ -1096,11 +1109,9 @@ local function _git_file_history(args, on_success, on_error)
     return
   end
 
-  local cwd = args and args.cwd
+  local filepath = resolve_path(args.filepath)
 
-
-
-  local result = _git_auto_mod.get_file_history(args.filepath, cwd)
+  local result = _git_auto_mod.get_file_history(filepath, cwd)
   if on_success then
     on_success(result)
   end
@@ -1134,12 +1145,11 @@ M.git_file_history = define_tool({
 })
 
 -- ============================================================================
--- 工具 git_branch（仅真实 git 模式可用）
--- ============================================================================
-
 local function _git_branch(args, on_success, on_error)
   local cwd = args and args.cwd
-
+  if cwd then
+    cwd = resolve_path(cwd)
+  end
 
 
   if not _git_auto_mod.is_git_available() then
@@ -1194,10 +1204,11 @@ M.git_branch = define_tool({
 
 -- ============================================================================
 -- 工具 git_auto_commit_config
--- ============================================================================
-
 local function _git_auto_commit_config(args, on_success, on_error)
   local cwd = args and args.cwd
+  if cwd then
+    cwd = resolve_path(cwd)
+  end
 
   if not args or args.enabled == nil then
     -- 查询当前状态

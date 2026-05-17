@@ -475,6 +475,11 @@ function M.decode(json_str)
       table.remove(stack)
 
       if #stack == 0 then
+        -- 检查是否还有剩余的非空白内容，有则说明不是有效的单一 JSON 值
+        skip_whitespace()
+        if pos <= len then
+          return nil
+        end
         return root
       end
       local parent = stack[#stack]
@@ -544,7 +549,7 @@ function M.decode(json_str)
     ::continue::
   end
 
-  return root
+  return nil  -- 结构不完整
 end
 
 return M

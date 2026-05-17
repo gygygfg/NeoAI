@@ -194,7 +194,12 @@ local function on_generation_completed(data)
       local last_entry = session.assistant[#session.assistant]
       local last_content = ""
       if type(last_entry) == "table" then
-        last_content = last_entry.content or ""
+        -- content 可能是字符串（折叠文本），也可能是 table（含 reasoning_content 和 content）
+        if type(last_entry.content) == "string" then
+          last_content = last_entry.content
+        elseif type(last_entry.content) == "table" then
+          last_content = last_entry.content.content or ""
+        end
       elseif type(last_entry) == "string" then
         last_content = last_entry
       end
@@ -225,6 +230,7 @@ end
 
 --- 处理历史保存最终内容事件（来自 chat_window，含 UI 构建的折叠文本）
 --- 此事件优先于 GENERATION_COMPLETED，因为内容已包含 UI 层面的折叠文本
+--- content 可能是 Lua table（含 reasoning_content 和 content 字段），也可能是字符串（含折叠文本）
 local function on_history_save_final(data)
   local session_id = data.session_id
   local content = data.content
@@ -240,9 +246,13 @@ local function on_history_save_final(data)
     local session = hm.get_session(session_id)
     if not session then return false, "会话不存在: " .. session_id end
 
-    -- 构建含 reasoning 的 assistant 条目
+    -- 构建 assistant 条目
+    -- content 可能是 Lua table（含 reasoning_content 和 content 字段），也可能是字符串
     local assistant_entry
-    if reasoning_content ~= "" then
+    if type(content) == "table" then
+      -- content 已经是 table 格式（含 reasoning_content 和 content 字段）
+      assistant_entry = content
+    elseif reasoning_content ~= "" then
       assistant_entry = {
         content = content,
         reasoning_content = reasoning_content,

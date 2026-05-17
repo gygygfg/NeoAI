@@ -20,6 +20,7 @@ local tool_cycle = require("NeoAI.core.ai.tool_cycle")
 local reasoning_display = require("NeoAI.ui.components.reasoning_display")
 local tool_display_component = require("NeoAI.ui.components.tool_display")
 local file_utils = require("NeoAI.utils.file_utils")
+local markdown_renderer = require("NeoAI.ui.components.markdown_renderer")
 
 -- ========== 辅助函数（不依赖 state） ==========
 
@@ -818,7 +819,8 @@ function M.open(session_id, window_id, branch_id)
       if session_id then
         -- 有会话 ID：加载已有会话的消息
         M._load_messages(session_id)
-        M.render_chat()
+        -- 直接调用 _do_render_chat 而非 render_chat，避免防抖和二次调度导致重复渲染
+        M._do_render_chat()
         M._update_usage_virt_text()
       else
         -- 无会话 ID：新会话，显示欢迎界面
@@ -916,52 +918,67 @@ end
 function M._render_single_message(msg, prev_role)
   local lines = {}
   local role_prefix = msg.role == "user" and "👤 用户:" or "🤖 AI:"
-  local raw_content = msg.content or ""
-  -- 防御性检查：确保 raw_content 是字符串（_session_to_messages 可能返回 table）
-  if type(raw_content) ~= "string" then
-    local ok, encoded = pcall(vim.json.encode, raw_content)
-    raw_content = ok and encoded or tostring(raw_content)
+
+  -- 统一获取 raw_content（支持 Lua table 和字符串两种格式）
+  local raw_content
+  local has_reasoning = false
+  local reasoning_content = ""
+  local main_content = ""
+
+  if type(msg.content) == "table" then
+    -- Lua table 格式：{ reasoning_content = "...", content = "..." }
+    reasoning_content = msg.content.reasoning_content or ""
+    main_content = msg.content.content or ""
+    has_reasoning = reasoning_content ~= ""
+    raw_content = main_content
+  else
+    raw_content = msg.content or ""
+    if type(raw_content) ~= "string" then
+      local ok, encoded = pcall(vim.json.encode, raw_content)
+      raw_content = ok and encoded or tostring(raw_content)
+    end
+
+    -- 尝试解析 JSON 格式（兼容旧数据）
+    if msg.role == "assistant" then
+      local json_ok, parsed = pcall(vim.json.decode, raw_content)
+      if json_ok and type(parsed) == "table" then
+        if parsed.reasoning_content and parsed.reasoning_content ~= "" then
+          has_reasoning = true
+          reasoning_content = parsed.reasoning_content
+          main_content = parsed.content or ""
+          raw_content = main_content
+        elseif parsed.content and parsed.content ~= "" then
+          main_content = parsed.content
+          raw_content = main_content
+        end
+      else
+        main_content = raw_content
+      end
+    else
+      main_content = raw_content
+    end
   end
 
-  -- 响应内容已直接来自 json.decode，不再进行 %%XX URL 编码
-  -- 无需额外的解码操作
-
-  -- 每轮对话之间添加分割线（user 消息前，且不是第一条消息）
-  -- 注意：只在最后一条消息前添加分割线，由 _do_render_chat 统一处理
-  -- 这里不再添加，避免消息之间出现多余的分割线
-  -- if msg.role == "user" and prev_role ~= nil then
-  --   table.insert(lines, "---")
-  --   table.insert(lines, "")
-  -- end
-
   -- 检查是否是折叠文本（以 {{{ 开头）
-  -- 注意：使用 raw_content 直接匹配，不 trim，因为 {{{ 必须在行首
-  if msg.role == "assistant" and raw_content:find("^{{{") then
+  if msg.role == "assistant" and type(raw_content) == "string" and raw_content:find("^{{{") then
     -- 折叠文本：直接显示，不加 AI 标记
-    -- 按行分割，每行作为独立元素
-    -- 先清理 \r 字符，将 \r 渲染为换行
     local clean_content = raw_content:gsub("\r\n", "\n"):gsub("\r", "\n")
-    -- 检测 }}} 后的剩余内容（AI 总结正文）
     local fold_end = select(2, clean_content:find("}}}%s*"))
     if fold_end then
-      -- 提取折叠部分（包含 }}} 及其后的空白）
       local fold_part = clean_content:sub(1, fold_end)
       for _, line in ipairs(vim.split(fold_part, "\n")) do
         table.insert(lines, line)
       end
-      -- 提取 }}} 后的剩余内容
       local remaining = clean_content:sub(fold_end + 1)
       remaining = remaining:gsub("^\n+", ""):gsub("\n+$", "")
       if remaining and remaining ~= "" then
         table.insert(lines, "")
-        -- 对剩余内容应用正常的消息格式化
         local remaining_lines = _format_remaining_content(remaining)
         for _, rline in ipairs(remaining_lines) do
           table.insert(lines, rline)
         end
       end
     else
-      -- 没有 }}}，按原逻辑处理
       for _, line in ipairs(vim.split(clean_content, "\n")) do
         table.insert(lines, line)
       end
@@ -972,7 +989,6 @@ function M._render_single_message(msg, prev_role)
 
   -- 检查 msg 是否包含 tool_calls 字段（原生 table 结构）
   if msg.role == "assistant" and msg.tool_calls and type(msg.tool_calls) == "table" and #msg.tool_calls > 0 then
-    -- 工具调用消息：显示工具调用信息
     table.insert(lines, role_prefix .. " 🔧 工具调用:")
     for _, tc in ipairs(msg.tool_calls) do
       local func = tc["function"] or tc.func or {}
@@ -991,7 +1007,6 @@ function M._render_single_message(msg, prev_role)
       end
       table.insert(lines, string.format("    🔧 %s(%s)", tool_name, args_str))
     end
-    -- 如果有 content，也显示
     if raw_content and raw_content ~= "" then
       table.insert(lines, "")
       for _, mline in ipairs(vim.split(raw_content, "\n")) do
@@ -1000,30 +1015,6 @@ function M._render_single_message(msg, prev_role)
     end
     table.insert(lines, "")
     return lines
-  end
-
-  -- 尝试解析 JSON 格式（包含 reasoning_content 的 assistant 消息）
-  local has_reasoning = false
-  local reasoning_content = ""
-  local main_content = raw_content
-  local has_tool_calls = false
-
-  if msg.role == "assistant" then
-    local json_ok, parsed = pcall(vim.json.decode, raw_content)
-    if json_ok and type(parsed) == "table" then
-      if parsed.reasoning_content and parsed.reasoning_content ~= "" then
-        has_reasoning = true
-        reasoning_content = parsed.reasoning_content
-        main_content = parsed.content or ""
-      elseif parsed.content and parsed.content ~= "" then
-        -- 只有 content 字段，没有 reasoning_content
-        main_content = parsed.content
-      end
-      -- 检查 JSON 中是否包含 tool_calls
-      if parsed.tool_calls and type(parsed.tool_calls) == "table" and #parsed.tool_calls > 0 then
-        has_tool_calls = true
-      end
-    end
   end
 
   if has_tool_calls then
@@ -1090,12 +1081,12 @@ function M._render_single_message(msg, prev_role)
       end
     end
   elseif main_content and main_content ~= "" then
-    -- 普通消息（有实际内容）
-    local msg_lines = vim.split(main_content, "\n")
-    if #msg_lines > 0 then
-      table.insert(lines, string.format("%s %s", role_prefix, msg_lines[1]))
-      for i = 2, #msg_lines do
-        table.insert(lines, string.format("    %s", msg_lines[i]))
+  -- 普通消息（有实际内容）：使用 markdown 格式化
+    local formatted_lines = markdown_renderer.format_text(main_content)
+    if #formatted_lines > 0 then
+      table.insert(lines, string.format("%s %s", role_prefix, formatted_lines[1]))
+      for i = 2, #formatted_lines do
+        table.insert(lines, string.format("    %s", formatted_lines[i]))
       end
     end
   else
@@ -1223,6 +1214,12 @@ function M._apply_rendered_content(content)
     end
   end
 
+  -- 对聊天 buffer 应用 markdown 语法高亮
+  local buf = window_manager.get_window_buf(state.current_window_id)
+  if buf and vim.api.nvim_buf_is_valid(buf) then
+    markdown_renderer.apply_highlights(buf)
+  end
+
   -- 触发渲染完成事件
   vim.api.nvim_exec_autocmds("User", {
     pattern = Events.RENDERING_COMPLETE,
@@ -1262,7 +1259,11 @@ function M.render_chat_async(callback)
     else
       for _, msg in ipairs(state.messages) do
         local role_prefix = msg.role == "user" and "👤 用户:" or "🤖 AI:"
-        table.insert(content, string.format("%s %s", role_prefix, msg.content))
+        local msg_content = msg.content
+        if type(msg_content) == "table" then
+          msg_content = msg_content.content or ""
+        end
+        table.insert(content, string.format("%s %s", role_prefix, tostring(msg_content)))
         table.insert(content, "")
       end
     end
@@ -2351,7 +2352,15 @@ end
 
 local function find_folded_msg_idx()
   for i = #state.messages, 1, -1 do
-    if state.messages[i].role == "assistant" and (state.messages[i].content or ""):find("^{{{") then
+    local content = state.messages[i].content
+    -- content 可能是 table（含 reasoning_content 和 content 字段）或字符串
+    local content_str = ""
+    if type(content) == "table" then
+      content_str = content.content or ""
+    elseif type(content) == "string" then
+      content_str = content
+    end
+    if state.messages[i].role == "assistant" and content_str:find("^{{{") then
       return i
     end
   end
@@ -2414,19 +2423,22 @@ function M._setup_event_listeners()
       local msg_idx = state.streaming.message_index
 
       -- 更新消息内容
-      -- 注意：思考过程已通过 _append_reasoning_folded_to_buffer 在 STREAM_CHUNK 或
-      -- STREAM_COMPLETED 事件中单独追加到聊天缓冲区。
-      -- 但 state.messages 中保存的内容需要包含 reasoning，以便全量重渲染时正确显示。
-      -- 如果 reasoning 已追加，state.messages 中的内容应保存为 JSON 格式（含 reasoning_content），
-      -- 这样 _render_single_message 可以正确解析并渲染。
-      -- 如果 reasoning 短且无正文（不折叠），则保存为 JSON 格式。
-      -- 如果 reasoning 折叠或有正文，则保存为 JSON 格式（_render_single_message 会处理折叠）。
+      -- content_with_reasoning 使用 Lua table 格式，不再编码为 JSON 字符串
+      -- _render_single_message 已支持直接处理 table 格式
       local content_with_reasoning = response_content
       if has_reasoning then
-        content_with_reasoning = vim.json.encode({
+        content_with_reasoning = {
           reasoning_content = reasoning_text,
           content = response_content,
-        })
+        }
+      end
+
+      -- 辅助函数：将 content 转为字符串（兼容 table 和 string 格式）
+      local function _content_to_str(c)
+        if type(c) == "table" then
+          return c.content or ""
+        end
+        return tostring(c)
       end
 
       if msg_idx and state.messages[msg_idx] then
@@ -2434,7 +2446,9 @@ function M._setup_event_listeners()
           local folded_idx = find_folded_msg_idx()
           if folded_idx then
             local append_content = has_reasoning and content_with_reasoning or response_content
-            state.messages[folded_idx].content = state.messages[folded_idx].content .. "\n\n" .. append_content
+            local folded_str = _content_to_str(state.messages[folded_idx].content)
+            local append_str = _content_to_str(append_content)
+            state.messages[folded_idx].content = folded_str .. "\n\n" .. append_str
             if msg_idx ~= folded_idx then
               table.remove(state.messages, msg_idx)
             end
@@ -2443,7 +2457,8 @@ function M._setup_event_listeners()
           end
         elseif has_tool_results then
           local folded = M._build_tool_folded_text(state.tool_display.results)
-          state.messages[msg_idx].content = (folded ~= "" and folded .. "\n\n" or "") .. content_with_reasoning
+          local append_str = _content_to_str(content_with_reasoning)
+          state.messages[msg_idx].content = (folded ~= "" and folded .. "\n\n" or "") .. append_str
         else
           state.messages[msg_idx].content = content_with_reasoning
         end
@@ -2452,7 +2467,9 @@ function M._setup_event_listeners()
           local folded_idx = find_folded_msg_idx()
           if folded_idx then
             local append_content = has_reasoning and content_with_reasoning or response_content
-            state.messages[folded_idx].content = state.messages[folded_idx].content .. "\n\n" .. append_content
+            local folded_str = _content_to_str(state.messages[folded_idx].content)
+            local append_str = _content_to_str(append_content)
+            state.messages[folded_idx].content = folded_str .. "\n\n" .. append_str
           else
             table.insert(
               state.messages,
@@ -2461,7 +2478,8 @@ function M._setup_event_listeners()
           end
         elseif has_tool_results then
           local folded = M._build_tool_folded_text(state.tool_display.results)
-          local final = (folded ~= "" and folded .. "\n\n" or "") .. content_with_reasoning
+          local append_str = _content_to_str(content_with_reasoning)
+          local final = (folded ~= "" and folded .. "\n\n" or "") .. append_str
           table.insert(state.messages, { role = "assistant", content = final, timestamp = os.time() })
         else
           local placeholder_idx = find_placeholder_idx()
@@ -2598,7 +2616,7 @@ function M._setup_event_listeners()
         local rt = state.streaming.reasoning_buffer or ""
         local mi = state.streaming.message_index
         if rt ~= "" and mi and state.messages[mi] then
-          state.messages[mi].content = vim.json.encode({ reasoning_content = rt, content = "" })
+          state.messages[mi].content = { reasoning_content = rt, content = "" }
         end
         -- 思考过程完毕：将完整的思考过程以折叠文本格式追加到聊天缓冲区
         -- 注意：此时悬浮窗已滚动显示完所有思考内容，关闭悬浮窗后将折叠文本写入缓冲区
@@ -3036,16 +3054,21 @@ function M._setup_event_listeners()
           local reasoning_text = ""
           -- 使用 _body_cache 作为正文内容，避免从 content 中提取导致折叠文本重复
           local body_text = state.tool_display._body_cache or ""
-          local json_ok, parsed = pcall(vim.json.decode, current_content)
-          if json_ok and type(parsed) == "table" and parsed.reasoning_content then
-            reasoning_text = parsed.reasoning_content
+          -- current_content 可能是 table（含 reasoning_content 和 content 字段）或 JSON 字符串
+          if type(current_content) == "table" then
+            reasoning_text = current_content.reasoning_content or ""
+          else
+            local json_ok, parsed = pcall(vim.json.decode, current_content)
+            if json_ok and type(parsed) == "table" and parsed.reasoning_content then
+              reasoning_text = parsed.reasoning_content
+            end
           end
           local new_content
           if reasoning_text ~= "" then
-            new_content = vim.json.encode({
+            new_content = {
               reasoning_content = reasoning_text,
               content = folded_text .. "\n\n" .. body_text,
-            })
+            }
           else
             new_content = folded_text .. "\n\n" .. body_text
           end
@@ -3145,18 +3168,22 @@ function M._setup_event_listeners()
           -- _body_cache 在 TOOL_LOOP_STARTED 时初始化为 ""，在工具执行阶段保持不变
           -- 只有 AI 回复内容（非折叠文本）应该作为 body 内容
           local body_text = state.tool_display._body_cache or ""
-          -- 尝试解析 JSON 格式（含 reasoning_content）
-          local json_ok, parsed = pcall(vim.json.decode, current_content)
-          if json_ok and type(parsed) == "table" and parsed.reasoning_content then
-            reasoning_text = parsed.reasoning_content
+          -- current_content 可能是 table（含 reasoning_content 和 content 字段）或 JSON 字符串
+          if type(current_content) == "table" then
+            reasoning_text = current_content.reasoning_content or ""
+          else
+            local json_ok, parsed = pcall(vim.json.decode, current_content)
+            if json_ok and type(parsed) == "table" and parsed.reasoning_content then
+              reasoning_text = parsed.reasoning_content
+            end
           end
           -- 将折叠文本插入到 reasoning 和 body 之间
           local new_content
           if reasoning_text ~= "" then
-            new_content = vim.json.encode({
+            new_content = {
               reasoning_content = reasoning_text,
               content = folded_text .. "\n\n" .. body_text,
-            })
+            }
           else
             new_content = folded_text .. "\n\n" .. body_text
           end
@@ -3508,6 +3535,12 @@ function M._append_message_to_buffer(role, content, window_id)
     return
   end
 
+  -- 统一 content 为字符串（兼容 Lua table 格式：{ reasoning_content = "...", content = "..." }）
+  if type(content) == "table" then
+    content = content.content or ""
+  end
+  content = tostring(content)
+
   local buf = window_manager.get_window_buf(target_window_id)
   if not buf or not vim.api.nvim_buf_is_valid(buf) then
     return
@@ -3544,6 +3577,16 @@ function M._append_message_to_buffer(role, content, window_id)
 
   -- 折叠新插入的 {{{ ... }}} 折叠区域
   _fold_new_markers(buf, lines)
+
+  -- 对新增内容应用 markdown 语法高亮
+  if not content:find("^{{{") then
+    -- 跳过折叠文本，只对普通消息内容应用高亮
+    vim.schedule(function()
+      if buf and vim.api.nvim_buf_is_valid(buf) then
+        markdown_renderer.apply_highlights(buf)
+      end
+    end)
+  end
 
   -- 执行光标跟随（使用协程共享表 should_follow 缓存值）
   _schedule_cursor_follow()
@@ -3642,6 +3685,14 @@ local function _render_streaming_message(window_id)
   end
   -- 折叠新插入的 {{{ ... }}} 折叠区域
   _fold_new_markers(buf, lines)
+
+  -- 对渲染的消息应用 markdown 语法高亮
+  vim.schedule(function()
+    if buf and vim.api.nvim_buf_is_valid(buf) then
+      markdown_renderer.apply_highlights(buf)
+    end
+  end)
+
   _schedule_cursor_follow()
 end
 
@@ -3660,16 +3711,15 @@ function M._append_reasoning_folded_to_buffer(reasoning_text, window_id)
     return
   end
 
-  -- 更新 state.messages 中的内容为 JSON 格式（含 reasoning_content）
-  -- 这样 _render_single_message 可以正确解析并渲染
+  -- 更新 state.messages 中的内容为 Lua table 格式（含 reasoning_content）
   local mi = state.streaming.message_index
   local full_content = state.streaming.content_buffer or ""
-  local encoded = vim.json.encode({
+  local content_table = {
     reasoning_content = reasoning_text,
     content = full_content,
-  })
+  }
   if mi and state.messages[mi] then
-    state.messages[mi].content = encoded
+    state.messages[mi].content = content_table
   end
 
   -- 使用 _render_streaming_message 统一渲染（复用 _render_single_message）
@@ -3716,7 +3766,7 @@ function M._append_stream_chunk_to_buffer(chunk_content, content_type, window_id
     local full = state.streaming.content_buffer or ""
     local rt = state.streaming.reasoning_buffer or ""
     local new_content = (rt ~= "") and { reasoning_content = rt, content = full } or { content = full }
-    state.messages[mi].content = (rt ~= "") and vim.json.encode({ reasoning_content = rt, content = full }) or full
+    state.messages[mi].content = new_content
 
     -- 流式更新保存到 history_manager
     -- 每 10 次更新触发一次防抖保存，确保流式内容不会丢失
@@ -3755,11 +3805,10 @@ function M._finalize_streaming()
   -- 临时保存累积内容到消息列表（后续会被 generation_completed 的完整响应替换）
   if message_index and state.messages[message_index] then
     if reasoning_text and reasoning_text ~= "" then
-      local combined = vim.json.encode({
+      state.messages[message_index].content = {
         reasoning_content = reasoning_text,
         content = full_content,
-      })
-      state.messages[message_index].content = combined
+      }
     else
       state.messages[message_index].content = full_content
     end
@@ -3767,11 +3816,10 @@ function M._finalize_streaming()
 
   -- 更新已持久化的占位符消息（而不是添加新消息）
   if reasoning_text and reasoning_text ~= "" then
-    local combined = vim.json.encode({
+    M._update_persisted_message("assistant", {
       reasoning_content = reasoning_text,
       content = full_content,
     })
-    M._update_persisted_message("assistant", combined)
   elseif full_content and full_content ~= "" then
     M._update_persisted_message("assistant", full_content)
   end
@@ -3979,14 +4027,13 @@ function M._save_final_content_to_history(data)
   local final_content = response_content
   if has_tool_results or folded_saved then
     local last_assistant_content = M.get_last_assistant_content()
-    if last_assistant_content and last_assistant_content ~= "" then
-      -- 如果最后一条 assistant 内容以折叠文本开头，说明是工具调用折叠文本
-      -- 注意：在 GENERATION_COMPLETED 回调中，折叠文本可能已被追加了 AI 回复
-      -- （state.messages[folded_idx].content = folded_text .. "\n\n" .. append_content）
-      -- 所以直接使用 last_assistant_content 即可，无需再次追加 response_content
-      if last_assistant_content:match("^{{{") then
+    if last_assistant_content then
+      -- last_assistant_content 可能是 table（含 reasoning_content 和 content 字段）或字符串
+      if type(last_assistant_content) == "table" then
+        -- 已经是 table 格式（含 reasoning_content 和 content），直接使用
         final_content = last_assistant_content
-      else
+      elseif last_assistant_content ~= "" then
+        -- 字符串格式
         final_content = last_assistant_content
       end
     elseif has_tool_results then
@@ -3998,11 +4045,21 @@ function M._save_final_content_to_history(data)
     end
   end
 
-  if final_content == "" and reasoning_text == "" then
+  -- 检查是否为空
+  local is_empty = false
+  if type(final_content) == "table" then
+    is_empty = (final_content.content == nil or final_content.content == "")
+      and (final_content.reasoning_content == nil or final_content.reasoning_content == "")
+  else
+    is_empty = final_content == ""
+  end
+  if is_empty and reasoning_text == "" then
     return nil
   end
 
   -- 返回构建的最终内容，由 history_saver 通过事件监听统一保存
+  -- final_content 可能是 table（含 reasoning_content 和 content）或字符串
+  -- saver.on_history_save_final 已支持两种格式
   return {
     content = final_content,
     reasoning_content = reasoning_text,
