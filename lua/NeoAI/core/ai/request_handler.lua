@@ -122,6 +122,7 @@ function M.format_messages(messages)
         fm.content = tostring(msg.content)
       end
     end
+    if msg.tool_calls then
       fm.tool_calls = msg.tool_calls
     end
     if msg.role == "tool" then
