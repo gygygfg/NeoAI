@@ -5,6 +5,10 @@ local M = {}
 
 local define_tool = require("NeoAI.tools.builtin.tool_helpers").define_tool
 
+-- 复用 neovim_tree 的 block_node_types 进行节点过滤
+local neovim_tree_ok, neovim_tree = pcall(require, "NeoAI.tools.builtin.neovim_tree")
+local block_node_types = neovim_tree_ok and neovim_tree.block_node_types or {}
+
 -- 复用 file_utils 模块
 local function get_file_utils()
   local ok, fu = pcall(require, "NeoAI.utils.file_utils")
@@ -138,24 +142,13 @@ local function _read_file(args, on_success, on_error)
   local end_line = args.end_line or args["end"] or -1
   local is_full_file = (start_line == 1) and (end_line == -1)
 
-  local function build_structure_overview(filepath, tree_result)
+  local function build_structure_overview(file_path, tree_result)
     local overview_lines = {}
     table.insert(
       overview_lines,
-      string.format("📋 文件结构概览 (%s, 共 %d 行)", filepath, tree_result.line_count)
+      string.format("📋 文件结构概览 (%s, 共 %d 行)", file_path, tree_result.line_count)
     )
     table.insert(overview_lines, "=" .. string.rep("=", 60))
-
-    local structure_types = {
-      function_definition = "function",
-      method_definition = "method",
-      class_definition = "class",
-      class_declaration = "class",
-      struct_specification = "struct",
-      interface_declaration = "interface",
-      enum_declaration = "enum",
-      module_definition = "module",
-    }
 
     local function extract_name(node)
       local text = node.text:match("^[^\n]+") or node.text
@@ -199,11 +192,10 @@ local function _read_file(args, on_success, on_error)
 
     local structures = {}
     for _, node in ipairs(tree_result.nodes) do
-      local label = structure_types[node.type]
-      if label and node.depth <= 4 then
+      if block_node_types[node.type] and node.depth <= 4 then
         local name = extract_name(node)
         table.insert(structures, {
-          label = label,
+          label = node.type,
           name = name,
           depth = node.depth,
           start_row = node.start_row,
@@ -254,9 +246,9 @@ local function _read_file(args, on_success, on_error)
     local total_lines = #all_lines
 
     if is_full_file and total_lines > 500 then
-      local ok_tree, neovim_tree = pcall(require, "NeoAI.tools.builtin.neovim_tree")
-      if ok_tree and neovim_tree then
-        neovim_tree.parse_file_content_async(filepath, -1, function(tree_result)
+      local ok_tree, nvim_tree_mod = pcall(require, "NeoAI.tools.builtin.neovim_tree")
+      if ok_tree and nvim_tree_mod then
+        nvim_tree_mod.parse_file_content_async(filepath, -1, function(tree_result)
           if tree_result and tree_result.nodes and #tree_result.nodes > 0 then
             local overview = build_structure_overview(filepath, tree_result)
             local notices = "⚠️ 文件过长（超过 500 行），仅显示文件结构概览。\n"
@@ -429,25 +421,22 @@ local function _edit_file(args, on_success, on_error)
         end
 
         -- 异步调用 _lsp_diagnostics，结果通过回调获取
-        local ok_pcall, call_err = pcall(lsp_mod.lsp_diagnostics.func, { filepath = filepath },
-          function(diag_result)
-            -- 成功获取诊断
-            if diag_result and not diag_result.error then
-              result.diagnostics = diag_result.diagnostics or {}
-              result.diagnostic_count = diag_result.diagnostic_count or 0
-            end
-            if on_success then
-              on_success(result)
-            end
-          end,
-          function(err_msg)
-            -- 获取诊断失败，仍然返回写入结果（不含诊断）
-            log_message("warn", "edit_file 诊断获取失败: " .. tostring(err_msg))
-            if on_success then
-              on_success(result)
-            end
+        local ok_pcall, call_err = pcall(lsp_mod.lsp_diagnostics.func, { filepath = filepath }, function(diag_result)
+          -- 成功获取诊断
+          if diag_result and not diag_result.error then
+            result.diagnostics = diag_result.diagnostics or {}
+            result.diagnostic_count = diag_result.diagnostic_count or 0
           end
-        )
+          if on_success then
+            on_success(result)
+          end
+        end, function(err_msg)
+          -- 获取诊断失败，仍然返回写入结果（不含诊断）
+          log_message("warn", "edit_file 诊断获取失败: " .. tostring(err_msg))
+          if on_success then
+            on_success(result)
+          end
+        end)
         if not ok_pcall then
           -- pcall 本身的错误（如函数不存在等）
           if on_success then
@@ -457,15 +446,21 @@ local function _edit_file(args, on_success, on_error)
       end
 
       -- DiagnosticChanged 回调：收到诊断后 debounce 500ms，等待可能来自多个 LSP 源的后续诊断
-      local function on_diag_changed(args)
-        if not args or not args.buf or args.buf ~= bufnr then
+      local function on_diag_changed(diag_args)
+        if not diag_args or not diag_args.buf or diag_args.buf ~= bufnr then
           return
         end
         -- 重置 debounce 计时器，每次新诊断到达都重新等待 500ms
-        debounce_timer:stop()
-        debounce_timer:start(500, 0, vim.schedule_wrap(function()
-          finalize()
-        end))
+        if debounce_timer then
+          debounce_timer:stop()
+          debounce_timer:start(
+            500,
+            0,
+            vim.schedule_wrap(function()
+              finalize()
+            end)
+          )
+        end
       end
 
       -- 创建 DiagnosticChanged autocmd（仅监听目标 buffer）
@@ -475,9 +470,15 @@ local function _edit_file(args, on_success, on_error)
       })
 
       -- 超时计时器（10 秒兜底）
-      timeout_timer:start(max_wait, 0, vim.schedule_wrap(function()
-        finalize()
-      end))
+      if timeout_timer then
+        timeout_timer:start(
+          max_wait,
+          0,
+          vim.schedule_wrap(function()
+            finalize()
+          end)
+        )
+      end
     else
       -- LSP 不可用，直接返回写入结果
       if on_success then

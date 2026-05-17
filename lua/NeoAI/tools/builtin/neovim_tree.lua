@@ -60,6 +60,8 @@ local block_node_types = {
   macro_invocation = true,
 }
 
+M.block_node_types = block_node_types
+
 -- 扩展名到 Tree-sitter 解析器名称的直接映射
 -- 避免在 fast event 上下文中调用 vim.filetype.match（内部调用 getenv）
 local ext_to_parser = {
@@ -146,6 +148,14 @@ end
 --- @param on_success function 安装成功或已存在时回调
 --- @param on_error function 安装失败时回调
 local function ensure_parser_installed(lang, on_success, on_error)
+  -- 确保 ts 模块已加载
+  if not check_ts() then
+    if on_error then
+      on_error("Tree-sitter 不可用（需要 Neovim >= 0.5）")
+    end
+    return
+  end
+
   -- 检查解析器是否已安装
   ---@diagnostic disable-next-line: need-check-nil
   local ok_inspect, _ = pcall(ts.language.inspect, lang)
@@ -468,6 +478,15 @@ local function _parse_file(args, on_success, on_error)
 
     for _, fp in ipairs(args.filepaths) do
       parse_file_content_async(fp, max_depth, function(r)
+        if r and r.nodes then
+          local filtered = {}
+          for _, n in ipairs(r.nodes) do
+            if block_node_types[n.type] then
+              table.insert(filtered, n)
+            end
+          end
+          r.nodes = filtered
+        end
         table.insert(results, r)
         check_done()
       end, function(err)
@@ -481,6 +500,15 @@ local function _parse_file(args, on_success, on_error)
   -- 处理单个 filepath
   if args.filepath then
     parse_file_content_async(args.filepath, max_depth, function(result)
+      if result and result.nodes then
+        local filtered = {}
+        for _, n in ipairs(result.nodes) do
+          if block_node_types[n.type] then
+            table.insert(filtered, n)
+          end
+        end
+        result.nodes = filtered
+      end
       if on_success then
         on_success(result)
       end
