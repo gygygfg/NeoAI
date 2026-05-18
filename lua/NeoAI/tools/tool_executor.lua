@@ -79,6 +79,35 @@ local timeout_state = {
 
 -- ========== 辅助函数 ==========
 
+-- 路径解析：展开 ~ 为家目录，将相对路径转为绝对路径
+-- 在参数规范化阶段自动对路径参数调用此函数
+-- @param path string|nil 路径字符串
+-- @return string|nil 解析后的绝对路径
+local function resolve_path(path)
+  if not path or path == "" then
+    return path
+  end
+  -- 展开 ~ 和 ~user 为家目录
+  local expanded = vim.fn.expand(path)
+  -- 如果是相对路径（不以 / 开头），转为绝对路径
+  if not vim.startswith(expanded, "/") then
+    expanded = vim.fn.getcwd() .. "/" .. expanded
+  end
+  -- 规范化路径，移除 ./ 和 ../ 等
+  return vim.fn.fnamemodify(expanded, ":p")
+end
+
+-- ========== 路径参数定义 ==========
+-- 工具参数中所有需要路径解析的字段名
+-- 在 _normalize_arguments 中自动对这些字段调用 resolve_path
+local PATH_PARAM_NAMES = {
+  filepath = true,
+  dir = true,
+  cwd = true,
+  dir_path = true,
+  diff_filepath = true,
+}
+
 local function resolve_json_args(args, param_schemas)
   if args == nil then
     return args
@@ -1261,6 +1290,43 @@ function M._normalize_arguments(tool_name, raw_arguments)
         end
       end
     end
+
+    -- 5) 路径自动解析
+    -- 将 AI 传入的相对路径和 ~ 转为绝对路径
+    -- 对所有已知的路径参数自动调用 resolve_path
+    for arg_name, arg_value in pairs(arguments) do
+      if PATH_PARAM_NAMES[arg_name] and type(arg_value) == "string" then
+        local resolved = resolve_path(arg_value)
+        if resolved ~= arg_value then
+          arguments[arg_name] = resolved
+          changed = true
+          logger.debug("[tool_executor] 路径自动解析: 参数 '%s' '%s' -> '%s'", arg_name, arg_value, resolved)
+        end
+      elseif arg_name == "filepaths" and type(arg_value) == "table" then
+        -- 处理 filepaths 数组中的每个路径
+        local resolved_any = false
+        for i, fp in ipairs(arg_value) do
+          if type(fp) == "string" then
+            local resolved = resolve_path(fp)
+            if resolved ~= fp then
+              arg_value[i] = resolved
+              resolved_any = true
+            end
+          elseif type(fp) == "table" and fp.filepath and type(fp.filepath) == "string" then
+            -- 处理 { filepath = "..." } 格式的数组元素
+            local resolved = resolve_path(fp.filepath)
+            if resolved ~= fp.filepath then
+              fp.filepath = resolved
+              resolved_any = true
+            end
+          end
+        end
+        if resolved_any then
+          changed = true
+          logger.debug("[tool_executor] 路径自动解析: 参数 'filepaths' 中的路径已解析")
+        end
+      end
+    end
   end
 
   return arguments, changed
@@ -1400,5 +1466,7 @@ function M._generate_example(tool)
   table.insert(lines, "})")
   return table.concat(lines, "\n")
 end
+
+M.resolve_path = resolve_path
 
 return M

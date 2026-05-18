@@ -107,6 +107,10 @@ local function _is_chat_buffer(buf)
   return ok and ft == "neoai"
 end
 
+-- 模块级聊天 buffer 句柄（在 M.open 中初始化，窗口关闭时清空）
+-- 所有添加文本和折叠文本的操作直接使用此变量，不依赖 state.current_window_id
+local _chat_buf = nil
+
 -- 模块状态
 local state = {
   initialized = false,
@@ -221,7 +225,7 @@ local function is_current_window(window_id)
 end
 
 local function get_buf()
-  return state.current_window_id and window_manager.get_window_buf(state.current_window_id) or nil
+  return _chat_buf or (state.current_window_id and window_manager.get_window_buf(state.current_window_id) or nil)
 end
 
 local function get_win()
@@ -500,6 +504,10 @@ local function _do_cursor_follow()
   if not buf or not vim.api.nvim_buf_is_valid(buf) then
     return
   end
+  -- 验证 buffer 是 neoai 类型，防止写入非聊天 buffer
+  if not _is_chat_buffer(buf) then
+    return
+  end
   local lc = vim.api.nvim_buf_line_count(buf)
   local last_line = vim.api.nvim_buf_get_lines(buf, lc - 1, lc, false)[1] or ""
   if last_line == "}}}" then
@@ -577,12 +585,11 @@ end
 --- @param folded_text string 新的折叠文本
 --- @param window_id string|nil 可选，指定目标窗口 ID
 local function _update_folded_text_in_buffer(folded_text, window_id)
-  local target_window_id = window_id or state.current_window_id
-  if not target_window_id or not folded_text or folded_text == "" then
+  if not folded_text or folded_text == "" then
     return
   end
 
-  local buf = window_manager.get_window_buf(target_window_id)
+  local buf = _chat_buf
   if not buf or not vim.api.nvim_buf_is_valid(buf) then
     return
   end
@@ -638,7 +645,10 @@ local function _update_folded_text_in_buffer(folded_text, window_id)
   vim.api.nvim_set_option_value("modified", false, { buf = buf })
 
   -- 折叠新插入的 {{{ ... }}} 折叠区域
-  _fold_new_markers(buf, new_lines)
+  -- 使用 _chat_buf 关联的窗口
+  local wins = vim.fn.win_findbuf(buf)
+  local win = #wins > 0 and wins[1] or nil
+  _fold_new_markers(buf, new_lines, win)
 
   _schedule_cursor_follow()
 end
@@ -744,6 +754,8 @@ function M.open(session_id, window_id, branch_id)
 
     -- 保存到模块 state 表，供 virtual_input 检测光标离开时使用
     state.chat_buf = buf
+    -- 保存到模块级变量，所有 buffer 操作直接使用此变量
+    _chat_buf = buf
   end
 
   if win_handle and vim.api.nvim_win_is_valid(win_handle) then
@@ -1220,16 +1232,25 @@ function M._apply_rendered_content(content)
   -- 仅在光标跟随（near_end=true）时获取焦点并打开输入框
   -- 光标不跟随时（near_end=false），不抢焦点，保持用户当前工作状态
   if near_end then
-    -- 自动获取焦点（如果虚拟输入框已激活，跳过，避免抢走输入框焦点）
-    if not virtual_input.is_active() then
-      M._focus_window()
+    -- 检查当前焦点是否在 NeoAI 相关窗口上，避免从用户文件 buffer 抢走焦点
+    local cur_win = vim.api.nvim_get_current_win()
+    local cur_buf = vim.api.nvim_win_get_buf(cur_win)
+    local ok_ft, cur_ft = pcall(vim.api.nvim_get_option_value, "filetype", { buf = cur_buf })
+    local is_neoai_focused = ok_ft and (cur_ft == "neoai" or cur_ft == "NeoAIInput" or cur_win == win_handle)
+
+    -- 仅当用户当前焦点已在 NeoAI 窗口上时才自动获取焦点
+    -- 避免在用户编辑文件时 AI 渲染内容窃取焦点
+    if is_neoai_focused then
+      -- 自动获取焦点（如果虚拟输入框已激活，跳过，避免抢走输入框焦点）
+      if not virtual_input.is_active() then
+        M._focus_window()
+      end
     end
     _schedule_cursor_follow()
     if not state.streaming.active and not state.generation_in_progress then
       M._open_float_input()
     end
   end
-
   -- 对聊天 buffer 应用 markdown 语法高亮
   local buf = window_manager.get_window_buf(state.current_window_id)
   if buf and vim.api.nvim_buf_is_valid(buf) then
@@ -1303,9 +1324,19 @@ function M.render_chat_async(callback)
       end
 
       if near_end then
-        -- 自动获取焦点（如果虚拟输入框已激活，跳过，避免抢走输入框焦点）
-        if not virtual_input.is_active() then
-          M._focus_window()
+        -- 检查当前焦点是否在 NeoAI 相关窗口上，避免从用户文件 buffer 抢走焦点
+        local cur_win = vim.api.nvim_get_current_win()
+        local cur_buf = vim.api.nvim_win_get_buf(cur_win)
+        local ok_ft, cur_ft = pcall(vim.api.nvim_get_option_value, "filetype", { buf = cur_buf })
+        local is_neoai_focused = ok_ft and (cur_ft == "neoai" or cur_ft == "NeoAIInput" or cur_win == win_handle)
+
+        -- 仅当用户当前焦点已在 NeoAI 窗口上时才自动获取焦点
+        -- 避免在用户编辑文件时 AI 渲染内容窃取焦点
+        if is_neoai_focused then
+          -- 自动获取焦点（如果虚拟输入框已激活，跳过，避免抢走输入框焦点）
+          if not virtual_input.is_active() then
+            M._focus_window()
+          end
         end
         -- 仅在非流式且无生成进行中时打开浮动虚拟输入框
         if not state.streaming.active and not state.generation_in_progress then
@@ -1902,6 +1933,7 @@ function M.close()
       state.current_window_id = nil
       state.current_session_id = nil
       state.chat_buf = nil
+      _chat_buf = nil
       state.messages = {}
       state.last_usage = nil
       state.usage_extmark_id = nil
@@ -3519,7 +3551,8 @@ end
 --- 在写入包含折叠标记的内容后调用，确保新插入的折叠文本默认折叠
 --- @param buf number buffer 句柄
 --- @param lines table 刚写入的行列表
-local function _fold_new_markers(buf, lines)
+--- @param win_id number|nil 可选，指定目标窗口句柄，默认使用 buf 关联的第一个窗口
+local function _fold_new_markers(buf, lines, win_id)
   if not buf_valid(buf) then
     return
   end
@@ -3539,8 +3572,14 @@ local function _fold_new_markers(buf, lines)
     if not buf_valid(buf) then
       return
     end
-    -- 获取当前窗口
-    local win = get_win()
+    -- 优先使用传入的 win_id，否则从 buf 关联的窗口中查找
+    local win = win_id
+    if not win or not vim.api.nvim_win_is_valid(win) then
+      local wins = vim.fn.win_findbuf(buf)
+      if #wins > 0 then
+        win = wins[1]
+      end
+    end
     if not win or not vim.api.nvim_win_is_valid(win) then
       return
     end
@@ -3568,8 +3607,7 @@ end
 --- @param content string 消息内容
 --- @param window_id string|nil 可选，指定目标窗口 ID，默认使用 state.current_window_id
 function M._append_message_to_buffer(role, content, window_id)
-  local target_window_id = window_id or state.current_window_id
-  if not target_window_id or not content then
+  if not content then
     return
   end
 
@@ -3579,7 +3617,7 @@ function M._append_message_to_buffer(role, content, window_id)
   end
   content = tostring(content)
 
-  local buf = window_manager.get_window_buf(target_window_id)
+  local buf = _chat_buf
   if not buf or not vim.api.nvim_buf_is_valid(buf) then
     return
   end
@@ -3614,7 +3652,10 @@ function M._append_message_to_buffer(role, content, window_id)
   pcall(vim.api.nvim_set_option_value, "modified", false, { buf = buf })
 
   -- 折叠新插入的 {{{ ... }}} 折叠区域
-  _fold_new_markers(buf, lines)
+  -- 使用 _chat_buf 关联的窗口
+  local wins = vim.fn.win_findbuf(buf)
+  local win = #wins > 0 and wins[1] or nil
+  _fold_new_markers(buf, lines, win)
 
   -- 对新增内容应用 markdown 语法高亮
   if not content:find("^{{{") then
@@ -3632,11 +3673,11 @@ end
 
 --- 替换缓冲区中指定消息的行（从起始行到末尾或到指定结束行）
 --- 用于流式渲染时更新已追加到缓冲区的消息内容
+--- @param buf number buffer 句柄
 --- @param start_line number 起始行号（0-based）
 --- @param lines table 新行列表
 --- @param end_line number|nil 结束行号（0-based），nil 表示替换到末尾
-local function _replace_message_in_buffer(start_line, lines, end_line)
-  local buf = get_buf()
+local function _replace_message_in_buffer(buf, start_line, lines, end_line)
   if not buf_valid(buf) then
     return
   end
@@ -3695,8 +3736,7 @@ local function _render_streaming_message(window_id)
   if #lines == 0 then
     return
   end
-  local target_window_id = window_id or state.current_window_id
-  local buf = target_window_id and window_manager.get_window_buf(target_window_id) or get_buf()
+  local buf = _chat_buf
   if not buf_valid(buf) then
     return
   end
@@ -3711,7 +3751,7 @@ local function _render_streaming_message(window_id)
   local start_line = state.streaming.message_start_line
   if start_line then
     -- 已有起始行：替换从起始行到末尾的内容
-    _replace_message_in_buffer(start_line, lines)
+    _replace_message_in_buffer(buf, start_line, lines)
   else
     -- 没有起始行：追加到缓冲区末尾
     set_buf_modifiable(buf, true)
@@ -3722,7 +3762,10 @@ local function _render_streaming_message(window_id)
     state.streaming.message_start_line = lc
   end
   -- 折叠新插入的 {{{ ... }}} 折叠区域
-  _fold_new_markers(buf, lines)
+  -- 使用 _chat_buf 关联的窗口
+  local wins = vim.fn.win_findbuf(buf)
+  local win = #wins > 0 and wins[1] or nil
+  _fold_new_markers(buf, lines, win)
 
   -- 对渲染的消息应用 markdown 语法高亮
   vim.schedule(function()

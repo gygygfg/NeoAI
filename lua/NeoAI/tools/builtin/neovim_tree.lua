@@ -1391,12 +1391,31 @@ local function _delete_node(args, on_success, on_error)
   end
 
   local filepath = resolve_path(args.filepath)
+  local uv = vim.uv or vim.loop
+  local finalized = false
+
+  -- 总超时保护：30 秒内未完成则报错退出
+  local timeout_timer = uv.new_timer()
+  local function finalize_with_timeout(msg, is_err)
+    if finalized then return end
+    finalized = true
+    if timeout_timer then
+      timeout_timer:stop()
+      timeout_timer:close()
+    end
+    if is_err and on_error then
+      on_error(msg)
+    end
+  end
+  timeout_timer:start(30000, 0, vim.schedule_wrap(function()
+    finalize_with_timeout("delete_node 操作超时（30 秒），Tree-sitter 解析或文件操作可能阻塞", true)
+  end))
 
   parse_file_content_async(filepath, -1, function(result)
     local filtered, fallback = filter_nodes(result.nodes, args)
     if #filtered == 0 then
       if on_error then
-        on_error("未找到匹配的节点")
+        finalize_with_timeout("未找到匹配的节点", true)
       end
       return
     end
@@ -1417,7 +1436,7 @@ local function _delete_node(args, on_success, on_error)
         .. table.concat(skipped, ", ")
         .. "）不是函数、类、结构体等代码块结构。请指定一个更具体的 node_type，如 'function_definition'"
       if on_error then
-        on_error(msg)
+        finalize_with_timeout(msg, true)
       end
       return
     end
@@ -1506,7 +1525,7 @@ local function _delete_node(args, on_success, on_error)
           bufnr = vim.fn.bufadd(abs_path)
           if bufnr == 0 then
             if on_error then
-              on_error("无法为文件创建缓冲区: " .. abs_path)
+              finalize_with_timeout("无法为文件创建缓冲区: " .. abs_path, true)
             end
             return
           end
@@ -1529,7 +1548,7 @@ local function _delete_node(args, on_success, on_error)
 
         if not save_ok then
           if on_error then
-            on_error("保存文件失败: " .. tostring(save_err))
+            finalize_with_timeout("保存文件失败: " .. tostring(save_err), true)
           end
           return
         end
@@ -1550,14 +1569,14 @@ local function _delete_node(args, on_success, on_error)
           ret.skipped_message = "以下节点类型不是代码块结构，已跳过: " .. table.concat(skipped, ", ")
         end
         if on_success then
+          timeout_timer:stop()
+          timeout_timer:close()
           on_success(ret)
         end
       end)
     end)
   end, function(err)
-    if on_error then
-      on_error(err or "解析结果为空")
-    end
+    finalize_with_timeout(err or "解析结果为空", true)
   end)
 end
 

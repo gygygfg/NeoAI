@@ -66,18 +66,11 @@ end
 
 -- 路径解析：展开 ~ 为家目录，将相对路径转为绝对路径
 -- 供所有工具模块统一使用
+-- 实际实现在 tool_executor 中，此函数转发调用以保持向后兼容
+-- 新代码应使用 tool_executor 中的 resolve_path
 function M.resolve_path(path)
-  if not path or path == "" then
-    return path
-  end
-  -- 展开 ~ 和 ~user 为家目录
-  local expanded = vim.fn.expand(path)
-  -- 如果是相对路径（不以 / 开头），转为绝对路径
-  if not vim.startswith(expanded, "/") then
-    expanded = vim.fn.getcwd() .. "/" .. expanded
-  end
-  -- 规范化路径，移除 ./ 和 ../ 等
-  return vim.fn.fnamemodify(expanded, ":p")
+  local tool_executor = require("NeoAI.tools.tool_executor")
+  return tool_executor.resolve_path(path)
 end
 
 return M

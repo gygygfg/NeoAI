@@ -17,11 +17,24 @@ local function _execute_vim_cmd(args, on_success, on_error)
     return
   end
 
+  -- 保存当前窗口和 buffer，执行命令后恢复焦点
+  local current_win = vim.api.nvim_get_current_win()
+  local current_buf = vim.api.nvim_get_current_buf()
+
   -- 使用 pcall 和 redir 捕获命令输出
   local ok, result = pcall(function()
     local output = vim.fn.execute(command)
     return output
   end)
+
+  -- 恢复焦点 buffer 和窗口
+  pcall(vim.api.nvim_set_current_win, current_win)
+  if vim.api.nvim_buf_is_valid(current_buf) then
+    local win_buf = vim.api.nvim_win_get_buf(current_win)
+    if win_buf ~= current_buf then
+      pcall(vim.api.nvim_win_set_buf, current_win, current_buf)
+    end
+  end
 
   if not ok then
     on_error("vim.cmd 执行失败: " .. tostring(result))

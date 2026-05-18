@@ -249,10 +249,26 @@ local function _edit_file(args, on_success, on_error)
   local end_line = args.end_line
   -- on_write_err 是 on_error 的别名，供内部闭包使用
   local on_write_err = on_error
+  -- LSP 诊断等待最大超时（毫秒），避免因 LSP 无响应导致永久挂起
+  local max_wait = args.max_wait or 20000
 
   -- 通用写回调：写入成功后尝试获取 LSP 诊断信息
   local function on_write_ok()
     local result = { filepath = filepath, success = true }
+
+    -- 保存当前窗口和 buffer，避免后续操作改变焦点
+    local current_win = vim.api.nvim_get_current_win()
+    local current_buf = vim.api.nvim_get_current_buf()
+
+    local function restore_focus()
+      pcall(vim.api.nvim_set_current_win, current_win)
+      if vim.api.nvim_buf_is_valid(current_buf) then
+        local win_buf = vim.api.nvim_win_get_buf(current_win)
+        if win_buf ~= current_buf then
+          pcall(vim.api.nvim_win_set_buf, current_win, current_buf)
+        end
+      end
+    end
 
     local ok_lsp, lsp_mod = pcall(require, "NeoAI.tools.builtin.neovim_lsp")
     if ok_lsp and lsp_mod and lsp_mod.lsp_diagnostics and lsp_mod.lsp_diagnostics.func then
@@ -263,86 +279,126 @@ local function _edit_file(args, on_success, on_error)
           vim.cmd("edit!")
         end)
       else
-        bufnr = vim.fn.bufadd(abs_path)
-        vim.fn.bufload(bufnr)
+        -- 使用 nvim_create_buf 替代 bufadd/bufload，避免改变当前窗口焦点
+        bufnr = vim.api.nvim_create_buf(false, true)
+        pcall(vim.api.nvim_buf_set_name, bufnr, abs_path)
+        local lines = vim.fn.readfile(abs_path)
+        vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, lines)
+        vim.bo[bufnr].modified = false
       end
 
-      local timeout_timer = vim.uv.new_timer()
-      local debounce_timer = vim.uv.new_timer()
-      local au_id = nil
-      local finalized = false
+      -- 🔧 修复：设置 filetype 并主动附加 LSP 客户端
+      -- bufload 不会触发 filetype 检测，edit! 在后台 buffer 也可能不触发
+      -- 没有 filetype 则 LSP 无法匹配，没有客户端附加则 DiagnosticChanged 永不触发
+      if vim.bo[bufnr].filetype == "" then
+        local ft = vim.filetype.match({ filename = abs_path, buf = bufnr })
+        if ft then
+          vim.bo[bufnr].filetype = ft
+        end
+      end
+      -- 主动将功能完整的 LSP 客户端附加到目标 buffer
+      -- 排除仅补全类客户端（如 GitHub Copilot），避免不必要的附加
+      local lsp_clients = vim.lsp.get_clients()
+      for _, client in ipairs(lsp_clients) do
+        local caps = client.server_capabilities or {}
+        if caps.hoverProvider or caps.definitionProvider or caps.documentSymbolProvider or caps.diagnosticProvider then
+          pcall(vim.lsp.buf_attach_client, bufnr, client.id)
+        end
+      end
 
-      local function finalize()
+      local finalized = false
+      local timers = {}
+
+      local function safe_close_all_timers()
+        for _, t in ipairs(timers) do
+          if t and not t:is_closing() then
+            pcall(t.stop, t)
+            pcall(t.close, t)
+          end
+        end
+        timers = {}
+      end
+
+      local function do_fetch_diagnostics()
         if finalized then
           return
         end
         finalized = true
+        safe_close_all_timers()
 
-        if au_id then
-          pcall(vim.api.nvim_del_autocmd, au_id)
-          au_id = nil
+        -- 直接从 vim.diagnostic 获取当前 buffer 的诊断
+        -- 此时 DiagnosticChanged 事件应已触发，诊断数据已就绪
+        local diagnostics = vim.diagnostic.get(bufnr)
+        local results = {}
+        if diagnostics then
+          for _, d in ipairs(diagnostics) do
+            table.insert(results, {
+              message = d.message,
+              severity = d.severity,
+              source = d.source,
+              code = d.code,
+              lnum = d.lnum and d.lnum + 1 or nil,
+              end_lnum = d.end_lnum and d.end_lnum + 1 or nil,
+              col = d.col and d.col + 1 or nil,
+              end_col = d.end_col and d.end_col + 1 or nil,
+            })
+          end
         end
-        if timeout_timer then
-          timeout_timer:stop()
-          timeout_timer:close()
-        end
-        if debounce_timer then
-          debounce_timer:stop()
-          debounce_timer:close()
-        end
+        result.diagnostics = results
+        result.diagnostic_count = #results
 
-        local ok_pcall, call_err = pcall(lsp_mod.lsp_diagnostics.func, { filepath = filepath }, function(diag_result)
-          if diag_result and not diag_result.error then
-            result.diagnostics = diag_result.diagnostics or {}
-            result.diagnostic_count = diag_result.diagnostic_count or 0
-          end
-          if on_success then
-            on_success(result)
-          end
-        end, function(err_msg)
-          log_tools.log_message.func({ message = "edit_file 诊断获取失败: " .. tostring(err_msg), level = "warn" }, function() end, function() end)
-          if on_success then
-            on_success(result)
-          end
-        end)
-        if not ok_pcall then
-          if on_success then
-            on_success(result)
-          end
+        restore_focus()
+        if on_success then
+          on_success(result)
         end
       end
 
-      local function on_diag_changed(diag_args)
-        if not diag_args or not diag_args.buf or diag_args.buf ~= bufnr then
-          return
-        end
-        if debounce_timer then
-          debounce_timer:stop()
-          debounce_timer:start(
-            500,
-            0,
-            vim.schedule_wrap(function()
-              finalize()
-            end)
-          )
-        end
-      end
+      -- 策略：
+      -- 1) 监听 DiagnosticChanged 事件（LSP 发布诊断时触发）
+      -- 2) 初始延迟 2000ms 后主动获取诊断（兜底）
+      -- 3) 总超时 20 秒（防止 LSP 无响应）
+      --
+      -- 注意：DiagnosticChanged 事件在 LSP 发布 textDocument/publishDiagnostics 时触发，
+      -- 即使诊断为空也会触发。事件触发后 vim.diagnostic.get 才能拿到最新数据。
 
-      au_id = vim.api.nvim_create_autocmd("DiagnosticChanged", {
+      -- 1) 监听 DiagnosticChanged 事件
+      local au_id = vim.api.nvim_create_autocmd("DiagnosticChanged", {
         buffer = bufnr,
-        callback = on_diag_changed,
+        callback = function()
+          if finalized then
+            return
+          end
+          -- 事件触发后，防抖 500ms 再获取诊断
+          -- 防抖避免 LSP 多次发布诊断时重复获取
+          local dt = vim.uv.new_timer()
+          table.insert(timers, dt)
+          dt:start(500, 0, vim.schedule_wrap(function()
+            do_fetch_diagnostics()
+          end))
+        end,
       })
 
-      if timeout_timer then
-        timeout_timer:start(
-          max_wait,
-          0,
-          vim.schedule_wrap(function()
-            finalize()
-          end)
-        )
-      end
+      -- 2) 初始延迟 2000ms：给 LSP 时间处理文件变更并发布诊断
+      --    如果 DiagnosticChanged 事件已触发，防抖到期后会调用 do_fetch_diagnostics
+      --    如果事件未触发（极端情况），2000ms 后主动获取
+      local init_timer = vim.uv.new_timer()
+      table.insert(timers, init_timer)
+      init_timer:start(2000, 0, vim.schedule_wrap(function()
+        do_fetch_diagnostics()
+      end))
+
+      -- 3) 总超时保护（20秒），防止 LSP 无响应导致永久挂起
+      local timeout_timer = vim.uv.new_timer()
+      table.insert(timers, timeout_timer)
+      timeout_timer:start(max_wait, 0, vim.schedule_wrap(function()
+        if finalized then
+          return
+        end
+        log_tools.log_message.func({ message = "edit_file LSP 诊断等待超时 (" .. max_wait .. "ms)，直接返回", level = "warn" }, function() end, function() end)
+        do_fetch_diagnostics()
+      end))
     else
+      restore_focus()
       if on_success then
         on_success(result)
       end
@@ -1022,16 +1078,34 @@ local function _delete_file(args, on_success, on_error)
     return
   end
 
-  local ok, err = fu.delete_file(filepath)
-  if ok then
-    if on_success then
-      on_success({ filepath = filepath, success = true })
+  -- 使用 uv.fs_unlink 异步删除，避免 os.remove 在文件锁/NFS 上阻塞
+  local uv = vim.uv or vim.loop
+  local ok, err = nil, nil
+  local deleted = false
+  local timer = uv.new_timer()
+  timer:start(10000, 0, vim.schedule_wrap(function()
+    if not deleted then
+      ok = nil
+      err = "删除超时（文件可能被锁定或无权限）"
+      if on_error then
+        on_error(string.format("删除文件失败 %s: %s", filepath, err))
+      end
     end
-  else
-    if on_error then
-      on_error(string.format("删除文件失败 %s: %s", filepath, err or "无法删除文件"))
+  end))
+  uv.fs_unlink(filepath, function(unlink_err)
+    deleted = true
+    timer:stop()
+    timer:close()
+    if unlink_err then
+      if on_error then
+        on_error(string.format("删除文件失败 %s: %s", filepath, tostring(unlink_err)))
+      end
+    else
+      if on_success then
+        on_success({ filepath = filepath, success = true })
+      end
     end
-  end
+  end)
 end
 
 M.delete_file = {
