@@ -3,12 +3,15 @@
 --- 注意：实际 HTTP 请求测试需要 API key 和网络连接，这里只测试逻辑层
 local M = {}
 
+local test
+
 -- 检测是否为 headless 模式
 local function is_headless()
   if vim.env.NVIM_HEADLESS then
     return true
   end
-  if vim.fn.has("nvim-0.5") == 1 and vim.g.colors_name == nil and vim.o.termguicolors == false then
+  local uis = vim.api.nvim_list_uis()
+  if #uis == 0 then
     return true
   end
   return false
@@ -21,39 +24,23 @@ local function safe_wait(timeout_ms, cond)
   return vim.wait(timeout_ms, cond, 1)
 end
 
--- 内联断言工具（避免依赖测试框架导致的循环依赖）
-local assert = {}
-function assert.equal(expected, actual, msg)
-  if expected ~= actual then
-    error(string.format("断言失败: %s\n  期望: %s\n  实际: %s",
-      msg or "值不相等", vim.inspect(expected), vim.inspect(actual)))
+--- 运行所有测试
+function M.run(test_module)
+  test = test_module or require("NeoAI.tests")
+  local assert = test.assert
+  -- 确保 _logger 可用（直接 dofile 运行时可能为 nil）
+  if not test._logger then
+    local logger = require("NeoAI.utils.logger")
+    test._logger = logger
   end
-end
-function assert.not_equal(expected, actual, msg)
-  if expected == actual then
-    error(string.format("断言失败: %s\n  期望不等于: %s", msg or "值不应相等", vim.inspect(expected)))
-  end
-end
-function assert.is_true(value, msg)
-  if not value then
-    error(string.format("断言失败: %s\n  期望为真, 实际为假", msg or "值应为真"))
-  end
-end
-function assert.is_false(value, msg)
-  if value then
-    error(string.format("断言失败: %s\n  期望为假, 实际为真", msg or "值应为假"))
-  end
-end
-function assert.not_nil(value, msg)
-  if value == nil then
-    error(string.format("断言失败: %s\n  值不应为 nil", msg or "值不应为 nil"))
-  end
-end
-function assert.is_nil(value, msg)
-  if value ~= nil then
-    error(string.format("断言失败: %s\n  期望为 nil, 实际为 %s", msg or "值应为 nil", vim.inspect(value)))
-  end
-end
+  -- 清除 http_utils 模块缓存，确保加载最新代码
+  package.loaded["NeoAI.utils.http_utils"] = nil
+  local logger = require("NeoAI.utils.logger")
+  logger.initialize({ level = "ERROR" })
+  test._logger.info("\n=== test_http_client ===")
+
+  return test.run_tests({
+
 
 --- 运行所有测试
 function M.run()
