@@ -852,10 +852,8 @@ local function _file_exists(args, on_success, on_error)
     end
     return
   end
-
   local filepath = resolve_path(args.filepath)
 
-  local function on_exists(exists)
   local function on_exists(exists)
     if on_success then
       on_success({ filepath = filepath, exists = exists })
