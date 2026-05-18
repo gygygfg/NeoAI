@@ -92,9 +92,10 @@ function M.run(test_module)
       local ai = require("NeoAI.core.ai")
       assert.not_nil(ai.engine, "应导出 engine")
       assert.not_nil(ai.http_utils, "应导出 http_utils")
-      assert.not_nil(ai.request_adapter, "应导出 request_adapter")
+      assert.not_nil(ai.request_handler, "应导出 request_handler")
       assert.not_nil(ai.tool_cycle, "应导出 tool_cycle")
       assert.not_nil(ai.chat_service, "应导出 chat_service")
+      assert.not_nil(ai.sub_agent_engine, "应导出 sub_agent_engine")
     end,
 
     test_ai_init_initialize = function()
