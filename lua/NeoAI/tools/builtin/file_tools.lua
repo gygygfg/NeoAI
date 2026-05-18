@@ -4,129 +4,11 @@
 local M = {}
 
 local define_tool = require("NeoAI.tools.builtin.tool_helpers").define_tool
-
--- 复用 neovim_tree 的 block_node_types 进行节点过滤
-local neovim_tree_ok, neovim_tree = pcall(require, "NeoAI.tools.builtin.neovim_tree")
-local block_node_types = neovim_tree_ok and neovim_tree.block_node_types or {}
-
--- 复用 file_utils 模块
-local function get_file_utils()
-  local ok, fu = pcall(require, "NeoAI.utils.file_utils")
-  return ok and fu or nil
-end
-
--- 引用 tool_helpers 的路径解析函数
+local fu = require("NeoAI.utils.file_utils")
+local neovim_tree = require("NeoAI.tools.builtin.neovim_tree")
+local block_node_types = neovim_tree.block_node_types or {}
 local resolve_path = require("NeoAI.tools.builtin.tool_helpers").resolve_path
 
--- ============================================================================
--- vim.uv 异步 I/O 辅助函数（回调模式）
--- ============================================================================
-
-local function uv_read_file(filepath, on_success, on_error)
-  vim.uv.fs_open(filepath, "r", 438, function(open_err, fd)
-    if open_err or not fd then
-      if on_error then
-        on_error(open_err or "无法打开文件")
-      end
-      return
-    end
-    vim.uv.fs_fstat(fd, function(stat_err, stat)
-      if stat_err or not stat then
-        vim.uv.fs_close(fd)
-        if on_error then
-          on_error(stat_err or "无法获取文件信息")
-        end
-        return
-      end
-      vim.uv.fs_read(fd, stat.size, 0, function(read_err, data)
-        vim.uv.fs_close(fd)
-        if read_err or not data then
-          if on_error then
-            on_error(read_err or "无法读取文件")
-          end
-          return
-        end
-        if on_success then
-          on_success(data)
-        end
-      end)
-    end)
-  end)
-end
-
-local function uv_write_file(filepath, content, append, on_success, on_error)
-  local flags = append and "a" or "w"
-  vim.uv.fs_open(filepath, flags, 438, function(open_err, fd)
-    if open_err or not fd then
-      if on_error then
-        on_error(open_err or "无法打开文件")
-      end
-      return
-    end
-    vim.uv.fs_write(fd, content, 0, function(write_err, written)
-      vim.uv.fs_close(fd)
-      if write_err or not written then
-        if on_error then
-          on_error(write_err or "无法写入文件")
-        end
-        return
-      end
-      if on_success then
-        on_success(true)
-      end
-    end)
-  end)
-end
-
-local function uv_exists(filepath, on_success)
-  vim.uv.fs_stat(filepath, function(_, stat)
-    if on_success then
-      on_success(stat ~= nil)
-    end
-  end)
-end
-
-local function uv_delete_file(filepath, on_success, on_error)
-  vim.uv.fs_unlink(filepath, function(err)
-    if err then
-      if on_error then
-        on_error(err or "无法删除文件")
-      end
-      return
-    end
-    if on_success then
-      on_success(true)
-    end
-  end)
-end
-
-local function uv_mkdir_p(filepath, on_success, on_error)
-  local function mkdir_recursive(path)
-    vim.uv.fs_mkdir(path, 493, function(err)
-      if err then
-        if err == "EEXIST" then
-          if on_success then
-            on_success(true)
-          end
-          return
-        end
-        local parent = path:match("^(.*/)[^/]+$")
-        if parent and parent ~= path then
-          mkdir_recursive(parent)
-        else
-          if on_error then
-            on_error(err or "无法创建目录")
-          end
-        end
-      else
-        if on_success then
-          on_success(true)
-        end
-      end
-    end)
-  end
-  mkdir_recursive(filepath)
-end
 
 -- ============================================================================
 -- 工具 read_file
@@ -237,8 +119,6 @@ local function _read_file(args, on_success, on_error)
     return table.concat(overview_lines, "\n")
   end
 
-  local fu = get_file_utils()
-
   local function on_content(content)
     -- 使用 split 保留空行，确保行号与 wc -l 一致
     local all_lines = vim.split(content, "\n", { plain = true })
@@ -312,18 +192,13 @@ local function _read_file(args, on_success, on_error)
     end
   end
 
-  if fu then
-    local content, err = fu.read_file(filepath)
-    if content then
-      on_content(content)
-    else
-      on_read_err(err)
-    end
+  local content, err = fu.read_file(filepath)
+  if content then
+    on_content(content)
   else
-    uv_read_file(filepath, on_content, on_read_err)
+    on_read_err(err)
   end
 end
-
 M.read_file = define_tool({
   name = "read_file",
   description = "读取文件的指定行范围，返回带行号的结果",
@@ -372,10 +247,6 @@ local function _edit_file(args, on_success, on_error)
     return
   end
   local start_line = args.start_line
-  local end_line = args.end_line
-
-  local fu = get_file_utils()
-
   -- on_write_err 是 on_error 的别名，供内部闭包使用
   local on_write_err = on_error
 
@@ -383,10 +254,8 @@ local function _edit_file(args, on_success, on_error)
   local function on_write_ok()
     local result = { filepath = filepath, success = true }
 
-    -- 尝试通过 LSP 获取更改后文件的诊断信息
     local ok_lsp, lsp_mod = pcall(require, "NeoAI.tools.builtin.neovim_lsp")
     if ok_lsp and lsp_mod and lsp_mod.lsp_diagnostics and lsp_mod.lsp_diagnostics.func then
-      -- 重新加载/加载缓冲区以确保内容是最新的
       local abs_path = vim.fn.fnamemodify(filepath, ":p")
       local bufnr = vim.fn.bufnr(abs_path)
       if bufnr ~= -1 then
@@ -398,21 +267,18 @@ local function _edit_file(args, on_success, on_error)
         vim.fn.bufload(bufnr)
       end
 
-      -- 通过 LSP DiagnosticChanged 事件等待诊断（最多 10 秒）
       local max_wait = 10000
       local timeout_timer = vim.loop.new_timer()
       local debounce_timer = vim.loop.new_timer()
       local au_id = nil
       local finalized = false
 
-      -- 最终获取诊断并返回结果
       local function finalize()
         if finalized then
           return
         end
         finalized = true
 
-        -- 清理 autocmd 和计时器
         if au_id then
           pcall(vim.api.nvim_del_autocmd, au_id)
           au_id = nil
@@ -426,9 +292,7 @@ local function _edit_file(args, on_success, on_error)
           debounce_timer:close()
         end
 
-        -- 异步调用 _lsp_diagnostics，结果通过回调获取
         local ok_pcall, call_err = pcall(lsp_mod.lsp_diagnostics.func, { filepath = filepath }, function(diag_result)
-          -- 成功获取诊断
           if diag_result and not diag_result.error then
             result.diagnostics = diag_result.diagnostics or {}
             result.diagnostic_count = diag_result.diagnostic_count or 0
@@ -437,26 +301,22 @@ local function _edit_file(args, on_success, on_error)
             on_success(result)
           end
         end, function(err_msg)
-          -- 获取诊断失败，仍然返回写入结果（不含诊断）
           log_message("warn", "edit_file 诊断获取失败: " .. tostring(err_msg))
           if on_success then
             on_success(result)
           end
         end)
         if not ok_pcall then
-          -- pcall 本身的错误（如函数不存在等）
           if on_success then
             on_success(result)
           end
         end
       end
 
-      -- DiagnosticChanged 回调：收到诊断后 debounce 500ms，等待可能来自多个 LSP 源的后续诊断
       local function on_diag_changed(diag_args)
         if not diag_args or not diag_args.buf or diag_args.buf ~= bufnr then
           return
         end
-        -- 重置 debounce 计时器，每次新诊断到达都重新等待 500ms
         if debounce_timer then
           debounce_timer:stop()
           debounce_timer:start(
@@ -469,13 +329,11 @@ local function _edit_file(args, on_success, on_error)
         end
       end
 
-      -- 创建 DiagnosticChanged autocmd（仅监听目标 buffer）
       au_id = vim.api.nvim_create_autocmd("DiagnosticChanged", {
         buffer = bufnr,
         callback = on_diag_changed,
       })
 
-      -- 超时计时器（10 秒兜底）
       if timeout_timer then
         timeout_timer:start(
           max_wait,
@@ -486,7 +344,6 @@ local function _edit_file(args, on_success, on_error)
         )
       end
     else
-      -- LSP 不可用，直接返回写入结果
       if on_success then
         on_success(result)
       end
@@ -495,15 +352,11 @@ local function _edit_file(args, on_success, on_error)
 
   -- 直接写入内容到文件的函数
   local function write_content(content_to_write)
-    if fu then
-      local success, _ = fu.write_file(filepath, content_to_write, false)
-      if success == true then
-        on_write_ok()
-      else
-        on_write_err("写入失败")
-      end
+    local success, _ = fu.write_file(filepath, content_to_write, false)
+    if success == true then
+      on_write_ok()
     else
-      uv_write_file(filepath, content_to_write, false, on_write_ok, on_write_err)
+      on_write_err("写入失败")
     end
   end
 
@@ -511,34 +364,27 @@ local function _edit_file(args, on_success, on_error)
   local function check_exists_and_proceed()
     local function on_exists(exists)
       if not exists then
-        -- 文件不存在，直接创建并返回警告（不走 on_write_ok 路径，避免重复回调）
         local warning = string.format(
           "⚠️ 警告：文件 '%s' 不存在，已自动创建。\n"
             .. "请确认文件路径是否正确，或使用 create_directory 先创建目录。",
           filepath
         )
-        -- 直接写文件，不触发 on_write_ok/on_write_err
         local function write_and_return()
           if on_success then
             on_success({ filepath = filepath, success = true, warning = warning })
           end
         end
-        if fu then
-          local ok, _ = fu.write_file(filepath, content, false)
-          if ok then
-            write_and_return()
-          else
-            if on_error then
-              on_error("写入失败")
-            end
-          end
+        local ok, _ = fu.write_file(filepath, content, false)
+        if ok then
+          write_and_return()
         else
-          uv_write_file(filepath, content, false, write_and_return, on_error)
+          if on_error then
+            on_error("写入失败")
+          end
         end
         return
       end
-      -- 文件存在，继续原有逻辑
-      -- append=false 时必须提供 start_line 和 end_line
+
       if not append and (not start_line or not end_line) then
         if on_error then
           on_error("覆盖模式(append=false)必须提供 start_line 和 end_line 参数")
@@ -546,7 +392,6 @@ local function _edit_file(args, on_success, on_error)
         return
       end
 
-      -- 行范围替换模式：读取文件，替换指定行范围，再写回
       if start_line and end_line then
         local function do_range_replace(file_content)
           local lines = vim.split(file_content, "\n", { plain = true })
@@ -568,7 +413,6 @@ local function _edit_file(args, on_success, on_error)
             return
           end
 
-          -- 构建新内容：保留 start_line 之前的部分 + 新内容 + 保留 end_line 之后的部分
           local before = {}
           for i = 1, start_line - 1 do
             table.insert(before, lines[i])
@@ -587,60 +431,38 @@ local function _edit_file(args, on_success, on_error)
             table.insert(new_lines, table.concat(after, "\n"))
           end
           local new_content = table.concat(new_lines, "\n")
-          -- 如果原文件末尾有换行，保持
           if file_content:sub(-1) == "\n" then
             new_content = new_content .. "\n"
           end
 
-          if fu then
-            local success, _ = fu.write_file(filepath, new_content, false)
-            if success == true then
-              on_write_ok()
-            else
-              on_write_err("写入失败")
-            end
+          local success, _ = fu.write_file(filepath, new_content, false)
+          if success == true then
+            on_write_ok()
           else
-            uv_write_file(filepath, new_content, false, on_write_ok, on_write_err)
+            on_write_err("写入失败")
           end
         end
 
-        if fu then
-          local file_content, err = fu.read_file(filepath)
-          if file_content then
-            do_range_replace(file_content)
-          else
-            if on_error then
-              on_error(string.format("读取文件失败 %s: %s", filepath, err or "无法读取文件"))
-            end
-          end
+        local file_content, err = fu.read_file(filepath)
+        if file_content then
+          do_range_replace(file_content)
         else
-          uv_read_file(filepath, do_range_replace, function(err)
-            if on_error then
-              on_error(string.format("读取文件失败 %s: %s", filepath, err or "无法读取文件"))
-            end
-          end)
+          if on_error then
+            on_error(string.format("读取文件失败 %s: %s", filepath, err or "无法读取文件"))
+          end
         end
         return
       end
 
-      -- 普通写入模式（覆盖/追加）
-      if fu then
-        local success, _ = fu.write_file(filepath, content, append)
-        if success == true then
-          on_write_ok()
-        else
-          on_write_err("写入失败")
-        end
+      local success, _ = fu.write_file(filepath, content, append)
+      if success == true then
+        on_write_ok()
       else
-        uv_write_file(filepath, content, append, on_write_ok, on_write_err)
+        on_write_err("写入失败")
       end
     end
 
-    if fu then
-      on_exists(fu.exists(filepath))
-    else
-      uv_exists(filepath, on_exists)
-    end
+    on_exists(fu.exists(filepath))
   end
 
   check_exists_and_proceed()
@@ -1032,19 +854,15 @@ local function _file_exists(args, on_success, on_error)
   end
 
   local filepath = resolve_path(args.filepath)
-  local fu = get_file_utils()
 
+  local function on_exists(exists)
   local function on_exists(exists)
     if on_success then
       on_success({ filepath = filepath, exists = exists })
     end
   end
 
-  if fu then
-    on_exists(fu.exists(filepath))
-  else
-    uv_exists(filepath, on_exists)
-  end
+  on_exists(fu.exists(filepath))
 end
 
 M.file_exists = define_tool({
@@ -1081,7 +899,6 @@ local function _create_directory(args, on_success, on_error)
   end
 
   local filepath = resolve_path(args.filepath)
-  local fu = get_file_utils()
 
   local function on_created(ok)
     if ok then
@@ -1095,16 +912,8 @@ local function _create_directory(args, on_success, on_error)
     end
   end
 
-  if fu then
-    local success, _ = fu.mkdir(filepath)
-    on_created(success == true)
-  else
-    uv_mkdir_p(filepath, function()
-      on_created(true)
-    end, function()
-      on_created(false)
-    end)
-  end
+  local success, _ = fu.mkdir(filepath)
+  on_created(success == true)
 end
 
 M.create_directory = define_tool({
@@ -1142,7 +951,6 @@ local function _ensure_dir(args, on_success, on_error)
   end
 
   local filepath = resolve_path(args.filepath):gsub("/+$", "")
-  local fu = get_file_utils()
 
   local function on_ensured(ok)
     if ok then
@@ -1156,16 +964,8 @@ local function _ensure_dir(args, on_success, on_error)
     end
   end
 
-  if fu then
-    local success, _ = fu.mkdir(filepath)
-    on_ensured(success == true)
-  else
-    uv_mkdir_p(filepath, function()
-      on_ensured(true)
-    end, function()
-      on_ensured(false)
-    end)
-  end
+  local success, _ = fu.mkdir(filepath)
+  on_ensured(success == true)
 end
 
 M.ensure_dir = define_tool({
@@ -1204,24 +1004,45 @@ local function _delete_file(args, on_success, on_error)
 
   local filepath = resolve_path(args.filepath)
 
-  uv_exists(filepath, function(exists)
-    if not exists then
-      if on_error then
-        on_error(string.format("文件不存在: %s", filepath))
-      end
-      return
+  if not fu.exists(filepath) then
+    if on_error then
+      on_error(string.format("文件不存在: %s", filepath))
     end
-    uv_delete_file(filepath, function()
-      if on_success then
-        on_success({ filepath = filepath, success = true })
-      end
-    end, function(err)
-      if on_error then
-        on_error(string.format("删除文件失败 %s: %s", filepath, err or "无法删除文件"))
-      end
-    end)
-  end)
+    return
+  end
+
+  local ok, err = fu.delete_file(filepath)
+  if ok then
+    if on_success then
+      on_success({ filepath = filepath, success = true })
+    end
+  else
+    if on_error then
+      on_error(string.format("删除文件失败 %s: %s", filepath, err or "无法删除文件"))
+    end
+  end
 end
+
+M.delete_file = define_tool({
+  name = "delete_file",
+  description = "删除文件",
+  func = _delete_file,
+  async = true,
+  parameters = {
+    type = "object",
+    properties = {
+      filepath = { type = "string", description = "文件路径（必填）" },
+    },
+    required = { "filepath" },
+  },
+  returns = {
+    type = "object",
+    properties = { filepath = { type = "string" }, success = { type = "boolean" } },
+    description = "文件删除结果",
+  },
+  category = "file",
+  permissions = { write = true },
+})
 
 M.delete_file = define_tool({
   name = "delete_file",
