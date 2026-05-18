@@ -1821,27 +1821,26 @@ function M.stop_session(session_id)
 end
 
 -- ============================================================================
--- get_tools()
+-- 工具注册列表（供 tool_registry 合并）
+-- ============================================================================
+-- 工具注册列表（供 tool_registry 合并）
 -- ============================================================================
 
-function M.get_tools()
-  local tools = {}
-  -- 排除 send_input 和 check_shell_timeout，这两个工具不应暴露给 AI 直接调用
-  -- 由 tool_orchestrator 在需要时动态注入到工具列表中
-  local exclude = {
-    send_input = true,
-    check_shell_timeout = true,
-  }
-  for _, v in pairs(M) do
-    if type(v) == "table" and v.name and v.func and not exclude[v.name] then
-      table.insert(tools, v)
-    end
+M.tools = {}
+-- 排除 send_input 和 check_shell_timeout，这两个工具不应暴露给 AI 直接调用
+-- 由 tool_orchestrator 在需要时动态注入到工具列表中
+local exclude = {
+  send_input = true,
+  check_shell_timeout = true,
+}
+for _, v in pairs(M) do
+  if type(v) == "table" and v.name and v.func and not exclude[v.name] then
+    table.insert(M.tools, v)
   end
-  table.sort(tools, function(a, b)
-    return a.name < b.name
-  end)
-  return tools
 end
+table.sort(M.tools, function(a, b)
+  return a.name < b.name
+end)
 
 -- ============================================================================
 -- 测试函数
