@@ -108,7 +108,7 @@ local TYPE_CONSTRAINTS = {
     fields = {
       enabled = { type = "boolean" },
       builtin = { type = "boolean" },
-      external = { type = "table" },
+external = { type = "table", free_form = true },
       approval = {
         type = "table",
         fields = {

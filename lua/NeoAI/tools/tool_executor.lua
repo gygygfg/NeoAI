@@ -299,7 +299,7 @@ function M.execute_async(tool_name, args, on_success, on_error, on_progress)
   local pack_name = nil
   local tp_ok, tp = pcall(require, "NeoAI.tools.tool_pack")
   if tp_ok then
-    pack_name = tp.get_pack_for_tool(tool_name)
+    pack_name = tp.get_pack_for_tool(tool_name) or "_uncategorized"
   end
 
   -- ===== 工具审批检查 =====
