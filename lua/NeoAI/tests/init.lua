@@ -41,8 +41,9 @@ function M.run_all(...)
     "test_sub_agent", -- 子 agent 创建与管理测试
     "test_tree_connectors", -- 树形连接符生成测试（合并了 user_data 测试）
     "test_integration", -- 端到端集成测试：完整 setup、真实 HTTP 请求、工具循环、命令注册
+  }
+
   -- 如果传入了指定测试名称，只运行这些
-  local tests
   if select("#", ...) > 0 then
     tests = {}
     for i = 1, select("#", ...) do
