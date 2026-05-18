@@ -3,12 +3,10 @@
 -- 工具函数签名：func(args, on_success, on_error)
 local M = {}
 
-local define_tool = require("NeoAI.tools.builtin.tool_helpers").define_tool
 local fu = require("NeoAI.utils.file_utils")
 local neovim_tree = require("NeoAI.tools.builtin.neovim_tree")
 local block_node_types = neovim_tree.block_node_types or {}
 local resolve_path = require("NeoAI.tools.builtin.tool_helpers").resolve_path
-
 
 -- ============================================================================
 -- 工具 read_file
@@ -199,7 +197,7 @@ local function _read_file(args, on_success, on_error)
     on_read_err(err)
   end
 end
-M.read_file = define_tool({
+M.read_file = {
   name = "read_file",
   description = "读取文件的指定行范围，返回带行号的结果",
   func = _read_file,
@@ -216,7 +214,7 @@ M.read_file = define_tool({
   returns = { type = "string", description = "带行号的文件内容" },
   category = "file",
   permissions = { read = true },
-})
+}
 
 -- ============================================================================
 -- 工具 edit_file
@@ -483,7 +481,7 @@ local function _edit_file(args, on_success, on_error)
   check_exists_and_proceed()
 end
 
-M.edit_file = define_tool({
+M.edit_file = {
   name = "edit_file",
   description = "修改文件内容，修改某行到某行的内容，尽量减少对原文件的改动",
   func = _edit_file,
@@ -526,7 +524,7 @@ M.edit_file = define_tool({
   },
   category = "file",
   permissions = { write = true },
-})
+}
 
 -- ============================================================================
 -- 工具 list_files
@@ -686,7 +684,7 @@ local function _list_files(args, on_success, on_error)
   end
 end
 
-M.list_files = define_tool({
+M.list_files = {
   name = "list_files",
   description = "列出目录中的文件，支持模式匹配和递归查找",
   func = _list_files,
@@ -708,7 +706,7 @@ M.list_files = define_tool({
   returns = { type = "array", items = { type = "string" }, description = "文件路径列表" },
   category = "file",
   permissions = { read = true },
-})
+}
 
 -- ============================================================================
 -- 工具 search_files
@@ -823,7 +821,7 @@ local function _search_files(args, on_success, on_error)
   end
 end
 
-M.search_files = define_tool({
+M.search_files = {
   name = "search_files",
   description = "搜索文件内容，支持正则匹配和固定字符串匹配",
   func = _search_files,
@@ -854,7 +852,7 @@ M.search_files = define_tool({
   },
   category = "file",
   permissions = { read = true },
-})
+}
 
 -- ============================================================================
 -- 工具 file_exists
@@ -878,7 +876,7 @@ local function _file_exists(args, on_success, on_error)
   on_exists(fu.exists(filepath))
 end
 
-M.file_exists = define_tool({
+M.file_exists = {
   name = "file_exists",
   description = "检查文件或目录是否存在",
   func = _file_exists,
@@ -897,7 +895,7 @@ M.file_exists = define_tool({
   },
   category = "file",
   permissions = { read = true },
-})
+}
 
 -- ============================================================================
 -- 工具 create_directory
@@ -929,7 +927,7 @@ local function _create_directory(args, on_success, on_error)
   on_created(success == true)
 end
 
-M.create_directory = define_tool({
+M.create_directory = {
   name = "create_directory",
   description = "创建目录",
   func = _create_directory,
@@ -949,7 +947,7 @@ M.create_directory = define_tool({
   },
   category = "file",
   permissions = { write = true },
-})
+}
 
 -- ============================================================================
 -- 工具 ensure_dir
@@ -981,7 +979,7 @@ local function _ensure_dir(args, on_success, on_error)
   on_ensured(success == true)
 end
 
-M.ensure_dir = define_tool({
+M.ensure_dir = {
   name = "ensure_dir",
   description = "确保目录存在，如果不存在则创建",
   func = _ensure_dir,
@@ -1001,7 +999,7 @@ M.ensure_dir = define_tool({
   },
   category = "file",
   permissions = { write = true },
-})
+}
 
 -- ============================================================================
 -- 工具 delete_file
@@ -1036,9 +1034,7 @@ local function _delete_file(args, on_success, on_error)
   end
 end
 
-
-
-M.delete_file = define_tool({
+M.delete_file = {
   name = "delete_file",
   description = "删除文件",
   func = _delete_file,
@@ -1057,7 +1053,7 @@ M.delete_file = define_tool({
   },
   category = "file",
   permissions = { write = true },
-})
+}
 
 -- get_tools()
 function M.get_tools()

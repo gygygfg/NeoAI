@@ -78,7 +78,10 @@ local function async_load_to_buffer(path)
 
     local bufnr = vim.fn.bufadd(abs_path)
     if bufnr and bufnr > 0 then
-      vim.fn.bufload(bufnr)
+      -- 使用 noautocmd 避免触发 nvim-tree 等插件的 BufEnter 自动命令
+      vim.api.nvim_buf_call(bufnr, function()
+        vim.cmd('noautocmd bufload ' .. bufnr)
+      end)
     end
   end)
 end

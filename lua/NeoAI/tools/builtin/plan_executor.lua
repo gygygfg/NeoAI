@@ -16,7 +16,6 @@
 
 local M = {}
 
-local define_tool = require("NeoAI.tools.builtin.tool_helpers").define_tool
 local logger = require("NeoAI.utils.logger")
 
 -- ========== 子 agent 监控悬浮窗（延迟加载）
@@ -647,7 +646,7 @@ end
 
 -- ========== 工具注册 ==========
 
-M.create_sub_agent = define_tool({
+M.create_sub_agent = {
   name = "create_sub_agent",
   description = [[创建子 agent 来执行复杂任务。子 agent 拥有独立的工具调用循环，与主 agent 共享创建前的上下文。
 子 agent 适合处理以下场景：
@@ -734,9 +733,9 @@ M.create_sub_agent = define_tool({
   },
   category = "system",
   permissions = { execute = true },
-})
+}
 
-M.get_sub_agent_status = define_tool({
+M.get_sub_agent_status = {
   name = "get_sub_agent_status",
   description = [[获取子 agent 的执行状态和当前进度。
 - 传入 sub_agent_id：查询单个子 agent 的详细状态
@@ -800,9 +799,9 @@ M.get_sub_agent_status = define_tool({
   },
   category = "system",
   permissions = { execute = true },
-})
+}
 
-M.cancel_sub_agent = define_tool({
+M.cancel_sub_agent = {
   name = "cancel_sub_agent",
   description = "取消正在运行的子 agent。取消后子 agent 会立即停止执行，并生成执行总结。",
   func = _cancel_sub_agent,
@@ -833,7 +832,7 @@ M.cancel_sub_agent = define_tool({
   },
   category = "system",
   permissions = { execute = true },
-})
+}
 
 -- ========== 获取工具列表 ==========
 
@@ -860,19 +859,6 @@ function M.get_all_agents_data()
     return a.created_at > b.created_at
   end)
   return agents_list
-end
-
-function M.get_tools()
-  local tools = {}
-  for _, v in pairs(M) do
-    if type(v) == "table" and v.name and v.func then
-      table.insert(tools, v)
-    end
-  end
-  table.sort(tools, function(a, b)
-    return a.name < b.name
-  end)
-  return tools
 end
 
 -- ========== 测试辅助接口 ==========

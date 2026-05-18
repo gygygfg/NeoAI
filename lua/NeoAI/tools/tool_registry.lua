@@ -297,4 +297,66 @@ function M.update_config(new_config)
   state.config = vim.tbl_extend("force", state.config, new_config or {})
 end
 
+-- ========== 内置工具加载（统一入口） ==========
+
+local builtin_modules_loaded = false
+
+-- define_tool 用于统一包装工具定义，设置默认值
+local define_tool = require("NeoAI.tools.builtin.tool_helpers").define_tool
+
+--- 从模块表中提取所有工具定义
+--- 遍历模块表，找到所有包含 name 和 func 字段的表作为工具注册
+--- 使用 define_tool 统一包装（设置默认值、验证字段类型）
+--- @param mod table 模块表
+--- @return table[] 工具定义列表
+local function extract_tools_from_module(mod)
+  local result = {}
+  local excluded = mod._excluded_tools or {}  -- 模块可定义排除列表
+  for _, v in pairs(mod) do
+    if type(v) == "table" and v.name and v.func and not excluded[v.name] then
+      table.insert(result, define_tool(v))
+    end
+  end
+  table.sort(result, function(a, b)
+    return a.name < b.name
+  end)
+  return result
+end
+
+--- 加载所有 builtin 工具模块
+--- 直接遍历各模块返回的表，提取工具定义注册到注册表中
+function M.load_builtin_tools()
+  if builtin_modules_loaded then
+    return
+  end
+
+  local script_path = debug.getinfo(1).source:match("^@(.+)$")
+  if not script_path then builtin_modules_loaded = true; return end
+
+  local builtin_dir = script_path:match("^(.+/)lua/NeoAI/tools/tool_registry%.lua$")
+    and script_path:match("^(.+/)lua/NeoAI/tools/tool_registry%.lua$") .. "lua/NeoAI/tools/builtin"
+    or nil
+  if not builtin_dir then builtin_modules_loaded = true; return end
+
+  local handle = vim.loop.fs_scandir(builtin_dir)
+  if not handle then builtin_modules_loaded = true; return end
+
+  while true do
+    local name, file_type = vim.loop.fs_scandir_next(handle)
+    if not name then break end
+    if file_type == "file" and name:match("%.lua$") then
+      local mod_name = name:gsub("%.lua$", "")
+      local ok, mod = pcall(require, "NeoAI.tools.builtin." .. mod_name)
+      if ok and type(mod) == "table" then
+        local tools = extract_tools_from_module(mod)
+        for _, tool in ipairs(tools) do
+          M.register(tool)
+        end
+      end
+    end
+  end
+
+  builtin_modules_loaded = true
+end
+
 return M

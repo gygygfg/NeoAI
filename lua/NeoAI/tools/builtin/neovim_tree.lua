@@ -4,7 +4,6 @@
 -- 仅在 Neovim >= 0.5 且 Tree-sitter 可用时自动启用
 local M = {}
 
-local define_tool = require("NeoAI.tools.builtin.tool_helpers").define_tool
 local resolve_path = require("NeoAI.tools.builtin.tool_helpers").resolve_path
 local lm = require("NeoAI.utils.language_map")
 
@@ -71,6 +70,8 @@ local ext_to_parser = lm.ext_to_parser
 local ts_available = false
 ---@class vim.treesitter
 ---@field get_string_parser fun(source: string, lang: string): table
+---@field language table
+---@field query table
 local ts = nil
 
 local function check_ts()
@@ -505,7 +506,7 @@ local function _parse_file(args, on_success, on_error)
   end
 end
 
-M.parse_file = define_tool({
+M.parse_file = {
   name = "parse_file",
   description = "解析文件并返回 Tree-sitter 语法树节点信息，支持 filepath（单个文件路径）和 filepaths（路径列表）参数。",
   func = _parse_file,
@@ -532,7 +533,7 @@ M.parse_file = define_tool({
   },
   category = "treesitter",
   permissions = { read = true },
-})
+}
 
 -- ============================================================================
 -- 工具 query_tree - 使用查询模式捕获节点（回调模式）
@@ -644,7 +645,7 @@ local function _query_tree(args, on_success, on_error)
   end)
 end
 
-M.query_tree = define_tool({
+M.query_tree = {
   name = "query_tree",
   description = "使用 Tree-sitter 查询模式捕获文件中语法树节点，支持自定义查询字符串。",
   func = _query_tree,
@@ -663,7 +664,7 @@ M.query_tree = define_tool({
   },
   category = "treesitter",
   permissions = { read = true },
-})
+}
 
 -- ============================================================================
 -- 工具 get_node_at_position - 获取文件中指定位置的语法树节点（回调模式）
@@ -799,7 +800,7 @@ local function _get_node_at_position(args, on_success, on_error)
     end
   end)
 end
-M.get_node_at_position = define_tool({
+M.get_node_at_position = {
   name = "get_node_at_position",
   description = "获取文件中指定位置（行、列）的 Tree-sitter 语法树节点，包含父节点链和子节点信息。",
   func = _get_node_at_position,
@@ -819,7 +820,7 @@ M.get_node_at_position = define_tool({
   },
   category = "treesitter",
   permissions = { read = true },
-})
+}
 
 -- ============================================================================
 -- 辅助函数：在 parse_file_content_async 回调中处理过滤和响应
@@ -895,7 +896,7 @@ local function _get_node_type(args, on_success, on_error)
   end)
 end
 
-M.get_node_type = define_tool({
+M.get_node_type = {
   name = "get_node_type",
   description = "获取文件中匹配节点的类型信息，支持按 node_type、text、named 属性过滤。",
   func = _get_node_type,
@@ -913,7 +914,7 @@ M.get_node_type = define_tool({
   returns = { type = "object", description = "匹配节点的类型信息列表" },
   category = "treesitter",
   permissions = { read = true },
-})
+}
 
 -- ============================================================================
 -- 工具 get_node_range - 获取节点范围（回调模式）
@@ -1019,7 +1020,7 @@ local function _get_node_range(args, on_success, on_error)
   end)
 end
 
-M.get_node_range = define_tool({
+M.get_node_range = {
   name = "get_node_range",
   description = "获取文件中匹配节点的范围信息（返回: 起始行/列、结束行/列），支持按 node_type、text、named 属性过滤，可选返回带行号的节点代码。",
   func = _get_node_range,
@@ -1041,7 +1042,7 @@ M.get_node_range = define_tool({
   returns = { type = "object", description = "匹配节点的范围信息列表" },
   category = "treesitter",
   permissions = { read = true },
-})
+}
 
 -- ============================================================================
 -- 工具 is_named_node - 检查是否为命名节点（回调模式）
@@ -1068,7 +1069,7 @@ local function _is_named_node(args, on_success, on_error)
   end)
 end
 
-M.is_named_node = define_tool({
+M.is_named_node = {
   name = "is_named_node",
   description = "检查文件中匹配节点是否为命名节点，支持按 node_type、text 属性过滤。",
   func = _is_named_node,
@@ -1085,7 +1086,7 @@ M.is_named_node = define_tool({
   returns = { type = "object", description = "匹配节点的命名状态信息" },
   category = "treesitter",
   permissions = { read = true },
-})
+}
 
 -- ============================================================================
 -- 工具 get_parent_node - 获取父节点（回调模式）
@@ -1186,7 +1187,7 @@ local function _get_parent_node(args, on_success, on_error)
   end)
 end
 
-M.get_parent_node = define_tool({
+M.get_parent_node = {
   name = "get_parent_node",
   description = "获取文件中匹配节点的父节点信息，支持按 node_type、text、named 属性过滤目标节点。",
   func = _get_parent_node,
@@ -1204,7 +1205,7 @@ M.get_parent_node = define_tool({
   returns = { type = "object", description = "匹配节点的父节点信息" },
   category = "treesitter",
   permissions = { read = true },
-})
+}
 
 -- ============================================================================
 -- 工具 get_child_nodes - 获取子节点列表（回调模式）
@@ -1252,7 +1253,7 @@ local function _get_child_nodes(args, on_success, on_error)
   end)
 end
 
-M.get_child_nodes = define_tool({
+M.get_child_nodes = {
   name = "get_child_nodes",
   description = "获取文件中匹配节点的直接子节点列表，支持按 node_type、text、named 属性过滤父节点。",
   func = _get_child_nodes,
@@ -1270,7 +1271,7 @@ M.get_child_nodes = define_tool({
   returns = { type = "object", description = "匹配父节点的子节点列表" },
   category = "treesitter",
   permissions = { read = true },
-})
+}
 
 -- ============================================================================
 -- 工具 get_node_code - 获取指定节点的源代码（回调模式）
@@ -1348,7 +1349,7 @@ local function _get_node_code(args, on_success, on_error)
   end)
 end
 
-M.get_node_code = define_tool({
+M.get_node_code = {
   name = "get_node_code",
   description = "获取文件中匹配节点的精确源代码，返回纯文本代码。支持按 node_type、text、named 属性过滤。",
   func = _get_node_code,
@@ -1366,7 +1367,7 @@ M.get_node_code = define_tool({
   returns = { type = "object", description = "匹配节点的源代码（code 字段为纯文本）" },
   category = "treesitter",
   permissions = { read = true },
-})
+}
 
 -- ============================================================================
 -- 工具 delete_node - 删除指定节点（回调模式）
@@ -1494,61 +1495,64 @@ local function _delete_node(args, on_success, on_error)
       end
 
       -- 使用 Neovim API 直接修改文件缓冲区
+      -- 注意：此回调在 libuv fast event 上下文中，需用 vim.schedule 调用 Neovim API
       local abs_path = filepath
-      local bufnr = vim.fn.bufnr(abs_path)
-      local was_loaded = true
+      vim.schedule(function()
+        local bufnr = vim.fn.bufnr(abs_path)
+        local was_loaded = true
 
-      if bufnr == -1 then
-        -- 文件未打开，创建隐藏缓冲区并加载
-        bufnr = vim.fn.bufadd(abs_path)
-        if bufnr == 0 then
+        if bufnr == -1 then
+          -- 文件未打开，创建隐藏缓冲区并加载
+          bufnr = vim.fn.bufadd(abs_path)
+          if bufnr == 0 then
+            if on_error then
+              on_error("无法为文件创建缓冲区: " .. abs_path)
+            end
+            return
+          end
+          vim.fn.bufload(bufnr)
+          was_loaded = false
+        end
+
+        -- 用 nvim_buf_set_lines 替换缓冲区全部内容
+        vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, new_lines)
+
+        -- 写入磁盘
+        local save_ok, save_err = pcall(vim.api.nvim_buf_call, bufnr, function()
+          vim.cmd("write!")
+        end)
+
+        -- 清理临时加载的缓冲区（不留下隐藏缓冲区）
+        if not was_loaded and vim.api.nvim_buf_is_valid(bufnr) then
+          pcall(vim.api.nvim_buf_delete, bufnr, { force = true })
+        end
+
+        if not save_ok then
           if on_error then
-            on_error("无法为文件创建缓冲区: " .. abs_path)
+            on_error("保存文件失败: " .. tostring(save_err))
           end
           return
         end
-        vim.fn.bufload(bufnr)
-        was_loaded = false
-      end
 
-      -- 用 nvim_buf_set_lines 替换缓冲区全部内容
-      vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, new_lines)
-
-      -- 写入磁盘
-      local save_ok, save_err = pcall(vim.api.nvim_buf_call, bufnr, function()
-        vim.cmd("write!")
-      end)
-
-      -- 清理临时加载的缓冲区（不留下隐藏缓冲区）
-      if not was_loaded and vim.api.nvim_buf_is_valid(bufnr) then
-        pcall(vim.api.nvim_buf_delete, bufnr, { force = true })
-      end
-
-      if not save_ok then
-        if on_error then
-          on_error("保存文件失败: " .. tostring(save_err))
+        local ret = {
+          filepath = args.filepath,
+          language = result.language,
+          deleted_count = #deletions,
+          deletions = deletions,
+        }
+        if fallback then
+          ret.warning = "未找到指定 node_type '"
+            .. (args.node_type or "")
+            .. "' 的节点，已回退到同类型节点"
         end
-        return
-      end
-
-      local ret = {
-        filepath = args.filepath,
-        language = result.language,
-        deleted_count = #deletions,
-        deletions = deletions,
-      }
-      if fallback then
-        ret.warning = "未找到指定 node_type '"
-          .. (args.node_type or "")
-          .. "' 的节点，已回退到同类型节点"
-      end
-      if #skipped > 0 then
-        ret.skipped_types = skipped
-        ret.skipped_message = "以下节点类型不是代码块结构，已跳过: " .. table.concat(skipped, ", ")
-      end
-      if on_success then
-        on_success(ret)
-      end
+        if #skipped > 0 then
+          ret.skipped_types = skipped
+          ret.skipped_message = "以下节点类型不是代码块结构，已跳过: " .. table.concat(skipped, ", ")
+        end
+        if on_success then
+          on_success(ret)
+        end
+      end)
     end)
   end, function(err)
     if on_error then
@@ -1557,7 +1561,7 @@ local function _delete_node(args, on_success, on_error)
   end)
 end
 
-M.delete_node = define_tool({
+M.delete_node = {
   name = "delete_node",
   description = "删除文件中匹配的 Tree-sitter 语法树节点，支持按 node_type、text、named 属性过滤。删除后自动保存文件。",
   func = _delete_node,
@@ -1575,26 +1579,11 @@ M.delete_node = define_tool({
   returns = { type = "object", description = "删除结果，包含被删除的节点信息" },
   category = "treesitter",
   permissions = { write = true },
-})
+}
 -- 导出 parse_file_content_async 供 file_tools 等模块使用
 -- 用于在读取大文件时获取语法树结构概览
 function M.parse_file_content_async(filepath, max_depth, on_success, on_error)
   parse_file_content_async(filepath, max_depth, on_success, on_error)
-end
-
--- 工具注册列表（供 tool_registry 合并）
-
--- 工具注册列表（供 tool_registry 合并）
-M.tools = {}
-if check_ts() then
-  for _, v in pairs(M) do
-    if type(v) == "table" and v.name and v.func then
-      table.insert(M.tools, v)
-    end
-  end
-  table.sort(M.tools, function(a, b)
-    return a.name < b.name
-  end)
 end
 
 return M

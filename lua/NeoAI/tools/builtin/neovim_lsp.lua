@@ -4,7 +4,6 @@
 -- 仅在 Neovim >= 0.5 且 LSP 客户端可用时自动启用
 local M = {}
 
-local define_tool = require("NeoAI.tools.builtin.tool_helpers").define_tool
 local resolve_path = require("NeoAI.tools.builtin.tool_helpers").resolve_path
 local lm = require("NeoAI.utils.language_map")
 local lsp_utils = require("NeoAI.utils.lsp_utils")
@@ -1461,7 +1460,7 @@ local function _lsp_hover(args, on_success, on_error)
   end, true)
 end
 
-M.lsp_hover = define_tool({
+M.lsp_hover = {
   name = "lsp_hover",
   description = "获取文件中指定符号的 LSP 悬停信息（函数/变量说明文档），通过符号名称和可选的节点类型定位",
   func = _lsp_hover,
@@ -1481,7 +1480,7 @@ M.lsp_hover = define_tool({
   returns = { type = "object", description = "悬停信息，包含文档内容和位置范围" },
   category = "lsp",
   permissions = { read = true },
-})
+}
 
 -- ============================================================================
 -- 工具 lsp_definition - 跳转到定义（回调模式）
@@ -1592,7 +1591,7 @@ local function _lsp_definition(args, on_success, on_error)
   end, true)
 end
 
-M.lsp_definition = define_tool({
+M.lsp_definition = {
   name = "lsp_definition",
   description = "获取文件中指定符号的定义位置，通过符号名称和可选的节点类型定位，返回定义所在的文件和位置范围",
   func = _lsp_definition,
@@ -1612,7 +1611,7 @@ M.lsp_definition = define_tool({
   returns = { type = "object", description = "定义位置信息列表" },
   category = "lsp",
   permissions = { read = true },
-})
+}
 
 -- ============================================================================
 -- 工具 lsp_references - 查找所有引用
@@ -1716,7 +1715,7 @@ local function _lsp_references(args, on_success, on_error)
   end, true)
 end
 
-M.lsp_references = define_tool({
+M.lsp_references = {
   name = "lsp_references",
   description = "获取文件中指定符号的所有引用位置，通过符号名称和可选的节点类型定位，返回引用列表",
   func = _lsp_references,
@@ -1743,7 +1742,7 @@ M.lsp_references = define_tool({
   },
   category = "lsp",
   permissions = { read = true },
-})
+}
 
 -- ============================================================================
 -- 工具 lsp_implementation - 查看实现位置
@@ -1839,7 +1838,7 @@ local function _lsp_implementation(args, on_success, on_error)
   end, true)
 end
 
-M.lsp_implementation = define_tool({
+M.lsp_implementation = {
   name = "lsp_implementation",
   description = "获取文件中指定符号的实现位置，通过符号名称和可选的节点类型定位，返回实现所在的文件和位置范围",
   func = _lsp_implementation,
@@ -1862,7 +1861,7 @@ M.lsp_implementation = define_tool({
   },
   category = "lsp",
   permissions = { read = true },
-})
+}
 
 -- ============================================================================
 -- 工具 lsp_declaration - 查看声明位置
@@ -1958,7 +1957,7 @@ local function _lsp_declaration(args, on_success, on_error)
   end, true)
 end
 
-M.lsp_declaration = define_tool({
+M.lsp_declaration = {
   name = "lsp_declaration",
   description = "获取文件中指定符号的声明位置，通过符号名称和可选的节点类型定位，返回声明所在的文件和位置范围",
   func = _lsp_declaration,
@@ -1981,7 +1980,7 @@ M.lsp_declaration = define_tool({
   },
   category = "lsp",
   permissions = { read = true },
-})
+}
 -- ============================================================================
 -- 工具 lsp_document_symbols - 获取文档符号列表
 -- ============================================================================
@@ -2335,7 +2334,7 @@ local function _lsp_document_symbols(args, on_success, on_error, on_progress)
   end, true)
 end
 
-M.lsp_document_symbols = define_tool({
+M.lsp_document_symbols = {
   name = "lsp_document_symbols",
   description = "获取文件中所有符号（变量、函数、类等）的列表，返回符号名称、类型和位置范围",
   func = _lsp_document_symbols,
@@ -2353,7 +2352,7 @@ M.lsp_document_symbols = define_tool({
   },
   category = "lsp",
   permissions = { read = true },
-})
+}
 
 -- ============================================================================
 -- 工具 lsp_workspace_symbols - 搜索工作区符号
@@ -2459,7 +2458,7 @@ local function _lsp_workspace_symbols(args, on_success, on_error)
   end, true)
 end
 
-M.lsp_workspace_symbols = define_tool({
+M.lsp_workspace_symbols = {
   name = "lsp_workspace_symbols",
   description = "在工作区中搜索符号（函数、类、变量等），返回匹配的符号列表及其位置",
   func = _lsp_workspace_symbols,
@@ -2478,7 +2477,7 @@ M.lsp_workspace_symbols = define_tool({
   },
   category = "lsp",
   permissions = { read = true },
-})
+}
 
 -- ============================================================================
 -- 工具 lsp_code_action - 获取代码修复建议
@@ -2590,7 +2589,7 @@ local function _lsp_code_action(args, on_success, on_error)
   end, true)
 end
 
-M.lsp_code_action = define_tool({
+M.lsp_code_action = {
   name = "lsp_code_action",
   description = "获取文件中指定符号位置的 LSP 代码操作建议（如自动修复、重构等），通过符号名称定位，返回操作标题和类型列表。注意：通常仅在文件有诊断信息（错误/警告）的位置才会有代码操作建议，无诊断的位置可能返回空结果。",
   func = _lsp_code_action,
@@ -2619,7 +2618,7 @@ M.lsp_code_action = define_tool({
   },
   category = "lsp",
   permissions = { read = true },
-})
+}
 
 -- ============================================================================
 -- 工具 lsp_rename - 重命名符号
@@ -2715,7 +2714,7 @@ local function _lsp_rename(args, on_success, on_error)
   end, true)
 end
 
-M.lsp_rename = define_tool({
+M.lsp_rename = {
   name = "lsp_rename",
   description = "重命名文件中指定符号，通过符号名称定位，返回重命名影响的所有文件变更",
   func = _lsp_rename,
@@ -2736,7 +2735,7 @@ M.lsp_rename = define_tool({
   },
   category = "lsp",
   permissions = { write = true },
-})
+}
 
 -- ============================================================================
 -- 工具 lsp_format - 格式化代码
@@ -2951,7 +2950,7 @@ local function _lsp_format(args, on_success, on_error)
   end, true)
 end
 
-M.lsp_format = define_tool({
+M.lsp_format = {
   name = "lsp_format",
   description = "使用 LSP 格式化指定文件中的代码，支持设置缩进大小和空格/制表符偏好",
   func = _lsp_format,
@@ -2971,7 +2970,7 @@ M.lsp_format = define_tool({
   },
   category = "lsp",
   permissions = { write = true },
-})
+}
 -- ============================================================================
 -- 工具 lsp_diagnostics - 获取诊断信息
 -- ============================================================================
@@ -3036,7 +3035,7 @@ local function _lsp_diagnostics(args, on_success, on_error)
     end
   end)
 end
-M.lsp_diagnostics = define_tool({
+M.lsp_diagnostics = {
   name = "lsp_diagnostics",
   description = "获取文件中所有 LSP 诊断信息（错误、警告、提示等），支持按严重程度过滤",
   func = _lsp_diagnostics,
@@ -3058,7 +3057,7 @@ M.lsp_diagnostics = define_tool({
   },
   category = "lsp",
   permissions = { read = true },
-})
+}
 
 -- ============================================================================
 -- 工具 lsp_client_info - 获取 LSP 客户端信息
@@ -3280,7 +3279,7 @@ local function _lsp_client_info(args, on_success, on_error, on_progress)
   process_next_file()
 end
 
-M.lsp_client_info = define_tool({
+M.lsp_client_info = {
   name = "lsp_client_info",
   description = "获取指定文件或文件列表的 LSP 客户端信息，包括名称、根目录、支持的能力列表。必须提供 filepath（单个文件）或 filepaths（文件列表）参数。",
   func = _lsp_client_info,
@@ -3302,7 +3301,7 @@ M.lsp_client_info = define_tool({
   },
   category = "lsp",
   permissions = { read = true },
-})
+}
 
 -- send_signature_request 前向声明（实际定义在文件后面）
 local _send_signature_request
@@ -3677,7 +3676,7 @@ _send_signature_request = function(bufnr, args, cleanup, on_success, on_error, r
   end)
 end
 
-M.lsp_signature_help = define_tool({
+M.lsp_signature_help = {
   name = "lsp_signature_help",
   description = "获取文件中指定符号的 LSP 签名帮助信息（函数参数提示），通过符号名称定位，返回参数列表和文档。注意：符号名必须在函数调用位置（如 `foo(` 或 `obj.method(`），而非定义位置（如 `function foo()`），否则 LSP 无法返回签名信息。",
   func = _lsp_signature_help,
@@ -3697,7 +3696,7 @@ M.lsp_signature_help = define_tool({
   },
   category = "lsp",
   permissions = { read = true },
-})
+}
 
 -- ============================================================================
 -- 工具 lsp_completion - 获取补全建议
@@ -3805,7 +3804,7 @@ local function _lsp_completion(args, on_success, on_error)
   end, true)
 end
 
-M.lsp_completion = define_tool({
+M.lsp_completion = {
   name = "lsp_completion",
   description = "获取文件中指定符号位置的 LSP 补全建议列表，通过符号名称定位，返回补全项标签、类型、文档和插入文本",
   func = _lsp_completion,
@@ -3830,7 +3829,7 @@ M.lsp_completion = define_tool({
   },
   category = "lsp",
   permissions = { read = true },
-})
+}
 
 -- ============================================================================
 -- 工具 lsp_type_definition - 获取类型定义
@@ -3926,7 +3925,7 @@ local function _lsp_type_definition(args, on_success, on_error)
   end, true)
 end
 
-M.lsp_type_definition = define_tool({
+M.lsp_type_definition = {
   name = "lsp_type_definition",
   description = "获取文件中指定符号的类型定义位置，通过符号名称和可选的节点类型定位，返回类型定义所在的文件和位置范围",
   func = _lsp_type_definition,
@@ -3946,7 +3945,7 @@ M.lsp_type_definition = define_tool({
   },
   category = "lsp",
   permissions = { read = true },
-})
+}
 
 -- 刷新延迟清理队列：执行所有暂存的 cleanup 函数并清空队列
 -- 在工具循环结束时自动调用，也可由外部手动调用
@@ -4028,23 +4027,6 @@ local function _lsp_service_info(args, on_success, on_error, on_progress)
   end)
 end
 
-M.lsp_service_info = define_tool({
-  name = "lsp_service_info",
-  description = "获取当前 Neovim 的 LSP 服务信息，包括检测到的服务类型、Mason 已安装的服务器列表、当前活跃的正式 LSP 客户端列表",
-  func = _lsp_service_info,
-  async = true,
-  parameters = {
-    type = "object",
-    properties = {},
-  },
-  returns = {
-    type = "object",
-    description = "LSP 服务信息",
-  },
-  category = "lsp",
-  permissions = { read = true },
-})
-
 -- 导出初始化信息供外部使用
 function M.get_lsp_init_info()
   ensure_lsp_init()
@@ -4063,22 +4045,22 @@ end
 -- 模块加载时自动触发 Tree-sitter 解析器安装
 ensure_ts_parsers()
 
--- get_tools() - 返回所有工具列表供注册
-function M.get_tools()
-  if not check_lsp() then
-    return {}
-  end
-
-  local tools = {}
-  for _, v in pairs(M) do
-    if type(v) == "table" and v.name and v.func then
-      table.insert(tools, v)
-    end
-  end
-  table.sort(tools, function(a, b)
-    return a.name < b.name
-  end)
-  return tools
-end
+M.lsp_service_info = {
+  name = "lsp_service_info",
+  description = "获取当前 Neovim 的 LSP 服务信息，包括检测到的服务类型、Mason 已安装的服务器列表、当前活跃的正式 LSP 客户端列表",
+  func = _lsp_service_info,
+  async = true,
+  parameters = {
+    type = "object",
+    properties = {},
+  },
+  returns = {
+    type = "object",
+    description = "LSP 服务信息",
+  },
+  category = "lsp",
+  permissions = { read = true },
+}
 
 return M
+

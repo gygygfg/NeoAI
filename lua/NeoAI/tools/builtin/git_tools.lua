@@ -4,7 +4,6 @@
 
 local M = {}
 
-local define_tool = require("NeoAI.tools.builtin.tool_helpers").define_tool
 local resolve_path = require("NeoAI.tools.builtin.tool_helpers").resolve_path
 
 -- ============================================================================
@@ -876,7 +875,7 @@ local function _git_diff(args, on_success, on_error)
   end
 end
 
-M.git_diff = define_tool({
+M.git_diff = {
   name = "git_diff",
   description = "查看工作区文件的差异（diff），可指定文件或查看所有变更",
   func = _git_diff,
@@ -900,7 +899,7 @@ M.git_diff = define_tool({
   },
   category = "git",
   permissions = { read = true },
-})
+}
 
 -- ============================================================================
 -- 工具 git_log
@@ -925,7 +924,7 @@ local function _git_log(args, on_success, on_error)
   end
 end
 
-M.git_log = define_tool({
+M.git_log = {
   name = "git_log",
   description = "查看提交历史日志，显示最近的提交记录",
   func = _git_log,
@@ -950,7 +949,7 @@ M.git_log = define_tool({
   },
   category = "git",
   permissions = { read = true },
-})
+}
 
 -- ============================================================================
 -- 工具 git_status
@@ -968,7 +967,7 @@ local function _git_status(args, on_success, on_error)
   end
 end
 
-M.git_status = define_tool({
+M.git_status = {
   name = "git_status",
   description = "查看工作区状态，显示已修改、新增、删除的文件",
   func = _git_status,
@@ -988,7 +987,7 @@ M.git_status = define_tool({
   },
   category = "git",
   permissions = { read = true },
-})
+}
 
 -- ============================================================================
 -- 工具 git_commit_detail
@@ -1019,7 +1018,7 @@ local function _git_commit_detail(args, on_success, on_error)
   end
 end
 
-M.git_commit_detail = define_tool({
+M.git_commit_detail = {
   name = "git_commit_detail",
   description = "查看指定提交的详细信息，包括变更文件列表",
   func = _git_commit_detail,
@@ -1044,7 +1043,7 @@ M.git_commit_detail = define_tool({
   },
   category = "git",
   permissions = { read = true },
-})
+}
 
 -- ============================================================================
 -- 工具 git_rollback
@@ -1086,7 +1085,7 @@ local function _git_rollback(args, on_success, on_error)
   end
 end
 
-M.git_rollback = define_tool({
+M.git_rollback = {
   name = "git_rollback",
   description = "回滚到指定提交，可指定回滚单个文件或整个工作区",
   func = _git_rollback,
@@ -1115,7 +1114,7 @@ M.git_rollback = define_tool({
   },
   category = "git",
   permissions = { write = true },
-})
+}
 
 -- ============================================================================
 -- 工具 git_file_history
@@ -1137,7 +1136,7 @@ local function _git_file_history(args, on_success, on_error)
   end
 end
 
-M.git_file_history = define_tool({
+M.git_file_history = {
   name = "git_file_history",
   description = "查看指定文件的修改历史记录",
   func = _git_file_history,
@@ -1162,7 +1161,7 @@ M.git_file_history = define_tool({
   },
   category = "git",
   permissions = { read = true },
-})
+}
 
 -- ============================================================================
 local function _git_branch(args, on_success, on_error)
@@ -1200,7 +1199,7 @@ local function _git_branch(args, on_success, on_error)
   end
 end
 
-M.git_branch = define_tool({
+M.git_branch = {
   name = "git_branch",
   description = "查看所有分支列表（仅真实 git 模式可用）",
   func = _git_branch,
@@ -1220,7 +1219,7 @@ M.git_branch = define_tool({
   },
   category = "git",
   permissions = { read = true },
-})
+}
 
 -- ============================================================================
 -- 工具 git_auto_commit_config
@@ -1252,7 +1251,7 @@ local function _git_auto_commit_config(args, on_success, on_error)
   end
 end
 
-M.git_auto_commit_config = define_tool({
+M.git_auto_commit_config = {
   name = "git_auto_commit_config",
   description = "查看或配置自动提交功能的状态",
   func = _git_auto_commit_config,
@@ -1276,31 +1275,6 @@ M.git_auto_commit_config = define_tool({
   },
   category = "git",
   permissions = { read = true },
-})
-
+}
 -- ============================================================================
--- get_tools()
--- ============================================================================
-function M.get_tools()
-  -- 初始化时先检查 git 是否可用，不可用则不注册任何工具
-  if not state.initialized then
-    _git_auto_mod.initialize({})
-  end
-  if not state.git_available then
-    return {}
-  end
-
-  local tools = {}
-  for _, v in pairs(M) do
-    if type(v) == "table" and v.name and v.func then
-      table.insert(tools, v)
-    end
-  end
-  table.sort(tools, function(a, b)
-    return a.name < b.name
-  end)
-  return tools
-end
-
-
 return M

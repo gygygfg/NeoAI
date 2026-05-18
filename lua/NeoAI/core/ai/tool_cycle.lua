@@ -639,7 +639,24 @@ function M._execute_tools(session_id, tool_calls, is_sub_agent)
     },
   })
 
-  -- 所有工具并发执行（保持原有异步并发行为）
+  -- 第一步：预注册所有工具的 tool_call_id，防止同步工具在循环中立即完成
+  -- 时误判所有工具已执行完毕（竞态条件）
+  for _, tc in ipairs(tool_calls) do
+    local tool_func = tc["function"] or tc.func
+    if tool_func and tool_func.name then
+      local tid = tc.id
+      if not tid or tid == "" then
+        if not M._tool_call_counter then M._tool_call_counter = 0 end
+        M._tool_call_counter = M._tool_call_counter + 1
+        tid = "call_" .. os.time() .. "_" .. M._tool_call_counter .. "_" .. math.random(10000, 99999)
+        tc.id = tid
+      end
+      ss.active_tool_calls[tid] = true
+    end
+  end
+
+  -- 第二步：逐个执行工具（此时 active_tool_calls 中已有所有条目，
+  -- 同步工具完成时 remaining 不会为 0）
   for _, tc in ipairs(tool_calls) do
     M._execute_single_tool(session_id, tc, is_sub_agent)
   end
@@ -773,15 +790,18 @@ function M._execute_single_tool(session_id, tool_call, is_sub_agent)
     debug.traceback()
   )
 
-  -- 生成唯一 tool_call_id
-  if not M._tool_call_counter then
-    M._tool_call_counter = 0
-  end
-  M._tool_call_counter = M._tool_call_counter + 1
+  -- 生成唯一 tool_call_id（如果已在 _execute_tools 中预注册，则跳过）
   local tool_call_id = tool_call.id
-    or ("call_" .. os.time() .. "_" .. M._tool_call_counter .. "_" .. math.random(10000, 99999))
-  tool_call.id = tool_call_id
-  ss.active_tool_calls[tool_call_id] = true
+  if not tool_call_id or tool_call_id == "" then
+    if not M._tool_call_counter then M._tool_call_counter = 0 end
+    M._tool_call_counter = M._tool_call_counter + 1
+    tool_call_id = "call_" .. os.time() .. "_" .. M._tool_call_counter .. "_" .. math.random(10000, 99999)
+    tool_call.id = tool_call_id
+  end
+  -- 如果 _execute_tools 已预注册，不再重复添加
+  if not ss.active_tool_calls[tool_call_id] then
+    ss.active_tool_calls[tool_call_id] = true
+  end
 
   -- ===== 子 agent 工具调用边界审核 =====
   if is_sub_agent then

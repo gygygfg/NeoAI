@@ -72,8 +72,8 @@ function M.initialize()
     if file_type == "file" and name:match("%.lua$") then
       local mod_name = name:gsub("%.lua$", "")
       local ok, mod = pcall(require, "NeoAI.tools.builtin." .. mod_name)
-      if ok and type(mod) == "table" and mod.get_tools then
-        local tools = mod.get_tools()
+      if ok and type(mod) == "table" and mod.tools then
+        local tools = mod.tools
         for _, tool in ipairs(tools) do
           if tool.name and tool.func then
             local cat = tool.category or "uncategorized"

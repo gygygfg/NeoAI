@@ -3,7 +3,6 @@
 -- 在伪终端中启动shell，获取PID后通过exec替换进程，监控进程状态
 local M = {}
 
-local define_tool = require("NeoAI.tools.builtin.tool_helpers").define_tool
 local resolve_path = require("NeoAI.tools.builtin.tool_helpers").resolve_path
 
 -- ============================================================================
@@ -1474,7 +1473,7 @@ local function _run_command(args, on_success, on_error, on_progress)
   end
 end
 
-M.run_command = define_tool({
+M.run_command = {
   name = "run_command",
   description = "执行 shell 命令并返回完整的执行结果。使用伪终端自动处理交互式输入，通过进程 PID 监控状态，无需手动调用 send_input。支持超时时间设置和工作目录指定。",
   func = _run_command,
@@ -1535,7 +1534,7 @@ M.run_command = define_tool({
   },
   category = "system",
   permissions = { execute = true },
-})
+}
 
 -- ============================================================================
 -- 工具 send_input
@@ -1823,24 +1822,12 @@ end
 -- ============================================================================
 -- 工具注册列表（供 tool_registry 合并）
 -- ============================================================================
--- 工具注册列表（供 tool_registry 合并）
--- ============================================================================
-
-M.tools = {}
--- 排除 send_input 和 check_shell_timeout，这两个工具不应暴露给 AI 直接调用
--- 由 tool_orchestrator 在需要时动态注入到工具列表中
-local exclude = {
+-- 不应暴露给 AI 直接调用的工具名称列表
+-- 这些工具由 tool_orchestrator 在需要时动态注入
+M._excluded_tools = {
   send_input = true,
   check_shell_timeout = true,
 }
-for _, v in pairs(M) do
-  if type(v) == "table" and v.name and v.func and not exclude[v.name] then
-    table.insert(M.tools, v)
-  end
-end
-table.sort(M.tools, function(a, b)
-  return a.name < b.name
-end)
 
 -- ============================================================================
 -- 测试函数
