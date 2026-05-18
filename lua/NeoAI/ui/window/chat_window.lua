@@ -287,6 +287,7 @@ local function reset_tool_display()
   state.tool_display.streaming_preview.tools = {}
   state.tool_display.streaming_preview.window_shown = false
   state.tool_display.message_index = nil
+  tool_display_component.reset_folded_index()
 end
 
 local function close_reasoning_display()
@@ -2517,8 +2518,14 @@ function M._setup_event_listeners()
             if msg_idx ~= folded_idx then
               table.remove(state.messages, msg_idx)
             end
+            -- 刷新缓冲区显示：将更新后的 content 渲染到聊天窗口
+            -- 此时 state.streaming.message_index 可能已被 reset_streaming_state 清空
+            -- 使用 state.tool_display.message_index 作为备选
+            state.streaming.message_index = folded_idx
+            M._render_streaming_message(data.window_id)
           else
             state.messages[msg_idx].content = content_with_reasoning
+            M._render_streaming_message(data.window_id)
           end
         elseif has_tool_results then
           local folded = M._build_tool_folded_text(state.tool_display.results)
@@ -2535,6 +2542,9 @@ function M._setup_event_listeners()
             local folded_str = _content_to_str(state.messages[folded_idx].content)
             local append_str = _content_to_str(append_content)
             state.messages[folded_idx].content = folded_str .. "\n\n" .. append_str
+            -- 刷新缓冲区显示
+            state.streaming.message_index = folded_idx
+            M._render_streaming_message(data.window_id)
           else
             table.insert(
               state.messages,
@@ -2546,6 +2556,9 @@ function M._setup_event_listeners()
           local append_str = _content_to_str(content_with_reasoning)
           local final = (folded ~= "" and folded .. "\n\n" or "") .. append_str
           table.insert(state.messages, { role = "assistant", content = final, timestamp = os.time() })
+          -- 触发渲染显示新消息
+          state.streaming.message_index = #state.messages
+          M._render_streaming_message(data.window_id)
         else
           local placeholder_idx = find_placeholder_idx()
           if placeholder_idx then
@@ -3051,6 +3064,8 @@ function M._setup_event_listeners()
       state.tool_display._body_cache = ""
       state.tool_display._finished = false
       state.tool_display.folded_saved = false
+      -- 重置增量折叠索引，新的一轮工具循环从零开始
+      tool_display_component.reset_folded_index()
       state.tool_display.packs = tool_display_component.get_packs()
       state.tool_display.pack_order = tool_display_component.get_pack_order()
       state.tool_display.substeps = {}
@@ -3113,18 +3128,14 @@ function M._setup_event_listeners()
       table.insert(state.tool_display.results, result_entry)
       tool_display_component.add_result(result_entry)
 
-      -- 立即生成当前所有已完成工具的折叠文本，合并到流式消息中
-      -- 优先使用 state.streaming.message_index（第一轮工具循环，流式状态未清空）
-      -- 其次使用 state.tool_display.message_index（后续轮次，TOOL_LOOP_STARTED 已保存）
+      -- 增量追加新完成的工具折叠文本到流式消息中
       local mi = state.streaming.message_index or state.tool_display.message_index
       if mi and state.messages[mi] then
-        local folded_text = tool_display_component.build_folded_text()
-        if folded_text ~= "" then
+        local new_folded_text = tool_display_component.build_folded_text()
+        if new_folded_text ~= "" then
           local current_content = state.messages[mi].content or ""
           local reasoning_text = ""
-          -- 使用 _body_cache 作为正文内容，避免从 content 中提取导致折叠文本重复
           local body_text = state.tool_display._body_cache or ""
-          -- current_content 可能是 table（含 reasoning_content 和 content 字段）或 JSON 字符串
           if type(current_content) == "table" then
             reasoning_text = current_content.reasoning_content or ""
           else
@@ -3133,14 +3144,38 @@ function M._setup_event_listeners()
               reasoning_text = parsed.reasoning_content
             end
           end
+          -- 从已有内容中提取已有的折叠文本
+          local existing_folded = ""
+          if type(current_content) == "table" then
+            existing_folded = current_content.content or ""
+          elseif type(current_content) == "string" then
+            existing_folded = current_content
+          end
+          local existing_body = body_text
+          if existing_folded ~= "" then
+            local last_fold_end = existing_folded:match(".*()}}}")
+            if last_fold_end then
+              local after_fold = existing_folded:sub(last_fold_end + 3)
+              if after_fold:match("^\n\n") then
+                existing_body = after_fold:sub(3)
+              end
+            end
+          end
+          -- 合并：已有折叠文本 + 新折叠文本 + 正文
+          local combined_folded = existing_folded
+          if combined_folded ~= "" and new_folded_text ~= "" then
+            combined_folded = combined_folded .. "\n" .. new_folded_text
+          elseif combined_folded == "" then
+            combined_folded = new_folded_text
+          end
           local new_content
           if reasoning_text ~= "" then
             new_content = {
               reasoning_content = reasoning_text,
-              content = folded_text .. "\n\n" .. body_text,
+              content = combined_folded .. "\n\n" .. existing_body,
             }
           else
-            new_content = folded_text .. "\n\n" .. body_text
+            new_content = combined_folded .. "\n\n" .. existing_body
           end
           state.messages[mi].content = new_content
           state.tool_display.folded_saved = true
@@ -3224,19 +3259,16 @@ function M._setup_event_listeners()
       table.insert(state.tool_display.results, result_entry)
       tool_display_component.add_result(result_entry)
 
-      -- 立即生成当前所有已完成工具的折叠文本，合并到流式消息中
-      -- 优先使用 state.streaming.message_index（第一轮工具循环，流式状态未清空）
-      -- 其次使用 state.tool_display.message_index（后续轮次，TOOL_LOOP_STARTED 已保存）
+      -- 增量追加新完成的工具折叠文本到流式消息中
+      -- 使用 build_folded_text 的增量模式，只返回新增的工具结果
+      -- 避免每次重新生成全部折叠文本导致渲染闪烁
       local mi = state.streaming.message_index or state.tool_display.message_index
       if mi and state.messages[mi] then
-        local folded_text = tool_display_component.build_folded_text()
-        if folded_text ~= "" then
+        local new_folded_text = tool_display_component.build_folded_text()
+        if new_folded_text ~= "" then
           -- 获取当前消息的原始内容（可能包含 reasoning_content）
           local current_content = state.messages[mi].content or ""
           local reasoning_text = ""
-          -- 使用 _body_cache 作为正文内容，避免从 content 中提取导致折叠文本重复
-          -- _body_cache 在 TOOL_LOOP_STARTED 时初始化为 ""，在工具执行阶段保持不变
-          -- 只有 AI 回复内容（非折叠文本）应该作为 body 内容
           local body_text = state.tool_display._body_cache or ""
           -- current_content 可能是 table（含 reasoning_content 和 content 字段）或 JSON 字符串
           if type(current_content) == "table" then
@@ -3247,15 +3279,41 @@ function M._setup_event_listeners()
               reasoning_text = parsed.reasoning_content
             end
           end
-          -- 将折叠文本插入到 reasoning 和 body 之间
+          -- 构建新内容：增量追加新折叠文本到已有折叠文本之后
+          local existing_folded = ""
+          if type(current_content) == "table" then
+            existing_folded = current_content.content or ""
+          elseif type(current_content) == "string" then
+            existing_folded = current_content
+          end
+          -- 从 existing_folded 中分离已有的折叠文本和正文
+          -- 正文在折叠文本之后，以 \n\n 分隔
+          local existing_body = body_text
+          if existing_folded ~= "" then
+            -- 查找最后一个折叠标记 }}} 的位置
+            local last_fold_end = existing_folded:match(".*()}}}")
+            if last_fold_end then
+              local after_fold = existing_folded:sub(last_fold_end + 3)
+              if after_fold:match("^\n\n") then
+                existing_body = after_fold:sub(3)
+              end
+            end
+          end
+          -- 合并：已有折叠文本 + 新折叠文本 + 正文
+          local combined_folded = existing_folded
+          if combined_folded ~= "" and new_folded_text ~= "" then
+            combined_folded = combined_folded .. "\n" .. new_folded_text
+          elseif combined_folded == "" then
+            combined_folded = new_folded_text
+          end
           local new_content
           if reasoning_text ~= "" then
             new_content = {
               reasoning_content = reasoning_text,
-              content = folded_text .. "\n\n" .. body_text,
+              content = combined_folded .. "\n\n" .. existing_body,
             }
           else
-            new_content = folded_text .. "\n\n" .. body_text
+            new_content = combined_folded .. "\n\n" .. existing_body
           end
           state.messages[mi].content = new_content
           state.tool_display.folded_saved = true
@@ -3961,7 +4019,7 @@ end
 --- @param results table 工具调用结果列表
 --- @return string 折叠文本格式的字符串
 function M._build_tool_folded_text(results)
-  return tool_display_component.build_folded_text()
+  return tool_display_component.build_all_folded_text()
 end
 
 --- 获取当前使用的模型标签

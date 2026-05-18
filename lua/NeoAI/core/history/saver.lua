@@ -23,6 +23,9 @@ local state = {
   _save_in_progress = {}, -- { [session_id] = true }
   _flush_timer = nil,     -- 批量刷新定时器
   _autocmd_ids = {},
+  -- 标记已通过 HISTORY_SAVE_FINAL 保存含折叠文本的会话
+  -- 用于 on_generation_completed 跳过重复保存
+  _folded_saved_sessions = {}, -- { [session_id] = true }
 }
 
 -- ========== 内部：写入队列 ==========
@@ -203,8 +206,15 @@ local function on_generation_completed(data)
       elseif type(last_entry) == "string" then
         last_content = last_entry
       end
-      if type(last_content) == "string" and last_content:match("^{{{") then
+  if type(last_content) == "string" and last_content:match("^{{{") then
         -- 最后一条内容已包含折叠文本，只更新 usage，不覆盖内容
+        hm.update_usage(session_id, usage)
+        return true
+      end
+      -- 检查内存标记：HISTORY_SAVE_FINAL 已保存含折叠文本的内容
+      -- 使用内存标记避免异步队列竞态（session.assistant 可能还未更新）
+      if state._folded_saved_sessions[session_id] then
+        state._folded_saved_sessions[session_id] = nil
         hm.update_usage(session_id, usage)
         return true
       end
@@ -221,6 +231,8 @@ local function on_generation_completed(data)
       assistant_entry = { content = response }
     end
 
+    -- 设置内存标记，防止 on_generation_completed 重复保存
+    state._folded_saved_sessions[session_id] = true
     -- 更新最后一条 assistant 条目（流式过程中已通过 update_last_assistant 创建）
     hm.update_last_assistant(session_id, assistant_entry)
     hm.update_usage(session_id, usage)

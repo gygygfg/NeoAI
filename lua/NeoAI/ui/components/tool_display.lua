@@ -746,54 +746,78 @@ function M._rebuild_buffer()
   state.buffer = text
 end
 
---- 构建折叠文本
+--- 为单个工具结果构建折叠文本块
+local function _build_single_tool_folded_block(r)
+  local pn = r.pack_name or "_uncategorized"
+  local pack_icon = tool_pack.get_pack_icon(pn)
+  local pack_name = tool_pack.get_pack_display_name(pn)
+  local duration_str = r.duration and string.format(" (%.1fs)", r.duration) or ""
+  local args_str = _format_table_for_fold(r.arguments or {})
+  args_str = args_str:gsub("}}}", "} } }"):gsub("{{{", "{ { {")
+  args_str = args_str:gsub("\n", "\n    ")
+  local result_raw = r.result
+  local result_str = ""
+  if type(result_raw) == "table" then
+    result_str = _format_table_for_fold(result_raw)
+  else
+    result_str = tostring(result_raw or "")
+    local json_ok, json_val = pcall(vim.json.decode, result_str)
+    if json_ok and type(json_val) == "table" then result_str = _format_table_for_fold(json_val) end
+  end
+  result_str = result_str:gsub("\\r\\n", "\n"):gsub("\\r", "\n")
+  result_str = _truncate_content_for_fold(result_str, 200)
+  local has_warning = false
+  for line in result_str:gmatch("[^\n]+") do
+    if line:match("^⚠️%s*警告：") then has_warning = true; break end
+  end
+  local icon = r.is_error and "❌" or (has_warning and "⚠️" or "✅")
+  result_str = result_str:gsub("}}}", "} } }"):gsub("{{{", "{ { {")
+  result_str = result_str:gsub("\n", "\n    ")
+
+  local display_tool_name = (r.tool_name and r.tool_name ~= "") and r.tool_name or "工具"
+  return "{{{ " .. pack_icon .. " " .. pack_name .. " - " .. icon .. " " .. display_tool_name .. duration_str
+    .. "\n    参数: " .. args_str .. "\n    结果: " .. result_str .. "\n}}}"
+end
+
+--- 构建折叠文本（增量模式）
+--- 只返回自上次调用以来新增的工具结果折叠文本
+--- 避免每次重新生成全部内容导致渲染闪烁
 function M.build_folded_text()
   local results = state.results or {}
   if #results == 0 then return "" end
 
-  local pack_results = {}
-  local pack_order = {}
-  for _, r in ipairs(results) do
-    local pn = r.pack_name or "_uncategorized"
-    if not pack_results[pn] then pack_results[pn] = {}; table.insert(pack_order, pn) end
-    table.insert(pack_results[pn], r)
+  -- 记录上次已处理的索引，实现增量追加
+  local last_idx = state._last_built_index or 0
+  if #results <= last_idx then
+    return ""
   end
-  table.sort(pack_order, function(a, b) return tool_pack.get_pack_order(a) < tool_pack.get_pack_order(b) end)
 
   local blocks = {}
-  for _, pn in ipairs(pack_order) do
-    local pack_tools = pack_results[pn]
-    local pack_icon = tool_pack.get_pack_icon(pn)
-    local pack_name = tool_pack.get_pack_display_name(pn)
-    for _, r in ipairs(pack_tools) do
-      local duration_str = r.duration and string.format(" (%.1fs)", r.duration) or ""
-      local args_str = _format_table_for_fold(r.arguments or {})
-      args_str = args_str:gsub("}}}", "} } }"):gsub("{{{", "{ { {")
-      args_str = args_str:gsub("\n", "\n    ")
-      local result_raw = r.result
-      local result_str = ""
-      if type(result_raw) == "table" then
-        result_str = _format_table_for_fold(result_raw)
-      else
-        result_str = tostring(result_raw or "")
-        local json_ok, json_val = pcall(vim.json.decode, result_str)
-        if json_ok and type(json_val) == "table" then result_str = _format_table_for_fold(json_val) end
-      end
-      result_str = result_str:gsub("\\r\\n", "\n"):gsub("\\r", "\n")
-      result_str = _truncate_content_for_fold(result_str, 200)
-      local has_warning = false
-      for line in result_str:gmatch("[^\n]+") do
-        if line:match("^⚠️%s*警告：") then has_warning = true; break end
-      end
-      local icon = r.is_error and "❌" or (has_warning and "⚠️" or "✅")
-      result_str = result_str:gsub("}}}", "} } }"):gsub("{{{", "{ { {")
-      result_str = result_str:gsub("\n", "\n    ")
+  for i = last_idx + 1, #results do
+    local r = results[i]
+    local block = _build_single_tool_folded_block(r)
+    table.insert(blocks, block)
+  end
+  state._last_built_index = #results
 
-      local display_tool_name = (r.tool_name and r.tool_name ~= "") and r.tool_name or "工具"
-      local block = "{{{ " .. pack_icon .. " " .. pack_name .. " - " .. icon .. " " .. display_tool_name .. duration_str
-        .. "\n    参数: " .. args_str .. "\n    结果: " .. result_str .. "\n}}}"
-      table.insert(blocks, block)
-    end
+  return table.concat(blocks, "\n")
+end
+
+--- 重置增量构建索引（在工具循环开始时调用）
+function M.reset_folded_index()
+  state._last_built_index = 0
+end
+
+--- 构建全部折叠文本（全量模式）
+--- 在 GENERATION_COMPLETED 中使用，确保所有工具结果都被包含
+function M.build_all_folded_text()
+  local results = state.results or {}
+  if #results == 0 then return "" end
+
+  local blocks = {}
+  for _, r in ipairs(results) do
+    local block = _build_single_tool_folded_block(r)
+    table.insert(blocks, block)
   end
   return table.concat(blocks, "\n")
 end
