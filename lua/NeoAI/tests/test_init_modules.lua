@@ -364,7 +364,8 @@ function M.run(test_module)
       local config = as.get_global_config()
       assert.not_nil(config, "get_global_config 应返回配置表")
     end,
-
+  })
+end
 
 -- 直接运行（仅在非 run_all 模式下）
 if not _G._NEOAI_TEST_RUNNING and pcall(vim.api.nvim_buf_get_name, 0) then
