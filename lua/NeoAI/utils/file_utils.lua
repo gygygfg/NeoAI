@@ -661,4 +661,159 @@ function M.create_directory(dir)
   return M.mkdir(dir)
 end
 
+-- ========== 异步 I/O API (基于 vim.uv / libuv) ==========
+
+--- 异步读取文件内容
+--- @param filepath string 文件路径
+--- @param on_success function(data) 成功回调
+--- @param on_error function(errmsg)|nil 错误回调（可选）
+function M.read_file_async(filepath, on_success, on_error)
+  if not filepath then
+    if on_error then on_error("文件路径不能为空") end
+    return
+  end
+  filepath = M.abs_path(filepath)
+  local uv = vim.uv or vim.loop
+  uv.fs_open(filepath, "r", 438, function(err, fd)
+    if err then
+      if on_error then on_error("打开文件失败: " .. err) end
+      return
+    end
+    uv.fs_fstat(fd, function(fstat_err, stat)
+      if fstat_err then
+        uv.fs_close(fd, function() end)
+        if on_error then on_error("获取文件信息失败: " .. fstat_err) end
+        return
+      end
+      local size = stat.size
+      uv.fs_read(fd, size, 0, function(read_err, data)
+        uv.fs_close(fd, function() end)
+        if read_err then
+          if on_error then on_error("读取文件失败: " .. read_err) end
+          return
+        end
+        if on_success then on_success(data) end
+      end)
+    end)
+  end)
+end
+
+--- 异步写入文件（自动创建父目录）
+--- @param filepath string 文件路径
+--- @param data string 数据
+--- @param on_success function() 成功回调
+--- @param on_error function(errmsg)|nil 错误回调（可选）
+function M.write_file_async(filepath, data, on_success, on_error)
+  if not filepath then
+    if on_error then on_error("文件路径不能为空") end
+    return
+  end
+  filepath = M.abs_path(filepath)
+  local uv = vim.uv or vim.loop
+  -- 先确保父目录存在
+  local parent_dir = vim.fn.fnamemodify(filepath, ":h")
+  M.mkdir_async(parent_dir, function()
+    uv.fs_open(filepath, "w", 438, function(err, fd)
+      if err then
+        if on_error then on_error("打开文件失败: " .. err) end
+        return
+      end
+      uv.fs_write(fd, data, 0, function(write_err, _)
+        uv.fs_close(fd, function() end)
+        if write_err then
+          if on_error then on_error("写入文件失败: " .. write_err) end
+          return
+        end
+        if on_success then on_success() end
+      end)
+    end)
+  end, on_error)
+end
+
+--- 异步检查文件或目录是否存在
+--- @param path string 路径
+--- @param callback function(exists) 回调
+function M.exists_async(path, callback)
+  if not path or not callback then return end
+  local uv = vim.uv or vim.loop
+  uv.fs_stat(path, function(err, stat)
+    if err or not stat then
+      callback(false)
+    else
+      callback(true)
+    end
+  end)
+end
+
+--- 异步删除文件
+--- @param filepath string 文件路径
+--- @param on_success function() 成功回调
+--- @param on_error function(errmsg)|nil 错误回调（可选）
+function M.delete_file_async(filepath, on_success, on_error)
+  if not filepath then
+    if on_error then on_error("文件路径不能为空") end
+    return
+  end
+  filepath = M.abs_path(filepath)
+  local uv = vim.uv or vim.loop
+  uv.fs_unlink(filepath, function(err)
+    if err then
+      if on_error then on_error("删除文件失败: " .. err) end
+      return
+    end
+    if on_success then on_success() end
+  end)
+end
+
+--- 异步递归创建目录
+--- @param dirpath string 目录路径
+--- @param on_success function() 成功回调
+--- @param on_error function(errmsg)|nil 错误回调（可选）
+function M.mkdir_async(dirpath, on_success, on_error)
+  if not dirpath or dirpath == "" then
+    if on_success then on_success() end
+    return
+  end
+  dirpath = M.abs_path(dirpath)
+  local uv = vim.uv or vim.loop
+
+  local function mkdir_recursive(current)
+    uv.fs_stat(current, function(stat_err, stat)
+      if stat_err then
+        -- 当前路径不存在：先创建父目录
+        local parent = vim.fn.fnamemodify(current, ":h")
+        if parent == current then
+          -- 根目录，无法继续
+          if on_error then on_error("无法创建根目录: " .. current) end
+          return
+        end
+        mkdir_recursive(parent)
+        -- 父目录创建完成后创建当前目录
+        uv.fs_mkdir(current, 493, function(mkdir_err)
+          if mkdir_err then
+            -- 忽略 EEXIST（并发安全）
+            if not mkdir_err:find("exist") then
+              if on_error then on_error("创建目录失败: " .. mkdir_err) end
+              return
+            end
+          end
+          if on_success and current == dirpath then
+            on_success()
+          end
+        end)
+      elseif stat and stat.type == "directory" then
+        -- 目录已存在
+        if current == dirpath and on_success then
+          on_success()
+        end
+      else
+        if on_error then on_error("路径已存在但不是目录: " .. current) end
+      end
+    end)
+  end
+
+  mkdir_recursive(dirpath)
+end
+
 return M
+

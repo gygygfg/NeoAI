@@ -45,7 +45,12 @@ local state = {
 --- @param cwd string|nil 自定义工作目录
 --- @return string, string|nil 解析后的 git 根目录，错误信息
 function _git_auto_mod._resolve_git_root(cwd)
+  local home = vim.fn.expand("~")
   if cwd then
+    -- 跳过家目录，避免在 ~ 目录下执行 git 操作
+    if cwd == home then
+      return cwd, "家目录不是 git 仓库"
+    end
     -- 检查 cwd 是否是 git 仓库
     local root = vim.fn.system("git -C " .. cwd .. " rev-parse --show-toplevel 2>/dev/null"):gsub("%s+$", "")
     if vim.v.shell_error == 0 and root ~= "" then
@@ -58,9 +63,17 @@ function _git_auto_mod._resolve_git_root(cwd)
   end
   return state.git_root, nil
 end
-
 --- 检测 git 是否可用（使用 git status 检查，同时验证是否在 git 仓库中）
 function _git_auto_mod._check_git()
+  -- 跳过家目录，避免在 ~ 目录下执行 git 操作（如 ~/ 下有 .git 会扫描大量文件）
+  local home = vim.fn.expand("~")
+  local cwd = vim.fn.getcwd()
+  if cwd == home then
+    state.git_available = false
+    state.git_root = nil
+    return false
+  end
+
   local ok = pcall(vim.fn.system, "git status 2>/dev/null")
   if vim.v.shell_error == 0 then
     state.git_available = true
@@ -77,6 +90,7 @@ function _git_auto_mod._check_git()
   state.git_root = vim.fn.getcwd()
   return false
 end
+
 
 --- 初始化伪 Git 模式
 function _git_auto_mod._init_pseudo()
@@ -663,8 +677,6 @@ function _git_auto_mod._register_listeners()
   table.insert(state.listeners, { group = group, id = id })
 end
 
--- ========== 初始化 ==========
-
 function _git_auto_mod.initialize(config)
   if state.initialized then
     return
@@ -676,8 +688,15 @@ function _git_auto_mod.initialize(config)
   -- 检测 git 环境
   local has_git = _git_auto_mod._check_git()
   if not has_git then
-    logger.info("[git_auto] git 不可用，启用伪 Git 模式")
-    _git_auto_mod._init_pseudo()
+    -- 判断是否因为家目录而跳过了 git 检测
+    local home = vim.fn.expand("~")
+    local cwd = vim.fn.getcwd()
+    if cwd == home then
+      logger.info("[git_auto] 当前目录为家目录(%s)，跳过 git 初始化", home)
+    else
+      logger.info("[git_auto] git 不可用，启用伪 Git 模式")
+      _git_auto_mod._init_pseudo()
+    end
   else
     logger.info("[git_auto] git 可用，工作目录: %s", state.git_root)
   end
@@ -688,6 +707,7 @@ function _git_auto_mod.initialize(config)
   state.initialized = true
   logger.info("[git_auto] 初始化完成 (git=%s, auto_commit=%s)", has_git, state.auto_commit_enabled)
 end
+
 
 -- ========== 公共 API（供 git_tools 调用） ==========
 

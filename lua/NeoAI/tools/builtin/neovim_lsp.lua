@@ -6,6 +6,9 @@ local M = {}
 
 local define_tool = require("NeoAI.tools.builtin.tool_helpers").define_tool
 local resolve_path = require("NeoAI.tools.builtin.tool_helpers").resolve_path
+local lm = require("NeoAI.utils.language_map")
+local lsp_utils = require("NeoAI.utils.lsp_utils")
+local file_utils = require("NeoAI.utils.file_utils")
 
 -- ============================================================================
 -- 通用 LSP 服务检测与初始化（自适应所有配置，不硬编码）
@@ -16,38 +19,7 @@ local _lsp_init_done = false
 local _mason_installed = nil
 local _lsp_service_type = nil
 
--- 判断客户端是否为正式 LSP 服务（纯能力检测，不依赖硬编码名称）
--- 规则：仅支持 inlineCompletion 且无任何核心 LSP 能力的客户端视为非正式
--- 核心 LSP 能力：hover、definition、references、formatting、codeAction、completion、documentSymbol 等
-local function is_formal_lsp_client(client)
-  if not client then
-    return false
-  end
-  local caps = client.server_capabilities
-  -- 如果尚未初始化完成（caps 为 nil），暂时视为正式，后续会重新检查
-  if not caps then
-    return true
-  end
-  -- 检查是否有至少一项核心 LSP 能力
-  local has_core = caps.hoverProvider
-    or caps.definitionProvider
-    or caps.referencesProvider
-    or caps.documentFormattingProvider
-    or caps.codeActionProvider
-    or caps.completionProvider
-    or caps.documentSymbolProvider
-    or caps.workspaceSymbolProvider
-    or caps.implementationProvider
-    or caps.declarationProvider
-    or caps.renameProvider
-    or caps.typeDefinitionProvider
-    or caps.signatureHelpProvider
-  -- 如果没有任何核心能力，且仅支持 inlineCompletion，视为非正式服务
-  if not has_core and caps.inlineCompletionProvider then
-    return false
-  end
-  return true
-end
+local is_formal_lsp_client = lsp_utils.is_formal_lsp_client
 
 -- 自动检测用户使用的 LSP 服务类型（不依赖特定路径）
 local function detect_lsp_service_type()
@@ -217,18 +189,8 @@ local function find_mason_server_cmd(config_name)
         -- 先检查 bin 目录下的常见可执行文件
         local bin_dir = install_path .. "/bin/"
         local mason_name = info.mason_name
-        -- Mason 包名到实际可执行文件名的映射
-        local executable_map = {
-          pyright = { "pyright-langserver", "--stdio" },
-          ["typescript-language-server"] = { "typescript-language-server", "--stdio" },
-          ["html-lsp"] = { "vscode-html-language-server", "--stdio" },
-          ["css-lsp"] = { "vscode-css-language-server", "--stdio" },
-          ["json-lsp"] = { "vscode-json-language-server", "--stdio" },
-          ["yaml-language-server"] = { "yaml-language-server", "--stdio" },
-          ["bash-language-server"] = { "bash-language-server", "start" },
-          ["lua-language-server"] = { "lua-language-server" },
-          ["rust-analyzer"] = { "rust-analyzer" },
-        }
+        -- Mason 包名到实际可执行文件名的映射（委托 language_map）
+        local executable_map = lm.mason_executables
         -- 优先使用映射表
         local mapped = executable_map[mason_name] or executable_map[config_name]
         if mapped then
@@ -315,38 +277,7 @@ local lsp_available = false
 local ts_parsers_checked = false
 
 -- 常用文件类型对应的 Tree-sitter 解析器名称
-local ft_to_ts_parser = {
-  lua = "lua",
-  python = "python",
-  javascript = "javascript",
-  typescript = "typescript",
-  javascriptreact = "tsx",
-  typescriptreact = "tsx",
-  go = "go",
-  rust = "rust",
-  java = "java",
-  c = "c",
-  cpp = "cpp",
-  ruby = "ruby",
-  php = "php",
-  json = "json",
-  yaml = "yaml",
-  markdown = "markdown",
-  bash = "bash",
-  sh = "bash",
-  zsh = "bash",
-  css = "css",
-  html = "html",
-  vue = "vue",
-  svelte = "svelte",
-  toml = "toml",
-  sql = "sql",
-  cmake = "cmake",
-  dockerfile = "dockerfile",
-  make = "make",
-  query = "query",
-  regex = "regex",
-}
+local ft_to_ts_parser = lm.ft_to_parser
 
 -- 自动安装 Tree-sitter 解析器（异步，非阻塞）
 -- 在模块加载时自动触发，仅执行一次
@@ -496,122 +427,17 @@ local function find_symbol_via_lsp_async(filepath, symbol_name, bufnr, callback)
   do_request()
 end
 
--- LSP 符号类型名称映射（兼容 Neovim 0.12，该版本没有 vim.lsp.symbol_kind_name）
-local symbol_kind_names = {
-  [1] = "File",
-  [2] = "Module",
-  [3] = "Namespace",
-  [4] = "Package",
-  [5] = "Class",
-  [6] = "Method",
-  [7] = "Property",
-  [8] = "Field",
-  [9] = "Constructor",
-  [10] = "Enum",
-  [11] = "Interface",
-  [12] = "Function",
-  [13] = "Variable",
-  [14] = "Constant",
-  [15] = "String",
-  [16] = "Number",
-  [17] = "Boolean",
-  [18] = "Array",
-  [19] = "Object",
-  [20] = "Key",
-  [21] = "Null",
-  [22] = "EnumMember",
-  [23] = "Struct",
-  [24] = "Event",
-  [25] = "Operator",
-  [26] = "TypeParameter",
-}
-
-local function safe_symbol_kind_name(kind)
-  if type(kind) ~= "number" then
-    return tostring(kind or "Unknown")
-  end
-  -- 优先使用 Neovim 内置函数（如果存在）
-  local ok, result = pcall(vim.lsp.symbol_kind_name, kind)
-  if ok and result then
-    return result
-  end
-  -- 回退到本地映射表
-  return symbol_kind_names[kind] or ("Symbol_" .. kind)
-end
+local safe_symbol_kind_name = lsp_utils.safe_symbol_kind_name
 
 local function check_lsp()
-  if lsp_available then
-    return true
-  end
-  local ok = pcall(require, "vim.lsp")
-  if ok then
-    lsp_available = true
-    return true
-  end
-  return false
+  return lsp_utils.check_lsp()
 end
 
--- 读取文件内容（使用 vim.uv 异步 I/O 替代 io.open）
-local function read_file_content(filepath)
-  local abs_path = vim.fn.fnamemodify(filepath, ":p")
-  local fd, open_err = vim.uv.fs_open(abs_path, "r", 438)
-  if not fd then
-    return nil, "无法读取文件: " .. (open_err or "未知错误")
-  end
-  local stat, stat_err = vim.uv.fs_fstat(fd)
-  if not stat then
-    vim.uv.fs_close(fd)
-    return nil, "无法读取文件: " .. (stat_err or "无法获取文件信息")
-  end
-  local content, read_err = vim.uv.fs_read(fd, stat.size, 0)
-  vim.uv.fs_close(fd)
-  if not content then
-    return nil, "无法读取文件: " .. (read_err or "未知错误")
-  end
-  return content, nil
-end
+local read_file_content = file_utils.read_file
 
--- 确保文件已加载到缓冲区，返回 bufnr 和清理函数
--- 如果文件之前不在缓冲区，加载后返回的 cleanup 会关闭它
--- 如果文件已在缓冲区，cleanup 为空操作
-local function ensure_buf_loaded(filepath)
-  local abs_path = vim.fn.fnamemodify(filepath, ":p")
-  local bufnr = vim.fn.bufnr(abs_path)
-  local was_loaded = true
+local ensure_buf_loaded = lsp_utils.ensure_buf_loaded
 
-  if bufnr == -1 then
-    -- 文件不在缓冲区，加载它
-    bufnr = vim.fn.bufadd(abs_path)
-    vim.fn.bufload(bufnr)
-    was_loaded = false
-  end
-
-  -- 返回清理函数：如果是我们加载的临时缓冲区，关闭它
-  local function cleanup()
-    if not was_loaded and bufnr and vim.api.nvim_buf_is_valid(bufnr) then
-      vim.api.nvim_buf_delete(bufnr, { force = true })
-    end
-  end
-
-  return bufnr, cleanup, nil
-end
-
--- 检查 LSP 客户端是否支持悬停（本模块所需的核心能力）
--- 大多数 LSP 操作（定义、引用、悬停、补全等）只需要 hoverProvider
--- 格式化能力单独在 lsp_format 工具中检查
---
--- 注意：如果 server_capabilities 为 nil，说明客户端尚未完成初始化。
--- 此时返回 true 以避免过滤掉刚启动的客户端，后续操作会等待初始化完成。
-local function client_has_required_capabilities(client)
-  local caps = client.server_capabilities
-  if not caps then
-    -- 客户端尚未初始化完成，暂时视为可用（后续会等待初始化）
-    return true
-  end
-  -- 只需要悬停能力（hoverProvider），这是大多数 LSP 操作的基础
-  local has_hover = caps.hoverProvider == true or (type(caps.hoverProvider) == "table")
-  return has_hover
-end
+local client_has_required_capabilities = lsp_utils.client_has_required_capabilities
 
 -- 从客户端列表中过滤出支持悬停能力的客户端
 local function filter_qualified_clients(clients)
@@ -935,27 +761,8 @@ local function try_start_lsp(config_name, bufnr)
   -- 方式 5：直接启动（通过 config_name 推断可执行文件名）
   -- 生成多种可能的命令变体
   local cmd_variants = {}
-  -- 特殊映射（常见 LSP 服务器的标准命令）
-  local special_cmds = {
-    lua_ls = { "lua-language-server" },
-    pyright = { "pyright-langserver", "--stdio" },
-    ts_ls = { "typescript-language-server", "--stdio" },
-    html = { "vscode-html-language-server", "--stdio" },
-    cssls = { "vscode-css-language-server", "--stdio" },
-    jsonls = { "vscode-json-language-server", "--stdio" },
-    yamlls = { "yaml-language-server", "--stdio" },
-    bashls = { "bash-language-server", "start" },
-    clangd = { "clangd" },
-    gopls = { "gopls" },
-    rust_analyzer = { "rust-analyzer" },
-    marksman = { "marksman" },
-    solargraph = { "solargraph", "stdio" },
-    intelephense = { "intelephense", "--stdio" },
-    jdtls = { "jdtls" },
-    volar = { "vue-language-server", "--stdio" },
-    svelte = { "svelte-language-server", "--stdio" },
-    htmlls = { "vscode-html-language-server", "--stdio" },
-  }
+  -- 特殊映射（常见 LSP 服务器的标准命令，委托 language_map）
+  local special_cmds = lm.lsp_commands
   if special_cmds[config_name] then
     table.insert(cmd_variants, special_cmds[config_name])
   end
@@ -1008,31 +815,7 @@ local function get_lsp_clients_async(filepath, callback, defer_cleanup)
   -- 获取文件类型和对应的 LSP 配置名
   local abs_path = vim.fn.fnamemodify(filepath, ":p")
   local ft = vim.filetype.match({ filename = abs_path })
-  local ft_to_lsp_config = {
-    lua = "lua_ls",
-    python = "pyright",
-    javascript = "ts_ls",
-    typescript = "ts_ls",
-    javascriptreact = "ts_ls",
-    typescriptreact = "ts_ls",
-    go = "gopls",
-    rust = "rust_analyzer",
-    java = "jdtls",
-    c = "clangd",
-    cpp = "clangd",
-    ruby = "solargraph",
-    php = "intelephense",
-    json = "jsonls",
-    yaml = "yamlls",
-    markdown = "marksman",
-    bash = "bashls",
-    sh = "bashls",
-    zsh = "bashls",
-    css = "cssls",
-    html = "htmlls",
-    vue = "volar",
-    svelte = "svelte",
-  }
+  local ft_to_lsp_config = lm.ft_to_lsp_config
   local expected_config = ft and ft_to_lsp_config[ft]
 
   -- 辅助函数：检查客户端是否与期望配置匹配
@@ -2288,33 +2071,7 @@ local function _lsp_document_symbols(args, on_success, on_error, on_progress)
 
       -- 推断语言
       local ext = vim.fn.fnamemodify(abs_path, ":e"):lower()
-      local ext_to_lang = {
-        py = "python",
-        lua = "lua",
-        js = "javascript",
-        ts = "typescript",
-        jsx = "tsx",
-        tsx = "tsx",
-        go = "go",
-        rs = "rust",
-        java = "java",
-        c = "c",
-        cpp = "cpp",
-        rb = "ruby",
-        php = "php",
-        json = "json",
-        yaml = "yaml",
-        yml = "yaml",
-        md = "markdown",
-        sh = "bash",
-        bash = "bash",
-        css = "css",
-        html = "html",
-        vue = "vue",
-        svelte = "svelte",
-        toml = "toml",
-        sql = "sql",
-      }
+      local ext_to_lang = lm.ext_to_lang
       local lang = ext_to_lang[ext]
       if not lang then
         if callback then
@@ -2987,56 +2744,7 @@ M.lsp_rename = define_tool({
 
 -- 外部格式化工具配置（文件类型 -> { 命令, 参数 } 列表）
 -- 当 LSP 不支持格式化时，尝试使用这些外部工具
-local external_formatters = {
-  python = {
-    { cmd = "ruff", args = { "format", "--quiet" }, name = "ruff" },
-    { cmd = "black", args = { "--quiet" }, name = "black" },
-    { cmd = "autopep8", args = { "--in-place" }, name = "autopep8" },
-    { cmd = "yapf", args = { "--in-place" }, name = "yapf" },
-  },
-  lua = {
-    { cmd = "stylua", args = {}, name = "stylua" },
-  },
-  javascript = {
-    { cmd = "prettier", args = { "--write" }, name = "prettier" },
-  },
-  typescript = {
-    { cmd = "prettier", args = { "--write" }, name = "prettier" },
-  },
-  javascriptreact = {
-    { cmd = "prettier", args = { "--write" }, name = "prettier" },
-  },
-  typescriptreact = {
-    { cmd = "prettier", args = { "--write" }, name = "prettier" },
-  },
-  json = {
-    { cmd = "prettier", args = { "--write" }, name = "prettier" },
-  },
-  yaml = {
-    { cmd = "prettier", args = { "--write" }, name = "prettier" },
-  },
-  markdown = {
-    { cmd = "prettier", args = { "--write" }, name = "prettier" },
-  },
-  css = {
-    { cmd = "prettier", args = { "--write" }, name = "prettier" },
-  },
-  html = {
-    { cmd = "prettier", args = { "--write" }, name = "prettier" },
-  },
-  go = {
-    { cmd = "gofmt", args = { "-w" }, name = "gofmt" },
-  },
-  rust = {
-    { cmd = "rustfmt", args = {}, name = "rustfmt" },
-  },
-  sh = {
-    { cmd = "shfmt", args = { "-w" }, name = "shfmt" },
-  },
-  bash = {
-    { cmd = "shfmt", args = { "-w" }, name = "shfmt" },
-  },
-}
+local external_formatters = lm.external_formatters
 
 -- 尝试使用外部格式化工具格式化文件
 -- 返回 true 表示成功，false 表示无可用工具
@@ -3495,31 +3203,7 @@ local function _lsp_client_info(args, on_success, on_error, on_progress)
 
     -- 获取文件类型并推断期望的 LSP 配置名
     local ft = vim.filetype.match({ filename = abs_path })
-    local ft_to_lsp_config = {
-      lua = "lua_ls",
-      python = "pyright",
-      javascript = "ts_ls",
-      typescript = "ts_ls",
-      javascriptreact = "tsx",
-      typescriptreact = "tsx",
-      go = "gopls",
-      rust = "rust_analyzer",
-      java = "jdtls",
-      c = "clangd",
-      cpp = "clangd",
-      ruby = "solargraph",
-      php = "intelephense",
-      json = "jsonls",
-      yaml = "yamlls",
-      markdown = "marksman",
-      bash = "bashls",
-      sh = "bashls",
-      zsh = "bashls",
-      css = "cssls",
-      html = "htmlls",
-      vue = "volar",
-      svelte = "svelte",
-    }
+    local ft_to_lsp_config = lm.ft_to_lsp_config
     local expected_config = ft and ft_to_lsp_config[ft]
 
     -- 使用异步非阻塞版本等待 LSP attach

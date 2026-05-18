@@ -6,6 +6,7 @@ local M = {}
 
 local define_tool = require("NeoAI.tools.builtin.tool_helpers").define_tool
 local resolve_path = require("NeoAI.tools.builtin.tool_helpers").resolve_path
+local lm = require("NeoAI.utils.language_map")
 
 local block_node_types = {
   -- 通用
@@ -65,41 +66,7 @@ M.block_node_types = block_node_types
 
 -- 扩展名到 Tree-sitter 解析器名称的直接映射
 -- 避免在 fast event 上下文中调用 vim.filetype.match（内部调用 getenv）
-local ext_to_parser = {
-  [".lua"] = "lua",
-  [".py"] = "python",
-  [".js"] = "javascript",
-  [".ts"] = "typescript",
-  [".jsx"] = "tsx",
-  [".tsx"] = "tsx",
-  [".go"] = "go",
-  [".rs"] = "rust",
-  [".java"] = "java",
-  [".c"] = "c",
-  [".cpp"] = "cpp",
-  [".h"] = "c",
-  [".hpp"] = "cpp",
-  [".rb"] = "ruby",
-  [".php"] = "php",
-  [".json"] = "json",
-  [".yaml"] = "yaml",
-  [".yml"] = "yaml",
-  [".md"] = "markdown",
-  [".sh"] = "bash",
-  [".bash"] = "bash",
-  [".zsh"] = "bash",
-  [".css"] = "css",
-  [".html"] = "html",
-  [".htm"] = "html",
-  [".vue"] = "vue",
-  [".svelte"] = "svelte",
-  [".toml"] = "toml",
-  [".sql"] = "sql",
-  [".cmake"] = "cmake",
-  [".mk"] = "make",
-  [".query"] = "query",
-  [".regex"] = "regex",
-}
+local ext_to_parser = lm.ext_to_parser
 -- 检查 Tree-sitter 是否可用
 local ts_available = false
 ---@class vim.treesitter
@@ -966,7 +933,6 @@ local function _get_node_range(args, on_success, on_error)
     return
   end
 
-
   local filepath = resolve_path(args.filepath)
 
   parse_file_content_async(filepath, -1, function(result)
@@ -1324,7 +1290,6 @@ local function _get_node_code(args, on_success, on_error)
     return
   end
 
-
   local filepath = resolve_path(args.filepath)
 
   parse_file_content_async(filepath, -1, function(result)
@@ -1423,7 +1388,6 @@ local function _delete_node(args, on_success, on_error)
     end
     return
   end
-
 
   local filepath = resolve_path(args.filepath)
 

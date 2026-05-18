@@ -789,7 +789,8 @@ function M.build_folded_text()
       result_str = result_str:gsub("}}}", "} } }"):gsub("{{{", "{ { {")
       result_str = result_str:gsub("\n", "\n    ")
 
-      local block = "{{{ " .. pack_icon .. " " .. pack_name .. " - " .. icon .. " " .. (r.tool_name or "unknown") .. duration_str
+      local display_tool_name = (r.tool_name and r.tool_name ~= "") and r.tool_name or "工具"
+      local block = "{{{ " .. pack_icon .. " " .. pack_name .. " - " .. icon .. " " .. display_tool_name .. duration_str
         .. "\n    参数: " .. args_str .. "\n    结果: " .. result_str .. "\n}}}"
       table.insert(blocks, block)
     end

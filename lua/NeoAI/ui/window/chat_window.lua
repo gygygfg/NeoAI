@@ -924,6 +924,8 @@ function M._render_single_message(msg, prev_role)
   local has_reasoning = false
   local reasoning_content = ""
   local main_content = ""
+  -- 检测 JSON 格式的工具调用
+  local has_tool_calls = false
 
   if type(msg.content) == "table" then
     -- Lua table 格式：{ reasoning_content = "...", content = "..." }
@@ -942,6 +944,10 @@ function M._render_single_message(msg, prev_role)
     if msg.role == "assistant" then
       local json_ok, parsed = pcall(vim.json.decode, raw_content)
       if json_ok and type(parsed) == "table" then
+        -- 检查是否包含 tool_calls
+        if parsed.tool_calls and type(parsed.tool_calls) == "table" and #parsed.tool_calls > 0 then
+          has_tool_calls = true
+        end
         if parsed.reasoning_content and parsed.reasoning_content ~= "" then
           has_reasoning = true
           reasoning_content = parsed.reasoning_content
@@ -957,6 +963,16 @@ function M._render_single_message(msg, prev_role)
     else
       main_content = raw_content
     end
+  end
+
+  -- 确保 raw_content 始终是字符串（防止嵌套 table 导致折叠文本检测失败）
+  if type(raw_content) ~= "string" then
+    local ok, encoded = pcall(vim.json.encode, raw_content)
+    raw_content = ok and encoded or tostring(raw_content)
+  end
+  if type(main_content) ~= "string" then
+    local ok, encoded = pcall(vim.json.encode, main_content)
+    main_content = ok and encoded or tostring(main_content)
   end
 
   -- 检查是否是折叠文本（以 {{{ 开头）
@@ -992,7 +1008,7 @@ function M._render_single_message(msg, prev_role)
     table.insert(lines, role_prefix .. " 🔧 工具调用:")
     for _, tc in ipairs(msg.tool_calls) do
       local func = tc["function"] or tc.func or {}
-      local tool_name = func.name or "unknown"
+      local tool_name = (func.name or "") ~= "" and func.name or "工具"
       local args_str = ""
       if func.arguments then
         local ok, parsed = pcall(vim.json.decode, func.arguments)
@@ -1024,7 +1040,7 @@ function M._render_single_message(msg, prev_role)
     if json_ok and parsed and parsed.tool_calls then
       for _, tc in ipairs(parsed.tool_calls) do
         local func = tc["function"] or tc.func or {}
-        local tool_name = func.name or "unknown"
+        local tool_name = (func.name or "") ~= "" and func.name or "工具"
         local args_str = ""
         if func.arguments then
           local ok2, parsed2 = pcall(vim.json.decode, func.arguments)
@@ -1081,7 +1097,7 @@ function M._render_single_message(msg, prev_role)
       end
     end
   elseif main_content and main_content ~= "" then
-  -- 普通消息（有实际内容）：使用 markdown 格式化
+    -- 普通消息（有实际内容）：使用 markdown 格式化
     local formatted_lines = markdown_renderer.format_text(main_content)
     if #formatted_lines > 0 then
       table.insert(lines, string.format("%s %s", role_prefix, formatted_lines[1]))
