@@ -109,7 +109,7 @@ function M.throttle(func, limit)
   limit = limit or 300
 
   return function(...)
-    local now = vim.loop.now()
+    local now = vim.uv.now()
     local args = { ... }
 
     if now - last_call >= limit then
@@ -123,7 +123,7 @@ function M.throttle(func, limit)
 
       -- 设置新的定时器
       timer = vim.defer_fn(function()
-        last_call = vim.loop.now()
+        last_call = vim.uv.now()
         func(unpack_fn(args))
       end, limit - (now - last_call))
     end
@@ -256,9 +256,9 @@ end
 -- @return any, number 函数返回值和执行时间（毫秒）
 -- @throws 如果函数执行失败，抛出错误
 function M.measure_time(func, ...)
-  local start_time = vim.loop.hrtime()
+  local start_time = vim.uv.hrtime()
   local result = { pcall(func, ...) }
-  local end_time = vim.loop.hrtime()
+  local end_time = vim.uv.hrtime()
 
   local duration_ms = (end_time - start_time) / 1000000
 

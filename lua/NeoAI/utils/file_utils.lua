@@ -76,8 +76,8 @@ local function async_load_to_buffer(path)
     table.insert(_buffer_order, abs_path)
     _loaded_buffers[abs_path] = #_buffer_order
 
-    -- 检查路径是否为普通文件，跳过目录
-    local stat = vim.loop.fs_stat(abs_path)
+    local uv = vim.uv or vim.loop
+    local stat = uv.fs_stat(abs_path)
     if not stat or stat.type ~= 'file' then
       return
     end
@@ -90,7 +90,7 @@ local function async_load_to_buffer(path)
       -- 读取文件内容到 buffer，不触发任何 autocmd
       local lines = vim.fn.readfile(abs_path)
       vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, lines)
-      vim.api.nvim_buf_set_option(bufnr, 'modified', false)
+      vim.bo[bufnr].modified = false
       -- 触发 FileType 检测（在 nvim_buf_call 中执行，避免 BufEnter）
       vim.api.nvim_buf_call(bufnr, function()
         pcall(vim.cmd, 'doautocmd FileType')
@@ -261,13 +261,17 @@ function M.exists(path)
     return false
   end
 
+  -- 使用 vim.uv/vim.loop fs_stat 检测文件和目录
+  local uv = vim.uv or vim.loop
+  local ok, stat = pcall(uv.fs_stat, path)
+  if ok and stat then
+    return true
+  end
+
+  -- 回退到 io.open（仅对文件有效）
   local file, err = io.open(path, "r")
   if file then
-    if file then
-      file:close()
-    end
-    -- 文件存在，异步加载到后台 buffer
-    async_load_to_buffer(path)
+    file:close()
     return true
   end
 
@@ -281,8 +285,8 @@ function M.dir_exists(path)
   if not path then
     return false
   end
-
-  local ok, stat = pcall(vim.loop.fs_stat, path)
+  local uv = vim.uv or vim.loop
+  local ok, stat = pcall(uv.fs_stat, path)
   if ok and stat then
     return stat.type == "directory"
   end
@@ -429,8 +433,8 @@ function M.get_mtime(path)
   if not path then
     return nil
   end
-
-  local ok, stat = pcall(vim.loop.fs_stat, path)
+  local uv = vim.uv or vim.loop
+  local ok, stat = pcall(uv.fs_stat, path)
   if ok and stat then
     return stat.mtime.sec
   end
@@ -566,7 +570,8 @@ function M.is_directory(path)
     return false
   end
 
-  local ok, stat = pcall(vim.loop.fs_stat, path)
+  local uv = vim.uv or vim.loop
+  local ok, stat = pcall(uv.fs_stat, path)
   if ok and stat then
     return stat.type == "directory"
   end
@@ -582,13 +587,16 @@ function M.is_file(path)
     return false
   end
 
-  local ok, stat = pcall(vim.loop.fs_stat, path)
+  local uv = vim.uv or vim.loop
+  local ok, stat = pcall(uv.fs_stat, path)
   if ok and stat then
     return stat.type == "file"
   end
 
   return false
 end
+
+--- 获取绝对路径
 
 --- 获取绝对路径
 --- @param path string 路径

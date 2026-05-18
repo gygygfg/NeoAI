@@ -7,6 +7,7 @@ local config_merger = require("NeoAI.core.config.merger")
 local core = require("NeoAI.core")
 local ui = require("NeoAI.ui")
 local tools = require("NeoAI.tools")
+local codecompanion_fix = require("NeoAI.patches.codecompanion_fix")
 
 -- ========== 闭包内私有状态 ==========
 local core_ref
@@ -283,6 +284,9 @@ function M.setup(user_config)
   -- 退出事件由 history_manager 内部的 VimLeavePre 统一处理（同步保存）
   -- 不要在 init.lua 中重复注册，避免退出时多次保存导致死锁
   -- 同时避免在退出过程中调用 cancel_generation（会尝试取消 HTTP 请求和触发事件）
+
+  -- 加载 CodeCompanion buffer 失效补丁
+  codecompanion_fix.setup()
 
   -- 注册文件编码自动命令
   vim.api.nvim_create_autocmd("BufRead", {

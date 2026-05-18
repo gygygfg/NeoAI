@@ -7,6 +7,7 @@ local fu = require("NeoAI.utils.file_utils")
 local neovim_tree = require("NeoAI.tools.builtin.neovim_tree")
 local block_node_types = neovim_tree.block_node_types or {}
 local resolve_path = require("NeoAI.tools.builtin.tool_helpers").resolve_path
+local log_tools = require("NeoAI.tools.builtin.log_tools")
 
 -- ============================================================================
 -- 工具 read_file
@@ -266,9 +267,8 @@ local function _edit_file(args, on_success, on_error)
         vim.fn.bufload(bufnr)
       end
 
-      local max_wait = 10000
-      local timeout_timer = vim.loop.new_timer()
-      local debounce_timer = vim.loop.new_timer()
+      local timeout_timer = vim.uv.new_timer()
+      local debounce_timer = vim.uv.new_timer()
       local au_id = nil
       local finalized = false
 
@@ -300,7 +300,7 @@ local function _edit_file(args, on_success, on_error)
             on_success(result)
           end
         end, function(err_msg)
-          log_message("warn", "edit_file 诊断获取失败: " .. tostring(err_msg))
+          log_tools.log_message.func({ message = "edit_file 诊断获取失败: " .. tostring(err_msg), level = "warn" }, function() end, function() end)
           if on_success then
             on_success(result)
           end

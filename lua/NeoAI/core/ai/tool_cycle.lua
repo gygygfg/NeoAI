@@ -581,6 +581,17 @@ function M._execute_tools(session_id, tool_calls, is_sub_agent)
     return
   end
 
+  -- 防止重复触发：如果 phase 已经是 waiting_tools，说明 _execute_tools 已被调用过
+  -- 此时工具正在执行中，跳过本次调用避免重复执行
+  if ss.phase == "waiting_tools" then
+    require("NeoAI.utils.logger").warn(
+      "[tool_orchestrator] _execute_tools 跳过: phase 已是 waiting_tools, session=%s, tool_calls=%d",
+      tostring(session_id),
+      #tool_calls
+    )
+    return
+  end
+
   require("NeoAI.utils.logger").debug(
     "[DEBUG_DUP] _execute_tools 进入: session=%s, tool_calls=%d, phase=%s",
     tostring(session_id),
@@ -610,6 +621,16 @@ function M._execute_tools(session_id, tool_calls, is_sub_agent)
     debug.traceback()
   )
 
+  -- 清空前检查是否有活跃工具调用（竞态检测）
+  local prev_active_count = vim.tbl_count(ss.active_tool_calls)
+  if prev_active_count > 0 then
+    require("NeoAI.utils.logger").warn(
+      "[tool_orchestrator] _execute_tools: 清空 %d 个活跃工具调用, session=%s, stack=%s",
+      prev_active_count,
+      tostring(session_id),
+      debug.traceback()
+    )
+  end
   ss.phase = "waiting_tools"
   ss.active_tool_calls = {}
 
@@ -1448,6 +1469,17 @@ function M.on_generation_complete(data)
     )
     return
   end
+
+  -- 防止重复触发：如果 _generation_completed 已经为 true，说明此回调已被处理过
+  -- 这可能在流式结束和非流式响应同时到达时发生
+  if ss._generation_completed then
+    require("NeoAI.utils.logger").warn(
+      "[tool_orchestrator] on_generation_complete 跳过: _generation_completed 已为 true, session=%s",
+      tostring(session_id)
+    )
+    return
+  end
+  ss._generation_completed = true
 
   local tool_calls = data.tool_calls or {}
   local content = data.content or ""

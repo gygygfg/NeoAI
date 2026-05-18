@@ -2145,8 +2145,25 @@ function M.add_message(role, content, opts)
   end
 
   opts = opts or {}
-  if not opts.allow_empty and (not content or vim.trim(content) == "") then
-    return false
+  if not opts.allow_empty then
+    if content == nil then
+      return false
+    end
+    if type(content) == "string" and vim.trim(content) == "" then
+      return false
+    end
+    if type(content) == "table" then
+      local has_content = false
+      if content.content and type(content.content) == "string" and vim.trim(content.content) ~= "" then
+        has_content = true
+      end
+      if content.reasoning_content and type(content.reasoning_content) == "string" and vim.trim(content.reasoning_content) ~= "" then
+        has_content = true
+      end
+      if not has_content then
+        return false
+      end
+    end
   end
 
   -- 触发消息添加事件
@@ -2951,6 +2968,11 @@ function M._setup_event_listeners()
 
       local tool_calls = data.tool_calls or {}
       if #tool_calls == 0 then
+        return
+      end
+
+      -- 防止 TOOL_LOOP_STARTED 重复触发：如果悬浮窗已激活，跳过
+      if state.tool_display.active then
         return
       end
 

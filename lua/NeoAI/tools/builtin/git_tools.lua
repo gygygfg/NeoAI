@@ -278,7 +278,7 @@ end
 --- 判断工具调用是否修改了文件
 --- @param tool_name string 工具名称
 --- @param args table 工具参数
---- @return boolean, string|nil 是否修改了文件, 被修改的文件路径
+--- @return boolean, string|nil 是否修改了文件，被修改的文件路径
 function _git_auto_mod._is_file_modifying_tool(tool_name, args)
   local modifying_tools = {
     edit_file = true,
@@ -1165,7 +1165,6 @@ M.git_file_history = {
   permissions = { read = true },
 }
 
--- ============================================================================
 local function _git_branch(args, on_success, on_error)
   local cwd = args and args.cwd
   if cwd then
@@ -1277,5 +1276,5 @@ M.git_auto_commit_config = {
   category = "git",
   permissions = { read = true },
 }
--- ============================================================================
+
 return M

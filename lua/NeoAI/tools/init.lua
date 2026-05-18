@@ -31,10 +31,10 @@ function M.initialize(config)
       M._load_builtin_tools()
     end)
   end
-  if config.external and #config.external > 0 then M._load_external_tools(config.external) end
+  -- 外部工具通过 tool_registry 统一加载（从 merger.lua 合并后的完整配置）
+  tool_registry.load_external_tools_from_config(config)
   return M
 end
-
 --- 检查工具系统是否已初始化
 --- @return boolean
 function M.is_initialized()
@@ -105,7 +105,8 @@ function M.reload_tools()
   builtin_tools_loaded = false
   local tools_config = full_config.tools or {}
   if tools_config.builtin ~= false then M._load_builtin_tools() end
-  if tools_config.external and #tools_config.external > 0 then M._load_external_tools(tools_config.external) end
+  -- 外部工具通过 tool_registry 统一加载
+  tool_registry.load_external_tools_from_config(full_config)
   vim.notify("工具重新加载完成", vim.log.levels.INFO)
 end
 
@@ -120,28 +121,6 @@ function M.search_tools(query)
 end
 
 -- ========== 内置工具加载 ==========
-
--- define_tool 用于统一包装工具定义，设置默认值
-local define_tool = require("NeoAI.tools.builtin.tool_helpers").define_tool
-
---- 从模块表中提取所有工具定义
---- 遍历模块表，找到所有包含 name 和 func 字段的表作为工具注册
---- 使用 define_tool 统一包装（设置默认值、验证字段类型）
---- @param mod table 模块表
---- @return table[] 工具定义列表
-local function extract_tools_from_module(mod)
-  local result = {}
-  local excluded = mod._excluded_tools or {}
-  for _, v in pairs(mod) do
-    if type(v) == "table" and v.name and v.func and not excluded[v.name] then
-      table.insert(result, define_tool(v))
-    end
-  end
-  table.sort(result, function(a, b)
-    return a.name < b.name
-  end)
-  return result
-end
 
 function M._load_builtin_tools()
   if builtin_tools_loaded then return end
@@ -164,7 +143,7 @@ function M._load_builtin_tools()
       local mod_name = name:gsub("%.lua$", "")
       local ok, mod = pcall(require, "NeoAI.tools.builtin." .. mod_name)
       if ok and type(mod) == "table" then
-        local tools = extract_tools_from_module(mod)
+        local tools = tool_registry.extract_tools_from_module(mod)
         for _, tool in ipairs(tools) do
           M.register_tool(tool)
         end
@@ -185,22 +164,6 @@ function M._load_builtin_tools()
   if full_config and full_config.tools and full_config.tools.approval then
     local tr = require("NeoAI.tools.tool_registry")
     pcall(tr.apply_approval_config, full_config)
-  end
-end
-
-function M._load_external_tools(external_tools)
-  for _, tool_config in ipairs(external_tools) do
-    if tool_config.path then
-      local ok, mod = pcall(require, tool_config.path)
-      if ok and mod then
-        local tools = extract_tools_from_module(mod)
-        for _, tool in ipairs(tools) do
-          M.register_tool(tool)
-        end
-      end
-    elseif tool_config.definition then
-      M.register_tool(tool_config.definition)
-    end
   end
 end
 

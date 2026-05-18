@@ -1,5 +1,6 @@
 -- 工具注册表模块
 -- 提供工具的注册、管理、查询等功能
+-- 支持内部工具注册和外部工具（通过 merger.lua 合并后的配置）的统一管理
 
 local logger = require("NeoAI.utils.logger")
 local approval_state = require("NeoAI.tools.approval_state")
@@ -297,9 +298,7 @@ function M.update_config(new_config)
   state.config = vim.tbl_extend("force", state.config, new_config or {})
 end
 
--- ========== 内置工具加载（统一入口） ==========
-
-local builtin_modules_loaded = false
+-- ========== 外部工具加载（从 merger.lua 合并后的完整配置） ==========
 
 -- define_tool 用于统一包装工具定义，设置默认值
 local define_tool = require("NeoAI.tools.builtin.tool_helpers").define_tool
@@ -309,9 +308,9 @@ local define_tool = require("NeoAI.tools.builtin.tool_helpers").define_tool
 --- 使用 define_tool 统一包装（设置默认值、验证字段类型）
 --- @param mod table 模块表
 --- @return table[] 工具定义列表
-local function extract_tools_from_module(mod)
+local function _extract_tools_from_module(mod)
   local result = {}
-  local excluded = mod._excluded_tools or {}  -- 模块可定义排除列表
+  local excluded = mod._excluded_tools or {}
   for _, v in pairs(mod) do
     if type(v) == "table" and v.name and v.func and not excluded[v.name] then
       table.insert(result, define_tool(v))
@@ -323,40 +322,66 @@ local function extract_tools_from_module(mod)
   return result
 end
 
---- 加载所有 builtin 工具模块
---- 直接遍历各模块返回的表，提取工具定义注册到注册表中
-function M.load_builtin_tools()
-  if builtin_modules_loaded then
+--- 公开的 extract_tools_from_module，供 init.lua 等外部调用
+M.extract_tools_from_module = _extract_tools_from_module
+
+--- 从 merger.lua 合并后的完整配置中加载外部工具
+--- 支持三种格式：
+---   1. { path = "module.path" } — 通过 require 加载模块，从中提取工具
+---   2. { definition = { name = ..., func = ..., ... } } — 显式传入工具定义
+---   3. { name = ..., func = ..., ... } — 直接传入工具定义表
+--- @param full_config table merger.lua 合并后的完整配置
+function M.load_external_tools_from_config(full_config)
+  guard()
+  if not full_config or not full_config.tools then
+    return
+  end
+  local external_tools = full_config.tools.external
+  if not external_tools or #external_tools == 0 then
     return
   end
 
-  local script_path = debug.getinfo(1).source:match("^@(.+)$")
-  if not script_path then builtin_modules_loaded = true; return end
+  -- 获取 tool_overrides 用于检查禁用状态
+  local tool_overrides = {}
+  if full_config.tools.approval and full_config.tools.approval.tool_overrides then
+    tool_overrides = full_config.tools.approval.tool_overrides
+  end
 
-  local builtin_dir = script_path:match("^(.+/)lua/NeoAI/tools/tool_registry%.lua$")
-    and script_path:match("^(.+/)lua/NeoAI/tools/tool_registry%.lua$") .. "lua/NeoAI/tools/builtin"
-    or nil
-  if not builtin_dir then builtin_modules_loaded = true; return end
-
-  local handle = vim.loop.fs_scandir(builtin_dir)
-  if not handle then builtin_modules_loaded = true; return end
-
-  while true do
-    local name, file_type = vim.loop.fs_scandir_next(handle)
-    if not name then break end
-    if file_type == "file" and name:match("%.lua$") then
-      local mod_name = name:gsub("%.lua$", "")
-      local ok, mod = pcall(require, "NeoAI.tools.builtin." .. mod_name)
-      if ok and type(mod) == "table" then
-        local tools = extract_tools_from_module(mod)
-        for _, tool in ipairs(tools) do
-          M.register(tool)
+  for _, tool_config in ipairs(external_tools) do
+    -- 格式1: { path = "module.path" } — 通过 require 加载模块，从中提取工具
+    if tool_config.path then
+      local ok, mod = pcall(require, tool_config.path)
+      if ok and mod then
+        local tools_list = _extract_tools_from_module(mod)
+        for _, tool in ipairs(tools_list) do
+          local override = tool_overrides[tool.name]
+          if not (override and override.enable == false) then
+            M.register(tool)
+          else
+            logger.debug("[tool_registry] 外部工具已被禁用，跳过注册: " .. tool.name)
+          end
         end
+      end
+    -- 格式2: { definition = { name = ..., func = ..., ... } } — 显式传入工具定义
+    elseif tool_config.definition then
+      local override = tool_overrides[tool_config.definition.name]
+      if not (override and override.enable == false) then
+        local tool = define_tool(tool_config.definition)
+        M.register(tool)
+      else
+        logger.debug("[tool_registry] 外部工具已被禁用，跳过注册: " .. tool_config.definition.name)
+      end
+    -- 格式3: 直接传入工具定义表（包含 name 和 func）
+    elseif tool_config.name and tool_config.func then
+      local override = tool_overrides[tool_config.name]
+      if not (override and override.enable == false) then
+        local tool = define_tool(tool_config)
+        M.register(tool)
+      else
+        logger.debug("[tool_registry] 外部工具已被禁用，跳过注册: " .. tool_config.name)
       end
     end
   end
-
-  builtin_modules_loaded = true
 end
 
 return M
