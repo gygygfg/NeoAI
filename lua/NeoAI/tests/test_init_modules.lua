@@ -340,6 +340,26 @@ function M.run(test_module)
       a.contains({ 1, 2, 3 }, 2)
       a.assert_error(function() error("预期错误") end, "预期错误")
     end,
+
+    -- ========== 新增模块入口测试 ==========
+    test_message_builder_basic = function()
+      local mb = require("NeoAI.core.history.message_builder")
+      local msgs = mb.build_messages({ { role = "user", content = "你好" } }, { session_id = "test" })
+      assert.is_true(type(msgs) == "table", "build_messages 应返回表")
+    end,
+
+    test_approval_handler_init = function()
+      local ah = require("NeoAI.tools.approval_handler")
+      ah.initialize({})
+      ah.cleanup()
+    end,
+
+    test_approval_state_basic = function()
+      local as = require("NeoAI.tools.approval_state")
+      as.reset()
+      local state = as.get_state()
+      assert.not_nil(state, "get_state 应返回状态")
+    end,
   })
 end
 
