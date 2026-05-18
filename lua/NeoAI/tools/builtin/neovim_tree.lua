@@ -1576,29 +1576,25 @@ M.delete_node = define_tool({
   category = "treesitter",
   permissions = { write = true },
 })
-
--- get_tools() - 返回所有工具列表供注册
 -- 导出 parse_file_content_async 供 file_tools 等模块使用
 -- 用于在读取大文件时获取语法树结构概览
 function M.parse_file_content_async(filepath, max_depth, on_success, on_error)
   parse_file_content_async(filepath, max_depth, on_success, on_error)
 end
 
-function M.get_tools()
-  if not check_ts() then
-    return {}
-  end
+-- 工具注册列表（供 tool_registry 合并）
 
-  local tools = {}
+-- 工具注册列表（供 tool_registry 合并）
+M.tools = {}
+if check_ts() then
   for _, v in pairs(M) do
     if type(v) == "table" and v.name and v.func then
-      table.insert(tools, v)
+      table.insert(M.tools, v)
     end
   end
-  table.sort(tools, function(a, b)
+  table.sort(M.tools, function(a, b)
     return a.name < b.name
   end)
-  return tools
 end
 
 return M
