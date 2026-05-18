@@ -1,17 +1,43 @@
--- Neovim vim.cmd 执行工具（回调模式）
--- 提供在当前 Neovim 实例中执行 vim.cmd 命令的工具
--- 工具函数签名：func(args, on_success, on_error)
-
 local M = {}
-
-local define_tool = require("NeoAI.tools.builtin.tool_helpers").define_tool
 
 -- ============================================================================
 -- 工具：execute_vim_cmd
 -- ============================================================================
 -- 在当前 Neovim 实例中执行 vim.cmd 命令，并将输出结果返回
 
-M.execute_vim_cmd = define_tool({
+local function _execute_vim_cmd(args, on_success, on_error)
+  -- 支持 cmd 作为 command 的别名，与 run_command 一致
+  if args.command == nil and args.cmd ~= nil then
+    args.command = args.cmd
+  end
+
+  local command = args.command
+  if not command or command == "" then
+    on_error("参数 'command' 不能为空")
+    return
+  end
+
+  -- 使用 pcall 和 redir 捕获命令输出
+  local ok, result = pcall(function()
+    local output = vim.fn.execute(command)
+    return output
+  end)
+
+  if not ok then
+    on_error("vim.cmd 执行失败: " .. tostring(result))
+    return
+  end
+
+  -- 如果命令没有输出（如编辑操作），返回成功提示
+  if not result or result == "" then
+    on_success("命令执行成功: " .. command)
+    return
+  end
+
+  on_success(result)
+end
+
+M.execute_vim_cmd = {
   name = "execute_vim_cmd",
   description = [[在当前 Neovim 实例中执行 vim.cmd Ex 命令（如编辑、写入、跳转等），返回命令输出结果。
 
@@ -29,50 +55,28 @@ M.execute_vim_cmd = define_tool({
 - 对于会阻塞或打开新窗口的命令（如 help），会自动处理
 - 输出结果会捕获并返回
 ]],
-  func = function(args, on_success, on_error)
-    local cmd = args.cmd
-    if not cmd or cmd == "" then
-      on_error("参数 'cmd' 不能为空")
-      return
-    end
-
-    -- 使用 pcall 和 redir 捕获命令输出
-    local ok, result = pcall(function()
-      -- 使用 execute 捕获输出
-      local output = vim.fn.execute(cmd)
-      return output
-    end)
-
-    if not ok then
-      on_error("vim.cmd 执行失败: " .. tostring(result))
-      return
-    end
-
-    -- 如果命令没有输出（如编辑操作），返回成功提示
-    if not result or result == "" then
-      on_success("命令执行成功: " .. cmd)
-      return
-    end
-
-    on_success(result)
-  end,
+  func = _execute_vim_cmd,
+  async = true,
   parameters = {
     type = "object",
     properties = {
+      command = {
+        type = "string",
+        description = "要执行的 vim.cmd Ex 命令（必填，如 'e file.txt', 'w', 'bnext', 'set number' 等）",
+      },
       cmd = {
         type = "string",
-        description = "要执行的 vim.cmd Ex 命令（如 'e file.txt', 'w', 'bnext', 'set number' 等）",
+        description = "command 的别名，与 command 等效",
       },
     },
-    required = { "cmd" },
+    required = { "command" },
   },
   returns = {
     type = "string",
     description = "命令执行结果输出",
   },
   category = "neovim",
-  async = true,
   timeout = 30000, -- 30 秒超时
-})
+}
 
 return M
