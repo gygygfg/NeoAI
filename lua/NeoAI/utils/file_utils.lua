@@ -76,11 +76,24 @@ local function async_load_to_buffer(path)
     table.insert(_buffer_order, abs_path)
     _loaded_buffers[abs_path] = #_buffer_order
 
-    local bufnr = vim.fn.bufadd(abs_path)
+    -- 检查路径是否为普通文件，跳过目录
+    local stat = vim.loop.fs_stat(abs_path)
+    if not stat or stat.type ~= 'file' then
+      return
+    end
+
+    -- 创建一个新的空 buffer，避免 bufadd 可能带来的问题
+    local bufnr = vim.api.nvim_create_buf(false, true)
     if bufnr and bufnr > 0 then
-      -- 使用 noautocmd 避免触发 nvim-tree 等插件的 BufEnter 自动命令
+      -- 设置 buffer 名称（关联到文件路径）
+      pcall(vim.api.nvim_buf_set_name, bufnr, abs_path)
+      -- 读取文件内容到 buffer，不触发任何 autocmd
+      local lines = vim.fn.readfile(abs_path)
+      vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, lines)
+      vim.api.nvim_buf_set_option(bufnr, 'modified', false)
+      -- 触发 FileType 检测（在 nvim_buf_call 中执行，避免 BufEnter）
       vim.api.nvim_buf_call(bufnr, function()
-        vim.cmd('noautocmd bufload ' .. bufnr)
+        pcall(vim.cmd, 'doautocmd FileType')
       end)
     end
   end)

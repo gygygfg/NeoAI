@@ -90,7 +90,6 @@ function _git_auto_mod._check_git()
   return false
 end
 
-
 --- 初始化伪 Git 模式
 function _git_auto_mod._init_pseudo()
   if state.pseudo.enabled then
@@ -707,7 +706,6 @@ function _git_auto_mod.initialize(config)
   logger.info("[git_auto] 初始化完成 (git=%s, auto_commit=%s)", has_git, state.auto_commit_enabled)
 end
 
-
 -- ========== 公共 API（供 git_tools 调用） ==========
 
 --- 获取 diff
@@ -1129,6 +1127,10 @@ local function _git_file_history(args, on_success, on_error)
   end
 
   local filepath = resolve_path(args.filepath)
+  local cwd = args.cwd
+  if cwd then
+    cwd = resolve_path(cwd)
+  end
 
   local result = _git_auto_mod.get_file_history(filepath, cwd)
   if on_success then
@@ -1169,7 +1171,6 @@ local function _git_branch(args, on_success, on_error)
   if cwd then
     cwd = resolve_path(cwd)
   end
-
 
   if not _git_auto_mod.is_git_available() then
     if on_error then
