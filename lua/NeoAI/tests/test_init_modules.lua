@@ -340,7 +340,30 @@ function M.run(test_module)
       a.contains({ 1, 2, 3 }, 2)
       a.assert_error(function() error("预期错误") end, "预期错误")
     end,
+    -- ========== 新增模块入口测试 ==========
+    test_message_builder_basic = function()
+      local mb = require("NeoAI.core.history.message_builder")
+      local msgs = mb.session_to_messages({ user = "你好", assistant = { '{"content":"你好！"}' } })
+      assert.is_true(type(msgs) == "table", "session_to_messages 应返回表")
+      assert.is_true(#msgs > 0, "应有消息")
+    end,
 
+    test_approval_handler_basic = function()
+      local ah = require("NeoAI.tools.approval_handler")
+      -- 测试基本功能：入队和清空
+      ah.clear_queue()
+      assert.equal(0, ah.queue_length(), "清空后队列长度应为0")
+      ah.enqueue({ name = "test_tool", arguments = {}, on_result = function() end })
+      assert.is_true(ah.queue_length() > 0, "入队后队列长度应大于0")
+      ah.clear_queue()
+    end,
+
+    test_approval_state_basic = function()
+      local as = require("NeoAI.tools.approval_state")
+      as.reset()
+      local config = as.get_global_config()
+      assert.not_nil(config, "get_global_config 应返回配置表")
+    end,
     -- ========== 新增模块入口测试 ==========
     test_message_builder_basic = function()
       local mb = require("NeoAI.core.history.message_builder")
