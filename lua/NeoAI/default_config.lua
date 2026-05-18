@@ -250,10 +250,6 @@ local DEFAULT_CONFIG = {
     builtin = true,
     external = {},
 
-    git = {
-      auto_commit = false,
-    },
-
     -- 工具审批配置
     -- 用户可通过此配置覆盖各工具的审批行为
     -- 默认行为：所有工具使用其自身注册时的 approval.auto_allow
@@ -329,9 +325,9 @@ local DEFAULT_CONFIG = {
         },
 
         -- ===== plan_executor.lua =====
-        create_sub_agent = { enable = true, auto_allow = false },
-        get_sub_agent_status = { enable = true, auto_allow = true },
-        cancel_sub_agent = { enable = true, auto_allow = true },
+        create_sub_agent = { enable = false, auto_allow = false },
+        get_sub_agent_status = { enable = false, auto_allow = true },
+        cancel_sub_agent = { enable = false, auto_allow = true },
         --
         -- ===== git_tools.lua =====
         git_diff = { enable = true, auto_allow = true },
@@ -341,7 +337,7 @@ local DEFAULT_CONFIG = {
         git_rollback = { enable = true, auto_allow = false },
         git_file_history = { enable = true, auto_allow = true },
         git_branch = { enable = true, auto_allow = true },
-        git_auto_commit_config = { enable = true, auto_allow = true },
+        git_auto_commit_config = { enable = true, auto_allow = true, auto_commit = false },
       },
     },
   },

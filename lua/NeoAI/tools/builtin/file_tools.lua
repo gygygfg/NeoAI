@@ -247,6 +247,7 @@ local function _edit_file(args, on_success, on_error)
     return
   end
   local start_line = args.start_line
+  local end_line = args.end_line
   -- on_write_err 是 on_error 的别名，供内部闭包使用
   local on_write_err = on_error
 
@@ -369,14 +370,18 @@ local function _edit_file(args, on_success, on_error)
             .. "请确认文件路径是否正确，或使用 create_directory 先创建目录。",
           filepath
         )
-        local function write_and_return()
-          if on_success then
-            on_success({ filepath = filepath, success = true, warning = warning })
-          end
-        end
         local ok, _ = fu.write_file(filepath, content, false)
         if ok then
-          write_and_return()
+          -- 使用 on_write_ok 获取 LSP 诊断信息，并在结果中加入 warning
+          -- 通过将 warning 注入 result 中
+          local orig_on_success = on_success
+          on_success = function(result)
+            result.warning = warning
+            if orig_on_success then
+              orig_on_success(result)
+            end
+          end
+          on_write_ok()
         else
           if on_error then
             on_error("写入失败")
@@ -421,16 +426,19 @@ local function _edit_file(args, on_success, on_error)
           for i = end_line + 1, total do
             table.insert(after, lines[i])
           end
-
+          -- 去除 content 末尾的换行符，避免与后续拼接产生双重重叠换行
+          local trimmed_content = content:gsub("\n+$", "")
           local new_lines = {}
           if #before > 0 then
             table.insert(new_lines, table.concat(before, "\n"))
           end
-          table.insert(new_lines, content)
+          table.insert(new_lines, trimmed_content)
           if #after > 0 then
             table.insert(new_lines, table.concat(after, "\n"))
           end
           local new_content = table.concat(new_lines, "\n")
+          -- 如果原文件末尾有换行符，给新内容也加上换行符
+          -- 注意：trimmed_content 已去除尾部 \n，所以不会重复
           if file_content:sub(-1) == "\n" then
             new_content = new_content .. "\n"
           end
@@ -450,6 +458,13 @@ local function _edit_file(args, on_success, on_error)
           if on_error then
             on_error(string.format("读取文件失败 %s: %s", filepath, err or "无法读取文件"))
           end
+        end
+        return
+      end
+      -- 追加模式且 content 为空时，避免空操作
+      if append and content == "" then
+        if on_success then
+          on_success({ filepath = filepath, success = true, notice = "内容为空，未做任何修改" })
         end
         return
       end
@@ -1021,26 +1036,7 @@ local function _delete_file(args, on_success, on_error)
   end
 end
 
-M.delete_file = define_tool({
-  name = "delete_file",
-  description = "删除文件",
-  func = _delete_file,
-  async = true,
-  parameters = {
-    type = "object",
-    properties = {
-      filepath = { type = "string", description = "文件路径（必填）" },
-    },
-    required = { "filepath" },
-  },
-  returns = {
-    type = "object",
-    properties = { filepath = { type = "string" }, success = { type = "boolean" } },
-    description = "文件删除结果",
-  },
-  category = "file",
-  permissions = { write = true },
-})
+
 
 M.delete_file = define_tool({
   name = "delete_file",
