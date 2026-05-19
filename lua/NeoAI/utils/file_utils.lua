@@ -88,7 +88,19 @@ local function async_load_to_buffer(path)
       -- 设置 buffer 名称（关联到文件路径）
       pcall(vim.api.nvim_buf_set_name, bufnr, abs_path)
       -- 读取文件内容到 buffer，不触发任何 autocmd
-      local lines = vim.fn.readfile(abs_path)
+      local raw_lines = vim.fn.readfile(abs_path)
+      -- 展开可能包含换行符的行（例如文件末尾有空行或特殊编码）
+      local lines = {}
+      for _, line in ipairs(raw_lines) do
+        -- 如果行内包含换行符，拆分成多行
+        if line:find('\n') then
+          for _, subline in ipairs(vim.split(line, '\n', { plain = true })) do
+            table.insert(lines, subline)
+          end
+        else
+          table.insert(lines, line)
+        end
+      end
       vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, lines)
       vim.bo[bufnr].modified = false
       -- 触发 FileType 检测（在 nvim_buf_call 中执行，避免 BufEnter）

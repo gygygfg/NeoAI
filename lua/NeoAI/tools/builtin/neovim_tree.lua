@@ -1519,6 +1519,8 @@ local function _delete_node(args, on_success, on_error)
             return
           end
           vim.fn.bufload(bufnr)
+          -- bufadd 创建的缓冲区 buftype 默认为 "acwrite"，需清空才能用 :write 保存
+          pcall(vim.api.nvim_buf_set_option, bufnr, "buftype", "")
           was_loaded = false
         end
 
@@ -1588,6 +1590,213 @@ M.delete_node = {
   category = "treesitter",
   permissions = { write = true },
 }
+
+-- ============================================================================
+-- 工具 edit_node - 修改指定语法树节点的内容（回调模式）
+-- 用新内容替换匹配节点的源代码，保留节点位置不变
+-- ============================================================================
+
+local function _edit_node(args, on_success, on_error)
+  if not check_ts() then
+    if on_error then
+      on_error("Tree-sitter 不可用（需要 Neovim >= 0.5）")
+    end
+    return
+  end
+  if not args or not args.filepath then
+    if on_error then
+      on_error("需要 filepath（文件路径）参数")
+    end
+    return
+  end
+  if not args.content then
+    if on_error then
+      on_error("需要 content（新内容）参数")
+    end
+    return
+  end
+
+  local filepath = args.filepath
+  local new_content = args.content
+  local uv = vim.uv or vim.loop
+  local finalized = false
+
+  -- 总超时保护：30 秒
+  local timeout_timer = uv.new_timer()
+  local function finalize_with_timeout(msg, is_err)
+    if finalized then
+      return
+    end
+    finalized = true
+    if timeout_timer then
+      timeout_timer:stop()
+      timeout_timer:close()
+    end
+    if is_err and on_error then
+      on_error(msg)
+    end
+  end
+  if timeout_timer then
+    timeout_timer:start(
+      30000,
+      0,
+      vim.schedule_wrap(function()
+        finalize_with_timeout("edit_node 操作超时（30 秒）", true)
+      end)
+    )
+  end
+
+  parse_file_content_async(filepath, -1, function(result)
+    local filtered, fallback = filter_nodes(result.nodes, args)
+    if #filtered == 0 then
+      if on_error then
+        finalize_with_timeout("未找到匹配的节点", true)
+      end
+      return
+    end
+
+    -- 只取第一个匹配的节点
+    local target = filtered[1]
+
+    -- 异步读取文件内容
+    read_file_content_async(filepath, function(content)
+      local file_lines = vim.split(content, "\n", { plain = true })
+      local sr, sc, er, ec = target.start_row, target.start_col, target.end_row, target.end_col
+
+      -- 构建新文件内容：将目标节点范围替换为新内容
+      local new_lines = {}
+      for i, line in ipairs(file_lines) do
+        table.insert(new_lines, line)
+      end
+
+      if sr == er then
+        -- 单行替换
+        local line = new_lines[sr + 1]
+        if line then
+          local before = line:sub(1, sc)
+          local after = line:sub(ec + 2) or ""
+          new_lines[sr + 1] = before .. new_content .. after
+        end
+      else
+        -- 多行替换：保留第一行的 before 部分和最后一行的 after 部分
+        local first_line = new_lines[sr + 1]
+        local last_line = new_lines[er + 1]
+        if first_line and last_line then
+          local before = first_line:sub(1, sc)
+          local after = last_line:sub(ec + 2) or ""
+          -- 将新内容按行拆分插入
+          local content_lines = vim.split(new_content, "\n", { plain = true })
+          local replacement = {}
+          if #content_lines > 0 then
+            -- 第一行加上 before 前缀
+            table.insert(replacement, before .. content_lines[1])
+            -- 中间行
+            for j = 2, #content_lines - 1 do
+              table.insert(replacement, content_lines[j])
+            end
+            -- 最后一行加上 after 后缀
+            if #content_lines > 1 then
+              table.insert(replacement, content_lines[#content_lines] .. after)
+            end
+          else
+            -- 新内容为空
+            table.insert(replacement, before .. after)
+          end
+
+          -- 替换 sr..er 范围内的行
+          for r = er, sr, -1 do
+            table.remove(new_lines, r + 1)
+          end
+          -- 在 sr 位置插入替换行
+          for idx = #replacement, 1, -1 do
+            table.insert(new_lines, sr + 1, replacement[idx])
+          end
+        end
+      end
+
+      -- 使用 file_utils.write_file_async 写入文件，统一文件写入入口
+      local abs_path = filepath
+      local content_to_write = table.concat(new_lines, "\n")
+      -- 保留原文件末尾换行符
+      if content:sub(-1) == "\n" then
+        content_to_write = content_to_write .. "\n"
+      end
+
+      local fu = require("NeoAI.utils.file_utils")
+      fu.write_file_async(abs_path, content_to_write, function()
+        -- 如果文件已在 Neovim 中打开，刷新缓冲区
+        local bufnr = vim.fn.bufnr(abs_path)
+        if bufnr ~= -1 then
+          pcall(vim.api.nvim_buf_call, bufnr, function()
+            vim.cmd("edit!")
+          end)
+        end
+
+        local ret = {
+          filepath = args.filepath,
+          language = result.language,
+          node_type = target.type,
+          start_row = sr,
+          start_col = sc,
+          end_row = er,
+          end_col = ec,
+        }
+        if fallback then
+          ret.warning = "未找到指定 node_type '"
+            .. (args.node_type or "")
+            .. "' 的节点，已回退到同类型节点"
+        end
+        if on_success then
+          if timeout_timer then
+            timeout_timer:stop()
+            timeout_timer:close()
+          end
+          on_success(ret)
+        end
+      end, function(err_msg)
+        if on_error then
+          finalize_with_timeout("写入文件失败: " .. err_msg, true)
+        end
+      end)
+    end)
+  end, function(err)
+    finalize_with_timeout(err or "解析结果为空", true)
+  end)
+end
+
+M.edit_node = {
+  name = "edit_node",
+  description = "修改文件中匹配的 Tree-sitter 语法树节点的源代码，用新内容替换。支持按 node_type、text、named 属性过滤。修改后自动保存文件。适用于替换函数体、类定义、控制流块等结构化代码块。",
+  func = _edit_node,
+  async = true,
+  parameters = {
+    type = "object",
+    properties = {
+      filepath = { type = "string", description = "文件路径（必填）" },
+      content = { type = "string", description = "替换的新源代码内容（必填）" },
+      node_type = { type = "string", description = "节点类型过滤（可选），如 'function_definition'" },
+      text = { type = "string", description = "节点文本过滤（可选）" },
+      named = { type = "boolean", description = "是否为命名节点（可选）" },
+    },
+    required = { "filepath", "content" },
+  },
+  returns = {
+    type = "object",
+    properties = {
+      filepath = { type = "string" },
+      language = { type = "string" },
+      node_type = { type = "string" },
+      start_row = { type = "number" },
+      start_col = { type = "number" },
+      end_row = { type = "number" },
+      end_col = { type = "number" },
+    },
+    description = "修改结果，包含被替换节点的位置信息",
+  },
+  category = "treesitter",
+  permissions = { write = true },
+}
+
 -- 导出 parse_file_content_async 供 file_tools 等模块使用
 -- 用于在读取大文件时获取语法树结构概览
 function M.parse_file_content_async(filepath, max_depth, on_success, on_error)
