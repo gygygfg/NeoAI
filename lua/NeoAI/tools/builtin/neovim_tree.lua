@@ -30,11 +30,8 @@ local block_node_types = {
   try_statement = true,
   catch_clause = true,
   finally_clause = true,
-  -- 模块/命名空间
-  module = true,
-  program = true,
-  translation_unit = true,
-  -- 其他代码块
+  -- 注意：module、program、translation_unit 等根容器类型不应在此列表中，
+  -- 因为它们代表整个文件，删除根节点会清空文件。
   block = true,
   body = true,
   declaration = true,
@@ -282,9 +279,14 @@ local function filter_nodes(nodes, args)
   end
 
   -- 如果指定了 node_type 但没有匹配到任何节点，回退到只按 text 和 named 过滤
+  -- 但排除根容器节点（depth == 0），避免误匹配整个文件
   if #filtered == 0 and args.node_type then
     local fallback = {}
     for _, node in ipairs(nodes or {}) do
+      -- 排除根容器节点（module/program/source_file 等），防止整个文件被意外替换/删除
+      if node.depth == 0 then
+        goto continue
+      end
       local matched = true
       if args.text ~= nil then
         if not node.text:find(args.text, 1, true) then
@@ -297,6 +299,7 @@ local function filter_nodes(nodes, args)
       if matched then
         table.insert(fallback, node)
       end
+      ::continue::
     end
     if #fallback > 0 then
       return fallback, true
@@ -1417,6 +1420,28 @@ local function _delete_node(args, on_success, on_error)
       return
     end
 
+    -- 安全检查：过滤掉根容器节点（depth == 0），防止删除整个文件
+    local safe_filtered = {}
+    local skipped_root = {}
+    for _, node in ipairs(filtered) do
+      if node.depth == 0 then
+        table.insert(skipped_root, node.type)
+      else
+        table.insert(safe_filtered, node)
+      end
+    end
+    if #safe_filtered == 0 then
+      local msg = "所有匹配的节点都是根容器节点（"
+        .. table.concat(skipped_root, ", ")
+        .. "），拒绝删除。根节点代表整个文件，不能被删除。"
+        .. "请指定一个具体的 node_type（如 'function_definition'、'class_definition' 等）"
+      if on_error then
+        finalize_with_timeout(msg, true)
+      end
+      return
+    end
+    filtered = safe_filtered
+
     -- 检查节点是否可删除（必须是代码块结构节点）
     local deletable = {}
     local skipped = {}
@@ -1567,6 +1592,14 @@ local function _delete_node(args, on_success, on_error)
           ret.skipped_types = skipped
           ret.skipped_message = "以下节点类型不是代码块结构，已跳过: " .. table.concat(skipped, ", ")
         end
+        if #skipped_root > 0 then
+          ret.skipped_root_types = skipped_root
+          if ret.warning then
+            ret.warning = ret.warning .. "; 已跳过根容器节点: " .. table.concat(skipped_root, ", ")
+          else
+            ret.warning = "已跳过根容器节点: " .. table.concat(skipped_root, ", ")
+          end
+        end
         if on_success then
           timeout_timer:stop()
           timeout_timer:close()
@@ -1623,6 +1656,13 @@ local function _edit_node(args, on_success, on_error)
     end
     return
   end
+  if not args.node_type then
+    if on_error then
+      on_error("需要 node_type（节点类型）参数，如 'function_definition'、'class_definition' 等。"
+        .. "为防止意外匹配根节点导致整个文件被替换，edit_node 要求必须指定 node_type。")
+    end
+    return
+  end
 
   local filepath = args.filepath
   local new_content = args.content
@@ -1665,6 +1705,27 @@ local function _edit_node(args, on_success, on_error)
 
     -- 只取第一个匹配的节点
     local target = filtered[1]
+
+    -- 安全检查：拒绝根容器节点（depth == 0），防止整个文件被替换
+    if target.depth == 0 then
+      if on_error then
+        finalize_with_timeout(
+          "拒绝替换根容器节点（类型: " .. target.type .. "）。"
+          .. "根节点代表整个文件，不能被替换。"
+          .. "请指定一个具体的 node_type（如 'function_definition'、'class_definition' 等）",
+          true
+        )
+      end
+      return
+    end
+
+    -- 如果匹配到多个节点且未指定 text 精确过滤，添加警告
+    local multi_match_warning = nil
+    if #filtered > 1 and not args.text then
+      multi_match_warning = "匹配到 " .. #filtered .. " 个节点，仅修改第一个（类型: "
+        .. target.type .. "，位置: 行 " .. target.start_row .. "）。"
+        .. "建议使用 text 参数精确指定要修改的节点。"
+    end
 
     -- 异步读取文件内容
     read_file_content_async(filepath, function(content)
@@ -1755,6 +1816,13 @@ local function _edit_node(args, on_success, on_error)
             ret.warning = "未找到指定 node_type '"
               .. (args.node_type or "")
               .. "' 的节点，已回退到同类型节点"
+          end
+          if multi_match_warning then
+            if ret.warning then
+              ret.warning = ret.warning .. "; " .. multi_match_warning
+            else
+              ret.warning = multi_match_warning
+            end
           end
           if on_success then
             if timeout_timer then
