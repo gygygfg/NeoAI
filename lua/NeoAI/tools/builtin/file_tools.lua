@@ -218,572 +218,99 @@ M.read_file = {
 }
 
 -- ============================================================================
--- PCRE 正则辅助函数（使用 Neovim 内置的 vim.regex）
--- ============================================================================
-
---- PCRE 版本的 find：查找第一个匹配的位置
---- 返回: start_pos, end_pos 或 nil
-local function pcre_find(str, pattern, start_pos)
-  start_pos = start_pos or 1
-  local regex = vim.regex("\\v" .. pattern)
-  if not regex then
-    return nil
-  end
-  -- match_str 只接受一个参数（要匹配的字符串），返回 1-indexed 位置
-  -- 通过截取子串实现从指定位置开始匹配
-  local s, e
-  if start_pos > 1 then
-    s, e = regex:match_str(str:sub(start_pos))
-    if s and e then
-      return s + start_pos, e + start_pos - 1
-    end
-  else
-    s, e = regex:match_str(str)
-    if s and e then
-      return s + 1, e
-    end
-  end
-  return nil
-end
-
---- PCRE 版本的 gsub：查找并替换所有匹配
---- 返回: new_string, replace_count
-local function pcre_gsub(str, pattern, replacement)
-  -- 使用 \\v 启用 very magic 模式（兼容 PCRE 语法）
-  local full_regex = vim.regex("\\v" .. pattern)
-  if not full_regex then
-    return str, 0
-  end
-
-  local parts = {}
-  local last_end = 1 -- 1-based
-  local count = 0
-
-  while true do
-    -- 使用 vim.fn.matchlist 获取匹配和捕获组
-    -- matchlist 返回: {full_match, cap1, cap2, ..., cap9}
-    -- start 参数是 0-based
-    local match_info = vim.fn.matchlist(str, "\\v" .. pattern, last_end - 1)
-    if not match_info or #match_info == 0 or match_info[1] == "" then
-      break
-    end
-
-    -- 使用 matchstrpos 获取准确位置（返回 {match, start, end}，0-based）
-    local pos_info = vim.fn.matchstrpos(str, "\\v" .. pattern, last_end - 1)
-    if not pos_info or #pos_info < 3 or not pos_info[2] then
-      break
-    end
-
-    count = count + 1
-    local full_match = pos_info[1] -- 匹配的文本
-    local s = pos_info[2] -- 0-based start
-    local e = pos_info[3] -- end（0-based exclusive? 还是 inclusive?）
-
-    -- 验证 end 位置：如果是 0-based exclusive，需要减 1
-    -- 但 match_str 返回的是 inclusive end，我们测试确认过
-    -- 对于 matchstrpos，我们先假设它是正确的 end 位置
-    -- 用 str:sub 来验证
-    local match_text = str:sub(s + 1, e)
-    -- 如果 match_text 不等于 full_match，尝试调整 e
-    if match_text ~= full_match then
-      -- 尝试减 1
-      match_text = str:sub(s + 1, e - 1)
-      if match_text == full_match then
-        e = e - 1
-      end
-    end
-
-    -- 匹配前的文本
-    if s + 1 > last_end then
-      table.insert(parts, str:sub(last_end, s))
-    end
-
-    -- 提取捕获组（match_info[2] 到 match_info[10]）
-    local captures = {}
-    for i = 1, 9 do
-      captures[i] = match_info[i + 1] or ""
-    end
-
-    -- 替换字符串解析
-    local function build_replacement(repl)
-      local r_parts = {}
-      local pos = 1
-      while pos <= #repl do
-        local char = repl:sub(pos, pos)
-        if char == "$" then
-          local next_char = repl:sub(pos + 1, pos + 1)
-          if next_char == "$" then
-            r_parts[#r_parts + 1] = "$"
-            pos = pos + 2
-          elseif next_char == "&" or next_char == "0" then
-            r_parts[#r_parts + 1] = full_match
-            pos = pos + 2
-          elseif next_char == "`" then
-            r_parts[#r_parts + 1] = str:sub(1, s)
-            pos = pos + 2
-          elseif next_char == "'" then
-            r_parts[#r_parts + 1] = str:sub(e + 1)
-            pos = pos + 2
-          elseif next_char and next_char:match("^%d$") then
-            local num_str = next_char
-            local next2 = repl:sub(pos + 2, pos + 2)
-            if next2 and next2:match("^%d$") then
-              num_str = num_str .. next2
-            end
-            local num = tonumber(num_str)
-            if num <= 9 and captures[num] and captures[num] ~= "" then
-              r_parts[#r_parts + 1] = captures[num]
-            else
-              r_parts[#r_parts + 1] = "$" .. num_str
-            end
-            pos = pos + 1 + #num_str
-          else
-            r_parts[#r_parts + 1] = "$"
-            pos = pos + 1
-          end
-        elseif char == "\\" then
-          local next_char = repl:sub(pos + 1, pos + 1)
-          if next_char and next_char:match("^%d$") then
-            local num_str = next_char
-            local next2 = repl:sub(pos + 2, pos + 2)
-            if next2 and next2:match("^%d$") then
-              num_str = num_str .. next2
-            end
-            local num = tonumber(num_str)
-            if num <= 9 and captures[num] and captures[num] ~= "" then
-              r_parts[#r_parts + 1] = captures[num]
-            else
-              r_parts[#r_parts + 1] = "\\" .. num_str
-            end
-            pos = pos + 1 + #num_str
-          else
-            r_parts[#r_parts + 1] = char
-            pos = pos + 1
-          end
-        else
-          r_parts[#r_parts + 1] = char
-          pos = pos + 1
-        end
-      end
-      return table.concat(r_parts)
-    end
-
-    table.insert(parts, build_replacement(replacement))
-    last_end = e + 1 -- 下一个搜索位置
-  end
-
-  -- 剩余文本
-  if last_end <= #str then
-    table.insert(parts, str:sub(last_end))
-  end
-
-  return table.concat(parts), count
-end
-
--- ============================================================================
--- 工具 edit_file
--- ============================================================================
-
-local function _edit_file(args, on_success, on_error)
-  if not args or not args.filepath then
-    if on_error then
-      on_error("需要 filepath 参数")
-    end
-    return
-  end
-
-  local filepath = args.filepath
-  local edits = args.edits
-  if not edits or type(edits) ~= "table" or #edits == 0 then
-    if on_error then
-      on_error(
-        "需要 edits 参数（编辑操作数组，每项含 pattern/replacement，可选 start_line/end_line）"
-      )
-    end
-    return
-  end
-
-  -- on_write_err 是 on_error 的别名，供内部闭包使用
-  local on_write_err = on_error
-  -- LSP 诊断等待最大超时（毫秒），避免因 LSP 无响应导致永久挂起
-  local max_wait = args.max_wait or 20000
-
-  -- 通用写回调：写入成功后尝试获取 LSP 诊断信息
-  local function on_write_ok()
-    local result = { filepath = filepath, success = true }
-
-    -- 保存当前窗口和 buffer，避免后续操作改变焦点
-    local current_win = vim.api.nvim_get_current_win()
-    local current_buf = vim.api.nvim_get_current_buf()
-
-    local function restore_focus()
-      pcall(vim.api.nvim_set_current_win, current_win)
-      if vim.api.nvim_buf_is_valid(current_buf) then
-        local win_buf = vim.api.nvim_win_get_buf(current_win)
-        if win_buf ~= current_buf then
-          pcall(vim.api.nvim_win_set_buf, current_win, current_buf)
-        end
-      end
-    end
-
-    local ok_lsp, lsp_mod = pcall(require, "NeoAI.tools.builtin.neovim_lsp")
-    if ok_lsp and lsp_mod and lsp_mod.lsp_diagnostics and lsp_mod.lsp_diagnostics.func then
-      local abs_path = vim.fn.fnamemodify(filepath, ":p")
-      local bufnr = vim.fn.bufnr(abs_path)
-      if bufnr ~= -1 then
-        pcall(vim.api.nvim_buf_call, bufnr, function()
-          vim.cmd("edit!")
-        end)
-      else
-        -- 使用 nvim_create_buf 替代 bufadd/bufload，避免改变当前窗口焦点
-        bufnr = vim.api.nvim_create_buf(false, true)
-        pcall(vim.api.nvim_buf_set_name, bufnr, abs_path)
-        local lines = vim.fn.readfile(abs_path)
-        vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, lines)
-        vim.bo[bufnr].modified = false
-      end
-
-      -- 设置 filetype 并主动附加 LSP 客户端
-      if vim.bo[bufnr].filetype == "" then
-        local ft = vim.filetype.match({ filename = abs_path, buf = bufnr })
-        if ft then
-          vim.bo[bufnr].filetype = ft
-        end
-      end
-      local lsp_clients = vim.lsp.get_clients()
-      for _, client in ipairs(lsp_clients) do
-        local caps = client.server_capabilities or {}
-        if caps.hoverProvider or caps.definitionProvider or caps.documentSymbolProvider or caps.diagnosticProvider then
-          pcall(vim.lsp.buf_attach_client, bufnr, client.id)
-        end
-      end
-
-      local finalized = false
-      local timers = {}
-
-      local function safe_close_all_timers()
-        for _, t in ipairs(timers) do
-          if t and not t:is_closing() then
-            pcall(t.stop, t)
-            pcall(t.close, t)
-          end
-        end
-        timers = {}
-      end
-
-      local function do_fetch_diagnostics()
-        if finalized then
-          return
-        end
-        finalized = true
-        safe_close_all_timers()
-
-        local diagnostics = vim.diagnostic.get(bufnr)
-        local results = {}
-        if diagnostics then
-          for _, d in ipairs(diagnostics) do
-            table.insert(results, {
-              message = d.message,
-              severity = d.severity,
-              source = d.source,
-              code = d.code,
-              lnum = d.lnum and d.lnum + 1 or nil,
-              end_lnum = d.end_lnum and d.end_lnum + 1 or nil,
-              col = d.col and d.col + 1 or nil,
-              end_col = d.end_col and d.end_col + 1 or nil,
-            })
-          end
-        end
-        result.diagnostics = results
-        result.diagnostic_count = #results
-
-        restore_focus()
-        if on_success then
-          on_success(result)
-        end
-      end
-
-      -- 监听 DiagnosticChanged 事件
-      vim.api.nvim_create_autocmd("DiagnosticChanged", {
-        buffer = bufnr,
-        callback = function()
-          if finalized then
-            return
-          end
-          local dt = vim.uv.new_timer()
-          if dt then
-            table.insert(timers, dt)
-            dt:start(
-              500,
-              0,
-              vim.schedule_wrap(function()
-                do_fetch_diagnostics()
-              end)
-            )
-          end
-        end,
-      })
-
-      -- 初始延迟 2000ms
-      local init_timer = vim.uv.new_timer()
-      if init_timer then
-        table.insert(timers, init_timer)
-        init_timer:start(
-          2000,
-          0,
-          vim.schedule_wrap(function()
-            do_fetch_diagnostics()
-          end)
-        )
-      end
-
-      -- 总超时保护
-      local timeout_timer = vim.uv.new_timer()
-      if timeout_timer then
-        table.insert(timers, timeout_timer)
-        timeout_timer:start(
-          max_wait,
-          0,
-          vim.schedule_wrap(function()
-            if finalized then
-              return
-            end
-            log_tools.log_message.func(
-              { message = "edit_file LSP 诊断等待超时 (" .. max_wait .. "ms)，直接返回", level = "warn" },
-              function() end,
-              function() end
-            )
-            do_fetch_diagnostics()
-          end)
-        )
-      end
-    else
-      restore_focus()
-      if on_success then
-        on_success(result)
-      end
-    end
-  end
-
-  -- 对文件内容依次应用所有 edits
-  local function apply_edits(file_content)
-    local has_trailing_nl = file_content:sub(-1) == "\n"
-    local content_no_trail = has_trailing_nl and file_content:sub(1, -2) or file_content
-    local current_content = content_no_trail
-    local total_replace_count = 0
-    local edit_results = {}
-
-    for idx, edit in ipairs(edits) do
-      if not edit.pattern then
-        if on_error then
-          on_error(string.format("edits[%d] 缺少 pattern 参数", idx))
-        end
-        return
-      end
-      if edit.replacement == nil then
-        if on_error then
-          on_error(string.format("edits[%d] 缺少 replacement 参数", idx))
-        end
-        return
-      end
-
-      local edit_start = edit.start_line
-      local edit_end = edit.end_line
-      local edit_pattern = edit.pattern
-      local edit_replacement = edit.replacement
-
-      if edit_start or edit_end then
-        -- 限定行范围替换
-        local lines = vim.split(current_content, "\n", { plain = true })
-        local total_lines = #lines
-
-        local s = edit_start or 1
-        local e = edit_end or total_lines
-
-        if s < 1 then
-          s = 1
-        end
-        if e > total_lines then
-          e = total_lines
-        end
-        if s > e then
-          if on_error then
-            on_error(string.format("edits[%d] 起始行(%d)大于结束行(%d)", idx, s, e))
-          end
-          return
-        end
-
-        local head = s > 1 and table.concat(lines, "\n", 1, s - 1) or nil
-        local middle = table.concat(lines, "\n", s, e)
-        local tail = e < total_lines and table.concat(lines, "\n", e + 1, total_lines) or nil
-
-        local replaced_middle, replace_count = pcre_gsub(middle, edit_pattern, edit_replacement)
-        total_replace_count = total_replace_count + replace_count
-
-        local parts = {}
-        if head then
-          table.insert(parts, head)
-        end
-        table.insert(parts, replaced_middle)
-        if tail then
-          table.insert(parts, tail)
-        end
-        current_content = table.concat(parts, "\n")
-
-        table.insert(edit_results, {
-          edit_index = idx,
-          replace_count = replace_count,
-          start_line = s,
-          end_line = e,
-        })
-      else
-        -- 全文替换
-        local new_content, replace_count = pcre_gsub(current_content, edit_pattern, edit_replacement)
-        total_replace_count = total_replace_count + replace_count
-        current_content = new_content
-
-        table.insert(edit_results, {
-          edit_index = idx,
-          replace_count = replace_count,
-        })
-      end
-    end
-
-    if total_replace_count == 0 then
-      if on_success then
-        on_success({
-          filepath = filepath,
-          success = true,
-          replace_count = 0,
-          edit_results = edit_results,
-          notice = "所有 edits 均未找到匹配的内容，文件未做修改",
-        })
-      end
-      return
-    end
-
-    -- 恢复末尾换行符
-    if has_trailing_nl then
-      current_content = current_content .. "\n"
-    end
-
-    local success, write_err = fu.write_file(filepath, current_content, false)
-    if success == true then
-      -- 在 result 中注入 edit_results 信息
-      local orig_on_success = on_success
-      on_success = function(result)
-        result.edit_results = edit_results
-        result.replace_count = total_replace_count
-        if orig_on_success then
-          orig_on_success(result)
-        end
-      end
-      on_write_ok()
-    else
-      if on_error then
-        on_error(string.format("写入文件失败 %s: %s", filepath, write_err or "写入失败"))
-      end
-    end
-  end
-
-  -- 先检查文件是否存在
-  local function check_exists_and_proceed()
-    local function on_exists(exists)
-      if not exists then
-        -- 文件不存在：创建空文件后再应用 edits
-        local ok, _ = fu.write_file(filepath, "", false)
-        if ok then
-          apply_edits("")
-        else
-          if on_error then
-            on_error("创建文件失败")
-          end
-        end
-        return
-      end
-
-      local file_content, err = fu.read_file(filepath)
-      if file_content then
-        apply_edits(file_content)
-      else
-        if on_error then
-          on_error(string.format("读取文件失败 %s: %s", filepath, err or "无法读取文件"))
-        end
-      end
-    end
-
-    on_exists(fu.exists(filepath))
-  end
-
-  check_exists_and_proceed()
-end
-
-M.edit_file = {
-  name = "edit_file",
-  description = "使用正则表达式在文件中查找并替换文本，支持批量编辑。通过 edits 数组指定多个编辑操作，每项可指定 pattern/replacement 和可选的 start_line/end_line 行范围。写入成功后异步等待 LSP 诊断并随返回值返回。\n\n与 replace_text 的区别：edit_file 会触发 LSP 诊断检查，适合需要确保代码质量的编辑场景；replace_text 是轻量级替换，不等待 LSP。",
-  func = _edit_file,
-  async = true,
-  parameters = {
-    type = "object",
-    properties = {
-      filepath = { type = "string", description = "文件路径（必填）" },
-      edits = {
-        type = "array",
-        description = "编辑操作数组（必填），每项包含：\n  - pattern: 正则表达式（必填）\n  - replacement: 替换文本（必填），支持 $1, $2 等捕获引用\n  - start_line: 起始行号（可选，从1开始）\n  - end_line: 结束行号（可选，从1开始）\n\n示例：\n[\n  { pattern = 'foo', replacement = 'bar' },\n  { pattern = 'old_func', replacement = 'new_func', start_line = 10, end_line = 20 }\n]",
-        items = {
-          type = "object",
-          properties = {
-            pattern = { type = "string", description = "匹配的正则表达式（必填）" },
-            replacement = {
-              type = "string",
-              description = "替换的文本（必填），支持 $1, $2 等捕获引用",
-            },
-            start_line = { type = "number", description = "起始行号（可选，从1开始）" },
-            end_line = { type = "number", description = "结束行号（可选，从1开始）" },
-          },
-          required = { "pattern", "replacement" },
-        },
-      },
-    },
-    required = { "filepath", "edits" },
-  },
-  returns = {
-    type = "object",
-    properties = {
-      filepath = { type = "string" },
-      success = { type = "boolean" },
-      replace_count = { type = "number", description = "所有 edits 的总替换次数" },
-      edit_results = {
-        type = "array",
-        description = "每个 edit 的执行结果详情",
-        items = {
-          type = "object",
-          properties = {
-            edit_index = { type = "number" },
-            replace_count = { type = "number" },
-            start_line = { type = "number" },
-            end_line = { type = "number" },
-          },
-        },
-      },
-      diagnostics = {
-        type = "array",
-        description = "修改后文件的 LSP 诊断信息列表（如有），每项包含 severity, message, source, code, lnum, col 等字段",
-      },
-      diagnostic_count = {
-        type = "number",
-        description = "诊断信息条数",
-      },
-    },
-    description = "写入结果，包含文件路径、是否成功、替换次数、每项编辑详情。写入成功后异步等待 LSP 诊断（最多 20 秒），诊断到达后随返回值一起返回",
-  },
-  category = "file",
-  permissions = { write = true },
-}
-
--- ============================================================================
 -- 工具 replace_text
 -- ============================================================================
+
+--- 规范化行文本：去除 \r，tab 转空格
+local function normalize_line_text(line)
+  if not line then
+    return ""
+  end
+  local normalized = line
+  normalized = normalized:gsub("\r", "")
+  normalized = normalized:gsub("\t", "    ")
+  return normalized
+end
+
+--- 从指定行号开始，上下查找匹配的文本行
+--- 返回: { start_line, end_line } 或 nil
+local function find_text_range(lines, anchor_line, search_text)
+  if not lines or not anchor_line or not search_text then
+    return nil
+  end
+  if anchor_line < 1 or anchor_line > #lines then
+    return nil
+  end
+
+  local normalized_search = normalize_line_text(search_text)
+  if normalized_search == "" then
+    return nil
+  end
+
+  local anchor_normalized = normalize_line_text(lines[anchor_line])
+  if anchor_normalized:find(normalized_search, 1, true) then
+    local s, e = anchor_line, anchor_line
+    for i = anchor_line + 1, #lines do
+      if normalize_line_text(lines[i]):find(normalized_search, 1, true) then
+        e = i
+      else
+        break
+      end
+    end
+    for i = anchor_line - 1, 1, -1 do
+      if normalize_line_text(lines[i]):find(normalized_search, 1, true) then
+        s = i
+      else
+        break
+      end
+    end
+    return { start_line = s, end_line = e }
+  end
+
+  for i = anchor_line - 1, 1, -1 do
+    if normalize_line_text(lines[i]):find(normalized_search, 1, true) then
+      local s, e = i, i
+      for j = i + 1, #lines do
+        if normalize_line_text(lines[j]):find(normalized_search, 1, true) then
+          e = j
+        else
+          break
+        end
+      end
+      for j = i - 1, 1, -1 do
+        if normalize_line_text(lines[j]):find(normalized_search, 1, true) then
+          s = j
+        else
+          break
+        end
+      end
+      return { start_line = s, end_line = e }
+    end
+  end
+
+  for i = anchor_line + 1, #lines do
+    if normalize_line_text(lines[i]):find(normalized_search, 1, true) then
+      local s, e = i, i
+      for j = i + 1, #lines do
+        if normalize_line_text(lines[j]):find(normalized_search, 1, true) then
+          e = j
+        else
+          break
+        end
+      end
+      for j = i - 1, 1, -1 do
+        if normalize_line_text(lines[j]):find(normalized_search, 1, true) then
+          s = j
+        else
+          break
+        end
+      end
+      return { start_line = s, end_line = e }
+    end
+  end
+
+  return nil
+end
 
 local function _replace_text(args, on_success, on_error)
   if not args or not args.filepath then
@@ -792,26 +319,25 @@ local function _replace_text(args, on_success, on_error)
     end
     return
   end
-  if not args.pattern then
+
+  local filepath = args.filepath
+  local new_text = args.new_text
+  local start_line_info = args.start_line -- { line_number, search_text }
+  local end_line_info = args.end_line -- { line_number, search_text }
+
+  if not new_text then
     if on_error then
-      on_error("需要 pattern 参数（匹配的正则表达式）")
-    end
-    return
-  end
-  if not args.replacement then
-    if on_error then
-      on_error("需要 replacement 参数（替换的文本）")
+      on_error("需要 new_text 参数（替换后的文本内容）")
     end
     return
   end
 
-  local filepath = args.filepath
-  local pattern = args.pattern
-  local replacement = args.replacement
-  local start_line = args.start_line
-  local end_line = args.end_line
-  local dry_run = args.dry_run
-  local allow_multi_line = args.allow_multi_line
+  if not start_line_info or not end_line_info then
+    if on_error then
+      on_error("需要 start_line 和 end_line 参数（格式：{line_number, search_text}）")
+    end
+    return
+  end
 
   local file_content, err = fu.read_file(filepath)
   if not file_content then
@@ -821,313 +347,158 @@ local function _replace_text(args, on_success, on_error)
     return
   end
 
-  -- 安全检测：多行模式（含 \n）且没有指定行范围时，自动阻止执行
-  if not start_line and not end_line and not allow_multi_line then
-    if pattern:find("\n") then
-      -- 扫描匹配位置
-      local matches = {}
-      local search_start = 1
-      local max_iterations = 10000
-      local iteration = 0
-      while true do
-        iteration = iteration + 1
-        if iteration > max_iterations then
-          break
-        end
-        local s_pos, e_pos = pcre_find(file_content, pattern, search_start)
-        if not s_pos then
-          break
-        end
-        if s_pos < search_start then
-          s_pos = search_start
-        end
-        if e_pos < s_pos then
-          e_pos = s_pos
-        end
-        -- 计算匹配的起始行号（1-based）
-        local start_ln = 1
-        for i = 1, s_pos - 1 do
-          if file_content:sub(i, i) == "\n" then
-            start_ln = start_ln + 1
-          end
-        end
-        local end_ln = start_ln
-        for i = s_pos, e_pos - 1 do
-          if file_content:sub(i, i) == "\n" then
-            end_ln = end_ln + 1
-          end
-        end
-        -- 提取匹配内容预览（最多显示200字符）
-        local preview = file_content:sub(s_pos, math.min(s_pos + 199, e_pos or s_pos))
-        preview = preview:gsub("\n", "\\n")
-        if #preview >= 200 then
-          preview = preview .. "..."
-        end
-        table.insert(matches, {
-          start_line = start_ln,
-          end_line = end_ln,
-          preview = preview,
-        })
-        search_start = e_pos + 1
-        if search_start <= s_pos then
-          search_start = s_pos + 1
-        end
-      end
+  -- 先剥掉末尾换行再 split
+  local has_trailing_nl = file_content:sub(-1) == "\n"
+  local content = has_trailing_nl and file_content:sub(1, -2) or file_content
+  local lines = vim.split(content, "\n", { plain = true })
+  local total_lines = #lines
 
-      if #matches > 0 then
-        local match_lines = {}
-        for _, m in ipairs(matches) do
-          table.insert(match_lines, string.format("  行 %d-%d: %s", m.start_line, m.end_line, m.preview))
-        end
-        local err_msg = string.format(
-          "⚠️ 安全拦截：检测到多行模式匹配了 %d 处内容，可能导致意外删除大量行！\n"
-            .. "匹配位置：\n%s\n\n"
-            .. "建议：\n"
-            .. "  1) 使用 start_line/end_line 限定替换范围（推荐）\n"
-            .. "  2) 或设置 allow_multi_line = true 跳过此检查\n"
-            .. "  3) 或设置 dry_run = true 仅预览匹配结果",
-          #matches,
-          table.concat(match_lines, "\n")
-        )
-        if on_error then
-          on_error(err_msg)
-        end
-        return
-      end
-    end
-  end
+  local start_anchor = start_line_info.line_number
+  local start_text = start_line_info.search_text
+  local end_anchor = end_line_info.line_number
+  local end_text = end_line_info.search_text
 
-  -- dry_run 模式：仅预览匹配结果，不执行替换
-  if dry_run then
-    local matches = {}
-    local search_start = 1
-    local max_iterations = 10000
-    local iteration = 0
-    while true do
-      iteration = iteration + 1
-      if iteration > max_iterations then
-        break
-      end
-      local s_pos, e_pos = pcre_find(file_content, pattern, search_start)
-      if not s_pos then
-        break
-      end
-      -- 防死循环：如果位置没有推进，强制推进
-      if s_pos < search_start then
-        s_pos = search_start
-      end
-      if e_pos < s_pos then
-        e_pos = s_pos
-      end
-      local start_ln = 1
-      for i = 1, s_pos - 1 do
-        if file_content:sub(i, i) == "\n" then
-          start_ln = start_ln + 1
-        end
-      end
-      local end_ln = start_ln
-      for i = s_pos, e_pos - 1 do
-        if file_content:sub(i, i) == "\n" then
-          end_ln = end_ln + 1
-        end
-      end
-      local preview = file_content:sub(s_pos, math.min(s_pos + 199, e_pos or s_pos))
-      preview = preview:gsub("\n", "\\n")
-      if #preview >= 200 then
-        preview = preview .. "..."
-      end
-      table.insert(matches, {
-        start_line = start_ln,
-        end_line = end_ln,
-        preview = preview,
-      })
-      search_start = e_pos + 1
-      -- 防止空匹配导致无限循环
-      if search_start <= s_pos then
-        search_start = s_pos + 1
-      end
-    end
-
-    if on_success then
-      on_success({
-        filepath = filepath,
-        success = true,
-        dry_run = true,
-        match_count = #matches,
-        matches = matches,
-        notice = string.format("dry_run 模式：共找到 %d 处匹配，未修改文件", #matches),
-      })
+  if not start_anchor or not start_text or not end_anchor or not end_text then
+    if on_error then
+      on_error("start_line 和 end_line 必须为 {line_number, search_text} 格式")
     end
     return
   end
 
-  if start_line or end_line then
-    -- 先剥掉末尾换行再 split，避免末尾空串干扰；最后统一加回
-    local has_trailing_nl = file_content:sub(-1) == "\n"
-    local content = has_trailing_nl and file_content:sub(1, -2) or file_content
-    local lines = vim.split(content, "\n", { plain = true })
-    local total_lines = #lines
-
-    local s = start_line or 1
-    local e = end_line or total_lines
-
-    -- 校验范围
-    if s < 1 then
-      s = 1
+  if start_anchor < 1 or start_anchor > total_lines then
+    if on_error then
+      on_error(string.format("start_line 行号 %d 超出文件范围 (1-%d)", start_anchor, total_lines))
     end
-    if e > total_lines then
-      e = total_lines
+    return
+  end
+  if end_anchor < 1 or end_anchor > total_lines then
+    if on_error then
+      on_error(string.format("end_line 行号 %d 超出文件范围 (1-%d)", end_anchor, total_lines))
     end
-    if s > e then
-      if on_error then
-        on_error(string.format("起始行(%d)不能大于结束行(%d)", s, e))
-      end
-      return
-    end
+    return
+  end
 
-    -- 切成三部分：头 / 中间 / 尾
-    local head = s > 1 and table.concat(lines, "\n", 1, s - 1) or nil
-    local middle = table.concat(lines, "\n", s, e)
-    local tail = e < total_lines and table.concat(lines, "\n", e + 1, total_lines) or nil
-
-    -- 只对中间部分进行替换
-    local replaced_middle, replace_count = pcre_gsub(middle, pattern, replacement)
-
-    if replace_count == 0 then
-      if on_success then
-        on_success({
-          filepath = filepath,
-          success = true,
-          replace_count = 0,
-          start_line = s,
-          end_line = e,
-          notice = string.format("在 %d-%d 行范围内未找到匹配的内容，文件未做修改", s, e),
-        })
-      end
-      return
+  local start_range = find_text_range(lines, start_anchor, start_text)
+  if not start_range then
+    if on_error then
+      on_error(string.format("在行 %d 附近未找到匹配文本: %s", start_anchor, start_text))
     end
+    return
+  end
 
-    -- 头 + 替换后的中间 + 尾 → 拼接
-    local parts = {}
-    if head then
-      table.insert(parts, head)
+  local end_range = find_text_range(lines, end_anchor, end_text)
+  if not end_range then
+    if on_error then
+      on_error(string.format("在行 %d 附近未找到匹配文本: %s", end_anchor, end_text))
     end
-    table.insert(parts, replaced_middle)
-    if tail then
-      table.insert(parts, tail)
-    end
-    local new_content = table.concat(parts, "\n")
-    if has_trailing_nl then
-      new_content = new_content .. "\n"
-    end
+    return
+  end
 
-    local success, write_err = fu.write_file(filepath, new_content, false)
-    if success == true then
-      if on_success then
-        on_success({
-          filepath = filepath,
-          success = true,
-          replace_count = replace_count,
-          start_line = s,
-          end_line = e,
-        })
-      end
-    else
-      if on_error then
-        on_error(string.format("写入文件失败 %s: %s", filepath, write_err or "写入失败"))
-      end
+  local replace_start = start_range.start_line
+  local replace_end = end_range.end_line
+
+  if replace_start > replace_end then
+    if on_error then
+      on_error(
+        string.format(
+          "起始匹配范围(行 %d-%d)在结束匹配范围(行 %d-%d)之后，请检查搜索文本",
+          start_range.start_line,
+          start_range.end_line,
+          end_range.start_line,
+          end_range.end_line
+        )
+      )
+    end
+    return
+  end
+
+  -- 构建新文件内容
+  local new_lines = {}
+  for i = 1, replace_start - 1 do
+    table.insert(new_lines, lines[i])
+  end
+  local replacement_lines = vim.split(new_text, "\n", { plain = true })
+  for _, rl in ipairs(replacement_lines) do
+    table.insert(new_lines, rl)
+  end
+  for i = replace_end + 1, total_lines do
+    table.insert(new_lines, lines[i])
+  end
+
+  local new_content_str = table.concat(new_lines, "\n")
+  if has_trailing_nl then
+    new_content_str = new_content_str .. "\n"
+  end
+
+  local success, write_err = fu.write_file(filepath, new_content_str, false)
+  if success == true then
+    if on_success then
+      on_success({
+        filepath = filepath,
+        success = true,
+        start_line = replace_start,
+        end_line = replace_end,
+        replaced_text = table.concat(lines, "\n", replace_start, replace_end),
+      })
     end
   else
-    -- 全文替换
-    local new_content, replace_count = pcre_gsub(file_content, pattern, replacement)
-
-    if replace_count == 0 then
-      if on_success then
-        on_success({
-          filepath = filepath,
-          success = true,
-          replace_count = 0,
-          notice = "未找到匹配的内容，文件未做修改",
-        })
-      end
-      return
-    end
-
-    local success, write_err = fu.write_file(filepath, new_content, false)
-    if success == true then
-      if on_success then
-        on_success({
-          filepath = filepath,
-          success = true,
-          replace_count = replace_count,
-        })
-      end
-    else
-      if on_error then
-        on_error(string.format("写入文件失败 %s: %s", filepath, write_err or "写入失败"))
-      end
+    if on_error then
+      on_error(string.format("写入文件失败 %s: %s", filepath, write_err or "写入失败"))
     end
   end
 end
 
 M.replace_text = {
   name = "replace_text",
-  description = "使用正则表达式在文件中查找并替换文本。应优先选择这个工具来编辑文件内容，它比逐行编辑更高效、更精确。支持 PCRE 正则，可通过 pattern 参数指定匹配模式，replacement 参数指定替换文本。可通过可选的 start_line 和 end_line 参数限定替换的行范围（从1开始计数，含首尾行），不指定则替换整个文件。\n\n安全特性：\n- 当匹配模式包含换行符（\\n）且未指定 start_line/end_line 时，自动阻止执行并列出所有匹配位置\n- 可通过 allow_multi_line=true 跳过此安全检查\n- 可通过 dry_run=true 仅预览匹配结果而不实际修改文件",
+  description = [[替换文件中指定范围的文本内容。替换的是从 **start_line 匹配行的行首**到 **end_line 匹配行的行尾**的完整范围，而非行内的子串。
+  start_line = { line_number: 行号, search_text: "搜索文本" }
+  end_line = { line_number: 行号, search_text: "搜索文本" }
+  工具会从指定行号开始上下查找匹配的文本
+  示例：
+  { filepath = "/path/to/file", start_line = {line_number = 5, search_text = "function foo"}, end_line = {line_number = 7, search_text = "}"}, new_text = "新的函数内容" }]],
   func = _replace_text,
   async = true,
   parameters = {
     type = "object",
     properties = {
       filepath = { type = "string", description = "文件路径（必填）" },
-      pattern = {
-        type = "string",
-        description = "匹配的正则表达式（必填，正则表达式的关键字需要添加转义）",
+      start_line = {
+        type = "object",
+        properties = {
+          line_number = { type = "number", description = "行号" },
+          search_text = { type = "string", description = "搜索文本" },
+        },
+        required = { "line_number", "search_text" },
+        additionalProperties = false,
+        description = "起始行定位：{line_number, search_text}，工具从该行号上下查找匹配文本，确定替换起始位置",
       },
-      replacement = {
-        type = "string",
-        description = "替换的文本（必填），支持正则捕获引用如 $1, $2 等",
-      },
-      start_line = { type = "number", description = "搜索起始行号（可选，从1开始，含该行）" },
       end_line = {
-        type = "number",
-        description = "搜索结束行号（可选，从1开始，含该行，需 >= start_line）",
+        type = "object",
+        properties = {
+          line_number = { type = "number", description = "行号" },
+          search_text = { type = "string", description = "搜索文本" },
+        },
+        required = { "line_number", "search_text" },
+        additionalProperties = false,
+        description = "结束行定位：{line_number, search_text}，工具从该行号上下查找匹配文本，确定替换结束位置",
       },
-      dry_run = {
-        type = "boolean",
-        description = "预览模式（可选）：仅查找匹配位置并返回，不实际修改文件",
-      },
-      allow_multi_line = {
-        type = "boolean",
-        description = "安全开关（可选）：设为 true 可跳过多行匹配的安全检查，允许跨行替换而不限定行范围",
+      new_text = {
+        type = "string",
+        description = "替换后的新文本内容（必填）",
       },
     },
-    required = { "filepath", "pattern", "replacement" },
+    required = { "filepath", "start_line", "end_line", "new_text" },
   },
   returns = {
     type = "object",
     properties = {
       filepath = { type = "string" },
       success = { type = "boolean" },
-      replace_count = { type = "number", description = "实际替换的次数" },
-      start_line = { type = "number", description = "搜索起始行号（指定行范围时返回）" },
-      end_line = { type = "number", description = "搜索结束行号（指定行范围时返回）" },
-      notice = { type = "string", description = "提示信息（如无匹配时）" },
-      dry_run = { type = "boolean", description = "是否为预览模式" },
-      match_count = { type = "number", description = "dry_run 模式下匹配的总数" },
-      matches = {
-        type = "array",
-        description = "dry_run 模式下的匹配详情列表",
-        items = {
-          type = "object",
-          properties = {
-            start_line = { type = "number" },
-            end_line = { type = "number" },
-            preview = { type = "string" },
-          },
-        },
-      },
+      start_line = { type = "number", description = "实际替换的起始行号" },
+      end_line = { type = "number", description = "实际替换的结束行号" },
+      replaced_text = { type = "string", description = "被替换的原始文本内容" },
     },
-    description = "替换结果，包含文件路径、是否成功、替换次数等信息",
+    description = "替换结果，包含文件路径、是否成功、替换范围等信息",
   },
   category = "file",
   permissions = { write = true },

@@ -2518,11 +2518,17 @@ function M._setup_event_listeners()
             if msg_idx ~= folded_idx then
               table.remove(state.messages, msg_idx)
             end
-            -- 刷新缓冲区显示：将更新后的 content 渲染到聊天窗口
-            -- 此时 state.streaming.message_index 可能已被 reset_streaming_state 清空
-            -- 使用 state.tool_display.message_index 作为备选
+            -- 折叠文本已通过 TOOL_EXECUTION_COMPLETED 逐工具渲染到缓冲区
+            -- AI 正文如果是流式返回的，已通过 STREAM_CHUNK 渲染到缓冲区
+            -- 此处只更新 state.messages，不再调用 _render_streaming_message 重新渲染
+            -- 避免 _render_streaming_message 使用 message_start_line 替换时
+            -- 将折叠文本插入到正文区域之前导致内容重复
             state.streaming.message_index = folded_idx
-            M._render_streaming_message(data.window_id)
+            -- 如果 AI 正文非空且不是流式返回的（非流式场景），追加纯正文到缓冲区
+            local append_str = _content_to_str(append_content)
+            if append_str ~= "" and state.streaming.generation_id ~= data.generation_id then
+              M._append_message_to_buffer("assistant", append_str, data.window_id)
+            end
           else
             state.messages[msg_idx].content = content_with_reasoning
             M._render_streaming_message(data.window_id)
@@ -2542,9 +2548,13 @@ function M._setup_event_listeners()
             local folded_str = _content_to_str(state.messages[folded_idx].content)
             local append_str = _content_to_str(append_content)
             state.messages[folded_idx].content = folded_str .. "\n\n" .. append_str
-            -- 刷新缓冲区显示
+            -- 折叠文本已通过 TOOL_EXECUTION_COMPLETED 逐工具渲染到缓冲区
+            -- 此处只更新 state.messages，不再调用 _render_streaming_message 重新渲染
             state.streaming.message_index = folded_idx
-            M._render_streaming_message(data.window_id)
+            -- 如果 AI 正文非空且不是流式返回的（非流式场景），追加纯正文到缓冲区
+            if append_str ~= "" and state.streaming.generation_id ~= data.generation_id then
+              M._append_message_to_buffer("assistant", append_str, data.window_id)
+            end
           else
             table.insert(
               state.messages,
@@ -2583,6 +2593,11 @@ function M._setup_event_listeners()
         })
       end
 
+      -- 在清理状态之前，保存 folded_saved 的值供 had_stream_prefix 判断使用
+      -- folded_saved 为 true 表示工具折叠文本已通过 TOOL_EXECUTION_COMPLETED 逐工具渲染到缓冲区
+      -- 应视为已有流式内容，避免 _append_message_to_buffer 追加整个消息导致折叠文本重复
+      local _had_folded_saved = state.tool_display.folded_saved
+
       -- 清理状态
       state.tool_display.folded_saved = false
       if has_tool_results then
@@ -2612,9 +2627,12 @@ function M._setup_event_listeners()
       -- 保存流式状态，用于判断是否需要增量更新
       -- 注意：reasoning_done 为 true 表示思考过程折叠文本已通过 _append_reasoning_folded_to_buffer 追加到缓冲区
       -- 此时即使 prefix_added 为 false（只有思考没有正文），也应视为已有流式内容，避免重复追加
+      -- _had_folded_saved 为 true 表示工具折叠文本已通过 TOOL_EXECUTION_COMPLETED 逐工具渲染到缓冲区
+      -- 同样应视为已有流式内容，避免 _append_message_to_buffer 追加整个消息导致折叠文本重复
       local had_stream_prefix = state.streaming.prefix_added
         or state.streaming.reasoning_prefix_added
         or state.streaming.reasoning_done
+        or _had_folded_saved
       state.tool_display.active = false
       reset_streaming_state()
       state.tool_loop_in_progress = false
@@ -2749,6 +2767,11 @@ function M._setup_event_listeners()
         cancel_reasoning_timer()
         -- 仅在光标跟随模式下显示思考过程悬浮窗
         if should_follow then
+          -- 打开思考过程悬浮窗前，关闭工具调用悬浮窗（避免重叠遮挡）
+          if state.tool_display.active then
+            close_tool_display()
+            reset_tool_display()
+          end
           reasoning_display.show("🤔 AI正在思考...")
         end
       end
@@ -2993,6 +3016,12 @@ function M._setup_event_listeners()
       -- 同步更新本地状态
       state.tool_display.streaming_preview.generation_id = gen_id
       state.tool_display.streaming_preview.tools = tool_display_component.get_streaming_preview_tools()
+
+      -- 打开接收参数预览窗前，关闭工具调用悬浮窗（避免重叠遮挡）
+      if state.tool_display.active then
+        close_tool_display()
+        reset_tool_display()
+      end
 
       -- 委托 tool_display_component 处理节流和预览窗口显示
       -- 注意：_pending_append 由 tool_display_component.update_streaming_tools 内部累积

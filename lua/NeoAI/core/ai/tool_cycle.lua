@@ -1532,14 +1532,28 @@ function M.on_generation_complete(data)
       local args = func.arguments
       -- 尝试修复 arguments：如果是字符串，尝试 JSON 解析
       if type(args) == "string" then
+        -- 先尝试直接解析
         local ok, parsed = pcall(vim.json.decode, args)
+        local used_fix = false
+        if not ok or type(parsed) ~= "table" then
+          -- 修复：AI 有时会在包含双引号的字符串值周围使用单引号（如 '"""text"""'），这不是合法 JSON
+          -- 将单引号包裹的字符串值中的双引号转义，然后把单引号换为双引号
+          local fixed_args = args:gsub("'([^']-)'", function(inner)
+            local escaped = inner:gsub('"', '\\"')
+            return '"' .. escaped .. '"'
+          end)
+          ok, parsed = pcall(vim.json.decode, fixed_args)
+          used_fix = true
+        end
         if ok and type(parsed) == "table" then
           func.arguments = parsed
           args = parsed
-          logger.warn(
-            "[tool_orchestrator] on_generation_complete: 工具 '%s' 的 arguments 为字符串，已解析为 table",
-            func.name
-          )
+          if used_fix then
+            logger.warn(
+              "[tool_orchestrator] on_generation_complete: 工具 '%s' 的 arguments 为字符串（已修复单引号），已解析为 table",
+              func.name
+            )
+          end
         else
           -- 容错：create_sub_agent 的 arguments 不是 JSON 时，将纯文本作为 task 参数
           if func.name == "create_sub_agent" and type(args) == "string" and args ~= "" then
