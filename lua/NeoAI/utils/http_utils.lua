@@ -244,6 +244,19 @@ function M.read_file(filepath)
   return ok and content or nil
 end
 
+--- 写入文件内容
+--- @param filepath string
+--- @param content string
+function M.write_file(filepath, content)
+  pcall(function()
+    local f = io.open(filepath, "w")
+    if f then
+      f:write(content)
+      f:close()
+    end
+  end)
+end
+
 -- =====================================================================
 -- curl 调用
 -- =====================================================================
@@ -844,6 +857,10 @@ function M.send_request(params)
       .. (request_body:len() > 2000 and "...[truncated]" or "")
   )
   local temp_file = vim.fn.tempname()
+  -- 将请求体写入临时文件，避免命令行参数过长导致 E903
+  local body_file = vim.fn.tempname()
+  M.write_file(body_file, request_body)
+
   local headers = request_handler.get_headers(api_key, api_type)
 
   local curl_args = { "-s", "-X", "POST", base_url, "-H", "Content-Type: application/json" }
@@ -855,7 +872,7 @@ function M.send_request(params)
   end
   vim.list_extend(curl_args, {
     "-d",
-    request_body,
+    "@" .. body_file,
     "-o",
     temp_file,
   })
@@ -1015,6 +1032,10 @@ function M.send_request_retry(params, on_complete)
   )
 
   local temp_file = vim.fn.tempname()
+  -- 将请求体写入临时文件，避免命令行参数过长
+  local body_file = vim.fn.tempname()
+  M.write_file(body_file, request_body)
+
   local headers = request_handler.get_headers(api_key, api_type)
 
   local curl_args = { "-s", "-X", "POST", base_url, "-H", "Content-Type: application/json" }
@@ -1026,7 +1047,7 @@ function M.send_request_retry(params, on_complete)
   end
   vim.list_extend(curl_args, {
     "-d",
-    request_body,
+    "@" .. body_file,
     "-o",
     temp_file,
   })
@@ -1034,6 +1055,8 @@ function M.send_request_retry(params, on_complete)
   local cmd = vim.list_extend({ "curl" }, curl_args)
   local ok, result = pcall(vim.fn.system, cmd)
   local exit_code = vim.v.shell_error
+
+  pcall(vim.fn.delete, body_file)
 
   if not ok or exit_code ~= 0 then
     pcall(vim.fn.delete, temp_file)
@@ -1731,6 +1754,10 @@ function M.send_request_async(params, on_complete)
   )
 
   local temp_file = vim.fn.tempname()
+  -- 将请求体写入临时文件，避免命令行参数过长导致 E903
+  local body_file = vim.fn.tempname()
+  M.write_file(body_file, request_body)
+
   local headers = request_handler.get_headers(api_key, api_type)
 
   local curl_args = { "-s", "-X", "POST", base_url, "-H", "Content-Type: application/json" }
@@ -1742,7 +1769,7 @@ function M.send_request_async(params, on_complete)
   end
   vim.list_extend(curl_args, {
     "-d",
-    request_body,
+    "@" .. body_file,
     "-o",
     temp_file,
   })
@@ -1752,6 +1779,7 @@ function M.send_request_async(params, on_complete)
 
   _http_state.active_requests[request_id] = {
     generation_id = generation_id,
+    body_file = body_file,
     temp_file = temp_file,
     cancelled = false,
     has_error = false,
@@ -1767,6 +1795,9 @@ function M.send_request_async(params, on_complete)
       end
     end,
     on_exit = function(_, exit_code, _)
+      -- 清理请求体临时文件
+      pcall(vim.fn.delete, body_file)
+
       local req = _http_state.active_requests[request_id]
       if not req then
         -- 请求已被取消
@@ -1859,6 +1890,8 @@ function M.send_request_async(params, on_complete)
           end
           if retry_ok_encode then
             local retry_temp = vim.fn.tempname()
+            local retry_body_file = vim.fn.tempname()
+            M.write_file(retry_body_file, retry_body)
             local retry_args = { "-s", "-X", "POST", base_url, "-H", "Content-Type: application/json" }
             for k, v in pairs(headers) do
               if k ~= "Content-Type" then
@@ -1868,7 +1901,7 @@ function M.send_request_async(params, on_complete)
             end
             vim.list_extend(retry_args, {
               "-d",
-              retry_body,
+              "@" .. retry_body_file,
               "-o",
               retry_temp,
             })
@@ -1883,6 +1916,7 @@ function M.send_request_async(params, on_complete)
                 end
               end,
               on_exit = function(_, retry_exit_code, _)
+                pcall(vim.fn.delete, retry_body_file)
                 if retry_exit_code ~= 0 then
                   pcall(vim.fn.delete, retry_temp)
                   if on_complete then
@@ -1975,6 +2009,7 @@ function M.send_request_async(params, on_complete)
   if not job_id or job_id <= 0 then
     _http_state.active_requests[request_id] = nil
     pcall(vim.fn.delete, temp_file)
+    pcall(vim.fn.delete, body_file)
     if on_complete then
       vim.schedule(function()
         on_complete(nil, "curl jobstart failed")

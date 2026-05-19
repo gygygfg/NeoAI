@@ -264,6 +264,7 @@ local function create_session_state(session_id, window_id)
     _param_retry_count = 0, -- 参数修正重试计数（工具执行失败后 AI 修正参数的重试）
     _generation_completed = false, -- GENERATION_COMPLETED 事件是否已到达
     _tools_all_completed = false, -- TOOL_EXECUTION_ALL_COMPLETED 事件是否已到达
+    _executed_tool_call_ids = {}, -- 已执行过的 tool_call_id 集合（用于去重）
     on_complete = nil,
     autocmd_ids = {},
   }
@@ -584,10 +585,18 @@ function M._execute_tools(session_id, tool_calls, is_sub_agent)
   -- 防止重复触发：如果 phase 已经是 waiting_tools，说明 _execute_tools 已被调用过
   -- 此时工具正在执行中，跳过本次调用避免重复执行
   if ss.phase == "waiting_tools" then
+    local tool_names_str = ""
+    for _, tc in ipairs(tool_calls) do
+      local func = tc["function"] or tc.func
+      local name = func and func.name or "unknown"
+      local tid = tc.id or "no-id"
+      tool_names_str = tool_names_str .. name .. "(" .. tid .. "), "
+    end
     require("NeoAI.utils.logger").warn(
-      "[tool_orchestrator] _execute_tools 跳过: phase 已是 waiting_tools, session=%s, tool_calls=%d",
+      "[tool_orchestrator] _execute_tools 跳过: phase 已是 waiting_tools, session=%s, tools=[%s], stack=%s",
       tostring(session_id),
-      #tool_calls
+      tool_names_str,
+      debug.traceback()
     )
     return
   end
@@ -823,6 +832,18 @@ function M._execute_single_tool(session_id, tool_call, is_sub_agent)
   if not ss.active_tool_calls[tool_call_id] then
     ss.active_tool_calls[tool_call_id] = true
   end
+
+  -- ===== tool_call_id 级别去重：防止同一个工具调用被执行两次 =====
+  if ss._executed_tool_call_ids[tool_call_id] then
+    require("NeoAI.utils.logger").warn(
+      "[tool_orchestrator] _execute_single_tool 跳过: tool_call_id 已执行过, session=%s, tool=%s, tool_call_id=%s",
+      tostring(session_id),
+      tostring(tool_name),
+      tostring(tool_call_id)
+    )
+    return
+  end
+  ss._executed_tool_call_ids[tool_call_id] = true
 
   -- ===== 子 agent 工具调用边界审核 =====
   if is_sub_agent then
@@ -1402,6 +1423,7 @@ function M._proceed_to_next_round(session_id, is_sub_agent)
 
   ss.phase = "idle"
   ss.active_tool_calls = {}
+  ss._executed_tool_call_ids = {} -- 重置已执行工具 ID 集合，新的一轮重新计数
 
   if ss.stop_requested then
     ss._proceed_in_progress = false
@@ -2038,6 +2060,7 @@ function M._finish_loop(session_id, success, result, is_sub_agent)
 
     -- idle 状态由 TOOL_LOOP_FINISHED 监听器统一设置
     ss.active_tool_calls = {}
+    ss._executed_tool_call_ids = {}
     ss.current_iteration = 0
     ss.generation_id = nil
     ss._generation_completed = false
@@ -2075,6 +2098,7 @@ function M._finish_loop(session_id, success, result, is_sub_agent)
   ss.on_complete = nil
   -- idle 状态由 TOOL_LOOP_FINISHED 监听器统一设置
   ss.active_tool_calls = {}
+  ss._executed_tool_call_ids = {}
   ss.current_iteration = 0
   ss.generation_id = nil
   ss._generation_completed = false

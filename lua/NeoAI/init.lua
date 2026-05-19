@@ -7,7 +7,6 @@ local config_merger = require("NeoAI.core.config.merger")
 local core = require("NeoAI.core")
 local ui = require("NeoAI.ui")
 local tools = require("NeoAI.tools")
-local codecompanion_fix = require("NeoAI.patches.codecompanion_fix")
 
 -- ========== 闭包内私有状态 ==========
 local core_ref
@@ -111,7 +110,10 @@ local function register_commands()
       end
       local results = tests.run_all(table.unpack(tests_to_run))
       -- 汇总统计已由 tests.run_all 写入日志文件，此处仅通过 vim.notify 显示到消息区域
-      vim.notify(string.format("测试结果: %d 通过, %d 失败", results.passed, results.failed), vim.log.levels.INFO)
+      vim.notify(
+        string.format("测试结果: %d 通过, %d 失败", results.passed, results.failed),
+        vim.log.levels.INFO
+      )
       if #results.errors > 0 then
         local error_msgs = {}
         for _, e in ipairs(results.errors) do
@@ -122,7 +124,10 @@ local function register_commands()
     else
       local results = tests.run_all()
       -- 汇总统计已由 tests.run_all 写入日志文件，此处仅通过 vim.notify 显示到消息区域
-      vim.notify(string.format("测试结果: %d 通过, %d 失败", results.passed, results.failed), vim.log.levels.INFO)
+      vim.notify(
+        string.format("测试结果: %d 通过, %d 失败", results.passed, results.failed),
+        vim.log.levels.INFO
+      )
       if #results.errors > 0 then
         local error_msgs = {}
         for _, e in ipairs(results.errors) do
@@ -258,11 +263,17 @@ function M.setup(user_config)
         },
       }
       -- 构建 AI 请求用的工具定义格式
-      local tf = { name = tool_def.name, description = tool_def.description or ("执行 " .. tool_def.name .. " 操作") }
+      local tf =
+        { name = tool_def.name, description = tool_def.description or ("执行 " .. tool_def.name .. " 操作") }
       local params = tool_def.parameters
       if params and type(params) == "table" then
         local has_props = false
-        if params.properties then for _,_ in pairs(params.properties) do has_props = true; break end end
+        if params.properties then
+          for _, _ in pairs(params.properties) do
+            has_props = true
+            break
+          end
+        end
         if has_props then
           local cp = { type = params.type or "object", properties = params.properties }
           if params.required and type(params.required) == "table" and #params.required > 0 then
@@ -284,9 +295,6 @@ function M.setup(user_config)
   -- 退出事件由 history_manager 内部的 VimLeavePre 统一处理（同步保存）
   -- 不要在 init.lua 中重复注册，避免退出时多次保存导致死锁
   -- 同时避免在退出过程中调用 cancel_generation（会尝试取消 HTTP 请求和触发事件）
-
-  -- 加载 CodeCompanion buffer 失效补丁
-  codecompanion_fix.setup()
 
   -- 注册文件编码自动命令
   vim.api.nvim_create_autocmd("BufRead", {
