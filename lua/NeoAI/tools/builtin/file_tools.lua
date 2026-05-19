@@ -221,6 +221,29 @@ M.read_file = {
 -- 工具 replace_text
 -- ============================================================================
 
+--- 将 vim.diagnostic 列表格式化为统一结构
+--- @param diagnostics table vim.diagnostic.get 返回的诊断列表
+--- @return table 格式化后的诊断列表
+local function format_diagnostics(diagnostics)
+  if not diagnostics then
+    return {}
+  end
+  local results = {}
+  for _, d in ipairs(diagnostics) do
+    table.insert(results, {
+      message = d.message,
+      severity = d.severity, -- 1=Error,2=Warn,3=Info,4=Hint
+      source = d.source,
+      code = d.code,
+      lnum = d.lnum and d.lnum + 1 or nil, -- 转为 1-based
+      end_lnum = d.end_lnum and d.end_lnum + 1 or nil,
+      col = d.col and d.col + 1 or nil,
+      end_col = d.end_col and d.end_col + 1 or nil,
+    })
+  end
+  return results
+end
+
 --- 规范化行文本：去除 \r，tab 转空格
 local function normalize_line_text(line)
   if not line then
@@ -431,21 +454,77 @@ local function _replace_text(args, on_success, on_error)
   end
 
   local success, write_err = fu.write_file(filepath, new_content_str, false)
-  if success == true then
-    if on_success then
-      on_success({
-        filepath = filepath,
-        success = true,
-        start_line = replace_start,
-        end_line = replace_end,
-        replaced_text = table.concat(lines, "\n", replace_start, replace_end),
-      })
-    end
-  else
+  if success ~= true then
     if on_error then
       on_error(string.format("写入文件失败 %s: %s", filepath, write_err or "写入失败"))
     end
+    return
   end
+
+  -- 写入成功，构建基础结果
+  local base_result = {
+    filepath = filepath,
+    success = true,
+    start_line = replace_start,
+    end_line = replace_end,
+    diagnostics = {},
+    diagnostic_count = 0,
+  }
+
+  -- 异步加载文件到 buffer 并监听 LSP 诊断，诊断到达后再调用 on_success
+  vim.schedule(function()
+    local lsp_ok, lsp_utils = pcall(require, "NeoAI.utils.lsp_utils")
+    if not lsp_ok or not lsp_utils or not lsp_utils.check_lsp() then
+      if on_success then
+        on_success(base_result)
+      end
+      return
+    end
+
+    local bufnr, cleanup, buf_err = lsp_utils.ensure_buf_loaded(filepath)
+    if buf_err or not bufnr then
+      if on_success then
+        on_success(base_result)
+      end
+      return
+    end
+
+    -- 用 DiagnosticChanged 自动命令监听诊断更新
+    local diag_timer = vim.defer_fn(function()
+      -- 超时保护：20 秒后不再等待，返回当前已有的诊断
+      if cleanup then
+        cleanup()
+      end
+      if on_success then
+        local diagnostics = vim.diagnostic.get(bufnr)
+        base_result.diagnostics = format_diagnostics(diagnostics)
+        base_result.diagnostic_count = #diagnostics
+        on_success(base_result)
+      end
+    end, 20000)
+
+    local augroup = vim.api.nvim_create_augroup("neoai_replace_text_diag_" .. bufnr, { clear = true })
+    vim.api.nvim_create_autocmd("DiagnosticChanged", {
+      group = augroup,
+      buffer = bufnr,
+      once = true,
+      callback = function()
+        diag_timer:stop()
+        diag_timer:close()
+
+        if cleanup then
+          cleanup()
+        end
+
+        if on_success then
+          local diagnostics = vim.diagnostic.get(bufnr)
+          base_result.diagnostics = format_diagnostics(diagnostics)
+          base_result.diagnostic_count = #diagnostics
+          on_success(base_result)
+        end
+      end,
+    })
+  end)
 end
 
 M.replace_text = {
@@ -491,14 +570,32 @@ M.replace_text = {
   },
   returns = {
     type = "object",
+    description = "替换结果，包含文件路径、是否成功、替换范围及 LSP 诊断信息",
     properties = {
       filepath = { type = "string" },
       success = { type = "boolean" },
       start_line = { type = "number", description = "实际替换的起始行号" },
       end_line = { type = "number", description = "实际替换的结束行号" },
-      replaced_text = { type = "string", description = "被替换的原始文本内容" },
+
+      diagnostic_count = { type = "number", description = "LSP 诊断数量（仅 LSP 可用时提供）" },
+      diagnostics = {
+        type = "array",
+        items = {
+          type = "object",
+          properties = {
+            message = { type = "string" },
+            severity = { type = "number", description = "1=错误, 2=警告, 3=信息, 4=提示" },
+            source = { type = "string" },
+            code = { type = "number" },
+            lnum = { type = "number", description = "行号（1-based）" },
+            end_lnum = { type = "number" },
+            col = { type = "number" },
+            end_col = { type = "number" },
+          },
+        },
+        description = "LSP 诊断列表（仅 LSP 可用时提供）",
+      },
     },
-    description = "替换结果，包含文件路径、是否成功、替换范围等信息",
   },
   category = "file",
   permissions = { write = true },

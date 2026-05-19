@@ -4,7 +4,6 @@
 -- 仅在 Neovim >= 0.5 且 Tree-sitter 可用时自动启用
 local M = {}
 
-
 local lm = require("NeoAI.utils.language_map")
 
 local block_node_types = {
@@ -685,7 +684,7 @@ local function _get_node_at_position(args, on_success, on_error)
       local lang = detect_lang_from_filepath(filepath)
       if not lang then
         if on_error then
-  local filepath = args.filepath
+          local filepath = args.filepath
         end
         return
       end
@@ -846,7 +845,7 @@ local function _with_parsed_tree(args, on_success, on_error, build_response)
       end
       return
     end
-  local filepath = args.filepath
+    local filepath = args.filepath
     if on_success then
       on_success(ret)
     end
@@ -1388,7 +1387,9 @@ local function _delete_node(args, on_success, on_error)
   -- 总超时保护：30 秒内未完成则报错退出
   local timeout_timer = uv.new_timer()
   local function finalize_with_timeout(msg, is_err)
-    if finalized then return end
+    if finalized then
+      return
+    end
     finalized = true
     timeout_timer:stop()
     timeout_timer:close()
@@ -1396,9 +1397,16 @@ local function _delete_node(args, on_success, on_error)
       on_error(msg)
     end
   end
-  timeout_timer:start(30000, 0, vim.schedule_wrap(function()
-    finalize_with_timeout("delete_node 操作超时（30 秒），Tree-sitter 解析或文件操作可能阻塞", true)
-  end))
+  timeout_timer:start(
+    30000,
+    0,
+    vim.schedule_wrap(function()
+      finalize_with_timeout(
+        "delete_node 操作超时（30 秒），Tree-sitter 解析或文件操作可能阻塞",
+        true
+      )
+    end)
+  )
 
   parse_file_content_async(filepath, -1, function(result)
     local filtered, fallback = filter_nodes(result.nodes, args)
@@ -1724,35 +1732,38 @@ local function _edit_node(args, on_success, on_error)
 
       local fu = require("NeoAI.utils.file_utils")
       fu.write_file_async(abs_path, content_to_write, function()
-        -- 如果文件已在 Neovim 中打开，刷新缓冲区
-        local bufnr = vim.fn.bufnr(abs_path)
-        if bufnr ~= -1 then
-          pcall(vim.api.nvim_buf_call, bufnr, function()
-            vim.cmd("edit!")
-          end)
-        end
-
-        local ret = {
-          filepath = args.filepath,
-          language = result.language,
-          node_type = target.type,
-          start_row = sr,
-          start_col = sc,
-          end_row = er,
-          end_col = ec,
-        }
-        if fallback then
-          ret.warning = "未找到指定 node_type '"
-            .. (args.node_type or "")
-            .. "' 的节点，已回退到同类型节点"
-        end
-        if on_success then
-          if timeout_timer then
-            timeout_timer:stop()
-            timeout_timer:close()
+        -- write_file_async 的回调在 fast event 上下文中，需切换到主线程
+        vim.schedule(function()
+          -- 如果文件已在 Neovim 中打开，刷新缓冲区
+          local bufnr = vim.fn.bufnr(abs_path)
+          if bufnr ~= -1 then
+            pcall(vim.api.nvim_buf_call, bufnr, function()
+              vim.cmd("edit!")
+            end)
           end
-          on_success(ret)
-        end
+
+          local ret = {
+            filepath = args.filepath,
+            language = result.language,
+            node_type = target.type,
+            start_row = sr,
+            start_col = sc,
+            end_row = er,
+            end_col = ec,
+          }
+          if fallback then
+            ret.warning = "未找到指定 node_type '"
+              .. (args.node_type or "")
+              .. "' 的节点，已回退到同类型节点"
+          end
+          if on_success then
+            if timeout_timer then
+              timeout_timer:stop()
+              timeout_timer:close()
+            end
+            on_success(ret)
+          end
+        end)
       end, function(err_msg)
         if on_error then
           finalize_with_timeout("写入文件失败: " .. err_msg, true)

@@ -11,6 +11,7 @@ M.ext_to_lang = {
   yaml = "yaml", yml = "yaml", md = "markdown", sh = "bash",
   bash = "bash", zsh = "bash", css = "css", html = "html", htm = "html",
   vue = "vue", svelte = "svelte", toml = "toml", sql = "sql",
+  gd = "gdscript", gdscript = "gdscript",
   cmake = "cmake", dockerfile = "dockerfile", make = "make",
   query = "query", regex = "regex",
 }
@@ -25,6 +26,7 @@ M.ext_to_parser = {
   [".bash"] = "bash", [".zsh"] = "bash", [".css"] = "css",
   [".html"] = "html", [".htm"] = "html", [".vue"] = "vue",
   [".svelte"] = "svelte", [".toml"] = "toml", [".sql"] = "sql",
+  [".gd"] = "gdscript",
   [".cmake"] = "cmake", [".mk"] = "make", [".query"] = "query",
   [".regex"] = "regex",
 }
@@ -37,7 +39,7 @@ M.ft_to_parser = {
   yaml = "yaml", markdown = "markdown", bash = "bash", sh = "bash",
   zsh = "bash", css = "css", html = "html", vue = "vue",
   svelte = "svelte", toml = "toml", sql = "sql", cmake = "cmake",
-  dockerfile = "dockerfile", make = "make", query = "query", regex = "regex",
+  dockerfile = "dockerfile", gdscript = "gdscript", make = "make", query = "query", regex = "regex",
 }
 
 M.ft_to_lsp_config = {
