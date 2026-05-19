@@ -3,8 +3,6 @@
 -- 在伪终端中启动shell，获取PID后通过exec替换进程，监控进程状态
 local M = {}
 
-local resolve_path = require("NeoAI.tools.builtin.tool_helpers").resolve_path
-
 -- ============================================================================
 -- 特殊按键映射表
 -- ============================================================================
@@ -390,7 +388,7 @@ local function _run_command(args, on_success, on_error, on_progress)
   -- 超时时间，默认 30 秒
   local timeout_sec = args.timeout or 30
   -- 工作目录，支持 ~ 和相对路径
-  local cwd = args.cwd and resolve_path(args.cwd) or vim.fn.getcwd()
+  local cwd = args.cwd or vim.fn.getcwd()
   -- 是否捕获 stderr（默认 true）
   local capture_stderr = true
   if args.capture_stderr ~= nil then
@@ -625,13 +623,13 @@ local function _run_command(args, on_success, on_error, on_progress)
       local timeout_prompt = build_timeout_check_message()
 
       -- 调用 AI 判断命令是否卡住或已完成
-      local tool_orchestrator = require("NeoAI.core.ai.tool_cycle")
       local chat_session_id = args._session_id
 
       -- 临时注册 check_shell_timeout 工具
-      local cleanup_tool = tool_orchestrator.register_tool_for_request("check_shell_timeout")
+      local tool_executor = require("NeoAI.tools.tool_executor")
+      local cleanup_tool = tool_executor.register_tool_for_request("check_shell_timeout")
 
-      tool_orchestrator.execute_single_tool_request(chat_session_id, "check_shell_timeout", {
+      tool_executor.execute_single_tool_request(chat_session_id, "check_shell_timeout", {
         prompt = timeout_prompt,
         stdout = timeout_prompt,
         command = command,
@@ -819,11 +817,11 @@ local function _run_command(args, on_success, on_error, on_progress)
 
     -- 调用AI决定输入内容
     -- 注意：PTY buffer 的读取放在 vim.schedule 回调内部，确保每次获取最新内容
-    local tool_orchestrator = require("NeoAI.core.ai.tool_cycle")
     local chat_session_id = args._session_id
 
     -- 临时注册 send_input 工具
-    local cleanup_tool = tool_orchestrator.register_tool_for_request("send_input")
+    local tool_executor = require("NeoAI.tools.tool_executor")
+    local cleanup_tool = tool_executor.register_tool_for_request("send_input")
 
     vim.schedule(function()
       -- 读取完整的 PTY buffer 内容，让 AI 看到完整的菜单和选项
@@ -927,7 +925,7 @@ local function _run_command(args, on_success, on_error, on_progress)
       -- 将轮次信息和历史摘要添加到 prompt 开头
       local enhanced_prompt = history_summary .. round_info .. prompt_output
 
-      tool_orchestrator.execute_single_tool_request(chat_session_id, "send_input", {
+      tool_executor.execute_single_tool_request(chat_session_id, "send_input", {
         prompt = enhanced_prompt,
         stdout = enhanced_prompt,
         stderr = stderr_output,
@@ -1052,9 +1050,9 @@ local function _run_command(args, on_success, on_error, on_progress)
                 end
                 -- 读取当前 PTY buffer 并记录位置，丢弃其中的内容
                 -- 这样下次 waiting 触发 AI 决策时，从新位置开始读取
-                local full_buffer = read_pty_buffer_output()
-                if full_buffer ~= "" then
-                  session.last_buffer_pos = #full_buffer
+                local pty_buffer = read_pty_buffer_output()
+                if pty_buffer ~= "" then
+                  session.last_buffer_pos = #pty_buffer
                 end
 
                 -- 立即恢复轮询，不再延迟。由 handle_process_state 中的 waiting 确认机制
@@ -1315,11 +1313,11 @@ local function _run_command(args, on_success, on_error, on_progress)
       end,
       on_exit = function(_, exit_code, signal)
         -- 停止同步定时器
-        if sync_timer then
-          if vim.fn.timer_info(sync_timer)[1] then
-            vim.fn.timer_stop(sync_timer)
+        if session._sync_timer then
+          if vim.fn.timer_info(session._sync_timer)[1] then
+            vim.fn.timer_stop(session._sync_timer)
           end
-          sync_timer = nil
+          session._sync_timer = nil
         end
 
         -- 修正退出码

@@ -4,7 +4,7 @@
 -- 仅在 Neovim >= 0.5 且 Tree-sitter 可用时自动启用
 local M = {}
 
-local resolve_path = require("NeoAI.tools.builtin.tool_helpers").resolve_path
+
 local lm = require("NeoAI.utils.language_map")
 
 local block_node_types = {
@@ -427,17 +427,8 @@ local function _parse_file(args, on_success, on_error)
 
   local max_depth = args.max_depth or 3
 
-  -- 解析 filepaths 列表中的路径
-  if args.filepaths and #args.filepaths > 0 then
-    local resolved_filepaths = {}
-    for _, fp in ipairs(args.filepaths) do
-      table.insert(resolved_filepaths, resolve_path(fp))
-    end
-    args.filepaths = resolved_filepaths
-  end
-
   -- 解析单个 filepath
-  local filepath = args.filepath and resolve_path(args.filepath) or nil
+  local filepath = args.filepath
 
   -- 处理 filepaths 列表
   if args.filepaths and #args.filepaths > 0 then
@@ -608,7 +599,7 @@ local function _query_tree(args, on_success, on_error)
   end
 
   local query_string = args.query
-  local filepath = resolve_path(args.filepath)
+  local filepath = args.filepath
 
   read_file_content_async(filepath, function(content)
     vim.schedule(function()
@@ -685,7 +676,7 @@ local function _get_node_at_position(args, on_success, on_error)
     return
   end
 
-  local filepath = resolve_path(args.filepath)
+  local filepath = args.filepath
   local target_row = args.row or 0
   local target_col = args.col or 0
 
@@ -694,7 +685,7 @@ local function _get_node_at_position(args, on_success, on_error)
       local lang = detect_lang_from_filepath(filepath)
       if not lang then
         if on_error then
-          on_error("无法确定文件语言")
+  local filepath = args.filepath
         end
         return
       end
@@ -846,7 +837,7 @@ local function _with_parsed_tree(args, on_success, on_error, build_response)
     return
   end
 
-  local filepath = resolve_path(args.filepath)
+  local filepath = args.filepath
   parse_file_content_async(filepath, -1, function(result)
     local filtered, fallback = filter_nodes(result.nodes, args)
     if #filtered == 0 then
@@ -855,7 +846,7 @@ local function _with_parsed_tree(args, on_success, on_error, build_response)
       end
       return
     end
-    local ret = build_response(result, filtered, fallback)
+  local filepath = args.filepath
     if on_success then
       on_success(ret)
     end
@@ -934,7 +925,7 @@ local function _get_node_range(args, on_success, on_error)
     return
   end
 
-  local filepath = resolve_path(args.filepath)
+  local filepath = args.filepath
 
   parse_file_content_async(filepath, -1, function(result)
     local filtered, fallback = filter_nodes(result.nodes, args)
@@ -1141,7 +1132,7 @@ local function _get_parent_node(args, on_success, on_error)
     return
   end
 
-  local filepath = resolve_path(args.filepath)
+  local filepath = args.filepath
 
   parse_file_content_async(filepath, -1, function(result)
     local parents, perr, fallback = _find_parent_by_attrs(result.nodes or {}, args.node_type, args.text, args.named)
@@ -1291,7 +1282,7 @@ local function _get_node_code(args, on_success, on_error)
     return
   end
 
-  local filepath = resolve_path(args.filepath)
+  local filepath = args.filepath
 
   parse_file_content_async(filepath, -1, function(result)
     local filtered, fallback = filter_nodes(result.nodes, args)
@@ -1390,7 +1381,7 @@ local function _delete_node(args, on_success, on_error)
     return
   end
 
-  local filepath = resolve_path(args.filepath)
+  local filepath = args.filepath
   local uv = vim.uv or vim.loop
   local finalized = false
 
@@ -1399,10 +1390,8 @@ local function _delete_node(args, on_success, on_error)
   local function finalize_with_timeout(msg, is_err)
     if finalized then return end
     finalized = true
-    if timeout_timer then
-      timeout_timer:stop()
-      timeout_timer:close()
-    end
+    timeout_timer:stop()
+    timeout_timer:close()
     if is_err and on_error then
       on_error(msg)
     end

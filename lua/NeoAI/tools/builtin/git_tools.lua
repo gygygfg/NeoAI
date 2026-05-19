@@ -4,7 +4,7 @@
 
 local M = {}
 
-local resolve_path = require("NeoAI.tools.builtin.tool_helpers").resolve_path
+
 
 -- ============================================================================
 -- 以下代码内联自 git_auto.lua
@@ -854,12 +854,6 @@ end
 local function _git_diff(args, on_success, on_error)
   local diff_filepath = args and args.filepath
   local cwd = args and args.cwd
-  if diff_filepath then
-    diff_filepath = resolve_path(diff_filepath)
-  end
-  if cwd then
-    cwd = resolve_path(cwd)
-  end
 
   local result = _git_auto_mod.get_diff(diff_filepath, cwd)
   if result then
@@ -906,9 +900,6 @@ M.git_diff = {
 local function _git_log(args, on_success, on_error)
   local max_count = args and args.max_count or 20
   local cwd = args and args.cwd
-  if cwd then
-    cwd = resolve_path(cwd)
-  end
 
   local result = _git_auto_mod.get_log(max_count, cwd)
   if result then
@@ -955,9 +946,6 @@ M.git_log = {
 
 local function _git_status(args, on_success, on_error)
   local cwd = args and args.cwd
-  if cwd then
-    cwd = resolve_path(cwd)
-  end
 
   local result = _git_auto_mod.get_status(cwd)
   if on_success then
@@ -1000,9 +988,6 @@ local function _git_commit_detail(args, on_success, on_error)
   end
 
   local cwd = args and args.cwd
-  if cwd then
-    cwd = resolve_path(cwd)
-  end
 
   local result = _git_auto_mod.get_commit_detail(args.commit_hash, cwd)
   if result then
@@ -1011,7 +996,7 @@ local function _git_commit_detail(args, on_success, on_error)
     end
   else
     if on_error then
-      on_error(string.format("未找到提交: %s", args.commit_hash))
+      on_error("获取提交详情失败")
     end
   end
 end
@@ -1056,29 +1041,16 @@ local function _git_rollback(args, on_success, on_error)
   end
 
   local cwd = args and args.cwd
-  if cwd then
-    cwd = resolve_path(cwd)
-  end
-
   local filepath = args.filepath
-  if filepath then
-    filepath = resolve_path(filepath)
-  end
 
   local ok, err = _git_auto_mod.rollback(args.commit_hash, filepath, cwd)
   if ok then
     if on_success then
-      on_success(
-        string.format(
-          "已成功回滚%s到提交 %s",
-          filepath and ("文件 '" .. filepath .. "'") or "",
-          args.commit_hash
-        )
-      )
+      on_success({ success = true, message = "回滚成功" })
     end
   else
     if on_error then
-      on_error(string.format("回滚失败: %s", err or "未知错误"))
+      on_error(err or "回滚失败")
     end
   end
 end
@@ -1126,11 +1098,8 @@ local function _git_file_history(args, on_success, on_error)
     return
   end
 
-  local filepath = resolve_path(args.filepath)
+  local filepath = args.filepath
   local cwd = args.cwd
-  if cwd then
-    cwd = resolve_path(cwd)
-  end
 
   local result = _git_auto_mod.get_file_history(filepath, cwd)
   if on_success then
@@ -1139,8 +1108,7 @@ local function _git_file_history(args, on_success, on_error)
 end
 
 M.git_file_history = {
-  name = "git_file_history",
-  description = "查看指定文件的修改历史记录",
+
   func = _git_file_history,
   async = true,
   parameters = {
@@ -1148,11 +1116,6 @@ M.git_file_history = {
     properties = {
       filepath = {
         type = "string",
-        description = "文件路径（必填）",
-      },
-      cwd = {
-        type = "string",
-        description = "工作目录路径（可选，默认当前项目目录）",
       },
     },
     required = { "filepath" },
@@ -1167,9 +1130,6 @@ M.git_file_history = {
 
 local function _git_branch(args, on_success, on_error)
   local cwd = args and args.cwd
-  if cwd then
-    cwd = resolve_path(cwd)
-  end
 
   if not _git_auto_mod.is_git_available() then
     if on_error then
@@ -1191,10 +1151,6 @@ local function _git_branch(args, on_success, on_error)
   if vim.v.shell_error == 0 then
     if on_success then
       on_success(result)
-    end
-  else
-    if on_error then
-      on_error("获取分支列表失败")
     end
   end
 end
@@ -1225,9 +1181,6 @@ M.git_branch = {
 -- 工具 git_auto_commit_config
 local function _git_auto_commit_config(args, on_success, on_error)
   local cwd = args and args.cwd
-  if cwd then
-    cwd = resolve_path(cwd)
-  end
 
   if not args or args.enabled == nil then
     -- 查询当前状态
@@ -1252,10 +1205,6 @@ local function _git_auto_commit_config(args, on_success, on_error)
 end
 
 M.git_auto_commit_config = {
-  name = "git_auto_commit_config",
-  description = "查看或配置自动提交功能的状态",
-  func = _git_auto_commit_config,
-  async = true,
   parameters = {
     type = "object",
     properties = {

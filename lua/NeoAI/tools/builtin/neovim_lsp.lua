@@ -4,7 +4,6 @@
 -- 仅在 Neovim >= 0.5 且 LSP 客户端可用时自动启用
 local M = {}
 
-local resolve_path = require("NeoAI.tools.builtin.tool_helpers").resolve_path
 local lm = require("NeoAI.utils.language_map")
 local lsp_utils = require("NeoAI.utils.lsp_utils")
 local file_utils = require("NeoAI.utils.file_utils")
@@ -1387,8 +1386,6 @@ local function _lsp_hover(args, on_success, on_error)
     return
   end
 
-  args.filepath = resolve_path(args.filepath)
-
   if not args.symbol then
     if on_error then
       on_error("需要 symbol（符号名称）参数来定位")
@@ -1499,7 +1496,7 @@ local function _lsp_definition(args, on_success, on_error)
     end
     return
   end
-  args.filepath = resolve_path(args.filepath)
+
   if not args.symbol then
     if on_error then
       on_error("需要 symbol（符号名称）参数来定位")
@@ -4063,4 +4060,3 @@ M.lsp_service_info = {
 }
 
 return M
-

@@ -106,6 +106,7 @@ local PATH_PARAM_NAMES = {
   cwd = true,
   dir_path = true,
   diff_filepath = true,
+  path = true,
 }
 
 local function resolve_json_args(args, param_schemas)
@@ -1465,6 +1466,61 @@ function M._generate_example(tool)
   end
   table.insert(lines, "})")
   return table.concat(lines, "\n")
+end
+
+-- ========== 单次工具请求（不计入工具循环） ==========
+
+--- 临时注册一个工具到 tool_registry，供 execute_single_tool_request 使用
+--- 返回一个清理函数，调用后移除该工具
+--- @param tool_name string 工具名称
+--- @return function|nil 清理函数，调用后移除工具；注册失败返回 nil
+function M.register_tool_for_request(tool_name)
+  -- 从 shell_tools 模块获取工具定义
+  local ok, shell_tools = pcall(require, "NeoAI.tools.builtin.shell_tools")
+  if not ok or not shell_tools then
+    logger.warn("[tool_executor] register_tool_for_request: 无法加载 shell_tools 模块")
+    return nil
+  end
+
+  local tool_def = shell_tools[tool_name]
+  if not tool_def or type(tool_def) ~= "table" or not tool_def.name or not tool_def.func then
+    logger.warn("[tool_executor] register_tool_for_request: 工具 '%s' 未在 shell_tools 中找到", tool_name)
+    return nil
+  end
+
+  -- 注册到 tool_registry
+  pcall(tool_registry.initialize, {})
+
+  -- 如果已存在，先移除再重新注册（确保使用最新定义）
+  if tool_registry.exists(tool_name) then
+    tool_registry.unregister(tool_name)
+  end
+
+  local ok2, err = pcall(tool_registry.register, tool_def)
+  if not ok2 then
+    logger.warn("[tool_executor] register_tool_for_request: 注册工具 '%s' 失败: %s", tool_name, tostring(err))
+    return nil
+  end
+
+  logger.debug("[tool_executor] register_tool_for_request: 已临时注册工具 '%s'", tool_name)
+
+  -- 返回清理函数
+  return function()
+    pcall(tool_registry.unregister, tool_name)
+    logger.debug("[tool_executor] register_tool_for_request: 已移除临时工具 '%s'", tool_name)
+  end
+end
+
+--- 执行一次非流式 AI 请求，只允许调用指定的工具，不计入工具循环
+--- 用于 shell 交互式命令的自动输入场景
+--- 委托给 tool_cycle 的现有实现，避免代码重复
+--- @param session_id string 会话 ID
+--- @param tool_name string 允许调用的工具名称（如 "send_input"）
+--- @param args table 工具参数
+--- @param callback function 回调函数，接收 (success, result)
+function M.execute_single_tool_request(session_id, tool_name, args, callback)
+  local tool_cycle = require("NeoAI.core.ai.tool_cycle")
+  tool_cycle.execute_single_tool_request(session_id, tool_name, args, callback)
 end
 
 M.resolve_path = resolve_path

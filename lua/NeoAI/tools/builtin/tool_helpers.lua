@@ -20,16 +20,7 @@ local M = {}
 ---   工具函数签名：function(args) -> result
 ---   直接返回结果，会阻塞主线程。
 ---
---- @param opts table 工具定义选项
---- @param opts.name string 工具名称
---- @param opts.description string 工具描述
---- @param opts.func function 工具实现函数
---- @param opts.parameters? table 参数的 JSON Schema 定义
---- @param opts.returns? table 返回值描述
---- @param opts.category? string 工具分类
---- @param opts.permissions? table 权限声明
---- @param opts.async? boolean 是否为回调模式（默认 false，即同步模式）
---- @param opts.timeout? number 超时毫秒数，nil 表示使用全局默认，-1 表示无限等待
+--- @param opts {name:string, description:string, func:function, parameters?:table, returns?:table, category?:string, permissions?:table, async?:boolean, timeout?:number, approval?:table} 工具定义选项
 --- @return table 工具定义表
 function M.define_tool(opts)
   vim.validate({
@@ -62,15 +53,6 @@ function M.define_tool(opts)
     async = opts.async or false, -- 标记是否为回调模式
     timeout = opts.timeout, -- 超时毫秒数，nil 使用全局默认，-1 无限等待
   }
-end
-
--- 路径解析：展开 ~ 为家目录，将相对路径转为绝对路径
--- 供所有工具模块统一使用
--- 实际实现在 tool_executor 中，此函数转发调用以保持向后兼容
--- 新代码应使用 tool_executor 中的 resolve_path
-function M.resolve_path(path)
-  local tool_executor = require("NeoAI.tools.tool_executor")
-  return tool_executor.resolve_path(path)
 end
 
 return M
