@@ -473,6 +473,7 @@ local function _replace_text(args, on_success, on_error)
 
   -- 异步加载文件到 buffer 并监听 LSP 诊断，诊断到达或超时后再调用 on_success
   vim.schedule(function()
+    local emitted = false
     local lsp_ok, lsp_utils = pcall(require, "NeoAI.utils.lsp_utils")
     if not lsp_ok or not lsp_utils or not lsp_utils.check_lsp() then
       if on_success then
@@ -489,21 +490,213 @@ local function _replace_text(args, on_success, on_error)
       return
     end
 
-    -- 辅助函数：收集当前诊断并调用 on_success
+    -- 确保文件类型正确设置（bufadd/bufload 可能未正确触发 FileType 事件）
+    local ft = vim.filetype.match({ buf = bufnr, filename = filepath })
+    if ft and ft ~= "" then
+      local current_ft = vim.bo[bufnr].filetype
+      if current_ft ~= ft then
+        vim.bo[bufnr].filetype = ft
+      end
+    end
+
+    -- Tree-sitter 后备诊断：当 LSP 诊断不可用时，使用 Tree-sitter 的 ERROR 节点检测语法错误
+    local function get_ts_error_diagnostics()
+      local ok_parser = pcall(vim.treesitter.get_parser, bufnr)
+      if not ok_parser then
+        -- 尝试通过语言名获取解析器
+        local ft = vim.bo[bufnr].filetype
+        if ft and ft ~= "" then
+          local ok_lang = pcall(vim.treesitter.language.get_lang, ft)
+          if ok_lang then
+            ok_parser = pcall(vim.treesitter.get_parser, bufnr, ft)
+          end
+        end
+      end
+      if not ok_parser then
+        return {}
+      end
+
+      local ok_parse, tree = pcall(function()
+        local p = vim.treesitter.get_parser(bufnr)
+        if not p then
+          return {}
+        end
+        return p:parse()
+      end)
+      if not ok_parse or not tree or #tree == 0 then
+        return {}
+      end
+
+      local root = tree[1]:root()
+      local ts_ft = vim.bo[bufnr].filetype or "python"
+      local ok_query, query = pcall(vim.treesitter.query.parse, ts_ft, "((ERROR) @err")
+      if not ok_query or not query then
+        return {}
+      end
+
+      local results = {}
+      local seen_positions = {} -- 去重
+      for pattern, match in query:iter_matches(root, bufnr, 0, -1) do
+        for id, capture_table in pairs(match) do
+          -- 在 Neovim 0.10+ 中，capture_table 是 { [1] = TSNode_userdata } 格式
+          local tsnode = capture_table and capture_table[1]
+          if tsnode then
+            local ok_range, srow, scol, erow, ecol = pcall(tsnode.range, tsnode)
+            if ok_range then
+              local pos_key = srow .. "-" .. scol .. "-" .. erow .. "-" .. ecol
+              if not seen_positions[pos_key] then
+                seen_positions[pos_key] = true
+                local err_text = vim.treesitter.get_node_text(tsnode, bufnr)
+                if err_text and #err_text > 80 then
+                  err_text = err_text:sub(1, 80) .. "..."
+                end
+                table.insert(results, {
+                  message = "语法错误: " .. (err_text or ""),
+                  severity = 1,
+                  source = "treesitter",
+                  code = nil,
+                  lnum = srow + 1,
+                  end_lnum = erow + 1,
+                  col = scol + 1,
+                  end_col = ecol + 1,
+                })
+              end
+            end
+          end
+        end
+      end
+      return results
+    end
+
     local function emit_diagnostics()
-      pcall(function() diag_timer:stop() end)
-      pcall(function() diag_timer:close() end)
+      emitted = true
+
+      pcall(function()
+        diag_timer:stop()
+      end)
+      pcall(function()
+        diag_timer:close()
+      end)
+
+      -- 删除 autocmd，避免后续误触发
+      pcall(vim.api.nvim_del_augroup_by_id, augroup)
 
       if cleanup then
         cleanup()
       end
 
       if on_success then
+        -- 先尝试 LSP 诊断
         local diagnostics = vim.diagnostic.get(bufnr)
+        if not diagnostics or #diagnostics == 0 then
+          -- LSP 诊断为空，回退到 Tree-sitter
+          diagnostics = get_ts_error_diagnostics()
+        end
         base_result.diagnostics = format_diagnostics(diagnostics)
         base_result.diagnostic_count = #diagnostics
         on_success(base_result)
       end
+    end
+
+    --- 触发 FileType autocmd 以启动 LSP（如果尚未运行）
+    local function trigger_lsp_autocmd()
+      local current_ft = vim.bo[bufnr].filetype
+      if current_ft and current_ft ~= "" then
+        -- 先检查是否已有该文件类型的 LSP 客户端
+        local lm
+        pcall(function()
+          lm = require("NeoAI.utils.language_map")
+        end)
+        local expected_config = lm and lm.ft_to_lsp_config and lm.ft_to_lsp_config[current_ft]
+
+        -- 检查是否有同名的 LSP 客户端已 attach
+        local already_attached = false
+        if expected_config then
+          local attached = vim.lsp.get_clients({ bufnr = bufnr })
+          for _, c in ipairs(attached) do
+            if c.name == expected_config then
+              already_attached = true
+              break
+            end
+          end
+        end
+
+        if not already_attached then
+          -- 触发 FileType 事件，让 lspconfig 或其他机制启动 LSP
+          -- 注意：不要指定 group，这样才能执行所有注册的 FileType autocmd
+          pcall(vim.api.nvim_exec_autocmds, "FileType", {
+            buffer = bufnr,
+            modelines = false,
+          })
+          -- 再次检查是否有客户端 attach
+          local after = vim.lsp.get_clients({ bufnr = bufnr })
+          if #after == 0 and expected_config then
+            -- FileType 事件未触发 LSP 启动，手动尝试启动
+            local mason_cmd = lm and lm.mason_executables and lm.mason_executables[expected_config]
+            if not mason_cmd then
+              mason_cmd = lm and lm.lsp_commands and lm.lsp_commands[expected_config]
+            end
+            if mason_cmd then
+              local project_root = filepath
+              pcall(function()
+                local fu = require("NeoAI.utils.file_utils")
+                project_root = fu.find_project_root(filepath) or vim.fn.getcwd()
+              end)
+              local temp_config = {
+                name = expected_config,
+                cmd = mason_cmd,
+                root_dir = project_root,
+              }
+              local ok, client_id = pcall(vim.lsp.start, temp_config)
+              if ok and client_id then
+                pcall(vim.lsp.buf_attach_client, bufnr, client_id)
+              end
+            end
+          end
+        end
+        return true
+      end
+      return false
+    end
+
+    --- 向已附加的 LSP 客户端发送 didChange 通知，强制重新诊断
+    local function force_lsp_diagnostics()
+      local clients = vim.lsp.get_clients({ bufnr = bufnr })
+      if #clients == 0 then
+        return false
+      end
+
+      local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+      -- 去除末尾多余的空行（nvim_buf_get_lines 总是以空行结尾）
+      if #lines > 0 and lines[#lines] == "" then
+        local actual_line_count = vim.api.nvim_buf_line_count(bufnr)
+        if #lines > actual_line_count then
+          table.remove(lines)
+        end
+      end
+      local text = table.concat(lines, "\n")
+      local uri = vim.uri_from_bufnr(bufnr)
+      local version = vim.b[bufnr].changedtick or 1
+
+      for _, client in ipairs(clients) do
+        if client.supports_method and client.supports_method("textDocument/didChange", { bufnr = bufnr }) then
+          local ok, err = pcall(client.notify, client, "textDocument/didChange", {
+            textDocument = {
+              uri = uri,
+              version = version,
+            },
+            contentChanges = {
+              {
+                text = text,
+              },
+            },
+          })
+          if not ok then
+            log_tools.log_tool("force_lsp_diagnostics notify error: " .. tostring(err), "warn")
+          end
+        end
+      end
+      return true
     end
 
     -- 超时保护：5 秒后不再等待，返回当前已有的诊断
@@ -513,23 +706,56 @@ local function _replace_text(args, on_success, on_error)
       emit_diagnostics()
     end, 5000)
 
-    -- 同时监听 DiagnosticChanged 和 LspAttach 事件：
-    --   DiagnosticChanged：LSP 发布初始诊断或诊断变更时触发
-    --   LspAttach：LSP 客户端 attach 到 buffer 时触发（此时诊断可能尚未到达，后续 DiagnosticChanged 会接力）
+    -- 创建 autocmd 组，分别监听 LspAttach 和 DiagnosticChanged
     local augroup = vim.api.nvim_create_augroup("neoai_replace_text_diag_" .. bufnr, { clear = true })
-    vim.api.nvim_create_autocmd({ "DiagnosticChanged", "LspAttach" }, {
+
+    -- LspAttach：LSP 客户端 attach 时，主动触发诊断请求
+    vim.api.nvim_create_autocmd("LspAttach", {
       group = augroup,
       buffer = bufnr,
-      once = true,
       callback = function()
-        -- LspAttach 时，延迟一小段时间等 LSP 发布初始诊断后检查
+        -- 延迟一下等 LSP 稳定后，主动触发诊断
         vim.defer_fn(function()
-          emit_diagnostics()
-        end, 500)
+          force_lsp_diagnostics()
+          -- 再延迟一小段时间让 LSP 处理并发布诊断
+          vim.defer_fn(function()
+            local diags = vim.diagnostic.get(bufnr)
+            if diags and #diags > 0 then
+              emit_diagnostics()
+            end
+          end, 800)
+        end, 200)
       end,
     })
 
-    -- 立即检查当前是否已有诊断（可能 buffer 已加载且 LSP 已 attach）
+    -- DiagnosticChanged：LSP 发布诊断时立即收集（不设 once，确保能捕获）
+    vim.api.nvim_create_autocmd("DiagnosticChanged", {
+      group = augroup,
+      buffer = bufnr,
+      callback = function()
+        emit_diagnostics()
+      end,
+    })
+
+    -- === 核心修复：主动触发 FileType 事件以启动 LSP ===
+    -- 先设置好 autocmd，再触发 FileType 事件
+    trigger_lsp_autocmd()
+
+    -- 检查是否已有客户端 attach（可能通过 FileType 事件刚启动）
+    local clients = vim.lsp.get_clients({ bufnr = bufnr })
+    if #clients > 0 then
+      vim.defer_fn(function()
+        force_lsp_diagnostics()
+        vim.defer_fn(function()
+          local diags = vim.diagnostic.get(bufnr)
+          if diags and #diags > 0 then
+            emit_diagnostics()
+          end
+        end, 800)
+      end, 100)
+    end
+
+    -- 立即检查当前是否已有诊断（可能 buffer 已加载且 LSP 已发布诊断）
     local existing_diags = vim.diagnostic.get(bufnr)
     if existing_diags and #existing_diags > 0 then
       emit_diagnostics()
@@ -1138,7 +1364,13 @@ local function _delete_file(args, on_success, on_error)
       end
       if rmdir_err then
         if on_error then
-          on_error(string.format("删除目录失败 %s: %s（目录可能非空，请使用 run_command 执行 rm -rf）", filepath, tostring(rmdir_err)))
+          on_error(
+            string.format(
+              "删除目录失败 %s: %s（目录可能非空，请使用 run_command 执行 rm -rf）",
+              filepath,
+              tostring(rmdir_err)
+            )
+          )
         end
       else
         if on_success then
@@ -1222,5 +1454,3 @@ function M.get_tools()
 end
 
 return M
-
-
