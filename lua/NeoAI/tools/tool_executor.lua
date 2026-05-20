@@ -337,24 +337,13 @@ function M.execute_async(tool_name, args, on_success, on_error, on_progress)
       session_id = session_id,
     })
 
-    -- 注册暂停回调：审批窗口打开时暂停超时，关闭时恢复
-    local tool_call_id = args and args._tool_call_id or ("call_" .. os.time() .. "_" .. math.random(10000, 99999))
-    local unregister = approval_handler.register_pause_callback(function(is_paused)
-      if is_paused then
-        -- 暂停超时：停止定时器，保留已过去的时间
-        M._pause_timeout(tool_call_id)
-      else
-        -- 恢复超时：用剩余时间重新启动定时器
-        M._resume_timeout(tool_call_id, function()
-          local saved = timeout_state.saved_timeouts[tool_call_id]
-          local timeout_ms = saved and saved.timeout_ms or timeout_state.timeout_ms
-          logger.warn("[tool_executor] 工具 '%s' 执行超时 (%dms)", tool_name, timeout_ms)
-          if on_error then
-            on_error(string.format("工具执行超时（%d 秒）", timeout_ms / 1000))
-          end
-        end)
-      end
-    end)
+    -- 清除由 execute_with_orchestrator 设置的超时定时器
+    -- 工具进入审批队列后，超时定时器不应继续运行
+    -- 超时配置已保存到 args._approval_timeout_ms，将在审批通过后的 _continue_execution 中重新设置
+    local tool_call_id = args and args._tool_call_id
+    if tool_call_id then
+      M._clear_timeout(tool_call_id)
+    end
 
     return
   end
@@ -417,7 +406,26 @@ function M._continue_execution(
     return
   end
 
+  -- 从 raw_args 中获取 tool_call_id（由 execute_with_orchestrator 注入），用于清除超时定时器
+  local tool_call_id = raw_args and (raw_args._tool_call_id or raw_args.tool_call_id)
+
+  -- 从 raw_args 中读取审批超时配置（由 execute_with_orchestrator 保存）
+  -- 如果存在，说明工具经过了审批流程，需要在执行前设置超时定时器
+  local approval_timeout_ms = raw_args and raw_args._approval_timeout_ms
+  if approval_timeout_ms and approval_timeout_ms > 0 and tool_call_id then
+    M._set_timeout(tool_call_id, approval_timeout_ms, function()
+      logger.warn("[tool_executor] 工具 '%s' 执行超时 (%dms)", tool_name, approval_timeout_ms)
+      if on_error then
+        on_error(string.format("工具执行超时（%d 秒）", approval_timeout_ms / 1000))
+      end
+    end)
+  end
+
   local function on_success_wrapper(result)
+    -- 清除超时定时器
+    if tool_call_id then
+      M._clear_timeout(tool_call_id)
+    end
     local duration = os.time() - start_time
     local formatted = M.format_result(result)
     local ok, err = pcall(fire_event, event_constants.TOOL_EXECUTION_COMPLETED, {
@@ -447,6 +455,10 @@ function M._continue_execution(
   end
 
   local function on_error_wrapper(err_msg)
+    -- 清除 execute_with_orchestrator 设置的超时定时器
+    if tool_call_id then
+      M._clear_timeout(tool_call_id)
+    end
     local duration = os.time() - start_time
     local err_str = type(err_msg) == "table" and vim.inspect(err_msg) or tostring(err_msg or "未知错误")
     local full_err = "工具执行错误: " .. err_str
@@ -1383,7 +1395,13 @@ function M.execute_with_orchestrator(tool_name, raw_args, session_context, callb
     timeout_ms = timeout_state.timeout_ms -- 全局默认超时
   end
 
+  -- 将超时配置保存到 arguments 中，供审批通过后 _continue_execution 使用
+  -- 审批队列中的工具的超时定时器不在 execute_with_orchestrator 中设置，
+  -- 改为在 _continue_execution 中设置，避免审批等待期间超时定时器仍在运行
+  arguments._approval_timeout_ms = (timeout_ms and timeout_ms > 0) and timeout_ms or nil
+
   if timeout_ms and timeout_ms > 0 then
+    -- 先设置超时定时器，如果工具需要审批，execute_async 的审批分支会清除它
     M._set_timeout(tool_call_id, timeout_ms, function()
       logger.warn("[tool_executor] 工具 '%s' 执行超时 (%dms)", tool_name, timeout_ms)
       if callbacks.on_result then
@@ -1391,31 +1409,15 @@ function M.execute_with_orchestrator(tool_name, raw_args, session_context, callb
       end
     end)
 
-    -- 注册审批暂停/恢复回调，确保等待审批时不计入超时
-    local ah = require("NeoAI.tools.approval_handler")
-    local unregister_pause = ah.register_pause_callback(function(is_paused)
-      if is_paused then
-        M._pause_timeout(tool_call_id)
-      else
-        M._resume_timeout(tool_call_id)
-      end
-    end)
-
-    -- 包装 on_success/on_error 以清除超时和暂停回调
+    -- 包装 on_success/on_error 以清除超时
     wrapped_on_success = function(result)
       M._clear_timeout(tool_call_id)
-      if unregister_pause then
-        pcall(unregister_pause)
-      end
       if original_on_result then
         original_on_result(true, result)
       end
     end
     wrapped_on_error = function(err)
       M._clear_timeout(tool_call_id)
-      if unregister_pause then
-        pcall(unregister_pause)
-      end
       if original_on_result then
         original_on_result(false, err)
       end
