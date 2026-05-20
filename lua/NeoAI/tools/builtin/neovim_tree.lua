@@ -1582,7 +1582,7 @@ local function _delete_node(args, on_success, on_error)
         -- 用 nvim_buf_set_lines 替换缓冲区全部内容
         vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, new_lines)
 
-        -- 写入磁盘
+        -- 写入磁盘（优先使用 Neovim buffer 写入，失败则回退到 Lua io.open）
         local save_ok, save_err = pcall(vim.api.nvim_buf_call, bufnr, function()
           vim.cmd("write!")
         end)
@@ -1593,9 +1593,50 @@ local function _delete_node(args, on_success, on_error)
         end
 
         if not save_ok then
-          if on_error then
-            finalize_with_timeout("保存文件失败: " .. tostring(save_err), true)
+          -- buffer 写入失败（如 buftype 限制），回退到 Lua io.open 写入
+          local content_to_write = table.concat(new_lines, "\n")
+          -- 保留原文件末尾换行符
+          if content:sub(-1) == "\n" then
+            content_to_write = content_to_write .. "\n"
           end
+          local fu = require("NeoAI.utils.file_utils")
+          fu.write_file_async(abs_path, content_to_write, function()
+            vim.schedule(function()
+              local ret = {
+                filepath = args.filepath,
+                language = result.language,
+                deleted_count = #deletions,
+                deletions = deletions,
+                fallback_write = true,
+              }
+              if fallback then
+                ret.warning = "未找到指定 node_type '"
+                  .. (args.node_type or "")
+                  .. "' 的节点，已回退到同类型节点"
+              end
+              if #skipped > 0 then
+                ret.skipped_types = skipped
+                ret.skipped_message = "以下节点类型不是代码块结构，已跳过: " .. table.concat(skipped, ", ")
+              end
+              if #skipped_root > 0 then
+                ret.skipped_root_types = skipped_root
+                if ret.warning then
+                  ret.warning = ret.warning .. "; 已跳过根容器节点: " .. table.concat(skipped_root, ", ")
+                else
+                  ret.warning = "已跳过根容器节点: " .. table.concat(skipped_root, ", ")
+                end
+              end
+              if on_success then
+                timeout_timer:stop()
+                timeout_timer:close()
+                on_success(ret)
+              end
+            end)
+          end, function(err)
+            if on_error then
+              finalize_with_timeout("保存文件失败（buffer 和 Lua 回退均失败）: " .. tostring(err), true)
+            end
+          end)
           return
         end
 

@@ -1962,7 +1962,13 @@ local function _lsp_declaration(args, on_success, on_error)
         if req_err then
           -- declaration 请求失败（通常是不支持），回退到 definition
           local err_msg = type(req_err) == "string" and req_err or tostring(req_err or "")
-          if err_msg:match("不支持") or err_msg:match("not supported") then
+          if err_msg:match("不支持")
+            or err_msg:match("not supported")
+            or err_msg:match("MethodNotFound")
+            or err_msg:match("method not found")
+            or err_msg:match("InternalError")
+            or err_msg:match("no declaration")
+          then
             lsp_request_async(bufnr, "textDocument/definition", {
               textDocument = { uri = vim.uri_from_fname(vim.fn.fnamemodify(args.filepath, ":p")) },
               position = { line = row, character = col },
@@ -2596,16 +2602,19 @@ local function _lsp_code_action(args, on_success, on_error)
     -- 辅助函数：发送 codeAction 请求
     local function send_code_action_request(row, col)
       -- 获取该位置的诊断信息（用于 code action context）
+      -- 使用全文件诊断而非仅某一行，因为 lua_ls 需要完整的诊断上下文
       local diagnostics = {}
       if args.include_diagnostics ~= false then
-        diagnostics = vim.diagnostic.get(bufnr, { lnum = row })
+        diagnostics = vim.diagnostic.get(bufnr)
       end
 
+      -- 构建 range，使用局部变量避免 Lua 'end' 保留字问题
+      local range_end = { line = row, character = col + 1 }
       lsp_request_async(bufnr, "textDocument/codeAction", {
         textDocument = { uri = vim.uri_from_fname(vim.fn.fnamemodify(args.filepath, ":p")) },
         range = {
           start = { line = row, character = col },
-          ["end"] = { line = row, character = col + 1 },
+          ["end"] = range_end,
         },
         context = {
           diagnostics = diagnostics,
@@ -3077,6 +3086,60 @@ local function _lsp_format(args, on_success, on_error)
           })
         end
         return
+      end
+
+      -- 将 LSP 返回的 textEdits 应用到缓冲区
+      if bufnr and vim.api.nvim_buf_is_valid(bufnr) then
+        -- 按行号从大到小排序，避免行号偏移
+        table.sort(result, function(a, b)
+          if a.range.start.line ~= b.range.start.line then
+            return a.range.start.line > b.range.start.line
+          end
+          return a.range.start.character > b.range.start.character
+        end)
+
+        vim.api.nvim_buf_set_option_value(bufnr, "modified", false, {})
+        for _, edit in ipairs(result) do
+          local start_line = edit.range.start.line
+          local start_char = edit.range.start.character
+          local end_line = edit.range["end"].line
+          local end_char = edit.range["end"].character
+
+          local lines = vim.api.nvim_buf_get_lines(bufnr, start_line, end_line + 1, false)
+          if #lines > 0 then
+            local first_line = lines[1]
+            local last_line = lines[#lines]
+            local new_text = edit.newText or ""
+
+            -- 构造替换后的行
+            local prefix = first_line:sub(1, start_char)
+            local suffix = last_line:sub(end_char + 1)
+            local new_lines = {}
+            for line in new_text:gmatch("[^\n]+") do
+              table.insert(new_lines, line)
+            end
+
+            if #new_lines == 0 then
+              -- 替换为空
+              if #lines == 1 then
+                new_lines = { prefix .. suffix }
+              else
+                new_lines = { prefix .. suffix }
+              end
+            else
+              new_lines[1] = prefix .. new_lines[1]
+              new_lines[#new_lines] = new_lines[#new_lines] .. suffix
+            end
+
+            vim.api.nvim_buf_set_lines(bufnr, start_line, end_line + 1, false, new_lines)
+          end
+        end
+        vim.api.nvim_buf_set_option_value(bufnr, "modified", false, {})
+
+        -- 保存文件
+        pcall(vim.api.nvim_buf_call, bufnr, function()
+          pcall(vim.cmd, "silent write")
+        end)
       end
 
       -- 读取格式化后的内容
