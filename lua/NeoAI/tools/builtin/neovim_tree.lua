@@ -870,7 +870,7 @@ local function _with_parsed_tree(args, on_success, on_error, build_response)
       end
       return
     end
-    local filepath = args.filepath
+    local ret = build_response(result, filtered, fallback)
     if on_success then
       on_success(ret)
     end

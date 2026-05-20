@@ -685,22 +685,38 @@ function M._execute_tools(session_id, tool_calls, is_sub_agent)
     end
   end
 
-  -- 第二步：逐个执行工具（此时 active_tool_calls 中已有所有条目，
-  -- 同步工具完成时 remaining 不会为 0）
+  -- 第二步：异步并发执行所有工具
+  -- 所有工具同时通过 vim.schedule 启动，利用 Neovim 事件循环并发执行
+  -- 每个工具完成时从 active_tool_calls 中移除自己
+  -- 当 active_tool_calls 为空时触发 _on_tools_complete
+  -- 注意：需要审批的工具在审批通过前 active_tool_calls 中仍有记录
+  -- 因此不会误触发完成
   for _, tc in ipairs(tool_calls) do
-    M._execute_single_tool(session_id, tc, is_sub_agent)
+    vim.schedule(function()
+      local s = sessions_table[session_id]
+      if not s or s.stop_requested then
+        return
+      end
+      M._execute_single_tool(session_id, tc, is_sub_agent, nil)
+    end)
   end
 end
 
-function M._execute_single_tool(session_id, tool_call, is_sub_agent)
+function M._execute_single_tool(session_id, tool_call, is_sub_agent, on_complete)
   local sessions_table = is_sub_agent and state.sub_agent_sessions or state.sessions
   local ss = sessions_table[session_id]
   if not ss or not tool_call then
+    if on_complete then
+      on_complete()
+    end
     return
   end
 
   -- 如果已请求停止，跳过工具执行
   if ss.stop_requested then
+    if on_complete then
+      on_complete()
+    end
     return
   end
 
@@ -709,12 +725,18 @@ function M._execute_single_tool(session_id, tool_call, is_sub_agent)
     logger.warn(
       "[tool_orchestrator] _execute_single_tool: tool_call 缺少 function 字段, tool_call=" .. vim.inspect(tool_call)
     )
+    if on_complete then
+      on_complete()
+    end
     return
   end
 
   local tool_name = tool_func.name
   if not tool_name or tool_name == "" then
     logger.warn("[tool_orchestrator] _execute_single_tool: tool_func.name 为空, tool_func=" .. vim.inspect(tool_func))
+    if on_complete then
+      on_complete()
+    end
     return
   end
 
@@ -841,6 +863,9 @@ function M._execute_single_tool(session_id, tool_call, is_sub_agent)
       tostring(tool_name),
       tostring(tool_call_id)
     )
+    if on_complete then
+      on_complete()
+    end
     return
   end
   ss._executed_tool_call_ids[tool_call_id] = true
@@ -864,6 +889,9 @@ function M._execute_single_tool(session_id, tool_call, is_sub_agent)
       local remaining = vim.tbl_count(ss.active_tool_calls)
       if remaining == 0 then
         M._on_tools_complete(session_id, is_sub_agent)
+      end
+      if on_complete then
+        on_complete()
       end
       return
     end
@@ -890,6 +918,9 @@ function M._execute_single_tool(session_id, tool_call, is_sub_agent)
       on_result = function(success, result)
         local s = sessions_table[session_id]
         if not s then
+          if on_complete then
+            on_complete()
+          end
           return
         end
 
@@ -897,6 +928,9 @@ function M._execute_single_tool(session_id, tool_call, is_sub_agent)
           s.active_tool_calls[tool_call_id] = nil
           if vim.tbl_count(s.active_tool_calls) == 0 then
             M._on_tools_complete(session_id, is_sub_agent)
+            if on_complete then
+              on_complete()
+            end
           end
           return
         end
@@ -997,6 +1031,9 @@ function M._execute_single_tool(session_id, tool_call, is_sub_agent)
         if remaining == 0 and s.phase ~= "round_complete" then
           M._on_tools_complete(session_id, is_sub_agent)
         end
+        if on_complete then
+          on_complete()
+        end
       end,
     })
     return
@@ -1020,6 +1057,9 @@ function M._execute_single_tool(session_id, tool_call, is_sub_agent)
       if remaining == 0 then
         M._on_tools_complete(session_id, is_sub_agent)
       end
+      if on_complete then
+        on_complete()
+      end
       return
     end
 
@@ -1037,6 +1077,9 @@ function M._execute_single_tool(session_id, tool_call, is_sub_agent)
       local remaining = vim.tbl_count(ss.active_tool_calls)
       if remaining == 0 then
         M._on_tools_complete(session_id, is_sub_agent)
+      end
+      if on_complete then
+        on_complete()
       end
       return
     end
@@ -1056,6 +1099,10 @@ function M._execute_single_tool(session_id, tool_call, is_sub_agent)
         on_result = function(success, result)
           local s = sessions_table[session_id]
           if not s then
+            _unregister_retry_tool()
+            if on_complete then
+              on_complete()
+            end
             return
           end
 
@@ -1084,6 +1131,9 @@ function M._execute_single_tool(session_id, tool_call, is_sub_agent)
           if remaining == 0 and s.phase ~= "round_complete" then
             M._on_tools_complete(session_id, is_sub_agent)
           end
+          if on_complete then
+            on_complete()
+          end
         end,
       })
     end
@@ -1093,6 +1143,9 @@ function M._execute_single_tool(session_id, tool_call, is_sub_agent)
       local s = sessions_table[session_id]
       if not s or s.stop_requested then
         _unregister_retry_tool()
+        if on_complete then
+          on_complete()
+        end
         return
       end
       execute_fn()
@@ -1116,6 +1169,9 @@ function M._execute_single_tool(session_id, tool_call, is_sub_agent)
       on_result = function(success, result)
         local s = sessions_table[session_id]
         if not s then
+          if on_complete then
+            on_complete()
+          end
           return
         end
 
@@ -1123,6 +1179,9 @@ function M._execute_single_tool(session_id, tool_call, is_sub_agent)
           s.active_tool_calls[tool_call_id] = nil
           if vim.tbl_count(s.active_tool_calls) == 0 then
             M._on_tools_complete(session_id, is_sub_agent)
+          end
+          if on_complete then
+            on_complete()
           end
           return
         end
@@ -1209,6 +1268,10 @@ function M._execute_single_tool(session_id, tool_call, is_sub_agent)
 
         if remaining == 0 and s.phase ~= "round_complete" then
           M._on_tools_complete(session_id, is_sub_agent)
+        end
+        -- on_complete 无条件调用（并发模式下由外部 completed_count 控制完成检测）
+        if on_complete then
+          on_complete()
         end
       end,
     })

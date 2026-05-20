@@ -344,12 +344,12 @@ local DEFAULT_CONFIG = {
   -- 日志配置
   log = {
     -- 日志级别: 'DEBUG', 'INFO', 'WARN', 'ERROR', 'FATAL'
-    level = "WARN",
-    -- 输出文件路径（可选，默认输出到文件，避免 print 阻塞消息区域）
-    output_path = nil,
+    -- level = "WARN",
+    -- -- 输出文件路径（可选，默认输出到文件，避免 print 阻塞消息区域）
+    -- output_path = nil,
 
-    -- level = "DEBUG",
-    -- output_path = "/root/NeoAI/lua/NeoAI/neoai.log",
+    level = "DEBUG",
+    output_path = "/root/NeoAI/lua/NeoAI/neoai.log",
 
     -- 日志格式模板
     format = "[{time}] [{level}] {message}",

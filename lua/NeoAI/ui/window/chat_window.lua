@@ -2213,7 +2213,11 @@ function M.add_message(role, content, opts)
       if content.content and type(content.content) == "string" and vim.trim(content.content) ~= "" then
         has_content = true
       end
-      if content.reasoning_content and type(content.reasoning_content) == "string" and vim.trim(content.reasoning_content) ~= "" then
+      if
+        content.reasoning_content
+        and type(content.reasoning_content) == "string"
+        and vim.trim(content.reasoning_content) ~= ""
+      then
         has_content = true
       end
       if not has_content then
@@ -2537,7 +2541,8 @@ function M._setup_event_listeners()
             local append_content = has_reasoning and content_with_reasoning or response_content
             local folded_str = _content_to_str(state.messages[folded_idx].content)
             local append_str = _content_to_str(append_content)
-            state.messages[folded_idx].content = folded_str .. "\n\n" .. append_str
+            local separator = (append_str ~= "") and "\n\n" or ""
+            state.messages[folded_idx].content = folded_str .. separator .. append_str
             if msg_idx ~= folded_idx then
               table.remove(state.messages, msg_idx)
             end
@@ -2558,7 +2563,8 @@ function M._setup_event_listeners()
         elseif has_tool_results then
           local folded = M._build_tool_folded_text(state.tool_display.results)
           local append_str = _content_to_str(content_with_reasoning)
-          state.messages[msg_idx].content = (folded ~= "" and folded .. "\n\n" or "") .. append_str
+          local separator = (append_str ~= "") and "\n\n" or ""
+          state.messages[msg_idx].content = (folded ~= "" and folded .. separator or "") .. append_str
         else
           state.messages[msg_idx].content = content_with_reasoning
         end
@@ -2569,7 +2575,8 @@ function M._setup_event_listeners()
             local append_content = has_reasoning and content_with_reasoning or response_content
             local folded_str = _content_to_str(state.messages[folded_idx].content)
             local append_str = _content_to_str(append_content)
-            state.messages[folded_idx].content = folded_str .. "\n\n" .. append_str
+            local separator = (append_str ~= "") and "\n\n" or ""
+            state.messages[folded_idx].content = folded_str .. separator .. append_str
             -- 折叠文本已通过 TOOL_EXECUTION_COMPLETED 逐工具渲染到缓冲区
             -- 此处只更新 state.messages，不再调用 _render_streaming_message 重新渲染
             state.streaming.message_index = folded_idx
@@ -2586,7 +2593,8 @@ function M._setup_event_listeners()
         elseif has_tool_results then
           local folded = M._build_tool_folded_text(state.tool_display.results)
           local append_str = _content_to_str(content_with_reasoning)
-          local final = (folded ~= "" and folded .. "\n\n" or "") .. append_str
+          local separator = (append_str ~= "") and "\n\n" or ""
+          local final = (folded ~= "" and folded .. separator or "") .. append_str
           table.insert(state.messages, { role = "assistant", content = final, timestamp = os.time() })
           -- 触发渲染显示新消息
           state.streaming.message_index = #state.messages
@@ -3225,13 +3233,14 @@ function M._setup_event_listeners()
             combined_folded = new_folded_text
           end
           local new_content
+          local separator = (existing_body ~= "") and "\n\n" or ""
           if reasoning_text ~= "" then
             new_content = {
               reasoning_content = reasoning_text,
-              content = combined_folded .. "\n\n" .. existing_body,
+              content = combined_folded .. separator .. existing_body,
             }
           else
-            new_content = combined_folded .. "\n\n" .. existing_body
+            new_content = combined_folded .. separator .. existing_body
           end
           state.messages[mi].content = new_content
           state.tool_display.folded_saved = true
@@ -3363,13 +3372,14 @@ function M._setup_event_listeners()
             combined_folded = new_folded_text
           end
           local new_content
+          local separator = (existing_body ~= "") and "\n\n" or ""
           if reasoning_text ~= "" then
             new_content = {
               reasoning_content = reasoning_text,
-              content = combined_folded .. "\n\n" .. existing_body,
+              content = combined_folded .. separator .. existing_body,
             }
           else
-            new_content = combined_folded .. "\n\n" .. existing_body
+            new_content = combined_folded .. separator .. existing_body
           end
           state.messages[mi].content = new_content
           state.tool_display.folded_saved = true
@@ -4235,7 +4245,8 @@ function M._save_final_content_to_history(data)
       -- 如果 state.messages 中没有 assistant 消息，从 tool_display 构建折叠文本
       local folded = M._build_tool_folded_text(state.tool_display.results)
       if folded ~= "" then
-        final_content = (response_content ~= "") and (folded .. "\n\n" .. response_content) or folded
+        local separator = (response_content ~= "") and "\n\n" or ""
+        final_content = folded .. separator .. response_content
       end
     end
   end

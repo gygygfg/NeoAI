@@ -2878,9 +2878,65 @@ local function _lsp_format(args, on_success, on_error)
   end
 
   get_lsp_clients_async(args.filepath, function(clients, err, bufnr, cleanup)
-    if err or not clients then
+    if err or not clients or #clients == 0 then
+      -- LSP 客户端不可用，回退到外部格式化工具
+      local abs_path = vim.fn.fnamemodify(args.filepath, ":p")
+      local ft = vim.filetype.match({ filename = abs_path })
+
+      local ok, tool_name = try_external_formatter(args.filepath, ft)
+      if ok then
+        if cleanup then
+          cleanup()
+        end
+        local content, _ = read_file_content(args.filepath)
+        if on_success then
+          on_success({
+            filepath = args.filepath,
+            formatted = true,
+            content = content,
+            _source = "external:" .. tool_name,
+            _note = string.format("使用外部工具 '%s' 格式化成功（LSP 客户端不可用: %s）", tool_name, err or "无客户端"),
+          })
+        end
+        return
+      end
+
+      -- 外部工具也不可用
+      if cleanup then
+        cleanup()
+      end
       if on_error then
-        on_error(err or "无法获取 LSP 客户端")
+        local available_tools = {}
+        local formatters = external_formatters[ft]
+        if formatters then
+          for _, f in ipairs(formatters) do
+            local installed = vim.fn.executable(f.cmd) == 1
+            table.insert(
+              available_tools,
+              string.format(
+                "  %s %s [%s]",
+                installed and "✓" or "✗",
+                f.name,
+                installed and "已安装" or "未安装"
+              )
+            )
+          end
+        end
+        local tool_list = #available_tools > 0 and table.concat(available_tools, "\\n")
+          or "  （该文件类型无可配置的外部格式化工具）"
+
+        local msg = string.format(
+          "LSP 客户端不可用: %s\\n"
+            .. "文件类型: %s\\n\\n"
+            .. "外部格式化工具状态：\\n%s\\n\\n"
+            .. "建议：\\n"
+            .. "  1. 安装上述标记为 ✗ 的工具（如 pip install ruff）\\n"
+            .. "  2. 或安装支持格式化的 LSP 服务器",
+          err or "无法获取 LSP 客户端",
+          ft or "未知",
+          tool_list
+        )
+        on_error(msg)
       end
       return
     end
