@@ -387,6 +387,18 @@ function _handle_stream_end(generation_id, processor, params)
   local reasoning_text = processor.reasoning_buffer or ""
   local usage = processor.usage or {}
   local tool_calls = http_utils.filter_valid_tool_calls(processor.tool_calls or {})
+
+  -- XML 回退：当 API 不返回 structured tool_calls 时，从 content 中提取 XML 格式工具调用
+  if #tool_calls == 0 and full_response ~= "" then
+    local xml_tool_calls = request_handler.extract_xml_tool_calls(full_response)
+    if xml_tool_calls and #xml_tool_calls > 0 then
+      tool_calls = xml_tool_calls
+      -- 从 content 中移除已解析的 XML 块，保持内容干净
+      full_response = request_handler.remove_xml_tool_calls(full_response)
+      logger.info("[ai_engine] 从 XML 内容中提取了 %d 个工具调用", #tool_calls)
+    end
+  end
+
   http_utils.clear_reasoning_throttle()
   local gen = state.active_generations[generation_id]
   if reasoning_text ~= "" and gen then gen.last_reasoning_content = reasoning_text end
@@ -575,6 +587,16 @@ function _handle_ai_response(generation_id, response, params)
     end
   end
   tool_calls = http_utils.filter_valid_tool_calls(tool_calls)
+
+  -- XML 回退：当 API 不返回 structured tool_calls 时，从 content 中提取 XML 格式工具调用
+  if #tool_calls == 0 and response_content ~= "" then
+    local xml_tool_calls = request_handler.extract_xml_tool_calls(response_content)
+    if xml_tool_calls and #xml_tool_calls > 0 then
+      tool_calls = xml_tool_calls
+      response_content = request_handler.remove_xml_tool_calls(response_content)
+      logger.info("[ai_engine] 从 XML 内容中提取了 %d 个工具调用", #tool_calls)
+    end
+  end
 
   local is_tool_loop = params and params.is_tool_loop
   local abnormal, reason = request_handler.detect_abnormal_response(response_content, tool_calls, { is_tool_loop = is_tool_loop })

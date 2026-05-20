@@ -1293,7 +1293,8 @@ local function lsp_request_async(bufnr, method, params, callback)
           state.defer_timer:close()
         end
         state.defer_timer = vim.uv.new_timer()
-        state.defer_timer:start(500, 0, function()
+        if state.defer_timer then
+          state.defer_timer:start(500, 0, function()
           vim.schedule(function()
             if state.done then
               return
@@ -1321,6 +1322,7 @@ local function lsp_request_async(bufnr, method, params, callback)
             end
           end)
         end)
+        end
       end
     end)
   end)
@@ -1335,7 +1337,8 @@ local function lsp_request_async(bufnr, method, params, callback)
   end
 
   -- 设置超时保护（15秒，给多客户端更多时间）
-  state.timer:start(15000, 0, function()
+  if state.timer then
+    state.timer:start(15000, 0, function()
     vim.schedule(function()
       if state.done then
         return
@@ -1362,6 +1365,7 @@ local function lsp_request_async(bufnr, method, params, callback)
       end
     end)
   end)
+  end
 end
 
 -- 赋值给前向声明变量，供 find_symbol_via_lsp_async 等函数使用
@@ -1862,6 +1866,8 @@ M.lsp_implementation = {
 
 -- ============================================================================
 -- 工具 lsp_declaration - 查看声明位置
+-- 注意：许多 LSP 服务器（如 lua_ls）不支持 textDocument/declaration，
+-- 此时自动回退到 textDocument/definition
 -- ============================================================================
 
 local function _lsp_declaration(args, on_success, on_error)
@@ -1904,31 +1910,23 @@ local function _lsp_declaration(args, on_success, on_error)
         return
       end
 
-      lsp_request_async(bufnr, "textDocument/declaration", {
-        textDocument = { uri = vim.uri_from_fname(vim.fn.fnamemodify(args.filepath, ":p")) },
-        position = { line = row, character = col },
-      }, function(result, req_err)
-        if cleanup then
-          cleanup()
-        end
-
-        if req_err then
-          if on_error then
-            on_error(req_err)
-          end
-          return
-        end
+      local function process_locations(result, source_method)
+        if cleanup then cleanup() end
 
         if not result or (type(result) == "table" and #result == 0) then
-          if on_success then
-            on_success({
-              filepath = args.filepath,
-              symbol = args.symbol,
-              position = { row = row, col = col },
-              locations = {},
-              found = false,
-            })
+          local response = {
+            filepath = args.filepath,
+            symbol = args.symbol,
+            position = { row = row, col = col },
+            locations = {},
+            found = false,
+          }
+          if source_method and source_method ~= "declaration" then
+            response._fallback_source = source_method
+            response._note = "当前 LSP 服务器不支持 'textDocument/declaration'，已回退使用 '"
+              .. source_method .. "'。结果可能与声明位置略有差异。"
           end
+          if on_success then on_success(response) end
           return
         end
 
@@ -1941,14 +1939,46 @@ local function _lsp_declaration(args, on_success, on_error)
           })
         end
 
-        if on_success then
-          on_success({
-            filepath = args.filepath,
-            symbol = args.symbol,
-            position = { row = row, col = col },
-            locations = locations,
-          })
+        local response = {
+          filepath = args.filepath,
+          symbol = args.symbol,
+          position = { row = row, col = col },
+          locations = locations,
+        }
+        if source_method and source_method ~= "declaration" then
+          response._fallback_source = source_method
+          response._note = "当前 LSP 服务器不支持 'textDocument/declaration'，已回退使用 '"
+            .. source_method .. "'。结果可能与声明位置略有差异。"
         end
+
+        if on_success then on_success(response) end
+      end
+
+      -- 先尝试 declaration，失败时回退到 definition
+      lsp_request_async(bufnr, "textDocument/declaration", {
+        textDocument = { uri = vim.uri_from_fname(vim.fn.fnamemodify(args.filepath, ":p")) },
+        position = { line = row, character = col },
+      }, function(result, req_err)
+        if req_err then
+          -- declaration 请求失败（通常是不支持），回退到 definition
+          local err_msg = type(req_err) == "string" and req_err or tostring(req_err or "")
+          if err_msg:match("不支持") or err_msg:match("not supported") then
+            lsp_request_async(bufnr, "textDocument/definition", {
+              textDocument = { uri = vim.uri_from_fname(vim.fn.fnamemodify(args.filepath, ":p")) },
+              position = { line = row, character = col },
+            }, function(def_result, def_err)
+              if def_err then
+                if on_error then on_error(def_err) end
+                return
+              end
+              process_locations(def_result, "definition")
+            end)
+            return
+          end
+          if on_error then on_error(req_err) end
+          return
+        end
+        process_locations(result, "declaration")
       end)
     end)
   end, true)
@@ -2029,75 +2059,64 @@ local function _lsp_document_symbols(args, on_success, on_error, on_progress)
 
     -- 使用 Tree-sitter 直接解析文件结构作为 LSP documentSymbol 的替代
     -- 当 LSP 返回空结果时，用 Tree-sitter 获取符号列表
-    -- 不依赖 neovim_tree 模块，直接使用 vim.treesitter API
+    -- 支持多语言：Python, Lua, JavaScript/TypeScript, Go, Rust, C/C++, Java, Ruby, PHP 等
     local function get_symbols_via_treesitter(filepath, callback)
       local ok_ts, ts = pcall(require, "vim.treesitter")
       if not ok_ts then
-        if callback then
-          callback(nil)
-        end
+        if callback then callback(nil) end
         return
       end
 
       -- 读取文件内容
       local abs_path = vim.fn.fnamemodify(filepath, ":p")
-      local fd, open_err = vim.uv.fs_open(abs_path, "r", 438)
+      local fd = vim.uv.fs_open(abs_path, "r", 438)
       if not fd then
-        if callback then
-          callback(nil)
-        end
+        if callback then callback(nil) end
         return
       end
-      local stat, _ = vim.uv.fs_fstat(fd)
+      local stat = vim.uv.fs_fstat(fd)
       if not stat then
         vim.uv.fs_close(fd)
-        if callback then
-          callback(nil)
-        end
+        if callback then callback(nil) end
         return
       end
-      local content, _ = vim.uv.fs_read(fd, stat.size, 0)
+      local content = vim.uv.fs_read(fd, stat.size, 0)
       vim.uv.fs_close(fd)
       if not content then
-        if callback then
-          callback(nil)
-        end
+        if callback then callback(nil) end
         return
       end
 
-      -- 推断语言
+      -- 推断语言（优先使用 ext_to_parser 获取 Tree-sitter 解析器名称）
       local ext = vim.fn.fnamemodify(abs_path, ":e"):lower()
-      local ext_to_lang = lm.ext_to_lang
-      local lang = ext_to_lang[ext]
+      local lang = lm.ext_to_parser["." .. ext] or lm.ext_to_lang[string.lower(ext)]
       if not lang then
-        if callback then
-          callback(nil)
+        local basename = vim.fn.fnamemodify(abs_path, ":t")
+        if basename == "Makefile" then lang = "make"
+        elseif basename:match("^Dockerfile") then lang = "dockerfile"
         end
+      end
+      if not lang then
+        if callback then callback(nil) end
         return
       end
 
       -- 检查解析器是否可用
-      local ok_inspect, _ = pcall(ts.language.inspect, lang)
+      local ok_inspect = pcall(ts.language.inspect, lang)
       if not ok_inspect then
-        if callback then
-          callback(nil)
-        end
+        if callback then callback(nil) end
         return
       end
 
       -- 解析
       local ok_parser, parser = pcall(ts.get_string_parser, content, lang)
       if not ok_parser or not parser then
-        if callback then
-          callback(nil)
-        end
+        if callback then callback(nil) end
         return
       end
       local ok_trees, trees = pcall(parser.parse, parser)
       if not ok_trees or not trees or #trees == 0 then
-        if callback then
-          callback(nil)
-        end
+        if callback then callback(nil) end
         return
       end
 
@@ -2107,53 +2126,124 @@ local function _lsp_document_symbols(args, on_success, on_error, on_progress)
       local symbols = {}
       local seen = {}
 
-      -- Python 的节点类型
+      -- 多语言结构类型 → SymbolKind 映射
+      -- LSP SymbolKind: 5=Class, 6=Method, 9=Constructor, 10=Enum,
+      --   11=Interface, 12=Function, 13=Variable, 23=Struct, 26=TypeParameter
       local structure_types = {
-        class_definition = 5, -- Class
-        function_definition = 12, -- Function
+        function_definition = 12, method_definition = 6, class_definition = 5,
+        class_declaration = 5, struct_specifier = 23, enum_specifier = 10,
+        union_specifier = 23, interface_declaration = 11, type_declaration = 26,
+        constructor_definition = 9, destructor_definition = 6,
+        variable_declaration = 13, local_variable_declaration = 13,
+        function_declaration = 12, local_function_declaration = 12,
+        decorated_definition = 12,
+        arrow_function = 12, generator_function = 12,
+        func_declaration = 12, method_declaration = 6,
+        impl_item = 3, trait_item = 11,
+        method = 6, singleton_method = 6, class = 5, module = 3,
       }
 
-      -- 需要跳过的节点类型（注释、字符串等，不包含有效符号）
+      -- 语言特定的名称提取模式
+      local lang_patterns = {
+        python = {
+          function_definition = "def%s+([%w_]+)",
+          class_definition = "class%s+([%w_]+)",
+        },
+        lua = {
+          function_declaration = "function%s+([%w_.]+)",
+          local_function_declaration = "function%s+([%w_]+)",
+          variable_declaration = "(%w+)%s*=",
+          local_variable_declaration = "(%w+)%s*=",
+        },
+        javascript = {
+          function_definition = "function%s+([%w_]+)",
+          arrow_function = "([%w_$]+)%s*=",
+          variable_declaration = "([%w_$]+)%s*=",
+          class_definition = "class%s+([%w_]+)",
+          class_declaration = "class%s+([%w_]+)",
+        },
+        typescript = {
+          function_definition = "function%s+([%w_]+)",
+          arrow_function = "([%w_$]+)%s*=",
+          variable_declaration = "([%w_$]+)%s*=",
+          class_definition = "class%s+([%w_]+)",
+          class_declaration = "class%s+([%w_]+)",
+        },
+        tsx = {
+          function_definition = "function%s+([%w_]+)",
+          arrow_function = "([%w_$]+)%s*=",
+          variable_declaration = "([%w_$]+)%s*=",
+          class_definition = "class%s+([%w_]+)",
+          class_declaration = "class%s+([%w_]+)",
+        },
+        go = {
+          func_declaration = "func%s+([%w_]+)",
+          method_declaration = "func%s+%(%s*%w+%s+%*?%w+%)%s*([%w_]+)",
+        },
+        rust = {
+          function_definition = "fn%s+([%w_]+)",
+          impl_item = "impl%s+([%w_]+)",
+          trait_item = "trait%s+([%w_]+)",
+          struct_specifier = "struct%s+([%w_]+)",
+          enum_specifier = "enum%s+([%w_]+)",
+        },
+        c = {
+          function_definition = "([%w_]+)%s*%(",
+          struct_specifier = "struct%s+([%w_]+)",
+          enum_specifier = "enum%s+([%w_]+)",
+        },
+        cpp = {
+          function_definition = "([%w_]+)%s*%(",
+          class_definition = "class%s+([%w_]+)",
+          struct_specifier = "struct%s+([%w_]+)",
+          enum_specifier = "enum%s+([%w_]+)",
+        },
+        java = {
+          class_definition = "class%s+([%w_]+)",
+          method_definition = "([%w_]+)%s*%(",
+          interface_declaration = "interface%s+([%w_]+)",
+        },
+        ruby = {
+          method = "def%s+([%w_?!]+)",
+          singleton_method = "def%s+self%.([%w_?!]+)",
+          class = "class%s+([%w_]+)",
+          module = "module%s+([%w_]+)",
+        },
+        php = {
+          function_definition = "function%s+([%w_]+)",
+          class_definition = "class%s+([%w_]+)",
+          method_definition = "function%s+([%w_]+)",
+        },
+      }
+
+      local function extract_name(node_type, text, lang)
+        local lang_ptns = lang_patterns[lang]
+        if lang_ptns then
+          local ptn = lang_ptns[node_type]
+          if ptn then
+            local name = text:match(ptn)
+            if name and name ~= "" then return name end
+          end
+        end
+        local first_line = text:match("^[^\n]+") or ""
+        local name = first_line:match("^%s*(%w+)")
+        return name or ""
+      end
+
       local skip_types = {
-        comment = true,
-        string = true,
-        string_literal = true,
-        line_comment = true,
-        block_comment = true,
+        comment = true, string = true, string_literal = true,
+        line_comment = true, block_comment = true, string_content = true,
       }
 
       local function traverse(node, depth)
-        if not node or depth > 6 then
-          return
-        end
-
+        if not node or depth > 8 then return end
         local node_type = node:type()
-
-        -- 跳过注释和字符串节点（及其子节点）
-        if skip_types[node_type] then
-          return
-        end
+        if skip_types[node_type] then return end
 
         local kind = structure_types[node_type]
-
         if kind then
           local text = vim.treesitter.get_node_text(node, content)
-          local name = text:match("^[^\n]+") or text
-
-          -- 提取名称
-          if node_type == "function_definition" then
-            local fn = text:match("def%s+([%w_]+)")
-            if fn then
-              name = fn
-            end
-          elseif node_type == "class_definition" then
-            local cls = text:match("class%s+([%w_]+)")
-            if cls then
-              name = cls
-            end
-          end
-
-          -- 只保留能提取到有效名称的符号
+          local name = extract_name(node_type, text, lang)
           if name and name ~= "" then
             local sr, sc, er, ec = node:range()
             local key = node_type .. ":" .. name .. ":" .. sr

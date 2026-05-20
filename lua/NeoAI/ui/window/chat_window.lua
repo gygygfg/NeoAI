@@ -287,6 +287,7 @@ local function reset_tool_display()
   state.tool_display.streaming_preview.tools = {}
   state.tool_display.streaming_preview.window_shown = false
   state.tool_display.message_index = nil
+  state.tool_display.message_start_line = nil
   tool_display_component.reset_folded_index()
 end
 
@@ -989,8 +990,30 @@ function M._render_single_message(msg, prev_role)
   end
 
   -- 检查是否是折叠文本（以 {{{ 开头）
+  -- 如果同时有 reasoning，需要先渲染 reasoning 折叠/内联，再将后续内容一并处理
   if msg.role == "assistant" and type(raw_content) == "string" and raw_content:find("^{{{") then
-    -- 折叠文本：直接显示，不加 AI 标记
+    -- 先处理 reasoning（如果有）
+    if has_reasoning then
+      local reasoning_lines = vim.split(reasoning_content, "\n")
+      local has_content = main_content and main_content ~= ""
+      local reasoning_text_combined = table.concat(reasoning_lines, " ")
+      local reasoning_short = #reasoning_text_combined < 200
+      local use_folded = has_content or not reasoning_short
+      if use_folded then
+        table.insert(lines, "{{{ 🤔 思考过程")
+        for _, rline in ipairs(reasoning_lines) do
+          table.insert(lines, "  " .. rline)
+        end
+        table.insert(lines, "}}}")
+      else
+        table.insert(lines, "🤖 AI: 🤔 思考过程:")
+        for _, rline in ipairs(reasoning_lines) do
+          table.insert(lines, "    " .. rline)
+        end
+      end
+      table.insert(lines, "")
+    end
+    -- 再处理 tool fold + 正文
     local clean_content = raw_content:gsub("\r\n", "\n"):gsub("\r", "\n")
     local fold_end = select(2, clean_content:find("}}}%s*"))
     if fold_end then
@@ -2524,11 +2547,10 @@ function M._setup_event_listeners()
             -- 避免 _render_streaming_message 使用 message_start_line 替换时
             -- 将折叠文本插入到正文区域之前导致内容重复
             state.streaming.message_index = folded_idx
-            -- 如果 AI 正文非空且不是流式返回的（非流式场景），追加纯正文到缓冲区
-            local append_str = _content_to_str(append_content)
-            if append_str ~= "" and state.streaming.generation_id ~= data.generation_id then
-              M._append_message_to_buffer("assistant", append_str, data.window_id)
-            end
+            -- folded_saved=true 时，正文已通过 TOOL_EXECUTION_COMPLETED 逐工具渲染到缓冲区
+            -- 不再调用 _append_message_to_buffer，避免重复追加
+            -- （原条件 state.streaming.generation_id ~= data.generation_id 在 TOOL_LOOP_STARTED
+            --  清空 generation_id 后恒为 true，导致流式场景也错误追加）
           else
             state.messages[msg_idx].content = content_with_reasoning
             M._render_streaming_message(data.window_id)
@@ -2551,10 +2573,10 @@ function M._setup_event_listeners()
             -- 折叠文本已通过 TOOL_EXECUTION_COMPLETED 逐工具渲染到缓冲区
             -- 此处只更新 state.messages，不再调用 _render_streaming_message 重新渲染
             state.streaming.message_index = folded_idx
-            -- 如果 AI 正文非空且不是流式返回的（非流式场景），追加纯正文到缓冲区
-            if append_str ~= "" and state.streaming.generation_id ~= data.generation_id then
-              M._append_message_to_buffer("assistant", append_str, data.window_id)
-            end
+            -- folded_saved=true 时，正文已通过 TOOL_EXECUTION_COMPLETED 逐工具渲染到缓冲区
+            -- 不再调用 _append_message_to_buffer，避免重复追加
+            -- （原条件 state.streaming.generation_id ~= data.generation_id 在 TOOL_LOOP_STARTED
+            --  清空 generation_id 后恒为 true，导致流式场景也错误追加）
           else
             table.insert(
               state.messages,
@@ -3057,10 +3079,14 @@ function M._setup_event_listeners()
       -- 如果不提前保存，思考过程折叠文本会丢失
       local saved_reasoning = state.streaming.reasoning_buffer or ""
       local saved_message_index = state.streaming.message_index
+      local saved_message_start_line = state.streaming.message_start_line
       if saved_reasoning ~= "" and saved_message_index then
-        state.streaming.reasoning_active = false
-        state.streaming.reasoning_done = true
-        M._append_reasoning_folded_to_buffer(saved_reasoning)
+        -- 如果思考过程已在 STREAM_CHUNK 的 reasoning→content 切换中追加过，不再重复追加
+        if not state.streaming.reasoning_done then
+          state.streaming.reasoning_active = false
+          state.streaming.reasoning_done = true
+          M._append_reasoning_folded_to_buffer(saved_reasoning)
+        end
       end
 
       local s = state.streaming
@@ -3098,9 +3124,10 @@ function M._setup_event_listeners()
       state.tool_display.packs = tool_display_component.get_packs()
       state.tool_display.pack_order = tool_display_component.get_pack_order()
       state.tool_display.substeps = {}
-      -- 保存 message_index，供 TOOL_EXECUTION_COMPLETED 写入折叠文本时使用
-      -- 因为 TOOL_LOOP_STARTED 清空了 state.streaming.message_index
+      -- 保存 message_index 和 message_start_line，供 TOOL_EXECUTION_COMPLETED 写入折叠文本时使用
+      -- 因为 TOOL_LOOP_STARTED 清空了 state.streaming.message_index 和 message_start_line
       state.tool_display.message_index = saved_message_index
+      state.tool_display.message_start_line = saved_message_start_line
 
       -- 仅在光标在后5行内时才显示工具调用悬浮窗
       -- 注意：必须同步创建悬浮窗，不能使用 vim.schedule 异步执行
@@ -3835,7 +3862,7 @@ local function _render_streaming_message(window_id)
 
   -- 在修改 buffer 内容之前缓存光标位置
   _check_cursor_near_end()
-  local start_line = state.streaming.message_start_line
+  local start_line = state.streaming.message_start_line or state.tool_display.message_start_line
   if start_line then
     -- 已有起始行：替换从起始行到末尾的内容
     _replace_message_in_buffer(buf, start_line, lines)

@@ -345,8 +345,8 @@ local function _replace_text(args, on_success, on_error)
 
   local filepath = args.filepath
   local new_text = args.new_text
-  local start_line_info = args.start_line -- { line_number, search_text }
-  local end_line_info = args.end_line -- { line_number, search_text }
+  local start_match = args.start_match -- { line_number, search_text }
+  local end_match = args.end_match -- { line_number, search_text }
 
   if not new_text then
     if on_error then
@@ -355,9 +355,9 @@ local function _replace_text(args, on_success, on_error)
     return
   end
 
-  if not start_line_info or not end_line_info then
+  if not start_match or not end_match then
     if on_error then
-      on_error("需要 start_line 和 end_line 参数（格式：{line_number, search_text}）")
+      on_error("需要 start_match 和 end_match 参数（格式：{line_number, search_text}）")
     end
     return
   end
@@ -376,10 +376,10 @@ local function _replace_text(args, on_success, on_error)
   local lines = vim.split(content, "\n", { plain = true })
   local total_lines = #lines
 
-  local start_anchor = start_line_info.line_number
-  local start_text = start_line_info.search_text
-  local end_anchor = end_line_info.line_number
-  local end_text = end_line_info.search_text
+  local start_anchor = start_match.line_number
+  local start_text = start_match.search_text
+  local end_anchor = end_match.line_number
+  local end_text = end_match.search_text
 
   if not start_anchor or not start_text or not end_anchor or not end_text then
     if on_error then
@@ -509,8 +509,8 @@ local function _replace_text(args, on_success, on_error)
       buffer = bufnr,
       once = true,
       callback = function()
-        diag_timer:stop()
-        diag_timer:close()
+        pcall(function() diag_timer:stop() end)
+        pcall(function() diag_timer:close() end)
 
         if cleanup then
           cleanup()
@@ -529,19 +529,19 @@ end
 
 M.replace_text = {
   name = "replace_text",
-  description = [[替换文件中指定范围的文本内容。替换的是从 **start_line 匹配行的行首**到 **end_line 匹配行的行尾**的完整范围，而非行内的子串。
-  start_line = { line_number: 行号, search_text: "搜索文本" }
-  end_line = { line_number: 行号, search_text: "搜索文本" }
+  description = [[替换文件中指定范围的文本内容。替换的是从 **start_match 匹配行的行首**到 **end_match 匹配行的行尾**的完整范围，而非行内的子串。
+  start_match = { line_number: 行号, search_text: "搜索文本" }
+  end_match = { line_number: 行号, search_text: "搜索文本" }
   工具会从指定行号开始上下查找匹配的文本
   示例：
-  { filepath = "/path/to/file", start_line = {line_number = 5, search_text = "function foo"}, end_line = {line_number = 7, search_text = "}"}, new_text = "新的函数内容" }]],
+  { filepath = "/path/to/file", start_match = {line_number = 5, search_text = "function foo"}, end_match = {line_number = 7, search_text = "}"}, new_text = "新的函数内容" }]],
   func = _replace_text,
   async = true,
   parameters = {
     type = "object",
     properties = {
       filepath = { type = "string", description = "文件路径（必填）" },
-      start_line = {
+      start_match = {
         type = "object",
         properties = {
           line_number = { type = "number", description = "行号" },
@@ -549,9 +549,9 @@ M.replace_text = {
         },
         required = { "line_number", "search_text" },
         additionalProperties = false,
-        description = "起始行定位：{line_number, search_text}，工具从该行号上下查找匹配文本，确定替换起始位置",
+        description = "起始匹配定位：{line_number, search_text}，工具从该行号上下查找匹配文本，确定替换起始位置",
       },
-      end_line = {
+      end_match = {
         type = "object",
         properties = {
           line_number = { type = "number", description = "行号" },
@@ -559,14 +559,14 @@ M.replace_text = {
         },
         required = { "line_number", "search_text" },
         additionalProperties = false,
-        description = "结束行定位：{line_number, search_text}，工具从该行号上下查找匹配文本，确定替换结束位置",
+        description = "结束匹配定位：{line_number, search_text}，工具从该行号上下查找匹配文本，确定替换结束位置",
       },
       new_text = {
         type = "string",
         description = "替换后的新文本内容（必填）",
       },
     },
-    required = { "filepath", "start_line", "end_line", "new_text" },
+    required = { "filepath", "start_match", "end_match", "new_text" },
   },
   returns = {
     type = "object",

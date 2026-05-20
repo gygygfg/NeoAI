@@ -1131,9 +1131,29 @@ M.git_file_history = {
 local function _git_branch(args, on_success, on_error)
   local cwd = args and args.cwd
 
+  -- 伪 Git 模式：显示快照历史作为分支列表
   if not _git_auto_mod.is_git_available() then
+    if state.pseudo.enabled then
+      local lines = {}
+      table.insert(lines, "伪 Git 模式 - 快照历史（作为分支列表）:")
+      if #state.pseudo.snapshots > 0 then
+        table.insert(lines, string.format("* (HEAD -> master) - 当前工作区"))
+        for i = #state.pseudo.snapshots, 1, -1 do
+          local s = state.pseudo.snapshots[i]
+          local short_hash = s.hash:sub(1, 7)
+          local msg = s.message or "(无提交信息)"
+          table.insert(lines, string.format("  snapshot-%d (%s) - %s", i, short_hash, msg))
+        end
+      else
+        table.insert(lines, "* (HEAD -> master) - 当前工作区（无历史快照）")
+      end
+      local result = table.concat(lines, "\n")
+      if on_success then on_success(result) end
+      return
+    end
+
     if on_error then
-      on_error("git 不可用，伪 Git 模式不支持分支操作")
+      on_error("git 不可用，且伪 Git 模式未启用")
     end
     return
   end
@@ -1152,12 +1172,16 @@ local function _git_branch(args, on_success, on_error)
     if on_success then
       on_success(result)
     end
+  else
+    if on_error then
+      on_error("git branch 命令执行失败")
+    end
   end
 end
 
 M.git_branch = {
   name = "git_branch",
-  description = "查看所有分支列表（仅真实 git 模式可用）",
+  description = "查看所有分支列表（伪 Git 模式以快照历史替代）",
   func = _git_branch,
   async = true,
   parameters = {

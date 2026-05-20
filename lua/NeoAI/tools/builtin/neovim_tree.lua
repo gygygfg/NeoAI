@@ -55,6 +55,28 @@ local block_node_types = {
   -- 宏
   macro_definition = true,
   macro_invocation = true,
+  -- 注释（可删除节点）
+  comment = true,
+  line_comment = true,
+  block_comment = true,
+  -- 字符串字面量（可删除节点）
+  string = true,
+  string_literal = true,
+  string_content = true,
+  -- 导入导出语句（可删除节点）
+  import_statement = true,
+  import_declaration = true,
+  export_declaration = true,
+  -- 语句级节点（可删除）
+  expression_statement = true,
+  return_statement = true,
+  break_statement = true,
+  continue_statement = true,
+  assert_statement = true,
+  raise_statement = true,
+  -- 属性/装饰器（可删除）
+  attribute = true,
+  annotation = true,
 }
 
 M.block_node_types = block_node_types
@@ -1883,3 +1905,4 @@ function M.parse_file_content_async(filepath, max_depth, on_success, on_error)
 end
 
 return M
+

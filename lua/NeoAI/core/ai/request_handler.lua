@@ -32,6 +32,8 @@ local function get_tool_definitions()
   return _tool_definitions or {}
 end
 
+
+
 --- 获取首次请求标志
 local function get_first_request()
   return _first_request ~= false
@@ -1353,4 +1355,100 @@ function M.set_retry_config(opts)
   end
 end
 
+-- ========== XML 工具调用解析 ==========
+
+--- 从 AI 文本回复中提取 XML 格式的工具调用
+--- 某些模型（Gemma、Qwen、DeepSeek 等）不支持原生 tool_calls，会在 content 中输出 XML：
+---   <invoke name="tool_name">
+---     <parameter name="param1">value1</parameter>
+---   </invoke>
+--- 解析后返回与 OpenAI tool_calls 兼容的格式，arguments 直接为 Lua table
+--- @param content string AI 回复的纯文本内容
+--- @return table|nil 解析出的 tool_calls 数组，无 XML 时返回 nil
+function M.extract_xml_tool_calls(content)
+  if not content or type(content) ~= "string" or content == "" then
+    return nil
+  end
+
+  local tool_calls = {}
+  local pos = 1
+  local call_index = 0
+
+  while true do
+    -- 找到 <invoke ...> 起始标签
+    local start_tag, end_tag = content:find("<invoke%s", pos)
+    if not start_tag then break end
+
+    -- 找到 > 结束起始标签
+    local tag_end = content:find(">", end_tag + 1)
+    if not tag_end then break end
+
+    -- 找到 </invoke>
+    local close_pos = content:find("</invoke>", tag_end + 1)
+    if not close_pos then break end
+
+    -- invoke_body = <invoke> 和 </invoke> 之间的内容
+    local invoke_block = content:sub(start_tag, tag_end)
+    local invoke_body = content:sub(tag_end + 1, close_pos - 1)
+
+    -- 解析 name 属性（支持单引号和双引号）
+    local name = invoke_block:match([=[<invoke[^>]-name%s*=%s*["']([^"']+)["']]=])
+    if name then
+      name = name:gsub("^%s+", ""):gsub("%s+$", "")
+    end
+
+    if name and name ~= "" then
+      -- 解析所有 <parameter name="...">value</parameter>
+      local arguments = {}
+      local param_pattern = [[<parameter[^>]-name%s*=%s*["']([^"']+)["']%s*>(.-)</parameter>]]
+      for param_name, param_value in invoke_body:gmatch(param_pattern) do
+        param_name = param_name:gsub("^%s+", ""):gsub("%s+$", "")
+        param_value = param_value:gsub("^%s+", ""):gsub("%s+$", "")
+        -- 尝试转换为数字/布尔值
+        if param_value == "true" then
+          arguments[param_name] = true
+        elseif param_value == "false" then
+          arguments[param_name] = false
+        elseif tonumber(param_value) then
+          arguments[param_name] = tonumber(param_value)
+        else
+          arguments[param_name] = param_value
+        end
+      end
+
+      if next(arguments) then
+        call_index = call_index + 1
+        local tc_id = "xml_call_" .. os.time() .. "_" .. call_index .. "_" .. math.random(10000, 99999)
+        table.insert(tool_calls, {
+          id = tc_id,
+          type = "function",
+          ["function"] = {
+            name = name,
+            arguments = arguments, -- 直接是 Lua table，不是 JSON 字符串
+          },
+        })
+      end
+    end
+
+    pos = close_pos + 9 -- 跳过 </invoke>
+  end
+
+  if #tool_calls > 0 then
+    logger.info("[request_handler] 从 XML 内容中提取到 %d 个工具调用", #tool_calls)
+    return tool_calls
+  end
+  return nil
+end
+
+--- 从 content 中移除已解析的 XML 工具调用块，返回干净的纯文本
+--- @param content string 原始内容
+--- @return string 移除 XML 块后的内容
+function M.remove_xml_tool_calls(content)
+  if not content or type(content) ~= "string" then return content or "" end
+  -- 移除所有 <invoke>...</invoke> 块（包括前后空白）
+  local cleaned = content:gsub("%s-<invoke[^>]->.-</invoke>%s-", "")
+  return cleaned
+end
+
 return M
+
