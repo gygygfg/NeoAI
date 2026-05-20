@@ -529,7 +529,7 @@ local function _replace_text(args, on_success, on_error)
 
       local root = tree[1]:root()
       local ts_ft = vim.bo[bufnr].filetype or "python"
-      local ok_query, query = pcall(vim.treesitter.query.parse, ts_ft, "((ERROR) @err")
+      local ok_query, query = pcall(vim.treesitter.query.parse, ts_ft, "((ERROR) @err)")
       if not ok_query or not query then
         return {}
       end
@@ -1341,74 +1341,89 @@ local function _delete_file(args, on_success, on_error)
 
   if is_dir then
     -- 目录使用 uv.fs_rmdir（仅支持空目录）
-    local deleted = false
+    local callback_called = false
+    local function safe_callback(ok, result)
+      if callback_called then
+        return
+      end
+      callback_called = true
+      if timer then
+        timer:stop()
+        timer:close()
+      end
+      if ok then
+        if on_success then
+          on_success(result)
+        end
+      else
+        if on_error then
+          on_error(result)
+        end
+      end
+    end
+
     local timer = uv.new_timer()
     if timer then
       timer:start(
         10000,
         0,
         vim.schedule_wrap(function()
-          if not deleted then
-            if on_error then
-              on_error(string.format("删除目录超时 %s（目录可能非空或无权限）", filepath))
-            end
-          end
+          safe_callback(false, string.format("删除目录超时 %s（目录可能非空或无权限）", filepath))
         end)
       )
     end
     uv.fs_rmdir(filepath, function(rmdir_err)
-      deleted = true
-      if timer then
-        timer:stop()
-        timer:close()
-      end
       if rmdir_err then
-        if on_error then
-          on_error(
-            string.format(
-              "删除目录失败 %s: %s（目录可能非空，请使用 run_command 执行 rm -rf）",
-              filepath,
-              tostring(rmdir_err)
-            )
+        safe_callback(
+          false,
+          string.format(
+            "删除目录失败 %s: %s（目录可能非空，请使用 run_command 执行 rm -rf）",
+            filepath,
+            tostring(rmdir_err)
           )
-        end
+        )
       else
-        if on_success then
-          on_success({ filepath = filepath, success = true, type = "directory" })
-        end
+        safe_callback(true, { filepath = filepath, success = true, type = "directory" })
       end
     end)
   else
     -- 文件使用 uv.fs_unlink
-    local deleted = false
+    local callback_called = false
+    local function safe_callback(ok, result)
+      if callback_called then
+        return
+      end
+      callback_called = true
+      if timer then
+        timer:stop()
+        timer:close()
+      end
+      if ok then
+        if on_success then
+          on_success(result)
+        end
+      else
+        if on_error then
+          on_error(result)
+        end
+      end
+    end
+
     local timer = uv.new_timer()
     if timer then
       timer:start(
         10000,
         0,
         vim.schedule_wrap(function()
-          if not deleted then
-            if on_error then
-              on_error(string.format("删除文件超时 %s（文件可能被锁定或无权限）", filepath))
-            end
-          end
+          safe_callback(false, string.format("删除文件超时 %s（文件可能被锁定或无权限）", filepath))
         end)
       )
     end
     uv.fs_unlink(filepath, function(unlink_err)
-      deleted = true
-      if timer then
-        timer:stop()
-        timer:close()
-      end
       if unlink_err then
-        if on_error then
-          on_error(string.format("删除文件失败 %s: %s", filepath, tostring(unlink_err)))
-        end
+        safe_callback(false, string.format("删除文件失败 %s: %s", filepath, tostring(unlink_err)))
       else
-        if on_success then
-          on_success({ filepath = filepath, success = true, type = "file" })
-        end
+        safe_callback(true, { filepath = filepath, success = true, type = "file" })
       end
     end)
   end

@@ -22,7 +22,7 @@ local request_dedup = {}
 --- @param generation_id string
 --- @param suffix string 后缀（如 "_stream"、"_nonstream"）
 --- @param body table 请求体
---- @param ttl_ms number TTL 毫秒
+--- @param ttl_ms number|nil TTL 毫秒
 --- @return boolean 是否重复
 function M.check_dedup(generation_id, suffix, body, ttl_ms)
   ttl_ms = ttl_ms or 3000
@@ -56,7 +56,9 @@ end
 --- 清除指定 generation_id 的去重缓存
 --- @param generation_id string
 function M.clear_dedup(generation_id)
-  if not generation_id or generation_id == "" then return end
+  if not generation_id or generation_id == "" then
+    return
+  end
   for key, _ in pairs(request_dedup) do
     if key:find(generation_id, 1, true) then
       request_dedup[key] = nil
@@ -77,7 +79,9 @@ end
 --- @param str string
 --- @return string
 function M.encode_special_chars(str)
-  if not str or str == "" then return str end
+  if not str or str == "" then
+    return str
+  end
   local result = {}
   local i = 1
   while i <= #str do
@@ -90,9 +94,12 @@ function M.encode_special_chars(str)
       i = i + 1
     elseif byte >= 0x80 then
       local trailing = 0
-      if byte >= 0xF0 and byte <= 0xF4 then trailing = 3
-      elseif byte >= 0xE0 then trailing = 2
-      elseif byte >= 0xC2 then trailing = 1
+      if byte >= 0xF0 and byte <= 0xF4 then
+        trailing = 3
+      elseif byte >= 0xE0 then
+        trailing = 2
+      elseif byte >= 0xC2 then
+        trailing = 1
       else
         result[#result + 1] = string.format("%%%02X", byte)
         i = i + 1
@@ -101,7 +108,10 @@ function M.encode_special_chars(str)
       local valid = true
       for j = 1, trailing do
         local next_byte = str:byte(i + j)
-        if not next_byte or next_byte < 0x80 or next_byte > 0xBF then valid = false; break end
+        if not next_byte or next_byte < 0x80 or next_byte > 0xBF then
+          valid = false
+          break
+        end
       end
       if valid then
         result[#result + 1] = str:sub(i, i + trailing)
@@ -109,7 +119,9 @@ function M.encode_special_chars(str)
       else
         for j = 1, trailing + 1 do
           local b = str:byte(i + j - 1)
-          if b then result[#result + 1] = string.format("%%%02X", b) end
+          if b then
+            result[#result + 1] = string.format("%%%02X", b)
+          end
         end
         i = i + trailing + 1
       end
@@ -127,7 +139,9 @@ end
 --- @param tool_calls table|nil 工具调用列表
 --- @return table 处理后的工具调用列表
 function M.parse_tool_call_arguments(tool_calls)
-  if not tool_calls or #tool_calls == 0 then return tool_calls or {} end
+  if not tool_calls or #tool_calls == 0 then
+    return tool_calls or {}
+  end
   for _, tc in ipairs(tool_calls) do
     local func = tc["function"] or tc.func
     if func and func.arguments and type(func.arguments) == "string" then
@@ -144,7 +158,9 @@ end
 --- @param response table 已解码的响应
 --- @return table 处理后的响应
 function M.parse_response_tool_calls(response)
-  if not response or type(response) ~= "table" then return response end
+  if not response or type(response) ~= "table" then
+    return response
+  end
   if response.choices then
     for _, choice in ipairs(response.choices) do
       if choice.delta and choice.delta.tool_calls then
@@ -168,11 +184,15 @@ end
 --- @param body string
 --- @return string
 function M.sanitize_json_body(body)
-  if not body or body == "" then return body end
+  if not body or body == "" then
+    return body
+  end
   local ok, decoded = pcall(json.decode, body)
   if ok and decoded ~= nil then
     local ok2, reencoded = pcall(json.encode, decoded)
-    if ok2 and reencoded then return reencoded end
+    if ok2 and reencoded then
+      return reencoded
+    end
   end
   return body
 end
@@ -182,23 +202,31 @@ end
 --- 将调用了工具列表中没有的工具的 tool 消息转为 user 消息
 --- @param request table 请求体（会被原地修改）
 function M.repair_orphan_tool_messages(request)
-  if not request or not request.messages or #request.messages == 0 then return end
+  if not request or not request.messages or #request.messages == 0 then
+    return
+  end
 
   local available_tools = {}
   if request.tools then
     for _, td in ipairs(request.tools) do
       local func = td["function"] or td.func
-      if func and func.name then available_tools[func.name] = true end
+      if func and func.name then
+        available_tools[func.name] = true
+      end
     end
   end
-  if not next(available_tools) then return end
+  if not next(available_tools) then
+    return
+  end
 
   local declared_ids = {}
   for _, msg in ipairs(request.messages) do
     if msg.role == "assistant" and msg.tool_calls then
       for _, tc in ipairs(msg.tool_calls) do
         local tc_id = tc.id or tc.tool_call_id
-        if tc_id then declared_ids[tc_id] = true end
+        if tc_id then
+          declared_ids[tc_id] = true
+        end
       end
     end
   end
@@ -208,12 +236,16 @@ function M.repair_orphan_tool_messages(request)
     if msg.role == "tool" then
       local is_orphan = false
       if msg.tool_call_id and msg.tool_call_id ~= "" then
-        if not declared_ids[msg.tool_call_id] then is_orphan = true end
+        if not declared_ids[msg.tool_call_id] then
+          is_orphan = true
+        end
       else
         is_orphan = true
       end
       if not is_orphan and msg.name and msg.name ~= "" then
-        if not available_tools[msg.name] then is_orphan = true end
+        if not available_tools[msg.name] then
+          is_orphan = true
+        end
       end
       if is_orphan then
         msg.role = "user"
@@ -236,7 +268,9 @@ end
 function M.read_file(filepath)
   local ok, content = pcall(function()
     local f = io.open(filepath, "r")
-    if not f then return nil end
+    if not f then
+      return nil
+    end
     local d = f:read("*a")
     f:close()
     return d
@@ -305,14 +339,14 @@ end
 
 --- 执行异步非流式 curl 请求（vim.fn.jobstart）
 --- @param opts { url: string, method?: string, headers: table, body: string, temp_file: string }
---- @param callbacks { on_complete: function(content, err), on_stderr?: function(data) }
+--- @param callbacks { on_complete: fun(content: string|nil, err: string|nil), on_stderr: fun(data: table)|nil }
 --- @return integer|nil job_id, string temp_file
 function M.execute_curl_async(opts, callbacks)
   local args = M.build_curl_args(opts)
   local temp_file = opts.temp_file or vim.fn.tempname()
   vim.list_extend(args, { "-o", temp_file })
 
-  local job_id = vim.fn.jobstart({ "curl", unpack(args) }, {
+  local job_id = vim.fn.jobstart({ "curl", table.unpack(args) }, {
     on_stderr = function(_, data)
       if data and #data > 0 and callbacks.on_stderr then
         callbacks.on_stderr(data)
@@ -351,10 +385,14 @@ end
 --- @param line string SSE 行
 --- @return table|nil 解析后的数据，nil 表示跳过（空行或 [DONE]）
 function M.parse_sse_line(line)
-  if not line or line == "" then return nil end
+  if not line or line == "" then
+    return nil
+  end
   local data_str = line:match("^data:%s*(.*)")
   if data_str then
-    if data_str == "[DONE]" then return nil end
+    if data_str == "[DONE]" then
+      return nil
+    end
     local ok, data = pcall(json.decode, data_str)
     if ok and type(data) == "table" then
       return data
@@ -392,7 +430,7 @@ function M.create_stream_processor(generation_id, session_id, window_id, is_tool
     start_time = os.time(),
     is_finished = false,
     -- 工具调用累积状态（用于调试和完整性检查）
-    _json_depth = 0,           -- 当前 JSON 嵌套深度（{+1, }-1）
+    _json_depth = 0, -- 当前 JSON 嵌套深度（{+1, }-1）
     _json_depth_changed = false, -- 深度是否曾发生过变化
   }
 end
@@ -402,7 +440,9 @@ end
 --- @param processor table 流式处理器实例
 --- @param str string 新增的字符串片段
 function M._update_json_depth(processor, str)
-  if not processor or not str or type(str) ~= "string" then return end
+  if not processor or not str or type(str) ~= "string" then
+    return
+  end
   local changed = false
   for i = 1, #str do
     local c = str:sub(i, i)
@@ -424,7 +464,9 @@ end
 --- @param processor table 流式处理器实例
 --- @return boolean
 function M._check_json_depth_zero(processor)
-  if not processor then return false end
+  if not processor then
+    return false
+  end
   return processor._json_depth == 0
 end
 
@@ -466,15 +508,22 @@ function M.process_stream_chunk(processor, data)
           if not processor.tool_calls[idx + 1] then
             local safe_id = tc.id or ("call_" .. os.time() .. "_" .. idx)
             processor.tool_calls[idx + 1] = {
-              id = safe_id, type = tc.type or "function",
+              id = safe_id,
+              type = tc.type or "function",
               ["function"] = { name = "", arguments = {} },
             }
           end
           local e = processor.tool_calls[idx + 1]
-          if tc.id then e.id = tc.id end
-          if tc.type then e.type = tc.type end
+          if tc.id then
+            e.id = tc.id
+          end
+          if tc.type then
+            e.type = tc.type
+          end
           if tc["function"] then
-            if tc["function"].name then e["function"].name = e["function"].name .. tc["function"].name end
+            if tc["function"].name then
+              e["function"].name = e["function"].name .. tc["function"].name
+            end
             if tc["function"].arguments ~= nil then
               if type(tc["function"].arguments) == "string" then
                 if type(e["function"].arguments) == "table" then
@@ -490,7 +539,9 @@ function M.process_stream_chunk(processor, data)
             end
           end
         end
-        if #processor.tool_calls > 0 then result.tool_calls = vim.deepcopy(processor.tool_calls) end
+        if #processor.tool_calls > 0 then
+          result.tool_calls = vim.deepcopy(processor.tool_calls)
+        end
       end
     end
     if choice.message and choice.message.tool_calls then
@@ -499,15 +550,22 @@ function M.process_stream_chunk(processor, data)
         if not processor.tool_calls[idx + 1] then
           local safe_id = tc.id or ("call_" .. os.time() .. "_" .. idx)
           processor.tool_calls[idx + 1] = {
-            id = safe_id, type = tc.type or "function",
+            id = safe_id,
+            type = tc.type or "function",
             ["function"] = { name = "", arguments = {} },
           }
         end
         local e = processor.tool_calls[idx + 1]
-        if tc.id then e.id = tc.id end
-        if tc.type then e.type = tc.type end
+        if tc.id then
+          e.id = tc.id
+        end
+        if tc.type then
+          e.type = tc.type
+        end
         if tc["function"] then
-          if tc["function"].name then e["function"].name = tc["function"].name end
+          if tc["function"].name then
+            e["function"].name = tc["function"].name
+          end
           if tc["function"].arguments ~= nil then
             if type(tc["function"].arguments) == "string" then
               if type(e["function"].arguments) == "table" then
@@ -523,7 +581,9 @@ function M.process_stream_chunk(processor, data)
           end
         end
       end
-      if #processor.tool_calls > 0 then result.tool_calls = vim.deepcopy(processor.tool_calls) end
+      if #processor.tool_calls > 0 then
+        result.tool_calls = vim.deepcopy(processor.tool_calls)
+      end
     end
     if choice.finish_reason then
       result.is_final = true
@@ -595,8 +655,11 @@ function M.try_finalize_tool_calls(processor)
         func.arguments = parsed
         args = parsed
       else
-        logger.debug("[http_utils] try_finalize_tool_calls: 工具 '%s' 的 arguments JSON 不完整: %s",
-          func.name, args:sub(1, 200))
+        logger.debug(
+          "[http_utils] try_finalize_tool_calls: 工具 '%s' 的 arguments JSON 不完整: %s",
+          func.name,
+          args:sub(1, 200)
+        )
         return nil
       end
     end
@@ -619,7 +682,9 @@ end
 --- 清理处理器中的工具调用状态
 --- @param processor table|nil 流式处理器实例
 function M.clear_dual_trigger_state(processor)
-  if not processor then return end
+  if not processor then
+    return
+  end
   processor._json_depth = 0
   processor._json_depth_changed = false
 end
@@ -646,13 +711,13 @@ function M.push_reasoning_content(generation_id, content, processor, params)
 
   if not _reasoning_throttle.timer then
     _reasoning_throttle.timer = vim.defer_fn(function()
-      local content = _reasoning_throttle.pending_content
+      local pending = _reasoning_throttle.pending_content
       local gid = _reasoning_throttle.generation_id
       local proc = _reasoning_throttle.processor
       _reasoning_throttle.pending_content = ""
       _reasoning_throttle.timer = nil
 
-      if content ~= "" then
+      if pending ~= "" then
         local shared = require("NeoAI.core.config.state").get_shared()
         local sid = shared and shared.session_id or (proc and proc.session_id)
         local wid = shared and shared.window_id or (proc and proc.window_id)
@@ -660,7 +725,7 @@ function M.push_reasoning_content(generation_id, content, processor, params)
           pattern = require("NeoAI.core.events").REASONING_CONTENT,
           data = {
             generation_id = gid,
-            reasoning_content = content,
+            reasoning_content = pending,
             session_id = sid,
             window_id = wid,
           },
@@ -674,10 +739,16 @@ end
 function M.clear_reasoning_throttle()
   if _reasoning_throttle.timer then
     local timer = _reasoning_throttle.timer
-    pcall(function()
-      if timer:is_active() then timer:stop() end
-      if not timer:is_closing() then timer:close() end
-    end)
+    if timer then
+      pcall(function()
+        if timer:is_active() then
+          timer:stop()
+        end
+        if not timer:is_closing() then
+          timer:close()
+        end
+      end)
+    end
     _reasoning_throttle.timer = nil
   end
   _reasoning_throttle.pending_content = ""
@@ -692,7 +763,6 @@ end
 function M.is_tool_calls_ready(processor)
   return processor and processor.is_finished
 end
-
 
 -- =====================================================================
 -- HTTP 客户端状态管理（从 http_client.lua 迁移）
@@ -846,7 +916,7 @@ function M.send_request(params)
   )
   -- 调试：打印请求体中的 model 字段
   local ok_body, decoded_body = pcall(json.decode, request_body)
-  if ok_body and decoded_body and decoded_body.model then
+  if ok_body and type(decoded_body) == "table" and decoded_body.model then
     logger.debug(string.format("[http_client] 非流式请求 model=%s", tostring(decoded_body.model)))
   end
   logger.debug(
@@ -900,8 +970,8 @@ function M.send_request(params)
       .. (content:len() > 2000 and "...[truncated]" or "")
   )
 
-  local ok, response = pcall(json.decode, content)
-  if not ok then
+  local ok_decode, response = pcall(json.decode, content)
+  if not ok_decode then
     logger.debug("[http_client] JSON 解析失败: " .. (content:sub(1, 500)))
     return nil, "JSON parse failed"
   end
@@ -909,7 +979,7 @@ function M.send_request(params)
   if type(response) == "table" then
     M.parse_response_tool_calls(response)
   end
-  if response.error then
+  if type(response) == "table" and response.error then
     local err_msg = response.error.message or json.encode(response.error)
     logger.debug("[http_client] API 错误: " .. err_msg)
 
@@ -946,15 +1016,16 @@ function M.send_request(params)
       pcall(vim.fn.delete, retry_temp)
       if retry_content and retry_content ~= "" then
         local retry_ok2, retry_response = pcall(json.decode, retry_content)
-        if retry_ok2 and retry_response then
+        if retry_ok2 and type(retry_response) == "table" then
           if retry_response.error then
             return nil, retry_response.error.message or json.encode(retry_response.error)
           end
-          if type(retry_response) == "table" then
-            M.parse_response_tool_calls(retry_response)
-          end
+          M.parse_response_tool_calls(retry_response)
           local retry_unified = request_handler.transform_response(retry_response, api_type)
-          return retry_unified, nil
+          if retry_unified then
+            return retry_unified, nil
+          end
+          return nil, "retry transform failed"
         end
       end
       return nil, "retry failed"
@@ -968,7 +1039,7 @@ function M.send_request(params)
     M.update_dedup(generation_id, api_type .. "_nonstream", request)
   end
 
-  local unified = request_handler.transform_response(response, api_type)
+  local unified = type(response) == "table" and request_handler.transform_response(response, api_type) or nil
   return unified, nil
 end
 
@@ -1075,8 +1146,8 @@ function M.send_request_retry(params, on_complete)
     return nil
   end
 
-  local ok, response = pcall(json.decode, content)
-  if not ok or type(response) ~= "table" then
+  local ok_decode, response = pcall(json.decode, content)
+  if not ok_decode or type(response) ~= "table" then
     if on_complete then
       on_complete(nil, "JSON parse failed")
     end
@@ -1101,7 +1172,7 @@ function M.send_request_retry(params, on_complete)
 
   local unified = request_handler.transform_response(response, api_type)
   if on_complete then
-    on_complete(unified, nil)
+    on_complete(unified or response, nil)
   end
   return nil
 end
@@ -1209,7 +1280,7 @@ function M.send_stream_request(params, on_chunk, on_complete, on_error)
   )
   -- 调试：打印请求体中的 model 字段
   local ok_body, decoded_body = pcall(json.decode, request_body)
-  if ok_body and decoded_body and decoded_body.model then
+  if ok_body and type(decoded_body) == "table" and decoded_body.model then
     logger.debug(string.format("[http_client] 流式请求 model=%s", tostring(decoded_body.model)))
   end
   logger.debug(
@@ -1253,6 +1324,9 @@ function M.send_stream_request(params, on_chunk, on_complete, on_error)
   local function start_idle_timer()
     reset_idle_timer()
     idle_timer = vim.uv.new_timer()
+    if not idle_timer then
+      return
+    end
     set_idle_timer(idle_timer)
     idle_timer:start(
       IDLE_TIMEOUT_MS,
@@ -1479,12 +1553,7 @@ function M.send_stream_request(params, on_chunk, on_complete, on_error)
   end
 
   if use_temp_file then
-    local ok, _ = pcall(function()
-      local r = vim.fn.writefile({ request_body }, temp_file)
-      if r == -1 then
-        error("write failed")
-      end
-    end)
+    local ok, _ = pcall(vim.fn.writefile, { request_body }, temp_file)
     if not ok then
       _http_state.active_requests[request_id] = nil
       if on_error then
@@ -1500,7 +1569,7 @@ function M.send_stream_request(params, on_chunk, on_complete, on_error)
 
   -- 不设置 curl 超时，由系统网络栈控制
 
-  local job_id = vim.fn.jobstart({ "curl", unpack(args) }, {
+  local job_id = vim.fn.jobstart({ "curl", table.unpack(args) }, {
     on_stdout = function(_, data)
       if data and #data > 0 then
         handle_stdout(data)
@@ -1570,11 +1639,9 @@ function M.cancel_request(request_id)
   _http_state.active_requests[request_id] = nil
 end
 
---- 清除指定 generation_id 的请求去重缓存
---- 用于重试场景：防止重试请求因请求体相同被去重机制拦截
---- @param generation_id string
 --- 取消指定 generation_id 的所有活跃请求
 --- 用于双触发机制：Trigger A 触发后取消仍在进行的 HTTP 请求
+--- 也用于重试场景：防止重试请求因请求体相同被去重机制拦截
 --- @param generation_id string
 function M.cancel_request_by_generation(generation_id)
   if not generation_id then
@@ -1785,7 +1852,7 @@ function M.send_request_async(params, on_complete)
     has_error = false,
   }
 
-  local job_id = vim.fn.jobstart({ "curl", unpack(curl_args) }, {
+  local job_id = vim.fn.jobstart({ "curl", table.unpack(curl_args) }, {
     on_stderr = function(_, data)
       if data and #data > 0 then
         local err = table.concat(data, "\n")
@@ -1874,7 +1941,7 @@ function M.send_request_async(params, on_complete)
         return
       end
 
-      if response.error then
+      if type(response) == "table" and response.error then
         local err_msg = response.error.message or json.encode(response.error)
 
         -- 自动修复：如果错误包含 tool_choice 不支持，清除 tool_choice 后重试
@@ -1906,7 +1973,7 @@ function M.send_request_async(params, on_complete)
               retry_temp,
             })
 
-            local retry_job_id = vim.fn.jobstart({ "curl", unpack(retry_args) }, {
+            local retry_job_id = vim.fn.jobstart({ "curl", table.unpack(retry_args) }, {
               on_stderr = function(_, data)
                 if data and #data > 0 then
                   local err = table.concat(data, "\n")
@@ -1949,7 +2016,7 @@ function M.send_request_async(params, on_complete)
                   return
                 end
 
-                if retry_response.error then
+                if type(retry_response) == "table" and retry_response.error then
                   if on_complete then
                     vim.schedule(function()
                       on_complete(nil, retry_response.error.message or json.encode(retry_response.error))
@@ -1964,9 +2031,13 @@ function M.send_request_async(params, on_complete)
                 end
 
                 if on_complete then
-                  local retry_unified = request_handler.transform_response(retry_response, api_type)
+                  local retry_unified = type(retry_response) == "table"
+                      and request_handler.transform_response(retry_response, api_type)
+                    or retry_response
                   -- 解析 tool_calls 中的 arguments（从 JSON 字符串转为 Lua table）
-                  M.parse_response_tool_calls(retry_unified)
+                  if type(retry_unified) == "table" then
+                    M.parse_response_tool_calls(retry_unified)
+                  end
                   vim.schedule(function()
                     on_complete(retry_unified, nil)
                   end)
@@ -1991,9 +2062,11 @@ function M.send_request_async(params, on_complete)
       end
 
       if on_complete then
-        local unified = request_handler.transform_response(response, api_type)
+        local unified = type(response) == "table" and request_handler.transform_response(response, api_type) or response
         -- 解析 tool_calls 中的 arguments（从 JSON 字符串转为 Lua table）
-        M.parse_response_tool_calls(unified)
+        if type(unified) == "table" then
+          M.parse_response_tool_calls(unified)
+        end
         vim.schedule(function()
           on_complete(unified, nil)
         end)
@@ -2025,6 +2098,5 @@ function M.shutdown()
   M.cancel_all_requests()
   _http_state.initialized = false
 end
-
 
 return M

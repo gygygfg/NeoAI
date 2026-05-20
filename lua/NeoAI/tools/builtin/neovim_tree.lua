@@ -88,8 +88,6 @@ local ext_to_parser = lm.ext_to_parser
 local ts_available = false
 ---@class vim.treesitter
 ---@field get_string_parser fun(source: string, lang: string): table
----@field language table
----@field query table
 local ts = nil
 
 local function check_ts()
@@ -709,7 +707,7 @@ local function _get_node_at_position(args, on_success, on_error)
       local lang = detect_lang_from_filepath(filepath)
       if not lang then
         if on_error then
-          local filepath = args.filepath
+          local fp = args.filepath
         end
         return
       end
@@ -1416,22 +1414,26 @@ local function _delete_node(args, on_success, on_error)
       return
     end
     finalized = true
-    timeout_timer:stop()
-    timeout_timer:close()
+    if timeout_timer then
+      timeout_timer:stop()
+      timeout_timer:close()
+    end
     if is_err and on_error then
       on_error(msg)
     end
   end
-  timeout_timer:start(
-    30000,
-    0,
-    vim.schedule_wrap(function()
-      finalize_with_timeout(
-        "delete_node 操作超时（30 秒），Tree-sitter 解析或文件操作可能阻塞",
-        true
-      )
-    end)
-  )
+  if timeout_timer then
+    timeout_timer:start(
+      30000,
+      0,
+      vim.schedule_wrap(function()
+        finalize_with_timeout(
+          "delete_node 操作超时（30 秒），Tree-sitter 解析或文件操作可能阻塞",
+          true
+        )
+      end)
+    )
+  end
 
   parse_file_content_async(filepath, -1, function(result)
     local filtered, fallback = filter_nodes(result.nodes, args)
@@ -1575,7 +1577,7 @@ local function _delete_node(args, on_success, on_error)
           end
           vim.fn.bufload(bufnr)
           -- bufadd 创建的缓冲区 buftype 默认为 "acwrite"，需清空才能用 :write 保存
-          pcall(vim.api.nvim_buf_set_option, bufnr, "buftype", "")
+          pcall(vim.api.nvim_set_option_value, "buftype", "", { buf = bufnr })
           was_loaded = false
         end
 
@@ -1616,7 +1618,8 @@ local function _delete_node(args, on_success, on_error)
               end
               if #skipped > 0 then
                 ret.skipped_types = skipped
-                ret.skipped_message = "以下节点类型不是代码块结构，已跳过: " .. table.concat(skipped, ", ")
+                ret.skipped_message = "以下节点类型不是代码块结构，已跳过: "
+                  .. table.concat(skipped, ", ")
               end
               if #skipped_root > 0 then
                 ret.skipped_root_types = skipped_root
@@ -1627,8 +1630,10 @@ local function _delete_node(args, on_success, on_error)
                 end
               end
               if on_success then
-                timeout_timer:stop()
-                timeout_timer:close()
+                if timeout_timer then
+                  timeout_timer:stop()
+                  timeout_timer:close()
+                end
                 on_success(ret)
               end
             end)
@@ -1664,8 +1669,10 @@ local function _delete_node(args, on_success, on_error)
           end
         end
         if on_success then
-          timeout_timer:stop()
-          timeout_timer:close()
+          if timeout_timer then
+            timeout_timer:stop()
+            timeout_timer:close()
+          end
           on_success(ret)
         end
       end)
@@ -1721,8 +1728,10 @@ local function _edit_node(args, on_success, on_error)
   end
   if not args.node_type then
     if on_error then
-      on_error("需要 node_type（节点类型）参数，如 'function_definition'、'class_definition' 等。"
-        .. "为防止意外匹配根节点导致整个文件被替换，edit_node 要求必须指定 node_type。")
+      on_error(
+        "需要 node_type（节点类型）参数，如 'function_definition'、'class_definition' 等。"
+          .. "为防止意外匹配根节点导致整个文件被替换，edit_node 要求必须指定 node_type。"
+      )
     end
     return
   end
@@ -1773,9 +1782,11 @@ local function _edit_node(args, on_success, on_error)
     if target.depth == 0 then
       if on_error then
         finalize_with_timeout(
-          "拒绝替换根容器节点（类型: " .. target.type .. "）。"
-          .. "根节点代表整个文件，不能被替换。"
-          .. "请指定一个具体的 node_type（如 'function_definition'、'class_definition' 等）",
+          "拒绝替换根容器节点（类型: "
+            .. target.type
+            .. "）。"
+            .. "根节点代表整个文件，不能被替换。"
+            .. "请指定一个具体的 node_type（如 'function_definition'、'class_definition' 等）",
           true
         )
       end
@@ -1785,8 +1796,13 @@ local function _edit_node(args, on_success, on_error)
     -- 如果匹配到多个节点且未指定 text 精确过滤，添加警告
     local multi_match_warning = nil
     if #filtered > 1 and not args.text then
-      multi_match_warning = "匹配到 " .. #filtered .. " 个节点，仅修改第一个（类型: "
-        .. target.type .. "，位置: 行 " .. target.start_row .. "）。"
+      multi_match_warning = "匹配到 "
+        .. #filtered
+        .. " 个节点，仅修改第一个（类型: "
+        .. target.type
+        .. "，位置: 行 "
+        .. target.start_row
+        .. "）。"
         .. "建议使用 text 参数精确指定要修改的节点。"
     end
 
@@ -1946,4 +1962,3 @@ function M.parse_file_content_async(filepath, max_depth, on_success, on_error)
 end
 
 return M
-
