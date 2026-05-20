@@ -1836,14 +1836,17 @@ local function _edit_node(args, on_success, on_error)
           local content_lines = vim.split(new_content, "\n", { plain = true })
           local replacement = {}
           if #content_lines > 0 then
-            -- 第一行加上 before 前缀
-            table.insert(replacement, before .. content_lines[1])
-            -- 中间行
-            for j = 2, #content_lines - 1 do
-              table.insert(replacement, content_lines[j])
-            end
-            -- 最后一行加上 after 后缀
-            if #content_lines > 1 then
+            if #content_lines == 1 then
+              -- 单行新内容：同时加上 before 前缀和 after 后缀
+              table.insert(replacement, before .. content_lines[1] .. after)
+            else
+              -- 第一行加上 before 前缀
+              table.insert(replacement, before .. content_lines[1])
+              -- 中间行
+              for j = 2, #content_lines - 1 do
+                table.insert(replacement, content_lines[j])
+              end
+              -- 最后一行加上 after 后缀
               table.insert(replacement, content_lines[#content_lines] .. after)
             end
           else

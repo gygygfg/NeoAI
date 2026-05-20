@@ -272,8 +272,10 @@ function M.open(parent_win, opts)
       if state.float_win and vim.api.nvim_win_is_valid(state.float_win) then
         pcall(function()
           vim.api.nvim_set_current_win(state.float_win)
-          vim.api.nvim_win_set_cursor(state.float_win, { 1, 2 })
+          -- 先进入插入模式，再移动光标
+          -- 避免 InsertEnter 自动命令干扰光标定位
           vim.cmd("startinsert")
+          vim.api.nvim_win_set_cursor(state.float_win, { 1, 2 })
         end)
       end
     end, 10)
