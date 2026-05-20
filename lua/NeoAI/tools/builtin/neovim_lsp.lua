@@ -644,6 +644,10 @@ end
 -- 尝试多种方式启动 LSP 服务器（通用实现，自适应所有 LSP 配置）
 -- 返回 true/false
 local function try_start_lsp(config_name, bufnr)
+  -- 从文件路径推断项目根目录作为 LSP root_dir
+  local filepath = bufnr and vim.api.nvim_buf_get_name(bufnr) or nil
+  local project_root = filepath and file_utils.find_project_root(filepath) or vim.fn.getcwd()
+
   -- 跳过非正式服务器
   if not is_formal_server_name(config_name) then
     return false
@@ -747,7 +751,7 @@ local function try_start_lsp(config_name, bufnr)
     local lsp_config = {
       name = config_name,
       cmd = mason_cmd,
-      root_dir = vim.fn.getcwd(),
+      root_dir = project_root,
     }
     local ok_id, client_id = pcall(vim.lsp.start, lsp_config)
     if ok_id and client_id then
@@ -777,7 +781,7 @@ local function try_start_lsp(config_name, bufnr)
       local lsp_config = {
         name = config_name,
         cmd = cmd,
-        root_dir = vim.fn.getcwd(),
+        root_dir = project_root,
       }
       local ok_id, client_id = pcall(vim.lsp.start, lsp_config)
       if ok_id and client_id then

@@ -471,7 +471,7 @@ local function _replace_text(args, on_success, on_error)
     diagnostic_count = 0,
   }
 
-  -- 异步加载文件到 buffer 并监听 LSP 诊断，诊断到达后再调用 on_success
+  -- 异步加载文件到 buffer 并监听 LSP 诊断，诊断到达或超时后再调用 on_success
   vim.schedule(function()
     local lsp_ok, lsp_utils = pcall(require, "NeoAI.utils.lsp_utils")
     if not lsp_ok or not lsp_utils or not lsp_utils.check_lsp() then
@@ -489,41 +489,51 @@ local function _replace_text(args, on_success, on_error)
       return
     end
 
-    -- 用 DiagnosticChanged 自动命令监听诊断更新
-    local diag_timer = vim.defer_fn(function()
-      -- 超时保护：20 秒后不再等待，返回当前已有的诊断
+    -- 辅助函数：收集当前诊断并调用 on_success
+    local function emit_diagnostics()
+      pcall(function() diag_timer:stop() end)
+      pcall(function() diag_timer:close() end)
+
       if cleanup then
         cleanup()
       end
+
       if on_success then
         local diagnostics = vim.diagnostic.get(bufnr)
         base_result.diagnostics = format_diagnostics(diagnostics)
         base_result.diagnostic_count = #diagnostics
         on_success(base_result)
       end
-    end, 20000)
+    end
 
+    -- 超时保护：5 秒后不再等待，返回当前已有的诊断
+    local diag_timer = vim.defer_fn(function()
+      -- 先删除 autocmd，避免在清理过程中误触发
+      pcall(vim.api.nvim_del_augroup_by_id, augroup)
+      emit_diagnostics()
+    end, 5000)
+
+    -- 同时监听 DiagnosticChanged 和 LspAttach 事件：
+    --   DiagnosticChanged：LSP 发布初始诊断或诊断变更时触发
+    --   LspAttach：LSP 客户端 attach 到 buffer 时触发（此时诊断可能尚未到达，后续 DiagnosticChanged 会接力）
     local augroup = vim.api.nvim_create_augroup("neoai_replace_text_diag_" .. bufnr, { clear = true })
-    vim.api.nvim_create_autocmd("DiagnosticChanged", {
+    vim.api.nvim_create_autocmd({ "DiagnosticChanged", "LspAttach" }, {
       group = augroup,
       buffer = bufnr,
       once = true,
       callback = function()
-        pcall(function() diag_timer:stop() end)
-        pcall(function() diag_timer:close() end)
-
-        if cleanup then
-          cleanup()
-        end
-
-        if on_success then
-          local diagnostics = vim.diagnostic.get(bufnr)
-          base_result.diagnostics = format_diagnostics(diagnostics)
-          base_result.diagnostic_count = #diagnostics
-          on_success(base_result)
-        end
+        -- LspAttach 时，延迟一小段时间等 LSP 发布初始诊断后检查
+        vim.defer_fn(function()
+          emit_diagnostics()
+        end, 500)
       end,
     })
+
+    -- 立即检查当前是否已有诊断（可能 buffer 已加载且 LSP 已 attach）
+    local existing_diags = vim.diagnostic.get(bufnr)
+    if existing_diags and #existing_diags > 0 then
+      emit_diagnostics()
+    end
   end)
 end
 

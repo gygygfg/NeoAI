@@ -40,27 +40,29 @@ local state = {
 
 -- ========== Git 环境检测 ==========
 
---- 解析 git 工作目录，优先使用传入的 cwd，否则使用 state.git_root
+--- 解析并动态检测 git 工作目录，优先使用传入的 cwd
 --- @param cwd string|nil 自定义工作目录
---- @return string, string|nil 解析后的 git 根目录，错误信息
+--- @return string, string|nil 解析后的 git 根目录，错误信息（nil 表示成功）
 function _git_auto_mod._resolve_git_root(cwd)
   local home = vim.fn.expand("~")
-  if cwd then
-    -- 跳过家目录，避免在 ~ 目录下执行 git 操作
-    if cwd == home then
-      return cwd, "家目录不是 git 仓库"
-    end
-    -- 检查 cwd 是否是 git 仓库
-    local root = vim.fn.system("git -C " .. cwd .. " rev-parse --show-toplevel 2>/dev/null"):gsub("%s+$", "")
-    if vim.v.shell_error == 0 and root ~= "" then
-      return root, nil
-    end
-    return cwd, "指定目录不是 git 仓库，将使用目录本身"
+  -- 确定目标目录：优先 cwd > state.git_root > getcwd()
+  local target = cwd or state.git_root or vim.fn.getcwd()
+
+  -- 跳过家目录
+  if target == home then
+    return target, "家目录不是 git 仓库"
   end
-  if not state.git_root then
-    return vim.fn.getcwd(), nil
+
+  -- 动态检测是否为 git 仓库（每次都检测，避免缓存过期）
+  local root = vim.fn.system("git -C " .. target .. " rev-parse --show-toplevel 2>/dev/null"):gsub("%s+$", "")
+  if vim.v.shell_error == 0 and root ~= "" then
+    -- 更新缓存，方便后续使用
+    state.git_available = true
+    state.git_root = root
+    return root, nil
   end
-  return state.git_root, nil
+
+  return target, "目录不是 git 仓库"
 end
 --- 检测 git 是否可用（使用 git status 检查，同时验证是否在 git 仓库中）
 function _git_auto_mod._check_git()
@@ -88,6 +90,25 @@ function _git_auto_mod._check_git()
   state.git_available = false
   state.git_root = vim.fn.getcwd()
   return false
+end
+
+--- 动态检测指定目录是否真实 git 仓库（每次调用都检测）
+--- @param cwd string|nil 目标目录（默认当前目录）
+--- @return boolean, string|nil 是否可用，git 根目录
+function _git_auto_mod._detect_real_git(cwd)
+  local target = cwd or state.git_root or vim.fn.getcwd()
+  local home = vim.fn.expand("~")
+  if target == home then
+    return false, nil
+  end
+  local root = vim.fn.system("git -C " .. target .. " rev-parse --show-toplevel 2>/dev/null"):gsub("%s+$", "")
+  if vim.v.shell_error == 0 and root ~= "" then
+    -- 更新缓存
+    state.git_available = true
+    state.git_root = root
+    return true, root
+  end
+  return false, nil
 end
 
 --- 初始化伪 Git 模式
@@ -145,7 +166,7 @@ function _git_auto_mod._scan_workspace_for_pseudo()
   local max_files = 500 -- 最多扫描 500 个文件
 
   local function scan_dir(dir, callback)
-    vim.uv.fs_scandir(dir, function(err, handle)
+    vim.uv.fs_opendir(dir, function(err, handle)
       if err or not handle then
         if callback then
           callback()
@@ -335,9 +356,6 @@ end
 --- @param filepath string|nil 文件路径
 --- @param cwd string|nil 自定义工作目录
 function _git_auto_mod._git_diff(filepath, cwd)
-  if not state.git_available then
-    return nil
-  end
   local root = _git_auto_mod._resolve_git_root(cwd)
   local rel_path = filepath and filepath:sub(#root + 2) or ""
   local cmd
@@ -385,10 +403,16 @@ end
 --- @param filepath_or_commit string 文件路径或提交
 --- @param cwd string|nil 自定义工作目录
 function _git_auto_mod._git_checkout(filepath_or_commit, cwd)
-  if state.pseudo.enabled then
-    return false, "伪 Git 模式不支持 git checkout"
-  end
   local root = _git_auto_mod._resolve_git_root(cwd)
+  -- 优先使用 git restore（更安全），若包含 " -- " 说明是文件回滚
+  if filepath_or_commit:find(" -- ") then
+    local commit, filepath = filepath_or_commit:match("(.+)%s+%-%-%s+(.+)")
+    if commit and filepath then
+      local cmd = string.format("git -C %s restore --source=%s --staged --worktree %s 2>/dev/null", root, commit, filepath)
+      vim.fn.system(cmd)
+      return vim.v.shell_error == 0, vim.v.shell_error ~= 0 and "git restore 失败" or nil
+    end
+  end
   local cmd = string.format("git -C %s checkout %s 2>/dev/null", root, filepath_or_commit)
   vim.fn.system(cmd)
   return vim.v.shell_error == 0, vim.v.shell_error ~= 0 and "git checkout 失败" or nil
@@ -599,6 +623,9 @@ function _git_auto_mod._auto_stage_and_commit(tool_name, filepath, args)
     return
   end
 
+  -- 动态检测 git 可用性（支持工具完成的自动提交）
+  _git_auto_mod._detect_real_git(nil)
+
   local message = _git_auto_mod._generate_commit_message(tool_name, filepath)
 
   if state.git_available then
@@ -713,7 +740,9 @@ end
 --- @param cwd string|nil 可选，指定工作目录
 --- @return string|nil
 function _git_auto_mod.get_diff(filepath, cwd)
-  if state.git_available then
+  -- 动态检测 git（每次调用都检测，支持任意 cwd）
+  local ok, root = _git_auto_mod._detect_real_git(cwd)
+  if ok then
     return _git_auto_mod._git_diff(filepath, cwd)
   end
   return _git_auto_mod._pseudo_diff(filepath)
@@ -724,7 +753,8 @@ end
 --- @param cwd string|nil 可选，指定工作目录
 --- @return string|nil
 function _git_auto_mod.get_log(max_count, cwd)
-  if state.git_available then
+  local ok, root = _git_auto_mod._detect_real_git(cwd)
+  if ok then
     return _git_auto_mod._git_log(max_count, cwd)
   end
   return _git_auto_mod._pseudo_log(max_count)
@@ -734,7 +764,8 @@ end
 --- @param cwd string|nil 可选，指定工作目录
 --- @return string
 function _git_auto_mod.get_status(cwd)
-  if state.git_available then
+  local ok, root = _git_auto_mod._detect_real_git(cwd)
+  if ok then
     local result = _git_auto_mod._git_status(cwd)
     return result or "无变更"
   end
@@ -746,7 +777,8 @@ end
 --- @param cwd string|nil 可选，指定工作目录
 --- @return string|nil
 function _git_auto_mod.get_commit_detail(commit_hash, cwd)
-  if state.git_available then
+  local ok, root = _git_auto_mod._detect_real_git(cwd)
+  if ok then
     return _git_auto_mod._git_show(commit_hash, cwd)
   end
   -- 伪 Git：查找快照
@@ -773,14 +805,17 @@ end
 --- @param cwd string|nil 可选，指定工作目录
 --- @return boolean, string|nil
 function _git_auto_mod.rollback(commit_hash, filepath, cwd)
-  if state.git_available then
+  local ok, root = _git_auto_mod._detect_real_git(cwd)
+  if ok then
     if filepath then
-      -- 回滚单个文件
-      local ok, err = _git_auto_mod._git_checkout(commit_hash .. " -- " .. filepath, cwd)
-      if ok then
+      -- 回滚单个文件（使用 git restore，比 checkout 更安全）
+      local restore_cmd = string.format("git -C %s restore --source=%s --staged --worktree %s 2>/dev/null", root, commit_hash, filepath)
+      vim.fn.system(restore_cmd)
+      local success = vim.v.shell_error == 0
+      if success then
         _git_auto_mod._auto_stage_and_commit("rollback", filepath, { filepath = filepath })
       end
-      return ok, err
+      return success, success and nil or "git restore 失败"
     else
       -- 回滚整个提交
       local ok, err = _git_auto_mod._git_reset(commit_hash, "hard", cwd)
@@ -795,8 +830,8 @@ end
 --- @param cwd string|nil 可选，指定工作目录
 --- @return string
 function _git_auto_mod.get_file_history(filepath, cwd)
-  if state.git_available then
-    local root = _git_auto_mod._resolve_git_root(cwd)
+  local ok, root = _git_auto_mod._detect_real_git(cwd)
+  if ok then
     local cmd = string.format("git -C %s log --oneline -- %s 2>/dev/null", root, filepath)
     local result = vim.fn.system(cmd)
     if vim.v.shell_error ~= 0 or result:gsub("%s+$", "") == "" then
@@ -807,10 +842,15 @@ function _git_auto_mod.get_file_history(filepath, cwd)
   return _git_auto_mod._pseudo_file_history(filepath)
 end
 
---- 获取 git 是否可用
+--- 获取 git 是否可用（动态检测当前目录）
 --- @return boolean
 function _git_auto_mod.is_git_available()
-  return state.git_available == true
+  -- 优先使用缓存，但也支持动态检测
+  if state.git_available then
+    return true
+  end
+  local ok, _ = _git_auto_mod._detect_real_git(nil)
+  return ok
 end
 
 --- 获取 git 根目录
@@ -823,8 +863,8 @@ end
 --- @param cwd string|nil 可选，指定工作目录
 --- @return string|nil
 function _git_auto_mod.get_last_commit_hash(cwd)
-  if state.git_available then
-    local root = _git_auto_mod._resolve_git_root(cwd)
+  local ok, root = _git_auto_mod._detect_real_git(cwd)
+  if ok then
     local hash = vim.fn.system("git -C " .. root .. " rev-parse HEAD 2>/dev/null"):gsub("%s+$", "")
     if vim.v.shell_error == 0 and hash ~= "" then
       return hash
@@ -1249,5 +1289,10 @@ M.git_auto_commit_config = {
   category = "git",
   permissions = { read = true },
 }
+
+-- ============================================================================
+-- 自动初始化：模块加载时自动检测 git 环境
+-- ============================================================================
+_git_auto_mod.initialize()
 
 return M

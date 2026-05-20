@@ -851,5 +851,76 @@ function M.mkdir_async(dirpath, on_success, on_error)
   mkdir_recursive(dirpath)
 end
 
+
+-- ========== 项目根目录查找 ==========
+
+--- 项目标志文件列表（按优先级排序）
+local PROJECT_MARKERS = {
+  ".git",
+  ".gitignore",
+  ".project",
+  ".root",
+  "package.json",
+  "pom.xml",
+  "build.gradle",
+  "Cargo.toml",
+  "go.mod",
+  "pyproject.toml",
+  "setup.py",
+  "Gemfile",
+  "Makefile",
+  "CMakeLists.txt",
+  "settings.gradle",
+  "settings.gradle.kts",
+  ".editorconfig",
+  ".projectile",
+}
+
+--- 查找项目根目录
+--- 从文件所在目录开始逐级向上查找项目标志文件（如 .git、package.json 等）
+--- 如果找到 $HOME 还没找到，返回文件所在目录（避免搜索范围过大）
+--- @param filepath string 文件路径
+--- @return string 项目根目录（绝对路径），失败时返回文件所在目录
+function M.find_project_root(filepath)
+  if not filepath or filepath == "" then
+    return vim.fn.getcwd()
+  end
+
+  local abs_path = vim.fn.fnamemodify(filepath, ":p")
+  local home = vim.fn.expand("$HOME")
+  -- 规范化 $HOME 路径（保证以 / 结尾）
+  if home:sub(-1) ~= "/" then
+    home = home .. "/"
+  end
+
+  local dir = vim.fn.fnamemodify(abs_path, ":h")
+
+  while dir and dir ~= "" do
+    -- 如果到了 $HOME，停止搜索，返回当前目录
+    local dir_with_slash = dir:sub(-1) == "/" and dir or dir .. "/"
+    if dir_with_slash == home or dir == home then
+      return dir
+    end
+
+    -- 检查是否存在项目标志文件
+    for _, marker in ipairs(PROJECT_MARKERS) do
+      local marker_path = dir .. "/" .. marker
+      if M.exists(marker_path) then
+        return dir
+      end
+    end
+
+    -- 向上一级
+    local parent = vim.fn.fnamemodify(dir, ":h")
+    if parent == dir then
+      -- 到了根目录 /，返回原始文件所在目录
+      return vim.fn.fnamemodify(abs_path, ":h")
+    end
+    dir = parent
+  end
+
+  return vim.fn.fnamemodify(abs_path, ":h")
+end
+
 return M
 
