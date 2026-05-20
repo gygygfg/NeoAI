@@ -1481,6 +1481,27 @@ function M.set_keymaps()
   end, { buffer = buf, noremap = true, silent = true, desc = "取消生成或退出插入模式" })
 end
 
+--- 进入插入模式（内部函数）
+--- float 模式下聚焦虚拟输入框，inline 模式下在 chat buffer 进入插入模式
+function M._enter_insert_mode()
+  if not state.current_window_id then
+    return
+  end
+
+  -- float 模式：聚焦虚拟输入框并进入插入模式
+  if virtual_input.is_active() then
+    virtual_input.focus_and_insert()
+    return
+  end
+
+  -- inline 模式：在 chat buffer 中进入插入模式
+  local win_handle = window_manager.get_window_win(state.current_window_id)
+  if win_handle and vim.api.nvim_win_is_valid(win_handle) then
+    vim.api.nvim_set_current_win(win_handle)
+    vim.api.nvim_command("startinsert")
+  end
+end
+
 --- 将 chat 窗口的快捷键同步到指定 buffer（用于悬浮窗）
 --- 除了 exclude_keys 中列出的快捷键（悬浮窗自己已注册的），其他 chat 快捷键都同步过去
 --- @param target_buf number 目标 buffer 句柄
@@ -1548,18 +1569,7 @@ function M.sync_keymaps_to_buf(target_buf, exclude_keys)
   end
 end
 
---- 进入插入模式（内部函数）
-function M._enter_insert_mode()
-  if not state.current_window_id then
-    return
-  end
 
-  local win_handle = window_manager.get_window_win(state.current_window_id)
-  if win_handle and vim.api.nvim_win_is_valid(win_handle) then
-    vim.api.nvim_set_current_win(win_handle)
-    vim.api.nvim_command("startinsert")
-  end
-end
 
 --- 退出插入模式（内部函数）
 function M._exit_insert_mode()
@@ -4297,3 +4307,4 @@ function M._set_cursor_follow_should(should)
 end
 
 return M
+

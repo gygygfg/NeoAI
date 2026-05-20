@@ -1088,68 +1088,110 @@ local function _delete_file(args, on_success, on_error)
   end
 
   local filepath = args.filepath
+  -- 去掉末尾斜杠，统一路径格式
+  filepath = filepath:gsub("/+$", "")
 
   if not fu.exists(filepath) then
     if on_error then
-      on_error(string.format("文件不存在: %s", filepath))
+      on_error(string.format("路径不存在: %s", filepath))
     end
     return
   end
 
-  -- 使用 uv.fs_unlink 异步删除，避免 os.remove 在文件锁/NFS 上阻塞
+  -- 使用 uv.fs_stat 检测是文件还是目录
   local uv = vim.uv or vim.loop
-  local ok, err = nil, nil
-  local deleted = false
-  local timer = uv.new_timer()
-  if timer then
-    timer:start(
-      10000,
-      0,
-      vim.schedule_wrap(function()
-        if not deleted then
-          ok = nil
-          err = "删除超时（文件可能被锁定或无权限）"
-          if on_error then
-            on_error(string.format("删除文件失败 %s: %s", filepath, err))
-          end
-        end
-      end)
-    )
-  end
-  uv.fs_unlink(filepath, function(unlink_err)
-    deleted = true
+  local stat_ok, stat = pcall(uv.fs_stat, filepath)
+  local is_dir = stat_ok and stat and stat.type == "directory"
+
+  if is_dir then
+    -- 目录使用 uv.fs_rmdir（仅支持空目录）
+    local deleted = false
+    local timer = uv.new_timer()
     if timer then
-      timer:stop()
-      timer:close()
+      timer:start(
+        10000,
+        0,
+        vim.schedule_wrap(function()
+          if not deleted then
+            if on_error then
+              on_error(string.format("删除目录超时 %s（目录可能非空或无权限）", filepath))
+            end
+          end
+        end)
+      )
     end
-    if unlink_err then
-      if on_error then
-        on_error(string.format("删除文件失败 %s: %s", filepath, tostring(unlink_err)))
+    uv.fs_rmdir(filepath, function(rmdir_err)
+      deleted = true
+      if timer then
+        timer:stop()
+        timer:close()
       end
-    else
-      if on_success then
-        on_success({ filepath = filepath, success = true })
+      if rmdir_err then
+        if on_error then
+          on_error(string.format("删除目录失败 %s: %s（目录可能非空，请使用 run_command 执行 rm -rf）", filepath, tostring(rmdir_err)))
+        end
+      else
+        if on_success then
+          on_success({ filepath = filepath, success = true, type = "directory" })
+        end
       end
+    end)
+  else
+    -- 文件使用 uv.fs_unlink
+    local deleted = false
+    local timer = uv.new_timer()
+    if timer then
+      timer:start(
+        10000,
+        0,
+        vim.schedule_wrap(function()
+          if not deleted then
+            if on_error then
+              on_error(string.format("删除文件超时 %s（文件可能被锁定或无权限）", filepath))
+            end
+          end
+        end)
+      )
     end
-  end)
+    uv.fs_unlink(filepath, function(unlink_err)
+      deleted = true
+      if timer then
+        timer:stop()
+        timer:close()
+      end
+      if unlink_err then
+        if on_error then
+          on_error(string.format("删除文件失败 %s: %s", filepath, tostring(unlink_err)))
+        end
+      else
+        if on_success then
+          on_success({ filepath = filepath, success = true, type = "file" })
+        end
+      end
+    end)
+  end
 end
 
 M.delete_file = {
   name = "delete_file",
-  description = "删除文件",
+  description = "删除文件或空目录。非空目录请使用 run_command 执行 rm -rf",
   func = _delete_file,
   async = true,
   parameters = {
     type = "object",
     properties = {
-      filepath = { type = "string", description = "文件路径（必填）" },
+      filepath = { type = "string", description = "文件或空目录路径（必填）" },
     },
     required = { "filepath" },
   },
   returns = {
     type = "object",
-    properties = { filepath = { type = "string" }, success = { type = "boolean" } },
-    description = "文件删除结果",
+    properties = {
+      filepath = { type = "string" },
+      success = { type = "boolean" },
+      type = { type = "string", description = "删除类型：file 或 directory" },
+    },
+    description = "删除结果",
   },
   category = "file",
   permissions = { write = true },
@@ -1170,3 +1212,5 @@ function M.get_tools()
 end
 
 return M
+
+

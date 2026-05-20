@@ -274,7 +274,7 @@ function M.open(parent_win, opts)
         pcall(function()
           vim.api.nvim_set_current_win(state.float_win)
           vim.api.nvim_win_set_cursor(state.float_win, { 1, 2 })
-          vim.cmd("startinsert!")
+          vim.cmd("startinsert")
         end)
       end
     end, 10)
@@ -620,7 +620,7 @@ function M._setup_float_keymaps()
       pcall(vim.api.nvim_set_current_win, state.float_win)
       -- 将光标定位到 > 后面
       pcall(vim.api.nvim_win_set_cursor, state.float_win, { 1, 2 })
-      vim.cmd("startinsert!")
+      vim.cmd("startinsert")
     end
   end, { buffer = buf, noremap = true, silent = true, desc = "进入插入模式" })
 
@@ -933,7 +933,7 @@ function M.focus_and_insert()
     end
     pcall(vim.api.nvim_set_current_win, state.float_win)
     pcall(vim.api.nvim_win_set_cursor, state.float_win, { 1, 2 })
-    vim.cmd("startinsert!")
+    vim.cmd("startinsert")
   end, 10)
 end
 
@@ -1217,4 +1217,288 @@ function M._cleanup_bufleave_autocmd()
   pcall(vim.api.nvim_del_augroup_by_name, "NeoAIVirtualInputBufLeave")
 end
 
+
+
+
+--- 是否激活
+function M.is_active()
+  return state.active
+end
+
+--- 获取输入区域起始行
+function M.get_input_start_line()
+  return state.input_start_line
+end
+
+--- 获取输入区域行数
+function M.get_input_line_count()
+  return state.input_line_count
+end
+
+--- 隐藏浮动输入框（不销毁，保留 buffer 和状态，切回来时恢复）
+function M.hide()
+  if not state.active or state.mode ~= "float" then
+    return
+  end
+  if state._hidden then
+    return
+  end
+  if not state.float_win or not vim.api.nvim_win_is_valid(state.float_win) then
+    return
+  end
+
+  -- 使用 window_manager 的 hide_float_window 将窗口移到屏幕外
+  if state._parent_buf then
+    wm.hide_float_window(state._parent_buf)
+  end
+
+  state._hidden = true
+end
+
+--- 显示被隐藏的浮动输入框
+function M.show()
+  if not state.active or state.mode ~= "float" then
+    return false
+  end
+  if not state._hidden then
+    return false
+  end
+  if not state.float_win or not vim.api.nvim_win_is_valid(state.float_win) then
+    return false
+  end
+  if not state.parent_win or not vim.api.nvim_win_is_valid(state.parent_win) then
+    return false
+  end
+
+  -- 使用 window_manager 的 show_float_window 恢复窗口位置
+  if state._parent_buf then
+    wm.show_float_window(state._parent_buf)
+  end
+
+  -- 重新定位确保位置正确
+  M.reposition()
+
+  state._hidden = false
+  return true
+end
+
+--- 重新定位浮动输入框（窗口大小变化时调用）
+function M.reposition()
+  if not state.active or state.mode ~= "float" then
+    return
+  end
+  if not state.float_win or not vim.api.nvim_win_is_valid(state.float_win) then
+    return
+  end
+  if not state.parent_win or not vim.api.nvim_win_is_valid(state.parent_win) then
+    return
+  end
+
+  local parent_config = vim.api.nvim_win_get_config(state.parent_win)
+  local parent_width = parent_config.width or 80
+  local parent_col = parent_config.col or 0
+  local parent_row = parent_config.row or 0
+  local parent_height = parent_config.height or 20
+  local screen_height = vim.o.lines
+
+  local input_height = 5
+  local input_width = parent_width
+
+  local chat_bottom = parent_row + parent_height + 1
+  local space_below = (screen_height - 1) - chat_bottom
+  local input_total_height = input_height + 2
+
+  -- 如果底部空间不足，抬升 chat 窗口
+  local adjusted_parent_row = parent_row
+  if space_below < input_total_height then
+    local lift = input_total_height - space_below
+    adjusted_parent_row = math.max(0, parent_row - lift)
+
+    -- 保存原始 parent 位置（仅首次抬升时保存）
+    if not state._saved_parent_config then
+      state._saved_parent_config = { row = parent_row }
+    end
+
+    parent_config.row = adjusted_parent_row
+    pcall(vim.api.nvim_win_set_config, state.parent_win, parent_config)
+  elseif state._saved_parent_config then
+    -- 空间足够，恢复 parent 到原始位置（收起）
+    parent_config.row = state._saved_parent_config.row
+    pcall(vim.api.nvim_win_set_config, state.parent_win, parent_config)
+    state._saved_parent_config = nil
+  end
+
+  -- 输入框位置：紧贴 chat 窗口底部 border 下方
+  local row = adjusted_parent_row + parent_height + 2
+  local col = parent_col
+
+  -- 确保输入框整体不超出屏幕底部
+  local input_bottom = row + input_height + 1
+  if input_bottom > screen_height - 1 then
+    row = math.max(0, (screen_height - 1) - (input_height + 1))
+  end
+
+  local config = vim.api.nvim_win_get_config(state.float_win)
+  config.row = row
+  config.col = col
+  config.width = input_width
+  config.height = input_height
+  pcall(vim.api.nvim_win_set_config, state.float_win, config)
+end
+
+--- 注册 VimResized 自动命令
+function M._setup_vimresized_autocmd()
+  M._cleanup_vimresized_autocmd()
+  local group = vim.api.nvim_create_augroup("NeoAIVirtualInputVimResized", { clear = true })
+  vim.api.nvim_create_autocmd("VimResized", {
+    group = group,
+    callback = function()
+      M.reposition()
+    end,
+    desc = "窗口大小变化时重新定位浮动输入框",
+  })
+end
+
+--- 清理 VimResized 自动命令
+function M._cleanup_vimresized_autocmd()
+  pcall(vim.api.nvim_del_augroup_by_name, "NeoAIVirtualInputVimResized")
+end
+
+--- 注册 buffer 隐藏自动命令
+--- 当 chat 窗口的 buffer 被隐藏到后台时（如切换到其他 buffer），隐藏浮动输入框
+--- 切换到 tool_approval、reasoning_display 等内部浮动窗口时不会触发
+function M._setup_bufhidden_autocmd()
+  M._cleanup_bufhidden_autocmd()
+  if not state._parent_buf or not vim.api.nvim_buf_is_valid(state._parent_buf) then
+    return
+  end
+  local group = vim.api.nvim_create_augroup("NeoAIVirtualInputBufHidden", { clear = true })
+  vim.api.nvim_create_autocmd("BufHidden", {
+    group = group,
+    buffer = state._parent_buf,
+    callback = function()
+      -- 仅在浮动输入框激活且未隐藏时处理
+      if not state.active or state.mode ~= "float" then
+        return
+      end
+      if state._hidden then
+        return
+      end
+      if not state.float_win or not vim.api.nvim_win_is_valid(state.float_win) then
+        return
+      end
+
+      -- 隐藏浮动输入框（不销毁，切回来时恢复）
+      M.hide()
+    end,
+    desc = "chat 窗口 buffer 隐藏时隐藏浮动输入框",
+  })
+end
+
+--- 清理 buffer 隐藏自动命令
+function M._cleanup_bufhidden_autocmd()
+  pcall(vim.api.nvim_del_augroup_by_name, "NeoAIVirtualInputBufHidden")
+end
+
+--- 注册 BufEnter 自动命令
+--- 当父窗口 buffer 重新成为当前 buffer 时，恢复显示被隐藏的输入框
+function M._setup_bufenter_autocmd()
+  M._cleanup_bufenter_autocmd()
+  if not state._parent_buf or not vim.api.nvim_buf_is_valid(state._parent_buf) then
+    return
+  end
+  local group = vim.api.nvim_create_augroup("NeoAIVirtualInputBufEnter", { clear = true })
+  vim.api.nvim_create_autocmd("BufEnter", {
+    group = group,
+    buffer = state._parent_buf,
+    callback = function()
+      -- 仅在输入框被隐藏时处理
+      if not state._hidden then
+        return
+      end
+      if not state.active or state.mode ~= "float" then
+        return
+      end
+
+      -- 延迟恢复，确保窗口切换完成
+      vim.defer_fn(function()
+        if not state._hidden then
+          return
+        end
+        M.show()
+      end, 30)
+    end,
+    desc = "父窗口 buffer 重新激活时恢复浮动输入框",
+  })
+end
+
+--- 清理 BufEnter 自动命令
+function M._cleanup_bufenter_autocmd()
+  pcall(vim.api.nvim_del_augroup_by_name, "NeoAIVirtualInputBufEnter")
+end
+
+--- 注册 BufLeave 自动命令
+--- 当焦点离开父窗口 buffer 时，隐藏浮动输入框
+--- 覆盖切换到其他非 NeoAI buffer 的场景（BufHidden 不会触发）
+function M._setup_bufleave_autocmd()
+  M._cleanup_bufleave_autocmd()
+  if not state._parent_buf or not vim.api.nvim_buf_is_valid(state._parent_buf) then
+    return
+  end
+  local group = vim.api.nvim_create_augroup("NeoAIVirtualInputBufLeave", { clear = true })
+  vim.api.nvim_create_autocmd("BufLeave", {
+    group = group,
+    buffer = state._parent_buf,
+    callback = function()
+      -- 仅在浮动输入框激活且未隐藏时处理
+      if not state.active or state.mode ~= "float" then
+        return
+      end
+      if state._hidden then
+        return
+      end
+      if not state.float_win or not vim.api.nvim_win_is_valid(state.float_win) then
+        return
+      end
+
+      -- 检查目标窗口是否是 NeoAI 内部窗口（如 tool_display、reasoning_display）
+      -- 如果是内部窗口，不隐藏输入框
+      local current_win = vim.api.nvim_get_current_win()
+      local current_buf = vim.api.nvim_win_get_buf(current_win)
+      local ok_ft, current_ft = pcall(vim.api.nvim_get_option_value, "filetype", { buf = current_buf })
+      if ok_ft and (current_ft == "NeoAIInput" or current_ft == "neoai") then
+        return
+      end
+
+      -- 延迟隐藏，给 BufEnter 一个机会取消隐藏（快速切回场景）
+      vim.defer_fn(function()
+        if not state.active or state.mode ~= "float" then
+          return
+        end
+        if state._hidden then
+          return
+        end
+        -- 再次检查当前焦点是否已回到 NeoAI 窗口
+        local cur_win = vim.api.nvim_get_current_win()
+        local cur_buf = vim.api.nvim_win_get_buf(cur_win)
+        local ok_ft2, cur_ft2 = pcall(vim.api.nvim_get_option_value, "filetype", { buf = cur_buf })
+        if ok_ft2 and (cur_ft2 == "neoai" or cur_ft2 == "NeoAIInput") then
+          return
+        end
+        if cur_win == state.parent_win then
+          return
+        end
+        M.hide()
+      end, 30)
+    end,
+    desc = "焦点离开父窗口时隐藏浮动输入框",
+  })
+end
+
+--- 清理 BufLeave 自动命令
+function M._cleanup_bufleave_autocmd()
+  pcall(vim.api.nvim_del_augroup_by_name, "NeoAIVirtualInputBufLeave")
+end
+
 return M
+

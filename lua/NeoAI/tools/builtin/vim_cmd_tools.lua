@@ -13,41 +13,53 @@ local function _execute_vim_cmd(args, on_success, on_error)
 
   local command = args.command
   if not command or command == "" then
-    on_error("参数 'command' 不能为空")
+    if on_error then
+      on_error("参数 'command' 不能为空")
+    end
     return
   end
 
   -- 保存当前窗口和 buffer，执行命令后恢复焦点
-  local current_win = vim.api.nvim_get_current_win()
-  local current_buf = vim.api.nvim_get_current_buf()
+  local current_win = pcall(vim.api.nvim_get_current_win) and vim.api.nvim_get_current_win() or 0
+  local current_buf = pcall(vim.api.nvim_get_current_buf) and vim.api.nvim_get_current_buf() or 0
 
-  -- 使用 pcall 和 redir 捕获命令输出
-  local ok, result = pcall(function()
-    local output = vim.fn.execute(command)
-    return output
+  -- 使用 nvim_exec2 执行命令并捕获输出（比 vim.fn.execute 更可靠，不会因 echo 等命令阻塞）
+  local ok, exec_result = pcall(function()
+    return vim.api.nvim_exec2(command, { output = true })
   end)
 
-  -- 恢复焦点 buffer 和窗口
-  pcall(vim.api.nvim_set_current_win, current_win)
-  if vim.api.nvim_buf_is_valid(current_buf) then
-    local win_buf = vim.api.nvim_win_get_buf(current_win)
+  -- 恢复焦点 buffer 和窗口（命令可能改变了窗口布局）
+  if current_win > 0 then
+    pcall(vim.api.nvim_set_current_win, current_win)
+  end
+  if current_buf > 0 and vim.api.nvim_buf_is_valid(current_buf) then
+    local win_buf = vim.api.nvim_win_get_buf(current_win > 0 and current_win or 0)
     if win_buf ~= current_buf then
-      pcall(vim.api.nvim_win_set_buf, current_win, current_buf)
+      pcall(vim.api.nvim_win_set_buf, current_win > 0 and current_win or 0, current_buf)
     end
   end
 
   if not ok then
-    on_error("vim.cmd 执行失败: " .. tostring(result))
+    if on_error then
+      on_error("vim.cmd 执行失败: " .. tostring(exec_result))
+    end
     return
   end
+
+  -- nvim_exec2 返回 { output = "..." }，提取输出文本
+  local output = exec_result and exec_result.output or ""
 
   -- 如果命令没有输出（如编辑操作），返回成功提示
-  if not result or result == "" then
-    on_success("命令执行成功: " .. command)
+  if not output or output == "" then
+    if on_success then
+      on_success("命令执行成功: " .. command)
+    end
     return
   end
 
-  on_success(result)
+  if on_success then
+    on_success(output)
+  end
 end
 
 M.execute_vim_cmd = {
@@ -93,3 +105,4 @@ M.execute_vim_cmd = {
 }
 
 return M
+
