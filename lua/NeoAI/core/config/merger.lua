@@ -355,10 +355,24 @@ function M.process_config(user_config)
     _validate_and_merge(result, config, { type = "table", fields = TYPE_CONSTRAINTS }, "")
   end
 
-  -- 3. 一次性输出所有配置错误
+  -- 3. 注入环境信息到 system_prompt
+  if result.ai and result.ai.system_prompt then
+    local file_utils = require("NeoAI.utils.file_utils")
+    local project_root = file_utils.find_project_root(vim.fn.getcwd())
+    local env_info = string.format(
+      "\n\n[环境信息]\nNeovim 版本: %s\n当前工作目录: %s\n项目主路径: %s\n操作系统: %s",
+      vim.version().version or tostring(vim.version()),
+      vim.fn.getcwd(),
+      project_root,
+      vim.loop.os_uname().sysname or ""
+    )
+    result.ai.system_prompt = result.ai.system_prompt .. env_info
+  end
+
+  -- 4. 一次性输出所有配置错误
   _flush_errors()
 
-  -- 4. 确保日志目录存在
+  -- 5. 确保日志目录存在
   if result.log and result.log.output_path then
     local log_dir = vim.fn.fnamemodify(result.log.output_path, ":h")
     if vim.fn.isdirectory(log_dir) == 0 then
@@ -366,12 +380,12 @@ function M.process_config(user_config)
     end
   end
 
-  -- 4. 初始化日志器（传入合并后的日志配置）
+  -- 6. 初始化日志器（传入合并后的日志配置）
   if result.log then
     logger.initialize(result.log)
   end
 
-  -- 5. 确保保存目录存在
+  -- 7. 确保保存目录存在
   if result.session and result.session.save_path then
     local path = result.session.save_path
     if vim.fn.isdirectory(path) == 0 then

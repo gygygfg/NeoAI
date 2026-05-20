@@ -11,6 +11,9 @@ local json = require("NeoAI.utils.json")
 local request_handler = require("NeoAI.core.ai.request_handler")
 local state_manager = require("NeoAI.core.config.state")
 
+-- Lua 5.1 兼容：table.unpack 可能不存在
+local unpack_fn = table.unpack or unpack
+
 local M = {}
 
 -- ========== 请求去重 ==========
@@ -346,7 +349,7 @@ function M.execute_curl_async(opts, callbacks)
   local temp_file = opts.temp_file or vim.fn.tempname()
   vim.list_extend(args, { "-o", temp_file })
 
-  local job_id = vim.fn.jobstart({ "curl", table.unpack(args) }, {
+  local job_id = vim.fn.jobstart({ "curl", unpack_fn(args) }, {
     on_stderr = function(_, data)
       if data and #data > 0 and callbacks.on_stderr then
         callbacks.on_stderr(data)
@@ -1569,7 +1572,7 @@ function M.send_stream_request(params, on_chunk, on_complete, on_error)
 
   -- 不设置 curl 超时，由系统网络栈控制
 
-  local job_id = vim.fn.jobstart({ "curl", table.unpack(args) }, {
+  local job_id = vim.fn.jobstart({ "curl", unpack_fn(args) }, {
     on_stdout = function(_, data)
       if data and #data > 0 then
         handle_stdout(data)
@@ -1852,7 +1855,7 @@ function M.send_request_async(params, on_complete)
     has_error = false,
   }
 
-  local job_id = vim.fn.jobstart({ "curl", table.unpack(curl_args) }, {
+local job_id = vim.fn.jobstart({ "curl", unpack_fn(curl_args) }, {
     on_stderr = function(_, data)
       if data and #data > 0 then
         local err = table.concat(data, "\n")
@@ -1973,7 +1976,7 @@ function M.send_request_async(params, on_complete)
               retry_temp,
             })
 
-            local retry_job_id = vim.fn.jobstart({ "curl", table.unpack(retry_args) }, {
+local retry_job_id = vim.fn.jobstart({ "curl", unpack_fn(retry_args) }, {
               on_stderr = function(_, data)
                 if data and #data > 0 then
                   local err = table.concat(data, "\n")

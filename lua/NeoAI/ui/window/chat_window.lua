@@ -1408,8 +1408,9 @@ function M.set_keymaps()
   local ok, full_config = pcall(core.get_config)
   full_config = ok and full_config or {}
   local chat_config = full_config.keymaps and full_config.keymaps.chat or {}
+  -- 注意：insert 键不再单独拦截（通过 InsertEnter 自动命令处理），
+  -- 让用户可以直接在 chat buffer 中使用 i（光标前插入）/ a（光标后插入）等标准行为
   local keymaps = {
-    insert = chat_config.insert.key,
     quit = chat_config.quit.key,
     refresh = chat_config.refresh.key,
     switch_model = chat_config.switch_model.key,
@@ -1420,10 +1421,6 @@ function M.set_keymaps()
   -- 使用闭包创建局部函数引用，避免每次按键都调用 require
   -- 这些函数形成闭包，可以访问外部作用域的 M 模块
   -- 使用 vim.keymap.set() 直接传递函数，性能更好且消除 LSP 警告
-  local function enter_insert_mode()
-    M._enter_insert_mode()
-  end
-
   local function close_window()
     M.close()
   end
@@ -1450,9 +1447,7 @@ function M.set_keymaps()
   -- 设置按键映射（使用 vim.keymap.set 直接传递函数）
   for key, mapping in pairs(keymaps) do
     local callback = nil
-    if key == "insert" then
-      callback = enter_insert_mode
-    elseif key == "quit" then
+    if key == "quit" then
       callback = close_window
     elseif key == "refresh" then
       callback = refresh_chat_window
@@ -1479,6 +1474,27 @@ function M.set_keymaps()
     })
     exit_insert_mode()
   end, { buffer = buf, noremap = true, silent = true, desc = "取消生成或退出插入模式" })
+
+  -- 注册 InsertEnter 自动命令：检测到任何进入插入模式的事件，
+  -- 若 virtual_input 处于 float 模式，自动将光标跳转到虚拟输入框
+  -- 这样用户通过 i / a / o / :startinsert 等方式进入插入模式都能被捕获
+  local augroup_name = "NeoAIChatInsertEnter_" .. tostring(buf)
+  pcall(vim.api.nvim_del_augroup_by_name, augroup_name)
+  local insert_group = vim.api.nvim_create_augroup(augroup_name, { clear = true })
+  vim.api.nvim_create_autocmd("InsertEnter", {
+    group = insert_group,
+    buffer = buf,
+    callback = function()
+      -- float 模式：将光标重定向到虚拟输入框
+      -- 不改变光标在虚拟输入框中的插入位置，由虚拟输入框自身控制
+      if virtual_input.is_active() then
+        virtual_input.focus_and_insert()
+      end
+      -- inline 模式：不做任何处理，光标停留在原位置，
+      -- 让用户享受 i（光标前插入）/ a（光标后插入）等标准 Vim 行为
+    end,
+    desc = "检测进入插入模式，float 模式下光标跳转到虚拟输入框",
+  })
 end
 
 --- 进入插入模式（内部函数）
@@ -4307,4 +4323,5 @@ function M._set_cursor_follow_should(should)
 end
 
 return M
+
 

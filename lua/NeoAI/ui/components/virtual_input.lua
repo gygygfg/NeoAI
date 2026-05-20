@@ -59,8 +59,7 @@ function M.activate(buf, opts)
   state.on_change = opts.on_change
   state.input_line_count = opts.input_line_count or 3
   state.active = true
-
-  -- 状态已通过模块级 state 表管理
+  state.mode = "inline"
 
   -- 设置 buffer 为可修改
   vim.api.nvim_set_option_value("modifiable", true, { buf = buf })
@@ -614,15 +613,19 @@ function M._setup_float_keymaps()
     end, 100)
   end, { buffer = buf, noremap = true, silent = true, desc = "退出插入模式" })
 
-  -- i 在 normal 模式下进入插入模式
+  -- i / a 在 normal 模式下进入插入模式，保持光标位置不变，和正常 buffer 行为一致
   vim.keymap.set("n", "i", function()
     if state.float_win and vim.api.nvim_win_is_valid(state.float_win) then
       pcall(vim.api.nvim_set_current_win, state.float_win)
-      -- 将光标定位到 > 后面
-      pcall(vim.api.nvim_win_set_cursor, state.float_win, { 1, 2 })
       vim.cmd("startinsert")
     end
-  end, { buffer = buf, noremap = true, silent = true, desc = "进入插入模式" })
+  end, { buffer = buf, noremap = true, silent = true, desc = "光标前插入" })
+  vim.keymap.set("n", "a", function()
+    if state.float_win and vim.api.nvim_win_is_valid(state.float_win) then
+      pcall(vim.api.nvim_set_current_win, state.float_win)
+      vim.cmd("startinsert!")
+    end
+  end, { buffer = buf, noremap = true, silent = true, desc = "光标后插入" })
 
   -- 清空输入
   vim.keymap.set("i", "<C-u>", function()
@@ -932,7 +935,7 @@ function M.focus_and_insert()
       return
     end
     pcall(vim.api.nvim_set_current_win, state.float_win)
-    pcall(vim.api.nvim_win_set_cursor, state.float_win, { 1, 2 })
+    -- 不改变光标位置，保持用户在虚拟输入框中的插入位置
     vim.cmd("startinsert")
   end, 10)
 end
@@ -1501,4 +1504,5 @@ function M._cleanup_bufleave_autocmd()
 end
 
 return M
+
 
