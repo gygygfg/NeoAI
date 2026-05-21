@@ -1556,27 +1556,19 @@ local function _delete_node(args, on_success, on_error)
 
       for _, del in ipairs(deletions) do
         local sr, sc, er, ec = del.start_row, del.start_col, del.end_row, del.end_col
-        if sr == er then
-          -- 单行删除：从该行移除 sc..ec 范围
-          local line = new_lines[sr + 1]
-          if line then
-            local before = line:sub(1, sc)
-            local after = line:sub(ec + 1) or ""
-            new_lines[sr + 1] = before .. after
-          end
-        else
-          -- 多行删除
-          local first_line = new_lines[sr + 1]
-          local last_line = new_lines[er + 1]
-          if first_line and last_line then
-            local before = first_line:sub(1, sc)
-            local after = last_line:sub(ec + 1) or ""
-            new_lines[sr + 1] = before .. after
-            -- 移除中间行和末行
-            for r = er, sr + 1, -1 do
-              table.remove(new_lines, r + 1)
-            end
-          end
+
+        -- 从 new_lines 中移除被删除节点的行范围
+        -- 注意：由于 deletions 已按从后往前排序，删除不会影响前面的行号
+        local lines_to_remove = {}
+        for line_num = sr, er do
+          table.insert(lines_to_remove, line_num + 1)
+        end
+        -- 从后往前删除行（保持索引正确）
+        table.sort(lines_to_remove, function(a, b)
+          return a > b
+        end)
+        for _, idx in ipairs(lines_to_remove) do
+          table.remove(new_lines, idx)
         end
       end
 
@@ -1817,147 +1809,51 @@ local function _edit_node(args, on_success, on_error)
       return
     end
 
-    -- 只取第一个匹配的节点
-    local target = filtered[1]
-
-    -- 安全检查：拒绝根容器节点（depth == 0），防止整个文件被替换
-    if target.depth == 0 then
-      if on_error then
-        finalize_with_timeout(
-          "拒绝替换根容器节点（类型: "
-            .. target.type
-            .. "）。"
-            .. "根节点代表整个文件，不能被替换。"
-            .. "请指定一个具体的 node_type（如 'function_definition'、'class_definition' 等）",
-          true
-        )
+    -- 根据 index 参数选择要编辑的节点
+    -- 如果只有一个匹配，index 可省略；多个匹配时必须指定 index
+    local target = nil
+    if args.index ~= nil then
+      local idx = tonumber(args.index)
+      if not idx or idx < 1 or idx > #filtered then
+        finalize_with_timeout("index 参数无效: " .. tostring(args.index) .. "。有效范围: 1 ~ " .. #filtered, true)
+        return
       end
+      target = filtered[idx]
+    elseif #filtered == 1 then
+      target = filtered[1]
+    else
+      -- 多个匹配但未指定 index，返回错误和所有匹配节点信息
+      local details = {}
+      for i, node in ipairs(filtered) do
+        table.insert(details, string.format("  [%d] 类型: %s, 文本: %s, 位置: 行 %d-%d",
+          i, node.type, node.text:gsub("\n", "\\n"):sub(1, 60), node.start_row + 1, node.end_row + 1))
+      end
+      finalize_with_timeout("匹配到 " .. #filtered .. " 个节点，请使用 index 参数指定要修改第几个:\n" .. table.concat(details, "\n"), true)
       return
-    end
-
-    -- 如果匹配到多个节点且未指定 text 精确过滤，添加警告
-    local multi_match_warning = nil
-    if #filtered > 1 and not args.text then
-      multi_match_warning = "匹配到 "
-        .. #filtered
-        .. " 个节点，仅修改第一个（类型: "
-        .. target.type
-        .. "，位置: 行 "
-        .. target.start_row
-        .. "）。"
-        .. "建议使用 text 参数精确指定要修改的节点。"
     end
 
     -- 异步读取文件内容
     read_file_content_async(filepath, function(content)
       -- ======================================================================
-      -- Step 1: 获取文件缩进格数和被替换节点缩进
+      -- 分割文件内容并定位节点范围
       -- ======================================================================
-      -- 检测文件缩进风格（空格/制表符，每级缩进宽度）
-      local function detect_indent_style(lines)
-        local indent_char, indent_width = " ", 2
-        -- 统计前 100 行中非空行的缩进字符
-        local space_count, tab_count = 0, 0
-        local space_widths = {}
-        for i = 1, math.min(#lines, 100) do
-          local line = lines[i] or ""
-          local leading = line:match("^(%s+)" )
-          if leading then
-            if leading:sub(1, 1) == "\t" then
-              tab_count = tab_count + 1
-            elseif leading:sub(1, 1) == " " then
-              space_count = space_count + 1
-              table.insert(space_widths, #leading)
-            end
-          end
-        end
-        if tab_count > space_count then
-          indent_char = "\t"
-          indent_width = 1
-        else
-          indent_char = " "
-          -- 从缩进宽度中推测每级宽度（取最小非零宽度）
-          if #space_widths > 0 then
-            table.sort(space_widths)
-            indent_width = space_widths[1]
-            -- 限制在合理范围
-            if indent_width < 1 or indent_width > 8 then
-              indent_width = 2
-            end
-          end
-        end
-        return indent_char, indent_width
-      end
-
       local file_lines = vim.split(content, "\n", { plain = true })
-      local indent_char, indent_width = detect_indent_style(file_lines)
-
       local sr, sc, er, ec = target.start_row, target.start_col, target.end_row, target.end_col
-
-      -- 被替换节点首行缩进（即节点在文件中的实际缩进字符串）
-      local node_first_line = file_lines[sr + 1] or ""
-      local node_indent = node_first_line:match("^(%s*)") or ""
-
-      -- ======================================================================
-      -- Step 2: 获取替换文本缩进
-      -- ======================================================================
       local new_content_lines = vim.split(new_content, "\n", { plain = true })
-      local new_first_line = new_content_lines[1] or ""
-      local new_indent = new_first_line:match("^(%s*)") or ""
 
-      -- ======================================================================
-      -- Step 3: 重写替换文本缩进为被替换节点缩进
-      -- ======================================================================
-      -- 原理：先剥离替换文本自身的基缩进（new_indent），再统一追加 node_indent。
-      -- 对于后续行，保留其相对于首行的额外缩进。
-      local reindented_lines = {}
-      for i, line in ipairs(new_content_lines) do
-        if line:match("^%s*$") then
-          -- 空行/纯空格行：保留原样
-          table.insert(reindented_lines, line)
-        elseif i == 1 then
-          -- 首行：剥离 new_indent，追加 node_indent
-          local stripped = line
-          if new_indent ~= "" then
-            stripped = line:gsub("^" .. vim.pesc(new_indent), "")
-          end
-          table.insert(reindented_lines, node_indent .. stripped)
-        else
-          -- 后续行：剥离 new_indent，计算相对缩进深度，叠加到 node_indent 上
-          local line_indent = line:match("^(%s*)") or ""
-          local relative_level = 0
-          if new_indent ~= "" and line_indent ~= "" then
-            -- 计算相对于 new_indent 的额外缩进级别
-            local new_level = math.floor(#new_indent / math.max(1, indent_width))
-            local line_level = math.floor(#line_indent / math.max(1, indent_width))
-            relative_level = math.max(0, line_level - new_level)
-          elseif line_indent ~= "" then
-            local line_level = math.floor(#line_indent / math.max(1, indent_width))
-            relative_level = line_level
-          end
-          local stripped = line:gsub("^%s*", "")
-          local extra_indent = string.rep(indent_char, relative_level * indent_width)
-          table.insert(reindented_lines, node_indent .. extra_indent .. stripped)
-        end
+      -- 节点首行之前的文本（保留以维持列位置；不再依赖原文本计算缩进）
+      local before_on_first_line = ""
+      if sr + 1 <= #file_lines then
+        before_on_first_line = file_lines[sr + 1]:sub(1, sc)
       end
-      local reindented_content = table.concat(reindented_lines, "\n")
 
-      -- ======================================================================
-      -- Step 4: 将文件分为首、被替换节点、尾三部分
-      -- ======================================================================
-      -- 首部：节点起始行之前的所有行 + 起始行上节点之前的文本
+      -- 构建文件首部：节点起始行之前的所有行
       local head_lines = {}
       for i = 1, sr do
         table.insert(head_lines, file_lines[i])
       end
-      if sr + 1 <= #file_lines then
-        local before_on_first_line = file_lines[sr + 1]:sub(1, sc)
-        if before_on_first_line ~= "" then
-          table.insert(head_lines, before_on_first_line)
-        end
-      end
 
-      -- 尾部：结束行上节点之后的文本 + 节点结束行之后的所有行
+      -- 构建文件尾部
       local tail_lines = {}
       if er + 1 <= #file_lines then
         local after_on_last_line = file_lines[er + 1]:sub(ec + 1)
@@ -1969,37 +1865,33 @@ local function _edit_node(args, on_success, on_error)
         table.insert(tail_lines, file_lines[i])
       end
 
-      -- ======================================================================
-      -- Step 5: 拼接文件为首 + 替换文本 + 尾
-      -- ======================================================================
+      -- 拼接文件：首部 + 新内容（直接使用用户提供的内容，不额外重算缩进） + 尾部
       local new_parts = {}
       if sr == er then
-        -- 单行节点：prefix + 替换内容 + suffix 拼接在同一行
-        local before = (head_lines[#head_lines] or "")
-        local after = (tail_lines[1] or "")
-        if #head_lines > 0 and head_lines[#head_lines] ~= "" then
-          head_lines[#head_lines] = nil
-        end
-        if #tail_lines > 0 and tail_lines[1] ~= "" then
-          table.remove(tail_lines, 1)
-        end
-        -- 先加入 head_lines
+        -- 单行节点：before + new_content + after 拼接在同一行
+        local source_line = file_lines[sr + 1] or ""
+        local before = source_line:sub(1, sc)
+        local after = source_line:sub(ec + 1)
+
         for _, line in ipairs(head_lines) do
           table.insert(new_parts, line)
         end
-        -- 拼接: before + replacement + after
-        local combined = before .. reindented_content .. after
+        local combined = before .. new_content .. after
         table.insert(new_parts, combined)
-        -- 再加入 tail_lines
         for _, line in ipairs(tail_lines) do
           table.insert(new_parts, line)
         end
       else
-        -- 多行节点：正常拼接
+        -- 多行节点：首行拼接缩进前缀，后续行保持用户提供的缩进
         for _, line in ipairs(head_lines) do
           table.insert(new_parts, line)
         end
-        table.insert(new_parts, reindented_content)
+        if #new_content_lines > 0 then
+          table.insert(new_parts, before_on_first_line .. new_content_lines[1])
+          for i = 2, #new_content_lines do
+            table.insert(new_parts, new_content_lines[i])
+          end
+        end
         for _, line in ipairs(tail_lines) do
           table.insert(new_parts, line)
         end
@@ -2061,10 +1953,10 @@ local function _edit_node(args, on_success, on_error)
           finalize_with_timeout("写入文件失败: " .. err_msg, true)
         end
       end)
-  end, function(err)
-    finalize_with_timeout(err or "解析结果为空", true)
+    end, function(err)
+      finalize_with_timeout(err or "解析结果为空", true)
+    end)
   end)
-end)
 end
 
 M.edit_node = {
@@ -2080,6 +1972,10 @@ M.edit_node = {
       node_type = { type = "string", description = "节点类型过滤（可选），如 'function_definition'" },
       text = { type = "string", description = "节点文本过滤（可选）" },
       named = { type = "boolean", description = "是否为命名节点（可选）" },
+      index = {
+        type = "number",
+        description = "匹配节点序号（可选，从1开始），仅一个匹配时可省略，多个匹配时必须指定",
+      },
     },
     required = { "filepath", "content" },
   },

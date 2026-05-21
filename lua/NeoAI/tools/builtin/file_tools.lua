@@ -313,27 +313,19 @@ local function find_text_range(lines, anchor_line, search_text)
     return nil
   end
 
-  -- 提取搜索文本的前导空白（缩进），用于严格缩进匹配
-  local search_indent = normalized_search:match("^(%s*)") or ""
-  local search_rest = normalized_search:sub(#search_indent + 1)
-
-  -- 严格匹配函数：检查行文本是否匹配搜索文本（含缩进检查）
-  local function line_matches(line)
-    local line_norm = normalize_line_text(line)
-    if search_indent ~= "" then
-      -- 有缩进要求：必须行首缩进完全一致，且剩余部分匹配
-      local line_indent = line_norm:match("^(%s*)") or ""
-      if line_indent ~= search_indent then
-        return false
-      end
-      return line_norm:sub(#search_indent + 1):find(search_rest, 1, true) ~= nil
-    else
-      -- 无缩进要求：退回到旧的子串匹配行为
-      return line_norm:find(normalized_search, 1, true) ~= nil
-    end
+  -- 去除所有空白字符（空格、制表符）后匹配
+  -- 忽略缩进差异，只匹配非空白内容
+  local search_stripped = normalized_search:gsub("%s", "")
+  if search_stripped == "" then
+    return nil
   end
 
-  local anchor_normalized = normalize_line_text(lines[anchor_line])
+  -- 匹配函数：去除行中所有空白字符后做子串匹配
+  local function line_matches(line)
+    local line_stripped = normalize_line_text(line):gsub("%s", "")
+    return line_stripped:find(search_stripped, 1, true) ~= nil
+  end
+
   if line_matches(lines[anchor_line]) then
     local s, e = anchor_line, anchor_line
     for i = anchor_line + 1, #lines do
@@ -506,29 +498,6 @@ local function _replace_text(args, on_success, on_error)
     table.insert(new_lines, lines[i])
   end
   local replacement_lines = vim.split(new_text, "\n", { plain = true })
-
-  -- 保留原始首行缩进：防止替换后缩进丢失
-  -- 注意：如果原始行是纯空白行（仅含空格/制表符），不保留缩进，直接替换
-  local original_indent = lines[replace_start]:match("^(%s*)") or ""
-  local is_blank_line = (lines[replace_start]:match("^%s*$") ~= nil)
-  if original_indent ~= "" and not is_blank_line then
-    -- 查找 new_text 中首个非空行，判断是否已包含缩进
-    local first_non_empty = nil
-    for _, rl in ipairs(replacement_lines) do
-      if rl:match("%S") then
-        first_non_empty = rl
-        break
-      end
-    end
-    -- 如果 new_text 首非空行不以原始缩进开头，说明缩进缺失，自动补齐
-    if first_non_empty and not first_non_empty:match("^" .. vim.pesc(original_indent)) then
-      for i, rl in ipairs(replacement_lines) do
-        if rl:match("%S") then
-          replacement_lines[i] = original_indent .. rl
-        end
-      end
-    end
-  end
 
   for _, rl in ipairs(replacement_lines) do
     table.insert(new_lines, rl)
