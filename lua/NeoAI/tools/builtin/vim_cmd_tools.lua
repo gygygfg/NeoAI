@@ -67,11 +67,11 @@ M.execute_vim_cmd = {
   description = [[在当前 Neovim 实例中执行 vim.cmd Ex 命令（如编辑、写入、跳转等），返回命令输出结果。
 
 支持所有 vim.cmd 可执行的 Ex 命令，包括但不限于：
-- 文件操作: e, w, q, wq, saveas, edit
+- 文件操作: e, w, q, wq, saveas, edit(不推荐，容易破坏当前buffer)
 - 缓冲区管理: bnext, bprev, bdelete, buffer
 - 窗口管理: split, vsplit, close, only
 - 标签页管理: tabnew, tabnext, tabclose
-- 搜索替换: %s/pattern/replacement/g
+- 搜索替换: %s/pattern/replacement/g(不推荐，容易破坏当前buffer)
 - 设置选项: set, setlocal
 - 其他: messages, echo, checkhealth, colorscheme, help
 
@@ -105,4 +105,3 @@ M.execute_vim_cmd = {
 }
 
 return M
-

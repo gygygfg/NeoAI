@@ -1462,19 +1462,39 @@ local function _delete_node(args, on_success, on_error)
       return
     end
 
-    -- 只删除第一个匹配的节点（与 edit_node 行为保持一致），多个匹配时发出警告
-    local multi_match_warning = nil
-    if #deletable > 1 and not args.text then
-      multi_match_warning = "匹配到 "
-        .. #deletable
-        .. " 个可删除节点，仅删除第一个（类型: "
-        .. deletable[1].type
-        .. "，位置: 行 "
-        .. deletable[1].start_row
-        .. "）。"
-        .. "建议使用 text 参数精确指定要删除的节点。"
+    -- 根据 index 参数选择要删除的节点
+    -- 如果只有一个匹配，index 可省略；多个匹配时必须指定 index
+    local target = nil
+    if args.index ~= nil then
+      local idx = tonumber(args.index)
+      if not idx or idx < 1 or idx > #deletable then
+        local msg = "index 参数无效: " .. tostring(args.index) .. "。"
+          .. "有效范围: 1 ~ " .. #deletable
+        if on_error then
+          finalize_with_timeout(msg, true)
+        end
+        return
+      end
+      target = deletable[idx]
+    elseif #deletable == 1 then
+      target = deletable[1]
+    else
+      -- 多个匹配但未指定 index，返回错误和所有匹配节点信息
+      local details = {}
+      for i, node in ipairs(deletable) do
+        table.insert(details, string.format(
+          "  [%d] 类型: %s, 文本: %s, 位置: 行 %d-%d",
+          i, node.type, node.text:gsub("\n", "\\n"):sub(1, 60),
+          node.start_row + 1, node.end_row + 1
+        ))
+      end
+      local msg = "匹配到 " .. #deletable .. " 个节点，请使用 index 参数指定要删除第几个:\n"
+        .. table.concat(details, "\n")
+      if on_error then
+        finalize_with_timeout(msg, true)
+      end
+      return
     end
-    local target = deletable[1]
 
     -- 跳过的节点会在最终结果中通过 skipped_types 字段提示
 
@@ -1636,13 +1656,6 @@ local function _delete_node(args, on_success, on_error)
                   ret.warning = "已跳过根容器节点: " .. table.concat(skipped_root, ", ")
                 end
               end
-              if multi_match_warning then
-                if ret.warning then
-                  ret.warning = ret.warning .. "; " .. multi_match_warning
-                else
-                  ret.warning = multi_match_warning
-                end
-              end
               if on_success then
                 if timeout_timer then
                   timeout_timer:stop()
@@ -1682,13 +1695,6 @@ local function _delete_node(args, on_success, on_error)
             ret.warning = "已跳过根容器节点: " .. table.concat(skipped_root, ", ")
           end
         end
-        if multi_match_warning then
-          if ret.warning then
-            ret.warning = ret.warning .. "; " .. multi_match_warning
-          else
-            ret.warning = multi_match_warning
-          end
-        end
         if on_success then
           if timeout_timer then
             timeout_timer:stop()
@@ -1705,7 +1711,7 @@ end
 
 M.delete_node = {
   name = "delete_node",
-  description = "删除文件中匹配的 Tree-sitter 语法树节点，支持按 node_type、text、named 属性过滤。删除后自动保存文件。",
+  description = "删除文件中匹配的 Tree-sitter 语法树节点，支持按 node_type、text、named 属性过滤。多个匹配时需用 index 参数指定删除第几个。删除后自动保存文件。",
   func = _delete_node,
   async = true,
   parameters = {
@@ -1715,13 +1721,14 @@ M.delete_node = {
       node_type = { type = "string", description = "节点类型过滤（可选），如 'function_definition'" },
       text = { type = "string", description = "节点文本过滤（可选）" },
       named = { type = "boolean", description = "是否为命名节点（可选）" },
+      index = { type = "number", description = "匹配节点序号（可选，从1开始），仅一个匹配时可省略，多个匹配时必须指定" },
     },
     required = { "filepath" },
   },
   returns = { type = "object", description = "删除结果，包含被删除的节点信息" },
   category = "treesitter",
-  permissions = { write = true },
 }
+
 
 -- ============================================================================
 -- 工具 edit_node - 修改指定语法树节点的内容（回调模式）
