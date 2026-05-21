@@ -1925,8 +1925,7 @@ function M.on_generation_complete(data)
     end
 
     -- AI 返回纯文本回复，直接结束循环
-    -- 重置 _tools_all_completed 标志，防止 _finish_loop 触发的 GENERATION_COMPLETED
-    -- 事件监听器中的 _check_round_complete 错误地进入下一轮
+    -- 重置 _tools_all_completed 标志，防止 _check_round_complete 错误地进入下一轮
     ss._tools_all_completed = false
     if #tool_calls == 0 and content and content ~= "" then
       logger.debug("[tool_orchestrator] AI 返回纯文本回复，直接结束循环，跳过总结轮次")
@@ -1953,8 +1952,9 @@ function M.on_generation_complete(data)
       ss.active_tool_calls = {}
       ss.current_iteration = 0
       ss.generation_id = nil
-      fire_loop_finished(ss, true, "ai_complete")
-      -- 触发 GENERATION_COMPLETED 事件显示调用用量
+      -- 先触发 GENERATION_COMPLETED 事件（此时 chat_window 的 streaming.message_index 仍然有效），
+      -- 再触发 TOOL_LOOP_FINISHED（reset_streaming_state 会清除 message_index）。
+      -- 否则 GENERATION_COMPLETED 事件处理中 mi 为 nil，导致纯文本回复无法渲染到聊天窗口。
       once_display_closed(session_id, function()
         local s = sessions_table[session_id]
         if not s then
@@ -1979,6 +1979,7 @@ function M.on_generation_complete(data)
           on_complete(true, saved_content, saved_usage)
         end
       end)
+      fire_loop_finished(ss, true, "ai_complete")
       return
     end
 
@@ -1995,7 +1996,8 @@ function M.on_generation_complete(data)
       ss.active_tool_calls = {}
       ss.current_iteration = 0
       ss.generation_id = nil
-      fire_loop_finished(ss, true, "ai_complete")
+      -- 先触发 GENERATION_COMPLETED 再触发 TOOL_LOOP_FINISHED
+      -- 确保 chat_window 的 streaming.message_index 在 GENERATION_COMPLETED 处理时仍有效
       once_display_closed(session_id, function()
         local s = sessions_table[session_id]
         if not s then
@@ -2020,11 +2022,9 @@ function M.on_generation_complete(data)
           on_complete(true, "", saved_usage)
         end
       end)
+      fire_loop_finished(ss, true, "ai_complete")
       return
     end
-
-    M._finish_loop(session_id, true, content, is_sub_agent)
-    return
   end
 
   -- 继续工具循环
@@ -3060,3 +3060,4 @@ function M.cleanup_all()
 end
 
 return M
+

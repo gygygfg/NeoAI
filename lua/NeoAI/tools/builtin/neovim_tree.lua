@@ -1952,14 +1952,18 @@ local function _edit_node(args, on_success, on_error)
       end
       if sr + 1 <= #file_lines then
         local before_on_first_line = file_lines[sr + 1]:sub(1, sc)
-        table.insert(head_lines, before_on_first_line)
+        if before_on_first_line ~= "" then
+          table.insert(head_lines, before_on_first_line)
+        end
       end
 
       -- 尾部：结束行上节点之后的文本 + 节点结束行之后的所有行
       local tail_lines = {}
       if er + 1 <= #file_lines then
         local after_on_last_line = file_lines[er + 1]:sub(ec + 1)
-        table.insert(tail_lines, after_on_last_line)
+        if after_on_last_line ~= "" then
+          table.insert(tail_lines, after_on_last_line)
+        end
       end
       for i = er + 2, #file_lines do
         table.insert(tail_lines, file_lines[i])
@@ -1969,15 +1973,36 @@ local function _edit_node(args, on_success, on_error)
       -- Step 5: 拼接文件为首 + 替换文本 + 尾
       -- ======================================================================
       local new_parts = {}
-      -- 首部
-      for _, line in ipairs(head_lines) do
-        table.insert(new_parts, line)
-      end
-      -- 替换文本（已调整缩进）
-      table.insert(new_parts, reindented_content)
-      -- 尾部
-      for _, line in ipairs(tail_lines) do
-        table.insert(new_parts, line)
+      if sr == er then
+        -- 单行节点：prefix + 替换内容 + suffix 拼接在同一行
+        local before = (head_lines[#head_lines] or "")
+        local after = (tail_lines[1] or "")
+        if #head_lines > 0 and head_lines[#head_lines] ~= "" then
+          head_lines[#head_lines] = nil
+        end
+        if #tail_lines > 0 and tail_lines[1] ~= "" then
+          table.remove(tail_lines, 1)
+        end
+        -- 先加入 head_lines
+        for _, line in ipairs(head_lines) do
+          table.insert(new_parts, line)
+        end
+        -- 拼接: before + replacement + after
+        local combined = before .. reindented_content .. after
+        table.insert(new_parts, combined)
+        -- 再加入 tail_lines
+        for _, line in ipairs(tail_lines) do
+          table.insert(new_parts, line)
+        end
+      else
+        -- 多行节点：正常拼接
+        for _, line in ipairs(head_lines) do
+          table.insert(new_parts, line)
+        end
+        table.insert(new_parts, reindented_content)
+        for _, line in ipairs(tail_lines) do
+          table.insert(new_parts, line)
+        end
       end
       local content_to_write = table.concat(new_parts, "\n")
 
@@ -2039,6 +2064,7 @@ local function _edit_node(args, on_success, on_error)
   end, function(err)
     finalize_with_timeout(err or "解析结果为空", true)
   end)
+end)
 end
 
 M.edit_node = {

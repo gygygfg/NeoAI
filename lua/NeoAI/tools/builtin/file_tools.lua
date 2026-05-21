@@ -354,7 +354,7 @@ local function find_text_range(lines, anchor_line, search_text)
   end
 
   -- 回退搜索：从 anchor 向上查找
-  for i = anchor_line - 1, 1, -1 do
+  for i = anchor_line - 1, math.max(1, anchor_line - 10), -1 do
     if line_matches(lines[i]) then
       local s, e = i, i
       for j = i + 1, #lines do
@@ -376,7 +376,7 @@ local function find_text_range(lines, anchor_line, search_text)
   end
 
   -- 回退搜索：从 anchor 向下查找
-  for i = anchor_line + 1, #lines do
+  for i = anchor_line + 1, math.min(#lines, anchor_line + 10) do
     if line_matches(lines[i]) then
       local s, e = i, i
       for j = i + 1, #lines do
