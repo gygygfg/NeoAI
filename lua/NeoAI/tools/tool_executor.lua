@@ -12,6 +12,7 @@ local tool_registry = require("NeoAI.tools.tool_registry")
 local tool_validator = require("NeoAI.tools.tool_validator")
 local event_constants = require("NeoAI.core.events")
 local json = require("NeoAI.utils.json")
+local file_utils = require("NeoAI.utils.file_utils")
 local approval_handler = require("NeoAI.tools.approval_handler")
 
 local state = {
@@ -1345,6 +1346,170 @@ function M._normalize_arguments(tool_name, raw_arguments)
   return arguments, changed
 end
 
+-- ========== Write 工具 AI 预览拦截 ==========
+
+--- 判断工具是否为 write 工具（修改文件的工具）
+--- @param tool_name string 工具名称
+--- @return boolean
+function M._is_write_tool(tool_name)
+  local tool = tool_registry.get(tool_name)
+  if not tool then
+    return false
+  end
+  -- 检查 permissions 中是否有 write=true
+  if tool.permissions and tool.permissions.write == true then
+    return true
+  end
+  -- 检查工具名称是否涉及文件修改
+  local write_tool_names = {
+    replace_text = true,
+    edit_file = true,
+    create_file = true,
+    write_file = true,
+    delete_file = true,
+    create_directory = true,
+    ensure_dir = true,
+    insert_edit_into_file = true,
+    lsp_rename = true,
+    lsp_format = true,
+  }
+  return write_tool_names[tool_name] == true
+end
+
+--- 从工具参数中提取文件路径
+--- @param args table 工具参数
+--- @return string|nil
+local function _extract_filepath_from_args(args)
+  if not args then
+    return nil
+  end
+  return args.filepath or args.file or args.path or nil
+end
+
+--- 读取文件修改点附近的上下文（±10 行）
+--- @param filepath string 文件路径
+--- @param start_line number|nil 修改起始行（1-based）
+--- @param end_line number|nil 修改结束行（1-based）
+--- @return string 上下文内容
+local function _read_file_context(filepath, start_line, end_line)
+  local content, err = file_utils.read_file(filepath)
+  if not content then
+    return string.format("[无法读取文件: %s]", err or "未知错误")
+  end
+
+  local all_lines = vim.split(content, "\n", { plain = true })
+  if #all_lines > 0 and all_lines[#all_lines] == "" then
+    table.remove(all_lines)
+  end
+  local total_lines = #all_lines
+
+  -- 确定上下文范围
+  local context_before = 10
+  local context_after = 10
+
+  -- 如果没有指定行号，显示文件开头和结尾
+  if not start_line or not end_line then
+    local preview_lines = {}
+    local show_count = math.min(20, total_lines)
+    for i = 1, show_count do
+      table.insert(preview_lines, string.format("%4d | %s", i, all_lines[i] or ""))
+    end
+    if total_lines > show_count then
+      table.insert(preview_lines, "  ... (文件共 " .. total_lines .. " 行，仅显示前 " .. show_count .. " 行) ...")
+    end
+    return table.concat(preview_lines, "\n")
+  end
+
+  local ctx_start = math.max(1, start_line - context_before)
+  local ctx_end = math.min(total_lines, end_line + context_after)
+
+  local preview_lines = {}
+  table.insert(preview_lines, string.format("=== %s === (行 %d-%d, 共 %d 行)", filepath, ctx_start, ctx_end, total_lines))
+
+  if ctx_start > 1 then
+    table.insert(preview_lines, "  ... (上方 " .. (ctx_start - 1) .. " 行省略) ...")
+  end
+
+  for i = ctx_start, ctx_end do
+    local marker = ""
+    if i >= start_line and i <= end_line then
+      marker = " >>"  -- 标记修改范围
+    end
+    table.insert(preview_lines, string.format("%s%4d | %s", marker, i, all_lines[i] or ""))
+  end
+
+  if ctx_end < total_lines then
+    table.insert(preview_lines, "  ... (下方 " .. (total_lines - ctx_end) .. " 行省略) ...")
+  end
+
+  return table.concat(preview_lines, "\n")
+end
+
+--- 构建 AI 预览结果（拦截 write 工具的真实执行）
+--- 当 write 工具执行成功时，不真正写入文件，而是构造模拟结果让 AI 预览
+--- @param tool_name string 工具名称
+--- @param resolved_args table 规范化后的参数
+--- @param raw_args table 原始参数
+--- @param original_result string 原始工具执行结果
+--- @param session_context table 会话上下文
+--- @param on_success function 成功回调
+--- @param on_error function 错误回调
+function M._intercept_write_tool_result(tool_name, resolved_args, raw_args, original_result, session_context, on_success, on_error)
+  local filepath = _extract_filepath_from_args(resolved_args)
+  local session_id = session_context and session_context.session_id or (raw_args and raw_args._session_id)
+
+  if not filepath then
+    -- 无法确定文件路径，返回原始结果
+    if on_success then
+      on_success(original_result)
+    end
+    return
+  end
+
+  -- 解析修改范围（从工具参数中提取）
+  local start_line = resolved_args.start_line or resolved_args.start
+  local end_line = resolved_args.end_line or resolved_args["end"]
+
+  -- 如果是 replace_text 工具，从 start_match/end_match 中提取
+  if resolved_args.start_match and type(resolved_args.start_match) == "table" then
+    start_line = resolved_args.start_match.line_number
+  end
+  if resolved_args.end_match and type(resolved_args.end_match) == "table" then
+    end_line = resolved_args.end_match.line_number
+  end
+
+  -- 读取文件上下文
+  local file_context = _read_file_context(filepath, start_line, end_line)
+
+  -- 构造预览结果
+  local preview_result = string.format(
+    [[【文件修改预览 - 等待 AI 确认】
+
+工具: %s
+文件: %s
+
+=== 修改点附近的内容 ===
+%s
+
+=== 操作说明 ===
+AI 需要检查上述修改是否符合预期。
+
+- 如果确认修改正确，请调用 `confirm_file_change` 工具，设置 confirmed=true，并说明原因。
+- 如果发现参数有误，可以直接调用其他编辑工具（如 replace_text、insert_edit_into_file 等）来覆盖参数重新执行。
+- 如果拒绝修改，请调用 `confirm_file_change` 工具，设置 confirmed=false，并说明原因。
+
+注意：在 AI 确认之前，文件不会被实际修改。]],
+    tool_name,
+    filepath,
+    file_context
+  )
+
+  -- 将预览结果通过 on_success 返回给 AI
+  if on_success then
+    on_success(preview_result)
+  end
+end
+
 -- ========== 带编排的工具执行 ==========
 
 --- 供 tool_orchestrator 调用的工具执行接口
@@ -1436,8 +1601,104 @@ function M.execute_with_orchestrator(tool_name, raw_args, session_context, callb
     end
   end
 
-  -- 调用 execute_async
-  M.execute_async(tool_name, arguments, wrapped_on_success, wrapped_on_error, callbacks.on_progress)
+  -- ===== Write 工具 AI 预览拦截 =====
+  -- 如果工具是 write 工具，在工具执行成功后拦截结果，
+  -- 构造文件修改预览让 AI 检查，AI 确认后才进入用户审批
+  local is_write = M._is_write_tool(tool_name)
+  if is_write then
+    -- 保存原始回调，用于 AI 确认后真正执行
+    local original_on_result = callbacks.on_result
+    local original_on_progress = callbacks.on_progress
+
+    -- 标记此工具需要 AI 预览确认
+    arguments._needs_ai_preview = true
+
+    -- 发射 AI 检查子步骤事件（UI 显示 "AI 检查中..."）
+    fire_event(event_constants.TOOL_EXECUTION_SUBSTEP, {
+      tool_name = tool_name,
+      pack_name = session_context.pack_name,
+      substep_name = "AI 检查",
+      status = "executing",
+      duration = 0,
+      detail = "等待 AI 确认文件修改...",
+      session_id = session_context.session_id,
+    })
+
+    -- 覆盖 wrapped_on_success：工具执行成功后不返回实际结果，而是构造预览
+    local preview_on_success = function(result)
+      M._clear_timeout(tool_call_id)
+
+      local duration = os.time() - (raw_args and raw_args._start_time or os.time())
+      local formatted = M.format_result(result)
+
+      -- 更新 AI 检查子步骤状态
+      fire_event(event_constants.TOOL_EXECUTION_SUBSTEP, {
+        tool_name = tool_name,
+        pack_name = session_context.pack_name,
+        substep_name = "AI 检查",
+        status = "executing",
+        duration = duration,
+        detail = "AI 正在检查文件修改...",
+        session_id = session_context.session_id,
+      })
+
+      -- 构造预览结果（拦截真实写入）
+      M._intercept_write_tool_result(
+        tool_name,
+        arguments,
+        raw_args or {},
+        formatted,
+        session_context,
+        function(preview_result)
+          -- 将预览结果作为工具结果返回给 AI
+          if original_on_result then
+            original_on_result(true, preview_result)
+          end
+        end,
+        function(err)
+          if original_on_result then
+            original_on_result(false, err)
+          end
+        end
+      )
+    end
+
+    -- 覆盖 wrapped_on_error：工具执行失败时，如果是 write 工具，也尝试读取文件当前内容给 AI 看
+    local preview_on_error = function(err)
+      M._clear_timeout(tool_call_id)
+
+      local err_str = type(err) == "table" and vim.inspect(err) or tostring(err or "未知错误")
+      local full_err = "工具执行错误: " .. err_str
+
+      -- 更新 AI 检查子步骤为错误
+      fire_event(event_constants.TOOL_EXECUTION_SUBSTEP, {
+        tool_name = tool_name,
+        pack_name = session_context.pack_name,
+        substep_name = "AI 检查",
+        status = "error",
+        duration = 0,
+        detail = "工具执行失败，等待 AI 处理...",
+        session_id = session_context.session_id,
+      })
+
+      -- 尝试读取文件当前内容，让 AI 看到文件状态
+      local filepath = _extract_filepath_from_args(arguments)
+      if filepath then
+        local file_context = _read_file_context(filepath, nil, nil)
+        full_err = full_err .. "\n\n=== 文件当前内容 ===\n" .. file_context
+      end
+
+      if original_on_result then
+        original_on_result(false, full_err)
+      end
+    end
+
+    -- 调用 execute_async，使用预览回调
+    M.execute_async(tool_name, arguments, preview_on_success, preview_on_error, callbacks.on_progress)
+  else
+    -- 非 write 工具，正常执行
+    M.execute_async(tool_name, arguments, wrapped_on_success, wrapped_on_error, callbacks.on_progress)
+  end
 
   -- 返回规范化后的参数（供调用方保存到会话）
   return arguments

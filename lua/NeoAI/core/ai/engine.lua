@@ -203,7 +203,20 @@ function M.generate_response(messages, params)
   if ai_preset.system_prompt and ai_preset.system_prompt ~= "" then
     local has_system = false
     for _, msg in ipairs(formatted) do if msg.role == "system" then has_system = true; break end end
-    if not has_system then table.insert(formatted, 1, { role = "system", content = ai_preset.system_prompt }) end
+    if not has_system then
+      -- 动态注入环境信息（每次请求时获取当前 cwd，而非固化在配置中）
+      local file_utils = require("NeoAI.utils.file_utils")
+      local current_cwd = vim.fn.getcwd()
+      local project_root = file_utils.find_project_root(current_cwd)
+      local env_info = string.format(
+        "\n\n[环境信息]\nNeovim 版本: %s\n当前工作目录: %s\n项目主路径: %s\n操作系统: %s",
+        vim.version().version or tostring(vim.version()),
+        current_cwd,
+        project_root,
+        vim.loop.os_uname().sysname or ""
+      )
+      table.insert(formatted, 1, { role = "system", content = ai_preset.system_prompt .. env_info })
+    end
   end
   local stream_val
   if options.stream ~= nil then
@@ -1112,3 +1125,4 @@ function M.shutdown()
 end
 
 return M
+

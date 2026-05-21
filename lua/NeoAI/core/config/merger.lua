@@ -355,19 +355,7 @@ function M.process_config(user_config)
     _validate_and_merge(result, config, { type = "table", fields = TYPE_CONSTRAINTS }, "")
   end
 
-  -- 3. 注入环境信息到 system_prompt
-  if result.ai and result.ai.system_prompt then
-    local file_utils = require("NeoAI.utils.file_utils")
-    local project_root = file_utils.find_project_root(vim.fn.getcwd())
-    local env_info = string.format(
-      "\n\n[环境信息]\nNeovim 版本: %s\n当前工作目录: %s\n项目主路径: %s\n操作系统: %s",
-      vim.version().version or tostring(vim.version()),
-      vim.fn.getcwd(),
-      project_root,
-      vim.loop.os_uname().sysname or ""
-    )
-    result.ai.system_prompt = result.ai.system_prompt .. env_info
-  end
+  -- 3. 环境信息改为动态注入（在 engine.lua 构建请求时获取当前 cwd）
 
   -- 4. 一次性输出所有配置错误
   _flush_errors()
@@ -564,3 +552,4 @@ function M.get_available_models(scenario, full_config)
 end
 
 return M
+

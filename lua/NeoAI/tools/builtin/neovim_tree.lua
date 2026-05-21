@@ -298,61 +298,36 @@ local function filter_nodes(nodes, args)
     end
   end
 
-  -- 如果指定了 node_type 但没有匹配到任何节点，回退到只按 text 和 named 过滤
-  -- 但排除根容器节点（depth == 0），避免误匹配整个文件
-  if #filtered == 0 and args.node_type then
-    local fallback = {}
-    for _, node in ipairs(nodes or {}) do
-      -- 排除根容器节点（module/program/source_file 等），防止整个文件被意外替换/删除
-      if node.depth == 0 then
-        goto continue
-      end
-      local matched = true
-      if args.text ~= nil then
-        if not node.text:find(args.text, 1, true) then
-          matched = false
-        end
-      end
-      if matched and args.named ~= nil and node.named ~= args.named then
-        matched = false
-      end
-      if matched then
-        table.insert(fallback, node)
-      end
-      ::continue::
-    end
-    if #fallback > 0 then
-      return fallback, true
-    end
-  end
+  -- 安全检查：如果指定了 node_type 但没有任何节点匹配，返回清晰错误而不是静默回退
+  -- 注意：不在这里过滤根容器节点（depth == 0），由调用方自行处理
 
   return filtered, false
 end
 
--- 递归遍历节点树，返回扁平化的节点信息列表
+-- 递归遍历语法树节点
 local function _traverse_node(node, source, depth, max_depth)
   if not node then
     return {}
   end
 
+  if max_depth >= 0 and depth > max_depth then
+    return {}
+  end
+
   local results = {}
-  local sr, sc, er, ec = node:range()
   local text = vim.treesitter.get_node_text(node, source)
+  local sr, sc, er, ec = node:range()
 
   table.insert(results, {
     type = node:type(),
+    text = text,
     named = node:named(),
     start_row = sr,
     start_col = sc,
     end_row = er,
     end_col = ec,
-    text = text,
     depth = depth,
   })
-
-  if max_depth and max_depth >= 0 and depth >= max_depth then
-    return results
-  end
 
   local child_count = node:named_child_count()
   for i = 0, child_count - 1 do
@@ -707,7 +682,7 @@ local function _get_node_at_position(args, on_success, on_error)
       local lang = detect_lang_from_filepath(filepath)
       if not lang then
         if on_error then
-          local fp = args.filepath
+          on_error("无法确定文件语言")
         end
         return
       end
@@ -861,14 +836,14 @@ local function _with_parsed_tree(args, on_success, on_error, build_response)
 
   local filepath = args.filepath
   parse_file_content_async(filepath, -1, function(result)
-    local filtered, fallback = filter_nodes(result.nodes, args)
+    local filtered = filter_nodes(result.nodes, args)
     if #filtered == 0 then
       if on_error then
         on_error("未找到匹配的节点")
       end
       return
     end
-    local ret = build_response(result, filtered, fallback)
+    local ret = build_response(result, filtered, false)
     if on_success then
       on_success(ret)
     end
@@ -950,7 +925,7 @@ local function _get_node_range(args, on_success, on_error)
   local filepath = args.filepath
 
   parse_file_content_async(filepath, -1, function(result)
-    local filtered, fallback = filter_nodes(result.nodes, args)
+    local filtered = filter_nodes(result.nodes, args)
     if #filtered == 0 then
       if on_error then
         on_error("未找到匹配的节点")
@@ -1114,7 +1089,7 @@ local function _find_parent_by_attrs(nodes, target_type, target_text, target_nam
       and parent.depth < child.depth
   end
 
-  local targets, fallback = filter_nodes(nodes, {
+  local targets = filter_nodes(nodes, {
     node_type = target_type,
     text = target_text,
     named = target_named,
@@ -1307,7 +1282,7 @@ local function _get_node_code(args, on_success, on_error)
   local filepath = args.filepath
 
   parse_file_content_async(filepath, -1, function(result)
-    local filtered, fallback = filter_nodes(result.nodes, args)
+    local filtered = filter_nodes(result.nodes, args)
     if #filtered == 0 then
       if on_error then
         on_error("未找到匹配的节点")
@@ -1436,7 +1411,7 @@ local function _delete_node(args, on_success, on_error)
   end
 
   parse_file_content_async(filepath, -1, function(result)
-    local filtered, fallback = filter_nodes(result.nodes, args)
+    local filtered = filter_nodes(result.nodes, args)
     if #filtered == 0 then
       if on_error then
         finalize_with_timeout("未找到匹配的节点", true)
@@ -1487,6 +1462,20 @@ local function _delete_node(args, on_success, on_error)
       return
     end
 
+    -- 只删除第一个匹配的节点（与 edit_node 行为保持一致），多个匹配时发出警告
+    local multi_match_warning = nil
+    if #deletable > 1 and not args.text then
+      multi_match_warning = "匹配到 "
+        .. #deletable
+        .. " 个可删除节点，仅删除第一个（类型: "
+        .. deletable[1].type
+        .. "，位置: 行 "
+        .. deletable[1].start_row
+        .. "）。"
+        .. "建议使用 text 参数精确指定要删除的节点。"
+    end
+    local target = deletable[1]
+
     -- 跳过的节点会在最终结果中通过 skipped_types 字段提示
 
     -- 异步读取文件内容
@@ -1494,7 +1483,8 @@ local function _delete_node(args, on_success, on_error)
       local file_lines = vim.split(content, "\n", { plain = true })
       local deletions = {}
 
-      for _, node in ipairs(deletable) do
+      do
+        local node = target
         local sr, sc, er, ec = node.start_row, node.start_col, node.end_row, node.end_col
         local deleted_code = {}
         for line_num = sr, er do
@@ -1540,7 +1530,7 @@ local function _delete_node(args, on_success, on_error)
           local line = new_lines[sr + 1]
           if line then
             local before = line:sub(1, sc)
-            local after = line:sub(ec + 2) or ""
+            local after = line:sub(ec + 1) or ""
             new_lines[sr + 1] = before .. after
           end
         else
@@ -1549,7 +1539,7 @@ local function _delete_node(args, on_success, on_error)
           local last_line = new_lines[er + 1]
           if first_line and last_line then
             local before = first_line:sub(1, sc)
-            local after = last_line:sub(ec + 2) or ""
+            local after = last_line:sub(ec + 1) or ""
             new_lines[sr + 1] = before .. after
             -- 移除中间行和末行
             for r = er, sr + 1, -1 do
@@ -1558,6 +1548,23 @@ local function _delete_node(args, on_success, on_error)
           end
         end
       end
+
+      -- 清理删除后残留的连续空行：保留最多 2 行空白行（符合 PEP 8 等规范）
+      local cleaned_lines = {}
+      local blank_count = 0
+      for _, line in ipairs(new_lines) do
+        local is_blank = line:match("^%s*$") ~= nil
+        if not is_blank then
+          table.insert(cleaned_lines, line)
+          blank_count = 0
+        elseif blank_count < 2 then
+          -- 允许最多 2 行连续空白行（PEP 8：顶层定义之间 2 空行）
+          table.insert(cleaned_lines, line)
+          blank_count = blank_count + 1
+        end
+        -- else: 第 3 行及以上连续空白行，跳过
+      end
+      new_lines = cleaned_lines
 
       -- 使用 Neovim API 直接修改文件缓冲区
       -- 注意：此回调在 libuv fast event 上下文中，需用 vim.schedule 调用 Neovim API
@@ -1629,6 +1636,13 @@ local function _delete_node(args, on_success, on_error)
                   ret.warning = "已跳过根容器节点: " .. table.concat(skipped_root, ", ")
                 end
               end
+              if multi_match_warning then
+                if ret.warning then
+                  ret.warning = ret.warning .. "; " .. multi_match_warning
+                else
+                  ret.warning = multi_match_warning
+                end
+              end
               if on_success then
                 if timeout_timer then
                   timeout_timer:stop()
@@ -1666,6 +1680,13 @@ local function _delete_node(args, on_success, on_error)
             ret.warning = ret.warning .. "; 已跳过根容器节点: " .. table.concat(skipped_root, ", ")
           else
             ret.warning = "已跳过根容器节点: " .. table.concat(skipped_root, ", ")
+          end
+        end
+        if multi_match_warning then
+          if ret.warning then
+            ret.warning = ret.warning .. "; " .. multi_match_warning
+          else
+            ret.warning = multi_match_warning
           end
         end
         if on_success then
@@ -1767,7 +1788,7 @@ local function _edit_node(args, on_success, on_error)
   end
 
   parse_file_content_async(filepath, -1, function(result)
-    local filtered, fallback = filter_nodes(result.nodes, args)
+    local filtered = filter_nodes(result.nodes, args)
     if #filtered == 0 then
       if on_error then
         finalize_with_timeout("未找到匹配的节点", true)
@@ -1811,6 +1832,37 @@ local function _edit_node(args, on_success, on_error)
       local file_lines = vim.split(content, "\n", { plain = true })
       local sr, sc, er, ec = target.start_row, target.start_col, target.end_row, target.end_col
 
+      -- 自动缩进调整：比较原节点首行缩进与新内容首行缩进，自动对齐
+      local original_first_line = file_lines[sr + 1] or ""
+      local original_indent = original_first_line:match("^(%s*)") or ""
+      local new_content_lines_raw = vim.split(new_content, "\n", { plain = true })
+      local new_first_line = new_content_lines_raw[1] or ""
+      local new_indent = new_first_line:match("^(%s*)") or ""
+
+      -- 自动缩进调整：对齐新内容到原节点的缩进级别
+      -- 原理：原节点首行缩进（original_indent）由 before 前缀在替换逻辑中提供，
+      -- 因此首行只需剥离 new_indent，不额外添加 original_indent；
+      -- 而后续行需要 original_indent 来保持与首行的相对缩进关系。
+      local adjusted_content = new_content
+      if #new_content_lines_raw > 0 then
+        local adjusted_lines = {}
+        for i, line in ipairs(new_content_lines_raw) do
+          if line:match("^%s*$") then
+            -- 空行/纯空格行：保留原样
+            table.insert(adjusted_lines, line)
+          elseif i == 1 then
+            -- 首行：剥离 new_indent，不添加 original_indent（before 前缀会处理）
+            local stripped = line:gsub("^" .. vim.pesc(new_indent), "")
+            table.insert(adjusted_lines, stripped)
+          else
+            -- 后续行：剥离 new_indent，添加 original_indent 保持相对缩进
+            local stripped = line:gsub("^" .. vim.pesc(new_indent), "")
+            table.insert(adjusted_lines, original_indent .. stripped)
+          end
+        end
+        adjusted_content = table.concat(adjusted_lines, "\n")
+      end
+
       -- 构建新文件内容：将目标节点范围替换为新内容
       local new_lines = {}
       for i, line in ipairs(file_lines) do
@@ -1822,8 +1874,8 @@ local function _edit_node(args, on_success, on_error)
         local line = new_lines[sr + 1]
         if line then
           local before = line:sub(1, sc)
-          local after = line:sub(ec + 2) or ""
-          new_lines[sr + 1] = before .. new_content .. after
+          local after = line:sub(ec + 1) or ""
+          new_lines[sr + 1] = before .. adjusted_content .. after
         end
       else
         -- 多行替换：保留第一行的 before 部分和最后一行的 after 部分
@@ -1831,9 +1883,9 @@ local function _edit_node(args, on_success, on_error)
         local last_line = new_lines[er + 1]
         if first_line and last_line then
           local before = first_line:sub(1, sc)
-          local after = last_line:sub(ec + 2) or ""
-          -- 将新内容按行拆分插入
-          local content_lines = vim.split(new_content, "\n", { plain = true })
+          local after = last_line:sub(ec + 1) or ""
+          -- 将调整后的新内容按行拆分插入
+          local content_lines = vim.split(adjusted_content, "\n", { plain = true })
           local replacement = {}
           if #content_lines > 0 then
             if #content_lines == 1 then

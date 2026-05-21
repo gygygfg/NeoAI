@@ -270,18 +270,38 @@ local function find_text_range(lines, anchor_line, search_text)
     return nil
   end
 
+  -- 提取搜索文本的前导空白（缩进），用于严格缩进匹配
+  local search_indent = normalized_search:match("^(%s*)") or ""
+  local search_rest = normalized_search:sub(#search_indent + 1)
+
+  -- 严格匹配函数：检查行文本是否匹配搜索文本（含缩进检查）
+  local function line_matches(line)
+    local line_norm = normalize_line_text(line)
+    if search_indent ~= "" then
+      -- 有缩进要求：必须行首缩进完全一致，且剩余部分匹配
+      local line_indent = line_norm:match("^(%s*)") or ""
+      if line_indent ~= search_indent then
+        return false
+      end
+      return line_norm:sub(#search_indent + 1):find(search_rest, 1, true) ~= nil
+    else
+      -- 无缩进要求：退回到旧的子串匹配行为
+      return line_norm:find(normalized_search, 1, true) ~= nil
+    end
+  end
+
   local anchor_normalized = normalize_line_text(lines[anchor_line])
-  if anchor_normalized:find(normalized_search, 1, true) then
+  if line_matches(lines[anchor_line]) then
     local s, e = anchor_line, anchor_line
     for i = anchor_line + 1, #lines do
-      if normalize_line_text(lines[i]):find(normalized_search, 1, true) then
+      if line_matches(lines[i]) then
         e = i
       else
         break
       end
     end
     for i = anchor_line - 1, 1, -1 do
-      if normalize_line_text(lines[i]):find(normalized_search, 1, true) then
+      if line_matches(lines[i]) then
         s = i
       else
         break
@@ -290,18 +310,19 @@ local function find_text_range(lines, anchor_line, search_text)
     return { start_line = s, end_line = e }
   end
 
+  -- 回退搜索：从 anchor 向上查找
   for i = anchor_line - 1, 1, -1 do
-    if normalize_line_text(lines[i]):find(normalized_search, 1, true) then
+    if line_matches(lines[i]) then
       local s, e = i, i
       for j = i + 1, #lines do
-        if normalize_line_text(lines[j]):find(normalized_search, 1, true) then
+        if line_matches(lines[j]) then
           e = j
         else
           break
         end
       end
       for j = i - 1, 1, -1 do
-        if normalize_line_text(lines[j]):find(normalized_search, 1, true) then
+        if line_matches(lines[j]) then
           s = j
         else
           break
@@ -311,18 +332,19 @@ local function find_text_range(lines, anchor_line, search_text)
     end
   end
 
+  -- 回退搜索：从 anchor 向下查找
   for i = anchor_line + 1, #lines do
-    if normalize_line_text(lines[i]):find(normalized_search, 1, true) then
+    if line_matches(lines[i]) then
       local s, e = i, i
       for j = i + 1, #lines do
-        if normalize_line_text(lines[j]):find(normalized_search, 1, true) then
+        if line_matches(lines[j]) then
           e = j
         else
           break
         end
       end
       for j = i - 1, 1, -1 do
-        if normalize_line_text(lines[j]):find(normalized_search, 1, true) then
+        if line_matches(lines[j]) then
           s = j
         else
           break

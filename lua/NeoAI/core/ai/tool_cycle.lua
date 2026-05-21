@@ -55,60 +55,73 @@ end
 
 --- 设置退出标志（由 VimLeavePre 回调调用）
 
--- ========== 参数修正重试工具 ==========
+-- ========== 文件修改确认工具 ==========
+--- AI 预览文件修改后，通过此工具确认执行、放弃修改或覆盖参数重试
+local _CONFIRM_TOOL_NAME = "confirm_file_change"
 
---- _retry_tool 的工具名称
---- 当工具因参数错误执行失败时，临时注册此工具到 request_handler，
---- AI 通过调用此工具来传递修正后的参数，实现自动重试
-local _RETRY_TOOL_NAME = "_retry_tool"
-
---- _retry_tool 的工具定义（OpenAI 格式）
-local _RETRY_TOOL_DEF = {
+--- confirm_file_change 的工具定义（OpenAI 格式）
+--- 统一处理：确认执行、拒绝修改、放弃修改、覆盖参数重试
+local _CONFIRM_TOOL_DEF = {
   type = "function",
   ["function"] = {
-    name = _RETRY_TOOL_NAME,
-    description = "修正参数后重试失败的工具调用。当工具执行因参数错误失败时，使用此工具传入修正后的参数重新执行。",
+    name = _CONFIRM_TOOL_NAME,
+    description = [[处理文件修改的最终决定。当工具执行涉及文件写入操作时，AI 会先看到模拟的修改结果（修改点附近 ±10 行的内容），然后需要调用此工具来决定如何处理。
+
+选项说明（三选一）：
+1. 确认执行：设置 action="confirm"，进入用户审批流程
+2. 放弃修改：设置 action="abandon"，不再尝试修改此文件
+3. 覆盖参数重试：设置 action="retry"，同时传入修正后的 arguments 重新执行
+
+注意：action="retry" 最多可重试 3 次，超过后将自动放弃。]],
     strict = true,
     parameters = {
       type = "object",
       properties = {
-        tool_name = {
+        action = {
           type = "string",
-          description = "要重试的原始工具名称",
+          description = [[操作类型：
+- "confirm": 确认执行修改，进入用户审批流程
+- "abandon": 放弃修改，不再尝试
+- "retry": 覆盖参数后重试（需同时传入 arguments）]],
+          enum = { "confirm", "abandon", "retry" },
+        },
+        reason = {
+          type = "string",
+          description = "操作原因说明（必填）",
         },
         arguments = {
           type = "object",
-          description = "修正后的参数，key-value 格式",
+          description = "仅当 action='retry' 时必填。修正后的参数，key-value 格式。例如修正文件路径、修改内容等。",
           additionalProperties = true,
         },
       },
-      required = { "tool_name", "arguments" },
+      required = { "action", "reason" },
       additionalProperties = false,
     },
   },
 }
 
---- 注册 _retry_tool 到 request_handler 的工具定义中
-local function _register_retry_tool()
+--- 注册 confirm_file_change 到 request_handler 的工具定义中
+local function _register_confirm_tool()
   local current_defs = request_handler.get_tool_definitions() or {}
   -- 检查是否已存在，避免重复注册
   for _, def in ipairs(current_defs) do
     local def_name = (def["function"] and def["function"].name) or def.name or ""
-    if def_name == _RETRY_TOOL_NAME then
+    if def_name == _CONFIRM_TOOL_NAME then
       return
     end
   end
-  table.insert(current_defs, vim.deepcopy(_RETRY_TOOL_DEF))
+  table.insert(current_defs, vim.deepcopy(_CONFIRM_TOOL_DEF))
   request_handler.set_tool_definitions(current_defs)
 end
 
---- 从 request_handler 的工具定义中移除 _retry_tool
-local function _unregister_retry_tool()
+--- 从 request_handler 的工具定义中移除 confirm_file_change
+local function _unregister_confirm_tool()
   local current_defs = request_handler.get_tool_definitions() or {}
   local filtered = {}
   for _, def in ipairs(current_defs) do
     local def_name = (def["function"] and def["function"].name) or def.name or ""
-    if def_name ~= _RETRY_TOOL_NAME then
+    if def_name ~= _CONFIRM_TOOL_NAME then
       table.insert(filtered, def)
     end
   end
@@ -1001,23 +1014,23 @@ function M._execute_single_tool(session_id, tool_call, is_sub_agent, on_complete
           local param_retry_count = s._param_retry_count or 0
           if param_retry_count < 3 then
             s._param_retry_count = param_retry_count + 1
-            -- 注册 _retry_tool 到 request_handler，让 AI 通过工具调用传递修正参数
-            _register_retry_tool()
+            -- 注册 confirm_file_change 到 request_handler，让 AI 通过工具调用传递修正参数
+            _register_confirm_tool()
             local combined_msg = string.format(
               "[工具执行失败] %s\n\n"
-                .. "请调用 `%s` 工具来修正参数后重试。\n"
+                .. "请调用 `%s` 工具，设置 action=\"retry\" 并传入修正后的 arguments 来重试。\n"
                 .. "传入参数:\n"
-                .. "  - tool_name: \"%s\"\n"
+                .. "  - action: \"retry\"\n"
+                .. "  - reason: \"修正原因\"\n"
                 .. "  - arguments: { ...修正后的参数字段... }\n"
                 .. "（修正尝试 %d/3）",
               err_msg,
-              _RETRY_TOOL_NAME,
-              tool_name,
+              _CONFIRM_TOOL_NAME,
               s._param_retry_count
             )
             M._add_tool_result_to_messages(session_id, tool_call_id, tool_name, combined_msg, is_sub_agent, normalized_args)
             logger.debug(
-              "[tool_orchestrator] 工具 '%s' 执行失败，已注册 _retry_tool 等待 AI 修正参数 (尝试 %d/3)",
+              "[tool_orchestrator] 工具 '%s' 执行失败，已注册 confirm_file_change 等待 AI 修正参数 (尝试 %d/3)",
               tool_name,
               s._param_retry_count
             )
@@ -1039,123 +1052,250 @@ function M._execute_single_tool(session_id, tool_call, is_sub_agent, on_complete
     return
   end
 
-  -- ===== 拦截 _retry_tool 调用（参数修正重试） =====
-  if tool_name == _RETRY_TOOL_NAME then
+  -- ===== 拦截 confirm_file_change 调用（统一处理确认/放弃/重试） =====
+  if tool_name == _CONFIRM_TOOL_NAME then
     local args = tool_func.arguments or {}
     if type(args) ~= "table" then
       args = {}
     end
-    local original_tool = args.tool_name
+    local action = args.action or ""
+    local reason = args.reason or ""
     local corrected_args = args.arguments or {}
 
-    if not original_tool or original_tool == "" then
-      local result_str = "[参数修正失败] _retry_tool 缺少 tool_name 参数，无法确定要重试的工具。"
-      M._add_tool_result_to_messages(session_id, tool_call_id, tool_name, result_str, is_sub_agent)
-      ss.active_tool_calls[tool_call_id] = nil
-      _unregister_retry_tool()
-      local remaining = vim.tbl_count(ss.active_tool_calls)
-      if remaining == 0 then
-        M._on_tools_complete(session_id, is_sub_agent)
+    -- 移除 confirm_file_change 工具定义
+    _unregister_confirm_tool()
+
+    -- 查找上一个 write 工具的信息
+    local last_write_tool_call_id = nil
+    local last_write_tool_name = nil
+    local last_write_args = nil
+
+    for i = #ss.messages, 1, -1 do
+      local msg = ss.messages[i]
+      if msg.role == "tool" and msg.name then
+        local tool_executor = require("NeoAI.tools.tool_executor")
+        if tool_executor._is_write_tool(msg.name) then
+          last_write_tool_call_id = msg.tool_call_id
+          last_write_tool_name = msg.name
+          if msg.normalized_args then
+            last_write_args = vim.deepcopy(msg.normalized_args)
+          end
+          break
+        end
       end
-      if on_complete then
-        on_complete()
-      end
-      return
     end
 
-    -- 验证原工具是否存在
-    local tool_registry = require("NeoAI.tools.tool_registry")
-    local original_tool_def = tool_registry.get(original_tool)
-    if not original_tool_def then
+    local substep_tool_name = last_write_tool_name or tool_name
+
+    -- ===== action = "confirm"：确认执行，进入用户审批 =====
+    if action == "confirm" then
+      -- 更新 AI 检查子步骤状态
+      pcall(vim.api.nvim_exec_autocmds, "User", {
+        pattern = event_constants.TOOL_EXECUTION_SUBSTEP,
+        data = {
+          tool_name = substep_tool_name,
+          substep_name = "AI 检查",
+          status = "completed",
+          duration = 0,
+          detail = "AI 已确认: " .. reason,
+          session_id = session_id,
+        },
+      })
+
+      if last_write_tool_name and last_write_args then
+        local result_str = string.format(
+          "[AI 已确认文件修改] 原因: %s\n\nAI 已确认上述文件修改，正在进入用户审批流程...",
+          reason
+        )
+        M._add_tool_result_to_messages(session_id, tool_call_id, tool_name, result_str, is_sub_agent)
+
+        local pack_name = tool_pack.get_pack_for_tool(last_write_tool_name)
+        local tool_executor = require("NeoAI.tools.tool_executor")
+
+        last_write_args._needs_ai_preview = nil
+        last_write_args._approval_timeout_ms = nil
+
+        if not M._tool_call_counter then M._tool_call_counter = 0 end
+        M._tool_call_counter = M._tool_call_counter + 1
+        local new_tool_call_id = "call_confirm_" .. os.time() .. "_" .. M._tool_call_counter .. "_" .. math.random(10000, 99999)
+
+        vim.schedule(function()
+          local s = sessions_table[session_id]
+          if not s or s.stop_requested then return end
+
+          s.active_tool_calls[new_tool_call_id] = true
+
+          local normalized_args = tool_executor.execute_with_orchestrator(last_write_tool_name, last_write_args, {
+            session_id = session_id,
+            window_id = ss.window_id,
+            generation_id = ss.generation_id,
+            tool_call_id = new_tool_call_id,
+            pack_name = pack_name,
+          }, {
+            on_result = function(success, result)
+              local s2 = sessions_table[session_id]
+              if not s2 then return end
+
+              local result_str = type(result) == "string" and result or vim.json.encode(result) or ""
+              M._add_tool_result_to_messages(session_id, new_tool_call_id, last_write_tool_name, result_str, is_sub_agent, normalized_args)
+
+              s2.active_tool_calls[new_tool_call_id] = nil
+              local remaining = vim.tbl_count(s2.active_tool_calls)
+              if remaining == 0 and s2.phase ~= "round_complete" then
+                M._on_tools_complete(session_id, is_sub_agent)
+              end
+            end,
+          })
+        end)
+      else
+        local result_str = "[确认失败] 找不到原始工具调用信息，请重新调用编辑工具来修改文件。"
+        M._add_tool_result_to_messages(session_id, tool_call_id, tool_name, result_str, is_sub_agent)
+      end
+
+    -- ===== action = "abandon"：放弃修改 =====
+    elseif action == "abandon" then
+      pcall(vim.api.nvim_exec_autocmds, "User", {
+        pattern = event_constants.TOOL_EXECUTION_SUBSTEP,
+        data = {
+          tool_name = substep_tool_name,
+          substep_name = "AI 检查",
+          status = "error",
+          duration = 0,
+          detail = "AI 已放弃修改: " .. reason,
+          session_id = session_id,
+        },
+      })
+
       local result_str = string.format(
-        "[参数修正失败] 工具 '%s' 不存在或已被移除，无法重试。请检查工具名称。",
-        original_tool
+        "[AI 放弃修改] 原因: %s\n\nAI 已决定放弃对此文件的修改，不再尝试。",
+        reason
       )
       M._add_tool_result_to_messages(session_id, tool_call_id, tool_name, result_str, is_sub_agent)
-      ss.active_tool_calls[tool_call_id] = nil
-      _unregister_retry_tool()
-      local remaining = vim.tbl_count(ss.active_tool_calls)
-      if remaining == 0 then
-        M._on_tools_complete(session_id, is_sub_agent)
-      end
-      if on_complete then
-        on_complete()
-      end
-      return
-    end
 
-    -- 用修正后的参数重新执行原工具
-    local pack_name = tool_pack.get_pack_for_tool(original_tool)
-    local tool_executor = require("NeoAI.tools.tool_executor")
+    -- ===== action = "retry"：覆盖参数重试 =====
+    elseif action == "retry" then
+      -- 检查重试次数
+      local retry_key = session_id .. ":" .. (last_write_tool_name or tool_name)
+      local retry_count = _param_retry_counts[retry_key] or 0
 
-    local execute_fn = function()
-      local normalized_args = tool_executor.execute_with_orchestrator(original_tool, corrected_args, {
-        session_id = session_id,
-        window_id = ss.window_id,
-        generation_id = ss.generation_id,
-        tool_call_id = tool_call_id,
-        pack_name = pack_name,
-      }, {
-        on_result = function(success, result)
-          local s = sessions_table[session_id]
-          if not s then
-            _unregister_retry_tool()
-            if on_complete then
-              on_complete()
-            end
-            return
-          end
+      if retry_count >= 3 then
+        -- 已达重试上限，自动放弃
+        pcall(vim.api.nvim_exec_autocmds, "User", {
+          pattern = event_constants.TOOL_EXECUTION_SUBSTEP,
+          data = {
+            tool_name = substep_tool_name,
+            substep_name = "AI 检查",
+            status = "error",
+            duration = 0,
+            detail = "重试已达上限(3/3)，自动放弃: " .. reason,
+            session_id = session_id,
+          },
+        })
 
-          -- 无论成功还是失败，都移除 _retry_tool
-          _unregister_retry_tool()
+        local result_str = string.format(
+          "[重试已达上限] 工具 '%s' 的参数修正重试已达上限 (3/3)，已自动放弃。\n原因: %s",
+          last_write_tool_name or tool_name,
+          reason
+        )
+        M._add_tool_result_to_messages(session_id, tool_call_id, tool_name, result_str, is_sub_agent)
+      else
+        -- 增加重试计数
+        _param_retry_counts[retry_key] = retry_count + 1
 
-          if success then
-            local result_str = type(result) == "string" and result or vim.json.encode(result) or ""
-            M._add_tool_result_to_messages(session_id, tool_call_id, original_tool, result_str, is_sub_agent, corrected_args)
-            -- 重置该工具的参数修正重试计数
-            local retry_key = session_id .. ":" .. original_tool
-            _param_retry_counts[retry_key] = nil
-          else
-            -- 重试仍然失败，记录错误
-            local err_msg = type(result) == "string" and result or "重试执行失败"
-            local result_str = string.format(
-              "[重试执行失败] 工具 '%s' 使用修正参数后仍然执行失败。\n错误: %s\n\n请检查参数是否正确，或使用其他工具。",
-              original_tool,
-              err_msg
-            )
-            M._add_tool_result_to_messages(session_id, tool_call_id, original_tool, result_str, is_sub_agent, corrected_args)
-          end
+        -- 更新 AI 检查子步骤状态
+        pcall(vim.api.nvim_exec_autocmds, "User", {
+          pattern = event_constants.TOOL_EXECUTION_SUBSTEP,
+          data = {
+            tool_name = substep_tool_name,
+            substep_name = "AI 检查",
+            status = "executing",
+            duration = 0,
+            detail = string.format("AI 正在重试 (%d/3): %s", retry_count + 1, reason),
+            session_id = session_id,
+          },
+        })
 
-          s.active_tool_calls[tool_call_id] = nil
-          local remaining = vim.tbl_count(s.active_tool_calls)
-          if remaining == 0 and s.phase ~= "round_complete" then
-            M._on_tools_complete(session_id, is_sub_agent)
-          end
-          if on_complete then
-            on_complete()
-          end
-        end,
-      })
-    end
-
-    -- 异步执行
-    vim.schedule(function()
-      local s = sessions_table[session_id]
-      if not s or s.stop_requested then
-        _unregister_retry_tool()
-        if on_complete then
-          on_complete()
+        -- 用修正后的参数重新执行原工具（仍然走 AI 预览拦截）
+        local target_tool = last_write_tool_name or tool_name
+        local target_args = corrected_args
+        -- 如果 corrected_args 为空且 last_write_args 存在，使用 last_write_args
+        if not next(corrected_args) and last_write_args then
+          target_args = last_write_args
         end
+
+        local pack_name = tool_pack.get_pack_for_tool(target_tool)
+        local tool_executor = require("NeoAI.tools.tool_executor")
+
+        -- 重新注册 confirm_file_change 工具供 AI 再次确认
+        _register_confirm_tool()
+
+        -- 重新执行（仍然走 AI 预览拦截）
+        local normalized_args = tool_executor.execute_with_orchestrator(target_tool, target_args, {
+          session_id = session_id,
+          window_id = ss.window_id,
+          generation_id = ss.generation_id,
+          tool_call_id = tool_call_id,
+          pack_name = pack_name,
+        }, {
+          on_result = function(success, result)
+            local s = sessions_table[session_id]
+            if not s then
+              _unregister_confirm_tool()
+              if on_complete then on_complete() end
+              return
+            end
+
+            local result_str = type(result) == "string" and result or vim.json.encode(result) or ""
+            M._add_tool_result_to_messages(session_id, tool_call_id, target_tool, result_str, is_sub_agent, normalized_args)
+
+            s.active_tool_calls[tool_call_id] = nil
+            local remaining = vim.tbl_count(s.active_tool_calls)
+            if remaining == 0 and s.phase ~= "round_complete" then
+              M._on_tools_complete(session_id, is_sub_agent)
+            end
+            if on_complete then on_complete() end
+          end,
+        })
+
+        -- 返回（避免后续重复处理）
+        ss.active_tool_calls[tool_call_id] = nil
+        local remaining = vim.tbl_count(ss.active_tool_calls)
+        if remaining == 0 and ss.phase ~= "round_complete" then
+          M._on_tools_complete(session_id, is_sub_agent)
+        end
+        if on_complete then on_complete() end
         return
       end
-      execute_fn()
-    end)
+
+    else
+      -- 未知 action
+      local result_str = string.format(
+        "[无效操作] 未知的操作类型 '%s'，请使用 confirm、abandon 或 retry。",
+        action
+      )
+      M._add_tool_result_to_messages(session_id, tool_call_id, tool_name, result_str, is_sub_agent)
+    end
+
+    ss.active_tool_calls[tool_call_id] = nil
+    local remaining = vim.tbl_count(ss.active_tool_calls)
+    if remaining == 0 and ss.phase ~= "round_complete" then
+      M._on_tools_complete(session_id, is_sub_agent)
+    end
+    if on_complete then
+      on_complete()
+    end
     return
+  end
+
+  -- ===== 如果是 write 工具，注册 confirm_file_change 工具供 AI 调用 =====
+  local tool_executor = require("NeoAI.tools.tool_executor")
+  if tool_executor._is_write_tool(tool_name) then
+    _register_confirm_tool()
+    logger.debug("[tool_orchestrator] write 工具 '%s' 已注册 confirm_file_change 工具等待 AI 确认", tool_name)
   end
 
   -- ===== 普通工具执行 =====
   local pack_name = tool_pack.get_pack_for_tool(tool_name)
-  local tool_executor = require("NeoAI.tools.tool_executor")
 
   local execute_fn = function()
     -- execute_with_orchestrator 返回规范化后的参数
@@ -1200,8 +1340,8 @@ function M._execute_single_tool(session_id, tool_call, is_sub_agent, on_complete
             -- 更新全局兼容计数
             s._param_retry_count = s._param_retry_count + 1
 
-            -- 注册 _retry_tool 到 request_handler，让 AI 通过工具调用传递修正参数
-            _register_retry_tool()
+            -- 注册 confirm_file_change 到 request_handler，让 AI 通过工具调用传递修正参数
+            _register_confirm_tool()
 
             -- 构建工具可用参数提示
             local tool_def = tool_registry.get(tool_name)
@@ -1220,17 +1360,17 @@ function M._execute_single_tool(session_id, tool_call, is_sub_agent, on_complete
 
             local result_str = string.format(
               "[工具执行失败] %s\n\n"
-                .. "请调用 `%s` 工具来修正参数后重试。\n"
+                .. "请调用 `%s` 工具，设置 action=\"retry\" 并传入修正后的 arguments 来重试。\n"
                 .. "传入参数:\n"
-                .. "  - tool_name: \"%s\"\n"
+                .. "  - action: \"retry\"\n"
+                .. "  - reason: \"修正原因\"\n"
                 .. "  - arguments: { ...修正后的参数字段... }\n"
                 .. "你传入的错误参数:\n"
                 .. "%s\n"
                 .. "%s\n"
-                .. "（修正尝试 %d/3）",
+                .. "（修正尝试 %d/3，超过后自动放弃）",
               tostring(result),
-              _RETRY_TOOL_NAME,
-              tool_name,
+              _CONFIRM_TOOL_NAME,
               vim.inspect(normalized_args or tool_func.arguments),
               param_hint,
               _param_retry_counts[retry_key]
@@ -1245,19 +1385,19 @@ function M._execute_single_tool(session_id, tool_call, is_sub_agent, on_complete
             )
 
             logger.debug(
-              "[tool_orchestrator] 工具 '%s' 执行失败，已注册 _retry_tool 等待 AI 修正参数 (尝试 %d/3)",
+              "[tool_orchestrator] 工具 '%s' 执行失败，已注册 confirm_file_change 等待 AI 修正参数 (尝试 %d/3)",
               tool_name,
               _param_retry_counts[retry_key]
             )
           else
-            -- 该工具重试已达上限，直接返回跳过结果，不插入修正提示
+            -- 该工具重试已达上限，自动放弃，不再提示重试
             local skip_msg = string.format(
-              "[工具调用已跳过] 工具 '%s' 的参数修正重试已达上限 (3/3)，已跳过此调用。请使用其他工具或直接返回文本。",
+              "[工具调用已放弃] 工具 '%s' 的参数修正重试已达上限 (3/3)，已自动放弃此修改。",
               tool_name
             )
             M._add_tool_result_to_messages(session_id, tool_call_id, tool_name, skip_msg, is_sub_agent, normalized_args)
             logger.warn(
-              "[tool_orchestrator] 工具 '%s' 参数修正重试已达上限 (3/3)，已跳过该工具调用",
+              "[tool_orchestrator] 工具 '%s' 参数修正重试已达上限 (3/3)，已自动放弃",
               tool_name
             )
           end
@@ -1311,8 +1451,8 @@ function M._on_tools_complete(session_id, is_sub_agent)
     })
   end
 
-  -- 工具执行完毕，清理 _retry_tool（如果 AI 没有调用它而是调用了其他工具）
-  _unregister_retry_tool()
+  -- 工具执行完毕，清理 confirm_file_change（如果 AI 没有调用它而是调用了其他工具）
+  _unregister_confirm_tool()
 
   -- 标记 TOOL_EXECUTION_ALL_COMPLETED 已到达
   ss._tools_all_completed = true
