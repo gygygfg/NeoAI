@@ -463,6 +463,28 @@ local function _replace_text(args, on_success, on_error)
     table.insert(new_lines, lines[i])
   end
   local replacement_lines = vim.split(new_text, "\n", { plain = true })
+
+  -- 保留原始首行缩进：防止替换后缩进丢失
+  local original_indent = lines[replace_start]:match("^(%s*)") or ""
+  if original_indent ~= "" then
+    -- 查找 new_text 中首个非空行，判断是否已包含缩进
+    local first_non_empty = nil
+    for _, rl in ipairs(replacement_lines) do
+      if rl:match("%S") then
+        first_non_empty = rl
+        break
+      end
+    end
+    -- 如果 new_text 首非空行不以原始缩进开头，说明缩进缺失，自动补齐
+    if first_non_empty and not first_non_empty:match("^" .. vim.pesc(original_indent)) then
+      for i, rl in ipairs(replacement_lines) do
+        if rl:match("%S") then
+          replacement_lines[i] = original_indent .. rl
+        end
+      end
+    end
+  end
+
   for _, rl in ipairs(replacement_lines) do
     table.insert(new_lines, rl)
   end
@@ -995,6 +1017,8 @@ local function _list_files(args, on_success, on_error)
   end
 
   local dir = args.dir
+  -- 去掉末尾斜杠，避免路径中出现双斜杠（如 /tmp//file.txt）
+  dir = dir:gsub("/+$", "")
   local pattern = args.pattern or "*"
   local recursive = args.recursive or false
   local max_results = args.max_results
@@ -1004,9 +1028,11 @@ local function _list_files(args, on_success, on_error)
   local all_files = {}
 
   local function done_callback()
-    if on_success then
-      on_success(all_files)
-    end
+    vim.schedule(function()
+      if on_success then
+        on_success(all_files)
+      end
+    end)
   end
 
   if recursive then
@@ -1102,31 +1128,33 @@ local function _search_files(args, on_success, on_error)
     args = grep_args,
     stdio = { nil, stdout_pipe, stderr_pipe },
   }, function(code)
-    safe_close_pipe(stdout_pipe)
-    safe_close_pipe(stderr_pipe)
+    vim.schedule(function()
+      safe_close_pipe(stdout_pipe)
+      safe_close_pipe(stderr_pipe)
 
-    if code == 0 or code == 1 then
-      local output = table.concat(stdout_data, "")
-      for line in output:gmatch("[^\n]+") do
-        local file, line_num, content = line:match("^(.+):(%d+):(.+)$")
-        if file and line_num and content then
-          table.insert(results, { file = file, line = tonumber(line_num), content = content })
-          if max_results and max_results > 0 and #results >= max_results then
-            break
+      if code == 0 or code == 1 then
+        local output = table.concat(stdout_data, "")
+        for line in output:gmatch("[^\n]+") do
+          local file, line_num, content = line:match("^(.+):(%d+):(.+)$")
+          if file and line_num and content then
+            table.insert(results, { file = file, line = tonumber(line_num), content = content })
+            if max_results and max_results > 0 and #results >= max_results then
+              break
+            end
           end
         end
+        if on_success then
+          on_success(results)
+        end
+      else
+        local err_msg = table.concat(stderr_data, ""):gsub("^%s*(.-)%s*$", "%1")
+        if on_error then
+          on_error(
+            string.format("grep 搜索失败 (dir=%s, pattern=%s): %s", dir, search_pattern, err_msg or "未知错误")
+          )
+        end
       end
-      if on_success then
-        on_success(results)
-      end
-    else
-      local err_msg = table.concat(stderr_data, ""):gsub("^%s*(.-)%s*$", "%1")
-      if on_error then
-        on_error(
-          string.format("grep 搜索失败 (dir=%s, pattern=%s): %s", dir, search_pattern, err_msg or "未知错误")
-        )
-      end
-    end
+    end)
   end)
 
   if handle then
@@ -1395,18 +1423,20 @@ local function _delete_file(args, on_success, on_error)
       )
     end
     uv.fs_rmdir(filepath, function(rmdir_err)
-      if rmdir_err then
-        safe_callback(
-          false,
-          string.format(
-            "删除目录失败 %s: %s（目录可能非空，请使用 run_command 执行 rm -rf）",
-            filepath,
-            tostring(rmdir_err)
+      vim.schedule(function()
+        if rmdir_err then
+          safe_callback(
+            false,
+            string.format(
+              "删除目录失败 %s: %s（目录可能非空，请使用 run_command 执行 rm -rf）",
+              filepath,
+              tostring(rmdir_err)
+            )
           )
-        )
-      else
-        safe_callback(true, { filepath = filepath, success = true, type = "directory" })
-      end
+        else
+          safe_callback(true, { filepath = filepath, success = true, type = "directory" })
+        end
+      end)
     end)
   else
     -- 文件使用 uv.fs_unlink
@@ -1442,11 +1472,13 @@ local function _delete_file(args, on_success, on_error)
       )
     end
     uv.fs_unlink(filepath, function(unlink_err)
-      if unlink_err then
-        safe_callback(false, string.format("删除文件失败 %s: %s", filepath, tostring(unlink_err)))
-      else
-        safe_callback(true, { filepath = filepath, success = true, type = "file" })
-      end
+      vim.schedule(function()
+        if unlink_err then
+          safe_callback(false, string.format("删除文件失败 %s: %s", filepath, tostring(unlink_err)))
+        else
+          safe_callback(true, { filepath = filepath, success = true, type = "file" })
+        end
+      end)
     end)
   end
 end

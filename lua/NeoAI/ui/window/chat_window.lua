@@ -91,6 +91,61 @@ local function move_cursor_to_end(win, buf)
   end
 end
 
+--- 折叠新插入的 {{{ ... }}} 折叠区域
+--- 在写入包含折叠标记的内容后调用，确保新插入的折叠文本默认折叠
+--- @param buf number buffer 句柄
+--- @param lines table 刚写入的行列表
+--- @param win_id number|nil 可选，指定目标窗口句柄，默认使用 buf 关联的第一个窗口
+local function _fold_new_markers(buf, lines, win_id)
+  if not buf_valid(buf) then
+    return
+  end
+  -- 检查新写入的行中是否包含折叠开始标记 {{{（在行首）
+  local has_fold_start = false
+  for _, line in ipairs(lines) do
+    if line:find("^{{{") then
+      has_fold_start = true
+      break
+    end
+  end
+  if not has_fold_start then
+    return
+  end
+  -- 使用 vim.schedule 延迟执行，确保内容已完全写入
+  vim.schedule(function()
+    if not buf_valid(buf) then
+      return
+    end
+    -- 优先使用传入的 win_id，否则从 buf 关联的窗口中查找
+    local win = win_id
+    if not win or not vim.api.nvim_win_is_valid(win) then
+      local wins = vim.fn.win_findbuf(buf)
+      if #wins > 0 then
+        win = wins[1]
+      end
+    end
+    if not win or not vim.api.nvim_win_is_valid(win) then
+      return
+    end
+    -- 通过 API 触发 Neovim 重新计算 marker 折叠
+    -- 方法：临时切换 foldmethod 再恢复，强制 Neovim 重新扫描 marker
+    -- 设置 foldlevel=0 确保新 marker 区域默认折叠
+    local saved_level = vim.api.nvim_get_option_value("foldlevel", { win = win })
+    local saved_method = vim.api.nvim_get_option_value("foldmethod", { win = win })
+    vim.api.nvim_set_option_value("foldlevel", 0, { win = win })
+    -- 临时切换到 manual 再切回 marker，强制 Neovim 重新扫描所有 marker 行
+    vim.api.nvim_set_option_value("foldmethod", "manual", { win = win })
+    vim.api.nvim_set_option_value("foldmethod", "marker", { win = win })
+    -- 恢复原 foldlevel，新 marker 区域会保持折叠状态
+    vim.schedule(function()
+      if win and vim.api.nvim_win_is_valid(win) then
+        vim.api.nvim_set_option_value("foldlevel", saved_level, { win = win })
+        vim.api.nvim_set_option_value("foldmethod", saved_method, { win = win })
+      end
+    end)
+  end)
+end
+
 local function fire_event(pattern, data)
   vim.api.nvim_exec_autocmds("User", { pattern = pattern, data = data or {} })
 end
@@ -110,6 +165,9 @@ end
 -- 模块级聊天 buffer 句柄（在 M.open 中初始化，窗口关闭时清空）
 -- 所有添加文本和折叠文本的操作直接使用此变量，不依赖 state.current_window_id
 local _chat_buf = nil
+
+-- 追踪已完成的 generation_id（模块级变量，供事件回调使用）
+local completed_generations = {}
 
 -- 模块状态
 local state = {
@@ -197,7 +255,7 @@ local state = {
   tool_loop_in_progress = false,
 
   -- 流式数据块节流状态
-  --- @type { buffer: string, timer: vim.uv_timer_t|nil, pending: boolean, interval_ms: number }
+  --- @type { buffer: string, timer: table|nil, pending: boolean, interval_ms: number }
   stream_throttle = {
     buffer = "",
     timer = nil,
@@ -921,10 +979,6 @@ function M.render_chat()
 end
 
 --- 将单条消息渲染为文本行列表
---- @param msg table 消息对象 {role, content}
---- @param prev_role string|nil 上一条消息的角色
---- @return table 文本行列表
---- 将单条消息渲染为文本行列表
 --- 注意：返回的每一行都不包含 \n 换行符，由调用方逐行写入缓冲区
 --- @param msg table 消息对象 {role, content}
 --- @param prev_role string|nil 上一条消息的角色
@@ -1278,7 +1332,7 @@ function M._apply_rendered_content(content)
   -- 对聊天 buffer 应用 markdown 语法高亮
   local buf = window_manager.get_window_buf(state.current_window_id)
   if buf and vim.api.nvim_buf_is_valid(buf) then
-    markdown_renderer.apply_highlights(buf)
+    markdown_renderer.apply_highlights(buf, 0)
   end
 
   -- 触发渲染完成事件
@@ -1585,8 +1639,6 @@ function M.sync_keymaps_to_buf(target_buf, exclude_keys)
   end
 end
 
-
-
 --- 退出插入模式（内部函数）
 function M._exit_insert_mode()
   if not state.current_window_id then
@@ -1745,12 +1797,6 @@ end
 --- @return number|nil
 function M.get_chat_buf()
   return state.chat_buf
-end
-
---- 获取当前聊天窗口ID
---- @return string|nil
-function M.get_current_window_id()
-  return state.current_window_id
 end
 
 --- 显示悬浮文本
@@ -2207,7 +2253,7 @@ function M.send_message(message, callback)
     else
       print("✗ 聊天窗口异步消息发送失败: " .. tostring(error_msg or result))
     end
-  end, 0)
+  end, nil)
 
   return true, "聊天窗口异步消息发送任务已启动 (ID: " .. tostring(task_id) .. ")"
 end
@@ -2295,7 +2341,7 @@ end
 --- 持久化消息到存储系统（内部函数）
 --- 通过后端 chat_service 操作
 --- @param role string 角色 ('user' 或 'assistant')
---- @param content string 消息内容
+--- @param content string|table 消息内容
 function M._persist_message(role, content)
   if not chat_service or not chat_service.get_current_session then
     return
@@ -2317,7 +2363,7 @@ end
 --- 更新已持久化的消息
 --- 通过后端 chat_service 操作
 --- @param role string 角色 ('user' 或 'assistant')
---- @param content string 新消息内容
+--- @param content string|table 新消息内容
 function M._update_persisted_message(role, content)
   if not chat_service or not chat_service.get_current_session then
     return
@@ -2495,6 +2541,50 @@ local function find_placeholder_idx()
   return nil
 end
 
+--- 替换缓冲区中指定消息的行（从起始行到末尾或到指定结束行）
+--- 用于流式渲染时更新已追加到缓冲区的消息内容
+--- @param buf number buffer 句柄
+--- @param start_line number 起始行号（0-based）
+--- @param lines table 新行列表
+--- @param end_line number|nil 结束行号（0-based），nil 表示替换到末尾
+local function _replace_message_in_buffer(buf, start_line, lines, end_line)
+  if not buf_valid(buf) then
+    return
+  end
+
+  -- 验证 buffer 是 neoai 类型，防止窗口关闭后写入其他 buffer
+  if not _is_chat_buffer(buf) then
+    return
+  end
+
+  set_buf_modifiable(buf, true)
+  local lc = get_line_count(buf)
+  local replace_end = end_line or lc
+  -- 确保起始行有效
+  if start_line < 0 or start_line > lc then
+    return
+  end
+  -- 如果新行数比旧行数多，需要先扩展；如果少，需要先删除多余行
+  local old_count = replace_end - start_line
+  local new_count = #lines
+  if new_count > old_count then
+    -- 需要插入空行
+    local insert_count = new_count - old_count
+    local insert_lines = {}
+    for _ = 1, insert_count do
+      table.insert(insert_lines, "")
+    end
+    vim.api.nvim_buf_set_lines(buf, replace_end, replace_end, false, insert_lines)
+  elseif new_count < old_count then
+    -- 需要删除多余行
+    local delete_count = old_count - new_count
+    vim.api.nvim_buf_set_lines(buf, replace_end - delete_count, replace_end, false, {})
+  end
+  -- 写入新内容
+  vim.api.nvim_buf_set_lines(buf, start_line, start_line + new_count, false, lines)
+  vim.api.nvim_set_option_value("modified", false, { buf = buf })
+end
+
 --- 设置事件监听器（内部函数）
 function M._setup_event_listeners()
   -- GENERATION_STARTED：关闭虚拟输入框，标记生成进行中
@@ -2513,212 +2603,68 @@ function M._setup_event_listeners()
   -- GENERATION_COMPLETED：处理 AI 响应完成
   vim.api.nvim_create_autocmd("User", {
     pattern = Events.GENERATION_COMPLETED,
-    callback = function(args)
-      local data = args.data or {}
-      if not is_current_window(data.window_id) then
+    callback = function(window_id)
+      -- 优先使用 state.streaming.message_index（第一轮工具循环，流式状态未清空）
+      -- 其次使用 state.tool_display.message_index（后续轮次，TOOL_LOOP_STARTED 已保存）
+      local mi = state.streaming.message_index or state.tool_display.message_index
+      if not mi or not state.messages[mi] then
+        return
+      end
+      local msg = state.messages[mi]
+      -- 使用 _render_single_message 生成行列表
+      local prev_role = nil
+      if mi > 1 then
+        prev_role = state.messages[mi - 1].role
+      end
+      local lines = M._render_single_message(msg, prev_role)
+      if #lines == 0 then
+        return
+      end
+      local buf = _chat_buf
+      if not buf_valid(buf) then
         return
       end
 
-      local response_content = extract_response_content(data.response)
-      local reasoning_text = data.reasoning_text or ""
-      local usage = data.usage or {}
-
-      -- 即使 response_content 为空，如果有 reasoning_text，仍需继续处理
-      -- 因为 reasoning 已通过 _append_reasoning_folded_to_buffer 追加到缓冲区
-      local has_reasoning = reasoning_text ~= ""
-      if not response_content or response_content == "" then
-        if not has_reasoning then
-          close_tool_display()
-          reset_tool_display()
-          reset_streaming_state()
-          state.tool_loop_in_progress = false
-          return
-        end
-        -- 只有 reasoning 没有正文：response_content 保持空字符串
+      -- 验证 buffer 是 neoai 类型，防止窗口关闭后写入其他 buffer
+      if not _is_chat_buffer(buf) then
+        return
       end
 
-      local has_tool_results = state.tool_display.active and #state.tool_display.results > 0
-      local folded_saved = state.tool_display.folded_saved
-      local msg_idx = state.streaming.message_index
-
-      -- 更新消息内容
-      -- content_with_reasoning 使用 Lua table 格式，不再编码为 JSON 字符串
-      -- _render_single_message 已支持直接处理 table 格式
-      local content_with_reasoning = response_content
-      if has_reasoning then
-        content_with_reasoning = {
-          reasoning_content = reasoning_text,
-          content = response_content,
-        }
-      end
-
-      -- 辅助函数：将 content 转为字符串（兼容 table 和 string 格式）
-      local function _content_to_str(c)
-        if type(c) == "table" then
-          return c.content or ""
-        end
-        return tostring(c)
-      end
-
-      if msg_idx and state.messages[msg_idx] then
-        if folded_saved then
-          local folded_idx = find_folded_msg_idx()
-          if folded_idx then
-            local append_content = has_reasoning and content_with_reasoning or response_content
-            local folded_str = _content_to_str(state.messages[folded_idx].content)
-            local append_str = _content_to_str(append_content)
-            local separator = (append_str ~= "") and "\n\n" or ""
-            state.messages[folded_idx].content = folded_str .. separator .. append_str
-            if msg_idx ~= folded_idx then
-              table.remove(state.messages, msg_idx)
-            end
-            -- 折叠文本已通过 TOOL_EXECUTION_COMPLETED 逐工具渲染到缓冲区
-            -- AI 正文如果是流式返回的，已通过 STREAM_CHUNK 渲染到缓冲区
-            -- 此处只更新 state.messages，不再调用 _render_streaming_message 重新渲染
-            -- 避免 _render_streaming_message 使用 message_start_line 替换时
-            -- 将折叠文本插入到正文区域之前导致内容重复
-            state.streaming.message_index = folded_idx
-            -- folded_saved=true 时，正文已通过 TOOL_EXECUTION_COMPLETED 逐工具渲染到缓冲区
-            -- 不再调用 _append_message_to_buffer，避免重复追加
-            -- （原条件 state.streaming.generation_id ~= data.generation_id 在 TOOL_LOOP_STARTED
-            --  清空 generation_id 后恒为 true，导致流式场景也错误追加）
-          else
-            state.messages[msg_idx].content = content_with_reasoning
-            M._render_streaming_message(data.window_id)
-          end
-        elseif has_tool_results then
-          local folded = M._build_tool_folded_text(state.tool_display.results)
-          local append_str = _content_to_str(content_with_reasoning)
-          local separator = (append_str ~= "") and "\n\n" or ""
-          state.messages[msg_idx].content = (folded ~= "" and folded .. separator or "") .. append_str
-        else
-          state.messages[msg_idx].content = content_with_reasoning
-        end
-      else
-        if folded_saved then
-          local folded_idx = find_folded_msg_idx()
-          if folded_idx then
-            local append_content = has_reasoning and content_with_reasoning or response_content
-            local folded_str = _content_to_str(state.messages[folded_idx].content)
-            local append_str = _content_to_str(append_content)
-            local separator = (append_str ~= "") and "\n\n" or ""
-            state.messages[folded_idx].content = folded_str .. separator .. append_str
-            -- 折叠文本已通过 TOOL_EXECUTION_COMPLETED 逐工具渲染到缓冲区
-            -- 此处只更新 state.messages，不再调用 _render_streaming_message 重新渲染
-            state.streaming.message_index = folded_idx
-            -- folded_saved=true 时，正文已通过 TOOL_EXECUTION_COMPLETED 逐工具渲染到缓冲区
-            -- 不再调用 _append_message_to_buffer，避免重复追加
-            -- （原条件 state.streaming.generation_id ~= data.generation_id 在 TOOL_LOOP_STARTED
-            --  清空 generation_id 后恒为 true，导致流式场景也错误追加）
-          else
-            table.insert(
-              state.messages,
-              { role = "assistant", content = content_with_reasoning, timestamp = os.time() }
-            )
-          end
-        elseif has_tool_results then
-          local folded = M._build_tool_folded_text(state.tool_display.results)
-          local append_str = _content_to_str(content_with_reasoning)
-          local separator = (append_str ~= "") and "\n\n" or ""
-          local final = (folded ~= "" and folded .. separator or "") .. append_str
-          table.insert(state.messages, { role = "assistant", content = final, timestamp = os.time() })
-          -- 触发渲染显示新消息
-          state.streaming.message_index = #state.messages
-          M._render_streaming_message(data.window_id)
-        else
-          local placeholder_idx = find_placeholder_idx()
-          if placeholder_idx then
-            table.remove(state.messages, placeholder_idx)
-          end
-          M.add_message("assistant", content_with_reasoning, { skip_render = true, skip_event = true })
-        end
-      end
-
-      -- 将最终内容保存到 history_manager（确保包含折叠文本的完整内容被持久化）
-      -- 通过 HISTORY_SAVE_FINAL 事件通知 history_saver 异步保存
-      local final_entry = M._save_final_content_to_history(data)
-      if final_entry then
-        vim.api.nvim_exec_autocmds("User", {
-          pattern = "NeoAI:history_save_final",
-          data = {
-            session_id = data.session_id,
-            content = final_entry.content,
-            reasoning_content = final_entry.reasoning_content,
-            usage = data.usage or {},
-          },
-        })
-      end
-
-      -- 在清理状态之前，保存 folded_saved 的值供 had_stream_prefix 判断使用
-      -- folded_saved 为 true 表示工具折叠文本已通过 TOOL_EXECUTION_COMPLETED 逐工具渲染到缓冲区
-      -- 应视为已有流式内容，避免 _append_message_to_buffer 追加整个消息导致折叠文本重复
-      local _had_folded_saved = state.tool_display.folded_saved
-
-      -- 清理状态
-      state.tool_display.folded_saved = false
-      if has_tool_results then
-        reset_tool_display()
-      end
-      if usage and next(usage) then
-        state.last_usage = usage
-      end
-
-      cancel_reasoning_timer()
-      close_reasoning_display()
-      if state.tool_display.active then
-        close_tool_display()
-        reset_tool_display()
-        state.tool_display._finished = false
-      end
-      clear_stream_throttle()
-      -- 通过 tool_display_component 清理流式工具预览状态
-      tool_display_component.clear_streaming_preview()
-      -- 同步更新本地状态
-      state.tool_display.streaming_preview.timer = nil
-      state.tool_display.streaming_preview.generation_id = nil
-      state.tool_display.streaming_preview.tools = {}
-      state.tool_display.streaming_preview.window_shown = false
-      state.tool_display.streaming_preview._last_buffer = ""
-
-      -- 保存流式状态，用于判断是否需要增量更新
-      -- 注意：reasoning_done 为 true 表示思考过程折叠文本已通过 _append_reasoning_folded_to_buffer 追加到缓冲区
-      -- 此时即使 prefix_added 为 false（只有思考没有正文），也应视为已有流式内容，避免重复追加
-      -- _had_folded_saved 为 true 表示工具折叠文本已通过 TOOL_EXECUTION_COMPLETED 逐工具渲染到缓冲区
-      -- 同样应视为已有流式内容，避免 _append_message_to_buffer 追加整个消息导致折叠文本重复
-      local had_stream_prefix = state.streaming.prefix_added
-        or state.streaming.reasoning_prefix_added
-        or state.streaming.reasoning_done
-        or _had_folded_saved
-      state.tool_display.active = false
-      reset_streaming_state()
-      state.tool_loop_in_progress = false
-      state.generation_in_progress = false
-
-      -- 增量更新：仅当没有流式数据时（非流式总结），才追加完整消息到缓冲区
-      -- 如果总结内容已通过流式方式追加，跳过以避免重复
-      if not had_stream_prefix then
-        local last = state.messages[#state.messages]
-        if last and last.role == "assistant" then
-          M._append_message_to_buffer("assistant", last.content, data.window_id)
-        end
-      end
-
-      M._update_usage_virt_text()
-      -- 先主动检测光标位置，确保协程共享的 should_follow 是最新值
+      -- 在修改 buffer 内容之前缓存光标位置
       _check_cursor_near_end()
-      -- 注意：直接使用模块级 state.should_follow，避免通过协程共享表读取
-      -- 事件回调不在协程上下文中，state_manager.get_shared_value 会返回默认值
-      if state.should_follow then
-        -- 光标在末尾附近：执行跟随并打开输入框
-        _do_cursor_follow()
-        M._open_float_input()
-        if virtual_input.is_active() then
-          virtual_input.focus_and_insert()
-        end
-      else
-        -- 光标不在末尾附近：打开输入框但不聚焦
-        M._open_float_input()
+      -- 获取起始行：优先 streaming.message_start_line，其次 tool_display.message_start_line
+      -- 但 tool_display.message_start_line 必须是同一消息的起始行，否则不能使用
+      -- 防止新一轮生成时错误地使用上一轮工具循环的 message_start_line
+      local start_line = state.streaming.message_start_line
+      if not start_line and state.tool_display.message_index == mi then
+        start_line = state.tool_display.message_start_line
       end
+      if start_line then
+        -- 已有起始行：替换从起始行到末尾的内容
+        _replace_message_in_buffer(buf, start_line, lines, nil)
+      else
+        -- 没有起始行：追加到缓冲区末尾
+        set_buf_modifiable(buf, true)
+        local lc = get_line_count(buf)
+        vim.api.nvim_buf_set_lines(buf, lc, lc, false, lines)
+        vim.api.nvim_set_option_value("modified", false, { buf = buf })
+        -- 记录起始行
+        state.streaming.message_start_line = lc
+      end
+      -- 折叠新插入的 {{{ ... }}} 折叠区域
+      -- 使用 _chat_buf 关联的窗口
+      local wins = vim.fn.win_findbuf(buf)
+      local win = #wins > 0 and wins[1] or nil
+      _fold_new_markers(buf, lines, win)
+
+      -- 对渲染的消息应用 markdown 语法高亮
+      vim.schedule(function()
+        if buf and vim.api.nvim_buf_is_valid(buf) then
+          markdown_renderer.apply_highlights(buf, 0)
+        end
+      end)
+
+      _schedule_cursor_follow()
     end,
   })
 
@@ -2782,9 +2728,6 @@ function M._setup_event_listeners()
       M._append_stream_chunk_to_buffer(chunk_content, nil, data.window_id)
     end,
   })
-
-  -- 追踪已完成的 generation_id
-  local completed_generations = {}
 
   -- REASONING_CONTENT：思考内容
   vim.api.nvim_create_autocmd("User", {
@@ -3697,64 +3640,9 @@ function M.update_message(index, content)
   return true
 end
 
---- 折叠新插入的 {{{ ... }}} 折叠区域
---- 在写入包含折叠标记的内容后调用，确保新插入的折叠文本默认折叠
---- @param buf number buffer 句柄
---- @param lines table 刚写入的行列表
---- @param win_id number|nil 可选，指定目标窗口句柄，默认使用 buf 关联的第一个窗口
-local function _fold_new_markers(buf, lines, win_id)
-  if not buf_valid(buf) then
-    return
-  end
-  -- 检查新写入的行中是否包含折叠开始标记 {{{（在行首）
-  local has_fold_start = false
-  for _, line in ipairs(lines) do
-    if line:find("^{{{") then
-      has_fold_start = true
-      break
-    end
-  end
-  if not has_fold_start then
-    return
-  end
-  -- 使用 vim.schedule 延迟执行，确保内容已完全写入
-  vim.schedule(function()
-    if not buf_valid(buf) then
-      return
-    end
-    -- 优先使用传入的 win_id，否则从 buf 关联的窗口中查找
-    local win = win_id
-    if not win or not vim.api.nvim_win_is_valid(win) then
-      local wins = vim.fn.win_findbuf(buf)
-      if #wins > 0 then
-        win = wins[1]
-      end
-    end
-    if not win or not vim.api.nvim_win_is_valid(win) then
-      return
-    end
-    -- 通过 API 触发 Neovim 重新计算 marker 折叠
-    -- 方法：临时切换 foldmethod 再恢复，强制 Neovim 重新扫描 marker
-    -- 设置 foldlevel=0 确保新 marker 区域默认折叠
-    local saved_level = vim.api.nvim_get_option_value("foldlevel", { win = win })
-    local saved_method = vim.api.nvim_get_option_value("foldmethod", { win = win })
-    vim.api.nvim_set_option_value("foldlevel", 0, { win = win })
-    -- 临时切换到 manual 再切回 marker，强制 Neovim 重新扫描所有 marker 行
-    vim.api.nvim_set_option_value("foldmethod", "manual", { win = win })
-    vim.api.nvim_set_option_value("foldmethod", "marker", { win = win })
-    -- 恢复原 foldlevel，新 marker 区域会保持折叠状态
-    vim.schedule(function()
-      if win and vim.api.nvim_win_is_valid(win) then
-        vim.api.nvim_set_option_value("foldlevel", saved_level, { win = win })
-        vim.api.nvim_set_option_value("foldmethod", saved_method, { win = win })
-      end
-    end)
-  end)
-end
-
 --- 将单条消息增量追加到缓冲区末尾（避免全量重渲染）
 --- @param role string 角色 ('user' 或 'assistant')
---- @param content string 消息内容
+--- @param content string|table 消息内容
 --- @param window_id string|nil 可选，指定目标窗口 ID，默认使用 state.current_window_id
 function M._append_message_to_buffer(role, content, window_id)
   if not content then
@@ -3812,57 +3700,13 @@ function M._append_message_to_buffer(role, content, window_id)
     -- 跳过折叠文本，只对普通消息内容应用高亮
     vim.schedule(function()
       if buf and vim.api.nvim_buf_is_valid(buf) then
-        markdown_renderer.apply_highlights(buf)
+        markdown_renderer.apply_highlights(buf, 0)
       end
     end)
   end
 
   -- 执行光标跟随（使用协程共享表 should_follow 缓存值）
   _schedule_cursor_follow()
-end
-
---- 替换缓冲区中指定消息的行（从起始行到末尾或到指定结束行）
---- 用于流式渲染时更新已追加到缓冲区的消息内容
---- @param buf number buffer 句柄
---- @param start_line number 起始行号（0-based）
---- @param lines table 新行列表
---- @param end_line number|nil 结束行号（0-based），nil 表示替换到末尾
-local function _replace_message_in_buffer(buf, start_line, lines, end_line)
-  if not buf_valid(buf) then
-    return
-  end
-
-  -- 验证 buffer 是 neoai 类型，防止窗口关闭后写入其他 buffer
-  if not _is_chat_buffer(buf) then
-    return
-  end
-
-  set_buf_modifiable(buf, true)
-  local lc = get_line_count(buf)
-  local replace_end = end_line or lc
-  -- 确保起始行有效
-  if start_line < 0 or start_line > lc then
-    return
-  end
-  -- 如果新行数比旧行数多，需要先扩展；如果少，需要先删除多余行
-  local old_count = replace_end - start_line
-  local new_count = #lines
-  if new_count > old_count then
-    -- 需要插入空行
-    local insert_count = new_count - old_count
-    local insert_lines = {}
-    for _ = 1, insert_count do
-      table.insert(insert_lines, "")
-    end
-    vim.api.nvim_buf_set_lines(buf, replace_end, replace_end, false, insert_lines)
-  elseif new_count < old_count then
-    -- 需要删除多余行
-    local delete_count = old_count - new_count
-    vim.api.nvim_buf_set_lines(buf, replace_end - delete_count, replace_end, false, {})
-  end
-  -- 写入新内容
-  vim.api.nvim_buf_set_lines(buf, start_line, start_line + new_count, false, lines)
-  vim.api.nvim_set_option_value("modified", false, { buf = buf })
 end
 
 --- 使用 _render_single_message 渲染当前流式消息并替换缓冲区中的对应行
@@ -3898,10 +3742,16 @@ local function _render_streaming_message(window_id)
 
   -- 在修改 buffer 内容之前缓存光标位置
   _check_cursor_near_end()
-  local start_line = state.streaming.message_start_line or state.tool_display.message_start_line
+  -- 获取起始行：优先 streaming.message_start_line，其次 tool_display.message_start_line
+  -- 但 tool_display.message_start_line 必须是同一消息的起始行，否则不能使用
+  -- 防止新一轮生成时错误地使用上一轮工具循环的 message_start_line
+  local start_line = state.streaming.message_start_line
+  if not start_line and state.tool_display.message_index == mi then
+    start_line = state.tool_display.message_start_line
+  end
   if start_line then
     -- 已有起始行：替换从起始行到末尾的内容
-    _replace_message_in_buffer(buf, start_line, lines)
+    _replace_message_in_buffer(buf, start_line, lines, nil)
   else
     -- 没有起始行：追加到缓冲区末尾
     set_buf_modifiable(buf, true)
@@ -3920,7 +3770,7 @@ local function _render_streaming_message(window_id)
   -- 对渲染的消息应用 markdown 语法高亮
   vim.schedule(function()
     if buf and vim.api.nvim_buf_is_valid(buf) then
-      markdown_renderer.apply_highlights(buf)
+      markdown_renderer.apply_highlights(buf, 0)
     end
   end)
 
@@ -4230,7 +4080,7 @@ end
 --- 由 history_saver 模块通过事件监听统一处理（队列异步写入，保证原子性）
 --- 此函数仅负责构建最终内容字符串，不再直接调用 add_assistant_entry
 --- @param data table GENERATION_COMPLETED 事件数据
---- @return string|nil 构建的最终内容（供 saver 使用），nil 表示无需保存
+--- @return table|nil 构建的最终内容（供 saver 使用），nil 表示无需保存
 function M._save_final_content_to_history(data)
   local session_id = data.session_id
   if not session_id then
@@ -4255,6 +4105,7 @@ function M._save_final_content_to_history(data)
   local folded_saved = state.tool_display.folded_saved
 
   -- 构建最终内容：优先从 state.messages 中获取已合并的完整内容（含折叠文本+AI回复）
+  --- @type string|table
   local final_content = response_content
   if has_tool_results or folded_saved then
     local last_assistant_content = M.get_last_assistant_content()
@@ -4323,5 +4174,3 @@ function M._set_cursor_follow_should(should)
 end
 
 return M
-
-

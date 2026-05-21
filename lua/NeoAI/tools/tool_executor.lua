@@ -1492,13 +1492,11 @@ function M._intercept_write_tool_result(tool_name, resolved_args, raw_args, orig
 %s
 
 === 操作说明 ===
-AI 需要检查上述修改是否符合预期。
+文件已被修改。AI 需要检查上述修改是否符合预期。
 
-- 如果确认修改正确，请调用 `confirm_file_change` 工具，设置 confirmed=true，并说明原因。
-- 如果发现参数有误，可以直接调用其他编辑工具（如 replace_text、insert_edit_into_file 等）来覆盖参数重新执行。
-- 如果拒绝修改，请调用 `confirm_file_change` 工具，设置 confirmed=false，并说明原因。
-
-注意：在 AI 确认之前，文件不会被实际修改。]],
+- 如果确认修改正确，修改将保留。无需额外操作。
+- 如果发现修改有误，请直接调用其他编辑工具（如 replace_text、edit_node 等）再次修正文件。
+- 如果希望撤销修改，可使用 git_rollback 工具恢复文件到修改前状态。]],
     tool_name,
     filepath,
     file_context

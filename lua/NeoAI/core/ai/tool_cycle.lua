@@ -1014,23 +1014,17 @@ function M._execute_single_tool(session_id, tool_call, is_sub_agent, on_complete
           local param_retry_count = s._param_retry_count or 0
           if param_retry_count < 3 then
             s._param_retry_count = param_retry_count + 1
-            -- 注册 confirm_file_change 到 request_handler，让 AI 通过工具调用传递修正参数
-            _register_confirm_tool()
             local combined_msg = string.format(
               "[工具执行失败] %s\n\n"
-                .. "请调用 `%s` 工具，设置 action=\"retry\" 并传入修正后的 arguments 来重试。\n"
-                .. "传入参数:\n"
-                .. "  - action: \"retry\"\n"
-                .. "  - reason: \"修正原因\"\n"
-                .. "  - arguments: { ...修正后的参数字段... }\n"
-                .. "（修正尝试 %d/3）",
+                .. "请直接重新调用工具 `%s`，使用修正后的参数重试。\n"
+                .. "（修正尝试 %d/3，超过后自动放弃）",
               err_msg,
-              _CONFIRM_TOOL_NAME,
+              tool_name,
               s._param_retry_count
             )
             M._add_tool_result_to_messages(session_id, tool_call_id, tool_name, combined_msg, is_sub_agent, normalized_args)
             logger.debug(
-              "[tool_orchestrator] 工具 '%s' 执行失败，已注册 confirm_file_change 等待 AI 修正参数 (尝试 %d/3)",
+              "[tool_orchestrator] 工具 '%s' 执行失败，等待 AI 修正参数重试 (尝试 %d/3)",
               tool_name,
               s._param_retry_count
             )
@@ -1360,17 +1354,13 @@ function M._execute_single_tool(session_id, tool_call, is_sub_agent, on_complete
 
             local result_str = string.format(
               "[工具执行失败] %s\n\n"
-                .. "请调用 `%s` 工具，设置 action=\"retry\" 并传入修正后的 arguments 来重试。\n"
-                .. "传入参数:\n"
-                .. "  - action: \"retry\"\n"
-                .. "  - reason: \"修正原因\"\n"
-                .. "  - arguments: { ...修正后的参数字段... }\n"
+                .. "请直接重新调用工具 `%s`，使用修正后的参数重试。\n"
                 .. "你传入的错误参数:\n"
                 .. "%s\n"
                 .. "%s\n"
                 .. "（修正尝试 %d/3，超过后自动放弃）",
               tostring(result),
-              _CONFIRM_TOOL_NAME,
+              tool_name,
               vim.inspect(normalized_args or tool_func.arguments),
               param_hint,
               _param_retry_counts[retry_key]
@@ -1385,7 +1375,7 @@ function M._execute_single_tool(session_id, tool_call, is_sub_agent, on_complete
             )
 
             logger.debug(
-              "[tool_orchestrator] 工具 '%s' 执行失败，已注册 confirm_file_change 等待 AI 修正参数 (尝试 %d/3)",
+              "[tool_orchestrator] 工具 '%s' 执行失败，等待 AI 修正参数重试 (尝试 %d/3)",
               tool_name,
               _param_retry_counts[retry_key]
             )

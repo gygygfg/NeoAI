@@ -153,9 +153,7 @@ local function ensure_parser_installed(lang, on_success, on_error)
 
   -- 尝试通过 nvim-treesitter 安装
   -- 优先使用 vim.treesitter.language.add（Neovim 0.12 内置 API）
-  local has_language_add = pcall(function()
-    return type(vim.treesitter.language.add) == "function"
-  end)
+  local has_language_add = pcall(vim.treesitter.language.add, lang)
 
   if has_language_add then
     -- 使用内置 API 添加/安装语言
@@ -244,30 +242,36 @@ local function read_file_content_async(filepath, on_success, on_error)
   local abs_path = vim.fn.fnamemodify(filepath, ":p")
   vim.uv.fs_open(abs_path, "r", 438, function(open_err, fd)
     if open_err or not fd then
-      if on_error then
-        on_error("无法读取文件: " .. (open_err or "未知错误"))
-      end
+      vim.schedule(function()
+        if on_error then
+          on_error("无法读取文件: " .. (open_err or "未知错误"))
+        end
+      end)
       return
     end
     vim.uv.fs_fstat(fd, function(stat_err, stat)
       if stat_err or not stat then
         vim.uv.fs_close(fd)
-        if on_error then
-          on_error("无法读取文件: " .. (stat_err or "无法获取文件信息"))
-        end
+        vim.schedule(function()
+          if on_error then
+            on_error("无法读取文件: " .. (stat_err or "无法获取文件信息"))
+          end
+        end)
         return
       end
       vim.uv.fs_read(fd, stat.size, 0, function(read_err, data)
         vim.uv.fs_close(fd)
-        if read_err or not data then
-          if on_error then
-            on_error("无法读取文件: " .. (read_err or "未知错误"))
+        vim.schedule(function()
+          if read_err or not data then
+            if on_error then
+              on_error("无法读取文件: " .. (read_err or "未知错误"))
+            end
+            return
           end
-          return
-        end
-        if on_success then
-          on_success(data)
-        end
+          if on_success then
+            on_success(data)
+          end
+        end)
       end)
     end)
   end)
@@ -1468,8 +1472,7 @@ local function _delete_node(args, on_success, on_error)
     if args.index ~= nil then
       local idx = tonumber(args.index)
       if not idx or idx < 1 or idx > #deletable then
-        local msg = "index 参数无效: " .. tostring(args.index) .. "。"
-          .. "有效范围: 1 ~ " .. #deletable
+        local msg = "index 参数无效: " .. tostring(args.index) .. "。" .. "有效范围: 1 ~ " .. #deletable
         if on_error then
           finalize_with_timeout(msg, true)
         end
@@ -1482,13 +1485,21 @@ local function _delete_node(args, on_success, on_error)
       -- 多个匹配但未指定 index，返回错误和所有匹配节点信息
       local details = {}
       for i, node in ipairs(deletable) do
-        table.insert(details, string.format(
-          "  [%d] 类型: %s, 文本: %s, 位置: 行 %d-%d",
-          i, node.type, node.text:gsub("\n", "\\n"):sub(1, 60),
-          node.start_row + 1, node.end_row + 1
-        ))
+        table.insert(
+          details,
+          string.format(
+            "  [%d] 类型: %s, 文本: %s, 位置: 行 %d-%d",
+            i,
+            node.type,
+            node.text:gsub("\n", "\\n"):sub(1, 60),
+            node.start_row + 1,
+            node.end_row + 1
+          )
+        )
       end
-      local msg = "匹配到 " .. #deletable .. " 个节点，请使用 index 参数指定要删除第几个:\n"
+      local msg = "匹配到 "
+        .. #deletable
+        .. " 个节点，请使用 index 参数指定要删除第几个:\n"
         .. table.concat(details, "\n")
       if on_error then
         finalize_with_timeout(msg, true)
@@ -1721,14 +1732,17 @@ M.delete_node = {
       node_type = { type = "string", description = "节点类型过滤（可选），如 'function_definition'" },
       text = { type = "string", description = "节点文本过滤（可选）" },
       named = { type = "boolean", description = "是否为命名节点（可选）" },
-      index = { type = "number", description = "匹配节点序号（可选，从1开始），仅一个匹配时可省略，多个匹配时必须指定" },
+      index = {
+        type = "number",
+        description = "匹配节点序号（可选，从1开始），仅一个匹配时可省略，多个匹配时必须指定",
+      },
     },
     required = { "filepath" },
   },
   returns = { type = "object", description = "删除结果，包含被删除的节点信息" },
   category = "treesitter",
+  permissions = { write = true },
 }
-
 
 -- ============================================================================
 -- 工具 edit_node - 修改指定语法树节点的内容（回调模式）
@@ -1846,10 +1860,25 @@ local function _edit_node(args, on_success, on_error)
       local new_first_line = new_content_lines_raw[1] or ""
       local new_indent = new_first_line:match("^(%s*)") or ""
 
+      -- 计算节点体缩进（body indent）：对于多行节点（如 function_definition），
+      -- 节点体行（body lines）的缩进通常比首行（如 def 行）更深一级。
+      -- 需要检测实际的 body 缩进，而非简单使用首行缩进。
+      local body_indent = original_indent
+      if sr < er then
+        -- 多行节点：查找第一条非空 body 行的缩进
+        for i = sr + 1, er do
+          local body_line = file_lines[i + 1] or ""
+          if not body_line:match("^%s*$") then
+            body_indent = body_line:match("^(%s*)") or original_indent
+            break
+          end
+        end
+      end
+
       -- 自动缩进调整：对齐新内容到原节点的缩进级别
       -- 原理：原节点首行缩进（original_indent）由 before 前缀在替换逻辑中提供，
       -- 因此首行只需剥离 new_indent，不额外添加 original_indent；
-      -- 而后续行需要 original_indent 来保持与首行的相对缩进关系。
+      -- 而后续行需要使用 body_indent 来保持正确的相对缩进关系。
       local adjusted_content = new_content
       if #new_content_lines_raw > 0 then
         local adjusted_lines = {}
@@ -1862,9 +1891,9 @@ local function _edit_node(args, on_success, on_error)
             local stripped = line:gsub("^" .. vim.pesc(new_indent), "")
             table.insert(adjusted_lines, stripped)
           else
-            -- 后续行：剥离 new_indent，添加 original_indent 保持相对缩进
+            -- 后续行：剥离 new_indent，添加 body_indent 保持正确的相对缩进
             local stripped = line:gsub("^" .. vim.pesc(new_indent), "")
-            table.insert(adjusted_lines, original_indent .. stripped)
+            table.insert(adjusted_lines, body_indent .. stripped)
           end
         end
         adjusted_content = table.concat(adjusted_lines, "\n")
