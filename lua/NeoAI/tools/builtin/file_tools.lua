@@ -10,6 +10,37 @@ local block_node_types = neovim_tree.block_node_types or {}
 local log_tools = require("NeoAI.tools.builtin.log_tools")
 
 -- ============================================================================
+-- 并发读取队列：防止多个 read_file 同时执行导致主线程卡顿
+-- ============================================================================
+local read_queue = {}
+local read_queue_active = false
+
+local function process_read_queue()
+  if read_queue_active or #read_queue == 0 then
+    return
+  end
+  read_queue_active = true
+  local task = table.remove(read_queue, 1)
+  vim.schedule(function()
+    task()
+  end)
+end
+
+local function enqueue_read(task_fn)
+  table.insert(read_queue, task_fn)
+  if not read_queue_active then
+    process_read_queue()
+  end
+end
+
+local function dequeue_read()
+  read_queue_active = false
+  if #read_queue > 0 then
+    process_read_queue()
+  end
+end
+
+-- ============================================================================
 -- 工具 read_file
 -- ============================================================================
 
@@ -26,120 +57,134 @@ local function _read_file(args, on_success, on_error)
   local end_line = args.end_line or args["end"] or -1
   local is_full_file = (start_line == 1) and (end_line == -1)
 
-  local function build_structure_overview(file_path, tree_result)
-    local overview_lines = {}
-    table.insert(
-      overview_lines,
-      string.format("📋 文件结构概览 (%s, 共 %d 行)", file_path, tree_result.line_count)
-    )
-    table.insert(overview_lines, "=" .. string.rep("=", 60))
+  -- 将实际读取逻辑包装为任务函数，放入并发队列串行执行
+  local function do_read()
+    local function build_structure_overview(file_path, tree_result)
+      local overview_lines = {}
+      table.insert(
+        overview_lines,
+        string.format("📋 文件结构概览 (%s, 共 %d 行)", file_path, tree_result.line_count)
+      )
+      table.insert(overview_lines, "=" .. string.rep("=", 60))
 
-    local function extract_name(node)
-      local text = node.text:match("^[^\n]+") or node.text
-      if node.type == "function_definition" or node.type == "method_definition" then
-        local py_name = text:match("def%s+([%w_]+)%s*%(")
-        if py_name then
-          return py_name
+      local function extract_name(node)
+        local text = node.text:match("^[^\n]+") or node.text
+        if node.type == "function_definition" or node.type == "method_definition" then
+          local py_name = text:match("def%s+([%w_]+)%s*%(")
+          if py_name then
+            return py_name
+          end
+          local lua_name = text:match("function%s+([%w_.:]+)")
+          if lua_name then
+            return lua_name
+          end
+          local js_name = text:match("function%s+([%w_]+)")
+          if js_name then
+            return js_name
+          end
+          local js_arrow = text:match("([%w_]+)%s*=%s*function")
+          if js_arrow then
+            return js_arrow
+          end
+          local js_arrow2 = text:match("([%w_]+)%s*=%s*%(")
+          if js_arrow2 then
+            return js_arrow2
+          end
+        elseif node.type == "class_definition" or node.type == "class_declaration" then
+          local py_class = text:match("class%s+([%w_]+)")
+          if py_class then
+            return py_class
+          end
+          local js_class = text:match("class%s+([%w_]+)")
+          if js_class then
+            return js_class
+          end
+          local lua_class = text:match("([%w_]+)%s*=%s*")
+          if lua_class then
+            return lua_class
+          end
         end
-        local lua_name = text:match("function%s+([%w_.:]+)")
-        if lua_name then
-          return lua_name
-        end
-        local js_name = text:match("function%s+([%w_]+)")
-        if js_name then
-          return js_name
-        end
-        local js_arrow = text:match("([%w_]+)%s*=%s*function")
-        if js_arrow then
-          return js_arrow
-        end
-        local js_arrow2 = text:match("([%w_]+)%s*=%s*%(")
-        if js_arrow2 then
-          return js_arrow2
-        end
-      elseif node.type == "class_definition" or node.type == "class_declaration" then
-        local py_class = text:match("class%s+([%w_]+)")
-        if py_class then
-          return py_class
-        end
-        local js_class = text:match("class%s+([%w_]+)")
-        if js_class then
-          return js_class
-        end
-        local lua_class = text:match("([%w_]+)%s*=%s*")
-        if lua_class then
-          return lua_class
-        end
+        return text
       end
-      return text
-    end
 
-    local structures = {}
-    for _, node in ipairs(tree_result.nodes) do
-      if block_node_types[node.type] and node.depth <= 4 then
-        local name = extract_name(node)
-        table.insert(structures, {
-          label = node.type,
-          name = name,
-          depth = node.depth,
-          start_row = node.start_row,
-          end_row = node.end_row,
-        })
-      end
-    end
-
-    if #structures == 0 then
+      local structures = {}
       for _, node in ipairs(tree_result.nodes) do
-        if node.depth <= 2 and node.named then
+        if block_node_types[node.type] and node.depth <= 4 then
+          local name = extract_name(node)
           table.insert(structures, {
             label = node.type,
-            name = (node.text:match("^[^\n]+") or node.text):sub(1, 60),
+            name = name,
             depth = node.depth,
             start_row = node.start_row,
             end_row = node.end_row,
           })
         end
       end
-    end
 
-    table.sort(structures, function(a, b)
-      if a.depth ~= b.depth then
-        return a.depth < b.depth
+      if #structures == 0 then
+        for _, node in ipairs(tree_result.nodes) do
+          if node.depth <= 2 and node.named then
+            table.insert(structures, {
+              label = node.type,
+              name = (node.text:match("^[^\n]+") or node.text):sub(1, 60),
+              depth = node.depth,
+              start_row = node.start_row,
+              end_row = node.end_row,
+            })
+          end
+        end
       end
-      return a.start_row < b.start_row
-    end)
 
-    for _, s in ipairs(structures) do
-      local indent = string.rep("  ", s.depth)
-      local line_range = string.format("行 %d-%d", s.start_row + 1, s.end_row + 1)
-      table.insert(overview_lines, string.format("%s[%s] %s (%s)", indent, s.label, s.name, line_range))
+      table.sort(structures, function(a, b)
+        if a.depth ~= b.depth then
+          return a.depth < b.depth
+        end
+        return a.start_row < b.start_row
+      end)
+
+      for _, s in ipairs(structures) do
+        local indent = string.rep("  ", s.depth)
+        local line_range = string.format("行 %d-%d", s.start_row + 1, s.end_row + 1)
+        table.insert(overview_lines, string.format("%s[%s] %s (%s)", indent, s.label, s.name, line_range))
+      end
+
+      return table.concat(overview_lines, "\n")
     end
 
-    return table.concat(overview_lines, "\n")
-  end
+    local function on_content(content)
+      -- 使用 split 保留空行，确保行号与 wc -l 一致
+      local all_lines = vim.split(content, "\n", { plain = true })
+      -- 如果文件末尾有换行符，split 会产生一个空字符串作为最后元素，去掉它
+      if #all_lines > 0 and all_lines[#all_lines] == "" then
+        table.remove(all_lines)
+      end
+      local total_lines = #all_lines
 
-  local function on_content(content)
-    -- 使用 split 保留空行，确保行号与 wc -l 一致
-    local all_lines = vim.split(content, "\n", { plain = true })
-    -- 如果文件末尾有换行符，split 会产生一个空字符串作为最后元素，去掉它
-    if #all_lines > 0 and all_lines[#all_lines] == "" then
-      table.remove(all_lines)
-    end
-    local total_lines = #all_lines
-
-    if is_full_file and total_lines > 500 then
-      local ok_tree, nvim_tree_mod = pcall(require, "NeoAI.tools.builtin.neovim_tree")
-      if ok_tree and nvim_tree_mod then
-        nvim_tree_mod.parse_file_content_async(filepath, -1, function(tree_result)
-          if tree_result and tree_result.nodes and #tree_result.nodes > 0 then
-            local overview = build_structure_overview(filepath, tree_result)
-            local notices = "⚠️ 文件过长（超过 500 行），仅显示文件结构概览。\n"
-              .. "如需读取完整内容，请指定 start_line/end_line 行范围。\n"
-              .. '示例：{ filepath = "/path/to/file", start_line = 1, end_line = 100 }\n\n'
-            if on_success then
-              on_success(notices .. overview)
+      if is_full_file and total_lines > 500 then
+        local ok_tree, nvim_tree_mod = pcall(require, "NeoAI.tools.builtin.neovim_tree")
+        if ok_tree and nvim_tree_mod then
+          nvim_tree_mod.parse_file_content_async(filepath, -1, function(tree_result)
+            if tree_result and tree_result.nodes and #tree_result.nodes > 0 then
+              local overview = build_structure_overview(filepath, tree_result)
+              local notices = "⚠️ 文件过长（超过 500 行），仅显示文件结构概览。\n"
+                .. "如需读取完整内容，请指定 start_line/end_line 行范围。\n"
+                .. '示例：{ filepath = "/path/to/file", start_line = 1, end_line = 100 }\n\n'
+              if on_success then
+                on_success(notices .. overview)
+              end
+              dequeue_read()
+            else
+              local output_lines = {}
+              for i = 1, total_lines do
+                table.insert(output_lines, string.format("%4d | %s", i, all_lines[i] or ""))
+              end
+              local header = string.format("=== %s === (行 1-%d, 共 %d 行)", filepath, total_lines, total_lines)
+              if on_success then
+                on_success(header .. "\n" .. table.concat(output_lines, "\n"))
+              end
+              dequeue_read()
             end
-          else
+          end, function()
             local output_lines = {}
             for i = 1, total_lines do
               table.insert(output_lines, string.format("%4d | %s", i, all_lines[i] or ""))
@@ -148,55 +193,53 @@ local function _read_file(args, on_success, on_error)
             if on_success then
               on_success(header .. "\n" .. table.concat(output_lines, "\n"))
             end
-          end
-        end, function()
-          local output_lines = {}
-          for i = 1, total_lines do
-            table.insert(output_lines, string.format("%4d | %s", i, all_lines[i] or ""))
-          end
-          local header = string.format("=== %s === (行 1-%d, 共 %d 行)", filepath, total_lines, total_lines)
-          if on_success then
-            on_success(header .. "\n" .. table.concat(output_lines, "\n"))
-          end
-        end)
+            dequeue_read()
+          end)
+          return
+        end
+      end
+
+      if start_line < 1 then
+        start_line = 1
+      end
+      if end_line < 0 or end_line > total_lines then
+        end_line = total_lines
+      end
+      if start_line > end_line then
+        if on_error then
+          on_error(string.format("起始行(%d)大于结束行(%d)", start_line, end_line))
+        end
+        dequeue_read()
         return
       end
-    end
-
-    if start_line < 1 then
-      start_line = 1
-    end
-    if end_line < 0 or end_line > total_lines then
-      end_line = total_lines
-    end
-    if start_line > end_line then
-      if on_error then
-        on_error(string.format("起始行(%d)大于结束行(%d)", start_line, end_line))
+      local output_lines = {}
+      for i = start_line, end_line do
+        table.insert(output_lines, string.format("%4d | %s", i, all_lines[i] or ""))
       end
-      return
+      local header = string.format("=== %s === (行 %d-%d, 共 %d 行)", filepath, start_line, end_line, total_lines)
+      if on_success then
+        on_success(header .. "\n" .. table.concat(output_lines, "\n"))
+      end
+      dequeue_read()
     end
-    local output_lines = {}
-    for i = start_line, end_line do
-      table.insert(output_lines, string.format("%4d | %s", i, all_lines[i] or ""))
+
+    local function on_read_err(err)
+      if on_error then
+        on_error(string.format("读取文件失败 %s: %s", filepath, err or "无法读取文件"))
+      end
+      dequeue_read()
     end
-    local header = string.format("=== %s === (行 %d-%d, 共 %d 行)", filepath, start_line, end_line, total_lines)
-    if on_success then
-      on_success(header .. "\n" .. table.concat(output_lines, "\n"))
+
+    local content, err = fu.read_file(filepath)
+    if content then
+      on_content(content)
+    else
+      on_read_err(err)
     end
   end
 
-  local function on_read_err(err)
-    if on_error then
-      on_error(string.format("读取文件失败 %s: %s", filepath, err or "无法读取文件"))
-    end
-  end
-
-  local content, err = fu.read_file(filepath)
-  if content then
-    on_content(content)
-  else
-    on_read_err(err)
-  end
+  -- 将读取任务加入队列，串行执行
+  enqueue_read(do_read)
 end
 M.read_file = {
   name = "read_file",
@@ -465,8 +508,10 @@ local function _replace_text(args, on_success, on_error)
   local replacement_lines = vim.split(new_text, "\n", { plain = true })
 
   -- 保留原始首行缩进：防止替换后缩进丢失
+  -- 注意：如果原始行是纯空白行（仅含空格/制表符），不保留缩进，直接替换
   local original_indent = lines[replace_start]:match("^(%s*)") or ""
-  if original_indent ~= "" then
+  local is_blank_line = (lines[replace_start]:match("^%s*$") ~= nil)
+  if original_indent ~= "" and not is_blank_line then
     -- 查找 new_text 中首个非空行，判断是否已包含缩进
     local first_non_empty = nil
     for _, rl in ipairs(replacement_lines) do

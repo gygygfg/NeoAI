@@ -1850,117 +1850,146 @@ local function _edit_node(args, on_success, on_error)
 
     -- 异步读取文件内容
     read_file_content_async(filepath, function(content)
+      -- ======================================================================
+      -- Step 1: 获取文件缩进格数和被替换节点缩进
+      -- ======================================================================
+      -- 检测文件缩进风格（空格/制表符，每级缩进宽度）
+      local function detect_indent_style(lines)
+        local indent_char, indent_width = " ", 2
+        -- 统计前 100 行中非空行的缩进字符
+        local space_count, tab_count = 0, 0
+        local space_widths = {}
+        for i = 1, math.min(#lines, 100) do
+          local line = lines[i] or ""
+          local leading = line:match("^(%s+)" )
+          if leading then
+            if leading:sub(1, 1) == "\t" then
+              tab_count = tab_count + 1
+            elseif leading:sub(1, 1) == " " then
+              space_count = space_count + 1
+              table.insert(space_widths, #leading)
+            end
+          end
+        end
+        if tab_count > space_count then
+          indent_char = "\t"
+          indent_width = 1
+        else
+          indent_char = " "
+          -- 从缩进宽度中推测每级宽度（取最小非零宽度）
+          if #space_widths > 0 then
+            table.sort(space_widths)
+            indent_width = space_widths[1]
+            -- 限制在合理范围
+            if indent_width < 1 or indent_width > 8 then
+              indent_width = 2
+            end
+          end
+        end
+        return indent_char, indent_width
+      end
+
       local file_lines = vim.split(content, "\n", { plain = true })
+      local indent_char, indent_width = detect_indent_style(file_lines)
+
       local sr, sc, er, ec = target.start_row, target.start_col, target.end_row, target.end_col
 
-      -- 自动缩进调整：比较原节点首行缩进与新内容首行缩进，自动对齐
-      local original_first_line = file_lines[sr + 1] or ""
-      local original_indent = original_first_line:match("^(%s*)") or ""
-      local new_content_lines_raw = vim.split(new_content, "\n", { plain = true })
-      local new_first_line = new_content_lines_raw[1] or ""
+      -- 被替换节点首行缩进（即节点在文件中的实际缩进字符串）
+      local node_first_line = file_lines[sr + 1] or ""
+      local node_indent = node_first_line:match("^(%s*)") or ""
+
+      -- ======================================================================
+      -- Step 2: 获取替换文本缩进
+      -- ======================================================================
+      local new_content_lines = vim.split(new_content, "\n", { plain = true })
+      local new_first_line = new_content_lines[1] or ""
       local new_indent = new_first_line:match("^(%s*)") or ""
 
-      -- 计算节点体缩进（body indent）：对于多行节点（如 function_definition），
-      -- 节点体行（body lines）的缩进通常比首行（如 def 行）更深一级。
-      -- 需要检测实际的 body 缩进，而非简单使用首行缩进。
-      local body_indent = original_indent
-      if sr < er then
-        -- 多行节点：查找第一条非空 body 行的缩进
-        for i = sr + 1, er do
-          local body_line = file_lines[i + 1] or ""
-          if not body_line:match("^%s*$") then
-            body_indent = body_line:match("^(%s*)") or original_indent
-            break
+      -- ======================================================================
+      -- Step 3: 重写替换文本缩进为被替换节点缩进
+      -- ======================================================================
+      -- 原理：先剥离替换文本自身的基缩进（new_indent），再统一追加 node_indent。
+      -- 对于后续行，保留其相对于首行的额外缩进。
+      local reindented_lines = {}
+      for i, line in ipairs(new_content_lines) do
+        if line:match("^%s*$") then
+          -- 空行/纯空格行：保留原样
+          table.insert(reindented_lines, line)
+        elseif i == 1 then
+          -- 首行：剥离 new_indent，追加 node_indent
+          local stripped = line
+          if new_indent ~= "" then
+            stripped = line:gsub("^" .. vim.pesc(new_indent), "")
           end
+          table.insert(reindented_lines, node_indent .. stripped)
+        else
+          -- 后续行：剥离 new_indent，计算相对缩进深度，叠加到 node_indent 上
+          local line_indent = line:match("^(%s*)") or ""
+          local relative_level = 0
+          if new_indent ~= "" and line_indent ~= "" then
+            -- 计算相对于 new_indent 的额外缩进级别
+            local new_level = math.floor(#new_indent / math.max(1, indent_width))
+            local line_level = math.floor(#line_indent / math.max(1, indent_width))
+            relative_level = math.max(0, line_level - new_level)
+          elseif line_indent ~= "" then
+            local line_level = math.floor(#line_indent / math.max(1, indent_width))
+            relative_level = line_level
+          end
+          local stripped = line:gsub("^%s*", "")
+          local extra_indent = string.rep(indent_char, relative_level * indent_width)
+          table.insert(reindented_lines, node_indent .. extra_indent .. stripped)
         end
       end
+      local reindented_content = table.concat(reindented_lines, "\n")
 
-      -- 自动缩进调整：对齐新内容到原节点的缩进级别
-      -- 原理：原节点首行缩进（original_indent）由 before 前缀在替换逻辑中提供，
-      -- 因此首行只需剥离 new_indent，不额外添加 original_indent；
-      -- 而后续行需要使用 body_indent 来保持正确的相对缩进关系。
-      local adjusted_content = new_content
-      if #new_content_lines_raw > 0 then
-        local adjusted_lines = {}
-        for i, line in ipairs(new_content_lines_raw) do
-          if line:match("^%s*$") then
-            -- 空行/纯空格行：保留原样
-            table.insert(adjusted_lines, line)
-          elseif i == 1 then
-            -- 首行：剥离 new_indent，不添加 original_indent（before 前缀会处理）
-            local stripped = line:gsub("^" .. vim.pesc(new_indent), "")
-            table.insert(adjusted_lines, stripped)
-          else
-            -- 后续行：剥离 new_indent，添加 body_indent 保持正确的相对缩进
-            local stripped = line:gsub("^" .. vim.pesc(new_indent), "")
-            table.insert(adjusted_lines, body_indent .. stripped)
-          end
-        end
-        adjusted_content = table.concat(adjusted_lines, "\n")
+      -- ======================================================================
+      -- Step 4: 将文件分为首、被替换节点、尾三部分
+      -- ======================================================================
+      -- 首部：节点起始行之前的所有行 + 起始行上节点之前的文本
+      local head_lines = {}
+      for i = 1, sr do
+        table.insert(head_lines, file_lines[i])
+      end
+      if sr + 1 <= #file_lines then
+        local before_on_first_line = file_lines[sr + 1]:sub(1, sc)
+        table.insert(head_lines, before_on_first_line)
       end
 
-      -- 构建新文件内容：将目标节点范围替换为新内容
-      local new_lines = {}
-      for i, line in ipairs(file_lines) do
-        table.insert(new_lines, line)
+      -- 尾部：结束行上节点之后的文本 + 节点结束行之后的所有行
+      local tail_lines = {}
+      if er + 1 <= #file_lines then
+        local after_on_last_line = file_lines[er + 1]:sub(ec + 1)
+        table.insert(tail_lines, after_on_last_line)
+      end
+      for i = er + 2, #file_lines do
+        table.insert(tail_lines, file_lines[i])
       end
 
-      if sr == er then
-        -- 单行替换
-        local line = new_lines[sr + 1]
-        if line then
-          local before = line:sub(1, sc)
-          local after = line:sub(ec + 1) or ""
-          new_lines[sr + 1] = before .. adjusted_content .. after
-        end
-      else
-        -- 多行替换：保留第一行的 before 部分和最后一行的 after 部分
-        local first_line = new_lines[sr + 1]
-        local last_line = new_lines[er + 1]
-        if first_line and last_line then
-          local before = first_line:sub(1, sc)
-          local after = last_line:sub(ec + 1) or ""
-          -- 将调整后的新内容按行拆分插入
-          local content_lines = vim.split(adjusted_content, "\n", { plain = true })
-          local replacement = {}
-          if #content_lines > 0 then
-            if #content_lines == 1 then
-              -- 单行新内容：同时加上 before 前缀和 after 后缀
-              table.insert(replacement, before .. content_lines[1] .. after)
-            else
-              -- 第一行加上 before 前缀
-              table.insert(replacement, before .. content_lines[1])
-              -- 中间行
-              for j = 2, #content_lines - 1 do
-                table.insert(replacement, content_lines[j])
-              end
-              -- 最后一行加上 after 后缀
-              table.insert(replacement, content_lines[#content_lines] .. after)
-            end
-          else
-            -- 新内容为空
-            table.insert(replacement, before .. after)
-          end
-
-          -- 替换 sr..er 范围内的行
-          for r = er, sr, -1 do
-            table.remove(new_lines, r + 1)
-          end
-          -- 在 sr 位置插入替换行
-          for idx = #replacement, 1, -1 do
-            table.insert(new_lines, sr + 1, replacement[idx])
-          end
-        end
+      -- ======================================================================
+      -- Step 5: 拼接文件为首 + 替换文本 + 尾
+      -- ======================================================================
+      local new_parts = {}
+      -- 首部
+      for _, line in ipairs(head_lines) do
+        table.insert(new_parts, line)
       end
+      -- 替换文本（已调整缩进）
+      table.insert(new_parts, reindented_content)
+      -- 尾部
+      for _, line in ipairs(tail_lines) do
+        table.insert(new_parts, line)
+      end
+      local content_to_write = table.concat(new_parts, "\n")
 
-      -- 使用 file_utils.write_file_async 写入文件，统一文件写入入口
-      local abs_path = filepath
-      local content_to_write = table.concat(new_lines, "\n")
+      -- ======================================================================
+      -- Step 6: 写入文件
+      -- ======================================================================
       -- 保留原文件末尾换行符
-      if content:sub(-1) == "\n" then
+      if content:sub(-1) == "\n" and content_to_write:sub(-1) ~= "\n" then
         content_to_write = content_to_write .. "\n"
       end
 
+      local abs_path = filepath
       local fu = require("NeoAI.utils.file_utils")
       fu.write_file_async(abs_path, content_to_write, function()
         -- write_file_async 的回调在 fast event 上下文中，需切换到主线程
@@ -2007,7 +2036,6 @@ local function _edit_node(args, on_success, on_error)
           finalize_with_timeout("写入文件失败: " .. err_msg, true)
         end
       end)
-    end)
   end, function(err)
     finalize_with_timeout(err or "解析结果为空", true)
   end)
