@@ -299,7 +299,7 @@ local function normalize_line_text(line)
 end
 
 --- 从指定行号开始，上下查找匹配的文本行
---- 返回: { start_line, end_line } 或 nil
+--- 返回: { start_line, end_line, fallback } 或 nil（fallback 表示搜索文本未在锚点行匹配，已回退到附近行）
 local function find_text_range(lines, anchor_line, search_text)
   if not lines or not anchor_line or not search_text then
     return nil
@@ -342,11 +342,11 @@ local function find_text_range(lines, anchor_line, search_text)
         break
       end
     end
-    return { start_line = s, end_line = e }
+    return { start_line = s, end_line = e, fallback = false }
   end
 
   -- 回退搜索：从 anchor 向上查找
-  for i = anchor_line - 1, math.max(1, anchor_line - 10), -1 do
+  for i = anchor_line - 1, math.max(1, anchor_line - 5), -1 do
     if line_matches(lines[i]) then
       local s, e = i, i
       for j = i + 1, #lines do
@@ -363,12 +363,12 @@ local function find_text_range(lines, anchor_line, search_text)
           break
         end
       end
-      return { start_line = s, end_line = e }
+      return { start_line = s, end_line = e, fallback = true }
     end
   end
 
   -- 回退搜索：从 anchor 向下查找
-  for i = anchor_line + 1, math.min(#lines, anchor_line + 10) do
+  for i = anchor_line + 1, math.min(#lines, anchor_line + 5) do
     if line_matches(lines[i]) then
       local s, e = i, i
       for j = i + 1, #lines do
@@ -385,7 +385,7 @@ local function find_text_range(lines, anchor_line, search_text)
           break
         end
       end
-      return { start_line = s, end_line = e }
+      return { start_line = s, end_line = e, fallback = true }
     end
   end
 
@@ -528,6 +528,18 @@ local function _replace_text(args, on_success, on_error)
     diagnostics = {},
     diagnostic_count = 0,
   }
+  -- 如果搜索文本未在锚点行精确匹配，添加警告
+  if start_range.fallback or end_range.fallback then
+    local fb_info = ""
+    if start_range.fallback then
+      fb_info = fb_info .. string.format("start_match \"%s\" 未在行 %d 精确匹配，已回退到行 %d", start_text, start_anchor, start_range.start_line)
+    end
+    if end_range.fallback then
+      if #fb_info > 0 then fb_info = fb_info .. "; " end
+      fb_info = fb_info .. string.format("end_match \"%s\" 未在行 %d 精确匹配，已回退到行 %d", end_text, end_anchor, end_range.start_line)
+    end
+    base_result.warning = fb_info
+  end
 
   -- 异步加载文件到 buffer 并监听 LSP 诊断，诊断到达或超时后再调用 on_success
   vim.schedule(function()

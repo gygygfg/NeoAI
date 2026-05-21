@@ -1011,22 +1011,24 @@ function M._execute_single_tool(session_id, tool_call, is_sub_agent, on_complete
           local err_msg = type(result) == "string" and result or "创建子 agent 失败"
 
           -- 合并修正提示到 tool 消息内容中（不插入独立的 user 消息，避免违反 API 规范）
-          local param_retry_count = s._param_retry_count or 0
-          if param_retry_count < 3 then
-            s._param_retry_count = param_retry_count + 1
+          -- 每个工具独立计数，互不影响
+          local retry_key = session_id .. ":" .. tool_name
+          local tool_retry_count = _param_retry_counts[retry_key] or 0
+          if tool_retry_count < 3 then
+            _param_retry_counts[retry_key] = tool_retry_count + 1
             local combined_msg = string.format(
               "[工具执行失败] %s\n\n"
                 .. "请直接重新调用工具 `%s`，使用修正后的参数重试。\n"
                 .. "（修正尝试 %d/3，超过后自动放弃）",
               err_msg,
               tool_name,
-              s._param_retry_count
+              _param_retry_counts[retry_key]
             )
             M._add_tool_result_to_messages(session_id, tool_call_id, tool_name, combined_msg, is_sub_agent, normalized_args)
             logger.debug(
               "[tool_orchestrator] 工具 '%s' 执行失败，等待 AI 修正参数重试 (尝试 %d/3)",
               tool_name,
-              s._param_retry_count
+              _param_retry_counts[retry_key]
             )
           else
             M._add_tool_result_to_messages(session_id, tool_call_id, tool_name, err_msg, is_sub_agent, normalized_args)
@@ -1331,8 +1333,7 @@ function M._execute_single_tool(session_id, tool_call, is_sub_agent, on_complete
 
           if tool_retry_count < 3 then
             _param_retry_counts[retry_key] = tool_retry_count + 1
-            -- 更新全局兼容计数
-            s._param_retry_count = s._param_retry_count + 1
+
 
             -- 注册 confirm_file_change 到 request_handler，让 AI 通过工具调用传递修正参数
             _register_confirm_tool()

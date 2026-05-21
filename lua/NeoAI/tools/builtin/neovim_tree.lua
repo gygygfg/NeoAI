@@ -1826,7 +1826,7 @@ local function _edit_node(args, on_success, on_error)
       local details = {}
       for i, node in ipairs(filtered) do
         table.insert(details, string.format("  [%d] 类型: %s, 文本: %s, 位置: 行 %d-%d",
-          i, node.type, node.text:gsub("\n", "\\n"):sub(1, 60), node.start_row + 1, node.end_row + 1))
+          i, node.type, node.text:gsub("\n", "\\n"):sub(1, 200), node.start_row + 1, node.end_row + 1))
       end
       finalize_with_timeout("匹配到 " .. #filtered .. " 个节点，请使用 index 参数指定要修改第几个:\n" .. table.concat(details, "\n"), true)
       return
@@ -1887,7 +1887,8 @@ local function _edit_node(args, on_success, on_error)
           table.insert(new_parts, line)
         end
         if #new_content_lines > 0 then
-          table.insert(new_parts, before_on_first_line .. new_content_lines[1])
+          local first_stripped = new_content_lines[1]:gsub("^%s+", "")
+          table.insert(new_parts, before_on_first_line .. first_stripped)
           for i = 2, #new_content_lines do
             table.insert(new_parts, new_content_lines[i])
           end
@@ -1969,7 +1970,7 @@ M.edit_node = {
     properties = {
       filepath = { type = "string", description = "文件路径（必填）" },
       content = { type = "string", description = "替换的新源代码内容（必填）" },
-      node_type = { type = "string", description = "节点类型过滤（可选），如 'function_definition'" },
+      node_type = { type = "string", description = "节点类型过滤（必填，防止意外匹配根节点），如 'function_definition'" },
       text = { type = "string", description = "节点文本过滤（可选）" },
       named = { type = "boolean", description = "是否为命名节点（可选）" },
       index = {
@@ -1977,7 +1978,7 @@ M.edit_node = {
         description = "匹配节点序号（可选，从1开始），仅一个匹配时可省略，多个匹配时必须指定",
       },
     },
-    required = { "filepath", "content" },
+    required = { "filepath", "content", "node_type" },
   },
   returns = {
     type = "object",
