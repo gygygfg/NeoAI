@@ -94,9 +94,29 @@ function M.initialize(config)
   history_tree.initialize(config)
   reasoning_display.initialize(config.reasoning or {})
   tree_window.initialize(config)
-  chat_window.initialize(config)
   tree_handlers.initialize(config)
   chat_handlers.initialize(config.handlers or {})
+
+  -- 初始化虚拟输入组件（原 chat_window.initialize 中的逻辑）
+  local virtual_input = require("NeoAI.ui.components.virtual_input")
+  virtual_input.initialize(config)
+
+  -- 初始化悬浮文本组件
+  local floating_text = require("NeoAI.ui.components.floating_text")
+  floating_text.initialize(config.floating_text or {})
+
+  -- 初始化模型选择器组件
+  local model_selector = require("NeoAI.ui.components.model_selector")
+  model_selector.initialize(config.model_selector or {}, {
+    on_update_title = function(title) chat_window.update_title(title) end,
+    on_render_chat = function() chat_window.render_chat() end,
+    on_get_window_id = function() return chat_window.get_current_window_id() end,
+  })
+
+  -- 聊天窗口：标记已初始化 + 注册事件监听器
+  chat_window._mark_initialized()
+  chat_window._setup_event_listeners()
+
   M._register_event_listeners()
   state.initialized = true
   return M

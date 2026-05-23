@@ -1677,8 +1677,9 @@ function M.on_generation_complete(data)
 
   local ss = sessions_table[session_id]
   if not ss or ss.generation_id ~= data.generation_id then
-    require("NeoAI.utils.logger").debug(
-      "[DEBUG_DUP] on_generation_complete 提前返回: ss=%s, ss.gen_id=%s, data.gen_id=%s",
+    require("NeoAI.utils.logger").warn(
+      "[tool_orchestrator] on_generation_complete 跳过: generation_id 不匹配 (session=%s, ss=%s, ss.gen_id=%s, data.gen_id=%s)",
+      tostring(session_id),
       tostring(ss ~= nil),
       tostring(ss and ss.generation_id),
       tostring(data.generation_id)
@@ -1690,9 +1691,22 @@ function M.on_generation_complete(data)
   -- 这可能在流式结束和非流式响应同时到达时发生
   if ss._generation_completed then
     require("NeoAI.utils.logger").warn(
-      "[tool_orchestrator] on_generation_complete 跳过: _generation_completed 已为 true, session=%s",
+      "[tool_orchestrator] on_generation_complete 被防重入拦截 (session=%s)，但仍尝试补充 usage 数据",
       tostring(session_id)
     )
+    -- 防重入时仍尝试累积 usage（某些 API 在 finish_reason 之后单独发送 usage chunk）
+    if data.usage and next(data.usage) then
+      local acc = ss.accumulated_usage or {}
+      acc.prompt_tokens = (acc.prompt_tokens or 0) + (data.usage.prompt_tokens or data.usage.input_tokens or 0)
+      acc.completion_tokens = (acc.completion_tokens or 0) + (data.usage.completion_tokens or data.usage.output_tokens or 0)
+      acc.total_tokens = (acc.total_tokens or 0) + (data.usage.total_tokens or 0)
+      if data.usage.completion_tokens_details and type(data.usage.completion_tokens_details) == "table" then
+        local rt = data.usage.completion_tokens_details.reasoning_tokens or 0
+        if not acc.completion_tokens_details then acc.completion_tokens_details = {} end
+        acc.completion_tokens_details.reasoning_tokens = (acc.completion_tokens_details.reasoning_tokens or 0) + rt
+      end
+      ss.accumulated_usage = acc
+    end
     return
   end
   ss._generation_completed = true

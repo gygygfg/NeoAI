@@ -22,6 +22,24 @@ local tool_display_component = require("NeoAI.ui.components.tool_display")
 local file_utils = require("NeoAI.utils.file_utils")
 local markdown_renderer = require("NeoAI.ui.components.markdown_renderer")
 
+-- 悬浮窗组件（从本文件分离到 components）
+local floating_text_component = nil -- 延迟初始化，避免循环 require
+local model_selector_component = nil -- 延迟初始化，避免循环 require
+
+local function _get_floating_text()
+  if not floating_text_component then
+    floating_text_component = require("NeoAI.ui.components.floating_text")
+  end
+  return floating_text_component
+end
+
+local function _get_model_selector()
+  if not model_selector_component then
+    model_selector_component = require("NeoAI.ui.components.model_selector")
+  end
+  return model_selector_component
+end
+
 -- ========== 辅助函数（不依赖 state） ==========
 
 local function buf_valid(buf)
@@ -729,19 +747,15 @@ local function get_config_merger()
   return config_merger
 end
 
---- 初始化聊天窗口
---- @param config table 配置
-function M.initialize(config)
-  if state.initialized then
-    return
-  end
+--- 初始化聊天窗口（仅标记初始化状态，组件初始化由 ui/init.lua 统一管理）
+function M._mark_initialized()
+  if state.initialized then return end
   state.initialized = true
+end
 
-  -- 初始化虚拟输入组件
-  virtual_input.initialize(config)
-
-  -- 注册AI响应事件监听器
-  M._setup_event_listeners()
+-- 保留旧的 initialize 作为兼容（仅标记状态，不再做虚拟输入/事件监听初始化）
+function M.initialize(_config)
+  M._mark_initialized()
 end
 
 --- 打开聊天窗口
@@ -2437,70 +2451,30 @@ function M._move_cursor_to_end()
   M._scroll_to_end_with_offset()
 end
 
---- 显示悬浮文本
+--- 显示悬浮文本（委托给 floating_text 组件）
 --- @param text string 要显示的文本
 --- @param opts table|nil 选项
 function M.show_floating_text(text, opts)
-  if not state.current_window_id then
-    return false
-  end
+  local comp = _get_floating_text()
+  if not comp then return false end
 
   opts = opts or {}
   local win_handle = window_manager.get_window_win(state.current_window_id)
-
   if not win_handle or not vim.api.nvim_win_is_valid(win_handle) then
     return false
   end
 
-  -- 触发显示悬浮文本事件
-  vim.api.nvim_exec_autocmds("User", {
-    pattern = Events.FLOATING_TEXT_SHOWING,
-    data = {
-      window_id = state.current_window_id,
-      text = text,
-    },
-  })
-
-  -- 这里可以实现实际的悬浮文本显示逻辑
-  -- 例如使用 nvim_open_win 创建浮动窗口
-
-  -- 触发显示悬浮文本完成事件
-  vim.api.nvim_exec_autocmds("User", {
-    pattern = Events.FLOATING_TEXT_SHOWN,
-    data = {
-      window_id = state.current_window_id,
-      text = text,
-    },
-  })
-
-  return true
+  return comp.show(text, vim.tbl_extend("force", opts, {
+    chat_win = win_handle,
+    chat_window_id = state.current_window_id,
+  }))
 end
 
---- 关闭悬浮文本
+--- 关闭悬浮文本（委托给 floating_text 组件）
 function M.close_floating_text()
-  if not state.current_window_id then
-    return false
-  end
-
-  -- 触发关闭悬浮文本事件
-  vim.api.nvim_exec_autocmds(
-    "User",
-    { pattern = Events.FLOATING_TEXT_CLOSING, data = {
-      window_id = state.current_window_id,
-    } }
-  )
-
-  -- 这里可以实现实际的悬浮文本关闭逻辑
-
-  -- 触发关闭悬浮文本完成事件
-  vim.api.nvim_exec_autocmds(
-    "User",
-    { pattern = Events.FLOATING_TEXT_CLOSED, data = {
-      window_id = state.current_window_id,
-    } }
-  )
-
-  return true
+  local comp = _get_floating_text()
+  if not comp then return false end
+  return comp.close()
 end
 
 -- ========== 辅助：提取响应内容 ==========
@@ -2617,6 +2591,11 @@ function M._setup_event_listeners()
       -- 保存用量信息
       if data.usage and next(data.usage) then
         state.last_usage = data.usage
+      else
+        require("NeoAI.utils.logger").debug(
+          "[chat_window] GENERATION_COMPLETED 未收到 usage 数据 (session=%s, gen_id=%s)",
+          tostring(data.session_id), tostring(data.generation_id)
+        )
       end
 
       -- 优先使用 state.streaming.message_index（第一轮工具循环，流式状态未清空）
@@ -4140,103 +4119,35 @@ function M._build_tool_folded_text(results)
   return tool_display_component.build_all_folded_text()
 end
 
---- 获取当前使用的模型标签
+--- 获取当前使用的模型标签（委托给 model_selector 组件）
 --- @return string|nil 模型标签，如 "deepseek/deepseek-chat"
 function M._get_current_model_label()
-  -- 使用 get_available_models 获取所有可用模型
-  local models = config_merger.get_available_models("chat")
-  local target = models[state.current_model_index]
-  if target then
-    return string.format("%s/%s", target.provider or "?", target.model_name or "?")
-  end
-  return nil
+  local comp = _get_model_selector()
+  return comp and comp.get_current_label() or nil
 end
 
---- 获取当前使用的模型候选索引
+--- 获取当前使用的模型候选索引（委托给 model_selector 组件）
 --- @return number 当前模型索引（1-based）
 function M.get_current_model_index()
-  return state.current_model_index or 1
+  local comp = _get_model_selector()
+  return comp and comp.get_current_index() or 1
 end
 
---- 显示模型选择器（浮动窗口菜单）
---- 列出当前场景（chat）内所有场景候选，用户选择后切换
+--- 显示模型选择器（浮动窗口菜单，委托给 model_selector 组件）
 function M.show_model_selector()
-  if not state.current_window_id then
-    return
-  end
-
-  -- 使用 get_available_models 获取所有可用模型（所有提供商，所有模型）
-  local models = config_merger.get_available_models("chat")
-
-  if #models == 0 then
-    vim.notify("[NeoAI] 没有可用的模型（请检查 API key 配置）", vim.log.levels.WARN)
-    return
-  end
-
-  -- 构建选择菜单项
-  local items = {}
-  for i, m in ipairs(models) do
-    local indicator = (i == state.current_model_index) and "✓ " or "  "
-    table.insert(items, string.format("%s%s/%s", indicator, m.provider or "?", m.model_name or "?"))
-  end
-
-  local current_label = "未知"
-  local current = models[state.current_model_index]
-  if current then
-    current_label = string.format("%s/%s", current.provider or "?", current.model_name or "?")
-  end
-
-  vim.ui.select(items, {
-    prompt = "选择 AI 模型 (当前: " .. current_label .. ")",
-    format_item = function(item)
-      return item
-    end,
-  }, function(choice, idx)
-    if choice and idx and idx ~= state.current_model_index then
-      M.switch_to_model(idx)
-    end
-  end)
+  if not state.current_window_id then return end
+  local comp = _get_model_selector()
+  if comp then comp.show() end
 end
 
---- 切换到当前场景内的指定模型候选
+--- 切换到当前场景内的指定模型候选（委托给 model_selector 组件）
 --- @param model_index number 模型候选索引（1-based）
 function M.switch_to_model(model_index)
-  if not model_index or model_index == state.current_model_index then
-    return
-  end
-
-  -- 使用 get_available_models 获取所有可用模型
-  local models = config_merger.get_available_models("chat")
-  local target = models[model_index]
-
-  if not target then
-    vim.notify("[NeoAI] 无效的模型索引: " .. tostring(model_index), vim.log.levels.WARN)
-    return
-  end
-
-  local old_index = state.current_model_index
-  state.current_model_index = model_index
-
-  -- 更新聊天窗口标题
-  M.update_title(string.format("NeoAI 聊天 [%s/%s]", target.provider or "?", target.model_name or "?"))
-
-  -- 重新渲染聊天内容（标题区域会显示新模型）
-  M.render_chat()
-
-  -- 触发模型切换事件
-  vim.api.nvim_exec_autocmds("User", {
-    pattern = Events.MODEL_SWITCHED,
-    data = {
-      old_index = old_index,
-      new_index = model_index,
-      provider = target.provider,
-      model_name = target.model_name,
-      window_id = state.current_window_id,
-    },
-  })
-
-  local label = string.format("%s/%s", target.provider or "?", target.model_name or "?")
-  vim.notify(string.format("[NeoAI] 已切换到模型: %s", label), vim.log.levels.INFO)
+  local comp = _get_model_selector()
+  if not comp then return end
+  comp.switch_to(model_index)
+  -- 同步 chat_window 本地状态
+  state.current_model_index = comp.get_current_index()
 end
 
 --- 获取最后一条 assistant 消息的内容

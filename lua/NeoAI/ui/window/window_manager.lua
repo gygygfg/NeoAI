@@ -841,6 +841,99 @@ end
 
 -- ========== 悬浮窗口管理 ==========
 
+--- 创建托管的浮动窗口（集中管理 buffer + window 的创建）
+--- 自动设置 buffer 选项、注册到 float_windows 系统
+--- @param opts table 选项:
+---   main_buf: number 关联的主 buffer（必填，用于注册）
+---   width: number 窗口宽度
+---   height: number 窗口高度
+---   row: number 行位置
+---   col: number 列位置
+---   border: string 边框样式（默认 "rounded"）
+---   title: string 窗口标题
+---   title_pos: string 标题位置
+---   filetype: string filetype（默认 "NeoAIInput"）
+---   enter: boolean 是否进入窗口（默认 false）
+---   style: string 窗口样式（默认 "minimal"）
+---   zindex: number z-index
+---   winopts: table 额外的窗口选项
+--- @return table|nil { buf = number, win = number } 或 nil
+function M.create_managed_float_window(opts)
+  opts = opts or {}
+  local main_buf = opts.main_buf
+
+  -- 创建 buffer
+  local buf = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_set_option_value("filetype", opts.filetype or "NeoAIInput", { buf = buf })
+  vim.api.nvim_set_option_value("buftype", "nofile", { buf = buf })
+  vim.api.nvim_set_option_value("bufhidden", "wipe", { buf = buf })
+  vim.api.nvim_set_option_value("swapfile", false, { buf = buf })
+  vim.api.nvim_set_option_value("modified", false, { buf = buf })
+  vim.api.nvim_set_option_value("modifiable", true, { buf = buf })
+
+  -- 阻止 LSP 附加
+  M.block_lsp_for_buffer(buf, opts.lsp_label or "浮动窗口")
+
+  -- 构建窗口配置
+  local win_config = vim.tbl_extend("keep", {
+    relative = opts.relative or "editor",
+    width = opts.width or 40,
+    height = opts.height or 5,
+    row = opts.row or 0,
+    col = opts.col or 0,
+    style = opts.style or "minimal",
+    border = opts.border or "rounded",
+    title = opts.title or "",
+    title_pos = opts.title_pos or "center",
+    noautocmd = true,
+    zindex = opts.zindex,
+    focusable = opts.focusable,
+  }, opts.winopts or {})
+
+  -- 创建浮动窗口
+  local enter = opts.enter or false
+  local win = vim.api.nvim_open_win(buf, enter, win_config)
+
+  -- 设置窗口选项
+  if opts.wrap ~= nil then
+    vim.api.nvim_set_option_value("wrap", opts.wrap, { win = win })
+  end
+  if opts.cursorline ~= nil then
+    vim.api.nvim_set_option_value("cursorline", opts.cursorline, { win = win })
+  end
+
+  -- 注册到 float_windows 系统
+  if main_buf then
+    float_windows[main_buf] = { win_id = win, buf_id = buf, visible = true }
+    if buf and vim.api.nvim_buf_is_valid(buf) then
+      vim.api.nvim_buf_set_var(buf, "neoai_float_window", true)
+    end
+  end
+
+  return { buf = buf, win = win }
+end
+
+--- 注销托管的浮动窗口（关闭窗口和 buffer，清理注册信息）
+--- @param main_buf number 关联的主 buffer
+function M.unregister_managed_float_window(main_buf)
+  local fw = float_windows[main_buf]
+  if not fw then
+    return
+  end
+  if fw.win_id and vim.api.nvim_win_is_valid(fw.win_id) then
+    pcall(vim.api.nvim_win_close, fw.win_id, true)
+  end
+  if fw.buf_id and vim.api.nvim_buf_is_valid(fw.buf_id) then
+    pcall(vim.api.nvim_buf_delete, fw.buf_id, { force = true })
+  end
+  float_windows[main_buf] = nil
+end
+
+--- 注册浮动窗口（轻量注册，不创建 buffer/window）
+--- 供直接创建了浮动窗口的组件（如 virtual_input）调用
+--- @param main_buf number 关联的主 buffer
+--- @param float_win_id number 浮动窗口 ID
+--- @param float_buf_id number 浮动 buffer ID
 function M.register_float_window(main_buf, float_win_id, float_buf_id)
   float_windows[main_buf] = { win_id = float_win_id, buf_id = float_buf_id, visible = true }
   if float_buf_id and vim.api.nvim_buf_is_valid(float_buf_id) then

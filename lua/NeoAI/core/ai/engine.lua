@@ -339,13 +339,16 @@ function _handle_stream_chunk(generation_id, data, processor, params)
     return
   end
 
-  -- 处理空闲超时标记（不再提前结束流式接收，仅记录日志）
+  -- 处理空闲超时标记（工具调用已完整时主动结束流式接收，避免无限等待）
   if data._idle_timeout then
     local finalized = http_utils.try_finalize_tool_calls(processor)
     if finalized then
-      logger.debug("[ai_engine] 空闲超时但工具调用已完整，等待 finish_reason 确认: %d 个工具调用", #finalized)
+      logger.warn("[ai_engine] 空闲超时但工具调用已完整 (%d 个)，主动结束流式接收", #finalized)
+      -- 标记完成状态，然后主动触发 _handle_stream_end 推进工具循环
+      processor.is_finished = true
+      _handle_stream_end(generation_id, processor, params)
     else
-      logger.debug("[ai_engine] 空闲超时但工具调用不完整，继续等待后续数据")
+      logger.warn("[ai_engine] 空闲超时且工具调用不完整，继续等待后续数据（最多 30s）")
     end
     return
   end
@@ -392,10 +395,24 @@ function _handle_stream_end(generation_id, processor, params)
       if gen then
         gen.accumulated_usage = processor.usage
       end
+      -- 同步更新 tool_cycle 会话的 accumulated_usage
+      local sid = (params and params.session_id) or processor.session_id
+      if sid then
+        local ok, tc = pcall(require, "NeoAI.core.ai.tool_cycle")
+        if ok and tc.on_generation_complete then
+          pcall(tc.on_generation_complete, {
+            generation_id = generation_id,
+            tool_calls = {},
+            content = "",
+            reasoning = "",
+            usage = processor.usage,
+            session_id = sid,
+          })
+        end
+      end
     end
     return
   end
-  processor._stream_end_handled = true
   local full_response = processor.content_buffer or ""
   local reasoning_text = processor.reasoning_buffer or ""
   local usage = processor.usage or {}

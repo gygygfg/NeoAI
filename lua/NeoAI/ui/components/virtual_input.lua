@@ -106,19 +106,8 @@ function M.open(parent_win, opts)
   state.mode = "float"
   state.input_line_count = math.max(3, 1)
 
-  -- 创建独立的浮动输入框 buffer
-  state.float_buf = vim.api.nvim_create_buf(false, true)
-  vim.api.nvim_set_option_value("filetype", "NeoAIInput", { buf = state.float_buf })
-  vim.api.nvim_set_option_value("buftype", "nofile", { buf = state.float_buf })
-  vim.api.nvim_set_option_value("bufhidden", "wipe", { buf = state.float_buf })
-  vim.api.nvim_set_option_value("swapfile", false, { buf = state.float_buf })
-  vim.api.nvim_set_option_value("modified", false, { buf = state.float_buf })
-
-  -- 阻止 LSP 附加到浮动输入框
-  wm.block_lsp_for_buffer(state.float_buf, "浮动输入框")
-
-  -- 设置提示符
-  vim.api.nvim_buf_set_lines(state.float_buf, 0, -1, false, { "> " })
+  -- 保存父窗口 buffer，用于 BufEnter 检测和 window_manager 注册
+  state._parent_buf = vim.api.nvim_win_get_buf(parent_win)
 
   -- 获取父窗口位置信息
   local parent_config = vim.api.nvim_win_get_config(parent_win)
@@ -179,26 +168,28 @@ function M.open(parent_win, opts)
   -- 创建浮动窗口
   -- enter 参数与 auto_focus 一致：auto_focus=false 时不进入窗口，避免抢焦点和触发 WinEnter/BufEnter 事件
   local enter_window = opts.auto_focus ~= false
-  state.float_win = vim.api.nvim_open_win(state.float_buf, enter_window, {
-    relative = "editor",
+
+  -- 创建独立的浮动输入框 buffer（通过 window_manager 集中管理）
+  local float_result = wm.create_managed_float_window({
+    main_buf = state._parent_buf,
     width = input_width,
     height = input_height,
     row = row,
     col = col,
-    style = "minimal",
     border = "rounded",
     title = " 输入 ",
     title_pos = "center",
-    noautocmd = true,
+    filetype = "NeoAIInput",
+    enter = enter_window,
+    lsp_label = "浮动输入框",
+    wrap = true,
+    cursorline = true,
   })
+  state.float_buf = float_result.buf
+  state.float_win = float_result.win
 
-  -- 保存父窗口 buffer，用于 BufEnter 检测
-  state._parent_buf = vim.api.nvim_win_get_buf(parent_win)
-
-  -- 注册到 window_manager，以便切换 buffer 时自动隐藏/显示
-  if wm.register_float_window then
-    wm.register_float_window(state._parent_buf, state.float_win, state.float_buf)
-  end
+  -- 设置提示符
+  vim.api.nvim_buf_set_lines(state.float_buf, 0, -1, false, { "> " })
 
   -- 设置自动命令：当在浮动输入框执行 Ex 命令时，自动将焦点切回 chat 主窗口
   -- 避免 :q / :e / :b 等命令在浮动输入框的 buffer 上执行
@@ -230,9 +221,10 @@ function M.open(parent_win, opts)
   -- 注册 BufEnter 监听器：当父窗口 buffer 重新成为当前 buffer 时，恢复显示输入框
   M._setup_bufenter_autocmd()
 
-  -- 设置窗口选项
-  vim.api.nvim_set_option_value("wrap", true, { win = state.float_win })
-  vim.api.nvim_set_option_value("cursorline", true, { win = state.float_win })
+  -- 注册 WinEnter 监听器：光标放到浮动输入框上时自动展开（进入插入模式）
+  M._setup_winenter_expand_autocmd()
+
+  -- 设置 showmode 为 false（隐藏模式显示，减少视觉干扰）
   vim.api.nvim_set_option_value("showmode", false, { scope = "local" })
 
   -- 设置按键映射
@@ -313,24 +305,20 @@ function M.close(force)
   -- 清理 BufEnter 自动命令
   M._cleanup_bufenter_autocmd()
 
+  -- 清理 WinEnter 自动命令
+  M._cleanup_winenter_expand_autocmd()
+
   -- 清理 CmdlineEnter 自动命令
   if state.float_buf then
     local float_augroup = "NeoAIFloatInputCmd_" .. tostring(state.float_buf)
     pcall(vim.api.nvim_del_augroup_by_name, float_augroup)
   end
 
-  -- 从 window_manager 注销（无需额外操作，后续会直接清理）
-
-  -- 关闭浮动窗口
-  if state.float_win and vim.api.nvim_win_is_valid(state.float_win) then
-    pcall(vim.api.nvim_win_close, state.float_win, true)
+  -- 从 window_manager 注销托管窗口（自动关闭窗口和 buffer）
+  if state._parent_buf then
+    wm.unregister_managed_float_window(state._parent_buf)
   end
   state.float_win = nil
-
-  -- 清理独立 buffer
-  if state.float_buf and vim.api.nvim_buf_is_valid(state.float_buf) then
-    pcall(vim.api.nvim_buf_delete, state.float_buf, { force = true })
-  end
   state.float_buf = nil
 
   -- 恢复父窗口位置（如果之前抬升过）
@@ -1222,8 +1210,42 @@ function M._cleanup_bufleave_autocmd()
   pcall(vim.api.nvim_del_augroup_by_name, "NeoAIVirtualInputBufLeave")
 end
 
+--- 注册 WinEnter 自动命令
+--- 当光标放到浮动输入框上时，自动展开（进入插入模式）
+--- 即使用户之前按 <Esc> 退出了插入模式，重新聚焦时也会自动进入
+function M._setup_winenter_expand_autocmd()
+  M._cleanup_winenter_expand_autocmd()
+  if not state.float_buf or not vim.api.nvim_buf_is_valid(state.float_buf) then
+    return
+  end
+  local group = vim.api.nvim_create_augroup("NeoAIVirtualInputWinEnter", { clear = true })
+  vim.api.nvim_create_autocmd("WinEnter", {
+    group = group,
+    buffer = state.float_buf,
+    callback = function()
+      -- 仅在浮动输入框激活时处理
+      if not state.active or state.mode ~= "float" then
+        return
+      end
+      if not state.float_win or not vim.api.nvim_win_is_valid(state.float_win) then
+        return
+      end
+      -- 如果输入框被隐藏，先恢复显示
+      if state._hidden then
+        M.show()
+      end
+      -- 进入插入模式（展开），忽略之前的 _user_exited_insert 标志
+      pcall(vim.api.nvim_set_current_win, state.float_win)
+      vim.cmd("startinsert")
+    end,
+    desc = "光标放到浮动输入框上时自动展开",
+  })
+end
 
-
+--- 清理 WinEnter 自动命令
+function M._cleanup_winenter_expand_autocmd()
+  pcall(vim.api.nvim_del_augroup_by_name, "NeoAIVirtualInputWinEnter")
+end
 
 --- 是否激活
 function M.is_active()

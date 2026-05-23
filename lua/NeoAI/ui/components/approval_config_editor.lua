@@ -7,10 +7,19 @@ local M = {}
 local Events = require("NeoAI.core.events")
 local approval_state = require("NeoAI.tools.approval_state")
 
+-- 选择器是否正在运行（防止重复打开及异常关闭后无法重新打开）
+M._selecting = false
+
 --- 打开修改审批配置悬浮窗
 --- 从 tool_registry 获取所有工具，通过 vim.ui.select 模糊匹配选择工具，
 --- 然后显示该工具的运行时审批配置，允许用户修改
 function M.open()
+  -- 防止重复打开
+  if M._selecting then
+    vim.notify("[NeoAI] 审批配置编辑器已打开，请先关闭当前界面", vim.log.levels.WARN)
+    return
+  end
+
   local ok, tool_registry = pcall(require, "NeoAI.tools.tool_registry")
   if not ok or not tool_registry then
     vim.notify("[NeoAI] 工具注册表不可用", vim.log.levels.WARN)
@@ -52,18 +61,24 @@ function M.open()
   end)
 
   -- 第一步：模糊匹配选择工具
-  vim.ui.select(items, {
+  M._selecting = true
+  local ok_select, err_select = pcall(vim.ui.select, items, {
     prompt = "选择要修改审批配置的工具:",
     format_item = function(item)
       return item.display
     end,
   }, function(selected)
+    M._selecting = false
     if not selected then
       return
     end
     -- 第二步：显示并修改该工具的审批配置
     M._show_editor(selected.name, selected.raw)
   end)
+  -- 如果 pcall 失败（vim.ui.select 被异常中断），清理状态
+  if not ok_select then
+    M._selecting = false
+end
 end
 
 --- 显示审批配置编辑器
