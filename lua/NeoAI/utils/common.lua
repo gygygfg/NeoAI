@@ -3,6 +3,28 @@ local M = {}
 -- LuaJIT/Lua 5.1 兼容：table.unpack 可能不存在
 local unpack_fn = table.unpack or unpack
 
+-- ========== Neovim 版本兼容 polyfill ==========
+-- vim.tbl_count 在 Neovim 0.10+ 引入，旧版本需要回退实现
+if vim.tbl_count == nil then
+  vim.tbl_count = function(t)
+    if type(t) ~= "table" then return 0 end
+    local count = 0
+    for _ in pairs(t) do count = count + 1 end
+    return count
+  end
+end
+
+-- vim.tbl_contains 在 Neovim 0.10+ 引入，旧版本需要回退实现
+if vim.tbl_contains == nil then
+  vim.tbl_contains = function(t, value)
+    if type(t) ~= "table" then return false end
+    for _, v in pairs(t) do
+      if v == value then return true end
+    end
+    return false
+  end
+end
+
 -- 表操作函数委托给 table_utils.lua
 local function get_table_utils()
   local ok, tu = pcall(require, "NeoAI.utils.table_utils")

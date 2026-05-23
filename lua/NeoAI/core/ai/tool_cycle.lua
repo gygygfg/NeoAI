@@ -849,15 +849,18 @@ function M._execute_single_tool(session_id, tool_call, is_sub_agent, on_complete
     end
   end
 
-  -- 调试日志：追踪 _execute_single_tool 调用
-  require("NeoAI.utils.logger").debug(
-    "[DEBUG_DUP] _execute_single_tool: session=%s, tool=%s, tool_call_id=%s, active_count=%d, stack=%s",
-    tostring(session_id),
-    tostring(tool_name),
-    tostring(tool_call.id or "nil"),
-    vim.tbl_count(ss.active_tool_calls or {}),
-    debug.traceback()
-  )
+  -- 调试日志：追踪 _execute_single_tool 调用（仅在 DEBUG 级别时发费性能求值）
+  local log_mod = require("NeoAI.utils.logger")
+  if log_mod.get_level and log_mod.get_level() == "DEBUG" then
+    log_mod.debug(
+      "[DEBUG_DUP] _execute_single_tool: session=%s, tool=%s, tool_call_id=%s, active_count=%d, stack=%s",
+      tostring(session_id),
+      tostring(tool_name),
+      tostring(tool_call.id or "nil"),
+      vim.tbl_count(ss.active_tool_calls or {}),
+      debug.traceback()
+    )
+  end
 
   -- 生成唯一 tool_call_id（如果已在 _execute_tools 中预注册，则跳过）
   local tool_call_id = tool_call.id

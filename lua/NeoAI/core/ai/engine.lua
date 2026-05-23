@@ -28,9 +28,11 @@ local state = {
   max_retries = 3,
   retry_delay_ms = 1000,
   active_generations = {},
+  session_locks = {},
   -- 防止 cancel_generation 被重复执行（多次按停止键时只生效一次）
   _cancel_processed = false,
 }
+
 
 -- ========== 初始化 ==========
 local M = {}
@@ -256,7 +258,7 @@ function _send_non_stream_request(generation_id, request, params)
   if not generation then return end
   local shared = state_manager.get_shared() or {}
   local ai_preset = shared.ai_preset or generation.ai_preset or {}
-    local response, err = http_utils.send_request({
+  local response, err = http_utils.send_request({
     request = request, generation_id = generation_id, base_url = ai_preset.base_url, api_key = ai_preset.api_key,
     timeout = ai_preset.timeout, api_type = ai_preset.api_type or "openai", provider_config = ai_preset,
   })
@@ -966,11 +968,7 @@ function M.handle_tool_result(data)
     state.active_generations[generation_id] = { start_time = os.time(), messages = messages, session_id = session_id, window_id = window_id, options = options, model_index = model_index, ai_preset = ai_preset, retry_count = 0, accumulated_usage = accumulated_usage, last_reasoning_content = last_reasoning }
   else
     local gen = state.active_generations[generation_id]
-    if not gen then
-      state.active_generations[generation_id] = { start_time = os.time(), messages = messages, session_id = session_id, window_id = window_id, options = options, model_index = model_index, ai_preset = ai_preset, retry_count = 0, accumulated_usage = accumulated_usage, last_reasoning_content = last_reasoning }
-    else
-      gen.messages = messages; gen.options = options; gen.ai_preset = ai_preset; gen.model_index = model_index; gen.accumulated_usage = accumulated_usage; gen.last_reasoning_content = last_reasoning
-    end
+    gen.messages = messages; gen.options = options; gen.ai_preset = ai_preset; gen.model_index = model_index; gen.accumulated_usage = accumulated_usage; gen.last_reasoning_content = last_reasoning
   end
 
   local formatted = request_handler.format_messages(messages)

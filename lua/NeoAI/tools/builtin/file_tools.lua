@@ -368,18 +368,26 @@ local function find_text_range(lines, anchor_line, search_text)
   -- 回退搜索：从 anchor 向上查找
   for i = anchor_line - 1, math.max(1, anchor_line - 5), -1 do
     if line_matches(lines[i]) then
-      return expand_range(i, line_matches)
+      local result = expand_range(i, line_matches)
+      result.fallback = true
+      return result
     elseif line_matches_fuzzy(lines[i]) then
-      return expand_range(i, line_matches_fuzzy)
+      local result = expand_range(i, line_matches_fuzzy)
+      result.fallback = true
+      return result
     end
   end
 
   -- 回退搜索：从 anchor 向下查找
   for i = anchor_line + 1, math.min(#lines, anchor_line + 5) do
     if line_matches(lines[i]) then
-      return expand_range(i, line_matches)
+      local result = expand_range(i, line_matches)
+      result.fallback = true
+      return result
     elseif line_matches_fuzzy(lines[i]) then
-      return expand_range(i, line_matches_fuzzy)
+      local result = expand_range(i, line_matches_fuzzy)
+      result.fallback = true
+      return result
     end
   end
 

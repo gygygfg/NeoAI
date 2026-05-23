@@ -2,6 +2,26 @@
 --- 职责：初始化所有模块、注册命令和快捷键
 --- 闭包内私有状态：core_ref, ui_ref, tools_ref（初始化后赋值）
 
+-- ========== Neovim 版本兼容 polyfill（最早加载） ==========
+-- vim.tbl_count / vim.tbl_contains 在 Neovim 0.10+ 引入
+if vim.tbl_count == nil then
+  vim.tbl_count = function(t)
+    if type(t) ~= "table" then return 0 end
+    local count = 0
+    for _ in pairs(t) do count = count + 1 end
+    return count
+  end
+end
+if vim.tbl_contains == nil then
+  vim.tbl_contains = function(t, value)
+    if type(t) ~= "table" then return false end
+    for _, v in pairs(t) do
+      if v == value then return true end
+    end
+    return false
+  end
+end
+
 local logger = require("NeoAI.utils.logger")
 local config_merger = require("NeoAI.core.config.merger")
 local core = require("NeoAI.core")
@@ -103,38 +123,27 @@ local function register_commands()
       return
     end
     local args = opts.args
+    local results
     if args and args ~= "" then
       local tests_to_run = {}
       for arg in args:gmatch("%S+") do
         table.insert(tests_to_run, arg)
       end
-      local results = tests.run_all(table.unpack(tests_to_run))
-      -- 汇总统计已由 tests.run_all 写入日志文件，此处仅通过 vim.notify 显示到消息区域
-      vim.notify(
-        string.format("测试结果: %d 通过, %d 失败", results.passed, results.failed),
-        vim.log.levels.INFO
-      )
-      if #results.errors > 0 then
-        local error_msgs = {}
-        for _, e in ipairs(results.errors) do
-          table.insert(error_msgs, e)
-        end
-        vim.notify("失败的测试:\n  " .. table.concat(error_msgs, "\n  "), vim.log.levels.WARN)
-      end
+      results = tests.run_all(table.unpack(tests_to_run))
     else
-      local results = tests.run_all()
-      -- 汇总统计已由 tests.run_all 写入日志文件，此处仅通过 vim.notify 显示到消息区域
-      vim.notify(
-        string.format("测试结果: %d 通过, %d 失败", results.passed, results.failed),
-        vim.log.levels.INFO
-      )
-      if #results.errors > 0 then
-        local error_msgs = {}
-        for _, e in ipairs(results.errors) do
-          table.insert(error_msgs, e)
-        end
-        vim.notify("失败的测试:\n  " .. table.concat(error_msgs, "\n  "), vim.log.levels.WARN)
+      results = tests.run_all()
+    end
+    -- 汇总统计已由 tests.run_all 写入日志文件，此处仅通过 vim.notify 显示到消息区域
+    vim.notify(
+      string.format("测试结果: %d 通过, %d 失败", results.passed, results.failed),
+      vim.log.levels.INFO
+    )
+    if #results.errors > 0 then
+      local error_msgs = {}
+      for _, e in ipairs(results.errors) do
+        table.insert(error_msgs, e)
       end
+      vim.notify("失败的测试:\n  " .. table.concat(error_msgs, "\n  "), vim.log.levels.WARN)
     end
   end, {
     nargs = "*",

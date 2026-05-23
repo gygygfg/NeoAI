@@ -49,15 +49,29 @@ function M.initialize()
 
   local builtin_dir = debug.getinfo(1).source:match("^@(.+)$")
   if not builtin_dir then
-    return
+    -- 回退：从 runtimepath 查找
+    for _, rt in ipairs(vim.api.nvim_list_runtime_paths()) do
+      local candidate = rt .. "/lua/NeoAI/tools/builtin"
+      if vim.uv.fs_stat(candidate) then
+        builtin_dir = candidate
+        break
+      end
+    end
   end
-
-  builtin_dir = builtin_dir:match("^(.+/)tool_pack%.lua$")
   if not builtin_dir then
     return
   end
 
-  builtin_dir = builtin_dir .. "builtin"
+  -- 如果 matched 的是完整文件路径，提取目录部分
+  if not vim.uv.fs_stat(builtin_dir) or vim.uv.fs_stat(builtin_dir).type ~= "directory" then
+    builtin_dir = builtin_dir:match("^(.+/)tool_pack%.lua$")
+    if builtin_dir then
+      builtin_dir = builtin_dir .. "builtin"
+    end
+  end
+  if not builtin_dir or not vim.uv.fs_stat(builtin_dir) then
+    return
+  end
 
   local handle = vim.uv.fs_scandir(builtin_dir)
   if not handle then

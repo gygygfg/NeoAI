@@ -126,11 +126,23 @@ function M._load_builtin_tools()
   if builtin_tools_loaded then return end
 
   local script_path = debug.getinfo(1).source:match("^@(.+)$")
-  if not script_path then builtin_tools_loaded = true; return end
-
+  if not script_path then
+    -- 回退：当 debug.getinfo 不可用时（如打包环境），使用 stdpath
+    script_path = vim.fn.stdpath("data") .. "/lazy/NeoAI/lua/NeoAI/tools/init.lua"
+  end
   local builtin_dir = script_path:match("^(.+/)lua/NeoAI/tools/init%.lua$")
     and script_path:match("^(.+/)lua/NeoAI/tools/init%.lua$") .. "lua/NeoAI/tools/builtin"
     or nil
+  if not builtin_dir then
+    -- 回退：尝试从 runtimepath 查找
+    for _, rt in ipairs(vim.api.nvim_list_runtime_paths()) do
+      local candidate = rt .. "/lua/NeoAI/tools/builtin"
+      if vim.uv.fs_stat(candidate) then
+        builtin_dir = candidate
+        break
+      end
+    end
+  end
   if not builtin_dir then builtin_tools_loaded = true; return end
 
   local handle = vim.uv.fs_scandir(builtin_dir)
