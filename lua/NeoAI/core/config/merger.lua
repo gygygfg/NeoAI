@@ -267,13 +267,19 @@ local function _validate_and_merge(default, user, constraint, path)
   for k, v in pairs(user) do
     local current_path = path .. "." .. tostring(k)
 
-    -- 如果该字段在默认配置中不存在，提示未知字段
+    local child_constraint = fields and fields[k] or nil
+
+    -- 如果该字段在默认配置中不存在，提示未知配置项
+    -- 但如果该字段有约束定义且允许为 null（nullable），则跳过不报错
     if default[k] == nil then
+      if child_constraint and child_constraint.nullable then
+        -- 允许为 nil 的字段，使用用户传入的值
+        default[k] = vim.deepcopy(v)
+        goto continue
+      end
       _collect_error(current_path, "未知配置项")
       goto continue
     end
-
-    local child_constraint = fields and fields[k] or nil
 
     -- 空表保护：如果用户传入空表且默认值非空，跳过覆盖保留默认值
     -- 适用于所有分支：无约束定义、free_form、递归合并
