@@ -104,6 +104,18 @@ function M._flush_session(session_id)
         if (entry.retry_count or 0) < 3 then
           entry.retry_count = (entry.retry_count or 0) + 1
           state._save_queue[session_id] = entry
+          -- 重新启动 per-session 定时器（原定时器已在 _flush_session 中关闭）
+          entry.timer = vim.uv.new_timer()
+          entry.timer:start(300, 0, vim.schedule_wrap(function()
+            M._flush_session(session_id)
+          end))
+          -- 确保全局刷新定时器存在
+          if not state._flush_timer or state._flush_timer:is_closing() then
+            state._flush_timer = vim.uv.new_timer()
+            state._flush_timer:start(2000, 0, vim.schedule_wrap(function()
+              M.flush_all()
+            end))
+          end
           logger.warn("[history_saver] 重试保存 (" .. entry.retry_count .. "/3)")
         end
       end

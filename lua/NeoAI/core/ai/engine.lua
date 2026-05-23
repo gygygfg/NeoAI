@@ -208,12 +208,13 @@ function M.generate_response(messages, params)
       local file_utils = require("NeoAI.utils.file_utils")
       local current_cwd = vim.fn.getcwd()
       local project_root = file_utils.find_project_root(current_cwd)
+      local nvim_ver = vim.version()
       local env_info = string.format(
         "\n\n[环境信息]\nNeovim 版本: %s\n当前工作目录: %s\n项目主路径: %s\n操作系统: %s",
-        vim.version().version or tostring(vim.version()),
+        nvim_ver.major .. "." .. nvim_ver.minor .. "." .. nvim_ver.patch,
         current_cwd,
         project_root,
-        vim.loop.os_uname().sysname or ""
+        (vim.uv.os_uname() or {}).sysname or ""
       )
       table.insert(formatted, 1, { role = "system", content = ai_preset.system_prompt .. env_info })
     end

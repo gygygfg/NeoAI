@@ -106,11 +106,13 @@ M.external_formatters = {
 }
 
 function M.lang_from_ext(ext)
+  if not ext then return nil end
   ext = ext:match("^%.?(.+)$")
   return M.ext_to_lang[ext]
 end
 
 function M.parser_from_ext(ext)
+  if not ext then return nil end
   local dotted = ext:find("^%.") and ext or "." .. ext
   return M.ext_to_parser[dotted]
 end

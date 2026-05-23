@@ -89,7 +89,7 @@ function M.debounce(func, delay)
     local args = { ... }
 
     if timer then
-      timer:close()
+      pcall(vim.fn.timer_stop, timer)
     end
 
     timer = vim.defer_fn(function()
@@ -118,7 +118,7 @@ function M.throttle(func, limit)
     else
       -- 如果已经有定时器，取消它
       if timer then
-        timer:close()
+        pcall(vim.fn.timer_stop, timer)
       end
 
       -- 设置新的定时器

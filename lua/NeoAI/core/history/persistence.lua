@@ -446,7 +446,7 @@ function M.debounced_save(sessions_func, debounce_ms)
   end
 
   if not state._debounce_timer or state._debounce_timer:is_closing() then
-    state._debounce_timer = vim.loop.new_timer()
+    state._debounce_timer = vim.uv.new_timer()
   end
 
   state._debounce_active = true

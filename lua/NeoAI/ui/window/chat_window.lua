@@ -51,6 +51,9 @@ local function win_valid(win)
 end
 
 local function set_buf_modifiable(buf, modifiable)
+  if buf and vim.api.nvim_buf_is_valid(buf) then
+    pcall(vim.api.nvim_set_option_value, "modifiable", modifiable, { buf = buf })
+  end
 end
 
 local function get_line_count(buf)
@@ -640,7 +643,7 @@ local function _schedule_cursor_follow(delay_ms)
       pcall(state.cursor_follow.timer.close, state.cursor_follow.timer)
       state.cursor_follow.timer = nil
     end
-    state.cursor_follow.timer = vim.loop.new_timer()
+    state.cursor_follow.timer = vim.uv.new_timer()
     state.cursor_follow.timer:start(
       delay_ms,
       0,
@@ -963,7 +966,7 @@ function M.render_chat()
   end
 
   -- 防抖处理：避免频繁渲染
-  local now = vim.loop.now()
+  local now = vim.uv.now()
   if now - state.last_render_time < 100 then -- 100毫秒内不重复渲染
     -- 取消之前的定时器
     if state.render_debounce_timer then
@@ -973,7 +976,7 @@ function M.render_chat()
     end
 
     -- 设置新的定时器
-    state.render_debounce_timer = vim.loop.new_timer()
+    state.render_debounce_timer = vim.uv.new_timer()
     state.render_debounce_timer:start(
       100,
       0,

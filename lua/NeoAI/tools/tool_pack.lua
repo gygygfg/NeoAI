@@ -59,13 +59,13 @@ function M.initialize()
 
   builtin_dir = builtin_dir .. "builtin"
 
-  local handle = vim.loop.fs_scandir(builtin_dir)
+  local handle = vim.uv.fs_scandir(builtin_dir)
   if not handle then
     return
   end
 
   while true do
-    local name, file_type = vim.loop.fs_scandir_next(handle)
+    local name, file_type = vim.uv.fs_scandir_next(handle)
     if not name then
       break
     end

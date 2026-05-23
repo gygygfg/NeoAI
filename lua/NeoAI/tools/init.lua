@@ -26,7 +26,7 @@ function M.initialize(config)
   tool_validator.initialize(tools_config)
   initialized = true
   -- 延迟加载内置工具，不阻塞初始化流程
-  if config.builtin ~= false then
+  if tools_config.builtin ~= false then
     vim.schedule(function()
       M._load_builtin_tools()
     end)
@@ -133,11 +133,11 @@ function M._load_builtin_tools()
     or nil
   if not builtin_dir then builtin_tools_loaded = true; return end
 
-  local handle = vim.loop.fs_scandir(builtin_dir)
+  local handle = vim.uv.fs_scandir(builtin_dir)
   if not handle then builtin_tools_loaded = true; return end
 
   while true do
-    local name, file_type = vim.loop.fs_scandir_next(handle)
+    local name, file_type = vim.uv.fs_scandir_next(handle)
     if not name then break end
     if file_type == "file" and name:match("%.lua$") then
       local mod_name = name:gsub("%.lua$", "")
