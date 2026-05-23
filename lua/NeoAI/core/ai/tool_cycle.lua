@@ -144,7 +144,11 @@ local function once_display_closed(session_id, callback)
   if is_shutting_down() then
     return
   end
-  callback()
+  -- pcall 保护：防止回调异常导致后续状态转换无法执行
+  local ok, err = pcall(callback)
+  if not ok then
+    logger.warn("[tool_orchestrator] once_display_closed 回调异常: %s", tostring(err))
+  end
 end
 
 --- 触发 TOOL_LOOP_FINISHED 事件
@@ -1541,7 +1545,15 @@ function M._on_tools_complete(session_id, is_sub_agent)
     -- 本轮已完成，由 _check_round_complete 决定是否开启下一轮
     M._check_round_complete(session_id, is_sub_agent)
   else
+    -- phase 异常时（如 idle/waiting_model），仍应调用 _check_round_complete
+    -- 避免 _tools_all_completed 已设为 true 但双事件检查永不触发导致循环卡死
     ss._tools_complete_in_progress = false
+    logger.warn(
+      "[tool_orchestrator] _on_tools_complete: phase 异常 '%s'，仍触发 _check_round_complete, session=%s",
+      tostring(ss.phase),
+      tostring(session_id)
+    )
+    M._check_round_complete(session_id, is_sub_agent)
   end
 end
 
@@ -1615,19 +1627,31 @@ function M._proceed_to_next_round(session_id, is_sub_agent)
   end
   ss._proceed_in_progress = true
 
-  ss.phase = "idle"
-  ss.active_tool_calls = {}
-  ss._executed_tool_call_ids = {} -- 重置已执行工具 ID 集合，新的一轮重新计数
+  -- pcall 保护：确保 _proceed_in_progress 始终被重置，防止异常导致永久卡死
+  local ok, proceed_err = pcall(function()
+    ss.phase = "idle"
+    ss.active_tool_calls = {}
+    ss._executed_tool_call_ids = {} -- 重置已执行工具 ID 集合，新的一轮重新计数
 
-  if ss.stop_requested then
-    ss._proceed_in_progress = false
+    if ss.stop_requested then
+      return
+    end
+
+    fire_loop_finished(ss, false, "tools_complete")
+    ss.current_iteration = ss.current_iteration + 1
+    ss.phase = "waiting_model"
+  end)
+
+  ss._proceed_in_progress = false
+
+  if not ok then
+    logger.warn("[tool_orchestrator] _proceed_to_next_round 内部异常: %s", tostring(proceed_err))
     return
   end
 
-  fire_loop_finished(ss, false, "tools_complete")
-  ss.current_iteration = ss.current_iteration + 1
-  ss.phase = "waiting_model"
-  ss._proceed_in_progress = false
+  if ss.stop_requested then
+    return
+  end
 
   -- 使用 vim.schedule 异步执行 _request_generation，防止 handle_tool_result
   -- 的同步回调导致递归调用 _proceed_to_next_round，造成工具被重复执行

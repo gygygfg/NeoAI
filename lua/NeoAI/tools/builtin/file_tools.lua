@@ -320,23 +320,31 @@ local function find_text_range(lines, anchor_line, search_text)
     return nil
   end
 
-  -- 匹配函数：去除行中所有空白字符后做子串匹配
+  -- 匹配函数：去除行中所有空白字符后做精确匹配
+  -- 使用精确匹配而非子串匹配，避免短文本（如 "end"）误匹配到包含该子串的行（如 "append"、"pending"）
   local function line_matches(line)
+    local line_stripped = normalize_line_text(line):gsub("%s", "")
+    return line_stripped == search_stripped
+  end
+
+  -- 子串匹配回退：兼容更灵活的搜索需求（如 "function foo" 匹配 "local function foo(a, b)"）
+  local function line_matches_fuzzy(line)
     local line_stripped = normalize_line_text(line):gsub("%s", "")
     return line_stripped:find(search_stripped, 1, true) ~= nil
   end
 
-  if line_matches(lines[anchor_line]) then
-    local s, e = anchor_line, anchor_line
-    for i = anchor_line + 1, #lines do
-      if line_matches(lines[i]) then
+  -- 扩展匹配范围：从 anchor_line 向上下扩展连续匹配的行
+  local function expand_range(anchor, match_fn)
+    local s, e = anchor, anchor
+    for i = anchor + 1, #lines do
+      if match_fn(lines[i]) then
         e = i
       else
         break
       end
     end
-    for i = anchor_line - 1, 1, -1 do
-      if line_matches(lines[i]) then
+    for i = anchor - 1, 1, -1 do
+      if match_fn(lines[i]) then
         s = i
       else
         break
@@ -345,47 +353,33 @@ local function find_text_range(lines, anchor_line, search_text)
     return { start_line = s, end_line = e, fallback = false }
   end
 
+  -- 先尝试精确匹配
+  local match_fn = line_matches
+  if match_fn(lines[anchor_line]) then
+    return expand_range(anchor_line, match_fn)
+  end
+
+  -- 精确匹配失败，尝试子串匹配
+  if line_matches_fuzzy(lines[anchor_line]) then
+    match_fn = line_matches_fuzzy
+    return expand_range(anchor_line, match_fn)
+  end
+
   -- 回退搜索：从 anchor 向上查找
   for i = anchor_line - 1, math.max(1, anchor_line - 5), -1 do
     if line_matches(lines[i]) then
-      local s, e = i, i
-      for j = i + 1, #lines do
-        if line_matches(lines[j]) then
-          e = j
-        else
-          break
-        end
-      end
-      for j = i - 1, 1, -1 do
-        if line_matches(lines[j]) then
-          s = j
-        else
-          break
-        end
-      end
-      return { start_line = s, end_line = e, fallback = true }
+      return expand_range(i, line_matches)
+    elseif line_matches_fuzzy(lines[i]) then
+      return expand_range(i, line_matches_fuzzy)
     end
   end
 
   -- 回退搜索：从 anchor 向下查找
   for i = anchor_line + 1, math.min(#lines, anchor_line + 5) do
     if line_matches(lines[i]) then
-      local s, e = i, i
-      for j = i + 1, #lines do
-        if line_matches(lines[j]) then
-          e = j
-        else
-          break
-        end
-      end
-      for j = i - 1, 1, -1 do
-        if line_matches(lines[j]) then
-          s = j
-        else
-          break
-        end
-      end
-      return { start_line = s, end_line = e, fallback = true }
+      return expand_range(i, line_matches)
+    elseif line_matches_fuzzy(lines[i]) then
+      return expand_range(i, line_matches_fuzzy)
     end
   end
 
@@ -412,9 +406,20 @@ local function _replace_text(args, on_success, on_error)
     return
   end
 
+  -- 向后兼容：如果未提供 start_match/end_match，尝试从 start_line/end_line（旧版参数名）构造
+  if (not start_match or not end_match) and args.start_line and args.end_line then
+    if not start_match then
+      start_match = { line_number = args.start_line, search_text = "" }
+    end
+    if not end_match then
+      end_match = { line_number = args.end_line, search_text = "" }
+    end
+  end
+
   if not start_match or not end_match then
     if on_error then
-      on_error("需要 start_match 和 end_match 参数（格式：{line_number, search_text}）")
+      on_error("需要 start_match 和 end_match 参数（格式：{line_number, search_text}），"
+        .. "或使用旧版参数 start_line 和 end_line")
     end
     return
   end
@@ -639,6 +644,10 @@ local function _replace_text(args, on_success, on_error)
     end
 
     local function emit_diagnostics()
+      if emitted then
+        return -- 防止重复调用（DiagnosticChanged 可能在定时器触发后再次触发）
+      end
+
       emitted = true
 
       pcall(function()
