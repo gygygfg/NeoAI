@@ -78,6 +78,29 @@ local timeout_state = {
   paused_elapsed = {}, -- tool_call_id -> number 暂停时已过去的毫秒数（用于暂停/恢复时正确计算剩余时间）
 }
 
+-- ========== 只读工具超时策略 ==========
+-- 只读工具（read_file、search_files、list_files 等）的超时时间更短
+-- 因为文件不存在或路径错误是立即返回的，不需要等 30 秒
+-- 且失败后重试也没有意义（文件不会突然出现）
+local READONLY_TOOL_TIMEOUT_MS = 10000 -- 10 秒
+
+-- 只读工具名称集合
+local READONLY_TOOL_NAMES = {
+  read_file = true,
+  search_files = true,
+  list_files = true,
+  file_exists = true,
+  parse_file = true,
+  query_tree = true,
+  get_node_at_position = true,
+  get_node_type = true,
+  get_node_range = true,
+  is_named_node = true,
+  get_parent_node = true,
+  get_child_nodes = true,
+  get_node_code = true,
+}
+
 -- ========== 辅助函数 ==========
 
 -- 路径解析：展开 ~ 为家目录，将相对路径转为绝对路径
@@ -1364,16 +1387,25 @@ function M._is_write_tool(tool_name)
   local write_tool_names = {
     replace_text = true,
     edit_file = true,
+    edit_node = true,
+    delete_node = true,
     create_file = true,
     write_file = true,
     delete_file = true,
-    create_directory = true,
-    ensure_dir = true,
+    -- 注意：create_directory 和 ensure_dir 不在此列表中，
+    -- 因为它们创建的是目录而非文件，不应触发"文件修改预览"
     insert_edit_into_file = true,
     lsp_rename = true,
     lsp_format = true,
   }
   return write_tool_names[tool_name] == true
+end
+
+--- 判断工具是否为只读工具（不会修改任何状态）
+--- @param tool_name string 工具名称
+--- @return boolean
+function M._is_readonly_tool(tool_name)
+  return READONLY_TOOL_NAMES[tool_name] == true
 end
 
 --- 从工具参数中提取文件路径
@@ -1481,9 +1513,67 @@ function M._intercept_write_tool_result(tool_name, resolved_args, raw_args, orig
   -- 读取文件上下文
   local file_context = _read_file_context(filepath, start_line, end_line)
 
+  -- 检查原始结果是否包含错误信息
+  local result_str = type(original_result) == "table" and vim.inspect(original_result) or tostring(original_result or "")
+  local is_error = result_str:find("错误") or result_str:find("error") or result_str:find("失败") or result_str:find("nil")
+
   -- 构造预览结果
-  local preview_result = string.format(
-    [[【文件修改预览 - 等待 AI 确认】
+  local preview_result
+  if is_error then
+    preview_result = string.format(
+      [[【工具执行出错 - 等待 AI 处理】
+
+工具: %s
+文件: %s
+
+=== 错误信息 ===
+%s
+
+=== 文件当前内容 ===
+%s
+
+=== 操作说明 ===
+工具执行时遇到错误。AI 需要检查错误原因并决定如何处理。
+
+- 如果参数有误（如行号、匹配文本不准确），请调用 confirm_file_change 工具：
+  - action: "retry"
+  - reason: 说明修正了哪些参数
+  - arguments: 修正后的完整参数字典（包含所有必要参数）
+  （注意：重试后仍会再次预览，最多可重试 3 次）
+- 如果确定不需要修改此文件，请调用 confirm_file_change 工具：
+  - action: "abandon"
+  - reason: 说明放弃原因]],
+      tool_name,
+      filepath,
+      result_str,
+      file_context
+    )
+  elseif tool_name == "delete_file" then
+    -- 删除操作的特殊预览：文件已被删除，无法读取内容
+    local delete_result_str = type(original_result) == "table"
+      and vim.inspect(original_result)
+      or tostring(original_result or "")
+    preview_result = string.format(
+      [[【文件删除预览 - 等待 AI 确认】
+
+工具: %s
+文件: %s
+
+=== 删除结果 ===
+%s
+
+=== 操作说明 ===
+文件已被删除。AI 需要检查删除操作是否符合预期。
+
+- 如果确认删除正确，删除将保留。无需额外操作。
+- 如果发现误删，请使用 git_rollback 工具恢复文件。]],
+      tool_name,
+      filepath,
+      delete_result_str
+    )
+  else
+    preview_result = string.format(
+      [[【文件修改预览 - 等待 AI 确认】
 
 工具: %s
 文件: %s
@@ -1497,10 +1587,11 @@ function M._intercept_write_tool_result(tool_name, resolved_args, raw_args, orig
 - 如果确认修改正确，修改将保留。无需额外操作。
 - 如果发现修改有误，请直接调用其他编辑工具（如 replace_text、edit_node 等）再次修正文件。
 - 如果希望撤销修改，可使用 git_rollback 工具恢复文件到修改前状态。]],
-    tool_name,
-    filepath,
-    file_context
-  )
+      tool_name,
+      filepath,
+      file_context
+    )
+  end
 
   -- 将预览结果通过 on_success 返回给 AI
   if on_success then
@@ -1554,8 +1645,12 @@ function M.execute_with_orchestrator(tool_name, raw_args, session_context, callb
     timeout_ms = -1 -- 无限等待，不设超时
   elseif tool_timeout ~= nil then
     timeout_ms = tool_timeout -- 工具自定义超时
+  elseif READONLY_TOOL_NAMES[tool_name] then
+    -- 只读工具使用更短的超时（10 秒）
+    -- 因为文件不存在或路径错误是立即返回的，不需要等 30 秒
+    timeout_ms = READONLY_TOOL_TIMEOUT_MS
   else
-    timeout_ms = timeout_state.timeout_ms -- 全局默认超时
+    timeout_ms = timeout_state.timeout_ms -- 全局默认超时（30 秒）
   end
 
   -- 将超时配置保存到 arguments 中，供审批通过后 _continue_execution 使用
@@ -1688,6 +1783,13 @@ function M.execute_with_orchestrator(tool_name, raw_args, session_context, callb
       elseif filepath and not file_utils.exists(filepath) then
         full_err = full_err .. "\n\n注意：文件 '" .. filepath .. "' 不存在，请检查路径是否正确。"
       end
+
+      -- 添加重试指引：告知 AI 可以使用 confirm_file_change 工具覆盖参数重试
+      full_err = full_err .. "\n\n💡 如果你认为可以修正参数后重试，请调用 confirm_file_change 工具："
+        .. "\n   - action: \"retry\""
+        .. "\n   - reason: 说明修正了哪些参数"
+        .. "\n   - arguments: 修正后的完整参数字典"
+        .. "\n（最多可重试 3 次，超过后将自动放弃）"
 
       if original_on_result then
         original_on_result(false, full_err)

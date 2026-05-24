@@ -606,8 +606,11 @@ local function _query_tree(args, on_success, on_error)
     vim.schedule(function()
       local lang = detect_lang_from_filepath(filepath)
       if not lang then
+        local ext = vim.fn.fnamemodify(filepath, ":e")
+        local filetype_hint = ext and ext ~= "" and ("（文件扩展名 '.%s' 没有对应的 Tree-sitter 解析器）"):format(ext)
+          or "（无法从文件路径推断语言类型）"
         if on_error then
-          on_error("无法确定文件语言")
+          on_error("无法确定文件语言" .. filetype_hint .. "。Tree-sitter 仅支持编程语言文件，不支持纯文本文件")
         end
         return
       end

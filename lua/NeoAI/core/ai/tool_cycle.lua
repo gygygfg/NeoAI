@@ -1385,43 +1385,17 @@ function M._execute_single_tool(session_id, tool_call, is_sub_agent, on_complete
           local result_str = type(result) == "string" and result or vim.json.encode(result) or ""
           M._add_tool_result_to_messages(session_id, tool_call_id, tool_name, result_str, is_sub_agent, normalized_args)
         else
-          -- 工具执行失败：按 (session_id, tool_name) 独立检查重试次数
-          local retry_key = session_id .. ":" .. tool_name
-          local tool_retry_count = _param_retry_counts[retry_key] or 0
+          -- 判断是否为只读工具
+          local is_readonly = tool_executor._is_readonly_tool(tool_name)
 
-          if tool_retry_count < 3 then
-            _param_retry_counts[retry_key] = tool_retry_count + 1
-
-            -- 注册 confirm_file_change 到 request_handler，让 AI 通过工具调用传递修正参数
-            _register_confirm_tool()
-
-            -- 构建工具可用参数提示
-            local tdef = tool_registry.get(tool_name)
-            local param_hint = ""
-            if tdef and tdef.parameters and tdef.parameters.properties then
-              local props = {}
-              for pname, pschema in pairs(tdef.parameters.properties) do
-                local desc = pschema.description or ""
-                local ptype = pschema.type or "any"
-                table.insert(props, string.format("  - %s (%s): %s", pname, ptype, desc))
-              end
-              if #props > 0 then
-                param_hint = "\n\n工具 " .. tool_name .. " 的可用参数:\n" .. table.concat(props, "\n")
-              end
-            end
-
+          if is_readonly then
+            -- 只读工具（read_file、search_files 等）失败不提示重试
+            -- 因为文件不存在或路径错误是确定性的，重试也没有意义
             local result_str = string.format(
               "[工具执行失败] %s\n\n"
-                .. "请直接重新调用工具 `%s`，使用修正后的参数重试。\n"
-                .. "你传入的错误参数:\n"
-                .. "%s\n"
-                .. "%s\n"
-                .. "（修正尝试 %d/3，超过后自动放弃）",
-              tostring(result),
-              tool_name,
-              vim.inspect(normalized_args or tool_func.arguments),
-              param_hint,
-              _param_retry_counts[retry_key]
+                .. "提示：这是一个只读操作，失败原因通常是文件不存在或路径错误。\n"
+                .. "请检查文件路径是否正确，或使用 list_files/search_files 先确认文件是否存在。",
+              tostring(result)
             )
             M._add_tool_result_to_messages(
               session_id,
@@ -1431,23 +1405,76 @@ function M._execute_single_tool(session_id, tool_call, is_sub_agent, on_complete
               is_sub_agent,
               normalized_args
             )
-
             logger.debug(
-              "[tool_orchestrator] 工具 '%s' 执行失败，等待 AI 修正参数重试 (尝试 %d/3)",
+              "[tool_orchestrator] 只读工具 '%s' 执行失败，不提示重试: %s",
               tool_name,
-              _param_retry_counts[retry_key]
+              tostring(result)
             )
           else
-            -- 该工具重试已达上限，自动放弃，不再提示重试
-            local skip_msg = string.format(
-              "[工具调用已放弃] 工具 '%s' 的参数修正重试已达上限 (3/3)，已自动放弃此修改。",
-              tool_name
-            )
-            M._add_tool_result_to_messages(session_id, tool_call_id, tool_name, skip_msg, is_sub_agent, normalized_args)
-            logger.warn(
-              "[tool_orchestrator] 工具 '%s' 参数修正重试已达上限 (3/3)，已自动放弃",
-              tool_name
-            )
+            -- 写入工具执行失败：按 (session_id, tool_name) 独立检查重试次数
+            local retry_key = session_id .. ":" .. tool_name
+            local tool_retry_count = _param_retry_counts[retry_key] or 0
+
+            if tool_retry_count < 3 then
+              _param_retry_counts[retry_key] = tool_retry_count + 1
+
+              -- 注册 confirm_file_change 到 request_handler，让 AI 通过工具调用传递修正参数
+              _register_confirm_tool()
+
+              -- 构建工具可用参数提示
+              local tdef = tool_registry.get(tool_name)
+              local param_hint = ""
+              if tdef and tdef.parameters and tdef.parameters.properties then
+                local props = {}
+                for pname, pschema in pairs(tdef.parameters.properties) do
+                  local desc = pschema.description or ""
+                  local ptype = pschema.type or "any"
+                  table.insert(props, string.format("  - %s (%s): %s", pname, ptype, desc))
+                end
+                if #props > 0 then
+                  param_hint = "\n\n工具 " .. tool_name .. " 的可用参数:\n" .. table.concat(props, "\n")
+                end
+              end
+
+              local result_str = string.format(
+                "[工具执行失败] %s\n\n"
+                  .. "请直接重新调用工具 `%s`，使用修正后的参数重试。\n"
+                  .. "你传入的错误参数:\n"
+                  .. "%s\n"
+                  .. "%s\n"
+                  .. "（修正尝试 %d/3，超过后自动放弃）",
+                tostring(result),
+                tool_name,
+                vim.inspect(normalized_args or tool_func.arguments),
+                param_hint,
+                _param_retry_counts[retry_key]
+              )
+              M._add_tool_result_to_messages(
+                session_id,
+                tool_call_id,
+                tool_name,
+                result_str,
+                is_sub_agent,
+                normalized_args
+              )
+
+              logger.debug(
+                "[tool_orchestrator] 工具 '%s' 执行失败，等待 AI 修正参数重试 (尝试 %d/3)",
+                tool_name,
+                _param_retry_counts[retry_key]
+              )
+            else
+              -- 该工具重试已达上限，自动放弃，不再提示重试
+              local skip_msg = string.format(
+                "[工具调用已放弃] 工具 '%s' 的参数修正重试已达上限 (3/3)，已自动放弃此修改。",
+                tool_name
+              )
+              M._add_tool_result_to_messages(session_id, tool_call_id, tool_name, skip_msg, is_sub_agent, normalized_args)
+              logger.warn(
+                "[tool_orchestrator] 工具 '%s' 参数修正重试已达上限 (3/3)，已自动放弃",
+                tool_name
+              )
+            end
           end
         end
 
@@ -3149,5 +3176,42 @@ function M.cleanup_all()
   state.sub_agent_sessions = {}
   _tools = {}
 end
+
+-- ========== 模型切换事件监听 ==========
+-- 当用户通过 model_selector 切换模型时，同步更新所有活跃会话的 model_index 和 ai_preset
+-- 确保下一轮工具循环使用新模型
+vim.api.nvim_create_autocmd("User", {
+  pattern = event_constants.MODEL_SWITCHED,
+  callback = function(args)
+    local data = args.data or {}
+    local new_index = data.new_index
+    if not new_index then
+      return
+    end
+
+    -- 延时加载 engine 模块，避免循环依赖（engine 在初始化时 require tool_cycle）
+    local ok, engine = pcall(require, "NeoAI.core.ai.engine")
+    if not ok or not engine or not engine.get_model_config then
+      -- 如果 engine 还未加载完成，至少更新 model_index
+      for _, ss in pairs(state.sessions) do
+        ss.model_index = new_index
+      end
+      for _, ss in pairs(state.sub_agent_sessions) do
+        ss.model_index = new_index
+      end
+      return
+    end
+
+    local new_preset = engine.get_model_config(new_index)
+    for _, ss in pairs(state.sessions) do
+      ss.model_index = new_index
+      ss.ai_preset = new_preset
+    end
+    for _, ss in pairs(state.sub_agent_sessions) do
+      ss.model_index = new_index
+      ss.ai_preset = new_preset
+    end
+  end,
+})
 
 return M

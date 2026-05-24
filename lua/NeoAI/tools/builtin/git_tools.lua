@@ -807,6 +807,24 @@ function _git_auto_mod.rollback(commit_hash, filepath, cwd)
   local ok, root = _git_auto_mod._detect_real_git(cwd)
   if ok then
     if filepath then
+      -- 验证文件路径：检查文件是否存在于工作目录中
+      local abs_filepath = filepath
+      if not abs_filepath:match("^/") then
+        abs_filepath = root .. "/" .. filepath
+      end
+      local file_stat = vim.uv.fs_stat(abs_filepath)
+      if not file_stat then
+        -- 检查是否是相对路径且文件在 root 下存在
+        local alt_path = root .. "/" .. filepath
+        file_stat = vim.uv.fs_stat(alt_path)
+        if not file_stat then
+          return false, string.format(
+            "文件 '%s' 在 git 工作目录中不存在（git 根目录: %s）。请确认文件路径是否正确。",
+            filepath,
+            root
+          )
+        end
+      end
       -- 回滚单个文件（使用 git restore，比 checkout 更安全）
       local restore_cmd = string.format("git -C %s restore --source=%s --staged --worktree %s 2>/dev/null", root, commit_hash, filepath)
       vim.fn.system(restore_cmd)
@@ -814,11 +832,11 @@ function _git_auto_mod.rollback(commit_hash, filepath, cwd)
       if success then
         _git_auto_mod._auto_stage_and_commit("rollback", filepath, { filepath = filepath })
       end
-      return success, success and nil or "git restore 失败"
+      return success, success and nil or string.format("git restore 失败: 无法将 '%s' 回滚到提交 '%s'", filepath, commit_hash:sub(1, 8))
     else
       -- 回滚整个提交
-      local ok, err = _git_auto_mod._git_reset(commit_hash, "hard", cwd)
-      return ok, err
+      local ok_r, err_r = _git_auto_mod._git_reset(commit_hash, "hard", cwd)
+      return ok_r, err_r
     end
   end
   return _git_auto_mod._pseudo_rollback(commit_hash)

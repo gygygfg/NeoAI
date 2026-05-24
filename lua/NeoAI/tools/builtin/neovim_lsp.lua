@@ -1226,12 +1226,23 @@ local function lsp_request_async(bufnr, method, params, callback)
             )
           )
         else
-          callback(nil, string.format('LSP 方法 "%s" 不被任何已连接的服务器支持', method))
-        end
-      end
-      return
-    end
-  end
+          -- 构建更友好的错误信息，包含连接的服务端名称
+          local client_names = {}
+          for _, c in ipairs(clients) do
+            table.insert(client_names, c.name)
+          end
+          local client_list_str = #client_names > 0 and table.concat(client_names, ", ") or "未知"
+          callback(
+            nil,
+            string.format(
+              'LSP 方法 "%s" 不被当前已连接的服务器支持。\n'
+                .. "已连接服务器: %s\n"
+                .. "提示: 该方法需要 LSP 服务器具备相应能力，当前服务器(%s)可能不支持此功能。",
+              method,
+              client_list_str,
+              client_list_str
+            )
+          )
 
   -- 生成唯一请求 ID
   _request_counter = _request_counter + 1
@@ -1575,9 +1586,37 @@ local function _lsp_hover(args, on_success, on_error)
           return
         end
 
-        -- 检查 contents 是否为空（空 table 或 nil）
-        local has_content = result.contents ~= nil
-          and not (type(result.contents) == "table" and vim.tbl_isempty(result.contents))
+        -- 检查 contents 是否为空（空 table、nil 或内容为空字符串）
+        local has_content = false
+        if result.contents ~= nil then
+          if type(result.contents) == "table" then
+            -- MarkupContent 格式: { kind = "markdown", value = "..." }
+            if result.contents.value ~= nil then
+              has_content = type(result.contents.value) == "string" and result.contents.value ~= ""
+            -- MarkedString 格式: { language = "python", value = "..." }
+            elseif result.contents.language ~= nil and result.contents.value ~= nil then
+              has_content = type(result.contents.value) == "string" and result.contents.value ~= ""
+            -- 数组格式: { { ... }, { ... } }
+            elseif #result.contents > 0 then
+              for _, item in ipairs(result.contents) do
+                if type(item) == "string" and item ~= "" then
+                  has_content = true
+                  break
+                elseif type(item) == "table" and item.value ~= nil and item.value ~= "" then
+                  has_content = true
+                  break
+                end
+              end
+            else
+              -- 其他 table 格式，使用通用检查
+              has_content = not vim.tbl_isempty(result.contents)
+            end
+          elseif type(result.contents) == "string" then
+            has_content = result.contents ~= ""
+          else
+            has_content = true -- 其他类型（number 等）视为有内容
+          end
+        end
 
         -- 当 LSP 返回空 contents 时，尝试从源码中提取文档注释作为兜底
         if not has_content then
@@ -3015,83 +3054,119 @@ local function _lsp_rename(args, on_success, on_error)
               new_name = args.new_name,
               changes = nil,
               found = false,
+              _note = "LSP 重命名请求返回空结果，符号可能未被重命名",
             })
           end
           return
         end
 
-        if on_success then
-          -- 应用 workspace edit 以实际修改文件
-          local offset_encoding = clients and clients[1] and clients[1].offset_encoding or "utf-16"
-
-          -- apply_workspace_edit 在 Neovim 0.10+ 返回 { status = true/false }
-          local ok_apply, apply_result = pcall(vim.lsp.util.apply_workspace_edit, result, offset_encoding)
-          if not ok_apply then
-            if on_error then
-              on_error("重命名请求成功但应用编辑失败: " .. tostring(apply_result))
-            end
-            return
+        -- 检查 LSP 返回的变更是否确实包含内容
+        local has_changes = (result.changes and next(result.changes) ~= nil)
+          or (result.documentChanges and #result.documentChanges > 0)
+        if not has_changes then
+          if on_success then
+            on_success({
+              filepath = args.filepath,
+              symbol = args.symbol,
+              new_name = args.new_name,
+              changes = result.changes or result.documentChanges,
+              found = false,
+              _note = "LSP 返回成功但无实际变更内容，重命名可能未生效",
+            })
           end
+          return
+        end
 
-          -- 检查 apply_workspace_edit 的返回状态（兼容新旧版本 Neovim）
-          if type(apply_result) == "table" and apply_result.status == false then
-            if on_error then
-              on_error("重命名请求成功但应用编辑被拒绝")
-            end
-            return
-          end
+        -- 应用 workspace edit 以实际修改文件
+        local offset_encoding = clients and clients[1] and clients[1].offset_encoding or "utf-16"
 
-          -- 保存所有受影响的文件到磁盘
-          -- apply_workspace_edit 只修改 buffer，不自动写入磁盘
-          local saved_files = {}
-          local uri_to_fname = {}
-          -- 处理 result.changes（旧格式：URI -> TextEdit[]）
-          if result.changes then
-            for uri, _ in pairs(result.changes) do
-              local fname = vim.uri_to_fname(uri)
-              uri_to_fname[uri] = fname
-            end
+        -- apply_workspace_edit 在 Neovim 0.10+ 返回 { status = true/false }
+        local ok_apply, apply_result = pcall(vim.lsp.util.apply_workspace_edit, result, offset_encoding)
+        if not ok_apply then
+          if on_error then
+            on_error("重命名请求成功但应用编辑失败: " .. tostring(apply_result))
           end
-          -- 处理 result.documentChanges（新格式：TextDocumentEdit[]）
-          if result.documentChanges then
-            for _, change in ipairs(result.documentChanges) do
-              if change.textDocument and change.textDocument.uri then
-                local fname = vim.uri_to_fname(change.textDocument.uri)
-                uri_to_fname[change.textDocument.uri] = fname
-              end
-            end
-          end
+          return
+        end
 
-          -- 遍历所有受影响的文件并保存
-          for uri, fname in pairs(uri_to_fname) do
-            local affected_bufnr = vim.fn.bufnr(fname)
-            if affected_bufnr ~= -1 and vim.api.nvim_buf_is_valid(affected_bufnr) then
-              local ok_save, save_err = pcall(vim.api.nvim_buf_call, affected_bufnr, function()
-                pcall(vim.cmd, "silent write")
+        -- 检查 apply_workspace_edit 的返回状态（兼容新旧版本 Neovim）
+        if type(apply_result) == "table" and apply_result.status == false then
+          if on_error then
+            on_error("重命名请求成功但应用编辑被拒绝")
+          end
+          return
+        end
+
+        -- 收集所有受影响的文件路径
+        local uri_to_fname = {}
+        if result.changes then
+          for uri, _ in pairs(result.changes) do
+            local fname = vim.uri_to_fname(uri)
+            uri_to_fname[uri] = fname
+          end
+        end
+        if result.documentChanges then
+          for _, change in ipairs(result.documentChanges) do
+            if change.textDocument and change.textDocument.uri then
+              local fname = vim.uri_to_fname(change.textDocument.uri)
+              uri_to_fname[change.textDocument.uri] = fname
+            end
+          end
+        end
+
+        -- 保存所有受影响的文件到磁盘
+        local saved_files = {}
+        for uri, fname in pairs(uri_to_fname) do
+          local affected_bufnr = vim.fn.bufnr(fname)
+          if affected_bufnr ~= -1 and vim.api.nvim_buf_is_valid(affected_bufnr) then
+            -- 检查 buffer 是否已被修改（apply_workspace_edit 修改后 modified=true）
+            if vim.api.nvim_buf_get_option(affected_bufnr, "modified") then
+              local ok_write, write_err = pcall(vim.api.nvim_buf_call, affected_bufnr, function()
+                vim.cmd("write!")
               end)
-              if ok_save then
-                table.insert(saved_files, fname)
+              if ok_write then
+                -- 验证写入：重新检查 modified 标志
+                if not vim.api.nvim_buf_get_option(affected_bufnr, "modified") then
+                  table.insert(saved_files, fname)
+                end
               end
             else
-              -- buffer 不在内存中，可能 apply_workspace_edit 已经直接写入磁盘
-              -- 对于这种情况，检查文件是否存在即可
-              if vim.uv.fs_stat(fname) then
-                table.insert(saved_files, fname)
-              end
+              -- buffer 未被标记为已修改，说明 apply_workspace_edit 可能未生效
+              -- 尝试强制写入
+              pcall(vim.api.nvim_buf_call, affected_bufnr, function()
+                vim.cmd("write!")
+              end)
+              table.insert(saved_files, fname)
+            end
+          else
+            -- buffer 不在内存中，检查 apply_workspace_edit 是否已直接写入磁盘
+            if vim.uv.fs_stat(fname) then
+              table.insert(saved_files, fname)
             end
           end
+        end
 
-          -- 如果以上都没保存到，至少保存当前 buffer
-          if #saved_files == 0 and bufnr and vim.api.nvim_buf_is_valid(bufnr) then
-            pcall(vim.api.nvim_buf_call, bufnr, function()
-              pcall(vim.cmd, "silent write")
-            end)
-            table.insert(saved_files, args.filepath)
+        -- 如果以上都没保存到，至少保存当前 buffer
+        if #saved_files == 0 and bufnr and vim.api.nvim_buf_is_valid(bufnr) then
+          pcall(vim.api.nvim_buf_call, bufnr, function()
+            vim.cmd("write!")
+          end)
+          table.insert(saved_files, args.filepath)
+        end
+
+        -- 验证重命名是否实际生效：重新读取文件检查新符号名是否存在
+        local rename_verified = false
+        if #saved_files > 0 then
+          for _, fname in ipairs(saved_files) do
+            local content, read_err = read_file_content(fname)
+            if content and content:find(args.new_name, 1, true) then
+              rename_verified = true
+              break
+            end
           end
+        end
 
-          -- 检查是否有实际的变更内容
-          local has_changes = result.changes and next(result.changes) ~= nil
-            or result.documentChanges and #result.documentChanges > 0
+        if on_success then
           on_success({
             filepath = args.filepath,
             symbol = args.symbol,
@@ -3099,8 +3174,12 @@ local function _lsp_rename(args, on_success, on_error)
             changes = result.changes or result.documentChanges,
             found = has_changes,
             saved_files = saved_files,
-            _note = has_changes and ("重命名已应用，保存了 " .. #saved_files .. " 个文件")
-              or "LSP 返回成功但无实际变更内容",
+            rename_verified = rename_verified,
+            _note = rename_verified
+              and ("重命名已应用并验证，保存了 " .. #saved_files .. " 个文件")
+              or (#saved_files > 0
+                and ("重命名已应用，保存了 " .. #saved_files .. " 个文件，但验证未通过——请手动检查文件确认重命名是否生效")
+                or "重命名请求返回了变更但未能保存任何文件，请手动检查"),
           })
         end
       end)

@@ -493,15 +493,52 @@ function M._close_preview()
   end
 end
 
---- 追加预览内容
-function M.append_preview(text)
-  if not text or text == "" then return end
+--- 重建预览 buffer（全量刷新，用于参数覆写场景）
+-- 增强版：强制刷新（忽略 _last_buffer 缓存），确保参数覆写时 UI 立即更新
+function M.rebuild_preview_buffer()
   if not state.preview_window_id then return end
   local buf = window_manager.get_window_buf(state.preview_window_id)
   if not buf or not buf_valid(buf) then return end
+  local content = M._build_preview_buffer()
+  -- 参数覆写场景下强制刷新，不依赖 _last_buffer 缓存
+  state.streaming_preview._last_buffer = content
+  local content_lines = vim.split(content, "\n")
+  vim.api.nvim_set_option_value("modifiable", true, { buf = buf })
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, content_lines)
+  vim.api.nvim_set_option_value("modifiable", false, { buf = buf })
+  local win = window_manager.get_window_win(state.preview_window_id)
+  if win and win_valid(win) then
+    local lc = vim.api.nvim_buf_line_count(buf)
+    pcall(vim.api.nvim_win_set_cursor, win, { lc, 0 })
+  end
+end
+
+--- 追加预览内容（旧接口保留，用于增量追加场景）
+-- 增强版：检测参数覆写，覆写时全量重建而非追加，避免 UI 混乱
+function M.append_preview(text)
+  if not text or text == "" then return end
+  if not state.preview_window_id then return end
+
+  -- 检测参数覆写：如果追加的文本看起来像完整的 JSON 参数块（非增量），则重建而非追加
+  local stripped = text:match("^%s*(.+.-)%s*$") or ""
+  if stripped:find('^{') or stripped:find('^"') then
+    -- 可能是参数覆写，重建整个预览
+    M.rebuild_preview_buffer()
+    return
+  end
+
+  -- 检测参数覆写：如果当前 buffer 行数超过 100 行，说明累积了太多增量内容
+  -- 此时应全量重建而非继续追加
+  local buf = window_manager.get_window_buf(state.preview_window_id)
+  if not buf or not buf_valid(buf) then return end
+
+  local line_count = vim.api.nvim_buf_line_count(buf)
+  if line_count > 100 then
+    M.rebuild_preview_buffer()
+    return
+  end
 
   local display_text = escape_json_for_display(text)
-  local line_count = vim.api.nvim_buf_line_count(buf)
   local last_line = vim.api.nvim_buf_get_lines(buf, line_count - 1, line_count, false)[1] or ""
   local parts = vim.split(display_text, "\n", { plain = true })
 
@@ -522,13 +559,42 @@ function M.append_preview(text)
 end
 
 --- 构建预览 buffer
+-- 支持检测参数覆写（全量重建 vs 增量追加）
+-- 当检测到参数被完全重写时，添加 "⚡ 参数已更新" 提示避免看起来像卡死
 function M._build_preview_buffer()
   local preview = state.streaming_preview
   local tools = preview.tools or {}
   if not next(tools) then return "🔧 正在接收工具调用参数..." end
-  local text = "🔧 工具调用（参数接收中...）"
+
+  -- 检测是否发生了参数覆写（检查是否有工具的参数长度突然变短）
+  local has_overwrite = false
+  if preview._last_tool_args then
+    for key, t in pairs(tools) do
+      local prev_len = (preview._last_tool_args[key] or ""):len()
+      local curr_len = (t.arguments or ""):len()
+      -- 如果当前参数比上次短且上次不为空，说明发生了覆写
+      if prev_len > 0 and curr_len > 0 and curr_len < prev_len * 0.5 then
+        has_overwrite = true
+        break
+      end
+    end
+  end
+  -- 保存当前参数用于下次比较
+  preview._last_tool_args = {}
+  for key, t in pairs(tools) do
+    preview._last_tool_args[key] = t.arguments or ""
+  end
+
+  local text
+  if has_overwrite then
+    text = "🔧 工具调用（⚡ 参数已更新...）"
+  else
+    text = "🔧 工具调用（参数接收中...）"
+  end
+
   for _, t in pairs(tools) do
-    text = text .. "\n\n  🔄 " .. t.name .. " (参数接收中...)"
+    local status_icon = has_overwrite and "⚡" or "🔄"
+    text = text .. "\n\n  " .. status_icon .. " " .. t.name .. " (参数接收中...)"
     if t.arguments and t.arguments ~= "" then
       local display_args = escape_json_for_display(t.arguments)
       display_args = display_args:gsub("\n", "\n  ")
@@ -547,6 +613,7 @@ local function try_parse_streaming_args(tool_entry)
 end
 
 --- 更新流式工具调用数据
+-- 增强版：检测参数覆写（全量重建 vs 增量追加），覆写时立即重建预览
 function M.update_streaming_tools(tool_calls, tool_calls_delta, generation_id)
   local preview = state.streaming_preview
   if preview.generation_id and preview.generation_id ~= generation_id then
@@ -555,11 +622,17 @@ function M.update_streaming_tools(tool_calls, tool_calls_delta, generation_id)
     preview.window_shown = false
     preview._last_buffer = ""
     preview._pending_append = ""
+    preview._last_tool_args = nil
   elseif not preview.generation_id then
     preview._last_buffer = ""
     preview._pending_append = ""
+    preview._last_tool_args = nil
   end
   preview.generation_id = generation_id
+
+  -- 检测参数覆写标志：如果 tool_calls 中有工具且其 arguments 是完整 JSON 对象（非 delta）
+  -- 说明发生了参数覆写（AI 重新生成了完整参数而非追加）
+  local has_overwrite = false
 
   -- BUG FIX: 使用 tool_call_id 作为 key，避免同名工具互相覆盖
   for _, tc in ipairs(tool_calls) do
@@ -573,6 +646,14 @@ function M.update_streaming_tools(tool_calls, tool_calls_delta, generation_id)
       end
       if func.arguments then
         local args_str = type(func.arguments) == "table" and vim.json.encode(func.arguments) or func.arguments
+        -- 检测参数覆写：如果已有 arguments 且新参数是完整的 JSON 对象
+        if preview.tools[tool_key].arguments ~= "" and args_str ~= "" then
+          -- 检查新参数是否以 { 开头（完整 JSON 对象）
+          local trimmed = args_str:match("^%s*(.-)%s*$") or ""
+          if trimmed:sub(1, 1) == "{" then
+            has_overwrite = true
+          end
+        end
         preview.tools[tool_key].arguments = args_str
         try_parse_streaming_args(preview.tools[tool_key])
       end
@@ -592,6 +673,11 @@ function M.update_streaming_tools(tool_calls, tool_calls_delta, generation_id)
       -- 保留全局 _pending_append 用于 schedule_preview_update 的节流显示
       preview._pending_append = preview._pending_append .. func.arguments
     end
+  end
+
+  -- 如果检测到参数覆写，立即重建预览窗口内容
+  if has_overwrite and preview.window_shown and state.preview_window_id then
+    M.rebuild_preview_buffer()
   end
 end
 
@@ -654,6 +740,8 @@ function M.clear_streaming_preview()
   preview.tools = {}
   preview.window_shown = false
   preview._pending_append = ""
+  preview._last_tool_args = nil
+  preview._last_tool_args = nil
 end
 
 -- ========== 内部方法 ==========

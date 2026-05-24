@@ -114,7 +114,10 @@ local function resolve_scenario_config(scenario)
   return result
 end
 
-local function get_model_config(model_index)
+--- 根据模型索引解析完整的 ai_preset 配置
+--- @param model_index number 模型候选索引（1-based）
+--- @return table ai_preset 包含 base_url, api_key, model_name, provider 等
+function M.get_model_config(model_index)
   model_index = model_index or 1
   local preset = {}
   -- 优先使用场景候选配置（用户通过 scenarios 指定的模型和参数）
@@ -175,7 +178,7 @@ function M.generate_response(messages, params)
   state._cancel_processed = false
   local session_id = params.session_id; local window_id = params.window_id; local options = params.options or {}
   state.is_generating = true
-  local model_index = params.model_index or 1; local ai_preset = get_model_config(model_index)
+  local model_index = params.model_index or 1; local ai_preset = M.get_model_config(model_index)
   logger.debug("[ai_engine] generate_response: ai_preset.model_name=%s, options.model=%s", tostring(ai_preset.model_name), tostring(options.model))
   local generation_id = os.time() .. "_" .. math.random(1000, 9999)
   state.current_generation_id = generation_id
@@ -298,7 +301,7 @@ function _send_stream_request(generation_id, request, params)
   if gen then gen._stream_processor = processor; gen._last_request = request end
   local ai_preset = shared.ai_preset or (gen and gen.ai_preset) or {}
   if not ai_preset.base_url or not ai_preset.api_key then
-    ai_preset = get_model_config(shared.model_index or (gen and gen.model_index) or 1)
+    ai_preset = M.get_model_config(shared.model_index or (gen and gen.model_index) or 1)
     shared.ai_preset = ai_preset
     if gen then gen.ai_preset = ai_preset end
   end
