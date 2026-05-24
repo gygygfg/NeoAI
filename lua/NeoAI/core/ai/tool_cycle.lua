@@ -26,6 +26,7 @@ local M = {}
 
 -- 模块局部变量：参数修正重试计数，按 (session_id, tool_name) 为 key
 local _param_retry_counts = {}
+local _inline_fuzzy_match
 
 local logger = require("NeoAI.utils.logger")
 local event_constants = require("NeoAI.core.events")
@@ -2196,7 +2197,7 @@ end
 --- @param all_names string[] 所有可用工具名称列表
 --- @return string|nil 最匹配的工具名称，或 nil
 ---@diagnostic disable-next-line: unused-local
-local function _inline_fuzzy_match(input, all_names)
+_inline_fuzzy_match = function(input, all_names)
   if not input or not all_names or #all_names == 0 then
     return nil
   end

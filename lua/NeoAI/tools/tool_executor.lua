@@ -133,6 +133,20 @@ local PATH_PARAM_NAMES = {
   path = true,
 }
 
+-- 已知的文本参数名（这些参数的值是纯文本，不应进行 JSON 解码）
+local TEXT_PARAM_NAMES = {
+  text = true,
+  content = true,
+  new_text = true,
+  newText = true,
+  search_text = true,
+  query = true,
+  code = true,
+  new_content = true,
+  old_text = true,
+  oldText = true,
+}
+
 local function resolve_json_args(args, param_schemas)
   if args == nil then
     return args
@@ -154,6 +168,9 @@ local function resolve_json_args(args, param_schemas)
       -- 避免将用户传入的原始字符串（如文件内容）误解析为 table
       local schema = param_schemas and param_schemas[k]
       if schema and schema.type == "string" then
+        result[k] = v
+      elseif TEXT_PARAM_NAMES[k] then
+        -- 已知的文本参数名，跳过 JSON 解码（防止花括号/方括号被误解析）
         result[k] = v
       else
         -- 只对 JSON 对象/数组字符串（以 { 或 [ 开头）进行解码

@@ -279,13 +279,28 @@ end
 
 -- 公共节点过滤函数：支持正则匹配 text，node_type 不匹配时回退到同类型节点
 -- 返回 filtered 和 fallback_used（是否使用了回退）
+-- node_type 支持带编号格式，如 'function_definition[2]' 表示匹配第2个 function_definition
 local function filter_nodes(nodes, node_type, text, named)
+  -- 解析 node_type 中的编号后缀 [N]
+  local actual_type = node_type
+  local target_index = nil
+  if node_type then
+    local base_type, idx = node_type:match("^(.-)%[(%d+)%]$")
+    if base_type and idx then
+      actual_type = base_type
+      target_index = tonumber(idx)
+    end
+  end
+
   local filtered = {}
 
   -- 第一轮：精确匹配所有条件
   for _, node in ipairs(nodes or {}) do
     local matched = true
-    if node_type and node.type ~= node_type then
+    if actual_type and node.type ~= actual_type then
+      matched = false
+    end
+    if matched and target_index and node.type_index ~= target_index then
       matched = false
     end
     if matched and text ~= nil then
@@ -306,6 +321,79 @@ local function filter_nodes(nodes, node_type, text, named)
   -- 注意：不在这里过滤根容器节点（depth == 0），由调用方自行处理
 
   return filtered, false
+end
+
+-- 检测 node_type 是否看起来像匿名 token
+-- Tree-sitter 的匿名节点类型通常是运算符、分隔符等纯符号 token
+-- 如: + - * / = == != < > <= >= && || ! ~ & | ^ << >> ( ) { } [ ] ; , . : :: -> => ? # @ $
+local function looks_like_anonymous_token(node_type)
+  if not node_type or node_type == "" then
+    return false
+  end
+  -- 如果包含字母、数字或下划线，则很可能是命名节点类型
+  if node_type:find("[%w_]") then
+    return false
+  end
+  return true
+end
+
+-- 构建"未找到匹配节点"的友好错误消息
+-- @param node_type string|nil 用户指定的 node_type（可能带 [N] 编号后缀）
+-- @param nodes table|nil 解析树中的所有节点（用于列出有效类型）
+-- @return string 错误消息
+local function _build_no_match_error(node_type, nodes)
+  local parts = { "未找到匹配的节点" }
+
+  -- 提取基础类型名（去掉 [N] 编号后缀）用于匿名 token 检测
+  local base_type = node_type
+  if node_type then
+    local b, _ = node_type:match("^(.-)%[(%d+)%]$")
+    if b then
+      base_type = b
+    end
+  end
+
+  -- 检测是否为匿名 token：这类节点不会出现在 named_child 遍历结果中
+  if base_type and looks_like_anonymous_token(base_type) then
+    parts[#parts + 1] = "。\""
+    parts[#parts + 1] = base_type
+    parts[#parts + 1] = "\" 看起来像是匿名 token（Tree-sitter 中的运算符、分隔符等），"
+      .. "不属于命名节点类型，因此无法通过 node_type 参数匹配。"
+      .. "建议：使用 query_tree 工具配合自定义查询来查找匿名 token，"
+      .. "或使用 text 参数进行文本匹配"
+    return table.concat(parts)
+  end
+
+  -- 列出文件中存在的命名节点类型，帮助用户找到正确的类型名
+  if nodes and #nodes > 0 then
+    local types = {}
+    local seen = {}
+    for _, n in ipairs(nodes) do
+      if not seen[n.type] then
+        seen[n.type] = true
+        table.insert(types, n.type)
+      end
+    end
+    if #types > 0 then
+      table.sort(types)
+      local max_show = 20
+      local type_list = {}
+      for i = 1, math.min(#types, max_show) do
+        type_list[#type_list + 1] = types[i]
+      end
+      parts[#parts + 1] = "。文件中存在的命名节点类型: "
+      parts[#parts + 1] = table.concat(type_list, ", ")
+      if #types > max_show then
+        parts[#parts + 1] = " ... (共 "
+        parts[#parts + 1] = tostring(#types)
+        parts[#parts + 1] = " 种，仅显示前 "
+        parts[#parts + 1] = tostring(max_show)
+        parts[#parts + 1] = " 种)"
+      end
+    end
+  end
+
+  return table.concat(parts)
 end
 
 -- 递归遍历语法树节点
@@ -381,6 +469,13 @@ local function parse_file_content_async(filepath, max_depth, on_success, on_erro
 
         local root = trees[1]:root()
         local nodes = _traverse_node(root, content, 0, max_depth or 3)
+
+        -- 给相同类型节点自动编号 [1][2][3]...
+        local type_counts = {}
+        for _, node in ipairs(nodes) do
+          type_counts[node.type] = (type_counts[node.type] or 0) + 1
+          node.type_index = type_counts[node.type]
+        end
 
         if on_success then
           on_success({
@@ -459,6 +554,12 @@ local function _parse_file(args, on_success, on_error)
             end
           end
           r.nodes = filtered
+          -- 过滤后重新编号
+          local tc = {}
+          for _, n2 in ipairs(filtered) do
+            tc[n2.type] = (tc[n2.type] or 0) + 1
+            n2.type_index = tc[n2.type]
+          end
         end
         table.insert(results, r)
         check_done()
@@ -481,6 +582,12 @@ local function _parse_file(args, on_success, on_error)
           end
         end
         result.nodes = filtered
+        -- 过滤后重新编号
+        local tc = {}
+        for _, n2 in ipairs(filtered) do
+          tc[n2.type] = (tc[n2.type] or 0) + 1
+          n2.type_index = tc[n2.type]
+        end
       end
       if on_success then
         on_success(result)
@@ -846,7 +953,7 @@ local function _with_parsed_tree(args, on_success, on_error, build_response)
     local filtered = filter_nodes(result.nodes, args.node_type, args.text, args.named)
     if #filtered == 0 then
       if on_error then
-        on_error("未找到匹配的节点")
+        on_error(_build_no_match_error(args.node_type, result.nodes))
       end
       return
     end
@@ -900,7 +1007,7 @@ M.get_node_type = {
     type = "object",
     properties = {
       filepath = { type = "string", description = "文件路径" },
-      node_type = { type = "string", description = "节点类型过滤（可选），如 'function_definition'" },
+      node_type = { type = "string", description = "节点类型过滤（可选，仅支持命名节点类型，匿名 token 如运算符 '+' 请使用 text 参数或 query_tree），如 'function_definition'" },
       text = { type = "string", description = "节点文本过滤（可选）" },
       named = { type = "boolean", description = "是否为命名节点（可选）" },
     },
@@ -935,7 +1042,7 @@ local function _get_node_range(args, on_success, on_error)
     local filtered = filter_nodes(result.nodes, args.node_type, args.text, args.named)
     if #filtered == 0 then
       if on_error then
-        on_error("未找到匹配的节点")
+        on_error(_build_no_match_error(args.node_type, result.nodes))
       end
       return
     end
@@ -1024,7 +1131,7 @@ M.get_node_range = {
     type = "object",
     properties = {
       filepath = { type = "string", description = "文件路径" },
-      node_type = { type = "string", description = "节点类型过滤（可选），如 'function_definition'" },
+      node_type = { type = "string", description = "节点类型过滤（可选，仅支持命名节点类型，匿名 token 如运算符 '+' 请使用 text 参数或 query_tree），如 'function_definition'" },
       text = { type = "string", description = "节点文本过滤（可选）" },
       named = { type = "boolean", description = "是否为命名节点（可选）" },
       include_code = {
@@ -1073,7 +1180,7 @@ M.is_named_node = {
     type = "object",
     properties = {
       filepath = { type = "string", description = "文件路径" },
-      node_type = { type = "string", description = "节点类型过滤（可选），如 'function_definition'" },
+      node_type = { type = "string", description = "节点类型过滤（可选，仅支持命名节点类型，匿名 token 如运算符 '+' 请使用 text 参数或 query_tree），如 'function_definition'" },
       text = { type = "string", description = "节点文本过滤（可选）" },
     },
     required = { "filepath" },
@@ -1088,18 +1195,33 @@ M.is_named_node = {
 -- ============================================================================
 
 local function _find_parent_by_attrs(nodes, target_type, target_text, target_named)
+  -- 修复 BUG 4: is_parent_of 函数体为空，添加正确的父子关系判断
+  -- 父节点必须满足：范围完全包含子节点，且深度小于子节点
   local function is_parent_of(parent, child)
-    return parent.start_row <= child.start_row
-      and parent.end_row >= child.end_row
-      and (parent.start_row < child.start_row or (parent.start_row == child.start_row and parent.start_col <= child.start_col))
-      and (parent.end_row > child.end_row or (parent.end_row == child.end_row and parent.end_col >= child.end_col))
-      and parent.depth < child.depth
+    if not parent or not child then
+      return false
+    end
+    -- 父节点的深度必须小于子节点
+    if parent.depth >= child.depth then
+      return false
+    end
+    -- 父节点的范围必须完全包含子节点
+    -- Tree-sitter 的 end_row/end_col 是独占的（exclusive）
+    if parent.start_row < child.start_row then
+      return parent.end_row > child.end_row
+          or (parent.end_row == child.end_row and parent.end_col >= child.end_col)
+    end
+    if parent.start_row == child.start_row and parent.start_col <= child.start_col then
+      return parent.end_row > child.end_row
+          or (parent.end_row == child.end_row and parent.end_col >= child.end_col)
+    end
+    return false
   end
 
   local targets = filter_nodes(nodes, target_type, target_text, target_named)
 
   if #targets == 0 then
-    return nil, "未找到匹配的目标节点"
+    return nil, _build_no_match_error(target_type, nodes)
   end
 
   local parents = {}
@@ -1187,7 +1309,7 @@ M.get_parent_node = {
     type = "object",
     properties = {
       filepath = { type = "string", description = "文件路径" },
-      node_type = { type = "string", description = "目标节点类型过滤（可选）" },
+      node_type = { type = "string", description = "目标节点类型过滤（可选，仅支持命名节点类型，匿名 token 如运算符 '+' 请使用 text 参数或 query_tree）" },
       text = { type = "string", description = "目标节点文本过滤（可选）" },
       named = { type = "boolean", description = "目标节点是否为命名节点（可选）" },
     },
@@ -1253,7 +1375,7 @@ M.get_child_nodes = {
     type = "object",
     properties = {
       filepath = { type = "string", description = "文件路径" },
-      node_type = { type = "string", description = "父节点类型过滤（可选），如 'function_definition'" },
+      node_type = { type = "string", description = "父节点类型过滤（可选，仅支持命名节点类型，匿名 token 如运算符 '+' 请使用 text 参数或 query_tree），如 'function_definition'" },
       text = { type = "string", description = "父节点文本过滤（可选）" },
       named = { type = "boolean", description = "父节点是否为命名节点（可选）" },
     },
@@ -1288,7 +1410,7 @@ local function _get_node_code(args, on_success, on_error)
     local filtered = filter_nodes(result.nodes, args.node_type, args.text, args.named)
     if #filtered == 0 then
       if on_error then
-        on_error("未找到匹配的节点")
+        on_error(_build_no_match_error(args.node_type, result.nodes))
       end
       return
     end
@@ -1296,29 +1418,41 @@ local function _get_node_code(args, on_success, on_error)
     -- 异步读取文件内容以提取精确的源代码
     read_file_content_async(filepath, function(content)
       local file_lines = vim.split(content, "\n", { plain = true })
-      local code_lines = {}
-      local first_node = filtered[1]
-      for line_num = first_node.start_row, first_node.end_row do
-        local line_content = file_lines[line_num + 1] or ""
-        if line_num == first_node.start_row and line_num == first_node.end_row then
-          line_content = line_content:sub(first_node.start_col + 1, first_node.end_col + 1)
-        elseif line_num == first_node.start_row then
-          line_content = line_content:sub(first_node.start_col + 1)
-        elseif line_num == first_node.end_row then
-          line_content = line_content:sub(1, first_node.end_col + 1)
+
+      -- 修复 BUG 3: 返回所有匹配节点的代码，而非仅第一个
+      local all_codes = {}
+      for _, node in ipairs(filtered) do
+        local code_lines = {}
+        for line_num = node.start_row, node.end_row do
+          local line_content = file_lines[line_num + 1] or ""
+          if line_num == node.start_row and line_num == node.end_row then
+            -- 修复 BUG 2: Tree-sitter 的 end_col 是独占的（exclusive），
+            -- 所以 sub 的结束位置应为 end_col 而非 end_col + 1
+            line_content = line_content:sub(node.start_col + 1, node.end_col)
+          elseif line_num == node.start_row then
+            line_content = line_content:sub(node.start_col + 1)
+          elseif line_num == node.end_row then
+            -- 修复 BUG 2: 同上，end_col 是独占的
+            line_content = line_content:sub(1, node.end_col)
+          end
+          table.insert(code_lines, line_content)
         end
-        table.insert(code_lines, line_content)
+        table.insert(all_codes, {
+          type = node.type,
+          text = node.text,
+          start_row = node.start_row,
+          start_col = node.start_col,
+          end_row = node.end_row,
+          end_col = node.end_col,
+          code = table.concat(code_lines, "\n"),
+        })
       end
 
       local ret = {
         filepath = filepath,
         language = result.language,
-        node_type = first_node.type,
-        start_row = first_node.start_row,
-        start_col = first_node.start_col,
-        end_row = first_node.end_row,
-        end_col = first_node.end_col,
-        code = table.concat(code_lines, "\n"),
+        match_count = #filtered,
+        nodes = all_codes,
       }
       if fallback then
         ret.warning = "未找到指定 node_type '"
@@ -1349,7 +1483,7 @@ M.get_node_code = {
     type = "object",
     properties = {
       filepath = { type = "string", description = "文件路径" },
-      node_type = { type = "string", description = "节点类型过滤（可选），如 'function_definition'" },
+      node_type = { type = "string", description = "节点类型过滤（可选，仅支持命名节点类型，匿名 token 如运算符 '+' 请使用 text 参数或 query_tree），如 'function_definition'" },
       text = { type = "string", description = "节点文本过滤（可选）" },
       named = { type = "boolean", description = "是否为命名节点（可选）" },
     },
@@ -1421,7 +1555,7 @@ local function _delete_node(args, on_success, on_error)
     local filtered = filter_nodes(result.nodes, node_type, text, named)
     if #filtered == 0 then
       if on_error then
-        finalize_with_timeout("未找到匹配的节点", true)
+        finalize_with_timeout(_build_no_match_error(node_type, result.nodes), true)
       end
       return
     end
@@ -1724,7 +1858,7 @@ M.delete_node = {
     type = "object",
     properties = {
       filepath = { type = "string", description = "文件路径" },
-      node_type = { type = "string", description = "节点类型过滤（可选），如 'function_definition'" },
+      node_type = { type = "string", description = "节点类型过滤（可选，仅支持命名节点类型，匿名 token 如运算符 '+' 请使用 text 参数或 query_tree），如 'function_definition'" },
       text = { type = "string", description = "节点文本过滤（可选）" },
       named = { type = "boolean", description = "是否为命名节点（可选）" },
       index = {
@@ -1811,7 +1945,7 @@ local function _edit_node(args, on_success, on_error)
     local filtered = filter_nodes(result.nodes, node_type, text, named)
     if #filtered == 0 then
       if on_error then
-        finalize_with_timeout("未找到匹配的节点", true)
+        finalize_with_timeout(_build_no_match_error(node_type, result.nodes), true)
       end
       return
     end
@@ -1889,15 +2023,45 @@ local function _edit_node(args, on_success, on_error)
           table.insert(new_parts, line)
         end
       else
-        -- 多行节点：首行拼接缩进前缀，后续行保持用户提供的缩进
+        -- 多行节点：根据原始节点缩进层级，调整新内容所有行的缩进
+        -- 计算新内容的最小缩进（跳过空白行），以确定相对缩进基准
         for _, line in ipairs(head_lines) do
           table.insert(new_parts, line)
         end
         if #new_content_lines > 0 then
-          local first_stripped = new_content_lines[1]:gsub("^%s+", "")
-          table.insert(new_parts, before_on_first_line .. first_stripped)
-          for i = 2, #new_content_lines do
-            table.insert(new_parts, new_content_lines[i])
+          -- 原始节点首行的缩进（before_on_first_line 中的前导空白）
+          local original_indent = before_on_first_line:match("^(%s*)") or ""
+
+          -- 计算新内容的最小缩进（跳过纯空白行）
+          local new_min_indent = nil
+          for _, line in ipairs(new_content_lines) do
+            local trimmed = line:gsub("^%s+$", "")
+            if #trimmed > 0 then
+              local indent = line:match("^(%s*)") or ""
+              if new_min_indent == nil or #indent < #new_min_indent then
+                new_min_indent = indent
+              end
+            end
+          end
+          new_min_indent = new_min_indent or ""
+
+          -- 逐行调整：原始缩进 + (行缩进 - 最小缩进)
+          for i, line in ipairs(new_content_lines) do
+            local trimmed = line:gsub("^%s+$", "")
+            if #trimmed == 0 then
+              table.insert(new_parts, line)
+            else
+              local line_indent = line:match("^(%s*)") or ""
+              local content = line:sub(#line_indent + 1)
+              local relative_indent = math.max(0, #line_indent - #new_min_indent)
+              if i == 1 then
+                -- 首行保留 before_on_first_line（可能含代码前缀如 "local "）
+                table.insert(new_parts, before_on_first_line .. string.rep(" ", relative_indent) .. content)
+              else
+                -- 后续行以原始缩进为基准
+                table.insert(new_parts, original_indent .. string.rep(" ", relative_indent) .. content)
+              end
+            end
           end
         end
         for _, line in ipairs(tail_lines) do
@@ -1977,7 +2141,7 @@ M.edit_node = {
     properties = {
       filepath = { type = "string", description = "文件路径（必填）" },
       content = { type = "string", description = "替换的新源代码内容（必填）" },
-      node_type = { type = "string", description = "节点类型过滤（必填，防止意外匹配根节点），如 'function_definition'" },
+      node_type = { type = "string", description = "节点类型过滤（必填，防止意外匹配根节点，仅支持命名节点类型，匿名 token 如运算符 '+' 请使用 text 参数或 query_tree），如 'function_definition'" },
       text = { type = "string", description = "节点文本过滤（可选）" },
       named = { type = "boolean", description = "是否为命名节点（可选）" },
       index = {
@@ -2011,3 +2175,4 @@ function M.parse_file_content_async(filepath, max_depth, on_success, on_error)
 end
 
 return M
+

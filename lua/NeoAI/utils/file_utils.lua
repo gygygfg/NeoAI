@@ -137,6 +137,14 @@ function M.read_file(path)
     return nil, "路径不能为空"
   end
 
+  -- 修复 BUG 5: 在尝试打开文件前先检查路径是否为目录
+  -- io.open 尝试打开目录会返回 "Is a directory" 错误，不够清晰
+  local uv = vim.uv or vim.loop
+  local stat = uv.fs_stat(path)
+  if stat and stat.type == "directory" then
+    return nil, "路径是一个目录，不是文件: " .. path
+  end
+
   local file, err = io.open(path, "r")
   if not file then
     -- 检查文件是否存在
@@ -212,6 +220,39 @@ function M.write_file(path, content, append)
   async_load_to_buffer(path)
 
   return true
+end
+
+--- 写入文件后尝试请求 LSP 诊断（异步回调模式）
+--- 如果 LSP 可用且有诊断结果，通过 callback 返回诊断信息
+--- 此函数延迟加载 neovim_lsp 模块，避免循环依赖
+--- @param filepath string 文件路径
+--- @param callback function(diagnostics_result|nil) 诊断结果回调
+function M.try_request_lsp_diagnostics(filepath, callback)
+  if not filepath or not callback then
+    return
+  end
+  -- 延迟执行，确保文件已写入磁盘且 buffer 已加载
+  vim.schedule(function()
+    local ok, neovim_lsp = pcall(require, "NeoAI.tools.builtin.neovim_lsp")
+    if not ok or not neovim_lsp then
+      callback(nil)
+      return
+    end
+    local lsp_diag = neovim_lsp.lsp_diagnostics
+    if not lsp_diag or not lsp_diag.func then
+      callback(nil)
+      return
+    end
+    lsp_diag.func({ filepath = filepath }, function(result)
+      if result and result.diagnostics and #result.diagnostics > 0 then
+        callback(result)
+      else
+        callback(nil)
+      end
+    end, function()
+      callback(nil)
+    end)
+  end)
 end
 
 --- 读取行

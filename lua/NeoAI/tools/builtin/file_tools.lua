@@ -313,8 +313,8 @@ local function find_text_range(lines, anchor_line, search_text)
     return nil
   end
 
-  -- 去除所有空白字符（空格、制表符）后匹配
-  -- 忽略缩进差异，只匹配非空白内容
+  -- 去除所有空白字符后匹配非空白内容
+  -- 当 search_text 包含前导缩进时严格要求缩进一致，否则忽略缩进差异
   local search_stripped = normalized_search:gsub("%s", "")
   if search_stripped == "" then
     return nil
@@ -322,15 +322,39 @@ local function find_text_range(lines, anchor_line, search_text)
 
   -- 匹配函数：去除行中所有空白字符后做精确匹配
   -- 使用精确匹配而非子串匹配，避免短文本（如 "end"）误匹配到包含该子串的行（如 "append"、"pending"）
+  -- 当 search_text 包含前导空白时，严格要求匹配行的缩进与其一致（防止不同嵌套层级的误匹配）
   local function line_matches(line)
     local line_stripped = normalize_line_text(line):gsub("%s", "")
-    return line_stripped == search_stripped
+    if line_stripped ~= search_stripped then
+      return false
+    end
+    -- 严格缩进检查：比较规范化后的前导空白
+    local search_leading = normalized_search:match("^(%s*)")
+    if #search_leading > 0 then
+      local line_leading = normalize_line_text(line):match("^(%s*)")
+      if line_leading ~= search_leading then
+        return false
+      end
+    end
+    return true
   end
 
   -- 子串匹配回退：兼容更灵活的搜索需求（如 "function foo" 匹配 "local function foo(a, b)"）
+  -- 同样进行严格缩进检查
   local function line_matches_fuzzy(line)
     local line_stripped = normalize_line_text(line):gsub("%s", "")
-    return line_stripped:find(search_stripped, 1, true) ~= nil
+    if line_stripped:find(search_stripped, 1, true) == nil then
+      return false
+    end
+    -- 严格缩进检查
+    local search_leading = normalized_search:match("^(%s*)")
+    if #search_leading > 0 then
+      local line_leading = normalize_line_text(line):match("^(%s*)")
+      if line_leading ~= search_leading then
+        return false
+      end
+    end
+    return true
   end
 
   -- 扩展匹配范围：从 anchor_line 向上下扩展连续匹配的行
@@ -936,7 +960,7 @@ local function glob_to_lua_pattern(glob)
   return p
 end
 
-local function scan_dir_flat(dir, pattern, all_results, max_results, done_callback)
+local function scan_dir_flat(dir, pattern, all_results, max_results, show_hidden, done_callback)
   vim.uv.fs_opendir(dir, function(opendir_err, dir_handle)
     if opendir_err or not dir_handle then
       if done_callback then
@@ -963,7 +987,10 @@ local function scan_dir_flat(dir, pattern, all_results, max_results, done_callba
         end
         for _, entry in ipairs(entries) do
           if entry.type == "file" then
-            if lua_pattern == nil or entry.name:match(lua_pattern) then
+            -- 跳过隐藏文件（以 . 开头），除非 show_hidden 为 true
+            if not show_hidden and entry.name:sub(1, 1) == "." then
+              -- skip
+            elseif lua_pattern == nil or entry.name:match(lua_pattern) then
               table.insert(all_results, dir .. "/" .. entry.name)
               if max_results and #all_results >= max_results then
                 vim.uv.fs_closedir(dir_handle)
@@ -982,7 +1009,7 @@ local function scan_dir_flat(dir, pattern, all_results, max_results, done_callba
   end)
 end
 
-local function scan_dir_recursive(dir, pattern, all_results, max_results, done_callback)
+local function scan_dir_recursive(dir, pattern, all_results, max_results, show_hidden, done_callback)
   vim.uv.fs_opendir(dir, function(opendir_err, dir_handle)
     if opendir_err or not dir_handle then
       if done_callback then
@@ -1019,7 +1046,7 @@ local function scan_dir_recursive(dir, pattern, all_results, max_results, done_c
             end
           end
           for _, subdir in ipairs(subdirs) do
-            scan_dir_recursive(subdir, pattern, all_results, max_results, subdir_done)
+            scan_dir_recursive(subdir, pattern, all_results, max_results, show_hidden, subdir_done)
           end
           return
         end
@@ -1028,7 +1055,10 @@ local function scan_dir_recursive(dir, pattern, all_results, max_results, done_c
           local typ = entry.type
           local full_path = dir .. "/" .. name
           if typ == "file" then
-            if lua_pattern == nil or name:match(lua_pattern) then
+            -- 跳过隐藏文件（以 . 开头），除非 show_hidden 为 true
+            if not show_hidden and name:sub(1, 1) == "." then
+              -- skip
+            elseif lua_pattern == nil or name:match(lua_pattern) then
               table.insert(all_results, full_path)
               if max_results and #all_results >= max_results then
                 vim.uv.fs_closedir(dir_handle)
@@ -1040,7 +1070,10 @@ local function scan_dir_recursive(dir, pattern, all_results, max_results, done_c
             end
           elseif typ == "directory" then
             if name ~= "." and name ~= ".." then
-              table.insert(subdirs, full_path)
+              -- 隐藏目录入栈，只有当 show_hidden 为 true 时才递归
+              if show_hidden or name:sub(1, 1) ~= "." then
+                table.insert(subdirs, full_path)
+              end
             end
           end
         end
@@ -1064,6 +1097,7 @@ local function _list_files(args, on_success, on_error)
   dir = dir:gsub("/+$", "")
   local pattern = args.pattern or "*"
   local recursive = args.recursive or false
+  local show_hidden = args.show_hidden or false
   local max_results = args.max_results
   if max_results == nil or max_results <= 0 then
     max_results = 50
@@ -1079,15 +1113,15 @@ local function _list_files(args, on_success, on_error)
   end
 
   if recursive then
-    scan_dir_recursive(dir, pattern, all_files, max_results, done_callback)
+    scan_dir_recursive(dir, pattern, all_files, max_results, show_hidden, done_callback)
   else
-    scan_dir_flat(dir, pattern, all_files, max_results, done_callback)
+    scan_dir_flat(dir, pattern, all_files, max_results, show_hidden, done_callback)
   end
 end
 
 M.list_files = {
   name = "list_files",
-  description = "列出目录中的文件，支持模式匹配和递归查找",
+  description = "列出目录中的文件，支持模式匹配、递归查找和隐藏文件过滤",
   func = _list_files,
   async = true,
   parameters = {
@@ -1100,6 +1134,11 @@ M.list_files = {
         type = "number",
         description = "最大返回结果数，默认50",
         default = 50,
+      },
+      show_hidden = {
+        type = "boolean",
+        description = "是否显示隐藏文件（以 . 开头的文件/目录），默认 false",
+        default = false,
       },
     },
     required = { "dir" },
