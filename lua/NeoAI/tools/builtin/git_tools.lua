@@ -5,7 +5,6 @@
 local M = {}
 
 
-
 -- ============================================================================
 -- 以下代码内联自 git_auto.lua
 -- ============================================================================
@@ -45,8 +44,8 @@ local state = {
 --- @return string, string|nil 解析后的 git 根目录，错误信息（nil 表示成功）
 function _git_auto_mod._resolve_git_root(cwd)
   local home = vim.fn.expand("~")
-  -- 确定目标目录：优先 cwd > state.git_root > getcwd()
-  local target = cwd or state.git_root or vim.fn.getcwd()
+    -- 确定目标目录：优先 cwd > getcwd()（动态当前目录）> state.git_root（上次缓存）
+  local target = cwd or vim.fn.getcwd() or state.git_root
 
   -- 跳过家目录
   if target == home then
@@ -96,7 +95,7 @@ end
 --- @param cwd string|nil 目标目录（默认当前目录）
 --- @return boolean, string|nil 是否可用，git 根目录
 function _git_auto_mod._detect_real_git(cwd)
-  local target = cwd or state.git_root or vim.fn.getcwd()
+    local target = cwd or vim.fn.getcwd() or state.git_root
   local home = vim.fn.expand("~")
   if target == home then
     return false, nil
@@ -1073,17 +1072,18 @@ M.git_commit_detail = {
 -- ============================================================================
 
 local function _git_rollback(args, on_success, on_error)
-  if not args or not args.commit_hash then
+  local commit_hash = args and args.commit_hash
+  if not commit_hash then
     if on_error then
       on_error("需要 commit_hash 参数")
     end
     return
   end
 
+  local filepath = args and args.filepath
   local cwd = args and args.cwd
-  local filepath = args.filepath
 
-  local ok, err = _git_auto_mod.rollback(args.commit_hash, filepath, cwd)
+  local ok, err = _git_auto_mod.rollback(commit_hash, filepath, cwd)
   if ok then
     if on_success then
       on_success({ success = true, message = "回滚成功" })
@@ -1296,3 +1296,4 @@ M.git_auto_commit_config = {
 _git_auto_mod.initialize()
 
 return M
+

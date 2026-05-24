@@ -896,18 +896,23 @@ function M.find_project_root(filepath)
   local dir = vim.fn.fnamemodify(abs_path, ":h")
 
   while dir and dir ~= "" do
-    -- 如果到了 $HOME，停止搜索，返回当前目录
-    local dir_with_slash = dir:sub(-1) == "/" and dir or dir .. "/"
-    if dir_with_slash == home or dir == home then
-      return dir
-    end
-
-    -- 检查是否存在项目标志文件
+    -- 优先检查当前目录是否存在项目标志文件（包括 HOME 目录本身也可以检测）
+    local found_marker = false
     for _, marker in ipairs(PROJECT_MARKERS) do
       local marker_path = dir .. "/" .. marker
       if M.exists(marker_path) then
-        return dir
+        found_marker = true
+        break
       end
+    end
+    if found_marker then
+      return dir
+    end
+
+    -- 如果到了 $HOME，停止搜索，返回原始文件所在目录（避免搜索范围过大）
+    local dir_with_slash = dir:sub(-1) == "/" and dir or dir .. "/"
+    if dir_with_slash == home or dir == home then
+      return vim.fn.fnamemodify(abs_path, ":h")
     end
 
     -- 向上一级

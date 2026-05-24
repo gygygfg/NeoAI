@@ -279,22 +279,22 @@ end
 
 -- 公共节点过滤函数：支持正则匹配 text，node_type 不匹配时回退到同类型节点
 -- 返回 filtered 和 fallback_used（是否使用了回退）
-local function filter_nodes(nodes, args)
+local function filter_nodes(nodes, node_type, text, named)
   local filtered = {}
 
   -- 第一轮：精确匹配所有条件
   for _, node in ipairs(nodes or {}) do
     local matched = true
-    if args.node_type and node.type ~= args.node_type then
+    if node_type and node.type ~= node_type then
       matched = false
     end
-    if matched and args.text ~= nil then
+    if matched and text ~= nil then
       -- 使用 Lua 的 string.find 做子串匹配（不区分大小写可选）
-      if not node.text:find(args.text, 1, true) then
+      if not node.text:find(text, 1, true) then
         matched = false
       end
     end
-    if matched and args.named ~= nil and node.named ~= args.named then
+    if matched and named ~= nil and node.named ~= named then
       matched = false
     end
     if matched then
@@ -840,7 +840,7 @@ local function _with_parsed_tree(args, on_success, on_error, build_response)
 
   local filepath = args.filepath
   parse_file_content_async(filepath, -1, function(result)
-    local filtered = filter_nodes(result.nodes, args)
+    local filtered = filter_nodes(result.nodes, args.node_type, args.text, args.named)
     if #filtered == 0 then
       if on_error then
         on_error("未找到匹配的节点")
@@ -929,7 +929,7 @@ local function _get_node_range(args, on_success, on_error)
   local filepath = args.filepath
 
   parse_file_content_async(filepath, -1, function(result)
-    local filtered = filter_nodes(result.nodes, args)
+    local filtered = filter_nodes(result.nodes, args.node_type, args.text, args.named)
     if #filtered == 0 then
       if on_error then
         on_error("未找到匹配的节点")
@@ -1093,11 +1093,7 @@ local function _find_parent_by_attrs(nodes, target_type, target_text, target_nam
       and parent.depth < child.depth
   end
 
-  local targets = filter_nodes(nodes, {
-    node_type = target_type,
-    text = target_text,
-    named = target_named,
-  })
+  local targets = filter_nodes(nodes, target_type, target_text, target_named)
 
   if #targets == 0 then
     return nil, "未找到匹配的目标节点"
@@ -1286,7 +1282,7 @@ local function _get_node_code(args, on_success, on_error)
   local filepath = args.filepath
 
   parse_file_content_async(filepath, -1, function(result)
-    local filtered = filter_nodes(result.nodes, args)
+    local filtered = filter_nodes(result.nodes, args.node_type, args.text, args.named)
     if #filtered == 0 then
       if on_error then
         on_error("未找到匹配的节点")
@@ -1383,6 +1379,10 @@ local function _delete_node(args, on_success, on_error)
   end
 
   local filepath = args.filepath
+  local node_type = args.node_type
+  local text = args.text
+  local named = args.named
+  local index = args.index
   local uv = vim.uv or vim.loop
   local finalized = false
 
@@ -1415,7 +1415,7 @@ local function _delete_node(args, on_success, on_error)
   end
 
   parse_file_content_async(filepath, -1, function(result)
-    local filtered = filter_nodes(result.nodes, args)
+    local filtered = filter_nodes(result.nodes, node_type, text, named)
     if #filtered == 0 then
       if on_error then
         finalize_with_timeout("未找到匹配的节点", true)
@@ -1469,10 +1469,10 @@ local function _delete_node(args, on_success, on_error)
     -- 根据 index 参数选择要删除的节点
     -- 如果只有一个匹配，index 可省略；多个匹配时必须指定 index
     local target = nil
-    if args.index ~= nil then
-      local idx = tonumber(args.index)
+    if index ~= nil then
+      local idx = tonumber(index)
       if not idx or idx < 1 or idx > #deletable then
-        local msg = "index 参数无效: " .. tostring(args.index) .. "。" .. "有效范围: 1 ~ " .. #deletable
+        local msg = "index 参数无效: " .. tostring(index) .. "。" .. "有效范围: 1 ~ " .. #deletable
         if on_error then
           finalize_with_timeout(msg, true)
         end
@@ -1635,7 +1635,7 @@ local function _delete_node(args, on_success, on_error)
           fu.write_file_async(abs_path, content_to_write, function()
             vim.schedule(function()
               local ret = {
-                filepath = args.filepath,
+                filepath = filepath,
                 language = result.language,
                 deleted_count = #deletions,
                 deletions = deletions,
@@ -1643,7 +1643,7 @@ local function _delete_node(args, on_success, on_error)
               }
               if fallback then
                 ret.warning = "未找到指定 node_type '"
-                  .. (args.node_type or "")
+                  .. (node_type or "")
                   .. "' 的节点，已回退到同类型节点"
               end
               if #skipped > 0 then
@@ -1676,14 +1676,14 @@ local function _delete_node(args, on_success, on_error)
         end
 
         local ret = {
-          filepath = args.filepath,
+          filepath = filepath,
           language = result.language,
           deleted_count = #deletions,
           deletions = deletions,
         }
         if fallback then
           ret.warning = "未找到指定 node_type '"
-            .. (args.node_type or "")
+            .. (node_type or "")
             .. "' 的节点，已回退到同类型节点"
         end
         if #skipped > 0 then
@@ -1772,6 +1772,10 @@ local function _edit_node(args, on_success, on_error)
 
   local filepath = args.filepath
   local new_content = args.content
+  local node_type = args.node_type
+  local text = args.text
+  local named = args.named
+  local index = args.index
   local uv = vim.uv or vim.loop
   local finalized = false
 
@@ -1801,7 +1805,7 @@ local function _edit_node(args, on_success, on_error)
   end
 
   parse_file_content_async(filepath, -1, function(result)
-    local filtered = filter_nodes(result.nodes, args)
+    local filtered = filter_nodes(result.nodes, node_type, text, named)
     if #filtered == 0 then
       if on_error then
         finalize_with_timeout("未找到匹配的节点", true)
@@ -1812,10 +1816,10 @@ local function _edit_node(args, on_success, on_error)
     -- 根据 index 参数选择要编辑的节点
     -- 如果只有一个匹配，index 可省略；多个匹配时必须指定 index
     local target = nil
-    if args.index ~= nil then
-      local idx = tonumber(args.index)
+    if index ~= nil then
+      local idx = tonumber(index)
       if not idx or idx < 1 or idx > #filtered then
-        finalize_with_timeout("index 参数无效: " .. tostring(args.index) .. "。有效范围: 1 ~ " .. #filtered, true)
+        finalize_with_timeout("index 参数无效: " .. tostring(index) .. "。有效范围: 1 ~ " .. #filtered, true)
         return
       end
       target = filtered[idx]
@@ -1921,7 +1925,7 @@ local function _edit_node(args, on_success, on_error)
           end
 
           local ret = {
-            filepath = args.filepath,
+            filepath = filepath,
             language = result.language,
             node_type = target.type,
             start_row = sr,
@@ -1931,7 +1935,7 @@ local function _edit_node(args, on_success, on_error)
           }
           if fallback then
             ret.warning = "未找到指定 node_type '"
-              .. (args.node_type or "")
+              .. (node_type or "")
               .. "' 的节点，已回退到同类型节点"
           end
           if multi_match_warning then
