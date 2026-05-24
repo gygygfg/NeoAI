@@ -48,7 +48,6 @@ local state = {
 function M.get_filepath()
   local save_path = state.save_path
   if not save_path or save_path == "" then
-    save_path = vim.fn.stdpath("cache") .. "/NeoAI"
   end
   return save_path .. "/sessions.json"
 end
@@ -456,20 +455,16 @@ function M.debounced_save(sessions_func, debounce_ms)
 
   debounce_ms = debounce_ms or 800
 
-  if state._debounce_active then
-    if state._debounce_timer and not state._debounce_timer:is_closing() then
-      state._debounce_timer:again()
-    end
-    return
-  end
-
-  if not state._debounce_timer or state._debounce_timer:is_closing() then
+  -- 停止旧定时器（如果存在），然后启动新定时器
+  -- 注意：不能用 timer:again()，因为定时器创建时 repeat=0（非重复定时器），
+  -- again() 对于非重复定时器只会停止而不会重新启动，导致防抖机制失效。
+  if state._debounce_timer and not state._debounce_timer:is_closing() then
+    state._debounce_timer:stop()
+  else
     state._debounce_timer = vim.uv.new_timer()
   end
 
-  state._debounce_active = true
   state._debounce_timer:start(debounce_ms, 0, vim.schedule_wrap(function()
-    state._debounce_active = false
     if state._debounce_timer and not state._debounce_timer:is_closing() then
       state._debounce_timer:stop()
     end
@@ -543,3 +538,4 @@ function M._test_reset()
 end
 
 return M
+

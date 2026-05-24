@@ -819,6 +819,45 @@ function M.initialize(options)
   return M
 end
 
+--- 使用 vim.fn.jobstart + vim.wait 执行 curl（不阻塞主线程）
+--- @param curl_args table curl 参数列表（不含 "curl" 前缀）
+--- @param temp_file string 输出文件路径
+--- @param timeout_ms number|nil 超时时间（毫秒，默认 60000）
+--- @return string|nil content, string|nil err
+local function _exec_curl_job(curl_args, temp_file, timeout_ms)
+  timeout_ms = timeout_ms or 60000
+  local done = false
+  local exit_code = nil
+
+  local job_id = vim.fn.jobstart({ "curl", unpack_fn(curl_args) }, {
+    on_exit = function(_, code, _)
+      exit_code = code
+      done = true
+    end,
+  })
+
+  if not job_id or job_id <= 0 then
+    return nil, "curl jobstart failed"
+  end
+
+  vim.wait(timeout_ms, function() return done end, 10)
+
+  if not done then
+    pcall(vim.fn.jobstop, job_id)
+    return nil, "curl timeout (" .. timeout_ms .. "ms)"
+  end
+
+  if exit_code ~= 0 then
+    return nil, "curl exit: " .. exit_code
+  end
+
+  local content = M.read_file(temp_file)
+  if not content or content == "" then
+    return nil, "Empty response"
+  end
+  return content, nil
+end
+
 --- 发送非流式请求
 function M.send_request(params)
   if not _http_state.initialized then
@@ -960,19 +999,11 @@ function M.send_request(params)
     temp_file,
   })
 
-  local cmd = vim.list_extend({ "curl" }, curl_args)
-  local ok, result = pcall(vim.fn.system, cmd)
-  local exit_code = vim.v.shell_error
-
-  if not ok or exit_code ~= 0 then
-    pcall(vim.fn.delete, temp_file)
-    return nil, "curl failed: " .. (ok and "exit " .. exit_code or tostring(result))
-  end
-
-  local content = M.read_file(temp_file)
+  local content, curl_err = _exec_curl_job(curl_args, temp_file, params.timeout or 60000)
+  pcall(vim.fn.delete, body_file)
   pcall(vim.fn.delete, temp_file)
-  if not content or content == "" then
-    return nil, "Empty response"
+  if curl_err then
+    return nil, curl_err
   end
 
   logger.debug(
@@ -1018,28 +1049,22 @@ function M.send_request(params)
         "-o",
         retry_temp,
       })
-      local retry_cmd = vim.list_extend({ "curl" }, retry_args)
-      local retry_ok, retry_result = pcall(vim.fn.system, retry_cmd)
-      local retry_exit = vim.v.shell_error
-      if not retry_ok or retry_exit ~= 0 then
-        pcall(vim.fn.delete, retry_temp)
-        return nil, "curl failed on retry: " .. (retry_ok and "exit " .. retry_exit or tostring(retry_result))
-      end
-      local retry_content = M.read_file(retry_temp)
+      local retry_content, retry_err = _exec_curl_job(retry_args, retry_temp, params.timeout or 60000)
       pcall(vim.fn.delete, retry_temp)
-      if retry_content and retry_content ~= "" then
-        local retry_ok2, retry_response = pcall(json.decode, retry_content)
-        if retry_ok2 and type(retry_response) == "table" then
-          if retry_response.error then
-            return nil, retry_response.error.message or json.encode(retry_response.error)
-          end
-          M.parse_response_tool_calls(retry_response)
-          local retry_unified = request_handler.transform_response(retry_response, api_type)
-          if retry_unified then
-            return retry_unified, nil
-          end
-          return nil, "retry transform failed"
+      if retry_err then
+        return nil, retry_err
+      end
+      local retry_ok2, retry_response = pcall(json.decode, retry_content)
+      if retry_ok2 and type(retry_response) == "table" then
+        if retry_response.error then
+          return nil, retry_response.error.message or json.encode(retry_response.error)
         end
+        M.parse_response_tool_calls(retry_response)
+        local retry_unified = request_handler.transform_response(retry_response, api_type)
+        if retry_unified then
+          return retry_unified, nil
+        end
+        return nil, "retry transform failed"
       end
       return nil, "retry failed"
     end
@@ -1136,25 +1161,12 @@ function M.send_request_retry(params, on_complete)
     temp_file,
   })
 
-  local cmd = vim.list_extend({ "curl" }, curl_args)
-  local ok, result = pcall(vim.fn.system, cmd)
-  local exit_code = vim.v.shell_error
-
+  local content, curl_err = _exec_curl_job(curl_args, temp_file, params.timeout or 60000)
   pcall(vim.fn.delete, body_file)
-
-  if not ok or exit_code ~= 0 then
-    pcall(vim.fn.delete, temp_file)
-    if on_complete then
-      on_complete(nil, "curl failed: " .. (ok and "exit " .. exit_code or tostring(result)))
-    end
-    return nil
-  end
-
-  local content = M.read_file(temp_file)
   pcall(vim.fn.delete, temp_file)
-  if not content or content == "" then
+  if curl_err then
     if on_complete then
-      on_complete(nil, "Empty response")
+      on_complete(nil, curl_err)
     end
     return nil
   end

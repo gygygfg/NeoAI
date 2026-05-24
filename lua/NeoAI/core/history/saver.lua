@@ -44,15 +44,17 @@ local function enqueue_save(session_id, save_fn)
   -- 追加保存函数到列表（不覆盖），确保多个工具结果都能被保存
   table.insert(entry.save_fns, save_fn)
 
-  -- 启动防抖定时器（300ms 内合并多次写入）
+  -- 停止旧定时器，启动新防抖定时器（300ms 内合并多次写入）
+  -- 注意：不能用 timer:again()，因为定时器创建时 repeat=0（非重复定时器），
+  -- again() 对于非重复定时器只会停止而不会重新启动，导致防抖机制失效。
   if entry.timer and not entry.timer:is_closing() then
-    entry.timer:again()
+    entry.timer:stop()
   else
     entry.timer = vim.uv.new_timer()
-    entry.timer:start(300, 0, vim.schedule_wrap(function()
-      M._flush_session(session_id)
-    end))
   end
+  entry.timer:start(300, 0, vim.schedule_wrap(function()
+    M._flush_session(session_id)
+  end))
 
   -- 启动全局批量刷新定时器（最迟 2s 强制刷新所有待处理会话）
   if not state._flush_timer or state._flush_timer:is_closing() then

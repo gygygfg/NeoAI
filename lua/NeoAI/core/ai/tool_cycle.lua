@@ -1953,10 +1953,23 @@ function M.on_generation_complete(data)
           layer = "tool_orchestrator",
         },
       })
+      -- 回滚失败的工具交互：找到最后一条 assistant+tool_calls 消息，
+      -- 删除它及其后续所有消息（tool 结果等），避免 AI 在重试时看到孤儿 tool 结果
       if #ss.messages > 0 then
-        local last_msg = ss.messages[#ss.messages]
-        if last_msg.role == "assistant" and last_msg.tool_calls then
-          table.remove(ss.messages)
+        -- 从后向前查找最后一条 assistant+tool_calls 消息
+        local remove_from = nil
+        for i = #ss.messages, 1, -1 do
+          local msg = ss.messages[i]
+          if msg.role == "assistant" and msg.tool_calls then
+            remove_from = i
+            break
+          end
+        end
+        if remove_from then
+          -- 删除从该位置到末尾的所有消息
+          for _ = #ss.messages, remove_from, -1 do
+            table.remove(ss.messages)
+          end
         end
       end
       -- 重置双事件标志，确保重试生成完成后能正常触发 _check_round_complete
@@ -2031,10 +2044,23 @@ function M.on_generation_complete(data)
             layer = "tool_orchestrator",
           },
         })
+        -- 回滚失败的工具交互：找到最后一条 assistant+tool_calls 消息，
+        -- 删除它及其后续所有消息（tool 结果等），避免 AI 在重试时看到孤儿 tool 结果
         if #ss.messages > 0 then
-          local last_msg = ss.messages[#ss.messages]
-          if last_msg.role == "assistant" and last_msg.tool_calls then
-            table.remove(ss.messages)
+          -- 从后向前查找最后一条 assistant+tool_calls 消息
+          local remove_from = nil
+          for i = #ss.messages, 1, -1 do
+            local msg = ss.messages[i]
+            if msg.role == "assistant" and msg.tool_calls then
+              remove_from = i
+              break
+            end
+          end
+          if remove_from then
+            -- 删除从该位置到末尾的所有消息
+            for _ = #ss.messages, remove_from, -1 do
+              table.remove(ss.messages)
+            end
           end
         end
         -- 重置双事件标志，确保重试生成完成后能正常触发 _check_round_complete

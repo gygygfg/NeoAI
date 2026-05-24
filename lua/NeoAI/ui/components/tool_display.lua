@@ -703,8 +703,29 @@ function M.schedule_preview_update()
     end
   end
 
-  if preview.timer then
-    preview.timer:again(60)
+  if preview.timer and not preview.timer:is_closing() then
+    preview.timer:stop()
+    preview.timer:start(60, 0, vim.schedule_wrap(function()
+      if not preview.timer then return end
+      preview.timer:stop()
+      preview.timer:close()
+      preview.timer = nil
+      local text = preview._pending_append
+      preview._pending_append = ""
+      if text == "" or state.active or state._finished then return end
+
+      if not preview.window_shown then
+        preview.window_shown = true
+        M.show_preview()
+        -- 通知 chat_window 更新光标跟随状态（通过事件解耦）
+        pcall(vim.api.nvim_exec_autocmds, "User", {
+          pattern = "NeoAI:tool_preview_shown",
+          data = { window_id = win_id },
+        })
+      elseif state.preview_window_id then
+        M.append_preview(text)
+      end
+    end))
   else
     preview.timer = vim.uv.new_timer()
     preview.timer:start(60, 0, vim.schedule_wrap(function()
@@ -729,7 +750,6 @@ function M.schedule_preview_update()
       end
     end))
   end
-end
 
 --- 清理流式预览
 function M.clear_streaming_preview()

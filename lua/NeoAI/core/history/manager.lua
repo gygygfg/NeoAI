@@ -487,6 +487,7 @@ function M.add_assistant_entry(session_id, assistant_entry)
     table.insert(session.assistant, { content = assistant_entry })
   end
   session.updated_at = os.time()
+  M._mark_dirty()
   return true
 end
 
@@ -585,6 +586,7 @@ function M.update_usage(session_id, usage)
   end
   session.usage = existing
   session.updated_at = os.time()
+  M._mark_dirty_light()
 end
 
 --- 将单个会话的消息展平为 role/content 列表（内部公共函数）

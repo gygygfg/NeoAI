@@ -261,28 +261,29 @@ function _send_non_stream_request(generation_id, request, params)
   if not generation then return end
   local shared = state_manager.get_shared() or {}
   local ai_preset = shared.ai_preset or generation.ai_preset or {}
-  local response, err = http_utils.send_request({
+  http_utils.send_request_async({
     request = request, generation_id = generation_id, base_url = ai_preset.base_url, api_key = ai_preset.api_key,
     timeout = ai_preset.timeout, api_type = ai_preset.api_type or "openai", provider_config = ai_preset,
-  })
-  if err then
-    if not state.is_generating or not state.active_generations or not state.active_generations[generation_id] then return end
-    if generation.retry_count < state.max_retries then
-      generation.retry_count = generation.retry_count + 1
-      vim.defer_fn(function()
-        if not state.is_generating or not state.active_generations or not state.active_generations[generation_id] then return end
-        _send_non_stream_request(generation_id, request, params)
-      end, state.retry_delay_ms)
-      return
+  }, function(response, err)
+    if err then
+      if not state.is_generating or not state.active_generations or not state.active_generations[generation_id] then return end
+      if generation.retry_count < state.max_retries then
+        generation.retry_count = generation.retry_count + 1
+        vim.defer_fn(function()
+          if not state.is_generating or not state.active_generations or not state.active_generations[generation_id] then return end
+          _send_non_stream_request(generation_id, request, params)
+        end, state.retry_delay_ms)
+        return
+      end
+      M.handle_generation_error(generation_id, err); return
     end
-    M.handle_generation_error(generation_id, err); return
-  end
-  if response and response.error then
-    local err_msg = response.error.message
-    if not err_msg then pcall(function() err_msg = json.encode(response.error) end) end
-    M.handle_generation_error(generation_id, err_msg or "未知错误"); return
-  end
-  _handle_ai_response(generation_id, response, params)
+    if response and response.error then
+      local err_msg = response.error.message
+      if not err_msg then pcall(function() err_msg = json.encode(response.error) end) end
+      M.handle_generation_error(generation_id, err_msg or "未知错误"); return
+    end
+    _handle_ai_response(generation_id, response, params)
+  end)
 end
 
 -- ========== 流式请求 ==========

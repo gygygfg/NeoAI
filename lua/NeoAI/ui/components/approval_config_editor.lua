@@ -78,7 +78,7 @@ function M.open()
   -- 如果 pcall 失败（vim.ui.select 被异常中断），清理状态
   if not ok_select then
     M._selecting = false
-end
+  end
 end
 
 --- 显示审批配置编辑器
@@ -110,9 +110,7 @@ function M._show_editor(tool_name, tool)
 
   -- 递归编辑菜单，支持修改多个字段
   local function show_field_menu()
-    local dirs_str = #current_allowed_directories > 0
-      and table.concat(current_allowed_directories, ", ")
-      or "(空)"
+    local dirs_str = #current_allowed_directories > 0 and table.concat(current_allowed_directories, ", ") or "(空)"
     local groups_str = ""
     for k, v in pairs(current_allowed_param_groups) do
       local vals = type(v) == "table" and table.concat(v, ", ") or tostring(v)
@@ -157,14 +155,9 @@ function M._show_editor(tool_name, tool)
           auto_allow = current_auto_allow,
           allowed_directories = current_allowed_directories,
           allowed_param_groups = current_allowed_param_groups,
-          allow_all = current_auto_allow,  -- 允许所有与 auto_allow 同步
+          allow_all = current_auto_allow, -- 允许所有与 auto_allow 同步
         }
         approval_state.set_tool_config(tool_name, save_config)
-
-        vim.notify(
-          string.format("[NeoAI] 工具 '%s' 运行时审批配置已更新", tool_name),
-          vim.log.levels.INFO
-        )
 
         pcall(vim.api.nvim_exec_autocmds, "User", {
           pattern = Events.TOOL_APPROVAL_CONFIG_CHANGED,
@@ -183,11 +176,7 @@ function M._show_editor(tool_name, tool)
           { display = "require_user - 需要用户审批", value = false },
         }
         vim.ui.select(behavior_options, {
-          prompt = string.format(
-            "工具 [%s] 当前 behavior: %s",
-            tool_name,
-            behavior_text(current_auto_allow)
-          ),
+          prompt = string.format("工具 [%s] 当前 behavior: %s", tool_name, behavior_text(current_auto_allow)),
           format_item = function(item)
             local marker = (item.value == current_auto_allow) and "✓ " or "  "
             return marker .. item.display
@@ -198,7 +187,6 @@ function M._show_editor(tool_name, tool)
           end
           show_field_menu()
         end)
-
       elseif selected.field == "allowed_directories" then
         local dirs_options = {
           { display = "添加目录", action = "add" },
@@ -207,11 +195,7 @@ function M._show_editor(tool_name, tool)
           { display = "返回上级菜单", action = "back" },
         }
         vim.ui.select(dirs_options, {
-          prompt = string.format(
-            "当前允许目录 (%d 个): %s",
-            #current_allowed_directories,
-            dirs_str
-          ),
+          prompt = string.format("当前允许目录 (%d 个): %s", #current_allowed_directories, dirs_str),
           format_item = function(item)
             return item.display
           end,
@@ -244,7 +228,6 @@ function M._show_editor(tool_name, tool)
               end
               show_field_menu()
             end)
-
           elseif selected_action.action == "remove" then
             if #current_allowed_directories == 0 then
               vim.notify("[NeoAI] 没有可删除的目录", vim.log.levels.INFO)
@@ -272,13 +255,11 @@ function M._show_editor(tool_name, tool)
               end
               show_field_menu()
             end)
-
           elseif selected_action.action == "clear" then
             current_allowed_directories = {}
             show_field_menu()
           end
         end)
-
       elseif selected.field == "allowed_param_groups" then
         local groups_options = {
           { display = "添加参数组", action = "add" },
@@ -287,10 +268,7 @@ function M._show_editor(tool_name, tool)
           { display = "返回上级菜单", action = "back" },
         }
         vim.ui.select(groups_options, {
-          prompt = string.format(
-            "当前允许参数组: %s",
-            groups_str
-          ),
+          prompt = string.format("当前允许参数组: %s", groups_str),
           format_item = function(item)
             return item.display
           end,
@@ -327,7 +305,6 @@ function M._show_editor(tool_name, tool)
                 show_field_menu()
               end)
             end)
-
           elseif selected_action.action == "remove" then
             local keys = vim.tbl_keys(current_allowed_param_groups)
             if #keys == 0 then
@@ -338,7 +315,7 @@ function M._show_editor(tool_name, tool)
             local remove_options = {}
             for _, k in ipairs(keys) do
               local vals = type(current_allowed_param_groups[k]) == "table"
-                and table.concat(current_allowed_param_groups[k], ", ")
+                  and table.concat(current_allowed_param_groups[k], ", ")
                 or tostring(current_allowed_param_groups[k])
               table.insert(remove_options, { display = string.format("%s = [%s]", k, vals), value = k })
             end
@@ -354,7 +331,6 @@ function M._show_editor(tool_name, tool)
               end
               show_field_menu()
             end)
-
           elseif selected_action.action == "clear" then
             current_allowed_param_groups = {}
             show_field_menu()
