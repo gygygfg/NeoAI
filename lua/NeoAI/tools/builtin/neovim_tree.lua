@@ -304,8 +304,8 @@ local function filter_nodes(nodes, node_type, text, named)
       matched = false
     end
     if matched and text ~= nil then
-      -- 使用 Lua 的 string.find 做子串匹配（不区分大小写可选）
-      if not node.text:find(text, 1, true) then
+      -- 精确匹配节点文本（区分大小写、精确空白），不是子串包含匹配
+      if node.text ~= text then
         matched = false
       end
     end
@@ -1008,7 +1008,7 @@ M.get_node_type = {
     properties = {
       filepath = { type = "string", description = "文件路径" },
       node_type = { type = "string", description = "节点类型过滤（可选，仅支持命名节点类型，匿名 token 如运算符 '+' 请使用 text 参数或 query_tree），如 'function_definition'" },
-      text = { type = "string", description = "节点文本过滤（可选）" },
+      text = { type = "string", description = "节点文本过滤（可选，精确匹配，区分大小写，精确空白）" },
       named = { type = "boolean", description = "是否为命名节点（可选）" },
     },
     required = { "filepath" },
@@ -1132,7 +1132,7 @@ M.get_node_range = {
     properties = {
       filepath = { type = "string", description = "文件路径" },
       node_type = { type = "string", description = "节点类型过滤（可选，仅支持命名节点类型，匿名 token 如运算符 '+' 请使用 text 参数或 query_tree），如 'function_definition'" },
-      text = { type = "string", description = "节点文本过滤（可选）" },
+      text = { type = "string", description = "节点文本过滤（可选，精确匹配，区分大小写，精确空白）" },
       named = { type = "boolean", description = "是否为命名节点（可选）" },
       include_code = {
         type = "boolean",
@@ -1181,7 +1181,7 @@ M.is_named_node = {
     properties = {
       filepath = { type = "string", description = "文件路径" },
       node_type = { type = "string", description = "节点类型过滤（可选，仅支持命名节点类型，匿名 token 如运算符 '+' 请使用 text 参数或 query_tree），如 'function_definition'" },
-      text = { type = "string", description = "节点文本过滤（可选）" },
+      text = { type = "string", description = "节点文本过滤（可选，精确匹配，区分大小写，精确空白）" },
     },
     required = { "filepath" },
   },
@@ -1310,7 +1310,7 @@ M.get_parent_node = {
     properties = {
       filepath = { type = "string", description = "文件路径" },
       node_type = { type = "string", description = "目标节点类型过滤（可选，仅支持命名节点类型，匿名 token 如运算符 '+' 请使用 text 参数或 query_tree）" },
-      text = { type = "string", description = "目标节点文本过滤（可选）" },
+      text = { type = "string", description = "目标节点文本过滤（可选，精确匹配，区分大小写，精确空白）" },
       named = { type = "boolean", description = "目标节点是否为命名节点（可选）" },
     },
     required = { "filepath" },
@@ -1376,7 +1376,7 @@ M.get_child_nodes = {
     properties = {
       filepath = { type = "string", description = "文件路径" },
       node_type = { type = "string", description = "父节点类型过滤（可选，仅支持命名节点类型，匿名 token 如运算符 '+' 请使用 text 参数或 query_tree），如 'function_definition'" },
-      text = { type = "string", description = "父节点文本过滤（可选）" },
+      text = { type = "string", description = "父节点文本过滤（可选，精确匹配，区分大小写，精确空白）" },
       named = { type = "boolean", description = "父节点是否为命名节点（可选）" },
     },
     required = { "filepath" },
@@ -1484,7 +1484,7 @@ M.get_node_code = {
     properties = {
       filepath = { type = "string", description = "文件路径" },
       node_type = { type = "string", description = "节点类型过滤（可选，仅支持命名节点类型，匿名 token 如运算符 '+' 请使用 text 参数或 query_tree），如 'function_definition'" },
-      text = { type = "string", description = "节点文本过滤（可选）" },
+      text = { type = "string", description = "节点文本过滤（可选，精确匹配，区分大小写，精确空白）" },
       named = { type = "boolean", description = "是否为命名节点（可选）" },
     },
     required = { "filepath" },
@@ -1859,7 +1859,7 @@ M.delete_node = {
     properties = {
       filepath = { type = "string", description = "文件路径" },
       node_type = { type = "string", description = "节点类型过滤（可选，仅支持命名节点类型，匿名 token 如运算符 '+' 请使用 text 参数或 query_tree），如 'function_definition'" },
-      text = { type = "string", description = "节点文本过滤（可选）" },
+      text = { type = "string", description = "节点文本过滤（可选，精确匹配，区分大小写，精确空白）" },
       named = { type = "boolean", description = "是否为命名节点（可选）" },
       index = {
         type = "number",
@@ -1891,9 +1891,9 @@ local function _edit_node(args, on_success, on_error)
     end
     return
   end
-  if not args.content then
+  if not args.content or args.content == "" then
     if on_error then
-      on_error("需要 content（新内容）参数")
+      on_error("需要 content（新内容）参数，且不能为空字符串。如需删除节点，请使用 delete_node 工具")
     end
     return
   end
@@ -2142,7 +2142,7 @@ M.edit_node = {
       filepath = { type = "string", description = "文件路径（必填）" },
       content = { type = "string", description = "替换的新源代码内容（必填）" },
       node_type = { type = "string", description = "节点类型过滤（必填，防止意外匹配根节点，仅支持命名节点类型，匿名 token 如运算符 '+' 请使用 text 参数或 query_tree），如 'function_definition'" },
-      text = { type = "string", description = "节点文本过滤（可选）" },
+      text = { type = "string", description = "节点文本过滤（可选，精确匹配，区分大小写，精确空白）" },
       named = { type = "boolean", description = "是否为命名节点（可选）" },
       index = {
         type = "number",

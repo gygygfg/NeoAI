@@ -19,8 +19,7 @@ local function _execute_vim_cmd(args, on_success, on_error)
     return
   end
 
-  -- 保存当前窗口和 buffer，执行命令后恢复焦点
-  local current_win = pcall(vim.api.nvim_get_current_win) and vim.api.nvim_get_current_win() or 0
+  -- 保存当前 buffer，执行命令后检查焦点是否变更
   local current_buf = pcall(vim.api.nvim_get_current_buf) and vim.api.nvim_get_current_buf() or 0
 
   -- 使用 nvim_exec2 执行命令并捕获输出（比 vim.fn.execute 更可靠，不会因 echo 等命令阻塞）
@@ -28,14 +27,11 @@ local function _execute_vim_cmd(args, on_success, on_error)
     return vim.api.nvim_exec2(command, { output = true })
   end)
 
-  -- 恢复焦点 buffer 和窗口（命令可能改变了窗口布局）
-  if current_win > 0 then
-    pcall(vim.api.nvim_set_current_win, current_win)
-  end
+  -- 执行完成后，检查焦点 buffer 是否变更，如有变更则还原
   if current_buf > 0 and vim.api.nvim_buf_is_valid(current_buf) then
-    local win_buf = vim.api.nvim_win_get_buf(current_win > 0 and current_win or 0)
-    if win_buf ~= current_buf then
-      pcall(vim.api.nvim_win_set_buf, current_win > 0 and current_win or 0, current_buf)
+    local new_buf = pcall(vim.api.nvim_get_current_buf) and vim.api.nvim_get_current_buf() or 0
+    if new_buf ~= current_buf then
+      pcall(vim.api.nvim_set_current_buf, current_buf)
     end
   end
 

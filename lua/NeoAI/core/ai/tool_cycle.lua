@@ -1959,6 +1959,9 @@ function M.on_generation_complete(data)
           table.remove(ss.messages)
         end
       end
+      -- 重置双事件标志，确保重试生成完成后能正常触发 _check_round_complete
+      ss._generation_completed = false
+      ss._tools_all_completed = false
       vim.defer_fn(function()
         M._request_generation(session_id, is_sub_agent)
       end, delay)
@@ -2034,6 +2037,9 @@ function M.on_generation_complete(data)
             table.remove(ss.messages)
           end
         end
+        -- 重置双事件标志，确保重试生成完成后能正常触发 _check_round_complete
+        ss._generation_completed = false
+        ss._tools_all_completed = false
         vim.defer_fn(function()
           M._request_generation(session_id, is_sub_agent)
         end, delay)

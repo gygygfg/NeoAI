@@ -537,8 +537,12 @@ end
 
 --- 伪 Git：回滚到指定快照
 function _git_auto_mod._pseudo_rollback(hash)
+  -- 防止空 hash 匹配到任意快照（vim.startswith(s, "") 总是返回 true）
+  if not hash or hash == "" then
+    return false, "hash 不能为空"
+  end
   for i, snapshot in ipairs(state.pseudo.snapshots) do
-    if snapshot.hash == hash then
+    if snapshot.hash == hash or vim.startswith(snapshot.hash, hash) then
       -- 恢复该快照的文件内容
       for filepath, content in pairs(snapshot.files) do
         state.pseudo.current_snapshot[filepath] = content
@@ -781,8 +785,12 @@ function _git_auto_mod.get_commit_detail(commit_hash, cwd)
     return _git_auto_mod._git_show(commit_hash, cwd)
   end
   -- 伪 Git：查找快照
+  -- 防止空 hash 匹配到任意快照（vim.startswith(s, "") 总是返回 true）
+  if not commit_hash or commit_hash == "" then
+    return nil
+  end
   for _, s in ipairs(state.pseudo.snapshots) do
-    if s.hash == commit_hash then
+    if s.hash == commit_hash or vim.startswith(s.hash, commit_hash) then
       local lines = {}
       table.insert(lines, string.format("提交: %s", s.hash))
       table.insert(lines, string.format("时间: %s", os.date("%Y-%m-%d %H:%M:%S", s.timestamp)))

@@ -63,8 +63,15 @@ function M.initialize(config)
   end
 
   -- 设置输出路径（仅当用户未通过 set_output 显式设置时）
-  if config.output_path and not state._explicit.output_path then
-    M.set_output(config.output_path)
+  if not state._explicit.output_path then
+    if config.output_path then
+      M.set_output(config.output_path)
+    else
+      -- 明确处理 output_path 为 nil 的情况（默认配置）
+      -- 必须调用 set_output(nil) 确保 state.output 正确设置为 nil
+      -- 并关闭可能存在的旧文件输出
+      M.set_output(nil)
+    end
   end
 
   -- 设置日志格式
@@ -324,12 +331,10 @@ function M._write_entry(entry)
       state.output:flush()
     end
   else
-    -- 没有文件输出时，使用 vim.notify 而非 print，避免污染控制台
-    if vim and vim.notify then
-      vim.notify(entry, vim.log.levels.DEBUG)
-    else
-      print(entry)
-    end
+    -- 没有文件输出时，使用 print 输出到 :messages（而非 vim.notify）
+    -- vim.notify 会触发 UI 通知事件，可能与 NeoAI 的悬浮窗（如工具参数预览窗）冲突
+    -- 导致工具循环卡死在参数接收阶段
+    print(entry)
   end
 end
 

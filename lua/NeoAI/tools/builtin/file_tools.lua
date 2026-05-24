@@ -503,7 +503,13 @@ local function _replace_text(args, on_success, on_error)
     return
   end
 
-  local end_range = find_text_range(lines, end_anchor, end_text)
+  -- 当 start_match 和 end_match 相同时，复用 start_range 避免 find_text_range 展开范围不一致
+  local end_range
+  if start_anchor == end_anchor and start_text == end_text then
+    end_range = start_range
+  else
+    end_range = find_text_range(lines, end_anchor, end_text)
+  end
   if not end_range then
     if on_error then
       on_error(string.format("在行 %d 附近未找到匹配文本: %s", end_anchor, end_text))
@@ -986,19 +992,23 @@ local function scan_dir_flat(dir, pattern, all_results, max_results, show_hidden
           return
         end
         for _, entry in ipairs(entries) do
-          if entry.type == "file" then
-            -- 跳过隐藏文件（以 . 开头），除非 show_hidden 为 true
-            if not show_hidden and entry.name:sub(1, 1) == "." then
-              -- skip
-            elseif lua_pattern == nil or entry.name:match(lua_pattern) then
-              table.insert(all_results, dir .. "/" .. entry.name)
-              if max_results and #all_results >= max_results then
-                vim.uv.fs_closedir(dir_handle)
-                if done_callback then
-                  done_callback()
-                end
-                return
+          local name = entry.name
+          local typ = entry.type
+          local full_path = dir .. "/" .. name
+          local is_hidden = name:sub(1, 1) == "."
+          -- 跳过 . 和 ..
+          if name == "." or name == ".." then
+            -- skip
+          elseif not show_hidden and is_hidden then
+            -- 跳过隐藏条目
+          elseif lua_pattern == nil or name:match(lua_pattern) then
+            table.insert(all_results, full_path)
+            if max_results and #all_results >= max_results then
+              vim.uv.fs_closedir(dir_handle)
+              if done_callback then
+                done_callback()
               end
+              return
             end
           end
         end
@@ -1054,24 +1064,26 @@ local function scan_dir_recursive(dir, pattern, all_results, max_results, show_h
           local name = entry.name
           local typ = entry.type
           local full_path = dir .. "/" .. name
-          if typ == "file" then
-            -- 跳过隐藏文件（以 . 开头），除非 show_hidden 为 true
-            if not show_hidden and name:sub(1, 1) == "." then
-              -- skip
-            elseif lua_pattern == nil or name:match(lua_pattern) then
-              table.insert(all_results, full_path)
-              if max_results and #all_results >= max_results then
-                vim.uv.fs_closedir(dir_handle)
-                if done_callback then
-                  done_callback()
+          local is_hidden = name:sub(1, 1) == "."
+          -- 跳过 . 和 ..
+          if name == "." or name == ".." then
+            -- skip
+          else
+            -- 隐藏条目过滤
+            if show_hidden or not is_hidden then
+              -- 添加到结果列表
+              if lua_pattern == nil or name:match(lua_pattern) then
+                table.insert(all_results, full_path)
+                if max_results and #all_results >= max_results then
+                  vim.uv.fs_closedir(dir_handle)
+                  if done_callback then
+                    done_callback()
+                  end
+                  return
                 end
-                return
               end
-            end
-          elseif typ == "directory" then
-            if name ~= "." and name ~= ".." then
-              -- 隐藏目录入栈，只有当 show_hidden 为 true 时才递归
-              if show_hidden or name:sub(1, 1) ~= "." then
+              -- 如果是目录，入栈递归
+              if typ == "directory" then
                 table.insert(subdirs, full_path)
               end
             end
@@ -1183,13 +1195,20 @@ local function _search_files(args, on_success, on_error)
   end
   if not regex then
     table.insert(grep_args, "-F")
+  else
+    -- 使用扩展正则表达式（ERE），避免 BRE 中 \( 等特殊字符导致的错误
+    -- 在 ERE 中，( 是特殊字符，\( 是字面量，更符合用户直觉
+    table.insert(grep_args, "-E")
   end
   table.insert(grep_args, "-n")
   if file_pattern and file_pattern ~= "*" then
-    table.insert(grep_args, "--include")
-    table.insert(grep_args, file_pattern)
+    -- 使用 --include=GLOB 合并形式，兼容性更好
+    -- BUG FIX: 原先使用两个独立参数 --include <pattern>，在某些 grep 实现中可能失败
+    table.insert(grep_args, "--include=" .. file_pattern)
   end
-  table.insert(grep_args, "--")
+  -- 使用 -e 显式标记搜索模式，防止以 - 开头的模式被误解析为 grep 选项
+  -- grep 语法: grep [OPTIONS] -e PATTERN [FILE...]
+  table.insert(grep_args, "-e")
   table.insert(grep_args, search_pattern)
   table.insert(grep_args, dir)
 
