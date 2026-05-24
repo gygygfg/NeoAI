@@ -2968,18 +2968,15 @@ function M._setup_event_listeners()
   -- 构建流式工具调用预览 buffer（从 TOOL_CALL_DETECTED 的累积数据生成）
   -- 将 JSON 中的转义字符（\n、\t、\\ 等）渲染为可读格式
   local function escape_json_for_display(str)
-    -- 先处理 \n（两个字符：反斜杠 + n）为真正换行
-    str = str:gsub("\\n", "\n")
-    -- 处理 \t 为制表符
-    str = str:gsub("\\t", "\t")
-    -- 处理 \\ 为单个反斜杠
+    -- BUG FIX: 先处理 \\\\，再处理其他转义，避免 \\\\n 被错误拆解
     str = str:gsub("\\\\", "\\")
-    -- 处理 \" 为 "
+    str = str:gsub("\\n", "\n")
+    str = str:gsub("\\t", "\t")
     str = str:gsub('\\"', '"')
     return str
-  end
+   end
 
-  function M.build_streaming_preview_buffer()
+   function M.build_streaming_preview_buffer()
     local preview = state.tool_display.streaming_preview
     local tools = preview.tools or {}
     if not next(tools) then
@@ -3463,6 +3460,38 @@ function M._setup_event_listeners()
         end
       end
       -- tools_complete 触发时不操作，由后续 GENERATION_COMPLETED 处理
+    end,
+  })
+
+  -- SUB_AGENT_SUMMARY_READY：子 agent 摘要已准备好
+  vim.api.nvim_create_autocmd("User", {
+    pattern = Events.SUB_AGENT_SUMMARY_READY,
+    callback = function(args)
+      if state.closing then
+        return
+      end
+      local data = args.data or {}
+      if not is_current_window(data.window_id) then
+        return
+      end
+      M.render_chat()
+    end,
+  })
+
+
+  -- TOOL_PREVIEW_SHOWN：工具预览窗口已显示
+  vim.api.nvim_create_autocmd("User", {
+    pattern = Events.TOOL_PREVIEW_SHOWN,
+    callback = function(args)
+      if state.closing then
+        return
+      end
+      local data = args.data or {}
+      if not is_current_window(data.window_id) then
+        return
+      end
+      M._set_cursor_follow_should(true)
+      _schedule_cursor_follow(150)
     end,
   })
 

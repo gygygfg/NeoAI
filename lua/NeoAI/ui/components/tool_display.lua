@@ -109,9 +109,10 @@ end
 
 --- JSON 转义字符渲染
 local function escape_json_for_display(str)
+  -- BUG FIX: 先处理 \\\\，再处理其他转义，避免 \\\\n 被错误拆解
+  str = str:gsub("\\\\", "\\")
   str = str:gsub("\\n", "\n")
   str = str:gsub("\\t", "\t")
-  str = str:gsub("\\\\", "\\")
   str = str:gsub('\\"', '"')
   return str
 end
@@ -560,24 +561,35 @@ function M.update_streaming_tools(tool_calls, tool_calls_delta, generation_id)
   end
   preview.generation_id = generation_id
 
+  -- BUG FIX: 使用 tool_call_id 作为 key，避免同名工具互相覆盖
   for _, tc in ipairs(tool_calls) do
     local func = tc["function"] or tc.func or {}
     local tool_name = func.name or ""
     if tool_name ~= "" then
-      if not preview.tools[tool_name] then
-        preview.tools[tool_name] = { name = tool_name, arguments = "", args_display = {} }
+      -- 使用 tc.id 或 index 构造唯一 key，避免同名工具（如多个 read_file）互相覆盖
+      local tool_key = tc.id or (tool_name .. "_" .. (tc.index or 0))
+      if not preview.tools[tool_key] then
+        preview.tools[tool_key] = { name = tool_name, arguments = "", args_display = {} }
       end
       if func.arguments then
         local args_str = type(func.arguments) == "table" and vim.json.encode(func.arguments) or func.arguments
-        preview.tools[tool_name].arguments = args_str
-        try_parse_streaming_args(preview.tools[tool_name])
+        preview.tools[tool_key].arguments = args_str
+        try_parse_streaming_args(preview.tools[tool_key])
       end
     end
   end
 
+  -- BUG FIX: 每个 tool_call_delta 的参数追加到对应工具的 _pending，而不是全局混在一起
   for _, tc in ipairs(tool_calls_delta) do
     local func = tc["function"] or tc.func or {}
     if func.arguments and type(func.arguments) == "string" and func.arguments ~= "" then
+      local tool_key = tc.id or ((func.name or "unknown") .. "_" .. (tc.index or 0))
+      if preview.tools[tool_key] then
+        -- 将 delta 参数追加到对应工具的 arguments 和全局 _pending_append
+        preview.tools[tool_key].arguments = preview.tools[tool_key].arguments .. func.arguments
+        try_parse_streaming_args(preview.tools[tool_key])
+      end
+      -- 保留全局 _pending_append 用于 schedule_preview_update 的节流显示
       preview._pending_append = preview._pending_append .. func.arguments
     end
   end
@@ -589,10 +601,10 @@ function M.schedule_preview_update()
   if preview._pending_append == "" or state.active or state._finished then return end
 
   -- 检测光标是否在末尾附近，不在末尾附近时不显示预览窗口
-  local chat_window = require("NeoAI.ui.window.chat_window")
-  local win_id = chat_window.get_current_window_id()
+  local win_mgr = require("NeoAI.ui.window.window_manager")
+  local chat_win = win_mgr.get_chat_window()
+  local win_id = chat_win and chat_win.id
   if win_id then
-    local win_mgr = require("NeoAI.ui.window.window_manager")
     local win = win_mgr.get_window_win(win_id)
     if win and vim.api.nvim_win_is_valid(win) then
       local cursor = vim.api.nvim_win_get_cursor(win)
@@ -621,9 +633,11 @@ function M.schedule_preview_update()
       if not preview.window_shown then
         preview.window_shown = true
         M.show_preview()
-        -- 通知 chat_window 更新光标跟随状态
-        pcall(chat_window._set_cursor_follow_should, true)
-        pcall(chat_window._schedule_cursor_follow, 150)
+        -- 通知 chat_window 更新光标跟随状态（通过事件解耦）
+        pcall(vim.api.nvim_exec_autocmds, "User", {
+          pattern = "NeoAI:tool_preview_shown",
+          data = { window_id = win_id },
+        })
       elseif state.preview_window_id then
         M.append_preview(text)
       end

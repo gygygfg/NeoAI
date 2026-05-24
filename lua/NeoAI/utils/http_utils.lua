@@ -624,12 +624,22 @@ function M.filter_valid_tool_calls(tool_calls)
         if ok and type(parsed) == "table" then
           func.arguments = parsed
           args = parsed
+        else
+          -- BUG FIX: arguments 字符串无法解析为 JSON，跳过该工具调用
+          -- 避免将损坏的参数传递给后续工具执行流程导致重试死循环
+          logger.warn(
+            "[http_utils] filter_valid_tool_calls: 工具 '%s' 的 arguments 字符串无法解析为 JSON，跳过该工具调用: %s",
+            func.name,
+            tostring(args):sub(1, 200)
+          )
+          goto continue
         end
       end
       if args ~= nil and args ~= "" then
         table.insert(valid, tc)
       end
     end
+    ::continue::
   end
   return valid
 end

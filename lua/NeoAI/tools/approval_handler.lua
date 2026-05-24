@@ -10,7 +10,13 @@
 local logger = require("NeoAI.utils.logger")
 local event_constants = require("NeoAI.core.events")
 local tool_registry = require("NeoAI.tools.tool_registry")
-local ui_init = require("NeoAI.ui.init")
+local ui_init = nil -- 延迟加载，避免循环依赖
+local function _get_ui()
+  if not ui_init then
+    ui_init = require("NeoAI.ui.init")
+  end
+  return ui_init
+end
 
 local M = {}
 
@@ -460,7 +466,7 @@ function M._render_ui()
   table.insert(lines, string.rep("─", win_width))
 
   -- 底部操作提示
-  local full_config = ui_init.get_full_config() or {}
+  local full_config = _get_ui().get_full_config() or {}
   local approval_config = ((full_config.keymaps or {}).chat or {}).approval or DEFAULT_APPROVAL_KEYMAPS
   local action_order = { "confirm", "confirm_all", "cancel", "cancel_with_reason" }
   for _, action in ipairs(action_order) do
@@ -632,7 +638,7 @@ function M._setup_ui_keymaps()
   end
   local buf = ui_state.buf
 
-  local full_config = ui_init.get_full_config() or {}
+  local full_config = _get_ui().get_full_config() or {}
   local approval_config = ((full_config.keymaps or {}).chat or {}).approval or DEFAULT_APPROVAL_KEYMAPS
 
   local actions = {

@@ -176,4 +176,9 @@ M.HISTORY_SAVE_FINAL = "NeoAI:history_save_final" -- 保存最终 AI 回复（�
 -- 使用位置: ui/init.lua
 M.UI_SESSION_UPDATED = "NeoAI:ui_session_updated" -- UI 会话ID已更新
 
+-- ==================== 子 Agent 事件 ====================
+-- 使用位置: tool_cycle.lua, chat_window.lua
+M.SUB_AGENT_SUMMARY_READY = "NeoAI:sub_agent_summary_ready" -- 子 agent 摘要已准备好，UI 需要刷新
+M.TOOL_PREVIEW_SHOWN = "NeoAI:tool_preview_shown" -- 工具预览窗口已显示
+
 return M

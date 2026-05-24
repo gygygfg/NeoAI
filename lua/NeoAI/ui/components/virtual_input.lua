@@ -1,7 +1,9 @@
 local M = {}
 
-local core = require("NeoAI.core")
+-- 注意：core 在函数内延迟加载，避免与 NeoAI.ui → chat_window → virtual_input → core 的循环依赖
+-- 所有使用 core.get_config() 的地方都在函数内部 require
 local wm = require("NeoAI.ui.window.window_manager")
+local file_utils = require("NeoAI.utils.file_utils")
 
 -- 模块状态
 local state = {
@@ -516,6 +518,26 @@ function M.clear()
   M._update_placeholder()
 end
 
+--- 将消息内容中的相对路径转换为绝对路径
+--- 匹配 ./ 或 ../ 开头的路径（含 glob 通配符如 ./* 或 ./dir/*.lua）
+--- @param content string 原始消息内容
+--- @return string 转换后的内容
+local function _convert_relative_paths(content)
+  if not content or content == "" then
+    return content
+  end
+
+  -- 匹配 ./ 或 ../ 开头的路径：字母、数字、下划线、点、连字符、斜杠、星号（glob）
+  -- 模式：\.\.?/ 匹配 ./ 或 ../，[%w_./%-*]+ 匹配路径剩余部分
+  return (content:gsub("(%.%.?/[%w_./%-*]+)", function(match)
+    -- 去除前导 ./ 后再转绝对路径，避免 join_path 产生 /root/NeoAI/./foo 这种冗余格式
+    local cleaned = match:gsub("^%.%/", "")
+    local abs = file_utils.abs_path(cleaned)
+    -- normalize 消除 .. 和多余的 . 组件
+    return file_utils.normalize_path(abs)
+  end))
+end
+
 --- 提交输入
 function M.submit()
   if not state.active then
@@ -526,6 +548,9 @@ function M.submit()
   if content == "" then
     return
   end
+
+  -- 将相对路径转换为绝对路径后再传给 AI
+  content = _convert_relative_paths(content)
 
   -- 调用提交回调
   if state.on_submit and type(state.on_submit) == "function" then
@@ -575,6 +600,7 @@ function M._setup_float_keymaps()
   local buf = state.float_buf
 
   -- 从配置读取 send 键位（send.insert / send.normal 是 { key = "...", desc = "..." } 结构）
+  local core = require("NeoAI.core")
   local full_config = core.get_config() or {}
   local send_config = full_config.keymaps and full_config.keymaps.chat and full_config.keymaps.chat.send
   local send_key = send_config and send_config.insert and send_config.insert.key or "<C-s>"
@@ -650,6 +676,7 @@ function M._bind_chat_keymaps_to_float(buf)
 
   -- 从配置中获取快捷键配置
   -- 所有键位统一由 default_config.lua 定义，模块内部不提供任何 fallback 默认值
+  local core = require("NeoAI.core")
   local full_config = core.get_config() or {}
   if not full_config or not full_config.keymaps or not full_config.keymaps.chat then
     return
@@ -736,6 +763,9 @@ function M._submit_float()
     return
   end
 
+  -- 将相对路径转换为绝对路径后再传给 AI
+  content = _convert_relative_paths(content)
+
   -- 调用提交回调
   -- 注意：on_submit 内部会触发 GENERATION_STARTED 事件，该事件的监听器会关闭虚拟输入框
   -- 所以这里不再重新聚焦输入框，避免覆盖关闭效果
@@ -760,6 +790,7 @@ function M._setup_keymaps()
   local buf = state.buf
 
   -- 从配置读取 send 键位（send.insert / send.normal 是 { key = "...", desc = "..." } 结构）
+  local core = require("NeoAI.core")
   local full_config = core.get_config() or {}
   local send_config = full_config.keymaps and full_config.keymaps.chat and full_config.keymaps.chat.send
   local send_key = send_config and send_config.insert and send_config.insert.key or "<C-s>"
@@ -865,6 +896,7 @@ end
 --- 获取键位配置
 --- 所有键位统一由 default_config.lua 定义，模块内部不提供任何 fallback 默认值
 function M._get_keymaps()
+  local core = require("NeoAI.core")
   local full_config = core.get_config() or {}
   local chat_keymaps = full_config.keymaps and full_config.keymaps.chat or {}
   return {
@@ -889,6 +921,8 @@ function M.focus_and_insert()
   end
 
   if not state.float_win or not vim.api.nvim_win_is_valid(state.float_win) then
+    -- 浮动窗口已被外部销毁（非隐藏状态），清理状态以允许 _open_float_input 重建
+    M.close()
     return
   end
 
@@ -932,7 +966,16 @@ end
 
 --- 是否激活
 function M.is_active()
-  return state.active
+  if not state.active then
+    return false
+  end
+  -- float 模式下额外检查浮动窗口是否仍有效（外部销毁后 active 可能未清理）
+  if state.mode == "float" then
+    if not state.float_win or not vim.api.nvim_win_is_valid(state.float_win) then
+      return false
+    end
+  end
+  return true
 end
 
 --- 获取输入区域起始行
@@ -954,6 +997,8 @@ function M.hide()
     return
   end
   if not state.float_win or not vim.api.nvim_win_is_valid(state.float_win) then
+    -- 浮动窗口已被外部销毁，关闭以允许重建
+    M.close()
     return
   end
 
@@ -974,9 +1019,13 @@ function M.show()
     return false
   end
   if not state.float_win or not vim.api.nvim_win_is_valid(state.float_win) then
+    -- 浮动窗口已被外部销毁（buffer 被其他窗口破坏），关闭以允许重建
+    M.close()
     return false
   end
   if not state.parent_win or not vim.api.nvim_win_is_valid(state.parent_win) then
+    -- 父窗口已被销毁，关闭以允许重建
+    M.close()
     return false
   end
 

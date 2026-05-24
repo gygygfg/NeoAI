@@ -1680,10 +1680,13 @@ function M.execute_with_orchestrator(tool_name, raw_args, session_context, callb
       })
 
       -- 尝试读取文件当前内容，让 AI 看到文件状态
+      -- 仅当文件存在时才读取，避免在文件不存在时产生混淆的错误信息
       local filepath = _extract_filepath_from_args(arguments)
-      if filepath then
+      if filepath and file_utils.exists(filepath) then
         local file_context = _read_file_context(filepath, nil, nil)
         full_err = full_err .. "\n\n=== 文件当前内容 ===\n" .. file_context
+      elseif filepath and not file_utils.exists(filepath) then
+        full_err = full_err .. "\n\n注意：文件 '" .. filepath .. "' 不存在，请检查路径是否正确。"
       end
 
       if original_on_result then

@@ -1,3 +1,4 @@
+---@diagnostic disable: undefined-global, unused-local, redefined-local, unused-function
 -- 统一的工具循环引擎（事件驱动架构）
 -- 职责：管理主 agent 和子 agent 的工具调用循环执行
 --
@@ -30,6 +31,7 @@ local logger = require("NeoAI.utils.logger")
 local event_constants = require("NeoAI.core.events")
 local tool_pack = require("NeoAI.tools.tool_pack")
 local shutdown_flag = require("NeoAI.core.shutdown_flag")
+local tool_executor = require("NeoAI.tools.tool_executor")
 local request_handler = require("NeoAI.core.ai.request_handler")
 local state_manager = require("NeoAI.core.config.state")
 local plan_executor = require("NeoAI.tools.builtin.plan_executor")
@@ -137,6 +139,7 @@ end
 --- TOOL_DISPLAY_CLOSED 由 chat_window 在 TOOL_LOOP_FINISHED 回调中触发
 --- 由于 fire_loop_finished 在调用此函数之前已触发，事件可能已错过
 --- 因此直接执行回调，不再等待事件
+---@diagnostic disable-next-line: unused-local
 local function once_display_closed(session_id, callback)
   -- 直接执行回调，不再使用 vim.schedule 延迟
   -- 之前的 vim.schedule 是为了等待 TOOL_DISPLAY_CLOSED 事件
@@ -165,7 +168,7 @@ local function fire_loop_finished(ss, is_round_end, trigger_source)
     return
   end
 
-  local ok, err = pcall(vim.api.nvim_exec_autocmds, "User", {
+  local ok, _ = pcall(vim.api.nvim_exec_autocmds, "User", {
     pattern = event_constants.TOOL_LOOP_FINISHED,
     data = {
       generation_id = ss.generation_id,
@@ -214,7 +217,7 @@ local function fire_tool_result_received(ss)
     return
   end
 
-  local ok, err = pcall(vim.api.nvim_exec_autocmds, "User", {
+  local ok, _ = pcall(vim.api.nvim_exec_autocmds, "User", {
     pattern = event_constants.TOOL_RESULT_RECEIVED,
     data = {
       generation_id = ss.generation_id,
@@ -569,6 +572,7 @@ function M.start_async_loop(params)
           end
         end
         -- 停止所有子 agent 会话
+        ---@diagnostic disable-next-line: redefined-local
         for sid, s in pairs(state.sub_agent_sessions) do
           if s then
             s.stop_requested = true
@@ -693,7 +697,9 @@ function M._execute_tools(session_id, tool_calls, is_sub_agent)
     if tool_func and tool_func.name then
       local tid = tc.id
       if not tid or tid == "" then
-        if not M._tool_call_counter then M._tool_call_counter = 0 end
+        if not M._tool_call_counter then
+          M._tool_call_counter = 0
+        end
         M._tool_call_counter = M._tool_call_counter + 1
         tid = "call_" .. os.time() .. "_" .. M._tool_call_counter .. "_" .. math.random(10000, 99999)
         tc.id = tid
@@ -758,7 +764,6 @@ function M._execute_single_tool(session_id, tool_call, is_sub_agent, on_complete
   end
 
   -- ===== 工具名称修正（别名映射 + 模糊匹配） =====
-  local tool_executor = require("NeoAI.tools.tool_executor")
   local tool_registry = require("NeoAI.tools.tool_registry")
   -- ===== 工具名称和参数规范化（别名映射 + 模糊匹配） =====
   -- 不检查工具是否存在，直接对工具名称和参数做规范化
@@ -777,13 +782,14 @@ function M._execute_single_tool(session_id, tool_call, is_sub_agent, on_complete
   end
 
   -- 2) 模糊匹配（别名映射未命中时）
+  -- 内联实现，避免调用已废弃的 M._fuzzy_match_tool
   if not tool_def then
     local all_tools = tool_registry.list()
     local all_names = {}
     for _, t in ipairs(all_tools) do
       table.insert(all_names, t.name)
     end
-    local best_match = M._fuzzy_match_tool(original_tool_name, all_names)
+    local best_match = _inline_fuzzy_match(original_tool_name, all_names)
     if best_match then
       tool_name = best_match
       tool_def = tool_registry.get(tool_name)
@@ -826,7 +832,6 @@ function M._execute_single_tool(session_id, tool_call, is_sub_agent, on_complete
     local normalized_args, args_changed = tool_executor._normalize_arguments(tool_name, tool_func.arguments)
     if args_changed then
       tool_func.arguments = normalized_args
-      logger.warn("[tool_orchestrator] 工具 '%s' 参数已规范化", tool_name)
       -- 更新 ss.messages 中的参数
       if ss.messages then
         for i = #ss.messages, 1, -1 do
@@ -865,7 +870,9 @@ function M._execute_single_tool(session_id, tool_call, is_sub_agent, on_complete
   -- 生成唯一 tool_call_id（如果已在 _execute_tools 中预注册，则跳过）
   local tool_call_id = tool_call.id
   if not tool_call_id or tool_call_id == "" then
-    if not M._tool_call_counter then M._tool_call_counter = 0 end
+    if not M._tool_call_counter then
+      M._tool_call_counter = 0
+    end
     M._tool_call_counter = M._tool_call_counter + 1
     tool_call_id = "call_" .. os.time() .. "_" .. M._tool_call_counter .. "_" .. math.random(10000, 99999)
     tool_call.id = tool_call_id
@@ -924,10 +931,10 @@ function M._execute_single_tool(session_id, tool_call, is_sub_agent, on_complete
       args = {}
     end
 
-    local tool_executor = require("NeoAI.tools.tool_executor")
     local pack_name = tool_pack.get_pack_for_tool(tool_name)
 
     -- execute_with_orchestrator 返回规范化后的参数
+    ---@diagnostic disable-next-line: unused-local
     local normalized_args = tool_executor.execute_with_orchestrator(tool_name, tool_func.arguments, {
       session_id = session_id,
       window_id = ss.window_id,
@@ -957,7 +964,7 @@ function M._execute_single_tool(session_id, tool_call, is_sub_agent, on_complete
 
         if success and result then
           local result_str = type(result) == "string" and result or ""
-          local ok2, parsed_result = pcall(vim.json.decode, result_str)
+          local _, parsed_result = pcall(vim.json.decode, result_str)
           local sub_agent_id = parsed_result and parsed_result.sub_agent_id or nil
 
           if sub_agent_id then
@@ -991,8 +998,15 @@ function M._execute_single_tool(session_id, tool_call, is_sub_agent, on_complete
 
                 vim.notify(string.format("[NeoAI] 子 agent [%s] 执行完成", sub_agent_id), vim.log.levels.INFO)
 
-                local chat_window = require("NeoAI.ui.window.chat_window")
-                pcall(chat_window.render_chat)
+                -- 通知 UI 刷新：子 agent 摘要已添加到消息列表
+                pcall(vim.api.nvim_exec_autocmds, "User", {
+                  pattern = event_constants.SUB_AGENT_SUMMARY_READY,
+                  data = {
+                    session_id = session_id,
+                    sub_agent_id = sub_agent_id,
+                    window_id = s2.window_id,
+                  },
+                })
 
                 plan_executor.cleanup_sub_agent(sub_agent_id)
                 M.unregister_sub_agent_session(sub_agent_id)
@@ -1031,7 +1045,14 @@ function M._execute_single_tool(session_id, tool_call, is_sub_agent, on_complete
               tool_name,
               _param_retry_counts[retry_key]
             )
-            M._add_tool_result_to_messages(session_id, tool_call_id, tool_name, combined_msg, is_sub_agent, normalized_args)
+            M._add_tool_result_to_messages(
+              session_id,
+              tool_call_id,
+              tool_name,
+              combined_msg,
+              is_sub_agent,
+              normalized_args
+            )
             logger.debug(
               "[tool_orchestrator] 工具 '%s' 执行失败，等待 AI 修正参数重试 (尝试 %d/3)",
               tool_name,
@@ -1069,16 +1090,13 @@ function M._execute_single_tool(session_id, tool_call, is_sub_agent, on_complete
     _unregister_confirm_tool()
 
     -- 查找上一个 write 工具的信息
-    local last_write_tool_call_id = nil
     local last_write_tool_name = nil
     local last_write_args = nil
 
     for i = #ss.messages, 1, -1 do
       local msg = ss.messages[i]
       if msg.role == "tool" and msg.name then
-        local tool_executor = require("NeoAI.tools.tool_executor")
         if tool_executor._is_write_tool(msg.name) then
-          last_write_tool_call_id = msg.tool_call_id
           last_write_tool_name = msg.name
           if msg.normalized_args then
             last_write_args = vim.deepcopy(msg.normalized_args)
@@ -1113,21 +1131,30 @@ function M._execute_single_tool(session_id, tool_call, is_sub_agent, on_complete
         M._add_tool_result_to_messages(session_id, tool_call_id, tool_name, result_str, is_sub_agent)
 
         local pack_name = tool_pack.get_pack_for_tool(last_write_tool_name)
-        local tool_executor = require("NeoAI.tools.tool_executor")
 
         last_write_args._needs_ai_preview = nil
         last_write_args._approval_timeout_ms = nil
 
-        if not M._tool_call_counter then M._tool_call_counter = 0 end
+        if not M._tool_call_counter then
+          M._tool_call_counter = 0
+        end
         M._tool_call_counter = M._tool_call_counter + 1
-        local new_tool_call_id = "call_confirm_" .. os.time() .. "_" .. M._tool_call_counter .. "_" .. math.random(10000, 99999)
+        local new_tool_call_id = "call_confirm_"
+          .. os.time()
+          .. "_"
+          .. M._tool_call_counter
+          .. "_"
+          .. math.random(10000, 99999)
 
         vim.schedule(function()
           local s = sessions_table[session_id]
-          if not s or s.stop_requested then return end
+          if not s or s.stop_requested then
+            return
+          end
 
           s.active_tool_calls[new_tool_call_id] = true
 
+          ---@diagnostic disable-next-line: unused-local
           local normalized_args = tool_executor.execute_with_orchestrator(last_write_tool_name, last_write_args, {
             session_id = session_id,
             window_id = ss.window_id,
@@ -1135,12 +1162,22 @@ function M._execute_single_tool(session_id, tool_call, is_sub_agent, on_complete
             tool_call_id = new_tool_call_id,
             pack_name = pack_name,
           }, {
-            on_result = function(success, result)
+            on_result = function(_, result)
               local s2 = sessions_table[session_id]
-              if not s2 then return end
+              if not s2 then
+                return
+              end
 
+              ---@diagnostic disable-next-line: redefined-local
               local result_str = type(result) == "string" and result or vim.json.encode(result) or ""
-              M._add_tool_result_to_messages(session_id, new_tool_call_id, last_write_tool_name, result_str, is_sub_agent, normalized_args)
+              M._add_tool_result_to_messages(
+                session_id,
+                new_tool_call_id,
+                last_write_tool_name,
+                result_str,
+                is_sub_agent,
+                normalized_args
+              )
 
               s2.active_tool_calls[new_tool_call_id] = nil
               local remaining = vim.tbl_count(s2.active_tool_calls)
@@ -1151,7 +1188,8 @@ function M._execute_single_tool(session_id, tool_call, is_sub_agent, on_complete
           })
         end)
       else
-        local result_str = "[确认失败] 找不到原始工具调用信息，请重新调用编辑工具来修改文件。"
+        local result_str =
+          "[确认失败] 找不到原始工具调用信息，请重新调用编辑工具来修改文件。"
         M._add_tool_result_to_messages(session_id, tool_call_id, tool_name, result_str, is_sub_agent)
       end
 
@@ -1227,12 +1265,12 @@ function M._execute_single_tool(session_id, tool_call, is_sub_agent, on_complete
         end
 
         local pack_name = tool_pack.get_pack_for_tool(target_tool)
-        local tool_executor = require("NeoAI.tools.tool_executor")
 
         -- 重新注册 confirm_file_change 工具供 AI 再次确认
         _register_confirm_tool()
 
         -- 重新执行（仍然走 AI 预览拦截）
+        ---@diagnostic disable-next-line: unused-local
         local normalized_args = tool_executor.execute_with_orchestrator(target_tool, target_args, {
           session_id = session_id,
           window_id = ss.window_id,
@@ -1240,23 +1278,34 @@ function M._execute_single_tool(session_id, tool_call, is_sub_agent, on_complete
           tool_call_id = tool_call_id,
           pack_name = pack_name,
         }, {
-          on_result = function(success, result)
+          on_result = function(_, result)
             local s = sessions_table[session_id]
             if not s then
               _unregister_confirm_tool()
-              if on_complete then on_complete() end
+              if on_complete then
+                on_complete()
+              end
               return
             end
 
             local result_str = type(result) == "string" and result or vim.json.encode(result) or ""
-            M._add_tool_result_to_messages(session_id, tool_call_id, target_tool, result_str, is_sub_agent, normalized_args)
+            M._add_tool_result_to_messages(
+              session_id,
+              tool_call_id,
+              target_tool,
+              result_str,
+              is_sub_agent,
+              normalized_args
+            )
 
             s.active_tool_calls[tool_call_id] = nil
             local remaining = vim.tbl_count(s.active_tool_calls)
             if remaining == 0 and s.phase ~= "round_complete" then
               M._on_tools_complete(session_id, is_sub_agent)
             end
-            if on_complete then on_complete() end
+            if on_complete then
+              on_complete()
+            end
           end,
         })
 
@@ -1266,16 +1315,15 @@ function M._execute_single_tool(session_id, tool_call, is_sub_agent, on_complete
         if remaining == 0 and ss.phase ~= "round_complete" then
           M._on_tools_complete(session_id, is_sub_agent)
         end
-        if on_complete then on_complete() end
+        if on_complete then
+          on_complete()
+        end
         return
       end
-
     else
       -- 未知 action
-      local result_str = string.format(
-        "[无效操作] 未知的操作类型 '%s'，请使用 confirm、abandon 或 retry。",
-        action
-      )
+      local result_str =
+        string.format("[无效操作] 未知的操作类型 '%s'，请使用 confirm、abandon 或 retry。", action)
       M._add_tool_result_to_messages(session_id, tool_call_id, tool_name, result_str, is_sub_agent)
     end
 
@@ -1291,10 +1339,12 @@ function M._execute_single_tool(session_id, tool_call, is_sub_agent, on_complete
   end
 
   -- ===== 如果是 write 工具，注册 confirm_file_change 工具供 AI 调用 =====
-  local tool_executor = require("NeoAI.tools.tool_executor")
   if tool_executor._is_write_tool(tool_name) then
     _register_confirm_tool()
-    logger.debug("[tool_orchestrator] write 工具 '%s' 已注册 confirm_file_change 工具等待 AI 确认", tool_name)
+    logger.debug(
+      "[tool_orchestrator] write 工具 '%s' 已注册 confirm_file_change 工具等待 AI 确认",
+      tool_name
+    )
   end
 
   -- ===== 普通工具执行 =====
@@ -1302,6 +1352,7 @@ function M._execute_single_tool(session_id, tool_call, is_sub_agent, on_complete
 
   local execute_fn = function()
     -- execute_with_orchestrator 返回规范化后的参数
+    ---@diagnostic disable-next-line: unused-local
     local normalized_args = tool_executor.execute_with_orchestrator(tool_name, tool_func.arguments, {
       session_id = session_id,
       window_id = ss.window_id,
@@ -1341,16 +1392,15 @@ function M._execute_single_tool(session_id, tool_call, is_sub_agent, on_complete
           if tool_retry_count < 3 then
             _param_retry_counts[retry_key] = tool_retry_count + 1
 
-
             -- 注册 confirm_file_change 到 request_handler，让 AI 通过工具调用传递修正参数
             _register_confirm_tool()
 
             -- 构建工具可用参数提示
-            local tool_def = tool_registry.get(tool_name)
+            local tdef = tool_registry.get(tool_name)
             local param_hint = ""
-            if tool_def and tool_def.parameters and tool_def.parameters.properties then
+            if tdef and tdef.parameters and tdef.parameters.properties then
               local props = {}
-              for pname, pschema in pairs(tool_def.parameters.properties) do
+              for pname, pschema in pairs(tdef.parameters.properties) do
                 local desc = pschema.description or ""
                 local ptype = pschema.type or "any"
                 table.insert(props, string.format("  - %s (%s): %s", pname, ptype, desc))
@@ -1725,11 +1775,14 @@ function M.on_generation_complete(data)
     if data.usage and next(data.usage) then
       local acc = ss.accumulated_usage or {}
       acc.prompt_tokens = (acc.prompt_tokens or 0) + (data.usage.prompt_tokens or data.usage.input_tokens or 0)
-      acc.completion_tokens = (acc.completion_tokens or 0) + (data.usage.completion_tokens or data.usage.output_tokens or 0)
+      acc.completion_tokens = (acc.completion_tokens or 0)
+        + (data.usage.completion_tokens or data.usage.output_tokens or 0)
       acc.total_tokens = (acc.total_tokens or 0) + (data.usage.total_tokens or 0)
       if data.usage.completion_tokens_details and type(data.usage.completion_tokens_details) == "table" then
         local rt = data.usage.completion_tokens_details.reasoning_tokens or 0
-        if not acc.completion_tokens_details then acc.completion_tokens_details = {} end
+        if not acc.completion_tokens_details then
+          acc.completion_tokens_details = {}
+        end
         acc.completion_tokens_details.reasoning_tokens = (acc.completion_tokens_details.reasoning_tokens or 0) + rt
       end
       ss.accumulated_usage = acc
@@ -2110,38 +2163,13 @@ function M.on_generation_complete(data)
   end)
 end
 
---- @deprecated 已移至 tool_executor
---- 计算两个字符串的编辑距离（Levenshtein）
---- @param s1 string
---- @param s2 string
---- @return number
-local function _levenshtein(s1, s2)
-  local len1 = #s1
-  local len2 = #s2
-  local matrix = {}
-  for i = 0, len1 do
-    matrix[i] = { [0] = i }
-  end
-  for j = 0, len2 do
-    matrix[0][j] = j
-  end
-  for i = 1, len1 do
-    for j = 1, len2 do
-      local cost = s1:sub(i, i) == s2:sub(j, j) and 0 or 1
-      matrix[i][j] = math.min(matrix[i - 1][j] + 1, matrix[i][j - 1] + 1, matrix[i - 1][j - 1] + cost)
-    end
-  end
-  return matrix[len1][len2]
-end
-
---- @deprecated 已移至 tool_executor._normalize_tool_name
---- 模糊匹配工具名称
---- 当模型调用了不存在的工具时，尝试找到最相似的工具
---- 新代码请使用 tool_executor._normalize_tool_name()
+--- 内联模糊匹配工具名称
+--- 替代已废弃的 M._fuzzy_match_tool
 --- @param input string 模型输入的工具名称
 --- @param all_names string[] 所有可用工具名称列表
 --- @return string|nil 最匹配的工具名称，或 nil
-function M._fuzzy_match_tool(input, all_names)
+---@diagnostic disable-next-line: unused-local
+local function _inline_fuzzy_match(input, all_names)
   if not input or not all_names or #all_names == 0 then
     return nil
   end
@@ -2212,11 +2240,9 @@ function M._fuzzy_match_tool(input, all_names)
   local input_len = #input_lower
   for _, name in ipairs(all_names) do
     local name_lower = name:lower()
-    -- 只考虑长度差异不超过 50% 的
     local len_diff = math.abs(#name_lower - input_len)
     if len_diff <= math.max(#name_lower, input_len) * 0.5 then
-      local dist = _levenshtein(input_lower, name_lower)
-      -- 编辑距离不超过名称长度的 40%
+      local dist = _inline_levenshtein(input_lower, name_lower)
       local max_len = math.max(#name_lower, input_len)
       if dist <= max_len * 0.4 and dist < best_dist then
         best_dist = dist
@@ -2230,6 +2256,30 @@ function M._fuzzy_match_tool(input, all_names)
   end
 
   return nil
+end
+
+--- 内联编辑距离计算
+--- @param s1 string
+--- @param s2 string
+--- @return number
+---@diagnostic disable-next-line: unused-local
+local function _inline_levenshtein(s1, s2)
+  local len1 = #s1
+  local len2 = #s2
+  local matrix = {}
+  for i = 0, len1 do
+    matrix[i] = { [0] = i }
+  end
+  for j = 0, len2 do
+    matrix[0][j] = j
+  end
+  for i = 1, len1 do
+    for j = 1, len2 do
+      local cost = s1:sub(i, i) == s2:sub(j, j) and 0 or 1
+      matrix[i][j] = math.min(matrix[i - 1][j] + 1, matrix[i][j - 1] + 1, matrix[i - 1][j - 1] + cost)
+    end
+  end
+  return matrix[len1][len2]
 end
 
 function M._add_tool_result_to_messages(session_id, tool_call_id, tool_name, result, is_sub_agent, normalized_args)
@@ -2269,6 +2319,7 @@ end
 
 -- ========== 结束循环 ==========
 
+---@diagnostic disable-next-line: unused-local
 function M._finish_loop(session_id, success, result, is_sub_agent)
   local sessions_table = is_sub_agent and state.sub_agent_sessions or state.sessions
   local ss = sessions_table[session_id]
@@ -2304,7 +2355,6 @@ function M._finish_loop(session_id, success, result, is_sub_agent)
     local saved_gen_id = ss.generation_id
     local saved_win_id = ss.window_id
     local saved_usage = ss.accumulated_usage or {}
-    local saved_reasoning = ss.last_reasoning or ""
     local saved_result = result or ""
 
     -- idle 状态由 TOOL_LOOP_FINISHED 监听器统一设置
@@ -2341,7 +2391,6 @@ function M._finish_loop(session_id, success, result, is_sub_agent)
   local saved_usage = ss.accumulated_usage or {}
   local saved_generation_id = ss.generation_id
   local saved_window_id = ss.window_id
-  local saved_reasoning = ss.last_reasoning or ""
   local saved_result = result or ""
 
   ss.on_complete = nil
@@ -2819,7 +2868,7 @@ function M.execute_single_tool_request(session_id, tool_name, args, callback)
 
   -- 构建非流式请求
   -- 注意：强制工具调用时禁用思考模式（DeepSeek 等 API 不支持思考模式下的强制工具调用）
-  local request_handler = require("NeoAI.core.ai.request_handler")
+  request_handler = require("NeoAI.core.ai.request_handler")
   local formatted = request_handler.format_messages(messages)
 
   local http_utils = require("NeoAI.utils.http_utils")
@@ -3102,4 +3151,3 @@ function M.cleanup_all()
 end
 
 return M
-

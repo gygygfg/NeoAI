@@ -39,8 +39,7 @@ end
 --- @return boolean
 local function _check_cursor_near_end(window_id)
   local wm = require("NeoAI.ui.window.window_manager")
-  local chat_window = require("NeoAI.ui.window.chat_window")
-  local target_win_id = window_id or (chat_window.get_current_window_id and chat_window.get_current_window_id())
+  local target_win_id = window_id or (wm.get_chat_window() and wm.get_chat_window().id)
   if not target_win_id then
     state_manager.set_shared("should_follow", false)
     return false
@@ -65,9 +64,8 @@ local function _do_cursor_follow()
   if not should then
     return
   end
-  local chat_window = require("NeoAI.ui.window.chat_window")
   local wm = require("NeoAI.ui.window.window_manager")
-  local window_id = chat_window.get_current_window_id and chat_window.get_current_window_id()
+  local window_id = wm.get_chat_window() and wm.get_chat_window().id
   if not window_id then return end
   local win = wm.get_window_win(window_id)
   if not win or not vim.api.nvim_win_is_valid(win) then return end

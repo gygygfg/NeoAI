@@ -455,6 +455,33 @@ function M.create_window(window_type, options)
       end,
       desc = "显示 " .. window_type .. " 悬浮窗口",
     })
+
+    -- BufWipeout 守卫：NeoAI buffer 被外部销毁时自动清理所有关联的浮动窗口和状态
+    vim.api.nvim_create_autocmd("BufWipeout", {
+      group = group,
+      buffer = buf,
+      callback = function()
+        -- 清理延迟隐藏标志
+        _pending_hide_flags[buf] = nil
+        -- 清理关联的浮动窗口条目
+        float_windows[buf] = nil
+        -- 清理父窗口的隐藏状态
+        child_window_hidden_states[window_id] = nil
+        -- 清理父子关联
+        parent_child_map[window_id] = nil
+        if child_parent_map[window_id] then
+          local pid = child_parent_map[window_id]
+          if parent_child_map[pid] then
+            parent_child_map[pid][window_id] = nil
+            if not next(parent_child_map[pid]) then
+              parent_child_map[pid] = nil
+            end
+          end
+        end
+        child_parent_map[window_id] = nil
+      end,
+      desc = "清理 " .. window_type .. " 关联状态",
+    })
   end
 
   return window_id
@@ -908,6 +935,25 @@ function M.create_managed_float_window(opts)
     if buf and vim.api.nvim_buf_is_valid(buf) then
       vim.api.nvim_buf_set_var(buf, "neoai_float_window", true)
     end
+
+    -- WinClosed 守卫：浮动窗口被外部销毁时自动清理 float_windows 条目
+    if win and vim.api.nvim_win_is_valid(win) then
+      local augroup = "NeoAIFloatWinGuard_" .. tostring(win)
+      pcall(vim.api.nvim_del_augroup_by_name, augroup)
+      local group = vim.api.nvim_create_augroup(augroup, { clear = true })
+      vim.api.nvim_create_autocmd("WinClosed", {
+        group = group,
+        callback = function(args)
+          if args.match == tostring(win) then
+            local fw_entry = float_windows[main_buf]
+            if fw_entry and fw_entry.win_id == win then
+              float_windows[main_buf] = nil
+            end
+          end
+        end,
+        desc = "NeoAI float window guard for " .. tostring(win),
+      })
+    end
   end
 
   return { buf = buf, win = win }
@@ -939,13 +985,37 @@ function M.register_float_window(main_buf, float_win_id, float_buf_id)
   if float_buf_id and vim.api.nvim_buf_is_valid(float_buf_id) then
     vim.api.nvim_buf_set_var(float_buf_id, "neoai_float_window", true)
   end
+
+  -- WinClosed 守卫：浮动窗口被外部销毁时自动清理 float_windows 条目
+  if float_win_id and vim.api.nvim_win_is_valid(float_win_id) then
+    local augroup = "NeoAIFloatWinGuard_" .. tostring(float_win_id)
+    pcall(vim.api.nvim_del_augroup_by_name, augroup)
+    local group = vim.api.nvim_create_augroup(augroup, { clear = true })
+    vim.api.nvim_create_autocmd("WinClosed", {
+      group = group,
+      callback = function(args)
+        if args.match == tostring(float_win_id) then
+          local fw_entry = float_windows[main_buf]
+          if fw_entry and fw_entry.win_id == float_win_id then
+            float_windows[main_buf] = nil
+          end
+        end
+      end,
+      desc = "NeoAI float window guard for " .. tostring(float_win_id),
+    })
+  end
 end
 
 function M.show_float_window(main_buf)
   -- 显示注册的浮动窗口（如虚拟输入框）
   local fw = float_windows[main_buf]
-  if fw and not fw.visible then
-    if fw.win_id and vim.api.nvim_win_is_valid(fw.win_id) then
+  if fw then
+    -- 无论 visible 状态如何，先检查 win_id 是否仍有效
+    if not fw.win_id or not vim.api.nvim_win_is_valid(fw.win_id) then
+      -- 浮动窗口已被外部销毁，清理僵尸条目
+      float_windows[main_buf] = nil
+    elseif not fw.visible then
+      -- 窗口有效但被隐藏，恢复位置
       if fw.saved_config then
         pcall(vim.api.nvim_win_set_config, fw.win_id, fw.saved_config)
       end
@@ -980,8 +1050,12 @@ end
 function M.hide_float_window(main_buf)
   -- 隐藏注册的浮动窗口（如虚拟输入框）
   local fw = float_windows[main_buf]
-  if fw and fw.visible then
-    if fw.win_id and vim.api.nvim_win_is_valid(fw.win_id) then
+  if fw then
+    -- 无论 visible 状态如何，先检查 win_id 是否仍有效
+    if not fw.win_id or not vim.api.nvim_win_is_valid(fw.win_id) then
+      -- 浮动窗口已被外部销毁，清理僵尸条目
+      float_windows[main_buf] = nil
+    elseif fw.visible then
       fw.saved_config = vim.api.nvim_win_get_config(fw.win_id)
       vim.api.nvim_win_set_config(fw.win_id, { relative = "editor", row = -1000, col = -1000, width = 1, height = 1 })
       fw.visible = false

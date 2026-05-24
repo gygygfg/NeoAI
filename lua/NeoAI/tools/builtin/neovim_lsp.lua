@@ -1278,8 +1278,20 @@ local function lsp_request_async(bufnr, method, params, callback)
       table.insert(state.responses, { err = err, result = result, ctx = ctx })
 
       -- 如果有非空结果，立即返回
+      -- 注意：不能仅用 #result > 0 判断表格是否"有内容"，
+      -- 因为 hash-table 结果（如 signatureHelp 返回的 {signatures={...}}）的 # 为 0
       if not err and result ~= nil then
-        if type(result) ~= "table" or #result > 0 then
+        local is_meaningful = false
+        if type(result) ~= "table" then
+          is_meaningful = true
+        elseif #result > 0 then
+          -- 数组表（如 locations、references 列表）
+          is_meaningful = true
+        elseif next(result) ~= nil then
+          -- hash 表（如 signatureHelp、hover 结果），有任意键就算有内容
+          is_meaningful = true
+        end
+        if is_meaningful then
           local cb = state.callback
           safe_cleanup()
           if cb then
@@ -1376,6 +1388,118 @@ end
 _lsp_request_async = lsp_request_async
 
 -- ============================================================================
+-- ============================================================================
+-- 辅助函数：从源码中提取 docstring/注释（当 LSP hover 返回空时作为兜底）
+-- ============================================================================
+-- 支持语言特定的注释前缀和 docstring 格式（Python docstring, Lua --, JS // 等）
+local function _extract_docstring_from_source(filepath, symbol_row)
+  local content, err = read_file_content(filepath)
+  if not content or not symbol_row then
+    return nil
+  end
+
+  local lines = vim.split(content, "\n")
+  -- symbol_row 是 0-based，转换为 1-based
+  local target_line = symbol_row + 1
+  if target_line < 1 or target_line > #lines then
+    return nil
+  end
+
+  -- 检测文件类型的注释风格
+  local abs_path = vim.fn.fnamemodify(filepath, ":p")
+  local ft = vim.filetype.match({ filename = abs_path })
+  local comment_prefixes = {
+    python = { "#", '"""', "'''" },
+    lua = { "---", "--" },
+    javascript = { "//", "/**", "/*" },
+    typescript = { "//", "/**", "/*" },
+    tsx = { "//", "/**", "/*" },
+    jsx = { "//", "/**", "/*" },
+    go = { "//", "/*" },
+    rust = { "///", "//", "/*" },
+    c = { "//", "/*" },
+    cpp = { "//", "///", "/*" },
+    java = { "//", "/**", "/*" },
+    ruby = { "#" },
+    php = { "//", "/**", "/*" },
+    sh = { "#" },
+    bash = { "#" },
+    zsh = { "#" },
+    vim = { '"' },
+  }
+  local prefixes = comment_prefixes[ft] or { "#", "//", "/*", "--" }
+
+  -- 从符号定义行向前查找连续的注释/docstring 行
+  local doc_lines = {}
+  -- 先检查紧邻的上一行是否是 block docstring 的结束 (''' 或 """)
+  local in_block_docstring = false
+  local block_delimiter = nil
+
+  for i = target_line - 1, math.max(1, target_line - 20), -1 do
+    local line = lines[i] or ""
+    local trimmed = line:match("^%s*(.-)%s*$") or ""
+
+    if trimmed == "" then
+      -- 空行：如果已经在收集 docstring 行，包含空行；否则停止
+      if #doc_lines > 0 then
+        table.insert(doc_lines, 1, "")
+      else
+        break
+      end
+    else
+      local is_comment = false
+      for _, prefix in ipairs(prefixes) do
+        -- 检查是否以注释前缀开头
+        local escaped_prefix = prefix:gsub("([%^%$%(%)%%%.%[%]%*%+%-%?])", "%%%1")
+        if trimmed:match("^" .. escaped_prefix) then
+          is_comment = true
+          -- 提取注释内容（去掉前缀）
+          local doc_text = trimmed:match("^" .. escaped_prefix .. "%s*(.*)") or ""
+          table.insert(doc_lines, 1, doc_text)
+          break
+        end
+        -- 检查 Python docstring 块
+        if prefix == '"""' or prefix == "'''" then
+          if trimmed:match("^" .. escaped_prefix) or trimmed:match(escaped_prefix .. "$") then
+            is_comment = true
+            local doc_text = trimmed:gsub(escaped_prefix, ""):match("^%s*(.-)%s*$") or ""
+            if doc_text ~= "" then
+              table.insert(doc_lines, 1, doc_text)
+            end
+            -- 如果是开始定界符，继续向上找
+            if not trimmed:match(escaped_prefix .. "$") then
+              -- 这是开始，继续向上收集
+            end
+            break
+          end
+        end
+      end
+
+      if not is_comment then
+        -- 如果已经有 docstring 行且遇到非注释行，停止
+        if #doc_lines > 0 then
+          break
+        end
+      end
+    end
+  end
+
+  -- 清理纯空行
+  while #doc_lines > 0 and doc_lines[1] == "" do
+    table.remove(doc_lines, 1)
+  end
+  while #doc_lines > 0 and doc_lines[#doc_lines] == "" do
+    table.remove(doc_lines, #doc_lines)
+  end
+
+  if #doc_lines > 0 then
+    return table.concat(doc_lines, "\n")
+  end
+
+  return nil
+end
+
+-- ============================================================================
 -- 工具 lsp_hover - 悬浮显示符号文档（回调模式）
 -- ============================================================================
 
@@ -1445,9 +1569,27 @@ local function _lsp_hover(args, on_success, on_error)
               position = { row = row, col = col },
               contents = nil,
               found = false,
+              _note = "LSP 未返回悬停信息（该符号可能没有文档注释）",
             })
           end
           return
+        end
+
+        -- 检查 contents 是否为空（空 table 或 nil）
+        local has_content = result.contents ~= nil
+          and not (type(result.contents) == "table" and vim.tbl_isempty(result.contents))
+
+        -- 当 LSP 返回空 contents 时，尝试从源码中提取文档注释作为兜底
+        if not has_content then
+          local extracted_doc = _extract_docstring_from_source(args.filepath, row)
+          if extracted_doc then
+            -- 将提取的文档注释包装成 LSP hover 格式
+            result.contents = {
+              kind = "markdown",
+              value = "```\n" .. extracted_doc .. "\n```\n\n*（从源码注释中提取，非 LSP 提供的文档）*",
+            }
+            has_content = true
+          end
         end
 
         if on_success then
@@ -1457,10 +1599,11 @@ local function _lsp_hover(args, on_success, on_error)
             position = { row = row, col = col },
             contents = result.contents,
             range = result.range,
-            found = true,
+            found = has_content,
+            _note = has_content and nil or "LSP 返回了结果但 contents 为空（该符号可能没有关联的文档信息）",
           })
         end
-      end)
+      end, true)
     end)
   end, true)
 end
@@ -1802,6 +1945,61 @@ local function _lsp_implementation(args, on_success, on_error)
         end
 
         if req_err then
+          -- implementation 请求失败（通常是不支持），回退到 definition
+          local err_msg = type(req_err) == "string" and req_err or tostring(req_err or "")
+          if err_msg:match("不支持")
+            or err_msg:match("not supported")
+            or err_msg:match("MethodNotFound")
+            or err_msg:match("method not found")
+            or err_msg:match("InternalError")
+            or err_msg:match("no implementation")
+          then
+            lsp_request_async(bufnr, "textDocument/definition", {
+              textDocument = { uri = vim.uri_from_fname(vim.fn.fnamemodify(args.filepath, ":p")) },
+              position = { line = row, character = col },
+            }, function(def_result, def_err)
+              if cleanup then cleanup() end
+              if def_err then
+                if on_error then on_error(def_err) end
+                return
+              end
+              -- 处理 definition 回退结果
+              if not def_result or (type(def_result) == "table" and #def_result == 0) then
+                if on_success then
+                  on_success({
+                    filepath = args.filepath,
+                    symbol = args.symbol,
+                    position = { row = row, col = col },
+                    locations = {},
+                    found = false,
+                    _fallback_source = "definition",
+                    _note = "当前 LSP 服务器不支持 'textDocument/implementation'，已回退使用 'textDocument/definition'。结果可能不是具体的实现位置。",
+                  })
+                end
+                return
+              end
+              local locations = {}
+              for _, loc in ipairs(def_result) do
+                table.insert(locations, {
+                  uri = loc.uri,
+                  filename = loc.filename or (loc.uri and vim.uri_to_fname(loc.uri)),
+                  range = loc.range,
+                })
+              end
+              if on_success then
+                on_success({
+                  filepath = args.filepath,
+                  symbol = args.symbol,
+                  position = { row = row, col = col },
+                  locations = locations,
+                  _fallback_source = "definition",
+                  _note = "当前 LSP 服务器不支持 'textDocument/implementation'，已回退使用 'textDocument/definition'。结果可能不是具体的实现位置。",
+                })
+              end
+            end)
+            return
+          end
+          -- 其他错误（非不支持），直接报错
           if on_error then
             on_error(req_err)
           end
@@ -2416,13 +2614,35 @@ local function _lsp_document_symbols(args, on_success, on_error, on_progress)
 
         local symbols = flatten_symbols(result)
 
-        if on_success then
-          on_success({
-            filepath = args.filepath,
-            symbol_count = #symbols,
-            symbols = symbols,
-          })
-        end
+        -- 补充 Tree-sitter 解析结果（LSP 可能遗漏某些符号，如顶层的简单函数）
+        get_symbols_via_treesitter(args.filepath, function(ts_symbols)
+          if ts_symbols and #ts_symbols > 0 then
+            local lsp_names = {}
+            for _, sym in ipairs(symbols) do
+              lsp_names[sym.name] = true
+            end
+            local added_count = 0
+            for _, ts_sym in ipairs(ts_symbols) do
+              if not lsp_names[ts_sym.name] then
+                table.insert(symbols, ts_sym)
+                lsp_names[ts_sym.name] = true
+                added_count = added_count + 1
+              end
+            end
+            if added_count > 0 and on_progress then
+              on_progress("获取LSP文档符号", "completed", 0,
+                string.format("LSP 返回 %d 个符号，Tree-sitter 补充 %d 个", #symbols - added_count, added_count))
+            end
+          end
+
+          if on_success then
+            on_success({
+              filepath = args.filepath,
+              symbol_count = #symbols,
+              symbols = symbols,
+            })
+          end
+        end)
       end)
     end
 
@@ -2801,12 +3021,86 @@ local function _lsp_rename(args, on_success, on_error)
         end
 
         if on_success then
+          -- 应用 workspace edit 以实际修改文件
+          local offset_encoding = clients and clients[1] and clients[1].offset_encoding or "utf-16"
+
+          -- apply_workspace_edit 在 Neovim 0.10+ 返回 { status = true/false }
+          local ok_apply, apply_result = pcall(vim.lsp.util.apply_workspace_edit, result, offset_encoding)
+          if not ok_apply then
+            if on_error then
+              on_error("重命名请求成功但应用编辑失败: " .. tostring(apply_result))
+            end
+            return
+          end
+
+          -- 检查 apply_workspace_edit 的返回状态（兼容新旧版本 Neovim）
+          if type(apply_result) == "table" and apply_result.status == false then
+            if on_error then
+              on_error("重命名请求成功但应用编辑被拒绝")
+            end
+            return
+          end
+
+          -- 保存所有受影响的文件到磁盘
+          -- apply_workspace_edit 只修改 buffer，不自动写入磁盘
+          local saved_files = {}
+          local uri_to_fname = {}
+          -- 处理 result.changes（旧格式：URI -> TextEdit[]）
+          if result.changes then
+            for uri, _ in pairs(result.changes) do
+              local fname = vim.uri_to_fname(uri)
+              uri_to_fname[uri] = fname
+            end
+          end
+          -- 处理 result.documentChanges（新格式：TextDocumentEdit[]）
+          if result.documentChanges then
+            for _, change in ipairs(result.documentChanges) do
+              if change.textDocument and change.textDocument.uri then
+                local fname = vim.uri_to_fname(change.textDocument.uri)
+                uri_to_fname[change.textDocument.uri] = fname
+              end
+            end
+          end
+
+          -- 遍历所有受影响的文件并保存
+          for uri, fname in pairs(uri_to_fname) do
+            local affected_bufnr = vim.fn.bufnr(fname)
+            if affected_bufnr ~= -1 and vim.api.nvim_buf_is_valid(affected_bufnr) then
+              local ok_save, save_err = pcall(vim.api.nvim_buf_call, affected_bufnr, function()
+                pcall(vim.cmd, "silent write")
+              end)
+              if ok_save then
+                table.insert(saved_files, fname)
+              end
+            else
+              -- buffer 不在内存中，可能 apply_workspace_edit 已经直接写入磁盘
+              -- 对于这种情况，检查文件是否存在即可
+              if vim.uv.fs_stat(fname) then
+                table.insert(saved_files, fname)
+              end
+            end
+          end
+
+          -- 如果以上都没保存到，至少保存当前 buffer
+          if #saved_files == 0 and bufnr and vim.api.nvim_buf_is_valid(bufnr) then
+            pcall(vim.api.nvim_buf_call, bufnr, function()
+              pcall(vim.cmd, "silent write")
+            end)
+            table.insert(saved_files, args.filepath)
+          end
+
+          -- 检查是否有实际的变更内容
+          local has_changes = result.changes and next(result.changes) ~= nil
+            or result.documentChanges and #result.documentChanges > 0
           on_success({
             filepath = args.filepath,
             symbol = args.symbol,
             new_name = args.new_name,
-            changes = result.changes,
-            found = true,
+            changes = result.changes or result.documentChanges,
+            found = has_changes,
+            saved_files = saved_files,
+            _note = has_changes and ("重命名已应用，保存了 " .. #saved_files .. " 个文件")
+              or "LSP 返回成功但无实际变更内容",
           })
         end
       end)
@@ -2857,11 +3151,15 @@ local function try_external_formatter(filepath, ft)
 
   for _, formatter in ipairs(formatters) do
     if vim.fn.executable(formatter.cmd) == 1 then
-      local cmd_args = vim.deepcopy(formatter.args)
+      -- 构建命令：{ cmd, args..., filepath }
+      -- 注意：vim.fn.system 接受列表时，第一个元素必须是可执行命令
+      local cmd_args = { formatter.cmd }
+      for _, arg in ipairs(formatter.args) do
+        table.insert(cmd_args, arg)
+      end
       table.insert(cmd_args, abs_path)
 
-      -- 使用 systemlist 获取退出码：返回 { exit_code, output }
-      -- vim.fn.system 在 Neovim 中返回 (output, exit_code)
+      -- 使用 system 执行命令
       local ok, result_or_err = pcall(vim.fn.system, cmd_args)
       if ok then
         -- 检查 vim.v.shell_error 来判断命令是否成功
@@ -3075,8 +3373,25 @@ local function _lsp_format(args, on_success, on_error)
       end
 
       if req_err then
-        if on_error then
-          on_error(req_err)
+        -- LSP 格式化失败（如 pyright 不支持格式化），回退到外部格式化工具
+        local abs_path = vim.fn.fnamemodify(args.filepath, ":p")
+        local ft = vim.filetype.match({ filename = abs_path })
+        local ok, tool_name = try_external_formatter(args.filepath, ft)
+        if ok then
+          local content, _ = read_file_content(args.filepath)
+          if on_success then
+            on_success({
+              filepath = args.filepath,
+              formatted = true,
+              content = content,
+              _source = "external:" .. tool_name,
+              _note = string.format("LSP 格式化失败（%s），回退到外部工具 '%s' 成功", req_err, tool_name),
+            })
+          end
+        else
+          if on_error then
+            on_error(string.format("LSP 格式化失败: %s（外部格式化工具亦不可用）", req_err))
+          end
         end
         return
       end
@@ -3415,6 +3730,23 @@ local function _lsp_client_info(args, on_success, on_error, on_progress)
     local ft_to_lsp_config = lm.ft_to_lsp_config
     local expected_config = ft and ft_to_lsp_config[ft]
 
+    -- 检查是否已有 LSP 客户端 attach
+    local existing_clients = vim.lsp.get_clients({ bufnr = bufnr })
+    local has_client = false
+    for _, c in ipairs(existing_clients) do
+      if is_formal_lsp_client(c) then
+        has_client = true
+        break
+      end
+    end
+    -- 如果没有已 attach 的客户端，尝试启动 LSP 服务器（避免超时等待）
+    if not has_client and expected_config then
+      if on_progress then
+        on_progress(string.format("尝试启动LSP服务 (%d/%d)", current_index, total_files), "executing", 0)
+      end
+      try_start_lsp(expected_config, bufnr)
+    end
+
     -- 使用异步非阻塞版本等待 LSP attach
     wait_for_lsp_attach_async(bufnr, function(clients, attach_err, _)
       if not clients or #clients == 0 then
@@ -3541,6 +3873,13 @@ local function _lsp_signature_help(args, on_success, on_error)
     return
   end
 
+  -- 清洗 args.symbol：括号 `(` 在 Lua 模式和 Tree-sitter 中有特殊含义
+  -- 用户可能误传入 `hello(` 表示函数调用，工具会剥离尾部括号
+  local cleaned = args.symbol:match("^(.-)%s*%(?$")
+  if cleaned and cleaned ~= args.symbol then
+    args.symbol = cleaned
+  end
+
   get_lsp_clients_async(args.filepath, function(clients, err, bufnr, cleanup)
     if err then
       if on_error then
@@ -3549,7 +3888,7 @@ local function _lsp_signature_help(args, on_success, on_error)
       return
     end
 
-    -- signatureHelp 需要在函数调用位置（如 `foo(` 或 `obj.method(`）而非定义位置
+    -- signatureHelp 需要在函数调用位置
     -- 因此我们使用 Tree-sitter 查找函数调用表达式（call_expression）的位置
     -- 如果用户指定了 node_type，优先使用；否则默认查找 call_expression
     local search_node_type = args.node_type or "call_expression"
@@ -3739,9 +4078,11 @@ local function _lsp_signature_help(args, on_success, on_error)
       -- 而不是定义位置（如 `class JupyterProcessor:` 或 `def __init__(self)`）
       local fallback_row, fallback_col = nil, nil
       local lines = vim.split(content, "\n")
+      -- 转义符号名中的 Lua 模式特殊字符（如括号），防止 "unfinished capture" 崩溃
+      local escaped_symbol = args.symbol:gsub("([%^%$%(%)%%%.%[%]%*%+%-%?])", "%%%1")
       for line_idx, line_text in ipairs(lines) do
         -- 查找包含 `symbol(` 的行（函数调用模式）
-        local call_start = line_text:find(args.symbol .. "%s*%(")
+        local call_start = line_text:find(escaped_symbol .. "%s*%(")
         if call_start then
           -- 跳过定义位置（class/def 关键字开头的行）
           local trimmed = line_text:match("^%s*(.-)%s*$")
@@ -3831,6 +4172,11 @@ _send_signature_request = function(bufnr, args, cleanup, on_success, on_error, r
   lsp_request_async(bufnr, "textDocument/signatureHelp", {
     textDocument = { uri = vim.uri_from_fname(vim.fn.fnamemodify(args.filepath, ":p")) },
     position = { line = row, character = col },
+    -- LSP context: 帮助服务器识别触发场景（手动调用/触发字符等）
+    context = {
+      triggerKind = 1, -- 1 = Invoked（手动调用）
+      isRetrigger = false,
+    },
   }, function(result, req_err)
     if cleanup then
       cleanup()
@@ -3881,6 +4227,7 @@ _send_signature_request = function(bufnr, args, cleanup, on_success, on_error, r
         active_signature = result.activeSignature,
         active_parameter = result.activeParameter,
         signatures = signatures,
+        found = true,
       })
     end
   end)

@@ -46,6 +46,35 @@ local function open_window(window_type, session_id, branch_id)
     state.windows[other] = nil
   end
 
+  -- 检查同类型窗口是否已存在且有效，如果是则尝试恢复而非新建
+  local existing_win_id = state.windows[window_type]
+  if existing_win_id then
+    local existing_win = window_manager.get_window_win(existing_win_id)
+    local existing_buf = window_manager.get_window_buf(existing_win_id)
+    -- 窗口句柄有效且 buffer 有效
+    if existing_win and vim.api.nvim_win_is_valid(existing_win)
+      and existing_buf and vim.api.nvim_buf_is_valid(existing_buf) then
+      -- 确保窗口显示的是 NeoAI 的 buffer（可能被其他 buffer 覆盖了）
+      local current_buf_in_win = vim.api.nvim_win_get_buf(existing_win)
+      if current_buf_in_win ~= existing_buf then
+        pcall(vim.api.nvim_win_set_buf, existing_win, existing_buf)
+      end
+      -- 恢复被隐藏的悬浮子窗口（virtual_input、tool_display 等）
+      window_manager.show_float_window(existing_buf)
+      -- 聚焦窗口
+      window_manager.focus_window(existing_win_id)
+      return true
+    else
+      -- 窗口已失效，清理旧状态
+      state.windows[window_type] = nil
+      if window_type == "chat" then
+        pcall(chat_window.close)
+      else
+        pcall(tree_window.close)
+      end
+    end
+  end
+
   local win_id = window_manager.create_window(window_type, {
     title = titles[window_type],
     width = config.width or (window_type == "chat" and 80 or 60),
