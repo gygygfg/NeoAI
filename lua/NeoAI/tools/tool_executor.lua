@@ -166,7 +166,11 @@ local function resolve_json_args(args, param_schemas)
     if type(v) == "string" then
       -- 检查参数 schema：如果声明为 string 类型，则绝不进行 JSON 自动解码
       -- 避免将用户传入的原始字符串（如文件内容）误解析为 table
-      local schema = param_schemas and param_schemas[k]
+      -- 修复 BUG 1: param_schemas 可能是 tool.parameters（含 .properties 子表）或直接的 properties 表
+      local schema = param_schemas and (
+        (param_schemas.properties and param_schemas.properties[k])
+        or param_schemas[k]
+      )
       if schema and schema.type == "string" then
         result[k] = v
       elseif TEXT_PARAM_NAMES[k] then
@@ -1396,6 +1400,10 @@ function M._is_write_tool(tool_name)
   if not tool then
     return false
   end
+  -- 修复 BUG 5: create_directory 和 ensure_dir 创建的是目录而非文件，不应触发"文件修改预览"
+  if tool_name == "create_directory" or tool_name == "ensure_dir" then
+    return false
+  end
   -- 检查 permissions 中是否有 write=true
   if tool.permissions and tool.permissions.write == true then
     return true
@@ -1909,3 +1917,4 @@ end
 M.resolve_path = resolve_path
 
 return M
+

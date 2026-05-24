@@ -817,6 +817,13 @@ function M._mark_dirty()
 end
 
 function M._mark_dirty_light()
+  local auto_save = (_config and _config.session and _config.session.auto_save) ~= false
+  if not auto_save then return end
+  if state._is_shutting_down then return end
+
+  persistence.debounced_save(function()
+    return state.sessions
+  end)
 end
 
 function M._save()

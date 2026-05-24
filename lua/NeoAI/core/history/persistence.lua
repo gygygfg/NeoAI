@@ -36,6 +36,8 @@ local state = {
 
   -- 行号缓存：{ [id] = line_number }，1-based
   _line_map = {},
+  -- 行内容缓存：{ [id] = raw_line_content }，用于检测内容变化
+  _line_content_cache = {},
   -- 文件行数缓存（用于快速判断是否有新增行）
   _file_line_count = 0,
 }
@@ -76,7 +78,13 @@ function M.serialize(sessions)
     end
   end
   table.sort(arr, function(a, b)
-    return (a.updated_at or a.created_at or 0) < (b.updated_at or b.created_at or 0)
+    local ta = a.updated_at or a.created_at or 0
+    local tb = b.updated_at or b.created_at or 0
+    if ta ~= tb then
+      return ta < tb
+    end
+    -- 同秒时按 id 排序，保证顺序稳定
+    return (a.id or "") < (b.id or "")
   end)
   if #arr == 0 then
     return ""
@@ -139,12 +147,14 @@ function M.deserialize(content)
     local filepath = M.get_filepath()
     if vim.fn.filereadable(filepath) ~= 1 then
       state._line_map = {}
+      state._line_content_cache = {}
       state._file_line_count = 0
       return sessions
     end
     local lines = vim.fn.readfile(filepath)
     if not lines or #lines == 0 then
       state._line_map = {}
+      state._line_content_cache = {}
       state._file_line_count = 0
       return sessions
     end
@@ -153,6 +163,7 @@ function M.deserialize(content)
 
   if not content or content == "" then
     state._line_map = {}
+    state._line_content_cache = {}
     state._file_line_count = 0
     return sessions
   end
@@ -161,6 +172,7 @@ function M.deserialize(content)
   local new_line_count = #lines
   local old_line_map = state._line_map
   local new_line_map = {}
+  local new_line_content_cache = {}
 
   for line_num, line in ipairs(lines) do
     local trimmed = vim.trim(line)
@@ -174,12 +186,15 @@ function M.deserialize(content)
     end
 
     new_line_map[id] = line_num
+    new_line_content_cache[id] = trimmed
 
-    -- 检查缓存：如果该 id 的行号没变，且 session 已存在，跳过解析
-    if old_line_map[id] == line_num and state._sessions_cache and state._sessions_cache[id] then
+    -- 检查缓存：如果该 id 的行号和行内容都没变，且 session 已存在，跳过解析
+    if old_line_map[id] == line_num
+       and state._sessions_cache and state._sessions_cache[id]
+       and state._line_content_cache and state._line_content_cache[id] == trimmed then
       sessions[id] = state._sessions_cache[id]
     else
-      -- 行号变了或没有缓存，解析该行
+      -- 行号变了、内容变了或没有缓存，解析该行
       local session = parse_session_from_line(trimmed)
       if session then
         sessions[id] = session
@@ -190,6 +205,7 @@ function M.deserialize(content)
 
   -- 更新缓存
   state._line_map = new_line_map
+  state._line_content_cache = new_line_content_cache
   state._file_line_count = new_line_count
   state._sessions_cache = sessions
 
@@ -264,6 +280,7 @@ function M.load()
     -- 创建空文件
     write_file_sync(filepath, "")
     state._line_map = {}
+    state._line_content_cache = {}
     state._file_line_count = 0
     state._sessions_cache = {}
     return {}
@@ -273,6 +290,7 @@ function M.load()
   local lines = vim.fn.readfile(filepath)
   if not lines or #lines == 0 then
     state._line_map = {}
+    state._line_content_cache = {}
     state._file_line_count = 0
     state._sessions_cache = {}
     return {}
@@ -282,7 +300,7 @@ function M.load()
   return M.deserialize(content)
 end
 
---- 获取行号映射（用于外部快速判断是否有变化）
+--- 获取行号映射
 --- @return table { [id] = line_number }
 function M.get_line_map()
   return state._line_map
@@ -513,6 +531,7 @@ function M._test_reset()
   state._queue_counter = 0
   state._is_shutting_down = false
   state._line_map = {}
+  state._line_content_cache = {}
   state._file_line_count = 0
   state._sessions_cache = {}
   if state._debounce_timer and not state._debounce_timer:is_closing() then

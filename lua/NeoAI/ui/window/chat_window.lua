@@ -112,7 +112,7 @@ end
 --- @param buf number buffer 句柄
 --- @param lines table 刚写入的行列表
 --- @param win_id number|nil 可选，指定目标窗口句柄，默认使用 buf 关联的第一个窗口
-local function _fold_new_markers(buf, lines, win_id)
+local function _fold_new_markers(buf, lines, win_id, insert_start_line)
   if not buf_valid(buf) then
     return
   end
@@ -151,21 +151,13 @@ local function _fold_new_markers(buf, lines, win_id)
     if not win or not vim.api.nvim_win_is_valid(win) then
       return
     end
-    -- 通过 API 触发 Neovim 重新计算 marker 折叠
-    -- 方法：临时切换 foldmethod 再恢复，强制 Neovim 重新扫描 marker
-    -- 设置 foldlevel=0 确保新 marker 区域默认折叠
-    local saved_level = vim.api.nvim_get_option_value("foldlevel", { win = win })
-    local saved_method = vim.api.nvim_get_option_value("foldmethod", { win = win })
-    vim.api.nvim_set_option_value("foldlevel", 0, { win = win })
-    -- 临时切换到 manual 再切回 marker，强制 Neovim 重新扫描所有 marker 行
-    vim.api.nvim_set_option_value("foldmethod", "manual", { win = win })
-    vim.api.nvim_set_option_value("foldmethod", "marker", { win = win })
-    -- 恢复原 foldlevel，新 marker 区域会保持折叠状态
-    vim.schedule(function()
-      if win and vim.api.nvim_win_is_valid(win) then
-        vim.api.nvim_set_option_value("foldlevel", saved_level, { win = win })
-        vim.api.nvim_set_option_value("foldmethod", saved_method, { win = win })
-      end
+    -- 仅关闭新插入范围内的折叠，不改变已有折叠的状态
+    -- insert_start_line 是 0-based，foldclose 需要 1-based 行号
+    local range_start = (insert_start_line or 0) + 1
+    local range_end = (insert_start_line or 0) + #lines
+    -- 使用 foldclose 在指定范围内关闭折叠，不影响范围外的折叠状态
+    pcall(vim.api.nvim_win_call, win, function()
+      pcall(vim.cmd, string.format("%d,%dfoldclose", range_start, range_end))
     end)
   end)
 end
@@ -734,7 +726,7 @@ local function _update_folded_text_in_buffer(folded_text, window_id)
   -- 使用 _chat_buf 关联的窗口
   local wins = vim.fn.win_findbuf(buf)
   local win = #wins > 0 and wins[1] or nil
-  _fold_new_markers(buf, new_lines, win)
+  _fold_new_markers(buf, new_lines, win, start_line)
 
   _schedule_cursor_follow()
 end
@@ -2650,6 +2642,7 @@ function M._setup_event_listeners()
       if not start_line and state.tool_display.message_index == mi then
         start_line = state.tool_display.message_start_line
       end
+      local insert_start = start_line
       if start_line then
         -- 已有起始行：替换从起始行到末尾的内容
         _replace_message_in_buffer(buf, start_line, lines, nil)
@@ -2661,12 +2654,13 @@ function M._setup_event_listeners()
         vim.api.nvim_set_option_value("modified", false, { buf = buf })
         -- 记录起始行
         state.streaming.message_start_line = lc
+        insert_start = lc
       end
       -- 折叠新插入的 {{{ ... }}} 折叠区域
       -- 使用 _chat_buf 关联的窗口
       local wins = vim.fn.win_findbuf(buf)
       local win = #wins > 0 and wins[1] or nil
-      _fold_new_markers(buf, lines, win)
+      _fold_new_markers(buf, lines, win, insert_start)
 
       -- 对渲染的消息应用 markdown 语法高亮（仅扫描变更区域）
       vim.schedule(function()
@@ -3748,7 +3742,7 @@ function M._append_message_to_buffer(role, content, window_id)
   -- 使用 _chat_buf 关联的窗口
   local wins = vim.fn.win_findbuf(buf)
   local win = #wins > 0 and wins[1] or nil
-  _fold_new_markers(buf, lines, win)
+  _fold_new_markers(buf, lines, win, line_count)
 
   -- 对新增内容应用 markdown 语法高亮（仅扫描新增区域）
   if not content:find("^{{{") then
@@ -3798,7 +3792,7 @@ local function _do_full_streaming_render(msg, mi, buf)
   -- 折叠新插入的 {{{ ... }}} 折叠区域
   local wins = vim.fn.win_findbuf(buf)
   local win = #wins > 0 and wins[1] or nil
-  _fold_new_markers(buf, lines, win)
+  _fold_new_markers(buf, lines, win, start_line or state.streaming.message_start_line)
 
   -- 对渲染的消息应用 markdown 语法高亮（仅扫描变更区域）
   vim.schedule(function()
