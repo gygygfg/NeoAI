@@ -732,8 +732,12 @@ function M.set_window_content(window_id, content)
   local lines = type(content) == "table" and clean_content_table(content) or vim.split(content or "", "\n")
   pcall(vim.api.nvim_buf_set_lines, buf, 0, -1, false, lines)
 
+  -- 只在 filetype 变化时才设置，避免触发 FileType 自动命令
+  local current_ft = pcall(vim.api.nvim_get_option_value, "filetype", { buf = buf }) and vim.api.nvim_get_option_value("filetype", { buf = buf }) or ""
   local ft = window.type == "chat" and "neoai" or "neoai_" .. window.type
-  vim.api.nvim_set_option_value("filetype", ft, { buf = buf })
+  if current_ft ~= ft then
+    vim.api.nvim_set_option_value("filetype", ft, { buf = buf })
+  end
 
   if window.type == "chat" then
     vim.api.nvim_set_option_value("modifiable", true, { buf = buf })
@@ -741,17 +745,21 @@ function M.set_window_content(window_id, content)
     vim.api.nvim_set_option_value("modified", false, { buf = buf })
     local win = wi.win
     if win and vim.api.nvim_win_is_valid(win) then
-      -- 合并设置窗口选项，减少 API 调用次数
-      local win_opts = {
-        foldmethod = "marker",
-        foldmarker = "{{{,}}}",
-        foldlevel = 0,
-        foldenable = true,
-        wrap = true,
-        linebreak = true,
-      }
-      for name, val in pairs(win_opts) do
-        vim.api.nvim_set_option_value(name, val, { win = win })
+      -- 只在首次或选项变化时设置窗口选项，避免触发全量折叠计算
+      -- 使用 window 缓存记录已设置的选项
+      if not window._opts_set then
+        local win_opts = {
+          foldmethod = "marker",
+          foldmarker = "{{{,}}}",
+          foldlevel = 0,
+          foldenable = true,
+          wrap = true,
+          linebreak = true,
+        }
+        for name, val in pairs(win_opts) do
+          vim.api.nvim_set_option_value(name, val, { win = win })
+        end
+        window._opts_set = true
       end
     end
   elseif window.type == "tree" or window.type == "reasoning" then

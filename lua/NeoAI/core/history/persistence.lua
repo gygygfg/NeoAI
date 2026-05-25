@@ -439,7 +439,11 @@ function M.sync_save(sessions)
   local ok, err = write_file_sync(filepath, content)
   if not ok then
     local lines = vim.split(content, "\n")
-    vim.fn.writefile(lines, filepath)
+    local wok, werr = pcall(vim.fn.writefile, lines, filepath)
+    if not wok then
+      logger.error("[history_persistence] sync_save 回退 writefile 也失败: " .. tostring(werr))
+      return false, tostring(werr)
+    end
     return true, nil
   end
 

@@ -19,6 +19,58 @@ local http_utils = require("NeoAI.utils.http_utils")
 local tool_cycle = require("NeoAI.core.ai.tool_cycle")
 local request_handler = require("NeoAI.core.ai.request_handler")
 
+-- 性能优化：延迟加载的模块缓存（避免热路径中重复 require）
+local _cached_core = nil
+local _cached_sub_agent_engine = nil
+local _cached_plan_executor = nil
+
+local function _get_core()
+  if not _cached_core then
+    _cached_core = require("NeoAI.core")
+  end
+  return _cached_core
+end
+
+local function _get_sub_agent_engine()
+  if not _cached_sub_agent_engine then
+    _cached_sub_agent_engine = require("NeoAI.core.ai.sub_agent_engine")
+  end
+  return _cached_sub_agent_engine
+end
+
+local function _get_plan_executor()
+  if not _cached_plan_executor then
+    _cached_plan_executor = require("NeoAI.tools.builtin.plan_executor")
+  end
+return _cached_plan_executor
+end
+
+-- 性能优化：更多延迟加载缓存
+local _cached_tool_pack = nil
+local _cached_file_utils = nil
+local _cached_tool_registry = nil
+
+local function _get_tool_pack()
+  if not _cached_tool_pack then
+    _cached_tool_pack = require("NeoAI.tools.tool_pack")
+  end
+  return _cached_tool_pack
+end
+
+local function _get_file_utils()
+  if not _cached_file_utils then
+    _cached_file_utils = require("NeoAI.utils.file_utils")
+  end
+  return _cached_file_utils
+end
+
+local function _get_tool_registry()
+  if not _cached_tool_registry then
+    _cached_tool_registry = require("NeoAI.tools.tool_registry")
+  end
+  return _cached_tool_registry
+end
+
 -- 性能优化：延迟求值 debug.traceback()，仅在 DEBUG 级别时计算
 local function _traceback_if_debug()
   if logger.get_level and logger.get_level() == "DEBUG" then
@@ -51,7 +103,7 @@ function M.initialize(options)
   http_utils.initialize({ config = {} })
   local full_config = (options or {}).config or {}
   tool_cycle.initialize({ config = full_config })
-  local tool_pack = require("NeoAI.tools.tool_pack")
+  local tool_pack = _get_tool_pack()
   tool_pack.initialize()
   _setup_event_listeners()
   state.initialized = true
@@ -103,7 +155,7 @@ local function resolve_scenario_config(scenario)
     local preset = config_merger.get_preset(scenario)
     if preset and preset.base_url and preset.api_key then return preset end
   end
-  local core = require("NeoAI.core")
+  local core = _get_core()
   local full_config = core.get_config() or {}
   local ai_config = (full_config and full_config.ai) or {}
   local scenarios = ai_config.scenarios or {}
@@ -144,7 +196,7 @@ function M.get_model_config(model_index)
       local models = config_merger.get_available_models("chat")
       local target = models[model_index]
       if target then
-        local core = require("NeoAI.core")
+        local core = _get_core()
         local full_config = core.get_config() or {}
         local providers = (full_config and full_config.ai and full_config.ai.providers) or {}
         local pdef = providers[target.provider]
@@ -218,7 +270,7 @@ function M.generate_response(messages, params)
     for _, msg in ipairs(formatted) do if msg.role == "system" then has_system = true; break end end
     if not has_system then
       -- 动态注入环境信息（每次请求时获取当前 cwd，而非固化在配置中）
-      local file_utils = require("NeoAI.utils.file_utils")
+      local file_utils = _get_file_utils()
       local current_cwd = vim.fn.getcwd()
       local project_root = file_utils.find_project_root(current_cwd)
       local nvim_ver = vim.version()
@@ -531,7 +583,7 @@ function _handle_stream_end(generation_id, processor, params)
 
   local is_tool_loop = params and params.is_tool_loop
   local tools_enabled = true
-  local core = require("NeoAI.core")
+  local core = _get_core()
   local full_config = core.get_config() or {}
   if full_config and full_config.tools and full_config.tools.enabled ~= nil then tools_enabled = full_config.tools.enabled
   elseif full_config and full_config.ai then tools_enabled = full_config.ai.tools_enabled end
@@ -539,7 +591,7 @@ function _handle_stream_end(generation_id, processor, params)
   if #tool_calls > 0 and tools_enabled then
     if is_tool_loop then
       -- 调试日志
-      require("NeoAI.utils.logger").debug("[DEBUG_DUP] _handle_stream_end: is_tool_loop=true, tool_calls=%d, _tool_loop_processed=%s",
+      logger.debug("[DEBUG_DUP] _handle_stream_end: is_tool_loop=true, tool_calls=%d, _tool_loop_processed=%s",
         #tool_calls, tostring(params and params._tool_loop_processed))
       -- 防止 on_generation_complete 内部的同步回调导致重复执行
       if params and params._tool_loop_processed then
@@ -586,8 +638,8 @@ function _handle_stream_end(generation_id, processor, params)
 
   if is_tool_loop then
     -- 调试日志
-    require("NeoAI.utils.logger").debug("[DEBUG_DUP] _handle_stream_end: is_tool_loop=true (no tools), _tool_loop_processed=%s",
-      tostring(params and params._tool_loop_processed))
+    logger.debug("[DEBUG_DUP] _handle_stream_end: is_tool_loop=true (no tools), _tool_loop_processed=%s",
+          tostring(params and params._tool_loop_processed))
     -- 防止第一个分支（#tool_calls > 0）执行后，同步回调导致再次进入此分支
     if params and params._tool_loop_processed then
       return
@@ -674,7 +726,7 @@ function _handle_ai_response(generation_id, response, params)
   end
 
   local tools_enabled = true
-  local core = require("NeoAI.core")
+  local core = _get_core()
   local full_config = core.get_config() or {}
   if full_config and full_config.tools and full_config.tools.enabled ~= nil then tools_enabled = full_config.tools.enabled
   elseif full_config and full_config.ai then tools_enabled = full_config.ai.tools_enabled end
@@ -796,9 +848,8 @@ function M.handle_tool_result(data)
   -- 但子 agent 的 TOOL_RESULT_RECEIVED 事件也会触发此函数，
   -- 需要直接转发给 sub_agent_engine，不经过主 agent 的生成流程。
   if data._sub_agent_id then
-    local logger = require("NeoAI.utils.logger")
     logger.info("[sub_agent] handle_tool_result: id=%s, msgs=%d", data._sub_agent_id, #(data.messages or {}))
-    local sub_agent_engine = require("NeoAI.core.ai.sub_agent_engine")
+    local sub_agent_engine = _get_sub_agent_engine()
     -- 子 agent 的请求直接发起 AI 生成，不经过主 agent 的状态管理
     local sa_session_id = data.session_id
     local sa_window_id = data.window_id
@@ -843,7 +894,7 @@ function M.handle_tool_result(data)
 
     -- 子 agent 请求需要携带工具列表，让 AI 知道有哪些工具可用
     -- 但只携带边界允许的工具（如果设置了 allowed_tools）
-    local plan_executor = require("NeoAI.tools.builtin.plan_executor")
+    local plan_executor = _get_plan_executor()
     local context = plan_executor.get_sub_agent_context(data._sub_agent_id)
     local allowed_tools = context and context.boundaries and context.boundaries.allowed_tools or nil
 
@@ -956,7 +1007,7 @@ function M.handle_tool_result(data)
   messages = cleaned
 
   -- 调试日志：追踪 handle_tool_result 调用
-  require("NeoAI.utils.logger").debug("[DEBUG_DUP] handle_tool_result: gen_id=%s, session=%s, is_generating=%s, cur_gen_id=%s, msgs=%d, stack=%s",
+  logger.debug("[DEBUG_DUP] handle_tool_result: gen_id=%s, session=%s, is_generating=%s, cur_gen_id=%s, msgs=%d, stack=%s",
     tostring(generation_id),
     tostring(session_id),
     tostring(state.is_generating),
@@ -1030,7 +1081,6 @@ function M.handle_generation_error(generation_id, error_msg)
   -- 检测是否为子 agent 的生成错误，通知 tool_cycle 结束
   local sub_agent_id = generation._sub_agent_id
   if sub_agent_id then
-    local tool_cycle = require("NeoAI.core.ai.tool_cycle")
     tool_cycle.on_generation_complete({
       generation_id = generation_id,
       tool_calls = {},
@@ -1100,7 +1150,7 @@ end
 function M.set_tools(tools)
   local tools_map = tools or {}
   local tool_defs = {}
-  local tool_registry = require("NeoAI.tools.tool_registry")
+  local tool_registry = _get_tool_registry()
   for name, def in pairs(tools_map) do
     if def.func then
       if not tool_registry.exists(name) then
@@ -1120,9 +1170,7 @@ function M.set_tools(tools)
       table.insert(tool_defs, { type = "function", ["function"] = tf })
     end
   end
-  -- 同步到 tool_cycle 和 request_handler
-  local to = require("NeoAI.core.ai.tool_cycle")
-  to.set_tools(tools_map)
+  tool_cycle.set_tools(tools_map)
   request_handler.set_tool_definitions(tool_defs)
 end
 

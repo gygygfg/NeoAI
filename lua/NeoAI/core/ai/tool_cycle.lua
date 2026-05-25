@@ -1166,6 +1166,10 @@ function M._execute_single_tool(session_id, tool_call, is_sub_agent, on_complete
         end
 
         if success and result then
+          -- 工具执行成功，清除该工具的参数重试计数（避免 key 残留导致内存泄漏）
+          local retry_key = session_id .. ":" .. tool_name
+          _param_retry_counts[retry_key] = nil
+
           local result_str = type(result) == "string" and result or ""
           local _, parsed_result = pcall(vim.json.decode, result_str)
           local sub_agent_id = parsed_result and parsed_result.sub_agent_id or nil
@@ -1749,9 +1753,6 @@ function M._on_tools_complete(session_id, is_sub_agent)
   -- 工具执行完毕，清理 confirm_file_change（如果 AI 没有调用它而是调用了其他工具）
   _unregister_confirm_tool()
 
-  -- 标记 TOOL_EXECUTION_ALL_COMPLETED 已到达
-  ss._tools_all_completed = true
-
   -- 调试日志：追踪 _on_tools_complete 调用
   require("NeoAI.utils.logger").debug(
     "[DEBUG_DUP] _on_tools_complete: session=%s, phase=%s, iter=%d, _tools_complete_in_progress=%s, active_count=%d, stack=%s",
@@ -1771,6 +1772,9 @@ function M._on_tools_complete(session_id, is_sub_agent)
     return
   end
   ss._tools_complete_in_progress = true
+
+  -- 标记 TOOL_EXECUTION_ALL_COMPLETED 已到达（在防重入检查之后设置）
+  ss._tools_all_completed = true
 
   if ss.stop_requested then
     ss._tools_complete_in_progress = false
@@ -1827,6 +1831,10 @@ function M._on_tools_complete(session_id, is_sub_agent)
     once_display_closed(session_id, function()
       local s = sessions_table[session_id]
       if not s then
+        require("NeoAI.utils.logger").debug(
+          "[tool_orchestrator] _on_tools_complete: once_display_closed 回调中 session 已为 nil, session=%s",
+          tostring(session_id)
+        )
         return
       end
       if is_shutting_down() then
@@ -1839,6 +1847,14 @@ function M._on_tools_complete(session_id, is_sub_agent)
         s._tools_complete_in_progress = false
         return
       end
+      require("NeoAI.utils.logger").debug(
+        "[tool_orchestrator] _on_tools_complete: once_display_closed 回调执行, session=%s, phase=%s, iter=%d, _generation_completed=%s, _tools_all_completed=%s",
+        tostring(session_id),
+        tostring(s.phase),
+        s.current_iteration or 0,
+        tostring(s._generation_completed),
+        tostring(s._tools_all_completed)
+      )
       -- 工具全部完成，检查是否两个事件都已到达，决定是否开启下一轮
       M._check_round_complete(session_id, is_sub_agent)
       -- 检查是否已进入下一轮：如果 _generation_completed 已被重置为 false，
@@ -1888,6 +1904,14 @@ function M._check_round_complete(session_id, is_sub_agent)
   -- 双事件等待机制：必须 GENERATION_COMPLETED 和 TOOL_EXECUTION_ALL_COMPLETED 都到达
   -- 才能开启下一轮 AI 请求
   if not ss._generation_completed or not ss._tools_all_completed then
+    require("NeoAI.utils.logger").debug(
+      "[tool_orchestrator] _check_round_complete: 双事件未就绪, session=%s, _generation_completed=%s, _tools_all_completed=%s, phase=%s, iter=%d",
+      tostring(session_id),
+      tostring(ss._generation_completed),
+      tostring(ss._tools_all_completed),
+      tostring(ss.phase),
+      ss.current_iteration or 0
+    )
     return
   end
 

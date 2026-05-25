@@ -222,6 +222,11 @@ local state = {
     _reasoning_display_timer = nil, -- 延迟打开 reasoning_display 的定时器
     message_start_line = nil, -- 当前流式消息在缓冲区中的起始行号（0-based），用于替换渲染
     _rendered_text = "", -- 已增量渲染到缓冲区的纯文本（用于增量追加，避免全量重渲染）
+    _highlight_timer = nil, -- 增量渲染防抖定时器（合并快速连续的 apply_highlights 调用）
+    _highlight_start = nil, -- 未应用的高亮起始行
+    _highlight_end = nil, -- 未应用的高亮结束行
+    _needs_full_render = nil, -- 缓存 _needs_full_render 结果（同一消息内不变）
+    _last_cursor_follow_time = nil, -- 上次光标跟随时间戳（防抖）
   },
 
   -- 工具调用悬浮显示状态
@@ -343,6 +348,15 @@ local function reset_streaming_state()
   s.content_separator_added = false
   s.message_start_line = nil
   s._rendered_text = ""
+  -- 清理高亮防抖定时器
+  if s._highlight_timer then
+    pcall(s._highlight_timer.stop, s._highlight_timer)
+    pcall(s._highlight_timer.close, s._highlight_timer)
+    s._highlight_timer = nil
+  end
+  s._highlight_start = nil
+  s._highlight_end = nil
+  s._needs_full_render = nil
 end
 
 local function reset_tool_display()
@@ -586,8 +600,11 @@ local function _do_cursor_follow()
   if not _is_chat_buffer(buf) then
     return
   end
+  -- 使用缓存的行数，避免重复调用 nvim_buf_line_count
   local lc = vim.api.nvim_buf_line_count(buf)
-  local last_line = vim.api.nvim_buf_get_lines(buf, lc - 1, lc, false)[1] or ""
+  -- 批量获取最后几行，减少 nvim_buf_get_lines 调用次数
+  local last_lines = vim.api.nvim_buf_get_lines(buf, math.max(0, lc - 3), lc, false)
+  local last_line = last_lines[#last_lines] or ""
   if last_line == "}}}" then
     -- 最后一行是折叠结束标记 }}}，在它之后追加一个空行并将光标设置在空行上
     -- 这样光标在折叠区域之后的可视位置，不会被 foldmethod=marker 吸到折叠开始行
@@ -596,7 +613,7 @@ local function _do_cursor_follow()
     vim.api.nvim_set_option_value("foldlevel", 999, { win = win })
     set_buf_modifiable(buf, true)
     vim.api.nvim_buf_set_lines(buf, lc, lc, false, { "" })
-    lc = vim.api.nvim_buf_line_count(buf)
+    lc = lc + 1
     pcall(vim.api.nvim_win_set_cursor, win, { lc, 0 })
     -- 恢复 foldlevel，使用 vim.schedule 延迟恢复，确保光标已稳定
     vim.schedule(function()
@@ -608,6 +625,7 @@ local function _do_cursor_follow()
     -- 普通内容：直接设置光标到最后一行末尾
     pcall(vim.api.nvim_win_set_cursor, win, { lc, #last_line })
   end
+  -- 使用 pcall 包裹 normal! zb，避免在折叠计算繁忙时出错
   pcall(vim.api.nvim_win_call, win, function()
     vim.cmd("normal! zb")
   end)
@@ -2665,7 +2683,9 @@ function M._setup_event_listeners()
       -- 对渲染的消息应用 markdown 语法高亮（仅扫描变更区域）
       vim.schedule(function()
         if buf and vim.api.nvim_buf_is_valid(buf) then
-          markdown_renderer.apply_highlights(buf, start_line or 0)
+          -- 计算变更区域结束行，避免扫描到缓冲区末尾
+          local hl_end = (start_line or 0) + #lines
+          markdown_renderer.apply_highlights(buf, start_line or 0, hl_end)
         end
       end)
 
@@ -3749,7 +3769,8 @@ function M._append_message_to_buffer(role, content, window_id)
     -- 跳过折叠文本，只对普通消息内容应用高亮
     vim.schedule(function()
       if buf and vim.api.nvim_buf_is_valid(buf) then
-        markdown_renderer.apply_highlights(buf, line_count)
+        local hl_end = line_count + #lines
+        markdown_renderer.apply_highlights(buf, line_count, hl_end)
       end
     end)
   end
@@ -3759,6 +3780,7 @@ function M._append_message_to_buffer(role, content, window_id)
 end
 
 --- 全量渲染流式消息（有折叠标记、代码块、工具调用等复杂内容时使用）
+--- 优化：首次进入全量渲染模式时全量替换，后续只追加增量行
 --- @param msg table 消息对象
 --- @param mi number 消息索引
 --- @param buf number 缓冲区句柄
@@ -3777,7 +3799,35 @@ local function _do_full_streaming_render(msg, mi, buf)
   if not start_line and state.tool_display.message_index == mi then
     start_line = state.tool_display.message_start_line
   end
+
   if start_line then
+    -- 已有起始行：计算增量行，避免全量替换
+    local old_lines = state.streaming._full_rendered_lines or 0
+    if old_lines > 0 and #lines > old_lines then
+      -- 只追加新增的行
+      local new_lines = {}
+      for i = old_lines + 1, #lines do
+        table.insert(new_lines, lines[i])
+      end
+      local append_line = start_line + old_lines
+      set_buf_modifiable(buf, true)
+      vim.api.nvim_buf_set_lines(buf, append_line, append_line, false, new_lines)
+      vim.api.nvim_set_option_value("modified", false, { buf = buf })
+      state.streaming._full_rendered_lines = #lines
+      -- 只对新增行应用折叠和高亮
+      local wins = vim.fn.win_findbuf(buf)
+      local win = #wins > 0 and wins[1] or nil
+      _fold_new_markers(buf, new_lines, win, append_line)
+      vim.schedule(function()
+        if buf and vim.api.nvim_buf_is_valid(buf) then
+          local hl_start = append_line
+          local hl_end = append_line + #new_lines
+          markdown_renderer.apply_highlights(buf, hl_start, hl_end)
+        end
+      end)
+      return
+    end
+    -- 行数未增长或减少：全量替换
     _replace_message_in_buffer(buf, start_line, lines, nil)
   else
     set_buf_modifiable(buf, true)
@@ -3786,6 +3836,8 @@ local function _do_full_streaming_render(msg, mi, buf)
     vim.api.nvim_set_option_value("modified", false, { buf = buf })
     state.streaming.message_start_line = lc
   end
+  -- 记录全量渲染的行数
+  state.streaming._full_rendered_lines = #lines
   -- 重置增量渲染追踪，因为全量渲染替换了整个消息
   state.streaming._rendered_text = ""
 
@@ -3797,7 +3849,9 @@ local function _do_full_streaming_render(msg, mi, buf)
   -- 对渲染的消息应用 markdown 语法高亮（仅扫描变更区域）
   vim.schedule(function()
     if buf and vim.api.nvim_buf_is_valid(buf) then
-      markdown_renderer.apply_highlights(buf, state.streaming.message_start_line or 0)
+      local hl_start = state.streaming.message_start_line or 0
+      local hl_end = hl_start + #lines
+      markdown_renderer.apply_highlights(buf, hl_start, hl_end)
     end
   end)
 end
@@ -3827,7 +3881,6 @@ local function _do_incremental_streaming_render(buf, content_text)
 
   if not start_line then
     -- 首次写入：通过 _render_single_message 生成完整格式（包含角色前缀等）
-    -- 构造临时消息对象进行渲染
     local msg = { role = "assistant", content = content_text }
     local lines = M._render_single_message(msg)
     if #lines == 0 then
@@ -3837,21 +3890,17 @@ local function _do_incremental_streaming_render(buf, content_text)
     vim.api.nvim_set_option_value("modified", false, { buf = buf })
     state.streaming.message_start_line = lc
   else
-    -- 已有内容：直接追加 delta 文本到现有行
+    -- 已有内容：合并所有增量修改到一次 nvim_buf_set_lines 调用
     local delta_parts = vim.split(delta, "\n")
     if #delta_parts == 0 then
       return
     end
 
     -- 找到当前消息在 buffer 中最后一个非空行
-    -- message_start_line 是 "🤖 AI: xxx" 所在行，后续行是 "    xxx" 缩进行，
-    -- 最后一行是空行分隔符
-    local rendered_end = start_line + (#vim.split(last_text, "\n") + 1) -- +1 for prefix
-    -- 确保不超出 buffer 范围
+    local rendered_end = start_line + (#vim.split(last_text, "\n") + 1)
     if rendered_end > lc then
       rendered_end = lc
     end
-    -- 跳过尾部空行，找到最后一个内容行
     local last_content_line = rendered_end - 1
     while last_content_line >= start_line do
       local line_text = vim.api.nvim_buf_get_lines(buf, last_content_line, last_content_line + 1, false)[1] or ""
@@ -3864,37 +3913,52 @@ local function _do_incremental_streaming_render(buf, content_text)
       last_content_line = start_line
     end
 
-    -- 第一个 delta 片段追加到最后一个内容行
+    -- 构建替换行和追加行，合并为一次 nvim_buf_set_lines 调用
     local current = vim.api.nvim_buf_get_lines(buf, last_content_line, last_content_line + 1, false)[1] or ""
-    vim.api.nvim_buf_set_lines(buf, last_content_line, last_content_line + 1, false, { current .. delta_parts[1] })
-
-    -- 后续片段作为新行插入（带缩进），在原有尾部空行之前
-    if #delta_parts > 1 then
-      local new_lines = {}
-      for i = 2, #delta_parts do
-        table.insert(new_lines, "    " .. delta_parts[i])
-      end
-      local insert_pos = last_content_line + 1
-      -- 如果 insert_pos 超出范围，追加到末尾
-      if insert_pos > lc then
-        insert_pos = lc
-      end
-      vim.api.nvim_buf_set_lines(buf, insert_pos, insert_pos, false, new_lines)
+    local replace_lines = { current .. delta_parts[1] }
+    for i = 2, #delta_parts do
+      table.insert(replace_lines, "    " .. delta_parts[i])
     end
+    vim.api.nvim_buf_set_lines(buf, last_content_line, last_content_line + 1, false, replace_lines)
     vim.api.nvim_set_option_value("modified", false, { buf = buf })
   end
 
   -- 记录已渲染的文本
   state.streaming._rendered_text = content_text
 
-  -- 只对新内容区域应用语法高亮
-  vim.schedule(function()
-    if buf and vim.api.nvim_buf_is_valid(buf) then
-      markdown_renderer.apply_highlights(buf, state.streaming.message_start_line or 0)
-    end
-  end)
-end
+  -- 防抖高亮：只在新内容行范围内应用语法高亮
+  -- 使用 _highlight_start/_highlight_end 记录变更行号范围
+  -- 使用 _highlight_timer 延迟 50ms 执行高亮
+  local s = state.streaming
+  if start_line then
+    s._highlight_end = start_line + #vim.split(content_text, "\n") + 1
+  end
+  if not s._highlight_start then
+    s._highlight_start = start_line or 0
+  end
 
+  -- 取消之前的定时器，延迟 50ms 执行高亮
+  if s._highlight_timer then
+    pcall(s._highlight_timer.stop, s._highlight_timer)
+    pcall(s._highlight_timer.close, s._highlight_timer)
+    s._highlight_timer = nil
+  end
+
+  s._highlight_timer = vim.defer_fn(function()
+    if buf and vim.api.nvim_buf_is_valid(buf) then
+      local hl_start = s._highlight_start or 0
+      local hl_end = s._highlight_end or get_line_count(buf)
+      -- 传递 hl_end 参数，避免扫描到缓冲区末尾
+      markdown_renderer.apply_highlights(buf, hl_start, hl_end)
+      s._highlight_start = nil
+      s._highlight_end = nil
+    end
+    if s._highlight_timer then
+      pcall(s._highlight_timer.close, s._highlight_timer)
+      s._highlight_timer = nil
+    end
+  end, 50)
+end
 --- 使用 _render_single_message 渲染当前流式消息并替换缓冲区中的对应行
 --- 统一流式渲染和历史渲染的显示格式
 --- 对纯文本内容采用增量追加，避免每 chunk 全量重渲染
@@ -3914,50 +3978,60 @@ local function _render_streaming_message(window_id)
   end
 
   -- 提取内容文本，判断是否需要全量渲染
+  -- 缓存 _needs_full_render：一旦为 true 则保持，避免每 chunk 重复检测
+  local s = state.streaming
   local content_text = ""
-  local needs_full_render = false
+  local needs_full_render = s._needs_full_render or false
 
-  if type(msg.content) == "table" then
-    content_text = msg.content.content or ""
-    if (msg.content.reasoning_content or "") ~= "" then
-      needs_full_render = true
-    end
-  else
-    content_text = tostring(msg.content or "")
-    -- 检测 JSON 格式中包含 reasoning 或 tool_calls
-    if msg.role == "assistant" then
-      local json_ok, parsed = pcall(vim.json.decode, content_text)
-      if json_ok and type(parsed) == "table" then
-        if (parsed.tool_calls and #parsed.tool_calls > 0)
-          or (parsed.reasoning_content and parsed.reasoning_content ~= "") then
-          needs_full_render = true
+  if not needs_full_render then
+    if type(msg.content) == "table" then
+      content_text = msg.content.content or ""
+      if (msg.content.reasoning_content or "") ~= "" then
+        needs_full_render = true
+      end
+    else
+      content_text = tostring(msg.content or "")
+      if msg.role == "assistant" then
+        local json_ok, parsed = pcall(vim.json.decode, content_text)
+        if json_ok and type(parsed) == "table" then
+          if (parsed.tool_calls and #parsed.tool_calls > 0)
+            or (parsed.reasoning_content and parsed.reasoning_content ~= "") then
+            needs_full_render = true
+          end
         end
       end
     end
-  end
-  -- 原生 tool_calls 字段
-  if msg.tool_calls and type(msg.tool_calls) == "table" and #msg.tool_calls > 0 then
-    needs_full_render = true
-  end
-  -- 折叠标记和代码块需要全量渲染
-  if content_text:find("^{{{") or content_text:find("```") then
-    needs_full_render = true
+    if msg.tool_calls and type(msg.tool_calls) == "table" and #msg.tool_calls > 0 then
+      needs_full_render = true
+    end
+    if content_text:find("^{{{") or content_text:find("```") then
+      needs_full_render = true
+    end
+    s._needs_full_render = needs_full_render
+  else
+    if type(msg.content) == "table" then
+      content_text = msg.content.content or ""
+    else
+      content_text = tostring(msg.content or "")
+    end
   end
 
   -- 在修改 buffer 内容之前缓存光标位置
   _check_cursor_near_end()
 
   if needs_full_render then
-    -- 全量渲染路径（折叠文本、代码块、思考过程、工具调用等复杂内容）
     _do_full_streaming_render(msg, mi, buf)
   else
-    -- 增量渲染路径（纯文本，无特殊格式）
     _do_incremental_streaming_render(buf, content_text)
   end
 
-  _schedule_cursor_follow()
+  -- 防抖光标跟随：每 50ms 最多触发一次
+  local now = vim.uv.now()
+  if not s._last_cursor_follow_time or (now - s._last_cursor_follow_time) >= 50 then
+    _schedule_cursor_follow()
+    s._last_cursor_follow_time = now
+  end
 end
-
 -- 暴露给事件回调使用（事件回调闭包中 local function 不可见）
 M._render_streaming_message = _render_streaming_message
 
@@ -4031,14 +4105,18 @@ function M._append_stream_chunk_to_buffer(chunk_content, content_type, window_id
     state.messages[mi].content = new_content
 
     -- 流式更新保存到 history_manager（使用模块级缓存避免每 chunk require）
-    -- 每 10 次更新触发一次防抖保存，确保流式内容不会丢失
+    -- 优化：使用防抖更新，每 5 个 chunk 才调用 update_last_assistant
+    -- 避免每 chunk 触发 cache.invalidate_round_text 和 cache.invalidate_tree
     if history_manager.is_initialized() then
       local session = history_manager.get_current_session()
       if session then
-        history_manager.update_last_assistant(session.id, new_content)
-        -- 定期保存：每 10 次 chunk 触发一次防抖保存
         state.streaming._save_counter = (state.streaming._save_counter or 0) + 1
-        if state.streaming._save_counter >= 10 then
+        -- 每 5 个 chunk 更新一次 history_manager（减少 cache 失效频率）
+        if state.streaming._save_counter % 5 == 0 then
+          history_manager.update_last_assistant(session.id, new_content)
+        end
+        -- 定期保存：每 20 次 chunk 触发一次防抖保存
+        if state.streaming._save_counter >= 20 then
           state.streaming._save_counter = 0
           history_manager._mark_dirty()
         end
