@@ -86,8 +86,14 @@ function M.initialize()
     if file_type == "file" and name:match("%.lua$") then
       local mod_name = name:gsub("%.lua$", "")
       local ok, mod = pcall(require, "NeoAI.tools.builtin." .. mod_name)
-      if ok and type(mod) == "table" and mod.tools then
-        local tools = mod.tools
+      if ok and type(mod) == "table" then
+        -- 从模块中提取工具定义（工具是模块上的命名 table，包含 name 和 func 字段）
+        local tools = {}
+        for _, v in pairs(mod) do
+          if type(v) == "table" and v.name and v.func then
+            table.insert(tools, v)
+          end
+        end
         for _, tool in ipairs(tools) do
           if tool.name and tool.func then
             local cat = tool.category or "uncategorized"
@@ -246,3 +252,4 @@ function M.get_pack_order(pack_name)
 end
 
 return M
+

@@ -2481,6 +2481,29 @@ function M.on_generation_complete(data)
   end)
 end
 
+--- 内联编辑距离计算
+--- @param s1 string
+--- @param s2 string
+--- @return number
+local function _inline_levenshtein(s1, s2)
+  local len1 = #s1
+  local len2 = #s2
+  local matrix = {}
+  for i = 0, len1 do
+    matrix[i] = { [0] = i }
+  end
+  for j = 0, len2 do
+    matrix[0][j] = j
+  end
+  for i = 1, len1 do
+    for j = 1, len2 do
+      local cost = s1:sub(i, i) == s2:sub(j, j) and 0 or 1
+      matrix[i][j] = math.min(matrix[i - 1][j] + 1, matrix[i][j - 1] + 1, matrix[i - 1][j - 1] + cost)
+    end
+  end
+  return matrix[len1][len2]
+end
+
 --- 内联模糊匹配工具名称
 --- 替代已废弃的 M._fuzzy_match_tool
 --- @param input string 模型输入的工具名称
@@ -2574,30 +2597,6 @@ _inline_fuzzy_match = function(input, all_names)
   end
 
   return nil
-end
-
---- 内联编辑距离计算
---- @param s1 string
---- @param s2 string
---- @return number
----@diagnostic disable-next-line: unused-local
-local function _inline_levenshtein(s1, s2)
-  local len1 = #s1
-  local len2 = #s2
-  local matrix = {}
-  for i = 0, len1 do
-    matrix[i] = { [0] = i }
-  end
-  for j = 0, len2 do
-    matrix[0][j] = j
-  end
-  for i = 1, len1 do
-    for j = 1, len2 do
-      local cost = s1:sub(i, i) == s2:sub(j, j) and 0 or 1
-      matrix[i][j] = math.min(matrix[i - 1][j] + 1, matrix[i][j - 1] + 1, matrix[i - 1][j - 1] + cost)
-    end
-  end
-  return matrix[len1][len2]
 end
 
 function M._add_tool_result_to_messages(session_id, tool_call_id, tool_name, result, is_sub_agent, normalized_args)
