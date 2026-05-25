@@ -27,7 +27,8 @@ local state = {
   _queue_counter = 0,
 
   -- 防抖状态
-  _debounce_timer = nil,
+  _debounce_timer = nil,        -- 防抖定时器
+  _max_delay_timer = nil,       -- 最大延迟定时器（强制保存）
   _debounce_active = false,
   _pending_flush = false,
 
@@ -449,13 +450,31 @@ end
 
 --- 防抖保存（高频更新时使用）
 --- @param sessions_func function 获取最新会话数据的函数
---- @param debounce_ms number|nil 防抖间隔（毫秒），默认 800ms
-function M.debounced_save(sessions_func, debounce_ms)
+--- @param debounce_ms number|nil 防抖间隔（毫秒），默认 300ms
+--- @param max_delay_ms number|nil 最大延迟（毫秒），超过此时间强制保存，默认 3000ms（0 表示不限）
+function M.debounced_save(sessions_func, debounce_ms, max_delay_ms)
   if state._is_shutting_down then return end
 
-  debounce_ms = debounce_ms or 800
+  debounce_ms = debounce_ms or 300
+  max_delay_ms = max_delay_ms or 3000
 
-  -- 停止旧定时器（如果存在），然后启动新定时器
+  local function do_save()
+    -- 停止两个定时器
+    if state._debounce_timer and not state._debounce_timer:is_closing() then
+      state._debounce_timer:stop()
+    end
+    if state._max_delay_timer and not state._max_delay_timer:is_closing() then
+      state._max_delay_timer:stop()
+    end
+
+    local sessions = sessions_func()
+    local content = M.serialize(sessions)
+    if content then
+      M.enqueue_save("debounced", content)
+    end
+  end
+
+  -- 停止旧防抖定时器（如果存在），然后启动新定时器
   -- 注意：不能用 timer:again()，因为定时器创建时 repeat=0（非重复定时器），
   -- again() 对于非重复定时器只会停止而不会重新启动，导致防抖机制失效。
   if state._debounce_timer and not state._debounce_timer:is_closing() then
@@ -465,16 +484,18 @@ function M.debounced_save(sessions_func, debounce_ms)
   end
 
   state._debounce_timer:start(debounce_ms, 0, vim.schedule_wrap(function()
-    if state._debounce_timer and not state._debounce_timer:is_closing() then
-      state._debounce_timer:stop()
-    end
-
-    local sessions = sessions_func()
-    local content = M.serialize(sessions)
-    if content then
-      M.enqueue_save("debounced", content)
-    end
+    do_save()
   end))
+
+  -- 最大延迟定时器：首次调用时启动，后续不重置，保证最多 max_delay_ms 后强制保存
+  if max_delay_ms > 0 then
+    if not state._max_delay_timer or state._max_delay_timer:is_closing() then
+      state._max_delay_timer = vim.uv.new_timer()
+      state._max_delay_timer:start(max_delay_ms, 0, vim.schedule_wrap(function()
+        do_save()
+      end))
+    end
+  end
 end
 
 -- ========== 初始化与清理 ==========
@@ -534,6 +555,11 @@ function M._test_reset()
     state._debounce_timer:close()
   end
   state._debounce_timer = nil
+  if state._max_delay_timer and not state._max_delay_timer:is_closing() then
+    state._max_delay_timer:stop()
+    state._max_delay_timer:close()
+  end
+  state._max_delay_timer = nil
   state._debounce_active = false
 end
 

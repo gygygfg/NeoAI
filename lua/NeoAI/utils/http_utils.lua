@@ -446,18 +446,12 @@ function M._update_json_depth(processor, str)
   if not processor or not str or type(str) ~= "string" then
     return
   end
-  local changed = false
-  for i = 1, #str do
-    local c = str:sub(i, i)
-    if c == "{" then
-      processor._json_depth = processor._json_depth + 1
-      changed = true
-    elseif c == "}" then
-      processor._json_depth = processor._json_depth - 1
-      changed = true
-    end
-  end
-  if changed then
+  -- 性能优化：使用 string.gsub 计数替代逐字符循环，利用 C 层实现避免 Lua 循环开销
+  local _, open_count = str:gsub("{", "")
+  local _, close_count = str:gsub("}", "")
+  local delta = open_count - close_count
+  if delta ~= 0 then
+    processor._json_depth = processor._json_depth + delta
     processor._json_depth_changed = true
   end
 end
@@ -543,7 +537,20 @@ function M.process_stream_chunk(processor, data)
           end
         end
         if #processor.tool_calls > 0 then
-          result.tool_calls = vim.deepcopy(processor.tool_calls)
+          -- 性能优化：用浅拷贝替代 vim.deepcopy，避免每个流式 chunk 都深拷贝整个 tool_calls 数组
+          -- 内层 function 表是安全的（同步分发，不会被并发修改）
+          local tc_copy = {}
+          for i, tc in ipairs(processor.tool_calls) do
+            tc_copy[i] = {
+              id = tc.id,
+              type = tc.type,
+              ["function"] = {
+                name = tc["function"] and tc["function"].name or "",
+                arguments = tc["function"] and tc["function"].arguments or "",
+              },
+            }
+          end
+          result.tool_calls = tc_copy
         end
       end
     end

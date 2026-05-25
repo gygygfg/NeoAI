@@ -22,6 +22,8 @@ local M = {}
 
 -- ========== 闭包内私有状态 ==========
 local _tool_definitions = {}
+-- 性能优化：缓存 core 模块引用，避免 hot path 中重复 require
+local _cached_core = nil
 local _first_request = true
 local tool_call_counter = 0
 
@@ -47,12 +49,16 @@ end
 -- ========== Builder 公共接口 ==========
 
 --- 格式化消息（带多层去重）
+-- 性能优化：合并多轮遍历为双轮，减少消息遍历次数（从 4→2 轮）
+-- 同时用浅拷贝替代 vim.deepcopy（msg 无嵌套 table），
+-- 并用 content:find 预检查避免不必要的 vim.split
 function M.format_messages(messages)
   if not messages then return {} end
 
-  -- 第一步：预去重，移除连续重复的消息
+  -- 第一轮遍历：去重 + 折叠过滤（合并原第1、2轮）
   local deduped = {}
   for _, msg in ipairs(messages) do
+    -- 去重
     local last = deduped[#deduped]
     if last and last.role == msg.role and last.role ~= "tool" then
       local last_content = type(last.content) == "string" and last.content or ""
@@ -62,42 +68,44 @@ function M.format_messages(messages)
     if last and last.role == "tool" and msg.role == "tool" then
       if last.tool_call_id == msg.tool_call_id then goto continue end
     end
-    table.insert(deduped, msg)
-    ::continue::
-  end
-  messages = deduped
-
-  -- 第二步：过滤 assistant 消息中的 UI 折叠文本（{{{ ... }}}）
-  local filtered = {}
-  for _, msg in ipairs(messages) do
+    -- 折叠过滤：仅对 assistant 消息处理 UI 折叠文本
     if msg.role == "assistant" and msg.content and type(msg.content) == "string" then
       local content = msg.content
-      local lines = vim.split(content, "\n")
-      local in_fold = false
-      local cleaned = {}
-      for _, line in ipairs(lines) do
-        if line:find("^{{{") then in_fold = true end
-        if not in_fold then table.insert(cleaned, line) end
-        if in_fold and line:find("^}}}") then in_fold = false end
-      end
-      local cleaned_str = vim.trim(table.concat(cleaned, "\n"))
-      if cleaned_str ~= content then
-        local new_msg = vim.deepcopy(msg)
-        new_msg.content = cleaned_str
-        table.insert(filtered, new_msg)
+      -- 性能优化：先检查是否包含折叠标记，避免不必要的 vim.split
+      if content:find("{{{", 1, true) then
+        local lines = vim.split(content, "\n")
+        local in_fold = false
+        local cleaned = {}
+        for _, line in ipairs(lines) do
+          if line:find("^{{{") then in_fold = true end
+          if not in_fold then table.insert(cleaned, line) end
+          if in_fold and line:find("^}}}") then in_fold = false end
+        end
+        local cleaned_str = vim.trim(table.concat(cleaned, "\n"))
+        if cleaned_str ~= content then
+          -- 性能优化：浅拷贝替代 vim.deepcopy（msg 仅含字符串/简单字段，无嵌套 table）
+          local new_msg = { role = msg.role, content = cleaned_str }
+          if msg.tool_calls then new_msg.tool_calls = msg.tool_calls end
+          if msg.tool_call_id then new_msg.tool_call_id = msg.tool_call_id end
+          if msg.name then new_msg.name = msg.name end
+          deduped[#deduped + 1] = new_msg
+        else
+          deduped[#deduped + 1] = msg
+        end
       else
-        table.insert(filtered, msg)
+        deduped[#deduped + 1] = msg
       end
     else
-      table.insert(filtered, msg)
+      deduped[#deduped + 1] = msg
     end
+    ::continue::
   end
-  messages = filtered
 
-  -- 第三步：收集 tool_call_id 并处理占位
+  -- 第二轮遍历：收集 tool_call_id + 构建结果（合并原第3、4轮）
   local result = {}
   local expected_ids = {}
-  for _, msg in ipairs(messages) do
+  for _, msg in ipairs(deduped) do
+    -- 收集 tool_call_id
     if msg.tool_calls then
       for _, tc in ipairs(msg.tool_calls) do
         if tc.id and tc.id ~= "" then
@@ -108,15 +116,11 @@ function M.format_messages(messages)
         end
       end
     end
-  end
-  for _, msg in ipairs(messages) do
+    -- 构建结果
     local fm = { role = msg.role or "user" }
-    -- 处理 content 可能是 table 格式（含 reasoning_content 和 content 字段）的情况
     if msg.content then
       if type(msg.content) == "table" then
-        -- 提取 table 中的 content 字段（字符串）作为 API 请求的 content
         fm.content = msg.content.content or ""
-        -- 如果有 reasoning_content，提取为独立字段
         if msg.content.reasoning_content then
           fm.reasoning_content = msg.content.reasoning_content
         end
@@ -124,9 +128,7 @@ function M.format_messages(messages)
         fm.content = tostring(msg.content)
       end
     end
-    if msg.tool_calls then
-      fm.tool_calls = msg.tool_calls
-    end
+    if msg.tool_calls then fm.tool_calls = msg.tool_calls end
     if msg.role == "tool" then
       if msg.tool_call_id and msg.tool_call_id ~= "" then
         fm.tool_call_id = msg.tool_call_id
@@ -143,19 +145,18 @@ function M.format_messages(messages)
     end
     if msg.name then fm.name = msg.name end
     if msg.reasoning_content then fm.reasoning_content = msg.reasoning_content end
-    table.insert(result, fm)
+    result[#result + 1] = fm
   end
 
-  -- 第四步：添加缺失的 tool 占位消息
-  local missing = {}
+  -- 添加缺失的 tool 占位消息
   for id, count in pairs(expected_ids) do
-    if count and count > 0 then table.insert(missing, id) end
-  end
-  for _, id in ipairs(missing) do
-    table.insert(result, { role = "tool", tool_call_id = id, content = "[工具结果缺失]" })
+    if count and count > 0 then
+      result[#result + 1] = { role = "tool", tool_call_id = id, content = "[工具结果缺失]" }
+    end
   end
   return result
 end
+
 
 --- 构建工具结果消息
 function M.build_tool_result_message(tool_call_id, result, tool_name)
@@ -273,7 +274,12 @@ function M.build_request(params)
     if options.tools_enabled ~= nil then
       tools_enabled = options.tools_enabled
     else
-      local core = require("NeoAI.core")
+      -- 性能优化：缓存 core.get_config 引用，避免每次请求 require + pcall
+      local core = _cached_core
+      if not core then
+        core = require("NeoAI.core")
+        _cached_core = core
+      end
       local ok, full_config = pcall(core.get_config)
       full_config = ok and full_config or {}
       if full_config and full_config.tools and full_config.tools.enabled ~= nil then
@@ -294,12 +300,22 @@ function M.build_request(params)
         if reasoning_enabled then
           local strict_tools = {}
           for _, td in ipairs(tools_to_use) do
-            local s = vim.deepcopy(td)
-            if s["function"] then
-              s["function"].strict = true
-              if s["function"].parameters then
-                s["function"].parameters.additionalProperties = false
+            -- 性能优化：浅拷贝替代 vim.deepcopy(td)，仅拷贝需要修改的层级
+            local s = { type = td.type }
+            if td["function"] then
+              local f = {}
+              for k, v in pairs(td["function"]) do
+                if k == "parameters" then
+                  f[k] = vim.deepcopy(v)  -- 仅对 parameters 深拷贝（需修改 additionalProperties）
+                else
+                  f[k] = v                -- 其他字段浅引用
+                end
               end
+              f.strict = true
+              if f.parameters then
+                f.parameters.additionalProperties = false
+              end
+              s["function"] = f
             end
             table.insert(strict_tools, s)
           end
@@ -1293,6 +1309,9 @@ function M.detect_abnormal_response(content, tool_calls, opts)
   -- 1. 空内容检测（非工具循环模式）
   -- 非工具循环模式下，空内容+无工具调用可能是正常的（如命名请求）
   -- 但如果有工具调用列表却为空，仍可能是异常
+  -- 修复：仅包含 reasoning 但无 content 时，视为正常
+  -- DeepSeek 等模型的思考模式可能只输出 reasoning_content
+  -- 此时 content 可能为空，但不应触发重试
   if (not content or content == "") and (not tool_calls or #tool_calls == 0) then
     -- 非工具循环模式：不将空内容视为异常，让上层逻辑处理
     return false, nil

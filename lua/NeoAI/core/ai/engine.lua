@@ -19,6 +19,14 @@ local http_utils = require("NeoAI.utils.http_utils")
 local tool_cycle = require("NeoAI.core.ai.tool_cycle")
 local request_handler = require("NeoAI.core.ai.request_handler")
 
+-- 性能优化：延迟求值 debug.traceback()，仅在 DEBUG 级别时计算
+local function _traceback_if_debug()
+  if logger.get_level and logger.get_level() == "DEBUG" then
+    return debug.traceback()
+  end
+  return "traceback_disabled"
+end
+
 -- ========== 闭包内私有状态 ==========
 local state = {
   initialized = false,
@@ -424,6 +432,15 @@ function _handle_stream_end(generation_id, processor, params)
   local reasoning_text = processor.reasoning_buffer or ""
   local usage = processor.usage or {}
   local tool_calls = http_utils.filter_valid_tool_calls(processor.tool_calls or {})
+
+  -- 修复：当只有 reasoning_content 没有 content 时，不视为空响应
+  -- DeepSeek 等模型的思考模式可能只输出 reasoning_content
+  -- 此时应正常结束生成，而不是触发重试
+  if full_response == "" and reasoning_text ~= "" and #tool_calls == 0 then
+    logger.warn("[ai_engine] 流式结束: 仅有 reasoning_content 无 content (长度=%d)，视为正常结束", #reasoning_text)
+    -- 将 reasoning 作为 content 处理，确保用户能看到思考结果
+    full_response = reasoning_text
+  end
 
   -- XML 回退：当 API 不返回 structured tool_calls 时，从 content 中提取 XML 格式工具调用
   if #tool_calls == 0 and full_response ~= "" then
@@ -945,7 +962,7 @@ function M.handle_tool_result(data)
     tostring(state.is_generating),
     tostring(state.current_generation_id),
     #messages,
-    debug.traceback()
+    _traceback_if_debug()
   )
 
   -- 检查 session 级别的生成锁，避免多会话互相阻塞

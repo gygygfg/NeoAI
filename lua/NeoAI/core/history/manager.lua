@@ -487,7 +487,7 @@ function M.add_assistant_entry(session_id, assistant_entry)
     table.insert(session.assistant, { content = assistant_entry })
   end
   session.updated_at = os.time()
-  M._mark_dirty()
+  M._mark_dirty_light()  -- 防抖保存：工具循环中避免每轮立即写文件
   return true
 end
 
@@ -550,7 +550,7 @@ function M.add_tool_result(session_id, tool_name, arguments, result, pack_name)
 
   cache.invalidate_round_text(session_id)
   cache.invalidate_tree()
-  M._mark_dirty()
+  M._mark_dirty_light()  -- 防抖保存：工具循环中避免每轮立即写文件
   return true
 end
 
@@ -808,24 +808,28 @@ end
 
 -- ========== 持久化 ==========
 
+--- 标记脏数据（重要操作，立即保存）
+--- 用于 add_round、add_tool_result、delete_session 等关键操作
 function M._mark_dirty()
   local auto_save = (_config and _config.session and _config.session.auto_save) ~= false
   if not auto_save then return end
   if state._is_shutting_down then return end
 
-  persistence.debounced_save(function()
-    return state.sessions
-  end)
+  -- 立即保存，不防抖：重要操作需要确保数据持久化
+  M._save()
 end
 
+--- 标记脏数据（轻量，防抖保存）
+--- 用于流式更新（update_last_assistant、update_usage）等高频操作
 function M._mark_dirty_light()
   local auto_save = (_config and _config.session and _config.session.auto_save) ~= false
   if not auto_save then return end
   if state._is_shutting_down then return end
 
+  -- 防抖保存：300ms 内合并多次更新，但最长 3s 内必定保存
   persistence.debounced_save(function()
     return state.sessions
-  end)
+  end, 300, 3000)
 end
 
 function M._save()

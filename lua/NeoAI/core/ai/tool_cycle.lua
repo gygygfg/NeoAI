@@ -37,6 +37,112 @@ local request_handler = require("NeoAI.core.ai.request_handler")
 local state_manager = require("NeoAI.core.config.state")
 local plan_executor = require("NeoAI.tools.builtin.plan_executor")
 
+-- 性能优化：延迟求值 debug.traceback()，仅在 DEBUG 级别时计算
+-- debug.traceback() 是 Lua 中开销最大的操作之一，不应在非 DEBUG 模式下执行
+local function _traceback_if_debug()
+  if logger.get_level and logger.get_level() == "DEBUG" then
+    return debug.traceback()
+  end
+  return "traceback_disabled"
+end
+
+-- 性能优化：消息上下文窗口大小限制
+-- 防止 ss.messages 在工具循环中无限增长导致内存和序列化开销
+-- 降低 MAX_CONTEXT_MESSAGES 从 50→30，减少内存占用和 API 请求体积
+local MAX_CONTEXT_MESSAGES = 30  -- 保留最近 30 条消息
+local MIN_RETAIN_ROUNDS = 3      -- 至少保留最近 3 轮完整对话
+
+-- 单条工具结果内容最大长度（字符数），超出部分截断
+-- 防止大文件读取或命令输出撑爆消息上下文
+local MAX_TOOL_RESULT_LENGTH = 32000  -- 32KB
+
+-- 性能优化：_trim_messages 调用节流
+-- 对于每次工具结果调用可避免不必要的 O(n) 扫描和内存分配
+-- 仅在每隔 TRIM_THROTTLE_INTERVAL 次调用才执行裁剪逻辑
+local _trim_call_count = 0
+local TRIM_THROTTLE_INTERVAL = 5  -- 每 5 次调用执行一次裁剪
+
+-- 性能优化：裁剪消息上下文窗口，防止无限增长
+-- 保留系统消息 + 最近 N 条消息（至少保留 MIN_RETAIN_ROUNDS 轮完整对话）
+local function _trim_messages(messages)
+  -- 节流：每 TRIM_THROTTLE_INTERVAL 次调用才执行一次实际裁剪
+  _trim_call_count = _trim_call_count + 1
+  if _trim_call_count % TRIM_THROTTLE_INTERVAL ~= 0 then
+    return
+  end
+  if #messages <= MAX_CONTEXT_MESSAGES then
+    return
+  end
+  -- 保留系统消息（如果有）
+  local system_count = 0
+  for _, msg in ipairs(messages) do
+    if msg.role == "system" then system_count = system_count + 1 else break end
+  end
+  -- 从末尾向前数，至少保留 MIN_RETAIN_ROUNDS 轮完整的 user-assistant-tool 交互
+  local rounds = 0
+  local keep_from = nil
+  for i = #messages, system_count + 1, -1 do
+    if messages[i].role == "user" then
+      rounds = rounds + 1
+      if rounds >= MIN_RETAIN_ROUNDS then
+        keep_from = i
+        break
+      end
+    end
+  end
+  -- 硬限制：不超过 MAX_CONTEXT_MESSAGES（需扣除系统消息占用的槽位）
+  local max_keep_from = math.max(
+    system_count + 1,
+    #messages - (MAX_CONTEXT_MESSAGES - system_count) + 1
+  )
+  if keep_from then
+    keep_from = math.max(keep_from, max_keep_from)
+  else
+    -- 未找到足够的 user 消息（可能全是 tool/assistant 消息或工具循环中），使用硬限制兜底
+    keep_from = max_keep_from
+  end
+  -- 确保裁剪不破坏 assistant(tool_calls) -> tool 成对关系
+  -- OpenAI API 要求：每个 tool 消息前必须有对应的 assistant(tool_calls) 消息
+  -- 裁剪点不能落在 assistant(tool_calls) 和 tool 消息之间
+  while keep_from > system_count + 1 and messages[keep_from].role == "tool" do
+    keep_from = keep_from - 1
+  end
+  -- 最终检查：裁剪后第一条非 system 消息不能是 tool 消息
+  if keep_from > #messages or keep_from <= system_count then
+    return
+  end
+  if messages[keep_from].role == "tool" then
+    -- 极端情况：所有非 system 消息都是 tool 消息，无法安全裁剪
+    -- 清空所有非系统消息以释放内存，防止无限增长导致 OOM
+    logger.warn("[tool_orchestrator] 消息裁剪：所有非系统消息均为 tool 消息，清空非系统消息以防止内存泄漏")
+    for i = #messages, system_count + 1, -1 do
+      messages[i] = nil
+    end
+    return
+  end
+  -- 裁剪：删除前面的旧消息（保留系统消息 + keep_from 之后的消息）
+  local trimmed = {}
+  for i = 1, system_count do
+    trimmed[i] = messages[i]
+  end
+  local ti = system_count + 1
+  for i = keep_from, #messages do
+    trimmed[ti] = messages[i]
+    ti = ti + 1
+  end
+  -- 原地替换：先清空超出部分，再复制回去
+  local old_len = #messages
+  for i = #messages, ti, -1 do
+    messages[i] = nil
+  end
+  for i = 1, #trimmed do
+    messages[i] = trimmed[i]
+  end
+  logger.debug("[tool_orchestrator] 消息上下文裁剪: %d -> %d 条", old_len, #trimmed)
+end
+
+-- 性能优化：消息上下文窗口大小限制（已整合到 _trim_messages 中）
+
 -- ========== 状态 ==========
 
 local _tools = {}
@@ -136,23 +242,25 @@ function M.set_shutting_down()
 end
 
 --- 等待 TOOL_DISPLAY_CLOSED 事件后执行回调
---- 优化：移除 5 秒超时等待，直接通过 vim.schedule 执行回调
---- TOOL_DISPLAY_CLOSED 由 chat_window 在 TOOL_LOOP_FINISHED 回调中触发
---- 由于 fire_loop_finished 在调用此函数之前已触发，事件可能已错过
---- 因此直接执行回调，不再等待事件
+--- 优化：使用 vim.defer_fn 延迟 150ms 执行回调，让出事件循环以避免 CPU 尖峰
+--- 之前的同步执行会在工具完成时立即触发下一轮，导致紧密循环
+--- 150ms 的延迟对人类感知无影响，但能显著降低 CPU 占用并避免回调风暴
 ---@diagnostic disable-next-line: unused-local
 local function once_display_closed(session_id, callback)
-  -- 直接执行回调，不再使用 vim.schedule 延迟
-  -- 之前的 vim.schedule 是为了等待 TOOL_DISPLAY_CLOSED 事件
-  -- 但现在该事件已不再使用，直接执行回调可以减少工具循环的延迟
   if is_shutting_down() then
     return
   end
+  -- 使用 vim.defer_fn 延迟执行回调，让出事件循环
   -- pcall 保护：防止回调异常导致后续状态转换无法执行
-  local ok, err = pcall(callback)
-  if not ok then
-    logger.warn("[tool_orchestrator] once_display_closed 回调异常: %s", tostring(err))
-  end
+  vim.defer_fn(function()
+    if is_shutting_down() then
+      return
+    end
+    local ok, err = pcall(callback)
+    if not ok then
+      logger.warn("[tool_orchestrator] once_display_closed 回调异常: %s", tostring(err))
+    end
+  end, 150)
 end
 
 --- 触发 TOOL_LOOP_FINISHED 事件
@@ -353,7 +461,11 @@ function M.register_session(session_id, window_id)
           s.last_reasoning = data.reasoning_text
         end
 
-        M._check_round_complete(session_id)
+        -- 注意：不在此处调用 _check_round_complete，因为 _generation_completed 尚未被设置。
+        -- on_generation_complete() 会在设置 _generation_completed=true 后通过 _execute_tools
+        -- → _on_tools_complete → _check_round_complete 的路径触发轮次检查。
+        -- 在此处调用会导致 _check_round_complete 发现 _generation_completed=false 而进入等待，
+        -- 而本模块已废弃轮询机制，直接 return 不会重试，可能导致循环卡死。
       end,
     })
   )
@@ -392,6 +504,13 @@ function M.unregister_session(session_id)
   end
   for _, id in ipairs(ss.autocmd_ids) do
     pcall(vim.api.nvim_del_autocmd, id)
+  end
+  -- 清理该 session 相关的参数重试计数，防止内存泄漏
+  local prefix = session_id .. ":"
+  for key, _ in pairs(_param_retry_counts) do
+    if vim.startswith(key, prefix) then
+      _param_retry_counts[key] = nil
+    end
   end
   state.sessions[session_id] = nil
 end
@@ -455,6 +574,13 @@ function M.unregister_sub_agent_session(sub_agent_id)
   end
   for _, id in ipairs(ss.autocmd_ids or {}) do
     pcall(vim.api.nvim_del_autocmd, id)
+  end
+  -- 清理该 sub_agent 相关的参数重试计数，防止内存泄漏
+  local prefix = sub_agent_id .. ":"
+  for key, _ in pairs(_param_retry_counts) do
+    if vim.startswith(key, prefix) then
+      _param_retry_counts[key] = nil
+    end
   end
   state.sub_agent_sessions[sub_agent_id] = nil
 end
@@ -599,6 +725,11 @@ function M._execute_tools(session_id, tool_calls, is_sub_agent)
     return
   end
 
+  -- 重置 _tools_complete_in_progress，确保新轮次工具完成后能正常触发 _on_tools_complete。
+  -- 上一轮 _on_tools_complete 进入下一轮后可能保持 _tools_complete_in_progress=true
+  -- 以阻止旧工具回调绕过保护，新轮次开始前必须重置。
+  ss._tools_complete_in_progress = false
+
   -- 如果已请求停止，跳过所有工具执行
   if ss.stop_requested then
     return
@@ -614,11 +745,11 @@ function M._execute_tools(session_id, tool_calls, is_sub_agent)
       local tid = tc.id or "no-id"
       tool_names_str = tool_names_str .. name .. "(" .. tid .. "), "
     end
-    require("NeoAI.utils.logger").warn(
+    logger.warn(
       "[tool_orchestrator] _execute_tools 跳过: phase 已是 waiting_tools, session=%s, tools=[%s], stack=%s",
       tostring(session_id),
       tool_names_str,
-      debug.traceback()
+      _traceback_if_debug()
     )
     return
   end
@@ -649,7 +780,7 @@ function M._execute_tools(session_id, tool_calls, is_sub_agent)
     table.concat(tool_names, ","),
     tostring(ss.phase),
     ss.current_iteration or 0,
-    debug.traceback()
+    _traceback_if_debug()
   )
 
   -- 清空前检查是否有活跃工具调用（竞态检测）
@@ -659,11 +790,16 @@ function M._execute_tools(session_id, tool_calls, is_sub_agent)
       "[tool_orchestrator] _execute_tools: 清空 %d 个活跃工具调用, session=%s, stack=%s",
       prev_active_count,
       tostring(session_id),
-      debug.traceback()
+      _traceback_if_debug()
     )
   end
   ss.phase = "waiting_tools"
-  ss.active_tool_calls = {}
+  -- 原地清理而非替换表引用：避免孤立仍在异步执行中的旧工具回调。
+  -- 旧回调通过 sessions_table[session_id].active_tool_calls 动态访问，替换表引用会导致
+  -- 旧回调写入新表、污染新轮次的工具计数，引发错误的 _on_tools_complete 触发。
+  for k in pairs(ss.active_tool_calls) do
+    ss.active_tool_calls[k] = nil
+  end
 
   -- 强制刷新 UI，让用户看到工具执行开始
 
@@ -724,6 +860,72 @@ function M._execute_tools(session_id, tool_calls, is_sub_agent)
       M._execute_single_tool(session_id, tc, is_sub_agent, nil)
     end)
   end
+
+  -- ===== 工具执行超时保护 =====
+  -- 如果某些工具的 on_result 回调因异常（工具 hang、crash 等）永不触发，
+  -- active_tool_calls 中对应的条目永远不会被移除，导致 _on_tools_complete 永远不被调用，
+  -- 整个工具循环永久卡死。此超时作为兜底保护。
+  -- 默认 300 秒（5 分钟），可通过 M.tool_timeout_ms 配置。
+  -- 注意：超时检查会跳过正在等待审批的工具（approval_handler.is_showing() 或队列非空），
+  -- 避免在用户审批期间强制推进循环。
+  local timeout_ms = M.tool_timeout_ms or 300000 -- 默认 300 秒，可通过 M.tool_timeout_ms 配置
+  local timeout_gen = ss.generation_id -- 捕获当前的 generation_id，防止跨轮误触发
+  -- 超时重试计数：审批等待最多重试 60 次（每次 5 秒 = 额外 5 分钟）
+  local timeout_retries = 0
+  local max_timeout_retries = 60
+  local function _timeout_check()
+    local s = sessions_table[session_id]
+    if not s then
+      return
+    end
+    -- 仅当 generation_id 匹配（未进入新轮次）且仍有活跃工具时才触发超时
+    if s.generation_id == timeout_gen and vim.tbl_count(s.active_tool_calls) > 0 then
+      -- 检查是否有工具正在等待审批，如果有则延长等待
+      local approval_ok, approval_handler = pcall(require, "NeoAI.tools.approval_handler")
+      if approval_ok and approval_handler then
+        if approval_handler.is_showing() or approval_handler.queue_length() > 0 then
+          if timeout_retries < max_timeout_retries then
+            timeout_retries = timeout_retries + 1
+            logger.debug(
+              "[tool_orchestrator] 工具执行超时检查: 仍有审批进行中 (showing=%s, queue=%d)，延长等待 (%d/%d)",
+              tostring(approval_handler.is_showing()),
+              approval_handler.queue_length(),
+              timeout_retries,
+              max_timeout_retries
+            )
+            -- 审批仍在进行中，延长 5 秒后重新检查
+            vim.defer_fn(_timeout_check, 5000)
+            return
+          end
+          logger.warn(
+            "[tool_orchestrator] 工具执行超时: 审批等待次数已达上限 (%d)，强制推进",
+            max_timeout_retries
+          )
+        end
+      end
+
+      local stuck_ids = {}
+      for tid in pairs(s.active_tool_calls) do
+        table.insert(stuck_ids, tid)
+      end
+      logger.warn(
+        "[tool_orchestrator] 工具执行超时 (%d ms), 强制完成 %d 个卡住的工具调用: %s, session=%s",
+        timeout_ms,
+        #stuck_ids,
+        table.concat(stuck_ids, ", "),
+        tostring(session_id)
+      )
+      -- 强制清理：移除所有卡住的工具调用
+      for _, tid in ipairs(stuck_ids) do
+        s.active_tool_calls[tid] = nil
+      end
+      -- 强制触发完成
+      if s.phase ~= "round_complete" then
+        M._on_tools_complete(session_id, is_sub_agent)
+      end
+    end
+  end
+  vim.defer_fn(_timeout_check, timeout_ms)
 end
 
 function M._execute_single_tool(session_id, tool_call, is_sub_agent, on_complete)
@@ -1060,6 +1262,7 @@ function M._execute_single_tool(session_id, tool_call, is_sub_agent, on_complete
               _param_retry_counts[retry_key]
             )
           else
+            _param_retry_counts[retry_key] = nil
             M._add_tool_result_to_messages(session_id, tool_call_id, tool_name, err_msg, is_sub_agent, normalized_args)
           end
         end
@@ -1188,10 +1391,24 @@ function M._execute_single_tool(session_id, tool_call, is_sub_agent, on_complete
             end,
           })
         end)
+        -- 关键：write 工具已通过 vim.schedule 异步调度，其 on_result 回调负责清理和触发 _on_tools_complete。
+        -- 必须在此 return，防止穿透到下方的统一清理逻辑（行 1397），否则会提前移除 confirm 的 tool_call_id
+        -- 并在 write 工具尚未执行时错误触发 _on_tools_complete → _proceed_to_next_round，导致竞态死锁。
+        return
       else
         local result_str =
           "[确认失败] 找不到原始工具调用信息，请重新调用编辑工具来修改文件。"
         M._add_tool_result_to_messages(session_id, tool_call_id, tool_name, result_str, is_sub_agent)
+        -- 清理并触发完成，防止穿透到下方的统一清理逻辑（行 1397）
+        ss.active_tool_calls[tool_call_id] = nil
+        local remaining = vim.tbl_count(ss.active_tool_calls)
+        if remaining == 0 and ss.phase ~= "round_complete" then
+          M._on_tools_complete(session_id, is_sub_agent)
+        end
+        if on_complete then
+          on_complete()
+        end
+        return
       end
 
     -- ===== action = "abandon"：放弃修改 =====
@@ -1222,6 +1439,7 @@ function M._execute_single_tool(session_id, tool_call, is_sub_agent, on_complete
 
       if retry_count >= 3 then
         -- 已达重试上限，自动放弃
+        _param_retry_counts[retry_key] = nil
         pcall(vim.api.nvim_exec_autocmds, "User", {
           pattern = event_constants.TOOL_EXECUTION_SUBSTEP,
           data = {
@@ -1466,6 +1684,7 @@ function M._execute_single_tool(session_id, tool_call, is_sub_agent, on_complete
               )
             else
               -- 该工具重试已达上限，自动放弃，不再提示重试
+              _param_retry_counts[retry_key] = nil
               local skip_msg = string.format(
                 "[工具调用已放弃] 工具 '%s' 的参数修正重试已达上限 (3/3)，已自动放弃此修改。",
                 tool_name
@@ -1541,10 +1760,14 @@ function M._on_tools_complete(session_id, is_sub_agent)
     ss.current_iteration or 0,
     tostring(ss._tools_complete_in_progress),
     vim.tbl_count(ss.active_tool_calls or {}),
-    debug.traceback()
+    _traceback_if_debug()
   )
 
-  if ss._tools_complete_in_progress then
+  -- 防止重复触发：如果 _tools_all_completed 已为 true，说明 _on_tools_complete
+  -- 已经被调用过（或正在执行），不应再次进入。
+  -- 注意：_tools_complete_in_progress 保护在异步回调场景下可能失效，
+  -- 因为 once_display_closed 回调中会重置它，导致后续工具回调绕过保护。
+  if ss._tools_all_completed or ss._tools_complete_in_progress then
     return
   end
   ss._tools_complete_in_progress = true
@@ -1606,9 +1829,6 @@ function M._on_tools_complete(session_id, is_sub_agent)
       if not s then
         return
       end
-      -- 在回调内部重置 _tools_complete_in_progress，防止在异步调度期间
-      -- 被第二次 _on_tools_complete 调用绕过保护
-      s._tools_complete_in_progress = false
       if is_shutting_down() then
         return
       end
@@ -1616,10 +1836,25 @@ function M._on_tools_complete(session_id, is_sub_agent)
         logger.debug(
           "[tool_orchestrator] _on_tools_complete: once_display_closed 回调中检测到 stop_requested，跳过 _check_round_complete"
         )
+        s._tools_complete_in_progress = false
         return
       end
       -- 工具全部完成，检查是否两个事件都已到达，决定是否开启下一轮
       M._check_round_complete(session_id, is_sub_agent)
+      -- 检查是否已进入下一轮：如果 _generation_completed 已被重置为 false，
+      -- 说明 _check_round_complete 成功推进了循环。此时不重置 _tools_complete_in_progress，
+      -- 防止后续工具回调（异步竞态）绕过保护再次触发 _on_tools_complete。
+      -- 后续轮次的 _on_tools_complete 会在新轮次工具完成后，由 _check_round_complete
+      -- 重置的 _tools_all_completed=false 配合 _tools_complete_in_progress=false 正常进入。
+      if s._generation_completed == false and s._tools_all_completed == false then
+        -- 已进入下一轮，保持 _tools_complete_in_progress=true 阻止旧工具回调
+        logger.debug(
+          "[tool_orchestrator] _on_tools_complete: 已进入下一轮，保持 _tools_complete_in_progress 阻止旧工具回调, session=%s",
+          tostring(session_id)
+        )
+      else
+        s._tools_complete_in_progress = false
+      end
     end)
   elseif ss.phase == "round_complete" then
     ss._tools_complete_in_progress = false
@@ -1653,14 +1888,6 @@ function M._check_round_complete(session_id, is_sub_agent)
   -- 双事件等待机制：必须 GENERATION_COMPLETED 和 TOOL_EXECUTION_ALL_COMPLETED 都到达
   -- 才能开启下一轮 AI 请求
   if not ss._generation_completed or not ss._tools_all_completed then
-    -- 其中一个事件尚未到达，继续等待
-    require("NeoAI.utils.logger").debug(
-      "[tool_orchestrator] _check_round_complete: 等待双事件到达, session=%s, gen_completed=%s, tools_completed=%s, phase=%s",
-      tostring(session_id),
-      tostring(ss._generation_completed),
-      tostring(ss._tools_all_completed),
-      tostring(ss.phase)
-    )
     return
   end
 
@@ -1700,7 +1927,7 @@ function M._proceed_to_next_round(session_id, is_sub_agent)
     tostring(ss.phase),
     ss.current_iteration or 0,
     tostring(ss._proceed_in_progress),
-    debug.traceback()
+    _traceback_if_debug()
   )
 
   if ss._proceed_in_progress then
@@ -1711,7 +1938,12 @@ function M._proceed_to_next_round(session_id, is_sub_agent)
   -- pcall 保护：确保 _proceed_in_progress 始终被重置，防止异常导致永久卡死
   local ok, proceed_err = pcall(function()
     ss.phase = "idle"
-    ss.active_tool_calls = {}
+    -- 原地清空而非替换表引用：防止 vim.schedule 中延迟执行的旧工具回调
+    -- 通过 sessions_table[session_id].active_tool_calls 写入新表，
+    -- 导致旧工具回调的 tool_call_id 出现在新轮次中，污染工具计数。
+    for k in pairs(ss.active_tool_calls) do
+      ss.active_tool_calls[k] = nil
+    end
     ss._executed_tool_call_ids = {} -- 重置已执行工具 ID 集合，新的一轮重新计数
 
     if ss.stop_requested then
@@ -2008,7 +2240,6 @@ function M.on_generation_complete(data)
         assistant_entry.reasoning_content = data.reasoning
       end
       hm.add_assistant_entry(session_id, assistant_entry)
-      hm._mark_dirty()
     end
   end
 
@@ -2198,6 +2429,9 @@ function M.on_generation_complete(data)
   end
   table.insert(ss.messages, assistant_msg)
 
+  -- 性能优化：裁剪消息上下文窗口，防止无限增长
+  _trim_messages(ss.messages)
+
   ss.current_iteration = ss.current_iteration + 1
 
   -- 标记 AI 生成已完成（用于双事件等待机制）
@@ -2350,9 +2584,16 @@ function M._add_tool_result_to_messages(session_id, tool_call_id, tool_name, res
   end
 
   local safe_id = tool_call_id or ("call_" .. os.time() .. "_" .. math.random(10000, 99999))
-  local result_str = type(result) == "string" and result
-    or (result ~= nil and pcall(vim.json.encode, result) and vim.json.encode(result) or tostring(result))
-    or ""
+  -- 性能优化：避免 pcall 后再次 vim.json.encode（已由 pcall 返回编码结果）
+  local result_str
+  if type(result) == "string" then
+    result_str = result
+  elseif result ~= nil then
+    local ok, encoded = pcall(vim.json.encode, result)
+    result_str = ok and encoded or tostring(result)
+  else
+    result_str = ""
+  end
 
   local tool_msg = {
     role = "tool",
@@ -2364,7 +2605,6 @@ function M._add_tool_result_to_messages(session_id, tool_call_id, tool_name, res
   if tool_name then
     tool_msg.name = tool_name
   end
-  -- 保存规范化后的调用参数（用于历史记录和后续上下文）
   if normalized_args and type(normalized_args) == "table" and next(normalized_args) then
     tool_msg.normalized_args = vim.deepcopy(normalized_args)
   end
@@ -2375,6 +2615,9 @@ function M._add_tool_result_to_messages(session_id, tool_call_id, tool_name, res
   -- 此处不再重复保存，避免竞态和重复
   -- 注意：_add_tool_result_to_messages 只负责将工具结果加入 ss.messages（AI 请求上下文）
   -- 持久化由 tool_executor 集中处理
+
+  -- 性能优化：裁剪消息上下文窗口，防止无限增长
+  _trim_messages(ss.messages)
 end
 
 -- ========== 结束循环 ==========
@@ -2502,6 +2745,7 @@ function M.request_stop(session_id)
     local ss = state.sessions[session_id] or state.sub_agent_sessions[session_id]
     if ss then
       ss.stop_requested = true
+      ss._executed_tool_call_ids = {}
       if next(ss.active_tool_calls) ~= nil then
         ss.active_tool_calls = {}
         vim.schedule(function()
@@ -3248,3 +3492,4 @@ vim.api.nvim_create_autocmd("User", {
 })
 
 return M
+

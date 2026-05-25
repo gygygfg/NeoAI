@@ -546,21 +546,7 @@ local function _parse_file(args, on_success, on_error)
 
     for _, fp in ipairs(args.filepaths) do
       parse_file_content_async(fp, max_depth, function(r)
-        if r and r.nodes then
-          local filtered = {}
-          for _, n in ipairs(r.nodes) do
-            if block_node_types[n.type] then
-              table.insert(filtered, n)
-            end
-          end
-          r.nodes = filtered
-          -- 过滤后重新编号
-          local tc = {}
-          for _, n2 in ipairs(filtered) do
-            tc[n2.type] = (tc[n2.type] or 0) + 1
-            n2.type_index = tc[n2.type]
-          end
-        end
+        -- 修复 BUG 1: 不再用 block_node_types 过滤，parse_file 应返回完整语法树
         table.insert(results, r)
         check_done()
       end, function(err)
@@ -574,21 +560,7 @@ local function _parse_file(args, on_success, on_error)
   -- 处理单个 filepath
   if filepath then
     parse_file_content_async(filepath, max_depth, function(result)
-      if result and result.nodes then
-        local filtered = {}
-        for _, n in ipairs(result.nodes) do
-          if block_node_types[n.type] then
-            table.insert(filtered, n)
-          end
-        end
-        result.nodes = filtered
-        -- 过滤后重新编号
-        local tc = {}
-        for _, n2 in ipairs(filtered) do
-          tc[n2.type] = (tc[n2.type] or 0) + 1
-          n2.type_index = tc[n2.type]
-        end
-      end
+      -- 修复 BUG 1: 不再用 block_node_types 过滤，parse_file 应返回完整语法树
       if on_success then
         on_success(result)
       end
@@ -1407,7 +1379,7 @@ local function _get_node_code(args, on_success, on_error)
   local filepath = args.filepath
 
   parse_file_content_async(filepath, -1, function(result)
-    local filtered = filter_nodes(result.nodes, args.node_type, args.text, args.named)
+    local filtered, fallback = filter_nodes(result.nodes, args.node_type, args.text, args.named)
     if #filtered == 0 then
       if on_error then
         on_error(_build_no_match_error(args.node_type, result.nodes))
@@ -1415,13 +1387,30 @@ local function _get_node_code(args, on_success, on_error)
       return
     end
 
+    -- 根据 index 参数选择目标节点（修复 BUG 2: index 参数无效）
+    -- 如果只有一个匹配，index 可省略；多个匹配时未指定 index 则返回所有节点
+    local targets = filtered
+    local multi_match_warning = nil
+    if args.index ~= nil then
+      local idx = tonumber(args.index)
+      if not idx or idx < 1 or idx > #filtered then
+        if on_error then
+          on_error("index 参数无效: " .. tostring(args.index) .. "。有效范围: 1 ~ " .. #filtered)
+        end
+        return
+      end
+      targets = { filtered[idx] }
+    elseif #filtered > 1 then
+      multi_match_warning = "匹配到 " .. #filtered .. " 个节点，返回全部。如需指定节点，请使用 index 参数（1~" .. #filtered .. "）"
+    end
+
     -- 异步读取文件内容以提取精确的源代码
     read_file_content_async(filepath, function(content)
       local file_lines = vim.split(content, "\n", { plain = true })
 
-      -- 修复 BUG 3: 返回所有匹配节点的代码，而非仅第一个
+      -- 修复 BUG 2: 使用 targets（已按 index 筛选）而非全部 filtered
       local all_codes = {}
-      for _, node in ipairs(filtered) do
+      for _, node in ipairs(targets) do
         local code_lines = {}
         for line_num = node.start_row, node.end_row do
           local line_content = file_lines[line_num + 1] or ""
@@ -1451,13 +1440,20 @@ local function _get_node_code(args, on_success, on_error)
       local ret = {
         filepath = filepath,
         language = result.language,
-        match_count = #filtered,
+        match_count = #targets,
         nodes = all_codes,
       }
       if fallback then
         ret.warning = "未找到指定 node_type '"
           .. (args.node_type or "")
           .. "' 的节点，已回退到同类型节点"
+      end
+      if multi_match_warning then
+        if ret.warning then
+          ret.warning = ret.warning .. "; " .. multi_match_warning
+        else
+          ret.warning = multi_match_warning
+        end
       end
       if on_success then
         on_success(ret)
@@ -1486,6 +1482,10 @@ M.get_node_code = {
       node_type = { type = "string", description = "节点类型过滤（可选，仅支持命名节点类型，匿名 token 如运算符 '+' 请使用 text 参数或 query_tree），如 'function_definition'" },
       text = { type = "string", description = "节点文本过滤（可选，精确匹配，区分大小写，精确空白）" },
       named = { type = "boolean", description = "是否为命名节点（可选）" },
+      index = {
+        type = "number",
+        description = "匹配节点序号（可选，从1开始），仅一个匹配时可省略，多个匹配时必须指定",
+      },
     },
     required = { "filepath" },
   },

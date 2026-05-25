@@ -750,6 +750,7 @@ function M.schedule_preview_update()
       end
     end))
   end
+end
 
 --- 清理流式预览
 function M.clear_streaming_preview()
