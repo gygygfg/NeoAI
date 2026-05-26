@@ -807,6 +807,9 @@ function M.open(session_id, window_id, branch_id)
   -- 设置按键映射
   M.set_keymaps()
 
+  -- 重新注册事件监听器（M.close() 会清理 augroup，重新打开窗口时需重新注册）
+  M._setup_event_listeners()
+
   -- 获取焦点（仅在当前焦点不在其他非 NeoAI 窗口时聚焦）
   local current_win = vim.api.nvim_get_current_win()
   local current_buf = vim.api.nvim_win_get_buf(current_win)
