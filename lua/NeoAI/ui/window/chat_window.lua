@@ -175,6 +175,10 @@ local function _fold_new_markers(buf, lines, win_id, insert_start_line)
     if saved_foldlevel ~= 0 then
       vim.api.nvim_set_option_value("foldlevel", saved_foldlevel, { win = win })
     end
+    -- foldclose! 会移动光标（如果光标在折叠区域内，Neovim 会把光标移到折叠行上）
+    -- 重新执行光标跟随，确保光标回到末尾
+    -- 使用 M._do_cursor_follow 而非 _do_cursor_follow（local function 在 vim.schedule 闭包中不可见）
+    M._do_cursor_follow()
   end)
 end
 
@@ -316,6 +320,11 @@ local state = {
   -- true: 光标在末尾附近（后5行内），新内容写入时应自动跟随
   -- false: 光标不在末尾附近，不跟随
   should_follow = true,
+
+  -- 折叠文本插入后的延迟光标跟随定时器
+  -- 每次插入折叠文本时重置，只有在一段时间内没有新插入时才执行光标跟随
+  -- 解决思考过程折叠文本和工具调用折叠文本先后插入时，光标在思考过程插入后就跳转的问题
+  fold_follow_timer = nil,
 }
 
 -- ========== 依赖 state 的辅助函数 ==========
@@ -615,7 +624,12 @@ local function _do_cursor_follow(should_follow)
     return
   end
   -- 合并为一次 nvim_win_call：设置光标 + 滚动到底部
+  -- 注意：foldmethod=marker 且 foldlevel=0 时，nvim_buf_line_count 返回的是视觉行数（折叠后）
+  -- 而非实际行数，导致 nvim_win_set_cursor 使用实际行号时位置错误
+  -- 改用 nvim_buf_line_count 获取实际行数，不修改 foldlevel，不触发重新渲染
   pcall(vim.api.nvim_win_call, win, function()
+    -- 使用 nvim_buf_line_count 获取实际最后一行号，不受折叠影响
+    -- 注意：vim.fn.line("$") 在 foldlevel=0 时返回视觉行数（折叠后），不可用
     local lc = vim.api.nvim_buf_line_count(buf)
     if lc > 0 then
       vim.api.nvim_win_set_cursor(win, { lc, 0 })
@@ -675,6 +689,30 @@ local function _schedule_cursor_follow(delay_ms)
       _do_cursor_follow(should_follow)
     end)
   end
+end
+
+--- 折叠文本插入后的延迟光标跟随
+--- 每次插入折叠文本后调用此函数，取消旧定时器并启动新定时器
+--- 只有在一段时间内没有新插入时，才执行光标跟随
+--- 解决思考过程折叠文本和工具调用折叠文本先后插入时，光标在思考过程插入后就跳转的问题
+local function _schedule_fold_follow()
+  -- 取消旧定时器
+  if state.fold_follow_timer then
+    pcall(state.fold_follow_timer.stop, state.fold_follow_timer)
+    pcall(state.fold_follow_timer.close, state.fold_follow_timer)
+    state.fold_follow_timer = nil
+  end
+  -- 启动新定时器，800ms 后执行光标跟随
+  -- 如果在这期间有新的折叠文本插入（如审批模式下的多个工具），定时器会被再次重置
+  -- 800ms 覆盖审批间隔，避免每个工具完成后都跳转一次
+  state.fold_follow_timer = vim.uv.new_timer()
+  state.fold_follow_timer:start(800, 0, vim.schedule_wrap(function()
+    if state.fold_follow_timer then
+      pcall(state.fold_follow_timer.close, state.fold_follow_timer)
+      state.fold_follow_timer = nil
+    end
+    _do_cursor_follow()
+  end))
 end
 
 --- 更新 buffer 中已有的折叠文本内容
@@ -1118,29 +1156,22 @@ function M._render_single_message(msg, prev_role)
     if not has_reasoning then
       table.insert(lines, role_prefix)
     end
-    -- 用 string.reverse + find 从末尾找最后一个 }}}（O(n) 但比循环快）
+    -- 用 string.reverse 从末尾反向查找最后一个 }}}
+    -- 比 match(".*()}}}") 快，因为从末尾开始匹配
     local clean_content = raw_content
-    -- 只在有 \r 时才替换（常见路径无 \r）
     if clean_content:find("\r") then
       clean_content = clean_content:gsub("\r\n", "\n"):gsub("\r", "\n")
     end
-    -- 从末尾找最后一个 }}}
-    local fold_end = clean_content:find("}}}", clean_content:len() - 5)
-    if not fold_end then
-      fold_end = clean_content:match(".*()}}}")
-    end
-    if fold_end then
-      -- 用 gmatch 逐行迭代代替 vim.split + ipairs
-      local pos = 1
-      for line in clean_content:gmatch("[^\n]+") do
-        if pos > fold_end + 2 then
-          -- 已进入 remaining 区域
-          break
-        end
+    -- 直接使用 msg.fold_end 缓存（由 _flush_stream_throttle / TOOL_EXECUTION_COMPLETED 设置）
+    -- 零查找开销
+    local fold_start = msg.fold_end
+    if fold_start and fold_start > 0 then
+      -- fold_part = 从开头到 }}} 结束（含 }}}）
+      local fold_part = clean_content:sub(1, fold_start + 2)
+      for line in fold_part:gmatch("[^\n]+") do
         table.insert(lines, line)
-        pos = pos + #line + 1
       end
-      local remaining = clean_content:sub(fold_end + 3)
+      local remaining = clean_content:sub(fold_start + 3)
       remaining = remaining:gsub("^\n+", ""):gsub("\n+$", "")
       if remaining and remaining ~= "" then
         table.insert(lines, "")
@@ -2027,6 +2058,11 @@ function M.close()
     state.cursor_follow.timer = nil
   end
   state.cursor_follow.pending = false
+  if state.fold_follow_timer then
+    pcall(state.fold_follow_timer.stop, state.fold_follow_timer)
+    pcall(state.fold_follow_timer.close, state.fold_follow_timer)
+    state.fold_follow_timer = nil
+  end
 
   -- 保存当前窗口ID到局部变量，供 defer_fn 使用
   -- 防止 defer_fn 执行时 state.current_window_id 已被 M.open() 修改
@@ -2735,7 +2771,7 @@ function M._setup_event_listeners()
       end
 
       -- 先刷新节流 buffer，确保最后一批数据写入 buffer
-      _flush_stream_throttle()
+      M._flush_stream_throttle()
 
       -- 获取起始行：判断流式渲染是否已将内容写入 buffer
       local start_line = state.streaming.message_start_line
@@ -2998,7 +3034,7 @@ function M._setup_event_listeners()
       cancel_reasoning_timer()
 
       -- 先刷新节流 buffer，确保最后一批数据写入 buffer
-      _flush_stream_throttle()
+      M._flush_stream_throttle()
 
       -- 如果思考过程仍在进行中（从未收到正文 STREAM_CHUNK），在此处追加折叠文本
       -- 正常情况下 reasoning→content 切换由 STREAM_CHUNK 回调处理
@@ -3409,6 +3445,11 @@ function M._setup_event_listeners()
             new_content = combined_folded .. separator .. existing_body
           end
           state.messages[mi].content = new_content
+          -- 更新折叠文本结束位置缓存
+          local content_str = type(new_content) == "table" and new_content.content or new_content or ""
+          local fe = content_str:find("}}}", content_str:len() - 3, true)
+          if not fe then fe = content_str:match(".*()}}}") end
+          state.messages[mi].fold_end = fe
           state.tool_display.folded_saved = true
           -- 清除全量渲染缓存，确保下次渲染使用新的折叠文本
           state.streaming._cached_full_lines = nil
@@ -3417,6 +3458,7 @@ function M._setup_event_listeners()
           -- 以处理 reasoning + fold 组合，并避免增量渲染路径中折叠标记被缩进
           state.streaming._needs_full_render = true
           M._render_streaming_message(data.window_id)
+          _schedule_fold_follow()
         end
       end
 
@@ -3476,6 +3518,9 @@ function M._setup_event_listeners()
       state.tool_display.active = false
       state.tool_display.window_id = nil
       state.tool_display._finished = false
+      -- 所有工具执行完毕，触发最终光标跟随
+      -- 作为 _schedule_fold_follow 的最终保障，确保光标回到末尾
+      _schedule_fold_follow()
     end,
   })
 
@@ -3598,6 +3643,10 @@ function M._setup_event_listeners()
           state.streaming._needs_full_render = true
           -- 通过 _render_streaming_message 重新渲染当前消息
           M._render_streaming_message(data.window_id)
+          -- 启动可取消的延迟光标跟随
+          -- 如果后续还有新的工具完成（TOOL_EXECUTION_COMPLETED），旧定时器会被取消并重启
+          -- 只有所有工具都插入完成后才执行跳转
+          _schedule_fold_follow()
         end
       end
 
@@ -4050,6 +4099,10 @@ local function _do_full_streaming_render(msg, mi, buf)
   if start_line then
     local old_lines = state.streaming._full_rendered_lines or 0
     local content_changed = content_len ~= cached_len
+    -- 内容未变化且行数未增长：跳过所有 buffer 写入
+    if not content_changed and old_lines > 0 and #lines == old_lines then
+      return
+    end
     if not content_changed and old_lines > 0 and #lines > old_lines then
       -- 只追加新增的行（避免全量替换）
       local new_lines = {}
@@ -4075,13 +4128,11 @@ local function _do_full_streaming_render(msg, mi, buf)
     local old_count = lc - start_line
     local new_count = #lines
     if new_count > old_count then
-      -- 先扩展 buffer
       local insert_count = new_count - old_count
       local insert_lines = {}
       for _ = 1, insert_count do table.insert(insert_lines, "") end
       vim.api.nvim_buf_set_lines(buf, lc, lc, false, insert_lines)
     elseif new_count < old_count then
-      -- 先收缩 buffer
       local delete_count = old_count - new_count
       vim.api.nvim_buf_set_lines(buf, lc - delete_count, lc, false, {})
     end
@@ -4101,12 +4152,11 @@ local function _do_full_streaming_render(msg, mi, buf)
   state.streaming._rendered_text = ""
   state.streaming._rendered_line_count = 0
 
-  -- 只在首次插入折叠标记时执行 foldclose
-  if not s._folded_first_time then
-    local win = state.current_window_id and window_manager.get_window_win(state.current_window_id) or nil
-    _fold_new_markers(buf, lines, win, start_line or state.streaming.message_start_line)
-    s._folded_first_time = true
-  end
+  -- 每次全量渲染时都检测新行中是否有折叠标记，有则触发 foldclose
+  -- 不能只在首次执行，因为后续插入的折叠文本（如工具调用结果）也需要折叠
+  local win = state.current_window_id and window_manager.get_window_win(state.current_window_id) or nil
+  _fold_new_markers(buf, lines, win, start_line or state.streaming.message_start_line)
+  s._folded_first_time = true
 
   s._highlight_end = hl_end
   if not s._highlight_start then s._highlight_start = hl_start end
@@ -4291,11 +4341,9 @@ local function _render_streaming_message(window_id)
     _do_incremental_streaming_render(buf, content_text)
   end
 
-  -- 防抖光标跟随：与光标检测合并，每 100ms 最多触发一次
-  if should_check_cursor then
-    _schedule_cursor_follow()
-    s._last_cursor_follow_time = now
-  end
+  -- 光标跟随由调用方统一控制（如 _append_reasoning_folded_to_buffer 和 TOOL_EXECUTION_COMPLETED 等）
+  -- 不在 _render_streaming_message 中触发，避免思考过程插入后立即跳转
+  -- 导致后续工具调用折叠文本插入时 foldclose! 又把光标移走
 end
 -- 暴露给事件回调使用（事件回调闭包中 local function 不可见）
 M._render_streaming_message = _render_streaming_message
@@ -4325,6 +4373,10 @@ function M._append_reasoning_folded_to_buffer(reasoning_text, window_id)
 
   -- 使用 _render_streaming_message 统一渲染（复用 _render_single_message）
   _render_streaming_message(window_id)
+  -- 启动可取消的延迟光标跟随
+  -- 如果后续有工具调用折叠文本插入（TOOL_EXECUTION_COMPLETED），旧定时器会被取消并重启
+  -- 只有最后一次插入完成后才执行跳转
+  _schedule_fold_follow()
 end
 
 --- 在缓冲区末尾插入一个空行（处理换行符数据块）
@@ -4376,6 +4428,12 @@ local function _flush_stream_throttle()
       new_content = (rt ~= "") and { reasoning_content = rt, content = full } or { content = full }
     end
     state.messages[mi].content = new_content
+    -- 缓存折叠文本结束位置，供 _render_single_message 直接使用，避免全文查找
+    if folded_prefix ~= "" then
+      state.messages[mi].fold_end = #folded_prefix - 2
+    else
+      state.messages[mi].fold_end = nil
+    end
 
     -- 防抖保存到 history_manager
     if history_manager.is_initialized() then
@@ -4667,6 +4725,7 @@ end
 M._schedule_cursor_follow = _schedule_cursor_follow
 M._do_cursor_follow = _do_cursor_follow
 M._check_cursor_near_end = _check_cursor_near_end
+M._flush_stream_throttle = _flush_stream_throttle
 
 --- 设置光标跟随缓存变量（供 virtual_input 等外部模块调用）
 --- @param should boolean 是否应该跟随
