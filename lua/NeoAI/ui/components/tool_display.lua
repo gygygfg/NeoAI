@@ -1074,15 +1074,8 @@ local function _build_single_tool_folded_block(r)
   result_str = result_str:gsub("\n", "\n    ")
 
   local display_tool_name = (r.tool_name and r.tool_name ~= "") and r.tool_name or "工具"
-  return "{{{ "
-    .. pack_icon
-    .. " "
-    .. pack_name
-    .. " - "
-    .. icon
-    .. " "
-    .. display_tool_name
-    .. duration_str
+  local header = string.format("%s %s - %s %s%s", pack_icon, pack_name, icon, display_tool_name, duration_str)
+  return "{{{ " .. header
     .. "\n    参数: "
     .. args_str
     .. "\n    结果: "
