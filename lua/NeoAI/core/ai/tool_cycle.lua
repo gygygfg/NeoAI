@@ -2365,30 +2365,25 @@ function M.on_generation_complete(data)
       -- 先触发 GENERATION_COMPLETED 事件（此时 chat_window 的 streaming.message_index 仍然有效），
       -- 再触发 TOOL_LOOP_FINISHED（reset_streaming_state 会清除 message_index）。
       -- 否则 GENERATION_COMPLETED 事件处理中 mi 为 nil，导致纯文本回复无法渲染到聊天窗口。
-      once_display_closed(session_id, function()
-        local s = sessions_table[session_id]
-        if not s then
-          return
-        end
-        if is_shutting_down() then
-          return
-        end
-        pcall(vim.api.nvim_exec_autocmds, "User", {
-          pattern = event_constants.GENERATION_COMPLETED,
-          data = {
-            generation_id = saved_gen_id,
-            response = saved_content,
-            reasoning_text = saved_reasoning,
-            usage = saved_usage,
-            session_id = session_id,
-            window_id = saved_win_id,
-            duration = 0,
-          },
-        })
-        if on_complete then
-          on_complete(true, saved_content, saved_usage)
-        end
-      end)
+      -- 直接触发 GENERATION_COMPLETED 事件（此时 chat_window 的 streaming.message_index 仍然有效），
+      -- 再触发 TOOL_LOOP_FINISHED（reset_streaming_state 会清除 message_index）。
+      -- 注意：不使用 once_display_closed 延迟触发，因为 TOOL_LOOP_FINISHED 会立即调用 reset_streaming_state，
+      -- 延迟后 GENERATION_COMPLETED 中 mi 为 nil，导致纯文本回复无法渲染到聊天窗口。
+      pcall(vim.api.nvim_exec_autocmds, "User", {
+        pattern = event_constants.GENERATION_COMPLETED,
+        data = {
+          generation_id = saved_gen_id,
+          response = saved_content,
+          reasoning_text = saved_reasoning,
+          usage = saved_usage,
+          session_id = session_id,
+          window_id = saved_win_id,
+          duration = 0,
+        },
+      })
+      if on_complete then
+        on_complete(true, saved_content, saved_usage)
+      end
       fire_loop_finished(ss, true, "ai_complete")
       return
     end

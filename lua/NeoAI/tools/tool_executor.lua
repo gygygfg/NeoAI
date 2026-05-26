@@ -600,11 +600,22 @@ function M._continue_execution(
   end
 end
 
+-- 缓存 headless 检测结果：nvim_list_uis() 在会话期间不会变化
+-- 使用惰性求值，仅首次调用时执行 C API 查询
+local _headless_cache = nil
+local function _is_headless()
+  if _headless_cache == nil then
+    local uis = vim.api.nvim_list_uis()
+    _headless_cache = #uis == 0 or vim.env.NVIM_HEADLESS == "1"
+  end
+  return _headless_cache
+end
+
 function M.execute(tool_name, args)
   local result, error_msg, done = nil, nil, false
   local timeout_ms = timeout_state.timeout_ms
   local elapsed_ms = 0
-  local poll_interval_ms = 50
+  local poll_interval_ms = 200  -- 200ms 轮询间隔（工具执行耗时秒级，100ms 不必要）
   local paused_during_wait = 0 -- 等待期间累计的暂停时长
   local was_paused = false
   local pause_check_start = nil
@@ -617,12 +628,8 @@ function M.execute(tool_name, args)
     done = true
   end)
 
-  -- 检测 headless 模式
-  -- 使用 vim.api.nvim_list_uis() 是最可靠的检测方式
-  -- 在 headless 模式下，nvim_list_uis() 返回空表 {}
-  -- 注意：vim.env.NVIM_HEADLESS 可能为 nil，vim.g.colors_name 可能被 colorscheme 插件设置
-  local uis = vim.api.nvim_list_uis()
-  local is_headless = #uis == 0 or vim.env.NVIM_HEADLESS == "1"
+  -- 使用缓存的 headless 检测结果
+  local is_headless = _is_headless()
 
   if is_headless then
     -- headless 模式下使用 vim.wait（能正确处理 vim.schedule 回调）
@@ -1917,4 +1924,5 @@ end
 M.resolve_path = resolve_path
 
 return M
+
 

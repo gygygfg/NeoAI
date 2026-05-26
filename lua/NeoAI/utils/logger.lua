@@ -538,6 +538,38 @@ function M.is_print_debug_enabled()
   return state.config and state.config.print_debug == true
 end
 
+-- 预缓存的调试级别判断（M.log() 中的 level < state.level 本身很快，
+-- 但调用方用 is_debug() 守卫可以避免整个函数调用开销）
+local debug_level_enabled = false
+
+--- 更新缓存的调试级别
+local function update_debug_cache()
+  debug_level_enabled = (LOG_LEVELS.DEBUG >= state.level)
+end
+
+--- 检查是否启用了调试日志（预缓存版本，比每次调 M.log 更轻量）
+--- @return boolean 是否启用调试级别
+function M.is_debug()
+  return debug_level_enabled
+end
+
+-- 在 set_level 后更新缓存
+local _orig_set_level = M.set_level
+function M.set_level(level)
+  _orig_set_level(level)
+  update_debug_cache()
+end
+
+-- 在 initialize 后更新缓存
+local _orig_initialize = M.initialize
+function M.initialize(config)
+  _orig_initialize(config)
+  update_debug_cache()
+end
+
+-- 初始化缓存
+update_debug_cache()
+
 --- 条件输出函数 - 只在详细模式启用时输出
 --- @param message string 消息内容
 --- @param level string|number 日志级别（可选）

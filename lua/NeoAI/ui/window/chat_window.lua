@@ -396,6 +396,7 @@ local function reset_streaming_state()
   s._last_cursor_check_time = nil
   s._save_counter = nil
   s._folded_prefix = nil
+  s._buffer_synced = nil
 end
 
 local function reset_tool_display()
@@ -434,138 +435,11 @@ local function close_tool_display()
   state.tool_display.window_id = nil
 end
 
---- 格式化 table 为多行字符串，强制每个元素换行显示
---- 避免 vim.inspect 将短数组合并为一行
---- @param t table
---- @param indent string 缩进前缀
---- @return string
-local function _format_table_for_fold(t, indent)
-  indent = indent or ""
-  if type(t) == "string" then
-    -- 如果字符串包含换行，使用多行格式
-    if t:find("\n") then
-      local lines = vim.split(t, "\n")
-      local parts = {}
-      for _, line in ipairs(lines) do
-        table.insert(parts, indent .. "  " .. line)
-      end
-      return table.concat(parts, "\n")
-    end
-    return string.format("%q", t)
-  end
-  if type(t) ~= "table" then
-    return tostring(t)
-  end
+-- ========== 消息内容计算（委托给 chat_service 后端执行）==========
 
-  -- 估算 table 大小：如果元素超过 500 个，回退到单行 JSON 格式
-  -- 避免生成超大折叠文本导致性能问题和界面卡顿
-  local count = 0
-  for _ in pairs(t) do
-    count = count + 1
-    if count > 500 then
-      -- 超过 500 个元素，使用 JSON 编码单行显示
-      local ok, encoded = pcall(vim.json.encode, t)
-      if ok then
-        return encoded
-      end
-      break
-    end
-  end
-
-  -- 判断是数组还是字典
-  local is_array = true
-  local max_key = 0
-  for k, _ in pairs(t) do
-    if type(k) ~= "number" or k <= 0 or math.floor(k) ~= k then
-      is_array = false
-      break
-    end
-    if k > max_key then
-      max_key = k
-    end
-  end
-  if is_array and max_key == #t then
-    -- 数组：每个元素换行
-    local parts = { "{" }
-    for i, v in ipairs(t) do
-      local val_str = _format_table_for_fold(v, indent .. "  ")
-      table.insert(parts, indent .. "  " .. val_str .. ",")
-    end
-    table.insert(parts, indent .. "}")
-    return table.concat(parts, "\n")
-  else
-    -- 字典：每个键值对换行
-    local parts = { "{" }
-    -- 排序键
-    local keys = {}
-    for k, _ in pairs(t) do
-      table.insert(keys, k)
-    end
-    table.sort(keys, function(a, b)
-      if type(a) == type(b) then
-        return tostring(a) < tostring(b)
-      end
-      return type(a) < type(b)
-    end)
-    for _, k in ipairs(keys) do
-      local v = t[k]
-      local key_str = type(k) == "string" and k or "[" .. tostring(k) .. "]"
-      local val_str = _format_table_for_fold(v, indent .. "  ")
-      table.insert(parts, indent .. "  " .. key_str .. " = " .. val_str .. ",")
-    end
-    table.insert(parts, indent .. "}")
-    return table.concat(parts, "\n")
-  end
-end
-
---- 截断过长的内容，限制在 200 行以内
---- 如果超过 200 行，只保留前 200 行并添加截断提示
---- 用于折叠文本中的结果渲染，避免超大折叠文本导致界面卡顿
---- @param content string 原始内容
---- @param max_lines number|nil 最大行数，默认 200
---- @return string 截断后的内容
-local function _truncate_content_for_fold(content, max_lines)
-  max_lines = max_lines or 200
-  if not content or content == "" then
-    return content or ""
-  end
-  local lines = vim.split(content, "\n")
-  if #lines <= max_lines then
-    return content
-  end
-  local truncated = {}
-  for i = 1, max_lines do
-    table.insert(truncated, lines[i])
-  end
-  local remaining = #lines - max_lines
-  table.insert(truncated, string.format("... [已截断，剩余 %d 行未显示]", remaining))
-  return table.concat(truncated, "\n")
-end
-
---- 格式化折叠文本 }}} 后的剩余内容（AI 总结正文）
---- 处理 JSON 格式的 content/reasoning_content，返回格式化后的行列表
---- @param content string 剩余内容文本
---- @return table 格式化后的行列表
---- 格式化折叠文本 }}} 后的剩余内容（AI 总结正文）
---- remaining 来自 msg.content.content 中 }}} 之后的纯文本正文，非 JSON
---- @param content string 剩余内容文本
---- @return table 格式化后的行列表
-local function _format_remaining_content(content)
-  if not content or content == "" then
-    return {}
-  end
-  local lines = {}
-  local first = true
-  for mline in content:gmatch("[^\n]+") do
-    if first then
-      table.insert(lines, string.format("🤖 AI: %s", mline))
-      first = false
-    else
-      table.insert(lines, string.format("    %s", mline))
-    end
-  end
-  return lines
-end
+local _format_table_for_fold = chat_service.format_table_for_fold
+local _truncate_content_for_fold = chat_service.truncate_content_for_fold
+local _format_remaining_content = chat_service.format_remaining_content
 
 --- 更新 buffer 中已有的折叠文本内容
 --- 找到 buffer 中第一个 {{{ 到最后一个 }}} 的范围，替换为新的折叠文本
@@ -1068,250 +942,7 @@ end
 --- @param prev_role string|nil 上一条消息的角色
 --- @return table 文本行列表
 function M._render_single_message(msg, prev_role)
-  local lines = {}
-  local role_prefix = msg.role == "user" and "👤 用户:" or "🤖 AI:"
-
-  -- 统一获取 raw_content（支持 Lua table 和字符串两种格式）
-  local raw_content
-  local has_reasoning = false
-  local reasoning_content = ""
-  local main_content = ""
-  -- 检测 JSON 格式的工具调用
-  local has_tool_calls = false
-
-  if type(msg.content) == "table" then
-    -- Lua table 格式：{ reasoning_content = "...", content = "..." }
-    reasoning_content = msg.content.reasoning_content or ""
-    main_content = msg.content.content or ""
-    has_reasoning = reasoning_content ~= ""
-    raw_content = main_content
-  else
-    raw_content = msg.content or ""
-    if type(raw_content) ~= "string" then
-      local ok, encoded = pcall(vim.json.encode, raw_content)
-      raw_content = ok and encoded or tostring(raw_content)
-    end
-
-    -- 尝试解析 JSON 格式（兼容旧数据）
-    -- 优化：跳过明显非 JSON 的内容，避免每 chunk 都做昂贵的 JSON 解析
-    if msg.role == "assistant" then
-      local first_char = type(raw_content) == "string" and raw_content:sub(1, 1) or ""
-      -- 只有以 { 或 [ 开头且不以 {{{ 开头的内容才尝试 JSON 解析
-      if (first_char == "{" or first_char == "[") and not raw_content:find("^{{{") then
-        local json_ok, parsed = pcall(vim.json.decode, raw_content)
-        if json_ok and type(parsed) == "table" then
-          -- 检查是否包含 tool_calls
-          if parsed.tool_calls and type(parsed.tool_calls) == "table" and #parsed.tool_calls > 0 then
-            has_tool_calls = true
-          end
-          if parsed.reasoning_content and parsed.reasoning_content ~= "" then
-            has_reasoning = true
-            reasoning_content = parsed.reasoning_content
-            main_content = parsed.content or ""
-            raw_content = main_content
-          elseif parsed.content and parsed.content ~= "" then
-            main_content = parsed.content
-            raw_content = main_content
-          end
-        end
-      end
-    end
-    -- 如果未通过 JSON 解析设置 main_content，直接使用 raw_content
-    if main_content == "" then
-      main_content = raw_content
-    end
-  end
-
-  -- 确保 raw_content 始终是字符串（防止嵌套 table 导致折叠文本检测失败）
-  if type(raw_content) ~= "string" then
-    local ok, encoded = pcall(vim.json.encode, raw_content)
-    raw_content = ok and encoded or tostring(raw_content)
-  end
-  if type(main_content) ~= "string" then
-    local ok, encoded = pcall(vim.json.encode, main_content)
-    main_content = ok and encoded or tostring(main_content)
-  end
-
-  -- 检查是否是折叠文本（以 {{{ 开头）
-  if msg.role == "assistant" and type(raw_content) == "string" and raw_content:find("^{{{") then
-    -- 先处理 reasoning（如果有）
-    if has_reasoning then
-      -- 一次遍历完成拆分、拼接和判断
-      local reasoning_lines_count = 0
-      local reasoning_total_len = 0
-      local reasoning_first = true
-      for rline in reasoning_content:gmatch("[^\n]+") do
-        reasoning_lines_count = reasoning_lines_count + 1
-        reasoning_total_len = reasoning_total_len + #rline + 1
-        if reasoning_first then
-          reasoning_first = false
-          local has_content = main_content and main_content ~= ""
-          if has_content or reasoning_total_len >= 200 then
-            table.insert(lines, "{{{ 🤔 思考过程")
-            table.insert(lines, "  " .. rline)
-          else
-            table.insert(lines, "🤖 AI: 🤔 思考过程:")
-            table.insert(lines, "    " .. rline)
-          end
-        else
-          if reasoning_total_len >= 200 or (main_content and main_content ~= "") then
-            table.insert(lines, "  " .. rline)
-          else
-            table.insert(lines, "    " .. rline)
-          end
-        end
-      end
-      if reasoning_total_len >= 200 or (main_content and main_content ~= "") then
-        table.insert(lines, "}}}")
-      end
-      table.insert(lines, "")
-    end
-    if not has_reasoning then
-      table.insert(lines, role_prefix)
-    end
-    -- 用 string.reverse 从末尾反向查找最后一个 }}}
-    -- 比 match(".*()}}}") 快，因为从末尾开始匹配
-    local clean_content = raw_content
-    if clean_content:find("\r") then
-      clean_content = clean_content:gsub("\r\n", "\n"):gsub("\r", "\n")
-    end
-    -- 直接使用 msg.fold_end 缓存（由 _flush_stream_throttle / TOOL_EXECUTION_COMPLETED 设置）
-    -- 零查找开销
-    local fold_start = msg.fold_end
-    if fold_start and fold_start > 0 then
-      -- fold_part = 从开头到 }}} 结束（含 }}}）
-      local fold_part = clean_content:sub(1, fold_start + 2)
-      for line in fold_part:gmatch("[^\n]+") do
-        table.insert(lines, line)
-      end
-      local remaining = clean_content:sub(fold_start + 3)
-      remaining = remaining:gsub("^\n+", ""):gsub("\n+$", "")
-      if remaining and remaining ~= "" then
-        table.insert(lines, "")
-        local remaining_lines = _format_remaining_content(remaining)
-        for _, rline in ipairs(remaining_lines) do
-          table.insert(lines, rline)
-        end
-      end
-    else
-      for line in clean_content:gmatch("[^\n]+") do
-        table.insert(lines, line)
-      end
-    end
-    table.insert(lines, "")
-    return lines
-  end
-
-  -- 检查 msg 是否包含 tool_calls 字段（原生 table 结构）
-  if msg.role == "assistant" and msg.tool_calls and type(msg.tool_calls) == "table" and #msg.tool_calls > 0 then
-    table.insert(lines, "{{{ 🔧 工具调用:")
-    for _, tc in ipairs(msg.tool_calls) do
-      local func = tc["function"] or tc.func or {}
-      local tool_name = (func.name or "") ~= "" and func.name or "工具"
-      local args_str = ""
-      if func.arguments then
-        local ok, parsed = pcall(vim.json.decode, func.arguments)
-        if ok and parsed then
-          args_str = vim.inspect(parsed)
-          if #args_str > 100 then
-            args_str = args_str:sub(1, 100) .. "..."
-          end
-        else
-          args_str = func.arguments
-        end
-      end
-      table.insert(lines, string.format("    🔧 %s(%s)", tool_name, args_str))
-    end
-    table.insert(lines, "}}}")
-    if raw_content and raw_content ~= "" then
-      table.insert(lines, "")
-      for _, mline in ipairs(vim.split(raw_content, "\n")) do
-        table.insert(lines, mline)
-      end
-    end
-    table.insert(lines, "")
-    return lines
-  end
-
-  if has_tool_calls then
-    -- 有工具调用的 JSON 格式消息
-    table.insert(lines, "{{{ 🔧 工具调用:")
-    local json_ok, parsed = pcall(vim.json.decode, raw_content)
-    if json_ok and parsed and parsed.tool_calls then
-      for _, tc in ipairs(parsed.tool_calls) do
-        local func = tc["function"] or tc.func or {}
-        local tool_name = (func.name or "") ~= "" and func.name or "工具"
-        local args_str = ""
-        if func.arguments then
-          local ok2, parsed2 = pcall(vim.json.decode, func.arguments)
-          if ok2 and parsed2 then
-            args_str = vim.inspect(parsed2)
-            if #args_str > 100 then
-              args_str = args_str:sub(1, 100) .. "..."
-            end
-          else
-            args_str = func.arguments
-          end
-        end
-        table.insert(lines, string.format("    🔧 %s(%s)", tool_name, args_str))
-      end
-    end
-    table.insert(lines, "}}}")
-    if main_content and main_content ~= "" then
-      table.insert(lines, "")
-      for _, mline in ipairs(vim.split(main_content, "\n")) do
-        table.insert(lines, mline)
-      end
-    end
-    table.insert(lines, "")
-    return lines
-
-
-  if has_reasoning then
-    -- 有思考过程
-    local reasoning_lines = vim.split(reasoning_content, "\n")
-    -- 判断条件：与 _append_reasoning_folded_to_buffer 保持一致
-    -- 只有无正文且短思考（<200字符）才不折叠，否则一律折叠
-    local has_content = main_content and main_content ~= ""
-    local reasoning_text_combined = table.concat(reasoning_lines, " ")
-    local reasoning_short = #reasoning_text_combined < 200
-    local use_folded = has_content or not reasoning_short
-
-    if use_folded then
-      -- 折叠文本格式
-      table.insert(lines, "{{{ 🤔 思考过程")
-      for _, rline in ipairs(reasoning_lines) do
-        table.insert(lines, "  " .. rline)
-      end
-      table.insert(lines, "}}}")
-    else
-      -- 无正文且思考短：直接显示
-      table.insert(lines, role_prefix .. " 🤔 思考过程:")
-      for _, rline in ipairs(reasoning_lines) do
-        table.insert(lines, "    " .. rline)
-      end
-    end
-    if main_content and main_content ~= "" then
-      table.insert(lines, "")
-      for _, mline in ipairs(vim.split(main_content, "\n")) do
-        table.insert(lines, mline)
-      end
-    end
-  elseif main_content and main_content ~= "" then
-    -- 普通消息（有实际内容）：使用 markdown 格式化
-    local formatted_lines = markdown_renderer.format_text(main_content)
-    if #formatted_lines > 0 then
-      table.insert(lines, string.format("%s %s", role_prefix, formatted_lines[1]))
-      for i = 2, #formatted_lines do
-        table.insert(lines, string.format("    %s", formatted_lines[i]))
-      end
-    end
-  else
-    -- 空内容消息，跳过不渲染
-  end
-
-  table.insert(lines, "")
-  return lines
+  return chat_service.render_message(msg, prev_role)
 end
 
 --- 实际执行渲染聊天内容
@@ -2259,36 +1890,9 @@ function M._update_usage_virt_text()
     return
   end
 
-  local prompt_tokens = (usage.prompt_tokens or usage.promptTokens or usage.input_tokens or usage.inputTokens) or 0
-  local completion_tokens = (
-    usage.completion_tokens
-    or usage.completionTokens
-    or usage.output_tokens
-    or usage.outputTokens
-  ) or 0
-  local total_tokens = (usage.total_tokens or usage.totalTokens) or (prompt_tokens + completion_tokens)
-
-  local reasoning_tokens = 0
-  if usage.completion_tokens_details and type(usage.completion_tokens_details) == "table" then
-    reasoning_tokens = usage.completion_tokens_details.reasoning_tokens or 0
-  end
-
-  local usage_text
-  if reasoning_tokens and reasoning_tokens > 0 then
-    usage_text = string.format(
-      "📊 Token 用量: 输入 %d · 输出 %d (思考 %d) · 总计 %d",
-      prompt_tokens,
-      completion_tokens,
-      reasoning_tokens,
-      total_tokens
-    )
-  else
-    usage_text = string.format(
-      "📊 Token 用量: 输入 %d · 输出 %d · 总计 %d",
-      prompt_tokens,
-      completion_tokens,
-      total_tokens
-    )
+  local usage_text = chat_service.build_usage_text(usage)
+  if not usage_text or usage_text == "" then
+    return
   end
 
   -- 先确保缓冲区可修改
@@ -2825,25 +2429,32 @@ function M._setup_event_listeners()
       -- 在修改 buffer 内容之前缓存光标位置
       _check_cursor_near_end()
 
-      if start_line then
-        -- 流式渲染已将内容写入 buffer：只替换从起始行到末尾的内容（确保最终格式一致）
-        _replace_message_in_buffer(buf, start_line, lines, nil)
-      else
-        -- 没有起始行（纯文本增量渲染路径）：追加到缓冲区末尾
-        set_buf_modifiable(buf, true)
-        local lc = get_line_count(buf)
-        vim.api.nvim_buf_set_lines(buf, lc, lc, false, lines)
-        vim.api.nvim_set_option_value("modified", false, { buf = buf })
-        -- 记录起始行
-        state.streaming.message_start_line = lc
-        start_line = lc
+      -- 检查缓冲区是否已通过 _do_full_streaming_render 同步到最终格式
+      -- 如果已同步，跳过全量替换和折叠（避免重复渲染造成闪烁）
+      local buffer_synced = state.streaming._buffer_synced
+        and state.streaming._full_rendered_lines
+        and #lines == state.streaming._full_rendered_lines
+
+      if not buffer_synced then
+        if start_line then
+          -- 流式渲染已将内容写入 buffer：只替换从起始行到末尾的内容（确保最终格式一致）
+          _replace_message_in_buffer(buf, start_line, lines, nil)
+        else
+          -- 没有起始行（纯文本增量渲染路径）：追加到缓冲区末尾
+          set_buf_modifiable(buf, true)
+          local lc = get_line_count(buf)
+          vim.api.nvim_buf_set_lines(buf, lc, lc, false, lines)
+          vim.api.nvim_set_option_value("modified", false, { buf = buf })
+          -- 记录起始行
+          state.streaming.message_start_line = lc
+          start_line = lc
+        end
+
+        -- 折叠新插入的 {{{ ... }}} 折叠区域
+        local win = state.current_window_id and window_manager.get_window_win(state.current_window_id) or nil
+        _fold_new_markers(buf, lines, win, start_line)
       end
 
-      -- 折叠新插入的 {{{ ... }}} 折叠区域
-      local win = state.current_window_id and window_manager.get_window_win(state.current_window_id) or nil
-      _fold_new_markers(buf, lines, win, start_line)
-
-      -- 统一执行流式过程中累积的高亮
       -- 使用 _highlight_start/_highlight_end（由 _do_incremental_streaming_render 和 _do_full_streaming_render 记录）
       local hl_start = state.streaming._highlight_start or start_line
       local hl_end = state.streaming._highlight_end or (start_line + #lines)
@@ -3678,6 +3289,9 @@ function M._setup_event_listeners()
           -- 清除全量渲染缓存，确保下次渲染使用新的折叠文本
           state.streaming._cached_full_lines = nil
           state.streaming._cached_full_hash = nil
+          -- 内容即将变更（工具结果折叠文本插入），标记缓冲区未同步
+          -- 防止 TOOL_EXECUTION_COMPLETED 后紧跟的 GENERATION_COMPLETED 跳过渲染
+          state.streaming._buffer_synced = false
           -- 强制全量渲染：折叠标记必须通过 _render_single_message 渲染，
           -- 以处理 reasoning + fold 组合，并避免增量渲染路径中折叠标记被缩进
           state.streaming._needs_full_render = true
@@ -4140,8 +3754,9 @@ local function _do_full_streaming_render(msg, mi, buf)
   if start_line then
     local old_lines = state.streaming._full_rendered_lines or 0
     local content_changed = content_len ~= cached_len
-    -- 内容未变化且行数未增长：跳过所有 buffer 写入
+    -- 内容未变化且行数未增长：跳过所有 buffer 写入（缓冲区已同步）
     if not content_changed and old_lines > 0 and #lines == old_lines then
+      s._buffer_synced = true
       return
     end
     if not content_changed and old_lines > 0 and #lines > old_lines then
@@ -4161,6 +3776,7 @@ local function _do_full_streaming_render(msg, mi, buf)
       hl_end = append_line + #new_lines
       s._highlight_end = hl_end
       if not s._highlight_start then s._highlight_start = hl_start end
+      s._buffer_synced = true
       return
     end
     -- 全量替换：合并为一次 nvim_buf_set_lines 调用
@@ -4192,6 +3808,9 @@ local function _do_full_streaming_render(msg, mi, buf)
   state.streaming._full_rendered_lines = #lines
   state.streaming._rendered_text = ""
   state.streaming._rendered_line_count = 0
+
+  -- 缓冲区已通过 _render_single_message 同步，后续 GENERATION_COMPLETED 可跳过全量替换
+  s._buffer_synced = true
 
   -- 每次全量渲染时都检测新行中是否有折叠标记，有则触发 foldclose
   -- 不能只在首次执行，因为后续插入的折叠文本（如工具调用结果）也需要折叠
@@ -4318,6 +3937,9 @@ local function _do_incremental_streaming_render(buf, content_text)
   if not s._highlight_start then
     s._highlight_start = start_line or 0
   end
+  -- 增量渲染使用 virt_text 格式，不是最终 _render_single_message 格式，
+  -- 标记缓冲区未同步，确保 GENERATION_COMPLETED 执行全量替换
+  state.streaming._buffer_synced = false
 end
 --- 使用 _render_single_message 渲染当前流式消息并替换缓冲区中的对应行
 --- 统一流式渲染和历史渲染的显示格式

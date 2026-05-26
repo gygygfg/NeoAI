@@ -1,19 +1,23 @@
---- NeoAI 聊天服务（后端）
+--- NeoAI 聊天服务（后端 + 计算层）
 --- 前后端分离架构中的后端服务层
 --- 职责：会话管理、消息历史管理、AI 生成请求调度、事件分发、自动命名会话
+---       消息内容计算（格式化、渲染行生成、内容提取等 CPU 密集型操作）
 ---
 --- 依赖关系：
 ---   - 会话管理 → history_manager
 ---   - AI 生成 → engine（仅触发生成，不参与生成流程编排）
 ---   - 自动命名 → http_utils + config_merger
+---   - 消息计算 → markdown_renderer（纯文本格式化）
 
 local M = {}
+
 
 local logger = require("NeoAI.utils.logger")
 local event_constants = require("NeoAI.core.events")
 local engine = require("NeoAI.core.ai.engine")
 local history_manager = require("NeoAI.core.history.manager")
 local shutdown_flag = require("NeoAI.core.shutdown_flag")
+local markdown_renderer = require("NeoAI.ui.components.markdown_renderer")
 
 -- ========== 状态 ==========
 
@@ -487,6 +491,500 @@ function M.save()
   history_manager._save()
 end
 
+-- ========== 消息内容计算（CPU 密集型操作，在后台线程执行）==========
+
+--- 构建助理消息内容（JSON 格式）
+--- 将正文和思考内容合并为可用于存储的 table 格式
+--- @param content_text string 正文内容
+--- @param reasoning_text string|nil 思考内容
+--- @return table { content = string, reasoning_content = string|nil }
+function M.build_assistant_content(content_text, reasoning_text)
+  if reasoning_text and reasoning_text ~= "" then
+    return {
+      content = content_text or "",
+      reasoning_content = reasoning_text,
+    }
+  end
+  return content_text or ""
+end
+
+--- 格式化 table 为多行字符串，强制每个元素换行显示
+--- 避免 vim.inspect 将短数组合并为一行
+--- @param t table
+--- @param indent string 缩进前缀
+--- @return string
+function M.format_table_for_fold(t, indent)
+  indent = indent or ""
+  if type(t) == "string" then
+    -- 如果字符串包含换行，使用多行格式
+    if t:find("\n") then
+      local lines = vim.split(t, "\n")
+      local parts = {}
+      for _, line in ipairs(lines) do
+        table.insert(parts, indent .. "  " .. line)
+      end
+      return table.concat(parts, "\n")
+    end
+    return string.format("%q", t)
+  end
+  if type(t) ~= "table" then
+    return tostring(t)
+  end
+
+  -- 估算 table 大小：如果元素超过 500 个，回退到单行 JSON 格式
+  -- 避免生成超大折叠文本导致性能问题和界面卡顿
+  local count = 0
+  for _ in pairs(t) do
+    count = count + 1
+    if count > 500 then
+      -- 超过 500 个元素，使用 JSON 编码单行显示
+      local ok, encoded = pcall(vim.json.encode, t)
+      if ok then
+        return encoded
+      end
+      break
+    end
+  end
+
+  -- 判断是数组还是字典
+  local is_array = true
+  local max_key = 0
+  for k, _ in pairs(t) do
+    if type(k) ~= "number" or k <= 0 or math.floor(k) ~= k then
+      is_array = false
+      break
+    end
+    if k > max_key then
+      max_key = k
+    end
+  end
+  if is_array and max_key == #t then
+    -- 数组：每个元素换行
+    local parts = { "{" }
+    for i, v in ipairs(t) do
+      local val_str = M.format_table_for_fold(v, indent .. "  ")
+      table.insert(parts, indent .. "  " .. val_str .. ",")
+    end
+    table.insert(parts, indent .. "}")
+    return table.concat(parts, "\n")
+  else
+    -- 字典：每个键值对换行
+    local parts = { "{" }
+    -- 排序键
+    local keys = {}
+    for k, _ in pairs(t) do
+      table.insert(keys, k)
+    end
+    table.sort(keys, function(a, b)
+      if type(a) == type(b) then
+        return tostring(a) < tostring(b)
+      end
+      return type(a) < type(b)
+    end)
+    for _, k in ipairs(keys) do
+      local v = t[k]
+      local key_str = type(k) == "string" and k or "[" .. tostring(k) .. "]"
+      local val_str = M.format_table_for_fold(v, indent .. "  ")
+      table.insert(parts, indent .. "  " .. key_str .. " = " .. val_str .. ",")
+    end
+    table.insert(parts, indent .. "}")
+    return table.concat(parts, "\n")
+  end
+end
+
+--- 截断过长的内容，限制在 max_lines 行以内
+--- 如果超过 max_lines 行，只保留前 max_lines 行并添加截断提示
+--- 用于折叠文本中的结果渲染，避免超大折叠文本导致界面卡顿
+--- @param content string 原始内容
+--- @param max_lines number|nil 最大行数，默认 200
+--- @return string 截断后的内容
+function M.truncate_content_for_fold(content, max_lines)
+  max_lines = max_lines or 200
+  if not content or content == "" then
+    return content or ""
+  end
+  local lines = vim.split(content, "\n")
+  if #lines <= max_lines then
+    return content
+  end
+  local truncated = {}
+  for i = 1, max_lines do
+    table.insert(truncated, lines[i])
+  end
+  local remaining = #lines - max_lines
+  table.insert(truncated, string.format("... [已截断，剩余 %d 行未显示]", remaining))
+  return table.concat(truncated, "\n")
+end
+
+--- 格式化折叠文本 }}} 后的剩余内容（AI 总结正文）
+--- remaining 来自 msg.content.content 中 }}} 之后的纯文本正文，非 JSON
+--- @param content string 剩余内容文本
+--- @return table 格式化后的行列表
+function M.format_remaining_content(content)
+  if not content or content == "" then
+    return {}
+  end
+  local lines = {}
+  local first = true
+  for mline in content:gmatch("[^\n]+") do
+    if first then
+      table.insert(lines, string.format("🤖 AI: %s", mline))
+      first = false
+    else
+      table.insert(lines, string.format("    %s", mline))
+    end
+  end
+  return lines
+end
+
+--- 将单条消息渲染为文本行列表（纯计算，无 buffer/window 交互）
+--- 注意：返回的每一行都不包含 \n 换行符，由调用方逐行写入缓冲区
+--- @param msg table 消息对象 {role, content}
+--- @param prev_role string|nil 上一条消息的角色
+--- @return table 文本行列表
+function M.render_message(msg, prev_role)
+  local lines = {}
+  local role_prefix = msg.role == "user" and "👤 用户:" or "🤖 AI:"
+
+  -- 统一获取 raw_content（支持 Lua table 和字符串两种格式）
+  local raw_content
+  local has_reasoning = false
+  local reasoning_content = ""
+  local main_content = ""
+  -- 检测 JSON 格式的工具调用
+  local has_tool_calls = false
+
+  if type(msg.content) == "table" then
+    -- Lua table 格式：{ reasoning_content = "...", content = "..." }
+    reasoning_content = msg.content.reasoning_content or ""
+    main_content = msg.content.content or ""
+    has_reasoning = reasoning_content ~= ""
+    raw_content = main_content
+  else
+    raw_content = msg.content or ""
+    if type(raw_content) ~= "string" then
+      local ok, encoded = pcall(vim.json.encode, raw_content)
+      raw_content = ok and encoded or tostring(raw_content)
+    end
+
+    -- 尝试解析 JSON 格式（兼容旧数据）
+    -- 优化：跳过明显非 JSON 的内容，避免每 chunk 都做昂贵的 JSON 解析
+    if msg.role == "assistant" then
+      local first_char = type(raw_content) == "string" and raw_content:sub(1, 1) or ""
+      -- 只有以 { 或 [ 开头且不以 {{{ 开头的内容才尝试 JSON 解析
+      if (first_char == "{" or first_char == "[") and not raw_content:find("^{{{") then
+        local json_ok, parsed = pcall(vim.json.decode, raw_content)
+        if json_ok and type(parsed) == "table" then
+          -- 检查是否包含 tool_calls
+          if parsed.tool_calls and type(parsed.tool_calls) == "table" and #parsed.tool_calls > 0 then
+            has_tool_calls = true
+          end
+          if parsed.reasoning_content and parsed.reasoning_content ~= "" then
+            has_reasoning = true
+            reasoning_content = parsed.reasoning_content
+            main_content = parsed.content or ""
+            raw_content = main_content
+          elseif parsed.content and parsed.content ~= "" then
+            main_content = parsed.content
+            raw_content = main_content
+          end
+        end
+      end
+    end
+    -- 如果未通过 JSON 解析设置 main_content，直接使用 raw_content
+    if main_content == "" then
+      main_content = raw_content
+    end
+  end
+
+  -- 确保 raw_content 始终是字符串（防止嵌套 table 导致折叠文本检测失败）
+  if type(raw_content) ~= "string" then
+    local ok, encoded = pcall(vim.json.encode, raw_content)
+    raw_content = ok and encoded or tostring(raw_content)
+  end
+  if type(main_content) ~= "string" then
+    local ok, encoded = pcall(vim.json.encode, main_content)
+    main_content = ok and encoded or tostring(main_content)
+  end
+
+  -- 检查是否是折叠文本（以 {{{ 开头）
+  if msg.role == "assistant" and type(raw_content) == "string" and raw_content:find("^{{{") then
+    -- 先处理 reasoning（如果有）
+    if has_reasoning then
+      -- 一次遍历完成拆分、拼接和判断
+      local reasoning_lines_count = 0
+      local reasoning_total_len = 0
+      local reasoning_first = true
+      for rline in reasoning_content:gmatch("[^\n]+") do
+        reasoning_lines_count = reasoning_lines_count + 1
+        reasoning_total_len = reasoning_total_len + #rline + 1
+        if reasoning_first then
+          reasoning_first = false
+          local has_content = main_content and main_content ~= ""
+          if has_content or reasoning_total_len >= 200 then
+            table.insert(lines, "{{{ 🤔 思考过程")
+            table.insert(lines, "  " .. rline)
+          else
+            table.insert(lines, "🤖 AI: 🤔 思考过程:")
+            table.insert(lines, "    " .. rline)
+          end
+        else
+          if reasoning_total_len >= 200 or (main_content and main_content ~= "") then
+            table.insert(lines, "  " .. rline)
+          else
+            table.insert(lines, "    " .. rline)
+          end
+        end
+      end
+      if reasoning_total_len >= 200 or (main_content and main_content ~= "") then
+        table.insert(lines, "}}}")
+      end
+      table.insert(lines, "")
+    end
+    if not has_reasoning then
+      table.insert(lines, role_prefix)
+    end
+    -- 用 string.reverse 从末尾反向查找最后一个 }}}
+    local clean_content = raw_content
+    if clean_content:find("\r") then
+      clean_content = clean_content:gsub("\r\n", "\n"):gsub("\r", "\n")
+    end
+    -- 直接使用 msg.fold_end 缓存
+    local fold_start = msg.fold_end
+    if fold_start and fold_start > 0 then
+      -- fold_part = 从开头到 }}} 结束（含 }}}）
+      local fold_part = clean_content:sub(1, fold_start + 2)
+      for line in fold_part:gmatch("[^\n]+") do
+        table.insert(lines, line)
+      end
+      local remaining = clean_content:sub(fold_start + 3)
+      remaining = remaining:gsub("^\n+", ""):gsub("\n+$", "")
+      if remaining and remaining ~= "" then
+        table.insert(lines, "")
+        local remaining_lines = M.format_remaining_content(remaining)
+        for _, rline in ipairs(remaining_lines) do
+          table.insert(lines, rline)
+        end
+      end
+    else
+      for line in clean_content:gmatch("[^\n]+") do
+        table.insert(lines, line)
+      end
+    end
+    table.insert(lines, "")
+    return lines
+  end
+
+  -- 检查 msg 是否包含 tool_calls 字段（原生 table 结构）
+  if msg.role == "assistant" and msg.tool_calls and type(msg.tool_calls) == "table" and #msg.tool_calls > 0 then
+    table.insert(lines, "{{{ 🔧 工具调用:")
+    for _, tc in ipairs(msg.tool_calls) do
+      local func = tc["function"] or tc.func or {}
+      local tool_name = (func.name or "") ~= "" and func.name or "工具"
+      local args_str = ""
+      if func.arguments then
+        local ok, parsed = pcall(vim.json.decode, func.arguments)
+        if ok and parsed then
+          args_str = vim.inspect(parsed)
+          if #args_str > 100 then
+            args_str = args_str:sub(1, 100) .. "..."
+          end
+        else
+          args_str = func.arguments
+        end
+      end
+      table.insert(lines, string.format("    🔧 %s(%s)", tool_name, args_str))
+    end
+    table.insert(lines, "}}}")
+    if raw_content and raw_content ~= "" then
+      table.insert(lines, "")
+      for _, mline in ipairs(vim.split(raw_content, "\n")) do
+        table.insert(lines, mline)
+      end
+    end
+    table.insert(lines, "")
+    return lines
+  end
+
+  if has_tool_calls then
+    -- 有工具调用的 JSON 格式消息
+    table.insert(lines, "{{{ 🔧 工具调用:")
+    local json_ok, parsed = pcall(vim.json.decode, raw_content)
+    if json_ok and parsed and parsed.tool_calls then
+      for _, tc in ipairs(parsed.tool_calls) do
+        local func = tc["function"] or tc.func or {}
+        local tool_name = (func.name or "") ~= "" and func.name or "工具"
+        local args_str = ""
+        if func.arguments then
+          local ok2, parsed2 = pcall(vim.json.decode, func.arguments)
+          if ok2 and parsed2 then
+            args_str = vim.inspect(parsed2)
+            if #args_str > 100 then
+              args_str = args_str:sub(1, 100) .. "..."
+            end
+          else
+            args_str = func.arguments
+          end
+        end
+        table.insert(lines, string.format("    🔧 %s(%s)", tool_name, args_str))
+      end
+    end
+    table.insert(lines, "}}}")
+    if main_content and main_content ~= "" then
+      table.insert(lines, "")
+      for _, mline in ipairs(vim.split(main_content, "\n")) do
+        table.insert(lines, mline)
+      end
+    end
+    table.insert(lines, "")
+    return lines
+  end
+
+  if has_reasoning then
+    -- 有思考过程
+    local reasoning_lines = vim.split(reasoning_content, "\n")
+    -- 判断条件：只有无正文且短思考（<200字符）才不折叠，否则一律折叠
+    local has_content = main_content and main_content ~= ""
+    local reasoning_text_combined = table.concat(reasoning_lines, " ")
+    local reasoning_short = #reasoning_text_combined < 200
+    local use_folded = has_content or not reasoning_short
+
+    if use_folded then
+      -- 折叠文本格式
+      table.insert(lines, "{{{ 🤔 思考过程")
+      for _, rline in ipairs(reasoning_lines) do
+        table.insert(lines, "  " .. rline)
+      end
+      table.insert(lines, "}}}")
+    else
+      -- 无正文且思考短：直接显示
+      table.insert(lines, role_prefix .. " 🤔 思考过程:")
+      for _, rline in ipairs(reasoning_lines) do
+        table.insert(lines, "    " .. rline)
+      end
+    end
+    if main_content and main_content ~= "" then
+      table.insert(lines, "")
+      for _, mline in ipairs(vim.split(main_content, "\n")) do
+        table.insert(lines, mline)
+      end
+    end
+  elseif main_content and main_content ~= "" then
+    -- 普通消息（有实际内容）：使用 markdown 格式化
+    local formatted_lines = markdown_renderer.format_text(main_content)
+    if #formatted_lines > 0 then
+      table.insert(lines, string.format("%s %s", role_prefix, formatted_lines[1]))
+      for i = 2, #formatted_lines do
+        table.insert(lines, string.format("    %s", formatted_lines[i]))
+      end
+    end
+  else
+    -- 空内容消息，跳过不渲染
+  end
+
+  table.insert(lines, "")
+  return lines
+end
+
+--- 从响应中提取内容字符串
+--- @param response any 响应数据（字符串或 table）
+--- @return string
+function M.extract_response_content(response)
+  if type(response) == "string" then
+    return response
+  end
+  if type(response) == "table" then
+    if response.content then
+      return response.content
+    end
+    if response.text then
+      return response.text
+    end
+  end
+  return tostring(response)
+end
+
+--- 构建 token 用量文本
+--- @param usage table token 用量数据
+--- @return string|nil 格式化的用量文本，无有效数据时返回 nil
+function M.build_usage_text(usage)
+  if not usage or not next(usage) then
+    return nil
+  end
+
+  local prompt_tokens = (usage.prompt_tokens or usage.promptTokens or usage.input_tokens or usage.inputTokens) or 0
+  local completion_tokens = (
+    usage.completion_tokens
+    or usage.completionTokens
+    or usage.output_tokens
+    or usage.outputTokens
+  ) or 0
+  local total_tokens = (usage.total_tokens or usage.totalTokens) or (prompt_tokens + completion_tokens)
+
+  local reasoning_tokens = 0
+  if usage.completion_tokens_details and type(usage.completion_tokens_details) == "table" then
+    reasoning_tokens = usage.completion_tokens_details.reasoning_tokens or 0
+  end
+
+  if reasoning_tokens and reasoning_tokens > 0 then
+    return string.format(
+      "📊 Token 用量: 输入 %d · 输出 %d (思考 %d) · 总计 %d",
+      prompt_tokens,
+      completion_tokens,
+      reasoning_tokens,
+      total_tokens
+    )
+  else
+    return string.format(
+      "📊 Token 用量: 输入 %d · 输出 %d · 总计 %d",
+      prompt_tokens,
+      completion_tokens,
+      total_tokens
+    )
+  end
+end
+
+--- 构建保存到历史记录的最终内容
+--- 将响应内容与折叠文本合并，返回可用于历史保存的格式
+--- @param response_content string|table 基础响应内容
+--- @param reasoning_text string 思考内容
+--- @param tool_display_state table|nil 工具调用状态 { active, results, folded_saved }
+--- @param last_assistant_content string|table|nil 最后一条 assistant 消息的完整内容
+--- @return table|nil { content, reasoning_content } 或 nil
+function M.build_final_content_for_history(response_content, reasoning_text, tool_display_state, last_assistant_content)
+  local has_tool_results = tool_display_state and tool_display_state.active and #(tool_display_state.results or {}) > 0
+  local folded_saved = tool_display_state and tool_display_state.folded_saved
+
+  local final_content = response_content
+  if has_tool_results or folded_saved then
+    if last_assistant_content then
+      -- last_assistant_content 可能是 table（含 reasoning_content 和 content 字段）或字符串
+      if type(last_assistant_content) == "table" then
+        final_content = last_assistant_content
+      elseif last_assistant_content ~= "" then
+        final_content = last_assistant_content
+      end
+    end
+  end
+
+  -- 检查是否为空
+  local is_empty = false
+  if type(final_content) == "table" then
+    is_empty = (final_content.content == nil or final_content.content == "")
+      and (final_content.reasoning_content == nil or final_content.reasoning_content == "")
+  else
+    is_empty = final_content == ""
+  end
+  if is_empty and reasoning_text == "" then
+    return nil
+  end
+
+  return {
+    content = final_content,
+    reasoning_content = reasoning_text,
+  }
+end
+
 -- ========== 清理 ==========
 
 function M.is_initialized()
@@ -503,3 +1001,5 @@ function M.shutdown()
 end
 
 return M
+
+

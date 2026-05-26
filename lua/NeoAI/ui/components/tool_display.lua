@@ -7,6 +7,7 @@ local M = {}
 local logger = require("NeoAI.utils.logger")
 local window_manager = require("NeoAI.ui.window.window_manager")
 local tool_pack = require("NeoAI.tools.tool_pack")
+local chat_service = require("NeoAI.core.ai.chat_service")
 
 -- ========== 私有状态 ==========
 
@@ -67,90 +68,12 @@ end
 
 --- 格式化 table 为多行字符串
 local function _format_table_for_fold(t, indent)
-  indent = indent or ""
-  if type(t) == "string" then
-    if t:find("\n") then
-      local lines = vim.split(t, "\n")
-      local parts = {}
-      for _, line in ipairs(lines) do
-        table.insert(parts, indent .. "  " .. line)
-      end
-      return table.concat(parts, "\n")
-    end
-    return string.format("%q", t)
-  end
-  if type(t) ~= "table" then
-    return tostring(t)
-  end
-
-  local count = 0
-  for _ in pairs(t) do
-    count = count + 1
-    if count > 500 then
-      local ok, encoded = pcall(vim.json.encode, t)
-      if ok then
-        return encoded
-      end
-      break
-    end
-  end
-
-  local is_array = true
-  local max_key = 0
-  for k, _ in pairs(t) do
-    if type(k) ~= "number" or k <= 0 or math.floor(k) ~= k then
-      is_array = false
-      break
-    end
-    if k > max_key then
-      max_key = k
-    end
-  end
-  if is_array and max_key == #t then
-    local parts = { "{" }
-    for i, v in ipairs(t) do
-      table.insert(parts, indent .. "  " .. _format_table_for_fold(v, indent .. "  ") .. ",")
-    end
-    table.insert(parts, indent .. "}")
-    return table.concat(parts, "\n")
-  else
-    local parts = { "{" }
-    local keys = {}
-    for k, _ in pairs(t) do
-      table.insert(keys, k)
-    end
-    table.sort(keys, function(a, b)
-      if type(a) == type(b) then
-        return tostring(a) < tostring(b)
-      end
-      return type(a) < type(b)
-    end)
-    for _, k in ipairs(keys) do
-      local v = t[k]
-      local key_str = type(k) == "string" and k or "[" .. tostring(k) .. "]"
-      table.insert(parts, indent .. "  " .. key_str .. " = " .. _format_table_for_fold(v, indent .. "  ") .. ",")
-    end
-    table.insert(parts, indent .. "}")
-    return table.concat(parts, "\n")
-  end
+  return chat_service.format_table_for_fold(t, indent)
 end
 
 --- 截断过长的内容
 local function _truncate_content_for_fold(content, max_lines)
-  max_lines = max_lines or 200
-  if not content or content == "" then
-    return content or ""
-  end
-  local lines = vim.split(content, "\n")
-  if #lines <= max_lines then
-    return content
-  end
-  local truncated = {}
-  for i = 1, max_lines do
-    table.insert(truncated, lines[i])
-  end
-  table.insert(truncated, string.format("... [已截断，剩余 %d 行未显示]", #lines - max_lines))
-  return table.concat(truncated, "\n")
+  return chat_service.truncate_content_for_fold(content, max_lines)
 end
 
 --- JSON 转义字符渲染
