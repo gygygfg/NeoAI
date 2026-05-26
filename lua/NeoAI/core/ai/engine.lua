@@ -425,15 +425,18 @@ function _handle_stream_chunk(generation_id, data, processor, params)
   local shared = state_manager.get_shared() or {}
   local sid = shared.session_id or processor.session_id or (params and params.session_id)
   local wid = shared.window_id or processor.window_id or (params and params.window_id)
-  if result.content then
-    vim.api.nvim_exec_autocmds("User", {
-      pattern = event_constants.STREAM_CHUNK,
-      data = { generation_id = generation_id, chunk = result.content, session_id = sid, window_id = wid, is_final = false },
-    })
-  end
-  if result.reasoning_content then
-    http_utils.push_reasoning_content(generation_id, result.reasoning_content, processor, params)
-  end
+  -- 将完整 result table 传给 STREAM_CHUNK 事件，前端直接使用 Lua table，无需 JSON 解析
+  -- result 包含: content (string), reasoning_content (string), tool_calls (table), is_final (boolean)
+  vim.api.nvim_exec_autocmds("User", {
+    pattern = event_constants.STREAM_CHUNK,
+    data = {
+      generation_id = generation_id,
+      chunk = result,
+      session_id = sid,
+      window_id = wid,
+      is_final = false,
+    },
+  })
   if result.tool_calls and #result.tool_calls > 0 then
     vim.api.nvim_exec_autocmds("User", {
       pattern = event_constants.TOOL_CALL_DETECTED,

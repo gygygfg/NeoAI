@@ -58,6 +58,7 @@ local function _check_cursor_near_end(window_id)
 end
 
 --- 执行光标跟随：将光标跳转到缓冲区末尾并滚动到窗口最底部
+--- 使用 nvim_buf_line_count + nvim_win_set_cursor API
 --- 使用协程共享表 should_follow 判断是否应该跟随
 local function _do_cursor_follow()
   local should = state_manager.get_shared_value("should_follow", false)
@@ -71,23 +72,10 @@ local function _do_cursor_follow()
   if not win or not vim.api.nvim_win_is_valid(win) then return end
   local buf = vim.api.nvim_win_get_buf(win)
   if not buf or not vim.api.nvim_buf_is_valid(buf) then return end
+  -- 使用 API 跳转到 buffer 末尾
   local lc = vim.api.nvim_buf_line_count(buf)
-  local last_line = vim.api.nvim_buf_get_lines(buf, lc - 1, lc, false)[1] or ""
-  if last_line == "}}}" then
-    local saved_foldlevel = vim.api.nvim_get_option_value("foldlevel", { win = win })
-    vim.api.nvim_set_option_value("foldlevel", 999, { win = win })
-    pcall(vim.api.nvim_set_option_value, "modifiable", true, { buf = buf })
-    pcall(vim.api.nvim_set_option_value, "readonly", false, { buf = buf })
-    vim.api.nvim_buf_set_lines(buf, lc, lc, false, { "" })
-    lc = vim.api.nvim_buf_line_count(buf)
+  if lc > 0 then
     pcall(vim.api.nvim_win_set_cursor, win, { lc, 0 })
-    vim.schedule(function()
-      if win and vim.api.nvim_win_is_valid(win) then
-        vim.api.nvim_set_option_value("foldlevel", saved_foldlevel, { win = win })
-      end
-    end)
-  else
-    pcall(vim.api.nvim_win_set_cursor, win, { lc, #last_line })
   end
   pcall(vim.api.nvim_win_call, win, function()
     vim.cmd("normal! zb")

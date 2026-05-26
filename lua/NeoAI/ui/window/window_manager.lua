@@ -40,6 +40,30 @@ local state = {
 
 local _blocked_buffers = {}
 
+--- 从指定 buffer 分离所有已附加的 LSP client
+--- 遍历所有 LSP clients，检查是否管理该 buffer，比 vim.lsp.get_clients({ bufnr = buf }) 更可靠
+--- @param buf number buffer 句柄
+local function detach_all_lsp_clients(buf)
+  if not buf or not vim.api.nvim_buf_is_valid(buf) then
+    return
+  end
+  pcall(vim.diagnostic.disable, buf)
+  pcall(function()
+    -- 遍历所有 LSP clients，不依赖 bufnr 过滤
+    local all_clients = vim.lsp.get_clients()
+    for _, client in ipairs(all_clients) do
+      -- 检查 client 是否管理该 buffer
+      -- 使用 pcall 保护，某些 client 可能不支持此操作
+      local ok, is_attached = pcall(function()
+        return client.attached_buffers and client.attached_buffers[buf]
+      end)
+      if ok and is_attached then
+        pcall(vim.lsp.buf_detach_client, buf, client.id)
+      end
+    end
+  end)
+end
+
 function M.block_lsp_for_buffer(buf, label)
   if not buf or not vim.api.nvim_buf_is_valid(buf) then
     return
@@ -51,14 +75,9 @@ function M.block_lsp_for_buffer(buf, label)
   _blocked_buffers[buf] = true
 
   pcall(vim.api.nvim_buf_set_var, buf, "neoai_no_lsp", true)
-  pcall(vim.diagnostic.disable, buf)
-  -- 使用 pcall 保护，避免在 Neovim 退出过程中调用 LSP API 出错
-  pcall(function()
-    local clients = vim.lsp.get_clients({ bufnr = buf })
-    for _, client in ipairs(clients) do
-      pcall(vim.lsp.buf_detach_client, buf, client.id)
-    end
-  end)
+  -- 使用更可靠的 detach 方式：遍历所有 clients 检查 attached_buffers
+  detach_all_lsp_clients(buf)
+
   local augroup_name = "NeoAIBlockLSP_buf_" .. tostring(buf)
   pcall(vim.api.nvim_del_augroup_by_name, augroup_name)
   local group = vim.api.nvim_create_augroup(augroup_name, { clear = true })
@@ -66,18 +85,12 @@ function M.block_lsp_for_buffer(buf, label)
     group = group,
     buffer = buf,
     callback = function()
-      -- 检查 Neovim 是否正在退出，避免在退出过程中调度 defer_fn 导致死循环
+      -- 检查 Neovim 是否正在退出
       local ok, tp = pcall(vim.api.nvim_get_current_tabpage)
       if not ok or not tp then
         return
       end
-
-      pcall(vim.diagnostic.disable, buf)
-      pcall(function()
-        for _, client in ipairs(vim.lsp.get_clients({ bufnr = buf })) do
-          pcall(vim.lsp.buf_detach_client, buf, client.id)
-        end
-      end)
+      detach_all_lsp_clients(buf)
     end,
     desc = "阻止 LSP 附加" .. (label and ("到 " .. label) or ""),
   })
@@ -101,11 +114,9 @@ function M.initialize(config)
       end
       local ok, neoai_no_lsp = pcall(vim.api.nvim_buf_get_var, buf, "neoai_no_lsp")
       if ok and neoai_no_lsp then
-        local client_id = args.data and args.data.client_id
-        if client_id then
-          pcall(vim.lsp.buf_detach_client, buf, client_id)
-        end
-        pcall(vim.diagnostic.disable, buf)
+        -- 使用 detach_all_lsp_clients 替代手动获取 client_id
+        -- 因为 args.data.client_id 在不同 Neovim 版本中可能字段名不同
+        detach_all_lsp_clients(buf)
       end
     end,
     desc = "阻止 LSP 附加到 NeoAI 的 buffer",

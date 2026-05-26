@@ -89,10 +89,8 @@ function M.register_listeners(state, callbacks)
     callback = function() refresh_chat(); refresh_tree() end,
   })
 
-  vim.api.nvim_create_autocmd("User", {
-    pattern = Events.MESSAGE_ADDED,
-    callback = refresh_chat,
-  })
+  -- MESSAGE_ADDED 不再触发全量渲染（由 add_message 的增量追加替代）
+  -- 如需全量刷新，使用 chat_window.render_chat() 手动触发
 
   -- 对话轮次添加后刷新树（用户在聊天中发送消息后，tree 自动更新）
   vim.api.nvim_create_autocmd("User", {
