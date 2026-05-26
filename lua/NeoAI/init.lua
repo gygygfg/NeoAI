@@ -305,6 +305,22 @@ function M.setup(user_config)
   -- 不要在 init.lua 中重复注册，避免退出时多次保存导致死锁
   -- 同时避免在退出过程中调用 cancel_generation（会尝试取消 HTTP 请求和触发事件）
 
+  -- VimLeave 清理：释放所有跨实例锁和临时目录
+  vim.api.nvim_create_autocmd("VimLeave", {
+    group = vim.api.nvim_create_augroup("NeoAICleanup", { clear = true }),
+    callback = function()
+      local ok_async, async_orch = pcall(require, "NeoAI.core.ai.async_orchestrator")
+      if ok_async and async_orch then
+        pcall(async_orch.shutdown)
+      end
+      local ok_tp, tp = pcall(require, "NeoAI.core.ai.thread_pool")
+      if ok_tp and tp then
+        pcall(tp.shutdown)
+      end
+    end,
+    desc = "NeoAI: 清理所有跨实例锁和临时目录",
+  })
+
   -- 注册文件编码自动命令
   vim.api.nvim_create_autocmd("BufRead", {
     pattern = { "*.log", "sessions.json" },

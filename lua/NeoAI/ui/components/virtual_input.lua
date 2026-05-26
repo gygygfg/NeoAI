@@ -25,6 +25,11 @@ local state = {
   _updating = false, -- 防抖标志
   _hidden = false, -- 是否被隐藏（而非关闭）
   _parent_buf = nil, -- 父窗口的 buffer，用于 BufEnter 检测
+  -- 命令历史
+  _history = {}, -- 历史记录列表
+  _history_index = 0, -- 当前浏览位置（0 = 不在浏览历史）
+  _history_max = 100, -- 最大历史记录数
+  _history_draft = nil, -- 开始浏览历史时保存的临时草稿
 }
 
 --- 初始化
@@ -540,6 +545,98 @@ local function _convert_relative_paths(content)
   return "当前目录：" .. cwd .. "\n" .. content
 end
 
+--- 保存内容到历史记录
+local function _save_to_history(content)
+  content = vim.trim(content)
+  if content == "" then
+    return
+  end
+  -- 去重：如果和最近一条相同，不重复保存
+  if #state._history > 0 and state._history[#state._history] == content then
+    state._history_index = 0
+    return
+  end
+  table.insert(state._history, content)
+  -- 限制历史记录数量
+  if #state._history > state._history_max then
+    table.remove(state._history, 1)
+  end
+  state._history_index = 0
+end
+
+--- 浏览历史：上一条
+local function _history_prev()
+  if #state._history == 0 then
+    return
+  end
+  if state._history_index == 0 then
+    -- 开始浏览历史，保存当前输入作为临时草稿
+    state._history_draft = M.get_content()
+    state._history_index = #state._history
+  elseif state._history_index > 1 then
+    state._history_index = state._history_index - 1
+  end
+  _set_input_content(state._history[state._history_index])
+end
+
+--- 浏览历史：下一条
+local function _history_next()
+  if #state._history == 0 or state._history_index == 0 then
+    return
+  end
+  if state._history_index < #state._history then
+    state._history_index = state._history_index + 1
+    _set_input_content(state._history[state._history_index])
+  else
+    -- 回到最新，恢复临时草稿
+    state._history_index = 0
+    _set_input_content(state._history_draft or "")
+    state._history_draft = nil
+  end
+end
+
+--- 设置输入区域的内容（兼容 inline 和 float 模式）
+local function _set_input_content(content)
+  content = content or ""
+  if state.mode == "float" then
+    if state.float_buf and vim.api.nvim_buf_is_valid(state.float_buf) then
+      local lines = vim.split(content, "\n")
+      vim.api.nvim_buf_set_lines(state.float_buf, 0, -1, false, lines)
+      -- 将光标移到末尾
+      if state.float_win and vim.api.nvim_win_is_valid(state.float_win) then
+        local last_line = #lines
+        vim.api.nvim_win_set_cursor(state.float_win, { last_line, #(lines[last_line] or "") })
+      end
+    end
+  else
+    -- inline 模式
+    if not state.buf or not vim.api.nvim_buf_is_valid(state.buf) then
+      return
+    end
+    local line_count = vim.api.nvim_buf_line_count(state.buf)
+    local input_start = math.max(1, line_count - state.input_line_count + 1)
+    local lines = vim.split(content, "\n")
+    -- 确保有足够的行
+    if #lines < state.input_line_count then
+      for _ = #lines + 1, state.input_line_count do
+        table.insert(lines, "")
+      end
+    elseif #lines > state.input_line_count then
+      -- 截断多余行
+      local trimmed = {}
+      for i = 1, state.input_line_count do
+        trimmed[i] = lines[i] or ""
+      end
+      lines = trimmed
+    end
+    vim.api.nvim_buf_set_lines(state.buf, input_start - 1, line_count, false, lines)
+    M._update_placeholder()
+    -- 将光标移到第一行末尾
+    local cur_win = vim.api.nvim_get_current_win()
+    vim.api.nvim_win_set_cursor(cur_win, { input_start, #(lines[1] or "") })
+  end
+end
+
 --- 提交输入
 function M.submit()
   if not state.active then
@@ -550,6 +647,9 @@ function M.submit()
   if content == "" then
     return
   end
+
+  -- 保存到历史记录（保存原始内容，路径转换前的）
+  _save_to_history(content)
 
   -- 将相对路径转换为绝对路径后再传给 AI
   content = _convert_relative_paths(content)
@@ -654,6 +754,16 @@ function M._setup_float_keymaps()
     -- 重置光标位置到行首
     vim.api.nvim_win_set_cursor(vim.api.nvim_get_current_win(), { 1, 2 })
   end, { buffer = buf, noremap = true, silent = true, desc = "清空输入" })
+
+  -- 历史浏览：上箭头
+  vim.keymap.set("i", "<Up>", function()
+    _history_prev()
+  end, { buffer = buf, noremap = true, silent = true, desc = "上一条历史" })
+
+  -- 历史浏览：下箭头
+  vim.keymap.set("i", "<Down>", function()
+    _history_next()
+  end, { buffer = buf, noremap = true, silent = true, desc = "下一条历史" })
 
   -- 在浮动输入框的 normal 模式下也绑定 chat 窗口的快捷键
   -- 这样用户在输入框里按 q/r/m 等键也能操作聊天窗口
@@ -765,6 +875,9 @@ function M._submit_float()
     return
   end
 
+  -- 保存到历史记录（保存原始内容，路径转换前的）
+  _save_to_history(content)
+
   -- 将相对路径转换为绝对路径后再传给 AI
   content = _convert_relative_paths(content)
 
@@ -850,6 +963,20 @@ function M._setup_keymaps()
   vim.keymap.set("i", "<C-u>", function()
     M.clear()
   end, { buffer = buf, noremap = true, silent = true, desc = "清空输入" })
+
+  -- 历史浏览：上箭头
+  vim.keymap.set("i", "<Up>", function()
+    if M._cursor_in_input_area() then
+      _history_prev()
+    end
+  end, { buffer = buf, noremap = true, silent = true, desc = "上一条历史" })
+
+  -- 历史浏览：下箭头
+  vim.keymap.set("i", "<Down>", function()
+    if M._cursor_in_input_area() then
+      _history_next()
+    end
+  end, { buffer = buf, noremap = true, silent = true, desc = "下一条历史" })
 end
 
 --- 检查光标是否在输入区域

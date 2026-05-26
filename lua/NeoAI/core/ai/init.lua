@@ -14,6 +14,7 @@
 ---   tool_cycle      - 只做工具循环，模糊匹配和单次工具请求委托给 tool_executor
 ---   chat_service    - 会话管理入口，自动命名从 engine 移入
 
+
 local M = {}
 
 M.engine = require("NeoAI.core.ai.engine")
@@ -23,15 +24,26 @@ M.tool_cycle = require("NeoAI.core.ai.tool_cycle")
 M.sub_agent_engine = require("NeoAI.core.ai.sub_agent_engine")
 M.chat_service = require("NeoAI.core.ai.chat_service")
 
+-- 多线程优化模块（v3.0+）
+-- thread_pool: 线程池管理器，自动选择最优执行后端（子进程/主线程）
+-- async_orchestrator: 异步编排器，管理 AI→工具→AI 的异步循环
+M.thread_pool = require("NeoAI.core.ai.thread_pool")
+M.async_orchestrator = require("NeoAI.core.ai.async_orchestrator")
+
 --- 初始化所有 AI 子模块
 --- @param options table 配置选项
 function M.initialize(options)
   M.chat_service.initialize(options)
+  -- 初始化线程池和异步编排器（pre-warm）
+  M.thread_pool.initialize(options or {})
+  M.async_orchestrator.initialize(options or {})
 end
 
 --- 关闭所有 AI 子模块
 function M.shutdown()
   M.chat_service.shutdown()
+  M.async_orchestrator.shutdown()
+  M.thread_pool.cancel_all()
 end
 
 return M

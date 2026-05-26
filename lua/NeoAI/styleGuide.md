@@ -28,16 +28,12 @@ NeoAI/
 │   │
 │   └── ai/                     # AI 交互
 │       ├── init.lua            # AI 模块入口
-│       ├── ai_engine.lua       # AI 引擎（事件驱动，协调子模块）
+│       ├── engine.lua          # AI 引擎（事件驱动，协调子模块），旧名 ai_engine.lua
 │       ├── chat_service.lua    # 后端聊天服务（前后端分离的后端入口）
-│       ├── http_client.lua     # HTTP 客户端（流式/非流式请求）
-│       ├── request_adapter.lua # 请求适配器（多 API 提供商格式转换）
-│       ├── request_builder.lua # 请求构建器（构建 API 请求体、格式化消息）
-│       ├── response_retry.lua  # 响应重试模块（检测异常并触发重试）
-│       ├── session_manager.lua # 工具循环会话管理器（管理工具循环的会话状态）
-│       ├── stream_processor.lua# 流式处理器（处理流式数据块、reasoning 节流）
-│       ├── generation_handler.lua # 生成完成处理器（usage 累积、消息构建）
-│       ├── tool_orchestrator.lua# 工具调用编排器
+│       ├── request_handler.lua # 请求处理器：请求构建（Builder）+ API 适配（Adapter）+ 响应重试（Retry）
+│       │                      # 合并了旧 request_builder / stream_processor / generation_handler
+│       │                      #           session_manager / request_adapter / response_retry / http_client
+│       ├── tool_cycle.lua      # 工具循环引擎（事件驱动架构），旧名 tool_orchestrator.lua
 │       └── sub_agent_engine.lua# 子 agent 引擎（独立 AI 引擎实例）
 │
 ├── ui/                         # 用户界面
@@ -55,7 +51,12 @@ NeoAI/
 │   │   ├── reasoning_display.lua# 思考过程显示
 │   │   ├── virtual_input.lua   # 虚拟输入框组件
 │   │   ├── approval_config_editor.lua # 审批配置编辑器
-│   │   └── sub_agent_monitor.lua # 子 agent 状态监控悬浮窗
+│   │   ├── sub_agent_monitor.lua # 子 agent 状态监控悬浮窗
+│   │   ├── floating_text.lua   # 悬浮文本窗口组件
+│   │   ├── model_selector.lua  # 模型选择器组件
+│   │   ├── markdown_renderer.lua # Markdown 渲染器
+│   │   ├── tool_display.lua    # 工具执行状态显示
+│   │   └── pty_terminal.lua    # 伪终端模拟组件
 │   │
 │   └── handlers/               # 事件处理器
 │       ├── tree_handlers.lua   # 树界面处理器（基于 history/manager）
@@ -73,11 +74,14 @@ NeoAI/
 │   └── builtin/                # 内置工具
 │       ├── file_tools.lua      # 文件操作工具
 │       ├── general_tools.lua   # 通用工具
+│       ├── git_tools.lua       # Git 操作工具
 │       ├── log_tools.lua       # 日志工具
 │       ├── neovim_lsp.lua      # LSP 工具
 │       ├── neovim_tree.lua     # 文件树工具
 │       ├── shell_tools.lua     # Shell 命令执行工具（伪终端+PID监控）
 │       ├── plan_executor.lua   # 执行计划工具
+│       ├── confirm_file_change.lua # 文件变更确认工具
+│       ├── vim_cmd_tools.lua   # Vim 命令执行工具
 │       └── tool_helpers.lua    # 工具定义辅助模块（define_tool）
 │
 ├── utils/                      # 工具库
@@ -109,13 +113,9 @@ NeoAI/
     ├── test_init_modules.lua   # 模块初始化测试
     ├── test_tools.lua          # 工具测试：tool_registry, tool_executor, tool_validator, tool_pack
     ├── test_utils.lua          # 工具库测试：utils_common, utils_logger, utils_json 等
-    ├── test_ai_core.lua        # AI 核心测试：ai_engine, chat_service, response_retry
+    ├── test_ai_core.lua        # AI 核心测试：engine, chat_service, request_handler
     ├── test_sub_agent.lua      # 子 agent 创建与管理测试
-    ├── test_sub_agent_debug.lua# 子 agent 调试测试
     ├── test_integration.lua    # 端到端集成测试
-    ├── test_user_data.lua      # 用户数据处理测试
-    ├── test_user_data2.lua     # 用户数据处理测试 2
-    ├── test_user_data3.lua     # 用户数据处理测试 3
     └── test_tree_connectors.lua# 树连接器测试
 ```
 
@@ -132,7 +132,7 @@ config_merger.process_config(config)      ← 一步完成：验证 → 合并 �
     ▼
 core.initialize(config)                   ← 初始化核心模块
   ├── config_module.initialize(config)    ← 配置模块（keymap_manager + merger.set_config）
-  ├── ai_engine.initialize()              ← AI 引擎（初始化子模块、注册事件监听）
+  ├── engine.initialize()                ← AI 引擎（初始化子模块、注册事件监听），旧名 ai_engine.lua
   ├── history_manager.initialize()        ← 历史管理器（唯一数据源，含 cache/persistence/saver）
   └── chat_service.initialize()           ← 后端聊天服务（前后端分离）
     │
@@ -160,7 +160,7 @@ tools.initialize(config)                  ← 初始化工具系统（传入完�
   └── _load_external_tools()              ← 加载外部工具（可选）
     │
     ▼
-vim.schedule → ai_engine.set_tools(tools_map)  ← 延迟注入工具注册表到 AI 引擎
+tool_cycle.set_tools(tools_map)            ← 延迟注入工具注册表到工具循环引擎，旧名 tool_orchestrator
     │
     ▼
 register_commands()                       ← 注册 :NeoAIOpen 等命令
@@ -192,6 +192,9 @@ _auto_run_tests(config)                   ← 可选：VimEnter 后延迟运行�
 5. 退出事件由 `history/manager.lua` 内部的 `VimLeavePre` 统一处理（同步保存），`init.lua` 不再重复注册
 6. `config_module.initialize()` 中不再调用 `state.initialize()`（state 的状态切片功能已移除）
 7. AI 引擎使用闭包内 `state` 表管理内部状态（`active_generations`, `is_generating` 等），共享数据通过协程上下文传递
+8. `ai_engine.lua` → `engine.lua`：重命名并精简为纯粹的事件驱动协调器
+9. `tool_orchestrator.lua` → `tool_cycle.lua`：重命名以反映其工具循环调度职责
+10. 旧 `request_builder.lua` / `stream_processor.lua` / `generation_handler.lua` / `session_manager.lua` / `request_adapter.lua` / `response_retry.lua` / `http_client.lua` 合并为 `request_handler.lua`
 
 ---
 
@@ -250,7 +253,7 @@ require("NeoAI").setup({
 - 提供对外接口：`open_neoai()`, `close_all()`, `get_session_manager()`, `get_ai_engine()`, `get_tools()`, `get_keymap_manager()`
 - 注册命令：`:NeoAIOpen`, `:NeoAIClose`, `:NeoAITree`, `:NeoAIChat`, `:NeoAIKeymaps`, `:NeoAIChatStatus`, `:NeoAITest`
 - 注册全局快捷键：`open_tree`, `open_chat`, `close_all`, `toggle_ui`（由 `config.keymaps.global` 配置）
-- 工具系统初始化后，通过 `vim.schedule` 延迟将工具注册表注入 AI 引擎（`ai_engine.set_tools(tools_map)`）
+- 工具系统初始化后，通过 `vim.schedule` 延迟将工具注册表注入工具循环引擎（`tool_cycle.set_tools(tools_map)`）
 - 支持 `config.test.auto_test` 自动运行测试（VimEnter 后延迟执行）
 - 注册 `BufRead` 自动命令确保 `.log` 和 `sessions.json` 文件编码为 utf-8
 - 使用 `config_merger.process_config()` 替代直接调用 `default_config`，`default_config.lua` 只负责定义默认配置
@@ -293,9 +296,9 @@ require("NeoAI").setup({
 
 ### `core/init.lua` — 核心模块入口
 
-|- 初始化 `config_module`（含 keymap_manager + merger.set_config）、`ai_engine`、`history_manager`（新版 history/）、`chat_service`
+|- 初始化 `config_module`（含 keymap_manager + merger.set_config）、`engine`（旧名 ai_engine）、`history_manager`（新版 history/）、`chat_service`
 |- 所有模块间通信通过 Neovim 原生事件系统（`nvim_exec_autocmds`/`nvim_create_autocmd`）
-|- 提供 `get_ai_engine()`, `get_keymap_manager()`, `get_history_manager()`, `get_config()`
+|- 提供 `get_ai_engine()`（保留兼容、返回 engine）、`get_keymap_manager()`, `get_history_manager()`, `get_config()`
 |- `get_config()` 返回闭包内 `_config` 引用（由 setup 传入的完整合并配置）
 |- `get_session_manager()` 保留向后兼容，返回 `nil`
 
@@ -335,24 +338,19 @@ require("NeoAI").setup({
 
 ### `core/ai/init.lua` — AI 模块入口
 
-|- 统一导出 AI 模块的所有子模块：ai_engine, http_client, request_adapter, tool_orchestrator, chat_service
+|- 统一导出 AI 模块的所有子模块：engine（旧名 ai_engine）, request_handler, tool_cycle（旧名 tool_orchestrator）, chat_service
 |- `initialize(options)` — 初始化 chat_service
 |- `shutdown()` — 关闭所有 AI 子模块
 
-### `core/ai/ai_engine.lua` — AI 引擎（精简版）
+### `core/ai/engine.lua` — AI 引擎（事件驱动协调器）
 
-|- **核心职责**：AI 生成流程编排、事件调度、工具管理
-|- 请求构建委托给 `request_builder`
-|- 流式处理委托给 `stream_processor`
-|- 重试逻辑委托给 `response_retry`
-|- 工具循环委托给 `tool_orchestrator`
-|- HTTP 请求委托给 `http_client`
-|- 生成完成处理委托给 `generation_handler`
-|- 工具循环会话管理委托给 `session_manager`
+|- **核心职责**：AI 生成流程编排、事件调度、工具管理，精简为纯粹的事件驱动协调器
+|- 请求构建、流式处理、重试、生成完成处理、会话管理、HTTP 请求均委托给 `request_handler`
+|- 工具循环委托给 `tool_cycle`
 |- 子 agent 请求委托给 `sub_agent_engine`
 |- 使用闭包内 `state` 表管理内部状态（initialized, is_generating, active_generations 等）
 |- 协程上下文：`generate_response()` 创建协程上下文，将共享变量写入 `shared` 表，后续所有子调用通过 `state_manager.get_shared()` 直接访问
-|- `set_tools(tools)` — 将工具注册表注入 AI 引擎，同时注册到 tool_registry 并更新 request_builder 的工具定义
+|- `set_tools(tools)` — 将工具注册表注入引擎，同时注册到 tool_registry 并更新 tool_cycle 的工具定义
 |- `cancel_generation()` — 取消当前生成，设置 shared 表的 stop_requested/user_cancelled 标志，取消所有 HTTP 请求
 |- 幂等保护：`_cancel_processed` 标志防止多次按停止键时重复触发取消事件
 
@@ -364,63 +362,30 @@ require("NeoAI").setup({
 | 1. 统一的消息发送/响应接口（`send_message()`）
 | 2. 会话管理（创建、切换、删除）
 | 3. 消息历史管理（读写、上下文构建、原始消息获取）
-| 4. AI 生成请求调度（调用 ai_engine.generate_response）
+| | 4. AI 生成请求调度（调用 engine.generate_response）
 | 5. 事件分发（向后端模块广播事件，不直接通知 UI）
 |- `send_message(params)` 封装完整流程：获取/创建会话 → 构建上下文 → 调用 AI 引擎 → 通过事件通知前端
 |- `cancel_generation()` — 直接取消 HTTP 请求并设置停止标志，然后触发取消事件
 |- 使用闭包内 `state` 表管理状态（initialized, pending_user_messages）
 
-### `core/ai/http_utils.lua` — HTTP 工具函数
+### `utils/http_utils.lua` — HTTP 工具函数
 
-|- 从 `http_client.lua` 提取的公共函数
+|- 从 `core/ai/http_client.lua` 提取的公共函数，现位于 `utils/` 目录
 |- 请求去重：基于 generation_id + suffix 的哈希比对，TTL 3 秒
 |- URL 编码/解码
 |- JSON 处理辅助
 
-### `core/ai/request_builder.lua` — 请求构建器
+### `core/ai/request_handler.lua` — 统一请求处理器
 
-|- 构建 AI API 请求体
-|- 格式化消息（role/content 列表）
-|- 构建工具结果消息
-|- 使用闭包内变量管理 tool_definitions 和 first_request 状态
-|- tool_call_counter 是模块内部计数器，保留在闭包内
-
-### `core/ai/stream_processor.lua` — 流式处理器
-
-|- 创建流式处理器实例
-|- 处理流式数据块
-|- 管理 reasoning 节流（80ms 间隔，避免高频事件触发）
-|- 过滤有效工具调用
-
-### `core/ai/generation_handler.lua` — 生成完成处理器
-
-|- 从 `ai_engine.lua` 提取，减轻其负担
-|- 累积 usage 信息（支持多种字段名：prompt_tokens/promptTokens/input_tokens 等）
-|- 消息构建
-|- 事件触发
-
-### `core/ai/session_manager.lua` — 工具循环会话管理器
-
-|- 从 `tool_orchestrator.lua` 提取，减轻其负担
-|- 创建会话状态对象（session_id, window_id, generation_id, phase 等）
-|- 会话状态注册、查询、清理
-|- `sync_stop_from_shared()` — 从 shared 表同步 stop_requested 到会话状态
-
-### `core/ai/sub_agent_engine.lua` — 子 agent 引擎
-
-|- 独立的 AI 引擎实例，用于执行子 agent 任务
-|- 拥有独立的会话管理、工具调用循环和状态管理
-|- 通过事件系统与主 agent 通信
-
-### `core/ai/response_retry.lua` — 响应重试模块
-
-|- 检测 AI 响应异常（内容重复/截断/空响应）并触发重试
-|- 支持指数退避策略：1s, 2s, 4s, 8s, 16s
-|- `max_retries = 5`
-|- `is_summary_content(content)` — 判断 AI 返回的内容是否为总结性质（含总结类关键词时视为正常结束）
-|- `is_repeated_content(content)` — 检测内容重复
-|- `is_truncated_content(content)` — 检测内容截断
-|- `detect_abnormal_response(content, tool_calls, opts)` — 统一异常检测入口
+|- **核心职责**：合并旧 `request_builder.lua` + `stream_processor.lua` + `generation_handler.lua` + `session_manager.lua` + `request_adapter.lua` + `response_retry.lua` + `http_client.lua` 七个模块的职责
+|- 构建 AI API 请求体（消息格式化、工具定义注入）
+|- 流式数据处理（数据块解析、reasoning 节流、工具调用过滤）
+|- HTTP 请求管理（发送、取消、连接池）
+|- 响应处理（usage 累积、消息构建、事件触发）
+|- 重试逻辑（内容重复/截断/空响应检测，指数退避 1s/2s/4s/8s/16s）
+|- 请求去重（基于 generation_id + suffix 的哈希比对，TTL 3 秒）
+|- 会话状态管理（session_id, window_id, generation_id, phase 等注册与清理）
+|- 使用闭包内 `state` 表管理内部状态
 
 ### `core/history/` — 新版历史管理（替代旧 `core/history_manager.lua`）
 
@@ -678,7 +643,7 @@ chat_service.send_message(params)              ← 后端统一入口
     ├── 构建上下文消息列表
     │
     ▼
-ai_engine.generate_response(messages, params)  ← AI 引擎生成
+engine.generate_response(messages, params)  ← AI 引擎生成
     │
     ▼
 AI响应完成后（GENERATION_COMPLETED 事件）：
@@ -718,43 +683,42 @@ AI响应完成后（GENERATION_COMPLETED 事件）：
 NeoAI:send_message 事件
     │
     ▼
-ai_engine.handle_send_message(data)
+engine.handle_send_message(data)
     │
     ├── 从 history_manager 获取消息历史
     ├── 添加用户消息
     ├── 触发 NeoAI:user_message_sent
     │
     ▼
-ai_engine.generate_response(messages, params)
+engine.generate_response(messages, params)
     │
     ├── 创建协程上下文（写入 shared 表：session_id, generation_id 等）
-    ├── request_builder.format_messages()      ← 格式化消息
-    ├── request_builder.build_request()        ← 构建请求体（含工具信息）
+    ├── request_handler.format_messages()        ← 格式化消息
+    ├── request_handler.build_request()          ← 构建请求体（含工具信息）
     ├── 触发 NeoAI:generation_started
     │
     ▼
     ├── 流式模式 (request.stream == true)
     │   ├── 触发 NeoAI:stream_started
-    │   ├── stream_processor.create_processor()
-    │   ├── http_client.send_stream_request()
+    │   ├── request_handler.send_stream_request()
     │   │   ├── on_chunk → _handle_stream_chunk()
-    │   │   │   ├── stream_processor.process_chunk()
+    │   │   │   ├── request_handler.process_chunk()
     │   │   │   ├── 触发 NeoAI:reasoning_content (思考内容，80ms 节流)
     │   │   │   ├── 触发 NeoAI:stream_chunk (普通内容)
     │   │   │   └── 触发 NeoAI:tool_call_detected (工具调用)
     │   │   └── on_complete → _handle_stream_end()
-    │   │       ├── 检测异常响应（response_retry.detect_abnormal_response）
-    │   │       ├── 如有工具调用 → tool_orchestrator.start_async_loop()
+    │   │       ├── 检测异常响应（request_handler.detect_abnormal_response）
+    │   │       ├── 如有工具调用 → tool_cycle.start_async_loop()
     │   │       ├── 否则触发 NeoAI:stream_completed
     │   │       └── _finalize_generation()
     │   └── on_error → 重试或触发错误事件
     │
     └── 非流式模式
-        ├── http_client.send_request()
+        ├── request_handler.send_request()
         ├── handle_ai_response()
         │   ├── 提取 content / reasoning_content / tool_calls
         │   ├── 检测异常响应
-        │   ├── 如有工具调用 → tool_orchestrator.start_async_loop()
+        │   ├── 如有工具调用 → tool_cycle.start_async_loop()
         │   └── _finalize_generation()
         └── 错误处理 → 重试或触发错误事件
 ```
@@ -765,7 +729,7 @@ ai_engine.generate_response(messages, params)
 模型返回 tool_calls
     │
     ▼
-tool_orchestrator.start_async_loop()
+tool_cycle.start_async_loop()
     │
     ├── 触发 NeoAI:tool_loop_started
     │
@@ -786,7 +750,7 @@ tool_orchestrator.start_async_loop()
 触发 NeoAI:tool_result_received
     │
     ▼
-ai_engine.handle_tool_result(data)
+engine.handle_tool_result(data)
     │
     ├── 清理重复 tool 消息
     ├── 如 is_final_round → 清理末尾 tool_calls 避免 API 报错
@@ -939,7 +903,7 @@ vim.api.nvim_create_autocmd("User", {
 除了事件机制，AI 生成流程中的模块间通信还通过**协程上下文**实现：
 
 ```lua
--- 在 ai_engine.generate_response() 中创建上下文
+-- 在 engine.generate_response() 中创建上下文
 local ctx = state_manager.create_context({
   session_id = session_id,
   generation_id = generation_id,
@@ -958,7 +922,7 @@ shared.generation_id = generation_id
 
 -- 在协程上下文中执行请求
 state_manager.with_context(ctx, function()
-  -- 子模块（http_client, stream_processor, tool_orchestrator 等）
+  -- 子模块（request_handler, tool_cycle 等）
   -- 通过 state_manager.get_shared() 直接访问共享变量
   local shared = state_manager.get_shared()
   local sid = shared.session_id
@@ -1123,17 +1087,17 @@ end)
 | 流式错误     | `NeoAI:stream_error`         | 最多重试 3 次                          |
 | 工具执行错误 | `NeoAI:tool_execution_error` | 返回错误结果给模型                     |
 | 网络错误     | `NeoAI:generation_error`     | 自动重试                               |
-| 响应异常     | `NeoAI:generation_error`     | 指数退避重试（由 response_retry 处理） |
+| 响应异常     | `NeoAI:generation_error`     | 指数退避重试（由 request_handler 处理） |
 
 ---
 
 ## 设计原则
 
 1. **事件驱动**：模块间通过 Neovim 原生事件系统（`nvim_exec_autocmds`/`nvim_create_autocmd`）通信，避免直接依赖
-2. **职责单一**：每个模块只负责一个领域的功能，AI 引擎已拆分为 ai_engine/http_utils/request_builder/stream_processor/generation_handler/session_manager/sub_agent_engine 等子模块
+2. **职责单一**：每个模块只负责一个领域的功能，AI 引擎已拆分为 engine/request_handler/tool_cycle/sub_agent_engine 等子模块
 3. **配置集中**：所有配置在 `default_config.lua` 中定义，`core/config/merger.lua` 的 `process_config()` 一步完成验证→合并→清理→初始化日志
 4. **闭包状态隔离**：每个模块使用自己的闭包 `state` 表管理内部状态，不再依赖全局状态切片。协程内通过 `state_manager.create_context()` 的 shared 表共享临时数据
-5. **前后端分离**：`core/ai/chat_service.lua` 作为统一后端入口，前端只调用 chat_service 的公开方法，不直接调用 ai_engine 或 history_manager
+5. **前后端分离**：`core/ai/chat_service.lua` 作为统一后端入口，前端只调用 chat_service 的公开方法，不直接调用 engine 或 history_manager
 6. **防抖持久化**：会话数据使用 `history/saver.lua` 的 300ms 防抖保存（事件驱动），按会话分组去重合并
 7. **单一数据源**：`core/history/manager.lua` 是唯一的会话数据源，旧版 `session_manager` 已删除
 8. **安全调用**：跨模块依赖使用 `pcall` 保护
@@ -1349,7 +1313,7 @@ return M
 -- core/events.lua 中统一定义
 local M = {}
 M.GENERATION_STARTED = "NeoAI:generation_started"
--- 使用位置注释：-- 使用位置: ai_engine.lua, chat_window.lua
+-- 使用位置注释：-- 使用位置: engine.lua, chat_window.lua
 
 -- 触发事件
 vim.api.nvim_exec_autocmds("User", {
@@ -1374,7 +1338,7 @@ vim.api.nvim_create_autocmd("User", {
 
 | 类别         | 规范         | 示例                                 |
 | ------------ | ------------ | ------------------------------------ |
-| 文件名       | snake_case   | `ai_engine.lua`, `tool_registry.lua` |
+| 文件名       | snake_case   | `engine.lua`, `tool_registry.lua` |
 | 目录名       | 小写英文     | `core/`, `tools/`, `builtin/`        |
 | 测试文件     | `test_` 前缀 | `test_ai_core.lua`, `test_tools.lua` |
 | 内置工具模块 | 语义化名称   | `file_tools.lua`, `shell_tools.lua`  |
@@ -1411,8 +1375,8 @@ init.lua
 ```
 
 - `core/` 模块**不依赖** `ui/` 或 `tools/`
-- `ui/` 模块通过 `core/ai/chat_service` 与后端交互，不直接调用 `ai_engine` 或 `history_manager`
-- `tools/` 模块通过 `tool_registry` 注册，通过 `tool_executor` 执行
+- `ui/` 模块通过 `core/ai/chat_service` 与后端交互，不直接调用 `engine` 或 `history_manager`
+- `tools/` 模块通过 `tool_registry` 注册，通过 `tool_cycle` 执行
 - `utils/` 为纯工具函数，**不依赖**项目其他模块
 - 跨模块依赖统一使用 `pcall` 保护，避免加载失败导致崩溃
 

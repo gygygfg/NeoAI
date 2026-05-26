@@ -597,17 +597,21 @@ local function _check_cursor_near_end()
   return near_end
 end
 
+
 --- 执行光标跟随：将光标跳转到缓冲区末尾并滚动到窗口最底部
 --- 使用 nvim_buf_line_count + nvim_win_set_cursor API
 --- 不手动处理折叠标记，让 Neovim 的 fold 行为自然处理光标位置
 --- @param should_follow boolean|nil 是否应该跟随（由 _schedule_cursor_follow 在调用时捕获传入）
+--- @param force boolean|nil 是否强制跟随（true 时忽略 should_follow 检查，直接执行）
 --- 不依赖 state.should_follow，避免延迟执行时被 CursorMoved 监听器重置
-local function _do_cursor_follow(should_follow)
-  if should_follow == nil then
-    should_follow = state.should_follow
-  end
-  if not should_follow then
-    return
+local function _do_cursor_follow(should_follow, force)
+  if not force then
+    if should_follow == nil then
+      should_follow = state.should_follow
+    end
+    if not should_follow then
+      return
+    end
   end
   if not state.current_window_id then
     return
@@ -641,21 +645,24 @@ end
 --- 安排光标跟随
 --- 始终通过 vim.schedule 延迟执行，等待渲染（折叠计算、高亮等）完成后再移动光标
 --- @param delay_ms number|nil 延迟毫秒数，默认 0（使用 vim.schedule 下一个 tick 执行）
+--- @param force boolean|nil 是否强制跟随（true 时忽略 should_follow 检查，直接执行）
 --- 内容写入后立即调用（delay_ms=0），工具调用悬浮窗打开后传 150ms
 --- 注意：调用方必须在修改 buffer 内容之前调用 _check_cursor_near_end() 缓存光标状态
 --- 此函数不再重新检测光标位置，直接使用协程共享表 should_follow 缓存值
 --- 将 should_follow 值捕获到闭包中，避免 vim.schedule 延迟执行时
 --- state.should_follow 被 CursorMoved 监听器重置为 false
-local function _schedule_cursor_follow(delay_ms)
+local function _schedule_cursor_follow(delay_ms, force)
   if not state.current_window_id then
     return
   end
-  if not state.should_follow then
-    -- 光标不在后5行内（已在 buffer 内容变化前检测并缓存），不跟随
-    return
+  if not force then
+    if not state.should_follow then
+      -- 光标不在后5行内（已在 buffer 内容变化前检测并缓存），不跟随
+      return
+    end
   end
   -- 将 should_follow 值捕获到闭包中，避免延迟执行时被 CursorMoved 监听器重置
-  local should_follow = state.should_follow
+  local should_follow = force or state.should_follow
   delay_ms = delay_ms or 0
   if delay_ms > 0 then
     -- 防抖模式：取消旧定时器，启动新定时器
@@ -686,7 +693,12 @@ local function _schedule_cursor_follow(delay_ms)
     -- 确保 Neovim 在当前 tick 完成 buffer 内容写入、折叠计算和 extmark 渲染
     -- 避免在渲染未完成时移动光标导致位置错误
     vim.schedule(function()
-      _do_cursor_follow(should_follow)
+      local t = state.stream_throttle.timer
+      if t then
+        t:stop()
+      end
+      state.stream_throttle.buffer = ""
+      state.stream_throttle.pending = false
     end)
   end
 end
@@ -846,6 +858,7 @@ function M.open(session_id, window_id, branch_id)
     state.current_window_id = nil
     state.current_session_id = nil
     state.chat_buf = nil
+    _chat_buf = nil
     state.messages = {}
     state.last_usage = nil
     state.usage_extmark_id = nil
@@ -1191,7 +1204,7 @@ function M._render_single_message(msg, prev_role)
 
   -- 检查 msg 是否包含 tool_calls 字段（原生 table 结构）
   if msg.role == "assistant" and msg.tool_calls and type(msg.tool_calls) == "table" and #msg.tool_calls > 0 then
-    table.insert(lines, role_prefix .. " 🔧 工具调用:")
+    table.insert(lines, "{{{ 🔧 工具调用:")
     for _, tc in ipairs(msg.tool_calls) do
       local func = tc["function"] or tc.func or {}
       local tool_name = (func.name or "") ~= "" and func.name or "工具"
@@ -1209,6 +1222,7 @@ function M._render_single_message(msg, prev_role)
       end
       table.insert(lines, string.format("    🔧 %s(%s)", tool_name, args_str))
     end
+    table.insert(lines, "}}}")
     if raw_content and raw_content ~= "" then
       table.insert(lines, "")
       for _, mline in ipairs(vim.split(raw_content, "\n")) do
@@ -1221,7 +1235,7 @@ function M._render_single_message(msg, prev_role)
 
   if has_tool_calls then
     -- 有工具调用的 JSON 格式消息
-    table.insert(lines, role_prefix .. " 🔧 工具调用:")
+    table.insert(lines, "{{{ 🔧 工具调用:")
     local json_ok, parsed = pcall(vim.json.decode, raw_content)
     if json_ok and parsed and parsed.tool_calls then
       for _, tc in ipairs(parsed.tool_calls) do
@@ -1242,6 +1256,7 @@ function M._render_single_message(msg, prev_role)
         table.insert(lines, string.format("    🔧 %s(%s)", tool_name, args_str))
       end
     end
+    table.insert(lines, "}}}")
     if main_content and main_content ~= "" then
       table.insert(lines, "")
       for _, mline in ipairs(vim.split(main_content, "\n")) do
@@ -1250,7 +1265,7 @@ function M._render_single_message(msg, prev_role)
     end
     table.insert(lines, "")
     return lines
-  end
+
 
   if has_reasoning then
     -- 有思考过程
@@ -1423,7 +1438,8 @@ function M._apply_rendered_content(content)
         M._focus_window()
       end
     end
-    _schedule_cursor_follow()
+    -- 渲染完成时，强制光标跟随到窗口最后（buffer 末尾）
+    _schedule_cursor_follow(0, true)
     if not state.streaming.active and not state.generation_in_progress then
       M._open_float_input()
     end
@@ -2035,6 +2051,7 @@ function M.close()
     state.current_window_id = nil
     state.current_session_id = nil
     state.chat_buf = nil
+    _chat_buf = nil
     state.messages = {}
     return
   end
@@ -2750,7 +2767,18 @@ function M._setup_event_listeners()
         -- 没有找到消息索引，仍然需要收尾
         state.generation_in_progress = false
         reset_streaming_state()
-        M._save_final_content_to_history(data)
+        local save_result = M._save_final_content_to_history(data)
+        if save_result then
+          vim.api.nvim_exec_autocmds("User", {
+            pattern = Events.HISTORY_SAVE_FINAL,
+            data = {
+              session_id = data.session_id,
+              content = save_result.content,
+              reasoning_content = save_result.reasoning_content,
+              usage = data.usage or {},
+            },
+          })
+        end
         M._update_usage_virt_text()
         M._open_float_input()
         return
@@ -2835,14 +2863,26 @@ function M._setup_event_listeners()
       state.generation_in_progress = false
       reset_streaming_state()
 
-      -- 保存最终内容到历史（含工具调用折叠文本）
-      M._save_final_content_to_history(data)
+      -- 保存最终内容到历史（含工具调用折叠文本）并触发事件
+      local save_result = M._save_final_content_to_history(data)
+      if save_result then
+        vim.api.nvim_exec_autocmds("User", {
+          pattern = Events.HISTORY_SAVE_FINAL,
+          data = {
+            session_id = data.session_id,
+            content = save_result.content,
+            reasoning_content = save_result.reasoning_content,
+            usage = data.usage or {},
+          },
+        })
+      end
 
       -- 显示用量信息
       M._update_usage_virt_text()
 
       -- 打开输入框（光标在末尾时）
-      _schedule_cursor_follow()
+      -- 渲染完成时，强制光标跟随到窗口最后（buffer 末尾）
+      _schedule_cursor_follow(0, true)
       if not state.tool_loop_in_progress then
         M._open_float_input()
       end
@@ -4054,7 +4094,8 @@ function M._append_message_to_buffer(role, content, window_id)
   end
 
   -- 执行光标跟随（使用协程共享表 should_follow 缓存值）
-  _schedule_cursor_follow()
+  -- 添加内容时，强制光标跟随到内容最后（buffer 末尾）
+  _schedule_cursor_follow(0, true)
 end
 
 --- 全量渲染流式消息（有折叠标记、代码块、工具调用等复杂内容时使用）
@@ -4341,9 +4382,10 @@ local function _render_streaming_message(window_id)
     _do_incremental_streaming_render(buf, content_text)
   end
 
-  -- 光标跟随由调用方统一控制（如 _append_reasoning_folded_to_buffer 和 TOOL_EXECUTION_COMPLETED 等）
-  -- 不在 _render_streaming_message 中触发，避免思考过程插入后立即跳转
-  -- 导致后续工具调用折叠文本插入时 foldclose! 又把光标移走
+  -- 添加内容时，强制光标跟随到内容最后（buffer 末尾）
+  -- 使用带防抖的强制跟随，避免每 30ms 节流刷新都跳转导致闪烁
+  _schedule_cursor_follow(150, true)
+
 end
 -- 暴露给事件回调使用（事件回调闭包中 local function 不可见）
 M._render_streaming_message = _render_streaming_message
@@ -4451,14 +4493,10 @@ local function _flush_stream_throttle()
     end
   end
 
-  -- 清理定时器引用
+  -- 停止定时器（不关闭，复用），然后批量渲染
   if throttle.timer then
-    pcall(throttle.timer.stop, throttle.timer)
-    pcall(throttle.timer.close, throttle.timer)
-    throttle.timer = nil
+    throttle.timer:stop()
   end
-
-  -- 批量渲染（将累积的 delta 一次性写入 buffer）
   _render_streaming_message()
 end
 
@@ -4483,19 +4521,15 @@ function M._append_stream_chunk_to_buffer(chunk_content, content_type, window_id
 
   if not throttle.pending then
     throttle.pending = true
-    -- 启动节流定时器（30ms 后批量刷新）
-    if throttle.timer then
-      pcall(throttle.timer.stop, throttle.timer)
-      pcall(throttle.timer.close, throttle.timer)
+    -- 复用持久定时器（30ms 后批量刷新），避免每次 chun 创建/销毁 timer
+    if not throttle.timer then
+      throttle.timer = vim.uv.new_timer()
     end
-    throttle.timer = vim.uv.new_timer()
     throttle.timer:start(30, 0, vim.schedule_wrap(function()
       _flush_stream_throttle()
     end))
   end
 end
-
---- 完成流式渲染
 --- 将累积的流式内容临时保存到消息列表中，并触发全量重渲染
 --- 注意：流式完成后服务器会重新发送完整正文（通过 NeoAI:generation_completed 事件），
 --- 所以这里只做临时保存，最终内容由 generation_completed 事件处理替换
