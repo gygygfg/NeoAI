@@ -168,8 +168,7 @@ local function _fold_new_markers(buf, lines, win_id, insert_start_line)
     local range_end = (insert_start_line or 0) + #lines
     -- 确保 foldmethod=marker 使 foldclose 能识别 {{{ }}} 标记
     local saved_foldmethod = pcall(vim.api.nvim_get_option_value, "foldmethod", { win = win })
-        and vim.api.nvim_get_option_value("foldmethod", { win = win })
-      or "manual"
+      and vim.api.nvim_get_option_value("foldmethod", { win = win }) or "manual"
     pcall(vim.api.nvim_set_option_value, "foldmethod", "marker", { win = win })
     -- 临时设置 foldlevel=0 确保 foldclose 能关闭范围内的折叠
     local saved_foldlevel = vim.api.nvim_get_option_value("foldlevel", { win = win })
@@ -700,10 +699,9 @@ local function _schedule_cursor_follow(delay_ms)
       end)
     )
   else
-    -- 立即模式：通过 vim.schedule 延迟到下一个 tick 执行
-    -- 确保 _fold_new_markers 的 vim.schedule 回调（foldclose）先执行
-    -- 避免 foldmethod=marker 的折叠计算未完成时光标被吸到折叠开始行
-    vim.schedule(_do_cursor_follow)
+    -- 立即模式：直接执行，不再通过 vim.schedule 延迟
+    -- 因为 should_follow 已在 buffer 内容变化前缓存，无需等待下一个 tick
+    _do_cursor_follow()
   end
 end
 
@@ -793,9 +791,7 @@ end
 
 --- 初始化聊天窗口（仅标记初始化状态，组件初始化由 ui/init.lua 统一管理）
 function M._mark_initialized()
-  if state.initialized then
-    return
-  end
+  if state.initialized then return end
   state.initialized = true
 end
 
@@ -1146,9 +1142,7 @@ function M._render_single_message(msg, prev_role)
     local search_pos = 1
     while true do
       local s, e = clean_content:find("}}}%s*", search_pos)
-      if not s then
-        break
-      end
+      if not s then break end
       fold_end = e
       search_pos = s + 1
     end
@@ -2521,9 +2515,7 @@ end
 --- @param opts table|nil 选项
 function M.show_floating_text(text, opts)
   local comp = _get_floating_text()
-  if not comp then
-    return false
-  end
+  if not comp then return false end
 
   opts = opts or {}
   local win_handle = window_manager.get_window_win(state.current_window_id)
@@ -2531,21 +2523,16 @@ function M.show_floating_text(text, opts)
     return false
   end
 
-  return comp.show(
-    text,
-    vim.tbl_extend("force", opts, {
-      chat_win = win_handle,
-      chat_window_id = state.current_window_id,
-    })
-  )
+  return comp.show(text, vim.tbl_extend("force", opts, {
+    chat_win = win_handle,
+    chat_window_id = state.current_window_id,
+  }))
 end
 
 --- 关闭悬浮文本（委托给 floating_text 组件）
 function M.close_floating_text()
   local comp = _get_floating_text()
-  if not comp then
-    return false
-  end
+  if not comp then return false end
   return comp.close()
 end
 
@@ -2672,8 +2659,7 @@ function M._setup_event_listeners()
       else
         logger.debug(
           "[chat_window] GENERATION_COMPLETED 未收到 usage 数据 (session=%s, gen_id=%s)",
-          tostring(data.session_id),
-          tostring(data.generation_id)
+          tostring(data.session_id), tostring(data.generation_id)
         )
       end
 
@@ -3058,9 +3044,9 @@ function M._setup_event_listeners()
     str = str:gsub("\\t", "\t")
     str = str:gsub('\\"', '"')
     return str
-  end
+   end
 
-  function M.build_streaming_preview_buffer()
+   function M.build_streaming_preview_buffer()
     local preview = state.tool_display.streaming_preview
     local tools = preview.tools or {}
     if not next(tools) then
@@ -3206,7 +3192,7 @@ function M._setup_event_listeners()
       state.tool_display._finished = false
       state.tool_display.folded_saved = false
       -- 重置增量折叠索引，新的一轮工具循环从零开始
-      tool_display_component.reset_folded_index()
+  tool_display_component.reset_folded_index()
       state.tool_display.packs = tool_display_component.get_packs()
       state.tool_display.pack_order = tool_display_component.get_pack_order()
       state.tool_display.substeps = {}
@@ -3582,6 +3568,7 @@ function M._setup_event_listeners()
     end,
   })
 
+
   -- TOOL_PREVIEW_SHOWN：工具预览窗口已显示
   vim.api.nvim_create_autocmd("User", {
     group = augroup,
@@ -3885,11 +3872,9 @@ local function _do_full_streaming_render(msg, mi, buf)
   local cached_lines = s._cached_full_lines
   local cached_hash = s._cached_full_hash
   local lines
-  local hash_changed = false
   if cached_lines and cached_hash == content_hash then
     lines = cached_lines
   else
-    hash_changed = true
     local prev_role = nil
     if mi > 1 then
       prev_role = state.messages[mi - 1].role
@@ -3912,9 +3897,7 @@ local function _do_full_streaming_render(msg, mi, buf)
   if start_line then
     -- 已有起始行：计算增量行，避免全量替换
     local old_lines = state.streaming._full_rendered_lines or 0
-    -- 如果内容哈希已变化（如新增折叠文本），必须全量替换而非增量追加
-    -- 否则旧行内容与新行不匹配，导致 {{{ 等关键行丢失
-    if not hash_changed and old_lines > 0 and #lines > old_lines then
+    if old_lines > 0 and #lines > old_lines then
       -- 只追加新增的行
       local new_lines = {}
       for i = old_lines + 1, #lines do
@@ -3930,12 +3913,9 @@ local function _do_full_streaming_render(msg, mi, buf)
       local win = #wins > 0 and wins[1] or nil
       _fold_new_markers(buf, new_lines, win, append_line)
       -- 防抖高亮：与增量渲染共用防抖定时器
-      -- 同时将光标跟随延迟到高亮应用后执行，确保折叠计算已完成
       local s = state.streaming
       s._highlight_end = append_line + #new_lines
-      if not s._highlight_start then
-        s._highlight_start = append_line
-      end
+      if not s._highlight_start then s._highlight_start = append_line end
       if s._highlight_timer then
         pcall(s._highlight_timer.stop, s._highlight_timer)
         pcall(s._highlight_timer.close, s._highlight_timer)
@@ -3948,12 +3928,10 @@ local function _do_full_streaming_render(msg, mi, buf)
           s._highlight_end = nil
         end
         s._highlight_timer = nil
-        -- 高亮和折叠计算完成后执行光标跟随
-        _schedule_cursor_follow()
       end, 50)
       return
     end
-    -- 行数未增长或减少，或内容哈希已变化：全量替换
+    -- 行数未增长或减少：全量替换
     _replace_message_in_buffer(buf, start_line, lines, nil)
   else
     set_buf_modifiable(buf, true)
@@ -3973,12 +3951,11 @@ local function _do_full_streaming_render(msg, mi, buf)
   local win = #wins > 0 and wins[1] or nil
   _fold_new_markers(buf, lines, win, start_line or state.streaming.message_start_line)
 
+ 
   -- 防抖高亮：与增量渲染共用防抖定时器
   local s = state.streaming
   s._highlight_end = (state.streaming.message_start_line or 0) + #lines
-  if not s._highlight_start then
-    s._highlight_start = state.streaming.message_start_line or 0
-  end
+  if not s._highlight_start then s._highlight_start = state.streaming.message_start_line or 0 end
   if s._highlight_timer then
     pcall(s._highlight_timer.stop, s._highlight_timer)
     pcall(s._highlight_timer.close, s._highlight_timer)
@@ -4065,9 +4042,7 @@ local function _do_incremental_streaming_render(buf, content_text)
   state.streaming._rendered_text = content_text
   -- 增量追踪行数：计算 delta 中的换行符数量
   local delta_newlines = 0
-  for _ in delta:gmatch("\n") do
-    delta_newlines = delta_newlines + 1
-  end
+  for _ in delta:gmatch("\n") do delta_newlines = delta_newlines + 1 end
   state.streaming._rendered_line_count = state.streaming._rendered_line_count + delta_newlines
 
   -- 防抖高亮：只在新内容行范围内应用语法高亮
@@ -4144,10 +4119,8 @@ local function _render_streaming_message(window_id)
         if first_char == "{" or first_char == "[" then
           local json_ok, parsed = pcall(vim.json.decode, content_text)
           if json_ok and type(parsed) == "table" then
-            if
-              (parsed.tool_calls and #parsed.tool_calls > 0)
-              or (parsed.reasoning_content and parsed.reasoning_content ~= "")
-            then
+            if (parsed.tool_calls and #parsed.tool_calls > 0)
+              or (parsed.reasoning_content and parsed.reasoning_content ~= "") then
               needs_full_render = true
             end
           end
@@ -4422,22 +4395,16 @@ end
 
 --- 显示模型选择器（浮动窗口菜单，委托给 model_selector 组件）
 function M.show_model_selector()
-  if not state.current_window_id then
-    return
-  end
+  if not state.current_window_id then return end
   local comp = _get_model_selector()
-  if comp then
-    comp.show()
-  end
+  if comp then comp.show() end
 end
 
 --- 切换到当前场景内的指定模型候选（委托给 model_selector 组件）
 --- @param model_index number 模型候选索引（1-based）
 function M.switch_to_model(model_index)
   local comp = _get_model_selector()
-  if not comp then
-    return
-  end
+  if not comp then return end
   comp.switch_to(model_index)
   -- 同步 chat_window 本地状态
   state.current_model_index = comp.get_current_index()
@@ -4554,3 +4521,5 @@ function M._set_cursor_follow_should(should)
 end
 
 return M
+
+
