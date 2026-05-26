@@ -1135,7 +1135,17 @@ function M._render_single_message(msg, prev_role)
     end
     -- 再处理 tool fold + 正文
     local clean_content = raw_content:gsub("\r\n", "\n"):gsub("\r", "\n")
-    local fold_end = select(2, clean_content:find("}}}%s*"))
+    -- 查找最后一个 }}} 的位置，正确分离折叠区域与正文
+    -- 多个工具结果折叠块通过 \n 连接，如果只用第一个 }}} 拆分，
+    -- 后续的 {{{ 折叠标记会被 _format_remaining_content 错误添加 "🤖 AI: " 前缀导致折叠失效
+    local fold_end = nil
+    local search_pos = 1
+    while true do
+      local s, e = clean_content:find("}}}%s*", search_pos)
+      if not s then break end
+      fold_end = e
+      search_pos = s + 1
+    end
     if fold_end then
       local fold_part = clean_content:sub(1, fold_end)
       for _, line in ipairs(vim.split(fold_part, "\n")) do
@@ -3300,6 +3310,12 @@ function M._setup_event_listeners()
           end
           state.messages[mi].content = new_content
           state.tool_display.folded_saved = true
+          -- 清除全量渲染缓存，确保下次渲染使用新的折叠文本
+          state.streaming._cached_full_lines = nil
+          state.streaming._cached_full_hash = nil
+          -- 强制全量渲染：折叠标记必须通过 _render_single_message 渲染，
+          -- 以处理 reasoning + fold 组合，并避免增量渲染路径中折叠标记被缩进
+          state.streaming._needs_full_render = true
           M._render_streaming_message(data.window_id)
         end
       end
@@ -3445,6 +3461,9 @@ function M._setup_event_listeners()
           -- 清除全量渲染缓存，确保下次渲染使用新的折叠文本
           state.streaming._cached_full_lines = nil
           state.streaming._cached_full_hash = nil
+          -- 强制全量渲染：折叠标记必须通过 _render_single_message 渲染，
+          -- 以处理 reasoning + fold 组合，并避免增量渲染路径中折叠标记被缩进
+          state.streaming._needs_full_render = true
           -- 通过 _render_streaming_message 重新渲染当前消息
           M._render_streaming_message(data.window_id)
         end
@@ -4092,7 +4111,7 @@ local function _render_streaming_message(window_id)
     else
       content_text = tostring(msg.content or "")
       -- 先做廉价的字符串检测（折叠标记和代码块），避免不必要的 JSON 解析
-      if content_text:find("^{{{") or content_text:find("```") then
+      if content_text:find("^{{{") or content_text:find("\n{{{") or content_text:find("```") then
         needs_full_render = true
       elseif msg.role == "assistant" then
         -- 只有不是折叠文本/代码块时才尝试 JSON 解析
