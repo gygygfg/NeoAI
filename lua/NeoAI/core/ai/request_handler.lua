@@ -13,6 +13,7 @@
 
 local logger = require("NeoAI.utils.logger")
 local json = require("NeoAI.utils.json")
+local file_utils = require("NeoAI.utils.file_utils")
 
 local M = {}
 
@@ -26,6 +27,112 @@ local _tool_definitions = {}
 local _cached_core = nil
 local _first_request = true
 local tool_call_counter = 0
+
+-- ========== 文件变更追踪 ==========
+-- 记录本轮工具执行中读取和修改了哪些文件的哪些代码结构
+-- 格式：{ [abs_path] = { reads = { {start_line, end_line, content_preview} }, writes = { {edit_type, old_text_preview, new_text_preview} } } }
+local _file_change_tracker = {}
+
+--- 重置文件变更追踪（每轮工具循环开始时调用）
+function M.reset_file_tracker()
+  _file_change_tracker = {}
+end
+
+--- 记录文件读取操作
+--- @param filepath string 文件路径
+--- @param start_line number 起始行号（0-based）
+--- @param end_line number 结束行号（0-based）
+--- @param content_preview string 内容预览（前 200 字符）
+function M.track_file_read(filepath, start_line, end_line, content_preview)
+  if not filepath or filepath == "" then return end
+  local abs_path = vim.fn.fnamemodify(filepath, ":p")
+  if not _file_change_tracker[abs_path] then
+    _file_change_tracker[abs_path] = { reads = {}, writes = {} }
+  end
+  local preview = content_preview or ""
+  if #preview > 200 then
+    preview = preview:sub(1, 200) .. "..."
+  end
+  table.insert(_file_change_tracker[abs_path].reads, {
+    start_line = start_line or 0,
+    end_line = end_line or -1,
+    content_preview = preview,
+  })
+end
+
+--- 记录文件修改操作
+--- @param filepath string 文件路径
+--- @param edit_type string 编辑类型（insert/replace/delete/overwrite）
+--- @param old_text_preview string 旧文本预览
+--- @param new_text_preview string 新文本预览
+function M.track_file_write(filepath, edit_type, old_text_preview, new_text_preview)
+  if not filepath or filepath == "" then return end
+  local abs_path = vim.fn.fnamemodify(filepath, ":p")
+  if not _file_change_tracker[abs_path] then
+    _file_change_tracker[abs_path] = { reads = {}, writes = {} }
+  end
+  local old_preview = old_text_preview or ""
+  if #old_preview > 200 then
+    old_preview = old_preview:sub(1, 200) .. "..."
+  end
+  local new_preview = new_text_preview or ""
+  if #new_preview > 200 then
+    new_preview = new_preview:sub(1, 200) .. "..."
+  end
+  table.insert(_file_change_tracker[abs_path].writes, {
+    edit_type = edit_type or "unknown",
+    old_text_preview = old_preview,
+    new_text_preview = new_preview,
+  })
+end
+
+--- 构建文件变更摘要文本
+--- @return string 格式化的变更摘要
+function M.build_file_change_summary()
+  if not next(_file_change_tracker) then
+    return ""
+  end
+  local parts = {}
+  table.insert(parts, "【本轮工具执行的文件操作记录】")
+  for abs_path, info in pairs(_file_change_tracker) do
+    table.insert(parts, string.format("\n文件: %s", abs_path))
+    if #info.reads > 0 then
+      table.insert(parts, string.format("  读取了 %d 次:", #info.reads))
+      for _, r in ipairs(info.reads) do
+        local range = string.format("行 %d-%d", r.start_line, r.end_line)
+        table.insert(parts, string.format("    - %s: %s", range, r.content_preview))
+      end
+    end
+    if #info.writes > 0 then
+      table.insert(parts, string.format("  修改了 %d 次:", #info.writes))
+      for _, w in ipairs(info.writes) do
+        table.insert(parts, string.format("    - [%s] 旧: %s", w.edit_type, w.old_text_preview))
+        table.insert(parts, string.format("      新: %s", w.new_text_preview))
+      end
+    end
+  end
+  return table.concat(parts, "\n")
+end
+
+--- 构建实时文件内容快照（读取所有被修改过的文件的最新内容）
+--- @return string 格式化的文件内容快照
+function M.build_live_file_snapshot()
+  if not next(_file_change_tracker) then
+    return ""
+  end
+  local parts = {}
+  table.insert(parts, "【当前文件实时状态】\n以下是被修改过的文件的最新内容，供你参考当前代码状态：")
+  for abs_path in pairs(_file_change_tracker) do
+    local content, err = file_utils.read_file(abs_path)
+    if content then
+      table.insert(parts, string.format("\n===== %s =====", abs_path))
+      table.insert(parts, content)
+    else
+      table.insert(parts, string.format("\n===== %s (读取失败: %s) =====", abs_path, err or "未知错误"))
+    end
+  end
+  return table.concat(parts, "\n")
+end
 
 -- ========== 辅助函数 ==========
 
@@ -158,18 +265,34 @@ function M.format_messages(messages)
 end
 
 
---- 构建工具结果消息
+--- 构建工具结果消息（精简版：去掉详细工具返回信息，仅保留摘要）
+-- 工具返回的详细内容会被剥离，只记录文件变更摘要
+-- 在请求结尾会附加实时读取的文件内容快照，确保 AI 获取最新信息
 function M.build_tool_result_message(tool_call_id, result, tool_name)
   local safe_id = tool_call_id
   if not safe_id or safe_id == "" then
     safe_id = "call_" .. os.time() .. "_" .. math.random(10000, 99999)
   end
-  local msg = { role = "tool", tool_call_id = safe_id, content = "" }
+
+  -- 构建精简摘要：只保留工具名和执行状态，去掉详细返回内容
+  local result_str = ""
   if type(result) == "string" then
-    msg.content = result
+    -- 检查是否包含失败/错误信息，保留错误摘要
+    local lower = result:lower()
+    if lower:find("error") or lower:find("失败") or lower:find("错误") or lower:find("fail") then
+      -- 保留错误信息的前 200 字符
+      result_str = "[执行失败] " .. result:sub(1, 200)
+    else
+      -- 成功执行，只记录工具名和简短状态
+      result_str = "[执行成功]"
+    end
   elseif result ~= nil then
-    msg.content = tostring(result)
+    result_str = "[执行成功]"
+  else
+    result_str = ""
   end
+
+  local msg = { role = "tool", tool_call_id = safe_id, content = result_str }
   if tool_name then msg.name = tool_name end
   return msg
 end
@@ -325,6 +448,27 @@ function M.build_request(params)
         end
         request.tool_choice = "auto"
       end
+    end
+  end
+
+  -- ===== 在请求末尾追加实时文件信息 =====
+  -- 如果有文件变更记录，在消息列表末尾插入一条包含变更摘要和实时文件内容的 user 消息
+  -- 这样 AI 能看到所有被修改过的文件的最新状态，消除过时信息
+  if mode ~= "fim" and next(_file_change_tracker) then
+    local change_summary = M.build_file_change_summary()
+    local live_snapshot = M.build_live_file_snapshot()
+    if live_snapshot and live_snapshot ~= "" then
+      local file_context_msg = {
+        role = "user",
+        content = string.format(
+          "%s\n\n%s\n\n【重要】以上是当前所有被修改过的文件的实时内容快照。"
+            .. "请基于这些最新内容进行后续操作，不要依赖之前过时的工具返回信息。"
+            .. "如果你需要读取其他文件，请直接使用 read_file 工具获取最新内容。",
+          change_summary,
+          live_snapshot
+        ),
+      }
+      table.insert(request.messages, file_context_msg)
     end
   end
 

@@ -1944,6 +1944,9 @@ function M._proceed_to_next_round(session_id, is_sub_agent)
     return
   end
 
+  -- 重置文件变更追踪器，为新一轮工具循环做准备
+  request_handler.reset_file_tracker()
+
   -- 调试日志：追踪 _proceed_to_next_round 调用
   require("NeoAI.utils.logger").debug(
     "[DEBUG_DUP] _proceed_to_next_round: session=%s, phase=%s, iter=%d, _proceed_in_progress=%s, stack=%s",
@@ -2602,31 +2605,52 @@ function M._add_tool_result_to_messages(session_id, tool_call_id, tool_name, res
   end
 
   local safe_id = tool_call_id or ("call_" .. os.time() .. "_" .. math.random(10000, 99999))
-  -- 性能优化：避免 pcall 后再次 vim.json.encode（已由 pcall 返回编码结果）
-  local result_str
-  if type(result) == "string" then
-    result_str = result
-  elseif result ~= nil then
-    local ok, encoded = pcall(vim.json.encode, result)
-    result_str = ok and encoded or tostring(result)
-  else
-    result_str = ""
-  end
 
-  local tool_msg = {
-    role = "tool",
-    tool_call_id = safe_id,
-    content = result_str,
-    timestamp = os.time(),
-    window_id = ss.window_id,
-  }
-  if tool_name then
-    tool_msg.name = tool_name
-  end
+  -- 使用 request_handler 的精简工具结果消息（去掉详细返回内容，只保留摘要）
+  local tool_msg = request_handler.build_tool_result_message(safe_id, result, tool_name)
+  tool_msg.timestamp = os.time()
+  tool_msg.window_id = ss.window_id
+
   if normalized_args and type(normalized_args) == "table" and next(normalized_args) then
     tool_msg.normalized_args = vim.deepcopy(normalized_args)
   end
   table.insert(ss.messages, tool_msg)
+
+  -- ===== 追踪文件变更（供 request_handler 在构建请求时附加实时文件快照） =====
+  if tool_name then
+    local is_read_tool = tool_executor._is_readonly_tool(tool_name)
+    local is_write_tool = tool_executor._is_write_tool(tool_name)
+
+    if is_read_tool and normalized_args and normalized_args.filepath then
+      -- 只读工具：记录文件读取操作
+      local filepath = normalized_args.filepath
+      local start_line = normalized_args.start_line_number_base_zero or 0
+      local end_line = normalized_args.end_line_number_base_zero or -1
+      local content_preview = ""
+      if type(result) == "string" then
+        content_preview = result:sub(1, 200)
+      end
+      request_handler.track_file_read(filepath, start_line, end_line, content_preview)
+    elseif is_write_tool and normalized_args then
+      -- 写入工具：记录文件修改操作
+      local filepath = normalized_args.filepath or (normalized_args.path or "")
+      if filepath and filepath ~= "" then
+        local edit_type = tool_name
+        local old_preview = ""
+        local new_preview = ""
+        if normalized_args.oldText then
+          old_preview = type(normalized_args.oldText) == "string" and normalized_args.oldText:sub(1, 200) or vim.inspect(normalized_args.oldText):sub(1, 200)
+        end
+        if normalized_args.newText then
+          new_preview = type(normalized_args.newText) == "string" and normalized_args.newText:sub(1, 200) or vim.inspect(normalized_args.newText):sub(1, 200)
+        end
+        if normalized_args.content then
+          new_preview = type(normalized_args.content) == "string" and normalized_args.content:sub(1, 200) or vim.inspect(normalized_args.content):sub(1, 200)
+        end
+        request_handler.track_file_write(filepath, edit_type, old_preview, new_preview)
+      end
+    end
+  end
 
   -- 工具结果实时持久化到 history_manager（由 tool_executor 统一保存）
   -- tool_executor 的 on_success_wrapper/on_error_wrapper 中已调用 _save_tool_result_to_history
