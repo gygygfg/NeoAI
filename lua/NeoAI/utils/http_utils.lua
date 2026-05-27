@@ -968,23 +968,11 @@ function M.send_request(params)
       #request_body
     )
   )
-  logger.debug(
-    "[http_client] 原始请求体: "
-      .. request_body:sub(1, 3000)
-      .. (request_body:len() > 3000 and "...[truncated]" or "")
-  )
   -- 调试：打印请求体中的 model 字段
   local ok_body, decoded_body = pcall(json.decode, request_body)
   if ok_body and type(decoded_body) == "table" and decoded_body.model then
     logger.debug(string.format("[http_client] 非流式请求 model=%s", tostring(decoded_body.model)))
   end
-  logger.debug(
-    "[http_client] 非流式请求: "
-      .. base_url
-      .. " | body="
-      .. request_body:sub(1, 2000)
-      .. (request_body:len() > 2000 and "...[truncated]" or "")
-  )
   local temp_file = vim.fn.tempname()
   -- 将请求体写入临时文件，避免命令行参数过长导致 E903
   local body_file = vim.fn.tempname()
@@ -1012,14 +1000,6 @@ function M.send_request(params)
   if curl_err then
     return nil, curl_err
   end
-
-  logger.debug(
-    "[http_client] 非流式响应: "
-      .. base_url
-      .. " | body="
-      .. content:sub(1, 2000)
-      .. (content:len() > 2000 and "...[truncated]" or "")
-  )
 
   local ok_decode, response = pcall(json.decode, content)
   if not ok_decode then
@@ -1141,12 +1121,6 @@ function M.send_request_retry(params, on_complete)
       #request_body
     )
   )
-  logger.debug(
-    "[http_client] 原始请求体(send_request_retry): "
-      .. request_body:sub(1, 3000)
-      .. (request_body:len() > 3000 and "...[truncated]" or "")
-  )
-
   local temp_file = vim.fn.tempname()
   -- 将请求体写入临时文件，避免命令行参数过长
   local body_file = vim.fn.tempname()
@@ -1305,11 +1279,6 @@ function M.send_stream_request(params, on_chunk, on_complete, on_error)
       #request_body
     )
   )
-  logger.debug(
-    "[http_client] 原始请求体(send_stream_request): "
-      .. request_body:sub(1, 3000)
-      .. (request_body:len() > 3000 and "...[truncated]" or "")
-  )
   -- 调试：打印请求体中的 model 字段
   local ok_body, decoded_body = pcall(json.decode, request_body)
   if ok_body and type(decoded_body) == "table" and decoded_body.model then
@@ -1415,17 +1384,7 @@ function M.send_stream_request(params, on_chunk, on_complete, on_error)
       local ok, data = pcall(json.decode, data_str)
       if ok and type(data) == "table" then
         total_received = total_received + #data_str
-        if logger.is_debug() then
-          logger.debug(
-            "[http_client] 流式数据块: 大小="
-              .. #data_str
-              .. " bytes, 累计="
-              .. total_received
-              .. " bytes | "
-              .. data_str:sub(1, 1000)
-              .. (data_str:len() > 1000 and "...[truncated]" or "")
-          )
-        end
+
         if data.error then
           local req = _http_state.active_requests[request_id]
           if req then
@@ -1475,16 +1434,7 @@ function M.send_stream_request(params, on_chunk, on_complete, on_error)
     for _, line in ipairs(data_lines) do
       lines_size = lines_size + #(line or "")
     end
-    if logger.is_debug() then
-      logger.debug(
-        string.format(
-          "[http_client] handle_stdout: 行数=%d, 本次大小=%d bytes, buffer大小=%d bytes",
-          n,
-          lines_size,
-          #(req.buffer or "")
-        )
-      )
-    end
+
     local ends_with_newline = data_lines[n] == ""
     local count = ends_with_newline and n - 1 or n
     for i = 1, count do
@@ -1924,14 +1874,6 @@ local job_id = vim.fn.jobstart({ "curl", unpack_fn(curl_args) }, {
         end
         return
       end
-
-      logger.debug(
-        "[http_client] 异步非流式响应: "
-          .. base_url
-          .. " | body="
-          .. content:sub(1, 2000)
-          .. (content:len() > 2000 and "...[truncated]" or "")
-      )
 
       local ok, response = pcall(json.decode, content)
       if not ok then

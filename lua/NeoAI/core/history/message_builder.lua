@@ -33,28 +33,109 @@ function M.session_to_messages(session)
     assistant_list = (assistant_list and assistant_list ~= "") and { assistant_list } or {}
   end
 
+  -- 工具调用计数器，用于生成占位 tool_call_id
+  local tool_call_counter = 0
+  -- 当前正在构建的 tool 消息列表（用于连续工具调用合并）
+  local pending_tool_msgs = nil
+  local pending_assistant = nil
+
+  local function flush_pending_tools()
+    if pending_assistant and pending_tool_msgs then
+      -- 先插入占位 assistant 消息，再插入所有 tool 消息
+      table.insert(msgs, pending_assistant)
+      for _, tm in ipairs(pending_tool_msgs) do
+        table.insert(msgs, tm)
+      end
+    end
+    pending_assistant = nil
+    pending_tool_msgs = nil
+  end
+
   for _, entry in ipairs(assistant_list) do
     -- 统一转为 Lua table
     local parsed = M._normalize_entry(entry)
     if not parsed then
+      flush_pending_tools()
       goto continue
     end
 
-    local content
     if parsed.type == "tool_call" then
-      content = M._build_tool_call_text(parsed)
-    elseif parsed.reasoning_content and parsed.reasoning_content ~= "" then
-      -- 含思考过程：返回 table，由调用方决定如何渲染
-      content = {
-        reasoning_content = parsed.reasoning_content,
-        content = parsed.content or "",
-      }
+      -- 工具调用条目：转换为 role="tool" 消息
+      -- 如果还没有占位 assistant，创建一个
+      if not pending_assistant then
+        tool_call_counter = tool_call_counter + 1
+        local placeholder_id = "call_history_" .. os.time() .. "_" .. tool_call_counter .. "_" .. math.random(10000, 99999)
+        pending_assistant = {
+          role = "assistant",
+          content = "",
+          tool_calls = {
+            {
+              id = placeholder_id,
+              type = "function",
+              ["function"] = {
+                name = parsed.tool_name or "unknown",
+                arguments = vim.json.encode(parsed.arguments or {}),
+              },
+            },
+          },
+        }
+        pending_tool_msgs = {}
+      else
+        -- 已有占位 assistant，追加 tool_call 到其 tool_calls 数组
+        tool_call_counter = tool_call_counter + 1
+        local placeholder_id = "call_history_" .. os.time() .. "_" .. tool_call_counter .. "_" .. math.random(10000, 99999)
+        table.insert(pending_assistant.tool_calls, {
+          id = placeholder_id,
+          type = "function",
+          ["function"] = {
+            name = parsed.tool_name or "unknown",
+            arguments = vim.json.encode(parsed.arguments or {}),
+          },
+        })
+      end
+
+      -- 构建 tool 消息内容
+      local result_content = ""
+      if parsed.results then
+        local parts = {}
+        for _, res in ipairs(parsed.results) do
+          local s = type(res) == "string" and res or (pcall(vim.json.encode, res) and vim.json.encode(res) or vim.inspect(res))
+          table.insert(parts, s)
+        end
+        result_content = table.concat(parts, "\n")
+      else
+        result_content = tostring(parsed.result or "")
+      end
+
+      -- 暂存 tool 消息（使用占位 assistant 中最后添加的 tool_call_id）
+      local last_tc = pending_assistant.tool_calls[#pending_assistant.tool_calls]
+      table.insert(pending_tool_msgs, {
+        role = "tool",
+        tool_call_id = last_tc.id,
+        name = parsed.tool_name or "unknown",
+        content = result_content,
+      })
     else
-      content = parsed.content or ""
+      -- 普通 AI 回复条目：先刷新待处理的工具消息
+      flush_pending_tools()
+
+      local content
+      if parsed.reasoning_content and parsed.reasoning_content ~= "" then
+        content = {
+          reasoning_content = parsed.reasoning_content,
+          content = parsed.content or "",
+        }
+      else
+        content = parsed.content or ""
+      end
+      table.insert(msgs, { role = "assistant", content = content })
     end
-    table.insert(msgs, { role = "assistant", content = content })
     ::continue::
   end
+
+  -- 刷新最后待处理的工具消息
+  flush_pending_tools()
+
   return msgs
 end
 

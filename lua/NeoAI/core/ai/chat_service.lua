@@ -205,7 +205,11 @@ function M.get_raw_messages(session_id)
     end
     local session_msgs = hm._session_to_messages(s)
     for _, msg in ipairs(session_msgs) do
-      table.insert(messages, msg)
+      -- 过滤掉 role="tool" 消息：UI 不需要显示工具结果消息
+      -- 工具调用结果已通过占位 assistant 消息的 tool_calls 字段在 UI 中渲染为折叠文本
+      if msg.role ~= "tool" then
+        table.insert(messages, msg)
+      end
     end
   end
   return messages

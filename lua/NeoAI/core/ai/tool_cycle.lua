@@ -664,6 +664,11 @@ function M.start_async_loop(params)
   ss._generation_completed = true
   ss._tools_all_completed = false
 
+  -- 重置文件变更追踪器，为新工具循环做准备
+  -- 注意：在 _proceed_to_next_round 中不重置，而是在此处（新轮次开始时）重置
+  -- 确保 _proceed_to_next_round → _request_generation → build_request 生成节点报告时文件追踪器仍然有效
+  request_handler.reset_file_tracker()
+
   -- 首次进入工具循环时（非工具循环重入），插入 assistant 消息（带 tool_calls）
   -- 确保 tool 结果消息前面有对应的 assistant 消息，避免 API 报错
   -- "Messages with role 'tool' must be a response to a preceding message with 'tool_calls'"
@@ -1776,6 +1781,44 @@ function M._on_tools_complete(session_id, is_sub_agent)
   -- 标记 TOOL_EXECUTION_ALL_COMPLETED 已到达（在防重入检查之后设置）
   ss._tools_all_completed = true
 
+  -- ===== 按对话轮次分割，精简非最后一轮的 tool 消息 =====
+  -- _add_tool_result_to_messages 中所有 tool 消息都完整插入
+  -- 现在找到最后一条 assistant+trool_calls 消息，它之前的所有 tool 消息属于上一轮
+  -- 将这些非本轮 tool 消息精简为摘要，减少历史消息体积
+  -- 本轮（最后一条 assistant+trool_calls 之后）的 tool 消息保持完整
+  local last_assistant_idx = nil
+  for i = #ss.messages, 1, -1 do
+    local msg = ss.messages[i]
+    if msg.role == "assistant" and msg.tool_calls and #msg.tool_calls > 0 then
+      last_assistant_idx = i
+      break
+    end
+  end
+
+  if last_assistant_idx then
+    -- last_assistant_idx 之前的 tool 消息属于上一轮，精简为摘要
+    -- 保留工具名称和关键信息，让 AI 在后续轮次中能看到上下文
+    for i = 1, last_assistant_idx - 1 do
+      local msg = ss.messages[i]
+      if msg.role == "tool" and msg.content and msg.content ~= "" then
+        local tool_name = msg.name or "unknown"
+        -- 检查是否包含错误信息
+        local lower = msg.content:lower()
+        if lower:find("error") or lower:find("失败") or lower:find("错误") or lower:find("fail") then
+          msg.content = string.format("[执行失败] 工具: %s, 错误: %s", tool_name, msg.content:sub(1, 300))
+        else
+          -- 保留工具名称和结果摘要（前 500 字符）
+          local summary = msg.content:sub(1, 500)
+          -- 如果内容较长，添加截断标记
+          if #msg.content > 500 then
+            summary = summary .. "\n...(截断，完整结果可通过 get_file_context 工具获取)"
+          end
+          msg.content = string.format("[执行成功] 工具: %s\n%s", tool_name, summary)
+        end
+      end
+    end
+  end
+
   if ss.stop_requested then
     ss._tools_complete_in_progress = false
     ss._generation_completed = false
@@ -1944,10 +1987,10 @@ function M._proceed_to_next_round(session_id, is_sub_agent)
     return
   end
 
-  -- 重置文件变更追踪器，为新一轮工具循环做准备
-  request_handler.reset_file_tracker()
-
   -- 调试日志：追踪 _proceed_to_next_round 调用
+  -- 注意：reset_file_tracker() 已移至 start_async_loop 中调用
+  -- 确保在 _request_generation → build_request 生成节点报告时文件追踪器仍然有效
+  -- 新轮次开始时（start_async_loop）才重置，而非在进入下一轮前重置
   require("NeoAI.utils.logger").debug(
     "[DEBUG_DUP] _proceed_to_next_round: session=%s, phase=%s, iter=%d, _proceed_in_progress=%s, stack=%s",
     tostring(session_id),
@@ -2337,22 +2380,37 @@ function M.on_generation_complete(data)
       end
     end
 
-    -- AI 返回纯文本回复，直接结束循环
-    -- 重置 _tools_all_completed 标志，防止 _check_round_complete 错误地进入下一轮
-    ss._tools_all_completed = false
-    if #tool_calls == 0 and content and content ~= "" then
-      logger.debug("[tool_orchestrator] AI 返回纯文本回复，直接结束循环，跳过总结轮次")
-      local assistant_msg = {
-        role = "assistant",
-        content = content,
-        timestamp = os.time(),
-        window_id = ss.window_id,
-      }
-      if data.reasoning and data.reasoning ~= "" then
-        assistant_msg.reasoning_content = data.reasoning
-        ss.last_reasoning = data.reasoning
+  -- AI 返回纯文本回复，直接结束循环
+  -- 重置 _tools_all_completed 标志，防止 _check_round_complete 错误地进入下一轮
+  ss._tools_all_completed = false
+  if #tool_calls == 0 and content and content ~= "" then
+    logger.debug("[tool_orchestrator] AI 返回纯文本回复，直接结束循环，跳过总结轮次")
+    local assistant_msg = {
+      role = "assistant",
+      content = content,
+      timestamp = os.time(),
+      window_id = ss.window_id,
+    }
+    if data.reasoning and data.reasoning ~= "" then
+      assistant_msg.reasoning_content = data.reasoning
+      ss.last_reasoning = data.reasoning
+    end
+    table.insert(ss.messages, assistant_msg)
+
+    -- ===== 修复：将 AI 回复持久化到 history_manager =====
+    -- 确保下一轮对话能获取到上一轮的 AI 消息
+    if not is_sub_agent then
+      local hm_ok, hm = pcall(require, "NeoAI.core.history.manager")
+      if hm_ok and hm.is_initialized() then
+        local assistant_entry = { content = content }
+        if data.reasoning and data.reasoning ~= "" then
+          assistant_entry.reasoning_content = data.reasoning
+        end
+        hm.add_assistant_entry(session_id, assistant_entry)
+        -- 触发立即保存，确保数据持久化
+        hm._mark_dirty()
       end
-      table.insert(ss.messages, assistant_msg)
+    end
 
       local saved_usage = ss.accumulated_usage or {}
       local saved_reasoning = ss.last_reasoning or ""
@@ -2606,8 +2664,9 @@ function M._add_tool_result_to_messages(session_id, tool_call_id, tool_name, res
 
   local safe_id = tool_call_id or ("call_" .. os.time() .. "_" .. math.random(10000, 99999))
 
-  -- 使用 request_handler 的精简工具结果消息（去掉详细返回内容，只保留摘要）
-  local tool_msg = request_handler.build_tool_result_message(safe_id, result, tool_name)
+  -- 先完整插入工具结果
+  -- _on_tools_complete 中会按对话轮次分割，将非最后一轮的 tool 消息精简为摘要
+  local tool_msg = request_handler.build_tool_result_message(safe_id, result, tool_name, true)
   tool_msg.timestamp = os.time()
   tool_msg.window_id = ss.window_id
 

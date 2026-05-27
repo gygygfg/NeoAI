@@ -299,6 +299,21 @@ function M.track_file_write(filepath, normalized_args, tool_name)
   end
 end
 
+--- 虚拟工具：get_file_context
+--- 获取当前会话中访问过的文件的语法树节点状态报告
+--- 不暴露给 AI，作为内部虚拟工具由 build_request 自动调用
+--- @return string 格式化的节点变更报告（含虚拟工具标记）
+function M.get_file_context()
+  local report = M.build_node_change_report()
+  if not report or report == "" then
+    return ""
+  end
+  return string.format(
+    "【虚拟工具 get_file_context 结果】\n\n%s\n\n【说明】以上是按语法树节点划分的代码状态报告，由虚拟工具 get_file_context 自动获取。",
+    report
+  )
+end
+
 --- 构建语法树节点变更报告（按节点展示原始代码 vs 当前代码）
 --- @return string 格式化的节点变更报告
 function M.build_node_change_report()
@@ -586,31 +601,44 @@ function M.format_messages(messages)
 end
 
 
---- 构建工具结果消息（精简版：去掉详细工具返回信息，仅保留摘要）
--- 工具返回的详细内容会被剥离，只记录文件变更摘要
--- 在请求结尾会附加实时读取的文件内容快照，确保 AI 获取最新信息
-function M.build_tool_result_message(tool_call_id, result, tool_name)
+--- 构建工具结果消息
+-- 通常精简为摘要（去掉详细返回内容），但最后一条工具调用保留完整结果
+-- 防止 AI 以为工具执行错误（如 AI 看到 [执行成功] 但后续没有内容可参考）
+-- @param tool_call_id string 工具调用 ID
+-- @param result any 工具执行结果
+-- @param tool_name string|nil 工具名称
+-- @param keep_full boolean|nil 是否保留完整结果（最后一条工具调用时传 true）
+function M.build_tool_result_message(tool_call_id, result, tool_name, keep_full)
   local safe_id = tool_call_id
   if not safe_id or safe_id == "" then
     safe_id = "call_" .. os.time() .. "_" .. math.random(10000, 99999)
   end
 
-  -- 构建精简摘要：只保留工具名和执行状态，去掉详细返回内容
-  local result_str = ""
-  if type(result) == "string" then
-    -- 检查是否包含失败/错误信息，保留错误摘要
-    local lower = result:lower()
-    if lower:find("error") or lower:find("失败") or lower:find("错误") or lower:find("fail") then
-      -- 保留错误信息的前 200 字符
-      result_str = "[执行失败] " .. result:sub(1, 200)
+  local result_str
+  if keep_full then
+    -- 最后一条工具调用：保留完整结果，让 AI 看到执行结果
+    if type(result) == "string" then
+      result_str = result
+    elseif result ~= nil then
+      local ok, encoded = pcall(vim.json.encode, result)
+      result_str = ok and encoded or tostring(result)
     else
-      -- 成功执行，只记录工具名和简短状态
+      result_str = ""
+    end
+  else
+    -- 非最后一条：精简为摘要，去掉详细返回内容
+    result_str = ""
+    if type(result) == "string" then
+      local lower = result:lower()
+      if lower:find("error") or lower:find("失败") or lower:find("错误") or lower:find("fail") then
+        -- 保留错误信息的前 200 字符
+        result_str = "[执行失败] " .. result:sub(1, 200)
+      else
+        result_str = "[执行成功]"
+      end
+    elseif result ~= nil then
       result_str = "[执行成功]"
     end
-  elseif result ~= nil then
-    result_str = "[执行成功]"
-  else
-    result_str = ""
   end
 
   local msg = { role = "tool", tool_call_id = safe_id, content = result_str }
@@ -772,21 +800,22 @@ function M.build_request(params)
     end
   end
 
-  -- ===== 在请求末尾追加语法树节点状态报告 =====
-  -- 如果有文件变更记录，在消息列表末尾插入一条包含语法树节点变更报告的 user 消息
-  -- 按节点（函数、类等）展示原始代码 vs 当前代码，未被访问的节点不展示
+  -- ===== 虚拟工具：get_file_context =====
+  -- 自动调用虚拟工具 get_file_context 获取文件节点状态报告，注入到请求末尾
+  -- 该工具不暴露给 AI，仅在内部自动调用
+  -- 按语法树节点（函数、类等）展示原始代码 vs 当前代码，未被访问的节点不展示
   if mode ~= "fim" and next(_file_change_tracker) then
-    local node_report = M.build_node_change_report()
-    if node_report and node_report ~= "" then
+    local result = M.get_file_context()
+    if result and result ~= "" then
       local file_context_msg = {
         role = "user",
-        content = string.format(
-          "%s\n\n【重要】以上是按语法树节点划分的代码状态报告。"
-            .. "请基于这些最新内容进行后续操作，不要依赖之前过时的工具返回信息。"
-            .. "如果你需要读取其他文件或节点的详细信息，请直接使用 read_file 或 parse_file 工具获取最新内容。",
-          node_report
-        ),
+        content = result
+          .. "\n\n请基于这些最新内容进行后续操作，不要依赖之前过时的工具返回信息。"
+          .. "如果你需要读取其他文件或节点的详细信息，请直接使用 read_file 或 parse_file 工具获取最新内容。",
       }
+      -- 插入到 messages 末尾（最后一条 user 消息之前），而不是追加到末尾
+      -- 这样 AI 在生成回复时能直接看到最新的代码状态
+      -- 同时避免报告被 _trim_messages 裁剪（_trim_messages 优先保留末尾消息）
       table.insert(request.messages, file_context_msg)
     end
   end
