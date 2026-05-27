@@ -1105,12 +1105,26 @@ function M.handle_generation_error(generation_id, error_msg)
 end
 
 -- ========== 取消生成 ==========
-function M.cancel_generation()
+function M.cancel_generation(params)
+  params = params or {}
   -- 幂等性保护：如果已经处理过停止请求，不再重复执行
   -- 防止多次按停止键时重复触发 GENERATION_CANCELLED 事件、重复显示通知和追加用量行
   if state._cancel_processed then
     return
   end
+
+  -- 如果提供了 window_id，仅当当前生成属于该窗口时才取消
+  -- 解决场景：用户切换到另一个正在流式生成的会话时，关闭旧窗口触发的
+  -- CANCEL_GENERATION 会错误地取消目标会话的后台生成
+  local window_id = params.window_id
+  if window_id then
+    local gen_id = state.current_generation_id
+    local gen = gen_id and state.active_generations[gen_id]
+    if gen and gen.window_id and gen.window_id ~= window_id then
+      return  -- 当前生成属于其他窗口，不取消
+    end
+  end
+
   state._cancel_processed = true
 
   http_utils.clear_reasoning_throttle()

@@ -311,14 +311,26 @@ function M.send_message(params)
     table.insert(messages, { role = "user", content = content })
   end
 
+  -- 应用上下文预算：限制发送给 AI 的历史消息数量，保留最近的消息
+  -- 预算为 0 表示不限制
+  local core = require("NeoAI.core")
+  local full_config = core.get_config() or {}
+  local budget = full_config.ai and full_config.ai.context_budget or 0
+  if budget > 0 and #messages > budget then
+    -- 保留最后 budget 条消息（最近的对话更相关）
+    local truncated = {}
+    for i = #messages - budget + 1, #messages do
+      table.insert(truncated, messages[i])
+    end
+    messages = truncated
+  end
+
   if #messages == 0 then
     return false, "上下文消息为空"
   end
 
   -- 检查工具是否启用
   local tools_enabled = true
-  local core = require("NeoAI.core")
-  local full_config = core.get_config() or {}
   if full_config and full_config.tools then
     tools_enabled = full_config.tools.enabled ~= false
   end

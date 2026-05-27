@@ -162,6 +162,9 @@ local DEFAULT_CONFIG = {
     -- 开启后 AI 会在回答前展示推理过程，适用于复杂问题
     reasoning_enabled = true,
     system_prompt = "你是一个AI编程助手，帮助用户解决编程问题。",
+    -- 上下文消息预算：限制发送给 AI 的历史消息数量，保留最近的 N 条消息
+    -- 设置为 0 表示不限制（保留所有消息）
+    context_budget = 0,
   },
   -- UI配置
   ui = {
