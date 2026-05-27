@@ -1882,6 +1882,62 @@ function M._on_tools_complete(session_id, is_sub_agent)
     end
   end
 
+  -- ===== 下下轮压缩：对上一轮追踪过的文件的工具结果进行压缩 =====
+  -- 如果上一轮追踪器中有文件被访问，本轮中这些文件的工具结果将被压缩为摘要
+  -- 并在请求末尾通过虚拟工具 get_file_context 提供实时信息
+  local prev_tracker = request_handler.get_prev_file_tracker()
+  if prev_tracker and next(prev_tracker) then
+    for i = #ss.messages, 1, -1 do
+      local msg = ss.messages[i]
+      if msg.role == "tool" and msg.content and msg.content ~= "" then
+        local tool_name = msg.name or ""
+        -- 检查该工具是否访问了上一轮追踪过的文件
+        local should_compress = false
+        if msg.normalized_args then
+          local filepath = msg.normalized_args.filepath or msg.normalized_args.path or msg.normalized_args.cwd or ""
+          if filepath ~= "" then
+            local abs_path = vim.fn.fnamemodify(filepath, ":p")
+            if prev_tracker[abs_path] then
+              should_compress = true
+            end
+          end
+        end
+        -- 如果工具名匹配已知的文件访问工具，也尝试压缩
+        if not should_compress then
+          local file_access_tools = {
+            read_file = true, write_file = true, insert_edit_into_file = true,
+            create_file = true, delete_file = true, edit_node = true, delete_node = true,
+            replace_text = true, search_files = true, grep_search = true,
+            file_exists = true, list_files = true, ensure_dir = true, create_directory = true,
+            get_node_type = true, get_node_at_position = true, get_child_nodes = true,
+            get_parent_node = true, get_node_code = true, get_node_range = true,
+            is_named_node = true, query_tree = true, parse_file = true,
+          }
+          if file_access_tools[tool_name] then
+            should_compress = true
+          end
+        end
+
+        if should_compress and not msg.content:find("^%[执行成功%]", 1, true) and not msg.content:find("^%[执行失败%]", 1, true) then
+          local lower = msg.content:lower()
+          if lower:find("error") or lower:find("失败") or lower:find("错误") or lower:find("fail") then
+            msg.content = string.format("[执行失败] 工具: %s, 错误: %s", tool_name, msg.content:sub(1, 300))
+          else
+            -- 压缩为摘要，保留前 200 字符
+            local summary = msg.content:sub(1, 200)
+            if #msg.content > 200 then
+              summary = summary .. "\n...(截断，完整结果可通过 get_file_context 虚拟工具获取最新文件内容)"
+            end
+            msg.content = string.format("[执行成功] 工具: %s\n%s", tool_name, summary)
+          end
+        end
+      end
+    end
+  end
+
+  -- ===== 保存本轮文件追踪快照供下一轮使用 =====
+  request_handler.snapshot_file_tracker()
+
   if ss.stop_requested then
     ss._tools_complete_in_progress = false
     ss._generation_completed = false

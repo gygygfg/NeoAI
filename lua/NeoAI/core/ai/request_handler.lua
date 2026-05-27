@@ -33,6 +33,8 @@ local tool_call_counter = 0
 -- 格式：{ [abs_path] = { nodes = { [node_key] = { node_type, name, original_code, current_code, accessed } }, touched_lines = { [line] = true } } }
 -- node_key = node_type .. "::" .. name（如 "function_definition::my_func"）
 local _file_change_tracker = {}
+-- 上一轮的文件变更追踪快照（用于下下轮压缩和虚拟工具注入）
+local _prev_file_change_tracker = {}
 
 -- 顶层结构节点类型（函数、类、方法等），用于识别代码结构
 local _top_level_node_types = {
@@ -235,6 +237,30 @@ end
 --- 重置文件变更追踪（每轮工具循环开始时调用）
 function M.reset_file_tracker()
   _file_change_tracker = {}
+end
+
+--- 将当前文件追踪器快照保存为上一轮追踪器（用于下下轮压缩）
+--- 在 _on_tools_complete 中调用，保存本轮追踪结果供下一轮使用
+function M.snapshot_file_tracker()
+  _prev_file_change_tracker = {}
+  for abs_path, info in pairs(_file_change_tracker) do
+    _prev_file_change_tracker[abs_path] = vim.deepcopy(info)
+  end
+end
+
+--- 获取上一轮的文件追踪器快照
+--- @return table 上一轮的文件追踪数据
+function M.get_prev_file_tracker()
+  return _prev_file_change_tracker
+end
+
+--- 检查上一轮追踪器是否包含指定文件路径
+--- @param filepath string 文件路径
+--- @return boolean
+function M.is_file_tracked_in_prev_round(filepath)
+  if not filepath then return false end
+  local abs_path = vim.fn.fnamemodify(filepath, ":p")
+  return _prev_file_change_tracker[abs_path] ~= nil
 end
 
 --- 记录文件读取操作
@@ -465,6 +491,152 @@ function M.build_node_change_report()
     end
 
     ::continue_file::
+  end
+
+  return table.concat(parts, "\n")
+end
+
+--- 基于指定追踪器构建节点变更报告（用于上一轮追踪快照）
+--- @param tracker table 追踪器数据（如 _prev_file_change_tracker）
+--- @return string 格式化的节点变更报告
+function M.build_node_change_report_from_tracker(tracker)
+  if not tracker or not next(tracker) then
+    return ""
+  end
+
+  local parts = {}
+  table.insert(parts, "【虚拟工具 get_file_context 结果】")
+  table.insert(parts, "以下是被访问过的文件中，被读取或修改的语法树节点的原始代码与当前代码对比。")
+  table.insert(parts, "未被访问的节点已省略。")
+
+  for abs_path, info in pairs(tracker) do
+    table.insert(parts, string.format("\n%s", string.rep("=", 60)))
+    table.insert(parts, string.format("文件: %s", abs_path))
+    table.insert(parts, string.rep("=", 60))
+
+    local current_content, err = file_utils.read_file(abs_path)
+    if not current_content then
+      table.insert(parts, string.format("  [读取失败] %s", err or "未知错误"))
+      goto continue_tracker_file
+    end
+
+    local current_nodes = {}
+    if info._lang and info._original_content then
+      local lang_map = require("NeoAI.utils.language_map")
+      local parser_name = lang_map.ext_to_parser["." .. info._lang]
+      if parser_name then
+        current_nodes = _parse_top_level_nodes(current_content, parser_name)
+      end
+    end
+
+    local touched_nodes = {}
+    if info._top_nodes then
+      for node_key, node_info in pairs(info._top_nodes) do
+        local is_touched = false
+        if next(info.touched_lines) then
+          for line = node_info.start_line, node_info.end_line do
+            if info.touched_lines[line] then
+              is_touched = true
+              break
+            end
+          end
+        else
+          is_touched = true
+        end
+
+        if is_touched then
+          local current_code = ""
+          if current_nodes and current_nodes[node_key] then
+            current_code = current_nodes[node_key].code
+          else
+            local current_lines = vim.split(current_content, "\n", { plain = true })
+            local code_lines = {}
+            for line_num = node_info.start_line, math.min(node_info.end_line, #current_lines - 1) do
+              table.insert(code_lines, current_lines[line_num + 1] or "")
+            end
+            current_code = table.concat(code_lines, "\n")
+          end
+
+          table.insert(touched_nodes, {
+            node_key = node_key,
+            node_type = node_info.node_type,
+            name = node_info.name,
+            original_code = node_info.code,
+            current_code = current_code,
+            start_line = node_info.start_line,
+            end_line = node_info.end_line,
+          })
+        end
+      end
+    end
+
+    if current_nodes then
+      for node_key, node_info in pairs(current_nodes) do
+        if not info._top_nodes or not info._top_nodes[node_key] then
+          local is_touched = false
+          if next(info.touched_lines) then
+            for line = node_info.start_line, node_info.end_line do
+              if info.touched_lines[line] then
+                is_touched = true
+                break
+              end
+            end
+          else
+            is_touched = true
+          end
+
+          if is_touched then
+            table.insert(touched_nodes, {
+              node_key = node_key,
+              node_type = node_info.node_type,
+              name = node_info.name,
+              original_code = "[新增节点，原始文件中不存在]",
+              current_code = node_info.code,
+              start_line = node_info.start_line,
+              end_line = node_info.end_line,
+              is_new = true,
+            })
+          end
+        end
+      end
+    end
+
+    table.sort(touched_nodes, function(a, b)
+      return a.start_line < b.start_line
+    end)
+
+    if #touched_nodes == 0 then
+      table.insert(parts, "  (未检测到被访问的语法树节点)")
+    else
+      for _, node in ipairs(touched_nodes) do
+        local changed = node.original_code ~= node.current_code
+        local status = changed and "[已修改]" or (node.is_new and "[新增]" or "[未变更]")
+        table.insert(parts, string.format("\n  %s %s: %s (行 %d-%d)", status, node.node_type, node.name, node.start_line + 1, node.end_line + 1))
+
+        if changed then
+          table.insert(parts, "    原始代码:")
+          for _, line in ipairs(vim.split(node.original_code, "\n", { plain = true })) do
+            table.insert(parts, "      | " .. line)
+          end
+          table.insert(parts, "    当前代码:")
+          for _, line in ipairs(vim.split(node.current_code, "\n", { plain = true })) do
+            table.insert(parts, "      | " .. line)
+          end
+        elseif not node.is_new then
+          table.insert(parts, "    代码:")
+          for _, line in ipairs(vim.split(node.current_code, "\n", { plain = true })) do
+            table.insert(parts, "      | " .. line)
+          end
+        else
+          table.insert(parts, "    代码:")
+          for _, line in ipairs(vim.split(node.current_code, "\n", { plain = true })) do
+            table.insert(parts, "      | " .. line)
+          end
+        end
+      end
+    end
+
+    ::continue_tracker_file::
   end
 
   return table.concat(parts, "\n")
@@ -804,8 +976,8 @@ function M.build_request(params)
   -- 自动调用虚拟工具 get_file_context 获取文件节点状态报告，注入到请求末尾
   -- 该工具不暴露给 AI，仅在内部自动调用
   -- 按语法树节点（函数、类等）展示原始代码 vs 当前代码，未被访问的节点不展示
-  if mode ~= "fim" and next(_file_change_tracker) then
-    local result = M.get_file_context()
+  if mode ~= "fim" and next(_prev_file_change_tracker) then
+    local result = M.build_node_change_report_from_tracker(_prev_file_change_tracker)
     if result and result ~= "" then
       -- 去重：移除上一条 get_file_context 消息（通过内容前缀匹配）
       -- 只保留最新的报告，避免历史报告累积导致请求体膨胀
