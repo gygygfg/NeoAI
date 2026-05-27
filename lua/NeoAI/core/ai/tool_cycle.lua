@@ -46,102 +46,156 @@ local function _traceback_if_debug()
   return "traceback_disabled"
 end
 
--- 性能优化：消息上下文窗口大小限制
--- 防止 ss.messages 在工具循环中无限增长导致内存和序列化开销
--- 降低 MAX_CONTEXT_MESSAGES 从 50→30，减少内存占用和 API 请求体积
-local MAX_CONTEXT_MESSAGES = 30  -- 保留最近 30 条消息
-local MIN_RETAIN_ROUNDS = 3      -- 至少保留最近 3 轮完整对话
-
 -- 单条工具结果内容最大长度（字符数），超出部分截断
 -- 防止大文件读取或命令输出撑爆消息上下文
 local MAX_TOOL_RESULT_LENGTH = 32000  -- 32KB
 
--- 性能优化：_trim_messages 调用节流
--- 对于每次工具结果调用可避免不必要的 O(n) 扫描和内存分配
--- 仅在每隔 TRIM_THROTTLE_INTERVAL 次调用才执行裁剪逻辑
-local _trim_call_count = 0
-local TRIM_THROTTLE_INTERVAL = 5  -- 每 5 次调用执行一次裁剪
+-- 单次请求最大 body 大小（字节），超过此大小直接报错并打印完整请求体
+-- 61MB 的请求体导致 DeepSeek 等模型空闲超时（30s），触发重试死循环
+-- 设置为 10MB，给正常请求留足空间
+local MAX_BODY_SIZE_BYTES = 10 * 1024 * 1024  -- 10MB
 
--- 性能优化：裁剪消息上下文窗口，防止无限增长
--- 保留系统消息 + 最近 N 条消息（至少保留 MIN_RETAIN_ROUNDS 轮完整对话）
+-- 估算消息列表序列化为 JSON 后的 body 大小（字节）
+-- 使用近似估算而非完整序列化，避免性能开销
+-- @param messages table 消息列表
+-- @return number 估算的 body 大小（字节）
+local function _estimate_body_size(messages)
+  local size = 0
+  for _, msg in ipairs(messages) do
+    -- 每条消息的固定开销（role, tool_call_id 等字段）
+    size = size + 50
+    if msg.content and type(msg.content) == "string" then
+      size = size + #msg.content
+    end
+    if msg.name then
+      size = size + #msg.name
+    end
+    if msg.tool_calls then
+      for _, tc in ipairs(msg.tool_calls) do
+        size = size + 100  -- tool_call 固定开销
+        if tc["function"] then
+          size = size + #(tc["function"].name or "")
+          size = size + #(tc["function"].arguments or "")
+        end
+        if tc.func then
+          size = size + #(tc.func.name or "")
+          size = size + #(tc.func.arguments or "")
+        end
+      end
+    end
+  end
+  return size
+end
+
+-- 截断 oversized 的 tool 结果内容，使 body 大小不超过 MAX_BODY_SIZE_BYTES
+-- 从最旧的 tool 消息开始截断，保留最新的 tool 结果完整
+-- @param messages table 消息列表
+-- @param system_count number 系统消息数量
+local function _truncate_oversized_tool_results(messages, system_count)
+  local estimated = _estimate_body_size(messages)
+  if estimated <= MAX_BODY_SIZE_BYTES then
+    return
+  end
+
+  logger.warn(
+    "[tool_orchestrator] body 大小 %.1fMB 超过限制 %.1fMB，开始截断 tool 结果",
+    estimated / (1024 * 1024),
+    MAX_BODY_SIZE_BYTES / (1024 * 1024)
+  )
+
+  -- 打印消息摘要到日志，帮助诊断 body 膨胀原因
+  local summary_lines = {}
+  table.insert(summary_lines, "===== 请求体超限，消息摘要 =====")
+  table.insert(summary_lines, string.format("消息总数: %d, 估算大小: %.1fMB", #messages, estimated / (1024 * 1024)))
+  for i, msg in ipairs(messages) do
+    local tc_args_size = 0
+    if msg.tool_calls then
+      for _, tc in ipairs(msg.tool_calls) do
+        if tc["function"] then
+          tc_args_size = tc_args_size + #(tc["function"].arguments or "")
+        end
+        if tc.func then
+          tc_args_size = tc_args_size + #(tc.func.arguments or "")
+        end
+      end
+    end
+    table.insert(summary_lines, string.format("  [%d] role=%-10s name=%-20s content_len=%-8d tool_calls=%-2d tc_args_size=%-8d",
+      i, msg.role or "?", msg.name or "-", #(msg.content or ""),
+      msg.tool_calls and #msg.tool_calls or 0, tc_args_size))
+  end
+  logger.warn("[tool_orchestrator] 请求体超限消息摘要:\n%s", table.concat(summary_lines, "\n"))
+
+  -- 从最旧的 tool 消息开始截断，保留最新的 tool 结果完整
+  -- 收集所有 tool 消息的索引
+  local tool_indices = {}
+  for i = system_count + 1, #messages do
+    if messages[i].role == "tool" and messages[i].content and #messages[i].content > 500 then
+      table.insert(tool_indices, i)
+    end
+  end
+
+  -- 从旧到新截断，直到 body 大小低于限制
+  for _, idx in ipairs(tool_indices) do
+    if _estimate_body_size(messages) <= MAX_BODY_SIZE_BYTES then
+      break
+    end
+    local msg = messages[idx]
+    local tool_name = msg.name or "unknown"
+    local original_len = #(msg.content or "")
+    -- 截断到 500 字符 + 摘要标记
+    local summary = (msg.content or ""):sub(1, 500)
+    local lower = summary:lower()
+    if lower:find("error") or lower:find("失败") or lower:find("错误") or lower:find("fail") then
+      msg.content = string.format("[执行失败] 工具: %s, 错误: %s\n...(截断，原大小 %d 字节)", tool_name, summary, original_len)
+    else
+      msg.content = string.format("[执行成功] 工具: %s\n%s\n...(截断，原大小 %d 字节)", tool_name, summary, original_len)
+    end
+    logger.debug("[tool_orchestrator] 截断 tool 结果: %s, %d -> %d 字节", tool_name, original_len, #msg.content)
+  end
+
+  local final_estimated = _estimate_body_size(messages)
+  if final_estimated > MAX_BODY_SIZE_BYTES then
+    -- 截断后仍然超限：打印完整请求体到日志，然后报错
+    -- 收集所有消息的完整内容用于诊断
+    local dump_lines = {}
+    table.insert(dump_lines, "===== 请求体过大，截断后仍超限 =====")
+    table.insert(dump_lines, string.format("原始大小: %.1fMB, 截断后大小: %.1fMB, 限制: %.1fMB",
+      estimated / (1024 * 1024), final_estimated / (1024 * 1024), MAX_BODY_SIZE_BYTES / (1024 * 1024)))
+    table.insert(dump_lines, string.format("消息总数: %d", #messages))
+    for i, msg in ipairs(messages) do
+      local content_preview = ""
+      if msg.content and type(msg.content) == "string" then
+        content_preview = msg.content:sub(1, 200)
+      end
+      local tc_count = msg.tool_calls and #msg.tool_calls or 0
+      table.insert(dump_lines, string.format("  [%d] role=%s, name=%s, tool_call_id=%s, content_len=%d, tool_calls=%d, content_preview=%s",
+        i, msg.role or "?", msg.name or "-", msg.tool_call_id or "-",
+        #(msg.content or ""), tc_count, content_preview))
+    end
+    local dump_text = table.concat(dump_lines, "\n")
+    logger.error("[tool_orchestrator] 请求体过大，截断后仍超限:\n%s", dump_text)
+    error(string.format("请求体过大: 截断后仍为 %.1fMB (限制 %.1fMB)，已打印完整请求体到日志",
+      final_estimated / (1024 * 1024), MAX_BODY_SIZE_BYTES / (1024 * 1024)))
+  end
+
+  logger.warn(
+    "[tool_orchestrator] 截断后 body 大小: %.1fMB (原 %.1fMB)",
+    final_estimated / (1024 * 1024),
+    estimated / (1024 * 1024)
+  )
+end
+
+-- 检查消息 body 大小，超限时截断 tool 结果或直接报错
+-- 取消消息数量轮次限制，只保留 body 大小限制
 local function _trim_messages(messages)
-  -- 节流：每 TRIM_THROTTLE_INTERVAL 次调用才执行一次实际裁剪
-  _trim_call_count = _trim_call_count + 1
-  if _trim_call_count % TRIM_THROTTLE_INTERVAL ~= 0 then
-    return
-  end
-  if #messages <= MAX_CONTEXT_MESSAGES then
-    return
-  end
-  -- 保留系统消息（如果有）
+  -- 只检查 body 大小，不限制消息数量
+  -- 找到系统消息数量用于截断逻辑
   local system_count = 0
   for _, msg in ipairs(messages) do
     if msg.role == "system" then system_count = system_count + 1 else break end
   end
-  -- 从末尾向前数，至少保留 MIN_RETAIN_ROUNDS 轮完整的 user-assistant-tool 交互
-  local rounds = 0
-  local keep_from = nil
-  for i = #messages, system_count + 1, -1 do
-    if messages[i].role == "user" then
-      rounds = rounds + 1
-      if rounds >= MIN_RETAIN_ROUNDS then
-        keep_from = i
-        break
-      end
-    end
-  end
-  -- 硬限制：不超过 MAX_CONTEXT_MESSAGES（需扣除系统消息占用的槽位）
-  local max_keep_from = math.max(
-    system_count + 1,
-    #messages - (MAX_CONTEXT_MESSAGES - system_count) + 1
-  )
-  if keep_from then
-    keep_from = math.max(keep_from, max_keep_from)
-  else
-    -- 未找到足够的 user 消息（可能全是 tool/assistant 消息或工具循环中），使用硬限制兜底
-    keep_from = max_keep_from
-  end
-  -- 确保裁剪不破坏 assistant(tool_calls) -> tool 成对关系
-  -- OpenAI API 要求：每个 tool 消息前必须有对应的 assistant(tool_calls) 消息
-  -- 裁剪点不能落在 assistant(tool_calls) 和 tool 消息之间
-  while keep_from > system_count + 1 and messages[keep_from].role == "tool" do
-    keep_from = keep_from - 1
-  end
-  -- 最终检查：裁剪后第一条非 system 消息不能是 tool 消息
-  if keep_from > #messages or keep_from <= system_count then
-    return
-  end
-  if messages[keep_from].role == "tool" then
-    -- 极端情况：所有非 system 消息都是 tool 消息，无法安全裁剪
-    -- 清空所有非系统消息以释放内存，防止无限增长导致 OOM
-    logger.warn("[tool_orchestrator] 消息裁剪：所有非系统消息均为 tool 消息，清空非系统消息以防止内存泄漏")
-    for i = #messages, system_count + 1, -1 do
-      messages[i] = nil
-    end
-    return
-  end
-  -- 裁剪：删除前面的旧消息（保留系统消息 + keep_from 之后的消息）
-  local trimmed = {}
-  for i = 1, system_count do
-    trimmed[i] = messages[i]
-  end
-  local ti = system_count + 1
-  for i = keep_from, #messages do
-    trimmed[ti] = messages[i]
-    ti = ti + 1
-  end
-  -- 原地替换：先清空超出部分，再复制回去
-  local old_len = #messages
-  for i = #messages, ti, -1 do
-    messages[i] = nil
-  end
-  for i = 1, #trimmed do
-    messages[i] = trimmed[i]
-  end
-  logger.debug("[tool_orchestrator] 消息上下文裁剪: %d -> %d 条", old_len, #trimmed)
+  _truncate_oversized_tool_results(messages, system_count)
 end
-
--- 性能优化：消息上下文窗口大小限制（已整合到 _trim_messages 中）
 
 -- ========== 状态 ==========
 
@@ -1816,6 +1870,15 @@ function M._on_tools_complete(session_id, is_sub_agent)
           msg.content = string.format("[执行成功] 工具: %s\n%s", tool_name, summary)
         end
       end
+      -- 同时精简 assistant 消息中的 tool_calls.arguments（参数字符串通常很大）
+      if msg.role == "assistant" and msg.tool_calls then
+        for _, tc in ipairs(msg.tool_calls) do
+          local func = tc["function"] or tc.func
+          if func and func.arguments and #func.arguments > 500 then
+            func.arguments = func.arguments:sub(1, 500) .. "\n...(截断，原大小 " .. #func.arguments .. " 字节)"
+          end
+        end
+      end
     end
   end
 
@@ -2230,6 +2293,14 @@ function M.on_generation_complete(data)
   })
   if abnormal then
     local retry_count = ss._tool_retry_count or 0
+
+    -- 如果是空响应重试（模型超时），先检查 body 大小
+    -- _trim_messages → _truncate_oversized_tool_results 会处理截断
+    -- 如果截断后仍然超限会直接 error 报错并打印完整请求体
+    if reason and reason:find("空响应") then
+      _trim_messages(ss.messages)
+    end
+
     if request_handler.can_retry(retry_count) then
       local new_retry_count = retry_count + 1
       ss._tool_retry_count = new_retry_count

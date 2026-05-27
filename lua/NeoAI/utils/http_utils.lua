@@ -435,6 +435,7 @@ function M.create_stream_processor(generation_id, session_id, window_id, is_tool
     -- 工具调用累积状态（用于调试和完整性检查）
     _json_depth = 0, -- 当前 JSON 嵌套深度（{+1, }-1）
     _json_depth_changed = false, -- 深度是否曾发生过变化
+    _json_depth_log_count = 0, -- 深度为0日志计数器，用于节流
   }
 end
 
@@ -608,6 +609,9 @@ function M.process_stream_chunk(processor, data)
   -- ===== 工具调用累积日志（仅调试用，不打断流式接收） =====
   if result.tool_calls_delta and #result.tool_calls_delta > 0 then
     if M._check_json_depth_zero(processor) and processor._json_depth_changed then
+      -- BUG FIX: 打印日志后将 _json_depth_changed 重置为 false
+      -- 防止 _json_depth_changed 永远为 true，导致每个后续 chunk 都重复打印
+      processor._json_depth_changed = false
       logger.debug("[http_utils] 工具调用 JSON 深度为0，等待 finish_reason")
     end
   end
@@ -707,6 +711,7 @@ function M.clear_dual_trigger_state(processor)
   end
   processor._json_depth = 0
   processor._json_depth_changed = false
+  processor._json_depth_log_count = 0
 end
 
 -- =====================================================================
@@ -973,6 +978,14 @@ function M.send_request(params)
   if ok_body and type(decoded_body) == "table" and decoded_body.model then
     logger.debug(string.format("[http_client] 非流式请求 model=%s", tostring(decoded_body.model)))
   end
+  -- 警告：body 过大可能导致模型空闲超时
+  if #request_body > 5 * 1024 * 1024 then
+    logger.warn(
+      "[http_client] 请求体过大: %.1f MB, generation_id=%s, 可能导致模型空闲超时",
+      #request_body / (1024 * 1024),
+      tostring(generation_id)
+    )
+  end
   local temp_file = vim.fn.tempname()
   -- 将请求体写入临时文件，避免命令行参数过长导致 E903
   local body_file = vim.fn.tempname()
@@ -1121,6 +1134,14 @@ function M.send_request_retry(params, on_complete)
       #request_body
     )
   )
+  -- 警告：body 过大可能导致模型空闲超时
+  if #request_body > 5 * 1024 * 1024 then
+    logger.warn(
+      "[http_client] 请求体过大: %.1f MB, generation_id=%s, 可能导致模型空闲超时",
+      #request_body / (1024 * 1024),
+      tostring(generation_id)
+    )
+  end
   local temp_file = vim.fn.tempname()
   -- 将请求体写入临时文件，避免命令行参数过长
   local body_file = vim.fn.tempname()
@@ -1291,6 +1312,14 @@ function M.send_stream_request(params, on_chunk, on_complete, on_error)
       #request_body
     )
   )
+  -- 警告：body 过大可能导致模型空闲超时
+  if #request_body > 5 * 1024 * 1024 then
+    logger.warn(
+      "[http_client] 请求体过大: %.1f MB, generation_id=%s, 可能导致模型空闲超时",
+      #request_body / (1024 * 1024),
+      tostring(generation_id)
+    )
+  end
   -- 对短请求体（< 8KB）使用 --data-raw 避免临时文件 I/O
   local use_temp_file = #request_body > 8192
   local temp_file = use_temp_file and vim.fn.tempname() or nil

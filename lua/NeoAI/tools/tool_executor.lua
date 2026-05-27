@@ -473,6 +473,17 @@ function M._continue_execution(
     end
     local duration = os.time() - start_time
     local formatted = M.format_result(result)
+    -- 通用结果大小限制：防止单个工具结果撑爆请求体
+    -- 注意：git_diff 等工具已有自身的大小限制，此限制作为兜底防御
+    local MAX_SINGLE_RESULT_SIZE = 1024 * 1024  -- 1MB
+    local original_size = #formatted
+    if original_size > MAX_SINGLE_RESULT_SIZE then
+      logger.warn("[tool_executor] 工具 '%s' 结果过大 (%d 字节)，截断至 %d 字节",
+        tool_name, original_size, MAX_SINGLE_RESULT_SIZE)
+      formatted = formatted:sub(1, MAX_SINGLE_RESULT_SIZE)
+        .. string.format("\n\n... (结果被截断，原大小 %d 字节，仅显示前 %d 字节)",
+             original_size, MAX_SINGLE_RESULT_SIZE)
+    end
     local ok, err = pcall(fire_event, event_constants.TOOL_EXECUTION_COMPLETED, {
       tool_name = tool_name,
       pack_name = pack_name,

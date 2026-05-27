@@ -922,6 +922,13 @@ local function _git_diff(args, on_success, on_error)
 
   local result = _git_auto_mod.get_diff(diff_filepath, cwd)
   if result then
+    -- 限制 diff 结果大小，防止撑爆请求体
+    local MAX_DIFF_SIZE = 500 * 1024  -- 500KB
+    if #result > MAX_DIFF_SIZE then
+      result = result:sub(1, MAX_DIFF_SIZE)
+        .. string.format("\n\n... (diff 被截断，原大小 %d 字节，仅显示前 %d 字节)",
+             #result, MAX_DIFF_SIZE)
+    end
     if on_success then
       on_success(result)
     end
@@ -934,7 +941,7 @@ end
 
 M.git_diff = {
   name = "git_diff",
-  description = "查看工作区文件的差异（diff），可指定文件或查看所有变更",
+  description = "查看工作区文件的差异（diff）。注意：不传 filepath 时返回所有文件变更，数据量可能很大（超过 500KB 会被截断）。建议优先指定 filepath 参数查看特定文件变更。",
   func = _git_diff,
   async = true,
   parameters = {
