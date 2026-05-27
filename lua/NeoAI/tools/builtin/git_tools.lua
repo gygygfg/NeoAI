@@ -64,38 +64,125 @@ function _git_auto_mod._resolve_git_root(cwd)
   return target, "目录不是 git 仓库"
 end
 --- 检测 git 是否可用（使用 git status 检查，同时验证是否在 git 仓库中）
-function _git_auto_mod._check_git()
+--- 使用 vim.uv.spawn 异步执行，不阻塞主线程
+function _git_auto_mod._check_git(callback)
+  callback = callback or function() end
+
   -- 跳过家目录，避免在 ~ 目录下执行 git 操作（如 ~/ 下有 .git 会扫描大量文件）
   local home = vim.fn.expand("~")
   local cwd = vim.fn.getcwd()
   if cwd == home then
     state.git_available = false
     state.git_root = nil
-    return false
+    callback(false)
+    return
   end
 
-  local ok = pcall(vim.fn.system, "git status 2>/dev/null")
-  if vim.v.shell_error == 0 then
-    state.git_available = true
-    -- 获取 git 根目录
-    local root = vim.fn.system("git rev-parse --show-toplevel 2>/dev/null"):gsub("%s+$", "")
-    if vim.v.shell_error == 0 and root ~= "" then
-      state.git_root = root
-    else
-      state.git_root = vim.fn.getcwd()
+  local stdout_data = {}
+  local stderr_data = {}
+
+  -- 异步执行 git status
+  local stdout = vim.uv.new_pipe(false)
+  local stderr = vim.uv.new_pipe(false)
+
+  local handle
+  handle = vim.uv.spawn("git", {
+    args = { "status" },
+    stdio = { nil, stdout, stderr },
+  }, function(code, signal)
+    -- 关闭管道
+    if stdout then pcall(stdout.close, stdout) end
+    if stderr then pcall(stderr.close, stderr) end
+    if handle and not handle:is_closing() then
+      handle:close()
     end
-    return true
+
+    -- 在主线程中更新状态
+    vim.schedule(function()
+      if code == 0 then
+        state.git_available = true
+        -- 获取 git 根目录
+        _git_auto_mod._get_git_root_async(function(root)
+          if root then
+            state.git_root = root
+          else
+            state.git_root = vim.fn.getcwd()
+          end
+          callback(true)
+        end)
+      else
+        state.git_available = false
+        state.git_root = vim.fn.getcwd()
+        callback(false)
+      end
+    end)
+  end)
+
+  if not handle then
+    state.git_available = false
+    state.git_root = vim.fn.getcwd()
+    vim.schedule(function() callback(false) end)
+    return
   end
-  state.git_available = false
-  state.git_root = vim.fn.getcwd()
-  return false
+
+  -- 读取 stdout
+  if stdout then
+    stdout:read_start(function(err, data)
+      if data then
+        table.insert(stdout_data, data)
+      end
+    end)
+  end
+end
+
+--- 异步获取 git 根目录
+--- @param callback function(root|nil)
+function _git_auto_mod._get_git_root_async(callback)
+  local stdout_data = {}
+  local stdout = vim.uv.new_pipe(false)
+  local stderr = vim.uv.new_pipe(false)
+
+  local handle
+  handle = vim.uv.spawn("git", {
+    args = { "rev-parse", "--show-toplevel" },
+    stdio = { nil, stdout, stderr },
+  }, function(code, signal)
+    if stdout then pcall(stdout.close, stdout) end
+    if stderr then pcall(stderr.close, stderr) end
+    if handle and not handle:is_closing() then
+      handle:close()
+    end
+
+    vim.schedule(function()
+      if code == 0 and #stdout_data > 0 then
+        local root = table.concat(stdout_data):gsub("%s+$", "")
+        callback(root)
+      else
+        callback(nil)
+      end
+    end)
+  end)
+
+  if not handle then
+    vim.schedule(function() callback(nil) end)
+    return
+  end
+
+  if stdout then
+    stdout:read_start(function(err, data)
+      if data then
+        table.insert(stdout_data, data)
+      end
+    end)
+  end
 end
 
 --- 动态检测指定目录是否真实 git 仓库（每次调用都检测）
+--- 工具调用场景使用同步方式，在 vim.schedule 中执行不会阻塞 UI
 --- @param cwd string|nil 目标目录（默认当前目录）
 --- @return boolean, string|nil 是否可用，git 根目录
 function _git_auto_mod._detect_real_git(cwd)
-    local target = cwd or vim.fn.getcwd() or state.git_root
+  local target = cwd or vim.fn.getcwd() or state.git_root
   local home = vim.fn.expand("~")
   if target == home then
     return false, nil
@@ -713,27 +800,28 @@ function _git_auto_mod.initialize(config)
   config = config or {}
   state.auto_commit_enabled = config.auto_git_commit ~= false
 
-  -- 检测 git 环境
-  local has_git = _git_auto_mod._check_git()
-  if not has_git then
-    -- 判断是否因为家目录而跳过了 git 检测
-    local home = vim.fn.expand("~")
-    local cwd = vim.fn.getcwd()
-    if cwd == home then
-      logger.info("[git_auto] 当前目录为家目录(%s)，跳过 git 初始化", home)
-    else
-      logger.info("[git_auto] git 不可用，启用伪 Git 模式")
-      _git_auto_mod._init_pseudo()
-    end
-  else
-    logger.info("[git_auto] git 可用，工作目录: %s", state.git_root)
-  end
-
-  -- 注册事件监听
+  -- 注册事件监听（不依赖 git 检测结果）
   _git_auto_mod._register_listeners()
 
-  state.initialized = true
-  logger.info("[git_auto] 初始化完成 (git=%s, auto_commit=%s)", has_git, state.auto_commit_enabled)
+  -- 异步检测 git 环境，使用 vim.uv.spawn 不阻塞主线程
+  _git_auto_mod._check_git(function(has_git)
+    if not has_git then
+      -- 判断是否因为家目录而跳过了 git 检测
+      local home = vim.fn.expand("~")
+      local cwd = vim.fn.getcwd()
+      if cwd == home then
+        logger.info("[git_auto] 当前目录为家目录(%s)，跳过 git 初始化", home)
+      else
+        logger.info("[git_auto] git 不可用，启用伪 Git 模式")
+        _git_auto_mod._init_pseudo()
+      end
+    else
+      logger.info("[git_auto] git 可用，工作目录: %s", state.git_root)
+    end
+
+    state.initialized = true
+    logger.info("[git_auto] 初始化完成 (git=%s, auto_commit=%s)", has_git, state.auto_commit_enabled)
+  end)
 end
 
 -- ========== 公共 API（供 git_tools 调用） ==========
@@ -1325,8 +1413,11 @@ M.git_auto_commit_config = {
 
 -- ============================================================================
 -- 自动初始化：模块加载时自动检测 git 环境
+-- 使用 vim.defer_fn 延迟 800ms 初始化，分散初始化负载
 -- ============================================================================
-_git_auto_mod.initialize()
+vim.defer_fn(function()
+  _git_auto_mod.initialize()
+end, 800)
 
 return M
 

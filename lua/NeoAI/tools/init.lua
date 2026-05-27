@@ -25,11 +25,9 @@ function M.initialize(config)
   tool_executor.initialize(tools_config)
   tool_validator.initialize(tools_config)
   initialized = true
-  -- 延迟加载内置工具，不阻塞初始化流程
+  -- 内置工具同步加载（ensure_tools 在首次使用时才调用，用户已等待）
   if tools_config.builtin ~= false then
-    vim.schedule(function()
-      M._load_builtin_tools()
-    end)
+    M._load_builtin_tools()
   end
   -- 外部工具通过 tool_registry 统一加载（从 merger.lua 合并后的完整配置）
   tool_registry.load_external_tools_from_config(config)

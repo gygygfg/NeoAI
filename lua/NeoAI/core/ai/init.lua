@@ -17,33 +17,51 @@
 
 local M = {}
 
-M.engine = require("NeoAI.core.ai.engine")
-M.http_utils = require("NeoAI.utils.http_utils")
-M.request_handler = require("NeoAI.core.ai.request_handler")
-M.tool_cycle = require("NeoAI.core.ai.tool_cycle")
-M.sub_agent_engine = require("NeoAI.core.ai.sub_agent_engine")
-M.chat_service = require("NeoAI.core.ai.chat_service")
+-- 延迟加载：所有子模块在首次访问或 initialize() 时按需加载
+-- 避免 require("NeoAI.core.ai") 时立即加载所有子模块破坏外层懒加载
+local _loaded = {}
 
--- 多线程优化模块（v3.0+）
--- thread_pool: 线程池管理器，自动选择最优执行后端（子进程/主线程）
--- async_orchestrator: 异步编排器，管理 AI→工具→AI 的异步循环
-M.thread_pool = require("NeoAI.core.ai.thread_pool")
-M.async_orchestrator = require("NeoAI.core.ai.async_orchestrator")
+local function _lazy_get(key, mod_path)
+  if not _loaded[key] then
+    _loaded[key] = require(mod_path)
+  end
+  return _loaded[key]
+end
+
+function M.__index(m, key)
+  local mod_map = {
+    engine = "NeoAI.core.ai.engine",
+    http_utils = "NeoAI.utils.http_utils",
+    request_handler = "NeoAI.core.ai.request_handler",
+    tool_cycle = "NeoAI.core.ai.tool_cycle",
+    sub_agent_engine = "NeoAI.core.ai.sub_agent_engine",
+    chat_service = "NeoAI.core.ai.chat_service",
+    thread_pool = "NeoAI.core.ai.thread_pool",
+    async_orchestrator = "NeoAI.core.ai.async_orchestrator",
+  }
+  local path = mod_map[key]
+  if path then
+    return _lazy_get(key, path)
+  end
+  return nil
+end
+
+setmetatable(M, M)
 
 --- 初始化所有 AI 子模块
 --- @param options table 配置选项
 function M.initialize(options)
-  M.chat_service.initialize(options)
+  _lazy_get("chat_service", "NeoAI.core.ai.chat_service").initialize(options)
   -- 初始化线程池和异步编排器（pre-warm）
-  M.thread_pool.initialize(options or {})
-  M.async_orchestrator.initialize(options or {})
+  _lazy_get("thread_pool", "NeoAI.core.ai.thread_pool").initialize(options or {})
+  _lazy_get("async_orchestrator", "NeoAI.core.ai.async_orchestrator").initialize(options or {})
 end
 
 --- 关闭所有 AI 子模块
 function M.shutdown()
-  M.chat_service.shutdown()
-  M.async_orchestrator.shutdown()
-  M.thread_pool.cancel_all()
+  if _loaded.chat_service then pcall(_loaded.chat_service.shutdown) end
+  if _loaded.async_orchestrator then pcall(_loaded.async_orchestrator.shutdown) end
+  if _loaded.thread_pool then pcall(_loaded.thread_pool.cancel_all) end
 end
 
 return M

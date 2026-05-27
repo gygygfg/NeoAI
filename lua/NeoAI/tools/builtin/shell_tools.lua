@@ -544,6 +544,9 @@ local function _run_command(args, on_success, on_error, on_progress)
             result[#result + 1] = string.char(byte)
             i = i + 1
           end
+        elseif byte < 32 and byte ~= 9 and byte ~= 10 and byte ~= 13 then
+          -- 控制字符：跳过，防止 API JSON 解析失败
+          i = i + 1
         else
           result[#result + 1] = string.char(byte)
           i = i + 1
@@ -838,7 +841,7 @@ local function _run_command(args, on_success, on_error, on_progress)
 
       -- 清理特殊字符：移除空字符、控制字符等可能导致 JSON 序列化失败的内容
       -- 确保字符串可以被安全嵌入 JSON：转义反斜杠和双引号，修复无效 UTF-8 序列
-      -- 注意：保留所有原始数据（包括空字符、控制字符等），只修复格式问题
+      -- 注意：保留所有原始数据，只修复格式问题并移除控制字符
       local function sanitize_for_json(text)
         if not text then
           return ""
@@ -883,8 +886,11 @@ local function _run_command(args, on_success, on_error, on_progress)
               result[#result + 1] = string.char(byte)
               i = i + 1
             end
+          elseif byte < 32 and byte ~= 9 and byte ~= 10 and byte ~= 13 then
+            -- 控制字符（0x00-0x1F，排除 tab/换行/回车）：跳过，防止 API JSON 解析失败
+            i = i + 1
           else
-            -- 所有其他字节（包括空字符 \0、控制字符、ASCII 可打印字符等）原样保留
+            -- 所有其他字节（ASCII 可打印字符等）原样保留
             result[#result + 1] = string.char(byte)
             i = i + 1
           end

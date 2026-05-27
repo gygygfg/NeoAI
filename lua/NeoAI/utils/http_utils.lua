@@ -1521,8 +1521,16 @@ function M.send_stream_request(params, on_chunk, on_complete, on_error)
         )
       )
     end
-    if not has_error and on_complete then
-      on_complete()
+    if not has_error then
+      if total_received == 0 then
+        -- 流式请求完成但没有任何数据到达（空响应），触发错误回调
+        logger.warn("[http_client] 流式请求空响应: generation_id=%s, 无任何数据到达", tostring(generation_id))
+        if on_error then
+          on_error("Empty stream response (no data received)")
+        end
+      elseif on_complete then
+        on_complete()
+      end
     end
   end
 

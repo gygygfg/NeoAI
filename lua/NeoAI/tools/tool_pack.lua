@@ -43,75 +43,30 @@ local category_config = {
 
 -- ========== 初始化 ==========
 
---- 从 builtin 目录动态扫描工具，按 category 分组
+--- 从 tool_registry 读取已注册的工具，按 category 分组
+--- 不再扫描 builtin 目录，避免与 tools/init.lua 的 _load_builtin_tools() 重复
 function M.initialize()
   packs = {}
 
-  local builtin_dir = debug.getinfo(1).source:match("^@(.+)$")
-  if not builtin_dir then
-    -- 回退：从 runtimepath 查找
-    for _, rt in ipairs(vim.api.nvim_list_runtime_paths()) do
-      local candidate = rt .. "/lua/NeoAI/tools/builtin"
-      if vim.uv.fs_stat(candidate) then
-        builtin_dir = candidate
-        break
-      end
-    end
-  end
-  if not builtin_dir then
-    return
-  end
+  local ok, registry = pcall(require, "NeoAI.tools.tool_registry")
+  if not ok then return end
 
-  -- 如果 matched 的是完整文件路径，提取目录部分
-  if not vim.uv.fs_stat(builtin_dir) or vim.uv.fs_stat(builtin_dir).type ~= "directory" then
-    builtin_dir = builtin_dir:match("^(.+/)tool_pack%.lua$")
-    if builtin_dir then
-      builtin_dir = builtin_dir .. "builtin"
+  -- tool_registry 可能尚未初始化（在 ensure_core -> engine -> tool_cycle 路径中调用时）
+  local list_ok, registered_tools = pcall(registry.list, registry)
+  if not list_ok or not registered_tools then return end
+  for _, tool in ipairs(registered_tools) do
+    local cat = tool.category or "uncategorized"
+    if not packs[cat] then
+      local cfg = category_config[cat] or { display_name = cat, icon = "🔧", order = 99 }
+      packs[cat] = {
+        name = cat,
+        display_name = cfg.display_name,
+        icon = cfg.icon,
+        tools = {},
+        order = cfg.order,
+      }
     end
-  end
-  if not builtin_dir or not vim.uv.fs_stat(builtin_dir) then
-    return
-  end
-
-  local handle = vim.uv.fs_scandir(builtin_dir)
-  if not handle then
-    return
-  end
-
-  while true do
-    local name, file_type = vim.uv.fs_scandir_next(handle)
-    if not name then
-      break
-    end
-    if file_type == "file" and name:match("%.lua$") then
-      local mod_name = name:gsub("%.lua$", "")
-      local ok, mod = pcall(require, "NeoAI.tools.builtin." .. mod_name)
-      if ok and type(mod) == "table" then
-        -- 从模块中提取工具定义（工具是模块上的命名 table，包含 name 和 func 字段）
-        local tools = {}
-        for _, v in pairs(mod) do
-          if type(v) == "table" and v.name and v.func then
-            table.insert(tools, v)
-          end
-        end
-        for _, tool in ipairs(tools) do
-          if tool.name and tool.func then
-            local cat = tool.category or "uncategorized"
-            if not packs[cat] then
-              local cfg = category_config[cat] or { display_name = cat, icon = "🔧", order = 99 }
-              packs[cat] = {
-                name = cat,
-                display_name = cfg.display_name,
-                icon = cfg.icon,
-                tools = {},
-                order = cfg.order,
-              }
-            end
-            table.insert(packs[cat].tools, tool.name)
-          end
-        end
-      end
-    end
+    table.insert(packs[cat].tools, tool.name)
   end
 
   -- 对每个包内的工具列表排序

@@ -17,6 +17,73 @@ local file_utils = require("NeoAI.utils.file_utils")
 
 local M = {}
 
+-- 非法 Unicode 字符过滤：控制字符（0x00-0x08, 0x0B, 0x0C, 0x0E-0x1F）和 noncharacters（U+FFFE, U+FFFF）
+-- 使用逐个字符遍历而非 gsub pattern，避免 Lua pattern 中多字节字符的转义问题
+local function _clean_invalid_unicode(str)
+  if type(str) ~= "string" then return str or "" end
+  local result = {}
+  local i = 1
+  local len = #str
+  while i <= len do
+    local byte = string.byte(str, i)
+    -- 控制字符（0x00-0x1F），排除 tab(0x09)、换行(0x0A)、回车(0x0D)
+    if byte < 32 and byte ~= 9 and byte ~= 10 and byte ~= 13 then
+      i = i + 1
+    -- 4 字节 UTF-8 序列
+    elseif byte >= 240 and byte <= 244 then
+      if i + 3 <= len then
+        local b2, b3, b4 = string.byte(str, i + 1), string.byte(str, i + 2), string.byte(str, i + 3)
+        if b2 and b3 and b4 and b2 >= 128 and b2 <= 191 and b3 >= 128 and b3 <= 191 and b4 >= 128 and b4 <= 191 then
+          result[#result + 1] = str:sub(i, i + 3)
+          i = i + 4
+        else
+          i = i + 1
+        end
+      else
+        i = i + 1
+      end
+    -- 3 字节 UTF-8 序列：检查 U+FFFE/U+FFFF/U+D800-U+DFFF
+    elseif byte >= 224 and byte <= 239 then
+      if i + 2 <= len then
+        local b2, b3 = string.byte(str, i + 1), string.byte(str, i + 2)
+        if b2 and b3 and b2 >= 128 and b2 <= 191 and b3 >= 128 and b3 <= 191 then
+          local cp = (byte - 224) * 4096 + (b2 - 128) * 64 + (b3 - 128)
+          if cp == 0xFFFE or cp == 0xFFFF or (cp >= 0xD800 and cp <= 0xDFFF) then
+            i = i + 3 -- 跳过非法码点
+          else
+            result[#result + 1] = str:sub(i, i + 2)
+            i = i + 3
+          end
+        else
+          i = i + 1
+        end
+      else
+        i = i + 1
+      end
+    -- 2 字节 UTF-8 序列
+    elseif byte >= 194 and byte <= 223 then
+      if i + 1 <= len then
+        local b2 = string.byte(str, i + 1)
+        if b2 and b2 >= 128 and b2 <= 191 then
+          result[#result + 1] = str:sub(i, i + 1)
+          i = i + 2
+        else
+          i = i + 1
+        end
+      else
+        i = i + 1
+      end
+    -- ASCII
+    elseif byte < 128 then
+      result[#result + 1] = string.char(byte)
+      i = i + 1
+    else
+      i = i + 1
+    end
+  end
+  return table.concat(result)
+end
+
 -- ====================================================================
 -- 第一部分：Builder - 请求构建
 -- ====================================================================
@@ -740,13 +807,17 @@ function M.format_messages(messages)
           fm.reasoning_content = msg.content.reasoning_content
         end
       else
-        fm.content = tostring(msg.content)
+        fm.content = _clean_invalid_unicode(tostring(msg.content))
       end
     end
     if msg.tool_calls then fm.tool_calls = msg.tool_calls end
     if msg.role == "tool" then
       if msg.tool_call_id and msg.tool_call_id ~= "" then
-        fm.tool_call_id = msg.tool_call_id
+      -- 清理工具结果中的非法 Unicode 字符
+      if fm.content then
+        fm.content = _clean_invalid_unicode(fm.content)
+      end
+      fm.tool_call_id = msg.tool_call_id
         if expected_ids[msg.tool_call_id] then
           expected_ids[msg.tool_call_id] = expected_ids[msg.tool_call_id] - 1
           if expected_ids[msg.tool_call_id] <= 0 then expected_ids[msg.tool_call_id] = nil end
@@ -1100,6 +1171,10 @@ M.register_adapter("openai", {
       for k, v in pairs(request.extra_body) do
         result[k] = v
       end
+    end
+    -- 清洗消息中的控制字符，防止 API JSON 解析失败
+    if result.messages then
+      result.messages = M.format_messages(result.messages)
     end
     return result
   end,

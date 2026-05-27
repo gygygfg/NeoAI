@@ -289,11 +289,13 @@ function M.run(test_module)
     -- ========== utils/init.lua ==========
     test_utils_init_auto_initialized = function()
       local utils = require("NeoAI.utils")
+      utils.initialize()
       assert.is_true(utils.is_module_loaded("common"), "common 应已加载")
     end,
 
     test_utils_list_modules = function()
       local utils = require("NeoAI.utils")
+      utils.initialize()
       local modules = utils.list_modules()
       assert.contains(modules, "common", "应包含 common 模块")
       assert.contains(modules, "table_utils", "应包含 table_utils 模块")
@@ -303,6 +305,7 @@ function M.run(test_module)
 
     test_utils_get_module = function()
       local utils = require("NeoAI.utils")
+      utils.initialize()
       local common = utils.get_module("common")
       assert.not_nil(common, "common 模块应存在")
       assert.equal(nil, utils.get_module("nonexistent"), "不存在的模块应返回 nil")
@@ -310,12 +313,14 @@ function M.run(test_module)
 
     test_utils_is_module_loaded = function()
       local utils = require("NeoAI.utils")
+      utils.initialize()
       assert.is_true(utils.is_module_loaded("common"), "common 应已加载")
       assert.is_false(utils.is_module_loaded("nonexistent"), "不存在的模块应未加载")
     end,
 
     test_utils_functions_merged = function()
       local utils = require("NeoAI.utils")
+      utils.initialize()
       assert.is_true(type(utils.list_modules) == "function", "list_modules 应可用")
       assert.is_true(type(utils.get_module) == "function", "get_module 应可用")
       assert.is_true(type(utils.is_module_loaded) == "function", "is_module_loaded 应可用")
@@ -323,6 +328,7 @@ function M.run(test_module)
 
     test_utils_reload = function()
       local utils = require("NeoAI.utils")
+      utils.initialize()
       utils.reload()
       assert.is_true(utils.is_module_loaded("common") or #utils.list_modules() > 0, "reload 后应有模块")
     end,

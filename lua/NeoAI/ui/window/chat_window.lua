@@ -2536,16 +2536,13 @@ function M._setup_event_listeners()
           if ok then
             state.streaming.message_index = #state.messages
           end
-          -- 仅在光标跟随模式下显示思考过程悬浮窗
-          local win = get_win()
-          if win and cursor_near_end(win) then
-            cancel_reasoning_timer()
-            if state.tool_display.active then
-              close_tool_display()
-              reset_tool_display()
-            end
-            reasoning_display.show("🤔 AI正在思考...")
+          -- 始终显示思考过程悬浮窗（不依赖光标位置）
+          cancel_reasoning_timer()
+          if state.tool_display.active then
+            close_tool_display()
+            reset_tool_display()
           end
+          reasoning_display.show("🤔 AI正在思考...")
         end
         state.streaming.reasoning_buffer = state.streaming.reasoning_buffer .. rc
         -- 更新思考过程悬浮窗
@@ -2646,28 +2643,23 @@ function M._setup_event_listeners()
           state.streaming.message_index = #state.messages
         end
         cancel_reasoning_timer()
-        -- 仅在光标跟随模式下显示思考过程悬浮窗
-        if should_follow then
-          -- 打开思考过程悬浮窗前，关闭工具调用悬浮窗（避免重叠遮挡）
-          if state.tool_display.active then
-            close_tool_display()
-            reset_tool_display()
-          end
-          reasoning_display.show("🤔 AI正在思考...")
+        -- 始终显示思考过程悬浮窗（不依赖光标位置）
+        -- 打开思考过程悬浮窗前，关闭工具调用悬浮窗（避免重叠遮挡）
+        if state.tool_display.active then
+          close_tool_display()
+          reset_tool_display()
         end
+        reasoning_display.show("🤔 AI正在思考...")
       end
 
       state.streaming.reasoning_active = true
       -- reasoning_buffer 保持编码后的原始内容，与 content_buffer 一致
       state.streaming.reasoning_buffer = state.streaming.reasoning_buffer .. rc
-      -- 仅在光标跟随模式下更新思考过程悬浮窗内容
+      -- 始终更新思考过程悬浮窗内容
       -- 注意：思考过程只在悬浮窗中滚动显示，不追加到聊天缓冲区
       -- 等思考过程完毕后，再以折叠文本格式一次性追加到聊天缓冲区
-      -- 响应内容已直接来自 json.decode，不再进行 %%XX URL 编码
-      if should_follow then
-        if reasoning_display.is_visible() then
-          reasoning_display.append(rc)
-        end
+      if reasoning_display.is_visible() then
+        reasoning_display.append(rc)
       end
     end,
   })

@@ -11,6 +11,93 @@
 
 local M = {}
 
+-- ========== 非法字符清洗 ==========
+
+--- 移除字符串中的控制字符和非法 unicode 码点（保留 tab、换行、回车）
+--- 处理以下情况：
+---   - 控制字符 0x00-0x1F（排除 tab/换行/回车）
+---   - 非法 UTF-8 序列（无效续字节、过长编码）
+---   - 非法 unicode 码点：U+FFFE、U+FFFF、U+D800-U+DFFF（孤立代理对）
+--- @param str string
+--- @return string
+local function strip_invalid_chars(str)
+  if type(str) ~= "string" or str == "" then
+    return str or ""
+  end
+  local result = {}
+  local i = 1
+  local len = #str
+  while i <= len do
+    local byte = string.byte(str, i)
+    -- 控制字符（0x00-0x1F），排除 tab(0x09)、换行(0x0A)、回车(0x0D)
+    if byte < 32 and byte ~= 9 and byte ~= 10 and byte ~= 13 then
+      i = i + 1
+    -- 4 字节 UTF-8 序列（U+10000-U+10FFFF）：检查非法码点
+    elseif byte >= 240 and byte <= 244 then
+      if i + 3 <= len then
+        local b2 = string.byte(str, i + 1)
+        local b3 = string.byte(str, i + 2)
+        local b4 = string.byte(str, i + 3)
+        if b2 and b3 and b4 and b2 >= 128 and b2 <= 191 and b3 >= 128 and b3 <= 191 and b4 >= 128 and b4 <= 191 then
+          local cp = (byte - 240) * 262144 + (b2 - 128) * 4096 + (b3 - 128) * 64 + (b4 - 128)
+          -- 非法码点：U+FFFE、U+FFFF、U+D800-U+DFFF 不会出现在 4 字节中，但做安全检查
+          if cp >= 0x10000 and cp <= 0x10FFFF then
+            result[#result + 1] = str:sub(i, i + 3)
+            i = i + 4
+          else
+            i = i + 1 -- 跳过非法码点
+          end
+        else
+          i = i + 1 -- 无效续字节，跳过
+        end
+      else
+        i = i + 1 -- 截断，跳过
+      end
+    -- 3 字节 UTF-8 序列（U+0800-U+FFFF）：检查非法码点
+    elseif byte >= 224 and byte <= 239 then
+      if i + 2 <= len then
+        local b2 = string.byte(str, i + 1)
+        local b3 = string.byte(str, i + 2)
+        if b2 and b3 and b2 >= 128 and b2 <= 191 and b3 >= 128 and b3 <= 191 then
+          local cp = (byte - 224) * 4096 + (b2 - 128) * 64 + (b3 - 128)
+          -- 跳过非法码点：U+FFFE(0xFFFE)、U+FFFF(0xFFFF)、孤立代理对(U+D800-U+DFFF)
+          if cp == 0xFFFE or cp == 0xFFFF or (cp >= 0xD800 and cp <= 0xDFFF) then
+            i = i + 3 -- 跳过整个序列
+          else
+            result[#result + 1] = str:sub(i, i + 2)
+            i = i + 3
+          end
+        else
+          i = i + 1 -- 无效续字节，跳过
+        end
+      else
+        i = i + 1 -- 截断，跳过
+      end
+    -- 2 字节 UTF-8 序列（U+0080-U+07FF）
+    elseif byte >= 194 and byte <= 223 then
+      if i + 1 <= len then
+        local b2 = string.byte(str, i + 1)
+        if b2 and b2 >= 128 and b2 <= 191 then
+          result[#result + 1] = str:sub(i, i + 1)
+          i = i + 2
+        else
+          i = i + 1 -- 无效续字节，跳过
+        end
+      else
+        i = i + 1 -- 截断，跳过
+      end
+    -- ASCII 可打印字符和常见控制字符（tab/换行/回车）
+    elseif byte < 128 then
+      result[#result + 1] = string.char(byte)
+      i = i + 1
+    else
+      -- 非法首字节（0x80-0xBF 续字节作为首字节，或 0xF8-0xFF）
+      i = i + 1
+    end
+  end
+  return table.concat(result)
+end
+
 -- ========== 消息展平 ==========
 
 --- 将单个会话的消息展平为 role/content 列表
@@ -94,17 +181,18 @@ function M.session_to_messages(session)
         })
       end
 
-      -- 构建 tool 消息内容
+      -- 构建 tool 消息内容（清洗控制字符，防止 API JSON 解析失败）
       local result_content = ""
       if parsed.results then
         local parts = {}
         for _, res in ipairs(parsed.results) do
           local s = type(res) == "string" and res or (pcall(vim.json.encode, res) and vim.json.encode(res) or vim.inspect(res))
+          s = strip_invalid_chars(s)
           table.insert(parts, s)
         end
         result_content = table.concat(parts, "\n")
       else
-        result_content = tostring(parsed.result or "")
+        result_content = strip_invalid_chars(tostring(parsed.result or ""))
       end
 
       -- 暂存 tool 消息（使用占位 assistant 中最后添加的 tool_call_id）

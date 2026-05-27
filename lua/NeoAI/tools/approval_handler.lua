@@ -13,7 +13,7 @@ local tool_registry = require("NeoAI.tools.tool_registry")
 local ui_init = nil -- 延迟加载，避免循环依赖
 local function _get_ui()
   if not ui_init then
-    ui_init = require("NeoAI.ui.init")
+    ui_init = require("NeoAI.ui")
   end
   return ui_init
 end

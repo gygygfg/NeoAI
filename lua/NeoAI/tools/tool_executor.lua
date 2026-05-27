@@ -217,13 +217,6 @@ function M.initialize(config)
   local tv = require("NeoAI.tools.tool_validator")
   pcall(tv.initialize, config)
 
-  -- 预加载内置工具模块，触发它们的初始化逻辑
-  -- file_tools: 无显式初始化，但预加载 file_utils 依赖
-  -- neovim_lsp: ensure_lsp_init() + ensure_ts_parsers() 在模块顶层自动执行
-  -- neovim_tree: 惰性检查，无需预初始化
-  pcall(require, "NeoAI.tools.builtin.file_tools")
-  pcall(require, "NeoAI.tools.builtin.neovim_lsp")
-
   -- 应用审批配置覆盖
   -- 从合并后的完整配置中读取 tools.approval 并覆盖各工具的 approval 字段
   local tools_init = require("NeoAI.tools")

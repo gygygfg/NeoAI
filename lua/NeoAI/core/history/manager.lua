@@ -41,6 +41,13 @@ local state = {
 -- 保存的完整配置引用
 local _config = nil
 
+-- 模块引用缓存，避免 VimLeavePre 时重新 require 导致卡顿
+local _tool_cycle_ref
+local _plan_executor_ref
+local _sub_agent_engine_ref
+local _http_utils_ref
+local _engine_ref
+
 -- ========== 辅助函数 ==========
 
 --- 获取 sessions 表的引用（供缓存模块使用）
@@ -124,8 +131,23 @@ function M.initialize(options)
 
   state.initialized = true
 
-  -- 同步加载历史文件
-  M._load()
+  -- 延迟加载历史文件和模块引用缓存
+  -- 不阻塞主线程初始化
+  vim.defer_fn(function()
+    -- 缓存模块引用，避免 VimLeavePre 时重新 require 导致卡顿
+    local ok1, m1 = pcall(require, "NeoAI.core.ai.tool_cycle")
+    if ok1 then _tool_cycle_ref = m1 end
+    local ok2, m2 = pcall(require, "NeoAI.tools.builtin.plan_executor")
+    if ok2 then _plan_executor_ref = m2 end
+    local ok3, m3 = pcall(require, "NeoAI.core.ai.sub_agent_engine")
+    if ok3 then _sub_agent_engine_ref = m3 end
+    local ok4, m4 = pcall(require, "NeoAI.utils.http_utils")
+    if ok4 then _http_utils_ref = m4 end
+    local ok5, m5 = pcall(require, "NeoAI.core.ai.engine")
+    if ok5 then _engine_ref = m5 end
+
+    M._load()
+  end, 300)
 
   -- 注册 VimLeavePre 自动保存钩子
   if not state._vimleave_hooked then
@@ -146,51 +168,31 @@ function M._shutdown_and_save()
   shutdown_flag.set()
 
   -- 1. 通知工具编排器关闭（清理所有会话状态和 autocmd）
-  pcall(function()
-    local orc_ok, tool_orc = pcall(require, "NeoAI.core.ai.tool_cycle")
-    if orc_ok and tool_orc then
-      if tool_orc.set_shutting_down then
-        tool_orc.set_shutting_down()
-      end
-      if tool_orc.cleanup_all then
-        tool_orc.cleanup_all()
-      end
-    end
-  end)
+  -- 使用缓存的模块引用，避免退出时重新 require
+  if _tool_cycle_ref then
+    pcall(_tool_cycle_ref.set_shutting_down)
+    pcall(_tool_cycle_ref.cleanup_all)
+  end
 
   -- 1.5 清理子 agent（停止所有定时器，释放资源）
-  pcall(function()
-    local pe_ok, plan_executor = pcall(require, "NeoAI.tools.builtin.plan_executor")
-    if pe_ok and plan_executor and plan_executor.cleanup_all then
-      plan_executor.cleanup_all()
-    end
-  end)
+  if _plan_executor_ref and _plan_executor_ref.cleanup_all then
+    pcall(_plan_executor_ref.cleanup_all)
+  end
 
   -- 1.6 清理子 agent 引擎（清理 autocmd 监听器和 runner 状态）
-  pcall(function()
-    local sa_ok, sub_agent_engine = pcall(require, "NeoAI.core.ai.sub_agent_engine")
-    if sa_ok and sub_agent_engine and sub_agent_engine.cleanup_all then
-      sub_agent_engine.cleanup_all()
-    end
-  end)
+  if _sub_agent_engine_ref and _sub_agent_engine_ref.cleanup_all then
+    pcall(_sub_agent_engine_ref.cleanup_all)
+  end
 
   -- 2. 取消所有 HTTP 请求
-  pcall(function()
-    local http_ok, http_utils = pcall(require, "NeoAI.utils.http_utils")
-    if http_ok and http_utils and http_utils.cancel_all_requests then
-      http_utils.cancel_all_requests()
-    end
-  end)
+  if _http_utils_ref and _http_utils_ref.cancel_all_requests then
+    pcall(_http_utils_ref.cancel_all_requests)
+  end
 
   -- 2.5 清理 engine 的活跃生成状态（防止 HTTP 回调触发死循环）
-  pcall(function()
-    local ae_ok, engine = pcall(require, "NeoAI.core.ai.engine")
-    if ae_ok and engine then
-      if engine.cleanup_all_generations then
-        engine.cleanup_all_generations()
-      end
-    end
-  end)
+  if _engine_ref and _engine_ref.cleanup_all_generations then
+    pcall(_engine_ref.cleanup_all_generations)
+  end
 
   -- 3. 刷新 saver 队列（等待所有待处理保存完成）
   saver.shutdown_sync()

@@ -435,9 +435,9 @@ function M.shutdown_sync()
   -- 先刷新所有待处理队列
   M.flush_all()
 
-  -- 等待所有 async_worker 完成（最多 3s）
+  -- 等待所有 async_worker 完成（最多 500ms，避免退出卡顿）
   -- 使用 vim.uv.run('once') 替代 vim.wait，避免 headless 模式下事件循环阻塞
-  local deadline = vim.uv.now() + 3000
+  local deadline = vim.uv.now() + 500
   while vim.uv.now() < deadline do
     local has_pending = false
     for _, v in pairs(state._save_in_progress) do

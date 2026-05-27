@@ -64,8 +64,5 @@ function M.is_module_loaded(module_name)
   return loaded_modules[module_name] ~= nil
 end
 
--- 自动初始化
-M.initialize()
-
 return M
 

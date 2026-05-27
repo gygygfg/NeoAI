@@ -302,4 +302,8 @@ end
 function M.get_event_count() return state.event_count or 0 end
 function M.reset_event_count() state.event_count = 0 end
 
+function M.is_initialized()
+  return state.initialized
+end
+
 return M

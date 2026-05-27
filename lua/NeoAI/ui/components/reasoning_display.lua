@@ -6,6 +6,7 @@ local M = {}
 
 local logger = require("NeoAI.utils.logger")
 local window_manager = require("NeoAI.ui.window.window_manager")
+local Events = require("NeoAI.core.events")
 
 local state = {
   initialized = false,
@@ -27,16 +28,8 @@ function M.initialize(config)
 
   local group = vim.api.nvim_create_augroup("NeoAIReasoningDisplay", { clear = true })
   vim.api.nvim_create_autocmd("User", {
-    group = group, pattern = "show_reasoning_display",
-    callback = function(args) M.show(args.data and args.data[1] or "") end,
-  })
-  vim.api.nvim_create_autocmd("User", {
-    group = group, pattern = "reasoning_content",
-    callback = function(args) M.append(args.data and args.data[1] or "") end,
-  })
-  vim.api.nvim_create_autocmd("User", {
-    group = group, pattern = "reasoning_chunk",
-    callback = function(args) M.append(args.data and args.data[1] or "") end,
+    group = group, pattern = Events.REASONING_CONTENT,
+    callback = function(args) M.append(args.data and args.data.reasoning_content or "") end,
   })
   vim.api.nvim_create_autocmd("User", {
     group = group, pattern = "close_reasoning_display",

@@ -1,10 +1,9 @@
 --- NeoAI 核心模块入口
 --- 职责：初始化并统一导出核心子模块（AI引擎、历史管理器、聊天服务、键位管理器）
---- 闭包内私有状态：initialized
+--- 闭包内私有状态：initialized, _config
 
 local logger = require("NeoAI.utils.logger")
-local engine = require("NeoAI.core.ai.engine")
-local history_manager = require("NeoAI.core.history.manager")
+
 -- ========== 闭包内私有状态 ==========
 local initialized = false
 local _config = nil
@@ -25,9 +24,11 @@ function M.initialize(config)
   config_module.initialize(config)
 
   -- 初始化 AI 引擎（各子模块自行从 state_manager 读取配置）
+  local engine = require("NeoAI.core.ai.engine")
   engine.initialize({})
 
   -- 初始化历史管理器（唯一数据源，幂等）
+  local history_manager = require("NeoAI.core.history.manager")
   history_manager.initialize({ config = config })
 
   -- 初始化聊天服务（前后端分离的后端入口，幂等）
@@ -41,7 +42,7 @@ end
 --- 获取 AI 引擎
 function M.get_engine()
   if not initialized then error("Core not initialized") end
-  return engine
+  return require("NeoAI.core.ai.engine")
 end
 
 --- 获取键位配置管理器
@@ -53,7 +54,7 @@ end
 --- 获取历史管理器
 function M.get_history_manager()
   if not initialized then error("Core not initialized") end
-  return history_manager
+  return require("NeoAI.core.history.manager")
 end
 
 --- 获取配置
