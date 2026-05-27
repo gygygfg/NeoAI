@@ -807,6 +807,16 @@ function M.build_request(params)
   if mode ~= "fim" and next(_file_change_tracker) then
     local result = M.get_file_context()
     if result and result ~= "" then
+      -- 去重：移除上一条 get_file_context 消息（通过内容前缀匹配）
+      -- 只保留最新的报告，避免历史报告累积导致请求体膨胀
+      for i = #request.messages, 1, -1 do
+        local msg = request.messages[i]
+        if msg.role == "user" and type(msg.content) == "string"
+          and msg.content:find("^【虚拟工具 get_file_context 结果】", 1, true) then
+          table.remove(request.messages, i)
+          break
+        end
+      end
       local file_context_msg = {
         role = "user",
         content = result
