@@ -28,10 +28,209 @@ local _cached_core = nil
 local _first_request = true
 local tool_call_counter = 0
 
--- ========== 文件变更追踪 ==========
--- 记录本轮工具执行中读取和修改了哪些文件的哪些代码结构
--- 格式：{ [abs_path] = { reads = { {start_line, end_line, content_preview} }, writes = { {edit_type, old_text_preview, new_text_preview} } } }
+-- ========== 文件变更追踪（Tree-sitter 语法树节点级） ==========
+-- 记录本轮工具执行中访问了哪些文件的哪些语法树节点
+-- 格式：{ [abs_path] = { nodes = { [node_key] = { node_type, name, original_code, current_code, accessed } }, touched_lines = { [line] = true } } }
+-- node_key = node_type .. "::" .. name（如 "function_definition::my_func"）
 local _file_change_tracker = {}
+
+-- 顶层结构节点类型（函数、类、方法等），用于识别代码结构
+local _top_level_node_types = {
+  -- C/C++/Java/Rust/Go 等主流语言
+  function_definition = true,
+  class_definition = true,
+  class_declaration = true,
+  method_definition = true,
+  constructor_definition = true,
+  destructor_definition = true,
+  struct_specifier = true,
+  enum_specifier = true,
+  union_specifier = true,
+  interface_declaration = true,
+  type_declaration = true,
+  func_declaration = true,
+  method_declaration = true,
+  impl_item = true,
+  trait_item = true,
+  -- JavaScript/TypeScript
+  arrow_function = true,
+  generator_function = true,
+  -- Python
+  decorated_definition = true,
+  -- 宏
+  macro_definition = true,
+  macro_invocation = true,
+  -- Lua
+  function_declaration = true,
+  -- Rust
+  function_item = true,
+  -- 通用声明
+  module_declaration = true,
+  program = true,
+  -- 变量声明（顶层）
+  variable_declaration = true,
+  lexical_declaration = true,
+  -- 导出语句
+  export_statement = true,
+}
+
+--- 从语法树节点中提取名称（函数名、类名等）
+--- @param node_type string 节点类型
+--- @param node_text string 节点文本
+--- @return string 提取的名称
+local function _extract_node_name(node_type, node_text)
+  if not node_text then return "" end
+  -- 尝试从首行提取名称：function name(...) / class Name / local name = function(...)
+  local first_line = node_text:match("^[^\n]+") or node_text
+  -- function name(...) (Lua, JS, TS, etc.)
+  local name = first_line:match("function%s+([%w_%.]+)")
+  if name then return name end
+  -- local function name(...) (Lua)
+  name = first_line:match("local%s+function%s+([%w_]+)")
+  if name then return name end
+  -- class Name (Java, C++, TS, Python, etc.)
+  name = first_line:match("class%s+([%w_]+)")
+  if name then return name end
+  -- struct Name / enum Name / interface Name / type Name
+  name = first_line:match("struct%s+([%w_]+)")
+  if name then return name end
+  name = first_line:match("enum%s+([%w_]+)")
+  if name then return name end
+  name = first_line:match("interface%s+([%w_]+)")
+  if name then return name end
+  name = first_line:match("type%s+([%w_]+)")
+  if name then return name end
+  -- impl Trait for Type (Rust)
+  local impl_for = first_line:match("impl%s+([%w_<>]+)%s+for%s+([%w_<>]+)")
+  if impl_for then return "impl " .. impl_for end
+  -- impl Trait (Rust inherent impl)
+  name = first_line:match("impl%s+([%w_<>]+)")
+  if name and not name:match("^for$") then return "impl " .. name end
+  -- def name(...): (Python)
+  name = first_line:match("def%s+([%w_]+)")
+  if name then return name end
+  -- func name(...) (Go)
+  name = first_line:match("func%s+([%w_]+)")
+  if name then return name end
+  -- fn name(...) (Rust)
+  name = first_line:match("fn%s+([%w_]+)")
+  if name then return name end
+  -- name = function(...) / name = (...) => (JS/TS assignment)
+  name = first_line:match("([%w_]+)%s*[=:]%s*function")
+  if name then return name end
+  name = first_line:match("([%w_]+)%s*[=:]%s*%(")
+  if name then return name end
+  -- export function/class/... (JS/TS)
+  name = first_line:match("export%s+%w+%s+([%w_]+)")
+  if name then return name end
+  -- local name = ... (Lua variable declaration)
+  name = first_line:match("local%s+([%w_]+)%s*=")
+  if name then return name end
+  -- name := ... (Go short declaration)
+  name = first_line:match("([%w_]+)%s*:=")
+  if name then return name end
+  -- 回退：使用节点类型 + 前 40 字符
+  local preview = node_type .. ": " .. node_text:gsub("\n", " "):gsub("%s+", " "):sub(1, 40)
+  return preview
+end
+
+--- 使用 Tree-sitter 解析文件内容，提取所有顶层结构节点
+--- @param content string 文件内容
+--- @param lang string 语言名称
+--- @return table { node_key -> { node_type, name, code, start_line, end_line } }
+local function _parse_top_level_nodes(content, lang)
+  local result = {}
+  if not content or content == "" then return result end
+
+  local ok, ts = pcall(require, "vim.treesitter")
+  if not ok then return result end
+
+  local ok_parser, parser = pcall(ts.get_string_parser, content, lang)
+  if not ok_parser or not parser then return result end
+
+  local ok_parse, trees = pcall(parser.parse, parser)
+  if not ok_parse or not trees or #trees == 0 then return result end
+
+  local root = trees[1]:root()
+  local file_lines = vim.split(content, "\n", { plain = true })
+
+  -- 递归遍历，收集所有顶层结构节点
+  local function traverse(node, depth)
+    if not node then return end
+    local node_type = node:type()
+    local sr, sc, er, ec = node:range()
+
+    if depth > 0 and _top_level_node_types[node_type] then
+      -- 提取节点代码
+      local code_lines = {}
+      for line_num = sr, er do
+        local line_content = file_lines[line_num + 1] or ""
+        if line_num == sr and line_num == er then
+          line_content = line_content:sub(sc + 1, ec)
+        elseif line_num == sr then
+          line_content = line_content:sub(sc + 1)
+        elseif line_num == er then
+          line_content = line_content:sub(1, ec)
+        end
+        table.insert(code_lines, line_content)
+      end
+      local code = table.concat(code_lines, "\n")
+      local name = _extract_node_name(node_type, code)
+      local node_key = node_type .. "::" .. name
+
+      if not result[node_key] then
+        result[node_key] = {
+          node_type = node_type,
+          name = name,
+          code = code,
+          start_line = sr,
+          end_line = er,
+        }
+      end
+      return -- 不继续遍历子节点（只收集顶层结构节点）
+    end
+
+    -- 继续遍历子节点
+    for i = 0, node:named_child_count() - 1 do
+      local child = node:named_child(i)
+      traverse(child, depth + 1)
+    end
+  end
+
+  traverse(root, 0)
+  return result
+end
+
+--- 判断文件中的哪些行被访问过（读取或修改）
+--- @param abs_path string 文件绝对路径
+--- @param touched_lines table 被触及的行号集合
+--- @param normalized_args table|nil 工具参数
+--- @param tool_name string 工具名称
+--- @param result any 工具执行结果
+local function _update_touched_lines(abs_path, touched_lines, normalized_args, tool_name, result)
+  if not normalized_args then return end
+
+  -- 从工具参数中提取行范围
+  local start_line = normalized_args.start_line_number_base_zero
+  local end_line = normalized_args.end_line_number_base_zero
+
+  if start_line ~= nil and end_line ~= nil then
+    for line = start_line, end_line do
+      touched_lines[line] = true
+    end
+  end
+
+  -- 对于 insert_edit_into_file，从 oldText/newText 推断行范围
+  if tool_name == "insert_edit_into_file" then
+    -- 无法精确推断，标记整个文件为已访问
+    -- 后续通过文件内容比较来确定具体变更
+  end
+
+  -- 如果 result 包含行信息（如 read_file 返回的内容），也尝试提取
+  if type(result) == "string" and result ~= "" then
+    -- 不依赖 result 的行号，因为 result 已被精简
+  end
+end
 
 --- 重置文件变更追踪（每轮工具循环开始时调用）
 function M.reset_file_tracker()
@@ -40,97 +239,219 @@ end
 
 --- 记录文件读取操作
 --- @param filepath string 文件路径
---- @param start_line number 起始行号（0-based）
---- @param end_line number 结束行号（0-based）
---- @param content_preview string 内容预览（前 200 字符）
-function M.track_file_read(filepath, start_line, end_line, content_preview)
+--- @param normalized_args table|nil 规范化后的工具参数
+--- @param tool_name string 工具名称
+--- @param result any 工具执行结果（用于提取内容预览）
+function M.track_file_read(filepath, normalized_args, tool_name, result)
   if not filepath or filepath == "" then return end
   local abs_path = vim.fn.fnamemodify(filepath, ":p")
   if not _file_change_tracker[abs_path] then
-    _file_change_tracker[abs_path] = { reads = {}, writes = {} }
+    _file_change_tracker[abs_path] = { nodes = {}, touched_lines = {} }
   end
-  local preview = content_preview or ""
-  if #preview > 200 then
-    preview = preview:sub(1, 200) .. "..."
+  local info = _file_change_tracker[abs_path]
+
+  -- 记录被触及的行
+  _update_touched_lines(abs_path, info.touched_lines, normalized_args, tool_name, result)
+
+  -- 如果还没有解析过语法树，解析并缓存原始代码
+  if not info._parsed then
+    info._parsed = true
+    info._original_content = file_utils.read_file(abs_path)
+    info._lang = vim.fn.fnamemodify(abs_path, ":e"):lower()
+    -- 解析顶层结构节点
+    if info._original_content then
+      local lang_map = require("NeoAI.utils.language_map")
+      local parser_name = lang_map.ext_to_parser["." .. info._lang]
+      if parser_name then
+        info._top_nodes = _parse_top_level_nodes(info._original_content, parser_name)
+      end
+    end
   end
-  table.insert(_file_change_tracker[abs_path].reads, {
-    start_line = start_line or 0,
-    end_line = end_line or -1,
-    content_preview = preview,
-  })
 end
 
 --- 记录文件修改操作
 --- @param filepath string 文件路径
---- @param edit_type string 编辑类型（insert/replace/delete/overwrite）
---- @param old_text_preview string 旧文本预览
---- @param new_text_preview string 新文本预览
-function M.track_file_write(filepath, edit_type, old_text_preview, new_text_preview)
+--- @param normalized_args table|nil 规范化后的工具参数
+--- @param tool_name string 工具名称
+function M.track_file_write(filepath, normalized_args, tool_name)
   if not filepath or filepath == "" then return end
   local abs_path = vim.fn.fnamemodify(filepath, ":p")
   if not _file_change_tracker[abs_path] then
-    _file_change_tracker[abs_path] = { reads = {}, writes = {} }
+    _file_change_tracker[abs_path] = { nodes = {}, touched_lines = {} }
   end
-  local old_preview = old_text_preview or ""
-  if #old_preview > 200 then
-    old_preview = old_preview:sub(1, 200) .. "..."
+  local info = _file_change_tracker[abs_path]
+
+  -- 记录被触及的行
+  _update_touched_lines(abs_path, info.touched_lines, normalized_args, tool_name, nil)
+
+  -- 如果还没有解析过语法树，解析并缓存原始代码
+  if not info._parsed then
+    info._parsed = true
+    info._original_content = file_utils.read_file(abs_path)
+    info._lang = vim.fn.fnamemodify(abs_path, ":e"):lower()
+    if info._original_content then
+      local lang_map = require("NeoAI.utils.language_map")
+      local parser_name = lang_map.ext_to_parser["." .. info._lang]
+      if parser_name then
+        info._top_nodes = _parse_top_level_nodes(info._original_content, parser_name)
+      end
+    end
   end
-  local new_preview = new_text_preview or ""
-  if #new_preview > 200 then
-    new_preview = new_preview:sub(1, 200) .. "..."
-  end
-  table.insert(_file_change_tracker[abs_path].writes, {
-    edit_type = edit_type or "unknown",
-    old_text_preview = old_preview,
-    new_text_preview = new_preview,
-  })
 end
 
---- 构建文件变更摘要文本
---- @return string 格式化的变更摘要
-function M.build_file_change_summary()
+--- 构建语法树节点变更报告（按节点展示原始代码 vs 当前代码）
+--- @return string 格式化的节点变更报告
+function M.build_node_change_report()
   if not next(_file_change_tracker) then
     return ""
   end
+
   local parts = {}
-  table.insert(parts, "【本轮工具执行的文件操作记录】")
+  table.insert(parts, "【文件语法树节点状态报告】")
+  table.insert(parts, "以下是被访问过的文件中，被读取或修改的语法树节点的原始代码与当前代码对比。")
+  table.insert(parts, "未被访问的节点已省略。")
+
   for abs_path, info in pairs(_file_change_tracker) do
-    table.insert(parts, string.format("\n文件: %s", abs_path))
-    if #info.reads > 0 then
-      table.insert(parts, string.format("  读取了 %d 次:", #info.reads))
-      for _, r in ipairs(info.reads) do
-        local range = string.format("行 %d-%d", r.start_line, r.end_line)
-        table.insert(parts, string.format("    - %s: %s", range, r.content_preview))
-      end
-    end
-    if #info.writes > 0 then
-      table.insert(parts, string.format("  修改了 %d 次:", #info.writes))
-      for _, w in ipairs(info.writes) do
-        table.insert(parts, string.format("    - [%s] 旧: %s", w.edit_type, w.old_text_preview))
-        table.insert(parts, string.format("      新: %s", w.new_text_preview))
-      end
-    end
-  end
-  return table.concat(parts, "\n")
-end
+    table.insert(parts, string.format("\n%s", string.rep("=", 60)))
+    table.insert(parts, string.format("文件: %s", abs_path))
+    table.insert(parts, string.rep("=", 60))
 
---- 构建实时文件内容快照（读取所有被修改过的文件的最新内容）
---- @return string 格式化的文件内容快照
-function M.build_live_file_snapshot()
-  if not next(_file_change_tracker) then
-    return ""
-  end
-  local parts = {}
-  table.insert(parts, "【当前文件实时状态】\n以下是被修改过的文件的最新内容，供你参考当前代码状态：")
-  for abs_path in pairs(_file_change_tracker) do
-    local content, err = file_utils.read_file(abs_path)
-    if content then
-      table.insert(parts, string.format("\n===== %s =====", abs_path))
-      table.insert(parts, content)
-    else
-      table.insert(parts, string.format("\n===== %s (读取失败: %s) =====", abs_path, err or "未知错误"))
+    -- 读取当前文件内容
+    local current_content, err = file_utils.read_file(abs_path)
+    if not current_content then
+      table.insert(parts, string.format("  [读取失败] %s", err or "未知错误"))
+      goto continue_file
     end
+
+    -- 解析当前文件的顶层节点
+    local current_nodes = {}
+    if info._lang and info._original_content then
+      local lang_map = require("NeoAI.utils.language_map")
+      local parser_name = lang_map.ext_to_parser["." .. info._lang]
+      if parser_name then
+        current_nodes = _parse_top_level_nodes(current_content, parser_name)
+      end
+    end
+
+    -- 遍历原始节点，找出被触及的节点
+    local touched_nodes = {}
+    if info._top_nodes then
+      for node_key, node_info in pairs(info._top_nodes) do
+        -- 检查该节点是否被触及（行范围与 touched_lines 有交集）
+        local is_touched = false
+        if next(info.touched_lines) then
+          for line = node_info.start_line, node_info.end_line do
+            if info.touched_lines[line] then
+              is_touched = true
+              break
+            end
+          end
+        else
+          -- 如果没有具体行信息，标记为已触及
+          is_touched = true
+        end
+
+        if is_touched then
+          local current_code = ""
+          if current_nodes and current_nodes[node_key] then
+            current_code = current_nodes[node_key].code
+          else
+            -- 节点可能已被删除或改名，从当前文件中按行范围提取
+            local current_lines = vim.split(current_content, "\n", { plain = true })
+            local code_lines = {}
+            for line_num = node_info.start_line, math.min(node_info.end_line, #current_lines - 1) do
+              table.insert(code_lines, current_lines[line_num + 1] or "")
+            end
+            current_code = table.concat(code_lines, "\n")
+          end
+
+          table.insert(touched_nodes, {
+            node_key = node_key,
+            node_type = node_info.node_type,
+            name = node_info.name,
+            original_code = node_info.code,
+            current_code = current_code,
+            start_line = node_info.start_line,
+            end_line = node_info.end_line,
+          })
+        end
+      end
+    end
+
+    -- 检查当前文件中是否有新增的节点（原始文件中不存在）
+    if current_nodes then
+      for node_key, node_info in pairs(current_nodes) do
+        if not info._top_nodes or not info._top_nodes[node_key] then
+          -- 新增节点：检查是否在被触及的行范围内
+          local is_touched = false
+          if next(info.touched_lines) then
+            for line = node_info.start_line, node_info.end_line do
+              if info.touched_lines[line] then
+                is_touched = true
+                break
+              end
+            end
+          else
+            is_touched = true
+          end
+
+          if is_touched then
+            table.insert(touched_nodes, {
+              node_key = node_key,
+              node_type = node_info.node_type,
+              name = node_info.name,
+              original_code = "[新增节点，原始文件中不存在]",
+              current_code = node_info.code,
+              start_line = node_info.start_line,
+              end_line = node_info.end_line,
+              is_new = true,
+            })
+          end
+        end
+      end
+    end
+
+    -- 按行号排序
+    table.sort(touched_nodes, function(a, b)
+      return a.start_line < b.start_line
+    end)
+
+    if #touched_nodes == 0 then
+      table.insert(parts, "  (未检测到被访问的语法树节点)")
+    else
+      for _, node in ipairs(touched_nodes) do
+        local changed = node.original_code ~= node.current_code
+        local status = changed and "[已修改]" or (node.is_new and "[新增]" or "[未变更]")
+        table.insert(parts, string.format("\n  %s %s: %s (行 %d-%d)", status, node.node_type, node.name, node.start_line + 1, node.end_line + 1))
+
+        if changed then
+          table.insert(parts, "    原始代码:")
+          for _, line in ipairs(vim.split(node.original_code, "\n", { plain = true })) do
+            table.insert(parts, "      | " .. line)
+          end
+          table.insert(parts, "    当前代码:")
+          for _, line in ipairs(vim.split(node.current_code, "\n", { plain = true })) do
+            table.insert(parts, "      | " .. line)
+          end
+        elseif not node.is_new then
+          -- 未变更的节点只显示代码，不显示对比
+          table.insert(parts, "    代码:")
+          for _, line in ipairs(vim.split(node.current_code, "\n", { plain = true })) do
+            table.insert(parts, "      | " .. line)
+          end
+        else
+          -- 新增节点
+          table.insert(parts, "    代码:")
+          for _, line in ipairs(vim.split(node.current_code, "\n", { plain = true })) do
+            table.insert(parts, "      | " .. line)
+          end
+        end
+      end
+    end
+
+    ::continue_file::
   end
+
   return table.concat(parts, "\n")
 end
 
@@ -451,21 +772,19 @@ function M.build_request(params)
     end
   end
 
-  -- ===== 在请求末尾追加实时文件信息 =====
-  -- 如果有文件变更记录，在消息列表末尾插入一条包含变更摘要和实时文件内容的 user 消息
-  -- 这样 AI 能看到所有被修改过的文件的最新状态，消除过时信息
+  -- ===== 在请求末尾追加语法树节点状态报告 =====
+  -- 如果有文件变更记录，在消息列表末尾插入一条包含语法树节点变更报告的 user 消息
+  -- 按节点（函数、类等）展示原始代码 vs 当前代码，未被访问的节点不展示
   if mode ~= "fim" and next(_file_change_tracker) then
-    local change_summary = M.build_file_change_summary()
-    local live_snapshot = M.build_live_file_snapshot()
-    if live_snapshot and live_snapshot ~= "" then
+    local node_report = M.build_node_change_report()
+    if node_report and node_report ~= "" then
       local file_context_msg = {
         role = "user",
         content = string.format(
-          "%s\n\n%s\n\n【重要】以上是当前所有被修改过的文件的实时内容快照。"
+          "%s\n\n【重要】以上是按语法树节点划分的代码状态报告。"
             .. "请基于这些最新内容进行后续操作，不要依赖之前过时的工具返回信息。"
-            .. "如果你需要读取其他文件，请直接使用 read_file 工具获取最新内容。",
-          change_summary,
-          live_snapshot
+            .. "如果你需要读取其他文件或节点的详细信息，请直接使用 read_file 或 parse_file 工具获取最新内容。",
+          node_report
         ),
       }
       table.insert(request.messages, file_context_msg)
