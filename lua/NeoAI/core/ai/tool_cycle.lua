@@ -142,8 +142,8 @@ local function _truncate_oversized_tool_results(messages, system_count)
     local msg = messages[idx]
     local tool_name = msg.name or "unknown"
     local original_len = #(msg.content or "")
-    -- 截断到 500 字符 + 摘要标记
-    local summary = (msg.content or ""):sub(1, 500)
+    -- 截断到 200 字符 + 摘要标记
+    local summary = (msg.content or ""):sub(1, 200)
     local lower = summary:lower()
     if lower:find("error") or lower:find("失败") or lower:find("错误") or lower:find("fail") then
       msg.content = string.format("[执行失败] 工具: %s, 错误: %s\n...(截断，原大小 %d 字节)", tool_name, summary, original_len)
@@ -1849,22 +1849,40 @@ function M._on_tools_complete(session_id, is_sub_agent)
   end
 
   if last_assistant_idx then
-    -- last_assistant_idx 之前的 tool 消息属于上一轮，精简为摘要
+    -- last_assistant_idx 之前的 tool 消息属于上一轮或更早，精简为摘要
     -- 保留工具名称和关键信息，让 AI 在后续轮次中能看到上下文
+    -- 策略：
+    --   - 上一轮（last_assistant_idx 之后到本轮）的 tool 消息：截断到 200 字符
+    --   - 超过2轮前（last_assistant_idx 之前）的 tool 消息：压缩为单行摘要
+    local second_last_assistant_idx = nil
+    for i = last_assistant_idx - 1, 1, -1 do
+      local msg = ss.messages[i]
+      if msg.role == "assistant" and msg.tool_calls and #msg.tool_calls > 0 then
+        second_last_assistant_idx = i
+        break
+      end
+    end
     for i = 1, last_assistant_idx - 1 do
       local msg = ss.messages[i]
       if msg.role == "tool" and msg.content and msg.content ~= "" then
         local tool_name = msg.name or "unknown"
         -- 检查是否包含错误信息
         local lower = msg.content:lower()
-        if lower:find("error") or lower:find("失败") or lower:find("错误") or lower:find("fail") then
-          msg.content = string.format("[执行失败] 工具: %s, 错误: %s", tool_name, msg.content:sub(1, 300))
+        local is_error = lower:find("error") or lower:find("失败") or lower:find("错误") or lower:find("fail")
+        -- 判断是否超过2轮前（需要更激进压缩）
+        local is_old_round = second_last_assistant_idx and i < second_last_assistant_idx
+        if is_old_round then
+          -- 超过2轮前的旧消息：压缩为单行摘要
+          local status = is_error and "失败" or "成功"
+          local preview = msg.content:sub(1, 80):gsub("\n", " "):gsub("\r", "")
+          msg.content = string.format("[%s] %s: %s", status, tool_name, preview)
+        elseif is_error then
+          msg.content = string.format("[执行失败] 工具: %s, 错误: %s", tool_name, msg.content:sub(1, 150))
         else
-          -- 保留工具名称和结果摘要（前 500 字符）
-          local summary = msg.content:sub(1, 500)
-          -- 如果内容较长，添加截断标记
-          if #msg.content > 500 then
-            summary = summary .. "\n...(截断，完整结果可通过 get_file_context 工具获取)"
+          -- 上一轮的 tool 结果：截断到 200 字符
+          local summary = msg.content:sub(1, 200)
+          if #msg.content > 200 then
+            summary = summary .. "\n...(截断)"
           end
           msg.content = string.format("[执行成功] 工具: %s\n%s", tool_name, summary)
         end
@@ -1873,8 +1891,8 @@ function M._on_tools_complete(session_id, is_sub_agent)
       if msg.role == "assistant" and msg.tool_calls then
         for _, tc in ipairs(msg.tool_calls) do
           local func = tc["function"] or tc.func
-          if func and func.arguments and #func.arguments > 500 then
-            func.arguments = func.arguments:sub(1, 500) .. "\n...(截断，原大小 " .. #func.arguments .. " 字节)"
+          if func and func.arguments and #func.arguments > 200 then
+            func.arguments = func.arguments:sub(1, 200) .. "\n...(截断，原大小 " .. #func.arguments .. " 字节)"
           end
         end
       end
@@ -1920,12 +1938,12 @@ function M._on_tools_complete(session_id, is_sub_agent)
         if should_compress and not msg.content:find("^%[执行成功%]", 1, true) and not msg.content:find("^%[执行失败%]", 1, true) then
           local lower = msg.content:lower()
           if lower:find("error") or lower:find("失败") or lower:find("错误") or lower:find("fail") then
-            msg.content = string.format("[执行失败] 工具: %s, 错误: %s", tool_name, msg.content:sub(1, 300))
+            msg.content = string.format("[执行失败] 工具: %s, 错误: %s", tool_name, msg.content:sub(1, 100))
           else
-            -- 压缩为摘要，保留前 200 字符
-            local summary = msg.content:sub(1, 200)
-            if #msg.content > 200 then
-              summary = summary .. "\n...(截断，完整结果可通过 get_file_context 虚拟工具获取最新文件内容)"
+            -- 压缩为摘要，保留前 100 字符（可通过 get_file_context 获取最新内容）
+            local summary = msg.content:sub(1, 100)
+            if #msg.content > 100 then
+              summary = summary .. "\n...(截断)"
             end
             msg.content = string.format("[执行成功] 工具: %s\n%s", tool_name, summary)
           end
