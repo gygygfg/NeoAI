@@ -1526,14 +1526,33 @@ local function _delete_file(args, on_success, on_error)
     uv.fs_rmdir(filepath, function(rmdir_err)
       vim.schedule(function()
         if rmdir_err then
-          safe_callback(
-            false,
-            string.format(
-              "删除目录失败 %s: %s（目录可能非空，请使用 run_command 执行 rm -rf）",
-              filepath,
-              tostring(rmdir_err)
+          -- rmdir 失败（通常因为目录非空），自动 fallback 到 rm -rf
+          -- 使用 vim.fn.system 同步执行，避免异步回调复杂度
+          local rm_ok, rm_result = pcall(vim.fn.system, {
+            "rm", "-rf", filepath
+          })
+          if rm_ok and vim.v.shell_error == 0 then
+            safe_callback(true, {
+              filepath = filepath,
+              success = true,
+              type = "directory",
+              method = "rm_rf",
+              note = "目录非空，已使用 rm -rf 递归删除",
+            })
+          else
+            local err_detail = tostring(rmdir_err)
+            if rm_result and rm_result ~= "" then
+              err_detail = err_detail .. " (rm -rf 也失败: " .. tostring(rm_result) .. ")"
+            end
+            safe_callback(
+              false,
+              string.format(
+                "删除目录失败 %s: %s（尝试了 rmdir 和 rm -rf 均失败）",
+                filepath,
+                err_detail
+              )
             )
-          )
+          end
         else
           safe_callback(true, { filepath = filepath, success = true, type = "directory" })
         end
@@ -1586,13 +1605,13 @@ end
 
 M.delete_file = {
   name = "delete_file",
-  description = "删除文件或空目录。非空目录请使用 run_command 执行 rm -rf",
+  description = "删除文件或目录（支持递归删除非空目录）",
   func = _delete_file,
   async = true,
   parameters = {
     type = "object",
     properties = {
-      filepath = { type = "string", description = "文件或空目录路径（必填）" },
+      filepath = { type = "string", description = "文件或目录路径（必填，非空目录会自动递归删除）" },
     },
     required = { "filepath" },
   },

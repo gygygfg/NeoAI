@@ -29,26 +29,35 @@ local function _clean_invalid_unicode(str)
     -- 控制字符（0x00-0x1F），排除 tab(0x09)、换行(0x0A)、回车(0x0D)
     if byte < 32 and byte ~= 9 and byte ~= 10 and byte ~= 13 then
       i = i + 1
-    -- 4 字节 UTF-8 序列
+    -- 4 字节 UTF-8 序列：检查 U+nFFFE/U+nFFFF (n=1-10) 和 U+10FFFE/U+10FFFF
     elseif byte >= 240 and byte <= 244 then
       if i + 3 <= len then
         local b2, b3, b4 = string.byte(str, i + 1), string.byte(str, i + 2), string.byte(str, i + 3)
         if b2 and b3 and b4 and b2 >= 128 and b2 <= 191 and b3 >= 128 and b3 <= 191 and b4 >= 128 and b4 <= 191 then
-          result[#result + 1] = str:sub(i, i + 3)
-          i = i + 4
+          local cp = (byte - 240) * 262144 + (b2 - 128) * 4096 + (b3 - 128) * 64 + (b4 - 128)
+          -- 跳过超出 U+10FFFF 的非法码点
+          if cp > 0x10FFFF then
+            i = i + 4
+          -- 跳过 noncharacters: U+nFFFE, U+nFFFF (n=0-10)
+          elseif (cp % 0x10000) >= 0xFFFE then
+            i = i + 4
+          else
+            result[#result + 1] = str:sub(i, i + 3)
+            i = i + 4
+          end
         else
           i = i + 1
         end
       else
         i = i + 1
       end
-    -- 3 字节 UTF-8 序列：检查 U+FFFE/U+FFFF/U+D800-U+DFFF
+    -- 3 字节 UTF-8 序列：检查 U+FFFE/U+FFFF/U+D800-U+DFFF/U+FDD0-U+FDEF
     elseif byte >= 224 and byte <= 239 then
       if i + 2 <= len then
         local b2, b3 = string.byte(str, i + 1), string.byte(str, i + 2)
         if b2 and b3 and b2 >= 128 and b2 <= 191 and b3 >= 128 and b3 <= 191 then
           local cp = (byte - 224) * 4096 + (b2 - 128) * 64 + (b3 - 128)
-          if cp == 0xFFFE or cp == 0xFFFF or (cp >= 0xD800 and cp <= 0xDFFF) then
+          if cp == 0xFFFE or cp == 0xFFFF or (cp >= 0xD800 and cp <= 0xDFFF) or (cp >= 0xFDD0 and cp <= 0xFDEF) then
             i = i + 3 -- 跳过非法码点
           else
             result[#result + 1] = str:sub(i, i + 2)
@@ -861,7 +870,7 @@ function M.build_tool_result_message(tool_call_id, result, tool_name, keep_full)
   if keep_full then
     -- 最后一条工具调用：保留完整结果，让 AI 看到执行结果
     if type(result) == "string" then
-      result_str = result
+      result_str = _clean_invalid_unicode(result)
     elseif result ~= nil then
       local ok, encoded = pcall(vim.json.encode, result)
       result_str = ok and encoded or tostring(result)

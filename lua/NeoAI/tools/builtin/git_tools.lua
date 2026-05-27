@@ -713,13 +713,15 @@ function _git_auto_mod._auto_stage_and_commit(tool_name, filepath, args)
     return
   end
 
-  -- 动态检测 git 可用性（支持工具完成的自动提交）
-  _git_auto_mod._detect_real_git(nil)
+  -- 动态检测 git 可用性（使用文件所在目录，而非当前工作目录）
+  -- 使用局部变量保存检测结果，避免污染全局 state.git_available
+  local file_dir = filepath and vim.fn.fnamemodify(filepath, ":h") or nil
+  local git_ok, git_root = _git_auto_mod._detect_real_git(file_dir)
 
   local message = _git_auto_mod._generate_commit_message(tool_name, filepath)
 
-  if state.git_available then
-    -- 真实 git 模式
+  if git_ok and git_root then
+    -- 真实 git 模式（使用检测到的 git_root，而非全局 state.git_root）
     local add_ok, add_err = _git_auto_mod._git_add(filepath)
     if not add_ok then
       logger.warn("[git_auto] git add 失败: %s", add_err)

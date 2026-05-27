@@ -630,11 +630,14 @@ function _handle_stream_end(generation_id, processor, params)
     -- 首次生成（非工具循环）时，不在此处插入 assistant 消息
     -- on_generation_complete 回调中会统一插入 assistant 消息（带 tool_calls）
     -- 避免重复插入导致消息历史膨胀
-    state.is_generating = false; state.current_generation_id = nil
+    -- 注意：不在此处重置 state.is_generating/current_generation_id，
+    -- 因为工具循环期间 handle_tool_result 需要这些状态来判断生成是否活跃。
+    -- 由 on_complete 回调在工具循环完全结束后统一重置。
     if state.session_locks then state.session_locks[sid] = nil end
     tool_cycle.start_async_loop({ generation_id = generation_id, tool_calls = tool_calls, content = full_response, reasoning = reasoning_text, session_id = sid, window_id = wid, options = options, messages = messages, model_index = model_index, ai_preset = ai_preset, on_complete = function(success, result)
       if not success then logger.error("Tool loop failed: " .. tostring(result)) end
       state.active_generations[generation_id] = nil; state.is_generating = false; state.current_generation_id = nil
+      if state.session_locks then state.session_locks[sid] = nil end
       local ok, lsp = pcall(require, "NeoAI.tools.builtin.neovim_lsp")
       if ok and lsp and lsp.flush_deferred_cleanups then lsp.flush_deferred_cleanups() end
     end })

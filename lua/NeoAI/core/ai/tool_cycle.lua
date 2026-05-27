@@ -296,9 +296,8 @@ function M.set_shutting_down()
 end
 
 --- 等待 TOOL_DISPLAY_CLOSED 事件后执行回调
---- 优化：使用 vim.defer_fn 延迟 150ms 执行回调，让出事件循环以避免 CPU 尖峰
---- 之前的同步执行会在工具完成时立即触发下一轮，导致紧密循环
---- 150ms 的延迟对人类感知无影响，但能显著降低 CPU 占用并避免回调风暴
+--- 使用 vim.defer_fn 延迟执行回调，让出事件循环以避免 CPU 尖峰
+--- 50ms 的延迟在保证事件循环让出的同时，减少轮次转换的等待时间
 ---@diagnostic disable-next-line: unused-local
 local function once_display_closed(session_id, callback)
   if is_shutting_down() then
@@ -314,7 +313,7 @@ local function once_display_closed(session_id, callback)
     if not ok then
       logger.warn("[tool_orchestrator] once_display_closed 回调异常: %s", tostring(err))
     end
-  end, 150)
+  end, 50)
 end
 
 --- 触发 TOOL_LOOP_FINISHED 事件
@@ -2003,9 +2002,6 @@ function M._on_tools_complete(session_id, is_sub_agent)
         return
       end
       if s.stop_requested then
-        logger.debug(
-          "[tool_orchestrator] _on_tools_complete: once_display_closed 回调中检测到 stop_requested，跳过 _check_round_complete"
-        )
         s._tools_complete_in_progress = false
         return
       end
@@ -2026,10 +2022,7 @@ function M._on_tools_complete(session_id, is_sub_agent)
       -- 重置的 _tools_all_completed=false 配合 _tools_complete_in_progress=false 正常进入。
       if s._generation_completed == false and s._tools_all_completed == false then
         -- 已进入下一轮，保持 _tools_complete_in_progress=true 阻止旧工具回调
-        logger.debug(
-          "[tool_orchestrator] _on_tools_complete: 已进入下一轮，保持 _tools_complete_in_progress 阻止旧工具回调, session=%s",
-          tostring(session_id)
-        )
+        -- 日志降级为 TRACE 避免噪音
       else
         s._tools_complete_in_progress = false
       end
