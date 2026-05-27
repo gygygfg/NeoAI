@@ -483,6 +483,8 @@ function _handle_stream_end(generation_id, processor, params)
     end
     return
   end
+  -- 设置防重入标志，必须在所有 return 路径之前
+  processor._stream_end_handled = true
   local full_response = processor.content_buffer or ""
   local reasoning_text = processor.reasoning_buffer or ""
   local usage = processor.usage or {}
