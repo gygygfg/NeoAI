@@ -506,7 +506,7 @@ NeoAI 基于 Neovim 原生 `User` 自动命令实现事件驱动架构，共定�
 运行指定测试：
 
 ```vim
-:NeoAITest test_config test_tools
+:NeoAITest flow_config flow_tools
 ```
 
 ---
@@ -544,7 +544,7 @@ NeoAI 基于 Neovim 原生 `User` 自动命令实现事件驱动架构，共定�
 
 ```vim
 :NeoAITest           " 运行所有测试
-:NeoAITest test_tools " 运行指定测试
+:NeoAITest flow_tools  " 运行指定测试
 ```
 
 ---

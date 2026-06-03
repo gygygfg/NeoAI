@@ -319,8 +319,11 @@ function M.get_available_actions(context)
   end
 
   local actions = {}
-  for action in pairs(DEFAULT_KEYMAPS[context]) do
-    table.insert(actions, action)
+  for action, value in pairs(DEFAULT_KEYMAPS[context]) do
+    -- 只返回叶子键位（有 key 字段的条目），过滤掉分组表
+    if type(value) == "table" and value.key then
+      table.insert(actions, action)
+    end
   end
 
   return actions

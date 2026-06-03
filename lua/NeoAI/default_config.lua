@@ -31,7 +31,7 @@ local DEFAULT_CONFIG = {
       google = {
         api_type = "google",
         base_url = "https://generativelanguage.googleapis.com/v1beta/models",
-        api_key = os.getenv("GOOGLE_API_KEY") or "",
+        api_key = os.getenv("GEMINI_API_KEY") or "",
         models = { "gemini-2.0-flash", "gemini-2.0-flash-lite", "gemini-1.5-pro", "gemini-1.5-flash" },
       },
       groq = {
@@ -67,7 +67,7 @@ local DEFAULT_CONFIG = {
       zhipu = {
         api_type = "openai",
         base_url = "https://open.bigmodel.cn/api/paas/v4/chat/completions",
-        api_key = os.getenv("ZHIPU_API_KEY") or "",
+        api_key = os.getenv("GLM_API_KEY") or "",
         models = { "glm-4-plus", "glm-4-air", "glm-4-flash" },
       },
       baidu = {
@@ -79,14 +79,14 @@ local DEFAULT_CONFIG = {
       aliyun = {
         api_type = "openai",
         base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
-        api_key = os.getenv("ALIYUN_API_KEY") or "",
+        api_key = os.getenv("QWEN_API_KEY") or "",
         models = { "qwen-plus", "qwen-turbo", "qwen-max" },
       },
       stepfun = {
         api_type = "openai",
         base_url = "https://api.stepfun.com/v1/chat/completions",
         api_key = os.getenv("STEPFUN_API_KEY") or "",
-        models = { "step-2-16k", "step-1-8k", "step-1-flash" },
+        models = { "step-3.5-flash", "step-3.7-flash" },
       },
     },
 

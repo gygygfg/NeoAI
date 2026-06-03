@@ -145,7 +145,9 @@ M.REQUEST_BUILT = "NeoAI:request_built" -- 请求构建完成
 M.LOG_DEBUG = "NeoAI:log_debug" -- 调试日志
 M.LOG_INFO = "NeoAI:log_info" -- 信息日志
 M.LOG_WARN = "NeoAI:log_warn" -- 警告日志
-M.LOG_ERROR = "NeoAI:log_error" -- 错误日志
+M.LOG_ERROR = "NeoAI:log_error"
+M.ERROR = "NeoAI:error" -- 错误日志
+ -- 错误日志
 -- AI_RESPONSE_CHUNK、AI_RESPONSE_COMPLETE、AI_RESPONSE_ERROR 已删除，统一使用 STREAM_CHUNK/STREAM_COMPLETED/STREAM_ERROR
 
 -- ==================== 自定义/命令事件 ====================

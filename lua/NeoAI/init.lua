@@ -39,12 +39,125 @@ local M = {}
 
 -- ========== 懒加载初始化 ==========
 
---- 确保核心模块已初始化
-local function ensure_core()
-  if _lazy.core_initialized then return end
-  _lazy.core_initialized = true
-  local core = require("NeoAI.core")
-  core.initialize(_config)
+  -- NeoAIClose 命令：关闭所有界面
+  vim.api.nvim_create_user_command("NeoAIClose", function()
+    M.close_all()
+  end, {
+    desc = "关闭所有NeoAI窗口",
+  })
+
+  -- NeoAITree 命令：打开树界面
+  vim.api.nvim_create_user_command("NeoAITree", function()
+    if ui_ref then
+      ui_ref.open_tree_ui()
+    else
+      error("NeoAI not initialized. Call setup() first.")
+    end
+  end, {
+    desc = "打开NeoAI树界面",
+  })
+
+  -- NeoAIChat 命令：打开聊天界面
+  vim.api.nvim_create_user_command("NeoAIChat", function()
+    if ui_ref then
+      ui_ref.open_chat_ui()
+    else
+      error("NeoAI not initialized. Call setup() first.")
+    end
+  end, {
+    desc = "打开NeoAI聊天界面",
+  })
+
+  -- NeoAIKeymaps 命令：显示当前键位配置
+  vim.api.nvim_create_user_command("NeoAIKeymaps", function()
+    if core_ref then
+      local keymap_manager = core_ref.get_keymap_manager()
+      if keymap_manager then
+        local formatted = keymap_manager.export_formatted()
+        -- 创建临时缓冲区显示键位配置
+        local buf = vim.api.nvim_create_buf(false, true)
+        vim.api.nvim_buf_set_lines(buf, 0, -1, false, vim.split(formatted, "\n", { plain = true }))
+        vim.bo[buf].filetype = "markdown"
+        vim.bo[buf].buftype = "nofile"
+        vim.bo[buf].bufhidden = "wipe"
+
+        local width = math.min(80, vim.o.columns - 10)
+        local height = math.min(30, vim.o.lines - 10)
+        local win = vim.api.nvim_open_win(buf, true, {
+          relative = "editor",
+          width = width,
+          height = height,
+          col = math.floor((vim.o.columns - width) / 2),
+          row = math.floor((vim.o.lines - height) / 2),
+          style = "minimal",
+          border = "rounded",
+          title = "NeoAI 键位配置",
+          title_pos = "center",
+        })
+
+        -- 设置窗口选项
+        vim.wo[win].wrap = true
+        vim.wo[win].cursorline = true
+      else
+        vim.notify("[NeoAI] 键位管理器不可用", vim.log.levels.ERROR)
+      end
+    else
+      error("NeoAI not initialized. Call setup() first.")
+    end
+  end, {
+    desc = "显示NeoAI键位配置",
+  })
+
+  -- NeoAITest 命令：运行测试（懒加载 tests/init.lua）
+  vim.api.nvim_create_user_command("NeoAITest", function(opts)
+    local ok, tests = pcall(require, "NeoAI.tests")
+    if not ok then
+      vim.notify("[NeoAI] 测试模块加载失败: " .. tostring(tests), vim.log.levels.ERROR)
+      return
+    end
+    local args = opts.args
+    local results
+    if args and args ~= "" then
+      local tests_to_run = {}
+      for arg in args:gmatch("%S+") do
+        table.insert(tests_to_run, arg)
+      end
+      results = tests.run_all(unpack(tests_to_run))
+    else
+      results = tests.run_all()
+    end
+    -- 汇总统计已由 tests.run_all 写入日志文件，此处仅通过 vim.notify 显示到消息区域
+    vim.notify(
+      string.format("测试结果: %d 通过, %d 失败", results.passed, results.failed),
+      vim.log.levels.INFO
+    )
+    if #results.errors > 0 then
+      local error_msgs = {}
+      for _, e in ipairs(results.errors) do
+        table.insert(error_msgs, e)
+      end
+      vim.notify("失败的测试:\n  " .. table.concat(error_msgs, "\n  "), vim.log.levels.WARN)
+    end
+  end, {
+    nargs = "*",
+    desc = "运行 NeoAI 测试（不带参数运行全部，带参数运行指定测试）",
+  })
+
+  -- NeoAIChatStatus 命令：显示聊天窗口状态
+  vim.api.nvim_create_user_command("NeoAIChatStatus", function()
+    if ui_ref then
+      local chat_window = ui_ref.get_chat_window()
+      if chat_window and chat_window.show_status then
+        chat_window.show_status()
+      else
+        vim.notify("[NeoAI] 聊天窗口状态不可用", vim.log.levels.WARN)
+      end
+    else
+      error("NeoAI not initialized. Call setup() first.")
+    end
+  end, {
+    desc = "显示NeoAI聊天窗口状态",
+  })
 end
 
 --- 确保 UI 模块已初始化
