@@ -12,40 +12,39 @@ Module Structure                                           *NeoAI-tools-modules*
 
 tools/init.lua:
   Entry point, initializes all tool sub-modules
-  - initialize(config): Setup tool system
-  - register_tool(tool_def): Register a tool
+  - init(): Apply approval config + lazily load built-in tools
   - get_tools(): List all registered tools
-  - execute_tool(tool_name, args): Execute a tool
-  - _load_builtin_tools(): Lazily load built-in tools
+  - execute_tool(tool_name, args): Execute a tool (via executor)
+  - reload_tools(): Reload built-in tools (debug)
 
-tools/tool_registry.lua:
+tools/registry.lua:
   Central registry for tool definitions
   - register(tool): Register tool with validation
   - get(tool_name): Get tool definition
   - list(category): List tools, optionally filtered by category
+  - list_as_map(): List as name → def map (for Agent binding)
   - search(query): Search tools by name/description/category
+  - resolve_name(raw): Resolve aliases/fuzzy names
   - get_approval_config(tool_name): Get approval configuration
-  - apply_approval_config(full_config): Apply user approval overrides
+  - apply_approval_config(per_tool): Apply user approval overrides
 
-tools/tool_executor.lua:
+tools/executor.lua:
   Tool execution engine
-  - execute_async(tool_name, args, on_success, on_error, on_progress): Main exec
-  - execute_with_orchestrator(tool_name, raw_args, ctx, callbacks): Orchestrator
-  - _normalize_arguments(tool_name, raw_arguments): Alias mapping
-  - _continue_execution(): Continue after approval
-  - Timeout management (_set_timeout, _clear_timeout, _pause_timeout)
+  - execute(tool_name, args, ctx): Main exec (normalize + validate + approve + run)
+  - _normalize_arguments: Alias mapping + simplified format conversion
+  - Timeout management with settled-flag pattern
 
-tools/tool_validator.lua:
+tools/validator.lua:
   Tool validation
   - validate_tool(tool_def): Validate tool definition structure
   - validate_parameters(parameters, args): Validate parameters against schema
-  - check_approval(tool_name, args, registry): Check if approval needed
-  - check_permissions(tool): Check tool permissions
+  - check_approval(tool_name, args, config, mode): Check if approval needed
+  - is_path_allowed(filepath, dirs): Path safety check
+  - is_params_safe(args, groups): Parameter safety check
 
-tools/tool_pack.lua:
+tools/packer.lua:
   Tool pack grouping
-  - initialize(): Scan builtin tools and group by category
-  - group_by_pack(tool_calls): Group tool calls by pack
+  - group_by_pack(tool_calls): Group tool calls by category
   - get_pack_for_tool(tool_name): Get pack name for tool
   - get_all_packs(): List all packs sorted by order
 
@@ -65,7 +64,7 @@ tools/approval_state.lua:
 ==============================================================================
 Built-in Tools                                            *NeoAI-builtin-tools*
 
-file_tools.lua (category: file):
+file_ops.lua (category: file):
   - read_file(filepath, start_line, end_line): Read file contents
   - edit_file(filepath, edits, mode, explanation): Edit file with structured edits
   - list_files(query, max_results): Search files by glob pattern
@@ -74,12 +73,13 @@ file_tools.lua (category: file):
   - create_directory(filepath): Create directory
   - ensure_dir(filepath): Ensure directory exists
   - delete_file(filepath): Delete file
+  - confirm_file_change(action): Confirm/abandon file write
 
-log_tools.lua (category: log):
+log_ops.lua (category: log):
   - log_message(message, level): Log a message
   - get_log_levels(): Get available log levels
 
-neovim_tree.lua (category: treesitter):
+tree_ops.lua (category: treesitter):
   - parse_file(filepath): Parse file with treesitter
   - query_tree(filepath, query): Query AST with pattern
   - get_node_at_position(filepath, line, col): Get node at position
@@ -91,7 +91,7 @@ neovim_tree.lua (category: treesitter):
   - get_node_code(node): Get node source code
   - delete_node(filepath, node): Delete AST node
 
-neovim_lsp.lua (category: lsp):
+lsp_ops.lua (category: lsp):
   - lsp_hover(filepath, line, col): Hover information
   - lsp_definition(filepath, line, col): Go to definition
   - lsp_references(filepath, line, col): Find references
@@ -109,22 +109,20 @@ neovim_lsp.lua (category: lsp):
   - lsp_type_definition(filepath, line, col): Type definition
   - lsp_service_info(): LSP service info
 
-shell_tools.lua (category: system):
-  - run_command(cmd, flag): Run shell command
+shell.lua (category: system):
+  - run_command(cmd, flag): Run shell command (async)
 
-general_tools.lua (category: system):
+plan.lua (category: agent):
   - create_sub_agent(task, boundaries): Create sub-agent
   - get_sub_agent_status(sub_agent_id): Get sub-agent status
   - cancel_sub_agent(sub_agent_id): Cancel sub-agent
-
-tool_helpers.lua:
-  - Utility functions used by other tool modules
-
-plan_executor.lua:
-  - Sub-agent plan execution and tracking
   - review_tool_call(sub_agent_id, tool_call): Boundary enforcement
   - get_summary(sub_agent_id): Get sub-agent execution summary
   - cleanup_sub_agent(sub_agent_id): Clean up sub-agent state
+
+tool_helpers.lua:
+  - Utility functions used by other tool modules
+  - define_tool(name, desc, params, func, opts): Tool definition builder
 
 ==============================================================================
 Tool Approval Workflow                                   *NeoAI-tool-approval*

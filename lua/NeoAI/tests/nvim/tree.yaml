@@ -1,0 +1,26 @@
+name: "NeoAI 会话树界面"
+description: "加载插件，打开会话树窗口，抓取渲染"
+nvim_args:
+  - "-u"
+  - "NONE"
+  - "--cmd"
+  - "set rtp+=/root/NeoAI"
+  - "--cmd"
+  - "lua require('NeoAI').setup({ log = { level = 'ERROR' }, session = { auto_save = false }, ui = { window_mode = 'tab' } })"
+width: 100
+height: 30
+output: "/tmp/neoai_tree_render.txt"
+steps:
+  - type: command
+    cmd: "set number relativenumber signcolumn=yes foldcolumn=2"
+    description: "模拟用户全局配置：开启行号/符号列/折叠列"
+    post_wait: 0.1
+  - type: command
+    cmd: "NeoAITree"
+    description: "打开会话树界面"
+    post_wait: 0.5
+  - type: sleep
+    seconds: 0.5
+  - type: redraw
+    description: "刷新屏幕"
+    post_wait: 0.3

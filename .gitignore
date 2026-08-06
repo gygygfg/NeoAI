@@ -1,10 +1,9 @@
 output.log
 output.txt
 *run*
-*test*
 *fix*
 *example*
 *.log
 !lua/NeoAI/tests/
 !lua/NeoAI/tests/*.lua
-./lua/NeoAI/tests/deepseek_responses/
+!lua/NeoAI/tests/**/*.json

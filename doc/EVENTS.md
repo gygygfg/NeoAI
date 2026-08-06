@@ -1,42 +1,74 @@
 # NeoAI 事件系统文档
 
+> 注意：v2.0 架构重建后，事件命名改为 `domain:verb` 格式（如 `generation:started`）。
+> 事件总线位于 `NeoAI.kernel.event_bus`，常量位于 `NeoAI.kernel.events`。
+> 触发时自动加 `NeoAI:` 前缀（如 `generation:started` → `NeoAI:generation:started`）。
+
 ## 概述
 
-NeoAI 使用 Neovim 原生事件系统 (`nvim_exec_autocmds`) 来实现异步事件通信。所有事件都通过 `User` 自动命令触发，模式为 `NeoAI:*`。
+NeoAI 使用 Neovim 原生事件系统 (`nvim_exec_autocmds`) 来实现异步事件通信。所有事件都通过 `User` 自动命令触发。
+
+## 事件总线
+
+推荐通过 `NeoAI.kernel.event_bus` 发布/订阅：
+
+```lua
+local event_bus = require("NeoAI.kernel.event_bus")
+local events = require("NeoAI.kernel.events")
+
+-- 订阅
+local unsub = event_bus.on(events.GENERATION_STARTED, function(data)
+  print("生成开始:", data.agent_id)
+end)
+
+-- 触发
+event_bus.emit(events.GENERATION_STARTED, { agent_id = "agent_xxx" })
+
+-- 取消订阅
+unsub()
+```
+
+也可直接使用原生 autocmd：
+
+```lua
+vim.api.nvim_create_autocmd("User", {
+  pattern = "NeoAI:generation:started",
+  callback = function(args) print(vim.inspect(args.data)) end,
+})
+```
 
 ## 事件常量
 
-所有事件常量定义在 `NeoAI.core.events` 模块中：
+所有事件常量定义在 `NeoAI.kernel.events` 模块中：
 
 ```lua
-local events = require("NeoAI.core.events")
-print(events.EVENTS.GENERATION_STARTED)  -- 输出: "NeoAI:generation_started"
+local events = require("NeoAI.kernel.events")
+print(events.GENERATION_STARTED)  -- 输出: "generation:started"
 ```
 
 ## 事件列表
 
 ### AI 生成事件
 - `GENERATION_STARTED` - AI生成开始
-  - 数据: `{generation_id, formatted_messages}`
+  - 数据: `{agent_id}`
 - `GENERATION_COMPLETED` - AI生成完成
-  - 数据: `{generation_id, response}`
+  - 数据: `{agent_id, message}`
 - `GENERATION_ERROR` - AI生成错误
-  - 数据: `{generation_id, error_msg}`
+  - 数据: `{agent_id, error}`
 - `GENERATION_CANCELLED` - AI生成取消
+  - 数据: `{agent_id}`
 
 ### 流式处理事件
 - `STREAM_CHUNK` - 流式数据块到达
-  - 数据: `{chunk}`
+  - 数据: `{agent_id}`
 - `STREAM_STARTED` - 流式处理开始
-  - 数据: `{generation_id, formatted_messages}`
 - `STREAM_COMPLETED` - 流式处理完成
-  - 数据: `{session_id}`
 - `STREAM_ERROR` - 流式处理错误
 
 ### 推理事件
-- `REASONING_CONTENT` - 推理内容到达
-  - 数据: `{reasoning_content}`
 - `REASONING_STARTED` - 推理开始
+- `REASONING_CHUNK` - 推理内容到达
+  - 数据: `{agent_id, reasoning}`
 - `REASONING_COMPLETED` - 推理完成
 
 ### 工具相关事件

@@ -8,6 +8,11 @@ directly into your editor. It features a dual-UI design (tree + chat),
 multi-provider AI support, a comprehensive tool execution system, sub-agent
 decomposition, and session history with branching.
 
+The plugin is built on the v2.0 architecture described in styleGuide.md,
+following the principles of isolation (each conversation gets a fresh Agent
+instance), unidirectional dependency (utils → kernel → core → services → ui),
+and async-by-default (all I/O non-blocking).
+
 ==============================================================================
 Core Features                                                  *NeoAI-features*
 
@@ -59,31 +64,38 @@ Project structure:
     lua/NeoAI/
       init.lua                   -- Main module: setup, commands, keymaps
       default_config.lua         -- Default configuration
+      kernel/                    -- Kernel layer (events, config, logger, lifecycle)
+        events.lua
+        event_bus.lua
+        config_store.lua
+        logger.lua
+        lifecycle.lua
       core/                      -- Core business logic
-        init.lua                 -- Core module initializer
-        events.lua               -- Event constants
-        shutdown_flag.lua        -- Global shutdown flag
-        config/                  -- Configuration management
-        ai/                      -- AI engine and sub-modules
-        history/                 -- Session history management
+        session/                 -- Session management (JSONL persistence)
+        model/                   -- Model registry, fetcher, adapters
+        agent/                   -- Agent engine (per-conversation instances)
+      services/                  -- Service layer (chat, tool, model)
       ui/                        -- User interface
-        init.lua                 -- UI module initializer
-        window/                  -- Window management
+        window/                  -- Window manager, chat view, tree view
         components/              -- UI components
-        handlers/                -- Key handlers
+        keymap.lua               -- Unified keymap management
       tools/                     -- Tool system
-        init.lua                 -- Tool system entry
+        registry.lua             -- Tool registry
+        executor.lua             -- Tool executor
+        validator.lua            -- Parameter validation + approval
+        packer.lua               -- Tool grouping
         builtin/                 -- Built-in tool implementations
-      utils/                     -- Utilities
-      tests/                     -- Test suite
+      utils/                     -- Utilities (async, json, http, fs, stringx)
+      tests/                     -- Test suite (:NeoAITest)
 <
 
 Key architectural principles:
-  - Event-driven: Components communicate via Neovim User autocommands
-  - Coroutine context: State manager provides coroutine-local shared state
-  - Graceful shutdown: Unified shutdown_flag module prevents deadlocks
-  - Modular tools: Built-in tools loaded lazily, external tools supported
-  - Decoupled UI/backend: chat_service acts as backend, UI renders independently
+  - Environment isolation: Each conversation = fresh Agent instance (private
+    message queue + independent AbortSignal). Zero state leakage.
+  - Unidirectional dependency: utils → kernel → core → services → ui/tools
+  - Async by default: All I/O non-blocking; model lists fetched in background
+  - Cancellation via AbortSignal: Cascading cancel propagation to HTTP + tools
+  - Event bus: domain:verb event naming over nvim User autocmds
 
 ==============================================================================
 Installation                                                *NeoAI-installation*

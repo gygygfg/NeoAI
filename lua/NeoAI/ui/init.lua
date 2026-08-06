@@ -1,309 +1,115 @@
+--- NeoAI UI 层入口
+--- @module NeoAI.ui
+--- 编排窗口/组件/键位。对外暴露 open/close 等命令入口。
+
+local window_manager = require("NeoAI.ui.window.manager")
+local chat_view = require("NeoAI.ui.window.chat_view")
+local tree_view = require("NeoAI.ui.window.tree_view")
+local config_store = require("NeoAI.kernel.config_store")
+
 local M = {}
 
-local logger = require("NeoAI.utils.logger")
-local window_manager = require("NeoAI.ui.window.window_manager")
-local chat_window = require("NeoAI.ui.window.chat_window")
-local tree_window = require("NeoAI.ui.window.tree_window")
-local input_handler = require("NeoAI.ui.components.input_handler")
-local history_tree = require("NeoAI.ui.components.history_tree")
-local reasoning_display = require("NeoAI.ui.components.reasoning_display")
-local tree_handlers = require("NeoAI.ui.handlers.tree_handlers")
-local chat_handlers = require("NeoAI.ui.handlers.chat_handlers")
-local Events = require("NeoAI.core.events")
-local ui_events = require("NeoAI.ui.ui_events")
+-- ========== 私有状态 ==========
+
 local state = {
-  initialized = false, windows = {}, current_ui_mode = nil,
-  current_session_id = nil, event_count = 0,
-  full_config = {},  -- 合并后的完整配置
+  initialized = false,
 }
 
--- ========== 辅助 ==========
+-- ========== 公开 API ==========
 
-local function get_hm()
-  local ok, hm = pcall(require, "NeoAI.core.history.manager")
-  return ok and hm or nil
-end
-
-local function resolve_session_id(session_id)
-  if session_id and session_id ~= "default" then return session_id end
-  local hm = get_hm()
-  if hm and hm.is_initialized() then
-    local current = hm.get_current_session()
-    if current then return current.id end
-  end
-  return "default"
-end
-
-local function open_window(window_type, session_id, branch_id)
-  local config = state.full_config or {}
-  local win_type_map = { tree = "tree", chat = "chat" }
-  local titles = { tree = "NeoAI 会话树", chat = "NeoAI 聊天" }
-
-  -- 关闭对立的窗口
-  local other = window_type == "chat" and "tree" or "chat"
-  if state.windows[other] then
-    if other == "chat" then chat_window.close() else tree_window.close() end
-    state.windows[other] = nil
-  end
-
-  -- 检查同类型窗口是否已存在且有效，如果是则尝试恢复而非新建
-  local existing_win_id = state.windows[window_type]
-  if existing_win_id then
-    local existing_win = window_manager.get_window_win(existing_win_id)
-    local existing_buf = window_manager.get_window_buf(existing_win_id)
-    -- 窗口句柄有效且 buffer 有效
-    if existing_win and vim.api.nvim_win_is_valid(existing_win)
-      and existing_buf and vim.api.nvim_buf_is_valid(existing_buf) then
-      -- 确保窗口显示的是 NeoAI 的 buffer（可能被其他 buffer 覆盖了）
-      local current_buf_in_win = vim.api.nvim_win_get_buf(existing_win)
-      if current_buf_in_win ~= existing_buf then
-        pcall(vim.api.nvim_win_set_buf, existing_win, existing_buf)
-      end
-      -- 恢复被隐藏的悬浮子窗口（virtual_input、tool_display 等）
-      window_manager.show_float_window(existing_buf)
-      -- 聚焦窗口
-      window_manager.focus_window(existing_win_id)
-      return true
-    else
-      -- 窗口已失效，清理旧状态
-      state.windows[window_type] = nil
-      if window_type == "chat" then
-        pcall(chat_window.close)
-      else
-        pcall(tree_window.close)
-      end
-    end
-  end
-
-  local win_id = window_manager.create_window(window_type, {
-    title = titles[window_type],
-    width = config.width or (window_type == "chat" and 80 or 60),
-    height = config.height or (window_type == "chat" and 20 or 25),
-    border = config.border or "rounded",
-  })
-
-  if not win_id then return false end
-
-  local open_fn = window_type == "chat" and chat_window.open or tree_window.open
-  local success = open_fn(session_id, win_id, branch_id)
-  if not success then
-    window_manager.close_window(win_id)
-    return false
-  end
-
-  state.windows[window_type] = win_id
-  state.current_ui_mode = window_type
-  if window_type == "chat" then state.current_session_id = session_id end
-
-  local set_keymaps = window_type == "chat" and chat_window.set_keymaps or tree_window.set_keymaps
-  set_keymaps()
-  window_manager.focus_window(win_id)
-
-  local event = window_type == "chat" and Events.CHAT_WINDOW_OPENED or Events.TREE_WINDOW_OPENED
-  vim.api.nvim_exec_autocmds("User", { pattern = event, data = { session_id, branch_id or "main" } })
-  return true
-end
-
--- ========== 初始化 ==========
-
---- 获取完整配置（供子组件使用，如 tool_approval 获取 keymaps）
---- @return table
-function M.get_full_config()
-  return state.full_config
-end
-
-function M.initialize(config)
+--- 初始化 UI 层（幂等）
+--- @return table ui
+function M.init()
   if state.initialized then return M end
-  state.full_config = config or {}
-  local window_config = vim.deepcopy(config.window or {})
-  if config.ui and config.ui.window_mode then window_config.window_mode = config.ui.window_mode end
-
-  window_manager.initialize(window_config)
-  input_handler.initialize(config.input or {})
-  history_tree.initialize(config)
-  reasoning_display.initialize(config.reasoning or {})
-  tree_window.initialize(config)
-  tree_handlers.initialize(config)
-  chat_handlers.initialize(config.handlers or {})
-
-  -- 初始化虚拟输入组件（原 chat_window.initialize 中的逻辑）
-  local virtual_input = require("NeoAI.ui.components.virtual_input")
-  virtual_input.initialize(config)
-
-  -- 初始化悬浮文本组件
-  local floating_text = require("NeoAI.ui.components.floating_text")
-  floating_text.initialize(config.floating_text or {})
-
-  -- 初始化模型选择器组件
-  local model_selector = require("NeoAI.ui.components.model_selector")
-  model_selector.initialize(config.model_selector or {}, {
-    on_update_title = function(title) chat_window.update_title(title) end,
-    on_render_chat = function() chat_window.render_chat() end,
-    on_get_window_id = function() return chat_window.get_current_window_id() end,
-  })
-
-  -- 聊天窗口：标记已初始化 + 注册事件监听器
-  chat_window._mark_initialized()
-  chat_window._setup_event_listeners()
-
-  M._register_event_listeners()
   state.initialized = true
+  -- 注册审批 UI
+  local approval_ui = require("NeoAI.ui.components.tool_approval")
+  approval_ui.init()
+  -- 启动子 Agent 监控监听
+  local sub_agent_dock = require("NeoAI.ui.components.sub_agent_dock")
+  sub_agent_dock.init()
   return M
 end
 
--- ========== UI 打开 ==========
-
-function M.open_tree_ui()
-  if not state.initialized then error("UI not initialized") end
-
-  -- 打开 tree 前检查文件是否有变化，有则重新加载
-  local hm = get_hm()
-  if hm and hm.is_initialized() and hm.has_file_changed() then
-    hm.reload_from_file()
+--- 打开默认界面（按配置 default_view）
+--- @return table
+function M.open_default()
+  M.init()
+  local default_view = config_store.get("ui.default_view") or "chat"
+  if default_view == "tree" then
+    return M.open_tree()
   end
-
-  local session_id = resolve_session_id(state.current_session_id)
-  open_window("tree", session_id)
+  return M.open_chat()
 end
 
-function M.open_chat_ui(session_id, branch_id)
-  if not state.initialized then error("UI not initialized") end
-  -- 如果传入了 session_id（从 tree 选择会话），直接打开该会话加载历史消息
-  -- 否则不创建新会话，传入 nil 让 chat_window 在用户发送消息时才创建
-  -- 这样用户只是打开窗口看看而不发送消息时，不会产生空会话
-  open_window("chat", session_id, branch_id or "main")
+--- 打开聊天界面
+--- @return table
+function M.open_chat()
+  M.init()
+  -- 树窗口保持打开，不自动关闭（可同时浏览会话）
+  return chat_view.open()
 end
 
--- ========== 窗口管理 ==========
+--- 打开会话树界面
+--- @return table
+function M.open_tree()
+  M.init()
+  -- 聊天窗口保持打开，不自动关闭
+  return tree_view.open()
+end
 
-function M.close_all_windows()
-  if not state.initialized then return end
+--- 关闭所有窗口
+function M.close_all()
+  chat_view.close()
+  tree_view.close()
   window_manager.close_all()
-  state.windows = {}
-  state.current_ui_mode = nil
 end
 
-function M.get_current_ui_mode() return state.current_ui_mode end
-function M.get_window_manager() return window_manager end
-
-function M.get_chat_window()
-  return state.windows.chat and chat_window or nil
+--- 是否有窗口
+--- @return boolean
+function M.has_windows()
+  return window_manager.has_windows()
 end
 
-function M.get_tree_window()
-  return state.windows.tree and tree_window or nil
+--- 显示键位配置
+function M.show_keymaps()
+  local keymap = require("NeoAI.ui.keymap")
+  keymap.show_keymaps()
 end
 
-function M.refresh_current_ui()
-  if state.current_ui_mode == "tree" and state.windows.tree then
-    tree_window.refresh_tree()
-  elseif state.current_ui_mode == "chat" and state.windows.chat then
-    chat_window.render_chat()
-  end
+--- 聊天窗口状态
+function M.chat_status()
+  chat_view.show_status()
 end
 
--- ========== Reasoning ==========
-
-function M.show_reasoning(content)
-  if state.initialized then reasoning_display.show(content) end
+--- 获取聊天视图
+--- @return table
+function M.get_chat_view()
+  return chat_view
 end
 
-function M.append_reasoning(content)
-  if state.initialized then reasoning_display.append(content) end
+--- 获取树视图
+--- @return table
+function M.get_tree_view()
+  return tree_view
 end
 
-function M.close_reasoning()
-  if state.initialized then reasoning_display.close() end
-end
-
--- ========== 事件监听 ==========
-
-function M._register_event_listeners()
-  ui_events.register_listeners(state, {
-    refresh_tree = function()
-      if state.current_ui_mode == "tree" and state.windows.tree then tree_window.refresh_tree() end
-    end,
-    refresh_chat = function()
-      if state.current_ui_mode == "chat" and state.windows.chat then chat_window.render_chat() end
-    end,
-    chat_window = chat_window,
-    tree_window = tree_window,
-    get_hm = get_hm,
-  })
-end
-
--- ========== 模式切换 ==========
-
-function M.switch_mode(mode)
-  if not state.initialized then return end
+--- 切换默认界面
+--- @param mode string "tree"|"chat"
+function M.switch_view(mode)
+  config_store.set("ui.default_view", mode)
+  M.close_all()
   if mode == "tree" then
-    M.open_tree_ui()
-  elseif mode == "chat" then
-    M.open_chat_ui(state.current_session_id or "default", "main")
+    M.open_tree()
+  else
+    M.open_chat()
   end
 end
 
-function M.handle_key_input(key)
-  if not state.initialized or not state.current_ui_mode then return end
-  state.event_count = state.event_count + 1
-  if state.current_ui_mode == "tree" then
-    tree_handlers.handle_key(key)
-  elseif state.current_ui_mode == "chat" then
-    chat_handlers.handle_key(key)
-  end
-end
-
--- ========== 配置 ==========
-
-function M.update_config(new_config)
-  if not state.initialized then return end
-  local config = state.full_config or {}
-  local merged = vim.tbl_extend("force", config, new_config or {})
-  local window_config = merged.window or {}
-  if merged.window_mode then window_config.window_mode = merged.window_mode end
-  window_manager.update_config(window_config)
-  input_handler.update_config(merged.input or {})
-  M.refresh_current_ui()
-end
-
--- ========== 窗口列表 ==========
-
-function M.list_windows()
-  if not state.initialized then return {} end
-  local windows = {}
-  for window_type, window_id in pairs(state.windows) do
-    local win_handle = window_manager.get_window_win(window_id)
-    if win_handle and vim.api.nvim_win_is_valid(win_handle) then
-      table.insert(windows, win_handle)
-    elseif window_id then
-      vim.notify(string.format("无法获取窗口句柄 for %s: %s", window_type, window_id), vim.log.levels.DEBUG)
-    end
-  end
-  return windows
-end
-
--- ========== 会话 ID ==========
-
-function M.get_current_session_id()
-  return state.current_session_id or "default"
-end
-
-function M.update_current_session_id(session_id)
-  if not state.initialized then return end
-  state.current_session_id = session_id
-  vim.api.nvim_exec_autocmds("User", {
-    pattern = Events.UI_SESSION_UPDATED,
-    data = { session_id = session_id },
-  })
-end
-
--- ========== 事件计数 ==========
-
-function M.get_event_count() return state.event_count or 0 end
-function M.reset_event_count() state.event_count = 0 end
-
-function M.is_initialized()
-  return state.initialized
+--- 重置（测试用）
+function M.reset()
+  M.close_all()
+  state.initialized = false
 end
 
 return M

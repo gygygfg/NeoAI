@@ -1,7 +1,7 @@
 " Vim autoload functions for NeoAI
 
 function! NeoAI#Open(...) abort
-    let l:mode = get(a:, 1, 'float')
+    let l:mode = get(a:, 1, '')
     execute 'NeoAIOpen ' . l:mode
 endfunction
 
@@ -9,50 +9,28 @@ function! NeoAI#Close() abort
     NeoAIClose
 endfunction
 
-function! NeoAI#Send(...) abort
-    if a:0 > 0
-        execute 'NeoAISend ' . join(a:000, ' ')
-    endif
+function! NeoAI#Chat(...) abort
+    execute 'NeoAIChat'
 endfunction
 
-function! NeoAI#New(...) abort
+function! NeoAI#Tree() abort
+    execute 'NeoAITree'
+endfunction
+
+function! NeoAI#Keymaps() abort
+    NeoAIKeymaps
+endfunction
+
+function! NeoAI#ChatStatus() abort
+    NeoAIChatStatus
+endfunction
+
+function! NeoAI#Test(...) abort
     if a:0 > 0
-        execute 'NeoAINew ' . a:1
+        execute 'NeoAITest ' . join(a:000, ' ')
     else
-        NeoAINew
+        NeoAITest
     endif
-endfunction
-
-function! NeoAI#List() abort
-    NeoAIList
-endfunction
-
-function! NeoAI#Switch(session_id) abort
-    execute 'NeoAISwitch ' . a:session_id
-endfunction
-
-function! NeoAI#Export(...) abort
-    if a:0 > 0
-        execute 'NeoAIExport ' . a:1
-    else
-        NeoAIExport
-    endif
-endfunction
-
-function! NeoAI#Import(...) abort
-    if a:0 > 0
-        execute 'NeoAIImport ' . a:1
-    else
-        NeoAIImport
-    endif
-endfunction
-
-function! NeoAI#Mode(mode) abort
-    execute 'NeoAIMode ' . a:mode
-endfunction
-
-function! NeoAI#Stats() abort
-    NeoAIStats
 endfunction
 
 function! NeoAI#Setup(config) abort

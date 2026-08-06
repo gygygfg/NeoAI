@@ -53,12 +53,7 @@ use {
 
 vim.pack.add({ gh("gygygfg/Neoai") })
 
-vim.api.nvim_create_autocmd("VimEnter", {
-  once = true,
-  callback = function()
-    require("NeoAI").setup({})
-  end,
-})
+require("NeoAI").setup({})
 
 ```
 
@@ -83,7 +78,7 @@ export ANTHROPIC_API_KEY="your-api-key"
 ```lua
 require("NeoAI").setup({
   ai = {
-    default = "balanced",
+    default_provider = "deepseek",
     providers = {
       deepseek = {
         api_key = os.getenv("DEEPSEEK_API_KEY"),
@@ -125,90 +120,91 @@ require("NeoAI").setup({
 require("NeoAI").setup({
   -- ===== AI 配置 =====
   ai = {
-    default = "balanced",                   -- 默认预设名称
+    default_provider = "deepseek",       -- 默认提供商
+    default_model = "auto",              -- "auto" = 使用 registry 第一个可用模型
 
-    -- 提供商定义（支持 13+ 家 AI 服务商）
+    -- 提供商定义（13+ 家 AI 服务商）
     providers = {
       deepseek = {
-        api_type = "openai",                -- API 类型：openai / anthropic / google
-        base_url = "https://api.deepseek.com/chat/completions",
+        api_type = "openai",             -- API 类型：openai / anthropic / google
+        base_url = "https://api.deepseek.com",
         api_key = os.getenv("DEEPSEEK_API_KEY"),
-        models = { "deepseek-v4-flash", "deepseek-v4-pro" },
+        fetch_models = true,             -- 是否自动获取模型列表（异步后台拉取）
+        models_override = nil,           -- 可选：手动指定模型（覆盖 API 结果）
       },
       openai = {
         api_type = "openai",
-        base_url = "https://api.openai.com/v1/chat/completions",
+        base_url = "https://api.openai.com/v1",
         api_key = os.getenv("OPENAI_API_KEY"),
-        models = { "gpt-4o", "gpt-4o-mini", "gpt-4-turbo" },
+        fetch_models = true,
       },
-      anthropic = {
-        api_type = "anthropic",
-        base_url = "https://api.anthropic.com/v1/messages",
-        api_key = os.getenv("ANTHROPIC_API_KEY"),
-        models = { "claude-sonnet-4-20250514", "claude-3-5-sonnet-20241022" },
-      },
-      -- 更多提供商：google, groq, together, openrouter, siliconflow,
+      -- 更多提供商：anthropic, google, groq, together, openrouter, siliconflow,
       -- moonshot, zhipu, baidu, aliyun, stepfun
     },
 
-    -- 场景化模型配置
-    scenarios = {
-      naming    = { { provider = "deepseek", model_name = "deepseek-v4-flash", temperature = 0.3 } },
-      chat      = { { provider = "deepseek", model_name = "deepseek-v4-flash", temperature = 0.7 } },
-      reasoning = { { provider = "deepseek", model_name = "deepseek-v4-pro",  temperature = 0.7 } },
-      coding    = { { provider = "deepseek", model_name = "deepseek-v4-pro",  temperature = 0.2 } },
-      tools     = { { provider = "deepseek", model_name = "deepseek-v4-flash", temperature = 0.3 } },
-      agent     = { { provider = "deepseek", model_name = "deepseek-v4-pro",  temperature = 0.7 } },
+    model_refresh = {
+      on_startup = true,                 -- 启动后自动获取模型列表
+      interval_sec = 3600,               -- 定期刷新（0 = 禁用）
+      timeout_ms = 10000,                -- 单次请求超时
     },
 
-    reasoning_enabled = true,               -- 启用深度思考模式
+    -- 场景化模型配置（每个场景用 provider + preset 组合）
+    scenarios = {
+      chat      = { provider = "deepseek", preset = "balanced" },
+      coding    = { provider = "deepseek", preset = "precise" },
+      reasoning = { provider = "deepseek", preset = "deep_think" },
+      agent     = { provider = "deepseek", preset = "balanced" },
+    },
+
+    -- 预设（温度/token/流式组合）
+    presets = {
+      fast      = { model = "auto", temperature = 0.3, max_tokens = 1024, stream = true },
+      balanced  = { model = "auto", temperature = 0.7, max_tokens = 4096, stream = true },
+      precise   = { model = "auto", temperature = 0.2, max_tokens = 8192, stream = true },
+      deep_think= { model = "auto", temperature = 0.7, max_tokens = 8192, stream = true },
+    },
+
+    reasoning_enabled = true,            -- 启用深度思考模式
     system_prompt = "你是一个AI编程助手，帮助用户解决编程问题。",
+    timeout_ms = 60000,                  -- 请求超时
+    max_retries = 3,                     -- 请求重试次数
   },
 
   -- ===== UI 配置 =====
   ui = {
-    default_ui = "tree",                    -- 默认界面：tree / chat
-    window_mode = "tab",                    -- 窗口模式：float / tab / split
-    window = {
-      width = 80,
-      height = 20,
-      border = "rounded",
-    },
-    split = {
-      size = 80,
-      chat_direction = "right",
-      tree_direction = "right",
-    },
+    default_view = "chat",               -- 默认界面：tree / chat
+    window_mode = "tab",                 -- 窗口模式：float / tab / split
+    window = { width = 80, height = 24, border = "rounded" },
+    split = { size = 80, direction = "right" },
   },
 
   -- ===== 键位配置 =====
   keymaps = {
     global = {
-      open_tree = { key = "<leader>at", desc = "打开树界面" },
-      open_chat = { key = "<leader>ac", desc = "打开聊天界面" },
-      close_all = { key = "<leader>aq", desc = "关闭所有窗口" },
       toggle_ui = { key = "<leader>aa", desc = "切换UI显示" },
+      open_chat = { key = "<leader>ac", desc = "打开聊天界面" },
+      open_tree = { key = "<leader>at", desc = "打开树界面" },
+      close_all = { key = "<leader>aq", desc = "关闭所有窗口" },
     },
     tree = {
-      select        = { key = "<CR>", desc = "选择节点/分支" },
-      new_child     = { key = "n",    desc = "新建子分支" },
-      new_root      = { key = "N",    desc = "新建根分支" },
-      delete_dialog = { key = "d",    desc = "删除对话" },
-      delete_branch = { key = "D",    desc = "删除分支" },
+      select = { key = "<CR>", desc = "选择节点/分支" },
+      new_child = { key = "n", desc = "新建子分支" },
+      new_root = { key = "N", desc = "新建根分支" },
+      delete_dialog = { key = "d", desc = "删除对话" },
+      delete_branch = { key = "D", desc = "删除分支" },
     },
     chat = {
-      insert          = { key = "i",       desc = "进入插入模式" },
-      quit            = { key = "q",       desc = "关闭聊天窗口" },
-      send            = { insert = { key = "<C-s>" }, normal = { key = "<CR>" } },
-      cancel          = { key = "<Esc>",   desc = "取消生成" },
-      switch_model    = { key = "m",       desc = "切换模型" },
-      toggle_reasoning= { key = "r",       desc = "切换思考过程显示" },
-      tool_approval   = { key = "<C-a>",   desc = "工具审批" },
+      insert = { key = "i", desc = "进入插入模式" },
+      quit = { key = "q", desc = "关闭聊天窗口" },
+      send = { insert = { key = "<C-s>" }, normal = { key = "<CR>" } },
+      cancel = { key = "<Esc>", desc = "取消生成" },
+      switch_model = { key = "m", desc = "切换模型" },
+      toggle_reasoning = { key = "r", desc = "切换思考过程显示" },
       approval = {
-        confirm            = { key = "<CR>", desc = "允许一次" },
-        confirm_all        = { key = "A",    desc = "允许所有" },
-        cancel             = { key = "<Esc>",desc = "取消" },
-        cancel_with_reason = { key = "C",    desc = "取消并说明" },
+        confirm = { key = "<CR>", desc = "允许一次" },
+        confirm_all = { key = "A", desc = "允许所有" },
+        cancel = { key = "<Esc>", desc = "取消" },
+        cancel_with_reason = { key = "C", desc = "取消并说明" },
       },
     },
   },
@@ -219,21 +215,26 @@ require("NeoAI").setup({
     auto_naming = true,
     save_path = vim.fn.stdpath("cache") .. "/NeoAI",
     max_history_per_session = 1000,
+    file = "sessions.jsonl",             -- 追加式 JSONL 存储
   },
 
   -- ===== 工具配置 =====
   tools = {
     enabled = true,
     builtin = true,
+    external = {},
     approval = {
+      mode = "prompt",                   -- prompt | auto_allow | strict
       default_auto_allow = false,
-      tool_overrides = {
+      allowed_directories = {},
+      allowed_param_groups = {},
+      per_tool = {
         read_file      = { auto_allow = true },
         edit_file      = { auto_allow = false },
         list_files     = { auto_allow = true },
         search_files   = { auto_allow = true },
         delete_file    = { auto_allow = false },
-        run_command    = { auto_allow = false },
+        run_command    = { auto_allow = false, allowed_directories = { "./" }, allowed_param_groups = { "ls", "grep" } },
         create_sub_agent = { auto_allow = false },
         -- 更多工具审批配置...
       },
@@ -242,8 +243,9 @@ require("NeoAI").setup({
 
   -- ===== 日志配置 =====
   log = {
-    level = "WARN",       -- DEBUG / INFO / WARN / ERROR / FATAL
-    max_file_size = 10485760,
+    level = "WARN",                      -- DEBUG / INFO / WARN / ERROR / FATAL
+    path = vim.fn.stdpath("cache") .. "/NeoAI/neoai.log",
+    max_size = 10485760,
     max_backups = 5,
   },
 })
@@ -331,148 +333,98 @@ NeoAI 内置了 40+ 工具，AI 可在对话中自动调用，涵盖以下类别
 
 ## 🏗️ 架构
 
+基于 v2.0 架构指南（见 [styleGuide.md](styleGuide.md)），遵循**隔离、简洁、异步优先**设计哲学。
+
 ```
 NeoAI/
-├── init.lua                 # 主入口：setup / 命令注册 / 全局快捷键
-├── default_config.lua       # 默认配置定义
+├── init.lua                    # 主入口：极薄，仅 setup + 命令/快捷键注册，业务懒加载
+├── default_config.lua          # 默认配置（纯数据，零逻辑）
 │
-├── core/                    # 核心业务逻辑
-│   ├── init.lua             # 核心模块入口
-│   ├── events.lua           # 事件常量定义（60+ 事件）
-│   ├── shutdown_flag.lua    # 全局关闭标志
-│   │
-│   ├── config/              # 配置管理
-│   │   ├── init.lua         # 配置模块入口
-│   │   ├── merger.lua       # 配置合并器（验证→合并→清理→日志初始化）
-│   │   ├── keymap_manager.lua # 键位配置管理器
-│   │   └── state.lua        # 协程上下文管理器
-│   │
-│   ├── history/             # 历史管理
-│   │   ├── manager.lua      # 会话 CRUD、消息管理
-│   │   ├── persistence.lua  # 文件序列化/事务性保存
-│   │   ├── cache.lua        # 树结构/列表缓存
-│   │   ├── saver.lua        # 事件驱动的异步写入器
-│   │   └── message_builder.lua # 消息构建器
-│   │
-│   └── ai/                  # AI 交互
-│       ├── init.lua         # AI 模块入口
-│       ├── ai_engine.lua    # AI 引擎（主编排器）
-│       ├── chat_service.lua # 后端聊天服务
-│       ├── http_client.lua  # HTTP 客户端（流式/非流式）
-│       ├── request_adapter.lua # 多 API 格式转换适配器
-│       ├── request_builder.lua # 请求构建器
-│       ├── stream_processor.lua # 流式数据处理器
-│       ├── tool_orchestrator.lua # 工具调用编排器
-│       ├── sub_agent_engine.lua # 子 Agent 引擎
-│       ├── response_retry.lua   # 响应重试模块
-│       ├── generation_handler.lua # 生成完成处理器
-│       └── session_manager.lua # 工具循环会话管理
+├── kernel/                     # 内核层（最底层，零业务依赖）
+│   ├── events.lua             # 事件常量注册表（domain:verb 命名）
+│   ├── event_bus.lua          # 事件总线（发布/订阅）
+│   ├── config_store.lua       # 配置存储（merge + validate + get + watch）
+│   ├── logger.lua             # 分级日志（文件输出 + 轮转）
+│   └── lifecycle.lua          # 生命周期（bootstrap/shutdown）
 │
-├── ui/                      # 用户界面
-│   ├── init.lua             # UI 模块入口
-│   ├── ui_events.lua        # UI 事件监听器
-│   ├── window/
-│   │   ├── window_manager.lua # 窗口管理器（float/tab/split）
-│   │   ├── chat_window.lua    # 聊天窗口
-│   │   └── tree_window.lua    # 会话树窗口
-│   ├── components/
-│   │   ├── input_handler.lua    # 输入处理器
-│   │   ├── history_tree.lua     # 历史树组件
-│   │   ├── reasoning_display.lua # 推理过程显示
-│   │   ├── virtual_input.lua    # 虚拟输入框
-│   │   ├── approval_config_editor.lua # 审批配置编辑器
-│   │   ├── sub_agent_monitor.lua  # 子 Agent 监控
-│   │   ├── pty_terminal.lua      # 伪终端组件
-│   │   ├── tool_display.lua      # 工具调用展示
-│   │   └── history_tree.lua      # 历史树
-│   └── handlers/
-│       ├── tree_handlers.lua  # 树界面事件处理器
-│       └── chat_handlers.lua  # 聊天界面事件处理器
+├── core/                       # 核心业务层
+│   ├── session/               # 会话管理
+│   │   ├── session.lua        # 会话对象（纯净数据 + fork 分支）
+│   │   ├── session_store.lua  # 会话持久化（追加式 JSONL）
+│   │   └── context_builder.lua# 上下文构建
+│   ├── model/                 # 模型管理
+│   │   ├── registry.lua       # 模型注册表（运行时动态更新）
+│   │   ├── fetcher.lua        # 模型列表异步获取器（指数退避重试）
+│   │   ├── adapter.lua        # 多提供商协议适配（openai/anthropic/google）
+│   │   └── cache.lua          # 模型列表本地缓存
+│   └── agent/                 # Agent 引擎
+│       ├── agent.lua          # Agent 对象（每次对话全新实例 + AbortSignal）
+│       ├── runtime.lua        # Agent 运行时（create/spawn/dispose/abort）
+│       ├── request.lua        # 请求构建 + 发送 + 重试
+│       ├── stream.lua         # 流式响应处理（SSE 解析）
+│       └── tool_loop.lua      # 工具调用循环
 │
-├── tools/                   # 工具系统
-│   ├── init.lua             # 工具模块入口
-│   ├── tool_registry.lua    # 工具注册表
-│   ├── tool_executor.lua    # 工具执行器
-│   ├── tool_validator.lua   # 工具验证器
-│   ├── tool_pack.lua        # 工具包管理（按类别分组）
-│   ├── approval_handler.lua # 工具审批处理器
-│   ├── approval_state.lua   # 审批共享状态
-│   └── builtin/             # 内置工具
-│       ├── file_tools.lua      # 文件操作工具
-│       ├── shell_tools.lua     # Shell 命令（伪终端+PID监控）
-│       ├── neovim_tree.lua     # Tree-sitter 语法树工具
-│       ├── neovim_lsp.lua      # LSP 工具
-│       ├── general_tools.lua   # 通用工具
-│       ├── log_tools.lua       # 日志工具
-│       ├── plan_executor.lua   # 执行计划/边界审核
-│       └── tool_helpers.lua    # 工具定义辅助函数
+├── services/                   # 服务层（连接 core 与 ui/tools）
+│   ├── chat_service.lua       # 聊天服务（send/attach/detach）
+│   ├── tool_service.lua       # 工具服务（审批 + 调度 + 执行）
+│   └── model_service.lua      # 模型服务（list/set_active/prefetch）
 │
-├── utils/                   # 工具库
-│   ├── init.lua             # 工具模块入口
-│   ├── logger.lua           # 日志系统
-│   ├── json.lua             # JSON 编解码
-│   ├── file_utils.lua       # 文件操作
-│   ├── http_utils.lua       # HTTP 工具函数
-│   ├── table_utils.lua      # 表操作
-│   ├── common.lua           # 通用函数（深拷贝等）
-│   ├── async_worker.lua     # 异步工作器
-│   └── skiplist.lua         # 跳表数据结构
+├── ui/                         # 表现层
+│   ├── window/                # 窗口管理（float/tab/split）
+│   │   ├── manager.lua        # 窗口管理器
+│   │   ├── chat_view.lua      # 聊天视图
+│   │   └── tree_view.lua      # 会话树视图
+│   ├── components/            # 可复用组件
+│   │   ├── input_box.lua      # 输入框
+│   │   ├── message_list.lua   # 消息列表渲染
+│   │   ├── reasoning_panel.lua# 思考过程面板
+│   │   ├── model_picker.lua   # 模型选择器（异步加载）
+│   │   ├── tool_approval.lua  # 工具审批弹窗
+│   │   ├── sub_agent_dock.lua # 子 Agent 监控
+│   │   └── markdown_view.lua  # Markdown 渲染器
+│   └── keymap.lua             # 按键映射（统一管理）
 │
-├── tests/                   # 测试
-│   ├── init.lua             # 测试入口（断言工具、测试运行器）
-│   ├── test_config.lua      # 配置测试
-│   ├── test_ai_core.lua     # AI 核心测试
-│   ├── test_tools.lua       # 工具系统测试
-│   ├── test_history.lua     # 历史管理测试
-│   ├── test_sub_agent.lua   # 子 Agent 测试
-│   ├── test_integration.lua # 端到端集成测试
-│   └── ...                  # 更多测试
+├── tools/                      # 工具系统
+│   ├── registry.lua           # 工具注册表
+│   ├── executor.lua           # 工具执行器（别名/审批/超时）
+│   ├── validator.lua          # 参数校验 + 审批决策
+│   ├── packer.lua             # 工具分组打包
+│   └── builtin/               # 内置工具
+│       ├── file_ops.lua       # 文件操作 + confirm_file_change
+│       ├── shell.lua          # Shell 命令
+│       ├── git_ops.lua        # Git 操作
+│       ├── lsp_ops.lua        # LSP 工具
+│       ├── tree_ops.lua       # Tree-sitter 工具
+│       ├── log_ops.lua        # 日志工具
+│       ├── plan.lua           # 子 Agent + 边界审核
+│       └── tool_helpers.lua   # 工具定义辅助
 │
-├── docs/                    # 文档
-│   ├── EVENTS.md             # 事件系统文档
-│   ├── AI_RESPONSE_FLOW.md   # AI 响应流程
-│   ├── chat_enhanced_usage.md # 聊天增强使用指南
-│   ├── ui_multithread_optimization.md # UI 多线程优化
-│   └── ...
+├── utils/                      # 纯工具库（零业务依赖）
+│   ├── async.lua             # Promise/Deferred/AbortSignal/retry
+│   ├── json.lua              # JSON 编解码
+│   ├── http.lua              # 异步 HTTP 客户端（curl jobstart，流式 SSE）
+│   ├── fs.lua                # 文件操作（JSONL）
+│   └── stringx.lua           # 字符串扩展
 │
-├── styleGuide.md            # 架构设计指南
-└── README.md                # 本文件
+└── tests/                      # 测试（自定义运行器，:NeoAITest）
+    ├── init.lua               # 断言 + 运行器
+    ├── test_kernel.lua        # 内核层
+    ├── test_session.lua       # 会话层
+    ├── test_model_registry.lua# 模型层
+    ├── test_agent.lua         # Agent 层
+    ├── test_tools.lua         # 工具层
+    ├── test_services.lua      # 服务层
+    └── test_integration.lua   # 集成测试（mock server）
 ```
 
-### 启动流程
+### 设计要点
 
-```
-用户调用 setup(config)
-    │
-    ▼
-config_merger.process_config(config)  ← 验证→合并→清理→日志初始化
-    │
-    ▼
-core.initialize(config)               ← 初始化AI引擎、历史管理器、聊天服务
-    │
-    ▼
-ui.initialize(config)                 ← 初始化窗口管理器、各UI组件
-    │
-    ▼
-tools.initialize(config)              ← 初始化工具注册表、执行器、验证器
-    │
-    ▼
-vim.schedule → 延迟加载内置工具       ← 异步注册 file_tools, shell_tools 等
-    │
-    ▼
-注入工具到 AI 引擎                    ← AI 可调用所有已注册工具
-    │
-    ▼
-注册命令和快捷键                      ← :NeoAIChat, :NeoAITree 等
-```
-
-### 架构设计要点
-
-- **事件驱动** — 所有模块通过 `nvim_exec_autocmds(User)` 通信，不直接耦合
-- **闭包内私有状态** — 各模块使用闭包变量维护私有状态，不暴露内部实现
-- **回调模式** — 工具函数采用 `func(args, on_success, on_error)` 异步回调模式
-- **配置合并** — 用户配置与默认配置通过 `config_merger` 深度合并
-- **前后端分离** — `chat_service` 作为后端入口，`chat_handlers` 和 `chat_window` 作为前端
+- **环境隔离**：每次打开对话窗口 → 全新 Agent 实例（空消息队列 + 独立 AbortSignal），零残留
+- **子 Agent 沙箱**：`runtime.spawn()` 创建全新环境，不继承父 Agent 的任何消息/状态
+- **依赖单向**：`utils → kernel → core → services → ui/tools`，禁止跨层穿透
+- **异步优先**：所有 I/O 异步，启动不阻塞 Neovim，模型列表后台拉取
+- **取消信号**：AbortSignal 级联传播（HTTP 请求 + 工具调用），替代全局标志
+- **事件驱动**：`event_bus` 基于 nvim autocmd 发布/订阅，事件名 `domain:verb`
 
 ---
 

@@ -11,75 +11,59 @@ Module List                                             *NeoAI-utils-modules*
 utils/init.lua:
   Entry point, exports all utility modules
 
-utils/logger.lua:
-  Logging system
-  - initialize(config): Setup logger with config
-  - debug(msg, ...): DEBUG level log
-  - info(msg, ...): INFO level log
-  - warn(msg, ...): WARN level log
-  - error(msg, ...): ERROR level log
-  - fatal(msg, ...): FATAL level log
-  - Log levels: DEBUG, INFO, WARN, ERROR, FATAL
-  - Output: file (configurable path) or default
-  - Format: "[{time}] [{level}] {message}"
-  - File rotation: max_file_size, max_backups
+utils/async.lua:
+  Async primitives (Promise/Deferred/AbortSignal)
+  - Deferred.new(): Manual resolve/reject promise
+  - new(executor): Promise with executor(resolve, reject)
+  - all(promises): Await all promises
+  - race(promises): First settled wins
+  - retry(fn, opts): Retry with exponential backoff
+  - sleep(ms): Delay
+  - create_signal(): AbortSignal (abort/reason/subscribe)
+  - Signal:abort(reason), :aborted(), :subscribe(cb)
 
 utils/json.lua:
   JSON utilities
   - encode(value): Encode Lua value to JSON string
   - decode(json_str): Decode JSON string to Lua value
-  - Wraps vim.json with error handling
+  - decode_or_nil(json_str): Safe decode (returns nil on error)
+  - decode_line(line): JSONL single line decode
 
-utils/http_utils.lua:
-  HTTP utilities
-  - sanitize_json_body(body): Clean JSON body
-  - repair_orphan_tool_messages(request): Fix tool message issues
-  - parse_response_tool_calls(response): Parse tool calls from response
-  - check_dedup(generation_id, api_type, request): Request dedup check
-  - update_dedup(generation_id, api_type, request): Update dedup cache
-  - clear_dedup(generation_id): Clear dedup for retry
-  - clear_all_dedup(): Clear all dedup caches
-  - read_file(filepath): Read file contents
+utils/http.lua:
+  Async HTTP client (curl via jobstart)
+  - request(opts): Non-blocking request
+    opts: { base_url, path, method, headers, body, query, timeout_ms, stream }
+  - stream support: on_chunk(data, done) callback for SSE
+  - AbortSignal: kills curl job on abort
+  - get_json(base_url, path, opts): GET JSON convenience
 
-utils/file_utils.lua:
+utils/fs.lua:
   File utilities
-  - read_file(filepath): Read file with encoding detection
-  - write_file(filepath, content): Write file
-  - file_exists(filepath): Check file existence
-  - Other file operations used by file_tools
+  - read_file/write_file/append_file/delete_file
+  - ensure_dir/mkdir
+  - read_jsonl/append_jsonl/repair_jsonl (torn line recovery)
+  - exists/is_dir/list_dir/join/basename/dirname
 
-utils/common.lua:
-  Common utility functions
-  - General-purpose helpers
-
-utils/async_worker.lua:
-  Async worker utilities
-  - Schedule and manage async operations
-  - Used by UI for non-blocking rendering
-
-utils/table_utils.lua:
-  Table manipulation utilities
-  - Deep copy
-  - Merge
-  - Filter
-  - Map
-  - Other table operations
-
-utils/skiplist.lua:
-  Skip list data structure
-  - Used for efficient ordered data access
+utils/stringx.lua:
+  String utilities
+  - trim/split/startswith/endswith
+  - template ({} placeholders)
+  - glob_to_pattern/glob_match
+  - truncate/capitalize/uuid/is_blank
 
 ==============================================================================
-Logger Configuration                                   *NeoAI-logger-config*
+Logger Configuration (kernel/logger.lua)              *NeoAI-logger-config*
+
+The logger lives in kernel/logger.lua (moved from utils to satisfy the
+kernel → utils dependency rule).
 
 >
     log = {
         level = "WARN",           -- DEBUG, INFO, WARN, ERROR, FATAL
-        output_path = nil,        -- File path (nil = default)
+        path = vim.fn.stdpath("cache") .. "/NeoAI/neoai.log",
         format = "[{time}] [{level}] {message}",
-        max_file_size = 10485760, -- 10MB
+        max_size = 10485760,      -- 10MB
         max_backups = 5,
-        verbose = false,
         print_debug = false,
     }
 <

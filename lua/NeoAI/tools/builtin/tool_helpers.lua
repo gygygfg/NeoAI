@@ -1,58 +1,74 @@
--- 工具定义辅助模块
--- 提供 define_tool() 函数，让工具的定义、描述、参数、实现紧密组织在一起
--- 支持同步和回调两种模式：
---   同步模式：func(args) -> result
---   回调模式：func(args, on_success, on_error) 异步执行后通过回调返回
+--- 工具定义辅助函数
+--- @module NeoAI.tools.builtin.tool_helpers
+--- 提供 define_tool 便捷构造器，供各内置工具模块使用。
+
 local M = {}
 
---- 定义一个工具
---- 将工具的所有信息（名称、描述、参数、实现、分类、权限）集中在一个调用中
----
---- 回调模式约定：
----   工具函数签名：function(args, on_success, on_error)
----     - args: table 工具参数
----     - on_success: function(result) 执行成功时调用
----     - on_error: function(error_msg) 执行失败时调用
----   工具函数内部应使用 vim.uv 异步 I/O 或 vim.schedule / vim.defer_fn 实现异步，
----   并通过 on_success/on_error 返回结果，不阻塞主线程。
----
---- 同步模式（兼容旧接口）：
----   工具函数签名：function(args) -> result
----   直接返回结果，会阻塞主线程。
----
---- @param opts {name:string, description:string, func:function, parameters?:table, returns?:table, category?:string, permissions?:table, async?:boolean, timeout?:number, approval?:table} 工具定义选项
---- @return table 工具定义表
-function M.define_tool(opts)
-  vim.validate({
-    name = { opts.name, "string" },
-    description = { opts.description, "string" },
-    func = { opts.func, "function" },
-    parameters = { opts.parameters, "table", true },
-    category = { opts.category, "string", true },
-    returns = { opts.returns, "table", true },
-    permissions = { opts.permissions, "table", true },
-    async = { opts.async, "boolean", true },
-    timeout = { opts.timeout, "number", true },
-  })
-
+--- 构造工具定义
+--- @param name string
+--- @param description string
+--- @param params table|nil parameters schema
+--- @param func function(args, on_success, on_error, ctx)
+--- @param opts table|nil { category?, approval?, timeout? }
+--- @return table 工具定义
+function M.define_tool(name, description, params, func, opts)
+  opts = opts or {}
   return {
-    name = opts.name,
-    description = opts.description,
-    func = opts.func,
-    parameters = opts.parameters or {
+    name = name,
+    description = description,
+    parameters = params or {
       type = "object",
       properties = {},
+      required = {},
     },
-    returns = opts.returns or {
-      type = "string",
-      description = "执行结果",
-    },
-    category = opts.category or "uncategorized",
-    permissions = opts.permissions or {},
-    approval = opts.approval, -- 审批配置（保留 nil 表示使用默认行为）
-    async = opts.async or false, -- 标记是否为回调模式
-    timeout = opts.timeout, -- 超时毫秒数，nil 使用全局默认，-1 无限等待
+    func = func,
+    category = opts.category or "other",
+    approval = opts.approval or {},
+    timeout = opts.timeout,
   }
+end
+
+--- 快捷：异步回调工具定义
+--- @param name string
+--- @param description string
+--- @param params table|nil
+--- @param handler function(args, on_success, on_error, ctx)
+--- @param opts table|nil
+--- @return table
+function M.define_async_tool(name, description, params, handler, opts)
+  return M.define_tool(name, description, params, handler, opts)
+end
+
+--- 工具结果包装（统一格式）
+--- @param content string|table
+--- @param opts table|nil { error? }
+--- @return table
+function M.ok(content, opts)
+  opts = opts or {}
+  if opts.error then
+    return { success = false, error = tostring(content) }
+  end
+  return { success = true, result = content }
+end
+
+--- 错误结果包装
+--- @param err string
+--- @return table
+function M.error(err)
+  return { success = false, error = tostring(err) }
+end
+
+--- 校验必填字符串参数
+--- @param args table
+--- @param key string
+--- @param tool_name string
+--- @return string|nil, string|nil
+function M.require_string(args, key, tool_name)
+  local v = args and args[key]
+  if type(v) ~= "string" or v == "" then
+    return nil, string.format("%s 缺少必填字符串参数 %s", tool_name, key)
+  end
+  return v, nil
 end
 
 return M

@@ -1,194 +1,142 @@
+--- NeoAI 默认配置
+--- @module NeoAI.default_config
+--- 纯数据，零逻辑。仅提供不可变默认配置，供 config_store 合并。
+
 local M = {}
 
--- 默认配置
+--- 默认配置
 local DEFAULT_CONFIG = {
-  -- AI配置
-  -- 支持多家AI提供商，按场景（窗口命名、聊天、思考、编码、工具执行、子agent）分配不同预设
   ai = {
-    -- 默认使用的预设名称
-    default = "balanced",
-
-    -- 提供商定义
+    default_provider = "deepseek",
+    default_model = "auto", -- "auto" = 使用 registry 第一个可用模型
     providers = {
       deepseek = {
         api_type = "openai",
-        base_url = "https://api.deepseek.com/chat/completions",
+        base_url = "https://api.deepseek.com",
         api_key = os.getenv("DEEPSEEK_API_KEY") or "",
-        models = { "deepseek-v4-flash", "deepseek-v4-pro" },
+        fetch_models = true,
+        models_override = nil,
       },
       openai = {
         api_type = "openai",
-        base_url = "https://api.openai.com/v1/chat/completions",
+        base_url = "https://api.openai.com/v1",
         api_key = os.getenv("OPENAI_API_KEY") or "",
-        models = { "gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "gpt-3.5-turbo" },
+        fetch_models = true,
+        models_override = nil,
       },
       anthropic = {
         api_type = "anthropic",
-        base_url = "https://api.anthropic.com/v1/messages",
+        base_url = "https://api.anthropic.com/v1",
         api_key = os.getenv("ANTHROPIC_API_KEY") or "",
-        models = { "claude-sonnet-4-20250514", "claude-3-5-sonnet-20241022", "claude-3-5-haiku-20241022" },
+        fetch_models = true,
+        models_override = nil,
       },
       google = {
         api_type = "google",
-        base_url = "https://generativelanguage.googleapis.com/v1beta/models",
+        base_url = "https://generativelanguage.googleapis.com/v1beta",
         api_key = os.getenv("GEMINI_API_KEY") or "",
-        models = { "gemini-2.0-flash", "gemini-2.0-flash-lite", "gemini-1.5-pro", "gemini-1.5-flash" },
+        fetch_models = true,
+        models_override = nil,
       },
       groq = {
         api_type = "openai",
-        base_url = "https://api.groq.com/openai/v1/chat/completions",
+        base_url = "https://api.groq.com/openai/v1",
         api_key = os.getenv("GROQ_API_KEY") or "",
-        models = { "llama-3.3-70b-versatile", "llama-3.1-8b-instant", "mixtral-8x7b-32768" },
+        fetch_models = true,
+        models_override = nil,
       },
       together = {
         api_type = "openai",
-        base_url = "https://api.together.xyz/v1/chat/completions",
+        base_url = "https://api.together.xyz/v1",
         api_key = os.getenv("TOGETHER_API_KEY") or "",
-        models = { "meta-llama/Llama-3.3-70B-Instruct-Turbo", "mistralai/Mixtral-8x22B-Instruct-v0.1" },
+        fetch_models = true,
+        models_override = nil,
       },
       openrouter = {
         api_type = "openai",
-        base_url = "https://openrouter.ai/api/v1/chat/completions",
+        base_url = "https://openrouter.ai/api/v1",
         api_key = os.getenv("OPENROUTER_API_KEY") or "",
-        models = { "openai/gpt-4o", "anthropic/claude-sonnet-4-20250514", "google/gemini-2.0-flash-001" },
+        fetch_models = true,
+        models_override = nil,
       },
       siliconflow = {
         api_type = "openai",
-        base_url = "https://api.siliconflow.cn/v1/chat/completions",
+        base_url = "https://api.siliconflow.cn/v1",
         api_key = os.getenv("SILICONFLOW_API_KEY") or "",
-        models = { "deepseek-ai/DeepSeek-V3", "deepseek-ai/DeepSeek-R1", "Qwen/Qwen2.5-72B-Instruct" },
+        fetch_models = true,
+        models_override = nil,
       },
       moonshot = {
         api_type = "openai",
-        base_url = "https://api.moonshot.cn/v1/chat/completions",
+        base_url = "https://api.moonshot.cn/v1",
         api_key = os.getenv("MOONSHOT_API_KEY") or "",
-        models = { "moonshot-v1-8k", "moonshot-v1-32k", "moonshot-v1-128k" },
+        fetch_models = true,
+        models_override = nil,
       },
       zhipu = {
         api_type = "openai",
-        base_url = "https://open.bigmodel.cn/api/paas/v4/chat/completions",
+        base_url = "https://open.bigmodel.cn/api/paas/v4",
         api_key = os.getenv("GLM_API_KEY") or "",
-        models = { "glm-4-plus", "glm-4-air", "glm-4-flash" },
+        fetch_models = true,
+        models_override = nil,
       },
       baidu = {
         api_type = "openai",
-        base_url = "https://aip.baidubce.com/rpc/2.0/ai_custom/v1/wenxinworkshop/chat/completions",
+        base_url = "https://aip.baidubce.com/rpc/2.0/ai_custom/v1/wenxinworkshop",
         api_key = os.getenv("BAIDU_API_KEY") or "",
-        models = { "ernie-4.0-8k", "ernie-3.5-8k" },
+        fetch_models = true,
+        models_override = nil,
       },
       aliyun = {
         api_type = "openai",
-        base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
+        base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1",
         api_key = os.getenv("QWEN_API_KEY") or "",
-        models = { "qwen-plus", "qwen-turbo", "qwen-max" },
+        fetch_models = true,
+        models_override = nil,
       },
       stepfun = {
         api_type = "openai",
-        base_url = "https://api.stepfun.com/v1/chat/completions",
+        base_url = "https://api.stepfun.com/v1",
         api_key = os.getenv("STEPFUN_API_KEY") or "",
-        models = { "step-3.5-flash", "step-3.7-flash" },
+        fetch_models = true,
+        models_override = nil,
       },
     },
-
-    -- 场景配置：分为窗口命名用、聊天用、思考问题用、编写代码用、执行工具用、子agent用
-    -- 每个场景可指定多个 AI 候选（数组），按顺序尝试；也可只传一个（单元素表）
-    -- 每个候选为 key-value 表：{ provider = '', model_name = '', ... }
+    model_refresh = {
+      on_startup = true,
+      interval_sec = 3600,
+      timeout_ms = 10000,
+    },
     scenarios = {
-      -- 窗口命名用：快速低延迟，使用非推理模型避免 reasoning_content 占用 token
-      naming = {
-        {
-          provider = "deepseek",
-          model_name = "deepseek-v4-flash",
-          temperature = 0.3,
-          max_tokens = 50,
-          stream = false,
-        },
-      },
-      -- 聊天用：平衡速度与质量
-      chat = {
-        {
-          provider = "deepseek",
-          model_name = "deepseek-v4-flash",
-          temperature = 0.7,
-          max_tokens = 4096,
-          stream = true,
-        },
-      },
-      -- 思考问题用：深度推理
-      reasoning = {
-        {
-          provider = "deepseek",
-          model_name = "deepseek-v4-pro",
-          temperature = 0.7,
-          max_tokens = 8192,
-          stream = true,
-        },
-      },
-      -- 编写代码用：高质量代码生成
-      coding = {
-        {
-          provider = "deepseek",
-          model_name = "deepseek-v4-pro",
-          temperature = 0.2,
-          max_tokens = 8192,
-          stream = true,
-        },
-      },
-      -- 执行工具用：快速响应
-      tools = {
-        {
-          provider = "deepseek",
-          model_name = "deepseek-v4-flash",
-          temperature = 0.3,
-          max_tokens = 1024,
-          stream = true,
-        },
-      },
-      -- 子agent用
-      agent = {
-        {
-          provider = "deepseek",
-          model_name = "deepseek-v4-pro",
-          temperature = 0.7,
-          max_tokens = 4096,
-          stream = true,
-        },
-      },
+      chat = { provider = "deepseek", preset = "balanced" },
+      coding = { provider = "deepseek", preset = "precise" },
+      reasoning = { provider = "deepseek", preset = "deep_think" },
+      agent = { provider = "deepseek", preset = "balanced" },
     },
-
-    -- 全局默认值（当预设中未指定时使用）
-    stream = true,
-    -- 是否启用深度思考模式（如 DeepSeek 的 reasoning_content）
-    -- 开启后 AI 会在回答前展示推理过程，适用于复杂问题
+    presets = {
+      fast = { model = "auto", temperature = 0.3, max_tokens = 1024, stream = true },
+      balanced = { model = "auto", temperature = 0.7, max_tokens = 4096, stream = true },
+      precise = { model = "auto", temperature = 0.2, max_tokens = 8192, stream = true },
+      deep_think = { model = "auto", temperature = 0.7, max_tokens = 8192, stream = true },
+    },
     reasoning_enabled = true,
     system_prompt = "你是一个AI编程助手，帮助用户解决编程问题。",
-    -- 上下文消息预算：限制发送给 AI 的历史消息数量，保留最近的 N 条消息
-    -- 设置为 0 表示不限制（保留所有消息）
-    context_budget = 0,
+    timeout_ms = 60000,
+    max_retries = 3,
   },
-  -- UI配置
+
   ui = {
-    -- 默认打开的界面: 'tree' (树界面), 'chat' (聊天界面)
-    default_ui = "tree",
-    -- 窗口模式配置: 'float' (浮动窗口), 'tab' (新标签页), 'split' (分割窗口)
+    default_view = "chat",
     window_mode = "tab",
-    window = {
-      width = 80,
-      height = 20,
-      border = "rounded",
-    },
+    window = { width = 80, height = 24, border = "rounded" },
+    split = { size = 80, direction = "right" },
     colors = {
       background = "Normal",
       border = "FloatBorder",
-      text = "Normal",
-    },
-    split = {
-      -- 分割大小（列数或百分比）
-      size = 80,
-      -- chat 窗口分割方向: 'left' 在左侧, 'right' 在右侧
-      chat_direction = "right",
-      -- tree 窗口分割方向: 'left' 在左侧, 'right' 在右侧
-      tree_direction = "right",
+      user_message = "Comment",
+      ai_message = "Normal",
+      reasoning = "Type",
+      title = "Title",
     },
     tree = {
       foldenable = false,
@@ -197,13 +145,13 @@ local DEFAULT_CONFIG = {
       foldlevel = 99,
     },
   },
-  -- 键位配置
+
   keymaps = {
     global = {
-      open_tree = { key = "<leader>at", desc = "打开树界面" },
-      open_chat = { key = "<leader>ac", desc = "打开聊天界面" },
-      close_all = { key = "<leader>aq", desc = "关闭所有窗口" },
       toggle_ui = { key = "<leader>aa", desc = "切换UI显示" },
+      open_chat = { key = "<leader>ac", desc = "打开聊天界面" },
+      open_tree = { key = "<leader>at", desc = "打开树界面" },
+      close_all = { key = "<leader>aq", desc = "关闭所有窗口" },
     },
     tree = {
       select = { key = "<CR>", desc = "选择节点/分支" },
@@ -217,20 +165,10 @@ local DEFAULT_CONFIG = {
     chat = {
       insert = { key = "i", desc = "进入插入模式" },
       quit = { key = "q", desc = "关闭聊天窗口" },
-      refresh = { key = "r", desc = "刷新聊天窗口" },
-      send = {
-        insert = { key = "<C-s>", desc = "发送消息" },
-        normal = { key = "<CR>", desc = "发送消息" },
-      },
+      send = { insert = { key = "<C-s>", desc = "发送消息" }, normal = { key = "<CR>", desc = "发送消息" } },
       cancel = { key = "<Esc>", desc = "取消生成" },
-      edit = { key = "e", desc = "编辑消息" },
-      delete = { key = "dd", desc = "删除消息" },
-      scroll_up = { key = "<C-u>", desc = "向上滚动" },
-      scroll_down = { key = "<C-d>", desc = "向下滚动" },
       toggle_reasoning = { key = "r", desc = "切换思考过程显示" },
       switch_model = { key = "m", desc = "切换模型" },
-      newline = { key = "<CR>", desc = "新建行" },
-      clear = { key = "<C-u>", desc = "清空输入" },
       tool_approval = { key = "<C-a>", desc = "工具审批" },
       approval = {
         confirm = { key = "<CR>", desc = "允许一次" },
@@ -240,132 +178,66 @@ local DEFAULT_CONFIG = {
       },
     },
   },
-  -- 会话配置
+
   session = {
     auto_save = true,
-    auto_naming = true, -- 是否自动命名会话
+    auto_naming = true,
     save_path = vim.fn.stdpath("cache") .. "/NeoAI",
     max_history_per_session = 1000,
+    file = "sessions.jsonl",
   },
-  -- 工具配置
+
   tools = {
     enabled = true,
     builtin = true,
     external = {},
-
-    -- 工具审批配置
-    -- 用户可通过此配置覆盖各工具的审批行为
-    -- 默认行为：所有工具使用其自身注册时的 approval.auto_allow
-    -- 各工具可通过 tool_overrides 单独覆盖
     approval = {
-      -- 默认是否自动允许（当工具未设置 auto_allow 时使用）
+      mode = "prompt", -- prompt | auto_allow | strict
       default_auto_allow = false,
-      -- 默认允许的目录列表（所有工具共享）
       allowed_directories = {},
-      -- 默认允许的参数组（参数名 -> 允许的值列表）
       allowed_param_groups = {},
-      -- 各工具单独审批配置覆盖
-      -- 键为工具名称，值为覆盖配置
-      -- 支持字段：auto_allow, allowed_directories, allowed_param_groups
-      --   auto_allow: true 表示自动允许（跳过审批窗口），false 表示需要用户审批
-      tool_overrides = {
-        -- ===== file_tools.lua =====
-        read_file = { enable = true, auto_allow = true },
-        edit_file = { enable = true, auto_allow = false },
-        list_files = { enable = true, auto_allow = true },
-        search_files = { enable = true, auto_allow = true },
-        file_exists = { enable = true, auto_allow = true },
-        create_directory = { enable = true, auto_allow = false },
-        ensure_dir = { enable = true, auto_allow = false },
-        delete_file = { enable = true, auto_allow = false },
-
-        -- ===== log_tools.lua =====
-        log_message = { enable = true, auto_allow = true },
-        get_log_levels = { enable = true, auto_allow = true },
-
-        -- ===== neovim_tree.lua =====
-        parse_file = { enable = true, auto_allow = true },
-        query_tree = { enable = true, auto_allow = true },
-        get_node_at_position = { enable = true, auto_allow = true },
-        get_node_type = { enable = true, auto_allow = true },
-        get_node_range = { enable = true, auto_allow = true },
-        is_named_node = { enable = true, auto_allow = true },
-        get_parent_node = { enable = true, auto_allow = true },
-        get_child_nodes = { enable = true, auto_allow = true },
-        get_node_code = { enable = true, auto_allow = true },
-        delete_node = { enable = true, auto_allow = false },
-
-        -- ===== neovim_lsp.lua =====
-        lsp_hover = { enable = true, auto_allow = true },
-        lsp_definition = { enable = true, auto_allow = true },
-        lsp_references = { enable = true, auto_allow = true },
-        lsp_implementation = { enable = true, auto_allow = true },
-        lsp_declaration = { enable = true, auto_allow = true },
-        lsp_document_symbols = { enable = true, auto_allow = true },
-        lsp_workspace_symbols = { enable = true, auto_allow = true },
-        lsp_code_action = { enable = true, auto_allow = true },
-        lsp_rename = { enable = true, auto_allow = false },
-        lsp_format = { enable = true, auto_allow = false },
-        lsp_diagnostics = { enable = true, auto_allow = true },
-        lsp_client_info = { enable = true, auto_allow = true },
-        lsp_signature_help = { enable = true, auto_allow = true },
-        lsp_completion = { enable = true, auto_allow = true },
-        lsp_type_definition = { enable = true, auto_allow = true },
-        lsp_service_info = { enable = true, auto_allow = true },
-
-        -- ===== shell_tools.lua =====
-        run_command = {
-          enable = true,
-          auto_allow = false,
-          allowed_directories = { "./" },
-          allowed_param_groups = {
-            "ls",
-            "wc",
-            "find",
-            "grep",
-            "pwd",
-          },
-        },
-
-        -- ===== plan_executor.lua =====
-        create_sub_agent = { enable = false, auto_allow = false },
-        get_sub_agent_status = { enable = false, auto_allow = true },
-        cancel_sub_agent = { enable = false, auto_allow = true },
-        --
-        -- ===== git_tools.lua =====
-        git_diff = { enable = true, auto_allow = true },
-        git_log = { enable = true, auto_allow = true },
-        git_status = { enable = true, auto_allow = true },
-        git_commit_detail = { enable = true, auto_allow = true },
-        git_rollback = { enable = true, auto_allow = false },
-        git_file_history = { enable = true, auto_allow = true },
-        git_branch = { enable = true, auto_allow = true },
-        git_auto_commit_config = { enable = true, auto_allow = true, auto_commit = false },
+      per_tool = {
+        read_file = { auto_allow = true },
+        edit_file = { auto_allow = false },
+        list_files = { auto_allow = true },
+        search_files = { auto_allow = true },
+        file_exists = { auto_allow = true },
+        create_directory = { auto_allow = false },
+        ensure_dir = { auto_allow = false },
+        delete_file = { auto_allow = false },
+        run_command = { auto_allow = false, allowed_directories = { "./" }, allowed_param_groups = { "ls", "wc", "find", "grep", "pwd" } },
+        create_sub_agent = { auto_allow = false },
+        get_sub_agent_status = { auto_allow = true },
+        cancel_sub_agent = { auto_allow = true },
+        git_diff = { auto_allow = true },
+        git_log = { auto_allow = true },
+        git_status = { auto_allow = true },
+        git_commit_detail = { auto_allow = true },
+        git_rollback = { auto_allow = false },
+        git_file_history = { auto_allow = true },
+        git_branch = { auto_allow = true },
+        git_auto_commit_config = { auto_allow = true, auto_commit = false },
+        log_message = { auto_allow = true },
+        get_log_levels = { auto_allow = true },
+        lsp_rename = { auto_allow = false },
+        lsp_format = { auto_allow = false },
+        delete_node = { auto_allow = false },
       },
     },
   },
-  -- 日志配置
-  log = {
-    -- 日志级别: 'DEBUG', 'INFO', 'WARN', 'ERROR', 'FATAL'
-    level = "WARN",
-    -- 输出文件路径（可选，默认输出到文件，避免 print 阻塞消息区域）
-    output_path = nil,
 
-    -- 日志格式模板
-    format = "[{time}] [{level}] {message}",
-    -- 最大文件大小（字节），默认 10MB
-    max_file_size = 10485760,
-    -- 最大备份文件数量
+  log = {
+    level = "WARN",
+    path = vim.fn.stdpath("cache") .. "/NeoAI/neoai.log",
+    max_size = 10485760,
     max_backups = 5,
-    -- 是否启用详细输出（verbose 模式）
+    format = "[{time}] [{level}] {message}",
     verbose = false,
-    -- 是否启用调试打印到控制台
-    print_debug = false,
   },
 }
 
---- 获取默认配置
---- @return table 默认配置
+--- 获取默认配置的深拷贝
+--- @return table 默认配置副本
 function M.get_default_config()
   return vim.deepcopy(DEFAULT_CONFIG)
 end

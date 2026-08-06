@@ -1,0 +1,27 @@
+name: "NeoAI 单元测试"
+description: "加载插件并运行内置测试套件 (:NeoAITest)，结果写入 /tmp/neoai_unit_tests.txt"
+nvim_args:
+  - "-u"
+  - "NONE"
+  - "--cmd"
+  - "set rtp+=/root/NeoAI"
+  - "--cmd"
+  - "lua require('NeoAI').setup({ log = { level = 'ERROR' }, session = { auto_save = false } })"
+width: 100
+height: 30
+output: "/tmp/neoai_unit_test_render.txt"
+steps:
+  - type: command
+    cmd: "cd /root/NeoAI"
+    description: "切换到项目根目录（is_path_allowed 测试依赖 cwd）"
+    post_wait: 0.1
+  - type: command
+    cmd: "lua do local f=io.open('/tmp/neoai_unit_tests.txt','w'); local orig=print; function print(...) local p={}; for _,v in ipairs({...}) do p[#p+1]=tostring(v) end; f:write(table.concat(p,'\\t')..string.char(10)) end; local r=require('NeoAI.tests').run_all(); f:write('SUMMARY: passed='..r.passed..' failed='..r.failed..' total='..(r.passed+r.failed)..string.char(10)); f:close() end"
+    description: "运行全部内置测试，输出重定向到 /tmp/neoai_unit_tests.txt"
+    post_wait: 0.3
+  - type: command
+    cmd: "messages"
+    description: "显示测试输出消息"
+    post_wait: 0.3
+  - type: sleep
+    seconds: 0.5
