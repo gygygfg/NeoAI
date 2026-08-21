@@ -4,23 +4,17 @@
 
 local helpers = require("NeoAI.tools.builtin.tool_helpers")
 local async = require("NeoAI.utils.async")
+local config_store = require("NeoAI.kernel.config_store")
 
 local M = {}
 
 -- ========== 私有函数 ==========
 
---- 通过文件路径获取 buffer
+--- 通过文件路径获取 buffer；未打开时后台加载
 --- @param filepath string
 --- @return number|nil bufnr
 local function _bufnr(filepath)
-  if not filepath or filepath == "" then
-    return vim.api.nvim_get_current_buf()
-  end
-  local bufnr = vim.fn.bufnr(filepath)
-  if bufnr < 0 then
-    return nil
-  end
-  return bufnr
+  return helpers.ensure_buffer(filepath)
 end
 
 --- 获取文件或当前 buffer 的 LSP 客户端
@@ -35,6 +29,10 @@ local function _client_for(filepath)
 end
 
 --- 请求 + 等待结果的包装
+--- LSP 服务器可能对请求永不响应（后台加载的 buffer、服务器内部卡住等），
+--- buf_request 本身无超时，若一直等待会让工具循环挂到 executor 超时（默认 30s）
+--- 才报"工具执行超时"，并拖累同一轮并行执行的所有工具（async.all 等最慢的）。
+--- 这里加请求级超时：超时即拒绝，工具快速失败并给出明确错误。
 --- @param method string
 --- @param params table
 --- @param bufnr number
@@ -42,17 +40,46 @@ end
 local function _request(method, params, bufnr)
   local d = async.Deferred.new()
   local called = false
-  local ok, err = pcall(vim.lsp.buf_request, bufnr, method, params, function(err_resp, result)
+  local timeout_ms = config_store.get("tools.lsp.timeout_ms") or 10000
+
+  local timer
+  local function _settle(ok_, value)
     if called then return end
     called = true
-    if err_resp and err_resp.code then
-      d:reject({ kind = "lsp", code = err_resp.code, message = err_resp.message })
+    if timer and timer:is_active() then
+      pcall(timer.stop, timer)
+    end
+    if ok_ then
+      d:resolve(value)
     else
-      d:resolve(result)
+      d:reject(value)
+    end
+  end
+
+  -- 请求级超时兜底：服务器无响应时按时拒绝，而不是永久挂起
+  timer = vim.uv.new_timer()
+  timer:start(timeout_ms, 0, function()
+    vim.schedule(function()
+      _settle(false, { kind = "lsp", message = ("LSP 请求超时 (%dms): %s"):format(timeout_ms, method) })
+    end)
+  end)
+
+  local ok, id = pcall(vim.lsp.buf_request, bufnr, method, params, function(err_resp, result)
+    if err_resp and err_resp.code then
+      _settle(false, { kind = "lsp", code = err_resp.code, message = err_resp.message })
+    else
+      _settle(true, result)
     end
   end)
   if not ok then
-    d:reject({ kind = "lsp", message = tostring(err) })
+    _settle(false, { kind = "lsp", message = tostring(id) })
+  elseif type(id) == "table" and not next(id) then
+    -- buf_request 返回空的客户端映射表示无客户端处理该请求，回调永不触发。
+    -- 后台加载的 buffer 客户端可能尚未附加，必须主动拒绝以免工具循环挂起。
+    _settle(false, { kind = "lsp", message = "无 LSP 客户端（文件可能在后台加载，客户端未附加）" })
+  elseif id == 0 then
+    -- 旧版 API：返回 0 表示无客户端
+    _settle(false, { kind = "lsp", message = "无 LSP 客户端（文件可能在后台加载，客户端未附加）" })
   end
   return d
 end
@@ -148,7 +175,9 @@ lsp_tools.lsp_references = helpers.define_tool(
   function(args, on_success, on_error)
     local bufnr, line, col = _position(args)
     if not bufnr then on_error("无法找到文件 buffer") return end
-    _request("textDocument/references", { textDocument = { uri = vim.uri_from_bufnr(bufnr) }, position = { line = line, character = col } }, bufnr)
+    -- context 为 LSP 必填字段（ReferenceParams），缺失时部分服务器（如 lua-language-server
+    -- provider.lua 会访问 params.context.includeDeclaration）直接内部异常。
+    _request("textDocument/references", { textDocument = { uri = vim.uri_from_bufnr(bufnr) }, position = { line = line, character = col }, context = { includeDeclaration = true } }, bufnr)
       :then_(function(locations)
         if not locations or #locations == 0 then on_success("未找到引用") return end
         local out = {}
@@ -303,13 +332,18 @@ lsp_tools.lsp_rename = helpers.define_tool(
     _request("textDocument/rename", { textDocument = { uri = vim.uri_from_bufnr(bufnr) }, position = { line = line, character = col }, newName = args.new_name }, bufnr)
       :then_(function(edit)
         if edit and edit.changes then
+          local changed = 0
           for uri, changes in pairs(edit.changes) do
-            local b = vim.fn.bufnr(vim.uri_to_fname(uri))
+            local b = helpers.ensure_buffer(vim.uri_to_fname(uri))
+            if not b then on_error("重命名失败：无法加载文件 " .. vim.uri_to_fname(uri)) return end
             for _, ch in ipairs(changes) do
               pcall(vim.api.nvim_buf_set_text, b, ch.range.start.line, ch.range.start.character, ch.range["end"].line, ch.range["end"].character, vim.split(ch.newText, "\n", { plain = true }))
             end
+            local saved, err = helpers.persist_buffer(b)
+            if not saved then on_error("重命名失败：无法保存文件 " .. vim.uri_to_fname(uri) .. " (" .. tostring(err) .. ")") return end
+            changed = changed + 1
           end
-          on_success("重命名完成")
+          on_success(("重命名完成（%d 个文件）"):format(changed))
         else
           on_success("无重命名编辑")
         end
@@ -336,6 +370,8 @@ lsp_tools.lsp_format = helpers.define_tool(
           for _, e in ipairs(edits) do
             pcall(vim.api.nvim_buf_set_text, bufnr, e.range.start.line, e.range.start.character, e.range["end"].line, e.range["end"].character, vim.split(e.newText, "\n", { plain = true }))
           end
+          local saved, err = helpers.persist_buffer(bufnr)
+          if not saved then on_error("格式化失败：无法保存文件（" .. tostring(err) .. "）") return end
           on_success("格式化完成")
         else
           on_success("无需格式化")

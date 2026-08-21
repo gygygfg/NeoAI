@@ -129,4 +129,37 @@ tests.suite("session", function(_, it)
     t.eq(2, #msgs)
     t.eq("world", msgs[2].content)
   end)
+
+  it("context_builder 带 tool_calls 的 assistant 消息省略空 content", function(t)
+    -- 协议要求：OpenAI/DeepSeek 中带 tool_calls 的 assistant 消息 content 必须为
+    -- null/省略；发送 content:"" 会让要求严格的模型在后续轮次返回空输出，
+    -- 表现为工具循环第二轮起模型"未返回后续内容"（第二个 turn 无法开启）。
+    local ctx = require("NeoAI.core.session.context_builder")
+
+    -- 空 content + tool_calls：必须省略 content 字段
+    local with_calls = ctx.to_api_message({
+      role = "assistant",
+      content = "",
+      tool_calls = { { id = "c1", type = "function", ["function"] = { name = "read_file", arguments = "{}" } } },
+    })
+    t.eq("assistant", with_calls.role)
+    t.nil_(with_calls.content, "带 tool_calls 且 content 为空的 assistant 消息不应输出 content")
+    t.eq(1, #with_calls.tool_calls)
+
+    -- 有实际内容的 assistant 消息：保留 content
+    local with_text = ctx.to_api_message({
+      role = "assistant",
+      content = "我先查一下",
+      tool_calls = { { id = "c2", type = "function", ["function"] = { name = "read_file", arguments = "{}" } } },
+    })
+    t.eq("我先查一下", with_text.content)
+
+    -- tool 消息 / 普通消息不受影响
+    local tool_msg = ctx.to_api_message({ role = "tool", content = "ok", tool_call_id = "c1" })
+    t.eq("ok", tool_msg.content)
+    t.eq("c1", tool_msg.tool_call_id)
+
+    local empty_plain = ctx.to_api_message({ role = "assistant", content = "" })
+    t.eq("", empty_plain.content, "无 tool_calls 的空 content 保持原样")
+  end)
 end)

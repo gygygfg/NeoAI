@@ -15,21 +15,26 @@ local state = {
 
 -- ========== 私有函数 ==========
 
---- 展开键位配置（支持 insert/normal 双模式）
+--- 展开键位配置（支持 insert/normal 双模式，且两模式可使用不同键）
 --- @param key_conf table|string
---- @return table { mode = {...}, key }
+--- @return table|nil 数组 { { mode, key }, ... }
 local function _expand(key_conf)
   if type(key_conf) == "string" then
-    return { modes = { "n" }, key = key_conf }
+    return { { mode = "n", key = key_conf } }
   end
   if key_conf.key then
-    return { modes = { "n" }, key = key_conf.key }
+    return { { mode = "n", key = key_conf.key } }
   end
+  -- insert/normal 双模式：分别展开，各自用各自的键（如 send: insert=<C-s>, normal=<CR>）
+  local out = {}
   if key_conf.insert and key_conf.insert.key then
-    return { modes = { "i", "n" }, key = key_conf.insert.key }
+    out[#out + 1] = { mode = "i", key = key_conf.insert.key }
   end
   if key_conf.normal and key_conf.normal.key then
-    return { modes = { "n" }, key = key_conf.normal.key }
+    out[#out + 1] = { mode = "n", key = key_conf.normal.key }
+  end
+  if #out > 0 then
+    return out
   end
   return nil
 end
@@ -52,13 +57,13 @@ function M.register_context(context, actions, buf, opts)
     if key_conf then
       local expanded = _expand(key_conf)
       if expanded then
-        for _, mode in ipairs(expanded.modes) do
-          vim.keymap.set(mode, expanded.key, handler, {
+        for _, entry in ipairs(expanded) do
+          vim.keymap.set(entry.mode, entry.key, handler, {
             buffer = buf,
             desc = key_conf.desc or ("NeoAI " .. action),
           })
         end
-        state.registered[action] = { buf = buf, key = expanded.key }
+        state.registered[action] = { buf = buf, key = expanded[1].key }
       end
     end
   end

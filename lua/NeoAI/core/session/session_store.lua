@@ -157,7 +157,11 @@ function M.get_children(session_id)
       out[#out + 1] = s
     end
   end
-  table.sort(out, function(a, b) return (a.created_at or 0) < (b.created_at or 0) end)
+  table.sort(out, function(a, b)
+    local at, bt = a.created_at or 0, b.created_at or 0
+    if at ~= bt then return at < bt end
+    return (a.id or "") < (b.id or "")
+  end)
   return out
 end
 
@@ -170,7 +174,13 @@ function M.get_roots()
       out[#out + 1] = s
     end
   end
-  table.sort(out, function(a, b) return (a.updated_at or 0) > (b.updated_at or 0) end)
+  -- 按 updated_at 倒序（最近使用在前）；同秒创建时用 id 决胜，保证排序确定，
+  -- 避免 Lua table.sort 在键相等时顺序随哈希遍历随机、导致树渲染不稳定
+  table.sort(out, function(a, b)
+    local at, bt = a.updated_at or 0, b.updated_at or 0
+    if at ~= bt then return at > bt end
+    return (a.id or "") > (b.id or "")
+  end)
   return out
 end
 

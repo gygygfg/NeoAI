@@ -8,13 +8,13 @@ local M = {}
 
 -- ========== 私有函数 ==========
 
---- 确保文件已加载且有 parser
+--- 确保文件已加载且有 parser（未打开时后台加载）
 --- @param filepath string
 --- @return number|nil bufnr
 local function _ensure_parsed(filepath)
   if not filepath or filepath == "" then return nil end
-  local bufnr = vim.fn.bufnr(filepath)
-  if bufnr < 0 then return nil end
+  local bufnr = helpers.ensure_buffer(filepath)
+  if not bufnr then return nil end
   local ok = pcall(vim.treesitter.get_parser, bufnr)
   if not ok then return nil end
   return bufnr
@@ -46,6 +46,37 @@ end
 --- @return number start_row, number start_col, number end_row, number end_col
 local function _node_range(node)
   return node:range()
+end
+
+--- 收集指定语言语法树的有效字段名（供 query 解析失败时给模型纠错提示）
+--- @param lang string
+--- @return string 逗号分隔的字段名列表
+local function _valid_fields_hint(lang)
+  local ok, info = pcall(vim.treesitter.language.inspect, lang)
+  if not ok or not info or not info.fields or type(info.fields) ~= "table" then
+    return ""
+  end
+  local names = {}
+  for _, f in ipairs(info.fields) do
+    names[#names + 1] = tostring(f)
+  end
+  table.sort(names)
+  return table.concat(names, ", ")
+end
+
+--- 将 query 解析错误包装成可指导模型修正的提示。
+--- 模型经常随手写错字段名（如 Lua 里把 table/field 写成 object），
+--- 只回传原始错误它无从知道正确的字段名，导致反复用错字段重试。
+--- @param lang string
+--- @param raw_err string
+--- @return string
+local function _query_error_hint(lang, raw_err)
+  local fields = _valid_fields_hint(lang)
+  local hint = "query 解析失败: " .. tostring(raw_err)
+  if fields ~= "" then
+    hint = hint .. "\n有效字段名: " .. fields
+  end
+  return hint
 end
 
 --- 获取节点源代码
@@ -224,7 +255,13 @@ tree_tools.get_node_code = helpers.define_tool(
 
 tree_tools.query_tree = helpers.define_tool(
   "query_tree",
-  "用 treesitter query 查询节点。filepath 必填，query 必填。",
+  "用 treesitter query 查询节点。filepath 必填，query 必填。"
+    .. "字段名（field:）必须是该语言语法对该节点类型定义的有效字段，"
+    .. "错误示例(Lua): (dot_index_expression object: ...) 的 object 是错的，应为 table；"
+    .. "(function_call function: ...) 的 function 是错的，function_call 无该字段。"
+    .. "正确示例(Lua): (dot_index_expression table: (identifier) @obj field: (identifier) @field)、"
+    .. "(function_call arguments: (arguments (string) @arg))、"
+    .. "(local_variable_declarator name: (identifier) @name value: (expression) @val)。",
   {
     type = "object",
     properties = { filepath = { type = "string" }, query = { type = "string" } },
@@ -232,10 +269,10 @@ tree_tools.query_tree = helpers.define_tool(
   },
   function(args, on_success, on_error)
     local bufnr = _ensure_parsed(args.filepath)
-    if not bufnr then on_error("无法解析文件") return end
+    if not bufnr then on_error("无法解析文件（缺少 parser 或文件未打开）") return end
     local lang = vim.treesitter.language.get_lang(vim.bo[bufnr].filetype) or vim.bo[bufnr].filetype
     local ok, query = pcall(vim.treesitter.query.parse, lang, args.query)
-    if not ok then on_error("query 解析失败: " .. tostring(query)) return end
+    if not ok then on_error(_query_error_hint(lang, tostring(query))) return end
     local root = _root(bufnr)
     if not root then on_error("无法获取语法树") return end
     local out = {}
@@ -265,6 +302,8 @@ tree_tools.delete_node = helpers.define_tool(
     local sr, sc, er, ec = _node_range(node)
     local ok = pcall(vim.api.nvim_buf_set_text, bufnr, sr, sc, er, ec, {})
     if not ok then on_error("删除失败") return end
+    local saved, err = helpers.persist_buffer(bufnr)
+    if not saved then on_error("删除失败：无法保存文件（" .. tostring(err) .. "）") return end
     on_success(string.format("已删除节点 %s (%d:%d-%d:%d)", node:type(), sr + 1, sc + 1, er + 1, ec + 1))
   end,
   { category = "treesitter", approval = { auto_allow = false } }

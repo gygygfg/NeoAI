@@ -8,6 +8,8 @@ local session_store = require("NeoAI.core.session.session_store")
 local event_bus = require("NeoAI.kernel.event_bus")
 local events = require("NeoAI.kernel.events")
 local chat_view = require("NeoAI.ui.window.chat_view")
+local chat_service = require("NeoAI.services.chat_service")
+local config_store = require("NeoAI.kernel.config_store")
 
 local M = {}
 
@@ -20,6 +22,7 @@ local state = {
   selected_idx = 1,
   expanded = {}, -- session_id -> true
   unsubs = {},
+  cursor_augroup = nil,
   cleaning = false, -- 清理空会话时的重入保护
 }
 
@@ -81,14 +84,16 @@ end
 
 --- 清理空会话：空会话直接从存储删除，避免树里显示 "├─ 新会话"。
 --- 仅删除整支（含所有子孙）都为空的分支，避免误删含内容的子会话。
+--- 正在聊天界面使用的会话（尚未发出首条消息）不会被删除，
+--- 否则刚按 N/n 新建、正等待输入的会话会被立刻清理掉。
 --- @return number 删除数量
 local function _cleanup_empty_sessions()
   local delete_ids = {}
   for id, s in pairs(session_store.get_all()) do
-    if _session_is_empty(s) then
+    if _session_is_empty(s) and not chat_service.is_session_active(id) then
       local branch_empty = true
       for _, d in ipairs(session_store.get_descendants(id)) do
-        if not _session_is_empty(d) then
+        if not _session_is_empty(d) or chat_service.is_session_active(d.id) then
           branch_empty = false
           break
         end
@@ -181,6 +186,7 @@ end
 
 --- 渲染树
 local function _render()
+  if not M.has_window() then return end
   if state.cleaning then return end
   -- 先删除空会话（delete 会触发 SESSION_DELETED 重入 _render，用 cleaning 防抖）
   state.cleaning = true
@@ -205,11 +211,12 @@ local function _render()
   _update_selection()
 end
 
---- 当前选中项
+--- 当前光标所在项（以窗口实际光标行为准，避免鼠标点击后 selected_idx 失同步）
 local function _current_item()
-  local item = state.flat_items[state.selected_idx]
-  if not item then return nil end
-  return item
+  if not state.win_id or not vim.api.nvim_win_is_valid(state.win_id) then return nil end
+  local row = vim.api.nvim_win_get_cursor(state.win_id)[1]
+  if row < 1 or row > #state.flat_items then return nil end
+  return state.flat_items[row]
 end
 
 --- 移动光标
@@ -232,29 +239,42 @@ local function _toggle_expand()
   _render()
 end
 
+--- 将给定会话打开到聊天界面（选择或新建共用）。
+--- 打开后按 ui.tree.auto_close_on_select 决定是否关闭树窗口。
+--- @param session table
+local function _open_session_in_chat(session)
+  if not session then return end
+  chat_view.open({ session_id = session.id })
+  -- 打开会话到聊天界面后自动关闭会话树（可用 ui.tree.auto_close_on_select 关闭此行为）
+  if config_store.get("ui.tree.auto_close_on_select", true) then
+    M.close()
+  end
+end
+
 --- 选择并打开聊天
 local function _select()
   local item = _current_item()
   if not item then return end
-  chat_view.open({ session_id = item.session.id })
+  _open_session_in_chat(item.session)
 end
 
---- 新建子分支
+--- 新建子分支：创建会话后直接切到聊天界面，避免"看不见新会话"
 local function _new_child()
   local item = _current_item()
+  local session
   if not item then
-    session_store.create()
+    session = session_store.create()
   else
-    session_store.create({ parent_id = item.session.id })
+    session = session_store.create({ parent_id = item.session.id })
     state.expanded[item.session.id] = true
   end
-  _render()
+  _open_session_in_chat(session)
 end
 
---- 新建根分支
+--- 新建根分支：创建会话后直接切到聊天界面
 local function _new_root()
-  session_store.create()
-  _render()
+  local session = session_store.create()
+  _open_session_in_chat(session)
 end
 
 --- 删除对话
@@ -269,6 +289,7 @@ end
 local function _set_keymaps()
   local keymap = require("NeoAI.ui.keymap")
   local actions = {
+    quit = function() M.close() end,
     select = _select,
     new_child = _new_child,
     new_root = _new_root,
@@ -280,6 +301,17 @@ local function _set_keymaps()
   vim.keymap.set("n", "j", function() _move(1) end, { buffer = state.buf, desc = "下移" })
   vim.keymap.set("n", "k", function() _move(-1) end, { buffer = state.buf, desc = "上移" })
   keymap.register_context("tree", actions, state.buf)
+
+  -- 鼠标点击/滚动等移动光标时同步选中索引
+  state.cursor_augroup = vim.api.nvim_create_augroup("NeoAITreeCursor", { clear = true })
+  vim.api.nvim_create_autocmd("CursorMoved", {
+    group = state.cursor_augroup,
+    buffer = state.buf,
+    callback = function()
+      if not state.win_id or not vim.api.nvim_win_is_valid(state.win_id) then return end
+      state.selected_idx = vim.api.nvim_win_get_cursor(state.win_id)[1]
+    end,
+  })
 end
 
 -- ========== 公开 API ==========
@@ -301,10 +333,18 @@ function M.open()
   _render()
   _set_keymaps()
 
-  -- 订阅会话变更
-  state.unsubs[#state.unsubs + 1] = event_bus.on(events.SESSION_CREATED, function() _render() end)
-  state.unsubs[#state.unsubs + 1] = event_bus.on(events.SESSION_DELETED, function() _render() end)
-  state.unsubs[#state.unsubs + 1] = event_bus.on(events.SESSION_RENAMED, function() _render() end)
+  -- 订阅会话变更。
+  -- 注意：SESSION_CREATED 在 session_store.create() 内部同步触发；直接在这里 _render()
+  -- 会在"新建会话 → 打开聊天"的间隙里先跑一遍空会话清理，把刚创建的空会话删掉。
+  -- 因此统一延迟到下一事件循环再渲染，让 chat 先绑定该会话（is_session_active 保护）。
+  local function _schedule_render()
+    vim.schedule(function()
+      if M.has_window() then _render() end
+    end)
+  end
+  state.unsubs[#state.unsubs + 1] = event_bus.on(events.SESSION_CREATED, _schedule_render)
+  state.unsubs[#state.unsubs + 1] = event_bus.on(events.SESSION_DELETED, _schedule_render)
+  state.unsubs[#state.unsubs + 1] = event_bus.on(events.SESSION_RENAMED, _schedule_render)
 
   return { win_id = state.win_id, buf = state.buf }
 end
@@ -320,6 +360,10 @@ function M.close()
   end
   for _, unsub in ipairs(state.unsubs) do unsub() end
   state.unsubs = {}
+  if state.cursor_augroup then
+    pcall(vim.api.nvim_del_augroup_by_id, state.cursor_augroup)
+    state.cursor_augroup = nil
+  end
   state.win_id = nil
   state.buf = nil
   state.selected_idx = 1

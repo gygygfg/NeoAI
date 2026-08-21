@@ -10,26 +10,35 @@ local M = {}
 
 -- ========== 私有函数 ==========
 
---- 构建系统消息
---- @param agent_config table|nil
+--- 构建系统消息（按有序段渲染，前缀缓存稳定）
+--- @param agent table|nil
 --- @return table
-local function _build_system_message(agent_config)
-  local system_prompt = agent_config and agent_config.system_prompt
-    or config_store.get("ai.system_prompt")
-    or "你是一个AI编程助手，帮助用户解决编程问题。"
-  return { role = "system", content = system_prompt }
+local function _build_system_message(agent)
+  local prefix = require("NeoAI.core.agent.prefix")
+  return { role = "system", content = prefix.build_system_prompt(agent) }
 end
 
---- 将内部消息转换为 API 消息
+--- 将内部消息转换为 API 消息（供压缩回放等复用，保证字节一致）
+--- OpenAI/DeepSeek 工具调用协议要求：带 tool_calls 的 assistant 消息，content 必须
+--- 为 null（或省略该字段）。发送 content:"" 会被要求严格的模型判定为格式异常，
+--- 在后续轮次直接返回空输出（无内容、无工具调用），表现为工具循环进入第二轮后
+--- 模型"未返回后续内容"（EMPTY_RESPONSE_MESSAGE，相当于第二轮 turn 无法开启）。
 --- @param message table
 --- @return table
 local function _to_api_message(message)
-  local out = { role = message.role, content = message.content or "" }
+  local content = message.content or ""
+  local has_tool_calls = message.tool_calls and #message.tool_calls > 0
+  local out = { role = message.role }
+  -- 仅当 assistant 消息带 tool_calls 且 content 为空时省略 content 字段；
+  -- 有实际内容的 assistant 消息、普通消息、tool 消息保持原样输出。
+  if content ~= "" or message.role ~= "assistant" or not has_tool_calls then
+    out.content = content
+  end
   if message.reasoning and message.role == "assistant" then
     -- 推理内容随回复一起保留（部分 API 用 reasoning_content 字段）
     out.reasoning_content = message.reasoning
   end
-  if message.tool_calls and #message.tool_calls > 0 then
+  if has_tool_calls then
     out.tool_calls = message.tool_calls
   end
   if message.tool_call_id then
@@ -48,7 +57,7 @@ function M.build(session, opts)
   opts = opts or {}
   local messages = {}
   if opts.include_system ~= false then
-    messages[#messages + 1] = _build_system_message(opts.agent_config)
+    messages[#messages + 1] = _build_system_message(nil)
   end
   local max_history = opts.max_history
     or config_store.get("session.max_history_per_session")
@@ -79,10 +88,7 @@ function M.build_from_agent(agent, opts)
   opts = opts or {}
   local messages = {}
   if opts.include_system ~= false then
-    local system_prompt = (agent.config and agent.config.system_prompt)
-      or config_store.get("ai.system_prompt")
-      or "你是一个AI编程助手，帮助用户解决编程问题。"
-    messages[#messages + 1] = { role = "system", content = system_prompt }
+    messages[#messages + 1] = _build_system_message(agent)
   end
   local max_history = opts.max_history
     or config_store.get("session.max_history_per_session")
@@ -94,6 +100,26 @@ function M.build_from_agent(agent, opts)
   end
   if opts.extra_user then
     messages[#messages + 1] = { role = "user", content = opts.extra_user }
+  end
+  return messages
+end
+
+--- 将内部消息转换为 API 消息（与请求发送完全一致，压缩回放保证字节一致）
+--- @param message table
+--- @return table
+M.to_api_message = _to_api_message
+
+--- 构建压缩回放前缀：系统消息 + 指定区间消息（供压缩辅助调用复用前缀缓存）
+--- @param agent table Agent
+--- @param range_messages table 需回放的消息数组（原对象）
+--- @return table API 消息数组（不含压缩指令，调用方自行追加）
+function M.build_prefix(agent, range_messages)
+  local messages = {}
+  if agent then
+    messages[#messages + 1] = _build_system_message(agent)
+  end
+  for _, m in ipairs(range_messages or {}) do
+    messages[#messages + 1] = _to_api_message(m)
   end
   return messages
 end

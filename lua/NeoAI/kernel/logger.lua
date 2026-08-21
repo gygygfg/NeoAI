@@ -56,8 +56,8 @@ local function _write(line)
   fs.append_file(state.path, line .. "\n")
 end
 
---- 格式化日志行
-local function _format(level, message, ...)
+--- 格式化日志行（printf 风格：message + 变长参数）
+local function _format(message, ...)
   local args = { ... }
   if #args > 0 then
     local n = 1

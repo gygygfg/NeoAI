@@ -63,6 +63,9 @@ function openai.parse_stream_chunk(raw)
   if obj.choices and obj.choices[1] and obj.choices[1].finish_reason then
     out.finish_reason = obj.choices[1].finish_reason
   end
+  if obj.usage then
+    out.usage = obj.usage
+  end
   if next(out) then return out end
   return nil
 end
@@ -138,7 +141,9 @@ function anthropic.parse_stream_chunk(raw)
     if obj.delta.thinking then out.reasoning = obj.delta.thinking end
     if next(out) then return out end
   elseif obj.type == "message_delta" and obj.delta and obj.delta.stop_reason then
-    return { finish_reason = obj.delta.stop_reason }
+    local out = { finish_reason = obj.delta.stop_reason }
+    if obj.usage then out.usage = obj.usage end
+    return out
   elseif obj.type == "content_block_start" and obj.content_block then
     if obj.content_block.type == "tool_use" then
       return { tool_call_start = { id = obj.content_block.id, name = obj.content_block.name } }
@@ -227,6 +232,12 @@ function google.parse_stream_chunk(raw)
       if part.text then
         out.content = (out.content or "") .. part.text
       end
+    end
+    if obj.usageMetadata then
+      out.usage = obj.usageMetadata
+    end
+    if cand.finishReason then
+      out.finish_reason = cand.finishReason
     end
     if next(out) then return out end
   end

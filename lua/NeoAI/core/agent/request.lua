@@ -76,7 +76,39 @@ local function _should_retry(err)
   return true
 end
 
+--- 是否上下文溢出错误（触发压缩后重试）
+--- 各提供商措辞不一，匹配常见标识；HTTP body 与 message 都检查。
+--- @param err table|nil
+--- @return boolean
+local function _is_context_overflow(err)
+  if type(err) ~= "table" then return false end
+  if err.kind == "aborted" or err.kind == "approval" or err.kind == "timeout" then return false end
+  local status = err.status
+  -- 主要看 400（OpenAI/DeepSeek 超长上下文）与 413（负载过大）
+  if status and status ~= 400 and status ~= 413 and status ~= 429 then return false end
+  local haystack = table.concat({
+    type(err.body) == "string" and err.body or "",
+    type(err.message) == "string" and err.message or "",
+  }, "\n"):lower()
+  local patterns = {
+    "context_length", "context length", "context window",
+    "maximum context", "max context", "prompt is too long",
+    "input is too long", "too many tokens", "token limit",
+    "request too large", "the input is too large", "context_exceeded",
+    "context_length_exceeded", "exceeds the maximum",
+  }
+  for _, p in ipairs(patterns) do
+    if haystack:find(p, 1, true) then return true end
+  end
+  return false
+end
+
 -- ========== 公开 API ==========
+
+--- 上下文溢出判断（供 recovery 模块使用）
+--- @param err table|nil
+--- @return boolean
+M.is_context_overflow = _is_context_overflow
 
 --- 发送请求（非流式）
 --- @param messages table
@@ -127,15 +159,21 @@ end
 --- @return Deferred resolve({ content, reasoning, tool_calls, finish_reason, usage })
 function M.send_stream(messages, opts, on_chunk)
   opts = opts or {}
+  -- 流式请求的请求体必须声明 stream=true：否则 API（如 DeepSeek）会以非流式
+  -- JSON 返回，而客户端按 SSE 逐事件解析，两者不匹配导致工具循环第二轮及以后
+  -- 的所有内容/工具调用增量全部丢失（表现为"模型未返回后续内容"，工具循环的
+  -- 第二轮 turn 无法开启）。runtime 首轮显式传了 stream=true，tool_loop 的
+  -- _send_round 之前漏传，这里统一强制。
+  opts = vim.tbl_extend("force", opts, { stream = true })
   local body, provider, model_id, a = _build_request(messages, opts)
   local timeout_ms = opts.timeout_ms or config_store.get("ai.timeout_ms") or 60000
   local max_retries = opts.max_retries or config_store.get("ai.max_retries") or 3
 
-  local acc = { content = "", reasoning = "", tool_calls = nil, finish_reason = nil }
+  local acc = { content = "", reasoning = "", tool_calls = nil, finish_reason = nil, usage = nil }
   local done = false
 
   return async.retry(function()
-    acc = { content = "", reasoning = "", tool_calls = nil, finish_reason = nil }
+    acc = { content = "", reasoning = "", tool_calls = nil, finish_reason = nil, usage = nil }
     done = false
     return http.request({
       base_url = provider.base_url,
@@ -172,6 +210,9 @@ function M.send_stream(messages, opts, on_chunk)
         if parsed.finish_reason then
           acc.finish_reason = parsed.finish_reason
         end
+        if parsed.usage then
+          acc.usage = parsed.usage
+        end
       end,
     }):then_(function()
       return {
@@ -179,6 +220,7 @@ function M.send_stream(messages, opts, on_chunk)
         reasoning = acc.reasoning ~= "" and acc.reasoning or nil,
         tool_calls = acc.tool_calls,
         finish_reason = acc.finish_reason,
+        usage = acc.usage,
         provider = provider.api_type,
         model = model_id,
       }

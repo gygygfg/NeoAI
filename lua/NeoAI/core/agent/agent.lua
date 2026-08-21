@@ -40,6 +40,11 @@ function M.create(opts)
     state = STATES.IDLE,
     iterations = 0,
     usage = { prompt = 0, completion = 0 },
+    cache = {
+      last_prefix_id = nil, -- 上一个请求的前缀缓存身份指纹
+      identity_changes = 0, -- 缓存身份变更次数
+      compaction_usage = nil, -- 最近一次压缩摘要调用的缓存用量
+    },
   }
   setmetatable(agent, { __index = M })
   return agent
@@ -168,8 +173,9 @@ end
 --- @param tool_call_id string
 --- @param tool_name string
 --- @param result string
+--- @param extra table|nil { duration_ms? } 附加元数据（仅 UI 展示用，不进入模型上下文）
 --- @return table 消息
-function M.add_tool_result(agent, tool_call_id, tool_name, result)
+function M.add_tool_result(agent, tool_call_id, tool_name, result, extra)
   local msg = {
     role = "tool",
     tool_call_id = tool_call_id,
@@ -177,6 +183,11 @@ function M.add_tool_result(agent, tool_call_id, tool_name, result)
     content = result or "",
     ts = os.time(),
   }
+  if extra then
+    for k, v in pairs(extra) do
+      msg[k] = v
+    end
+  end
   table.insert(agent.messages, msg)
   event_bus.emit(events.TOOL_RESULT_RECEIVED, { agent_id = agent.id, message = msg })
   return msg
@@ -236,13 +247,26 @@ end
 
 -- ========== 其它 ==========
 
---- 累加 usage
+--- 累加 usage（兼容 openai 的 prompt_tokens/completion_tokens 与内部 prompt/completion 两种形状）
 --- @param agent table
 --- @param usage table
 --- @return table Agent
 function M.add_usage(agent, usage)
-  agent.usage.prompt = agent.usage.prompt + (usage.prompt or 0)
-  agent.usage.completion = agent.usage.completion + (usage.completion or 0)
+  agent.usage.prompt = agent.usage.prompt + (usage.prompt or usage.prompt_tokens or 0)
+  agent.usage.completion = agent.usage.completion + (usage.completion or usage.completion_tokens or 0)
+  local prefix = require("NeoAI.core.agent.prefix")
+  local cu = prefix.parse_cache_usage(usage)
+  if cu then
+    agent.usage.cache_read = (agent.usage.cache_read or 0) + cu.cache_read
+    agent.usage.cache_write = (agent.usage.cache_write or 0) + cu.cache_write
+    agent.usage.cache_miss = (agent.usage.cache_miss or 0) + cu.cache_miss
+    agent.usage.requests = (agent.usage.requests or 0) + 1
+    agent.usage.prompt_cache_total = (agent.usage.prompt_cache_total or 0) + cu.cache_read
+    agent.usage.prompt_total = (agent.usage.prompt_total or 0) + (usage.prompt_tokens or usage.prompt or 0)
+    agent.usage.cache_ratio = agent.usage.prompt_total > 0
+      and (agent.usage.prompt_cache_total / agent.usage.prompt_total)
+      or 0
+  end
   return agent
 end
 

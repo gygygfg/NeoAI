@@ -15,7 +15,6 @@ local M = {}
 
 local state = {
   initialized = false,
-  loading = false,
 }
 
 -- ========== 私有函数 ==========
@@ -29,6 +28,8 @@ local BUILTIN_MODULES = {
   "NeoAI.tools.builtin.tree_ops",
   "NeoAI.tools.builtin.log_ops",
   "NeoAI.tools.builtin.plan",
+  "NeoAI.tools.builtin.todo",
+  "NeoAI.tools.builtin.plan_mode",
 }
 
 --- 加载内置工具
@@ -65,23 +66,18 @@ function M.init()
   local approval = tools_cfg.approval or {}
   registry.apply_approval_config(approval.per_tool)
 
-  -- 加载内置工具（异步）
+  -- 同步加载内置工具（仅注册定义，无 I/O，确保首个 Agent 请求前已就绪）
   if tools_cfg.builtin ~= false then
-    vim.schedule(function()
-      if state.loading then return end
-      state.loading = true
-      local errors = _load_builtin_tools()
-      if #errors > 0 then
-        for _, e in ipairs(errors) do
-          logger.warn("[tools] 内置工具加载错误: %s", e)
-        end
+    local errors = _load_builtin_tools()
+    if #errors > 0 then
+      for _, e in ipairs(errors) do
+        logger.warn("[tools] 内置工具加载错误: %s", e)
       end
-      logger.info("[tools] 内置工具加载完成: %d 个", registry.count())
-      state.loading = false
-      local event_bus = require("NeoAI.kernel.event_bus")
-      local events = require("NeoAI.kernel.events")
-      event_bus.emit(events.TOOL_LOOP_FINISHED, { kind = "tools_loaded", count = registry.count() })
-    end)
+    end
+    logger.info("[tools] 内置工具加载完成: %d 个", registry.count())
+    local event_bus = require("NeoAI.kernel.event_bus")
+    local events = require("NeoAI.kernel.events")
+    event_bus.emit(events.TOOL_LOOP_FINISHED, { kind = "tools_loaded", count = registry.count() })
   end
 
   return M

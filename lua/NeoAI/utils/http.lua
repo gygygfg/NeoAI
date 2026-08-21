@@ -19,6 +19,34 @@ local function _which_curl()
   return vim.fn.exepath("curl")
 end
 
+-- 懒检测：--fail-with-body 让 4xx/5xx 以非零退出码结束并保留响应体
+local _fail_with_body_support = nil
+local function _supports_fail_with_body()
+  if _fail_with_body_support ~= nil then return _fail_with_body_support end
+  local curl = _which_curl()
+  local ok = curl ~= nil
+  if ok then
+    local handle = io.popen(curl .. " --help all 2>/dev/null")
+    if handle then
+      local out = handle:read("*a")
+      handle:close()
+      ok = out and out:find("--fail%-with%-body") ~= nil
+    end
+  end
+  _fail_with_body_support = ok
+  return ok
+end
+
+--- 从 curl 错误信息中解析真实 HTTP 状态码
+--- 如 "curl: (22) The requested URL returned error: 400"
+--- @param err_msg string
+--- @return number|nil
+local function _parse_http_status(err_msg)
+  local status = err_msg and err_msg:match("error: (%d+)")
+  if status then return tonumber(status) end
+  return nil
+end
+
 local function _build_url(base_url, path)
   if not path or path == "" then return base_url end
   if base_url:match("/$") then
@@ -38,6 +66,10 @@ end
 
 local function _build_args(opts)
   local args = { "-sS", "--no-buffer", "--max-time", tostring((opts.timeout_ms or 30000) / 1000) }
+  if _supports_fail_with_body() then
+    -- 4xx/5xx 以非零退出码结束并保留响应体，避免错误被静默吞掉
+    args[#args + 1] = "--fail-with-body"
+  end
   if opts.stream then
     args[#args + 1] = "-N"
   end
@@ -84,6 +116,9 @@ end
 
 --- 将累计的 buffer 解析为 SSE 事件
 --- 返回 { events = {...}, rest = 剩余未消费的字符串 }
+--- 只消费以换行结尾的完整 data 行；行尾未到的部分保留在 rest 中等待后续数据，
+--- 避免把跨多次 on_stdout 回调的 data 行当作完整事件消费掉而丢失
+--- （丢事件 = 丢工具调用增量/内容增量，表现为"工具调用后不再进入下一轮"）。
 local function _parse_sse(buffer)
   local events = {}
   local rest = buffer
@@ -91,24 +126,27 @@ local function _parse_sse(buffer)
     local data_start = rest:find("data: ")
     if not data_start then break end
     local line_end = rest:find("\n", data_start, true)
-    local line = line_end and rest:sub(data_start + 6, line_end - 1) or rest:sub(data_start + 6)
+    if not line_end then
+      -- data 行尚未收全（缺行尾换行）：保留缓冲，等待后续数据补齐
+      break
+    end
+    local line = rest:sub(data_start + 6, line_end - 1)
+    line = line:gsub("\r$", "") -- 兼容 CRLF 行尾
     if line == "[DONE]" then
       events[#events + 1] = { type = "done" }
-      rest = line_end and rest:sub(line_end + 1) or ""
+      rest = rest:sub(line_end + 1)
       break
     end
     events[#events + 1] = { type = "data", data = line }
-    if line_end then
-      rest = rest:sub(line_end + 1)
-    else
-      rest = ""
-      break
-    end
+    rest = rest:sub(line_end + 1)
   end
   return events, rest
 end
 
 -- ========== 公共 API ==========
+
+--- SSE 解析器（测试用：与 stream.accumulate_tool_calls 同类导出约定）
+M._parse_sse = _parse_sse
 
 --- 发起 HTTP 请求
 --- @param opts table { base_url, path?, method?, headers?, query?, body?, timeout_ms?, stream? }
@@ -152,24 +190,30 @@ function M.request(opts, callbacks)
     stderr_buffered = true,
     on_stdout = function(_, data)
       if done then return end
-      if opts.stream then
-        for _, line in ipairs(data or {}) do
-          if line ~= "" then
-            chunk_acc = chunk_acc .. line .. "\n"
-            local events, rest = _parse_sse(chunk_acc)
-            chunk_acc = rest
-            for _, ev in ipairs(events) do
-              if ev.type == "done" then
-                -- 结束标记，等待 on_exit 最终 resolve
-              elseif ev.type == "data" and callbacks.on_chunk then
-                callbacks.on_chunk(ev.data, false)
-              end
-            end
+      for _, line in ipairs(data or {}) do
+        if line == "" then
+          -- nvim 以空串元素标记行尾（换行）；补上 \n 后该行才被 _parse_sse 视为完整。
+          -- 不能对非空元素追加 \n：跨回调拆分的 data 行片段会被误判为完整行而提前消费（丢事件）。
+          if opts.stream then
+            chunk_acc = chunk_acc .. "\n"
+          end
+        else
+          stdout[#stdout + 1] = line
+          if opts.stream then
+            -- 原样拼接：片段跨回调自然累积，直到行尾空串元素补齐换行
+            chunk_acc = chunk_acc .. line
           end
         end
-      else
-        for _, line in ipairs(data or {}) do
-          if line ~= "" then stdout[#stdout + 1] = line end
+      end
+      if opts.stream then
+        local events, rest = _parse_sse(chunk_acc)
+        chunk_acc = rest
+        for _, ev in ipairs(events) do
+          if ev.type == "done" then
+            -- 结束标记，等待 on_exit 最终 resolve
+          elseif ev.type == "data" and callbacks.on_chunk then
+            callbacks.on_chunk(ev.data, false)
+          end
         end
       end
     end,
@@ -183,22 +227,23 @@ function M.request(opts, callbacks)
       done = true
       cleanup_unsub()
       if opts.stream and callbacks.on_chunk then
-        -- 消费剩余缓冲
+        -- 消费剩余缓冲（补一个换行让末行没有行尾换行时也能被解析）
         if chunk_acc and chunk_acc ~= "" then
-          local events, _ = _parse_sse(chunk_acc)
+          local events, _ = _parse_sse(chunk_acc .. "\n")
           for _, ev in ipairs(events) do
             if ev.type == "data" then callbacks.on_chunk(ev.data, false) end
           end
         end
         callbacks.on_chunk(nil, true)
       end
+      local body = table.concat(stdout, "\n")
       if code == 0 then
-        local body = table.concat(stdout, "\n")
         d:resolve(body)
       else
         local err_msg = table.concat(stderr, "\n")
         if err_msg == "" then err_msg = "curl 退出码 " .. tostring(code) end
-        d:reject({ kind = "http", status = code, message = err_msg, body = table.concat(stdout, "\n") })
+        local status = _parse_http_status(err_msg)
+        d:reject({ kind = "http", status = status or code, message = err_msg, body = body })
       end
     end,
   })

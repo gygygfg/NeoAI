@@ -7,6 +7,7 @@ local async = require("NeoAI.utils.async")
 local helpers = require("NeoAI.tools.builtin.tool_helpers")
 local event_bus = require("NeoAI.kernel.event_bus")
 local events = require("NeoAI.kernel.events")
+local stringx = require("NeoAI.utils.stringx")
 
 local M = {}
 
@@ -30,12 +31,13 @@ local plan_tools = {}
 
 plan_tools.create_sub_agent = helpers.define_tool(
   "create_sub_agent",
-  "创建子 Agent 执行独立子任务。task 必填；boundaries 可选约束（allowed_tools/allowed_directories/max_tool_calls）。",
+  "创建子 Agent 执行独立子任务。task 必填；mode 可选 'background'（默认，立即返回）或 'foreground'（等待子 Agent 完成后返回完整结果）；boundaries 可选约束（allowed_tools/allowed_directories/max_tool_calls）。",
   {
     type = "object",
     properties = {
       task = { type = "string", description = "子任务描述" },
       model = { type = "string", description = "指定模型（可选）" },
+      mode = { type = "string", enum = { "background", "foreground" }, description = "执行模式（默认 background）" },
       boundaries = {
         type = "object",
         description = "边界约束",
@@ -81,30 +83,47 @@ plan_tools.create_sub_agent = helpers.define_tool(
     local tool_service = require("NeoAI.services.tool_service")
     local tools_subset = _allowed_tools(boundaries.allowed_tools)
     sub_agent.tools = tools_subset
-    runtime.run(sub_agent, args.task):then_(function(result)
+
+    local function _finish(result)
       local entry = state.sub_agents[sub_id]
       if entry then
         entry.status = "completed"
         entry.result = result
+        entry.result_text = (result and result.content) or ""
         event_bus.emit(events.SUB_AGENT_COMPLETED, { sub_agent_id = sub_id })
+        event_bus.emit(events.SUB_AGENT_RESULT_READY, { sub_agent_id = sub_id })
       end
-    end, function(err)
+    end
+    local function _fail(err)
       local entry = state.sub_agents[sub_id]
       if entry then
         entry.status = "error"
         entry.error = err
+        entry.result_text = tostring(err and err.message or err)
         event_bus.emit(events.SUB_AGENT_ERROR, { sub_agent_id = sub_id, error = err })
+        event_bus.emit(events.SUB_AGENT_RESULT_READY, { sub_agent_id = sub_id })
       end
-    end)
+    end
+    runtime.run(sub_agent, args.task):then_(_finish, _fail)
+
+    if args.mode == "foreground" then
+      -- 前台模式：等待子 Agent 完成后返回完整结果
+      M.wait(sub_id):then_(function(entry)
+        on_success(("【子 agent 执行完成】\n子 agent ID: %s\n状态: %s\n\n%s"):format(sub_id, entry.status, entry.result_text or ""))
+      end, function(err)
+        on_error("子 Agent 执行失败: " .. tostring(err and err.message or err))
+      end)
+      return
+    end
 
     on_success(("子 Agent 已创建: %s\n任务: %s"):format(sub_id, args.task))
   end,
-  { category = "agent", approval = { auto_allow = false } }
+  { category = "agent", approval = { auto_allow = false }, timeout = -1 }
 )
 
 plan_tools.get_sub_agent_status = helpers.define_tool(
   "get_sub_agent_status",
-  "查询子 Agent 状态。sub_agent_id 必填。",
+  "查询子 Agent 状态。sub_agent_id 必填。返回状态、任务与执行结果。",
   {
     type = "object",
     properties = { sub_agent_id = { type = "string" } },
@@ -116,9 +135,36 @@ plan_tools.get_sub_agent_status = helpers.define_tool(
       on_success("子 Agent 不存在: " .. tostring(args.sub_agent_id))
       return
     end
-    on_success(("状态: %s\n任务: %s\n工具调用: %d"):format(entry.status, entry.task, entry.tool_calls or 0))
+    local lines = {
+      ("状态: %s"):format(entry.status),
+      ("任务: %s"):format(entry.task),
+      ("工具调用: %d"):format(entry.tool_calls or 0),
+    }
+    if entry.result_text and entry.result_text ~= "" then
+      lines[#lines + 1] = ("结果:\n%s"):format(stringx.truncate(entry.result_text, 2000))
+    end
+    on_success(table.concat(lines, "\n"))
   end,
   { category = "agent" }
+)
+
+plan_tools.wait_sub_agent = helpers.define_tool(
+  "wait_sub_agent",
+  "等待子 Agent 完成并返回完整结果。sub_agent_id 必填。若已完成则立即返回，否则阻塞直到完成/失败。",
+  {
+    type = "object",
+    properties = { sub_agent_id = { type = "string" } },
+    required = { "sub_agent_id" },
+  },
+  function(args, on_success, on_error)
+    M.wait(args.sub_agent_id):then_(function(entry)
+      on_success(("【子 agent 执行完成】\n子 agent ID: %s\n状态: %s\n\n%s"):format(
+        entry.id, entry.status, entry.result_text or ""))
+    end, function(err)
+      on_error(tostring(err and err.message or err))
+    end)
+  end,
+  { category = "agent", timeout = -1 }
 )
 
 plan_tools.cancel_sub_agent = helpers.define_tool(
@@ -228,6 +274,43 @@ end
 --- @param sub_agent_id string
 function M.cleanup_sub_agent(sub_agent_id)
   state.sub_agents[sub_agent_id] = nil
+end
+
+--- 等待子 Agent 完成（前台阻塞）
+--- @param sub_agent_id string
+--- @return Deferred resolve(entry), reject(不存在/取消)
+function M.wait(sub_agent_id)
+  local d = async.Deferred.new()
+  local entry = state.sub_agents[sub_agent_id]
+  if not entry then
+    d:reject({ message = "子 Agent 不存在: " .. tostring(sub_agent_id) })
+    return d
+  end
+  local status = entry.status
+  if status == "completed" or status == "error" or status == "cancelled" then
+    vim.schedule(function() d:resolve(entry) end)
+    return d
+  end
+
+  local unsubs = {}
+  local function _settle()
+    for _, u in ipairs(unsubs) do
+      if u then pcall(u) end
+    end
+    unsubs = {}
+    d:resolve(state.sub_agents[sub_agent_id] or entry)
+  end
+
+  unsubs[#unsubs + 1] = event_bus.on(events.SUB_AGENT_COMPLETED, function(data)
+    if data and data.sub_agent_id == sub_agent_id then _settle() end
+  end)
+  unsubs[#unsubs + 1] = event_bus.on(events.SUB_AGENT_ERROR, function(data)
+    if data and data.sub_agent_id == sub_agent_id then _settle() end
+  end)
+  unsubs[#unsubs + 1] = event_bus.on(events.SUB_AGENT_UPDATED, function(data)
+    if data and data.sub_agent_id == sub_agent_id and data.status == "cancelled" then _settle() end
+  end)
+  return d
 end
 
 --- 测试辅助：直接构造子 Agent 条目

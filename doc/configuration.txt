@@ -227,7 +227,8 @@ Chat window keymaps:
     scroll_up = { key = "<C-u>", desc = "向上滚动" }
     scroll_down = { key = "<C-d>", desc = "向下滚动" }
     toggle_reasoning = { key = "r", desc = "切换思考过程显示" }
-    switch_model = { key = "m", desc = "切换模型" }
+    switch_model = { key = "M", desc = "切换模型" }
+    cycle_mode = { key = "m", desc = "循环切换模式（CHAT/PLAN/AUTO）" }
     newline = { key = "<CR>", desc = "新建行" }
     clear = { key = "<C-u>", desc = "清空输入" }
     tool_approval = { key = "<C-a>", desc = "工具审批" }

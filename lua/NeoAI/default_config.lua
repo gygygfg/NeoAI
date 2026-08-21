@@ -123,6 +123,17 @@ local DEFAULT_CONFIG = {
     system_prompt = "你是一个AI编程助手，帮助用户解决编程问题。",
     timeout_ms = 60000,
     max_retries = 3,
+    context_cache = {
+      enabled = true, -- 启用前缀缓存身份一致性 + 自动上下文压缩
+      context_window = 64000, -- 模型上下文窗口（token 估算）
+      threshold_ratio = 0.8, -- 达到该比例触发压缩
+      retain_ratio = 0.16, -- 保留的最近历史比例（压缩后尾部）
+      retain_min_tokens = 4096, -- 尾部保留的下限（token）
+      compact_max_tokens = 8192, -- 压缩摘要输出的 token 上限
+      min_shadow_messages = 2, -- 至少折叠多少条消息才值得压缩
+      include_identity = true, -- 系统提示是否包含固定身份段（-100 顺序位）
+      identity = "你是一个由 NeoAI 驱动的 AI 编程助手。",
+    },
   },
 
   ui = {
@@ -143,6 +154,7 @@ local DEFAULT_CONFIG = {
       foldmethod = "manual",
       foldcolumn = "0",
       foldlevel = 99,
+      auto_close_on_select = true, -- 从树选择会话打开聊天后自动关闭树窗口
     },
   },
 
@@ -154,9 +166,10 @@ local DEFAULT_CONFIG = {
       close_all = { key = "<leader>aq", desc = "关闭所有窗口" },
     },
     tree = {
+      quit = { key = "q", desc = "关闭会话树" },
       select = { key = "<CR>", desc = "选择节点/分支" },
-      new_child = { key = "n", desc = "新建子分支" },
-      new_root = { key = "N", desc = "新建根分支" },
+      new_child = { key = "n", desc = "新建子分支并打开聊天" },
+      new_root = { key = "N", desc = "新建根分支并打开聊天" },
       delete_dialog = { key = "d", desc = "删除对话" },
       delete_branch = { key = "D", desc = "删除分支" },
       expand = { key = "o", desc = "展开节点" },
@@ -168,7 +181,8 @@ local DEFAULT_CONFIG = {
       send = { insert = { key = "<C-s>", desc = "发送消息" }, normal = { key = "<CR>", desc = "发送消息" } },
       cancel = { key = "<Esc>", desc = "取消生成" },
       toggle_reasoning = { key = "r", desc = "切换思考过程显示" },
-      switch_model = { key = "m", desc = "切换模型" },
+      switch_model = { key = "M", desc = "切换模型" },
+      cycle_mode = { key = "m", desc = "循环切换模式（CHAT/PLAN/AUTO）" },
       tool_approval = { key = "<C-a>", desc = "工具审批" },
       approval = {
         confirm = { key = "<CR>", desc = "允许一次" },
@@ -191,9 +205,41 @@ local DEFAULT_CONFIG = {
     enabled = true,
     builtin = true,
     external = {},
+    lsp = {
+      timeout_ms = 10000, -- LSP 请求超时（ms）：服务器无响应时快速失败，避免工具循环挂到 executor 超时
+    },
+    guard = {
+      repeat_tool = {
+        enabled = true, -- 检测连续重复工具调用并注入提醒
+        thresholds = { 3, 5, 8 }, -- 递增提醒阈值
+        messages = {
+          [3] = "⚠️ 你已连续多次调用同一个工具并使用相同的参数。如果上一次调用没有达到预期效果，请先读取文件/检查输出，改变参数或换一种做法，而不是原样重试。",
+          [5] = "⚠️ 你仍在重复调用相同工具与相同参数（第 5 次）。继续这样执行不会产生新结果。请停下来分析原因：查看错误输出、读取相关文件，或向用户询问意图。",
+          [8] = "⚠️ 已连续 8 次重复相同的工具调用。循环将不会自动终止，但建议立即改变策略：考虑用不同的工具、不同的参数，或结束本轮并让用户补充说明。",
+        },
+      },
+    },
+    todo = {
+      enabled = true, -- 待办清单工具 + 系统提示注入
+    },
+    plan_mode = {
+      enabled = true, -- 计划模式
+      mutating_tools = {
+        "edit_file",
+        "delete_file",
+        "create_directory",
+        "ensure_dir",
+        "delete_node",
+        "lsp_rename",
+        "lsp_format",
+        "git_rollback",
+        "confirm_file_change",
+      },
+    },
     approval = {
       mode = "prompt", -- prompt | auto_allow | strict
       default_auto_allow = false,
+      timeout_ms = 60000, -- 审批弹窗超时（ms），防止弹窗丢失后工具循环永久挂起
       allowed_directories = {},
       allowed_param_groups = {},
       per_tool = {
@@ -205,7 +251,11 @@ local DEFAULT_CONFIG = {
         create_directory = { auto_allow = false },
         ensure_dir = { auto_allow = false },
         delete_file = { auto_allow = false },
-        run_command = { auto_allow = false, allowed_directories = { "./" }, allowed_param_groups = { "ls", "wc", "find", "grep", "pwd" } },
+        run_command = {
+          auto_allow = false,
+          allowed_directories = { "./" },
+          allowed_param_groups = { "ls", "wc", "find", "grep", "pwd" },
+        },
         create_sub_agent = { auto_allow = false },
         get_sub_agent_status = { auto_allow = true },
         cancel_sub_agent = { auto_allow = true },

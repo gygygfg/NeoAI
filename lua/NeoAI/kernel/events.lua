@@ -52,6 +52,7 @@ M.TREE_REFRESHED = "tree:refreshed"
 -- ========== 工具 ==========
 M.TOOL_LOOP_STARTED = "tool_loop:started"
 M.TOOL_LOOP_FINISHED = "tool_loop:finished"
+M.TOOL_LOOP_LIMIT_REACHED = "tool_loop:limit_reached"
 M.TOOL_EXECUTION_STARTED = "tool:execution_started"
 M.TOOL_EXECUTION_COMPLETED = "tool:execution_completed"
 M.TOOL_EXECUTION_ERROR = "tool:execution_error"
@@ -60,6 +61,12 @@ M.TOOL_APPROVAL_REQUESTED = "tool:approval_requested"
 M.TOOL_APPROVED = "tool:approved"
 M.TOOL_APPROVAL_CANCELLED = "tool:approval_cancelled"
 M.TOOL_RESULT_RECEIVED = "tool:result_received"
+M.TOOL_LOOP_GUARD_REMINDER = "tool_loop:guard_reminder"
+M.AUTO_MODE_CHANGED = "approval_mode:auto_changed"
+
+-- ========== 待办 / 计划模式 ==========
+M.TODO_UPDATED = "todo:updated"
+M.PLAN_MODE_CHANGED = "plan_mode:changed"
 
 -- ========== 模型 ==========
 M.MODELS_UPDATED = "models:updated"
@@ -78,6 +85,7 @@ M.SUB_AGENT_CREATED = "sub_agent:created"
 M.SUB_AGENT_UPDATED = "sub_agent:updated"
 M.SUB_AGENT_COMPLETED = "sub_agent:completed"
 M.SUB_AGENT_ERROR = "sub_agent:error"
+M.SUB_AGENT_RESULT_READY = "sub_agent:result_ready"
 
 -- ========== 配置 / 生命周期 ==========
 M.CONFIG_LOADED = "config:loaded"
@@ -87,5 +95,9 @@ M.PLUGIN_SHUTDOWN = "plugin:shutdown"
 
 -- ========== 日志 ==========
 M.LOG_MESSAGE = "log:message"
+
+-- ========== 上下文压缩 ==========
+M.COMPACTION_STARTED = "compaction:started"
+M.COMPACTION_COMPLETED = "compaction:completed"
 
 return M

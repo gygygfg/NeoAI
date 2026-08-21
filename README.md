@@ -99,6 +99,7 @@ require("NeoAI").setup({
 | `:NeoAIKeymaps`    | 显示当前键位配置                                 |
 | `:NeoAITest`       | 运行测试（不带参数运行全部，带参数运行指定测试） |
 | `:NeoAIChatStatus` | 显示聊天窗口状态                                 |
+| `:NeoAIPlan`       | 切换计划模式（计划模式下禁止修改类工具）         |
 
 ### 4. 默认快捷键
 
@@ -198,8 +199,9 @@ require("NeoAI").setup({
       quit = { key = "q", desc = "关闭聊天窗口" },
       send = { insert = { key = "<C-s>" }, normal = { key = "<CR>" } },
       cancel = { key = "<Esc>", desc = "取消生成" },
-      switch_model = { key = "m", desc = "切换模型" },
+      switch_model = { key = "M", desc = "切换模型" },
       toggle_reasoning = { key = "r", desc = "切换思考过程显示" },
+      cycle_mode = { key = "m", desc = "循环切换模式（CHAT/PLAN/AUTO）" },
       approval = {
         confirm = { key = "<CR>", desc = "允许一次" },
         confirm_all = { key = "A", desc = "允许所有" },
@@ -316,11 +318,24 @@ NeoAI 内置了 40+ 工具，AI 可在对话中自动调用，涵盖以下类别
 
 ### 🤖 子 Agent 工具
 
-| 工具名                 | 描述                    | 默认审批    |
-| ---------------------- | ----------------------- | ----------- |
-| `create_sub_agent`     | 创建子 Agent 执行子任务 | ❌ 需审批   |
-| `get_sub_agent_status` | 查询子 Agent 状态       | ✅ 自动允许 |
-| `cancel_sub_agent`     | 取消子 Agent            | ✅ 自动允许 |
+| 工具名                 | 描述                                                      | 默认审批    |
+| ---------------------- | --------------------------------------------------------- | ----------- |
+| `create_sub_agent`     | 创建子 Agent 执行子任务（支持 `foreground` 前台等待结果） | ❌ 需审批   |
+| `wait_sub_agent`       | 等待子 Agent 完成并返回完整结果                           | ✅ 自动允许 |
+| `get_sub_agent_status` | 查询子 Agent 状态与结果                                   | ✅ 自动允许 |
+| `cancel_sub_agent`     | 取消子 Agent                                              | ✅ 自动允许 |
+
+### 📋 待办与计划
+
+| 工具名            | 描述                                 | 默认审批    |
+| ----------------- | ------------------------------------ | ----------- |
+| `todo_write`      | 整表替换任务清单（自动注入系统提示） | ✅ 自动允许 |
+| `todo_read`       | 读取当前任务清单                     | ✅ 自动允许 |
+| `todo_clear`      | 清空任务清单                         | ✅ 自动允许 |
+| `enter_plan_mode` | 进入计划模式（屏蔽修改类工具）       | ✅ 自动允许 |
+| `set_plan`        | 记录/更新计划内容                    | ✅ 自动允许 |
+| `present_plan`    | 提交计划并退出计划模式               | ✅ 自动允许 |
+| `exit_plan_mode`  | 直接退出计划模式                     | ✅ 自动允许 |
 
 ### 🪵 日志工具
 
