@@ -113,6 +113,42 @@ function M.is_background_loaded(bufnr)
   return bg_loaded[bufnr] == true
 end
 
+--- 磁盘内容与内存不一致时从磁盘同步 buffer（仅当 buffer 无未保存改动）。
+--- edit_file 等磁盘直写工具只改磁盘、不改已加载 buffer 的内容，导致后续
+--- LSP / treesitter 操作基于过期内容（读错位置、lsp_rename 把旧内容写回磁盘等）。
+--- 此函数把磁盘最新内容同步进 buffer，Neovim 的 LSP sync 随之向服务器发送
+--- didChange，刷新其文档缓存，后续请求基于最新内容。
+--- @param bufnr number
+--- @return boolean
+function M.sync_buffer_from_disk(bufnr)
+  if not vim.api.nvim_buf_is_loaded(bufnr) then return true end
+  if vim.bo[bufnr].modified then return true end -- 有未保存改动，绝不覆盖
+  local filepath = vim.api.nvim_buf_get_name(bufnr)
+  if filepath == "" or vim.fn.filereadable(filepath) ~= 1 then return true end
+  local disk_lines = vim.fn.readfile(filepath)
+  local mem_lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+  local same = #disk_lines == #mem_lines
+  if same then
+    for i = 1, #disk_lines do
+      if disk_lines[i] ~= mem_lines[i] then same = false break end
+    end
+  end
+  if same then return true end
+  -- readfile 会丢弃末尾换行符；用 buffer 的 eol 选项补偿，保证写回时末行换行与磁盘一致
+  local has_eol = true
+  local f = io.open(filepath, "rb")
+  if f then
+    local data = f:read("*a")
+    f:close()
+    has_eol = data:sub(-1) == "\n"
+  end
+  local ok1 = pcall(vim.api.nvim_buf_set_lines, bufnr, 0, -1, false, disk_lines)
+  local ok2 = pcall(vim.api.nvim_buf_set_option, bufnr, "eol", has_eol)
+  -- set_lines 会把 buffer 标记为 modified；磁盘一致时不视为未保存改动
+  local ok3 = pcall(vim.api.nvim_buf_set_option, bufnr, "modified", false)
+  return ok1 and ok2 and ok3
+end
+
 --- 持久化后台加载的 buffer（写回磁盘）。
 --- 仅对 ensure_buffer 在后台加载的 buffer 生效，绝不覆盖用户打开的 buffer，
 --- 避免写掉用户未保存的改动。buffer 未被修改时跳过。

@@ -453,6 +453,155 @@ tests.suite("tools", function(_, it)
     config_store.set("tools.lsp.timeout_ms", nil)
   end)
 
+  it("sync_buffer_from_disk 磁盘直写后同步陈旧 buffer（BUG-1 回归）", function(t)
+    local helpers = require("NeoAI.tools.builtin.tool_helpers")
+    local fs = require("NeoAI.utils.fs")
+    -- 后台加载后磁盘被 edit_file 直写覆盖：buffer 仍为旧内容
+    local path = "/tmp/neoai_sync_bug1.lua"
+    fs.write_file(path, "local old_name = 1\n")
+    local buf = helpers.ensure_buffer(path)
+    t.true_(vim.deep_equal({ "local old_name = 1" }, vim.api.nvim_buf_get_lines(buf, 0, -1, false)))
+    fs.write_file(path, "local new_name = 2\n")
+    t.true_(vim.deep_equal({ "local old_name = 1" }, vim.api.nvim_buf_get_lines(buf, 0, -1, false)), "磁盘直写不应更新 buffer")
+    local ok = helpers.sync_buffer_from_disk(buf)
+    t.true_(ok)
+    t.true_(vim.deep_equal({ "local new_name = 2" }, vim.api.nvim_buf_get_lines(buf, 0, -1, false)), "sync 后应反映磁盘最新内容")
+    t.false_(vim.bo[buf].modified, "sync 不应把磁盘一致内容标记为未保存改动")
+    -- 有未保存改动时绝不覆盖
+    local p2 = "/tmp/neoai_sync_bug1b.lua"
+    fs.write_file(p2, "keep me\n")
+    local b2 = helpers.ensure_buffer(p2)
+    pcall(vim.api.nvim_buf_set_text, b2, 0, 0, -1, -1, { "user edit" })
+    fs.write_file(p2, "disk overwrite\n")
+    helpers.sync_buffer_from_disk(b2)
+    t.true_(vim.deep_equal({ "user edit" }, vim.api.nvim_buf_get_lines(b2, 0, -1, false)), "未保存改动不应被覆盖")
+    -- 无换行的文件 sync 后 eol 保持 false
+    local p3 = "/tmp/neoai_sync_bug1c.txt"
+    fs.write_file(p3, "a\nb")
+    local b3 = helpers.ensure_buffer(p3)
+    fs.write_file(p3, "x\ny")
+    helpers.sync_buffer_from_disk(b3)
+    t.false_(vim.bo[b3].eol, "无末行换行的文件 sync 后 eol 应为 false")
+  end)
+
+  it("lsp LocationLink 结果正常解析不挂起（BUG-3 回归）", function(t)
+    local config_store = require("NeoAI.kernel.config_store")
+    config_store.load({ tools = { approval = { mode = "auto_allow" }, lsp = { timeout_ms = 500 } } })
+    local registry = require("NeoAI.tools.registry")
+    registry.reset()
+    local executor = require("NeoAI.tools.executor")
+    local lsp_ops = require("NeoAI.tools.builtin.lsp_ops")
+    registry.register_many(lsp_ops.get_tools())
+    local fs = require("NeoAI.utils.fs")
+    local path = "/tmp/neoai_lsp_link.lua"
+    fs.write_file(path, "local x = 1\n")
+    local buf = vim.fn.bufadd(path)
+    vim.fn.bufload(buf)
+    vim.bo[buf].filetype = "lua"
+    -- lua-language-server 对 typeDefinition/implementation 返回 LocationLink
+    -- （targetUri/targetRange，无 uri/range）。修复前 loc.uri 为 nil → 解析抛异常
+    -- → 被 then_ 派生 Deferred 吞掉 → 挂到 executor 超时（30s）。
+    local orig = vim.lsp.buf_request
+    vim.lsp.buf_request = function(bnr, method, params, cb)
+      cb(nil, { {
+        targetUri = "file:///tmp/x.lua",
+        targetRange = { start = { line = 0, character = 6 }, ["end"] = { line = 0, character = 11 } },
+      } })
+      return { [1] = 1 }
+    end
+    local done = false
+    executor.execute("lsp_type_definition", { filepath = path, line = 1, col = 1 }):then_(function(r)
+      t.matches("/tmp/x.lua:1:6", r)
+      done = true
+    end, function(e)
+      t.true_(false, "不应失败: " .. tostring(e))
+      done = true
+    end)
+    local waited = vim.wait(2000, function() return done end)
+    t.true_(waited, "LocationLink 应正常解析，不得挂到超时")
+    vim.lsp.buf_request = orig
+  end)
+
+  it("lsp 结果处理异常转 on_error 而非挂起（BUG-3 回归）", function(t)
+    local config_store = require("NeoAI.kernel.config_store")
+    config_store.load({ tools = { approval = { mode = "auto_allow" }, lsp = { timeout_ms = 500 } } })
+    local registry = require("NeoAI.tools.registry")
+    registry.reset()
+    local executor = require("NeoAI.tools.executor")
+    local lsp_ops = require("NeoAI.tools.builtin.lsp_ops")
+    registry.register_many(lsp_ops.get_tools())
+    local fs = require("NeoAI.utils.fs")
+    local path = "/tmp/neoai_lsp_bad.lua"
+    fs.write_file(path, "local x = 1\n")
+    local buf = vim.fn.bufadd(path)
+    vim.fn.bufload(buf)
+    vim.bo[buf].filetype = "lua"
+    -- 返回畸形位置（既非 Location 也非 LocationLink）：处理器抛异常。
+    -- 修复前异常被吞 → 工具挂到 executor 超时；现在应快速 on_error。
+    local orig = vim.lsp.buf_request
+    vim.lsp.buf_request = function(bnr, method, params, cb)
+      cb(nil, { { targetUri = nil } })
+      return { [1] = 1 }
+    end
+    local done = false
+    executor.execute("lsp_type_definition", { filepath = path, line = 1, col = 1 }):then_(function(r)
+      t.true_(false, "畸形结果不应成功: " .. tostring(r))
+      done = true
+    end, function(e)
+      t.matches("结果处理失败", tostring(e))
+      done = true
+    end)
+    local waited = vim.wait(2000, function() return done end)
+    t.true_(waited, "处理异常应快速 on_error，不得挂到 executor 超时")
+    vim.lsp.buf_request = orig
+  end)
+
+  it("lsp 无客户端与不支持请求的错误区分（BUG-2 回归）", function(t)
+    local config_store = require("NeoAI.kernel.config_store")
+    config_store.load({ tools = { approval = { mode = "auto_allow" }, lsp = { timeout_ms = 500 } } })
+    local registry = require("NeoAI.tools.registry")
+    registry.reset()
+    local executor = require("NeoAI.tools.executor")
+    local lsp_ops = require("NeoAI.tools.builtin.lsp_ops")
+    registry.register_many(lsp_ops.get_tools())
+    local fs = require("NeoAI.utils.fs")
+    local path = "/tmp/neoai_lsp_unsupported.lua"
+    fs.write_file(path, "local x = 1\n")
+    local buf = vim.fn.bufadd(path)
+    vim.fn.bufload(buf)
+    vim.bo[buf].filetype = "lua"
+    local orig_request = vim.lsp.buf_request
+    local orig_clients = vim.lsp.get_clients
+    -- 有客户端但不支持该请求（如 Copilot 不支持 textDocument/declaration）：
+    -- buf_request 返回 {}，应报"不支持请求"而非误导为"无 LSP 客户端"。
+    vim.lsp.buf_request = function() return {} end
+    vim.lsp.get_clients = function() return { { id = 1, name = "copilot" } } end
+    local done = false
+    executor.execute("lsp_declaration", { filepath = path, line = 1, col = 1 }):then_(function(r)
+      t.true_(false, "不支持请求不应成功: " .. tostring(r))
+      done = true
+    end, function(e)
+      t.matches("不支持请求", tostring(e))
+      done = true
+    end)
+    local waited = vim.wait(2000, function() return done end)
+    t.true_(waited, "不支持请求应快速失败")
+    -- 完全无客户端：仍报"无 LSP 客户端"
+    done = false
+    vim.lsp.get_clients = function() return {} end
+    executor.execute("lsp_declaration", { filepath = path, line = 1, col = 1 }):then_(function(r)
+      t.true_(false, "无客户端不应成功: " .. tostring(r))
+      done = true
+    end, function(e)
+      t.matches("无 LSP 客户端", tostring(e))
+      done = true
+    end)
+    local waited2 = vim.wait(2000, function() return done end)
+    t.true_(waited2, "无客户端应快速失败")
+    vim.lsp.buf_request = orig_request
+    vim.lsp.get_clients = orig_clients
+  end)
+
   it("environment: 无 git 工作树时禁用 git 工具，进入后恢复", function(t)
     local env = require("NeoAI.tools.environment")
     local tool_loop = require("NeoAI.core.agent.tool_loop")

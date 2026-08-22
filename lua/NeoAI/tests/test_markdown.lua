@@ -103,4 +103,23 @@ tests.suite("markdown", function(_, it)
     t.matches("^%| A ", lines[1], "表头应以对齐后的 | 开头")
     t.matches("^%| %s*─", lines[2], "分隔行应渲染为 ─ 分隔")
   end)
+
+  it("超长单元格截断显示且不撑爆行宽（渲染不卡死）", function(t)
+    local mv = require("NeoAI.ui.components.markdown_view")
+    local long = string.rep("数据内容", 20000) -- ~240KB 单格
+    local rendered = mv.render("| 列A | 列B |\n| --- | --- |\n| " .. long .. " | short |\n| b | c |")
+
+    t.eq("table", rendered[1].style, "应识别为表格")
+    t.matches("…", rendered[3].text, "超长单元格应截断并以 … 结尾")
+    t.false_(rendered[3].text:find(long, 1, true) ~= nil, "渲染行不应包含完整超长单元格")
+    -- 渲染行长度应受列宽上限约束（不能是几十万字节的巨长行）
+    local maxlen = 0
+    for _, l in ipairs(rendered) do
+      maxlen = math.max(maxlen, #l.text)
+    end
+    t.true_(maxlen < 1000, "表格行长度应有界（实际 " .. maxlen .. " 字节）")
+    -- 分隔行与后续短行仍正确渲染
+    t.matches("^%| ─", rendered[2].text, "分隔行应正常渲染")
+    t.matches("b", rendered[4].text, "短内容行应保留")
+  end)
 end)

@@ -12,6 +12,13 @@ local MARKDOWN_EXTS = { lua = "lua", py = "python", js = "javascript", ts = "typ
 -- 转义竖线占位符（\| 在拆分表格单元格前暂存，避免被当作列分隔符）
 local PIPE_PLACEHOLDER = "\1"
 
+-- 表格列显示宽度上限：单格内容过长时截断显示，避免按最长格做整表对齐
+-- （一个超长格会让所有行/分隔行填充成几十万字节的巨长行，渲染与重绘卡死）
+local MAX_COL_WIDTH = 60
+-- 单行扫描上限：超过则只处理有界前缀（任何单元格展示宽度最多 MAX_COL_WIDTH，
+-- 超长行的后半段本就不会被显示，无需对几十万字节做模式匹配）
+local TABLE_ROW_SCAN_LIMIT = 2048
+
 -- ========== 私有函数 ==========
 
 --- 清理行内 markdown 标记
@@ -33,24 +40,25 @@ local function _is_table_row(line)
   return line:match("^%s*%|") ~= nil
 end
 
---- 拆分表格行为单元格数组（保留空单元格，支持 \| 转义）
+--- 拆分表格行为单元格数组（保留空单元格，支持 \| 转义）。
+--- 用 string.find 定位分隔符（O(n) 快速路径），避免逐字符 sub 分配。
 --- @param line string
 --- @return table
 local function _split_table_row(line)
   line = line:gsub("^%s*%|%s*", ""):gsub("%s*%|%s*$", "")
   line = line:gsub("\\%|", PIPE_PLACEHOLDER)
   local cells = {}
-  local buf = {}
-  for i = 1, #line do
-    local ch = line:sub(i, i)
-    if ch == "|" then
-      cells[#cells + 1] = table.concat(buf):gsub(PIPE_PLACEHOLDER, "|")
-      buf = {}
+  local start = 1
+  while true do
+    local pos = line:find("|", start, true)
+    if pos then
+      cells[#cells + 1] = line:sub(start, pos - 1):gsub(PIPE_PLACEHOLDER, "|")
+      start = pos + 1
     else
-      buf[#buf + 1] = ch
+      cells[#cells + 1] = line:sub(start):gsub(PIPE_PLACEHOLDER, "|")
+      break
     end
   end
-  cells[#cells + 1] = table.concat(buf):gsub(PIPE_PLACEHOLDER, "|")
   return cells
 end
 
@@ -61,15 +69,38 @@ local function _is_sep_cell(cell)
   return cell:match("^:?%-+:?$") ~= nil
 end
 
+--- 按显示宽度截断字符串，超出部分以 … 结尾（CJK 占 2 列）。
+--- 字节数超过 max_width*3（最多 3 字节/字符）时显示宽度必然超限，跳过 strwidth
+--- 快速截断；否则先做一次 strwidth 判断。strcharpart 取前 max_width 个字符再回退，
+--- 保证只做有界的 strwidth 调用。
+--- @param str string
+--- @param max_width number 显示宽度上限
+--- @return string
+local function _truncate_display(str, max_width)
+  if #str <= max_width * 3 and vim.fn.strwidth(str) <= max_width then return str end
+  local s = vim.fn.strcharpart(str, 0, max_width)
+  while vim.fn.strwidth(s) > max_width - 1 do
+    s = vim.fn.strcharpart(s, 0, vim.fn.strchars(s) - 1)
+  end
+  return s .. "…"
+end
+
 --- 渲染 markdown 表格：按列显示宽度对齐（CJK 占 2 列）。
 --- 需要至少一个分隔行（---/:-+:）才认为是表格；否则返回 nil（当作普通行）。
+--- 每列宽度上限 MAX_COL_WIDTH：超长单元格截断显示，避免整表被单个巨长格撑爆。
 --- @param rows table 连续表格行
 --- @return table|nil 对齐后的行数组
 local function _render_table(rows)
   local split = {}
   local sep_idx = nil
   for idx, row in ipairs(rows) do
-    local cells = _split_table_row(row)
+    -- 超长行只处理有界前缀：后半个单元格本就会被截断显示，跳过可避免对
+    -- 几十万字节做 gsub/逐字符拆分（卡死主因）。
+    local line = row
+    if #line > TABLE_ROW_SCAN_LIMIT then
+      line = line:sub(1, TABLE_ROW_SCAN_LIMIT)
+    end
+    local cells = _split_table_row(line)
     split[idx] = cells
     if not sep_idx and #cells > 0 then
       local is_sep = true
@@ -84,6 +115,17 @@ local function _render_table(rows)
   end
   if sep_idx == nil then return nil end
 
+  -- 一次性处理所有单元格：超长格先截断显示宽度再清理行内标记
+  -- （宽度计算与渲染共用，避免对超大字符串重复 strwidth/gsub）
+  local cleaned = {}
+  for idx, cells in ipairs(split) do
+    cleaned[idx] = {}
+    for ci, c in ipairs(cells) do
+      local raw = c:gsub("^%s+", ""):gsub("%s+$", "")
+      cleaned[idx][ci] = _clean_inline(_truncate_display(raw, MAX_COL_WIDTH))
+    end
+  end
+
   local col_count = 0
   for _, cells in ipairs(split) do
     col_count = math.max(col_count, #cells)
@@ -91,26 +133,25 @@ local function _render_table(rows)
   local widths = {}
   for ci = 1, col_count do
     local w = 1
-    for idx, cells in ipairs(split) do
+    for idx = 1, #split do
       if idx ~= sep_idx then
-        local cell = (cells[ci] or ""):gsub("^%s+", ""):gsub("%s+$", "")
-        w = math.max(w, vim.fn.strwidth(_clean_inline(cell)))
+        w = math.max(w, vim.fn.strwidth(cleaned[idx][ci] or ""))
       end
     end
-    widths[ci] = w
+    widths[ci] = math.min(w, MAX_COL_WIDTH)
   end
 
   local out = {}
-  for idx, cells in ipairs(split) do
+  for idx = 1, #split do
     local parts = {}
     for ci = 1, col_count do
-      local cell = (cells[ci] or ""):gsub("^%s+", ""):gsub("%s+$", "")
+      local cell = cleaned[idx][ci] or ""
       if idx == sep_idx then
         parts[#parts + 1] = string.rep("─", widths[ci])
       else
-        local cleaned = _clean_inline(cell)
-        local pad = math.max(0, widths[ci] - vim.fn.strwidth(cleaned))
-        parts[#parts + 1] = cleaned .. string.rep(" ", pad)
+        local disp = _truncate_display(cell, MAX_COL_WIDTH)
+        local pad = math.max(0, widths[ci] - vim.fn.strwidth(disp))
+        parts[#parts + 1] = disp .. string.rep(" ", pad)
       end
     end
     out[#out + 1] = "| " .. table.concat(parts, " | ") .. " |"
