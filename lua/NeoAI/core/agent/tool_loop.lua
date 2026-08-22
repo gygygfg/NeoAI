@@ -94,17 +94,21 @@ end
 --- 从 Agent 提取工具定义（供请求使用）
 --- 工具按名称字典序输出：确定性 → 相同工具集跨请求逐字节相同，前缀缓存友好。
 --- 空 properties 不输出该字段：JSON 中空 Lua 表会编码为 []，DeepSeek 拒绝 [] schema。
+--- 拼接工具上下文前先做环境探测：无法获取 workspace/git 目录时禁用相关工具
+--- （tools.environment.filter_tools），避免向模型暴露必然失败的调用。
 --- @param agent table
 --- @return table 数组
 function M._tool_definitions(agent)
+  local environment = require("NeoAI.tools.environment")
+  local tools = environment.filter_tools(agent.tools or {})
   local names = {}
-  for name in pairs(agent.tools or {}) do
+  for name in pairs(tools) do
     names[#names + 1] = name
   end
   table.sort(names)
   local out = {}
   for _, name in ipairs(names) do
-    local tool = agent.tools[name]
+    local tool = tools[name]
     local tf = { name = name, description = tool.description or ("执行 " .. name) }
     local params = tool.parameters
     if params then

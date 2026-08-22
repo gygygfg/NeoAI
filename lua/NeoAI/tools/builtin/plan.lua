@@ -81,7 +81,7 @@ plan_tools.create_sub_agent = helpers.define_tool(
 
     -- 启动子 Agent 执行
     local tool_service = require("NeoAI.services.tool_service")
-    local tools_subset = _allowed_tools(boundaries.allowed_tools)
+    local tools_subset = M._allowed_tools(boundaries.allowed_tools)
     sub_agent.tools = tools_subset
 
     local function _finish(result)

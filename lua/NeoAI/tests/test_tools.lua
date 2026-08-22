@@ -452,4 +452,39 @@ tests.suite("tools", function(_, it)
     vim.lsp.buf_request = orig
     config_store.set("tools.lsp.timeout_ms", nil)
   end)
+
+  it("environment: 无 git 工作树时禁用 git 工具，进入后恢复", function(t)
+    local env = require("NeoAI.tools.environment")
+    local tool_loop = require("NeoAI.core.agent.tool_loop")
+    local tools = {
+      git_status = { description = "git" },
+      git_diff = { description = "git" },
+      list_files = { description = "ws" },
+      read_file = { description = "generic" },
+    }
+    local agent = { tools = tools }
+    local function def_names()
+      local out = {}
+      for _, d in ipairs(tool_loop._tool_definitions(agent)) do
+        out[#out + 1] = d["function"].name
+      end
+      table.sort(out)
+      return out
+    end
+
+    local cwd = vim.fn.getcwd()
+    local tmp = "/tmp/neoai_env_test"
+    vim.fn.mkdir(tmp, "p")
+    vim.cmd("cd " .. tmp)
+    local names_no_git = def_names()
+    vim.cmd("cd " .. cwd) -- 先恢复 cwd 再断言，断言失败也不影响后续测试
+    t.true_(vim.tbl_contains(names_no_git, "read_file"), "通用工具应保留")
+    t.true_(vim.tbl_contains(names_no_git, "list_files"), "工作区工具应保留（cwd 存在）")
+    t.false_(vim.tbl_contains(names_no_git, "git_status"), "无 git 目录时 git 工具应禁用")
+    t.false_(vim.tbl_contains(names_no_git, "git_diff"), "无 git 目录时 git 工具应禁用")
+
+    local names_restored = def_names()
+    t.eq(env.git_available(), vim.tbl_contains(names_restored, "git_status"),
+      "git 工具暴露与否应与 git 环境一致")
+  end)
 end)

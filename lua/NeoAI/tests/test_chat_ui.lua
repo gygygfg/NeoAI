@@ -192,6 +192,41 @@ tests.suite("chat_ui", function(_, it)
     chat_service.reset()
   end)
 
+  it("子 Agent 完成不触发主界面光标回输入框（仅主 Agent 生效）", function(t)
+    local chat_view = require("NeoAI.ui.window.chat_view")
+    local chat_service = require("NeoAI.services.chat_service")
+    local input_box = require("NeoAI.ui.components.input_box")
+    local event_bus = require("NeoAI.kernel.event_bus")
+    local events = require("NeoAI.kernel.events")
+    chat_view.reset()
+    chat_service.reset()
+
+    local opened = chat_view.open()
+    local agent = chat_service.get_current_agent()
+    t.true_(opened.win_id and vim.api.nvim_win_is_valid(opened.win_id), "应创建聊天窗口")
+
+    local focus_calls = 0
+    local orig_focus = input_box.focus
+    input_box.focus = function()
+      focus_calls = focus_calls + 1
+      return orig_focus()
+    end
+
+    -- 子 Agent 完成（agent_id 与主 Agent 不同）：不应把光标拽回输入框
+    event_bus.emit(events.GENERATION_COMPLETED, { agent_id = "sub_agent_xyz" })
+    event_bus.emit(events.GENERATION_ERROR, { agent_id = "sub_agent_xyz", error = "boom" })
+    event_bus.emit(events.AGENT_ABORTED, { agent_id = "sub_agent_xyz" })
+    t.eq(0, focus_calls, "子 Agent 完成/失败/取消不应调用 input_box.focus")
+
+    -- 主 Agent 完成：才应把光标移回输入框
+    event_bus.emit(events.GENERATION_COMPLETED, { agent_id = agent.id })
+    t.eq(1, focus_calls, "仅主 Agent 完成应调用 input_box.focus")
+
+    input_box.focus = orig_focus
+    chat_view.reset()
+    chat_service.reset()
+  end)
+
   it("多行工具结果可渲染且不中断聊天窗口", function(t)
     local message_list = require("NeoAI.ui.components.message_list")
     local chat_view = require("NeoAI.ui.window.chat_view")
@@ -784,6 +819,143 @@ tests.suite("chat_ui", function(_, it)
     -- 重新打开聊天时，即使窗口曾被切走，也应把聊天 buffer 绑回聊天窗口
     chat_view.open()
     t.eq(opened.buf, vim.api.nvim_win_get_buf(opened.win_id), "重新打开聊天时应把聊天 buffer 绑回聊天窗口")
+
+    chat_view.reset()
+    chat_service.reset()
+  end)
+
+  it("工具执行中折叠文本实时刷新耗时（回归 timer_start 竞态）", function(t)
+    local chat_view = require("NeoAI.ui.window.chat_view")
+    local chat_service = require("NeoAI.services.chat_service")
+    local event_bus = require("NeoAI.kernel.event_bus")
+    local events = require("NeoAI.kernel.events")
+    chat_view.reset()
+    chat_service.reset()
+
+    local opened = chat_view.open()
+    local agent = chat_service.get_current_agent()
+    agent.messages = {
+      { role = "user", content = "跑命令" },
+      { role = "assistant", content = "", tool_calls = {
+        { id = "c_tick_1", ["function"] = { name = "run_command", arguments = "{}" } },
+      } },
+    }
+    chat_view.refresh()
+    event_bus.emit(events.TOOL_EXECUTION_STARTED, {
+      agent_id = agent.id, name = "run_command", tool_call_id = "c_tick_1",
+    })
+
+    local function tool_time()
+      for _, l in ipairs(vim.api.nvim_buf_get_lines(opened.buf, 0, -1, false)) do
+        -- 执行中为 "⏳ 调用工具: run_command(...) · X"，完成后为 "✅ 工具: run_command · X"
+        if l:find("run_command", 1, true) and l:find("工具", 1, true) then
+          return l:match("· ([%d%.]+%a*)")
+        end
+      end
+      return nil
+    end
+
+    local tm0 = tool_time()
+    t.not_nil(tm0, "开始执行时应显示耗时（可为 0ms）")
+
+    -- 等待超过一个 tick 间隔（1000ms）：此前 timer_start(..., {}) 传入空 Lua 表
+    -- 被转成 vim 列表触发 E1206，tick 静默失败，耗时停留在 0ms 不实时更新。
+    local done, refreshed = false, false
+    vim.defer_fn(function() done = true end, 1300)
+    vim.wait(4000, function()
+      if done then
+        local tm = tool_time()
+        if tm and tm ~= tm0 and tm ~= "0ms" then
+          refreshed = true
+        end
+        return true
+      end
+      return false
+    end)
+    t.true_(refreshed, "工具执行中折叠文本应实时刷新耗时（而非停留在 0ms）")
+
+    event_bus.emit(events.TOOL_EXECUTION_COMPLETED, {
+      agent_id = agent.id, name = "run_command", tool_call_id = "c_tick_1", duration_ms = 1500,
+    })
+    t.matches("1%.5s", tool_time() or "", "完成后折叠文本应显示总耗时")
+
+    chat_view.reset()
+    chat_service.reset()
+  end)
+
+  it("思考悬浮窗禁用折叠（不被全局 fold 收起内容）", function(t)
+    local reasoning_panel = require("NeoAI.ui.components.reasoning_panel")
+    reasoning_panel.reset()
+    -- 模拟用户全局开启折叠：minimal 浮窗会继承 foldenable/foldmethod
+    local prev_foldenable, prev_foldmethod = vim.o.foldenable, vim.o.foldmethod
+    vim.o.foldenable = true
+    vim.o.foldmethod = "indent"
+
+    reasoning_panel.show("  step one\n  step two")
+    local found = false
+    for _, win in ipairs(vim.api.nvim_list_wins()) do
+      local buf = vim.api.nvim_win_get_buf(win)
+      if vim.bo[buf].filetype == "neoai_reasoning" then
+        found = true
+        t.false_(vim.wo[win].foldenable, "思考悬浮窗应关闭 foldenable")
+        t.eq("manual", vim.wo[win].foldmethod, "思考悬浮窗 foldmethod 应为 manual")
+        local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+        t.eq("  step one", lines[1], "推理内容应完整可见（不被折叠收起）")
+        t.eq("  step two", lines[2], "推理内容应完整可见（不被折叠收起）")
+        break
+      end
+    end
+    t.true_(found, "应创建思考悬浮窗")
+
+    vim.o.foldenable, vim.o.foldmethod = prev_foldenable, prev_foldmethod
+    reasoning_panel.reset()
+  end)
+
+  it("每个工具完成即各自更新状态（并发工具不互相等待）", function(t)
+    local chat_view = require("NeoAI.ui.window.chat_view")
+    local chat_service = require("NeoAI.services.chat_service")
+    local event_bus = require("NeoAI.kernel.event_bus")
+    local events = require("NeoAI.kernel.events")
+    chat_view.reset()
+    chat_service.reset()
+
+    local opened = chat_view.open()
+    local agent = chat_service.get_current_agent()
+    agent.messages = {
+      { role = "user", content = "查一下" },
+      { role = "assistant", content = "", tool_calls = {
+        { id = "a", ["function"] = { name = "lsp_type_definition", arguments = "{}" } },
+        { id = "b", ["function"] = { name = "lsp_implementation", arguments = "{}" } },
+      } },
+    }
+    chat_view.refresh()
+
+    local function status_of(name)
+      for _, l in ipairs(vim.api.nvim_buf_get_lines(opened.buf, 0, -1, false)) do
+        if l:find(name, 1, true) and l:find("工具", 1, true) then
+          if l:find("✅", 1, true) then return "success" end
+          if l:find("❌", 1, true) then return "failure" end
+          return "running"
+        end
+      end
+      return nil
+    end
+
+    event_bus.emit(events.TOOL_EXECUTION_STARTED, { agent_id = agent.id, tool_call_id = "a" })
+    event_bus.emit(events.TOOL_EXECUTION_STARTED, { agent_id = agent.id, tool_call_id = "b" })
+    t.eq("running", status_of("lsp_type_definition"), "刚启动时应为执行中")
+    t.eq("running", status_of("lsp_implementation"), "刚启动时应为执行中")
+
+    -- 只完成 a：a 应立即更新为 ✅，b 仍为 ⏳（此前 a 会一直停在 ⏳ 等整批结果落库）
+    event_bus.emit(events.TOOL_EXECUTION_COMPLETED, { agent_id = agent.id, tool_call_id = "a", duration_ms = 89 })
+    t.eq("success", status_of("lsp_type_definition"), "单个工具完成应立即更新为 ✅")
+    t.matches("89ms", table.concat(vim.api.nvim_buf_get_lines(opened.buf, 0, -1, false), "\n"),
+      "已完成工具应锁定总耗时")
+    t.eq("running", status_of("lsp_implementation"), "未完成的工具应保持 ⏳")
+
+    -- b 失败：应立即更新为 ❌
+    event_bus.emit(events.TOOL_EXECUTION_ERROR, { agent_id = agent.id, tool_call_id = "b", error = "timeout", duration_ms = 500 })
+    t.eq("failure", status_of("lsp_implementation"), "单个工具失败应立即更新为 ❌")
 
     chat_view.reset()
     chat_service.reset()

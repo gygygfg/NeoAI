@@ -115,13 +115,13 @@ local function _tool_tick()
   if not M.has_window() then return end
   _render()
   if fold.has_running() then
-    state.tool_tick = vim.fn.timer_start(TOOL_TICK_MS, _tool_tick, {})
+    state.tool_tick = vim.fn.timer_start(TOOL_TICK_MS, _tool_tick, vim.empty_dict())
   end
 end
 
 local function _schedule_tool_tick()
   if state.tool_tick then return end
-  state.tool_tick = vim.fn.timer_start(TOOL_TICK_MS, _tool_tick, {})
+  state.tool_tick = vim.fn.timer_start(TOOL_TICK_MS, _tool_tick, vim.empty_dict())
 end
 
 --- 工具开始执行：记录开始时间并启动折叠文本耗时刷新
@@ -135,12 +135,14 @@ local function _on_tool_started(payload)
   _schedule_tool_tick()
 end
 
---- 工具执行结束：记录总耗时；全部结束后停止刷新
+--- 工具执行结束：记录总耗时与状态；全部结束后停止刷新
 --- @param payload table
 local function _on_tool_finished(payload)
   if not payload or payload.agent_id ~= state.agent_id then return end
   if payload.tool_call_id then
-    fold.record_end(payload.tool_call_id, payload.duration_ms)
+    -- 每个工具完成即各自更新状态（结果消息要等整批 async.all 落库，这里先记下）
+    local status = payload.error ~= nil and "failure" or "success"
+    fold.record_end(payload.tool_call_id, payload.duration_ms, status)
   end
   _render()
   if not fold.has_running() then
@@ -185,7 +187,11 @@ end
 --- @param payload table
 local function _on_agent_end(payload)
   _on_generation_finished(payload)
-  _focus_input_insert()
+  -- 仅主 Agent 结束才把光标移回输入框：子 Agent 完成/失败/取消也会携带
+  -- 自己的 agent_id 发射 GENERATION_COMPLETED 等事件，不能触发主界面的焦点动作。
+  if payload and payload.agent_id == state.agent_id then
+    _focus_input_insert()
+  end
 end
 
 --- 提交输入

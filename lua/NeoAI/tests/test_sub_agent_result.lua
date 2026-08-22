@@ -62,4 +62,44 @@ tests.suite("sub_agent_result", function(_, it)
     t.matches("状态", out.msg or "")
     t.matches("工具调用", out.msg or "")
   end)
+
+  it("create_sub_agent 不因 _allowed_tools 全局缺失而崩溃（回归）", function(t)
+    local plan = require("NeoAI.tools.builtin.plan")
+    local runtime = require("NeoAI.core.agent.runtime")
+    local async = require("NeoAI.utils.async")
+    plan.reset()
+    -- stub runtime.spawn/run 避免真实启动子 Agent
+    local orig_spawn, orig_run = runtime.spawn, runtime.run
+    runtime.spawn = function(_, opts)
+      return { id = "fake_sub", tools = {}, messages = {} }
+    end
+    runtime.run = function(_, _)
+      return async.resolve({ content = "done" })
+    end
+
+    local tool
+    for _, tl in ipairs(plan.get_tools()) do
+      if tl.name == "create_sub_agent" then tool = tl break end
+    end
+    t.not_nil(tool, "应注册 create_sub_agent 工具")
+
+    local out = {}
+    local ok, err = pcall(tool.func, { task = "t", mode = "background" },
+      function(m) out.msg = m end, function(e) out.err = e end,
+      { agent = { id = "parent" } })
+    t.true_(ok, "create_sub_agent 不应抛错（此前调用全局 _allowed_tools 崩溃），实际: " .. tostring(err))
+    t.nil_(out.err, "create_sub_agent 不应返回错误")
+    t.matches("已创建", out.msg or "")
+
+    -- 前台模式同样不崩溃
+    local out2 = {}
+    local ok2, err2 = pcall(tool.func, { task = "fg", mode = "foreground" },
+      function(m) out2.msg = m end, function(e) out2.err = e end,
+      { agent = { id = "parent" } })
+    t.true_(ok2, "前台模式 create_sub_agent 不应抛错，实际: " .. tostring(err2))
+    t.nil_(out2.err, "前台模式 create_sub_agent 不应返回错误")
+
+    runtime.spawn, runtime.run = orig_spawn, orig_run
+    plan.reset()
+  end)
 end)

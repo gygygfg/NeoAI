@@ -36,6 +36,11 @@ function M.open(title)
     title_pos = "center",
   })
   vim.wo[state.win_id].wrap = true
+  -- 思考过程悬浮窗内容禁止折叠：minimal 浮窗会继承全局 foldenable/foldmethod
+  -- （如用户的 foldmethod=indent + foldenable），导致推理内容被自动收起而看不到。
+  vim.wo[state.win_id].foldenable = false
+  vim.wo[state.win_id].foldmethod = "manual"
+  vim.wo[state.win_id].foldcolumn = "0"
   return state.win_id
 end
 

@@ -140,7 +140,16 @@ local function _append_tool_block(lines, tool_call, result_msg)
       local failed = _tool_result_failed(result_msg.content)
       rows[#rows + 1] = string.format("%s 工具: %s%s", failed and "❌" or "✅", name, time_str)
     else
-      rows[#rows + 1] = string.format("⏳ 调用工具: %s(%s)%s", name, fn.arguments or "", time_str)
+      -- 结果消息未到达时按各自执行状态渲染（fold 计时记录了每个工具的开始/结束状态）：
+      -- 已完成的工具立即显示 ✅/❌ 并锁定总耗时，仍在执行的显示 ⏳ + 实时耗时。
+      local status = fold.get_status(tool_call.id)
+      if status == "success" then
+        rows[#rows + 1] = string.format("✅ 工具: %s%s", name, time_str)
+      elseif status == "failure" then
+        rows[#rows + 1] = string.format("❌ 工具: %s%s", name, time_str)
+      else
+        rows[#rows + 1] = string.format("⏳ 调用工具: %s(%s)%s", name, fn.arguments or "", time_str)
+      end
     end
   end
   if result_msg then

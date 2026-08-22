@@ -16,8 +16,8 @@ local STATUS_EMOJI = {
 }
 
 -- ========== 工具执行计时 ==========
--- tool_call_id -> { start_ms?, duration_ms? }
--- 执行中只记 start_ms，完成后记 duration_ms。
+-- tool_call_id -> { start_ms?, duration_ms?, status? }
+-- 执行中只记 start_ms，完成后记 duration_ms 与状态（success/failure）。
 -- 由 chat_view 在 TOOL_EXECUTION_STARTED/COMPLETED/ERROR 事件中写入。
 
 local timing = {}
@@ -29,18 +29,20 @@ end
 --- 记录工具开始执行
 --- @param tool_call_id string
 function M.record_start(tool_call_id)
-  timing[tool_call_id] = { start_ms = _now_ms(), duration_ms = nil }
+  timing[tool_call_id] = { start_ms = _now_ms(), duration_ms = nil, status = "running" }
 end
 
 --- 记录工具执行结束
 --- @param tool_call_id string
 --- @param duration_ms number|nil
-function M.record_end(tool_call_id, duration_ms)
+--- @param status string|nil "success" | "failure"（默认 success）
+function M.record_end(tool_call_id, duration_ms, status)
   local rec = timing[tool_call_id]
   if rec then
     rec.duration_ms = duration_ms
+    rec.status = status or "success"
   else
-    timing[tool_call_id] = { start_ms = nil, duration_ms = duration_ms }
+    timing[tool_call_id] = { start_ms = nil, duration_ms = duration_ms, status = status or "success" }
   end
 end
 
@@ -54,6 +56,17 @@ function M.get_duration(tool_call_id)
   if rec.duration_ms then return rec.duration_ms end
   if rec.start_ms then return _now_ms() - rec.start_ms end
   return nil
+end
+
+--- 工具状态：执行中 running / 成功 success / 失败 failure
+--- 供渲染在工具结果消息到达前也能按各自状态更新折叠文本。
+--- @param tool_call_id string|nil
+--- @return string|nil
+function M.get_status(tool_call_id)
+  if not tool_call_id then return nil end
+  local rec = timing[tool_call_id]
+  if not rec then return nil end
+  return rec.status or (rec.duration_ms and "success" or "running")
 end
 
 --- 是否仍有工具在执行（用于驱动折叠文本的定时刷新）
