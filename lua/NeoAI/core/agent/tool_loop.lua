@@ -58,6 +58,8 @@ local function _execute_single(agent, tool_call, tool_service, opts)
   local name = fn and fn.name or "unknown"
   local args = _parse_arguments(fn and fn.arguments or "{}")
   local start_ms = vim.uv.hrtime() / 1e6
+  local logger = require("NeoAI.kernel.logger")
+  logger.warn("[tool_loop] 执行工具 %s round=%s", name, tostring(agent._round_seq or ""))
 
   event_bus.emit(events.TOOL_EXECUTION_STARTED, {
     agent_id = agent.id, name = name, args = args, tool_call_id = tool_call.id,
@@ -68,6 +70,7 @@ local function _execute_single(agent, tool_call, tool_service, opts)
     signal = agent.signal,
   }):then_(function(result)
     local duration_ms = vim.uv.hrtime() / 1e6 - start_ms
+    logger.warn("[tool_loop] 工具完成 %s 耗时 %dms", name, math.floor(duration_ms))
     local result_str = result
     if type(result) ~= "string" then
       local json = require("NeoAI.utils.json")
@@ -80,6 +83,8 @@ local function _execute_single(agent, tool_call, tool_service, opts)
     return { tool_call_id = tool_call.id, name = name, result_str = result_str, duration_ms = duration_ms }
   end, function(err)
     local duration_ms = vim.uv.hrtime() / 1e6 - start_ms
+    local logger = require("NeoAI.kernel.logger")
+    logger.warn("[tool_loop] 工具失败 %s 耗时 %dms err=%s", name, math.floor(duration_ms), tostring(err and err.message or err))
     local json = require("NeoAI.utils.json")
     local err_msg = type(err) == "table" and (err.message or json.encode(err)) or tostring(err)
     local result_str = json.encode({ error = err_msg, tool = name })
@@ -135,11 +140,20 @@ end
 local function _send_round(agent)
   local recovery = require("NeoAI.core.agent.recovery")
   local proc = stream_mod.create(agent)
+  local start_ms = vim.uv.hrtime() / 1e6
+  local first_chunk_ms = nil
+  agent._round_seq = (agent._round_seq or 0) + 1
+  local round_seq = agent._round_seq
   return recovery.send_stream(agent, {
     agent_config = agent.config,
     model = agent.model,
     signal = agent.signal,
   }, function(chunk)
+    if chunk and first_chunk_ms == nil then
+      first_chunk_ms = vim.uv.hrtime() / 1e6
+      local logger = require("NeoAI.kernel.logger")
+      logger.warn("[tool_loop] 本轮首 token 延迟 %dms round=%d", math.floor(first_chunk_ms - start_ms), round_seq)
+    end
     if chunk then proc.process(chunk) end
   end):then_(function(response)
     -- 内容已由 on_chunk 增量写入 agent，这里仅终结工具调用

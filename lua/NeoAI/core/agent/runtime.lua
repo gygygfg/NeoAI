@@ -97,11 +97,18 @@ local function _run_generation(agent, opts)
   end
 
   local function _run()
+    local start_ms = vim.uv.hrtime() / 1e6
+    local first_chunk_ms = nil
     return recovery.send_stream(agent, {
       agent_config = agent.config,
       model = agent.model,
       signal = agent.signal,
     }, function(chunk)
+      if chunk and first_chunk_ms == nil then
+        first_chunk_ms = vim.uv.hrtime() / 1e6
+        local logger = require("NeoAI.kernel.logger")
+        logger.warn("[runtime] 首 token 延迟 %dms", math.floor(first_chunk_ms - start_ms))
+      end
       if chunk then proc.process(chunk) end
     end):then_(function(response)
       -- 内容已由 on_chunk 增量写入 agent，这里仅终结工具调用

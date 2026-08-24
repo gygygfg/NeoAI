@@ -341,7 +341,11 @@ local function _on_submit(content)
   -- 发送后切回主窗口并进入普通模式：生成期间可随时滚动查看流式输出
   _focus_main_normal()
   chat_service.send_message(content):catch(function(e)
-    vim.notify("[NeoAI] 发送失败: " .. tostring(e.message or e), vim.log.levels.ERROR)
+    local msg = tostring(e.message or e)
+    if type(e.body) == "string" and e.body ~= "" then
+      msg = msg .. "\n" .. e.body
+    end
+    vim.notify("[NeoAI] 发送失败: " .. msg, vim.log.levels.ERROR)
     input_box.on_submitted()
   end)
 end

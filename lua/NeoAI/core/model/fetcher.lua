@@ -35,7 +35,8 @@ local function _fetch_provider(provider_name, provider, opts)
   end
   local timeout_ms = opts.timeout_ms or config_store.get("ai.model_refresh.timeout_ms") or 10000
 
-  local attempt = function(n)
+  local attempt
+  attempt = function(n)
     return http.request({
       base_url = provider.base_url,
       path = a.models_path(provider),
