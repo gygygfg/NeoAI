@@ -6,6 +6,7 @@ local markdown_view = require("NeoAI.ui.components.markdown_view")
 local stringx = require("NeoAI.utils.stringx")
 local fold = require("NeoAI.ui.components.fold")
 local config_store = require("NeoAI.kernel.config_store")
+local json = require("NeoAI.utils.json")
 
 local M = {}
 
@@ -121,10 +122,91 @@ local function _tool_result_failed(content)
   return decoded.error ~= nil
 end
 
+--- 提取工具调用的目的说明（description 参数）
+--- @param fn table tool_call["function"]
+--- @return string|nil
+local function _tool_description(fn)
+  if not fn or type(fn.arguments) ~= "string" or fn.arguments == "" then return nil end
+  local json = require("NeoAI.utils.json")
+  local decoded = json.decode_or_nil(fn.arguments)
+  if type(decoded) ~= "table" then return nil end
+  local desc = decoded.description
+  if type(desc) ~= "string" or desc == "" then return nil end
+  -- 折叠文本单行展示：折行/换行压缩为空格
+  desc = desc:gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
+  if desc == "" then return nil end
+  return desc
+end
+
+--- 递归将 JSON 值格式化为带缩进的多行文本（数组/对象均结构化展示）。
+--- @param value any
+--- @param indent number
+--- @return string
+local function _pretty_json(value, indent)
+  indent = indent or 0
+  local pad = string.rep("  ", indent)
+  if type(value) ~= "table" then
+    return json.encode(value)
+  end
+  if not next(value) then return "{}" end
+  -- 数组判断：键为 1..n 的连续整数序列（#value > 0 才可能是数组，避免把字符串键对象误判）
+  local is_array = #value > 0
+  if is_array then
+    for i = 1, #value do
+      if value[i] == nil then is_array = false break end
+    end
+  end
+  if is_array then
+    local parts = {}
+    for i = 1, #value do
+      parts[i] = pad .. "  " .. _pretty_json(value[i], indent + 1)
+    end
+    return "[\n" .. table.concat(parts, ",\n") .. "\n" .. pad .. "]"
+  end
+  local parts = {}
+  local n = 0
+  for k, v in pairs(value) do
+    n = n + 1
+    parts[n] = pad .. "  " .. json.encode(k) .. ": " .. _pretty_json(v, indent + 1)
+  end
+  return "{\n" .. table.concat(parts, ",\n") .. "\n" .. pad .. "}"
+end
+
+--- 工具调用参数的结构化展示行（解析 JSON，剔除 description 样板字段后缩进展示）。
+--- @param fn table tool_call["function"]
+--- @return table|nil 行数组（无参数时 nil）
+local function _tool_arguments_lines(fn)
+  if not fn or type(fn.arguments) ~= "string" or fn.arguments == "" then return nil end
+  local decoded = json.decode_or_nil(fn.arguments)
+  if decoded == nil then return { fn.arguments } end
+  if type(decoded) == "table" then
+    local filtered = {}
+    for k, v in pairs(decoded) do
+      if k ~= "description" then filtered[k] = v end
+    end
+    if not next(filtered) then return nil end
+    return _split_lines(stringx.truncate(_pretty_json(filtered), 500))
+  end
+  return { json.encode(decoded) }
+end
+
+--- 工具结果的结构化展示行（JSON 内容解析后多行缩进展示，非 JSON 原样截断展示）。
+--- @param content string|nil
+--- @return table 行数组
+local function _result_lines(content)
+  if not content or content == "" then return { "(空)" } end
+  local decoded = json.decode_or_nil(content)
+  if type(decoded) == "table" then
+    return _split_lines(stringx.truncate(_pretty_json(decoded), 500))
+  end
+  return _split_lines(stringx.truncate(content, 500))
+end
+
 --- 追加单个工具块（调用 + 结果合并成一个折叠块）。
 --- 块首行即状态标记：执行中显示 ⏳（无结果），结果到达后更新为 ✅（成功）或 ❌（失败），
 --- 折叠文本（foldtext）按首行 emoji 自动切换图标。结果未到达时只显示首行（仍可折叠）。
---- 首行追加耗时（" · 1.2s"）：执行中显示已执行时长，完成后显示总时长（由 fold 计时提供）。
+--- 首行在工具名后展示目的说明（" · 修改配置"），随后追加耗时（" · 1.2s"）：
+--- 执行中显示已执行时长，完成后显示总时长（由 fold 计时提供）。
 --- @param lines table
 --- @param tool_call table
 --- @param result_msg table|nil 对应的工具结果消息
@@ -133,28 +215,39 @@ local function _append_tool_block(lines, tool_call, result_msg)
   local rows = {}
   if fn then
     local name = fn.name or ""
+    local desc = _tool_description(fn)
+    local desc_str = desc and (" · " .. desc) or ""
     -- 已完成工具优先用结果消息里持久化的总时长；执行中/无持久化时回退 fold 计时
     local duration = (result_msg and result_msg.duration_ms) or fold.get_duration(tool_call.id)
     local time_str = duration and (" · " .. fold.format_ms(duration)) or ""
     if result_msg then
       local failed = _tool_result_failed(result_msg.content)
-      rows[#rows + 1] = string.format("%s 工具: %s%s", failed and "❌" or "✅", name, time_str)
+      rows[#rows + 1] = string.format("%s 工具: %s%s%s", failed and "❌" or "✅", name, desc_str, time_str)
     else
       -- 结果消息未到达时按各自执行状态渲染（fold 计时记录了每个工具的开始/结束状态）：
       -- 已完成的工具立即显示 ✅/❌ 并锁定总耗时，仍在执行的显示 ⏳ + 实时耗时。
       local status = fold.get_status(tool_call.id)
       if status == "success" then
-        rows[#rows + 1] = string.format("✅ 工具: %s%s", name, time_str)
+        rows[#rows + 1] = string.format("✅ 工具: %s%s%s", name, desc_str, time_str)
       elseif status == "failure" then
-        rows[#rows + 1] = string.format("❌ 工具: %s%s", name, time_str)
+        rows[#rows + 1] = string.format("❌ 工具: %s%s%s", name, desc_str, time_str)
       else
-        rows[#rows + 1] = string.format("⏳ 调用工具: %s(%s)%s", name, fn.arguments or "", time_str)
+        rows[#rows + 1] = string.format("⏳ 调用工具: %s%s%s", name, desc_str, time_str)
       end
     end
   end
+  -- 结构化调用参数：无论工具最终成功/失败，展开折叠都能看到本次调用传了哪些参数
+  local arg_lines = _tool_arguments_lines(fn)
+  if arg_lines then
+    rows[#rows + 1] = "参数:"
+    for _, l in ipairs(arg_lines) do
+      rows[#rows + 1] = l
+    end
+  end
+  -- 结构化执行结果：成功/失败都有对应的结果内容（失败时通常为 error 对象）
   if result_msg then
-    -- 工具结果常为多行（如 shell 输出 / 文件内容），逐行追加避免换行符进入单行
-    for _, l in ipairs(_split_lines(stringx.truncate(result_msg.content or "", 500))) do
+    rows[#rows + 1] = "结果:"
+    for _, l in ipairs(_result_lines(result_msg.content)) do
       rows[#rows + 1] = l
     end
   end

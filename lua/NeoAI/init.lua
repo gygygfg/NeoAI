@@ -77,6 +77,25 @@ local function _register_commands()
     local active = chat_service.toggle_auto_mode()
     vim.notify("[NeoAI] AUTO 模式（自动允许所有工具调用）已" .. (active and "开启" or "关闭"), vim.log.levels.INFO)
   end, { desc = "切换AUTO模式（自动允许所有工具调用）", force = true })
+
+  vim.api.nvim_create_user_command("NeoAIApprovePlan", function()
+    local chat_service = require("NeoAI.services.chat_service")
+    local function report(result)
+      if result and result.approved then
+        vim.notify(("[NeoAI] 计划已确认，已转入 CHAT 模式，任务清单 %d 项"):format(result.todo_count or 0), vim.log.levels.INFO)
+      else
+        vim.notify("[NeoAI] 确认计划失败: " .. tostring(result and result.error or "未知错误"), vim.log.levels.WARN)
+      end
+    end
+    local result = chat_service.approve_plan()
+    if result and result.then_ then
+      result:then_(report, function(err)
+        vim.notify("[NeoAI] 确认计划失败: " .. tostring(err and err.message or err), vim.log.levels.WARN)
+      end)
+    else
+      report(result)
+    end
+  end, { desc = "确认计划并转入 CHAT 执行", force = true })
 end
 
 --- 注册全局快捷键（从 config_store 读取）

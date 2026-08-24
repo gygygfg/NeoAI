@@ -183,6 +183,7 @@ local DEFAULT_CONFIG = {
       toggle_reasoning = { key = "r", desc = "切换思考过程显示" },
       switch_model = { key = "M", desc = "切换模型" },
       cycle_mode = { key = "m", desc = "循环切换模式（CHAT/PLAN/AUTO）" },
+      approve_plan = { key = "P", desc = "确认计划并转入 CHAT 执行" },
       tool_approval = { key = "<C-a>", desc = "工具审批" },
       approval = {
         confirm = { key = "<CR>", desc = "允许一次" },
@@ -224,7 +225,9 @@ local DEFAULT_CONFIG = {
     },
     plan_mode = {
       enabled = true, -- 计划模式
-      mutating_tools = {
+      auto_execute_on_approve = true, -- 计划经用户确认后自动转入 CHAT 并按任务清单开始执行
+      extra_safe_tools = {}, -- 计划模式白名单扩展（只读/信息查询类之外的工具需显式加入）
+      mutating_tools = { -- 兼容保留（计划模式可见集已覆盖此语义）
         "edit_file",
         "delete_file",
         "create_directory",

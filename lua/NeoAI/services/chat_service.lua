@@ -2,6 +2,7 @@
 --- @module NeoAI.services.chat_service
 --- 前后端桥梁。UI 通过此服务发送消息、绑定/解绑窗口。
 --- - send_message(content)：创建或复用当前 Agent 并发送
+--- - approve_plan()：用户确认计划 → 任务清单 + 转入 CHAT
 --- - attach_window(win_id, agent)：绑定窗口到 Agent
 --- - detach_window(win_id)：解绑（窗口关闭时调用，持久化会话）
 
@@ -14,6 +15,9 @@ local event_bus = require("NeoAI.kernel.event_bus")
 local events = require("NeoAI.kernel.events")
 
 local M = {}
+
+-- 计划确认后自动执行时注入的用户消息（代表用户的确认指令）
+local APPROVE_EXECUTE_MESSAGE = "计划已确认，请按任务清单逐项开始执行。"
 
 -- ========== 私有状态 ==========
 
@@ -217,6 +221,60 @@ function M.toggle_plan_mode()
   if not agent then return nil end
   local plan_mode = require("NeoAI.tools.builtin.plan_mode")
   return plan_mode.toggle(agent)
+end
+
+--- 用户确认计划：解析计划为任务清单（todo）→ 退出计划模式（直接转入 CHAT）→ 可选自动执行。
+--- 计划文本取自 agent.plan 或最后一条 assistant 消息（AI 在计划模式下输出的格式化计划）。
+--- @param opts table|nil { auto_execute? boolean 覆盖配置 tools.plan_mode.auto_execute_on_approve }
+--- @return table|Deferred 未自动执行时返回 { approved, plan, todo_count, error? }；
+---   自动执行时返回 Deferred（resolve 同样的表）
+function M.approve_plan(opts)
+  opts = opts or {}
+  local agent = M.get_current_agent()
+  if not agent then
+    return { approved = false, error = "无当前 Agent" }
+  end
+  local plan_mode = require("NeoAI.tools.builtin.plan_mode")
+  if not plan_mode.is_active(agent) then
+    return { approved = false, error = "当前不在计划模式，无法确认计划" }
+  end
+  local plan = agent.plan
+  if not plan or plan == "" then
+    local last = agent.messages[#agent.messages]
+    if last and last.role == "assistant" and last.content and last.content ~= "" then
+      plan = last.content
+    end
+  end
+  if not plan or plan == "" then
+    return { approved = false, error = "未找到计划内容（AI 尚未输出计划）" }
+  end
+
+  -- 计划 → 任务清单
+  local todo_mod = require("NeoAI.tools.builtin.todo")
+  local items = plan_mode.plan_to_todos(plan)
+  local session_id = agent.session_id
+  if #items > 0 then
+    todo_mod.seed(session_id, items)
+    event_bus.emit(events.TODO_UPDATED, { session_id = session_id, count = #items })
+  end
+
+  agent.plan = plan
+  plan_mode.exit(agent) -- 直接转入 CHAT 模式
+  _persist_agent(agent)
+
+  local auto = opts.auto_execute
+  if auto == nil then
+    auto = config_store.get("tools.plan_mode.auto_execute_on_approve") ~= false
+  end
+  if auto and #items > 0 then
+    -- 自动执行：以确认指令驱动一轮生成，AI 按任务清单（todo）开始工作
+    return M.send_message(APPROVE_EXECUTE_MESSAGE):then_(function(resp)
+      return { approved = true, plan = plan, todo_count = #items, message = resp }
+    end, function(err)
+      return { approved = true, plan = plan, todo_count = #items, error = tostring(err and err.message or err) }
+    end)
+  end
+  return { approved = true, plan = plan, todo_count = #items }
 end
 
 --- 切换 AUTO 模式（自动允许所有工具调用，全局运行期开关）

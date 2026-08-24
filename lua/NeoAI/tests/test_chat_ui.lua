@@ -70,6 +70,7 @@ tests.suite("chat_ui", function(_, it)
     local agent = chat_service.get_current_agent()
     event_bus.emit(events.REASONING_CHUNK, { agent_id = agent.id, chunk = "first ", reasoning = "first " })
     event_bus.emit(events.REASONING_CHUNK, { agent_id = agent.id, chunk = "step", reasoning = "first step" })
+    chat_view.flush()
     t.true_(reasoning_panel.is_open(), "收到推理分片时应打开悬浮窗")
     for _, win in ipairs(vim.api.nvim_list_wins()) do
       local buf = vim.api.nvim_win_get_buf(win)
@@ -83,12 +84,14 @@ tests.suite("chat_ui", function(_, it)
     t.false_(reasoning_panel.is_open(), "推理完成时应关闭悬浮窗")
 
     event_bus.emit(events.REASONING_CHUNK, { agent_id = agent.id, chunk = "second step", reasoning = "second step" })
+    chat_view.flush()
     t.true_(reasoning_panel.is_open(), "后续推理分片仍应打开悬浮窗")
 
     event_bus.emit(events.MESSAGE_UPDATED, {
       agent_id = agent.id,
       message = { role = "assistant", content = "answer" },
     })
+    chat_view.flush()
     t.false_(reasoning_panel.is_open(), "正文开始输出时应关闭悬浮窗")
 
     chat_view.reset()
@@ -458,6 +461,7 @@ tests.suite("chat_ui", function(_, it)
     local last = agent.messages[#agent.messages]
     last.content = last.content .. "\n流式新内容"
     event_bus.emit(events.MESSAGE_UPDATED, { agent_id = agent.id, message = last })
+    chat_view.flush()
 
     local cur_after = vim.api.nvim_win_get_cursor(opened.win_id)
     t.eq(2, cur_after[1], "光标不在最后 5 行时流式更新不应移动光标")
@@ -468,6 +472,7 @@ tests.suite("chat_ui", function(_, it)
     vim.api.nvim_win_set_cursor(opened.win_id, { total_after, 0 })
     last.content = last.content .. "\n更多内容"
     event_bus.emit(events.MESSAGE_UPDATED, { agent_id = agent.id, message = last })
+    chat_view.flush()
 
     local final_total = vim.api.nvim_buf_line_count(opened.buf)
     local final_cur = vim.api.nvim_win_get_cursor(opened.win_id)
@@ -507,6 +512,7 @@ tests.suite("chat_ui", function(_, it)
     for i = 1, 15 do ls[#ls + 1] = "结果行 " .. i end
     result.content = table.concat(ls, "\n")
     event_bus.emit(events.MESSAGE_UPDATED, { agent_id = agent.id, message = result })
+    chat_view.flush()
 
     local cur = vim.api.nvim_win_get_cursor(opened.win_id)
     local line_count = vim.api.nvim_buf_line_count(opened.buf)
@@ -807,6 +813,7 @@ tests.suite("chat_ui", function(_, it)
     local agent = chat_service.get_current_agent()
     agent.messages = { { role = "assistant", content = "streamed answer", reasoning = "folded thought" } }
     event_bus.emit(events.MESSAGE_UPDATED, { agent_id = agent.id, message = agent.messages[1] })
+    chat_view.flush()
 
     -- 聊天 buffer 应收到流式文本与推理折叠块
     local chat_text = table.concat(vim.api.nvim_buf_get_lines(opened.buf, 0, -1, false), "\n")
@@ -844,6 +851,7 @@ tests.suite("chat_ui", function(_, it)
     event_bus.emit(events.TOOL_EXECUTION_STARTED, {
       agent_id = agent.id, name = "run_command", tool_call_id = "c_tick_1",
     })
+    chat_view.flush()
 
     local function tool_time()
       for _, l in ipairs(vim.api.nvim_buf_get_lines(opened.buf, 0, -1, false)) do
@@ -877,7 +885,46 @@ tests.suite("chat_ui", function(_, it)
     event_bus.emit(events.TOOL_EXECUTION_COMPLETED, {
       agent_id = agent.id, name = "run_command", tool_call_id = "c_tick_1", duration_ms = 1500,
     })
+    chat_view.flush()
     t.matches("1%.5s", tool_time() or "", "完成后折叠文本应显示总耗时")
+
+    chat_view.reset()
+    chat_service.reset()
+  end)
+
+  it("工具折叠文本含结构化调用参数与执行结果（成功/失败均展示）", function(t)
+    local chat_view = require("NeoAI.ui.window.chat_view")
+    local chat_service = require("NeoAI.services.chat_service")
+    chat_view.reset()
+    chat_service.reset()
+
+    local opened = chat_view.open()
+    local agent = chat_service.get_current_agent()
+    agent.messages = {
+      { role = "user", content = "跑命令" },
+      { role = "assistant", content = "", tool_calls = {
+        { id = "c_ok", ["function"] = { name = "run_command", arguments = '{"cmd": "ls", "dirs": "/tmp"}' } },
+        { id = "c_err", ["function"] = { name = "read_file", arguments = '{"filepath": "/nope.txt"}' } },
+      } },
+      { role = "tool", tool_call_id = "c_ok", tool_name = "run_command", content = "file1\nfile2" },
+      { role = "tool", tool_call_id = "c_err", tool_name = "read_file", content = '{"error": "文件不存在", "tool": "read_file"}' },
+    }
+    chat_view.refresh()
+    vim.api.nvim_set_current_win(opened.win_id)
+
+    local joined = table.concat(vim.api.nvim_buf_get_lines(opened.buf, 0, -1, false), "\n")
+    -- 成功工具：含参数 + 结果标签，参数剔除 description 样板并结构化展示
+    t.true_(joined:find("参数:", 1, true) ~= nil, "折叠内应有参数标签")
+    t.true_(joined:find('"cmd": "ls"', 1, true) ~= nil, "成功工具应展示调用参数 cmd")
+    t.true_(joined:find('"dirs": "/tmp"', 1, true) ~= nil, "成功工具应展示调用参数 dirs")
+    t.true_(joined:find("结果:", 1, true) ~= nil, "折叠内应有结果标签")
+    t.true_(joined:find("file1", 1, true) ~= nil, "成功工具应展示执行结果")
+    -- 失败工具：同样有结构化参数与结构化（JSON）错误结果
+    t.true_(joined:find('"filepath": "/nope.txt"', 1, true) ~= nil, "失败工具也应展示调用参数")
+    t.true_(joined:find('"error": "文件不存在"', 1, true) ~= nil, "失败工具应结构化展示错误结果")
+    t.true_(joined:find("❌ 工具: read_file", 1, true) ~= nil, "失败工具首行应为 ❌ 状态")
+    -- 参数里不应重复展示 description 样板字段
+    t.true_(joined:find('"description"', 1, true) == nil, "参数区不应重复展示 description 字段")
 
     chat_view.reset()
     chat_service.reset()
@@ -909,6 +956,40 @@ tests.suite("chat_ui", function(_, it)
 
     vim.o.foldenable, vim.o.foldmethod = prev_foldenable, prev_foldmethod
     reasoning_panel.reset()
+  end)
+
+  it("提问悬浮窗禁用折叠（不被全局 fold 收起内容）", function(t)
+    local ask_user_ui = require("NeoAI.ui.components.ask_user")
+    ask_user_ui.reset()
+    -- 模拟用户全局开启折叠：minimal 浮窗会继承 foldenable/foldmethod
+    local prev_foldenable, prev_foldmethod = vim.o.foldenable, vim.o.foldmethod
+    vim.o.foldenable = true
+    vim.o.foldmethod = "indent"
+
+    ask_user_ui.show({
+      question = "要继续吗？",
+      options = { "是", "否" },
+      on_answer = function() end,
+      on_cancel = function() end,
+    })
+    local found = false
+    for _, win in ipairs(vim.api.nvim_list_wins()) do
+      local buf = vim.api.nvim_win_get_buf(win)
+      if vim.bo[buf].filetype == "neoai_ask_user" then
+        found = true
+        t.false_(vim.wo[win].foldenable, "提问悬浮窗应关闭 foldenable")
+        t.eq("manual", vim.wo[win].foldmethod, "提问悬浮窗 foldmethod 应为 manual")
+        local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+        t.true_(lines[1]:find("要继续吗", 1, true) ~= nil, "问题应完整可见（不被折叠收起）")
+        local joined = table.concat(lines, "\n")
+        t.true_(joined:find("选项", 1, true) ~= nil, "选项内容应完整可见（不被折叠收起）")
+        break
+      end
+    end
+    t.true_(found, "应创建提问悬浮窗")
+
+    vim.o.foldenable, vim.o.foldmethod = prev_foldenable, prev_foldmethod
+    ask_user_ui.reset()
   end)
 
   it("每个工具完成即各自更新状态（并发工具不互相等待）", function(t)
@@ -943,11 +1024,13 @@ tests.suite("chat_ui", function(_, it)
 
     event_bus.emit(events.TOOL_EXECUTION_STARTED, { agent_id = agent.id, tool_call_id = "a" })
     event_bus.emit(events.TOOL_EXECUTION_STARTED, { agent_id = agent.id, tool_call_id = "b" })
+    chat_view.flush()
     t.eq("running", status_of("lsp_type_definition"), "刚启动时应为执行中")
     t.eq("running", status_of("lsp_implementation"), "刚启动时应为执行中")
 
     -- 只完成 a：a 应立即更新为 ✅，b 仍为 ⏳（此前 a 会一直停在 ⏳ 等整批结果落库）
     event_bus.emit(events.TOOL_EXECUTION_COMPLETED, { agent_id = agent.id, tool_call_id = "a", duration_ms = 89 })
+    chat_view.flush()
     t.eq("success", status_of("lsp_type_definition"), "单个工具完成应立即更新为 ✅")
     t.matches("89ms", table.concat(vim.api.nvim_buf_get_lines(opened.buf, 0, -1, false), "\n"),
       "已完成工具应锁定总耗时")
@@ -955,7 +1038,109 @@ tests.suite("chat_ui", function(_, it)
 
     -- b 失败：应立即更新为 ❌
     event_bus.emit(events.TOOL_EXECUTION_ERROR, { agent_id = agent.id, tool_call_id = "b", error = "timeout", duration_ms = 500 })
+    chat_view.flush()
     t.eq("failure", status_of("lsp_implementation"), "单个工具失败应立即更新为 ❌")
+
+    chat_view.reset()
+    chat_service.reset()
+  end)
+
+  it("光标不跟随时不弹出思考悬浮窗（agent loop）", function(t)
+    local chat_view = require("NeoAI.ui.window.chat_view")
+    local chat_service = require("NeoAI.services.chat_service")
+    local reasoning_panel = require("NeoAI.ui.components.reasoning_panel")
+    local event_bus = require("NeoAI.kernel.event_bus")
+    local events = require("NeoAI.kernel.events")
+    chat_view.reset()
+    chat_service.reset()
+    reasoning_panel.reset()
+
+    local opened = chat_view.open()
+    local agent = chat_service.get_current_agent()
+    -- 预置足够长的内容，使 buffer 行数超过 5
+    agent.messages = {
+      { role = "user", content = "q1" },
+      { role = "assistant", content = "第一行\n第二行\n第三行\n第四行\n第五行\n第六行" },
+    }
+    chat_view.refresh()
+    vim.api.nvim_set_current_win(opened.win_id)
+
+    -- 光标放在第 2 行（不在最后 5 行内）：先触发一次渲染把 following 记为不跟随
+    vim.api.nvim_win_set_cursor(opened.win_id, { 2, 0 })
+    local last = agent.messages[#agent.messages]
+    event_bus.emit(events.MESSAGE_UPDATED, { agent_id = agent.id, message = last })
+    chat_view.flush()
+
+    -- 推理分片到达：此前会直接弹出思考悬浮窗；现在光标不跟随时应抑制
+    event_bus.emit(events.REASONING_CHUNK, { agent_id = agent.id, chunk = "思考一 ", reasoning = "思考一" })
+    chat_view.flush()
+    t.false_(reasoning_panel.is_open(), "光标不跟随时不应弹出思考悬浮窗")
+    event_bus.emit(events.REASONING_CHUNK, { agent_id = agent.id, chunk = "思考二", reasoning = "思考一思考二" })
+    chat_view.flush()
+    t.false_(reasoning_panel.is_open(), "后续推理分片也不应弹出思考悬浮窗")
+
+    -- 光标回到底部（跟随）：推理分片应恢复正常弹出
+    local total = vim.api.nvim_buf_line_count(opened.buf)
+    vim.api.nvim_win_set_cursor(opened.win_id, { total, 0 })
+    event_bus.emit(events.REASONING_CHUNK, { agent_id = agent.id, chunk = "思考三", reasoning = "思考三" })
+    chat_view.flush()
+    t.true_(reasoning_panel.is_open(), "光标回到底部跟随时应恢复弹出思考悬浮窗")
+
+    chat_view.reset()
+    chat_service.reset()
+    reasoning_panel.reset()
+  end)
+
+  it("光标不跟随时不重新折叠已展开的折叠文本（agent loop）", function(t)
+    local chat_view = require("NeoAI.ui.window.chat_view")
+    local chat_service = require("NeoAI.services.chat_service")
+    local event_bus = require("NeoAI.kernel.event_bus")
+    local events = require("NeoAI.kernel.events")
+    chat_view.reset()
+    chat_service.reset()
+
+    local opened = chat_view.open()
+    local agent = chat_service.get_current_agent()
+    -- 多轮内容：推理折叠 + 工具折叠 + 长正文，使 buffer 行数超过 5
+    agent.messages = {
+      { role = "user", content = "q1" },
+      { role = "assistant", content = "正文1", reasoning = "思考过程内容", tool_calls = {
+        { id = "c1", ["function"] = { name = "run_command", arguments = "{}" } },
+      } },
+      { role = "tool", tool_call_id = "c1", tool_name = "run_command", content = "out1" },
+      { role = "assistant", content = "正文2\n正文3\n正文4\n正文5" },
+    }
+    chat_view.refresh()
+    vim.api.nvim_set_current_win(opened.win_id)
+
+    -- 找到推理折叠并展开（模拟用户正在查看）
+    local reason_line = 0
+    local lines = vim.api.nvim_buf_get_lines(opened.buf, 0, -1, false)
+    for i, l in ipairs(lines) do
+      if l:find("思考过程内容", 1, true) then reason_line = i break end
+    end
+    t.true_(reason_line > 0, "应找到推理折叠内容行")
+    vim.api.nvim_win_set_cursor(opened.win_id, { reason_line, 0 })
+    local fold_start = vim.fn.foldclosed(reason_line)
+    t.true_(fold_start > 0, "推理折叠应默认收起")
+    vim.cmd("normal! zo")
+    t.eq(-1, vim.fn.foldclosed(reason_line), "zo 后推理折叠应展开")
+
+    -- 光标放在第 2 行（不跟随），流式更新触发渲染：不应把展开的折叠重新收起
+    vim.api.nvim_win_set_cursor(opened.win_id, { 2, 0 })
+    local last = agent.messages[#agent.messages]
+    last.content = last.content .. "\n流式新内容"
+    event_bus.emit(events.MESSAGE_UPDATED, { agent_id = agent.id, message = last })
+    chat_view.flush()
+
+    -- 重新定位：buffer 已重写，需按内容重新找到推理行，再断言折叠状态未被强制收起
+    local lines2 = vim.api.nvim_buf_get_lines(opened.buf, 0, -1, false)
+    local reason_line2 = 0
+    for i, l in ipairs(lines2) do
+      if l:find("思考过程内容", 1, true) then reason_line2 = i break end
+    end
+    t.true_(reason_line2 > 0, "流式更新后推理内容仍在 buffer")
+    t.eq(-1, vim.fn.foldclosed(reason_line2), "光标不跟随时不应把已展开的折叠重新收起")
 
     chat_view.reset()
     chat_service.reset()

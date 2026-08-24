@@ -394,7 +394,8 @@ class H(http.server.BaseHTTPRequestHandler):
         n_tool = len(tool_msgs)
         if n_tool < 3:
             name = "tool_req" + str(n_tool + 1)
-            delta = {"tool_calls":[{"index":0,"id":"call_" + str(n_tool + 1),"function":{"name":name,"arguments":"{}"}}]}
+            args = json.dumps({"description": "执行工具 " + name})
+            delta = {"tool_calls":[{"index":0,"id":"call_" + str(n_tool + 1),"function":{"name":name,"arguments":args}}]}
             fin = "tool_calls"
         else:
             delta = {"content": "completed after popup failure"}
@@ -406,7 +407,8 @@ class H(http.server.BaseHTTPRequestHandler):
         else:
             msg = {"role":"assistant"}
             if n_tool < 3:
-                msg["tool_calls"] = [{"id":"call_" + str(n_tool + 1),"type":"function","function":{"name":name,"arguments":"{}"}}]
+                args = json.dumps({"description": "执行工具 " + name})
+                msg["tool_calls"] = [{"id":"call_" + str(n_tool + 1),"type":"function","function":{"name":name,"arguments":args}}]
             else:
                 msg["content"] = "completed after popup failure"
             resp = json.dumps({"choices":[{"message": msg, "finish_reason": fin}],"usage":{"prompt_tokens":1,"completion_tokens":1}})

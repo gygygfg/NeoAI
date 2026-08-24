@@ -25,6 +25,8 @@ function M.init()
   -- 注册审批 UI
   local approval_ui = require("NeoAI.ui.components.tool_approval")
   approval_ui.init()
+  -- 注册向用户提问 UI
+  require("NeoAI.ui.components.ask_user").init()
   -- 启动子 Agent 监控监听
   local sub_agent_dock = require("NeoAI.ui.components.sub_agent_dock")
   sub_agent_dock.init()

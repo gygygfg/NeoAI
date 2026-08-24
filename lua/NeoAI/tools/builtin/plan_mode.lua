@@ -1,14 +1,17 @@
 --- 计划模式
 --- @module NeoAI.tools.builtin.plan_mode
---- 对齐 deepseek-harness plan：计划模式作为 per-agent 状态（logged），
---- 激活时：注入 plan-policy 系统提示段 + 屏蔽所有修改类工具 + 提供 present_plan 收尾。
+--- 计划模式作为 per-agent 状态（logged），激活时：
+--- 1. 注入 plan-policy 系统提示段（要求输出清晰、格式化的修改计划）；
+--- 2. 工具上下文只保留「只读/信息查询工具 + ask_user（向用户提问）」，不暴露任何修改类工具；
+--- 3. 执行期门禁同步收紧：计划模式下调用可见集之外的任何工具都会被驳回（纵深防御）。
+--- 计划经用户确认（chat_service.approve_plan）后直接转入 CHAT 模式，
+--- 并把计划解析为任务清单（todo）供执行阶段使用。
 --- 状态持久化在 session.metadata.plan（chat_service 同步），恢复会话时还原。
 
-local async = require("NeoAI.utils.async")
+local config_store = require("NeoAI.kernel.config_store")
 local event_bus = require("NeoAI.kernel.event_bus")
 local events = require("NeoAI.kernel.events")
 local helpers = require("NeoAI.tools.builtin.tool_helpers")
-local config_store = require("NeoAI.kernel.config_store")
 
 local M = {}
 
@@ -17,16 +20,46 @@ local M = {}
 --- 计划模式策略段（注入系统提示，order=100 工具指引区）
 local PLAN_POLICY_TEXT = table.concat({
   "## 计划模式（PLAN MODE）",
-  "当前处于计划模式：只允许分析、调研与制定计划，禁止执行任何修改性操作",
-  "（编辑文件、删除、创建目录、执行写命令、重命名/格式化、删除节点、git 回滚等）。",
-  "你的输出应是清晰、可评审的计划，而不是直接改动。",
-  "完成后调用 present_plan 展示计划并请求用户确认。",
+  "当前处于计划模式。你的工具上下文只包含只读/信息查询类工具与 ask_user（向用户提问），",
+  "没有任何修改类工具（编辑/删除/创建文件、执行写命令、git 回滚、重命名/格式化等均不可用）。",
+  "任务流程：",
+  "1. 充分调研：读取相关文件、搜索、查看 git 状态 / diff / 诊断信息，理解现状；",
+  "2. 若有歧义或缺少关键信息，用 ask_user 向用户澄清；",
+  "3. 最终输出一份清晰、格式化的修改计划，必须包含：",
+  "   - 目标与背景（为什么改）",
+  "   - 改动清单（涉及的文件 + 每处改动的内容/操作）",
+  "   - 实施步骤（先后顺序）",
+  "   - 验证方式与回滚方案",
+  "4. 计划完成后结束回合，提示用户检查计划。用户确认后系统会自动切换到 CHAT 模式，",
+  "   并把计划转为任务清单（todo），随后按清单执行。",
 }, "\n")
 
---- 修改类工具（计划模式下被屏蔽）
-local DEFAULT_MUTATING_TOOLS = {
-  "edit_file", "delete_file", "create_directory", "ensure_dir", "delete_node",
-  "lsp_rename", "lsp_format", "git_rollback", "confirm_file_change",
+--- 计划模式下可见的只读/信息查询工具白名单
+--- （修改类、系统命令、子 Agent 调度、待办写入等均不在此列）
+local PLAN_SAFE_TOOLS = {
+  -- 文件读取 / 搜索
+  "read_file", "list_files", "search_files", "file_exists",
+  -- 语法树只读查询
+  "parse_file", "query_tree", "get_node_at_position", "get_node_type",
+  "get_node_range", "is_named_node", "get_parent_node", "get_child_nodes",
+  "get_node_code",
+  -- LSP 只读查询
+  "lsp_hover", "lsp_definition", "lsp_references", "lsp_implementation",
+  "lsp_declaration", "lsp_document_symbols", "lsp_workspace_symbols",
+  "lsp_diagnostics", "lsp_client_info", "lsp_signature_help",
+  "lsp_completion", "lsp_type_definition", "lsp_service_info",
+  -- Git 只读查询
+  "git_status", "git_diff", "git_log", "git_commit_detail",
+  "git_branch", "git_file_history",
+  -- 日志
+  "log_message", "get_log_levels",
+  -- 子 Agent 状态查询（只读）
+  "get_sub_agent_status",
+}
+
+--- 计划模式下附加可见工具（非只读类，需显式加入）
+local PLAN_EXTRA_TOOLS = {
+  "ask_user", -- 向用户提问
 }
 
 -- ========== 私有函数 ==========
@@ -74,7 +107,7 @@ function M.enter(agent)
   return true
 end
 
---- 退出计划模式
+--- 退出计划模式（转入 CHAT 模式）
 --- @param agent table
 --- @return boolean
 function M.exit(agent)
@@ -109,12 +142,54 @@ function M.restore(agent, state)
   end
 end
 
---- 指定工具是否属于修改类（计划模式下被屏蔽）
+--- 计划模式下可见的工具名集合（含配置扩展）
+--- @param agent table
+--- @return table|nil 可见工具名集合（非计划模式返回 nil = 不限制）
+function M.visible_names(agent)
+  if not M.is_active(agent) then return nil end
+  local cfg = _cfg()
+  local extra = cfg.extra_safe_tools or {}
+  local set = {}
+  for _, name in ipairs(PLAN_SAFE_TOOLS) do set[name] = true end
+  for _, name in ipairs(PLAN_EXTRA_TOOLS) do set[name] = true end
+  for _, name in ipairs(extra) do
+    if type(name) == "string" and name ~= "" then set[name] = true end
+  end
+  return set
+end
+
+--- 应用计划模式工具过滤：非计划模式原样返回；计划模式只保留可见集
+--- @param agent table
+--- @param tools table name -> def
+--- @return table name -> def
+function M.apply_tool_filter(agent, tools)
+  local visible = M.visible_names(agent)
+  if not visible then return tools end
+  local out = {}
+  for name, tool in pairs(tools or {}) do
+    if visible[name] then
+      out[name] = tool
+    end
+  end
+  return out
+end
+
+--- 指定工具在计划模式下是否可见
+--- @param agent table
+--- @param tool_name string
+--- @return boolean
+function M.is_visible(agent, tool_name)
+  local visible = M.visible_names(agent)
+  if not visible then return true end
+  return visible[tool_name] == true
+end
+
+--- 指定工具是否属于修改类（兼容保留，旧配置 mutating_tools 仍生效）
 --- @param tool_name string
 --- @return boolean
 function M.is_mutating(tool_name)
   local cfg = _cfg()
-  local list = cfg.mutating_tools or DEFAULT_MUTATING_TOOLS
+  local list = cfg.mutating_tools or {}
   for _, t in ipairs(list) do
     if t == tool_name then return true end
   end
@@ -122,13 +197,14 @@ function M.is_mutating(tool_name)
 end
 
 --- 校验工具调用是否被计划模式阻止
+--- 计划模式下只允许可见集（只读/信息查询 + ask_user）内的工具
 --- @param agent table
 --- @param tool_name string
 --- @return boolean allowed, string|nil reason
 function M.check_tool(agent, tool_name)
   if not M.is_active(agent) then return true end
-  if M.is_mutating(tool_name) then
-    return false, "[计划模式] 工具 '" .. tool_name .. "' 为修改操作，计划模式下禁止执行。请先调用 present_plan 提交计划并退出计划模式。"
+  if not M.is_visible(agent, tool_name) then
+    return false, ("[计划模式] 工具 '%s' 不在计划模式可用工具集内（只允许只读/信息查询工具与 ask_user）。请先输出格式化修改计划，用户确认后会自动转入 CHAT 模式执行。"):format(tool_name)
   end
   return true
 end
@@ -142,13 +218,75 @@ function M.cleanup(agent)
   end
 end
 
+--- 把格式化计划文本解析为任务清单（todo 项数组）
+--- 识别：任务清单项（- [ ]）、无序/有序列表项；失败时回退到 Markdown 标题；再失败则整段压缩为一项
+--- @param plan_text string
+--- @return table 数组 { content, status }
+function M.plan_to_todos(plan_text)
+  if type(plan_text) ~= "string" or plan_text == "" then return {} end
+  local items = {}
+  local seen = {}
+  local in_fence = false
+  local lines = vim.split(plan_text, "\n", { plain = true })
+  for _, raw in ipairs(lines) do
+    local line = raw:gsub("\r$", "")
+    if line:match("^```") then in_fence = not in_fence end
+    local content = nil
+    if not in_fence then
+      -- 注意：任务清单项模式有两个捕获组（勾选标记 + 内容），只取内容
+      local _, checklist = line:match("^%s*%- %[([ xX]?)%]%s*(.+)$")
+      if checklist then
+        content = checklist
+      else
+        local bullet = line:match("^%s*[-*+]%s+(.+)$")
+        if bullet then content = bullet end
+        local numbered = line:match("^%s*%d+[%.)]%s+(.+)$")
+        if numbered then content = numbered end
+      end
+    end
+    if content then
+      content = content:gsub("^%s+", ""):gsub("%s+$", "")
+      if content ~= "" and not seen[content] then
+        seen[content] = true
+        items[#items + 1] = { content = content, status = "pending" }
+      end
+    end
+  end
+  if #items == 0 then
+    -- 回退：按 Markdown 标题分段（Lua 5.1 模式不支持 {n,m} 量词，用 #+）
+    local headers = {}
+    for _, raw in ipairs(lines) do
+      local h = raw:match("^%s*#+%s+(.+)$")
+      if h then
+        h = h:gsub("^%s+", ""):gsub("%s+$", "")
+        if h ~= "" then headers[#headers + 1] = h end
+      end
+    end
+    for _, h in ipairs(headers) do
+      if not seen[h] then
+        seen[h] = true
+        items[#items + 1] = { content = h, status = "pending" }
+      end
+    end
+  end
+  if #items == 0 then
+    -- 最终回退：整段压缩为一项
+    local flat = plan_text:gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
+    if #flat > 200 then flat = flat:sub(1, 200) .. "…" end
+    if flat ~= "" then
+      items[#items + 1] = { content = flat, status = "pending" }
+    end
+  end
+  return items
+end
+
 -- ========== 工具定义 ==========
 
 local plan_mode_tools = {}
 
 plan_mode_tools.enter_plan_mode = helpers.define_tool(
   "enter_plan_mode",
-  "进入计划模式：停止一切修改性操作，只分析、调研并制定计划。多步骤任务应先调用本工具。",
+  "进入计划模式：工具集立即切换为只读/信息查询 + ask_user（无法修改任何文件），用于调研并制定格式化修改计划。多步骤/涉及改动的任务应先调用本工具。",
   {
     type = "object",
     properties = {},
@@ -161,78 +299,7 @@ plan_mode_tools.enter_plan_mode = helpers.define_tool(
       return
     end
     M.enter(agent)
-    on_success("已进入计划模式。请分析任务并制定计划，完成后再调用 present_plan 提交计划。")
-  end,
-  { category = "agent", approval = { auto_allow = true } }
-)
-
-plan_mode_tools.set_plan = helpers.define_tool(
-  "set_plan",
-  "记录/更新当前计划内容（仅文本，不触发任何修改）。plan 必填。",
-  {
-    type = "object",
-    properties = {
-      plan = { type = "string", description = "计划内容（Markdown）" },
-    },
-    required = { "plan" },
-  },
-  function(args, on_success, on_error, ctx)
-    local agent = ctx and ctx.agent
-    if not agent then
-      on_error("缺少 agent 上下文")
-      return
-    end
-    agent.plan = args.plan or ""
-    event_bus.emit(events.PLAN_MODE_CHANGED, { agent_id = agent.id, active = M.is_active(agent) })
-    on_success("计划已记录")
-  end,
-  { category = "agent", approval = { auto_allow = true } }
-)
-
-plan_mode_tools.present_plan = helpers.define_tool(
-  "present_plan",
-  "提交计划并退出计划模式。plan 为计划内容；approved=true 表示用户已确认可开始执行，approved=false 表示用户要求继续修改计划（保持计划模式）。",
-  {
-    type = "object",
-    properties = {
-      plan = { type = "string", description = "最终计划内容（Markdown）" },
-      approved = { type = "boolean", description = "是否已获用户批准" },
-    },
-    required = {},
-  },
-  function(args, on_success, on_error, ctx)
-    local agent = ctx and ctx.agent
-    if not agent then
-      on_error("缺少 agent 上下文")
-      return
-    end
-    if args.plan then agent.plan = args.plan end
-    if args.approved then
-      M.exit(agent)
-      on_success(("计划已获批准，已退出计划模式，可以开始执行。\n\n%s"):format(agent.plan or ""))
-    else
-      on_success(("计划已提交待审（仍处于计划模式）。\n\n%s"):format(agent.plan or ""))
-    end
-  end,
-  { category = "agent", approval = { auto_allow = true } }
-)
-
-plan_mode_tools.exit_plan_mode = helpers.define_tool(
-  "exit_plan_mode",
-  "直接退出计划模式，不提交计划。",
-  {
-    type = "object",
-    properties = {},
-    required = {},
-  },
-  function(args, on_success, on_error, ctx)
-    local agent = ctx and ctx.agent
-    if not agent then
-      on_error("缺少 agent 上下文")
-      return
-    end
-    M.exit(agent)
-    on_success("已退出计划模式")
+    on_success("已进入计划模式：只读调研 + 提问，输出格式化计划，等待用户确认后转入 CHAT 执行。")
   end,
   { category = "agent", approval = { auto_allow = true } }
 )

@@ -16,14 +16,25 @@ local bg_loaded = {}
 --- @return table 工具定义
 function M.define_tool(name, description, params, func, opts)
   opts = opts or {}
+  params = params or { type = "object", properties = {}, required = {} }
+  -- 统一注入 description 参数：所有工具都要求模型说明本次调用目的（供审批与折叠展示）。
+  -- 已存在则保持原样（如 edit_file 的强制描述），否则补充为必填字符串参数。
+  params.properties = params.properties or {}
+  params.required = params.required or {}
+  if params.properties.description == nil then
+    params.properties.description = { type = "string", description = "本次调用目的说明（必填，用于审批与折叠展示）" }
+    local has = false
+    for _, r in ipairs(params.required) do
+      if r == "description" then has = true break end
+    end
+    if not has then
+      params.required[#params.required + 1] = "description"
+    end
+  end
   return {
     name = name,
     description = description,
-    parameters = params or {
-      type = "object",
-      properties = {},
-      required = {},
-    },
+    parameters = params,
     func = func,
     category = opts.category or "other",
     approval = opts.approval or {},

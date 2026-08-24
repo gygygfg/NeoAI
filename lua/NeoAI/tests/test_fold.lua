@@ -28,6 +28,31 @@ tests.suite("fold", function(_, it)
     t.eq("  🔧 run_command ❌ 30.0s", fold.label("  ❌ 工具: run_command · 30.0s", 4))
   end)
 
+  it("label 工具折叠占位文本含目的说明（工具名后显示工具目的）", function(t)
+    local fold = require("NeoAI.ui.components.fold")
+    t.eq("  🔧 run_command · 构建项目 ✅ 1.2s",
+      fold.label("  ✅ 工具: run_command · 构建项目 · 1.2s", 3),
+      "已完成工具折叠应显示 🔧 工具名 · 目的 ✅ 耗时")
+    t.eq("  🔧 edit_file · 修改配置 ❌ 800ms",
+      fold.label("  ❌ 工具: edit_file · 修改配置 · 800ms", 4),
+      "失败工具折叠应显示目的")
+    t.eq("  🔧 git_status · 查看工作区状态 ⏳ 1.2s",
+      fold.label("  ⏳ 调用工具: git_status · 查看工作区状态 · 1.2s", 2),
+      "执行中工具折叠应显示目的")
+    t.eq("  🔧 run_command · 构建项目 ✅",
+      fold.label("  ✅ 工具: run_command · 构建项目", 3),
+      "无耗时也应显示目的")
+    -- detect 应返回目的
+    local kind, status, name, desc = fold.detect("  ✅ 工具: read_file · 读取源码 · 5ms")
+    t.eq("tool_result", kind)
+    t.eq("success", status)
+    t.eq("read_file", name)
+    t.eq("读取源码", desc, "detect 应返回目的说明")
+    -- 无目的时 detect 返回 nil
+    local _, _, _, d2 = fold.detect("  ✅ 工具: run_command · 1.2s")
+    t.nil_(d2, "无目的时应返回 nil")
+  end)
+
   it("detect 带耗时的工具行 name 不含耗时", function(t)
     local fold = require("NeoAI.ui.components.fold")
     local kind, status, name = fold.detect("  ✅ 工具: lsp_service_info · 800ms")

@@ -15,6 +15,10 @@ local function _ensure_parsed(filepath)
   if not filepath or filepath == "" then return nil end
   local bufnr = helpers.ensure_buffer(filepath)
   if not bufnr then return nil end
+  -- 磁盘直写工具（edit_file 等）只改磁盘不改已加载 buffer，导致内存与磁盘不一致；
+  -- 先把磁盘最新内容同步进 buffer 再解析，避免 delete_node 等修改类工具基于过期
+  -- 内容定位节点、并把旧内容整体写回磁盘覆盖掉 edit_file 刚写入的新内容（BUG-1）。
+  helpers.sync_buffer_from_disk(bufnr)
   local ok = pcall(vim.treesitter.get_parser, bufnr)
   if not ok then return nil end
   return bufnr

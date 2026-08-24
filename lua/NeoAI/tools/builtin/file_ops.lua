@@ -1,19 +1,33 @@
 --- 文件操作工具
 --- @module NeoAI.tools.builtin.file_ops
 --- 读/写/列/搜/删/建目录 + confirm_file_change（写入确认）。
+--- 阻塞式文件 I/O（读大文件 / 递归搜索 / 写盘）经 utils.work 在线程池执行，
+--- 不占用 nvim 主线程，避免工具调用时主界面卡住。
 
 local fs = require("NeoAI.utils.fs")
-local stringx = require("NeoAI.utils.stringx")
 local helpers = require("NeoAI.tools.builtin.tool_helpers")
-local registry = require("NeoAI.tools.registry")
 
 local M = {}
+
+-- ========== 私有函数 ==========
+
+--- 异步文件操作公共接线：resolve → on_success，reject → on_error
+--- @param d Deferred
+--- @param on_success function
+--- @param on_error function
+local function _pipe(d, on_success, on_error)
+  d:then_(function(res)
+    on_success(res)
+  end, function(e)
+    on_error(e.message or tostring(e))
+  end)
+end
 
 -- ========== 工具定义 ==========
 
 local file_tools = {}
 
--- 读取文件
+-- 读取文件（线程池异步）
 file_tools.read_file = helpers.define_tool(
   "read_file",
   "读取文件内容。filepath 必填；start_line/end_line 可选指定行范围（1-based，含两端）。",
@@ -28,34 +42,26 @@ file_tools.read_file = helpers.define_tool(
   },
   function(args, on_success, on_error)
     local filepath = args.filepath
-    local content, err = fs.read_file(filepath)
-    if not content then
-      on_error("无法读取文件: " .. filepath .. (err and (" (" .. err .. ")") or ""))
-      return
-    end
+    local d
     if args.start_line or args.end_line then
-      local lines = vim.split(content, "\n", { plain = true })
-      local start = args.start_line or 1
-      local finish = args.end_line or #lines
-      start = math.max(1, start)
-      finish = math.min(#lines, finish)
-      local selected = {}
-      for i = start, finish do selected[#selected + 1] = lines[i] end
-      content = table.concat(selected, "\n")
+      d = fs.read_file_lines_async(filepath, args.start_line or 0, args.end_line or 0)
+    else
+      d = fs.read_file_async(filepath)
     end
-    on_success(content)
+    _pipe(d, on_success, on_error)
   end,
   { category = "file" }
 )
 
--- 编辑文件
+-- 编辑文件（线程池异步读写）
 file_tools.edit_file = helpers.define_tool(
   "edit_file",
-  "编辑文件。filepath 必填；mode='write' 整体覆写，mode='append' 追加；或提供 edits 数组做结构化替换。",
+  "编辑文件。filepath 必填；description 必填（描述本次修改目的）；mode='write' 整体覆写，mode='append' 追加；或提供 edits 数组做结构化替换。",
   {
     type = "object",
     properties = {
       filepath = { type = "string", description = "文件路径" },
+      description = { type = "string", description = "修改目的说明（必填，供审批与记录）" },
       mode = { type = "string", description = "'write' | 'append' | 'edit'" },
       content = { type = "string", description = "写入内容（write/append 模式）" },
       edits = {
@@ -63,44 +69,76 @@ file_tools.edit_file = helpers.define_tool(
         description = "结构化编辑 { old_text, new_text } 数组",
         items = { type = "object", properties = { old_text = { type = "string" }, new_text = { type = "string" } } },
       },
-      explanation = { type = "string", description = "修改原因" },
     },
-    required = { "filepath" },
+    required = { "filepath", "description" },
   },
   function(args, on_success, on_error)
     local filepath = args.filepath
+    local description = args.description
     local mode = args.mode or "edit"
 
     if mode == "write" then
-      local ok, werr = fs.write_file(filepath, args.content or "")
-      if not ok then on_error("写入失败: " .. tostring(werr)) return end
-      on_success(("文件已写入: %s (%d 字节)"):format(filepath, #(args.content or "")))
+      _pipe(fs.write_file_async(filepath, args.content or ""), function()
+        on_success(("文件已写入: %s (%d 字节)"):format(filepath, #(args.content or "")))
+      end, on_error)
       return
     end
     if mode == "append" then
-      local ok, aerr = fs.append_file(filepath, args.content or "")
-      if not ok then on_error("追加失败: " .. tostring(aerr)) return end
-      on_success("已追加到: " .. filepath)
+      _pipe(fs.append_file_async(filepath, args.content or ""), function()
+        on_success("已追加到: " .. filepath)
+      end, on_error)
       return
     end
 
-    -- edit 模式：结构化替换
-    local content, err = fs.read_file(filepath)
-    if not content then on_error("无法读取: " .. filepath) return end
-    for _, edit in ipairs(args.edits or {}) do
-      local old, new = edit.old_text, edit.new_text
-      if old and new then
-        content = stringx.replace(content, old, new)
+    -- edit 模式：结构化替换（读在子线程，替换与写盘也在子线程）
+    local edits = args.edits or {}
+    if #edits == 0 then
+      on_error("edit 模式需要提供 edits 数组")
+      return
+    end
+    -- 序列化传给子线程（仅原始类型）：分隔符约定
+    --   \1 = old/new 之间   \2 = 编辑条目之间   \3 = filepath 与编辑序列之间
+    local packed = {}
+    for _, edit in ipairs(edits) do
+      if edit.old_text and edit.new_text then
+        packed[#packed + 1] = edit.old_text .. "\1" .. edit.new_text
       end
     end
-    local ok, werr = fs.write_file(filepath, content)
-    if not ok then on_error("写入失败: " .. tostring(werr)) return end
-    on_success("文件已编辑: " .. filepath)
+    if #packed == 0 then
+      on_error("edits 需要包含有效的 old_text/new_text")
+      return
+    end
+    fs.read_file_async(filepath):then_(function()
+      local work = require("NeoAI.utils.work")
+      return work.run(function(payload)
+        local path, edits_blob = payload:match("^(.-)\3(.*)$")
+        if not path then error("编辑负载格式错误") end
+        local f = io.open(path, "rb")
+        if not f then error("无法读取文件: " .. path) end
+        local text = f:read("*a")
+        f:close()
+        for entry in edits_blob:gmatch("[^\2]+") do
+          local old, new = entry:match("^(.-)\1(.*)$")
+          if old and new ~= nil then
+            text = text:gsub(old:gsub("([%(%)%.%%%+%-%*%?%[%]%^%$])", "%%%1"), new)
+          end
+        end
+        local w = io.open(path, "wb")
+        if not w then error("无法写入文件: " .. path) end
+        w:write(text)
+        w:close()
+        return "ok"
+      end, filepath .. "\3" .. table.concat(packed, "\2"))
+    end):then_(function()
+      on_success("文件已编辑: " .. filepath)
+    end, function(e)
+      on_error(e.message or tostring(e))
+    end)
   end,
   { category = "file", approval = { auto_allow = false } }
 )
 
--- 列出目录
+-- 列出目录（线程池异步）
 file_tools.list_files = helpers.define_tool(
   "list_files",
   "列出目录内容。path 可选，默认当前目录；recursive 可选。",
@@ -115,22 +153,34 @@ file_tools.list_files = helpers.define_tool(
   },
   function(args, on_success, on_error)
     local dir = args.path or "."
+    local max = args.max_results or 0
     if not fs.is_dir(dir) then
       on_error("目录不存在: " .. dir)
       return
     end
-    local entries = fs.list_dir(dir)
-    local out = {}
-    for _, e in ipairs(entries) do
-      local full = fs.join(dir, e)
-      out[#out + 1] = full .. (fs.is_dir(full) and "/" or "")
+    if args.recursive then
+      _pipe(fs.list_dir_async(dir, max), on_success, on_error)
+      return
     end
-    on_success(table.concat(out, "\n"))
+    -- 非递归：单层列出（join + is_dir 判断在主线程，量级很小；readdir 走子线程）
+    local work = require("NeoAI.utils.work")
+    _pipe(work.run(function(path)
+      local handle = vim.uv.fs_scandir(path)
+      if not handle then return "" end
+      local out = {}
+      while true do
+        local name, t = vim.uv.fs_scandir_next(handle)
+        if not name then break end
+        out[#out + 1] = path .. "/" .. name .. (t == "directory" and "/" or "")
+      end
+      table.sort(out)
+      return table.concat(out, "\n")
+    end, dir), on_success, on_error)
   end,
   { category = "file" }
 )
 
--- 搜索文件内容
+-- 搜索文件内容（线程池异步递归）
 file_tools.search_files = helpers.define_tool(
   "search_files",
   "在目录中按模式搜索文件内容。query 必填；include 可选 glob。",
@@ -146,36 +196,15 @@ file_tools.search_files = helpers.define_tool(
   },
   function(args, on_success, on_error)
     local dir = args.path or "."
-    local query = args.query
-    local max = args.max_results or 50
-    local include = args.include
-    local results = {}
-    local count = 0
-    local function walk(path)
-      if count >= max then return end
-      for _, e in ipairs(fs.list_dir(path)) do
-        if count >= max then return end
-        local full = fs.join(path, e)
-        if fs.is_dir(full) then
-          walk(full)
-        else
-          if not include or stringx.glob_match(include, e) then
-            local content = fs.read_file(full)
-            if content and content:find(query, 1, true) then
-              count = count + 1
-              results[#results + 1] = full .. ": " .. stringx.truncate(content:sub(content:find(query, 1, true), -1), 200)
-            end
-          end
-        end
-      end
-    end
-    walk(dir)
-    on_success(#results > 0 and table.concat(results, "\n") or "未找到匹配内容")
+    _pipe(fs.search_files_async(dir, args.query, {
+      include = args.include,
+      max_results = args.max_results or 50,
+    }), on_success, on_error)
   end,
   { category = "file" }
 )
 
--- 文件是否存在
+-- 文件是否存在（同步，量级极小）
 file_tools.file_exists = helpers.define_tool(
   "file_exists",
   "检查文件是否存在。filepath 必填。返回 'true'/'false'。",
@@ -224,7 +253,7 @@ file_tools.ensure_dir = helpers.define_tool(
   { category = "file", approval = { auto_allow = false } }
 )
 
--- 删除文件
+-- 删除文件（线程池异步）
 file_tools.delete_file = helpers.define_tool(
   "delete_file",
   "删除文件。filepath 必填。",
@@ -234,9 +263,9 @@ file_tools.delete_file = helpers.define_tool(
     required = { "filepath" },
   },
   function(args, on_success, on_error)
-    local ok, err = fs.delete_file(args.filepath)
-    if not ok then on_error("删除失败: " .. tostring(err)) return end
-    on_success("文件已删除: " .. args.filepath)
+    _pipe(fs.delete_file_async(args.filepath), function()
+      on_success("文件已删除: " .. args.filepath)
+    end, on_error)
   end,
   { category = "file", approval = { auto_allow = false } }
 )

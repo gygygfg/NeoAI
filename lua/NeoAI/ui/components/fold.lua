@@ -104,48 +104,59 @@ local function _tool_status(first)
   return nil
 end
 
---- 识别折叠类型、状态与名称（按折叠首行）
---- 工具块首行格式：<状态 emoji> 调用工具: name(args) [耗时]（执行中）或
---- <状态 emoji> 工具: name [耗时]（已完成），耗时可选。
+--- 识别折叠类型、状态、名称与目的说明（按折叠首行）
+--- 工具块首行格式：<状态 emoji> 调用工具: name [· 目的] [· 耗时]（执行中）或
+--- <状态 emoji> 工具: name [· 目的] [· 耗时]（已完成），目的/耗时可选。
 --- @param first string 折叠首行
 --- @return string kind "reasoning" | "tool_call" | "tool_result"
 --- @return string|nil status "running" | "success" | "failure"（工具类折叠）
 --- @return string|nil name 工具名（工具类折叠）
+--- @return string|nil desc 目的说明（工具类折叠，可无）
 function M.detect(first)
   local status = _tool_status(first)
-  local call_line = first:match("调用工具:%s*([^%(]*)")
-  if call_line then
-    return "tool_call", status or "running", call_line:gsub("%s+$", "")
+  -- 耗时形如 " · 1.2s" / " · 800ms"（纯数字+单位），先剥掉；剩余部分解析 name 与 desc，
+  -- 避免 name/desc 里的 " · " 干扰耗时识别。非耗时结尾（如无耗时的中文描述）不剥。
+  local time = first:match("%·%s*%d+%.?%d*%s*[msd]+%s*$")
+  local body = first
+  if time then
+    body = first:gsub("%·%s*%d+%.?%d*%s*[msd]+%s*$", "")
   end
-  local tool_name = first:match("工具:%s*(.-)%s*·") or first:match("工具:%s*(.-)%s*$")
+  local call_name = body:match("调用工具:%s*([^%s%(%·]+)")
+  if call_name then
+    local desc = body:match("调用工具:%s*[^%s%(%·]+%s*·%s*(.-)%s*$")
+    return "tool_call", status or "running", call_name, desc
+  end
+  local tool_name = body:match("工具:%s*([^%s%(%·]+)")
   if tool_name then
-    return "tool_result", status or "success", tool_name
+    local desc = body:match("工具:%s*[^%s%(%·]+%s*·%s*(.-)%s*$")
+    return "tool_result", status or "success", tool_name, desc
   end
-  return "reasoning", nil, nil
+  return "reasoning", nil, nil, nil
 end
 
---- 提取首行末尾的耗时文本（形如 " · 1.2s" / " · 800ms"）
+--- 提取首行末尾的耗时文本（形如 " · 1.2s" / " · 800ms" / " · 30.0s"）
 --- @param first string
 --- @return string|nil
 local function _extract_time(first)
-  return first:match("%·%s*([^%s]+)%s*$")
+  return first:match("%·%s*(%d+%.?%d*%s*[msd]+)%s*$")
 end
 
 --- 生成折叠占位文本（纯函数，供 foldtext 与测试使用）
---- 工具折叠格式：工具 emoji + 工具名称 + 状态 emoji + 耗时（🔧 name ✅ 1.2s）。
---- 推理折叠沿用思考过程摘要。
+--- 工具折叠格式：工具 emoji + 工具名称 + 目的 + 状态 emoji + 耗时
+--- （🔧 name · 目的 ✅ 1.2s）。推理折叠沿用思考过程摘要。
 --- @param first string 折叠首行
 --- @param count number 折叠行数
 --- @return string
 function M.label(first, count)
-  local kind, status, name = M.detect(first)
+  local kind, status, name, desc = M.detect(first)
   if kind == "tool_call" or kind == "tool_result" then
     local status_emoji = STATUS_EMOJI[status] or "⏳"
+    local desc_str = desc and (desc ~= "") and (" · " .. desc) or ""
     local time_str = _extract_time(first)
     if time_str then
-      return string.format("  🔧 %s %s %s", name, status_emoji, time_str)
+      return string.format("  🔧 %s%s %s %s", name, desc_str, status_emoji, time_str)
     end
-    return string.format("  🔧 %s %s", name, status_emoji)
+    return string.format("  🔧 %s%s %s", name, desc_str, status_emoji)
   end
   return string.format("  🤔 思考过程 %d 行", count)
 end

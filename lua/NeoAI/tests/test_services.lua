@@ -50,7 +50,7 @@ tests.suite("services", function(_, it)
     local shown = false
     tool_service.set_approval_ui({ show = function() shown = true end, hide = function() end })
     local agent = { id = "a" }
-    tool_service.execute(agent, "fast_tool", {}, nil, {}):then_(function(r)
+    tool_service.execute(agent, "fast_tool", { description = "测试快捷允许" }, nil, {}):then_(function(r)
       t.eq("fast", r)
       t.false_(shown) -- 未走审批
       print("  allow_all done")

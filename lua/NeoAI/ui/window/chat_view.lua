@@ -27,31 +27,10 @@ local state = {
   unsubs = {},
   agent_id = nil,
   tool_tick = nil, -- 工具执行中折叠文本定时刷新句柄
+  following = true, -- 流式更新时光标是否跟随（不跟随时不弹思考悬浮窗、不重新折叠已有折叠）
 }
 
 -- ========== 私有函数 ==========
-
---- 渲染全部消息
-local function _render()
-  local messages = chat_service.get_messages()
-  message_list.render(state.buf, messages)
-  if state.win_id and vim.api.nvim_win_is_valid(state.win_id) then
-    vim.api.nvim_win_call(state.win_id, function()
-      -- 每次重写 buffer 后，expr 折叠并不会自动重算（带 UI 会话里 nvim_buf_set_lines
-      -- 不触发 foldexpr 求值，导致 foldlevel 全为 0、折叠失效）。先 zx 强制按 foldexpr
-      -- 重算折叠，再 zM 全部收起（zc 只对光标处的折叠生效，其它位置会报 E490）。
-      vim.cmd("silent! normal! zxzM")
-    end)
-  end
-end
-
---- 刷新/滚动到底部
-local function _scroll_to_end()
-  if state.win_id and vim.api.nvim_win_is_valid(state.win_id) then
-    local line_count = vim.api.nvim_buf_line_count(state.buf)
-    vim.api.nvim_win_set_cursor(state.win_id, { math.max(1, line_count), 0 })
-  end
-end
 
 -- 流式更新跟随滚动的触发范围：光标处于 buffer 最后 5 行内才跟随到底部，
 -- 否则用户正在回看上方内容，不动光标。
@@ -68,31 +47,190 @@ local function _cursor_within_follow_margin()
   return cur[1] >= math.max(1, line_count - (FOLLOW_MARGIN - 1))
 end
 
+--- 当前处于展开状态的折叠块首行行号集合（供不跟随时重写 buffer 后恢复展开状态）。
+--- 仅当整块 buffer 重写会让手动开合状态丢失时使用；按折叠首行行号记录，
+--- 流式更新内容追加在底部，上方已展开折叠的行号保持稳定。
+--- @return table 行号数组
+local function _open_fold_start_lines()
+  local starts = {}
+  if not state.buf or not vim.api.nvim_buf_is_valid(state.buf) then return starts end
+  local total = vim.api.nvim_buf_line_count(state.buf)
+  local prev_level = 0
+  for ln = 1, total do
+    local lvl = vim.fn.foldlevel(ln)
+    if lvl > 0 and prev_level == 0 then
+      if vim.fn.foldclosed(ln) == -1 then
+        starts[#starts + 1] = ln
+      end
+    end
+    prev_level = lvl
+  end
+  return starts
+end
+
+--- 渲染全部消息
+local function _render()
+  -- 不跟随（用户回看上方内容）时记录已展开的折叠块，重写 buffer 后恢复其展开状态，
+  -- 避免把用户正在查看的内容重新折叠起来。
+  local open_folds = {}
+  if not state.following then
+    open_folds = _open_fold_start_lines()
+  end
+  local messages = chat_service.get_messages()
+  message_list.render(state.buf, messages)
+  if state.win_id and vim.api.nvim_win_is_valid(state.win_id) then
+    vim.api.nvim_win_call(state.win_id, function()
+      -- 每次重写 buffer 后，expr 折叠并不会自动重算（带 UI 会话里 nvim_buf_set_lines
+      -- 不触发 foldexpr 求值，导致 foldlevel 全为 0、折叠失效）。先 zx 强制按 foldexpr
+      -- 重算折叠。光标跟随（底部）时 zM 全部收起（zc 只对光标处的折叠生效，其它位置会报 E490）；
+      -- 光标不跟随（用户正在回看上方内容）时只重算、不收起，并把重写前已展开的折叠重新展开，
+      -- 保留用户当前查看的折叠状态（zx 会保留手动开合的折叠状态，但整块 buffer 重写会丢失它）。
+      if state.following then
+        vim.cmd("silent! normal! zxzM")
+      else
+        vim.cmd("silent! normal! zx")
+        -- 记录光标位置，重开折叠后恢复：不跟随说明用户正在回看上方，不能被拽走。
+        local cur = vim.api.nvim_win_get_cursor(state.win_id)
+        for _, ln in ipairs(open_folds) do
+          if vim.fn.foldclosed(ln) ~= -1 then
+            pcall(vim.api.nvim_win_set_cursor, state.win_id, { math.max(1, ln), 0 })
+            vim.cmd("silent! normal! zo")
+          end
+        end
+        pcall(vim.api.nvim_win_set_cursor, state.win_id, cur)
+      end
+    end)
+  end
+end
+
+--- 刷新/滚动到底部
+--- 仅在聊天窗口当前显示聊天 buffer 时移动光标：用户把窗口切到别的 buffer
+--- （:bnext 等）后，聊天内容照常写入 state.buf，但光标属于其它 buffer，
+--- 用 state.buf 的行号设置光标会越界抛错。
+local function _scroll_to_end()
+  if not state.win_id or not vim.api.nvim_win_is_valid(state.win_id) then return end
+  if not state.buf or not vim.api.nvim_buf_is_valid(state.buf) then return end
+  if vim.api.nvim_win_get_buf(state.win_id) ~= state.buf then return end
+  local line_count = vim.api.nvim_buf_line_count(state.buf)
+  vim.api.nvim_win_set_cursor(state.win_id, { math.max(1, line_count), 0 })
+end
+
+-- 渲染合并：流式分片 / 工具事件在同一个事件循环 tick 内可能连续触发多次，
+-- 每次都同步全量重渲染 + zxzM 折叠重算会占满主线程，第二/多轮（历史消息更多）
+-- 时尤其明显，表现为"主界面卡住"。这里把渲染延后到本 tick 结束，合并为一次。
+local render_scheduled = false
+local render_pending_follow = false
+local render_flushed = false
+
+--- 执行一次实际渲染（由调度回调或 flush 调用）
+local function _do_render()
+  render_scheduled = false
+  render_flushed = true
+  _render()
+  if render_pending_follow then
+    _scroll_to_end()
+  end
+end
+
+--- 调度一次渲染（合并同一 tick 内的多次更新）
+local function _schedule_render()
+  if render_scheduled then return end
+  render_scheduled = true
+  render_flushed = false
+  -- 在渲染前判断是否跟随（_render 内 zxzM 会把光标从收起的折叠块内拽到折叠首行，
+  -- 渲染后再判断会导致跟随失效），把决定缓存在调度时，并同步给 state.following
+  -- （不跟随时用于抑制思考悬浮窗弹出与折叠收起）。
+  render_pending_follow = _cursor_within_follow_margin()
+  state.following = render_pending_follow
+  vim.schedule(function()
+    if render_flushed then
+      -- 已被 flush 同步执行过，跳过以避免重复渲染
+      render_scheduled = false
+      return
+    end
+    _do_render()
+  end)
+end
+
+-- 推理分片批量：推理 token 高频到达时，逐片 nvim_buf_set_lines / set_cursor 会
+-- 反复唤醒 UI 重绘，把主线程占满。这里把同一 tick 内的分片拼起来，合并为一次追加。
+local reasoning_pending = ""
+local reasoning_flush_scheduled = false
+-- 推理已终止（正文开始/推理结束）：已排队的冲刷回调应作废，避免重新打开悬浮窗。
+local reasoning_cancelled = false
+
+--- 取消未冲刷的推理分片（正文开始 / 推理结束 / 窗口关闭时调用）
+local function _cancel_pending_reasoning()
+  reasoning_pending = ""
+  reasoning_cancelled = true
+end
+
+--- 把缓存的推理分片一次性追加到悬浮窗
+local function _flush_reasoning()
+  reasoning_flush_scheduled = false
+  if reasoning_cancelled then
+    reasoning_cancelled = false
+    return
+  end
+  if reasoning_pending == "" then return end
+  -- 冲刷时若光标已不跟随（用户回看上方内容 / 切走），作废本次冲刷：
+  -- 不重新弹出思考悬浮窗，避免干扰用户当前查看的位置。
+  if not _cursor_within_follow_margin() then
+    reasoning_pending = ""
+    return
+  end
+  local chunk = reasoning_pending
+  reasoning_pending = ""
+  reasoning_panel.append(chunk)
+end
+
 --- 流式更新当前消息
 --- @param payload table
 local function _on_message_updated(payload)
   if not payload or not payload.agent_id then return end
   if payload.agent_id ~= state.agent_id then return end
   if payload.message and payload.message.content ~= "" then
+    -- 正文开始：取消尚未冲刷的推理分片并关闭悬浮窗。若不取消，已 vim.schedule 的
+    -- _flush_reasoning 稍后还会把残留分片 append 上去、把已关闭的悬浮窗重新打开。
+    _cancel_pending_reasoning()
     reasoning_panel.close()
   end
-  -- 在重渲染之前判断是否跟随：_render() 内的 zxzM 会把光标从收起的折叠块内
-  -- 拽到折叠首行，若一次添加多行折叠文本（如工具结果整块到达），渲染后光标
-  -- 已远离底部，此时再判断会导致跟随失效。
-  local should_follow = _cursor_within_follow_margin()
-  _render()
-  if should_follow then
-    _scroll_to_end()
+  -- 渲染延后到本 tick 结束并合并：同一 tick 内多次分片/事件只渲染一次，
+  -- 避免每个分片都全量重渲染 + zxzM 折叠重算（多轮历史消息时尤其卡主界面）。
+  -- 跟随判断在调度时缓存（见 _schedule_render 注释）。
+  _schedule_render()
+end
+
+--- 同步执行待处理的渲染与推理分片（测试用：事件流在真实环境走 schedule，
+--- 单测在事件循环外发射事件后需要手动冲刷才能断言 buffer 内容）
+function M.flush()
+  if reasoning_flush_scheduled then
+    _flush_reasoning()
+  end
+  if render_scheduled and not render_flushed then
+    _do_render()
   end
 end
 
 --- 实时显示当前 Agent 的推理；正文开始或推理结束后会自动关闭。
+--- 光标不跟随（用户回看上方内容）时不弹出思考悬浮窗，仅照常渲染到聊天 buffer。
 --- @param payload table
 local function _on_reasoning_chunk(payload)
   if not payload or payload.agent_id ~= state.agent_id then return end
   if payload.chunk then
-    reasoning_panel.append(payload.chunk)
+    -- 新一轮推理（如工具循环第二/多轮 turn）会重新发射分片：重置取消标记，
+    -- 允许后续分片正常冲刷到悬浮窗。
+    reasoning_cancelled = false
+    -- 光标不跟随时抑制思考悬浮窗：既不缓存分片也不调度冲刷，避免弹出悬浮窗干扰查看。
+    -- 用实时光标位置判断（而非缓存的 state.following），用户切回底部后下一分片即可恢复。
+    if not _cursor_within_follow_margin() then return end
+    reasoning_pending = reasoning_pending .. payload.chunk
+    if not reasoning_flush_scheduled then
+      reasoning_flush_scheduled = true
+      vim.schedule(_flush_reasoning)
+    end
   else
+    if not _cursor_within_follow_margin() then return end
     reasoning_panel.show(payload.reasoning)
   end
 end
@@ -113,7 +251,7 @@ end
 local function _tool_tick()
   state.tool_tick = nil
   if not M.has_window() then return end
-  _render()
+  _schedule_render()
   if fold.has_running() then
     state.tool_tick = vim.fn.timer_start(TOOL_TICK_MS, _tool_tick, vim.empty_dict())
   end
@@ -131,7 +269,7 @@ local function _on_tool_started(payload)
   if payload.tool_call_id then
     fold.record_start(payload.tool_call_id)
   end
-  _render()
+  _schedule_render()
   _schedule_tool_tick()
 end
 
@@ -144,7 +282,7 @@ local function _on_tool_finished(payload)
     local status = payload.error ~= nil and "failure" or "success"
     fold.record_end(payload.tool_call_id, payload.duration_ms, status)
   end
-  _render()
+  _schedule_render()
   if not fold.has_running() then
     _stop_tool_tick()
   end
@@ -153,6 +291,8 @@ end
 --- @param payload table
 local function _close_reasoning_panel(payload)
   if not payload or payload.agent_id ~= state.agent_id then return end
+  -- 推理结束：取消尚未冲刷的分片（避免已排队的 flush 回调重新打开悬浮窗），再关闭。
+  _cancel_pending_reasoning()
   reasoning_panel.close()
 end
 
@@ -239,6 +379,25 @@ local function _build_chat_actions()
       vim.notify("[NeoAI] 模式已切换: " .. (names[mode] or mode), vim.log.levels.INFO)
       _render()
     end,
+    approve_plan = function()
+      local function report(result)
+        if result and result.approved then
+          vim.notify(("[NeoAI] 计划已确认，已转入 CHAT 模式，任务清单 %d 项"):format(result.todo_count or 0), vim.log.levels.INFO)
+        else
+          vim.notify("[NeoAI] 确认计划失败: " .. tostring(result and result.error or "未知错误"), vim.log.levels.WARN)
+        end
+        _render()
+      end
+      local result = chat_service.approve_plan()
+      if result and result.then_ then
+        result:then_(report, function(err)
+          vim.notify("[NeoAI] 确认计划失败: " .. tostring(err and err.message or err), vim.log.levels.WARN)
+          _render()
+        end)
+      else
+        report(result)
+      end
+    end,
     tool_approval = function()
       require("NeoAI.ui.components.tool_approval").init()
     end,
@@ -320,6 +479,7 @@ function M.open(opts)
   local created = window_manager.create("chat", { title = "NeoAI Chat" })
   state.win_id = created.win_id
   state.buf = created.buf
+  state.following = true
   vim.bo[state.buf].modifiable = true
   vim.wo[state.win_id].wrap = true
   -- 推理正文与工具内容由 message_list 缩进两个空格，标题保持可见。
@@ -382,6 +542,11 @@ function M.close()
   _stop_tool_tick()
   fold.clear_timing()
   reasoning_panel.close()
+  -- 清理缓存中的推理分片与待调度渲染，避免窗口重开后残留
+  reasoning_pending = ""
+  reasoning_flush_scheduled = false
+  reasoning_cancelled = true
+  render_scheduled = false
   status_float.detach()
   if state.input_win_id and vim.api.nvim_win_is_valid(state.input_win_id) then
     pcall(vim.api.nvim_win_close, state.input_win_id, true)
@@ -402,6 +567,7 @@ function M.close()
   state.buf = nil
   state.input_win_id = nil
   state.agent_id = nil
+  state.following = true
 end
 
 --- 是否有打开的窗口

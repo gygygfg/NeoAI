@@ -112,7 +112,8 @@ NeoAI/
 │       ├── tree_ops.lua       # treesitter 解析/查询/删除节点
 │       ├── log_ops.lua        # 日志读写工具
 │       ├── plan.lua           # 子 Agent 创建/监控/取消（含边界审核）
-│       ├── plan_mode.lua      # 计划模式（进入/退出/提交计划）
+│       ├── plan_mode.lua      # 计划模式（只读工具上下文 + 格式化计划 + 确认转 CHAT）
+│       ├── ask_user.lua       # 向用户提问工具（UI seam）
 │       ├── todo.lua           # 待办清单（整表替换语义）
 │       └── tool_helpers.lua   # define_tool 辅助函数
 │
@@ -557,7 +558,7 @@ if signal:aborted() then return end
 - `send_message(content)` — 发送消息（创建或复用当前 Agent）。
 - `attach_window` / `detach_window` — 绑定/解绑窗口（关闭时持久化 + 清理审批）。
 - `new_session` / `load_session` — 新建/加载会话（还原计划模式、待办清单）。
-- `toggle_plan_mode` / `toggle_auto_mode` / `cycle_mode` / `get_mode` / `cancel_generation` / `switch_model` / `get_todos`。
+- `toggle_plan_mode` / `toggle_auto_mode` / `cycle_mode` / `approve_plan` / `get_mode` / `cancel_generation` / `switch_model` / `get_todos`。
 
 ### `services/tool_service.lua` — 工具服务
 
@@ -859,7 +860,7 @@ require("NeoAI").setup({
     external = {},
     guard = { repeat_tool = { enabled, thresholds = {3,5,8}, messages } },
     todo = { enabled = true },
-    plan_mode = { enabled = true, mutating_tools = {...} },
+    plan_mode = { enabled = true, auto_execute_on_approve = true, extra_safe_tools = {}, mutating_tools = {...} },
     approval = {
       mode = "prompt",             -- prompt | auto_allow | strict
       default_auto_allow = false,
@@ -1029,7 +1030,8 @@ async.all({ deferred1, deferred2 })
 | `tools/builtin/tree_ops.lua` | treesitter 解析/查询/删除节点            |
 | `tools/builtin/log_ops.lua`  | 日志读写工具                             |
 | `tools/builtin/plan.lua`     | 子 Agent 创建/监控/取消（含边界审核）    |
-| `tools/builtin/plan_mode.lua`| 计划模式（进入/退出/提交计划）           |
+| `tools/builtin/plan_mode.lua`| 计划模式（只读工具上下文 + 格式化计划 + 确认转 CHAT）|
+| `tools/builtin/ask_user.lua` | 向用户提问工具（UI seam + vim.ui.input 回退）      |
 | `tools/builtin/todo.lua`     | 待办清单（整表替换语义 + 系统提示注入）  |
 | `ui/components/fold.lua`     | 折叠组件                                 |
 | `ui/components/status_float.lua` | 状态浮窗                              |
@@ -1047,5 +1049,6 @@ async.all({ deferred1, deferred2 })
 | `tree_ops.lua` | `parse_file` / `get_node_at_position` / `get_node_type` / `get_node_range` / `is_named_node` / `get_parent_node` / `get_child_nodes` / `get_node_code` / `query_tree` / `delete_node` |
 | `log_ops.lua`  | `log_message` / `get_log_levels` |
 | `plan.lua`     | `create_sub_agent` / `get_sub_agent_status` / `wait_sub_agent` / `cancel_sub_agent` |
-| `plan_mode.lua`| `enter_plan_mode` / `set_plan` / `present_plan` / `exit_plan_mode` |
+| `plan_mode.lua`| `enter_plan_mode`（工具上下文切换为只读/信息 + 提问） |
+| `ask_user.lua` | `ask_user` |
 | `todo.lua`     | `todo_write` / `todo_read` / `todo_clear` |
