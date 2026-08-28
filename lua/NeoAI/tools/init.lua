@@ -31,6 +31,7 @@ local BUILTIN_MODULES = {
   "NeoAI.tools.builtin.todo",
   "NeoAI.tools.builtin.plan_mode",
   "NeoAI.tools.builtin.ask_user",
+  "NeoAI.tools.builtin.read_image",
 }
 
 --- 加载内置工具

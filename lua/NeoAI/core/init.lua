@@ -16,6 +16,10 @@ M.model = {
   fetcher = require("NeoAI.core.model.fetcher"),
   adapter = require("NeoAI.core.model.adapter"),
   cache = require("NeoAI.core.model.cache"),
+  content = require("NeoAI.core.model.content"),
+}
+M.attachment = {
+  store = require("NeoAI.core.attachment.attachment"),
 }
 M.agent = {
   runtime = require("NeoAI.core.agent.runtime"),

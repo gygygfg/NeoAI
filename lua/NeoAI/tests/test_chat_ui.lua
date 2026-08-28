@@ -56,6 +56,37 @@ tests.suite("chat_ui", function(_, it)
     chat_service.reset()
   end)
 
+  it("打开已加载会话时主界面光标先定位到消息底部再聚焦输入框", function(t)
+    local config_store = require("NeoAI.kernel.config_store")
+    local fs = require("NeoAI.utils.fs")
+    local session_store = require("NeoAI.core.session.session_store")
+    local chat_view = require("NeoAI.ui.window.chat_view")
+    local chat_service = require("NeoAI.services.chat_service")
+    config_store.load({ session = { save_path = "/tmp/neoai_chat_cursor_test", file = "sessions.jsonl" } })
+    chat_view.reset()
+    chat_service.reset()
+    session_store.reset()
+    fs.delete_file("/tmp/neoai_chat_cursor_test/sessions.jsonl")
+    session_store.init()
+
+    local session = session_store.create({
+      messages = {
+        { role = "user", content = "问题" },
+        { role = "assistant", content = "回答" },
+      },
+    })
+    local opened = chat_view.open({ session_id = session.id })
+
+    -- 打开后焦点虽在输入框，主界面光标应已定位到消息最底部
+    local line_count = vim.api.nvim_buf_line_count(opened.buf)
+    local cur = vim.api.nvim_win_get_cursor(opened.win_id)
+    t.eq(line_count, cur[1], "主界面光标应位于最后一行")
+
+    chat_view.reset()
+    chat_service.reset()
+    session_store.reset()
+  end)
+
   it("流式推理显示悬浮窗并在完成或正文开始时关闭", function(t)
     local chat_view = require("NeoAI.ui.window.chat_view")
     local chat_service = require("NeoAI.services.chat_service")
@@ -1141,6 +1172,56 @@ tests.suite("chat_ui", function(_, it)
     end
     t.true_(reason_line2 > 0, "流式更新后推理内容仍在 buffer")
     t.eq(-1, vim.fn.foldclosed(reason_line2), "光标不跟随时不应把已展开的折叠重新收起")
+
+    chat_view.reset()
+    chat_service.reset()
+  end)
+
+  it("跟随模式折叠后光标可视化回到窗口底部（而非被拽到窗口上面）", function(t)
+    local chat_view = require("NeoAI.ui.window.chat_view")
+    local chat_service = require("NeoAI.services.chat_service")
+    local event_bus = require("NeoAI.kernel.event_bus")
+    local events = require("NeoAI.kernel.events")
+    chat_view.reset()
+    chat_service.reset()
+
+    local opened = chat_view.open()
+    local agent = chat_service.get_current_agent()
+    -- 足够多非缩进的普通行，使窗口显示高度有限，折叠块位于正文末尾
+    local plain = {}
+    for i = 1, 40 do plain[#plain + 1] = "普通行 " .. i end
+    agent.messages = {
+      { role = "user", content = "q1" },
+      { role = "assistant", content = table.concat(plain, "\n"), tool_calls = {
+        { id = "c1", ["function"] = { name = "run_command", arguments = "{}" } },
+      } },
+      { role = "tool", tool_call_id = "c1", tool_name = "run_command", content = "" },
+    }
+    chat_view.refresh()
+    vim.api.nvim_set_current_win(opened.win_id)
+
+    -- 光标停在底部（跟随流式输出），关闭本地 scrolloff 使 zb 能贴到底
+    local total = vim.api.nvim_buf_line_count(opened.buf)
+    vim.wo[opened.win_id].scrolloff = 0
+    vim.api.nvim_win_set_cursor(opened.win_id, { total, 0 })
+
+    -- 折叠块一次到达多行：此前 _render 里 zM 收起折叠后，_scroll_to_end 只 set_cursor
+    -- 到最后一行，nvim 把可视化光标放到折叠首行，导致 winline 接近窗口顶部（光标"跳到窗口上面"）。
+    -- 修复后在 set_cursor 后追加 zb 把光标行平移到窗口底部。
+    local result = agent.messages[3]
+    local ls = {}
+    for i = 1, 25 do ls[#ls + 1] = "结果行 " .. i end
+    result.content = table.concat(ls, "\n")
+    event_bus.emit(events.MESSAGE_UPDATED, { agent_id = agent.id, message = result })
+    chat_view.flush()
+
+    local cur = vim.api.nvim_win_get_cursor(opened.win_id)
+    local line_count = vim.api.nvim_buf_line_count(opened.buf)
+    local winh = vim.fn.winheight(0)
+    t.eq(line_count, cur[1], "光标逻辑行应跟随到最后一行")
+    local winline = vim.fn.winline()
+    t.true_(winline >= winh - 1,
+      string.format("折叠后光标视窗行应贴到窗口底部（winline=%d/winheight=%d），而非跳到窗口上面", winline, winh))
 
     chat_view.reset()
     chat_service.reset()

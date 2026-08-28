@@ -10,6 +10,7 @@ local model_picker = require("NeoAI.ui.components.model_picker")
 local reasoning_panel = require("NeoAI.ui.components.reasoning_panel")
 local status_float = require("NeoAI.ui.components.status_float")
 local fold = require("NeoAI.ui.components.fold")
+local display_modes = require("NeoAI.ui.components.display_modes")
 local chat_service = require("NeoAI.services.chat_service")
 local event_bus = require("NeoAI.kernel.event_bus")
 local events = require("NeoAI.kernel.events")
@@ -113,6 +114,13 @@ local function _scroll_to_end()
   if vim.api.nvim_win_get_buf(state.win_id) ~= state.buf then return end
   local line_count = vim.api.nvim_buf_line_count(state.buf)
   vim.api.nvim_win_set_cursor(state.win_id, { math.max(1, line_count), 0 })
+  -- 光标落在被折叠的行上时，nvim 会把可视光标放在折叠首行而非窗口底部，
+  -- 在跟随模式下 _render 里 zM 收起整个 buffer 后光标因此被"拽到窗口上面"
+  -- （winline 变成接近 1）。这里在折叠后的状态下用 zb 把光标行平移到窗口底部，
+  -- 光标逻辑行仍停留在最后一行，仅滚动窗口，从而保持跟随到最底部。
+  vim.api.nvim_win_call(state.win_id, function()
+    vim.cmd("silent! normal! zb")
+  end)
 end
 
 -- 渲染合并：流式分片 / 工具事件在同一个事件循环 tick 内可能连续触发多次，
@@ -363,6 +371,18 @@ local function _switch_model()
   end)
 end
 
+--- 构建显示模式插件的宿主 API（chat_view.open 时注入 display_modes）
+--- @return table
+local function _build_host()
+  return {
+    get_buf = function() return state.buf end,
+    get_messages = function() return chat_service.get_messages() end,
+    set_foldexpr = function(fn) fold.set_foldexpr_override(fn) end,
+    set_foldtext = function(fn) fold.set_foldtext_override(fn) end,
+    refresh = function() M.refresh() end,
+  }
+end
+
 --- 构建 buffer 无关的 chat 上下文 actions（主界面与输入框共用）。
 --- send/insert 在主界面语义为「聚焦输入框」，输入框内会单独覆盖为发送/进入插入。
 --- @return table action -> handler
@@ -382,6 +402,23 @@ local function _build_chat_actions()
       local mode = chat_service.cycle_mode()
       vim.notify("[NeoAI] 模式已切换: " .. (names[mode] or mode), vim.log.levels.INFO)
       _render()
+    end,
+    cycle_display = function()
+      local plugin = display_modes.cycle()
+      if plugin then
+        vim.notify("[NeoAI] 显示模式已切换: " .. (plugin.label or plugin.name), vim.log.levels.INFO)
+      end
+    end,
+    reload_display = function()
+      local name = display_modes.get_current_name()
+      if not name then
+        vim.notify("[NeoAI] 无当前显示模式可重载", vim.log.levels.WARN)
+        return
+      end
+      local plugin = display_modes.reload(name)
+      if plugin then
+        vim.notify("[NeoAI] 显示模式已热重载: " .. (plugin.label or plugin.name), vim.log.levels.INFO)
+      end
     end,
     approve_plan = function()
       local function report(result)
@@ -452,7 +489,7 @@ end
 -- ========== 公开 API ==========
 
 --- 打开聊天窗口
---- @param opts table|nil { session_id? }
+--- @param opts table|nil { session_id?, round? }
 --- @return table { win_id, buf }
 function M.open(opts)
   opts = opts or {}
@@ -460,7 +497,7 @@ function M.open(opts)
     if opts.session_id and opts.session_id ~= chat_service.get_current_session_id() then
       -- Tree selection must replace the active conversation, not reuse its buffer.
       chat_service.detach_window(state.win_id)
-      local agent = chat_service.load_session(opts.session_id)
+      local agent = chat_service.load_session(opts.session_id, { round = opts.round })
       state.agent_id = agent.id
       chat_service.attach_window(state.win_id, agent)
       reasoning_panel.close()
@@ -486,6 +523,9 @@ function M.open(opts)
   state.following = true
   vim.bo[state.buf].modifiable = true
   vim.wo[state.win_id].wrap = true
+  -- 聊天窗口滚动行为固定为"贴底"：关闭本窗口的 scrolloff，避免用户全局 scrolloff
+  -- 让跟随滚动的 zb 停在离底部数行处，而非真正贴到窗口底部。
+  vim.wo[state.win_id].scrolloff = 0
   -- 推理正文与工具内容由 message_list 缩进两个空格，标题保持可见。
   -- 用 expr 折叠（components.fold.foldexpr）：推理 / 每个工具块（调用+结果）
   -- 各自独立成折叠，块与块之间无需分隔行（indent 折叠需要分隔行才能拆开相邻块）。
@@ -509,14 +549,22 @@ function M.open(opts)
   -- 获取/创建 Agent（若有 session_id 则加载已有会话）
   local agent
   if opts.session_id then
-    agent = chat_service.load_session(opts.session_id)
+    agent = chat_service.load_session(opts.session_id, { round = opts.round })
   else
     agent = chat_service.new_session({})
   end
   state.agent_id = agent.id
   chat_service.attach_window(state.win_id, agent)
 
+  -- 显示模式插件：注入宿主 API，激活默认（或上次）显示模式。
+  -- force=true 让插件用当前 host 重新执行 load（窗口重开后引用的是新的 buf/窗口）。
+  display_modes.attach(_build_host())
+  display_modes.activate(display_modes.get_current_name() or "chat", { force = true })
+
   _render()
+  -- 先把主界面光标放到消息最底部，再聚焦输入框，
+  -- 否则用户切回主界面时光标停留在折叠收起处（通常在第 1 行）。
+  _scroll_to_end()
   _set_keymaps()
   _create_input_area()
   input_box.focus()
@@ -546,6 +594,8 @@ function M.close()
   _stop_tool_tick()
   fold.clear_timing()
   reasoning_panel.close()
+  -- 卸载当前显示模式插件（还原折叠覆盖）
+  display_modes.detach()
   -- 清理缓存中的推理分片与待调度渲染，避免窗口重开后残留
   reasoning_pending = ""
   reasoning_flush_scheduled = false
@@ -593,11 +643,33 @@ function M.show_status()
     vim.notify("[NeoAI] 无当前 Agent", vim.log.levels.WARN)
     return
   end
+  local mode = display_modes.get_current()
+  local mode_str = mode and (mode.label or mode.name) or "对话"
   vim.notify(
-    string.format("[NeoAI] Agent: %s | 状态: %s | 消息: %d | 模型: %s",
-      agent.id, agent.state, #agent.messages, agent.model or "auto"),
+    string.format("[NeoAI] Agent: %s | 状态: %s | 消息: %d | 模型: %s | 显示: %s",
+      agent.id, agent.state, #agent.messages, agent.model or "auto", mode_str),
     vim.log.levels.INFO
   )
+end
+
+--- 循环切换显示模式
+--- @return table|nil 新激活的显示模式插件
+function M.cycle_display()
+  return display_modes.cycle()
+end
+
+--- 激活指定显示模式
+--- @param name string 模式名（chat / trajectory / 自定义注册的模式）
+--- @return table|nil
+function M.set_display(name)
+  return display_modes.activate(name)
+end
+
+--- 热重载显示模式插件（缺省重载当前激活的模式）
+--- @param name string|nil
+--- @return table|nil
+function M.reload_display(name)
+  return display_modes.reload(name)
 end
 
 --- 重置（测试用）

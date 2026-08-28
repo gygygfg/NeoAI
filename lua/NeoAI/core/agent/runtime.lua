@@ -115,6 +115,13 @@ local function _run_generation(agent, opts)
       if response.usage then agent:add_usage(response.usage) end
       local tool_calls = proc.finish()
 
+      -- 附加本轮原始请求/响应元数据（轨迹显示用；不进入模型上下文）
+      local request = require("NeoAI.core.agent.request")
+      agent:attach_round(request.build_round_meta(response, {
+        ttft_ms = first_chunk_ms and (first_chunk_ms - start_ms) or nil,
+        total_ms = vim.uv.hrtime() / 1e6 - start_ms,
+      }))
+
       if tool_calls and #tool_calls > 0 then
         local tool_loop = require("NeoAI.core.agent.tool_loop")
         return tool_loop.run(agent, tool_calls, tool_service, {}):then_(function()

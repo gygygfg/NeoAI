@@ -44,6 +44,40 @@ tests.suite("chat_keys", function(_, it)
     t.nil_(submitted)
     input_box.reset()
   end)
+  it("创建输入框时放开 nvim-cmp（prompt buffer 也能触发路径补全）", function(t)
+    local input_box = require("NeoAI.ui.components.input_box")
+    input_box.reset()
+
+    -- 打桩 require('cmp')，捕获 setup.filetype 调用，验证对 neoai_input 放开 enabled
+    local filetype_calls = {}
+    local mock_cmp = {
+      setup = {
+        filetype = function(ft, cfg)
+          filetype_calls[#filetype_calls + 1] = { ft = ft, cfg = cfg }
+        end,
+      },
+    }
+    local prev_preload = package.preload["cmp"]
+    local prev_loaded = package.loaded["cmp"]
+    package.preload["cmp"] = function() return mock_cmp end
+    package.loaded["cmp"] = nil
+
+    local ok = pcall(function()
+      input_box.create({ on_submit = function() end })
+    end)
+
+    -- 恢复 require('cmp')，避免污染其它用例
+    package.preload["cmp"] = prev_preload
+    package.loaded["cmp"] = prev_loaded
+
+    t.true_(ok, "创建输入框不应因 cmp 打桩而抛错")
+    t.eq(1, #filetype_calls, "创建输入框应调用一次 cmp.setup.filetype")
+    t.eq("neoai_input", filetype_calls[1].ft, "应对 neoai_input 这个 filetype 放开补全")
+    t.not_nil(filetype_calls[1].cfg.enabled, "应传入 enabled 判定函数")
+    t.true_(filetype_calls[1].cfg.enabled(), "enabled 应返回 true，从而放开 prompt buffer 的补全")
+
+    input_box.reset()
+  end)
   it("输入框同步主界面的 chat 按键且回车语义正确（insert 换行 / normal 发送）", function(t)
     local input_box = require("NeoAI.ui.components.input_box")
     input_box.reset()

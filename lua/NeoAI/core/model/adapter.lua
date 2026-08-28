@@ -9,7 +9,7 @@ local M = {}
 
 --- 默认模型列表（当获取失败且无缓存时兜底）
 local FALLBACK_MODELS = {
-  deepseek = { "deepseek-v4-flash", "deepseek-v4-pro" },
+  deepseek = { "deepseek-v4-flash", "deepseek-v4-pro", "deepseek-v4-flash-vision-exp" },
   openai = { "gpt-4o", "gpt-4o-mini", "gpt-4-turbo" },
   anthropic = { "claude-sonnet-4-20250514", "claude-3-5-sonnet-20241022" },
   google = { "gemini-2.0-flash", "gemini-1.5-pro" },

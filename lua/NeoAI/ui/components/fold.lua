@@ -6,6 +6,39 @@
 
 local M = {}
 
+-- ========== 显示模式覆盖钩子 ==========
+-- 显示模式插件（NeoAI.ui.components.display_modes.*）通过这里的覆盖钩子安装/卸载
+-- 各自的折叠行为：默认（块折叠）与轨迹模式（按 turn 折叠）使用同一套 expr 折叠，
+-- 但 foldexpr/foldtext 的求值逻辑不同。覆盖为空时回退到本模块的默认实现。
+-- 由 chat_view 在插件 load/unload 时写入。
+
+local foldexpr_override = nil
+local foldtext_override = nil
+
+--- 安装/清除 foldexpr 覆盖回调（nil = 使用默认块折叠）
+--- @param fn function|nil 回调读取 vim.v.lnum 返回折叠等级
+function M.set_foldexpr_override(fn)
+  foldexpr_override = fn
+end
+
+--- 安装/清除 foldtext 覆盖回调（nil = 使用默认折叠文本）
+--- @param fn function|nil 回调读取 vim.v.foldstart/foldend 返回折叠文本
+function M.set_foldtext_override(fn)
+  foldtext_override = fn
+end
+
+--- 当前是否有 foldexpr 覆盖（测试/诊断用）
+--- @return boolean
+function M.has_foldexpr_override()
+  return foldexpr_override ~= nil
+end
+
+--- 当前是否有 foldtext 覆盖（测试/诊断用）
+--- @return boolean
+function M.has_foldtext_override()
+  return foldtext_override ~= nil
+end
+
 -- ========== 折叠占位文本 ==========
 
 --- 工具状态对应的折叠 emoji（首行带此 emoji 决定折叠文本的状态图标）
@@ -162,8 +195,12 @@ function M.label(first, count)
 end
 
 --- 折叠占位文本（foldtext 回调：读取 vim.v.foldstart/foldend 与折叠首行）
+--- 有显示模式覆盖时委托给当前插件的 foldtext。
 --- @return string
 function M.foldtext()
+  if foldtext_override then
+    return foldtext_override()
+  end
   local count = vim.v.foldend - vim.v.foldstart + 1
   local first = vim.fn.getline(vim.v.foldstart) or ""
   return M.label(first, count)
@@ -187,13 +224,17 @@ local function _is_tool_block_start(text)
 end
 
 --- 逐行计算折叠等级（foldmethod=expr 的 foldexpr 回调）。
---- 推理、每个工具块（调用+结果）各自独立成折叠，且块与块之间不需要任何分隔行：
+--- 默认块折叠：推理、每个工具块（调用+结果）各自独立成折叠，且块与块之间不需要任何分隔行：
 --- - 缩进 2 格的连续行构成一个折叠块；
 --- - 每个工具块首行（含 ⏳/✅/❌ 状态 emoji + 调用工具:/工具:）通过返回 ">1"
 ---   强制结束上一个折叠并开启新折叠，从而在同一缩进级别下也能把相邻工具块拆成独立折叠；
 --- - 空白行如果紧邻缩进内容则并入该折叠（推理/工具结果内的空行不会中断折叠）。
+--- 有显示模式覆盖时委托给当前插件的 foldexpr。
 --- @return string|number
 function M.foldexpr()
+  if foldexpr_override then
+    return foldexpr_override()
+  end
   local ln = vim.v.lnum
   local text = vim.fn.getline(ln)
   local prev = vim.fn.getline(ln - 1)

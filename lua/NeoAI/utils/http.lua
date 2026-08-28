@@ -65,7 +65,21 @@ local function _format_headers(headers)
 end
 
 local function _build_args(opts)
-  local args = { "-sS", "--no-buffer", "--max-time", tostring((opts.timeout_ms or 30000) / 1000) }
+  local args = { "-sS", "--no-buffer" }
+  if opts.stream then
+    -- 流式请求：用空闲超时（--speed-time/--speed-limit）替代总时长上限（--max-time）。
+    -- 流式（尤其是长推理 / 长生成）会在超过 timeout 秒内持续收到数据，若按总时长用
+    -- --max-time 强制掐断，会出现 curl 错误 28（"Operation timed out after ... "）且已收到
+    -- 大片数据（如 "with 2021737 bytes received"）。改为：连续 timeout_ms/1000 秒无任何
+    -- 数据到达才判定为超时中断；只要数据持续流动就不再限时，避免长耗时流被误杀。
+    args[#args + 1] = "--speed-time"
+    args[#args + 1] = tostring((opts.timeout_ms or 30000) / 1000)
+    args[#args + 1] = "--speed-limit"
+    args[#args + 1] = "1"
+  else
+    args[#args + 1] = "--max-time"
+    args[#args + 1] = tostring((opts.timeout_ms or 30000) / 1000)
+  end
   if _supports_fail_with_body() then
     -- 4xx/5xx 以非零退出码结束并保留响应体，避免错误被静默吞掉
     args[#args + 1] = "--fail-with-body"

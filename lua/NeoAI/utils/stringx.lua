@@ -150,4 +150,73 @@ function M.clean_text(s)
   return (s:gsub("\n[ \t]*\n+", "\n\n"):gsub("%s+$", ""))
 end
 
+--- 判定指定位置是否存在合法 UTF-8 序列，返回其长度；非法则返回 0
+--- @param s string
+--- @param i number 起始字节位置（1 索引）
+--- @return number
+local function _utf8_sequence_len(s, i)
+  local b1 = s:byte(i)
+  if not b1 then return 0 end
+  if b1 <= 0x7F then return 1 end
+  local len = 1
+  local lo, hi = 0, 0
+  if b1 >= 0xC2 and b1 <= 0xDF then
+    len = 2
+  elseif b1 >= 0xE0 and b1 <= 0xEF then
+    len = 3
+    if b1 == 0xE0 then lo = 0xA0
+    elseif b1 == 0xED then hi = 0x9F end
+  elseif b1 >= 0xF0 and b1 <= 0xF4 then
+    len = 4
+    if b1 == 0xF0 then lo = 0x90
+    elseif b1 == 0xF4 then hi = 0x8F end
+  else
+    return 0 -- 非法首字节（0x80-0xC1、0xF5-0xFF）
+  end
+  if i + len - 1 > #s then return 0 end
+  local b2 = s:byte(i + 1)
+  if b2 < 0x80 or b2 > 0xBF then return 0 end
+  if lo > 0 and b2 < lo then return 0 end
+  if hi > 0 and b2 > hi then return 0 end
+  for k = 3, len do
+    local b = s:byte(i + k - 1)
+    if b < 0x80 or b > 0xBF then return 0 end
+  end
+  return len
+end
+
+--- 将字符串修复为合法 UTF-8：非法字节序替换为 U+FFFD（替换字符）
+--- vim.json.encode 会把非法 UTF-8 字节原样透传进 JSON 输出，导致对方严格 JSON
+--- 解析器报 "invalid unicode code point"。本函数在编码前清洗，保持合法内容不变。
+--- @param s string|nil
+--- @return string|nil
+function M.sanitize_utf8(s)
+  if not s or s == "" then return s end
+  local i, n = 1, #s
+  local changed = false
+  while i <= n do
+    local len = _utf8_sequence_len(s, i)
+    if len == 0 then
+      changed = true
+      i = i + 1
+    else
+      i = i + len
+    end
+  end
+  if not changed then return s end
+  local buf = {}
+  i = 1
+  while i <= n do
+    local len = _utf8_sequence_len(s, i)
+    if len == 0 then
+      buf[#buf + 1] = "\xef\xbf\xbd" -- U+FFFD
+      i = i + 1
+    else
+      buf[#buf + 1] = s:sub(i, i + len - 1)
+      i = i + len
+    end
+  end
+  return table.concat(buf)
+end
+
 return M

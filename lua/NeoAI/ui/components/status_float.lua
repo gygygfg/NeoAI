@@ -35,6 +35,12 @@ local function _build_lines()
   local mode = chat_service.get_mode()
   local label = mode == "auto" and "AUTO" or (mode == "plan" and "PLAN" or "CHAT")
   lines[#lines + 1] = "[" .. label .. "]"
+  -- 显示模式徽标（对话/轨迹等）
+  local display_modes = require("NeoAI.ui.components.display_modes")
+  local disp = display_modes.get_current()
+  if disp then
+    lines[#lines + 1] = "[" .. (disp.label or disp.name) .. "]"
+  end
   if plan.active then
     if plan.plan and plan.plan ~= "" then
       lines[#lines + 1] = "计划: " .. stringx.truncate(plan.plan:gsub("%s+", " "), 48)
@@ -137,7 +143,7 @@ function M.attach(parent_win)
   local subscribe = { events.PLAN_MODE_CHANGED, events.TODO_UPDATED, events.AGENT_STATE_CHANGED,
     events.MODEL_SWITCHED, events.MESSAGE_ADDED, events.GENERATION_STARTED,
     events.GENERATION_COMPLETED, events.GENERATION_ERROR, events.AGENT_ABORTED,
-    events.SESSION_LOADED, events.AUTO_MODE_CHANGED }
+    events.SESSION_LOADED, events.AUTO_MODE_CHANGED, events.DISPLAY_MODE_CHANGED }
   for _, ev in ipairs(subscribe) do
     state.unsubs[#state.unsubs + 1] = event_bus.on(ev, refresh)
   end

@@ -106,4 +106,72 @@ tests.suite("services", function(_, it)
     t.eq("历史消息", agent.messages[1].content)
     t.eq(s.id, chat.get_current_session_id())
   end)
+
+  it("chat_service load_session 载入祖先链与下游单子链", function(t)
+    local config_store = require("NeoAI.kernel.config_store")
+    config_store.load({
+      ai = { default_provider = "deepseek", default_model = "m1" },
+      session = { save_path = "/tmp/neoai_test_svc3", file = "s.jsonl" },
+    })
+    local session_store = require("NeoAI.core.session.session_store")
+    local fs = require("NeoAI.utils.fs")
+    local chat = require("NeoAI.services.chat_service")
+    chat.reset()
+    session_store.reset()
+    fs.delete_file("/tmp/neoai_test_svc3/s.jsonl")
+    session_store.init()
+
+    local function msgs(ms)
+      local out = {}
+      for _, content in ipairs(ms) do
+        out[#out + 1] = { role = "user", content = content }
+        out[#out + 1] = { role = "assistant", content = "回复:" .. content }
+      end
+      return out
+    end
+
+    local a = session_store.create({ messages = msgs({ "A1", "A2" }) })
+    local b = session_store.create({ parent_id = a.id, messages = msgs({ "B1", "B2" }) })
+    local d = session_store.create({ parent_id = b.id, messages = msgs({ "D1" }) })
+    session_store.create({ parent_id = a.id, messages = msgs({ "C1" }) })
+
+    local chain = session_store.get_chain(b.id)
+    t.eq(a.id, chain[1].id)
+    t.eq(b.id, chain[2].id)
+
+    local down = session_store.get_downstream(b.id)
+    t.eq(1, #down)
+    t.eq(d.id, down[1].id)
+    t.eq(0, #session_store.get_downstream(d.id), "末尾无子会话应返回空")
+
+    -- 选中 B：祖先 A 全部 + B 全部 + 下游 D 全部 = 4 + 4 + 2 = 10 条
+    local agent = chat.load_session(b.id)
+    t.eq(10, #agent.messages)
+    t.eq(b.id, chat.get_current_session_id(), "当前会话仍为选中的 B")
+    local contents = {}
+    for _, m in ipairs(agent.messages) do contents[#contents + 1] = m.content end
+    t.deep_eq(
+      { "A1", "回复:A1", "A2", "回复:A2", "B1", "回复:B1", "B2", "回复:B2", "D1", "回复:D1" },
+      contents,
+      "祖先/选中/下游消息应按顺序拼接"
+    )
+    for _, m in ipairs(agent.messages) do
+      t.eq(true, m._synced, "链上消息必须标记已同步，避免写入选中会话")
+    end
+
+    -- 选中 B 的轮次 1：B 只保留到本轮，下游仍全部 = 4 + 2 + 2 = 8 条
+    chat.reset()
+    agent = chat.load_session(b.id, { round = 1 })
+    t.eq(8, #agent.messages)
+    t.eq("B1", agent.messages[5].content)
+    t.eq("D1", agent.messages[7].content)
+
+    -- 选中根 A 且其下有分裂分支：A 全部，下游为空
+    chat.reset()
+    agent = chat.load_session(a.id)
+    t.eq(4, #agent.messages)
+    chat.reset()
+    agent = chat.load_session(a.id, { round = 2 })
+    t.eq(4, #agent.messages)
+  end)
 end)

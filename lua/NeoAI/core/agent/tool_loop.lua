@@ -159,6 +159,12 @@ local function _send_round(agent)
     -- 内容已由 on_chunk 增量写入 agent，这里仅终结工具调用
     if response.usage then agent:add_usage(response.usage) end
     local next_calls = proc.finish()
+    -- 附加本轮原始请求/响应元数据（轨迹显示用；不进入模型上下文）
+    local request = require("NeoAI.core.agent.request")
+    agent:attach_round(request.build_round_meta(response, {
+      ttft_ms = first_chunk_ms and (first_chunk_ms - start_ms) or nil,
+      total_ms = vim.uv.hrtime() / 1e6 - start_ms,
+    }))
     return { next_calls = next_calls, response = response }
   end)
 end

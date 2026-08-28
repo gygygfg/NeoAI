@@ -18,6 +18,7 @@
 - **高度可配置** — 完整的键位绑定、UI 布局、日志级别等自定义配置
 - **纯lua编写** — 无需安装额外的依赖
 - **⚠️⚠️⚠️使用curl发送请求** 环境变量内没有curl可能无法发送请求
+- **多模态图像** — `read_image` 工具读入 PNG/JPEG/WebP/GIF 并注入多模态模型（内容寻址附件存储 + 请求期像素/字节预算 offload，模型不支持图像时自动降级为文本）
 
 ---
 
@@ -99,6 +100,8 @@ require("NeoAI").setup({
 | `:NeoAIKeymaps`    | 显示当前键位配置                                 |
 | `:NeoAITest`       | 运行测试（不带参数运行全部，带参数运行指定测试） |
 | `:NeoAIChatStatus` | 显示聊天窗口状态                                 |
+| `:NeoAICycleDisplay`| 循环切换聊天显示模式（对话/轨迹）                  |
+| `:NeoAIReloadDisplay`| 热重载显示模式插件（缺省重载当前模式）            |
 | `:NeoAIPlan`       | 切换计划模式（工具上下文只保留只读/信息查询 + 提问）|
 | `:NeoAIApprovePlan`| 确认计划并转入 CHAT 模式按任务清单执行             |
 
@@ -203,6 +206,11 @@ require("NeoAI").setup({
       switch_model = { key = "M", desc = "切换模型" },
       toggle_reasoning = { key = "r", desc = "切换思考过程显示" },
       cycle_mode = { key = "m", desc = "循环切换模式（CHAT/PLAN/AUTO）" },
+      cycle_display = {
+        insert = { key = "<C-t>", desc = "循环切换显示模式（对话/轨迹）" },
+        normal = { key = "T", desc = "循环切换显示模式（对话/轨迹）" },
+      },
+      reload_display = { key = "<F5>", desc = "热重载当前显示模式插件" },
       approve_plan = { key = "P", desc = "确认计划并转入 CHAT 执行" },
       approval = {
         confirm = { key = "<CR>", desc = "允许一次" },
@@ -255,6 +263,42 @@ require("NeoAI").setup({
 })
 ```
 
+### 多模态（视觉）配置
+
+NeoAI 支持把图像注入多模态模型：
+
+```lua
+ai = {
+  -- ...其余配置...
+  attachments = {
+    enabled = true, -- 多模态总开关
+    path = vim.fn.stdpath("cache") .. "/NeoAI/attachments", -- 内容寻址附件存储目录
+    vision_models = {
+      "deepseek-v4-flash-vision-exp", -- 声明支持图像输入的模型 id 或 provider:model
+    },
+    vision_model_heuristics = { "vision", "-vl", "4o", "gemini" }, -- 按 id 子串自动识别视觉模型
+    media_types = { "image/png", "image/jpeg", "image/webp", "image/gif" },
+    limits = {
+      max_image_bytes = 20 * 1024 * 1024,
+      max_images_per_message = 16,
+      max_message_image_bytes = 40 * 1024 * 1024,
+      max_image_pixels = 50000000,
+      max_image_dimension = 8000,
+    },
+    request_image = {
+      max_pixels = 640000, -- 单请求图像像素预算
+      max_bytes = 1024 * 1024, -- 单请求图像编码字节上限
+      max_images_per_request = 8, -- 单请求最多保留图像（超出丢最旧）
+      max_request_bytes = 20 * 1024 * 1024,
+    },
+  },
+}
+```
+
+> 图像内容寻址存储于 `attachments.path`，会话消息只保存不可变引用；发送请求时才解析为
+> `image_url`（data URL）按模型 route 的像素/字节预算注入，超限的**最旧**图像被替换为
+> 文本占位。模型不支持图像时自动降级，不阻塞调用。
+
 </details>
 
 ---
@@ -275,6 +319,7 @@ NeoAI 内置了 40+ 工具，AI 可在对话中自动调用，涵盖以下类别
 | `ensure_dir`       | 确保目录存在     | ❌ 需审批   |
 | `delete_file`      | 删除文件         | ❌ 需审批   |
 | `file_exists`      | 检查文件是否存在 | ✅ 自动允许 |
+| `read_image`       | 读取图像文件，把图像注入多模态模型 | ✅ 自动允许 |
 
 ### 🌳 代码分析工具（Tree-sitter）Neovim >= 0.6 原生支持
 

@@ -103,6 +103,48 @@ local function _persist_agent(agent)
   session_store.persist(session)
 end
 
+--- 组装会话链消息：祖先链（根→父）全部消息 + 选中会话截止本轮 + 下游单子链全部消息。
+--- 从树界面进入会话时，仅打开选中会话会丢失分支上下文；这里沿会话树
+--- 先向上遍历到首轮，再向下延展到分裂分支或末尾，拼出完整线性对话。
+--- @param session table 选中会话
+--- @param round number|nil 选中轮次（nil = 整个会话，即选择会话节点）
+--- @return table 消息数组
+local function _build_chain_messages(session, round)
+  local out = {}
+  -- 祖先链：根 → 父会话（不含选中会话自身）全部消息
+  local chain = session_store.get_chain(session.id)
+  for _, s in ipairs(chain) do
+    if s.id ~= session.id then
+      for _, m in ipairs(s.messages or {}) do
+        out[#out + 1] = m
+      end
+    end
+  end
+  -- 选中会话：截止本轮（nil = 整个会话；round N = 到第 N 条用户消息为止）
+  local selected = session.messages or {}
+  if round then
+    local user_count = 0
+    for _, m in ipairs(selected) do
+      if m.role == "user" then
+        user_count = user_count + 1
+        if user_count > round then break end
+      end
+      out[#out + 1] = m
+    end
+  else
+    for _, m in ipairs(selected) do
+      out[#out + 1] = m
+    end
+  end
+  -- 下游：沿单子链向下，各会话全部消息，直到分裂分支或末尾
+  for _, s in ipairs(session_store.get_downstream(session.id)) do
+    for _, m in ipairs(s.messages or {}) do
+      out[#out + 1] = m
+    end
+  end
+  return out
+end
+
 -- ========== 公开 API ==========
 
 --- 发送消息
@@ -353,8 +395,10 @@ end
 
 --- 加载已有会话到当前 Agent（从会话树选择时调用）
 --- @param session_id string
+--- @param opts table|nil { round? number 选中轮次；nil = 整个会话 }
 --- @return table Agent
-function M.load_session(session_id)
+function M.load_session(session_id, opts)
+  opts = opts or {}
   local session = session_store.get(session_id)
   if not session then
     return M.new_session({})
@@ -368,7 +412,7 @@ function M.load_session(session_id)
       return existing
     end
   end
-  -- 创建新 Agent 并载入会话消息
+  -- 创建新 Agent 并载入会话链消息（祖先链 + 选中会话 + 下游单子链）
   local agent = runtime.create({
     session_id = session.id,
     scenario = "chat",
@@ -376,8 +420,9 @@ function M.load_session(session_id)
   })
   local registry = require("NeoAI.tools.registry")
   agent.tools = registry.list_as_map()
-  -- 载入历史消息（标记已同步）
-  for _, msg in ipairs(session.messages or {}) do
+  -- 载入历史消息（标记已同步，避免 _persist_agent 把祖先/下游消息误写进选中会话）
+  local chain_messages = _build_chain_messages(session, opts.round)
+  for _, msg in ipairs(chain_messages) do
     local copy = vim.deepcopy(msg)
     copy._synced = true
     agent.messages[#agent.messages + 1] = copy

@@ -213,6 +213,50 @@ tests.suite("tree_ui", function(_, it)
     session_store.reset()
   end)
 
+  it("选择子会话打开完整链上下文（祖先+选中+下游）", function(t)
+    local config_store = require("NeoAI.kernel.config_store")
+    local fs = require("NeoAI.utils.fs")
+    local session_store = require("NeoAI.core.session.session_store")
+    local tree_view = require("NeoAI.ui.window.tree_view")
+    local chat_view = require("NeoAI.ui.window.chat_view")
+    local chat_service = require("NeoAI.services.chat_service")
+    config_store.load({ session = { save_path = "/tmp/neoai_tree_chain_test", file = "sessions.jsonl" } })
+    tree_view.reset()
+    chat_view.reset()
+    chat_service.reset()
+    session_store.reset()
+    fs.delete_file("/tmp/neoai_tree_chain_test/sessions.jsonl")
+    session_store.init()
+
+    local root = session_store.create({
+      messages = { { role = "user", content = "根问题" }, { role = "assistant", content = "根回答" } },
+    })
+    local child = session_store.create({ parent_id = root.id, messages = {
+      { role = "user", content = "分支问题" }, { role = "assistant", content = "分支回答" },
+    } })
+
+    local opened = tree_view.open()
+    -- 树展开后第二行是子会话节点（根节点下无更多轮次）
+    vim.api.nvim_win_set_cursor(opened.win_id, { 2, 0 })
+    local mapping = vim.fn.maparg("<CR>", "n", false, true)
+    t.not_nil(mapping.callback)
+    mapping.callback()
+
+    t.true_(chat_view.has_window(), "聊天窗口应已打开")
+    t.eq(child.id, chat_service.get_current_session_id(), "当前会话应为选中的子会话")
+    local messages = chat_service.get_messages()
+    t.eq(4, #messages, "应载入祖先链（根）+ 选中子会话的全部消息")
+    t.eq("根问题", messages[1].content)
+    t.eq("根回答", messages[2].content)
+    t.eq("分支问题", messages[3].content)
+    t.eq("分支回答", messages[4].content)
+
+    tree_view.reset()
+    chat_view.reset()
+    chat_service.reset()
+    session_store.reset()
+  end)
+
   it("关闭自动关闭配置时按 N 保留树窗口且新会话不被清理", function(t)
     local config_store = require("NeoAI.kernel.config_store")
     local fs = require("NeoAI.utils.fs")

@@ -60,6 +60,23 @@ local function _register_commands()
     require("NeoAI.ui").chat_status()
   end, { desc = "显示 NeoAI 聊天窗口状态", force = true })
 
+  vim.api.nvim_create_user_command("NeoAICycleDisplay", function()
+    local chat_view = require("NeoAI.ui.window.chat_view")
+    local plugin = chat_view.cycle_display()
+    if plugin then
+      vim.notify("[NeoAI] 显示模式已切换: " .. (plugin.label or plugin.name), vim.log.levels.INFO)
+    end
+  end, { desc = "循环切换聊天显示模式（对话/轨迹）", force = true })
+
+  vim.api.nvim_create_user_command("NeoAIReloadDisplay", function(opts)
+    local chat_view = require("NeoAI.ui.window.chat_view")
+    local name = (opts.args or ""):match("%S+") or nil
+    local plugin = chat_view.reload_display(name)
+    if plugin then
+      vim.notify("[NeoAI] 显示模式插件已热重载: " .. (plugin.label or plugin.name), vim.log.levels.INFO)
+    end
+  end, { nargs = "?", desc = "热重载显示模式插件（缺省重载当前模式）", force = true })
+
   vim.api.nvim_create_user_command("NeoAIPlan", function()
     local chat_service = require("NeoAI.services.chat_service")
     local active = chat_service.toggle_plan_mode()

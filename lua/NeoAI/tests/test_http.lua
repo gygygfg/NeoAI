@@ -82,4 +82,20 @@ tests.suite("http", function(_, it)
     t.eq('{"partial":3}', events2[1].data)
     t.true_(rest2:match("^%s*$") ~= nil, "rest2 应为空白")
   end)
+
+  it("请求体含非法 UTF-8 字节时被清洗为合法 JSON（回归 BUG-4）", function(t)
+    local json = require("NeoAI.utils.json")
+    -- vim.json.encode 原样透传非法字节（如 0xff、孤立的替换字符首字节），
+    -- 导致服务端报 "invalid unicode code point"。编码前必须清洗为合法 UTF-8。
+    local raw = "hi \xff \xc3\xa9" -- 非法 0xff + 合法 é
+    local body = json.encode({ messages = { { role = "user", content = raw } } })
+    -- 输出必须能被子 JSON 解析器（解码）接受：无未转义非法字节
+    local ok, obj = pcall(json.decode, body)
+    t.true_(ok, "编码后 JSON 不得含非法字节，无法解析: " .. tostring(obj))
+    t.eq("hi \xef\xbf\xbd \xc3\xa9", obj.messages[1].content, "非法字节应替换为 U+FFFD，合法 UTF-8 保留")
+    -- 扁平内容（tool 结果、助手消息）同样被清洗
+    local body2 = json.encode({ a = "x \xc3", b = { "\xed\xa0\x80" } })
+    local ok2, obj2 = pcall(json.decode, body2)
+    t.true_(ok2, "嵌套非法字节同样被清洗: " .. tostring(obj2))
+  end)
 end)

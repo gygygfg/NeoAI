@@ -133,6 +133,7 @@ local function _build_flat()
       has_children = has_children,
       prefix = prefix .. connector,
       is_last = false,
+      round = nil, -- 会话节点 = 打开整个会话
       label = _round_preview(rounds[1] or {}),
     }
 
@@ -154,6 +155,7 @@ local function _build_flat()
           has_children = false,
           prefix = child_prefix .. (entry_idx == entry_count and "└─ " or "├─ "),
           is_last = false,
+          round = round_idx,
           label = _round_preview(rounds[round_idx]),
         }
       end
@@ -242,9 +244,10 @@ end
 --- 将给定会话打开到聊天界面（选择或新建共用）。
 --- 打开后按 ui.tree.auto_close_on_select 决定是否关闭树窗口。
 --- @param session table
-local function _open_session_in_chat(session)
+--- @param round number|nil 选中的轮次；nil = 整个会话
+local function _open_session_in_chat(session, round)
   if not session then return end
-  chat_view.open({ session_id = session.id })
+  chat_view.open({ session_id = session.id, round = round })
   -- 打开会话到聊天界面后自动关闭会话树（可用 ui.tree.auto_close_on_select 关闭此行为）
   if config_store.get("ui.tree.auto_close_on_select", true) then
     M.close()
@@ -255,7 +258,7 @@ end
 local function _select()
   local item = _current_item()
   if not item then return end
-  _open_session_in_chat(item.session)
+  _open_session_in_chat(item.session, item.round)
 end
 
 --- 新建子分支：创建会话后直接切到聊天界面，避免"看不见新会话"

@@ -79,6 +79,7 @@ M.WINDOW_OPENED = "window:opened"
 M.WINDOW_CLOSED = "window:closed"
 M.UI_REFRESHED = "ui:refreshed"
 M.UI_MODE_CHANGED = "ui:mode_changed"
+M.DISPLAY_MODE_CHANGED = "display:mode_changed"
 
 -- ========== 子 Agent ==========
 M.SUB_AGENT_CREATED = "sub_agent:created"

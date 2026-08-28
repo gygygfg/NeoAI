@@ -200,6 +200,47 @@ function M.get_descendants(session_id)
   return out
 end
 
+--- 获取从根到指定会话的祖先链（含自身，根在前）
+--- @param session_id string
+--- @return table 数组
+function M.get_chain(session_id)
+  local chain = {}
+  local current = state.sessions[session_id]
+  if not current then return chain end
+  local path = { current }
+  local parent = current.parent_id
+  local guard = 0
+  -- 自环根（parent_id == id）与缺失父级都视为到达根部
+  while parent and parent ~= current.id and state.sessions[parent] and guard < 1000 do
+    current = state.sessions[parent]
+    path[#path + 1] = current
+    parent = current.parent_id
+    guard = guard + 1
+  end
+  for i = #path, 1, -1 do
+    chain[#chain + 1] = path[i]
+  end
+  return chain
+end
+
+--- 沿会话树向下的单子链（不含起始会话）。
+--- 只有唯一子会话时继续深入；遇分裂分支（多个子会话）或末尾（无子会话）即止。
+--- @param session_id string
+--- @return table 数组
+function M.get_downstream(session_id)
+  local out = {}
+  local current = session_id
+  local guard = 0
+  while state.sessions[current] and guard < 1000 do
+    local children = M.get_children(current)
+    if #children ~= 1 then break end
+    out[#out + 1] = children[1]
+    current = children[1].id
+    guard = guard + 1
+  end
+  return out
+end
+
 --- 会话数量
 --- @return number
 function M.count()

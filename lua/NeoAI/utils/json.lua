@@ -6,12 +6,40 @@ local M = {}
 
 local vim_json_available = vim and vim.json and vim.json.encode
 
+local strx = require("NeoAI.utils.stringx")
+
+--- 递归清洗结构中所有字符串为合法 UTF-8（仅在有非法字节时复制/替换）
+--- @param v any
+--- @return any
+local function _sanitize_value(v)
+  local t = type(v)
+  if t == "string" then
+    return strx.sanitize_utf8(v)
+  end
+  if t ~= "table" then return v end
+  local out = nil
+  for k, val in pairs(v) do
+    local nk = type(k) == "string" and strx.sanitize_utf8(k) or k
+    local nv = _sanitize_value(val)
+    if nk ~= k or nv ~= val then
+      if not out then
+        out = {}
+        for k2, v2 in pairs(v) do out[k2] = v2 end
+      end
+      out[nk] = nv
+      if nk ~= k then out[k] = nil end
+    end
+  end
+  return out or v
+end
+
 -- ========== 编码 ==========
 
 --- 编码为 JSON 字符串
 --- @param value any
 --- @return string
 function M.encode(value)
+  value = _sanitize_value(value)
   if vim_json_available then
     return vim.json.encode(value)
   end

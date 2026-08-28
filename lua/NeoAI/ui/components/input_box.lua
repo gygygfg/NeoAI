@@ -17,6 +17,7 @@ local state = {
   submitting = false,
   unsubs = {},
   chat_actions = nil, -- 主界面同步过来的 chat 上下文 actions
+  cmp_aucmd_id = nil, -- 开启 nvim-cmp 的 InsertEnter 自动命令句柄（便于清理）
 }
 
 -- ========== 私有函数 ==========
@@ -32,6 +33,48 @@ end
 --- 设置输入内容（prompt 前缀由 prompt_setprompt 负责显示）
 local function _set_content(content)
   vim.api.nvim_buf_set_lines(state.buf, 0, -1, false, { content })
+end
+
+--- 让 nvim-cmp 在输入框（prompt buffer）中生效，以支持路径补全。
+--- nvim-cmp 默认的 enabled 判定会排除 buftype=prompt 的 buffer（见 cmp/config/default.lua），
+--- 这里是输入框无法触发补全的根因；此处仅针对 neoai_input 这个 filetype 单独放开开关。
+--- 只放开 enabled、不覆盖 sources：沿用用户全局配置里的 path/buffer 等补全源。
+--- @return boolean 是否已成功启用
+local function _enable_cmp_for_input()
+  local ok, cmp = pcall(require, "cmp")
+  if not ok then
+    return false
+  end
+  cmp.setup.filetype("neoai_input", {
+    enabled = function()
+      return true
+    end,
+  })
+  return true
+end
+
+--- 在输入 buffer 上注册补全启用逻辑。
+--- 用户可能未安装 nvim-cmp（此时应无副作用），或 cmp 在其配置里于首次 InsertEnter 才被加载；
+--- 故用 pcall 静默失败 + 延迟调度，确保在 cmp 真正加载并配置后仍对本 buffer 生效。
+local function _setup_cmp_completion()
+  if not state.buf or not vim.api.nvim_buf_is_valid(state.buf) then
+    return
+  end
+  -- 复用同一个 buffer 时避免重复注册自动命令
+  if state.cmp_aucmd_id then
+    pcall(vim.api.nvim_del_autocmd, state.cmp_aucmd_id)
+    state.cmp_aucmd_id = nil
+  end
+  -- 立即尝试一次：若 cmp 尚未加载则静默失败
+  _enable_cmp_for_input()
+  -- 注册插入触发：延迟到当前事件循环末尾再执行，
+  -- 等待用户「首次 InsertEnter 才 require('cmp')」的 once 自动命令先跑完。
+  state.cmp_aucmd_id = vim.api.nvim_create_autocmd("InsertEnter", {
+    buffer = state.buf,
+    callback = function()
+      vim.schedule(_enable_cmp_for_input)
+    end,
+  })
 end
 
 --- 绑定输入框键位
@@ -154,6 +197,8 @@ function M.create(opts)
   _set_content("")
   state.win_id = opts.win_id
   _set_keymaps()
+  -- 启用 nvim-cmp 路径补全（不改变 prompt buffer 行为，无 cmp 时无副作用）
+  _setup_cmp_completion()
   return { buf = state.buf, win_id = state.win_id }
 end
 
@@ -273,6 +318,10 @@ function M.reset()
     unsub()
   end
   state.unsubs = {}
+  if state.cmp_aucmd_id then
+    pcall(vim.api.nvim_del_autocmd, state.cmp_aucmd_id)
+    state.cmp_aucmd_id = nil
+  end
   state.buf = nil
   state.win_id = nil
   state.on_submit = nil

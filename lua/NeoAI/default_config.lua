@@ -123,6 +123,33 @@ local DEFAULT_CONFIG = {
     system_prompt = "你是一个AI编程助手，帮助用户解决编程问题。",
     timeout_ms = 60000,
     max_retries = 3,
+    -- ===== 多模态 / 附件 =====
+    attachments = {
+      enabled = true, -- 多模态图像注入总开关（read_image 工具 + 图像消息解析）
+      path = vim.fn.stdpath("cache") .. "/NeoAI/attachments", -- 附件存储目录（内容寻址）
+      -- 声明支持图像输入的模型（模型 id 或 provider:model；命中则注入图像，否则降级为文本）
+      vision_models = {
+        "deepseek-v4-flash-vision-exp",
+        "deepseek-vl",
+      },
+      -- 启发式：模型 id 含这些子串即视为视觉模型（可配置，需时清空）
+      vision_model_heuristics = { "vision", "-vl", "4o", "gemini" },
+      media_types = { "image/png", "image/jpeg", "image/webp", "image/gif" },
+      limits = {
+        maxImageBytes = 20 * 1024 * 1024, -- 单图字节上限
+        maxImagesPerMessage = 16, -- 每条消息图像数上限
+        maxMessageImageBytes = 40 * 1024 * 1024, -- 每条消息图像累计字节
+        maxImagePixels = 50000000, -- 解码后像素上限（无缩略工具时强拒）
+        maxImageDimension = 8000, -- 长边上限
+      },
+      request_image = {
+        maxPixels = 640000, -- 单请求图像像素预算（有 ImageMagick 时缩略到该预算）
+        maxBytes = 1024 * 1024, -- 单请求图像编码字节上限
+        maxImagesPerRequest = 8, -- 单请求最多保留图像数（超出丢最旧）
+        maxRequestBytes = 20 * 1024 * 1024, -- 单请求图像累计字节上限（超出丢最旧）
+        maxRequestImages = 600, -- 与 provider 上限对齐的深层兜底
+      },
+    },
     context_cache = {
       enabled = true, -- 启用前缀缓存身份一致性 + 自动上下文压缩
       context_window = 64000, -- 模型上下文窗口（token 估算）
@@ -183,6 +210,11 @@ local DEFAULT_CONFIG = {
       toggle_reasoning = { key = "r", desc = "切换思考过程显示" },
       switch_model = { key = "M", desc = "切换模型" },
       cycle_mode = { key = "m", desc = "循环切换模式（CHAT/PLAN/AUTO）" },
+      cycle_display = {
+        insert = { key = "<C-t>", desc = "循环切换显示模式（对话/轨迹）" },
+        normal = { key = "T", desc = "循环切换显示模式（对话/轨迹）" },
+      },
+      reload_display = { key = "<F5>", desc = "热重载当前显示模式插件" },
       approve_plan = { key = "P", desc = "确认计划并转入 CHAT 执行" },
       tool_approval = { key = "<C-a>", desc = "工具审批" },
       approval = {

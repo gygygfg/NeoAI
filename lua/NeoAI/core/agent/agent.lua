@@ -147,6 +147,18 @@ function M.append_reasoning(agent, chunk)
   return last
 end
 
+--- 给最后一条 assistant 消息附加请求/响应元数据（仅供轨迹展示，不进入模型上下文）
+--- @param agent table
+--- @param round table { request?, response? }
+--- @return table|nil 消息
+function M.attach_round(agent, round)
+  local last = agent.messages[#agent.messages]
+  if not last or last.role ~= "assistant" then return nil end
+  if round and round.request then last.request = round.request end
+  if round and round.response then last.response = round.response end
+  return last
+end
+
 --- 获取消息
 --- @param agent table
 --- @return table

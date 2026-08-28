@@ -7,6 +7,7 @@ local stringx = require("NeoAI.utils.stringx")
 local fold = require("NeoAI.ui.components.fold")
 local config_store = require("NeoAI.kernel.config_store")
 local json = require("NeoAI.utils.json")
+local display_modes = require("NeoAI.ui.components.display_modes")
 
 local M = {}
 
@@ -191,12 +192,25 @@ local function _tool_arguments_lines(fn)
 end
 
 --- 工具结果的结构化展示行（JSON 内容解析后多行缩进展示，非 JSON 原样截断展示）。
+--- 结果含 read_image 的图像引用时先行渲染一条图像摘要行。
 --- @param content string|nil
 --- @return table 行数组
 local function _result_lines(content)
   if not content or content == "" then return { "(空)" } end
   local decoded = json.decode_or_nil(content)
   if type(decoded) == "table" then
+    local img = decoded.image
+    if type(img) == "table" and img.attachmentId then
+      local dims = img.width and img.height and (string.format(" %dx%dpx", img.width, img.height)) or ""
+      local lines = {
+        string.format("🖼️ 图像%s（%s, %d 字节）", dims, img.mediaType or img.media_type or "image", img.bytes or 0),
+      }
+      local json_lines = _split_lines(stringx.truncate(_pretty_json(decoded), 500))
+      for _, l in ipairs(json_lines) do
+        lines[#lines + 1] = l
+      end
+      return lines
+    end
     return _split_lines(stringx.truncate(_pretty_json(decoded), 500))
   end
   return _split_lines(stringx.truncate(content, 500))
@@ -279,12 +293,25 @@ end
 
 -- ========== 公开 API ==========
 
---- 渲染消息列表到 buffer
+--- 渲染消息列表到 buffer（按当前激活的显示模式插件分派）
+--- 未激活任何显示模式插件时回退到默认对话渲染（render_chat）。
 --- 工具调用与其结果按「每个工具一个折叠块」分组：assistant 消息里的每个
 --- tool_call 与紧随其后的 tool 结果消息配对渲染进同一个折叠块。
 --- @param buf number
 --- @param messages table 数组
 function M.render(buf, messages)
+  local plugin = display_modes.get_current()
+  if plugin and plugin.render then
+    plugin.render(buf, messages)
+    return
+  end
+  M.render_chat(buf, messages)
+end
+
+--- 渲染消息列表到 buffer（默认对话模式）
+--- @param buf number
+--- @param messages table 数组
+function M.render_chat(buf, messages)
   local all_lines = {}
   local msgs = messages or {}
   local i = 1
@@ -354,11 +381,31 @@ function M.toggle_reasoning()
   return state.show_reasoning
 end
 
+--- 当前是否显示推理（显示模式插件渲染时读取）
+--- @return boolean
+function M.is_show_reasoning()
+  return state.show_reasoning
+end
+
 --- 设置推理显示
 --- @param show boolean
 function M.set_show_reasoning(show)
   state.show_reasoning = show
 end
+
+-- ========== 显示模式插件共享工具 ==========
+
+--- 供显示模式插件复用的渲染工具
+--- @type table
+M.helpers = {
+  append_tool_block = _append_tool_block,
+  pretty_json = _pretty_json,
+  split_lines = _split_lines,
+  truncate = function(s, n) return stringx.truncate(s, n) end,
+  tool_arguments_lines = _tool_arguments_lines,
+  result_lines = _result_lines,
+  tool_result_failed = _tool_result_failed,
+}
 
 --- 重置（测试用）
 function M.reset()

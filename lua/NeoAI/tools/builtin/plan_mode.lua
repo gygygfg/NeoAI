@@ -39,6 +39,7 @@ local PLAN_POLICY_TEXT = table.concat({
 local PLAN_SAFE_TOOLS = {
   -- 文件读取 / 搜索
   "read_file", "list_files", "search_files", "file_exists",
+  "read_image",
   -- 语法树只读查询
   "parse_file", "query_tree", "get_node_at_position", "get_node_type",
   "get_node_range", "is_named_node", "get_parent_node", "get_child_nodes",
