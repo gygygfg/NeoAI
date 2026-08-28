@@ -17,13 +17,25 @@ local M = {}
 local state = {
   sessions = {}, -- id -> session
   loaded = false,
+  default_path_redirect = nil, -- 测试隔离：默认会话目录的重定向
 }
 
 -- ========== 私有函数 ==========
 
+local function _default_session_dir()
+  return vim.fn.stdpath("cache") .. "/NeoAI"
+end
+
 local function _session_path()
   local session_cfg = config_store.get("session") or {}
-  return fs.join(session_cfg.save_path or (vim.fn.stdpath("cache") .. "/NeoAI"), session_cfg.file or "sessions.jsonl")
+  local base = session_cfg.save_path or _default_session_dir()
+  local file = session_cfg.file or "sessions.jsonl"
+  -- 测试隔离：仅当使用默认目录（未被显式配置为其它路径）时重定向到临时目录，
+  -- 避免测试会话污染真实历史。显式配置 save_path 的测试不受影响。
+  if state.default_path_redirect and base == _default_session_dir() then
+    return fs.join(state.default_path_redirect, file)
+  end
+  return fs.join(base, file)
 end
 
 --- 原子重写整个文件（删除/更新时用）
@@ -253,6 +265,20 @@ end
 function M.reset()
   state.sessions = {}
   state.loaded = false
+end
+
+--- 设置默认会话目录重定向（测试隔离用）。
+--- 仅影响走默认路径（未显式配置 save_path）的会话，不影响显式 save_path 的会话。
+--- @param dir string|nil nil 表示取消重定向
+function M.set_default_path_redirect(dir)
+  state.default_path_redirect = dir
+end
+
+--- 用给定会话表替换内存状态（测试隔离结束后恢复真实会话用）
+--- @param sessions table id -> session
+function M.restore(sessions)
+  state.sessions = sessions or {}
+  state.loaded = true
 end
 
 return M

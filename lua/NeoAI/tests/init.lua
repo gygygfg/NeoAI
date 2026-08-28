@@ -184,6 +184,22 @@ function M.run_all(...)
   local all_errors = {}
   local loaded = false
 
+  -- 会话隔离：防止测试把会话写入真实历史（~/.cache/nvim/NeoAI/sessions.jsonl）。
+  -- 测试期间把“默认路径”会话重定向到临时目录，结束后清理并恢复内存中的真实会话。
+  local session_store = require("NeoAI.core.session.session_store")
+  local real_sessions = {}
+  for id, s in pairs(session_store.get_all()) do
+    real_sessions[id] = s
+  end
+  local test_session_dir = vim.fn.stdpath("cache") .. "/NeoAI-test"
+  session_store.set_default_path_redirect(test_session_dir)
+
+  local function _cleanup()
+    session_store.set_default_path_redirect(nil)
+    session_store.restore(real_sessions)
+    vim.fn.delete(test_session_dir, "rf") -- 清理临时会话目录
+  end
+
   -- 动态加载所有 test_*.lua 文件（幂等）
   local src = debug.getinfo(1, "S").source
   local test_dir = src:match("^@(.+)[/\\][^/\\]+$")
@@ -215,14 +231,21 @@ function M.run_all(...)
     suites_to_run = state.suites
   end
 
-  print(string.format("\n=== NeoAI 测试 (%d 套件) ===", #suites_to_run))
-  for _, suite in ipairs(suites_to_run) do
-    print("▶ " .. suite.name)
-    local p, f, errs = _run_suite(suite)
-    total_passed = total_passed + p
-    total_failed = total_failed + f
-    for _, e in ipairs(errs) do all_errors[#all_errors + 1] = e end
+  local ok_run, run_err = xpcall(function()
+    print(string.format("\n=== NeoAI 测试 (%d 套件) ===", #suites_to_run))
+    for _, suite in ipairs(suites_to_run) do
+      print("▶ " .. suite.name)
+      local p, f, errs = _run_suite(suite)
+      total_passed = total_passed + p
+      total_failed = total_failed + f
+      for _, e in ipairs(errs) do all_errors[#all_errors + 1] = e end
+    end
+  end, debug.traceback)
+  if not ok_run then
+    all_errors[#all_errors + 1] = tostring(run_err)
   end
+
+  _cleanup()
 
   print(string.format("\n=== 结果: %d 通过, %d 失败 ===", total_passed, total_failed))
   return { passed = total_passed, failed = total_failed, errors = all_errors }
