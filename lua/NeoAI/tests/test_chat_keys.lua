@@ -29,8 +29,9 @@ tests.suite("chat_keys", function(_, it)
       end,
     })
     local buf = input_box.get_buf()
-    -- prompt 前缀应为 "> "（避免默认 "% " 叠加）
-    t.eq("> ", vim.fn.prompt_getprompt(buf))
+    -- 输入框应为普通可编辑 buffer（不再用 buftype=prompt，否则 nvim-cmp 默认 enabled 会排除它）
+    t.ne("prompt", vim.bo[buf].buftype, "输入框应使用普通 buffer，以便 nvim-cmp 补全")
+    t.eq("", table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), "\n"), "初始内容应为空")
     -- 设置内容后调用回车回调，应触发 submit
     vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "hello" })
     local cb = input_box.get_enter_callback()
@@ -44,7 +45,7 @@ tests.suite("chat_keys", function(_, it)
     t.nil_(submitted)
     input_box.reset()
   end)
-  it("创建输入框时放开 nvim-cmp（prompt buffer 也能触发路径补全）", function(t)
+  it("创建输入框时放开 nvim-cmp（针对 neoai_input 放开 enabled，兼容任意 buftype）", function(t)
     local input_box = require("NeoAI.ui.components.input_box")
     input_box.reset()
 
@@ -75,6 +76,43 @@ tests.suite("chat_keys", function(_, it)
     t.eq("neoai_input", filetype_calls[1].ft, "应对 neoai_input 这个 filetype 放开补全")
     t.not_nil(filetype_calls[1].cfg.enabled, "应传入 enabled 判定函数")
     t.true_(filetype_calls[1].cfg.enabled(), "enabled 应返回 true，从而放开 prompt buffer 的补全")
+
+    input_box.reset()
+  end)
+  it("nvim-cmp 对输入框的 enabled 配置经 FileType 重触发后生效（懒加载场景兜底）", function(t)
+    local input_box = require("NeoAI.ui.components.input_box")
+    input_box.reset()
+
+    -- 模拟真实 nvim-cmp：setup.filetype 会注册一个 FileType 自动命令，仅在对应 filetype
+    -- 出现新事件时才应用配置。若 create 不再重新触发 FileType，该配置永远不会生效。
+    local applied = false
+    local mock_cmp = {
+      setup = {
+        filetype = function(ft, cfg)
+          vim.api.nvim_create_autocmd("FileType", {
+            pattern = ft,
+            callback = function()
+              applied = true
+            end,
+          })
+        end,
+      },
+    }
+    local prev_preload = package.preload["cmp"]
+    local prev_loaded = package.loaded["cmp"]
+    package.preload["cmp"] = function() return mock_cmp end
+    package.loaded["cmp"] = nil
+
+    local ok = pcall(function()
+      input_box.create({ on_submit = function() end })
+    end)
+
+    package.preload["cmp"] = prev_preload
+    package.loaded["cmp"] = prev_loaded
+
+    t.true_(ok, "创建输入框不应因 cmp 打桩而抛错")
+    t.true_(applied,
+      "create 后应重新触发 neoai_input 的 FileType 事件，使 nvim-cmp 的 enabled 放开真正生效")
 
     input_box.reset()
   end)

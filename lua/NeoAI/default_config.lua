@@ -90,7 +90,7 @@ local DEFAULT_CONFIG = {
       aliyun = {
         api_type = "openai",
         base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1",
-        api_key = os.getenv("QWEN_API_KEY") or "",
+        api_key = os.getenv("DASHSCOPE_API_KEY") or "",
         fetch_models = true,
         models_override = nil,
       },

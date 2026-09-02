@@ -29,6 +29,8 @@ local state = {
   agent_id = nil,
   tool_tick = nil, -- 工具执行中折叠文本定时刷新句柄
   following = true, -- 流式更新时光标是否跟随（不跟随时不弹思考悬浮窗、不重新折叠已有折叠）
+  collapsed = false, -- 聊天窗口进入后台后是否已收起（状态悬浮窗 + 输入框）
+  focus_augroup = nil, -- 焦点追踪自动命令组（WinEnter/BufEnter）
 }
 
 -- ========== 私有函数 ==========
@@ -445,8 +447,9 @@ local function _build_chat_actions()
   }
 end
 
---- 创建输入区（主窗口下方 split，高度 3）
-local function _create_input_area()
+--- 在主窗口下方创建输入 split 窗口（不 touch input_box 的状态，仅建窗口+接管 buffer）
+--- @return number win_id
+local function _create_input_window()
   -- 在当前主窗口下方水平分割
   local win
   vim.api.nvim_win_call(state.win_id, function()
@@ -454,18 +457,114 @@ local function _create_input_area()
     win = vim.api.nvim_get_current_win()
   end)
   vim.api.nvim_win_set_height(win, 3)
-  input_box.create({
-    on_submit = _on_submit,
-    on_cancel = _on_cancel,
-    on_quit = function() M.close() end,
-    -- 同步主界面的 chat 上下文按键到输入框（quit/cancel/toggle_reasoning/switch_model/cycle_mode/tool_approval）
-    chat_actions = _build_chat_actions(),
-  })
-  input_box.attach_window(win)
   vim.wo[win].winfixheight = true
   vim.wo[win].wrap = false
+  return win
+end
+
+--- 创建输入区（主窗口下方 split，高度 3）
+--- @param fresh boolean|nil true=首次/重开（input_box.create 新建 buffer+键位）；false=收起后恢复（复用已有输入 buffer）
+local function _create_input_area(fresh)
+  local win = _create_input_window()
+  if fresh then
+    input_box.create({
+      on_submit = _on_submit,
+      on_cancel = _on_cancel,
+      on_quit = function() M.close() end,
+      -- 同步主界面的 chat 上下文按键到输入框（quit/cancel/toggle_reasoning/switch_model/cycle_mode/tool_approval）
+      chat_actions = _build_chat_actions(),
+    })
+  end
+  input_box.attach_window(win)
   state.input_win_id = win
   return win
+end
+
+-- ========== 后台收起 / 恢复（焦点追踪） ==========
+
+--- 判断窗口是否属于聊天界面（主窗口 / 输入窗口 / 任一 neoai-* 浮窗）。
+--- 以「窗口当前显示的 buffer」为准而非窗口句柄：主窗口被 :bnext 切到别的文件后不算聊天界面，
+--- 否则恢复时会把状态浮窗重新盖在用户正在看的文件上。
+--- @param win number|nil
+--- @return boolean
+local function _is_chat_affiliated(win)
+  if not win or not vim.api.nvim_win_is_valid(win) then return false end
+  local ok, buf = pcall(vim.api.nvim_win_get_buf, win)
+  if not ok or not buf or not vim.api.nvim_buf_is_valid(buf) then return false end
+  if state.buf and buf == state.buf then return true end
+  if vim.bo[buf] and vim.bo[buf].filetype:sub(1, 5) == "neoai" then return true end
+  return false
+end
+
+--- 收起绑定的悬浮窗与输入框（聊天窗口进入后台 / 主窗口被切到别的 buffer）
+local function _collapse_aux()
+  if state.collapsed then return end
+  state.collapsed = true
+  status_float.detach()
+  if state.input_win_id and vim.api.nvim_win_is_valid(state.input_win_id) then
+    pcall(vim.api.nvim_win_close, state.input_win_id, true)
+  end
+  state.input_win_id = nil
+end
+
+--- 恢复收起前的悬浮窗与输入框（回到聊天界面）。输入 buffer 内容保留（bufhidden=hide）。
+local function _restore_aux()
+  if not state.collapsed then return end
+  state.collapsed = false
+  if not state.win_id or not vim.api.nvim_win_is_valid(state.win_id) then return end
+  status_float.attach(state.win_id)
+  if not state.input_win_id or not vim.api.nvim_win_is_valid(state.input_win_id) then
+    _create_input_area(false)
+  end
+end
+
+--- WinEnter：焦点进入某窗口时同步收起/恢复（in insert 与否无关）。
+--- 状态浮窗点击也会触发 WinEnter，但其 filetype 为 neoai_status，属于聊天界面，不会误收起。
+local function _on_win_enter()
+  if not M.has_window() then return end
+  if _is_chat_affiliated(vim.api.nvim_get_current_win()) then
+    _restore_aux()
+  else
+    _collapse_aux()
+  end
+end
+
+--- BufEnter：主聊天窗口里 :bnext/:bprev 切换 buffer 时同步收起/恢复。
+--- 只在主窗口（state.win_id）当前显示的 buffer 变化时动作，避免输入窗口/浮窗的 BufEnter 误触发。
+local function _on_buf_enter()
+  if not M.has_window() then return end
+  if not state.win_id or not vim.api.nvim_win_is_valid(state.win_id) then return end
+  if vim.api.nvim_get_current_win() ~= state.win_id then return end
+  local shown = vim.api.nvim_win_get_buf(state.win_id)
+  if state.buf and shown == state.buf then
+    _restore_aux()
+  else
+    _collapse_aux()
+  end
+end
+
+--- 注册焦点追踪自动命令（每次打开聊天窗口时创建，关闭时清理）
+local function _register_focus_tracking()
+  if state.focus_augroup then
+    pcall(vim.api.nvim_del_augroup_by_id, state.focus_augroup)
+  end
+  state.focus_augroup = vim.api.nvim_create_augroup("NeoAIChatFocus", { clear = true })
+  vim.api.nvim_create_autocmd("WinEnter", {
+    group = state.focus_augroup,
+    callback = _on_win_enter,
+  })
+  vim.api.nvim_create_autocmd("BufEnter", {
+    group = state.focus_augroup,
+    callback = _on_buf_enter,
+  })
+end
+
+--- 清理焦点追踪自动命令
+local function _clear_focus_tracking()
+  if state.focus_augroup then
+    pcall(vim.api.nvim_del_augroup_by_id, state.focus_augroup)
+    state.focus_augroup = nil
+  end
 end
 
 --- 设置键位（主窗口）
@@ -566,8 +665,12 @@ function M.open(opts)
   -- 否则用户切回主界面时光标停留在折叠收起处（通常在第 1 行）。
   _scroll_to_end()
   _set_keymaps()
-  _create_input_area()
+  -- 首次打开：新建输入 buffer + 键位（fresh 显式传 true）
+  _create_input_area(true)
   input_box.focus()
+  -- 焦点追踪：焦点离开聊天窗口或主窗口被切到别的 buffer 时收起悬浮窗+输入框，回到聊天时恢复
+  state.collapsed = false
+  _register_focus_tracking()
 
   -- 订阅事件
   state.unsubs[#state.unsubs + 1] = event_bus.on(events.MESSAGE_ADDED, _on_message_updated)
@@ -617,6 +720,8 @@ function M.close()
     unsub()
   end
   state.unsubs = {}
+  _clear_focus_tracking()
+  state.collapsed = false
   state.win_id = nil
   state.buf = nil
   state.input_win_id = nil

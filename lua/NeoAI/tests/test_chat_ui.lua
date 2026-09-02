@@ -261,6 +261,77 @@ tests.suite("chat_ui", function(_, it)
     chat_service.reset()
   end)
 
+  it("聊天窗口失去焦点时收起悬浮窗与输入框，返回时恢复且内容保留", function(t)
+    local chat_view = require("NeoAI.ui.window.chat_view")
+    local chat_service = require("NeoAI.services.chat_service")
+    local input_box = require("NeoAI.ui.components.input_box")
+    local status_float = require("NeoAI.ui.components.status_float")
+    chat_view.reset()
+    chat_service.reset()
+
+    -- 先建一个普通代码窗口（非 neoai buffer），模拟用户编辑代码的窗口
+    vim.cmd("vsplit")
+    local code_win = vim.api.nvim_get_current_win()
+    local code_buf = vim.api.nvim_get_current_buf()
+    vim.bo[code_buf].filetype = "lua"
+
+    local opened = chat_view.open()
+    local input_win = input_box.get_win()
+    t.true_(input_win ~= nil and vim.api.nvim_win_is_valid(input_win), "打开后应创建输入窗口")
+    t.true_(status_float.is_attached(), "打开后应挂载状态悬浮窗")
+
+    -- 在输入框写点内容，验证收起-恢复后草稿内容保留
+    vim.api.nvim_buf_set_lines(input_box.get_buf(), 0, -1, false, { "draft text" })
+
+    -- 焦点切到代码窗口（聊天界面进入后台）→ 收起
+    vim.api.nvim_set_current_win(code_win)
+    t.eq(code_win, vim.api.nvim_get_current_win(), "焦点应切到代码窗口")
+    local collapsed_win = input_box.get_win()
+    t.true_(collapsed_win == nil or not vim.api.nvim_win_is_valid(collapsed_win), "离开聊天后输入窗口应收起")
+    t.false_(status_float.is_attached(), "离开聊天后状态悬浮窗应隐藏")
+
+    -- 焦点切回聊天主窗口 → 恢复
+    vim.api.nvim_set_current_win(opened.win_id)
+    local restored_win = input_box.get_win()
+    t.true_(restored_win ~= nil and vim.api.nvim_win_is_valid(restored_win), "回到聊天后应重建输入窗口")
+    t.true_(status_float.is_attached(), "回到聊天后应恢复状态悬浮窗")
+    t.eq("draft text", vim.api.nvim_buf_get_lines(input_box.get_buf(), 0, -1, false)[1], "输入内容应保留")
+
+    pcall(vim.api.nvim_buf_delete, code_buf, { force = true })
+    chat_view.reset()
+    chat_service.reset()
+  end)
+
+  it("聊天主窗口被 :bnext 切到别的 buffer 时收起输入框，切回聊天 buffer 时恢复", function(t)
+    local chat_view = require("NeoAI.ui.window.chat_view")
+    local chat_service = require("NeoAI.services.chat_service")
+    local input_box = require("NeoAI.ui.components.input_box")
+    local status_float = require("NeoAI.ui.components.status_float")
+    chat_view.reset()
+    chat_service.reset()
+
+    local opened = chat_view.open()
+    t.true_(vim.api.nvim_win_is_valid(input_box.get_win()), "打开后应创建输入窗口")
+
+    -- 焦点在主聊天窗口，模拟用户在聊天窗口里 :bnext 切到别的文件
+    vim.api.nvim_set_current_win(opened.win_id)
+    local fb = vim.api.nvim_create_buf(false, true)
+    vim.api.nvim_buf_set_lines(fb, 0, -1, false, { "FILE" })
+    vim.api.nvim_win_set_buf(opened.win_id, fb)
+    local collapsed_win = input_box.get_win()
+    t.true_(collapsed_win == nil or not vim.api.nvim_win_is_valid(collapsed_win), "主窗口切走应收起输入框")
+    t.false_(status_float.is_attached(), "主窗口切走应收起状态悬浮窗")
+
+    -- :bprev 切回聊天 buffer → 恢复
+    vim.api.nvim_win_set_buf(opened.win_id, opened.buf)
+    t.true_(input_box.get_win() ~= nil and vim.api.nvim_win_is_valid(input_box.get_win()), "切回聊天 buffer 应恢复输入窗口")
+    t.true_(status_float.is_attached(), "切回聊天 buffer 应恢复状态悬浮窗")
+
+    pcall(vim.api.nvim_buf_delete, fb, { force = true })
+    chat_view.reset()
+    chat_service.reset()
+  end)
+
   it("多行工具结果可渲染且不中断聊天窗口", function(t)
     local message_list = require("NeoAI.ui.components.message_list")
     local chat_view = require("NeoAI.ui.window.chat_view")

@@ -18,11 +18,29 @@ local state = {
   unsubs = {},
   chat_actions = nil, -- 主界面同步过来的 chat 上下文 actions
   cmp_aucmd_id = nil, -- 开启 nvim-cmp 的 InsertEnter 自动命令句柄（便于清理）
+  prompt_ns = nil, -- 渲染 "> " 前缀的 extmark 命名空间
+  prompt_extmark_id = nil, -- "> " 前缀 extmark id
 }
 
 -- ========== 私有函数 ==========
 
---- 获取输入内容（去掉可能的 "> " 提示前缀）
+--- 渲染不可编辑的 "> " 提示前缀（用 virt_text inline 在行首显示，内容区保持"纯输入"）。
+--- 之前用 buftype=prompt 实现，但因 prompt buffer 与 nvim-cmp 冲突（默认 enabled 排除
+--- prompt buffer）导致插入补全失效，改回普通 buffer + virt_text 前缀。
+local function _render_prompt_prefix()
+  if not state.buf or not vim.api.nvim_buf_is_valid(state.buf) then return end
+  state.prompt_ns = state.prompt_ns or vim.api.nvim_create_namespace("neoai_input_prompt")
+  if state.prompt_extmark_id then
+    pcall(vim.api.nvim_buf_del_extmark, state.buf, state.prompt_ns, state.prompt_extmark_id)
+    state.prompt_extmark_id = nil
+  end
+  state.prompt_extmark_id = vim.api.nvim_buf_set_extmark(state.buf, state.prompt_ns, 0, 0, {
+    virt_text = { { "> ", "Comment" } },
+    virt_text_pos = "inline",
+  })
+end
+
+--- 获取输入内容（去掉可能残留的 "> " 提示前缀）
 local function _get_content()
   local lines = vim.api.nvim_buf_get_lines(state.buf, 0, -1, false)
   local content = table.concat(lines, "\n")
@@ -30,15 +48,15 @@ local function _get_content()
   return content
 end
 
---- 设置输入内容（prompt 前缀由 prompt_setprompt 负责显示）
+--- 设置输入内容（"> " 前缀由 virt_text 显示，不在内容区）
 local function _set_content(content)
   vim.api.nvim_buf_set_lines(state.buf, 0, -1, false, { content })
 end
 
---- 让 nvim-cmp 在输入框（prompt buffer）中生效，以支持路径补全。
---- nvim-cmp 默认的 enabled 判定会排除 buftype=prompt 的 buffer（见 cmp/config/default.lua），
---- 这里是输入框无法触发补全的根因；此处仅针对 neoai_input 这个 filetype 单独放开开关。
---- 只放开 enabled、不覆盖 sources：沿用用户全局配置里的 path/buffer 等补全源。
+--- 让 nvim-cmp 在输入框中生效，以支持路径/关键字补全。
+--- nvim-cmp 的 filetype 配置会覆盖全局 enabled（见 config.lua 的 merge 顺序：filetype 后于全局合并），
+--- 此处仅针对 neoai_input 这个 filetype 单独放开开关；不覆盖 sources，沿用用户全局配置里的
+--- path/buffer 等补全源。
 --- @return boolean 是否已成功启用
 local function _enable_cmp_for_input()
   local ok, cmp = pcall(require, "cmp")
@@ -51,6 +69,19 @@ local function _enable_cmp_for_input()
     end,
   })
   return true
+end
+
+--- 放开 nvim-cmp 并让其对 filetype 的配置在检测到 buffer 时生效。
+--- nvim-cmp 的 config.filetypes 是按 filetype 读取的，为保险起见在成功配置后重新赋值一遍
+--- 同样的 filetype（NeoVim 对同值赋值也会触发 FileType 事件），以确保任何依赖 FileType 事件
+--- 的路径（如用户首启 InsertEnter 才加载 cmp 的懒加载场景）也都把 enabled 放开。
+--- @return boolean 是否已成功放开
+local function _apply_cmp_for_input()
+  local enabled = _enable_cmp_for_input()
+  if enabled and state.buf and vim.api.nvim_buf_is_valid(state.buf) then
+    vim.bo[state.buf].filetype = "neoai_input"
+  end
+  return enabled
 end
 
 --- 在输入 buffer 上注册补全启用逻辑。
@@ -66,13 +97,13 @@ local function _setup_cmp_completion()
     state.cmp_aucmd_id = nil
   end
   -- 立即尝试一次：若 cmp 尚未加载则静默失败
-  _enable_cmp_for_input()
+  _apply_cmp_for_input()
   -- 注册插入触发：延迟到当前事件循环末尾再执行，
   -- 等待用户「首次 InsertEnter 才 require('cmp')」的 once 自动命令先跑完。
   state.cmp_aucmd_id = vim.api.nvim_create_autocmd("InsertEnter", {
     buffer = state.buf,
     callback = function()
-      vim.schedule(_enable_cmp_for_input)
+      vim.schedule(_apply_cmp_for_input)
     end,
   })
 end
@@ -116,7 +147,7 @@ local function _set_keymaps()
   end, { buffer = state.buf, desc = "NeoAI 发送" })
 
   -- 插入模式：回车换行（多行输入），不发送。
-  -- 直接把换行符插到光标处（buf 为 prompt 缓冲时 <CR> 默认触发 prompt 回调，这里覆盖为换行）。
+  -- 直接把换行符插到光标处（<CR> 在插入模式=换行，不发送）。
   vim.keymap.set("i", "<CR>", function()
     local win = state.win_id
     if not win or not vim.api.nvim_win_is_valid(win) then
@@ -184,20 +215,21 @@ function M.create(opts)
   state.chat_actions = opts.chat_actions
 
   state.buf = opts.buf or vim.api.nvim_create_buf(false, true)
-  vim.bo[state.buf].buftype = "prompt"
+  -- 注意：不设置 buftype=prompt。之前用 prompt buffer 是为了显示 "> " 前缀，但 prompt buffer
+  -- 与 nvim-cmp 存在冲突（nvim-cmp 默认 enabled 排除 buftype=prompt，导致插入补全不生效；
+  -- 且 prompt 回车回调与插件自定义 <CR> 语义冲突）。这里改成普通可编辑 buffer，用 virt_text
+  -- extmark 渲染不可编辑的 "> " 前缀，内容区保持纯文本，nvim-cmp 可正常解析/补全。
   -- bufhidden=hide 而非 wipe：用户把输入窗口切到别的 buffer 时输入 buffer 必须存活，
   -- 否则 focus() 无法把输入 buffer 绑回窗口，feedkeys("A") 会把输入写进错误的 buffer。
   vim.bo[state.buf].bufhidden = "hide"
   vim.bo[state.buf].modifiable = true
   vim.bo[state.buf].filetype = "neoai_input"
-  -- 用 nvim 原生 prompt 显示 "> " 前缀（避免默认 "% " 与手动前缀叠加）
-  vim.fn.prompt_setprompt(state.buf, "> ")
-  -- 不再用 prompt_setcallback 把「回车」绑定为发送：insert 模式回车=换行、normal 模式回车=发送，
-  -- 由 _set_keymaps 里的 <CR> 映射负责，避免终端里 insert 回车误发送。
+  -- 不可编辑的 "> " 提示前缀（inline 把真实内容向右推，内容区不含 "> ")
+  _render_prompt_prefix()
   _set_content("")
   state.win_id = opts.win_id
   _set_keymaps()
-  -- 启用 nvim-cmp 路径补全（不改变 prompt buffer 行为，无 cmp 时无副作用）
+  -- 启用 nvim-cmp 插入补全（普通 buffer 不再被默认 enabled 排除，无 cmp 时无副作用）
   _setup_cmp_completion()
   return { buf = state.buf, win_id = state.win_id }
 end
@@ -322,6 +354,10 @@ function M.reset()
     pcall(vim.api.nvim_del_autocmd, state.cmp_aucmd_id)
     state.cmp_aucmd_id = nil
   end
+  if state.buf and vim.api.nvim_buf_is_valid(state.buf) and state.prompt_ns and state.prompt_extmark_id then
+    pcall(vim.api.nvim_buf_del_extmark, state.buf, state.prompt_ns, state.prompt_extmark_id)
+  end
+  state.prompt_extmark_id = nil
   state.buf = nil
   state.win_id = nil
   state.on_submit = nil
