@@ -63,8 +63,31 @@ end
 --- @param tool_call_id string
 --- @param timer table|nil 可暂停计时器（tool_loop 注入）：执行中耗时取自其活跃时间，
 ---   等待用户审批/提问的暂停期间不累计；无 timer 时回退到墙钟。
+---   事件经 nvim_exec_autocmds 传递 data 会深拷贝并丢失元表/方法，因此这里保存的 timer
+---   只是（可用的）副本；执行中耗时优先取 set_live_timer 注册的原对象实时值。
 function M.record_start(tool_call_id, timer)
-  timing[tool_call_id] = { timer = timer, start_ms = _now_ms(), duration_ms = nil, status = "running" }
+  local prev = timing[tool_call_id]
+  timing[tool_call_id] = {
+    timer = timer or (prev and prev.timer) or nil,
+    start_ms = _now_ms(),
+    duration_ms = nil,
+    status = "running",
+  }
+end
+
+--- 注册工具的原对象计时器（tool_loop 直接调用）。
+--- 事件总线经 nvim_exec_autocmds 传递 data 会深拷贝并丢失元表/方法，计时器的 elapsed
+--- 等方法无法随事件传播；tool_loop 以原对象（含元表）注册到这里，get_duration 才可用它
+--- 实时读取剔除用户交互等待的活跃耗时。已存在记录时仅更新 timer 字段。
+--- @param tool_call_id string
+--- @param timer table|nil
+function M.set_live_timer(tool_call_id, timer)
+  local rec = timing[tool_call_id]
+  if rec then
+    rec.timer = timer
+  else
+    timing[tool_call_id] = { timer = timer, start_ms = _now_ms(), duration_ms = nil, status = "running" }
+  end
 end
 
 --- 记录工具执行结束
@@ -90,7 +113,11 @@ function M.get_duration(tool_call_id)
   if not rec then return nil end
   if rec.duration_ms then return rec.duration_ms end
   -- 优先用可暂停计时器的活跃耗时：等待用户交互的暂停期间耗时保持不变。
-  if rec.timer then return rec.timer:elapsed() end
+  -- 计时器须是 set_live_timer 注册的原对象（含元表）；经事件总线深拷贝的副本无 elapsed，
+  -- 会回退到墙钟。
+  if rec.timer and rec.timer.elapsed then
+    return rec.timer:elapsed()
+  end
   if rec.start_ms then return _now_ms() - rec.start_ms end
   return nil
 end

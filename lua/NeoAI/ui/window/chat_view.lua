@@ -286,7 +286,7 @@ end
 local function _on_tool_started(payload)
   if not payload or payload.agent_id ~= state.agent_id then return end
   if payload.tool_call_id then
-    fold.record_start(payload.tool_call_id, payload.timer)
+    fold.record_start(payload.tool_call_id)
   end
   _schedule_render()
   _schedule_tool_tick()

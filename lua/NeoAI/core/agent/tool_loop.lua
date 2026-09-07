@@ -64,8 +64,12 @@ local function _execute_single(agent, tool_call, tool_service, opts)
   local exec_opts = vim.tbl_extend("force", {}, opts or {}, { timer = timer })
   logger.warn("[tool_loop] 执行工具 %s round=%s", name, tostring(agent._round_seq or ""))
 
+  -- 以原对象注册到 fold：事件经 nvim_exec_autocmds 深拷贝会丢失元表/方法，计时器无法随
+  -- 事件传播。tool_loop 直接以原对象（含元表）注册，供 UI 实时读取剔除等待的活跃耗时。
+  require("NeoAI.ui.components.fold").set_live_timer(tool_call.id, timer)
+
   event_bus.emit(events.TOOL_EXECUTION_STARTED, {
-    agent_id = agent.id, name = name, args = args, tool_call_id = tool_call.id, timer = timer,
+    agent_id = agent.id, name = name, args = args, tool_call_id = tool_call.id,
   })
 
   return tool_service.execute(agent, name, args, tool_call.id, exec_opts):then_(function(result)
