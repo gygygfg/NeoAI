@@ -107,17 +107,13 @@ local DEFAULT_CONFIG = {
       interval_sec = 3600,
       timeout_ms = 10000,
     },
-    scenarios = {
-      chat = { provider = "deepseek", preset = "balanced" },
-      coding = { provider = "deepseek", preset = "precise" },
-      reasoning = { provider = "deepseek", preset = "deep_think" },
-      agent = { provider = "deepseek", preset = "balanced" },
-    },
-    presets = {
-      fast = { model = "auto", temperature = 0.3, max_tokens = 1024, stream = true },
-      balanced = { model = "auto", temperature = 0.7, max_tokens = 4096, stream = true },
-      precise = { model = "auto", temperature = 0.2, max_tokens = 8192, stream = true },
-      deep_think = { model = "auto", temperature = 0.7, max_tokens = 8192, stream = true },
+    -- 按三种会话模式（CHAT / PLAN / AUTO）分别配置提供商与模型参数。
+    -- 进入某模式时应用该模式对应的 provider/model/temperature/max_tokens/stream，
+    -- 系统提示等全局项仍由 ai.system_prompt 提供。缺省字段回退到 ai.default_provider / 默认值。
+    modes = {
+      chat = { provider = "deepseek", model = "auto", temperature = 0.7, max_tokens = 4096, stream = true },
+      plan = { provider = "deepseek", model = "auto", temperature = 0.3, max_tokens = 8192, stream = true },
+      auto = { provider = "deepseek", model = "auto", temperature = 0.7, max_tokens = 8192, stream = true },
     },
     reasoning_enabled = true,
     system_prompt = "你是一个AI编程助手，帮助用户解决编程问题。",
@@ -325,6 +321,12 @@ local DEFAULT_CONFIG = {
         delete_node = { auto_allow = false },
       },
     },
+  },
+
+  herder = {
+    enabled = true, -- 是否启用 Herder 终端状态信号上报（还需 HERDR_ENV=1 才真正生效；非 Herder 环境为 no-op）
+    source = "custom:neoai", -- 稳定且全局唯一的生命周期权威标识
+    agent = "neoai", -- agent 名称（Herder 侧识别用）
   },
 
   log = {

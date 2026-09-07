@@ -1,268 +1,105 @@
-# NeoAI 多线程测试框架
+# NeoAI 测试框架（v3.0）
 
-## 概述
+> NeoAI 自带**轻量自定义测试框架**（无外部依赖，`:NeoAITest` 运行）。
+> 所有测试文件位于 `lua/NeoAI/tests/`。旧版文档中提到的 `thread_worker.lua` /
+> `thread_scheduler.lua` / `threaded_runner.lua` 及 `:NeoAITestAll` 命令均**不存在**。
+> 对应源码：`lua/NeoAI/tests/init.lua`。
 
-NeoAI 多线程测试框架使用 Neovim V0.12 的多线程 API，将测试执行从主线程移到后台线程，避免阻塞编辑器界面。
-
-## 核心特性
-
-1. **真正的后台执行**：使用 `vim.uv.new_thread()` 创建后台线程
-2. **进程隔离**：支持在完全独立的外部进程中运行测试
-3. **并发控制**：可配置的最大并发测试数
-4. **优先级调度**：支持不同优先级的测试任务
-5. **状态监控**：实时查看测试执行状态
-
-## 架构组件
-
-### 1. 线程工作器 (`thread_worker.lua`)
-- 底层线程管理
-- 支持三种线程类型：
-  - `uv_thread`: CPU 密集型任务
-  - `io_thread`: I/O 密集型任务  
-  - `job`: 外部进程（完全隔离）
-
-### 2. 线程调度器 (`thread_scheduler.lua`)
-- 统一的任务调度接口
-- 优先级管理（高/中/低）
-- 任务类型分类（计算/渲染/测试/I/O）
-- 并发控制
-
-### 3. 多线程测试运行器 (`threaded_runner.lua`)
-- 专门为测试优化的运行器
-- 支持套件级和批量测试
-- 外部进程测试支持
-- 结果聚合和报告
-
-## 使用方法
-
-### 基本命令
+## 1. 运行方式
 
 ```vim
-" 运行所有测试（默认使用多线程）
-:NeoAITestAll
-
-" 运行指定测试套件
-:NeoAITestSuite <套件名称>
-
-" 多线程运行测试
-:NeoAITestThread
-
-" 切换多线程测试模式
-:NeoAITestThreadToggle
-
-" 显示线程状态
-:NeoAIThreadStatus
-
-" 运行多线程测试演示
-:NeoAITestThreadDemo
+:NeoAITest              " 运行全部测试
+:NeoAITest flow_tools   " 运行指定套件（按名字）
+:NeoAITest test_agent test_herder  " 运行多个套件
 ```
 
-### 配置选项
+`run_all(...)` 动态加载 `lua/NeoAI/tests/test_*.lua`（幂等），收集所有 `suite` 并执行。
+支持按名字过滤（`requested` 匹配套件名）。
 
-在 `default_config.lua` 中配置：
+## 2. 测试框架 API（tests/init.lua）
 
-```lua
-testing = {
-  threaded = true, -- 启用多线程测试
-  max_concurrent_tests = 4, -- 最大并发测试数
-  timeout = 60, -- 测试超时时间（秒）
-  cleanup_after_tests = true, -- 测试后清理临时文件
-}
-```
-
-### 编程接口
-
-#### 运行单个测试套件（多线程）
+### 2.1 套件定义
 
 ```lua
 local tests = require("NeoAI.tests")
-local suite = tests.get_suite("套件名称")
 
--- 多线程运行
-tests.run_suite_thread("套件名称", function(results)
-  -- 处理结果
-end)
-
--- 或者使用运行器
-local runner = tests.get_threaded_runner()
-runner.run_suite_threaded(suite, function(success, results, error_msg)
-  -- 处理结果
-end)
-```
-
-#### 批量运行测试套件
-
-```lua
-local runner = tests.get_threaded_runner()
-local suites = {
-  ["套件1"] = suite1,
-  ["套件2"] = suite2,
-  -- ...
-}
-
-runner.run_suites_threaded(suites, function(total_results)
-  -- 处理聚合结果
-end)
-```
-
-#### 在外部进程中运行测试
-
-```lua
-runner.run_suite_in_process(suite, function(success, results, error_msg)
-  -- 完全隔离的进程环境
-end)
-```
-
-## 性能优势
-
-### 测试场景对比
-
-| 场景 | 单线程耗时 | 多线程耗时 | 加速比 |
-|------|-----------|-----------|--------|
-| 4个快速测试（各100ms） | 400ms | 100ms | 4x |
-| 2个慢速测试（各1s） | 2s | 1s | 2x |
-| 混合测试（快速+慢速） | 1.4s | 0.5s | 2.8x |
-
-### 资源隔离
-
-- **内存隔离**：外部进程测试不会影响主进程内存
-- **CPU隔离**：后台线程不会阻塞UI渲染
-- **错误隔离**：测试崩溃不会导致编辑器崩溃
-
-## 最佳实践
-
-### 1. 测试分类
-
-```lua
--- CPU密集型测试（计算、算法）
-local computation_suite = tests.register_suite("计算测试")
-computation_suite:add_test("性能测试", function()
-  -- 大量计算
-  for i = 1, 10000000 do
-    math.sqrt(i)
-  end
-  return true
-end)
-
--- I/O密集型测试（文件、网络）
-local io_suite = tests.register_suite("I/O测试")
-io_suite:add_test("文件操作", function()
-  -- 文件读写
-  local temp = vim.fn.tempname()
-  local file = io.open(temp, "w")
-  file:write("test")
-  file:close()
-  return true
-end)
-```
-
-### 2. 并发控制
-
-```lua
--- 配置并发数（根据CPU核心数调整）
-local config = require("NeoAI.default_config")
-config.testing.max_concurrent_tests = 4 -- 4核CPU
-```
-
-### 3. 超时处理
-
-```lua
--- 设置合理的超时时间
-config.testing.timeout = 30 -- 30秒
-
--- 在测试中添加超时检查
-suite:add_test("长时间测试", function()
-  local start = os.clock()
-  while os.clock() - start < 10 do
-    -- 工作
-  end
-  return true
-end)
-```
-
-## 故障排除
-
-### 常见问题
-
-1. **测试没有在后台运行**
-   - 检查 `testing.threaded` 配置
-   - 使用 `:NeoAITestThreadToggle` 启用
-
-2. **测试结果不一致**
-   - 确保测试是幂等的
-   - 使用 `before_each` 重置状态
-
-3. **外部进程测试失败**
-   - 检查临时文件权限
-   - 确保 `nvim` 在 PATH 中
-
-4. **内存泄漏**
-   - 使用外部进程进行内存密集型测试
-   - 定期清理临时文件
-
-### 调试命令
-
-```vim
-" 查看线程状态
-:NeoAIThreadStatus
-
-" 查看测试运行器状态
-:lua require("NeoAI.tests").get_threaded_runner().get_status()
-
-" 停止所有测试
-:lua require("NeoAI.tests").get_threaded_runner().stop_all_tests()
-```
-
-## 扩展开发
-
-### 添加新的测试类型
-
-```lua
--- 自定义测试运行器
-local CustomTestRunner = {}
-CustomTestRunner.__index = CustomTestRunner
-
-function CustomTestRunner.new()
-  local self = setmetatable({}, CustomTestRunner)
-  self.tests = {}
-  return self
-end
-
-function CustomTestRunner:add_test(name, func)
-  table.insert(self.tests, {name = name, func = func})
-end
-
-function CustomTestRunner:run(callback)
-  -- 使用线程调度器
-  local scheduler = require("NeoAI.utils.thread_scheduler")
-  
-  scheduler.schedule_testing(function()
-    -- 在后台运行测试
-    local results = {}
-    for _, test in ipairs(self.tests) do
-      local success, message = pcall(test.func)
-      table.insert(results, {
-        name = test.name,
-        success = success,
-        message = message
-      })
-    end
-    return results
-  end, function(success, results, error_msg)
-    if callback then
-      callback(success, results, error_msg)
-    end
+tests.suite("flow_tools", function(describe, it, before_each)
+  before_each(function()
+    -- 每个用例前的初始化（可选）
   end)
-end
+  it("should ...", function(t)
+    t.eq(1, 1)
+  end)
+end)
 ```
 
-## 总结
+- `suite(name, fn)`：定义测试套件，`fn(describe, it, before_each)`。
+- `it(name, fn)`：定义用例，`fn(t)` 收到断言辅助表 `t`。
 
-NeoAI 多线程测试框架提供了：
+### 2.2 断言辅助
 
-1. **非阻塞测试执行**：保持编辑器响应
-2. **灵活的并发控制**：根据硬件调整
-3. **完全隔离选项**：外部进程支持
-4. **统一的管理接口**：易于使用和扩展
+`it` 的用例回调参数 `t` 包含全部断言辅助：
 
-通过将测试移到后台线程，可以显著提升开发体验，特别是在运行大型测试套件时。
+| 辅助 | 说明 |
+| --- | --- |
+| `t.eq(expected, actual, msg?)` | 相等 |
+| `t.ne(expected, actual, msg?)` / `t.not_eq(...)` | 不等 |
+| `t.true_(value, msg?)` | 为真 |
+| `t.false_(value, msg?)` | 为假 |
+| `t.nil_(value, msg?)` / `t.not_nil(value, msg?)` | nil / 非 nil |
+| `t.matches(pattern, value, msg?)` | 字符串匹配 |
+| `t.ok(value, msg?)` | 真值 |
+| `t.deep_eq(expected, actual, msg?)` | 深比较（`vim.inspect`） |
+| `t.sleep(ms)` | 异步等待（返回 Deferred） |
+| `t.throws(fn)` | 捕获错误（返回 ok, err） |
+
+### 2.3 运行器
+
+`run_all(...)` 会：
+
+1. **会话隔离**：把会话默认路径重定向到临时目录（`~/.cache/NeoAI-test`），结束后清理并
+   恢复内存中的真实会话，防止测试污染真实历史。
+2. 动态加载所有 `test_*.lua`。
+3. 用 `xpcall` 逐个运行用例（带 `debug.traceback`），统计 `passed / failed / errors`。
+4. 返回 `{ passed, failed, errors }`。
+
+## 3. 测试文件清单
+
+`lua/NeoAI/tests/` 下按模块/特性划分：
+
+| 文件 | 覆盖 |
+| --- | --- |
+| `test_kernel.lua` | 内核（config_store / event_bus / events / lifecycle） |
+| `test_session.lua` | 会话（session / session_store / context_builder / compactor） |
+| `test_model_registry.lua` | 模型注册表 |
+| `test_agent.lua` | Agent（agent / runtime / guardian） |
+| `test_guard.lua` | 工具循环护栏 |
+| `test_overflow.lua` | 上下文溢出恢复 |
+| `test_tools.lua` | 工具系统 |
+| `test_services.lua` | 服务层（chat / tool / model / status） |
+| `test_ask_user.lua` | 向用户提问 |
+| `test_herder.lua` | Herder 状态上报 |
+| `test_plan_mode.lua` | 计划模式 |
+| `test_chat_ui.lua` | 聊天 UI |
+| `test_tree_ui.lua` | 会话树 UI |
+| `test_display_modes.lua` | 显示模式插件 |
+| `test_fold.lua` | 折叠 |
+| `test_status.lua` | 状态栏服务 |
+| `test_multimodal.lua` | 多模态图像 |
+| `test_cache_strategy.lua` | 前缀缓存策略 |
+| test_chat_keys / test_timer / test_todo / test_sub_agent_result / test_http / test_markdown / test_model_picker | 其它 |
+
+## 4. headless 运行
+
+测试可在 headless 模式运行（无需 GUI）：
+
+```bash
+nvim --headless "+lua require('NeoAI.tests').run_all()" +q
+```
+
+> 具体集成脚本见 `lua/NeoAI/tests/nvim_test.py` 与 `lua/NeoAI/tests/nvim/*.yaml`（若存在）。
+
+## 5. 相关文档
+
+- [testing.md](testing.md)：测试方法与断言。
+- [threaded_testing 说明]：本框架为轻量单线程运行器，**没有**多线程测试组件。

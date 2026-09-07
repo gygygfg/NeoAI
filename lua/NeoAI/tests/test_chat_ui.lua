@@ -129,6 +129,51 @@ tests.suite("chat_ui", function(_, it)
     chat_service.reset()
   end)
 
+  it("接收工具参数时打开悬浮窗并在参数流结束关闭", function(t)
+    local chat_view = require("NeoAI.ui.window.chat_view")
+    local chat_service = require("NeoAI.services.chat_service")
+    local tool_args_panel = require("NeoAI.ui.components.tool_args_panel")
+    local event_bus = require("NeoAI.kernel.event_bus")
+    local events = require("NeoAI.kernel.events")
+    chat_view.reset()
+    chat_service.reset()
+    tool_args_panel.reset()
+
+    chat_view.open()
+    local agent = chat_service.get_current_agent()
+    local mk = function(name, args)
+      local c = { index = 0, type = "function" }
+      c["function"] = { name = name, arguments = args }
+      return c
+    end
+    event_bus.emit(events.TOOL_ARG_CHUNK, { agent_id = agent.id, tool_calls = {
+      mk("bash", '{"cmd":'),
+    } })
+    event_bus.emit(events.TOOL_ARG_CHUNK, { agent_id = agent.id, tool_calls = {
+      mk("bash", '{"cmd":"ls"}'),
+    } })
+    chat_view.flush()
+    t.true_(tool_args_panel.is_open(), "收到工具参数分片时应打开悬浮窗")
+    t.true_(tool_args_panel.get_content():find("bash", 1, true) ~= nil, "悬浮窗应展示工具名")
+    t.true_(tool_args_panel.get_content():find('"cmd"', 1, true) ~= nil, "悬浮窗应展示接收到的参数")
+
+    event_bus.emit(events.TOOL_ARG_COMPLETED, { agent_id = agent.id })
+    t.false_(tool_args_panel.is_open(), "工具参数流结束时应关闭悬浮窗")
+
+    event_bus.emit(events.TOOL_ARG_CHUNK, { agent_id = agent.id, tool_calls = {
+      mk("bash", '{"cmd":"ls"}'),
+    } })
+    chat_view.flush()
+    t.true_(tool_args_panel.is_open(), "后续工具参数分片仍应打开悬浮窗")
+
+    event_bus.emit(events.GENERATION_COMPLETED, { agent_id = agent.id })
+    t.false_(tool_args_panel.is_open(), "生成结束时应关闭悬浮窗")
+
+    chat_view.reset()
+    chat_service.reset()
+    tool_args_panel.reset()
+  end)
+
   it("单行推理也显示折叠文本", function(t)
     local chat_view = require("NeoAI.ui.window.chat_view")
     local chat_service = require("NeoAI.services.chat_service")

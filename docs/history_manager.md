@@ -1,187 +1,89 @@
-# History Manager Reference
+# NeoAI 会话系统（v3.0）
 
-The history manager manages session data with a flat session structure.
-Sessions form a tree via child_ids, enabling branching conversations.
-Persistence is handled by a debounced, event-driven save system.
+> 会话系统管理对话历史，支持**分支树**、**追加式 JSONL 持久化**、**上下文构建**与**上下文压缩**。
+> 对应源码：`lua/NeoAI/core/session/*`。
 
-## Module Structure
+## 1. 模块结构
 
-**history/manager.lua:**
+| 模块 | 职责 |
+| --- | --- |
+| `core/session/session.lua` | 会话对象（纯净数据 + 方法），字段 `id / parent_id / root_id / created_at / updated_at / model / messages / metadata`。fork 分支。 |
+| `core/session/session_store.lua` | 会话持久化：追加式 JSONL + `.bak` 备份 + 撕裂行修复；CRUD + get_chain/get_downstream 链式遍历。 |
+| `core/session/context_builder.lua` | 从会话/Agent 构建发送给模型的上下文消息（含 system 渲染、工具调用协议处理）。 |
+| `core/session/compactor.lua` | 上下文压缩：达到压力阈值时折叠旧历史、辅助摘要（前缀缓存复用）、检查点替换。 |
 
-- Session CRUD, tree management, message management
-  - `create_session(name, is_root, parent_id)`: Create session
-  - `get_session(session_id)`: Get session by ID
-  - `get_current_session()`: Get current session
-  - `set_current_session(session_id)`: Switch current session
-  - `delete_session(session_id)`: Delete session (reparents children)
-  - `rename_session(session_id, new_name)`: Rename session
-  - `add_round(session_id, user_msg, assistant_msg, usage)`: Add conversation round
-  - `update_last_assistant(session_id, content)`: Update streaming response
-  - `add_tool_result(session_id, tool_name, arguments, result)`: Log tool result
-  - `get_messages(session_id)`: Get flattened message list
-  - `get_context_and_new_parent(session_id)`: Get context path for AI
-  - `find_parent_session(session_id)`: Find parent in tree
-  - `delete_chain_to_branch(session_id)`: Delete chain up to branch point
-  - `cleanup_orphans()`: Remove unreachable sessions
-  - `auto_name_session(session_id)`: AI-powered session naming
-  - `export_sessions(filepath)` / `import_sessions(filepath)`: Export/import
-  - `has_file_changed()` / `reload_from_file()`: External change detection
+## 2. 会话对象（session.lua）
 
-**history/cache.lua:**
+会话是纯净数据结构，无副作用、无 I/O：
 
-- Caching for round text, tree structure, and session list
-  - `get_round_text(session_id)`: Cached formatted round text
-  - `get_tree()`: Cached tree structure
-  - `get_list()`: Cached session list
-  - `invalidate_round_text(session_id)`: Invalidate specific cache
-  - `invalidate_all()`: Clear all caches
-
-**history/persistence.lua:**
-
-- File I/O with debounced saves
-  - `initialize(options)`: Setup save path and debounce
-  - `load()`: Load sessions from file
-  - `serialize(sessions)`: Convert sessions to JSON
-  - `debounced_save(get_sessions_fn)`: Debounced async save
-  - `enqueue_save(type, content)`: Queue save operation
-  - `sync_save(sessions)`: Synchronous save (for VimLeavePre)
-  - `flush_queue()`: Clear pending saves
-
-**history/saver.lua:**
-
-- Event-driven async save queue
-  - `initialize(history_manager)`: Setup event listeners
-  - `shutdown_sync()`: Flush queue synchronously on shutdown
-  - `_test_reset()`: Reset for testing
-
-**history/message_builder.lua:**
-
-- Session-to-messages conversion
-  - `session_to_messages(session)`: Convert session to role/content list
-  - `build_round_text(session)`: Build display text for session
-
-## Session Structure
-
-```lua
-{
-    id = "session_1",          -- Unique ID (session_N)
-    name = "Session name",     -- Display name (auto-named or user-set)
-    created_at = 1234567890,   -- Creation timestamp
-    updated_at = 1234567890,   -- Last update timestamp
-    is_root = true,            -- Root session in tree
-    child_ids = { "session_2" }, -- Child session IDs (branching)
-    user = "User message",     -- Last user message text
-    assistant = {              -- Array of assistant entries
-        { content = "AI response", reasoning_content = "..." },
-        { type = "tool_call", tool_name = "read_file", arguments = {...}, result = "..." },
-    },
-    timestamp = 1234567890,    -- Last message timestamp
-    usage = {                  -- Token usage (accumulated)
-        prompt_tokens = 24,
-        completion_tokens = 770,
-        total_tokens = 794,
-        completion_tokens_details = { reasoning_tokens = 100 },
-    }
-}
+```
+{ id, parent_id, root_id, created_at, updated_at, model,
+  messages = { { role, content, reasoning?, tool_calls?, tool_call_id?, ts, checkpoint? } },
+  metadata = { name?, tags?, usage? } }
 ```
 
-Assistant entry types:
+- `parent_id`：父会话 id（根会话为 nil）。
+- `root_id`：根会话 id（子会话未显式指定时以父为根）。
+- `fork(session, {copy_messages})`：派生新会话（`parent_id = session.id`）。
+- 消息操作：`add_message` / `get_message` / `update_message` / `delete_message` / `trim_messages` /
+  `clear_messages`。
+- `add_usage`：累加 usage（prompt/completion）。
 
-- `{ content = "text" }`: Normal AI text response
-- `{ content = "text", reasoning_content = "..." }`: AI response with reasoning
-- `{ type = "tool_call", tool_name, arguments, result }`: Tool execution record
-- `{ type = "tool_call", tool_name, results = {...}, arguments_list = {...} }`: Merged tool calls
+## 3. 会话持久化（session_store.lua）
 
-## Session Tree Management
+**追加式 JSONL**：每次写入 append 一行 JSON，无需解析整个文件；崩溃恢复截断最后不完整行即可。
 
-Sessions form a tree structure:
+- `_session_path()`：`session.save_path / session.file`（默认 `~/.cache/NeoAI/sessions.jsonl`）。
+- **init**：读取并修复 JSONL（`fs.repair_jsonl`），反序列化全部会话。
+- **persist(session)**：追加式持久化单个会话。
+- **save_all()**：原子重写整个文件（先写 `.bak` 再写正式文件；失败回滚），用于删除/批量变更后。
+- **delete(session_id)**：删除会话及其全部子孙（`get_descendants`）。
+- **get_chain(session_id)**：从根到指定会话的祖先链（含自身，根在前）。
+- **get_downstream(session_id)**：沿会话树向下的单子链。只有唯一子会话才继续深入；
+  遇分裂分支（多个子会话）或末尾即止。用于重建完整线性对话。
 
-```text
-session_1 (root)  <- "How do I use Neovim?"
-  ├── session_2  <- "Explain buffers"
-  │     └── session_4  <- "Explain windows too"
-  └── session_3  <- "Explain plugins"
-```
+### 3.1 撕裂行恢复
 
-Tree operations:
+`fs.repair_jsonl` 在读取前修复被截断/撕裂的最后一行，保证崩溃后下一次启动能正常加载。
 
-- `create_session(name, true, nil)`: Create root session
-- `create_session(name, false, parent_id)`: Create child (branch)
-- `delete_session(id)`: Remove session, reparent children to parent
-- `delete_chain_to_branch(id)`: Delete chain up to branch point
-- `get_root_sessions()`: Get all root sessions (sorted by update time)
-- `get_tree()`: Get full tree structure (cached)
+## 4. 上下文构建（context_builder.lua）
 
-Context path resolution (`get_context_and_new_parent`):
+`context_builder.build(session)` / `build_from_agent(agent)`：
 
-- Walk up from session to root via unique child chains
-- Walk down from session to leaf via unique child chains
-- Collect all messages along the path
-- This ensures AI has full conversation context
+- 首条消息为 system（`prefix.build_system_prompt` 渲染）。
+- 截断历史：保留最近的 `session.max_history_per_session`（缺省 1000）条非 system。
+- **工具调用协议**：带 `tool_calls` 的 assistant 消息，`content` 必须为 `null`（或省略）；
+  发送 `content:""` 会被要求严格的模型判定为格式异常。
+- **推理内容不随历史回传**：`reasoning_content` 不写入 API 消息，内部 `message.reasoning` 仅用于渲染。
+  避免重复发送整段思维链、使 DeepSeek 前缀缓存从该 assistant 消息起失效。
+- `build_prefix(agent, range_messages)`：构建压缩回放前缀（system + 指定区间），供压缩辅助调用复用前缀缓存。
+- `build_fork_context(session, task)`：从父会话派生子会话的初始上下文。
+- `estimate_tokens(messages)`：token 粗估（字符/4）。
 
-## Persistence System
+## 5. 上下文压缩（compactor.lua）
 
-**Save location:**
+策略对齐 deepseek-harness 的 compaction：
 
-- Default: `stdpath("cache") .. "/NeoAI/sessions.json"`
-- Configurable via `session.save_path`
+1. **触发**：`maybe_compact(agent)` 在每次新一步前检查，估算 token 达到
+   `context_window * threshold_ratio` 阈值时折叠。
+2. **选择折叠区间**：`_select_shadow_range` 折叠最早的整段历史，保留最近尾部（`retain_ratio` 预算，
+   下限 `retain_min_tokens`，至少 `min_shadow_messages` 条消息）。
+3. **辅助摘要**：`_summarize` 逐字节回放会话前缀（相同系统提示、工具 schema、被折叠区消息），
+   再追加压缩指令作为最后一条 user 消息 → 复用 provider 热前缀缓存。
+4. **检查点替换**：生成带 `<compacted-summary>` 标签的 checkpoint user 消息，**替换被折叠区间**
+   （`_replace_with_checkpoint`），并记录 `replaced_count`。后续请求在替换点之前的未变前缀仍可复用缓存。
+5. **仅替换而非追加**（不产生第二份历史副本）。成功后发射 `COMPACTION_COMPLETED`。
 
-**Save triggers:**
+`force_compact`（溢出恢复用）跳过压力阈值判断，保留空闲/并发锁检查。
 
-- `add_round()`: User sends a message
-- `add_tool_result()`: Tool execution completes
-- `delete_session()`: Session deleted
-- `rename_session()`: Session renamed
-- VimLeavePre: Synchronous save (via shutdown_flag)
+## 6. 会话树与分支
 
-**Save mechanism:**
+会话通过 `parent_id` / `root_id` 表达树形结构。从树界面打开某会话时，`chat_service.load_session`
+沿 `get_chain`（祖先）向上延展到首轮，再沿 `get_downstream`（单子链）向下延展到分裂分支或末尾，
+拼出完整线性对话（`_build_chain_messages`），避免只打开选中会话丢失分支上下文。
 
-- `debounced_save()`: Debounces by 500ms (configurable)
-- `enqueue_save()`: Event-driven queue (saver.lua)
-- `sync_save()`: Direct synchronous write (for shutdown)
+## 7. 相关文档
 
-**External change detection:**
-
-- `has_file_changed()`: Check if file was modified externally
-- `reload_from_file()`: Re-read sessions from file
-- Uses line count caching for efficient detection
-
-## Auto-Naming
-
-When `auto_naming = true`:
-
-1. User sends first message in a session
-2. `history_manager.add_round()` triggers `auto_name_session()`
-3. Checks if session name is a default name ("聊天会话", "新会话", etc.)
-4. If default, calls `ai_engine.auto_name_session()`
-5. AI generates a short name (<=20 chars) from the user message
-6. Session is renamed via `rename_session()`
-7. SESSION_RENAMED event is fired
-
-## Export/Import
-
-Export format (JSON):
-
-```json
-{
-    "sessions": [
-        { "id": "session_1", "name": "...", "user": "...", ... }
-    ],
-    "export_time": 1234567890
-}
-```
-
-Commands:
-
-- `:NeoAIExport [path]` — Export sessions to JSON
-- `:NeoAIImport [path]` — Import sessions from JSON
-
-## Orphan Cleanup
-
-`cleanup_orphans()` removes sessions not reachable from any root session:
-
-1. Mark all root sessions and their descendants as referenced
-2. Remove all unreferenced sessions
-3. Trigger ORPHANS_CLEANED event
-4. Invalidate all caches
-5. Mark dirty for persistence
+- [configuration.md](configuration.md)：`session.*` 配置（save_path / max_history_per_session / file）。
+- [ai_engine.md](ai_engine.md)：`context_builder` / `compactor` 在生成流程中的作用。
+- [EVENTS.md](EVENTS.md)：会话事件（`SESSION_*`）。

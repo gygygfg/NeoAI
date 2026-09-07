@@ -1,219 +1,104 @@
-# 测试指南
+# NeoAI 测试指南（v3.0）
 
-## 概述
+> NeoAI 采用**轻量自定义测试框架**（`lua/NeoAI/tests/init.lua`，无外部依赖）。
+> 以 `suite` / `it` 组织用例，`t.<断言>` 断言，`:NeoAITest` 运行。
+> 配合 Mock 对 HTTP、模型、文件系统等做隔离单元/集成测试。
 
-NeoAI 测试体系采用 Lua 测试框架，结合 Mock 机制对各个模块进行单元测试和集成测试。
+## 1. 运行
 
-## 测试策略
-
-| 测试类型 | 覆盖范围 | 工具 |
-|---------|---------|------|
-| **单元测试** | 单个模块/函数 | Lua 单元测试框架 |
-| **集成测试** | 模块间交互 | Mock HTTP + 模拟 AI 响应 |
-| **功能测试** | 端到端工作流 | Neovim 测试环境 |
-| **Mock 测试** | AI API、文件系统 | 自定义 Mock 函数 |
-
-## Mock 策略
-
-### AI API Mock
-
-对 HTTP 请求进行 Mock，模拟 LLM 的流式和非流式响应：
-
-```lua
--- Mock 配置
-local mock_responses = {
-    stream = {
-        -- 模拟流式文本响应
-        { type = "content", content = "Hello" },
-        { type = "content", content = " World" },
-        { type = "done", reason = "stop" }
-    },
-    tool_call = {
-        -- 模拟工具调用响应
-        { type = "tool_call",
-          tool_calls = {{
-              id = "call_mock",
-              function = { name = "read_file", arguments = '{"filepath":"test.txt"}' }
-          }}
-        },
-        { type = "done", reason = "tool_calls" }
-    }
-}
-
--- Mock HTTP 请求
-function mock_http_request(url, opts)
-    if opts.stream then
-        -- 返回流式 Mock 数据
-        return mock_stream_response(mock_responses.stream)
-    else
-        -- 返回完整 Mock 响应
-        return mock_complete_response(mock_responses.tool_call)
-    end
-end
+```vim
+:NeoAITest          " 运行全部套件
+:NeoAITest flow_tools  " 运行指定套件（按名字）
 ```
 
-### 文件系统 Mock
-
-```lua
--- Mock 文件系统操作
-local mock_fs = {
-    files = {
-        ["/test/file.txt"] = "original content"
-    },
-    read_file = function(path)
-        return mock_fs.files[path]
-    end,
-    write_file = function(path, content)
-        mock_fs.files[path] = content
-    end,
-    file_exists = function(path)
-        return mock_fs.files[path] ~= nil
-    end
-}
-```
-
-### Request Handler Mock
-
-```lua
--- Mock RequestHandler
-local MockRequestHandler = {}
-
-function MockRequestHandler:new(config)
-    return setmetatable({
-        _config = config,
-        _scenario = "simple_response"
-    }, { __index = MockRequestHandler })
-end
-
-function MockRequestHandler:send_request(messages, opts)
-    if self._scenario == "simple_response" then
-        -- 返回简单文本响应
-        return { content = "This is a mock response" }
-    elseif self._scenario == "tool_call_response" then
-        -- 返回带工具调用的响应
-        return {
-            content = nil,
-            tool_calls = {{
-                id = "call_1",
-                function = { name = "read_file", arguments = '{}' }
-            }}
-        }
-    elseif self._scenario == "error_response" then
-        -- 返回错误
-        error("API Error: rate limit exceeded")
-    end
-end
-```
-
-## 测试用例结构
-
-### AI 引擎测试
-
-```lua
-describe("AIEngine", function()
-    before_each(function()
-        -- 创建 Mock 配置
-        local config = {
-            provider = "openai",
-            model = "gpt-4",
-            api_key = "test-key",
-            max_tokens = 100,
-            stream = true
-        }
-        -- 注入 Mock 依赖
-        package.loaded["NeoAI.core.ai.request_handler"] = MockRequestHandler
-        -- 创建引擎实例
-        local Engine = require("NeoAI.core.ai.engine")
-        self.engine = Engine:new(config)
-    end)
-
-    describe("on_submit()", function()
-        it("应该创建新会话并开始生成", function()
-            self.engine:on_submit("Hello AI!", {})
-            -- 验证会话已创建
-            assert.not_nil(self.engine._session_id)
-            -- 验证用户消息已添加
-            local session = self.engine._sessions[self.engine._session_id]
-            assert.equal("user", session.messages[1].role)
-            assert.equal("Hello AI!", session.messages[1].content)
-        end)
-    end)
-
-    describe("prepare_messages()", function()
-        it("应该包含系统消息", function()
-            -- ...
-        end)
-    end)
-
-    describe("stop_generation()", function()
-        it("应该设置停止标志", function()
-            self.engine:stop_generation()
-            assert.is_true(self.engine._stop_flag)
-        end)
-    end)
-end)
-```
-
-### 历史管理器测试
-
-```lua
-describe("HistoryManager", function()
-    describe("add_message()", function()
-        it("应该按顺序添加消息", function()
-            local hm = HistoryManager:new({})
-            local sid = hm:create_session()
-            hm:add_message(sid, "user", "Hello")
-            hm:add_message(sid, "assistant", "Hi there")
-            local msgs = hm:get_messages(sid)
-            assert.equal(2, #msgs)
-            assert.equal("user", msgs[1].role)
-            assert.equal("assistant", msgs[2].role)
-        end)
-    end)
-
-    describe("prune_messages()", function()
-        it("应该在超过限制时修剪消息", function()
-            -- ...
-        end)
-    end)
-end)
-```
-
-### 工具注册表测试
-
-```lua
-describe("ToolRegistry", function()
-    describe("execute()", function()
-        it("应该正确执行注册的工具", function()
-            -- ...
-        end)
-        it("应该处理不存在的工具并返回错误", function()
-            -- ...
-        end)
-        it("应该处理工具参数规范化", function()
-            -- ...
-        end)
-    end)
-end)
-```
-
-## 运行测试
+headless 运行：
 
 ```bash
-# 运行所有测试
-make test
-
-# 运行特定测试文件
-make test TEST=test_ai_engine
-
-# 运行特定测试用例
-make test TEST=test_ai_engine TEST_CASE="should create new session"
+nvim --headless "+lua require('NeoAI.tests').run_all()" +q
 ```
 
-## Mock 最佳实践
+## 2. 测试组织
 
-1. **隔离依赖** — 每个测试应 Mock 所有外部依赖
-2. **场景覆盖** — 覆盖正常流程、边界条件和错误场景
-3. **状态重置** — 每个测试前后重置状态，避免测试间污染
-4. **断言清晰** — 明确断言每个测试的预期行为
-5. **Mock 验证** — 验证 Mock 是否按预期被调用
+```lua
+local tests = require("NeoAI.tests")
+
+tests.suite("flow_config", function(describe, it, before_each)
+  before_each(function()
+    require("NeoAI.kernel.config_store").reset()
+  end)
+
+  it("merge user overrides default", function(t)
+    local cs = require("NeoAI.kernel.config_store")
+    cs.load({ ai = { default_provider = "openai" } })
+    t.eq(cs.get("ai.default_provider"), "openai")
+  end)
+
+  it("reads dotted path", function(t)
+    local cs = require("NeoAI.kernel.config_store")
+    cs.load({})
+    t.eq(cs.get("ui.window.width"), 80)
+  end)
+end)
+```
+
+## 3. 断言辅助
+
+用例回调收到 `t`（断言辅助表）：
+
+| 断言 | 说明 |
+| --- | --- |
+| `t.eq(a, b)` | 相等 |
+| `t.ne(a, b)` / `t.not_eq(a, b)` | 不等 |
+| `t.true_(v)` / `t.false_(v)` | 真假 |
+| `t.nil_(v)` / `t.not_nil(v)` | nil / 非 nil |
+| `t.matches(pattern, v)` | 字符串匹配 |
+| `t.ok(v)` | 真值 |
+| `t.deep_eq(a, b)` | 深比较 |
+| `t.sleep(ms)` | 异步等待（返回 Deferred） |
+| `t.throws(fn)` | 捕获错误 |
+
+## 4. Mock 策略
+
+### 4.1 会话/文件隔离
+
+测试运行器自动把会话默认路径重定向到临时目录（`~/.cache/NeoAI-test`），结束后清理并恢复
+内存中的真实会话，防止测试污染真实历史。`kernel.*` 与 `core.session.*` 模块提供 `reset()` 方法
+（config_store / event_bus / lifecycle / session_store / registry / tool_service 等），便于隔离。
+
+### 4.2 HTTP / AI Mock
+
+对 HTTP 请求做 Mock，模拟 LLM 的流式与非流式响应：
+
+- 需要时覆写 `utils.http` 的请求层，或注入 mock server。
+- `test_http.lua` 覆盖 HTTP 客户端；`test_integration.lua` 用 mock server 做集成。
+
+### 4.3 工具 Mock
+
+可直接调用工具定义，或覆写 `registry`（如 `registry.reset()` 后用 `register` 注入 mock 工具）。
+`test_tools.lua`、`test_sub_agent_result.lua` 覆盖工具与子 Agent 结果。
+
+### 4.4 事件 / 状态隔离
+
+各模块 `reset()`（`event_bus.clear_all`、`herder.reset`、`chat_service.reset`、`status.reset` 等）
+确保测试间无残留订阅/状态。
+
+## 5. 测试覆盖主题
+
+| 文件 | 覆盖 |
+| --- | --- |
+| `test_config / test_kernel` | 配置合并、事件总线、生命周期 |
+| `test_session` | 会话对象、JSONL 存储、上下文构建、压缩 |
+| `test_agent / test_guard` | Agent 状态机、护栏 |
+| `test_overflow` | 上下文溢出恢复 |
+| `test_tools / test_sub_agent_result` | 工具执行、子 Agent |
+| `test_services` | 聊天/工具/模型/状态服务 |
+| `test_ask_user / test_herder` | 提问、Herder 上报 |
+| `test_plan_mode` | 计划模式 |
+| `test_chat_ui / test_tree_ui / test_display_modes / test_fold` | UI |
+| `test_status` | 状态栏 |
+| `test_multimodal / test_cache_strategy` | 多模态、前缀缓存 |
+
+## 6. 相关文档
+
+- [threaded_testing.md](threaded_testing.md)：测试框架结构与运行器。
+- [utils.md](utils.md)：`utils.async`（Deferred/sleep 等用于测试）。

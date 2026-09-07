@@ -6,6 +6,8 @@
 --- 未注册 UI 时回退到 vim.ui.input，仍不可用则报错（不阻塞工具循环）。
 
 local helpers = require("NeoAI.tools.builtin.tool_helpers")
+local event_bus = require("NeoAI.kernel.event_bus")
+local events = require("NeoAI.kernel.events")
 
 local M = {}
 
@@ -48,7 +50,9 @@ ask_user_tools.ask_user = helpers.define_tool(
       end
     end
 
+    local agent_id = ctx and ctx.agent and ctx.agent.id
     local settled = false
+    local waiting_started = false -- 本次调用是否真正进入等待（用于对称上报 waiting/answered）
     -- 等待用户回答的耗时不计入工具执行时间/超时：暂停可暂停计时器，回答/取消后恢复。
     local timer = ctx and ctx.timer
     local function finish_ok(answer)
@@ -56,6 +60,9 @@ ask_user_tools.ask_user = helpers.define_tool(
       settled = true
       pending = false
       if timer and timer.resume then pcall(timer.resume, timer) end
+      if waiting_started then
+        event_bus.emit(events.ASK_USER_ANSWERED, { agent_id = agent_id })
+      end
       on_success(("用户回答: %s"):format(tostring(answer)))
     end
     local function finish_err(err)
@@ -63,6 +70,9 @@ ask_user_tools.ask_user = helpers.define_tool(
       settled = true
       pending = false
       if timer and timer.resume then pcall(timer.resume, timer) end
+      if waiting_started then
+        event_bus.emit(events.ASK_USER_ANSWERED, { agent_id = agent_id })
+      end
       on_error(err)
     end
 
@@ -72,6 +82,8 @@ ask_user_tools.ask_user = helpers.define_tool(
       return
     end
     pending = true
+    waiting_started = true
+    event_bus.emit(events.ASK_USER_WAITING, { agent_id = agent_id })
     -- 真正开始等待用户前暂停计时器：等待时间不累计活跃耗时、不消耗超时预算。
     if timer and timer.pause then pcall(timer.pause, timer) end
 

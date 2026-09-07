@@ -1,225 +1,203 @@
-# AI Engine Architecture
+# NeoAI Agent 引擎（v3.0）
 
-The AI engine is the core generation orchestrator. It manages the complete
-lifecycle of AI interactions: request building, HTTP communication, stream
-processing, tool orchestration, and response retry.
+> 本文档描述 NeoAI 的 Agent 引擎，从会话构建上下文、发送请求、处理流式响应、
+> 执行工具循环、到上下文压缩与溢出恢复的完整链路。
+> 对应源码：`lua/NeoAI/core/agent/*`。
 
-## Module Structure
+## 1. 模块结构
 
-**ai/init.lua:**
+`core/agent/` 下每个模块职责单一，依赖单向（`agent → runtime → request/stream/tool_loop`）。
 
-- Entry point, exports all AI sub-modules
+| 模块 | 职责 |
+| --- | --- |
+| `agent.lua` | Agent 对象（纯数据 + 方法，不含 I/O）。状态机 `idle → generating → tool_running → idle`（或 `aborted`/`error`）。私有消息队列、工具集、独立 AbortSignal。 |
+| `runtime.lua` | Agent 运行时：`create` / `spawn`（派生） / `dispose` / `abort` / `run`。解析场景配置、绑定工具、编排生成流程。 |
+| `request.lua` | 请求构建（经 adapter）+ 发送（流式/非流式）+ 指数退避重试 + 上下文溢出判断。 |
+| `stream.lua` | 流式响应处理：把 OpenAI 分片格式的增量 `tool_calls` 累积为完整 tool_call，并实时发射 `TOOL_ARG_CHUNK`/`TOOL_ARG_COMPLETED`。 |
+| `tool_loop.lua` | 工具调用循环：并行执行工具 → 请求 AI 继续 → 直到无工具调用。 |
+| `prefix.lua` | 前缀缓存身份一致性：系统提示按有序段拼接、工具按字典序输出、fingerprint 比对，缓存命中率最大化。 |
+| `guard.lua` | 工具循环护栏：检测连续重复的工具调用并注入提醒（observe-and-enrich）。 |
+| `recovery.lua` | 上下文溢出恢复：请求返回 context window exceeded 时自动压缩历史后重发。 |
 
-**ai/ai_engine.lua:**
+## 2. 核心概念
 
-- Central orchestrator for AI generation flow
-  - `generate_response(messages, params)`: Main entry point
-  - `process_query(query, options)`: Simplified query interface
-  - `cancel_generation()`: Stop current generation
-  - `handle_tool_result(data)`: Process tool execution results
-  - `auto_name_session(session_id, user_msg, callback)`: AI-powered naming
-  - `set_tools(tools)`: Register tool definitions with AI engine
+### 2.1 Agent 对象（每次对话全新实例）
 
-**ai/chat_service.lua:**
+每个会话对应一个**全新的 Agent 实例**，零状态泄漏：
 
-- Backend service for chat operations
-  - `send_message(params)`: Send user message, trigger AI generation
-  - `cancel_generation()`: Cancel current generation
-  - Session CRUD delegation to history_manager
-  - Message management (get_raw_messages, add_round, etc.)
+- `id`：全局唯一（`stringx.uuid("agent")`）。
+- `session_id`：所属会话 id。
+- `parent`：子 Agent 的父 Agent id。
+- `messages`：私有消息队列（`{ role, content, reasoning?, tool_calls?, ts }`）。
+- `tools`：可见工具子集（`name -> tool def`）。
+- `signal`：独立 AbortSignal（取消信号）。
+- `state`：状态机当前值。
+- `cache`：前缀缓存身份指纹与命中统计。
 
-**ai/http_client.lua:**
+状态机由 `agent.lua` 定义：
 
-- HTTP client for AI API communication
-  - `send_request(params)`: Synchronous non-streaming request
-  - `send_stream_request(params, on_chunk, on_complete, on_error)`: Streaming
-  - `send_request_async(params, on_complete)`: Async non-streaming
-  - `cancel_request(request_id)`: Cancel specific request
-  - `cancel_all_requests()`: Cancel all active requests
-
-**ai/request_builder.lua:**
-
-- Builds AI API request payloads
-  - `build_request(params)`: Construct request with messages, tools, options
-  - `format_messages(messages)`: Deduplicate, filter, and format messages
-  - `build_tool_result_message(tool_call_id, result, tool_name)`: Tool result message
-  - `estimate_tokens(text)`: Token estimation
-
-**ai/request_adapter.lua:**
-
-- Multi-provider request/response format adapter
-  - Registered adapters: openai, anthropic, google
-  - `transform_request(request, api_type, provider_config)`: Convert to native format
-  - `transform_response(response, api_type)`: Convert from native to unified format
-  - `get_headers(api_key, api_type)`: Get HTTP headers for provider
-
-**ai/stream_processor.lua:**
-
-- Streaming response processing
-  - `create_processor(generation_id, session_id, window_id)`: Create processor
-  - `process_chunk(processor, data)`: Process single stream chunk
-  - `filter_valid_tool_calls(tool_calls)`: Remove invalid/truncated tool calls
-  - `push_reasoning_content()`: Throttled reasoning content dispatch
-  - `clear_reasoning_throttle()`: Clean up throttle state
-
-**ai/response_retry.lua:**
-
-- Abnormal response detection and retry logic
-  - `detect_abnormal_response(content, tool_calls, opts)`: Detect issues
-  - `is_summary_content(content)`: Check if response is summary
-  - `can_retry(retry_count)`: Check retry limit
-  - `get_retry_delay(retry_count)`: Exponential backoff (1s, 2s, 4s, 8s, 16s)
-
-**ai/tool_orchestrator.lua:**
-
-- Unified tool loop engine (event-driven)
-  - `start_async_loop(params)`: Start tool execution loop
-  - `on_generation_complete(data)`: Handle AI response in tool loop
-  - `execute_single_tool_request()`: One-shot tool request (for shell input)
-  - Session lifecycle: register/unregister sessions and sub-agent sessions
-
-**ai/sub_agent_engine.lua:**
-
-- Sub-agent lifecycle manager
-  - `start_sub_agent_loop(sub_agent_id, tool_calls, session_context)`: Start
-  - `review_tool_call(sub_agent_id, tool_name, args)`: Boundary enforcement
-  - `_request_generation(sub_agent_id)`: Request next AI generation
-  - `_finalize_sub_agent(sub_agent_id, result)`: Clean up sub-agent
-
-**ai/session_manager.lua:**
-
-- Tool loop session state factory
-  - `create_session_state(session_id, window_id)`: Create state object
-  - `reset_session_state(ss)`: Reset state (preserve id/win)
-  - `is_executing_phase(ss)`: Check if in execution phase
-  - `all_idle(sessions)`: Check if all sessions idle
-
-**ai/generation_handler.lua:**
-
-- Generation completion utilities
-  - `accumulate_usage(accumulated, current_usage)`: Merge usage stats
-  - `build_assistant_message(content, reasoning_text, window_id, tool_calls)`
-  - `fire_generation_completed(params)`: Trigger completion event
-  - `fire_generation_error(params)`: Trigger error event
-  - `fire_generation_cancelled(params)`: Trigger cancel event
-
-## Generation Flow
-
-1. User sends message via `chat_service.send_message()`
-2. chat_service gets context messages from history_manager
-3. chat_service calls `ai_engine.generate_response(messages, params)`
-4. ai_engine resolves scenario config via config_merger
-5. `request_builder.build_request()` constructs the API request
-6. http_client sends request (streaming or non-streaming)
-7. For streaming: stream_processor processes chunks in real-time
-   - Content chunks dispatched via STREAM_CHUNK event
-   - Reasoning content dispatched via REASONING_CONTENT (throttled)
-   - Tool calls accumulated in processor.tool_calls
-8. On stream end: response_retry detects abnormal responses
-   - Abnormal: retry with exponential backoff
-   - Normal: dispatch to tool_orchestrator or finalize
-9. If tool calls detected: `tool_orchestrator.start_async_loop()`
-10. Tool loop: execute tools → request next AI generation → repeat
-11. On completion: GENERATION_COMPLETED event fired
-
-## Tool Loop Flow
-
-1. AI returns tool_calls in response
-2. `ai_engine._handle_stream_end` detects tool_calls
-3. `tool_orchestrator.start_async_loop()` begins
-4. `_execute_tools()` groups tools by pack and executes concurrently
-5. Each tool goes through:
-   - `tool_executor.execute_with_orchestrator()`
-   - Parameter normalization (alias mapping)
-   - Approval check (approval_handler)
-   - Actual execution with timeout
-   - Result added to session messages
-6. When all tools complete: `_on_tools_complete()`
-7. `fire_tool_result_received()` triggers next AI generation
-8. AI generates next response with tool results in context
-9. Loop continues until AI returns text-only response or max iterations
-
-## Multi-Provider Support
-
-Supported providers and their api_type:
-
-```text
-deepseek    - openai (OpenAI-compatible API)
-openai      - openai
-anthropic   - anthropic (Anthropic Messages API)
-google      - google (Gemini API)
-groq        - openai
-together    - openai
-openrouter  - openai
-siliconflow - openai
-moonshot    - openai
-zhipu       - openai
-baidu       - openai
-aliyun      - openai
-stepfun     - openai
+```
+idle → generating → tool_running → idle
+            ↓              ↓
+         aborted          error
 ```
 
-Each provider can define multiple models. The request_adapter transforms
-requests and responses between the unified internal format and each
-provider's native format.
+### 2.2 场景化配置解析
 
-## Reasoning Mode
+`runtime._resolve_agent_config` 按 `scenario` 解析模型配置，优先级：`场景 provider/preset → 预设 → 用户覆盖`。
+场景取值：`chat` / `coding` / `reasoning` / `agent`。`model = "auto"` 时从 `core.model.registry` 解析默认模型。
 
-When `reasoning_enabled = true`:
+## 3. 生成流程（runtime.run）
 
-- `extra_body.thinking = { type = "enabled" }` is sent to API
-- `reasoning_effort` controls depth: "low", "high", "max"
-- AI reasoning content is displayed via REASONING_CONTENT event
-- stream_processor throttles reasoning content updates (80ms interval)
-- reasoning_display component shows reasoning in a floating window
+`runtime.run(agent, content)` 是主入口：
 
-When `reasoning_enabled = false`:
+1. **忙碌检查**：`agent_mod.is_busy(agent)`（generating / tool_running）→ 返回 `reject({kind="busy"})`。
+2. **信号复位**：若上一次被取消（`signal:aborted()`），则替换为全新 AbortSignal（否则新一轮请求会立即失败）。
+3. **上下文压缩检查**：`compactor.maybe_compact(agent)` —— 到达压力阈值先折叠旧历史，复用前缀缓存。
+4. **护栏复位**：`guard.reset(agent)` —— 用户新输入重置重复调用计数。
+5. **添加用户消息**：`agent:add_message("user", content)`，发射 `MESSAGE_SENT`。
+6. **生成**：`_run_generation(agent, {})`（见下）。
 
-- `extra_body.thinking = { type = "disabled" }` is sent
-- DeepSeek reasoner models are auto-switched to chat models
-- Forced tool calls (`tool_choice = function`) disable reasoning mode
+### 3.1 生成（_run_generation）
 
-## Error Handling & Retry
+```
+_runtime._run_generation(agent, opts)
+  → stream.create(agent) 创建流处理器
+  → agent:set_state("generating") + GENERATION_STARTED
+  → recovery.send_stream(agent, { agent_config, model, signal }, on_chunk)
+      ├─ 逐 chunk → proc.process(chunk)（内容/推理/工具调用增量写入 agent）
+      ├─ 成功 → usage 累加 + proc.finish() 得到工具调用
+      │    ├─ 有工具调用 → tool_loop.run(agent, tool_calls, tool_service)
+      │    └─ 无工具调用 → 若空响应写 EMPTY_RESPONSE_MESSAGE → 收尾 idle
+      └─ 失败（取消）→ 状态复位 idle，reject({kind="cancelled"})
+                    （普通错误）→ 状态 error + GENERATION_ERROR
+```
 
-response_retry.lua detects these abnormal responses:
+### 3.2 流式处理（stream.lua）
 
-**Content issues:**
+`stream.create(agent)` 返回 `processor`，`processor.process(parsed)` 处理每个解析后的分片：
 
-- Repeated lines/paragraphs
-- Duplicate headers (## Title)
-- Long identical lines (>50 chars)
-- Unclosed code blocks (```)
-- Incomplete endings (trailing comma, colon, semicolon)
+- **推理**：`REASONING_STARTED` → `agent:append_reasoning(chunk)`（`REASONING_CHUNK`）。
+- **内容**：`agent:append_content(chunk)`。
+- **工具调用**：`_accumulate_tool_calls` 按 `index` 累积增量（名/参数字符串拼接），
+  并实时发射 `TOOL_ARG_CHUNK { agent_id, tool_calls = 当前累积快照 }`。
 
-**Tool call issues:**
+`processor.finish()` 结束流：把累积的 tool_calls finalize 写入 agent（`set_tool_calls`，
+发射 `TOOL_CALL_DETECTED`），并发射 `TOOL_ARG_COMPLETED`。
 
-- Empty arguments (nil or empty table)
-- Duplicate tool calls (same name + same arguments)
+> `TOOL_ARG_CHUNK` / `TOOL_ARG_COMPLETED` 是新增事件，供 UI 实时展示「接收参数」悬浮窗
+> （`tool_args_panel`），与思考过程悬浮窗行为一致。
 
-**Retry strategy:**
+### 3.3 上下文构建（core/session/context_builder）
 
-- Max 5 retries
-- Exponential backoff: 1s, 2s, 4s, 8s, 16s
-- Summary rounds also retry on empty response
-- Tool loop empty responses trigger immediate end (no retry)
+`context_builder.build_from_agent(agent)` 从 Agent 消息队列构建 API 上下文：
 
-## HTTP Client Details
+- 首条系统消息由 `prefix.build_system_prompt(agent)` 渲染（有序段拼接）。
+- 工具调用协议要求：带 `tool_calls` 的 assistant 消息，`content` 必须为 `null`（或省略）。
+- **推理内容（reasoning_content）不随历史回传**：避免每次请求重复发送整段思维链、
+  使 DeepSeek 前缀缓存从该 assistant 消息起字节不一致而失效。内部 `message.reasoning`
+  仍保留用于渲染。
 
-Request methods:
+## 4. 工具调用循环（tool_loop.lua）
 
-- `send_request()`: Synchronous curl via `vim.fn.system`
-- `send_stream_request()`: Streaming curl via `vim.fn.jobstart`
-- `send_request_async()`: Async curl via `vim.fn.jobstart`
+`tool_loop.run(agent, tool_calls, tool_service, opts)` 是工具循环主循环。
 
-Streaming implementation:
+### 4.1 循环结构
 
-- SSE (Server-Sent Events) parsing
-- Buffer management for partial lines
-- Tool call arguments accumulated as JSON strings, parsed on completion
-- Request deduplication via http_utils
+```
+_run() 每轮：
+  1. abort 检查 → reject({kind="aborted"})
+  2. rounds 计数，超过 MAX_ROUNDS(1000) → 写 LOOP_LIMIT_MESSAGE + TOOL_LOOP_LIMIT_REACHED
+  3. 无工具调用 → resolve({response, rounds})
+  4. set_state("tool_running") + TOOL_LOOP_STARTED
+  5. 并行执行所有工具（_execute_single，promises[i]）
+  6. async.all(...) → 结果统一按原始顺序写回消息队列（add_tool_result）
+  7. 护栏 check_round（重复调用提醒注入）
+  8. set_state("generating") + TOOL_LOOP_FINISHED
+  9. _send_round(agent) 请求下一轮
+     ├─ 有工具调用 → 回到第 1 步循环
+     └─ 无工具调用 → 若最后一条是 tool 消息则写 EMPTY_RESPONSE_MESSAGE → 结束
+```
 
-Error recovery:
+### 4.2 工具定义输出（_tool_definitions）
 
-- Auto-retry on tool_choice not supported (clear tool_choice)
-- Auto-switch from reasoner to chat model for forced tool calls
-- Request cancellation via jobstop
+- 工具按名称字典序输出：确定性 → 相同工具集跨请求逐字节相同，前缀缓存友好。
+- 空 properties 不输出该字段（DeepSeek 拒绝 `[]` schema）。
+- 先做环境探测（`tools.environment.filter_tools`）：无法获取 workspace/git 目录时禁用相关工具。
+- 计划模式（`plan_mode.apply_tool_filter`）：只保留只读/信息查询工具 + `ask_user`。
+
+### 4.3 单工具执行（_execute_single）
+
+`tool_service.execute(agent, name, args, tool_call_id, opts)`：
+
+- 每个工具创建**可暂停计时器**（`utils.timer.create`）：从真正开始执行（审批通过/直接执行）才计时，
+  等待用户审批或 ask_user 回答期间暂停，耗时与超时不计等待。
+- 执行结果/错误发射 `TOOL_EXECUTION_STARTED` / `TOOL_EXECUTION_COMPLETED` / `TOOL_EXECUTION_ERROR`
+  （均携带 `duration_ms`，供折叠文本实时展示耗时）。
+
+### 4.4 并行执行与顺序回写
+
+工具调用**并行执行**（`vim.schedule`），但结果在 `async.all` 完成后**统一按原始调用顺序**写回
+消息队列（`_execute_single` 不直接写入）。保证 tool 消息顺序与 assistant 的 `tool_calls` 一致，
+API 兼容且前缀缓存确定。
+
+## 5. 前缀缓存（prefix.lua）
+
+策略对齐 deepseek-harness 的上下文缓存实践：
+
+1. **系统提示按有序段拼接**：`identity(-100) / persona(0) / 工具指引(100+)`，渲染逐字节稳定。
+   任何顺序位或文本变化都会使前缀缓存从第一个变更 token 起失效。
+2. **工具定义按名称字典序输出**（确定性）。
+3. **缓存身份（fingerprint）**：`_fnv1a` 稳定哈希，跨请求比对。身份变更即前缀缓存失效，用于诊断与统计。
+4. **缓存用量解析**：从 provider usage 解析 `prompt_cache_hit_tokens` / `cached_tokens` 等，
+   计算命中率。
+
+系统提示段可注册：
+
+- 全局：`prefix.register_section(name, order, text)`。
+- Agent 级：`prefix.register_agent_section(agent, name, order, text)`（遮蔽同名全局段）。
+  `todo` 模块注册 `deployment:todos`（order=100），`plan_mode` 注册 `deployment:plan_policy`（order=100），
+  分别把当前任务清单/计划策略注入系统提示。
+
+## 6. 上下文压缩（core/session/compactor）
+
+`compactor.maybe_compact(agent)` 在每次新一步前做压力检查：
+
+- 达到 `context_window * threshold_ratio` 阈值时折叠最早的整段历史，保留最近尾部（retain 预算）。
+- **辅助摘要调用**：`_summarize` 逐字节回放会话前缀（相同系统提示、工具 schema、被折叠区消息），
+  再把压缩指令作为最后的 user 消息追加 → 复用 provider 的热前缀缓存。
+- **检查点替换**：用带 `<compacted-summary>` 标签的 checkpoint user 消息**替换被折叠区间**
+  （`_replace_with_checkpoint`）。后续请求在替换点之前的未变前缀仍可复用缓存。
+- 仅替换而非追加（不产生第二份历史副本）。成功后发射 `COMPACTION_COMPLETED`。
+
+`force_compact`（溢出恢复用）跳过压力阈值判断，保留空闲/并发锁检查。
+
+## 7. 溢出恢复（recovery.lua）
+
+`recovery.send_stream(agent, opts, on_chunk)` 包裹 `request.send_stream`：
+
+- 请求返回 `context window exceeded` 时（`request.is_context_overflow`），先 `force_compact` 压缩历史，
+  再重新请求（`attempt()` 重试）。
+- 每轮请求最多触发一次压缩恢复；成功后重置 `agent._overflow_recovered = false`，允许后续再次恢复。
+- 无可折叠内容时原样抛回溢出错误。
+
+## 8. 请求与重试（request.lua）
+
+`request.send` / `request.send_stream`：
+
+- **多模态物化**：`_prepare_messages` 把会话内的图像引用解析为 wire part（`core.model.content.materialize`）；
+  模型不支持图像时原样为文本。
+- **请求体构建**：经 `core.model.adapter`（openai/anthropic/google）适配。
+- **流式强制**：`send_stream` 强制 `stream = true`（否则 API 以非流式 JSON 返回而客户端按 SSE
+  解析，导致工具循环第二轮内容丢失）。
+- **重试**：`async.retry` 指数退避（`delay_ms=1000, backoff=2`），`max_retries` 缺省 3。
+  4xx 不重试、abort 不重试。
+- **上下文溢出判断**：`_is_context_overflow` 匹配多种 provider 措辞（`context_length`、
+  `prompt is too long`、`too many tokens` 等），主要看 400/413/429。
+
+## 9. 相关文档
+
+- [EVENTS.md](EVENTS.md)：事件常量与数据。
+- [tool_system.md](tool_system.md)：工具系统（`tool_loop` 依赖 `tool_service`）。
+- [sub_agent_system.md](sub_agent_system.md)：子 Agent（`runtime.spawn`）。
+- [configuration.md](configuration.md)：`ai.context_cache` / `ai.reasoning_enabled` 等配置。

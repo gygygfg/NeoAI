@@ -1,176 +1,66 @@
-# NeoAI UI 多线程优化文档
+# NeoAI 线程池优化（v3.0）
 
-## 概述
+> v3.0 不再使用基于 `vim.uv.new_thread()` 的多线程 UI（旧 `history_tree` / `chat_window` /
+> `tree_window` 等组件已删除）。当前把阻塞式 I/O / CPU 密集计算统一交给 **`utils.work` 线程池**
+> 执行，避免卡住 nvim 主线程；异步原语由 `utils.async` 提供。
+> 对应源码：`lua/NeoAI/utils/work.lua`、`lua/NeoAI/utils/async.lua`、
+> `lua/NeoAI/utils/timer.lua`。
 
-本优化将所有UI模块中的CPU密集型计算移到多线程中执行，通过异步回调将结果传回主线程更新UI，避免了主线程阻塞，提升了Neovim的响应性。
+## 1. 核心思路
 
-## 修改的模块
+Neovim 主线程负责事件循环与界面渲染。若在主线程做阻塞式文件 I/O（读大文件、递归目录搜索、
+写盘）或 CPU 密集计算，会卡住整个编辑器。因此：
 
-### 1. `ui/components/history_tree.lua`
-- 添加了 `_load_tree_data_async(session_id, callback)` 方法
-- 添加了 `build_tree_async(session_id, callback)` 方法  
-- 添加了 `refresh_async(session_id, callback)` 方法
+- **阻塞式 I/O / CPU 密集** → `utils.work` 线程池（libuv `vim.uv.new_work`）。
+- **异步原语** → `utils.async`（Promise / Deferred / AbortSignal / retry）。
+- **可暂停计时** → `utils.timer`（跟踪活跃执行时间，剔除等待用户交互的暂停时长）。
 
-### 2. `ui/components/reasoning_display.lua`
-- 添加了 `_convert_to_folded_text_async(reasoning_text, callback)` 方法
+## 2. utils.work 线程池
 
-### 3. `ui/window/chat_window.lua`
-- 添加了 `_load_messages_async(session_id, callback)` 方法
-- 添加了 `open_async(session_id, window_id, callback)` 方法
-- 已有 `render_chat_async(callback)` 方法
-
-### 4. `ui/window/tree_window.lua`
-- 添加了 `_load_tree_data_async(session_id, callback)` 方法
-- 添加了 `render_tree_async(tree_data, callback)` 方法
-- 添加了 `open_async(session_id, window_id, callback)` 方法
-- 添加了 `refresh_tree_async(callback)` 方法
-
-### 5. `ui/window/window_manager.lua`
-- 添加了 `render_tree_async(tree_data, state, load_data_func, callback)` 方法
-- 添加了 `set_window_content_async(window_id, content, callback)` 方法
-
-## 设计模式
-
-所有异步方法都遵循相同的模式：
+基于 libuv 线程池，默认 4 根线程，文件系统操作也在池内排队共享。
 
 ```lua
--- 1. 在多线程中执行CPU密集型计算
-local thread = vim.uv.new_thread(function()
-    local heavy_result = perform_complex_syntax_parsing()
+local work = require("NeoAI.utils.work")
 
-    -- 2. 通过异步回调将结果传回主线程
-    vim.schedule(function()
-        -- 3. 在主线程中安全地更新UI
-        update_syntax_highlighting(heavy_result)
-    end)
-end)
-
--- 避免频繁的单个更新
-vim.schedule(function()
-    multiple_ui_updates_in_one_batch()
-end)
+work.run(function(path)
+  local f = io.open(path, "rb")
+  local data = f:read("*a")
+  f:close()
+  return data           -- 返回 string（纯原始类型）
+end, "/path/to/file"):then_(function(data)
+  -- 主线程收到结果
+end, function(err) ... end)
 ```
 
-## 核心原则
+**约束**（线程内是全新 Lua state，不共享闭包 / require / vim.fn / vim.api）：
 
-### 1. 线程分离
-- **CPU密集型计算**：在 `vim.uv.new_thread` 中执行
-- **UI更新**：通过 `vim.schedule` 在主线程中执行
-- **数据传递**：通过回调函数传递结果
+- 工作函数以字节码（`string.dump`）传入，仅能用参数 + 纯 Lua 标准库 + `vim.uv`。
+- 参数与返回值必须是原始类型（string / number / boolean / nil），**不能是 table**。
+- 无 `vim.uv.new_work`（nvim < 0.10）时回退到 `vim.schedule` 同步执行（仍不阻塞调用栈）。
 
-### 2. 批量更新
-- 使用 `vim.schedule` 包装多个UI更新操作
-- 避免频繁的单个UI更新调用
-- 减少主线程的调度开销
+## 3. 使用线程池的模块
 
-### 3. 错误处理
-- 所有异步方法都支持回调函数
-- 回调函数接收 `(success, result, error_message)` 参数
-- 提供友好的错误信息
+| 模块 | 用途 |
+| --- | --- |
+| `utils/fs.lua` | `read_file_async` / `write_file_async` / `append_file_async` / `delete_file_async` / `list_dir_async` / `search_files_async` / `read_file_lines_async`。 |
+| `tools/builtin/file_ops.lua` | `read_file` / `edit_file` / `list_files` / `search_files` / `delete_file`（异步变体）。 |
+| `tools/builtin/read_image.lua` | 读二进制文件（`work.run(_read_binary, abs_path)`）。 |
+| `tools/builtin/edit_file.lua`（edit 模式） | 读文件 + 结构化替换 + 写盘（在线程池内完成）。 |
 
-## 使用示例
+## 4. 线程池 vs 旧多线程 UI
 
-### 异步构建历史树
-```lua
-local history_tree = require("NeoAI.ui.components.history_tree")
-history_tree.build_tree_async("session_id", function(tree_data)
-    print("异步构建完成，节点数: " .. #tree_data)
-end)
-```
+旧（已删除）方案：给 `history_tree` / `chat_window` / `tree_window` 等组件添加 `_xxx_async` 方法，
+用 `vim.uv.new_thread()` 在独立线程运行并回调主线程。问题：
 
-### 异步打开聊天窗口
-```lua
-local chat_window = require("NeoAI.ui.window.chat_window")
-chat_window.open_async("session_id", "win_123", function(success, message)
-    if success then
-        print("聊天窗口已异步打开")
-    else
-        print("打开失败: " .. message)
-    end
-end)
-```
+- 线程间要序列化/复制复杂 table，易出错。
+- 每个组件各自实现异步方法，难维护、难复用。
 
-### 异步渲染树窗口
-```lua
-local tree_window = require("NeoAI.ui.window.tree_window")
-tree_window.render_tree_async(tree_data, function(success, result)
-    if success then
-        print("树状图异步渲染完成")
-    end
-end)
-```
+当前方案：**收敛到 `utils.work` 统一线程池**。阻塞 I/O 明确委托给 `utils.work`，异步流程统一用
+`utils.async` 的 Deferred 组合，UI 层只负责事件驱动渲染（`chat_view` 把同一 tick 内的多次分片
+合并为一次渲染，配合折叠与悬浮窗）。
 
-## 性能优势
+## 5. 相关文档
 
-### 1. 响应性提升
-- 主线程不再被CPU密集型计算阻塞
-- UI保持流畅响应
-- 用户可以继续编辑和操作
-
-### 2. 并行处理
-- 多个异步操作可以并行执行
-- 充分利用多核CPU
-- 减少总体等待时间
-
-### 3. 内存优化
-- 大数据处理在后台线程进行
-- 主线程内存压力减小
-- 避免大型数据结构在主线程中构建
-
-## 测试和验证
-
-### 测试文件
-- `examples/ui_multithread_example.lua` - 完整的使用示例
-- `tests/ui_multithread_test.lua` - 自动化测试
-
-### 运行测试
-```lua
--- 运行示例
-:lua require('NeoAI.examples.ui_multithread_example').run_all_demos()
-
--- 运行测试
-:lua require('NeoAI.tests.ui_multithread_test').run_all_tests()
-```
-
-## 向后兼容性
-
-### 保持同步方法
-- 所有原有的同步方法保持不变
-- 新增的异步方法以 `_async` 后缀命名
-- 开发者可以逐步迁移到异步版本
-
-### 回调函数设计
-- 回调函数参数一致：`(success, result, error_message)`
-- 支持可选的回调函数参数
-- 提供默认的错误处理
-
-## 最佳实践
-
-### 1. 何时使用异步
-- **大数据处理**：处理大量历史记录、消息、树节点
-- **复杂计算**：语法分析、文本转换、数据格式化
-- **网络请求**：API调用、文件读取、数据库查询
-
-### 2. 何时使用同步
-- **简单操作**：状态切换、配置更新、简单查询
-- **即时反馈**：需要立即响应的用户操作
-- **小数据量**：处理少量数据的操作
-
-### 3. 错误处理
-```lua
-module.async_method(params, function(success, result, error)
-    if success then
-        -- 处理成功结果
-        process_result(result)
-    else
-        -- 处理错误
-        vim.notify("操作失败: " .. error, vim.log.levels.ERROR)
-    end
-end)
-```
-
-## 总结
-
-本次优化为NeoAI的所有UI模块添加了多线程支持，显著提升了应用的响应性和性能。通过将CPU密集型计算移到后台线程，并使用异步回调更新UI，确保了Neovim主线程的流畅性。
-
-所有修改都保持了向后兼容性，原有的同步API继续可用，开发者可以根据需要选择使用同步或异步版本。
+- [utils.md](utils.md)：`utils.work` / `utils.async` / `utils.timer` 详细 API。
+- [tool_system.md](tool_system.md)：文件工具如何使用线程池。
+- [ui_system.md](ui_system.md)：`chat_view` 事件驱动渲染合并。

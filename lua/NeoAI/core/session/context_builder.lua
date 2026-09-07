@@ -34,10 +34,11 @@ local function _to_api_message(message)
   if content ~= "" or message.role ~= "assistant" or not has_tool_calls then
     out.content = content
   end
-  if message.reasoning and message.role == "assistant" then
-    -- 推理内容随回复一起保留（部分 API 用 reasoning_content 字段）
-    out.reasoning_content = message.reasoning
-  end
+  -- 推理内容（reasoning_content / 思维链）不随历史回传，仅用于 UI 展示：
+  --   1) 符合 OpenAI/DeepSeek 协议（assistant 消息无 reasoning_content 字段）；
+  --   2) 避免每次请求把整段思维链重复发送，显著降低 prompt token；
+  --   3) 推理内容若随两轮之间的变化写回，会让 DeepSeek 前缀缓存从该 assistant 消息起
+  --      字节不一致而失效（这里规避，缓存命中率更高）。内部 message.reasoning 仍保留用于渲染。
   if has_tool_calls then
     out.tool_calls = message.tool_calls
   end
@@ -137,14 +138,58 @@ function M.build_fork_context(session, task)
   return messages
 end
 
---- 统计上下文的 token 估算（字符/4 粗估）
+--- 估算单条消息 content 的 token（字符/4 粗估），content 可能是字符串，
+--- 也可能是多模态块数组（{ type="text", text=.. } / { type="image", attachment=ref }）。
+--- @param content any
+--- @return number
+local function _estimate_content(content)
+  if type(content) == "string" then
+    return math.ceil(#content / 4)
+  elseif type(content) == "table" then
+    local n = 0
+    for _, b in ipairs(content) do
+      if type(b) ~= "table" then
+        n = n + math.ceil(#tostring(b) / 4)
+      elseif b.type == "text" then
+        n = n + math.ceil(#(b.text or "") / 4)
+      elseif b.type == "image" then
+        n = n + M._estimate_image(b.attachment or b)
+      end
+    end
+    return n
+  elseif content ~= nil then
+    return math.ceil(#tostring(content) / 4)
+  end
+  return 0
+end
+
+--- 估算单图 token（按像素/4 或字节兜底，低估会污染容量显示故宁可稍高）
+--- @param ref table|nil { width?, height?, bytes? }
+--- @return number
+function M._estimate_image(ref)
+  if type(ref) ~= "table" then return 100 end
+  local w = tonumber(ref.width) or 0
+  local h = tonumber(ref.height) or 0
+  if w > 0 and h > 0 then
+    return math.max(100, math.ceil(w * h / 750))
+  end
+  local bytes = tonumber(ref.bytes) or 0
+  if bytes > 0 then
+    return math.max(100, math.ceil(bytes / 400))
+  end
+  return 100
+end
+
+--- 统计上下文的 token 估算（字符/4 粗估，兼容多模态 content 块与 m.image）
 --- @param messages table
 --- @return number
 function M.estimate_tokens(messages)
   local total = 0
   for _, m in ipairs(messages or {}) do
-    local content = m.content or ""
-    total = total + math.ceil(#content / 4)
+    total = total + _estimate_content(m.content)
+    if m.image then
+      total = total + M._estimate_image(m.image)
+    end
     if m.tool_calls then
       for _, tc in ipairs(m.tool_calls) do
         local fn = tc["function"]

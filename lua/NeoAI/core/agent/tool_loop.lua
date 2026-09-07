@@ -17,6 +17,12 @@ local M = {}
 
 local MAX_ROUNDS = 1000
 
+-- 轮末用户消息注入器：由 chat_service 注册（避免 core→service 反向依赖）。
+-- 工具循环每轮结束（工具结果记录完、下次模型调用之前）调用它，把用户在
+-- agent 忙碌期间发送、被 pending_queue 暂存的消息插入对话，让下一轮模型看到
+-- 这条用户消息，而不是等整个工具循环彻底结束后才插入。
+local inject_user = nil
+
 -- 达到轮数上限时写入 agent 消息队列的停止说明（chat 界面经 MESSAGE_ADDED 直接可见）
 local LOOP_LIMIT_MESSAGE = "⚠️ 工具循环达到最大轮数限制（" .. tostring(MAX_ROUNDS) .. "），已停止继续执行。"
 
@@ -175,6 +181,18 @@ end
 
 -- ========== 公开 API ==========
 
+--- 注册轮末用户消息注入器（由 chat_service 调用；nil 清除）
+--- @param fn function(agent)|nil
+function M.set_inject_user(fn)
+  inject_user = fn
+end
+
+--- 在轮末触发一次 pending 注入（工具循环每轮结束调用；也可手动复用）
+--- @param agent table
+function M.inject_pending(agent)
+  if inject_user then inject_user(agent) end
+end
+
 --- 运行工具循环
 --- @param agent table Agent
 --- @param tool_calls table 首轮工具调用
@@ -231,6 +249,14 @@ function M.run(agent, tool_calls, tool_service, opts)
         agent:add_message("user", reminder)
         event_bus.emit(events.TOOL_LOOP_GUARD_REMINDER, { agent_id = agent.id, repeats = agent.guard and agent.guard.repeats })
       end
+
+      -- 轮末注入：用户在 agent 忙碌期间发送、暂存在 pending_queue 的消息，
+      -- 于本轮工具结果记录后、下次模型调用之前插入对话，供下一轮模型感知。
+      M.inject_pending(agent)
+
+      -- 同步最新的运行时上下文快照（todos/计划模式可能在上一轮工具执行中变化）；
+      -- 仅在内容变化时追加，系统提示保持稳定，不影响前缀缓存。
+      require("NeoAI.core.session.runtime_context").ensure(agent)
 
       agent:set_state("generating")
       event_bus.emit(events.TOOL_LOOP_FINISHED, { agent_id = agent.id, rounds = rounds })

@@ -87,19 +87,12 @@ local function _render(session_id)
   return table.concat(lines, "\n")
 end
 
---- 懒注册 agent 级系统提示段（order=100 工具指引区），一次注册长期生效。
---- 按 agent 实例去重（agent._todo_section），而非按 session_id：
---- 会话重开会新建 agent（新 id），若按 session_id 去重会因残留标记而跳过注册，
---- 导致系统提示缺失「当前任务清单」段、前缀缓存从系统提示起即失效。
---- 注入文本仍按 session_id 聚合（_render(_key(agent))），随每次请求动态求值。
+--- 待办状态已改由「运行时上下文快照」注入历史（见 core/session/runtime_context），
+--- 不再注册系统提示段：系统提示必须逐字节稳定，否则任何待办变化都会让前缀缓存
+--- 从系统提示起失效。此处保留 _ensure_section 仅为兼容旧调用（no-op）。
 --- @param agent table
 local function _ensure_section(agent)
-  if agent._todo_section then return end
-  local prefix = require("NeoAI.core.agent.prefix")
-  local unreg = prefix.register_agent_section(agent, "deployment:todos", 100, function()
-    return _render(_key(agent))
-  end)
-  agent._todo_section = unreg
+  -- no-op：系统提示段已废弃，改用运行时上下文快照
 end
 
 -- ========== 工具定义 ==========
@@ -194,6 +187,14 @@ function M.get(session_id)
   local e = state.todos[session_id]
   if not e or #e.items == 0 then return nil end
   return e.items
+end
+
+--- 渲染待办清单文本（供运行时上下文快照复用；无清单返回 ""）
+--- 对应旧的系统提示段内容，规避把易变状态放进系统提示导致前缀缓存失效。
+--- @param session_id string|nil
+--- @return string
+function M.render(session_id)
+  return _render(session_id)
 end
 
 --- 从持久化元数据恢复清单（加载会话时）

@@ -44,17 +44,19 @@ local function agent_mod_is_disposed(agent)
 end
 
 --- 创建/获取当前 Agent
---- @param opts table|nil { model?, scenario? }
+--- @param opts table|nil { model?, mode?, scenario? }
 --- @return table Agent
 local function _get_or_create_agent(opts)
   opts = opts or {}
   local agent_id = state.current_agent_id
   local agent = agent_id and runtime.get(agent_id) or nil
   if not agent or agent_mod_is_disposed(agent) then
+    -- 新建 Agent 按当前模式解析 provider/model 配置；默认 chat。
+    local mode = opts.mode or opts.scenario or M.get_mode()
     local session = session_store.create()
     agent = runtime.create({
       session_id = session.id,
-      scenario = opts.scenario or "chat",
+      mode = mode,
       model = opts.model,
       config = opts.config,
     })
@@ -75,9 +77,10 @@ local function _persist_agent(agent)
   if not info then return end
   local session = session_store.get(info.session_id)
   if not session then return end
-  -- 同步消息
+  -- 同步消息；跳过运行时上下文快照（runtime_context），重开会话时由快照重新渲染，
+  -- 避免把易变运行态固化到持久历史并污染「用户轮次」计数。
   for _, msg in ipairs(agent.messages) do
-    if not msg._synced then
+    if not msg._synced and not msg.runtime_context then
       -- 压缩检查点：先在 durable surface 移除被替换的已同步旧消息（替换而非追加）
       if msg.checkpoint and msg.replaced_count and session.messages then
         local n = math.min(msg.replaced_count, #session.messages)
@@ -161,6 +164,41 @@ local function _flush_pending(agent_id)
   )
 end
 
+--- 把暂存队列中的用户消息直接注入 agent 对话（工具循环轮末调用）。
+--- 与 _flush_pending 不同：_flush_pending 在 agent 空闲（整个工具循环结束）后才发送；
+--- 这里在工具循环中途、本轮工具结果记录后、下次模型调用之前插入，供下一轮模型感知，
+--- 而不是等整个工具循环彻底结束才补上。
+--- @param agent table
+local function _inject_pending(agent)
+  local q = pending_queue[agent.id]
+  if not q or #q == 0 then
+    pending_queue[agent.id] = nil
+    return
+  end
+  pending_queue[agent.id] = nil
+  for _, item in ipairs(q) do
+    agent:add_message("user", item.content)
+    event_bus.emit(events.MESSAGE_SENT, { agent_id = agent.id, content = item.content })
+    -- 消息已插入对话即视为已发送；resolve 避免 UI await 挂起（UI 主要只关心 reject）。
+    -- 若 Agent 中途被销毁，会由 detach_window 走 _flush_pending 的拒绝逻辑，不在此重复。
+    item.d:resolve(true)
+  end
+end
+
+-- 注入器是否已默认注册到 tool_loop（幂等）
+local injector_registered = false
+
+--- 懒加载地把 pending 注入器注册到 tool_loop（幂等）。core 模块不反向依赖服务，
+--- 因此通过 tool_loop.set_inject_user 把「拉取暂存消息」的实现注入进去。
+local function _ensure_injector()
+  if injector_registered then return end
+  injector_registered = true
+  local tool_loop = require("NeoAI.core.agent.tool_loop")
+  tool_loop.set_inject_user(function(agent)
+    _inject_pending(agent)
+  end)
+end
+
 --- 确保已监听 Agent 状态变化（幂等）：Agent 回到非忙碌状态时刷新暂存队列
 local function _ensure_queue_observer()
   if queue_state_sub then return end
@@ -172,17 +210,19 @@ local function _ensure_queue_observer()
   end)
 end
 
---- 暂存一条消息：AI 忙碌时不拒绝，而是入队，待本轮 turn 结束后发送
+--- 暂存一条消息：AI 忙碌时不拒绝，而是入队。工具循环中途（下轮模型调用前）由
+--- 注入器插入对话；若没有工具循环则在整个循环结束、agent 空闲后由 flush 发送。
 --- @param agent table
 --- @param content string
 --- @param opts table|nil
 --- @return Deferred 等消息真正发送后 resolve，失败则 reject
 local function _enqueue_message(agent, content, opts)
   _ensure_queue_observer()
+  _ensure_injector()
   local d = async.Deferred.new()
   pending_queue[agent.id] = pending_queue[agent.id] or {}
   table.insert(pending_queue[agent.id], { content = content, opts = opts, d = d })
-  -- 静默暂存：不提示失败、也不提示“正忙”，本轮结束后自动发送
+  -- 静默暂存：不提示失败、也不提示“正忙”，随下轮模型调用或本轮结束自动发送
   return d
 end
 
@@ -329,6 +369,14 @@ function M.cancel_generation()
   tool_service.clear_approval()
 end
 
+--- 把当前运行模式（chat/plan/auto）对应的 provider/model 配置应用到 Agent
+--- @param agent table|nil
+local function _apply_current_mode(agent)
+  agent = agent or M.get_current_agent()
+  if not agent then return end
+  runtime.apply_mode(agent, M.get_mode())
+end
+
 --- 切换当前 Agent 模型
 --- @param model_id string
 function M.switch_model(model_id)
@@ -344,7 +392,9 @@ function M.toggle_plan_mode()
   local agent = M.get_current_agent()
   if not agent then return nil end
   local plan_mode = require("NeoAI.tools.builtin.plan_mode")
-  return plan_mode.toggle(agent)
+  local ret = plan_mode.toggle(agent)
+  _apply_current_mode(agent)
+  return ret
 end
 
 --- 用户确认计划：解析计划为任务清单（todo）→ 退出计划模式（直接转入 CHAT）→ 可选自动执行。
@@ -384,6 +434,7 @@ function M.approve_plan(opts)
 
   agent.plan = plan
   plan_mode.exit(agent) -- 直接转入 CHAT 模式
+  _apply_current_mode(agent) -- 按退出后的模式应用 provider/model 配置
   _persist_agent(agent)
 
   local auto = opts.auto_execute
@@ -405,7 +456,9 @@ end
 --- @return boolean 切换后的状态
 function M.toggle_auto_mode()
   local tool_service = require("NeoAI.services.tool_service")
-  return tool_service.toggle_auto_mode()
+  local ret = tool_service.toggle_auto_mode()
+  _apply_current_mode()
+  return ret
 end
 
 --- 是否处于 AUTO 模式
@@ -436,15 +489,18 @@ function M.cycle_mode()
     local agent = M.get_current_agent() or M.new_session({})
     plan_mode.enter(agent)
     tool_service.set_auto_mode(false)
+    _apply_current_mode(agent)
     return "plan"
   elseif mode == "plan" then
     -- 退出计划模式，进入 AUTO
     local agent = M.get_current_agent()
     if agent then plan_mode.exit(agent) end
     tool_service.set_auto_mode(true)
+    _apply_current_mode(agent)
     return "auto"
   else -- auto
     tool_service.set_auto_mode(false)
+    _apply_current_mode()
     return "chat"
   end
 end
@@ -466,13 +522,14 @@ function M.get_todos()
   return todo_mod.get(agent.session_id)
 end
 
---- 创建新会话（新 Agent）
+--- 创建新会话（新 Agent）；新会话默认从 CHAT 模式开始
 --- @param opts table|nil
 --- @return table Agent
 function M.new_session(opts)
   opts = opts or {}
   state.current_agent_id = nil
-  return _get_or_create_agent(opts)
+  local o = vim.tbl_extend("force", {}, opts, { mode = opts.mode or "chat" })
+  return _get_or_create_agent(o)
 end
 
 --- 加载已有会话到当前 Agent（从会话树选择时调用）
@@ -509,7 +566,8 @@ function M.load_session(session_id, opts)
     copy._synced = true
     agent.messages[#agent.messages + 1] = copy
   end
-  -- 还原计划模式状态（计划模式提示段 + 标志）
+  -- 还原计划模式状态（标志 + 计划文本）；易变运行态经运行时上下文快照注入历史，
+  -- 不再注册系统提示段，系统提示保持逐字节稳定以复用前缀缓存。
   local plan_mode = require("NeoAI.tools.builtin.plan_mode")
   plan_mode.restore(agent, session.metadata and session.metadata.plan)
   -- 还原累计用量（含前缀缓存命中/未命中统计），避免重开会话后缓存命中率归零
@@ -517,16 +575,18 @@ function M.load_session(session_id, opts)
   if meta.usage and type(meta.usage) == "table" then
     agent.usage = vim.deepcopy(meta.usage)
   end
-  -- 还原待办清单（供 todo_read / 系统提示注入）
+  -- 还原待办清单（供 todo_read / 运行时上下文快照注入）；系统提示段已废弃，不需注册。
   local todo_mod = require("NeoAI.tools.builtin.todo")
   todo_mod.seed(session.id, session.metadata and session.metadata.todos)
-  -- 恢复 agent 级待办系统提示段：否则重开会话后的系统提示缺少「当前任务清单」段，
-  -- 与关闭前不一致，前缀缓存从系统提示起即失效（缓存命中率骤降）。对齐 plan_mode.restore。
-  todo_mod.ensure_registered(agent)
+  -- 重开后首次生成时由 runtime.run 的 runtime_context.ensure 重建快照，
+  -- 保证易变状态以最新内容注入历史、系统提示稳定。
+  require("NeoAI.core.session.runtime_context").ensure(agent)
   state.sessions = state.sessions or {}
   state.sessions[session.id] = agent.id
   state.agents[agent.id] = { session_id = session.id }
   state.current_agent_id = agent.id
+  -- 恢复会话后按还原的模式（含计划模式）应用对应 provider/model 配置
+  _apply_current_mode(agent)
   return agent
 end
 
@@ -540,7 +600,10 @@ function M.reset()
   state.agents = {}
   state.sessions = {}
   state.current_agent_id = nil
-  -- 清理暂存队列与状态监听，避免测试间/重载后残留并重复发送
+  -- 清理暂存队列、状态监听与注入器，避免测试间/重载后残留并重复发送
+  local tool_loop = require("NeoAI.core.agent.tool_loop")
+  tool_loop.set_inject_user(nil)
+  injector_registered = false
   for _, q in pairs(pending_queue) do
     for _, item in ipairs(q) do
       item.d:reject({ kind = "cancelled", message = "会话已重置，暂存消息已取消" })

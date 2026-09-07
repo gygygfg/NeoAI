@@ -165,6 +165,9 @@ function M.setup(user_config)
   -- 内核引导：事件常量表、日志、生命周期
   kernel.bootstrap()
 
+  -- Herder 终端状态信号（懒检测环境；非 Herder 环境为 no-op）
+  require("NeoAI.services.herder").init()
+
   -- 初始化工具系统（同步注册内置工具，供 Agent 绑定）
   require("NeoAI.tools").init()
 

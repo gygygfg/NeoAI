@@ -64,6 +64,17 @@ M.TOOL_RESULT_RECEIVED = "tool:result_received"
 M.TOOL_LOOP_GUARD_REMINDER = "tool_loop:guard_reminder"
 M.AUTO_MODE_CHANGED = "approval_mode:auto_changed"
 
+-- ========== 用户提问（ask_user） ==========
+-- 开始等待用户回答时触发（agent 处于 blocked 候选），回答/取消后触发 answered。
+M.ASK_USER_WAITING = "ask_user:waiting"
+M.ASK_USER_ANSWERED = "ask_user:answered"
+
+-- ========== 工具参数接收（流式） ==========
+-- 模型流式生成工具调用参数时逐片触发（携带当前累积的 tool_calls 快照），
+-- 参数流结束触发 completed。UI 用它像推理悬浮窗一样实时展示"接收参数"悬浮窗。
+M.TOOL_ARG_CHUNK = "tool:arg_chunk"
+M.TOOL_ARG_COMPLETED = "tool:arg_completed"
+
 -- ========== 待办 / 计划模式 ==========
 M.TODO_UPDATED = "todo:updated"
 M.PLAN_MODE_CHANGED = "plan_mode:changed"

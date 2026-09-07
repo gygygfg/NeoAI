@@ -264,17 +264,25 @@ end
 --- @param usage table
 --- @return table Agent
 function M.add_usage(agent, usage)
-  agent.usage.prompt = agent.usage.prompt + (usage.prompt or usage.prompt_tokens or 0)
-  agent.usage.completion = agent.usage.completion + (usage.completion or usage.completion_tokens or 0)
+  local prompt_all = tonumber(usage.prompt or usage.prompt_tokens or 0) or 0
+  local completion = tonumber(usage.completion or usage.completion_tokens or 0) or 0
   local prefix = require("NeoAI.core.agent.prefix")
   local cu = prefix.parse_cache_usage(usage)
+  local cache_read = cu and cu.cache_read or 0
+  -- 对齐 deepseek-harness：DeepSeek 的 prompt_tokens 已折叠缓存命中
+  -- （prompt_tokens = prompt_cache_hit_tokens + prompt_cache_miss_tokens），计费的
+  -- 「未缓存输入」= prompt_tokens - cache_read，缓存命中单独统计、不重复计入输入。
+  -- 对不返回 cache 计数的 provider（cache_read=0）此式退化为原值，无副作用。
+  agent.usage.prompt = agent.usage.prompt + math.max(0, prompt_all - cache_read)
+  agent.usage.completion = agent.usage.completion + completion
   if cu then
     agent.usage.cache_read = (agent.usage.cache_read or 0) + cu.cache_read
     agent.usage.cache_write = (agent.usage.cache_write or 0) + cu.cache_write
     agent.usage.cache_miss = (agent.usage.cache_miss or 0) + cu.cache_miss
     agent.usage.requests = (agent.usage.requests or 0) + 1
+    -- 缓存命中率只对 prompt 维度（DeepSeek 缓存不涉及输出 token）
     agent.usage.prompt_cache_total = (agent.usage.prompt_cache_total or 0) + cu.cache_read
-    agent.usage.prompt_total = (agent.usage.prompt_total or 0) + (usage.prompt_tokens or usage.prompt or 0)
+    agent.usage.prompt_total = (agent.usage.prompt_total or 0) + prompt_all
     agent.usage.cache_ratio = agent.usage.prompt_total > 0
       and (agent.usage.prompt_cache_total / agent.usage.prompt_total)
       or 0

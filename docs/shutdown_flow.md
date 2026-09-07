@@ -1,133 +1,88 @@
-# Shutdown and Graceful Exit
+# NeoAI 生命周期与关闭（v3.0）
 
-NeoAI implements a comprehensive graceful shutdown system to prevent
-deadlocks and data loss when Neovim exits. The system is built around a
-unified shutdown_flag module that all components check before performing
-Neovim API calls.
+> 生命周期管理由 `kernel/lifecycle.lua` 负责：`bootstrap` / `on_shutdown` / `shutdown`。
+> 取消由 **AbortSignal** 级联传播（替代旧 `shutdown_flag`）。
+> 对应源码：`lua/NeoAI/kernel/lifecycle.lua`、`lua/NeoAI/kernel/init.lua`、
+> `lua/NeoAI/init.lua`（setup）。
 
-## Shutdown Flag Module
+## 1. 内核引导（kernel/init.lua）
 
-**core/shutdown_flag.lua:**
+`kernel.bootstrap()` 是内核层入口，依次：
 
-- `set()`: Set shutdown flag (called by VimLeavePre)
-- `is_set()`: Check if shutting down
-- `reset()`: Reset for testing
+1. 初始化日志（`logger.init(config_store.get("log"))`）。
+2. 注册 `VimLeavePre` 自动命令（`NeoAILifecycle` 组）：退出时调用 `M.shutdown()`。
+3. `schedule` 延迟 100ms 后台刷新模型列表（`model_service.prefetch`，启动不阻塞）。
 
-All vim.schedule callbacks and deferred functions check `shutdown_flag.is_set()`
-before executing Neovim API calls. This prevents:
+## 2. 生命周期（kernel/lifecycle.lua）
 
-- Deadlocks from API calls during teardown
-- Recursive event loops
-- Crashes from invalid window/buffer handles
+### 2.1 bootstrap
 
-## Shutdown Sequence
+`M.bootstrap()` 幂等。初始化日志、注册 `VimLeavePre` 清理自动命令、后台模型刷新。
+发射 `PLUGIN_INITIALIZED`？——不，实际在 `setup()` 后由 init 触发。见 `NeoAI.setup()`。
 
-VimLeavePre triggers this sequence:
+### 2.2 on_shutdown
 
-1. `history_manager._shutdown_and_save()`:
-   - Set shutdown_flag
-   - Set persistence shutting_down flag
-   - Notify tool_orchestrator to shut down
-   - Clean up all sub-agents (`plan_executor.cleanup_all()`)
-   - Clean up sub-agent engine (`sub_agent_engine.cleanup_all()`)
-   - Cancel all HTTP requests (`http_client.cancel_all_requests()`)
-   - Clean up AI engine generations (`ai_engine.cleanup_all_generations()`)
-   - Flush saver queue (`saver.shutdown_sync()`)
-   - Flush persistence queue (`persistence.flush_queue()`)
-   - Sync save sessions (`persistence.sync_save()`)
+`M.on_shutdown(fn)` 注册清理函数（VimLeave 时执行），返回取消函数。多个清理函数按注册顺序执行，
+关闭时**逆序**执行（后注册的先清理）。
 
-2. `after/plugin/NeoAI.lua` VimLeavePre:
-   - Legacy auto-save (currently no-op, handled by history_manager)
+### 2.3 shutdown
 
-## Component Cleanup
+`M.shutdown()` 幂等：
 
-**tool_orchestrator.cleanup_all():**
+1. 置 `shutting_down = true`（防止重复执行）。
+2. 逆序执行所有清理函数（`pcall` 包裹，异常不中断）。
+3. 发射 `PLUGIN_SHUTDOWN` 事件。
+4. 日志 `"NeoAI shutdown complete"`。
 
-- Remove global ESC stop listener
-- Set all sessions to stop_requested
-- Set all phases to idle
-- Clear active_tool_calls
-- Cancel all HTTP requests
-- Unregister all sessions and sub-agent sessions
+## 3. setup 流程（NeoAI.init）
 
-**ai_engine.cleanup_all_generations():**
+`NeoAI.setup(user_config)` 是插件入口，极薄：
 
-- Set `is_generating = false`
-- Clear `current_generation_id`
-- Clear `active_generations` table
-
-**sub_agent_engine.cleanup_all():**
-
-- Set all runners to stop_requested
-- Clear `sub_agent_runners` table
-
-**plan_executor.cleanup_all():**
-
-- Stop all timers
-- Clear all sub-agent contexts
-
-**http_client.cancel_all_requests():**
-
-- Cancel all active curl jobs
-- Delete temp files
-- Clear dedup cache
-
-## Preventing Deadlocks
-
-Key patterns used throughout the codebase:
-
-1. shutdown_flag check before vim.schedule:
-
-```lua
-if shutdown_flag.is_set() then return end
-vim.schedule(function()
-    if shutdown_flag.is_set() then return end
-    -- Neovim API calls
-end)
+```
+config_store.load(user_config)      -- 纯函数：合并 + 校验
+kernel.bootstrap()                  -- 内核引导（日志、VimLeavePre、模型后台刷新）
+herder.init()                       -- Herder 终端状态信号（懒检测环境，no-op）
+tools.init()                        -- 初始化工具系统（同步注册内置工具）
+_register_commands()                -- 注册用户命令（懒加载业务模块）
+_register_global_keymaps()          -- 注册全局快捷键
+status.ensure_lualine_extension()   -- 注入 lualine 扩展（若已加载）
 ```
 
-2. pcall protection for all event firing:
+命令注册均懒加载对应的业务模块（`require(...)` 在命令调用时才执行）。
 
-```lua
-local ok, err = pcall(vim.api.nvim_exec_autocmds, "User", {
-    pattern = event_constants.SOME_EVENT,
-    data = { ... },
-})
-if not ok then
-    if shutdown_flag.is_set() then return end
-    vim.schedule(function()
-        if shutdown_flag.is_set() then return end
-        pcall(vim.api.nvim_exec_autocmds, "User", { ... })
-    end)
-end
-```
+## 4. AbortSignal 级联取消
 
-3. Guard checks in tool_orchestrator callbacks:
+取消机制基于 `async.create_signal()` 的 AbortSignal：
 
-```lua
-if is_shutting_down() then return end
-```
+- 每个 Agent 持有独立 `signal`。
+- `runtime.abort(agent, reason)` → `agent.signal:abort(reason)` + 状态置 `aborted` + 发射 `AGENT_ABORTED`。
+- 取消级联传播到 HTTP 请求（`utils.http` 监听 signal）、工具调用（`tools.executor` 检查 `signal:aborted()`）。
+- **取消是正常停止而非错误**：`runtime._run_generation` 的错误回调区分 `aborted/cancelled`，
+  状态复位 `idle`、reject `{kind="cancelled"}`，不弹「发送失败」提示。
 
-4. Session state cleanup in `_finish_loop`:
-   - Set phase to idle
-   - Clear active_tool_calls
-   - Set current_iteration to 0
-   - Set generation_id to nil
+## 5. 关闭路径
 
-## Data Persistence on Shutdown
+### 5.1 Vim 退出（VimLeavePre）
 
-The save sequence ensures no data loss:
+`lifecycle.shutdown()` 逆序执行清理函数，保存未持久化的会话、关闭异步任务。随后 `event_bus.emit(PLUGIN_SHUTDOWN)`。
 
-1. `saver.shutdown_sync()`:
-   - Process remaining save queue items
-   - Wait for all pending writes to complete
-   - Clear the queue
+### 5.2 窗口关闭
 
-2. `persistence.flush_queue()`:
-   - Discard any remaining queued saves
-   - Prevent async callbacks during teardown
+`chat_view.close()` → `chat_service.detach_window(win_id)`：
 
-3. `persistence.sync_save()`:
-   - Direct synchronous file write
-   - Uses `io.open()` instead of `vim.fn.writefile()`
-   - No debounce, no callbacks
+- 持久化 Agent 消息到会话（`_persist_agent`）。
+- `runtime.dispose(agent)`（释放资源，`agent:signal:abort("disposed")`）。
+- `todo_mod.cleanup(agent)`（清理待办状态与系统提示段）。
+- 拒绝窗口关闭时仍在等待的暂存消息（`_flush_pending`），避免永久挂起。
+- `tool_service.clear_approval()`：拒绝队列中所有待审批工具、释放串行审批槽位（否则 `approval_showing`
+  残留 true 会让后续审批卡死）。
+
+### 5.3 取消生成
+
+`chat_service.cancel_generation()` → `runtime.abort(agent, "user_cancelled")` + `tool_service.clear_approval()`。
+
+## 6. 相关文档
+
+- [ai_engine.md](ai_engine.md)：Agent 状态机与 `runtime.run`。
+- [EVENTS.md](EVENTS.md)：`PLUGIN_INITIALIZED` / `PLUGIN_SHUTDOWN` / `AGENT_*`。
+- [configuration.md](configuration.md)：`log` / `herder` 配置。

@@ -24,35 +24,24 @@ local state = {
 
 -- ========== 私有函数 ==========
 
---- 解析 agent 的场景配置
---- @param config table 用户/系统配置
---- @param scenario string|nil
+--- 解析 agent 的模式配置
+--- 按当前会话模式（chat/plan/auto）从 ai.modes 取 provider/model/temperature/etc.，
+--- 再叠加用户级覆盖，最后把 "auto" 模型解析为 registry 默认模型。
+--- @param config table 用户/系统配置（覆盖层）
+--- @param mode string|nil "chat" | "plan" | "auto"
 --- @return table agent_config
-local function _resolve_agent_config(config, scenario)
-  scenario = scenario or "chat"
+local function _resolve_agent_config(config, mode)
+  mode = mode or "chat"
+  local modes = config_store.get("ai.modes") or {}
+  local mc = modes[mode] or {}
   local agent_config = {
-    provider = config_store.get("ai.default_provider"),
-    model = nil,
-    temperature = 0.7,
-    max_tokens = 4096,
-    stream = true,
+    provider = mc.provider or config_store.get("ai.default_provider"),
+    model = mc.model,
+    temperature = mc.temperature ~= nil and mc.temperature or 0.7,
+    max_tokens = mc.max_tokens or 4096,
+    stream = mc.stream ~= nil and mc.stream or true,
     system_prompt = config_store.get("ai.system_prompt"),
   }
-  local scenarios = config_store.get("ai.scenarios") or {}
-  local sc = scenarios[scenario]
-  if sc then
-    if sc.provider then agent_config.provider = sc.provider end
-    if sc.preset then
-      local presets = config_store.get("ai.presets") or {}
-      local preset = presets[sc.preset]
-      if preset then
-        if preset.model then agent_config.model = preset.model end
-        if preset.temperature ~= nil then agent_config.temperature = preset.temperature end
-        if preset.max_tokens then agent_config.max_tokens = preset.max_tokens end
-        if preset.stream ~= nil then agent_config.stream = preset.stream end
-      end
-    end
-  end
   -- 用户级覆盖
   if config then
     if config.provider then agent_config.provider = config.provider end
@@ -62,7 +51,7 @@ local function _resolve_agent_config(config, scenario)
     if config.stream ~= nil then agent_config.stream = config.stream end
   end
   -- 从 registry 解析 "auto"
-  if agent_config.model == "auto" then
+  if agent_config.model == "auto" or not agent_config.model then
     local registry = require("NeoAI.core.model.registry")
     agent_config.model = registry.resolve_default(agent_config.provider)
   end
@@ -162,12 +151,29 @@ end
 
 -- ========== 公开 API ==========
 
+--- 应用某模式的模型配置到已有 Agent（模式切换时调用）。
+--- 提供者/模型/温度/max_tokens/流式随 modes 变化；系统提示等全局项不改。
+--- @param agent table
+--- @param mode string "chat" | "plan" | "auto"
+--- @return table Agent
+function M.apply_mode(agent, mode)
+  if not agent then return nil end
+  local cfg = _resolve_agent_config(nil, mode or "chat")
+  agent.model = cfg.model
+  agent.config.provider = cfg.provider
+  agent.config.temperature = cfg.temperature
+  agent.config.max_tokens = cfg.max_tokens
+  agent.config.stream = cfg.stream
+  event_bus.emit(events.MODEL_SWITCHED, { agent_id = agent.id, model = agent.model, mode = mode })
+  return agent
+end
+
 --- 创建 Agent
---- @param opts table { config?, scenario?, session_id?, model?, tools? }
+--- @param opts table { config?, mode?, session_id?, model?, tools? }
 --- @return table Agent
 function M.create(opts)
   opts = opts or {}
-  local agent_config = _resolve_agent_config(opts.config, opts.scenario or "chat")
+  local agent_config = _resolve_agent_config(opts.config, opts.mode or opts.scenario or "chat")
   local agent = agent_mod.create({
     session_id = opts.session_id,
     config = agent_config,
@@ -247,6 +253,9 @@ function M.run(agent, content)
     -- 用户新输入重置工具循环护栏计数链
     local guard = require("NeoAI.core.agent.guard")
     guard.reset(agent)
+    -- 易变运行态（todos/计划模式）以运行时上下文快照追加进历史：
+    -- 系统提示保持逐字节稳定，前缀缓存不因它们变化而失效。
+    require("NeoAI.core.session.runtime_context").ensure(agent)
     agent_mod.add_message(agent, "user", content)
     event_bus.emit(events.MESSAGE_SENT, { agent_id = agent.id, content = content })
     return _run_generation(agent, {})

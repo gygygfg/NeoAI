@@ -71,21 +71,19 @@ local function _cfg()
   return config_store.get("tools.plan_mode") or {}
 end
 
---- 注册/注销 plan-policy 提示段
+--- 计划模式状态已改由「运行时上下文快照」注入历史（见 core/session/runtime_context），
+--- 不再注册系统提示段：系统提示必须逐字节稳定，否则计划模式切换会让前缀缓存失效。
+--- 保留 _apply_section 仅为兼容旧调用（no-op）。
 --- @param agent table
 --- @param active boolean
 local function _apply_section(agent, active)
-  if not agent then return end
-  if active then
-    if agent._plan_section then return end
-    local prefix = require("NeoAI.core.agent.prefix")
-    agent._plan_section = prefix.register_agent_section(agent, "deployment:plan_policy", 100, PLAN_POLICY_TEXT)
-  else
-    if agent._plan_section then
-      pcall(agent._plan_section)
-      agent._plan_section = nil
-    end
-  end
+  -- no-op：系统提示段已废弃，改用运行时上下文快照
+end
+
+--- 计划模式策略段文本（供运行时上下文快照复用）
+--- @return string
+function M.policy_text()
+  return PLAN_POLICY_TEXT
 end
 
 -- ========== 公开 API ==========

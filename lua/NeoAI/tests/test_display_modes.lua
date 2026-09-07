@@ -373,7 +373,7 @@ tests.suite("display_modes", function(_, it)
           },
         },
         model_refresh = { on_startup = false },
-        scenarios = { chat = { provider = "mock", preset = "balanced" } },
+        modes = { chat = { provider = "mock", model = "mock-model" } },
       },
       session = { save_path = "/tmp/neoai_display", file = "s.jsonl" },
     })

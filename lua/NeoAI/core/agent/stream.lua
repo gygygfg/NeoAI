@@ -92,6 +92,11 @@ function M.create(agent)
     if parsed.tool_calls then
       tool_acc = _accumulate_tool_calls(tool_acc, parsed.tool_calls)
       updated.tool_calls = true
+      -- 实时推送当前累积的工具调用快照：UI 用它像思考过程悬浮窗一样打开"接收参数"悬浮窗。
+      event_bus.emit(events.TOOL_ARG_CHUNK, {
+        agent_id = agent.id,
+        tool_calls = _finalize_tool_calls(tool_acc),
+      })
     end
     if parsed.finish_reason then
       updated.finish_reason = parsed.finish_reason
@@ -110,6 +115,7 @@ function M.create(agent)
       local final = _finalize_tool_calls(tool_acc)
       if #final > 0 then
         agent:set_tool_calls(final)
+        event_bus.emit(events.TOOL_ARG_COMPLETED, { agent_id = agent.id })
         return final
       end
     end

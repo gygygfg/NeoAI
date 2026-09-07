@@ -254,7 +254,7 @@ tests.suite("chat_keys", function(_, it)
           },
         },
         model_refresh = { on_startup = false },
-        scenarios = { chat = { provider = "mock", preset = "balanced" } },
+        modes = { chat = { provider = "mock", model = "mock-model" } },
       },
       session = { save_path = "/tmp/neoai_keys", file = "s.jsonl" },
     })

@@ -60,6 +60,10 @@ end
 --- @return boolean
 local function _is_turn_end(messages, i)
   local msg = messages[i]
+  -- 运行时上下文快照不算用户轮次（它是注入历史的易变状态，不产生用户回合）
+  if msg.runtime_context then
+    return false
+  end
   if msg.role == "user" then
     return true -- 用户消息始终后接分割线（与 AI 回复的视觉分隔）
   end
@@ -68,7 +72,7 @@ local function _is_turn_end(messages, i)
   end
   -- assistant：仅当它是本轮的可见最后一条（后面是下一条用户消息或列表末尾）时画分割线
   for j = i + 1, #messages do
-    if messages[j].role ~= "system" then
+    if not messages[j].runtime_context and messages[j].role ~= "system" then
       return messages[j].role == "user"
     end
   end
@@ -319,7 +323,9 @@ function M.render_chat(buf, messages)
   local i = 1
   while i <= #msgs do
     local msg = msgs[i]
-    if msg.role == "system" then
+    if msg.runtime_context then
+      i = i + 1 -- 运行时上下文快照不渲染为聊天消息（只进模型请求）
+    elseif msg.role == "system" then
       i = i + 1
     elseif msg.role == "assistant" and msg.tool_calls and #msg.tool_calls > 0 then
       -- 该 assistant 消息带工具调用：渲染角色头 + 推理 + 正文（模型常在调用工具前

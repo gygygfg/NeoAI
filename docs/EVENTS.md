@@ -1,34 +1,47 @@
-# NeoAI 事件系统文档
+# NeoAI 事件系统（唯一权威文档）
 
-> 注意：v2.0 架构重建后，事件命名改为 `domain:verb` 格式（如 `generation:started`）。
-> 事件总线位于 `NeoAI.kernel.event_bus`，常量位于 `NeoAI.kernel.events`。
-> 触发时自动加 `NeoAI:` 前缀（如 `generation:started` → `NeoAI:generation:started`）。
+> 本文档是 NeoAI 事件系统的**唯一权威来源**，合并了原先分散在
+> `docs/event_system.md`、`docs/NATIVE_EVENTS.md`、`docs/IMPLEMENTED_EVENTS.md`
+> 三份文档中的内容。
 
-## 概述
+## 1. 概述
 
-NeoAI 使用 Neovim 原生事件系统 (`nvim_exec_autocmds`) 来实现异步事件通信。所有事件都通过 `User` 自动命令触发。
+NeoAI 采用 **事件驱动异步架构**，所有模块通过事件总线通信，UI 与业务逻辑解耦。
 
-## 事件总线
+- **事件命名规范**：`domain:verb`（如 `generation:started`、`stream:chunk`）。
+- **传播机制**：基于 Neovim 原生 `User` autocmd（`nvim_exec_autocmds`）。
+- **前缀**：触发时自动加 `NeoAI:` 前缀（`generation:started` → `NeoAI:generation:started`），
+  避免与其它插件事件冲突。
+- **常量注册表**：`NeoAI.kernel.events` 模块集中定义全部事件常量。**禁止硬编码事件字符串**，
+  一律通过引用常量触发/订阅。
 
-推荐通过 `NeoAI.kernel.event_bus` 发布/订阅：
+## 2. 事件总线 API
+
+事件总线的实现位于 `NeoAI.kernel.event_bus`，提供发布/订阅/一次性订阅/全清。
 
 ```lua
 local event_bus = require("NeoAI.kernel.event_bus")
-local events = require("NeoAI.kernel.events")
+local events    = require("NeoAI.kernel.events")
 
--- 订阅
+-- 订阅事件（回调第一个参数为 payload=args.data）
 local unsub = event_bus.on(events.GENERATION_STARTED, function(data)
   print("生成开始:", data.agent_id)
 end)
 
--- 触发
+-- 触发事件
 event_bus.emit(events.GENERATION_STARTED, { agent_id = "agent_xxx" })
+
+-- 订阅一次（触发后自动取消）
+event_bus.once(events.SESSION_CREATED, function(data) print("首次会话创建") end)
 
 -- 取消订阅
 unsub()
+
+-- 清空所有订阅（插件卸载/测试）
+event_bus.clear_all()
 ```
 
-也可直接使用原生 autocmd：
+也可直接使用原生 autocmd（事件总线内部就是这么做的）：
 
 ```lua
 vim.api.nvim_create_autocmd("User", {
@@ -37,238 +50,198 @@ vim.api.nvim_create_autocmd("User", {
 })
 ```
 
-## 事件常量
+> **约定**：`emit(event, payload)` 将 payload 放入 `args.data`；
+> 订阅回调签名为 `function(data, args) ... end`，其中 `data` 即 `args.data`。
+> 订阅回调内部发生异常会被事件总线捕获并记日志，不会中断其它订阅者。
 
-所有事件常量定义在 `NeoAI.kernel.events` 模块中：
+## 3. 事件常量表
+
+所有事件常量在 `NeoAI.kernel.events` 中定义。按分区列如下。
+
+### Agent 生命周期
+
+| 常量 | 值 | 触发时机 | payload 关键字段 |
+| --- | --- | --- | --- |
+| `AGENT_CREATED` | `agent:created` | 创建 Agent | `{ agent }` |
+| `AGENT_SPAWNED` | `agent:spawned` | 派生子 Agent | `{ parent, agent }` |
+| `AGENT_DISPOSED` | `agent:disposed` | 销毁 Agent | `{ agent_id }` |
+| `AGENT_ABORTED` | `agent:aborted` | 取消 Agent | `{ agent_id, reason }` |
+| `AGENT_STATE_CHANGED` | `agent:state_changed` | 状态切换（idle/generating/tool_running/aborted/error） | `{ agent_id, old, new }` |
+
+### 生成 / 流式
+
+| 常量 | 值 | 触发时机 | payload 关键字段 |
+| --- | --- | --- | --- |
+| `GENERATION_STARTED` | `generation:started` | 开始生成 | `{ agent_id }` |
+| `GENERATION_COMPLETED` | `generation:completed` | 生成完成 | `{ agent_id, message }` |
+| `GENERATION_ERROR` | `generation:error` | 生成出错 | `{ agent_id, error }` |
+| `GENERATION_CANCELLED` | `generation:cancelled` | 生成取消 | `{ agent_id }` |
+| `STREAM_STARTED` | `stream:started` | 流式开始 | — |
+| `STREAM_CHUNK` | `stream:chunk` | 流式内容分片 | `{ agent_id }` |
+| `STREAM_COMPLETED` | `stream:completed` | 流式完成 | — |
+| `STREAM_ERROR` | `stream:error` | 流式出错 | — |
+
+### 推理
+
+| 常量 | 值 | 触发时机 | payload 关键字段 |
+| --- | --- | --- | --- |
+| `REASONING_STARTED` | `reasoning:started` | 推理开始 | `{ agent_id }` |
+| `REASONING_CHUNK` | `reasoning:chunk` | 推理内容分片 | `{ agent_id, chunk, reasoning }` |
+| `REASONING_COMPLETED` | `reasoning:completed` | 推理完成 | `{ agent_id }` |
+
+### 消息
+
+| 常量 | 值 | 触发时机 | payload 关键字段 |
+| --- | --- | --- | --- |
+| `MESSAGE_ADDED` | `message:added` | 添加消息 | `{ agent_id, message }` |
+| `MESSAGE_UPDATED` | `message:updated` | 更新消息 | `{ agent_id, message }` |
+| `MESSAGE_EDITED` | `message:edited` | 编辑消息 | `{ agent_id, message }` |
+| `MESSAGE_DELETED` | `message:deleted` | 删除消息 | `{ agent_id, message }` |
+| `MESSAGE_SENT` | `message:sent` | 用户发送消息 | `{ agent_id, content }` |
+| `MESSAGES_CLEARED` | `messages:cleared` | 清空消息 | — |
+
+### 会话
+
+| 常量 | 值 | 触发时机 | payload 关键字段 |
+| --- | --- | --- | --- |
+| `SESSION_CREATED` | `session:created` | 创建会话 | `{ session }` |
+| `SESSION_LOADED` | `session:loaded` | 加载会话 | `{ session_id }` |
+| `SESSION_SAVED` | `session:saved` | 保存会话 | `{ count }` |
+| `SESSION_DELETED` | `session:deleted` | 删除会话 | `{ session_id, deleted }` |
+| `SESSION_SWITCHED` | `session:switched` | 切换会话 | `{ session_id }` |
+| `SESSION_RENAMED` | `session:renamed` | 会话重命名 | `{ session_id }` |
+| `SESSION_FORKED` | `session:forked` | 会话分支 | `{ parent_id, child }` |
+
+### 分支 / 树
+
+| 常量 | 值 | 触发时机 | payload 关键字段 |
+| --- | --- | --- | --- |
+| `BRANCH_CREATED` | `branch:created` | 创建分支 | `{ session_id }` |
+| `BRANCH_DELETED` | `branch:deleted` | 删除分支 | `{ session_id }` |
+| `TREE_REFRESHED` | `tree:refreshed` | 会话树刷新 | — |
+
+### 工具
+
+| 常量 | 值 | 触发时机 | payload 关键字段 |
+| --- | --- | --- | --- |
+| `TOOL_LOOP_STARTED` | `tool_loop:started` | 工具循环开始 | `{ agent_id, tool_calls }` |
+| `TOOL_LOOP_FINISHED` | `tool_loop:finished` | 工具循环结束 | `{ agent_id, rounds }` |
+| `TOOL_LOOP_LIMIT_REACHED` | `tool_loop:limit_reached` | 达到最大轮数（1000） | `{ agent_id, rounds }` |
+| `TOOL_LOOP_GUARD_REMINDER` | `tool_loop:guard_reminder` | 护栏注入重复调用提醒 | `{ agent_id, repeats }` |
+| `TOOL_EXECUTION_STARTED` | `tool:execution_started` | 单个工具开始执行 | `{ agent_id, name, args, tool_call_id }` |
+| `TOOL_EXECUTION_COMPLETED` | `tool:execution_completed` | 单个工具完成 | `{ agent_id, name, result, tool_call_id, duration_ms }` |
+| `TOOL_EXECUTION_ERROR` | `tool:execution_error` | 单个工具出错 | `{ agent_id, name, error, tool_call_id, duration_ms }` |
+| `TOOL_CALL_DETECTED` | `tool:call_detected` | 检测到工具调用 | `{ agent_id, tool_calls }` |
+| `TOOL_RESULT_RECEIVED` | `tool:result_received` | 收到工具结果 | `{ agent_id, message }` |
+| `TOOL_APPROVAL_REQUESTED` | `tool:approval_requested` | 发起工具审批（入队） | `{ tool_name, args, agent_id }` |
+| `TOOL_APPROVED` | `tool:approved` | 审批通过 | `{ tool_name, agent_id }` |
+| `TOOL_APPROVAL_CANCELLED` | `tool:approval_cancelled` | 审批取消/拒绝 | `{ tool_name, reason, agent_id }` |
+| `AUTO_MODE_CHANGED` | `approval_mode:auto_changed` | AUTO 模式（自动允许）切换 | `{ active }` |
+
+> 审批事件携带 `agent_id`，供 Herder 等订阅者区分不同 Agent 的阻塞状态。
+> `AUTO_MODE_CHANGED` 的值为 `approval_mode:auto_changed`（注意与名不一致，属既有约定）。
+
+### 用户提问（ask_user）
+
+| 常量 | 值 | 触发时机 | payload 关键字段 |
+| --- | --- | --- | --- |
+| `ASK_USER_WAITING` | `ask_user:waiting` | 开始等待用户回答（Agent 进入 blocked 候选） | `{ agent_id }` |
+| `ASK_USER_ANSWERED` | `ask_user:answered` | 用户回答或取消提问 | `{ agent_id }` |
+
+### 工具参数接收（流式）
+
+| 常量 | 值 | 触发时机 | payload 关键字段 |
+| --- | --- | --- | --- |
+| `TOOL_ARG_CHUNK` | `tool:arg_chunk` | 模型流式生成工具调用参数时逐片触发 | `{ agent_id, tool_calls }`（当前累积的 tool_calls 快照） |
+| `TOOL_ARG_COMPLETED` | `tool:arg_completed` | 参数流结束 | `{ agent_id }` |
+
+> UI 借助这两类事件像思考过程悬浮窗一样实时展示「接收参数」悬浮窗（`tool_args_panel`）。
+
+### 待办 / 计划模式
+
+| 常量 | 值 | 触发时机 | payload 关键字段 |
+| --- | --- | --- | --- |
+| `TODO_UPDATED` | `todo:updated` | 待办清单更新 | `{ session_id, count, counts }` |
+| `PLAN_MODE_CHANGED` | `plan_mode:changed` | 计划模式切换 | `{ agent_id, active }` |
+
+### 模型
+
+| 常量 | 值 | 触发时机 | payload 关键字段 |
+| --- | --- | --- | --- |
+| `MODELS_UPDATED` | `models:updated` | 模型列表更新 | `{ models }` |
+| `MODEL_SWITCHED` | `model:switched` | 切换模型 | `{ agent_id, model }` |
+| `MODEL_REFRESH_STARTED` | `models:refresh_started` | 开始刷新模型 | `{ provider }` |
+| `MODEL_REFRESH_FAILED` | `models:refresh_failed` | 模型刷新失败 | `{ provider, error }` |
+
+### UI / 窗口
+
+| 常量 | 值 | 触发时机 | payload 关键字段 |
+| --- | --- | --- | --- |
+| `WINDOW_OPENED` | `window:opened` | 打开窗口 | `{ win_id }` |
+| `WINDOW_CLOSED` | `window:closed` | 关闭窗口 | `{ win_id }` |
+| `UI_REFRESHED` | `ui:refreshed` | UI 刷新 | — |
+| `UI_MODE_CHANGED` | `ui:mode_changed` | UI 模式切换 | `{ mode }` |
+| `DISPLAY_MODE_CHANGED` | `display:mode_changed` | 显示模式切换 | `{ name }` |
+
+### 子 Agent
+
+| 常量 | 值 | 触发时机 | payload 关键字段 |
+| --- | --- | --- | --- |
+| `SUB_AGENT_CREATED` | `sub_agent:created` | 创建子 Agent | `{ sub_agent_id, task }` |
+| `SUB_AGENT_UPDATED` | `sub_agent:updated` | 子 Agent 更新 | `{ sub_agent_id, status }` |
+| `SUB_AGENT_COMPLETED` | `sub_agent:completed` | 子 Agent 完成 | `{ sub_agent_id }` |
+| `SUB_AGENT_ERROR` | `sub_agent:error` | 子 Agent 出错 | `{ sub_agent_id, error }` |
+| `SUB_AGENT_RESULT_READY` | `sub_agent:result_ready` | 子 Agent 结果就绪 | `{ sub_agent_id }` |
+
+### 配置 / 生命周期
+
+| 常量 | 值 | 触发时机 | payload 关键字段 |
+| --- | --- | --- | --- |
+| `CONFIG_LOADED` | `config:loaded` | 配置加载 | `{ config }` |
+| `CONFIG_CHANGED` | `config:changed` | 配置变更 | `{ path, old, new }` |
+| `PLUGIN_INITIALIZED` | `plugin:initialized` | 插件初始化 | — |
+| `PLUGIN_SHUTDOWN` | `plugin:shutdown` | 插件关闭 | — |
+
+### 日志
+
+| 常量 | 值 | 触发时机 | payload 关键字段 |
+| --- | --- | --- | --- |
+| `LOG_MESSAGE` | `log:message` | 记录日志消息 | `{ level, message }` |
+
+### 上下文压缩
+
+| 常量 | 值 | 触发时机 | payload 关键字段 |
+| --- | --- | --- | --- |
+| `COMPACTION_STARTED` | `compaction:started` | 开始上下文压缩 | `{ agent_id, estimated_tokens }` |
+| `COMPACTION_COMPLETED` | `compaction:completed` | 压缩完成 | `{ agent_id, replaced, summary }` |
+
+## 4. 事件订阅最佳实践
+
+1. **始终引用常量**：订阅/触发都通过 `NeoAI.kernel.events` 的常量，不要硬编码字符串。
+2. **及时清理**：`event_bus.on(...)` 返回取消函数，窗口关闭/agent 销毁时调用，防泄漏。
+3. **避免阻塞**：事件回调在 autocmd 上下文执行，不要做耗时 I/O；耗时操作用 `vim.schedule` 延后。
+4. **错误隔离**：回调抛异常会被 event_bus 捕获并记日志，不会中断其它订阅者（但最好自己 `pcall`）。
+5. **payload 为浅表**：`emit` 的 payload 经 `nvim_exec_autocmds` 深拷贝，**不要依赖对象元表/方法**。
+   需要传原对象（如计时器、Agent 实例）时，应直接以闭包/模块级引用传递，而非塞进事件 payload。
+
+## 5. 订阅事件示例
 
 ```lua
-local events = require("NeoAI.kernel.events")
-print(events.GENERATION_STARTED)  -- 输出: "generation:started"
-```
+local event_bus = require("NeoAI.kernel.event_bus")
+local events    = require("NeoAI.kernel.events")
 
-## 事件列表
-
-### AI 生成事件
-- `GENERATION_STARTED` - AI生成开始
-  - 数据: `{agent_id}`
-- `GENERATION_COMPLETED` - AI生成完成
-  - 数据: `{agent_id, message}`
-- `GENERATION_ERROR` - AI生成错误
-  - 数据: `{agent_id, error}`
-- `GENERATION_CANCELLED` - AI生成取消
-  - 数据: `{agent_id}`
-
-### 流式处理事件
-- `STREAM_CHUNK` - 流式数据块到达
-  - 数据: `{agent_id}`
-- `STREAM_STARTED` - 流式处理开始
-- `STREAM_COMPLETED` - 流式处理完成
-- `STREAM_ERROR` - 流式处理错误
-
-### 推理事件
-- `REASONING_STARTED` - 推理开始
-- `REASONING_CHUNK` - 推理内容到达
-  - 数据: `{agent_id, reasoning}`
-- `REASONING_COMPLETED` - 推理完成
-
-### 工具相关事件
-- `TOOL_LOOP_STARTED` - 工具循环开始
-  - 数据: `{current_messages}`
-- `TOOL_LOOP_FINISHED` - 工具循环结束
-  - 数据: `{final_result, iteration_count}`
-- `TOOL_EXECUTION_STARTED` - 工具执行开始
-  - 数据: `{tool_name, args, start_time}`
-- `TOOL_EXECUTION_COMPLETED` - 工具执行完成
-  - 数据: `{tool_name, args, result, duration}`
-- `TOOL_EXECUTION_ERROR` - 工具执行错误
-  - 数据: `{tool_name, args, error_msg, duration}`
-- `TOOL_CALL_DETECTED` - 检测到工具调用
-- `TOOL_RESULT_RECEIVED` - 收到工具结果
-
-### 会话事件
-- `SESSION_CREATED` - 会话创建
-  - 数据: `{session_id, session}`
-- `SESSION_REUSED` - 会话重用
-  - 数据: `{session_id, session}`
-- `SESSION_LOADED` - 会话加载
-- `SESSION_SAVED` - 会话保存
-- `SESSION_DELETED` - 会话删除
-- `SESSION_CHANGED` - 会话变更
-
-### 分支事件
-- `BRANCH_CREATED` - 分支创建
-- `BRANCH_SWITCHED` - 分支切换
-- `BRANCH_DELETED` - 分支删除
-
-### 消息事件
-- `MESSAGE_ADDED` - 消息添加
-  - 数据: `{message_id, message}`
-- `MESSAGE_EDITED` - 消息编辑
-  - 数据: `{message_id, old_content, new_content}`
-- `MESSAGE_DELETED` - 消息删除
-  - 数据: `{message_id, message}`
-- `MESSAGES_CLEARED` - 消息清空
-  - 数据: `{branch_id, deleted_ids}`
-- `MESSAGES_BUILT` - 消息构建完成
-  - 数据: `{messages, history_count}`
-- `MESSAGE_SENT` - 消息发送
-  - 数据: `{session_id, branch_id, original_content, formatted_content, message, window_id, timestamp}`
-- `FORMATTED_MESSAGE_SENT` - 格式化消息发送
-  - 数据: `{session_id, branch_id, original_content, formatted_content, message, window_id, timestamp}`
-
-### UI 事件
-- `CHAT_WINDOW_OPENED` - 聊天窗口打开
-  - 数据: `{window_id, window_type, options}`
-- `CHAT_WINDOW_CLOSED` - 聊天窗口关闭
-  - 数据: `{window_id, window_type}`
-- `TREE_WINDOW_OPENED` - 树窗口打开
-- `TREE_WINDOW_CLOSED` - 树窗口关闭
-- `WINDOW_MODE_CHANGED` - 窗口模式变更
-
-### 配置事件
-- `CONFIG_LOADED` - 配置加载
-- `CONFIG_CHANGED` - 配置变更
-
-### 状态事件
-- `PLUGIN_INITIALIZED` - 插件初始化
-- `PLUGIN_SHUTDOWN` - 插件关闭
-
-## 使用方法
-
-### 基本使用
-
-```lua
-local events = require("NeoAI.core.events")
-
--- 监听事件
-local listener_id = events.on(events.EVENTS.MESSAGE_ADDED, function(data)
-    local message_id, message = data[1], data[2]
-    print("新消息:", message_id, message.content)
+-- 订阅生成完成并渲染
+event_bus.on(events.GENERATION_COMPLETED, function(data)
+  print("Agent", data.agent_id, "完成生成")
 end)
 
--- 触发事件
-events.trigger(events.EVENTS.MESSAGE_ADDED, {"msg_123", {id="msg_123", content="Hello"}})
-
--- 移除监听器
-events.off(listener_id)
-```
-
-### 高级用法
-
-```lua
--- 一次性监听器
-events.once(events.EVENTS.SESSION_CREATED, function(data)
-    print("第一次会话创建:", data[1])
+-- 订阅工具审批（Herder 用：标记阻塞）
+event_bus.on(events.TOOL_APPROVAL_REQUESTED, function(data)
+  -- data.agent_id
 end)
 
--- 等待事件（带超时）
-local result = events.wait(events.EVENTS.GENERATION_COMPLETED, 5000) -- 5秒超时
-if result then
-    print("生成完成:", result[1])
-else
-    print("等待超时")
-end
-
--- 异步触发事件
-events.trigger_async(events.EVENTS.CONFIG_CHANGED, {version="2.0"})
-
--- 批量触发事件
-events.trigger_batch({
-    {name = events.EVENTS.PLUGIN_INITIALIZED, data = {timestamp = os.time()}},
-    {name = events.EVENTS.CONFIG_LOADED, data = {config = "default"}}
-})
-
--- 事件组管理
-local group = events.create_group("my_group")
-group:on(events.EVENTS.CHAT_WINDOW_OPENED, function(data) print("窗口打开") end)
-group:on(events.EVENTS.CHAT_WINDOW_CLOSED, function(data) print("窗口关闭") end)
-group:clear() -- 清理组内所有监听器
-```
-
-### 检查事件状态
-
-```lua
--- 检查事件是否已注册
-local is_registered = events.is_registered(events.EVENTS.GENERATION_STARTED)
-
--- 获取监听器数量
-local count = events.listener_count(events.EVENTS.GENERATION_STARTED)
-
--- 清理所有事件监听器
-events.clear_all() -- 清理所有事件
-events.clear_all("NeoAI:generation_*") -- 清理特定模式的事件
-```
-
-## 在插件开发中使用
-
-### 扩展事件系统
-
-```lua
--- 在你的插件模块中
-local M = {}
-
-function M.doSomething()
-    -- ... 执行操作 ...
-    
-    -- 触发自定义事件
-    vim.api.nvim_exec_autocmds("User", {
-        pattern = "NeoAI:my_plugin_event",
-        data = {result = "success", timestamp = os.time()}
-    })
-end
-
--- 或者使用事件系统模块
-local events = require("NeoAI.core.events")
-function M.doSomethingElse()
-    events.trigger("NeoAI:my_plugin_event", {action = "completed"})
-end
-
-return M
-```
-
-### 响应系统事件
-
-```lua
--- 监听系统事件并做出响应
-local events = require("NeoAI.core.events")
-
--- 当AI生成开始时，显示通知
-events.on(events.EVENTS.GENERATION_STARTED, function(data)
-    vim.notify("AI生成开始...", vim.log.levels.INFO)
-end)
-
--- 当工具执行错误时，记录日志
-events.on(events.EVENTS.TOOL_EXECUTION_ERROR, function(data)
-    local tool_name, args, error_msg = data[1], data[2], data[3]
-    print(string.format("工具 %s 执行错误: %s", tool_name, error_msg))
+-- 订阅工具参数流（UI 用：打开接收参数悬浮窗）
+event_bus.on(events.TOOL_ARG_CHUNK, function(data)
+  -- data.tool_calls → tool_args_panel.show(...)
 end)
 ```
-
-## 最佳实践
-
-1. **及时清理监听器**：避免内存泄漏，在不需要时移除监听器
-2. **使用事件组**：管理相关事件的监听器
-3. **避免阻塞**：事件回调中不要执行耗时操作
-4. **错误处理**：在事件回调中添加错误处理
-5. **文档化**：为自定义事件添加文档说明
-
-## 故障排除
-
-### 事件未触发
-1. 检查事件名称是否正确
-2. 确保事件在正确的时间点触发
-3. 检查是否有其他代码移除了监听器
-
-### 内存泄漏
-1. 使用事件组管理相关监听器
-2. 在插件卸载时清理所有监听器
-3. 使用一次性监听器处理临时需求
-
-### 性能问题
-1. 避免在事件回调中执行复杂计算
-2. 减少不必要的事件监听
-3. 使用 `trigger_async` 避免阻塞主线程
-
-## 示例代码
-
-更多示例请参考 `NeoAI/examples/event_usage.lua`。

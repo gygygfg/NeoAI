@@ -126,10 +126,10 @@ local function _drain_approval_queue()
     item.d = nil -- 已决策：审批超时不再作用于本条目（避免杀掉已批准的长耗时执行）
     if d and d:is_pending() then
       if allowed then
-        event_bus.emit(events.TOOL_APPROVED, { tool_name = item.tool_name })
+        event_bus.emit(events.TOOL_APPROVED, { tool_name = item.tool_name, agent_id = item.ctx.agent and item.ctx.agent.id })
         item.continue_fn():then_(function(r) d:resolve(r) end, function(e) d:reject(e) end)
       else
-        event_bus.emit(events.TOOL_APPROVAL_CANCELLED, { tool_name = item.tool_name, reason = reason })
+        event_bus.emit(events.TOOL_APPROVAL_CANCELLED, { tool_name = item.tool_name, reason = reason, agent_id = item.ctx.agent and item.ctx.agent.id })
         d:reject({ kind = "approval", message = reason or ("用户拒绝了工具调用: " .. item.tool_name) })
       end
     end
@@ -215,7 +215,7 @@ function M.approve_and_execute(tool_name, args, ctx, continue_fn)
     return continue_fn()
   end
 
-  event_bus.emit(events.TOOL_APPROVAL_REQUESTED, { tool_name = tool_name, args = args })
+  event_bus.emit(events.TOOL_APPROVAL_REQUESTED, { tool_name = tool_name, args = args, agent_id = ctx.agent and ctx.agent.id })
 
   -- 入队等待串行审批。工具执行本身并行（tool_loop 并发发起），这里只串行化
   -- "弹窗确认"这一环节：单槽位弹窗一次只展示一个，其余排队，互不覆盖。

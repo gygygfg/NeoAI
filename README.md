@@ -20,6 +20,8 @@
 - **⚠️⚠️⚠️使用curl发送请求** 环境变量内没有curl可能无法发送请求
 - **多模态图像** — `read_image` 工具读入 PNG/JPEG/WebP/GIF 并注入多模态模型（内容寻址附件存储 + 请求期像素/字节预算 offload，模型不支持图像时自动降级为文本）
 - **lualine 状态栏集成** — 在聊天窗口中用 `nvim-lualine` 实时展示大模型用量、缓存命中率与上下文容量（模型/用量/缓存/容量等段可自定义）
+- **Herder 状态上报** — 在 Herder pane 内实时上报 Agent 作态（working/idle/blocked），多会话自动聚合，带严格递增 `--seq` 防并发回退
+- **工具参数接收面板** — 模型流式生成工具调用参数时实时打开「接收参数」悬浮窗（`tool_args_panel`），随分片更新、参数结束后自动关闭，与思考过程悬浮窗一致
 
 ---
 
@@ -104,6 +106,7 @@ require("NeoAI").setup({
 | `:NeoAICycleDisplay`| 循环切换聊天显示模式（对话/轨迹）                  |
 | `:NeoAIReloadDisplay`| 热重载显示模式插件（缺省重载当前模式）            |
 | `:NeoAIPlan`       | 切换计划模式（工具上下文只保留只读/信息查询 + 提问）|
+| `:NeoAIAuto`       | 切换 AUTO 模式（自动允许所有工具调用）             |
 | `:NeoAIApprovePlan`| 确认计划并转入 CHAT 模式按任务清单执行             |
 
 ### 4. 默认快捷键
@@ -154,20 +157,12 @@ require("NeoAI").setup({
       timeout_ms = 10000,                -- 单次请求超时
     },
 
-    -- 场景化模型配置（每个场景用 provider + preset 组合）
-    scenarios = {
-      chat      = { provider = "deepseek", preset = "balanced" },
-      coding    = { provider = "deepseek", preset = "precise" },
-      reasoning = { provider = "deepseek", preset = "deep_think" },
-      agent     = { provider = "deepseek", preset = "balanced" },
-    },
-
-    -- 预设（温度/token/流式组合）
-    presets = {
-      fast      = { model = "auto", temperature = 0.3, max_tokens = 1024, stream = true },
-      balanced  = { model = "auto", temperature = 0.7, max_tokens = 4096, stream = true },
-      precise   = { model = "auto", temperature = 0.2, max_tokens = 8192, stream = true },
-      deep_think= { model = "auto", temperature = 0.7, max_tokens = 8192, stream = true },
+    -- 按模式（CHAT / PLAN / AUTO）分别配置提供商与模型参数；
+    -- 进入某模式时应用其 provider/model/temperature/max_tokens/stream，缺省回退 ai.default_provider。
+    modes = {
+      chat = { provider = "deepseek", model = "auto", temperature = 0.7, max_tokens = 4096, stream = true },
+      plan = { provider = "deepseek", model = "auto", temperature = 0.3, max_tokens = 8192, stream = true },
+      auto = { provider = "deepseek", model = "auto", temperature = 0.7, max_tokens = 8192, stream = true },
     },
 
     reasoning_enabled = true,            -- 启用深度思考模式
@@ -260,6 +255,13 @@ require("NeoAI").setup({
     path = vim.fn.stdpath("cache") .. "/NeoAI/neoai.log",
     max_size = 10485760,
     max_backups = 5,
+  },
+
+  -- ===== Herder 终端状态信号 =====
+  herder = {
+    enabled = true,                      -- 是否启用上报（还需 HERDR_ENV=1 才生效；非 Herder 环境为 no-op）
+    source = "custom:neoai",             -- 稳定且全局唯一的生命周期权威标识
+    agent = "neoai",                     -- agent 名称（Herder 侧识别用）
   },
 })
 ```
@@ -374,6 +376,60 @@ require("NeoAI").setup({
 - `require("NeoAI.services.status").segment(name)` — 单个段文本（mode/model/usage/cache/capacity/state/display）
 - `:NeoAIStatusline` — 预览当前状态栏组件内容
 
+### Herder 终端状态集成
+
+NeoAI 可以在 **Herder** 管理的 pane 内向 Herder 上报 AI Agent 的真实作态（`working` / `idle` / `blocked`），
+让 Herder 侧边栏实时反映 Agent 状态，而不是靠屏幕输出启发式猜测。本集成只负责**信号生成端**——
+把 NeoAI 的 Agent 生命周期翻译成 Herder 语义并上报；Herder 侧的识别/解析由 Herder 自身处理。
+
+**生效条件**（缺一不可）：
+
+1. 运行在 Herder 注入环境的 pane 内（存在环境变量 `HERDR_ENV=1`、`HERDR_PANE_ID`、`HERDER_BIN_PATH`）；
+2. `herder.enabled = true`（默认开启）。
+
+非 Herder 环境下本模块完全 no-op：不订阅事件、不产生任何副作用。
+
+**状态映射**：
+
+| NeoAI Agent 状态 | Herder 上报 |
+|---|---|
+| `generating` / `tool_running` | `working` |
+| 工具审批等待 / `ask_user` 等待用户回答 | `blocked` |
+| `idle` / `aborted` / `error` | `idle` |
+
+**多会话聚合**：单个 Neovim pane 内可能有多个 AI 会话（含子 Agent），NeoAI 聚合成一个固定的
+`source`（默认 `custom:neoai`）统一上报，聚合优先级为 `blocked > working > idle`。所有上报带
+严格递增的 `--seq`，令 Herder 忽略同一 `source` 的旧包，避免并发/异步回调导致状态回退。
+
+**上报流程示例**：
+
+```
+# 用户发送消息，Agent 进入生成
+herdr pane report-agent w1:p1 --source custom:neoai --agent neoai --state working --seq 1
+# 工具需要审批 / 向用户提问等待回答（阻塞）
+herdr pane report-agent w1:p1 --source custom:neoai --agent neoai --state blocked --seq 2
+# 审批通过、仍在生成
+herdr pane report-agent w1:p1 --source custom:neoai --agent neoai --state working --seq 3
+# 本轮生成完成、等待输入
+herdr pane report-agent w1:p1 --source custom:neoai --agent neoai --state idle --seq 4
+# 关闭聊天窗口、最后一个 Agent 销毁（释放生命周期权威）
+herdr pane release-agent w1:p1 --source custom:neoai --agent neoai --seq 5
+```
+
+**配置**：
+
+```lua
+require("NeoAI").setup({
+  herder = {
+    enabled = true,           -- 是否启用上报（还需 HERDR_ENV=1 才真正生效）
+    source = "custom:neoai",  -- 稳定且全局唯一的生命周期权威标识
+    agent = "neoai",          -- agent 名称（Herder 侧识别用）
+  },
+})
+```
+
+> 诊断：在 Herder pane 内用 `herdr agent explain <pane-id>` 可查看当前 Agent 状态来源与最近上报。
+
 </details>
 
 ---
@@ -434,16 +490,29 @@ NeoAI 内置了 40+ 工具，AI 可在对话中自动调用，涵盖以下类别
 
 ### 💻 Shell 工具 支持交互式shell 由AI自动填写
 
-| 工具名        | 描述                      | 默认审批                    |
-| ------------- | ------------------------- | --------------------------- |
-| `run_command` | 执行 Shell 命令（伪终端） | ❌ 需审批（支持参数白名单） |
+| 工具名        | 描述               | 默认审批                    |
+| ------------- | ------------------ | --------------------------- |
+| `run_command` | 执行 Shell 命令（非交互，异步 jobstart） | ❌ 需审批（支持参数白名单 `ls`/`wc`/`find`/`grep`/`pwd`） |
+
+### 🔄 Git 工具
+
+| 工具名                  | 描述                     | 默认审批    |
+| ----------------------- | ------------------------ | ----------- |
+| `git_status`            | 查看 git 状态（--short） | ✅ 自动允许 |
+| `git_diff`              | 查看未提交改动           | ✅ 自动允许 |
+| `git_log`               | 查看提交历史             | ✅ 自动允许 |
+| `git_commit_detail`     | 查看某次提交详情         | ✅ 自动允许 |
+| `git_branch`            | 查看分支列表（-a）       | ✅ 自动允许 |
+| `git_file_history`      | 查看文件历史             | ✅ 自动允许 |
+| `git_rollback`          | 回滚文件到指定提交       | ❌ 需审批   |
+| `git_auto_commit_config`| 查看/设置自动提交配置    | ✅ 自动允许 |
 
 ### 🤖 子 Agent 工具
 
 | 工具名                 | 描述                                                      | 默认审批    |
 | ---------------------- | --------------------------------------------------------- | ----------- |
-| `create_sub_agent`     | 创建子 Agent 执行子任务（支持 `foreground` 前台等待结果） | ❌ 需审批   |
-| `wait_sub_agent`       | 等待子 Agent 完成并返回完整结果                           | ✅ 自动允许 |
+| `create_sub_agent`     | 创建子 Agent 执行子任务（支持 `foreground` 前台等待结果；`mode` 可选，`boundaries` 可选约束） | ❌ 需审批   |
+| `wait_sub_agent`       | 等待子 Agent 完成并返回完整结果（若已完成则立即返回）     | ❌ 需审批   |
 | `get_sub_agent_status` | 查询子 Agent 状态与结果                                   | ✅ 自动允许 |
 | `cancel_sub_agent`     | 取消子 Agent                                              | ✅ 自动允许 |
 
@@ -481,7 +550,7 @@ NeoAI 内置了 40+ 工具，AI 可在对话中自动调用，涵盖以下类别
 
 ## 🏗️ 架构
 
-基于 v2.0 架构指南（见 [styleGuide.md](styleGuide.md)），遵循**隔离、简洁、异步优先**设计哲学。
+基于 v3.0 架构指南（见 [styleGuide.md](styleGuide.md)），遵循**隔离、简洁、异步优先**设计哲学。
 
 ```
 NeoAI/
@@ -504,7 +573,10 @@ NeoAI/
 │   │   ├── registry.lua       # 模型注册表（运行时动态更新）
 │   │   ├── fetcher.lua        # 模型列表异步获取器（指数退避重试）
 │   │   ├── adapter.lua        # 多提供商协议适配（openai/anthropic/google）
+│   │   ├── content.lua        # 多模态消息物化（图像引用→wire part）
 │   │   └── cache.lua          # 模型列表本地缓存
+│   ├── attachment/            # 附件（多模态图像）
+│   │   └── attachment.lua     # 内容寻址附件存储 + 门禁（vision 支持/类型/上限）
 │   └── agent/                 # Agent 引擎
 │       ├── agent.lua          # Agent 对象（每次对话全新实例 + AbortSignal）
 │       ├── runtime.lua        # Agent 运行时（create/spawn/dispose/abort）
@@ -513,9 +585,11 @@ NeoAI/
 │       └── tool_loop.lua      # 工具调用循环
 │
 ├── services/                   # 服务层（连接 core 与 ui/tools）
-│   ├── chat_service.lua       # 聊天服务（send/attach/detach）
-│   ├── tool_service.lua       # 工具服务（审批 + 调度 + 执行）
-│   └── model_service.lua      # 模型服务（list/set_active/prefetch）
+│   ├── chat_service.lua       # 聊天服务（send/attach/detach/approve_plan/cycle_mode）
+│   ├── tool_service.lua       # 工具服务（审批 + 调度 + 执行，串行审批队列）
+│   ├── model_service.lua      # 模型服务（list/set_active/prefetch）
+│   ├── status.lua             # 状态栏服务（lualine 集成，段拼接 + 高亮）
+│   └── herder.lua             # Herder 终端状态上报（working/idle/blocked）
 │
 ├── ui/                         # 表现层
 │   ├── window/                # 窗口管理（float/tab/split）
@@ -552,6 +626,9 @@ NeoAI/
 │   ├── json.lua              # JSON 编解码
 │   ├── http.lua              # 异步 HTTP 客户端（curl jobstart，流式 SSE）
 │   ├── fs.lua                # 文件操作（JSONL）
+│   ├── work.lua              # 线程池（阻塞式文件 I/O / 图像解码在线程池执行）
+│   ├── timer.lua             # 可暂停计时器（工具活跃耗时，剔除等待时间）
+│   ├── image.lua             # 图像类型检测/媒体类型
 │   └── stringx.lua           # 字符串扩展
 │
 └── tests/                      # 测试（自定义运行器，:NeoAITest）
@@ -578,20 +655,27 @@ NeoAI/
 
 ## 📡 事件系统
 
-NeoAI 基于 Neovim 原生 `User` 自动命令实现事件驱动架构，共定义了 60+ 事件：
+NeoAI 基于 Neovim 原生 `User` 自动命令实现事件驱动架构，事件常量定义在 `NeoAI.kernel.events` 模块（事件总线为 `NeoAI.kernel.event_bus`，触发时自动加 `NeoAI:` 前缀）。按分区统计如下：
 
-| 事件类别     | 数量 | 说明                               |
-| ------------ | ---- | ---------------------------------- |
-| AI 生成事件  | 6    | 生成开始、完成、错误、取消、重试   |
-| 流式处理事件 | 4    | 流式开始、数据块、完成、错误       |
-| 推理事件     | 3    | 推理开始、内容到达、完成           |
-| 工具相关事件 | 12   | 工具循环、执行、审批、调用检测     |
-| 会话事件     | 7    | 创建、复用、加载、保存、删除、切换 |
-| 分支事件     | 3    | 分支创建、切换、删除               |
-| 消息事件     | 9    | 添加、编辑、删除、发送、清空       |
-| 窗口/UI 事件 | 12+  | 打开、关闭、渲染、模式切换         |
+| 事件分区         | 数量 | 说明                               |
+| ---------------- | ---- | ---------------------------------- |
+| Agent 生命周期   | 5    | 创建、派生、销毁、中止、状态变更   |
+| 生成/流式        | 8    | 生成开始、完成、错误、取消、流式   |
+| 推理             | 3    | 推理开始、内容到达、完成           |
+| 消息             | 6    | 添加、更新、编辑、删除、发送、清空 |
+| 会话             | 7    | 创建、加载、保存、删除、切换、重命名、分支 |
+| 分支/树          | 3    | 分支创建、删除、树刷新             |
+| 工具             | 13   | 工具循环、执行、审批、调用检测、护栏 |
+| 用户提问         | 2    | 等待用户回答开始、回答/取消结束    |
+| 工具参数接收     | 2    | `tool:arg_chunk` / `tool:arg_completed` |
+| 待办/计划模式    | 2    | 待办更新、计划模式变更             |
+| 模型             | 4    | 模型更新、切换、刷新开始、刷新失败 |
+| UI/窗口          | 5    | 打开、关闭、刷新、模式、显示模式   |
+| 子 Agent         | 5    | 创建、更新、完成、错误、结果就绪   |
+| 配置/生命周期    | 4    | 配置加载、变更、初始化、关闭       |
+| 日志/上下文压缩  | 3    | 日志消息、压缩开始、压缩完成       |
 
-所有事件常量定义在 `NeoAI.core.events` 模块中，详见 [docs/EVENTS.md](docs/EVENTS.md)。
+详见 [docs/EVENTS.md](docs/EVENTS.md)（唯一权威事件文档）。
 
 ---
 
@@ -616,13 +700,14 @@ NeoAI 基于 Neovim 原生 `User` 自动命令实现事件驱动架构，共定�
 | 文档                                                                       | 说明             |
 | -------------------------------------------------------------------------- | ---------------- |
 | [styleGuide.md](styleGuide.md)                                             | 架构设计指南     |
-| [docs/EVENTS.md](docs/EVENTS.md)                                           | 事件系统文档     |
-| [docs/IMPLEMENTED_EVENTS.md](docs/IMPLEMENTED_EVENTS.md)                   | 已实现事件列表   |
-| [docs/NATIVE_EVENTS.md](docs/NATIVE_EVENTS.md)                             | 原生事件文档     |
-| [docs/AI_RESPONSE_FLOW.md](docs/AI_RESPONSE_FLOW.md)                       | AI 响应流程      |
+| [docs/EVENTS.md](docs/EVENTS.md)                                           | 事件系统文档（唯一权威） |
+| [docs/overview.md](docs/overview.md)                                       | 插件总览         |
+| [docs/ai_engine.md](docs/ai_engine.md)                                     | Agent 引擎       |
+| [docs/tool_system.md](docs/tool_system.md)                                 | 工具系统         |
+| [docs/ui_system.md](docs/ui_system.md)                                     | UI 系统          |
+| [docs/sub_agent_system.md](docs/sub_agent_system.md)                       | 子 Agent 系统    |
+| [docs/configuration.md](docs/configuration.md)                             | 配置系统         |
 | [docs/chat_enhanced_usage.md](docs/chat_enhanced_usage.md)                 | 聊天增强使用指南 |
-| [docs/ui_multithread_optimization.md](docs/ui_multithread_optimization.md) | UI 多线程优化    |
-| [docs/threaded_testing.md](docs/threaded_testing.md)                       | 线程测试文档     |
 
 ---
 
@@ -638,7 +723,7 @@ NeoAI 基于 Neovim 原生 `User` 自动命令实现事件驱动架构，共定�
 ### 添加新 AI 提供商
 
 1. 在配置的 `ai.providers` 中添加新提供商
-2. 如有特殊 API 格式，在 `request_adapter.lua` 中注册适配器
+2. 如有特殊 API 格式，在 `core/model/adapter.lua` 中注册适配器
 
 ### 运行测试
 

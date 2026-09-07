@@ -54,10 +54,10 @@ local function _validate(config)
       table.insert(errors, string.format("ai.providers.%s.base_url 缺失", name))
     end
   end
-  local sc = ai.scenarios or {}
-  for sname, sval in pairs(sc) do
-    if type(sval) ~= "table" or not sval.provider then
-      table.insert(errors, string.format("ai.scenarios.%s 应为 { provider = ... }", sname))
+  local modes = ai.modes or {}
+  for mname, mval in pairs(modes) do
+    if type(mval) ~= "table" then
+      table.insert(errors, string.format("ai.modes.%s 应为 { provider?, model?, temperature?, max_tokens?, stream? }", mname))
     end
   end
   return errors

@@ -1,212 +1,206 @@
-# Tool System Architecture
+# NeoAI 工具系统（v3.0）
 
-The tool system enables AI to interact with the editor and filesystem through
-a structured tool-calling interface. Tools are registered, validated, executed
-with approval, and grouped by category for organized display.
+> 工具系统让 AI 通过结构化工具调用接口与编辑器/文件系统交互。工具注册、校验、
+> 审批（串行单槽位）、执行、分类，均由本系统完成。Agent 的工具循环经
+> `services.tool_service` 调用本系统执行工具。
+> 对应源码：`lua/NeoAI/tools/*`、`lua/NeoAI/services/tool_service.lua`。
 
-## Module Structure
+## 1. 模块结构
 
-**tools/init.lua:**
+| 模块 | 职责 |
+| --- | --- |
+| `tools/init.lua` | 工具系统入口。`init()` 应用审批配置 + 加载内置工具；`get_tools()` / `execute()` / `reload_tools()`。 |
+| `tools/registry.lua` | 工具注册表：注册、查询、别名解析、审批配置管理。 |
+| `tools/executor.lua` | 工具执行器：参数规范化 → 校验 → 审批决策 → 执行（异步）+ 基于可暂停计时器的超时。 |
+| `tools/validator.lua` | 参数 schema 校验 + 审批决策（路径/参数组安全判断）。 |
+| `tools/packer.lua` | 工具按类别分组打包（UI 分类展示）。 |
+| `tools/environment.lua` | 工具环境探测（workspace / git 目录），不可用则禁用依赖环境工具。 |
+| `tools/builtin/*` | 内置工具实现（见下）。 |
 
-- Entry point, initializes all tool sub-modules
-  - `init()`: Apply approval config + lazily load built-in tools
-  - `get_tools()`: List all registered tools
-  - `execute_tool(tool_name, args)`: Execute a tool (via executor)
-  - `reload_tools()`: Reload built-in tools (debug)
+## 2. 工具定义
 
-**tools/registry.lua:**
+工具通过 `tool_helpers.define_tool(name, description, params, func, opts)` 构造。工具定义结构：
 
-- Central registry for tool definitions
-  - `register(tool)`: Register tool with validation
-  - `get(tool_name)`: Get tool definition
-  - `list(category)`: List tools, optionally filtered by category
-  - `list_as_map()`: List as name → def map (for Agent binding)
-  - `search(query)`: Search tools by name/description/category
-  - `resolve_name(raw)`: Resolve aliases/fuzzy names
-  - `get_approval_config(tool_name)`: Get approval configuration
-  - `apply_approval_config(per_tool)`: Apply user approval overrides
-
-**tools/executor.lua:**
-
-- Tool execution engine
-  - `execute(tool_name, args, ctx)`: Main exec (normalize + validate + approve + run)
-  - `_normalize_arguments`: Alias mapping + simplified format conversion
-  - Timeout management with settled-flag pattern
-
-**tools/validator.lua:**
-
-- Tool validation
-  - `validate_tool(tool_def)`: Validate tool definition structure
-  - `validate_parameters(parameters, args)`: Validate parameters against schema
-  - `check_approval(tool_name, args, config, mode)`: Check if approval needed
-  - `is_path_allowed(filepath, dirs)`: Path safety check
-  - `is_params_safe(args, groups)`: Parameter safety check
-
-**tools/packer.lua:**
-
-- Tool pack grouping
-  - `group_by_pack(tool_calls)`: Group tool calls by category
-  - `get_pack_for_tool(tool_name)`: Get pack name for tool
-  - `get_all_packs()`: List all packs sorted by order
-
-**tools/approval_handler.lua:**
-
-- Tool approval workflow
-  - `enqueue(item)`: Add tool to approval queue
-  - `process_queue()`: Show approval dialog for next item
-  - `pause_timer()` / `resume_timer()`: Pause/resolve tool timeout during approval
-  - UI rendering: Floating window with tool info and action keys
-
-**tools/approval_state.lua:**
-
-- Shared approval state
-  - `get_tool_config(tool_name)`: Get runtime approval config
-  - `set_tool_config(tool_name, config)`: Set runtime config
-  - `set_allow_all(tool_name)`: Mark tool as "always allow"
-
-## Built-in Tools
-
-**file_ops.lua (category: file):**
-
-- `read_file(filepath, start_line, end_line)`: Read file contents
-- `edit_file(filepath, edits, mode, explanation)`: Edit file with structured edits
-- `list_files(query, max_results)`: Search files by glob pattern
-- `search_files(query, include_pattern)`: Text search in workspace
-- `file_exists(filepath)`: Check if file exists
-- `create_directory(filepath)`: Create directory
-- `ensure_dir(filepath)`: Ensure directory exists
-- `delete_file(filepath)`: Delete file
-- `confirm_file_change(action)`: Confirm/abandon file write
-
-**log_ops.lua (category: log):**
-
-- `log_message(message, level)`: Log a message
-- `get_log_levels()`: Get available log levels
-
-**tree_ops.lua (category: treesitter):**
-
-- `parse_file(filepath)`: Parse file with treesitter
-- `query_tree(filepath, query)`: Query AST with pattern
-- `get_node_at_position(filepath, line, col)`: Get node at position
-- `get_node_type(node)`: Get node type
-- `get_node_range(node)`: Get node range
-- `is_named_node(node)`: Check if named node
-- `get_parent_node(node)`: Get parent node
-- `get_child_nodes(node)`: Get child nodes
-- `get_node_code(node)`: Get node source code
-- `delete_node(filepath, node)`: Delete AST node
-
-**lsp_ops.lua (category: lsp):**
-
-- `lsp_hover(filepath, line, col)`: Hover information
-- `lsp_definition(filepath, line, col)`: Go to definition
-- `lsp_references(filepath, line, col)`: Find references
-- `lsp_implementation(filepath, line, col)`: Find implementations
-- `lsp_declaration(filepath, line, col)`: Go to declaration
-- `lsp_document_symbols(filepath)`: Document symbols
-- `lsp_workspace_symbols(query)`: Workspace symbols
-- `lsp_code_action(filepath, line, col)`: Code actions
-- `lsp_rename(filepath, line, col, new_name)`: Rename symbol
-- `lsp_format(filepath)`: Format document
-- `lsp_diagnostics(filepath)`: Get diagnostics
-- `lsp_client_info()`: LSP client info
-- `lsp_signature_help(filepath, line, col)`: Signature help
-- `lsp_completion(filepath, line, col)`: Completions
-- `lsp_type_definition(filepath, line, col)`: Type definition
-- `lsp_service_info()`: LSP service info
-
-**shell.lua (category: system):**
-
-- `run_command(cmd, flag)`: Run shell command (async)
-
-**plan.lua (category: agent):**
-
-- `create_sub_agent(task, boundaries)`: Create sub-agent
-- `get_sub_agent_status(sub_agent_id)`: Get sub-agent status
-- `cancel_sub_agent(sub_agent_id)`: Cancel sub-agent
-- `review_tool_call(sub_agent_id, tool_call)`: Boundary enforcement
-- `get_summary(sub_agent_id)`: Get sub-agent execution summary
-- `cleanup_sub_agent(sub_agent_id)`: Clean up sub-agent state
-
-**tool_helpers.lua:**
-
-- Utility functions used by other tool modules
-- `define_tool(name, desc, params, func, opts)`: Tool definition builder
-
-## Tool Approval Workflow
-
-The approval system uses a three-tier check:
-
-1. **Allow-all check:**
-   - If user selected "Allow All" for this tool (via approval_state),
-     execution proceeds without dialog
-
-2. **Path safety AND parameter safety check:**
-   - Path safety: Tool arguments reference files in allowed_directories
-   - Parameter safety: Tool arguments match allowed_param_groups
-   - Both safe: auto-execute without dialog
-   - Either unsafe: show approval dialog
-
-3. **Approval dialog:**
-   - Shows tool name, description, and arguments
-   - User actions: confirm (once), confirm all, cancel, cancel with reason
-   - Timer paused during approval (`approval_handler.pause_timer`)
-   - Timer resumed after approval (`approval_handler.resume_timer`)
-
-Approval configuration:
-
-- `default_auto_allow`: Global default (false = require approval)
-- `tool_overrides`: Per-tool overrides
-- `allowed_directories`: Safe directory patterns
-- `allowed_param_groups`: Safe parameter value patterns
-
-## Parameter Normalization
-
-The `tool_executor._normalize_arguments()` function handles:
-
-**Tool name aliases:**
-
-```text
-"read" -> "read_file", "cat" -> "read_file"
-"write" -> "edit_file", "edit" -> "edit_file"
-"list" -> "list_files", "ls" -> "list_files"
-"search" -> "search_files", "grep" -> "search_files"
-"delete" -> "delete_file", "rm" -> "delete_file"
-"mkdir" -> "create_directory"
-"cmd" -> "run_command"
+```lua
+{
+  name = "read_file",            -- 工具名
+  description = "读取文件内容…", -- 描述（给模型）
+  parameters = { type = "object", properties = {...}, required = {...} }, -- schema
+  func = function(args, on_success, on_error, ctx) ... end, -- 执行函数
+  category = "file",             -- 分类（file/system/git/treesitter/lsp/log/agent）
+  approval = { auto_allow = ... }, -- 审批配置
+  timeout = ...                  -- 可选超时（ms）
+}
 ```
 
-**Parameter name aliases:**
+> **统一注入 `description` 参数**：`define_tool` 会为所有工具补充一个必填字符串参数 `description`
+> （「本次调用目的说明」），除非已存在。供审批与折叠展示使用。
 
-```text
-"cmd" -> "command"
-"file" -> "filepath", "files" -> "filepath"
-"dir" -> "dirs", "dir_path" -> "dirs"
-"start" -> "start_line", "end" -> "end_line"
+工具定义支持两种执行形式（`executor._call_tool`）：
+
+- **回调风格**：`func(args, on_success, on_error, ctx)`（`arity >= 2`）。
+- **返回 Deferred**：`func(args, ctx)` 返回带 `then_` 的对象。
+
+## 3. 工具注册
+
+`tools/init.lua` 的 `BUILTIN_MODULES` 列出内置工具模块，`init()` 时经 `registry.register_many` 同步注册
+（仅注册定义，无 I/O，确保首个 Agent 请求前已就绪）。`tool_helpers.lua` 是工具定义辅助库，不入内置清单。
+
+内置工具模块：`file_ops` / `shell` / `git_ops` / `lsp_ops` / `tree_ops` / `log_ops` / `plan`（子 Agent）/
+`todo` / `plan_mode` / `ask_user` / `read_image`。
+
+## 4. 执行流程（tools/executor.lua）
+
+`M.execute(tool_name, raw_args, ctx)` 完整流水线：
+
+```
+resolve_name（别名/模糊匹配）
+  → _normalize_arguments（别名映射，如 cmd→command、file→filepath）
+  → _expand_path_args（展开 ~ / $VAR 路径）
+  → validator.validate_parameters（schema 校验）
+  → 审批决策 validator.check_approval(...)
+      ├─ 需审批 → tool_service.approve_and_execute(...)
+      │           （审批通过后 continue_fn 继续，计时器审批后才 start）
+      └─ 直接执行 → _execute_tool(...)
+          → _call_tool（调用 func/execute）
+          → 基于可暂停计时器做超时（等待审批/提问不计入）
 ```
 
-**Simplified format conversion:**
+### 4.1 参数别名规范化
 
-- `file="foo.lua"` → `filepath={{filepath="foo.lua"}}`
-- Inherits related fields (start_line, end_line, content, etc.)
+`_normalize_arguments` 处理常见别名：`cmd→command`、`file/files→filepath`、`start→start_line`、
+`end→end_line`、`new_text/text→content` 等。简单字符串参数（`read_file` 等）直接转 `{ filepath = ... }`。
 
-**JSON repair:**
+### 4.2 路径展开
 
-- Truncated JSON strings are repaired (add missing quotes/braces)
-- Non-standard key:value format parsed as fallback
+`_expand_path_args` 对 `path` / `filepath` / `file_path` / `dirs` / `dir` 字段展开 `~` 别名
+（`~/...` ↔ 主目录），使相对主目录的路径可正常读写。
 
-## Tool Timeout Management
+### 4.3 审批决策（tools/validator.lua）
 
-Timeout configuration:
+`validator.check_approval(tool_name, args, approval_config, mode)`：
 
-- Global default: 30 seconds (configurable via `tool_timeout_ms`)
-- Per-tool override: `tool_def.timeout` field
-- `-1` = no timeout (used by run_command for interactive commands)
+- `mode == "auto_allow"` → 不审批。
+- `mode == "strict"` → 必审批。
+- `approval_config.auto_allow == true` → 不审批。
+- **路径安全**：`filepath` 落入 `allowed_directories` → 安全。
+- **参数安全**：`command` 首词落入 `allowed_param_groups`（如 `ls`/`grep`）→ 安全。
+- 无路径且无命令 → 按 `auto_allow` 决定。
 
-Timeout lifecycle:
+### 4.4 超时（可暂停计时器）
 
-1. `_set_timeout()` starts timer when tool execution begins
-2. `_pause_timeout()` pauses timer during approval dialog
-3. `_resume_timeout()` resumes with remaining time
-4. `_clear_timeout()` cancels timer on completion/error
-5. `_reset_timeout()` replaces timer with new duration
+`executor._execute_tool` 用可暂停计时器（`utils.timer`）基于**活跃时间**做超时：
+等待审批/提问期间暂停，不累计耗时、不消耗超时预算。超时缺省 `tools.executor.timeout_ms`（30s），
+可被工具自带 `timeout` 或 `ctx.timeout_ms` 覆盖。
+
+## 5. 审批（services/tool_service.lua）
+
+审批是**串行单槽位**设计：工具执行本身并行（tool_loop 并发发起），但「弹窗确认」串行化——
+一次只展示一个审批弹窗，其余排队，互不覆盖。
+
+### 5.1 串行审批队列
+
+```
+M.execute(agent, name, args, tool_call_id, opts)
+  ├─ 子 Agent 边界审核 _review_sub_agent（plan.review_tool_call）
+  ├─ 计划模式门禁 plan_mode.check_tool（修改类工具在计划模式下驳回）
+  ├─ 构造 ctx（含可暂停 timer）
+  └─ executor.execute(...)
+```
+
+`approve_and_execute`：
+
+- `auto_allow` 模式或该工具已 `allow_all` → 直接执行。
+- 否则入 `approval_queue`，`_drain_approval_queue` 逐条弹窗（单槽位）。
+- **审批超时兜底**：`tools.approval.timeout_ms` 默认 60s，超时拒绝而不是永久挂起；
+  一旦决策（`item.d = nil`）超时即失效，不干扰已批准工具的执行。
+- `AUTO` 模式（`toggle_auto_mode`）：自动允许所有工具调用，开启时立刻批批准当前待审批/排队的工具。
+
+### 5.2 审批 UI
+
+`tool_approval` 组件经 `tool_service.set_approval_ui(impl)` 注入。无 UI（headless/测试）时默认允许并 notify。
+
+## 6. 内置工具
+
+### 📁 文件操作（file_ops.lua，阻塞 I/O 走线程池）
+
+`read_file` / `edit_file` / `list_files` / `search_files` / `file_exists` / `create_directory` /
+`ensure_dir` / `delete_file` / `confirm_file_change`。
+
+> `edit_file` 支持 `mode='write'/'append'/'edit'`。`confirm_file_change` 配合 `edit_file`：
+> 模型先看到「预览」结果，再调 `confirm_file_change(action='confirm'/'abandon'/'retry')` 确认。
+> 阻塞式文件 I/O（读大文件/递归搜索/写盘）经 `utils.work` 在线程池执行，不占用主线程。
+
+### 💻 Shell（shell.lua）
+
+`run_command`：异步 jobstart（非交互），收集 stdout/stderr，支持 `timeout_ms`（默认 30000，-1 不限）。
+
+### 🗂 Git（git_ops.lua）
+
+`git_status` / `git_diff` / `git_log` / `git_commit_detail` / `git_branch` / `git_file_history` /
+`git_rollback` / `git_auto_commit_config`。
+
+### 🔧 LSP（lsp_ops.lua，Neovim >= 0.12）
+
+`lsp_hover` / `lsp_definition` / `lsp_references` / `lsp_implementation` / `lsp_declaration` /
+`lsp_document_symbols` / `lsp_workspace_symbols` / `lsp_code_action` / `lsp_rename` / `lsp_format` /
+`lsp_diagnostics` / `lsp_client_info` / `lsp_signature_help` / `lsp_completion` /
+`lsp_type_definition` / `lsp_service_info`。
+
+> `lsp_ops` 有**请求级超时**兜底（`tools.lsp.timeout_ms` 默认 10s）：服务器无响应时快速失败，
+> 避免工具循环挂到 executor 超时。
+
+### 🌳 Tree-sitter（tree_ops.lua）
+
+`parse_file` / `query_tree` / `get_node_at_position` / `get_node_type` / `get_node_range` /
+`is_named_node` / `get_parent_node` / `get_child_nodes` / `get_node_code` / `delete_node`。
+
+### 🪵 日志（log_ops.lua）
+
+`log_message` / `get_log_levels`。
+
+### 🤖 子 Agent（plan.lua）
+
+`create_sub_agent` / `wait_sub_agent` / `get_sub_agent_status` / `cancel_sub_agent`。详见
+[sub_agent_system.md](sub_agent_system.md)。
+
+### 📋 待办（todo.lua）
+
+`todo_write`（整表替换）/ `todo_read` / `todo_clear`。会注册 agent 级系统提示段 `deployment:todos`
+（order=100），把当前任务清单注入每次请求。
+
+### 📐 计划模式（plan_mode.lua）
+
+`enter_plan_mode`。详见 [configuration.md](configuration.md) 与 [chat_enhanced_usage.md](chat_enhanced_usage.md)。
+
+### 💬 向用户提问（ask_user.lua）
+
+`ask_user`：暂停生成向用户提问，回答回传为工具结果。发射 `ASK_USER_WAITING`/`ASK_USER_ANSWERED`，
+等待期间暂停可暂停计时器。
+
+### 🖼 图像（read_image.lua）
+
+`read_image`：读取 PNG/JPEG/WebP/GIF，持久化进附件存储，返回引用。详见
+[configuration.md](configuration.md)（多模态）。
+
+## 7. 工具输出到模型（tool_loop._tool_definitions）
+
+工具定义输出到请求时（`core.agent.tool_loop._tool_definitions`）：
+
+- 按名称字典序输出（确定性，前缀缓存友好）。
+- 空 `properties` 不输出该字段（DeepSeek 拒绝 `[]` schema）。
+- 先环境探测（`tools.environment.filter_tools`），禁用依赖不可用环境（workspace/git）的工具。
+- 计划模式下只保留只读/信息查询 + `ask_user`（`plan_mode.apply_tool_filter`）。
+
+## 8. 环境探测（tools/environment.lua）
+
+- `workspace_available()`：cwd 非空且目录存在。
+- `git_available()`：从 cwd 向上查 `.git`（目录或文件，覆盖 worktree）。
+- `filter_tools()`：依赖git环境的工具（git_*）无 git 目录则禁用；依赖 workspace 的
+  `list_files`/`search_files` 无 cwd 则禁用。
+
+## 9. 相关文档
+
+- [ai_engine.md](ai_engine.md)：Agent 引擎（`tool_loop` 调用工具系统）。
+- [sub_agent_system.md](sub_agent_system.md)：子 Agent 边界审核。
+- [EVENTS.md](EVENTS.md)：工具事件（`TOOL_*`、`TOOL_ARG_*`、审批）。

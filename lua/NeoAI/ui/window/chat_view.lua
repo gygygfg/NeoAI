@@ -8,6 +8,7 @@ local message_list = require("NeoAI.ui.components.message_list")
 local input_box = require("NeoAI.ui.components.input_box")
 local model_picker = require("NeoAI.ui.components.model_picker")
 local reasoning_panel = require("NeoAI.ui.components.reasoning_panel")
+local tool_args_panel = require("NeoAI.ui.components.tool_args_panel")
 local fold = require("NeoAI.ui.components.fold")
 local display_modes = require("NeoAI.ui.components.display_modes")
 local chat_service = require("NeoAI.services.chat_service")
@@ -177,6 +178,36 @@ local reasoning_flush_scheduled = false
 -- 推理已终止（正文开始/推理结束）：已排队的冲刷回调应作废，避免重新打开悬浮窗。
 local reasoning_cancelled = false
 
+-- 工具参数分片批量：与推理一致，把同一 tick 内的参数快照合并为一次窗口刷新。
+local tool_args_pending = ""
+local tool_args_flush_scheduled = false
+-- 参数流已终止（参数结束/窗口关闭）：已排队的冲刷回调应作废，避免重新打开悬浮窗。
+local tool_args_cancelled = true
+
+--- 取消未冲刷的工具参数分片（参数结束 / 窗口关闭时调用）
+local function _cancel_pending_tool_args()
+  tool_args_pending = ""
+  tool_args_cancelled = true
+end
+
+--- 把缓存的工具参数快照一次性刷到悬浮窗
+local function _flush_tool_args()
+  tool_args_flush_scheduled = false
+  if tool_args_cancelled then
+    tool_args_cancelled = false
+    return
+  end
+  if tool_args_pending == "" then return end
+  -- 冲刷时若光标已不跟随，作废本次冲刷：不重新弹出接收参数悬浮窗，避免干扰当前查看。
+  if not _cursor_within_follow_margin() then
+    tool_args_pending = ""
+    return
+  end
+  local tool_calls = tool_args_pending
+  tool_args_pending = ""
+  tool_args_panel.show(tool_calls)
+end
+
 --- 取消未冲刷的推理分片（正文开始 / 推理结束 / 窗口关闭时调用）
 local function _cancel_pending_reasoning()
   reasoning_pending = ""
@@ -224,6 +255,9 @@ end
 function M.flush()
   if reasoning_flush_scheduled then
     _flush_reasoning()
+  end
+  if tool_args_flush_scheduled then
+    _flush_tool_args()
   end
   if render_scheduled and not render_flushed then
     _do_render()
@@ -315,9 +349,35 @@ local function _close_reasoning_panel(payload)
   reasoning_panel.close()
 end
 
+--- 工具参数流分片：打开/更新"接收参数"悬浮窗（与思考过程悬浮窗一致，光标不跟随时不弹）
+--- @param payload table { agent_id, tool_calls }
+local function _on_tool_arg_chunk(payload)
+  if not payload or payload.agent_id ~= state.agent_id then return end
+  if not payload.tool_calls or #payload.tool_calls == 0 then return end
+  tool_args_cancelled = false
+  -- 光标不跟随时抑制接收参数悬浮窗，避免弹出悬浮窗干扰用户查看。
+  if not _cursor_within_follow_margin() then return end
+  -- 参数接收阶段收起思考过程悬浮窗（含作废其已排队的冲刷），避免两窗重叠遮挡。
+  _close_reasoning_panel(payload)
+  tool_args_pending = payload.tool_calls
+  if not tool_args_flush_scheduled then
+    tool_args_flush_scheduled = true
+    vim.schedule(_flush_tool_args)
+  end
+end
+
+--- 工具参数流结束：关闭接收参数悬浮窗
+--- @param payload table
+local function _close_tool_args_panel(payload)
+  if not payload or payload.agent_id ~= state.agent_id then return end
+  _cancel_pending_tool_args()
+  tool_args_panel.close()
+end
+
 --- @param payload table
 local function _on_generation_finished(payload)
   _close_reasoning_panel(payload)
+  _close_tool_args_panel(payload)
   _on_message_updated(payload)
 end
 
@@ -691,6 +751,9 @@ function M.open(opts)
   state.unsubs[#state.unsubs + 1] = event_bus.on(events.TOOL_EXECUTION_ERROR, _on_tool_finished)
   state.unsubs[#state.unsubs + 1] = event_bus.on(events.REASONING_CHUNK, _on_reasoning_chunk)
   state.unsubs[#state.unsubs + 1] = event_bus.on(events.REASONING_COMPLETED, _close_reasoning_panel)
+  -- 工具参数流式接收：像思考过程悬浮窗一样实时打开"接收参数"悬浮窗
+  state.unsubs[#state.unsubs + 1] = event_bus.on(events.TOOL_ARG_CHUNK, _on_tool_arg_chunk)
+  state.unsubs[#state.unsubs + 1] = event_bus.on(events.TOOL_ARG_COMPLETED, _close_tool_args_panel)
   state.unsubs[#state.unsubs + 1] = event_bus.on(events.GENERATION_COMPLETED, _on_agent_end)
   state.unsubs[#state.unsubs + 1] = event_bus.on(events.GENERATION_ERROR, _on_agent_end)
   state.unsubs[#state.unsubs + 1] = event_bus.on(events.AGENT_ABORTED, _on_agent_end)
@@ -707,12 +770,16 @@ function M.close()
   _stop_tool_tick()
   fold.clear_timing()
   reasoning_panel.close()
+  tool_args_panel.close()
   -- 卸载当前显示模式插件（还原折叠覆盖）
   display_modes.detach()
   -- 清理缓存中的推理分片与待调度渲染，避免窗口重开后残留
   reasoning_pending = ""
   reasoning_flush_scheduled = false
   reasoning_cancelled = true
+  tool_args_pending = ""
+  tool_args_flush_scheduled = false
+  tool_args_cancelled = true
   render_scheduled = false
   if state.input_win_id and vim.api.nvim_win_is_valid(state.input_win_id) then
     pcall(vim.api.nvim_win_close, state.input_win_id, true)

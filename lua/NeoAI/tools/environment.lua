@@ -44,9 +44,15 @@ function M.workspace_available()
 end
 
 --- 是否处于 git 工作树内：从 cwd 向上查找 .git 目录或文件（覆盖 worktree 的 .git 文件）
+--- 注意：必须用 cwd 作为搜索起点（cwd .. ";"），而非 ".;"。
+--- vim.fn.finddir/.findfile 的 ".;" 从「当前 buffer 所在目录」开始向上搜索，
+--- 而不是从 cwd 开始。若 buffer 在项目内、cwd 在别处，会穿透到 buffer 目录的 .git，
+--- 得到与真实工作目录不符合的结果。
 --- @return boolean
 function M.git_available()
-  return vim.fn.finddir(".git", ".;") ~= "" or vim.fn.findfile(".git", ".;") ~= ""
+  local cwd = vim.fn.getcwd()
+  if cwd == "" or cwd == nil then return false end
+  return vim.fn.finddir(".git", cwd .. ";") ~= "" or vim.fn.findfile(".git", cwd .. ";") ~= ""
 end
 
 --- 过滤不可用环境的工具（保留可用的子集）

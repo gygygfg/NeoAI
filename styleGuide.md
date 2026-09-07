@@ -806,12 +806,10 @@ require("NeoAI").setup({
       -- 共 13 家内置 provider，均可 models_override 手动覆盖
     },
     model_refresh = { on_startup = true, interval_sec = 3600, timeout_ms = 10000 },
-    scenarios = { chat / coding / reasoning / agent = { provider, preset } },
-    presets  = {
-      fast = { model = "auto", temperature = 0.3, max_tokens = 1024, stream = true },
-      balanced = { model = "auto", temperature = 0.7, max_tokens = 4096, stream = true },
-      precise = { model = "auto", temperature = 0.2, max_tokens = 8192, stream = true },
-      deep_think = { model = "auto", temperature = 0.7, max_tokens = 8192, stream = true },
+    modes = {          -- 按模式（CHAT/PLAN/AUTO）分别配置 provider/model/temperature/max_tokens/stream
+      chat = { provider = "deepseek", model = "auto", temperature = 0.7, max_tokens = 4096, stream = true },
+      plan = { provider = "deepseek", model = "auto", temperature = 0.3, max_tokens = 8192, stream = true },
+      auto = { provider = "deepseek", model = "auto", temperature = 0.7, max_tokens = 8192, stream = true },
     },
     reasoning_enabled = true,
     system_prompt = "你是一个AI编程助手...",
