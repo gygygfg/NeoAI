@@ -38,6 +38,16 @@ local function _register_commands()
     require("NeoAI.ui").show_keymaps()
   end, { desc = "显示 NeoAI 当前键位配置", force = true })
 
+  vim.api.nvim_create_user_command("NeoAIStatusline", function()
+    local status = require("NeoAI.services.status")
+    local text = status.component()
+    if text == "" then
+      vim.notify("[NeoAI] (无激活 Agent)", vim.log.levels.INFO)
+    else
+      vim.notify("[NeoAI] " .. text:gsub("%%%%", "%"), vim.log.levels.INFO)
+    end
+  end, { desc = "预览 NeoAI lualine 状态栏组件内容", force = true })
+
   vim.api.nvim_create_user_command("NeoAITest", function(opts)
     local ok, tests = pcall(require, "NeoAI.tests")
     if not ok then
@@ -162,6 +172,10 @@ function M.setup(user_config)
   _register_commands()
   _register_global_keymaps()
 
+  -- 若 lualine 已加载（启动即加载情形），把 'neoai' 扩展注入其配置，实现零配置联动。
+  -- 未加载时的注入推迟到聊天窗口打开时（chat_view.open）。
+  pcall(require("NeoAI.services.status").ensure_lualine_extension)
+
   return M
 end
 
@@ -201,6 +215,30 @@ end
 --- @return table model_service
 function M.get_model_service()
   return require("NeoAI.services.model_service")
+end
+
+--- 获取状态栏服务（懒加载），用于 nvim-lualine 集成
+--- @return table status_service
+function M.get_status_service()
+  return require("NeoAI.services.status")
+end
+
+--- 获取状态栏信息（方便其它插件 / 状态栏消费）
+--- @return table 当前 Agent 的用量/缓存/容量信息
+function M.get_statusline_info()
+  return require("NeoAI.services.status").get_info()
+end
+
+--- 生成 lualine 状态栏文本
+--- @return string
+function M.get_statusline()
+  return require("NeoAI.services.status").component()
+end
+
+--- 手动把 NeoAI lualine 扩展注入 lualine（幂等；一般无需手动调用）
+--- @return boolean
+function M.enable_statusline()
+  return require("NeoAI.services.status").ensure_lualine_extension()
 end
 
 return M

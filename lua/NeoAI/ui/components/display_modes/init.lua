@@ -62,7 +62,7 @@ local function _ensure(name)
   return _load_module(name)
 end
 
---- 触发显示模式切换事件（chat_view 据此重渲染，status_float 据此刷新徽标）
+--- 触发显示模式切换事件（chat_view 据此重渲染）
 --- @param name string
 --- @param opts table|nil { reload? }
 local function _emit_changed(name, opts)

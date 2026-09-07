@@ -61,8 +61,10 @@ end
 
 --- 记录工具开始执行
 --- @param tool_call_id string
-function M.record_start(tool_call_id)
-  timing[tool_call_id] = { start_ms = _now_ms(), duration_ms = nil, status = "running" }
+--- @param timer table|nil 可暂停计时器（tool_loop 注入）：执行中耗时取自其活跃时间，
+---   等待用户审批/提问的暂停期间不累计；无 timer 时回退到墙钟。
+function M.record_start(tool_call_id, timer)
+  timing[tool_call_id] = { timer = timer, start_ms = _now_ms(), duration_ms = nil, status = "running" }
 end
 
 --- 记录工具执行结束
@@ -87,6 +89,8 @@ function M.get_duration(tool_call_id)
   local rec = timing[tool_call_id]
   if not rec then return nil end
   if rec.duration_ms then return rec.duration_ms end
+  -- 优先用可暂停计时器的活跃耗时：等待用户交互的暂停期间耗时保持不变。
+  if rec.timer then return rec.timer:elapsed() end
   if rec.start_ms then return _now_ms() - rec.start_ms end
   return nil
 end

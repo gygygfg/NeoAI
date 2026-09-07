@@ -8,7 +8,6 @@ local message_list = require("NeoAI.ui.components.message_list")
 local input_box = require("NeoAI.ui.components.input_box")
 local model_picker = require("NeoAI.ui.components.model_picker")
 local reasoning_panel = require("NeoAI.ui.components.reasoning_panel")
-local status_float = require("NeoAI.ui.components.status_float")
 local fold = require("NeoAI.ui.components.fold")
 local display_modes = require("NeoAI.ui.components.display_modes")
 local chat_service = require("NeoAI.services.chat_service")
@@ -29,7 +28,7 @@ local state = {
   agent_id = nil,
   tool_tick = nil, -- 工具执行中折叠文本定时刷新句柄
   following = true, -- 流式更新时光标是否跟随（不跟随时不弹思考悬浮窗、不重新折叠已有折叠）
-  collapsed = false, -- 聊天窗口进入后台后是否已收起（状态悬浮窗 + 输入框）
+  collapsed = false, -- 聊天窗口进入后台后是否已收起（输入框）
   focus_augroup = nil, -- 焦点追踪自动命令组（WinEnter/BufEnter）
 }
 
@@ -72,11 +71,13 @@ local function _open_fold_start_lines()
 end
 
 --- 渲染全部消息
-local function _render()
-  -- 不跟随（用户回看上方内容）时记录已展开的折叠块，重写 buffer 后恢复其展开状态，
-  -- 避免把用户正在查看的内容重新折叠起来。
+--- @param keep_view boolean|nil 仅刷新折叠文本（如工具耗时更新）时传 true：
+--- 无论光标是否在跟随区，都记录并恢复已展开的折叠块与光标/视口，避免把正在查看的地方拽走。
+local function _render(keep_view)
+  -- 不跟随（用户回看上方内容）或仅刷新折叠文本时记录已展开的折叠块，
+  -- 重写 buffer 后恢复其展开状态，避免把用户正在查看的内容重新折叠起来。
   local open_folds = {}
-  if not state.following then
+  if not state.following or keep_view then
     open_folds = _open_fold_start_lines()
   end
   local messages = chat_service.get_messages()
@@ -85,14 +86,15 @@ local function _render()
     vim.api.nvim_win_call(state.win_id, function()
       -- 每次重写 buffer 后，expr 折叠并不会自动重算（带 UI 会话里 nvim_buf_set_lines
       -- 不触发 foldexpr 求值，导致 foldlevel 全为 0、折叠失效）。先 zx 强制按 foldexpr
-      -- 重算折叠。光标跟随（底部）时 zM 全部收起（zc 只对光标处的折叠生效，其它位置会报 E490）；
-      -- 光标不跟随（用户正在回看上方内容）时只重算、不收起，并把重写前已展开的折叠重新展开，
-      -- 保留用户当前查看的折叠状态（zx 会保留手动开合的折叠状态，但整块 buffer 重写会丢失它）。
-      if state.following then
+      -- 重算折叠。光标跟随（底部）且非仅刷新折叠文本时 zM 全部收起（zc 只对光标处的折叠生效，
+      -- 其它位置会报 E490）；其余情况（光标不跟随——用户回看上方、或仅刷新折叠文本）只重算、
+      -- 不收起，并把重写前已展开的折叠重新展开，保留用户当前查看的折叠状态
+      -- （zx 会保留手动开合的折叠状态，但整块 buffer 重写会丢失它）。
+      if state.following and not keep_view then
         vim.cmd("silent! normal! zxzM")
       else
         vim.cmd("silent! normal! zx")
-        -- 记录光标位置，重开折叠后恢复：不跟随说明用户正在回看上方，不能被拽走。
+        -- 记录光标位置，重开折叠后恢复：不能让用户正在查看的位置被拽走。
         local cur = vim.api.nvim_win_get_cursor(state.win_id)
         for _, ln in ipairs(open_folds) do
           if vim.fn.foldclosed(ln) ~= -1 then
@@ -130,20 +132,25 @@ end
 -- 时尤其明显，表现为"主界面卡住"。这里把渲染延后到本 tick 结束，合并为一次。
 local render_scheduled = false
 local render_pending_follow = false
+local render_pending_keep_view = false
 local render_flushed = false
 
 --- 执行一次实际渲染（由调度回调或 flush 调用）
 local function _do_render()
   render_scheduled = false
   render_flushed = true
-  _render()
-  if render_pending_follow then
+  local keep_view = render_pending_keep_view
+  render_pending_keep_view = false
+  _render(keep_view)
+  -- 仅跟随且非保持视图时才滚动到底部：保持视图（如工具耗时刷新）时不动视口。
+  if render_pending_follow and not keep_view then
     _scroll_to_end()
   end
 end
 
 --- 调度一次渲染（合并同一 tick 内的多次更新）
-local function _schedule_render()
+--- @param keep_view boolean|nil 仅刷新折叠文本（不滚动、不改变光标/视口）
+local function _schedule_render(keep_view)
   if render_scheduled then return end
   render_scheduled = true
   render_flushed = false
@@ -152,6 +159,7 @@ local function _schedule_render()
   -- （不跟随时用于抑制思考悬浮窗弹出与折叠收起）。
   render_pending_follow = _cursor_within_follow_margin()
   state.following = render_pending_follow
+  render_pending_keep_view = keep_view == true
   vim.schedule(function()
     if render_flushed then
       -- 已被 flush 同步执行过，跳过以避免重复渲染
@@ -261,7 +269,8 @@ end
 local function _tool_tick()
   state.tool_tick = nil
   if not M.has_window() then return end
-  _schedule_render()
+  -- 仅刷新折叠文本（工具耗时），保持已展开折叠与光标/视口不变，避免打断用户查看。
+  _schedule_render(true)
   if fold.has_running() then
     state.tool_tick = vim.fn.timer_start(TOOL_TICK_MS, _tool_tick, vim.empty_dict())
   end
@@ -277,7 +286,7 @@ end
 local function _on_tool_started(payload)
   if not payload or payload.agent_id ~= state.agent_id then return end
   if payload.tool_call_id then
-    fold.record_start(payload.tool_call_id)
+    fold.record_start(payload.tool_call_id, payload.timer)
   end
   _schedule_render()
   _schedule_tool_tick()
@@ -351,6 +360,10 @@ local function _on_submit(content)
   -- 发送后切回主窗口并进入普通模式：生成期间可随时滚动查看流式输出
   _focus_main_normal()
   chat_service.send_message(content):catch(function(e)
+    if e and (e.kind == "aborted" or e.kind == "cancelled") then
+      -- 用户手动取消（ESC）是正常停止，不是发送失败，不弹错误提示。
+      return
+    end
     local msg = tostring(e.message or e)
     if type(e.body) == "string" and e.body ~= "" then
       msg = msg .. "\n" .. e.body
@@ -496,30 +509,27 @@ local function _is_chat_affiliated(win)
   return false
 end
 
---- 收起绑定的悬浮窗与输入框（聊天窗口进入后台 / 主窗口被切到别的 buffer）
+--- 收起绑定的输入框（聊天窗口进入后台 / 主窗口被切到别的 buffer）
 local function _collapse_aux()
   if state.collapsed then return end
   state.collapsed = true
-  status_float.detach()
   if state.input_win_id and vim.api.nvim_win_is_valid(state.input_win_id) then
     pcall(vim.api.nvim_win_close, state.input_win_id, true)
   end
   state.input_win_id = nil
 end
 
---- 恢复收起前的悬浮窗与输入框（回到聊天界面）。输入 buffer 内容保留（bufhidden=hide）。
+--- 恢复收起前的输入框（回到聊天界面）。输入 buffer 内容保留（bufhidden=hide）。
 local function _restore_aux()
   if not state.collapsed then return end
   state.collapsed = false
   if not state.win_id or not vim.api.nvim_win_is_valid(state.win_id) then return end
-  status_float.attach(state.win_id)
   if not state.input_win_id or not vim.api.nvim_win_is_valid(state.input_win_id) then
     _create_input_area(false)
   end
 end
 
 --- WinEnter：焦点进入某窗口时同步收起/恢复（in insert 与否无关）。
---- 状态浮窗点击也会触发 WinEnter，但其 filetype 为 neoai_status，属于聊天界面，不会误收起。
 local function _on_win_enter()
   if not M.has_window() then return end
   if _is_chat_affiliated(vim.api.nvim_get_current_win()) then
@@ -612,7 +622,6 @@ function M.open(opts)
       end
     end
     vim.api.nvim_set_current_win(state.win_id)
-    status_float.attach(state.win_id)
     return { win_id = state.win_id, buf = state.buf }
   end
 
@@ -642,9 +651,6 @@ function M.open(opts)
   -- 允许单行折叠被收起（如单行推理、结果未到达的单行工具调用），
   -- 否则 foldminlines=1 会让单行折叠无法 zM 关闭。
   vim.wo[state.win_id].foldminlines = 0
-  -- 常驻状态悬浮窗（模式/模型/状态/待办）
-  status_float.attach(state.win_id)
-
   -- 获取/创建 Agent（若有 session_id 则加载已有会话）
   local agent
   if opts.session_id then
@@ -668,7 +674,7 @@ function M.open(opts)
   -- 首次打开：新建输入 buffer + 键位（fresh 显式传 true）
   _create_input_area(true)
   input_box.focus()
-  -- 焦点追踪：焦点离开聊天窗口或主窗口被切到别的 buffer 时收起悬浮窗+输入框，回到聊天时恢复
+  -- 焦点追踪：焦点离开聊天窗口或主窗口被切到别的 buffer 时收起输入框，回到聊天时恢复
   state.collapsed = false
   _register_focus_tracking()
 
@@ -689,6 +695,10 @@ function M.open(opts)
   state.unsubs[#state.unsubs + 1] = event_bus.on(events.GENERATION_ERROR, _on_agent_end)
   state.unsubs[#state.unsubs + 1] = event_bus.on(events.AGENT_ABORTED, _on_agent_end)
 
+  -- 打开聊天窗口时懒注入 lualine 扩展：此阶段用户启动配置已执行、lualine 已可用，
+  -- 避免因 lualine 懒加载 / setup 顺序导致扩展注册不到。
+  require("NeoAI.services.status").ensure_lualine_extension()
+
   return { win_id = state.win_id, buf = state.buf }
 end
 
@@ -704,7 +714,6 @@ function M.close()
   reasoning_flush_scheduled = false
   reasoning_cancelled = true
   render_scheduled = false
-  status_float.detach()
   if state.input_win_id and vim.api.nvim_win_is_valid(state.input_win_id) then
     pcall(vim.api.nvim_win_close, state.input_win_id, true)
   end

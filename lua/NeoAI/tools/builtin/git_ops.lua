@@ -149,6 +149,7 @@ git_tools.git_rollback = helpers.define_tool(
     local commit = args.commit or "HEAD"
     _git({ "checkout", commit, "--", args.filepath }):then_(function(r)
       if r.code == 0 then
+        helpers.reload_buffers_for(args.filepath)
         on_success(("已回滚 %s 到 %s"):format(args.filepath, commit))
       else
         on_error(r.output)

@@ -105,7 +105,9 @@ local function _append_content(lines, message)
   local rendered = markdown_view.render(message.content)
   for _, l in ipairs(rendered) do
     if l.text ~= "" then
-      lines[#lines + 1] = l.text
+      -- 去掉行首空白：正文（含 Markdown 代码/缩进段落）不应因缩进被误判为推理或工具折叠块。
+      -- 只有推理/工具块由 _append_fold_block 统一添加缩进，才是 ex 折叠的目标；正文顶格不折叠。
+      lines[#lines + 1] = l.text:gsub("^%s+", "")
     end
   end
 end

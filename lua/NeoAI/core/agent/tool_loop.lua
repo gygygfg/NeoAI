@@ -57,19 +57,19 @@ local function _execute_single(agent, tool_call, tool_service, opts)
   local fn = tool_call["function"]
   local name = fn and fn.name or "unknown"
   local args = _parse_arguments(fn and fn.arguments or "{}")
-  local start_ms = vim.uv.hrtime() / 1e6
   local logger = require("NeoAI.kernel.logger")
+  -- 可暂停计时器：从工具真正开始执行（审批通过 / 直接执行）才计时，
+  -- 等待用户审批或 ask_user 回答期间暂停，耗时与超时均不含等待时间。
+  local timer = require("NeoAI.utils.timer").create()
+  local exec_opts = vim.tbl_extend("force", {}, opts or {}, { timer = timer })
   logger.warn("[tool_loop] 执行工具 %s round=%s", name, tostring(agent._round_seq or ""))
 
   event_bus.emit(events.TOOL_EXECUTION_STARTED, {
-    agent_id = agent.id, name = name, args = args, tool_call_id = tool_call.id,
+    agent_id = agent.id, name = name, args = args, tool_call_id = tool_call.id, timer = timer,
   })
 
-  return tool_service.execute(agent, name, args, tool_call.id, {
-    is_sub_agent = opts.is_sub_agent,
-    signal = agent.signal,
-  }):then_(function(result)
-    local duration_ms = vim.uv.hrtime() / 1e6 - start_ms
+  return tool_service.execute(agent, name, args, tool_call.id, exec_opts):then_(function(result)
+    local duration_ms = timer:elapsed()
     logger.warn("[tool_loop] 工具完成 %s 耗时 %dms", name, math.floor(duration_ms))
     local result_str = result
     if type(result) ~= "string" then
@@ -82,7 +82,7 @@ local function _execute_single(agent, tool_call, tool_service, opts)
     })
     return { tool_call_id = tool_call.id, name = name, result_str = result_str, duration_ms = duration_ms }
   end, function(err)
-    local duration_ms = vim.uv.hrtime() / 1e6 - start_ms
+    local duration_ms = timer:elapsed()
     local logger = require("NeoAI.kernel.logger")
     logger.warn("[tool_loop] 工具失败 %s 耗时 %dms err=%s", name, math.floor(duration_ms), tostring(err and err.message or err))
     local json = require("NeoAI.utils.json")

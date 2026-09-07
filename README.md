@@ -19,6 +19,7 @@
 - **纯lua编写** — 无需安装额外的依赖
 - **⚠️⚠️⚠️使用curl发送请求** 环境变量内没有curl可能无法发送请求
 - **多模态图像** — `read_image` 工具读入 PNG/JPEG/WebP/GIF 并注入多模态模型（内容寻址附件存储 + 请求期像素/字节预算 offload，模型不支持图像时自动降级为文本）
+- **lualine 状态栏集成** — 在聊天窗口中用 `nvim-lualine` 实时展示大模型用量、缓存命中率与上下文容量（模型/用量/缓存/容量等段可自定义）
 
 ---
 
@@ -298,6 +299,80 @@ ai = {
 > 图像内容寻址存储于 `attachments.path`，会话消息只保存不可变引用；发送请求时才解析为
 > `image_url`（data URL）按模型 route 的像素/字节预算注入，超限的**最旧**图像被替换为
 > 文本占位。模型不支持图像时自动降级，不阻塞调用。
+
+### lualine 状态栏集成
+
+NeoAI 会把当前 Agent 的大模型用量、缓存命中率、上下文容量等信息暴露给 `nvim-lualine`。
+支持两种方式：
+
+**方式一：自动（推荐）** — 无需任何配置。只要检测到 nvim-lualine，NeoAI 会自动把
+`neoai` 扩展注入其配置：lualine 处于 `setup()` 之后时在 `NeoAI.setup()` 注入，
+否则延迟到聊天窗口打开时注入（此时 lualine 必然已可用）。
+
+**方式二：手动扩展** — 在 lualine 配置里显式声明（功能相同，适合喜欢显式配置的人）：
+
+```lua
+require("lualine").setup({
+  extensions = { "neoai" },
+  -- ...其余 lualine 配置
+})
+```
+
+扩展在聊天窗口（`filetype` 为 `neoai` / `neoai_input` / `neoai_status`）自动用 NeoAI
+状态栏替换默认状态栏；对扩展代码的改动需重新执行一次 setup 或重启生效。
+
+**方式三：手动组件** — 保留自己的状态栏，只把 NeoAI 信息作为一段塞进任意 section：
+
+```lua
+require("lualine").setup({
+  sections = {
+    lualine_c = {
+      { function() return require("NeoAI.services.status").component() end },
+    },
+  },
+})
+```
+
+> 若自动注入因启动顺序没生效，可手动调用 `NeoAI.enable_statusline()` 或
+> `require("NeoAI.services.status").ensure_lualine_extension()`。
+
+只接管聊天**主消息窗口**（`filetype == neoai`），输入框等其它窗口保留你自己
+的 lualine，不被污染。展示刻意简洁，干净分行、无重复、无成片截断：
+
+- **第 1 行（winbar）** 身份：`[模式] 模型 状态`
+- **第 2 行（statusline）** 指标：`↑prompt ↓completion 缓存命中x% 剩余容量y%`
+
+各段默认链接到**鲜艳的 nvim 高亮组**（`Title`/`Type`/`Number`/`String`/`Statement`/`Function`/`Keyword`），
+active 与 inactive 一致，杜绝无焦点时整行变灰（虚化）。
+
+关于多行：单独的 `statusline` 只能占一行（Vim 原生不支持换行）。NeoAI 用主消息窗口
+的 `winbar` 作为第二行，从而得到干净的两行；其余窗口保持单行。若只想一行，设 `ui.statusline.winbar = false`。
+
+```lua
+require("NeoAI").setup({
+  ui = {
+    statusline = {
+      enabled = true,                                   -- false → 组件返回空串
+      winbar = true,                                    -- 主聊天窗口顶部第二行（模式/模型/状态）
+      parts = { "mode", "model", "usage", "cache", "capacity" }, -- component() 拼接的段顺序
+      separator = " ",                                  -- 段间分隔符
+      colors = {                                        -- 各段链接的高亮组（去掉灰暗配色）
+        mode = "Title",        display = "Keyword",
+        model = "Type",        usage = "Number",
+        cache = "String",      capacity = "Statement",
+        state = "Function",    brand = "Title",
+      },
+    },
+  },
+})
+```
+
+相关公开 API：
+
+- `NeoAI.get_statusline_info()` — 返回当前 Agent 的用量/缓存/容量结构化数据
+- `NeoAI.get_statusline()` — 返回状态栏文本
+- `require("NeoAI.services.status").segment(name)` — 单个段文本（mode/model/usage/cache/capacity/state/display）
+- `:NeoAIStatusline` — 预览当前状态栏组件内容
 
 </details>
 

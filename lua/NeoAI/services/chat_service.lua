@@ -28,6 +28,12 @@ local state = {
   current_agent_id = nil,
 }
 
+-- 正忙时暂存的消息队列：agent_id -> { { content, opts, d = Deferred }, ... }。
+-- AI 忙碌（generating / tool_running）期间用户发送的消息先入队，当前 turn 结束
+-- （Agent 回到非忙碌状态）后再逐条发送，而不是直接提示失败。
+local pending_queue = {}
+local queue_state_sub = nil -- 监听 Agent 状态变化以在 turn 结束时机性刷新的订阅
+
 -- ========== 私有函数 ==========
 
 --- 判断 Agent 是否已被销毁
@@ -103,6 +109,83 @@ local function _persist_agent(agent)
   session_store.persist(session)
 end
 
+-- ========== 正忙暂存队列 ==========
+
+--- Agent 是否处于忙碌状态（generating / tool_running）
+--- @param agent table
+--- @return boolean
+local function _is_busy(agent)
+  return agent.state == "generating" or agent.state == "tool_running"
+end
+
+--- 发送一条消息（不做忙碌检查：调用方需保证 agent 空闲）
+--- @param agent table
+--- @param content string
+--- @param opts table|nil
+--- @return Deferred
+local function _run_message(agent, content, opts)
+  event_bus.emit(events.MESSAGE_SENT, { agent_id = agent.id, content = content })
+  return runtime.run(agent, content):then_(function(resp)
+    _persist_agent(agent)
+    return resp
+  end, function(err)
+    _persist_agent(agent)
+    return async.reject(err)
+  end)
+end
+
+--- 发送队列中的下一条暂存消息（Agent 空闲时调用；每次只发一条，
+--- 发送后 Agent 重新忙碌，待其再次空闲时由状态事件驱动发送下一条）
+--- @param agent_id string
+local function _flush_pending(agent_id)
+  local q = pending_queue[agent_id]
+  if not q or #q == 0 then
+    pending_queue[agent_id] = nil
+    return
+  end
+  local agent = runtime.get(agent_id)
+  if not agent or agent_mod_is_disposed(agent) then
+    -- Agent 已被销毁：拒绝所有仍在等待的消息，避免永久挂起
+    for _, item in ipairs(q) do
+      item.d:reject({ kind = "cancelled", message = "会话已关闭，暂存消息已取消" })
+    end
+    pending_queue[agent_id] = nil
+    return
+  end
+  if _is_busy(agent) then return end
+  local item = table.remove(q, 1)
+  if #q == 0 then pending_queue[agent_id] = nil end
+  _run_message(agent, item.content, item.opts):then_(
+    function(resp) item.d:resolve(resp) end,
+    function(err) item.d:reject(err) end
+  )
+end
+
+--- 确保已监听 Agent 状态变化（幂等）：Agent 回到非忙碌状态时刷新暂存队列
+local function _ensure_queue_observer()
+  if queue_state_sub then return end
+  queue_state_sub = event_bus.on(events.AGENT_STATE_CHANGED, function(data)
+    if not data or not data.agent_id then return end
+    local agent = runtime.get(data.agent_id)
+    if not agent or _is_busy(agent) then return end
+    _flush_pending(data.agent_id)
+  end)
+end
+
+--- 暂存一条消息：AI 忙碌时不拒绝，而是入队，待本轮 turn 结束后发送
+--- @param agent table
+--- @param content string
+--- @param opts table|nil
+--- @return Deferred 等消息真正发送后 resolve，失败则 reject
+local function _enqueue_message(agent, content, opts)
+  _ensure_queue_observer()
+  local d = async.Deferred.new()
+  pending_queue[agent.id] = pending_queue[agent.id] or {}
+  table.insert(pending_queue[agent.id], { content = content, opts = opts, d = d })
+  -- 静默暂存：不提示失败、也不提示“正忙”，本轮结束后自动发送
+  return d
+end
+
 --- 组装会话链消息：祖先链（根→父）全部消息 + 选中会话截止本轮 + 下游单子链全部消息。
 --- 从树界面进入会话时，仅打开选中会话会丢失分支上下文；这里沿会话树
 --- 先向上遍历到首轮，再向下延展到分裂分支或末尾，拼出完整线性对话。
@@ -157,14 +240,11 @@ function M.send_message(content, opts)
     return async.resolve(nil)
   end
   local agent = _get_or_create_agent(opts)
-  event_bus.emit(events.MESSAGE_SENT, { agent_id = agent.id, content = content })
-  return runtime.run(agent, content):then_(function(resp)
-    _persist_agent(agent)
-    return resp
-  end, function(err)
-    _persist_agent(agent)
-    return async.reject(err)
-  end)
+  -- AI 正忙：不入库、不报错，暂存起来等本轮 turn 结束后再发送。
+  if _is_busy(agent) then
+    return _enqueue_message(agent, content, opts)
+  end
+  return _run_message(agent, content, opts)
 end
 
 --- 获取当前 Agent
@@ -221,7 +301,7 @@ function M.detach_window(win_id)
     runtime.dispose(agent)
     if session_id then
       local todo_mod = require("NeoAI.tools.builtin.todo")
-      todo_mod.cleanup(session_id)
+      todo_mod.cleanup(agent)
     end
     state.agents[agent_id] = nil
     if session_id and state.sessions[session_id] == agent_id then
@@ -229,6 +309,8 @@ function M.detach_window(win_id)
     end
   end
   state.windows[win_id] = nil
+  -- 窗口关闭时若仍有暂存消息（Agent 正忙时被入队），Agent 已销毁，拒绝它们以免永久挂起
+  _flush_pending(agent_id)
   -- 窗口关闭时清理正在展示/排队的审批，释放串行审批槽位，
   -- 否则 approval_showing 残留 true 会让后续工具审批只入队不弹窗，循环卡死。
   local tool_service = require("NeoAI.services.tool_service")
@@ -430,9 +512,17 @@ function M.load_session(session_id, opts)
   -- 还原计划模式状态（计划模式提示段 + 标志）
   local plan_mode = require("NeoAI.tools.builtin.plan_mode")
   plan_mode.restore(agent, session.metadata and session.metadata.plan)
+  -- 还原累计用量（含前缀缓存命中/未命中统计），避免重开会话后缓存命中率归零
+  local meta = session.metadata or {}
+  if meta.usage and type(meta.usage) == "table" then
+    agent.usage = vim.deepcopy(meta.usage)
+  end
   -- 还原待办清单（供 todo_read / 系统提示注入）
   local todo_mod = require("NeoAI.tools.builtin.todo")
   todo_mod.seed(session.id, session.metadata and session.metadata.todos)
+  -- 恢复 agent 级待办系统提示段：否则重开会话后的系统提示缺少「当前任务清单」段，
+  -- 与关闭前不一致，前缀缓存从系统提示起即失效（缓存命中率骤降）。对齐 plan_mode.restore。
+  todo_mod.ensure_registered(agent)
   state.sessions = state.sessions or {}
   state.sessions[session.id] = agent.id
   state.agents[agent.id] = { session_id = session.id }
@@ -450,6 +540,13 @@ function M.reset()
   state.agents = {}
   state.sessions = {}
   state.current_agent_id = nil
+  -- 清理暂存队列与状态监听，避免测试间/重载后残留并重复发送
+  for _, q in pairs(pending_queue) do
+    for _, item in ipairs(q) do
+      item.d:reject({ kind = "cancelled", message = "会话已重置，暂存消息已取消" })
+    end
+  end
+  pending_queue = {}
 end
 
 return M

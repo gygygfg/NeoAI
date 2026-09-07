@@ -10,18 +10,33 @@ local M = {}
 
 -- ========== 基础 ==========
 
+--- 展开路径中的 shell 风格的别名：开头的 ~ / ~user（及 $VAR 环境变量）。
+--- 仅当 path 以 ~ 或 $ 开头时才展开；纯相对路径保持不变（保留 cwd 语义）。
+--- 需在主线程调用（内部用 vim.fn.expand）。
+--- @param path string
+--- @return string
+function M.expand(path)
+  if type(path) ~= "string" or path == "" then return path end
+  local c = path:sub(1, 1)
+  if c == "~" or c == "$" then
+    local ok, r = pcall(vim.fn.expand, path)
+    if ok and r and r ~= "" then return r end
+  end
+  return path
+end
+
 --- 判断文件是否存在
 --- @param path string
 --- @return boolean
 function M.exists(path)
-  return vim.fn.filereadable(path) == 1
+  return vim.fn.filereadable(M.expand(path)) == 1
 end
 
 --- 判断目录是否存在
 --- @param path string
 --- @return boolean
 function M.is_dir(path)
-  return vim.fn.isdirectory(path) == 1
+  return vim.fn.isdirectory(M.expand(path)) == 1
 end
 
 --- 确保目录存在（递归创建）

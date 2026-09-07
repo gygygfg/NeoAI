@@ -582,6 +582,33 @@ tests.suite("tools", function(_, it)
     cleanup_test_buffers({ buf, b2, b3 }, {})
   end)
 
+  it("reload_buffers_for 直写复盘已打开的窗口 buffer（BUG 回归）", function(t)
+    local helpers = require("NeoAI.tools.builtin.tool_helpers")
+    local fs = require("NeoAI.utils.fs")
+    local path = "/tmp/neoai_reload_open.lua"
+    cleanup_test_buffers({}, { path })
+    fs.write_file(path, "local foo = 1\n")
+    -- 模拟用户“已打开”的窗口 buffer
+    local buf = vim.fn.bufadd(path)
+    vim.fn.bufload(buf)
+    t.true_(vim.deep_equal({ "local foo = 1" }, vim.api.nvim_buf_get_lines(buf, 0, -1, false)))
+    -- AI 直写磁盘后，reload_buffers_for 应把窗口 buffer 更新为磁盘内容
+    fs.write_file(path, "local bar = 2\n")
+    helpers.reload_buffers_for(path)
+    t.true_(vim.deep_equal({ "local bar = 2" }, vim.api.nvim_buf_get_lines(buf, 0, -1, false)), "打开中的 buffer 应反映磁盘最新内容")
+    -- 无关路径不应误伤
+    fs.write_file("/tmp/neoai_reload_other.txt", "x\n")
+    helpers.reload_buffers_for("/tmp/neoai_reload_other.txt")
+    t.true_(vim.deep_equal({ "local bar = 2" }, vim.api.nvim_buf_get_lines(buf, 0, -1, false)), "不同文件的 buffer 不受影响")
+    vim.fn.delete("/tmp/neoai_reload_other.txt")
+    -- 未保存改动绝不被覆盖
+    fs.write_file(path, "local baz = 3\n")
+    pcall(vim.api.nvim_buf_set_text, buf, 0, 0, -1, -1, { "user unsaved" })
+    helpers.reload_buffers_for(path)
+    t.true_(vim.deep_equal({ "user unsaved" }, vim.api.nvim_buf_get_lines(buf, 0, -1, false)), "未保存改动不应被覆盖")
+    cleanup_test_buffers({ buf }, { path })
+  end)
+
   it("lsp LocationLink 结果正常解析不挂起（BUG-3 回归）", function(t)
     local config_store = require("NeoAI.kernel.config_store")
     config_store.load({ tools = { approval = { mode = "auto_allow" }, lsp = { timeout_ms = 500 } } })

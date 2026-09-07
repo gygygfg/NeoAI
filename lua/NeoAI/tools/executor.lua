@@ -4,10 +4,12 @@
 --- 执行结果统一转为字符串（供 Agent 回传）。
 
 local async = require("NeoAI.utils.async")
+local tool_timer = require("NeoAI.utils.timer")
 local json = require("NeoAI.utils.json")
 local registry = require("NeoAI.tools.registry")
 local validator = require("NeoAI.tools.validator")
 local config_store = require("NeoAI.kernel.config_store")
+local fs = require("NeoAI.utils.fs")
 
 local M = {}
 
@@ -39,6 +41,23 @@ local function _normalize_arguments(tool_name, args)
     end
   end
   return normalized
+end
+
+-- 携带路径语义的参数名：进入工具前展开 ~ / $VAR（与内容/文本类参数区分开，
+-- 避免把 description/content/query 等误当成路径）。
+local PATH_KEYS = { "path", "filepath", "file_path", "dirs", "dir" }
+
+--- 展开参数中路径型字段的 ~ 别名，使 ~/... 等相对主目录的路径可正常读写
+--- @param args table
+--- @return table
+local function _expand_path_args(args)
+  if type(args) ~= "table" then return args end
+  for _, k in ipairs(PATH_KEYS) do
+    if type(args[k]) == "string" then
+      args[k] = fs.expand(args[k])
+    end
+  end
+  return args
 end
 
 --- 统一执行工具函数
@@ -99,27 +118,35 @@ local function _call_tool(tool, args, ctx)
   return d
 end
 
---- 超时包装
---- @param d Deferred
---- @param timeout_ms number|nil -1 = 无超时
+--- 执行工具并基于"活跃时间"做超时。
+--- 用可暂停计时器（ctx.timer）替代固定墙钟超时：等待用户审批/提问的暂停期间
+--- 不累计耗时、不消耗超时预算。无 ctx.timer 时（直接调用）自建一个。
+--- @param tool table
+--- @param args table
+--- @param ctx table
+--- @param timer table 可暂停计时器
 --- @return Deferred
-local function _with_timeout(d, timeout_ms)
-  if not timeout_ms or timeout_ms < 0 then return d end
+local function _execute_tool(tool, args, ctx, timer)
+  local timeout = ctx.timeout_ms or tool.timeout or config_store.get("tools.executor.timeout_ms") or 30000
   local wrapped = async.Deferred.new()
   local settled = false
-  vim.defer_fn(function()
-    if not settled then
-      settled = true
-      wrapped:reject({ kind = "timeout", message = "工具执行超时 (" .. tostring(timeout_ms) .. "ms)" })
-    end
-  end, timeout_ms)
+  -- 先设置超时回调再 start：budget<=0 时 start 会同步触发超时，避免回调缺失。
+  timer.on_timeout = function()
+    if settled then return end
+    settled = true
+    wrapped:reject({ kind = "timeout", message = "工具执行超时 (" .. tostring(timeout) .. "ms)" })
+  end
+  timer:start(timeout)
+  local d = _call_tool(tool, args, ctx)
   d:then_(function(v)
     if settled then return end
     settled = true
+    timer:stop()
     wrapped:resolve(v)
   end, function(e)
     if settled then return end
     settled = true
+    timer:stop()
     wrapped:reject(e)
   end)
   return wrapped
@@ -148,6 +175,8 @@ function M.execute(tool_name, raw_args, ctx)
 
   -- 参数规范化
   local args = _normalize_arguments(resolved, raw_args)
+  -- 展开路径字段的 ~ 别名（~/... ↔ 主目录）
+  args = _expand_path_args(args)
 
   -- schema 校验
   local valid, verr = validator.validate_parameters(tool.parameters, args)
@@ -160,21 +189,26 @@ function M.execute(tool_name, raw_args, ctx)
   local mode = ctx.approval_mode or config_store.get("tools.approval.mode") or "prompt"
   local needs_approval = validator.check_approval(resolved, args, approval_config, mode)
 
+  -- 可暂停计时器：tool_loop 在调用前已创建并注入 ctx.timer（用于展示活跃耗时）。
+  -- 直接调用（无 tool_loop，如测试）时自建一个，仅用于超时。
+  local timer = ctx.timer
+  if not timer then
+    timer = tool_timer.create()
+    ctx.timer = timer
+  end
+
   if needs_approval and not ctx.is_sub_agent then
     if ctx.tool_service then
-      -- 交由 tool_service 做审批 UI，审批通过后继续执行
+      -- 交由 tool_service 做审批 UI，审批通过后继续执行。
+      -- 计时器只在审批通过后才 start，因此等待审批的时间不计入耗时、也不消耗超时预算。
       return ctx.tool_service.approve_and_execute(resolved, args, ctx, function()
-        local d = _call_tool(tool, args, ctx)
-        local timeout = ctx.timeout_ms or tool.timeout or config_store.get("tools.executor.timeout_ms") or 30000
-        return _with_timeout(d, timeout)
+        return _execute_tool(tool, args, ctx, timer)
       end)
     end
   end
 
   -- 直接执行
-  local d = _call_tool(tool, args, ctx)
-  local timeout = ctx.timeout_ms or tool.timeout or config_store.get("tools.executor.timeout_ms") or 30000
-  return _with_timeout(d, timeout)
+  return _execute_tool(tool, args, ctx, timer)
 end
 
 --- 结果字符串化

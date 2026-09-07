@@ -29,7 +29,7 @@ function M.open(title)
     width = width,
     height = height,
     col = math.floor((vim.o.columns - width) / 2),
-    row = 7,
+    row = 2,
     style = "minimal",
     border = "rounded",
     title = title or "🤔 思考过程",

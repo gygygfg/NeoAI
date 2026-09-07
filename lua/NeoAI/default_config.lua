@@ -183,6 +183,22 @@ local DEFAULT_CONFIG = {
       foldlevel = 99,
       auto_close_on_select = true, -- 从树选择会话打开聊天后自动关闭树窗口
     },
+    statusline = {
+      enabled = true, -- 是否让 lualine 状态栏组件输出内容（false → 组件返回空串）
+      winbar = true, -- 是否在聊天主窗口顶部渲染第二行（模式/显示模式/模型/状态）；false 只保留一行
+      parts = { "mode", "model", "usage", "cache", "capacity" }, -- component() 拼接的段顺序
+      separator = " ", -- 段间分隔符
+      colors = { -- 各段链接的 nvim 高亮组（避免默认灰暗配色）
+        mode = "Title",
+        display = "Keyword",
+        model = "Type",
+        usage = "Number",
+        cache = "String",
+        capacity = "Statement",
+        state = "Function",
+        brand = "Title",
+      },
+    },
   },
 
   keymaps = {

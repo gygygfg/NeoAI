@@ -49,16 +49,20 @@ ask_user_tools.ask_user = helpers.define_tool(
     end
 
     local settled = false
+    -- 等待用户回答的耗时不计入工具执行时间/超时：暂停可暂停计时器，回答/取消后恢复。
+    local timer = ctx and ctx.timer
     local function finish_ok(answer)
       if settled then return end
       settled = true
       pending = false
+      if timer and timer.resume then pcall(timer.resume, timer) end
       on_success(("用户回答: %s"):format(tostring(answer)))
     end
     local function finish_err(err)
       if settled then return end
       settled = true
       pending = false
+      if timer and timer.resume then pcall(timer.resume, timer) end
       on_error(err)
     end
 
@@ -68,6 +72,8 @@ ask_user_tools.ask_user = helpers.define_tool(
       return
     end
     pending = true
+    -- 真正开始等待用户前暂停计时器：等待时间不累计活跃耗时、不消耗超时预算。
+    if timer and timer.pause then pcall(timer.pause, timer) end
 
     -- Agent 取消时立即终止等待（关闭 UI + 拒绝）
     local unsub

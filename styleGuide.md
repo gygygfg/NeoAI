@@ -94,8 +94,7 @@ NeoAI/
 │   │   ├── tool_approval.lua # 工具审批弹窗
 │   │   ├── sub_agent_dock.lua# 子 Agent 监控面板
 │   │   ├── markdown_view.lua # Markdown 渲染器
-│   │   ├── fold.lua          # 折叠组件
-│   │   └── status_float.lua  # 状态浮窗
+│   │   └── fold.lua          # 折叠组件
 │   └── keymap.lua            # 按键映射（统一配置入口）
 │
 ├── tools/                      # 工具系统
@@ -1034,7 +1033,6 @@ async.all({ deferred1, deferred2 })
 | `tools/builtin/ask_user.lua` | 向用户提问工具（UI seam + vim.ui.input 回退）      |
 | `tools/builtin/todo.lua`     | 待办清单（整表替换语义 + 系统提示注入）  |
 | `ui/components/fold.lua`     | 折叠组件                                 |
-| `ui/components/status_float.lua` | 状态浮窗                              |
 
 ---
 

@@ -79,12 +79,14 @@ file_tools.edit_file = helpers.define_tool(
 
     if mode == "write" then
       _pipe(fs.write_file_async(filepath, args.content or ""), function()
+        helpers.reload_buffers_for(filepath)
         on_success(("文件已写入: %s (%d 字节)"):format(filepath, #(args.content or "")))
       end, on_error)
       return
     end
     if mode == "append" then
       _pipe(fs.append_file_async(filepath, args.content or ""), function()
+        helpers.reload_buffers_for(filepath)
         on_success("已追加到: " .. filepath)
       end, on_error)
       return
@@ -130,6 +132,7 @@ file_tools.edit_file = helpers.define_tool(
         return "ok"
       end, filepath .. "\3" .. table.concat(packed, "\2"))
     end):then_(function()
+      helpers.reload_buffers_for(filepath)
       on_success("文件已编辑: " .. filepath)
     end, function(e)
       on_error(e.message or tostring(e))
@@ -264,6 +267,7 @@ file_tools.delete_file = helpers.define_tool(
   },
   function(args, on_success, on_error)
     _pipe(fs.delete_file_async(args.filepath), function()
+      helpers.reload_buffers_for(args.filepath)
       on_success("文件已删除: " .. args.filepath)
     end, on_error)
   end,

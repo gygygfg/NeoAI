@@ -141,6 +141,16 @@ local function _run_generation(agent, opts)
 
       return _finish_idle(response)
     end, function(err)
+      -- 用户取消（ESC）：正常停止而非错误。错误回调在 abort 时也会被触发，
+      -- 若按普通错误处理会把状态覆盖为 error、并发 GENERATION_ERROR，
+      -- 导致聊天界面弹"发送失败"提示。这里屏蔽并转为 benign 取消信号；
+      -- 同时把状态复位为 idle，否则 `_run_generation` 已置的 "generating"
+      -- （或 abort 的 "aborted"）会让同一 Agent 在取消后继续发送时卡在 busy。
+      local is_cancel = err and (err.kind == "aborted" or err.kind == "cancelled")
+      if is_cancel then
+        agent:set_state("idle")
+        return async.reject({ kind = "cancelled", message = err.message or "已取消" })
+      end
       agent:set_state("error")
       event_bus.emit(events.GENERATION_ERROR, { agent_id = agent.id, error = err })
       return async.reject(err)
@@ -223,6 +233,12 @@ end
 function M.run(agent, content)
   if agent_mod.is_busy(agent) then
     return async.reject({ kind = "busy", message = "Agent 正忙" })
+  end
+  -- 上一次生成被取消（ESC）后，取消信号永久处于 aborted：若不重置，新一轮
+  -- request.send_stream 会因信号已取消而立即失败（"operation aborted"），
+  -- 表现为"停止后继续发送报错"。这里在开启新一步前检测并重置为全新信号。
+  if agent.signal:aborted() then
+    agent.signal = async.create_signal()
   end
   -- 新一步之前先做上下文压缩检查（对齐 deepseek-harness 的 pre-step 压力检查）：
   -- 已到达压力阈值则先折叠旧历史，再派生请求，复用未变的前缀缓存。

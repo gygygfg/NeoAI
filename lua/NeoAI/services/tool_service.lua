@@ -263,6 +263,7 @@ function M.execute(agent, tool_name, args, tool_call_id, opts)
     sub_agent_id = opts.sub_agent_id,
     tool_service = M,
     approval_mode = _current_mode(),
+    timer = opts.timer, -- 可暂停计时器（tool_loop 注入，用于展示活跃耗时并排除等待时间）
   }
 
   return executor.execute(tool_name, args, ctx)
