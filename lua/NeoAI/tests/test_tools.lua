@@ -123,7 +123,7 @@ tests.suite("tools", function(_, it)
     t.ok(grouped.system)
     t.ok(grouped.lsp)
     t.eq(1, #grouped.file)
-    t.eq(7, #packer.get_all_packs())
+    t.eq(9, #packer.get_all_packs())
     t.not_nil(packer.pack_display_name("file"))
   end)
 

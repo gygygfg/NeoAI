@@ -176,6 +176,34 @@ log = {
 }
 ```
 
+### 2.8 `mcp`
+
+```lua
+mcp = {
+  enabled = true,
+  timeout_ms = 60000,
+  connect_timeout_ms = 20000,
+  reconnect = true,
+  cache_path = ".../NeoAI/mcp_cache.json",
+  servers = { /* 见 docs/mcp.md */ },
+  resources = { max_result_bytes = 100 * 1024 },
+}
+```
+
+### 2.9 `skills`
+
+```lua
+skills = {
+  enabled = true,
+  paths = { vim.fn.stdpath("config") .. "/skills", ".neoai/skills", ".claude/skills" },
+  max_skills_in_prompt = 20,
+  max_skill_bytes = 64 * 1024,
+  inject_mode = "list",       -- list | full | none
+  persist_loaded = false,
+  register_tools = true,
+}
+```
+
 ## 3. 计划模式（tools/plan_mode）
 
 计划模式作为 **per-agent 状态**（`agent.plan_mode`），激活时：

@@ -22,6 +22,8 @@
 - **lualine 状态栏集成** — 在聊天窗口中用 `nvim-lualine` 实时展示大模型用量、缓存命中率与上下文容量（模型/用量/缓存/容量等段可自定义）
 - **Herder 状态上报** — 在 Herder pane 内实时上报 Agent 作态（working/idle/blocked），多会话自动聚合，带严格递增 `--seq` 防并发回退
 - **工具参数接收面板** — 模型流式生成工具调用参数时实时打开「接收参数」悬浮窗（`tool_args_panel`），随分片更新、参数结束后自动关闭，与思考过程悬浮窗一致
+- **MCP 支持** — 通过 stdio / Streamable HTTP 连接外部 MCP 服务器，把远端 `tools`/`resources`/`prompts` 注册进工具系统（含预缓存 + 失败驱动的动态刷新，见 [docs/mcp.md](docs/mcp.md)）
+- **Skills 支持** — 扫描 SKILL.md 技能目录，把可用技能列表注入系统提示，模型用 `load_skill` 装载技能正文（Claude/opencode 风格，见 [docs/skills.md](docs/skills.md)）
 
 ---
 
@@ -255,6 +257,48 @@ require("NeoAI").setup({
     path = vim.fn.stdpath("cache") .. "/NeoAI/neoai.log",
     max_size = 10485760,
     max_backups = 5,
+  },
+
+  -- ===== MCP（Model Context Protocol）=====
+  mcp = {
+    enabled = true,                      -- 是否启用 MCP 客户端
+    timeout_ms = 60000,                  -- 单次 JSON-RPC 请求超时
+    connect_timeout_ms = 20000,          -- 连接/握手超时
+    reconnect = true,                    -- 连接失败/断开后重连
+    cache_path = vim.fn.stdpath("cache") .. "/NeoAI/mcp_cache.json", -- 工具描述预缓存
+    servers = {
+      -- [name] = {
+      --   transport = "stdio" | "http",
+      --   -- stdio：
+      --   command = "npx",
+      --   args = { "-y", "@modelcontextprotocol/server-filesystem", vim.fn.getcwd() },
+      --   env = {},
+      --   -- http：
+      --   url = "https://example.com/mcp",
+      --   headers = { ["Authorization"] = "Bearer ..." },
+      --   -- 通用：
+      --   expose = { tools = true, resources = true, prompts = true },
+      --   approval = { auto_allow = false },  -- 默认需审批（远端工具不可信）
+      --   plan_safe = false,                   -- 计划模式下是否放行
+      -- }
+    },
+    resources = { max_result_bytes = 100 * 1024 },
+  },
+
+  -- ===== Skills（技能目录 + SKILL.md）=====
+  skills = {
+    enabled = true,
+    paths = {
+      vim.fn.stdpath("config") .. "/skills",
+      vim.fn.stdpath("data") .. "/neoai/skills",
+      ".neoai/skills",
+      ".claude/skills",
+    },
+    max_skills_in_prompt = 20,           -- 系统提示列出技能数上限
+    max_skill_bytes = 64 * 1024,         -- load_skill 单技能内容上限
+    inject_mode = "list",                -- list | full | none
+    persist_loaded = false,              -- load_skill 是否注册 agent 级提示段常驻
+    register_tools = true,               -- 注册 list_skills / load_skill
   },
 
   -- ===== Herder 终端状态信号 =====
@@ -550,6 +594,33 @@ NeoAI 内置了 40+ 工具，AI 可在对话中自动调用，涵盖以下类别
 | `log_message`    | 记录日志消息     | ✅ 自动允许 |
 | `get_log_levels` | 获取可用日志级别 | ✅ 自动允许 |
 
+### 🔌 MCP 工具（远端服务器，按需启用）
+
+`mcp.servers.<name>` 配置的服务器会把其能力注册为工具，命名 `mcp__<server>__<tool>`。
+远端 `tools/list` → 每个远端工具一个 NeoAI 工具；`resources`/`prompts` → 每服务器各一个浏览工具。
+
+| 工具名（示例，`server`=配置名） | 描述 | 默认审批 |
+| ------------------------------ | ---- | -------- |
+| `mcp__<server>__<远端工具>`   | 调用 MCP 服务器的远端工具 | ❌ 需审批（`approval.auto_allow`） |
+| `mcp__<server>__list_resources` | 列出服务器资源（只读） | ✅ 自动允许 |
+| `mcp__<server>__read_resource`  | 读取指定资源（只读） | ❌ 需审批 |
+| `mcp__<server>__list_prompts`   | 列出提示模板（只读） | ✅ 自动允许 |
+| `mcp__<server>__get_prompt`     | 获取提示模板内容 | ❌ 需审批 |
+
+> **工具时序**：启动时先从 `mcp_cache.json` 预缓存注册（连接前可见）；连接/变更通知后动态刷新；
+> 因参数 schema 变化导致远端调用失败时标记 stale，下一轮发送前自动刷新并重绑定工具定义
+> （模型按最新 schema 重试）。详见 [docs/mcp.md](docs/mcp.md)。
+
+### 🧩 技能工具（Skills）
+
+| 工具名         | 描述                           | 默认审批    |
+| -------------- | ------------------------------ | ----------- |
+| `list_skills`  | 列出可用技能                   | ✅ 自动允许 |
+| `load_skill`   | 装载某技能正文给模型（SKILL.md）| ✅ 自动允许 |
+
+> 系统提示会注入「可用技能」清单（`skills.inject_mode`），模型可 `load_skill` 装载正文。
+> 详见 [docs/skills.md](docs/skills.md)。
+
 ---
 
 ## 🏗️ 架构
@@ -593,7 +664,13 @@ NeoAI/
 │   ├── tool_service.lua       # 工具服务（审批 + 调度 + 执行，串行审批队列）
 │   ├── model_service.lua      # 模型服务（list/set_active/prefetch）
 │   ├── status.lua             # 状态栏服务（lualine 集成，段拼接 + 高亮）
-│   └── herder.lua             # Herder 终端状态上报（working/idle/blocked）
+│   ├── herder.lua             # Herder 终端状态上报（working/idle/blocked）
+│   ├── skills.lua             # Skills 服务（SKILL.md 扫描 + frontmatter 解析 + 索引）
+│   └── mcp/                   # MCP 服务（客户端 + 传输 + 缓存 + 工具桥接）
+│       ├── client.lua         # JSON-RPC 2.0 客户端（id 关联/超时/通知/取消）
+│       ├── transports.lua     # 传输层（stdio / Streamable HTTP）
+│       ├── cache.lua          # 工具/资源/提示预缓存 + pending/stale 状态
+│       └── init.lua           # 管理器（连接/注册/动态刷新/失败驱动 stale）
 │
 ├── ui/                         # 表现层
 │   ├── window/                # 窗口管理（float/tab/split）
@@ -623,6 +700,7 @@ NeoAI/
 │       ├── tree_ops.lua       # Tree-sitter 工具
 │       ├── log_ops.lua        # 日志工具
 │       ├── plan.lua           # 子 Agent + 边界审核
+│       ├── skills.lua         # 技能工具（list_skills/load_skill + 提示段）
 │       └── tool_helpers.lua   # 工具定义辅助
 │
 ├── utils/                      # 纯工具库（零业务依赖）
@@ -643,7 +721,11 @@ NeoAI/
     ├── test_agent.lua         # Agent 层
     ├── test_tools.lua         # 工具层
     ├── test_services.lua      # 服务层
-    └── test_integration.lua   # 集成测试（mock server）
+    ├── test_integration.lua   # 集成测试（mock server）
+    ├── test_mcp_client.lua    # MCP JSON-RPC 客户端
+    ├── test_mcp_transport.lua # MCP 传输层（stdio/HTTP）
+    ├── test_mcp_bridge.lua    # MCP 管理器桥接（init→注册→调用）
+    └── test_skills.lua        # Skills（frontmatter/发现/装载）
 ```
 
 ### 设计要点
@@ -712,6 +794,8 @@ NeoAI 基于 Neovim 原生 `User` 自动命令实现事件驱动架构，事件�
 | [docs/sub_agent_system.md](docs/sub_agent_system.md)                       | 子 Agent 系统    |
 | [docs/configuration.md](docs/configuration.md)                             | 配置系统         |
 | [docs/chat_enhanced_usage.md](docs/chat_enhanced_usage.md)                 | 聊天增强使用指南 |
+| [docs/mcp.md](docs/mcp.md)                                                 | MCP 支持（传输/工具/时序） |
+| [docs/skills.md](docs/skills.md)                                           | Skills 支持（SKILL.md + load_skill） |
 
 ---
 

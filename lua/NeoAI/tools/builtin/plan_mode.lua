@@ -154,6 +154,12 @@ function M.visible_names(agent)
   for _, name in ipairs(extra) do
     if type(name) == "string" and name ~= "" then set[name] = true end
   end
+  -- MCP 服务器明确声明 plan_safe 的工具：在计划模式下也可用（只读调研场景）
+  for name, tool in pairs(require("NeoAI.tools.registry").list_as_map()) do
+    if tool.source == "mcp" and tool.mcp_plan_safe then
+      set[name] = true
+    end
+  end
   return set
 end
 

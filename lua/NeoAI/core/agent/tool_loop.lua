@@ -23,6 +23,12 @@ local MAX_ROUNDS = 1000
 -- 这条用户消息，而不是等整个工具循环彻底结束后才插入。
 local inject_user = nil
 
+-- 轮前刷新钩子：由 chat_service/mcp 注册（避免 core→service 反向依赖）。
+-- 工具循环每轮发送请求（_send_round）之前调用，返回 Deferred。用于在下一轮模型
+-- 请求前刷新「因 schema 变化而 stale」的 MCP 工具定义并重绑定 agent.tools，
+-- 使下一 Turn 模型看到最新工具签名（失败驱动的时序保证）。
+local pre_round_refresh = nil
+
 -- 达到轮数上限时写入 agent 消息队列的停止说明（chat 界面经 MESSAGE_ADDED 直接可见）
 local LOOP_LIMIT_MESSAGE = "⚠️ 工具循环达到最大轮数限制（" .. tostring(MAX_ROUNDS) .. "），已停止继续执行。"
 
@@ -144,10 +150,27 @@ function M._tool_definitions(agent)
   return out
 end
 
+-- 前向声明：_send_round 需在定义前引用 _do_send_round（Lua 局部作用域限制，
+-- 前向引用会绕过局部声明而解析到 global nil）。故先声明后赋函数体。
+local _do_send_round
+
 --- 发送一次请求（带持久流处理器 + 溢出恢复）
 --- @param agent table
 --- @return Deferred resolve({ next_calls = table|nil, response = table })
 local function _send_round(agent)
+  -- 轮前刷新：若 MCP 工具因 schema 变化被标记 stale，先刷新定义并重绑定 agent.tools，
+  -- 确保下一轮模型看到的工具签名与服务器一致（失败驱动的时序保证）。
+  local refresh_d = M.pre_round_refresh(agent)
+  if refresh_d then
+    return refresh_d:then_(function() return _do_send_round(agent) end)
+  end
+  return _do_send_round(agent)
+end
+
+--- 实际发送一轮请求
+--- @param agent table
+--- @return Deferred
+_do_send_round = function(agent)
   local recovery = require("NeoAI.core.agent.recovery")
   local proc = stream_mod.create(agent)
   local start_ms = vim.uv.hrtime() / 1e6
@@ -187,10 +210,24 @@ function M.set_inject_user(fn)
   inject_user = fn
 end
 
+--- 注册轮前刷新钩子（由 chat_service/mcp 调用；nil 清除）
+--- @param fn function(agent) -> Deferred|nil
+function M.set_pre_round_refresh(fn)
+  pre_round_refresh = fn
+end
+
 --- 在轮末触发一次 pending 注入（工具循环每轮结束调用；也可手动复用）
 --- @param agent table
 function M.inject_pending(agent)
   if inject_user then inject_user(agent) end
+end
+
+--- 在轮前触发一次刷新钩子（工具循环每轮发送前调用；返回 Deferred）
+--- @param agent table
+--- @return Deferred|nil
+function M.pre_round_refresh(agent)
+  if pre_round_refresh then return pre_round_refresh(agent) end
+  return nil
 end
 
 --- 运行工具循环

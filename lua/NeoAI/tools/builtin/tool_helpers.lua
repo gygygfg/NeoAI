@@ -7,6 +7,10 @@ local M = {}
 --- ensure_buffer 后台加载的 buffer 集合（bufnr -> true）
 local bg_loaded = {}
 
+--- Neovim >= 0.13 起由内置文件监听（autoread）自动把外部改动的文件重载进 buffer，
+--- 无需手动同步；更早版本依赖 sync_buffer_from_disk / reload_buffers_for。
+local use_autoread = vim.fn.has("nvim-0.13") == 1
+
 --- 构造工具定义
 --- @param name string
 --- @param description string
@@ -132,6 +136,7 @@ end
 --- @param bufnr number
 --- @return boolean
 function M.sync_buffer_from_disk(bufnr)
+  if use_autoread then return true end -- >=0.13: 由 autoread 自动重载
   if not vim.api.nvim_buf_is_loaded(bufnr) then return true end
   if vim.bo[bufnr].modified then return true end -- 有未保存改动，绝不覆盖
   local filepath = vim.api.nvim_buf_get_name(bufnr)
@@ -165,6 +170,7 @@ end
 --- 过期内容（看不见 AI 的修改、按旧行号操作读错位置）的问题。
 --- @param filepath string
 function M.reload_buffers_for(filepath)
+  if use_autoread then return end -- >=0.13: 由 autoread 自动重载
   if not filepath or filepath == "" then return end
   local abs = vim.fn.fnamemodify(filepath, ":p")
   for _, buf in ipairs(vim.api.nvim_list_bufs()) do

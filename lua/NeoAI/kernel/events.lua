@@ -106,6 +106,16 @@ M.CONFIG_CHANGED = "config:changed"
 M.PLUGIN_INITIALIZED = "plugin:initialized"
 M.PLUGIN_SHUTDOWN = "plugin:shutdown"
 
+-- ========== MCP ==========
+M.MCP_CONNECTING = "mcp:connecting"
+M.MCP_READY = "mcp:ready"
+M.MCP_ERROR = "mcp:error"
+M.MCP_DISCONNECTED = "mcp:disconnected"
+M.MCP_TOOLS_UPDATED = "mcp:tools_updated"
+
+-- ========== Skills ==========
+M.SKILLS_UPDATED = "skills:updated"
+
 -- ========== 日志 ==========
 M.LOG_MESSAGE = "log:message"
 

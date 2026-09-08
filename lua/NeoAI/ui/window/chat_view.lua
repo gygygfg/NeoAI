@@ -548,6 +548,12 @@ local function _create_input_window()
   vim.api.nvim_win_set_height(win, _input_idle_height())
   vim.wo[win].winfixheight = true
   vim.wo[win].wrap = false
+  -- 抑制折叠：输入窗口由 :belowright split 从聊天主窗口分裂而来，会继承其
+  -- foldmethod=expr / foldexpr / foldtext。用户在输入框输入多行缩进内容时，
+  -- 缩进行会被 NeoAI 的 expr 折叠误判为"推理块"并收成「🤔 思考过程」折叠，
+  -- 导致输入内容看似被折叠。输入框是纯文本输入区，始终禁用折叠。
+  vim.wo[win].foldenable = false
+  vim.wo[win].foldmethod = "manual"
   return win
 end
 

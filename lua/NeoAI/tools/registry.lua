@@ -56,6 +56,26 @@ function M.register_many(tools)
   return result
 end
 
+--- 更新工具定义（覆盖同名工具，用于 MCP 工具刷新等热更新场景）
+--- @param tool table 工具定义（与 register 同构）
+--- @return boolean, string|nil
+function M.update(tool)
+  local ok, err = _validate(tool)
+  if not ok then return false, err end
+  state.tools[tool.name] = tool
+  return true
+end
+
+--- 删除工具定义
+--- @param name string
+--- @return boolean
+function M.remove(name)
+  if state.tools[name] == nil then return false end
+  state.tools[name] = nil
+  state.approval_overrides[name] = nil
+  return true
+end
+
 --- 获取工具定义
 --- @param name string
 --- @return table|nil

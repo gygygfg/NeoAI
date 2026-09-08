@@ -173,10 +173,16 @@ function M.execute(tool_name, raw_args, ctx)
   end
   local tool = registry.get(resolved)
 
-  -- 参数规范化
-  local args = _normalize_arguments(resolved, raw_args)
-  -- 展开路径字段的 ~ 别名（~/... ↔ 主目录）
-  args = _expand_path_args(args)
+  -- 参数规范化：MCP 工具跳过别名改写与路径展开。
+  -- 远端工具的 schema 由服务器权威定义，本地 alias（file→filepath 等）会破坏参数名，
+  -- 且服务器会校验 arguments 与 inputSchema（未知参数报错）。路径语义也归属服务器。
+  local is_mcp = tool and tool.source == "mcp"
+  local args = raw_args
+  if not is_mcp then
+    args = _normalize_arguments(resolved, raw_args)
+    -- 展开路径字段的 ~ 别名（~/... ↔ 主目录）
+    args = _expand_path_args(args)
+  end
 
   -- schema 校验
   local valid, verr = validator.validate_parameters(tool.parameters, args)

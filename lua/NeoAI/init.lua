@@ -162,6 +162,12 @@ function M.setup(user_config)
   -- 纯函数：合并 + 校验，返回不可变配置
   config_store.load(user_config or {})
 
+  -- Neovim >= 0.13 起由 autoread 自动把外部改动的文件重载进 buffer，
+  -- 替代内置工具写盘后的手动缓冲区同步；更早版本走 sync_buffer_from_disk。
+  if vim.fn.has("nvim-0.13") == 1 then
+    vim.opt.autoread = true
+  end
+
   -- 内核引导：事件常量表、日志、生命周期
   kernel.bootstrap()
 
@@ -170,6 +176,17 @@ function M.setup(user_config)
 
   -- 初始化工具系统（同步注册内置工具，供 Agent 绑定）
   require("NeoAI.tools").init()
+
+  -- 初始化 Skills（扫描技能目录，填充索引；系统提示段已随工具注册）
+  require("NeoAI.services.skills").init()
+
+  -- 初始化 MCP（预缓存注册工具/资源/提示 → 异步连接服务器 → 动态刷新）
+  require("NeoAI.services.mcp").init()
+
+  -- 插件关闭时关闭 MCP 子进程/会话
+  kernel.lifecycle.on_shutdown(function()
+    pcall(require("NeoAI.services.mcp").shutdown)
+  end)
 
   -- 注册命令 + 全局快捷键（仅此而已）
   _register_commands()

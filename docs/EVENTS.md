@@ -164,6 +164,22 @@ vim.api.nvim_create_autocmd("User", {
 | `TODO_UPDATED` | `todo:updated` | 待办清单更新 | `{ session_id, count, counts }` |
 | `PLAN_MODE_CHANGED` | `plan_mode:changed` | 计划模式切换 | `{ agent_id, active }` |
 
+### MCP
+
+| 常量 | 值 | 触发时机 | payload 关键字段 |
+| --- | --- | --- | --- |
+| `MCP_CONNECTING` | `mcp:connecting` | 开始连接某服务器 | `{ server }` |
+| `MCP_READY` | `mcp:ready` | 服务器握手并注册完成 | `{ server, tools }` |
+| `MCP_ERROR` | `mcp:error` | 连接/初始化失败 | `{ server, error }` |
+| `MCP_DISCONNECTED` | `mcp:disconnected` | 服务器断开 | `{ server }` |
+| `MCP_TOOLS_UPDATED` | `mcp:tools_updated` | 工具/资源/提示刷新后注册更新 | `{ server }`（chat_service 据此重绑定当前 Agent 工具集） |
+
+### Skills
+
+| 常量 | 值 | 触发时机 | payload 关键字段 |
+| --- | --- | --- | --- |
+| `SKILLS_UPDATED` | `skills:updated` | 技能索引热重载 | `{ count }` |
+
 ### 模型
 
 | 常量 | 值 | 触发时机 | payload 关键字段 |

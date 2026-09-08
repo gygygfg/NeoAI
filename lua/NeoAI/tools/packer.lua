@@ -14,6 +14,8 @@ local PACK_ORDER = {
   lsp = 5,
   log = 6,
   agent = 7,
+  mcp = 8,
+  skill = 9,
 }
 
 -- ========== 公开 API ==========
@@ -98,6 +100,8 @@ function M.pack_display_name(category)
     lsp = "LSP",
     log = "日志",
     agent = "子 Agent",
+    mcp = "MCP",
+    skill = "技能",
     other = "其它",
   }
   return names[category] or category

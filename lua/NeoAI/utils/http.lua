@@ -47,6 +47,24 @@ local function _parse_http_status(err_msg)
   return nil
 end
 
+--- 解析 curl --dump-header 临时文件为 header 映射（key 小写）
+--- @param path string
+--- @return table
+local function _parse_headers_file(path)
+  local out = {}
+  local f = io.open(path, "rb")
+  if not f then return out end
+  local content = f:read("*a")
+  f:close()
+  for line in (content .. "\n"):gmatch("(.-)\n") do
+    local name, value = line:match("^([%w%-_%[%]]+):%s*(.*)%s*$")
+    if name then
+      out[name:lower()] = value
+    end
+  end
+  return out
+end
+
 local function _build_url(base_url, path)
   if not path or path == "" then return base_url end
   if base_url:match("/$") then
@@ -66,6 +84,15 @@ end
 
 local function _build_args(opts)
   local args = { "-sS", "--no-buffer" }
+  if opts.include_headers then
+    -- 捕获响应头（供 MCP http 会话 id / 内容类型检测）：
+    -- 使用临时文件转储头部，避免与响应体混淆。
+    if not opts._dump_headers_path then
+      opts._dump_headers_path = vim.fn.tempname()
+    end
+    args[#args + 1] = "--dump-header"
+    args[#args + 1] = opts._dump_headers_path
+  end
   if opts.stream then
     -- 流式请求：用空闲超时（--speed-time/--speed-limit）替代总时长上限（--max-time）。
     -- 流式（尤其是长推理 / 长生成）会在超过 timeout 秒内持续收到数据，若按总时长用
@@ -137,22 +164,27 @@ local function _parse_sse(buffer)
   local events = {}
   local rest = buffer
   while true do
-    local data_start = rest:find("data: ")
-    if not data_start then break end
-    local line_end = rest:find("\n", data_start, true)
-    if not line_end then
-      -- data 行尚未收全（缺行尾换行）：保留缓冲，等待后续数据补齐
+    local line_end = rest:find("\n", 1, true)
+    local line, remainder
+    if line_end then
+      line = rest:sub(1, line_end - 1)
+      remainder = rest:sub(line_end + 1)
+    else
+      -- 最后一行尚未收全（缺行尾换行）：保留缓冲，等待后续数据补齐
       break
     end
-    local line = rest:sub(data_start + 6, line_end - 1)
     line = line:gsub("\r$", "") -- 兼容 CRLF 行尾
-    if line == "[DONE]" then
-      events[#events + 1] = { type = "done" }
-      rest = rest:sub(line_end + 1)
-      break
+    -- 兼容 "data: " 与 "data:"（MCP streamable HTTP 部分服务器不带空格）
+    local content = line:match("^data:%s?(.*)$")
+    if content then
+      rest = remainder
+      if content == "[DONE]" then
+        events[#events + 1] = { type = "done" }
+        break
+      end
+      events[#events + 1] = { type = "data", data = content }
     end
-    events[#events + 1] = { type = "data", data = line }
-    rest = rest:sub(line_end + 1)
+    rest = remainder
   end
   return events, rest
 end
@@ -251,13 +283,25 @@ function M.request(opts, callbacks)
         callbacks.on_chunk(nil, true)
       end
       local body = table.concat(stdout, "\n")
+      -- include_headers：读取 curl --dump-header 临时文件，解析响应头
+      local headers = nil
+      if opts.include_headers and opts._dump_headers_path and vim.fn.filereadable(opts._dump_headers_path) == 1 then
+        headers = _parse_headers_file(opts._dump_headers_path)
+        pcall(vim.fn.delete, opts._dump_headers_path)
+      end
       if code == 0 then
-        d:resolve(body)
+        if opts.include_headers then
+          d:resolve({ body = body, headers = headers or {} })
+        else
+          d:resolve(body)
+        end
       else
         local err_msg = table.concat(stderr, "\n")
         if err_msg == "" then err_msg = "curl 退出码 " .. tostring(code) end
         local status = _parse_http_status(err_msg)
-        d:reject({ kind = "http", status = status or code, message = err_msg, body = body })
+        local err = { kind = "http", status = status or code, message = err_msg, body = body }
+        if opts.include_headers then err.headers = headers or {} end
+        d:reject(err)
       end
     end,
   })

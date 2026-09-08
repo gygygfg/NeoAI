@@ -88,7 +88,7 @@ lua/NeoAI/
     model/                   -- Model (registry, fetcher, adapter, content, cache)
     attachment/              -- Attachment (image content-addressed store)
     agent/                   -- Agent engine (agent, runtime, request, stream, tool_loop, prefix, guard, recovery)
-  services/                  -- Service layer (chat, tool, model, status, herder)
+  services/                  -- Service layer (chat, tool, model, status, herder, skills, mcp/*)
   ui/                        -- Presentation layer
     window/                  -- Window manager, chat view, tree view
     components/              -- input_box, message_list, reasoning_panel, tool_args_panel,

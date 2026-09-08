@@ -343,6 +343,43 @@ tests.suite("chat_ui", function(_, it)
     chat_service.reset()
   end)
 
+  it("输入框多行缩进内容不被误折叠为思考过程", function(t)
+    local chat_view = require("NeoAI.ui.window.chat_view")
+    local chat_service = require("NeoAI.services.chat_service")
+    local input_box = require("NeoAI.ui.components.input_box")
+    chat_view.reset()
+    chat_service.reset()
+
+    local opened = chat_view.open()
+    local input_win = input_box.get_win()
+    t.true_(input_win ~= nil and vim.api.nvim_win_is_valid(input_win), "应创建输入窗口")
+
+    -- 输入窗口由 :belowright split 从聊天主窗口分裂而来，会继承其 expr 折叠。
+    -- 输入框内缩进的多行内容不应被误判为推理/工具折叠块（「🤔 思考过程」）。
+    t.false_(vim.wo[input_win].foldenable, "输入窗口应禁用折叠")
+
+    vim.api.nvim_buf_set_lines(input_box.get_buf(), 0, -1, false, {
+      "第一行",
+      "  缩进的第二行",
+      "第四行",
+    })
+
+    -- 光标留在输入窗口，折叠重算后各行均应顶格显示（无折叠）
+    vim.api.nvim_set_current_win(input_win)
+    local total = vim.api.nvim_buf_line_count(input_box.get_buf())
+    for ln = 1, total do
+      t.eq(0, vim.fn.foldlevel(ln), "输入框第 " .. ln .. " 行不应被折叠")
+      t.eq(-1, vim.fn.foldclosed(ln), "输入框第 " .. ln .. " 行不应处于折叠块内")
+      t.eq("", vim.fn.foldtextresult(ln), "输入框第 " .. ln .. " 行不应显示思考过程折叠文本")
+    end
+    -- 缩进内容本身应保留（不被折叠隐藏）
+    local lines = vim.api.nvim_buf_get_lines(input_box.get_buf(), 0, -1, false)
+    t.eq("  缩进的第二行", lines[2], "输入框缩进内容应原样保留")
+
+    chat_view.reset()
+    chat_service.reset()
+  end)
+
   it("聊天主窗口被 :bnext 切到别的 buffer 时收起输入框，切回聊天 buffer 时恢复", function(t)
     local chat_view = require("NeoAI.ui.window.chat_view")
     local chat_service = require("NeoAI.services.chat_service")

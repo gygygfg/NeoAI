@@ -212,6 +212,59 @@ local function _ensure_queue_observer()
   end)
 end
 
+-- ========== MCP 集成（动态工具更新） ==========
+
+local mcp_pre_round_registered = false
+local mcp_observer_sub = nil
+
+--- MCP 刷新钩子：每轮模型请求前刷新 stale 的 MCP 工具定义并就地更新 agent.tools 中
+--- 已有 MCP 工具的签名，保证下一轮模型看到与服务器一致的 schema（失败驱动时序）。
+--- @param agent table
+--- @return Deferred resolve(boolean changed)
+local function _mcp_pre_round(agent)
+  local mcp = require("NeoAI.services.mcp")
+  return mcp.pre_round():then_(function(changed)
+    if changed and agent and agent.tools then
+      local registry = require("NeoAI.tools.registry")
+      for name in pairs(agent.tools) do
+        local def = registry.get(name)
+        if def and def.source == "mcp" then
+          agent.tools[name] = def
+        end
+      end
+    end
+    return changed
+  end)
+end
+
+--- 懒加载地注册 MCP 轮前刷新钩子到 tool_loop（幂等）
+local function _ensure_mcp_pre_round()
+  if mcp_pre_round_registered then return end
+  mcp_pre_round_registered = true
+  local tool_loop = require("NeoAI.core.agent.tool_loop")
+  tool_loop.set_pre_round_refresh(_mcp_pre_round)
+end
+
+--- 懒加载地监听 MCP 工具更新，把当前主 Agent 的工具集与注册表同步（幂等）。
+--- 连接晚于 Agent 创建时，MCP 工具在 MCP_TOOLS_UPDATED 时被补进当前 Agent。
+local function _ensure_mcp_observer()
+  if mcp_observer_sub then return end
+  mcp_observer_sub = event_bus.on(events.MCP_TOOLS_UPDATED, function()
+    local registry = require("NeoAI.tools.registry")
+    local aid = state.current_agent_id
+    local agent = aid and runtime.get(aid)
+    if agent and not agent_mod_is_disposed(agent) and not _is_busy(agent) and agent.tools then
+      agent.tools = registry.list_as_map()
+    end
+  end)
+end
+
+--- 一次性确保 MCP 相关钩子（幂等；在模块加载时调用）
+local function _ensure_mcp_hooks()
+  _ensure_mcp_pre_round()
+  _ensure_mcp_observer()
+end
+
 --- 暂存一条消息：AI 忙碌时不拒绝，而是入队。工具循环中途（下轮模型调用前）由
 --- 注入器插入对话；若没有工具循环则在整个循环结束、agent 空闲后由 flush 发送。
 --- @param agent table
@@ -630,13 +683,24 @@ function M.reset()
   -- 清理暂存队列、状态监听与注入器，避免测试间/重载后残留并重复发送
   local tool_loop = require("NeoAI.core.agent.tool_loop")
   tool_loop.set_inject_user(nil)
+  tool_loop.set_pre_round_refresh(nil)
   injector_registered = false
+  mcp_pre_round_registered = false
+  if mcp_observer_sub then
+    mcp_observer_sub()
+    mcp_observer_sub = nil
+  end
   for _, q in pairs(pending_queue) do
     for _, item in ipairs(q) do
       item.d:reject({ kind = "cancelled", message = "会话已重置，暂存消息已取消" })
     end
   end
   pending_queue = {}
+  -- 恢复 MCP 钩子（幂等）：reset 清空后重新注册，保证工具动态更新仍能被感知与刷新
+  _ensure_mcp_hooks()
 end
+
+-- 模块加载即注册 MCP 钩子（幂等）：保证工具动态更新在任意时刻都能被感知与刷新。
+_ensure_mcp_hooks()
 
 return M

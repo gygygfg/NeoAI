@@ -332,6 +332,50 @@ local DEFAULT_CONFIG = {
     },
   },
 
+  -- ===== MCP（Model Context Protocol）=====
+  mcp = {
+    enabled = true, -- 是否启用 MCP 客户端
+    timeout_ms = 60000, -- 单次 JSON-RPC 请求超时（ms）
+    connect_timeout_ms = 20000, -- 连接/初始化握手超时（ms）
+    reconnect = true, -- 连接失败/断开后是否重连
+    cache_path = vim.fn.stdpath("cache") .. "/NeoAI/mcp_cache.json", -- 工具/资源/提示描述的本地缓存（预缓存）
+    servers = {
+      -- [name] = {
+      --   transport = "stdio" | "http",
+      --   -- stdio:
+      --   command = "npx",
+      --   args = { "-y", "@modelcontextprotocol/server-filesystem", vim.fn.getcwd() },
+      --   env = {},
+      --   -- http:
+      --   url = "https://example.com/mcp",
+      --   headers = { ["Authorization"] = "Bearer ..." },
+      --   -- 通用：
+      --   expose = { tools = true, resources = true, prompts = true },
+      --   approval = { auto_allow = false },
+      --   plan_safe = false,
+      -- }
+    },
+    resources = {
+      max_result_bytes = 100 * 1024, -- read_resource 单返回内容字节上限
+    },
+  },
+
+  -- ===== Skills（技能目录 + SKILL.md）=====
+  skills = {
+    enabled = true, -- 是否启用技能系统
+    paths = { -- 扫描目录（展开 ~ / stdpath / 项目相对路径），顺序越前优先级越高
+      vim.fn.stdpath("config") .. "/skills",
+      vim.fn.stdpath("data") .. "/neoai/skills",
+      ".neoai/skills",
+      ".claude/skills",
+    },
+    max_skills_in_prompt = 20, -- 系统提示里列出的技能数量上限
+    max_skill_bytes = 64 * 1024, -- load_skill 单技能内容字节上限
+    inject_mode = "list", -- list | full | none（系统提示列出方式；list=名称+描述，full=整篇正文）
+    persist_loaded = false, -- load_skill 是否同时注册 agent 级提示段使其常驻上下文
+    register_tools = true, -- 是否注册 list_skills / load_skill 工具
+  },
+
   herder = {
     enabled = true, -- 是否启用 Herder 终端状态信号上报（还需 HERDR_ENV=1 才真正生效；非 Herder 环境为 no-op）
     source = "custom:neoai", -- 稳定且全局唯一的生命周期权威标识

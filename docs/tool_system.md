@@ -27,7 +27,8 @@
   description = "读取文件内容…", -- 描述（给模型）
   parameters = { type = "object", properties = {...}, required = {...} }, -- schema
   func = function(args, on_success, on_error, ctx) ... end, -- 执行函数
-  category = "file",             -- 分类（file/system/git/treesitter/lsp/log/agent）
+  category = "file",             -- 分类（file/system/git/treesitter/lsp/log/agent/mcp/skill）
+  source = "builtin",            -- 来源（builtin/mcp；mcp 工具在 executor 中跳过参数别名改写）
   approval = { auto_allow = ... }, -- 审批配置
   timeout = ...                  -- 可选超时（ms）
 }
@@ -47,7 +48,8 @@
 （仅注册定义，无 I/O，确保首个 Agent 请求前已就绪）。`tool_helpers.lua` 是工具定义辅助库，不入内置清单。
 
 内置工具模块：`file_ops` / `shell` / `git_ops` / `lsp_ops` / `tree_ops` / `log_ops` / `plan`（子 Agent）/
-`todo` / `plan_mode` / `ask_user` / `read_image`。
+`todo` / `plan_mode` / `ask_user` / `read_image` / `skills`（技能工具 + 系统提示段）。
+MCP 远端工具由 `services/mcp/init.lua` 动态注册（`category = "mcp"`，`source = "mcp"`），详见 [mcp.md](mcp.md)。
 
 ## 4. 执行流程（tools/executor.lua）
 
