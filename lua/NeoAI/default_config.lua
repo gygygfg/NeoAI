@@ -201,6 +201,7 @@ local DEFAULT_CONFIG = {
         capacity = "Statement",
         state = "Function",
         brand = "Title",
+        pending = "Warning",
       },
     },
   },

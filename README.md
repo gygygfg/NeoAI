@@ -342,7 +342,10 @@ require("lualine").setup({
 的 lualine，不被污染。展示刻意简洁，干净分行、无重复、无成片截断：
 
 - **第 1 行（winbar）** 身份：`[模式] 模型 状态`
-- **第 2 行（statusline）** 指标：`↑prompt ↓completion 缓存命中x% 剩余容量y%`
+- **第 2 行（statusline）** 指标：`↑prompt ↓completion 缓存命中x% 剩余容量y% 待发N`
+
+> `待发N`：Agent 正忙（generating / tool_running / 生成槽被占用）时你发送的消息会先暂存，
+> 状态栏出现该徽标提醒；消息真正发送后徽标自动消失（计数归零不渲染）。
 
 各段默认链接到**鲜艳的 nvim 高亮组**（`Title`/`Type`/`Number`/`String`/`Statement`/`Function`/`Keyword`），
 active 与 inactive 一致，杜绝无焦点时整行变灰（虚化）。
@@ -373,7 +376,8 @@ require("NeoAI").setup({
 
 - `NeoAI.get_statusline_info()` — 返回当前 Agent 的用量/缓存/容量结构化数据
 - `NeoAI.get_statusline()` — 返回状态栏文本
-- `require("NeoAI.services.status").segment(name)` — 单个段文本（mode/model/usage/cache/capacity/state/display）
+- `require("NeoAI.services.status").segment(name)` — 单个段文本（mode/model/usage/cache/capacity/state/display/pending）
+- `require("NeoAI.services.chat_service").pending_count()` — 当前 Agent 正忙时暂存的待发消息数
 - `:NeoAIStatusline` — 预览当前状态栏组件内容
 
 ### Herder 终端状态集成

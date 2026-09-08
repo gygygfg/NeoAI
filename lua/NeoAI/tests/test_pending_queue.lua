@@ -74,6 +74,45 @@ tests.suite("pending_queue", function(_, it)
     t.eq(0, #agent.messages, "reset 后暂存已清空，不应再注入")
   end)
 
+  it("has_pending_work：正忙/排队时 true，清空后 false", function(t)
+    local chat = init_chat()
+    local agent = chat.new_session({})
+    t.false_(chat.has_pending_work(), "空闲且无排队时应无工作")
+
+    agent:set_state("tool_running")
+    t.true_(chat.has_pending_work(), "正忙时有工作")
+    chat.send_message("排队1")
+    t.true_(chat.has_pending_work(), "排队中仍有工作")
+
+    local tool_loop = require("NeoAI.core.agent.tool_loop")
+    tool_loop.inject_pending(agent)
+    agent:set_state("idle")
+    t.false_(chat.has_pending_work(), "注入且空闲后无工作")
+  end)
+
+  it("入队触发 MESSAGE_QUEUED，注入触发 MESSAGE_SENT（驱动状态栏刷新）", function(t)
+    local chat = init_chat()
+    local event_bus = require("NeoAI.kernel.event_bus")
+    local events = require("NeoAI.kernel.events")
+    local queued, sent = 0, 0
+    local sub1 = event_bus.on(events.MESSAGE_QUEUED, function() queued = queued + 1 end)
+    local sub2 = event_bus.on(events.MESSAGE_SENT, function() sent = sent + 1 end)
+
+    local agent = chat.new_session({})
+    agent:set_state("generating")
+    chat.send_message("排队消息")
+    t.eq(1, queued, "入队应触发 MESSAGE_QUEUED")
+    t.eq(0, sent, "入队不应触发 MESSAGE_SENT")
+
+    local tool_loop = require("NeoAI.core.agent.tool_loop")
+    tool_loop.inject_pending(agent)
+    t.eq(1, sent, "注入（发送）应触发 MESSAGE_SENT")
+    t.eq(0, chat.pending_count(), "注入后队列清空")
+
+    sub1()
+    sub2()
+  end)
+
   it("同一 tick 连续运行时按忙碌拒绝/入队（原子占用，防并行生成）", function(t)
     local async = require("NeoAI.utils.async")
     local config_store = require("NeoAI.kernel.config_store")

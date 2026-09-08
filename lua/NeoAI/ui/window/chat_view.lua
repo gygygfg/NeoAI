@@ -421,7 +421,10 @@ local function _on_agent_end(payload)
   _on_generation_finished(payload)
   -- 仅主 Agent 结束才把光标移回输入框：子 Agent 完成/失败/取消也会携带
   -- 自己的 agent_id 发射 GENERATION_COMPLETED 等事件，不能触发主界面的焦点动作。
-  if payload and payload.agent_id == state.agent_id then
+  -- 且仅在当前 Agent 真正完成（空闲且暂存队列为空）时才移回输入框；
+  -- 若仍有工作（正忙/暂存消息正逐条刷新、继续生成），保持光标在主窗口观看流式输出，
+  -- 避免每个刷新 turn 都触发一次进入插入模式。
+  if payload and payload.agent_id == state.agent_id and not chat_service.has_pending_work() then
     _focus_input_insert()
   end
 end

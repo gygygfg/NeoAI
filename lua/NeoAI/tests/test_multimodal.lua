@@ -181,6 +181,12 @@ tests.suite("multimodal", function(_, it, before_each)
   it("read_image 工具：门禁 + 成功注入", function(t)
     local registry = require("NeoAI.tools.registry")
     local att = require("NeoAI.core.attachment.attachment")
+    -- 工具系统仅在 NeoAI.setup() 时初始化；headless 单测未走过 setup，
+    -- 内置工具（含 read_image）不会自动注册到 registry（真实会话中由 setup 注入）。
+    -- 这里显式重载内置工具，确保 read_image 已在 registry 中。
+    if not registry.has("read_image") then
+      require("NeoAI.tools").reload_tools()
+    end
     -- 写入真实测试图像文件
     local path = "/tmp/opencode/neoai_test_img.png"
     os.execute("mkdir -p /tmp/opencode")

@@ -116,4 +116,25 @@ tests.suite("status", function(_, it)
     local ext = require("lualine.extensions.neoai")
     t.deep_eq({ "neoai" }, ext.filetypes, "扩展 filetypes 应只含 neoai")
   end)
+
+  it("正忙排队时 segment(pending) 显示待发N，发送后清零", function(t)
+    local chat = init_chat()
+    local status = require("NeoAI.services.status")
+    local agent = chat.new_session({})
+    t.eq(0, chat.pending_count(), "空闲时无待发消息")
+    t.eq("", status.segment("pending"), "无敌徽标不渲染")
+
+    -- agent 正忙时发送 → 入队
+    agent:set_state("tool_running")
+    chat.send_message("第一条")
+    chat.send_message("第二条")
+    t.eq(2, chat.pending_count(), "排队数应反映暂存消息")
+    t.eq("待发2", status.segment("pending"), "正忙时显示待发N徽标")
+
+    -- 轮末注入（模拟 tool_loop 注入器，等价于发送/清除）
+    local tool_loop = require("NeoAI.core.agent.tool_loop")
+    tool_loop.inject_pending(agent)
+    t.eq(0, chat.pending_count(), "注入后队列应清空")
+    t.eq("", status.segment("pending"), "发送后徽标应消失")
+  end)
 end)

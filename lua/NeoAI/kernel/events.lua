@@ -33,6 +33,7 @@ M.MESSAGE_UPDATED = "message:updated"
 M.MESSAGE_EDITED = "message:edited"
 M.MESSAGE_DELETED = "message:deleted"
 M.MESSAGE_SENT = "message:sent"
+M.MESSAGE_QUEUED = "message:queued"
 M.MESSAGES_CLEARED = "messages:cleared"
 
 -- ========== 会话 ==========

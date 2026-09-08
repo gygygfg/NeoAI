@@ -21,7 +21,7 @@ local function is_main()
 end
 
 --- 构造单个带高亮链接的函数组件
---- @param part string 段名（mode/display/model/usage/cache/capacity/state）
+--- @param part string 段名（mode/display/model/usage/cache/capacity/state/pending）
 --- @param opts table|nil { cond? function, sep? string }
 --- @return table lualine 组件
 local function comp(part, opts)
@@ -42,11 +42,11 @@ local function main_cond()
   return function() return status.winbar_enabled() and is_main() end
 end
 
--- 指标（状态栏）：用量 / 缓存命中率 / 上下文容量
+-- 指标（状态栏）：用量 / 缓存命中率 / 上下文容量 / 待发（正忙时排队）
 -- 每次调用返回全新数组，避免同一数组被多个 section（sections/inactive_sections 等）
 -- 共享，lualine 在 load_sections 时会原地改写，共享会互相污染。
 local function metrics()
-  return { comp("usage"), comp("cache"), comp("capacity") }
+  return { comp("usage"), comp("cache"), comp("capacity"), comp("pending") }
 end
 -- 身份（winbar 第一行）：模式 / 模型 / 状态
 local function identity()

@@ -36,6 +36,7 @@ local DEFAULTS = {
     capacity = "Statement",
     state = "Function",
     brand = "Title",
+    pending = "Warning",
   },
 }
 
@@ -112,6 +113,10 @@ local function _build_part(info, part)
     return "剩余容量" .. _fmt_pct(math.max(0, 1 - info.capacity.pct))
   elseif part == "state" then
     return info.state or "idle"
+  elseif part == "pending" then
+    -- agent 正忙时暂存/待发消息数：>0 才显示徽标（0 时返回 nil，不渲染）
+    if not info.pending or info.pending <= 0 then return nil end
+    return "待发" .. info.pending
   elseif part == "display" then
     return info.display and ("[" .. info.display .. "]") or nil
   end
@@ -190,7 +195,10 @@ function M.get_info()
     state = agent and agent.state or "idle",
     usage = nil,
     capacity = nil,
+    pending = nil,
   }
+  -- 当前 agent 正忙时暂存的待发消息数（无 agent 或队列为空则缺省，徽标不渲染）
+  info.pending = chat_service.pending_count()
   if agent then
     local u = agent.usage or {}
     info.usage = {
@@ -281,6 +289,7 @@ function M.watch()
     events.STREAM_COMPLETED, events.AGENT_STATE_CHANGED,
     events.AGENT_ABORTED, events.MODEL_SWITCHED,
     events.SESSION_LOADED, events.MESSAGE_ADDED,
+    events.MESSAGE_QUEUED, events.MESSAGE_SENT,
     events.AUTO_MODE_CHANGED, events.PLAN_MODE_CHANGED,
     events.DISPLAY_MODE_CHANGED, events.TODO_UPDATED,
   }

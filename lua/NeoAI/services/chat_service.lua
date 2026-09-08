@@ -222,9 +222,15 @@ local function _enqueue_message(agent, content, opts)
   _ensure_queue_observer()
   _ensure_injector()
   local d = async.Deferred.new()
-  pending_queue[agent.id] = pending_queue[agent.id] or {}
-  table.insert(pending_queue[agent.id], { content = content, opts = opts, d = d })
-  -- 静默暂存：不提示失败、也不提示“正忙”，随下轮模型调用或本轮结束自动发送
+  local q = pending_queue[agent.id]
+  if not q then
+    q = {}
+    pending_queue[agent.id] = q
+  end
+  table.insert(q, { content = content, opts = opts, d = d })
+  -- 通知状态栏：消息已入队（agent 正忙），渲染「待发N」徽标
+  event_bus.emit(events.MESSAGE_QUEUED, { agent_id = agent.id, count = #q })
+  -- 静默暂存：不提示失败、也不提示"正忙"，随下轮模型调用或本轮结束自动发送
   return d
 end
 
@@ -294,6 +300,25 @@ end
 function M.get_current_agent()
   if not state.current_agent_id then return nil end
   return runtime.get(state.current_agent_id)
+end
+
+--- 当前 Agent 暂存队列中的消息数（agent 正忙时入队的待发消息）
+--- @return number
+function M.pending_count()
+  if not state.current_agent_id then return 0 end
+  local q = pending_queue[state.current_agent_id]
+  return (q and #q) or 0
+end
+
+--- 当前 Agent 是否仍有未完成的工作（正忙，或暂存队列里还有待发消息）。
+--- 供 UI 在生成结束（GENERATION_COMPLETED/GENERATION_ERROR/AGENT_ABORTED）时判断
+--- 是否把光标移回输入框：还有工作（暂存消息正逐条刷新/继续生成）就不移，
+--- 避免反复进入插入模式、且让光标停留在主窗口以观看继续进行的流式输出。
+--- @return boolean
+function M.has_pending_work()
+  local agent = M.get_current_agent()
+  if agent and _is_busy(agent) then return true end
+  return M.pending_count() > 0
 end
 
 --- 获取当前 Agent 的消息
