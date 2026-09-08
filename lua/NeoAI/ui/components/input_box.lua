@@ -221,7 +221,11 @@ function M.create(opts)
   -- extmark 渲染不可编辑的 "> " 前缀，内容区保持纯文本，nvim-cmp 可正常解析/补全。
   -- bufhidden=hide 而非 wipe：用户把输入窗口切到别的 buffer 时输入 buffer 必须存活，
   -- 否则 focus() 无法把输入 buffer 绑回窗口，feedkeys("A") 会把输入写进错误的 buffer。
+  -- buftype=nofile：纯 UI 暂存 buffer；仅 nofile 能保证退出/切走时不触发 E37/E162
+  -- "No write since last change"（acwrite/普通 buftype 会把已命名的暂存 buffer 当作未保存文件）。
+  -- nofile 仍可编辑，不影响输入与 nvim-cmp。
   vim.bo[state.buf].bufhidden = "hide"
+  vim.bo[state.buf].buftype = "nofile"
   vim.bo[state.buf].modifiable = true
   vim.bo[state.buf].filetype = "neoai_input"
   -- 不可编辑的 "> " 提示前缀（inline 把真实内容向右推，内容区不含 "> ")

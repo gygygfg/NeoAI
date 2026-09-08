@@ -73,4 +73,67 @@ tests.suite("pending_queue", function(_, it)
     tool_loop.inject_pending(agent)
     t.eq(0, #agent.messages, "reset 后暂存已清空，不应再注入")
   end)
+
+  it("同一 tick 连续运行时按忙碌拒绝/入队（原子占用，防并行生成）", function(t)
+    local async = require("NeoAI.utils.async")
+    local config_store = require("NeoAI.kernel.config_store")
+    config_store.load({
+      ai = {
+        default_provider = "deepseek", default_model = "auto",
+        providers = { deepseek = { api_type = "openai", base_url = "http://127.0.0.1:8950", api_key = "k" } },
+        modes = { chat = { provider = "deepseek", model = "m1", temperature = 0.7, max_tokens = 4096, stream = true } },
+        context_cache = { enabled = false },
+      },
+      session = { save_path = "/tmp/neoai_test_claim", file = "s.jsonl" },
+      tools = { approval = { mode = "auto_allow" } },
+    })
+    local session_store = require("NeoAI.core.session.session_store")
+    local runtime = require("NeoAI.core.agent.runtime")
+    local chat = require("NeoAI.services.chat_service")
+    local fs = require("NeoAI.utils.fs")
+    chat.reset(); runtime.reset(); session_store.reset()
+    fs.delete_file("/tmp/neoai_test_claim/s.jsonl")
+    session_store.init()
+
+    -- stub 网络：立即返回一条简单回复，让被占用的首轮正常结束并清掉 claim
+    local http = require("NeoAI.utils.http")
+    local original_http = http.request
+    http.request = function(opts, cb)
+      local d = async.Deferred.new()
+      vim.schedule(function()
+        local on_chunk = cb and cb.on_chunk
+        if on_chunk then
+          on_chunk(vim.json.encode({ choices = { { delta = { content = "ok" }, finish_reason = "stop" } } }), false)
+          vim.schedule(function() on_chunk("finished", true) end)
+        end
+        d:resolve({})
+      end)
+      return d
+    end
+
+    local agent = chat.new_session({})
+    -- 首轮：runtime.run 应同步占用生成槽位，即使 agent.state 此刻仍是 idle
+    local d1 = runtime.run(agent, "first")
+    t.true_(agent._turn_claim ~= nil, "首轮运行应同步占用生成槽位")
+    t.eq("idle", agent.state, "此时 state 尚未置 generating（异步链先跑）")
+
+    -- 同一 tick 内再次 runtime.run：应立即被 busy 拒绝，而非并行启动
+    local d2 = runtime.run(agent, "second")
+    local kind = nil
+    d2:catch(function(e) kind = e and e.kind end)
+    vim.wait(50, function() return kind ~= nil end)
+    t.eq("busy", kind, "二次 runtime.run 应拒绝 busy")
+
+    -- send_message 在槽位被占用时应收纳为 pending（而不是直接失败/并行运行）
+    local d3 = chat.send_message("queued-while-busy")
+    t.true_(d3:is_pending(), "槽位被占用时 send_message 应暂存为 pending")
+
+    -- 等待首轮（与暂存队列中的消息）自然结束并清掉 claim
+    vim.wait(500, function() return agent._turn_claim == nil end)
+    t.nil_(agent._turn_claim, "运行结束后生成占用应被释放")
+
+    http.request = original_http
+    runtime.reset()
+    chat.reset()
+  end)
 end)

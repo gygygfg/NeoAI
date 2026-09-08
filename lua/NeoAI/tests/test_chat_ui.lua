@@ -741,7 +741,8 @@ tests.suite("chat_ui", function(_, it)
 
     local opened = chat_view.open()
     local buf = opened.buf
-    t.eq("nofile", vim.bo[buf].buftype, "聊天 buffer 应为 nofile（native LSP 自动启用会跳过）")
+    -- 默认对话模式：聊天 buffer 应为 nofile（native LSP 自动启用会跳过；:w 报原生 E382）
+    t.eq("nofile", vim.bo[buf].buftype, "对话模式下聊天 buffer 应为 nofile")
     t.true_(vim.b[buf].copilot_disabled, "应设置 copilot.vim 的 b:copilot_disabled")
     t.true_(vim.b[buf].copilot_disable, "应设置 copilot.lua 的 b:copilot_disable")
     local ok, clients = pcall(vim.lsp.get_clients, { bufnr = buf })

@@ -128,7 +128,8 @@ end
 --- 无元数据（如历史会话）时跳过，不影响基本展示。
 --- @param lines table
 --- @param msg table assistant 消息
-local function _append_request_meta(lines, msg)
+--- @param full boolean|nil true=保存日志：不截断原始请求体/响应分片（完整 wire 数据）
+local function _append_request_meta(lines, msg, full)
   local helpers = require("NeoAI.ui.components.message_list").helpers
   local fold = require("NeoAI.ui.components.fold")
   local req = msg.request
@@ -157,7 +158,8 @@ local function _append_request_meta(lines, msg)
   if req and req.body then
     lines[#lines + 1] = "    ▸ 原始请求体"
     local encoded = helpers.pretty_json(req.body)
-    for _, l in ipairs(helpers.split_lines(helpers.truncate(encoded, MAX_REQUEST_BODY_CHARS))) do
+    if not full then encoded = helpers.truncate(encoded, MAX_REQUEST_BODY_CHARS) end
+    for _, l in ipairs(helpers.split_lines(encoded)) do
       lines[#lines + 1] = "      " .. l
     end
   end
@@ -189,7 +191,7 @@ local function _append_request_meta(lines, msg)
       local total_chars, truncated = 0, false
       local shown = {}
       for _, c in ipairs(chunks) do
-        if total_chars + #c > MAX_RAW_CHUNKS_CHARS then
+        if not full and total_chars + #c > MAX_RAW_CHUNKS_CHARS then
           truncated = true
           break
         end
@@ -212,7 +214,8 @@ end
 --- - 层级 3 子块：推理、工具调用、原始请求体、原始响应。
 --- @param lines table
 --- @param turn table
-local function _append_turn(lines, turn)
+--- @param full boolean|nil true=保存日志：不截断 wire 数据
+local function _append_turn(lines, turn, full)
   lines[#lines + 1] = _header(turn)
   if turn.user then
     lines[#lines + 1] = "  ▸ 用户请求"
@@ -250,7 +253,7 @@ local function _append_turn(lines, turn)
         i = i + 1
       end
       -- wire 级细节：请求参数 + 原始请求体 + 原始响应（层级 3 子块）
-      _append_request_meta(lines, msg)
+      _append_request_meta(lines, msg, full)
     else
       i = i + 1
     end
@@ -292,8 +295,10 @@ end
 
 --- 生成轨迹视图的全部行
 --- @param messages table
+--- @param opts table|nil { full? } full=true 时不截断原始请求体/响应分片（供保存日志）
 --- @return table
-local function _build_lines(messages)
+local function _build_lines(messages, opts)
+  opts = opts or {}
   local lines = {}
   local turns = _group_turns(messages)
   if #turns == 0 then
@@ -303,7 +308,7 @@ local function _build_lines(messages)
     if turn.kind == "system" then
       _append_system(lines, turn)
     else
-      _append_turn(lines, turn)
+      _append_turn(lines, turn, opts.full)
     end
   end
   return lines
@@ -382,6 +387,360 @@ end
 --- @return table 行数组
 function M.build_lines(messages)
   return _build_lines(messages)
+end
+
+-- ========== 日志保存 ==========
+
+--- 构建完整轨迹日志行（full=true：不截断原始请求体 / 原始 SSE 分片）
+--- @param messages table
+--- @return table 行数组
+function M.build_log(messages)
+  return _build_lines(messages, { full = true })
+end
+
+--- 生成文件头（保存时间 / 会话信息）
+--- @param messages table|nil
+--- @return table
+local function _log_header(messages)
+  local lines = { "# NeoAI 轨迹日志", "# 保存时间: " .. os.date("%Y-%m-%d %H:%M:%S") }
+  if messages and #messages > 0 then
+    lines[#lines + 1] = "# 消息数: " .. #messages
+  end
+  lines[#lines + 1] = ""
+  return lines
+end
+
+--- 解析保存目录（缺省 ui.trajectory.log_dir，未配置回退 ~/.cache/nvim/NeoAI/logs）
+--- @param opts table { dir? }
+--- @return string dir
+local function _resolve_dir(opts)
+  local config_store = require("NeoAI.kernel.config_store")
+  local fs = require("NeoAI.utils.fs")
+  local dir = opts.dir or config_store.get("ui.trajectory.log_dir")
+  dir = fs.expand(dir or "")
+  if dir == "" then
+    dir = vim.fn.stdpath("cache") .. "/NeoAI/logs"
+  end
+  fs.ensure_dir(dir)
+  return dir
+end
+
+--- 计算文件名（补 .log 后缀；缺省按时间戳）
+--- @param opts table { filename? }
+--- @return string
+local function _resolve_filename(opts)
+  local filename = opts.filename or ("neoai-trajectory-" .. os.date("%Y%m%d-%H%M%S") .. ".log")
+  if filename:sub(-4) ~= ".log" then filename = filename .. ".log" end
+  return filename
+end
+
+--- 生成完整日志内容（文件头 + 不截断的轨迹正文）
+--- @param messages table
+--- @return string
+local function _log_content(messages)
+  local body = table.concat(M.build_log(messages or {}), "\n") .. "\n"
+  local header = table.concat(_log_header(messages), "\n") .. "\n"
+  return header .. body
+end
+
+--- 把轨迹日志保存成文件到指定目录（缺省 ui.trajectory.log_dir，默认 ~/.cache/nvim/NeoAI/logs）。
+--- 同步写入，返回路径。写入的是完整 wire 数据（不截断请求体与响应分片）。
+--- @param messages table
+--- @param opts table|nil { dir? 自定义保存目录; filename? 自定义文件名（缺省按时间戳） }
+--- @return string|nil 文件路径；失败时返回 nil（内部已 vim.notify 报错）
+function M.save_log(messages, opts)
+  opts = opts or {}
+  local fs = require("NeoAI.utils.fs")
+  local path = fs.join(_resolve_dir(opts), _resolve_filename(opts))
+  local w_ok, w_err = fs.write_file(path, _log_content(messages))
+  if not w_ok then
+    vim.notify("[NeoAI] 写入轨迹日志失败: " .. tostring(w_err), vim.log.levels.ERROR)
+    return nil
+  end
+  return path
+end
+
+--- 异步写入轨迹日志（线程池，不阻塞主线程）。给 vim 保存事件钩子用，避免每次 :w 卡顿。
+--- @param messages table
+--- @param opts table|nil { dir?; filename? }
+--- @return Deferred resolve(文件路径 string)；失败会 notify 并 reject
+function M.save_log_async(messages, opts)
+  opts = opts or {}
+  local fs = require("NeoAI.utils.fs")
+  local path = fs.join(_resolve_dir(opts), _resolve_filename(opts))
+  return fs.write_file_async(path, _log_content(messages)):then_(function()
+    return path
+  end, function(err)
+    local msg = tostring(err and err.message or err)
+    vim.notify("[NeoAI] 写入轨迹日志失败: " .. msg, vim.log.levels.ERROR)
+    return nil
+  end)
+end
+
+-- ========== vim 原生保存事件钩子 ==========
+
+--- 把 agent id 规范化成安全文件名（供会话稳定文件名使用）
+--- @param id string
+--- @return string
+local function _safe_name(id)
+  local s = tostring(id or ""):gsub("[^%w%-_]", "_")
+  if s == "" then s = "default" end
+  return s
+end
+
+--- 已挂钩的 buffer 集合（buf -> true），保证每个 buffer 只挂一次
+local hooked_bufs = {}
+
+--- 上次成功保存的目录（作为下次弹窗默认值；缺省取配置 log_dir）
+local last_save_dir = nil
+
+--- 会话日志文件的稳定名（按 session_id 派生；缺省用默认名）
+--- @return string
+function M.log_filename()
+  local ok, chat_service = pcall(require, "NeoAI.services.chat_service")
+  if not ok then return "neoai-trajectory.log" end
+  local session_id = chat_service.get_current_session_id()
+  if session_id then
+    return "neoai-trajectory-" .. _safe_name(session_id) .. ".log"
+  end
+  return "neoai-trajectory.log"
+end
+
+--- 默认保存目录（配置 log_dir，未配置回退 ~/.cache/nvim/NeoAI/logs）
+--- @return string
+local function _default_dir()
+  local config_store = require("NeoAI.kernel.config_store")
+  local fs = require("NeoAI.utils.fs")
+  return fs.expand(config_store.get("ui.trajectory.log_dir") or vim.fn.stdpath("cache") .. "/NeoAI/logs")
+end
+
+--- 依据弹窗输入路径写入轨迹日志。
+--- 规则：以 `.log` 结尾 → 视为完整文件路径；否则视为目录，自动加会话文件名。
+--- target 为空 → 落盘到默认目录。
+--- @param messages table
+--- @param target string|nil 用户输入的路径
+--- @param silent boolean
+--- @return string|nil 保存路径
+local function _save_by_input(messages, target, silent)
+  local fs = require("NeoAI.utils.fs")
+  target = (target or ""):match("^%s*(.-)%s*$")
+  local dir, filename
+  if target == "" then
+    dir = _default_dir()
+    filename = M.log_filename()
+  elseif target:match("%.log$") then
+    dir = fs.dirname(fs.expand(target))
+    filename = fs.basename(fs.expand(target))
+  else
+    dir = fs.expand(target)
+    filename = M.log_filename()
+  end
+  local path = M.save_log(messages, { dir = dir, filename = filename })
+  if path then
+    last_save_dir = fs.dirname(path)
+    if not silent then
+      vim.notify("[NeoAI] 轨迹日志已保存: " .. path, vim.log.levels.INFO)
+    end
+  end
+  return path
+end
+
+-- ========== 路径输入浮窗 ==========
+
+local dlg = { win = nil, buf = nil, on_confirm = nil, on_cancel = nil, prompt_ns = nil, guard_aucmd = nil }
+
+-- 输入行在 buffer 中的行号（1-based）：第 1 行为不可编辑的提示（virt_text），第 2 行为可编辑的输入
+local INPUT_LINE = 2
+
+--- 关闭路径浮窗（不触发回调，仅清理）
+local function _dlg_close()
+  if dlg.win and vim.api.nvim_win_is_valid(dlg.win) then
+    pcall(vim.api.nvim_win_close, dlg.win, true)
+  end
+  if dlg.guard_aucmd then
+    pcall(vim.api.nvim_del_autocmd, dlg.guard_aucmd)
+  end
+  dlg.guard_aucmd = nil
+  dlg.prompt_ns = nil
+  dlg.win = nil
+  dlg.buf = nil
+  dlg.on_confirm = nil
+  dlg.on_cancel = nil
+end
+
+--- 读取浮窗输入行（第 2 行）的值
+--- @return string
+local function _dlg_value()
+  if dlg.buf and vim.api.nvim_buf_is_valid(dlg.buf) then
+    local l = vim.api.nvim_buf_get_lines(dlg.buf, INPUT_LINE - 1, INPUT_LINE, false)
+    return (l[1] or ""):gsub("^%s+", ""):gsub("%s+$", "")
+  end
+  return ""
+end
+
+--- 确认提交（Enter 或测试调用）：以给定值（缺省取输入行）保存
+--- @param value string|nil
+function M._path_confirm(value)
+  local cb = dlg.on_confirm
+  if type(value) ~= "string" then value = _dlg_value() end
+  _dlg_close()
+  if cb then cb(value) end
+end
+
+--- 取消（Esc 或测试调用）：不保存
+function M._path_cancel()
+  local cb = dlg.on_cancel
+  _dlg_close()
+  if cb then cb() end
+end
+
+--- 浮窗键位：回车确认，Esc 取消
+local function _dlg_set_keymaps()
+  if not dlg.buf then return end
+  -- 回车确认（插入 + 普通模式）
+  vim.keymap.set({ "i", "n" }, "<CR>", function() M._path_confirm(_dlg_value()) end, { buffer = dlg.buf, desc = "确认保存路径" })
+  -- Esc：插入模式先退回普通模式（支持 normal 下用 vim 编辑），普通模式下再按 Esc 才取消
+  vim.keymap.set("i", "<Esc>", function() vim.cmd("stopinsert") end, { buffer = dlg.buf, desc = "退出插入（普通模式）" })
+  vim.keymap.set("n", "<Esc>", function() M._path_cancel() end, { buffer = dlg.buf, desc = "取消保存" })
+  -- 普通模式回到插入：i 光标前插入 / a 行尾追加
+  vim.keymap.set("n", "i", function() vim.api.nvim_feedkeys("i", "n", false) end, { buffer = dlg.buf, desc = "进入插入" })
+  vim.keymap.set("n", "a", function() vim.api.nvim_feedkeys("A", "n", false) end, { buffer = dlg.buf, desc = "进入插入（追加）" })
+end
+
+--- 弹出「设置日志保存路径」浮窗，光标自动落入输入行（插入模式）
+--- @param default string 默认路径
+--- @param on_confirm function(value) 确认时回调
+--- @param on_cancel function() 取消时回调
+local function _open_path_dialog(default, on_confirm, on_cancel)
+  if dlg.win and vim.api.nvim_win_is_valid(dlg.win) then _dlg_close() end
+  dlg.on_confirm = on_confirm
+  dlg.on_cancel = on_cancel
+  dlg.buf = vim.api.nvim_create_buf(false, true)
+  vim.bo[dlg.buf].filetype = "neoai_traj_path"
+  -- nofile：纯飘窗暂存，用户可编辑输入行，但退出/切走不会触发 E37/E162
+  vim.bo[dlg.buf].buftype = "nofile"
+  vim.bo[dlg.buf].modifiable = true
+  vim.bo[dlg.buf].bufhidden = "wipe"
+  vim.bo[dlg.buf].swapfile = false
+  local height = 3
+  local width = math.min(90, vim.o.columns - 6)
+  -- 第 1 行放不可编辑的提示文本（virt_text，不进入 buffer 内容）；第 2 行是可编辑的输入。
+  vim.api.nvim_buf_set_lines(dlg.buf, 0, -1, false, { "", default })
+  dlg.prompt_ns = vim.api.nvim_create_namespace("neoai_traj_prompt")
+  vim.api.nvim_buf_set_extmark(dlg.buf, dlg.prompt_ns, 0, 0, {
+    virt_text = { { "保存轨迹日志到路径（回车确认，Esc 取消）: ", "Comment" } },
+    virt_text_pos = "inline",
+  })
+  local ok, wid = pcall(vim.api.nvim_open_win, dlg.buf, false, {
+    relative = "editor",
+    width = width,
+    height = height,
+    col = math.floor((vim.o.columns - width) / 2),
+    row = math.floor((vim.o.lines - height) / 2),
+    style = "minimal",
+    border = "rounded",
+    title = "💾 NeoAI 保存轨迹日志",
+    title_pos = "center",
+  })
+  if not ok then
+    dlg.buf = nil
+    dlg.on_confirm, dlg.on_cancel = nil, nil
+    vim.notify("[NeoAI] 无法打开保存路径弹窗: " .. tostring(wid), vim.log.levels.ERROR)
+    return
+  end
+  dlg.win = wid
+  vim.wo[dlg.win].wrap = true
+  vim.wo[dlg.win].foldenable = false
+  _dlg_set_keymaps()
+  -- 锁定输入行为第 2 行：光标/编辑被吸附到该行，提示行（第 1 行）不可被修改
+  dlg.guard_aucmd = vim.api.nvim_create_autocmd({ "CursorMoved", "CursorMovedI", "InsertEnter" }, {
+    buffer = dlg.buf,
+    callback = function()
+      if not dlg.win or not vim.api.nvim_win_is_valid(dlg.win) then return end
+      local cur = vim.api.nvim_win_get_cursor(dlg.win)
+      if cur[1] ~= INPUT_LINE then
+        local input = vim.api.nvim_buf_get_lines(dlg.buf, INPUT_LINE - 1, INPUT_LINE, false)
+        pcall(vim.api.nvim_win_set_cursor, dlg.win, { INPUT_LINE, #(input[1] or "") })
+      end
+    end,
+  })
+  -- 焦点与光标必须在 :w 写命令彻底返回后再落到弹窗（否则写命令结束会还原焦点到原窗口）。
+  -- 用 schedule 延后到下一 tick：此时写命令已完成，set_current_win 才真正生效。
+  -- 默认进入普通模式（光标落在输入行第 2 行），按 i/a 进入插入编辑，回车确认，Esc 取消。
+  local input_len = #(default or "")
+  vim.schedule(function()
+    if not dlg.win or not vim.api.nvim_win_is_valid(dlg.win) then return end
+    pcall(vim.api.nvim_win_set_cursor, dlg.win, { INPUT_LINE, input_len })
+    vim.api.nvim_set_current_win(dlg.win)
+  end)
+end
+
+--- 安装「vim 原生保存事件」钩子：把指定 buffer 切为 acwrite 并挂 BufWriteCmd。
+--- 仅在轨迹模式激活时调用（chat_view 依显示模式同步）。:w 时弹窗让用户设置日志路径。
+--- acwrite 的非 ''/help buftype 仍能跳过 native LSP 自动启用（与 nofile 等效），仅由 BufWriteCmd 接管保存。
+--- 幂等：同一 buffer 重复调用无副作用。
+--- @param buf number
+--- @param opts table|nil { silent? } 缺省 false（notify 保存成功）；true=静默
+--- @return boolean 是否已安装
+function M.install_save_hook(buf, opts)
+  opts = opts or {}
+  if not buf or not vim.api.nvim_buf_is_valid(buf) then return false end
+  if hooked_bufs[buf] then return true end
+  hooked_bufs[buf] = true
+  local silent = opts.silent == true
+  pcall(vim.api.nvim_set_option_value, "buftype", "acwrite", { buf = buf })
+  if vim.api.nvim_buf_get_name(buf) == "" then
+    pcall(vim.api.nvim_buf_set_name, buf, "NeoAI-" .. tostring(buf))
+  end
+  local augroup = "NeoAISaveTrajectory" .. buf
+  vim.api.nvim_create_autocmd("BufWriteCmd", {
+    group = vim.api.nvim_create_augroup(augroup, { clear = true }),
+    buffer = buf,
+    callback = function()
+      local ok, chat_service = pcall(require, "NeoAI.services.chat_service")
+      if ok then
+        local agent = chat_service.get_current_agent()
+        if agent and agent.messages and #agent.messages > 0 then
+          local messages = agent.messages
+          -- 默认位置 = 目录 + 会话文件名（完整路径），用户可改
+          local fs = require("NeoAI.utils.fs")
+          local default = fs.join(last_save_dir or _default_dir(), M.log_filename())
+          _open_path_dialog(default, function(value)
+            _save_by_input(messages, value, silent)
+          end, function()
+            -- 取消（Esc）：不保存
+          end)
+        end
+      end
+      -- 清掉修改标志：保存由弹窗流程接管（无真实文件），否则 vim 会认为未保存
+      vim.bo[buf].modified = false
+    end,
+  })
+  return true
+end
+
+--- 移除保存事件钩子：删除 BufWriteCmd，并把 buffer 恢复为 nofile（非轨迹模式下 :w 报原生 E382）。
+--- @param buf number|nil 缺省移除全部
+function M.remove_save_hook(buf)
+  local function _disable(b)
+    pcall(vim.api.nvim_set_option_value, "buftype", "nofile", { buf = b })
+  end
+  if buf then
+    pcall(vim.api.nvim_del_augroup_by_name, "NeoAISaveTrajectory" .. buf)
+    hooked_bufs[buf] = nil
+    if vim.api.nvim_buf_is_valid(buf) then _disable(buf) end
+    return
+  end
+  for b in pairs(hooked_bufs) do
+    pcall(vim.api.nvim_del_augroup_by_name, "NeoAISaveTrajectory" .. b)
+    if vim.api.nvim_buf_is_valid(b) then _disable(b) end
+  end
+  hooked_bufs = {}
+end
+
+--- 旧名兼容（测试/外部曾用）
+function M.uninstall_save_hook(...)
+  M.remove_save_hook(...)
 end
 
 manager.register(M)

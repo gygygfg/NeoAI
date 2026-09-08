@@ -4,6 +4,7 @@
 --- 布局：主消息区（上） + 输入框（下，split）。
 
 local window_manager = require("NeoAI.ui.window.manager")
+local config_store = require("NeoAI.kernel.config_store")
 local message_list = require("NeoAI.ui.components.message_list")
 local input_box = require("NeoAI.ui.components.input_box")
 local model_picker = require("NeoAI.ui.components.model_picker")
@@ -31,7 +32,19 @@ local state = {
   following = true, -- 流式更新时光标是否跟随（不跟随时不弹思考悬浮窗、不重新折叠已有折叠）
   collapsed = false, -- 聊天窗口进入后台后是否已收起（输入框）
   focus_augroup = nil, -- 焦点追踪自动命令组（WinEnter/BufEnter）
+  input_resize_augroup = nil, -- 输入框随内容增高自动命令组
 }
+
+-- 输入框高度：光标在主界面 → idle_height；光标在输入框 → min_height 起步，随内容行数增长，上限为主窗口高度的 max_ratio。
+local function _input_box_cfg()
+  return config_store.get("ui.input_box") or {}
+end
+local function _input_idle_height()
+  return math.max(1, _input_box_cfg().idle_height or 1)
+end
+
+-- 输入框非模块级函数，但 _create_input_area（在下方定义）会引用，需提前声明。
+local _register_input_resize
 
 -- ========== 私有函数 ==========
 
@@ -529,7 +542,7 @@ local function _create_input_window()
     vim.cmd("belowright split")
     win = vim.api.nvim_get_current_win()
   end)
-  vim.api.nvim_win_set_height(win, 3)
+  vim.api.nvim_win_set_height(win, _input_idle_height())
   vim.wo[win].winfixheight = true
   vim.wo[win].wrap = false
   return win
@@ -547,10 +560,91 @@ local function _create_input_area(fresh)
       -- 同步主界面的 chat 上下文按键到输入框（quit/cancel/toggle_reasoning/switch_model/cycle_mode/tool_approval）
       chat_actions = _build_chat_actions(),
     })
+    -- 输入框随内容增高：注册文本/光标变化时重算高度
+    _register_input_resize()
   end
   input_box.attach_window(win)
   state.input_win_id = win
   return win
+end
+
+-- ========== 输入框高度（焦点 + 内容自适应） ==========
+
+--- 计算输入框最大可用高度：主窗口+输入框总高度的 max_ratio，不小于输入框最小高度。
+--- 以「主窗口高度 + 输入窗口高度」为基准（两者之和在 split 内恒定），
+--- 避免输入框增高挤占主窗口导致基准随之缩小、产生反复回落振荡。
+--- @return number
+local function _input_max_height()
+  local min_h = _input_box_cfg().min_height or 5
+  if not state.win_id or not vim.api.nvim_win_is_valid(state.win_id) then
+    return min_h
+  end
+  local ratio = tonumber(_input_box_cfg().max_ratio) or 0.8
+  local total = vim.api.nvim_win_get_height(state.win_id)
+  if state.input_win_id and vim.api.nvim_win_is_valid(state.input_win_id) then
+    total = total + vim.api.nvim_win_get_height(state.input_win_id)
+  end
+  return math.max(min_h, math.floor(total * ratio))
+end
+
+--- 按输入内容计算输入框目标高度：至少 min_height 行，随内容行数增长，上限为主窗口高度的 max_ratio。
+--- 输入窗口 wrap=false，每个逻辑行即一个视觉行，直接用 buffer 行数。
+--- @return number
+local function _compute_input_height()
+  local min_h = _input_box_cfg().min_height or 5
+  local input_buf = input_box.get_buf()
+  local lines = 1
+  if input_buf and vim.api.nvim_buf_is_valid(input_buf) then
+    lines = vim.api.nvim_buf_line_count(input_buf)
+  end
+  return math.max(min_h, math.min(lines, _input_max_height()))
+end
+
+--- 设置输入窗口高度（winfixheight 不影响程序化调整）
+--- @param h number
+local function _set_input_height(h)
+  if not state.input_win_id or not vim.api.nvim_win_is_valid(state.input_win_id) then return end
+  vim.api.nvim_win_set_height(state.input_win_id, math.max(1, h))
+end
+
+--- 按当前焦点窗口同步输入框高度：输入窗口聚焦 → 随内容增高；主窗口聚焦 → 收起为 1 行。
+local function _resize_input_for_focus()
+  if not state.input_win_id or not vim.api.nvim_win_is_valid(state.input_win_id) then return end
+  local cur_win = vim.api.nvim_get_current_win()
+  if cur_win == state.input_win_id then
+    _set_input_height(_compute_input_height())
+  elseif cur_win == state.win_id then
+    _set_input_height(_input_idle_height())
+  end
+end
+
+--- 注册输入框随内容增高命令（输入窗口聚焦时根据内容行数重算高度）。
+_register_input_resize = function()
+  if state.input_resize_augroup then
+    pcall(vim.api.nvim_del_augroup_by_id, state.input_resize_augroup)
+  end
+  local input_buf = input_box.get_buf()
+  if not input_buf or not vim.api.nvim_buf_is_valid(input_buf) then return end
+  state.input_resize_augroup = vim.api.nvim_create_augroup("NeoAIInputHeight", { clear = true })
+  for _, ev in ipairs({ "TextChanged", "TextChangedI", "InsertLeave", "CursorMoved", "CursorMovedI" }) do
+    vim.api.nvim_create_autocmd(ev, {
+      group = state.input_resize_augroup,
+      buffer = input_buf,
+      callback = function()
+        if vim.api.nvim_get_current_win() == state.input_win_id then
+          _set_input_height(_compute_input_height())
+        end
+      end,
+    })
+  end
+end
+
+--- 清理输入框增高命令
+local function _clear_input_resize()
+  if state.input_resize_augroup then
+    pcall(vim.api.nvim_del_augroup_by_id, state.input_resize_augroup)
+    state.input_resize_augroup = nil
+  end
 end
 
 -- ========== 后台收起 / 恢复（焦点追踪） ==========
@@ -589,11 +683,13 @@ local function _restore_aux()
   end
 end
 
---- WinEnter：焦点进入某窗口时同步收起/恢复（in insert 与否无关）。
+--- WinEnter：焦点进入某窗口时同步收起/恢复并按焦点调整输入框高度（in insert 与否无关）。
 local function _on_win_enter()
   if not M.has_window() then return end
-  if _is_chat_affiliated(vim.api.nvim_get_current_win()) then
+  local cur_win = vim.api.nvim_get_current_win()
+  if _is_chat_affiliated(cur_win) then
     _restore_aux()
+    _resize_input_for_focus()
   else
     _collapse_aux()
   end
@@ -608,12 +704,40 @@ local function _on_buf_enter()
   local shown = vim.api.nvim_win_get_buf(state.win_id)
   if state.buf and shown == state.buf then
     _restore_aux()
+    _set_input_height(_input_idle_height())
   else
     _collapse_aux()
   end
 end
 
 --- 注册焦点追踪自动命令（每次打开聊天窗口时创建，关闭时清理）
+-- ========== 轨迹模式保存能力（随显示模式启停） ==========
+
+--- 仅轨迹模式可保存（:w 走 BufWriteCmd 弹窗落盘）；其它模式把主消息 buffer 恢复为 nofile，
+--- 让 `:w` 报原生 E382。随显示模式切换自动同步（含打开窗口时的初始状态）。
+--- 输入框恒为 nofile（见 input_box.create），不参与 acwrite：避免命名暂存 buffer 触发 E37/E162。
+local function _sync_trajectory_save()
+  local trajectory = require("NeoAI.ui.components.display_modes.trajectory")
+  local active = display_modes.get_current_name() == "trajectory"
+  if not state.buf or not vim.api.nvim_buf_is_valid(state.buf) then return end
+  if active then
+    trajectory.install_save_hook(state.buf)
+  else
+    trajectory.remove_save_hook(state.buf)
+  end
+  -- 确保输入框保持 nofile（若曾因旧逻辑被改为 acwrite，这里兜底恢复）
+  local input_buf = input_box.get_buf()
+  if input_buf and vim.api.nvim_buf_is_valid(input_buf) then
+    trajectory.remove_save_hook(input_buf)
+  end
+end
+
+--- 显示模式变化：同步轨迹保存能力
+--- @param payload table
+local function _on_display_mode_changed(payload) -- luacheck: ignore payload
+  _sync_trajectory_save()
+end
+
 local function _register_focus_tracking()
   if state.focus_augroup then
     pcall(vim.api.nvim_del_augroup_by_id, state.focus_augroup)
@@ -734,6 +858,8 @@ function M.open(opts)
   -- 首次打开：新建输入 buffer + 键位（fresh 显式传 true）
   _create_input_area(true)
   input_box.focus()
+  -- 打开即聚焦输入框：显式按内容适配初始高度（此时焦点追踪尚未注册，WinEnter 不会触发）
+  _set_input_height(_compute_input_height())
   -- 焦点追踪：焦点离开聊天窗口或主窗口被切到别的 buffer 时收起输入框，回到聊天时恢复
   state.collapsed = false
   _register_focus_tracking()
@@ -757,6 +883,10 @@ function M.open(opts)
   state.unsubs[#state.unsubs + 1] = event_bus.on(events.GENERATION_COMPLETED, _on_agent_end)
   state.unsubs[#state.unsubs + 1] = event_bus.on(events.GENERATION_ERROR, _on_agent_end)
   state.unsubs[#state.unsubs + 1] = event_bus.on(events.AGENT_ABORTED, _on_agent_end)
+  -- 轨迹模式保存随显示模式启停
+  state.unsubs[#state.unsubs + 1] = event_bus.on(events.DISPLAY_MODE_CHANGED, _on_display_mode_changed)
+  -- 打开窗口时按当前显示模式同步一次（activate 的 DISPLAY_MODE_CHANGED 在订阅前已发出）
+  _sync_trajectory_save()
 
   -- 打开聊天窗口时懒注入 lualine 扩展：此阶段用户启动配置已执行、lualine 已可用，
   -- 避免因 lualine 懒加载 / setup 顺序导致扩展注册不到。
@@ -797,6 +927,7 @@ function M.close()
   end
   state.unsubs = {}
   _clear_focus_tracking()
+  _clear_input_resize()
   state.collapsed = false
   state.win_id = nil
   state.buf = nil

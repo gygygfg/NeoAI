@@ -114,11 +114,13 @@ end
 
 -- ========== 正忙暂存队列 ==========
 
---- Agent 是否处于忙碌状态（generating / tool_running）
+--- Agent 是否处于忙碌状态（generating / tool_running / 生成槽位被占用）。
+--- `_turn_claim` 是 runtime.run 同步设置的生成占用令牌：状态要等异步链才置为
+--- generating，若只看 state，同一 tick 内连续两次 send 会被判为 idle 而并行启动。
 --- @param agent table
 --- @return boolean
 local function _is_busy(agent)
-  return agent.state == "generating" or agent.state == "tool_running"
+  return agent.state == "generating" or agent.state == "tool_running" or agent._turn_claim ~= nil
 end
 
 --- 发送一条消息（不做忙碌检查：调用方需保证 agent 空闲）

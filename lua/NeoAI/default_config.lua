@@ -179,6 +179,14 @@ local DEFAULT_CONFIG = {
       foldlevel = 99,
       auto_close_on_select = true, -- 从树选择会话打开聊天后自动关闭树窗口
     },
+    input_box = {
+      idle_height = 1, -- 光标在主聊天区域时输入框高度
+      min_height = 5, -- 光标在输入框内时的最小高度（起始）
+      max_ratio = 0.8, -- 输入框随内容增长的上限（主窗口高度占比）
+    },
+    trajectory = {
+      log_dir = vim.fn.stdpath("cache") .. "/NeoAI/logs", -- 轨迹日志保存目录（可自定义；缺省 ~/.cache/nvim/NeoAI/logs）
+    },
     statusline = {
       enabled = true, -- 是否让 lualine 状态栏组件输出内容（false → 组件返回空串）
       winbar = true, -- 是否在聊天主窗口顶部渲染第二行（模式/显示模式/模型/状态）；false 只保留一行

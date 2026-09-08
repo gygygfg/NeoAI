@@ -309,9 +309,14 @@ function M.render(buf, messages)
   local plugin = display_modes.get_current()
   if plugin and plugin.render then
     plugin.render(buf, messages)
-    return
+  else
+    M.render_chat(buf, messages)
   end
-  M.render_chat(buf, messages)
+  -- 聊天消息 buffer 是纯 UI 暂存（非用户文件）：清除 modified，避免 :q/退出时
+  -- 触发 E37/E162 "No write since last change"（尤其 acwrite 命名的聊天 buffer）。
+  if vim.api.nvim_buf_is_valid(buf) then
+    vim.bo[buf].modified = false
+  end
 end
 
 --- 渲染消息列表到 buffer（默认对话模式）

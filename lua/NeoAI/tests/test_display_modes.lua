@@ -457,4 +457,207 @@ tests.suite("display_modes", function(_, it)
     chat_service.reset()
     display_modes.reset()
   end)
+
+  it("轨迹模式保存日志：build_log 不截断 wire 数据，save_log 写入文件到目录", function(t)
+    local display_modes = require("NeoAI.ui.components.display_modes")
+    local chat_view = require("NeoAI.ui.window.chat_view")
+    local chat_service = require("NeoAI.services.chat_service")
+    local trajectory = require("NeoAI.ui.components.display_modes.trajectory")
+    local fs = require("NeoAI.utils.fs")
+    display_modes.reset()
+    chat_view.reset()
+    chat_service.reset()
+
+    local opened = chat_view.open()
+    local agent = chat_service.get_current_agent()
+    -- 超长请求体 / 响应分片，末尾各带唯一标记：展示模式应截断（标记被裁掉），日志应完整保留（标记在）。
+    local long_body = string.rep("x", 9000) .. "REQ_TAIL_MARKER"
+    local long_chunk = string.rep("y", 7000) .. "CHK_TAIL_MARKER"
+    agent.messages = {
+      { role = "user", content = "问题" },
+      {
+        role = "assistant", content = "回答", reasoning = "思考",
+        request = { model = "m1", provider = "p1", body = { model = "m1", stream = true, long = long_body } },
+        response = {
+          finish_reason = "stop", usage = { prompt_tokens = 10 }, ttft_ms = 250, total_ms = 1500, status = "ok",
+          raw_chunks = { long_chunk },
+        },
+      },
+    }
+    chat_view.set_display("trajectory")
+    chat_view.refresh()
+
+    -- 展示模式：超长内容被截断（末尾标记不出现）
+    local shown = table.concat(vim.api.nvim_buf_get_lines(opened.buf, 0, -1, false), "\n")
+    t.false_(shown:find("REQ_TAIL_MARKER", 1, true) ~= nil, "展示模式应截断超长请求体")
+    t.false_(shown:find("CHK_TAIL_MARKER", 1, true) ~= nil, "展示模式应截断超长响应分片")
+
+    -- build_log：完整 wire 数据（不截断）
+    local log = table.concat(trajectory.build_log(agent.messages), "\n")
+    t.true_(log:find("REQ_TAIL_MARKER", 1, true) ~= nil, "build_log 应含完整请求体")
+    t.true_(log:find("CHK_TAIL_MARKER", 1, true) ~= nil, "build_log 应含完整响应分片")
+
+    -- save_log：写入文件并返回路径
+    local dir = "/tmp/neoai_traj_log"
+    pcall(vim.fn.delete, dir, "rf")
+    local path = trajectory.save_log(agent.messages, { dir = dir })
+    t.not_nil(path, "save_log 应返回文件路径")
+    t.true_(path:find(dir, 1, true) == 1, "保存路径应在指定目录下")
+    local content = fs.read_file(path)
+    t.not_nil(content, "日志文件应可读")
+    t.true_(content:find("# NeoAI 轨迹日志", 1, true) ~= nil, "日志应有文件头")
+    t.true_(content:find("REQ_TAIL_MARKER", 1, true) ~= nil, "日志文件应含完整请求体")
+    t.true_(content:find("CHK_TAIL_MARKER", 1, true) ~= nil, "日志文件应含完整响应分片")
+    pcall(fs.delete_file, path)
+
+    chat_view.reset()
+    chat_service.reset()
+    display_modes.reset()
+  end)
+
+  it("轨迹模式下 :w 弹窗可保存轨迹日志，对话模式 :w 保持 E382", function(t)
+    local trajectory = require("NeoAI.ui.components.display_modes.trajectory")
+    local display_modes = require("NeoAI.ui.components.display_modes")
+    local chat_view = require("NeoAI.ui.window.chat_view")
+    local chat_service = require("NeoAI.services.chat_service")
+    local config_store = require("NeoAI.kernel.config_store")
+    local fs = require("NeoAI.utils.fs")
+    local DIR = "/tmp/neoai_traj_hook_dlg"
+    pcall(vim.fn.delete, DIR, "rf")
+    config_store.reset()
+    config_store.load({ ui = { trajectory = { log_dir = DIR } } })
+    trajectory.uninstall_save_hook()
+    chat_view.reset()
+    chat_service.reset()
+
+    -- === 对话（普通）模式：不可保存，:w 报原生 E382 ===
+    local opened_chat = chat_view.open()
+    local agent = chat_service.get_current_agent()
+    agent.messages = {
+      { role = "user", content = "hi" },
+      { role = "assistant", content = "yo",
+        request = { model = "m", provider = "p", body = { model = "m" } } },
+    }
+    t.eq("nofile", vim.bo[opened_chat.buf].buftype, "对话模式聊天 buffer 应为 nofile")
+    vim.api.nvim_set_current_win(opened_chat.win_id)
+    local wok, werr = pcall(vim.cmd, "write")
+    t.false_(wok, "对话模式 :w 应报错")
+    t.true_(werr:find("E382", nil, true) ~= nil, "对话模式 :w 应报 E382，实际: " .. tostring(werr))
+
+    -- === 轨迹模式：切换后 buffer 变 acwrite，:w 弹窗并写日志 ===
+    chat_view.set_display("trajectory")
+    t.eq("acwrite", vim.bo[opened_chat.buf].buftype, "轨迹模式聊天 buffer 应为 acwrite")
+    vim.api.nvim_set_current_win(opened_chat.win_id)
+    local ok, err = pcall(vim.cmd, "write")
+    t.true_(ok, "轨迹模式 :w 不应报错，实际: " .. tostring(err))
+    -- 弹窗已打开且焦点（光标）移到弹窗输入行
+    t.true_(trajectory._path_confirm ~= nil, "应提供路径确认函数")
+    local focused = vim.wait(3000, function()
+      return vim.bo[vim.api.nvim_get_current_buf()].filetype == "neoai_traj_path"
+    end)
+    t.true_(focused, "光标应聚焦到路径弹窗（当前窗口应为 neoai_traj_path）")
+    trajectory._path_confirm(DIR)
+    local entries = {}
+    vim.wait(3000, function()
+      entries = fs.list_dir(DIR)
+      return #entries >= 1
+    end)
+    t.true_(#entries >= 1, "确认后应在目录内写出日志")
+    local content = entries[1] and fs.read_file(fs.join(DIR, entries[1]))
+    t.not_nil(content, "日志文件应可读")
+    t.true_(content:find("# NeoAI 轨迹日志", 1, true) ~= nil, "日志应有文件头")
+    t.true_(content:find("用户", 1, true) ~= nil, "日志应含会话内容")
+
+    -- === 切回对话模式：buffer 恢复 nofile，:w 再次 E382 ===
+    chat_view.set_display("chat")
+    t.eq("nofile", vim.bo[opened_chat.buf].buftype, "切回对话模式应恢复 nofile")
+    vim.api.nvim_set_current_win(opened_chat.win_id)
+    local wok2, werr2 = pcall(vim.cmd, "write")
+    t.false_(wok2, "切回对话模式 :w 应报错")
+    t.true_(werr2:find("E382", nil, true) ~= nil, "切回对话模式 :w 应报 E382")
+
+    pcall(vim.fn.delete, DIR, "rf")
+    trajectory.uninstall_save_hook()
+    chat_view.reset()
+    chat_service.reset()
+    display_modes.reset()
+  end)
+
+  it("轨迹模式对话框取消（Esc）不保存", function(t)
+    local trajectory = require("NeoAI.ui.components.display_modes.trajectory")
+    local display_modes = require("NeoAI.ui.components.display_modes")
+    local chat_view = require("NeoAI.ui.window.chat_view")
+    local chat_service = require("NeoAI.services.chat_service")
+    local config_store = require("NeoAI.kernel.config_store")
+    local fs = require("NeoAI.utils.fs")
+    local DIR = "/tmp/neoai_traj_cancel"
+    pcall(vim.fn.delete, DIR, "rf")
+    config_store.reset()
+    config_store.load({ ui = { trajectory = { log_dir = DIR } } })
+    trajectory.uninstall_save_hook()
+    chat_view.reset()
+    chat_service.reset()
+    local opened = chat_view.open()
+    chat_view.set_display("trajectory")
+    local agent = chat_service.get_current_agent()
+    agent.messages = { { role = "user", content = "hi" }, { role = "assistant", content = "yo" } }
+    vim.api.nvim_set_current_win(opened.win_id)
+    local ok, err = pcall(vim.cmd, "write")
+    t.true_(ok, "轨迹模式 :w 不应报错，实际: " .. tostring(err))
+    local dialog_open = vim.wait(3000, function()
+      return vim.bo[vim.api.nvim_get_current_buf()].filetype == "neoai_traj_path"
+    end)
+    t.true_(dialog_open, ":w 应打开路径弹窗并聚焦")
+    trajectory._path_cancel()
+    vim.wait(500, function() return true end)
+    t.eq(0, #fs.list_dir(DIR), "取消后不应写出日志")
+    pcall(vim.fn.delete, DIR, "rf")
+    trajectory.uninstall_save_hook()
+    chat_view.reset()
+    chat_service.reset()
+    display_modes.reset()
+  end)
+
+  it("弹窗支持进入普通模式：Esc 先退出插入、再次才取消", function(t)
+    local trajectory = require("NeoAI.ui.components.display_modes.trajectory")
+    local display_modes = require("NeoAI.ui.components.display_modes")
+    local chat_view = require("NeoAI.ui.window.chat_view")
+    local chat_service = require("NeoAI.services.chat_service")
+    local config_store = require("NeoAI.kernel.config_store")
+    local fs = require("NeoAI.utils.fs")
+    local DIR = "/tmp/neoai_traj_norm"
+    pcall(vim.fn.delete, DIR, "rf")
+    config_store.reset()
+    config_store.load({ ui = { trajectory = { log_dir = DIR } } })
+    trajectory.uninstall_save_hook()
+    chat_view.reset()
+    chat_service.reset()
+    local opened = chat_view.open()
+    chat_view.set_display("trajectory")
+    chat_service.get_current_agent().messages = {
+      { role = "user", content = "hi" }, { role = "assistant", content = "yo" },
+    }
+    vim.api.nvim_set_current_win(opened.win_id)
+    local wk, werr = pcall(vim.cmd, "write")
+    t.true_(wk, "轨迹模式 :w 不应报错: " .. tostring(werr))
+    local open = vim.wait(3000, function()
+      return vim.bo[vim.api.nvim_get_current_buf()].filetype == "neoai_traj_path"
+    end)
+    t.true_(open, ":w 应打开路径弹窗")
+    local dlg_win = vim.api.nvim_get_current_win()
+    pcall(vim.cmd, "startinsert")
+    local esc = vim.api.nvim_replace_termcodes("<Esc>", true, false, true)
+    vim.api.nvim_feedkeys(esc, "x", false)
+    local to_normal = vim.wait(1000, function() return vim.fn.mode() ~= "i" end)
+    t.true_(to_normal, "第一次 Esc 应退出插入进入普通模式")
+    t.true_(vim.api.nvim_win_is_valid(dlg_win), "第一次 Esc 不应关闭弹窗")
+    vim.api.nvim_feedkeys(esc, "x", false)
+    local closed = vim.wait(1000, function() return not vim.api.nvim_win_is_valid(dlg_win) end)
+    t.true_(closed, "第二次 Esc 应取消并关闭弹窗")
+    pcall(vim.fn.delete, DIR, "rf")
+    trajectory.uninstall_save_hook()
+    chat_view.reset()
+    chat_service.reset()
+    display_modes.reset()
+  end)
 end)

@@ -80,6 +80,9 @@ local function _run_generation(agent, opts)
   event_bus.emit(events.GENERATION_STARTED, { agent_id = agent.id })
 
   local function _finish_idle(message)
+    -- 先释放生成占用令牌、再回到 idle：保证 AGENT_STATE_CHANGED 触发的 pending 刷新
+    -- 能在同一 tick 看到 agent 已空闲并立即启动下一条消息，而不是被本轮的 claim 挡住。
+    agent._turn_claim = nil
     agent:set_state("idle")
     event_bus.emit(events.GENERATION_COMPLETED, { agent_id = agent.id, message = message })
     return message
@@ -136,6 +139,9 @@ local function _run_generation(agent, opts)
       -- 同时把状态复位为 idle，否则 `_run_generation` 已置的 "generating"
       -- （或 abort 的 "aborted"）会让同一 Agent 在取消后继续发送时卡在 busy。
       local is_cancel = err and (err.kind == "aborted" or err.kind == "cancelled")
+      -- 所有结束路径都释放生成占用令牌（_run_generation 内已置 _turn_claim），
+      -- 否则 Agent 会永久停留在"忙碌"，后续发送被吞进 pending_queue 且永不刷新。
+      agent._turn_claim = nil
       if is_cancel then
         agent:set_state("idle")
         return async.reject({ kind = "cancelled", message = err.message or "已取消" })
@@ -237,9 +243,18 @@ end
 --- @param content string
 --- @return Deferred resolve(响应)
 function M.run(agent, content)
-  if agent_mod.is_busy(agent) then
+  -- 原子占用生成槽位：状态在 maybe_compact / 异步链中才置为 generating，若仅靠 state
+  -- 判断（chat_service._is_busy 与这里此前都只看 state），同一 tick 内连续两次 send
+  -- （模式切换、approve_plan 自动执行后立即发送等场景常触发）都会判为 idle 并并行
+  -- 启动两个 _run_generation：两个流写入同一条 assistant 消息、互相争夺 agent.state，
+  -- 表现为回复合并/错乱，或把状态卡在 busy 导致后续消息被吞进 pending_queue 永不刷新
+  -- （"发出但无响应"）。用同步令牌 _turn_claim 在进入前标记忙碌，重复调用直接拒绝/入队。
+  if agent._turn_claim or agent_mod.is_busy(agent) then
     return async.reject({ kind = "busy", message = "Agent 正忙" })
   end
+  local claim_id = (agent._claim_seq or 0) + 1
+  agent._claim_seq = claim_id
+  agent._turn_claim = claim_id
   -- 上一次生成被取消（ESC）后，取消信号永久处于 aborted：若不重置，新一轮
   -- request.send_stream 会因信号已取消而立即失败（"operation aborted"），
   -- 表现为"停止后继续发送报错"。这里在开启新一步前检测并重置为全新信号。
@@ -259,6 +274,13 @@ function M.run(agent, content)
     agent_mod.add_message(agent, "user", content)
     event_bus.emit(events.MESSAGE_SENT, { agent_id = agent.id, content = content })
     return _run_generation(agent, {})
+  end):finally(function()
+    -- 兜底释放：仅在令牌仍属本轮时清除，避免误清掉 AGENT_STATE_CHANGED 刷新
+    -- 链同步启动的下一轮（_finish_idle 已在置 idle 前清掉本轮的令牌，此分支通常
+    -- 只在异常路径（如工具循环被取消且未走 _finish_idle）触发）。
+    if agent._turn_claim == claim_id then
+      agent._turn_claim = nil
+    end
   end)
 end
 

@@ -254,6 +254,7 @@ function M.dispose(agent)
   agent.messages = {}
   agent.tools = {}
   agent.state = STATES.IDLE
+  agent._turn_claim = nil
   event_bus.emit(events.AGENT_DISPOSED, { agent_id = agent.id })
 end
 
