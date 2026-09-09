@@ -99,8 +99,9 @@
 | --- | --- |
 | `input_box` | 聊天输入框。`create`/`attach_window`/`focus`/`submit`/`on_submitted`/`clear`；`virt_text` 渲染 `>` 前缀；放开 `neoai_input` 文件类型补全。 |
 | `message_list` | 消息列表渲染。`render(buf, messages)`；`toggle_reasoning()`。 |
-| `reasoning_panel` | 思考过程悬浮窗。`open`/`show`/`append`/`close`/`is_open`。 |
-| `tool_args_panel` | 工具参数接收悬浮窗（流式工具调用参数）。`open`/`show`/`close`/`is_open`/`get_content`/`reset`；`filetype=neoai_tool_args`。 |
+| `float_stream_window` | 复用流式悬浮窗。`open(title,{filetype})`/`set_text`/`append`/`get_text`/`close`/`is_open`/`reset`；思考过程 / 接收参数 / 上下文压缩 / 计划蒸馏共享同一窗口。 |
+| `reasoning_panel` | 思考过程悬浮窗（`float_stream_window` 适配器）。`open`/`show`/`append`/`close`/`is_open`；`filetype=neoai_reasoning`。 |
+| `tool_args_panel` | 工具参数接收悬浮窗（`float_stream_window` 适配器，流式工具调用参数）。`open`/`show`/`close`/`is_open`/`get_content`/`reset`；`filetype=neoai_tool_args`。 |
 | `model_picker` | 模型选择器（异步加载模型列表）。`open(callback)`。 |
 | `tool_approval` | 工具审批弹窗。`init()`；串行单槽位展示。 |
 | `ask_user` | 向用户提问弹窗。`init()`；经 `ask_user.set_ui` 注入。 |

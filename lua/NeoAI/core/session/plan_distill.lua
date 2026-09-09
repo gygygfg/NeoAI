@@ -174,13 +174,29 @@ local function _classify(agent, front, chunks, cfg)
   messages[#messages + 1] = { role = "user", content = _build_prompt(chunks) }
 
   local tool_defs = tool_loop._tool_definitions(agent)
-  return request.send(messages, {
+  -- 流式接收分类摘要：实时把收到的推理 / 正文分片广播出去，UI 端显示"计划蒸馏"悬浮窗。
+  local acc_reasoning = ""
+  local acc_content = ""
+  return request.send_stream(messages, {
     agent_config = agent.config,
     model = agent.model,
     tools = tool_defs,
     signal = agent.signal,
     max_tokens = cfg.compact_max_tokens or 8192,
-  }):then_(function(resp)
+  }, function(chunk)
+    if not chunk then return end
+    if chunk.reasoning and chunk.reasoning ~= "" then
+      acc_reasoning = acc_reasoning .. chunk.reasoning
+    end
+    if chunk.content and chunk.content ~= "" then
+      acc_content = acc_content .. chunk.content
+    end
+    event_bus.emit(events.PLAN_DISTILL_CHUNK, {
+      agent_id = agent.id,
+      reasoning = acc_reasoning,
+      content = acc_content,
+    })
+  end):then_(function(resp)
     return { content = resp and resp.content, usage = resp and resp.usage }
   end)
 end
@@ -227,6 +243,7 @@ local function _distill(agent, opts)
     return async.resolve(false)
   end
   agent._distilling = true
+  event_bus.emit(events.PLAN_DISTILL_STARTED, { agent_id = agent.id })
   return _classify(agent, front, chunks, cfg):then_(function(res)
     local summary = res and res.content
     if not summary or summary:gsub("%s", "") == "" then

@@ -1,18 +1,16 @@
 --- 接收工具参数面板
 --- @module NeoAI.ui.components.tool_args_panel
---- 在独立浮动窗口实时展示模型流式生成的工具调用参数，支持随分片更新与关闭，
---- 与思考过程悬浮窗（reasoning_panel）行为一致。
+--- 在独立浮动窗口实时展示模型流式生成的工具调用参数，支持随分片更新与关闭。
+--- 依托复用组件 float_stream_window；保留 open/show/close/is_open/get_content/reset API。
+
+local float_window = require("NeoAI.ui.components.float_stream_window")
 
 local M = {}
 
 local json = require("NeoAI.utils.json")
 
--- ========== 私有状态 ==========
-
-local state = {
-  win_id = nil,
-  buf = nil,
-}
+local FILETYPE = "neoai_tool_args"
+local TITLE = "🔧 接收参数"
 
 -- ========== 私有函数 ==========
 
@@ -52,70 +50,36 @@ end
 --- @param title string|nil
 --- @return number win_id
 function M.open(title)
-  if state.win_id and vim.api.nvim_win_is_valid(state.win_id) then
-    return state.win_id
-  end
-  state.buf = vim.api.nvim_create_buf(false, true)
-  vim.bo[state.buf].filetype = "neoai_tool_args"
-  local width = math.min(70, vim.o.columns - 10)
-  local height = math.min(6, vim.o.lines - 10)
-  state.win_id = vim.api.nvim_open_win(state.buf, false, {
-    relative = "editor",
-    width = width,
-    height = height,
-    col = math.floor((vim.o.columns - width) / 2),
-    row = 2,
-    style = "minimal",
-    border = "rounded",
-    title = title or "🔧 接收参数",
-    title_pos = "center",
-  })
-  vim.wo[state.win_id].wrap = true
-  -- 参数接收悬浮窗内容禁止折叠：minimal 浮窗会继承全局 foldenable/foldmethod，
-  -- 导致参数内容被自动收起而看不到。
-  vim.wo[state.win_id].foldenable = false
-  vim.wo[state.win_id].foldmethod = "manual"
-  vim.wo[state.win_id].foldcolumn = "0"
-  return state.win_id
+  return float_window.open(title or TITLE, { filetype = FILETYPE })
 end
 
 --- 展示工具调用参数快照（替换内容）
 --- @param tool_calls table 数组 { id, function = { name, arguments } }
 function M.show(tool_calls)
   M.open()
-  if not vim.api.nvim_buf_is_valid(state.buf) then return end
-  local content = _format_tool_calls(tool_calls)
-  vim.api.nvim_buf_set_lines(state.buf, 0, -1, false, vim.split(content, "\n", { plain = true }))
-  if state.win_id and vim.api.nvim_win_is_valid(state.win_id) then
-    vim.api.nvim_win_set_cursor(state.win_id, { vim.api.nvim_buf_line_count(state.buf), 0 })
-  end
+  float_window.set_text(_format_tool_calls(tool_calls))
 end
 
 --- 面板当前展示的文本（测试用）
 --- @return string
 function M.get_content()
-  if not state.buf or not vim.api.nvim_buf_is_valid(state.buf) then return "" end
-  return table.concat(vim.api.nvim_buf_get_lines(state.buf, 0, -1, false), "\n")
+  return float_window.get_text()
 end
 
 --- 关闭面板
 function M.close()
-  if state.win_id and vim.api.nvim_win_is_valid(state.win_id) then
-    pcall(vim.api.nvim_win_close, state.win_id, true)
-  end
-  state.win_id = nil
-  state.buf = nil
+  float_window.close()
 end
 
 --- 是否打开
 --- @return boolean
 function M.is_open()
-  return state.win_id ~= nil and vim.api.nvim_win_is_valid(state.win_id)
+  return float_window.is_open()
 end
 
 --- 重置（测试用）
 function M.reset()
-  M.close()
+  float_window.reset()
 end
 
 return M

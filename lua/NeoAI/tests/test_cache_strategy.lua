@@ -222,9 +222,13 @@ tests.suite("cache_strategy", function(_, it)
     end
 
     local captured = nil
-    local orig_send = request_mod.send
-    request_mod.send = function(messages, opts)
+    local orig_send = request_mod.send_stream
+    request_mod.send_stream = function(messages, opts, on_chunk)
       captured = { messages = messages, opts = opts }
+      -- 模拟流式返回摘要：先吐分片（供 COMPACTION_CHUNK 广播），再整体 resolve
+      if on_chunk then
+        on_chunk({ content = "## Primary Request and Intent\n- resume" })
+      end
       return async.resolve({ content = "## Primary Request and Intent\n- resume", usage = { prompt_tokens = 60, prompt_cache_hit_tokens = 55 } })
     end
 
@@ -237,7 +241,7 @@ tests.suite("cache_strategy", function(_, it)
     end)
     local wait_ok = vim.wait(3000, function() return done end)
     ok = wait_ok and value == true
-    request_mod.send = orig_send
+    request_mod.send_stream = orig_send
 
     t.true_(ok, "压缩应发生")
     t.not_nil(captured, "应调用摘要请求")

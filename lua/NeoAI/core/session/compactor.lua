@@ -127,13 +127,30 @@ local function _summarize(agent, shadow, cfg)
   messages[#messages + 1] = { role = "user", content = COMPACTION_INSTRUCTION }
 
   local tool_defs = tool_loop._tool_definitions(agent)
-  return request.send(messages, {
+  -- 流式接收摘要：实时把收到的推理 / 正文分片广播出去，UI 端显示"上下文压缩"悬浮窗，
+  -- 避免压缩期间界面无任何反馈、看起来像卡住。
+  local acc_reasoning = ""
+  local acc_content = ""
+  return request.send_stream(messages, {
     agent_config = agent.config,
     model = agent.model,
     tools = tool_defs,
     signal = agent.signal,
     max_tokens = cfg.compact_max_tokens or 8192,
-  })
+  }, function(chunk)
+    if not chunk then return end
+    if chunk.reasoning and chunk.reasoning ~= "" then
+      acc_reasoning = acc_reasoning .. chunk.reasoning
+    end
+    if chunk.content and chunk.content ~= "" then
+      acc_content = acc_content .. chunk.content
+    end
+    event_bus.emit(events.COMPACTION_CHUNK, {
+      agent_id = agent.id,
+      reasoning = acc_reasoning,
+      content = acc_content,
+    })
+  end)
 end
 
 --- 用检查点 user 消息替换被折叠区间

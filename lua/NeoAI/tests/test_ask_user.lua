@@ -101,13 +101,15 @@ tests.suite("ask_user", function(_, it)
     ask.reset()
   end)
 
-  it("并行第二次提问被拒绝（防双弹窗挂起）", function(t)
+  it("并行第二次提问排队等待，回答后再展示（不失败）", function(t)
     local ask = require("NeoAI.tools.builtin.ask_user")
     local async = require("NeoAI.utils.async")
     ask.reset()
-    local captured = {}
+    local shown = {}
     ask.set_ui({
-      show = function(config) captured.config = config end,
+      show = function(config)
+        shown[#shown + 1] = config
+      end,
       hide = function() end,
     })
     local tl = find_tool("ask_user")
@@ -120,10 +122,22 @@ tests.suite("ask_user", function(_, it)
       function(m) out2.msg = m end,
       function(e) out2.err = e end,
       { agent = { id = "a7" }, signal = async.create_signal() })
+
     t.nil_(out1.err, "第一个提问等待回答")
-    t.matches("等待", tostring(out2.err and out2.err.message or out2.err) or "", "第二个提问应被拒绝")
-    captured.config.on_answer("完成")
+    t.nil_(out2.err, "第二个提问不应被拒绝，而是排队等待")
+    t.nil_(out2.msg, "第二个提问排队中，尚未展示")
+    t.eq(1, #shown, "同一时刻只展示一个提问弹窗")
+    t.eq("第一个问题", shown[1].question)
+
+    shown[1].on_answer("完成")
     t.matches("完成", out1.msg or "")
+    -- 第一个回答后展示第二个
+    t.eq(2, #shown, "第一个回答后应紧接展示第二个提问")
+    t.eq("第二个问题", shown[2].question)
+    t.nil_(out2.msg, "第二个提问已展示，正等待用户回答")
+
+    shown[2].on_answer("第二个答案")
+    t.matches("第二个答案", out2.msg or "")
     ask.reset()
   end)
 

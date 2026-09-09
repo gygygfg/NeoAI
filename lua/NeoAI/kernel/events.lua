@@ -121,7 +121,12 @@ M.LOG_MESSAGE = "log:message"
 
 -- ========== 上下文压缩 ==========
 M.COMPACTION_STARTED = "compaction:started"
+M.COMPACTION_CHUNK = "compaction:chunk"
 M.COMPACTION_COMPLETED = "compaction:completed"
+
+-- ========== 计划蒸馏 ==========
+M.PLAN_DISTILL_STARTED = "plan_distill:started"
+M.PLAN_DISTILL_CHUNK = "plan_distill:chunk"
 M.PLAN_DISTILLED = "plan_distilled"
 
 return M

@@ -14,7 +14,100 @@ local M = {}
 -- ========== 私有状态 ==========
 
 local ui = nil -- { show(config), hide() }
-local pending = false -- 是否有未回答的提问（工具循环并行执行，避免双提问互相覆盖挂起）
+-- 并行提问排队：同一时刻只展示一个提问弹窗，其余按序等待；前一个回答/取消后再展示下一个，
+-- 而不是直接失败。UI 是单窗口，串行展示避免双弹窗互相覆盖挂起。
+local queue = {} -- 待展示的提问（FIFO）
+local current = nil -- 当前展示中的提问（none 时才有队列可弹出）
+
+-- ========== 私有辅助（排队调度） ==========
+
+--- 前置声明：_settle 在结束时调用 _drain 弹出队首（_drain 于下方定义）
+local _drain
+
+--- 终结一个提问：收敛状态、恢复计时器、上报事件、回传给工具框架。
+--- @param inv table 提问对象
+--- @param ok boolean 是否成功
+--- @param result any 成功时答案 / 失败时错误表
+--- @param allow_next boolean 是否继续展示队首（用户回答/取消后 true；Agent 中止时不新开弹窗）
+local function _settle(inv, ok, result, allow_next)
+  if inv.settled then return end
+  inv.settled = true
+  if current == inv then current = nil end
+  if not inv.waiting_started then
+    for i = #queue, 1, -1 do
+      if queue[i] == inv then
+        table.remove(queue, i)
+        break
+      end
+    end
+  end
+  if inv.waiting_started then
+    event_bus.emit(events.ASK_USER_ANSWERED, { agent_id = inv.agent_id })
+  end
+  if inv.timer and inv.timer.resume then pcall(inv.timer.resume, inv.timer) end
+  if inv.unsub then pcall(inv.unsub) end
+  if ok then
+    inv.on_success(result)
+  else
+    inv.on_error(result)
+  end
+  -- 用户回答/取消后继续展示队首；Agent 中止等场景不新开弹窗。
+  if allow_next and not current then
+    _drain()
+  end
+end
+
+--- 展示一个提问（等待用户回答）
+--- @param inv table
+local function _activate(inv)
+  if not inv or inv.settled or inv.waiting_started then return end
+  inv.waiting_started = true
+  event_bus.emit(events.ASK_USER_WAITING, { agent_id = inv.agent_id })
+  -- 真正开始等待用户前暂停计时器：等待时间不累计活跃耗时、不消耗超时预算。
+  if inv.timer and inv.timer.pause then pcall(inv.timer.pause, inv.timer) end
+
+  local config = {
+    question = inv.question,
+    options = inv.options,
+    on_answer = function(answer)
+      _settle(inv, true, ("用户回答: %s"):format(tostring(answer)), true)
+    end,
+    on_cancel = function(reason)
+      _settle(inv, false, { kind = "cancelled", message = "用户取消了提问: " .. tostring(reason or "取消") }, true)
+    end,
+  }
+
+  if ui and ui.show then
+    local ok, err = pcall(ui.show, config)
+    if not ok then
+      _settle(inv, false, { kind = "ui", message = "提问界面打开失败: " .. tostring(err) }, true)
+    end
+    return
+  end
+
+  -- 未注册 UI：回退到 vim.ui.input（原生输入行）；仍不可用则报错
+  local ok, err = pcall(function()
+    vim.ui.input({ prompt = inv.question .. " " }, function(answer)
+      if answer == nil or answer == "" then
+        _settle(inv, false, { kind = "cancelled", message = "用户未输入回答（已跳过提问）" }, true)
+      else
+        _settle(inv, true, ("用户回答: %s"):format(tostring(answer)), true)
+      end
+    end)
+  end)
+  if not ok then
+    _settle(inv, false, { kind = "ui", message = "无法向用户提问（未注册提问 UI 且 vim.ui.input 不可用）: " .. tostring(err) }, true)
+  end
+end
+
+--- 若当前无提问，弹出队首提问
+_drain = function()
+  if current then return end
+  local inv = table.remove(queue, 1)
+  if not inv then return end
+  current = inv
+  _activate(inv)
+end
 
 -- ========== 工具定义 ==========
 
@@ -50,94 +143,31 @@ ask_user_tools.ask_user = helpers.define_tool(
       end
     end
 
-    local agent_id = ctx and ctx.agent and ctx.agent.id
-    local settled = false
-    local waiting_started = false -- 本次调用是否真正进入等待（用于对称上报 waiting/answered）
-    -- 等待用户回答的耗时不计入工具执行时间/超时：暂停可暂停计时器，回答/取消后恢复。
-    local timer = ctx and ctx.timer
-    local function finish_ok(answer)
-      if settled then return end
-      settled = true
-      pending = false
-      if timer and timer.resume then pcall(timer.resume, timer) end
-      if waiting_started then
-        event_bus.emit(events.ASK_USER_ANSWERED, { agent_id = agent_id })
-      end
-      on_success(("用户回答: %s"):format(tostring(answer)))
-    end
-    local function finish_err(err)
-      if settled then return end
-      settled = true
-      pending = false
-      if timer and timer.resume then pcall(timer.resume, timer) end
-      if waiting_started then
-        event_bus.emit(events.ASK_USER_ANSWERED, { agent_id = agent_id })
-      end
-      on_error(err)
-    end
-
-    -- 同一时刻只允许一个未回答的提问（工具循环并行执行时防止双弹窗互相覆盖挂起）
-    if pending then
-      finish_err({ kind = "busy", message = "已有未回答的提问，请先等待用户回答上一个问题" })
-      return
-    end
-    pending = true
-    waiting_started = true
-    event_bus.emit(events.ASK_USER_WAITING, { agent_id = agent_id })
-    -- 真正开始等待用户前暂停计时器：等待时间不累计活跃耗时、不消耗超时预算。
-    if timer and timer.pause then pcall(timer.pause, timer) end
-
-    -- Agent 取消时立即终止等待（关闭 UI + 拒绝）
-    local unsub
-    local signal = ctx and ctx.signal
-    if signal and signal.subscribe then
-      unsub = signal:subscribe(function(reason)
-        if ui and ui.hide then pcall(ui.hide) end
-        finish_err({ kind = "aborted", message = "提问被取消（" .. tostring(reason or "aborted") .. "）" })
-      end)
-    end
-
-    local function cleanup()
-      if unsub then pcall(unsub) end
-    end
-
-    local config = {
+    local inv = {
       question = question,
       options = options,
-      on_answer = function(answer)
-        cleanup()
-        finish_ok(answer)
-      end,
-      on_cancel = function(reason)
-        cleanup()
-        finish_err({ kind = "cancelled", message = "用户取消了提问: " .. tostring(reason or "取消") })
-      end,
+      agent_id = ctx and ctx.agent and ctx.agent.id,
+      on_success = on_success,
+      on_error = on_error,
+      timer = ctx and ctx.timer,
+      settled = false,
+      waiting_started = false, -- 是否真正进入等待（用于对称上报 waiting/answered）
+      unsub = nil,
     }
 
-    if ui and ui.show then
-      local ok, err = pcall(ui.show, config)
-      if not ok then
-        cleanup()
-        finish_err({ kind = "ui", message = "提问界面打开失败: " .. tostring(err) })
-      end
-      return
+    -- Agent 中止时立即终止等待（关闭当前展示的 UI + 拒绝）；排队中的提问一并终结，
+    -- 不再弹新的提问。
+    local signal = ctx and ctx.signal
+    if signal and signal.subscribe then
+      inv.unsub = signal:subscribe(function(reason)
+        if current == inv and ui and ui.hide then pcall(ui.hide) end
+        _settle(inv, false, { kind = "aborted", message = "提问被取消（" .. tostring(reason or "aborted") .. "）" }, false)
+      end)
     end
 
-    -- 未注册 UI：回退到 vim.ui.input（原生输入行）；仍不可用则报错
-    local ok, err = pcall(function()
-      vim.ui.input({ prompt = question .. " " }, function(answer)
-        cleanup()
-        if answer == nil or answer == "" then
-          finish_err({ kind = "cancelled", message = "用户未输入回答（已跳过提问）" })
-        else
-          finish_ok(answer)
-        end
-      end)
-    end)
-    if not ok then
-      cleanup()
-      finish_err({ kind = "ui", message = "无法向用户提问（未注册提问 UI 且 vim.ui.input 不可用）: " .. tostring(err) })
-    end
+    -- 并行提问入队等待：同一时刻只展示一个，其余按序排在前一个回答/取消后再展示，不直接失败。
+    queue[#queue + 1] = inv
+    _drain()
   end,
   { category = "agent", approval = { auto_allow = true }, timeout = 300000 }
 )
@@ -160,7 +190,8 @@ end
 --- 重置（测试用）
 function M.reset()
   ui = nil
-  pending = false
+  queue = {}
+  current = nil
 end
 
 --- 获取工具列表

@@ -222,4 +222,78 @@ tests.suite("multimodal", function(_, it, before_each)
     t.eq(PNG, accessible, "附件字节与源一致")
     os.execute("rm -f " .. path)
   end)
+
+  it("read_image 工具：URL 下载 + 附件一致 + 临时文件清理", function(t)
+    local registry = require("NeoAI.tools.registry")
+    local att = require("NeoAI.core.attachment.attachment")
+    if not registry.has("read_image") then
+      require("NeoAI.tools").reload_tools()
+    end
+    local image_tool = registry.get("read_image")
+    t.not_nil(image_tool, "read_image 已注册")
+
+    -- 准备 PNG 文件 + 本地 HTTP 服务（python3 http.server 提供 /tmp 下的静态文件）
+    os.execute("mkdir -p /tmp/opencode/neoai_www")
+    local spath = "/tmp/opencode/neoai_www/t.png"
+    local f = io.open(spath, "wb")
+    f:write(PNG)
+    f:close()
+
+    -- 找一个空闲端口（绑定 127.0.0.1:0 后取出分配给的实际端口）
+    local uv = vim.uv
+    local sock = uv.new_tcp()
+    uv.tcp_bind(sock, "127.0.0.1", 0)
+    local sname = uv.tcp_getsockname(sock)
+    uv.close(sock)
+    local port = sname.port
+    t.true_(type(port) == "number" and port > 0, "取得空闲端口")
+
+    -- 启动服务器（jobstart 传空字典 {} 会触发 Vim E475，故省略 options）
+    local server_job = vim.fn.jobstart({
+      "python3", "-m", "http.server", tostring(port), "--bind", "127.0.0.1",
+      "--directory", "/tmp/opencode/neoai_www",
+    })
+    t.true_(server_job > 0, "HTTP 服务器启动")
+
+    -- 等待服务器就绪（curl -fs 成功即 2xx）
+    local ready = wait_until(function()
+      pcall(vim.fn.system,
+        { "curl", "-fs", "-o", "/dev/null", "http://127.0.0.1:" .. port .. "/t.png" })
+      return vim.v.shell_error == 0
+    end)
+    t.true_(ready, "服务器就绪（可下载 2xx）")
+
+    -- 记录调用前已有的 /tmp 临时文件数，断言调用后不新增（成功/失败均清理）
+    local before_leftover = #vim.fn.glob("/tmp/neoai_img_*", false, true)
+
+    local url = "http://127.0.0.1:" .. port .. "/t.png"
+    local ok = false
+    local result
+    image_tool.func({ file_path = url, description = "测试URL" }, function(res)
+      result = res
+      ok = true
+    end, function(e)
+      error("URL 读取应成功却失败: " .. tostring(e and e.message or e))
+    end, { agent = { model = "deepseek-v4-flash-vision-exp" } })
+    t.true_(wait_until(function() return ok end), "URL 读取成功")
+
+    t.eq(url, result.path, "返回 path 为原始 URL")
+    t.matches("^sha256:", result.image.attachmentId, "图像引用内容寻址")
+
+    -- 附件字节与源一致
+    local ok2, accessible
+    att.read_original(result.image.attachmentId):then_(function(data) accessible = data ok2 = true end)
+    t.true_(wait_until(function() return ok2 end), "附件可读")
+    t.eq(PNG, accessible, "附件字节与源一致")
+
+    -- 临时文件已清理（finally 在 on_success 之后执行，轮询确认无新增）
+    local cleaned = wait_until(function()
+      return #vim.fn.glob("/tmp/neoai_img_*", false, true) == before_leftover
+    end)
+    t.true_(cleaned, "临时文件已清理")
+
+    -- 清理：停服务器 + 删除静态目录
+    pcall(vim.fn.jobstop, server_job)
+    os.execute("rm -rf /tmp/opencode/neoai_www")
+  end)
 end)

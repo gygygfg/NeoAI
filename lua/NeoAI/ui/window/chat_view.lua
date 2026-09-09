@@ -10,6 +10,7 @@ local input_box = require("NeoAI.ui.components.input_box")
 local model_picker = require("NeoAI.ui.components.model_picker")
 local reasoning_panel = require("NeoAI.ui.components.reasoning_panel")
 local tool_args_panel = require("NeoAI.ui.components.tool_args_panel")
+local float_stream_window = require("NeoAI.ui.components.float_stream_window")
 local fold = require("NeoAI.ui.components.fold")
 local display_modes = require("NeoAI.ui.components.display_modes")
 local chat_service = require("NeoAI.services.chat_service")
@@ -246,6 +247,63 @@ local function _flush_reasoning()
   reasoning_panel.append(chunk)
 end
 
+-- 上下文压缩 / 计划蒸馏分片批处理：与推理分片一致，压缩 / 蒸馏期间实时把接收到的
+-- 摘要（推理 + 正文）合并为一次窗口刷新，避免界面"看起来卡住"。
+local ctxop_pending = ""
+local ctxop_flush_scheduled = false
+-- 上下文操作已终止（完成 / 正文开始 / 窗口关闭）：已排队的冲刷回调应作废。
+local ctxop_cancelled = true
+-- 当前上下文操作类型（决定悬浮窗标题）："compaction" | "distill"
+local ctxop_kind = "compaction"
+
+--- 取消未冲刷的上下文操作分片（完成 / 正文开始 / 窗口关闭时调用）
+local function _cancel_ctxop()
+  ctxop_pending = ""
+  ctxop_cancelled = true
+end
+
+--- 按当前类型打开上下文操作悬浮窗
+local function _open_ctxop_window()
+  local title = "🧬 上下文压缩"
+  if ctxop_kind == "distill" then title = "🧬 计划蒸馏" end
+  float_stream_window.open(title, { filetype = "neoai_context_op" })
+end
+
+--- 把接收到的推理 + 正文格式化为展示文本
+--- @param reasoning string|nil
+--- @param content string|nil
+--- @return string
+local function _format_ctxop(reasoning, content)
+  local parts = {}
+  if reasoning and reasoning ~= "" then
+    parts[#parts + 1] = "🧠 思考中…\n" .. reasoning
+  end
+  if content and content ~= "" then
+    parts[#parts + 1] = content
+  end
+  return table.concat(parts, "\n\n")
+end
+
+--- 把缓存的上下文操作分片一次性刷到悬浮窗
+local function _flush_ctxop()
+  ctxop_flush_scheduled = false
+  if ctxop_cancelled then
+    ctxop_cancelled = false
+    return
+  end
+  if ctxop_pending == "" then return end
+  -- 冲刷时若光标已不跟随（用户回看上方内容 / 切走），作废本次冲刷：
+  -- 不弹出上下文操作悬浮窗，避免干扰用户当前查看的位置。
+  if not _cursor_within_follow_margin() then
+    ctxop_pending = ""
+    return
+  end
+  local text = ctxop_pending
+  ctxop_pending = ""
+  _open_ctxop_window()
+  float_stream_window.set_text(text)
+end
+
 --- 流式更新当前消息
 --- @param payload table
 local function _on_message_updated(payload)
@@ -256,6 +314,9 @@ local function _on_message_updated(payload)
     -- _flush_reasoning 稍后还会把残留分片 append 上去、把已关闭的悬浮窗重新打开。
     _cancel_pending_reasoning()
     reasoning_panel.close()
+    -- 正文开始说明生成已在恢复，关闭上下文压缩 / 蒸馏悬浮窗。
+    _cancel_ctxop()
+    float_stream_window.close()
   end
   -- 渲染延后到本 tick 结束并合并：同一 tick 内多次分片/事件只渲染一次，
   -- 避免每个分片都全量重渲染 + zxzM 折叠重算（多轮历史消息时尤其卡主界面）。
@@ -271,6 +332,9 @@ function M.flush()
   end
   if tool_args_flush_scheduled then
     _flush_tool_args()
+  end
+  if ctxop_flush_scheduled then
+    _flush_ctxop()
   end
   if render_scheduled and not render_flushed then
     _do_render()
@@ -387,10 +451,61 @@ local function _close_tool_args_panel(payload)
   tool_args_panel.close()
 end
 
+-- ========== 上下文压缩 / 计划蒸馏悬浮窗 ==========
+
+--- 上下文操作开始：打开悬浮窗并准备接收分片（光标不跟随时不弹）
+--- @param payload table
+--- @param kind string "compaction" | "distill"
+local function _on_ctxop_started(payload, kind)
+  if not payload or payload.agent_id ~= state.agent_id then return end
+  ctxop_cancelled = false
+  ctxop_kind = kind or "compaction"
+  -- 光标不跟随时抑制悬浮窗：既不缓存分片也不调度冲刷，避免弹出悬浮窗干扰查看。
+  if not _cursor_within_follow_margin() then return end
+  local placeholder = kind == "distill" and "正在计划蒸馏…" or "正在压缩上下文…"
+  ctxop_pending = placeholder
+  if not ctxop_flush_scheduled then
+    ctxop_flush_scheduled = true
+    vim.schedule(_flush_ctxop)
+  end
+end
+
+--- 上下文操作分片：更新悬浮窗内容
+--- @param payload table { agent_id, reasoning, content }
+local function _on_ctxop_chunk(payload)
+  if not payload or payload.agent_id ~= state.agent_id then return end
+  ctxop_cancelled = false
+  if not _cursor_within_follow_margin() then return end
+  ctxop_pending = _format_ctxop(payload.reasoning, payload.content)
+  if not ctxop_flush_scheduled then
+    ctxop_flush_scheduled = true
+    vim.schedule(_flush_ctxop)
+  end
+end
+
+--- 上下文操作结束：关闭悬浮窗
+--- @param payload table
+local function _close_ctxop_panel(payload)
+  if not payload or payload.agent_id ~= state.agent_id then return end
+  _cancel_ctxop()
+  float_stream_window.close()
+end
+
+--- @param payload table
+local function _on_compaction_started(payload)
+  _on_ctxop_started(payload, "compaction")
+end
+
+--- @param payload table
+local function _on_distill_started(payload)
+  _on_ctxop_started(payload, "distill")
+end
+
 --- @param payload table
 local function _on_generation_finished(payload)
   _close_reasoning_panel(payload)
   _close_tool_args_panel(payload)
+  _close_ctxop_panel(payload)
   _on_message_updated(payload)
 end
 
@@ -803,6 +918,8 @@ function M.open(opts)
       state.agent_id = agent.id
       chat_service.attach_window(state.win_id, agent)
       reasoning_panel.close()
+      _cancel_ctxop()
+      float_stream_window.close()
       _render()
       _scroll_to_end()
     end
@@ -889,6 +1006,13 @@ function M.open(opts)
   -- 工具参数流式接收：像思考过程悬浮窗一样实时打开"接收参数"悬浮窗
   state.unsubs[#state.unsubs + 1] = event_bus.on(events.TOOL_ARG_CHUNK, _on_tool_arg_chunk)
   state.unsubs[#state.unsubs + 1] = event_bus.on(events.TOOL_ARG_COMPLETED, _close_tool_args_panel)
+  -- 上下文压缩 / 计划蒸馏期间实时展示接收到的摘要（推理 + 正文）
+  state.unsubs[#state.unsubs + 1] = event_bus.on(events.COMPACTION_STARTED, _on_compaction_started)
+  state.unsubs[#state.unsubs + 1] = event_bus.on(events.COMPACTION_CHUNK, _on_ctxop_chunk)
+  state.unsubs[#state.unsubs + 1] = event_bus.on(events.COMPACTION_COMPLETED, _close_ctxop_panel)
+  state.unsubs[#state.unsubs + 1] = event_bus.on(events.PLAN_DISTILL_STARTED, _on_distill_started)
+  state.unsubs[#state.unsubs + 1] = event_bus.on(events.PLAN_DISTILL_CHUNK, _on_ctxop_chunk)
+  state.unsubs[#state.unsubs + 1] = event_bus.on(events.PLAN_DISTILLED, _close_ctxop_panel)
   state.unsubs[#state.unsubs + 1] = event_bus.on(events.GENERATION_COMPLETED, _on_agent_end)
   state.unsubs[#state.unsubs + 1] = event_bus.on(events.GENERATION_ERROR, _on_agent_end)
   state.unsubs[#state.unsubs + 1] = event_bus.on(events.AGENT_ABORTED, _on_agent_end)
@@ -910,6 +1034,8 @@ function M.close()
   fold.clear_timing()
   reasoning_panel.close()
   tool_args_panel.close()
+  _cancel_ctxop()
+  float_stream_window.close()
   -- 卸载当前显示模式插件（还原折叠覆盖）
   display_modes.detach()
   -- 清理缓存中的推理分片与待调度渲染，避免窗口重开后残留
@@ -919,6 +1045,9 @@ function M.close()
   tool_args_pending = ""
   tool_args_flush_scheduled = false
   tool_args_cancelled = true
+  ctxop_pending = ""
+  ctxop_flush_scheduled = false
+  ctxop_cancelled = true
   render_scheduled = false
   if state.input_win_id and vim.api.nvim_win_is_valid(state.input_win_id) then
     pcall(vim.api.nvim_win_close, state.input_win_id, true)

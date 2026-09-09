@@ -229,7 +229,18 @@ vim.api.nvim_create_autocmd("User", {
 | 常量 | 值 | 触发时机 | payload 关键字段 |
 | --- | --- | --- | --- |
 | `COMPACTION_STARTED` | `compaction:started` | 开始上下文压缩 | `{ agent_id, estimated_tokens }` |
+| `COMPACTION_CHUNK` | `compaction:chunk` | 摘要流式分片到达 | `{ agent_id, reasoning, content }` |
 | `COMPACTION_COMPLETED` | `compaction:completed` | 压缩完成 | `{ agent_id, replaced, summary }` |
+
+### 计划蒸馏
+
+| 常量 | 值 | 触发时机 | payload 关键字段 |
+| --- | --- | --- | --- |
+| `PLAN_DISTILL_STARTED` | `plan_distill:started` | 开始计划阶段蒸馏 | `{ agent_id }` |
+| `PLAN_DISTILL_CHUNK` | `plan_distill:chunk` | 分类摘要流式分片到达 | `{ agent_id, reasoning, content }` |
+| `PLAN_DISTILLED` | `plan_distilled` | 蒸馏完成 | `{ agent_id, replaced, summary }` |
+
+> 压缩 / 蒸馏期间 UI 会打开"🧬 上下文压缩 / 🧬 计划蒸馏"悬浮窗，实时展示接收到的推理与正文。
 
 ## 4. 事件订阅最佳实践
 

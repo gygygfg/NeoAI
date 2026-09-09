@@ -1374,4 +1374,97 @@ tests.suite("chat_ui", function(_, it)
     chat_service.reset()
   end)
 
+  it("上下文压缩期间打开悬浮窗并流式显示摘要，完成后关闭", function(t)
+    local chat_view = require("NeoAI.ui.window.chat_view")
+    local chat_service = require("NeoAI.services.chat_service")
+    local float_window = require("NeoAI.ui.components.float_stream_window")
+    local event_bus = require("NeoAI.kernel.event_bus")
+    local events = require("NeoAI.kernel.events")
+    chat_view.reset()
+    chat_service.reset()
+    float_window.reset()
+
+    chat_view.open()
+    local agent = chat_service.get_current_agent()
+    event_bus.emit(events.COMPACTION_STARTED, { agent_id = agent.id, estimated_tokens = 100 })
+    chat_view.flush()
+    t.true_(float_window.is_open(), "开始压缩时应打开悬浮窗")
+    t.matches("正在压缩", float_window.get_text(), "压缩开始时应显示占位提示")
+
+    event_bus.emit(events.COMPACTION_CHUNK, { agent_id = agent.id, reasoning = "思考中", content = "发生了一次压缩" })
+    chat_view.flush()
+    t.true_(float_window.is_open(), "压缩分片应保持悬浮窗打开")
+    t.matches("思考中", float_window.get_text(), "悬浮窗应展示接收到的推理")
+    t.matches("压缩", float_window.get_text(), "悬浮窗应展示接收到的摘要正文")
+
+    event_bus.emit(events.COMPACTION_COMPLETED, { agent_id = agent.id, replaced = 2, summary = "摘要" })
+    t.false_(float_window.is_open(), "压缩完成时应关闭悬浮窗")
+
+    chat_view.reset()
+    chat_service.reset()
+    float_window.reset()
+  end)
+
+  it("计划蒸馏期间打开悬浮窗，完成后关闭", function(t)
+    local chat_view = require("NeoAI.ui.window.chat_view")
+    local chat_service = require("NeoAI.services.chat_service")
+    local float_window = require("NeoAI.ui.components.float_stream_window")
+    local event_bus = require("NeoAI.kernel.event_bus")
+    local events = require("NeoAI.kernel.events")
+    chat_view.reset()
+    chat_service.reset()
+    float_window.reset()
+
+    chat_view.open()
+    local agent = chat_service.get_current_agent()
+    event_bus.emit(events.PLAN_DISTILL_STARTED, { agent_id = agent.id })
+    chat_view.flush()
+    t.true_(float_window.is_open(), "开始蒸馏时应打开悬浮窗")
+    t.matches("蒸馏", float_window.get_text(), "蒸馏开始时应显示占位提示")
+
+    event_bus.emit(events.PLAN_DISTILL_CHUNK, { agent_id = agent.id, reasoning = nil, content = "蒸馏后的上下文" })
+    chat_view.flush()
+    t.matches("蒸馏后的上下文", float_window.get_text(), "悬浮窗应展示蒸馏时接收到的正文")
+
+    event_bus.emit(events.PLAN_DISTILLED, { agent_id = agent.id, replaced = 2, summary = "蒸馏摘要" })
+    t.false_(float_window.is_open(), "蒸馏完成时应关闭悬浮窗")
+
+    chat_view.reset()
+    chat_service.reset()
+    float_window.reset()
+  end)
+
+  it("光标不跟随时不打开上下文压缩悬浮窗（与推理一致）", function(t)
+    local chat_view = require("NeoAI.ui.window.chat_view")
+    local chat_service = require("NeoAI.services.chat_service")
+    local float_window = require("NeoAI.ui.components.float_stream_window")
+    local event_bus = require("NeoAI.kernel.event_bus")
+    local events = require("NeoAI.kernel.events")
+    chat_view.reset()
+    chat_service.reset()
+    float_window.reset()
+
+    local opened = chat_view.open()
+    local agent = chat_service.get_current_agent()
+    -- 预置足够长的内容，使 buffer 行数超过 5
+    agent.messages = {
+      { role = "user", content = "q1" },
+      { role = "assistant", content = "第一行\n第二行\n第三行\n第四行\n第五行\n第六行" },
+    }
+    chat_view.refresh()
+    vim.api.nvim_set_current_win(opened.win_id)
+
+    -- 光标移到顶部（不在最后 5 行内），模拟用户回看上方内容
+    vim.api.nvim_win_set_cursor(opened.win_id, { 1, 0 })
+
+    event_bus.emit(events.COMPACTION_STARTED, { agent_id = agent.id, estimated_tokens = 100 })
+    event_bus.emit(events.COMPACTION_CHUNK, { agent_id = agent.id, reasoning = "", content = "不应显示" })
+    chat_view.flush()
+    t.false_(float_window.is_open(), "光标不跟随时不弹出压缩悬浮窗")
+
+    chat_view.reset()
+    chat_service.reset()
+    float_window.reset()
+  end)
+
 end)
