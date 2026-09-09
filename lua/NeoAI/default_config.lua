@@ -279,6 +279,7 @@ local DEFAULT_CONFIG = {
     plan_mode = {
       enabled = true, -- 计划模式
       auto_execute_on_approve = true, -- 计划经用户确认后自动转入 CHAT 并按任务清单开始执行
+      distill_on_execute = true, -- 计划完成、用户以任何非计划模式确认开始时，把计划阶段调研上下文蒸馏为 8 段检查点并替换压缩
       extra_safe_tools = {}, -- 计划模式白名单扩展（只读/信息查询类之外的工具需显式加入）
       mutating_tools = { -- 兼容保留（计划模式可见集已覆盖此语义）
         "edit_file",

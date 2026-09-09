@@ -101,6 +101,10 @@ end
 function M.enter(agent)
   if not agent then return false end
   agent.plan_mode = true
+  -- 记录进入计划模式时的消息数，供 plan_distill 切分「计划阶段调研窗口」。
+  agent._plan_enter_index = #(agent.messages or {})
+  -- 新一轮计划：重置「本次 plan 已蒸馏」标记，允许从 plan 切到其它模式时再次蒸馏。
+  agent._plan_distilled = false
   _apply_section(agent, true)
   event_bus.emit(events.PLAN_MODE_CHANGED, { agent_id = agent.id, active = true })
   return true

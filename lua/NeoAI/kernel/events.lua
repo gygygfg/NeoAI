@@ -122,5 +122,6 @@ M.LOG_MESSAGE = "log:message"
 -- ========== 上下文压缩 ==========
 M.COMPACTION_STARTED = "compaction:started"
 M.COMPACTION_COMPLETED = "compaction:completed"
+M.PLAN_DISTILLED = "plan_distilled"
 
 return M

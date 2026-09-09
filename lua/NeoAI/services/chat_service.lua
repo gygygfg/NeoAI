@@ -43,6 +43,37 @@ local function agent_mod_is_disposed(agent)
   return agent.state == "disposed" or (agent.messages and #agent.messages == 0 and agent.signal and agent.signal:aborted())
 end
 
+--- plan→其它模式执行前的蒸馏：仅当「上一回合是计划模式」且「本次以非计划模式发送」时触发一次。
+--- 触发条件（对齐 plan→execute 语义）：
+--- - 当前不在计划模式（正在计划模式下发送是计划回合，不得蒸馏）；
+--- - 本 agent 记录过进入计划模式的边界（_plan_enter_index）且尚未蒸馏（_plan_distilled）；
+--- - 窗口非空（有计划阶段内容待压缩）。
+--- 蒸馏失败/空摘要/窗口过小一律 no-op（plan_distill 内部已兜底），不阻塞发送。
+--- @param agent table
+--- @return Deferred resolve(boolean) 是否执行了蒸馏
+local function _distill_if_needed(agent)
+  if not agent or not agent.messages then
+    return async.resolve(false)
+  end
+  local plan_mode = require("NeoAI.tools.builtin.plan_mode")
+  if plan_mode.is_active(agent) then
+    return async.resolve(false)
+  end
+  if not agent._plan_enter_index or agent._plan_distilled then
+    return async.resolve(false)
+  end
+  if #agent.messages <= agent._plan_enter_index then
+    return async.resolve(false)
+  end
+  local plan_distill = require("NeoAI.core.session.plan_distill")
+  return plan_distill.run(agent):then_(function(done)
+    if done then agent._plan_distilled = true end
+    return done
+  end, function()
+    return async.resolve(false)
+  end)
+end
+
 --- 创建/获取当前 Agent
 --- @param opts table|nil { model?, mode?, scenario? }
 --- @return table Agent
@@ -81,11 +112,18 @@ local function _persist_agent(agent)
   -- 避免把易变运行态固化到持久历史并污染「用户轮次」计数。
   for _, msg in ipairs(agent.messages) do
     if not msg._synced and not msg.runtime_context then
-      -- 压缩检查点：先在 durable surface 移除被替换的已同步旧消息（替换而非追加）
+      -- 压缩检查点：先在 durable surface 移除被替换的已同步旧消息（替换而非追加）。
+      -- front 替换（compactor）从头部移除；tail 替换（plan_distill）从尾部移除。
       if msg.checkpoint and msg.replaced_count and session.messages then
         local n = math.min(msg.replaced_count, #session.messages)
-        for _ = 1, n do
-          table.remove(session.messages, 1)
+        if msg.replaced_tail then
+          for _ = 1, n do
+            table.remove(session.messages)
+          end
+        else
+          for _ = 1, n do
+            table.remove(session.messages, 1)
+          end
         end
       end
       session_mod.add_message(session, {
@@ -123,12 +161,12 @@ local function _is_busy(agent)
   return agent.state == "generating" or agent.state == "tool_running" or agent._turn_claim ~= nil
 end
 
---- 发送一条消息（不做忙碌检查：调用方需保证 agent 空闲）
+--- 实际执行一轮生成（含 MESSAGE_SENT 事件 + 持久化）
 --- @param agent table
 --- @param content string
 --- @param opts table|nil
 --- @return Deferred
-local function _run_message(agent, content, opts)
+local function _do_run(agent, content, opts)
   event_bus.emit(events.MESSAGE_SENT, { agent_id = agent.id, content = content })
   return runtime.run(agent, content):then_(function(resp)
     _persist_agent(agent)
@@ -136,6 +174,20 @@ local function _run_message(agent, content, opts)
   end, function(err)
     _persist_agent(agent)
     return async.reject(err)
+  end)
+end
+
+--- 发送一条消息（不做忙碌检查：调用方需保证 agent 空闲）。
+--- 发送前做 plan→非plan 边界蒸馏：计划完成、用户以任何非计划模式确认开始即自动蒸馏一次。
+--- @param agent table
+--- @param content string
+--- @param opts table|nil
+--- @return Deferred
+local function _run_message(agent, content, opts)
+  return _distill_if_needed(agent):then_(function()
+    return _do_run(agent, content, opts)
+  end, function()
+    return _do_run(agent, content, opts)
   end)
 end
 
@@ -522,7 +574,8 @@ function M.approve_plan(opts)
     auto = config_store.get("tools.plan_mode.auto_execute_on_approve") ~= false
   end
   if auto and #items > 0 then
-    -- 自动执行：以确认指令驱动一轮生成，AI 按任务清单（todo）开始工作
+    -- 自动执行：发送确认指令驱动一轮生成，AI 按任务清单（todo）开始工作。
+    -- plan→非plan 边界蒸馏由发送路径统一触发（_run_message → _distill_if_needed）。
     return M.send_message(APPROVE_EXECUTE_MESSAGE):then_(function(resp)
       return { approved = true, plan = plan, todo_count = #items, message = resp }
     end, function(err)
