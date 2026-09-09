@@ -141,6 +141,38 @@ tests.suite("ask_user", function(_, it)
     ask.reset()
   end)
 
+  it("对象选项归一化为 label + description，选序号返回 label", function(t)
+    local ask = require("NeoAI.tools.builtin.ask_user")
+    local async = require("NeoAI.utils.async")
+    ask.reset()
+    local shown = {}
+    ask.set_ui({
+      show = function(config) shown[#shown + 1] = config end,
+      hide = function() end,
+    })
+    local tl = find_tool("ask_user")
+    local out = {}
+    tl.func(
+      { question = "怎么生成？", options = {
+        { label = "快速生成", description = "直接用当前上下文，不做计划" },
+        "仅计划",
+      } },
+      function(m) out.msg = m end,
+      function(e) out.err = e end,
+      { agent = { id = "a8" }, signal = async.create_signal() })
+
+    local cfg = shown[1]
+    t.eq(2, #cfg.options, "字符串与对象选项都应保留")
+    t.eq("快速生成", cfg.options[1].label)
+    t.eq("直接用当前上下文，不做计划", cfg.options[1].description)
+    t.eq("仅计划", cfg.options[2].label)
+    t.eq("", cfg.options[2].description)
+
+    cfg.on_answer("快速生成")
+    t.matches("快速生成", out.msg or "")
+    ask.reset()
+  end)
+
   it("未注册 UI 时回退到 vim.ui.input", function(t)
     local ask = require("NeoAI.tools.builtin.ask_user")
     local async = require("NeoAI.utils.async")

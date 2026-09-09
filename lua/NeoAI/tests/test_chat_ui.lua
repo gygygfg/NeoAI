@@ -1170,6 +1170,44 @@ tests.suite("chat_ui", function(_, it)
     ask_user_ui.reset()
   end)
 
+  it("提问选项拆分简介与描述并高亮", function(t)
+    local ask_user_ui = require("NeoAI.ui.components.ask_user")
+    ask_user_ui.reset()
+
+    local answered = nil
+    ask_user_ui.show({
+      question = "选择生成方式？",
+      options = {
+        { label = "快速生成", description = "直接用当前上下文" },
+        { label = "计划模式", description = "先调研再生成" },
+      },
+      on_answer = function(a) answered = a end,
+      on_cancel = function() end,
+    })
+
+    local buf
+    for _, w in ipairs(vim.api.nvim_list_wins()) do
+      local b = vim.api.nvim_win_get_buf(w)
+      if vim.bo[b].filetype == "neoai_ask_user" then
+        buf = b
+        break
+      end
+    end
+    t.not_nil(buf, "应创建提问悬浮窗")
+
+    local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+    local joined = table.concat(lines, "\n")
+    t.true_(joined:find("快速生成", 1, true) ~= nil, "应展示选项简介（短标签）")
+    t.true_(joined:find("直接用当前上下文", 1, true) ~= nil, "应展示选项描述")
+
+    -- 高亮：附加了选项简介/描述的高亮标记
+    local hl_ns = vim.api.nvim_create_namespace("neoai_ask_user_hi")
+    local marks = vim.api.nvim_buf_get_extmarks(buf, hl_ns, 0, -1, {})
+    t.true_(#marks > 0, "应附加选项高亮标记")
+
+    ask_user_ui.reset()
+  end)
+
   it("每个工具完成即各自更新状态（并发工具不互相等待）", function(t)
     local chat_view = require("NeoAI.ui.window.chat_view")
     local chat_service = require("NeoAI.services.chat_service")

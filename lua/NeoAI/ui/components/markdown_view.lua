@@ -12,9 +12,15 @@ local MARKDOWN_EXTS = { lua = "lua", py = "python", js = "javascript", ts = "typ
 -- 转义竖线占位符（\| 在拆分表格单元格前暂存，避免被当作列分隔符）
 local PIPE_PLACEHOLDER = "\1"
 
--- 表格列显示宽度上限：单格内容过长时截断显示，避免按最长格做整表对齐
--- （一个超长格会让所有行/分隔行填充成几十万字节的巨长行，渲染与重绘卡死）
+-- 单列显示宽度上限：未传入自适应 table_width（无窗口上下文/纯文本导出）时，
+-- 每列最多加到此宽度，整列超宽单元格按此列宽折行；原来按最长格做整表对齐把
+-- 所有行/分隔行填充成几十万字节的巨长行，卡死渲染。
 local MAX_COL_WIDTH = 60
+-- 单列内容宽下限（窗口自适应缩列时保底，表头/单字可换行显示）。
+local MIN_COL_WIDTH = 3
+-- 单格折行数上限：折行超过此数时末行以 … 结尾，避免单个巨长格撑爆 buffer。
+-- 折行显示（不再整格截断丢弃）已让长内容可读，但数量仍须有界。
+local MAX_CELL_LINES = 8
 -- 单行扫描上限：超过则只处理有界前缀（任何单元格展示宽度最多 MAX_COL_WIDTH，
 -- 超长行的后半段本就不会被显示，无需对几十万字节做模式匹配）
 local TABLE_ROW_SCAN_LIMIT = 2048
@@ -69,32 +75,91 @@ local function _is_sep_cell(cell)
   return cell:match("^:?%-+:?$") ~= nil
 end
 
---- 按显示宽度截断字符串，超出部分以 … 结尾（CJK 占 2 列）。
---- 字节数超过 max_width*3（最多 3 字节/字符）时显示宽度必然超限，跳过 strwidth
---- 快速截断；否则先做一次 strwidth 判断。strcharpart 取前 max_width 个字符再回退，
---- 保证只做有界的 strwidth 调用。
+--- 按显示宽度折行字符串（CJK 占 2 列），每行显示宽度不超过 max_width。
+--- 折行数超过 MAX_CELL_LINES 时截断：末行末尾以 … 结尾，保证输出有界，
+--- 避免单个超长格被折成数千行撑爆 buffer。
 --- @param str string
---- @param max_width number 显示宽度上限
---- @return string
-local function _truncate_display(str, max_width)
-  if #str <= max_width * 3 and vim.fn.strwidth(str) <= max_width then return str end
-  local s = vim.fn.strcharpart(str, 0, max_width)
-  while vim.fn.strwidth(s) > max_width - 1 do
-    s = vim.fn.strcharpart(s, 0, vim.fn.strchars(s) - 1)
+--- @param max_width number 每行显示宽度上限
+--- @return table 折行行数组
+local function _wrap_display(str, max_width)
+  local out = {}
+  local n = vim.fn.strchars(str)
+  local i = 1
+  while i <= n do
+    local line = ""
+    local w = 0
+    while i <= n do
+      local ch = vim.fn.strcharpart(str, i - 1, 1)
+      local cw = vim.fn.strwidth(ch)
+      if w + cw > max_width and w > 0 then break end
+      line = line .. ch
+      w = w + cw
+      i = i + 1
+    end
+    out[#out + 1] = line
   end
-  return s .. "…"
+  if #out == 0 then out[1] = "" end
+  if #out > MAX_CELL_LINES then
+    local capped = {}
+    for k = 1, MAX_CELL_LINES - 1 do capped[k] = out[k] end
+    -- 逐字回退末行，保证「末行 + …」的显示宽度不超出 max_width，
+    -- 避免截断后反而溢出列宽、破坏该行与下一列边框的对齐。
+    local last = out[MAX_CELL_LINES]
+    local avail = math.max(0, max_width - vim.fn.strwidth("…"))
+    while vim.fn.strwidth(last) > avail and vim.fn.strwidth(last) > 0 do
+      last = vim.fn.strcharpart(last, 0, math.max(1, vim.fn.strchars(last) - 1))
+    end
+    capped[MAX_CELL_LINES] = last .. "…"
+    return capped
+  end
+  return out
 end
 
---- 渲染 markdown 表格：按列显示宽度对齐（CJK 占 2 列）。
+--- 解析分隔行单元格的对齐标记（:--- / :---: / ---:），无冒号默认左对齐。
+--- @param cell string 已 trim 的分隔行单元格
+--- @return string "left"|"center"|"right"
+local function _sep_align(cell)
+  if cell:match("^:%-+:$") then return "center" end
+  if cell:match("^:%-+$") then return "left" end
+  if cell:match("^-+:$") then return "right" end
+  return "left"
+end
+
+--- 把单格内容按对齐方式在显示宽度内填充空格（左对齐补右、右对齐补左、居中两侧均分）。
+--- @param line string
+--- @param width number 目标显示宽度
+--- @param align string "left"|"center"|"right"
+--- @return string
+local function _pad_cell(line, width, align)
+  local extra = math.max(0, width - vim.fn.strwidth(line))
+  if align == "right" then
+    return string.rep(" ", extra) .. line
+  elseif align == "center" then
+    local left = math.floor(extra / 2)
+    return string.rep(" ", left) .. line .. string.rep(" ", extra - left)
+  end
+  return line .. string.rep(" ", extra)
+end
+
+--- 渲染 markdown 表格：按列显示宽度对齐（CJK 占 2 列），带完整上下边框。
 --- 需要至少一个分隔行（---/:-+:）才认为是表格；否则返回 nil（当作普通行）。
---- 每列宽度上限 MAX_COL_WIDTH：超长单元格截断显示，避免整表被单个巨长格撑爆。
+--- streaming=true 时正在生成：原样返回表格行（不填充空格/不折行），等生成结束后
+--- 再由本函数做一次完整对齐填充，避免表格流式生成期间列宽不断跳动。
+--- 表格最大总宽随调用方传入自适应（见 opts.table_width），在列间按自然宽度分摊；
+--- 超宽单元格按所分列宽折行（_wrap_display），每行输出多条物理行，行高 = 该行最高
+--- 单元格行数，其余单元格补空行使整行同步加高。
 --- @param rows table 连续表格行
---- @return table|nil 对齐后的行数组
-local function _render_table(rows)
+--- @param streaming boolean|nil 是否处于流式生成中
+--- @param table_width number|nil 表格最大总显示宽度（含边框；默认 MAX_TABLE_WIDTH）
+--- @return table|nil 对齐后的行数组（streaming 时为原样行）
+local function _render_table(rows, streaming, table_width)
+  if streaming then return rows end
+
   local split = {}
   local sep_idx = nil
+  local aligns = {}
   for idx, row in ipairs(rows) do
-    -- 超长行只处理有界前缀：后半个单元格本就会被截断显示，跳过可避免对
+    -- 超长行只处理有界前缀：后半个单元格本就会被折行/截断显示，跳过可避免对
     -- 几十万字节做 gsub/逐字符拆分（卡死主因）。
     local line = row
     if #line > TABLE_ROW_SCAN_LIMIT then
@@ -110,19 +175,24 @@ local function _render_table(rows)
           break
         end
       end
-      if is_sep then sep_idx = idx end
+      if is_sep then
+        sep_idx = idx
+        -- 提取每列对齐标记（缺省左对齐），用于后续单元格填充
+        for ci, c in ipairs(cells) do
+          aligns[ci] = _sep_align(c:gsub("^%s+", ""):gsub("%s+$", ""))
+        end
+      end
     end
   end
   if sep_idx == nil then return nil end
 
-  -- 一次性处理所有单元格：超长格先截断显示宽度再清理行内标记
-  -- （宽度计算与渲染共用，避免对超大字符串重复 strwidth/gsub）
+  -- 一次性清理所有单元格的行内标记（宽度计算与渲染共用，避免重复 strwidth/gsub）
   local cleaned = {}
   for idx, cells in ipairs(split) do
     cleaned[idx] = {}
     for ci, c in ipairs(cells) do
       local raw = c:gsub("^%s+", ""):gsub("%s+$", "")
-      cleaned[idx][ci] = _clean_inline(_truncate_display(raw, MAX_COL_WIDTH))
+      cleaned[idx][ci] = _clean_inline(raw)
     end
   end
 
@@ -130,7 +200,10 @@ local function _render_table(rows)
   for _, cells in ipairs(split) do
     col_count = math.max(col_count, #cells)
   end
-  local widths = {}
+  if col_count == 0 then return nil end
+
+  -- 各列自然显示宽度（该列非分隔行单元格的最大显示宽度）
+  local natural = {}
   for ci = 1, col_count do
     local w = 1
     for idx = 1, #split do
@@ -138,24 +211,99 @@ local function _render_table(rows)
         w = math.max(w, vim.fn.strwidth(cleaned[idx][ci] or ""))
       end
     end
-    widths[ci] = math.min(w, MAX_COL_WIDTH)
+    natural[ci] = w
+  end
+
+  -- 列宽分配：
+  -- - 未传 table_width（无窗口上下文）：每列 = min(自然宽, MAX_COL_WIDTH)，不做总宽缩减；
+  -- - 传了 table_width（随窗口自适应）：把「表格最大总宽」折算为列内容可用宽度分摊，
+  --   超出时按比例缩减（缩减小限 = max(表头列宽, MIN_COL_WIDTH)，窄列不虚增），
+  --   保证整表不超 table_width。
+  -- cell_pad_w=2：单元格左右各 1 空格；边界符（首尾 + 列间）共 col_count+1 个。
+  local cell_pad_w = 2
+  local widths = {}
+  if table_width == nil then
+    for ci = 1, col_count do
+      widths[ci] = math.min(natural[ci], MAX_COL_WIDTH)
+    end
+  else
+    local header_idx = nil
+    for idx = 1, #split do
+      if idx ~= sep_idx then header_idx = idx break end
+    end
+    local avail = math.max(col_count, table_width - (col_count + 1) - cell_pad_w * col_count)
+    local floor_n = {}
+    for ci = 1, col_count do
+      widths[ci] = math.min(natural[ci], avail)
+      local header_w = header_idx and vim.fn.strwidth(cleaned[header_idx][ci] or "") or 0
+      floor_n[ci] = math.min(natural[ci], math.max(MIN_COL_WIDTH, header_w))
+    end
+    local total = 0
+    for ci = 1, col_count do total = total + widths[ci] end
+    if total > avail then
+      local scale = avail / total
+      for ci = 1, col_count do
+        widths[ci] = math.max(floor_n[ci], math.floor(widths[ci] * scale))
+      end
+    end
+  end
+
+  -- 各列对齐方式补齐到默认左对齐
+  for ci = 1, col_count do
+    if aligns[ci] == nil then aligns[ci] = "left" end
+  end
+
+  -- 按行折行：每格先折成 <=列宽 的多行，行高 = 该行最高单元格行数。
+  local wrapped = {}
+  for idx = 1, #split do
+    wrapped[idx] = {}
+    if idx ~= sep_idx then
+      for ci = 1, col_count do
+        wrapped[idx][ci] = _wrap_display(cleaned[idx][ci] or "", widths[ci])
+      end
+    end
+  end
+
+  -- 构造边框横线块（块宽 = 列宽 + 2，字符为 ─）
+  local function _h_blocks()
+    local parts = {}
+    for ci = 1, col_count do
+      parts[ci] = string.rep("─", widths[ci] + cell_pad_w)
+    end
+    return parts
   end
 
   local out = {}
+  -- 顶边：┌──┬──┐ 封顶
+  local top = _h_blocks()
+  out[#out + 1] = { text = "┌" .. table.concat(top, "┬") .. "┐", k = "border" }
+  -- 内容行奇偶（用于斑马纹背景）：从表头起算，折行的每个物理行同属一个逻辑行
+  local content_n = 0
   for idx = 1, #split do
-    local parts = {}
-    for ci = 1, col_count do
-      local cell = cleaned[idx][ci] or ""
-      if idx == sep_idx then
-        parts[#parts + 1] = string.rep("─", widths[ci])
-      else
-        local disp = _truncate_display(cell, MAX_COL_WIDTH)
-        local pad = math.max(0, widths[ci] - vim.fn.strwidth(disp))
-        parts[#parts + 1] = disp .. string.rep(" ", pad)
+    if idx == sep_idx then
+      -- 表头与数据之间的分隔横线：├──┼──┤
+      local mid = _h_blocks()
+      out[#out + 1] = { text = "├" .. table.concat(mid, "┼") .. "┤", k = "border" }
+    else
+      content_n = content_n + 1
+      local k = (content_n % 2 == 1) and "odd" or "even"
+      local height = 0
+      for ci = 1, col_count do
+        height = math.max(height, #wrapped[idx][ci])
+      end
+      for ln = 1, height do
+        local parts = {}
+        for ci = 1, col_count do
+          local line_text = wrapped[idx][ci][ln] or ""
+          parts[ci] = " " .. _pad_cell(line_text, widths[ci], aligns[ci]) .. " "
+        end
+        out[#out + 1] = { text = "│" .. table.concat(parts, "│") .. "│", k = k }
       end
     end
-    out[#out + 1] = "| " .. table.concat(parts, " | ") .. " |"
   end
+  -- 底边：└──┴──┘ 封底
+  local bottom = _h_blocks()
+  out[#out + 1] = { text = "└" .. table.concat(bottom, "┴") .. "┘", k = "border" }
   return out
 end
 
@@ -163,8 +311,11 @@ end
 
 --- 将 markdown 文本转换为可渲染的行数组
 --- @param text string
---- @return table { { text, style } } style = "normal"|"code"|"heading"|"list"|"quote"|"table"
-function M.render(text)
+--- @param opts table|nil { streaming? boolean; table_width? number }
+---   streaming=true 时表格原样输出；table_width 限制表格总显示宽度（随窗口自适应）
+--- @return table { { text, style, tbl? } } style = "normal"|"code"|"heading"|"list"|"quote"|"table"
+function M.render(text, opts)
+  opts = opts or {}
   local lines = vim.split(text or "", "\n", { plain = true })
   local out = {}
   local in_code = false
@@ -192,10 +343,15 @@ function M.render(text)
         block[#block + 1] = lines[j]
         j = j + 1
       end
-      local rendered = _render_table(block)
+      local rendered = _render_table(block, opts.streaming, opts.table_width)
       if rendered then
         for _, r in ipairs(rendered) do
-          out[#out + 1] = { text = r, style = "table" }
+          if type(r) == "string" then
+            -- 流式期间原样行：仅标记为表格，不变更内容
+            out[#out + 1] = { text = r, style = "table" }
+          else
+            out[#out + 1] = { text = r.text, style = "table", tbl = r.k }
+          end
         end
         i = j
       else
@@ -227,9 +383,10 @@ end
 
 --- 将 markdown 渲染为纯文本（紧凑）
 --- @param text string
+--- @param opts table|nil 传给 M.render 的选项
 --- @return string
-function M.to_plain(text)
-  local lines = M.render(text)
+function M.to_plain(text, opts)
+  local lines = M.render(text, opts)
   local out = {}
   for _, l in ipairs(lines) do
     out[#out + 1] = l.text

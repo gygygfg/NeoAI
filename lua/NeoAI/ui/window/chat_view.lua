@@ -34,6 +34,8 @@ local state = {
   collapsed = false, -- 聊天窗口进入后台后是否已收起（输入框）
   focus_augroup = nil, -- 焦点追踪自动命令组（WinEnter/BufEnter）
   input_resize_augroup = nil, -- 输入框随内容增高自动命令组
+  resize_augroup = nil, -- 窗口大小变化时重排表格自动命令组（VimResized）
+  last_table_width = nil, -- 上次渲染表格所用宽度（resize 后宽度变化才重排）
 }
 
 -- 输入框高度：光标在主界面 → idle_height；光标在输入框 → min_height 起步，随内容行数增长，上限为主窗口高度的 max_ratio。
@@ -85,6 +87,19 @@ local function _open_fold_start_lines()
   return starts
 end
 
+--- 当前聊天窗口对应的表格宽度上限：随窗口宽度自适应（窄窗收表、宽窗放表）。
+--- 无有效聊天窗口时返回 nil（表格用默认单列上限）。
+--- @return number|nil
+local function _current_table_width()
+  if state.win_id and vim.api.nvim_win_is_valid(state.win_id) then
+    local ok, w = pcall(vim.api.nvim_win_get_width, state.win_id)
+    if ok and w and w > 0 then
+      return math.max(20, w - 2)
+    end
+  end
+  return nil
+end
+
 --- 渲染全部消息
 --- @param keep_view boolean|nil 仅刷新折叠文本（如工具耗时更新）时传 true：
 --- 无论光标是否在跟随区，都记录并恢复已展开的折叠块与光标/视口，避免把正在查看的地方拽走。
@@ -96,7 +111,15 @@ local function _render(keep_view)
     open_folds = _open_fold_start_lines()
   end
   local messages = chat_service.get_messages()
-  message_list.render(state.buf, messages)
+  -- 还在生成（agent 忙碌 / 暂存队列非空）时，仅对末尾消息做流式渲染：
+  -- 表格在生成期间原样输出，生成结束后才做对齐填充，避免列宽随流式跳动。
+  -- table_width 随聊天窗口宽度自适应：窄窗把表收紧（更多折行），宽窗放宽表，避免整表超出屏幕。
+  local render_opts = { streaming = chat_service.has_pending_work() }
+  state.last_table_width = _current_table_width()
+  if state.last_table_width then
+    render_opts.table_width = state.last_table_width
+  end
+  message_list.render(state.buf, messages, render_opts)
   if state.win_id and vim.api.nvim_win_is_valid(state.win_id) then
     vim.api.nvim_win_call(state.win_id, function()
       -- 每次重写 buffer 后，expr 折叠并不会自动重算（带 UI 会话里 nvim_buf_set_lines
@@ -885,6 +908,34 @@ local function _clear_focus_tracking()
   end
 end
 
+--- 注册窗口大小变化重排：VimResized 后若聊天窗口表格宽度变化，保持视图重写 buffer，
+--- 让表格列宽/折行随窗口自适应（避免调整窗口后表格仍停留在旧宽度）。
+local function _register_resize_reflow()
+  if state.resize_augroup then
+    pcall(vim.api.nvim_del_augroup_by_id, state.resize_augroup)
+  end
+  state.resize_augroup = vim.api.nvim_create_augroup("NeoAIChatResize", { clear = true })
+  vim.api.nvim_create_autocmd("VimResized", {
+    group = state.resize_augroup,
+    callback = function()
+      -- 仅聊天窗口打开时才重排；宽度未变（如仅高度拖动）则跳过，避免无谓整表重写
+      local tw = _current_table_width()
+      if tw and tw ~= state.last_table_width then
+        _schedule_render(true)
+      end
+    end,
+  })
+end
+
+--- 清理窗口大小重排自动命令
+local function _clear_resize_reflow()
+  if state.resize_augroup then
+    pcall(vim.api.nvim_del_augroup_by_id, state.resize_augroup)
+    state.resize_augroup = nil
+  end
+  state.last_table_width = nil
+end
+
 --- 设置键位（主窗口）
 local function _set_keymaps()
   local keymap = require("NeoAI.ui.keymap")
@@ -989,6 +1040,7 @@ function M.open(opts)
   -- 焦点追踪：焦点离开聊天窗口或主窗口被切到别的 buffer 时收起输入框，回到聊天时恢复
   state.collapsed = false
   _register_focus_tracking()
+  _register_resize_reflow()
 
   -- 订阅事件
   state.unsubs[#state.unsubs + 1] = event_bus.on(events.MESSAGE_ADDED, _on_message_updated)
@@ -1066,6 +1118,7 @@ function M.close()
   state.unsubs = {}
   _clear_focus_tracking()
   _clear_input_resize()
+  _clear_resize_reflow()
   state.collapsed = false
   state.win_id = nil
   state.buf = nil

@@ -16,6 +16,36 @@ local state = {
   on_cancel = nil,
 }
 
+-- 高亮命名空间：选项简介 / 选项描述各用一组高亮
+local HL_NS = vim.api.nvim_create_namespace("neoai_ask_user_hi")
+
+--- 定义高亮组（default=true，不覆盖用户自定义；兼容无外部依赖）
+local function _setup_hl()
+  vim.api.nvim_set_hl(0, "NeoAIAskUserOptionLabel", { default = true, bold = true })
+  vim.api.nvim_set_hl(0, "NeoAIAskUserOptionDesc", { default = true, fg = "#8a8a8a" })
+end
+
+--- 归一化选项：兼容纯字符串或 { label, description } 对象
+--- @param opts table 数组，元素为 string 或 { label, description }
+--- @return table 数组 { label, description }
+local function _normalize_options(opts)
+  local out = {}
+  for _, o in ipairs(opts or {}) do
+    if type(o) == "string" then
+      if o ~= "" then out[#out + 1] = { label = o, description = "" } end
+    elseif type(o) == "table" then
+      local label = type(o.label) == "string" and o.label or ""
+      if label == "" and type(o.name) == "string" then label = o.name end
+      if label ~= "" then
+        local description = type(o.description) == "string" and o.description or ""
+        if description == "" and type(o.desc) == "string" then description = o.desc end
+        out[#out + 1] = { label = label, description = description }
+      end
+    end
+  end
+  return out
+end
+
 -- ========== 私有函数 ==========
 
 local function _close()
@@ -77,7 +107,7 @@ local function _set_keymaps()
       bind(mode, tostring(i), function()
         local opt = state._options and state._options[i]
         if not opt then return end
-        close_then(state.on_answer, opt)
+        close_then(state.on_answer, opt.label or "")
       end)
     end
     -- 自由输入
@@ -107,23 +137,37 @@ function M.show(config)
   state.on_answer = config.on_answer
   state.on_cancel = config.on_cancel
   state._question = config.question
-  state._options = config.options or {}
+  state._options = _normalize_options(config.options)
 
   state.buf = vim.api.nvim_create_buf(false, true)
   vim.bo[state.buf].filetype = "neoai_ask_user"
   local lines = vim.split(config.question or "", "\n", { plain = true })
-  if #(config.options or {}) > 0 then
+  -- { line = 0-based, col, len, group }，随内容行构建，set_lines 后统一高亮
+  local highlights = {}
+  if #state._options > 0 then
     lines[#lines + 1] = ""
     lines[#lines + 1] = "选项:"
-    for i, opt in ipairs(config.options) do
-      if i <= 9 then
-        lines[#lines + 1] = string.format("  [%d] %s", i, opt)
+    for i, opt in ipairs(state._options) do
+      local label_line = #lines + 1
+      lines[#lines + 1] = string.format("  [%d] %s", i, opt.label)
+      local label_col = (#("  [" .. i .. "] ")) -- 0-based：选项简介起始列
+      highlights[#highlights + 1] = { line = label_line - 1, col = label_col, len = #opt.label, group = "NeoAIAskUserOptionLabel" }
+      if opt.description and opt.description ~= "" then
+        local desc_line = #lines + 1
+        lines[#lines + 1] = string.format("        %s", opt.description)
+        highlights[#highlights + 1] = { line = desc_line - 1, col = 8, len = #opt.description, group = "NeoAIAskUserOptionDesc" }
       end
     end
   end
   lines[#lines + 1] = ""
   lines[#lines + 1] = "快捷键: [1-9] 选择选项    [i / 回车] 自由输入    [Esc] 取消"
   vim.api.nvim_buf_set_lines(state.buf, 0, -1, false, lines)
+
+  _setup_hl()
+  vim.api.nvim_buf_clear_namespace(state.buf, HL_NS, 0, -1)
+  for _, h in ipairs(highlights) do
+    pcall(vim.api.nvim_buf_add_highlight, state.buf, HL_NS, h.group, h.line, h.col, h.col + h.len)
+  end
 
   local height = math.min(#lines + 4, 24)
   local width = math.min(80, vim.o.columns - 10)

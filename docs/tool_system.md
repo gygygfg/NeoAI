@@ -178,8 +178,9 @@ M.execute(agent, name, args, tool_call_id, opts)
 ### 💬 向用户提问（ask_user.lua）
 
 `ask_user`：暂停生成向用户提问，回答回传为工具结果。发射 `ASK_USER_WAITING`/`ASK_USER_ANSWERED`，
-等待期间暂停可暂停计时器。同一时刻只展示一个提问弹窗，并行发起的多次提问按序排队
-（前一个回答/取消后再展示下一个），不会直接失败。
+等待期间暂停可暂停计时器。选项既可以是字符串，也可以是 `{ label, description }`（label 为选项简介，
+description 为选项描述，二者在弹窗中分别展示并高亮）。同一时刻只展示一个提问弹窗，并行发起的
+多次提问按序排队（前一个回答/取消后再展示下一个），不会直接失败。
 
 ### 🖼 图像（read_image.lua）
 

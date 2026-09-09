@@ -122,8 +122,21 @@ ask_user_tools.ask_user = helpers.define_tool(
       question = { type = "string", description = "要向用户提出的问题" },
       options = {
         type = "array",
-        description = "可选：供用户快速选择的选项（字符串数组），用户可直接选序号或输入自由回答",
-        items = { type = "string" },
+        description = "可选：供用户快速选择的选项。每个选项可以是字符串，或对象 { label（选项简介，简短标签）, description（选项描述，可选，更详细说明） }。用户可直接选序号或输入自由回答。",
+        items = {
+          oneOf = {
+            { type = "string", description = "纯字符串选项，该字符串即选项简介" },
+            {
+              type = "object",
+              description = "带简介与描述的选项",
+              properties = {
+                label = { type = "string", description = "选项简介（简短标签，展示给用户并作为选中的答案）" },
+                description = { type = "string", description = "选项描述（可选，更详细说明该选项的意图/影响）" },
+              },
+              required = { "label" },
+            },
+          },
+        },
       },
     },
     required = { "question" },
@@ -137,8 +150,16 @@ ask_user_tools.ask_user = helpers.define_tool(
     local options = {}
     if type(args.options) == "table" then
       for _, o in ipairs(args.options) do
-        if type(o) == "string" and o ~= "" then
-          options[#options + 1] = o
+        if type(o) == "string" then
+          if o ~= "" then options[#options + 1] = { label = o, description = "" } end
+        elseif type(o) == "table" then
+          local label = type(o.label) == "string" and o.label:gsub("%s+$", "") or ""
+          if label == "" and type(o.name) == "string" then label = o.name:gsub("%s+$", "") end
+          if label ~= "" then
+            local description = type(o.description) == "string" and o.description or ""
+            if description == "" and type(o.desc) == "string" then description = o.desc end
+            options[#options + 1] = { label = label, description = description }
+          end
         end
       end
     end
