@@ -207,4 +207,41 @@ tests.suite("markdown", function(_, it)
     t.matches("^│ A ", lines[2], "结束后表头应对齐补空格")
     t.matches("^└", lines[5], "结束后应有底边封底")
   end)
+  it("整表宽度永不超出 table_width（窄窗自动换行收进窗口）", function(t)
+    local mv = require("NeoAI.ui.components.markdown_view")
+    -- 回归：真实会话中渲染失败的宽表（请求 #4 的模型选型表，长单元格 + 窄表头列）
+    local tbl = table.concat({
+      "| 目标 | 建议参数量上限 | 典型模型 |",
+      "|---|---|---|",
+      "| **保证速度**（单条 ~几十~300ms，可实时/批量） | **≤ 0.5B** | bge-large(326M)、bge-m3(568M)、multilingual-e5-large(560M) |",
+      "| 折中（单条 ~0.3–1s） | **~1.5B** | gte-Qwen2-1.5B |",
+      "| 能加载但明显变慢（1–3s/条） | ~4B（量化） | Qwen3-Embedding-4B(INT8) |",
+      "| **纯内存极限**（无速度保证） | ~7–8B | e5-mistral-7b / Qwen3-Embedding-8B（必须 INT8/Q4） |",
+    }, "\n")
+    for _, tw in ipairs({ 20, 26, 38, 40, 58, 70, 78, 80, 100, 118 }) do
+      local rendered = mv.render(tbl, { table_width = tw })
+      local maxw = 0
+      for _, l in ipairs(rendered) do
+        maxw = math.max(maxw, vim.fn.strwidth(l.text))
+      end
+      t.true_(maxw <= tw, "table_width=" .. tw .. " 时整表宽 " .. maxw .. " 不得溢出（原来会溢出 4~16 列）")
+      t.eq("table", rendered[1].style, "table_width=" .. tw .. " 时仍应识别为表格")
+    end
+  end)
+  it("缩列时优先保留窄列（表头列）的自然宽", function(t)
+    local mv = require("NeoAI.ui.components.markdown_view")
+    local tbl = table.concat({
+      "| 目标 | 建议参数量上限 | 典型模型 |",
+      "|---|---|---|",
+      "| 保证速度（单条 ~几十~300ms，可实时/批量） | ≤ 0.5B | bge-large(326M)、bge-m3(568M)、multilingual-e5-large(560M) |",
+    }, "\n")
+    local rendered = mv.render(tbl, { table_width = 78 })
+    -- 中等宽窗下，14 列宽的表头列不应被等比缩放压得折行（削峰而非等比缩窄列）
+    t.matches("建议参数量上限", rendered[2].text, "窄表头列应保留自然宽、不折行")
+    local maxw = 0
+    for _, l in ipairs(rendered) do
+      maxw = math.max(maxw, vim.fn.strwidth(l.text))
+    end
+    t.true_(maxw <= 78, "整表仍不得超出 table_width（实际 " .. maxw .. "）")
+  end)
 end)

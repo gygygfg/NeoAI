@@ -217,8 +217,11 @@ local function _render_table(rows, streaming, table_width)
   -- 列宽分配：
   -- - 未传 table_width（无窗口上下文）：每列 = min(自然宽, MAX_COL_WIDTH)，不做总宽缩减；
   -- - 传了 table_width（随窗口自适应）：把「表格最大总宽」折算为列内容可用宽度分摊，
-  --   超出时按比例缩减（缩减小限 = max(表头列宽, MIN_COL_WIDTH)，窄列不虚增），
-  --   保证整表不超 table_width。
+  --   放不下时缩列，并严格保证 sum(列宽) <= avail，即整表（含边框与单元格 padding）
+  --   永不超出 table_width —— 长内容由单元格折行（_wrap_display）消化，窄窗下表格能被
+  --   压进窗口宽度自动换行，而不是溢出窗口后被 nvim 从中间硬折、破坏边框对齐。
+  --   缩列采用「削峰/水填」：优先缩最宽的列、保留较窄列（如短表头列的自然宽），
+  --   每列不低于 min(自然宽, MIN_COL_WIDTH)，故列宽永不超过自然宽。
   -- cell_pad_w=2：单元格左右各 1 空格；边界符（首尾 + 列间）共 col_count+1 个。
   local cell_pad_w = 2
   local widths = {}
@@ -227,23 +230,62 @@ local function _render_table(rows, streaming, table_width)
       widths[ci] = math.min(natural[ci], MAX_COL_WIDTH)
     end
   else
-    local header_idx = nil
-    for idx = 1, #split do
-      if idx ~= sep_idx then header_idx = idx break end
-    end
     local avail = math.max(col_count, table_width - (col_count + 1) - cell_pad_w * col_count)
-    local floor_n = {}
+    local sum_nat = 0
+    local max_nat = 0
     for ci = 1, col_count do
-      widths[ci] = math.min(natural[ci], avail)
-      local header_w = header_idx and vim.fn.strwidth(cleaned[header_idx][ci] or "") or 0
-      floor_n[ci] = math.min(natural[ci], math.max(MIN_COL_WIDTH, header_w))
+      sum_nat = sum_nat + natural[ci]
+      if natural[ci] > max_nat then max_nat = natural[ci] end
     end
-    local total = 0
-    for ci = 1, col_count do total = total + widths[ci] end
-    if total > avail then
-      local scale = avail / total
+    if sum_nat <= avail then
+      -- 自然宽合计放得下：不缩列、不折行，直接用自然宽
+      for ci = 1, col_count do widths[ci] = natural[ci] end
+    else
+      -- 各列缩列下限（不高于自然宽，避免把窄列虚增到 MIN_COL_WIDTH）
+      local mins = {}
+      local min_total = 0
       for ci = 1, col_count do
-        widths[ci] = math.max(floor_n[ci], math.floor(widths[ci] * scale))
+        mins[ci] = math.min(natural[ci], MIN_COL_WIDTH)
+        min_total = min_total + mins[ci]
+      end
+      -- 极端窄窗：连下限都放不下时退化为每列至少 1 列（不可再缩，允许极小溢出）
+      if min_total > avail then
+        for ci = 1, col_count do mins[ci] = 1 end
+      end
+      -- 二分求“削峰水位” level：宽列截到 level、窄列保留自然宽，
+      -- 使 sum(clamp(自然宽, mins, level)) 尽量贴合 avail（单调，可二分）。
+      local function _sum_at(level)
+        local s = 0
+        for i = 1, col_count do
+          local w = (natural[i] < level) and natural[i] or level
+          if w < mins[i] then w = mins[i] end
+          s = s + w
+        end
+        return s
+      end
+      local lo, hi = 0, max_nat
+      while lo < hi do
+        local mid = math.ceil((lo + hi) / 2)
+        if _sum_at(mid) <= avail then lo = mid else hi = mid - 1 end
+      end
+      local total = 0
+      for ci = 1, col_count do
+        local w = (natural[ci] < lo) and natural[ci] or lo
+        if w < mins[ci] then w = mins[ci] end
+        widths[ci] = w
+        total = total + w
+      end
+      -- 水位取整会残留不足一列宽的空档（< 列数）：补给仍可增宽的自然宽最大的列
+      while total < avail do
+        local pick, pick_nat = nil, 0
+        for ci = 1, col_count do
+          if widths[ci] < natural[ci] and natural[ci] > pick_nat then
+            pick, pick_nat = ci, natural[ci]
+          end
+        end
+        if not pick then break end
+        widths[pick] = widths[pick] + 1
+        total = total + 1
       end
     end
   end
