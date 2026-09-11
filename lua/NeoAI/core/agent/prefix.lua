@@ -232,17 +232,49 @@ end
 -- ========== 缓存用量解析 ==========
 
 --- 从 provider usage 解析缓存命中/未命中 token
---- @param usage table|nil 原始 usage（openai 格式）
+--- 保持向后兼容：不传 model/provider 时按 OpenAI/DeepSeek 字段解析。
+--- @param usage table|nil 原始 usage
+--- @param model string|nil 模型 id（提供则按能力表分派解析器）
+--- @param provider_name string|nil 提供商名
 --- @return table|nil { cache_read, cache_write, cache_miss, ratio }
-function M.parse_cache_usage(usage)
+function M.parse_cache_usage(usage, model, provider_name)
   if not usage or type(usage) ~= "table" then return nil end
-  local details = usage.prompt_tokens_details or {}
-  local cache_read = tonumber(usage.cache_read
-    or usage.prompt_cache_hit_tokens
-    or details.cached_tokens) or 0
-  local cache_write = tonumber(usage.cache_write
-    or usage.prompt_cache_miss_tokens) or 0
-  local total_prompt = tonumber(usage.prompt_tokens) or 0
+
+  local kind = "openai"
+  if model or provider_name then
+    local ok, caps = pcall(function()
+      return require("NeoAI.core.model.capabilities").resolve(model, provider_name)
+    end)
+    if ok and caps and caps.cache_kind then kind = caps.cache_kind end
+  end
+
+  local cache_read, cache_write, total_prompt
+
+  if kind == "anthropic" then
+    -- Anthropic: input_tokens 不含缓存命中（无缓存时 input_tokens 即全部输入）
+    local read = tonumber(usage.cache_read_input_tokens) or 0
+    local write = tonumber(usage.cache_creation_input_tokens) or 0
+    local input = tonumber(usage.input_tokens) or tonumber(usage.prompt_tokens) or 0
+    cache_read = read
+    cache_write = write
+    total_prompt = input + read + write
+  elseif kind == "gemini" then
+    -- Gemini: promptTokenCount 为输入总量，cachedContentTokenCount 为其中命中缓存的部分
+    local meta = usage.usageMetadata or usage
+    cache_read = tonumber(meta.cachedContentTokenCount or usage.cachedContentTokenCount) or 0
+    cache_write = 0
+    total_prompt = tonumber(meta.promptTokenCount or usage.promptTokenCount or usage.prompt_tokens) or 0
+  else
+    -- OpenAI / DeepSeek: prompt_tokens 已包含缓存命中（含 cache_read）
+    local details = usage.prompt_tokens_details or {}
+    cache_read = tonumber(usage.cache_read
+      or usage.prompt_cache_hit_tokens
+      or details.cached_tokens) or 0
+    cache_write = tonumber(usage.cache_write
+      or usage.prompt_cache_miss_tokens) or 0
+    total_prompt = tonumber(usage.prompt_tokens) or 0
+  end
+
   local cache_miss = math.max(0, total_prompt - cache_read)
   return {
     cache_read = cache_read,

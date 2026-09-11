@@ -34,6 +34,11 @@ local state = {
 local pending_queue = {}
 local queue_state_sub = nil -- 监听 Agent 状态变化以在 turn 结束时机性刷新的订阅
 
+-- 生成中切换模式：暂存目标模式（"chat"|"plan"|"auto"），待 Agent 空闲后再应用，
+-- 保证当前回合在旧模式下跑完（不中途改工具集 / 系统策略 / 模型）。
+local pending_mode = nil
+local pending_mode_agent_id = nil
+
 -- ========== 私有函数 ==========
 
 --- 判断 Agent 是否已被销毁
@@ -253,13 +258,58 @@ local function _ensure_injector()
   end)
 end
 
---- 确保已监听 Agent 状态变化（幂等）：Agent 回到非忙碌状态时刷新暂存队列
+-- ========== 生成中切换模式（延迟到本轮结束应用） ==========
+
+--- 当前实际生效的模式（不含待应用的目标模式）
+--- @return string "chat" | "plan" | "auto"
+local function _actual_mode()
+  local tool_service = require("NeoAI.services.tool_service")
+  if tool_service.is_auto_mode() then return "auto" end
+  local agent = M.get_current_agent()
+  if agent and agent.plan_mode == true then return "plan" end
+  return "chat"
+end
+
+--- 应用目标模式到 Agent（要求 Agent 空闲，同步）
+--- @param agent table
+--- @param target string "chat" | "plan" | "auto"
+local function _apply_target_mode(agent, target)
+  local tool_service = require("NeoAI.services.tool_service")
+  local plan_mode = require("NeoAI.tools.builtin.plan_mode")
+  if target == "plan" then
+    plan_mode.enter(agent)
+    tool_service.set_auto_mode(false)
+  elseif target == "auto" then
+    plan_mode.exit(agent)
+    tool_service.set_auto_mode(true)
+  else
+    plan_mode.exit(agent)
+    tool_service.set_auto_mode(false)
+  end
+  runtime.apply_mode(agent, target)
+end
+
+--- Agent 空闲时应用暂存的模式切换（若有）
+--- @param agent table
+local function _apply_pending_mode(agent)
+  if not pending_mode or not agent then return end
+  if pending_mode_agent_id and agent.id ~= pending_mode_agent_id then return end
+  if _is_busy(agent) then return end
+  local target = pending_mode
+  pending_mode = nil
+  pending_mode_agent_id = nil
+  _apply_target_mode(agent, target)
+end
+
+--- 确保已监听 Agent 状态变化（幂等）：Agent 回到非忙碌状态时先应用暂存的模式切换，
+--- 再刷新暂存队列（保证入队消息以切换后的模式发送）
 local function _ensure_queue_observer()
   if queue_state_sub then return end
   queue_state_sub = event_bus.on(events.AGENT_STATE_CHANGED, function(data)
     if not data or not data.agent_id then return end
     local agent = runtime.get(data.agent_id)
     if not agent or _is_busy(agent) then return end
+    _apply_pending_mode(agent)
     _flush_pending(data.agent_id)
   end)
 end
@@ -506,7 +556,27 @@ end
 local function _apply_current_mode(agent)
   agent = agent or M.get_current_agent()
   if not agent then return end
-  runtime.apply_mode(agent, M.get_mode())
+  runtime.apply_mode(agent, _actual_mode())
+end
+
+--- 请求切换到目标模式：Agent 空闲时立即应用；生成中（generating/tool_running）则暂存，
+--- 待本轮结束（Agent 回到 idle）后应用，避免中途改变工具集 / 系统策略 / 模型而打断当前回合。
+--- @param target string "chat" | "plan" | "auto"
+--- @return string 目标模式
+--- @return boolean 是否已立即应用（false = 已暂存待本轮结束）
+local function _request_mode(target)
+  local agent = M.get_current_agent()
+  if not agent then return target, false end
+  if _is_busy(agent) then
+    pending_mode = target
+    pending_mode_agent_id = agent.id
+    _ensure_queue_observer()
+    return target, false
+  end
+  pending_mode = nil
+  pending_mode_agent_id = nil
+  _apply_target_mode(agent, target)
+  return target, true
 end
 
 --- 切换当前 Agent 模型
@@ -523,10 +593,9 @@ end
 function M.toggle_plan_mode()
   local agent = M.get_current_agent()
   if not agent then return nil end
-  local plan_mode = require("NeoAI.tools.builtin.plan_mode")
-  local ret = plan_mode.toggle(agent)
-  _apply_current_mode(agent)
-  return ret
+  local target = (M.get_mode() == "plan") and "chat" or "plan"
+  _request_mode(target)
+  return target == "plan"
 end
 
 --- 用户确认计划：解析计划为任务清单（todo）→ 退出计划模式（直接转入 CHAT）→ 可选自动执行。
@@ -544,7 +613,8 @@ function M.approve_plan(opts)
   if not plan_mode.is_active(agent) then
     return { approved = false, error = "当前不在计划模式，无法确认计划" }
   end
-  local plan = agent.plan
+  local plan = opts.plan
+  if not plan or plan == "" then plan = agent.plan end
   if not plan or plan == "" then
     local last = agent.messages[#agent.messages]
     if last and last.role == "assistant" and last.content and last.content ~= "" then
@@ -565,6 +635,8 @@ function M.approve_plan(opts)
   end
 
   agent.plan = plan
+  pending_mode = nil -- 确认计划后清除待应用的模式切换（以本次退出为准）
+  pending_mode_agent_id = nil
   plan_mode.exit(agent) -- 直接转入 CHAT 模式
   _apply_current_mode(agent) -- 按退出后的模式应用 provider/model 配置
   _persist_agent(agent)
@@ -588,10 +660,9 @@ end
 --- 切换 AUTO 模式（自动允许所有工具调用，全局运行期开关）
 --- @return boolean 切换后的状态
 function M.toggle_auto_mode()
-  local tool_service = require("NeoAI.services.tool_service")
-  local ret = tool_service.toggle_auto_mode()
-  _apply_current_mode()
-  return ret
+  local target = (M.get_mode() == "auto") and "chat" or "auto"
+  _request_mode(target)
+  return target == "auto"
 end
 
 --- 是否处于 AUTO 模式
@@ -601,41 +672,42 @@ function M.is_auto_mode()
   return tool_service.is_auto_mode()
 end
 
---- 当前模式（互斥：一次只处于一种模式）
+--- 当前模式（互斥：一次只处于一种模式）。
+--- 生成中切换时返回待应用的目标模式，让状态栏/UI 立即反映用户意图；
+--- 实际生效（工具集/系统策略/模型）在 Agent 空闲后由 _apply_pending_mode 应用。
 --- @return string "chat" | "plan" | "auto"
 function M.get_mode()
-  local plan = M.get_plan_state()
-  local auto = M.is_auto_mode()
-  if auto then return "auto" end
-  if plan.active then return "plan" end
-  return "chat"
+  if pending_mode then return pending_mode end
+  return _actual_mode()
+end
+
+--- 是否有待本轮结束应用的模式切换
+--- @return boolean
+function M.has_pending_mode()
+  return pending_mode ~= nil
 end
 
 --- 循环切换模式：chat -> plan -> auto -> chat
 --- @return string 切换后的模式
 function M.cycle_mode()
-  local tool_service = require("NeoAI.services.tool_service")
-  local plan_mode = require("NeoAI.tools.builtin.plan_mode")
   local mode = M.get_mode()
+  local target
   if mode == "chat" then
-    -- 进入计划模式（无 Agent 时先创建）
-    local agent = M.get_current_agent() or M.new_session({})
-    plan_mode.enter(agent)
-    tool_service.set_auto_mode(false)
-    _apply_current_mode(agent)
-    return "plan"
+    target = "plan"
   elseif mode == "plan" then
-    -- 退出计划模式，进入 AUTO
-    local agent = M.get_current_agent()
-    if agent then plan_mode.exit(agent) end
-    tool_service.set_auto_mode(true)
-    _apply_current_mode(agent)
-    return "auto"
-  else -- auto
-    tool_service.set_auto_mode(false)
-    _apply_current_mode()
-    return "chat"
+    target = "auto"
+  else
+    target = "chat"
   end
+  -- 无 Agent 时先创建（新会话从 CHAT 开始，再应用目标模式）
+  local agent = M.get_current_agent()
+  if not agent then
+    agent = M.new_session({})
+    _apply_target_mode(agent, target)
+    return target
+  end
+  _request_mode(target)
+  return target
 end
 
 --- 当前 Agent 计划模式状态
@@ -661,6 +733,9 @@ end
 function M.new_session(opts)
   opts = opts or {}
   state.current_agent_id = nil
+  -- 新会话从 CHAT（或显式 opts.mode）开始，丢弃上一会话遗留的待应用模式切换
+  pending_mode = nil
+  pending_mode_agent_id = nil
   local o = vim.tbl_extend("force", {}, opts, { mode = opts.mode or "chat" })
   return _get_or_create_agent(o)
 end
@@ -733,6 +808,13 @@ function M.reset()
   state.agents = {}
   state.sessions = {}
   state.current_agent_id = nil
+  -- 清理待应用的模式切换与状态监听，避免跨测试/重载残留
+  pending_mode = nil
+  pending_mode_agent_id = nil
+  if queue_state_sub then
+    queue_state_sub()
+    queue_state_sub = nil
+  end
   -- 清理暂存队列、状态监听与注入器，避免测试间/重载后残留并重复发送
   local tool_loop = require("NeoAI.core.agent.tool_loop")
   tool_loop.set_inject_user(nil)

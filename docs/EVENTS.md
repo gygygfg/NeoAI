@@ -98,6 +98,7 @@ vim.api.nvim_create_autocmd("User", {
 | `MESSAGE_EDITED` | `message:edited` | 编辑消息 | `{ agent_id, message }` |
 | `MESSAGE_DELETED` | `message:deleted` | 删除消息 | `{ agent_id, message }` |
 | `MESSAGE_SENT` | `message:sent` | 用户发送消息 | `{ agent_id, content }` |
+| `MESSAGE_QUEUED` | `message:queued` | 消息入暂存队列（Agent 正忙时） | `{ agent_id, content }` |
 | `MESSAGES_CLEARED` | `messages:cleared` | 清空消息 | — |
 
 ### 会话
@@ -133,6 +134,7 @@ vim.api.nvim_create_autocmd("User", {
 | `TOOL_EXECUTION_ERROR` | `tool:execution_error` | 单个工具出错 | `{ agent_id, name, error, tool_call_id, duration_ms }` |
 | `TOOL_CALL_DETECTED` | `tool:call_detected` | 检测到工具调用 | `{ agent_id, tool_calls }` |
 | `TOOL_RESULT_RECEIVED` | `tool:result_received` | 收到工具结果 | `{ agent_id, message }` |
+| `TOOL_RESULT_PRUNED` | `tool:result_pruned` | 压缩前裁剪超长工具结果 | `{ agent_id, tool_name, chars_before, chars_after }` |
 | `TOOL_APPROVAL_REQUESTED` | `tool:approval_requested` | 发起工具审批（入队） | `{ tool_name, args, agent_id }` |
 | `TOOL_APPROVED` | `tool:approved` | 审批通过 | `{ tool_name, agent_id }` |
 | `TOOL_APPROVAL_CANCELLED` | `tool:approval_cancelled` | 审批取消/拒绝 | `{ tool_name, reason, agent_id }` |
@@ -215,7 +217,7 @@ vim.api.nvim_create_autocmd("User", {
 | --- | --- | --- | --- |
 | `CONFIG_LOADED` | `config:loaded` | 配置加载 | `{ config }` |
 | `CONFIG_CHANGED` | `config:changed` | 配置变更 | `{ path, old, new }` |
-| `PLUGIN_INITIALIZED` | `plugin:initialized` | 插件初始化 | — |
+| `PLUGIN_INITIALIZED` | `plugin:initialized` | 插件初始化（当前仅定义、未实际 emit） | — |
 | `PLUGIN_SHUTDOWN` | `plugin:shutdown` | 插件关闭 | — |
 
 ### 日志

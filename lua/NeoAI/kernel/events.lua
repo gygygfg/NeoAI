@@ -123,6 +123,7 @@ M.LOG_MESSAGE = "log:message"
 M.COMPACTION_STARTED = "compaction:started"
 M.COMPACTION_CHUNK = "compaction:chunk"
 M.COMPACTION_COMPLETED = "compaction:completed"
+M.TOOL_RESULT_PRUNED = "tool:result_pruned"
 
 -- ========== 计划蒸馏 ==========
 M.PLAN_DISTILL_STARTED = "plan_distill:started"

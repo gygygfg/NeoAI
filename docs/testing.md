@@ -86,17 +86,29 @@ end)
 
 | 文件 | 覆盖 |
 | --- | --- |
-| `test_config / test_kernel` | 配置合并、事件总线、生命周期 |
+| `test_kernel` | 内核：配置合并、事件总线、生命周期 |
 | `test_session` | 会话对象、JSONL 存储、上下文构建、压缩 |
-| `test_agent / test_guard` | Agent 状态机、护栏 |
-| `test_overflow` | 上下文溢出恢复 |
-| `test_tools / test_sub_agent_result` | 工具执行、子 Agent |
-| `test_services` | 聊天/工具/模型/状态服务 |
+| `test_tool_result_pruner` | 工具结果裁剪（码点计量、头/标记/尾、图像跳过） |
+| `test_agent / test_guard / test_overflow` | Agent 状态机、护栏、溢出恢复、配对安全切分 |
+| `test_runtime_context` | 运行时上下文注入 |
+| `test_model_registry / test_model_capabilities / test_model_profiles / test_model_metadata` | 模型注册表、能力表、方言、实时元数据 |
+| `test_protocol_adapter` | 协议编解码 |
+| `test_prompt_cache / test_cache_strategy / test_cache_usage` | 显式缓存、前缀缓存策略、缓存命中用量 |
+| `test_model_picker` | 模型选择器 |
+| `test_modes` | 模式（CHAT/PLAN/AUTO） |
+| `test_multimodal` | 多模态图像 |
+| `test_tools / test_tool_pending` | 工具执行、工具待发/暂存 |
+| `test_max_tokens / test_truncation` | max_tokens 发送策略、输出截断续写 |
+| `test_sub_agent_result` | 子 Agent 结果 |
+| `test_pending_queue` | 待发消息队列 |
+| `test_services / test_status` | 服务层（chat/tool/model/status）、状态栏 |
 | `test_ask_user / test_herder` | 提问、Herder 上报 |
-| `test_plan_mode` | 计划模式 |
-| `test_chat_ui / test_tree_ui / test_display_modes / test_fold` | UI |
-| `test_status` | 状态栏 |
-| `test_multimodal / test_cache_strategy` | 多模态、前缀缓存 |
+| `test_plan_mode / test_plan_distill / test_todo` | 计划模式、计划蒸馏、待办 |
+| `test_skills` | Skills（frontmatter/发现/装载） |
+| `test_mcp_client / test_mcp_transport / test_mcp_bridge` | MCP 客户端、传输层、桥接 |
+| `test_chat_ui / test_tree_ui / test_chat_keys` | 聊天/树 UI、聊天键位 |
+| `test_display_modes / test_fold / test_markdown` | 显示模式、折叠、Markdown |
+| `test_timer / test_http / test_integration` | 可暂停计时器、HTTP 客户端、集成（mock server） |
 
 ## 6. 相关文档
 

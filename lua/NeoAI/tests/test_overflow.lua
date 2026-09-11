@@ -108,4 +108,59 @@ tests.suite("overflow", function(_, it)
     t.false_(compacted[1])
     t.eq(500, err and err.status)
   end)
+
+  it("_select_shadow_range：切点不拆散 assistant.tool_calls 与其 tool 结果", function(t)
+    local compactor = require("NeoAI.core.session.compactor")
+    local cfg = { min_shadow_messages = 1 }
+    local agent = {
+      id = "pair1", model = "gpt-4o", config = {},
+      messages = {
+        { role = "user", content = "u1" },
+        { role = "assistant", content = "", tool_calls = { { id = "a" }, { id = "b" } } },
+        { role = "tool", tool_call_id = "a", content = "r1" },
+        { role = "tool", tool_call_id = "b", content = "r2" },
+        { role = "user", content = "u2" },
+      },
+    }
+    local shadow = compactor._select_shadow_range(agent, cfg, { retain_tokens = 0 })
+    t.eq(4, #shadow)
+    t.eq("r2", shadow[4].content)
+
+    -- 末尾是 tool 结果时，切点前移，配对整体留在保留区
+    local agent2 = {
+      id = "pair2", model = "gpt-4o", config = {},
+      messages = {
+        { role = "user", content = "u1" },
+        { role = "assistant", content = "", tool_calls = { { id = "a" } } },
+        { role = "tool", tool_call_id = "a", content = "r1" },
+      },
+    }
+    local shadow2 = compactor._select_shadow_range(agent2, cfg, { retain_tokens = 0 })
+    t.eq(1, #shadow2)
+    t.eq("u1", shadow2[1].content)
+  end)
+
+  it("force_compact：裁剪大工具结果后无需摘要（不触发 API）", function(t)
+    local compactor = require("NeoAI.core.session.compactor")
+    local big = string.rep("x", 200000)
+    local agent = {
+      id = "pc1", state = "idle", model = "gpt-4o", config = {},
+      usage = {}, cache = {},
+      messages = {
+        { role = "user", content = "read it" },
+        { role = "assistant", content = "", tool_calls = { { id = "c1" } } },
+        { role = "tool", tool_name = "read_file", tool_call_id = "c1", content = big },
+      },
+    }
+    local done = false
+    local result
+    compactor.force_compact(agent, { context_cache = { context_window = 2000 } }):then_(
+      function(r) done = true; result = r end,
+      function() done = true; result = false end)
+    vim.wait(1500, function() return done end)
+    t.true_(done)
+    t.true_(result)
+    t.true_(agent.messages[3].pruned)
+    t.true_(#agent.messages[3].content < #big)
+  end)
 end)

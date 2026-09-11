@@ -424,9 +424,13 @@ if signal:aborted() then return end
 2. **溢出恢复**：请求返回 `context window exceeded`（400/413/429）时，`recovery.send_stream` 调 `compactor.force_compact` 后重发（每轮请求最多触发一次）。
 
 **压缩策略**：
-- 折叠最早的整段消息，保留最近尾部（`retain_ratio`/`retain_min_tokens` 预算）。
+- 先做**模型无关的工具结果裁剪**：超长 `read_file`/`run_command` 输出裁成「头部 + 省略标记 + 尾部」，
+  多数情况下无需摘要即可回到阈值内。
+- 折叠最早的整段消息，保留最近尾部（`retain_ratio`/`retain_min_tokens` 预算）；切点保持**工具配对平衡**，
+  不拆散 `assistant.tool_calls` 与其 `tool` 结果。
 - 辅助摘要调用「逐字节回放」系统提示 + 工具 schema + 被折叠区消息，压缩指令作为最后一条 user 消息追加 → 复用热前缀缓存。
 - 用带 `<compacted-summary>` 标签的检查点 user 消息**替换**被折叠区间（仅替换，不产生第二份历史副本）。
+- 摘要后仍高于阈值时按 `compaction_retries` 重试；溢出恢复走最大化平衡头部缩减。
 
 **前缀身份一致性**（`core/agent/prefix.lua`）：
 - 系统提示按有序段拼接（身份 `-100` / persona `0` / 工具指引 `100+`），跨请求逐字节稳定。
@@ -489,10 +493,16 @@ if signal:aborted() then return end
 
 ### `core/session/compactor.lua` — 上下文压缩
 
-- `maybe_compact(agent)` — 达到 token 压力阈值时折叠历史（仅空闲时执行）。
-- `force_compact(agent)` — 跳过阈值判断，供溢出恢复使用。
-- `_select_shadow_range` — 折叠最早整段，保留最近尾部。
+- `maybe_compact(agent)` — 达到 token 压力阈值时先裁剪工具结果，必要时折叠历史（仅空闲时执行）。
+- `force_compact(agent)` — 跳过阈值判断，供溢出恢复使用（最大化平衡头部缩减）。
+- `_select_shadow_range` — 折叠最早整段，保留最近尾部；切点保持工具配对平衡。
 - `checkpoint_message(summary)` — 生成 `<compacted-summary>` 检查点消息。
+
+### `core/session/tool_result_pruner.lua` — 工具结果裁剪
+
+- `prune_agent(agent, opts)` — 摘要前把超预算工具结果裁成「头部 + 省略标记 + 尾部」。
+- `prune_content(content, cfg)` / `measure_content(content)` — 单条内容的裁剪与码点计量。
+- 含图像引用的工具结果跳过，避免裁剪使内嵌 JSON 失效、图像无法注入。
 
 ### `core/model/registry.lua` — 模型注册表
 

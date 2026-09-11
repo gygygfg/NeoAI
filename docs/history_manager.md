@@ -10,6 +10,7 @@
 | `core/session/session.lua` | 会话对象（纯净数据 + 方法），字段 `id / parent_id / root_id / created_at / updated_at / model / messages / metadata`。fork 分支。 |
 | `core/session/session_store.lua` | 会话持久化：追加式 JSONL + `.bak` 备份 + 撕裂行修复；CRUD + get_chain/get_downstream 链式遍历。 |
 | `core/session/context_builder.lua` | 从会话/Agent 构建发送给模型的上下文消息（含 system 渲染、工具调用协议处理）。 |
+| `core/session/tool_result_pruner.lua` | 模型无关的工具结果裁剪：摘要前把超长工具结果裁成「头部 + 省略标记 + 尾部」。 |
 | `core/session/compactor.lua` | 上下文压缩：达到压力阈值时折叠旧历史、辅助摘要（前缀缓存复用）、检查点替换。 |
 
 ## 2. 会话对象（session.lua）
@@ -66,15 +67,21 @@
 
 1. **触发**：`maybe_compact(agent)` 在每次新一步前检查，估算 token 达到
    `context_window * threshold_ratio` 阈值时折叠。
-2. **选择折叠区间**：`_select_shadow_range` 折叠最早的整段历史，保留最近尾部（`retain_ratio` 预算，
-   下限 `retain_min_tokens`，至少 `min_shadow_messages` 条消息）。
-3. **辅助摘要**：`_summarize` 逐字节回放会话前缀（相同系统提示、工具 schema、被折叠区消息），
+2. **模型无关裁剪**：先由 `tool_result_pruner.prune_agent` 把超预算的工具结果裁成
+   「头部 + 省略标记 + 尾部」（`prune_threshold_chars` / `prune_head_chars` / `prune_tail_chars`），
+   含图像引用的结果跳过。裁剪后已回到阈值内则直接结束，无需摘要调用；有裁剪则作废过期 API 用量。
+3. **选择折叠区间**：`_select_shadow_range` 折叠最早的整段历史，保留最近尾部（`retain_ratio` 预算，
+   下限 `retain_min_tokens`，至少 `min_shadow_messages` 条消息）。切点必须**工具配对平衡**：
+   前移切点直到不拆散 `assistant.tool_calls` 与其 `tool` 结果，否则压缩后请求会被 API 拒绝。
+4. **辅助摘要**：`_summarize` 逐字节回放会话前缀（相同系统提示、工具 schema、被折叠区消息），
    再追加压缩指令作为最后一条 user 消息 → 复用 provider 热前缀缓存。
-4. **检查点替换**：生成带 `<compacted-summary>` 标签的 checkpoint user 消息，**替换被折叠区间**
+5. **检查点替换**：生成带 `<compacted-summary>` 标签的 checkpoint user 消息，**替换被折叠区间**
    （`_replace_with_checkpoint`），并记录 `replaced_count`。后续请求在替换点之前的未变前缀仍可复用缓存。
-5. **仅替换而非追加**（不产生第二份历史副本）。成功后发射 `COMPACTION_COMPLETED`。
+   仅替换而非追加（不产生第二份历史副本）。成功后发射 `COMPACTION_COMPLETED`。
+6. **收敛重试**：摘要后仍高于阈值时按 `compaction_retries` 继续折叠更早区间。
 
-`force_compact`（溢出恢复用）跳过压力阈值判断，保留空闲/并发锁检查。
+`force_compact`（溢出恢复用）跳过压力阈值判断，保留空闲/并发锁检查；先裁剪，裁剪已足以回到
+窗口内则不再摘要，否则做一次最大化的平衡头部缩减（retain 0，只保留最新一个不可分单元）。
 
 ## 6. 会话树与分支
 

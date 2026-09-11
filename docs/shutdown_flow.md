@@ -18,7 +18,7 @@
 ### 2.1 bootstrap
 
 `M.bootstrap()` 幂等。初始化日志、注册 `VimLeavePre` 清理自动命令、后台模型刷新。
-发射 `PLUGIN_INITIALIZED`？——不，实际在 `setup()` 后由 init 触发。见 `NeoAI.setup()`。
+`PLUGIN_INITIALIZED` 事件常量虽在 `kernel/events.lua` 中定义，但**当前代码未实际 emit**（属预留常量），故 bootstrap 不触发它。
 
 ### 2.2 on_shutdown
 
@@ -43,6 +43,9 @@ config_store.load(user_config)      -- 纯函数：合并 + 校验
 kernel.bootstrap()                  -- 内核引导（日志、VimLeavePre、模型后台刷新）
 herder.init()                       -- Herder 终端状态信号（懒检测环境，no-op）
 tools.init()                        -- 初始化工具系统（同步注册内置工具）
+skills.init()                       -- 扫描技能目录，填充索引
+mcp.init()                          -- 预缓存注册 + 异步连接 MCP 服务器
+lifecycle.on_shutdown(mcp.shutdown) -- 关闭时关 MCP 子进程/会话
 _register_commands()                -- 注册用户命令（懒加载业务模块）
 _register_global_keymaps()          -- 注册全局快捷键
 status.ensure_lualine_extension()   -- 注入 lualine 扩展（若已加载）

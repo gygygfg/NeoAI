@@ -79,33 +79,81 @@ local function _resolve_provider_model(model, agent_config)
   return model_id, provider_name
 end
 
---- 构建请求体
---- @param messages table
---- @param opts table { model?, stream?, temperature?, max_tokens?, tools?, agent_config?, reasoning_enabled? }
---- @return table, string provider_name, string model_id
+--- 构建请求上下文（协议编码 + 方言 + 显式缓存）
+--- @param messages table 已物化的 wire 消息（内部规范）
+--- @param opts table { model?, stream?, temperature?, max_tokens?, tools?, agent_config?, reasoning_enabled?, reasoning_budget?, reasoning_effort? }
+--- @return table ctx { body, provider, provider_name, model_id, adapter, dialect, caps, path, headers }
 local function _build_request(messages, opts)
   opts = opts or {}
   local model_id, provider_name = _resolve_provider_model(opts.model, opts.agent_config)
   local providers = config_store.get("ai.providers") or {}
   local provider = providers[provider_name] or {}
-  local a = adapter.get(provider.api_type or "openai") or adapter.get("openai")
+  local api_type = provider.api_type or "openai"
+  local a = adapter.get(api_type) or adapter.get("openai")
+
+  local profiles = require("NeoAI.core.model.profiles")
+  local capabilities = require("NeoAI.core.model.capabilities")
+  local dialect = profiles.resolve(provider_name, provider, model_id)
+  local caps = capabilities.resolve(model_id, provider_name, provider)
 
   local reasoning_enabled = opts.reasoning_enabled
   if reasoning_enabled == nil then
     reasoning_enabled = config_store.get("ai.reasoning_enabled")
   end
 
+  -- 协议编码：内部规范 → 各协议 wire 形态（Anthropic system/blocks、Gemini contents 等）
+  local encoded = a.encode_messages(messages, dialect)
+  local tools = a.encode_tools(opts.tools, dialect)
+
+  -- 请求参数回落：显式 opts → 场景配置（modes 的 temperature/max_tokens）
+  local ac = opts.agent_config or {}
+  local temperature = opts.temperature
+  if temperature == nil then temperature = ac.temperature end
+  local max_tokens = opts.max_tokens
+  if max_tokens == nil then max_tokens = ac.max_tokens end
+
+  -- 输出上限发送策略：仅用户显式配置（opts.max_tokens 或场景 modes.*.max_tokens）才下发；
+  -- 未配置则不发送该参数，由模型/厂商默认最大输出决定（实时/override 值不再自动发送）。
+  -- 例外：协议必填（如 Anthropic max_tokens）用能力表 max_output 兜底。
+  -- 显式值超出模型上限时收敛，避免厂商 400（超过模型最大输出）。
+  local cap_out = tonumber(caps.max_output)
+  if max_tokens == nil and dialect.max_tokens_required then
+    max_tokens = cap_out
+  elseif max_tokens ~= nil and cap_out and cap_out > 0 and max_tokens > cap_out then
+    local logger = require("NeoAI.kernel.logger")
+    logger.debug("[request] max_tokens %d 超出 %s 上限 %d，已收敛", max_tokens, tostring(model_id), cap_out)
+    max_tokens = cap_out
+  end
+
   local body = a.build_body({
     model = model_id,
-    messages = messages,
+    messages = encoded.messages,
+    system = encoded.system,
     stream = opts.stream or false,
-    temperature = opts.temperature,
-    max_tokens = opts.max_tokens,
+    temperature = temperature,
+    max_tokens = max_tokens,
     reasoning_enabled = reasoning_enabled,
-    tools = opts.tools,
+    reasoning_budget = opts.reasoning_budget or caps.reasoning_budget,
+    reasoning_effort = opts.reasoning_effort,
+    tools = tools,
+    dialect = dialect,
   })
 
-  return body, provider, model_id, a
+  -- 显式缓存由发送阶段异步注入（Gemini 需先创建 cachedContents），见 send / send_stream。
+
+  return {
+    body = body,
+    provider = provider,
+    provider_name = provider_name,
+    model_id = model_id,
+    adapter = a,
+    dialect = dialect,
+    caps = caps,
+    system = encoded.system,
+    tools = tools,
+    path = a.chat_path(provider, model_id, { stream = opts.stream }),
+    headers = a.headers(provider, dialect),
+  }
 end
 
 --- 先物化消息（多模态：把会话内的图像引用解析为 wire part；模型不支持图像则原样文本）
@@ -179,43 +227,49 @@ M.is_context_overflow = _is_context_overflow
 function M.send(messages, opts)
   opts = opts or {}
   return _prepare_messages(messages, opts):then_(function(prepared)
-    local body, provider, model_id, a = _build_request(prepared, opts)
+    local ctx = _build_request(prepared, opts)
     local timeout_ms = opts.timeout_ms or config_store.get("ai.timeout_ms") or 60000
     local max_retries = opts.max_retries or config_store.get("ai.max_retries") or 3
 
-    return async.retry(function()
-      return http.request({
-        base_url = provider.base_url,
-        path = a.chat_path(provider),
-        method = "POST",
-        headers = a.headers(provider),
-        body = body,
-        timeout_ms = timeout_ms,
-      }, { signal = opts.signal }):then_(function(resp_body)
-        local parsed = a.parse_response(resp_body)
-        if not parsed then
-          return async.reject({ kind = "parse", message = "响应解析失败" })
-        end
-        return {
-          content = parsed.content,
-          reasoning = parsed.reasoning,
-          tool_calls = parsed.tool_calls,
-          finish_reason = parsed.finish_reason,
-          usage = parsed.usage,
-          provider = provider.api_type,
-          model = model_id,
-          request_body = body,
-          raw_body = resp_body,
-        }
+    return require("NeoAI.core.model.prompt_cache").apply_async({
+      body = ctx.body, provider = ctx.provider, provider_name = ctx.provider_name,
+      model = ctx.model_id, dialect = ctx.dialect, caps = ctx.caps,
+      system = ctx.system, tools = ctx.tools, stream = opts.stream, signal = opts.signal,
+    }):then_(function()
+      return async.retry(function()
+        return http.request({
+          base_url = ctx.provider.base_url,
+          path = ctx.path,
+          method = "POST",
+          headers = ctx.headers,
+          body = ctx.body,
+          timeout_ms = timeout_ms,
+        }, { signal = opts.signal }):then_(function(resp_body)
+          local parsed = ctx.adapter.parse_response(resp_body)
+          if not parsed then
+            return async.reject({ kind = "parse", message = "响应解析失败" })
+          end
+          return {
+            content = parsed.content,
+            reasoning = parsed.reasoning,
+            tool_calls = parsed.tool_calls,
+            finish_reason = parsed.finish_reason,
+            usage = parsed.usage,
+            provider = ctx.provider.api_type,
+            model = ctx.model_id,
+            request_body = ctx.body,
+            raw_body = resp_body,
+          }
+        end)
+        end, {
+          retries = max_retries,
+          delay_ms = 1000,
+          backoff = 2,
+          signal = opts.signal,
+          should_retry = _should_retry,
+        })
       end)
-    end, {
-      retries = max_retries,
-      delay_ms = 1000,
-      backoff = 2,
-      signal = opts.signal,
-      should_retry = _should_retry,
-    })
-  end)
+    end)
 end
 
 --- 发送流式请求
@@ -232,7 +286,7 @@ function M.send_stream(messages, opts, on_chunk)
   -- _send_round 之前漏传，这里统一强制。
   opts = vim.tbl_extend("force", opts, { stream = true })
   return _prepare_messages(messages, opts):then_(function(prepared)
-    local body, provider, model_id, a = _build_request(prepared, opts)
+    local ctx = _build_request(prepared, opts)
     local timeout_ms = opts.timeout_ms or config_store.get("ai.timeout_ms") or 60000
     local max_retries = opts.max_retries or config_store.get("ai.max_retries") or 3
 
@@ -240,16 +294,21 @@ function M.send_stream(messages, opts, on_chunk)
     local raw = { chunks = {}, bytes = 0, truncated = false }
     local done = false
 
+    return require("NeoAI.core.model.prompt_cache").apply_async({
+      body = ctx.body, provider = ctx.provider, provider_name = ctx.provider_name,
+      model = ctx.model_id, dialect = ctx.dialect, caps = ctx.caps,
+      system = ctx.system, tools = ctx.tools, stream = true, signal = opts.signal,
+    }):then_(function()
     return async.retry(function()
       acc = { content = "", reasoning = "", tool_calls = nil, finish_reason = nil, usage = nil }
       raw = { chunks = {}, bytes = 0, truncated = false }
       done = false
       return http.request({
-        base_url = provider.base_url,
-        path = a.chat_path(provider),
+        base_url = ctx.provider.base_url,
+        path = ctx.path,
         method = "POST",
-        headers = a.headers(provider),
-        body = body,
+        headers = ctx.headers,
+        body = ctx.body,
         timeout_ms = timeout_ms,
         stream = true,
       }, {
@@ -261,7 +320,7 @@ function M.send_stream(messages, opts, on_chunk)
           end
           -- 原始响应（SSE 分片）捕获：供轨迹显示查看 wire 级数据
           _append_raw(raw, raw_chunk)
-          local parsed = a.parse_stream_chunk(raw_chunk)
+          local parsed = ctx.adapter.parse_stream_chunk(raw_chunk)
           if not parsed then return end
           if type(parsed.content) == "string" then
             acc.content = acc.content .. parsed.content
@@ -281,8 +340,11 @@ function M.send_stream(messages, opts, on_chunk)
           if parsed.finish_reason then
             acc.finish_reason = parsed.finish_reason
           end
-          if parsed.usage then
-            acc.usage = parsed.usage
+          -- 必须用 type 判断：JSON null 经 vim.json.decode 变成 vim.NIL(userdata)，为真值，
+          -- 直接传给 tbl_deep_extend 会报 "expected table, got userdata"。
+          if type(parsed.usage) == "table" then
+            -- 跨分片合并：Anthropic 在 message_start 回传输入/缓存 token、message_delta 回传输出 token
+            acc.usage = vim.tbl_deep_extend("force", acc.usage or {}, parsed.usage)
           end
         end,
       }):then_(function()
@@ -292,24 +354,25 @@ function M.send_stream(messages, opts, on_chunk)
           tool_calls = acc.tool_calls,
           finish_reason = acc.finish_reason,
           usage = acc.usage,
-          provider = provider.api_type,
-          model = model_id,
-          request_body = body,
+          provider = ctx.provider.api_type,
+          model = ctx.model_id,
+          request_body = ctx.body,
           raw_chunks = raw.chunks,
           raw_truncated = raw.truncated,
         }
       end)
-    end, {
-      retries = max_retries,
-      delay_ms = 1000,
-      backoff = 2,
-      signal = opts.signal,
-      should_retry = function(err)
-        if done then return false end
-        return _should_retry(err)
-      end,
-    })
-  end)
+      end, {
+        retries = max_retries,
+        delay_ms = 1000,
+        backoff = 2,
+        signal = opts.signal,
+        should_retry = function(err)
+          if done then return false end
+          return _should_retry(err)
+        end,
+      })
+    end)
+    end)
 end
 
 return M

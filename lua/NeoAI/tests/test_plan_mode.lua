@@ -35,10 +35,11 @@ tests.suite("plan_mode", function(_, it)
     t.false_(pm.check_tool(agent, "run_command"))
     t.false_(pm.check_tool(agent, "create_sub_agent"))
     t.false_(pm.check_tool(agent, "todo_write"))
-    -- 只读/信息查询 + ask_user：放行
+    -- 只读/信息查询 + ask_user + exit_plan_mode：放行
     t.true_(pm.check_tool(agent, "read_file"))
     t.true_(pm.check_tool(agent, "git_status"))
     t.true_(pm.check_tool(agent, "ask_user"))
+    t.true_(pm.check_tool(agent, "exit_plan_mode"))
     pm.exit(agent)
     t.true_(pm.check_tool(agent, "edit_file"))
   end)
@@ -64,6 +65,7 @@ tests.suite("plan_mode", function(_, it)
     t.nil_(filtered.lsp_rename, "计划模式不暴露 lsp_rename")
     t.not_nil(filtered.read_file, "计划模式保留 read_file")
     t.not_nil(filtered.ask_user, "计划模式保留 ask_user")
+    t.not_nil(filtered.exit_plan_mode, "计划模式保留 exit_plan_mode")
     t.not_nil(filtered.git_status, "计划模式保留 git_status")
     t.not_nil(filtered.lsp_diagnostics, "计划模式保留 lsp_diagnostics")
     pm.exit(agent)
@@ -149,6 +151,51 @@ tests.suite("plan_mode", function(_, it)
     todo.reset()
   end)
 
+  it("exit_plan_mode 工具需审批，调用后转入 CHAT 并建立任务清单", function(t)
+    local config_store = require("NeoAI.kernel.config_store")
+    config_store.load({
+      tools = {
+        approval = { mode = "prompt", per_tool = {} },
+        plan_mode = { auto_execute_on_approve = false },
+      },
+    })
+    local chat_service = require("NeoAI.services.chat_service")
+    local tool_service = require("NeoAI.services.tool_service")
+    local todo = require("NeoAI.tools.builtin.todo")
+    local pm = require("NeoAI.tools.builtin.plan_mode")
+    chat_service.reset()
+    tool_service.reset()
+    todo.reset()
+
+    local agent = chat_service.new_session({})
+    pm.enter(agent)
+
+    local tool
+    for _, tl in ipairs(pm.get_tools()) do
+      if tl.name == "exit_plan_mode" then tool = tl end
+    end
+    t.not_nil(tool, "应注册 exit_plan_mode 工具")
+    t.false_(tool.approval and tool.approval.auto_allow, "exit_plan_mode 需用户审批确认")
+
+    local out = {}
+    tool.func(
+      { plan = "- 步骤一：修改 core/init.lua\n- 步骤二：运行验证" },
+      function(m) out.msg = m end,
+      function(e) out.err = e end,
+      { agent = agent })
+
+    t.nil_(out.err)
+    t.matches("转入 CHAT", out.msg or "")
+    t.false_(pm.is_active(agent), "工具调用后应退出计划模式")
+    t.eq("chat", chat_service.get_mode())
+    local items = todo.get(agent.session_id)
+    t.not_nil(items)
+    t.eq(2, #items)
+    chat_service.reset()
+    tool_service.reset()
+    todo.reset()
+  end)
+
   it("approve_plan 无计划 / 非计划模式下失败", function(t)
     local config_store = require("NeoAI.kernel.config_store")
     config_store.load({
@@ -197,6 +244,36 @@ tests.suite("plan_mode", function(_, it)
     t.eq("chat", chat_service.cycle_mode(), "第三次回到 CHAT")
     t.false_(pm.is_active(chat_service.get_current_agent()))
     t.false_(tool_service.is_auto_mode())
+    chat_service.reset()
+    tool_service.reset()
+  end)
+
+  it("生成中切换模式延迟到本轮结束后应用，不打断当前回合", function(t)
+    local config_store = require("NeoAI.kernel.config_store")
+    config_store.load({ tools = { approval = { mode = "prompt", per_tool = {} } } })
+    local chat_service = require("NeoAI.services.chat_service")
+    local tool_service = require("NeoAI.services.tool_service")
+    local pm = require("NeoAI.tools.builtin.plan_mode")
+    chat_service.reset()
+    tool_service.reset()
+
+    local agent = chat_service.new_session({})
+    -- 模拟正在生成（generating）
+    agent.state = "generating"
+    t.false_(pm.is_active(agent))
+
+    local target = chat_service.cycle_mode()
+    t.eq("plan", target, "生成中切模式应立即返回目标模式")
+    t.eq("plan", chat_service.get_mode(), "get_mode 应反映目标模式")
+    t.true_(chat_service.has_pending_mode(), "生成中应暂存模式切换")
+    t.false_(pm.is_active(agent), "生成中不得立即改工具集/模式，以免打断当前回合")
+
+    -- 本轮结束：Agent 回到 idle，触发状态事件后应用暂存模式
+    agent:set_state("idle")
+    t.true_(pm.is_active(agent), "空闲后应应用暂存的计划模式")
+    t.false_(chat_service.has_pending_mode(), "应用后应清空暂存")
+    t.eq("plan", chat_service.get_mode())
+
     chat_service.reset()
     tool_service.reset()
   end)

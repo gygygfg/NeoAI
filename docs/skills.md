@@ -57,7 +57,7 @@ require("NeoAI").setup({
 
 系统提示会注入「可用技能」段（`inject_mode`）：
 
-- `list`：`## 可用技能（Skills）` + `- name: description`（默认）。
+- `list`：`## 可用技能（Skills）` + 加载说明（何时/如何加载、加载后按正文执行）+ `- name: description`（默认）。
 - `full`：把全部技能正文注入系统提示（token 占用大，慎用）。
 - `none`：不注入清单，模型借助 `list_skills` 自行发现。
 

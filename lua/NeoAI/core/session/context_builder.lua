@@ -138,27 +138,29 @@ function M.build_fork_context(session, task)
   return messages
 end
 
---- 估算单条消息 content 的 token（字符/4 粗估），content 可能是字符串，
+--- 估算单条消息 content 的 token（字符/系数粗估），content 可能是字符串，
 --- 也可能是多模态块数组（{ type="text", text=.. } / { type="image", attachment=ref }）。
 --- @param content any
+--- @param divisor number|nil 每 token 字符数（缺省 4；CJK 模型可传更小值）
 --- @return number
-local function _estimate_content(content)
+local function _estimate_content(content, divisor)
+  divisor = divisor or 4
   if type(content) == "string" then
-    return math.ceil(#content / 4)
+    return math.ceil(#content / divisor)
   elseif type(content) == "table" then
     local n = 0
     for _, b in ipairs(content) do
       if type(b) ~= "table" then
-        n = n + math.ceil(#tostring(b) / 4)
+        n = n + math.ceil(#tostring(b) / divisor)
       elseif b.type == "text" then
-        n = n + math.ceil(#(b.text or "") / 4)
+        n = n + math.ceil(#(b.text or "") / divisor)
       elseif b.type == "image" then
         n = n + M._estimate_image(b.attachment or b)
       end
     end
     return n
   elseif content ~= nil then
-    return math.ceil(#tostring(content) / 4)
+    return math.ceil(#tostring(content) / divisor)
   end
   return 0
 end
@@ -180,25 +182,82 @@ function M._estimate_image(ref)
   return 100
 end
 
---- 统计上下文的 token 估算（字符/4 粗估，兼容多模态 content 块与 m.image）
+--- 统计上下文的 token 估算（字符/系数粗估，兼容多模态 content 块与 m.image）
 --- @param messages table
+--- @param opts table|nil { chars_per_token?: number } 模型级字符/token 系数
 --- @return number
-function M.estimate_tokens(messages)
+function M.estimate_tokens(messages, opts)
+  local divisor = opts and opts.chars_per_token or 4
   local total = 0
   for _, m in ipairs(messages or {}) do
-    total = total + _estimate_content(m.content)
+    total = total + _estimate_content(m.content, divisor)
     if m.image then
       total = total + M._estimate_image(m.image)
     end
     if m.tool_calls then
       for _, tc in ipairs(m.tool_calls) do
         local fn = tc["function"]
-        total = total + math.ceil(#(fn and fn.name or "") / 4)
-        total = total + math.ceil(#(fn and fn.arguments or "") / 4)
+        total = total + math.ceil(#(fn and fn.name or "") / divisor)
+        total = total + math.ceil(#(fn and fn.arguments or "") / divisor)
       end
     end
   end
   return total
+end
+
+--- 估算「完整请求」的 token：系统提示 + 工具定义 + 消息。
+--- 只估算 messages 会漏掉 system/tools，导致压缩阈值偏低、实际请求先于压缩而溢出。
+--- @param agent table|nil
+--- @param opts table|nil { chars_per_token?, messages?, tools?, include_system? }
+--- @return number
+function M.estimate_request(agent, opts)
+  opts = opts or {}
+  local divisor = tonumber(opts.chars_per_token) or 4
+  local total = 0
+  if opts.include_system ~= false and agent then
+    local ok, sys = pcall(function()
+      return require("NeoAI.core.agent.prefix").build_system_prompt(agent)
+    end)
+    if ok and type(sys) == "string" then
+      total = total + math.ceil(#sys / divisor)
+    end
+  end
+  local messages = opts.messages
+  if messages == nil then
+    messages = agent and M.build_from_agent(agent, { include_system = false }) or {}
+  end
+  total = total + M.estimate_tokens(messages, { chars_per_token = divisor })
+  local tools = opts.tools
+  if tools == nil and agent and agent.tools then
+    local ok, defs = pcall(function()
+      return require("NeoAI.core.agent.tool_loop")._tool_definitions(agent)
+    end)
+    if ok then tools = defs end
+  end
+  if type(tools) == "table" and next(tools) ~= nil then
+    local ok, encoded = pcall(function()
+      return require("NeoAI.utils.json").encode(tools)
+    end)
+    if ok and type(encoded) == "string" then
+      total = total + math.ceil(#encoded / divisor)
+    end
+  end
+  return total
+end
+
+--- 当前上下文占用 token：优先用 API 最近一次请求回传的输入 token（最准确，天然含
+--- 系统提示/工具定义/缓存命中），缺失时回退本地完整请求估算。
+--- @param agent table|nil
+--- @param opts table|nil { chars_per_token? } 回退估算用
+--- @return number
+--- @return string 取值来源 "api" | "estimate"
+function M.used_tokens(agent, opts)
+  opts = opts or {}
+  local last = agent and agent.usage and agent.usage.last_prompt
+  if type(last) == "number" and last > 0 then
+    return last, "api"
+  end
+  return M.estimate_request(agent, opts), "estimate"
 end
 
 return M

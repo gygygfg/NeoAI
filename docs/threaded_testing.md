@@ -67,27 +67,51 @@ end)
 
 `lua/NeoAI/tests/` 下按模块/特性划分：
 
+`lua/NeoAI/tests/` 下共 **41** 个 `test_*.lua`（另 `init.lua` 为运行器），按模块/特性划分：
+
 | 文件 | 覆盖 |
 | --- | --- |
 | `test_kernel.lua` | 内核（config_store / event_bus / events / lifecycle） |
 | `test_session.lua` | 会话（session / session_store / context_builder / compactor） |
-| `test_model_registry.lua` | 模型注册表 |
-| `test_agent.lua` | Agent（agent / runtime / guardian） |
+| `test_agent.lua` | Agent（agent / runtime） |
 | `test_guard.lua` | 工具循环护栏 |
 | `test_overflow.lua` | 上下文溢出恢复 |
+| `test_runtime_context.lua` | 运行时上下文 |
+| `test_model_registry.lua` | 模型注册表 |
+| `test_model_capabilities.lua` | 模型能力表 |
+| `test_model_profiles.lua` | 厂商/模型方言 |
+| `test_model_metadata.lua` | 实时模型元数据 |
+| `test_protocol_adapter.lua` | 协议编解码 |
+| `test_prompt_cache.lua` | 显式缓存 |
+| `test_cache_strategy.lua` | 前缀缓存策略 |
+| `test_cache_usage.lua` | 缓存命中用量统计 |
+| `test_model_picker.lua` | 模型选择器 |
+| `test_modes.lua` | 模式（CHAT/PLAN/AUTO） |
+| `test_multimodal.lua` | 多模态图像 |
 | `test_tools.lua` | 工具系统 |
+| `test_tool_pending.lua` | 工具待发/暂存 |
+| `test_pending_queue.lua` | 待发消息队列 |
 | `test_services.lua` | 服务层（chat / tool / model / status） |
+| `test_status.lua` | 状态栏服务 |
 | `test_ask_user.lua` | 向用户提问 |
 | `test_herder.lua` | Herder 状态上报 |
 | `test_plan_mode.lua` | 计划模式 |
+| `test_plan_distill.lua` | 计划蒸馏 |
+| `test_todo.lua` | 待办清单 |
+| `test_sub_agent_result.lua` | 子 Agent 结果 |
+| `test_skills.lua` | Skills（frontmatter/发现/装载） |
+| `test_mcp_client.lua` | MCP JSON-RPC 客户端 |
+| `test_mcp_transport.lua` | MCP 传输层（stdio/HTTP） |
+| `test_mcp_bridge.lua` | MCP 管理器桥接 |
 | `test_chat_ui.lua` | 聊天 UI |
 | `test_tree_ui.lua` | 会话树 UI |
+| `test_chat_keys.lua` | 聊天键位 |
 | `test_display_modes.lua` | 显示模式插件 |
 | `test_fold.lua` | 折叠 |
-| `test_status.lua` | 状态栏服务 |
-| `test_multimodal.lua` | 多模态图像 |
-| `test_cache_strategy.lua` | 前缀缓存策略 |
-| test_chat_keys / test_timer / test_todo / test_sub_agent_result / test_http / test_markdown / test_model_picker | 其它 |
+| `test_markdown.lua` | Markdown 渲染 |
+| `test_timer.lua` | 可暂停计时器 |
+| `test_http.lua` | HTTP 客户端 |
+| `test_integration.lua` | 集成测试（mock server） |
 
 ## 4. headless 运行
 

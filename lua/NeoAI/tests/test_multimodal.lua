@@ -137,11 +137,11 @@ tests.suite("multimodal", function(_, it, before_each)
     for _, m in ipairs(wire) do
       if type(m.content) == "table" then
         for _, p in ipairs(m.content) do
-          if p.type == "image_url" then img = true end
+          if p.type == "image" and p.base64 then img = true end
         end
       end
     end
-    t.true_(img, "vision 注入 image_url")
+    t.true_(img, "vision 注入中立图像块（image/base64）")
 
     local ok3, wire2
     content.materialize(msgs, { vision = false }):then_(function(w) wire2 = w ok3 = true end)
@@ -171,7 +171,7 @@ tests.suite("multimodal", function(_, it, before_each)
     for _, m in ipairs(wire) do
       if type(m.content) == "table" then
         for _, p in ipairs(m.content) do
-          if p.type == "image_url" then img_count = img_count + 1 end
+          if p.type == "image" then img_count = img_count + 1 end
         end
       end
     end

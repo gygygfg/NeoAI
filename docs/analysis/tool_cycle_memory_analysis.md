@@ -138,8 +138,9 @@ end
 ### 4.2 上下文压缩
 
 `runtime.run` 在每次新一步前调用 `compactor.maybe_compact`：达到压力阈值（`context_window *
-threshold_ratio`）时折叠最早的整段历史，保留最近尾部（retain 预算），用检查点替换（仅替换而非追加）。
-`force_compact` 用于溢出恢复。
+threshold_ratio`）时先由 `tool_result_pruner` 裁剪超长工具结果（头/标记/尾），裁剪后仍超阈值再折叠
+最早的整段历史（切点保持工具配对平衡），保留最近尾部（retain 预算），用检查点替换（仅替换而非追加）。
+`force_compact` 用于溢出恢复：先裁剪，必要时做最大化平衡头部缩减（retain 0）。
 
 ### 4.3 前缀缓存身份
 

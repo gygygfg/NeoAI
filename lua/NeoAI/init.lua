@@ -95,14 +95,16 @@ local function _register_commands()
     if active == nil then
       vim.notify("[NeoAI] 无当前 Agent，无法切换计划模式", vim.log.levels.WARN)
     else
-      vim.notify("[NeoAI] 计划模式已" .. (active and "开启" or "关闭"), vim.log.levels.INFO)
+      local suffix = chat_service.has_pending_mode() and "（将在本轮生成结束后生效）" or ""
+      vim.notify("[NeoAI] 计划模式已" .. (active and "开启" or "关闭") .. suffix, vim.log.levels.INFO)
     end
   end, { desc = "切换计划模式", force = true })
 
   vim.api.nvim_create_user_command("NeoAIAuto", function()
     local chat_service = require("NeoAI.services.chat_service")
     local active = chat_service.toggle_auto_mode()
-    vim.notify("[NeoAI] AUTO 模式（自动允许所有工具调用）已" .. (active and "开启" or "关闭"), vim.log.levels.INFO)
+    local suffix = chat_service.has_pending_mode() and "（将在本轮生成结束后生效）" or ""
+    vim.notify("[NeoAI] AUTO 模式（自动允许所有工具调用）已" .. (active and "开启" or "关闭") .. suffix, vim.log.levels.INFO)
   end, { desc = "切换AUTO模式（自动允许所有工具调用）", force = true })
 
   vim.api.nvim_create_user_command("NeoAIApprovePlan", function()

@@ -261,18 +261,33 @@ end
 -- ========== 其它 ==========
 
 --- 累加 usage（兼容 openai 的 prompt_tokens/completion_tokens 与内部 prompt/completion 两种形状）
+--- 按模型缓存机制分派解析缓存命中（Anthropic/Gemini 字段与 OpenAI/DeepSeek 不同）。
 --- @param agent table
 --- @param usage table
 --- @return table Agent
 function M.add_usage(agent, usage)
-  local prompt_all = tonumber(usage.prompt or usage.prompt_tokens or 0) or 0
-  local completion = tonumber(usage.completion or usage.completion_tokens or 0) or 0
+  if type(usage) ~= "table" then return agent end
+  local meta_usage = usage.usageMetadata or usage
+  local provider_name = agent.config and agent.config.provider or nil
   local prefix = require("NeoAI.core.agent.prefix")
-  local cu = prefix.parse_cache_usage(usage)
+  local cu = prefix.parse_cache_usage(usage, agent.model, provider_name)
   local cache_read = cu and cu.cache_read or 0
-  -- 对齐 deepseek-harness：DeepSeek 的 prompt_tokens 已折叠缓存命中
-  -- （prompt_tokens = prompt_cache_hit_tokens + prompt_cache_miss_tokens），计费的
-  -- 「未缓存输入」= prompt_tokens - cache_read，缓存命中单独统计、不重复计入输入。
+  -- 输入总量（含缓存命中）：OpenAI/DeepSeek 的 prompt_tokens 已含命中；Anthropic/Gemini
+  -- 无此字段时用解析器归一量（未命中+命中+写入）回退。
+  local prompt_all = tonumber(usage.prompt or meta_usage.prompt_tokens or meta_usage.promptTokenCount)
+  if not prompt_all and cu then
+    prompt_all = cu.cache_read + cu.cache_write + cu.cache_miss
+  end
+  prompt_all = prompt_all or 0
+  local completion = tonumber(usage.completion or meta_usage.completion_tokens
+    or meta_usage.output_tokens or meta_usage.candidatesTokenCount or 0) or 0
+  -- 最近一次请求的 API 实际用量：容量显示/压缩阈值优先据此计算，避免本地字符估算偏差
+  -- （prompt_all 含缓存命中，即真实送入模型的上下文规模）。
+  agent.usage.last_prompt = prompt_all
+  agent.usage.last_prompt_uncached = math.max(0, prompt_all - cache_read)
+  agent.usage.last_completion = completion
+  agent.usage.last_cache_read = cache_read
+  -- 计费的「未缓存输入」= 输入总量 - 缓存命中，缓存命中单独统计、不重复计入输入。
   -- 对不返回 cache 计数的 provider（cache_read=0）此式退化为原值，无副作用。
   agent.usage.prompt = agent.usage.prompt + math.max(0, prompt_all - cache_read)
   agent.usage.completion = agent.usage.completion + completion
@@ -281,7 +296,7 @@ function M.add_usage(agent, usage)
     agent.usage.cache_write = (agent.usage.cache_write or 0) + cu.cache_write
     agent.usage.cache_miss = (agent.usage.cache_miss or 0) + cu.cache_miss
     agent.usage.requests = (agent.usage.requests or 0) + 1
-    -- 缓存命中率只对 prompt 维度（DeepSeek 缓存不涉及输出 token）
+    -- 缓存命中率只对 prompt 维度（缓存不涉及输出 token）
     agent.usage.prompt_cache_total = (agent.usage.prompt_cache_total or 0) + cu.cache_read
     agent.usage.prompt_total = (agent.usage.prompt_total or 0) + prompt_all
     agent.usage.cache_ratio = agent.usage.prompt_total > 0

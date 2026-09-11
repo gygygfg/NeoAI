@@ -215,7 +215,13 @@ local function _summary_text()
   if inject == "none" then return "" end
   local list = M.list()
   if #list == 0 then return "" end
-  local lines = { "## 可用技能（Skills）", "以下技能可按需调用 load_skill 装载其内容以获得针对特定任务的分步指引。当你判断当前任务匹配某技能时，先调用 load_skill。" }
+  local lines = {
+    "## 可用技能（Skills）",
+    "技能是针对特定任务的步骤式操作指引，按需加载，不要加载与当前任务无关的技能。",
+    "何时加载：当当前任务与某技能的描述匹配时，先加载该技能再动手。",
+    "如何加载：调用 load_skill 工具，name 必填，取值为下方清单中的技能名。",
+    "加载后：按 SKILL.md 正文的步骤指引执行。",
+  }
   local shown = 0
   for _, s in ipairs(list) do
     if shown >= max then break end

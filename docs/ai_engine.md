@@ -15,11 +15,33 @@
 | `request.lua` | 请求构建（经 adapter）+ 发送（流式/非流式）+ 指数退避重试 + 上下文溢出判断。 |
 | `stream.lua` | 流式响应处理：把 OpenAI 分片格式的增量 `tool_calls` 累积为完整 tool_call，并实时发射 `TOOL_ARG_CHUNK`/`TOOL_ARG_COMPLETED`。 |
 | `tool_loop.lua` | 工具调用循环：并行执行工具 → 请求 AI 继续 → 直到无工具调用。 |
-| `prefix.lua` | 前缀缓存身份一致性：系统提示按有序段拼接、工具按字典序输出、fingerprint 比对，缓存命中率最大化。 |
+| `prefix.lua` | 前缀缓存身份一致性：系统提示按有序段拼接、工具按字典序输出、fingerprint 比对，缓存命中率最大化；缓存命中解析按模型机制分派（OpenAI/DeepSeek/Anthropic/Gemini 字段归一）。 |
 | `guard.lua` | 工具循环护栏：检测连续重复的工具调用并注入提醒（observe-and-enrich）。 |
 | `recovery.lua` | 上下文溢出恢复：请求返回 context window exceeded 时自动压缩历史后重发。 |
 
 ## 2. 核心概念
+
+### 2.0 按模型自动选择（capabilities / profiles / adapter）
+
+整条链路对每个请求解析出一套「模型策略」：
+
+- `core/model/profiles.lua` → **方言**：协议族内的厂商/模型覆盖（`max_tokens` / `max_completion_tokens` /
+  `maxOutputTokens`；`reasoning_effort` / `enable_thinking` / `thinking` / `thinkingConfig`；鉴权头；
+  usage 字段；`reasoning_echo`）。模型 pattern 仅在协议与 `api_type` 一致时覆盖 provider profile。
+- `core/model/capabilities.lua` → **能力**：上下文窗口、最大输出、缓存机制（`openai`/`anthropic`/`gemini`）、
+  最小可缓存 token、显式缓存 TTL/断点上限、字符/token 系数。数值解析序：用户覆盖 → **实时 API 元数据
+  （`/models` 回传的 `inputTokenLimit` / `context_length` 等）** → 内置 pattern → `api_type` 默认 → 兜底
+  （`caps.source` 标注来源）。`max_tokens` 发送策略：仅用户显式配置才发送，未配置则不发送
+  （由模型/厂商默认最大输出决定；必填协议如 Anthropic 用能力表 `max_output` 兜底）。
+- `core/model/adapter.lua` → **协议编解码**：把内部规范（OpenAI 形消息 + 统一响应）编解码为
+  各协议 wire 形态（`encode_messages` / `encode_tools`；Anthropic `system` 顶层 + `tool_use`/`tool_result`
+  + `input_schema` + `source.base64`；Gemini `contents` + `functionDeclarations`（类型大写、裁剪 schema）
+  + `inlineData`）。
+- `core/model/prompt_cache.lua` → **显式缓存**：Anthropic `cache_control` 断点 / OpenAI explicit /
+  Gemini `cachedContents` 生命周期；失败自动降级为隐式。
+
+请求参数格式与缓存命中计算方案因此**随模型自动选择**，未知模型安全回退。详见
+[model_policy.md](model_policy.md)。
 
 ### 2.1 Agent 对象（每次对话全新实例）
 
@@ -116,8 +138,23 @@ _run() 每轮：
   8. set_state("generating") + TOOL_LOOP_FINISHED
   9. _send_round(agent) 请求下一轮
      ├─ 有工具调用 → 回到第 1 步循环
+     ├─ 无工具调用但被截断 → _drain_truncation 自动续写（见 4.5）
      └─ 无工具调用 → 若最后一条是 tool 消息则写 EMPTY_RESPONSE_MESSAGE → 结束
 ```
+
+### 4.5 截断续写（_drain_truncation）
+
+模型输出被输出上限截断（`finish_reason` 为 `length` / `max_tokens` / `MAX_TOKENS`，见
+`tool_loop.is_truncated`）且本轮无工具调用时，若 `ai.truncation` 启用且未达 `max_continues`，
+自动以 `extra_user` 附加续写提示（`ai.truncation.nudge`）重发一轮：
+
+- 提示**只进请求 wire、不落库**（`context_builder.build_from_agent` 的 `extra_user`），续写内容经
+  `append_content` 追加进**同一条** assistant 消息，不产生空 assistant 历史或聊天噪声。
+- 续写得到工具调用 → 回到循环第 1 步；得到正文/非截断 → 正常结束；达到次数上限仍截断 →
+  写入 `TRUNCATED_MESSAGE`（可见提示）后结束，避免循环静默退出。
+- 首轮（runtime 直接生成、无工具调用）同样经 `_drain_truncation` 处理，续写出工具调用则进入
+  工具循环。
+- 计数 `agent._truncation_continues` 在每轮用户输入时重置（`runtime.run` 内）。
 
 ### 4.2 工具定义输出（_tool_definitions）
 
@@ -164,6 +201,8 @@ API 兼容且前缀缓存确定。
 `compactor.maybe_compact(agent)` 在每次新一步前做压力检查：
 
 - 达到 `context_window * threshold_ratio` 阈值时折叠最早的整段历史，保留最近尾部（retain 预算）。
+  其中 `context_window` 缺省按模型能力表推导（用户显式非默认配置优先），显式缓存模型自动取
+  更保守的阈值/保留比。实例模型参考 [model_policy.md](model_policy.md)。
 - **辅助摘要调用**：`_summarize` 逐字节回放会话前缀（相同系统提示、工具 schema、被折叠区消息），
   再把压缩指令作为最后的 user 消息追加 → 复用 provider 的热前缀缓存。
 - **检查点替换**：用带 `<compacted-summary>` 标签的 checkpoint user 消息**替换被折叠区间**
@@ -185,11 +224,12 @@ API 兼容且前缀缓存确定。
 
 `request.send` / `request.send_stream`：
 
-- **多模态物化**：`_prepare_messages` 把会话内的图像引用解析为 wire part（`core.model.content.materialize`）；
+- **多模态物化**：`_prepare_messages` 把会话内的图像引用解析为协议中立的图像块（`core.model.content.materialize`）；
   模型不支持图像时原样为文本。
-- **请求体构建**：经 `core.model.adapter`（openai/anthropic/google）适配。
-- **流式强制**：`send_stream` 强制 `stream = true`（否则 API 以非流式 JSON 返回而客户端按 SSE
-  解析，导致工具循环第二轮内容丢失）。
+- **请求体构建**：经 `core.model.adapter`（openai/anthropic/google）+ `core.model.profiles` 方言适配；
+  编码后由 `prompt_cache.apply_async` 注入显式缓存（失败降级隐式）。
+- **流式强制**：`send_stream` 强制 `stream = true`；OpenAI 兼容端点自动加 `stream_options.include_usage`
+  （否则拿不到 usage，无法统计缓存命中）。
 - **重试**：`async.retry` 指数退避（`delay_ms=1000, backoff=2`），`max_retries` 缺省 3。
   4xx 不重试、abort 不重试。
 - **上下文溢出判断**：`_is_context_overflow` 匹配多种 provider 措辞（`context_length`、
@@ -201,3 +241,4 @@ API 兼容且前缀缓存确定。
 - [tool_system.md](tool_system.md)：工具系统（`tool_loop` 依赖 `tool_service`）。
 - [sub_agent_system.md](sub_agent_system.md)：子 Agent（`runtime.spawn`）。
 - [configuration.md](configuration.md)：`ai.context_cache` / `ai.reasoning_enabled` 等配置。
+- [model_policy.md](model_policy.md)：按模型自动选择（协议方言 / 能力表 / 显式缓存 / token 节省技巧）。

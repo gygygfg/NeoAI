@@ -184,6 +184,32 @@ tests.suite("tools", function(_, it)
       end)
   end)
 
+  it("shell run_command 出错/超时也回传终端输出", function(t)
+    local tools = require("NeoAI.tools")
+    local registry = require("NeoAI.tools.registry")
+    local shell = require("NeoAI.tools.builtin.shell")
+    registry.register_many(shell.get_tools())
+
+    -- 非零退出：状态行 + stdout + stderr 都应出现在结果里
+    local done1, res1 = false, nil
+    tools.execute("run_command", { command = "echo before-error; echo oops 1>&2; exit 3", description = "错误输出" }, {})
+      :then_(function(r) res1 = r; done1 = true end, function(e) res1 = e; done1 = true end)
+    vim.wait(3000, function() return done1 end)
+    t.true_(done1, "命令应返回")
+    t.matches("命令退出码 3", res1)
+    t.matches("before%-error", res1)
+    t.matches("oops", res1)
+
+    -- 超时：回传超时前已产生的输出
+    local done2, res2 = false, nil
+    tools.execute("run_command", { command = "echo partial-timeout; sleep 5", timeout_ms = 300, description = "超时输出" }, {})
+      :then_(function(r) res2 = r; done2 = true end, function(e) res2 = e; done2 = true end)
+    vim.wait(3000, function() return done2 end)
+    t.true_(done2, "超时命令应返回")
+    t.matches("超时", res2)
+    t.matches("partial%-timeout", res2)
+  end)
+
   it("tool_service 审批通过执行", function(t)
     local config_store = require("NeoAI.kernel.config_store")
     config_store.load({ tools = { approval = { mode = "prompt", per_tool = {} } } })

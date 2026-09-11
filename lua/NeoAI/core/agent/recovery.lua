@@ -20,7 +20,8 @@ function M.send_stream(agent, opts, on_chunk)
   local prefix = require("NeoAI.core.agent.prefix")
 
   local function attempt()
-    local messages = context_builder.build_from_agent(agent)
+    -- extra_user：仅注入请求 wire（如截断续写提示），不写入 agent 消息队列。
+    local messages = context_builder.build_from_agent(agent, { extra_user = opts.extra_user })
     local tool_defs = nil
     if agent.tools then
       tool_defs = require("NeoAI.core.agent.tool_loop")._tool_definitions(agent)

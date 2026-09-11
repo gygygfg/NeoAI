@@ -34,6 +34,8 @@ local DEFAULTS = {
     usage = "Number",
     cache = "String",
     capacity = "Statement",
+    capacity_warn = "WarningMsg",
+    capacity_over = "ErrorMsg",
     state = "Function",
     brand = "Title",
     pending = "Warning",
@@ -102,13 +104,17 @@ local function _build_part(info, part)
     return _fmt_model(info.model)
   elseif part == "usage" then
     if not info.usage then return nil end
-    return "↑" .. _fmt_tokens(info.usage.prompt) .. " ↓" .. _fmt_tokens(info.usage.completion)
+    -- 优先展示最近一次请求的 API 真实用量（当前上下文规模），无则回退累计
+    local p = info.usage.last_prompt or info.usage.prompt
+    local c = info.usage.last_completion or info.usage.completion
+    return "↑" .. _fmt_tokens(p) .. " ↓" .. _fmt_tokens(c)
   elseif part == "cache" then
     if not info.usage or (not info.usage.requests or info.usage.requests == 0) then return nil end
     -- 只显示命中率，简洁不堆 token 数
     return "缓存命中" .. _fmt_pct(info.usage.cache_ratio or 0)
   elseif part == "capacity" then
     if not info.capacity or not info.capacity.total or info.capacity.total <= 0 then return nil end
+    if info.capacity.level == "over" then return "上下文超限" end
     -- 剩余容量 = 1 - 已用比例
     return "剩余容量" .. _fmt_pct(math.max(0, 1 - info.capacity.pct))
   elseif part == "state" then
@@ -182,6 +188,77 @@ function M.setup(opts)
   return _opts()
 end
 
+--- 计算某 Agent 的上下文容量信息。
+--- used 优先取 API 最近一次请求回传的输入 token（真实上下文规模，含系统提示/工具/缓存命中），
+--- 无 API 用量时回退本地完整请求估算；total 为有效窗口（用户显式配置 → 模型能力表 → 兜底）。
+--- @param agent table
+--- @return table|nil { used, total, pct, level, warn_ratio, source }
+function M.capacity_for(agent)
+  if not agent then return nil end
+  local provider_name = (agent.config and agent.config.provider)
+    or config_store.get("ai.default_provider")
+  local capabilities = require("NeoAI.core.model.capabilities")
+  local caps = capabilities.resolve(agent.model, provider_name)
+  local used, source = 0, "estimate"
+  local ok, u, s = pcall(function()
+    return require("NeoAI.core.session.context_builder").used_tokens(agent, {
+      chars_per_token = caps.chars_per_token,
+    })
+  end)
+  if ok then used, source = tonumber(u) or 0, s or "estimate" end
+  local total = capabilities.resolve_window(
+    config_store.get("ai.context_cache.context_window"), agent.model, provider_name)
+  local warn_ratio = tonumber(config_store.get("ai.context_cache.warn_ratio")) or 0.85
+  local pct = total > 0 and (used / total) or 0
+  local level = "ok"
+  if pct >= 1 then
+    level = "over"
+  elseif pct >= warn_ratio then
+    level = "warn"
+  end
+  return {
+    used = used,
+    total = total,
+    pct = pct,
+    level = level,
+    warn_ratio = warn_ratio,
+    source = source,
+  }
+end
+
+--- 当前 Agent 的容量告警级别（供状态栏动态配色）
+--- @return string "ok" | "warn" | "over"
+function M.capacity_level()
+  local chat_service = require("NeoAI.services.chat_service")
+  local agent = chat_service.get_current_agent()
+  local cap = agent and M.capacity_for(agent)
+  return (cap and cap.level) or "ok"
+end
+
+--- 检查上下文压力并按级别提示一次（同一 Agent 同级别去重，回落到 ok 后重置）。
+--- @param agent table
+--- @return string|nil level
+function M.check_pressure(agent)
+  if not agent then return nil end
+  local cap = M.capacity_for(agent)
+  if not cap then return nil end
+  local prev = agent._context_pressure
+  agent._context_pressure = cap.level
+  if cap.level == "ok" or cap.level == prev then return cap.level end
+  local used, total = _fmt_tokens(cap.used), _fmt_tokens(cap.total)
+  if cap.level == "over" then
+    vim.notify(
+      ("[NeoAI] 上下文已超限（%s / %s，%s）。下一轮将自动压缩；若仍不足请精简历史或改用更大窗口的模型。"):format(
+        used, total, _fmt_pct(cap.pct)),
+      vim.log.levels.ERROR)
+  else
+    vim.notify(
+      ("[NeoAI] 上下文接近上限（%s / %s，%s）。"):format(used, total, _fmt_pct(cap.pct)),
+      vim.log.levels.WARN)
+  end
+  return cap.level
+end
+
 --- 获取当前 Agent 的状态信息（不格式化，供自定义组件使用）
 --- @return table { available, mode, display, model, state, usage, capacity }
 function M.get_info()
@@ -204,23 +281,16 @@ function M.get_info()
     info.usage = {
       prompt = u.prompt or 0,
       completion = u.completion or 0,
+      last_prompt = u.last_prompt,
+      last_completion = u.last_completion,
       requests = u.requests or 0,
       cache_read = u.cache_read or 0,
       cache_write = u.cache_write or 0,
       cache_miss = u.cache_miss or 0,
       cache_ratio = u.cache_ratio or 0,
     }
-    -- 上下文容量：估算当前消息 token 用量 / 配置的上下文窗口
-    local ok, est = pcall(function()
-      return require("NeoAI.core.session.context_builder").estimate_tokens(agent.messages or {})
-    end)
-    local used = ok and est or 0
-    local total = tonumber(config_store.get("ai.context_cache.context_window")) or 64000
-    info.capacity = {
-      used = used,
-      total = total,
-      pct = total > 0 and (used / total) or 0,
-    }
+    -- 上下文容量：优先 API 最近一次请求的真实输入 token，缺失回退完整请求估算
+    info.capacity = M.capacity_for(agent)
   end
   local display_modes = require("NeoAI.ui.components.display_modes")
   local disp = display_modes.get_current()

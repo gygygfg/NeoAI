@@ -38,7 +38,8 @@ local function _resolve_agent_config(config, mode)
     provider = mc.provider or config_store.get("ai.default_provider"),
     model = mc.model,
     temperature = mc.temperature ~= nil and mc.temperature or 0.7,
-    max_tokens = mc.max_tokens or 4096,
+    -- 未配置即 nil：请求不发送 max_tokens，由模型/厂商默认最大输出决定。
+    max_tokens = mc.max_tokens,
     stream = mc.stream ~= nil and mc.stream or true,
     system_prompt = config_store.get("ai.system_prompt"),
   }
@@ -84,6 +85,10 @@ local function _run_generation(agent, opts)
     -- 能在同一 tick 看到 agent 已空闲并立即启动下一条消息，而不是被本轮的 claim 挡住。
     agent._turn_claim = nil
     agent:set_state("idle")
+    -- 上下文压力提示（状态栏变色 + notify；同一级别去重）
+    pcall(function()
+      require("NeoAI.services.status").check_pressure(agent)
+    end)
     event_bus.emit(events.GENERATION_COMPLETED, { agent_id = agent.id, message = message })
     return message
   end
@@ -114,24 +119,32 @@ local function _run_generation(agent, opts)
         total_ms = vim.uv.hrtime() / 1e6 - start_ms,
       }))
 
-      if tool_calls and #tool_calls > 0 then
-        local tool_loop = require("NeoAI.core.agent.tool_loop")
-        return tool_loop.run(agent, tool_calls, tool_service, {}):then_(function()
-          return _finish_idle(agent.messages[#agent.messages])
+      -- 首轮响应即使无工具调用，也可能因输出被截断（finish_reason=length）而中断：
+      -- 先交给 tool_loop 的截断续写逻辑（附加"继续"提示重发，提示不落库），
+      -- 续写出工具调用则进入工具循环，否则按可见内容/截断/空响应收尾。
+      local tool_loop = require("NeoAI.core.agent.tool_loop")
+      return tool_loop._drain_truncation(agent, { next_calls = tool_calls, response = response })
+        :then_(function(result)
+          local calls = result.next_calls
+          if calls and #calls > 0 then
+            return tool_loop.run(agent, calls, tool_service, {}):then_(function()
+              return _finish_idle(agent.messages[#agent.messages])
+            end)
+          end
+
+          -- 无工具调用且模型也没返回任何内容（空响应）：写一条可见说明，避免聊天里
+          -- 只看到用户消息却没有任何回复、看起来像"卡住"。截断未续写成功时优先提示截断。
+          local last = agent.messages[#agent.messages]
+          local has_visible_content = last and last.role == "assistant"
+            and ((last.content and last.content ~= "") or (last.reasoning and last.reasoning ~= ""))
+          if tool_loop.is_truncated(result.response and result.response.finish_reason) then
+            agent:add_message("assistant", tool_loop.TRUNCATED_MESSAGE)
+          elseif not has_visible_content then
+            agent:add_message("assistant", tool_loop.EMPTY_RESPONSE_MESSAGE)
+          end
+
+          return _finish_idle(response)
         end)
-      end
-
-      -- 无工具调用但模型也没返回任何内容（空响应）：写一条可见说明，避免聊天里
-      -- 只看到用户消息却没有任何回复、看起来像"卡住"。
-      local last = agent.messages[#agent.messages]
-      local has_visible_content = last and last.role == "assistant"
-        and ((last.content and last.content ~= "") or (last.reasoning and last.reasoning ~= ""))
-      if not has_visible_content then
-        local tool_loop = require("NeoAI.core.agent.tool_loop")
-        agent:add_message("assistant", tool_loop.EMPTY_RESPONSE_MESSAGE)
-      end
-
-      return _finish_idle(response)
     end, function(err)
       -- 用户取消（ESC）：正常停止而非错误。错误回调在 abort 时也会被触发，
       -- 若按普通错误处理会把状态覆盖为 error、并发 GENERATION_ERROR，
@@ -221,6 +234,11 @@ end
 --- @param agent table
 function M.dispose(agent)
   if not agent then return end
+  -- 释放该会话模型对应的显式缓存资源（Gemini cachedContents 等）
+  pcall(function()
+    require("NeoAI.core.model.prompt_cache").dispose(
+      agent.config and agent.config.provider, agent.model)
+  end)
   local plan_mode = require("NeoAI.tools.builtin.plan_mode")
   plan_mode.cleanup(agent)
   agent_mod.dispose(agent)
@@ -265,9 +283,14 @@ function M.run(agent, content)
   -- 已到达压力阈值则先折叠旧历史，再派生请求，复用未变的前缀缓存。
   local compactor = require("NeoAI.core.session.compactor")
   return compactor.maybe_compact(agent):then_(function()
-    -- 用户新输入重置工具循环护栏计数链
+    -- 压缩后仍有压力则先提示（超限时让用户知道下一轮可能溢出/被压缩）
+    pcall(function()
+      require("NeoAI.services.status").check_pressure(agent)
+    end)
+    -- 用户新输入重置工具循环护栏计数链与截断续写计数
     local guard = require("NeoAI.core.agent.guard")
     guard.reset(agent)
+    agent._truncation_continues = nil
     -- 易变运行态（todos/计划模式）以运行时上下文快照追加进历史：
     -- 系统提示保持逐字节稳定，前缀缓存不因它们变化而失效。
     require("NeoAI.core.session.runtime_context").ensure(agent)

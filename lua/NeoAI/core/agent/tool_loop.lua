@@ -38,6 +38,52 @@ local EMPTY_RESPONSE_MESSAGE = "⚠️ 工具已执行完毕，但模型未返�
 --- 供 runtime 在无工具调用的空响应场景复用同一文案
 M.EMPTY_RESPONSE_MESSAGE = EMPTY_RESPONSE_MESSAGE
 
+-- 截断续写：模型输出被输出上限截断（finish_reason=length/max_tokens/MAX_TOKENS）且本轮无
+-- 工具调用时，自动附加一条"继续"提示重发，直到获得正文/工具调用或达到次数上限，避免循环
+-- 静默退出。提示经 extra_user 只进请求 wire、不落库，续写内容追加进同一条 assistant 消息。
+local DEFAULT_MAX_CONTINUES = 3
+local CONTINUE_NUDGE = "请从中断处继续输出，不要重复已输出的内容。"
+local TRUNCATED_MESSAGE = "⚠️ 模型输出达到长度上限被截断，已尝试自动续写仍未完成，本轮生成到此结束。"
+M.TRUNCATED_MESSAGE = TRUNCATED_MESSAGE
+
+-- 各协议/厂商的截断 finish_reason（归一化小写）：OpenAI/DeepSeek "length"、Anthropic
+-- "max_tokens"、Gemini "MAX_TOKENS"。
+local TRUNCATED_REASONS = {
+  length = true,
+  max_tokens = true,
+  max_output_tokens = true,
+  maxtokens = true,
+}
+
+--- 是否为输出被截断的 finish_reason
+--- @param finish_reason string|nil
+--- @return boolean
+local function _is_truncated(finish_reason)
+  if not finish_reason then return false end
+  return TRUNCATED_REASONS[tostring(finish_reason):lower()] == true
+end
+
+M.is_truncated = _is_truncated
+
+--- 是否还能继续自动续写（受 ai.truncation.enabled / max_continues 约束）
+--- @param agent table
+--- @return boolean
+local function _can_continue(agent)
+  local cfg = config_store.get("ai.truncation") or {}
+  if cfg.enabled == false then return false end
+  local max = tonumber(cfg.max_continues) or DEFAULT_MAX_CONTINUES
+  return (agent._truncation_continues or 0) < max
+end
+
+--- 记一次续写并返回续写提示文本
+--- @param agent table
+--- @return string
+local function _begin_continue(agent)
+  agent._truncation_continues = (agent._truncation_continues or 0) + 1
+  local cfg = config_store.get("ai.truncation") or {}
+  return cfg.nudge or CONTINUE_NUDGE
+end
+
 -- ========== 私有函数 ==========
 
 --- 解析 tool_call 的 arguments JSON
@@ -156,21 +202,24 @@ local _do_send_round
 
 --- 发送一次请求（带持久流处理器 + 溢出恢复）
 --- @param agent table
+--- @param opts table|nil { extra_user? = string } extra_user 仅注入请求 wire（截断续写提示）
 --- @return Deferred resolve({ next_calls = table|nil, response = table })
-local function _send_round(agent)
+local function _send_round(agent, opts)
   -- 轮前刷新：若 MCP 工具因 schema 变化被标记 stale，先刷新定义并重绑定 agent.tools，
   -- 确保下一轮模型看到的工具签名与服务器一致（失败驱动的时序保证）。
   local refresh_d = M.pre_round_refresh(agent)
   if refresh_d then
-    return refresh_d:then_(function() return _do_send_round(agent) end)
+    return refresh_d:then_(function() return _do_send_round(agent, opts) end)
   end
-  return _do_send_round(agent)
+  return _do_send_round(agent, opts)
 end
 
 --- 实际发送一轮请求
 --- @param agent table
+--- @param opts table|nil { extra_user? = string }
 --- @return Deferred
-_do_send_round = function(agent)
+_do_send_round = function(agent, opts)
+  opts = opts or {}
   local recovery = require("NeoAI.core.agent.recovery")
   local proc = stream_mod.create(agent)
   local start_ms = vim.uv.hrtime() / 1e6
@@ -181,6 +230,7 @@ _do_send_round = function(agent)
     agent_config = agent.config,
     model = agent.model,
     signal = agent.signal,
+    extra_user = opts.extra_user,
   }, function(chunk)
     if chunk and first_chunk_ms == nil then
       first_chunk_ms = vim.uv.hrtime() / 1e6
@@ -200,6 +250,38 @@ _do_send_round = function(agent)
     }))
     return { next_calls = next_calls, response = response }
   end)
+end
+
+--- 截断续写递归（不含预算重置；预算以「一次截断响应」为单位）
+--- @param agent table
+--- @param result table { next_calls, response }
+--- @return Deferred resolve(result)
+local function _drain(agent, result)
+  local calls = result and result.next_calls
+  if calls and #calls > 0 then return async.resolve(result) end
+  if not _is_truncated(result and result.response and result.response.finish_reason) then
+    return async.resolve(result)
+  end
+  if not _can_continue(agent) then
+    return async.resolve(result)
+  end
+  local nudge = _begin_continue(agent)
+  local logger = require("NeoAI.kernel.logger")
+  logger.warn("[tool_loop] 输出被截断，自动续写第 %d 次", agent._truncation_continues)
+  return _send_round(agent, { extra_user = nudge }):then_(function(next_result)
+    return _drain(agent, next_result)
+  end)
+end
+
+--- 处理"无工具调用但输出被截断"：自动附加续写提示重发，直到获得工具调用/正文或达到上限。
+--- 续写提示经 extra_user 只进请求 wire、不落库；续写内容追加进同一条 assistant 消息
+--- （append_content 作用于最后一条 assistant）。每个截断响应独立预算（进入时重置计数）。
+--- @param agent table
+--- @param result table { next_calls, response }
+--- @return Deferred resolve(result)
+function M._drain_truncation(agent, result)
+  agent._truncation_continues = 0
+  return _drain(agent, result)
 end
 
 -- ========== 公开 API ==========
@@ -298,16 +380,21 @@ function M.run(agent, tool_calls, tool_service, opts)
       agent:set_state("generating")
       event_bus.emit(events.TOOL_LOOP_FINISHED, { agent_id = agent.id, rounds = rounds })
       return _send_round(agent):then_(function(result)
-        current_calls = result.next_calls
-        if not current_calls or #current_calls == 0 then
-          -- 模型既没返回新内容也没请求更多工具：避免循环静默结束、聊天看起来"卡住"，
-          -- 写一条可见的 assistant 说明作为本轮收尾。
-          local last = agent.messages[#agent.messages]
-          if last and last.role == "tool" then
-            agent:add_message("assistant", EMPTY_RESPONSE_MESSAGE)
+        -- 输出被截断且无工具调用时自动续写（提示不落库），直到获得调用/正文或达到上限。
+        return M._drain_truncation(agent, result):then_(function(final_result)
+          current_calls = final_result.next_calls
+          if not current_calls or #current_calls == 0 then
+            -- 模型既没返回新内容也没请求更多工具：避免循环静默结束、聊天看起来"卡住"，
+            -- 写一条可见的 assistant 说明作为本轮收尾。截断未续写成功时优先提示截断。
+            local last = agent.messages[#agent.messages]
+            if _is_truncated(final_result.response and final_result.response.finish_reason) then
+              agent:add_message("assistant", TRUNCATED_MESSAGE)
+            elseif last and last.role == "tool" then
+              agent:add_message("assistant", EMPTY_RESPONSE_MESSAGE)
+            end
           end
-        end
-        return _loop()
+          return _loop()
+        end)
       end)
     end)
   end

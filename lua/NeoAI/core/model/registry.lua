@@ -36,6 +36,28 @@ local function _get_provider(provider)
   return providers[provider], provider
 end
 
+--- 规范化模型条目：接受 string[] 或 object[]，统一为 { id, provider, status, context_window?, max_output? }
+--- @param provider string
+--- @param models table
+--- @return table 对象数组
+local function _normalize(provider, models)
+  local out = {}
+  for _, m in ipairs(models or {}) do
+    if type(m) == "string" then
+      out[#out + 1] = { id = m, provider = provider, status = "available" }
+    elseif type(m) == "table" and m.id then
+      out[#out + 1] = {
+        id = m.id,
+        provider = provider,
+        status = m.status or "available",
+        context_window = m.context_window,
+        max_output = m.max_output,
+      }
+    end
+  end
+  return out
+end
+
 --- 从配置静态列表构建（models_override 或 provider.models）
 --- @param provider_name string
 --- @param provider table
@@ -43,11 +65,7 @@ end
 local function _static_models(provider_name, provider)
   local list = provider.models_override or provider.models
   if not list then return {} end
-  local out = {}
-  for _, id in ipairs(list) do
-    out[#out + 1] = { id = id, provider = provider_name, status = "available" }
-  end
-  return out
+  return _normalize(provider_name, list)
 end
 
 --- 合并静态与动态列表（动态优先，静态保持顺序）
@@ -99,19 +117,34 @@ function M.get(model_id, provider)
   return nil
 end
 
+--- 获取某模型的实时数值元数据（来自 /models 响应，未获取到则为 nil）
+--- @param model_id string
+--- @param provider string|nil
+--- @return table|nil { context_window?, max_output? }
+function M.meta(model_id, provider)
+  if not model_id then return nil end
+  local pname = provider or config_store.get("ai.default_provider")
+  for _, m in ipairs(_merge(pname)) do
+    if m.id == model_id then
+      if m.context_window or m.max_output then
+        return { context_window = m.context_window, max_output = m.max_output }
+      end
+      return nil
+    end
+  end
+  return nil
+end
+
 --- 更新某 provider 的模型列表（由 fetcher 调用）
 --- @param provider string
---- @param models table id 数组
+--- @param models table string[] 或 object[]（{ id, context_window?, max_output? }）
 function M.update(provider, models)
   if not models or #models == 0 then
     local logger = require("NeoAI.kernel.logger")
-    logger.warn("[registry] 忽略空模型列表更新: %s", provider)
+    logger.warn("[registry] 忽略空模型列表更新: s", provider)
     return state.models[provider] or {}
   end
-  local list = {}
-  for _, id in ipairs(models) do
-    list[#list + 1] = { id = id, provider = provider, status = "available" }
-  end
+  local list = _normalize(provider, models)
   state.models[provider] = list
   state.updated_at[provider] = os.time()
   event_bus.emit(events.MODELS_UPDATED, { provider = provider, count = #list, models = list })

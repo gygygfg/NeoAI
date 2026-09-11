@@ -21,53 +21,80 @@ and async-by-default (all I/O non-blocking).
    - Chinese providers: SiliconFlow, Moonshot, Zhipu, Baidu, Aliyun, StepFun
    - Scenario-based model selection (chat, code, reasoning, agent)
 
-3. Streaming Generation
+3. Model-Aware Policy (capabilities / profiles / prompt cache)
+   - Protocol families: OpenAI / Anthropic / Gemini wire encoding
+   - Vendor dialects: max_tokens / max_completion_tokens, reasoning_effort /
+     thinking / enable_thinking, auth headers, usage fields
+   - Capability table: context window, max output, cache kind, chars-per-token
+     (live `/models` metadata preferred over built-in table)
+   - Explicit cache (Anthropic breakpoints / OpenAI explicit / Gemini
+     cachedContents), silent fallback to implicit; unknown models fall back safely
+   - See docs/model_policy.md
+
+4. Streaming Generation
    - Real-time content display
    - Reasoning content display (e.g., DeepSeek reasoning_content)
    - Tool-call argument streaming (tool_args_panel receives args live)
    - Cancel generation via AbortSignal
 
-4. Tool System
+5. Tool System
    - Built-in tools: file ops, LSP, treesitter, shell, git, logging, todo,
-     plan_mode, ask_user, read_image, sub-agent
+     plan_mode, ask_user, read_image, sub-agent, skills
    - Tool approval workflow (serial single-slot queue, auto-allow config,
-     per-tool permission overrides, AUTO mode)
+     per-tool permission overrides, AUTO mode, approval timeout)
    - Plan mode: read-only/info tools + ask_user only; mutating tools gated
+   - Plan distillation: on approve, distill plan-phase research context into a
+     checkpoint replacing compaction
    - Guard: repetitive tool-call reminder (observe-and-enrich)
+   - Environment probing: tools depending on unavailable workspace/git disabled
 
-5. Sub-Agent System
+6. Sub-Agent System
    - Create sub-agents via `runtime.spawn()` (fresh environment, zero inheritance)
    - Boundary enforcement (allowed tools, directories, commands, max_tool_calls)
    - Independent tool loops per sub-agent
    - `foreground` mode: wait for complete result
    - Sub-agent dock UI monitors status
 
-6. Session History
+7. Session History
    - Branching session tree (fork)
    - Append-style JSONL persistence with `.bak` backup + torn-line repair
-   - Context compaction with prefix-cache-friendly checkpoint replacement
+   - Streaming context compaction with prefix-cache-friendly checkpoint replacement
+     (live reasoning + content shown in a floating window)
    - Reasoning content NOT fed back to history (keeps prefix cache stable)
 
-7. Graceful Shutdown
+8. Graceful Shutdown
    - `kernel/lifecycle`: bootstrap / on_shutdown / shutdown
    - AbortSignal cascading cancel (HTTP + tools)
    - Sync save on `VimLeavePre` (registered in lifecycle)
 
-8. Herder Terminal State Reporting
+9. Herder Terminal State Reporting
    - Report Agent lifecycle state (working/idle/blocked) to Herder
    - Strict no-op outside a Herder environment (HERDR_ENV=1 guard)
    - Multi-session/sub-agent aggregation into one lifecycle authority
    - Strictly increasing --seq for concurrent/safe reporting
 
-9. lualine Statusline Integration
+10. lualine Statusline Integration
    - Real-time usage/cache/capacity display in the chat window
    - winbar as a second line (mode/model/state)
    - Configurable parts + bright highlight groups
 
-10. Tool Argument Receive Panel
+11. Tool Argument Receive Panel
    - Live floating window showing streaming tool-call arguments
    - Opens on `TOOL_ARG_CHUNK`, closes on `TOOL_ARG_COMPLETED`
    - Same UX as the reasoning panel; suppressed when cursor not following
+
+12. MCP Support (client)
+   - Connect external MCP servers over stdio / Streamable HTTP
+   - Register remote tools / resources / prompts into the tool system
+   - Pre-cache on startup + failure-driven dynamic refresh
+
+13. Skills Support
+   - Scan SKILL.md directories, inject the skill index into the system prompt
+   - Model loads a skill body on demand via `load_skill`
+
+14. Pending Message Queue
+   - Messages sent while the Agent is busy are queued
+   - `待发N` badge in the statusline; clears once actually sent
 
 ## Architecture Overview
 
@@ -78,31 +105,38 @@ lua/NeoAI/
   init.lua                   -- Main module: setup, commands, keymaps
   default_config.lua         -- Default configuration (pure data)
   kernel/                    -- Kernel layer (no business deps)
+    init.lua
     events.lua
     event_bus.lua
     config_store.lua
     logger.lua
     lifecycle.lua
   core/                      -- Core business layer
-    session/                 -- Session (object, JSONL store, context builder, compactor)
-    model/                   -- Model (registry, fetcher, adapter, content, cache)
+    session/                 -- Session (object, JSONL store, context builder, compactor,
+                             -- plan_distill, runtime_context)
+    model/                   -- Model (registry, fetcher, adapter, profiles, capabilities,
+                             -- prompt_cache, content, cache)
     attachment/              -- Attachment (image content-addressed store)
-    agent/                   -- Agent engine (agent, runtime, request, stream, tool_loop, prefix, guard, recovery)
+    agent/                   -- Agent engine (agent, runtime, request, stream, tool_loop,
+                             -- prefix, guard, recovery)
   services/                  -- Service layer (chat, tool, model, status, herder, skills, mcp/*)
   ui/                        -- Presentation layer
+    init.lua                 -- Registers approval/ask_user/sub-agent dock UI
     window/                  -- Window manager, chat view, tree view
     components/              -- input_box, message_list, reasoning_panel, tool_args_panel,
-                             -- model_picker, tool_approval, ask_user, sub_agent_dock,
-                             -- fold, display_modes, markdown_view
+                             -- float_stream_window, model_picker, tool_approval, ask_user,
+                             -- sub_agent_dock, fold, display_modes, markdown_view
     keymap.lua               -- Unified keymap management
   tools/                     -- Tool system
+    init.lua
     registry.lua
     executor.lua
     validator.lua
     packer.lua
     environment.lua          -- Tool environment probing (disable unavailable)
     builtin/                 -- file_ops, shell, git_ops, lsp_ops, tree_ops, log_ops,
-                             -- plan, todo, plan_mode, ask_user, read_image, tool_helpers
+                             -- plan, todo, plan_mode, ask_user, read_image, skills,
+                             -- tool_helpers
   utils/                     -- Utilities (async, json, http, fs, work, timer, image, stringx)
   tests/                     -- Test suite (:NeoAITest)
 ```
@@ -149,6 +183,7 @@ Basic usage:
 :NeoAIPlan          " Toggle plan mode
 :NeoAIAuto          " Toggle AUTO mode (auto-allow all tool calls)
 :NeoAIApprovePlan   " Approve plan and switch to CHAT mode
+:NeoAIStatusline    " Preview the lualine statusline component content
 ```
 
 ## Herder Terminal State Integration

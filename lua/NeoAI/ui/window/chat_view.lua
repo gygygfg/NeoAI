@@ -573,6 +573,9 @@ local function _on_submit(content)
   input_box.on_submitted()
   -- 发送后切回主窗口并进入普通模式：生成期间可随时滚动查看流式输出
   _focus_main_normal()
+  -- 发送后光标直接跳到主界面最下端：用户刚发送的消息位于末尾，
+  -- 让光标贴在最后一行（并触发后续流式的"跟随"判定：光标在最后 5 行内即自动跟随）。
+  _scroll_to_end()
   chat_service.send_message(content):catch(function(e)
     if e and (e.kind == "aborted" or e.kind == "cancelled") then
       -- 用户手动取消（ESC）是正常停止，不是发送失败，不弹错误提示。
@@ -629,7 +632,8 @@ local function _build_chat_actions()
     cycle_mode = function()
       local names = { chat = "CHAT", plan = "PLAN", auto = "AUTO" }
       local mode = chat_service.cycle_mode()
-      vim.notify("[NeoAI] 模式已切换: " .. (names[mode] or mode), vim.log.levels.INFO)
+      local suffix = chat_service.has_pending_mode() and "（将在本轮生成结束后生效）" or ""
+      vim.notify("[NeoAI] 模式已切换: " .. (names[mode] or mode) .. suffix, vim.log.levels.INFO)
       _render()
     end,
     cycle_display = function()
@@ -647,25 +651,6 @@ local function _build_chat_actions()
       local plugin = display_modes.reload(name)
       if plugin then
         vim.notify("[NeoAI] 显示模式已热重载: " .. (plugin.label or plugin.name), vim.log.levels.INFO)
-      end
-    end,
-    approve_plan = function()
-      local function report(result)
-        if result and result.approved then
-          vim.notify(("[NeoAI] 计划已确认，已转入 CHAT 模式，任务清单 %d 项"):format(result.todo_count or 0), vim.log.levels.INFO)
-        else
-          vim.notify("[NeoAI] 确认计划失败: " .. tostring(result and result.error or "未知错误"), vim.log.levels.WARN)
-        end
-        _render()
-      end
-      local result = chat_service.approve_plan()
-      if result and result.then_ then
-        result:then_(report, function(err)
-          vim.notify("[NeoAI] 确认计划失败: " .. tostring(err and err.message or err), vim.log.levels.WARN)
-          _render()
-        end)
-      else
-        report(result)
       end
     end,
     tool_approval = function()

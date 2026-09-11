@@ -45,8 +45,22 @@ end
 -- 指标（状态栏）：用量 / 缓存命中率 / 上下文容量 / 待发（正忙时排队）
 -- 每次调用返回全新数组，避免同一数组被多个 section（sections/inactive_sections 等）
 -- 共享，lualine 在 load_sections 时会原地改写，共享会互相污染。
+-- 容量段按告警级别动态配色（接近上限黄、超限红）。
+local function capacity_comp()
+  local colors = status.colors()
+  return {
+    function() return status.segment("capacity") end,
+    color = function()
+      local level = status.capacity_level()
+      if level == "over" then return colors.capacity_over or "ErrorMsg" end
+      if level == "warn" then return colors.capacity_warn or "WarningMsg" end
+      return colors.capacity
+    end,
+  }
+end
+
 local function metrics()
-  return { comp("usage"), comp("cache"), comp("capacity"), comp("pending") }
+  return { comp("usage"), comp("cache"), capacity_comp(), comp("pending") }
 end
 -- 身份（winbar 第一行）：模式 / 模型 / 状态
 local function identity()

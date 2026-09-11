@@ -30,8 +30,8 @@ local PLAN_POLICY_TEXT = table.concat({
   "   - 改动清单（涉及的文件 + 每处改动的内容/操作）",
   "   - 实施步骤（先后顺序）",
   "   - 验证方式与回滚方案",
-  "4. 计划完成后结束回合，提示用户检查计划。用户确认后系统会自动切换到 CHAT 模式，",
-  "   并把计划转为任务清单（todo），随后按清单执行。",
+  "4. 计划完成后调用 exit_plan_mode 工具：会弹出审批窗口，由用户确认是否按此计划开始执行；",
+  "   用户确认后系统把计划转为任务清单（todo），自动转入 CHAT 模式并按清单执行。",
 }, "\n")
 
 --- 计划模式下可见的只读/信息查询工具白名单
@@ -61,6 +61,7 @@ local PLAN_SAFE_TOOLS = {
 --- 计划模式下附加可见工具（非只读类，需显式加入）
 local PLAN_EXTRA_TOOLS = {
   "ask_user", -- 向用户提问
+  "exit_plan_mode", -- 用户确认计划后转入 CHAT 执行
 }
 
 -- ========== 私有函数 ==========
@@ -311,6 +312,41 @@ plan_mode_tools.enter_plan_mode = helpers.define_tool(
     on_success("已进入计划模式：只读调研 + 提问，输出格式化计划，等待用户确认后转入 CHAT 执行。")
   end,
   { category = "agent", approval = { auto_allow = true } }
+)
+
+plan_mode_tools.exit_plan_mode = helpers.define_tool(
+  "exit_plan_mode",
+  "确认修改计划并转入 CHAT 模式执行。仅在已向用户展示格式化计划、且用户明确表示确认后调用；调用会弹出审批窗口请用户最终确认。确认后系统把计划解析为任务清单（todo）、退出计划模式并按配置开始执行。",
+  {
+    type = "object",
+    properties = {
+      plan = { type = "string", description = "可选：本次要确认执行的计划全文或摘要；缺省时取上一条助手消息作为计划" },
+    },
+    required = {},
+  },
+  function(args, on_success, on_error, ctx)
+    local agent = ctx and ctx.agent
+    if not agent then
+      on_error("缺少 agent 上下文")
+      return
+    end
+    local chat_service = require("NeoAI.services.chat_service")
+    -- 复用 approve_plan：解析计划为任务清单（todo）→ 退出计划模式（转入 CHAT）→ 按配置自动执行。
+    local result = chat_service.approve_plan({ plan = args.plan })
+    if type(result) == "table" and result.then_ then
+      -- 自动执行路径：approve_plan 已在 Agent 忙碌时把执行指令暂存进 pending 队列，
+      -- 由工具循环在本轮工具结果后注入下一轮模型调用。此处绝不能等待该 Deferred，
+      -- 否则工具结果无法返回、注入永不发生，工具循环死锁。
+      on_success("计划已确认，已转入 CHAT 模式，正在按任务清单开始执行。")
+      return
+    end
+    if result and result.approved then
+      on_success(("计划已确认，已转入 CHAT 模式，任务清单 %d 项。请按任务清单逐项执行。"):format(result.todo_count or 0))
+    else
+      on_error((result and result.error) or "确认计划失败")
+    end
+  end,
+  { category = "agent", approval = { auto_allow = false } }
 )
 
 -- ========== 测试辅助 ==========

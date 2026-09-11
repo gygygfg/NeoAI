@@ -1,12 +1,16 @@
 --- 上下文压缩
 --- @module NeoAI.core.session.compactor
 --- 策略对齐 deepseek-harness 的 compaction：
---- 1. 达到 token 压力阈值时，折叠最早的整段历史，保留最近尾部（retain 预算）。
---- 2. 辅助摘要调用「逐字节回放」会话前缀：相同的系统提示、工具 schema、被折叠区消息，
+--- 1. 达到 token 压力阈值时，先做模型无关的工具结果裁剪（tool_result_pruner）；
+---    裁剪后已回到阈值内则跳过摘要调用。
+--- 2. 仍需摘要时，折叠最早的整段历史，保留最近尾部（retain 预算）；
+---    切点保持工具调用配对平衡，绝不拆散 assistant.tool_calls 与其 tool 结果。
+--- 3. 辅助摘要调用「逐字节回放」会话前缀：相同的系统提示、工具 schema、被折叠区消息，
 ---    再把压缩指令作为最后的 user 消息追加 → 复用 provider 的热前缀缓存。
---- 3. 用带 <compacted-summary> 标签的检查点 user 消息替换被折叠区间；
----    后续请求在替换点之前的未变前缀仍然可复用缓存。
---- 4. 仅替换而非追加：不产生第二份历史副本。
+--- 4. 用带 <compacted-summary> 标签的检查点 user 消息替换被折叠区间；
+---    后续请求在替换点之前的未变前缀仍然可复用缓存。仅替换而非追加：不产生第二份副本。
+--- 5. 摘要后仍高于阈值时按 compaction_retries 重试；溢出恢复走最大化平衡头部缩减
+---    （retain 0，只保留最新一个不可分单元）。
 
 local async = require("NeoAI.utils.async")
 local config_store = require("NeoAI.kernel.config_store")
@@ -73,37 +77,111 @@ local function _cfg(opts)
   return cfg
 end
 
---- 估算当前上下文 token 占用
+--- 解析模型能力表（缓存机制 / 上下文窗口）
+--- @param agent table
+--- @return table
+local function _caps(agent)
+  local provider_name = (agent.config and agent.config.provider)
+    or config_store.get("ai.default_provider")
+  return require("NeoAI.core.model.capabilities").resolve(agent.model, provider_name)
+end
+
+--- 解析有效上下文窗口（用户显式配置优先，否则按模型能力表；未知模型回退默认）
+--- @param agent table
+--- @param cfg table
+--- @return number
+local function _window_for(agent, cfg)
+  if type(cfg.context_window) == "number" and cfg.context_window > 0 and cfg.context_window ~= 64000 then
+    return cfg.context_window
+  end
+  return require("NeoAI.core.model.capabilities").resolve_window(
+    cfg.context_window, agent.model, agent.config and agent.config.provider)
+end
+
+--- 有效阈值比例：显式缓存模型取更保守（更高阈值），减少前缀重写导致的缓存失效
+--- @param cfg table
+--- @param caps table
+--- @return number
+local function _threshold_ratio(cfg, caps)
+  local r = cfg.threshold_ratio or 0.8
+  if caps.explicit_cache then r = math.max(r, 0.85) end
+  return r
+end
+
+--- 有效尾部保留比例：显式缓存模型稍大（保留更多热前缀）
+--- @param cfg table
+--- @param caps table
+--- @return number
+local function _retain_ratio(cfg, caps)
+  local r = cfg.retain_ratio or 0.16
+  if caps.explicit_cache then r = math.min(0.5, r * 1.25) end
+  return r
+end
+
+--- 估算当前上下文 token 占用（优先 API 最近一次请求的真实用量，缺失回退完整请求估算）
 --- @param agent table
 --- @return number
 local function _estimate(agent)
   local context_builder = require("NeoAI.core.session.context_builder")
-  return context_builder.estimate_tokens(agent.messages or {})
+  local caps = _caps(agent)
+  return context_builder.used_tokens(agent, { chars_per_token = caps.chars_per_token })
 end
 
---- 选择被折叠区间：折叠最早的整段消息，保留最近尾部（retain 预算）
+--- 切点（位置 idx 之前）是否工具配对平衡：前 idx-1 条消息里没有未配对的 tool_call。
+--- @param messages table
+--- @param idx number 保留区间的起始下标（1-based）
+--- @return boolean
+local function _pairing_balanced_before(messages, idx)
+  local open = 0
+  for i = 1, idx - 1 do
+    local m = messages[i]
+    if not m then return false end
+    if m.role == "assistant" and m.tool_calls and #m.tool_calls > 0 then
+      open = open + #m.tool_calls
+    end
+    if m.role == "tool" then
+      open = open - 1
+    end
+    if open < 0 then return false end
+  end
+  return open == 0
+end
+
+--- 选择被折叠区间：折叠最早的整段消息，保留最近尾部（retain 预算）。
+--- 切点必须工具配对平衡，否则前移切点（并入更多消息）直到平衡；移到头部则返回空。
 --- @param agent table
 --- @param cfg table
+--- @param opts table|nil { retain_tokens?, min_shadow? } 溢出恢复传 retain_tokens=0 做最大化缩减
 --- @return table 被折叠消息数组（保留原顺序，可为空）
-local function _select_shadow_range(agent, cfg)
+local function _select_shadow_range(agent, cfg, opts)
+  opts = opts or {}
   local messages = agent.messages or {}
   local context_builder = require("NeoAI.core.session.context_builder")
-  local window = cfg.context_window or 64000
-  local retain_budget = (cfg.retain_ratio or 0.16) * window
-  local retain_min = cfg.retain_min_tokens or 4096
-  if retain_budget < retain_min then retain_budget = retain_min end
-  local min_shadow = cfg.min_shadow_messages or 2
+  local caps = _caps(agent)
+  local window = _window_for(agent, cfg)
+  local retain_budget
+  if type(opts.retain_tokens) == "number" then
+    retain_budget = opts.retain_tokens
+  else
+    retain_budget = _retain_ratio(cfg, caps) * window
+    local retain_min = cfg.retain_min_tokens or 4096
+    if retain_budget < retain_min then retain_budget = retain_min end
+  end
+  local min_shadow = opts.min_shadow or cfg.min_shadow_messages or 2
 
   local keep_start = #messages + 1
   local tail_tokens = 0
   for i = #messages, 1, -1 do
-    local toks = context_builder.estimate_tokens({ messages[i] })
-    if tail_tokens + toks > retain_budget then
-      break
-    end
-    tail_tokens = tail_tokens + toks
+    tail_tokens = tail_tokens + context_builder.estimate_tokens({ messages[i] })
     keep_start = i
+    if tail_tokens >= retain_budget then break end
   end
+  -- 工具配对安全：切点不能落在 assistant.tool_calls 与其 tool 结果之间，
+  -- 否则压缩后请求会缺少配对的 tool 结果而被 API 拒绝。
+  while keep_start > 1 and not _pairing_balanced_before(messages, keep_start) do
+    keep_start = keep_start - 1
+  end
+  if keep_start <= 1 then return {} end
   local shadow_count = keep_start - 1
   if shadow_count < min_shadow then return {} end
   local shadow = {}
@@ -174,48 +252,95 @@ local function _replace_with_checkpoint(agent, shadow, summary)
   })
 end
 
+--- 模型无关的工具结果裁剪（摘要前的第一道压缩）；有裁剪则作废过期 API 用量。
+--- @param agent table
+--- @param cfg table
+--- @return boolean 是否发生了裁剪
+local function _prune(agent, cfg)
+  if cfg.prune_enabled == false then return false end
+  local pruner = require("NeoAI.core.session.tool_result_pruner")
+  -- 裁剪是可选优化：任何异常都不得阻断发送（对齐 harness 的"操作失败告警后继续"）
+  local ok, result = pcall(pruner.prune_agent, agent, { context_cache = cfg })
+  if not ok then
+    logger.warn("[compactor] 工具结果裁剪失败，跳过: %s", tostring(result))
+    return false
+  end
+  if result.pruned > 0 then
+    if agent.usage then agent.usage.last_prompt = nil end
+    return true
+  end
+  return false
+end
+
 -- ========== 公开 API ==========
 
 --- 内部压缩执行（maybe_compact 与 force_compact 共用）
 --- @param agent table
 --- @param cfg table
+--- @param opts table|nil { threshold?, retain_tokens?, min_shadow? }
 --- @return Deferred resolve(boolean)
-local function _compact(agent, cfg)
+local function _compact(agent, cfg, opts)
+  opts = opts or {}
   agent._compacting = true
   local est = _estimate(agent)
-  event_bus.emit(events.COMPACTION_STARTED, { agent_id = agent.id, estimated_tokens = est, threshold = 0 })
+  event_bus.emit(events.COMPACTION_STARTED, {
+    agent_id = agent.id,
+    estimated_tokens = est,
+    threshold = opts.threshold or 0,
+  })
 
-  local shadow = _select_shadow_range(agent, cfg)
-  if #shadow < (cfg.min_shadow_messages or 2) then
-    logger.warn("[compactor] 可折叠消息过少，无法压缩")
+  local max_attempts = (tonumber(cfg.compaction_retries) or 1) + 1
+  local compacted_any = false
+  local function finish(ok)
     agent._compacting = false
-    return async.resolve(false)
+    return async.resolve(ok)
   end
 
-  return _summarize(agent, shadow, cfg):then_(function(response)
-    local summary = response and response.content
-    if not summary or summary:gsub("%s", "") == "" then
-      logger.warn("[compactor] 摘要为空，跳过压缩")
-      agent._compacting = false
-      return async.resolve(false)
-    end
-    _replace_with_checkpoint(agent, shadow, summary)
-    if response.usage then
-      local prefix = require("NeoAI.core.agent.prefix")
-      local cu = prefix.parse_cache_usage(response.usage)
-      if cu then
-        local cache = agent.cache or {}
-        cache.compaction_usage = cu
-        agent.cache = cache
+  local function step(attempt)
+    local shadow = _select_shadow_range(agent, cfg, opts)
+    if #shadow == 0 then
+      if not compacted_any then
+        logger.warn("[compactor] 可折叠消息过少，无法压缩")
       end
+      return finish(compacted_any)
     end
-    agent._compacting = false
-    return async.resolve(true)
-  end, function(err)
-    agent._compacting = false
-    logger.warn("[compactor] 压缩失败: %s", tostring(err and err.message or err))
-    return async.resolve(false)
-  end)
+    return _summarize(agent, shadow, cfg):then_(function(response)
+      local summary = response and response.content
+      if not summary or summary:gsub("%s", "") == "" then
+        logger.warn("[compactor] 摘要为空，跳过压缩")
+        return finish(compacted_any)
+      end
+      _replace_with_checkpoint(agent, shadow, summary)
+      compacted_any = true
+      -- 历史被替换：作废上一轮 API 用量，避免用压缩前的旧值再次触发压缩
+      if agent.usage then agent.usage.last_prompt = nil end
+      -- 压缩会替换较早历史：显式缓存（尤其 Gemini cachedContents，绑定 system+tools）
+      -- 需失效重建，避免命中陈旧前缀
+      pcall(function()
+        require("NeoAI.core.model.prompt_cache").invalidate(
+          agent.config and agent.config.provider or config_store.get("ai.default_provider"), agent.model)
+      end)
+      if response.usage then
+        local prefix = require("NeoAI.core.agent.prefix")
+        local cu = prefix.parse_cache_usage(response.usage)
+        if cu then
+          local cache = agent.cache or {}
+          cache.compaction_usage = cu
+          agent.cache = cache
+        end
+      end
+      -- 收敛：仍在阈值之上且还有重试预算则继续折叠更早区间
+      if opts.threshold and _estimate(agent) >= opts.threshold and attempt + 1 < max_attempts then
+        return step(attempt + 1)
+      end
+      return finish(true)
+    end, function(err)
+      logger.warn("[compactor] 压缩失败: %s", tostring(err and err.message or err))
+      return finish(compacted_any)
+    end)
+  end
+
+  return step(0)
 end
 
 --- 检查 token 压力并按需压缩（仅在 Agent 空闲时执行）
@@ -231,16 +356,22 @@ function M.maybe_compact(agent, opts)
   if not agent or agent.state ~= "idle" or agent._compacting then
     return async.resolve(false)
   end
-  local window = cfg.context_window or 64000
-  local threshold = window * (cfg.threshold_ratio or 0.8)
+  local caps = _caps(agent)
+  local window = _window_for(agent, cfg)
+  local threshold = window * _threshold_ratio(cfg, caps)
   local est = _estimate(agent)
   if est < threshold then
     return async.resolve(false)
   end
-  return _compact(agent, cfg)
+  -- 先裁剪工具结果：多数情况下裁剪后即回到阈值内，无需摘要调用
+  if _prune(agent, cfg) and _estimate(agent) < threshold then
+    return async.resolve(true)
+  end
+  return _compact(agent, cfg, { threshold = threshold })
 end
 
---- 强制压缩（上下文溢出恢复用）：跳过压力阈值判断，仍保留空闲/并发锁检查
+--- 强制压缩（上下文溢出恢复用）：跳过压力阈值判断，仍保留空闲/并发锁检查。
+--- 先裁剪；裁剪已足以回到窗口内则不再摘要；否则做最大化平衡头部缩减（retain 0）。
 --- @param agent table Agent
 --- @param opts table|nil { context_cache? }
 --- @return Deferred resolve(boolean) 是否发生了压缩
@@ -253,7 +384,10 @@ function M.force_compact(agent, opts)
   if not agent or agent.state ~= "idle" or agent._compacting then
     return async.resolve(false)
   end
-  return _compact(agent, cfg)
+  if _prune(agent, cfg) and _estimate(agent) < _window_for(agent, cfg) then
+    return async.resolve(true)
+  end
+  return _compact(agent, cfg, { retain_tokens = 0, min_shadow = 1 })
 end
 
 --- 构建检查点消息（供测试直接使用）

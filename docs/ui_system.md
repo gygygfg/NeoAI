@@ -117,7 +117,7 @@
 当前键位配置。
 
 聊天上下文键位（`keymaps.chat`）：`insert`(i)、`quit`(q)、`send`、`cancel`(<Esc>)、`toggle_reasoning`(r)、
-`switch_model`(M)、`cycle_mode`(m)、`cycle_display`(<C-t>/T)、`reload_display`(<F5>)、`approve_plan`(P)、
+`switch_model`(M)、`cycle_mode`(m)、`cycle_display`(<C-t>/T)、`reload_display`(<F5>)、
 `tool_approval`(<C-a>)、`approval.confirm/confirm_all/cancel/cancel_with_reason`。
 
 ## 8. 相关文档

@@ -113,8 +113,8 @@ local function _apply_budget(wire, policy)
   for _, m in ipairs(wire) do
     if type(m.content) == "table" then
       for i, part in ipairs(m.content) do
-        if type(part) == "table" and part.type == "image_url" then
-          local b = part._bytes or _data_url_size(part.image_url and part.image_url.url)
+        if type(part) == "table" and part.type == "image" then
+          local b = part._bytes or 0
           local over_count = max_count and count >= max_count
           local over_bytes = max_bytes and (total_bytes + b) > max_bytes
           if over_count or over_bytes then
@@ -129,14 +129,17 @@ local function _apply_budget(wire, policy)
   end
 end
 
---- 估算 data URL 的原始字节数（base64 长度反推）
---- @param url string
---- @return number
-local function _data_url_size(url)
-  if not url then return 0 end
-  local b64 = url:match(";base64,(.*)$")
-  if not b64 then return #url end
-  return math.floor(#b64 * 3 / 4)
+--- 构造协议中立的图像块（由 adapter 按协议编码为 image_url / source / inlineData）
+--- @param ri table request_image 结果 { data, mediaType, bytes }
+--- @return table
+local function _neutral_image_part(ri)
+  local image = require("NeoAI.utils.image")
+  return {
+    type = "image",
+    media_type = ri.mediaType,
+    base64 = image.base64_encode(ri.data),
+    _bytes = ri.bytes,
+  }
 end
 
 --- 构建 wire 消息（vision=true 且含图像时）
@@ -173,10 +176,8 @@ local function _build_wire(messages, infos, policy)
           elseif type(b) == "table" and b.type == "image" and b.attachment then
             info_i = info_i + 1
             local info = infos and infos[info_i]
-            if info and info.url then
-              local p = { type = "image_url", image_url = { url = info.url } }
-              p._bytes = info.bytes or _data_url_size(info.url)
-              parts[#parts + 1] = p
+            if info and info.part then
+              parts[#parts + 1] = info.part
             else
               parts[#parts + 1] = { type = "text", text = OFFLOADED_IMAGE_TEXT }
             end
@@ -193,8 +194,8 @@ local function _build_wire(messages, infos, policy)
         info_i = info_i + 1
         local info = infos and infos[info_i]
         wire[#wire + 1] = { role = "tool", tool_call_id = m.tool_call_id, content = m.content or "(no output)" }
-        if info and info.url then
-          pending[#pending + 1] = { part = { type = "image_url", image_url = { url = info.url } }, bytes = info.bytes }
+        if info and info.part then
+          pending[#pending + 1] = { part = info.part, bytes = info.bytes }
         else
           pending[#pending + 1] = { part = { type = "text", text = OFFLOADED_IMAGE_TEXT }, bytes = 0 }
         end
@@ -247,9 +248,9 @@ function M.materialize(messages, opts)
     local infos = {}
     for _, ri in ipairs(ris) do
       if ri and ri.data then
-        infos[#infos + 1] = { url = attachment.data_url(ri), bytes = ri.bytes }
+        infos[#infos + 1] = { part = _neutral_image_part(ri), bytes = ri.bytes }
       else
-        infos[#infos + 1] = { url = nil, bytes = 0 }
+        infos[#infos + 1] = { part = nil, bytes = 0 }
       end
     end
     return _build_wire(messages, infos, policy)

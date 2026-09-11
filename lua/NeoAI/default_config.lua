@@ -108,12 +108,21 @@ local DEFAULT_CONFIG = {
       timeout_ms = 10000,
     },
     -- 按三种会话模式（CHAT / PLAN / AUTO）分别配置提供商与模型参数。
-    -- 进入某模式时应用该模式对应的 provider/model/temperature/max_tokens/stream，
+    -- 进入某模式时应用该模式对应的 provider/model/temperature/stream，
     -- 系统提示等全局项仍由 ai.system_prompt 提供。缺省字段回退到 ai.default_provider / 默认值。
+    -- max_tokens 缺省不配置：请求不发送该参数，由模型/厂商默认最大输出决定；仅在此显式配置时才下发。
     modes = {
-      chat = { provider = "deepseek", model = "auto", temperature = 0.7, max_tokens = 4096, stream = true },
-      plan = { provider = "deepseek", model = "auto", temperature = 0.3, max_tokens = 8192, stream = true },
-      auto = { provider = "deepseek", model = "auto", temperature = 0.7, max_tokens = 8192, stream = true },
+      chat = { provider = "deepseek", model = "auto", temperature = 0.7, stream = true },
+      plan = { provider = "deepseek", model = "auto", temperature = 0.3, stream = true },
+      auto = { provider = "deepseek", model = "auto", temperature = 0.7, stream = true },
+    },
+    -- 输出被截断（finish_reason=length/max_tokens/MAX_TOKENS）且无工具调用时的处理：
+    -- 自动附加续写提示重发（提示只进请求、不落库），直到获得正文/工具调用或达到次数上限；
+    -- 仍被截断则写入一条可见提示，避免工具循环静默退出。
+    truncation = {
+      enabled = true,
+      max_continues = 3, -- 单轮最多自动续写次数
+      nudge = "请从中断处继续输出，不要重复已输出的内容。",
     },
     reasoning_enabled = true,
     system_prompt = "你是一个AI编程助手，帮助用户解决编程问题。",
@@ -146,14 +155,43 @@ local DEFAULT_CONFIG = {
         maxRequestImages = 600, -- 与 provider 上限对齐的深层兜底
       },
     },
+    -- 按模型自动选择策略：能力表（上下文窗口/缓存机制/输出上限）+ 厂商方言（请求参数名/
+    -- 推理形态/鉴权头）+ 显式缓存（Anthropic 断点 / OpenAI explicit / Gemini cachedContents）。
+    -- 未知模型回退到协议族默认值，不影响既有行为。
+    model_policy = {
+      enabled = true, -- 总开关（关闭后仅保留三协议基础编解码，不做模型感知推导）
+      explicit_cache = {
+        enabled = true, -- 显式缓存总开关
+        -- anthropic = true, -- 分机制开关（缺省跟随总开关；可单独关闭某一家）
+        -- gemini = true,
+        openai = false, -- OpenAI 显式断点默认关闭（隐式缓存已足够，避免误写缓存计费）
+      },
+      -- 模型/提供商级能力覆盖：key 为模型 id 或 provider 名
+      -- overrides = {
+      --   ["deepseek-v4-flash"] = { window = 131072, max_output = 8192 },
+      --   ["my-provider"] = { cache_kind = "openai", chars_per_token = 2 },
+      -- },
+      -- 方言覆盖：key 为 provider 名或模型 id
+      -- dialects = {
+      --   ["my-provider"] = { max_tokens_field = "max_completion_tokens", reasoning_kind = "effort" },
+      -- },
+    },
     context_cache = {
       enabled = true, -- 启用前缀缓存身份一致性 + 自动上下文压缩
       context_window = 64000, -- 模型上下文窗口（token 估算）
       threshold_ratio = 0.8, -- 达到该比例触发压缩
+      warn_ratio = 0.85, -- 达到该比例状态栏变色并提示（接近上限）
       retain_ratio = 0.16, -- 保留的最近历史比例（压缩后尾部）
       retain_min_tokens = 4096, -- 尾部保留的下限（token）
       compact_max_tokens = 8192, -- 压缩摘要输出的 token 上限
       min_shadow_messages = 2, -- 至少折叠多少条消息才值得压缩
+      compaction_retries = 1, -- 摘要后仍高于阈值时的重试次数
+      -- 模型无关的工具结果裁剪：摘要之前先把超长工具结果（read_file/run_command 等）
+      -- 裁成「头部 + 省略标记 + 尾部」，多数情况下无需再调用摘要即可回到阈值内。
+      prune_enabled = true, -- 裁剪总开关
+      prune_threshold_chars = 8192, -- 文本码点超过该值的工具结果才裁剪
+      prune_head_chars = 4096, -- 保留的头部码点数
+      prune_tail_chars = 1024, -- 保留的尾部码点数
       include_identity = true, -- 系统提示是否包含固定身份段（-100 顺序位）
       identity = "你是一个由 NeoAI 驱动的 AI 编程助手。",
     },
@@ -199,6 +237,8 @@ local DEFAULT_CONFIG = {
         usage = "Number",
         cache = "String",
         capacity = "Statement",
+        capacity_warn = "WarningMsg",
+        capacity_over = "ErrorMsg",
         state = "Function",
         brand = "Title",
         pending = "Warning",
@@ -236,7 +276,6 @@ local DEFAULT_CONFIG = {
         normal = { key = "T", desc = "循环切换显示模式（对话/轨迹）" },
       },
       reload_display = { key = "<F5>", desc = "热重载当前显示模式插件" },
-      approve_plan = { key = "P", desc = "确认计划并转入 CHAT 执行" },
       tool_approval = { key = "<C-a>", desc = "工具审批" },
       approval = {
         confirm = { key = "<CR>", desc = "允许一次" },

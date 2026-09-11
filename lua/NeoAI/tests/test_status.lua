@@ -59,7 +59,8 @@ tests.suite("status", function(_, it)
     local ratio_ok = math.abs(info.usage.cache_ratio - (25000 / 30000)) < 1e-6
     t.true_(ratio_ok, "缓存命中率")
     t.not_nil(info.capacity)
-    t.eq(64000, info.capacity.total)
+    -- deepseek-v4-flash 命中能力表 window=131072（用户未显式覆盖 context_window）
+    t.eq(131072, info.capacity.total)
     t.true_(info.capacity.used > 0, "容量估算应>0")
 
     local c = status.component()
@@ -136,5 +137,48 @@ tests.suite("status", function(_, it)
     tool_loop.inject_pending(agent)
     t.eq(0, chat.pending_count(), "注入后队列应清空")
     t.eq("", status.segment("pending"), "发送后徽标应消失")
+  end)
+
+  it("capacity 优先用 API 最近一次用量并分级告警", function(t)
+    local chat = init_chat()
+    local status = require("NeoAI.services.status")
+    local agent = chat.new_session({})
+    agent.model = "deepseek-v4-flash"
+    agent.messages = {}
+    agent.usage = { prompt = 100, completion = 10, last_prompt = 120000, last_completion = 20 }
+    local cap = status.capacity_for(agent)
+    t.eq(120000, cap.used)
+    t.eq("api", cap.source)
+    t.eq("warn", cap.level, "120000/131072 ≈ 0.92 应为 warn")
+    t.matches("↑120k", status.segment("usage"), "usage 段显示最近一次请求")
+
+    agent.usage.last_prompt = 140000
+    t.eq("over", status.capacity_for(agent).level)
+    t.eq("上下文超限", status.segment("capacity"))
+  end)
+
+  it("check_pressure 按级别提示且同级去重", function(t)
+    local chat = init_chat()
+    local status = require("NeoAI.services.status")
+    local agent = chat.new_session({})
+    agent.model = "deepseek-v4-flash"
+    agent.messages = {}
+    agent.usage = { last_prompt = 120000, last_completion = 1 }
+    local calls = {}
+    local orig = vim.notify
+    vim.notify = function(msg, lvl) calls[#calls + 1] = { msg = msg, lvl = lvl } end
+    local ok, err = pcall(function()
+      t.eq("warn", status.check_pressure(agent))
+      t.eq(1, #calls, "warn 首次应提示")
+      t.eq("warn", status.check_pressure(agent))
+      t.eq(1, #calls, "同级别去重")
+      agent.usage.last_prompt = 140000
+      t.eq("over", status.check_pressure(agent))
+      t.eq(2, #calls, "升级到 over 应再提示")
+      t.eq(vim.log.levels.ERROR, calls[2].lvl)
+      t.eq(vim.log.levels.WARN, calls[1].lvl)
+    end)
+    vim.notify = orig
+    if not ok then error(err) end
   end)
 end)

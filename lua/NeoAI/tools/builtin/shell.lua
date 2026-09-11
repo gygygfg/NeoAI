@@ -9,71 +9,89 @@ local M = {}
 
 -- ========== 私有函数 ==========
 
---- 执行 shell 命令（jobstart，收集 stdout/stderr）
+--- 执行 shell 命令（jobstart，实时累积 stdout/stderr）。
+--- 采用非缓冲输出：命令超时/被取消时也能回传「此刻终端已产生的内容」，
+--- 而不是只剩一句错误信息。始终 resolve 结果表（含 timed_out/aborted 标记），
+--- 由调用方决定如何呈现；只有进程无法启动才 reject。
 --- @param command string
 --- @param opts table { timeout_ms?, signal? }
---- @return Deferred resolve({ code, stdout, stderr })
+--- @return Deferred resolve({ code, stdout, stderr, timed_out?, aborted?, message? })
 local function _run_command(command, opts)
   opts = opts or {}
   local d = async.Deferred.new()
-  local stdout = {}
-  local stderr = {}
+  local stdout_chunks = {}
+  local stderr_chunks = {}
   local done = false
+  local job
   local timeout_ms = opts.timeout_ms or 30000
 
+  local function snapshot()
+    return table.concat(stdout_chunks), table.concat(stderr_chunks)
+  end
+
   local unsub = function() end
+
+  local function settle(result)
+    if done then return end
+    done = true
+    unsub()
+    d:resolve(result)
+  end
+
   if opts.signal then
     unsub = opts.signal:subscribe(function(reason)
-      if job and vim.fn.job_status(job) == "run" then
-        pcall(vim.fn.jobstop, job)
-      end
-      if not done then
-        done = true
-        d:reject({ kind = "aborted", message = reason })
-      end
+      if job then pcall(vim.fn.jobstop, job) end
+      local out, errout = snapshot()
+      settle({ code = -1, stdout = out, stderr = errout, aborted = true, message = reason })
     end)
   end
 
-  local timer
   if timeout_ms > 0 then
-    timer = true
     vim.defer_fn(function()
-      if not done then
-        done = true
-        pcall(vim.fn.jobstop, job)
-        d:reject({ kind = "timeout", message = "命令执行超时" })
-      end
+      if done then return end
+      if job then pcall(vim.fn.jobstop, job) end
+      local out, errout = snapshot()
+      settle({ code = -1, stdout = out, stderr = errout, timed_out = true })
     end, timeout_ms)
   end
 
-  local job = vim.fn.jobstart({ "sh", "-c", command }, {
-    stdout_buffered = true,
-    stderr_buffered = true,
+  job = vim.fn.jobstart({ "sh", "-c", command }, {
+    stdout_buffered = false,
+    stderr_buffered = false,
     on_stdout = function(_, data)
-      for _, line in ipairs(data or {}) do
-        if line ~= "" then stdout[#stdout + 1] = line end
+      if data and #data > 0 then
+        stdout_chunks[#stdout_chunks + 1] = table.concat(data, "\n")
       end
     end,
     on_stderr = function(_, data)
-      for _, line in ipairs(data or {}) do
-        if line ~= "" then stderr[#stderr + 1] = line end
+      if data and #data > 0 then
+        stderr_chunks[#stderr_chunks + 1] = table.concat(data, "\n")
       end
     end,
     on_exit = function(_, code)
-      if done then return end
-      done = true
-      unsub()
-      if timer then timer = nil end
-      d:resolve({ code = code, stdout = table.concat(stdout, "\n"), stderr = table.concat(stderr, "\n") })
+      local out, errout = snapshot()
+      settle({ code = code, stdout = out, stderr = errout })
     end,
   })
 
   if job <= 0 then
     done = true
-    if timer then timer = nil end
     return async.reject({ kind = "shell", message = "无法启动 shell 进程" })
   end
   return d
+end
+
+--- 组合「状态行 + 已产生的终端输出」，错误路径也保留输出内容
+--- @param status string
+--- @param out string
+--- @param errout string
+--- @return string
+local function _with_status(status, out, errout)
+  local parts = { status }
+  if out and out ~= "" then parts[#parts + 1] = out end
+  if errout and errout ~= "" then parts[#parts + 1] = errout end
+  if #parts == 1 then parts[#parts + 1] = "（无输出）" end
+  return table.concat(parts, "\n")
 end
 
 -- ========== 工具定义 ==========
@@ -95,10 +113,17 @@ shell_tools.run_command = helpers.define_tool(
     local command = args.command
     local signal = ctx and ctx.signal
     _run_command(command, { timeout_ms = args.timeout_ms, signal = signal }):then_(function(result)
-      if result.code == 0 then
-        on_success(result.stdout ~= "" and result.stdout or "（无输出）")
+      local out = result.stdout or ""
+      local errout = result.stderr or ""
+      if result.aborted then
+        -- 取消/超时/非零退出都回传已产生的终端内容，模型仍能看到当前进度
+        on_success(_with_status("命令已取消：" .. tostring(result.message or "cancelled"), out, errout))
+      elseif result.timed_out then
+        on_success(_with_status("命令执行超时", out, errout))
+      elseif result.code == 0 then
+        on_success(out ~= "" and out or "（无输出）")
       else
-        on_success(string.format("命令退出码 %d\n%s", result.code, result.stderr ~= "" and result.stderr or result.stdout))
+        on_success(_with_status(string.format("命令退出码 %d", result.code), out, errout))
       end
     end, function(err)
       on_error(err.message or tostring(err))

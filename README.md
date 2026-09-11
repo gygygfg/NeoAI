@@ -8,16 +8,20 @@
 
 - **多 AI 提供商支持** — 内置 DeepSeek、OpenAI、Anthropic、Google Gemini、Groq、Together AI、OpenRouter、SiliconFlow、月之暗面、智谱、百度、阿里云、阶跃星辰等 13+ 家 AI 服务商
   - (钞能力有限，只测试了DeepSeek)
+- **按模型自动选择** — 请求参数格式与缓存命中计算方案随模型自动适配：协议族编解码（OpenAI/Anthropic/Gemini 消息·工具·图像）+ 厂商方言（`max_tokens`/`max_completion_tokens`、`reasoning_effort`/`thinking`/`enable_thinking` 等）+ 模型能力表（上下文窗口/输出上限/缓存机制）+ 显式缓存（Anthropic 断点 / OpenAI explicit / Gemini `cachedContents`，失败自动降级为隐式），未知模型安全回退（见 [docs/model_policy.md](docs/model_policy.md)）
 - **场景化模型配置** — 按场景（聊天、编程、思考、工具执行、子 Agent、窗口命名）分配不同的 AI 模型和参数
 - **流式响应** — 实时流式显示 AI 生成内容，支持推理过程（reasoning）展示
 - **树形会话管理** — 基于分支树管理多个对话会话，支持分支创建、切换、删除
 - **丰富的内置工具** — AI 可调用文件操作、代码分析、LSP、Shell 命令等 40+ 工具
 - **工具审批系统** — 细粒度的工具执行权限控制，支持自动允许/手动审批/参数级别白名单
+- **计划模式（PLAN）与计划蒸馏** — 按 `m` 或 `:NeoAIPlan` 切换，工具上下文只保留只读/信息查询 + `ask_user` + `exit_plan_mode`（不暴露任何修改类工具）；AI 调研澄清后输出格式化修改计划，调用 `exit_plan_mode` 经用户确认后转入 CHAT 并按任务清单自动执行，并把计划阶段调研上下文**蒸馏**为检查点替换压缩
+- **流式上下文压缩** — 接近上下文阈值时自动折叠旧历史、以检查点**替换**（非追加）被折叠区间，保持前缀缓存可复用；压缩/计划蒸馏过程以悬浮窗实时展示推理与正文
 - **子 Agent 系统** — AI 可创建子 Agent 并行执行子任务，支持边界审核
 - **前后端分离架构** — 事件驱动的异步架构，UI 与业务逻辑解耦
 - **高度可配置** — 完整的键位绑定、UI 布局、日志级别等自定义配置
 - **纯lua编写** — 无需安装额外的依赖
 - **⚠️⚠️⚠️使用curl发送请求** 环境变量内没有curl可能无法发送请求
+- **待发消息队列** — Agent 正忙时发送的消息自动暂存，状态栏出现 `待发N` 徽标提醒，消息真正发送后徽标消失
 - **多模态图像** — `read_image` 工具读入 PNG/JPEG/WebP/GIF 并注入多模态模型（内容寻址附件存储 + 请求期像素/字节预算 offload，模型不支持图像时自动降级为文本）
 - **lualine 状态栏集成** — 在聊天窗口中用 `nvim-lualine` 实时展示大模型用量、缓存命中率与上下文容量（模型/用量/缓存/容量等段可自定义）
 - **Herder 状态上报** — 在 Herder pane 内实时上报 Agent 作态（working/idle/blocked），多会话自动聚合，带严格递增 `--seq` 防并发回退
@@ -110,6 +114,7 @@ require("NeoAI").setup({
 | `:NeoAIPlan`       | 切换计划模式（工具上下文只保留只读/信息查询 + 提问）|
 | `:NeoAIAuto`       | 切换 AUTO 模式（自动允许所有工具调用）             |
 | `:NeoAIApprovePlan`| 确认计划并转入 CHAT 模式按任务清单执行             |
+| `:NeoAIStatusline` | 预览当前 lualine 状态栏组件内容                    |
 
 ### 4. 默认快捷键
 
@@ -160,17 +165,57 @@ require("NeoAI").setup({
     },
 
     -- 按模式（CHAT / PLAN / AUTO）分别配置提供商与模型参数；
-    -- 进入某模式时应用其 provider/model/temperature/max_tokens/stream，缺省回退 ai.default_provider。
+    -- 进入某模式时应用其 provider/model/temperature/stream，缺省回退 ai.default_provider。
+    -- max_tokens 缺省不配置：请求不发送该参数，由模型/厂商默认最大输出决定；仅显式配置时才下发。
     modes = {
-      chat = { provider = "deepseek", model = "auto", temperature = 0.7, max_tokens = 4096, stream = true },
-      plan = { provider = "deepseek", model = "auto", temperature = 0.3, max_tokens = 8192, stream = true },
-      auto = { provider = "deepseek", model = "auto", temperature = 0.7, max_tokens = 8192, stream = true },
+      chat = { provider = "deepseek", model = "auto", temperature = 0.7, stream = true },
+      plan = { provider = "deepseek", model = "auto", temperature = 0.3, stream = true },
+      auto = { provider = "deepseek", model = "auto", temperature = 0.7, stream = true },
     },
+
+    -- 输出被截断（finish_reason=length/max_tokens/MAX_TOKENS）且无工具调用时自动续写：
+    -- 续写提示只进请求、不落库；达到次数上限仍截断则写可见提示（见 docs/ai_engine.md 4.5）。
+    truncation = { enabled = true, max_continues = 3 },
 
     reasoning_enabled = true,            -- 启用深度思考模式
     system_prompt = "你是一个AI编程助手，帮助用户解决编程问题。",
     timeout_ms = 60000,                  -- 请求超时
     max_retries = 3,                     -- 请求重试次数
+
+    -- 按模型自动选择：能力表 + 厂商方言 + 显式缓存（见 docs/model_policy.md）
+    model_policy = {
+      enabled = true,                    -- 总开关（关闭后仅保留三协议基础编解码）
+      explicit_cache = {
+        enabled = true,                  -- 显式缓存总开关
+        openai = false,                  -- OpenAI 显式断点默认关闭（隐式缓存已足够）
+        -- anthropic = true, gemini = true, -- 分机制开关（缺省跟随总开关）
+      },
+      -- overrides = {                    -- 能力覆盖（key = 模型 id 或 provider 名）
+      --   ["deepseek-v4-flash"] = { window = 131072, max_output = 8192 },
+      -- },
+      -- dialects = {                     -- 方言覆盖（key = provider 名 或 模型 id）
+      --   ["my-provider"] = { max_tokens_field = "max_completion_tokens", reasoning_kind = "effort" },
+      -- },
+    },
+
+    -- 前缀缓存身份一致性 + 自动上下文压缩
+    context_cache = {
+      enabled = true,                    -- 启用身份一致 + 自动压缩
+      context_window = 64000,            -- 兜底窗口：用户显式非默认值优先，否则按模型能力表推导
+      threshold_ratio = 0.8,             -- 达到该比例触发压缩
+      warn_ratio = 0.85,                 -- 接近上限时状态栏变色提示
+      retain_ratio = 0.16,               -- 保留的最近历史比例
+      retain_min_tokens = 4096,          -- 尾部保留下限（token）
+      compact_max_tokens = 8192,         -- 压缩摘要输出上限
+      min_shadow_messages = 2,           -- 至少折叠多少条才值得压缩
+      compaction_retries = 1,            -- 摘要后仍高于阈值的重试次数
+      prune_enabled = true,              -- 摘要前先做模型无关的工具结果裁剪
+      prune_threshold_chars = 8192,      -- 文本码点超过该值的工具结果才裁剪
+      prune_head_chars = 4096,           -- 裁剪保留的头部码点数
+      prune_tail_chars = 1024,           -- 裁剪保留的尾部码点数
+      include_identity = true,           -- 系统提示是否含固定身份段（-100 顺序位）
+      identity = "你是一个由 NeoAI 驱动的 AI 编程助手。",
+    },
   },
 
   -- ===== UI 配置 =====
@@ -179,6 +224,23 @@ require("NeoAI").setup({
     window_mode = "tab",                 -- 窗口模式：float / tab / split
     window = { width = 80, height = 24, border = "rounded" },
     split = { size = 80, direction = "right" },
+    colors = {                           -- 各元素链接的高亮组
+      background = "Normal", border = "FloatBorder",
+      user_message = "Comment", ai_message = "Normal",
+      reasoning = "Type", title = "Title",
+    },
+    tree = {
+      foldenable = false, foldmethod = "manual", foldcolumn = "0", foldlevel = 99,
+      auto_close_on_select = true,       -- 从树选择会话打开聊天后自动关闭树窗口
+    },
+    input_box = {
+      idle_height = 1,                   -- 光标在主聊天区域时输入框高度
+      min_height = 5,                    -- 光标在输入框内时的最小高度（起始）
+      max_ratio = 0.8,                   -- 随内容增长的上限（主窗口高度占比）
+    },
+    trajectory = {
+      log_dir = vim.fn.stdpath("cache") .. "/NeoAI/logs", -- 轨迹日志保存目录
+    },
   },
 
   -- ===== 键位配置 =====
@@ -190,11 +252,14 @@ require("NeoAI").setup({
       close_all = { key = "<leader>aq", desc = "关闭所有窗口" },
     },
     tree = {
+      quit = { key = "q", desc = "关闭会话树" },
       select = { key = "<CR>", desc = "选择节点/分支" },
       new_child = { key = "n", desc = "新建子分支" },
       new_root = { key = "N", desc = "新建根分支" },
       delete_dialog = { key = "d", desc = "删除对话" },
       delete_branch = { key = "D", desc = "删除分支" },
+      expand = { key = "o", desc = "展开节点" },
+      collapse = { key = "O", desc = "折叠节点" },
     },
     chat = {
       insert = { key = "i", desc = "进入插入模式" },
@@ -209,7 +274,7 @@ require("NeoAI").setup({
         normal = { key = "T", desc = "循环切换显示模式（对话/轨迹）" },
       },
       reload_display = { key = "<F5>", desc = "热重载当前显示模式插件" },
-      approve_plan = { key = "P", desc = "确认计划并转入 CHAT 执行" },
+      tool_approval = { key = "<C-a>", desc = "工具审批" },
       approval = {
         confirm = { key = "<CR>", desc = "允许一次" },
         confirm_all = { key = "A", desc = "允许所有" },
@@ -233,9 +298,30 @@ require("NeoAI").setup({
     enabled = true,
     builtin = true,
     external = {},
+    lsp = {
+      timeout_ms = 10000,                -- LSP 请求超时（服务器无响应快速失败）
+    },
+    guard = {
+      repeat_tool = {
+        enabled = true,                  -- 检测连续重复工具调用并注入提醒
+        thresholds = { 3, 5, 8 },        -- 递增提醒阈值
+        messages = { [3] = "...", [5] = "...", [8] = "..." },
+      },
+    },
+    todo = {
+      enabled = true,                    -- 待办清单工具 + 系统提示注入
+    },
+    plan_mode = {
+      enabled = true,                    -- 计划模式
+      auto_execute_on_approve = true,    -- 计划确认后自动转入 CHAT 并按清单执行
+      distill_on_execute = true,         -- 计划阶段调研上下文蒸馏为检查点替换压缩
+      extra_safe_tools = {},             -- 计划模式白名单扩展
+      -- mutating_tools = { ... },       -- 修改类工具（计划模式可见集已覆盖此语义）
+    },
     approval = {
       mode = "prompt",                   -- prompt | auto_allow | strict
       default_auto_allow = false,
+      timeout_ms = 60000,                -- 审批弹窗超时（防永久挂起）
       allowed_directories = {},
       allowed_param_groups = {},
       per_tool = {
@@ -572,6 +658,7 @@ NeoAI 内置了 40+ 工具，AI 可在对话中自动调用，涵盖以下类别
 | `todo_read`       | 读取当前任务清单                               | ✅ 自动允许 |
 | `todo_clear`      | 清空任务清单                                   | ✅ 自动允许 |
 | `enter_plan_mode` | 进入计划模式（工具上下文切换为只读/信息 + 提问）| ✅ 自动允许 |
+| `exit_plan_mode`  | 用户确认后解析计划为 todo 并转入 CHAT 执行      | ⚠️ 需审批   |
 
 ### 💬 向用户提问
 
@@ -579,13 +666,16 @@ NeoAI 内置了 40+ 工具，AI 可在对话中自动调用，涵盖以下类别
 | ---------- | ---------------------------------------- | ----------- |
 | `ask_user` | 暂停生成并向用户提问，回答回传为工具结果 | ✅ 自动允许 |
 
-> **计划模式（PLAN MODE）**：激活时工具上下文**只包含只读/信息查询工具与 `ask_user`**，
+> **计划模式（PLAN MODE）**：激活时工具上下文**只包含只读/信息查询工具、`ask_user` 与 `exit_plan_mode`**，
 > 不暴露任何修改类工具（编辑/删除/创建/写命令/git 回滚等）；执行期门禁同步收紧，
 > 调用可见集之外的任何工具都会被驳回。AI 在此模式下调研、提问澄清，
 > 并输出**清晰、格式化的修改计划**（目标与背景 / 改动清单 / 实施步骤 / 验证与回滚）。
-> 计划经用户确认（聊天窗口按 `P` 或执行 `:NeoAIApprovePlan`）后，
-> **直接转入 CHAT 模式**，系统把计划解析为任务清单（todo），
+> 计划完成后 AI 调用 `exit_plan_mode`（弹出审批窗口由用户确认），
+> 用户确认后**直接转入 CHAT 模式**，系统把计划解析为任务清单（todo），
 > 并按 `tools.plan_mode.auto_execute_on_approve`（默认开启）自动开始执行。
+> 也可手动执行 `:NeoAIApprovePlan` 完成同样的确认。
+> 生成过程中按 `m` / `:NeoAIPlan` / `:NeoAIAuto` 切换模式会**延迟到当前回合结束后生效**，
+> 不会中途改变工具集 / 系统策略 / 模型而打断正在进行的生成。
 
 ### 🪵 日志工具
 
@@ -642,13 +732,20 @@ NeoAI/
 ├── core/                       # 核心业务层
 │   ├── session/               # 会话管理
 │   │   ├── session.lua        # 会话对象（纯净数据 + fork 分支）
-│   │   ├── session_store.lua  # 会话持久化（追加式 JSONL）
-│   │   └── context_builder.lua# 上下文构建
+│   │   ├── session_store.lua  # 会话持久化（追加式 JSONL + 撕裂行修复）
+│   │   ├── context_builder.lua# 上下文构建（system 渲染 + 工具调用协议）
+│   │   ├── tool_result_pruner.lua # 工具结果裁剪（摘要前头/标记/尾裁剪）
+│   │   ├── compactor.lua      # 上下文压缩（配对安全切分 + 检查点替换 + 辅助摘要）
+│   │   ├── plan_distill.lua   # 计划阶段蒸馏（调研上下文→8 段检查点）
+│   │   └── runtime_context.lua# 运行时上下文（环境/时间等注入）
 │   ├── model/                 # 模型管理
-│   │   ├── registry.lua       # 模型注册表（运行时动态更新）
+│   │   ├── registry.lua       # 模型注册表（运行时动态更新 + 实时元数据）
 │   │   ├── fetcher.lua        # 模型列表异步获取器（指数退避重试）
-│   │   ├── adapter.lua        # 多提供商协议适配（openai/anthropic/google）
-│   │   ├── content.lua        # 多模态消息物化（图像引用→wire part）
+│   │   ├── adapter.lua        # 协议编解码（openai/anthropic/google）
+│   │   ├── profiles.lua       # 厂商/模型方言（参数名/推理形态/鉴权头）
+│   │   ├── capabilities.lua   # 模型能力表（窗口/输出/缓存机制/字符系数）
+│   │   ├── prompt_cache.lua   # 显式缓存（Anthropic 断点/OpenAI explicit/Gemini cachedContents）
+│   │   ├── content.lua        # 多模态消息物化（图像引用→协议中立块）
 │   │   └── cache.lua          # 模型列表本地缓存
 │   ├── attachment/            # 附件（多模态图像）
 │   │   └── attachment.lua     # 内容寻址附件存储 + 门禁（vision 支持/类型/上限）
@@ -656,8 +753,11 @@ NeoAI/
 │       ├── agent.lua          # Agent 对象（每次对话全新实例 + AbortSignal）
 │       ├── runtime.lua        # Agent 运行时（create/spawn/dispose/abort）
 │       ├── request.lua        # 请求构建 + 发送 + 重试
-│       ├── stream.lua         # 流式响应处理（SSE 解析）
-│       └── tool_loop.lua      # 工具调用循环
+│       ├── stream.lua         # 流式响应处理（SSE 解析 + 工具参数累积）
+│       ├── tool_loop.lua      # 工具调用循环
+│       ├── prefix.lua         # 前缀缓存身份一致性（系统提示有序段 + 工具典序）
+│       ├── guard.lua          # 工具循环护栏（连续重复调用提醒）
+│       └── recovery.lua       # 上下文溢出恢复（压缩后重发）
 │
 ├── services/                   # 服务层（连接 core 与 ui/tools）
 │   ├── chat_service.lua       # 聊天服务（send/attach/detach/approve_plan/cycle_mode）
@@ -673,25 +773,33 @@ NeoAI/
 │       └── init.lua           # 管理器（连接/注册/动态刷新/失败驱动 stale）
 │
 ├── ui/                         # 表现层
+│   ├── init.lua               # UI 入口（注册审批/提问/子Agent UI；open_*/close_all）
 │   ├── window/                # 窗口管理（float/tab/split）
 │   │   ├── manager.lua        # 窗口管理器
-│   │   ├── chat_view.lua      # 聊天视图
+│   │   ├── chat_view.lua      # 聊天视图（事件/流式/折叠/悬浮窗/显示模式宿主）
 │   │   └── tree_view.lua      # 会话树视图
 │   ├── components/            # 可复用组件
 │   │   ├── input_box.lua      # 输入框
 │   │   ├── message_list.lua   # 消息列表渲染
 │   │   ├── reasoning_panel.lua# 思考过程面板
+│   │   ├── tool_args_panel.lua# 工具参数接收悬浮窗（流式）
+│   │   ├── float_stream_window.lua # 复用流式悬浮窗（思考/参数/压缩/蒸馏共享）
 │   │   ├── model_picker.lua   # 模型选择器（异步加载）
 │   │   ├── tool_approval.lua  # 工具审批弹窗
+│   │   ├── ask_user.lua       # 向用户提问弹窗
 │   │   ├── sub_agent_dock.lua # 子 Agent 监控
+│   │   ├── fold.lua           # 折叠（推理/工具调用/结果共享）
+│   │   ├── display_modes/     # 显示模式插件（chat/trajectory）
 │   │   └── markdown_view.lua  # Markdown 渲染器
 │   └── keymap.lua             # 按键映射（统一管理）
 │
 ├── tools/                      # 工具系统
+│   ├── init.lua               # 工具系统入口（init/get_tools/execute/reload_tools）
 │   ├── registry.lua           # 工具注册表
 │   ├── executor.lua           # 工具执行器（别名/审批/超时）
 │   ├── validator.lua          # 参数校验 + 审批决策
 │   ├── packer.lua             # 工具分组打包
+│   ├── environment.lua        # 工具环境探测（workspace/git，不可用则禁用）
 │   └── builtin/               # 内置工具
 │       ├── file_ops.lua       # 文件操作 + confirm_file_change
 │       ├── shell.lua          # Shell 命令
@@ -700,6 +808,10 @@ NeoAI/
 │       ├── tree_ops.lua       # Tree-sitter 工具
 │       ├── log_ops.lua        # 日志工具
 │       ├── plan.lua           # 子 Agent + 边界审核
+│       ├── todo.lua           # 待办清单（todo_write/read/clear + 提示段）
+│       ├── plan_mode.lua      # 计划模式（enter_plan_mode/exit_plan_mode + 工具过滤/门禁）
+│       ├── ask_user.lua       # 向用户提问
+│       ├── read_image.lua     # 图像读取（多模态）
 │       ├── skills.lua         # 技能工具（list_skills/load_skill + 提示段）
 │       └── tool_helpers.lua   # 工具定义辅助
 │
@@ -713,19 +825,50 @@ NeoAI/
 │   ├── image.lua             # 图像类型检测/媒体类型
 │   └── stringx.lua           # 字符串扩展
 │
-└── tests/                      # 测试（自定义运行器，:NeoAITest）
+└── tests/                      # 测试（自定义运行器，:NeoAITest；共 44 个 test_*.lua）
     ├── init.lua               # 断言 + 运行器
-    ├── test_kernel.lua        # 内核层
-    ├── test_session.lua       # 会话层
-    ├── test_model_registry.lua# 模型层
-    ├── test_agent.lua         # Agent 层
-    ├── test_tools.lua         # 工具层
-    ├── test_services.lua      # 服务层
-    ├── test_integration.lua   # 集成测试（mock server）
+    ├── test_kernel.lua        # 内核（config_store/event_bus/events/lifecycle）
+    ├── test_session.lua       # 会话（session/store/context_builder/compactor）
+    ├── test_tool_result_pruner.lua # 工具结果裁剪
+    ├── test_agent.lua         # Agent（agent/runtime）
+    ├── test_guard.lua         # 工具循环护栏
+    ├── test_overflow.lua      # 上下文溢出恢复（配对安全切分 + 裁剪）
+    ├── test_cache_strategy.lua# 前缀缓存策略
+    ├── test_cache_usage.lua   # 缓存命中用量统计
+    ├── test_prompt_cache.lua  # 显式缓存
+    ├── test_model_registry.lua# 模型注册表
+    ├── test_model_capabilities.lua # 模型能力表
+    ├── test_model_profiles.lua# 厂商/模型方言
+    ├── test_model_metadata.lua# 实时模型元数据
+    ├── test_protocol_adapter.lua # 协议编解码
+    ├── test_model_picker.lua  # 模型选择器
+    ├── test_modes.lua         # 模式（CHAT/PLAN/AUTO）
+    ├── test_multimodal.lua    # 多模态图像
+    ├── test_runtime_context.lua # 运行时上下文
+    ├── test_tools.lua         # 工具系统
+    ├── test_tool_pending.lua  # 工具待发/暂存
+    ├── test_pending_queue.lua # 待发消息队列
+    ├── test_services.lua      # 服务层（chat/tool/model/status）
+    ├── test_status.lua        # 状态栏服务
+    ├── test_herder.lua        # Herder 状态上报
+    ├── test_ask_user.lua      # 向用户提问
+    ├── test_plan_mode.lua     # 计划模式
+    ├── test_plan_distill.lua  # 计划蒸馏
+    ├── test_todo.lua          # 待办清单
+    ├── test_sub_agent_result.lua # 子 Agent 结果
+    ├── test_skills.lua        # Skills（frontmatter/发现/装载）
     ├── test_mcp_client.lua    # MCP JSON-RPC 客户端
     ├── test_mcp_transport.lua # MCP 传输层（stdio/HTTP）
     ├── test_mcp_bridge.lua    # MCP 管理器桥接（init→注册→调用）
-    └── test_skills.lua        # Skills（frontmatter/发现/装载）
+    ├── test_chat_ui.lua       # 聊天 UI
+    ├── test_tree_ui.lua       # 会话树 UI
+    ├── test_chat_keys.lua     # 聊天键位
+    ├── test_display_modes.lua # 显示模式插件
+    ├── test_fold.lua          # 折叠
+    ├── test_markdown.lua      # Markdown 渲染
+    ├── test_timer.lua         # 可暂停计时器
+    ├── test_http.lua          # HTTP 客户端
+    └── test_integration.lua   # 集成测试（mock server）
 ```
 
 ### 设计要点
@@ -748,7 +891,7 @@ NeoAI 基于 Neovim 原生 `User` 自动命令实现事件驱动架构，事件�
 | Agent 生命周期   | 5    | 创建、派生、销毁、中止、状态变更   |
 | 生成/流式        | 8    | 生成开始、完成、错误、取消、流式   |
 | 推理             | 3    | 推理开始、内容到达、完成           |
-| 消息             | 6    | 添加、更新、编辑、删除、发送、清空 |
+| 消息             | 7    | 添加、更新、编辑、删除、发送、入队、清空 |
 | 会话             | 7    | 创建、加载、保存、删除、切换、重命名、分支 |
 | 分支/树          | 3    | 分支创建、删除、树刷新             |
 | 工具             | 13   | 工具循环、执行、审批、调用检测、护栏 |
@@ -759,7 +902,10 @@ NeoAI 基于 Neovim 原生 `User` 自动命令实现事件驱动架构，事件�
 | UI/窗口          | 5    | 打开、关闭、刷新、模式、显示模式   |
 | 子 Agent         | 5    | 创建、更新、完成、错误、结果就绪   |
 | 配置/生命周期    | 4    | 配置加载、变更、初始化、关闭       |
-| 日志/上下文压缩  | 3    | 日志消息、压缩开始、压缩完成       |
+| MCP              | 5    | 连接、就绪、错误、断开、工具更新   |
+| Skills           | 1    | 技能索引热重载                     |
+| 日志/上下文压缩  | 4    | 日志消息、压缩开始、压缩分片、压缩完成 |
+| 计划蒸馏         | 3    | 蒸馏开始、分片到达、完成           |
 
 详见 [docs/EVENTS.md](docs/EVENTS.md)（唯一权威事件文档）。
 
@@ -789,13 +935,18 @@ NeoAI 基于 Neovim 原生 `User` 自动命令实现事件驱动架构，事件�
 | [docs/EVENTS.md](docs/EVENTS.md)                                           | 事件系统文档（唯一权威） |
 | [docs/overview.md](docs/overview.md)                                       | 插件总览         |
 | [docs/ai_engine.md](docs/ai_engine.md)                                     | Agent 引擎       |
+| [docs/model_policy.md](docs/model_policy.md)                               | 按模型自动选择（协议方言/能力表/显式缓存） |
 | [docs/tool_system.md](docs/tool_system.md)                                 | 工具系统         |
 | [docs/ui_system.md](docs/ui_system.md)                                     | UI 系统          |
 | [docs/sub_agent_system.md](docs/sub_agent_system.md)                       | 子 Agent 系统    |
+| [docs/history_manager.md](docs/history_manager.md)                         | 会话系统（分支/持久化/压缩） |
 | [docs/configuration.md](docs/configuration.md)                             | 配置系统         |
 | [docs/chat_enhanced_usage.md](docs/chat_enhanced_usage.md)                 | 聊天增强使用指南 |
 | [docs/mcp.md](docs/mcp.md)                                                 | MCP 支持（传输/工具/时序） |
 | [docs/skills.md](docs/skills.md)                                           | Skills 支持（SKILL.md + load_skill） |
+| [docs/utils.md](docs/utils.md)                                             | Utils 工具库（async/http/fs/work/timer） |
+| [docs/shutdown_flow.md](docs/shutdown_flow.md)                             | 生命周期与关闭流程 |
+| [docs/testing.md](docs/testing.md)                                         | 测试指南         |
 
 ---
 

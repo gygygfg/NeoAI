@@ -39,7 +39,10 @@ tests.suite("model_registry", function(_, it)
     local a = adapter.get("openai")
     local models = a.parse_models('{"data":[{"id":"m1"},{"id":"m2"}]}')
     t.eq(2, #models)
-    t.eq("m1", models[1])
+    t.eq("m1", models[1].id)
+    t.nil_(models[1].context_window)
+    -- 兼容取 id 数组
+    t.eq("m2", adapter.model_ids(models)[2])
   end)
 
   it("anthropic 协议解析", function(t)

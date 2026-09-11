@@ -173,7 +173,7 @@ M.execute(agent, name, args, tool_call_id, opts)
 
 ### 📐 计划模式（plan_mode.lua）
 
-`enter_plan_mode`。详见 [configuration.md](configuration.md) 与 [chat_enhanced_usage.md](chat_enhanced_usage.md)。
+`enter_plan_mode`（进入计划模式：工具上下文切换为只读/信息 + 提问）/ `exit_plan_mode`（用户确认后解析计划为 todo 并转入 CHAT 执行）。详见 [configuration.md](configuration.md) 与 [chat_enhanced_usage.md](chat_enhanced_usage.md)。
 
 ### 💬 向用户提问（ask_user.lua）
 
