@@ -1,5 +1,7 @@
 # NeoAI 子 Agent 系统（v3.0）
 
+> [English](en/sub_agent_system.md) | **中文**
+
 > 子 Agent 让 AI 通过 `create_sub_agent` 把复杂任务拆给独立沙箱执行。每个子 Agent 是
 > **全新环境、零继承**，拥有独立的 AbortSignal 与工具子集，在边界约束（allowed_tools /
 > allowed_directories / max_tool_calls 等）内运行。

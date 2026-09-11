@@ -1,5 +1,7 @@
 # NeoAI Utils 工具库（v3.0）
 
+> [English](en/utils.md) | **中文**
+
 > `utils` 目录是纯工具模块，**零业务依赖**。遵循依赖单向规则
 > `utils → kernel → core → services → ui/tools`，被其它各层复用。
 > 对应源码：`lua/NeoAI/utils/*`。

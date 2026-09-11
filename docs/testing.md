@@ -1,5 +1,7 @@
 # NeoAI 测试指南（v3.0）
 
+> [English](en/testing.md) | **中文**
+
 > NeoAI 采用**轻量自定义测试框架**（`lua/NeoAI/tests/init.lua`，无外部依赖）。
 > 以 `suite` / `it` 组织用例，`t.<断言>` 断言，`:NeoAITest` 运行。
 > 配合 Mock 对 HTTP、模型、文件系统等做隔离单元/集成测试。

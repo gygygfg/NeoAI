@@ -189,7 +189,23 @@ end
 --- 调度一次渲染（合并同一 tick 内的多次更新）
 --- @param keep_view boolean|nil 仅刷新折叠文本（不滚动、不改变光标/视口）
 local function _schedule_render(keep_view)
-  if render_scheduled then return end
+  local kv = keep_view == true
+  if render_scheduled then
+    -- 同一 tick 已有待渲染：合并本次请求，而不是直接丢弃。
+    -- 若直接 return，后到的请求语义会丢失：典型场景是工具耗时 tick / 窗口重排的
+    -- keep_view 渲染先被调度，随后同一 tick 内到达的内容更新（折叠文本）被吞掉——
+    -- 该次渲染会写入新折叠文本却按 keep_view 跳过滚动，光标滞留在旧底部，
+    -- 下一次 _cursor_within_follow_margin() 判定「不在最后 5 行内」→ 跟随永久丢失。
+    if not kv then
+      -- 内容更新语义优先：清掉 keep_view，确保渲染后滚动到底部（跟随）。
+      render_pending_keep_view = false
+      -- 用实时光标重判跟随：此前 keep_view 调度时缓存的判定可能已过期，
+      -- 避免把仍贴底的光标误判为不跟随而不再滚动。
+      render_pending_follow = _cursor_within_follow_margin()
+      state.following = render_pending_follow
+    end
+    return
+  end
   render_scheduled = true
   render_flushed = false
   -- 在渲染前判断是否跟随（_render 内 zxzM 会把光标从收起的折叠块内拽到折叠首行，
@@ -197,7 +213,7 @@ local function _schedule_render(keep_view)
   -- （不跟随时用于抑制思考悬浮窗弹出与折叠收起）。
   render_pending_follow = _cursor_within_follow_margin()
   state.following = render_pending_follow
-  render_pending_keep_view = keep_view == true
+  render_pending_keep_view = kv
   vim.schedule(function()
     if render_flushed then
       -- 已被 flush 同步执行过，跳过以避免重复渲染

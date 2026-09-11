@@ -1,5 +1,7 @@
 # NeoAI 工具系统（v3.0）
 
+> [English](en/tool_system.md) | **中文**
+
 > 工具系统让 AI 通过结构化工具调用接口与编辑器/文件系统交互。工具注册、校验、
 > 审批（串行单槽位）、执行、分类，均由本系统完成。Agent 的工具循环经
 > `services.tool_service` 调用本系统执行工具。

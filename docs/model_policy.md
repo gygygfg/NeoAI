@@ -1,5 +1,7 @@
 # 按模型自动选择：协议方言 · 能力表 · 上下文策略
 
+> [English](en/model_policy.md) | **中文**
+
 > 本文汇总各大模型 API 的请求/缓存差异（来自官方文档），并说明 NeoAI 如何把这些差异
 > 收敛成「按模型自动选择」的链路：**上下文过滤/压缩 → 协议编码 → 发送**。
 > 对应源码：`lua/NeoAI/core/model/{capabilities,profiles,adapter,prompt_cache}.lua`、

@@ -1,5 +1,7 @@
 # NeoAI 测试框架（v3.0）
 
+> [English](en/threaded_testing.md) | **中文**
+
 > NeoAI 自带**轻量自定义测试框架**（无外部依赖，`:NeoAITest` 运行）。
 > 所有测试文件位于 `lua/NeoAI/tests/`。旧版文档中提到的 `thread_worker.lua` /
 > `thread_scheduler.lua` / `threaded_runner.lua` 及 `:NeoAITestAll` 命令均**不存在**。

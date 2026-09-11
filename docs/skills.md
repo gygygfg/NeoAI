@@ -1,5 +1,7 @@
 # NeoAI Skills 支持
 
+> [English](en/skills.md) | **中文**
+
 > 技能（Skills）是目录内带 `SKILL.md` 的**可复用操作指引**（Claude / opencode 风格）：一个技能 =
 > 一个目录 + `SKILL.md`（YAML frontmatter 描述元信息 + 正文片段指引）。NeoAI 扫描技能目录，
 > 把「可用技能清单」注入系统提示，模型按需调用 `load_skill` 装载正文。

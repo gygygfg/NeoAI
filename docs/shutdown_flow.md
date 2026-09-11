@@ -1,5 +1,7 @@
 # NeoAI 生命周期与关闭（v3.0）
 
+> [English](en/shutdown_flow.md) | **中文**
+
 > 生命周期管理由 `kernel/lifecycle.lua` 负责：`bootstrap` / `on_shutdown` / `shutdown`。
 > 取消由 **AbortSignal** 级联传播（替代旧 `shutdown_flag`）。
 > 对应源码：`lua/NeoAI/kernel/lifecycle.lua`、`lua/NeoAI/kernel/init.lua`、

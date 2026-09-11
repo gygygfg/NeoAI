@@ -1,5 +1,7 @@
 # NeoAI 线程池优化（v3.0）
 
+> [English](en/ui_multithread_optimization.md) | **中文**
+
 > v3.0 不再使用基于 `vim.uv.new_thread()` 的多线程 UI（旧 `history_tree` / `chat_window` /
 > `tree_window` 等组件已删除）。当前把阻塞式 I/O / CPU 密集计算统一交给 **`utils.work` 线程池**
 > 执行，避免卡住 nvim 主线程；异步原语由 `utils.async` 提供。

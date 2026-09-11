@@ -1,5 +1,7 @@
 # NeoAI
 
+> [English](README.en.md) | **中文**
+
 > 🧠 **NeoAI** — 一款功能强大的 Neovim AI 编程助手插件，集成多模型 AI 对话、文件操作、代码分析和 Shell 命令执行等能力，支持树形会话管理和子 Agent 协作。
 
 ---
@@ -943,6 +945,7 @@ NeoAI 基于 Neovim 原生 `User` 自动命令实现事件驱动架构，事件�
 | 文档                                                                       | 说明             |
 | -------------------------------------------------------------------------- | ---------------- |
 | [styleGuide.md](styleGuide.md)                                             | 架构设计指南     |
+| [styleGuide.en.md](styleGuide.en.md)                                       | 架构设计指南（英文版） |
 | [docs/EVENTS.md](docs/EVENTS.md)                                           | 事件系统文档（唯一权威） |
 | [docs/overview.md](docs/overview.md)                                       | 插件总览         |
 | [docs/ai_engine.md](docs/ai_engine.md)                                     | Agent 引擎       |
@@ -958,6 +961,7 @@ NeoAI 基于 Neovim 原生 `User` 自动命令实现事件驱动架构，事件�
 | [docs/utils.md](docs/utils.md)                                             | Utils 工具库（async/http/fs/work/timer） |
 | [docs/shutdown_flow.md](docs/shutdown_flow.md)                             | 生命周期与关闭流程 |
 | [docs/testing.md](docs/testing.md)                                         | 测试指南         |
+| [docs/en/](docs/en/)                                                       | 以上文档的英文版（English mirror） |
 
 ---
 

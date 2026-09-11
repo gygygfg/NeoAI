@@ -1,5 +1,7 @@
 # NeoAI Agent 引擎（v3.0）
 
+> [English](en/ai_engine.md) | **中文**
+
 > 本文档描述 NeoAI 的 Agent 引擎，从会话构建上下文、发送请求、处理流式响应、
 > 执行工具循环、到上下文压缩与溢出恢复的完整链路。
 > 对应源码：`lua/NeoAI/core/agent/*`。

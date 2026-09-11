@@ -1,5 +1,7 @@
 # NeoAI 聊天界面使用指南（v3.0）
 
+> [English](en/chat_enhanced_usage.md) | **中文**
+
 > 本文档描述 v3.0 聊天界面的实际使用。旧版提到的 `NeoAI.ui.chat_enhanced` 模块、
 > `:NeoAISend` / `:NeoAIMode` / `:NeoAIDemo` / `:NeoAIList` 命令均**不存在**。
 > 对应源码：`lua/NeoAI/ui/window/chat_view.lua`、`lua/NeoAI/ui/components/*`。

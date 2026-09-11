@@ -1,5 +1,7 @@
 # NeoAI MCP 支持
 
+> [English](en/mcp.md) | **中文**
+
 > NeoAI 作为 MCP **客户端**，连接外部 MCP 服务器，把远端 `tools` / `resources` / `prompts`
 > 注册进 NeoAI 工具系统，让模型直接调用。对应源码：`lua/NeoAI/services/mcp/*`。
 

@@ -1,5 +1,7 @@
 # NeoAI 配置系统（v3.0）
 
+> [English](en/configuration.md) | **中文**
+
 > 配置由 `default_config.lua`（纯数据、零逻辑）提供不可变默认值，
 > `kernel/config_store.lua`（merge + validate + get + watch）管理合并与读取，
 > `kernel/lifecycle.lua`（bootstrap/shutdown）负责内核引导。

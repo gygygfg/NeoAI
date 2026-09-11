@@ -706,6 +706,55 @@ tests.suite("chat_ui", function(_, it)
     chat_service.reset()
   end)
 
+  it("同一 tick 内先调度 keep_view 渲染再到达内容更新时仍跟随到底部", function(t)
+    -- 回归：_schedule_render 曾在"同一 tick 已有待渲染"时直接 return，导致后到的
+    -- 内容更新被吞掉。当窗口重排（VimResized）/ 工具耗时 tick 的 keep_view 渲染先被
+    -- 调度时，该次渲染会写入新折叠文本却跳过滚动，光标滞留在旧底部；下一次
+    -- _cursor_within_follow_margin() 便判定"不在最后 5 行内"，跟随永久丢失。
+    local chat_view = require("NeoAI.ui.window.chat_view")
+    local chat_service = require("NeoAI.services.chat_service")
+    local event_bus = require("NeoAI.kernel.event_bus")
+    local events = require("NeoAI.kernel.events")
+    chat_view.reset()
+    chat_service.reset()
+
+    local opened = chat_view.open()
+    local agent = chat_service.get_current_agent()
+    local body = {}
+    for i = 1, 100 do body[#body + 1] = "正文 " .. i end
+    agent.messages = {
+      { role = "user", content = "q1" },
+      { role = "assistant", content = table.concat(body, "\n") },
+      { role = "assistant", content = "", tool_calls = { { id = "c1", ["function"] = { name = "run_command", arguments = "{}" } } } },
+      { role = "tool", tool_call_id = "c1", tool_name = "run_command", content = "" },
+    }
+    chat_view.refresh()
+    vim.api.nvim_set_current_win(opened.win_id)
+    local total = vim.api.nvim_buf_line_count(opened.buf)
+    vim.api.nvim_win_set_cursor(opened.win_id, { total, 0 })
+
+    local saved_cols = vim.o.columns
+    -- 同一 tick 内：先触发窗口重排（keep_view 渲染），再让大块折叠文本到达。
+    vim.o.columns = math.max(40, saved_cols - 20)
+    vim.cmd("doautocmd VimResized")
+    local res = {}
+    for i = 1, 90 do res[#res + 1] = "结果行 " .. i end
+    local last = agent.messages[#agent.messages]
+    last.content = table.concat(res, "\n")
+    event_bus.emit(events.MESSAGE_UPDATED, { agent_id = agent.id, message = last })
+    chat_view.flush()
+    vim.o.columns = saved_cols
+
+    local line_count = vim.api.nvim_buf_line_count(opened.buf)
+    local cur = vim.api.nvim_win_get_cursor(opened.win_id)
+    t.true_(line_count > total, "折叠文本应已写入 buffer")
+    t.eq(line_count, cur[1],
+      "同一 tick keep_view 与内容更新合并后光标应仍跟随到底部，实际 " .. cur[1] .. "/" .. line_count)
+
+    chat_view.reset()
+    chat_service.reset()
+  end)
+
   it("工具调用消息的正文不因工具落地而消失", function(t)
     local chat_view = require("NeoAI.ui.window.chat_view")
     local chat_service = require("NeoAI.services.chat_service")

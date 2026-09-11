@@ -1,5 +1,7 @@
 # NeoAI 会话系统（v3.0）
 
+> [English](en/history_manager.md) | **中文**
+
 > 会话系统管理对话历史，支持**分支树**、**追加式 JSONL 持久化**、**上下文构建**与**上下文压缩**。
 > 对应源码：`lua/NeoAI/core/session/*`。
 

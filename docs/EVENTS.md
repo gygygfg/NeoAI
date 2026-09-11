@@ -1,5 +1,7 @@
 # NeoAI 事件系统（唯一权威文档）
 
+> [English](en/EVENTS.md) | **中文**
+
 > 本文档是 NeoAI 事件系统的**唯一权威来源**，合并了原先分散在
 > `docs/event_system.md`、`docs/NATIVE_EVENTS.md`、`docs/IMPLEMENTED_EVENTS.md`
 > 三份文档中的内容。

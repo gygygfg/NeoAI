@@ -1,0 +1,116 @@
+# NeoAI Testing Guide (v3.0)
+
+> [中文](../testing.md) | **English**
+
+> NeoAI uses a **lightweight custom test framework** (`lua/NeoAI/tests/init.lua`, no external dependencies).
+> Tests are organized with `suite` / `it`, assertions use `t.<assertion>`, and `:NeoAITest` runs them.
+> Combined with mocks, it enables isolated unit and integration tests for HTTP, models, the file system, and more.
+
+## 1. Running
+
+```vim
+:NeoAITest          " run all suites
+:NeoAITest flow_tools  " run a specific suite (by name)
+```
+
+Running headless:
+
+```bash
+nvim --headless "+lua require('NeoAI.tests').run_all()" +q
+```
+
+## 2. Test Organization
+
+```lua
+local tests = require("NeoAI.tests")
+
+tests.suite("flow_config", function(describe, it, before_each)
+  before_each(function()
+    require("NeoAI.kernel.config_store").reset()
+  end)
+
+  it("merge user overrides default", function(t)
+    local cs = require("NeoAI.kernel.config_store")
+    cs.load({ ai = { default_provider = "openai" } })
+    t.eq(cs.get("ai.default_provider"), "openai")
+  end)
+
+  it("reads dotted path", function(t)
+    local cs = require("NeoAI.kernel.config_store")
+    cs.load({})
+    t.eq(cs.get("ui.window.width"), 80)
+  end)
+end)
+```
+
+## 3. Assertion Helpers
+
+The test callback receives `t` (the assertion helper table):
+
+| Assertion | Description |
+| --- | --- |
+| `t.eq(a, b)` | Equal |
+| `t.ne(a, b)` / `t.not_eq(a, b)` | Not equal |
+| `t.true_(v)` / `t.false_(v)` | True / false |
+| `t.nil_(v)` / `t.not_nil(v)` | nil / not nil |
+| `t.matches(pattern, v)` | String match |
+| `t.ok(v)` | Truthy |
+| `t.deep_eq(a, b)` | Deep comparison |
+| `t.sleep(ms)` | Async wait (returns a Deferred) |
+| `t.throws(fn)` | Catch errors |
+
+## 4. Mock Strategies
+
+### 4.1 Session / File Isolation
+
+The test runner automatically redirects the default session path to a temporary directory (`~/.cache/NeoAI-test`), then cleans up and restores the real in-memory session after the run, preventing tests from polluting real history. The `kernel.*` and `core.session.*` modules provide a `reset()` method (config_store / event_bus / lifecycle / session_store / registry / tool_service, etc.) to make isolation easy.
+
+### 4.2 HTTP / AI Mock
+
+HTTP requests are mocked to simulate both streaming and non-streaming LLM responses:
+
+- Override the request layer of `utils.http` when needed, or inject a mock server.
+- `test_http.lua` covers the HTTP client; `test_integration.lua` performs integration tests with a mock server.
+
+### 4.3 Tool Mock
+
+You can call tool definitions directly, or override `registry` (for example, call `registry.reset()` and then use `register` to inject a mock tool).
+`test_tools.lua` and `test_sub_agent_result.lua` cover tools and sub-agent results.
+
+### 4.4 Event / State Isolation
+
+Each module's `reset()` (`event_bus.clear_all`, `herder.reset`, `chat_service.reset`, `status.reset`, etc.)
+ensures there are no leftover subscriptions or state between tests.
+
+## 5. Test Coverage Topics
+
+| File | Coverage |
+| --- | --- |
+| `test_kernel` | Kernel: config merging, event bus, lifecycle |
+| `test_session` | Session object, JSONL storage, context building, compaction |
+| `test_tool_result_pruner` | Tool result pruning (code point accounting, head/marker/tail, image skipping) |
+| `test_agent / test_guard / test_overflow` | Agent state machine, guardrails, overflow recovery, pairing-safe splitting |
+| `test_runtime_context` | Runtime context injection |
+| `test_model_registry / test_model_capabilities / test_model_profiles / test_model_metadata` | Model registry, capability table, dialects, live metadata |
+| `test_protocol_adapter` | Protocol encoding and decoding |
+| `test_prompt_cache / test_cache_strategy / test_cache_usage` | Explicit cache, prefix cache strategy, cache hit usage |
+| `test_model_picker` | Model picker |
+| `test_modes` | Modes (CHAT/PLAN/AUTO) |
+| `test_multimodal` | Multimodal images |
+| `test_tools / test_tool_pending` | Tool execution, pending/staged tools |
+| `test_max_tokens / test_truncation` | max_tokens sending strategy, output truncation and continuation |
+| `test_sub_agent_result` | Sub-agent results |
+| `test_pending_queue` | Pending message queue |
+| `test_services / test_status` | Service layer (chat/tool/model/status), status line |
+| `test_ask_user / test_herder` | Asking questions, Herder reporting |
+| `test_plan_mode / test_plan_distill / test_todo` | Plan mode, plan distillation, todos |
+| `test_skills` | Skills (frontmatter/discovery/loading) |
+| `test_mcp_client / test_mcp_transport / test_mcp_bridge` | MCP client, transport layer, bridge |
+| `test_chat_ui / test_tree_ui / test_chat_keys` | Chat/tree UI, chat keymaps |
+| `test_display_modes / test_fold / test_markdown` | Display modes, folding, Markdown |
+| `test_timer / test_http / test_integration` | Pausable timer, HTTP client, integration (mock server) |
+
+## 6. Related Docs
+
+- [threaded_testing.md](threaded_testing.md): Test framework structure and runner.
+- [utils.md](utils.md): `utils.async` (Deferred/sleep, etc. used in tests).

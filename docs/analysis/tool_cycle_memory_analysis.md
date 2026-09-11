@@ -1,5 +1,7 @@
 # NeoAI 工具循环引擎深度分析（v3.0）
 
+> [English](../en/analysis/tool_cycle_memory_analysis.md) | **中文**
+
 > 本文档分析 v3.0 的工具调用循环（`core/agent/tool_loop.lua`）及其与审批、护栏、超时的交互。
 > 旧版 `core/ai/tool_cycle.lua` / `tool_executor.lua` / `approval_handler.lua` 等已删除，
 > 对应职责由 `core/agent/tool_loop.lua` + `services/tool_service.lua` + `tools/*` 继承。
