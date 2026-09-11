@@ -117,10 +117,16 @@ local function _persist_agent(agent)
   -- 避免把易变运行态固化到持久历史并污染「用户轮次」计数。
   for _, msg in ipairs(agent.messages) do
     if not msg._synced and not msg.runtime_context then
-      -- 压缩检查点：先在 durable surface 移除被替换的已同步旧消息（替换而非追加）。
+      -- 压缩检查点：先在 durable surface 移除被替换的「已同步」旧消息（替换而非追加）。
       -- front 替换（compactor）从头部移除；tail 替换（plan_distill）从尾部移除。
+      -- 按 replaced_synced_count（被替换消息中已落盘的条数）而非 replaced_count 删除：
+      -- 回合边界压缩时两者相等；但工具循环中途压缩时，本回合新增消息尚未落盘，
+      -- 若按 replaced_count 删除会把上一回合的历史误删。缺省回退到 replaced_count 以
+      -- 兼容旧数据/未记录该字段的检查点。
       if msg.checkpoint and msg.replaced_count and session.messages then
-        local n = math.min(msg.replaced_count, #session.messages)
+        local n = msg.replaced_synced_count
+        if n == nil then n = msg.replaced_count end
+        n = math.min(n, #session.messages)
         if msg.replaced_tail then
           for _ = 1, n do
             table.remove(session.messages)
@@ -568,6 +574,14 @@ local function _request_mode(target)
   local agent = M.get_current_agent()
   if not agent then return target, false end
   if _is_busy(agent) then
+    -- AUTO 是审批放宽开关（不放宽工具集/模型）：生成中/工具执行中也应立即生效，
+    -- 立刻批准当前待审批/排队的工具（set_auto_mode 内部 _approve_all_pending），
+    -- 避免「切到 AUTO 后本轮仍在弹审批框」。其余模式切换（工具集/模型）仍延迟到
+    -- 本轮结束由 _apply_pending_mode 应用，不打断当前回合；离开 AUTO 同样延迟，
+    -- 防止本轮中途突然弹出审批框。
+    if target == "auto" then
+      require("NeoAI.services.tool_service").set_auto_mode(true)
+    end
     pending_mode = target
     pending_mode_agent_id = agent.id
     _ensure_queue_observer()

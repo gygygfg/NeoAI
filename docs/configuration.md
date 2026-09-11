@@ -152,6 +152,7 @@ session = {
 | `enabled` | `true` | 工具系统总开关 |
 | `builtin` | `true` | 加载内置工具 |
 | `external` | `{}` | 外部工具 |
+| `read_file` | `{outline_threshold_chars=500, outline_max_nodes=200, outline_max_depth=4, outline_preview_lines=50}` | read_file 大文件保护：未指定行范围且超阈值时返回语法树大纲（无解析器则截断预览） |
 | `lsp` | `{timeout_ms=10000}` | LSP 请求超时（服务器无响应快速失败） |
 | `guard.repeat_tool` | `{enabled=true, thresholds={3,5,8}, messages=...}` | 连续重复工具调用提醒 |
 | `todo.enabled` | `true` | 待办工具 + 系统提示注入 |

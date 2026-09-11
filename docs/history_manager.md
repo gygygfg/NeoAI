@@ -65,8 +65,12 @@
 
 策略对齐 deepseek-harness 的 compaction：
 
-1. **触发**：`maybe_compact(agent)` 在每次新一步前检查，估算 token 达到
-   `context_window * threshold_ratio` 阈值时折叠。
+1. **触发**：分两处。
+   - **回合边界**：`runtime.run` 在新一步前调 `maybe_compact(agent)`（要求 `idle`）。
+   - **工具循环内部**：`tool_loop._send_round` 每轮发送前调 `maybe_compact(agent, { allow_busy = true })`；
+     溢出恢复（`recovery`）调 `force_compact(agent, { allow_busy = true })`。二者放宽 `idle` 要求，
+     因为此刻上一轮工具结果已回写、下一轮请求尚未发出（或请求已因溢出失败），无并发写入。
+   估算 token 达到 `context_window * threshold_ratio` 阈值时折叠。
 2. **模型无关裁剪**：先由 `tool_result_pruner.prune_agent` 把超预算的工具结果裁成
    「头部 + 省略标记 + 尾部」（`prune_threshold_chars` / `prune_head_chars` / `prune_tail_chars`），
    含图像引用的结果跳过。裁剪后已回到阈值内则直接结束，无需摘要调用；有裁剪则作废过期 API 用量。
@@ -76,11 +80,16 @@
 4. **辅助摘要**：`_summarize` 逐字节回放会话前缀（相同系统提示、工具 schema、被折叠区消息），
    再追加压缩指令作为最后一条 user 消息 → 复用 provider 热前缀缓存。
 5. **检查点替换**：生成带 `<compacted-summary>` 标签的 checkpoint user 消息，**替换被折叠区间**
-   （`_replace_with_checkpoint`），并记录 `replaced_count`。后续请求在替换点之前的未变前缀仍可复用缓存。
-   仅替换而非追加（不产生第二份历史副本）。成功后发射 `COMPACTION_COMPLETED`。
+   （`_replace_with_checkpoint`），并记录：
+   - `replaced_count`：被替换消息条数（供展示/统计）；
+   - `replaced_synced_count`：其中**已落盘（`_synced`）**的条数。回合边界压缩时二者相等；
+     工具循环中途压缩时，本回合新增消息尚未落盘，该值小于 `replaced_count`。
+
+   `chat_service._persist_agent` 按 **`replaced_synced_count`**（缺省回退 `replaced_count`，兼容
+   旧数据）从 durable surface 头部/尾部删除已同步旧消息，**保证不误删上一回合历史**。
 6. **收敛重试**：摘要后仍高于阈值时按 `compaction_retries` 继续折叠更早区间。
 
-`force_compact`（溢出恢复用）跳过压力阈值判断，保留空闲/并发锁检查；先裁剪，裁剪已足以回到
+`force_compact`（溢出恢复用）跳过压力阈值判断，**缺省 `allow_busy = true`**；先裁剪，裁剪已足以回到
 窗口内则不再摘要，否则做一次最大化的平衡头部缩减（retain 0，只保留最新一个不可分单元）。
 
 ## 6. 会话树与分支

@@ -1505,4 +1505,108 @@ tests.suite("chat_ui", function(_, it)
     float_window.reset()
   end)
 
+  it("接收参数悬浮窗按分片增量追加原始参数并始终滚到底", function(t)
+    local tool_args_panel = require("NeoAI.ui.components.tool_args_panel")
+    tool_args_panel.reset()
+
+    local function tc(name, args)
+      local c = { index = 0, type = "function" }
+      c["function"] = { name = name, arguments = args }
+      return c
+    end
+
+    local function count_heads(s)
+      local _, n = s:gsub("正在接收参数: ", "")
+      return n
+    end
+
+    -- 模拟模型分片生成参数（残缺 JSON 逐片累积）：面板应增量追加（终端式增长，
+    -- 与思考面板一致），工具头只出现一次，不因分片而整段重复渲染。
+    tool_args_panel.show({ tc("run_command", '{"cmd":') })
+    t.true_(tool_args_panel.is_open(), "应打开接收参数悬浮窗")
+    local c1 = tool_args_panel.get_content()
+    t.true_(c1:find("正在接收参数: run_command", 1, true) ~= nil, "应展示工具头")
+    t.true_(c1:find('{"cmd":', 1, true) ~= nil, "应展示原始参数分片")
+
+    tool_args_panel.show({ tc("run_command", '{"cmd":"ls') })
+    tool_args_panel.show({ tc("run_command", '{"cmd":"ls"}') })
+    local c2 = tool_args_panel.get_content()
+    t.true_(c2:find('{"cmd":"ls"}', 1, true) ~= nil, "参数应增量拼接为完整 JSON")
+    t.eq(1, count_heads(c2), "工具头应只出现一次（增量追加不重复渲染整段）")
+
+    -- 位置不变但参数被替换（不再以已见内容为前缀）：回退整段重建，仍只有一处工具头
+    tool_args_panel.show({ tc("run_command", '{"other":1}') })
+    local c3 = tool_args_panel.get_content()
+    t.true_(c3:find('{"other":1}', 1, true) ~= nil, "替换后应展示新参数")
+    t.true_(c3:find('{"cmd"', 1, true) == nil, "替换后不应残留旧参数片段")
+    t.eq(1, count_heads(c3), "替换重建后仍只有一处工具头")
+
+    local win_id
+    for _, w in ipairs(vim.api.nvim_list_wins()) do
+      if vim.bo[vim.api.nvim_win_get_buf(w)].filetype == "neoai_tool_args" then win_id = w break end
+    end
+    t.not_nil(win_id, "应创建接收参数悬浮窗")
+
+    local function last_buf_line()
+      return vim.api.nvim_buf_line_count(vim.api.nvim_win_get_buf(win_id))
+    end
+
+    -- 追加超长单行（wrap 折成多屏幕行）：滚动到底应把光标移到内容末尾（末行末列），
+    -- 否则 wrap 下只显示长行开头（看不到尾部）。列 > 0 证明光标进入了末行内部。
+    local big = string.rep("段", 400)
+    tool_args_panel.show({ tc("run_command", '{"cmd":"' .. big .. '"}') })
+    local cur = vim.api.nvim_win_get_cursor(win_id)
+    t.eq(last_buf_line(), cur[1], "超长单行内容时光标仍应位于最后一行")
+    t.true_(cur[2] > 0, "超长单行时光标应移到内容末尾（列>0），而非停留在行首")
+    -- 末行应为参数结构收尾（闭合括号），说明已滚过超长参数行到末尾
+    local last_line = vim.api.nvim_buf_get_lines(vim.api.nvim_win_get_buf(win_id),
+      last_buf_line() - 1, last_buf_line(), false)[1]
+    t.true_(last_line:find("}", 1, true) ~= nil, "末行应为结构收尾（}），表明已滚到内容末尾")
+
+    -- 两个并发工具调用：应出现两处工具头（各自独立增长）
+    tool_args_panel.show({ tc("git_status", "1"), tc("run_command", "2") })
+    t.eq(2, count_heads(tool_args_panel.get_content()), "并发工具应各自出现一处工具头")
+
+    tool_args_panel.reset()
+  end)
+
+  it("主界面鼠标滚轮滚动不越过 buffer 末尾", function(t)
+    local chat_view = require("NeoAI.ui.window.chat_view")
+    local chat_service = require("NeoAI.services.chat_service")
+    chat_view.reset()
+    chat_service.reset()
+
+    local opened = chat_view.open()
+    local agent = chat_service.get_current_agent()
+    agent.messages = {
+      { role = "user", content = "q1" },
+      { role = "assistant", content = "第一行\n第二行\n第三行\n第四行\n第五行\n第六行" },
+    }
+    chat_view.refresh()
+    vim.api.nvim_set_current_win(opened.win_id)
+
+    local total = vim.api.nvim_buf_line_count(opened.buf)
+    -- 滚轮向下映射应存在且移动光标（不越界）
+    local fwd = vim.fn.maparg("<ScrollWheelDown>", "n", false, true)
+    local back = vim.fn.maparg("<ScrollWheelUp>", "n", false, true)
+    t.not_nil(fwd.callback, "主界面应注册 <ScrollWheelDown> 映射")
+    t.not_nil(back.callback, "主界面应注册 <ScrollWheelUp> 映射")
+
+    -- 停在顶部，连续向下滚：光标至多到末行，绝不超过 buffer 行数
+    vim.api.nvim_win_set_cursor(opened.win_id, { 1, 0 })
+    for _ = 1, 20 do fwd.callback() end
+    t.eq(total, vim.api.nvim_win_get_cursor(opened.win_id)[1], "连续向下滚应停在末行")
+    local topline = vim.api.nvim_win_call(opened.win_id, function() return vim.fn.line("w0") end)
+    t.true_(topline <= total, "视口首行不应越过末行（topline=" .. topline .. "/" .. total .. "）")
+
+    -- 再向上滚：光标回到首行且不越界
+    for _ = 1, 20 do back.callback() end
+    t.eq(1, vim.api.nvim_win_get_cursor(opened.win_id)[1], "连续向上滚应停在首行")
+    local topline2 = vim.api.nvim_win_call(opened.win_id, function() return vim.fn.line("w0") end)
+    t.eq(1, topline2, "视口首行应为第 1 行（不越界）")
+
+    chat_view.reset()
+    chat_service.reset()
+  end)
+
 end)

@@ -298,6 +298,16 @@ local DEFAULT_CONFIG = {
     enabled = true,
     builtin = true,
     external = {},
+    -- read_file 大文件保护：未指定 start_line/end_line 时，字符数超过
+    -- outline_threshold_chars 的文件不再整篇回传，而返回语法树节点大纲
+    -- （该文件类型无 tree-sitter parser 时回退为前 outline_preview_lines 行预览），
+    -- 防止 AI 一次性意外读取超大文件耗尽上下文。
+    read_file = {
+      outline_threshold_chars = 500, -- 触发保护的字符数阈值
+      outline_max_nodes = 200, -- 大纲最多输出的结构节点数
+      outline_max_depth = 4, -- 大纲最大递归深度（相对根节点）
+      outline_preview_lines = 50, -- 无 parser 时的预览行数
+    },
     lsp = {
       timeout_ms = 10000, -- LSP 请求超时（ms）：服务器无响应时快速失败，避免工具循环挂到 executor 超时
     },

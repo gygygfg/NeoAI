@@ -277,4 +277,59 @@ tests.suite("plan_mode", function(_, it)
     chat_service.reset()
     tool_service.reset()
   end)
+
+  it("生成中切到 AUTO 立即生效并自动批准当前待审批项", function(t)
+    local config_store = require("NeoAI.kernel.config_store")
+    config_store.load({ tools = { approval = { mode = "prompt", per_tool = {} } } })
+    local chat_service = require("NeoAI.services.chat_service")
+    local tool_service = require("NeoAI.services.tool_service")
+    local registry = require("NeoAI.tools.registry")
+    local helpers = require("NeoAI.tools.builtin.tool_helpers")
+    local todo = require("NeoAI.tools.builtin.todo")
+    chat_service.reset()
+    tool_service.reset()
+    todo.reset()
+
+    registry.register(helpers.define_tool(
+      "auto_now_tool", "自动", { type = "object", properties = {}, required = {} },
+      function(args, on_success) on_success("ran") end
+    ))
+
+    -- 审批 UI：记录弹窗是否被展示（切 AUTO 后不应再弹）
+    local showed = false
+    tool_service.set_approval_ui({
+      show = function() showed = true end,
+      hide = function() end,
+    })
+
+    local agent = chat_service.new_session({})
+    agent.state = "generating" -- 模拟生成中
+
+    -- 生成中发起一个需要审批的工具调用：应弹窗等待
+    local done, err = false, nil
+    tool_service.execute(agent, "auto_now_tool", { description = "生成中审批" }, nil, {}):then_(
+      function() done = true end,
+      function(e) err = e; done = true end
+    )
+    t.true_(showed, "prompt 模式下应先弹审批窗")
+    t.true_(tool_service.has_pending_approval(), "应存在待审批项")
+
+    -- 生成中切到 AUTO：应立即生效并自动批准当前待审批项，而不是等到本轮结束
+    local target = chat_service.cycle_mode()
+    t.eq("plan", target, "CHAT -> PLAN（生成中）")
+    target = chat_service.cycle_mode()
+    t.eq("auto", target, "PLAN -> AUTO")
+    t.true_(tool_service.is_auto_mode(), "生成中切到 AUTO 应立即生效（auto_mode=true）")
+    t.true_(chat_service.has_pending_mode(), "工具集/模型切换仍应暂存到本轮结束")
+    t.false_(tool_service.has_pending_approval(), "AUTO 开启后待审批项应被自动批准")
+
+    -- 被暂存的审批项已批准并执行
+    local waited = vim.wait(1000, function() return done end)
+    t.true_(waited, "待审批工具应在 AUTO 后立即执行完毕")
+    t.nil_(err, "自动批准后不应报错: " .. tostring(err and err.message or err))
+
+    chat_service.reset()
+    tool_service.reset()
+    todo.reset()
+  end)
 end)

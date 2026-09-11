@@ -137,10 +137,19 @@ end
 
 ### 4.2 上下文压缩
 
-`runtime.run` 在每次新一步前调用 `compactor.maybe_compact`：达到压力阈值（`context_window *
-threshold_ratio`）时先由 `tool_result_pruner` 裁剪超长工具结果（头/标记/尾），裁剪后仍超阈值再折叠
+`runtime.run` 在每次新一步前调用 `compactor.maybe_compact`（回合边界，要求 idle）；
+`tool_loop._send_round` 在**工具循环每一轮**发送前调用 `maybe_compact({ allow_busy = true })`
+（此时上一轮工具结果已回写、下一轮请求尚未发出，无并发写入，压缩安全）。两者：达到压力阈值
+（`context_window * threshold_ratio`）时先由 `tool_result_pruner` 裁剪超长工具结果（头/标记/尾），裁剪后仍超阈值再折叠
 最早的整段历史（切点保持工具配对平衡），保留最近尾部（retain 预算），用检查点替换（仅替换而非追加）。
-`force_compact` 用于溢出恢复：先裁剪，必要时做最大化平衡头部缩减（retain 0）。
+
+`force_compact` 用于溢出恢复：先裁剪，必要时做最大化平衡头部缩减（retain 0）；**缺省
+`allow_busy = true`**，保证溢出恢复在回合首轮与工具循环中途（generating/tool_running）
+都能真正压缩（否则会被 idle 守卫拒绝、溢出错误直接抛出）。
+
+检查点同时记录 `replaced_count`（被替换条数）与 `replaced_synced_count`（已落盘条数）：
+回合边界压缩二者相等；循环中途压缩时本回合消息尚未落盘，durable surface 仅删已同步条数，
+避免误删上一回合历史。
 
 ### 4.3 前缀缓存身份
 
@@ -197,8 +206,9 @@ assistant 收尾，避免聊天「看起来卡住」。
 
 ### 6.3 溢出恢复
 
-`recovery.send_stream` 在请求返回 context overflow 时先 `force_compact` 压缩历史再重试，
-每轮最多一次，成功后重置标志。无可折叠内容时原样抛回溢出错误。
+`recovery.send_stream` 在请求返回 context overflow 时先 `force_compact(agent, { allow_busy = true })`
+压缩历史再重试，每轮最多一次，成功后重置标志。无可折叠内容时原样抛回溢出错误。
+`allow_busy = true` 保证恢复在 generating/tool_running 下也能生效（回合首轮与工具循环中途均走此路径）。
 
 ### 6.4 已知取舍
 

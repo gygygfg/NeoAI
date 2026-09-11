@@ -4,6 +4,8 @@
 --- 每轮创建持久流处理器累积 tool_calls 增量。
 --- 工具执行经 tool_service（审批 + 调度 + 执行）。
 --- 工具调用并行执行；审批在 tool_service 内串行化（单槽位弹窗互不覆盖）。
+--- 每轮发送前在轮边界做上下文压力检查（allow_busy 压缩）：上一轮工具结果已回写、
+--- 下一轮请求尚未发出，此时折叠历史安全；长循环因此可逐轮收敛，不耗尽上下文。
 
 local async = require("NeoAI.utils.async")
 local event_bus = require("NeoAI.kernel.event_bus")
@@ -201,17 +203,35 @@ end
 local _do_send_round
 
 --- 发送一次请求（带持久流处理器 + 溢出恢复）
+--- 轮边界压力检查：上一轮工具结果已回写、下一轮请求尚未发出，此时做上下文压缩是
+--- 安全的（无并发写入）。长工具循环会在此逐轮累积压缩，避免耗尽上下文后撞溢出。
+--- 顺序：轮边界压缩 → 轮前刷新（MCP stale schema）→ 实际发送。
 --- @param agent table
 --- @param opts table|nil { extra_user? = string } extra_user 仅注入请求 wire（截断续写提示）
 --- @return Deferred resolve({ next_calls = table|nil, response = table })
 local function _send_round(agent, opts)
   -- 轮前刷新：若 MCP 工具因 schema 变化被标记 stale，先刷新定义并重绑定 agent.tools，
   -- 确保下一轮模型看到的工具签名与服务器一致（失败驱动的时序保证）。
-  local refresh_d = M.pre_round_refresh(agent)
-  if refresh_d then
-    return refresh_d:then_(function() return _do_send_round(agent, opts) end)
+  local function _refresh_then_send()
+    local refresh_d = M.pre_round_refresh(agent)
+    if refresh_d then
+      return refresh_d:then_(function() return _do_send_round(agent, opts) end)
+    end
+    return _do_send_round(agent, opts)
   end
-  return _do_send_round(agent, opts)
+  -- 轮边界压缩：allow_busy=true 放宽 idle 要求（此刻状态为 generating，且即将发送请求）。
+  -- 压缩失败/无可折叠内容均为 no-op，不阻断发送。
+  local compactor = require("NeoAI.core.session.compactor")
+  return compactor.maybe_compact(agent, { allow_busy = true }):then_(function()
+    -- 压缩后仍有压力则先提示（超限时让用户知道下一轮可能溢出/被压缩）
+    pcall(function()
+      require("NeoAI.services.status").check_pressure(agent)
+    end)
+    return _refresh_then_send()
+  end, function()
+    -- 压缩本身异常也不阻断发送（兜底走原路径）
+    return _refresh_then_send()
+  end)
 end
 
 --- 实际发送一轮请求

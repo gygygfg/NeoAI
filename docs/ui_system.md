@@ -64,17 +64,29 @@
 
 - **思考过程悬浮窗**（`reasoning_panel`）：`REASONING_CHUNK` 流式追加；正文开始/推理结束/生成结束自动关闭；
   同 tick 分片批量合并；光标不跟随时抑制弹出。
-- **工具参数悬浮窗**（`tool_args_panel`）：`TOOL_ARG_CHUNK` 实时打开/更新，`TOOL_ARG_COMPLETED`/生成结束关闭；
+- **工具参数悬浮窗**（`tool_args_panel`）：`TOOL_ARG_CHUNK` 实时打开；单个工具调用时对累积快照做差分，
+  把**新增参数分片**直接 `append` 到窗口尾部（与思考悬浮窗一致，不整段解析/重排）；多工具、名字变化或
+  参数被替换等不连续变化时回退整段重建（`set_text`）。`TOOL_ARG_COMPLETED`/生成结束关闭；
   参数接收阶段先收起思考悬浮窗（避免两窗重叠）；批量冲刷 + 取消标记（`_cancel_pending_tool_args`）。
 
 两者都：光标不跟随时不弹（`_cursor_within_follow_margin`）、`minimal` 浮窗、`foldenable=false`
-（避免继承全局折叠把内容收起）。
+（避免继承全局折叠把内容收起）。共享的 `float_stream_window` 还：按**显示行数**
+（`nvim_win_text_height`，含 wrap 折行）自适应高度、开启 `smoothscroll`、写入后**先增高再滚**，
+并把光标移到内容末尾（`G$`）后 `zb` 贴底，保证长单行/大量内容始终滚到最新尾部。
 
-### 4.6 输入框联动
+### 4.6 输入框联动与滚动
 
 主消息区（上）+ 输入 split（下，高度 3）。发送后切回主窗口并进入普通模式（生成期间可滚动浏览）；
 主体与输入框共用一套 chat 上下文键位（`_build_chat_actions`）。`input_box` 用 `virt_text` 渲染 `> `
 前缀（不用 `buftype=prompt`，避免与 nvim-cmp 冲突），并放开 `neoai_input` filetype 的补全。
+
+主消息区滚动统一走 `_scroll(delta)`（光标被钳制在 `[1, 行数]`）：`j`/`k` 与鼠标
+`<ScrollWheelUp>`/`<ScrollWheelDown>`（步长取 `mousescroll` 的 `ver` 值，默认 3）共用，
+因此滚轮不会像原生那样只滚视口、越过 buffer 末尾在下方留下空白。
+
+> **AUTO 立即生效**：`chat_service._request_mode` 在 Agent 忙碌（generating/tool_running）时，
+> 若目标为 AUTO 则**立即** `tool_service.set_auto_mode(true)`（内部自动批准当前待审批/排队项），
+> 而非等到本轮结束；其余模式切换（工具集/模型，含离开 AUTO）仍延迟到本轮结束应用。
 
 ### 4.7 后台收起 / 恢复
 
@@ -99,9 +111,9 @@
 | --- | --- |
 | `input_box` | 聊天输入框。`create`/`attach_window`/`focus`/`submit`/`on_submitted`/`clear`；`virt_text` 渲染 `>` 前缀；放开 `neoai_input` 文件类型补全。 |
 | `message_list` | 消息列表渲染。`render(buf, messages)`；`toggle_reasoning()`。 |
-| `float_stream_window` | 复用流式悬浮窗。`open(title,{filetype})`/`set_text`/`append`/`get_text`/`close`/`is_open`/`reset`；思考过程 / 接收参数 / 上下文压缩 / 计划蒸馏共享同一窗口。 |
+| `float_stream_window` | 复用流式悬浮窗。`open(title,{filetype})`/`set_text`/`append`/`get_text`/`close`/`is_open`/`reset`；思考过程 / 接收参数 / 上下文压缩 / 计划蒸馏共享同一窗口。窗口高度按显示行数（`nvim_win_text_height`）自适应，开启 `smoothscroll`，写入后先增高再滚、光标移到内容末尾后 `zb` 贴底。 |
 | `reasoning_panel` | 思考过程悬浮窗（`float_stream_window` 适配器）。`open`/`show`/`append`/`close`/`is_open`；`filetype=neoai_reasoning`。 |
-| `tool_args_panel` | 工具参数接收悬浮窗（`float_stream_window` 适配器，流式工具调用参数）。`open`/`show`/`close`/`is_open`/`get_content`/`reset`；`filetype=neoai_tool_args`。 |
+| `tool_args_panel` | 工具参数接收悬浮窗（`float_stream_window` 适配器，流式工具调用参数）。单工具时按分片增量 `append`，否则整段重建；`open`/`show`/`close`/`is_open`/`get_content`/`reset`；`filetype=neoai_tool_args`。 |
 | `model_picker` | 模型选择器（异步加载模型列表）。`open(callback)`。 |
 | `tool_approval` | 工具审批弹窗。`init()`；串行单槽位展示。 |
 | `ask_user` | 向用户提问弹窗。`init()`；经 `ask_user.set_ui` 注入。 |
@@ -119,6 +131,7 @@
 聊天上下文键位（`keymaps.chat`）：`insert`(i)、`quit`(q)、`send`、`cancel`(<Esc>)、`toggle_reasoning`(r)、
 `switch_model`(M)、`cycle_mode`(m)、`cycle_display`(<C-t>/T)、`reload_display`(<F5>)、
 `tool_approval`(<C-a>)、`approval.confirm/confirm_all/cancel/cancel_with_reason`。
+另有主消息区内部滚动映射：`j`/`k`、`<ScrollWheelUp>`/`<ScrollWheelDown>`（均走 `_scroll`）。
 
 ## 8. 相关文档
 

@@ -6,10 +6,218 @@
 
 local fs = require("NeoAI.utils.fs")
 local helpers = require("NeoAI.tools.builtin.tool_helpers")
+local config_store = require("NeoAI.kernel.config_store")
 
 local M = {}
 
+-- ========== 私有常量 ==========
+
+-- read_file 大文件保护的默认参数（可经 tools.read_file 覆盖）。
+-- 未指定 start_line/end_line 时，超过字符阈值的文件不再整篇回传，
+-- 改为返回语法树节点大纲（无 parser 时回退为截断预览），避免 AI
+-- 一次性意外读取超大文件、瞬间耗尽上下文。
+local DEFAULT_READ_GUARD = {
+  outline_threshold_chars = 500, -- 超过该字符数即触发保护
+  outline_max_nodes = 200, -- 大纲最多输出的结构节点数
+  outline_max_depth = 4, -- 大纲最大递归深度（相对根节点）
+  outline_preview_lines = 50, -- 无 parser 时的预览行数
+}
+
 -- ========== 私有函数 ==========
+
+--- 读取 read_file 保护参数（配置缺省时用默认值兜底）
+--- @return table
+local function _read_guard_opts()
+  local user = config_store.get("tools.read_file")
+  local opts = {}
+  for k, v in pairs(DEFAULT_READ_GUARD) do
+    local uv = type(user) == "table" and user[k] or nil
+    opts[k] = type(uv) == "number" and uv or v
+  end
+  return opts
+end
+
+--- 统计文本码点数（Blob / 异常时回退字节长度）
+--- @param s string
+--- @return number
+local function _char_count(s)
+  if type(s) ~= "string" then return 0 end
+  local ok, n = pcall(vim.fn.strchars, s)
+  if ok and type(n) == "number" then return n end
+  return #s
+end
+
+--- 统计行数
+--- @param s string
+--- @return number
+local function _line_count(s)
+  if s == "" then return 0 end
+  local n = 1
+  for _ in s:gmatch("\n") do
+    n = n + 1
+  end
+  return n
+end
+
+--- 按行范围从内容中切出某行文本（1-based，缺失返回 ""）
+--- @param content string
+--- @param row number 1-based 行号
+--- @return string
+local function _line_at(content, row)
+  if row < 1 then return "" end
+  local i = 0
+  for line in (content .. "\n"):gmatch("(.-)\n") do
+    i = i + 1
+    if i == row then return line end
+  end
+  return ""
+end
+
+--- 把内容切成行数组（供 filetype.match 的内容探测用），最多取前 max 行
+--- @param content string
+--- @param max number
+--- @return string[]
+local function _lines_of(content, max)
+  local out = {}
+  for line in (content .. "\n"):gmatch("(.-)\n") do
+    out[#out + 1] = line
+    if #out >= max then break end
+  end
+  return out
+end
+
+--- 生成语法树节点大纲：递归输出「有命名子节点」的结构性节点。
+--- 用 vim.treesitter.get_string_parser 直接从字符串解析，不创建/加载 buffer，
+--- 避免污染 buffer 列表或触发 LSP 附着等副作用。
+--- @param content string 文件内容
+--- @param filepath string 文件路径（用于推断 filetype/语言）
+--- @param opts table { max_nodes, max_depth }
+--- @return string|nil outline, string|nil err
+local function _build_outline(content, filepath, opts)
+  -- contents 需为行数组（vim.filetype.match 的契约），可辅助无扩展名文件的探测
+  local ft = vim.filetype.match({ filename = filepath, contents = _lines_of(content, 100) })
+  if not ft or ft == "" then
+    return nil, "无法识别文件类型"
+  end
+  local lang = vim.treesitter.language.get_lang(ft) or ft
+  local ok_parser, parser = pcall(vim.treesitter.get_string_parser, content, lang)
+  if not ok_parser or not parser then
+    return nil, "无可用 tree-sitter parser"
+  end
+  local ok_parse, trees = pcall(function()
+    return parser:parse()
+  end)
+  if not ok_parse or not trees or not trees[1] then
+    return nil, "语法树解析失败"
+  end
+  local root = trees[1]:root()
+  if not root then
+    return nil, "语法树为空"
+  end
+
+  local max_nodes = opts.max_nodes or 200
+  local max_depth = opts.max_depth or 4
+  local lines = {}
+  local count = 0
+  local truncated = false
+
+  local function render(node, depth)
+    if count >= max_nodes then
+      truncated = true
+      return
+    end
+    if depth > max_depth then
+      truncated = true
+      return
+    end
+    local sr, _, er = node:range()
+    local snippet = _line_at(content, sr + 1):gsub("^%s+", ""):gsub("%s+$", "")
+    if #snippet > 80 then snippet = snippet:sub(1, 80) .. "…" end
+    count = count + 1
+    local seg = string.rep("  ", depth) .. node:type()
+    if er + 1 > sr + 1 then seg = seg .. " [" .. (sr + 1) .. "-" .. (er + 1) .. "]" end
+    if snippet ~= "" then seg = seg .. ": " .. snippet end
+    lines[#lines + 1] = seg
+    for i = 0, node:named_child_count() - 1 do
+      if count >= max_nodes then
+        truncated = true
+        break
+      end
+      local child = node:named_child(i)
+      -- 仅保留有命名子节点的结构性节点，折叠纯叶子（identifier/number 等），
+      -- 否则大纲会被大量低信息量节点淹没。
+      if child and child:named_child_count() > 0 then
+        render(child, depth + 1)
+      end
+    end
+  end
+
+  -- 根节点自身不渲染，从顶层命名结构开始
+  for i = 0, root:named_child_count() - 1 do
+    if count >= max_nodes then
+      truncated = true
+      break
+    end
+    local child = root:named_child(i)
+    if child and child:named_child_count() > 0 then
+      render(child, 0)
+    end
+  end
+
+  if count == 0 then
+    return nil, "无可展示的结构节点"
+  end
+  if truncated then
+    lines[#lines + 1] = string.format("  …（节点较多，已省略；可用 start_line/end_line 读取具体区间）")
+  end
+  return table.concat(lines, "\n")
+end
+
+--- 无 parser 时的截断预览：取前 n 行
+--- @param content string
+--- @param n number
+--- @return string
+local function _preview_lines(content, n)
+  local out = {}
+  local i = 0
+  for line in (content .. "\n"):gmatch("(.-)\n") do
+    i = i + 1
+    if i > n then break end
+    out[#out + 1] = line
+  end
+  return table.concat(out, "\n")
+end
+
+--- 大文件保护：阈值内返回全文；超阈值优先返回语法树大纲，
+--- 无 parser 时回退为「提示 + 截断预览」。
+--- @param content string
+--- @param filepath string
+--- @return string
+local function _guarded_content(content, filepath)
+  local opts = _read_guard_opts()
+  local chars = _char_count(content)
+  if chars <= opts.outline_threshold_chars then
+    return content
+  end
+  local outline = _build_outline(content, filepath, {
+    max_nodes = opts.outline_max_nodes,
+    max_depth = opts.outline_max_depth,
+  })
+  local header = string.format(
+    "[文件较大] %s 共 %d 字符 / %d 行，超过阈值 %d，未返回全文以避免一次性读取过大。\n"
+      .. "请改用 start_line/end_line 读取所需行区间。",
+    filepath,
+    chars,
+    _line_count(content),
+    opts.outline_threshold_chars
+  )
+  if outline then
+    return header .. "\n\n语法树节点大纲：\n" .. outline
+  end
+  return header
+    .. string.format("\n（该文件无可用语法树解析器，以下为前 %d 行预览）：\n", opts.outline_preview_lines)
+    .. _preview_lines(content, opts.outline_preview_lines)
+end
 
 --- 异步文件操作公共接线：resolve → on_success，reject → on_error
 --- @param d Deferred
@@ -30,7 +238,10 @@ local file_tools = {}
 -- 读取文件（线程池异步）
 file_tools.read_file = helpers.define_tool(
   "read_file",
-  "读取文件内容。filepath 必填；start_line/end_line 可选指定行范围（1-based，含两端）。",
+  "读取文件内容。filepath 必填；start_line/end_line 可选指定行范围（1-based，含两端）。"
+    .. "未指定行范围且文件较大（默认超 500 字符）时不返回全文，"
+    .. "而返回该文件的语法树节点大纲（无解析器时为截断预览），"
+    .. "以避免一次性读取过大文件；此时请改用 start_line/end_line 读取所需区间。",
   {
     type = "object",
     properties = {
@@ -42,13 +253,15 @@ file_tools.read_file = helpers.define_tool(
   },
   function(args, on_success, on_error)
     local filepath = args.filepath
-    local d
     if args.start_line or args.end_line then
-      d = fs.read_file_lines_async(filepath, args.start_line or 0, args.end_line or 0)
-    else
-      d = fs.read_file_async(filepath)
+      -- 指定行范围：精确读取，不受大文件保护影响
+      _pipe(fs.read_file_lines_async(filepath, args.start_line or 0, args.end_line or 0), on_success, on_error)
+      return
     end
-    _pipe(d, on_success, on_error)
+    -- 无行范围：小文件返回全文；大文件返回语法树大纲（无 parser 时预览）
+    _pipe(fs.read_file_async(filepath), function(content)
+      on_success(_guarded_content(content, filepath))
+    end, on_error)
   end,
   { category = "file" }
 )
@@ -122,7 +335,10 @@ file_tools.edit_file = helpers.define_tool(
         for entry in edits_blob:gmatch("[^\2]+") do
           local old, new = entry:match("^(.-)\1(.*)$")
           if old and new ~= nil then
-            text = text:gsub(old:gsub("([%(%)%.%%%+%-%*%?%[%]%^%$])", "%%%1"), new)
+            -- new 作为替换串会被 gsub 解析其中的 % 转义（如 %d/%s 被吞），
+            -- 用函数替换使 new 按字面写入，避免破坏含 % 的内容。
+            local escaped = old:gsub("([%(%)%.%%%+%-%*%?%[%]%^%$])", "%%%1")
+            text = text:gsub(escaped, function() return new end)
           end
         end
         local w = io.open(path, "wb")

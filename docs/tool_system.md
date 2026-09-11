@@ -132,6 +132,12 @@ M.execute(agent, name, args, tool_call_id, opts)
 > `edit_file` 支持 `mode='write'/'append'/'edit'`。`confirm_file_change` 配合 `edit_file`：
 > 模型先看到「预览」结果，再调 `confirm_file_change(action='confirm'/'abandon'/'retry')` 确认。
 > 阻塞式文件 I/O（读大文件/递归搜索/写盘）经 `utils.work` 在线程池执行，不占用主线程。
+>
+> **`read_file` 大文件保护**：未指定 `start_line`/`end_line` 且文件字符数超过阈值（默认
+> `tools.read_file.outline_threshold_chars=500`）时，不返回全文，而返回该文件的 tree-sitter
+> **语法树节点大纲**（用 `get_string_parser` 从字符串解析，不加载 buffer）；该文件类型无解析器时
+> 回退为「提示 + 前 `outline_preview_lines` 行预览」。大纲仅输出有命名子节点的结构节点，
+> 受 `outline_max_nodes`/`outline_max_depth` 限制；指定行范围时不受该保护影响。
 
 ### 💻 Shell（shell.lua）
 

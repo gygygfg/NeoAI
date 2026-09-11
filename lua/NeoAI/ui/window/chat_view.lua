@@ -921,6 +921,9 @@ local function _clear_resize_reflow()
   state.last_table_width = nil
 end
 
+--- 主窗口滚动（前向声明：_set_keymaps 先于此定义即引用，须声明为局部变量）
+local _scroll
+
 --- 设置键位（主窗口）
 local function _set_keymaps()
   local keymap = require("NeoAI.ui.keymap")
@@ -928,10 +931,21 @@ local function _set_keymaps()
   -- 主窗口 j/k 滚动
   vim.keymap.set("n", "j", function() _scroll(1) end, { buffer = state.buf })
   vim.keymap.set("n", "k", function() _scroll(-1) end, { buffer = state.buf })
+  -- 鼠标滚轮：走 _scroll（光标被钳制在 [1, 行数]），视口不会越过 buffer 末尾。
+  -- 默认滚轮只滚视口不动光标，会把末行上方留白（下方出现 ~），这里改为移动光标。
+  -- 步长取用户 'mousescroll' 的 ver 值（默认 3）。
+  local function _wheel_step()
+    local s = vim.o.mousescroll or ""
+    local _, e = s:find("ver:")
+    local digits = e and s:sub(e + 1):match("^[0-9]+")
+    return math.max(1, tonumber(digits or "") or 3)
+  end
+  vim.keymap.set("n", "<ScrollWheelUp>", function() _scroll(-_wheel_step()) end, { buffer = state.buf })
+  vim.keymap.set("n", "<ScrollWheelDown>", function() _scroll(_wheel_step()) end, { buffer = state.buf })
 end
 
 --- 主窗口滚动
-local function _scroll(delta)
+_scroll = function(delta)
   if not state.win_id or not vim.api.nvim_win_is_valid(state.win_id) then return end
   local cur = vim.api.nvim_win_get_cursor(state.win_id)
   local total = vim.api.nvim_buf_line_count(state.buf)

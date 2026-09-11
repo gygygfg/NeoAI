@@ -231,6 +231,22 @@ local function _summarize(agent, shadow, cfg)
   end)
 end
 
+--- 压缩门禁：无效 agent / 正在压缩 / 已取消 一律拒绝。
+--- 默认要求 agent 处于 idle（回合边界压缩）；opts.allow_busy 为真时放宽该要求，
+--- 允许在 generating / tool_running 状态下压缩——供工具循环轮边界与溢出恢复使用。
+--- 调用方须自行保证此刻没有并发写入 agent.messages（工具结果已回写、下一轮请求尚未发出；
+--- 或请求已失败进入恢复路径）。
+--- @param agent table
+--- @param opts table|nil { allow_busy? = boolean }
+--- @return boolean
+local function _can_compact(agent, opts)
+  if not agent or agent._compacting then return false end
+  -- 已取消（ESC / 销毁）：不再压缩，避免与取消/清理竞态。
+  if agent.signal and agent.signal.aborted and agent.signal:aborted() then return false end
+  if not (opts and opts.allow_busy) and agent.state ~= "idle" then return false end
+  return true
+end
+
 --- 用检查点 user 消息替换被折叠区间
 --- @param agent table
 --- @param shadow table 被折叠消息
@@ -238,12 +254,20 @@ end
 local function _replace_with_checkpoint(agent, shadow, summary)
   local remove_count = #shadow
   if remove_count == 0 then return end
+  -- 记录被替换消息中「已同步（已落盘）」的条数：回合边界压缩时被折叠消息此前都已持久化，
+  -- 该值等于 remove_count；但工具循环中途压缩时，本回合新增消息尚未落盘，
+  -- 若仍按 remove_count 从 durable surface 删除会误删上一回合的历史并损坏会话。
+  local synced_count = 0
+  for _, m in ipairs(shadow) do
+    if m and m._synced then synced_count = synced_count + 1 end
+  end
   for _ = 1, remove_count do
     table.remove(agent.messages, 1)
   end
   local checkpoint = M.checkpoint_message(summary)
   checkpoint.ts = os.time()
   checkpoint.replaced_count = remove_count
+  checkpoint.replaced_synced_count = synced_count
   table.insert(agent.messages, 1, checkpoint)
   event_bus.emit(events.COMPACTION_COMPLETED, {
     agent_id = agent.id,
@@ -343,9 +367,12 @@ local function _compact(agent, cfg, opts)
   return step(0)
 end
 
---- 检查 token 压力并按需压缩（仅在 Agent 空闲时执行）
+--- 检查 token 压力并按需压缩。
+--- 默认仅在 Agent 空闲时执行（回合边界）；opts.allow_busy 为真时允许在工具循环
+--- 轮边界（generating/tool_running）执行——此时工具结果已回写、下一轮请求尚未发出，
+--- 可安全折叠历史并复用前缀缓存。
 --- @param agent table Agent
---- @param opts table|nil { context_cache? }
+--- @param opts table|nil { context_cache?, allow_busy? }
 --- @return Deferred resolve(boolean) 是否发生了压缩
 function M.maybe_compact(agent, opts)
   opts = opts or {}
@@ -353,7 +380,7 @@ function M.maybe_compact(agent, opts)
   if cfg.enabled == false then
     return async.resolve(false)
   end
-  if not agent or agent.state ~= "idle" or agent._compacting then
+  if not _can_compact(agent, opts) then
     return async.resolve(false)
   end
   local caps = _caps(agent)
@@ -370,18 +397,22 @@ function M.maybe_compact(agent, opts)
   return _compact(agent, cfg, { threshold = threshold })
 end
 
---- 强制压缩（上下文溢出恢复用）：跳过压力阈值判断，仍保留空闲/并发锁检查。
+--- 强制压缩（上下文溢出恢复用）：跳过压力阈值判断。
+--- 溢出恢复路径固定在 allow_busy 下执行（不要求 idle）：请求已因溢出失败，
+--- 此刻无并发写入，压缩安全；回合首轮与工具循环中途均会走此路径。
 --- 先裁剪；裁剪已足以回到窗口内则不再摘要；否则做最大化平衡头部缩减（retain 0）。
 --- @param agent table Agent
---- @param opts table|nil { context_cache? }
+--- @param opts table|nil { context_cache?, allow_busy? } allow_busy 缺省视为 true
 --- @return Deferred resolve(boolean) 是否发生了压缩
 function M.force_compact(agent, opts)
   opts = opts or {}
+  -- 溢出恢复默认放宽 idle：除非调用方显式 allow_busy=false，否则允许在循环中途压缩。
+  if opts.allow_busy == nil then opts.allow_busy = true end
   local cfg = _cfg(opts)
   if cfg.enabled == false then
     return async.resolve(false)
   end
-  if not agent or agent.state ~= "idle" or agent._compacting then
+  if not _can_compact(agent, opts) then
     return async.resolve(false)
   end
   if _prune(agent, cfg) and _estimate(agent) < _window_for(agent, cfg) then

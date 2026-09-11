@@ -143,6 +143,125 @@ tests.suite("tools", function(_, it)
     end)
   end)
 
+  it("read_file 大文件保护：小文件无行范围仍返回全文", function(t)
+    local registry = require("NeoAI.tools.registry")
+    registry.reset()
+    local config_store = require("NeoAI.kernel.config_store")
+    config_store.load({ tools = { approval = { mode = "auto_allow" } } })
+    local executor = require("NeoAI.tools.executor")
+    local file_ops = require("NeoAI.tools.builtin.file_ops")
+    registry.register_many(file_ops.get_tools())
+    local fs = require("NeoAI.utils.fs")
+    local path = "/tmp/neoai_read_small.lua"
+    local content = "local x = 1\n"
+    fs.write_file(path, content)
+    local done = false
+    executor.execute("read_file", { filepath = path, description = "读取小文件" }, {}):then_(function(r)
+      t.eq(content, r, "小文件应原样返回全文")
+      done = true
+    end, function(e)
+      t.true_(false, "不应失败: " .. tostring(e))
+      done = true
+    end)
+    t.true_(vim.wait(2000, function() return done end), "read_file 应完成")
+  end)
+
+  it("read_file 大文件保护：超阈值 .lua 返回语法树大纲且不含后段源码", function(t)
+    local registry = require("NeoAI.tools.registry")
+    registry.reset()
+    local config_store = require("NeoAI.kernel.config_store")
+    config_store.load({ tools = { approval = { mode = "auto_allow" } } })
+    local executor = require("NeoAI.tools.executor")
+    local file_ops = require("NeoAI.tools.builtin.file_ops")
+    registry.register_many(file_ops.get_tools())
+    local fs = require("NeoAI.utils.fs")
+    local path = "/tmp/neoai_read_big.lua"
+    -- 构造 > 500 字符、且后段含独特标记的 Lua 文件
+    local parts = { "local function alpha(a, b)", "  return a + b", "end" }
+    for i = 1, 60 do
+      parts[#parts + 1] = string.format("local var_%d = %d", i, i)
+    end
+    parts[#parts + 1] = "-- BIG_TAIL_MARKER"
+    local content = table.concat(parts, "\n") .. "\n"
+    t.true_(#content > 500, "测试文件应超过 500 字符")
+    fs.write_file(path, content)
+    local done = false
+    executor.execute("read_file", { filepath = path, description = "读取大文件" }, {}):then_(function(r)
+      t.matches("语法树节点大纲", r, "应返回语法树大纲")
+      t.matches("function_declaration", r, "大纲应含函数节点类型")
+      t.matches("start_line/end_line", r, "应提示改用行范围读取")
+      t.eq(nil, r:find("BIG_TAIL_MARKER", 1, true), "不应回传后段源码")
+      done = true
+    end, function(e)
+      t.true_(false, "不应失败: " .. tostring(e))
+      done = true
+    end)
+    t.true_(vim.wait(2000, function() return done end), "read_file 应完成")
+  end)
+
+  it("read_file 大文件保护：无 parser 文件返回截断预览", function(t)
+    local registry = require("NeoAI.tools.registry")
+    registry.reset()
+    local config_store = require("NeoAI.kernel.config_store")
+    config_store.load({ tools = { approval = { mode = "auto_allow" } } })
+    local executor = require("NeoAI.tools.executor")
+    local file_ops = require("NeoAI.tools.builtin.file_ops")
+    registry.register_many(file_ops.get_tools())
+    local fs = require("NeoAI.utils.fs")
+    local path = "/tmp/neoai_read_big.log"
+    local parts = {}
+    for i = 1, 120 do
+      parts[#parts + 1] = string.format("log line %d with some padding text", i)
+    end
+    parts[#parts + 1] = "LOG_TAIL_MARKER"
+    local content = table.concat(parts, "\n") .. "\n"
+    t.true_(#content > 500, "测试文件应超过 500 字符")
+    fs.write_file(path, content)
+    local done = false
+    executor.execute("read_file", { filepath = path, description = "读取大日志文件" }, {}):then_(function(r)
+      t.matches("预览", r, "无 parser 时应返回预览")
+      t.matches("log line 1 ", r, "预览应含开头内容")
+      t.eq(nil, r:find("LOG_TAIL_MARKER", 1, true), "不应回传末尾内容")
+      done = true
+    end, function(e)
+      t.true_(false, "不应失败: " .. tostring(e))
+      done = true
+    end)
+    t.true_(vim.wait(2000, function() return done end), "read_file 应完成")
+  end)
+
+  it("read_file 大文件保护：指定行范围时精确返回不受阈值影响", function(t)
+    local registry = require("NeoAI.tools.registry")
+    registry.reset()
+    local config_store = require("NeoAI.kernel.config_store")
+    config_store.load({ tools = { approval = { mode = "auto_allow" } } })
+    local executor = require("NeoAI.tools.executor")
+    local file_ops = require("NeoAI.tools.builtin.file_ops")
+    registry.register_many(file_ops.get_tools())
+    local fs = require("NeoAI.utils.fs")
+    local path = "/tmp/neoai_read_range.lua"
+    local parts = {}
+    for i = 1, 100 do
+      parts[#parts + 1] = string.format("local line_%d = %d", i, i)
+    end
+    fs.write_file(path, table.concat(parts, "\n") .. "\n")
+    local done = false
+    executor.execute("read_file", {
+      filepath = path,
+      start_line = 2,
+      end_line = 4,
+      description = "读取大文件指定行",
+    }, {}):then_(function(r)
+      t.eq("local line_2 = 2\nlocal line_3 = 3\nlocal line_4 = 4", r, "应精确返回指定行区间")
+      t.eq(nil, r:find("语法树节点大纲", 1, true), "指定行范围不应返回大纲")
+      done = true
+    end, function(e)
+      t.true_(false, "不应失败: " .. tostring(e))
+      done = true
+    end)
+    t.true_(vim.wait(2000, function() return done end), "read_file 应完成")
+  end)
+
   it("executor 别名 + file_exists", function(t)
     local tools = require("NeoAI.tools")
     local async = require("NeoAI.utils.async")
@@ -170,6 +289,34 @@ tests.suite("tools", function(_, it)
         t.matches("写入", r)
         print("  edit done")
       end)
+  end)
+
+  it("edit_file edits 字面 % 不被 gsub 吞（BUG 回归）", function(t)
+    local registry = require("NeoAI.tools.registry")
+    registry.reset()
+    local config_store = require("NeoAI.kernel.config_store")
+    config_store.load({ tools = { approval = { mode = "auto_allow" } } })
+    local executor = require("NeoAI.tools.executor")
+    local file_ops = require("NeoAI.tools.builtin.file_ops")
+    registry.register_many(file_ops.get_tools())
+    local fs = require("NeoAI.utils.fs")
+    local path = "/tmp/neoai_edit_percent.lua"
+    fs.write_file(path, "local t = OLD_MARKER\n")
+    local done = false
+    executor.execute("edit_file", {
+      filepath = path,
+      description = "替换含百分号的格式串",
+      edits = { { old_text = "OLD_MARKER", new_text = 'string.format("n=%d s=%s", 1, "x")' } },
+    }, {}):then_(function()
+      done = true
+    end, function(e)
+      t.true_(false, "不应失败: " .. tostring(e))
+      done = true
+    end)
+    t.true_(vim.wait(2000, function() return done end), "edit_file 应完成")
+    local content = fs.read_file(path) or ""
+    t.matches("n=%%d s=%%s", content, "字面 %%d/%%s 应原样写入，不被 gsub 吞掉")
+    t.eq(nil, content:find("n=d s=s", 1, true), "不应出现被吞后的 n=d s=s")
   end)
 
   it("shell run_command", function(t)

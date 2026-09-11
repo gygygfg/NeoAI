@@ -3,6 +3,10 @@
 --- 上下文溢出恢复：请求返回 context window exceeded 时自动压缩历史后重发。
 --- 对齐 deepseek-harness compaction 的 request-error 触发路径：
 --- 溢出不是直接报错结束，而是先压缩（复用前缀缓存）再重试。
+---
+--- 本模块被回合首轮（runtime._run_generation）与工具循环每一轮（tool_loop._send_round）
+--- 共同复用。压缩固定以 allow_busy=true 调用：请求已因溢出失败，此刻 agent 处于
+--- generating/tool_running（仍非 idle），但无并发写入，可安全折叠历史后重试。
 
 local async = require("NeoAI.utils.async")
 
@@ -41,7 +45,9 @@ function M.send_stream(agent, opts, on_chunk)
       if not agent._overflow_recovered and request.is_context_overflow(err) then
         agent._overflow_recovered = true
         local compactor = require("NeoAI.core.session.compactor")
-        return compactor.force_compact(agent):then_(function(compacted)
+        -- allow_busy=true：允许在工具循环中途（generating/tool_running）压缩，
+        -- 否则长循环耗尽上下文时压缩会被 idle 守卫拒绝、溢出错误直接抛出。
+        return compactor.force_compact(agent, { allow_busy = true }):then_(function(compacted)
           if compacted then
             return attempt()
           end

@@ -207,6 +207,12 @@ end
 --- @param summary string
 local function _splice(agent, window, summary)
   local remove_count = #window
+  -- 记录被替换消息中已落盘的条数（与 compactor 一致）：蒸馏在 plan→execute 边界触发，
+  -- 窗口消息通常已同步；仍按实际标记记录，保证 durable surface 删除与落盘状态严格对应。
+  local synced_count = 0
+  for _, m in ipairs(window) do
+    if m and m._synced then synced_count = synced_count + 1 end
+  end
   for _ = 1, remove_count do
     table.remove(agent.messages)
   end
@@ -214,6 +220,7 @@ local function _splice(agent, window, summary)
   local checkpoint = compactor.checkpoint_message(summary)
   checkpoint.ts = os.time()
   checkpoint.replaced_count = remove_count
+  checkpoint.replaced_synced_count = synced_count
   checkpoint.replaced_tail = true
   table.insert(agent.messages, checkpoint)
   event_bus.emit(events.PLAN_DISTILLED, {

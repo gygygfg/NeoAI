@@ -137,10 +137,16 @@ _run() 每轮：
   7. 护栏 check_round（重复调用提醒注入）
   8. set_state("generating") + TOOL_LOOP_FINISHED
   9. _send_round(agent) 请求下一轮
+     ├─ 轮边界压缩：maybe_compact({allow_busy=true})（工具结果已回写、下一轮请求前）
+     ├─ 轮前刷新（MCP stale schema）
      ├─ 有工具调用 → 回到第 1 步循环
      ├─ 无工具调用但被截断 → _drain_truncation 自动续写（见 4.5）
      └─ 无工具调用 → 若最后一条是 tool 消息则写 EMPTY_RESPONSE_MESSAGE → 结束
 ```
+
+> **轮边界压缩**：`_send_round` 在真正发送前先调 `compactor.maybe_compact(agent, { allow_busy = true })`。
+> 此刻上一轮工具结果已回写、下一轮请求尚未发出，无并发写入，折叠历史安全；长工具循环因此逐轮
+> 收敛上下文。压缩为 no-op（低于阈值/无可折叠）时不阻断发送，压缩异常也兜底走原发送路径。
 
 ### 4.5 截断续写（_drain_truncation）
 
@@ -198,25 +204,40 @@ API 兼容且前缀缓存确定。
 
 ## 6. 上下文压缩（core/session/compactor）
 
-`compactor.maybe_compact(agent)` 在每次新一步前做压力检查：
+`compactor.maybe_compact(agent, opts)` 做 token 压力检查（两处触发）：
 
-- 达到 `context_window * threshold_ratio` 阈值时折叠最早的整段历史，保留最近尾部（retain 预算）。
-  其中 `context_window` 缺省按模型能力表推导（用户显式非默认配置优先），显式缓存模型自动取
-  更保守的阈值/保留比。实例模型参考 [model_policy.md](model_policy.md)。
+- **回合边界**：`runtime.run` 在新一步前调用（不传 `allow_busy`，要求 `idle`）。
+- **工具循环内部**：`tool_loop._send_round` 每轮发送前调用 `maybe_compact(agent, { allow_busy = true })`——
+  上一轮工具结果已回写、下一轮请求尚未发出，此刻折叠历史安全（无并发写入）。长循环因此逐轮收敛，
+  不至于耗尽上下文后撞溢出。
+
+门禁 `_can_compact(agent, opts)`：无效 agent / `_compacting` / 信号已 abort → 拒绝；
+`opts.allow_busy` 为真时放宽 `idle` 要求（允许在 `generating`/`tool_running` 下压缩）。
+
+达到 `context_window * threshold_ratio` 阈值时折叠最早的整段历史，保留最近尾部（retain 预算）。
+其中 `context_window` 缺省按模型能力表推导（用户显式非默认配置优先），显式缓存模型自动取
+更保守的阈值/保留比。实例模型参考 [model_policy.md](model_policy.md)。
+
 - **辅助摘要调用**：`_summarize` 逐字节回放会话前缀（相同系统提示、工具 schema、被折叠区消息），
   再把压缩指令作为最后的 user 消息追加 → 复用 provider 的热前缀缓存。
 - **检查点替换**：用带 `<compacted-summary>` 标签的 checkpoint user 消息**替换被折叠区间**
-  （`_replace_with_checkpoint`）。后续请求在替换点之前的未变前缀仍可复用缓存。
-- 仅替换而非追加（不产生第二份历史副本）。成功后发射 `COMPACTION_COMPLETED`。
+  （`_replace_with_checkpoint`），并记录 `replaced_count` 与 `replaced_synced_count`（被替换消息中
+  **已落盘**的条数；回合边界压缩时二者相等，循环中途压缩时前者大于后者）。
+  后续请求在替换点之前的未变前缀仍可复用缓存。仅替换而非追加（不产生第二份历史副本）。
+  成功后发射 `COMPACTION_COMPLETED`。
 
-`force_compact`（溢出恢复用）跳过压力阈值判断，保留空闲/并发锁检查。
+`force_compact`（溢出恢复用）跳过压力阈值判断；**缺省 `allow_busy = true`**，保证溢出恢复在
+回合首轮与工具循环中途（`generating`/`tool_running`）都能真正压缩——先裁剪，裁剪已足以回到窗口内
+则不再摘要，否则做一次最大化的平衡头部缩减（retain 0，只保留最新一个不可分单元）。
 
 ## 7. 溢出恢复（recovery.lua）
 
-`recovery.send_stream(agent, opts, on_chunk)` 包裹 `request.send_stream`：
+`recovery.send_stream(agent, opts, on_chunk)` 包裹 `request.send_stream`，被回合首轮
+（`runtime._run_generation`）与工具循环每一轮（`tool_loop._send_round`）共用：
 
-- 请求返回 `context window exceeded` 时（`request.is_context_overflow`），先 `force_compact` 压缩历史，
-  再重新请求（`attempt()` 重试）。
+- 请求返回 `context window exceeded` 时（`request.is_context_overflow`），先 `force_compact(agent, { allow_busy = true })`
+  压缩历史，再重新请求（`attempt()` 重试）。`allow_busy = true` 是关键：请求已因溢出失败、
+  agent 仍处于 `generating`/`tool_running`，若不放宽 `idle` 守卫，压缩会被拒绝、溢出错误直接抛出。
 - 每轮请求最多触发一次压缩恢复；成功后重置 `agent._overflow_recovered = false`，允许后续再次恢复。
 - 无可折叠内容时原样抛回溢出错误。
 
