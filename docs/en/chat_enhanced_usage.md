@@ -23,9 +23,9 @@ The chat window = **main message area (top)** + **input box (bottom, split, heig
 - Main message area: `expr` folds (reasoning / each tool call block / tool results each become independent
   folds), with `foldenable` explicitly enabled.
   When the cursor is near the bottom (within the last 5 lines), streaming output follows along automatically;
-  `j`/`k` and the mouse wheel go through the same scroll logic
-  (`_scroll`, with the cursor clamped to `[1, line count]`), stopping at the end of the buffer without
-  scrolling past the last line and leaving blank space below.
+  `j`/`k` move the cursor by line (`_scroll`), while the mouse wheel uses `<C-E>`/`<C-Y>` to smoothly scroll the
+  viewport (`_wheel_scroll`), clamping the blank space below the last line to `ui.chat.mousescroll_max_blank`
+  (default 3) lines instead of leaving more and more white space like the native behavior.
 - Input box: a regular buffer with a `virt_text`-rendered `> ` prefix (not using `buftype=prompt`, to avoid
   conflicts with nvim-cmp); completion is enabled for the `neoai_input` filetype.
 
@@ -44,7 +44,7 @@ The chat window = **main message area (top)** + **input box (bottom, split, heig
 | Hot-reload display mode | `<F5>` | Reload the current display-mode plugin |
 | Approve plan | — | AI calls `exit_plan_mode` (opens an approval window for confirmation) or run `:NeoAIApprovePlan` |
 | Tool approval | `<C-a>` | Confirm inside the approval popup |
-| Scroll | `j` / `k` / mouse wheel | Cursor-movement style scrolling (never past the end of the buffer) |
+| Scroll | `j` / `k` / mouse wheel | `j`/`k` move the cursor by line; the wheel smoothly scrolls the viewport, with blank space below the last line capped at `ui.chat.mousescroll_max_blank` lines |
 
 ## 4. Streaming Updates and Floating Windows
 

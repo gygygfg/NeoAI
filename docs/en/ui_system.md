@@ -92,10 +92,19 @@ normal mode (you can scroll and browse during generation); the main body and the
 context keymaps (`_build_chat_actions`). `input_box` renders the `> ` prefix with `virt_text` (it does not use
 `buftype=prompt`, to avoid conflicts with nvim-cmp), and enables completion for the `neoai_input` filetype.
 
-Scrolling in the main message area uniformly goes through `_scroll(delta)` (the cursor is clamped to `[1, line count]`):
-`j`/`k` and the mouse `<ScrollWheelUp>`/`<ScrollWheelDown>` share it (the step size takes the `ver` value of
-`mousescroll`, default 3), so the mouse wheel does not, as it does natively, scroll only the viewport and leave blank
-space below when going past the end of the buffer.
+Scrolling in the main message area uses two paths:
+
+- **`j` / `k`**: go through `_scroll(delta)`, moving the cursor by line (clamped to `[1, line count]`).
+- **Mouse wheel `<ScrollWheelUp>` / `<ScrollWheelDown>`**: go through `_wheel_scroll(delta)`, using
+  `<C-E>`/`<C-Y>` to smoothly scroll the viewport (preserving the native wheel feel); the step size takes the `ver`
+  value of `mousescroll` (default 3). After scrolling it syncs the cursor (moved to the last line when at the bottom to
+  keep following; moved to the top visible line when reviewing history to cancel following).
+
+To avoid the native wheel scrolling past the end of the buffer and leaving a large blank area below the last line,
+when scrolling down with the last line already visible `_wheel_scroll` clamps the blank lines below the last line to
+`ui.chat.mousescroll_max_blank` (default 3; `0` means strictly bottom-aligned): if there is too much blank space it
+scrolls back, and if too little it adds breathing room. The blank count is computed with `nvim_win_text_height`
+(correctly accounting for folds and wrapped lines), minus the 1 line taken by the winbar.
 
 > **AUTO takes effect immediately**: while the Agent is busy (generating/tool_running), `chat_service._request_mode`
 > calls `tool_service.set_auto_mode(true)` **immediately** if the target is AUTO (internally auto-approving the current
@@ -148,8 +157,9 @@ box). `show_keymaps()` displays the current keymap configuration.
 Chat context keymaps (`keymaps.chat`): `insert`(i), `quit`(q), `send`, `cancel`(<Esc>), `toggle_reasoning`(r),
 `switch_model`(M), `cycle_mode`(m), `cycle_display`(<C-t>/T), `reload_display`(<F5>),
 `tool_approval`(<C-a>), `approval.confirm/confirm_all/cancel/cancel_with_reason`.
-There are also internal scrolling mappings for the main message area: `j`/`k`, `<ScrollWheelUp>`/`<ScrollWheelDown>`
-(both go through `_scroll`).
+There are also internal scrolling mappings for the main message area: `j`/`k` (through `_scroll`, moving the cursor by
+line), and `<ScrollWheelUp>`/`<ScrollWheelDown>` (through `_wheel_scroll`, smoothly scrolling the viewport while clamping
+the blank space below the last line to `ui.chat.mousescroll_max_blank` lines).
 
 ## 8. Related Documents
 

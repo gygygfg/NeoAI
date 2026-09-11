@@ -82,9 +82,17 @@
 主体与输入框共用一套 chat 上下文键位（`_build_chat_actions`）。`input_box` 用 `virt_text` 渲染 `> `
 前缀（不用 `buftype=prompt`，避免与 nvim-cmp 冲突），并放开 `neoai_input` filetype 的补全。
 
-主消息区滚动统一走 `_scroll(delta)`（光标被钳制在 `[1, 行数]`）：`j`/`k` 与鼠标
-`<ScrollWheelUp>`/`<ScrollWheelDown>`（步长取 `mousescroll` 的 `ver` 值，默认 3）共用，
-因此滚轮不会像原生那样只滚视口、越过 buffer 末尾在下方留下空白。
+主消息区滚动分两套：
+
+- **`j` / `k`**：走 `_scroll(delta)`，按行移动光标（光标被钳制在 `[1, 行数]`）。
+- **鼠标滚轮 `<ScrollWheelUp>` / `<ScrollWheelDown>`**：走 `_wheel_scroll(delta)`，用 `<C-E>`/`<C-Y>`
+  原生平滑滚动视口（保留滚轮手感），步长取 `mousescroll` 的 `ver` 值（默认 3）。滚轮滚动后会同步
+  光标（滚到底时置于末行以保持跟随；回看历史时置于视口首行以取消跟随）。
+
+为避免原生滚轮越过 buffer 末尾、在末行下方留出大片空白，向下滚且末行已可见时，
+`_wheel_scroll` 会把末行下方的空白行数钳制到 `ui.chat.mousescroll_max_blank`（默认 3，`0` 为严格贴底）：
+空白过多则回滚、不足则补足呼吸空间。空白行数用 `nvim_win_text_height` 计算（正确考虑折叠与折行），
+并减去 winbar 占用的 1 行。
 
 > **AUTO 立即生效**：`chat_service._request_mode` 在 Agent 忙碌（generating/tool_running）时，
 > 若目标为 AUTO 则**立即** `tool_service.set_auto_mode(true)`（内部自动批准当前待审批/排队项），
@@ -133,7 +141,9 @@
 聊天上下文键位（`keymaps.chat`）：`insert`(i)、`quit`(q)、`send`、`cancel`(<Esc>)、`toggle_reasoning`(r)、
 `switch_model`(M)、`cycle_mode`(m)、`cycle_display`(<C-t>/T)、`reload_display`(<F5>)、
 `tool_approval`(<C-a>)、`approval.confirm/confirm_all/cancel/cancel_with_reason`。
-另有主消息区内部滚动映射：`j`/`k`、`<ScrollWheelUp>`/`<ScrollWheelDown>`（均走 `_scroll`）。
+另有主消息区内部滚动映射：`j`/`k`（走 `_scroll`，按行移动光标）、
+`<ScrollWheelUp>`/`<ScrollWheelDown>`（走 `_wheel_scroll`，平滑滚动视口并把末行下方留白钳制在
+`ui.chat.mousescroll_max_blank` 行内）。
 
 ## 8. 相关文档
 

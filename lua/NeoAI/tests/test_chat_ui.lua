@@ -1619,7 +1619,7 @@ tests.suite("chat_ui", function(_, it)
     tool_args_panel.reset()
   end)
 
-  it("主界面鼠标滚轮滚动不越过 buffer 末尾", function(t)
+  it("主界面鼠标滚轮平滑滚动且末行下方留白不超上限", function(t)
     local chat_view = require("NeoAI.ui.window.chat_view")
     local chat_service = require("NeoAI.services.chat_service")
     chat_view.reset()
@@ -1627,32 +1627,88 @@ tests.suite("chat_ui", function(_, it)
 
     local opened = chat_view.open()
     local agent = chat_service.get_current_agent()
+    -- 预置足够长的内容（远超窗口高度），使视口需要滚动
+    local body = {}
+    for i = 1, 200 do body[#body + 1] = "content line " .. i end
     agent.messages = {
       { role = "user", content = "q1" },
-      { role = "assistant", content = "第一行\n第二行\n第三行\n第四行\n第五行\n第六行" },
+      { role = "assistant", content = table.concat(body, "\n") },
     }
     chat_view.refresh()
     vim.api.nvim_set_current_win(opened.win_id)
 
     local total = vim.api.nvim_buf_line_count(opened.buf)
-    -- 滚轮向下映射应存在且移动光标（不越界）
+    local win_h = vim.api.nvim_win_get_height(opened.win_id)
+    local wb = vim.wo[opened.win_id].winbar
+    local avail = win_h - ((wb ~= nil and wb ~= "") and 1 or 0)
+    t.true_(total > avail + 5, "前置条件：buffer 应远超窗口高度，实际 " .. total .. "/" .. avail)
+
+    -- 滚轮映射应存在
     local fwd = vim.fn.maparg("<ScrollWheelDown>", "n", false, true)
     local back = vim.fn.maparg("<ScrollWheelUp>", "n", false, true)
     t.not_nil(fwd.callback, "主界面应注册 <ScrollWheelDown> 映射")
     t.not_nil(back.callback, "主界面应注册 <ScrollWheelUp> 映射")
 
-    -- 停在顶部，连续向下滚：光标至多到末行，绝不超过 buffer 行数
+    -- 顶部连续向下滚：中间过程应真的滚动视口（不再是"光标撞边才动"），
+    -- 且最终停在底部（末行可见）
     vim.api.nvim_win_set_cursor(opened.win_id, { 1, 0 })
-    for _ = 1, 20 do fwd.callback() end
-    t.eq(total, vim.api.nvim_win_get_cursor(opened.win_id)[1], "连续向下滚应停在末行")
-    local topline = vim.api.nvim_win_call(opened.win_id, function() return vim.fn.line("w0") end)
-    t.true_(topline <= total, "视口首行不应越过末行（topline=" .. topline .. "/" .. total .. "）")
+    local toplines = {}
+    for _ = 1, 150 do
+      fwd.callback()
+      toplines[#toplines + 1] = vim.api.nvim_win_call(opened.win_id, function() return vim.fn.line("w0") end)
+    end
+    t.true_(toplines[1] > 1 or toplines[2] > toplines[1],
+      "向下滚应平滑移动视口（而不是只在光标撞边时跳动）")
+    local topline_end = vim.api.nvim_win_call(opened.win_id, function() return vim.fn.line("w0") end)
+    t.true_(topline_end > 1, "连续向下滚后视口应已下移")
 
-    -- 再向上滚：光标回到首行且不越界
-    for _ = 1, 20 do back.callback() end
-    t.eq(1, vim.api.nvim_win_get_cursor(opened.win_id)[1], "连续向上滚应停在首行")
-    local topline2 = vim.api.nvim_win_call(opened.win_id, function() return vim.fn.line("w0") end)
-    t.eq(1, topline2, "视口首行应为第 1 行（不越界）")
+    -- 末行可见，且下方留白不超过配置上限（默认 3）
+    local ws_end = vim.api.nvim_win_call(opened.win_id, function()
+      return { w0 = vim.fn.line("w0"), wd = vim.fn.line("w$") }
+    end)
+    t.eq(total, ws_end.wd, "连续向下滚后应停在 buffer 末行（末行可见）")
+    local blank = vim.api.nvim_win_call(opened.win_id, function()
+      local topline = vim.fn.winsaveview().topline
+      local h = vim.api.nvim_win_text_height(opened.win_id, {
+        start_row = topline - 1, end_row = total - 1,
+      })
+      return avail - h.all
+    end)
+    t.true_(blank >= 0 and blank <= 3,
+      "末行下方留白应被钳制在 [0, 3] 行内，实际 " .. blank)
+
+    -- 继续向下滚不应让留白增长（不应越滚越白）
+    for _ = 1, 10 do fwd.callback() end
+    local blank2 = vim.api.nvim_win_call(opened.win_id, function()
+      local topline = vim.fn.winsaveview().topline
+      local h = vim.api.nvim_win_text_height(opened.win_id, {
+        start_row = topline - 1, end_row = total - 1,
+      })
+      return avail - h.all
+    end)
+    t.true_(blank2 <= 3, "持续向下滚时留白不应突破上限，实际 " .. blank2)
+
+    -- 向上滚：视口平滑上移，光标跟到视口首行附近
+    local before_up = vim.api.nvim_win_call(opened.win_id, function() return vim.fn.line("w0") end)
+    back.callback()
+    local after_up = vim.api.nvim_win_call(opened.win_id, function() return vim.fn.line("w0") end)
+    t.true_(after_up < before_up, "向上滚应把视口首行上移（平滑滚动）")
+
+    -- 向上回看时视为"不跟随"：流式新内容到达后视口不应被拽回底部
+    local event_bus = require("NeoAI.kernel.event_bus")
+    local events = require("NeoAI.kernel.events")
+    local last = agent.messages[#agent.messages]
+    last.content = last.content .. "\n流式追加行"
+    event_bus.emit(events.MESSAGE_UPDATED, { agent_id = agent.id, message = last })
+    chat_view.flush()
+    local topline_after_stream = vim.api.nvim_win_call(opened.win_id, function() return vim.fn.line("w0") end)
+    t.true_(topline_after_stream < vim.api.nvim_buf_line_count(opened.buf),
+      "向上回看时流式更新不应把视口拽到底部（topline=" .. topline_after_stream .. "）")
+
+    -- 连续向上滚不越界（topline >= 1）
+    for _ = 1, 200 do back.callback() end
+    local topline_top = vim.api.nvim_win_call(opened.win_id, function() return vim.fn.line("w0") end)
+    t.eq(1, topline_top, "连续向上滚应停在 buffer 首行（视口首行 = 1）")
 
     chat_view.reset()
     chat_service.reset()

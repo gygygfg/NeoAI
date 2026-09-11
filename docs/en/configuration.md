@@ -127,6 +127,7 @@ context_cache = {
 | `colors` | Per-segment highlights | User/AI/reasoning/title colors |
 | `tree` | `{foldenable=false, ...auto_close_on_select=true}` | Session tree folding/auto-close |
 | `input_box` | `{idle_height=1, min_height=5, max_ratio=0.8}` | Input box height (idle/focused/growth cap) |
+| `chat` | `{mousescroll_max_blank=3}` | Max blank lines allowed below the last line when the wheel reaches the bottom (0 = strictly bottom-aligned) |
 | `trajectory` | `{log_dir=".../NeoAI/logs"}` | Log directory for the trajectory display mode |
 | `statusline` | `{enabled=true, winbar=true, parts={mode,model,usage,cache,capacity}, separator=" ", colors=...}` | lualine statusline |
 

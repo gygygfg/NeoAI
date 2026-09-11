@@ -124,6 +124,7 @@ context_cache = {
 | `colors` | 各段高亮 | 用户/AI/推理/标题色 |
 | `tree` | `{foldenable=false, ...auto_close_on_select=true}` | 会话树折叠/自动关闭 |
 | `input_box` | `{idle_height=1, min_height=5, max_ratio=0.8}` | 输入框高度（空闲/聚焦/增长上限） |
+| `chat` | `{mousescroll_max_blank=3}` | 鼠标滚轮滚到底时末行下方允许的最大空白行数（0=严格贴底） |
 | `trajectory` | `{log_dir=".../NeoAI/logs"}` | 轨迹显示模式的日志保存目录 |
 | `statusline` | `{enabled=true, winbar=true, parts={mode,model,usage,cache,capacity}, separator=" ", colors=...}` | lualine 状态栏 |
 

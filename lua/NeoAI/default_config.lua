@@ -222,6 +222,10 @@ local DEFAULT_CONFIG = {
       min_height = 5, -- 光标在输入框内时的最小高度（起始）
       max_ratio = 0.8, -- 输入框随内容增长的上限（主窗口高度占比）
     },
+    chat = {
+      -- 鼠标滚轮滚到底部时，末行下方允许留出的最大空白行数（0 = 严格贴底不留白）
+      mousescroll_max_blank = 3,
+    },
     trajectory = {
       log_dir = vim.fn.stdpath("cache") .. "/NeoAI/logs", -- 轨迹日志保存目录（可自定义；缺省 ~/.cache/nvim/NeoAI/logs）
     },

@@ -940,33 +940,121 @@ end
 --- 主窗口滚动（前向声明：_set_keymaps 先于此定义即引用，须声明为局部变量）
 local _scroll
 
+--- 主窗口鼠标滚轮滚动（前向声明，同上）
+local _wheel_scroll
+
+--- 鼠标滚轮步长：取用户 'mousescroll' 的 ver 值（默认 3）
+local function _wheel_step()
+  local s = vim.o.mousescroll or ""
+  local _, e = s:find("ver:")
+  local digits = e and s:sub(e + 1):match("^[0-9]+")
+  return math.max(1, tonumber(digits or "") or 3)
+end
+
+--- 滚轮滚到底部时末行下方允许的最大空白行数（ui.chat.mousescroll_max_blank，默认 3）
+local function _wheel_max_blank()
+  local cfg = config_store.get("ui.chat") or {}
+  local n = tonumber(cfg.mousescroll_max_blank)
+  if n == nil then n = 3 end
+  return math.max(0, math.floor(n))
+end
+
+--- 滚到底部时视口在 buffer 末行下方留出的空白行数（= 内容区高度 - 自视口首行到末行的屏幕行数）。
+--- 用 nvim_win_text_height 计算，正确考虑折叠与折行（buffer 行数 != 屏幕行数）。
+--- @return number|nil 无法测量（无有效窗口 / API 失败）时返回 nil
+local function _blank_below_end()
+  if not state.win_id or not vim.api.nvim_win_is_valid(state.win_id) then return nil end
+  if not state.buf or not vim.api.nvim_buf_is_valid(state.buf) then return nil end
+  local v = vim.fn.winsaveview()
+  local topline = v.topline
+  if not topline or topline < 1 then return nil end
+  local total = vim.api.nvim_buf_line_count(state.buf)
+  if total < 1 then return nil end
+  local ok, h = pcall(vim.api.nvim_win_text_height, state.win_id, {
+    start_row = topline - 1,
+    end_row = total - 1,
+  })
+  if not ok then return nil end
+  local rows = h and h.all or nil
+  if not rows then return nil end
+  -- 内容区高度：窗口高减去 winbar 占用的 1 行
+  local avail = vim.api.nvim_win_get_height(state.win_id)
+  local wb = vim.wo[state.win_id].winbar
+  if wb ~= nil and wb ~= "" then avail = avail - 1 end
+  if avail < 1 then avail = 1 end
+  return math.max(0, avail - rows)
+end
+
 --- 设置键位（主窗口）
 local function _set_keymaps()
   local keymap = require("NeoAI.ui.keymap")
   keymap.register_context("chat", _build_chat_actions(), state.buf)
-  -- 主窗口 j/k 滚动
+  -- 主窗口 j/k 滚动（按行移动光标）
   vim.keymap.set("n", "j", function() _scroll(1) end, { buffer = state.buf })
   vim.keymap.set("n", "k", function() _scroll(-1) end, { buffer = state.buf })
-  -- 鼠标滚轮：走 _scroll（光标被钳制在 [1, 行数]），视口不会越过 buffer 末尾。
-  -- 默认滚轮只滚视口不动光标，会把末行上方留白（下方出现 ~），这里改为移动光标。
-  -- 步长取用户 'mousescroll' 的 ver 值（默认 3）。
-  local function _wheel_step()
-    local s = vim.o.mousescroll or ""
-    local _, e = s:find("ver:")
-    local digits = e and s:sub(e + 1):match("^[0-9]+")
-    return math.max(1, tonumber(digits or "") or 3)
-  end
-  vim.keymap.set("n", "<ScrollWheelUp>", function() _scroll(-_wheel_step()) end, { buffer = state.buf })
-  vim.keymap.set("n", "<ScrollWheelDown>", function() _scroll(_wheel_step()) end, { buffer = state.buf })
+  -- 鼠标滚轮：走 _wheel_scroll 原生平滑滚动视口（保留滚轮手感），
+  -- 并把滚到底部时末行下方的空白限制在 ui.chat.mousescroll_max_blank 行内。
+  vim.keymap.set("n", "<ScrollWheelUp>", function() _wheel_scroll(-_wheel_step()) end, { buffer = state.buf })
+  vim.keymap.set("n", "<ScrollWheelDown>", function() _wheel_scroll(_wheel_step()) end, { buffer = state.buf })
 end
 
---- 主窗口滚动
+--- 主窗口按行滚动（供 j/k 使用）：移动光标，并被钳制在 [1, 行数] 内。
 _scroll = function(delta)
   if not state.win_id or not vim.api.nvim_win_is_valid(state.win_id) then return end
   local cur = vim.api.nvim_win_get_cursor(state.win_id)
   local total = vim.api.nvim_buf_line_count(state.buf)
   local new_line = math.max(1, math.min(total, cur[1] + delta))
   vim.api.nvim_win_set_cursor(state.win_id, { new_line, cur[2] })
+end
+
+--- 主窗口鼠标滚轮滚动：用 <C-E>/<C-Y> 平滑滚动视口（原生手感，会带动光标移出屏幕外），
+--- 并在滚到底部时把末行下方的空白钳制在 max_blank 行内。
+--- @param delta number 正数向下、负数向上
+_wheel_scroll = function(delta)
+  local win = state.win_id
+  if not win or not vim.api.nvim_win_is_valid(win) then return end
+  if not state.buf or not vim.api.nvim_buf_is_valid(state.buf) then return end
+  -- 窗口当前显示的不是聊天 buffer（用户 :bnext 切走后）时，不作用于聊天 buffer
+  if vim.api.nvim_win_get_buf(win) ~= state.buf then return end
+  local step = math.max(1, math.floor(math.abs(delta or 0)))
+  local max_blank = _wheel_max_blank()
+  local total = vim.api.nvim_buf_line_count(state.buf)
+  local new_topline, at_end
+
+  vim.api.nvim_win_call(win, function()
+    -- 先做一次原生平滑滚动（<C-E> 向下 / <C-Y> 向上），保留滚轮手感。
+    vim.cmd("silent! normal! " .. step .. (delta > 0 and "\5" or "\25"))
+    -- 向下滚且已触及 buffer 末尾（末行可见）时，把末行下方的空白钳制到 max_blank。
+    -- 留白过多则上滚（<C-Y>）、不足则下滚（<C-E>）；单次修正不超过 step，
+    -- 并用有界循环迭代，保证即使留白一上来就超出 step 也能收敛（否则回滚会
+    -- 把本次前进完全抵消、停在原地）。
+    if delta > 0 and vim.fn.line("w$") >= total then
+      for _ = 1, 4 do
+        local blank = _blank_below_end() -- 需在 win_call 内调用（winsaveview 读当前窗口）
+        if blank == nil then break end
+        local diff = blank - max_blank
+        if diff == 0 then break end
+        local fix = math.min(math.abs(diff), step)
+        if fix < 1 then break end
+        vim.cmd("silent! normal! " .. fix .. (diff > 0 and "\25" or "\5"))
+      end
+    end
+    local v = vim.fn.winsaveview()
+    new_topline = v.topline
+    at_end = vim.fn.line("w$") >= total
+  end)
+
+  -- <C-E>/<C-Y> 只移动视口，不移动光标；而流式跟随语义依赖光标位置
+  -- （_cursor_within_follow_margin 读实时光标），这里同步光标：
+  --   滚到底（末行可见）→ 光标放到末行，保持跟随（新内容继续自动滚动）；
+  --   回看上方历史 → 光标搬到视口首行，使跟随判定为 false，
+  --   否则新到达的流仍会把视口拽回底部。
+  if delta > 0 and at_end then
+    pcall(vim.api.nvim_win_set_cursor, win, { total, 0 })
+  elseif new_topline and new_topline >= 1 then
+    pcall(vim.api.nvim_win_set_cursor, win, { math.min(new_topline, total), 0 })
+  end
+  state.following = _cursor_within_follow_margin()
 end
 
 -- ========== 公开 API ==========
