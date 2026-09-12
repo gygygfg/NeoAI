@@ -332,4 +332,37 @@ tests.suite("plan_mode", function(_, it)
     tool_service.reset()
     todo.reset()
   end)
+
+  it("AUTO 模式下 enter_plan_mode 自动退出 AUTO 并转入 PLAN", function(t)
+    local config_store = require("NeoAI.kernel.config_store")
+    config_store.load({ tools = { approval = { mode = "prompt", per_tool = {} } } })
+    local chat_service = require("NeoAI.services.chat_service")
+    local tool_service = require("NeoAI.services.tool_service")
+    local pm = require("NeoAI.tools.builtin.plan_mode")
+    chat_service.reset()
+    tool_service.reset()
+
+    local agent = chat_service.new_session({})
+    -- 先切到 AUTO 模式
+    tool_service.set_auto_mode(true)
+    t.true_(tool_service.is_auto_mode())
+    t.eq("auto", chat_service.get_mode())
+
+    -- AI 在 AUTO 模式下调用 enter_plan_mode 工具
+    local tool
+    for _, tl in ipairs(pm.get_tools()) do
+      if tl.name == "enter_plan_mode" then tool = tl end
+    end
+    t.not_nil(tool, "应注册 enter_plan_mode 工具")
+    local out = {}
+    tool.func({}, function(m) out.msg = m end, function(e) out.err = e end, { agent = agent })
+
+    t.nil_(out.err)
+    t.true_(pm.is_active(agent), "应进入计划模式")
+    t.false_(tool_service.is_auto_mode(), "进入计划模式必须关闭 AUTO")
+    t.eq("plan", chat_service.get_mode(), "状态栏应反映 PLAN 而非 AUTO")
+
+    chat_service.reset()
+    tool_service.reset()
+  end)
 end)

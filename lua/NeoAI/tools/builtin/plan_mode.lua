@@ -298,7 +298,7 @@ local plan_mode_tools = {}
 
 plan_mode_tools.enter_plan_mode = helpers.define_tool(
   "enter_plan_mode",
-  "进入计划模式：工具集立即切换为只读/信息查询 + ask_user（无法修改任何文件），用于调研并制定格式化修改计划。多步骤/涉及改动的任务应先调用本工具。",
+  "进入计划模式：工具集立即切换为只读/信息查询 + ask_user（无法修改任何文件），用于调研并制定格式化修改计划。多步骤/涉及改动的任务应先调用本工具。进入计划模式会自动退出 AUTO 模式（两种模式互斥）。",
   {
     type = "object",
     properties = {},
@@ -311,6 +311,10 @@ plan_mode_tools.enter_plan_mode = helpers.define_tool(
       return
     end
     M.enter(agent)
+    -- 模式互斥：进入计划模式必须关闭 AUTO（自动允许所有工具调用）开关。
+    -- 否则 AUTO 优先级高于 PLAN（chat_service._actual_mode），状态栏仍显示 AUTO、
+    -- 且后续 exit_plan_mode 会被 AUTO 直接批准、弹不出审批窗。
+    require("NeoAI.services.tool_service").set_auto_mode(false)
     on_success("已进入计划模式：只读调研 + 提问，输出格式化计划，等待用户确认后转入 CHAT 执行。")
   end,
   { category = "agent", approval = { auto_allow = true } }

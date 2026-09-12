@@ -107,6 +107,22 @@ local function _register_commands()
     vim.notify("[NeoAI] AUTO 模式（自动允许所有工具调用）已" .. (active and "开启" or "关闭") .. suffix, vim.log.levels.INFO)
   end, { desc = "切换AUTO模式（自动允许所有工具调用）", force = true })
 
+  vim.api.nvim_create_user_command("NeoAIReloadAll", function()
+    local reload_all = require("NeoAI.tools.builtin.reload_all")
+    local res = reload_all._precheck()
+    if not res.ok then
+      vim.notify("[NeoAI] 热重载预检失败，已取消：\n" .. tostring(res.message), vim.log.levels.ERROR)
+      return
+    end
+    local fn = reload_all._perform_reload
+    local ok, err = fn()
+    if ok then
+      vim.notify("[NeoAI] 插件已热重载完成", vim.log.levels.INFO)
+    else
+      vim.notify("[NeoAI] 插件热重载失败（已尽力回滚）：" .. tostring(err), vim.log.levels.ERROR)
+    end
+  end, { desc = "热重载整个 NeoAI 插件（先隔离子进程预检，失败则取消）", force = true })
+
   vim.api.nvim_create_user_command("NeoAIApprovePlan", function()
     local chat_service = require("NeoAI.services.chat_service")
     local function report(result)

@@ -34,6 +34,7 @@ local BUILTIN_MODULES = {
   "NeoAI.tools.builtin.read_image",
   "NeoAI.tools.builtin.web_fetch",
   "NeoAI.tools.builtin.skills",
+  "NeoAI.tools.builtin.reload_all",
 }
 
 --- 加载内置工具
