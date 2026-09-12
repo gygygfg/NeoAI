@@ -129,16 +129,20 @@ end
 --- @param cb function
 --- @return Deferred
 function Deferred:finally(cb)
+  local function cleanup(continue)
+    -- then_ 负责捕获同步异常；异步清理必须完成后才恢复原始结果。
+    local result = cb()
+    if type(result) == "table" and type(result.then_) == "function" then
+      return result:then_(continue)
+    end
+    return continue()
+  end
   return self:then_(
     function(value)
-      local ok, res = pcall(cb)
-      if not ok then return value end
-      return value
+      return cleanup(function() return value end)
     end,
     function(err)
-      local ok, res = pcall(cb)
-      if not ok then return err end
-      return err
+      return cleanup(function() return M.reject(err) end)
     end
   )
 end

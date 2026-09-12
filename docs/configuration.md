@@ -133,7 +133,7 @@ context_cache = {
 | 分区 | 说明 |
 | --- | --- |
 | `global` | `toggle_ui`(<leader>aa)、`open_chat`(<leader>ac)、`open_tree`(<leader>at)、`close_all`(<leader>aq) |
-| `tree` | `quit`(q)、`select`(<CR>)、`new_child`(n)、`new_root`(N)、`delete_dialog`(d)、`delete_branch`(D)、`expand`(o)、`collapse`(O) |
+| `tree` | `quit`(q)、`select`(<CR>)、`new_child`(n)、`new_root`(N)、`delete_dialog`(d，删除当前轮次)、`delete_branch`(D，删除所属会话及全部子分支)、`expand`(o)、`collapse`(O) |
 | `chat` | `insert`(i)、`quit`(q)、`send`、`cancel`(<Esc>)、`toggle_reasoning`(r)、`switch_model`(M)、`cycle_mode`(m)、`cycle_display`(<C-t>/T)、`reload_display`(<F5>)、`tool_approval`(<C-a>)、`approval.*` |
 
 ### 2.4 `session`
@@ -155,7 +155,8 @@ session = {
 | `enabled` | `true` | 工具系统总开关 |
 | `builtin` | `true` | 加载内置工具 |
 | `external` | `{}` | 外部工具 |
-| `read_file` | `{outline_threshold_chars=500, outline_max_nodes=200, outline_max_depth=4, outline_preview_lines=50}` | read_file 大文件保护：未指定行范围且超阈值时返回语法树大纲（无解析器则截断预览） |
+| `read_file` | `{outline_threshold_chars=500, outline_max_nodes=200, outline_max_depth=4, outline_preview_lines=50, max_read_bytes=5242880}` | read_file 大文件保护：未指定行范围且超阈值时返回语法树大纲（无解析器则截断预览）；超过 `max_read_bytes` 则拒绝整读并只给预览，避免 OOM |
+| `search_files` | `{max_file_bytes=8388608}` | 搜索时单文件扫描上限（字节），超过则跳过；二进制文件（含 NUL）跳过，避免大文件 OOM |
 | `lsp` | `{timeout_ms=10000}` | LSP 请求超时（服务器无响应快速失败） |
 | `guard.repeat_tool` | `{enabled=true, thresholds={3,5,8}, messages=...}` | 连续重复工具调用提醒 |
 | `todo.enabled` | `true` | 待办工具 + 系统提示注入 |

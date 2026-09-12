@@ -7,6 +7,7 @@
 local fs = require("NeoAI.utils.fs")
 local helpers = require("NeoAI.tools.builtin.tool_helpers")
 local config_store = require("NeoAI.kernel.config_store")
+local stringx = require("NeoAI.utils.stringx")
 
 local M = {}
 
@@ -21,6 +22,7 @@ local DEFAULT_READ_GUARD = {
   outline_max_nodes = 200, -- 大纲最多输出的结构节点数
   outline_max_depth = 4, -- 大纲最大递归深度（相对根节点）
   outline_preview_lines = 50, -- 无 parser 时的预览行数
+  max_read_bytes = 5 * 1024 * 1024, -- 整读硬上限（字节），超过则拒绝整读避免 OOM
 }
 
 -- ========== 私有函数 ==========
@@ -94,9 +96,11 @@ end
 --- @param opts table { max_nodes, max_depth }
 --- @return string|nil outline, string|nil err
 local function _build_outline(content, filepath, opts)
-  -- contents 需为行数组（vim.filetype.match 的契约），可辅助无扩展名文件的探测
-  local ft = vim.filetype.match({ filename = filepath, contents = _lines_of(content, 100) })
-  if not ft or ft == "" then
+  -- contents 需为行数组（vim.filetype.match 的契约），可辅助无扩展名文件的探测。
+  -- 某些 Neovim 版本对未知类型文件会抛错（detect.lua: bad argument to 'find'），
+  -- 这里 pcall 兜底，无法识别时按无类型处理。
+  local ok_ft, ft = pcall(vim.filetype.match, { filename = filepath, contents = _lines_of(content, 100) })
+  if not ok_ft or not ft or ft == "" then
     return nil, "无法识别文件类型"
   end
   local lang = vim.treesitter.language.get_lang(ft) or ft
@@ -132,7 +136,8 @@ local function _build_outline(content, filepath, opts)
     end
     local sr, _, er = node:range()
     local snippet = _line_at(content, sr + 1):gsub("^%s+", ""):gsub("%s+$", "")
-    if #snippet > 80 then snippet = snippet:sub(1, 80) .. "…" end
+    -- UTF-8 安全截断：字节截断可能切断多字节字符（显示乱码），故按字符边界回退
+    if #snippet > 80 then snippet = stringx.safe_truncate(snippet, 80, "…") end
     count = count + 1
     local seg = string.rep("  ", depth) .. node:type()
     if er + 1 > sr + 1 then seg = seg .. " [" .. (sr + 1) .. "-" .. (er + 1) .. "]" end
@@ -253,13 +258,38 @@ file_tools.read_file = helpers.define_tool(
   },
   function(args, on_success, on_error)
     local filepath = args.filepath
+    local guard = _read_guard_opts()
+    local max_bytes = guard.max_read_bytes
     if args.start_line or args.end_line then
-      -- 指定行范围：精确读取，不受大文件保护影响
-      _pipe(fs.read_file_lines_async(filepath, args.start_line or 0, args.end_line or 0), on_success, on_error)
+      -- 指定行范围：按块逐行读取，不整读大文件，不受大文件保护影响
+      _pipe(fs.read_file_lines_async(filepath, args.start_line or 0, args.end_line or 0, max_bytes), on_success, on_error)
+      return
+    end
+    -- 目录不是文件：明确报错，避免静默返回空内容。
+    local stat = vim.uv.fs_stat(filepath)
+    if stat and stat.type == "directory" then
+      on_error("路径是目录，无法作为文件读取: " .. filepath)
+      return
+    end
+    if stat and stat.size and stat.size > max_bytes then
+      -- 超大文件：只读前若干行预览，绝不整读，避免 OOM。
+      -- 预览仍设独立上限（不小于整读上限），防止单行超长再次撑爆内存。
+      local preview_cap = math.max(max_bytes, 256 * 1024)
+      local header = string.format(
+        "[文件过大] %s 共 %d 字节，超过 %d 字节整读上限，未返回全文。\n"
+          .. "请改用 start_line/end_line 读取所需行区间。",
+        filepath, stat.size, max_bytes
+      )
+      _pipe(fs.read_file_lines_async(filepath, 1, guard.outline_preview_lines, preview_cap), function(preview)
+        on_success(header .. string.format("\n\n以下为前 %d 行预览：\n%s", guard.outline_preview_lines, preview))
+      end, function(err)
+        -- 预览读取失败（如单行超长）也不应让整个读取失败，回传提示即可。
+        on_success(header .. "\n（预览读取失败: " .. tostring(err) .. "）")
+      end)
       return
     end
     -- 无行范围：小文件返回全文；大文件返回语法树大纲（无 parser 时预览）
-    _pipe(fs.read_file_async(filepath), function(content)
+    _pipe(fs.read_file_async(filepath, max_bytes), function(content)
       on_success(_guarded_content(content, filepath))
     end, on_error)
   end,
@@ -415,9 +445,12 @@ file_tools.search_files = helpers.define_tool(
   },
   function(args, on_success, on_error)
     local dir = args.path or "."
+    local search_cfg = config_store.get("tools.search_files") or {}
+    local max_file_bytes = type(search_cfg.max_file_bytes) == "number" and search_cfg.max_file_bytes or nil
     _pipe(fs.search_files_async(dir, args.query, {
       include = args.include,
       max_results = args.max_results or 50,
+      max_file_bytes = max_file_bytes,
     }), on_success, on_error)
   end,
   { category = "file" }

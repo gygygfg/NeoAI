@@ -9,6 +9,7 @@
 --- 4. 重载本身 pcall 包裹，失败时按 require 缓存快照尽力回滚。
 
 local helpers = require("NeoAI.tools.builtin.tool_helpers")
+local stringx = require("NeoAI.utils.stringx")
 
 local M = {}
 
@@ -41,7 +42,7 @@ local function _trim(s, max)
   s = tostring(s or "")
   max = max or 4000
   if #s > max then
-    return s:sub(1, max) .. "\n…（输出已截断）"
+    return stringx.safe_truncate(s, max, "\n…（输出已截断）")
   end
   return s
 end

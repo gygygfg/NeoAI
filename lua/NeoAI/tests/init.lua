@@ -140,6 +140,21 @@ function assert_helpers.sleep(ms)
   return async.sleep(ms)
 end
 
+--- 等待 Deferred 并传播拒绝/断言异常；异步测试也可直接 return Deferred。
+function assert_helpers.await(promise, timeout_ms)
+  local settled, value, failure, rejected = false, nil, nil, false
+  promise:then_(function(v)
+    value, settled = v, true
+  end, function(err)
+    failure, rejected, settled = err, true, true
+  end)
+  if not vim.wait(timeout_ms or 10000, function() return settled end, 10) then
+    _fail("异步测试等待超时")
+  end
+  if rejected then error(failure, 0) end
+  return value
+end
+
 --- 捕获错误
 --- @param fn function
 --- @return boolean, string
@@ -160,7 +175,10 @@ local function _run_suite(suite)
       end
       local t = {}
       for k, v in pairs(assert_helpers) do t[k] = v end
-      test.fn(t)
+      local result = test.fn(t)
+      if type(result) == "table" and type(result.then_) == "function" then
+        assert_helpers.await(result)
+      end
     end, debug.traceback)
     if ok then
       passed = passed + 1
@@ -182,22 +200,27 @@ function M.run_all(...)
   local requested = { ... }
   local total_passed, total_failed = 0, 0
   local all_errors = {}
-  local loaded = false
 
   -- 会话隔离：防止测试把会话写入真实历史（~/.cache/nvim/NeoAI/sessions.jsonl）。
   -- 测试期间把“默认路径”会话重定向到临时目录，结束后清理并恢复内存中的真实会话。
+  -- 每个套件使用独立临时目录：否则前一套件残留的默认路径会话会被后续套件 init()
+  -- 重新载入，造成跨套件污染（如 chat_ui 残留影响 tree_ui）。
   local session_store = require("NeoAI.core.session.session_store")
   local real_sessions = {}
   for id, s in pairs(session_store.get_all()) do
     real_sessions[id] = s
   end
-  local test_session_dir = vim.fn.stdpath("cache") .. "/NeoAI-test"
-  session_store.set_default_path_redirect(test_session_dir)
+  local test_session_dir = vim.fn.tempname() .. "-NeoAI-test"
+  local previous_redirect = session_store.set_default_path_redirect(test_session_dir)
+  local suite_dirs = {}
 
   local function _cleanup()
-    session_store.set_default_path_redirect(nil)
+    session_store.set_default_path_redirect(previous_redirect)
     session_store.restore(real_sessions)
     vim.fn.delete(test_session_dir, "rf") -- 清理临时会话目录
+    for _, dir in ipairs(suite_dirs) do
+      vim.fn.delete(dir, "rf")
+    end
   end
 
   -- 动态加载所有 test_*.lua 文件（幂等）
@@ -210,21 +233,33 @@ function M.run_all(...)
   for _, file in ipairs(files) do
     local mod_name = "NeoAI.tests." .. vim.fn.fnamemodify(file, ":t:r")
     if vim.fn.fnamemodify(file, ":t") ~= "init.lua" then
+      local suite_count = #state.suites
       local ok, err = pcall(require, mod_name)
       if not ok then
-        all_errors[#all_errors + 1] = ("加载测试模块 %s 失败: %s"):format(mod_name, tostring(err))
+        -- 模块中途抛错时撤销已注册的半成品套件。
+        while #state.suites > suite_count do table.remove(state.suites) end
+        state.current_suite = nil
+        local message = ("加载测试模块 %s 失败: %s"):format(mod_name, tostring(err))
+        all_errors[#all_errors + 1] = message
+        total_failed = total_failed + 1
+        print("  ✗ " .. message)
       end
-      loaded = true
     end
   end
 
   local suites_to_run = {}
   if #requested > 0 then
     for _, name in ipairs(requested) do
+      local found = false
       for _, suite in ipairs(state.suites) do
         if suite.name == name then
+          found = true
           suites_to_run[#suites_to_run + 1] = suite
         end
+      end
+      if not found then
+        total_failed = total_failed + 1
+        all_errors[#all_errors + 1] = "未找到测试套件: " .. name
       end
     end
   else
@@ -235,6 +270,11 @@ function M.run_all(...)
     print(string.format("\n=== NeoAI 测试 (%d 套件) ===", #suites_to_run))
     for _, suite in ipairs(suites_to_run) do
       print("▶ " .. suite.name)
+      -- 每个套件独立重定向目录 + 清空内存会话，杜绝跨套件残留。
+      local suite_dir = vim.fn.tempname() .. "-NeoAI-suite"
+      suite_dirs[#suite_dirs + 1] = suite_dir
+      session_store.set_default_path_redirect(suite_dir)
+      session_store.reset()
       local p, f, errs = _run_suite(suite)
       total_passed = total_passed + p
       total_failed = total_failed + f
@@ -243,9 +283,14 @@ function M.run_all(...)
   end, debug.traceback)
   if not ok_run then
     all_errors[#all_errors + 1] = tostring(run_err)
+    total_failed = total_failed + 1
   end
 
-  _cleanup()
+  local ok_cleanup, cleanup_err = pcall(_cleanup)
+  if not ok_cleanup then
+    all_errors[#all_errors + 1] = "测试清理失败: " .. tostring(cleanup_err)
+    total_failed = total_failed + 1
+  end
 
   print(string.format("\n=== 结果: %d 通过, %d 失败 ===", total_passed, total_failed))
   return { passed = total_passed, failed = total_failed, errors = all_errors }

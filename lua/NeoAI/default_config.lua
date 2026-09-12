@@ -265,8 +265,8 @@ local DEFAULT_CONFIG = {
       select = { key = "<CR>", desc = "选择节点/分支" },
       new_child = { key = "n", desc = "新建子分支并打开聊天" },
       new_root = { key = "N", desc = "新建根分支并打开聊天" },
-      delete_dialog = { key = "d", desc = "删除对话" },
-      delete_branch = { key = "D", desc = "删除分支" },
+      delete_dialog = { key = "d", desc = "删除当前轮次" },
+      delete_branch = { key = "D", desc = "删除整个会话分支" },
       expand = { key = "o", desc = "展开节点" },
       collapse = { key = "O", desc = "折叠节点" },
     },
@@ -299,6 +299,11 @@ local DEFAULT_CONFIG = {
     save_path = vim.fn.stdpath("cache") .. "/NeoAI",
     max_history_per_session = 1000,
     file = "sessions.jsonl",
+    log_compaction = {
+      enabled = true,
+      max_redundant_records = 64, -- 旧快照达到此条数时原子合并
+      min_bytes = 8 * 1024 * 1024, -- 超过此大小且日志至少为最新快照总量的两倍时合并
+    },
   },
 
   tools = {
@@ -314,6 +319,10 @@ local DEFAULT_CONFIG = {
       outline_max_nodes = 200, -- 大纲最多输出的结构节点数
       outline_max_depth = 4, -- 大纲最大递归深度（相对根节点）
       outline_preview_lines = 50, -- 无 parser 时的预览行数
+      max_read_bytes = 5 * 1024 * 1024, -- 整读硬上限（字节）：超过则拒绝整读并提示用行范围，避免 OOM
+    },
+    search_files = {
+      max_file_bytes = 8 * 1024 * 1024, -- 单文件扫描上限（字节）：超过则跳过，避免大文件 OOM；二进制文件跳过
     },
     lsp = {
       timeout_ms = 10000, -- LSP 请求超时（ms）：服务器无响应时快速失败，避免工具循环挂到 executor 超时

@@ -16,7 +16,8 @@
 headless 运行：
 
 ```bash
-nvim --headless "+lua require('NeoAI.tests').run_all()" +q
+nvim --headless -u NONE --cmd 'set rtp+=.' \
+  -c 'lua local r=require("NeoAI.tests").run_all(); vim.cmd(r.failed>0 and "cquit 1" or "qa!")'
 ```
 
 ## 2. 测试组织
@@ -57,13 +58,17 @@ end)
 | `t.ok(v)` | 真值 |
 | `t.deep_eq(a, b)` | 深比较 |
 | `t.sleep(ms)` | 异步等待（返回 Deferred） |
+| `t.await(promise, timeout_ms?)` | 等待完成并传播拒绝，默认超时 10 秒 |
 | `t.throws(fn)` | 捕获错误 |
+
+异步用例必须 `return` 最终的 Deferred 链，或使用 `t.await()`；运行器会等待并统计异步断言失败。
+仅启动异步回调而不返回/等待，无法可靠归属结果。测试模块加载失败、未知套件和运行器/清理异常都会计入 `failed` 与 `errors`。
 
 ## 4. Mock 策略
 
 ### 4.1 会话/文件隔离
 
-测试运行器自动把会话默认路径重定向到临时目录（`~/.cache/NeoAI-test`），结束后清理并恢复
+测试运行器自动把会话默认路径重定向到每次运行独占的临时目录（`vim.fn.tempname()`），结束后清理并恢复
 内存中的真实会话，防止测试污染真实历史。`kernel.*` 与 `core.session.*` 模块提供 `reset()` 方法
 （config_store / event_bus / lifecycle / session_store / registry / tool_service 等），便于隔离。
 
@@ -72,7 +77,8 @@ end)
 对 HTTP 请求做 Mock，模拟 LLM 的流式与非流式响应：
 
 - 需要时覆写 `utils.http` 的请求层，或注入 mock server。
-- `test_http.lua` 覆盖 HTTP 客户端；`test_integration.lua` 用 mock server 做集成。
+- `test_http.lua` 使用 `tests/http_server.lua` 的真实本地 TCP 服务和随机端口，覆盖分包、取消与进程退出、错误体上限；无需 Python 或外网。
+- `test_integration.lua` 用 mock server 做集成；`test_fs_io.lua` 覆盖原子写入及磁盘满等故障，`test_session_store.lua` 覆盖删除重挂、日志合并和恢复。
 
 ### 4.3 工具 Mock
 

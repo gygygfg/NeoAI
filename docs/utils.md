@@ -23,6 +23,7 @@
 ## 2. async.lua
 
 - `Deferred.new()`：手动 resolve/reject 的 Promise。
+- `promise:finally(cb)`：等待清理（包括返回的 Deferred），保留原成功值/拒绝原因；清理本身失败则传播该错误。
 - `new(executor)`：带 executor(resolve, reject) 的 Promise。
 - `all(promises)` / `race(promises)`：并发聚合。
 - `retry(fn, opts)`：指数退避重试（`delay_ms` / `backoff` / `signal` / `should_retry`）。
@@ -44,7 +45,8 @@
 基于 `curl` jobstart 的异步 HTTP 客户端：
 
 - `request(opts)`：非阻塞请求。opts `{ base_url, path, method, headers, body, query, timeout_ms, stream }`。
-- 流式：`on_chunk(data, done)` 回调处理 SSE。
+- 流式：`on_chunk(data, done)` 回调处理 SSE，仅成功结束时收到 `done=true`。成功请求 resolve `""`，不重复保存完整原文；错误体最多保留 64 KiB，超出标记 `body_truncated=true`。
+- 数据重组保留跨 job 回调的行片段与 UTF-8 字节；`event:`/`data:` 相邻行不会粘连。
 - AbortSignal：on abort 时 kill curl job。
 - `get_json(base_url, path, opts)`：GET JSON 便捷函数。
 
@@ -53,6 +55,8 @@
 ## 5. fs.lua
 
 - 文件操作：`read_file` / `write_file` / `append_file` / `delete_file`。
+- 原子写入：`write_file_atomic(path, content, { backup = true })`，同目录临时文件 + fsync + rename，可保留旧版 `.bak`。
+- 写入与关闭失败都会返回 `false, err`；线程池异步变体会 reject 错误。
 - 目录：`ensure_dir` / `mkdir` / `is_dir` / `list_dir` / `join` / `basename` / `dirname` / `copy_file` / `expand`。
 - JSONL：`read_jsonl` / `append_jsonl` / `repair_jsonl`（撕裂行恢复）。
 - 异步变体：`read_file_async` / `write_file_async` / `append_file_async` / `delete_file_async` /

@@ -114,6 +114,7 @@ require("NeoAI").setup({
 | `:NeoAIChatStatus` | Show the chat window status                      |
 | `:NeoAICycleDisplay`| Cycle through chat display modes (chat/trace)   |
 | `:NeoAIReloadDisplay`| Hot-reload the display mode plugin (reloads the current mode by default) |
+| `:NeoAIReloadAll`  | Hot-reload the whole NeoAI plugin (isolated pre-check first; cancel on failure) |
 | `:NeoAIPlan`       | Toggle plan mode (the tool context retains only read-only / informational queries + asking the user) |
 | `:NeoAIAuto`       | Toggle AUTO mode (automatically allow all tool calls) |
 | `:NeoAIApprovePlan`| Confirm the plan and switch to CHAT mode to execute it per the task list |
@@ -714,6 +715,24 @@ categories:
 | ---------------- | ---------------- | ----------- |
 | `log_message`    | Log a message     | ✅ Auto-allowed |
 | `get_log_levels` | Get the available log levels | ✅ Auto-allowed |
+
+### 🔁 System Tools
+
+| Tool name    | Description                                          | Default approval |
+| ------------ | ---------------------------------------------------- | ---------------- |
+| `reload_all` | Hot-reload the whole NeoAI plugin (isolated pre-check) | ⚠️ Requires approval |
+
+> **Plugin hot-reload (isolated & safe)**: the `reload_all` tool and the `:NeoAIReloadAll` command
+> reload the whole NeoAI plugin without restarting nvim (so source edits take effect immediately).
+> To avoid a half-loaded state corrupting the live session, it uses a two-phase strategy:
+> 1. **Isolated subprocess pre-check**: first spawn a fresh headless nvim (`--clean -u NONE` + rtp=plugin root),
+>    load the plugin and run a smoke check (core modules requireable, tools registerable). Any error stays
+>    inside the subprocess with **zero impact** on the live session; **on failure it returns the error and
+>    cancels the reload**, never proceeding to phase 2.
+> 2. **Controlled in-process reload**: only after the pre-check passes does it clear the `NeoAI.*` require
+>    cache, re-run `setup`, rebuild tools / skills / MCP and the chat UI, preserving the current session
+>    where possible. The reload itself is wrapped in `pcall` and **best-effort rolls back** from a require-cache
+>    snapshot on failure.
 
 ### 🔌 MCP Tools (remote servers, enabled on demand)
 

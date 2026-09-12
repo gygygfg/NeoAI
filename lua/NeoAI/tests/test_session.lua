@@ -130,6 +130,67 @@ tests.suite("session", function(_, it)
     t.eq("world", msgs[2].content)
   end)
 
+  it("context_builder 修复中断调用且不修改原始历史", function(t)
+    local ctx = require("NeoAI.core.session.context_builder")
+    local source = {
+      { role = "assistant", tool_calls = {
+        { id = "a", type = "function", ["function"] = { name = "read_file", arguments = "{}" } },
+        { id = "b", type = "function", ["function"] = { name = "write_file", arguments = "{}" } },
+      } },
+      { role = "tool", tool_call_id = "a", content = "actual result" },
+      { role = "user", content = "continue" },
+    }
+    local before = vim.deepcopy(source)
+    for _, build in ipairs({
+      function() return ctx.build({ messages = source }, { include_system = false, max_history = 100 }) end,
+      function() return ctx.build_from_agent({ messages = source }, { include_system = false, max_history = 100 }) end,
+      function() return ctx.build_prefix(nil, source) end,
+    }) do
+      local msgs = build()
+      t.eq(4, #msgs)
+      t.eq("actual result", msgs[2].content)
+      t.eq("b", msgs[3].tool_call_id)
+      t.matches("Execution status is unknown", msgs[3].content)
+      t.eq("user", msgs[4].role)
+    end
+    t.deep_eq(before, source)
+    local msgs = ctx.build_from_agent({ messages = { source[1] } }, {
+      include_system = false, extra_user = "retry", max_history = 100,
+    })
+    t.eq(4, #msgs)
+    t.eq("a", msgs[2].tool_call_id)
+    t.eq("b", msgs[3].tool_call_id)
+    t.eq("retry", msgs[4].content)
+    t.eq(3, #ctx.build_prefix(nil, { source[1] }))
+  end)
+
+  it("context_builder 裁剪保留完整工具轮次并过滤孤立或重复结果", function(t)
+    local ctx = require("NeoAI.core.session.context_builder")
+    local source = {
+      { role = "user", content = "read" },
+      { role = "assistant", tool_calls = {
+        { id = "a", type = "function", ["function"] = { name = "read_file", arguments = "{}" } },
+        { id = "b", type = "function", ["function"] = { name = "read_file", arguments = "{}" } },
+      } },
+      { role = "tool", tool_call_id = "a", content = "A" },
+      { role = "tool", tool_call_id = "b", content = "B" },
+      { role = "user", content = "continue" },
+    }
+    for _, build in ipairs({ ctx.build, ctx.build_from_agent }) do
+      local msgs = build({ messages = source }, { include_system = false, max_history = 2 })
+      t.eq(4, #msgs)
+      t.deep_eq(source[2].tool_calls, msgs[1].tool_calls)
+      t.eq("A", msgs[2].content)
+      t.eq("B", msgs[3].content)
+    end
+    t.deep_eq(source, ctx.build_prefix(nil, source))
+    local msgs = ctx.build_prefix(nil, { source[3], source[2], source[4], source[4], source[3], source[5], source[3] })
+    t.eq(4, #msgs)
+    t.eq("B", msgs[2].content)
+    t.eq("A", msgs[3].content)
+    t.eq("user", msgs[4].role)
+  end)
+
   it("context_builder 带 tool_calls 的 assistant 消息省略空 content", function(t)
     -- 协议要求：OpenAI/DeepSeek 中带 tool_calls 的 assistant 消息 content 必须为
     -- null/省略；发送 content:"" 会让要求严格的模型在后续轮次返回空输出，

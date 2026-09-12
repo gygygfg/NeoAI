@@ -110,9 +110,12 @@ end
 --- @param agent table
 local function _persist_agent(agent)
   local info = state.agents[agent.id]
-  if not info then return end
-  local session = session_store.get(info.session_id)
-  if not session then return end
+  if not info then return true end
+  local stored = session_store.get(info.session_id)
+  if not stored then return true end
+  -- 在候选快照上同步，落盘成功后再标记 _synced；写入失败可安全重试。
+  local session = vim.deepcopy(stored)
+  local synced = {}
   -- 同步消息；跳过运行时上下文快照（runtime_context），重开会话时由快照重新渲染，
   -- 避免把易变运行态固化到持久历史并污染「用户轮次」计数。
   for _, msg in ipairs(agent.messages) do
@@ -145,11 +148,11 @@ local function _persist_agent(agent)
         tool_call_id = msg.tool_call_id,
         checkpoint = msg.checkpoint,
       })
-      msg._synced = true
+      synced[#synced + 1] = msg
     end
   end
   session.model = agent.model
-  session.metadata.usage = agent.usage
+  session.metadata.usage = vim.deepcopy(agent.usage)
   -- 同步待办清单与计划模式状态到 durable surface（重开会话时还原）
   local todo_mod = require("NeoAI.tools.builtin.todo")
   session.metadata.todos = todo_mod.get(info.session_id)
@@ -158,7 +161,14 @@ local function _persist_agent(agent)
     plan = agent.plan,
   }
   if session.metadata.auto_naming == false then end
-  session_store.persist(session)
+  local ok, err = session_store.persist(session)
+  if not ok then
+    vim.notify("[NeoAI] 会话保存失败，消息仍保留在内存中: " .. tostring(err), vim.log.levels.ERROR)
+    return false, err
+  end
+  for k, v in pairs(session) do stored[k] = v end
+  for _, msg in ipairs(synced) do msg._synced = true end
+  return true
 end
 
 -- ========== 正忙暂存队列 ==========
@@ -180,7 +190,8 @@ end
 local function _do_run(agent, content, opts)
   event_bus.emit(events.MESSAGE_SENT, { agent_id = agent.id, content = content })
   return runtime.run(agent, content):then_(function(resp)
-    _persist_agent(agent)
+    local ok, err = _persist_agent(agent)
+    if not ok then return async.reject({ kind = "persistence", message = tostring(err) }) end
     return resp
   end, function(err)
     _persist_agent(agent)
@@ -524,7 +535,8 @@ function M.detach_window(win_id)
   if not agent_id then return end
   local agent = runtime.get(agent_id)
   if agent then
-    _persist_agent(agent)
+    local ok, err = _persist_agent(agent)
+    if not ok then return false, err end
     local session_id = agent.session_id
     runtime.dispose(agent)
     if session_id then

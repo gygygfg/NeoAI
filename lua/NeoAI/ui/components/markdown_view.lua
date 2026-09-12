@@ -104,11 +104,17 @@ local function _wrap_display(str, max_width)
     for k = 1, MAX_CELL_LINES - 1 do capped[k] = out[k] end
     -- 逐字回退末行，保证「末行 + …」的显示宽度不超出 max_width，
     -- 避免截断后反而溢出列宽、破坏该行与下一列边框的对齐。
+    -- 回退必须「严格递减」：当末行只剩单个宽字符（CJK 宽 2）而 avail 更小时，
+    -- strcharpart(last, 0, math.max(1, n-1)) 对 n=1 恒返回原串，宽度不变 → 死循环
+    -- 卡死主线程（思考/历史消息重渲染时命中）。改为 k 从字符数递减到 0，
+    -- k=0 取空串必然满足宽度条件，保证终止。
     local last = out[MAX_CELL_LINES]
     local avail = math.max(0, max_width - vim.fn.strwidth("…"))
-    while vim.fn.strwidth(last) > avail and vim.fn.strwidth(last) > 0 do
-      last = vim.fn.strcharpart(last, 0, math.max(1, vim.fn.strchars(last) - 1))
+    local k = vim.fn.strchars(last)
+    while k > 0 and vim.fn.strwidth(vim.fn.strcharpart(last, 0, k)) > avail do
+      k = k - 1
     end
+    last = vim.fn.strcharpart(last, 0, k)
     capped[MAX_CELL_LINES] = last .. "…"
     return capped
   end

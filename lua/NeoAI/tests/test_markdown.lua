@@ -244,4 +244,29 @@ tests.suite("markdown", function(_, it)
     end
     t.true_(maxw <= 78, "整表仍不得超出 table_width（实际 " .. maxw .. "）")
   end)
+
+  it("极窄窄窗 + 多列 CJK 长单元格不卡死，且末行以 … 截断", function(t)
+    -- 回归：窄 table_width 把多列压到 1~2 列，CJK 单元格折行超 MAX_CELL_LINES
+    -- 进入末行回退。旧实现用 strcharpart(last, 0, math.max(1, strchars-1))，
+    -- 末行仅剩单个宽字符时恒返回原串 → 死循环卡死 nvim 主线程。
+    local mv = require("NeoAI.ui.components.markdown_view")
+    local rows = { "| 甲 | 乙 | 丙 | 丁 | 戊 | 己 | 庚 | 辛 |", "|---|---|---|---|---|---|---|---|" }
+    for i = 1, 12 do
+      rows[#rows + 1] = "| 这是一个很长的中文单元格内容测试文本" .. i
+        .. " | 内容" .. i .. " | 更多中文内容" .. i .. " | 列" .. i
+        .. " | 数据" .. i .. " | 值" .. i .. " | 单元" .. i .. " | 结尾" .. i .. " |"
+    end
+    local rendered = mv.render(table.concat(rows, "\n"), { table_width = 30 })
+    t.true_(#rendered > 0, "极窄窄窗下应能正常渲染返回（不卡死）")
+    local has_ell = false
+    for _, l in ipairs(rendered) do
+      -- 单行输出应有界：不得是几十万字节巨长行，也不得含非法 UTF-8（乱码）
+      t.true_(#l.text < 1000, "单行长度应有界（实际 " .. #l.text .. " 字节）")
+      t.true_(pcall(vim.str_utfindex, l.text), "渲染行应为合法 UTF-8")
+      if l.text:find("…", 1, true) then has_ell = true end
+    end
+    t.true_(has_ell, "超长 CJK 单元格折行应以 … 截断")
+    -- 注：极端窄窗下列宽降至 1，CJK 宽字符无法压进 1 列（每行至少 2 列宽），
+    -- 设计上允许「极小溢出」（见 _render_table 注释），故此处不断言总宽 <= table_width。
+  end)
 end)

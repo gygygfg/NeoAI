@@ -293,6 +293,7 @@ function M.send_stream(messages, opts, on_chunk)
     local acc = { content = "", reasoning = "", tool_calls = nil, finish_reason = nil, usage = nil }
     local raw = { chunks = {}, bytes = 0, truncated = false }
     local done = false
+    local emitted = false
 
     return require("NeoAI.core.model.prompt_cache").apply_async({
       body = ctx.body, provider = ctx.provider, provider_name = ctx.provider_name,
@@ -303,6 +304,7 @@ function M.send_stream(messages, opts, on_chunk)
       acc = { content = "", reasoning = "", tool_calls = nil, finish_reason = nil, usage = nil }
       raw = { chunks = {}, bytes = 0, truncated = false }
       done = false
+      emitted = false
       return http.request({
         base_url = ctx.provider.base_url,
         path = ctx.path,
@@ -323,14 +325,17 @@ function M.send_stream(messages, opts, on_chunk)
           local parsed = ctx.adapter.parse_stream_chunk(raw_chunk)
           if not parsed then return end
           if type(parsed.content) == "string" then
+            emitted = emitted or parsed.content ~= ""
             acc.content = acc.content .. parsed.content
             if on_chunk then on_chunk({ content = parsed.content }) end
           end
           if type(parsed.reasoning) == "string" then
+            emitted = emitted or parsed.reasoning ~= ""
             acc.reasoning = acc.reasoning .. parsed.reasoning
             if on_chunk then on_chunk({ reasoning = parsed.reasoning }) end
           end
           if parsed.tool_calls then
+            emitted = true
             acc.tool_calls = acc.tool_calls or {}
             for _, tc in ipairs(parsed.tool_calls) do
               acc.tool_calls[#acc.tool_calls + 1] = tc
@@ -367,7 +372,8 @@ function M.send_stream(messages, opts, on_chunk)
         backoff = 2,
         signal = opts.signal,
         should_retry = function(err)
-          if done then return false end
+          -- 一旦流式增量交付给调用方，重放请求会重复正文/工具参数。
+          if done or emitted then return false end
           return _should_retry(err)
         end,
       })

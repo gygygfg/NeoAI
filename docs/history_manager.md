@@ -37,10 +37,10 @@
 **追加式 JSONL**：每次写入 append 一行 JSON，无需解析整个文件；崩溃恢复截断最后不完整行即可。
 
 - `_session_path()`：`session.save_path / session.file`（默认 `~/.cache/NeoAI/sessions.jsonl`）。
-- **init**：读取并修复 JSONL（`fs.repair_jsonl`），反序列化全部会话。
-- **persist(session)**：追加式持久化单个会话。
-- **save_all()**：原子重写整个文件（先写 `.bak` 再写正式文件；失败回滚），用于删除/批量变更后。
-- **delete(session_id)**：删除会话及其全部子孙（`get_descendants`）。
+- **init**：逐行读取并修复 JSONL（`fs.repair_jsonl`），仅反序列化每个会话的最新快照。
+- **persist(session)** / **update(session)**：追加单个会话快照，返回 `true` 或 `false, err`；达到日志冗余阈值时合并。
+- **save_all()**：写入同目录临时文件、fsync、备份旧文件到 `.bak`，再 rename 替换正式文件；失败返回 `false, err`，正式文件不被截断。
+- **delete(session_id)**：删除目标及直接子会话。更深后代重挂到最近存活祖先，无祖先则提升为根，并更新子树的 `root_id`。保存成功后才提交内存变更和删除事件；失败返回 `{}, err`。
 - **get_chain(session_id)**：从根到指定会话的祖先链（含自身，根在前）。
 - **get_downstream(session_id)**：沿会话树向下的单子链。只有唯一子会话才继续深入；
   遇分裂分支（多个子会话）或末尾即止。用于重建完整线性对话。
@@ -48,6 +48,22 @@
 ### 3.1 撕裂行恢复
 
 `fs.repair_jsonl` 在读取前修复被截断/撕裂的最后一行，保证崩溃后下一次启动能正常加载。
+完整 JSON 末行缺换行时会补齐分隔符，避免后续追加粘连。聊天消息只有保存成功才标记 `_synced`；失败后保留内存内容供重试。
+
+### 3.2 日志合并
+
+```lua
+session = {
+  log_compaction = {
+    enabled = true,
+    max_redundant_records = 64,
+    min_bytes = 8 * 1024 * 1024,
+  },
+}
+```
+
+冗余旧快照达到 64 条，或日志达到 8 MiB 且至少为最新快照总大小的两倍时，原子重写为每个会话一条快照。
+合并失败不影响已经成功追加的记录，下次持久化再次尝试。此合并只回收磁盘旧版本，不压缩/删除会话消息。
 
 ## 4. 上下文构建（context_builder.lua）
 

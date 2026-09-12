@@ -48,6 +48,53 @@ local function _to_api_message(message)
   return out
 end
 
+--- 只修复出站副本：中断/循环上限可能留下未完成调用，旧历史也可能有孤立结果。
+--- 结果必须紧跟调用且每个 id 恰好一次；缺失结果不代表工具未执行，不能伪造成功。
+local function _balance_tools(messages)
+  local out, pending, order = {}, {}, {}
+  local function flush()
+    for _, id in ipairs(order) do
+      if pending[id] then
+        out[#out + 1] = {
+          role = "tool", tool_call_id = id,
+          content = "Tool result unavailable: this call has no recorded result. Execution status is unknown; verify any side effects before retrying.",
+        }
+      end
+    end
+    pending, order = {}, {}
+  end
+  for _, m in ipairs(messages) do
+    if m.role == "tool" then
+      if m.tool_call_id and pending[m.tool_call_id] then
+        out[#out + 1] = m
+        pending[m.tool_call_id] = nil
+      end
+    else
+      flush()
+      out[#out + 1] = m
+      if m.role == "assistant" then
+        for _, tc in ipairs(m.tool_calls or {}) do
+          if tc.id and not pending[tc.id] then
+            pending[tc.id] = true
+            order[#order + 1] = tc.id
+          end
+        end
+      end
+    end
+  end
+  flush()
+  return out
+end
+
+--- 若窗口从工具结果开始，向前扩展到发起调用的消息，保留完整工具轮次。
+local function _history_start(source, max_history)
+  local start = math.max(1, #source - max_history + 1)
+  while start > 1 and source[start] and source[start].role == "tool" do
+    start = start - 1
+  end
+  return start
+end
+
 -- ========== 公开 API ==========
 
 --- 从会话构建上下文消息列表
@@ -71,14 +118,14 @@ function M.build(session, opts)
       non_system[#non_system + 1] = m
     end
   end
-  local start = math.max(1, #non_system - max_history + 1)
+  local start = _history_start(non_system, max_history)
   for i = start, #non_system do
     messages[#messages + 1] = _to_api_message(non_system[i])
   end
   if opts.extra_user then
     messages[#messages + 1] = { role = "user", content = opts.extra_user }
   end
-  return messages
+  return _balance_tools(messages)
 end
 
 --- 从 Agent 构建上下文消息（Agent 持有私有消息队列 + 配置）
@@ -95,14 +142,14 @@ function M.build_from_agent(agent, opts)
     or config_store.get("session.max_history_per_session")
     or 1000
   local source = agent.messages or {}
-  local start = math.max(1, #source - max_history + 1)
+  local start = _history_start(source, max_history)
   for i = start, #source do
     messages[#messages + 1] = _to_api_message(source[i])
   end
   if opts.extra_user then
     messages[#messages + 1] = { role = "user", content = opts.extra_user }
   end
-  return messages
+  return _balance_tools(messages)
 end
 
 --- 将内部消息转换为 API 消息（与请求发送完全一致，压缩回放保证字节一致）
@@ -122,7 +169,7 @@ function M.build_prefix(agent, range_messages)
   for _, m in ipairs(range_messages or {}) do
     messages[#messages + 1] = _to_api_message(m)
   end
-  return messages
+  return _balance_tools(messages)
 end
 
 --- 从父会话派生子会话的初始上下文

@@ -109,9 +109,15 @@ function M.ensure_buffer(filepath)
   if buf < 0 then return nil end
   bg_loaded[buf] = true
   -- 后台加载不触发默认的 filetype 检测（-u NONE / 纯 headless 环境）
-  -- treesitter / LSP 依赖 filetype 匹配语言或客户端，这里显式补齐
+  -- treesitter / LSP 依赖 filetype 匹配语言或客户端，这里显式补齐。
+  -- 部分 Neovim 版本对未知类型文件用 { buf = ... } 形式匹配会抛错
+  -- （detect.lua: bad argument to 'find'），回退为仅按文件名匹配并忽略失败。
   if vim.bo[buf].filetype == nil or vim.bo[buf].filetype == "" then
-    local ft = vim.filetype.match({ buf = buf, filename = filepath })
+    local ok_ft, ft = pcall(vim.filetype.match, { buf = buf, filename = filepath })
+    if not ok_ft or ft == nil or ft == "" then
+      local ok_name, ft2 = pcall(vim.filetype.match, { filename = filepath })
+      ft = ok_name and ft2 or nil
+    end
     if ft and ft ~= "" then
       pcall(vim.api.nvim_set_option_value, "filetype", ft, { buf = buf })
     end

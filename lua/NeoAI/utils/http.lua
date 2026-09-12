@@ -10,6 +10,9 @@ local async = require("NeoAI.utils.async")
 
 local M = {}
 
+-- 流式成功响应只经 on_chunk 交付；仅保留有界错误体供诊断/溢出恢复。
+local MAX_STREAM_ERROR_BYTES = 64 * 1024
+
 -- ========== 私有工具 ==========
 
 local function _which_curl()
@@ -57,7 +60,10 @@ local function _parse_headers_file(path)
   local content = f:read("*a")
   f:close()
   for line in (content .. "\n"):gmatch("(.-)\n") do
-    local name, value = line:match("^([%w%-_%[%]]+):%s*(.*)%s*$")
+    line = line:gsub("\r$", "")
+    -- CONNECT / 100 Continue 的头部不得混入最终响应。
+    if line:match("^HTTP/%S+ %d+") then out = {} end
+    local name, value = line:match("^([%w%-_%[%]]+):%s*(.-)%s*$")
     if name then
       out[name:lower()] = value
     end
@@ -100,7 +106,7 @@ local function _build_args(opts)
     -- 大片数据（如 "with 2021737 bytes received"）。改为：连续 timeout_ms/1000 秒无任何
     -- 数据到达才判定为超时中断；只要数据持续流动就不再限时，避免长耗时流被误杀。
     args[#args + 1] = "--speed-time"
-    args[#args + 1] = tostring((opts.timeout_ms or 30000) / 1000)
+    args[#args + 1] = tostring(math.max(1, math.ceil((opts.timeout_ms or 30000) / 1000)))
     args[#args + 1] = "--speed-limit"
     args[#args + 1] = "1"
   else
@@ -197,37 +203,89 @@ M._parse_sse = _parse_sse
 --- 发起 HTTP 请求
 --- @param opts table { base_url, path?, method?, headers?, query?, body?, timeout_ms?, stream? }
 --- @param callbacks table|nil { on_chunk?: fun(data: string, done: boolean), signal? }
---- @return Deferred resolve(响应体字符串), reject(错误)
+--- @return Deferred resolve(响应体字符串；流式为 ""), reject(错误)
 function M.request(opts, callbacks)
   callbacks = callbacks or {}
+  if callbacks.signal and callbacks.signal:aborted() then
+    return async.reject({ kind = "aborted", message = callbacks.signal:reason() })
+  end
   local curl = _which_curl()
   if not curl then
     return async.reject({ kind = "http", message = "curl 不可用，无法发送 HTTP 请求" })
   end
 
+  -- 每次请求独占头部文件；不把内部临时路径写回调用方的 opts。
+  opts = vim.tbl_extend("force", {}, opts)
+  opts._dump_headers_path = opts.include_headers and vim.fn.tempname() or nil
   local args, stdin_body = _build_args(opts)
   local stdout = {}
+  local stdout_bytes = 0
+  local body_truncated = false
   local stderr = {}
   local done = false
+  local sse_done = false
+  local skip_line = false
   local chunk_acc = ""
 
   local d = async.Deferred.new()
+  local job
   local cleanup_unsub = function() end
+  local function cleanup()
+    cleanup_unsub()
+    if opts._dump_headers_path then pcall(vim.fn.delete, opts._dump_headers_path) end
+  end
+
+  local function fail(err)
+    if done then return end
+    done = true
+    if job and job > 0 then pcall(vim.fn.jobstop, job) end
+    cleanup()
+    d:reject(err)
+  end
+
+  local function deliver(chunk, is_done)
+    if not callbacks.on_chunk then return true end
+    local ok, err = pcall(callbacks.on_chunk, chunk, is_done)
+    if not ok then
+      fail({ kind = "callback", message = tostring(err) })
+    end
+    return ok
+  end
+
+  local function consume(buffer)
+    if skip_line then
+      local nl = buffer:find("\n", 1, true)
+      if not nl then return end
+      buffer = buffer:sub(nl + 1)
+      skip_line = false
+    end
+    local parsed, rest = _parse_sse(buffer)
+    chunk_acc = rest
+    for _, ev in ipairs(parsed) do
+      if ev.type == "done" then
+        sse_done = true
+        chunk_acc = ""
+        break
+      elseif not deliver(ev.data, false) then
+        break
+      end
+      if done then break end -- on_chunk 内也可能触发取消
+    end
+    -- 非 data 行（如巨大的 JSON 错误体）不需要无限缓存到行尾。
+    if chunk_acc ~= "" and not chunk_acc:match("^data:")
+      and ("data:"):sub(1, #chunk_acc) ~= chunk_acc then
+      chunk_acc = ""
+      skip_line = true
+    end
+  end
 
   if callbacks.signal then
     cleanup_unsub = callbacks.signal:subscribe(function(reason)
-      if job and vim.fn.job_status(job) == "run" then
-        pcall(vim.fn.chanclose, job)
-        pcall(vim.fn.jobstop, job)
-      end
-      if not done then
-        done = true
-        d:reject({ kind = "aborted", message = reason })
-      end
+      fail({ kind = "aborted", message = reason })
     end)
   end
 
-  local job = vim.fn.jobstart({
+  local started, result = pcall(vim.fn.jobstart, {
     curl,
     unpack(args),
   }, {
@@ -236,31 +294,19 @@ function M.request(opts, callbacks)
     stderr_buffered = true,
     on_stdout = function(_, data)
       if done then return end
-      for _, line in ipairs(data or {}) do
-        if line == "" then
-          -- nvim 以空串元素标记行尾（换行）；补上 \n 后该行才被 _parse_sse 视为完整。
-          -- 不能对非空元素追加 \n：跨回调拆分的 data 行片段会被误判为完整行而提前消费（丢事件）。
-          if opts.stream then
-            chunk_acc = chunk_acc .. "\n"
-          end
-        else
-          stdout[#stdout + 1] = line
-          if opts.stream then
-            -- 原样拼接：片段跨回调自然累积，直到行尾空串元素补齐换行
-            chunk_acc = chunk_acc .. line
-          end
-        end
-      end
+      -- 元素间才是换行；首尾元素可以是跨回调的同一行片段。
+      local chunk = table.concat(data or {}, "\n")
+      local saved = chunk
       if opts.stream then
-        local events, rest = _parse_sse(chunk_acc)
-        chunk_acc = rest
-        for _, ev in ipairs(events) do
-          if ev.type == "done" then
-            -- 结束标记，等待 on_exit 最终 resolve
-          elseif ev.type == "data" and callbacks.on_chunk then
-            callbacks.on_chunk(ev.data, false)
-          end
-        end
+        saved = chunk:sub(1, math.max(0, MAX_STREAM_ERROR_BYTES - stdout_bytes))
+        body_truncated = body_truncated or #saved < #chunk
+      end
+      if saved ~= "" then
+        stdout[#stdout + 1] = saved
+        stdout_bytes = stdout_bytes + #saved
+      end
+      if opts.stream and not sse_done then
+        consume(chunk_acc .. chunk)
       end
     end,
     on_stderr = function(_, data)
@@ -269,26 +315,24 @@ function M.request(opts, callbacks)
       end
     end,
     on_exit = function(_, code)
-      if done then return end
-      done = true
-      cleanup_unsub()
-      if opts.stream and callbacks.on_chunk then
+      -- 取消后 curl 仍可能在退出前创建 dump-header 文件，再清理一次。
+      if done then cleanup(); return end
+      if opts.stream and code == 0 then
         -- 消费剩余缓冲（补一个换行让末行没有行尾换行时也能被解析）
-        if chunk_acc and chunk_acc ~= "" then
-          local events, _ = _parse_sse(chunk_acc .. "\n")
-          for _, ev in ipairs(events) do
-            if ev.type == "data" then callbacks.on_chunk(ev.data, false) end
-          end
+        if not sse_done and chunk_acc ~= "" then
+          consume(chunk_acc .. "\n")
         end
-        callbacks.on_chunk(nil, true)
+        if done then return end
+        if not deliver(nil, true) or done then return end
       end
-      local body = table.concat(stdout, "\n")
+      done = true
+      local body = opts.stream and code == 0 and "" or table.concat(stdout)
       -- include_headers：读取 curl --dump-header 临时文件，解析响应头
       local headers = nil
       if opts.include_headers and opts._dump_headers_path and vim.fn.filereadable(opts._dump_headers_path) == 1 then
         headers = _parse_headers_file(opts._dump_headers_path)
-        pcall(vim.fn.delete, opts._dump_headers_path)
       end
+      cleanup()
       if code == 0 then
         if opts.include_headers then
           d:resolve({ body = body, headers = headers or {} })
@@ -300,17 +344,18 @@ function M.request(opts, callbacks)
         if err_msg == "" then err_msg = "curl 退出码 " .. tostring(code) end
         local status = _parse_http_status(err_msg)
         local err = { kind = "http", status = status or code, message = err_msg, body = body }
+        if body_truncated then err.body_truncated = true end
         if opts.include_headers then err.headers = headers or {} end
         d:reject(err)
       end
     end,
   })
 
-  if job <= 0 then
-    done = true
-    cleanup_unsub()
-    return async.reject({ kind = "http", message = "无法启动 curl 进程" })
+  if not started or result <= 0 then
+    fail({ kind = "http", message = "无法启动 curl 进程: " .. tostring(result) })
+    return d
   end
+  job = result
 
   if stdin_body then
     pcall(vim.fn.chansend, job, stdin_body)

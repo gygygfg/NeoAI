@@ -508,8 +508,8 @@ local function _parse_node_output(stdout)
   local trimmed = stdout:gsub("^%s+", ""):gsub("%s+$", "")
   local ok, decoded = pcall(json.decode, trimmed)
   if not ok or type(decoded) ~= "table" then
-    -- 按字节截断可能切断 UTF-8 多字节字符，产生乱码；先截断再清洗为合法 UTF-8。
-    local snippet = strx.sanitize_utf8(trimmed:sub(1, 500)) or trimmed:sub(1, 500)
+    -- 按字节截断可能切断 UTF-8 多字节字符，产生乱码；改用 UTF-8 安全截断。
+    local snippet = strx.safe_truncate(trimmed, 500, "")
     return { ok = false, error = "解析 Node 输出失败：" .. snippet }
   end
   return decoded

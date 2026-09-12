@@ -48,20 +48,26 @@ end
 local function _conversation_rounds(session)
   local rounds = {}
   local current = nil
-  for _, message in ipairs(session.messages or {}) do
+  for index, message in ipairs(session.messages or {}) do
     if message.role == "user" then
-      if current then rounds[#rounds + 1] = current end
-      current = { user = _message_preview(message.content) }
+      if current then
+        current.last = index - 1
+        rounds[#rounds + 1] = current
+      end
+      current = { user = _message_preview(message.content), first = index }
     elseif message.role == "assistant" then
       local content = _message_preview(message.content)
       if content then
-        current = current or {}
+        current = current or { first = index }
         -- 工具循环可能产生多条 assistant 消息，最终文本才是本轮结果。
         current.assistant = content
       end
     end
   end
-  if current then rounds[#rounds + 1] = current end
+  if current then
+    current.last = #(session.messages or {})
+    rounds[#rounds + 1] = current
+  end
   return rounds
 end
 
@@ -280,11 +286,23 @@ local function _new_root()
   _open_session_in_chat(session)
 end
 
---- 删除对话
-local function _delete()
+--- 删除光标所在轮次（会话首行对应第一轮）。
+local function _delete_round()
   local item = _current_item()
   if not item then return end
-  session_store.delete(item.session.id)
+  local round = _conversation_rounds(item.session)[item.round or 1]
+  if not round then return end
+  local ok, err = session_store.delete_messages(item.session.id, round.first, round.last)
+  if not ok then vim.notify("[NeoAI] 删除轮次失败: " .. tostring(err), vim.log.levels.ERROR) end
+  _render()
+end
+
+--- 删除该轮所属会话及全部后代分支。
+local function _delete_branch()
+  local item = _current_item()
+  if not item then return end
+  local _, err = session_store.delete(item.session.id, { recursive = true })
+  if err then vim.notify("[NeoAI] 删除会话失败: " .. tostring(err), vim.log.levels.ERROR) end
   _render()
 end
 
@@ -296,8 +314,8 @@ local function _set_keymaps()
     select = _select,
     new_child = _new_child,
     new_root = _new_root,
-    delete_dialog = _delete,
-    delete_branch = _delete,
+    delete_dialog = _delete_round,
+    delete_branch = _delete_branch,
     expand = _toggle_expand,
     collapse = _toggle_expand,
   }

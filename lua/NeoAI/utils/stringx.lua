@@ -63,13 +63,15 @@ function M.replace(s, from, to)
   return (s:gsub(from:gsub("([%(%)%.%%%+%-%*%?%[%]%^%$])", "%%%1"), to))
 end
 
---- 截断到指定长度并加省略号
+--- 截断到指定长度并加省略号（UTF-8 安全：不切断多字节字符）
+--- 注意：max_len 为「字节」预算，与历史行为一致；截断点若落在多字节字符中
+--- 间则向前回退到字符边界，结果不会产生非法 UTF-8（乱码）。
 --- @param s string
 --- @param max_len number
 --- @return string
 function M.truncate(s, max_len)
   if #s <= max_len then return s end
-  return s:sub(1, max_len - 3) .. "..."
+  return M.safe_truncate(s, max_len, "...") or s
 end
 
 --- 大写首字母
@@ -217,6 +219,43 @@ function M.sanitize_utf8(s)
     end
   end
   return table.concat(buf)
+end
+
+--- 计算字节前缀长度：返回最大的 keep <= budget，使 s:sub(1, keep) 为完整合法 UTF-8。
+--- 正向前进扫描（逐字符推进），跳过非法字节（当作单字节）。keep=0 必合法。
+--- @param s string
+--- @param budget number
+--- @return number
+local function _utf8_prefix_len(s, budget)
+  local pos, last = 1, 0
+  while pos <= budget do
+    local len = _utf8_sequence_len(s, pos)
+    if len == 0 then len = 1 end -- 非法字节：当单字节处理
+    if pos + len - 1 > budget then break end
+    last = pos + len - 1
+    pos = pos + len
+  end
+  return last
+end
+
+--- UTF-8 安全截断：在字节预算内截断，不切断多字节字符，可追加省略符。
+--- 与 `s:sub(1, n)` 的区别：后者可能截在 UTF-8 序列中间，产生半个字符
+--- （显示为替换字符 / 乱码，并可能让下游严格 JSON 解析器报 invalid unicode
+--- code point）。这里向前回退到最近的字符边界。
+--- @param s string|nil
+--- @param max_bytes number 字节预算（含省略符字节）
+--- @param ellipsis string|nil 截断时追加的尾串（如 "…"），默认空
+--- @return string|nil
+function M.safe_truncate(s, max_bytes, ellipsis)
+  if s == nil then return nil end
+  if type(s) ~= "string" then s = tostring(s) end
+  ellipsis = ellipsis or ""
+  if #s <= max_bytes then return s end
+  -- 预留省略符字节作为内容预算；预算为负则归零（不输出内容，仅省略符）
+  local budget = max_bytes - #ellipsis
+  if budget < 0 then budget = 0 end
+  local keep = _utf8_prefix_len(s, budget)
+  return s:sub(1, keep) .. ellipsis
 end
 
 return M

@@ -12,6 +12,7 @@ local config_store = require("NeoAI.kernel.config_store")
 local event_bus = require("NeoAI.kernel.event_bus")
 local events = require("NeoAI.kernel.events")
 local helpers = require("NeoAI.tools.builtin.tool_helpers")
+local stringx = require("NeoAI.utils.stringx")
 
 local M = {}
 
@@ -284,7 +285,7 @@ function M.plan_to_todos(plan_text)
   if #items == 0 then
     -- 最终回退：整段压缩为一项
     local flat = plan_text:gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
-    if #flat > 200 then flat = flat:sub(1, 200) .. "…" end
+    if #flat > 200 then flat = stringx.safe_truncate(flat, 200, "…") end
     if flat ~= "" then
       items[#items + 1] = { content = flat, status = "pending" }
     end

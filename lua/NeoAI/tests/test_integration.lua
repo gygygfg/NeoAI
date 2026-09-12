@@ -5,75 +5,64 @@
 
 local tests = require("NeoAI.tests")
 
-local MOCK_SERVER = [[
-import http.server, json
-class H(http.server.BaseHTTPRequestHandler):
-    def do_POST(self):
-        length = int(self.headers.get("Content-Length", 0))
-        req = json.loads(self.rfile.read(length) or b"{}")
-        msgs = req.get("messages", [])
-        has_tool_result = any(m.get("role") == "tool" for m in msgs)
-        if not has_tool_result:
-            first = 'data: ' + json.dumps({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"mock_add","arguments":"{\"a\":1,\"b\":2}"}}]}}]})
-        else:
-            first = 'data: ' + json.dumps({"choices":[{"delta":{"content":"the sum is 3"}}]})
-        second = 'data: ' + json.dumps({"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5}})
-        resp = first + "\n\n" + second + "\n\n" + "data: [DONE]\n\n"
-        self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream")
-        self.send_header("Content-Length", str(len(resp.encode())))
-        self.end_headers()
-        self.wfile.write(resp.encode())
-    def log_message(self, *a): pass
-http.server.HTTPServer(("127.0.0.1", 8950), H).serve_forever()
-]]
+local function mock_response(client, request)
+  local header_end = request:find("\r\n\r\n", 1, true)
+  local req = vim.json.decode(request:sub(header_end + 4))
+  local has_tool_result = false
+  for _, msg in ipairs(req.messages or {}) do
+    if msg.role == "tool" then has_tool_result = true end
+  end
+  local delta = has_tool_result and { content = "the sum is 3" } or {
+    tool_calls = { { index = 0, id = "call_1", ["function"] = {
+      name = "mock_add", arguments = '{"a":1,"b":2,"description":"calculate sum"}',
+    } } },
+  }
+  local first = vim.json.encode({ choices = { { delta = delta } } })
+  local second = vim.json.encode({ choices = { { delta = {}, finish_reason = "stop" } },
+    usage = { prompt_tokens = 10, completion_tokens = 5 } })
+  require("NeoAI.tests.http_server").respond(client, "data: " .. first .. "\n\ndata: " .. second .. "\n\ndata: [DONE]\n\n")
+end
 
 tests.suite("integration", function(_, it)
   it("完整 Agent 生成流程（mock server）", function(t)
-    local async = require("NeoAI.utils.async")
-    local config_store = require("NeoAI.kernel.config_store")
-    config_store.load({
-      ai = {
-        default_provider = "mock",
-        providers = { mock = { api_type = "openai", base_url = "http://127.0.0.1:8950", api_key = "test" } },
-      },
-      tools = { approval = { mode = "auto_allow", per_tool = {} } },
-      session = { save_path = "/tmp/neoai_test_int", file = "s.jsonl" },
-    })
+    require("NeoAI.tests.http_server").with_server(mock_response, function(base_url)
+      local config_store = require("NeoAI.kernel.config_store")
+      config_store.load({
+        ai = {
+          default_provider = "mock",
+          providers = { mock = { api_type = "openai", base_url = base_url, api_key = "test" } },
+          modes = { chat = { provider = "mock", model = "test" } },
+          model_refresh = { on_startup = false },
+        },
+        tools = { approval = { mode = "auto_allow", per_tool = {} } },
+        session = { save_path = "/tmp/neoai_test_int", file = "s.jsonl" },
+      })
 
-    local job = vim.fn.jobstart({ "python3", "-c", MOCK_SERVER }, { stdout_buffered = true })
+      local registry = require("NeoAI.tools.registry")
+      local helpers = require("NeoAI.tools.builtin.tool_helpers")
+      registry.register(helpers.define_tool(
+        "mock_add", "adds numbers",
+        { type = "object", properties = { a = { type = "number" }, b = { type = "number" } }, required = { "a", "b" } },
+        function(args, on_success) on_success("sum is 3") end,
+        { category = "system" }
+      ))
 
-    -- 注册 mock 工具
-    local registry = require("NeoAI.tools.registry")
-    local helpers = require("NeoAI.tools.builtin.tool_helpers")
-    registry.register(helpers.define_tool(
-      "mock_add", "adds numbers",
-      { type = "object", properties = { a = { type = "number" }, b = { type = "number" } }, required = { "a", "b" } },
-      function(args, on_success) on_success("sum is 3") end,
-      { category = "system" }
-    ))
+      local runtime = require("NeoAI.core.agent.runtime")
+      runtime.reset()
+      local agent = runtime.create({ scenario = "chat" })
+      agent.tools = registry.list_as_map()
 
-    -- mock tool_service
-    local tool_service = require("NeoAI.services.tool_service")
-
-    local runtime = require("NeoAI.core.agent.runtime")
-    runtime.reset()
-    local agent = runtime.create({ scenario = "chat" })
-    agent.tools = registry.list_as_map()
-
-    runtime.run(agent, "calculate 1+2"):then_(function()
-      t.eq("idle", agent.state)
-      t.eq(4, #agent.messages) -- user, assistant(tool_call), tool, assistant(final)
-      local last = agent.messages[#agent.messages]
-      t.eq("assistant", last.role)
-      t.eq("the sum is 3", last.content)
-      t.ok(agent.usage.completion > 0)
-      vim.fn.jobstop(job)
-      print("  integration done")
-    end):catch(function(e)
-      vim.fn.jobstop(job)
-      t.true_(false, "集成测试失败: " .. tostring(e.message or e))
-      print("  integration error:", e.kind, e.message)
+      local ok, err = xpcall(function()
+        t.await(runtime.run(agent, "calculate 1+2"))
+        t.eq("idle", agent.state)
+        t.eq(4, #agent.messages) -- user, assistant(tool_call), tool, assistant(final)
+        local last = agent.messages[#agent.messages]
+        t.eq("assistant", last.role)
+        t.eq("the sum is 3", last.content)
+        t.ok(agent.usage.completion > 0)
+      end, function(e) return e end)
+      runtime.dispose(agent)
+      if not ok then error(err, 0) end
     end)
   end)
 

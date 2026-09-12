@@ -43,6 +43,7 @@ end
 --- @param path string
 --- @return boolean, string|nil
 function M.ensure_dir(path)
+  path = M.expand(path)
   if M.is_dir(path) then return true end
   local ok, err = pcall(vim.fn.mkdir, path, "p")
   if not ok then return false, err end
@@ -68,15 +69,20 @@ end
 --- @param path string
 --- @param content string
 --- @return boolean, string|nil
-function M.write_file(path, content)
-  local ok, err = pcall(function()
-    local f = io.open(path, "wb")
-    if not f then error("无法打开文件: " .. path) end
-    f:write(content)
-    f:close()
-  end)
-  if not ok then return false, err end
+local function _write_file(path, content, mode)
+  local f, err = io.open(path, mode)
+  if not f then return false, err end
+  -- Lua I/O 通常返回 nil, err，而不是抛异常；缓冲写入也可能到 close 才失败。
+  local called, written, write_err = pcall(f.write, f, content)
+  local closed, close_err = f:close()
+  if not called then return false, written end
+  if not written then return false, write_err end
+  if not closed then return false, close_err end
   return true
+end
+
+function M.write_file(path, content)
+  return _write_file(path, content, "wb")
 end
 
 --- 追加内容到文件末尾
@@ -84,22 +90,56 @@ end
 --- @param content string
 --- @return boolean, string|nil
 function M.append_file(path, content)
-  local ok, err = pcall(function()
-    local f = io.open(path, "ab")
-    if not f then error("无法打开文件: " .. path) end
-    f:write(content)
-    f:close()
-  end)
-  if not ok then return false, err end
-  return true
+  return _write_file(path, content, "ab")
 end
 
 --- 删除文件
 --- @param path string
 --- @return boolean, string|nil
 function M.delete_file(path)
-  local ok, err = pcall(vim.fn.delete, path)
-  if not ok then return false, err end
+  local ok, result = pcall(vim.fn.delete, path)
+  if not ok then return false, result end
+  if result ~= 0 then return false, "无法删除文件: " .. path end
+  return true
+end
+
+--- 同目录临时文件 + fsync + rename：失败不截断原文件。
+--- @param path string
+--- @param content string
+--- @param opts table|nil { backup?: boolean } 保留替换前的 .bak
+--- @return boolean, string|nil
+function M.write_file_atomic(path, content, opts)
+  local uv = vim.uv
+  local fd, tmp = uv.fs_mkstemp(path .. ".tmp.XXXXXX")
+  if not fd then return false, tmp end
+  local function fail(err)
+    if fd then uv.fs_close(fd); fd = nil end
+    uv.fs_unlink(tmp)
+    return false, err
+  end
+  -- fs_write 可以短写，必须写完全部内容再提交。
+  local offset = 0
+  while offset < #content do
+    local n, err = uv.fs_write(fd, content:sub(offset + 1), offset)
+    if not n or n == 0 then return fail(err or "文件写入未完成") end
+    offset = offset + n
+  end
+  local synced, sync_err = uv.fs_fsync(fd)
+  if not synced then return fail(sync_err) end
+  local closed, close_err = uv.fs_close(fd)
+  fd = nil
+  if not closed then return fail(close_err) end
+  if opts and opts.backup then
+    local stat, stat_err, stat_code = uv.fs_stat(path)
+    if stat then
+      local copied, copy_err = M.copy_file(path, path .. ".bak")
+      if not copied then return fail(copy_err) end
+    elseif stat_code ~= "ENOENT" then
+      return fail(stat_err)
+    end
+  end
+  local renamed, rename_err = uv.fs_rename(tmp, path)
+  if not renamed then return fail(rename_err) end
   return true
 end
 
@@ -139,6 +179,14 @@ function M.repair_jsonl(path)
   if not M.exists(path) then return false end
   local f = io.open(path, "rb")
   if not f then return false end
+  local size = f:seek("end")
+  if size == 0 then f:close(); return false end
+  -- 正常日志只读最后一个字节，避免启动时为检查行尾额外读一遍全部历史。
+  if size then
+    f:seek("set", size - 1)
+    if f:read(1) == "\n" then f:close(); return false end
+    f:seek("set", 0)
+  end
   local content = f:read("*a")
   f:close()
   if content:sub(-1) == "\n" then return false end
@@ -147,9 +195,15 @@ function M.repair_jsonl(path)
   if trailing == "" then return false end
   local json = require("NeoAI.utils.json")
   local ok = json.decode_line(trailing) ~= nil
-  if ok then return false end
+  if ok then
+    -- 完整 JSON 但缺行尾：补齐分隔符，避免下一次追加粘成一行。
+    local written, err = M.append_file(path, "\n")
+    if not written then return false, err end
+    return false
+  end
   local cut = content:sub(1, last_nl - 1)
-  M.write_file(path, cut)
+  local written, err = M.write_file_atomic(path, cut)
+  if not written then return false, err end
   return true
 end
 
@@ -160,7 +214,7 @@ end
 --- @param dst string
 --- @return boolean, string|nil
 function M.copy_file(src, dst)
-  local ok, err = pcall(vim.fn.copyfile, src, dst, true)
+  local ok, err = vim.uv.fs_copyfile(src, dst)
   if not ok then return false, err end
   return true
 end
@@ -254,20 +308,19 @@ local function _list_worker(dir, max)
   return table.concat(out, "\n")
 end
 
---- 线程内递归搜索文件内容
+--- 线程内递归搜索文件内容。逐文件限制扫描字节数并跳过二进制，避免大文件 OOM。
 --- @param dir string 起始目录
 --- @param query string 搜索关键字（plain 匹配）
 --- @param include_pat string|"" 文件名匹配的 lua pattern（主线程用 stringx.glob_to_pattern 预编译；空则不过滤）
 --- @param max number 最大条数
+--- @param max_bytes number 单文件最大扫描字节数（超过则跳过）
 --- @return string 每行一条：路径 + 匹配片段
-local function _search_worker(dir, query, include_pat, max)
+local function _search_worker(dir, query, include_pat, max, max_bytes)
   local out = {}
   local count = 0
   local limit = max and max > 0 and max or 50
   local inc_pat = include_pat or ""
-  if inc_pat ~= "" then
-    -- glob 已在主线程转成 anchored lua pattern；这里按文件名匹配
-  end
+  local scan_cap = (max_bytes and max_bytes > 0) and max_bytes or (8 * 1024 * 1024)
   local function walk(path)
     if count >= limit then return end
     local handle = vim.uv.fs_scandir(path)
@@ -281,16 +334,23 @@ local function _search_worker(dir, query, include_pat, max)
         walk(full)
       elseif t == "file" then
         if inc_pat == "" or name:match(inc_pat) then
-          local f = io.open(full, "rb")
-          if f then
-            local content = f:read("*a")
-            f:close()
-            if content and content:find(query, 1, true) then
-              local pos = content:find(query, 1, true)
-              local snippet = content:sub(pos, pos + 200)
-              snippet = snippet:gsub("[\n\r]+", " ")
-              out[#out + 1] = full .. ": " .. snippet
-              count = count + 1
+          local stat = vim.uv.fs_stat(full)
+          if stat and stat.size and stat.size <= scan_cap then
+            local f = io.open(full, "rb")
+            if f then
+              -- 多读 1 字节：文件在 stat 之后增长也能被识别并跳过。
+              local content = f:read(scan_cap + 1)
+              f:close()
+              -- 超限或二进制（含 NUL）不整读，避免内存暴涨与乱码片段。
+              if content and #content <= scan_cap and not content:find("\0", 1, true) then
+                local pos = content:find(query, 1, true)
+                if pos then
+                  local snippet = content:sub(pos, pos + 200)
+                  snippet = snippet:gsub("[\n\r]+", " "):gsub("%c", " ")
+                  out[#out + 1] = full .. ": " .. snippet
+                  count = count + 1
+                end
+              end
             end
           end
         end
@@ -302,29 +362,99 @@ local function _search_worker(dir, query, include_pat, max)
   return table.concat(out, "\n")
 end
 
---- 线程内读取文件（可指定行范围）
---- @param filepath string
---- @param start_line number|0 起始行（1-based；0 = 不限制）
---- @param end_line number|0 结束行（1-based；0 = 不限制）
---- @return string 文件内容（或选中行拼接）
-local function _read_worker(filepath, start_line, end_line)
+--- 线程内按块逐行读取，避免一次性把超大文件读入内存。
+--- 注意：工作函数经 string.dump 序列化后不携带 upvalue，此函数必须定义在
+--- _read_worker 内部（作为局部函数），不能作为外部 upvalue 引用。
+--- @param f file* 已打开的文件
+--- @param start_line number 起始行（1-based）
+--- @param end_line number|0 结束行（0 = 到文件末尾）
+--- @param cap number 累计输出字节上限
+--- @return string 选中行拼接
+local function _read_worker(filepath, start_line, end_line, max_bytes)
+  local function read_lines_bounded(f, first, last, cap, trailing_nl)
+    local chunk_size = 65536
+    local finish = (last and last > 0) and last or math.huge
+    local out, out_bytes = {}, 0
+    local lineno = 0
+    local pending = ""
+    local done = false
+    while not done do
+      local chunk = f:read(chunk_size)
+      if not chunk then
+        if pending ~= "" then
+          lineno = lineno + 1
+          if lineno >= first and lineno <= finish then
+            out[#out + 1] = pending
+            out_bytes = out_bytes + #pending
+          end
+        elseif trailing_nl then
+          -- 与 vim.split(content .. "\n", "\n") 语义一致：文件以换行结尾时多一个空行。
+          lineno = lineno + 1
+          if lineno >= first and lineno <= finish then
+            out[#out + 1] = ""
+          end
+        end
+        break
+      end
+      pending = pending .. chunk
+      local pos = 1
+      while true do
+        local nl = pending:find("\n", pos, true)
+        if not nl then
+          pending = pending:sub(pos)
+          break
+        end
+        local line = pending:sub(pos, nl - 1)
+        lineno = lineno + 1
+        if lineno >= first and lineno <= finish then
+          out[#out + 1] = line
+          out_bytes = out_bytes + #line + 1
+          if out_bytes > cap then
+            error(string.format("读取内容超过 %d 字节上限，请缩小 start_line/end_line 区间", cap))
+          end
+          if lineno >= finish then
+            done = true
+            break
+          end
+        end
+        pos = nl + 1
+        if lineno >= finish then
+          done = true
+          break
+        end
+      end
+      -- 单行超长（如无换行的巨大文件）同样要设限，否则 pending 会无限增长。
+      if not done and #pending > cap then
+        error(string.format("单行内容超过 %d 字节上限，无法安全读取", cap))
+      end
+    end
+    return table.concat(out, "\n")
+  end
+
+  local stat = vim.uv.fs_stat(filepath)
+  if stat and stat.type == "directory" then
+    error("路径是目录，无法作为文件读取: " .. filepath)
+  end
+  local cap = (max_bytes and max_bytes > 0) and max_bytes or (8 * 1024 * 1024)
   local f = io.open(filepath, "rb")
   if not f then error("无法打开文件: " .. filepath) end
-  local content = f:read("*a")
-  f:close()
   if start_line and start_line > 0 then
-    -- 与 vim.split(content, "\n", {plain=true}) 行为一致：保留空行、末尾换行产生空行
-    local lines = {}
-    for line in (content .. "\n"):gmatch("(.-)\n") do
-      lines[#lines + 1] = line
+    local trailing_nl = false
+    local size = f:seek("end")
+    if size and size > 0 then
+      f:seek("set", size - 1)
+      trailing_nl = f:read(1) == "\n"
+      f:seek("set", 0)
     end
-    local start = start_line
-    local finish = end_line and end_line > 0 and end_line or #lines
-    start = math.max(1, start)
-    finish = math.min(#lines, finish)
-    local selected = {}
-    for i = start, finish do selected[#selected + 1] = lines[i] end
-    content = table.concat(selected, "\n")
+    local ok, content = pcall(read_lines_bounded, f, start_line, end_line, cap, trailing_nl)
+    f:close()
+    if not ok then error(content) end
+    return content
+  end
+  local content = f:read(cap + 1) or ""
+  f:close()
+  if #content > cap then
+    error(string.format("文件过大（超过 %d 字节），请改用 start_line/end_line 读取指定区间", cap))
   end
   return content
 end
@@ -334,10 +464,13 @@ end
 --- @param content string
 --- @return string "ok" 或抛错
 local function _write_worker(filepath, content)
-  local f = io.open(filepath, "wb")
-  if not f then error("无法写入文件: " .. filepath) end
-  f:write(content)
-  f:close()
+  local f, err = io.open(filepath, "wb")
+  if not f then error("无法写入文件: " .. filepath .. ": " .. tostring(err)) end
+  local called, written, write_err = pcall(f.write, f, content)
+  local closed, close_err = f:close()
+  if not called then error(written) end
+  if not written then error(write_err) end
+  if not closed then error(close_err) end
   return "ok"
 end
 
@@ -346,10 +479,13 @@ end
 --- @param content string
 --- @return string "ok" 或抛错
 local function _append_worker(filepath, content)
-  local f = io.open(filepath, "ab")
-  if not f then error("无法追加文件: " .. filepath) end
-  f:write(content)
-  f:close()
+  local f, err = io.open(filepath, "ab")
+  if not f then error("无法追加文件: " .. filepath .. ": " .. tostring(err)) end
+  local called, written, write_err = pcall(f.write, f, content)
+  local closed, close_err = f:close()
+  if not called then error(written) end
+  if not written then error(write_err) end
+  if not closed then error(close_err) end
   return "ok"
 end
 
@@ -364,18 +500,20 @@ end
 
 --- 异步读取文件（线程池，不阻塞主线程）
 --- @param filepath string
+--- @param max_bytes number|nil 整读字节上限（超过则拒绝，提示改用行范围）
 --- @return Deferred resolve(内容 string)
-function M.read_file_async(filepath)
-  return work.run(_read_worker, filepath, 0, 0)
+function M.read_file_async(filepath, max_bytes)
+  return work.run(_read_worker, filepath, 0, 0, max_bytes or 0)
 end
 
 --- 异步读取文件（带行范围）
 --- @param filepath string
 --- @param start_line number
 --- @param end_line number
+--- @param max_bytes number|nil 累计输出字节上限
 --- @return Deferred resolve(内容 string)
-function M.read_file_lines_async(filepath, start_line, end_line)
-  return work.run(_read_worker, filepath, start_line, end_line)
+function M.read_file_lines_async(filepath, start_line, end_line, max_bytes)
+  return work.run(_read_worker, filepath, start_line, end_line, max_bytes or 0)
 end
 
 --- 异步写入文件
@@ -412,7 +550,7 @@ end
 --- 异步递归搜索文件内容（线程池执行，避免递归遍历卡住主线程）
 --- @param dir string 起始目录
 --- @param query string 搜索关键字
---- @param opts table|nil { include?, max_results? }
+--- @param opts table|nil { include?, max_results?, max_file_bytes? }
 --- @return Deferred resolve(每行一条 string)
 function M.search_files_async(dir, query, opts)
   opts = opts or {}
@@ -425,7 +563,7 @@ function M.search_files_async(dir, query, opts)
     local stringx = require("NeoAI.utils.stringx")
     include_pat = stringx.glob_to_pattern(include)
   end
-  return work.run(_search_worker, dir, query, include_pat, opts.max_results or 50)
+  return work.run(_search_worker, dir, query, include_pat, opts.max_results or 50, opts.max_file_bytes or 0)
 end
 
 return M

@@ -37,10 +37,10 @@ A session is a pure data structure with no side effects and no I/O:
 **Append-only JSONL**: each write appends a single line of JSON, with no need to parse the entire file; crash recovery only requires truncating the last incomplete line.
 
 - `_session_path()`: `session.save_path / session.file` (default `~/.cache/NeoAI/sessions.jsonl`).
-- **init**: reads and repairs the JSONL (`fs.repair_jsonl`), then deserializes all sessions.
-- **persist(session)**: persists a single session by appending.
-- **save_all()**: atomically rewrites the entire file (writes `.bak` first, then the real file; rolls back on failure), used after deletions or bulk changes.
-- **delete(session_id)**: deletes a session and all of its descendants (`get_descendants`).
+- **init**: reads JSONL line by line, repairs its tail (`fs.repair_jsonl`), and deserializes only the latest snapshot of each session.
+- **persist(session)** / **update(session)**: append one session snapshot, returning `true` or `false, err`; compact redundant snapshots when thresholds are reached.
+- **save_all()**: writes a same-directory temporary file, fsyncs it, backs up the old file to `.bak`, then renames the temporary file over the destination. Returns `false, err` on failure without truncating the destination.
+- **delete(session_id)**: deletes the target and its direct children. Deeper descendants are reparented to the nearest surviving ancestor, or promoted to roots, with subtree `root_id` values updated. Memory changes and deletion events are committed only after saving succeeds; failure returns `{}, err`.
 - **get_chain(session_id)**: the ancestor chain from the root to the specified session (including itself, root first).
 - **get_downstream(session_id)**: the single-child chain descending through the session tree. It only continues deeper when there is exactly one child session;
   it stops at a split branch (multiple child sessions) or at the end. Used to reconstruct the full linear conversation.
@@ -48,6 +48,22 @@ A session is a pure data structure with no side effects and no I/O:
 ### 3.1 Torn-Line Recovery
 
 `fs.repair_jsonl` repairs a truncated/torn last line before reading, ensuring the next startup after a crash loads correctly.
+If a complete JSON record lacks its final newline, the separator is restored before further appends. Chat messages are marked `_synced` only after saving succeeds; failed saves retain their in-memory content for retry.
+
+### 3.2 Log Compaction
+
+```lua
+session = {
+  log_compaction = {
+    enabled = true,
+    max_redundant_records = 64,
+    min_bytes = 8 * 1024 * 1024,
+  },
+}
+```
+
+Once there are 64 redundant snapshots, or the log reaches 8 MiB and is at least twice the total size of the latest snapshots, it is atomically rewritten to one snapshot per session.
+Compaction failure preserves the successfully appended records and retries on a subsequent persist. This reclaims old disk versions without compressing or deleting conversation messages.
 
 ## 4. Context Building (context_builder.lua)
 

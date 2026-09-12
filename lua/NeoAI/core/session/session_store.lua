@@ -4,7 +4,6 @@
 --- 追加写入无需解析整个文件；崩溃恢复截断最后不完整行即可。
 
 local fs = require("NeoAI.utils.fs")
-local stringx = require("NeoAI.utils.stringx")
 local session_mod = require("NeoAI.core.session.session")
 local config_store = require("NeoAI.kernel.config_store")
 local event_bus = require("NeoAI.kernel.event_bus")
@@ -18,6 +17,7 @@ local state = {
   sessions = {}, -- id -> session
   loaded = false,
   default_path_redirect = nil, -- 测试隔离：默认会话目录的重定向
+  logs = {}, -- path -> { rows, bytes, sizes = { [session_id] = 最新快照字节数 } }
 }
 
 -- ========== 私有函数 ==========
@@ -38,25 +38,59 @@ local function _session_path()
   return fs.join(base, file)
 end
 
+local function _new_log()
+  return { rows = 0, bytes = 0, sizes = {}, count = 0, live_bytes = 0 }
+end
+
+local function _record(log, id, size)
+  log.rows = log.rows + 1
+  log.bytes = log.bytes + size
+  if id then
+    local previous = log.sizes[id]
+    if not previous then log.count = log.count + 1 end
+    log.live_bytes = log.live_bytes - (previous or 0) + size
+    log.sizes[id] = size
+  end
+end
+
 --- 原子重写整个文件（删除/更新时用）
 --- @param path string
 --- @param sessions table
 local function _rewrite_all(path, sessions)
   local json = require("NeoAI.utils.json")
   local lines = {}
+  local sizes = {}
   for id, s in pairs(sessions) do
     if s then
-      lines[#lines + 1] = json.encode(session_mod.serialize(s))
+      local line = json.encode(session_mod.serialize(s))
+      lines[#lines + 1] = line
+      sizes[id] = #line + 1
     end
   end
-  -- 先写 .bak 再写正式文件
-  fs.copy_file(path, path .. ".bak")
-  local ok = fs.write_file(path, table.concat(lines, "\n") .. "\n")
+  local content = #lines > 0 and (table.concat(lines, "\n") .. "\n") or ""
+  local ok, err = fs.write_file_atomic(path, content, { backup = true })
+  if not ok then return false, err end
+  state.logs[path] = { rows = #lines, bytes = #content, sizes = sizes, count = #lines, live_bytes = #content }
+  return true
+end
+
+local function _save(path, sessions)
+  local ok, err = fs.ensure_dir(fs.dirname(path))
+  if ok then ok, err = _rewrite_all(path, sessions) end
   if not ok then
-    fs.copy_file(path .. ".bak", path) -- 回滚
-    return false
+    require("NeoAI.kernel.logger").error("[session_store] 保存失败 %s: %s", path, tostring(err))
+    return false, err
   end
   return true
+end
+
+local function _should_compact(log)
+  local cfg = config_store.get("session.log_compaction") or {}
+  if cfg.enabled == false then return false end
+  -- 条数上限限制小快照冗余；字节上限避免少量巨大快照积累。
+  local redundant = log.rows - log.count
+  return redundant >= math.max(1, cfg.max_redundant_records or 64)
+    or (redundant > 0 and log.bytes >= math.max(cfg.min_bytes or 8 * 1024 * 1024, log.live_bytes * 2))
 end
 
 -- ========== 公开 API ==========
@@ -65,16 +99,33 @@ end
 function M.init()
   if state.loaded then return M end
   local path = _session_path()
+  local log = _new_log()
   if fs.exists(path) then
-    fs.repair_jsonl(path)
-    local rows = fs.read_jsonl(path)
-    for _, data in ipairs(rows) do
+    local _, repair_err = fs.repair_jsonl(path)
+    if repair_err then error("无法修复会话日志: " .. tostring(repair_err)) end
+    local json = require("NeoAI.utils.json")
+    local latest = {}
+    local f, err = io.open(path, "rb")
+    if not f then error("无法读取会话: " .. tostring(err)) end
+    for line in f:lines() do
+      local data = json.decode_line(line)
+      if type(data) == "table" and type(data.id) == "string" then
+        latest[data.id] = data
+        _record(log, data.id, #line + 1)
+      else
+        _record(log, nil, #line + 1)
+      end
+    end
+    f:close()
+    -- 同一会话只反序列化最新快照，不保留/深复制全部旧版本。
+    for _, data in pairs(latest) do
       local ok, s = pcall(session_mod.deserialize, data)
       if ok and s then
         state.sessions[s.id] = s
       end
     end
   end
+  state.logs[path] = log
   state.loaded = true
   local logger = require("NeoAI.kernel.logger")
   logger.info("[session_store] 已加载 %d 个会话", M.count())
@@ -109,9 +160,12 @@ function M.create(opts)
   end
   local s = session_mod.create(opts)
   state.sessions[s.id] = s
-  M.persist(s)
+  local ok, err = M.persist(s)
+  if not ok then
+    vim.notify("[NeoAI] 新会话暂未保存: " .. tostring(err), vim.log.levels.ERROR)
+  end
   event_bus.emit(events.SESSION_CREATED, { session = s })
-  return s
+  return s, err
 end
 
 --- 追加式持久化单个会话
@@ -119,43 +173,127 @@ end
 --- @return boolean
 function M.persist(session)
   local path = _session_path()
-  fs.ensure_dir(fs.dirname(path))
-  return fs.append_jsonl(path, session_mod.serialize(session))
+  local ok, err = fs.ensure_dir(fs.dirname(path))
+  if not ok then return false, err end
+  local json = require("NeoAI.utils.json")
+  local line = json.encode(session_mod.serialize(session)) .. "\n"
+  local log = state.logs[path]
+  if not log then
+    local stat = vim.uv.fs_stat(path)
+    log = _new_log()
+    log.bytes = stat and stat.size or 0
+    state.logs[path] = log
+  end
+  if log.dirty then
+    local _, repair_err = fs.repair_jsonl(path)
+    if repair_err then return false, repair_err end
+    log.dirty = false
+  end
+  ok, err = fs.append_file(path, line)
+  if not ok then
+    -- 失败追加可能留下半行，后续重试不能直接接到其后。
+    log.dirty = true
+    return false, err
+  end
+  _record(log, session.id, #line)
+  if _should_compact(log) then
+    -- 追加已落盘；合并失败保留原日志并记录错误，下次持久化重试合并。
+    local sessions = vim.tbl_extend("force", state.sessions, { [session.id] = session })
+    _save(path, sessions)
+  end
+  return true
 end
 
 --- 保存（重写整个文件，用于删除/批量变更后）
 function M.save_all()
   local path = _session_path()
-  fs.ensure_dir(fs.dirname(path))
-  _rewrite_all(path, state.sessions)
+  local ok, err = _save(path, state.sessions)
+  if not ok then return false, err end
   event_bus.emit(events.SESSION_SAVED, { count = M.count() })
+  return true
 end
 
 --- 更新会话并持久化
 --- @param session table
 function M.update(session)
   state.sessions[session.id] = session
-  M.save_all()
+  return M.persist(session)
 end
 
---- 删除会话（同时删除其子孙）
+--- 删除指定消息区间，持久化成功后才更新内存。
+function M.delete_messages(session_id, first, last)
+  local session = M.get(session_id)
+  if not session or not first or not last or first < 1 or last > #session.messages or first > last then
+    return false, "无效的消息区间"
+  end
+  local copy = vim.tbl_extend("force", {}, session)
+  copy.messages = {}
+  for i, msg in ipairs(session.messages) do
+    if i < first or i > last then copy.messages[#copy.messages + 1] = msg end
+  end
+  copy.updated_at = os.time()
+  local ok, err = M.persist(copy)
+  if not ok then return false, err end
+  session.messages = copy.messages
+  session.updated_at = copy.updated_at
+  return true
+end
+
+--- 默认删除目标及直接子会话；opts.recursive 删除完整分支。
 --- @param session_id string
---- @return table 删除的 id 列表
-function M.delete(session_id)
+--- @param opts table|nil { recursive?: boolean }
+--- @return table 删除的 id 列表（保存失败为空）, string|nil 错误
+function M.delete(session_id, opts)
   M.init()
   local target = state.sessions[session_id]
   if not target then return {} end
   local deleted = { session_id }
-  -- 收集子孙
-  local children = M.get_children(session_id)
+  local removed = { [session_id] = true }
+  -- 保留既有的一层删除语义。
+  local children = opts and opts.recursive and M.get_descendants(session_id) or M.get_children(session_id)
   for _, c in ipairs(children) do
-    deleted[#deleted + 1] = c.id
+    if not removed[c.id] then
+      deleted[#deleted + 1] = c.id
+      removed[c.id] = true
+    end
   end
-  for _, id in ipairs(deleted) do
-    state.sessions[id] = nil
+  local survivors = {}
+  local reparented = {}
+  for id, s in pairs(state.sessions) do
+    if not removed[id] then
+      local parent = s.parent_id
+      local seen = { [id] = true }
+      while parent and removed[parent] and not seen[parent] do
+        seen[parent] = true
+        parent = state.sessions[parent].parent_id
+      end
+      if parent and (removed[parent] or not state.sessions[parent]) then parent = nil end
+      local copy = vim.tbl_extend("force", {}, s)
+      copy.parent_id = parent
+      survivors[id] = copy
+      if parent ~= s.parent_id then reparented[#reparented + 1] = id end
+    end
   end
-  M.save_all()
-  event_bus.emit(events.SESSION_DELETED, { session_id = session_id, deleted = deleted })
+  for id, s in pairs(survivors) do
+    local root = s
+    local seen = { [id] = true }
+    while root.parent_id and survivors[root.parent_id] and not seen[root.parent_id] do
+      root = survivors[root.parent_id]
+      seen[root.id] = true
+    end
+    s.root_id = root.id
+  end
+  -- 先提交磁盘；失败时不改变内存树或发送删除成功事件。
+  local ok, err = _save(_session_path(), survivors)
+  if not ok then return {}, err end
+  for id, s in pairs(survivors) do
+    -- 保留存活会话的对象身份，避免 UI/Agent 持有陈旧引用。
+    state.sessions[id].parent_id = s.parent_id
+    state.sessions[id].root_id = s.root_id
+  end
+  for _, id in ipairs(deleted) do state.sessions[id] = nil end
+  event_bus.emit(events.SESSION_SAVED, { count = M.count() })
+  event_bus.emit(events.SESSION_DELETED, { session_id = session_id, deleted = deleted, reparented = reparented })
   return deleted
 end
 
@@ -202,11 +340,17 @@ end
 function M.get_descendants(session_id)
   local out = {}
   local queue = { session_id }
-  while #queue > 0 do
-    local current = table.remove(queue, 1)
+  local seen = { [session_id] = true }
+  local head = 1
+  while head <= #queue do
+    local current = queue[head]
+    head = head + 1
     for _, c in ipairs(M.get_children(current)) do
-      out[#out + 1] = c
-      queue[#queue + 1] = c.id
+      if not seen[c.id] then
+        seen[c.id] = true
+        out[#out + 1] = c
+        queue[#queue + 1] = c.id
+      end
     end
   end
   return out
@@ -265,13 +409,17 @@ end
 function M.reset()
   state.sessions = {}
   state.loaded = false
+  state.logs = {}
 end
 
 --- 设置默认会话目录重定向（测试隔离用）。
 --- 仅影响走默认路径（未显式配置 save_path）的会话，不影响显式 save_path 的会话。
 --- @param dir string|nil nil 表示取消重定向
+--- @return string|nil 原重定向目录（允许嵌套测试恢复）
 function M.set_default_path_redirect(dir)
+  local previous = state.default_path_redirect
   state.default_path_redirect = dir
+  return previous
 end
 
 --- 用给定会话表替换内存状态（测试隔离结束后恢复真实会话用）
@@ -279,6 +427,7 @@ end
 function M.restore(sessions)
   state.sessions = sessions or {}
   state.loaded = true
+  state.logs = {}
 end
 
 return M

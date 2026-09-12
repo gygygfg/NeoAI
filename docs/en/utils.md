@@ -23,6 +23,7 @@
 ## 2. async.lua
 
 - `Deferred.new()`: a Promise you resolve/reject manually.
+- `promise:finally(cb)`: waits for cleanup (including a returned Deferred), preserving the original value/rejection; a cleanup failure replaces that outcome with its error.
 - `new(executor)`: a Promise with an executor(resolve, reject).
 - `all(promises)` / `race(promises)`: concurrent aggregation.
 - `retry(fn, opts)`: exponential backoff retry (`delay_ms` / `backoff` / `signal` / `should_retry`).
@@ -44,7 +45,8 @@
 An async HTTP client built on `curl` jobstart:
 
 - `request(opts)`: non-blocking request. opts `{ base_url, path, method, headers, body, query, timeout_ms, stream }`.
-- Streaming: the `on_chunk(data, done)` callback handles SSE.
+- Streaming: `on_chunk(data, done)` handles SSE, with `done=true` only on successful completion. Successful requests resolve `""` instead of retaining the full raw stream; error bodies are capped at 64 KiB, with `body_truncated=true` when truncated.
+- Reconstruction preserves line fragments and UTF-8 bytes across job callbacks, including adjacent `event:` and `data:` lines.
 - AbortSignal: kills the curl job on abort.
 - `get_json(base_url, path, opts)`: convenience function for GET JSON.
 
@@ -53,6 +55,8 @@ An async HTTP client built on `curl` jobstart:
 ## 5. fs.lua
 
 - File operations: `read_file` / `write_file` / `append_file` / `delete_file`.
+- Atomic writes: `write_file_atomic(path, content, { backup = true })` uses a same-directory temporary file, fsync and rename, optionally keeping the previous version as `.bak`.
+- Both write and close failures return `false, err`; threaded async variants reject with the error.
 - Directories: `ensure_dir` / `mkdir` / `is_dir` / `list_dir` / `join` / `basename` / `dirname` / `copy_file` / `expand`.
 - JSONL: `read_jsonl` / `append_jsonl` / `repair_jsonl` (torn-line recovery).
 - Async variants: `read_file_async` / `write_file_async` / `append_file_async` / `delete_file_async` /

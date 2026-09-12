@@ -16,7 +16,8 @@
 Running headless:
 
 ```bash
-nvim --headless "+lua require('NeoAI.tests').run_all()" +q
+nvim --headless -u NONE --cmd 'set rtp+=.' \
+  -c 'lua local r=require("NeoAI.tests").run_all(); vim.cmd(r.failed>0 and "cquit 1" or "qa!")'
 ```
 
 ## 2. Test Organization
@@ -57,20 +58,25 @@ The test callback receives `t` (the assertion helper table):
 | `t.ok(v)` | Truthy |
 | `t.deep_eq(a, b)` | Deep comparison |
 | `t.sleep(ms)` | Async wait (returns a Deferred) |
+| `t.await(promise, timeout_ms?)` | Wait and propagate rejection; defaults to a 10-second timeout |
 | `t.throws(fn)` | Catch errors |
+
+Async tests must return their final Deferred chain or use `t.await()` so the runner can wait and count asynchronous assertion failures.
+Starting detached callbacks cannot reliably attribute their results. Module loading failures, unknown suites, and runner/cleanup errors all contribute to both `failed` and `errors`.
 
 ## 4. Mock Strategies
 
 ### 4.1 Session / File Isolation
 
-The test runner automatically redirects the default session path to a temporary directory (`~/.cache/NeoAI-test`), then cleans up and restores the real in-memory session after the run, preventing tests from polluting real history. The `kernel.*` and `core.session.*` modules provide a `reset()` method (config_store / event_bus / lifecycle / session_store / registry / tool_service, etc.) to make isolation easy.
+The test runner redirects the default session path to a unique temporary directory (`vim.fn.tempname()`) for each run, then cleans up and restores the real in-memory sessions. The `kernel.*` and `core.session.*` modules provide a `reset()` method (config_store / event_bus / lifecycle / session_store / registry / tool_service, etc.) to make isolation easy.
 
 ### 4.2 HTTP / AI Mock
 
 HTTP requests are mocked to simulate both streaming and non-streaming LLM responses:
 
 - Override the request layer of `utils.http` when needed, or inject a mock server.
-- `test_http.lua` covers the HTTP client; `test_integration.lua` performs integration tests with a mock server.
+- `test_http.lua` uses the real loopback TCP server in `tests/http_server.lua` on random ports to cover fragmentation, cancellation/process exit, and error-body limits, without Python or external networking.
+- `test_integration.lua` uses a mock server; `test_fs_io.lua` covers atomic writes and disk-full errors, while `test_session_store.lua` covers reparenting, log compaction, and recovery.
 
 ### 4.3 Tool Mock
 

@@ -19,6 +19,10 @@ local state = {
 -- ========== 私有函数 ==========
 
 --- 深度合并 user 覆盖 default
+--- 语义：map 递归合并；数组（list）按值整体替换，不做按下标合并。
+--- 数组按下标合并会导致「用户只覆盖第一项时默认项残留」（例如
+--- skills.paths = { 自定义目录 } 会与默认的 stdpath/config 等目录叠加，
+--- 从而扫到预期之外的技能）。数组一律替换，符合直觉且可预测。
 --- @param base table
 --- @param override table
 --- @return table 新表
@@ -28,7 +32,11 @@ local function _deep_merge(base, override)
     result[k] = vim.deepcopy(v)
   end
   for k, v in pairs(override or {}) do
-    if type(v) == "table" and type(base[k]) == "table" then
+    -- {} 没有足够信息区分 list/map，沿用默认值的形状：数组清空，map 保留默认。
+    local base_value = base and base[k]
+    local replace_list = type(v) == "table" and vim.islist(v)
+      and (next(v) ~= nil or type(base_value) ~= "table" or vim.islist(base_value))
+    if type(v) == "table" and type(base_value) == "table" and not replace_list then
       result[k] = _deep_merge(base[k], v)
     else
       result[k] = vim.deepcopy(v)

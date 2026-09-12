@@ -13,6 +13,7 @@ local async = require("NeoAI.utils.async")
 local json = require("NeoAI.utils.json")
 local logger = require("NeoAI.kernel.logger")
 local registry = require("NeoAI.tools.registry")
+local stringx = require("NeoAI.utils.stringx")
 local config_store = require("NeoAI.kernel.config_store")
 local event_bus = require("NeoAI.kernel.event_bus")
 local events = require("NeoAI.kernel.events")
@@ -558,7 +559,7 @@ function M.read_resource(server, uri)
         text = tostring(c)
       end
       if total + #text > max then
-        text = text:sub(1, max - total) .. "…"
+        text = stringx.safe_truncate(text, max - total, "…")
       end
       total = total + #text
       parts[#parts + 1] = ((c and c.uri) or uri) .. ":\n" .. text
