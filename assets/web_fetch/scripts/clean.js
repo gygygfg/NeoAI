@@ -4,8 +4,10 @@
  * 运行环境：浏览器页面上下文（由 render_url.js 经 page.evaluate 以
  *   new Function("args", <本文件内容>) 执行）。
  * 入参：args = { selector, url }
- * 行为：移除噪声元素、绝对化链接/图片，并保留 article/main/body 作为正文根。
- * 返回：undefined —— Node 侧回退取 document.documentElement.outerHTML。
+ * 行为：移除噪声元素、绝对化链接，并保留 article/main/body 作为正文根。
+ *      图片不在此处理：render_url.js 会在脚本执行后把 <img> 转存到临时目录
+ *      （images_dir）并原位替换为占位符，故此处的 <img> 最终会被丢弃/替换。
+ * 返回：undefined —— Node 侧回退取 document.body.innerHTML（不含 head 样式）。
  *
  * 约定：脚本体可直接使用 `return`；不要使用 Node 的 require / module 等
  * 主机侧 API（此处无 Node 运行时）。
@@ -17,6 +19,8 @@ var selector = args.selector || "";
 /* 常见噪声选择器：导航/页脚/广告/评论/侧栏/Cookie 横幅等 */
 var NOISE = [
   "script", "style", "noscript", "template", "svg", "canvas", "iframe",
+  "link", "meta", "head",
+  "textarea", "select", "option", "input", "button",
   "nav", "header", "footer", "aside", "form",
   "[role=navigation]", "[role=banner]", "[role=contentinfo]", "[role=search]",
   "[aria-hidden=true]",

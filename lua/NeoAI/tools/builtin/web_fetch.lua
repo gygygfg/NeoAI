@@ -18,6 +18,7 @@
 local async = require("NeoAI.utils.async")
 local fs = require("NeoAI.utils.fs")
 local json = require("NeoAI.utils.json")
+local strx = require("NeoAI.utils.stringx")
 local config_store = require("NeoAI.kernel.config_store")
 local logger = require("NeoAI.kernel.logger")
 local helpers = require("NeoAI.tools.builtin.tool_helpers")
@@ -30,7 +31,7 @@ local M = {}
 local ENGINES = { chromium = true, firefox = true, webkit = true }
 
 --- 支持的输出格式
-local FORMATS = { markdown = true, text = true, html = true }
+local FORMATS = { markdown = true, text = true }
 
 --- 默认脚本名
 local DEFAULT_SCRIPT = "clean"
@@ -41,6 +42,9 @@ local MODULE_FILE = (debug.getinfo(1, "S").source or ""):gsub("^@", "")
 --- 需要 @mozilla/readability 的脚本名
 local READABILITY_SCRIPTS = { readability = true }
 
+--- 图片临时目录前缀（mktemp -d 模板；退出 nvim 时整体删除）
+local IMAGES_TMP_PREFIX = "neoai_web_fetch."
+
 -- ========== 私有状态 ==========
 
 local state = {
@@ -48,6 +52,9 @@ local state = {
   deps = nil, --- 进行中的依赖安装 Deferred
   install_started = false, --- 后台安装是否已触发
   cache_dir_override = nil, --- 测试用：覆盖缓存目录
+  images_dir = nil, --- 当前会话的图片临时目录（懒创建，mktemp -d）
+  images_dirs = {}, --- 已创建的所有图片临时目录（供退出时清理）
+  images_cleanup_registered = false, --- 退出清理钩子是否已注册
 }
 
 -- ========== 私有函数：路径与资源 ==========
@@ -92,6 +99,56 @@ end
 --- @return string
 local function _cache_dir()
   return state.cache_dir_override or fs.join(_install_dir(), "cache")
+end
+
+--- 图片临时目录：用 `mktemp -d` 懒创建（每会话一个），退出时整体删除。
+--- 返回 nil 表示创建失败（Node 侧将放弃转存，图片直接丢弃）。
+--- @return string|nil
+local function _images_dir()
+  if state.images_dir then return state.images_dir end
+  local base = vim.env.TMPDIR
+  if not base or base == "" then base = "/tmp" end
+  local template = fs.join(base, IMAGES_TMP_PREFIX .. "XXXXXX")
+  local out = vim.fn.system({ "mktemp", "-d", template })
+  if vim.v.shell_error ~= 0 then
+    logger.warn("[web_fetch] mktemp -d 失败：%s", tostring(out))
+    return nil
+  end
+  local dir = (out or ""):gsub("%s+$", "")
+  if dir == "" or not fs.is_dir(dir) then
+    logger.warn("[web_fetch] mktemp -d 返回无效目录：%s", tostring(out))
+    return nil
+  end
+  state.images_dir = dir
+  state.images_dirs[#state.images_dirs + 1] = dir
+  logger.info("[web_fetch] 图片临时目录：%s", dir)
+  return dir
+end
+
+--- 删除本会话创建的所有图片临时目录（退出钩子 / 测试用）
+--- @return number 删除的目录数
+local function _cleanup_images()
+  local n = 0
+  for _, dir in ipairs(state.images_dirs) do
+    if type(dir) == "string" and dir ~= "" and fs.is_dir(dir) then
+      pcall(vim.fn.delete, dir, "rf")
+      n = n + 1
+    end
+  end
+  state.images_dirs = {}
+  state.images_dir = nil
+  return n
+end
+
+--- 幂等注册退出清理钩子（启用后注册一次）
+--- @return boolean 本次是否新注册
+local function _ensure_cleanup_registered()
+  if state.images_cleanup_registered then return false end
+  state.images_cleanup_registered = true
+  require("NeoAI.kernel.lifecycle").on_shutdown(function()
+    pcall(_cleanup_images)
+  end)
+  return true
 end
 
 --- 用户自定义脚本目录（可扩展/覆盖内置脚本）
@@ -249,6 +306,37 @@ local function _sync_assets(dir)
   return true
 end
 
+--- 构造网络相关环境变量导出/清除行（安装与渲染共用）。
+--- 每行形如 `export K=V` 或 `unset K`，供拼接进 bash 脚本。
+--- 默认配置（各键为空 / ignore_system_proxy=false）时返回空数组，行为与旧版一致。
+--- @param cfg table
+--- @return string[] 行数组
+local function _build_env_exports(cfg)
+  cfg = cfg or {}
+  local q = _sh_quote
+  local lines = {}
+
+  local dl_host = cfg.playwright_download_host
+  if type(dl_host) == "string" and dl_host ~= "" then
+    lines[#lines + 1] = "export PLAYWRIGHT_DOWNLOAD_HOST=" .. q(dl_host)
+  end
+
+  if cfg.ignore_system_proxy == true then
+    lines[#lines + 1] = "unset HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy"
+  else
+    local hp = cfg.http_proxy
+    if type(hp) == "string" and hp ~= "" then
+      lines[#lines + 1] = "export http_proxy=" .. q(hp) .. " HTTP_PROXY=" .. q(hp)
+    end
+    local sp = cfg.https_proxy
+    if type(sp) == "string" and sp ~= "" then
+      lines[#lines + 1] = "export https_proxy=" .. q(sp) .. " HTTPS_PROXY=" .. q(sp)
+    end
+  end
+
+  return lines
+end
+
 --- 构造依赖安装脚本
 --- @param dir string
 --- @param engine string
@@ -257,14 +345,23 @@ end
 local function _build_install_script(dir, engine, cfg)
   local q = _sh_quote
   local node_bin = (cfg.node_path and cfg.node_path ~= "") and cfg.node_path or "node"
+  local npm_install = "npm install --no-audit --no-fund --loglevel=error"
+  if type(cfg.npm_registry) == "string" and cfg.npm_registry ~= "" then
+    npm_install = npm_install .. " --registry=" .. q(cfg.npm_registry)
+  end
   local lines = {
     "set -e",
     "cd " .. q(dir),
     "command -v " .. q(node_bin) .. " >/dev/null 2>&1 || { echo NODE_MISSING; exit 42; }",
     "command -v npm >/dev/null 2>&1 || { echo NPM_MISSING; exit 43; }",
     "export PLAYWRIGHT_BROWSERS_PATH=" .. q(fs.join(dir, "browsers")),
+  }
+  for _, ln in ipairs(_build_env_exports(cfg)) do
+    lines[#lines + 1] = ln
+  end
+  local rest = {
     "if [ ! -d node_modules/playwright ] || [ ! -d node_modules/turndown ] || [ ! -d node_modules/@mozilla/readability ]; then",
-    "  npm install --no-audit --no-fund --loglevel=error",
+    "  " .. npm_install,
     "fi",
     "if [ ! -f " .. q(".browsers_ok_" .. engine) .. " ]; then",
     "  npx playwright install " .. engine .. (cfg.install_os_deps and " --with-deps" or "") .. " || { echo BROWSER_INSTALL_FAILED; exit 44; }",
@@ -272,6 +369,9 @@ local function _build_install_script(dir, engine, cfg)
     "fi",
     "echo WEB_FETCH_DEPS_OK",
   }
+  for _, ln in ipairs(rest) do
+    lines[#lines + 1] = ln
+  end
   return table.concat(lines, "\n")
 end
 
@@ -359,7 +459,7 @@ local function _build_options(url, params, cfg)
   local format = params.format or cfg.format or "markdown"
   format = tostring(format):lower()
   if not FORMATS[format] then
-    return nil, "不支持的 format：" .. tostring(format) .. "（可选 markdown/text/html）"
+    return nil, "不支持的 format：" .. tostring(format) .. "（可选 markdown/text）"
   end
 
   local engine = params.engine or cfg.engine or "chromium"
@@ -390,6 +490,11 @@ local function _build_options(url, params, cfg)
     need_readability = READABILITY_SCRIPTS[_sanitize_script_name(script_name) or ""] == true,
     headless = true,
     user_agent = cfg.user_agent,
+    -- 图片：转存到临时目录（mktemp -d），正文仅保留 [image: 路径] 占位
+    images_dir = _images_dir(),
+    max_images = tonumber(cfg.max_images) or 50,
+    max_image_bytes = tonumber(cfg.max_image_bytes) or (5 * 1024 * 1024),
+    image_timeout_ms = tonumber(cfg.image_timeout_ms) or 15000,
   }
 end
 
@@ -403,7 +508,9 @@ local function _parse_node_output(stdout)
   local trimmed = stdout:gsub("^%s+", ""):gsub("%s+$", "")
   local ok, decoded = pcall(json.decode, trimmed)
   if not ok or type(decoded) ~= "table" then
-    return { ok = false, error = "解析 Node 输出失败：" .. trimmed:sub(1, 500) }
+    -- 按字节截断可能切断 UTF-8 多字节字符，产生乱码；先截断再清洗为合法 UTF-8。
+    local snippet = strx.sanitize_utf8(trimmed:sub(1, 500)) or trimmed:sub(1, 500)
+    return { ok = false, error = "解析 Node 输出失败：" .. snippet }
   end
   return decoded
 end
@@ -432,11 +539,15 @@ local function _render(url, params, cfg, ctx)
 
   local node_bin = (cfg.node_path and cfg.node_path ~= "") and cfg.node_path or "node"
   local q = _sh_quote
-  local script = table.concat({
+  local script_lines = {
     "cd " .. q(dir),
     "export PLAYWRIGHT_BROWSERS_PATH=" .. q(fs.join(dir, "browsers")),
-    "exec " .. q(node_bin) .. " " .. q(fs.join(dir, "render_url.js")) .. " " .. q(opts_file),
-  }, "\n")
+  }
+  for _, ln in ipairs(_build_env_exports(cfg)) do
+    script_lines[#script_lines + 1] = ln
+  end
+  script_lines[#script_lines + 1] = "exec " .. q(node_bin) .. " " .. q(fs.join(dir, "render_url.js")) .. " " .. q(opts_file)
+  local script = table.concat(script_lines, "\n")
 
   local nav_timeout = tonumber(opts.nav_timeout_ms) or 30000
   local total_timeout = tonumber(cfg.timeout_ms) or 45000
@@ -468,6 +579,7 @@ local function _render(url, params, cfg, ctx)
       engine = parsed.engine or opts.engine,
       format = parsed.format or opts.format,
       readability = parsed.readability,
+      images = parsed.images or {},
       script = _sanitize_script_name(params.script or DEFAULT_SCRIPT) or DEFAULT_SCRIPT,
     })
   end):then_(function(v) d:resolve(v) end, function(e) d:reject(e) end)
@@ -678,7 +790,7 @@ end
 
 local web_fetch = helpers.define_tool(
   "web_fetch",
-  "抓取网页并渲染为可读内容（Markdown/文本/HTML）。对动态网页（React/Vue/SPA）会在无头浏览器中执行 JavaScript 后再取最终 DOM，再用通用转换器转成 Markdown。默认不启用，需在配置中开启 `tools.web_fetch.enabled`；首次启用会在缓存目录自动安装依赖（Node + Playwright + turndown）。参数：url 必填；selector/wait_selector/wait_ms 用于定位与等待；script 选择注入脚本（clean/readability）；format 选择输出格式；force_refresh 跳过本地缓存。",
+  "抓取网页并渲染为可读内容（Markdown/纯文本），只输出正文、不含原始 HTML 标签与样式。对动态网页（React/Vue/SPA）会在无头浏览器中执行 JavaScript 后再取最终 DOM，再用通用转换器转成 Markdown。默认不启用，需在配置中开启 `tools.web_fetch.enabled`；首次启用会在缓存目录自动安装依赖（Node + Playwright + turndown）。参数：url 必填；selector/wait_selector/wait_ms 用于定位与等待；script 选择注入脚本（clean/readability）；format 选择输出格式（markdown/text）；force_refresh 跳过本地缓存。正文中的图片不会写入正文，而是转存到临时目录并在原位保留 `[image: 路径]` 占位符（可用 read_image 查看），退出 Neovim 时自动删除。",
   {
     type = "object",
     properties = {
@@ -687,7 +799,7 @@ local web_fetch = helpers.define_tool(
       wait_selector = { type = "string", description = "可选：加载后等待该选择器出现（用于 SPA）" },
       wait_ms = { type = "integer", description = "可选：加载后额外等待毫秒数" },
       script = { type = "string", description = "注入脚本名（默认 clean；内置 clean/readability，可用用户目录扩展）" },
-      format = { type = "string", enum = { "markdown", "text", "html" }, description = "输出格式，默认 markdown" },
+      format = { type = "string", enum = { "markdown", "text" }, description = "输出格式（markdown 或纯文本 text），默认 markdown" },
       force_refresh = { type = "boolean", description = "为 true 时忽略本地缓存强制抓取" },
     },
     required = { "url" },
@@ -769,6 +881,8 @@ function M.get_tools()
   if not _is_enabled() then return {} end
 
   local cfg = _cfg()
+  -- 退出 nvim 时删除图片临时目录（幂等，仅注册一次）
+  _ensure_cleanup_registered()
   -- 启用后：后台异步检查/安装依赖（不阻塞启动/首个请求）
   if cfg.auto_install ~= false and not state.install_started then
     state.install_started = true
@@ -789,6 +903,9 @@ function M.reset()
   state.deps = nil
   state.install_started = false
   state.cache_dir_override = nil
+  state.images_dir = nil
+  state.images_dirs = {}
+  state.images_cleanup_registered = false
 end
 
 -- ========== 测试可见的内部 API ==========
@@ -797,12 +914,16 @@ M._is_enabled = _is_enabled
 M._install_dir = _install_dir
 M._assets_dir = _assets_dir
 M._cache_dir = _cache_dir
+M._images_dir = _images_dir
+M._cleanup_images = _cleanup_images
+M._ensure_cleanup_registered = _ensure_cleanup_registered
 M._set_cache_dir = function(path) state.cache_dir_override = path end
 M._list_scripts = _list_scripts
 M._resolve_script_file = _resolve_script_file
 M._sanitize_script_name = _sanitize_script_name
 M._build_options = _build_options
 M._build_install_script = _build_install_script
+M._build_env_exports = _build_env_exports
 M._parse_node_output = _parse_node_output
 M._format_envelope = _format_envelope
 M._cache_key = _cache_key

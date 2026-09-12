@@ -72,7 +72,7 @@ tests.suite("web_fetch", function(_, it, before_each)
     t.not_nil(props.url, "应有 url 参数")
     t.true_(vim.tbl_contains(def.parameters.required, "url"), "url 必填")
     t.not_nil(props.format, "应有 format 参数")
-    t.deep_eq({ "markdown", "text", "html" }, props.format.enum)
+    t.deep_eq({ "markdown", "text" }, props.format.enum)
     t.not_nil(props.script, "应有 script 参数")
   end)
 
@@ -98,11 +98,16 @@ tests.suite("web_fetch", function(_, it, before_each)
     t.not_nil(opts.script_file, "应解析出内置 clean 脚本")
     t.matches("clean%.js$", opts.script_file)
 
-    local opts2 = wf._build_options("https://a.com", { format = "html", engine = "firefox", wait_ms = 500 }, cfg)
+    local opts2 = wf._build_options("https://a.com", { format = "text", engine = "firefox", wait_ms = 500 }, cfg)
     t.not_nil(opts2)
-    t.eq("html", opts2.format)
+    t.eq("text", opts2.format)
     t.eq("firefox", opts2.engine)
     t.eq(500, opts2.wait_ms)
+
+    -- html 已不再支持，应被拒绝（避免回吐原始 HTML）
+    local no_html, html_err = wf._build_options("https://a.com", { format = "html" }, cfg)
+    t.nil_(no_html, "html 格式应被拒绝")
+    t.matches("format", html_err or "")
 
     local bad, err = wf._build_options("https://a.com", { format = "pdf" }, cfg)
     t.nil_(bad)
@@ -119,6 +124,43 @@ tests.suite("web_fetch", function(_, it, before_each)
     local bad4, err4 = wf._build_options("https://a.com", { script = "nope" }, cfg)
     t.nil_(bad4, "未知脚本应被拒绝")
     t.matches("注入脚本", err4 or "")
+  end)
+
+  it("_build_options：图片目录与上限", function(t)
+    _enable()
+    local cfg = wf._cfg()
+    local opts = wf._build_options("https://a.com", {}, cfg)
+    t.not_nil(opts)
+    t.not_nil(opts.images_dir, "应给出图片临时目录")
+    t.true_(fs.is_dir(opts.images_dir), "图片目录应真实存在（mktemp -d）")
+    t.matches("neoai_web_fetch%.", opts.images_dir)
+    t.eq(50, opts.max_images, "max_images 默认 50")
+    t.eq(5 * 1024 * 1024, opts.max_image_bytes, "max_image_bytes 默认 5MB")
+    -- 清理本次创建的临时目录
+    wf._cleanup_images()
+  end)
+
+  it("_images_dir：懒创建且同会话复用；_cleanup_images 删除全部", function(t)
+    _enable()
+    local d1 = wf._images_dir()
+    local d2 = wf._images_dir()
+    t.not_nil(d1)
+    t.eq(d1, d2, "同一会话应复用同一目录")
+    t.true_(fs.is_dir(d1), "目录应存在")
+    local n = wf._cleanup_images()
+    t.true_(n >= 1, "应至少删除 1 个目录")
+    t.false_(fs.is_dir(d1), "清理后目录应被删除")
+    wf._cleanup_images()
+  end)
+
+  it("_ensure_cleanup_registered：幂等，仅首次注册", function(t)
+    _enable()
+    t.true_(wf._ensure_cleanup_registered(), "首次应注册")
+    t.false_(wf._ensure_cleanup_registered(), "再次应跳过")
+    -- 启用后 get_tools 会触发注册，不报错
+    local tools = wf.get_tools()
+    t.eq(1, #tools)
+    wf._cleanup_images()
   end)
 
   it("readability 脚本触发 need_readability", function(t)
@@ -161,6 +203,31 @@ tests.suite("web_fetch", function(_, it, before_each)
 
     local empty = wf._parse_node_output("   ")
     t.false_(empty.ok)
+  end)
+
+  it("_parse_node_output：大输出（>128KB）完整解析，模拟管道截断回归", function(t)
+    -- 回归：曾因 render_url.js 在 stdout 管道异步写入后立即 process.exit()，
+    -- 复杂页面（大 JSON）在 64KB/128KB 管道缓冲处被截断而解析失败。
+    -- 这里验证一个远超管道缓冲区的完整 JSON 能被正确解析。
+    local big = string.rep("百度一下，你就知道abc", 9000) -- 远超 128KB
+    local payload = vim.json.encode({ ok = true, url = "https://example.com", title = "T", content = big })
+    t.ok(#payload > 128 * 1024, "载荷应大于 128KB（实际 " .. #payload .. "）")
+    local parsed = wf._parse_node_output(payload)
+    t.true_(parsed.ok)
+    t.eq(#big, #(parsed.content or ""), "内容应完整保留，不得被截断")
+    t.eq(big, parsed.content)
+  end)
+
+  it("_parse_node_output：非 JSON 错误信息 UTF-8 安全截断（不产生乱码）", function(t)
+    -- 回归：错误信息曾用 trimmed:sub(1, 500) 按字节截断，可能切断多字节字符产生乱码。
+    -- 构造一个前 500 字节内正好断开多字节字符的无效 JSON。
+    local s = "汉" .. string.rep("字", 400) -- 每字 3 字节：1 + 3*400 = 1201 字节
+    local res = wf._parse_node_output(s)
+    t.false_(res.ok)
+    t.matches("解析 Node 输出失败", res.error or "")
+    -- 截断结果应为合法 UTF-8（vim.json.encode 遇到非法字节会报错，以此验证）
+    local enc_ok = pcall(vim.json.encode, { e = res.error })
+    t.true_(enc_ok, "错误信息应为合法 UTF-8，可被编码")
   end)
 
   it("_format_envelope：结构 / bytes / cached / 截断", function(t)
@@ -279,6 +346,51 @@ tests.suite("web_fetch", function(_, it, before_each)
     t.matches("playwright install chromium", script)
     t.matches("PLAYWRIGHT_BROWSERS_PATH", script)
     t.nil_(script:find("with%-deps", 1, true), "默认不应附带 --with-deps")
+  end)
+
+  it("_build_env_exports：默认无输出，设置了镜像/代理时正确导出", function(t)
+    _enable()
+    -- 1) 默认（全空）→ 不输出任何 export/unset
+    local base = wf._build_env_exports(wf._cfg())
+    t.eq(0, #base, "默认配置不应注入网络环境变量")
+
+    -- 2) 镜像 + npm 源 + 显式代理
+    local lines = wf._build_env_exports({
+      playwright_download_host = "https://registry.npmmirror.com/-/binary/playwright",
+      npm_registry = "https://registry.npmmirror.com/",
+      http_proxy = "http://127.0.0.1:7890",
+      https_proxy = "http://127.0.0.1:7890",
+    })
+    local joined = table.concat(lines, "\n")
+    t.matches("PLAYWRIGHT_DOWNLOAD_HOST", joined)
+    t.matches("registry%.npmmirror%.com/%-/binary/playwright", joined)
+    t.matches("export http_proxy=", joined)
+    t.matches("export https_proxy=", joined)
+
+    -- 3) ignore_system_proxy=true → 清空继承的代理变量
+    local cleared = table.concat(wf._build_env_exports({ ignore_system_proxy = true }), "\n")
+    t.matches("unset", cleared)
+    t.matches("HTTP_PROXY", cleared)
+    t.matches("HTTPS_PROXY", cleared)
+  end)
+
+  it("镜像/代理配置透传进安装脚本", function(t)
+    config_store.load({
+      tools = {
+        web_fetch = {
+          enabled = true,
+          auto_install = false,
+          npm_registry = "https://registry.npmmirror.com/",
+          playwright_download_host = "https://registry.npmmirror.com/-/binary/playwright",
+          ignore_system_proxy = true,
+        },
+      },
+    })
+    local cfg = wf._cfg()
+    local script = wf._build_install_script("/tmp/whatever", "chromium", cfg)
+    t.matches("--registry='https://registry.npmmirror.com/'", script)
+    t.matches("PLAYWRIGHT_DOWNLOAD_HOST", script)
+    t.matches("unset HTTP_PROXY", script)
   end)
 
   it("资源目录与内置文件存在", function(t)

@@ -748,16 +748,19 @@ Remote `tools/list` → one NeoAI tool per remote tool; `resources`/`prompts` �
 
 | Tool name   | Description | Default approval |
 | ----------- | ----------- | ---------------- |
-| `web_fetch` | Fetch a page and render it to readable content (Markdown/text/HTML); for dynamic pages it runs JS in a headless browser and takes the final DOM | ✅ Auto-allowed |
+| `web_fetch` | Fetch a page and render it to readable content (Markdown/plain text, body only, no raw HTML); for dynamic pages it runs JS in a headless browser and takes the final DOM | ✅ Auto-allowed |
 
 **Pipeline**: Neovim (Lua only orchestrates) → bash checks/installs deps → Node + Playwright renders and injects JS → final DOM → turndown converts to Markdown → returned (optionally cached). Lua never parses dynamic pages itself.
 
 - **Disabled by default**: set `tools.web_fetch.enabled = true`; while off, the tool is not registered and no dependency is installed.
 - **Auto dependency install**: once enabled, bash checks and installs Node deps (`playwright` / `turndown` / `@mozilla/readability`) and the browser engine **inside the cache dir** (`stdpath('cache')/NeoAI/web_fetch`, browsers under `browsers/`) — no root, no system changes. With `auto_install = true` (default) it installs in the background and the first call waits for it.
 - **No system Node install**: if `node`/`npm` is missing, an actionable error is returned (it will not silently run a system package manager).
+- **Restricted networks (CN mirrors / broken proxy)**: `tools.web_fetch` adds optional `npm_registry`, `playwright_download_host`, `http_proxy` / `https_proxy` and `ignore_system_proxy` keys; all empty = inherit system behavior. For CN environments: `npm_registry = "https://registry.npmmirror.com/"`, `playwright_download_host = "https://registry.npmmirror.com/-/binary/playwright"`; if a broken local proxy breaks downloads, set `ignore_system_proxy = true` to go direct.
 - **Injection scripts**: built-in scripts live in `assets/web_fetch/scripts/` (`clean` generic denoise, `readability` article extraction); you can drop same-named scripts into `tools.web_fetch.scripts_dir` (default `stdpath('config')/NeoAI/web_fetch/scripts`) to **override** the built-ins, or select one with the `script` arg.
 - **Cache**: results are cached by URL + args with TTL / entry-count / **total-size cap (default 500MB)**, evicting oldest first; a single entry larger than the cap is not cached.
-- **Args**: `url` (required), `selector`, `wait_selector`, `wait_ms`, `script`, `format` (`markdown`/`text`/`html`), `force_refresh`.
+- **Args**: `url` (required), `selector`, `wait_selector`, `wait_ms`, `script`, `format` (`markdown`/`text`), `force_refresh`.
+- **Output format**: always Markdown or plain text, never raw HTML; `<style>`/`<script>` and similar noise are stripped before conversion so CSS never leaks into the content.
+- **Images**: images are **not written into the Markdown** (avoids base64 bloat); they are saved to a temp dir (created via `mktemp -d`, e.g. `/tmp/neoai_web_fetch.XXXXXX/`) and the body keeps an inline `[image: <path>]` placeholder you can open with `read_image`. The dir is **auto-deleted when Neovim exits**. Caps: `max_images` / `max_image_bytes` / `image_timeout_ms`.
 
 ```lua
 require("NeoAI").setup({

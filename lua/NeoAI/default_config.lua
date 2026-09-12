@@ -345,13 +345,24 @@ local DEFAULT_CONFIG = {
       enabled = false, -- 总开关（默认关闭；开启后才会注册工具、安装依赖、抓取）
       auto_install = true, -- 启用后在后台自动检查/安装依赖（关闭则首次调用时按需安装）；安装内容：playwright + turndown + @mozilla/readability + 浏览器内核
       engine = "chromium", -- 浏览器引擎：chromium | firefox | webkit
-      format = "markdown", -- 默认输出格式：markdown | text | html
+      format = "markdown", -- 默认输出格式：markdown | text（只输出正文，不含原始 HTML）
       timeout_ms = 45000, -- 单次抓取总超时（ms，含启动浏览器）；<=0 时用 nav_timeout_ms + 15s
       nav_timeout_ms = 30000, -- 页面导航/等待超时（ms）
       max_bytes = 2 * 1024 * 1024, -- 单次返回内容上限（字节，超出截断）
+      -- ↓ 图片处理：正文中的图片不写入 Markdown，而是转存到临时目录（mktemp -d，退出 nvim 时删除），
+      --   正文原位保留 [image: 路径] 占位符，可按需用 read_image 查看。
+      max_images = 50, -- 单次抓取最多转存图片数（超出直接丢弃）
+      max_image_bytes = 5 * 1024 * 1024, -- 单张图片字节上限（超出则占位符回退为原始 URL）
+      image_timeout_ms = 15000, -- 单张远程图片下载超时（ms）
       install_timeout_ms = 600000, -- 依赖安装超时（ms，首次下载浏览器内核可能较久）
       node_path = "", -- 自定义 node 可执行文件路径（空则用 PATH 中的 node）
       install_os_deps = false, -- 安装浏览器时是否附带系统依赖（需要 root/sudo，一般无需开启）
+      -- ↓ 受限网络（国内镜像 / 代理异常）下的下载与代理控制；默认全空 = 完全沿用系统行为
+      npm_registry = "", -- npm 源；空则用系统 npm 配置。国内可设 "https://registry.npmmirror.com/"
+      playwright_download_host = "", -- 浏览器内核下载基址；空则用官方 CDN。国内可设 "https://registry.npmmirror.com/-/binary/playwright"
+      http_proxy = "", -- 安装/渲染时显式设置的 HTTP 代理；空则不覆盖继承值
+      https_proxy = "", -- 安装/渲染时显式设置的 HTTPS 代理；空则不覆盖继承值
+      ignore_system_proxy = false, -- true = 安装/渲染时清空继承的代理变量（应对本机代理损坏/不可用）
       -- 注入脚本目录（可扩展/覆盖内置脚本；同名用户脚本优先）
       -- 内置脚本：clean（通用去噪）、readability（正文提取）
       scripts_dir = vim.fn.stdpath("config") .. "/NeoAI/web_fetch/scripts",

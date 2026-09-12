@@ -729,16 +729,19 @@ NeoAI 内置了 40+ 工具，AI 可在对话中自动调用，涵盖以下类别
 
 | 工具名      | 描述 | 默认审批 |
 | ----------- | ---- | -------- |
-| `web_fetch` | 抓取网页并渲染为可读内容（Markdown/文本/HTML）；对动态网页在无头浏览器执行 JS 后取最终 DOM | ✅ 自动允许 |
+| `web_fetch` | 抓取网页并渲染为可读内容（Markdown/纯文本，只输出正文、不含原始 HTML）；对动态网页在无头浏览器执行 JS 后取最终 DOM | ✅ 自动允许 |
 
 **管线**：Neovim（Lua 只做编排）→ bash 检查/安装依赖 → Node + Playwright 渲染并注入 JS → 取最终 DOM → turndown 转 Markdown → 回传（可选落缓存）。Lua 不自行解析动态页面。
 
 - **默认关闭**：需在配置里设 `tools.web_fetch.enabled = true`；关闭时不会注册工具，也不会安装任何依赖。
 - **依赖自动安装**：启用后在**缓存目录**（`stdpath('cache')/NeoAI/web_fetch`）用 bash 检查并安装 Node 依赖（`playwright` / `turndown` / `@mozilla/readability`）与浏览器内核（下载到该目录下的 `browsers/`），无需 root、不动系统环境。`auto_install = true`（默认）时后台异步安装，首次调用会等待其完成。
 - **不自动装系统 Node**：若 `node`/`npm` 缺失，返回可操作的错误提示（不会擅自调用系统包管理器）。
+- **受限网络（国内镜像 / 代理异常）**：`tools.web_fetch` 新增 `npm_registry`（npm 源）、`playwright_download_host`（浏览器内核下载基址）、`http_proxy` / `https_proxy`（显式代理）、`ignore_system_proxy`（安装/渲染时清空继承的代理变量）五个可选键，默认全空 = 完全沿用系统行为。国内环境推荐：`npm_registry = "https://registry.npmmirror.com/"`、`playwright_download_host = "https://registry.npmmirror.com/-/binary/playwright"`；若本机代理损坏导致下载失败，可设 `ignore_system_proxy = true` 直连。
 - **注入脚本目录**：内置脚本位于插件 `assets/web_fetch/scripts/`（`clean` 通用去噪、`readability` 正文提取）；用户可在 `tools.web_fetch.scripts_dir`（默认 `stdpath('config')/NeoAI/web_fetch/scripts`）放置同名脚本**覆盖**内置，或用 `script` 参数选择。
 - **缓存**：结果按 URL + 参数缓存，带 TTL / 条数 / **总容量上限（默认 500MB）**，超出按最旧优先淘汰；单条超过总容量时不缓存。
-- **参数**：`url`（必填）、`selector`、`wait_selector`、`wait_ms`、`script`、`format`（`markdown`/`text`/`html`）、`force_refresh`。
+- **参数**：`url`（必填）、`selector`、`wait_selector`、`wait_ms`、`script`、`format`（`markdown`/`text`）、`force_refresh`。
+- **输出格式**：恒为 Markdown 或纯文本，不返回原始 HTML；转换前会剥离 `<style>`/`<script>` 等噪声，避免 CSS 混入正文。
+- **图片处理**：正文中的图片**不写入 Markdown**（避免 base64 膨胀）；会转存到临时目录（`mktemp -d` 创建，形如 `/tmp/neoai_web_fetch.XXXXXX/`），正文原位保留 `[image: 路径]` 占位符，可按需用 `read_image` 查看；**退出 Neovim 时自动删除**该目录。可用 `max_images` / `max_image_bytes` / `image_timeout_ms` 控制上限。
 
 ```lua
 require("NeoAI").setup({

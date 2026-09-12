@@ -209,13 +209,19 @@ web_fetch = {
   enabled = false,                 -- Master switch (off by default; only then is the tool registered / deps installed / fetching allowed)
   auto_install = true,             -- After enabling, install deps in the background; false installs on first call
   engine = "chromium",             -- Browser engine: chromium | firefox | webkit
-  format = "markdown",             -- Default output format: markdown | text | html
+  format = "markdown",             -- Default output format: markdown | text (body only, no raw HTML)
   timeout_ms = 45000,              -- Total fetch timeout (ms, incl. browser startup); <=0 uses nav_timeout_ms + 15s
   nav_timeout_ms = 30000,          -- Page navigation/wait timeout (ms)
   max_bytes = 2 * 1024 * 1024,     -- Max content returned per call (bytes, truncated beyond)
   install_timeout_ms = 600000,     -- Dependency install timeout (ms; first browser download can take a while)
   node_path = "",                  -- Custom node binary path (empty = node from PATH)
   install_os_deps = false,         -- Also install OS deps for the browser (needs root/sudo; rarely necessary)
+  -- Download/proxy control for restricted networks (CN mirrors / broken proxy); all empty = inherit system behavior
+  npm_registry = "",               -- npm registry; empty = system npm config. CN: "https://registry.npmmirror.com/"
+  playwright_download_host = "",   -- Browser download base URL; empty = official CDN. CN: "https://registry.npmmirror.com/-/binary/playwright"
+  http_proxy = "",                 -- Explicit HTTP proxy for install/render; empty = do not override inherited value
+  https_proxy = "",                -- Explicit HTTPS proxy for install/render; empty = do not override inherited value
+  ignore_system_proxy = false,     -- true = clear inherited proxy vars during install/render (for a broken local proxy)
   -- Injection script dir (extend/override built-ins; same-named user scripts win)
   -- Built-ins: clean (generic denoise), readability (article extraction)
   scripts_dir = vim.fn.stdpath("config") .. "/NeoAI/web_fetch/scripts",
