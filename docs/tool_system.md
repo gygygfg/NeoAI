@@ -50,7 +50,7 @@
 （仅注册定义，无 I/O，确保首个 Agent 请求前已就绪）。`tool_helpers.lua` 是工具定义辅助库，不入内置清单。
 
 内置工具模块：`file_ops` / `shell` / `git_ops` / `lsp_ops` / `tree_ops` / `log_ops` / `plan`（子 Agent）/
-`todo` / `plan_mode` / `ask_user` / `read_image` / `skills`（技能工具 + 系统提示段）。
+`todo` / `plan_mode` / `ask_user` / `read_image` / `web_fetch`（网页抓取，默认不启用）/ `skills`（技能工具 + 系统提示段）。
 MCP 远端工具由 `services/mcp/init.lua` 动态注册（`category = "mcp"`，`source = "mcp"`），详见 [mcp.md](mcp.md)。
 
 ## 4. 执行流程（tools/executor.lua）
@@ -194,6 +194,16 @@ description 为选项描述，二者在弹窗中分别展示并高亮）。同�
 
 `read_image`：读取 PNG/JPEG/WebP/GIF，持久化进附件存储，返回引用。详见
 [configuration.md](configuration.md)（多模态）。
+
+### 🌐 网页抓取（web_fetch.lua，默认不启用）
+
+`web_fetch`：把动态网页（React/Vue/SPA）在无头浏览器中渲染、注入 JS 后取最终 DOM，再用通用转换器
+（turndown）转 Markdown。**默认不启用**（`tools.web_fetch.enabled = false`，关闭时 `get_tools()` 返回空，
+不注册、不装依赖）。启用后在缓存目录（`stdpath('cache')/NeoAI/web_fetch`）用 bash 检查并安装
+Node 依赖与浏览器内核（`auto_install=true` 时后台异步，首次调用等待完成）。Lua 只做编排，不自行解析
+动态页面。结果按 URL + 参数缓存（TTL / 条数 / 总容量默认 500MB，最旧优先淘汰）。注入脚本可扩展：
+内置 `assets/web_fetch/scripts/*.js`，用户目录（`tools.web_fetch.scripts_dir`）同名覆盖。
+详见 [configuration.md](configuration.md)（`tools.web_fetch`）。
 
 ## 7. 工具输出到模型（tool_loop._tool_definitions）
 

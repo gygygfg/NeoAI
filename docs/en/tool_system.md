@@ -53,7 +53,7 @@ Tool definitions support two execution forms (`executor._call_tool`):
 `tool_helpers.lua` is the tool-definition helper library and is not part of the built-in list.
 
 Built-in tool modules: `file_ops` / `shell` / `git_ops` / `lsp_ops` / `tree_ops` / `log_ops` / `plan` (sub-agent) /
-`todo` / `plan_mode` / `ask_user` / `read_image` / `skills` (skill tools + system prompt section).
+`todo` / `plan_mode` / `ask_user` / `read_image` / `web_fetch` (web fetch, disabled by default) / `skills` (skill tools + system prompt section).
 MCP remote tools are registered dynamically by `services/mcp/init.lua` (`category = "mcp"`, `source = "mcp"`); see [mcp.md](mcp.md) for details.
 
 ## 4. Execution Flow (tools/executor.lua)
@@ -208,6 +208,17 @@ fail outright.
 
 `read_image`: reads PNG/JPEG/WebP/GIF, persists it into attachment storage, and returns a reference. See
 [configuration.md](configuration.md) (multimodal).
+
+### 🌐 Web fetch (web_fetch.lua, disabled by default)
+
+`web_fetch`: renders dynamic pages (React/Vue/SPA) in a headless browser, injects JS, takes the final DOM and
+converts it to Markdown with a general converter (turndown). **Disabled by default** (`tools.web_fetch.enabled = false`;
+while off, `get_tools()` returns nothing — no registration, no dependency install). Once enabled, bash checks and
+installs Node deps and the browser engine inside the cache dir (`stdpath('cache')/NeoAI/web_fetch`); with
+`auto_install=true` this happens in the background and the first call waits for it. Lua only orchestrates and never
+parses dynamic pages itself. Results are cached by URL + args (TTL / entry count / total-size cap default 500MB,
+evicting oldest first). Injection scripts are extensible: built-ins in `assets/web_fetch/scripts/*.js`, overridable by
+same-named scripts in the user dir (`tools.web_fetch.scripts_dir`). See [configuration.md](configuration.md) (`tools.web_fetch`).
 
 ## 7. Tool Output to the Model (tool_loop._tool_definitions)
 

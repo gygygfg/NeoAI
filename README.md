@@ -25,6 +25,7 @@
 - **⚠️⚠️⚠️使用curl发送请求** 环境变量内没有curl可能无法发送请求
 - **待发消息队列** — Agent 正忙时发送的消息自动暂存，状态栏出现 `待发N` 徽标提醒，消息真正发送后徽标消失
 - **多模态图像** — `read_image` 工具读入 PNG/JPEG/WebP/GIF 并注入多模态模型（内容寻址附件存储 + 请求期像素/字节预算 offload，模型不支持图像时自动降级为文本）
+- **网页抓取（web_fetch）** — 把动态网页（React/Vue/SPA）在无头浏览器中渲染、注入 JS 后取最终 DOM，再用通用转换器转成 Markdown 供模型阅读；**默认不启用**，开启后在缓存目录自动检查并安装依赖，结果按 URL 缓存（默认上限 500MB）
 - **lualine 状态栏集成** — 在聊天窗口中用 `nvim-lualine` 实时展示大模型用量、缓存命中率与上下文容量（模型/用量/缓存/容量等段可自定义）
 - **Herder 状态上报** — 在 Herder pane 内实时上报 Agent 作态（working/idle/blocked），多会话自动聚合，带严格递增 `--seq` 防并发回退
 - **工具参数接收面板** — 模型流式生成工具调用参数时实时打开「接收参数」悬浮窗（`tool_args_panel`），随分片增量追加、参数结束后自动关闭，与思考过程悬浮窗一致
@@ -724,6 +725,37 @@ NeoAI 内置了 40+ 工具，AI 可在对话中自动调用，涵盖以下类别
 > 系统提示会注入「可用技能」清单（`skills.inject_mode`），模型可 `load_skill` 装载正文。
 > 详见 [docs/skills.md](docs/skills.md)。
 
+### 🌐 网页抓取工具（默认不启用）
+
+| 工具名      | 描述 | 默认审批 |
+| ----------- | ---- | -------- |
+| `web_fetch` | 抓取网页并渲染为可读内容（Markdown/文本/HTML）；对动态网页在无头浏览器执行 JS 后取最终 DOM | ✅ 自动允许 |
+
+**管线**：Neovim（Lua 只做编排）→ bash 检查/安装依赖 → Node + Playwright 渲染并注入 JS → 取最终 DOM → turndown 转 Markdown → 回传（可选落缓存）。Lua 不自行解析动态页面。
+
+- **默认关闭**：需在配置里设 `tools.web_fetch.enabled = true`；关闭时不会注册工具，也不会安装任何依赖。
+- **依赖自动安装**：启用后在**缓存目录**（`stdpath('cache')/NeoAI/web_fetch`）用 bash 检查并安装 Node 依赖（`playwright` / `turndown` / `@mozilla/readability`）与浏览器内核（下载到该目录下的 `browsers/`），无需 root、不动系统环境。`auto_install = true`（默认）时后台异步安装，首次调用会等待其完成。
+- **不自动装系统 Node**：若 `node`/`npm` 缺失，返回可操作的错误提示（不会擅自调用系统包管理器）。
+- **注入脚本目录**：内置脚本位于插件 `assets/web_fetch/scripts/`（`clean` 通用去噪、`readability` 正文提取）；用户可在 `tools.web_fetch.scripts_dir`（默认 `stdpath('config')/NeoAI/web_fetch/scripts`）放置同名脚本**覆盖**内置，或用 `script` 参数选择。
+- **缓存**：结果按 URL + 参数缓存，带 TTL / 条数 / **总容量上限（默认 500MB）**，超出按最旧优先淘汰；单条超过总容量时不缓存。
+- **参数**：`url`（必填）、`selector`、`wait_selector`、`wait_ms`、`script`、`format`（`markdown`/`text`/`html`）、`force_refresh`。
+
+```lua
+require("NeoAI").setup({
+  tools = {
+    web_fetch = {
+      enabled = true,            -- 默认 false
+      engine = "chromium",       -- chromium | firefox | webkit
+      script = "clean",          -- 内置 clean / readability
+      cache = { max_bytes = 500 * 1024 * 1024 },
+    },
+  },
+})
+```
+
+> 依赖：`node`（>=18）与 `npm` 需在 `PATH` 中（可用 `tools.web_fetch.node_path` 指定 node 路径）。
+> 首次启用会下载浏览器内核，请确保网络通畅。
+
 ---
 
 ## 🏗️ 架构
@@ -734,6 +766,12 @@ NeoAI 内置了 40+ 工具，AI 可在对话中自动调用，涵盖以下类别
 NeoAI/
 ├── init.lua                    # 主入口：极薄，仅 setup + 命令/快捷键注册，业务懒加载
 ├── default_config.lua          # 默认配置（纯数据，零逻辑）
+│
+├── assets/                     # 随插件分发的内置资源
+│   └── web_fetch/              # 网页抓取运行时（拷到缓存目录）
+│       ├── render_url.js       # Playwright 渲染器（注入 JS + turndown 转 MD）
+│       ├── package.json        # Node 依赖清单（playwright/turndown/readability）
+│       └── scripts/            # 内置注入脚本（clean / readability）
 │
 ├── kernel/                     # 内核层（最底层，零业务依赖）
 │   ├── events.lua             # 事件常量注册表（domain:verb 命名）
@@ -825,6 +863,7 @@ NeoAI/
 │       ├── plan_mode.lua      # 计划模式（enter_plan_mode/exit_plan_mode + 工具过滤/门禁）
 │       ├── ask_user.lua       # 向用户提问
 │       ├── read_image.lua     # 图像读取（多模态）
+│       ├── web_fetch.lua      # 网页抓取（无头浏览器渲染 + 注入 JS + 转 Markdown，默认不启用）
 │       ├── skills.lua         # 技能工具（list_skills/load_skill + 提示段）
 │       └── tool_helpers.lua   # 工具定义辅助
 │
@@ -838,7 +877,7 @@ NeoAI/
 │   ├── image.lua             # 图像类型检测/媒体类型
 │   └── stringx.lua           # 字符串扩展
 │
-└── tests/                      # 测试（自定义运行器，:NeoAITest；共 44 个 test_*.lua）
+└── tests/                      # 测试（自定义运行器，:NeoAITest；共 45 个 test_*.lua）
     ├── init.lua               # 断言 + 运行器
     ├── test_kernel.lua        # 内核（config_store/event_bus/events/lifecycle）
     ├── test_session.lua       # 会话（session/store/context_builder/compactor）

@@ -124,7 +124,7 @@ context_cache = {
 | `colors` | 各段高亮 | 用户/AI/推理/标题色 |
 | `tree` | `{foldenable=false, ...auto_close_on_select=true}` | 会话树折叠/自动关闭 |
 | `input_box` | `{idle_height=1, min_height=5, max_ratio=0.8}` | 输入框高度（空闲/聚焦/增长上限） |
-| `chat` | `{mousescroll_max_blank=3}` | 鼠标滚轮滚到底时末行下方允许的最大空白行数（0=严格贴底） |
+| `chat` | `{mousescroll_max_blank=3, incremental=true}` | 鼠标滚轮滚到底时末行下方允许的最大空白行数（0=严格贴底）；`incremental` 开启增量刷新（只重渲染变化的消息块且只写差异行），设为 `false` 降级回整 buffer 全量重写 |
 | `trajectory` | `{log_dir=".../NeoAI/logs"}` | 轨迹显示模式的日志保存目录 |
 | `statusline` | `{enabled=true, winbar=true, parts={mode,model,usage,cache,capacity}, separator=" ", colors=...}` | lualine 状态栏 |
 
@@ -159,6 +159,7 @@ session = {
 | `lsp` | `{timeout_ms=10000}` | LSP 请求超时（服务器无响应快速失败） |
 | `guard.repeat_tool` | `{enabled=true, thresholds={3,5,8}, messages=...}` | 连续重复工具调用提醒 |
 | `todo.enabled` | `true` | 待办工具 + 系统提示注入 |
+| `web_fetch` | 见下（默认 `enabled=false`） | 网页抓取：无头浏览器渲染动态页面并转 Markdown |
 | `plan_mode` | `{enabled=true, auto_execute_on_approve=true, extra_safe_tools={}, mutating_tools=...}` | 计划模式 |
 | `approval` | 见下 | 工具审批 |
 
@@ -196,6 +197,38 @@ approval = {
 
 > **审批决策**：`mode=auto_allow` → 不审批；`mode=strict` → 必审批；
 > 工具 `auto_allow=true` → 不审批；路径落允许目录 + 命令首词落参数组 → 不审批。
+
+**web_fetch（网页抓取，默认不启用）**：
+
+```lua
+web_fetch = {
+  enabled = false,                 -- 总开关（默认关闭；开启后才会注册工具/安装依赖/抓取）
+  auto_install = true,             -- 启用后在后台自动检查/安装依赖；false 则首次调用时按需安装
+  engine = "chromium",             -- 浏览器引擎：chromium | firefox | webkit
+  format = "markdown",             -- 默认输出格式：markdown | text | html
+  timeout_ms = 45000,              -- 单次抓取总超时（ms，含启动浏览器）；<=0 时用 nav_timeout_ms + 15s
+  nav_timeout_ms = 30000,          -- 页面导航/等待超时（ms）
+  max_bytes = 2 * 1024 * 1024,     -- 单次返回内容上限（字节，超出截断）
+  install_timeout_ms = 600000,     -- 依赖安装超时（ms，首次下载浏览器内核可能较久）
+  node_path = "",                  -- 自定义 node 可执行文件路径（空则用 PATH 中的 node）
+  install_os_deps = false,         -- 安装浏览器时是否附带系统依赖（需 root/sudo，一般无需）
+  -- 注入脚本目录（可扩展/覆盖内置脚本；同名用户脚本优先）
+  -- 内置脚本：clean（通用去噪）、readability（正文提取）
+  scripts_dir = vim.fn.stdpath("config") .. "/NeoAI/web_fetch/scripts",
+  cache = {
+    enabled = true,                -- 结果缓存开关
+    ttl_sec = 3600,                -- 缓存有效期（秒）；<=0 表示不过期
+    max_entries = 200,             -- 缓存条目数上限
+    max_bytes = 500 * 1024 * 1024, -- 缓存总大小上限（字节，默认 500MB；超出按最旧优先淘汰）
+  },
+},
+```
+
+> **运行时行为**：禁用时零副作用（不注册工具、不安装依赖）；启用后依赖装到缓存目录
+> （`stdpath('cache')/NeoAI/web_fetch`）并使用同一目录下的 `browsers/`，**不改动系统环境**。
+> 若 `node`/`npm` 缺失，不自动调用系统包管理器，而是返回可操作的错误提示。
+> `approval.per_tool.web_fetch = { auto_allow = true }`（默认自动放行）。
+> 管线：Lua 编排 → bash 装依赖 → Node/Playwright 渲染并注入 JS → 取 DOM → turndown 转 Markdown。
 
 ### 2.6 `herder`
 

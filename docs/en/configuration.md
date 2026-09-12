@@ -127,7 +127,7 @@ context_cache = {
 | `colors` | Per-segment highlights | User/AI/reasoning/title colors |
 | `tree` | `{foldenable=false, ...auto_close_on_select=true}` | Session tree folding/auto-close |
 | `input_box` | `{idle_height=1, min_height=5, max_ratio=0.8}` | Input box height (idle/focused/growth cap) |
-| `chat` | `{mousescroll_max_blank=3}` | Max blank lines allowed below the last line when the wheel reaches the bottom (0 = strictly bottom-aligned) |
+| `chat` | `{mousescroll_max_blank=3, incremental=true}` | Max blank lines allowed below the last line when the wheel reaches the bottom (0 = strictly bottom-aligned); `incremental` enables incremental refresh (re-render only changed message blocks and write only the diff lines). Set to `false` to fall back to a full buffer rewrite |
 | `trajectory` | `{log_dir=".../NeoAI/logs"}` | Log directory for the trajectory display mode |
 | `statusline` | `{enabled=true, winbar=true, parts={mode,model,usage,cache,capacity}, separator=" ", colors=...}` | lualine statusline |
 
@@ -162,6 +162,7 @@ session = {
 | `lsp` | `{timeout_ms=10000}` | LSP request timeout (fail fast when the server does not respond) |
 | `guard.repeat_tool` | `{enabled=true, thresholds={3,5,8}, messages=...}` | Reminder for consecutive repeated tool calls |
 | `todo.enabled` | `true` | Todo tool + system prompt injection |
+| `web_fetch` | See below (`enabled=false` by default) | Web fetch: render dynamic pages in a headless browser and convert to Markdown |
 | `plan_mode` | `{enabled=true, auto_execute_on_approve=true, extra_safe_tools={}, mutating_tools=...}` | Plan mode |
 | `approval` | See below | Tool approval |
 
@@ -200,6 +201,39 @@ approval = {
 > **Approval decisions**: `mode=auto_allow` → no approval; `mode=strict` → always approve;
 > a tool with `auto_allow=true` → no approval; a path inside an allowed directory + the command's first word in an
 > allowed parameter group → no approval.
+
+**web_fetch (web fetch, disabled by default)**:
+
+```lua
+web_fetch = {
+  enabled = false,                 -- Master switch (off by default; only then is the tool registered / deps installed / fetching allowed)
+  auto_install = true,             -- After enabling, install deps in the background; false installs on first call
+  engine = "chromium",             -- Browser engine: chromium | firefox | webkit
+  format = "markdown",             -- Default output format: markdown | text | html
+  timeout_ms = 45000,              -- Total fetch timeout (ms, incl. browser startup); <=0 uses nav_timeout_ms + 15s
+  nav_timeout_ms = 30000,          -- Page navigation/wait timeout (ms)
+  max_bytes = 2 * 1024 * 1024,     -- Max content returned per call (bytes, truncated beyond)
+  install_timeout_ms = 600000,     -- Dependency install timeout (ms; first browser download can take a while)
+  node_path = "",                  -- Custom node binary path (empty = node from PATH)
+  install_os_deps = false,         -- Also install OS deps for the browser (needs root/sudo; rarely necessary)
+  -- Injection script dir (extend/override built-ins; same-named user scripts win)
+  -- Built-ins: clean (generic denoise), readability (article extraction)
+  scripts_dir = vim.fn.stdpath("config") .. "/NeoAI/web_fetch/scripts",
+  cache = {
+    enabled = true,                -- Result cache switch
+    ttl_sec = 3600,                -- Cache TTL (seconds); <=0 means no expiry
+    max_entries = 200,             -- Max number of cached entries
+    max_bytes = 500 * 1024 * 1024, -- Max total cache size (bytes, default 500MB; evicts oldest first)
+  },
+},
+```
+
+> **Runtime behavior**: while disabled there are zero side effects (no tool registration, no dependency install);
+> once enabled, deps are installed into the cache dir (`stdpath('cache')/NeoAI/web_fetch`) and browsers are kept in the
+> same dir's `browsers/` — **the system environment is never modified**. If `node`/`npm` is missing it does not invoke a
+> system package manager, but returns an actionable error. `approval.per_tool.web_fetch = { auto_allow = true }` (auto-allowed
+> by default). Pipeline: Lua orchestrates → bash installs deps → Node/Playwright renders and injects JS → final DOM →
+> turndown converts to Markdown.
 
 ### 2.6 `herder`
 

@@ -56,6 +56,25 @@
 卡住主线程。光标是否跟随（最后 5 行内）在调度时缓存：不跟随时不弹悬浮窗、不收起折叠，
 并把重写前已展开的折叠块恢复，避免拽走用户正在查看的位置。
 
+### 4.3.1 增量刷新（避免整 buffer 重写）
+
+普通刷新（流式分片、事件驱动的重渲染、工具耗时 tick、窗口宽度变化等）**不再整 buffer 重写**，
+而走增量路径：
+
+- `components.incremental` 按「块 key + 签名」缓存每条消息（对话模式）或每个 turn（轨迹模式）
+  的渲染结果。签名覆盖所有影响渲染的输入（role/content/reasoning/tool_calls/duration_ms、
+  折叠块状态 `fold.get_status/get_duration`、`streaming`/`table_width` 等）；签名未变的块直接复用，
+  只有变化的块会重新渲染。
+- 拼接出的行与上次写入内容做最长公共前缀/后缀差分（`incremental.diff_range`），只把**变化的
+  行区间** `nvim_buf_set_lines` 写回；内容完全一致时**完全不触碰 buffer**（`changed=false`），
+  连带跳过 `zx`/`zM` 折叠重算与滚动。表格高亮也只在差异区间内重贴。
+- 因此流式输出时每片只改写末尾若干行，历史消息所在的前缀区域零开销；`chat_view._render` 依据
+  返回的 diff 决定是否重算折叠与滚动。
+
+缓存失效（`incremental.invalidate`）：会话切换、上下文压缩 / 计划蒸馏重排历史、
+切换显示模式、窗口宽度变化（表格重排）时清空镜像，下一次渲染回退到全量替换，避免基于旧行位置
+做差分写入。旧行为可通过 `ui.chat.incremental = false` 降级回整 buffer 全量重写。
+
 ### 4.4 折叠
 
 主窗口用 `expr` 折叠（`components.fold.foldexpr`），推理 / 每个工具调用块（调用+结果）各自独立成折叠。

@@ -41,7 +41,7 @@ and async-by-default (all I/O non-blocking).
 
 5. Tool System
    - Built-in tools: file ops, LSP, treesitter, shell, git, logging, todo,
-     plan_mode, ask_user, read_image, sub-agent, skills
+     plan_mode, ask_user, read_image, web_fetch (disabled by default), sub-agent, skills
    - Tool approval workflow (serial single-slot queue, auto-allow config,
      per-tool permission overrides, AUTO mode, approval timeout)
    - Plan mode: read-only/info tools + ask_user only; mutating tools gated
@@ -138,7 +138,7 @@ lua/NeoAI/
     environment.lua          -- Tool environment probing (disable unavailable)
     builtin/                 -- file_ops, shell, git_ops, lsp_ops, tree_ops, log_ops,
                              -- plan, todo, plan_mode, ask_user, read_image, skills,
-                             -- tool_helpers
+                             -- web_fetch (web fetch, disabled by default), tool_helpers
   utils/                     -- Utilities (async, json, http, fs, work, timer, image, stringx)
   tests/                     -- Test suite (:NeoAITest)
 ```

@@ -35,7 +35,7 @@ NeoAI 是一款面向 Neovim 的 AI 驱动聊天插件，可将 AI 助手直接�
 
 5. 工具系统
    - 内置工具：file ops、LSP、treesitter、shell、git、logging、todo、
-     plan_mode、ask_user、read_image、sub-agent、skills
+     plan_mode、ask_user、read_image、web_fetch（默认不启用）、sub-agent、skills
    - 工具审批工作流（串行单槽队列、自动允许配置、
      按工具权限覆盖、AUTO 模式、审批超时）
    - Plan mode：仅允许只读/信息类工具 + ask_user；修改类工具受门控
@@ -132,7 +132,7 @@ lua/NeoAI/
     environment.lua          -- 工具环境探测（禁用不可用的工具）
     builtin/                 -- file_ops、shell、git_ops、lsp_ops、tree_ops、log_ops、
                              -- plan、todo、plan_mode、ask_user、read_image、skills、
-                             -- tool_helpers
+                             -- web_fetch（网页抓取，默认不启用）、tool_helpers
   utils/                     -- 工具函数（async、json、http、fs、work、timer、image、stringx）
   tests/                     -- 测试套件（:NeoAITest）
 ```

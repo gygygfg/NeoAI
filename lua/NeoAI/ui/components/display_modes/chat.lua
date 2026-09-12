@@ -35,7 +35,7 @@ end
 --- @param opts table|nil 渲染选项（流式表格）
 function M.render(buf, messages, opts)
   local message_list = require("NeoAI.ui.components.message_list")
-  message_list.render_chat(buf, messages, opts)
+  return message_list.render_chat(buf, messages, opts)
 end
 
 manager.register(M)

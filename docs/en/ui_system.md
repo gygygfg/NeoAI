@@ -59,6 +59,27 @@ per-chunk full re-renders plus fold recomputation that would block the main thre
 folds are not collapsed, and fold blocks that were expanded before the rewrite are restored, so the position the
 user is viewing is not dragged away.
 
+### 4.3.1 Incremental Refresh (no full-buffer rewrite)
+
+Ordinary refreshes (streaming chunks, event-driven re-renders, tool-duration ticks, window-width changes, ...)
+**no longer rewrite the whole buffer**. They take an incremental path:
+
+- `components.incremental` caches the render result of each message (chat mode) or each turn (trajectory mode)
+  keyed by "block key + signature". The signature covers every input that affects rendering (role/content/reasoning/
+  tool_calls/duration_ms, fold-block state `fold.get_status`/`get_duration`, `streaming`/`table_width`, ...). Blocks
+  whose signature is unchanged are reused; only changed blocks are re-rendered.
+- The assembled lines are diffed against the last written content via longest common prefix/suffix
+  (`incremental.diff_range`), and only the **changed line range** is written back with `nvim_buf_set_lines`. When the
+  content is identical the buffer is **not touched at all** (`changed=false`), which also skips the `zx`/`zM` fold
+  recomputation and scrolling. Table highlights are likewise only repainted inside the diff range.
+- As a result, each streaming chunk rewrites only a few trailing lines, and the prefix region holding earlier
+  messages costs nothing. `chat_view._render` uses the returned diff to decide whether to recompute folds and scroll.
+
+Cache invalidation (`incremental.invalidate`): switching sessions, context compaction / plan distillation that
+reorders history, switching display modes, and window-width changes (table reflow) clear the mirror so the next
+render falls back to a full rewrite, avoiding diff writes based on stale line positions. The old behavior can be
+restored by setting `ui.chat.incremental = false`.
+
 ### 4.4 Folds
 
 The main window uses `expr` folds (`components.fold.foldexpr`); reasoning / each tool call block (call + result)

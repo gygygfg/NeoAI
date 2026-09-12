@@ -6,6 +6,7 @@
 local window_manager = require("NeoAI.ui.window.manager")
 local config_store = require("NeoAI.kernel.config_store")
 local message_list = require("NeoAI.ui.components.message_list")
+local incremental = require("NeoAI.ui.components.incremental")
 local input_box = require("NeoAI.ui.components.input_box")
 local model_picker = require("NeoAI.ui.components.model_picker")
 local reasoning_panel = require("NeoAI.ui.components.reasoning_panel")
@@ -100,9 +101,10 @@ local function _current_table_width()
   return nil
 end
 
---- 渲染全部消息
+--- 渲染全部消息（增量：块缓存 + 差分写入）
 --- @param keep_view boolean|nil 仅刷新折叠文本（如工具耗时更新）时传 true：
 --- 无论光标是否在跟随区，都记录并恢复已展开的折叠块与光标/视口，避免把正在查看的地方拽走。
+--- @return boolean 内容是否发生变化（false = 未触碰 buffer/折叠/视口）
 local function _render(keep_view)
   -- 不跟随（用户回看上方内容）或仅刷新折叠文本时记录已展开的折叠块，
   -- 重写 buffer 后恢复其展开状态，避免把用户正在查看的内容重新折叠起来。
@@ -119,7 +121,12 @@ local function _render(keep_view)
   if state.last_table_width then
     render_opts.table_width = state.last_table_width
   end
-  message_list.render(state.buf, messages, render_opts)
+  local diff = message_list.render(state.buf, messages, render_opts)
+  -- 内容无任何变化（如工具耗时 tick 落在同一毫秒、重复 refresh）：
+  -- 完全不触碰 buffer / 折叠 / 视口，直接返回。
+  if diff and diff.changed == false then
+    return false
+  end
   if state.win_id and vim.api.nvim_win_is_valid(state.win_id) then
     vim.api.nvim_win_call(state.win_id, function()
       -- 每次重写 buffer 后，expr 折叠并不会自动重算（带 UI 会话里 nvim_buf_set_lines
@@ -144,6 +151,7 @@ local function _render(keep_view)
       end
     end)
   end
+  return true
 end
 
 --- 刷新/滚动到底部
@@ -179,9 +187,10 @@ local function _do_render()
   render_flushed = true
   local keep_view = render_pending_keep_view
   render_pending_keep_view = false
-  _render(keep_view)
-  -- 仅跟随且非保持视图时才滚动到底部：保持视图（如工具耗时刷新）时不动视口。
-  if render_pending_follow and not keep_view then
+  local changed = _render(keep_view)
+  -- 仅跟随且非保持视图且内容确实变化时才滚动到底部：
+  -- 保持视图（如工具耗时刷新）时不动视口；内容无变化时无需重新滚动。
+  if changed and render_pending_follow and not keep_view then
     _scroll_to_end()
   end
 end
@@ -922,6 +931,8 @@ local function _register_resize_reflow()
       -- 仅聊天窗口打开时才重排；宽度未变（如仅高度拖动）则跳过，避免无谓整表重写
       local tw = _current_table_width()
       if tw and tw ~= state.last_table_width then
+        -- 表格宽度变化：历史消息的整表渲染都变，块缓存失效后按全量重写。
+        message_list.invalidate(state.buf)
         _schedule_render(true)
       end
     end,
@@ -1074,6 +1085,8 @@ function M.open(opts)
       reasoning_panel.close()
       _cancel_ctxop()
       float_stream_window.close()
+      -- 会话切换：历史全变，块缓存与内容镜像失效（下次渲染走全量替换）
+      message_list.invalidate(state.buf)
       _render()
       _scroll_to_end()
     end
@@ -1228,6 +1241,8 @@ function M.close()
   state.input_win_id = nil
   state.agent_id = nil
   state.following = true
+  -- 缓存以 buffer 为键，关闭前已删除 buffer，回收其块缓存避免泄漏
+  incremental.reset()
 end
 
 --- 是否有打开的窗口
@@ -1237,8 +1252,12 @@ function M.has_window()
 end
 
 --- 刷新聊天窗口
+--- 立即重绘聊天界面（显式刷新：强制全量重绘，保证折叠状态重置与容器重算）
 function M.refresh()
   if not state.buf then return end
+  -- 显式刷新（用户命令 / 显示模式激活）语义 = 「重新渲染」，与旧的整 buffer 重写一致：
+  -- 使块缓存失效后重绘，保证重渲染会把推理/工具折叠重新收起。
+  message_list.invalidate(state.buf)
   _render()
 end
 

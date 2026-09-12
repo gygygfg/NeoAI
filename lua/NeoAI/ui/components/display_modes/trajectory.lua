@@ -11,6 +11,7 @@
 
 local manager = require("NeoAI.ui.components.display_modes")
 local stringx = require("NeoAI.utils.stringx")
+local incremental = require("NeoAI.ui.components.incremental")
 
 local M = {
   name = "trajectory",
@@ -293,7 +294,7 @@ local function _group_turns(messages)
   return turns
 end
 
---- 生成轨迹视图的全部行
+--- 生成轨迹视图的全部行（全量；供 build_lines / build_log / 测试使用）
 --- @param messages table
 --- @param opts table|nil { full? } full=true 时不截断原始请求体/响应分片（供保存日志）
 --- @return table
@@ -312,6 +313,117 @@ local function _build_lines(messages, opts)
     end
   end
   return lines
+end
+
+--- 文本指纹（见 incremental.fingerprint）
+--- @param s string|nil
+--- @return string
+local function _fingerprint(s)
+  return incremental.fingerprint(s)
+end
+
+--- 请求元数据签名（覆盖请求参数与原始请求体）
+--- @param req table|nil
+--- @return string
+local function _req_sig(req)
+  if not req then return "nil" end
+  local helpers = require("NeoAI.ui.components.message_list").helpers
+  local body_fp = "nil"
+  if req.body then
+    local ok, enc = pcall(helpers.pretty_json, req.body)
+    body_fp = _fingerprint(ok and enc or tostring(req.body))
+  end
+  return table.concat({ tostring(req.model), tostring(req.provider), body_fp }, ",")
+end
+
+--- 响应元数据签名（覆盖 finish_reason / 用量 / 耗时 / SSE 分片）
+--- @param resp table|nil
+--- @return string
+local function _resp_sig(resp)
+  if not resp then return "nil" end
+  local p = {
+    tostring(resp.finish_reason), tostring(resp.ttft_ms), tostring(resp.total_ms),
+    tostring(resp.status), tostring(resp.raw_truncated),
+  }
+  local u = resp.usage
+  if u then
+    for _, k in ipairs({ "prompt_tokens", "completion_tokens", "prompt_cache_hit_tokens", "prompt_cache_miss_tokens" }) do
+      p[#p + 1] = tostring(u[k])
+    end
+  end
+  local ch = resp.raw_chunks
+  if ch then
+    p[#p + 1] = "#" .. #ch
+    p[#p + 1] = _fingerprint(table.concat(ch))
+  end
+  return table.concat(p, ",")
+end
+
+--- 单个 turn 的渲染签名：覆盖该 turn 全部渲染输入（用户内容、各条 entry 的
+--- 角色/正文/推理/工具调用/耗时、请求与响应元数据、推理开关与 full 标志）。
+--- @param turn table
+--- @param full boolean|nil
+--- @return string
+local function _turn_sig(turn, full)
+  local message_list = require("NeoAI.ui.components.message_list")
+  local fold = require("NeoAI.ui.components.fold")
+  local p = {
+    tostring(turn.kind), tostring(turn.index), full and "F" or "-",
+    message_list.is_show_reasoning() and "R" or "-",
+  }
+  if turn.kind == "system" then
+    for _, m in ipairs(turn.sys_msgs or {}) do
+      p[#p + 1] = _fingerprint(m.content)
+    end
+    return table.concat(p, "\1")
+  end
+  if turn.user then
+    p[#p + 1] = _fingerprint(turn.user.content)
+  end
+  for _, m in ipairs(turn.entries or {}) do
+    p[#p + 1] = tostring(m.role)
+    p[#p + 1] = _fingerprint(m.content)
+    p[#p + 1] = _fingerprint(m.reasoning)
+    p[#p + 1] = tostring(m.duration_ms)
+    for _, tc in ipairs(m.tool_calls or {}) do
+      local fn = tc["function"] or {}
+      p[#p + 1] = "tc"
+      p[#p + 1] = tostring(tc.id)
+      p[#p + 1] = tostring(fn.name)
+      p[#p + 1] = _fingerprint(fn.arguments)
+      p[#p + 1] = tostring(fold.get_status(tc.id))
+      p[#p + 1] = tostring(fold.get_duration(tc.id))
+    end
+    p[#p + 1] = _req_sig(m.request)
+    p[#p + 1] = _resp_sig(m.response)
+  end
+  return table.concat(p, "\1")
+end
+
+--- 把消息分组为可缓存的渲染块（系统提示词块 + 每个 turn 一块）
+--- @param messages table
+--- @param full boolean|nil
+--- @return table 块数组 { { key, sig, build } }
+local function _render_blocks(messages, full)
+  local blocks = {}
+  for _, turn in ipairs(_group_turns(messages)) do
+    local snap = turn
+    local sig = _turn_sig(snap, full)
+    blocks[#blocks + 1] = {
+      key = "t:" .. tostring(snap.index) .. ":" .. tostring(snap.kind),
+      sig = sig,
+      build = function()
+        local lines = {}
+        if snap.kind == "system" then
+          _append_system(lines, snap)
+        else
+          _append_turn(lines, snap, full)
+        end
+        return { lines = lines, marks = {} }
+      end,
+    }
+  end
+  return blocks
 end
 
 --- 逐行计算折叠等级（多级：turn=1、小节=2、子块=3）。
@@ -373,13 +485,22 @@ function M.unload(host)
   end
 end
 
---- 渲染消息到 buffer
+--- 渲染消息到 buffer（增量：按 turn 块缓存 + 差分写入）
 --- @param buf number
 --- @param messages table
+--- @return table 增量写入结果 { changed, start, removed, inserted, full }
 function M.render(buf, messages)
-  local lines = _build_lines(messages)
-  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+  local cache = incremental.cache_for(buf)
+  local lines = cache:render(_render_blocks(messages, nil))
+  if #lines == 0 then
+    -- 空对话占位（与全量渲染一致）
+    lines = { "NeoAI 聊天（轨迹模式）", "", "输入消息开始对话。", "" }
+    cache.new_lines = lines
+    cache.new_marks = {}
+  end
+  local diff = cache:write(buf)
   vim.bo[buf].modifiable = true
+  return diff
 end
 
 --- 文本构建（测试用，无 buffer 副作用）

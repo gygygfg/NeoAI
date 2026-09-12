@@ -225,6 +225,9 @@ local DEFAULT_CONFIG = {
     chat = {
       -- 鼠标滚轮滚到底部时，末行下方允许留出的最大空白行数（0 = 严格贴底不留白）
       mousescroll_max_blank = 3,
+      -- 增量刷新：仅重渲染变化的消息块并只写入差异行（默认开启）。
+      -- 设为 false 时降级回整 buffer 全量重写（用于排查渲染问题）。
+      incremental = true,
     },
     trajectory = {
       log_dir = vim.fn.stdpath("cache") .. "/NeoAI/logs", -- 轨迹日志保存目录（可自定义；缺省 ~/.cache/nvim/NeoAI/logs）
@@ -329,6 +332,36 @@ local DEFAULT_CONFIG = {
     todo = {
       enabled = true, -- 待办清单工具 + 系统提示注入
     },
+    -- 网页抓取：把动态网页（React/Vue/SPA）在无头浏览器中渲染后转成 Markdown。
+    --
+    -- ⚠️ 依赖提示：启用本工具（enabled = true）会自动检查和安装 Node 依赖，
+    --   需在系统中预先安装【node 与 npm】（>=18，需在 PATH 中）；随后工具会
+    --   在缓存目录（stdpath('cache')/NeoAI/web_fetch）内自动执行：
+    --     npm i playwright turndown @mozilla/readability
+    --     npx playwright install chromium   （下载浏览器内核，首次较慢）
+    --   即启用会安装 node 与 playwright 相关依赖，请确保网络通畅、磁盘充足。
+    --   本工具默认【不启用】；不使用 Web 抓取时保持 enabled = false 即可。
+    web_fetch = {
+      enabled = false, -- 总开关（默认关闭；开启后才会注册工具、安装依赖、抓取）
+      auto_install = true, -- 启用后在后台自动检查/安装依赖（关闭则首次调用时按需安装）；安装内容：playwright + turndown + @mozilla/readability + 浏览器内核
+      engine = "chromium", -- 浏览器引擎：chromium | firefox | webkit
+      format = "markdown", -- 默认输出格式：markdown | text | html
+      timeout_ms = 45000, -- 单次抓取总超时（ms，含启动浏览器）；<=0 时用 nav_timeout_ms + 15s
+      nav_timeout_ms = 30000, -- 页面导航/等待超时（ms）
+      max_bytes = 2 * 1024 * 1024, -- 单次返回内容上限（字节，超出截断）
+      install_timeout_ms = 600000, -- 依赖安装超时（ms，首次下载浏览器内核可能较久）
+      node_path = "", -- 自定义 node 可执行文件路径（空则用 PATH 中的 node）
+      install_os_deps = false, -- 安装浏览器时是否附带系统依赖（需要 root/sudo，一般无需开启）
+      -- 注入脚本目录（可扩展/覆盖内置脚本；同名用户脚本优先）
+      -- 内置脚本：clean（通用去噪）、readability（正文提取）
+      scripts_dir = vim.fn.stdpath("config") .. "/NeoAI/web_fetch/scripts",
+      cache = {
+        enabled = true, -- 结果缓存开关
+        ttl_sec = 3600, -- 缓存有效期（秒）；<=0 表示不过期
+        max_entries = 200, -- 缓存条目数上限
+        max_bytes = 500 * 1024 * 1024, -- 缓存总大小上限（字节，默认 500MB；超出按最旧优先淘汰）
+      },
+    },
     plan_mode = {
       enabled = true, -- 计划模式
       auto_execute_on_approve = true, -- 计划经用户确认后自动转入 CHAT 并按任务清单开始执行
@@ -382,6 +415,7 @@ local DEFAULT_CONFIG = {
         lsp_rename = { auto_allow = false },
         lsp_format = { auto_allow = false },
         delete_node = { auto_allow = false },
+        web_fetch = { auto_allow = true },
       },
     },
   },

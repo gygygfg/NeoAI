@@ -16,6 +16,7 @@ local PACK_ORDER = {
   agent = 7,
   mcp = 8,
   skill = 9,
+  web = 10,
 }
 
 -- ========== 公开 API ==========
@@ -102,6 +103,7 @@ function M.pack_display_name(category)
     agent = "子 Agent",
     mcp = "MCP",
     skill = "技能",
+    web = "网页抓取",
     other = "其它",
   }
   return names[category] or category

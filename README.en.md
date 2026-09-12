@@ -25,6 +25,7 @@
 - **⚠️⚠️⚠️Requests are sent with curl** — if curl is not available in the environment, requests may fail
 - **Pending message queue** — messages sent while the Agent is busy are queued automatically, a `待发N` ("N pending") badge appears in the statusline as a reminder, and the badge disappears once the messages are actually sent
 - **Multimodal images** — the `read_image` tool loads PNG/JPEG/WebP/GIF and injects them into multimodal models (content-addressed attachment storage + request-time pixel/byte budget offload, automatically degrading to text when the model does not support images)
+- **Web fetch (web_fetch)** — render dynamic pages (React/Vue/SPA) in a headless browser, inject JS, take the final DOM and convert it to Markdown with a general converter; **disabled by default**, and once enabled it auto-installs deps into the cache dir and caches results by URL (default cap 500MB)
 - **lualine statusline integration** — show model usage, cache-hit rate, and context capacity in real time inside the chat window via `nvim-lualine` (the model/usage/cache/capacity sections are customizable)
 - **Herder status reporting** — report Agent state (working/idle/blocked) in real time inside the Herder pane, automatically aggregating multiple sessions, with a strictly increasing `--seq` to guard against concurrent rollback
 - **Tool argument receiving panel** — while the model streams tool-call arguments, a "receiving arguments" floating window (`tool_args_panel`) opens in real time, appending each chunk incrementally and closing automatically once the arguments end, consistent with the reasoning floating window
@@ -743,6 +744,36 @@ Remote `tools/list` → one NeoAI tool per remote tool; `resources`/`prompts` �
 > The system prompt injects the list of "available skills" (`skills.inject_mode`), and the model can `load_skill` to load the body text.
 > See [docs/en/skills.md](docs/en/skills.md).
 
+### 🌐 Web Fetch Tool (disabled by default)
+
+| Tool name   | Description | Default approval |
+| ----------- | ----------- | ---------------- |
+| `web_fetch` | Fetch a page and render it to readable content (Markdown/text/HTML); for dynamic pages it runs JS in a headless browser and takes the final DOM | ✅ Auto-allowed |
+
+**Pipeline**: Neovim (Lua only orchestrates) → bash checks/installs deps → Node + Playwright renders and injects JS → final DOM → turndown converts to Markdown → returned (optionally cached). Lua never parses dynamic pages itself.
+
+- **Disabled by default**: set `tools.web_fetch.enabled = true`; while off, the tool is not registered and no dependency is installed.
+- **Auto dependency install**: once enabled, bash checks and installs Node deps (`playwright` / `turndown` / `@mozilla/readability`) and the browser engine **inside the cache dir** (`stdpath('cache')/NeoAI/web_fetch`, browsers under `browsers/`) — no root, no system changes. With `auto_install = true` (default) it installs in the background and the first call waits for it.
+- **No system Node install**: if `node`/`npm` is missing, an actionable error is returned (it will not silently run a system package manager).
+- **Injection scripts**: built-in scripts live in `assets/web_fetch/scripts/` (`clean` generic denoise, `readability` article extraction); you can drop same-named scripts into `tools.web_fetch.scripts_dir` (default `stdpath('config')/NeoAI/web_fetch/scripts`) to **override** the built-ins, or select one with the `script` arg.
+- **Cache**: results are cached by URL + args with TTL / entry-count / **total-size cap (default 500MB)**, evicting oldest first; a single entry larger than the cap is not cached.
+- **Args**: `url` (required), `selector`, `wait_selector`, `wait_ms`, `script`, `format` (`markdown`/`text`/`html`), `force_refresh`.
+
+```lua
+require("NeoAI").setup({
+  tools = {
+    web_fetch = {
+      enabled = true,            -- default false
+      engine = "chromium",       -- chromium | firefox | webkit
+      cache = { max_bytes = 500 * 1024 * 1024 },
+    },
+  },
+})
+```
+
+> Requires `node` (>=18) and `npm` in `PATH` (use `tools.web_fetch.node_path` to point at a node binary).
+> The first enable downloads the browser engine, so make sure the network is available.
+
 ---
 ## 🏗️ Architecture
 
@@ -752,6 +783,12 @@ Built on the v3.0 architecture guide (see [styleGuide.md](styleGuide.en.md)), fo
 NeoAI/
 ├── init.lua                    # Main entry: extremely thin, only setup + command/keymap registration, business logic lazy-loaded
 ├── default_config.lua          # Default config (pure data, zero logic)
+│
+├── assets/                     # Bundled resources shipped with the plugin
+│   └── web_fetch/              # Web fetch runtime (copied into the cache dir)
+│       ├── render_url.js       # Playwright renderer (JS injection + turndown)
+│       ├── package.json        # Node dependency list (playwright/turndown/readability)
+│       └── scripts/            # Built-in injection scripts (clean / readability)
 │
 ├── kernel/                     # Kernel layer (lowest level, zero business dependencies)
 │   ├── events.lua             # Event constant registry (domain:verb naming)
@@ -856,7 +893,7 @@ NeoAI/
 │   ├── image.lua             # Image type detection/media type
 │   └── stringx.lua           # String extensions
 │
-└── tests/                      # Tests (custom runner, :NeoAITest; 44 test_*.lua files total)
+└── tests/                      # Tests (custom runner, :NeoAITest; 45 test_*.lua files total)
     ├── init.lua               # Assertions + runner
     ├── test_kernel.lua        # Kernel (config_store/event_bus/events/lifecycle)
     ├── test_session.lua       # Session (session/store/context_builder/compactor)

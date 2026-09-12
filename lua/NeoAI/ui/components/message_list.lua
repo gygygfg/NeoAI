@@ -8,6 +8,7 @@ local fold = require("NeoAI.ui.components.fold")
 local config_store = require("NeoAI.kernel.config_store")
 local json = require("NeoAI.utils.json")
 local display_modes = require("NeoAI.ui.components.display_modes")
+local incremental = require("NeoAI.ui.components.incremental")
 
 local M = {}
 
@@ -25,6 +26,13 @@ local ROLE_LABELS = {
 local state = {
   show_reasoning = true,
 }
+
+--- 取指定 buffer 的共享块缓存（对话模式块键前缀 c:，避免与轨迹模式互相命中）
+--- @param buf number
+--- @return table
+local function _cache_for(buf)
+  return incremental.cache_for(buf)
+end
 
 -- ========== 私有函数 ==========
 
@@ -83,35 +91,64 @@ local function _ensure_table_hl()
 end
 
 --- 对 buffer 应用表格斑马纹高亮。
+--- 传入 range_from/range_to 时只重贴该区间（增量）：前缀区域的高亮保持不动，
+--- 由调用方保证区间外的内容与高亮未变化；缺省时清空整个命名空间后全量重加。
 --- @param buf number
 --- @param marks table|nil 与行并行的元数据数组（每元素 nil 或 { tbl = "border"|"odd"|"even" }）
 --- @param start_line number|nil marks[1] 对应的 1-based buffer 行号（默认 1）
-local function _apply_table_hl(buf, marks, start_line)
+--- @param range_from number|nil 增量重贴起始行（1-based，含）
+--- @param range_to number|nil 增量重贴结束行（1-based，含）
+local function _apply_table_hl(buf, marks, start_line, range_from, range_to)
   if not buf or not vim.api.nvim_buf_is_valid(buf) then return end
+  -- marks 与行并行，首行多为 nil（角色头等无高亮），不能用 ipairs（遇 nil 即止）。
   local has = false
-  for _, m in ipairs(marks or {}) do
-    if m and m.tbl then has = true break end
+  for i = 1, #(marks or {}) do
+    if marks[i] and marks[i].tbl then has = true break end
   end
   if not has then return end
   _ensure_table_hl()
   start_line = start_line or 1
-  vim.api.nvim_buf_clear_namespace(buf, TABLE_HL_NS, 0, -1)
-  for ln, m in ipairs(marks) do
+  local paint = function(b, ns, m, row)
     local group = m and TABLE_HL_GROUP[m.tbl]
     if group then
-      pcall(vim.api.nvim_buf_add_highlight, buf, TABLE_HL_NS, group, start_line - 1 + (ln - 1), 0, -1)
+      pcall(vim.api.nvim_buf_add_highlight, b, ns, group, row, 0, -1)
+    end
+  end
+  if range_from and range_to and range_to >= range_from then
+    -- 增量：只重贴差异区间（marks 是全量数组，需按 start_line 偏移换算行号）
+    local mfrom = range_from - start_line + 1
+    local mto = range_to - start_line + 1
+    local from = math.max(1, mfrom)
+    local to = math.min(#(marks or {}), mto)
+    pcall(vim.api.nvim_buf_clear_namespace, buf, TABLE_HL_NS, range_from - 1, range_to)
+    for ln = from, to do
+      local m = marks[ln]
+      if m and m.tbl then
+        paint(buf, TABLE_HL_NS, m, start_line - 1 + (ln - 1))
+      end
+    end
+    return
+  end
+  vim.api.nvim_buf_clear_namespace(buf, TABLE_HL_NS, 0, -1)
+  for ln = 1, #marks do
+    local m = marks[ln]
+    if m and m.tbl then
+      paint(buf, TABLE_HL_NS, m, start_line - 1 + (ln - 1))
     end
   end
 end
 
 --- 追加一行渲染输出，并记录与该行并行的元数据（marks，供斑马纹高亮）。
+--- 注意：marks 与 lines 严格按下标对齐。必须用 lines 的长度做下标——
+--- 不能写 `marks[#marks + 1] = mark`：mark 为 nil（角色头/空行）时不会推进长度，
+--- 后续非 nil 标记会被挤到靠前的下标，导致高亮错行。
 --- @param lines table 文本行数组
 --- @param marks table 与 lines 并行的元数据数组（nil 或 { tbl = "border"|"odd"|"even" }）
 --- @param text string
 --- @param mark table|nil
 local function _push(lines, marks, text, mark)
   lines[#lines + 1] = text
-  marks[#marks + 1] = mark
+  marks[#lines] = mark
 end
 
 --- 追加一个可折叠块（推理 / 单个工具块）。所有行缩进 2 格，由聊天窗口的
@@ -392,98 +429,217 @@ end
 --- @param buf number
 --- @param messages table 数组
 --- @param opts table|nil { streaming? boolean } 流式生成中时不对表格填充
+--- @return table|nil 增量写入结果 { changed, start, removed, inserted, full }
 function M.render(buf, messages, opts)
+  local diff
   local plugin = display_modes.get_current()
   if plugin and plugin.render then
-    plugin.render(buf, messages, opts)
+    diff = plugin.render(buf, messages, opts)
   else
-    M.render_chat(buf, messages, opts)
+    diff = M.render_chat(buf, messages, opts)
   end
   -- 聊天消息 buffer 是纯 UI 暂存（非用户文件）：清除 modified，避免 :q/退出时
   -- 触发 E37/E162 "No write since last change"（尤其 acwrite 命名的聊天 buffer）。
   if vim.api.nvim_buf_is_valid(buf) then
     vim.bo[buf].modified = false
   end
+  return diff
 end
 
---- 渲染消息列表到 buffer（默认对话模式）
+--- 文本指纹（见 incremental.fingerprint）
+--- @param s string|nil
+--- @return string
+local function _fingerprint(s)
+  return incremental.fingerprint(s)
+end
+
+--- 按「流式末尾消息 / 表格宽度」生成单条消息的渲染选项
+--- @param is_stream boolean
+--- @param opts table|nil
+--- @return table|nil
+local function _msg_opts(is_stream, opts)
+  local tw = opts and opts.table_width
+  if not is_stream and not tw then return nil end
+  local o = {}
+  if is_stream then o.streaming = true end
+  if tw then o.table_width = tw end
+  return o
+end
+
+--- 拼接块渲染签名（任何影响渲染结果的输入都必须纳入，否则会命中陈旧缓存）
+--- @param opts table|nil
+--- @param turn_end boolean
+--- @param extra table|nil
+--- @return string
+local function _sig(opts, turn_end, extra)
+  local p = {
+    state.show_reasoning and "R" or "-",
+    (opts and opts.streaming) and "S" or "-",
+    (opts and opts.table_width) or "-",
+    turn_end and "T" or "-",
+  }
+  for _, e in ipairs(extra or {}) do
+    p[#p + 1] = e
+  end
+  return table.concat(p, "\1")
+end
+
+--- 把消息序列切分为可缓存的渲染块。每个块 = 一条消息；带工具调用的 assistant
+--- 消息与其配对的工具结果消息合并为一个块（工具结果消息不再单独成块）。
+--- 运行时上下文快照与 system 消息不渲染（不产生块）。
+--- @param msgs table
+--- @param opts table|nil
+--- @return table 块数组 { { key, sig, build } }
+local function _blocks(msgs, opts)
+  local blocks = {}
+  local i = 1
+  while i <= #msgs do
+    local idx = i
+    local msg = msgs[idx]
+    if msg.runtime_context then
+      i = i + 1
+    elseif msg.role == "system" then
+      i = i + 1
+    elseif msg.role == "assistant" and msg.tool_calls and #msg.tool_calls > 0 then
+      -- 工具结果消息按调用顺序紧随其后；仅在当前位置确实是工具结果时才推进
+      -- （否则工具未返回结果时会把下一条非工具消息当作结果位置消费掉）。
+      local snap = msg
+      local paired = {}
+      local ridx = idx + 1
+      for _, tc in ipairs(snap.tool_calls) do
+        local res = nil
+        if msgs[ridx] and msgs[ridx].role == "tool" then
+          res = msgs[ridx]
+          ridx = ridx + 1
+        end
+        paired[#paired + 1] = { tc = tc, res = res }
+      end
+      local consumed_until = ridx - 1
+      local turn_end = _is_turn_end(msgs, idx)
+      local extra = { "assistant", _fingerprint(snap.content), _fingerprint(snap.reasoning) }
+      for _, pp in ipairs(paired) do
+        local fn = pp.tc["function"] or {}
+        extra[#extra + 1] = "tc"
+        extra[#extra + 1] = tostring(pp.tc.id)
+        extra[#extra + 1] = tostring(fn.name)
+        extra[#extra + 1] = _fingerprint(fn.arguments)
+        extra[#extra + 1] = tostring(fold.get_status(pp.tc.id))
+        extra[#extra + 1] = tostring(fold.get_duration(pp.tc.id))
+        extra[#extra + 1] = pp.res and "res" or "nil"
+        if pp.res then
+          extra[#extra + 1] = _fingerprint(pp.res.content)
+          extra[#extra + 1] = tostring(pp.res.duration_ms)
+        end
+      end
+      local is_stream = opts and opts.streaming and idx == #msgs
+      local eopts = _msg_opts(is_stream, opts)
+      local sig = _sig(eopts, turn_end, extra)
+      blocks[#blocks + 1] = {
+        key = "c:" .. idx,
+        sig = sig,
+        build = function()
+          local lines, marks = {}, {}
+          _append_role_header(lines, marks, snap)
+          _append_reasoning(lines, marks, snap, eopts)
+          _append_content(lines, marks, snap, eopts)
+          for _, pp in ipairs(paired) do
+            _append_tool_block(lines, marks, pp.tc, pp.res)
+          end
+          if turn_end then
+            _append_turn_sep(lines, marks)
+          end
+          return { lines = lines, marks = marks }
+        end,
+      }
+      i = consumed_until + 1
+    else
+      local snap = msg
+      local turn_end = _is_turn_end(msgs, idx)
+      local is_stream = opts and opts.streaming and idx == #msgs
+      local eopts = _msg_opts(is_stream, opts)
+      local sig = _sig(eopts, turn_end, { snap.role or "", _fingerprint(snap.content), _fingerprint(snap.reasoning) })
+      blocks[#blocks + 1] = {
+        key = "c:" .. idx,
+        sig = sig,
+        build = function()
+          local lines, marks = {}, {}
+          _format_message(lines, marks, snap, turn_end, eopts)
+          return { lines = lines, marks = marks }
+        end,
+      }
+      i = i + 1
+    end
+  end
+  return blocks
+end
+
+--- 是否开启增量刷新（ui.chat.incremental，默认 true）
+--- @return boolean
+local function _incremental_enabled()
+  return config_store.get("ui.chat.incremental") ~= false
+end
+
+--- 降级路径：整 buffer 全量重写（ui.chat.incremental = false 时使用）
+--- @param buf number
+--- @param msgs table
+--- @param opts table|nil
+--- @return table
+local function _render_chat_full(buf, msgs, opts)
+  local lines, marks = {}, {}
+  for _, b in ipairs(_blocks(msgs, opts)) do
+    local built = b.build() or {}
+    local bl = built.lines or {}
+    local bm = built.marks or {}
+    for i = 1, #bl do
+      lines[#lines + 1] = bl[i]
+      marks[#lines] = bm[i]
+    end
+  end
+  if #lines == 0 then
+    lines = { "NeoAI 聊天", "", "输入消息开始对话。", "" }
+    marks = { nil, nil, nil, nil }
+  end
+  vim.bo[buf].modifiable = true
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+  _apply_table_hl(buf, marks)
+  -- 已直接重写全书：块缓存与内容镜像过期
+  incremental.invalidate(buf)
+  return { changed = true, start = 1, removed = -1, inserted = #lines, full = true }
+end
+
+--- 渲染消息列表到 buffer（默认对话模式，增量：块缓存 + 差分写入）
 --- @param buf number
 --- @param messages table 数组
 --- @param opts table|nil { streaming? boolean; table_width? number }
 ---   streaming 流式生成中时不对表格填充；table_width 限制表格总显示宽度（随窗口自适应）
+--- @return table 增量写入结果 { changed, start, removed, inserted, full }
 function M.render_chat(buf, messages, opts)
-  local all_lines = {}
-  local all_marks = {}
   local msgs = messages or {}
-  local streaming = opts and opts.streaming
-  local table_width = opts and opts.table_width
-  local i = 1
-  while i <= #msgs do
-    local msg = msgs[i]
-    -- 仅对仍在流式生成的末尾消息使用原始表格渲染，历史消息照常对齐；
-    -- 表格总宽随窗口自适应（table_width 始终透传，含历史消息）
-    local is_stream = streaming and i == #msgs
-    local msg_opts = nil
-    if is_stream or table_width then
-      msg_opts = {}
-      if is_stream then msg_opts.streaming = true end
-      if table_width then msg_opts.table_width = table_width end
-    end
-    if msg.runtime_context then
-      i = i + 1 -- 运行时上下文快照不渲染为聊天消息（只进模型请求）
-    elseif msg.role == "system" then
-      i = i + 1
-    elseif msg.role == "assistant" and msg.tool_calls and #msg.tool_calls > 0 then
-      -- 该 assistant 消息带工具调用：渲染角色头 + 推理 + 正文（模型常在调用工具前
-      -- 先输出一段话，这段正文必须保留，否则工具调用落地后正文会从界面消失），
-      -- 再把每个调用与其结果配对
-      local lines = {}
-      local marks = {}
-      _append_role_header(lines, marks, msg)
-      _append_reasoning(lines, marks, msg, msg_opts)
-      _append_content(lines, marks, msg, msg_opts)
-      -- 工具结果消息按调用顺序紧随其后（tool_loop 保证顺序一致）。
-      -- 仅在当前位置确实是工具结果时才推进（否则工具未返回结果时会把
-      -- 下一条非工具消息（如下一轮用户消息）当作结果位置消费掉，导致其从界面消失）
-      local result_idx = i + 1
-      for _, tc in ipairs(msg.tool_calls) do
-        local result_msg = nil
-        if msgs[result_idx] and msgs[result_idx].role == "tool" then
-          result_msg = msgs[result_idx]
-          result_idx = result_idx + 1
-        end
-        _append_tool_block(lines, marks, tc, result_msg)
-      end
-      -- 消费掉该 assistant 消息与所有配对到的工具结果消息
-      local consumed_until = result_idx - 1
-      -- 轮次分割线：若本条 assistant 消息是本轮可见最后一条则补分割线
-      local turn_end = _is_turn_end(msgs, i)
-      if turn_end then
-        _append_turn_sep(lines, marks)
-      end
-      for k = 1, #lines do
-        all_lines[#all_lines + 1] = lines[k]
-        all_marks[#all_marks + 1] = marks[k]
-      end
-      i = consumed_until + 1
-    else
-      local lines = {}
-      local marks = {}
-      _format_message(lines, marks, msg, _is_turn_end(msgs, i), msg_opts)
-      for k = 1, #lines do
-        all_lines[#all_lines + 1] = lines[k]
-        all_marks[#all_marks + 1] = marks[k]
-      end
-      i = i + 1
-    end
+  if not _incremental_enabled() then
+    return _render_chat_full(buf, msgs, opts)
   end
-  if #all_lines == 0 then
-    all_lines = { "NeoAI 聊天", "", "输入消息开始对话。", "" }
-    all_marks = { nil, nil, nil, nil }
+  local cache = _cache_for(buf)
+  local lines, marks = cache:render(_blocks(msgs, opts))
+  if #lines == 0 then
+    -- 空对话占位（与旧行为一致）
+    lines = { "NeoAI 聊天", "", "输入消息开始对话。", "" }
+    marks = { nil, nil, nil, nil }
   end
-  vim.api.nvim_buf_set_lines(buf, 0, -1, false, all_lines)
-  vim.bo[buf].modifiable = true
-  _apply_table_hl(buf, all_marks)
+  cache.new_lines = lines
+  cache.new_marks = marks
+  local diff = cache:write(buf)
+  if diff.changed then
+    local from, to = incremental.written_range(diff)
+    _apply_table_hl(buf, marks, 1, diff.full and nil or from, diff.full and nil or to)
+  end
+  return diff
+end
+
+--- 使指定 buffer 的块缓存失效（下次渲染走全量替换）
+--- 会话切换 / 上下文压缩重排 / 显示模式切换 / 表格宽度变化时调用。
+--- @param buf number|nil
+function M.invalidate(buf)
+  incremental.invalidate(buf)
 end
 
 --- 追加消息到 buffer（增量渲染）
@@ -496,6 +652,8 @@ function M.append(buf, message)
   local line_count = vim.api.nvim_buf_line_count(buf)
   vim.api.nvim_buf_set_lines(buf, line_count - 1, -1, false, lines)
   _apply_table_hl(buf, marks, line_count)
+  -- 直接写入后块缓存的内容镜像过期：置无效，下次渲染走全量替换。
+  M.invalidate(buf)
 end
 
 --- 切换推理显示
@@ -535,6 +693,7 @@ M.helpers = {
 --- 重置（测试用）
 function M.reset()
   state.show_reasoning = true
+  incremental.reset()
 end
 
 return M

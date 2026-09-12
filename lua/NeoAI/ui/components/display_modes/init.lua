@@ -74,6 +74,20 @@ local function _emit_changed(name, opts)
   })
 end
 
+--- 使聊天 buffer 的增量渲染缓存失效（切换显示模式前调用：差异写入需基于真实 buffer 内容）
+--- @param name string|nil 待卸载的插件名
+local function _invalidate_cache(name)
+  if not host then return end
+  local buf = host.get_buf and host.get_buf()
+  if not buf then return end
+  local plugin = name and registry[name]
+  if plugin and plugin.invalidate then
+    pcall(plugin.invalidate, buf)
+  else
+    require("NeoAI.ui.components.incremental").invalidate(buf)
+  end
+end
+
 -- ========== 公开 API ==========
 
 --- 注册一个显示模式插件
@@ -153,6 +167,7 @@ function M.activate(name, opts)
   -- 卸载当前插件
   if current and current ~= name then
     local prev = registry[current]
+    _invalidate_cache(current)
     if prev and prev.unload then
       pcall(prev.unload, host)
     end
@@ -211,6 +226,7 @@ function M.reload(name)
   -- 先卸载（若正激活），确保折叠/渲染挂钩被还原
   if was_active then
     local prev = registry[name]
+    _invalidate_cache(name)
     if prev and prev.unload then
       pcall(prev.unload, host)
     end
@@ -248,6 +264,7 @@ function M.reset()
   registry = {}
   order = {}
   current = nil
+  require("NeoAI.ui.components.incremental").reset()
 end
 
 return M
