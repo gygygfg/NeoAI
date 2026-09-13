@@ -51,6 +51,8 @@ NeoAI/
 │   ├── event_bus.lua         # 事件总线（基于 Neovim User autocmd）
 │   ├── lifecycle.lua          # 生命周期管理（启动/关闭/清理函数）
 │   ├── config_store.lua       # 配置存储（merge + validate + watch）
+│   ├── services.lua           # 服务定位器（provide/use/wait，use 不回落默认模块）
+│   ├── plugins.lua            # 插件宿主（依赖注入/服务提供/启停/失败回滚）
 │   └── logger.lua            # 日志
 │
 ├── core/                       # 核心业务层
@@ -81,6 +83,12 @@ NeoAI/
 │   ├── chat_service.lua       # 聊天服务（前后端桥梁 + 会话同步）
 │   ├── tool_service.lua       # 工具服务（审批 + 调度 + 执行）
 │   └── model_service.lua      # 模型服务（供 UI 选择/切换模型）
+│
+├── plugins/                    # 插件目录与默认组合
+│   ├── catalog.lua            # 内置插件登记（服务提供方 + 副作用 + tool.*），处理禁用/替换
+│   └── builtin/
+│       ├── commands.lua       # 命令插件（:NeoAI* 注册/删除）
+│       └── keymaps.lua        # 全局键位插件（注册/删除）
 │
 ├── ui/                         # 表现层
 │   ├── init.lua               # UI 编排（审批 UI + 子 Agent 监控）
@@ -117,6 +125,29 @@ NeoAI/
 │       ├── ask_user.lua       # 向用户提问工具（UI seam）
 │       ├── todo.lua           # 待办清单（整表替换语义）
 │       └── tool_helpers.lua   # define_tool 辅助函数
+│
+├── sandbox/                    # 工具执行沙箱（控制面）
+│   ├── init.lua              # 入口（gate/attach/commit/discard/list/probe）
+│   ├── control.lua           # 状态机/幂等/fencing
+│   ├── policy.lua            # 规则评估聚合 + 受限 Lua 规则沙箱
+│   ├── runtime.lua           # bwrap/unshare 后端探测与进程前缀
+│   ├── candidate.lua         # 私有暂存/冻结/CAS 发布
+│   ├── store.lua             # 候选与回执持久化
+│   ├── review.lua            # 异步审批变更单元队列
+│   ├── impact.lua            # fs/process/network 影响记录
+│   ├── evidence.lua          # 证据保存/脱敏/分页
+│   ├── grant.lua             # 窄范围任务授权
+│   ├── envelope.lua          # 裁决信封
+│   ├── network.lua           # 受控网络网关
+│   ├── broker.lua            # 外部操作 broker
+│   ├── replay.lua            # 策略回放
+│   ├── cgroup.lua            # cgroup v2 资源域
+│   ├── seccomp.lua           # seccomp 能力探测/门禁
+│   ├── cache.lua             # 内容寻址缓存
+│   ├── fault.lua             # 故障注入
+│   ├── bench.lua             # 性能基准
+│   ├── tool_spec.lua         # 工具影响类别声明
+│   └── wrapper.lua           # 执行门禁
 │
 ├── utils/                      # 纯工具库（无业务依赖）
 │   ├── init.lua
@@ -169,16 +200,20 @@ config_store.load(user_config)         ← 纯函数：merge + validate，返回
 kernel.bootstrap()                    ← 初始化事件常量、日志、生命周期（注册 VimLeavePre）
   │
   ▼
-tools.init()                          ← 同步注册内置工具（仅定义，无 I/O）
+plugins.catalog.setup()               ← 登记并启动内置插件：
+  │                                      服务提供方 → 副作用 → 每个 tool.*
+  │                                      （依赖优先；失败整批回滚）
+  ▼
+lifecycle.on_shutdown(plugins.stop_all)  ← 关闭时统一卸载插件
   │
   ▼
-注册命令 + 全局快捷键（仅此而已）
-  │
-  ▼
-返回（延迟 100ms 后台刷新模型列表，由 lifecycle 触发）
+返回
 ```
 
-**核心变化**：`setup()` 不初始化任何业务模块（core/services/ui）。所有重活在首次使用时按需懒加载；模型列表刷新由 `kernel.lifecycle` 在启动后延迟调度，不阻塞 Neovim。
+**核心变化**：`setup()` 不再逐个初始化业务模块，而是交给插件宿主。业务代码通过
+`kernel.services.use()` 获取服务（未提供/被禁用返回 `nil`，不回退默认模块）；所有副作用
+（命令、键位、模型预取、MCP、Skills、状态栏、Herder、每个工具、UI 注入）都随插件启停而
+加载/释放，`NeoAIReloadAll` 先 `plugins.stop_all()` 再清缓存重载。
 
 ---
 
@@ -383,12 +418,15 @@ ui ──→ chat_service ──→ engine ──→ request_handler ──→ h
 > 注：`tools/` 属工具系统层，其 `builtin/*` 各文件相互独立、互不引用，可被 core（tool_loop）与 services（tool_service）调用；工具定义本身回写 Agent 状态需通过 `ctx.agent` 上下文，保持边界清晰。
 
 **依赖规则**：
-- `ui/` → 只允许调用 `services/` 的公开方法
+- `ui/` → 只允许调用 `services.use("services.*")` 的公开方法
 - `services/` → 只允许调用 `core/` 的公开方法 + `kernel/` 事件 + `tools/` 执行
 - `core/` → 只允许调用 `kernel/` + `utils/`（agent 子模块间可互相引用）
 - `tools/` → 只允许调用 `kernel/` + `utils/`（builtin 独立，互不引用）
+- `sandbox/` → 只允许调用 `kernel/` + `utils/`；工具执行经 `services.sandbox` 暴露（`tools/executor` 门禁）
+- `plugins/` → 通过 `kernel.plugins` / `kernel.services` 组合上述能力
 - `kernel/` → 只允许调用 `utils/`
 - `utils/` → 不依赖任何项目模块
+- 业务代码禁止直接 `require("NeoAI.services.*")`；改为 `kernel.services.use()` 并处理 `nil`
 - 禁止反向依赖、禁止跨层穿透、禁止同级循环引用
 
 ### 决策 5：取消信号替代全局标志
@@ -440,6 +478,29 @@ if signal:aborted() then return end
 - 缓存身份指纹（FNV-1a）跨请求比对，身份变更即前缀缓存失效，用于诊断与统计。
 - 从 provider usage 解析缓存命中/未命中 token（`prompt_cache_hit_tokens` / `cached_tokens`）。
 
+### 决策 7：服务定位器 + 插件宿主
+
+**问题**：早期模块直接 `require("NeoAI.services.*")`，无法在配置中替换实现或禁用 UI/MCP，
+且命令/键位/工具/事件订阅等副作用只注册不释放，热重载与测试隔离困难。
+
+**方案**：
+
+- `kernel/services.lua`：服务定位器。`provide(name, impl)` 登记实现，`use(name)` 取当前实现，
+  **未提供/被禁用返回 `nil`，绝不回退默认模块**；`wait(name, cb)` 支持依赖等待。
+- `kernel/plugins.lua`：插件宿主。每个插件声明 `id / deps / service / module / start / stop`，
+  宿主按依赖顺序启动、提供服务、执行副作用；失败回滚本次新启动的插件；`stop` 逆序清理并注销服务；
+  启停幂等。
+- `plugins/catalog.lua`：默认组合。服务提供方（model/chat/tool/skills/mcp/status/herder/session/agent/tools）、
+  副作用插件（`ui`/`commands`/`keymaps`/`model_prefetch`/`mcp.connect`/`skills.scan`/`statusline`/`herder`）、
+  以及每个内置工具 `tool.<name>`。
+- 业务代码一律 `services.use("services.x")`，并显式处理 `nil`（降级），实现运行期替换与禁用。
+
+**清理契约**：任何注册（命令、全局键位、事件订阅、提示段、MCP 连接、工具、状态栏监听、UI 注入）
+都必须返回清理函数，由插件宿主在卸载时调用。`NeoAIReloadAll` / `reload_all` 先 `plugins.stop_all()`
+再清缓存重载。
+
+> 详见 [docs/plugins.md](docs/plugins.md)。
+
 ---
 
 ## 五、核心模块职责
@@ -472,6 +533,17 @@ if signal:aborted() then return end
 - `set(path, value)` — 运行时热更新（触发 watch + `CONFIG_CHANGED`）。
 - `watch(path, cb)` — 监听配置变更。
 - 不再有 merger/validator/state 三个文件的分裂。
+
+### `kernel/services.lua` — 服务定位器
+
+- `provide(name, impl)` / `use(name)` / `has(name)` / `revoke(name)` / `wait(name, cb)` / `list()`。
+- `use()` 未提供/被禁用返回 `nil`，**不回退默认模块**；业务代码据此显式降级。
+
+### `kernel/plugins.lua` — 插件宿主
+
+- 规格：`{ id, deps?, service?, module?, start?, stop? }`；`start` 返回清理函数（或数组）。
+- `register` / `start` / `stop` / `start_all` / `stop_all` / `status` / `is_started` / `unregister` / `reset`。
+- 依赖优先启动、循环依赖检测、失败回滚、逆序清理、启停幂等。
 
 ### `core/session/session.lua` — 会话对象
 

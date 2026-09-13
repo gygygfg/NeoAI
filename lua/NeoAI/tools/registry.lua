@@ -25,6 +25,15 @@ local function _validate(tool)
   return true
 end
 
+--- 为工具附加沙箱规格（所有注册路径统一，覆盖 MCP 动态注册）
+--- @param tool table
+--- @return table
+local function _attach(tool)
+  local ok, wrapper = pcall(require, "NeoAI.sandbox.wrapper")
+  if ok and wrapper and wrapper.attach then wrapper.attach(tool) end
+  return tool
+end
+
 -- ========== 公开 API ==========
 
 --- 注册工具
@@ -36,7 +45,7 @@ function M.register(tool)
   if state.tools[tool.name] then
     return false, "工具已存在: " .. tool.name
   end
-  state.tools[tool.name] = tool
+  state.tools[tool.name] = _attach(tool)
   return true
 end
 
@@ -62,7 +71,7 @@ end
 function M.update(tool)
   local ok, err = _validate(tool)
   if not ok then return false, err end
-  state.tools[tool.name] = tool
+  state.tools[tool.name] = _attach(tool)
   return true
 end
 

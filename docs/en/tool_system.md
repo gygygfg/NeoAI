@@ -19,6 +19,7 @@
 | `tools/packer.lua` | Groups tools by category for packing (categorized UI display). |
 | `tools/environment.lua` | Tool environment detection (workspace / git directory); disables environment-dependent tools when unavailable. |
 | `tools/builtin/*` | Built-in tool implementations (see below). |
+| `sandbox/*` | Tool execution sandbox control plane (preflight / isolated execution / candidate freeze / CAS publish); see [sandbox.md](sandbox.md). |
 
 ## 2. Tool Definition
 
@@ -69,9 +70,17 @@ resolve_name (alias/fuzzy matching)
       ├─ approval required → tool_service.approve_and_execute(...)
       │           (continue_fn resumes after approval; the timer starts only after approval)
       └─ direct execution → _execute_tool(...)
+          → sandbox gate sandbox.gate(...) (preflight → isolated execution → freeze candidate → CAS publish)
           → _call_tool (invoke func/execute)
           → timeout based on a pausable timer (waiting for approval/question does not count)
 ```
+
+> **Sandbox enforcement**: every tool execution goes through `services.sandbox.gate`; the loader
+> and registry attach `__sandbox_spec` (effect/paths). The default async review
+> (`tools.approval.mode="async"`) executes effectful tools immediately in the sandbox and freezes
+> a candidate without blocking; real changes enter a review queue and are applied after async
+> confirmation via `:NeoAISandboxReview`. When the sandbox service is missing and
+> `fail_closed=true`, execution is rejected. See [sandbox.md](sandbox.md).
 
 ### 4.1 Argument Alias Normalization
 

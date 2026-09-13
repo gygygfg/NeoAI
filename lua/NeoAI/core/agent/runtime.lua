@@ -12,6 +12,7 @@ local async = require("NeoAI.utils.async")
 local event_bus = require("NeoAI.kernel.event_bus")
 local events = require("NeoAI.kernel.events")
 local config_store = require("NeoAI.kernel.config_store")
+local services = require("NeoAI.kernel.services")
 
 local M = {}
 
@@ -72,7 +73,7 @@ end
 --- @return Deferred resolve(最终响应)
 local function _run_generation(agent, opts)
   local stream_mod = require("NeoAI.core.agent.stream")
-  local tool_service = require("NeoAI.services.tool_service")
+  local tool_service = services.use("services.tool_service")
   local recovery = require("NeoAI.core.agent.recovery")
 
   local proc = stream_mod.create(agent)
@@ -87,7 +88,8 @@ local function _run_generation(agent, opts)
     agent:set_state("idle")
     -- 上下文压力提示（状态栏变色 + notify；同一级别去重）
     pcall(function()
-      require("NeoAI.services.status").check_pressure(agent)
+      local status = services.use("services.status")
+      if status then status.check_pressure(agent) end
     end)
     event_bus.emit(events.GENERATION_COMPLETED, { agent_id = agent.id, message = message })
     return message
@@ -127,6 +129,9 @@ local function _run_generation(agent, opts)
         :then_(function(result)
           local calls = result.next_calls
           if calls and #calls > 0 then
+            if not tool_service then
+              return async.reject({ kind = "service", message = "工具服务未启用，无法执行工具调用" })
+            end
             return tool_loop.run(agent, calls, tool_service, {}):then_(function()
               return _finish_idle(agent.messages[#agent.messages])
             end)
@@ -285,7 +290,8 @@ function M.run(agent, content)
   return compactor.maybe_compact(agent):then_(function()
     -- 压缩后仍有压力则先提示（超限时让用户知道下一轮可能溢出/被压缩）
     pcall(function()
-      require("NeoAI.services.status").check_pressure(agent)
+      local status = services.use("services.status")
+      if status then status.check_pressure(agent) end
     end)
     -- 用户新输入重置工具循环护栏计数链与截断续写计数
     local guard = require("NeoAI.core.agent.guard")

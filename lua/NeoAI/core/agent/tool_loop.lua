@@ -12,6 +12,7 @@ local event_bus = require("NeoAI.kernel.event_bus")
 local events = require("NeoAI.kernel.events")
 local stream_mod = require("NeoAI.core.agent.stream")
 local config_store = require("NeoAI.kernel.config_store")
+local services = require("NeoAI.kernel.services")
 
 local M = {}
 
@@ -225,7 +226,8 @@ local function _send_round(agent, opts)
   return compactor.maybe_compact(agent, { allow_busy = true }):then_(function()
     -- 压缩后仍有压力则先提示（超限时让用户知道下一轮可能溢出/被压缩）
     pcall(function()
-      require("NeoAI.services.status").check_pressure(agent)
+      local status = services.use("services.status")
+      if status then status.check_pressure(agent) end
     end)
     return _refresh_then_send()
   end, function()

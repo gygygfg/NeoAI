@@ -198,8 +198,21 @@ function M.persist_buffer(bufnr)
   if not bg_loaded[bufnr] then return true end
   if not vim.api.nvim_buf_is_loaded(bufnr) or not vim.bo[bufnr].modifiable then return true end
   if not vim.bo[bufnr].modified then return true end
+  -- 沙箱激活时把 buffer 写盘重定向到私有暂存层，不落真实工作区。
+  local filepath = vim.api.nvim_buf_get_name(bufnr)
+  local target = nil
+  if filepath ~= "" then
+    local ok_sb, sandbox = pcall(require, "NeoAI.sandbox")
+    if ok_sb and sandbox and sandbox.candidate then
+      target = sandbox.candidate.persist_target(filepath)
+    end
+  end
+  local write_cmd = "silent write!"
+  if target then
+    write_cmd = "silent write! " .. vim.fn.fnameescape(target)
+  end
   local ok, err = pcall(vim.api.nvim_buf_call, bufnr, function()
-    vim.cmd("silent write!")
+    vim.cmd(write_cmd)
   end)
   if not ok then return false, tostring(err) end
   return true

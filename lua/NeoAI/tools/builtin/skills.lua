@@ -7,6 +7,7 @@
 local helpers = require("NeoAI.tools.builtin.tool_helpers")
 local config_store = require("NeoAI.kernel.config_store")
 local prefix = require("NeoAI.core.agent.prefix")
+local services = require("NeoAI.kernel.services")
 
 local M = {}
 
@@ -17,6 +18,7 @@ local SECTION_ORDER = 90
 -- ========== 私有状态 ==========
 
 local section_registered = false
+local section_unregister = nil
 
 -- ========== 私有函数 ==========
 
@@ -24,10 +26,11 @@ local section_registered = false
 local function _ensure_section()
   if section_registered then return end
   section_registered = true
-  pcall(prefix.register_section, "deployment:skills", SECTION_ORDER, function()
-    local skills = require("NeoAI.services.skills")
-    return skills.summary_text()
+  local ok, unreg = pcall(prefix.register_section, "deployment:skills", SECTION_ORDER, function()
+    local skills = services.use("services.skills")
+    return skills and skills.summary_text() or ""
   end)
+  if ok then section_unregister = unreg end
 end
 
 --- 持久化已装载技能为 agent 级提示段（config.skills.persist_loaded）
@@ -55,7 +58,11 @@ skill_tools.list_skills = helpers.define_tool(
     required = {},
   },
   function(args, on_success, on_error)
-    local skills = require("NeoAI.services.skills")
+    local skills = services.use("services.skills")
+    if not skills then
+      on_error("技能服务未启用")
+      return
+    end
     local list = skills.list()
     if #list == 0 then
       on_success("（当前没有已发现的可加载技能）")
@@ -87,7 +94,11 @@ skill_tools.load_skill = helpers.define_tool(
       on_error("load_skill 缺少必填参数 name")
       return
     end
-    local skills = require("NeoAI.services.skills")
+    local skills = services.use("services.skills")
+    if not skills then
+      on_error("技能服务未启用")
+      return
+    end
     local skill = skills.load(name)
     if not skill then
       on_error("未知技能: " .. tostring(name) .. "。请先用 list_skills 列出可用技能。")
@@ -116,8 +127,12 @@ function M.get_tools()
   return out
 end
 
---- 重置（测试用）
+--- 重置（测试用）：注销提示段，允许重新注册
 function M.reset()
+  if section_unregister then
+    pcall(section_unregister)
+    section_unregister = nil
+  end
   section_registered = false
 end
 

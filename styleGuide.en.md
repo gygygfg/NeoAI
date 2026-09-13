@@ -51,6 +51,8 @@ NeoAI/
 │   ├── event_bus.lua             # Event bus (built on Neovim User autocmd)
 │   ├── lifecycle.lua             # Lifecycle management (startup/shutdown/cleanup functions)
 │   ├── config_store.lua          # Config store (merge + validate + watch)
+│   ├── services.lua              # Service locator (provide/use/wait; use never falls back)
+│   ├── plugins.lua               # Plugin host (DI/service provision/start-stop/failure rollback)
 │   └── logger.lua                # Logging
 │
 ├── core/                         # Core business layer
@@ -81,6 +83,12 @@ NeoAI/
 │   ├── chat_service.lua          # Chat service (frontend/backend bridge + session sync)
 │   ├── tool_service.lua          # Tool service (approval + scheduling + execution)
 │   └── model_service.lua         # Model service (for UI model selection/switching)
+│
+├── plugins/                      # Plugin catalog and default composition
+│   ├── catalog.lua               # Builtin registration (service providers + side effects + tool.*), disable/replace
+│   └── builtin/
+│       ├── commands.lua          # Command plugin (:NeoAI* register/delete)
+│       └── keymaps.lua           # Global keymap plugin (register/delete)
 │
 ├── ui/                           # Presentation layer
 │   ├── init.lua                  # UI orchestration (approval UI + sub-agent monitoring)
@@ -117,6 +125,29 @@ NeoAI/
 │       ├── ask_user.lua          # Ask-user tool (UI seam)
 │       ├── todo.lua              # Todo list (whole-table replacement semantics)
 │       └── tool_helpers.lua      # define_tool helper functions
+│
+├── sandbox/                      # Tool execution sandbox (control plane)
+│   ├── init.lua                # Facade (gate/attach/commit/discard/list/probe)
+│   ├── control.lua             # State machine / idempotency / fencing
+│   ├── policy.lua              # Rule aggregation + restricted Lua rule sandbox
+│   ├── runtime.lua             # bwrap/unshare backend probe and process prefix
+│   ├── candidate.lua           # Private staging / freeze / CAS publish
+│   ├── store.lua               # Candidate & receipt persistence
+│   ├── review.lua              # Async review change-set queue
+│   ├── impact.lua              # fs/process/network impact records
+│   ├── evidence.lua            # Evidence storage/redaction/paging
+│   ├── grant.lua               # Narrow task grants
+│   ├── envelope.lua            # Decision envelope
+│   ├── network.lua             # Controlled network gateway
+│   ├── broker.lua              # External-operation broker
+│   ├── replay.lua              # Policy replay
+│   ├── cgroup.lua              # cgroup v2 resource domain
+│   ├── seccomp.lua             # seccomp capability probe/gate
+│   ├── cache.lua               # Content-addressed cache
+│   ├── fault.lua               # Fault injection
+│   ├── bench.lua               # Performance benchmarks
+│   ├── tool_spec.lua           # Per-tool effect declaration
+│   └── wrapper.lua             # Execution gate
 │
 ├── utils/                        # Pure utility library (no business dependencies)
 │   ├── init.lua
@@ -168,16 +199,21 @@ config_store.load(user_config)         ← Pure function: merge + validate, retu
 kernel.bootstrap()                    ← Initialize event constants, logging, lifecycle (registers VimLeavePre)
   │
   ▼
-tools.init()                          ← Synchronously register built-in tools (definitions only, no I/O)
+plugins.catalog.setup()               ← Register and start builtin plugins:
+  │                                      service providers → side effects → each tool.*
+  │                                      (dependencies first; whole batch rolls back on failure)
+  ▼
+lifecycle.on_shutdown(plugins.stop_all)  ← Unload all plugins on shutdown
   │
   ▼
-Register commands + global keymaps (that's all)
-  │
-  ▼
-Return (model list refreshed in the background after a 100ms delay, triggered by lifecycle)
+Return
 ```
 
-**Key change**: `setup()` does not initialize any business modules (core/services/ui). All heavy work is lazily loaded on first use; the model list refresh is scheduled with a delay after startup by `kernel.lifecycle` and does not block Neovim.
+**Key change**: `setup()` no longer initializes business modules one by one; it delegates to the
+plugin host. Business code obtains services via `kernel.services.use()` (returns `nil` when absent
+or disabled, never falling back to the default module); every side effect (commands, keymaps, model
+prefetch, MCP, Skills, statusline, Herder, each tool, UI injection) is loaded/released with its
+plugin, and `NeoAIReloadAll` calls `plugins.stop_all()` before clearing the cache and reloading.
 
 ---
 
@@ -381,12 +417,15 @@ ui ──→ chat_service ──→ engine ──→ request_handler ──→ h
 > Note: `tools/` belongs to the tool system layer; its `builtin/*` files are mutually independent and never reference one another, and they may be called from core (tool_loop) and services (tool_service). A tool definition that writes back Agent state must do so through the `ctx.agent` context, keeping boundaries clean.
 
 **Dependency rules**:
-- `ui/` → may only call the public methods of `services/`
+- `ui/` → may only call public methods via `services.use("services.*")`
 - `services/` → may only call the public methods of `core/` + `kernel/` events + `tools/` execution
 - `core/` → may only call `kernel/` + `utils/` (agent submodules may reference one another)
 - `tools/` → may only call `kernel/` + `utils/` (builtins are independent and never reference one another)
+- `sandbox/` → may only call `kernel/` + `utils/`; tool execution is exposed via `services.sandbox` (gated in `tools/executor`)
+- `plugins/` → compose the above via `kernel.plugins` / `kernel.services`
 - `kernel/` → may only call `utils/`
 - `utils/` → depends on no project modules
+- Business code must not `require("NeoAI.services.*")` directly; use `kernel.services.use()` and handle `nil`
 - No reverse dependencies, no cross-layer penetration, no same-level circular references
 
 ### Decision 5: Abort Signals Instead of Global Flags
@@ -436,6 +475,33 @@ This solves the problem of very long sessions hitting the model's context window
 - The cache identity fingerprint (FNV-1a) is compared across requests; an identity change means the prefix cache is invalidated, and this is used for diagnostics and statistics.
 - Cache hit/miss tokens are parsed from provider usage (`prompt_cache_hit_tokens` / `cached_tokens`).
 
+### Decision 7: Service Locator + Plugin Host
+
+**Problem**: modules used to `require("NeoAI.services.*")` directly, so implementations could not be
+replaced or UI/MCP disabled via configuration; side effects (commands, keymaps, tools, event
+subscriptions) were registered but never released, making hot reload and test isolation hard.
+
+**Solution**:
+
+- `kernel/services.lua`: the service locator. `provide(name, impl)` registers, `use(name)` returns
+  the active implementation, **returning `nil` when absent/disabled and never falling back**;
+  `wait(name, cb)` supports dependency waiting.
+- `kernel/plugins.lua`: the plugin host. Each plugin declares `id / deps / service / module / start / stop`;
+  the host starts dependencies first, provides services, runs side effects, rolls back newly started
+  plugins on failure, cleans up in reverse on `stop`, and is idempotent.
+- `plugins/catalog.lua`: the default composition — service providers (model/chat/tool/skills/mcp/status/
+  herder/session/agent/tools), side-effect plugins (`ui`/`commands`/`keymaps`/`model_prefetch`/
+  `mcp.connect`/`skills.scan`/`statusline`/`herder`), and one `tool.<name>` per builtin tool.
+- Business code always uses `services.use("services.x")` and handles `nil` (degrade), enabling runtime
+  replacement and disabling.
+
+**Cleanup contract**: every registration (commands, global keymaps, event subscriptions, prompt
+sections, MCP connections, tools, statusline listeners, UI injection) must return a cleanup function
+invoked by the host on unload. `NeoAIReloadAll` / `reload_all` call `plugins.stop_all()` before
+clearing the cache and reloading.
+
+> See [docs/plugins.md](docs/en/plugins.md).
+
 ---
 ## 5. Core Module Responsibilities
 
@@ -467,6 +533,17 @@ This solves the problem of very long sessions hitting the model's context window
 - `set(path, value)` — hot update at runtime (triggers watch + `CONFIG_CHANGED`).
 - `watch(path, cb)` — watch for config changes.
 - No longer split across the three files merger/validator/state.
+
+### `kernel/services.lua` — Service locator
+
+- `provide(name, impl)` / `use(name)` / `has(name)` / `revoke(name)` / `wait(name, cb)` / `list()`.
+- `use()` returns `nil` when absent/disabled and **never falls back**; callers degrade explicitly.
+
+### `kernel/plugins.lua` — Plugin host
+
+- Spec: `{ id, deps?, service?, module?, start?, stop? }`; `start` returns a cleanup function (or array).
+- `register` / `start` / `stop` / `start_all` / `stop_all` / `status` / `is_started` / `unregister` / `reset`.
+- Dependencies first, circular-dependency detection, failure rollback, reverse cleanup, idempotent start/stop.
 
 ### `core/session/session.lua` — Session object
 

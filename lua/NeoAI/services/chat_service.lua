@@ -13,6 +13,7 @@ local session_mod = require("NeoAI.core.session.session")
 local config_store = require("NeoAI.kernel.config_store")
 local event_bus = require("NeoAI.kernel.event_bus")
 local events = require("NeoAI.kernel.events")
+local services = require("NeoAI.kernel.services")
 
 local M = {}
 
@@ -280,8 +281,8 @@ end
 --- 当前实际生效的模式（不含待应用的目标模式）
 --- @return string "chat" | "plan" | "auto"
 local function _actual_mode()
-  local tool_service = require("NeoAI.services.tool_service")
-  if tool_service.is_auto_mode() then return "auto" end
+  local tool_service = services.use("services.tool_service")
+  if tool_service and tool_service.is_auto_mode() then return "auto" end
   local agent = M.get_current_agent()
   if agent and agent.plan_mode == true then return "plan" end
   return "chat"
@@ -291,17 +292,17 @@ end
 --- @param agent table
 --- @param target string "chat" | "plan" | "auto"
 local function _apply_target_mode(agent, target)
-  local tool_service = require("NeoAI.services.tool_service")
+  local tool_service = services.use("services.tool_service")
   local plan_mode = require("NeoAI.tools.builtin.plan_mode")
   if target == "plan" then
     plan_mode.enter(agent)
-    tool_service.set_auto_mode(false)
+    if tool_service then tool_service.set_auto_mode(false) end
   elseif target == "auto" then
     plan_mode.exit(agent)
-    tool_service.set_auto_mode(true)
+    if tool_service then tool_service.set_auto_mode(true) end
   else
     plan_mode.exit(agent)
-    tool_service.set_auto_mode(false)
+    if tool_service then tool_service.set_auto_mode(false) end
   end
   runtime.apply_mode(agent, target)
 end
@@ -341,7 +342,8 @@ local mcp_observer_sub = nil
 --- @param agent table
 --- @return Deferred resolve(boolean changed)
 local function _mcp_pre_round(agent)
-  local mcp = require("NeoAI.services.mcp")
+  local mcp = services.use("services.mcp")
+  if not mcp then return async.resolve(false) end
   return mcp.pre_round():then_(function(changed)
     if changed and agent and agent.tools then
       local registry = require("NeoAI.tools.registry")
@@ -553,8 +555,8 @@ function M.detach_window(win_id)
   _flush_pending(agent_id)
   -- 窗口关闭时清理正在展示/排队的审批，释放串行审批槽位，
   -- 否则 approval_showing 残留 true 会让后续工具审批只入队不弹窗，循环卡死。
-  local tool_service = require("NeoAI.services.tool_service")
-  tool_service.clear_approval()
+  local tool_service = services.use("services.tool_service")
+  if tool_service then tool_service.clear_approval() end
 end
 
 --- 取消当前生成
@@ -565,8 +567,8 @@ function M.cancel_generation()
   end
   -- 取消时同样清理待审批项（弹窗与信号无关，abort 不会自动关掉它），
   -- 释放串行槽位，避免下一轮工具调用卡在审批队列。
-  local tool_service = require("NeoAI.services.tool_service")
-  tool_service.clear_approval()
+  local tool_service = services.use("services.tool_service")
+  if tool_service then tool_service.clear_approval() end
 end
 
 --- 把当前运行模式（chat/plan/auto）对应的 provider/model 配置应用到 Agent
@@ -592,7 +594,8 @@ local function _request_mode(target)
     -- 本轮结束由 _apply_pending_mode 应用，不打断当前回合；离开 AUTO 同样延迟，
     -- 防止本轮中途突然弹出审批框。
     if target == "auto" then
-      require("NeoAI.services.tool_service").set_auto_mode(true)
+      local tool_service = services.use("services.tool_service")
+      if tool_service then tool_service.set_auto_mode(true) end
     end
     pending_mode = target
     pending_mode_agent_id = agent.id
@@ -694,8 +697,8 @@ end
 --- 是否处于 AUTO 模式
 --- @return boolean
 function M.is_auto_mode()
-  local tool_service = require("NeoAI.services.tool_service")
-  return tool_service.is_auto_mode()
+  local tool_service = services.use("services.tool_service")
+  return tool_service and tool_service.is_auto_mode() or false
 end
 
 --- 当前模式（互斥：一次只处于一种模式）。

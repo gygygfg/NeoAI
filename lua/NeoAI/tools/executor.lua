@@ -126,7 +126,7 @@ end
 --- @param ctx table
 --- @param timer table 可暂停计时器
 --- @return Deferred
-local function _execute_tool(tool, args, ctx, timer)
+local function _execute_tool_raw(tool, args, ctx, timer)
   local timeout = ctx.timeout_ms or tool.timeout or config_store.get("tools.executor.timeout_ms") or 30000
   local wrapped = async.Deferred.new()
   local settled = false
@@ -150,6 +150,34 @@ local function _execute_tool(tool, args, ctx, timer)
     wrapped:reject(e)
   end)
   return wrapped
+end
+
+--- 沙箱门禁包装：所有工具执行必须经控制面。
+--- 沙箱服务缺失且 fail_closed 时拒绝执行（不得静默降级，设计文档 §1.1 第 6/7 条）。
+--- @param tool table
+--- @param args table
+--- @param ctx table
+--- @param timer table
+--- @return Deferred
+local function _execute_tool(tool, args, ctx, timer)
+  local cfg = config_store.get("tools.sandbox") or {}
+  local sandbox = require("NeoAI.kernel.services").use("services.sandbox")
+  if not sandbox then
+    if cfg.enabled ~= false and cfg.fail_closed ~= false then
+      return async.reject({
+        kind = "sandbox",
+        message = "沙箱服务不可用且 fail_closed=true，拒绝执行工具: " .. tostring(tool and tool.name),
+      })
+    end
+    return _execute_tool_raw(tool, args, ctx, timer)
+  end
+  -- 兜底附加规格（覆盖动态注册/未走加载器的工具）
+  require("NeoAI.sandbox.wrapper").attach(tool)
+  local out = async.Deferred.new()
+  sandbox.gate(tool, args, ctx, function()
+    return _execute_tool_raw(tool, args, ctx, timer)
+  end):then_(function(v) out:resolve(v) end, function(e) out:reject(e) end)
+  return out
 end
 
 -- ========== 公开 API ==========
@@ -190,10 +218,12 @@ function M.execute(tool_name, raw_args, ctx)
     return async.reject({ kind = "validation", message = verr })
   end
 
-  -- 审批检查
+  -- 审批检查。async 模式（默认）不使用执行前阻塞审批：工具立即在沙箱内执行并冻结
+  -- 候选，真实修改进入异步待审队列由用户确认后应用（设计文档 §15）。
   local approval_config = registry.get_approval_config(resolved)
-  local mode = ctx.approval_mode or config_store.get("tools.approval.mode") or "prompt"
-  local needs_approval = validator.check_approval(resolved, args, approval_config, mode)
+  local mode = ctx.approval_mode or config_store.get("tools.approval.mode") or "async"
+  local needs_approval = mode ~= "async"
+    and validator.check_approval(resolved, args, approval_config, mode)
 
   -- 可暂停计时器：tool_loop 在调用前已创建并注入 ctx.timer（用于展示活跃耗时）。
   -- 直接调用（无 tool_loop，如测试）时自建一个，仅用于超时。

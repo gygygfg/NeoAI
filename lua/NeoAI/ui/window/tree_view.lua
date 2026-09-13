@@ -8,8 +8,13 @@ local session_store = require("NeoAI.core.session.session_store")
 local event_bus = require("NeoAI.kernel.event_bus")
 local events = require("NeoAI.kernel.events")
 local chat_view = require("NeoAI.ui.window.chat_view")
-local chat_service = require("NeoAI.services.chat_service")
+local services = require("NeoAI.kernel.services")
 local config_store = require("NeoAI.kernel.config_store")
+
+--- 聊天服务经服务定位器动态解析（禁用时为 nil）
+local function _chat_service()
+  return services.use("services.chat_service")
+end
 
 local M = {}
 
@@ -95,11 +100,12 @@ end
 --- @return number 删除数量
 local function _cleanup_empty_sessions()
   local delete_ids = {}
+  local cs = _chat_service()
   for id, s in pairs(session_store.get_all()) do
-    if _session_is_empty(s) and not chat_service.is_session_active(id) then
+    if _session_is_empty(s) and not (cs and cs.is_session_active(id)) then
       local branch_empty = true
       for _, d in ipairs(session_store.get_descendants(id)) do
-        if not _session_is_empty(d) or chat_service.is_session_active(d.id) then
+        if not _session_is_empty(d) or (cs and cs.is_session_active(d.id)) then
           branch_empty = false
           break
         end

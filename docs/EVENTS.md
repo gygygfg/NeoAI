@@ -246,6 +246,26 @@ vim.api.nvim_create_autocmd("User", {
 
 > 压缩 / 蒸馏期间 UI 会打开"🧬 上下文压缩 / 🧬 计划蒸馏"悬浮窗，实时展示接收到的推理与正文。
 
+### 沙箱
+
+| 常量 | 值 | 触发时机 | payload 关键字段 |
+| --- | --- | --- | --- |
+| `SANDBOX_PREFLIGHT_STARTED` | `sandbox:preflight_started` | 开始预检 | `{ command_id, tool }` |
+| `SANDBOX_STAGED` | `sandbox:staged` | 隔离执行完成 | `{ command_id, attempt_id }` |
+| `SANDBOX_CANDIDATE_READY` | `sandbox:candidate_ready` | 候选冻结完成 | `{ candidate_digest, command_id }` |
+| `SANDBOX_PUBLISH_STARTED` | `sandbox:publish_started` | 开始 CAS 发布 | `{ candidate_digest, command_id }` |
+| `SANDBOX_COMMITTED` | `sandbox:committed` | 发布并写回执成功 | `{ candidate_digest, operation_id }` |
+| `SANDBOX_DISCARDED` | `sandbox:discarded` | 丢弃候选 | `{ candidate_digest }` |
+| `SANDBOX_CONFLICT` | `sandbox:conflict` | CAS 基线冲突 | `{ candidate_digest, reason }` |
+| `SANDBOX_RECOVERY_REQUIRED` | `sandbox:recovery_required` | 需人工恢复 | `{ command_id }` |
+| `SANDBOX_OUTCOME_UNKNOWN` | `sandbox:outcome_unknown` | 结果不明需对账 | `{ operation_id }` |
+| `SANDBOX_REVIEW_ENQUEUED` | `sandbox:review_enqueued` | 候选进入异步待审队列 | `{ change_set_id, candidate_digest, write_set, tool }` |
+| `SANDBOX_REVIEW_APPROVED` | `sandbox:review_approved` | 变更单元被批准（未应用） | `{ change_set_id }` |
+| `SANDBOX_REVIEW_REJECTED` | `sandbox:review_rejected` | 变更单元被拒绝 | `{ change_set_id, reason }` |
+| `SANDBOX_APPLIED` | `sandbox:applied` | 变更单元已 CAS 应用到真实工作区 | `{ change_set_id, operation_id }` |
+| `SANDBOX_GRANT_CREATED` | `sandbox:grant_created` | 创建任务授权 | `{ grant_id, scope, operations }` |
+| `SANDBOX_GRANT_REVOKED` | `sandbox:grant_revoked` | 撤销任务授权 | `{ grant_id }` |
+
 ## 4. 事件订阅最佳实践
 
 1. **始终引用常量**：订阅/触发都通过 `NeoAI.kernel.events` 的常量，不要硬编码字符串。

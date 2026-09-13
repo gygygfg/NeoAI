@@ -1,6 +1,7 @@
 --- 生命周期管理
 --- @module NeoAI.kernel.lifecycle
 --- 启动/关闭/信号处理。维护注册的清理函数列表，关闭时按序执行。
+--- 关闭流程：先统一卸载插件（释放服务/工具/事件订阅），再执行剩余清理函数。
 
 local M = {}
 
@@ -35,18 +36,6 @@ function M.bootstrap()
     desc = "NeoAI: 生命周期清理",
   })
 
-  -- 延迟 100ms 后台刷新模型列表（启动不阻塞）
-  local model_refresh = config_store.get("ai.model_refresh")
-  if model_refresh and model_refresh.on_startup then
-    vim.schedule(function()
-      if state.shutting_down then return end
-      local ok, model_service = pcall(require, "NeoAI.services.model_service")
-      if ok and model_service and model_service.prefetch then
-        pcall(model_service.prefetch)
-      end
-    end)
-  end
-
   logger.info("NeoAI kernel bootstrapped")
   return M
 end
@@ -70,11 +59,13 @@ function M.on_shutdown(fn)
   end
 end
 
---- 关闭：执行所有清理函数，逆序
+--- 关闭：执行清理函数（逆序）。插件卸载由 setup 注册的清理函数负责（plugins.stop_all）。
 function M.shutdown()
   if state.shutting_down then return M end
   state.shutting_down = true
   local logger = require("NeoAI.kernel.logger")
+
+  -- 执行清理函数，逆序
   local fns = state.cleanup_fns
   state.cleanup_fns = {}
   for i = #fns, 1, -1 do
@@ -83,6 +74,7 @@ function M.shutdown()
       logger.warn("[lifecycle] 清理函数异常: %s", tostring(err))
     end
   end
+
   -- 触发插件关闭事件
   local event_bus = require("NeoAI.kernel.event_bus")
   local events = require("NeoAI.kernel.events")

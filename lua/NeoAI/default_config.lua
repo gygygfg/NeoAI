@@ -400,7 +400,7 @@ local DEFAULT_CONFIG = {
       },
     },
     approval = {
-      mode = "prompt", -- prompt | auto_allow | strict
+      mode = "async", -- async（默认，异步审批：立即沙箱执行，事后确认应用）| prompt | auto_allow | strict
       default_auto_allow = false,
       timeout_ms = 60000, -- 审批弹窗超时（ms），防止弹窗丢失后工具循环永久挂起
       allowed_directories = {},
@@ -436,6 +436,52 @@ local DEFAULT_CONFIG = {
         lsp_format = { auto_allow = false },
         delete_node = { auto_allow = false },
         web_fetch = { auto_allow = true },
+      },
+    },
+    -- 工具执行沙箱（对齐《Agent 沙箱 dry-run 与 commit 架构设计 v2》）。
+    -- 所有工具执行经控制面：预检 → 隔离执行 → 冻结候选 → 校验授权 → CAS 发布。
+    -- 默认 dry_run：只产出候选，不写真实工作区；用 :NeoAISandboxCommit 显式应用。
+    sandbox = {
+      enabled = true, -- 总开关；关闭且 fail_closed=true 时拒绝所有工具执行
+      fail_closed = true, -- 沙箱服务缺失/被禁用时是否拒绝执行（不得静默降级）
+      mode = "dry_run", -- dry_run（默认，仅出候选）| commit（授权后立即 CAS 发布）
+      backend = "auto", -- auto | bwrap | unshare（外部隔离后端）
+      offline = true, -- 默认离线：网络类工具直接硬拒绝
+      require_seccomp = false, -- true 时缺少 seccomp 能力则拒绝外部执行
+      -- 受控网络网关（阶段三）：offline=false 时按声明端点放行，并受字节预算约束。
+      network = {
+        enabled = false, -- 是否允许受控联网（默认关闭）
+        allowed_endpoints = {}, -- 允许的主机/URL 模式，如 "api.example.com"、"*.example.com"
+        budget_bytes = 0, -- 累计字节预算（0 = 不限制）
+      },
+      -- 异步审批（设计文档 §15）：AI 修改立即沙箱执行并冻结候选，
+      -- 用户异步确认允许哪些文件/配置修改后再 CAS 应用。
+      review = {
+        enabled = true, -- 效果类候选自动进入待审队列
+        auto_apply = false, -- true 时任务授权内自动应用（默认关闭，需用户确认）
+      },
+      workspace_root = vim.fn.stdpath("cache") .. "/NeoAI/sandbox", -- 暂存/候选/回执根目录
+      retention = {
+        candidate_days = 7, -- 未应用候选保留期（天）
+        max_pending = 20, -- 每任务最多待审候选数
+      },
+      policy = {
+        version = "1", -- 策略版本（用于审计回放；规则变更时应递增）
+        deny_tools = {}, -- 硬拒绝的工具名（用户确认亦不可覆盖）
+        rules = {}, -- 受限 Lua 规则（函数数组；返回 { decision, reason_codes }）
+      },
+      limits = {
+        wall_ms = 60000, -- 外部进程墙钟超时（ms）
+        memory_bytes = 0, -- cgroup 内存上限（0 = 不设置）
+        pids = 0, -- cgroup PID 上限（0 = 不设置）
+        cpu_max = 0, -- cgroup CPU 配额（微秒/100ms；0 = 不设置，如 50000 = 0.5 CPU）
+        cgroup_base = "/sys/fs/cgroup", -- cgroup v2 挂载点
+      },
+      seccomp_filter_path = "", -- 可选：编译后 seccomp BPF 过滤器路径（供 bwrap --seccomp）
+      -- seccomp 基线：默认关闭；开启后经 bwrap 在载荷上施加 denylist 过滤器。
+      seccomp = {
+        enabled = false, -- 是否施加 seccomp 基线（仅 bwrap 后端）
+        filter_path = "", -- 自定义过滤器路径；空则使用内置 denylist 生成
       },
     },
   },
@@ -488,6 +534,17 @@ local DEFAULT_CONFIG = {
     enabled = true, -- 是否启用 Herder 终端状态信号上报（还需 HERDR_ENV=1 才真正生效；非 Herder 环境为 no-op）
     source = "custom:neoai", -- 稳定且全局唯一的生命周期权威标识
     agent = "neoai", -- agent 名称（Herder 侧识别用）
+  },
+
+  -- ===== 插件系统（kernel/plugins.lua + plugins/catalog.lua）=====
+  plugins = {
+    builtin = true, -- 是否登记并启动内置插件（false = 完全自管，不加载默认组合）
+    disabled = {}, -- 禁用的插件/服务 id 列表，如 { "ui", "services.mcp" }
+    entries = {
+      -- 按插件 id 覆盖：
+      --   ["tool.shell"] = false,                     -- 禁用该插件
+      --   ["services.model_service"] = { module = "my_model_provider" }, -- 替换实现
+    },
   },
 
   log = {

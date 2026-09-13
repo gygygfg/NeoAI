@@ -22,5 +22,7 @@ M.event_bus = require("NeoAI.kernel.event_bus")
 M.logger = require("NeoAI.kernel.logger")
 M.config_store = require("NeoAI.kernel.config_store")
 M.lifecycle = require("NeoAI.kernel.lifecycle")
+M.services = require("NeoAI.kernel.services")
+M.plugins = require("NeoAI.kernel.plugins")
 
 return M

@@ -211,11 +211,12 @@ function M.init()
   })
 end
 
---- 重置（测试用）
+--- 重置（测试用）：关闭弹窗并解除注册
 function M.reset()
   _close()
   state._question = nil
   state._options = nil
+  pcall(function() ask_user.set_ui(nil) end)
 end
 
 return M

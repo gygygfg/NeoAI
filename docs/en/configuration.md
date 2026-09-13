@@ -166,12 +166,13 @@ session = {
 | `web_fetch` | See below (`enabled=false` by default) | Web fetch: render dynamic pages in a headless browser and convert to Markdown |
 | `plan_mode` | `{enabled=true, auto_execute_on_approve=true, extra_safe_tools={}, mutating_tools=...}` | Plan mode |
 | `approval` | See below | Tool approval |
+| `sandbox` | See below | Tool execution sandbox (dry-run/commit, isolation backend, policy) |
 
 **approval (tool approval)**:
 
 ```lua
 approval = {
-  mode = "prompt",             -- prompt | auto_allow | strict
+  mode = "async",              -- async (default: execute immediately in sandbox, confirm apply later) | prompt | auto_allow | strict
   default_auto_allow = false,
   timeout_ms = 60000,          -- Approval dialog timeout (prevents hanging forever)
   allowed_directories = {},
@@ -202,6 +203,38 @@ approval = {
 > **Approval decisions**: `mode=auto_allow` → no approval; `mode=strict` → always approve;
 > a tool with `auto_allow=true` → no approval; a path inside an allowed directory + the command's first word in an
 > allowed parameter group → no approval.
+
+**sandbox (tool execution sandbox)**:
+
+```lua
+sandbox = {
+  enabled = true,                  -- Master switch
+  fail_closed = true,              -- Reject execution when the sandbox service is missing/disabled (no silent downgrade)
+  mode = "dry_run",                -- dry_run (default, only freezes candidates) | commit (CAS publish after authorization)
+  backend = "auto",                -- auto | bwrap | unshare
+  offline = true,                  -- Offline by default: network tools are hard-denied
+  require_seccomp = false,         -- Reject external execution when seccomp is unavailable
+  seccomp = { enabled = false, filter_path = "" }, -- seccomp baseline (built-in denylist; bwrap only)
+  network = { enabled = false, allowed_endpoints = {}, budget_bytes = 0 }, -- controlled network gateway
+  workspace_root = vim.fn.stdpath("cache") .. "/NeoAI/sandbox",
+  review = { enabled = true, auto_apply = false }, -- async review: candidates enter a pending queue
+  retention = { candidate_days = 7, max_pending = 20 },
+  policy = {
+    version = "1",                 -- policy version (for audit replay; bump when rules change)
+    deny_tools = {},               -- Hard-denied tool names (cannot be overridden by confirmation)
+    rules = {},                    -- Restricted Lua rule functions returning { decision, reason_codes }
+  },
+  limits = { wall_ms = 60000, memory_bytes = 0, pids = 0, cpu_max = 0, cgroup_base = "/sys/fs/cgroup" },
+  seccomp_filter_path = "",        -- optional: compiled seccomp BPF filter (with require_seccomp)
+}
+```
+
+> Every tool call goes through the control plane: preflight → isolated execution → freeze candidate →
+> CAS publish. The default `dry_run` does not write the real workspace; candidates enter an async
+> review queue — use `:NeoAISandboxReview` to view/apply, or
+> `:NeoAISandboxApprove/Reject/Apply <change_set_id>`; `:NeoAISandboxList/Show/Discard/Caps` manage
+> candidates and inspect runtime capabilities. Rules run in a restricted environment with
+> instruction/wall-clock budgets; rule errors produce `DENY`. See [sandbox.md](sandbox.md).
 
 **web_fetch (web fetch, disabled by default)**:
 
@@ -293,6 +326,23 @@ skills = {
 }
 ```
 
+### 2.10 `plugins`
+
+```lua
+plugins = {
+  builtin = true,                 -- false = register no builtin plugins
+  disabled = { "ui", "services.mcp" }, -- disabled plugin/service ids (incl. dependency closure)
+  entries = {
+    ["tool.shell"] = false,        -- disable a plugin
+    ["services.model_service"] = { module = "my_model_provider" }, -- replace implementation
+  },
+}
+```
+
+- Disabled plugins and their downstream dependents are removed together; `entries[id] = false` disables.
+- `entries[id] = { module = "..." }` replaces a service/tool implementation (must be `require`-able with the same interface).
+- See [plugins.md](plugins.md) for the plugin protocol, cleanup, replacement and testing requirements.
+
 ## 3. Plan Mode (tools/plan_mode)
 
 Plan mode is a **per-agent state** (`agent.plan_mode`); when active:
@@ -313,3 +363,4 @@ The state is persisted in `session.metadata.plan` and restored when the session 
 - [tool_system.md](tool_system.md): runtime behavior of the `tools.*` tool/approval configuration.
 - [ai_engine.md](ai_engine.md): engine-side behavior of `ai.context_cache` / `ai.reasoning_enabled`.
 - [model_policy.md](model_policy.md): automatic per-model selection (protocol dialect / capability table / explicit cache).
+- [plugins.md](plugins.md): plugin system, service locator and default composition.

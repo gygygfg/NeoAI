@@ -2,7 +2,7 @@
 --- @module NeoAI.ui.components.tool_approval
 --- 工具执行审批 UI。注册到 tool_service。
 
-local tool_service = require("NeoAI.services.tool_service")
+local services = require("NeoAI.kernel.services")
 
 local M = {}
 
@@ -159,15 +159,19 @@ end
 
 --- 注册到 tool_service
 function M.init()
+  local tool_service = services.use("services.tool_service")
+  if not tool_service then return end
   tool_service.set_approval_ui({
     show = M.show,
     hide = M.hide,
   })
 end
 
---- 重置（测试用）
+--- 重置（测试用）：关闭弹窗并解除 tool_service 注册
 function M.reset()
   _close()
+  local tool_service = services.use("services.tool_service")
+  if tool_service then tool_service.set_approval_ui(nil) end
 end
 
 return M

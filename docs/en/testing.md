@@ -115,8 +115,18 @@ ensures there are no leftover subscriptions or state between tests.
 | `test_chat_ui / test_tree_ui / test_chat_keys` | Chat/tree UI, chat keymaps |
 | `test_display_modes / test_fold / test_markdown` | Display modes, folding, Markdown |
 | `test_timer / test_http / test_integration` | Pausable timer, HTTP client, integration (mock server) |
+| `test_plugins` | Plugin protocol: dependency waiting, replacement, disable, failure rollback, real message request, repeated start, tool/prompt-section release, hot reload |
+| `test_sandbox` | Tool sandbox: loader spec attachment, fail-closed, state machine/idempotency/fencing, policy aggregation and restricted rules, dry-run no-write, CAS publish and conflict, buffer write redirection, runtime probe and isolated process, async review enqueue/apply/reject, selective apply, run_command overlay candidate capture, impact model, evidence redaction/paging, task grants auto-apply/scope, constraint aggregation, decision envelope, retention and metrics, controlled network gateway, broker idempotency/reconcile, dependency closure, composed publish and path conflict, policy replay, evidence retention, cgroup resource domain and PID limit, seccomp baseline enforcement and gate, content-addressed cache, fault injection (publish/backend/freeze), performance benchmarks, revision derivation |
+
+### 5.1 Plugin Testing Conventions
+
+- Use unique plugin ids and service names; `unregister` / `revoke` at the end so running builtin plugins are not polluted.
+- Tests that change configuration save and restore `config_store.get_all()`.
+- Tests that stop/start builtin plugins restore `plugins.start_all()` before asserting, so a failure cannot affect later suites.
+- Real message requests use the local `tests/http_server.lua` mock and stay offline reproducible.
 
 ## 6. Related Docs
 
 - [threaded_testing.md](threaded_testing.md): Test framework structure and runner.
 - [utils.md](utils.md): `utils.async` (Deferred/sleep, etc. used in tests).
+- [plugins.md](plugins.md): plugin system and cleanup/replacement testing requirements.

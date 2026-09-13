@@ -5,7 +5,7 @@
 --- - 按提供商分组折叠（expr 折叠，默认展开，可用 zc/za/zo 折叠/展开）
 --- - 回车在模型行上选择正确模型；在提供商头行上切换折叠
 
-local model_service = require("NeoAI.services.model_service")
+local services = require("NeoAI.kernel.services")
 local config_store = require("NeoAI.kernel.config_store")
 
 local M = {}
@@ -153,30 +153,37 @@ function M.open(on_select)
   })
 
   -- 加载模型
-  model_service.list():then_(function(groups)
-    local data = _build_lines(groups)
-    state.line_to_model = data.line_to_model
-    state.first_model_line = data.first_model_line
-    state.has_providers = #data.providers > 0
-
-    local lines = data.lines
-    if #lines == 0 then
-      lines = { "未找到配置 api_key 的提供商" }
-    end
+  local model_service = services.use("services.model_service")
+  if not model_service then
     if vim.api.nvim_buf_is_valid(state.buf) then
-      vim.api.nvim_buf_set_lines(state.buf, 0, -1, false, lines)
+      vim.api.nvim_buf_set_lines(state.buf, 0, -1, false, { "模型服务未启用" })
     end
+  else
+    model_service.list():then_(function(groups)
+      local data = _build_lines(groups)
+      state.line_to_model = data.line_to_model
+      state.first_model_line = data.first_model_line
+      state.has_providers = #data.providers > 0
 
-    -- 有模型时才开启按提供商折叠
-    if state.has_providers and state.first_model_line then
-      _setup_folds()
-      vim.api.nvim_win_set_cursor(state.win_id, { state.first_model_line, 0 })
-    end
-  end):catch(function(e)
-    if vim.api.nvim_buf_is_valid(state.buf) then
-      vim.api.nvim_buf_set_lines(state.buf, 0, -1, false, { "加载模型失败: " .. tostring(e.message or e) })
-    end
-  end)
+      local lines = data.lines
+      if #lines == 0 then
+        lines = { "未找到配置 api_key 的提供商" }
+      end
+      if vim.api.nvim_buf_is_valid(state.buf) then
+        vim.api.nvim_buf_set_lines(state.buf, 0, -1, false, lines)
+      end
+
+      -- 有模型时才开启按提供商折叠
+      if state.has_providers and state.first_model_line then
+        _setup_folds()
+        vim.api.nvim_win_set_cursor(state.win_id, { state.first_model_line, 0 })
+      end
+    end):catch(function(e)
+      if vim.api.nvim_buf_is_valid(state.buf) then
+        vim.api.nvim_buf_set_lines(state.buf, 0, -1, false, { "加载模型失败: " .. tostring(e.message or e) })
+      end
+    end)
+  end
 
   -- 快捷键
   vim.keymap.set("n", "q", function() M.close() end, { buffer = state.buf })

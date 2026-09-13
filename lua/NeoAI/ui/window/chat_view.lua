@@ -14,9 +14,17 @@ local tool_args_panel = require("NeoAI.ui.components.tool_args_panel")
 local float_stream_window = require("NeoAI.ui.components.float_stream_window")
 local fold = require("NeoAI.ui.components.fold")
 local display_modes = require("NeoAI.ui.components.display_modes")
-local chat_service = require("NeoAI.services.chat_service")
+local services = require("NeoAI.kernel.services")
 local event_bus = require("NeoAI.kernel.event_bus")
 local events = require("NeoAI.kernel.events")
+
+-- 聊天服务经服务定位器动态解析：支持运行期替换/禁用，不做默认模块回退。
+local chat_service = setmetatable({}, {
+  __index = function(_, key)
+    local svc = services.use("services.chat_service")
+    return svc and svc[key] or nil
+  end,
+})
 
 local M = {}
 
@@ -1191,7 +1199,8 @@ function M.open(opts)
 
   -- 打开聊天窗口时懒注入 lualine 扩展：此阶段用户启动配置已执行、lualine 已可用，
   -- 避免因 lualine 懒加载 / setup 顺序导致扩展注册不到。
-  require("NeoAI.services.status").ensure_lualine_extension()
+  local status = services.use("services.status")
+  if status then status.ensure_lualine_extension() end
 
   return { win_id = state.win_id, buf = state.buf }
 end

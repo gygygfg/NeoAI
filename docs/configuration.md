@@ -163,12 +163,13 @@ session = {
 | `web_fetch` | 见下（默认 `enabled=false`） | 网页抓取：无头浏览器渲染动态页面并转 Markdown |
 | `plan_mode` | `{enabled=true, auto_execute_on_approve=true, extra_safe_tools={}, mutating_tools=...}` | 计划模式 |
 | `approval` | 见下 | 工具审批 |
+| `sandbox` | 见下 | 工具执行沙箱（dry-run/commit、隔离后端、策略） |
 
 **approval（工具审批）**：
 
 ```lua
 approval = {
-  mode = "prompt",             -- prompt | auto_allow | strict
+  mode = "async",              -- async（默认，异步审批：立即沙箱执行，事后确认应用）| prompt | auto_allow | strict
   default_auto_allow = false,
   timeout_ms = 60000,          -- 审批弹窗超时（防永久挂起）
   allowed_directories = {},
@@ -198,6 +199,37 @@ approval = {
 
 > **审批决策**：`mode=auto_allow` → 不审批；`mode=strict` → 必审批；
 > 工具 `auto_allow=true` → 不审批；路径落允许目录 + 命令首词落参数组 → 不审批。
+
+**sandbox（工具执行沙箱）**：
+
+```lua
+sandbox = {
+  enabled = true,                  -- 总开关
+  fail_closed = true,              -- 沙箱服务缺失/禁用时拒绝执行（不静默降级）
+  mode = "dry_run",                -- dry_run（默认，仅冻结候选）| commit（授权后立即 CAS 发布）
+  backend = "auto",                -- auto | bwrap | unshare
+  offline = true,                  -- 默认离线：网络类工具直接硬拒绝
+  require_seccomp = false,         -- 缺少 seccomp 能力时是否拒绝外部执行
+  seccomp = { enabled = false, filter_path = "" }, -- seccomp 基线（内置 denylist；仅 bwrap）
+  network = { enabled = false, allowed_endpoints = {}, budget_bytes = 0 }, -- 受控网络网关
+  workspace_root = vim.fn.stdpath("cache") .. "/NeoAI/sandbox",
+  review = { enabled = true, auto_apply = false }, -- 异步审批：候选进入待审队列，用户确认后应用
+  retention = { candidate_days = 7, max_pending = 20 },
+  policy = {
+    version = "1",                 -- 策略版本（用于审计回放；规则变更时递增）
+    deny_tools = {},               -- 硬拒绝工具名（用户确认亦不可覆盖）
+    rules = {},                    -- 受限 Lua 规则函数数组：返回 { decision, reason_codes }
+  },
+  limits = { wall_ms = 60000, memory_bytes = 0, pids = 0, cpu_max = 0, cgroup_base = "/sys/fs/cgroup" },
+  seccomp_filter_path = "",        -- 可选：编译后 seccomp BPF 过滤器（配合 require_seccomp）
+}
+```
+
+> 所有工具执行经控制面：预检 → 隔离执行 → 冻结候选 → CAS 发布。默认 `dry_run` 不写真实
+> 工作区，候选进入异步待审队列，用 `:NeoAISandboxReview` 查看并应用，或
+> `:NeoAISandboxApprove/Reject/Apply <change_set_id>`；`:NeoAISandboxList/Show/Discard/Caps`
+> 管理候选与查看运行时能力。策略规则在受限环境执行并有指令/墙钟预算；规则异常统一 DENY。
+> 详见 [sandbox.md](sandbox.md)。
 
 **web_fetch（网页抓取，默认不启用）**：
 
@@ -288,6 +320,23 @@ skills = {
 }
 ```
 
+### 2.10 `plugins`
+
+```lua
+plugins = {
+  builtin = true,                 -- false = 不登记任何内置插件（宿主自管）
+  disabled = { "ui", "services.mcp" }, -- 禁用的插件/服务 id（含依赖闭包）
+  entries = {
+    ["tool.shell"] = false,        -- 禁用某插件
+    ["services.model_service"] = { module = "my_model_provider" }, -- 替换实现模块
+  },
+}
+```
+
+- `disabled` 中的插件及其下游依赖会被一并移除；`entries[id] = false` 等价禁用。
+- `entries[id] = { module = "..." }` 替换服务/工具实现（模块需可 `require`，接口一致）。
+- 插件协议、清理、替换与测试要求详见 [plugins.md](plugins.md)。
+
 ## 3. 计划模式（tools/plan_mode）
 
 计划模式作为 **per-agent 状态**（`agent.plan_mode`），激活时：
@@ -308,3 +357,4 @@ skills = {
 - [tool_system.md](tool_system.md)：`tools.*` 工具/审批配置的运行时行为。
 - [ai_engine.md](ai_engine.md)：`ai.context_cache` / `ai.reasoning_enabled` 的引擎侧行为。
 - [model_policy.md](model_policy.md)：按模型自动选择（协议方言 / 能力表 / 显式缓存）。
+- [plugins.md](plugins.md)：插件系统、服务定位器与默认组合。

@@ -80,7 +80,6 @@ plan_tools.create_sub_agent = helpers.define_tool(
     event_bus.emit(events.SUB_AGENT_CREATED, { sub_agent_id = sub_id, task = args.task })
 
     -- 启动子 Agent 执行
-    local tool_service = require("NeoAI.services.tool_service")
     local tools_subset = M._allowed_tools(boundaries.allowed_tools)
     sub_agent.tools = tools_subset
 

@@ -1,11 +1,14 @@
 --- NeoAI 服务层入口
 --- @module NeoAI.services
---- 连接 core 与 ui/tools。向上提供简洁 API。
+--- 兼容旧用法：M.chat_service / M.tool_service / M.model_service 等经
+--- kernel.services.use 动态解析当前实现；服务被禁用/替换时不会回退默认模块。
 
-local M = {}
+local services = require("NeoAI.kernel.services")
 
-M.chat_service = require("NeoAI.services.chat_service")
-M.tool_service = require("NeoAI.services.tool_service")
-M.model_service = require("NeoAI.services.model_service")
+local M = setmetatable({}, {
+  __index = function(_, key)
+    return services.use("services." .. key)
+  end,
+})
 
 return M

@@ -18,6 +18,7 @@
 | `tools/packer.lua` | 工具按类别分组打包（UI 分类展示）。 |
 | `tools/environment.lua` | 工具环境探测（workspace / git 目录），不可用则禁用依赖环境工具。 |
 | `tools/builtin/*` | 内置工具实现（见下）。 |
+| `sandbox/*` | 工具执行沙箱控制面（预检/隔离执行/候选冻结/CAS 发布），详见 [sandbox.md](sandbox.md)。 |
 
 ## 2. 工具定义
 
@@ -66,9 +67,16 @@ resolve_name（别名/模糊匹配）
       ├─ 需审批 → tool_service.approve_and_execute(...)
       │           （审批通过后 continue_fn 继续，计时器审批后才 start）
       └─ 直接执行 → _execute_tool(...)
+          → 沙箱门禁 sandbox.gate(...)（预检 → 隔离执行 → 冻结候选 → CAS 发布）
           → _call_tool（调用 func/execute）
           → 基于可暂停计时器做超时（等待审批/提问不计入）
 ```
+
+> **沙箱强制**：所有工具执行都经 `services.sandbox.gate`；加载器与注册表为工具附加
+> `__sandbox_spec`（effect/paths）。默认异步审批（`tools.approval.mode="async"`）：
+> 效果类工具立即在沙箱内执行并冻结候选，不阻塞等待；真实修改进入待审队列，用
+> `:NeoAISandboxReview` 异步确认后应用。沙箱服务缺失且 `fail_closed=true` 时拒绝执行。
+> 详见 [sandbox.md](sandbox.md)。
 
 ### 4.1 参数别名规范化
 

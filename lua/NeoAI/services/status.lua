@@ -9,6 +9,7 @@
 local config_store = require("NeoAI.kernel.config_store")
 local event_bus = require("NeoAI.kernel.event_bus")
 local events = require("NeoAI.kernel.events")
+local services = require("NeoAI.kernel.services")
 
 local M = {}
 
@@ -229,8 +230,8 @@ end
 --- 当前 Agent 的容量告警级别（供状态栏动态配色）
 --- @return string "ok" | "warn" | "over"
 function M.capacity_level()
-  local chat_service = require("NeoAI.services.chat_service")
-  local agent = chat_service.get_current_agent()
+  local chat_service = services.use("services.chat_service")
+  local agent = chat_service and chat_service.get_current_agent()
   local cap = agent and M.capacity_for(agent)
   return (cap and cap.level) or "ok"
 end
@@ -262,11 +263,11 @@ end
 --- 获取当前 Agent 的状态信息（不格式化，供自定义组件使用）
 --- @return table { available, mode, display, model, state, usage, capacity }
 function M.get_info()
-  local chat_service = require("NeoAI.services.chat_service")
-  local agent = chat_service.get_current_agent()
+  local chat_service = services.use("services.chat_service")
+  local agent = chat_service and chat_service.get_current_agent()
   local info = {
     available = agent ~= nil,
-    mode = chat_service.get_mode() or "chat",
+    mode = (chat_service and chat_service.get_mode()) or "chat",
     display = nil,
     model = agent and agent.model or config_store.get("ai.default_model") or "auto",
     state = agent and agent.state or "idle",
@@ -275,7 +276,7 @@ function M.get_info()
     pending = nil,
   }
   -- 当前 agent 正忙时暂存的待发消息数（无 agent 或队列为空则缺省，徽标不渲染）
-  info.pending = chat_service.pending_count()
+  info.pending = chat_service and chat_service.pending_count() or nil
   if agent then
     local u = agent.usage or {}
     info.usage = {
@@ -366,6 +367,15 @@ function M.watch()
   for _, ev in ipairs(subscribed) do
     state.unsubs[#state.unsubs + 1] = event_bus.on(ev, _refresh)
   end
+end
+
+--- 取消事件订阅并复位监听状态（插件卸载/测试用）
+function M.unwatch()
+  for _, u in ipairs(state.unsubs) do
+    if u then pcall(u) end
+  end
+  state.unsubs = {}
+  state.watching = false
 end
 
 --- 刷新状态栏（供扩展 init / 手动调用）

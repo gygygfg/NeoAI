@@ -9,6 +9,18 @@ local M = {}
 
 -- ========== 私有函数 ==========
 
+--- 为 argv 前置沙箱运行时前缀（隔离执行）
+--- @param argv table
+--- @param opts table { prefix?: table }
+--- @return table
+local function _sandboxed_argv(argv, opts)
+  if not (opts and opts.prefix and #opts.prefix > 0) then return argv end
+  local full = {}
+  for _, v in ipairs(opts.prefix) do full[#full + 1] = v end
+  for _, v in ipairs(argv) do full[#full + 1] = v end
+  return full
+end
+
 --- 执行 shell 命令（jobstart，实时累积 stdout/stderr）。
 --- 采用非缓冲输出：命令超时/被取消时也能回传「此刻终端已产生的内容」，
 --- 而不是只剩一句错误信息。始终 resolve 结果表（含 timed_out/aborted 标记），
@@ -55,7 +67,8 @@ local function _run_command(command, opts)
     end, timeout_ms)
   end
 
-  job = vim.fn.jobstart({ "sh", "-c", command }, {
+  job = vim.fn.jobstart(_sandboxed_argv({ "sh", "-c", command }, opts), {
+    cwd = opts.cwd,
     stdout_buffered = false,
     stderr_buffered = false,
     on_stdout = function(_, data)
@@ -112,7 +125,12 @@ shell_tools.run_command = helpers.define_tool(
   function(args, on_success, on_error, ctx)
     local command = args.command
     local signal = ctx and ctx.signal
-    _run_command(command, { timeout_ms = args.timeout_ms, signal = signal }):then_(function(result)
+    _run_command(command, {
+      timeout_ms = args.timeout_ms,
+      signal = signal,
+      prefix = ctx and ctx.sandbox_prefix,
+      cwd = ctx and ctx.sandbox_cwd,
+    }):then_(function(result)
       local out = result.stdout or ""
       local errout = result.stderr or ""
       if result.aborted then

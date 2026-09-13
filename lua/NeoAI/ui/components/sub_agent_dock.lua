@@ -14,6 +14,7 @@ local state = {
   buf = nil,
   agents = {}, -- id -> { task, status, updated_at }
   unsub = nil,
+  unsubs = {},
 }
 
 -- ========== 私有函数 ==========
@@ -71,25 +72,31 @@ end
 --- 启动事件监听
 function M.init()
   if state.unsub then return end
-  state.unsub = event_bus.on(events.SUB_AGENT_CREATED, function(data)
-    state.agents[data.sub_agent_id] = { task = data.task, status = "running" }
-    _render()
-  end)
-  event_bus.on(events.SUB_AGENT_COMPLETED, function(data)
-    local a = state.agents[data.sub_agent_id]
-    if a then a.status = "completed" end
-    _render()
-  end)
-  event_bus.on(events.SUB_AGENT_ERROR, function(data)
-    local a = state.agents[data.sub_agent_id]
-    if a then a.status = "error" end
-    _render()
-  end)
+  state.unsub = true
+  state.unsubs = {
+    event_bus.on(events.SUB_AGENT_CREATED, function(data)
+      state.agents[data.sub_agent_id] = { task = data.task, status = "running" }
+      _render()
+    end),
+    event_bus.on(events.SUB_AGENT_COMPLETED, function(data)
+      local a = state.agents[data.sub_agent_id]
+      if a then a.status = "completed" end
+      _render()
+    end),
+    event_bus.on(events.SUB_AGENT_ERROR, function(data)
+      local a = state.agents[data.sub_agent_id]
+      if a then a.status = "error" end
+      _render()
+    end),
+  }
 end
 
 --- 重置（测试用）
 function M.reset()
-  if state.unsub then state.unsub() end
+  for _, u in ipairs(state.unsubs or {}) do
+    if u then pcall(u) end
+  end
+  state.unsubs = {}
   state.unsub = nil
   state.agents = {}
   M.close()

@@ -31,6 +31,7 @@
 - **Tool argument receiving panel** — while the model streams tool-call arguments, a "receiving arguments" floating window (`tool_args_panel`) opens in real time, appending each chunk incrementally and closing automatically once the arguments end, consistent with the reasoning floating window
 - **MCP support** — connect to external MCP servers over stdio / Streamable HTTP and register remote `tools`/`resources`/`prompts` in the tool system (with pre-caching + failure-driven dynamic refresh, see [docs/en/mcp.md](docs/en/mcp.md))
 - **Skills support** — scan SKILL.md skill directories and inject the list of available skills into the system prompt; the model loads the skill body with `load_skill` (Claude/opencode style, see [docs/en/skills.md](docs/en/skills.md))
+- **Tool execution sandbox** — every tool call goes through the control plane (preflight → isolated execution → freeze candidate → CAS publish); the default async review executes AI changes immediately in the sandbox and freezes candidates, with real workspace changes queued for the user to confirm via `:NeoAISandboxReview`; external processes are isolated via bwrap/unshare and network is offline by default (see [docs/en/sandbox.md](docs/en/sandbox.md))
 
 ---
 
@@ -118,6 +119,16 @@ require("NeoAI").setup({
 | `:NeoAIPlan`       | Toggle plan mode (the tool context retains only read-only / informational queries + asking the user) |
 | `:NeoAIAuto`       | Toggle AUTO mode (automatically allow all tool calls) |
 | `:NeoAIApprovePlan`| Confirm the plan and switch to CHAT mode to execute it per the task list |
+| `:NeoAISandboxCommit`| Apply a sandbox candidate to the real workspace (CAS publish; arg = candidate digest) |
+| `:NeoAISandboxReview`| List pending changes and apply the selected one (async review) |
+| `:NeoAISandboxApprove` / `:NeoAISandboxReject` | Approve (no apply) / reject & discard a change set |
+| `:NeoAISandboxApply` / `:NeoAISandboxApplyAll` | Approve and apply one / all pending change sets |
+| `:NeoAISandboxGrant` / `:NeoAISandboxRevoke` | Create a narrow task grant / revoke a grant |
+| `:NeoAISandboxPrune` / `:NeoAISandboxMetrics` | Prune expired candidates / show sandbox metrics |
+| `:NeoAISandboxPublish` / `:NeoAISandboxReplay` | Publish multiple change sets together / replay a policy decision |
+| `:NeoAISandboxList` / `:NeoAISandboxShow` | List / inspect pending sandbox candidates |
+| `:NeoAISandboxDiscard`| Discard a sandbox candidate (arg = candidate digest) |
+| `:NeoAISandboxCaps`| Show sandbox runtime capability probe results |
 | `:NeoAIStatusline` | Preview the content of the current lualine statusline components |
 
 ### 4. Default Keymaps
@@ -403,6 +414,16 @@ require("NeoAI").setup({
     enabled = true,                      -- whether to enable reporting (also requires HERDR_ENV=1 to take effect; a no-op outside a Herder environment)
     source = "custom:neoai",             -- stable, globally unique authoritative lifecycle identifier
     agent = "neoai",                     -- agent name (used for identification on the Herder side)
+  },
+
+  -- ===== Plugin system (replaceable services / disable side effects) =====
+  plugins = {
+    builtin = true,                      -- false = register no builtin plugins
+    disabled = {},                       -- disabled plugin/service ids, e.g. { "ui", "services.mcp" }
+    entries = {
+      -- ["tool.shell"] = false,                                  -- disable a plugin
+      -- ["services.model_service"] = { module = "my_model_provider" }, -- replace implementation
+    },
   },
 })
 ```
@@ -905,6 +926,29 @@ NeoAI/
 │       ├── skills.lua         # Skills tools (list_skills/load_skill + prompt segment)
 │       └── tool_helpers.lua   # Tool definition helpers
 │
+├── sandbox/                    # Tool execution sandbox control plane (dry-run/commit)
+│   ├── init.lua              # Facade (gate/attach/commit/discard/list/probe)
+│   ├── control.lua           # State machine / idempotency / fencing
+│   ├── policy.lua            # Rule aggregation + restricted Lua rule sandbox
+│   ├── runtime.lua           # bwrap/unshare backend probe and process prefix
+│   ├── candidate.lua         # Private staging / freeze / CAS publish
+│   ├── store.lua             # Candidate & receipt persistence
+│   ├── review.lua            # Async review change-set queue
+│   ├── impact.lua            # fs/process/network impact records
+│   ├── evidence.lua          # Evidence storage/redaction/paging
+│   ├── grant.lua             # Narrow task grants
+│   ├── envelope.lua          # Decision envelope
+│   ├── network.lua           # Controlled network gateway
+│   ├── broker.lua            # External-operation broker
+│   ├── replay.lua            # Policy replay
+│   ├── cgroup.lua            # cgroup v2 resource domain
+│   ├── seccomp.lua           # seccomp capability probe/gate
+│   ├── cache.lua             # Content-addressed cache
+│   ├── fault.lua             # Fault injection
+│   ├── bench.lua             # Performance benchmarks
+│   ├── tool_spec.lua         # Per-tool effect declaration
+│   └── wrapper.lua           # Execution gate
+│
 ├── utils/                      # Pure utility library (zero business dependencies)
 │   ├── async.lua             # Promise/Deferred/AbortSignal/retry
 │   ├── json.lua              # JSON encoding/decoding
@@ -1027,10 +1071,12 @@ Run specific tests:
 | [docs/ai_engine.md](docs/en/ai_engine.md)                                     | Agent engine     |
 | [docs/model_policy.md](docs/en/model_policy.md)                               | Automatic per-model selection (protocol dialects/capability table/explicit caching) |
 | [docs/tool_system.md](docs/en/tool_system.md)                                 | Tool system      |
+| [docs/sandbox.md](docs/en/sandbox.md)                                         | Tool execution sandbox (dry-run/commit, isolation backends, policy) |
 | [docs/ui_system.md](docs/en/ui_system.md)                                     | UI system        |
 | [docs/sub_agent_system.md](docs/en/sub_agent_system.md)                       | Sub-agent system |
 | [docs/history_manager.md](docs/en/history_manager.md)                         | Session system (branch/persistence/compaction) |
 | [docs/configuration.md](docs/en/configuration.md)                             | Configuration system |
+| [docs/plugins.md](docs/en/plugins.md)                                         | Plugin system (service locator/host/cleanup/replacement) |
 | [docs/chat_enhanced_usage.md](docs/en/chat_enhanced_usage.md)                 | Enhanced chat usage guide |
 | [docs/mcp.md](docs/en/mcp.md)                                                 | MCP support (transport/tools/timing) |
 | [docs/skills.md](docs/en/skills.md)                                           | Skills support (SKILL.md + load_skill) |

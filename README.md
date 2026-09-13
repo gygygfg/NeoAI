@@ -31,6 +31,7 @@
 - **工具参数接收面板** — 模型流式生成工具调用参数时实时打开「接收参数」悬浮窗（`tool_args_panel`），随分片增量追加、参数结束后自动关闭，与思考过程悬浮窗一致
 - **MCP 支持** — 通过 stdio / Streamable HTTP 连接外部 MCP 服务器，把远端 `tools`/`resources`/`prompts` 注册进工具系统（含预缓存 + 失败驱动的动态刷新，见 [docs/mcp.md](docs/mcp.md)）
 - **Skills 支持** — 扫描 SKILL.md 技能目录，把可用技能列表注入系统提示，模型用 `load_skill` 装载技能正文（Claude/opencode 风格，见 [docs/skills.md](docs/skills.md)）
+- **工具执行沙箱** — 所有工具执行经控制面（预检 → 隔离执行 → 冻结候选 → CAS 发布）；默认异步审批：AI 的修改立即在沙箱内执行并冻结候选，真实工作区改动进入待审队列，用户用 `:NeoAISandboxReview` 异步确认后应用；外部进程经 bwrap/unshare 隔离，网络默认离线（见 [docs/sandbox.md](docs/sandbox.md)）
 
 ---
 
@@ -118,6 +119,16 @@ require("NeoAI").setup({
 | `:NeoAIPlan`       | 切换计划模式（工具上下文只保留只读/信息查询 + 提问）|
 | `:NeoAIAuto`       | 切换 AUTO 模式（自动允许所有工具调用）             |
 | `:NeoAIApprovePlan`| 确认计划并转入 CHAT 模式按任务清单执行             |
+| `:NeoAISandboxCommit`| 应用沙箱候选到真实工作区（CAS 发布，参数为候选摘要）|
+| `:NeoAISandboxReview`| 列出待审修改并选择应用（异步审批）              |
+| `:NeoAISandboxApprove` / `:NeoAISandboxReject` | 批准（不应用）/ 拒绝并丢弃变更单元 |
+| `:NeoAISandboxApply` / `:NeoAISandboxApplyAll` | 批准并应用单个 / 全部待审变更单元 |
+| `:NeoAISandboxGrant` / `:NeoAISandboxRevoke` | 创建窄范围任务授权 / 撤销授权 |
+| `:NeoAISandboxPrune` / `:NeoAISandboxMetrics` | 清理过期候选 / 显示沙箱指标 |
+| `:NeoAISandboxPublish` / `:NeoAISandboxReplay` | 组合发布多个变更单元 / 回放策略裁决 |
+| `:NeoAISandboxList` / `:NeoAISandboxShow` | 列出/查看待处理沙箱候选 |
+| `:NeoAISandboxDiscard`| 丢弃沙箱候选（参数为候选摘要）                  |
+| `:NeoAISandboxCaps`| 显示沙箱运行时能力探测结果                        |
 | `:NeoAIStatusline` | 预览当前 lualine 状态栏组件内容                    |
 
 ### 4. 默认快捷键
@@ -402,6 +413,16 @@ require("NeoAI").setup({
     enabled = true,                      -- 是否启用上报（还需 HERDR_ENV=1 才生效；非 Herder 环境为 no-op）
     source = "custom:neoai",             -- 稳定且全局唯一的生命周期权威标识
     agent = "neoai",                     -- agent 名称（Herder 侧识别用）
+  },
+
+  -- ===== 插件系统（可替换服务 / 禁用副作用）=====
+  plugins = {
+    builtin = true,                      -- false = 不登记内置插件（宿主自管）
+    disabled = {},                       -- 禁用的插件/服务 id，如 { "ui", "services.mcp" }
+    entries = {
+      -- ["tool.shell"] = false,                                  -- 禁用某插件
+      -- ["services.model_service"] = { module = "my_model_provider" }, -- 替换实现
+    },
   },
 })
 ```
@@ -886,6 +907,29 @@ NeoAI/
 │       ├── skills.lua         # 技能工具（list_skills/load_skill + 提示段）
 │       └── tool_helpers.lua   # 工具定义辅助
 │
+├── sandbox/                    # 工具执行沙箱控制面（dry-run/commit）
+│   ├── init.lua              # 入口（gate/attach/commit/discard/list/probe）
+│   ├── control.lua           # 状态机/幂等/fencing
+│   ├── policy.lua            # 规则评估聚合 + 受限 Lua 规则沙箱
+│   ├── runtime.lua           # bwrap/unshare 后端探测与进程前缀
+│   ├── candidate.lua         # 私有暂存/冻结/CAS 发布
+│   ├── store.lua             # 候选与回执持久化
+│   ├── review.lua            # 异步审批变更单元队列
+│   ├── impact.lua            # fs/process/network 影响记录
+│   ├── evidence.lua          # 证据保存/脱敏/分页
+│   ├── grant.lua             # 窄范围任务授权
+│   ├── envelope.lua          # 裁决信封
+│   ├── network.lua           # 受控网络网关
+│   ├── broker.lua            # 外部操作 broker
+│   ├── replay.lua            # 策略回放
+│   ├── cgroup.lua            # cgroup v2 资源域
+│   ├── seccomp.lua           # seccomp 能力探测/门禁
+│   ├── cache.lua             # 内容寻址缓存
+│   ├── fault.lua             # 故障注入
+│   ├── bench.lua             # 性能基准
+│   ├── tool_spec.lua         # 工具影响类别声明
+│   └── wrapper.lua           # 执行门禁
+│
 ├── utils/                      # 纯工具库（零业务依赖）
 │   ├── async.lua             # Promise/Deferred/AbortSignal/retry
 │   ├── json.lua              # JSON 编解码
@@ -1009,10 +1053,12 @@ NeoAI 基于 Neovim 原生 `User` 自动命令实现事件驱动架构，事件�
 | [docs/ai_engine.md](docs/ai_engine.md)                                     | Agent 引擎       |
 | [docs/model_policy.md](docs/model_policy.md)                               | 按模型自动选择（协议方言/能力表/显式缓存） |
 | [docs/tool_system.md](docs/tool_system.md)                                 | 工具系统         |
+| [docs/sandbox.md](docs/sandbox.md)                                         | 工具执行沙箱（dry-run/commit、隔离后端、策略） |
 | [docs/ui_system.md](docs/ui_system.md)                                     | UI 系统          |
 | [docs/sub_agent_system.md](docs/sub_agent_system.md)                       | 子 Agent 系统    |
 | [docs/history_manager.md](docs/history_manager.md)                         | 会话系统（分支/持久化/压缩） |
 | [docs/configuration.md](docs/configuration.md)                             | 配置系统         |
+| [docs/plugins.md](docs/plugins.md)                                         | 插件系统（服务定位器/宿主/清理/替换） |
 | [docs/chat_enhanced_usage.md](docs/chat_enhanced_usage.md)                 | 聊天增强使用指南 |
 | [docs/mcp.md](docs/mcp.md)                                                 | MCP 支持（传输/工具/时序） |
 | [docs/skills.md](docs/skills.md)                                           | Skills 支持（SKILL.md + load_skill） |

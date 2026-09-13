@@ -186,27 +186,20 @@ function M._perform_reload()
   local user_config, session_id, auto_on
   pcall(function() user_config = require("NeoAI.kernel.config_store").get_all() end)
   pcall(function()
-    local cs = require("NeoAI.services.chat_service")
-    session_id = cs.get_current_session_id()
+    local cs = require("NeoAI.kernel.services").use("services.chat_service")
+    session_id = cs and cs.get_current_session_id()
   end)
-  pcall(function() auto_on = require("NeoAI.services.tool_service").is_auto_mode() end)
+  pcall(function()
+    local ts = require("NeoAI.kernel.services").use("services.tool_service")
+    auto_on = ts and ts.is_auto_mode()
+  end)
 
   -- 3) 受控重载
   local ok, err = pcall(function()
-    -- 关闭 UI（若已打开）
-    pcall(function()
-      local ui = require("NeoAI.ui")
-      ui.close_all()
-      ui.reset()
-    end)
-    -- 关闭 MCP 子进程
-    pcall(function() require("NeoAI.services.mcp").shutdown() end)
-    -- 清理事件总线订阅与 augroup
+    -- 先统一卸载插件：释放工具/命令/事件订阅/MCP 子进程/状态栏监听/UI 注入
+    pcall(function() require("NeoAI.kernel.plugins").stop_all() end)
+    -- 清理事件总线订阅与 augroup（旧模块表残留订阅）
     pcall(function() require("NeoAI.kernel.event_bus").clear_all() end)
-    -- 清理各服务运行时状态
-    pcall(function() require("NeoAI.services.chat_service").reset() end)
-    pcall(function() require("NeoAI.services.tool_service").reset() end)
-    pcall(function() require("NeoAI.services.skills").reset() end)
 
     -- 清空 NeoAI.* 模块缓存，强制从磁盘重新加载
     local keys = {}
@@ -222,15 +215,20 @@ function M._perform_reload()
     -- 重新引导（全新模块表，once-guard 已随缓存清空而复位）
     require("NeoAI").setup(user_config or {})
 
-    -- 重建聊天界面
-    require("NeoAI.ui").open_chat()
+    -- 重建聊天界面（经服务定位器；UI 被禁用时跳过）
+    local ui = require("NeoAI.kernel.services").use("services.ui")
+    if ui then ui.open_chat() end
 
     -- 恢复当前会话（含计划模式/用量/待办；计划态来自会话元数据）
     if session_id then
-      local cs = require("NeoAI.services.chat_service")
-      cs.load_session(session_id)
-      if auto_on then
-        require("NeoAI.services.tool_service").set_auto_mode(true)
+      local services = require("NeoAI.kernel.services")
+      local cs = services.use("services.chat_service")
+      if cs then
+        cs.load_session(session_id)
+        if auto_on then
+          local ts = services.use("services.tool_service")
+          if ts then ts.set_auto_mode(true) end
+        end
       end
     end
   end)
@@ -254,8 +252,8 @@ end
 --- 调度真正重载：Agent 忙碌时等本轮结束（回到 idle）后执行，避免在工具循环栈内清缓存。
 --- @param ctx table|nil
 local function _schedule_reload(ctx)
-  local chat_service = require("NeoAI.services.chat_service")
-  local agent = ctx and ctx.agent or chat_service.get_current_agent()
+  local chat_service = require("NeoAI.kernel.services").use("services.chat_service")
+  local agent = ctx and ctx.agent or (chat_service and chat_service.get_current_agent())
   local busy = agent and (agent.state == "generating" or agent.state == "tool_running")
 
   local function do_it()

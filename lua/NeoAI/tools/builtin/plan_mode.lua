@@ -315,7 +315,8 @@ plan_mode_tools.enter_plan_mode = helpers.define_tool(
     -- 模式互斥：进入计划模式必须关闭 AUTO（自动允许所有工具调用）开关。
     -- 否则 AUTO 优先级高于 PLAN（chat_service._actual_mode），状态栏仍显示 AUTO、
     -- 且后续 exit_plan_mode 会被 AUTO 直接批准、弹不出审批窗。
-    require("NeoAI.services.tool_service").set_auto_mode(false)
+    local tool_service = require("NeoAI.kernel.services").use("services.tool_service")
+    if tool_service then tool_service.set_auto_mode(false) end
     on_success("已进入计划模式：只读调研 + 提问，输出格式化计划，等待用户确认后转入 CHAT 执行。")
   end,
   { category = "agent", approval = { auto_allow = true } }
@@ -337,7 +338,11 @@ plan_mode_tools.exit_plan_mode = helpers.define_tool(
       on_error("缺少 agent 上下文")
       return
     end
-    local chat_service = require("NeoAI.services.chat_service")
+    local chat_service = require("NeoAI.kernel.services").use("services.chat_service")
+    if not chat_service then
+      on_error("聊天服务未启用")
+      return
+    end
     -- 复用 approve_plan：解析计划为任务清单（todo）→ 退出计划模式（转入 CHAT）→ 按配置自动执行。
     local result = chat_service.approve_plan({ plan = args.plan })
     if type(result) == "table" and result.then_ then
