@@ -129,7 +129,7 @@ context_cache = {
 | `input_box` | `{idle_height=1, min_height=5, max_ratio=0.8}` | Input box height (idle/focused/growth cap) |
 | `chat` | `{mousescroll_max_blank=3, incremental=true}` | Max blank lines allowed below the last line when the wheel reaches the bottom (0 = strictly bottom-aligned); `incremental` enables incremental refresh (re-render only changed message blocks and write only the diff lines). Set to `false` to fall back to a full buffer rewrite |
 | `trajectory` | `{log_dir=".../NeoAI/logs"}` | Log directory for the trajectory display mode |
-| `statusline` | `{enabled=true, winbar=true, parts={mode,model,usage,cache,capacity}, separator=" ", colors=...}` | lualine statusline |
+| `statusline` | `{enabled=true, winbar=true, parts={mode,model,usage,cache,capacity,sandbox}, separator=" ", colors=...}` | lualine statusline; the `sandbox` part shows `待审N` when pending reviews > 0 (`N` is the total number of pending **files**, since the approval unit is a single file), linked to the prominent `NeoAISandboxPending` highlight group by default (bold yellow, override via `colors.sandbox`) |
 
 ### 2.3 `keymaps`
 
@@ -137,7 +137,7 @@ context_cache = {
 | --- | --- |
 | `global` | `toggle_ui`(<leader>aa), `open_chat`(<leader>ac), `open_tree`(<leader>at), `close_all`(<leader>aq) |
 | `tree` | `quit`(q), `select`(<CR>), `new_child`(n), `new_root`(N), `delete_dialog`(d, delete selected round), `delete_branch`(D, delete owning session and all descendants), `expand`(o), `collapse`(O) |
-| `chat` | `insert`(i), `quit`(q), `send`, `cancel`(<Esc>), `toggle_reasoning`(r), `switch_model`(M), `cycle_mode`(m), `cycle_display`(<C-t>/T), `reload_display`(<F5>), `tool_approval`(<C-a>), `approval.*` |
+| `chat` | `insert`(i), `quit`(q), `send`, `cancel`(<Esc>), `toggle_reasoning`(r), `switch_model`(M), `cycle_mode`(m), `cycle_display`(<C-t>/T), `reload_display`(<F5>), `tool_approval`(<C-a>), `sandbox_review`(<leader>ap, view and apply pending sandbox changes), `approval.*` |
 
 ### 2.4 `session`
 
@@ -212,12 +212,68 @@ sandbox = {
   fail_closed = true,              -- Reject execution when the sandbox service is missing/disabled (no silent downgrade)
   mode = "dry_run",                -- dry_run (default, only freezes candidates) | commit (CAS publish after authorization)
   backend = "auto",                -- auto | bwrap | unshare
-  offline = true,                  -- Offline by default: network tools are hard-denied
-  require_seccomp = false,         -- Reject external execution when seccomp is unavailable
-  seccomp = { enabled = false, filter_path = "" }, -- seccomp baseline (built-in denylist; bwrap only)
+  offline = false,                 -- Network allowed by default (recorded only, not blocked); true hard-denies network and isolates process networking
+  require_seccomp = true,          -- Reject external execution when seccomp is unavailable (default on, fail-closed)
+  seccomp = { enabled = true, filter_path = "" }, -- seccomp baseline (built-in denylist; default on; bwrap only)
+  cap_add = {},                    -- Capabilities to add back on demand; empty (default) = bwrap --cap-drop ALL
+  -- Minimal read-only system set (allowlist): only these host roots/subtrees/files are exposed
+  -- read-only to external commands; unlisted paths do not exist inside the sandbox (no more
+  -- `--ro-bind / /`). `/usr` is no longer exposed as a whole (avoids leaking the /usr/share/doc
+  -- package DB, /usr/local/go_workspace, /usr/src, etc.); /lib*, /bin, /sbin are loader symlink
+  -- roots and must stay. Supports `*` globs; missing entries are skipped.
+  readonly_roots = {
+    "/lib", "/lib32", "/lib64", "/libx32", "/bin", "/sbin",
+    "/usr/bin", "/usr/sbin", "/usr/lib", "/usr/lib32", "/usr/lib64", "/usr/libx32",
+    "/usr/libexec", "/usr/include",
+    "/usr/share/terminfo", "/usr/share/locale", "/usr/share/zoneinfo",
+    "/usr/share/ca-certificates", "/usr/share/misc", "/usr/share/common-licenses",
+    "/usr/share/git-core", "/usr/share/vim", "/usr/share/nvim",
+    "/usr/local/bin", "/usr/local/sbin", "/usr/local/lib", "/usr/local/libexec", "/usr/local/include", "/usr/local/go",
+  },
+  readonly_paths = { "/etc/ld.so.cache", "/etc/passwd", "/etc/group", "/etc/nsswitch.conf",
+    "/etc/hosts", "/etc/ssl", "/etc/alternatives", "/etc/localtime",
+    "/etc/os-release", "/etc/terminfo", "/etc/profile", "/etc/security", "/etc/pam.d" },
+  resolv_conf = "sanitize",        -- /etc/resolv.conf: sanitize (default, nameservers only) | hide | passthrough
+  tmpfs_roots = { "/tmp", "/var/tmp" }, -- per-session private tmpfs (never an overlay lower; destroyed on exit)
+  hide_proc_paths = { "/proc/cmdline", "/proc/version" }, -- overridden with an empty file; hides host kernel cmdline/version
+  mask_paths = {                   -- Mask host-sensitive paths (dirs -> tmpfs; files/sockets -> /dev/null)
+    "/run/docker.sock", "/var/run/docker.sock", "/var/lib/docker", "/var/lib/containerd",
+    "/root/.config/herdr", "/etc/1panel", "/run/dbus", "/run/systemd",
+    "/root/.ssh", "/root/.aws", "/root/.gnupg", "/root/.kube", "/root/.cache/keyring-*",
+    "/etc/shadow", "/etc/gshadow", "/etc/sudoers", "/etc/machine-id", "/etc/ssh",
+    "/var/log", "/var/spool/cron", "/etc/crontab",
+    "/root/.bash_history", "/root/.zsh_history", "/root/.python_history", "/root/.wget-hsts",
+  },
+  -- Masked directories (on by default): the user home containing cwd is exposed read-only and its
+  -- other entries masked; hits request approval.
+  mask_dirs_enabled = true,        -- master switch
+  mask_dirs = { "/home", "/root" }, -- masked dirs (supports * globs)
+  mask_dirs_approval = true,       -- request approval on masked hits (reuses tool approval UI)
   network = { enabled = false, allowed_endpoints = {}, budget_bytes = 0 }, -- controlled network gateway
+  -- Privilege tiers and auto-escalation: commands run at T0 least privilege by default
+  -- (network isolated by default); escalation is auto-requested when privilege is insufficient.
+  privilege = {
+    enabled = true, auto_escalate = true, max_tier = 2, record = true,
+    tiers = {                       -- per-tier network/extra caps/mounts/unmask/review strictness
+      [0] = { name = "minimal", review = "auto", network = false, cap_add = {}, mounts = {}, unmask = {} },
+      [1] = { name = "elevated", review = "auto", network = true, cap_add = {}, mounts = {}, unmask = { "/run/docker.sock", "/var/run/docker.sock" } },
+      [2] = { name = "privileged", review = "approve", network = true, userns = true, cap_add = {}, mounts = {}, unmask = { "/run/docker.sock", "/var/run/docker.sock" } },
+    },
+    classify = {                    -- command classification (bins = exact binary; bin+subs = binary + subcommand)
+      { tier = 2, name = "privileged", bins = { "sudo", "mount", "modprobe", "iptables", "systemctl", "unshare", "nsenter" } },
+      { tier = 1, name = "docker", bins = { "docker", "docker-compose", "podman", "nerdctl" } },
+      { tier = 1, name = "network", bins = { "curl", "wget", "ssh", "rsync", "ping", "socat" } },
+      { tier = 1, name = "network", bin = "git", subs = { "push", "pull", "fetch", "clone" } },
+    },
+  },
+  -- Controlled docker: never binds the host /var/run/docker.sock; controlled points at an external controlled socket.
+  docker = { mode = "controlled", socket = "/run/neoai-docker/docker.sock" }, -- off | controlled | host
   workspace_root = vim.fn.stdpath("cache") .. "/NeoAI/sandbox",
+  session_shell = true,            -- persist shell state (export/cd) across run_command within a session (bwrap only)
+  process_roots = {},              -- run_command writable roots (overlaid; default cwd only, auto-added). /tmp, /var/tmp belong to tmpfs_roots; host /root, /home, /etc are not exposed as read-only lower; add explicitly if needed
   review = { enabled = true, auto_apply = false }, -- async review: candidates enter a pending queue
+  lsp_overlay = { enabled = false }, -- LSP process mount-namespace overlay: LSP disk reads see staged content (opt-in, bwrap+overlay only)
+  secrets = { enabled = true, min_length = 20, max_length = 200, min_entropy = 3.5, min_distinct = 8, exclude_pure_hex = true, allowlist = {} }, -- Secret guard: entropy detection + token mapping; env values whose names contain KEY/TOKEN/SECRET/PASSWORD/CREDENTIAL are force-tokenized
   retention = { candidate_days = 7, max_pending = 20 },
   policy = {
     version = "1",                 -- policy version (for audit replay; bump when rules change)

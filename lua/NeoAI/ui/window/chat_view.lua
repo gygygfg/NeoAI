@@ -689,6 +689,13 @@ local function _build_chat_actions()
     tool_approval = function()
       require("NeoAI.ui.components.tool_approval").init()
     end,
+    sandbox_review = function()
+      if vim.fn.exists(":NeoAISandboxReview") ~= 2 then
+        vim.notify("[NeoAI] 沙箱审批命令不可用", vim.log.levels.WARN)
+        return
+      end
+      vim.cmd("NeoAISandboxReview")
+    end,
   }
 end
 
@@ -839,13 +846,39 @@ local function _collapse_aux()
 end
 
 --- 恢复收起前的输入框（回到聊天界面）。输入 buffer 内容保留（bufhidden=hide）。
+--- 在 WinEnter/BufEnter 自动命令内直接 :split 可能撞上另一个窗口正在关闭
+--- （如 telescope 关闭窗口时触发 WinEnter），报 E242 "Can't split a window while
+--- closing another"。此时不能直接失败：先同步尝试，仅在 E242 时推迟到主循环下一拍重试。
+local _restore_pending = false
 local function _restore_aux()
   if not state.collapsed then return end
-  state.collapsed = false
   if not state.win_id or not vim.api.nvim_win_is_valid(state.win_id) then return end
-  if not state.input_win_id or not vim.api.nvim_win_is_valid(state.input_win_id) then
-    _create_input_area(false)
+  if state.input_win_id and vim.api.nvim_win_is_valid(state.input_win_id) then
+    state.collapsed = false
+    return
   end
+  -- 先标记为已恢复：创建输入窗口时会同步触发 WinEnter，若不提前置位，
+  -- 嵌套的 _restore_aux 会再次进入并创建出第二个输入框。
+  state.collapsed = false
+  if pcall(_create_input_area, false) then return end
+  -- 失败但窗口其实已建出（失败发生在后续步骤）：视为已恢复，绝不再建一个。
+  if state.input_win_id and vim.api.nvim_win_is_valid(state.input_win_id) then return end
+  state.collapsed = true
+  -- 正处另一个窗口关闭过程中（E242）：推迟到主循环下一拍，届时再校验状态并重试。
+  if _restore_pending then return end
+  _restore_pending = true
+  vim.schedule(function()
+    _restore_pending = false
+    if not state.collapsed then return end
+    if not M.has_window() then return end
+    if not _is_chat_affiliated(vim.api.nvim_get_current_win()) then return end
+    if state.input_win_id and vim.api.nvim_win_is_valid(state.input_win_id) then
+      state.collapsed = false
+      return
+    end
+    state.collapsed = false
+    if not pcall(_create_input_area, false) then state.collapsed = true end
+  end)
 end
 
 --- WinEnter：焦点进入某窗口时同步收起/恢复并按焦点调整输入框高度（in insert 与否无关）。

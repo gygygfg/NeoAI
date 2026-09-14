@@ -236,6 +236,187 @@ local function _pipe(d, on_success, on_error)
   end)
 end
 
+--- 沙箱工作区暂存覆盖快照（沙箱未启用/无暂存时返回空数组）
+--- @return table
+local function _sandbox_overrides()
+  local ok, cand = pcall(require, "NeoAI.sandbox.candidate")
+  if not ok or not cand or type(cand.workspace_overrides) ~= "function" then return {} end
+  local ok2, ov = pcall(cand.workspace_overrides)
+  if not ok2 or type(ov) ~= "table" then return {} end
+  return ov
+end
+
+--- 规范化绝对路径（去尾部斜杠）
+--- @param p string
+--- @return string
+local function _abs_norm(p)
+  return (vim.fn.fnamemodify(fs.expand(p), ":p"):gsub("/+$", ""))
+end
+
+--- 暂存条目是否为目录（create_directory 等会暂存目录本身）。
+--- @param o table { staged }
+--- @return boolean
+local function _override_is_dir(o)
+  local st = o.staged and vim.uv.fs_stat(o.staged)
+  return st ~= nil and st.type == "directory"
+end
+
+--- 沙箱视图中该目录下是否存在内容（真实目录可能尚不存在）。
+--- 用于 list_files：run_command/create_directory 可在沙箱里新建整棵目录树，
+--- 而真实磁盘尚无该目录；只按真实 fs.is_dir 判断会把沙箱视图判为“目录不存在”。
+--- @param dir string
+--- @return boolean
+local function _sandbox_dir_present(dir)
+  local absdir = _abs_norm(dir)
+  for _, o in ipairs(_sandbox_overrides()) do
+    if not o.deleted then
+      local abs = o.real
+      if abs == absdir or abs:sub(1, #absdir + 1) == absdir .. "/" then return true end
+    end
+  end
+  return false
+end
+
+--- 沙箱视图中路径是否存在；返回 nil 表示沙箱无覆盖，交由真实文件系统判断。
+--- @param path string
+--- @return boolean|nil
+local function _sandbox_path_exists(path)
+  local abs = _abs_norm(path)
+  for _, o in ipairs(_sandbox_overrides()) do
+    if o.real == abs then return not o.deleted end
+    if not o.deleted and o.real:sub(1, #abs + 1) == abs .. "/" then return true end
+  end
+  return nil
+end
+
+--- 把沙箱暂存覆盖叠加到目录列举结果上：新增未发布的文件、移除已删除的文件，
+--- 使 list_files 对 AI 呈现与真实编辑一致（沙箱不可见）。
+--- @param base_text string 原始列举结果（每行一条）
+--- @param dir string 起始目录
+--- @param recursive boolean|nil
+--- @param max number|nil
+--- @return string
+local function _merge_list(base_text, dir, recursive, max)
+  local overrides = _sandbox_overrides()
+  local absdir = _abs_norm(dir)
+  local lines, seen, removed = {}, {}, {}
+  for _, o in ipairs(overrides) do
+    if o.deleted then removed[o.real] = true end
+  end
+  if base_text ~= "" and base_text ~= "(空目录)" then
+    for line in (base_text .. "\n"):gmatch("(.-)\n") do
+      if line ~= "" then
+        local is_dir = line:sub(-1) == "/"
+        local raw = is_dir and line:sub(1, -2) or line
+        local abs = _abs_norm(raw)
+        local drop = false
+        for del in pairs(removed) do
+          if abs == del or abs:sub(1, #del + 1) == del .. "/" then drop = true break end
+        end
+        if not drop then
+          lines[#lines + 1] = line
+          seen[abs] = true
+        end
+      end
+    end
+  end
+  -- 把暂存路径补进列举结果：recursive 时补齐各级父目录条目，非 recursive 时只补直接子项。
+  -- 目录条目以 "/" 结尾，与真实列举格式一致。
+  local function add_entry(rel, is_dir)
+    local abs = absdir .. "/" .. rel
+    if seen[abs] then return end
+    seen[abs] = true
+    lines[#lines + 1] = dir .. "/" .. rel .. (is_dir and "/" or "")
+  end
+  for _, o in ipairs(overrides) do
+    if not o.deleted then
+      local abs = o.real
+      local under = abs == absdir or abs:sub(1, #absdir + 1) == absdir .. "/"
+      if under and abs ~= absdir then
+        local rel = abs:sub(#absdir + 2)
+        if recursive then
+          local acc = ""
+          for seg in rel:gmatch("[^/]+") do
+            acc = acc == "" and seg or (acc .. "/" .. seg)
+            if acc ~= rel then add_entry(acc, true) end
+          end
+          add_entry(rel, _override_is_dir(o))
+        else
+          local first = rel:match("^([^/]+)")
+          if first then
+            add_entry(first, rel:find("/", 1, true) ~= nil or _override_is_dir(o))
+          end
+        end
+      end
+    end
+  end
+  table.sort(lines)
+  if max and max > 0 and #lines > max then
+    local trimmed = {}
+    for i = 1, max do trimmed[i] = lines[i] end
+    lines = trimmed
+  end
+  if #lines == 0 then return "(空目录)" end
+  return table.concat(lines, "\n")
+end
+
+--- 把沙箱暂存覆盖叠加到内容搜索结果上：替换被暂存覆盖的文件的真实结果，
+--- 并搜索尚未发布的新建/修改内容。
+--- @param base_text string 原始搜索结果
+--- @param dir string 搜索目录
+--- @param query string 关键字
+--- @param include string|nil glob
+--- @param max number|nil
+--- @return string
+local function _merge_search(base_text, dir, query, include, max)
+  local overrides = _sandbox_overrides()
+  if #overrides == 0 then return base_text end
+  local absdir = _abs_norm(dir)
+  local overridden = {}
+  for _, o in ipairs(overrides) do overridden[o.real] = o.deleted end
+  local out, count = {}, 0
+  local limit = (max and max > 0) and max or 50
+  if base_text ~= "" and base_text ~= "未找到匹配内容" then
+    for line in (base_text .. "\n"):gmatch("(.-)\n") do
+      if line ~= "" and count < limit then
+        local p = line:match("^(.-): ")
+        if p and overridden[_abs_norm(p)] == nil then
+          out[#out + 1] = line
+          count = count + 1
+        end
+      end
+    end
+  end
+  local inc_pat = ""
+  local inc = (include or ""):gsub("^%s+", ""):gsub("%s+$", "")
+  if inc ~= "" then
+    inc_pat = require("NeoAI.utils.stringx").glob_to_pattern(inc)
+  end
+  for _, o in ipairs(overrides) do
+    if count >= limit then break end
+    if not o.deleted then
+      local abs = o.real
+      local under = abs == absdir or abs:sub(1, #absdir + 1) == absdir .. "/"
+      if under and fs.exists(o.staged) then
+        local name = vim.fn.fnamemodify(abs, ":t")
+        if inc_pat == "" or name:match(inc_pat) then
+          local content = fs.read_file(o.staged)
+          if content and not content:find("\0", 1, true) then
+            local pos = content:find(query, 1, true)
+            if pos then
+              local snippet = content:sub(pos, pos + 200):gsub("[\n\r]+", " "):gsub("%c", " ")
+              out[#out + 1] = abs .. ": " .. snippet
+              count = count + 1
+            end
+          end
+        end
+      end
+    end
+  end
+  if #out == 0 then return "未找到匹配内容" end
+  return table.concat(out, "\n")
+end
+
 -- ========== 工具定义 ==========
 
 local file_tools = {}
@@ -404,27 +585,40 @@ file_tools.list_files = helpers.define_tool(
     local dir = args.path or "."
     local max = args.max_results or 0
     if not fs.is_dir(dir) then
-      on_error("目录不存在: " .. dir)
+      -- 真实目录不存在：若沙箱暂存已在其下创建内容，按沙箱视图合成列举（沙箱对 AI 不可见）。
+      if not _sandbox_dir_present(dir) then
+        on_error("目录不存在: " .. dir)
+        return
+      end
+      on_success(_merge_list("", dir, args.recursive, max))
       return
     end
     if args.recursive then
-      _pipe(fs.list_dir_async(dir, max), on_success, on_error)
+      _pipe(fs.list_dir_async(dir, max), function(out)
+        on_success(_merge_list(out, dir, true, max))
+      end, on_error)
       return
     end
-    -- 非递归：单层列出（join + is_dir 判断在主线程，量级很小；readdir 走子线程）
-    local work = require("NeoAI.utils.work")
-    _pipe(work.run(function(path)
-      local handle = vim.uv.fs_scandir(path)
-      if not handle then return "" end
-      local out = {}
-      while true do
-        local name, t = vim.uv.fs_scandir_next(handle)
-        if not name then break end
-        out[#out + 1] = path .. "/" .. name .. (t == "directory" and "/" or "")
-      end
-      table.sort(out)
-      return table.concat(out, "\n")
-    end, dir), on_success, on_error)
+    -- 非递归：单层列出。量级很小，直接在主线程用 uv.fs_scandir 完成，
+    -- 不依赖工作线程（部分环境下线程内 vim.uv 不可用会静默返回空）。
+    local handle = vim.uv.fs_scandir(dir)
+    if not handle then
+      on_error("无法读取目录: " .. dir)
+      return
+    end
+    local out = {}
+    while true do
+      local name, t = vim.uv.fs_scandir_next(handle)
+      if not name then break end
+      out[#out + 1] = dir .. "/" .. name .. (t == "directory" and "/" or "")
+    end
+    table.sort(out)
+    if max and max > 0 and #out > max then
+      local trimmed = {}
+      for i = 1, max do trimmed[i] = out[i] end
+      out = trimmed
+    end
+    on_success(_merge_list(table.concat(out, "\n"), dir, false, max))
   end,
   { category = "file" }
 )
@@ -447,11 +641,14 @@ file_tools.search_files = helpers.define_tool(
     local dir = args.path or "."
     local search_cfg = config_store.get("tools.search_files") or {}
     local max_file_bytes = type(search_cfg.max_file_bytes) == "number" and search_cfg.max_file_bytes or nil
+    local max_results = args.max_results or 50
     _pipe(fs.search_files_async(dir, args.query, {
       include = args.include,
-      max_results = args.max_results or 50,
+      max_results = max_results,
       max_file_bytes = max_file_bytes,
-    }), on_success, on_error)
+    }), function(out)
+      on_success(_merge_search(out, dir, args.query, args.include, max_results))
+    end, on_error)
   end,
   { category = "file" }
 )
@@ -466,6 +663,11 @@ file_tools.file_exists = helpers.define_tool(
     required = { "filepath" },
   },
   function(args, on_success)
+    local sv = _sandbox_path_exists(args.filepath)
+    if sv ~= nil then
+      on_success(tostring(sv))
+      return
+    end
     on_success(tostring(fs.exists(args.filepath)))
   end,
   { category = "file" }
@@ -515,6 +717,10 @@ file_tools.delete_file = helpers.define_tool(
     required = { "filepath" },
   },
   function(args, on_success, on_error)
+    if not fs.exists(args.filepath) then
+      on_error("文件不存在: " .. args.filepath)
+      return
+    end
     _pipe(fs.delete_file_async(args.filepath), function()
       helpers.reload_buffers_for(args.filepath)
       on_success("文件已删除: " .. args.filepath)

@@ -152,6 +152,25 @@ local function _side_effect_specs()
       end,
     },
     {
+      -- agent 循环内共用同一沙箱会话；agentEnd 时轮换并迁移暂存内容
+      id = "sandbox.session", deps = { "services.sandbox" },
+      start = function()
+        local sandbox = services.use("services.sandbox")
+        if sandbox then return sandbox.watch_sessions() end
+      end,
+    },
+    {
+      -- LSP server 命名空间覆盖（opt-in）：包装 vim.lsp.rpc.start，使 LSP 磁盘读取
+      -- 看到暂存内容；卸载时恢复原始实现。
+      id = "sandbox.lsp", deps = { "services.sandbox" },
+      start = function()
+        return require("NeoAI.sandbox.lsp").install()
+      end,
+      stop = function()
+        pcall(require("NeoAI.sandbox.lsp")._cleanup)
+      end,
+    },
+    {
       id = "statusline", deps = { "services.status" },
       start = function()
         local status = services.use("services.status")

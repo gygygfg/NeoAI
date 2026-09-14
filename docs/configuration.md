@@ -126,7 +126,7 @@ context_cache = {
 | `input_box` | `{idle_height=1, min_height=5, max_ratio=0.8}` | 输入框高度（空闲/聚焦/增长上限） |
 | `chat` | `{mousescroll_max_blank=3, incremental=true}` | 鼠标滚轮滚到底时末行下方允许的最大空白行数（0=严格贴底）；`incremental` 开启增量刷新（只重渲染变化的消息块且只写差异行），设为 `false` 降级回整 buffer 全量重写 |
 | `trajectory` | `{log_dir=".../NeoAI/logs"}` | 轨迹显示模式的日志保存目录 |
-| `statusline` | `{enabled=true, winbar=true, parts={mode,model,usage,cache,capacity}, separator=" ", colors=...}` | lualine 状态栏 |
+| `statusline` | `{enabled=true, winbar=true, parts={mode,model,usage,cache,capacity,sandbox}, separator=" ", colors=...}` | lualine 状态栏；`sandbox` 段在沙箱待审数 > 0 时显示 `待审N`（`N` 为待审**文件**总数，审批单位为单个文件），默认链接醒目高亮组 `NeoAISandboxPending`（黄底加粗，可在 `colors.sandbox` 覆盖） |
 
 ### 2.3 `keymaps`
 
@@ -134,7 +134,7 @@ context_cache = {
 | --- | --- |
 | `global` | `toggle_ui`(<leader>aa)、`open_chat`(<leader>ac)、`open_tree`(<leader>at)、`close_all`(<leader>aq) |
 | `tree` | `quit`(q)、`select`(<CR>)、`new_child`(n)、`new_root`(N)、`delete_dialog`(d，删除当前轮次)、`delete_branch`(D，删除所属会话及全部子分支)、`expand`(o)、`collapse`(O) |
-| `chat` | `insert`(i)、`quit`(q)、`send`、`cancel`(<Esc>)、`toggle_reasoning`(r)、`switch_model`(M)、`cycle_mode`(m)、`cycle_display`(<C-t>/T)、`reload_display`(<F5>)、`tool_approval`(<C-a>)、`approval.*` |
+| `chat` | `insert`(i)、`quit`(q)、`send`、`cancel`(<Esc>)、`toggle_reasoning`(r)、`switch_model`(M)、`cycle_mode`(m)、`cycle_display`(<C-t>/T)、`reload_display`(<F5>)、`tool_approval`(<C-a>)、`sandbox_review`(<leader>ap，查看并应用待审的沙箱修改)、`approval.*` |
 
 ### 2.4 `session`
 
@@ -208,12 +208,65 @@ sandbox = {
   fail_closed = true,              -- 沙箱服务缺失/禁用时拒绝执行（不静默降级）
   mode = "dry_run",                -- dry_run（默认，仅冻结候选）| commit（授权后立即 CAS 发布）
   backend = "auto",                -- auto | bwrap | unshare
-  offline = true,                  -- 默认离线：网络类工具直接硬拒绝
-  require_seccomp = false,         -- 缺少 seccomp 能力时是否拒绝外部执行
-  seccomp = { enabled = false, filter_path = "" }, -- seccomp 基线（内置 denylist；仅 bwrap）
+  offline = false,                 -- 网络默认放行（仅记录，不拦截）；true 时硬拒绝网络并隔离进程网络
+  require_seccomp = true,          -- 缺少 seccomp 能力时是否拒绝外部执行（默认开，fail-closed）
+  seccomp = { enabled = true, filter_path = "" }, -- seccomp 基线（内置 denylist；默认开；仅 bwrap）
+  cap_add = {},                    -- 按需加回的 capability；默认空 = bwrap --cap-drop ALL
+  -- 最小只读系统集（白名单）：仅这些宿主根/子树/文件以只读方式暴露给外部命令；未列出的路径
+  -- 在沙箱内不存在（不再 `--ro-bind / /`）。不再整目录暴露 /usr（避免泄露 /usr/share/doc
+  -- 包数据库、/usr/local/go_workspace、/usr/src 等）；/lib*、/bin、/sbin 为加载器符号链接根，
+  -- 必须保留。支持 `*` 通配，不存在的条目跳过。
+  readonly_roots = {
+    "/lib", "/lib32", "/lib64", "/libx32", "/bin", "/sbin",
+    "/usr/bin", "/usr/sbin", "/usr/lib", "/usr/lib32", "/usr/lib64", "/usr/libx32",
+    "/usr/libexec", "/usr/include",
+    "/usr/share/terminfo", "/usr/share/locale", "/usr/share/zoneinfo",
+    "/usr/share/ca-certificates", "/usr/share/misc", "/usr/share/common-licenses",
+    "/usr/share/git-core", "/usr/share/vim", "/usr/share/nvim",
+    "/usr/local/bin", "/usr/local/sbin", "/usr/local/lib", "/usr/local/libexec", "/usr/local/include", "/usr/local/go",
+  },
+  readonly_paths = { "/etc/ld.so.cache", "/etc/passwd", "/etc/group", "/etc/nsswitch.conf",
+    "/etc/hosts", "/etc/ssl", "/etc/alternatives", "/etc/localtime",
+    "/etc/os-release", "/etc/terminfo", "/etc/profile", "/etc/security", "/etc/pam.d" },
+  resolv_conf = "sanitize",        -- /etc/resolv.conf：sanitize（默认，仅 nameserver）| hide | passthrough
+  tmpfs_roots = { "/tmp", "/var/tmp" }, -- 每会话私有 tmpfs（不作为 overlay lower；退出即销毁）
+  hide_proc_paths = { "/proc/cmdline", "/proc/version" }, -- 以空文件覆盖，隐藏宿主内核命令行/版本
+  mask_paths = {                   -- 遮蔽宿主敏感路径（目录 tmpfs / 文件·socket 用 /dev/null 覆盖）
+    "/run/docker.sock", "/var/run/docker.sock", "/var/lib/docker", "/var/lib/containerd",
+    "/root/.config/herdr", "/etc/1panel", "/run/dbus", "/run/systemd",
+    "/root/.ssh", "/root/.aws", "/root/.gnupg", "/root/.kube", "/root/.cache/keyring-*",
+    "/etc/shadow", "/etc/gshadow", "/etc/sudoers", "/etc/machine-id", "/etc/ssh",
+    "/var/log", "/var/spool/cron", "/etc/crontab",
+    "/root/.bash_history", "/root/.zsh_history", "/root/.python_history", "/root/.wget-hsts",
+  },
+  -- 遮蔽目录（默认开启）：cwd 所在用户 home 只读暴露并遮蔽其余条目；命中时弹窗审批。
+  mask_dirs_enabled = true,        -- 总开关
+  mask_dirs = { "/home", "/root" }, -- 遮蔽目录列表（支持 * 通配）
+  mask_dirs_approval = true,       -- 命中遮蔽目录时弹窗审批（复用工具审批 UI）
   network = { enabled = false, allowed_endpoints = {}, budget_bytes = 0 }, -- 受控网络网关
+  -- 权限档位与自动提权：命令默认 T0 最小权限（含默认隔离网络），权限不足自动发起升级。
+  privilege = {
+    enabled = true, auto_escalate = true, max_tier = 2, record = true,
+    tiers = {                       -- 各档位的网络/额外 cap/挂载/解除遮蔽/审查严格度
+      [0] = { name = "minimal", review = "auto", network = false, cap_add = {}, mounts = {}, unmask = {} },
+      [1] = { name = "elevated", review = "auto", network = true, cap_add = {}, mounts = {}, unmask = { "/run/docker.sock", "/var/run/docker.sock" } },
+      [2] = { name = "privileged", review = "approve", network = true, userns = true, cap_add = {}, mounts = {}, unmask = { "/run/docker.sock", "/var/run/docker.sock" } },
+    },
+    classify = {                    -- 命令分类规则（bins 精确可执行名；bin+subs 可执行名+子命令）
+      { tier = 2, name = "privileged", bins = { "sudo", "mount", "modprobe", "iptables", "systemctl", "unshare", "nsenter" } },
+      { tier = 1, name = "docker", bins = { "docker", "docker-compose", "podman", "nerdctl" } },
+      { tier = 1, name = "network", bins = { "curl", "wget", "ssh", "rsync", "ping", "socat" } },
+      { tier = 1, name = "network", bin = "git", subs = { "push", "pull", "fetch", "clone" } },
+    },
+  },
+  -- 受控 docker：不绑定宿主 /var/run/docker.sock；controlled 指向外部受控 socket。
+  docker = { mode = "controlled", socket = "/run/neoai-docker/docker.sock" }, -- off | controlled | host
   workspace_root = vim.fn.stdpath("cache") .. "/NeoAI/sandbox",
+  session_shell = true,            -- run_command 会话内保留 shell 状态（export/cd 跨命令生效；仅 bwrap）
+  process_roots = {},              -- run_command 可写根（overlay 覆盖；默认仅 cwd 自动补入）。/tmp、/var/tmp 属 tmpfs_roots；避免把宿主 /root、/home、/etc 等作为只读 lower 暴露；按需显式加回
   review = { enabled = true, auto_apply = false }, -- 异步审批：候选进入待审队列，用户确认后应用
+  lsp_overlay = { enabled = false }, -- LSP 进程命名空间覆盖：LSP 磁盘读取看到暂存内容（opt-in，仅 bwrap+overlay）
+  secrets = { enabled = true, min_length = 20, max_length = 200, min_entropy = 3.5, min_distinct = 8, exclude_pure_hex = true, allowlist = {} }, -- 密钥防护：熵检测 + token 加密映射；env 名含 KEY/TOKEN/SECRET/PASSWORD/CREDENTIAL 的值无视熵强制 token 化
   retention = { candidate_days = 7, max_pending = 20 },
   policy = {
     version = "1",                 -- 策略版本（用于审计回放；规则变更时递增）

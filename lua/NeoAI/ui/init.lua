@@ -114,6 +114,7 @@ function M.reset()
   pcall(function() require("NeoAI.ui.components.tool_approval").reset() end)
   pcall(function() require("NeoAI.ui.components.ask_user").reset() end)
   pcall(function() require("NeoAI.ui.components.sub_agent_dock").reset() end)
+  pcall(function() require("NeoAI.ui.components.sandbox_review").reset() end)
   state.initialized = false
 end
 

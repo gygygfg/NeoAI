@@ -22,9 +22,13 @@ local state = {
   unsubs = {}, -- 事件订阅句柄
 }
 
+-- 沙箱待审徽标的自定义高亮组：黄底加粗，醒目；用户可在
+-- config ui.statusline.colors.sandbox 覆盖为其它高亮组。
+local SANDBOX_HL = "NeoAISandboxPending"
+
 -- 默认格式化选项：可展示的段与分隔符
 local DEFAULTS = {
-  parts = { "mode", "model", "usage", "cache", "capacity" },
+  parts = { "mode", "model", "usage", "cache", "capacity", "sandbox" },
   separator = " ",
   -- 各段在高亮时链接到的 nvim 高亮组（避免使用 lualine 默认的灰暗 c/b 段配色）。
   -- 均取自 Vim 内置鲜艳组，用户可按需在 config 覆盖。
@@ -40,6 +44,7 @@ local DEFAULTS = {
     state = "Function",
     brand = "Title",
     pending = "Warning",
+    sandbox = SANDBOX_HL,
   },
 }
 
@@ -93,6 +98,14 @@ local function _fmt_model(model)
   return model:match("[^/:]+$") or model
 end
 
+--- 确保沙箱待审徽标的高亮组存在（幂等、用户已自定义时不覆盖）。
+--- 采用 default=true 语义：只在未定义时写入，配色方案重载后被清空会再次补回。
+local function _ensure_sandbox_hl()
+  if vim.fn.hlexists(SANDBOX_HL) == 0 then
+    pcall(vim.api.nvim_set_hl, 0, SANDBOX_HL, { bold = true, fg = "#3a2d00", bg = "#e5c07b" })
+  end
+end
+
 --- 计算段字符串
 --- @param info table get_info() 结果
 --- @param part string
@@ -124,6 +137,10 @@ local function _build_part(info, part)
     -- agent 正忙时暂存/待发消息数：>0 才显示徽标（0 时返回 nil，不渲染）
     if not info.pending or info.pending <= 0 then return nil end
     return "待发" .. info.pending
+  elseif part == "sandbox" then
+    -- 沙箱待审变更数：>0 才显示醒目徽标（0 时返回 nil，不渲染、不打扰）
+    if not info.sandbox_pending or info.sandbox_pending <= 0 then return nil end
+    return "待审" .. info.sandbox_pending
   elseif part == "display" then
     return info.display and ("[" .. info.display .. "]") or nil
   end
@@ -274,9 +291,16 @@ function M.get_info()
     usage = nil,
     capacity = nil,
     pending = nil,
+    sandbox_pending = nil,
   }
   -- 当前 agent 正忙时暂存的待发消息数（无 agent 或队列为空则缺省，徽标不渲染）
   info.pending = chat_service and chat_service.pending_count() or nil
+  -- 沙箱待审变更数：仅 >0 时填充，供状态栏醒目显示
+  local sandbox = services.use("services.sandbox")
+  if sandbox and sandbox.pending_count then
+    local ok, n = pcall(sandbox.pending_count)
+    if ok and tonumber(n) and tonumber(n) > 0 then info.sandbox_pending = tonumber(n) end
+  end
   if agent then
     local u = agent.usage or {}
     info.usage = {
@@ -335,6 +359,7 @@ end
 --- 各段对应的 nvim 高亮组（config ui.statusline.colors 可覆盖）
 --- @return table part -> hl
 function M.colors()
+  _ensure_sandbox_hl()
   local cfg = vim.deepcopy(DEFAULTS.colors or {})
   local overrides = config_store.get("ui.statusline.colors")
   if overrides then
@@ -363,6 +388,10 @@ function M.watch()
     events.MESSAGE_QUEUED, events.MESSAGE_SENT,
     events.AUTO_MODE_CHANGED, events.PLAN_MODE_CHANGED,
     events.DISPLAY_MODE_CHANGED, events.TODO_UPDATED,
+    events.SANDBOX_REVIEW_ENQUEUED, events.SANDBOX_REVIEW_APPROVED,
+    events.SANDBOX_REVIEW_REJECTED, events.SANDBOX_REVIEW_SUPERSEDED,
+    events.SANDBOX_APPLIED, events.SANDBOX_COMMITTED,
+    events.SANDBOX_DISCARDED,
   }
   for _, ev in ipairs(subscribed) do
     state.unsubs[#state.unsubs + 1] = event_bus.on(ev, _refresh)

@@ -249,6 +249,7 @@ local DEFAULT_CONFIG = {
         state = "Function",
         brand = "Title",
         pending = "Warning",
+        sandbox = "NeoAISandboxPending",
       },
     },
   },
@@ -284,6 +285,7 @@ local DEFAULT_CONFIG = {
       },
       reload_display = { key = "<F5>", desc = "热重载当前显示模式插件" },
       tool_approval = { key = "<C-a>", desc = "工具审批" },
+      sandbox_review = { key = "<leader>ap", desc = "查看并应用待审的沙箱修改" },
       approval = {
         confirm = { key = "<CR>", desc = "允许一次" },
         confirm_all = { key = "A", desc = "允许所有" },
@@ -446,8 +448,95 @@ local DEFAULT_CONFIG = {
       fail_closed = true, -- 沙箱服务缺失/被禁用时是否拒绝执行（不得静默降级）
       mode = "dry_run", -- dry_run（默认，仅出候选）| commit（授权后立即 CAS 发布）
       backend = "auto", -- auto | bwrap | unshare（外部隔离后端）
-      offline = true, -- 默认离线：网络类工具直接硬拒绝
-      require_seccomp = false, -- true 时缺少 seccomp 能力则拒绝外部执行
+      offline = false, -- 网络默认放行（仅记录审计，不拦截）；true 时硬拒绝网络类工具并隔离进程网络
+      require_seccomp = true, -- true 时缺少 seccomp 能力则拒绝外部执行（默认开，fail-closed）
+      -- 载荷 capability：默认全部丢弃（--cap-drop ALL）。仅在此列出需按需加回的
+      -- capability 名（如 "CAP_NET_BIND_SERVICE"）；留空即不持有任何 capability。
+      cap_add = {},
+      -- 在隔离环境内遮蔽的宿主敏感路径（安全默认）：目录以空 tmpfs 遮蔽，
+      -- 文件/socket 以 /dev/null 覆盖。含 docker.sock（= 宿主 root）、容器数据、
+      -- 编排器/面板/D-Bus 通道、宿主凭据目录，以及宿主身份/日志/命令历史等读取面泄露项。
+      -- 空表表示退回 runtime 内置安全默认。
+      -- 支持 `*` 通配（如 /root/.cache/keyring-*）。
+      mask_paths = {
+        "/run/docker.sock", "/var/run/docker.sock",
+        "/run/containerd", "/run/containerd/containerd.sock",
+        "/var/run/containerd", "/var/lib/docker", "/var/lib/containerd",
+        "/run/podman", "/var/run/podman", "/var/lib/containers",
+        "/root/.config/herdr", "/etc/1panel", "/run/1panel", "/var/run/1panel",
+        "/run/dbus", "/run/systemd",
+        "/root/.ssh", "/root/.aws", "/root/.gnupg", "/root/.kube",
+        "/root/.docker/config.json", "/root/.netrc", "/root/.git-credentials",
+        "/root/.cache/keyring-*", "/root/.cache/at-spi", "/root/.local/share/keyrings",
+        -- 宿主身份与凭据
+        "/etc/shadow", "/etc/shadow-", "/etc/gshadow", "/etc/gshadow-",
+        "/etc/sudoers", "/etc/sudoers.d", "/etc/machine-id", "/etc/hostid",
+        "/etc/ssh", "/etc/ssl/private", "/etc/ipa", "/etc/krb5.keytab",
+        -- 日志、计划任务与审计
+        "/var/log", "/var/spool/cron", "/etc/crontab", "/etc/cron.d",
+        "/etc/cron.daily", "/etc/cron.hourly", "/etc/cron.weekly", "/etc/cron.monthly",
+        -- root 命令历史与残留（经 /root overlay 可达时）
+        "/root/.bash_history", "/root/.zsh_history", "/root/.sh_history",
+        "/root/.python_history", "/root/.mysql_history", "/root/.psql_history",
+        "/root/.sqlite_history", "/root/.node_repl_history", "/root/.wget-hsts",
+        "/root/.lesshst", "/root/.viminfo", "/root/.config/gh", "/root/.config/gcloud",
+      },
+      -- 最小只读系统集（白名单）：仅这些宿主根/子树以只读方式暴露给外部命令；未列出的
+      -- 路径在沙箱内不存在（不再 `--ro-bind / /`）。`/home`、`/var/log`、`/etc/shadow`、
+      -- `/opt`、`/srv`、`/mnt`、`/media`、`/boot` 等默认不可达。
+      -- 不再整目录暴露 `/usr`：宿主根分区挂到同一块磁盘时会泄露 `/usr/share/doc` 包数据库、
+      -- `/usr/local/go_workspace`、`/usr/src` 等软件清单，改为只挂运行时真正需要的子树。
+      -- `/lib*`、`/bin`、`/sbin` 为指向 `/usr/lib*`、`/usr/bin`、`/usr/sbin` 的符号链接，
+      -- 必须保留（动态加载器），否则任何二进制无法启动。支持 `*` 通配；不存在的条目跳过。
+      readonly_roots = {
+        -- 动态加载器与二进制符号链接根（必须）
+        "/lib", "/lib32", "/lib64", "/libx32", "/bin", "/sbin",
+        -- 运行时可执行文件、共享库与头文件
+        "/usr/bin", "/usr/sbin", "/usr/lib", "/usr/lib32", "/usr/lib64", "/usr/libx32",
+        "/usr/libexec", "/usr/include",
+        -- 运行时共享数据（不含 /usr/share/doc|man|info 等宿主软件清单）
+        "/usr/share/terminfo", "/usr/share/locale", "/usr/share/zoneinfo",
+        "/usr/share/ca-certificates", "/usr/share/misc", "/usr/share/common-licenses",
+        "/usr/share/awk", "/usr/share/perl", "/usr/share/perl5",
+        "/usr/share/pkgconfig", "/usr/share/aclocal", "/usr/share/bash-completion",
+        "/usr/share/git-core", "/usr/share/vim", "/usr/share/nvim",
+        "/usr/share/tabset", "/usr/share/gnupg", "/usr/share/icu",
+        -- 本地安装工具与 Go 工具链（不含 /usr/local/go_workspace、/usr/local/src、/usr/local/man）
+        "/usr/local/bin", "/usr/local/sbin", "/usr/local/lib", "/usr/local/libexec",
+        "/usr/local/include", "/usr/local/go",
+      },
+      -- 最小 /etc 必要文件（白名单）：命令运行所需，避免整目录暴露（含 shadow/machine-id/ssh）。
+      -- 注意 `/etc/resolv.conf` 不在此列，见下方 `resolv_conf`。
+      readonly_paths = {
+        "/etc/ld.so.cache", "/etc/ld.so.conf", "/etc/ld.so.conf.d",
+        "/etc/passwd", "/etc/group", "/etc/nsswitch.conf",
+        "/etc/hosts", "/etc/hostname", "/etc/host.conf",
+        "/etc/localtime", "/etc/timezone", "/etc/os-release", "/etc/debian_version",
+        "/etc/ssl", "/etc/ca-certificates", "/etc/ca-certificates.conf",
+        "/etc/alternatives", "/etc/terminfo", "/etc/mime.types", "/etc/shells",
+        "/etc/environment", "/etc/profile", "/etc/profile.d", "/etc/bash.bashrc",
+        "/etc/inputrc", "/etc/security", "/etc/pam.d", "/etc/xdg", "/etc/fonts",
+        "/etc/gitconfig", "/etc/npmrc", "/etc/apt", "/etc/dpkg",
+        "/etc/python3*",
+      },
+      -- /etc/resolv.conf 处理方式：sanitize（默认，仅保留 nameserver 行，剥离
+      -- search/domain/options，避免泄露宿主内网/Tailscale 域）| hide（不暴露）|
+      -- passthrough（原样暴露宿主文件）。
+      resolv_conf = "sanitize",
+      -- 每会话私有临时根：始终以会话私有目录（mode 1777，位于 /dev/shm 等 tmpfs）绑定，
+      -- 绝不作为 overlay 的只读 lower 暴露宿主真实内容；退出/轮换会话即销毁，杜绝跨会话残留。
+      tmpfs_roots = { "/tmp", "/var/tmp" },
+      -- 隐藏的 /proc 泄露项：procfs 全局可见（不随 pid namespace 隔离），会泄露宿主内核
+      -- 命令行（root=UUID、crashkernel）与内核版本；以空文件只读覆盖，读取得到空内容。
+      hide_proc_paths = { "/proc/cmdline", "/proc/version" },
+      -- 遮蔽目录（默认开启）：这些目录下除 cwd 路径外的内容对外部命令不可见。
+      -- cwd 位于某遮蔽目录下时，仅暴露并遮蔽「含 cwd 的用户 home」作用域
+      -- （`/home` 取一级用户子目录，其他目录取自身）；沿 cwd 祖先链遮蔽兄弟条目
+      -- （含隐藏文件/目录），cwd 子树自身豁免；cwd 即作用域时遮蔽其隐藏子条目。
+      -- 工具命中遮蔽条目时弹窗审批（复用 tools.approval 弹窗），批准后对该次调用解除遮蔽。
+      mask_dirs_enabled = true, -- 总开关（默认开）
+      mask_dirs = { "/home", "/root" }, -- 遮蔽目录列表（支持 * 通配）
+      mask_dirs_approval = true, -- 命中遮蔽目录时是否弹窗审批（false = 直接硬遮蔽）
       -- 受控网络网关（阶段三）：offline=false 时按声明端点放行，并受字节预算约束。
       network = {
         enabled = false, -- 是否允许受控联网（默认关闭）
@@ -461,6 +550,14 @@ local DEFAULT_CONFIG = {
         auto_apply = false, -- true 时任务授权内自动应用（默认关闭，需用户确认）
       },
       workspace_root = vim.fn.stdpath("cache") .. "/NeoAI/sandbox", -- 暂存/候选/回执根目录
+      session_shell = true, -- run_command 会话内保留 shell 状态（export/cd 跨命令生效，仅 bwrap 后端）
+      -- run_command 可写根：这些根以 overlay 覆盖（真实内容只读 lower，写入进会话 upper），
+      -- 使命令能修改这些根下的任意路径并冻结为候选；cwd 未覆盖时自动补入。
+      -- 安全默认仅 cwd（自动补入）；不再默认覆盖 `/tmp`、`/var/tmp`（属每会话私有 tmpfs，
+      -- 见 `tmpfs_roots`），也不覆盖 `/root`、`/home`、`/etc` 等整目录，避免把宿主真实
+      -- home/账户/配置/临时残留作为只读 lower 暴露。需要任意路径写入时按需显式加回
+      -- （注意同时收紧 mask_paths）。
+      process_roots = {},
       retention = {
         candidate_days = 7, -- 未应用候选保留期（天）
         max_pending = 20, -- 每任务最多待审候选数
@@ -478,10 +575,84 @@ local DEFAULT_CONFIG = {
         cgroup_base = "/sys/fs/cgroup", -- cgroup v2 挂载点
       },
       seccomp_filter_path = "", -- 可选：编译后 seccomp BPF 过滤器路径（供 bwrap --seccomp）
-      -- seccomp 基线：默认关闭；开启后经 bwrap 在载荷上施加 denylist 过滤器。
+      -- seccomp 基线：默认开启；经 bwrap 在载荷上施加 denylist 过滤器（拦 mount/
+      -- unshare/ptrace/init_module/bpf 等）。与 --cap-drop ALL 共同构成纵深防御。
       seccomp = {
-        enabled = false, -- 是否施加 seccomp 基线（仅 bwrap 后端）
+        enabled = true, -- 是否施加 seccomp 基线（仅 bwrap 后端）
         filter_path = "", -- 自定义过滤器路径；空则使用内置 denylist 生成
+      },
+      -- 权限档位与自动提权（见 docs/sandbox.md §17）：命令默认以最小权限（T0）运行，
+      -- 权限不足时自动「发起」升级请求（不静默执行）；T1 在隔离内自动执行并留痕，
+      -- T2 在嵌套 userns 内自动执行、主机效果冻结为提案异步审批。
+      privilege = {
+        enabled = true, -- 总开关；关闭则所有进程固定 T0（不自动提权）
+        auto_escalate = true, -- 权限/网络失败时自动发起升级（记录，不静默执行）
+        max_tier = 2, -- 允许的最高档位（0 最小权限 | 1 提权 | 2 特权）；超过直接拒绝
+        record = true, -- 每次档位裁决/升级写入证据与事件
+        tiers = {
+          [0] = { name = "minimal", review = "auto", network = false, cap_add = {}, mounts = {}, unmask = {} },
+          [1] = {
+            name = "elevated", review = "auto", network = true, cap_add = {}, mounts = {},
+            unmask = { "/run/docker.sock", "/var/run/docker.sock" },
+          },
+          [2] = {
+            name = "privileged", review = "approve", network = true, userns = true,
+            cap_add = {}, mounts = {},
+            unmask = { "/run/docker.sock", "/var/run/docker.sock" },
+          },
+        },
+        -- 命令分类规则：命中即提升到对应档位（多条命中取最高档）。
+        -- bins = 精确可执行名；bin+subs = 可执行名 + 子命令。
+        classify = {
+          { tier = 2, name = "privileged", bins = {
+            "sudo", "doas", "mount", "umount", "modprobe", "insmod", "rmmod", "kmod",
+            "iptables", "ip6tables", "nft", "systemctl", "reboot", "shutdown", "poweroff",
+            "kexec", "sysctl", "swapon", "swapoff", "mknod", "chroot", "unshare", "nsenter",
+          } },
+          { tier = 1, name = "docker", bins = {
+            "docker", "docker-compose", "podman", "podman-compose", "nerdctl", "buildah", "skopeo",
+          } },
+          { tier = 1, name = "network", bins = {
+            "curl", "wget", "ssh", "scp", "sftp", "rsync", "ping", "nc", "ncat", "socat",
+            "telnet", "dig", "nslookup", "host", "traceroute", "ftp",
+          } },
+          { tier = 1, name = "network", bin = "git", subs = {
+            "push", "pull", "fetch", "clone", "remote", "ls-remote", "submodule",
+          } },
+          { tier = 1, name = "network", bin = "npm", subs = { "install", "i", "ci", "add", "update", "publish" } },
+          { tier = 1, name = "network", bin = "pnpm", subs = { "install", "i", "add", "update", "publish" } },
+          { tier = 1, name = "network", bin = "yarn", subs = { "install", "add", "upgrade", "publish" } },
+          { tier = 1, name = "network", bin = "pip", subs = { "install", "download" } },
+          { tier = 1, name = "network", bin = "pip3", subs = { "install", "download" } },
+          { tier = 1, name = "network", bin = "go", subs = { "get", "install" } },
+          { tier = 1, name = "network", bin = "cargo", subs = { "install", "add", "update", "publish" } },
+          { tier = 1, name = "network", bin = "gem", subs = { "install", "update" } },
+          { tier = 1, name = "network", bin = "composer", subs = { "install", "require", "update" } },
+          { tier = 1, name = "network", bins = { "apt", "apt-get", "apt-key", "add-apt-repository", "dnf", "yum", "pacman", "apk", "brew" } },
+        },
+      },
+      -- 受控 docker：不绑定宿主 /var/run/docker.sock。controlled 指向外部受控 socket
+      -- （rootless dockerd / docker-socket-proxy / dind），仅提权档位挂载。
+      docker = {
+        mode = "controlled", -- off（禁用）| controlled（外部受控 socket）| host（宿主 socket，仅 T2）
+        socket = "/run/neoai-docker/docker.sock", -- controlled 模式使用的受控 socket 路径
+      },
+      -- LSP 进程命名空间覆盖：把 LSP server 放进 bwrap + overlay（工作区根 lower=真实只读，
+      -- upper=沙箱私有层），使其磁盘读取看到 AI 尚未发布的暂存内容。默认关闭（opt-in）；
+      -- overlay 不可用（如 tmpfs 工作区）时自动跳过，不影响 LSP 正常使用。
+      lsp_overlay = {
+        enabled = false,
+      },
+      -- 密钥防护（常开）：基于熵检测高熵密钥，进沙箱替换为随机 token、仅在 commit 还原；
+      -- 对 token 的操作留痕并在待审界面警告；工具参数中出现原始密钥时硬拦截并终止 Agent。
+      secrets = {
+        enabled = true, -- 总开关
+        min_length = 20, -- 候选密钥最小长度
+        max_length = 200, -- 候选密钥最大长度
+        min_entropy = 3.5, -- 香农熵阈值（bits/char）
+        min_distinct = 8, -- 最少不同字符数
+        exclude_pure_hex = true, -- 排除纯小写十六进制（git SHA/sha256/md5 等哈希）
+        allowlist = {}, -- 额外排除的 Lua pattern 数组（命中不视为密钥）
       },
     },
   },

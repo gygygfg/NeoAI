@@ -106,6 +106,7 @@ stop：逆序执行清理 → 注销服务 → stopped
 | `skills.scan` | 扫描技能目录 | `skills.reset()` |
 | `statusline` | 状态栏事件订阅 + lualine 注入 | `status.unwatch()` |
 | `herder` | Herder 状态上报 | `herder.reset()` |
+| `sandbox.session` | agent 生命周期订阅：循环内共用沙箱、agentEnd 轮换并迁移暂存 | `sandbox.unwatch_sessions()` |
 
 ### 3.3 工具插件
 

@@ -31,7 +31,7 @@
 - **工具参数接收面板** — 模型流式生成工具调用参数时实时打开「接收参数」悬浮窗（`tool_args_panel`），随分片增量追加、参数结束后自动关闭，与思考过程悬浮窗一致
 - **MCP 支持** — 通过 stdio / Streamable HTTP 连接外部 MCP 服务器，把远端 `tools`/`resources`/`prompts` 注册进工具系统（含预缓存 + 失败驱动的动态刷新，见 [docs/mcp.md](docs/mcp.md)）
 - **Skills 支持** — 扫描 SKILL.md 技能目录，把可用技能列表注入系统提示，模型用 `load_skill` 装载技能正文（Claude/opencode 风格，见 [docs/skills.md](docs/skills.md)）
-- **工具执行沙箱** — 所有工具执行经控制面（预检 → 隔离执行 → 冻结候选 → CAS 发布）；默认异步审批：AI 的修改立即在沙箱内执行并冻结候选，真实工作区改动进入待审队列，用户用 `:NeoAISandboxReview` 异步确认后应用；外部进程经 bwrap/unshare 隔离，网络默认离线（见 [docs/sandbox.md](docs/sandbox.md)）
+- **工具执行沙箱** — 所有工具执行经控制面（预检 → 隔离执行 → 冻结候选 → CAS 发布）；默认异步审批：AI 的修改立即在沙箱内执行并冻结候选，真实工作区改动进入待审队列（聊天窗口状态栏显示醒目的 `待审N` 徽标），用户用 `:NeoAISandboxReview` 或聊天窗口内 `<leader>ap` 键异步确认后应用（审批单位为单个文件）；外部进程经 bwrap/unshare 隔离；命令可写整个文件系统（改动进暂存/候选）、会话内 shell 状态（export/cd）保留；载荷默认 `--cap-drop ALL` + seccomp 基线，并遮蔽 `docker.sock`、宿主凭据等敏感路径（纵深防御）；**权限档位**：命令默认最小权限运行（默认隔离网络），权限不足自动发起升级——T1（网络/受控 docker）隔离内自动执行并留痕，T2（cap/宿主操作）在嵌套 userns 内执行、主机效果冻结为提案异步审批；受控 docker 指向外部受控 socket（rootless/proxy/dind），不绑定宿主 socket（见 [docs/sandbox.md](docs/sandbox.md)）
 
 ---
 

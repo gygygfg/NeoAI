@@ -138,22 +138,33 @@ function M.evaluate(facts)
     end
   end
   if facts.effect == "network" then
-    local offline = require("NeoAI.kernel.config_store").get("tools.sandbox.offline")
-    if offline ~= false then
-      results[#results + 1] = { decision = "DENY", reason_codes = { "NETWORK_NOT_DECLARED" } }
-    else
+    local sb = require("NeoAI.kernel.config_store").get("tools.sandbox") or {}
+    if sb.offline == true then
+      -- 显式离线：硬拒绝网络
+      results[#results + 1] = { decision = "DENY", reason_codes = { "NETWORK_OFFLINE" } }
+    elseif type(sb.network) == "table" and sb.network.enabled == true then
+      -- 可选更严格模式：受控网关按声明端点校验
       local url = facts.args and (facts.args.url or facts.args.endpoint)
       local ok, reason = require("NeoAI.sandbox.network").authorize(url, {})
       if not ok then
         results[#results + 1] = { decision = "DENY", reason_codes = { reason } }
       end
     end
+    -- 默认放行：仅记录（不拦截）
   end
   if facts.effect == "process" then
     local runtime = require("NeoAI.sandbox.runtime")
     local ok, err = runtime.check_available()
     if not ok then
       results[#results + 1] = { decision = "DENY", reason_codes = { err } }
+    end
+  end
+  -- 权限档位：超过配置的最高档位直接硬拒绝（自动提权不得越界）。
+  if facts.privilege then
+    local pcfg = require("NeoAI.kernel.config_store").get("tools.sandbox.privilege") or {}
+    local tier = tonumber(facts.privilege.tier) or 0
+    if tier > (pcfg.max_tier or 0) then
+      results[#results + 1] = { decision = "DENY", reason_codes = { "PRIVILEGE_TIER_EXCEEDS_MAX" } }
     end
   end
 

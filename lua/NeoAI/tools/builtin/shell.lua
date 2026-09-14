@@ -4,6 +4,8 @@
 
 local async = require("NeoAI.utils.async")
 local helpers = require("NeoAI.tools.builtin.tool_helpers")
+local conceal = require("NeoAI.sandbox.conceal")
+local secret = require("NeoAI.sandbox.secret")
 
 local M = {}
 
@@ -69,6 +71,8 @@ local function _run_command(command, opts)
 
   job = vim.fn.jobstart(_sandboxed_argv({ "sh", "-c", command }, opts), {
     cwd = opts.cwd,
+    -- 环境变量脱敏：高熵密钥值替换为 token，命令看不到真实密钥（进沙箱加密）。
+    env = secret.sanitized_env(),
     stdout_buffered = false,
     stderr_buffered = false,
     on_stdout = function(_, data)
@@ -92,6 +96,25 @@ local function _run_command(command, opts)
     return async.reject({ kind = "shell", message = "无法启动 shell 进程" })
   end
   return d
+end
+
+--- 会话级 shell 状态持久化包装。
+--- 每个 run_command 是独立进程/独立 shell，export/cd 默认不保留；通过在命令前后
+--- 载入/保存「cwd + 导出变量」到会话状态文件，使同一 agent 循环内状态跨命令保留。
+--- @param command string
+--- @param state_dir string 沙箱内会话状态目录（已 bind 到宿主会话目录）
+--- @return string
+local function _wrap_session_command(command, state_dir)
+  return table.concat({
+    "_sd='" .. state_dir .. "'",
+    'if [ -f "$_sd/env" ]; then . "$_sd/env"; fi',
+    'if [ -f "$_sd/cwd" ]; then cd "$(cat "$_sd/cwd")" 2>/dev/null || true; fi',
+    command,
+    "_rc=$?",
+    'pwd > "$_sd/cwd" 2>/dev/null',
+    'export -p > "$_sd/env" 2>/dev/null',
+    "exit $_rc",
+  }, "\n")
 end
 
 --- 组合「状态行 + 已产生的终端输出」，错误路径也保留输出内容
@@ -125,14 +148,20 @@ shell_tools.run_command = helpers.define_tool(
   function(args, on_success, on_error, ctx)
     local command = args.command
     local signal = ctx and ctx.signal
+    if ctx and ctx.sandbox_shell_state then
+      command = _wrap_session_command(command, ctx.sandbox_shell_state)
+    end
     _run_command(command, {
       timeout_ms = args.timeout_ms,
       signal = signal,
       prefix = ctx and ctx.sandbox_prefix,
       cwd = ctx and ctx.sandbox_cwd,
     }):then_(function(result)
-      local out = result.stdout or ""
-      local errout = result.stderr or ""
+      -- 供沙箱门禁做权限不足检测（自动提权）：保留原始 {code,stdout,stderr}。
+      if ctx then ctx.sandbox_last_result = result end
+      -- 输出脱敏：抹去 bwrap/overlay/沙箱自有路径等指纹，使 AI 的外部命令难以识别沙箱。
+      local out = conceal.redact(result.stdout or "")
+      local errout = conceal.redact(result.stderr or "")
       if result.aborted then
         -- 取消/超时/非零退出都回传已产生的终端内容，模型仍能看到当前进度
         on_success(_with_status("命令已取消：" .. tostring(result.message or "cancelled"), out, errout))
@@ -144,7 +173,7 @@ shell_tools.run_command = helpers.define_tool(
         on_success(_with_status(string.format("命令退出码 %d", result.code), out, errout))
       end
     end, function(err)
-      on_error(err.message or tostring(err))
+      on_error(conceal.redact(err.message or tostring(err)))
     end)
   end,
   { category = "system", approval = { auto_allow = false }, timeout = -1 }

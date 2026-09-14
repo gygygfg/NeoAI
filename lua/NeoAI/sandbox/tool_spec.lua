@@ -55,7 +55,7 @@ local SPECS = {
   get_parent_node = { effect = "read", paths = { "filepath" } },
   get_child_nodes = { effect = "read", paths = { "filepath" } },
   get_node_code = { effect = "read", paths = { "filepath" } },
-  delete_node = { effect = "fs_write" },
+  delete_node = { effect = "fs_write", paths = { "filepath" } },
   lsp_hover = { effect = "read" },
   lsp_definition = { effect = "read" },
   lsp_references = { effect = "read" },

@@ -25,6 +25,8 @@ local broker = require("NeoAI.sandbox.broker")
 local replay = require("NeoAI.sandbox.replay")
 local cgroup = require("NeoAI.sandbox.cgroup")
 local seccomp = require("NeoAI.sandbox.seccomp")
+local privilege = require("NeoAI.sandbox.privilege")
+local hostop = require("NeoAI.sandbox.hostop")
 local cache = require("NeoAI.sandbox.cache")
 local fault = require("NeoAI.sandbox.fault")
 local bench = require("NeoAI.sandbox.bench")
@@ -37,6 +39,7 @@ local M = {}
 local state = {
   initialized = false,
   active = nil, -- 当前暂存尝试（供 persist_buffer 重定向）
+  session_unsubs = nil, -- 会话轮换的事件订阅句柄
 }
 
 -- ========== 私有函数 ==========
@@ -51,6 +54,18 @@ local function _emit(event, payload)
   event_bus.emit(event, payload or {})
 end
 
+--- 把持久化的待审变更单元重新物化进当前沙箱会话的暂存层。
+--- 插件热重载 / 重开时 `shutdown` 会清空暂存目录，但待审队列仍落盘；若不再物化，
+--- 只读工具会看不到这些待审修改（沙箱视图与待审队列不一致）。此处按候选内容重建。
+local function _rehydrate_pending()
+  local ok, items = pcall(review.list, { review_state = review.REVIEW.PENDING })
+  if not ok or type(items) ~= "table" then return end
+  for _, item in ipairs(items) do
+    local cand = store.read_candidate(item.candidate_digest)
+    if cand then pcall(candidate.merge_candidate, cand) end
+  end
+end
+
 -- ========== 公开 API ==========
 
 --- 初始化：探测运行时能力并准备存储
@@ -59,8 +74,10 @@ function M.init()
   if state.initialized then return M end
   store.init(_root())
   cache.init(_root())
+  candidate.ensure_dirs(_root())
   runtime.probe()
   state.initialized = true
+  _rehydrate_pending()
   return M
 end
 
@@ -75,9 +92,48 @@ end
 
 --- 关闭：清理暂存
 function M.shutdown()
+  M.unwatch_sessions()
   candidate.reset()
   state.active = nil
   state.initialized = false
+end
+
+--- 订阅 agent 生命周期，在 agentEnd（生成结束/错误/取消/中止）时轮换沙箱会话。
+--- 同一 agent 循环内共用同一会话（编辑可叠加）；跨循环切换到新会话但迁移暂存内容，
+--- 保证文件修改的一致性。幂等，返回取消订阅函数。
+--- @return function|nil 取消订阅
+function M.watch_sessions()
+  if state.session_unsubs then return end
+  local event_bus = require("NeoAI.kernel.event_bus")
+  local events = require("NeoAI.kernel.events")
+  local unsubs = {}
+  local function rotate()
+    pcall(candidate.rotate_session)
+  end
+  for _, ev in ipairs({
+    events.GENERATION_COMPLETED,
+    events.GENERATION_ERROR,
+    events.GENERATION_CANCELLED,
+    events.AGENT_ABORTED,
+  }) do
+    unsubs[#unsubs + 1] = event_bus.on(ev, rotate)
+  end
+  state.session_unsubs = unsubs
+  return M.unwatch_sessions
+end
+
+--- 取消会话轮换订阅（插件卸载/测试用）
+function M.unwatch_sessions()
+  for _, u in ipairs(state.session_unsubs or {}) do
+    if u then pcall(u) end
+  end
+  state.session_unsubs = nil
+end
+
+--- 当前沙箱会话 id
+--- @return string|nil
+function M.session_id()
+  return candidate.session_id()
 end
 
 --- 为工具附加沙箱规格（加载器/注册表调用）
@@ -141,7 +197,12 @@ end
 function M.discard(digest)
   M.init()
   local ok = store.discard_candidate(digest)
-  if ok then _emit(events.SANDBOX_DISCARDED, { candidate_digest = digest }) end
+  if ok then
+    -- 候选已删除：对应待审项必须同步标记为已拒绝，否则重新打开审批界面会
+    -- 再次显示一个无法应用的待审项（候选已不存在）。
+    review.discard_by_digest(digest, "DISCARDED")
+    _emit(events.SANDBOX_DISCARDED, { candidate_digest = digest })
+  end
   return ok
 end
 
@@ -197,6 +258,15 @@ end
 --- @return table|nil
 function M.reject(id, reason)
   return review.reject(id, reason)
+end
+
+--- 拒绝变更单元中的单个文件（其余文件保留待审）
+--- @param id string
+--- @param path string
+--- @param reason string|nil
+--- @return table|nil
+function M.reject_file(id, path, reason)
+  return review.reject_file(id, path, reason)
 end
 
 --- 应用变更单元（CAS 发布；opts.files 支持选择性应用）
@@ -374,6 +444,8 @@ M.network = network
 M.broker = broker
 M.cgroup = cgroup
 M.seccomp = seccomp
+M.privilege = privilege
+M.hostop = hostop
 M.cache = cache
 M.fault = fault
 M.bench = bench
@@ -392,8 +464,11 @@ function M.reset()
   broker.reset()
   cgroup.reset()
   seccomp.reset()
+  privilege.reset()
+  hostop.reset()
   cache.reset()
   fault.reset()
+  require("NeoAI.sandbox.secret").reset()
   state.active = nil
   state.initialized = false
   M.init()

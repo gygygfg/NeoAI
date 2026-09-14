@@ -240,36 +240,25 @@ function M.start()
     for _, k in ipairs({ "bwrap", "unshare", "userns", "cgroup2", "overlayfs", "seccomp", "cgroup", "seccomp_filter" }) do
       parts[#parts + 1] = k .. "=" .. tostring(caps[k])
     end
+    -- 权限档位与受控 docker 可用性
+    local pcfg = require("NeoAI.kernel.config_store").get("tools.sandbox.privilege") or {}
+    local dcfg = require("NeoAI.kernel.config_store").get("tools.sandbox.docker") or {}
+    local dstat = "off"
+    if dcfg.mode == "controlled" then
+      dstat = (type(dcfg.socket) == "string" and vim.uv.fs_stat(dcfg.socket) ~= nil) and "ready" or "socket-missing"
+    elseif dcfg.mode == "host" then
+      dstat = "host"
+    end
+    parts[#parts + 1] = "privilege=" .. tostring(pcfg.enabled ~= false)
+    parts[#parts + 1] = "max_tier=" .. tostring(pcfg.max_tier or 0)
+    parts[#parts + 1] = "docker=" .. tostring(dcfg.mode or "?") .. "(" .. dstat .. ")"
     vim.notify("[NeoAI] 沙箱能力: " .. table.concat(parts, " "), vim.log.levels.INFO)
   end, { desc = "显示沙箱运行时能力探测结果" })
 
-  --- 异步审批：列出待审修改，可选择应用
+  --- 异步审批：列出待审修改（按路径级别高亮），选择应用
   _cmd("NeoAISandboxReview", function()
-    local sandbox = _svc("services.sandbox")
-    if not sandbox then return end
-    local items = sandbox.list_reviews({ review_state = "PENDING" })
-    if #items == 0 then
-      vim.notify("[NeoAI] 无待审修改", vim.log.levels.INFO)
-      return
-    end
-    local labels, by_label = {}, {}
-    for _, item in ipairs(items) do
-      local files = item.write_set or {}
-      local label = string.format("[%s] %s（%d 个文件）", item.change_set_id, item.tool or "?", #files)
-      labels[#labels + 1] = label
-      by_label[label] = item
-    end
-    vim.ui.select(labels, { prompt = "选择要应用的修改（异步审批）" }, function(choice)
-      if not choice then return end
-      local item = by_label[choice]
-      local res = sandbox.apply(item.change_set_id, { auto_approve = true })
-      if res.ok then
-        vim.notify(("[NeoAI] 已应用 %s（%d 个文件）"):format(item.change_set_id, #(item.write_set or {})), vim.log.levels.INFO)
-      else
-        vim.notify(("[NeoAI] 应用失败(%s): %s"):format(tostring(res.state), tostring(res.reason)), vim.log.levels.ERROR)
-      end
-    end)
-  end, { desc = "列出并应用待审的沙箱修改（异步审批）" })
+    require("NeoAI.ui.components.sandbox_review").open()
+  end, { desc = "列出并应用待审的沙箱修改（按路径级别高亮）" })
 
   _cmd("NeoAISandboxApprove", function(opts)
     local sandbox = _svc("services.sandbox")

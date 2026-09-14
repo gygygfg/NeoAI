@@ -146,6 +146,21 @@ M.SANDBOX_APPLIED = "sandbox:applied"
 M.SANDBOX_GRANT_CREATED = "sandbox:grant_created"
 M.SANDBOX_GRANT_REVOKED = "sandbox:grant_revoked"
 
+-- ========== 沙箱权限档位 / 自动提权 ==========
+M.SANDBOX_PRIVILEGE_CLASSIFIED = "sandbox:privilege_classified"
+M.SANDBOX_PRIVILEGE_ESCALATION_REQUESTED = "sandbox:privilege_escalation_requested"
+M.SANDBOX_PRIVILEGE_ESCALATION_GRANTED = "sandbox:privilege_escalation_granted"
+M.SANDBOX_PRIVILEGE_ESCALATION_DENIED = "sandbox:privilege_escalation_denied"
+M.SANDBOX_PRIVILEGE_RECORDED = "sandbox:privilege_recorded"
+M.SANDBOX_HOST_OP_ENQUEUED = "sandbox:host_op_enqueued"
+M.SANDBOX_HOST_OP_APPLIED = "sandbox:host_op_applied"
+M.SANDBOX_HOST_OP_REJECTED = "sandbox:host_op_rejected"
+
+-- ========== 沙箱密钥防护 ==========
+M.SANDBOX_SECRET_DETECTED = "sandbox:secret_detected"
+M.SANDBOX_SECRET_TRACED = "sandbox:secret_traced"
+M.SANDBOX_SECRET_BLOCKED = "sandbox:secret_blocked"
+
 -- ========== 计划蒸馏 ==========
 M.PLAN_DISTILL_STARTED = "plan_distill:started"
 M.PLAN_DISTILL_CHUNK = "plan_distill:chunk"

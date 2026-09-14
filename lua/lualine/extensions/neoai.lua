@@ -21,7 +21,7 @@ local function is_main()
 end
 
 --- 构造单个带高亮链接的函数组件
---- @param part string 段名（mode/display/model/usage/cache/capacity/state/pending）
+--- @param part string 段名（mode/display/model/usage/cache/capacity/state/pending/sandbox）
 --- @param opts table|nil { cond? function, sep? string }
 --- @return table lualine 组件
 local function comp(part, opts)
@@ -60,7 +60,7 @@ local function capacity_comp()
 end
 
 local function metrics()
-  return { comp("usage"), comp("cache"), capacity_comp(), comp("pending") }
+  return { comp("usage"), comp("cache"), capacity_comp(), comp("pending"), comp("sandbox") }
 end
 -- 身份（winbar 第一行）：模式 / 模型 / 状态
 local function identity()

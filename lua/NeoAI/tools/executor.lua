@@ -10,10 +10,47 @@ local registry = require("NeoAI.tools.registry")
 local validator = require("NeoAI.tools.validator")
 local config_store = require("NeoAI.kernel.config_store")
 local fs = require("NeoAI.utils.fs")
+local secret = require("NeoAI.sandbox.secret")
+local tool_spec = require("NeoAI.sandbox.tool_spec")
 
 local M = {}
 
 -- ========== 私有函数 ==========
+
+--- 工具参数命中的首个遮蔽目录条目（供弹窗审批与 fail-closed）。未命中/未开启返回 nil。
+--- 覆盖显式路径参数（tool_spec.paths）与 run_command 命令串中的绝对路径。
+--- @param tool_name string
+--- @param args table
+--- @return string|nil mask_entry
+local function _masked_target(tool_name, args)
+  local runtime = require("NeoAI.sandbox.runtime")
+  if not runtime.mask_dirs_enabled() then return nil end
+  local cwd = vim.fn.getcwd()
+  local spec = tool_spec.get(tool_name)
+  for _, field in ipairs(spec.paths or {}) do
+    local p = args and args[field]
+    if type(p) == "string" and p ~= "" then
+      local hit = runtime.mask_entry(vim.fn.fnamemodify(p, ":p"), cwd)
+      if hit then return hit end
+    end
+  end
+  local cmd = args and args.command
+  if type(cmd) == "string" and cmd ~= "" then
+    for _, d in ipairs(runtime.mask_dirs()) do
+      local init = 1
+      while true do
+        local s, e = cmd:find(d .. "/", init, true)
+        if not s then break end
+        local e2 = e
+        while e2 < #cmd and cmd:sub(e2 + 1, e2 + 1):match("[%w%._%-/]") do e2 = e2 + 1 end
+        local hit = runtime.mask_entry(cmd:sub(s, e2), cwd)
+        if hit then return hit end
+        init = e + 1
+      end
+    end
+  end
+  return nil
+end
 
 --- 参数别名规范化
 --- @param tool_name string
@@ -182,6 +219,65 @@ end
 
 -- ========== 公开 API ==========
 
+--- 出向密钥防护：扫描工具参数。
+--- - 命中映射表中已知的**原始密钥** → 硬拦截并终止整个 Agent（明确通知用户）；
+--- - 命中 token → 记录留痕（证据 + 待审警告）；
+--- - fs_write 类工具的内容参数做 token 化，使写入只落 token，commit 时再还原。
+--- @param tool table
+--- @param tool_name string
+--- @param args table
+--- @param ctx table
+--- @return boolean ok
+--- @return table|nil err
+local function _secret_guard(tool, tool_name, args, ctx)
+  if not secret.enabled() then return true end
+  local scan = secret.scan(args)
+  if scan.secret then
+    secret.trace("blocked", { tool = tool_name })
+    local agent = ctx and ctx.agent
+    if agent then
+      pcall(function() require("NeoAI.core.agent.runtime").abort(agent, "secret_exposure") end)
+    end
+    pcall(function()
+      require("NeoAI.kernel.event_bus").emit(require("NeoAI.kernel.events").SANDBOX_SECRET_BLOCKED, {
+        tool = tool_name, agent_id = agent and agent.id,
+      })
+    end)
+    pcall(vim.notify,
+      "[NeoAI] 检测到对原始密钥的操作，已拦截并终止 Agent（工具: " .. tostring(tool_name) .. "）",
+      vim.log.levels.ERROR)
+    return false, { kind = "secret", message = "SANDBOX_SECRET_BLOCKED: 工具参数包含原始密钥，已终止 Agent" }
+  end
+  if next(scan.tokens) then
+    secret.trace("token_used", { tool = tool_name, tokens = scan.tokens })
+    pcall(function()
+      require("NeoAI.kernel.event_bus").emit(require("NeoAI.kernel.events").SANDBOX_SECRET_TRACED, {
+        tool = tool_name, count = (function() local n = 0; for _ in pairs(scan.tokens) do n = n + 1 end; return n end)(),
+      })
+    end)
+  end
+  local spec = require("NeoAI.sandbox.tool_spec").get(tool_name, tool and tool.category)
+  if spec and spec.effect == "fs_write" then
+    secret.tokenize_args(args)
+  end
+  return true
+end
+
+--- 入向：把工具结果中的真实密钥替换为 token，再回传模型（AI 永远看不到原始密钥）。
+--- @param d Deferred
+--- @return Deferred
+local function _tokenize_out(d)
+  if not secret.enabled() then return d end
+  local out = async.Deferred.new()
+  d:then_(function(v)
+    local ok, tv = pcall(secret.tokenize_result, v)
+    out:resolve(ok and tv or v)
+  end, function(e)
+    out:reject(e)
+  end)
+  return out
+end
+
 --- 执行工具
 --- @param tool_name string
 --- @param raw_args any
@@ -218,12 +314,38 @@ function M.execute(tool_name, raw_args, ctx)
     return async.reject({ kind = "validation", message = verr })
   end
 
+  -- 出向密钥防护（原始密钥硬拦截 + token 留痕 + 写入 token 化）
+  local ok_secret, serr = _secret_guard(tool, resolved, args, ctx)
+  if not ok_secret then
+    return async.reject(serr)
+  end
+
   -- 审批检查。async 模式（默认）不使用执行前阻塞审批：工具立即在沙箱内执行并冻结
   -- 候选，真实修改进入异步待审队列由用户确认后应用（设计文档 §15）。
+  -- 例外：命中「遮蔽目录」的工具调用（即使 async）也走审批弹窗；批准后仅对该次调用
+  -- 解除对应遮蔽条目（ctx.sandbox_unmask → 运行时 unmask），未批准则拒绝执行。
   local approval_config = registry.get_approval_config(resolved)
   local mode = ctx.approval_mode or config_store.get("tools.approval.mode") or "async"
-  local needs_approval = mode ~= "async"
-    and validator.check_approval(resolved, args, approval_config, mode)
+  local spec = tool_spec.get(resolved)
+  local masked_hit = _masked_target(resolved, args)
+  local approval_on = config_store.get("tools.sandbox.mask_dirs_approval") ~= false
+  -- 进程内读写（read/fs_write）不受 mount 遮蔽约束，必须显式拦截；外部进程（process/network）
+  -- 由 mount 硬遮蔽。有审批界面且开启审批时弹窗放行，否则 fail-closed 拒绝。
+  local can_approve = (not ctx.is_sub_agent) and ctx.tool_service ~= nil
+  local in_process_fs = spec.effect == "read" or spec.effect == "fs_write"
+  local needs_approval = false
+  if masked_hit then
+    if approval_on and can_approve then
+      ctx.sandbox_unmask = ctx.sandbox_unmask or {}
+      ctx.sandbox_unmask[#ctx.sandbox_unmask + 1] = masked_hit
+      needs_approval = true
+    elseif in_process_fs then
+      return async.reject({ kind = "sandbox", message = "路径位于遮蔽目录且不可审批: " .. masked_hit })
+    end
+  end
+  if mode ~= "async" and validator.check_approval(resolved, args, approval_config, mode) then
+    needs_approval = true
+  end
 
   -- 可暂停计时器：tool_loop 在调用前已创建并注入 ctx.timer（用于展示活跃耗时）。
   -- 直接调用（无 tool_loop，如测试）时自建一个，仅用于超时。
@@ -233,18 +355,17 @@ function M.execute(tool_name, raw_args, ctx)
     ctx.timer = timer
   end
 
-  if needs_approval and not ctx.is_sub_agent then
-    if ctx.tool_service then
-      -- 交由 tool_service 做审批 UI，审批通过后继续执行。
-      -- 计时器只在审批通过后才 start，因此等待审批的时间不计入耗时、也不消耗超时预算。
-      return ctx.tool_service.approve_and_execute(resolved, args, ctx, function()
-        return _execute_tool(tool, args, ctx, timer)
-      end)
-    end
+  -- 入向 token 化：结果中的真实密钥替换为 token 后再回传模型。
+  if needs_approval and not ctx.is_sub_agent and ctx.tool_service then
+    -- 交由 tool_service 做审批 UI，审批通过后继续执行。
+    -- 计时器只在审批通过后才 start，因此等待审批的时间不计入耗时、也不消耗超时预算。
+    return _tokenize_out(ctx.tool_service.approve_and_execute(resolved, args, ctx, function()
+      return _execute_tool(tool, args, ctx, timer)
+    end))
   end
 
   -- 直接执行
-  return _execute_tool(tool, args, ctx, timer)
+  return _tokenize_out(_execute_tool(tool, args, ctx, timer))
 end
 
 --- 结果字符串化

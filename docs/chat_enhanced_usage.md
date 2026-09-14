@@ -41,6 +41,7 @@
 | 热重载显示模式 | `<F5>` | 重载当前显示模式插件 |
 | 确认计划 | — | 由 AI 调用 `exit_plan_mode`（弹审批窗口确认）或执行 `:NeoAIApprovePlan` |
 | 工具审批 | `<C-a>` | 审批弹窗内确认 |
+| 沙箱待审审批 | `<leader>ap` | 等价 `:NeoAISandboxReview`，列出并应用待审的沙箱修改（审批单位为单个文件） |
 | 滚动 | `j` / `k` / 鼠标滚轮 | `j`/`k` 按行移动光标；滚轮平滑滚动视口，末行留白不超 `ui.chat.mousescroll_max_blank` 行 |
 
 ## 4. 流式更新与悬浮窗

@@ -73,6 +73,14 @@ end
 --- @return table item
 function M.enqueue(cand, meta)
   meta = meta or {}
+  -- 空候选（无文件改动）没有审批意义，不入待审队列，避免出现「0 个文件」空项。
+  if #(cand and cand.files or {}) == 0 then return nil end
+  -- 密钥防护：候选内容涉及 token（密钥被加密映射）时生成警告。
+  local secret_warning = meta.secret_warning
+  if secret_warning == nil then
+    local ok, s = pcall(require, "NeoAI.sandbox.secret")
+    if ok and s.enabled() then secret_warning = s.warn_for_files(cand.files) end
+  end
   state.seq = state.seq + 1
   local id = meta.id or string.format("cs_%d_%s", state.seq, tostring(os.time()))
   local item = {
@@ -90,6 +98,8 @@ function M.enqueue(cand, meta)
     effect = cand.effect,
     evidence = meta.evidence or {},
     stats = meta.stats or {},
+    -- 密钥防护：候选内容涉及 token 操作时的警告（供待审界面醒目提示）
+    secret_warning = secret_warning,
     depends_on = meta.depends_on or {},
     atomic_group = meta.atomic_group,
     review_state = M.REVIEW.PENDING,
@@ -104,6 +114,33 @@ function M.enqueue(cand, meta)
     write_set = item.write_set,
     tool = item.tool,
   })
+  return item
+end
+
+--- 入队一条主机操作提案（T2 特权档的主机效果，审批后 replay）
+--- @param rec table hostop 记录
+--- @return table item
+function M.enqueue_host_op(rec)
+  state.seq = state.seq + 1
+  local id = string.format("cs_%d_%s", state.seq, tostring(os.time()))
+  local item = {
+    change_set_id = id,
+    kind = "host_op",
+    host_op_id = rec.host_op_id,
+    candidate_digest = "host_op:" .. tostring(rec.host_op_id),
+    tool = rec.tool,
+    command_id = rec.command_id,
+    attempt_id = rec.attempt_id,
+    write_set = { rec.command },
+    files = {},
+    privilege_tier = rec.tier,
+    effect = "process",
+    review_state = M.REVIEW.PENDING,
+    apply_state = M.APPLY.NOT_REQUESTED,
+    created_at = os.time(),
+  }
+  state.items[id] = item
+  _persist(item)
   return item
 end
 
@@ -135,7 +172,11 @@ function M.list(filter)
   end
   local filtered = {}
   for _, item in ipairs(out) do
-    if (not filter.review_state or item.review_state == filter.review_state)
+    -- 过滤空变更单元（0 文件）：历史持久化记录可能残留，无审批意义。
+    -- 主机操作提案（host_op）无文件但必须保留。
+    local has_files = (item.files and #item.files > 0) or (item.write_set and #item.write_set > 0)
+    if (has_files or item.kind == "host_op")
+      and (not filter.review_state or item.review_state == filter.review_state)
       and (not filter.apply_state or item.apply_state == filter.apply_state) then
       filtered[#filtered + 1] = item
     end
@@ -144,11 +185,20 @@ function M.list(filter)
   return filtered
 end
 
---- 待审数量
+--- 待审数量（按文件计：审批单位为单个文件，与审批界面一致）
+--- 一个变更单元可能含多个文件，用户需逐个确认，故徽标数应为待审文件总数。
 --- @return number
 function M.pending_count()
   local n = 0
-  for _, item in ipairs(M.list({ review_state = M.REVIEW.PENDING })) do n = n + 1 end
+  for _, item in ipairs(M.list({ review_state = M.REVIEW.PENDING })) do
+    if item.kind == "host_op" then
+      n = n + 1
+    else
+      local count = #(item.files or {})
+      if count == 0 then count = #(item.write_set or {}) end
+      n = n + count
+    end
+  end
   return n
 end
 
@@ -178,14 +228,87 @@ function M.reject(id, reason)
   item.reject_reason = reason
   item.rejected_at = os.time()
   state.items[id] = item
+  if item.kind == "host_op" then
+    pcall(function() require("NeoAI.sandbox.hostop").reject(item.host_op_id, reason) end)
+    _persist(item)
+    _emit(require("NeoAI.kernel.events").SANDBOX_REVIEW_REJECTED, { change_set_id = id, reason = reason })
+    return item
+  end
   store.discard_candidate(item.candidate_digest)
+  -- 拒绝后暂存副本失效：后续编辑应重新以真实文件为基线，不能带上被拒改动。
+  candidate.invalidate(item.write_set)
   _persist(item)
   _emit(require("NeoAI.kernel.events").SANDBOX_REVIEW_REJECTED, { change_set_id = id, reason = reason })
   return item
 end
 
+--- 拒绝变更单元中的单个文件（其余文件保留待审，按文件审批）
+--- @param id string
+--- @param path string
+--- @param reason string|nil
+--- @return table|nil item 剩余文件的待审项；无剩余时返回被拒绝的原项
+function M.reject_file(id, path, reason)
+  local item = M.get(id)
+  if not item then return nil end
+  local files = item.files
+  if not files or #files == 0 then
+    return M.reject(id, reason)
+  end
+  local remaining_paths = {}
+  local found = false
+  for _, f in ipairs(files) do
+    if f.path == path then found = true else remaining_paths[#remaining_paths + 1] = f.path end
+  end
+  if not found then return item end
+  -- 被拒文件的暂存副本失效：后续编辑重新以真实文件为基线，不带上被拒改动。
+  candidate.invalidate({ path })
+  if #remaining_paths == 0 then
+    return M.reject(id, reason)
+  end
+  local child = M.derive_revision(id, { paths = remaining_paths })
+  if not child then
+    -- 候选缺失等异常：退化为整单元拒绝，保证不残留无法处理的待审项。
+    return M.reject(id, reason)
+  end
+  _emit(require("NeoAI.kernel.events").SANDBOX_REVIEW_REJECTED, {
+    change_set_id = id, path = path, reason = reason,
+  })
+  return child
+end
+
+--- 将选择性应用后剩余的文件重新入队为新的待审变更单元（按文件审批）。
+--- @param item table 原变更单元
+--- @param remaining table 剩余文件数组
+--- @return table|nil 新变更单元
+local function _requeue_remaining(item, remaining)
+  if #remaining == 0 then return nil end
+  local manifest = {}
+  for _, f in ipairs(remaining) do
+    manifest[#manifest + 1] = { path = f.path, action = f.action, after_hash = f.after_hash }
+  end
+  local json = require("NeoAI.utils.json")
+  local newcand = {
+    candidate_digest = "sha256:" .. vim.fn.sha256(json.encode(manifest)),
+    files = remaining,
+    created_at = os.time(),
+    effect = item.effect,
+    command_id = item.command_id,
+  }
+  store.write_candidate(newcand)
+  return M.enqueue(newcand, {
+    tool = item.tool,
+    revision = item.revision or 1,
+    supersedes = item.change_set_id,
+    base_version = item.base_version,
+    evidence = item.evidence,
+    stats = item.stats,
+    depends_on = item.depends_on,
+    atomic_group = item.atomic_group,
+  })
+end
+
 --- 应用变更单元（CAS 发布到真实工作区）
---- 支持选择性应用：opts.files 指定允许的文件子集。
+--- 支持选择性应用：opts.files 指定允许的文件子集（按单个文件审批）。
 --- @param id string
 --- @param opts table|nil { files?: string[], auto_approve?: boolean }
 --- @return table { ok, state, reason?, receipt? }
@@ -194,6 +317,21 @@ function M.apply(id, opts)
   local item = M.get(id)
   if not item then
     return { ok = false, state = "FAILED", reason = "CHANGE_SET_NOT_FOUND: " .. tostring(id) }
+  end
+  -- 主机操作提案：审批后在主机上 replay（无候选、无文件）
+  if item.kind == "host_op" then
+    if opts.auto_approve and item.review_state == M.REVIEW.PENDING then M.approve(id) end
+    if item.review_state ~= M.REVIEW.APPROVED then
+      return { ok = false, state = "NOT_APPROVED", reason = "CHANGE_SET_NOT_APPROVED: " .. tostring(id) }
+    end
+    item.apply_state = M.APPLY.APPLYING
+    _persist(item)
+    local res = require("NeoAI.sandbox.hostop").replay(item.host_op_id)
+    item.apply_state = res.ok and M.APPLY.APPLIED or M.APPLY.FAILED
+    item.fail_reason = res.reason
+    state.items[id] = item
+    _persist(item)
+    return res
   end
   if opts.auto_approve and item.review_state == M.REVIEW.PENDING then
     M.approve(id)
@@ -205,13 +343,14 @@ function M.apply(id, opts)
   if not cand then
     return { ok = false, state = "FAILED", reason = "CANDIDATE_NOT_FOUND: " .. tostring(item.candidate_digest) }
   end
-  -- 选择性应用：按允许文件子集过滤候选
+  -- 选择性应用：按允许文件子集过滤候选，未选中的文件保留为新的待审项
+  local remaining = {}
   if opts.files and #opts.files > 0 then
     local allow = {}
     for _, p in ipairs(opts.files) do allow[p] = true end
     local filtered = {}
     for _, f in ipairs(cand.files or {}) do
-      if allow[f.path] then filtered[#filtered + 1] = f end
+      if allow[f.path] then filtered[#filtered + 1] = f else remaining[#remaining + 1] = f end
     end
     if #filtered == 0 then
       return { ok = false, state = "FAILED", reason = "NO_FILES_SELECTED" }
@@ -234,6 +373,8 @@ function M.apply(id, opts)
     store.write_receipt(pub.receipt)
     store.discard_candidate(item.candidate_digest)
     _persist(item)
+    -- 仅应用了部分文件：其余文件保留待审，供用户逐个确认
+    if #remaining > 0 then _requeue_remaining(item, remaining) end
     _emit(require("NeoAI.kernel.events").SANDBOX_APPLIED, {
       change_set_id = id, operation_id = pub.receipt.operation_id,
     })
@@ -277,6 +418,66 @@ function M.supersede_by_digest(digest, operation_id)
       _persist(item)
     end
   end
+end
+
+--- 丢弃指定候选摘要对应的待审变更单元（供候选被显式丢弃后对账）。
+--- 候选被 `sandbox.discard` 删除后，其待审项若仍为 PENDING，会在下次打开聊天界面/
+--- 审批界面时重新出现且无法应用；此处统一标记为 REJECTED 并失效暂存副本。
+--- @param digest string
+--- @param reason string|nil
+--- @return number 更新的变更单元数
+function M.discard_by_digest(digest, reason)
+  if not digest then return 0 end
+  local n = 0
+  for _, item in ipairs(M.list({ review_state = M.REVIEW.PENDING })) do
+    if item.candidate_digest == digest then
+      item.review_state = M.REVIEW.REJECTED
+      item.reject_reason = reason or "DISCARDED"
+      item.rejected_at = os.time()
+      state.items[item.change_set_id] = item
+      candidate.invalidate(item.write_set)
+      _persist(item)
+      _emit(require("NeoAI.kernel.events").SANDBOX_REVIEW_REJECTED, {
+        change_set_id = item.change_set_id, reason = item.reject_reason,
+      })
+      n = n + 1
+    end
+  end
+  return n
+end
+
+--- 取代（SUPERSEDED）覆盖指定路径的旧待审变更单元。
+--- 同一文件被再次编辑/发布时，旧待审项不再有意义（内容已被更新版本覆盖），
+--- 标记为 SUPERSEDED 并丢弃候选，避免同一文件在队列中出现多个版本。
+--- @param paths table 路径数组
+--- @param except_id string|nil 不取代的 change_set_id（通常是刚入队的新项）
+--- @return number superseded 被取代的数量
+function M.supersede_by_paths(paths, except_id)
+  local set = {}
+  for _, p in ipairs(paths or {}) do set[p] = true end
+  if not next(set) then return 0 end
+  local n = 0
+  for _, item in ipairs(M.list({ review_state = M.REVIEW.PENDING })) do
+    if item.change_set_id ~= except_id then
+      local overlap = false
+      for _, f in ipairs(item.files or {}) do
+        if set[f.path] then overlap = true break end
+      end
+      if overlap then
+        item.review_state = M.REVIEW.SUPERSEDED
+        item.superseded_by = except_id
+        item.superseded_at = os.time()
+        state.items[item.change_set_id] = item
+        store.discard_candidate(item.candidate_digest)
+        _persist(item)
+        _emit(require("NeoAI.kernel.events").SANDBOX_REVIEW_SUPERSEDED, {
+          change_set_id = item.change_set_id, superseded_by = except_id,
+        })
+        n = n + 1
+      end
+    end
+  end
+  return n
 end
 
 -- ========== 依赖图与组合发布（阶段四）==========

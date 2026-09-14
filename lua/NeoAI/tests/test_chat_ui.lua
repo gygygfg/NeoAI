@@ -336,9 +336,60 @@ tests.suite("chat_ui", function(_, it)
     vim.api.nvim_set_current_win(opened.win_id)
     local restored_win = input_box.get_win()
     t.true_(restored_win ~= nil and vim.api.nvim_win_is_valid(restored_win), "回到聊天后应重建输入窗口")
+    local input_buf = input_box.get_buf()
+    local n = 0
+    for _, w in ipairs(vim.api.nvim_list_wins()) do
+      if vim.api.nvim_win_get_buf(w) == input_buf then n = n + 1 end
+    end
+    t.eq(1, n, "恢复后应只有一个输入框")
     t.eq("draft text", vim.api.nvim_buf_get_lines(input_box.get_buf(), 0, -1, false)[1], "输入内容应保留")
 
     pcall(vim.api.nvim_buf_delete, code_buf, { force = true })
+    chat_view.reset()
+    chat_service.reset()
+  end)
+
+  it("关闭其它窗口触发 WinEnter 恢复输入框时不报 E242", function(t)
+    local chat_view = require("NeoAI.ui.window.chat_view")
+    local chat_service = require("NeoAI.services.chat_service")
+    local input_box = require("NeoAI.ui.components.input_box")
+    chat_view.reset()
+    chat_service.reset()
+
+    local opened = chat_view.open()
+    local main = opened.win_id
+    t.true_(vim.api.nvim_win_is_valid(input_box.get_win()), "打开后应有输入窗口")
+
+    -- 在聊天标签页内从主窗口分出一个非聊天窗口，聚焦它使输入框收起
+    vim.api.nvim_set_current_win(main)
+    vim.cmd("vsplit")
+    local side = vim.api.nvim_get_current_win()
+    local side_buf = vim.api.nvim_create_buf(false, true)
+    vim.bo[side_buf].filetype = "lua"
+    vim.api.nvim_win_set_buf(side, side_buf)
+    vim.api.nvim_set_current_win(main)
+    vim.api.nvim_set_current_win(side)
+    local cw = input_box.get_win()
+    t.true_(cw == nil or not vim.api.nvim_win_is_valid(cw), "离开聊天后输入框应已收起")
+
+    -- 关闭 side 窗口：关闭过程中会对聊天主窗口触发 WinEnter，此时同步 :split
+    -- 会报 E242 "Can't split a window while closing another"，不应抛出。
+    local ok = pcall(vim.api.nvim_win_close, side, true)
+    t.true_(ok, "关闭窗口不应因恢复输入框而报错")
+    t.true_(vim.wait(300, function()
+      local w = input_box.get_win()
+      return w ~= nil and vim.api.nvim_win_is_valid(w)
+    end), "随后应延迟恢复输入窗口")
+
+    -- 不得重复创建：恰好一个窗口显示输入 buffer
+    local input_buf = input_box.get_buf()
+    local n = 0
+    for _, w in ipairs(vim.api.nvim_list_wins()) do
+      if vim.api.nvim_win_get_buf(w) == input_buf then n = n + 1 end
+    end
+    t.eq(1, n, "恢复后应只有一个输入框")
+
+    pcall(vim.api.nvim_buf_delete, side_buf, { force = true })
     chat_view.reset()
     chat_service.reset()
   end)
@@ -1709,6 +1760,24 @@ tests.suite("chat_ui", function(_, it)
     for _ = 1, 200 do back.callback() end
     local topline_top = vim.api.nvim_win_call(opened.win_id, function() return vim.fn.line("w0") end)
     t.eq(1, topline_top, "连续向上滚应停在 buffer 首行（视口首行 = 1）")
+
+    chat_view.reset()
+    chat_service.reset()
+  end)
+
+  it("聊天主窗口注册 <leader>ap 快捷键触发沙箱待审审批", function(t)
+    local chat_view = require("NeoAI.ui.window.chat_view")
+    local chat_service = require("NeoAI.services.chat_service")
+    chat_view.reset()
+    chat_service.reset()
+
+    local opened = chat_view.open()
+    local found = nil
+    for _, m in ipairs(vim.api.nvim_buf_get_keymap(opened.buf, "n")) do
+      if (m.desc or ""):find("沙箱", 1, true) then found = m break end
+    end
+    t.not_nil(found, "主窗口普通模式应注册沙箱待审审批快捷键（<leader>ap）")
+    t.true_(found.lhs:sub(-2) == "ap", "沙箱待审审批快捷键应以 ap 结尾，实际: " .. tostring(found.lhs))
 
     chat_view.reset()
     chat_service.reset()

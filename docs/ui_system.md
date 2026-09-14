@@ -147,6 +147,7 @@
 | `tool_approval` | 工具审批弹窗。`init()`；串行单槽位展示。 |
 | `ask_user` | 向用户提问弹窗。`init()`；经 `ask_user.set_ui` 注入。 |
 | `sub_agent_dock` | 子 Agent 状态监控。`init()`。 |
+| `sandbox_review` | 沙箱待审审批界面。`open()`；按路径级别高亮（工作区绿/用户目录黄/系统红），「待审」标签黄色；审批单位为单个文件：`<CR>` 仅应用该文件、`d` 仅拒绝该文件（其余文件保留待审），头行仅作信息展示，`r` 刷新、`q` 关闭。 |
 | `fold` | 折叠（推理/工具调用/结果共用实现）。`foldexpr`/`foldtext`/`record_start`/`record_end`/`has_running`/`set_live_timer`/`set_foldexpr_override`/`set_foldtext_override`。 |
 | `display_modes/` | 显示模式插件管理器 + `chat.lua`/`trajectory.lua`。 |
 | `markdown_view` | Markdown 渲染器。 |
@@ -159,7 +160,8 @@
 
 聊天上下文键位（`keymaps.chat`）：`insert`(i)、`quit`(q)、`send`、`cancel`(<Esc>)、`toggle_reasoning`(r)、
 `switch_model`(M)、`cycle_mode`(m)、`cycle_display`(<C-t>/T)、`reload_display`(<F5>)、
-`tool_approval`(<C-a>)、`approval.confirm/confirm_all/cancel/cancel_with_reason`。
+`tool_approval`(<C-a>)、`sandbox_review`(<leader>ap，触发 `:NeoAISandboxReview`)、
+`approval.confirm/confirm_all/cancel/cancel_with_reason`。
 另有主消息区内部滚动映射：`j`/`k`（走 `_scroll`，按行移动光标）、
 `<ScrollWheelUp>`/`<ScrollWheelDown>`（走 `_wheel_scroll`，平滑滚动视口并把末行下方留白钳制在
 `ui.chat.mousescroll_max_blank` 行内）。

@@ -108,6 +108,7 @@ stop: cleanups in reverse → revoke service → stopped
 | `skills.scan` | Scan skill directories | `skills.reset()` |
 | `statusline` | Statusline subscriptions + lualine injection | `status.unwatch()` |
 | `herder` | Herder state reporting | `herder.reset()` |
+| `sandbox.session` | Agent lifecycle subscription: shared sandbox per loop, rotate + migrate staging at agentEnd | `sandbox.unwatch_sessions()` |
 
 ### 3.3 Tool plugins
 

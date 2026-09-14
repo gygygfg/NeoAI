@@ -11,16 +11,24 @@ local M = {}
 --- 确保文件已加载且有 parser（未打开时后台加载）
 --- @param filepath string
 --- @return number|nil bufnr
+--- @return string|nil err 失败原因（供工具给出可操作提示）
 local function _ensure_parsed(filepath)
-  if not filepath or filepath == "" then return nil end
+  if not filepath or filepath == "" then return nil, "缺少 filepath" end
   local bufnr = helpers.ensure_buffer(filepath)
-  if not bufnr then return nil end
+  if not bufnr then return nil, "文件不存在或无法打开: " .. filepath end
   -- 磁盘直写工具（edit_file 等）只改磁盘不改已加载 buffer，导致内存与磁盘不一致；
   -- 先把磁盘最新内容同步进 buffer 再解析，避免 delete_node 等修改类工具基于过期
   -- 内容定位节点、并把旧内容整体写回磁盘覆盖掉 edit_file 刚写入的新内容（BUG-1）。
   helpers.sync_buffer_from_disk(bufnr)
-  local ok = pcall(vim.treesitter.get_parser, bufnr)
-  if not ok then return nil end
+  local ok, parser = pcall(vim.treesitter.get_parser, bufnr)
+  if not ok then return nil, "语法树解析器初始化失败: " .. tostring(parser) end
+  if not parser then
+    local ft = vim.bo[bufnr].filetype
+    if ft == nil or ft == "" then
+      return nil, "无法识别文件类型（无语法树解析器）: " .. filepath
+    end
+    return nil, "该文件类型无可用语法树解析器: " .. ft
+  end
   return bufnr
 end
 
@@ -109,10 +117,10 @@ tree_tools.parse_file = helpers.define_tool(
     required = { "filepath" },
   },
   function(args, on_success, on_error)
-    local bufnr = _ensure_parsed(args.filepath)
-    if not bufnr then on_error("无法解析文件（缺少 parser 或文件未打开）") return end
+    local bufnr, err = _ensure_parsed(args.filepath)
+    if not bufnr then on_error(err or "无法解析文件") return end
     local root = _root(bufnr)
-    if not root then on_error("无法获取语法树") return end
+    if not root then on_error("无法获取语法树（解析失败）") return end
     on_success(string.format("root: %s, children: %d", root:type(), root:child_count()))
   end,
   { category = "treesitter" }
