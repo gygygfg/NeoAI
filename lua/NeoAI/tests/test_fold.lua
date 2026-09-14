@@ -11,6 +11,38 @@ tests.suite("fold", function(_, it)
     t.eq("  🤔 思考过程 2 行", fold.label("  step 1", 2))
   end)
 
+  it("label 未登记为非推理的折叠显示中性占位（不冒充思考过程）", function(t)
+    local fold = require("NeoAI.ui.components.fold")
+    local s = fold.label("  参数:", 3, false)
+    t.true_(s:find("📄", 1, true) ~= nil, "应使用中性占位")
+    t.true_(s:find("思考过程", 1, true) == nil, "不应显示思考过程")
+    t.matches("参数", s, "应展示首行预览")
+    t.matches("3 行", s, "应展示行数")
+  end)
+
+  it("渲染后仅推理块被登记，工具块不登记", function(t)
+    local fold = require("NeoAI.ui.components.fold")
+    local ml = require("NeoAI.ui.components.message_list")
+    local buf = vim.api.nvim_create_buf(false, true)
+    ml.render_chat(buf, {
+      { role = "assistant", content = "", reasoning = "先推理\n再作答", tool_calls = {
+        { id = "c1", ["function"] = { name = "read_file", arguments = "{}" } },
+      } },
+      { role = "tool", tool_call_id = "c1", tool_name = "read_file", content = "x" },
+    })
+    local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+    local rline, tline
+    for i, l in ipairs(lines) do
+      if l == "  先推理" then rline = i end
+      if l:find("工具: read_file", 1, true) then tline = i end
+    end
+    t.not_nil(rline, "应找到推理行")
+    t.not_nil(tline, "应找到工具行")
+    t.true_(fold.is_reasoning_start(buf, rline), "推理行应被登记")
+    t.false_(fold.is_reasoning_start(buf, tline), "工具行不应被登记为推理")
+    vim.api.nvim_buf_delete(buf, { force = true })
+  end)
+
   it("label 工具折叠占位文本格式：🔧 工具名 状态emoji", function(t)
     local fold = require("NeoAI.ui.components.fold")
     t.eq("  🔧 bash ⏳", fold.label("  ⏳ 调用工具: bash({\"cmd\":\"pwd\"})", 2))
@@ -103,15 +135,17 @@ tests.suite("fold", function(_, it)
 
   it("foldexpr 按块独立成折叠（推理 + 每工具），无需分隔行", function(t)
     local fold = require("NeoAI.ui.components.fold")
-    -- 构造与 message_list 输出一致的行结构（含空白分隔行）
+    -- 确保使用默认折叠行为（清除可能由其它套件残留的显示模式覆盖），保证用例可独立运行。
+    fold.set_foldexpr_override(nil)
+    fold.set_foldtext_override(nil)
+    -- 构造与 message_list 输出一致的行结构：每个工具块只有一行状态头（完成态 ✅ 工具:），
+    -- 推理块与其后的工具块在同一缩进级别下也各自独立成折叠。
     local lines = {
       "🤖 AI",
       "  思考一",
       "  思考二",
-      "  ⏳ 调用工具: git_status({})",
       "  ✅ 工具: git_status",
       "  M f1",
-      "  ⏳ 调用工具: run_command({})",
       "  ✅ 工具: run_command",
       "  out1",
       "## 正文",
@@ -127,9 +161,10 @@ tests.suite("fold", function(_, it)
 
     -- 推理、git_status、run_command 各自独立折叠
     t.eq(1, vim.fn.foldlevel(2), "推理首行应折叠")
-    t.eq(4, vim.fn.foldclosed(4), "git_status 调用块应独立折叠")
-    t.eq(7, vim.fn.foldclosed(7), "run_command 调用块应独立折叠")
-    t.eq(0, vim.fn.foldlevel(10), "正文不应折叠")
+    t.eq(2, vim.fn.foldclosed(2), "推理块应从第 2 行开始折叠")
+    t.eq(4, vim.fn.foldclosed(4), "git_status 块应独立折叠")
+    t.eq(6, vim.fn.foldclosed(6), "run_command 块应独立折叠")
+    t.eq(0, vim.fn.foldlevel(8), "正文不应折叠")
 
     vim.api.nvim_win_close(win, true)
     vim.api.nvim_buf_delete(buf, { force = true })

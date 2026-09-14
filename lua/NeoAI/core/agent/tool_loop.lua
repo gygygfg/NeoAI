@@ -38,6 +38,12 @@ local LOOP_LIMIT_MESSAGE = "⚠️ 工具循环达到最大轮数限制（" .. t
 -- 工具执行完毕后模型未返回内容时的收尾说明：避免循环静默结束、聊天看起来"卡住"
 local EMPTY_RESPONSE_MESSAGE = "⚠️ 工具已执行完毕，但模型未返回后续内容，本轮生成到此结束。"
 
+-- 工具被取消/中止时写入的显式结果：避免留下孤立 tool_calls，使后续请求被合成
+-- 「Tool result unavailable」而让模型误以为调用结果未知。
+local CANCELLED_RESULT_MESSAGE =
+  "Tool call cancelled: the agent was stopped before this call completed. "
+  .. "No side effects should be assumed; re-run the tool if its result is still needed."
+
 --- 供 runtime 在无工具调用的空响应场景复用同一文案
 M.EMPTY_RESPONSE_MESSAGE = EMPTY_RESPONSE_MESSAGE
 
@@ -334,6 +340,18 @@ function M.pre_round_refresh(agent)
   return nil
 end
 
+--- 为一轮中尚未记录结果的工具调用补写「已取消」结果，保持 assistant.tool_calls 与
+--- tool 消息一一对应。否则历史中会留下孤立 tool_calls，下一轮请求被合成
+--- 「Tool result unavailable」，模型无法区分「结果未知」与「用户主动取消」。
+--- @param agent table
+--- @param calls table 工具调用数组
+local function _settle_cancelled_calls(agent, calls)
+  for _, tc in ipairs(calls or {}) do
+    local name = tc["function"] and tc["function"].name or "unknown"
+    agent:add_tool_result(tc.id, name, CANCELLED_RESULT_MESSAGE)
+  end
+end
+
 --- 运行工具循环
 --- @param agent table Agent
 --- @param tool_calls table 首轮工具调用
@@ -347,6 +365,9 @@ function M.run(agent, tool_calls, tool_service, opts)
 
   local function _loop()
     if agent.signal:aborted() then
+      -- 取消发生在上一轮结果落库之后、本轮执行之前：本轮 tool_calls 已有 assistant
+      -- 消息但无结果，补写显式取消结果，避免孤立调用污染后续请求。
+      _settle_cancelled_calls(agent, current_calls)
       return async.reject({ kind = "aborted", message = "工具循环被取消" })
     end
     rounds = rounds + 1
@@ -418,6 +439,10 @@ function M.run(agent, tool_calls, tool_service, opts)
           return _loop()
         end)
       end)
+    end, function(err)
+      -- 本轮工具并发执行被取消/异常：补写取消结果，避免孤立 tool_calls。
+      _settle_cancelled_calls(agent, current_calls)
+      return async.reject(err)
     end)
   end
 

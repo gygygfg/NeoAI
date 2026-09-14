@@ -36,6 +36,7 @@ M.APPLY = {
 local state = {
   items = {}, -- change_set_id -> item
   seq = 0,
+  session_auto = nil, -- 会话级自动审批覆盖（nil = 用配置默认，默认关闭）
 }
 
 -- ========== 私有函数 ==========
@@ -102,6 +103,12 @@ function M.enqueue(cand, meta)
     secret_warning = secret_warning,
     depends_on = meta.depends_on or {},
     atomic_group = meta.atomic_group,
+    -- 安全分级：级别、原因、包安装标记与建议动作（供审批分级展示与决策）
+    risk_level = meta.risk_level,
+    risk_name = meta.risk_name,
+    risk_reasons = meta.risk_reasons,
+    package = meta.package,
+    action = meta.action,
     review_state = M.REVIEW.PENDING,
     apply_state = M.APPLY.NOT_REQUESTED,
     created_at = os.time(),
@@ -200,6 +207,28 @@ function M.pending_count()
     end
   end
   return n
+end
+
+--- 会话级自动审批是否开启（默认关闭；仅靠本地模型时由用户显式开启以管理 agent 行为）
+--- @return boolean
+function M.session_auto()
+  if state.session_auto ~= nil then return state.session_auto == true end
+  local cfg = require("NeoAI.kernel.config_store").get("tools.sandbox.review") or {}
+  return cfg.session_auto_approve == true
+end
+
+--- 设置会话级自动审批（nil 恢复配置默认）
+--- @param v boolean|nil
+function M.set_session_auto(v)
+  state.session_auto = v
+end
+
+--- 是否应自动应用（会话自动审批或全局 review.auto_apply）
+--- @return boolean
+function M.auto_apply_enabled()
+  if M.session_auto() then return true end
+  local cfg = require("NeoAI.kernel.config_store").get("tools.sandbox.review") or {}
+  return cfg.auto_apply == true
 end
 
 --- 批准变更单元（不应用）
@@ -683,6 +712,7 @@ end
 function M.reset()
   state.items = {}
   state.seq = 0
+  state.session_auto = nil
 end
 
 return M

@@ -160,6 +160,14 @@ M.SANDBOX_HOST_OP_REJECTED = "sandbox:host_op_rejected"
 M.SANDBOX_SECRET_DETECTED = "sandbox:secret_detected"
 M.SANDBOX_SECRET_TRACED = "sandbox:secret_traced"
 M.SANDBOX_SECRET_BLOCKED = "sandbox:secret_blocked"
+M.SANDBOX_SENSITIVE_REDACTED = "sandbox:sensitive_redacted"
+
+-- ========== 沙箱安全分级 / 行为审计 / 容器受控 ==========
+M.SANDBOX_RISK_ASSESSED = "sandbox:risk_assessed"
+M.SANDBOX_RISK_BLOCKED = "sandbox:risk_blocked"
+M.SANDBOX_AUDIT_OBSERVED = "sandbox:audit_observed"
+M.SANDBOX_AUDIT_ANOMALY = "sandbox:audit_anomaly"
+M.SANDBOX_CONTAINER_PLANNED = "sandbox:container_planned"
 
 -- ========== 计划蒸馏 ==========
 M.PLAN_DISTILL_STARTED = "plan_distill:started"

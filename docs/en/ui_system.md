@@ -83,7 +83,10 @@ restored by setting `ui.chat.incremental = false`.
 ### 4.4 Folds
 
 The main window uses `expr` folds (`components.fold.foldexpr`); reasoning / each tool call block (call + result)
-becomes its own independent fold. The fold placeholder text is provided uniformly by `components.fold`. During tool
+becomes its own independent fold. The fold placeholder text is provided uniformly by `components.fold`. **Only folds
+explicitly registered as reasoning by the renderer show `🤔 思考过程 N 行`** (`message_list` registers reasoning start
+lines after writing the buffer); tool blocks show `🔧 <tool>` and any other unrecognized fold shows a neutral
+placeholder (`📄 <first-line preview> (N lines)`), so not every fold is rendered as a thinking process. During tool
 execution it re-renders once per second (`TOOL_TICK_MS=1000`), so the elapsed time in the fold text ticks in real time.
 
 ### 4.5 Reasoning and Tool Arguments Floating Windows
@@ -165,7 +168,7 @@ Following deepseek-harness's Cordis plugin model, the chat view's "display modes
 | `tool_approval` | Tool approval popup. `init()`; serial single-slot display. |
 | `ask_user` | User questioning popup. `init()`; injected via `ask_user.set_ui`. |
 | `sub_agent_dock` | Sub-agent status monitoring. `init()`. |
-| `fold` | Folds (shared implementation for reasoning/tool calls/results). `foldexpr`/`foldtext`/`record_start`/`record_end`/`has_running`/`set_live_timer`/`set_foldexpr_override`/`set_foldtext_override`. |
+| `fold` | Folds (shared implementation for reasoning/tool calls/results). `foldexpr`/`foldtext`/`record_start`/`record_end`/`has_running`/`set_live_timer`/`set_foldexpr_override`/`set_foldtext_override`/`set_reasoning_lines`/`is_reasoning_start`/`generic_label`. |
 | `display_modes/` | Display mode plugin manager + `chat.lua`/`trajectory.lua`. |
 | `markdown_view` | Markdown renderer. |
 

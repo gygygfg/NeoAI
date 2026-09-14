@@ -30,6 +30,9 @@ local hostop = require("NeoAI.sandbox.hostop")
 local cache = require("NeoAI.sandbox.cache")
 local fault = require("NeoAI.sandbox.fault")
 local bench = require("NeoAI.sandbox.bench")
+local risk = require("NeoAI.sandbox.risk")
+local audit = require("NeoAI.sandbox.audit")
+local container = require("NeoAI.sandbox.container")
 local events = require("NeoAI.kernel.events")
 
 local M = {}
@@ -93,6 +96,8 @@ end
 --- 关闭：清理暂存
 function M.shutdown()
   M.unwatch_sessions()
+  pcall(function() require("NeoAI.sandbox.net_gateway").teardown() end)
+  pcall(function() require("NeoAI.sandbox.host_proxy").stop() end)
   candidate.reset()
   state.active = nil
   state.initialized = false
@@ -449,6 +454,9 @@ M.hostop = hostop
 M.cache = cache
 M.fault = fault
 M.bench = bench
+M.risk = risk
+M.audit = audit
+M.container = container
 
 --- 重置（测试用）
 function M.reset()
@@ -468,7 +476,12 @@ function M.reset()
   hostop.reset()
   cache.reset()
   fault.reset()
+  risk.reset()
+  audit.reset()
+  container.reset()
   require("NeoAI.sandbox.secret").reset()
+  pcall(function() require("NeoAI.sandbox.net_gateway").reset() end)
+  pcall(function() require("NeoAI.sandbox.host_proxy").reset() end)
   state.active = nil
   state.initialized = false
   M.init()

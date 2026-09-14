@@ -17,9 +17,28 @@ local M = {}
 
 local TOKEN_PREFIX = "NEOKEY_"
 local TOKEN_PAT = "NEOKEY_%x+"
+-- 环境变量信号：沙箱进程内该变量列出被 token 化的变量名（逗号分隔），
+-- 使工具/Agent 能区分「真实密钥」与「沙箱 token」，避免把 token 当真实凭据误判（如 401）。
+local ENV_MARKER = "NEOAI_TOKENIZED_ENV"
 -- 候选密钥允许的字符集：字母/数字/下划线/连字符/加号（不含 `/`、`.`、`=`，
 -- 避免把路径/域名/赋值前缀并入候选；base64 末尾的 `=` 会留在 token 之外，往返无损）
 local RUN_PAT = "[%w_%-%+]+"
+
+-- 具名敏感信息规则（Lua pattern）：命中即视为敏感信息，无视熵阈值一律 token 化/脱敏。
+-- 覆盖「高熵熵检测」盲区（结构化凭据、带前缀的 token、私钥块等），实现敏感信息全部脱敏。
+-- 每条 `{ name, pattern }`；pattern 命中整段（含捕获）作为敏感值处理。
+local DEFAULT_RULES = {
+  { name = "private_key", pattern = "%-%-%-%-%-BEGIN[%w ]*PRIVATE KEY%-%-%-%-%-[%s%S]-%-%-%-%-%-END[%w ]*PRIVATE KEY%-%-%-%-%-" },
+  { name = "aws_access_key", pattern = "AKIA[0-9A-Z]+" },
+  { name = "github_token", pattern = "gh[pousr]_[A-Za-z0-9]+" },
+  { name = "slack_token", pattern = "xox[baprs]%-[A-Za-z0-9%-]+" },
+  { name = "google_api_key", pattern = "AIza[0-9A-Za-z_%-]+" },
+  { name = "stripe_key", pattern = "s?[rp]k_(live|test)_[A-Za-z0-9]+" },
+  { name = "openai_key", pattern = "sk%-[A-Za-z0-9_%-]+" },
+  { name = "jwt", pattern = "eyJ[%w_%-]+%.eyJ[%w_%-]+%.[%w_%-]+" },
+  { name = "bearer", pattern = "[Bb]earer%s+[%w%._%-]+" },
+  { name = "basic_auth", pattern = "[Bb]asic%s+[A-Za-z0-9+/=]+" },
+}
 
 local DEFAULTS = {
   enabled = true,
@@ -30,6 +49,13 @@ local DEFAULTS = {
   -- 排除纯小写十六进制串（git SHA / sha256 / md5 等哈希与校验和），避免把常见
   -- 标识符当密钥导致 token 化后不可用；代价是纯小写 hex 形式的密钥不被覆盖。
   exclude_pure_hex = true,
+  -- 是否对沙箱进程环境变量做 token 化。关闭后环境变量原样注入（调试/本地可信运行时），
+  -- 工具结果与暂存内容仍按密钥防护处理。
+  tokenize_env = true,
+  -- 具名敏感信息规则（见 DEFAULT_RULES）；配置后**替换**内置规则。
+  rules = DEFAULT_RULES,
+  -- 额外追加的具名规则（在内置/配置规则之外追加）
+  extra_rules = {},
   -- 额外排除的正则（Lua pattern），命中则不视为密钥
   allowlist = {},
 }
@@ -53,6 +79,15 @@ local function _cfg()
   if type(c) == "table" then
     for k, v in pairs(c) do out[k] = v end
   end
+  -- 具名规则：默认/配置规则 + extra_rules 追加
+  local rules = {}
+  for _, r in ipairs(out.rules or {}) do
+    if type(r) == "table" and type(r.pattern) == "string" then rules[#rules + 1] = r end
+  end
+  for _, r in ipairs(out.extra_rules or {}) do
+    if type(r) == "table" and type(r.pattern) == "string" then rules[#rules + 1] = r end
+  end
+  out.rules = rules
   return out
 end
 
@@ -101,8 +136,9 @@ end
 
 --- 生成随机 token（每进程随机盐，跨密钥唯一）
 --- @param secret string
+--- @param rule_name string|nil 命中的具名规则（用于留痕）
 --- @return string
-local function _token_for(secret)
+local function _token_for(secret, rule_name)
   local existing = state.by_secret[secret]
   if existing then return existing end
   state.seq = state.seq + 1
@@ -114,13 +150,76 @@ local function _token_for(secret)
   local token = TOKEN_PREFIX .. hex:sub(1, 32)
   state.by_secret[secret] = token
   state.by_token[token] = secret
-  state.traces[#state.traces + 1] = { event = "detected", token = token, at = os.time() }
+  state.traces[#state.traces + 1] = { event = "detected", token = token, rule = rule_name, at = os.time() }
   pcall(function()
     require("NeoAI.kernel.event_bus").emit(require("NeoAI.kernel.events").SANDBOX_SECRET_DETECTED, {
-      token = token,
+      token = token, rule = rule_name,
     })
   end)
+  if rule_name then
+    pcall(function()
+      require("NeoAI.sandbox.audit").observe({
+        kind = "secret", level = 3, reasons = { "SENSITIVE_RULE:" .. tostring(rule_name) },
+      })
+    end)
+  end
   return token
+end
+
+--- 应用具名敏感信息规则：命中整段替换为 token（进沙箱加密，可无损还原）。
+--- @param text string
+--- @param cfg table
+--- @param used table token 累加器
+--- @return string
+local function _apply_rules(text, cfg, used)
+  for _, rule in ipairs(cfg.rules or {}) do
+    if type(rule.pattern) == "string" then
+      local ok, out = pcall(function()
+        return (text:gsub(rule.pattern, function(m)
+          local token = _token_for(m, rule.name)
+          used[#used + 1] = token
+          return token
+        end))
+      end)
+      if ok and type(out) == "string" then text = out end
+    end
+  end
+  return text
+end
+
+--- 对文本应用具名敏感信息规则做**破坏性脱敏**（用于日志/证据，不可还原）。
+--- @param text string
+--- @return string redacted
+--- @return table hits 命中的规则名数组
+function M.redact(text)
+  if type(text) ~= "string" or text == "" then return text, {} end
+  local cfg = _cfg()
+  if cfg.enabled == false then return text, {} end
+  local hits = {}
+  for _, rule in ipairs(cfg.rules or {}) do
+    if type(rule.pattern) == "string" then
+      local ok, out, n = pcall(function()
+        local count = 0
+        local res = text:gsub(rule.pattern, function()
+          count = count + 1
+          return "[REDACTED:" .. tostring(rule.name) .. "]"
+        end)
+        return res, count
+      end)
+      if ok and type(out) == "string" then
+        text = out
+        if (n or 0) > 0 then
+          hits[#hits + 1] = rule.name
+          pcall(function()
+            require("NeoAI.kernel.event_bus").emit(require("NeoAI.kernel.events").SANDBOX_SENSITIVE_REDACTED, {
+              rule = rule.name, count = n,
+            })
+          end)
+        end
+      end
+    end
+  end
+  return text, hits
 end
 
 --- 记录一条留痕（证据）
@@ -155,6 +254,47 @@ local function _secret_name(name)
   return false
 end
 
+-- 具名赋值中敏感值的字符集：仅密钥常见字符，避免把空白/引号/控制符/分隔符并入候选而跨条目吞并
+-- （如 /proc/self/environ 以 NUL 分隔、值中含 `.`/`+`/`/`/`=`/`:`）。
+local NAME_VALUE_CHARS = "[%w%._%+%=/:-]+"
+
+--- 按变量名强制 token 化赋值中的敏感值。覆盖熵检测盲区：
+---   * 纯小写十六进制（被 `exclude_pure_hex` 排除）；
+---   * 含 `.` 等分隔符的多段密钥（被 `RUN_PAT` 拆成不满足候选条件的片段）。
+--- 仅当赋值**名字**暗示敏感（`_secret_name`）时才替换值，避免误伤普通配置/代码。
+--- 支持 `NAME=value` / `NAME="value"` / `"NAME": "value"` 三种写法。
+--- @param text string
+--- @param used table token 累加器
+--- @return string
+local function _apply_secret_names(text, used)
+  local function make(name, value)
+    if type(name) ~= "string" or type(value) ~= "string" then return nil end
+    if value == "" or not _secret_name(name) then return nil end
+    if value:sub(1, #TOKEN_PREFIX) == TOKEN_PREFIX then return nil end
+    local token = _token_for(value, "env_name:" .. name)
+    used[#used + 1] = token
+    return token
+  end
+  text = text:gsub("([%a_][%w_]*)(%s*=%s*)(" .. NAME_VALUE_CHARS .. ")", function(name, sep, value)
+    local token = make(name, value)
+    if not token then return nil end
+    return name .. sep .. token
+  end)
+  for _, q in ipairs({ '"', "'" }) do
+    text = text:gsub("([%a_][%w_]*)(%s*=%s*)" .. q .. "(.-)" .. q, function(name, sep, value)
+      local token = make(name, value)
+      if not token then return nil end
+      return name .. sep .. q .. token .. q
+    end)
+    text = text:gsub(q .. "([%a_][%w_]*)" .. q .. "(%s*:%s*)" .. q .. "(.-)" .. q, function(name, sep, value)
+      local token = make(name, value)
+      if not token then return nil end
+      return q .. name .. q .. sep .. q .. token .. q
+    end)
+  end
+  return text
+end
+
 -- ========== 公开 API ==========
 
 --- 是否启用密钥防护
@@ -170,27 +310,44 @@ function M.entropy(s)
   return _entropy(s or "")
 end
 
---- 检测文本中的高熵密钥候选
+--- 检测文本中的密钥候选（高熵 + 具名敏感信息规则）
 --- @param text string
---- @return table 数组 { value, start, stop, entropy }
+--- @return table 数组 { value, start, stop, entropy, rule? }
 function M.detect(text)
   local out = {}
   if type(text) ~= "string" or text == "" then return out end
   local cfg = _cfg()
+  local seen = {}
+  local function add(s, e, rule)
+    if s == nil then return end
+    local key = s .. ":" .. e
+    if seen[key] then return end
+    seen[key] = true
+    local v = text:sub(s, e)
+    out[#out + 1] = { value = v, start = s, stop = e, entropy = _entropy(v), rule = rule }
+  end
   local pos = 1
   while true do
     local s, e = text:find(RUN_PAT, pos)
     if not s then break end
     local run = text:sub(s, e)
-    if _is_candidate(run, cfg) then
-      out[#out + 1] = { value = run, start = s, stop = e, entropy = _entropy(run) }
-    end
+    if _is_candidate(run, cfg) then add(s, e) end
     pos = e + 1
+  end
+  -- 具名规则：补充结构化敏感信息（私钥块/带前缀 token 等熵检测盲区）；与熵检测重叠时去重。
+  for _, rule in ipairs(cfg.rules or {}) do
+    if type(rule.pattern) == "string" then
+      local s, e = text:find(rule.pattern)
+      while s do
+        add(s, e, rule.name)
+        s, e = text:find(rule.pattern, e + 1)
+      end
+    end
   end
   return out
 end
 
---- 把文本中的密钥替换为随机 token（进沙箱加密）
+--- 把文本中的密钥/敏感信息替换为随机 token（进沙箱加密）
 --- @param text string
 --- @return string tokenized
 --- @return table tokens 本次用到的 token 数组
@@ -198,6 +355,11 @@ function M.tokenize(text)
   if not M.enabled() or type(text) ~= "string" or text == "" then return text, {} end
   local cfg = _cfg()
   local used = {}
+  -- 先应用具名敏感信息规则（结构化凭据优先，整段替换）
+  text = _apply_rules(text, cfg, used)
+  -- 再按变量名强制 token 化赋值中的敏感值（覆盖纯 hex / 含点号多段密钥等熵检测盲区）
+  text = _apply_secret_names(text, used)
+  -- 再对残余高熵串做熵检测替换
   local out = text:gsub(RUN_PAT, function(run)
     if _is_candidate(run, cfg) then
       local token = _token_for(run)
@@ -230,6 +392,33 @@ end
 --- @return boolean
 function M.has_token(text)
   return type(text) == "string" and text:find(TOKEN_PAT) ~= nil
+end
+
+-- AI 读取到 KEY（结果被 token 化）时追加的说明：token 仅对 AI 不可见，真实密钥在
+-- 网络发送 / 写入文件时自动还原，不改变程序语义。避免 AI 误以为拿到的是真实密钥或
+-- 误判密钥无效。
+local READ_HINT = "提示：结果中的 NEOKEY_* 为沙箱密钥 token——仅对 AI 不可见；"
+  .. "网络发送、写入文件时会自动替换回原有真实密钥，不影响程序执行。"
+
+--- AI 读取到 KEY 时的提示文本
+--- @return string
+function M.read_hint()
+  return READ_HINT
+end
+
+--- 值（字符串或表内字符串字段）是否含 token
+--- @param value any
+--- @return boolean
+function M.contains_token(value)
+  local t = type(value)
+  if t == "string" then return M.has_token(value) end
+  if t == "table" then
+    for k, v in pairs(value) do
+      if M.contains_token(v) then return true end
+      if type(k) == "string" and M.has_token(k) then return true end
+    end
+  end
+  return false
 end
 
 --- 文本是否含映射表中已知的**原始密钥**
@@ -286,22 +475,41 @@ end
 --- 生成沙箱进程环境覆盖：把高熵环境变量值替换为 token（命令拿到 token，非真实密钥）。
 --- 变量名命中敏感词段（KEY/TOKEN/SECRET/PASSWORD/CREDENTIAL）时**无视熵阈值**强制 token 化，
 --- 避免纯 hex 密钥（如 GLM_API_KEY）逃过熵检测而原样注入沙箱。
---- @return table var -> tokenized_value
+--- 只要发生 token 化，就注入 `NEOAI_TOKENIZED_ENV=<变量名列表>` 信号，使沙箱内
+--- 能明确区分「沙箱 token」与真实密钥（避免把 token 当真实凭据而误判 401）。
+--- 配置 `tools.sandbox.secrets.tokenize_env=false` 可整体关闭环境变量 token 化。
+--- @return table var -> tokenized_value（另含 NEOAI_TOKENIZED_ENV 信号）
 function M.sanitized_env()
   local overrides = {}
   if not M.enabled() then return overrides end
+  if _cfg().tokenize_env == false then return overrides end
   local env = vim.fn.environ() or {}
+  local names = {}
   for k, v in pairs(env) do
     if type(v) == "string" and #v > 0 then
       if _secret_name(k) then
         overrides[k] = _token_for(v)
+        names[#names + 1] = k
       else
         local nv = M.tokenize(v)
-        if nv ~= v then overrides[k] = nv end
+        if nv ~= v then
+          overrides[k] = nv
+          names[#names + 1] = k
+        end
       end
     end
   end
+  if #names > 0 then
+    table.sort(names)
+    overrides[ENV_MARKER] = table.concat(names, ",")
+  end
   return overrides
+end
+
+--- 沙箱内用于标识「哪些环境变量已被 token 化」的变量名
+--- @return string
+function M.env_marker_name()
+  return ENV_MARKER
 end
 
 --- 对工具结果做 token 化（字符串或表内字符串字段）

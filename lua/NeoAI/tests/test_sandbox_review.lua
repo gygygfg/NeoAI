@@ -169,4 +169,79 @@ tests.suite("sandbox_review", function(_, it)
     sr.close()
     services.provide("services.sandbox", saved)
   end)
+
+  it("build_lines 显示高危/中危/低危风险档", function(t)
+    local sr = require("NeoAI.ui.components.sandbox_review")
+    local cwd = vim.fn.getcwd()
+    local data = sr.build_lines({
+      { change_set_id = "r0", tool = "edit_file", risk_level = 0, risk_reasons = { "WORKSPACE" },
+        files = { { path = cwd .. "/a.lua" } } },
+      { change_set_id = "r1", tool = "run_command", risk_level = 1, risk_reasons = { "NETWORK_ACCESS" },
+        files = { { path = cwd .. "/b.lua" } } },
+      { change_set_id = "r2", tool = "run_command", risk_level = 2, risk_reasons = { "SYSTEM_PATH_WRITE" },
+        files = { { path = "/etc/x.conf" } } },
+    })
+    local text = table.concat(data.lines, "\n")
+    t.matches("低危", text, "应显示低危")
+    t.matches("中危", text, "应显示中危")
+    t.matches("高危", text, "应显示高危")
+  end)
+
+  it("按 i 临时关闭审批窗并打开修改 diff，关闭 diff 后恢复", function(t)
+    local services = require("NeoAI.kernel.services")
+    local sr = require("NeoAI.ui.components.sandbox_review")
+    sr.reset()
+    local saved = services.use("services.sandbox")
+    local cwd = vim.fn.getcwd()
+    local path = cwd .. "/preview.txt"
+    local fs = require("NeoAI.utils.fs")
+    fs.write_file(path, "old line\nkeep\n")
+    services.provide("services.sandbox", {
+      list_reviews = function()
+        return {
+          {
+            change_set_id = "csP", tool = "edit_file", risk_level = 2,
+            files = { { path = path, action = "modify", content = "new line\nkeep\n" } },
+          },
+        }
+      end,
+      apply = function() return { ok = true } end,
+      reject = function() end,
+      reject_file = function() end,
+    })
+
+    sr.open()
+    local buf = sr.get_buf()
+    t.not_nil(buf, "应创建审批 buffer")
+    local file_line
+    for ln, target in pairs(sr.get_line_map()) do
+      if target.path == path then file_line = ln end
+    end
+    t.not_nil(file_line, "应找到文件行")
+    vim.api.nvim_win_set_cursor(0, { file_line, 0 })
+
+    -- 存在 i 键位
+    local has_i = false
+    for _, m in ipairs(vim.api.nvim_buf_get_keymap(buf, "n")) do
+      if m.lhs == "i" then has_i = true end
+    end
+    t.true_(has_i, "审批窗应注册 i 预览键")
+
+    sr.preview_current()
+    t.nil_(sr.get_buf(), "打开 diff 时审批窗应暂时关闭")
+    local dbuf = sr.get_diff_buf()
+    t.not_nil(dbuf, "应打开 diff buffer")
+    local dtext = table.concat(vim.api.nvim_buf_get_lines(dbuf, 0, -1, false), "\n")
+    t.matches("new line", dtext, "diff 应包含新增内容")
+    t.matches("old line", dtext, "diff 应包含删除内容")
+
+    sr.close_diff()
+    t.nil_(sr.get_diff_buf(), "diff 应已关闭")
+    t.not_nil(sr.get_buf(), "关闭 diff 后应恢复审批窗")
+    t.eq(file_line, vim.api.nvim_win_get_cursor(0)[1], "应恢复光标到原条目行")
+
+    sr.close()
+    fs.delete_file(path)
+    services.provide("services.sandbox", saved)
+  end)
 end)

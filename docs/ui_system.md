@@ -78,8 +78,10 @@
 ### 4.4 折叠
 
 主窗口用 `expr` 折叠（`components.fold.foldexpr`），推理 / 每个工具调用块（调用+结果）各自独立成折叠。
-折叠占位文本由 `components.fold` 统一提供。工具执行期间每秒重渲染一次（`TOOL_TICK_MS=1000`），
-让折叠文本中的耗时实时跳动。
+折叠占位文本由 `components.fold` 统一提供。**只有被渲染层显式登记为推理块的折叠才显示
+「🤔 思考过程 N 行」**（`message_list` 写入 buffer 后登记推理块起始行），工具块显示 `🔧 工具名`，
+其余未识别折叠显示中性占位（`📄 首行预览 (N 行)`），避免「所有折叠都渲染成思考过程」。
+工具执行期间每秒重渲染一次（`TOOL_TICK_MS=1000`），让折叠文本中的耗时实时跳动。
 
 ### 4.5 推理与工具参数悬浮窗
 
@@ -147,8 +149,8 @@
 | `tool_approval` | 工具审批弹窗。`init()`；串行单槽位展示。 |
 | `ask_user` | 向用户提问弹窗。`init()`；经 `ask_user.set_ui` 注入。 |
 | `sub_agent_dock` | 子 Agent 状态监控。`init()`。 |
-| `sandbox_review` | 沙箱待审审批界面。`open()`；按路径级别高亮（工作区绿/用户目录黄/系统红），「待审」标签黄色；审批单位为单个文件：`<CR>` 仅应用该文件、`d` 仅拒绝该文件（其余文件保留待审），头行仅作信息展示，`r` 刷新、`q` 关闭。 |
-| `fold` | 折叠（推理/工具调用/结果共用实现）。`foldexpr`/`foldtext`/`record_start`/`record_end`/`has_running`/`set_live_timer`/`set_foldexpr_override`/`set_foldtext_override`。 |
+| `sandbox_review` | 沙箱待审审批界面。`open()`；按路径级别高亮（工作区绿/用户目录黄/系统红）、按安全级别显示高危/中危/低危风险档与原因；审批单位为单个文件：`<CR>` 仅应用该文件、`d` 仅拒绝该文件（其余文件保留待审）、`i` 临时关闭审批窗并打开该条目的修改 diff 预览（关闭后自动返回并恢复光标），头行仅作信息展示，`r` 刷新、`q` 关闭。 |
+| `fold` | 折叠（推理/工具调用/结果共用实现）。`foldexpr`/`foldtext`/`record_start`/`record_end`/`has_running`/`set_live_timer`/`set_foldexpr_override`/`set_foldtext_override`/`set_reasoning_lines`/`is_reasoning_start`/`generic_label`。 |
 | `display_modes/` | 显示模式插件管理器 + `chat.lua`/`trajectory.lua`。 |
 | `markdown_view` | Markdown 渲染器。 |
 

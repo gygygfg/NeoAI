@@ -9,14 +9,36 @@ local M = {}
 
 -- ========== 私有函数 ==========
 
---- 运行 git 命令
+--- 为 argv 前置沙箱运行时前缀：git 在沙箱命名空间（与 run_command 同一 overlay）内执行，
+--- 磁盘读取看到的是暂存视图而非真实工作区。
+--- @param argv table
+--- @param ctx table|nil
+--- @return table
+local function _sandboxed_argv(argv, ctx)
+  local prefix = ctx and ctx.sandbox_prefix
+  if not (prefix and #prefix > 0) then return argv end
+  local full = {}
+  for _, v in ipairs(prefix) do full[#full + 1] = v end
+  for _, v in ipairs(argv) do full[#full + 1] = v end
+  return full
+end
+
+--- 运行 git 命令（沙箱命名空间内；无前缀时回退宿主）
 --- @param args table git 参数数组
+--- @param ctx table|nil 工具上下文（含 sandbox_prefix/cwd/env）
 --- @return Deferred resolve(输出)
-local function _git(args, opts)
-  opts = opts or {}
+local function _git(args, ctx)
   local d = async.Deferred.new()
   local out = {}
-  local job = vim.fn.jobstart({ "git", unpack(args) }, {
+  local env = {}
+  if ctx and type(ctx.sandbox_env) == "table" then
+    for k, v in pairs(ctx.sandbox_env) do env[k] = v end
+  end
+  -- 只读 git 命令不写 index（避免在 overlay upper 产生副作用）。
+  env.GIT_OPTIONAL_LOCKS = "0"
+  local job = vim.fn.jobstart(_sandboxed_argv({ "git", unpack(args) }, ctx), {
+    cwd = ctx and ctx.sandbox_cwd or nil,
+    env = env,
     stdout_buffered = true,
     stderr_buffered = true,
     on_stdout = function(_, data)
@@ -46,9 +68,9 @@ git_tools.git_status = helpers.define_tool(
     properties = { path = { type = "string" } },
     required = {},
   },
-  function(args, on_success, on_error)
-    _git({ "status", "--short" }):then_(function(r)
-      on_success(r.code == 0 and (r.output or "工作区干净") or r.output)
+  function(args, on_success, on_error, ctx)
+    _git({ "status", "--short" }, ctx):then_(function(r)
+      on_success(r.code == 0 and (r.output ~= "" and r.output or "工作区干净") or r.output)
     end, function(e) on_error(e.message) end)
   end,
   { category = "git" }
@@ -62,9 +84,9 @@ git_tools.git_diff = helpers.define_tool(
     properties = { filepath = { type = "string" } },
     required = {},
   },
-  function(args, on_success, on_error)
+  function(args, on_success, on_error, ctx)
     local cmd = args.filepath and { "diff", "--", args.filepath } or { "diff" }
-    _git(cmd):then_(function(r)
+    _git(cmd, ctx):then_(function(r)
       on_success(r.output ~= "" and r.output or "无改动")
     end, function(e) on_error(e.message) end)
   end,
@@ -79,10 +101,10 @@ git_tools.git_log = helpers.define_tool(
     properties = { max = { type = "integer" }, path = { type = "string" } },
     required = {},
   },
-  function(args, on_success, on_error)
+  function(args, on_success, on_error, ctx)
     local cmd = { "log", "--oneline", "-n", tostring(args.max or 20) }
     if args.path then cmd[#cmd + 1] = "--"; cmd[#cmd + 1] = args.path end
-    _git(cmd):then_(function(r)
+    _git(cmd, ctx):then_(function(r)
       on_success(r.output)
     end, function(e) on_error(e.message) end)
   end,
@@ -97,8 +119,8 @@ git_tools.git_commit_detail = helpers.define_tool(
     properties = { ref = { type = "string" } },
     required = { "ref" },
   },
-  function(args, on_success, on_error)
-    _git({ "show", "--stat", args.ref }):then_(function(r)
+  function(args, on_success, on_error, ctx)
+    _git({ "show", "--stat", args.ref }, ctx):then_(function(r)
       on_success(r.output)
     end, function(e) on_error(e.message) end)
   end,
@@ -113,8 +135,8 @@ git_tools.git_branch = helpers.define_tool(
     properties = {},
     required = {},
   },
-  function(args, on_success, on_error)
-    _git({ "branch", "-a" }):then_(function(r)
+  function(args, on_success, on_error, ctx)
+    _git({ "branch", "-a" }, ctx):then_(function(r)
       on_success(r.output)
     end, function(e) on_error(e.message) end)
   end,
@@ -129,8 +151,8 @@ git_tools.git_file_history = helpers.define_tool(
     properties = { filepath = { type = "string" }, max = { type = "integer" } },
     required = { "filepath" },
   },
-  function(args, on_success, on_error)
-    _git({ "log", "--oneline", "-n", tostring(args.max or 20), "--", args.filepath }):then_(function(r)
+  function(args, on_success, on_error, ctx)
+    _git({ "log", "--oneline", "-n", tostring(args.max or 20), "--", args.filepath }, ctx):then_(function(r)
       on_success(r.output)
     end, function(e) on_error(e.message) end)
   end,

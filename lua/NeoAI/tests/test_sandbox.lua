@@ -776,6 +776,58 @@ tests.suite("sandbox", function(_, it)
     t.true_(out:find("BOOT_IMAGE", 1, true) == nil, "不应泄露宿主内核命令行")
   end)
 
+  it("加固：强制遮蔽危险全局 sysctl（core_pattern/modprobe），用户不可移除", function(t)
+    local runtime = require("NeoAI.sandbox.runtime")
+    local masks = runtime.mandatory_proc_masks()
+    t.true_(vim.tbl_contains(masks, "/proc/sys/kernel/core_pattern"), "应含 core_pattern")
+    t.true_(vim.tbl_contains(masks, "/proc/sys/kernel/modprobe"), "应含 modprobe")
+    t.true_(vim.tbl_contains(masks, "/proc/sysrq-trigger"), "应含 sysrq-trigger")
+    t.true_(vim.tbl_contains(masks, "/proc/kcore"), "应含 kcore")
+    t.true_(vim.tbl_contains(masks, "/proc/vmallocinfo"), "应含 vmallocinfo")
+    t.true_(vim.tbl_contains(masks, "/proc/keys"), "应含 keys")
+    -- 用户把 hide_proc_paths 设为空表，强制项仍在
+    with_config({ tools = { sandbox = { hide_proc_paths = {} } } }, function()
+      local paths = runtime.proc_mask_paths()
+      t.true_(vim.tbl_contains(paths, "/proc/sys/kernel/core_pattern"), "空配置下仍应含 core_pattern")
+      t.true_(vim.tbl_contains(paths, "/proc/sys/kernel/modprobe"), "空配置下仍应含 modprobe")
+      local joined = table.concat(runtime.append_hidden_proc({}), " ")
+      t.true_(joined:find("/proc/sys/kernel/core_pattern", 1, true) ~= nil, "argv 应遮蔽 core_pattern")
+      t.true_(joined:find("/proc/sys/kernel/modprobe", 1, true) ~= nil, "argv 应遮蔽 modprobe")
+    end)
+    -- 整个 /proc/sys 只读绑定应出现在 bwrap 前缀中
+    if runtime.backend() == "bwrap" then
+      local pre = table.concat(runtime.process_prefix({ cwd = "/tmp" }), " ")
+      t.true_(pre:find("--ro-bind /proc/sys /proc/sys", 1, true) ~= nil, "前缀应只读绑定 /proc/sys")
+    end
+  end)
+
+  it("加固：沙箱内无法写 core_pattern（只读遮蔽 → EROFS）", function(t)
+    local runtime = require("NeoAI.sandbox.runtime")
+    if runtime.backend() ~= "bwrap" then return end
+    local prefix = runtime.process_prefix({ cwd = "/tmp" })
+    t.not_nil(prefix, "应能构造前缀")
+    local cmd = {}
+    for _, v in ipairs(prefix) do cmd[#cmd + 1] = v end
+    -- `: > file` 只做 open(O_WRONLY) 不写内容：可写则无副作用，只读则 EROFS。
+    -- 放进子 shell 重定向，避免 dash 因重定向失败而终止整条命令。
+    for _, v in ipairs({ "/bin/sh", "-c",
+      "if ( : > /proc/sys/kernel/core_pattern ) 2>/dev/null; then echo WRITABLE; else echo READONLY; fi; "
+      .. "if ( : > /proc/sys/kernel/modprobe ) 2>/dev/null; then echo WRITABLE; else echo READONLY; fi; "
+      .. "if ( : > /proc/sys/kernel/randomize_va_space ) 2>/dev/null; then echo WRITABLE; else echo READONLY; fi; "
+      .. "if ( : > /proc/sys/net/ipv4/ip_forward ) 2>/dev/null; then echo WRITABLE; else echo READONLY; fi; "
+      .. "if ( : > /proc/sys/vm/swappiness ) 2>/dev/null; then echo WRITABLE; else echo READONLY; fi",
+    }) do cmd[#cmd + 1] = v end
+    local out = vim.fn.system(cmd)
+    t.true_(out:find("WRITABLE", 1, true) == nil, "全局 sysctl 不应可写，实际: " .. tostring(out))
+    t.true_(out:find("READONLY", 1, true) ~= nil, "应为只读（EROFS），实际: " .. tostring(out))
+    -- 只读绑定不应破坏读取
+    local cmd2 = {}
+    for _, v in ipairs(prefix) do cmd2[#cmd2 + 1] = v end
+    for _, v in ipairs({ "/bin/sh", "-c", "cat /proc/sys/kernel/randomize_va_space" }) do cmd2[#cmd2 + 1] = v end
+    local out2 = vim.fn.system(cmd2)
+    t.matches("%d", out2, "只读后仍应能读取 sysctl，实际: " .. tostring(out2))
+  end)
+
   it("加固：/etc/resolv.conf 净化暴露（剥离 search/domain）", function(t)
     local runtime = require("NeoAI.sandbox.runtime")
     if runtime.backend() ~= "bwrap" then return end
@@ -938,6 +990,116 @@ tests.suite("sandbox", function(_, it)
     vim.fn.delete(home, "rf")
   end)
 
+  it("加固：进程内工具硬拦截宿主敏感遮蔽路径（mask_paths）", function(t)
+    local runtime = require("NeoAI.sandbox.runtime")
+    local fs = require("NeoAI.utils.fs")
+    local dir = vim.fn.tempname()
+    fs.ensure_dir(dir)
+    local file = dir .. "/secret.env"
+    fs.write_file(file, "TOPSECRET")
+    with_config({ tools = { sandbox = { mask_paths = { file, dir } } } }, function()
+      -- 查询 API：目录/文件/后代命中，普通路径不命中
+      t.eq(dir, runtime.is_masked_path(dir), "目录本身应命中")
+      t.eq(dir, runtime.is_masked_path(dir .. "/sub/x"), "目录后代应命中")
+      t.eq(file, runtime.is_masked_path(file), "文件本身应命中")
+      t.nil_(runtime.is_masked_path("/tmp/neoai_not_masked"), "普通路径不应命中")
+      -- 进程内 read_file 命中即硬拒绝（即便有审批界面也不放行）
+      local stub = { approve_and_execute = function(_, _, _, cont) return cont() end }
+      local done, err = false, nil
+      require("NeoAI.tools").execute("read_file", { filepath = file, description = "t" }, { tool_service = stub })
+        :then_(function(r)
+          err = "OK:" .. tostring(r)
+          done = true
+        end, function(e)
+          err = "ERR:" .. tostring(e and e.message or e)
+          done = true
+        end)
+      t.true_(vim.wait(5000, function() return done end), "应快速返回")
+      t.matches("宿主敏感遮蔽路径", err or "", "应硬拒绝，实际: " .. tostring(err))
+    end)
+    vim.fn.delete(dir, "rf")
+  end)
+
+  it("加固：遮蔽路径解析符号链接与 /proc/<pid>/root，防进程内绕过", function(t)
+    local runtime = require("NeoAI.sandbox.runtime")
+    local fs = require("NeoAI.utils.fs")
+    local dir = vim.fn.tempname()
+    fs.ensure_dir(dir)
+    local file = dir .. "/secret.env"
+    fs.write_file(file, "TOPSECRET")
+    local link_dir = vim.fn.tempname()
+    fs.ensure_dir(link_dir)
+    local link = link_dir .. "/link.env"
+    vim.uv.fs_symlink(file, link)
+    -- 悬空符号链接：目标尚未创建，但指向被遮蔽目录（写入也会落到宿主敏感路径）
+    local dangling = link_dir .. "/dangling.env"
+    vim.uv.fs_symlink(dir .. "/new-secret.env", dangling)
+    with_config({ tools = { sandbox = { mask_paths = { file, dir } } } }, function()
+      t.eq(file, runtime.is_masked_path(file), "原路径应命中")
+      t.eq(file, runtime.is_masked_path(link), "符号链接应解析到遮蔽文件")
+      t.eq(dir, runtime.is_masked_path(dangling), "悬空符号链接应解析到遮蔽目录")
+      t.eq(file, runtime.is_masked_path("/proc/self/root" .. file), "/proc/<pid>/root 应解析到遮蔽文件")
+      t.eq(file, runtime.is_masked_path("/proc/1/root" .. file), "/proc/1/root 应解析到遮蔽文件")
+      -- 进程内 read_file 经符号链接/`/proc/self/root` 均应硬拒绝
+      local function must_reject(path)
+        local done, err = false, nil
+        require("NeoAI.tools").execute("read_file", { filepath = path, description = "t" }, {})
+          :then_(function(r)
+            err = "OK:" .. tostring(r)
+            done = true
+          end, function(e)
+            err = "ERR:" .. tostring(e and e.message or e)
+            done = true
+          end)
+        t.true_(vim.wait(5000, function() return done end), "应快速返回")
+        t.matches("宿主敏感遮蔽路径", err or "", "应硬拒绝: " .. tostring(path))
+      end
+      must_reject(link)
+      must_reject("/proc/self/root" .. file)
+      -- 非进程内 fs 工具（read_image，effect=network）的本地 file_path 也纳入遮蔽判定。
+      local done, err = false, nil
+      require("NeoAI.tools").execute("read_image", { file_path = file, description = "t" }, {})
+        :then_(function(r)
+          err = "OK:" .. tostring(r)
+          done = true
+        end, function(e)
+          err = "ERR:" .. tostring(e and e.message or e)
+          done = true
+        end)
+      t.true_(vim.wait(5000, function() return done end), "应快速返回")
+      t.matches("宿主敏感遮蔽路径", err or "", "read_image 应硬拒绝，实际: " .. tostring(err))
+    end)
+    vim.fn.delete(link_dir, "rf")
+    vim.fn.delete(dir, "rf")
+  end)
+
+  it("加固：mask_paths 硬命中优先于遮蔽目录软命中（非进程内 fs 工具不放行）", function(t)
+    local fs = require("NeoAI.utils.fs")
+    local home = "/root/neoai_mask_order_test"
+    local proj = home .. "/proj"
+    fs.ensure_dir(proj)
+    fs.ensure_dir(home .. "/other")
+    local secret = home .. "/other/secret.png"
+    fs.write_file(secret, "x")
+    local prev = vim.fn.getcwd()
+    vim.fn.chdir(proj)
+    with_config({ tools = { sandbox = { mask_dirs = { home }, mask_paths = { secret } } } }, function()
+      local done, err = false, nil
+      require("NeoAI.tools").execute("read_image", { file_path = secret, description = "t" }, {})
+        :then_(function(r)
+          err = "OK:" .. tostring(r)
+          done = true
+        end, function(e)
+          err = "ERR:" .. tostring(e and e.message or e)
+          done = true
+        end)
+      t.true_(vim.wait(5000, function() return done end), "应快速返回")
+      t.matches("宿主敏感遮蔽路径", err or "", "mask_paths 应优先硬拒绝，实际: " .. tostring(err))
+    end)
+    vim.fn.chdir(prev)
+    vim.fn.delete(home, "rf")
+  end)
+
   it("权限档位：命令分类与最高档校验", function(t)
     local privilege = require("NeoAI.sandbox.privilege")
     local spec = { effect = "process" }
@@ -959,13 +1121,13 @@ tests.suite("sandbox", function(_, it)
     end)
   end)
 
-  it("权限档位：T0 默认隔离网络，T1 放行", function(t)
+  it("权限档位：T0 默认放行网络（仅记录），offline 时硬隔离", function(t)
     local runtime = require("NeoAI.sandbox.runtime")
     local privilege = require("NeoAI.sandbox.privilege")
     if runtime.backend() ~= "bwrap" then return end
     local t0 = privilege.resolve(0, { tier = 0 })
     local pre0 = table.concat(runtime.process_prefix({ cwd = "/tmp", privileges = t0.privileges }), " ")
-    t.true_(pre0:find("--unshare-net", 1, true) ~= nil, "T0 应隔离网络")
+    t.true_(pre0:find("--unshare-net", 1, true) == nil, "T0 默认不应隔离网络（仅记录）")
     local t1 = privilege.resolve(1, { tier = 1, network = true })
     local pre1 = table.concat(runtime.process_prefix({ cwd = "/tmp", privileges = t1.privileges }), " ")
     t.true_(pre1:find("--unshare-net", 1, true) == nil, "T1 不应隔离网络")
@@ -973,6 +1135,11 @@ tests.suite("sandbox", function(_, it)
     local t2 = privilege.resolve(2, { tier = 2, network = true })
     local pre2 = table.concat(runtime.process_prefix({ cwd = "/tmp", privileges = t2.privileges }), " ")
     t.true_(pre2:find("--unshare-all", 1, true) ~= nil, "T2 应新建 user namespace")
+    -- offline=true 硬隔离，优先于档位
+    with_config({ tools = { sandbox = { offline = true } } }, function()
+      local preo = table.concat(runtime.process_prefix({ cwd = "/tmp", privileges = t0.privileges }), " ")
+      t.true_(preo:find("--unshare-net", 1, true) ~= nil, "offline=true 应隔离网络")
+    end)
   end)
 
   it("受控 docker：T1 挂载受控 socket 而非宿主 socket", function(t)
@@ -1281,6 +1448,135 @@ tests.suite("sandbox", function(_, it)
     secret.reset()
   end)
 
+  it("密钥防护：文本层按变量名强制脱敏（纯 hex / 含点号多段密钥）", function(t)
+    local secret = require("NeoAI.sandbox.secret")
+    secret.reset()
+    -- 复现日志泄露：GLM_API_KEY 值 = 纯小写 hex + `.` + 无数字段，熵检测会漏
+    -- （hex 段被 exclude_pure_hex 排除，另一段因无数字不满足候选条件）。
+    local raw = "dfe946fb66864c48927f31f2aa49164d.rwbWDAfnQjlHuMFt"
+    local line = "GLM_API_KEY=" .. raw
+    local out = secret.tokenize(line)
+    t.true_(not out:find(raw, 1, true), "按变量名应强制 token 化，实际: " .. out)
+    t.true_(not out:find("dfe946fb", 1, true), "纯 hex 段也不应泄露")
+    t.matches("NEOKEY_", out, "应回传 token")
+    local back, unresolved = secret.detokenize(out)
+    t.eq(line, back, "应可无损还原")
+    t.eq(0, unresolved, "应全部解析")
+    -- JSON 风格键值同样按名脱敏，且保留键结构
+    local j = secret.tokenize('{"PASSWORD": "hunter2"}')
+    t.true_(not j:find("hunter2", 1, true), "JSON 值应脱敏")
+    t.matches('"PASSWORD"', j, "应保留键结构")
+    t.eq('{"PASSWORD": "hunter2"}', (secret.detokenize(j)), "JSON 应无损还原")
+    -- 非敏感名 + 纯 hex 仍不误报（保持既有行为）
+    local sha = "sha=a1b2c3d4e5f60718293a4b5c6d7e8f9012345678"
+    t.eq(sha, (secret.tokenize(sha)), "非敏感名不应被 token 化")
+    secret.reset()
+  end)
+
+  it("密钥防护：环境变量 token 化注入可观测信号且可整体关闭", function(t)
+    local secret = require("NeoAI.sandbox.secret")
+    secret.reset()
+    local fake = "sk-Ab3xY9pQ2mNv7Kd4Lw8Zr1Tg6Hs5"
+    vim.env.NEOAI_TEST_API_KEY = fake
+    local ov = secret.sanitized_env()
+    t.true_(ov.NEOAI_TEST_API_KEY ~= nil, "应 token 化敏感变量")
+    t.true_(ov[secret.env_marker_name()] ~= nil, "应注入 token 化信号")
+    t.matches("NEOAI_TEST_API_KEY", ov[secret.env_marker_name()], "信号应列出被 token 化的变量名")
+
+    with_config({ tools = { sandbox = { secrets = { tokenize_env = false } } } }, function()
+      local ov2 = secret.sanitized_env()
+      t.eq(nil, ov2.NEOAI_TEST_API_KEY, "关闭后不应 token 化环境变量")
+      t.eq(nil, ov2[secret.env_marker_name()], "关闭后不应注入信号")
+    end)
+
+    vim.env.NEOAI_TEST_API_KEY = nil
+    secret.reset()
+  end)
+
+  it("密钥防护：AI 读取到 KEY 时结果附加 token 说明", function(t)
+    local secret = require("NeoAI.sandbox.secret")
+    local fs = require("NeoAI.utils.fs")
+    secret.reset()
+    local fake = "sk-Ab3xY9pQ2mNv7Kd4Lw8Zr1Tg6Hs5"
+    local path = vim.fn.tempname()
+    fs.write_file(path, "API_KEY=" .. fake .. "\n")
+    local done = false
+    require("NeoAI.tools").execute("read_file", { filepath = path, description = "t" }, {}):then_(function(r)
+      local s = tostring(r)
+      t.true_(s:find(fake, 1, true) == nil, "不应回传真实密钥")
+      t.matches("NEOKEY_", s, "应回传 token")
+      t.matches("仅对 AI 不可见", s, "应附加 token 说明")
+      t.matches("自动替换回原有", s, "说明应包含自动还原语义")
+      done = true
+    end, function(e)
+      t.true_(false, "read_file 失败: " .. tostring(e and e.message or e))
+      done = true
+    end)
+    t.true_(vim.wait(5000, function() return done end), "应完成")
+    vim.fn.delete(path)
+    secret.reset()
+  end)
+
+  it("运行时：expose_paths 在遮蔽之后只读暴露并前置到 PATH", function(t)
+    local runtime = require("NeoAI.sandbox.runtime")
+    if runtime.backend() ~= "bwrap" then return end
+    local fs = require("NeoAI.utils.fs")
+    local dir = vim.fn.tempname()
+    fs.ensure_dir(dir)
+    with_config({ tools = { sandbox = { expose_paths = { dir } } } }, function()
+      local prefix = runtime.process_prefix({ cwd = "/tmp" })
+      t.not_nil(prefix, "应能构造进程前缀")
+      local joined = table.concat(prefix, " ")
+      t.true_(joined:find("--ro-bind " .. dir .. " " .. dir, 1, true) ~= nil, "应只读绑定 expose 路径")
+      local env = runtime.sandbox_env(nil)
+      t.true_(tostring(env.PATH):find(dir, 1, true) ~= nil, "PATH 应包含 expose 目录")
+    end)
+    vim.fn.delete(dir, "rf")
+  end)
+
+  it("视图一致性：git 读工具在沙箱命名空间内看到暂存内容", function(t)
+    local fs = require("NeoAI.utils.fs")
+    local runtime = require("NeoAI.sandbox.runtime")
+    if runtime.backend() ~= "bwrap" or vim.fn.executable("git") ~= 1 then return end
+    local root = vim.fn.tempname()
+    fs.ensure_dir(root)
+    vim.fn.system({ "git", "-C", root, "init", "-q" })
+    vim.fn.system({ "git", "-C", root, "config", "user.email", "t@t" })
+    vim.fn.system({ "git", "-C", root, "config", "user.name", "t" })
+    fs.write_file(root .. "/a.txt", "base\n")
+    vim.fn.system({ "git", "-C", root, "add", "a.txt" })
+    vim.fn.system({ "git", "-C", root, "commit", "-qm", "init" })
+    local prev = vim.fn.getcwd()
+    vim.fn.chdir(root)
+    local sandbox = require("NeoAI.sandbox")
+    with_config({ tools = { approval = { mode = "async" }, sandbox = { mode = "dry_run", review = { enabled = true } } } }, function()
+      sandbox.reset()
+      local done = false
+      -- 暂存一次修改：真实磁盘仍为 base
+      require("NeoAI.tools").execute("edit_file", {
+        filepath = root .. "/a.txt", mode = "write", content = "changed\n", description = "t",
+      }, {}):then_(function()
+        return require("NeoAI.tools").execute("git_diff", { description = "t" }, {})
+      end):then_(function(diff)
+        t.matches("+changed", tostring(diff), "git_diff 应显示暂存后的内容")
+        t.true_(tostring(diff):find("+base", 1, true) == nil, "git_diff 不应以真实磁盘为准")
+        return require("NeoAI.tools").execute("git_status", { description = "t" }, {})
+      end):then_(function(st)
+        t.matches("a.txt", tostring(st), "git_status 应显示暂存修改的文件")
+        t.true_(fs.exists(root .. "/a.txt"), "真实文件仍应存在")
+        t.eq("base\n", fs.read_file(root .. "/a.txt"), "真实文件不应被改动")
+        done = true
+      end, function(e)
+        t.true_(false, "git 沙箱执行失败: " .. tostring(e and e.message or e))
+        done = true
+      end)
+      t.true_(vim.wait(20000, function() return done end), "git 工具应完成")
+    end)
+    vim.fn.chdir(prev)
+    vim.fn.delete(root, "rf")
+    runtime.reset()
+  end)
+
   it("运行时：overlay 不可用时降级为私有可写 cwd 且命令仍可执行", function(t)
     local fs = require("NeoAI.utils.fs")
     local runtime = require("NeoAI.sandbox.runtime")
@@ -1299,6 +1595,7 @@ tests.suite("sandbox", function(_, it)
       local done = false
       require("NeoAI.tools").execute("run_command", { command = "ls", description = "t" }, {}):then_(function(r)
         t.true_(not tostring(r):find("real.txt", 1, true), "降级 cwd 应为私有目录，不暴露真实项目文件")
+        t.matches("降级模式", tostring(r), "降级视图应在结果中标注提示")
         t.true_(fs.exists(dir .. "/real.txt"), "真实文件不应被改动")
         done = true
       end, function(e)
@@ -2067,6 +2364,86 @@ tests.suite("sandbox", function(_, it)
         done = true
       end, function(e) t.true_(false, tostring(e and e.message or e)); done = true end)
       t.true_(vim.wait(8000, function() return done end), "seccomp 模式检查应完成")
+    end)
+  end)
+
+  it("seccomp：clone 带命名空间标志被拒绝、clone3 返回 ENOSYS", function(t)
+    local runtime = require("NeoAI.sandbox.runtime")
+    if runtime.backend() ~= "bwrap" or vim.fn.executable("python3") ~= 1 then return end
+    local sandbox = require("NeoAI.sandbox")
+    with_config({ tools = { approval = { mode = "async" }, sandbox = { mode = "dry_run", seccomp = { enabled = true } } } }, function()
+      sandbox.reset()
+      require("NeoAI.sandbox.seccomp").reset()
+      local py = table.concat({
+        "import ctypes,os",
+        "libc=ctypes.CDLL('libc.so.6',use_errno=True)",
+        "ctypes.set_errno(0); libc.syscall(56,0x10000000|17,0,0,0,0); print('CLONE_NEWUSER',ctypes.get_errno())",
+        "ctypes.set_errno(0); libc.syscall(435,0,0); print('CLONE3',ctypes.get_errno())",
+      }, "\n")
+      local cmd = "python3 - <<'PY'\n" .. py .. "\nPY"
+      local done = false
+      require("NeoAI.tools").execute("run_command", { command = cmd, description = "t" }, {}):then_(function(r)
+        local s = tostring(r)
+        t.matches("CLONE_NEWUSER 1", s, "clone(CLONE_NEWUSER) 应 EPERM，实际: " .. s)
+        t.matches("CLONE3 38", s, "clone3 应 ENOSYS，实际: " .. s)
+        done = true
+      end, function(e) t.true_(false, tostring(e and e.message or e)); done = true end)
+      t.true_(vim.wait(20000, function() return done end), "clone 过滤测试应完成")
+    end)
+  end)
+
+  it("seccomp：socket 地址族白名单（AF_VSOCK 等被拒绝，AF_INET 放行）", function(t)
+    local runtime = require("NeoAI.sandbox.runtime")
+    if runtime.backend() ~= "bwrap" or vim.fn.executable("python3") ~= 1 then return end
+    local sandbox = require("NeoAI.sandbox")
+    with_config({ tools = { approval = { mode = "async" }, sandbox = { mode = "dry_run", seccomp = { enabled = true } } } }, function()
+      sandbox.reset()
+      require("NeoAI.sandbox.seccomp").reset()
+      local py = table.concat({
+        "import socket",
+        "def t(fam,name):",
+        "    try:",
+        "        s=socket.socket(fam,socket.SOCK_STREAM); s.close(); print(name,'OK')",
+        "    except OSError as e: print(name,e.errno)",
+        "t(40,'VSOCK')",
+        "t(38,'ALG')",
+        "t(2,'INET')",
+      }, "\n")
+      local cmd = "python3 - <<'PY'\n" .. py .. "\nPY"
+      local done = false
+      require("NeoAI.tools").execute("run_command", { command = cmd, description = "t" }, {}):then_(function(r)
+        local s = tostring(r)
+        t.matches("VSOCK 1", s, "AF_VSOCK 应 EPERM，实际: " .. s)
+        t.matches("ALG 1", s, "AF_ALG 应 EPERM，实际: " .. s)
+        t.matches("INET OK", s, "AF_INET 应放行，实际: " .. s)
+        done = true
+      end, function(e) t.true_(false, tostring(e and e.message or e)); done = true end)
+      t.true_(vim.wait(20000, function() return done end), "socket 白名单测试应完成")
+    end)
+  end)
+
+  it("加固：read_file 读 /proc 经 conceal 脱敏（不泄露 overlay 真实路径）", function(t)
+    local runtime = require("NeoAI.sandbox.runtime")
+    if runtime.backend() ~= "bwrap" then return end
+    local sandbox = require("NeoAI.sandbox")
+    local store = require("NeoAI.sandbox.store")
+    with_config({ tools = { approval = { mode = "async" }, sandbox = { mode = "dry_run" } } }, function()
+      sandbox.reset()
+      local done = false
+      require("NeoAI.tools").execute("read_file",
+        { filepath = "/proc/self/mountinfo", description = "t" }, {}):then_(function(r)
+        local s = tostring(r)
+        t.true_(not s:find("/.cache-", 1, true), "不应泄露 overlay 私有基目录，实际: " .. s)
+        if store.root() and store.root() ~= "" then
+          t.true_(not s:find(store.root(), 1, true), "不应泄露沙箱存储根")
+        end
+        -- 若存在 lowerdir 行，其路径必须已被替换为 hidden
+        if s:find("lowerdir=", 1, true) then
+          t.matches("lowerdir=hidden", s, "lowerdir 路径应脱敏")
+        end
+        done = true
+      end, function(e) t.true_(false, tostring(e and e.message or e)); done = true end)
+      t.true_(vim.wait(15000, function() return done end), "read_file /proc 测试应完成")
     end)
   end)
 

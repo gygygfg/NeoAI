@@ -16,7 +16,7 @@ local COMMANDS = {
   "NeoAISandboxReview", "NeoAISandboxApprove", "NeoAISandboxReject",
   "NeoAISandboxApply", "NeoAISandboxApplyAll",
   "NeoAISandboxGrant", "NeoAISandboxRevoke", "NeoAISandboxPrune", "NeoAISandboxMetrics",
-  "NeoAISandboxPublish", "NeoAISandboxReplay",
+  "NeoAISandboxPublish", "NeoAISandboxReplay", "NeoAISandboxAudit", "NeoAISandboxAutoApprove",
 }
 
 -- ========== 私有函数 ==========
@@ -252,6 +252,11 @@ function M.start()
     parts[#parts + 1] = "privilege=" .. tostring(pcfg.enabled ~= false)
     parts[#parts + 1] = "max_tier=" .. tostring(pcfg.max_tier or 0)
     parts[#parts + 1] = "docker=" .. tostring(dcfg.mode or "?") .. "(" .. dstat .. ")"
+    -- overlay 可用性诊断：不可用时给出原因（便于排查降级模式）
+    local runtime = require("NeoAI.sandbox.runtime")
+    local diag = runtime.overlay_diagnosis(vim.fn.getcwd())
+    parts[#parts + 1] = "overlay=" .. (diag.available and "ready"
+      or ("unavailable(" .. tostring(diag.reason) .. ")"))
     vim.notify("[NeoAI] 沙箱能力: " .. table.concat(parts, " "), vim.log.levels.INFO)
   end, { desc = "显示沙箱运行时能力探测结果" })
 
@@ -371,6 +376,29 @@ function M.start()
     vim.notify(("[NeoAI] 沙箱指标：候选=%d 待审=%d 已应用=%d 已拒绝=%d 冲突=%d")
       :format(m.candidates, m.pending, m.applied, m.rejected, m.conflicts), vim.log.levels.INFO)
   end, { desc = "显示沙箱运行指标" })
+
+  --- 行为审计与风险评估（监视 AI 的读取/调用行为）
+  _cmd("NeoAISandboxAudit", function()
+    local ok, audit = pcall(require, "NeoAI.sandbox.audit")
+    if not ok then return end
+    vim.notify("[NeoAI] " .. audit.summary(), vim.log.levels.INFO)
+  end, { desc = "显示沙箱行为审计与风险评估摘要" })
+
+  --- 会话级自动审批（默认关闭）：开启后 L0/L1 风险自动应用，包/密钥仍需确认
+  _cmd("NeoAISandboxAutoApprove", function(opts)
+    local review = require("NeoAI.sandbox.review")
+    local arg = (opts.args or ""):match("%S+")
+    if arg == "on" or arg == "true" then
+      review.set_session_auto(true)
+    elseif arg == "off" or arg == "false" then
+      review.set_session_auto(false)
+    elseif arg ~= nil and arg ~= "status" then
+      vim.notify("[NeoAI] 用法: :NeoAISandboxAutoApprove [on|off|status]", vim.log.levels.WARN)
+      return
+    end
+    local state = review.session_auto() and "开启" or "关闭"
+    vim.notify(("[NeoAI] 新会话自动审批：%s（L2+ 与包/密钥仍会进入待审）"):format(state), vim.log.levels.INFO)
+  end, { nargs = "?", desc = "设置 AI 新会话自动审批（默认关闭）" })
 
   _cmd("NeoAISandboxPublish", function(opts)
     local sandbox = _svc("services.sandbox")

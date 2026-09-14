@@ -120,7 +120,24 @@ end)
 | `test_plugins` | 插件协议：依赖等待、替换、禁用、失败回滚、实际消息请求、重复启动、工具/提示段释放、热重载 |
 | `test_sandbox` | 工具沙箱：加载器附加规格、fail-closed、状态机/幂等/fencing、策略聚合与受限规则、dry-run 不落盘、CAS 发布与冲突、buffer 写盘重定向、运行时能力探测与隔离进程、异步审批入队/应用/拒绝、选择性应用、run_command overlay 候选捕获、影响模型、证据脱敏分页、任务授权自动应用/范围、约束聚合、裁决信封、保留期与指标、受控网络网关、broker 幂等与对账、依赖图闭包、组合发布与路径冲突、策略回放、证据保留期、cgroup 资源域与 PID 上限、seccomp 基线施加与门禁、内容寻址缓存、故障注入（发布/后端/冻结）、性能基准、revision 派生 |
 
-### 5.1 插件测试约定
+### 5.1 沙箱逃逸/信息泄露审计（`scripts/sandbox_audit.lua`）
+
+在真实沙箱内跑一组攻击探测（写入危险全局 sysctl、读宿主凭据/socket、magic sysrq、
+`mount`/`unshare`/`nsenter`、`/proc/net` 与 `ip` 信息泄露、裸 TCP vs 代理拦截等），输出
+结构化报告供人工确认：
+
+```bash
+nvim --headless --clean -u NONE --cmd "set rtp+=$PWD" -c "luafile scripts/sandbox_audit.lua"
+```
+
+判读：所有 `write_*` 应为 `READONLY`；`socket AF_VSOCK`/`AF_PACKET`/`AF_ALG` 应为 `EPERM`、
+`clone_NEWUSER` 应 `EPERM`、`clone3` 应 `ENOSYS`、`sysctl(2)` 应 `ENOSYS`；
+`raw_tcp_host=RAW_REACHED`、`proc_net_*`/`ip_*`/`host_info_leaks` 非零为**已知残余边界**
+（共享 netns/全局 procfs 固有，见 [sandbox.md](sandbox.md) §6.1）。回归由 `test_sandbox` 的
+「强制遮蔽危险全局 sysctl」「沙箱内无法写 core_pattern」「clone 命名空间过滤」「socket 地址族
+白名单」「read_file /proc 脱敏」「遮蔽路径符号链接/`/proc/<pid>/root` 解析」用例守护。
+
+### 5.2 插件测试约定
 
 - 使用唯一插件 id 与服务名，测试结束 `unregister` / `revoke`，避免污染已启动的内置插件；
 - 需要改配置的用例保存并恢复 `config_store.get_all()`；

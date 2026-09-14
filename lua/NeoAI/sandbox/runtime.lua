@@ -95,14 +95,105 @@ local DEFAULT_READONLY_PATHS = {
 -- 每会话私有临时根（tmpfs 语义）：这些根始终以「会话私有目录（mode 1777）」绑定，
 -- 绝不作为 overlay 的只读 lower 暴露宿主真实内容（否则会泄露 /tmp 跨会话残留与宿主数据）。
 -- 退出/轮换会话即随进程目录销毁；可用 `tools.sandbox.tmpfs_roots` 覆盖。
+-- 私有目录位置由 `tools.sandbox.tmp_private_base` 决定：
+--   host（默认）= 建在宿主根之下的隐藏临时子目录（如 /tmp/.cache-<tag>/<session>），
+--                  命名空间映射回该根，AI 只见自己的私有子目录（隔离 AI）；
+--   session     = 建在会话进程目录下（/dev/shm 等），保持旧行为。
 local DEFAULT_TMPFS_ROOTS = { "/tmp", "/var/tmp" }
 
 -- 默认隐藏的 /proc 泄露项：这些文件在 procfs 中全局可见（不随 pid namespace 隔离），
 -- 会泄露宿主内核命令行（root=UUID、crashkernel）与内核版本。以空文件只读覆盖，
--- 读取得到空内容。可用 `tools.sandbox.hide_proc_paths` 覆盖。
+-- 读取得到空内容。可用 `tools.sandbox.hide_proc_paths` 覆盖（只增不减）。
 local DEFAULT_HIDE_PROC = { "/proc/cmdline", "/proc/version" }
 
+-- 强制遮蔽的危险全局 sysctl（常驻，不可被用户配置移除）。这些条目**非命名空间**，
+-- 且写权限按 `test_perm` 的 DAC 判定（euid == 全局 root uid）放行——`--cap-drop ALL`
+-- 并不能阻止写。沙箱以 root 运行且不建 userns 时 euid 即全局 root，故 core_pattern/
+-- modprobe 可被写入，构成 coredump/modprobe 提权原语（宿主全局状态被改）。
+-- 以空文件只读覆盖后：读为空、写返回 EROFS，从根上封死。
+local MANDATORY_PROC_MASKS = {
+  "/proc/sys/kernel/core_pattern",
+  "/proc/sys/kernel/modprobe",
+  "/proc/sys/kernel/hotplug",
+  "/proc/sys/kernel/uevent_helper",
+  "/proc/sys/kernel/kexec_load_disabled",
+  "/proc/sys/kernel/sysrq",
+  "/proc/sys/kernel/panic",
+  "/proc/sys/kernel/panic_on_oops",
+  "/proc/sys/kernel/perf_event_paranoid",
+  "/proc/sys/kernel/unprivileged_bpf_disabled",
+  "/proc/sys/kernel/unprivileged_userns_clone",
+  "/proc/sys/vm/drop_caches",
+  "/proc/sys/vm/compact_memory",
+  -- 非 /proc/sys 下的危险/信息泄露 proc 文件：magic sysrq 触发口、内核内存读口、
+  -- 已加载模块清单、内核符号表（地址已被 kptr_restrict 遮蔽，整表一并隐藏）。
+  "/proc/sysrq-trigger",
+  "/proc/kcore",
+  "/proc/modules",
+  "/proc/kallsyms",
+  -- 内核信息泄露面（审计实测可读）：/proc/vmallocinfo 暴露内核虚拟地址（绕过 kptr_restrict），
+  -- 另有调度/内存/中断/密钥等元信息。统一以空文件只读覆盖。
+  "/proc/vmallocinfo",
+  "/proc/timer_list",
+  "/proc/slabinfo",
+  "/proc/interrupts",
+  "/proc/softirqs",
+  "/proc/buddyinfo",
+  "/proc/zoneinfo",
+  "/proc/pagetypeinfo",
+  "/proc/keys",
+  "/proc/sched_debug",
+  "/proc/iomem",
+  "/proc/ioports",
+}
+
 -- ========== 私有函数 ==========
+
+-- 关闭除 0/1/2 外所有继承 fd 的 shell 片段（bash）。沙箱载荷不得继承宿主的目录 fd
+-- （如 AppImage 挂载点 /tmp/.mount_* 的 fd），否则可用 openat(dir_fd, "..") 逐级
+-- 上溯逃逸出 chroot/命名空间。注意：dash 只支持个位数 fd 重定向（无法关闭 fd 1023），
+-- 故优先用 bash；无 bash 时用 python3 的 closerange；再退回 sh（仅个位 fd，尽力而为）。
+local BASH_FD_CLOSE = "for _f in /proc/self/fd/*; do _n=${_f##*/}; "
+  .. "if [ \"$_n\" -gt 2 ] 2>/dev/null; then eval \"exec $_n>&-\" 2>/dev/null; fi; done"
+local PY_FD_CLOSE = "import os,sys; os.closerange(3, 65536); os.execvp(sys.argv[1], sys.argv[1:])"
+local PY_FD_CLOSE_SECCOMP = "import os,sys; os.closerange(3, 65536); "
+  .. "f=os.open(sys.argv[1], os.O_RDONLY); os.dup2(f, 3); os.execvp(sys.argv[2], sys.argv[2:])"
+local SH_FD_CLOSE = "for _n in 3 4 5 6 7 8 9; do eval \"exec $_n>&-\" 2>/dev/null; done"
+
+--- 用外部程序包装内层 argv：先关闭继承 fd（可选前置片段），再 exec 内层命令。
+--- 优先 bash（支持多位数 fd），其次 python3，最后 sh（仅个位 fd）。
+--- @param inner table 内层命令 argv
+--- @param pre string|nil 关闭 fd 之后、exec 之前执行的片段（如 `exec 3<'<filter>'` 打开 seccomp fd）
+--- @return table
+local function _wrap_close_fds(inner, pre)
+  local bash = vim.fn.exepath("bash")
+  if bash ~= "" then
+    local snippet = BASH_FD_CLOSE
+    if type(pre) == "string" and pre ~= "" then snippet = snippet .. "; " .. pre end
+    snippet = snippet .. "; exec \"$@\""
+    local out = { bash, "-c", snippet, "bash" }
+    for _, v in ipairs(inner) do out[#out + 1] = v end
+    return out
+  end
+  local py = vim.fn.exepath("python3")
+  if py ~= "" then
+    local out
+    if type(pre) == "string" and pre ~= "" then
+      local filter = pre:match("^exec 3<'(.-)'$") or pre:match("^exec 3<(.*)$")
+      out = { py, "-c", PY_FD_CLOSE_SECCOMP, filter or "" }
+    else
+      out = { py, "-c", PY_FD_CLOSE }
+    end
+    for _, v in ipairs(inner) do out[#out + 1] = v end
+    return out
+  end
+  local snippet = SH_FD_CLOSE
+  if type(pre) == "string" and pre ~= "" then snippet = snippet .. "; " .. pre end
+  snippet = snippet .. "; exec \"$@\""
+  local out = { "sh", "-c", snippet, "sh" }
+  for _, v in ipairs(inner) do out[#out + 1] = v end
+  return out
+end
 
 --- 配置的按需加回 capability（默认空：载荷不持有任何 capability）
 --- @return table 字符串数组
@@ -185,10 +276,77 @@ local function _tmpfs_roots()
   return out
 end
 
---- 需隐藏的 /proc 泄露项
+--- 需隐藏的 /proc 泄露项（用户可配置，只增不减）
 --- @return table 字符串数组
 local function _hide_proc_paths()
   return _config_list("tools.sandbox.hide_proc_paths", DEFAULT_HIDE_PROC)
+end
+
+--- 实际遮蔽的 /proc 路径：强制危险 sysctl 表 ∪ 用户隐藏项（去重）。强制项不可移除。
+--- @return table 字符串数组
+local function _proc_mask_paths()
+  local seen, out = {}, {}
+  local function add(p)
+    if type(p) ~= "string" or p == "" or seen[p] then return end
+    seen[p] = true
+    out[#out + 1] = p
+  end
+  for _, p in ipairs(MANDATORY_PROC_MASKS) do add(p) end
+  for _, p in ipairs(_hide_proc_paths()) do add(p) end
+  return out
+end
+
+--- 不应自动暴露的宿主目录前缀（凭据/系统/沙箱自身）
+local AUTO_EXPOSE_SKIP = {
+  "/etc", "/var", "/run", "/dev", "/proc", "/sys", "/boot",
+  "/root/.ssh", "/root/.aws", "/root/.gnupg", "/root/.kube", "/root/.docker",
+  "/root/.config/herdr", "/root/.netrc", "/root/.git-credentials",
+}
+
+--- 自动直通宿主 PATH 中的工具目录（opt-in，`tools.sandbox.expose_tool_paths`）。
+--- 用于让 node/npm/fd/go 等装在 $HOME 下的工具链在沙箱内可用；只暴露存在的目录，
+--- 跳过凭据/系统目录。返回去尾斜杠的目录数组。
+--- @return table 字符串数组
+local function _auto_tool_paths()
+  if config_store.get("tools.sandbox.expose_tool_paths") ~= true then return {} end
+  local out, seen = {}, {}
+  for dir in tostring(vim.env.PATH or ""):gmatch("[^:]+") do
+    if dir ~= "" and not seen[dir] then
+      seen[dir] = true
+      dir = dir:gsub("/+$", "")
+      if vim.fn.isdirectory(dir) == 1 then
+        local skip = false
+        for _, pre in ipairs(AUTO_EXPOSE_SKIP) do
+          if dir == pre or dir:sub(1, #pre + 1) == pre .. "/" then skip = true break end
+        end
+        -- 跳过沙箱自身存储与临时根
+        if not skip then
+          local ok, store = pcall(require, "NeoAI.sandbox.store")
+          local root = (ok and store and store.root and store.root()) or ""
+          if root ~= "" and (dir == root or dir:sub(1, #root + 1) == root .. "/") then skip = true end
+        end
+        if not skip then out[#out + 1] = dir end
+      end
+    end
+  end
+  return out
+end
+
+--- 宿主运行时直通路径（opt-in，`tools.sandbox.expose_paths`）：规范化去尾斜杠。
+--- 另可经 `tools.sandbox.expose_tool_paths=true` 自动直通宿主 PATH 中的工具目录。
+--- @return table 字符串数组
+local function _expose_paths()
+  local out, seen = {}, {}
+  local function add(p)
+    if type(p) ~= "string" or p == "" or p == "/" then return end
+    p = p:gsub("/+$", "")
+    if seen[p] then return end
+    seen[p] = true
+    out[#out + 1] = p
+  end
+  for _, p in ipairs(_config_list("tools.sandbox.expose_paths", {})) do add(p) end
+  for _, p in ipairs(_auto_tool_paths()) do add(p) end
+  return out
 end
 
 --- 沙箱运行时私有目录（宿主，不暴露给沙箱）：存放空文件、净化 resolv.conf 等。
@@ -250,6 +408,24 @@ local DEFAULT_MASK_DIRS = { "/home", "/root" }
 local function _under(p, r)
   if type(p) ~= "string" or type(r) ~= "string" then return false end
   return p == r or p:sub(1, #r + 1) == r .. "/"
+end
+
+--- 解析路径的规范形式（进程内工具遮蔽判定用）：展开 ~/环境变量 → 绝对化 → 解析符号链接。
+--- 必须解析 `/proc/<pid>/root`、`/proc/<pid>/cwd`、`/proc/<pid>/fd` 及普通符号链接，
+--- 否则 `read_file /proc/self/root/etc/shadow` 或工作区内指向宿主凭据的符号链接可绕过
+--- `mask_paths`/`mask_dirs`（进程内工具不经 mount 遮蔽，只靠这里的路径比对）。
+--- `vim.fn.resolve` 能解析悬空符号链接（目标尚不存在时按符号链接指向判定），
+--- 使「经符号链接写入未创建文件」也被覆盖。
+--- @param path string
+--- @return string
+local function _canonical(path)
+  if type(path) ~= "string" or path == "" then return path end
+  local abs = vim.fn.fnamemodify(path, ":p")
+  local ok, resolved = pcall(vim.fn.resolve, abs)
+  if ok and type(resolved) == "string" and resolved ~= "" then abs = resolved end
+  abs = abs:gsub("^/+", "/"):gsub("/+$", "")
+  if abs == "" then abs = "/" end
+  return abs
 end
 
 --- 遮蔽目录总开关（默认开）
@@ -347,15 +523,58 @@ end
 --- 追加每会话私有临时根挂载。给了 session_base（会话私有宿主目录）时，把其下
 --- 按根编码的子目录以 mode 1777 绑定到该根（tmpfs 语义、会话内共享、退出即销毁）；
 --- 未给时退回空 `--tmpfs`。始终不把宿主真实临时目录作为 lower/内容暴露。
+--- 临时根私有目录位置模式：host（默认，建在宿主根之下的隐藏子目录）| session（旧行为）
+--- @return string
+local function _tmp_private_base_mode()
+  local m = config_store.get("tools.sandbox.tmp_private_base")
+  if m == "session" then return "session" end
+  return "host"
+end
+
+--- 清理某临时根私有基目录下除 keep_session 外的陈旧会话子目录
+--- @param base string
+--- @param keep_session string|nil
+local function _prune_tmp_base(base, keep_session)
+  if vim.fn.isdirectory(base) ~= 1 then return end
+  for _, name in ipairs(vim.fn.readdir(base) or {}) do
+    if name ~= keep_session then
+      pcall(vim.fn.delete, base .. "/" .. name, "rf")
+    end
+  end
+end
+
+--- 追加每会话私有临时根挂载。
+--- host 模式：在宿主根（如 /tmp）下建隐藏子目录 <root>/.cache-<tag>/<session>（1777），
+--- 命名空间 bind 回该根——AI 在沙箱内看到的 /tmp 即此私有子目录，宿主 /tmp 内容不可见。
+--- session 模式/不可用时：退回进程目录下的私有目录；再退回空 tmpfs。
 --- @param argv table
---- @param session_base string|nil
+--- @param session_base string|nil 会话进程目录（其 basename 即会话 id）
 local function _append_tmpfs_roots(argv, session_base)
+  local session = (type(session_base) == "string" and session_base ~= "")
+    and vim.fn.fnamemodify(session_base, ":t") or nil
+  local mode = _tmp_private_base_mode()
+  local conceal = require("NeoAI.sandbox.conceal")
   for _, p in ipairs(_tmpfs_roots()) do
     local bound = false
-    if type(session_base) == "string" and session_base ~= "" then
-      local dir = session_base .. "/" .. p:gsub("^/", ""):gsub("/", "_")
+    -- host 模式：私有目录建在宿主根之下，命名空间映射回该根
+    if mode == "host" and session and vim.fn.isdirectory(p) == 1 then
+      local base = conceal.tmp_base_host(p)
+      local dir = base .. "/" .. session
       pcall(vim.fn.mkdir, dir, "p")
       pcall(vim.uv.fs_chmod, dir, 1023) -- 01777（sticky + world-writable）
+      if vim.fn.isdirectory(dir) == 1 then
+        _prune_tmp_base(base, session)
+        argv[#argv + 1] = "--bind"
+        argv[#argv + 1] = dir
+        argv[#argv + 1] = p
+        bound = true
+      end
+    end
+    -- session 模式 / host 模式建目录失败：退回进程目录下的私有目录
+    if not bound and type(session_base) == "string" and session_base ~= "" then
+      local dir = session_base .. "/" .. p:gsub("^/", ""):gsub("/", "_")
+      pcall(vim.fn.mkdir, dir, "p")
+      pcall(vim.uv.fs_chmod, dir, 1023)
       if vim.fn.isdirectory(dir) == 1 then
         argv[#argv + 1] = "--bind"
         argv[#argv + 1] = dir
@@ -370,15 +589,50 @@ local function _append_tmpfs_roots(argv, session_base)
   end
 end
 
---- 追加 /proc 泄露项隐藏（以空文件只读覆盖，读取得到空内容）。
+--- 清理沙箱临时根在宿主侧创建的私有目录（重置/关闭时调用）。
+function M.cleanup_tmp_roots()
+  local conceal = require("NeoAI.sandbox.conceal")
+  for _, p in ipairs(_tmpfs_roots()) do
+    pcall(vim.fn.delete, conceal.tmp_base_host(p), "rf")
+  end
+end
+
+--- 追加 /proc/sys 整体只读绑定：一次性封闭**所有**非命名空间全局 sysctl 的写入面
+--- （core_pattern/modprobe/randomize_va_space/kptr_restrict/dmesg_restrict/net.*/vm.*/fs.* 等）。
+--- 这些条目的写权限按 DAC（euid == 全局 root uid）判定，`--cap-drop ALL` 无法阻止；
+--- 共享 netns 下 net.* 还会直接改宿主网络。只读绑定后读仍可用、写返回 EROFS。
+--- 必须在 `--proc /proc` 之后调用（源路径取自新 procfs）。
+--- @param argv table
+local function _append_proc_sys_ro(argv)
+  argv[#argv + 1] = "--ro-bind"
+  argv[#argv + 1] = "/proc/sys"
+  argv[#argv + 1] = "/proc/sys"
+end
+
+--- 追加 /proc 泄露项与危险 sysctl 遮蔽（以空文件只读覆盖：读为空、写 EROFS）。
+--- 强制表（core_pattern/modprobe 等）始终生效，用户 `hide_proc_paths` 只能追加。
 --- @param argv table
 local function _append_hidden_proc(argv)
   local empty = _empty_file()
   if not empty then return end
-  for _, p in ipairs(_hide_proc_paths()) do
+  for _, p in ipairs(_proc_mask_paths()) do
     if type(p) == "string" and p ~= "" and vim.uv.fs_stat(p) then
       argv[#argv + 1] = "--ro-bind"
       argv[#argv + 1] = empty
+      argv[#argv + 1] = p
+    end
+  end
+end
+
+--- 追加宿主运行时直通挂载（opt-in）：置于 tmpfs/遮蔽之后，故可显式暴露被遮蔽或临时根
+--- 下的工具链目录（如 appimage nvim 的 `/tmp/.mount_*`、mason 的 `~/.local/share/nvim/mason`）。
+--- 仅以只读绑定暴露；空/根/不存在路径跳过。
+--- @param argv table
+local function _append_expose_mounts(argv)
+  for _, p in ipairs(_expose_paths()) do
+    if vim.uv.fs_stat(p) then
+      argv[#argv + 1] = "--ro-bind"
+      argv[#argv + 1] = p
       argv[#argv + 1] = p
     end
   end
@@ -397,12 +651,16 @@ local function _append_bwrap_base(argv, flags, priv, cwd)
   for _, f in ipairs({ "--dev", "/dev", "--proc", "/proc" }) do
     argv[#argv + 1] = f
   end
+  -- /proc/sys 整体只读绑定（根因修复），见 _append_proc_sys_ro。
+  _append_proc_sys_ro(argv)
   -- 临时根默认空 tmpfs（会话级绑定的覆盖见 process_prefix）；/proc 泄露项以空文件覆盖。
   _append_tmpfs_roots(argv)
   _append_hidden_proc(argv)
   -- 丢弃全部 capabilities（可经 tools.sandbox.cap_add / 档位 cap_add 按需加回）。载荷不再
-  -- 持有 CAP_SYS_ADMIN / CAP_SYS_MODULE / CAP_SYS_PTRACE 等，mount、模块加载、写
-  -- /proc/sys/kernel/core_pattern 等均被内核拒绝，不再依赖 seccomp 单点防护。
+  -- 持有 CAP_SYS_ADMIN / CAP_SYS_MODULE / CAP_SYS_PTRACE 等，mount、模块加载等被内核拒绝。
+  -- 注意：cap-drop **不能**阻止写 core_pattern/modprobe —— /proc/sys 的写权限按 DAC
+  -- （euid == 全局 root uid）判定，与 capability 无关；这类全局 sysctl 由上面的
+  -- _append_hidden_proc（MANDATORY_PROC_MASKS）以只读绑定遮蔽，而非依赖 cap-drop/seccomp。
   argv[#argv + 1] = "--cap-drop"
   argv[#argv + 1] = "ALL"
   for _, cap in ipairs(_cap_add(priv)) do
@@ -563,10 +821,11 @@ end
 local function _mask_entry(path, cwd)
   if not _mask_dirs_enabled() then return nil end
   if type(path) ~= "string" or path == "" then return nil end
-  path = path:gsub("/+$", "")
+  -- 先解析符号链接/`/proc/<pid>/root`，否则可经其绕过遮蔽目录命中判定。
+  path = _canonical(path)
   if path == "" or path == "/" then return nil end
   if type(cwd) ~= "string" or cwd == "" then return nil end
-  cwd = cwd:gsub("/+$", "")
+  cwd = _canonical(cwd)
   for _, scope in ipairs(_mask_scopes(cwd)) do
     if _under(path, scope) then
       if scope == cwd then
@@ -590,6 +849,31 @@ local function _mask_entry(path, cwd)
     end
   end
   return nil
+end
+
+--- 配置/内置的宿主敏感遮蔽路径（展开 glob、去重）。不含沙箱自身存储与按 cwd 的遮蔽目录。
+--- @return table 字符串数组
+local function _config_mask_paths()
+  local out, seen = {}, {}
+  local cfg = config_store.get("tools.sandbox.mask_paths")
+  local list = type(cfg) == "table" and cfg or DEFAULT_MASK_PATHS
+  for _, p in ipairs(list) do
+    if type(p) == "string" then
+      if p:find("[*?[]") then
+        local okg, matches = pcall(vim.fn.glob, p, false, true)
+        if okg and type(matches) == "table" then
+          for _, m in ipairs(matches) do
+            m = m:gsub("/+$", "")
+            if m ~= "" and m ~= "/" and not seen[m] then seen[m] = true; out[#out + 1] = m end
+          end
+        end
+      else
+        p = p:gsub("/+$", "")
+        if p ~= "" and p ~= "/" and not seen[p] then seen[p] = true; out[#out + 1] = p end
+      end
+    end
+  end
+  return out
 end
 
 --- 需要在隔离环境内遮蔽的宿主路径，返回 { path, kind } 数组（kind = "dir" | "file"）。
@@ -630,20 +914,7 @@ local function _masked_paths(unmask, cwd)
   -- 沙箱自身存储永远遮蔽（force），审批放行/档位 unmask 均不得解除。
   local ok, store = pcall(require, "NeoAI.sandbox.store")
   if ok and store and store.root then add(store.root(), true) end
-  local cfg = config_store.get("tools.sandbox.mask_paths")
-  local list = type(cfg) == "table" and cfg or DEFAULT_MASK_PATHS
-  for _, p in ipairs(list) do
-    if type(p) == "string" then
-      if p:find("[*?[]") then
-        local okg, matches = pcall(vim.fn.glob, p, false, true)
-        if okg and type(matches) == "table" then
-          for _, m in ipairs(matches) do add(m) end
-        end
-      else
-        add(p)
-      end
-    end
-  end
+  for _, p in ipairs(_config_mask_paths()) do add(p) end
   for _, p in ipairs(_dir_masks(cwd)) do add(p) end
   return out
 end
@@ -698,10 +969,163 @@ function M.append_hidden_proc(argv)
   return argv
 end
 
+--- 追加 /proc/sys 只读绑定（供 LSP 前缀复用；须在 `--proc /proc` 之后调用）。
+--- @param argv table|nil
+--- @return table
+function M.append_proc_sys_ro(argv)
+  argv = argv or {}
+  _append_proc_sys_ro(argv)
+  return argv
+end
+
+--- 强制遮蔽的危险全局 sysctl 列表（常驻，不可被用户配置移除）。
+--- @return table 字符串数组
+function M.mandatory_proc_masks()
+  local out = {}
+  for i, p in ipairs(MANDATORY_PROC_MASKS) do out[i] = p end
+  return out
+end
+
+--- 实际遮蔽的 /proc 路径（强制表 ∪ 用户 hide_proc_paths，去重）。
+--- @return table 字符串数组
+function M.proc_mask_paths()
+  return _proc_mask_paths()
+end
+
+--- 沙箱外部命令可代理变量（大小写两种写法）
+local PROXY_KEYS = {
+  "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "FTP_PROXY", "RSYNC_PROXY",
+  "http_proxy", "https_proxy", "all_proxy", "ftp_proxy", "rsync_proxy",
+}
+
+--- 沙箱外部命令代理策略：
+---   "strip"（默认）：不把宿主代理传入沙箱（如 mihomo 只代理 opencode 自身）；
+---   "passthrough"：沿用宿主代理；
+---   table { http, https, all, no_proxy }：显式设置（未列出的代理变量清除）。
+--- @return string|table
+local function _proxy_policy()
+  local netcfg = config_store.get("tools.sandbox.network") or {}
+  local p = netcfg.proxy
+  if p == nil then return "strip" end
+  return p
+end
+
+--- 是否启用「宿主本机访问拦截」代理（默认开）。offline=true 时网络已硬隔离，无需代理。
+--- @return boolean
+local function _host_local_block_enabled()
+  local netcfg = config_store.get("tools.sandbox.network") or {}
+  if netcfg.host_local_block == false then return false end
+  local sandbox = config_store.get("tools.sandbox") or {}
+  if sandbox.offline == true then return false end
+  -- 独立 netns 网关模式已自行提供代理，二者互斥。
+  local ok_ng, net_gateway = pcall(require, "NeoAI.sandbox.net_gateway")
+  if ok_ng and net_gateway.enabled() then return false end
+  return true
+end
+
+--- 生成清除代理变量的 shell 片段（供外部命令前置）。passthrough 或无需清除时返回 nil。
+--- 网络网关模式 / 本机拦截代理启用时返回 nil：会注入指向宿主代理的变量，不能被清除。
+--- @return string|nil
+local function _proxy_unset_snippet()
+  local ok_ng, net_gateway = pcall(require, "NeoAI.sandbox.net_gateway")
+  if ok_ng and net_gateway.enabled() then return nil end
+  if _host_local_block_enabled() then return nil end
+  local p = _proxy_policy()
+  if p == "passthrough" then return nil end
+  local keep = {}
+  if type(p) == "table" then
+    if p.http then keep.HTTP_PROXY = true; keep.http_proxy = true end
+    if p.https then keep.HTTPS_PROXY = true; keep.https_proxy = true end
+    if p.all then keep.ALL_PROXY = true; keep.all_proxy = true end
+  end
+  local keys = {}
+  for _, k in ipairs(PROXY_KEYS) do
+    if not keep[k] then keys[#keys + 1] = k end
+  end
+  if #keys == 0 then return nil end
+  return "unset " .. table.concat(keys, " ") .. " 2>/dev/null"
+end
+
+--- 构造沙箱进程环境：密钥 token 化覆盖 + expose_paths 目录前置到 PATH + 代理策略 + 档位 env。
+--- 所有外部进程（run_command / runtime.run）统一经此构造，保证环境一致且可观测。
+--- @param privileges table|nil { env? = table }
+--- @return table
+function M.sandbox_env(privileges)
+  local env = require("NeoAI.sandbox.secret").sanitized_env()
+  local expose = _expose_paths()
+  if #expose > 0 and config_store.get("tools.sandbox.expose_path_env") ~= false then
+    local cur = vim.env.PATH or ""
+    env.PATH = table.concat(expose, ":") .. (cur ~= "" and (":" .. cur) or "")
+  end
+  -- 代理策略：显式代理写入 env（strip 时由外部命令前置 unset 清除，避免宿主代理不可达导致失败）。
+  local proxy = _proxy_policy()
+  if type(proxy) == "table" then
+    if proxy.http then env.HTTP_PROXY = proxy.http; env.http_proxy = proxy.http end
+    if proxy.https then env.HTTPS_PROXY = proxy.https; env.https_proxy = proxy.https end
+    if proxy.all then env.ALL_PROXY = proxy.all; env.all_proxy = proxy.all end
+    if proxy.no_proxy ~= nil then env.NO_PROXY = proxy.no_proxy; env.no_proxy = proxy.no_proxy end
+  end
+  -- 网络网关模式：注入代理环境，使 curl/wget/git 等经宿主网关（探测端口、拦截服务）。
+  local ok_ng, net_gateway = pcall(require, "NeoAI.sandbox.net_gateway")
+  if ok_ng and net_gateway.enabled() then
+    for k, v in pairs(net_gateway.env()) do env[k] = v end
+  end
+  -- 宿主本机访问拦截：注入指向宿主过滤代理（host_proxy）的代理变量。代理拦截本机目标、
+  -- 放行外部并记录；网络整体仍是「放行 + 记录」。裸 TCP 不经代理（应用层边界，见文档）。
+  if _host_local_block_enabled() then
+    local ok_hp, host_proxy = pcall(require, "NeoAI.sandbox.host_proxy")
+    if ok_hp and host_proxy then
+      local addr = host_proxy.ensure()
+      if addr then
+        local url = ("http://127.0.0.1:%d"):format(addr.port)
+        env.HTTP_PROXY, env.http_proxy = url, url
+        env.HTTPS_PROXY, env.https_proxy = url, url
+        local socks = ("socks5h://127.0.0.1:%d"):format(addr.port)
+        env.ALL_PROXY, env.all_proxy = socks, socks
+        env.NO_PROXY, env.no_proxy = "", ""
+      end
+    end
+  end
+  if privileges and type(privileges.env) == "table" then
+    for k, v in pairs(privileges.env) do env[k] = v end
+  end
+  return env
+end
+
+--- 外部命令应前置的代理清除片段（strip/显式策略下；passthrough 返回 nil）。
+--- @return string|nil
+function M.proxy_unset_snippet()
+  return _proxy_unset_snippet()
+end
+
+--- 用 shell 包装 argv：先关闭除 0/1/2 外所有继承 fd，再 exec argv。
+--- 供 LSP 等自建 bwrap 前缀复用，避免继承宿主目录 fd 造成 chroot 逃逸。
+--- @param argv table
+--- @return table
+function M.wrap_close_fds(argv)
+  return _wrap_close_fds(argv)
+end
+
 --- 配置的每会话私有临时根列表（供 wrapper 从可写根 overlay 中剔除）。
 --- @return table 字符串数组
 function M.tmpfs_roots()
   return _tmpfs_roots()
+end
+
+--- 追加宿主敏感路径遮蔽挂载（供 LSP 命名空间等复用，保持与 run_command 一致的遮蔽面）：
+--- 仅应用配置/内置 mask_paths 与沙箱自身存储，不含按 cwd 的遮蔽目录（避免遮蔽工作区兄弟）。
+--- @param argv table|nil
+--- @return table
+function M.append_masked(argv)
+  argv = argv or {}
+  for _, mp in ipairs(_masked_paths(nil, nil)) do
+    if mp.kind == "dir" then
+      table.insert(argv, "--tmpfs"); table.insert(argv, mp.path)
+    else
+      table.insert(argv, "--bind"); table.insert(argv, "/dev/null"); table.insert(argv, mp.path)
+    end
+  end
+  return argv
 end
 
 --- 查询目标路径命中的遮蔽条目（供工具审批：命中则弹窗，批准后 unmask 该条目）。
@@ -710,6 +1134,30 @@ end
 --- @return string|nil mask_entry
 function M.mask_entry(path, cwd)
   return _mask_entry(path, cwd)
+end
+
+--- 目标路径是否命中宿主敏感遮蔽路径（`tools.sandbox.mask_paths` + 沙箱自身存储）。
+--- 供**进程内** read/fs_write 工具显式拦截：这些工具不经 namespace，mount 遮蔽对其无效，
+--- 必须由执行器按此查询 fail-closed。不含按 cwd 的遮蔽目录（由 `mask_entry` 处理，
+--- 语义与审批放行不同）。
+--- @param path string|nil 绝对路径
+--- @return string|nil 命中的遮蔽条目
+function M.is_masked_path(path)
+  if type(path) ~= "string" or path == "" then return nil end
+  -- 解析符号链接与 `/proc/<pid>/root|cwd|fd`：进程内工具只按路径比对遮蔽，
+  -- 若不做规范化，`/proc/self/root/etc/shadow` 或指向宿主凭据的符号链接可绕过。
+  path = _canonical(path)
+  if path == "" or path == "/" then return nil end
+  local ok, store = pcall(require, "NeoAI.sandbox.store")
+  if ok and store and store.root then
+    local sr = (store.root() or ""):gsub("/+$", "")
+    if sr ~= "" and (_under(path, sr) or _under(path, _canonical(sr))) then return sr end
+  end
+  for _, p in ipairs(_config_mask_paths()) do
+    -- 同时比对原始与规范化后的遮蔽条目：条目自身可能含符号链接（如 /var/run → /run）。
+    if _under(path, p) or _under(path, _canonical(p)) then return p end
+  end
+  return nil
 end
 
 --- 遮蔽目录总开关与列表（只读查询）
@@ -747,6 +1195,71 @@ function M.overlay_mountable(lower, upper, work)
   return ok
 end
 
+--- 诊断某可写根为何无法使用 overlay（供能力查询与降级提示）。
+--- 返回 nil 表示可用；否则返回简短原因码（含设备/挂载信息）。
+--- @param root string
+--- @param upper string|nil
+--- @param work string|nil
+--- @return string|nil
+function M.overlay_reason(root, upper, work)
+  local caps = M.capabilities()
+  if not caps.bwrap then return "NO_BWRAP_BACKEND" end
+  if not caps.overlayfs then
+    -- 粗粒度探测失败：区分是否缺少 user namespace（root 下免 userns 可用）
+    local flags = caps.bwrap_flags or M.bwrap_flags()
+    local userns = false
+    for _, f in ipairs(flags) do
+      if f == "--unshare-all" or f == "--unshare-user" then userns = true end
+    end
+    if userns then
+      return "OVERLAY_COARSE_PROBE_FAILED(userns=true; 容器内宿主 / 归属 init userns 时 overlay 会 EINVAL)"
+    end
+    return "OVERLAY_COARSE_PROBE_FAILED(内核/挂载不支持或 upper 文件系统不支持 overlay)"
+  end
+  if not (root and upper and work) then return nil end
+  if M.overlay_mountable(root, upper, work) then return nil end
+  local st_l = vim.uv.fs_stat(root)
+  local st_u = vim.uv.fs_stat(upper)
+  local ldev = st_l and st_l.dev or -1
+  local udev = st_u and st_u.dev or -1
+  if ldev ~= udev then
+    return string.format("OVERLAY_MOUNT_EINVAL(lower_dev=%s upper_dev=%s; lower/upper 跨挂载或 userns 归属不同)",
+      tostring(ldev), tostring(udev))
+  end
+  return string.format("OVERLAY_MOUNT_EINVAL(dev=%s; 该文件系统不支持 overlay upper/work)",
+    tostring(ldev))
+end
+
+--- 诊断当前环境的 overlay 可用性（供能力查询）：用真实执行路径（cwd + 沙箱 overlay 基目录）
+--- 实测一次并返回原因，便于排查降级模式为何触发。
+--- @param root string|nil（默认当前工作目录）
+--- @return table { available, reason?, flags, userns, upper? }
+function M.overlay_diagnosis(root)
+  root = root or vim.fn.getcwd()
+  local caps = M.capabilities()
+  local flags = caps.bwrap_flags or M.bwrap_flags()
+  local userns = false
+  for _, f in ipairs(flags) do
+    if f == "--unshare-all" or f == "--unshare-user" then userns = true end
+  end
+  if not caps.bwrap then
+    return { available = false, reason = "NO_BWRAP_BACKEND", flags = flags, userns = userns }
+  end
+  if not caps.overlayfs then
+    return { available = false, reason = M.overlay_reason(root), flags = flags, userns = userns }
+  end
+  local base = require("NeoAI.sandbox.conceal").base_host()
+  local upper, work = base .. "/diag-u", base .. "/diag-w"
+  pcall(vim.fn.mkdir, upper, "p")
+  pcall(vim.fn.mkdir, work, "p")
+  local ok = M.overlay_mountable(root, upper, work)
+  return {
+    available = ok,
+    reason = ok and nil or M.overlay_reason(root, upper, work),
+    flags = flags, userns = userns, upper = upper,
+  }
+end
+
 --- 选择可用后端
 --- @return string|nil "bwrap" | "unshare"
 function M.backend()
@@ -776,12 +1289,25 @@ function M.process_prefix(opts)
   local cfg = config_store.get("tools.sandbox") or {}
   local offline = cfg.offline ~= false
   local priv = opts.privileges
+  -- 独立 netns + 宿主网关模式：沙箱只能到达宿主网关（探测端口，服务被拦）。
+  local net_gateway = require("NeoAI.sandbox.net_gateway")
+  local gateway_mode = net_gateway.enabled()
+  if gateway_mode and backend ~= "bwrap" then
+    return nil, "GATEWAY_REQUIRES_BWRAP: 网络网关模式仅支持 bwrap 后端"
+  end
+  if gateway_mode then
+    local ng, ngerr = net_gateway.ensure()
+    if not ng then return nil, ngerr end
+  end
   if backend == "bwrap" then
     local overlays = opts.overlays or {}
     local flags = M.bwrap_flags()
     -- 档位要求嵌套 userns（如 T2）：改用带 user namespace 的隔离标志，
     -- 使 cap_add 的权限被限制在该 userns 内，够不到宿主。
     if priv and priv.userns then flags = USER_FLAGS end
+    -- 网关模式：网络命名空间由 `ip netns exec` 提供，bwrap 不得再 unshare net，
+    -- 故使用不带 net 的隔离标志（--unshare-pid/ipc/uts/cgroup）。
+    if gateway_mode then flags = NO_USER_FLAGS end
     local userns = false
     for _, f in ipairs(flags) do if f == "--unshare-all" then userns = true end end
     local argv = {}
@@ -852,6 +1378,8 @@ function M.process_prefix(opts)
         table.insert(argv, "--bind"); table.insert(argv, "/dev/null"); table.insert(argv, mp.path)
       end
     end
+    -- 宿主运行时直通（opt-in）：置于遮蔽之后，允许显式暴露被遮蔽/临时根下的工具链。
+    _append_expose_mounts(argv)
     -- 降级：无任何 overlay 生效时把私有可写目录 bind 到 cwd，保留隔离与只读 rootfs。
     if opts.cwd and not overlays_active and opts.fallback_cwd then
       table.insert(argv, "--bind"); table.insert(argv, opts.fallback_cwd)
@@ -862,14 +1390,28 @@ function M.process_prefix(opts)
       table.insert(argv, opts.cwd)
     end
     -- 网络：
-    --   档位显式指定时以档位为准（T0 默认隔离：--unshare-net；T1/T2 允许网络）；
+    --   网关模式：网络由外部 netns 提供（仅可达宿主网关），此处不再处理 net 标志；
+    --   档位显式指定时以档位为准（T0 默认放行网络，经 host_proxy 拦截本机；T1/T2 允许网络）；
     --   未指定档位时维持旧语义：带 userns 隔离 net 后按需 --share-net，否则 offline 才隔离。
-    local want_net
-    if priv then want_net = priv.network == true else want_net = not offline end
-    if userns then
-      if want_net then table.insert(argv, "--share-net") end
-    elseif not want_net then
-      table.insert(argv, "--unshare-net")
+    --   offline=true 为硬隔离，优先级高于档位（网络类工具与进程网络一律断开）。
+    if not gateway_mode then
+      local want_net
+      if offline then want_net = false
+      elseif priv then want_net = priv.network == true
+      else want_net = true end
+      if userns then
+        if want_net then table.insert(argv, "--share-net") end
+      elseif not want_net then
+        table.insert(argv, "--unshare-net")
+      end
+    end
+    -- 网关模式：在 bwrap 之前加 `ip netns exec <ns>`，把载荷放进隔离网络命名空间。
+    if gateway_mode then
+      local pre = net_gateway.exec_prefix()
+      local full = {}
+      for _, v in ipairs(pre) do full[#full + 1] = v end
+      for _, v in ipairs(argv) do full[#full + 1] = v end
+      argv = full
     end
     -- seccomp 基线：bwrap 在载荷 exec 前装载过滤器；用 shell 打开过滤器 fd 后 exec bwrap
     local seccomp = require("NeoAI.sandbox.seccomp")
@@ -880,13 +1422,9 @@ function M.process_prefix(opts)
       end
       table.insert(argv, "--seccomp")
       table.insert(argv, "3")
-      local wrapper = { "sh", "-c", "exec 3<'" .. filter .. "'; exec \"$@\"", "sh" }
-      local full = {}
-      for _, v in ipairs(wrapper) do full[#full + 1] = v end
-      for _, v in ipairs(argv) do full[#full + 1] = v end
-      return full, nil, opts.cwd
+      return _wrap_close_fds(argv, "exec 3<'" .. filter .. "'"), nil, opts.cwd
     end
-    return argv, nil, opts.cwd
+    return _wrap_close_fds(argv), nil, opts.cwd
   end
   -- unshare 后端：无 overlay 支持，退化为空暂存 cwd（仍隔离 net/pid/ipc/uts/user）
   if require("NeoAI.sandbox.seccomp").enabled() then
@@ -896,6 +1434,11 @@ function M.process_prefix(opts)
   if priv and ((priv.mounts and #priv.mounts > 0) or (priv.cap_add and #priv.cap_add > 0)) then
     return nil, "SANDBOX_PRIVILEGE_UNSUPPORTED: unshare 后端不支持档位挂载/capability"
   end
+  -- 危险全局 sysctl 遮蔽（core_pattern/modprobe 等）需要 bind mount，仅 bwrap 后端支持。
+  -- unshare 后端下 root 的 euid 仍是全局 root，DAC 会放行写入 → 必须 fail-closed，不静默降级。
+  if #MANDATORY_PROC_MASKS > 0 then
+    return nil, "SANDBOX_SYSCTL_MASK_UNAVAILABLE: unshare 后端无法遮蔽 /proc/sys（core_pattern/modprobe 等）"
+  end
   local argv = { "unshare", "--user", "--map-root-user", "--mount", "--pid", "--fork",
     "--ipc", "--uts", "--mount-proc" }
   -- 网络：档位显式指定时以档位为准；否则仅 offline=true 时隔离 net。
@@ -904,7 +1447,7 @@ function M.process_prefix(opts)
   if not want_net then
     table.insert(argv, "--net")
   end
-  return argv, nil, (opts.fallback_cwd or opts.cwd)
+  return _wrap_close_fds(argv), nil, (opts.fallback_cwd or opts.cwd)
 end
 
 --- 判断某 effect 是否可在当前环境隔离执行
@@ -941,9 +1484,16 @@ function M.run(argv, opts)
   if not prefix then
     return async.reject({ kind = "sandbox", message = err })
   end
+  -- 代理策略：清除宿主代理变量（默认），避免不可达代理导致命令失败。
+  local unset = _proxy_unset_snippet()
+  local run_argv = argv
+  if unset then
+    run_argv = { "sh", "-c", unset .. "\nexec \"$@\"", "sh" }
+    for _, v in ipairs(argv) do run_argv[#run_argv + 1] = v end
+  end
   local full = {}
   for _, v in ipairs(prefix) do full[#full + 1] = v end
-  for _, v in ipairs(argv) do full[#full + 1] = v end
+  for _, v in ipairs(run_argv) do full[#full + 1] = v end
 
   local d = async.Deferred.new()
   local stdout, stderr = {}, {}
@@ -969,14 +1519,8 @@ function M.run(argv, opts)
   end
   job = vim.fn.jobstart(full, {
     cwd = opts.cwd,
-    -- 环境变量脱敏：高熵密钥值替换为 token（进沙箱加密）。
-    env = (function()
-      local env = require("NeoAI.sandbox.secret").sanitized_env()
-      if opts.privileges and type(opts.privileges.env) == "table" then
-        for k, v in pairs(opts.privileges.env) do env[k] = v end
-      end
-      return env
-    end)(),
+    -- 环境变量脱敏 + 宿主运行时直通（统一经 sandbox_env 构造）。
+    env = M.sandbox_env(opts.privileges),
     stdout_buffered = true,
     stderr_buffered = true,
     on_stdout = function(_, data)
@@ -1000,6 +1544,7 @@ function M.reset()
   state.caps = nil
   state.overlay_probe = {}
   state.empty_file = nil
+  pcall(M.cleanup_tmp_roots)
 end
 
 return M

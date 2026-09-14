@@ -18,7 +18,7 @@ local EFFECTS = {
 }
 
 --- 已知工具的显式规格
---- @type table<string, { effect: string, paths?: string[] }>
+--- @type table<string, { effect: string, paths?: string[], read_only?: boolean }>
 local SPECS = {
   -- 文件读
   read_file = { effect = "read", paths = { "filepath" } },
@@ -33,13 +33,14 @@ local SPECS = {
   -- 进程
   run_command = { effect = "process" },
   reload_all = { effect = "process" },
-  -- git
-  git_status = { effect = "read" },
-  git_diff = { effect = "read" },
-  git_log = { effect = "read" },
-  git_commit_detail = { effect = "read" },
-  git_branch = { effect = "read" },
-  git_file_history = { effect = "read" },
+  -- git：读操作在沙箱命名空间内执行（与 run_command 同一 overlay），看到暂存内容而非真实磁盘；
+  -- read_only 表示不捕获候选（只读，无副作用）。
+  git_status = { effect = "process", read_only = true },
+  git_diff = { effect = "process", read_only = true },
+  git_log = { effect = "process", read_only = true },
+  git_commit_detail = { effect = "process", read_only = true },
+  git_branch = { effect = "process", read_only = true },
+  git_file_history = { effect = "process", read_only = true },
   git_rollback = { effect = "process" },
   git_auto_commit_config = { effect = "in_process" },
   -- 日志
@@ -74,7 +75,8 @@ local SPECS = {
   lsp_format = { effect = "fs_write" },
   -- 网络
   web_fetch = { effect = "network" },
-  read_image = { effect = "network" },
+  -- read_image 的 file_path 可为本地路径：进程内读盘，必须纳入遮蔽判定（URL 分支不受影响）。
+  read_image = { effect = "network", paths = { "file_path" } },
   -- 进程内交互 / 子 agent
   confirm_file_change = { effect = "in_process" },
   ask_user = { effect = "in_process" },
@@ -111,15 +113,15 @@ local CATEGORY_DEFAULT = {
 --- 获取工具规格
 --- @param name string
 --- @param category string|nil
---- @return table { effect: string, paths: string[] }
+--- @return table { effect: string, paths: string[], read_only: boolean }
 function M.get(name, category)
   local spec = SPECS[name]
   if spec then
-    return { effect = spec.effect, paths = spec.paths or {} }
+    return { effect = spec.effect, paths = spec.paths or {}, read_only = spec.read_only == true }
   end
   local effect = CATEGORY_DEFAULT[category or "other"] or "process"
   if not EFFECTS[effect] then effect = "process" end
-  return { effect = effect, paths = {} }
+  return { effect = effect, paths = {}, read_only = false }
 end
 
 --- 该 effect 是否产生可暂存的文件系统影响

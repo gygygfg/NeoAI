@@ -9,8 +9,8 @@
 --- `tool_helpers.persist_buffer` 重定向到暂存层。LSP 自身缓存目录以 rw bind
 --- 直连宿主，避免把缓存写入 overlay 或待审队列。
 ---
---- 需 opt-in：`tools.sandbox.lsp_overlay.enabled = true`；overlay 不可用（如 tmpfs
---- 工作区）时自动跳过，不影响 LSP 正常使用。
+--- 默认开启（`tools.sandbox.lsp_overlay.enabled = true`），使 LSP 与 run_command/git 读工具
+--- 共享同一暂存视图；overlay 不可用（如 tmpfs 工作区）时自动跳过，不影响 LSP 正常使用。
 
 local fs = require("NeoAI.utils.fs")
 local config_store = require("NeoAI.kernel.config_store")
@@ -112,6 +112,8 @@ local function _prefix(specs, cwd)
   for _, f in ipairs({ "--dev", "/dev", "--proc", "/proc" }) do
     table.insert(argv, f)
   end
+  -- /proc/sys 只读（与 run_command 一致）：LSP server 也不得写宿主全局 sysctl。
+  runtime.append_proc_sys_ro(argv)
   -- 临时根用私有 tmpfs，并隐藏 /proc 泄露项（与 run_command 一致）。
   runtime.append_tmpfs_roots(argv)
   runtime.append_hidden_proc(argv)
@@ -123,8 +125,12 @@ local function _prefix(specs, cwd)
   for _, d in ipairs(_rw_dirs()) do
     table.insert(argv, "--bind"); table.insert(argv, d); table.insert(argv, d)
   end
+  -- 遮蔽宿主敏感路径（与 run_command 一致的遮蔽面）：rw bind 之后覆盖，避免把
+  -- keyring / 凭据等随缓存目录（~/.local/share、~/.cache）一并暴露给 LSP server。
+  runtime.append_masked(argv)
   table.insert(argv, "--chdir"); table.insert(argv, cwd)
-  return argv
+  -- 关闭继承 fd 后再 exec bwrap，避免 LSP server 继承宿主目录 fd（chroot 逃逸）。
+  return runtime.wrap_close_fds(argv)
 end
 
 -- ========== 公开 API ==========

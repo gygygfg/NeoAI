@@ -233,9 +233,13 @@ sandbox = {
   readonly_paths = { "/etc/ld.so.cache", "/etc/passwd", "/etc/group", "/etc/nsswitch.conf",
     "/etc/hosts", "/etc/ssl", "/etc/alternatives", "/etc/localtime",
     "/etc/os-release", "/etc/terminfo", "/etc/profile", "/etc/security", "/etc/pam.d" },
+  expose_paths = {},               -- Host runtime passthrough (opt-in): these host paths are exposed read-only after masking/tmpfs and prepended to the sandbox PATH so run_command can invoke host toolchains (e.g. nvim/lua/luajit/mason). Only expose trusted read-only tool dirs
+  expose_path_env = true,          -- Whether to prepend expose_paths dirs to the sandbox PATH (false = mount only)
+  expose_tool_paths = false,       -- Auto-expose host PATH tool dirs (opt-in): read-only-expose existing, non-credential/system PATH bin dirs and prepend them to the sandbox PATH so toolchains under $HOME (node/npm/fd/go) work (widens the read surface)
   resolv_conf = "sanitize",        -- /etc/resolv.conf: sanitize (default, nameservers only) | hide | passthrough
-  tmpfs_roots = { "/tmp", "/var/tmp" }, -- per-session private tmpfs (never an overlay lower; destroyed on exit)
-  hide_proc_paths = { "/proc/cmdline", "/proc/version" }, -- overridden with an empty file; hides host kernel cmdline/version
+  tmpfs_roots = { "/tmp", "/var/tmp" }, -- per-session private temporary roots (never an overlay lower; destroyed on exit)
+  tmp_private_base = "host",       -- location of the private temp dir: host (default: hidden subdir under the host root, e.g. /tmp/.cache-<tag>/<session>, namespace-bound back onto the root to isolate the AI) | session (old behavior: under the session process dir)
+  hide_proc_paths = { "/proc/cmdline", "/proc/version" }, -- overridden with an empty file; hides host kernel cmdline/version (dangerous global sysctls are mandatory and can only grow)
   mask_paths = {                   -- Mask host-sensitive paths (dirs -> tmpfs; files/sockets -> /dev/null)
     "/run/docker.sock", "/var/run/docker.sock", "/var/lib/docker", "/var/lib/containerd",
     "/root/.config/herdr", "/etc/1panel", "/run/dbus", "/run/systemd",
@@ -249,31 +253,63 @@ sandbox = {
   mask_dirs_enabled = true,        -- master switch
   mask_dirs = { "/home", "/root" }, -- masked dirs (supports * globs)
   mask_dirs_approval = true,       -- request approval on masked hits (reuses tool approval UI)
-  network = { enabled = false, allowed_endpoints = {}, budget_bytes = 0 }, -- controlled network gateway
+  network = {
+    enabled = false, allowed_endpoints = {}, budget_bytes = 0, -- controlled network gateway
+    -- Intercept access to the host itself (loopback/host NIC IPs/link-local/cloud metadata; on by
+    -- default): injects HTTP(S)_PROXY/ALL_PROXY pointing at the host-side Lua filtering proxy —
+    -- host-local targets are blocked, external targets allowed and recorded. Application-layer
+    -- boundary: raw TCP that ignores the proxy can bypass it (see docs/en/sandbox.md §6.1).
+    host_local_block = true,
+    host_local_proxy_port = 0,       -- host filtering proxy port (0 = random loopback port)
+    -- Proxy policy for sandbox external commands: strip (default: do not pass host proxies into the
+    -- sandbox; e.g. mihomo only proxies opencode itself, avoiding an unreachable host
+    -- HTTPS_PROXY=127.0.0.1:7890 breaking pip/npm) | passthrough (keep host proxies) |
+    -- table { http, https, all, no_proxy } (explicit; unlisted proxy vars are cleared).
+    -- Note: when host_local_block is on, the injected filtering-proxy vars take precedence over strip.
+    proxy = "strip",
+    -- Isolated netns + host gateway (opt-in): the sandbox process enters a private network
+    -- namespace and can only reach the host gateway; the gateway first runs a TCP connect probe on
+    -- the target host:port (so host listening ports are discoverable), but never relays real service
+    -- data — it returns the interception reason (JSON) to the client. Only host-local addresses may
+    -- be probed. Requires root and `ip`.
+    gateway = { enabled = false, probe_timeout_ms = 1000, max_probes = 4096 },
+  },
   -- Privilege tiers and auto-escalation: commands run at T0 least privilege by default
-  -- (network isolated by default); escalation is auto-requested when privilege is insufficient.
+  -- (network allowed by default with host-local access intercepted); escalation is auto-requested
+  -- when privilege is insufficient.
   privilege = {
     enabled = true, auto_escalate = true, max_tier = 2, record = true,
     tiers = {                       -- per-tier network/extra caps/mounts/unmask/review strictness
-      [0] = { name = "minimal", review = "auto", network = false, cap_add = {}, mounts = {}, unmask = {} },
+      [0] = { name = "minimal", review = "auto", network = true, cap_add = {}, mounts = {}, unmask = {} }, -- network allowed (recorded); host-local intercepted via host_proxy
       [1] = { name = "elevated", review = "auto", network = true, cap_add = {}, mounts = {}, unmask = { "/run/docker.sock", "/var/run/docker.sock" } },
       [2] = { name = "privileged", review = "approve", network = true, userns = true, cap_add = {}, mounts = {}, unmask = { "/run/docker.sock", "/var/run/docker.sock" } },
     },
     classify = {                    -- command classification (bins = exact binary; bin+subs = binary + subcommand)
       { tier = 2, name = "privileged", bins = { "sudo", "mount", "modprobe", "iptables", "systemctl", "unshare", "nsenter" } },
-      { tier = 1, name = "docker", bins = { "docker", "docker-compose", "podman", "nerdctl" } },
+      { tier = 1, name = "docker", bins = { "docker", "docker-compose", "nerdctl" } }, -- daemon-backed: controlled socket
+      { tier = 1, name = "container", bins = { "podman", "podman-compose", "buildah", "skopeo" } }, -- daemonless: can share the sandbox namespace
       { tier = 1, name = "network", bins = { "curl", "wget", "ssh", "rsync", "ping", "socat" } },
       { tier = 1, name = "network", bin = "git", subs = { "push", "pull", "fetch", "clone" } },
+      { tier = 1, name = "package", bins = { "apt", "apt-get", "dnf", "yum", "pacman", "apk", "brew" } }, -- package install: extra rules
     },
   },
   -- Controlled docker: never binds the host /var/run/docker.sock; controlled points at an external controlled socket.
   docker = { mode = "controlled", socket = "/run/neoai-docker/docker.sock" }, -- off | controlled | host
+  -- Controlled containers: daemonless runtimes (podman) get --net/pid/ipc/uts=host to share the
+  -- sandbox namespace; docker relies on an external daemon and cannot share, so the controlled
+  -- socket scheme is kept and the reason is recorded.
+  container = { enabled = true, share_namespace = true, prefer = "podman" },
   workspace_root = vim.fn.stdpath("cache") .. "/NeoAI/sandbox",
   session_shell = true,            -- persist shell state (export/cd) across run_command within a session (bwrap only)
   process_roots = {},              -- run_command writable roots (overlaid; default cwd only, auto-added). /tmp, /var/tmp belong to tmpfs_roots; host /root, /home, /etc are not exposed as read-only lower; add explicitly if needed
-  review = { enabled = true, auto_apply = false }, -- async review: candidates enter a pending queue
-  lsp_overlay = { enabled = false }, -- LSP process mount-namespace overlay: LSP disk reads see staged content (opt-in, bwrap+overlay only)
-  secrets = { enabled = true, min_length = 20, max_length = 200, min_entropy = 3.5, min_distinct = 8, exclude_pure_hex = true, allowlist = {} }, -- Secret guard: entropy detection + token mapping; env values whose names contain KEY/TOKEN/SECRET/PASSWORD/CREDENTIAL are force-tokenized
+  -- Async review: candidates enter a pending queue. session_auto_approve auto-applies L0/L1.
+  review = { enabled = true, auto_apply = false, session_auto_approve = false },
+  -- Approval graded by security level (L0-L3): action auto/record/review/block; default "review".
+  approval = { default = "review", levels = {} },
+  -- Extra rules for package installs: review (default, forced review, not auto-approved) | allow | deny.
+  packages = { mode = "review", managers = { "apt", "pip", "npm", "go", "cargo", "gem", "composer" } },
+  lsp_overlay = { enabled = true }, -- LSP process mount-namespace overlay: LSP disk reads see staged content (on by default, bwrap+overlay only; skipped when unavailable)
+  secrets = { enabled = true, min_length = 20, max_length = 200, min_entropy = 3.5, min_distinct = 8, exclude_pure_hex = true, tokenize_env = true, extra_rules = {}, allowlist = {} }, -- Secret/sensitive guard: entropy + named rules (private-key blocks/AKIA/ghp_/sk-/JWT/Bearer…) + token mapping; env values whose names contain KEY/TOKEN/SECRET/PASSWORD/CREDENTIAL are force-tokenized
   retention = { candidate_days = 7, max_pending = 20 },
   policy = {
     version = "1",                 -- policy version (for audit replay; bump when rules change)

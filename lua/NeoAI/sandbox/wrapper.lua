@@ -157,8 +157,9 @@ end
 --- @param attempt table
 --- @param cfg table
 --- @param env table|nil
+--- @param meta table|nil 安全分级元数据
 --- @return table|nil item
-local function _enqueue_review(cand, attempt, cfg, env)
+local function _enqueue_review(cand, attempt, cfg, env, meta)
   local review_cfg = (cfg and cfg.review) or {}
   if review_cfg.enabled == false then return nil end
   local review = require("NeoAI.sandbox.review")
@@ -169,6 +170,12 @@ local function _enqueue_review(cand, attempt, cfg, env)
     base_version = attempt.request_hash,
     evidence = env and env.evidence or nil,
     stats = env and env.stats or nil,
+    secret_warning = meta and meta.secret_warning or nil,
+    risk_level = meta and meta.risk_level or nil,
+    risk_name = meta and meta.risk_name or nil,
+    risk_reasons = meta and meta.risk_reasons or nil,
+    package = meta and meta.package or nil,
+    action = meta and meta.action or nil,
   })
 end
 
@@ -190,10 +197,65 @@ local function _settle_candidate(cand, attempt, ctx, cfg, spec, result, process_
   })
   local stats = impact.stats(impacts)
 
-  -- 任务授权匹配：覆盖时自动应用（TASK_POLICY_MATCH）；mode=commit 亦立即发布
+  -- 安全分级：按写路径/包安装/密钥/提权/网络/结果信号评估级别并给出建议动作。
+  local risk = require("NeoAI.sandbox.risk")
+  local review = require("NeoAI.sandbox.review")
+  local secret_warning = nil
+  do
+    local ok, s = pcall(require, "NeoAI.sandbox.secret")
+    if ok and s.enabled() then secret_warning = s.warn_for_files(cand.files) end
+  end
+  local paths = _cand_paths(cand)
+  local rf = {
+    effect = spec.effect,
+    paths = paths,
+    privilege_tier = attempt.privilege_tier,
+    package = attempt.package == true,
+    network = attempt.network == true,
+    secret = (secret_warning and (secret_warning.count or 0) > 0) or false,
+    command = attempt.container_command or (process_info and process_info.command) or nil,
+  }
+  local r = risk.classify(rf)
+  if attempt.result_risk and (attempt.result_risk.level or 0) > r.level then
+    r.level = attempt.result_risk.level
+    r.name = risk.level_name(r.level)
+    r.badge = risk.badge(r.level)
+    for _, x in ipairs(attempt.result_risk.reasons or {}) do r.reasons[#r.reasons + 1] = x end
+  end
+  risk.record({
+    tool = attempt.tool_name, command_id = attempt.command_id, attempt_id = attempt.attempt_id,
+    level = r.level, reasons = r.reasons,
+  })
+  pcall(function()
+    require("NeoAI.sandbox.audit").observe({
+      kind = spec.effect, tool = attempt.tool_name, level = r.level,
+      reasons = r.reasons, paths = paths, command_id = attempt.command_id,
+    })
+  end)
+
+  -- 建议动作：block 直接拒绝；auto 立即发布；review 入待审队列（不阻塞 agent）。
+  local action = risk.action(r.level, {
+    session_auto = review.session_auto(),
+    package = rf.package,
+    secret = rf.secret,
+  })
+  if action == "block" then
+    control.transition(attempt, "BLOCKED")
+    return { ok = false, err = {
+      kind = "sandbox",
+      message = "安全策略拒绝（" .. tostring(r.name) .. "）: " .. table.concat(r.reasons, ","),
+      reason_codes = r.reasons, command_id = attempt.command_id,
+    } }
+  end
+
+  -- 任务授权匹配：覆盖时自动应用（TASK_POLICY_MATCH）；mode=commit / 自动审批亦立即发布
   local covering = grant.find_covering(spec.effect, cand)
   local mode = ctx.sandbox_mode or cfg.mode or "dry_run"
-  local auto = covering ~= nil or ((cfg.review or {}).auto_apply == true) or mode == "commit"
+  local auto = covering ~= nil or review.auto_apply_enabled() or mode == "commit" or action == "auto"
+  -- 包安装走额外规则：默认强制复核（不随自动审批放行），除非 packages.mode="allow"。
+  if rf.package and ((cfg.packages or {}).mode or "review") ~= "allow" then auto = false end
+  -- 密钥操作永不自动发布（需显式确认）。
+  if rf.secret then auto = false end
   local severity = require("NeoAI.sandbox.privilege").severity(attempt.privilege_tier or 0)
   local env = envelope.build({
     command_id = attempt.command_id,
@@ -230,7 +292,11 @@ local function _settle_candidate(cand, attempt, ctx, cfg, spec, result, process_
 
   -- 结果原样返回给模型：不把「已暂存/待审」暴露给 AI，让它认为修改已完成；
   -- 待审状态仅通过 UI 徽标提示用户（见 services.status 的 sandbox 段）。
-  local item = _enqueue_review(cand, attempt, cfg, env)
+  local item = _enqueue_review(cand, attempt, cfg, env, {
+    secret_warning = secret_warning,
+    risk_level = r.level, risk_name = r.name, risk_reasons = r.reasons,
+    package = rf.package, action = action,
+  })
   if item then
     -- 同一文件被再次编辑：新候选取代同路径的旧待审项（队列只保留最新版本）
     require("NeoAI.sandbox.review").supersede_by_paths(_cand_paths(cand), item.change_set_id)
@@ -299,6 +365,12 @@ function M.gate(tool, args, ctx, call_original)
 
   -- 只读 / 进程内：直接执行并记录只读回执（无候选，无需审批）
   if spec.effect == "read" or spec.effect == "in_process" then
+    pcall(function()
+      require("NeoAI.sandbox.audit").observe({
+        kind = spec.effect == "read" and "read" or "tool",
+        tool = attempt.tool_name, level = 0, command_id = attempt.command_id,
+      })
+    end)
     control.transition(attempt, "STAGING")
     control.transition(attempt, "CANDIDATE_READY")
     control.transition(attempt, "COMPLETED_READ_ONLY")
@@ -309,10 +381,12 @@ function M.gate(tool, args, ctx, call_original)
     -- 其目录级一致性由工具自身叠加暂存视图实现。LSP 工具不重写：把无项目根的暂存路径
     -- 交给 LSP 会导致 root_dir/client 匹配错误，故仍读真实内容（已知边界）。
     local rev = {}
+    local read_proc = false -- 读 /proc/* 时结果需经 conceal 脱敏（防沙箱指纹/宿主路径泄露）
     if spec.effect == "read" then
       for _, key in ipairs(spec.paths or {}) do
         local v = args[key]
         if type(v) == "string" then
+          if v:match("^/proc/") then read_proc = true end
           local staged = candidate.read_path(v)
           if staged then
             rev[staged] = vim.fn.fnamemodify(fs.expand(v), ":p"):gsub("/+$", "")
@@ -326,14 +400,29 @@ function M.gate(tool, args, ctx, call_original)
       pcall(function() require("NeoAI.sandbox.lsp").refresh() end)
     end
     local d = call_original()
-    if next(rev) then
+    if next(rev) or read_proc then
       -- 成功与失败都还原暂存路径：读取暂存副本失败（如暂存已删除）时，错误信息
       -- 会带暂存路径，必须还原为真实路径，避免沙箱内部路径泄露给模型。
+      -- read_proc：`read_file /proc/self/mountinfo` 等进程内直读不经 run_command，
+      -- 不会被 shell 输出脱敏；此处对 /proc 读取结果补做 conceal 脱敏，避免 overlay
+      -- lowerdir/upperdir 等沙箱指纹与宿主路径泄露给模型（此前为 conceal 旁路）。
       local out = async.Deferred.new()
+      local function _sanitize(v)
+        v = _rewrite_value(rev, v)
+        if not read_proc then return v end
+        local conceal = require("NeoAI.sandbox.conceal")
+        if type(v) == "string" then return conceal.redact(v) end
+        if type(v) == "table" then
+          for k, val in pairs(v) do
+            if type(val) == "string" then v[k] = conceal.redact(val) end
+          end
+        end
+        return v
+      end
       d:then_(function(res)
-        out:resolve(_rewrite_value(rev, res))
+        out:resolve(_sanitize(res))
       end, function(err)
-        out:reject(_rewrite_value(rev, err))
+        out:reject(_sanitize(err))
       end)
       return out
     end
@@ -342,6 +431,12 @@ function M.gate(tool, args, ctx, call_original)
 
   -- 网络：默认放行，仅记录审计（不拦截）；offline=true 或受控白名单在策略层已拒绝
   if spec.effect == "network" then
+    pcall(function()
+      require("NeoAI.sandbox.audit").observe({
+        kind = "network", tool = attempt.tool_name, level = 1,
+        reasons = { "NETWORK_ACCESS" }, command_id = attempt.command_id,
+      })
+    end)
     control.transition(attempt, "STAGING")
     control.transition(attempt, "CANDIDATE_READY")
     control.transition(attempt, "COMPLETED_READ_ONLY")
@@ -380,6 +475,8 @@ function M.gate(tool, args, ctx, call_original)
         spec.mode = "overlay"
       else
         spec.mode = "bind"
+        -- 记录降级原因，供 run_command 结果中说明（便于排查 overlay 为何不可用）
+        spec.overlay_reason = runtime.overlay_reason(spec.root, spec.upper, spec.work)
       end
     end
     -- 双向互通：把工作区暂存内容物化进所选层，使命令看到 AI 尚未发布的编辑
@@ -410,6 +507,21 @@ function M.gate(tool, args, ctx, call_original)
     local privilege = require("NeoAI.sandbox.privilege")
     local pcfg = config_store.get("tools.sandbox.privilege") or {}
     local req = privilege.classify(attempt.tool_name, args, spec)
+    attempt.package = req.package == true
+    attempt.network = req.network == true
+    -- 容器受控：docker/podman 等运行时尽量与沙箱同 namespace（podman 无守护进程可共享；
+    -- docker 依赖外部 daemon，保持受控 socket 并记录原因）。重写命令以注入共享标志。
+    pcall(function()
+      local container = require("NeoAI.sandbox.container")
+      local plan = container.plan(args and args.command)
+      if plan then
+        if plan.rewritten then args.command = plan.command end
+        attempt.container_command = plan.command
+        container.record(plan, {
+          tool = attempt.tool_name, command_id = attempt.command_id, attempt_id = attempt.attempt_id,
+        })
+      end
+    end)
     -- 实际用于执行/捕获的 overlay 规格：嵌套 userns（T2）下 overlay 会 EINVAL，
     -- 退化为「只读根 + 私有 cwd」，改动仅在 cwd 捕获（主机效果走提案）。
     local active_specs = specs
@@ -444,6 +556,17 @@ function M.gate(tool, args, ctx, call_original)
       end
       ctx.sandbox_prefix = prefix
       ctx.sandbox_cwd = eff_cwd
+      ctx.sandbox_env = runtime.sandbox_env(eff_priv)
+      -- 视图降级标记：无 overlay（bind 私有层 / userns 档）时命令看不到真实项目文件，
+      -- 只看到会话私有视图；供 run_command 在结果中提示，避免与真实磁盘视图混同。
+      local degraded = true
+      local degraded_reason
+      for _, s in ipairs(active_specs) do
+        if s.mode == "overlay" then degraded = false end
+        if not degraded_reason and s.overlay_reason then degraded_reason = s.overlay_reason end
+      end
+      ctx.sandbox_degraded = degraded
+      ctx.sandbox_degraded_reason = degraded_reason
       ctx.sandbox_shell_state = session_dir and require("NeoAI.sandbox.conceal").session_mount() or nil
       return true
     end
@@ -480,6 +603,34 @@ function M.gate(tool, args, ctx, call_original)
         control.transition(attempt, "FAILED")
         candidate.cleanup(attempt.attempt_id)
         d:reject(_rewrite_result(mapping, err))
+        return
+      end
+      -- 通过命令执行结果判断安全级别（权限不足/网络/包变更/破坏性输出等信号）。
+      if ctx.sandbox_last_result then
+        pcall(function()
+          attempt.result_risk = require("NeoAI.sandbox.risk").from_result(ctx.sandbox_last_result, nil)
+        end)
+      end
+      -- 只读进程工具（如 git_status/git_diff）：在沙箱命名空间内读取暂存视图，但不捕获候选。
+      -- 命令运行在 overlay 上（真实内容为只读 lower，暂存已物化进 upper），故看到的是暂存内容；
+      -- 不冻结候选、不入待审队列，避免只读命令把已暂存改动重复入队。
+      if spec.read_only then
+        if attempt.result_risk and (attempt.result_risk.level or 0) > 0 then
+          pcall(function()
+            require("NeoAI.sandbox.risk").record({
+              tool = attempt.tool_name, command_id = attempt.command_id, attempt_id = attempt.attempt_id,
+              level = attempt.result_risk.level, reasons = attempt.result_risk.reasons,
+              signals = attempt.result_risk.signals, source = "result",
+            })
+            require("NeoAI.sandbox.audit").observe({
+              kind = "process", tool = attempt.tool_name, level = attempt.result_risk.level,
+              reasons = attempt.result_risk.reasons, command_id = attempt.command_id,
+            })
+          end)
+        end
+        control.transition(attempt, "COMPLETED_READ_ONLY")
+        candidate.cleanup(attempt.attempt_id)
+        d:resolve(res)
         return
       end
       -- 捕获各可写根 overlay 的改动；overlay 不可用（或 userns 档位）时捕获降级私有 cwd
@@ -546,6 +697,13 @@ function M.gate(tool, args, ctx, call_original)
                       command_id = attempt.command_id, from_tier = current_tier,
                       to_tier = esc.tier, reason = esc.reason,
                     })
+                end)
+                -- 提权行为仅记录（写入保护已覆盖文件改动），供后续异常行为分析。
+                pcall(function()
+                  require("NeoAI.sandbox.audit").observe({
+                    kind = "privilege", tool = attempt.tool_name, level = esc.tier >= 2 and 2 or 1,
+                    reasons = { esc.reason or "ESCALATION" }, command_id = attempt.command_id,
+                  })
                 end)
                 run(r2.privileges, esc.tier)
                 return

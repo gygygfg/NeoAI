@@ -19,7 +19,8 @@ M.TIER = { MINIMAL = 0, ELEVATED = 1, PRIVILEGED = 2 }
 
 -- 档位默认（配置缺省时兜底；与 default_config.lua 保持一致）
 local TIER_DEFAULTS = {
-  [0] = { name = "minimal", review = "auto", network = false, cap_add = {}, mounts = {}, unmask = {} },
+  -- T0 默认放行网络（仅记录）但经 host_proxy 拦截本机访问；offline=true 时仍硬隔离。
+  [0] = { name = "minimal", review = "auto", network = true, cap_add = {}, mounts = {}, unmask = {} },
   [1] = {
     name = "elevated", review = "auto", network = true, cap_add = {}, mounts = {},
     unmask = { "/run/docker.sock", "/var/run/docker.sock" },
@@ -174,32 +175,34 @@ end
 --- @param tool string|nil
 --- @param args table|nil
 --- @param spec table|nil { effect }
---- @return table { tier, reasons, docker, network }
+--- @return table { tier, reasons, docker, container, network, package }
 function M.classify(tool, args, spec)
   local cfg = _cfg()
   if cfg.enabled == false then
-    return { tier = M.TIER.MINIMAL, reasons = { "PRIVILEGE_DISABLED" }, docker = false, network = false }
+    return { tier = M.TIER.MINIMAL, reasons = { "PRIVILEGE_DISABLED" }, docker = false, container = false, network = false, package = false }
   end
   if not spec or spec.effect ~= "process" then
-    return { tier = M.TIER.MINIMAL, reasons = { "NON_PROCESS_EFFECT" }, docker = false, network = false }
+    return { tier = M.TIER.MINIMAL, reasons = { "NON_PROCESS_EFFECT" }, docker = false, container = false, network = false, package = false }
   end
   local command = tostring((args and (args.command or args.cmd)) or "")
   if command == "" then
-    return { tier = M.TIER.MINIMAL, reasons = { "NO_COMMAND" }, docker = false, network = false }
+    return { tier = M.TIER.MINIMAL, reasons = { "NO_COMMAND" }, docker = false, container = false, network = false, package = false }
   end
   local rules = cfg.classify or {}
   local tier, reasons = M.TIER.MINIMAL, {}
-  local docker, network = false, false
+  local docker, container, network, package = false, false, false, false
   for _, seg in ipairs(_segments(command)) do
     local t, name = _classify_segment(seg, rules)
     if t then
       if t > tier then tier = t end
       reasons[#reasons + 1] = name or ("TIER_" .. tostring(t))
       if name == "docker" then docker = true end
+      if name == "container" then container = true; network = true end
       if name == "network" then network = true end
+      if name == "package" then package = true; network = true end
     end
   end
-  return { tier = tier, reasons = reasons, docker = docker, network = network }
+  return { tier = tier, reasons = reasons, docker = docker, container = container, network = network, package = package }
 end
 
 --- 解析档位对应的具体隔离参数

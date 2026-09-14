@@ -107,4 +107,26 @@ tests.suite("tool_pending", function(_, it)
     -- 暂存 Deferred 已 resolve，不会另开一轮
     t.true_(d:is_resolved(), "注入后用户消息 Deferred 应 resolve")
   end)
+
+  it("工具循环取消时为未完成调用补写显式结果，避免孤立 tool_calls", function(t)
+    local agent_mod = require("NeoAI.core.agent.agent")
+    local tool_loop = require("NeoAI.core.agent.tool_loop")
+    local agent = agent_mod.create({ config = {} })
+    local calls = {
+      { id = "a", type = "function", ["function"] = { name = "read_file", arguments = "{}" } },
+    }
+    agent:add_message("assistant", "")
+    agent:set_tool_calls(calls)
+    agent.signal:abort("user_cancelled")
+
+    local d = tool_loop.run(agent, calls, {}, {})
+    local settled = vim.wait(2000, function() return d:is_resolved() or d._state == "rejected" end)
+    t.true_(settled, "取消时 run 应 settle")
+    t.eq("rejected", d._state, "取消应 reject")
+
+    local last = agent.messages[#agent.messages]
+    t.eq("tool", last.role, "应为未完成调用补写 tool 结果")
+    t.eq("a", last.tool_call_id, "tool 结果应对应原调用 id")
+    t.matches("cancelled", last.content, "结果应明确标注已取消")
+  end)
 end)

@@ -35,7 +35,10 @@ tests.suite("sandbox_lsp", function(_, it)
       sandbox.reset()
       local wrapped = lsp.wrap_cmd({ "fake-lsp", "--stdio" }, { cwd = dir })
       if not wrapped then return end -- overlay 不可用环境跳过
-      t.eq("bwrap", wrapped[1], "应以 bwrap 启动")
+      -- 前缀先经 fd 关闭包装（bash/python/sh）再 exec bwrap；bwrap 可能不在首位。
+      local bw
+      for i, v in ipairs(wrapped) do if v == "bwrap" then bw = i end end
+      t.not_nil(bw, "应包含 bwrap 启动")
       t.eq("fake-lsp", wrapped[#wrapped - 1], "原始命令应保留在末尾")
       t.eq("--stdio", wrapped[#wrapped], "原始参数顺序不变")
       local joined = table.concat(wrapped, " ")

@@ -9,6 +9,11 @@ local secret = require("NeoAI.sandbox.secret")
 
 local M = {}
 
+-- 降级视图提示：overlay 不可用时命令运行在会话私有 cwd，看不到真实项目文件（仅暂存改动），
+-- 与真实磁盘视图不一致；在结果中明确标注，避免把「看不到」误判为「文件不存在/改动未生效」。
+local DEGRADED_NOTE = "[NeoAI] 注意：沙箱以降级模式运行（overlay 不可用），命令工作目录为"
+  .. "会话私有视图，可能不含真实磁盘上的其他文件；请用 read_file/search_files 核对。"
+
 -- ========== 私有函数 ==========
 
 --- 为 argv 前置沙箱运行时前缀（隔离执行）
@@ -71,8 +76,8 @@ local function _run_command(command, opts)
 
   job = vim.fn.jobstart(_sandboxed_argv({ "sh", "-c", command }, opts), {
     cwd = opts.cwd,
-    -- 环境变量脱敏：高熵密钥值替换为 token，命令看不到真实密钥（进沙箱加密）。
-    env = secret.sanitized_env(),
+    -- 环境变量脱敏 + 宿主运行时直通；优先使用门禁预构造的沙箱环境（含档位 env/PATH）。
+    env = opts.env or secret.sanitized_env(),
     stdout_buffered = false,
     stderr_buffered = false,
     on_stdout = function(_, data)
@@ -148,30 +153,58 @@ shell_tools.run_command = helpers.define_tool(
   function(args, on_success, on_error, ctx)
     local command = args.command
     local signal = ctx and ctx.signal
+    -- 代理策略：默认不把宿主代理（如不可达的 127.0.0.1:7890）传入沙箱，
+    -- 避免 pip/npm 等按代理配置走网络时 Connection refused；仅 opencode 自身用代理。
+    local unset_proxy = require("NeoAI.sandbox.runtime").proxy_unset_snippet()
+    if unset_proxy then command = unset_proxy .. "\n" .. command end
     if ctx and ctx.sandbox_shell_state then
       command = _wrap_session_command(command, ctx.sandbox_shell_state)
     end
+    -- 丢弃上一条命令遗留的网关探测记录，确保摘要只反映本次命令。
+    local ok_gw0, gw0 = pcall(require, "NeoAI.sandbox.gateway")
+    if ok_gw0 and gw0 then gw0.drain_probes() end
     _run_command(command, {
       timeout_ms = args.timeout_ms,
       signal = signal,
       prefix = ctx and ctx.sandbox_prefix,
       cwd = ctx and ctx.sandbox_cwd,
+      env = ctx and ctx.sandbox_env,
     }):then_(function(result)
       -- 供沙箱门禁做权限不足检测（自动提权）：保留原始 {code,stdout,stderr}。
       if ctx then ctx.sandbox_last_result = result end
       -- 输出脱敏：抹去 bwrap/overlay/沙箱自有路径等指纹，使 AI 的外部命令难以识别沙箱。
       local out = conceal.redact(result.stdout or "")
       local errout = conceal.redact(result.stderr or "")
+      local text
       if result.aborted then
         -- 取消/超时/非零退出都回传已产生的终端内容，模型仍能看到当前进度
-        on_success(_with_status("命令已取消：" .. tostring(result.message or "cancelled"), out, errout))
+        text = _with_status("命令已取消：" .. tostring(result.message or "cancelled"), out, errout)
       elseif result.timed_out then
-        on_success(_with_status("命令执行超时", out, errout))
+        text = _with_status("命令执行超时", out, errout)
       elseif result.code == 0 then
-        on_success(out ~= "" and out or "（无输出）")
+        text = out ~= "" and out or "（无输出）"
       else
-        on_success(_with_status(string.format("命令退出码 %d", result.code), out, errout))
+        text = _with_status(string.format("命令退出码 %d", result.code), out, errout)
       end
+      if ctx and ctx.sandbox_degraded then
+        text = text .. "\n\n" .. DEGRADED_NOTE
+        if ctx.sandbox_degraded_reason and ctx.sandbox_degraded_reason ~= "" then
+          text = text .. "（overlay 不可用原因：" .. tostring(ctx.sandbox_degraded_reason) .. "）"
+        end
+      end
+      -- 网络网关模式：把本次命令经网关探测到的宿主端口及拦截原因回传给 AI。
+      local ok_gw, gw = pcall(require, "NeoAI.sandbox.gateway")
+      if ok_gw and gw then
+        local s = gw.summary()
+        if s then text = text .. "\n\n" .. s end
+      end
+      -- 本机访问拦截代理：回传本次经代理放行/拦截的目标摘要（应用层）。
+      local ok_hp, hp = pcall(require, "NeoAI.sandbox.host_proxy")
+      if ok_hp and hp then
+        local s = hp.summary()
+        if s then text = text .. "\n\n" .. s end
+      end
+      on_success(text)
     end, function(err)
       on_error(conceal.redact(err.message or tostring(err)))
     end)

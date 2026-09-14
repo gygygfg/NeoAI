@@ -44,7 +44,7 @@ The chat window = **main message area (top)** + **input box (bottom, split, heig
 | Hot-reload display mode | `<F5>` | Reload the current display-mode plugin |
 | Approve plan | — | AI calls `exit_plan_mode` (opens an approval window for confirmation) or run `:NeoAIApprovePlan` |
 | Tool approval | `<C-a>` | Confirm inside the approval popup |
-| Sandbox review | `<leader>ap` | Equivalent to `:NeoAISandboxReview`; list and apply pending sandbox changes (per-file approval) |
+| Sandbox review | `<leader>ap` | Equivalent to `:NeoAISandboxReview`; list and apply pending sandbox changes (per-file approval), graded high/medium/low; press `i` to preview that item's diff (temporarily closes the review window and returns with the cursor restored) |
 | Scroll | `j` / `k` / mouse wheel | `j`/`k` move the cursor by line; the wheel smoothly scrolls the viewport, with blank space below the last line capped at `ui.chat.mousescroll_max_blank` lines |
 
 ## 4. Streaming Updates and Floating Windows

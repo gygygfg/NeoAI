@@ -55,6 +55,38 @@ local STATUS_EMOJI = {
 
 local timing = {}
 
+-- ========== 推理折叠标记 ==========
+-- 由渲染层（message_list）在写入 buffer 后登记「推理块起始行」。
+-- 折叠占位文本据此判定某折叠是否为真正的推理块：只有被显式登记的行才显示
+-- 「🤔 思考过程」，其余未识别折叠显示中性占位，避免「所有折叠都渲染成思考过程」。
+-- 以 buffer 为单位保存（弱键），随每次渲染全量重建。
+
+local reasoning_lines = setmetatable({}, { __mode = "k" })
+
+--- 登记某 buffer 的推理块起始行集合
+--- @param buf number
+--- @param set table<number, boolean>
+function M.set_reasoning_lines(buf, set)
+  if buf and vim.api.nvim_buf_is_valid(buf) then
+    reasoning_lines[buf] = set or {}
+  end
+end
+
+--- 清除某 buffer 的推理块标记
+--- @param buf number
+function M.clear_reasoning_lines(buf)
+  reasoning_lines[buf] = nil
+end
+
+--- 某行是否为已登记的推理块起始行
+--- @param buf number
+--- @param line number
+--- @return boolean
+function M.is_reasoning_start(buf, line)
+  local set = reasoning_lines[buf]
+  return (set ~= nil) and (set[line] == true)
+end
+
 local function _now_ms()
   return vim.uv.hrtime() / 1e6
 end
@@ -210,8 +242,9 @@ end
 --- （🔧 name · 目的 ✅ 1.2s）。推理折叠沿用思考过程摘要。
 --- @param first string 折叠首行
 --- @param count number 折叠行数
+--- @param is_reasoning boolean|nil 是否为已登记的推理块（默认 true，保持旧语义）
 --- @return string
-function M.label(first, count)
+function M.label(first, count, is_reasoning)
   local kind, status, name, desc = M.detect(first)
   if kind == "tool_call" or kind == "tool_result" then
     local status_emoji = STATUS_EMOJI[status] or "⏳"
@@ -222,19 +255,42 @@ function M.label(first, count)
     end
     return string.format("  🔧 %s%s %s", name, desc_str, status_emoji)
   end
+  if is_reasoning == false then
+    return M.generic_label(first, count)
+  end
   return string.format("  🤔 思考过程 %d 行", count)
 end
 
+--- 未识别折叠的中性占位文本（不冒充思考过程）：优先显示首行预览，否则显示行数
+--- @param first string 折叠首行
+--- @param count number 折叠行数
+--- @return string
+function M.generic_label(first, count)
+  local preview = (first or ""):gsub("^%s+", ""):gsub("%s+$", ""):gsub("%s+", " ")
+  if preview == "" then
+    return string.format("  📄 折叠 %d 行", count)
+  end
+  if #preview > 40 then preview = preview:sub(1, 40) .. "…" end
+  return string.format("  📄 %s  (%d 行)", preview, count)
+end
+
 --- 折叠占位文本（foldtext 回调：读取 vim.v.foldstart/foldend 与折叠首行）
---- 有显示模式覆盖时委托给当前插件的 foldtext。
+--- 有显示模式覆盖时委托给当前插件的 foldtext。仅「已登记为推理块」的折叠显示
+--- 思考过程；其余未识别折叠显示中性占位，避免所有折叠都渲染成思考过程。
 --- @return string
 function M.foldtext()
   if foldtext_override then
     return foldtext_override()
   end
-  local count = vim.v.foldend - vim.v.foldstart + 1
-  local first = vim.fn.getline(vim.v.foldstart) or ""
-  return M.label(first, count)
+  local start = vim.v.foldstart
+  local count = vim.v.foldend - start + 1
+  local first = vim.fn.getline(start) or ""
+  local kind = M.detect(first)
+  if kind == "tool_call" or kind == "tool_result" then
+    return M.label(first, count, true)
+  end
+  local buf = vim.api.nvim_get_current_buf()
+  return M.label(first, count, M.is_reasoning_start(buf, start))
 end
 
 -- ========== expr 折叠 ==========

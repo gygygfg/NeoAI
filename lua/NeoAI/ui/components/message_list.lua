@@ -156,15 +156,29 @@ end
 --- 空行保留为空白分隔（expr 折叠会把紧邻缩进内容的空行并入折叠）。
 --- @param lines table
 --- @param rows table 块内文本行（单行纯文本，不含换行）
-local function _append_fold_block(lines, marks, rows)
+--- @param kind string|nil 折叠类型（"reasoning"/"tool"），登记到首行元数据供 foldtext 判定
+local function _append_fold_block(lines, marks, rows, kind)
   if not rows or #rows == 0 then return end
-  for _, l in ipairs(rows) do
+  for idx, l in ipairs(rows) do
+    local mark = (idx == 1 and kind) and { fold_kind = kind } or nil
     if l == "" then
-      _push(lines, marks, "", nil)
+      _push(lines, marks, "", mark)
     else
-      _push(lines, marks, "  " .. l, nil)
+      _push(lines, marks, "  " .. l, mark)
     end
   end
+end
+
+--- 把推理块起始行登记到 fold 组件，供 foldtext 区分「思考过程」与其它折叠。
+--- @param buf number
+--- @param marks table 与 lines 并行的元数据数组
+local function _sync_fold_kinds(buf, marks)
+  local set = {}
+  for i = 1, #(marks or {}) do
+    local m = marks[i]
+    if m and m.fold_kind == "reasoning" then set[i] = true end
+  end
+  fold.set_reasoning_lines(buf, set)
 end
 
 --- 判断消息是否为轮次边界（其后应绘制分割线）。
@@ -216,7 +230,7 @@ local function _append_reasoning(lines, marks, message, opts)
   for _, l in ipairs(rl) do
     rows[#rows + 1] = l.text
   end
-  _append_fold_block(lines, marks, rows)
+  _append_fold_block(lines, marks, rows, "reasoning")
 end
 
 --- 追加正文内容（markdown 渲染）——工具消息除外
@@ -393,7 +407,7 @@ local function _append_tool_block(lines, marks, tool_call, result_msg)
       rows[#rows + 1] = l
     end
   end
-  _append_fold_block(lines, marks, rows)
+  _append_fold_block(lines, marks, rows, "tool")
 end
 
 --- 追加轮次分割线（仅在轮次边界出现）
@@ -602,6 +616,7 @@ local function _render_chat_full(buf, msgs, opts)
   vim.bo[buf].modifiable = true
   vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
   _apply_table_hl(buf, marks)
+  _sync_fold_kinds(buf, marks)
   -- 已直接重写全书：块缓存与内容镜像过期
   incremental.invalidate(buf)
   return { changed = true, start = 1, removed = -1, inserted = #lines, full = true }
@@ -631,6 +646,7 @@ function M.render_chat(buf, messages, opts)
   if diff.changed then
     local from, to = incremental.written_range(diff)
     _apply_table_hl(buf, marks, 1, diff.full and nil or from, diff.full and nil or to)
+    _sync_fold_kinds(buf, marks)
   end
   return diff
 end

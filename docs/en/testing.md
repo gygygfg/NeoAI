@@ -118,7 +118,26 @@ ensures there are no leftover subscriptions or state between tests.
 | `test_plugins` | Plugin protocol: dependency waiting, replacement, disable, failure rollback, real message request, repeated start, tool/prompt-section release, hot reload |
 | `test_sandbox` | Tool sandbox: loader spec attachment, fail-closed, state machine/idempotency/fencing, policy aggregation and restricted rules, dry-run no-write, CAS publish and conflict, buffer write redirection, runtime probe and isolated process, async review enqueue/apply/reject, selective apply, run_command overlay candidate capture, impact model, evidence redaction/paging, task grants auto-apply/scope, constraint aggregation, decision envelope, retention and metrics, controlled network gateway, broker idempotency/reconcile, dependency closure, composed publish and path conflict, policy replay, evidence retention, cgroup resource domain and PID limit, seccomp baseline enforcement and gate, content-addressed cache, fault injection (publish/backend/freeze), performance benchmarks, revision derivation |
 
-### 5.1 Plugin Testing Conventions
+### 5.1 Sandbox Escape / Info-leak Audit (`scripts/sandbox_audit.lua`)
+
+Runs an attack battery inside the real sandbox (writing dangerous global sysctls, reading host
+credentials/sockets, magic sysrq, `mount`/`unshare`/`nsenter`, `/proc/net` and `ip` info leaks,
+raw TCP vs proxy interception, ...) and prints a structured report for human confirmation:
+
+```bash
+nvim --headless --clean -u NONE --cmd "set rtp+=$PWD" -c "luafile scripts/sandbox_audit.lua"
+```
+
+Reading it: every `write_*` must be `READONLY`; `socket AF_VSOCK`/`AF_PACKET`/`AF_ALG` must be
+`EPERM`, `clone_NEWUSER` `EPERM`, `clone3` `ENOSYS`, `sysctl(2)` `ENOSYS`;
+`raw_tcp_host=RAW_REACHED` and non-empty `proc_net_*`/`ip_*`/`host_info_leaks` are **known
+residual boundaries** (inherent to the shared netns / global procfs, see
+[sandbox.md](sandbox.md) §6.1). Regressions are guarded by the `test_sandbox` cases
+"mandatory dangerous-sysctl masking", "cannot write core_pattern", "clone namespace filtering",
+"socket address-family allowlist", "read_file /proc redaction" and
+"masked-path symlink / `/proc/<pid>/root` resolution".
+
+### 5.2 Plugin Testing Conventions
 
 - Use unique plugin ids and service names; `unregister` / `revoke` at the end so running builtin plugins are not polluted.
 - Tests that change configuration save and restore `config_store.get_all()`.

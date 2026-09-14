@@ -19,21 +19,30 @@ local M = {}
 
 --- 工具参数命中的首个遮蔽目录条目（供弹窗审批与 fail-closed）。未命中/未开启返回 nil。
 --- 覆盖显式路径参数（tool_spec.paths）与 run_command 命令串中的绝对路径。
+--- 返回值第二项 `hard=true` 表示命中**宿主敏感遮蔽路径**（mask_paths/沙箱存储）：
+--- 进程内 read/fs_write 不经 namespace，mount 遮蔽无效，必须硬拒绝（不可审批放行）。
 --- @param tool_name string
 --- @param args table
 --- @return string|nil mask_entry
+--- @return boolean hard
 local function _masked_target(tool_name, args)
   local runtime = require("NeoAI.sandbox.runtime")
-  if not runtime.mask_dirs_enabled() then return nil end
   local cwd = vim.fn.getcwd()
   local spec = tool_spec.get(tool_name)
   for _, field in ipairs(spec.paths or {}) do
     local p = args and args[field]
     if type(p) == "string" and p ~= "" then
-      local hit = runtime.mask_entry(vim.fn.fnamemodify(p, ":p"), cwd)
+      local abs = vim.fn.fnamemodify(p, ":p")
+      -- 先判宿主敏感遮蔽路径（mask_paths/沙箱存储，硬拒绝），再判遮蔽目录（mask_dirs，可审批）。
+      -- 二者可能重叠（如 /root/.ssh 既在 mask_paths 又位于遮蔽目录 /root 下）；若先判
+      -- mask_dirs，软命中会遮蔽硬命中，使非进程内 fs 工具（如 read_image）在无审批界面时放行。
+      local masked = runtime.is_masked_path(abs)
+      if masked then return masked, true end
+      local hit = runtime.mask_entry(abs, cwd)
       if hit then return hit end
     end
   end
+  if not runtime.mask_dirs_enabled() then return nil end
   local cmd = args and args.command
   if type(cmd) == "string" and cmd ~= "" then
     for _, d in ipairs(runtime.mask_dirs()) do
@@ -271,7 +280,18 @@ local function _tokenize_out(d)
   local out = async.Deferred.new()
   d:then_(function(v)
     local ok, tv = pcall(secret.tokenize_result, v)
-    out:resolve(ok and tv or v)
+    local result = ok and tv or v
+    -- 识别到 AI 读取到 KEY（结果含 token）时追加说明，澄清 token 语义与自动还原。
+    if secret.contains_token(result) then
+      local hint = secret.read_hint()
+      if type(result) == "string" then
+        result = result .. "\n\n" .. hint
+      elseif type(result) == "table" then
+        result = vim.deepcopy(result)
+        result.neoai_secret_hint = hint
+      end
+    end
+    out:resolve(result)
   end, function(e)
     out:reject(e)
   end)
@@ -327,14 +347,18 @@ function M.execute(tool_name, raw_args, ctx)
   local approval_config = registry.get_approval_config(resolved)
   local mode = ctx.approval_mode or config_store.get("tools.approval.mode") or "async"
   local spec = tool_spec.get(resolved)
-  local masked_hit = _masked_target(resolved, args)
+  local masked_hit, masked_hard = _masked_target(resolved, args)
   local approval_on = config_store.get("tools.sandbox.mask_dirs_approval") ~= false
   -- 进程内读写（read/fs_write）不受 mount 遮蔽约束，必须显式拦截；外部进程（process/network）
   -- 由 mount 硬遮蔽。有审批界面且开启审批时弹窗放行，否则 fail-closed 拒绝。
+  -- 命中宿主敏感遮蔽路径（mask_paths/沙箱存储）时不可审批放行，直接硬拒绝。
   local can_approve = (not ctx.is_sub_agent) and ctx.tool_service ~= nil
   local in_process_fs = spec.effect == "read" or spec.effect == "fs_write"
   local needs_approval = false
   if masked_hit then
+    if masked_hard then
+      return async.reject({ kind = "sandbox", message = "路径位于宿主敏感遮蔽路径: " .. masked_hit })
+    end
     if approval_on and can_approve then
       ctx.sandbox_unmask = ctx.sandbox_unmask or {}
       ctx.sandbox_unmask[#ctx.sandbox_unmask + 1] = masked_hit

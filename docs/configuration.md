@@ -228,9 +228,13 @@ sandbox = {
   readonly_paths = { "/etc/ld.so.cache", "/etc/passwd", "/etc/group", "/etc/nsswitch.conf",
     "/etc/hosts", "/etc/ssl", "/etc/alternatives", "/etc/localtime",
     "/etc/os-release", "/etc/terminfo", "/etc/profile", "/etc/security", "/etc/pam.d" },
+  expose_paths = {},               -- 宿主运行时直通（opt-in）：这些宿主路径在遮蔽/临时根之后只读暴露，并前置到沙箱 PATH，使 run_command 能调用宿主工具链（如 nvim/lua/luajit/mason）。仅暴露可信只读工具目录
+  expose_path_env = true,          -- 是否把 expose_paths 目录前置到沙箱 PATH（false 仅挂载不改 PATH）
+  expose_tool_paths = false,       -- 自动直通宿主 PATH 中的工具目录（opt-in）：把宿主 PATH 里存在且非凭据/系统目录的 bin 目录只读暴露并前置到沙箱 PATH，使 node/npm/fd/go 等装在 $HOME 下的工具链可用（会扩大读取面）
   resolv_conf = "sanitize",        -- /etc/resolv.conf：sanitize（默认，仅 nameserver）| hide | passthrough
-  tmpfs_roots = { "/tmp", "/var/tmp" }, -- 每会话私有 tmpfs（不作为 overlay lower；退出即销毁）
-  hide_proc_paths = { "/proc/cmdline", "/proc/version" }, -- 以空文件覆盖，隐藏宿主内核命令行/版本
+  tmpfs_roots = { "/tmp", "/var/tmp" }, -- 每会话私有临时根（不作为 overlay lower；退出即销毁）
+  tmp_private_base = "host",       -- 临时根私有目录位置：host（默认，宿主根下隐藏子目录 /tmp/.cache-<tag>/<session>，命名空间映射回该根，隔离 AI）| session（旧行为：建在会话进程目录）
+  hide_proc_paths = { "/proc/cmdline", "/proc/version" }, -- 以空文件覆盖，隐藏宿主内核命令行/版本（危险全局 sysctl 为常驻强制遮蔽，只增不减）
   mask_paths = {                   -- 遮蔽宿主敏感路径（目录 tmpfs / 文件·socket 用 /dev/null 覆盖）
     "/run/docker.sock", "/var/run/docker.sock", "/var/lib/docker", "/var/lib/containerd",
     "/root/.config/herdr", "/etc/1panel", "/run/dbus", "/run/systemd",
@@ -243,30 +247,56 @@ sandbox = {
   mask_dirs_enabled = true,        -- 总开关
   mask_dirs = { "/home", "/root" }, -- 遮蔽目录列表（支持 * 通配）
   mask_dirs_approval = true,       -- 命中遮蔽目录时弹窗审批（复用工具审批 UI）
-  network = { enabled = false, allowed_endpoints = {}, budget_bytes = 0 }, -- 受控网络网关
-  -- 权限档位与自动提权：命令默认 T0 最小权限（含默认隔离网络），权限不足自动发起升级。
+  network = {
+    enabled = false, allowed_endpoints = {}, budget_bytes = 0, -- 受控网络网关
+    -- 拦截向宿主本机（回环/宿主网卡 IP/链路本地/云元数据）的访问（默认开）：注入
+    -- HTTP(S)_PROXY/ALL_PROXY 指向宿主侧 Lua 过滤代理，本机目标拦截、外部放行并记录。
+    -- 应用层边界：不认代理的裸 TCP 可绕过（详见 docs/sandbox.md §6.1）。
+    host_local_block = true,
+    host_local_proxy_port = 0,       -- 宿主过滤代理端口（0 = 自动分配 loopback 随机端口）
+    -- 沙箱外部命令代理策略：strip（默认，不把宿主代理传入沙箱，如 mihomo 只代理 opencode 自身，
+    -- 避免宿主 HTTPS_PROXY=127.0.0.1:7890 在沙箱内不可达导致 pip/npm 失败）| passthrough（沿用宿主）|
+    -- table { http, https, all, no_proxy }（显式设置；未列出的代理变量清除）。
+    -- 注意：host_local_block 开启时会注入指向宿主过滤代理的变量，此时 strip 不生效。
+    proxy = "strip",
+    -- 独立 netns + 宿主网关（opt-in）：沙箱进程进入隔离网络命名空间，只能到达宿主网关；
+    -- 网关对目标 host:port 先做 TCP connect 探针（可探测宿主哪些端口在监听），但不回传真实
+    -- 服务数据，而是把拦截原因（JSON）返回给客户端。仅允许探测宿主本机地址。需 root 与 ip。
+    gateway = { enabled = false, probe_timeout_ms = 1000, max_probes = 4096 },
+  },
+  -- 权限档位与自动提权：命令默认 T0 最小权限（网络默认放行并拦截本机访问），权限不足自动发起升级。
   privilege = {
     enabled = true, auto_escalate = true, max_tier = 2, record = true,
     tiers = {                       -- 各档位的网络/额外 cap/挂载/解除遮蔽/审查严格度
-      [0] = { name = "minimal", review = "auto", network = false, cap_add = {}, mounts = {}, unmask = {} },
+      [0] = { name = "minimal", review = "auto", network = true, cap_add = {}, mounts = {}, unmask = {} }, -- 默认放行网络（仅记录）；本机访问经 host_proxy 拦截
       [1] = { name = "elevated", review = "auto", network = true, cap_add = {}, mounts = {}, unmask = { "/run/docker.sock", "/var/run/docker.sock" } },
       [2] = { name = "privileged", review = "approve", network = true, userns = true, cap_add = {}, mounts = {}, unmask = { "/run/docker.sock", "/var/run/docker.sock" } },
     },
     classify = {                    -- 命令分类规则（bins 精确可执行名；bin+subs 可执行名+子命令）
       { tier = 2, name = "privileged", bins = { "sudo", "mount", "modprobe", "iptables", "systemctl", "unshare", "nsenter" } },
-      { tier = 1, name = "docker", bins = { "docker", "docker-compose", "podman", "nerdctl" } },
+      { tier = 1, name = "docker", bins = { "docker", "docker-compose", "nerdctl" } }, -- 有守护进程：受控 socket
+      { tier = 1, name = "container", bins = { "podman", "podman-compose", "buildah", "skopeo" } }, -- 无守护进程：可与沙箱同 namespace
       { tier = 1, name = "network", bins = { "curl", "wget", "ssh", "rsync", "ping", "socat" } },
       { tier = 1, name = "network", bin = "git", subs = { "push", "pull", "fetch", "clone" } },
+      { tier = 1, name = "package", bins = { "apt", "apt-get", "dnf", "yum", "pacman", "apk", "brew" } }, -- 包安装：额外规则
     },
   },
   -- 受控 docker：不绑定宿主 /var/run/docker.sock；controlled 指向外部受控 socket。
   docker = { mode = "controlled", socket = "/run/neoai-docker/docker.sock" }, -- off | controlled | host
+  -- 容器受控运行：podman 等无守护进程运行时注入 --net/pid/ipc/uts=host，与沙箱同 namespace；
+  -- docker 依赖外部 daemon，无法共享，保持受控 socket 并记录原因。
+  container = { enabled = true, share_namespace = true, prefer = "podman" },
   workspace_root = vim.fn.stdpath("cache") .. "/NeoAI/sandbox",
   session_shell = true,            -- run_command 会话内保留 shell 状态（export/cd 跨命令生效；仅 bwrap）
   process_roots = {},              -- run_command 可写根（overlay 覆盖；默认仅 cwd 自动补入）。/tmp、/var/tmp 属 tmpfs_roots；避免把宿主 /root、/home、/etc 等作为只读 lower 暴露；按需显式加回
-  review = { enabled = true, auto_apply = false }, -- 异步审批：候选进入待审队列，用户确认后应用
-  lsp_overlay = { enabled = false }, -- LSP 进程命名空间覆盖：LSP 磁盘读取看到暂存内容（opt-in，仅 bwrap+overlay）
-  secrets = { enabled = true, min_length = 20, max_length = 200, min_entropy = 3.5, min_distinct = 8, exclude_pure_hex = true, allowlist = {} }, -- 密钥防护：熵检测 + token 加密映射；env 名含 KEY/TOKEN/SECRET/PASSWORD/CREDENTIAL 的值无视熵强制 token 化
+  -- 异步审批：候选进入待审队列，用户确认后应用。session_auto_approve 开启后 L0/L1 自动应用。
+  review = { enabled = true, auto_apply = false, session_auto_approve = false },
+  -- 审批按安全级别分级（L0-L3）：动作 auto/record/review/block；默认 default="review"。
+  approval = { default = "review", levels = {} },
+  -- 安装包（apt/pip/npm 等）额外规则：review（默认，强制待审，不随自动审批放行）| allow | deny。
+  packages = { mode = "review", managers = { "apt", "pip", "npm", "go", "cargo", "gem", "composer" } },
+  lsp_overlay = { enabled = true }, -- LSP 进程命名空间覆盖：LSP 磁盘读取看到暂存内容（默认开，仅 bwrap+overlay；不可用时自动跳过）
+  secrets = { enabled = true, min_length = 20, max_length = 200, min_entropy = 3.5, min_distinct = 8, exclude_pure_hex = true, tokenize_env = true, extra_rules = {}, allowlist = {} }, -- 密钥/敏感信息防护：熵检测 + 具名规则（私钥块/AKIA/ghp_/sk-/JWT/Bearer…）+ token 加密映射；env 名含 KEY/TOKEN/SECRET/PASSWORD/CREDENTIAL 的值无视熵强制 token 化
   retention = { candidate_days = 7, max_pending = 20 },
   policy = {
     version = "1",                 -- 策略版本（用于审计回放；规则变更时递增）

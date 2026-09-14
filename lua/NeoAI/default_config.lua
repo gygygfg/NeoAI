@@ -519,6 +519,17 @@ local DEFAULT_CONFIG = {
         "/etc/gitconfig", "/etc/npmrc", "/etc/apt", "/etc/dpkg",
         "/etc/python3*",
       },
+      -- 宿主运行时直通（opt-in）：这些宿主路径在遮蔽/临时根之后以只读方式暴露进沙箱，
+      -- 并把这些目录前置到沙箱进程 PATH，使 `run_command` 能调用宿主工具链
+      -- （如 nvim/lua/luajit/mason 二进制）。默认空（保持最小读取面）。
+      -- 安全提示：仅暴露可信、只读的工具目录；不要放入凭据/密钥目录。
+      expose_paths = {},
+      -- 是否把 expose_paths 中的目录前置到沙箱 PATH（默认开）。关闭则仅挂载不改 PATH。
+      expose_path_env = true,
+      -- 自动直通宿主 PATH 中的工具目录（opt-in，默认关）：开启后把宿主 PATH 里存在、
+      -- 且非凭据/系统目录的 bin 目录只读暴露并前置到沙箱 PATH，使 node/npm/fd/go 等
+      -- 装在 $HOME 下的工具链在沙箱内可用。会扩大读取面，仅在需要时开启。
+      expose_tool_paths = false,
       -- /etc/resolv.conf 处理方式：sanitize（默认，仅保留 nameserver 行，剥离
       -- search/domain/options，避免泄露宿主内网/Tailscale 域）| hide（不暴露）|
       -- passthrough（原样暴露宿主文件）。
@@ -526,6 +537,10 @@ local DEFAULT_CONFIG = {
       -- 每会话私有临时根：始终以会话私有目录（mode 1777，位于 /dev/shm 等 tmpfs）绑定，
       -- 绝不作为 overlay 的只读 lower 暴露宿主真实内容；退出/轮换会话即销毁，杜绝跨会话残留。
       tmpfs_roots = { "/tmp", "/var/tmp" },
+      -- 临时根私有目录位置：host（默认）= 建在宿主根之下的隐藏临时子目录
+      -- （如 /tmp/.cache-<tag>/<session>），命名空间映射回该根，AI 只见自己的私有子目录
+      -- （隔离 AI，宿主 /tmp 内容不可见）；session = 建在会话进程目录下（旧行为）。
+      tmp_private_base = "host",
       -- 隐藏的 /proc 泄露项：procfs 全局可见（不随 pid namespace 隔离），会泄露宿主内核
       -- 命令行（root=UUID、crashkernel）与内核版本；以空文件只读覆盖，读取得到空内容。
       hide_proc_paths = { "/proc/cmdline", "/proc/version" },
@@ -542,12 +557,59 @@ local DEFAULT_CONFIG = {
         enabled = false, -- 是否允许受控联网（默认关闭）
         allowed_endpoints = {}, -- 允许的主机/URL 模式，如 "api.example.com"、"*.example.com"
         budget_bytes = 0, -- 累计字节预算（0 = 不限制）
+        -- 沙箱外部命令代理策略：
+        --   "strip"（默认）= 不把宿主代理传入沙箱（如 mihomo 只代理 opencode 自身；
+        --                    避免宿主 HTTPS_PROXY=127.0.0.1:7890 在沙箱内不可达导致 pip/npm 失败）；
+        --   "passthrough"  = 沿用宿主代理；
+        --   table { http, https, all, no_proxy } = 显式设置（未列出的代理变量清除）。
+        proxy = "strip",
+        -- 拦截向宿主本机（回环、宿主网卡 IP、链路本地、云元数据）的访问（默认开）：
+        -- 沙箱外部命令注入 HTTP(S)_PROXY/ALL_PROXY 指向宿主侧 Lua 过滤代理（host_proxy），
+        -- 代理拦截本机目标、放行外部并记录；网络整体仍为「放行 + 记录」。
+        -- 边界：应用层过滤——不认代理的裸 TCP 可绕过（共享 netns 无法按目的地做内核过滤）。
+        host_local_block = true,
+        -- 宿主过滤代理监听端口（0 = 自动分配 loopback 随机端口）。
+        host_local_proxy_port = 0,
+        -- 独立 netns + 宿主网关（opt-in）：沙箱进程进入隔离网络命名空间，只能到达宿主网关；
+        -- 网关对目标 host:port 先做 TCP connect 探针（可探测宿主哪些端口在监听），但不回传
+        -- 真实服务数据，而是把拦截原因（JSON）返回给客户端。仅允许探测宿主本机地址。
+        -- 需 root 与 ip（ip netns）；不可用时 fail-closed。启用后 curl/wget/git/nmap --proxies
+        -- 等走代理的工具可探测端口；直接裸 TCP 不经代理无法到达宿主。
+        gateway = {
+          enabled = false, -- 总开关
+          probe_timeout_ms = 1000, -- 单次端口探针超时
+          max_probes = 4096, -- 探测记录上限（防滥用）
+        },
       },
       -- 异步审批（设计文档 §15）：AI 修改立即沙箱执行并冻结候选，
       -- 用户异步确认允许哪些文件/配置修改后再 CAS 应用。
       review = {
         enabled = true, -- 效果类候选自动进入待审队列
         auto_apply = false, -- true 时任务授权内自动应用（默认关闭，需用户确认）
+        -- AI 新会话自动审批（默认关闭）：开启后 L0/L1 风险自动应用，L2+ 与包/密钥仍待审。
+        -- 目的：即便仅靠本地模型的智能水平，也能在写入保护下管理好 agent 行为。
+        session_auto_approve = false,
+      },
+      -- 审批按安全级别分级（见 sandbox/risk.lua）：级别 L0-L3，动作 auto/record/review/block。
+      -- 默认 default="review"（全部进入异步待审，不阻塞 agent）；可覆盖单级动作。
+      approval = {
+        default = "review",
+        levels = {}, -- 覆盖：{ [0]="auto", [1]="review", [2]="review", [3]="review" }
+      },
+      -- 安装包（apt/pip/npm 等）额外规则：默认 review（不随自动审批放行，需显式确认）。
+      --   review = 强制进入待审；allow = 允许自动应用；deny = 硬拒绝。
+      packages = {
+        mode = "review",
+        managers = { "apt", "apt-get", "dnf", "yum", "pacman", "apk", "brew",
+          "pip", "pip3", "npm", "pnpm", "yarn", "go", "cargo", "gem", "composer" },
+      },
+      -- 容器受控运行：AI 调用 docker/podman 等时尽量与沙箱同 namespace（受控）。
+      -- podman 等无守护进程运行时注入 --net/pid/ipc/uts=host 共享沙箱命名空间；
+      -- docker 依赖外部 daemon，保持受控 socket 方案并记录原因。
+      container = {
+        enabled = true,
+        share_namespace = true, -- 对无守护进程运行时注入命名空间共享标志
+        prefer = "podman", -- 优先使用的无守护进程运行时（供提示/文档）
       },
       workspace_root = vim.fn.stdpath("cache") .. "/NeoAI/sandbox", -- 暂存/候选/回执根目录
       session_shell = true, -- run_command 会话内保留 shell 状态（export/cd 跨命令生效，仅 bwrap 后端）
@@ -590,7 +652,8 @@ local DEFAULT_CONFIG = {
         max_tier = 2, -- 允许的最高档位（0 最小权限 | 1 提权 | 2 特权）；超过直接拒绝
         record = true, -- 每次档位裁决/升级写入证据与事件
         tiers = {
-          [0] = { name = "minimal", review = "auto", network = false, cap_add = {}, mounts = {}, unmask = {} },
+          -- T0 默认放行网络（仅记录）但经 host_proxy 拦截本机访问；offline=true 时仍硬隔离。
+          [0] = { name = "minimal", review = "auto", network = true, cap_add = {}, mounts = {}, unmask = {} },
           [1] = {
             name = "elevated", review = "auto", network = true, cap_add = {}, mounts = {},
             unmask = { "/run/docker.sock", "/var/run/docker.sock" },
@@ -610,7 +673,10 @@ local DEFAULT_CONFIG = {
             "kexec", "sysctl", "swapon", "swapoff", "mknod", "chroot", "unshare", "nsenter",
           } },
           { tier = 1, name = "docker", bins = {
-            "docker", "docker-compose", "podman", "podman-compose", "nerdctl", "buildah", "skopeo",
+            "docker", "docker-compose", "nerdctl",
+          } },
+          { tier = 1, name = "container", bins = {
+            "podman", "podman-compose", "buildah", "skopeo",
           } },
           { tier = 1, name = "network", bins = {
             "curl", "wget", "ssh", "scp", "sftp", "rsync", "ping", "nc", "ncat", "socat",
@@ -619,16 +685,16 @@ local DEFAULT_CONFIG = {
           { tier = 1, name = "network", bin = "git", subs = {
             "push", "pull", "fetch", "clone", "remote", "ls-remote", "submodule",
           } },
-          { tier = 1, name = "network", bin = "npm", subs = { "install", "i", "ci", "add", "update", "publish" } },
-          { tier = 1, name = "network", bin = "pnpm", subs = { "install", "i", "add", "update", "publish" } },
-          { tier = 1, name = "network", bin = "yarn", subs = { "install", "add", "upgrade", "publish" } },
-          { tier = 1, name = "network", bin = "pip", subs = { "install", "download" } },
-          { tier = 1, name = "network", bin = "pip3", subs = { "install", "download" } },
-          { tier = 1, name = "network", bin = "go", subs = { "get", "install" } },
-          { tier = 1, name = "network", bin = "cargo", subs = { "install", "add", "update", "publish" } },
-          { tier = 1, name = "network", bin = "gem", subs = { "install", "update" } },
-          { tier = 1, name = "network", bin = "composer", subs = { "install", "require", "update" } },
-          { tier = 1, name = "network", bins = { "apt", "apt-get", "apt-key", "add-apt-repository", "dnf", "yum", "pacman", "apk", "brew" } },
+          { tier = 1, name = "package", bin = "npm", subs = { "install", "i", "ci", "add", "update", "publish" } },
+          { tier = 1, name = "package", bin = "pnpm", subs = { "install", "i", "add", "update", "publish" } },
+          { tier = 1, name = "package", bin = "yarn", subs = { "install", "add", "upgrade", "publish" } },
+          { tier = 1, name = "package", bin = "pip", subs = { "install", "download" } },
+          { tier = 1, name = "package", bin = "pip3", subs = { "install", "download" } },
+          { tier = 1, name = "package", bin = "go", subs = { "get", "install" } },
+          { tier = 1, name = "package", bin = "cargo", subs = { "install", "add", "update", "publish" } },
+          { tier = 1, name = "package", bin = "gem", subs = { "install", "update" } },
+          { tier = 1, name = "package", bin = "composer", subs = { "install", "require", "update" } },
+          { tier = 1, name = "package", bins = { "apt", "apt-get", "apt-key", "add-apt-repository", "dnf", "yum", "pacman", "apk", "brew" } },
         },
       },
       -- 受控 docker：不绑定宿主 /var/run/docker.sock。controlled 指向外部受控 socket
@@ -638,10 +704,11 @@ local DEFAULT_CONFIG = {
         socket = "/run/neoai-docker/docker.sock", -- controlled 模式使用的受控 socket 路径
       },
       -- LSP 进程命名空间覆盖：把 LSP server 放进 bwrap + overlay（工作区根 lower=真实只读，
-      -- upper=沙箱私有层），使其磁盘读取看到 AI 尚未发布的暂存内容。默认关闭（opt-in）；
-      -- overlay 不可用（如 tmpfs 工作区）时自动跳过，不影响 LSP 正常使用。
+      -- upper=沙箱私有层），使其磁盘读取看到 AI 尚未发布的暂存内容。默认开启，使 LSP 与
+      -- run_command/git 读工具共享同一暂存视图（不再读真实磁盘）；overlay 不可用（如 tmpfs
+      -- 工作区）时自动跳过，不影响 LSP 正常使用。
       lsp_overlay = {
-        enabled = false,
+        enabled = true,
       },
       -- 密钥防护（常开）：基于熵检测高熵密钥，进沙箱替换为随机 token、仅在 commit 还原；
       -- 对 token 的操作留痕并在待审界面警告；工具参数中出现原始密钥时硬拦截并终止 Agent。
@@ -652,6 +719,11 @@ local DEFAULT_CONFIG = {
         min_entropy = 3.5, -- 香农熵阈值（bits/char）
         min_distinct = 8, -- 最少不同字符数
         exclude_pure_hex = true, -- 排除纯小写十六进制（git SHA/sha256/md5 等哈希）
+        tokenize_env = true, -- 是否对沙箱进程环境变量 token 化（false = 原样注入，调试用）
+        -- 具名敏感信息规则（Lua pattern）：命中即脱敏/token 化（无视熵阈值），覆盖
+        -- 私钥块、带前缀 token（AKIA/ghp_/sk-…）、JWT、Bearer 等结构化凭据。
+        -- 配置 rules 将替换内置规则；extra_rules 在内置/配置规则之外追加。
+        extra_rules = {},
         allowlist = {}, -- 额外排除的 Lua pattern 数组（命中不视为密钥）
       },
     },

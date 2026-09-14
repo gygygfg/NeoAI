@@ -92,6 +92,16 @@ function M.session_mount()
   return "/tmp/" .. _session_basename()
 end
 
+--- 沙箱内某 tmpfs 根（如 /tmp）的宿主私有基目录：位于该根之下的隐藏临时子目录。
+--- 命名空间把「该子目录」bind 回根路径，使沙箱内的 /tmp 只暴露会话私有临时子目录，
+--- 宿主 /tmp 的真实内容对 AI 不可见（隔离 AI）。目录名同样无特征。
+--- @param root string 宿主根路径（如 "/tmp"）
+--- @return string
+function M.tmp_base_host(root)
+  root = tostring(root or ""):gsub("/+$", "")
+  return root .. "/.cache-" .. _tag()
+end
+
 --- 会话挂载点 basename（供 overlay 捕获排除）
 --- @return string
 function M.session_basename()

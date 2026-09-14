@@ -47,6 +47,9 @@
 | `sandbox/bench.lua` | 控制面关键路径性能基准 |
 | `sandbox/tool_spec.lua` | 每个工具的影响类别（effect）与暂存路径声明 |
 | `sandbox/wrapper.lua` | 执行门禁：`attach` 附加规格、`gate` 强制过闸门 |
+| `sandbox/risk.lua` | 安全级别评估（L0-L3）、审批分级动作与结果分级 |
+| `sandbox/audit.lua` | AI 读取/调用行为监视、风险分与异常事件 |
+| `sandbox/container.lua` | 容器运行时受控：与沙箱同 namespace（podman）或受控 socket（docker） |
 
 ## 3. 强制入口（加载器 + 执行器）
 
@@ -92,9 +95,11 @@
 - 异步确认命令：
   - `:NeoAISandboxReview` — 打开待审审批界面（`ui/components/sandbox_review.lua`）：
     按文件路径级别高亮 —— **工作区文件=绿色、用户目录=黄色、系统路径=红色**，
-    「待审」状态标签=黄色。**审批单位为单个文件**：`<CR>` 仅应用光标所在文件、
-    `d` 仅拒绝该文件（其余文件保留待审）、`r` 刷新、`q`/`<Esc>` 关闭；头行仅作
-    信息展示，不参与审批。聊天主窗口内可按 `<leader>ap` 直接触发
+    「待审」状态标签=黄色；并按安全级别显示 **高危/中危/低危** 风险档（`[L0]低危` …
+    `[L2]/[L3]高危`）与风险原因。**审批单位为单个文件**：`<CR>` 仅应用光标所在文件、
+    `d` 仅拒绝该文件（其余文件保留待审）、`i` 临时关闭审批窗并打开该条目的**修改 diff**
+    预览（`q`/`<Esc>` 关闭后自动返回审批窗并恢复光标）、`r` 刷新、`q`/`<Esc>` 关闭；
+    头行仅作信息展示，不参与审批。聊天主窗口内可按 `<leader>ap` 直接触发
     （`keymaps.chat.sandbox_review`）。
   - `:NeoAISandboxApprove <id>` / `:NeoAISandboxReject <id>` — 批准（不应用）/ 拒绝并丢弃。
   - `:NeoAISandboxApply <id>` — 批准并应用（CAS 发布）；`:NeoAISandboxApplyAll` 批量应用。
@@ -127,18 +132,27 @@
   - treesitter 工具（`parse_file` / `query_tree` / `get_node_*`）读暂存副本：暂存路径
     **保留真实 basename（含扩展名）**，故 filetype/parser 正常；`delete_node` 等写类工具
     经同一暂存副本修改后写回暂存（不二次暂存）。
-  - LSP 工具默认仍读真实内容；开启 `tools.sandbox.lsp_overlay.enabled = true` 后，LSP server
-    进程被放进 bwrap + overlay（见下节），其磁盘读取即看到暂存内容。写类 LSP 工具
+  - LSP 工具与 `run_command`/git 读工具共享同一暂存视图：`tools.sandbox.lsp_overlay.enabled`
+    默认开启，LSP server 进程被放进 bwrap + overlay（见下节），其磁盘读取即看到暂存内容
+    （不再读真实磁盘）；overlay 不可用时自动跳过，不影响 LSP 正常使用。写类 LSP 工具
     （`lsp_rename`/`lsp_format`）的落盘始终经 `persist_buffer` 重定向到暂存层。
+  - **git 读工具（`git_status` / `git_diff` / `git_log` / `git_branch` / `git_file_history` /
+    `git_commit_detail`）**：在沙箱命名空间内执行（与 `run_command` 同一 overlay），磁盘读取
+    看到的是**暂存内容**而非真实工作区；命令以 `GIT_OPTIONAL_LOCKS=0` 运行避免写 index，
+    且作为只读进程工具**不捕获候选**、不入待审队列。真实工作区不会被 git 读操作改动。
+    （`git_rollback` 为写操作，仍按宿主执行并经审批。）
 - **buffer 写盘工具**（`delete_node` / `lsp_rename` / `lsp_format`）：
   `tool_helpers.persist_buffer` 在沙箱激活时把 `:write!` 重定向到暂存层。
 - **外部进程**（`run_command`）：bwrap 后端对一组**可写根**（`tools.sandbox.process_roots`，
   默认仅 cwd，未覆盖时自动补入）做 overlayfs：真实根为只读 lower、会话 upper 为可写层。
   命令能读取这些根的真实内容，且对其下**任意路径**的新建/修改/删除都落到 upper，随后冻结为
   候选（删除以 whiteout 设备节点识别为 `delete`/`rmdir`）。
-  - `/tmp`、`/var/tmp` 属**每会话私有临时根**（`tools.sandbox.tmpfs_roots`）：以会话私有目录
-    （mode 1777，位于 `/dev/shm` 等 tmpfs 上）绑定，**不**作为 overlay 只读 lower，退出/轮换
+  - `/tmp`、`/var/tmp` 属**每会话私有临时根**（`tools.sandbox.tmpfs_roots`）：默认
+    （`tmp_private_base="host"`）在宿主根之下建隐藏临时子目录（如 `/tmp/.cache-<tag>/<session>`，
+    mode 1777），并经**命名空间 bind 映射回该根**——沙箱内 `/tmp` 即此会话私有子目录，
+    宿主 `/tmp` 真实内容对 AI 不可见（隔离 AI）。**不**作为 overlay 只读 lower，退出/轮换
     会话即销毁。命令对 `/tmp` 的写入属临时草稿，不冻结为候选，杜绝跨会话残留与宿主 `/tmp` 泄露。
+    `tmp_private_base="session"` 可退回旧的「建在会话进程目录（/dev/shm）」行为。
   - 默认不再覆盖 `/root`、`/home`、`/etc` 等整目录，避免把宿主真实 home/账户/配置作为
     只读 lower 暴露；需要写这些路径时显式加回 `process_roots`，并同步收紧 `mask_paths`。
   - 可写层为**会话级共享**：同一 agent 循环内所有命令共用（命令 N 看得到命令 N-1 的
@@ -168,10 +182,10 @@
   `sandbox.init()` 会按待审候选内容**重新物化**进新会话暂存层（`_rehydrate_pending`），
   使重载/重开后只读工具看到的视图与待审队列一致。
 
-### LSP 命名空间覆盖（opt-in）
+### LSP 命名空间覆盖（默认开启）
 
-- 开关：`tools.sandbox.lsp_overlay.enabled`（默认 false）。仅 `bwrap` 后端且工作区根可挂载
-  overlay 时生效；不满足条件自动跳过，LSP 正常使用。
+- 开关：`tools.sandbox.lsp_overlay.enabled`（默认 true）。仅 `bwrap` 后端且工作区根可挂载
+  overlay 时生效；不满足条件自动跳过，LSP 正常使用。设为 false 可关闭（LSP 改读真实磁盘）。
 - 机制：包装 `vim.lsp.rpc.start`，把 server 启动命令包成
   `bwrap --unshare-all <最小只读系统集> … --overlay-src <工作区> --overlay <upper> <work> <工作区> --chdir <工作区> <原命令>`；
   lower 为真实工作区（只读），upper 为沙箱私有可写层。server 读到的是「真实文件 + 暂存改动」
@@ -180,7 +194,9 @@
   工作区暂存重新物化 upper（先清空再写入），使 server 即时看到最新未发布改动。
 - 隔离与缓存：LSP 自身缓存/状态目录（`stdpath(cache|data|state)`、`~/.cache`、`~/.local/*`）
   以 rw bind 直连宿主，避免缓存写入 overlay 或被当作待审候选；overlay upper 按工作区 hash
-  分片，多项目互不串扰，位于 `/dev/shm/.cache-<tag>/lsp/<hash>`。
+  分片，多项目互不串扰，位于 `/dev/shm/.cache-<tag>/lsp/<hash>`。rw bind 之后应用与
+  `run_command` 一致的 `mask_paths` 遮蔽（如 `~/.local/share/keyrings`、`~/.cache/keyring-*`），
+  避免随缓存目录把 keyring/凭据暴露给 LSP server。
 - 生命周期：插件 `sandbox.lsp` 负责安装/卸载包装，卸载时恢复原始 `vim.lsp.rpc.start`。
 
 ## 6. 运行时后端
@@ -190,7 +206,16 @@
   - **overlay 可用时**：每个可写根（`process_roots`）真实内容作为只读 lower、会话 upper
     作为可写层，命令看到真实内容且写入可捕获。
   - **overlay 不可用时**：把会话私有目录 `--bind` 到该根（命名空间隔离与只读 rootfs 保留），
-    **不再让全部 `process` 工具直接失败**。
+    **不再让全部 `process` 工具直接失败**。此模式下命令看到的是会话私有视图（仅含暂存改动），
+    可能不含真实磁盘上的其他文件；`run_command` 结果会附加「降级模式」提示
+    （`ctx.sandbox_degraded`）并给出**降级原因**（`ctx.sandbox_degraded_reason`），
+    避免把「看不到」误判为「文件不存在/改动未生效」。
+  - **排查降级原因**：`:NeoAISandboxCaps` 输出 `overlay=ready` 或
+    `overlay=unavailable(<原因>)`；`runtime.overlay_diagnosis()` 用真实执行路径
+    （cwd + 沙箱 overlay 基目录）实测并返回 `{ available, reason, flags, userns }`。
+    常见原因：宿主 `/` 归属 init userns 且以 userns 运行（overlay EINVAL）、
+    lower/upper 跨挂载或 userns 归属不同、upper 所在文件系统不支持 overlay upper/work
+    （如未启用 xattr 的 tmpfs / fuse / 网络文件系统）。
   - **网络默认放行**：带 userns 时 `--unshare-all` 后按需 `--share-net`；无 userns 时默认共享，
     `offline=true` 才隔离（`--unshare-net`）。
 - `unshare`（兜底）：`--user --map-root-user --mount --pid --fork --ipc --uts --mount-proc`
@@ -214,9 +239,39 @@
 仅靠 namespace 隔离不足以阻止「root 载荷 + 全 capability + 可访问宿主 socket」的逃逸。
 `runtime` 在 bwrap 前缀中默认施加以下纵深防御：
 
+- **关闭继承 fd（防 chroot 逃逸）**：启动载荷前先关闭除 0/1/2 外所有继承 fd。否则宿主
+  进程（如 AppImage 运行时）持有的**目录 fd**（如 `/tmp/.mount_*`）会被沙箱继承，AI 可用
+  `openat(dir_fd, "..")` 逐级上溯重回宿主 `/`，绕过 chroot/命名空间。实现见
+  `runtime._wrap_close_fds`：优先 `bash`（支持多位数 fd），无 `bash` 时用 `python3`
+  的 `os.closerange`，最后退回 `sh`（dash 仅支持个位数 fd，属尽力而为）。`run_command`、
+  `runtime.run` 与 LSP 命名空间覆盖均经此包装。
+
 - **丢弃全部 capability**：`--cap-drop ALL`（可经 `tools.sandbox.cap_add` 按需加回）。
   载荷不再持有 `CAP_SYS_ADMIN`/`CAP_SYS_MODULE`/`CAP_SYS_PTRACE` 等，`mount`、模块加载、
-  写 `/proc/sys/kernel/core_pattern`、`ptrace` 等被内核直接拒绝（实测 `CapEff=0`）。
+  `ptrace` 等被内核直接拒绝（实测 `CapEff=0`）。
+  **注意**：cap-drop **不能**阻止写 `/proc/sys/kernel/core_pattern`、`modprobe` 等全局 sysctl——
+  这些条目非命名空间，其写权限按 `test_perm` 的 **DAC**（`euid == 全局 root uid`）判定，与
+  capability 无关；沙箱以 root 运行且不建 userns 时 `euid` 即全局 root，`--cap-drop ALL` 下
+  仍可写，构成 coredump/modprobe 提权原语（修改宿主全局内核状态）。故由下面的「危险全局
+  sysctl 强制遮蔽」以只读绑定封死，而非依赖 cap-drop/seccomp。
+- **`/proc/sys` 整体只读绑定（常驻，根因修复）**：在 `--proc /proc` 之后 `--ro-bind
+  /proc/sys /proc/sys`，一次性封闭**所有**非命名空间全局 sysctl 的写入面。审计实测：修复前
+  `randomize_va_space`/`pid_max`/`kptr_restrict`/`dmesg_restrict`/`net.ipv4.ip_forward`/
+  `net.ipv4.conf.all.forwarding`/`vm.swappiness`/`vm.max_map_count`/`vm.overcommit_memory`/
+  `fs.protected_hardlinks` 等均 **WRITABLE**（`--cap-drop ALL` 挡不住，写权限按 DAC 的
+  `euid==全局 root uid` 判定；共享 netns 下 `net.*` 还会直接改宿主网络）；修复后全部 `EROFS`，
+  且读取不受影响。
+- **危险/信息泄露 proc 文件强制遮蔽（常驻，不可配置移除）**：`runtime.MANDATORY_PROC_MASKS`
+  以空文件只读覆盖（读为空、写 `EROFS`）：`/proc/sys/kernel/{core_pattern,modprobe,hotplug,
+  uevent_helper,kexec_load_disabled,sysrq,panic,panic_on_oops,perf_event_paranoid,
+  unprivileged_bpf_disabled,unprivileged_userns_clone}`、`/proc/sys/vm/{drop_caches,
+  compact_memory}`，以及非 `/proc/sys` 的 `/proc/sysrq-trigger`（magic sysrq 触发口）、
+  `/proc/kcore`（内核内存读口）、`/proc/modules`、`/proc/kallsyms`，以及审计实测可读的内核
+  信息泄露面 `/proc/vmallocinfo`（暴露内核虚拟地址，绕过 `kptr_restrict`）、`/proc/timer_list`、
+  `/proc/slabinfo`、`/proc/interrupts`、`/proc/softirqs`、`/proc/buddyinfo`、`/proc/zoneinfo`、
+  `/proc/pagetypeinfo`、`/proc/keys`、`/proc/sched_debug`、`/proc/iomem`、`/proc/ioports`。
+  用户 `hide_proc_paths` 只能**追加**、不能移除强制项。`unshare` 兜底后端无法 bind mount，
+  故对 `process` 类 **fail-closed**（`SANDBOX_SYSCTL_MASK_UNAVAILABLE`），不静默降级。
 - **seccomp 基线默认开启**（见 §12）：即便未来出现 capability 相关内核缺陷，denylist
   仍拦截 `mount`/`unshare`/`setns`/`bpf`/`init_module` 等危险 syscall。
 - **遮蔽宿主敏感路径**（`tools.sandbox.mask_paths`，安全默认）：目录以空 `tmpfs`、
@@ -227,6 +282,9 @@
   并补充 `/etc/shadow`、`/etc/gshadow`、`/etc/sudoers`、`/etc/machine-id`、`/etc/ssh`、
   `/var/log`、`/var/spool/cron` 及 root 命令历史等读取面泄露项。
   遮蔽挂载置于各可写根 overlay 之后，确保覆盖生效。
+  进程内 `read`/`fs_write` 工具不经 namespace，mount 遮蔽对其无效；执行器对路径参数额外
+  查询 `runtime.is_masked_path`，命中即**硬拒绝**（`路径位于宿主敏感遮蔽路径`，不可审批放行），
+  覆盖 `read_file`/`search_files`/`edit_file` 等直接读宿主的路径。
 - **最小只读系统集（白名单，默认开启）**：不再 `--ro-bind / /`，也**不再整目录暴露 `/usr`**
   （宿主根分区挂到同一块磁盘时会泄露 `/usr/share/doc` 包数据库、`/usr/local/go_workspace`、
   `/usr/src` 等软件清单）。仅按 `tools.sandbox.readonly_roots`（默认 `/usr` 的运行时子树
@@ -239,12 +297,28 @@
   `/etc/passwd`、`/etc/group` 作为运行所需的标准只读文件保留（Unix 世界可读，仅暴露账户名，
   不含口令）。需要更小读取面时可继续收窄白名单；需要额外路径时显式加回（并同步 `mask_paths`）。
   该读取面同样用于 LSP 命名空间覆盖（见 §5）。
+- **宿主运行时直通（`tools.sandbox.expose_paths`，opt-in，默认空）**：这些宿主路径在
+  遮蔽/临时根**之后**以只读方式暴露，并把目录前置到沙箱 `PATH`（`expose_path_env`），
+  使 `run_command` 能调用宿主工具链（如 appimage `nvim` 的 `/tmp/.mount_*`、`lua`/`luajit`、
+  `~/.local/share/nvim/mason` 下的二进制）。默认空保持最小读取面；仅暴露可信、只读的
+  工具目录，**不要放入凭据/密钥目录**。注意这会扩大沙箱读取面，属显式 opt-in。
+  - **自动直通工具目录**（`tools.sandbox.expose_tool_paths`，默认关）：开启后自动把宿主
+    `PATH` 中**存在**且非凭据/系统目录（跳过 `/etc`、`/var`、`~/.ssh` 等）的 bin 目录
+    只读暴露并前置到沙箱 `PATH`，使装在 `$HOME` 下的 `node`/`npm`/`fd`/`go` 等工具链可用
+    （否则它们因未被挂载而在沙箱内“缺失”，只有位于 `/usr` 等白名单目录的工具可用）。
+- **代理策略（`tools.sandbox.network.proxy`，默认 `strip`）**：默认**不把宿主代理传入沙箱**
+  （如 mihomo 只代理 opencode 自身），避免宿主 `HTTPS_PROXY=127.0.0.1:7890` 在沙箱内不可达
+  导致 `pip`/`npm` 按代理配置走网络时报 `Connection refused`。`strip` 会在外部命令前
+  `unset` 代理变量（`run_command` 与 `runtime.run` 都覆盖）；`passthrough` 沿用宿主代理；
+  也可用 `{ http, https, all, no_proxy }` 显式设置（未列出的代理变量清除）。
 - **`/etc/resolv.conf` 净化**（`tools.sandbox.resolv_conf`，默认 `sanitize`）：仅保留
   `nameserver` 行，剥离 `search`/`domain`/`options`，避免泄露宿主内网/Tailscale 域；
   可配 `hide`（不暴露）或 `passthrough`（原样暴露宿主文件）。
 - **`/proc` 泄露项隐藏**（`tools.sandbox.hide_proc_paths`，默认 `/proc/cmdline`、`/proc/version`）：
   procfs 全局可见（不随 pid namespace 隔离），以空文件只读覆盖，避免泄露宿主内核命令行
-  （`root=UUID`、`crashkernel`）与内核版本。
+  （`root=UUID`、`crashkernel`）与内核版本。此项与上一条「危险全局 sysctl 强制遮蔽」共用
+  同一只读覆盖机制，用户配置**只增不减**。
+- **宿主本机访问拦截（`tools.sandbox.network.host_local_block`，默认开）**：见 §6.1。
 - **遮蔽目录（`tools.sandbox.mask_dirs`，默认开启）**：当 cwd 位于某遮蔽目录
   （默认 `/home`、`/root`）下时，仅把「含 cwd 的用户 home」以只读暴露
   （`/home` 取一级用户子目录，其他遮蔽目录取自身），并沿 cwd 祖先链遮蔽其兄弟条目
@@ -255,6 +329,12 @@
     遮蔽条目（`ctx.sandbox_unmask` → 运行时 unmask），拒绝则终止该工具调用。
   - **进程内 fail-closed**：`read`/`fs_write` 等进程内工具不受 mount 遮蔽约束，
     无审批界面（headless/子 Agent）时直接拒绝，不静默放行；`process` 类由 mount 硬遮蔽。
+    其中命中 `mask_paths`（宿主敏感路径/沙箱存储）时一律**硬拒绝**，即使有审批界面也不放行；
+    仅遮蔽目录（`mask_dirs`）命中才走审批放行。命中判定前先对路径做**规范化**（展开 `~`、
+    绝对化并解析符号链接，含 `/proc/<pid>/root`、`/proc/<pid>/cwd`、`/proc/<pid>/fd` 及悬空
+    符号链接），否则 `read_file /proc/self/root/etc/shadow` 或工作区内指向宿主凭据的符号链接
+    可绕过 `mask_paths`/`mask_dirs`。同一路径同时命中 `mask_paths` 与 `mask_dirs` 时，
+    以 `mask_paths` 硬拒绝优先（不得因软命中而放行）。
   - `mask_dirs_approval = false` 时命中遮蔽目录不弹窗，直接硬遮蔽。
 
 > **残余风险（user namespace）**：NeoAI 以 root 运行时，`bwrap` 只能把调用者 uid 1:1
@@ -262,6 +342,43 @@
 > 不在 root 下新建 userns。丢弃全部 capability + seccomp 后，1:1 映射不再可直接提权，
 > 但读取未遮蔽的 root 文件仍受文件权限约束。**彻底根治需在容器运行时层启用
 > `userns-remap` / rootless**，使容器 root 映射到高位宿主 uid——属部署侧配置，不在本插件内。
+
+### 6.1 宿主本机访问拦截（`tools.sandbox.network.host_local_block`，默认开启）
+
+网络整体策略为「**放行 + 记录**」（`offline=false`），但默认拦截**向宿主本机**的访问，
+防止 AI 借外部命令触达宿主服务（SSRF，如宿主管理面板、内部端口、云元数据）：
+
+- **机制**：为沙箱外部命令注入 `HTTP_PROXY`/`HTTPS_PROXY`（HTTP 代理）与 `ALL_PROXY`
+  （`socks5h://`），指向宿主侧纯 Lua 过滤代理 `sandbox/host_proxy.lua`（监听 `127.0.0.1`
+  随机端口，`host_local_proxy_port` 可固定）。代理支持 **HTTP CONNECT + 绝对形式 + SOCKS5**：
+  目标命中本机集合（`127/8`、`::1`、宿主各网卡 IP、`169.254/16`、`fe80::/10`、
+  `169.254.169.254`）即拒绝并记录；其余外部目标双向转发并记录。域名先解析再校验，
+  防 DNS rebinding 到本机。记录经 `run_command` 结果摘要回传，并写入 `network` 证据。
+- **T0 默认放行网络**：`tools.sandbox.privilege.tiers[0].network = true`，T0 不再
+  `--unshare-net`；`offline=true` 时仍硬隔离（优先于档位）。
+- **边界（重要）**：这是**应用层**过滤。**不认代理的裸 TCP**（`nc`/`ssh`/数据库客户端、
+  忽略代理变量的工具）在共享 netns 下可直连宿主本机，不受此层约束。要硬拦截裸 TCP 只能：
+  root + iptables/nft（按目的地过滤），或无 root 的 `slirp4netns`/`passt`（原生用户态
+  网络栈，本机未安装）——本插件不引入这些依赖。故本机拦截为「非硬边界」，见
+  `sandbox/host_proxy.lua` 模块头。
+- **残余信息泄露（共享 netns 固有）**：因 T0 共享宿主网络命名空间，`/proc/net/tcp`、
+  `/proc/net/unix`（宿主连接/Unix socket 清单）、`ip addr`/`ip route`（netlink，宿主拓扑）
+  对沙箱可见。`/proc/net` 是 `self/net` 符号链接，无法用挂载遮蔽；netlink 也不经挂载。
+  仅靠隔离 netns 才能消除，与「网络放行」取舍冲突，故作为已知边界记录（连接仍受代理与本机
+  拦截约束，泄露的是元信息）。
+- **抽象命名空间 Unix socket（残余）**：路径遮蔽只作用于文件系统 socket（如
+  `/var/run/docker.sock` 被替换为字符设备）；**抽象命名空间 socket（`@name`，无文件路径）
+  不受遮蔽**，共享 netns 下可被 connect。与裸 TCP 同类，属应用层过滤无法覆盖的残余边界
+  （审计实测 `AF_UNIX` connect 可达，抽象 socket 计数可见）。
+- **宿主元信息泄露（procfs 全局条目，残余）**：`/proc/loadavg`、`/proc/pressure/*`、
+  `/proc/cpuinfo`、`/proc/bus/{pci,input}`、`/proc/schedstat` 等为全局 procfs 条目，暴露宿主
+  负载/进程数/硬件信息；新 uts ns 会**继承宿主 hostname**（`hostname` 可见宿主名）。属低危
+  信息泄露，按需可继续加入 `MANDATORY_PROC_MASKS`（会牺牲对应工具）。
+- **setuid 二进制（残余，已被 NNP 中和）**：沙箱内可见宿主 setuid 程序（`mount`/`passwd`/
+  `ssh-keysign`/`fusermount3`/`chrome-sandbox` 等），但 `NoNewPrivs=1` 使 setuid/文件 capability
+  一律被忽略，且 `mount`/`clone(CLONE_NEWUSER)` 已被 seccomp 拦截、`/dev/fuse` 不存在，
+  故不可借其提权。
+- **与独立 netns 网关（`network.gateway`）互斥**：后者启用时由网关提供代理，本拦截自动让位。
 
 ## 7. 配置
 
@@ -291,9 +408,13 @@ require("NeoAI").setup({
         "/etc/ld.so.cache", "/etc/passwd", "/etc/group", "/etc/nsswitch.conf",
         "/etc/hosts", "/etc/ssl", "/etc/alternatives", "/etc/localtime",
       },
+      expose_paths = {},             -- 宿主运行时直通（opt-in）：遮蔽/临时根之后只读暴露并前置 PATH
+      expose_path_env = true,        -- 是否把 expose_paths 目录前置到沙箱 PATH
+      expose_tool_paths = false,     -- 自动直通宿主 PATH 工具目录（opt-in，默认关；使 $HOME 下 node/npm/fd/go 可用）
       resolv_conf = "sanitize",      -- /etc/resolv.conf：sanitize（默认，仅 nameserver）| hide | passthrough
-      tmpfs_roots = { "/tmp", "/var/tmp" }, -- 每会话私有 tmpfs（不作为 overlay lower；退出即销毁）
-      hide_proc_paths = { "/proc/cmdline", "/proc/version" }, -- 以空文件覆盖，隐藏宿主内核信息
+      tmpfs_roots = { "/tmp", "/var/tmp" }, -- 每会话私有临时根（不作为 overlay lower；退出即销毁）
+      tmp_private_base = "host",     -- host（默认，宿主根下的隐藏子目录，命名空间映射回该根）| session
+      hide_proc_paths = { "/proc/cmdline", "/proc/version" }, -- 追加隐藏项（危险 sysctl 强制表只增不减）
       mask_paths = {                 -- 遮蔽宿主敏感路径（目录 tmpfs / 文件 socket 用 /dev/null）
         "/run/docker.sock", "/var/run/docker.sock", "/var/lib/docker",
         "/root/.config/herdr", "/etc/1panel", "/root/.ssh", "/root/.aws", "/root/.gnupg",
@@ -304,6 +425,11 @@ require("NeoAI").setup({
       mask_dirs = { "/home", "/root" }, -- 遮蔽目录列表（cwd 所在作用域只读暴露并遮蔽其余条目）
       mask_dirs_approval = true,     -- 命中遮蔽目录时弹窗审批（复用工具审批 UI）
       process_roots = {},            -- run_command 可写根（默认仅 cwd，自动补入；按需加回更多）
+      network = {
+        host_local_block = true,     -- 拦截向宿主本机的访问（应用层；裸 TCP 不覆盖，见 §6.1）
+        host_local_proxy_port = 0,   -- 宿主过滤代理端口（0 = 自动分配 loopback 随机端口）
+        proxy = "strip",             -- strip | passthrough | { http, https, all, no_proxy }
+      },
       seccomp = { enabled = true, filter_path = "" }, -- 内置 denylist 过滤器；仅 bwrap 后端
       workspace_root = vim.fn.stdpath("cache") .. "/NeoAI/sandbox",
       review = { enabled = true, auto_apply = false }, -- 异步审批：候选进入待审队列
@@ -333,7 +459,8 @@ require("NeoAI").setup({
 `lua/NeoAI/tests/test_sandbox.lua` 覆盖：加载器强制附加规格、fail-closed、
 状态机/幂等/fencing、策略聚合与受限规则、dry-run 不落盘、CAS 发布与冲突、
 buffer 写盘重定向、运行时能力探测与隔离进程执行、异步审批入队/应用/拒绝、
-run_command overlay 候选捕获（含删除 whiteout 捕获与尝试目录清理）。
+run_command overlay 候选捕获（含删除 whiteout 捕获与尝试目录清理）、
+进程内 `mask_paths` 硬拦截、密钥按名强制脱敏（文本层）。
 
 ## 10. 影响、证据、授权与外部操作（阶段二/三）
 
@@ -366,6 +493,36 @@ run_command overlay 候选捕获（含删除 whiteout 捕获与尝试目录清�
 - 可选更严格：`tools.sandbox.network.enabled=true` 且 `allowed_endpoints` 声明后，按应用层
   端点（主机模式，支持 `*.example.com`）放行，并受 `budget_bytes` 约束；未声明端点拒绝。
   L3/L4 五元组不能独立证明应用层身份，故以声明端点为准。
+
+### 独立 netns + 宿主网关（`network.gateway`，opt-in）
+
+开启 `tools.sandbox.network.gateway.enabled=true` 后，沙箱进程进入**独立网络命名空间**
+（`ip netns exec <ns> bwrap …`，bwrap 不再 unshare net），仅能到达宿主网关；网关在宿主侧
+对目标 `host:port` 先做 TCP connect **探针**（可探测宿主哪些端口在监听），随后**不回传真实
+服务数据**，而是把拦截原因（JSON）返回给客户端：
+
+- 开放端口：`HTTP 403` + `{"open":true,"reason":"port_open_but_service_access_blocked_…"}`；
+- 关闭端口：`HTTP 502` + `{"open":false,"reason":"port_not_open:…"}`；
+- 非宿主本机地址：`HTTP 403` + `only_host_local_addresses_allowed`。
+
+实现为宿主侧 HTTP 代理（`sandbox/gateway.lua`，纯 Lua/vim.uv）；`run_command` 注入
+`HTTP(S)_PROXY` 指向网关，故 `curl`/`wget`/`git`/`nmap --proxies` 等**走代理的工具**可经网关
+探测并拿到原因；直接裸 TCP 不经代理无法到达宿主（隔离 netns），因此不生效。`run_command`
+结果会附上本次探测摘要（开放/关闭端口 + 拦截原因）供 AI 参考。
+
+编排（`sandbox/net_gateway.lua`）：创建 veth 对与 netns、默认路由指向网关，并在宿主防火墙
+（如 ufw）插入仅针对该 veth 接口的入站放行规则（teardown 时移除）；资源在会话/插件卸载时
+清理。需 root 与 `ip`；不可用时 fail-closed（`GATEWAY_*` 明确错误）。
+
+> 说明：真正的透明拦截（任意裸 TCP 均可扫端口、服务被拦）需要 `TPROXY` +
+> `SO_ORIGINAL_DST`，纯 Lua 无法实现（需少量原生代码），当前以代理网关方案覆盖代理类工具。
+
+### AI 读取到密钥时的提示
+
+当工具结果被 token 化（AI 读取到 `NEOKEY_*`）时，`tools/executor` 会在结果末尾附加说明：
+「`NEOKEY_*` 为沙箱密钥 token——仅对 AI 不可见；网络发送、写入文件时会自动替换回原有真实
+密钥，不影响程序执行。」避免 AI 误以为拿到的是真实密钥或误判密钥无效。环境变量侧另有
+`NEOAI_TOKENIZED_ENV` 信号（见密钥防护章节）。
 
 ### 外部操作 broker
 
@@ -415,11 +572,22 @@ run_command overlay 候选捕获（含删除 whiteout 捕获与尝试目录清�
 
 内置生成 denylist 过滤器（x86_64/aarch64）：先校验 `AUDIT_ARCH`（不符直接 `KILL_PROCESS`），
 再对危险 syscall（`ptrace`/`mount`/`unshare`/`setns`/`bpf`/`kexec_load`/`init_module`/
-`io_uring_*`/`open_by_handle_at`/…）返回 `EPERM`，其余 `ALLOW`。经 `bwrap --seccomp FD`
+`io_uring_*`/`open_by_handle_at`/新挂载 API `open_tree`/`move_mount`/`fsopen`/`fsconfig`/
+`fsmount`/`fspick`/`mount_setattr`/…）返回 `EPERM`，其余 `ALLOW`。经 `bwrap --seccomp FD`
 在载荷 exec 前施加（bwrap 特权设置不被过滤）：`runtime` 用 shell 打开过滤器 fd 再 exec bwrap。
 
+- **`clone`/`clone3` 命名空间过滤（审计加固）**：`unshare`/`setns` 被拦，但 `clone`/`clone3`
+  带 `CLONE_NEWUSER` 等标志可创建**嵌套 userns**，绕过 unshare 拦截。过滤器对 `clone`
+  检查 `args[0] & (NEWUSER|NEWNS|NEWPID|NEWNET|NEWIPC|NEWUTS|NEWCGROUP)`，命中返回 `EPERM`；
+  `clone3` 的标志在指针参数中无法由经典 seccomp 解引用，故返回 `ENOSYS` 促使 glibc 回退到
+  `clone`（回退后再受上述 flags 过滤），避免直接 `EPERM` 打断线程创建。
+- **`socket` 地址族白名单（审计加固）**：仅放行 `AF_UNIX`/`AF_INET`/`AF_INET6`/`AF_NETLINK`，
+  其余地址族（`AF_PACKET`/`AF_VSOCK`/`AF_ALG`/`AF_XDP`/`AF_TIPC`…）返回 `EPERM`。尤其
+  **`AF_VSOCK` 不受网络命名空间隔离、也不经代理**，可直达宿主 vsock 服务（审计实测可创建
+  并 connect 宿主 CID）——属独立于 netns 的宿主通信通道，必须按地址族拦截。
 - `tools.sandbox.seccomp.enabled=true` 时启用；**默认开启**（与 `--cap-drop ALL` 共同构成纵深防御）。
-- `filter_path` 为空则用内置 denylist 生成到 `<root>/seccomp/baseline-<arch>.bpf`；
+- `filter_path` 为空则用内置 denylist 生成到 `<root>/seccomp/baseline-v2-<arch>.bpf`
+  （文件名带版本，内容变更时自动重建）；
   非空则必须存在，否则明确拒绝。
 - `require_seccomp=true` 要求外部进程有可用过滤器（且后端为 bwrap），否则返回
   `SANDBOX_SECCOMP_UNAVAILABLE`，不声称已施加。
@@ -479,7 +647,10 @@ run_command overlay 候选捕获（含删除 whiteout 捕获与尝试目录清�
 
 ### 命令输出脱敏（`shell.redact`）
 
-`run_command` 在把 stdout/stderr 回传模型前经 `conceal.redact()`，抹去：
+`run_command` 在把 stdout/stderr 回传模型前经 `conceal.redact()`；**进程内 `read` 工具读取
+`/proc/*` 时同样补做脱敏**（审计发现 `read_file /proc/self/mountinfo` 曾直出 overlay 真实
+路径，绕过 shell 输出脱敏；现由 `wrapper.gate` 对 `/proc` 读取结果调用 `conceal.redact`）。
+抹去：
 
 - overlay 挂载选项 `lowerdir=`/`upperdir=`/`workdir=` 的真实路径与 `userxattr`/`uuid=on`；
 - 挂载类型 `overlay` → `tmpfs`（mountinfo / mounts / mount 三种格式）；
@@ -507,8 +678,26 @@ run_command overlay 候选捕获（含删除 whiteout 捕获与尝试目录清�
   命中 `KEY`/`TOKEN`/`SECRET`/`PASSWORD`/`CREDENTIAL` 的值**无视熵阈值**一律替换为 token，
   覆盖 `GLM_API_KEY=dfe946…` 这类纯 hex 密钥逃过熵检测的盲区（刻意不含过宽的 `AUTH`，
   以免误伤 `SSH_AUTH_SOCK` 等路径变量）。
+- **文本层按名强制 token 化**：`tokenize()`（工具结果/暂存内容）对文本中的赋值
+  `NAME=value`、`NAME="value"`、`"NAME": "value"`，当 `NAME` 命中同一敏感名规则时，
+  无视熵阈值替换 `value`。这补上熵检测的两个盲区：纯小写 hex 段（被 `exclude_pure_hex`
+  排除）与含 `.` 等多段密钥（被 `RUN_PAT` 拆成不满足候选条件的片段），例如
+  `/proc/self/environ` 中的 `GLM_API_KEY=dfe946….rwbWDAf…`。值字符集刻意收窄，避免跨条目吞并。
 - `allowlist` 可再加 Lua pattern 排除。参数见
   [configuration.md](configuration.md) 的 `tools.sandbox.secrets`。
+
+### 环境变量 token 化的可观测性
+
+沙箱内看到的敏感环境变量是 **token（`NEOKEY_<hex>`）而非真实密钥**，与宿主环境不一致。
+为避免把 token 当真实凭据而误判（例如 `curl` 带 `$DEEPSEEK_API_KEY` 得到 `401 api key
+invalid`，实则 key 已被替换）：
+
+- 只要发生环境变量 token 化，沙箱进程环境会注入信号变量
+  `NEOAI_TOKENIZED_ENV=<变量名列表,逗号分隔>`，`env` / `printenv` 可见，可据此判断
+  「该值已被沙箱替换」。
+- 需要真实环境变量排查（调试 / 本地可信运行时）时，设
+  `tools.sandbox.secrets.tokenize_env = false` 整体关闭环境变量 token 化；工具结果与
+  暂存内容仍按密钥防护处理。**注意这会降低隔离强度，仅建议在可信环境临时使用。**
 
 ### 加密映射与生命周期
 
@@ -552,7 +741,7 @@ run_command overlay 候选捕获（含删除 whiteout 捕获与尝试目录清�
 
 | 档 | 名称 | 用途 | 隔离 | 审查 |
 |---|---|---|---|---|
-| **T0** | minimal | 普通命令 | cap-drop ALL + seccomp + 遮蔽 + **默认隔离网络** | 无逐命令审查；fs 改动进待审队列 |
+| **T0** | minimal | 普通命令 | cap-drop ALL + seccomp + 遮蔽 + **默认放行网络（经 host_proxy 拦截本机，见 §6.1）** | 无逐命令审查；fs 改动进待审队列 |
 | **T1** | elevated | 网络访问、受控 docker | 隔离内执行，网络放行 | 自动授权、留痕；fs 改动进待审队列 |
 | **T2** | privileged | cap_add、宿主 socket、宿主挂载 | **嵌套 userns** 内执行（cap 被作用域限制，够不到宿主） | 主机效果冻结为**提案**，异步审批后 replay |
 
@@ -605,3 +794,74 @@ T2 命令在嵌套 userns 内执行（`--unshare-all` + 可选 `--cap-add`，cap
 ### 配置
 
 见 [configuration.md](configuration.md) 的 `tools.sandbox.privilege` 与 `tools.sandbox.docker`。
+
+## 18. 安全分级、容器受控与行为审计
+
+### 18.1 审批按安全级别分级（`sandbox/risk.lua`）
+
+每次效果类调用都会评估安全级别（L0-L3），并在待审界面以 `[L0]`-`[L3]` 徽标着色展示，
+同时记录证据（`kind="risk"`）与 `SANDBOX_RISK_ASSESSED` 事件：
+
+| 级别 | 含义 | 触发（取最高） |
+| --- | --- | --- |
+| L0 low | 常规、可逆、工作区内 | 工作区文件写入、只读 |
+| L1 moderate | 网络、包安装、T1 提权 | 网络访问、`apt/pip/npm…`、T1 |
+| L2 high | 用户/系统路径写入、T2、危险命令 | `~`/系统路径写入、T2、`chmod -R 777`、`systemctl` |
+| L3 critical | 密钥、主机效果、破坏性命令 | 密钥操作、主机操作、`rm -rf /`、`curl … | sh` |
+
+审批动作由 `risk.action(level, opts)` 给出：`auto`（直接发布）/ `record`（发布并记录）/
+`review`（进入异步待审，不阻塞 agent）/ `block`（硬拒绝）。默认 `default="review"`
+保持既有语义；可用 `tools.sandbox.approval.levels` 覆盖单级动作。
+
+- **写入保护优先**：文件改动始终经暂存层，故**进程提权行为仅做记录**（证据 + `SANDBOX_PRIVILEGE_RECORDED`
+  + 审计），用于后续异常行为分析，不作为阻塞式审批门槛。T2 主机效果仍冻结为提案（见 §17）。
+- **仅在必要时才暂停**：默认异步模式下 agent 不被暂停；只有真正需要人工判断的动作
+  （如命中遮蔽目录、`block` 级别）才走阻塞式审批或拒绝。
+
+### 18.2 通过命令执行结果判断安全级别
+
+外部命令结束后，`risk.from_result({code,stdout,stderr})` 解析结果信号（权限不足
+`operation not permitted`/`permission denied` → L2，网络失败 → L1，包变更
+`Setting up …`/`Successfully installed …` → L1，破坏性输出 → L3），与调用前分级取较大者，
+记录证据并驱动自动提权检测（§17）。只读进程工具也会记录结果分级。
+
+### 18.3 容器受控运行（`sandbox/container.lua`）
+
+AI 调用容器运行时（docker/podman 等）时，尽量让容器与沙箱处于**同一 namespace**：
+
+- **无守护进程运行时**（`podman`/`buildah`）：CLI 在沙箱内执行、容器是 CLI 子进程，命令重写为
+  注入 `--net=host --pid=host --ipc=host --uts=host`，容器复用沙箱的 pid/net/ipc/uts
+  命名空间，被沙箱隔离边界一并约束（`tools.sandbox.container.share_namespace`，默认开）。
+- **有守护进程运行时**（`docker`/`nerdctl`）：容器由宿主侧 daemon 创建，无法复用沙箱命名空间，
+  保持「受控 socket」方案（§17）并记录原因 `DOCKER_NAMESPACE_NOT_SHARABLE`。
+
+计划写入 `kind="container"` 证据并发出 `SANDBOX_CONTAINER_PLANNED`。
+
+### 18.4 新会话自动审批（默认关闭）
+
+`tools.sandbox.review.session_auto_approve`（默认 false）：开启后 L0/L1 风险自动应用，
+L2+ 与包/密钥仍进入待审。目的是即便仅靠本地模型的智能水平，也能在写入保护下管理 agent
+行为。命令 `:NeoAISandboxAutoApprove [on|off|status]` 可随时切换。
+
+### 18.5 安装包额外规则
+
+包安装命令（`apt/pip/npm/go/cargo/gem/composer…`）分类为 `package`（T1，需网络）。
+`tools.sandbox.packages.mode`：`review`（默认，强制进入待审，**不随会话自动审批放行**）、
+`allow`（允许自动应用）、`deny`（硬拒绝）。包安装的写入仍在暂存层，不会直接改动宿主。
+
+### 18.6 敏感信息全部脱敏与行为审计
+
+- **具名敏感信息规则**（`sandbox/secret.lua` 的 `rules`/`extra_rules`）：除熵检测外，按 Lua
+  pattern 识别私钥块、`AKIA…`、`ghp_…`、`sk-…`、`xox…`、JWT、`Bearer`/`Basic` 等结构化凭据，
+  命中即 token 化（可无损还原）并留痕。`secret.redact()` 提供破坏性脱敏（用于日志/证据），
+  发出 `SANDBOX_SENSITIVE_REDACTED`。
+- **行为审计**（`sandbox/audit.lua`）：记录 AI 的读取/调用/进程/网络/密钥/提权/容器/包安装等
+  观测，累计加权风险分与异常计数；`:NeoAISandboxAudit` 查看摘要。高风险观测发出
+  `SANDBOX_AUDIT_ANOMALY`。
+
+### 18.7 命令与事件
+
+- 命令：`:NeoAISandboxAudit`、`:NeoAISandboxAutoApprove [on|off|status]`。
+- 事件：`SANDBOX_RISK_ASSESSED` / `SANDBOX_RISK_BLOCKED` / `SANDBOX_AUDIT_OBSERVED` /
+  `SANDBOX_AUDIT_ANOMALY` / `SANDBOX_CONTAINER_PLANNED` / `SANDBOX_SENSITIVE_REDACTED`。
+- 测试：`lua/NeoAI/tests/test_sandbox_governance.lua`。
