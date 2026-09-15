@@ -101,12 +101,12 @@ Anthropic `max_tokens` is required, and falls back to the capability table's `ma
 context_cache = {
   enabled = true,
   context_window = 64000,       -- Context window fallback: an explicit non-default user value wins, otherwise it is derived from the model capability table
-  threshold_ratio = 0.8,        -- Reaching this ratio triggers compaction (explicit-cache models automatically use a more conservative value)
-  retain_ratio = 0.16,          -- Proportion of recent history to retain
-  retain_min_tokens = 4096,     -- Lower bound for the retained tail
+  threshold_ratio = 0.8,        -- Reaching this ratio triggers background async compaction (non-blocking, no window; explicit-cache models use a more conservative value)
+  retain_ratio = 0.16,          -- Proportion of recent history retained for overflow recovery (regular compaction folds round 1 through the second-to-last round)
+  retain_min_tokens = 4096,     -- Lower bound for the retained tail during overflow recovery
   compact_max_tokens = 8192,    -- Max output for the compaction summary
-  min_shadow_messages = 2,      -- Minimum number of messages to collapse before compaction is worthwhile
-  compaction_retries = 1,       -- Retries when the result is still above the threshold after summarization
+  min_shadow_messages = 2,      -- Minimum messages to collapse during overflow recovery (regular compaction uses the round range)
+  compaction_retries = 1,       -- Retries when still above the threshold (regular compaction stops when no new messages are foldable)
   prune_enabled = true,         -- Perform model-agnostic tool-result pruning before summarization
   prune_threshold_chars = 8192, -- Only tool results whose text code points exceed this value are pruned
   prune_head_chars = 4096,      -- Number of head code points kept when pruning
@@ -115,6 +115,12 @@ context_cache = {
   identity = "You are an AI programming assistant powered by NeoAI.",
 }
 ```
+
+> **Compaction behavior**: regular (threshold-triggered) compaction runs **asynchronously in the background and non-blocking** — it folds round 1
+> through the second-to-last round (keeping the last round intact) and, once the summary completes, writes a **compaction overlay** (`agent.compaction`).
+> Subsequent requests and further compactions use the compacted replacement, while chat rendering and session persistence keep the **original context**
+> (the overlay is persisted in `session.metadata.compaction` and survives a restart). Compaction opens **no floating window**. Context-overflow
+> recovery (`force_compact`) still blocks and awaits, and uses `retain_ratio`/`retain_min_tokens`/`min_shadow_messages` for a maximal reduction.
 
 ### 2.2 `ui`
 
@@ -129,7 +135,7 @@ context_cache = {
 | `input_box` | `{idle_height=1, min_height=5, max_ratio=0.8}` | Input box height (idle/focused/growth cap) |
 | `chat` | `{mousescroll_max_blank=3, incremental=true}` | Max blank lines allowed below the last line when the wheel reaches the bottom (0 = strictly bottom-aligned); `incremental` enables incremental refresh (re-render only changed message blocks and write only the diff lines). Set to `false` to fall back to a full buffer rewrite |
 | `trajectory` | `{log_dir=".../NeoAI/logs"}` | Log directory for the trajectory display mode |
-| `statusline` | `{enabled=true, winbar=true, parts={mode,model,usage,cache,capacity,sandbox}, separator=" ", colors=...}` | lualine statusline; the `sandbox` part shows `待审N` when pending reviews > 0 (`N` is the total number of pending **files**, since the approval unit is a single file), linked to the prominent `NeoAISandboxPending` highlight group by default (bold yellow, override via `colors.sandbox`) |
+| `statusline` | `{enabled=true, winbar=true, parts={mode,model,usage,cache,capacity,sandbox}, separator=" ", colors=...}` | lualine statusline; the `sandbox` part shows `待审N` when pending reviews > 0 (`N` is the total number of pending **files**, since the approval unit is a single file), linked to the prominent `NeoAISandboxPending` highlight group by default (bold yellow, override via `colors.sandbox`); when the pending queue contains an **L3 (high-risk)** item, the part appends `⚠危险` and switches to the red `NeoAISandboxDanger` group (override via `colors.sandbox_danger`) |
 
 ### 2.3 `keymaps`
 
@@ -203,6 +209,10 @@ approval = {
 > **Approval decisions**: `mode=auto_allow` → no approval; `mode=strict` → always approve;
 > a tool with `auto_allow=true` → no approval; a path inside an allowed directory + the command's first word in an
 > allowed parameter group → no approval.
+> `allowed_directories` is the **global workspace allowlist** (applies to every tool and **includes all of its
+> subdirectories**); tool-level and `per_tool` entries are **unioned** with it (append-only, never overriding).
+> File tools are judged by path alone (the command allowlist does not apply when there is no command argument),
+> so once the workspace directory is configured its subdirectories need no per-file approval.
 
 **sandbox (tool execution sandbox)**:
 
@@ -210,25 +220,52 @@ approval = {
 sandbox = {
   enabled = true,                  -- Master switch
   fail_closed = true,              -- Reject execution when the sandbox service is missing/disabled (no silent downgrade)
+  -- Every child process a tool spawns internally (run_command/git/curl/node/MCP server, ...) is created
+  -- inside the sandbox namespace; the tool's own cache/temp dirs are exposed read-write, shared root
+  -- stdpath('cache')/NeoAI/shared (same path on host and sandbox).
   mode = "dry_run",                -- dry_run (default, only freezes candidates) | commit (CAS publish after authorization)
   backend = "auto",                -- auto | bwrap | unshare
   offline = false,                 -- Network allowed by default (recorded only, not blocked); true hard-denies network and isolates process networking
   require_seccomp = true,          -- Reject external execution when seccomp is unavailable (default on, fail-closed)
   seccomp = { enabled = true, filter_path = "" }, -- seccomp baseline (built-in denylist; default on; bwrap only)
-  cap_add = {},                    -- Capabilities to add back on demand; empty (default) = bwrap --cap-drop ALL
-  -- Minimal read-only system set (allowlist): only these host roots/subtrees/files are exposed
-  -- read-only to external commands; unlisted paths do not exist inside the sandbox (no more
-  -- `--ro-bind / /`). `/usr` is no longer exposed as a whole (avoids leaking the /usr/share/doc
-  -- package DB, /usr/local/go_workspace, /usr/src, etc.); /lib*, /bin, /sbin are loader symlink
-  -- roots and must stay. Supports `*` globs; missing entries are skipped.
+  cap_add = {},                    -- Least privilege by default (`--cap-drop ALL`); capabilities are added back narrowly per command (package installs via packages.cap_add). Set { "ALL" } only for debugging
+  -- Payload identity (least privilege): sandboxed processes run as a non-root user by default.
+  --   * NeoAI launched as non-root: uses the current uid/gid automatically (this setting is ignored).
+  --   * NeoAI launched as root: must use the dedicated non-root uid/gid here (default nobody 65534);
+  --     the plugin runs `setpriv` to drop bwrap to that uid before entering the userns, so the payload
+  --     is non-root both on the host and inside the namespace. Writable sandbox dirs (overlay
+  --     upper/work, staging, session) are chowned to that uid/gid; the workspace and `workspace_root`
+  --     must be traversable by it (do not put them under a 0700 /root when launching as root).
+  --   * uid = 0: explicitly opt out of dropping privileges (run payload as root; not recommended).
+  run_as = { uid = 65534, gid = 65534 },
+  cap_drop = {                     -- Host-global capability narrowing: dropped even when cap_add contains ALL (network/clock/modules/raw I/O/boot/MAC/audit)
+    "CAP_NET_ADMIN", "CAP_SYS_TIME", "CAP_SYS_MODULE", "CAP_SYS_RAWIO",
+    "CAP_SYS_BOOT", "CAP_MAC_ADMIN", "CAP_MAC_OVERRIDE", "CAP_AUDIT_CONTROL",
+  },
+  max_file_bytes = 8 * 1024 * 1024, -- Max bytes per file included in a candidate; larger files are skipped to avoid huge apt/pkgcache.bin blocking the main thread; 0 = unlimited
+  -- Read surface (on by default): when true the whole host root is exposed read-only
+  -- (`--ro-bind / /`), masking only the important config files/credentials in `mask_paths`
+  -- (~/.ssh, ~/.aws, /etc/shadow, sudoers, docker.sock, ...) plus the sandbox's own storage;
+  -- `mask_dirs` (home/root sibling dirs) are no longer mount-masked, but accessing user dirs
+  -- outside cwd is **traced** (evidence + `sandbox:outside_access` event) and shown in the
+  -- `:NeoAISandboxReview` window under "越界访问留痕" (non-blocking, still allowed). When false,
+  -- falls back to the minimal read-only allowlist below.
+  read_all = true,
+  -- Minimal read-only system set (allowlist, only when read_all=false): only these host
+  -- roots/subtrees/files are exposed read-only to external commands; unlisted paths do not exist
+  -- inside the sandbox. `/usr` is not exposed as a whole (avoids leaking /usr/local/go_workspace,
+  -- /usr/src, etc.), but `/usr/share` and `/var/lib` are exposed read-only as a whole so run_command
+  -- can read runtime shared data (nodejs/dotnet/java/git-core/terminfo, ...) and the host package DB
+  -- (dpkg/apt/rpm, ...); dangerous/sensitive subpaths are still masked by mask_paths (e.g.
+  -- /var/lib/docker). /lib*, /bin, /sbin are loader symlink roots and must stay. Supports `*` globs;
+  -- missing entries are skipped.
   readonly_roots = {
     "/lib", "/lib32", "/lib64", "/libx32", "/bin", "/sbin",
     "/usr/bin", "/usr/sbin", "/usr/lib", "/usr/lib32", "/usr/lib64", "/usr/libx32",
     "/usr/libexec", "/usr/include",
-    "/usr/share/terminfo", "/usr/share/locale", "/usr/share/zoneinfo",
-    "/usr/share/ca-certificates", "/usr/share/misc", "/usr/share/common-licenses",
-    "/usr/share/git-core", "/usr/share/vim", "/usr/share/nvim",
+    "/usr/share",                  -- runtime shared data (nodejs/dotnet/java/git-core/terminfo, ...)
     "/usr/local/bin", "/usr/local/sbin", "/usr/local/lib", "/usr/local/libexec", "/usr/local/include", "/usr/local/go",
+    "/var/lib",                    -- host package DB (dpkg/apt/rpm, ...); dangerous subpaths still masked
   },
   readonly_paths = { "/etc/ld.so.cache", "/etc/passwd", "/etc/group", "/etc/nsswitch.conf",
     "/etc/hosts", "/etc/ssl", "/etc/alternatives", "/etc/localtime",
@@ -238,12 +275,17 @@ sandbox = {
   expose_tool_paths = false,       -- Auto-expose host PATH tool dirs (opt-in): read-only-expose existing, non-credential/system PATH bin dirs and prepend them to the sandbox PATH so toolchains under $HOME (node/npm/fd/go) work (widens the read surface)
   resolv_conf = "sanitize",        -- /etc/resolv.conf: sanitize (default, nameservers only) | hide | passthrough
   tmpfs_roots = { "/tmp", "/var/tmp" }, -- per-session private temporary roots (never an overlay lower; destroyed on exit)
+  ephemeral_roots = { "/tmp", "/var/tmp" }, -- ephemeral candidate roots (excluding the cwd subtree): file writes under these roots are session-private, discarded when nvim exits, and produce no pending candidate / no publish / no approval popup; `{}` disables
   tmp_private_base = "host",       -- location of the private temp dir: host (default: hidden subdir under the host root, e.g. /tmp/.cache-<tag>/<session>, namespace-bound back onto the root to isolate the AI) | session (old behavior: under the session process dir)
   hide_proc_paths = { "/proc/cmdline", "/proc/version" }, -- overridden with an empty file; hides host kernel cmdline/version (dangerous global sysctls are mandatory and can only grow)
   mask_paths = {                   -- Mask host-sensitive paths (dirs -> tmpfs; files/sockets -> /dev/null)
     "/run/docker.sock", "/var/run/docker.sock", "/var/lib/docker", "/var/lib/containerd",
     "/root/.config/herdr", "/etc/1panel", "/run/dbus", "/run/systemd",
     "/root/.ssh", "/root/.aws", "/root/.gnupg", "/root/.kube", "/root/.cache/keyring-*",
+    -- Git credentials and signing keys (SSH/GPG/credential store/netrc/gh token), incl. non-root homes
+    "/root/.git-credentials", "/root/.config/git/credentials", "/root/.git-credential-cache", "/root/.config/gh",
+    "/home/*/.ssh", "/home/*/.gnupg", "/home/*/.netrc", "/home/*/.git-credentials",
+    "/home/*/.config/git/credentials", "/home/*/.config/gh", "/home/*/.docker/config.json",
     "/etc/shadow", "/etc/gshadow", "/etc/sudoers", "/etc/machine-id", "/etc/ssh",
     "/var/log", "/var/spool/cron", "/etc/crontab",
     "/root/.bash_history", "/root/.zsh_history", "/root/.python_history", "/root/.wget-hsts",
@@ -276,13 +318,13 @@ sandbox = {
   },
   -- Privilege tiers and auto-escalation: commands run at T0 least privilege by default
   -- (network allowed by default with host-local access intercepted); escalation is auto-requested
-  -- when privilege is insufficient.
+  -- at ALL tiers (T0→T1→T2 up to max_tier) and re-run in isolation, logging evidence/events/audit.
   privilege = {
     enabled = true, auto_escalate = true, max_tier = 2, record = true,
     tiers = {                       -- per-tier network/extra caps/mounts/unmask/review strictness
-      [0] = { name = "minimal", review = "auto", network = true, cap_add = {}, mounts = {}, unmask = {} }, -- network allowed (recorded); host-local intercepted via host_proxy
-      [1] = { name = "elevated", review = "auto", network = true, cap_add = {}, mounts = {}, unmask = { "/run/docker.sock", "/var/run/docker.sock" } },
-      [2] = { name = "privileged", review = "approve", network = true, userns = true, cap_add = {}, mounts = {}, unmask = { "/run/docker.sock", "/var/run/docker.sock" } },
+      [0] = { name = "minimal", review = "auto", network = true, cap_add = {}, mounts = {}, unmask = {} }, -- least privilege: non-root payload, cap-drop ALL. network allowed (recorded); host-local intercepted via host_proxy
+      [1] = { name = "elevated", review = "auto", network = true, cap_add = {}, mounts = {}, unmask = {} }, -- docker.sock is unmasked only for docker commands
+      [2] = { name = "privileged", review = "approve", network = true, userns = true, cap_add = { "ALL" }, mounts = {}, unmask = {} }, -- full caps inside the nested userns (scoped); seccomp still applies
     },
     classify = {                    -- command classification (bins = exact binary; bin+subs = binary + subcommand)
       { tier = 2, name = "privileged", bins = { "sudo", "mount", "modprobe", "iptables", "systemctl", "unshare", "nsenter" } },
@@ -303,11 +345,26 @@ sandbox = {
   session_shell = true,            -- persist shell state (export/cd) across run_command within a session (bwrap only)
   process_roots = {},              -- run_command writable roots (overlaid; default cwd only, auto-added). /tmp, /var/tmp belong to tmpfs_roots; host /root, /home, /etc are not exposed as read-only lower; add explicitly if needed
   -- Async review: candidates enter a pending queue. session_auto_approve auto-applies L0/L1.
-  review = { enabled = true, auto_apply = false, session_auto_approve = false },
+  -- l3_warning: L3 (critical) items require second confirmation (AI consequence warning + auto diff; apply only after re-confirming).
+  review = { enabled = true, auto_apply = false, session_auto_approve = false,
+             l3_warning = { enabled = true, max_tokens = 256, timeout_ms = 15000 } },
   -- Approval graded by security level (L0-L3): action auto/record/review/block; default "review".
   approval = { default = "review", levels = {} },
   -- Extra rules for package installs: review (default, forced review, not auto-approved) | allow | deny.
-  packages = { mode = "review", managers = { "apt", "pip", "npm", "go", "cargo", "gem", "composer" } },
+  -- `managers` also identifies the package manager: install candidates are grouped per install
+  -- command into one approval unit (approve the whole package from the header line).
+  -- Detection skips wrappers (sudo/doas/env/bash -c/for…do) so an install is not missed and
+  -- escalated to L3.
+  -- `roots` = package-manager state dirs (added as writable overlay staging so apt/pip/npm can write
+  -- indexes/caches/metadata); `cap_add` = narrow capabilities added back for package installs
+  -- when the global cap_add is narrowed (e.g. {}); granted only when the whole command is package
+  -- managers; no CAP_MKNOD — device nodes are hard-blocked by the seccomp baseline, FIFOs unaffected.
+  packages = {
+    mode = "review",
+    managers = { "apt", "apt-get", "pip", "pip3", "uv", "conda", "npm", "npx", "pnpm", "yarn", "go", "cargo", "gem", "composer" }, -- 包管理器名单（命令识别）；改动路径特征见 privilege.package_path_manager
+    roots = { "/var/lib/apt", "/var/cache/apt", "/var/lib/dpkg", "/usr/local", "~/.cache", "~/.npm" },
+    cap_add = { "CAP_DAC_OVERRIDE", "CAP_CHOWN", "CAP_SETUID", "CAP_SETGID", "CAP_FOWNER" },
+  },
   lsp_overlay = { enabled = true }, -- LSP process mount-namespace overlay: LSP disk reads see staged content (on by default, bwrap+overlay only; skipped when unavailable)
   secrets = { enabled = true, min_length = 20, max_length = 200, min_entropy = 3.5, min_distinct = 8, exclude_pure_hex = true, tokenize_env = true, extra_rules = {}, allowlist = {} }, -- Secret/sensitive guard: entropy + named rules (private-key blocks/AKIA/ghp_/sk-/JWT/Bearer…) + token mapping; env values whose names contain KEY/TOKEN/SECRET/PASSWORD/CREDENTIAL are force-tokenized
   retention = { candidate_days = 7, max_pending = 20 },
@@ -316,7 +373,12 @@ sandbox = {
     deny_tools = {},               -- Hard-denied tool names (cannot be overridden by confirmation)
     rules = {},                    -- Restricted Lua rule functions returning { decision, reason_codes }
   },
-  limits = { wall_ms = 60000, memory_bytes = 0, pids = 0, cpu_max = 0, cgroup_base = "/sys/fs/cgroup" },
+  -- Resource limits (cgroup v2): dynamic=true by default, deriving CPU/memory/PID caps from host
+  -- resources so a sandboxed command cannot starve the machine; explicit static values (>0) win.
+  -- With fail_closed=false, an unavailable cgroup is skipped rather than blocking execution.
+  limits = { wall_ms = 60000, dynamic = true, memory_ratio = 0.5, memory_max_bytes = 0,
+    cpu_cores_max = 4, pids_max = 2048, memory_bytes = 0, pids = 0, cpu_max = 0,
+    cgroup_base = "/sys/fs/cgroup", fail_closed = false },
   seccomp_filter_path = "",        -- optional: compiled seccomp BPF filter (with require_seccomp)
 }
 ```
@@ -440,7 +502,7 @@ plugins = {
 Plan mode is a **per-agent state** (`agent.plan_mode`); when active:
 
 1. **Injects the plan-policy system prompt section** (`deployment:plan_policy`, order=100): requires a clear, formatted modification plan as output.
-2. **Keeps only read-only/informational tools in the tool context, plus `ask_user` + `exit_plan_mode`** (the `PLAN_SAFE_TOOLS` allowlist), exposing no mutating tools.
+2. **Keeps only read-only/informational tools in the tool context, plus `run_command` (read-only research) + `ask_user` + `exit_plan_mode`** (the `PLAN_SAFE_TOOLS` allowlist + `PLAN_EXTRA_TOOLS`), exposing no mutating tools.
 3. **Tightens the execution-time gate accordingly** (`plan_mode.check_tool`): in plan mode, any tool outside the visible set is rejected.
 
 **Plan confirmation**: the AI calls `exit_plan_mode` (the approval dialog is confirmed by the user) or the user runs `:NeoAIApprovePlan`;

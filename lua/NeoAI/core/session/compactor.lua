@@ -1,16 +1,17 @@
 --- 上下文压缩
 --- @module NeoAI.core.session.compactor
---- 策略对齐 deepseek-harness 的 compaction：
+--- 后台异步、非阻塞压缩：
 --- 1. 达到 token 压力阈值时，先做模型无关的工具结果裁剪（tool_result_pruner）；
 ---    裁剪后已回到阈值内则跳过摘要调用。
---- 2. 仍需摘要时，折叠最早的整段历史，保留最近尾部（retain 预算）；
----    切点保持工具调用配对平衡，绝不拆散 assistant.tool_calls 与其 tool 结果。
---- 3. 辅助摘要调用「逐字节回放」会话前缀：相同的系统提示、工具 schema、被折叠区消息，
+--- 2. 仍需摘要时，折叠第一轮至倒数第二轮（保留最后一轮完整）；溢出恢复则做最大化
+---    平衡头部缩减（retain 0，只保留最新一个不可分单元，绝不拆散 tool_calls 与其结果）。
+--- 3. 辅助摘要调用「逐字节回放」请求视图前缀：相同的系统提示、工具 schema、被折叠区消息，
 ---    再把压缩指令作为最后的 user 消息追加 → 复用 provider 的热前缀缓存。
---- 4. 用带 <compacted-summary> 标签的检查点 user 消息替换被折叠区间；
----    后续请求在替换点之前的未变前缀仍然可复用缓存。仅替换而非追加：不产生第二份副本。
---- 5. 摘要后仍高于阈值时按 compaction_retries 重试；溢出恢复走最大化平衡头部缩减
----    （retain 0，只保留最新一个不可分单元）。
+--- 4. 摘要结果写入压缩覆盖层 `agent.compaction = { checkpoint, replaced }`，**不改动
+---    agent.messages**：渲染与会话持久化仍是原始上下文，后续请求与再次压缩经
+---    `context_builder.request_view` 使用「检查点 + 未替换尾部」。
+--- 5. `start_background` 启动后台压缩后立即返回（agent 不被阻塞，不弹压缩悬浮窗）；
+---    `maybe_compact` 为可等待版本；`force_compact`（溢出恢复）仍阻塞等待。
 
 local async = require("NeoAI.utils.async")
 local config_store = require("NeoAI.kernel.config_store")
@@ -155,8 +156,8 @@ end
 --- @return table 被折叠消息数组（保留原顺序，可为空）
 local function _select_shadow_range(agent, cfg, opts)
   opts = opts or {}
-  local messages = agent.messages or {}
   local context_builder = require("NeoAI.core.session.context_builder")
+  local messages = context_builder.request_view(agent)
   local caps = _caps(agent)
   local window = _window_for(agent, cfg)
   local retain_budget
@@ -191,6 +192,33 @@ local function _select_shadow_range(agent, cfg, opts)
   return shadow
 end
 
+--- 按轮次选择被折叠区间：折叠第一轮至倒数第二轮，保留最后一轮完整。
+--- 在请求视图上操作（可能已含上一次的检查点）：以最后一条非运行态 user 消息为最后一轮起点。
+--- @param agent table
+--- @param cfg table
+--- @return table shadow 被折叠消息数组（可为空）
+--- @return number added 其中「原始（非运行态、非检查点）消息」条数，用于累加覆盖层 replaced
+local function _select_round_shadow(agent, cfg)
+  local context_builder = require("NeoAI.core.session.context_builder")
+  local messages = context_builder.request_view(agent)
+  local last_user = nil
+  for i = #messages, 1, -1 do
+    local m = messages[i]
+    if m and m.role == "user" and not m.runtime_context then
+      last_user = i
+      break
+    end
+  end
+  if not last_user or last_user <= 1 then return {}, 0 end
+  local shadow, added = {}, 0
+  for i = 1, last_user - 1 do
+    local m = messages[i]
+    shadow[#shadow + 1] = m
+    if m and not m.runtime_context and not m.checkpoint then added = added + 1 end
+  end
+  return shadow, added
+end
+
 --- 回放被折叠区间做辅助摘要（前缀缓存复用）
 --- @param agent table
 --- @param shadow table 被折叠消息（原对象，保持字节一致）
@@ -205,30 +233,15 @@ local function _summarize(agent, shadow, cfg)
   messages[#messages + 1] = { role = "user", content = COMPACTION_INSTRUCTION }
 
   local tool_defs = tool_loop._tool_definitions(agent)
-  -- 流式接收摘要：实时把收到的推理 / 正文分片广播出去，UI 端显示"上下文压缩"悬浮窗，
-  -- 避免压缩期间界面无任何反馈、看起来像卡住。
-  local acc_reasoning = ""
-  local acc_content = ""
+  -- 后台异步压缩：不再向 UI 广播分片/打开「上下文压缩」悬浮窗（压缩不阻塞 agent，
+  -- 也无须弹窗打断用户）。摘要结果直接用于构建请求视图覆盖层。
   return request.send_stream(messages, {
     agent_config = agent.config,
     model = agent.model,
     tools = tool_defs,
     signal = agent.signal,
     max_tokens = cfg.compact_max_tokens or 8192,
-  }, function(chunk)
-    if not chunk then return end
-    if chunk.reasoning and chunk.reasoning ~= "" then
-      acc_reasoning = acc_reasoning .. chunk.reasoning
-    end
-    if chunk.content and chunk.content ~= "" then
-      acc_content = acc_content .. chunk.content
-    end
-    event_bus.emit(events.COMPACTION_CHUNK, {
-      agent_id = agent.id,
-      reasoning = acc_reasoning,
-      content = acc_content,
-    })
-  end)
+  })
 end
 
 --- 压缩门禁：无效 agent / 正在压缩 / 已取消 一律拒绝。
@@ -247,31 +260,20 @@ local function _can_compact(agent, opts)
   return true
 end
 
---- 用检查点 user 消息替换被折叠区间
+--- 应用压缩覆盖层：用检查点取代「前 added 条原始消息」的请求视图，不改动 agent.messages。
+--- 渲染与持久化仍使用原始消息；后续请求与再次压缩都走覆盖层后的请求视图。
 --- @param agent table
---- @param shadow table 被折叠消息
 --- @param summary string 摘要文本
-local function _replace_with_checkpoint(agent, shadow, summary)
-  local remove_count = #shadow
-  if remove_count == 0 then return end
-  -- 记录被替换消息中「已同步（已落盘）」的条数：回合边界压缩时被折叠消息此前都已持久化，
-  -- 该值等于 remove_count；但工具循环中途压缩时，本回合新增消息尚未落盘，
-  -- 若仍按 remove_count 从 durable surface 删除会误删上一回合的历史并损坏会话。
-  local synced_count = 0
-  for _, m in ipairs(shadow) do
-    if m and m._synced then synced_count = synced_count + 1 end
-  end
-  for _ = 1, remove_count do
-    table.remove(agent.messages, 1)
-  end
+--- @param added number 本次新折叠的原始（非运行态、非检查点）消息条数
+local function _apply_overlay(agent, summary, added)
+  local prev = (agent.compaction and tonumber(agent.compaction.replaced)) or 0
   local checkpoint = M.checkpoint_message(summary)
   checkpoint.ts = os.time()
-  checkpoint.replaced_count = remove_count
-  checkpoint.replaced_synced_count = synced_count
-  table.insert(agent.messages, 1, checkpoint)
+  checkpoint.replaced_count = prev + (added or 0)
+  agent.compaction = { checkpoint = checkpoint, replaced = prev + (added or 0) }
   event_bus.emit(events.COMPACTION_COMPLETED, {
     agent_id = agent.id,
-    replaced = remove_count,
+    replaced = added or 0,
     summary = summary,
   })
 end
@@ -306,12 +308,6 @@ end
 local function _compact(agent, cfg, opts)
   opts = opts or {}
   agent._compacting = true
-  local est = _estimate(agent)
-  event_bus.emit(events.COMPACTION_STARTED, {
-    agent_id = agent.id,
-    estimated_tokens = est,
-    threshold = opts.threshold or 0,
-  })
 
   local max_attempts = (tonumber(cfg.compaction_retries) or 1) + 1
   local compacted_any = false
@@ -321,11 +317,26 @@ local function _compact(agent, cfg, opts)
   end
 
   local function step(attempt)
-    local shadow = _select_shadow_range(agent, cfg, opts)
+    local shadow, added
+    if opts.mode == "overflow" then
+      shadow = _select_shadow_range(agent, cfg, opts)
+    else
+      -- 默认（阈值触发）：折叠第一轮至倒数第二轮，保留最后一轮完整。
+      shadow, added = _select_round_shadow(agent, cfg)
+    end
     if #shadow == 0 then
       if not compacted_any then
         logger.warn("[compactor] 可折叠消息过少，无法压缩")
       end
+      return finish(compacted_any)
+    end
+    if opts.mode == "overflow" then
+      added = 0
+      for _, m in ipairs(shadow) do
+        if m and not m.runtime_context and not m.checkpoint then added = added + 1 end
+      end
+    elseif not added or added == 0 then
+      -- 仅剩检查点、没有可折叠的原始消息：不再重复摘要。
       return finish(compacted_any)
     end
     return _summarize(agent, shadow, cfg):then_(function(response)
@@ -334,7 +345,7 @@ local function _compact(agent, cfg, opts)
         logger.warn("[compactor] 摘要为空，跳过压缩")
         return finish(compacted_any)
       end
-      _replace_with_checkpoint(agent, shadow, summary)
+      _apply_overlay(agent, summary, added)
       compacted_any = true
       -- 历史被替换：作废上一轮 API 用量，避免用压缩前的旧值再次触发压缩
       if agent.usage then agent.usage.last_prompt = nil end
@@ -394,7 +405,30 @@ function M.maybe_compact(agent, opts)
   if _prune(agent, cfg) and _estimate(agent) < threshold then
     return async.resolve(true)
   end
-  return _compact(agent, cfg, { threshold = threshold })
+  return _compact(agent, cfg, { mode = "round", threshold = threshold })
+end
+
+--- 后台异步压缩（非阻塞）：达到压力阈值时启动压缩，立即返回，不等待摘要完成。
+--- agent 继续用当前（原始）请求视图执行；压缩完成后覆盖层生效，后续请求与再次压缩
+--- 都基于压缩后的替换。不弹出任何 UI。裁剪同步完成（廉价），摘要异步进行。
+--- @param agent table Agent
+--- @param opts table|nil { context_cache?, allow_busy? }
+function M.start_background(agent, opts)
+  opts = opts or {}
+  local cfg = _cfg(opts)
+  if cfg.enabled == false then return end
+  if not _can_compact(agent, opts) then return end
+  local caps = _caps(agent)
+  local window = _window_for(agent, cfg)
+  local threshold = window * _threshold_ratio(cfg, caps)
+  if _estimate(agent) < threshold then return end
+  if _prune(agent, cfg) and _estimate(agent) < threshold then return end
+  local d = _compact(agent, cfg, { mode = "round", threshold = threshold })
+  if d and d.catch then
+    d:catch(function(err)
+      logger.warn("[compactor] 后台压缩失败: %s", tostring(err and err.message or err))
+    end)
+  end
 end
 
 --- 强制压缩（上下文溢出恢复用）：跳过压力阈值判断。
@@ -418,7 +452,7 @@ function M.force_compact(agent, opts)
   if _prune(agent, cfg) and _estimate(agent) < _window_for(agent, cfg) then
     return async.resolve(true)
   end
-  return _compact(agent, cfg, { retain_tokens = 0, min_shadow = 1 })
+  return _compact(agent, cfg, { mode = "overflow", retain_tokens = 0, min_shadow = 1 })
 end
 
 --- 构建检查点消息（供测试直接使用）

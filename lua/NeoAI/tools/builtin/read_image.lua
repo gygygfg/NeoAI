@@ -14,6 +14,7 @@ local image = require("NeoAI.utils.image")
 local attachment = require("NeoAI.core.attachment.attachment")
 local helpers = require("NeoAI.tools.builtin.tool_helpers")
 local async = require("NeoAI.utils.async")
+local sandbox_exec = require("NeoAI.sandbox.exec")
 
 local M = {}
 
@@ -50,10 +51,12 @@ local function _is_url(path)
   return type(path) == "string" and (path:lower():match("^https?://") ~= nil)
 end
 
---- 生成 /tmp 下的临时图像文件路径（普通文件，无执行权限）
+--- 生成临时图像文件路径（普通文件，无执行权限）。
+--- 位于宿主与沙箱同路径可见的共享目录，使沙箱内 curl 下载的文件宿主侧可直接读取。
 --- @return string
 local function _make_temp_image_path()
-  return ("/tmp/neoai_img_%d_%d.img"):format(vim.fn.getpid(), vim.fn.rand())
+  local dir = sandbox_exec.ensure_shared()
+  return ("%s/neoai_img_%d_%d.img"):format(dir, vim.fn.getpid(), vim.fn.rand())
 end
 
 --- 校验当前 route 是否声明图像输入（vision model）
@@ -102,8 +105,9 @@ end
 --- @return Deferred resolve(ref)
 local function _ingest(target_path, declared_media, display_path)
   local limits = attachment.image_limits()
-  -- 读盘（线程池）
-  return work.run(_read_binary, target_path):then_(function(data)
+  -- 读盘（线程池）：优先读取沙箱暂存副本（工具子进程的写入已冻结为候选，尚未落盘）。
+  local read_target = require("NeoAI.sandbox.candidate").read_path(target_path) or target_path
+  return work.run(_read_binary, read_target):then_(function(data)
     if not data or #data == 0 then
       error(("读取到空文件: %s"):format(target_path))
     end
@@ -141,41 +145,29 @@ end
 --- @param max_bytes number --max-filesize 上限（字节）
 --- @return Deferred resolve(tmp_path string)
 local function _download_to_temp(url, max_bytes)
-  local d = async.Deferred.new()
   local tmp = _make_temp_image_path()
-  local stderr_chunks = {}
   local cmd = {
     "curl", "-sSL", "--fail", "--max-time", tostring(MAX_DOWNLOAD_SECONDS),
     "--max-filesize", tostring(max_bytes), "-o", tmp, "--", url,
   }
-  local job_id = vim.fn.jobstart(cmd, {
-    stderr_buffered = true,
-    on_stdout = function() end,
-    on_stderr = function(_, data)
-      if data then
-        for _, line in ipairs(data) do
-          if line and line ~= "" then stderr_chunks[#stderr_chunks + 1] = line end
-        end
-      end
-    end,
-    on_exit = function(_, code)
-      if code == 0 and vim.fn.filereadable(tmp) == 1 then
-        d:resolve(tmp)
-      else
-        local msg = "下载失败: " .. url
-        if #stderr_chunks > 0 then
-          msg = msg .. " (" .. table.concat(stderr_chunks, " ") .. ")"
-        end
-        pcall(vim.fn.delete, tmp)
-        d:reject({ kind = "download", message = msg })
-      end
-    end,
-  })
-  if job_id == 0 then
-    pcall(vim.fn.delete, tmp)
-    d:reject({ kind = "download", message = "无法启动 curl 下载: " .. url })
-  end
-  return d
+  -- 统一经沙箱运行：overlay 暂存共享目录 → 下载结果冻结为候选（不直接落盘）；
+  -- 读取经 candidate.read_path 取暂存副本。
+  return sandbox_exec.run(cmd, {
+    name = "read_image",
+    writable_roots = { sandbox_exec.shared_root() },
+    network = true,
+    timeout_ms = (MAX_DOWNLOAD_SECONDS + 5) * 1000,
+  }):then_(function(res)
+    if res.aborted then error("下载已取消: " .. url) end
+    if res.timed_out then error("下载超时: " .. url) end
+    if res.code ~= 0 then
+      local msg = "下载失败: " .. url
+      local tail = (res.stderr or ""):gsub("%s+$", "")
+      if tail ~= "" then msg = msg .. " (" .. tail:sub(-300) .. ")" end
+      error(msg)
+    end
+    return tmp
+  end)
 end
 
 -- ========== 工具定义 ==========

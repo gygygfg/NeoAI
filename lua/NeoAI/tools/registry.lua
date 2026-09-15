@@ -182,26 +182,37 @@ function M.apply_approval_config(overrides)
 end
 
 --- 获取工具的审批配置
+--- 合并顺序：全局默认（`tools.approval.allowed_directories` / `allowed_param_groups`
+--- / `default_auto_allow`）→ 工具自身默认 → 用户 per_tool 覆盖。
+--- 允许目录/命令组按**并集**合并：全局「工作区目录」一旦设置，其子目录对所有工具自动放行，
+--- 工具自身与 per_tool 的条目只做追加，不会覆盖掉全局工作区。
 --- @param name string
 --- @return table { auto_allow, allowed_directories, allowed_param_groups }
 function M.get_approval_config(name)
   local tool = state.tools[name]
+  local global = require("NeoAI.kernel.config_store").get("tools.approval") or {}
   local base = {
-    auto_allow = false,
-    allowed_directories = {},
-    allowed_param_groups = {},
+    auto_allow = global.default_auto_allow == true,
+    allowed_directories = vim.deepcopy(global.allowed_directories or {}),
+    allowed_param_groups = vim.deepcopy(global.allowed_param_groups or {}),
   }
-  if tool and tool.approval then
-    base.auto_allow = tool.approval.auto_allow or false
-    base.allowed_directories = vim.deepcopy(tool.approval.allowed_directories or {})
-    base.allowed_param_groups = vim.deepcopy(tool.approval.allowed_param_groups or {})
+  local function add_dirs(list)
+    for _, d in ipairs(list or {}) do base.allowed_directories[#base.allowed_directories + 1] = d end
   end
-  -- 用户覆盖优先
+  local function add_groups(list)
+    for _, g in ipairs(list or {}) do base.allowed_param_groups[#base.allowed_param_groups + 1] = g end
+  end
+  if tool and tool.approval then
+    if tool.approval.auto_allow ~= nil then base.auto_allow = tool.approval.auto_allow end
+    add_dirs(tool.approval.allowed_directories)
+    add_groups(tool.approval.allowed_param_groups)
+  end
+  -- 用户 per_tool 覆盖：追加允许目录/命令组（不覆盖全局工作区），auto_allow 显式覆盖。
   local ov = state.approval_overrides[name]
   if ov then
     if ov.auto_allow ~= nil then base.auto_allow = ov.auto_allow end
-    if ov.allowed_directories then base.allowed_directories = ov.allowed_directories end
-    if ov.allowed_param_groups then base.allowed_param_groups = ov.allowed_param_groups end
+    add_dirs(ov.allowed_directories)
+    add_groups(ov.allowed_param_groups)
   end
   return base
 end
@@ -211,6 +222,26 @@ end
 --- @param config table
 function M.set_runtime_approval(name, config)
   state.approval_overrides[name] = vim.deepcopy(config)
+end
+
+--- 运行期把目录并入某工具的 allowed_directories（审批弹窗「加入工作目录」用）。
+--- 只记录新增目录；生效配置由 get_approval_config 与全局/工具默认做并集。
+--- @param name string 工具名
+--- @param dir string 目录路径（可为相对/带 ~）
+--- @return boolean 是否新增（已包含或参数非法时返回 false）
+function M.add_allowed_directory(name, dir)
+  if type(name) ~= "string" or type(dir) ~= "string" or dir == "" then return false end
+  local abs = vim.fn.fnamemodify(vim.fn.expand(dir), ":p"):gsub("/+$", "")
+  if abs == "" then return false end
+  -- 已生效（全局/工具默认/已有覆盖）的目录不重复添加
+  for _, d in ipairs(M.get_approval_config(name).allowed_directories or {}) do
+    if vim.fn.fnamemodify(vim.fn.expand(d), ":p"):gsub("/+$", "") == abs then return false end
+  end
+  local ov = vim.deepcopy(state.approval_overrides[name] or {})
+  ov.allowed_directories = ov.allowed_directories or {}
+  ov.allowed_directories[#ov.allowed_directories + 1] = abs
+  state.approval_overrides[name] = ov
+  return true
 end
 
 --- 清空（测试用）

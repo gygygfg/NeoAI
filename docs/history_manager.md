@@ -13,7 +13,7 @@
 | `core/session/session_store.lua` | 会话持久化：追加式 JSONL + `.bak` 备份 + 撕裂行修复；CRUD + get_chain/get_downstream 链式遍历。 |
 | `core/session/context_builder.lua` | 从会话/Agent 构建发送给模型的上下文消息（含 system 渲染、工具调用协议处理）。 |
 | `core/session/tool_result_pruner.lua` | 模型无关的工具结果裁剪：摘要前把超长工具结果裁成「头部 + 省略标记 + 尾部」。 |
-| `core/session/compactor.lua` | 上下文压缩：达到压力阈值时折叠旧历史、辅助摘要（前缀缓存复用）、检查点替换。 |
+| `core/session/compactor.lua` | 上下文压缩：达到压力阈值时后台折叠第一轮至倒数第二轮、辅助摘要（前缀缓存复用）、写入压缩覆盖层（渲染/持久化仍原始）。 |
 
 ## 2. 会话对象（session.lua）
 
@@ -81,34 +81,35 @@ session = {
 
 ## 5. 上下文压缩（compactor.lua）
 
-策略对齐 deepseek-harness 的 compaction：
+后台异步、非阻塞压缩：达到阈值时启动摘要生成后立即返回，agent 不被阻塞，也不弹压缩悬浮窗。
+摘要完成后写入**压缩覆盖层**，后续请求与再次压缩使用压缩后的替换；渲染与会话持久化仍是原始上下文。
 
-1. **触发**：分两处。
-   - **回合边界**：`runtime.run` 在新一步前调 `maybe_compact(agent)`（要求 `idle`）。
-   - **工具循环内部**：`tool_loop._send_round` 每轮发送前调 `maybe_compact(agent, { allow_busy = true })`；
-     溢出恢复（`recovery`）调 `force_compact(agent, { allow_busy = true })`。二者放宽 `idle` 要求，
-     因为此刻上一轮工具结果已回写、下一轮请求尚未发出（或请求已因溢出失败），无并发写入。
+1. **触发**：分两处（均保持阈值判断，`start_background` 后台执行）。
+   - **回合边界**：`runtime.run` 追加用户消息后调 `start_background(agent, { allow_busy = true })`。
+   - **工具循环内部**：`tool_loop._send_round` 每轮发送前调 `start_background(agent, { allow_busy = true })`；
+     溢出恢复（`recovery`）仍调**阻塞等待**的 `force_compact(agent, { allow_busy = true })`。
    估算 token 达到 `context_window * threshold_ratio` 阈值时折叠。
 2. **模型无关裁剪**：先由 `tool_result_pruner.prune_agent` 把超预算的工具结果裁成
    「头部 + 省略标记 + 尾部」（`prune_threshold_chars` / `prune_head_chars` / `prune_tail_chars`），
    含图像引用的结果跳过。裁剪后已回到阈值内则直接结束，无需摘要调用；有裁剪则作废过期 API 用量。
-3. **选择折叠区间**：`_select_shadow_range` 折叠最早的整段历史，保留最近尾部（`retain_ratio` 预算，
-   下限 `retain_min_tokens`，至少 `min_shadow_messages` 条消息）。切点必须**工具配对平衡**：
-   前移切点直到不拆散 `assistant.tool_calls` 与其 `tool` 结果，否则压缩后请求会被 API 拒绝。
-4. **辅助摘要**：`_summarize` 逐字节回放会话前缀（相同系统提示、工具 schema、被折叠区消息），
+3. **选择折叠区间（常规）**：`_select_round_shadow` 折叠**第一轮至倒数第二轮**（保留最后一轮完整），
+   以请求视图（可能已含上一次检查点）中最后一条非运行态 user 消息为最后一轮起点。
+   溢出恢复的 `force_compact` 则走 `_select_shadow_range` 做最大化平衡头部缩减
+   （retain 0，至少 `min_shadow_messages` 条；切点必须**工具配对平衡**，不拆散
+   `assistant.tool_calls` 与其 `tool` 结果）。
+4. **辅助摘要**：`_summarize` 逐字节回放请求视图前缀（相同系统提示、工具 schema、被折叠区消息），
    再追加压缩指令作为最后一条 user 消息 → 复用 provider 热前缀缓存。
-5. **检查点替换**：生成带 `<compacted-summary>` 标签的 checkpoint user 消息，**替换被折叠区间**
-   （`_replace_with_checkpoint`），并记录：
-   - `replaced_count`：被替换消息条数（供展示/统计）；
-   - `replaced_synced_count`：其中**已落盘（`_synced`）**的条数。回合边界压缩时二者相等；
-     工具循环中途压缩时，本回合新增消息尚未落盘，该值小于 `replaced_count`。
+5. **压缩覆盖层**：`_apply_overlay` 写入 `agent.compaction = { checkpoint, replaced }`：
+   - `checkpoint`：带 `<compacted-summary>` 标签的 user 消息；
+   - `replaced`：被替换的**非运行态快照**消息条数（跨运行态快照计数，重开可复现）。
 
-   `chat_service._persist_agent` 按 **`replaced_synced_count`**（缺省回退 `replaced_count`，兼容
-   旧数据）从 durable surface 头部/尾部删除已同步旧消息，**保证不误删上一回合历史**。
-6. **收敛重试**：摘要后仍高于阈值时按 `compaction_retries` 继续折叠更早区间。
+   **不改动 `agent.messages`**：聊天渲染与会话持久化仍是原始完整历史。
+   `context_builder.request_view(agent)` 用「检查点 + 未替换尾部」构建请求视图；
+   `build_from_agent` 使用该视图。覆盖层存于 `session.metadata.compaction`，`load_session` 重开时还原。
+6. **收敛重试**：摘要后仍高于阈值时按 `compaction_retries` 重试；常规压缩在无新的可折叠原始消息时停止。
 
-`force_compact`（溢出恢复用）跳过压力阈值判断，**缺省 `allow_busy = true`**；先裁剪，裁剪已足以回到
-窗口内则不再摘要，否则做一次最大化的平衡头部缩减（retain 0，只保留最新一个不可分单元）。
+`force_compact`（溢出恢复用）跳过压力阈值判断，**缺省 `allow_busy = true`**，**阻塞等待**；先裁剪，
+裁剪已足以回到窗口内则不再摘要，否则做一次最大化的平衡头部缩减（retain 0，只保留最新一个不可分单元）。
 
 ## 6. 会话树与分支
 

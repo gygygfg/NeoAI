@@ -25,6 +25,8 @@ local state = {
 -- 沙箱待审徽标的自定义高亮组：黄底加粗，醒目；用户可在
 -- config ui.statusline.colors.sandbox 覆盖为其它高亮组。
 local SANDBOX_HL = "NeoAISandboxPending"
+-- 待审队列含 L3（高危）时的红色危险高亮组；可用 ui.statusline.colors.sandbox_danger 覆盖。
+local SANDBOX_DANGER_HL = "NeoAISandboxDanger"
 
 -- 默认格式化选项：可展示的段与分隔符
 local DEFAULTS = {
@@ -45,6 +47,7 @@ local DEFAULTS = {
     brand = "Title",
     pending = "Warning",
     sandbox = SANDBOX_HL,
+    sandbox_danger = SANDBOX_DANGER_HL,
   },
 }
 
@@ -104,6 +107,9 @@ local function _ensure_sandbox_hl()
   if vim.fn.hlexists(SANDBOX_HL) == 0 then
     pcall(vim.api.nvim_set_hl, 0, SANDBOX_HL, { bold = true, fg = "#3a2d00", bg = "#e5c07b" })
   end
+  if vim.fn.hlexists(SANDBOX_DANGER_HL) == 0 then
+    pcall(vim.api.nvim_set_hl, 0, SANDBOX_DANGER_HL, { bold = true, fg = "#ffffff", bg = "#e06c75" })
+  end
 end
 
 --- 计算段字符串
@@ -140,7 +146,10 @@ local function _build_part(info, part)
   elseif part == "sandbox" then
     -- 沙箱待审变更数：>0 才显示醒目徽标（0 时返回 nil，不渲染、不打扰）
     if not info.sandbox_pending or info.sandbox_pending <= 0 then return nil end
-    return "待审" .. info.sandbox_pending
+    local text = "待审" .. info.sandbox_pending
+    -- L3（高危）时追加红色危险标记（配色见 lualine 扩展的 sandbox_comp）
+    if info.sandbox_level and info.sandbox_level >= 3 then text = text .. " ⚠危险" end
+    return text
   elseif part == "display" then
     return info.display and ("[" .. info.display .. "]") or nil
   end
@@ -253,6 +262,20 @@ function M.capacity_level()
   return (cap and cap.level) or "ok"
 end
 
+--- 待审沙箱变更的最高危险级别（供状态栏动态配色：L3 显示红色危险高亮）。
+--- 无待审/沙箱不可用时返回 nil。
+--- @return number|nil
+function M.sandbox_level()
+  local sandbox = services.use("services.sandbox")
+  if not sandbox then return nil end
+  if sandbox.pending_summary then
+    local ok, sum = pcall(sandbox.pending_summary)
+    if ok and type(sum) == "table" and tonumber(sum.max_level) then return tonumber(sum.max_level) end
+    return nil
+  end
+  return nil
+end
+
 --- 检查上下文压力并按级别提示一次（同一 Agent 同级别去重，回落到 ok 后重置）。
 --- @param agent table
 --- @return string|nil level
@@ -292,12 +315,19 @@ function M.get_info()
     capacity = nil,
     pending = nil,
     sandbox_pending = nil,
+    sandbox_level = nil,
   }
   -- 当前 agent 正忙时暂存的待发消息数（无 agent 或队列为空则缺省，徽标不渲染）
   info.pending = chat_service and chat_service.pending_count() or nil
-  -- 沙箱待审变更数：仅 >0 时填充，供状态栏醒目显示
+  -- 沙箱待审变更数 + 最高安全级别（单次扫描）：供状态栏徽标与 L3 红色危险高亮
   local sandbox = services.use("services.sandbox")
-  if sandbox and sandbox.pending_count then
+  if sandbox and sandbox.pending_summary then
+    local ok, sum = pcall(sandbox.pending_summary)
+    if ok and type(sum) == "table" then
+      if tonumber(sum.count) and tonumber(sum.count) > 0 then info.sandbox_pending = tonumber(sum.count) end
+      if tonumber(sum.max_level) then info.sandbox_level = tonumber(sum.max_level) end
+    end
+  elseif sandbox and sandbox.pending_count then
     local ok, n = pcall(sandbox.pending_count)
     if ok and tonumber(n) and tonumber(n) > 0 then info.sandbox_pending = tonumber(n) end
   end

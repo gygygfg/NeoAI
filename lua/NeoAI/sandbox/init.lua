@@ -33,6 +33,8 @@ local bench = require("NeoAI.sandbox.bench")
 local risk = require("NeoAI.sandbox.risk")
 local audit = require("NeoAI.sandbox.audit")
 local container = require("NeoAI.sandbox.container")
+local secret = require("NeoAI.sandbox.secret")
+local trace = require("NeoAI.sandbox.trace")
 local events = require("NeoAI.kernel.events")
 
 local M = {}
@@ -61,11 +63,19 @@ end
 --- 插件热重载 / 重开时 `shutdown` 会清空暂存目录，但待审队列仍落盘；若不再物化，
 --- 只读工具会看不到这些待审修改（沙箱视图与待审队列不一致）。此处按候选内容重建。
 local function _rehydrate_pending()
-  local ok, items = pcall(review.list, { review_state = review.REVIEW.PENDING })
+  local ok, items = pcall(review.list)
   if not ok or type(items) ~= "table" then return end
   for _, item in ipairs(items) do
-    local cand = store.read_candidate(item.candidate_digest)
-    if cand then pcall(candidate.merge_candidate, cand) end
+    -- 待审（PENDING）与已批准但尚未应用（APPROVED/NOT_REQUESTED）的候选都要重新物化：
+    -- 包安装等大批量暂存内容在重启后仍应可读、可应用，直到真正应用或拒绝。
+    local st = item.review_state
+    local ap = item.apply_state
+    local keep = st == review.REVIEW.PENDING
+      or (st == review.REVIEW.APPROVED and ap == review.APPLY.NOT_REQUESTED)
+    if keep then
+      local cand = store.read_candidate(item.candidate_digest)
+      if cand then pcall(candidate.merge_candidate, cand) end
+    end
   end
 end
 
@@ -248,6 +258,18 @@ end
 --- @return number
 function M.pending_count()
   return review.pending_count()
+end
+
+--- 待审摘要：文件数 + 最高安全级别（供状态栏徽标与 L3 危险高亮）
+--- @return table { count = number, max_level = number|nil }
+function M.pending_summary()
+  return review.pending_summary()
+end
+
+--- 越界访问留痕（访问 cwd 之外用户工作目录；供审批悬浮窗展示）
+--- @return table 数组
+function M.list_traces()
+  return trace.list()
 end
 
 --- 批准变更单元
@@ -457,6 +479,8 @@ M.bench = bench
 M.risk = risk
 M.audit = audit
 M.container = container
+M.secret = secret
+M.trace = trace
 
 --- 重置（测试用）
 function M.reset()
@@ -480,6 +504,7 @@ function M.reset()
   audit.reset()
   container.reset()
   require("NeoAI.sandbox.secret").reset()
+  trace.reset()
   pcall(function() require("NeoAI.sandbox.net_gateway").reset() end)
   pcall(function() require("NeoAI.sandbox.host_proxy").reset() end)
   state.active = nil

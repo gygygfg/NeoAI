@@ -9,13 +9,14 @@
 --- 级别：
 ---   L0 low      常规、可逆、工作区内（默认按配置动作，通常是 review）
 ---   L1 moderate 网络、包安装、T1 提权
----   L2 high     用户目录/系统路径写入、T2 特权、危险命令
----   L3 critical 密钥操作、主机效果、破坏性命令
+---   L2 high     用户目录/系统路径写入、T2 特权、危险命令、**工作区内的密钥操作**
+---   L3 critical **工作区外的密钥操作**、主机效果、破坏性命令
 ---
 --- 说明：本模块只做「评估与建议」，不直接执行/发布；最终动作由 wrapper 结合
 --- 任务授权、sandbox.mode、会话自动审批与包规则综合决定。
 
 local config_store = require("NeoAI.kernel.config_store")
+local fs = require("NeoAI.utils.fs")
 
 local M = {}
 
@@ -31,6 +32,12 @@ local DANGEROUS = {
   { level = 3, name = "DESTRUCTIVE", pats = {
     "rm%s+%-[%w]*r[%w]*f[%w]*%s+/", "rm%s+%-[%w]*f[%w]*r[%w]*%s+/",
     "mkfs", "dd%s+[^\n]*of=/dev/", ">%s*/dev/sd", ">%s*/dev/nvme",
+    "shred%s", "wipefs", "blkdiscard", "of=/dev/",
+  } },
+  { level = 3, name = "FORK_BOMB", pats = {
+    ":%(%)%s*{%s*:%s*|%s*:%s*&%s*}",
+    "while%s+true%s+do%s+.*fork",
+    "perl%s+%-e%s+['\"]?fork",
   } },
   { level = 3, name = "PIPE_TO_SHELL", pats = {
     "curl[^\n]-|%s*[%w/]*sh", "wget[^\n]-|%s*[%w/]*sh", "|%s*sh%s*$", "|%s*bash%s*$",
@@ -43,6 +50,30 @@ local DANGEROUS = {
     "mkfs", "swapoff", "swapon",
   } },
 }
+
+-- 本机 SSH 服务目标（禁止访问）：回环、链路本地、通配地址、localhost。
+local SSH_LOCAL_TARGETS = { "localhost", "127.", "::1", "[::1]", "0.0.0.0", "169.254." }
+
+--- 命令是否试图访问**本机 SSH 服务**（ssh/scp/sftp/sshpass 或 `ssh://` 指向本机）。
+--- 供 wrapper 硬拒绝：在「agent socket 遮蔽 + SSH_AUTH_SOCK 环境清除」之外，直接禁止
+--- 沙箱内命令连接宿主 sshd（共享 netns 下裸 TCP 不经代理，需命令级闸门）。
+--- @param command string|nil
+--- @return boolean denied
+--- @return string|nil target
+function M.ssh_local_target(command)
+  if type(command) ~= "string" or command == "" then return false end
+  local lower = command:lower()
+  local has_ssh = lower:find("%f[%w]ssh%f[%W]") ~= nil
+    or lower:find("%f[%w]scp%f[%W]") ~= nil
+    or lower:find("%f[%w]sftp%f[%W]") ~= nil
+    or lower:find("sshpass", 1, true) ~= nil
+    or lower:find("ssh://", 1, true) ~= nil
+  if not has_ssh then return false end
+  for _, t in ipairs(SSH_LOCAL_TARGETS) do
+    if lower:find(t, 1, true) then return true, t end
+  end
+  return false
+end
 
 -- 执行结果 → 安全级别提示（失败模式）。命中取最高。
 local RESULT_PATTERNS = {
@@ -79,8 +110,7 @@ end
 --- @param p string
 --- @return string
 local function _norm(p)
-  local abs = vim.fn.fnamemodify(vim.fn.expand(p), ":p")
-  return (abs:gsub("/+$", ""))
+  return fs.canonical(p)
 end
 
 local function _under(path, base)
@@ -162,11 +192,35 @@ function M.classify(facts)
       facts.privilege_tier >= 2 and "PRIVILEGE_T2" or "PRIVILEGE_T1")
   end
   if facts.host_op then bump(M.LEVEL.CRITICAL, "HOST_OPERATION") end
-  if facts.secret then bump(M.LEVEL.CRITICAL, "SECRET_OPERATION") end
+  if facts.secret then
+    -- 密钥操作按作用域分级：工作区内 L2（HIGH），工作区外（用户目录/系统路径）L3（CRITICAL）。
+    local outside = false
+    for _, p in ipairs(facts.paths or {}) do
+      if M.path_level(p) > 0 then outside = true break end
+    end
+    if outside then
+      bump(M.LEVEL.CRITICAL, "SECRET_OPERATION_OUTSIDE_WORKSPACE")
+    else
+      bump(M.LEVEL.HIGH, "SECRET_OPERATION")
+    end
+  end
   local dlevel, dreasons = _dangerous(facts.command)
   if dlevel > level then level = dlevel end
   for _, r in ipairs(dreasons) do reasons[#reasons + 1] = r end
+  -- 包安装（apt/pip/npm 等）属高危但非 critical：其状态文件位于工作区外、且常含高熵签名/
+  -- 哈希，不因「工作区外写入/密钥误报」升到 L3；仅当命令本身命中破坏性模式时才保留 L3。
+  if facts.package and level >= M.LEVEL.CRITICAL and dlevel < M.LEVEL.CRITICAL then
+    level = M.LEVEL.HIGH
+  end
   return { level = level, name = M.level_name(level), badge = M.badge(level), reasons = reasons }
+end
+
+--- 命令文本命中的最高危险级别（供包安装降级判定）
+--- @param command string|nil
+--- @return number
+function M.dangerous_level(command)
+  local l = _dangerous(command)
+  return l
 end
 
 --- 依据命令执行结果判断安全级别（失败/网络/包变更等信号）

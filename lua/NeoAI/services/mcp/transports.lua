@@ -103,6 +103,7 @@ function M.stdio(server, opts)
   self.command = server.command
   self.args = server.args or {}
   self.env = server.env or {}
+  self.cwd = server.cwd
   self.timeout_ms = server.timeout_ms or 60000
   self.dead_ms = server.dead_ms or 15000 -- SIGTERM 后等待退出的时间
   self.job = nil
@@ -119,7 +120,31 @@ function M.stdio(server, opts)
       logger.warn("[mcp] %s 无 command 可启动", self.name)
       return
     end
-    self.job = vim.fn.jobstart(argv, {
+    -- 统一经沙箱创建 server 子进程：网络放行；只读暴露 command 所在目录（支持装在
+    -- $HOME 下的 server）；cwd（或进程工作目录）作为可写根经 overlay 暂存，server 的
+    -- 写入在退出时冻结为候选（与 edit_file 一样走暂存）。后端不可用时拒绝启动（fail-closed）。
+    local sandbox_exec = require("NeoAI.sandbox.exec")
+    local ro, rw = {}, {}
+    local resolved = vim.fn.exepath(self.command)
+    local cmd_path = (resolved ~= "" and resolved) or self.command
+    if type(cmd_path) == "string" and cmd_path:sub(1, 1) == "/" then
+      ro[#ro + 1] = vim.fn.fnamemodify(cmd_path, ":p:h")
+    end
+    if type(self.cwd) == "string" and self.cwd ~= "" then rw[#rw + 1] = self.cwd end
+    local full, finish, werr = sandbox_exec.open(argv, {
+      name = "mcp_" .. tostring(self.name),
+      network = true,
+      ro_binds = ro,
+      writable_roots = rw,
+      cwd = self.cwd,
+      command = table.concat(argv, " "),
+    })
+    if not full then
+      logger.warn("[mcp] %s 沙箱不可用，拒绝启动: %s", self.name, tostring(werr))
+      return
+    end
+    self._sandbox_finish = finish
+    self.job = vim.fn.jobstart(full, {
       stdin = "pipe",
       stdout_buffered = false,
       stderr_buffered = true,
@@ -149,6 +174,11 @@ function M.stdio(server, opts)
         if self.buf ~= "" then
           _emit_line(self, self.buf)
           self.buf = ""
+        end
+        -- 冻结 server 在 overlay 暂存层产生的写入为候选（退出时统一捕获）。
+        if self._sandbox_finish then
+          pcall(self._sandbox_finish, { code = code })
+          self._sandbox_finish = nil
         end
         local was_open = self.open_
         self.open_ = false

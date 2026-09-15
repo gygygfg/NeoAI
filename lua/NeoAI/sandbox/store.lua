@@ -49,6 +49,11 @@ local function _ensure_dirs()
   fs.ensure_dir(_reviews_dir())
   fs.ensure_dir(_evidence_dir())
   fs.ensure_dir(_host_ops_dir())
+  -- 存储根与子目录收紧到 0700：候选/证据含未发布内容与命令详情，避免同机其他用户枚举/读取。
+  -- （同 uid 的本地进程属信任边界之外，无法靠权限或摘要防住——见 docs/sandbox.md。）
+  for _, d in ipairs({ state.root, _candidates_dir(), _receipts_dir(), _reviews_dir(), _evidence_dir(), _host_ops_dir() }) do
+    pcall(vim.uv.fs_chmod, d, 448) -- 0700
+  end
   return true
 end
 

@@ -171,7 +171,7 @@ a round is automatically resent with a continuation nudge (`ai.truncation.nudge`
 - Tools are output in lexicographic order by name: deterministic → an identical tool set is byte-for-byte identical across requests, which is prefix-cache friendly.
 - An empty `properties` omits that field (DeepSeek rejects `[]` schemas).
 - Environment probing comes first (`tools.environment.filter_tools`): related tools are disabled when the workspace/git directory cannot be obtained.
-- Plan mode (`plan_mode.apply_tool_filter`): keep only read-only/information-query tools + `ask_user`.
+- Plan mode (`plan_mode.apply_tool_filter`): keep only read-only/information-query tools + `run_command` (read-only research) + `ask_user`.
 
 ### 4.3 Single Tool Execution (_execute_single)
 
@@ -208,31 +208,39 @@ System prompt sections can be registered:
 
 ## 6. Context Compaction (core/session/compactor)
 
-`compactor.maybe_compact(agent, opts)` performs a token pressure check (triggered in two places):
+Compaction is **asynchronous in the background and non-blocking**: once the token pressure threshold is reached it starts summary generation and returns
+immediately, while the agent keeps running with the current (original) request view; when the summary completes it writes a **compaction overlay**, and
+subsequent requests and further compactions use the compacted replacement. It opens no floating window (it does not emit `COMPACTION_STARTED` / `COMPACTION_CHUNK`).
 
-- **Turn boundary**: `runtime.run` calls it before a new step (without passing `allow_busy`, requiring `idle`).
-- **Inside the tool loop**: `tool_loop._send_round` calls `maybe_compact(agent, { allow_busy = true })` before each round's send —
-  the previous round's tool results have already been written back and the next round's request has not yet been sent, so folding history at this moment is safe (no concurrent writes). A long loop thus converges round by round,
-  instead of exhausting the context and running into an overflow.
+Triggers (all still threshold-driven):
+
+- **Turn boundary**: `runtime.run` calls `compactor.start_background(agent, { allow_busy = true })` after appending the user message.
+- **Inside the tool loop**: `tool_loop._send_round` calls `start_background(agent, { allow_busy = true })` before each round's send —
+  the previous round's tool results have already been written back and the next round's request has not yet been sent. A long loop thus converges round by round.
 
 The gate `_can_compact(agent, opts)`: invalid agent / `_compacting` / signal already aborted → refuse;
-when `opts.allow_busy` is true, the `idle` requirement is relaxed (compaction is allowed while in `generating`/`tool_running`).
+when `allow_busy` is true, the `idle` requirement is relaxed (compaction is allowed while in `generating`/`tool_running`).
 
-Once the `context_window * threshold_ratio` threshold is reached, the earliest whole block of history is folded, keeping the most recent tail (retain budget).
-Here `context_window` is by default derived from the model capability table (an explicit non-default user configuration takes precedence), and models with explicit caching automatically use
-a more conservative threshold/retain ratio. For concrete models, refer to [model_policy.md](model_policy.md).
+Once the `context_window * threshold_ratio` threshold is reached, it first performs model-independent tool-result pruning (`tool_result_pruner`);
+if pruning already gets back within the threshold, summarization is skipped. Otherwise it **folds the first round through the second-to-last round**
+(keeping the last round intact); `_select_round_shadow` uses the last non-runtime `user` message as the start of the last round.
+`context_window` is by default derived from the model capability table (an explicit non-default user configuration takes precedence), and models with
+explicit caching automatically use a more conservative threshold/retain ratio. For concrete models, refer to [model_policy.md](model_policy.md).
 
-- **Auxiliary summarization call**: `_summarize` replays the session prefix byte-for-byte (the same system prompt, tool schema, and messages in the folded region),
+- **Auxiliary summarization call**: `_summarize` replays the request-view prefix byte-for-byte (the same system prompt, tool schema, and folded-region messages),
   then appends the compaction instruction as the last user message → reusing the provider's warm prefix cache.
-- **Checkpoint replacement**: replaces the folded interval with a checkpoint user message carrying the `<compacted-summary>` tag
-  (`_replace_with_checkpoint`), and records `replaced_count` and `replaced_synced_count` (the number of replaced messages that have
-  **already been persisted**; at a turn-boundary compaction the two are equal, whereas for a mid-loop compaction the former is greater than the latter).
-  Subsequent requests can still reuse the cache for the unchanged prefix before the replacement point. It replaces rather than appends (producing no second copy of the history).
+- **Compaction overlay**: `_apply_overlay` records `agent.compaction = { checkpoint, replaced }` — the checkpoint message and the number of replaced
+  "non-runtime-snapshot" messages — and **does not modify `agent.messages`**. The checkpoint carries the `<compacted-summary>` tag.
+  `context_builder.request_view(agent)` builds the request view (checkpoint + un-replaced tail) from it; `context_builder.build_from_agent` uses that view.
   On success it emits `COMPACTION_COMPLETED`.
+- **Rendering and persistence still use the original context**: `agent.messages` is always the full original history and the chat UI renders it;
+  `session.messages` is also the original history. The overlay lives separately in `session.metadata.compaction` and is restored by
+  `chat_service.load_session`, so a reopened session still sends requests using the compacted replacement.
 
-`force_compact` (used for overflow recovery) skips the pressure threshold check; **it defaults to `allow_busy = true`**, ensuring that overflow recovery
-can actually compact both in the first round of a turn and midway through the tool loop (`generating`/`tool_running`) — it trims first, and if trimming is already
-enough to get back within the window it does not summarize; otherwise it performs one maximized balanced head reduction (retain 0, keeping only the newest indivisible unit).
+`maybe_compact` is kept as an awaitable version (for tests/direct calls). `force_compact` (used for overflow recovery) still **blocks and awaits**,
+skipping the pressure threshold check; **it defaults to `allow_busy = true`**, ensuring that overflow recovery can actually compact both in the first
+round of a turn and midway through the tool loop (`generating`/`tool_running`) — it trims first, and if trimming is already enough to get back within the
+window it does not summarize; otherwise it performs one maximized balanced head reduction (retain 0, keeping only the newest indivisible unit).
 
 ## 7. Overflow Recovery (recovery.lua)
 

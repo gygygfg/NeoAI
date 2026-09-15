@@ -3,11 +3,17 @@
 
 local tests = require("NeoAI.tests")
 
---- 保存/恢复全局配置
+--- 保存/恢复全局配置（默认关闭临时根免候选，避免 /tmp 测试工作区被当作临时根）
 local function with_config(overrides, fn)
   local config_store = require("NeoAI.kernel.config_store")
   local saved = config_store.get_all()
-  config_store.load(overrides)
+  local merged = vim.deepcopy(overrides or {})
+  merged.tools = merged.tools or {}
+  merged.tools.sandbox = merged.tools.sandbox or {}
+  if merged.tools.sandbox.ephemeral_roots == nil then
+    merged.tools.sandbox.ephemeral_roots = {}
+  end
+  config_store.load(merged)
   local ok, err = pcall(fn)
   config_store.load(saved)
   if not ok then error(err, 0) end
@@ -25,8 +31,10 @@ tests.suite("sandbox_governance", function(_, it)
     t.eq(1, risk.classify({ effect = "fs_write", paths = { vim.fn.expand("~") .. "/x.txt" } }).level,
       "用户目录写入应为 L1")
     t.eq(2, risk.classify({ effect = "fs_write", paths = { "/etc/hosts" } }).level, "系统路径写入应为 L2")
+    t.eq(2, risk.classify({ effect = "fs_write", paths = { cwd .. "/a.lua" }, secret = true }).level,
+      "工作区内的密钥操作应为 L2")
     t.eq(3, risk.classify({ effect = "fs_write", paths = { "/etc/x" }, secret = true }).level,
-      "密钥操作应为 L3")
+      "工作区外的密钥操作应为 L3")
     t.eq(1, risk.classify({ effect = "process", package = true }).level, "包安装应为 L1")
     t.eq(2, risk.classify({ effect = "process", privilege_tier = 2 }).level, "T2 提权应为 L2")
     t.eq(3, risk.classify({ effect = "process", command = "rm -rf /" }).level, "破坏性命令应为 L3")
@@ -270,9 +278,12 @@ tests.suite("sandbox_governance", function(_, it)
       t.matches("unset", snippet, "应为 unset 片段")
       t.matches("HTTPS_PROXY", snippet, "应包含 HTTPS_PROXY")
     end)
-    -- passthrough：不清除
+    -- passthrough：不清除代理变量，但 SSH agent 变量始终清除
     with_config(cfg({ proxy = "passthrough" }), function()
-      t.nil_(runtime.proxy_unset_snippet(), "passthrough 不应清除代理")
+      local sn = runtime.proxy_unset_snippet()
+      t.not_nil(sn, "应始终生成 SSH agent 清除片段")
+      t.matches("SSH_AUTH_SOCK", sn, "应清除 SSH_AUTH_SOCK")
+      t.true_(sn:find("HTTPS_PROXY", 1, true) == nil, "passthrough 不应清除代理")
     end)
     -- 显式代理：写入 env，且不清除显式指定的键
     with_config(cfg({ proxy = { https = "http://10.0.0.1:8080" } }), function()

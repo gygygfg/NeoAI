@@ -154,7 +154,7 @@ tests.suite("pending_queue", function(_, it)
     -- 首轮：runtime.run 应同步占用生成槽位，即使 agent.state 此刻仍是 idle
     local d1 = runtime.run(agent, "first")
     t.true_(agent._turn_claim ~= nil, "首轮运行应同步占用生成槽位")
-    t.eq("idle", agent.state, "此时 state 尚未置 generating（异步链先跑）")
+    t.eq("generating", agent.state, "首轮运行应同步进入 generating（后台压缩不再阻塞状态置位）")
 
     -- 同一 tick 内再次 runtime.run：应立即被 busy 拒绝，而非并行启动
     local d2 = runtime.run(agent, "second")

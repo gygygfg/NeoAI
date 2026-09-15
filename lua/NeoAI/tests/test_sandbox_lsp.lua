@@ -7,7 +7,13 @@ local tests = require("NeoAI.tests")
 local function with_config(overrides, fn)
   local config_store = require("NeoAI.kernel.config_store")
   local saved = config_store.get_all()
-  config_store.load(overrides)
+  local merged = vim.deepcopy(overrides or {})
+  merged.tools = merged.tools or {}
+  merged.tools.sandbox = merged.tools.sandbox or {}
+  if merged.tools.sandbox.ephemeral_roots == nil then
+    merged.tools.sandbox.ephemeral_roots = {}
+  end
+  config_store.load(merged)
   local ok, err = pcall(fn)
   config_store.load(saved)
   if not ok then error(err, 0) end

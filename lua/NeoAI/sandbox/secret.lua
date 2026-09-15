@@ -5,8 +5,9 @@
 ---   2. 为每个真实密钥生成随机 token（进程内映射表，不落盘），
 ---      「进沙箱」时把密钥替换为 token（工具结果、暂存视图、环境变量），
 ---      「出沙箱」仅在 commit 发布到真实工作区时把 token 还原为密钥；
----   3. 对 token 的操作留痕（证据 + 待审警告）；
----   4. 工具参数中出现**原始密钥**（映射表中已知的真实值）时上报硬拦截，由执行器终止 Agent。
+---   3. 对 token 或**敏感环境变量名**的操作留痕（证据 + 待审警告），只提级不终止；
+---   4. **原始密钥**（映射表中已知的真实值）出现在工具参数或 AI 可见上下文时上报硬拦截，
+---      由执行器 / 请求前守卫终止 Agent；token（KEY 环境变量操作）只提级审批，不终止。
 ---
 --- 边界：熵检测是启发式的，存在误报（长哈希/随机串会被当作密钥，但会原样往返，不破坏内容）；
 --- 映射表仅在内存，热重载后 token 无法还原 → commit 明确拒绝（fail-closed），不写入 token。
@@ -36,8 +37,16 @@ local DEFAULT_RULES = {
   { name = "stripe_key", pattern = "s?[rp]k_(live|test)_[A-Za-z0-9]+" },
   { name = "openai_key", pattern = "sk%-[A-Za-z0-9_%-]+" },
   { name = "jwt", pattern = "eyJ[%w_%-]+%.eyJ[%w_%-]+%.[%w_%-]+" },
-  { name = "bearer", pattern = "[Bb]earer%s+[%w%._%-]+" },
-  { name = "basic_auth", pattern = "[Bb]asic%s+[A-Za-z0-9+/=]+" },
+  -- Bearer/Basic 后接普通英文单词（注释/文档，如 "Bearer token"）不应视为凭据：
+  -- 要求凭证部分足够长且像 token（含数字或 base64/连接符）。
+  { name = "bearer", pattern = "[Bb]earer%s+[%w%._%-]+", validate = function(m)
+    local v = m:match("^[Bb]earer%s+(.+)$")
+    return v ~= nil and #v >= 16 and (v:match("%d") ~= nil or v:find("[%+/=._%-]") ~= nil)
+  end },
+  { name = "basic_auth", pattern = "[Bb]asic%s+[A-Za-z0-9+/=]+", validate = function(m)
+    local v = m:match("^[Bb]asic%s+(.+)$")
+    return v ~= nil and #v >= 16 and (v:match("%d") ~= nil or v:find("[%+/=]") ~= nil)
+  end },
 }
 
 local DEFAULTS = {
@@ -176,6 +185,7 @@ local function _apply_rules(text, cfg, used)
     if type(rule.pattern) == "string" then
       local ok, out = pcall(function()
         return (text:gsub(rule.pattern, function(m)
+          if type(rule.validate) == "function" and not rule.validate(m) then return m end
           local token = _token_for(m, rule.name)
           used[#used + 1] = token
           return token
@@ -200,7 +210,8 @@ function M.redact(text)
     if type(rule.pattern) == "string" then
       local ok, out, n = pcall(function()
         local count = 0
-        local res = text:gsub(rule.pattern, function()
+        local res = text:gsub(rule.pattern, function(m)
+          if type(rule.validate) == "function" and not rule.validate(m) then return m end
           count = count + 1
           return "[REDACTED:" .. tostring(rule.name) .. "]"
         end)
@@ -258,11 +269,28 @@ end
 -- （如 /proc/self/environ 以 NUL 分隔、值中含 `.`/`+`/`/`/`=`/`:`）。
 local NAME_VALUE_CHARS = "[%w%._%+%=/:-]+"
 
+--- 裸值（`NAME=value`，未加引号）是否像**字面量密钥**，用于把代码表达式（`api_key =
+--- os.getenv(...)`、`api_key = api_key`）排除在外。否则 `_apply_secret_names` 会把
+--- `os.getenv` 这类代码片段当作密钥写入映射表，进而在编辑该代码时被 `find_real_secret`
+--- 误判为「原始密钥」并错误终止 Agent（误报）。
+--- 判据（满足其一）：纯十六进制；含 `+ / = :` 等密钥分隔符；含数字且足够长。
+--- @param value string
+--- @return boolean
+local function _looks_like_literal_secret(value)
+  if type(value) ~= "string" or #value < 8 then return false end
+  if value:match("^[0-9a-fA-F]+$") then return true end -- 纯十六进制（含全 a-f 无数字）
+  if value:find("[%+/=:]") then return true end -- base64 / URL / 连接符风格
+  if value:match("%d") and #value >= 12 then return true end -- 含数字的长串
+  return false
+end
+
 --- 按变量名强制 token 化赋值中的敏感值。覆盖熵检测盲区：
 ---   * 纯小写十六进制（被 `exclude_pure_hex` 排除）；
 ---   * 含 `.` 等分隔符的多段密钥（被 `RUN_PAT` 拆成不满足候选条件的片段）。
 --- 仅当赋值**名字**暗示敏感（`_secret_name`）时才替换值，避免误伤普通配置/代码。
---- 支持 `NAME=value` / `NAME="value"` / `"NAME": "value"` 三种写法。
+--- 支持 `NAME=value` / `NAME="value"` / `"NAME": "value"` 三种写法；其中裸值额外要求
+--- 「像字面量密钥」且不是函数调用（见 `_looks_like_literal_secret`），避免把代码表达式
+--- 当密钥。引号包裹的值按字面量处理，不受该限制。
 --- @param text string
 --- @param used table token 累加器
 --- @return string
@@ -275,7 +303,10 @@ local function _apply_secret_names(text, used)
     used[#used + 1] = token
     return token
   end
-  text = text:gsub("([%a_][%w_]*)(%s*=%s*)(" .. NAME_VALUE_CHARS .. ")", function(name, sep, value)
+  -- 裸值：排除函数调用（值后紧跟 `(`）与非字面量代码表达式。
+  text = text:gsub("([%a_][%w_]*)(%s*=%s*)(" .. NAME_VALUE_CHARS .. ")([%(]?)", function(name, sep, value, paren)
+    if paren == "(" then return nil end
+    if not _looks_like_literal_secret(value) then return nil end
     local token = make(name, value)
     if not token then return nil end
     return name .. sep .. token
@@ -339,7 +370,8 @@ function M.detect(text)
     if type(rule.pattern) == "string" then
       local s, e = text:find(rule.pattern)
       while s do
-        add(s, e, rule.name)
+        local m = text:sub(s, e)
+        if type(rule.validate) ~= "function" or rule.validate(m) then add(s, e, rule.name) end
         s, e = text:find(rule.pattern, e + 1)
       end
     end
@@ -421,6 +453,37 @@ function M.contains_token(value)
   return false
 end
 
+-- 敏感环境变量名形态：全大写字母/数字/下划线，长度 >= 6（排除 KEY/TOKEN 等短词噪声）。
+local ENV_NAME_PAT = "%u[%u%d_]*"
+
+--- 深度扫描值中的**敏感环境变量名**（全大写、名字含 KEY/TOKEN/SECRET/PASSWORD/CREDENTIAL 段）。
+--- 用于「出现了 key 的环境变量名」时的软告警 + 审批：**不终止 Agent**，只提级并把候选送入
+--- 待审（悬浮窗展示 `⚠ 密钥操作`）。全大写 + 长度阈值避免把代码里的 `api_key`/`os.getenv`
+--- 等小写标识符当作环境变量名。
+--- @param value any
+--- @return table 去重后的名字数组
+function M.scan_names(value)
+  local out, seen = {}, {}
+  local function walk(v)
+    local t = type(v)
+    if t == "string" then
+      for name in v:gmatch(ENV_NAME_PAT) do
+        if #name >= 6 and not seen[name] and _secret_name(name) then
+          seen[name] = true
+          out[#out + 1] = name
+        end
+      end
+    elseif t == "table" then
+      for k, x in pairs(v) do
+        walk(x)
+        if type(k) == "string" then walk(k) end
+      end
+    end
+  end
+  walk(value)
+  return out
+end
+
 --- 文本是否含映射表中已知的**原始密钥**
 --- @param text string
 --- @return string|nil secret
@@ -430,6 +493,33 @@ function M.find_real_secret(text)
     if #secret >= 8 and text:find(secret, 1, true) then return secret end
   end
   return nil
+end
+
+--- 扫描 AI 可见上下文（wire 消息等嵌套结构）是否含映射表中已知的**原始密钥**。
+--- 供请求前终止判定：原始密钥出现在 AI 上下文中说明 token 化被绕过（沙箱上下文被突破）。
+--- token（`NEOKEY_*`）不算命中——KEY 环境变量操作只提级审批，不终止 Agent。
+--- @param value any
+--- @return string|nil secret 命中的原始密钥
+function M.context_leak(value)
+  if not M.enabled() then return nil end
+  if next(state.by_secret) == nil then return nil end
+  local function walk(v)
+    local t = type(v)
+    if t == "string" then
+      return M.find_real_secret(v)
+    elseif t == "table" then
+      for k, x in pairs(v) do
+        local hit = walk(x)
+        if hit then return hit end
+        if type(k) == "string" then
+          local hk = M.find_real_secret(k)
+          if hk then return hk end
+        end
+      end
+    end
+    return nil
+  end
+  return walk(value)
 end
 
 --- 深度扫描参数中的字符串：返回是否命中原始密钥与用到的 token
@@ -557,18 +647,44 @@ function M.warn_for_files(files)
   return { count = count, tokens = list }
 end
 
---- 记录一次 token 操作留痕（并写证据）
+--- 检测 AI **生成/写入**的高熵/结构化敏感内容（候选文件内容）。
+--- 与 `warn_for_files`（只识别已 token 化的宿主密钥）不同：此函数直接对候选内容做熵/具名规则
+--- 检测，捕获 AI 自行生成的密钥类信息（生成的私钥、随机 token、API key 等），供留痕与审批提示。
+--- token（`NEOKEY_*`）不计入（那是宿主密钥的加密形式，由 `warn_for_files` 处理）。
+--- @param files table 候选文件数组
+--- @return table 数组 { path, entropy, rule, preview }
+function M.detect_generated(files)
+  local out = {}
+  if not M.enabled() then return out end
+  local token_pat = "^" .. TOKEN_PAT .. "$"
+  for _, f in ipairs(files or {}) do
+    if type(f.content) == "string" and f.content ~= "" then
+      for _, hit in ipairs(M.detect(f.content)) do
+        if not hit.value:match(token_pat) then
+          out[#out + 1] = {
+            path = f.path, entropy = hit.entropy, rule = hit.rule,
+            preview = hit.value:sub(1, 8) .. "…",
+          }
+        end
+      end
+    end
+  end
+  return out
+end
+
+--- 记录一次 token / 密钥环境变量名操作留痕（并写证据）
 --- @param event string
---- @param meta table { tool?, path?, tokens? }
+--- @param meta table { tool?, path?, tokens?, names? }
 function M.trace(event, meta)
   meta = meta or {}
   state.traces[#state.traces + 1] = {
     event = event, tool = meta.tool, path = meta.path,
-    tokens = meta.tokens, at = os.time(),
+    tokens = meta.tokens, names = meta.names, at = os.time(),
   }
   _record({
     event = event, tool = meta.tool, path = meta.path,
     tokens = meta.tokens and vim.tbl_keys(meta.tokens) or {},
+    names = meta.names or {},
   })
 end
 

@@ -252,6 +252,7 @@ function M.dispose(agent)
     agent.signal:abort("disposed")
   end
   agent.messages = {}
+  agent.compaction = nil
   agent.tools = {}
   agent.state = STATES.IDLE
   agent._turn_claim = nil

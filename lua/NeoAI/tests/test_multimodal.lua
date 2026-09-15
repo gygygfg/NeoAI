@@ -269,13 +269,19 @@ tests.suite("multimodal", function(_, it, before_each)
     local url = "http://127.0.0.1:" .. port .. "/t.png"
     local ok = false
     local result
+    -- 子进程统一经沙箱（含 host_local_block 本机拦截）；本测试需访问本地 HTTP 服务，
+    -- 临时关闭本机拦截并在断言前恢复，避免污染其它用例。
+    local prev_hlb = config_store.get("tools.sandbox.network.host_local_block")
+    config_store.set("tools.sandbox.network.host_local_block", false)
     image_tool.func({ file_path = url, description = "测试URL" }, function(res)
       result = res
       ok = true
     end, function(e)
       error("URL 读取应成功却失败: " .. tostring(e and e.message or e))
     end, { agent = { model = "deepseek-v4-flash-vision-exp" } })
-    t.true_(wait_until(function() return ok end), "URL 读取成功")
+    local read_ok = wait_until(function() return ok end)
+    config_store.set("tools.sandbox.network.host_local_block", prev_hlb)
+    t.true_(read_ok, "URL 读取成功")
 
     t.eq(url, result.path, "返回 path 为原始 URL")
     t.matches("^sha256:", result.image.attachmentId, "图像引用内容寻址")

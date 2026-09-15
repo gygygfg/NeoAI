@@ -284,26 +284,24 @@ function M.run(agent, content)
   if agent.signal:aborted() then
     agent.signal = async.create_signal()
   end
-  -- 新一步之前先做上下文压缩检查（对齐 deepseek-harness 的 pre-step 压力检查）：
-  -- 已到达压力阈值则先折叠旧历史，再派生请求，复用未变的前缀缓存。
+  -- 用户新输入重置工具循环护栏计数链与截断续写计数
+  local guard = require("NeoAI.core.agent.guard")
+  guard.reset(agent)
+  agent._truncation_continues = nil
+  -- 易变运行态（todos/计划模式）以运行时上下文快照追加进历史：
+  -- 系统提示保持逐字节稳定，前缀缓存不因它们变化而失效。
+  require("NeoAI.core.session.runtime_context").ensure(agent)
+  agent_mod.add_message(agent, "user", content)
+  event_bus.emit(events.MESSAGE_SENT, { agent_id = agent.id, content = content })
+  -- 上下文压缩改为后台异步：达到压力阈值时在后台生成摘要（折叠第一轮至倒数第二轮），
+  -- 不阻塞本轮请求；完成后覆盖层对后续请求与再次压缩生效。压力提示保持原样。
+  pcall(function()
+    local status = services.use("services.status")
+    if status then status.check_pressure(agent) end
+  end)
   local compactor = require("NeoAI.core.session.compactor")
-  return compactor.maybe_compact(agent):then_(function()
-    -- 压缩后仍有压力则先提示（超限时让用户知道下一轮可能溢出/被压缩）
-    pcall(function()
-      local status = services.use("services.status")
-      if status then status.check_pressure(agent) end
-    end)
-    -- 用户新输入重置工具循环护栏计数链与截断续写计数
-    local guard = require("NeoAI.core.agent.guard")
-    guard.reset(agent)
-    agent._truncation_continues = nil
-    -- 易变运行态（todos/计划模式）以运行时上下文快照追加进历史：
-    -- 系统提示保持逐字节稳定，前缀缓存不因它们变化而失效。
-    require("NeoAI.core.session.runtime_context").ensure(agent)
-    agent_mod.add_message(agent, "user", content)
-    event_bus.emit(events.MESSAGE_SENT, { agent_id = agent.id, content = content })
-    return _run_generation(agent, {})
-  end):finally(function()
+  compactor.start_background(agent, { allow_busy = true })
+  return _run_generation(agent, {}):finally(function()
     -- 兜底释放：仅在令牌仍属本轮时清除，避免误清掉 AGENT_STATE_CHANGED 刷新
     -- 链同步启动的下一轮（_finish_idle 已在置 idle 前清掉本轮的令牌，此分支通常
     -- 只在异常路径（如工具循环被取消且未走 _finish_idle）触发）。

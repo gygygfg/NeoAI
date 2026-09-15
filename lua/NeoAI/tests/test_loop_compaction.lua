@@ -96,8 +96,10 @@ tests.suite("loop_compaction", function(_, it)
     t.true_(vim.wait(2000, function() return done end), "异步未完成")
     restore()
     t.eq(true, val, "allow_busy 下非 idle 也应压缩")
-    t.true_(agent.messages[1].checkpoint, "首条应被替换为检查点")
-    t.eq("user", agent.messages[1].role)
+    t.not_nil(agent.compaction, "应写入压缩覆盖层")
+    t.true_(agent.compaction.checkpoint.checkpoint, "覆盖层应含检查点")
+    t.eq("user", agent.compaction.checkpoint.role)
+    t.eq(4, #agent.messages, "原始消息不应被改动（渲染仍原始）")
   end)
 
   it("force_compact 缺省 allow_busy：非 idle 也能压缩（溢出恢复回归）", function(t)
@@ -177,6 +179,8 @@ tests.suite("loop_compaction", function(_, it)
       { id = "t1", type = "function", ["function"] = { name = "tool1", arguments = "{}" } },
     }, tool_service, {})
     local resolved = vim.wait(5000, function() return not d:is_pending() end)
+    -- 后台压缩异步进行：等待覆盖层落地后再恢复桩，避免挂起中的摘要调用打到真实网络
+    vim.wait(3000, function() return agent.compaction ~= nil end)
 
     unsub()
     restore_recovery()
@@ -184,7 +188,8 @@ tests.suite("loop_compaction", function(_, it)
 
     t.true_(resolved, "工具循环应正常完成")
     t.true_(compaction_events >= 1, "轮边界应触发压缩")
-    t.true_(agent.messages[1].checkpoint, "头部应被检查点替换")
+    t.not_nil(agent.compaction, "应写入压缩覆盖层")
+    t.true_(agent.compaction.checkpoint.checkpoint, "覆盖层应含检查点")
     t.eq("最终回答", agent.messages[#agent.messages].content, "压缩后循环应继续到最终回答")
   end)
 

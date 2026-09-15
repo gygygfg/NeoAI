@@ -227,19 +227,15 @@ local function _send_round(agent, opts)
     return _do_send_round(agent, opts)
   end
   -- 轮边界压缩：allow_busy=true 放宽 idle 要求（此刻状态为 generating，且即将发送请求）。
-  -- 压缩失败/无可折叠内容均为 no-op，不阻断发送。
+  -- 后台异步执行，不阻塞本轮发送；完成后覆盖层对后续轮次生效。失败/无可折叠内容均为
+  -- no-op，不影响循环。
   local compactor = require("NeoAI.core.session.compactor")
-  return compactor.maybe_compact(agent, { allow_busy = true }):then_(function()
-    -- 压缩后仍有压力则先提示（超限时让用户知道下一轮可能溢出/被压缩）
-    pcall(function()
-      local status = services.use("services.status")
-      if status then status.check_pressure(agent) end
-    end)
-    return _refresh_then_send()
-  end, function()
-    -- 压缩本身异常也不阻断发送（兜底走原路径）
-    return _refresh_then_send()
+  compactor.start_background(agent, { allow_busy = true })
+  pcall(function()
+    local status = services.use("services.status")
+    if status then status.check_pressure(agent) end
   end)
+  return _refresh_then_send()
 end
 
 --- 实际发送一轮请求

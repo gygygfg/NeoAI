@@ -39,6 +39,22 @@ function M.is_dir(path)
   return vim.fn.isdirectory(M.expand(path)) == 1
 end
 
+--- 解析路径的规范形式：展开 ~/$VAR → 绝对化 → 解析符号链接并折叠 `..`/`.`。
+--- 用于安全判定（遮蔽/风险分级/候选发布）——必须与「打开文件时内核的解析结果」一致。
+--- 注意 `fnamemodify(:p)` 在中间组件不存在时**不会**折叠 `..`，而 `vim.fn.resolve` 会，
+--- 故这里以 resolve 为准（它也能解析悬空符号链接）。
+--- @param path string
+--- @return string
+function M.canonical(path)
+  if type(path) ~= "string" or path == "" then return path end
+  local abs = vim.fn.fnamemodify(M.expand(path), ":p")
+  local ok, resolved = pcall(vim.fn.resolve, abs)
+  if ok and type(resolved) == "string" and resolved ~= "" then abs = resolved end
+  abs = abs:gsub("^/+", "/"):gsub("/+$", "")
+  if abs == "" then abs = "/" end
+  return abs
+end
+
 --- 确保目录存在（递归创建）
 --- @param path string
 --- @return boolean, string|nil

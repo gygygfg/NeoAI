@@ -16,8 +16,8 @@
 - **Tree-based session management** — manage multiple chat sessions as a branch tree, with branch creation, switching, and deletion
 - **A rich set of built-in tools** — the AI can call 40+ tools for file operations, code analysis, LSP, Shell commands, and more
 - **Tool approval system** — fine-grained control over tool execution permissions, supporting auto-allow / manual approval / argument-level allowlists
-- **Plan mode (PLAN) and plan distillation** — toggle with `m` or `:NeoAIPlan`; the tool context retains only read-only / informational queries plus `ask_user` and `exit_plan_mode` (no mutating tools are exposed); after the AI researches and clarifies, it emits a formatted change plan and calls `exit_plan_mode`; once the user confirms, NeoAI switches to CHAT and executes the plan automatically, **distilling** the research context gathered during planning into a checkpoint that replaces the compacted range
-- **Streaming context compaction** — as the context threshold approaches, old history is folded automatically and the folded range is **replaced** (not appended to) by a checkpoint, keeping the prefix cache reusable; in addition to turn boundaries, **a pressure check runs before every round of the tool loop** (after tool results are written back and before the next request), so long loops converge round by round; on overflow the request is compacted and retried automatically; the compaction / plan distillation process shows reasoning and content live in a floating window
+- **Plan mode (PLAN) and plan distillation** — toggle with `m` or `:NeoAIPlan`; the tool context retains only read-only / informational queries plus `run_command` (read-only research), `ask_user` and `exit_plan_mode` (no mutating tools are exposed); after the AI researches and clarifies, it emits a formatted change plan and calls `exit_plan_mode`; once the user confirms, NeoAI switches to CHAT and executes the plan automatically, **distilling** the research context gathered during planning into a checkpoint that replaces the compacted range
+- **Background context compaction** — as the context threshold approaches, round 1 through the second-to-last round (keeping the last round intact) is folded **asynchronously in the background, non-blocking**, and a checkpoint is written into a **compaction overlay**: subsequent requests and further compactions use the compacted replacement, while chat rendering and session persistence keep the original context (the overlay is saved with the session and survives a restart); compaction opens no floating window; in addition to turn boundaries, **a pressure check runs before every round of the tool loop** (after tool results are written back and before the next request), so long loops converge round by round; on overflow the request is compacted and retried automatically; plan distillation still shows reasoning and content live in a floating window
 - **Sub-Agent system** — the AI can spawn sub-Agents to run subtasks in parallel, with boundary review
 - **Decoupled frontend/backend architecture** — an event-driven asynchronous architecture that separates the UI from business logic
 - **Highly configurable** — full customization of keymaps, UI layout, log level, and more
@@ -31,7 +31,7 @@
 - **Tool argument receiving panel** — while the model streams tool-call arguments, a "receiving arguments" floating window (`tool_args_panel`) opens in real time, appending each chunk incrementally and closing automatically once the arguments end, consistent with the reasoning floating window
 - **MCP support** — connect to external MCP servers over stdio / Streamable HTTP and register remote `tools`/`resources`/`prompts` in the tool system (with pre-caching + failure-driven dynamic refresh, see [docs/en/mcp.md](docs/en/mcp.md))
 - **Skills support** — scan SKILL.md skill directories and inject the list of available skills into the system prompt; the model loads the skill body with `load_skill` (Claude/opencode style, see [docs/en/skills.md](docs/en/skills.md))
-- **Tool execution sandbox** — every tool call goes through the control plane (preflight → isolated execution → freeze candidate → CAS publish); the default async review executes AI changes immediately in the sandbox and freezes candidates, with real workspace changes queued for the user to confirm via `:NeoAISandboxReview` or the `<leader>ap` key in the chat window (per-file approval; a prominent `待审N` badge is shown in the chat statusline); external processes are isolated via bwrap/unshare; commands can write the whole filesystem (changes staged as candidates) with session shell state (export/cd) preserved; the payload runs with `--cap-drop ALL` plus a seccomp baseline and masks host-sensitive paths such as `docker.sock` and host credentials (defense in depth); **privilege tiers**: commands run with least privilege by default (network isolated by default) and automatically request escalation when privilege is insufficient — T1 (network / controlled docker) runs isolated and recorded, T2 (caps / host operations) runs inside a nested userns with host effects frozen as proposals for async approval; controlled docker points at an external controlled socket (rootless/proxy/dind) and never binds the host socket (see [docs/en/sandbox.md](docs/en/sandbox.md))
+- **Tool execution sandbox** — every tool call goes through the control plane (preflight → isolated execution → freeze candidate → CAS publish); the default async review executes AI changes immediately in the sandbox and freezes candidates, with real workspace changes queued for the user to confirm via `:NeoAISandboxReview` or the `<leader>ap` key in the chat window (per-file approval; a prominent `待审N` badge is shown in the chat statusline), and L3 dangerous items get an AI-generated consequence warning with an auto-opened diff before a second confirmation; external processes are isolated via bwrap/unshare; commands can write the whole filesystem (changes staged as candidates) with session shell state (export/cd) preserved; the payload runs with `--cap-drop ALL` plus a seccomp baseline and masks host-sensitive paths such as `docker.sock` and host credentials (defense in depth); **privilege tiers**: commands run with least privilege by default (network isolated by default) and automatically request escalation when privilege is insufficient — T1 (network / controlled docker) runs isolated and recorded, T2 (caps / host operations) runs inside a nested userns with host effects frozen as proposals for async approval; controlled docker points at an external controlled socket (rootless/proxy/dind) and never binds the host socket; the **read surface** is whole-host read-only by default (`read_all`, masking only the important config files/credentials in `mask_paths`), and accessing user dirs outside the workspace is **traced** and shown in the review window under "越界访问留痕" (non-blocking) (see [docs/en/sandbox.md](docs/en/sandbox.md))
 
 ---
 
@@ -214,16 +214,16 @@ require("NeoAI").setup({
       -- },
     },
 
-    -- Prefix cache identity consistency + automatic context compaction
+    -- Prefix cache identity consistency + background automatic context compaction
     context_cache = {
       enabled = true,                    -- enable identity consistency + automatic compaction
       context_window = 64000,            -- fallback window: an explicit non-default user value wins, otherwise derived from the model capability table
-      threshold_ratio = 0.8,             -- reaching this ratio triggers compaction
+      threshold_ratio = 0.8,             -- reaching this ratio triggers background async compaction (non-blocking, no window)
       warn_ratio = 0.85,                 -- the statusline changes color as the limit approaches
-      retain_ratio = 0.16,               -- proportion of the most recent history to retain
-      retain_min_tokens = 4096,          -- lower bound for the retained tail (tokens)
+      retain_ratio = 0.16,               -- proportion of recent history retained for overflow recovery (regular compaction folds round 1..second-to-last)
+      retain_min_tokens = 4096,          -- lower bound for the retained tail during overflow recovery (tokens)
       compact_max_tokens = 8192,         -- output limit of the compaction summary
-      min_shadow_messages = 2,           -- minimum number of messages to fold before compaction is worthwhile
+      min_shadow_messages = 2,           -- minimum messages to fold during overflow recovery (regular compaction uses the round range)
       compaction_retries = 1,            -- number of retries when still above the threshold after summarization
       prune_enabled = true,              -- perform model-agnostic tool-result pruning before summarization
       prune_threshold_chars = 8192,      -- only tool results whose text exceeds this many code points are pruned
@@ -294,6 +294,7 @@ require("NeoAI").setup({
       approval = {
         confirm = { key = "<CR>", desc = "Allow once" },
         confirm_all = { key = "A", desc = "Allow all" },
+        add_to_workspace = { key = "D", desc = "Allow and add to workspace" },
         cancel = { key = "<Esc>", desc = "Cancel" },
         cancel_with_reason = { key = "C", desc = "Cancel with a reason" },
       },
@@ -718,8 +719,8 @@ categories:
 | ---------- | ---------------------------------------- | ----------- |
 | `ask_user` | Pause generation and ask the user a question; the answer is returned as the tool result | ✅ Auto-allowed |
 
-> **PLAN MODE**: while active, the tool context **contains only read-only/informational query tools, `ask_user`, and `exit_plan_mode`**,
-> and exposes no mutating tools whatsoever (edit/delete/create/write commands/git rollback, etc.); execution-time
+> **PLAN MODE**: while active, the tool context **contains only read-only/informational query tools, `run_command` (read-only research), `ask_user`, and `exit_plan_mode`**,
+> and exposes no mutating tools whatsoever (edit/delete/create/git rollback, etc.); execution-time
 > gating is tightened accordingly, and any tool outside the visible set is rejected. In this mode the AI investigates,
 > asks clarifying questions,
 > and produces a **clear, well-formatted change plan** (goals and background / list of changes / implementation steps / verification and rollback).

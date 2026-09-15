@@ -37,10 +37,11 @@ tests.suite("async_finally", function(_, it)
     local runtime = require("NeoAI.core.agent.runtime")
     local recovery = require("NeoAI.core.agent.recovery")
     local compactor = require("NeoAI.core.session.compactor")
-    local send, compact = recovery.send_stream, compactor.maybe_compact
+    local send, compact, bg = recovery.send_stream, compactor.maybe_compact, compactor.start_background
     local expected = { kind = "http", status = 401, message = "unauthorized" }
     recovery.send_stream = function() return async.reject(expected) end
     compactor.maybe_compact = function() return async.resolve(false) end
+    compactor.start_background = function() end
     local agent = runtime.create({ model = "test" })
     local ok, err = xpcall(function()
       local failure
@@ -50,7 +51,7 @@ tests.suite("async_finally", function(_, it)
       t.eq("rejected", result._state)
       t.nil_(agent._turn_claim)
     end, function(e) return e end)
-    recovery.send_stream, compactor.maybe_compact = send, compact
+    recovery.send_stream, compactor.maybe_compact, compactor.start_background = send, compact, bg
     runtime.dispose(agent)
     if not ok then error(err, 0) end
   end)

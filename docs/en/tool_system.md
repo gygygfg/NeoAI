@@ -237,7 +237,7 @@ When tool definitions are output into the request (`core.agent.tool_loop._tool_d
 - Empty `properties` omits that field (DeepSeek rejects `[]` schemas).
 - Environment detection runs first (`tools.environment.filter_tools`), disabling tools that depend on unavailable
   environments (workspace/git).
-- In plan mode, only read-only/informational queries + `ask_user` are kept (`plan_mode.apply_tool_filter`).
+- In plan mode, only read-only/informational queries + `run_command` (read-only research) + `ask_user` are kept (`plan_mode.apply_tool_filter`).
 
 ## 8. Environment Detection (tools/environment.lua)
 

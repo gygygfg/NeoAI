@@ -8,6 +8,7 @@
 
 local async = require("NeoAI.utils.async")
 local config_store = require("NeoAI.kernel.config_store")
+local fs = require("NeoAI.utils.fs")
 
 local M = {}
 
@@ -16,6 +17,7 @@ local M = {}
 local state = {
   caps = nil,
   overlay_probe = {}, -- "dev_lower:dev_upper" -> boolean（按文件系统对缓存实测结果）
+  overlay_write_probe = {}, -- "w|lower|dev_upper|uid|gid" -> boolean（可写性依赖载荷身份）
   empty_file = nil, -- 用于覆盖 /proc 泄露项的空文件路径（宿主）
 }
 
@@ -35,6 +37,16 @@ local DEFAULT_MASK_PATHS = {
   "/root/.ssh", "/root/.aws", "/root/.gnupg", "/root/.kube",
   "/root/.docker/config.json", "/root/.netrc", "/root/.git-credentials",
   "/root/.cache/keyring-*", "/root/.cache/at-spi", "/root/.local/share/keyrings",
+  -- Git / 版本控制凭据与签名密钥（SSH/GPG、credential store、netrc、gh token），含非 root home
+  "/root/.config/git/credentials", "/root/.git-credential-cache", "/root/.config/gh",
+  "/home/*/.ssh", "/home/*/.gnupg", "/home/*/.netrc",
+  "/home/*/.git-credentials", "/home/*/.config/git/credentials", "/home/*/.git-credential-cache",
+  "/home/*/.config/gh", "/home/*/.aws", "/home/*/.kube", "/home/*/.docker/config.json",
+  "/home/*/.cache/keyring-*", "/home/*/.local/share/keyrings",
+  -- 本机 SSH 服务：sshd 运行目录 + ssh-agent / gpg-agent 套接字
+  "/run/sshd", "/run/sshd.pid", "/run/ssh-agent.socket",
+  "/run/user/*/keyring", "/run/user/*/keyring/ssh", "/run/user/*/ssh*",
+  "/run/user/*/gnupg*", "/tmp/ssh-*", "/root/.ssh-agent",
   -- 宿主身份与凭据
   "/etc/shadow", "/etc/shadow-", "/etc/gshadow", "/etc/gshadow-",
   "/etc/sudoers", "/etc/sudoers.d", "/etc/machine-id", "/etc/hostid",
@@ -50,29 +62,29 @@ local DEFAULT_MASK_PATHS = {
 }
 
 -- 最小只读系统集（白名单）：仅这些宿主根/子树以只读方式暴露给外部命令。
--- 不再整目录暴露 `/usr`：当宿主把根分区（含 /usr）挂到同一块大磁盘时，整目录会泄露
--- 宿主软件清单（/usr/share/doc 包数据库、/usr/local/go_workspace、/usr/src 等）。改为
--- 按运行时真正需要的子树挂载。`/lib*`、`/bin`、`/sbin` 是指向 `/usr/lib*`、`/usr/bin`、
--- `/usr/sbin` 的符号链接，必须保留（动态加载器 `/lib64/ld-linux-*` 等），否则任何二进制
--- 都无法启动。未列出的宿主路径在沙箱内**不存在**（/home、/var/log、/etc/shadow、/opt、
--- /srv、/mnt、/media、/boot、/usr/share/doc、/usr/src、/usr/local/go_workspace 等默认不可达）。
--- 需要更多子树时显式加回本列表（并同步收紧 mask_paths）。
+-- 仍不整目录暴露 `/usr`（避免宿主软件清单 /usr/local/go_workspace、/usr/src 等），但按运行时
+-- 需要把 `/usr/share` 与 `/var/lib` 整目录只读暴露，使 run_command 能读取运行时共享数据
+-- （nodejs/dotnet/java/git-core/terminfo 等）与宿主包数据库（dpkg/apt/rpm 等）。
+-- 危险/敏感子路径仍由 `mask_paths` 遮蔽（如 /var/lib/docker、/var/lib/containerd）。
+-- `/lib*`、`/bin`、`/sbin` 是指向 `/usr/lib*`、`/usr/bin`、`/usr/sbin` 的符号链接，必须保留
+-- （动态加载器 `/lib64/ld-linux-*` 等），否则任何二进制都无法启动。未列出的宿主路径在沙箱内
+-- **不存在**（/home、/var/log、/etc/shadow、/opt、/srv、/mnt、/media、/boot、/usr/src、
+-- /usr/local/go_workspace 等默认不可达）。需要更多子树时显式加回本列表（并同步收紧 mask_paths）。
 local DEFAULT_READONLY_ROOTS = {
   -- 动态加载器与二进制符号链接根（必须，否则二进制无法启动）
   "/lib", "/lib32", "/lib64", "/libx32", "/bin", "/sbin",
   -- 运行时可执行文件、共享库与头文件
   "/usr/bin", "/usr/sbin", "/usr/lib", "/usr/lib32", "/usr/lib64", "/usr/libx32",
   "/usr/libexec", "/usr/include",
-  -- 运行时共享数据（刻意不含 /usr/share/doc、/usr/share/man、/usr/share/info 等宿主软件清单）
-  "/usr/share/terminfo", "/usr/share/locale", "/usr/share/zoneinfo",
-  "/usr/share/ca-certificates", "/usr/share/misc", "/usr/share/common-licenses",
-  "/usr/share/awk", "/usr/share/perl", "/usr/share/perl5",
-  "/usr/share/pkgconfig", "/usr/share/aclocal", "/usr/share/bash-completion",
-  "/usr/share/git-core", "/usr/share/vim", "/usr/share/nvim",
-  "/usr/share/tabset", "/usr/share/gnupg", "/usr/share/icu",
+  -- 运行时共享数据：整目录只读暴露（nodejs/dotnet/java/git-core/terminfo 等）。
+  -- 若需隐藏软件清单，可把 /usr/share/doc|man|info 加入 mask_paths 按需遮蔽。
+  "/usr/share",
   -- 本地安装工具与 Go 工具链（刻意不含 /usr/local/go_workspace、/usr/local/src、/usr/local/man）
   "/usr/local/bin", "/usr/local/sbin", "/usr/local/lib", "/usr/local/libexec",
   "/usr/local/include", "/usr/local/go",
+  -- 宿主系统状态/包数据库：整目录只读暴露，使 run_command 可查询 /var/lib（dpkg/apt/rpm 等）。
+  -- 危险子路径（docker/containerd/containers 等）仍由 mask_paths 遮蔽。
+  "/var/lib",
 }
 
 -- 最小 /etc 必要文件（白名单）：命令运行所需，避免整目录暴露（含 shadow/machine-id/ssh 等）。
@@ -195,10 +207,23 @@ local function _wrap_close_fds(inner, pre)
   return out
 end
 
---- 配置的按需加回 capability（默认空：载荷不持有任何 capability）
+--- 配置的按需加回 capability（默认 `{ "ALL" }`：载荷持有完整 root 能力）
 --- @return table 字符串数组
 local function _global_cap_add()
   local list = config_store.get("tools.sandbox.cap_add")
+  if type(list) ~= "table" then return {} end
+  local out = {}
+  for _, c in ipairs(list) do
+    if type(c) == "string" and c ~= "" then out[#out + 1] = c end
+  end
+  return out
+end
+
+--- 配置的「主机全局能力收敛」丢弃列表（默认丢弃可修改宿主全局状态的能力）。
+--- 即使 cap_add 含 ALL，也会逐项 --cap-drop；显式在 cap_add 列出的能力不丢。
+--- @return table 字符串数组
+local function _global_cap_drop()
+  local list = config_store.get("tools.sandbox.cap_drop")
   if type(list) ~= "table" then return {} end
   local out = {}
   for _, c in ipairs(list) do
@@ -242,6 +267,32 @@ local USER_FLAGS = { "--unshare-all" }
 --- @return boolean
 local function _is_root()
   return vim.uv.getuid ~= nil and vim.uv.getuid() == 0
+end
+
+--- 载荷运行身份（最小权限原则）：返回 uid, gid。
+---   * 非 root 启动：始终以当前用户运行（本身即非 root），忽略 run_as 配置；
+---   * root 启动：使用 `tools.sandbox.run_as`（默认 nobody 65534）。root 无法在 bwrap 内把
+---     自身 1:1 之外降权，故由 `process_prefix` 先用 `setpriv` 把 bwrap 降为该 uid，再进入
+---     用户命名空间，使载荷在宿主与命名空间内都是非 root（避免「userns 内 root」伪装）。
+---     `uid <= 0` 表示显式放弃降权（以 root 运行载荷，不推荐）。
+--- @return number uid
+--- @return number gid
+local function _payload_ids()
+  if not _is_root() then
+    return vim.uv.getuid(), vim.uv.getgid()
+  end
+  local cfg = config_store.get("tools.sandbox.run_as") or {}
+  local uid = tonumber(cfg.uid) or 0
+  local gid = tonumber(cfg.gid) or 0
+  if uid <= 0 then return 0, 0 end
+  return uid, gid
+end
+
+--- 载荷是否以非 root 运行
+--- @return boolean
+local function _payload_nonroot()
+  local uid = _payload_ids()
+  return uid ~= nil and uid > 0
 end
 
 --- 读取只读白名单配置；缺省/空表时退回内置安全默认
@@ -350,14 +401,17 @@ local function _expose_paths()
 end
 
 --- 沙箱运行时私有目录（宿主，不暴露给沙箱）：存放空文件、净化 resolv.conf 等。
---- 优先沙箱存储根；不可用时退回 nvim 缓存目录。
+--- 放在 conceal 的无特征基目录（/dev/shm 等可被非 root 载荷遍历的位置），而非沙箱存储根
+--- （0700，root 专属）——否则非 root 载荷无法读取 `--ro-bind` 的源文件（EACCES）。
 --- @return string
 local function _private_dir()
-  local ok, store = pcall(require, "NeoAI.sandbox.store")
-  local root = (ok and store and store.root and store.root())
-    or (vim.fn.stdpath("cache") .. "/NeoAI/sandbox")
-  local dir = root .. "/runtime"
+  local base = require("NeoAI.sandbox.conceal").base_host()
+  local dir = base .. "/runtime"
   pcall(vim.fn.mkdir, dir, "p")
+  if _payload_nonroot() then
+    pcall(vim.uv.fs_chmod, base, 493) -- 0755：允许载荷遍历
+    pcall(vim.uv.fs_chmod, dir, 493)
+  end
   return dir
 end
 
@@ -369,7 +423,7 @@ local function _empty_file()
   local f = io.open(p, "w")
   if not f then return nil end
   f:close()
-  pcall(vim.uv.fs_chmod, p, 384) -- 0600
+  pcall(vim.uv.fs_chmod, p, 420) -- 0644：非 root 载荷需可读
   state.empty_file = p
   return p
 end
@@ -420,17 +474,20 @@ end
 --- @return string
 local function _canonical(path)
   if type(path) ~= "string" or path == "" then return path end
-  local abs = vim.fn.fnamemodify(path, ":p")
-  local ok, resolved = pcall(vim.fn.resolve, abs)
-  if ok and type(resolved) == "string" and resolved ~= "" then abs = resolved end
-  abs = abs:gsub("^/+", "/"):gsub("/+$", "")
-  if abs == "" then abs = "/" end
-  return abs
+  return fs.canonical(path)
 end
 
---- 遮蔽目录总开关（默认开）
+--- 读取面总开关（`tools.sandbox.read_all`，默认开）：true 时整机根只读暴露，
+--- 仅遮蔽 mask_paths 中的重要配置文件/凭据；false 时退回最小只读白名单。
+--- @return boolean
+local function _read_all()
+  return config_store.get("tools.sandbox.read_all") ~= false
+end
+
+--- 遮蔽目录总开关（默认开；`read_all=true` 时关闭目录遮蔽，改为只读放行 + 留痕）
 --- @return boolean
 local function _mask_dirs_enabled()
+  if _read_all() then return false end
   return config_store.get("tools.sandbox.mask_dirs_enabled") ~= false
 end
 
@@ -478,6 +535,13 @@ end
 --- @param argv table
 --- @param cwd string|nil
 local function _append_readonly_mounts(argv, cwd)
+  -- read_all（默认）：整机根以只读方式暴露，只遮蔽 mask_paths 中的重要配置文件/凭据
+  -- （在后续 `_masked_paths` 中覆盖）。沙箱自身存储、临时根、/proc 等仍在之后覆盖。
+  if _read_all() then
+    argv[#argv + 1] = "--ro-bind"
+    argv[#argv + 1] = "/"
+    argv[#argv + 1] = "/"
+  end
   local seen = {}
   local function add(p)
     if type(p) ~= "string" or p == "" or p == "/" then return end
@@ -502,9 +566,11 @@ local function _append_readonly_mounts(argv, cwd)
       end
     end
   end
-  add_list(_readonly_list("tools.sandbox.readonly_roots", DEFAULT_READONLY_ROOTS))
-  add_list(_readonly_list("tools.sandbox.readonly_paths", DEFAULT_READONLY_PATHS))
-  for _, scope in ipairs(_mask_scopes(cwd)) do add(scope) end
+  if not _read_all() then
+    add_list(_readonly_list("tools.sandbox.readonly_roots", DEFAULT_READONLY_ROOTS))
+    add_list(_readonly_list("tools.sandbox.readonly_paths", DEFAULT_READONLY_PATHS))
+    for _, scope in ipairs(_mask_scopes(cwd)) do add(scope) end
+  end
   -- /etc/resolv.conf：默认净化后暴露（仅 nameserver，剥离 search/domain/options，避免
   -- 泄露宿主内网/Tailscale 域）；"hide" 不暴露；"passthrough" 原样暴露宿主文件。
   local rmode = config_store.get("tools.sandbox.resolv_conf") or "sanitize"
@@ -656,16 +722,30 @@ local function _append_bwrap_base(argv, flags, priv, cwd)
   -- 临时根默认空 tmpfs（会话级绑定的覆盖见 process_prefix）；/proc 泄露项以空文件覆盖。
   _append_tmpfs_roots(argv)
   _append_hidden_proc(argv)
-  -- 丢弃全部 capabilities（可经 tools.sandbox.cap_add / 档位 cap_add 按需加回）。载荷不再
-  -- 持有 CAP_SYS_ADMIN / CAP_SYS_MODULE / CAP_SYS_PTRACE 等，mount、模块加载等被内核拒绝。
-  -- 注意：cap-drop **不能**阻止写 core_pattern/modprobe —— /proc/sys 的写权限按 DAC
-  -- （euid == 全局 root uid）判定，与 capability 无关；这类全局 sysctl 由上面的
-  -- _append_hidden_proc（MANDATORY_PROC_MASKS）以只读绑定遮蔽，而非依赖 cap-drop/seccomp。
-  argv[#argv + 1] = "--cap-drop"
-  argv[#argv + 1] = "ALL"
-  for _, cap in ipairs(_cap_add(priv)) do
-    argv[#argv + 1] = "--cap-add"
-    argv[#argv + 1] = cap
+  -- capability：默认完整 root 能力（`cap_add = { "ALL" }`）——node/python/apt/dpkg 等任意
+  -- 开发与包管理操作都可用；宿主不可修改由**命名空间（mount/pid/uts/ipc/cgroup）+ 只读根 +
+  -- overlay 暂存 + 遮蔽 + /proc/sys 只读绑定 + seccomp（含设备节点屏障）**保证。
+  -- 另按 `cap_drop` 收敛「可修改宿主全局状态」的能力（网络栈/时钟/内核模块/裸 I/O/重启/MAC/
+  -- 审计）：即便授予 ALL 也逐项丢弃，netlink 改路由、改时钟等宿主修改被 EPERM 拦截，
+  -- 而 node/python/apt 不需要这些能力，不受影响。需要更小权限时可设 cap_add = {}。
+  local caps = _cap_add(priv)
+  local full = false
+  for _, c in ipairs(caps) do if c == "ALL" then full = true end end
+  if not full then
+    argv[#argv + 1] = "--cap-drop"
+    argv[#argv + 1] = "ALL"
+  end
+  for _, cap in ipairs(caps) do
+    if cap ~= "ALL" then
+      argv[#argv + 1] = "--cap-add"
+      argv[#argv + 1] = cap
+    end
+  end
+  for _, cap in ipairs(_global_cap_drop()) do
+    if not vim.tbl_contains(caps, cap) then
+      argv[#argv + 1] = "--cap-drop"
+      argv[#argv + 1] = cap
+    end
   end
 end
 
@@ -699,6 +779,47 @@ local function _overlay_mount_works(lower, upper, work, flags)
     "--overlay-src", lower, "--overlay", upper, work, lower,
     "--chdir", lower, "--", "true",
   }) do argv[#argv + 1] = f end
+  return _run_probe(argv)
+end
+
+--- 用真实执行路径 + 真实载荷 uid 实测 overlay **可写**（挂载探测只证明能挂，不证明能写）。
+--- 非 root 载荷下 copy-up/新建依赖 upper 归属与 DAC：必须实测「写-读-删」三段都成功。
+--- @param lower string
+--- @param upper string
+--- @param work string
+--- @param flags table 隔离标志
+--- @return boolean
+local function _overlay_write_works(lower, upper, work, flags)
+  local argv = {}
+  _append_bwrap_base(argv, flags)
+  local puid, pgid = _payload_ids()
+  local nonroot = puid ~= nil and puid > 0
+  local user_drop = nonroot and not _is_root()
+  local root_drop = nonroot and _is_root()
+  -- user_drop：bwrap 在 userns 内切 uid；root_drop：bwrap 保持 root，载荷经 setpriv 降权。
+  if user_drop then
+    argv[#argv + 1] = "--uid"; argv[#argv + 1] = tostring(puid)
+    argv[#argv + 1] = "--gid"; argv[#argv + 1] = tostring(pgid)
+  elseif root_drop then
+    for _, c in ipairs({ "CAP_SETUID", "CAP_SETGID" }) do
+      argv[#argv + 1] = "--cap-add"; argv[#argv + 1] = c
+    end
+  end
+  argv[#argv + 1] = "--overlay-src"; argv[#argv + 1] = lower
+  argv[#argv + 1] = "--overlay"; argv[#argv + 1] = upper
+  argv[#argv + 1] = work; argv[#argv + 1] = lower
+  argv[#argv + 1] = "--chdir"; argv[#argv + 1] = lower
+  argv[#argv + 1] = "--"
+  if root_drop then
+    for _, v in ipairs({ "setpriv", "--reuid", tostring(puid), "--regid", tostring(pgid),
+      "--clear-groups" }) do
+      argv[#argv + 1] = v
+    end
+  end
+  for _, v in ipairs({ "sh", "-c",
+    'p=.wprobe-$$; printf x > "$p" && cat "$p" >/dev/null && rm -f "$p"' }) do
+    argv[#argv + 1] = v
+  end
   return _run_probe(argv)
 end
 
@@ -857,8 +978,12 @@ local function _config_mask_paths()
   local out, seen = {}, {}
   local cfg = config_store.get("tools.sandbox.mask_paths")
   local list = type(cfg) == "table" and cfg or DEFAULT_MASK_PATHS
+  local read_all = _read_all()
   for _, p in ipairs(list) do
-    if type(p) == "string" then
+    -- `/home/*` 凭据遮蔽仅在 read_all（整机只读）时生效：read_all=false 时 home 不在白名单内
+    -- （本就不暴露），而为其创建挂载点会让 /home 意外可见（信息泄露）；cwd 位于 home 时由
+    -- `_dir_masks` 遮蔽兄弟条目。
+    if type(p) == "string" and (read_all or p:sub(1, 6) ~= "/home/") then
       if p:find("[*?[]") then
         local okg, matches = pcall(vim.fn.glob, p, false, true)
         if okg and type(matches) == "table" then
@@ -884,9 +1009,52 @@ end
 --- @param unmask table|nil 解除遮蔽的路径数组（档位提权 / 审批放行）
 --- @param cwd string|nil 工作目录（用于遮蔽目录）
 --- @return table 数组 { path, kind }
-local function _masked_paths(unmask, cwd)
+--- 载荷是否持有 CAP_DAC_OVERRIDE（可无视 DAC 遍历任意目录）
+--- @return boolean
+local function _payload_has_dac_override()
+  local caps = config_store.get("tools.sandbox.cap_add")
+  if type(caps) ~= "table" then return false end
+  for _, c in ipairs(caps) do
+    if c == "ALL" or c == "CAP_DAC_OVERRIDE" then return true end
+  end
+  return false
+end
+
+--- 载荷能否遍历到该路径：逐级检查祖先目录的执行位。
+--- 按载荷 uid 选位：owner（uid 相同）用 owner 执行位，否则用 others 执行位（保守，忽略组）。
+--- `dac_override` 为真（载荷在**初始 userns** 持有 CAP_DAC_OVERRIDE）时无视 DAC 返回 true；
+--- 嵌套 userns（T2）里该能力对宿主文件无效，调用方应传 false。不可达路径无需遮蔽
+--- （DAC 已阻止访问，且 bwrap 无法在其下创建挂载点，强行遮蔽会导致整条命令失败）。
+--- @param path string
+--- @param dac_override boolean|nil
+--- @return boolean
+local function _payload_can_traverse(path, dac_override)
+  if dac_override then return true end
+  local uid = _payload_ids()
+  local parts = {}
+  for seg in tostring(path):gmatch("[^/]+") do parts[#parts + 1] = seg end
+  local acc = ""
+  for i = 1, #parts do
+    acc = acc .. "/" .. parts[i]
+    if i < #parts then
+      local st = vim.uv.fs_stat(acc)
+      if st then
+        if st.type ~= "directory" then return false end
+        local bit = (st.uid ~= nil and uid ~= nil and st.uid == uid) and 64 or 1 -- 0o100 / 0o001
+        if (st.mode or 0) % (bit * 2) < bit then return false end
+      end
+    end
+  end
+  return true
+end
+
+local function _masked_paths(unmask, cwd, dac_override)
   local out, seen = {}, {}
   local skip, skip_list = {}, {}
+  -- 仅对载荷不可达的路径跳过遮蔽：无论 root 还是非 root 载荷，`--cap-drop ALL` 下都无
+  -- CAP_DAC_OVERRIDE，无法遍历他人 0700 目录，也无法在其下创建挂载点；此类遮蔽既无必要
+  -- 又会让整条命令失败（如 `/home/<other-user>/.ssh`）。`/root`（载荷自身属主）仍会遮蔽。
+  local skip_unreachable = true
   for _, p in ipairs(unmask or {}) do
     if type(p) == "string" and p ~= "" then
       p = p:gsub("/+$", "")
@@ -906,6 +1074,7 @@ local function _masked_paths(unmask, cwd)
     if type(p) ~= "string" or p == "" or p == "/" then return end
     p = p:gsub("/+$", "")
     if seen[p] or (not force and unmasked(p)) then return end
+    if skip_unreachable and not _payload_can_traverse(p, dac_override) then return end
     local st = vim.uv.fs_stat(p)
     if not st then return end
     seen[p] = true
@@ -938,6 +1107,46 @@ end
 function M.bwrap_flags()
   local caps = M.capabilities()
   return caps.bwrap_flags or USER_FLAGS
+end
+
+--- 载荷运行身份（uid, gid）：非 root 启动为当前用户；root 启动为 `tools.sandbox.run_as`。
+--- @return number uid
+--- @return number gid
+function M.payload_ids()
+  return _payload_ids()
+end
+
+--- 载荷是否以非 root 运行
+--- @return boolean
+function M.payload_nonroot()
+  return _payload_nonroot()
+end
+
+--- 将路径（递归）chown 到载荷 uid/gid（仅 root 且载荷非 root 时需要）。
+--- 沙箱可写目录（overlay upper/work、暂存、会话目录）必须归载荷所有，否则非 root 载荷
+--- 无法写入（overlay 会 EROFS/EACCES）。非 root 启动时为 no-op。
+--- @param path string
+--- @param uid number|nil 缺省用载荷 uid
+--- @param gid number|nil 缺省用载荷 gid
+function M.chown_payload(path, uid, gid)
+  if not _is_root() then return end
+  if type(path) ~= "string" or path == "" then return end
+  local puid, pgid = _payload_ids()
+  uid = uid or puid
+  gid = gid or pgid
+  if not uid or uid <= 0 then return end
+  pcall(vim.uv.fs_chown, path, uid, gid)
+  local st = vim.uv.fs_stat(path)
+  if st and st.type == "directory" then
+    local handle = vim.uv.fs_scandir(path)
+    if handle then
+      while true do
+        local name = vim.uv.fs_scandir_next(handle)
+        if not name then break end
+        M.chown_payload(path .. "/" .. name, uid, gid)
+      end
+    end
+  end
 end
 
 --- 追加最小只读系统集挂载参数（供 LSP overlay 等复用，保证读取面一致）。
@@ -1023,26 +1232,28 @@ local function _host_local_block_enabled()
   return true
 end
 
---- 生成清除代理变量的 shell 片段（供外部命令前置）。passthrough 或无需清除时返回 nil。
---- 网络网关模式 / 本机拦截代理启用时返回 nil：会注入指向宿主代理的变量，不能被清除。
+--- 生成清除敏感环境变量的 shell 片段（供外部命令前置）。
+--- 始终清除 SSH agent 变量（`SSH_AUTH_SOCK`/`SSH_AGENT_PID`）——禁止沙箱内进程使用宿主
+--- ssh-agent 服务（与 mask_paths 对 agent socket 的遮蔽形成双保险）。
+--- 代理变量按策略清除：passthrough / 网关 / 本机拦截代理时不覆盖代理（其余情况 strip）。
 --- @return string|nil
 local function _proxy_unset_snippet()
+  local keys = { "SSH_AUTH_SOCK", "SSH_AGENT_PID" }
   local ok_ng, net_gateway = pcall(require, "NeoAI.sandbox.net_gateway")
-  if ok_ng and net_gateway.enabled() then return nil end
-  if _host_local_block_enabled() then return nil end
-  local p = _proxy_policy()
-  if p == "passthrough" then return nil end
-  local keep = {}
-  if type(p) == "table" then
-    if p.http then keep.HTTP_PROXY = true; keep.http_proxy = true end
-    if p.https then keep.HTTPS_PROXY = true; keep.https_proxy = true end
-    if p.all then keep.ALL_PROXY = true; keep.all_proxy = true end
+  local passthrough = _proxy_policy() == "passthrough"
+  local skip_proxy = (ok_ng and net_gateway.enabled()) or _host_local_block_enabled() or passthrough
+  if not skip_proxy then
+    local p = _proxy_policy()
+    local keep = {}
+    if type(p) == "table" then
+      if p.http then keep.HTTP_PROXY = true; keep.http_proxy = true end
+      if p.https then keep.HTTPS_PROXY = true; keep.https_proxy = true end
+      if p.all then keep.ALL_PROXY = true; keep.all_proxy = true end
+    end
+    for _, k in ipairs(PROXY_KEYS) do
+      if not keep[k] then keys[#keys + 1] = k end
+    end
   end
-  local keys = {}
-  for _, k in ipairs(PROXY_KEYS) do
-    if not keep[k] then keys[#keys + 1] = k end
-  end
-  if #keys == 0 then return nil end
   return "unset " .. table.concat(keys, " ") .. " 2>/dev/null"
 end
 
@@ -1171,6 +1382,31 @@ function M.mask_dirs()
   return _mask_dirs()
 end
 
+--- 读取面是否放开（`tools.sandbox.read_all`，默认开）
+--- @return boolean
+function M.read_all()
+  return _read_all()
+end
+
+--- 判断路径是否属于「工作区之外的用户工作目录」：不在 cwd 子树内、但位于某个
+--- 遮蔽目录（home/root 等）之下。用于越界访问留痕（`read_all` 下这些目录可读，
+--- 但会记录并在审批悬浮窗展示）。系统路径（/usr、/etc 等）不计入，避免噪声。
+--- @param path string|nil
+--- @param cwd string|nil
+--- @return string|nil 命中的绝对路径（规范化后）
+function M.outside_workspace(path, cwd)
+  if type(path) ~= "string" or path == "" then return nil end
+  if type(cwd) ~= "string" or cwd == "" then return nil end
+  local p = _canonical(path)
+  local c = _canonical(cwd)
+  if p == "" or p == "/" then return nil end
+  if p == c or _under(p, c) then return nil end
+  for _, d in ipairs(_mask_dirs()) do
+    if p == d or _under(p, d) then return p end
+  end
+  return nil
+end
+
 --- 当前环境是否可在 bwrap userns 内真实挂载 overlayfs（粗粒度能力门禁）
 --- @return boolean
 function M.overlay_available()
@@ -1192,6 +1428,31 @@ function M.overlay_mountable(lower, upper, work)
   if cached ~= nil then return cached end
   local ok = _overlay_mount_works(lower, upper, work, M.bwrap_flags())
   state.overlay_probe[key] = ok
+  return ok
+end
+
+--- 用真实执行路径 + 真实载荷 uid 实测 overlay **可写**（挂载成功不代表可写）。
+--- 结果按 (lower, upper.dev, uid, gid) 缓存——可写性依赖载荷身份，不能只按文件系统对缓存。
+--- @param lower string
+--- @param upper string
+--- @param work string
+--- @return boolean
+function M.overlay_writable(lower, upper, work)
+  if not (lower and upper and work) then return false end
+  if not M.overlay_available() then return false end
+  local puid, pgid = _payload_ids()
+  local st_u = vim.uv.fs_stat(upper)
+  local key = string.format("w|%s|%s|%s|%s",
+    tostring(lower), tostring(st_u and st_u.dev or -1), tostring(puid), tostring(pgid))
+  local cached = state.overlay_write_probe[key]
+  if cached ~= nil then return cached end
+  local flags = M.bwrap_flags()
+  local nonroot = puid ~= nil and puid > 0
+  -- 仅「非 root 启动」需要 userns 承载 --uid；root 启动时 bwrap 保持 root（载荷经 setpriv 降权）。
+  if nonroot and not _is_root() then flags = USER_FLAGS end
+  local ok = _overlay_mount_works(lower, upper, work, flags)
+    and _overlay_write_works(lower, upper, work, flags)
+  state.overlay_write_probe[key] = ok
   return ok
 end
 
@@ -1301,6 +1562,15 @@ function M.process_prefix(opts)
   end
   if backend == "bwrap" then
     local overlays = opts.overlays or {}
+    local puid, pgid = _payload_ids()
+    local nonroot = puid ~= nil and puid > 0
+    -- 降权方式（最小权限）：
+    --   user_drop：非 root 启动 → bwrap 以当前用户运行 + `--unshare-user --uid/--gid`（guest 非 root）。
+    --   root_drop：root 启动 + 专用 uid → bwrap 仍以 **root** 运行（挂载权限足够：可处理 /root 下的
+    --     挂载点与 overlay lower），仅**载荷**经 `setpriv` 降权（见函数末尾）。若把 bwrap 本身降权，
+    --     它将无法在 /root 等 0700 目录下创建挂载点，导致隔离挂载失败/降级。
+    local user_drop = nonroot and not _is_root()
+    local root_drop = nonroot and _is_root()
     local flags = M.bwrap_flags()
     -- 档位要求嵌套 userns（如 T2）：改用带 user namespace 的隔离标志，
     -- 使 cap_add 的权限被限制在该 userns 内，够不到宿主。
@@ -1308,10 +1578,30 @@ function M.process_prefix(opts)
     -- 网关模式：网络命名空间由 `ip netns exec` 提供，bwrap 不得再 unshare net，
     -- 故使用不带 net 的隔离标志（--unshare-pid/ipc/uts/cgroup）。
     if gateway_mode then flags = NO_USER_FLAGS end
+    -- 非 root 启动且载荷非 root：需要 user namespace 承载 `--uid/--gid`（bwrap 要求）。
+    if user_drop then
+      if gateway_mode then
+        flags = { "--unshare-user", "--unshare-pid", "--unshare-ipc", "--unshare-uts", "--unshare-cgroup" }
+      else
+        flags = USER_FLAGS
+      end
+    end
     local userns = false
-    for _, f in ipairs(flags) do if f == "--unshare-all" then userns = true end end
+    for _, f in ipairs(flags) do if f == "--unshare-all" or f == "--unshare-user" then userns = true end end
     local argv = {}
     _append_bwrap_base(argv, flags, priv, opts.cwd)
+    -- root_drop：为让载荷经 setpriv 降 uid，bwrap 需保留 SETUID/SETGID（其余能力仍被
+    -- `--cap-drop ALL` 丢弃）；setuid 后内核清空 permitted/effective，载荷无能力。
+    if root_drop then
+      for _, c in ipairs({ "CAP_SETUID", "CAP_SETGID" }) do
+        argv[#argv + 1] = "--cap-add"; argv[#argv + 1] = c
+      end
+    end
+    -- user_drop：bwrap 在新建 userns 内切到该 uid/gid（guest 与宿主都非 root）。
+    if user_drop then
+      argv[#argv + 1] = "--uid"; argv[#argv + 1] = tostring(puid)
+      argv[#argv + 1] = "--gid"; argv[#argv + 1] = tostring(pgid)
+    end
     -- F2：临时根覆盖为「会话私有目录」（mode 1777，位于 /dev/shm 等 tmpfs 上），
     -- 覆盖基础参数里的空 tmpfs；绝不把宿主真实 /tmp、/var/tmp 作为 lower/内容暴露，
     -- 退出/轮换会话即销毁，杜绝跨会话残留泄露。
@@ -1335,7 +1625,9 @@ function M.process_prefix(opts)
     for _, ov in ipairs(overlays) do
       local mode = ov.mode
       if not mode then
-        mode = (M.overlay_available() and M.overlay_mountable(ov.root, ov.upper, ov.work))
+        -- 可写性实测：挂载成功但载荷无法写入（非 root + upper 归属/DAC）时降级 bind，
+        -- 避免命令因 overlay 只读而失败（设计：实测 overlay 可写）。
+        mode = (M.overlay_available() and M.overlay_writable(ov.root, ov.upper, ov.work))
           and "overlay" or "bind"
       end
       if mode == "overlay" then
@@ -1353,7 +1645,7 @@ function M.process_prefix(opts)
     if #overlays == 0 and opts.cwd then
       local overlay_ok = opts.upper and opts.work
         and M.overlay_available()
-        and M.overlay_mountable(opts.cwd, opts.upper, opts.work)
+        and M.overlay_writable(opts.cwd, opts.upper, opts.work)
       if overlay_ok then
         table.insert(argv, "--overlay-src"); table.insert(argv, opts.cwd)
         table.insert(argv, "--overlay"); table.insert(argv, opts.upper)
@@ -1370,12 +1662,20 @@ function M.process_prefix(opts)
     end
     -- 遮蔽沙箱自身存储与宿主敏感路径：置于各可写根 overlay/bind 之后，确保覆盖生效。
     -- 目录用空 tmpfs；文件/socket 用 /dev/null 覆盖（socket 被替换为字符设备，connect 失败）。
-    -- 档位 unmask 中的路径（如受控 docker socket）不遮蔽。
-    for _, mp in ipairs(_masked_paths(priv and priv.unmask or nil, opts.cwd)) do
+    -- 档位 unmask 中的路径（如受控 docker socket）不遮蔽。嵌套 userns（T2）内 DAC_OVERRIDE
+    -- 对宿主文件无效，故仅非 userns 档位才允许 DAC 旁路可达性判断。
+    local dac_override = _payload_has_dac_override() and not (priv and priv.userns)
+    for _, mp in ipairs(_masked_paths(priv and priv.unmask or nil, opts.cwd, dac_override)) do
       if mp.kind == "dir" then
         table.insert(argv, "--tmpfs"); table.insert(argv, mp.path)
       else
         table.insert(argv, "--bind"); table.insert(argv, "/dev/null"); table.insert(argv, mp.path)
+      end
+    end
+    -- 工具子进程只读绑定：置于遮蔽之后，用于暴露工具命令自身所在目录（如 $HOME 下的脚本）。
+    for _, p in ipairs(opts.ro_binds or {}) do
+      if type(p) == "string" and p ~= "" and vim.uv.fs_stat(p) then
+        table.insert(argv, "--ro-bind"); table.insert(argv, p); table.insert(argv, p)
       end
     end
     -- 宿主运行时直通（opt-in）：置于遮蔽之后，允许显式暴露被遮蔽/临时根下的工具链。
@@ -1413,15 +1713,30 @@ function M.process_prefix(opts)
       for _, v in ipairs(argv) do full[#full + 1] = v end
       argv = full
     end
-    -- seccomp 基线：bwrap 在载荷 exec 前装载过滤器；用 shell 打开过滤器 fd 后 exec bwrap
+    -- seccomp 基线：bwrap 在载荷 exec 前装载过滤器（须在 `--` 之前，作为 bwrap 选项）。
     local seccomp = require("NeoAI.sandbox.seccomp")
+    local filter
     if seccomp.enabled() then
-      local filter, ferr = seccomp.ensure_filter()
-      if not filter then
+      local f, ferr = seccomp.ensure_filter()
+      if not f then
         return nil, ferr or "SANDBOX_SECCOMP_UNAVAILABLE"
       end
+      filter = f
       table.insert(argv, "--seccomp")
       table.insert(argv, "3")
+    end
+    -- 最小权限（root 启动 + 专用 uid）：bwrap 以 root 完成全部挂载后，仅**载荷**经 setpriv
+    -- 降为专用非 root uid。载荷在宿主与命名空间内都非 root、无能力（bwrap 已 --cap-drop ALL，
+    -- 改 uid 时内核清空 caps）；bwrap 设置的 NoNewPrivs 使 setuid/文件能力二进制无法提权。
+    -- 用 `--` 分隔后，调用方追加的真实命令即成为 setpriv 的实参。
+    if root_drop then
+      table.insert(argv, "--")
+      for _, v in ipairs({ "setpriv", "--reuid", tostring(puid), "--regid", tostring(pgid),
+        "--clear-groups" }) do
+        table.insert(argv, v)
+      end
+    end
+    if filter then
       return _wrap_close_fds(argv, "exec 3<'" .. filter .. "'"), nil, opts.cwd
     end
     return _wrap_close_fds(argv), nil, opts.cwd
@@ -1462,6 +1777,17 @@ function M.check_available()
     return false, "SANDBOX_BACKEND_UNAVAILABLE: 既无 bwrap 也无可用的 unshare/userns"
   end
   local cfg = config_store.get("tools.sandbox") or {}
+  -- 最小权限提醒：root 启动且显式放弃降权（run_as.uid<=0）时，载荷以 root 运行。
+  if _is_root() then
+    local uid = _payload_ids()
+    if not uid or uid <= 0 then
+      require("NeoAI.kernel.logger").warn(
+        "[sandbox] root 启动且 tools.sandbox.run_as.uid=0：载荷以 root 运行（不推荐，最小权限失效）")
+    elseif vim.fn.executable("setpriv") ~= 1 then
+      -- root 启动需 setpriv 把载荷降为专用 uid；缺失则 fail-closed，绝不静默以 root 运行载荷。
+      return false, "SANDBOX_SETPRIV_UNAVAILABLE: root 启动需 setpriv 降权到 run_as.uid"
+    end
+  end
   if cfg.require_seccomp then
     local seccomp = require("NeoAI.sandbox.seccomp")
     if backend ~= "bwrap" then
@@ -1543,6 +1869,7 @@ end
 function M.reset()
   state.caps = nil
   state.overlay_probe = {}
+  state.overlay_write_probe = {}
   state.empty_file = nil
   pcall(M.cleanup_tmp_roots)
 end

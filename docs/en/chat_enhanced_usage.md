@@ -78,7 +78,7 @@ Expand/collapse: `zM` (collapse all) / `zo` (expand) / `zR` (expand all).
 
 `m` or `:NeoAIPlan` toggles plan mode:
 
-- The tool context keeps only **read-only/information-query tools + `ask_user` + `exit_plan_mode`**, exposing no
+- The tool context keeps only **read-only/information-query tools + `run_command` (read-only research) + `ask_user` + `exit_plan_mode`**, exposing no
   modifying tools at all.
 - The execution-time gate tightens accordingly; tools outside the visible set are rejected when called.
 - In plan mode the AI researches and asks clarifying questions, then outputs a **clear, well-formatted change

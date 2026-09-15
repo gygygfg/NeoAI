@@ -232,9 +232,9 @@ vim.api.nvim_create_autocmd("User", {
 
 | 常量 | 值 | 触发时机 | payload 关键字段 |
 | --- | --- | --- | --- |
-| `COMPACTION_STARTED` | `compaction:started` | 开始上下文压缩 | `{ agent_id, estimated_tokens }` |
-| `COMPACTION_CHUNK` | `compaction:chunk` | 摘要流式分片到达 | `{ agent_id, reasoning, content }` |
-| `COMPACTION_COMPLETED` | `compaction:completed` | 压缩完成 | `{ agent_id, replaced, summary }` |
+| `COMPACTION_STARTED` | `compaction:started` | （保留，后台压缩不再发射） | `{ agent_id, estimated_tokens }` |
+| `COMPACTION_CHUNK` | `compaction:chunk` | （保留，后台压缩不再发射） | `{ agent_id, reasoning, content }` |
+| `COMPACTION_COMPLETED` | `compaction:completed` | 后台压缩完成（写入覆盖层） | `{ agent_id, replaced, summary }` |
 
 ### 计划蒸馏
 
@@ -244,7 +244,8 @@ vim.api.nvim_create_autocmd("User", {
 | `PLAN_DISTILL_CHUNK` | `plan_distill:chunk` | 分类摘要流式分片到达 | `{ agent_id, reasoning, content }` |
 | `PLAN_DISTILLED` | `plan_distilled` | 蒸馏完成 | `{ agent_id, replaced, summary }` |
 
-> 压缩 / 蒸馏期间 UI 会打开"🧬 上下文压缩 / 🧬 计划蒸馏"悬浮窗，实时展示接收到的推理与正文。
+> 上下文压缩为**后台异步、不弹窗**：不再发射 `COMPACTION_STARTED` / `COMPACTION_CHUNK`（常量保留），仅发射 `COMPACTION_COMPLETED`。
+> 计划蒸馏仍会打开"🧬 计划蒸馏"悬浮窗并发射 `PLAN_DISTILL_STARTED` / `PLAN_DISTILL_CHUNK`。
 
 ### 沙箱
 
@@ -265,6 +266,7 @@ vim.api.nvim_create_autocmd("User", {
 | `SANDBOX_APPLIED` | `sandbox:applied` | 变更单元已 CAS 应用到真实工作区 | `{ change_set_id, operation_id }` |
 | `SANDBOX_GRANT_CREATED` | `sandbox:grant_created` | 创建任务授权 | `{ grant_id, scope, operations }` |
 | `SANDBOX_GRANT_REVOKED` | `sandbox:grant_revoked` | 撤销任务授权 | `{ grant_id }` |
+| `SANDBOX_OUTSIDE_ACCESS` | `sandbox:outside_access` | 越界访问留痕（访问 cwd 之外用户工作目录，非阻塞） | `{ trace_id, path, tool, kind }` |
 
 ## 4. 事件订阅最佳实践
 

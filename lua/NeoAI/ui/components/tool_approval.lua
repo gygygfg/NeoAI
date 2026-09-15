@@ -14,6 +14,7 @@ local state = {
   on_confirm = nil,
   on_cancel = nil,
   on_confirm_all = nil,
+  on_add_to_workspace = nil,
 }
 
 -- ========== 私有函数 ==========
@@ -27,6 +28,7 @@ local function _close()
   state.on_confirm = nil
   state.on_cancel = nil
   state.on_confirm_all = nil
+  state.on_add_to_workspace = nil
 end
 
 --- 按键显示名（<CR>/<Esc> 等转为可读文本）
@@ -46,6 +48,7 @@ local function _hint_lines()
   local defs = {
     { conf = cfg.confirm, key = "<CR>", desc = "允许一次" },
     { conf = cfg.confirm_all, key = "A", desc = "允许所有" },
+    { conf = cfg.add_to_workspace, key = "D", desc = "允许并加入工作目录" },
     { conf = cfg.cancel, key = "<Esc>", desc = "取消" },
     { conf = cfg.cancel_with_reason, key = "C", desc = "取消并说明" },
   }
@@ -69,6 +72,7 @@ local function _set_keymaps()
   local approval_cfg = (config.get("keymaps.chat.approval") or {})
   local k_confirm = approval_cfg.confirm and approval_cfg.confirm.key or "<CR>"
   local k_confirm_all = approval_cfg.confirm_all and approval_cfg.confirm_all.key or "A"
+  local k_add_to_workspace = approval_cfg.add_to_workspace and approval_cfg.add_to_workspace.key or "D"
   local k_cancel = approval_cfg.cancel and approval_cfg.cancel.key or "<Esc>"
   local k_cancel_reason = approval_cfg.cancel_with_reason and approval_cfg.cancel_with_reason.key or "C"
 
@@ -94,6 +98,9 @@ local function _set_keymaps()
     bind(mode, k_confirm_all, function()
       close_then(state.on_confirm_all)
     end)
+    bind(mode, k_add_to_workspace, function()
+      close_then(state.on_add_to_workspace)
+    end)
     bind(mode, k_cancel, function()
       close_then(state.on_cancel, "用户取消")
     end)
@@ -106,7 +113,7 @@ end
 -- ========== 公开 API ==========
 
 --- 展示审批弹窗
---- @param config table { text, tool_name, args, on_confirm, on_cancel, on_confirm_all }
+--- @param config table { text, tool_name, args, on_confirm, on_cancel, on_confirm_all, on_add_to_workspace }
 function M.show(config)
   if state.win_id and vim.api.nvim_win_is_valid(state.win_id) then
     _close()
@@ -114,6 +121,7 @@ function M.show(config)
   state.on_confirm = config.on_confirm
   state.on_cancel = config.on_cancel
   state.on_confirm_all = config.on_confirm_all
+  state.on_add_to_workspace = config.on_add_to_workspace
 
   state.buf = vim.api.nvim_create_buf(false, true)
   vim.bo[state.buf].filetype = "neoai_approval"

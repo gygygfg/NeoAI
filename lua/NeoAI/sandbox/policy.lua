@@ -36,6 +36,17 @@ local function _run_restricted(fn, facts)
     tostring = tostring,
     tonumber = tonumber,
   }
+  -- 真隔离：把规则的**全局环境**替换为白名单 env。否则 env 只是作为参数传入，规则闭包仍可
+  -- 直接访问 `os`/`io`/`debug`/`require`/`pcall`（可执行命令、读文件、清除预算钩子）。
+  -- LuaJIT 提供 setfenv/getfenv；不可用时 fail-closed（拒绝该规则）。
+  -- 注：若规则通过 upvalue 提前捕获了全局（如 `local os=os`），setfenv 无法回收——属已记录残余。
+  if type(setfenv) ~= "function" or type(getfenv) ~= "function" then
+    return false, "POLICY_ISOLATION_UNAVAILABLE"
+  end
+  local ok_env, prev_env = pcall(getfenv, fn)
+  if not ok_env then return false, "POLICY_ISOLATION_FAILED" end
+  local ok_set = pcall(setfenv, fn, env)
+  if not ok_set then return false, "POLICY_ISOLATION_FAILED" end
   -- LuaJIT 的 JIT 编译会绕过 debug 钩子（紧循环永不触发预算），
   -- 因此规则执行期间关闭 JIT，保证指令预算/墙钟限制真实生效。
   local has_jit = false
@@ -60,6 +71,7 @@ local function _run_restricted(fn, facts)
     return fn(facts, env)
   end)
   debug.sethook()
+  pcall(setfenv, fn, prev_env)
   if has_jit then pcall(require("jit").on) end
   if not ok then return false, res end
   return true, res

@@ -192,7 +192,7 @@ tests.suite("cache_strategy", function(_, it)
     t.eq(false, value)
   end)
 
-  it("maybe_compact 回放前缀 + 压缩指令，并替换被折叠区间", function(t)
+  it("maybe_compact 回放前缀 + 压缩指令，写入覆盖层且不改动原始消息", function(t)
     local config_store = require("NeoAI.kernel.config_store")
     config_store.load({
       ai = {
@@ -245,23 +245,28 @@ tests.suite("cache_strategy", function(_, it)
 
     t.true_(ok, "压缩应发生")
     t.not_nil(captured, "应调用摘要请求")
-    -- 回放前缀：系统 + 被折叠消息（两条）+ 压缩指令 = 4 条
+    -- 回放前缀：系统 + 折叠区间（第一轮至倒数第二轮：3 条）+ 压缩指令 = 5 条
     t.eq("system", captured.messages[1].role)
     t.eq("persona", captured.messages[1].content)
-    t.eq(4, #captured.messages)
+    t.eq(5, #captured.messages)
     -- 折叠区消息逐字节回放
     t.eq(long, captured.messages[2].content)
     t.eq(short, captured.messages[3].content)
+    t.eq(short, captured.messages[4].content)
     -- 压缩指令为最后一条 user 消息（前缀缓存复用）
     local last = captured.messages[#captured.messages]
     t.eq("user", last.role)
     t.true_(last.content:find("compaction engine", 1, true) ~= nil)
     -- 摘要请求带上工具定义
     t.not_nil(captured.opts.tools)
-    -- 替换：首条为检查点，原被折叠的两条消失，最近两条保留
-    t.eq(3, #agent.messages)
-    t.eq("user", agent.messages[1].role)
-    t.true_(agent.messages[1].checkpoint)
-    t.true_(agent.messages[1].content:find("resume", 1, true) ~= nil)
+    -- 覆盖层：原始消息不被改动（渲染仍原始），请求视图首条为检查点、末轮保留
+    t.eq(4, #agent.messages, "原始消息不应被改动")
+    t.not_nil(agent.compaction, "应写入压缩覆盖层")
+    t.true_(agent.compaction.checkpoint.checkpoint)
+    t.true_(agent.compaction.checkpoint.content:find("resume", 1, true) ~= nil)
+    local view = context_builder.request_view(agent)
+    t.eq(2, #view, "请求视图 = 检查点 + 最后一轮")
+    t.true_(view[1].checkpoint)
+    t.eq(short, view[2].content, "最后一轮应保留在请求视图尾部")
   end)
 end)

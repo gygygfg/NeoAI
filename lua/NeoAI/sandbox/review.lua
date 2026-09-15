@@ -29,6 +29,7 @@ M.APPLY = {
   CONFLICT = "CONFLICT",
   FAILED = "FAILED",
   RECONCILING = "RECONCILING",
+  NEEDS_ROOT = "NEEDS_ROOT",
 }
 
 -- ========== 私有状态 ==========
@@ -66,6 +67,102 @@ local function _write_set(cand)
   return out
 end
 
+--- 去重合并两个字符串数组（保留首次出现顺序）
+--- @param a table|nil
+--- @param b table|nil
+--- @return table
+local function _union(a, b)
+  local out, seen = {}, {}
+  for _, list in ipairs({ a or {}, b or {} }) do
+    for _, v in ipairs(list) do
+      if type(v) == "string" and not seen[v] then seen[v] = true; out[#out + 1] = v end
+    end
+  end
+  return out
+end
+
+--- 合并同一「安装命令」（package_key）的待审候选为一个审批单元。
+--- 包安装命令（apt/pip/npm 等）常产生多个候选（索引、元数据、包文件），按安装命令键合并后，
+--- 待审悬浮窗只显示一个条目、整包一次审批，避免同类条目反复确认。
+--- @param item table 新入队的变更单元（含 package_key）
+--- @param cand table 新候选
+--- @return table 合并后的变更单元（无同类时返回 item）
+local function _merge_package_item(item, cand)
+  local key = item.package_key
+  if type(key) ~= "string" or key == "" then return item end
+  local members = {}
+  for _, it in ipairs(M.list({ review_state = M.REVIEW.PENDING })) do
+    if it.change_set_id ~= item.change_set_id and it.package_key == key then
+      members[#members + 1] = it
+    end
+  end
+  if #members == 0 then return item end
+  local base = members[1]
+  -- 按路径合并文件（新候选优先），并集排序。
+  local by_path, order = {}, {}
+  local function add(f)
+    if not by_path[f.path] then order[#order + 1] = f.path end
+    by_path[f.path] = f
+  end
+  for _, it in ipairs(members) do
+    local c = store.read_candidate(it.candidate_digest)
+    for _, f in ipairs((c and c.files) or it.files or {}) do add(vim.deepcopy(f)) end
+  end
+  for _, f in ipairs(cand.files or {}) do add(vim.deepcopy(f)) end
+  local files = {}
+  for _, p in ipairs(order) do files[#files + 1] = by_path[p] end
+  table.sort(files, function(a, b) return a.path < b.path end)
+  local manifest = {}
+  for _, f in ipairs(files) do manifest[#manifest + 1] = { path = f.path, action = f.action, after_hash = f.after_hash } end
+  local json = require("NeoAI.utils.json")
+  local digest = "sha256:" .. vim.fn.sha256(json.encode(manifest))
+  local newcand = {
+    candidate_digest = digest, files = files, created_at = os.time(),
+    effect = base.effect or cand.effect, command_id = cand.command_id,
+  }
+  store.write_candidate(newcand)
+  -- 其余同键成员并入 base：标记取代并丢弃各自候选。
+  for i = 2, #members do
+    local it = members[i]
+    it.review_state = M.REVIEW.SUPERSEDED
+    it.superseded_by = base.change_set_id
+    it.superseded_at = os.time()
+    state.items[it.change_set_id] = it
+    if it.candidate_digest ~= digest then store.discard_candidate(it.candidate_digest) end
+    _persist(it)
+    _emit(require("NeoAI.kernel.events").SANDBOX_REVIEW_SUPERSEDED, {
+      change_set_id = it.change_set_id, superseded_by = base.change_set_id,
+    })
+  end
+  if base.candidate_digest ~= digest then store.discard_candidate(base.candidate_digest) end
+  base.candidate_digest = digest
+  base.files = files
+  base.write_set = _write_set(newcand)
+  base.package_names = _union(base.package_names, item.package_names)
+  base.command = item.command or base.command
+  base.package_manager = item.package_manager or base.package_manager
+  if (tonumber(item.risk_level) or 0) > (tonumber(base.risk_level) or 0) then
+    base.risk_level = item.risk_level
+    base.risk_name = item.risk_name
+  end
+  base.risk_reasons = _union(base.risk_reasons, item.risk_reasons)
+  base.secret_warning = item.secret_warning or base.secret_warning
+  base.updated_at = os.time()
+  state.items[base.change_set_id] = base
+  _persist(base)
+  -- 新条目已并入 base：标记取代并丢弃其候选。
+  item.review_state = M.REVIEW.SUPERSEDED
+  item.superseded_by = base.change_set_id
+  item.superseded_at = os.time()
+  state.items[item.change_set_id] = item
+  if item.candidate_digest ~= digest then store.discard_candidate(item.candidate_digest) end
+  _persist(item)
+  _emit(require("NeoAI.kernel.events").SANDBOX_REVIEW_SUPERSEDED, {
+    change_set_id = item.change_set_id, superseded_by = base.change_set_id,
+  })
+  return base
+end
+
 -- ========== 公开 API ==========
 
 --- 入队一个候选为待审变更单元
@@ -77,8 +174,10 @@ function M.enqueue(cand, meta)
   -- 空候选（无文件改动）没有审批意义，不入待审队列，避免出现「0 个文件」空项。
   if #(cand and cand.files or {}) == 0 then return nil end
   -- 密钥防护：候选内容涉及 token（密钥被加密映射）时生成警告。
+  -- 包安装候选由 wrapper 明确跳过密钥检测（状态文件含高熵签名/哈希），此处不重复检测，
+  -- 避免把包管理器状态文件误报为「密钥操作」。
   local secret_warning = meta.secret_warning
-  if secret_warning == nil then
+  if secret_warning == nil and not meta.package then
     local ok, s = pcall(require, "NeoAI.sandbox.secret")
     if ok and s.enabled() then secret_warning = s.warn_for_files(cand.files) end
   end
@@ -109,6 +208,11 @@ function M.enqueue(cand, meta)
     risk_reasons = meta.risk_reasons,
     package = meta.package,
     action = meta.action,
+    -- 包安装：管理器/包名/合并键/命令（按安装命令合并为一个审批单元，界面标注）。
+    command = meta.command,
+    package_manager = meta.package_manager,
+    package_names = meta.package_names,
+    package_key = meta.package_key,
     review_state = M.REVIEW.PENDING,
     apply_state = M.APPLY.NOT_REQUESTED,
     created_at = os.time(),
@@ -121,7 +225,7 @@ function M.enqueue(cand, meta)
     write_set = item.write_set,
     tool = item.tool,
   })
-  return item
+  return _merge_package_item(item, cand)
 end
 
 --- 入队一条主机操作提案（T2 特权档的主机效果，审批后 replay）
@@ -192,21 +296,31 @@ function M.list(filter)
   return filtered
 end
 
---- 待审数量（按文件计：审批单位为单个文件，与审批界面一致）
---- 一个变更单元可能含多个文件，用户需逐个确认，故徽标数应为待审文件总数。
---- @return number
-function M.pending_count()
-  local n = 0
+--- 待审摘要：待审文件数 + 最高安全级别（单次扫描，供状态栏徽标与危险高亮）。
+--- 待审数量按文件计（审批单位为单个文件，与审批界面一致）：一个变更单元可能含多个文件，
+--- 用户需逐个确认，故徽标数应为待审文件总数。
+--- @return table { count = number, max_level = number|nil }
+function M.pending_summary()
+  local count, max_level = 0, nil
   for _, item in ipairs(M.list({ review_state = M.REVIEW.PENDING })) do
     if item.kind == "host_op" then
-      n = n + 1
+      count = count + 1
     else
-      local count = #(item.files or {})
-      if count == 0 then count = #(item.write_set or {}) end
-      n = n + count
+      local n = #(item.files or {})
+      if n == 0 then n = #(item.write_set or {}) end
+      count = count + n
+    end
+    if item.risk_level and (not max_level or item.risk_level > max_level) then
+      max_level = item.risk_level
     end
   end
-  return n
+  return { count = count, max_level = max_level }
+end
+
+--- 待审数量（按文件计）
+--- @return number
+function M.pending_count()
+  return M.pending_summary().count
 end
 
 --- 会话级自动审批是否开启（默认关闭；仅靠本地模型时由用户显式开启以管理 agent 行为）
@@ -347,6 +461,21 @@ function M.apply(id, opts)
   if not item then
     return { ok = false, state = "FAILED", reason = "CHANGE_SET_NOT_FOUND: " .. tostring(id) }
   end
+  -- 陈旧 id / 审批界面：被取代（SUPERSEDED）的旧变更单元已丢弃候选，无法直接应用。
+  -- 沿 supersede 链重定向到最新版本，使用户对旧 id 的应用意图落到当前内容，而不是
+  -- 报 NOT_APPROVED。已应用（APPLIED）的终态直接视为成功（幂等）。
+  local seen = { [id] = true }
+  while item.review_state == M.REVIEW.SUPERSEDED and item.superseded_by
+    and not seen[item.superseded_by] do
+    seen[item.superseded_by] = true
+    local nxt = M.get(item.superseded_by)
+    if not nxt then break end
+    item = nxt
+    id = item.change_set_id
+  end
+  if item.apply_state == M.APPLY.APPLIED then
+    return { ok = true, state = "ALREADY_APPLIED", receipt = item.receipt }
+  end
   -- 主机操作提案：审批后在主机上 replay（无候选、无文件）
   if item.kind == "host_op" then
     if opts.auto_approve and item.review_state == M.REVIEW.PENDING then M.approve(id) end
@@ -394,7 +523,7 @@ function M.apply(id, opts)
   _emit(require("NeoAI.kernel.events").SANDBOX_PUBLISH_STARTED, {
     change_set_id = id, candidate_digest = item.candidate_digest,
   })
-  local pub = candidate.publish(cand, { expected_base = item.base_version })
+  local pub = candidate.publish(cand, { expected_base = item.base_version, allow_root = opts.allow_root == true })
   if pub.ok then
     item.apply_state = M.APPLY.APPLIED
     item.applied_at = os.time()
@@ -406,6 +535,16 @@ function M.apply(id, opts)
     if #remaining > 0 then _requeue_remaining(item, remaining) end
     _emit(require("NeoAI.kernel.events").SANDBOX_APPLIED, {
       change_set_id = id, operation_id = pub.receipt.operation_id,
+    })
+  elseif pub.state == "NEEDS_ROOT" then
+    -- 非 root 写入被拒（目标归 root 所有）：保持待审并标记「需 root」，进入异步审批；
+    -- 用户确认（allow_root=true）后才以 root / sudo 写入。不自动提权。
+    item.apply_state = M.APPLY.NEEDS_ROOT
+    item.needs_root = true
+    item.fail_reason = pub.reason
+    _persist(item)
+    _emit(require("NeoAI.kernel.events").SANDBOX_PRIVILEGE_ESCALATION_REQUESTED, {
+      change_set_id = id, reason = "PUBLISH_WRITE_DENIED",
     })
   else
     item.apply_state = pub.state == "CONFLICT" and M.APPLY.CONFLICT or M.APPLY.FAILED

@@ -95,6 +95,33 @@ local function _history_start(source, max_history)
   return start
 end
 
+--- 应用压缩覆盖层：检查点消息取代 messages 的前 replaced 条「非运行态快照」消息。
+--- 运行态快照（runtime_context）若落在被替换前缀内则一并折叠；前缀之后的消息全部保留。
+--- 覆盖层不改动原始 messages（渲染仍为原始上下文），仅用于构建请求视图。
+--- @param messages table 原始内部消息
+--- @param comp table|nil { checkpoint = table, replaced = number }
+--- @return table 请求视图消息数组
+local function _apply_overlay(messages, comp)
+  messages = messages or {}
+  if type(comp) ~= "table" or not comp.checkpoint or type(comp.replaced) ~= "number" or comp.replaced <= 0 then
+    return messages
+  end
+  local out = { comp.checkpoint }
+  local skipped = 0
+  for _, m in ipairs(messages) do
+    if skipped < comp.replaced then
+      if m and m.runtime_context then
+        -- 前缀内的运行态快照随被替换区间一并折叠（检查点已概括）
+      else
+        skipped = skipped + 1
+      end
+    else
+      out[#out + 1] = m
+    end
+  end
+  return out
+end
+
 -- ========== 公开 API ==========
 
 --- 从会话构建上下文消息列表
@@ -110,7 +137,9 @@ function M.build(session, opts)
   local max_history = opts.max_history
     or config_store.get("session.max_history_per_session")
     or 1000
-  local source = session.messages
+  -- 请求视图：应用会话持久化的压缩覆盖层（渲染仍用原始 session.messages）
+  local comp = session.metadata and session.metadata.compaction
+  local source = _apply_overlay(session.messages, comp)
   -- 截断历史（保留最近的 max_history 条非 system）
   local non_system = {}
   for _, m in ipairs(source) do
@@ -141,7 +170,7 @@ function M.build_from_agent(agent, opts)
   local max_history = opts.max_history
     or config_store.get("session.max_history_per_session")
     or 1000
-  local source = agent.messages or {}
+  local source = M.request_view(agent)
   local start = _history_start(source, max_history)
   for i = start, #source do
     messages[#messages + 1] = _to_api_message(source[i])
@@ -150,6 +179,15 @@ function M.build_from_agent(agent, opts)
     messages[#messages + 1] = { role = "user", content = opts.extra_user }
   end
   return _balance_tools(messages)
+end
+
+--- 构建 Agent 的请求视图：应用压缩覆盖层（若有）。
+--- 覆盖层仅影响发往模型的上下文；agent.messages 保持原始，供渲染与持久化。
+--- @param agent table Agent
+--- @return table 内部消息数组（原始或「检查点 + 尾部」）
+function M.request_view(agent)
+  if not agent then return {} end
+  return _apply_overlay(agent.messages, agent.compaction)
 end
 
 --- 将内部消息转换为 API 消息（与请求发送完全一致，压缩回放保证字节一致）

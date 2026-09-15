@@ -977,6 +977,7 @@ tests.suite("chat_ui", function(_, it)
         t.true_(text:find("快捷键", 1, true) ~= nil, "应包含快捷键提示行")
         t.true_(text:find("回车", 1, true) ~= nil, "应提示回车允许一次")
         t.true_(text:find("允许所有", 1, true) ~= nil, "应提示允许所有")
+        t.true_(text:find("加入工作目录", 1, true) ~= nil, "应提示加入工作目录")
         t.true_(text:find("Esc", 1, true) ~= nil, "应提示 Esc 取消")
         break
       end
@@ -1050,6 +1051,21 @@ tests.suite("chat_ui", function(_, it)
     t.not_nil(map_esc.callback, "普通模式应注册 Esc 映射")
     map_esc.callback()
     t.true_(cancelled, "按 Esc 应取消")
+
+    -- D = 允许并加入工作目录
+    local added = false
+    tool_approval.show({
+      text = "工具: edit_file",
+      tool_name = "edit_file",
+      on_confirm = function() end,
+      on_cancel = function() end,
+      on_confirm_all = function() end,
+      on_add_to_workspace = function() added = true end,
+    })
+    local map_d = vim.fn.maparg("D", "n", false, true)
+    t.not_nil(map_d.callback, "普通模式应注册 D 映射")
+    map_d.callback()
+    t.true_(added, "按 D 应触发加入工作目录")
 
     tool_approval.reset()
   end)

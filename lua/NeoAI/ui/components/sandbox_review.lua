@@ -7,6 +7,7 @@
 --- 经 kernel.services.use 获取 sandbox 服务，缺失时降级提示。
 
 local services = require("NeoAI.kernel.services")
+local fs = require("NeoAI.utils.fs")
 
 local M = {}
 
@@ -25,7 +26,10 @@ local LEVEL_HL = {
   risk3 = "NeoAISandboxReviewRisk3",
 }
 
-local LEGEND = "级别：工作区(绿) 用户目录(黄) 系统(红)  风险：L0低危/L1中危/L2·L3高危  ⚠密钥操作(红)   |   <CR> 应用该文件   d 拒绝该文件   i 预览修改diff   r 刷新   q 关闭"
+local LEGEND = "级别：工作区(绿) 用户目录(黄) 系统(红)  风险：L0低危/L1中危/L2·L3高危  ⚠密钥操作(红)   |   <CR> 头行=整包应用 / 文件行=应用该文件   d 拒绝该文件   i 预览修改diff   r 刷新   q 关闭"
+
+-- L3 后果警告高亮组（diff 预览顶部）
+local L3_WARN_HL = "NeoAISandboxReviewL3Warning"
 
 -- ========== 私有状态 ==========
 
@@ -38,7 +42,9 @@ local state = {
   last_target = nil, -- { change_set_id, path? } 关闭时光标所在条目（优先恢复）
   geom = nil, -- { col, row, width, height } 窗口几何，重开时恢复
   suspended = false, -- 是否因查看 diff 临时关闭（关闭 diff 后自动重开审批窗）
-  diff = nil, -- { win, buf } 当前 diff 预览窗口
+  diff = nil, -- { win, buf, ns, mode, warn_start, warn_end, diff_start, width } 当前 diff 预览窗口
+  pending_l3 = nil, -- { change_set_id, path } L3 二次确认中待应用的条目
+  l3_seq = 0, -- L3 警告生成序号：关闭/重开 diff 后作废过期结果
 }
 
 -- 安全级别 -> 中文风险档（高危 / 中危 / 低危）
@@ -64,6 +70,7 @@ local function _ensure_hl()
   vim.api.nvim_set_hl(0, LEVEL_HL.risk1, { default = true, fg = "#e5c07b", bold = true })
   vim.api.nvim_set_hl(0, LEVEL_HL.risk2, { default = true, fg = "#e06c75", bold = true })
   vim.api.nvim_set_hl(0, LEVEL_HL.risk3, { default = true, fg = "#ff5555", bold = true, underline = true })
+  vim.api.nvim_set_hl(0, L3_WARN_HL, { default = true, fg = "#ff5555", bold = true })
 end
 
 --- 安全级别 -> 高亮键
@@ -89,8 +96,7 @@ end
 --- @param p string
 --- @return string
 local function _norm(p)
-  local abs = vim.fn.fnamemodify(vim.fn.expand(p), ":p")
-  return (abs:gsub("/+$", ""))
+  return fs.canonical(p)
 end
 
 --- path 是否位于 base 之下（含相等）
@@ -117,8 +123,9 @@ end
 
 --- 构建展示行与高亮标记（纯函数，测试用）
 --- @param items table list_reviews 结果数组
+--- @param traces table|nil 越界访问留痕数组（sandbox.list_traces）
 --- @return table { lines, marks, line_to_target }
-function M.build_lines(items)
+function M.build_lines(items, traces)
   local lines = { LEGEND, "" }
   local marks = {}
   local line_to_target = {}
@@ -154,19 +161,42 @@ function M.build_lines(items)
       files = {}
       for _, p in ipairs(item.write_set or {}) do files[#files + 1] = { path = p } end
     end
-    local base = _one_line(string.format("[%s] %s%s%s（%d 个文件）  ", item.change_set_id, item.tool or "?", badge, risk_badge, #files))
+    -- 包安装：标注管理器与包名（按安装命令合并为一个审批单元）。
+    local pkg = ""
+    if item.package then
+      local mgr = item.package_manager
+      local names = item.package_names
+      if mgr and type(names) == "table" and #names > 0 then
+        pkg = string.format("包安装 %s: %s，", mgr, _one_line(table.concat(names, ", ")))
+      elseif mgr then
+        pkg = string.format("包安装 %s，", mgr)
+      else
+        pkg = "包安装，"
+      end
+    end
+    local base = _one_line(string.format("[%s] %s%s%s（%s%d 个文件）  ", item.change_set_id, item.tool or "?", badge, risk_badge, pkg, #files))
     local hln = #lines + 1
     lines[#lines + 1] = base .. "待审"
     -- 「待审」标签黄色高亮
     marks[#marks + 1] = { line = hln, start_col = #base, end_col = #base + #"待审", level = "pending" }
+    -- 头行 = 整单元审批入口：<CR> 一次应用该变更单元的全部文件
+    -- （包安装按安装命令合并，整包一次审批，无需逐文件确认）。
+    line_to_target[hln] = { change_set_id = item.change_set_id, whole = true }
     -- 安全级徽标按级别着色
     if risk_badge ~= "" then
       local rb = base:find("%[L%d%]", 1)
       if rb then marks[#marks + 1] = { line = hln, start_col = rb - 1, end_col = rb + 2, level = _risk_hl(item.risk_level) } end
     end
-    -- 密钥防护警告：该变更涉及被加密映射的密钥（token 操作），红色醒目提示。
+    -- 密钥防护警告：该变更涉及被加密映射的密钥（token）或敏感环境变量名，红色醒目提示。
     if item.secret_warning and (item.secret_warning.count or 0) > 0 then
-      local warn = string.format("  ⚠ 密钥操作×%d（内容含加密 token，应用时还原）", item.secret_warning.count)
+      local sw = item.secret_warning
+      local detail = "内容含加密 token，应用时还原"
+      local ntok = (sw.tokens and #sw.tokens or 0)
+      local nname = (sw.names and #sw.names or 0)
+      if ntok == 0 and nname > 0 then
+        detail = "涉及密钥环境变量：" .. _one_line(table.concat(sw.names, ", "))
+      end
+      local warn = string.format("  ⚠ 密钥操作×%d（%s）", sw.count, detail)
       lines[#lines + 1] = warn
       marks[#marks + 1] = { line = #lines, start_col = 0, end_col = #warn, level = "secret" }
     end
@@ -176,7 +206,7 @@ function M.build_lines(items)
       lines[#lines + 1] = reason
       marks[#marks + 1] = { line = #lines, start_col = 0, end_col = #reason, level = _risk_hl(item.risk_level) }
     end
-    -- 头行为信息行，不参与审批；审批单位为下方单个文件行。
+    -- 头行 = 整单元审批；下方文件行为单文件审批（可选择性只应用某个文件）。
 
     for _, f in ipairs(files) do
       local path = _one_line(f.path or tostring(f))
@@ -190,6 +220,21 @@ function M.build_lines(items)
     lines[#lines + 1] = ""
     end
   end
+  -- 越界访问留痕（read_all 下访问 cwd 之外用户工作目录；仅记录，非阻塞）。
+  if traces and #traces > 0 then
+    local head = "── 越界访问留痕（工作区外，仅记录）──"
+    lines[#lines + 1] = head
+    for _, tr in ipairs(traces) do
+      local path = _one_line(tr.path or "")
+      local tool = _one_line(tr.tool or "?")
+      local text = string.format("  [%s] %s", tool, path)
+      local ln = #lines + 1
+      lines[#lines + 1] = text
+      local start_col = 2 + #tool + 3
+      marks[#marks + 1] = { line = ln, start_col = start_col, end_col = start_col + #path, level = M.level_of(path) }
+    end
+    lines[#lines + 1] = ""
+  end
   -- 防御：任何元素都必须是单行字符串，否则 nvim_buf_set_lines 会报 E5108。
   for i = 1, #lines do
     if type(lines[i]) ~= "string" then lines[i] = _one_line(lines[i]) end
@@ -198,7 +243,33 @@ function M.build_lines(items)
   return { lines = lines, marks = marks, line_to_target = line_to_target }
 end
 
---- 应用光标所在文件（审批单位为单个文件）
+-- 前向声明（定义见下方 diff 预览区）
+local _find_item
+local _open_l3_confirm
+
+--- 执行一次文件级应用（不刷新界面）
+--- @param target table { change_set_id, path, host_op? }
+--- @return table|nil sandbox.apply 结果
+local function _do_apply(target)
+  local sandbox = services.use("services.sandbox")
+  if not sandbox then return nil end
+  -- 主机操作 / 整单元（头行）：应用全部文件；文件行：仅应用该文件。
+  if target.host_op or target.whole then
+    return sandbox.apply(target.change_set_id, { auto_approve = true })
+  end
+  return sandbox.apply(target.change_set_id, { auto_approve = true, files = { target.path } })
+end
+
+--- L3 二次确认门禁是否开启
+--- @return boolean
+local function _l3_gate_enabled()
+  local config_store = require("NeoAI.kernel.config_store")
+  return config_store.get("tools.sandbox.review.l3_warning.enabled") ~= false
+end
+
+--- 应用光标所在文件（审批单位为单个文件）。
+--- L3（critical）条目首次 <CR> 不直接应用：由 AI 生成后果警告并自动打开 diff，
+--- 用户在 diff 内再次确认后才真正应用（q/Esc 取消）。
 local function _apply_current()
   local target = state.line_to_target[vim.api.nvim_win_get_cursor(0)[1]]
   if not target then
@@ -209,7 +280,7 @@ local function _apply_current()
   if not sandbox then return end
   -- 主机操作提案：整条审批后在主机 replay
   if target.host_op then
-    local res = sandbox.apply(target.change_set_id, { auto_approve = true })
+    local res = _do_apply(target)
     if res and res.ok then
       vim.notify(("[NeoAI] 已执行主机操作 %s"):format(target.change_set_id), vim.log.levels.WARN)
     else
@@ -219,11 +290,34 @@ local function _apply_current()
     M.refresh()
     return
   end
+  -- 整单元（头行）：一次应用该变更单元的全部文件（包安装按安装命令合并，整包一次审批）。
+  local item = _find_item(target.change_set_id)
+  if target.whole then
+    if _l3_gate_enabled() and item and (tonumber(item.risk_level) or 0) >= 3 then
+      _open_l3_confirm(target, item)
+      return
+    end
+    local res = _do_apply(target)
+    if res and res.ok then
+      vim.notify(("[NeoAI] 已应用 %s（整包 %d 个文件）"):format(target.change_set_id, #(item and item.files or {})),
+        vim.log.levels.INFO)
+    else
+      vim.notify(("[NeoAI] 应用失败(%s): %s"):format(tostring(res and res.state), tostring(res and res.reason)),
+        vim.log.levels.ERROR)
+    end
+    M.refresh()
+    return
+  end
   if not target.path then
     vim.notify("[NeoAI] 请将光标移到要应用的文件行", vim.log.levels.WARN)
     return
   end
-  local res = sandbox.apply(target.change_set_id, { auto_approve = true, files = { target.path } })
+  -- L3 二次确认门禁
+  if _l3_gate_enabled() and item and (tonumber(item.risk_level) or 0) >= 3 then
+    _open_l3_confirm(target, item)
+    return
+  end
+  local res = _do_apply(target)
   if res and res.ok then
     vim.notify(("[NeoAI] 已应用 %s %s"):format(target.change_set_id, target.path), vim.log.levels.INFO)
   else
@@ -245,6 +339,12 @@ local function _reject_current()
   if target.host_op then
     sandbox.reject(target.change_set_id)
     vim.notify(("[NeoAI] 已拒绝主机操作 %s"):format(target.change_set_id), vim.log.levels.INFO)
+    M.refresh()
+    return
+  end
+  if target.whole then
+    sandbox.reject(target.change_set_id)
+    vim.notify(("[NeoAI] 已拒绝 %s（整包）"):format(target.change_set_id), vim.log.levels.INFO)
     M.refresh()
     return
   end
@@ -277,7 +377,7 @@ end
 --- 在待审队列中查找变更单元
 --- @param change_set_id string
 --- @return table|nil
-local function _find_item(change_set_id)
+_find_item = function(change_set_id)
   local sandbox = services.use("services.sandbox")
   if not sandbox then return nil end
   for _, it in ipairs(sandbox.list_reviews({ review_state = "PENDING" })) do
@@ -315,8 +415,10 @@ end
 --- @param buf number
 --- @param ns number
 --- @param lines table
-local function _paint_diff(buf, ns, lines)
-  for i, l in ipairs(lines) do
+--- @param start_idx number|nil 起始行（1-based，默认 1；警告区不计入）
+local function _paint_diff(buf, ns, lines, start_idx)
+  for i = start_idx or 1, #lines do
+    local l = lines[i]
     local hl
     if l:sub(1, 1) == "+" and l:sub(1, 3) ~= "+++" then
       hl = "diffAdded"
@@ -335,6 +437,8 @@ local function _close_diff()
   local reopen = state.suspended
   state.diff = nil
   state.suspended = false
+  state.pending_l3 = nil
+  state.l3_seq = state.l3_seq + 1 -- 作废过期的 AI 警告结果
   if d then
     if d.win and vim.api.nvim_win_is_valid(d.win) then
       pcall(vim.api.nvim_win_close, d.win, true)
@@ -346,6 +450,176 @@ local function _close_diff()
   if reopen then
     M.open()
   end
+end
+
+--- 硬换行：按显示宽度切分单行文本（CJK 按 2 列计）
+--- @param s string
+--- @param width number
+--- @return table 行数组
+local function _wrap(s, width)
+  width = math.max(10, width or 80)
+  local out = {}
+  local n = vim.fn.strchars(s)
+  local i = 0
+  while i < n do
+    local part, w = "", 0
+    while i < n and w < width do
+      local ch = vim.fn.strcharpart(s, i, 1)
+      local cw = vim.fn.strdisplaywidth(ch)
+      if w + cw > width and w > 0 then break end
+      part, w, i = part .. ch, w + cw, i + 1
+    end
+    out[#out + 1] = part
+  end
+  if #out == 0 then out[1] = "" end
+  return out
+end
+
+--- 构造 L3 警告区行（含标题；pending 时显示占位）
+--- @param text string|nil
+--- @param pending boolean
+--- @param width number
+--- @return table
+local function _warning_lines(text, pending, width)
+  local out = { "⚠ L3 严重风险操作 — 后果警告" }
+  if pending then
+    out[#out + 1] = "（正在生成后果警告…）"
+    return out
+  end
+  if type(text) ~= "string" or text:gsub("%s", "") == "" then
+    out[#out + 1] = "（无警告内容）"
+    return out
+  end
+  for _, para in ipairs(vim.split(text, "\n", { plain = true })) do
+    if para == "" then
+      out[#out + 1] = ""
+    else
+      for _, l in ipairs(_wrap(para, width)) do out[#out + 1] = l end
+    end
+  end
+  return out
+end
+
+--- 为 L3 警告区着色
+--- @param buf number
+--- @param ns number
+--- @param start0 number|nil 0-based 起始行
+--- @param count number|nil 行数
+local function _paint_warning(buf, ns, start0, count)
+  if start0 == nil or count == nil then return end
+  for i = 0, count - 1 do
+    pcall(vim.api.nvim_buf_add_highlight, buf, ns, L3_WARN_HL, start0 + i, 0, -1)
+  end
+end
+
+--- 更新已打开 diff 的警告区（AI 异步返回后调用）
+--- @param text string
+local function _set_diff_warning(text)
+  local d = state.diff
+  if not d or not d.buf or not vim.api.nvim_buf_is_valid(d.buf) then return end
+  if d.mode ~= "l3_confirm" or d.warn_start == nil then return end
+  local wl = _warning_lines(text, false, (d.width or 80) - 4)
+  vim.bo[d.buf].modifiable = true
+  vim.api.nvim_buf_set_lines(d.buf, d.warn_start, d.warn_end, false, wl)
+  vim.bo[d.buf].modifiable = false
+  d.warn_end = d.warn_start + #wl
+  local lines = vim.api.nvim_buf_get_lines(d.buf, 0, -1, false)
+  vim.api.nvim_buf_clear_namespace(d.buf, d.ns, 0, -1)
+  _paint_warning(d.buf, d.ns, d.warn_start, #wl)
+  _paint_diff(d.buf, d.ns, lines, d.diff_start)
+end
+
+--- 构建预览内容：标题 / 修改前 / 修改后
+--- @param target table
+--- @param item table
+--- @return string title
+--- @return string before
+--- @return string after
+local function _preview_data(target, item)
+  local level = item.risk_level
+  if target.host_op then
+    return "主机操作 · " .. _risk_label(level), "", (item.write_set and item.write_set[1]) or "?"
+  end
+  local f = _find_file(item, target.path)
+  local action = f and f.action or "modify"
+  local before = (action == "create" or action == "mkdir") and "" or _read_file(target.path)
+  local after = (action == "delete" or action == "rmdir") and "" or ((f and f.content) or "")
+  -- 预览给用户看：token 还原为真实密钥（best-effort）。
+  pcall(function()
+    local restored = require("NeoAI.sandbox.secret").detokenize(after)
+    if restored ~= nil then after = restored end
+  end)
+  return string.format("%s · %s · %s", action, _risk_label(level), target.path), before, after
+end
+
+--- 打开 diff 预览窗口（可选 L3 二次确认模式）
+--- @param target table
+--- @param item table
+--- @param opts table|nil { mode?, on_confirm?, warning?, pending? }
+local function _open_diff(target, item, opts)
+  opts = opts or {}
+  local mode = opts.mode or "preview"
+  local title, before, after = _preview_data(target, item)
+
+  -- 暂时关闭审批窗（保留光标/几何，关闭 diff 后自动重开并恢复光标）
+  state.suspended = true
+  M.close()
+
+  local width = math.min(120, vim.o.columns - 8)
+  local lines = {
+    ("%s  %s"):format(mode == "l3_confirm" and "确认应用" or "修改预览", _one_line(title)),
+  }
+  if mode == "l3_confirm" then
+    lines[#lines + 1] = "<CR> 确认应用    q/Esc 取消    （+ 新增  - 删除）"
+  else
+    lines[#lines + 1] = "q/Esc 返回审批    （+ 新增  - 删除）"
+  end
+  lines[#lines + 1] = ""
+
+  local warn_start, warn_end
+  if mode == "l3_confirm" then
+    warn_start = #lines -- 0-based 起始（当前已有行数）
+    local wl = _warning_lines(opts.warning, opts.pending == true, width - 4)
+    for _, l in ipairs(wl) do lines[#lines + 1] = l end
+    warn_end = #lines
+    lines[#lines + 1] = ""
+  end
+  local diff_start = #lines + 1
+  for _, l in ipairs(_diff_lines(before, after)) do lines[#lines + 1] = l end
+
+  local buf = vim.api.nvim_create_buf(false, true)
+  vim.bo[buf].filetype = "neoai_sandbox_diff"
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+  vim.bo[buf].modifiable = false
+  local ns = vim.api.nvim_create_namespace("NeoAISandboxDiff")
+  _paint_warning(buf, ns, warn_start, warn_end and (warn_end - (warn_start or 0)) or nil)
+  _paint_diff(buf, ns, lines, diff_start)
+
+  local height = math.min(30, vim.o.lines - 6)
+  local win = vim.api.nvim_open_win(buf, true, {
+    relative = "editor",
+    width = width,
+    height = height,
+    col = math.floor((vim.o.columns - width) / 2),
+    row = math.floor((vim.o.lines - height) / 2),
+    style = "minimal",
+    border = "rounded",
+    title = mode == "l3_confirm" and "⚠ L3 确认应用" or "🔍 修改预览",
+    title_pos = "center",
+  })
+  vim.wo[win].wrap = true
+  vim.keymap.set("n", "q", function() _close_diff() end, { buffer = buf })
+  vim.keymap.set("n", "<Esc>", function() _close_diff() end, { buffer = buf })
+  if mode == "l3_confirm" and opts.on_confirm then
+    vim.keymap.set("n", "<CR>", function() opts.on_confirm() end, { buffer = buf })
+  end
+  vim.api.nvim_create_autocmd("BufWipeout", {
+    buffer = buf, once = true, callback = function() _close_diff() end,
+  })
+  state.diff = {
+    win = win, buf = buf, ns = ns, mode = mode,
+    warn_start = warn_start, warn_end = warn_end, diff_start = diff_start, width = width,
+  }
 end
 
 --- 打开一个临时 buffer 预览光标所在条目的修改 diff（暂时关闭审批窗，关闭后自动返回）
@@ -360,67 +634,51 @@ local function _open_diff_current()
     vim.notify("[NeoAI] 变更单元已不存在: " .. tostring(target.change_set_id), vim.log.levels.WARN)
     return
   end
-  local title, before, after
-  local level = item.risk_level
-  if target.host_op then
-    title = "主机操作 · " .. _risk_label(level)
-    before = ""
-    after = (item.write_set and item.write_set[1]) or "?"
-  else
-    if not target.path then
-      vim.notify("[NeoAI] 请将光标移到要预览的文件行", vim.log.levels.WARN)
-      return
-    end
-    local f = _find_file(item, target.path)
-    local action = f and f.action or "modify"
-    before = (action == "create" or action == "mkdir") and "" or _read_file(target.path)
-    after = (action == "delete" or action == "rmdir") and "" or ((f and f.content) or "")
-    -- 预览给用户看：token 还原为真实密钥（best-effort）。
-    pcall(function()
-      local restored = require("NeoAI.sandbox.secret").detokenize(after)
-      if restored ~= nil then after = restored end
-    end)
-    title = string.format("%s · %s · %s", action, _risk_label(level), target.path)
+  if not target.host_op and not target.path and not target.whole then
+    vim.notify("[NeoAI] 请将光标移到要预览的文件行", vim.log.levels.WARN)
+    return
   end
+  -- 整单元（头行）无具体 path：取首个文件作预览（应用仍为整单元）。
+  local path = target.path
+  if not path and item.files and item.files[1] then path = item.files[1].path end
+  _open_diff({ change_set_id = target.change_set_id, path = path, whole = target.whole, host_op = target.host_op },
+    item, { mode = "preview" })
+end
 
-  -- 暂时关闭审批窗（保留光标/几何，关闭 diff 后自动重开并恢复光标）
-  state.suspended = true
-  M.close()
+--- 二次确认后应用 L3 条目
+local function _confirm_l3()
+  local p = state.pending_l3
+  if not p then return end
+  state.pending_l3 = nil
+  local res = _do_apply(p)
+  if res and res.ok then
+    vim.notify(("[NeoAI] 已应用 %s %s"):format(p.change_set_id, p.path or ""), vim.log.levels.INFO)
+  else
+    vim.notify(("[NeoAI] 应用失败(%s): %s"):format(tostring(res and res.state), tostring(res and res.reason)),
+      vim.log.levels.ERROR)
+  end
+  _close_diff()
+end
 
-  local lines = {
-    ("修改预览  %s"):format(_one_line(title)),
-    "q/Esc 返回审批    （+ 新增  - 删除）",
-    "",
-  }
-  for _, l in ipairs(_diff_lines(before, after)) do lines[#lines + 1] = l end
-
-  local buf = vim.api.nvim_create_buf(false, true)
-  vim.bo[buf].filetype = "neoai_sandbox_diff"
-  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
-  vim.bo[buf].modifiable = false
-  local ns = vim.api.nvim_create_namespace("NeoAISandboxDiff")
-  _paint_diff(buf, ns, lines)
-
-  local width = math.min(120, vim.o.columns - 8)
-  local height = math.min(30, vim.o.lines - 6)
-  local win = vim.api.nvim_open_win(buf, true, {
-    relative = "editor",
-    width = width,
-    height = height,
-    col = math.floor((vim.o.columns - width) / 2),
-    row = math.floor((vim.o.lines - height) / 2),
-    style = "minimal",
-    border = "rounded",
-    title = "🔍 修改预览",
-    title_pos = "center",
-  })
-  vim.wo[win].wrap = true
-  vim.keymap.set("n", "q", function() _close_diff() end, { buffer = buf })
-  vim.keymap.set("n", "<Esc>", function() _close_diff() end, { buffer = buf })
-  vim.api.nvim_create_autocmd("BufWipeout", {
-    buffer = buf, once = true, callback = function() _close_diff() end,
-  })
-  state.diff = { win = win, buf = buf }
+--- 打开 L3 二次确认 diff 并异步生成 AI 后果警告
+--- @param target table
+--- @param item table
+_open_l3_confirm = function(target, item)
+  -- 整单元（头行）无具体 path：取首个文件作预览；应用仍按 target.whole 整单元。
+  local path = target.path
+  if not path and item and item.files and item.files[1] then path = item.files[1].path end
+  state.pending_l3 = { change_set_id = target.change_set_id, path = path, whole = target.whole }
+  _open_diff({ change_set_id = target.change_set_id, path = path, whole = target.whole, host_op = target.host_op },
+    item, { mode = "l3_confirm", on_confirm = _confirm_l3, pending = true })
+  state.l3_seq = state.l3_seq + 1
+  local seq = state.l3_seq
+  local l3 = require("NeoAI.sandbox.l3_warning")
+  l3.generate(item, target, function(text)
+    if seq ~= state.l3_seq then return end
+    local d = state.diff
+    if not d or d.mode ~= "l3_confirm" then return end
+    _set_diff_warning(text or l3.fallback(item, target))
+  end)
 end
 
 -- ========== 公开 API ==========
@@ -436,7 +694,8 @@ function M.open()
     M.refresh()
     return
   end
-  if #sandbox.list_reviews({ review_state = "PENDING" }) == 0 then
+  local traces = (sandbox.list_traces and sandbox.list_traces()) or {}
+  if #sandbox.list_reviews({ review_state = "PENDING" }) == 0 and #traces == 0 then
     vim.notify("[NeoAI] 无待审修改", vim.log.levels.INFO)
     return
   end
@@ -496,7 +755,8 @@ function M.refresh()
     end)
   end
   local items = sandbox.list_reviews({ review_state = "PENDING" })
-  if #items == 0 then
+  local traces = (sandbox.list_traces and sandbox.list_traces()) or {}
+  if #items == 0 and #traces == 0 then
     vim.notify("[NeoAI] 无待审修改", vim.log.levels.INFO)
     M.close()
     return
@@ -507,7 +767,7 @@ function M.refresh()
     if la ~= lb then return la > lb end
     return (a.created_at or 0) < (b.created_at or 0)
   end)
-  local data = M.build_lines(items)
+  local data = M.build_lines(items, traces)
   vim.api.nvim_buf_set_lines(state.buf, 0, -1, false, data.lines)
   state.line_to_target = data.line_to_target
   vim.api.nvim_buf_clear_namespace(state.buf, state.ns, 0, -1)

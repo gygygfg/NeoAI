@@ -20,7 +20,8 @@ local state = {
   peer_if = nil,  -- 沙箱侧 veth
   gw_ip = nil,
   sb_ip = nil,
-  fw_rule = false, -- 是否插入了宿主防火墙放行规则
+  fw_input = nil,   -- 宿主 INPUT 放行规则的参数（-i veth -d gw_ip -p tcp --dport 网关端口）
+  fw_forward = nil, -- 宿主 FORWARD 丢弃规则的参数（-i veth）
 }
 
 -- ========== 私有函数 ==========
@@ -111,16 +112,21 @@ function M.ensure()
   _ns_run(ns, { "ip", "link", "set", "lo", "up" })
   if not _ns_run(ns, { "ip", "route", "add", "default", "via", gw_ip }) then return fail("GATEWAY_ROUTE_FAILED") end
 
-  -- 宿主防火墙（如 ufw）默认丢弃来自 veth 的新连接；仅放行本网关接口的入站，
-  -- 并在 teardown 时移除。规则绑定具体接口名，接口删除后即失效，无残留影响。
-  if vim.fn.executable("iptables") == 1 then
-    if _run({ "iptables", "-I", "INPUT", "1", "-i", h, "-j", "ACCEPT" }) then
-      state.fw_rule = true
-    end
-  end
-
+  -- 启动网关（绑定 gw_ip:随机端口）后再按「目的地址 + 端口」放行，而非按接口全放行——
+  -- 后者会让 netns 直达宿主任意非 loopback 服务（绕过网关探针）。同时丢弃来自该 veth 的
+  -- 转发流量（宿主 ip_forward=1 时 netns 仍可能经宿主转发直达局域网/外网）。
   local addr, gerr = gateway.start(gw_ip, 0)
   if not addr then return fail("GATEWAY_START_FAILED: " .. tostring(gerr)) end
+  if vim.fn.executable("iptables") == 1 then
+    local in_rule = { "-i", h, "-d", gw_ip, "-p", "tcp", "--dport", tostring(addr.port), "-j", "ACCEPT" }
+    local fwd_rule = { "-i", h, "-j", "DROP" }
+    local in_args = { "iptables", "-I", "INPUT", "1" }
+    vim.list_extend(in_args, in_rule)
+    if _run(in_args) then state.fw_input = in_rule end
+    local fwd_args = { "iptables", "-I", "FORWARD", "1" }
+    vim.list_extend(fwd_args, fwd_rule)
+    if _run(fwd_args) then state.fw_forward = fwd_rule end
+  end
   state.gw_ip, state.sb_ip = gw_ip, sb_ip
   return { ns = ns, host = addr.host, port = addr.port }
 end
@@ -154,9 +160,17 @@ end
 --- 清理 netns/veth 与网关
 function M.teardown()
   gateway.stop()
-  if state.fw_rule and state.host_if then
-    pcall(vim.fn.system, { "iptables", "-D", "INPUT", "-i", state.host_if, "-j", "ACCEPT" })
-    state.fw_rule = false
+  if state.fw_input then
+    local args = { "iptables", "-D", "INPUT" }
+    vim.list_extend(args, state.fw_input)
+    pcall(vim.fn.system, args)
+    state.fw_input = nil
+  end
+  if state.fw_forward then
+    local args = { "iptables", "-D", "FORWARD" }
+    vim.list_extend(args, state.fw_forward)
+    pcall(vim.fn.system, args)
+    state.fw_forward = nil
   end
   if state.ns then
     pcall(vim.fn.system, { "ip", "netns", "del", state.ns })

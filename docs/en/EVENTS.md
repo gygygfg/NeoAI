@@ -232,9 +232,9 @@ All event constants are defined in `NeoAI.kernel.events`. They are listed below 
 
 | Constant | Value | When it fires | Key payload fields |
 | --- | --- | --- | --- |
-| `COMPACTION_STARTED` | `compaction:started` | Context compaction starts | `{ agent_id, estimated_tokens }` |
-| `COMPACTION_CHUNK` | `compaction:chunk` | A streamed summary chunk arrives | `{ agent_id, reasoning, content }` |
-| `COMPACTION_COMPLETED` | `compaction:completed` | Compaction completes | `{ agent_id, replaced, summary }` |
+| `COMPACTION_STARTED` | `compaction:started` | (reserved; no longer emitted by background compaction) | `{ agent_id, estimated_tokens }` |
+| `COMPACTION_CHUNK` | `compaction:chunk` | (reserved; no longer emitted by background compaction) | `{ agent_id, reasoning, content }` |
+| `COMPACTION_COMPLETED` | `compaction:completed` | Background compaction completes (writes the overlay) | `{ agent_id, replaced, summary }` |
 
 ### Plan Distillation
 
@@ -244,7 +244,8 @@ All event constants are defined in `NeoAI.kernel.events`. They are listed below 
 | `PLAN_DISTILL_CHUNK` | `plan_distill:chunk` | A streamed categorized-summary chunk arrives | `{ agent_id, reasoning, content }` |
 | `PLAN_DISTILLED` | `plan_distilled` | Distillation completes | `{ agent_id, replaced, summary }` |
 
-> During compaction / distillation, the UI opens the "🧬 Context Compaction / 🧬 Plan Distillation" floating window, showing the received reasoning and content in real time.
+> Context compaction is **asynchronous in the background and opens no window**: it no longer emits `COMPACTION_STARTED` / `COMPACTION_CHUNK` (constants reserved),
+> only `COMPACTION_COMPLETED`. Plan distillation still opens the "🧬 Plan Distillation" floating window and emits `PLAN_DISTILL_STARTED` / `PLAN_DISTILL_CHUNK`.
 
 ## 4. Event Subscription Best Practices
 

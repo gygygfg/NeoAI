@@ -38,6 +38,63 @@ local function _safe_id(id)
   return tostring(id):gsub("[^%w_%-]", "_")
 end
 
+--- 宿主逻辑 CPU 数（用于动态 CPU 配额）
+--- @return number
+local function _nproc()
+  local ok, cpus = pcall(vim.uv.cpus)
+  if ok and type(cpus) == "table" and #cpus > 0 then return #cpus end
+  local raw = vim.fn.system("nproc 2>/dev/null") or ""
+  local n = tonumber((raw:gsub("%s+$", "")))
+  return (n and n > 0) and n or 1
+end
+
+--- 宿主物理内存总量（字节；读取 /proc/meminfo）
+--- @return number
+local function _mem_total_bytes()
+  local f = io.open("/proc/meminfo", "r")
+  if not f then return 0 end
+  local total = 0
+  for line in f:lines() do
+    local kb = line:match("^MemTotal:%s*(%d+)%s*kB")
+    if kb then total = tonumber(kb) * 1024 break end
+  end
+  f:close()
+  return total or 0
+end
+
+--- 解析实际生效的资源限制：静态显式值优先，未设置时按宿主资源动态推导。
+--- @return table { memory_bytes, pids, cpu_max }
+function M.resolve_limits()
+  local cfg = require("NeoAI.kernel.config_store").get("tools.sandbox.limits") or {}
+  local out = {
+    memory_bytes = tonumber(cfg.memory_bytes) or 0,
+    pids = tonumber(cfg.pids) or 0,
+    cpu_max = tonumber(cfg.cpu_max) or 0,
+  }
+  if cfg.dynamic == false then return out end
+  -- 动态：内存取宿主总量的比例（受 memory_max_bytes 上限约束）
+  if out.memory_bytes <= 0 then
+    local total = _mem_total_bytes()
+    local ratio = tonumber(cfg.memory_ratio) or 0.5
+    local mb = math.floor(total * ratio)
+    local cap = tonumber(cfg.memory_max_bytes) or 0
+    if cap > 0 and (mb <= 0 or mb > cap) then mb = cap end
+    if mb > 0 then out.memory_bytes = mb end
+  end
+  -- 动态：PID 上限
+  if out.pids <= 0 then
+    local pm = tonumber(cfg.pids_max) or 2048
+    if pm > 0 then out.pids = pm end
+  end
+  -- 动态：CPU 配额取 min(宿主核数, cpu_cores_max) 个核
+  if out.cpu_max <= 0 then
+    local cores_max = tonumber(cfg.cpu_cores_max) or 4
+    local cores = math.min(_nproc(), math.max(1, cores_max))
+    if cores > 0 then out.cpu_max = cores * 100000 end
+  end
+  return out
+end
+
 -- ========== 公开 API ==========
 
 --- 探测 cgroup v2 能力
@@ -63,10 +120,11 @@ function M.capabilities()
   return state.caps
 end
 
---- 是否配置了资源限制
+--- 是否启用资源限制（动态默认开启；或任一静态限制 > 0）
 --- @return boolean
 function M.limits_configured()
   local limits = require("NeoAI.kernel.config_store").get("tools.sandbox.limits") or {}
+  if limits.dynamic ~= false then return true end
   return (limits.memory_bytes or 0) > 0 or (limits.pids or 0) > 0 or (limits.cpu_max or 0) > 0
 end
 
@@ -76,7 +134,7 @@ end
 --- @return table|nil handle
 --- @return string|nil err
 function M.prepare(attempt_id, limits)
-  limits = limits or {}
+  limits = limits or M.resolve_limits()
   local caps = M.capabilities()
   if not caps.available then
     return nil, "SANDBOX_CGROUP_UNAVAILABLE"

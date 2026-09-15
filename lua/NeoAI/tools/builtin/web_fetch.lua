@@ -22,6 +22,7 @@ local strx = require("NeoAI.utils.stringx")
 local config_store = require("NeoAI.kernel.config_store")
 local logger = require("NeoAI.kernel.logger")
 local helpers = require("NeoAI.tools.builtin.tool_helpers")
+local sandbox_exec = require("NeoAI.sandbox.exec")
 
 local M = {}
 
@@ -106,8 +107,9 @@ end
 --- @return string|nil
 local function _images_dir()
   if state.images_dir then return state.images_dir end
-  local base = vim.env.TMPDIR
-  if not base or base == "" then base = "/tmp" end
+  -- 位于宿主与沙箱同路径可见的共享目录：node 在沙箱内转存图片后，宿主侧可读取该路径
+  -- （供后续 read_image 使用），且不暴露宿主 /tmp。
+  local base = sandbox_exec.ensure_shared()
   local template = fs.join(base, IMAGES_TMP_PREFIX .. "XXXXXX")
   local out = vim.fn.system({ "mktemp", "-d", template })
   if vim.v.shell_error ~= 0 then
@@ -208,74 +210,23 @@ end
 
 -- ========== 私有函数：进程执行 ==========
 
---- 执行 bash 脚本（jobstart，非缓冲输出；支持超时与取消）。
---- 始终 resolve 结果表；仅进程无法启动时 reject。
+--- 执行 bash 脚本（统一经沙箱：overlay 暂存安装/缓存目录 → 冻结候选；支持超时与取消）。
+--- 始终 resolve 结果表；仅进程无法启动/被拒时 reject。
 --- @param script string bash 脚本内容
 --- @param opts table { timeout_ms?, signal? }
 --- @return Deferred resolve({ code, stdout, stderr, timed_out?, aborted?, message? })
 local function _run_bash(script, opts)
   opts = opts or {}
-  local d = async.Deferred.new()
-  local stdout_chunks = {}
-  local stderr_chunks = {}
-  local done = false
-  local job
-  local timeout_ms = opts.timeout_ms or 30000
-
-  local function snapshot()
-    return table.concat(stdout_chunks, ""), table.concat(stderr_chunks, "")
-  end
-
-  local unsub = function() end
-
-  local function settle(result)
-    if done then return end
-    done = true
-    unsub()
-    d:resolve(result)
-  end
-
-  if opts.signal then
-    unsub = opts.signal:subscribe(function(reason)
-      if job then pcall(vim.fn.jobstop, job) end
-      local out, errout = snapshot()
-      settle({ code = -1, stdout = out, stderr = errout, aborted = true, message = reason })
-    end)
-  end
-
-  if timeout_ms > 0 then
-    vim.defer_fn(function()
-      if done then return end
-      if job then pcall(vim.fn.jobstop, job) end
-      local out, errout = snapshot()
-      settle({ code = -1, stdout = out, stderr = errout, timed_out = true })
-    end, timeout_ms)
-  end
-
-  job = vim.fn.jobstart({ "bash", "-c", script }, {
-    stdout_buffered = false,
-    stderr_buffered = false,
-    on_stdout = function(_, data)
-      if data and #data > 0 then
-        stdout_chunks[#stdout_chunks + 1] = table.concat(data, "\n")
-      end
-    end,
-    on_stderr = function(_, data)
-      if data and #data > 0 then
-        stderr_chunks[#stderr_chunks + 1] = table.concat(data, "\n")
-      end
-    end,
-    on_exit = function(_, code)
-      local out, errout = snapshot()
-      settle({ code = code, stdout = out, stderr = errout })
-    end,
+  -- 工具自身安装/缓存目录与共享临时目录作为可写根：写入经 overlay 暂存并冻结为候选，
+  -- 不直接落盘；node/npm 仍能在会话 overlay 内看到自己写入的内容。
+  return sandbox_exec.run({ "bash", "-c", script }, {
+    name = "web_fetch",
+    writable_roots = { _install_dir(), sandbox_exec.shared_root() },
+    network = true,
+    timeout_ms = opts.timeout_ms or 30000,
+    signal = opts.signal,
+    command = script,
   })
-
-  if job <= 0 then
-    done = true
-    return async.reject({ kind = "web_fetch", message = "无法启动 bash 进程（请确认系统已安装 bash）" })
-  end
-  return d
 end
 
 --- bash 单引号安全包裹

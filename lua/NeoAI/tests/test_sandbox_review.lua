@@ -72,7 +72,7 @@ tests.suite("sandbox_review", function(_, it)
     end
   end)
 
-  it("build_lines 头行不参与审批，仅文件行可审批", function(t)
+  it("build_lines 头行=整单元审批，文件行=单文件审批", function(t)
     local sr = require("NeoAI.ui.components.sandbox_review")
     local cwd = vim.fn.getcwd()
     local data = sr.build_lines({
@@ -90,10 +90,63 @@ tests.suite("sandbox_review", function(_, it)
       if line:find("cs2", 1, true) then header_line = ln end
     end
     t.not_nil(header_line, "应有头行")
-    t.nil_(data.line_to_target[header_line], "头行（轮次）不应参与审批")
+    t.not_nil(data.line_to_target[header_line], "头行应参与整单元审批")
+    t.eq(true, data.line_to_target[header_line].whole, "头行应为整单元目标")
     local mapped = 0
     for _ in pairs(data.line_to_target) do mapped = mapped + 1 end
-    t.eq(2, mapped, "应只有两个文件行参与审批")
+    t.eq(3, mapped, "头行 + 两个文件行")
+  end)
+
+  it("build_lines 包安装标注管理器与包名", function(t)
+    local sr = require("NeoAI.ui.components.sandbox_review")
+    local cwd = vim.fn.getcwd()
+    local data = sr.build_lines({
+      {
+        change_set_id = "cs_pkg",
+        tool = "run_command",
+        package = true,
+        package_manager = "npm",
+        package_names = { "express", "lodash" },
+        files = { { path = cwd .. "/node_modules/express/index.js", action = "create" } },
+      },
+    })
+    local text = table.concat(data.lines, "\n")
+    t.true_(text:find("包安装 npm: express, lodash", 1, true) ~= nil, "头行应标注管理器与包名，实际: " .. text)
+  end)
+
+  it("build_lines 展示越界访问留痕区（仅记录）", function(t)
+    local sr = require("NeoAI.ui.components.sandbox_review")
+    local data = sr.build_lines({}, {
+      { trace_id = "t1", tool = "read_file", path = "/root/other/x.txt" },
+      { trace_id = "t2", tool = "run_command", path = "/root/proj2/y.lua" },
+    })
+    local text = table.concat(data.lines, "\n")
+    t.matches("越界访问留痕", text, "应展示留痕区标题")
+    t.true_(text:find("/root/other/x.txt", 1, true) ~= nil, "应展示越界路径")
+    t.true_(text:find("read_file", 1, true) ~= nil, "应展示工具名")
+    -- 留痕行不参与审批（无行映射）
+    for _, tgt in pairs(data.line_to_target) do
+      t.true_(tgt.change_set_id ~= nil, "留痕行不应映射为审批目标")
+    end
+  end)
+
+  it("open 仅有越界留痕时也能打开审批窗", function(t)
+    local services = require("NeoAI.kernel.services")
+    local sr = require("NeoAI.ui.components.sandbox_review")
+    sr.reset()
+    local saved = services.use("services.sandbox")
+    services.provide("services.sandbox", {
+      list_reviews = function() return {} end,
+      list_traces = function() return { { tool = "read_file", path = "/root/other/x.txt" } } end,
+      apply = function() return { ok = true } end,
+      reject = function() end,
+    })
+    sr.open()
+    t.not_nil(sr.get_buf(), "仅有留痕也应打开审批窗")
+    local text = table.concat(vim.api.nvim_buf_get_lines(sr.get_buf(), 0, -1, false), "\n")
+    t.matches("越界访问留痕", text, "应展示留痕区")
+    sr.close()
+    services.provide("services.sandbox", saved)
   end)
 
   it("open 渲染待审界面并应用高亮，apply 走文件级目标", function(t)
@@ -243,5 +296,171 @@ tests.suite("sandbox_review", function(_, it)
     sr.close()
     fs.delete_file(path)
     services.provide("services.sandbox", saved)
+  end)
+
+  it("L3 条目首次 <CR> 打开 AI 警告 diff，二次确认后才应用", function(t)
+    local services = require("NeoAI.kernel.services")
+    local sr = require("NeoAI.ui.components.sandbox_review")
+    local l3 = require("NeoAI.sandbox.l3_warning")
+    sr.reset()
+    l3.reset()
+    l3.set_generator(function(_, _, on_done) on_done("这是 AI 生成的后果警告") end)
+    local saved = services.use("services.sandbox")
+    local cwd = vim.fn.getcwd()
+    local path = cwd .. "/l3.txt"
+    local fs = require("NeoAI.utils.fs")
+    fs.write_file(path, "old\n")
+    local applied = {}
+    services.provide("services.sandbox", {
+      list_reviews = function()
+        return {
+          {
+            change_set_id = "csL3", tool = "edit_file", risk_level = 3,
+            risk_name = "critical", risk_reasons = { "SYSTEM_PATH_WRITE" },
+            files = { { path = path, action = "modify", content = "new\n" } },
+          },
+        }
+      end,
+      apply = function(id, opts) applied[#applied + 1] = { id, opts }; return { ok = true } end,
+      reject = function() end,
+      reject_file = function() end,
+    })
+
+    sr.open()
+    local buf = sr.get_buf()
+    local file_line
+    for ln, target in pairs(sr.get_line_map()) do
+      if target.path == path then file_line = ln end
+    end
+    vim.api.nvim_win_set_cursor(0, { file_line, 0 })
+
+    local cr
+    for _, m in ipairs(vim.api.nvim_buf_get_keymap(buf, "n")) do
+      if m.lhs == "<CR>" then cr = m.callback end
+    end
+    t.not_nil(cr, "应注册 <CR> 应用键")
+    cr()
+    t.eq(0, #applied, "L3 首次 <CR> 不应直接应用")
+    local dbuf = sr.get_diff_buf()
+    t.not_nil(dbuf, "L3 应自动打开 diff 预览")
+    local dtext = table.concat(vim.api.nvim_buf_get_lines(dbuf, 0, -1, false), "\n")
+    t.matches("L3 严重风险操作", dtext, "diff 顶部应展示 L3 警告标题")
+    t.matches("这是 AI 生成的后果警告", dtext, "应展示 AI 生成的警告文本")
+    t.matches("确认应用", dtext, "应提示二次确认")
+
+    local dcr
+    for _, m in ipairs(vim.api.nvim_buf_get_keymap(dbuf, "n")) do
+      if m.lhs == "<CR>" then dcr = m.callback end
+    end
+    t.not_nil(dcr, "diff 内应注册 <CR> 确认键")
+    dcr()
+    t.eq(1, #applied, "二次确认后应应用一次")
+    t.eq("csL3", applied[1][1])
+    t.eq(path, applied[1][2].files[1])
+
+    sr.close()
+    l3.reset()
+    fs.delete_file(path)
+    services.provide("services.sandbox", saved)
+  end)
+
+  it("L3 警告 diff 内 q 取消不应用", function(t)
+    local services = require("NeoAI.kernel.services")
+    local sr = require("NeoAI.ui.components.sandbox_review")
+    local l3 = require("NeoAI.sandbox.l3_warning")
+    sr.reset()
+    l3.reset()
+    l3.set_generator(function(_, _, on_done) on_done("警告") end)
+    local saved = services.use("services.sandbox")
+    local cwd = vim.fn.getcwd()
+    local path = cwd .. "/l3cancel.txt"
+    local fs = require("NeoAI.utils.fs")
+    fs.write_file(path, "old\n")
+    local applied = 0
+    services.provide("services.sandbox", {
+      list_reviews = function()
+        return {
+          {
+            change_set_id = "csL3c", tool = "edit_file", risk_level = 3,
+            files = { { path = path, action = "modify", content = "new\n" } },
+          },
+        }
+      end,
+      apply = function() applied = applied + 1; return { ok = true } end,
+      reject = function() end,
+      reject_file = function() end,
+    })
+
+    sr.open()
+    local buf = sr.get_buf()
+    local file_line
+    for ln, target in pairs(sr.get_line_map()) do
+      if target.path == path then file_line = ln end
+    end
+    vim.api.nvim_win_set_cursor(0, { file_line, 0 })
+    for _, m in ipairs(vim.api.nvim_buf_get_keymap(buf, "n")) do
+      if m.lhs == "<CR>" then m.callback() end
+    end
+    local dbuf = sr.get_diff_buf()
+    t.not_nil(dbuf, "应打开 L3 diff")
+    for _, m in ipairs(vim.api.nvim_buf_get_keymap(dbuf, "n")) do
+      if m.lhs == "q" then m.callback() end
+    end
+    t.eq(0, applied, "取消后不应应用")
+    t.nil_(sr.get_diff_buf(), "diff 应已关闭")
+    t.not_nil(sr.get_buf(), "应返回审批窗")
+
+    sr.close()
+    l3.reset()
+    fs.delete_file(path)
+    services.provide("services.sandbox", saved)
+  end)
+
+  it("非 L3 条目 <CR> 直接应用（不触发二次确认）", function(t)
+    local services = require("NeoAI.kernel.services")
+    local sr = require("NeoAI.ui.components.sandbox_review")
+    sr.reset()
+    local saved = services.use("services.sandbox")
+    local cwd = vim.fn.getcwd()
+    local path = cwd .. "/l2.txt"
+    local applied = 0
+    services.provide("services.sandbox", {
+      list_reviews = function()
+        return {
+          {
+            change_set_id = "csL2", tool = "edit_file", risk_level = 2,
+            files = { { path = path, action = "modify", content = "new\n" } },
+          },
+        }
+      end,
+      apply = function() applied = applied + 1; return { ok = true } end,
+      reject = function() end,
+      reject_file = function() end,
+    })
+
+    sr.open()
+    local buf = sr.get_buf()
+    local file_line
+    for ln, target in pairs(sr.get_line_map()) do
+      if target.path == path then file_line = ln end
+    end
+    vim.api.nvim_win_set_cursor(0, { file_line, 0 })
+    for _, m in ipairs(vim.api.nvim_buf_get_keymap(buf, "n")) do
+      if m.lhs == "<CR>" then m.callback() end
+    end
+    t.eq(1, applied, "非 L3 应直接应用")
+    t.nil_(sr.get_diff_buf(), "非 L3 不应打开二次确认 diff")
+
+    sr.close()
+    services.provide("services.sandbox", saved)
+  end)
+
+  it("l3_warning.fallback 生成确定性警告", function(t)
+    local l3 = require("NeoAI.sandbox.l3_warning")
+    local w = l3.fallback(
+      { risk_name = "critical", risk_reasons = { "SYSTEM_PATH_WRITE" }, write_set = { "/etc/nginx.conf" } },
+      { path = "/etc/nginx.conf" })
+    t.matches("L3", w)
+    t.matches("/etc/nginx%.conf", w)
   end)
 end)

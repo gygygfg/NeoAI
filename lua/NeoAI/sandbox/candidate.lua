@@ -31,8 +31,11 @@ local function _sha(content)
   return ok and ("sha256:" .. hex) or "sha256:?"
 end
 
+--- 规范化真实路径：展开 ~/$VAR、绝对化、解析符号链接并折叠 `..`。
+--- 必须与内核打开文件时的解析一致，否则「风险分级/审批展示」与「实际写入」会分裂
+--- （例如 `x/../../../etc/cron.d/pwn` 被显示为工作区内 L0，却写到工作区外）。
 local function _abs(path)
-  return vim.fn.fnamemodify(fs.expand(path), ":p")
+  return fs.canonical(path)
 end
 
 local function _hash_key(path)
@@ -53,6 +56,15 @@ end
 local function _workspace_dir()
   local root = state.workspace_root or (vim.fn.stdpath("cache") .. "/NeoAI/sandbox")
   return root .. "/sessions/" .. (state.session_id or "default")
+end
+
+--- 把沙箱可写目录 chown 到载荷非 root uid（仅 root 启动且载荷非 root 时需要）。
+--- 否则非 root 载荷无法写入 overlay upper / 暂存目录（EROFS/EACCES）。
+--- @param path string
+local function _chown_payload(path)
+  pcall(function()
+    require("NeoAI.sandbox.runtime").chown_payload(path)
+  end)
 end
 
 --- 工作区暂存文件路径（每个真实路径一个稳定副本）。
@@ -90,6 +102,7 @@ local function _base_entry(attempt, real)
     -- 无论新建还是复制，都必须先确保暂存副本的父目录存在：
     -- 新建文件（base 不存在）时若不建目录，写入会报 ENOENT。
     fs.ensure_dir(vim.fn.fnamemodify(staged, ":h"))
+    _chown_payload(vim.fn.fnamemodify(staged, ":h"))
     if stat and stat.type == "file" then
       fs.copy_file(real, staged)
     end
@@ -136,6 +149,8 @@ function M.ensure_dirs(root)
   local base = state.workspace_root or (vim.fn.stdpath("cache") .. "/NeoAI/sandbox")
   fs.ensure_dir(base .. "/sessions")
   fs.ensure_dir(base .. "/workspace") -- 兼容旧布局
+  _chown_payload(base .. "/sessions")
+  _chown_payload(base .. "/workspace")
 end
 
 --- 当前沙箱会话目录（不存在时创建）
@@ -143,6 +158,7 @@ end
 function M.session_dir()
   M.begin_session()
   fs.ensure_dir(_workspace_dir())
+  _chown_payload(_workspace_dir())
   return _workspace_dir()
 end
 
@@ -160,6 +176,7 @@ function M.process_dir()
   M.begin_session()
   local dir = _process_base_host() .. "/" .. state.session_id
   fs.ensure_dir(dir)
+  _chown_payload(dir)
   state.process_dir_cache = dir
   return dir
 end
@@ -171,6 +188,7 @@ function M.begin_session()
   state.session_seq = state.session_seq + 1
   state.session_id = string.format("s%d_%d", os.time(), state.session_seq)
   fs.ensure_dir(_workspace_dir())
+  _chown_payload(_workspace_dir())
   return state.session_id
 end
 
@@ -221,6 +239,7 @@ function M.begin(attempt, root)
   M.begin_session()
   local dir = string.format("%s/attempts/%s", root, attempt.attempt_id)
   fs.ensure_dir(dir .. "/upper")
+  _chown_payload(dir)
   local record = { dir = dir, mapping = {}, attempt = attempt }
   state.attempts[attempt.attempt_id] = record
   return record
@@ -362,6 +381,15 @@ function M.invalidate(paths)
   end
 end
 
+--- 单文件纳入候选的大小上限（字节）：超过则不纳入候选，避免把 apt/pkgcache.bin、
+--- 缓存归档、镜像层等超大文件嵌入候选 JSON 而阻塞主线程 / 撑爆磁盘。0 = 不限制。
+--- @return number
+local function _max_file_bytes()
+  local n = tonumber(require("NeoAI.kernel.config_store").get("tools.sandbox.max_file_bytes"))
+  if n == nil then return 8 * 1024 * 1024 end
+  return n
+end
+
 --- 登记 overlay upper 中一条路径为候选条目（相对 real_root）
 --- @param attempt table
 --- @param real_root string
@@ -369,7 +397,30 @@ end
 --- @param child_rel string 相对 real_root 的路径
 local function _capture_entry(attempt, real_root, staged, child_rel)
   local real = real_root .. "/" .. child_rel
+  -- 仅由 materialize_overlay 带入 overlay 的 AI 暂存编辑（命令本身未改动）不产生候选：
+  -- 否则只读命令（ls/cat/git status 等）会把暂存编辑重复捕获为 run_command 候选并取代
+  -- 原 edit 候选；一旦该命令被拒绝，还会 invalidate 掉这条暂存编辑，表现为「已允许的
+  -- 修改被回滚」。内容与当前工作区暂存一致（或已标记删除）即视为未被命令改动。
+  local ws = state.workspace[real]
+  if ws then
+    if ws.deleted then return end
+    if ws.staged and fs.exists(ws.staged) then
+      local before = _read(ws.staged)
+      local after = _read(staged)
+      if before ~= nil and before == after then return end
+    end
+  end
   local stat = vim.uv.fs_stat(real)
+  local cap = _max_file_bytes()
+  local staged_stat = vim.uv.fs_stat(staged)
+  -- 超大普通文件不纳入候选（写入仍在 overlay 私有层，不落真实盘；只是不进入待审/发布）。
+  if cap > 0 and staged_stat and staged_stat.type == "file" and (staged_stat.size or 0) > cap then
+    pcall(function()
+      require("NeoAI.kernel.logger").warn(
+        "[sandbox] 跳过超大候选文件（%d 字节 > 上限 %d）：%s", staged_stat.size, cap, real)
+    end)
+    return
+  end
   attempt.mapping[real] = {
     real = real,
     staged = staged,
@@ -451,41 +502,50 @@ function M.finish(attempt_id)
   local attempt = state.attempts[attempt_id]
   if not attempt then return nil end
   local files = {}
+  local cap = _max_file_bytes()
   for real, entry in pairs(attempt.mapping) do
     local staged_stat = vim.uv.fs_stat(entry.staged)
-    local action, after_hash, content
-    if entry.base_type == "directory" then
-      if staged_stat and staged_stat.type == "directory" then
-        if not entry.base_exists then action = "mkdir" end
-      else
-        if entry.base_exists then action = "rmdir" end
-      end
+    -- 超大普通文件不纳入候选（避免读入内存 / 嵌入候选 JSON 阻塞主线程）。
+    if cap > 0 and staged_stat and staged_stat.type == "file" and (staged_stat.size or 0) > cap then
+      pcall(function()
+        require("NeoAI.kernel.logger").warn(
+          "[sandbox] 跳过超大候选文件（%d 字节 > 上限 %d）：%s", staged_stat.size, cap, real)
+      end)
     else
-      if staged_stat and staged_stat.type == "file" then
-        content = _read(entry.staged)
-        after_hash = _sha(content)
-        if not entry.base_exists then
-          action = "create"
-        elseif (entry.view_base_hash or entry.base_hash) ~= after_hash then
-          action = "modify"
+      local action, after_hash, content
+      if entry.base_type == "directory" then
+        if staged_stat and staged_stat.type == "directory" then
+          if not entry.base_exists then action = "mkdir" end
+        else
+          if entry.base_exists then action = "rmdir" end
         end
       else
-        if entry.base_exists then action = "delete" end
+        if staged_stat and staged_stat.type == "file" then
+          content = _read(entry.staged)
+          after_hash = _sha(content)
+          if not entry.base_exists then
+            action = "create"
+          elseif (entry.view_base_hash or entry.base_hash) ~= after_hash then
+            action = "modify"
+          end
+        else
+          if entry.base_exists then action = "delete" end
+        end
       end
-    end
-    if action then
-      -- 同步工作区暂存状态：删除态标记，使后续 read/list/search 一致地看不到该文件。
-      local ws = state.workspace[real]
-      if ws then ws.deleted = (action == "delete" or action == "rmdir") end
-      files[#files + 1] = {
-        path = real,
-        action = action,
-        before_hash = entry.base_hash,
-        after_hash = after_hash,
-        base_exists = entry.base_exists,
-        base_type = entry.base_type,
-        content = (action == "create" or action == "modify") and content or nil,
-      }
+      if action then
+        -- 同步工作区暂存状态：删除态标记，使后续 read/list/search 一致地看不到该文件。
+        local ws = state.workspace[real]
+        if ws then ws.deleted = (action == "delete" or action == "rmdir") end
+        files[#files + 1] = {
+          path = real,
+          action = action,
+          before_hash = entry.base_hash,
+          after_hash = after_hash,
+          base_exists = entry.base_exists,
+          base_type = entry.base_type,
+          content = (action == "create" or action == "modify") and content or nil,
+        }
+      end
     end
   end
   table.sort(files, function(a, b) return a.path < b.path end)
@@ -511,6 +571,23 @@ end
 --- @return table { ok, state, reason?, receipt? }
 function M.publish(candidate, opts)
   opts = opts or {}
+  -- 发布前校验（纵深防御）：候选路径可能来自落盘存储（本地可篡改）或旧版本记录。
+  -- 逐文件重规范化：若解析结果与记录的路径不一致（`..`/符号链接被引入或替换），
+  -- 或命中宿主敏感遮蔽路径，一律拒绝，绝不把内容写到未经验证的真实位置。
+  local runtime = require("NeoAI.sandbox.runtime")
+  for _, f in ipairs(candidate.files or {}) do
+    if type(f.path) ~= "string" or f.path == "" then
+      return { ok = false, state = "FAILED", reason = "INVALID_PATH" }
+    end
+    local canonical = _abs(f.path)
+    if canonical ~= f.path then
+      return { ok = false, state = "CONFLICT", reason = "PATH_CHANGED: " .. tostring(f.path) }
+    end
+    local masked = runtime.is_masked_path(canonical)
+    if masked then
+      return { ok = false, state = "FAILED", reason = "SANDBOX_MASKED_TARGET: " .. tostring(masked) }
+    end
+  end
   -- 冲突预检：任一文件真实状态偏离基线则整体拒绝
   for _, f in ipairs(candidate.files or {}) do
     local stat = vim.uv.fs_stat(f.path)
@@ -542,21 +619,30 @@ function M.publish(candidate, opts)
       end
     end
   end
-  -- 应用
+  -- 应用：统一经 writer（先非 root，权限不足 → NEEDS_ROOT，待用户批准 root 写入）。
+  local writer = require("NeoAI.sandbox.writer")
   for _, f in ipairs(candidate.files or {}) do
+    local action, content
     if f.action == "create" or f.action == "modify" then
-      fs.ensure_dir(vim.fn.fnamemodify(f.path, ":h"))
-      local content = (secret.detokenize(f.content or ""))
-      local ok, err = fs.write_file_atomic(f.path, content)
-      if not ok then
-        return { ok = false, state = "ROLLBACK_FAILED", reason = "WRITE_FAILED: " .. f.path .. " " .. tostring(err) }
-      end
+      action = "write"
+      content = (secret.detokenize(f.content or ""))
     elseif f.action == "mkdir" then
-      fs.ensure_dir(f.path)
+      action = "mkdir"
     elseif f.action == "delete" then
-      fs.delete_file(f.path)
+      action = "delete"
     elseif f.action == "rmdir" then
-      pcall(vim.fn.delete, f.path, "d")
+      action = "rmdir"
+    end
+    if action then
+      local res = writer.apply(action, f.path, content, { allow_root = opts.allow_root == true })
+      if res.state == writer.STATE.NEEDS_ROOT then
+        return { ok = false, state = "NEEDS_ROOT",
+          reason = res.reason or ("WRITE_REQUIRES_ROOT: " .. f.path) }
+      end
+      if not res.ok then
+        return { ok = false, state = "ROLLBACK_FAILED",
+          reason = "WRITE_FAILED: " .. f.path .. " " .. tostring(res.err) }
+      end
     end
   end
   -- 已发布到真实工作区：丢弃对应暂存副本，后续编辑重新以真实文件为基线。

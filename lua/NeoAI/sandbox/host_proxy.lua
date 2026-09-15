@@ -33,7 +33,43 @@ local function _strip_zone(ip)
   return (tostring(ip):gsub("%%.*$", ""))
 end
 
---- 宿主各网卡地址集合（回环 + inet/inet6）
+--- 将 IPv4-mapped IPv6（`::ffff:a.b.c.d`）归一为 IPv4，便于按数值判定。
+--- 内核把 v4-mapped 地址当 IPv4 处理，若只做字符串比较会漏判本机（`::ffff:127.0.0.1`）。
+--- @param ip string
+--- @return string
+local function _unmap_v4(ip)
+  local v4 = ip:match("^::ffff:(%d+%.%d+%.%d+%.%d+)$")
+  return v4 or ip
+end
+
+--- 规范化单个 IP 字面量：去 zone、小写、展开 v4-mapped。
+--- @param ip string
+--- @return string
+local function _canon_ip(ip)
+  return _unmap_v4(_strip_zone(ip):lower())
+end
+
+--- IPv4 字符串 -> 32 位整数；非法返回 nil
+--- @param ip string
+--- @return number|nil
+local function _ipv4_to_num(ip)
+  local a, b, c, d = ip:match("^(%d+)%.(%d+)%.(%d+)%.(%d+)$")
+  if not a then return nil end
+  a, b, c, d = tonumber(a), tonumber(b), tonumber(c), tonumber(d)
+  if a > 255 or b > 255 or c > 255 or d > 255 then return nil end
+  return ((a * 256 + b) * 256 + c) * 256 + d
+end
+
+--- IPv6 首个 hextet 数值（用于 fe80::/10 前缀判定）；无则 nil
+--- @param ip string
+--- @return number|nil
+local function _ipv6_first_hextet(ip)
+  local first = ip:match("^([0-9a-f]+)")
+  if not first then return nil end
+  return tonumber(first, 16)
+end
+
+--- 宿主各网卡地址集合（回环 + inet/inet6），键为规范化形式
 --- @return table ip -> true
 local function _host_addrs()
   if state.host_addrs then return state.host_addrs end
@@ -42,43 +78,40 @@ local function _host_addrs()
   if ok and type(lines) == "table" then
     for _, line in ipairs(lines) do
       local ip = line:match("inet6? ([%da-fA-F:%.]+)/")
-      if ip then set[_strip_zone(ip)] = true end
+      if ip then set[_canon_ip(ip)] = true end
     end
   end
   state.host_addrs = set
   return set
 end
 
---- IP 是否属于宿主本机 / 链路本地 / 元数据
+--- IP 是否属于宿主本机 / 链路本地 / 元数据（数值判定，含 v4-mapped）
 --- @param ip string
 --- @return boolean
 local function _ip_is_host_local(ip)
   if type(ip) ~= "string" or ip == "" then return false end
-  ip = _strip_zone(ip)
-  local lower = ip:lower()
-  if ip == "0.0.0.0" or lower == "::" then return true end
-  if ip:sub(1, 4) == "127." then return true end
-  if lower == "::1" then return true end
-  if ip:sub(1, 8) == "169.254." then return true end
-  if lower:sub(1, 5) == "fe80:" then return true end
+  ip = _canon_ip(ip)
+  local n = _ipv4_to_num(ip)
+  if n then
+    if n == 0 then return true end -- 0.0.0.0（connect 即 loopback）
+    if math.floor(n / 0x1000000) == 127 then return true end -- 127/8
+    if math.floor(n / 0x10000) == 0xA9FE then return true end -- 169.254/16（含云元数据）
+  else
+    if ip == "::" or ip == "::1" then return true end
+    local h = _ipv6_first_hextet(ip)
+    if h and h >= 0xfe80 and h <= 0xfebf then return true end -- fe80::/10
+  end
   if _host_addrs()[ip] then return true end
   return false
 end
 
---- @param host string
---- @return boolean
-local function _is_ip_literal(host)
-  if host:match("^%d+%.%d+%.%d+%.%d+$") then return true end
-  if host:find(":", 1, true) then return true end
-  return false
-end
-
---- 解析主机名（同步）。IP 字面量直接返回自身。
+--- 解析主机名为规范化 IP 列表（同步，含 IP 字面量）。
+--- 统一经 getaddrinfo：它把八进制/十六进制/短式 IPv4 与全展开 IPv6 全部规范化为标准形式，
+--- 避免「字面量字符串比较」与「连接时内核解析」不一致造成的绕过。
 --- @param host string
 --- @return table ip 字符串数组
 local function _resolve(host)
   local out = {}
-  if _is_ip_literal(host) then out[1] = host; return out end
   local ok, res = pcall(vim.uv.getaddrinfo, host, nil, { socktype = "stream" })
   if ok and type(res) == "table" then
     for _, a in ipairs(res) do
@@ -88,21 +121,32 @@ local function _resolve(host)
   return out
 end
 
---- 目标是否宿主本机（域名会先解析，防 DNS rebinding 到本机）
+--- 判定目标并返回已解析 IP（**只解析一次**，连接复用同一批 IP，防 DNS rebinding）。
+--- 无法解析（含字面量解析失败）时按 fail-closed 视为本机拒绝。
+--- @param host string
+--- @return boolean is_host_local
+--- @return table ips 规范化 IP 数组（本地/解析失败时可能为空）
+local function _classify(host)
+  if type(host) ~= "string" or host == "" then return true, {} end
+  host = host:gsub("^%[", ""):gsub("%]$", "")
+  local lower = host:lower()
+  if lower == "localhost" or lower:sub(-10) == ".localhost" then return true, {} end
+  if state.opts.host_local_fn then return state.opts.host_local_fn(host) == true, {} end
+  local ips = _resolve(host)
+  if #ips == 0 then return true, {} end -- 解析失败：无法证明非本机，fail-closed
+  for _, ip in ipairs(ips) do
+    if _ip_is_host_local(ip) then return true, ips end
+  end
+  return false, ips
+end
+
+--- 目标是否宿主本机
 --- @param host string
 --- @return boolean
 local function _is_host_local(host)
-  if type(host) ~= "string" or host == "" then return false end
-  host = host:gsub("^%[", ""):gsub("%]$", "")
-  local lower = host:lower()
-  if lower == "localhost" or lower:sub(-10) == ".localhost" then return true end
-  if state.opts.host_local_fn then return state.opts.host_local_fn(host) == true end
-  if _is_ip_literal(host) then return _ip_is_host_local(host) end
-  for _, ip in ipairs(_resolve(host)) do
-    if _ip_is_host_local(ip) then return true end
-  end
-  return false
+  return (_classify(host))
 end
+
 
 -- ========== 记录 ==========
 
@@ -119,15 +163,16 @@ local function _close(c)
   if c then pcall(function() c:close() end) end
 end
 
---- 向上游建连（域名先解析）
---- @param host string
+--- 向上游建连。连接**已校验过的 IP**（由 `_classify` 单次解析返回），不再重复解析，
+--- 避免 DNS rebinding 在校验与连接之间切换答案。
+--- @param host string 原始主机名（无 IP 时兜底）
+--- @param ips table 已校验的规范化 IP 数组
 --- @param port number
 --- @param on_ok function(up userdata)
 --- @param on_err function()
-local function _open_upstream(host, port, on_ok, on_err)
+local function _open_upstream(host, ips, port, on_ok, on_err)
   local up = vim.uv.new_tcp()
   local done = false
-  local ips = _resolve(host)
   local target = (#ips > 0) and ips[1] or host
   local ok = pcall(function()
     up:connect(target, port, function(err)
@@ -207,13 +252,14 @@ local function _handle_http(ctx, client, header, rest)
       return
     end
     p = tonumber(p)
-    if _is_host_local(h) then
+    local local_, ips = _classify(h)
+    if local_ then
       _record(h, p, "http", "block")
       _respond(client, 403, "Forbidden", "host_local_blocked")
       return
     end
     ctx.state = "connecting"
-    _open_upstream(h, p, function(up)
+    _open_upstream(h, ips, p, function(up)
       _record(h, p, "http", "allow")
       pcall(function() client:write("HTTP/1.1 200 Connection Established\r\n\r\n") end)
       _start_piping(ctx, client, up, rest)
@@ -232,7 +278,8 @@ local function _handle_http(ctx, client, header, rest)
     _respond(client, 400, "Bad Request", "not_a_proxy_request")
     return
   end
-  if _is_host_local(h) then
+  local local_, ips = _classify(h)
+  if local_ then
     _record(h, p, "http", "block")
     _respond(client, 403, "Forbidden", "host_local_blocked")
     return
@@ -242,7 +289,7 @@ local function _handle_http(ctx, client, header, rest)
   if path == "" then path = "/" end
   local rewritten = header:gsub("^([^\r\n]+)", method .. " " .. path .. " HTTP/1.1", 1)
   ctx.state = "connecting"
-  _open_upstream(h, p, function(up)
+  _open_upstream(h, ips, p, function(up)
     _record(h, p, "http", "allow")
     pcall(function() up:write(rewritten .. "\r\n\r\n") end)
     _start_piping(ctx, client, up, rest)
@@ -322,14 +369,15 @@ local function _process_socks(ctx, client)
     local rest = ctx.buf
     ctx.buf = ""
 
-    if _is_host_local(host) then
+    local local_, ips = _classify(host)
+    if local_ then
       _record(host, port, "socks5", "block")
       _socks_reply(client, 2) -- connection not allowed by ruleset
       _close(client)
       return
     end
     ctx.state = "connecting"
-    _open_upstream(host, port, function(up)
+    _open_upstream(host, ips, port, function(up)
       _record(host, port, "socks5", "allow")
       _socks_reply(client, 0)
       _start_piping(ctx, client, up, rest)

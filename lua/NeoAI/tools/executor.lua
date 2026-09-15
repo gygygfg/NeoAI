@@ -61,6 +61,41 @@ local function _masked_target(tool_name, args)
   return nil
 end
 
+--- 越界访问留痕（非阻塞）：`read_all` 下记录访问 cwd 之外用户工作目录（home/root 等）的
+--- 工具调用，写入证据 + 事件，供审批悬浮窗展示。系统路径（/usr、/etc 等）不计入。
+--- @param tool_name string
+--- @param args table
+--- @param ctx table
+local function _trace_outside_access(tool_name, args, ctx)
+  local ok, runtime = pcall(require, "NeoAI.sandbox.runtime")
+  if not ok or not runtime.read_all() then return end
+  local ok2, trace = pcall(require, "NeoAI.sandbox.trace")
+  if not ok2 then return end
+  local cwd = vim.fn.getcwd()
+  local spec = tool_spec.get(tool_name)
+  local seen = {}
+  local function consider(p, command)
+    if type(p) ~= "string" or p == "" then return end
+    local hit = runtime.outside_workspace(p, cwd)
+    if hit and not seen[hit] then
+      seen[hit] = true
+      trace.record({
+        path = hit, tool = tool_name, kind = "read", command = command,
+        source = (ctx and ctx.is_sub_agent) and "sub_agent" or "observed",
+      })
+    end
+  end
+  for _, field in ipairs(spec.paths or {}) do consider(args and args[field]) end
+  -- 进程命令：扫描命令串中的绝对路径 token（启发式，仍非阻塞放行）。
+  local cmd = args and (args.command or args.cmd)
+  if type(cmd) == "string" then
+    for tok in cmd:gmatch("%S+") do
+      local p = tok:gsub("^['\"]", ""):gsub("['\"]$", "")
+      if p:sub(1, 1) == "/" then consider(p, cmd) end
+    end
+  end
+end
+
 --- 参数别名规范化
 --- @param tool_name string
 --- @param args table
@@ -229,9 +264,12 @@ end
 -- ========== 公开 API ==========
 
 --- 出向密钥防护：扫描工具参数。
---- - 命中映射表中已知的**原始密钥** → 硬拦截并终止整个 Agent（明确通知用户）；
---- - 命中 token → 记录留痕（证据 + 待审警告）；
+--- - 命中映射表中已知的**原始密钥**（未加密真实值）→ 硬拦截并终止整个 Agent（明确通知用户）；
+--- - 命中 token（加密后的 key）或**敏感环境变量名** → 记录留痕并提级审批
+---   （`ctx.secret_operation`），由待审悬浮窗展示 `⚠ 密钥操作`，**不终止**；
 --- - fs_write 类工具的内容参数做 token 化，使写入只落 token，commit 时再还原。
+--- 另：AI 可见上下文中的原始密钥由 `core/agent/recovery` 在请求前守卫并终止（沙箱上下文
+--- 被突破）。
 --- @param tool table
 --- @param tool_name string
 --- @param args table
@@ -257,11 +295,21 @@ local function _secret_guard(tool, tool_name, args, ctx)
       vim.log.levels.ERROR)
     return false, { kind = "secret", message = "SANDBOX_SECRET_BLOCKED: 工具参数包含原始密钥，已终止 Agent" }
   end
-  if next(scan.tokens) then
-    secret.trace("token_used", { tool = tool_name, tokens = scan.tokens })
+  -- 加密后的 key（token）与敏感环境变量名：软信号，只提级待审，不终止。
+  local names = secret.scan_names and secret.scan_names(args) or {}
+  if next(scan.tokens) or #names > 0 then
+    if next(scan.tokens) then secret.trace("token_used", { tool = tool_name, tokens = scan.tokens }) end
+    if #names > 0 then secret.trace("name_used", { tool = tool_name, names = names }) end
+    -- KEY 环境变量操作：提级审批（wrapper 据此把候选判为密钥操作 L3，强制待审），不终止。
+    if ctx then
+      ctx.secret_operation = true
+      ctx.secret_names = names
+    end
     pcall(function()
       require("NeoAI.kernel.event_bus").emit(require("NeoAI.kernel.events").SANDBOX_SECRET_TRACED, {
-        tool = tool_name, count = (function() local n = 0; for _ in pairs(scan.tokens) do n = n + 1 end; return n end)(),
+        tool = tool_name,
+        count = (function() local n = 0; for _ in pairs(scan.tokens) do n = n + 1 end; return n end)(),
+        names = names,
       })
     end)
   end
@@ -333,6 +381,9 @@ function M.execute(tool_name, raw_args, ctx)
   if not valid then
     return async.reject({ kind = "validation", message = verr })
   end
+
+  -- 越界访问留痕（read_all 下）：记录 cwd 之外用户工作目录的访问，非阻塞。
+  pcall(_trace_outside_access, resolved, args, ctx)
 
   -- 出向密钥防护（原始密钥硬拦截 + token 留痕 + 写入 token 化）
   local ok_secret, serr = _secret_guard(tool, resolved, args, ctx)

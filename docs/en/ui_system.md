@@ -180,7 +180,7 @@ box). `show_keymaps()` displays the current keymap configuration.
 
 Chat context keymaps (`keymaps.chat`): `insert`(i), `quit`(q), `send`, `cancel`(<Esc>), `toggle_reasoning`(r),
 `switch_model`(M), `cycle_mode`(m), `cycle_display`(<C-t>/T), `reload_display`(<F5>),
-`tool_approval`(<C-a>), `approval.confirm/confirm_all/cancel/cancel_with_reason`.
+`tool_approval`(<C-a>), `approval.confirm/confirm_all/add_to_workspace/cancel/cancel_with_reason` (`add_to_workspace` merges the operated file's directory into that tool's runtime `allowed_directories`, session-only).
 There are also internal scrolling mappings for the main message area: `j`/`k` (through `_scroll`, moving the cursor by
 line), and `<ScrollWheelUp>`/`<ScrollWheelDown>` (through `_wheel_scroll`, smoothly scrolling the viewport while clamping
 the blank space below the last line to `ui.chat.mousescroll_max_blank` lines).

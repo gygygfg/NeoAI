@@ -1,9 +1,10 @@
 --- 沙箱 seccomp 基线
 --- @module NeoAI.sandbox.seccomp
---- 生成并施加 seccomp 基线（设计文档 §7.1）：默认 denylist（只拦危险 syscall），
---- 架构不符直接 KILL。经 `bwrap --seccomp FD` 在沙箱载荷上施加（bwrap 特权设置不被过滤）。
+--- 生成并施加 seccomp 基线（设计文档 §7.1）：默认 denylist（只拦危险 syscall）+
+--- 设备节点屏障，架构不符直接 KILL。经 `bwrap --seccomp FD` 在沙箱载荷上施加
+--- （bwrap 特权设置不被过滤）。
 ---
---- 默认关闭（`tools.sandbox.seccomp.enabled=false`）；开启且无可用过滤器时明确拒绝，
+--- 默认开启（`tools.sandbox.seccomp.enabled=true`）；无可用过滤器时明确拒绝，
 --- 不静默声称已施加。`require_seccomp=true` 时外部进程必须有可用过滤器。
 
 local config_store = require("NeoAI.kernel.config_store")
@@ -24,12 +25,26 @@ local SECCOMP_RET_ERRNO_ENOSYS = 0x00050000 + 38 -- ENOSYS
 local AUDIT_ARCH_X86_64 = 0xC000003E
 local AUDIT_ARCH_AARCH64 = 0xC00000B7
 
+-- x86_64 的 x32 ABI 位（__X32_SYSCALL_BIT）：x32 进程的 `seccomp_data.arch` 与 x86_64 相同，
+-- 但 syscall 号带该高位。若不做屏蔽，denylist 的精确 JEQ 全部失配 → 整份过滤器被绕过
+-- （`syscall(165 | 0x40000000, …)` 仍到达 sys_mount/mknod 处理器）。故带该位一律 KILL。
+local X32_SYSCALL_BIT = 0x40000000
+
 -- seccomp_data.args[0] 的偏移（nr@0, arch@4, ip@8, args@16）
 local ARG0_OFFSET = 16
+local ARG1_OFFSET = 24
+local ARG2_OFFSET = 32
 -- clone(2) 命名空间标志位：NEWNS/NEWCGROUP/NEWUTS/NEWIPC/NEWUSER/NEWPID/NEWNET。
 -- 这些位若出现即拒绝：`unshare`/`setns` 已被 denylist 拦截，但 `clone`/`clone3` 带同名标志
 -- 可创建嵌套 userns（绕开 unshare 拦截），故在此按 flags 过滤。
 local CLONE_NS_MASK = 0x7E020000
+
+-- mknod(2)/mknodat(2) 的设备类型位：S_IFCHR(0x2000) | S_IFBLK(0x6000) = 0x6000。
+-- 设备节点**不经 overlayfs**——open 直接触达真实设备，是绕过暂存/遮蔽/审批的裸磁盘通道
+-- （`mknod /tmp/d b 8 0 && dd if=/tmp/d` 即可读宿主磁盘）。mode 命中该位即拒绝；
+-- FIFO（0x1000）/普通文件（0x8000）不受影响，`mkfifo` 仍可用。
+-- 即便 capability 含 CAP_MKNOD（如用户显式加回），这里也硬拦（纵深防御）。
+local S_IFDEV_MASK = 0x6000
 
 -- socket(2) 允许的地址族白名单：AF_UNIX / AF_INET / AF_INET6 / AF_NETLINK。
 -- 其余地址族（AF_PACKET/AF_VSOCK/AF_ALG/AF_XDP/AF_TIPC…）一律拒绝——尤其 AF_VSOCK 不受
@@ -43,21 +58,29 @@ local ARCH = {
     clone = 56,
     clone3 = 435,
     socket = 41,
+    x32_guard = true,
+    mknod = 133,
+    mknodat = 259,
     blocked = {
       101, -- ptrace
       155, -- pivot_root
+      159, -- adjtimex（读写系统时钟参数）
       161, -- chroot
       163, -- acct
+      164, -- settimeofday
       165, 166, -- mount, umount2
       167, 168, -- swapon, swapoff
       169, -- reboot
+      172, 173, -- iopl, ioperm（裸端口 I/O）
       175, 176, -- init_module, delete_module
       179, -- quotactl
+      227, -- clock_settime
       246, -- kexec_load
       248, 249, 250, -- add_key, request_key, keyctl
       272, -- unshare
       298, -- perf_event_open
       303, 304, -- name_to_handle_at, open_by_handle_at
+      305, -- clock_adjtime
       308, -- setns
       310, 311, -- process_vm_readv, process_vm_writev
       312, -- kcmp
@@ -77,6 +100,8 @@ local ARCH = {
     clone = 220,
     clone3 = 435,
     socket = 198,
+    -- arm64 无 mknod（glibc 经 mknodat(AT_FDCWD,…) 实现）；号码见 asm-generic/unistd.h。
+    mknodat = 33,
     blocked = {
       40, 39, -- mount, umount2
       41, -- pivot_root
@@ -85,12 +110,16 @@ local ARCH = {
       89, -- acct
       97, -- unshare
       104, 105, 106, -- kexec_load, init_module, delete_module
+      112, -- clock_settime
       117, -- ptrace
       142, -- reboot
+      170, -- settimeofday
+      171, -- adjtimex
       217, 218, 219, -- add_key, request_key, keyctl
       224, 225, -- swapon, swapoff
       241, -- perf_event_open
       264, 265, -- name_to_handle_at, open_by_handle_at
+      266, -- clock_adjtime
       268, -- setns
       270, 271, -- process_vm_readv, process_vm_writev
       273, -- finit_module
@@ -149,6 +178,12 @@ function M.build_filter(arch)
   parts[#parts + 1] = _insn(BPF_JEQ_K, 1, 0, spec.audit)    -- JEQ arch ? skip kill : kill
   parts[#parts + 1] = _insn(BPF_RET_K, 0, 0, SECCOMP_RET_KILL_PROCESS)
   parts[#parts + 1] = _insn(BPF_LD_ABS, 0, 0, 0)            -- LD nr
+  -- x32 ABI 位：带 `__X32_SYSCALL_BIT` 的 syscall 号与 x86_64 共用 arch，精确 JEQ 会失配，
+  -- 必须在所有号码比较之前整体 KILL（仅 x86_64 适用）。
+  if spec.x32_guard then
+    parts[#parts + 1] = _insn(BPF_JSET_K, 0, 1, X32_SYSCALL_BIT) -- nr & bit ? KILL : skip
+    parts[#parts + 1] = _insn(BPF_RET_K, 0, 0, SECCOMP_RET_KILL_PROCESS)
+  end
   -- socket：仅放行 AF_UNIX/AF_INET/AF_INET6/AF_NETLINK，其余地址族返回 EPERM。
   if spec.socket then
     local n = #AF_ALLOW
@@ -172,6 +207,20 @@ function M.build_filter(arch)
   if spec.clone3 then
     parts[#parts + 1] = _insn(BPF_JEQ_K, 0, 1, spec.clone3)
     parts[#parts + 1] = _insn(BPF_RET_K, 0, 0, SECCOMP_RET_ERRNO_ENOSYS)
+  end
+  -- mknod/mknodat：mode（mknod 为 args[1]，mknodat 为 args[2]）含 S_IFCHR/S_IFBLK 位
+  -- 即拒绝（EPERM），封死「创建设备节点 → 裸读磁盘」的逃逸通道；FIFO/普通文件放行。
+  if spec.mknod then
+    parts[#parts + 1] = _insn(BPF_JEQ_K, 0, 3, spec.mknod)   -- nr==mknod ? 检查 mode : 跳过
+    parts[#parts + 1] = _insn(BPF_LD_ABS, 0, 0, ARG1_OFFSET) -- LD args[1] (mode)
+    parts[#parts + 1] = _insn(BPF_JSET_K, 0, 1, S_IFDEV_MASK) -- (mode & mask) ? EPERM : 放行
+    parts[#parts + 1] = _insn(BPF_RET_K, 0, 0, SECCOMP_RET_ERRNO_EPERM)
+  end
+  if spec.mknodat then
+    parts[#parts + 1] = _insn(BPF_JEQ_K, 0, 3, spec.mknodat) -- nr==mknodat ? 检查 mode : 跳过
+    parts[#parts + 1] = _insn(BPF_LD_ABS, 0, 0, ARG2_OFFSET) -- LD args[2] (mode)
+    parts[#parts + 1] = _insn(BPF_JSET_K, 0, 1, S_IFDEV_MASK)
+    parts[#parts + 1] = _insn(BPF_RET_K, 0, 0, SECCOMP_RET_ERRNO_EPERM)
   end
   for _, nr in ipairs(spec.blocked) do
     parts[#parts + 1] = _insn(BPF_JEQ_K, 0, 1, nr)          -- JEQ nr ? ret errno : skip
@@ -198,8 +247,10 @@ function M.ensure_filter()
     or (vim.fn.stdpath("cache") .. "/NeoAI/sandbox")
   local dir = root .. "/seccomp"
   -- 版本化文件名：过滤器内容变更时避免命中旧缓存
-  -- （v3 在 v2 的 clone/clone3 命名空间过滤之上，增加 socket 地址族白名单）。
-  local path = dir .. "/baseline-v3-" .. name .. ".bpf"
+  -- （v3：clone/clone3 命名空间过滤 + socket 地址族白名单；
+  --   v4：mknod/mknodat 设备节点屏障，CHR/BLK 模式拒绝、FIFO 放行；
+  --   v5：时钟（adjtimex/settimeofday/clock_settime/clock_adjtime）与裸端口 I/O（iopl/ioperm）拦截）。
+  local path = dir .. "/baseline-v5-" .. name .. ".bpf"
   if vim.fn.filereadable(path) == 1 then
     state.filter_path = path
     return path

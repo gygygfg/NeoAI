@@ -201,6 +201,30 @@ function M.run_all(...)
   local total_passed, total_failed = 0, 0
   local all_errors = {}
 
+  -- 测试默认以 root 运行载荷（run_as.uid=0，显式放弃降权）以保持既有行为：
+  -- 测试环境通常以 root 运行且工作区文件归 root，非 root 载荷无法写入。非 root 场景的
+  -- 专项用例自行传入 tools.sandbox.run_as 覆盖。
+  local config_store = require("NeoAI.kernel.config_store")
+  local orig_config_load = config_store.load
+  config_store.load = function(user_config)
+    local uc = vim.deepcopy(user_config or {})
+    uc.tools = uc.tools or {}
+    uc.tools.sandbox = uc.tools.sandbox or {}
+    if uc.tools.sandbox.run_as == nil then
+      uc.tools.sandbox.run_as = { uid = 0, gid = 0 }
+    end
+    return orig_config_load(uc)
+  end
+  pcall(function()
+    local cur = config_store.get_all()
+    if cur then
+      cur.tools = cur.tools or {}
+      cur.tools.sandbox = cur.tools.sandbox or {}
+      cur.tools.sandbox.run_as = { uid = 0, gid = 0 }
+      orig_config_load(cur)
+    end
+  end)
+
   -- 会话隔离：防止测试把会话写入真实历史（~/.cache/nvim/NeoAI/sessions.jsonl）。
   -- 测试期间把“默认路径”会话重定向到临时目录，结束后清理并恢复内存中的真实会话。
   -- 每个套件使用独立临时目录：否则前一套件残留的默认路径会话会被后续套件 init()
@@ -287,6 +311,7 @@ function M.run_all(...)
   end
 
   local ok_cleanup, cleanup_err = pcall(_cleanup)
+  config_store.load = orig_config_load
   if not ok_cleanup then
     all_errors[#all_errors + 1] = "测试清理失败: " .. tostring(cleanup_err)
     total_failed = total_failed + 1

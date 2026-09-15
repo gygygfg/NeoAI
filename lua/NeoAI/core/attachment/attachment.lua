@@ -233,10 +233,32 @@ function M.downscale_sync(data, media_type, width, height, max_pixels)
   local scale = math.sqrt(max_pixels / (width * height))
   local tw = math.max(1, math.floor(width * scale))
   local th = math.max(1, math.floor(height * scale))
-  local ok, out = pcall(vim.fn.system,
-    { tool, "-", "-resize", string.format("%dx%d", tw, th), "-strip", "png:-" },
-    data)
-  if not ok or not out or out == "" then return nil end
+  -- 统一经沙箱运行：以共享目录下的临时文件承载输入/输出，写入经 overlay 暂存为候选。
+  -- 属罕见 best-effort 路径：同步等待其完成；失败（含沙箱拒绝）返回 nil，放弃缩放。
+  local sandbox_exec = require("NeoAI.sandbox.exec")
+  local shared = sandbox_exec.ensure_shared()
+  local stamp = ("%d_%d"):format(vim.fn.getpid(), vim.fn.rand())
+  local inp = shared .. "/ds_in_" .. stamp
+  local outp = shared .. "/ds_out_" .. stamp .. ".png"
+  local wf = io.open(inp, "wb")
+  if not wf then return nil end
+  wf:write(data)
+  wf:close()
+  local argv = { tool, inp, "-resize", string.format("%dx%d", tw, th), "-strip", outp }
+  local d = sandbox_exec.run(argv, {
+    name = "downscale", writable_roots = { shared }, network = false, timeout_ms = 30000,
+  })
+  vim.wait(30000, function() return not d:is_pending() end, 20)
+  local result = d._value
+  local out = nil
+  if d:is_resolved() and result and result.code == 0 then
+    local read_target = require("NeoAI.sandbox.candidate").read_path(outp) or outp
+    local rf = io.open(read_target, "rb")
+    if rf then out = rf:read("*a"); rf:close() end
+  end
+  pcall(os.remove, inp)
+  pcall(os.remove, outp)
+  if not out or out == "" then return nil end
   return out
 end
 

@@ -32,18 +32,17 @@ Invariants:
 | `sandbox/candidate.lua` | Private staging, candidate freeze, CAS publish |
 | `sandbox/store.lua` | Candidate/receipt persistence (queryable reconciliation) |
 | `sandbox/review.lua` | Async review: change-set queue and review/apply states |
-| `sandbox/impact.lua` | fs/process/network impact records and compact stats (unknown = null) |
+| `sandbox/observe.lua` | Impact records (fs/process/network, unknown = null) and decision envelope (decision/severity/stats/asks/evidence); merges former `impact`+`envelope` (old files are compat shims) |
 | `sandbox/evidence.lua` | Evidence storage, redaction, paging |
 | `sandbox/grant.lua` | Narrow task grants (scope/operations/budget/ttl/revocation) |
-| `sandbox/envelope.lua` | Decision envelope (decision/severity/stats/asks/evidence) |
+| `sandbox/writer.lua` | Publish writer: tries non-root first, `NEEDS_ROOT` on permission error, then root/`sudo`(tty) after approval |
 | `sandbox/network.lua` | Controlled network gateway (allowed by default; declared endpoints when enabled) |
 | `sandbox/broker.lua` | External-operation adapter protocol (idempotency/query/compensation capability declarations and reconcile) |
 | `sandbox/replay.lua` | Policy replay (reproduce a decision from the same rules and facts) |
 | `sandbox/cgroup.lua` | cgroup v2 resource domain (memory/PID/CPU), one per attempt |
 | `sandbox/seccomp.lua` | seccomp capability probe and require_seccomp gate |
 | `sandbox/cache.lua` | Content-addressed cache (isolated writes, prunable) |
-| `sandbox/fault.lua` | Fault injection (backend/freeze/publish/store) for recovery-path verification |
-| `sandbox/bench.lua` | Control-plane critical-path performance benchmarks |
+| `sandbox/diag.lua` | Fault injection (backend/freeze/publish/store) and critical-path benchmarks; merges former `fault`+`bench` (old files are compat shims) |
 | `sandbox/tool_spec.lua` | Per-tool effect class and staged path declaration |
 | `sandbox/wrapper.lua` | Enforcement gate: `attach` specs, `gate` all executions |
 | `sandbox/risk.lua` | Security-level assessment (L0-L3), graded approval action, result grading |
@@ -95,13 +94,52 @@ is only kept for other `approval.mode` values (`prompt`/`strict`).
   - `:NeoAISandboxReview` — open the review UI (`ui/components/sandbox_review.lua`), which
     highlights files by path level — **workspace=green, user directory=yellow, system=red** —
     with a yellow `待审` state label, and shows a **high/medium/low** risk grade (`[L0]低危` …
-    `[L2]/[L3]高危`) plus risk reasons. **The approval unit is a single file**: `<CR>` applies only
-    the file under the cursor, `d` rejects only that file (remaining files stay pending),
-    `i` temporarily closes the review window and opens a **diff preview** of that item
-    (`q`/`<Esc>` closes it and returns to the review window with the cursor restored),
-    `r` refreshes, `q`/`<Esc>` closes; the header line is informational only and is not
-    approvable. Inside the chat main window press `<leader>ap` to trigger it
-    (`keymaps.chat.sandbox_review`).
+    `[L2]/[L3]高危`) plus risk reasons. **The header line approves the whole change set**
+    (`<CR>` applies every file in it), while a **file line approves a single file**
+    (`<CR>` applies only the file under the cursor); `d` rejects that file (on the header, the
+    whole unit), `i` temporarily closes the review window and opens a **diff preview** of that
+    item (`q`/`<Esc>` closes it and returns to the review window with the cursor restored),
+    `r` refreshes, `q`/`<Esc>` closes. Inside the chat main window press `<leader>ap` to trigger
+    it (`keymaps.chat.sandbox_review`).
+    - **Package installs are grouped per install command**: candidates produced by npm/pip/apt
+      package installs are labelled on the header as `包安装 <manager>: <packages>`
+      (`privilege.package_info`) and **merged into a single approval unit by the install-command
+      key `package_key` (`<manager>:<packages>`)** — multiple candidates from the same install
+      command (indexes, metadata, package files) appear as one entry in the review queue and are
+      approved as one unit (`<CR>` applies all files) without per-file confirmation; `files` still
+      allows applying only a subset. Detection skips wrappers such as `sudo`/`doas`/`env`/
+      `bash -c`/`for …; do …` so a package install is not missed and escalated to L3.
+    - **Writable roots and capabilities for package installs**: package install commands
+      (any segment matching a package manager, `req.package`) automatically add the
+      package-manager state dirs (`tools.sandbox.packages.roots`: `/var/lib/apt`,
+      `/var/cache/apt`, `/var/lib/dpkg`, `/usr/local`, `~/.cache`, `~/.npm`, …) as writable
+      roots staged via overlay, so `apt update`/`apt install`/`pip install`/`npm install` can
+      write indexes/caches/metadata and those writes are frozen as candidates too. The
+      on-demand capability grant (`req.package_all`) requires the **whole command** to be
+      package managers (or benign companions such as `tee`; `apt update 2>&1 | tee log`
+      still qualifies) — mixed commands (e.g. `apt update && cat /x`) get nothing, so `cat`
+      cannot inherit `CAP_DAC_OVERRIDE`. Because `--cap-drop ALL` removes `CAP_DAC_OVERRIDE`
+      (root cannot even write `_apt`-owned 0700 dirs), pure package installs add back the
+      narrow capabilities listed in `tools.sandbox.packages.cap_add`
+      (`CAP_DAC_OVERRIDE`/`CAP_CHOWN`/`CAP_SETUID`, …; **no `CAP_MKNOD`** — device nodes are
+      hard-blocked by the seccomp baseline, see §6); the process still runs under the
+      mount/pid namespace + seccomp + read-only root + masking + overlay staging.
+    - **Oversized files are not captured** (`tools.sandbox.max_file_bytes`, default 8 MiB): files
+      above the cap are still written to the overlay private layer (never the real disk) but are
+      excluded from candidates/review/publish, so apt's `pkgcache.bin`, cache archives and image
+      layers cannot be embedded into candidate JSON and block the main thread / fill the disk.
+    - **Staged content is persistent**: `PENDING` and `APPROVED` (not yet applied) candidates are
+      **re-materialized** from disk by `_rehydrate_pending` after a reload/restart, so large
+      staged content such as package installs stays readable until applied or rejected and is not
+      destroyed by session rotation/exit.
+    - **L3 second confirmation** (`tools.sandbox.review.l3_warning.enabled`, on by default):
+      for items with `risk_level=3`, the first `<CR>` does **not** apply directly. Instead the
+      model (`sandbox/l3_warning.lua` via `core/agent/request`) generates a short consequence
+      warning and the item's **diff** opens automatically with the warning shown at the top
+      (a placeholder is shown while generating). Press `<CR>` again inside the diff to actually
+      apply, or `q`/`<Esc>` to cancel and return. When the model is unavailable, times out, or no
+      provider is configured, it falls back to a deterministic rule-based warning built from
+      `risk_reasons`/paths and does not block the flow.
   - `:NeoAISandboxApprove <id>` / `:NeoAISandboxReject <id>` — approve (no apply) / reject & discard.
   - `:NeoAISandboxApply <id>` — approve and apply (CAS publish); `:NeoAISandboxApplyAll` applies all.
   - `:NeoAISandboxList` / `:NeoAISandboxShow` / `:NeoAISandboxDiscard <digest>` / `:NeoAISandboxCommit <digest>`.
@@ -112,6 +150,11 @@ is only kept for other `approval.mode` values (`prompt`/`strict`).
   (re-freezing the composed candidate before CAS); unselected files remain queued as a new
   pending change set so the user can confirm them one by one. `sandbox.reject_file(id, path)`
   rejects a single file.
+- **Re-validation before publish (defense in depth)**: `candidate.publish` re-canonicalizes every
+  file path — if the resolved result differs from the recorded path (`..`/symlink introduced or
+  swapped, e.g. a tampered on-disk candidate) it returns `CONFLICT/PATH_CHANGED`; if it hits a
+  host-sensitive masked path (`is_masked_path`) it returns `FAILED/SANDBOX_MASKED_TARGET`. Even a
+  locally-rewritten candidate cannot write to an unvalidated real location.
 - **Same-file supersede**: when the same file is edited again (a new candidate is enqueued) or
   published directly, older `PENDING` change sets covering that path are marked `SUPERSEDED` and
   their candidates discarded, so the queue keeps only the latest version
@@ -120,7 +163,12 @@ is only kept for other `approval.mode` values (`prompt`/`strict`).
 ### Staging
 
 - **Explicit-path tools** (`edit_file`/`create_directory`/`ensure_dir`/`delete_file`): the
-  gate rewrites path args to a private copy under `<root>/workspace/<hash>`. The workspace keeps a
+  gate rewrites path args to a private copy under `<root>/workspace/<hash>`. Paths are
+  **fully canonicalized before staging** (`utils.fs.canonical`: expand `~`, make absolute, resolve
+  symlinks and collapse `..`) so the staging key, risk grading, review display and publish target
+  all use the same real path — otherwise `x/../../../etc/cron.d/pwn` (when `x` does not exist,
+  `fnamemodify(:p)` does not collapse `..`) is shown as an in-workspace L0 green entry but written
+  outside the workspace by the kernel at publish time. The workspace keeps a
   **persistent mapping** (real path → staged copy):
   - Editing the same file repeatedly always starts from the latest sandbox content (not a fresh copy
     of the real file), so successive edits compose; the copy is refreshed only when the real file
@@ -169,6 +217,13 @@ is only kept for other `approval.mode` values (`prompt`/`strict`).
     destroyed on exit/session rotation. Writes to `/tmp` are scratch and are not frozen as candidates,
     eliminating cross-session residue and host `/tmp` leakage. Set `tmp_private_base="session"` to
     restore the old behavior (directory under the session process dir, e.g. `/dev/shm`).
+  - **Ephemeral candidate roots (`tools.sandbox.ephemeral_roots`, defaults to `tmpfs_roots`)**:
+    file writes under these roots (**excluding the cwd subtree**) are **session-private and discarded
+    when nvim exits** — they produce no pending candidate, no CAS publish, and no approval popup (the
+    content stays only in the staging layer for consistent reads within the session). This applies to
+    both in-process tools (`edit_file`/`create_directory`, which write the host directly) and external
+    commands, so `/tmp` scratch is not repeatedly surfaced as a pending change. Set
+    `ephemeral_roots = {}` to disable (then `/tmp` goes through normal review/approval).
   - Broad directories such as `/root`, `/home`, `/etc` are no longer overlaid by default, so host
     home/accounts/config are not exposed as read-only lowers; add them back explicitly to
     `process_roots` if needed, and tighten `mask_paths` accordingly.
@@ -178,7 +233,12 @@ is only kept for other `approval.mode` values (`prompt`/`strict`).
   - **Bidirectional**: before a command the workspace staged content is materialized into the writable
     layer (the command sees `edit_file`'s unpublished edits and new files; deletions are represented as
     whiteouts); after it the changes are merged back into the workspace staging map (`read_file`/
-    `edit_file` see the command's changes and keep composing).
+    `edit_file` see the command's changes and keep composing). Capture records **only files the command
+    actually changed**: materialized files whose content equals the current workspace staging (or that
+    are already marked deleted) produce no candidate, so a read-only command (`ls`/`cat`/`git status`,
+    …) cannot re-capture the AI's staged edit as a `run_command` candidate and supersede the original
+    `edit_file` candidate — otherwise rejecting that read-only command would invalidate the staged edit,
+    i.e. an "approved change rolled back".
   - The overlay base is generated by `sandbox.conceal` with a **featureless name**
     (`/dev/shm/.cache-<tag>`, no `NeoAI`/`sandbox` substring; must be outside the writable roots,
     otherwise upper-under-lower yields kernel `EINVAL`); falls back to the sandbox root when
@@ -203,8 +263,9 @@ is only kept for other `approval.mode` values (`prompt`/`strict`).
 - **No path leaks**: staged paths in both success results and error messages are rewritten back to the
   real workspace paths (including read-only tools failing to read a deleted staged copy), so the model
   never sees sandbox-internal paths.
-- **Hot-reload consistency**: `sandbox.shutdown()` clears the staging directory while the pending queue
-  stays on disk; the next `sandbox.init()` **re-materializes** pending candidates into the new session's
+- **Hot-reload consistency**: `sandbox.shutdown()` clears the staging directory while the review queue
+  and candidates stay on disk; the next `sandbox.init()` **re-materializes** both pending (`PENDING`)
+  and approved-but-unapplied (`APPROVED`/`NOT_REQUESTED`) candidates into the new session's
   staging layer (`_rehydrate_pending`), so read tools see the same view as the review queue after a
   reload/reopen.
 
@@ -274,8 +335,9 @@ is only kept for other `approval.mode` values (`prompt`/`strict`).
 ### Privilege reduction and host-sensitive path masking (on by default)
 
 Namespace isolation alone is not enough to stop escape when a root payload keeps all
-capabilities and can reach host sockets. `runtime` applies the following defense-in-depth
-to the bwrap prefix by default:
+capabilities and can reach host sockets. `runtime` therefore applies the following
+defense-in-depth to the bwrap prefix by default (capabilities stay full for compatibility, while
+host-global capabilities are narrowed via `cap_drop`):
 
 - **Close inherited fds (anti-chroot-escape)**: before starting the payload, all inherited fds
   except 0/1/2 are closed. Otherwise a **directory fd** held by a host process (e.g. the AppImage
@@ -284,17 +346,29 @@ to the bwrap prefix by default:
   prefers `bash` (supports multi-digit fds), falls back to `python3`'s `os.closerange`, then to
   `sh` (dash only supports single-digit fds — best effort). `run_command`, `runtime.run` and the
   LSP namespace overlay all go through this wrapper.
-- **Drop all capabilities**: `--cap-drop ALL` (add specific ones back via
-  `tools.sandbox.cap_add`). The payload no longer holds `CAP_SYS_ADMIN`/`CAP_SYS_MODULE`/
-  `CAP_SYS_PTRACE`, so `mount`, module loading and `ptrace` are rejected by the kernel
-  (verified `CapEff=0`).
-  **Note**: cap-drop does **not** prevent writing global sysctls such as
+- **Full capabilities by default + host-global capability narrowing (`cap_drop`)**: by default
+  `cap_add = { "ALL" }` and `--cap-drop ALL` is **not** applied — node/python/apt/dpkg/pip and
+  any other operation run with full root capabilities. At the same time, the capabilities that
+  can **modify host-global state** are dropped one by one per `cap_drop` (default
+  `CAP_NET_ADMIN`/`CAP_SYS_TIME`/`CAP_SYS_MODULE`/`CAP_SYS_RAWIO`/`CAP_SYS_BOOT`/
+  `CAP_MAC_ADMIN`/`CAP_MAC_OVERRIDE`/`CAP_AUDIT_CONTROL`), so netlink route/firewall changes,
+  clock changes, module loading, raw port I/O, reboot and MAC/audit changes are denied with
+  `EPERM`; none of them are needed by dev/package workflows. Capabilities explicitly listed in
+  `cap_add` are not dropped. Host **filesystem** immutability does not rely on capabilities but
+  on namespaces + read-only root + overlay staging (writes are frozen as candidates). For minimal
+  privileges set `cap_add = {}` (`--cap-drop ALL`); pure package-install commands then add back
+  `CAP_DAC_OVERRIDE`/`CAP_CHOWN`/`CAP_SETUID`, … per `packages.cap_add`, while mixed commands
+  (`apt update && cat /x`) get nothing. The sandbox already
+  runs as root, so a leading `sudo`/`doas` (and its common boolean flags) is **stripped**
+  (`sudo apt update` → `apt update`); otherwise `sudo` fails with `setresuid` EINVAL under the
+  nested userns and a masked `/etc/sudoers`. Forms that change user/login (`-u/-g/-i/-s`, …)
+  are left as-is.
+  **Note**: capabilities are irrelevant to writing global sysctls such as
   `/proc/sys/kernel/core_pattern` and `modprobe` — these are not namespaced, and their write
-  permission is decided by `test_perm` **DAC** (`euid == global root uid`), independent of
-  capabilities. When the sandbox runs as root without a userns, `euid` is the global root, so
-  the write still succeeds under `--cap-drop ALL`, forming a coredump/modprobe escalation
-  primitive (host-global kernel state). It is therefore closed by the "mandatory dangerous
-  sysctl masking" below, not by cap-drop/seccomp.
+  permission is decided by **DAC** (`euid == global root uid`). When the sandbox runs as root
+  without a userns, `euid` is the global root, so the write succeeds under any capability
+  configuration, forming a coredump/modprobe escalation primitive (host-global kernel state). It is
+  therefore closed by the "mandatory dangerous sysctl masking" below, not by capabilities/seccomp.
 - **Whole `/proc/sys` read-only bind (always on, root-cause fix)**: after `--proc /proc`,
   `--ro-bind /proc/sys /proc/sys` closes the write surface of **all** non-namespaced global
   sysctls in one shot. Audit found that before the fix `randomize_va_space`/`pid_max`/
@@ -324,7 +398,10 @@ to the bwrap prefix by default:
   character device, so `connect` fails). Defaults cover `/var/run/docker.sock`
   (equivalent to host root, the classic escape entry), `/var/lib/docker`, containerd/podman
   data, orchestrator (herdr) / panel (1panel) / D-Bus / systemd control channels, and host
-  credentials such as `/root/.ssh`, `/root/.aws`, `/root/.gnupg`, `/root/.kube`, keyrings, plus
+  credentials such as `/root/.ssh`, `/root/.aws`, `/root/.gnupg`, `/root/.kube`, keyrings,
+  **Git credentials and signing keys** (`~/.git-credentials`, `~/.config/git/credentials`,
+  `~/.git-credential-cache`, `~/.netrc`, `~/.ssh`, `~/.gnupg`, `~/.config/gh`, for both root and
+  `/home/*` users), plus
   read-surface leaks such as `/etc/shadow`, `/etc/gshadow`, `/etc/sudoers`, `/etc/machine-id`,
   `/etc/ssh`, `/var/log`, `/var/spool/cron` and root shell history.
   Masks are mounted after the writable-root overlays so they take effect.
@@ -332,21 +409,42 @@ to the bwrap prefix by default:
   the executor additionally queries `runtime.is_masked_path` for path arguments and **hard-rejects**
   hits (`路径位于宿主敏感遮蔽路径`, no approval), covering `read_file`/`search_files`/`edit_file`
   and other tools that read the host directly.
-- **Minimal read-only system set (allowlist, on by default)**: no more `--ro-bind / /`, and `/usr`
-  is **no longer exposed as a whole** (when the host root partition sits on the same disk, that leaks
-  the `/usr/share/doc` package database, `/usr/local/go_workspace`, `/usr/src`, etc.). Only
-  `tools.sandbox.readonly_roots` (by default the `/usr` runtime subtrees
-  `bin`/`sbin`/`lib*`/`libexec`/`include`, `share/{terminfo,locale,zoneinfo,ca-certificates,misc,…}`,
-  `local/{bin,sbin,lib,libexec,include}`, plus the `/lib*`, `/bin`, `/sbin` loader symlink roots) and
-  `tools.sandbox.readonly_paths` (default required `/etc` files: `ld.so.cache`/`passwd`/`group`/
-  `nsswitch.conf`/`ssl`/`alternatives`/`profile` etc.) are exposed read-only.
-  Unlisted host paths **do not exist** in the sandbox: `/var/log`, `/etc/shadow`, `/opt`, `/srv`,
-  `/mnt`, `/media`, `/boot`, `/usr/share/doc`, `/usr/src`, `/usr/local/go_workspace` etc. are
-  unreachable by default.
-  `/etc/passwd` and `/etc/group` remain as standard read-only runtime files (world-readable on
-  Unix; they expose account names, not password hashes). Narrow the allowlist further for a smaller
-  read surface, or add paths back explicitly (and update `mask_paths`).
-  The same read surface is used by the LSP namespace overlay (see §5).
+- **Read surface: whole host read-only (`read_all`, on by default)**: by default the host root is
+  exposed **read-only** as a whole (`--ro-bind / /`), masking only the important config
+  files/credentials in `mask_paths` (see above) plus the sandbox's own storage — i.e. "everything is
+  readable except important config files", so `/opt`, `/srv`, other project dirs, … are readable.
+  `mask_dirs` (`/home`, `/root` sibling dirs) are no longer mount-masked.
+  - **Outside-workspace tracing (non-blocking)**: accessing user working dirs outside `cwd` (under
+    home/root) records evidence (kind=observation), emits a `sandbox:outside_access` event, and is
+    shown in the `:NeoAISandboxReview` window under "越界访问留痕"; the read is still allowed, not
+    blocked. Dedup is by `(tool, path)`; in-process read tools are judged by their path args and
+    `run_command` heuristically by absolute paths in the command string; system paths (`/usr`,
+    `/etc`, …) are not traced to avoid noise.
+  - **`read_all = false` (fall back to the minimal allowlist)**: no whole-root bind, and `/usr`
+    is **not exposed as a whole** (avoids leaking `/usr/local/go_workspace`, `/usr/src`, etc.). Via
+    `tools.sandbox.readonly_roots` it exposes the `/usr` runtime subtrees
+    `bin`/`sbin`/`lib*`/`libexec`/`include`, `local/{bin,sbin,lib,libexec,include}`, plus the
+    `/lib*`, `/bin`, `/sbin` loader symlink roots. It also exposes the whole `/usr/share` and
+    `/var/lib` read-only (runtime resources nodejs/dotnet/java/git-core/terminfo, host package
+    databases dpkg/apt/rpm, …). `tools.sandbox.readonly_paths` (default required `/etc` files:
+    `ld.so.cache`/`passwd`/`group`/`nsswitch.conf`/`ssl`/`alternatives`/`profile` etc.) is exposed
+    read-only. Unlisted host paths **do not exist** in the sandbox. `/etc/passwd` and `/etc/group`
+    remain as standard read-only runtime files (world-readable on Unix; they expose account names,
+    not password hashes).
+  In both modes dangerous/sensitive subpaths are still masked by `mask_paths` (e.g.
+  `/var/lib/docker`, `/var/lib/containerd`; add `/usr/share/doc|man|info` to `mask_paths` to hide the
+  software inventory). The same read surface is used by the LSP namespace overlay (see §5).
+- **Tool child processes go through the sandbox (`NeoAI.sandbox.exec`)**: every child process a tool
+  spawns internally (the `run_command` shell, `git` operations, `read_image`'s curl download,
+  `web_fetch`'s bash/node rendering and dependency install, MCP stdio servers, …) is created inside
+  the bwrap namespace rather than on the host. These helper processes do not freeze candidates (they
+  only write the tool's own cache/temp dirs); `rw_binds` exposes the tool's own dirs read-write (host
+  and sandbox see the same path) and `ro_binds` exposes the command's directory read-only, while the
+  rest of the read surface keeps the minimal allowlist and host-sensitive masking. Tool temp/download
+  dirs live under the shared root `stdpath('cache')/NeoAI/shared` (outside the sandbox store, same
+  path on host and sandbox, avoiding exposing the host `/tmp`). When the backend is unavailable or the
+  sandbox is disabled, `tools.sandbox.fail_closed` decides: `true` rejects execution (default),
+  otherwise it falls back to the host (no silent read-surface downgrade).
 - **Host runtime passthrough (`tools.sandbox.expose_paths`, opt-in, empty by default)**: these host
   paths are exposed read-only **after** masking/tmpfs and their directories are prepended to the
   sandbox `PATH` (`expose_path_env`), so `run_command` can invoke host toolchains (e.g. the appimage
@@ -395,10 +493,14 @@ to the bwrap prefix by default:
 
 > **Residual risk (user namespace)**: when NeoAI runs as root, `bwrap` can only map the
 > caller's uid 1:1 (`uid_map 0 0`); it cannot truly remap uids from inside the plugin, and
-> `conceal` deliberately avoids creating a userns under root to hide fingerprints. After
-> dropping all capabilities and enabling seccomp, the 1:1 mapping is no longer directly
-> exploitable for privilege escalation, but reading unmasked root files is still governed by
-> file permissions. **The complete fix is to enable `userns-remap` / rootless at the container
+> `conceal` deliberately avoids creating a userns under root to hide fingerprints. With full
+> capabilities by default, the payload is host root inside the namespace: **filesystem
+> modification** is closed by namespaces + read-only root + overlay staging + masking +
+> approval, and **host-global state modification** is closed by `cap_drop` (network/clock/
+> modules/raw I/O/boot/MAC/audit) plus seccomp (device nodes, clock, port I/O,
+> mount/unshare/bpf/… barriers); `CAP_DAC_OVERRIDE` can still **read** 0600 files outside the
+> mask list (information disclosure, not modification). Set `cap_add = {}` to narrow further to
+> minimal privileges. **The complete fix is to enable `userns-remap` / rootless at the container
 > runtime layer** so container root maps to a high host uid — a deployment-side setting,
 > outside this plugin.
 
@@ -414,8 +516,12 @@ commands (SSRF, e.g. host admin panels, internal ports, cloud metadata):
   `host_local_proxy_port`). The proxy supports **HTTP CONNECT + absolute form + SOCKS5**: targets
   hitting the host-local set (`127/8`, `::1`, host NIC IPs, `169.254/16`, `fe80::/10`,
   `169.254.169.254`) are denied and recorded; other external targets are forwarded bidirectionally
-  and recorded. Domains are resolved before the check, preventing DNS rebinding to the host.
-  Records are returned via the `run_command` result summary and stored as `network` evidence.
+  and recorded. **Targets are resolved exactly once**: canonicalized to IPs via `getaddrinfo`
+  (normalizing octal/hex/short-form IPv4, fully-expanded IPv6, IPv4-mapped `::ffff:127.0.0.1`),
+  checked numerically against the host-local set, then **connected using the same validated IPs** —
+  avoiding both "literal string compare vs. kernel parse" mismatches and DNS-rebinding by a second
+  resolution. Unresolvable targets fail closed (treated as host-local). Records are returned via the
+  `run_command` result summary and stored as `network` evidence.
 - **T0 allows network by default**: `tools.sandbox.privilege.tiers[0].network = true`, so T0 no
   longer passes `--unshare-net`; `offline=true` still hard-isolates (taking precedence over tiers).
 - **Boundary (important)**: this is **application-layer** filtering. **Raw TCP that ignores the
@@ -460,17 +566,20 @@ require("NeoAI").setup({
       backend = "auto",              -- auto | bwrap | unshare
       offline = false,               -- network allowed by default (recorded only)
       require_seccomp = true,        -- reject external execution when seccomp is unavailable (default on, fail-closed)
-      cap_add = {},                  -- capabilities to add back; empty (default) = --cap-drop ALL
-      -- Minimal read-only system set (allowlist): only /usr runtime subtrees, not the whole dir.
+      cap_add = { "ALL" },           -- full root capabilities by default (namespaces/read-only/overlay/seccomp keep the host unmodified); {} = minimal
+      cap_drop = {                   -- host-global capability narrowing (dropped even when cap_add contains ALL)
+        "CAP_NET_ADMIN", "CAP_SYS_TIME", "CAP_SYS_MODULE", "CAP_SYS_RAWIO",
+        "CAP_SYS_BOOT", "CAP_MAC_ADMIN", "CAP_MAC_OVERRIDE", "CAP_AUDIT_CONTROL",
+      },
+      -- Minimal read-only system set (allowlist): /usr is not whole-exposed, but /usr/share and /var/lib are read-only.
       readonly_roots = {
         "/lib", "/lib32", "/lib64", "/libx32", "/bin", "/sbin", -- loader/binary symlink roots (required)
         "/usr/bin", "/usr/sbin", "/usr/lib", "/usr/lib32", "/usr/lib64", "/usr/libx32",
         "/usr/libexec", "/usr/include",
-        "/usr/share/terminfo", "/usr/share/locale", "/usr/share/zoneinfo",
-        "/usr/share/ca-certificates", "/usr/share/misc", "/usr/share/common-licenses",
-        "/usr/share/git-core", "/usr/share/vim", "/usr/share/nvim",
+        "/usr/share",                -- runtime shared data (nodejs/dotnet/java/git-core/terminfo, ...)
         "/usr/local/bin", "/usr/local/sbin", "/usr/local/lib", "/usr/local/libexec",
         "/usr/local/include", "/usr/local/go",
+        "/var/lib",                  -- host package DB (dpkg/apt/rpm, ...); dangerous subpaths still masked
       },
       readonly_paths = {             -- minimal /etc allowlist (supports * globs)
         "/etc/ld.so.cache", "/etc/passwd", "/etc/group", "/etc/nsswitch.conf",
@@ -481,11 +590,14 @@ require("NeoAI").setup({
       expose_tool_paths = false,     -- auto-expose host PATH tool dirs (opt-in; makes $HOME node/npm/fd/go usable)
       resolv_conf = "sanitize",      -- /etc/resolv.conf: sanitize (default, nameservers only) | hide | passthrough
       tmpfs_roots = { "/tmp", "/var/tmp" }, -- per-session private temporary roots (never an overlay lower; destroyed on exit)
+      ephemeral_roots = { "/tmp", "/var/tmp" }, -- ephemeral candidate roots (excluding cwd subtree): session-private writes, no pending/approval
       tmp_private_base = "host",     -- host (default: hidden subdir under the host root, namespace-bound back) | session
       hide_proc_paths = { "/proc/cmdline", "/proc/version" }, -- additional hides (mandatory sysctl list can only grow)
       mask_paths = {                 -- mask host-sensitive paths (dirs tmpfs / files·sockets /dev/null)
         "/run/docker.sock", "/var/run/docker.sock", "/var/lib/docker",
         "/root/.config/herdr", "/etc/1panel", "/root/.ssh", "/root/.aws", "/root/.gnupg",
+        "/root/.git-credentials", "/root/.config/git/credentials", "/root/.config/gh",
+        "/home/*/.ssh", "/home/*/.gnupg", "/home/*/.git-credentials", "/home/*/.config/gh",
         "/etc/shadow", "/etc/gshadow", "/etc/machine-id", "/etc/ssh", "/var/log",
         "/root/.bash_history", "/root/.zsh_history",
       },
@@ -503,15 +615,20 @@ require("NeoAI").setup({
       review = { enabled = true, auto_apply = false }, -- async review: candidates enter a pending queue
       retention = { candidate_days = 7, max_pending = 20 },
       policy = { deny_tools = {}, rules = {} },
-      limits = { wall_ms = 60000, memory_bytes = 0, pids = 0 },
+      limits = { wall_ms = 60000, dynamic = true, memory_ratio = 0.5, cpu_cores_max = 4, pids_max = 2048 },
     },
   },
 })
 ```
 
-Rules run in a restricted environment (explicit function allowlist; no `os/io/debug/load/require`)
-with instruction/wall-clock budgets. Rule errors/timeouts/invalid results produce `DENY`
-(`POLICY_EVALUATION_FAILED`). Aggregation is `DENY > NEEDS_CONFIRMATION > ALLOW`.
+Rules run in a restricted environment: `setfenv` replaces the rule's **global environment** with an
+explicit allowlist (`string`/`table`/`math`/`ipairs`/`pairs`/`type`/`tostring`/`tonumber`/`facts`),
+so `os`/`io`/`debug`/`require`/`load`/`pcall` are unreachable (`pcall` is deliberately excluded so a
+rule cannot swallow the budget hook's abort error); if `setfenv` is unavailable or fails the rule is
+rejected fail-closed. Instruction/wall-clock budgets still apply. Rule errors/timeouts/invalid
+results produce `DENY` (`POLICY_EVALUATION_FAILED`). Aggregation is `DENY > NEEDS_CONFIRMATION > ALLOW`.
+> Residual: a rule that captured a global via upvalue (e.g. `local os = os`) cannot be reclaimed by
+> `setfenv` — only source rules from trusted origins.
 
 ## 8. Events
 
@@ -525,7 +642,10 @@ plus async review `SANDBOX_REVIEW_ENQUEUED` / `SANDBOX_REVIEW_APPROVED` /
 idempotency/fencing, policy aggregation and restricted rules, dry-run no-write, CAS publish
 and conflict, buffer write redirection, runtime probe and isolated process execution,
 `run_command` overlay candidate capture (including deletion whiteout capture and attempt-dir cleanup),
-in-process `mask_paths` hard-rejection, and name-forced secret tokenization (text layer).
+in-process `mask_paths` hard-rejection, and name-forced secret tokenization (text layer), plus
+security-hardening regressions: pre-publish path re-canonicalization (rejecting `..` traversal /
+masked targets), risk-grading and review-UI path resolution, restricted-rule environment isolation
+(`os`/`pcall` unreachable), seccomp x32-bit interception, and `0700` candidate-store permissions.
 
 ## 10. Impact, evidence, grants and external operations (phases 2/3)
 
@@ -581,8 +701,12 @@ isolated netns and thus does not work. The `run_command` result is annotated wit
 summary (open/closed ports + reason) for the AI.
 
 Orchestration (`sandbox/net_gateway.lua`): creates a veth pair and netns, sets the default route to
-the gateway, and inserts a host-firewall (e.g. ufw) inbound allow rule scoped to that veth interface
-(removed on teardown); resources are cleaned up on session/plugin unload. Requires root and `ip`;
+the gateway, and inserts a host-firewall (e.g. ufw) inbound allow rule **scoped to that veth and
+limited to the gateway's destination address and port** (`-i <veth> -d <gw_ip> -p tcp --dport
+<gateway port>`, not a blanket per-interface allow — otherwise the netns could reach arbitrary
+non-loopback host services), plus a `-i <veth> -j DROP` FORWARD drop rule (so that with host
+`ip_forward=1` the netns cannot reach the LAN/internet via host forwarding); both removed on
+teardown. Resources are cleaned up on session/plugin unload. Requires root and `ip`;
 when unavailable it fails closed with an explicit `GATEWAY_*` error.
 
 > Note: true transparent interception (any raw TCP can scan ports while services are blocked) needs
@@ -609,7 +733,12 @@ inconclusive results (resolved via `reconcile`, never blindly replayed).
 
 `:NeoAISandboxPrune` removes terminal (rejected/applied/failed/conflict) candidates and change sets
 past `retention.candidate_days`; items referenced by recovery/reconcile/queued apply are kept.
-`:NeoAISandboxMetrics` reports candidate/pending/applied/rejected/conflict counts.
+`:NeoAISandboxMetrics` reports candidate/pending/applied/rejected/conflict counts. The store root
+and its subdirectories (`candidates`/`reviews`/`evidence`/`receipts`/`host_ops`) are chmodded to
+`0700` so other local users cannot enumerate/read unpublished content or command details.
+> Boundary: a same-uid local process can read/write these files (equivalent to any of the user's
+> other files) and is outside this plugin's protection scope; the publish-side path re-validation
+> and mask hard-deny still stop a tampered candidate from being written to sensitive locations.
 
 ## 11. Phase 4: dependency graph, composed publication and replay
 
@@ -639,11 +768,15 @@ decision records are kept by default for policy replay (`evidence.prune(days, { 
 
 ### cgroup v2 resource domain
 
-Each external process attempt gets its own resource domain from `tools.sandbox.limits`
-(`memory_bytes` / `pids` / `cpu_max`). When any limit is set, the control plane creates a cgroup v2
-child and joins the process (`join_prefix` writes `cgroup.procs` before exec); on completion/error it
-`cgroup.kill`s and removes the child so the process tree converges. **If cgroup is unavailable while
-limits are configured, execution is rejected** (`SANDBOX_CGROUP_UNAVAILABLE`) — no silent downgrade.
+Each external process attempt gets its own resource domain from `tools.sandbox.limits`. By default
+`dynamic = true` derives caps from host resources — memory = `MemTotal * memory_ratio` (default 0.5,
+bounded by `memory_max_bytes`), CPU = `min(nproc, cpu_cores_max)` cores (default 4), PIDs =
+`pids_max` (default 2048); explicit static `memory_bytes`/`pids`/`cpu_max` (>0) win over the derived
+values. The control plane creates a cgroup v2 child and joins the process (`join_prefix` writes
+`cgroup.procs` before exec); on completion/error it `cgroup.kill`s and removes the child so the
+process tree converges. When cgroup is unavailable it **skips the limits with a warning** (no
+blocking); set `limits.fail_closed = true` to reject execution instead
+(`SANDBOX_CGROUP_UNAVAILABLE`) — no silent downgrade.
 
 ### seccomp baseline
 
@@ -667,9 +800,23 @@ then execs bwrap.
   namespace and does not go through the proxy**, so it can reach host vsock services (the audit
   created one and connected to the host CID) — a host communication channel independent of the
   netns, which must be blocked by address family.
-- Enabled with `tools.sandbox.seccomp.enabled=true`; **on by default** (defense in depth together
-  with `--cap-drop ALL`).
-- Empty `filter_path` generates the built-in denylist to `<root>/seccomp/baseline-v2-<arch>.bpf`
+- **x32 ABI-bit interception (audit hardening)**: on x86_64, an x32 process reports the same
+  `seccomp_data.arch` but its syscall number carries `__X32_SYSCALL_BIT` (`0x40000000`). Without
+  masking, every exact `JEQ` in the denylist misses → the whole filter is bypassed
+  (`syscall(165 | 0x40000000, …)` still reaches `sys_mount`/`mknod`). After loading `nr` the filter
+  does `JSET 0x40000000` → `KILL_PROCESS`, before any number comparison (x86_64 only).
+- **`mknod`/`mknodat` device-node barrier (audit hardening)**: a `mode` containing
+  `S_IFCHR`/`S_IFBLK` returns `EPERM`, closing the "create a device node → `open` reaches the
+  real device → raw disk read" escape (device nodes bypass overlayfs; staging/masking/approval
+  are all ineffective against `open` on a device node). FIFOs (`mkfifo`) and regular files are
+  unaffected; the barrier holds even when `CAP_MKNOD` is present (e.g. the default
+  `cap_add = { "ALL" }`) — defense in depth.
+- **Host-global state syscall barrier (seccomp, defense in depth)**: `adjtimex`/`settimeofday`/
+  `clock_settime`/`clock_adjtime` (host clock) and `iopl`/`ioperm` (raw port I/O, x86) return
+  `EPERM`, backing up `cap_drop` (`CAP_SYS_TIME`/`CAP_SYS_RAWIO`); `mount`/`unshare`/`setns`/
+  `bpf`/`init_module`/`kexec_load`/`reboot` are in the denylist too.
+- Enabled with `tools.sandbox.seccomp.enabled=true`; **on by default** (defense in depth).
+- Empty `filter_path` generates the built-in denylist to `<root>/seccomp/baseline-v5-<arch>.bpf`
   (versioned filename so content changes rebuild it);
   a non-empty path must exist or execution is rejected.
 - `require_seccomp=true` requires a usable filter (and the bwrap backend); otherwise
@@ -756,8 +903,14 @@ support). Tests live in the "concealment" cases of `tests/test_sandbox.lua`.
 
 `sandbox/secret.lua` ensures the AI can neither see nor use real secrets: entropy-based detection,
 encryption into a random token on the way into the sandbox, decryption only when committing to the
-real workspace; token operations are traced and warned about in the review UI; when a **raw secret**
-appears in tool arguments it is hard-blocked and the whole agent is aborted immediately.
+real workspace. **Encrypted keys (tokens) and sensitive env-var names** are only traced and
+**escalated** in the review floating window (classified as a secret operation — L2 inside the
+workspace / L3 outside, forced review,
+`⚠ 密钥操作`) and **do not abort the agent**; only when a **raw secret** (the unencrypted real value)
+appears in **tool arguments** or in the **AI-visible context** (the wire messages about to be sent to
+the model) is it hard-blocked and the whole agent aborted immediately — the latter means tokenization
+was bypassed (the sandbox context was broken). Note: detection understands code semantics, so
+expressions like `api_key = os.getenv("..._API_KEY")` are not treated as raw secrets.
 
 ### Detection (entropy + charset heuristics)
 
@@ -810,19 +963,30 @@ keys**, diverging from the host. To avoid mistaking a token for a real credentia
 
 ### Tracing and warnings
 
-- Every newly detected secret and every token used in tool arguments writes a `kind="secret"` evidence
-  record.
-- When a candidate's content involves a token, the review change-set carries `secret_warning` and
-  `NeoAISandboxReview` shows a red `⚠ 密钥操作×N` marker.
+- Every newly detected secret, every token used in tool arguments, and every sensitive env-var name
+  occurrence writes a `kind="secret"` evidence record.
+- A token used in tool arguments or a sensitive env-var name (all-uppercase, containing a
+  `KEY`/`TOKEN`/`SECRET`/`PASSWORD`/`CREDENTIAL` segment, length ≥ 6, e.g. `GIT_COMMIT_AI_API_KEY`)
+  sets `ctx.secret_operation`, so the candidate is classified as a secret operation (L2 inside the
+  workspace / L3 outside) and
+  **forced into review** (`auto=false`) — the agent is **not** aborted.
+- When a candidate's content involves a token, or the call hit a sensitive env-var name, the review
+  change-set carries `secret_warning` and the `NeoAISandboxReview` floating window shows a red
+  `⚠ 密钥操作×N` marker (including the env-var names).
 - Events: `SANDBOX_SECRET_DETECTED` / `SANDBOX_SECRET_TRACED` / `SANDBOX_SECRET_BLOCKED`.
 
-### Raw-secret hard block
+### Raw-secret hard block (tool arguments and AI context)
 
-When a **raw secret** known to the mapping table appears in tool arguments (deep scan):
+When a **raw secret** known to the mapping table appears in **either** location, the whole agent is
+aborted:
 
-1. the tool call is rejected (`SANDBOX_SECRET_BLOCKED`);
-2. `core.agent.runtime.abort(agent, "secret_exposure")` **immediately aborts the whole agent**;
-3. a `SANDBOX_SECRET_BLOCKED` event is emitted and the user is notified via `vim.notify`.
+1. **tool arguments** (deep scan, outbound): the tool call is rejected (`SANDBOX_SECRET_BLOCKED`);
+2. **AI-visible context** (pre-request scan of the wire messages `core/agent/recovery` is about to
+   send): tokenization was bypassed (the sandbox context was broken), so the round is rejected.
+
+Both paths call `core.agent.runtime.abort(agent, "secret_exposure")` to **immediately abort the whole
+agent**, emit a `SANDBOX_SECRET_BLOCKED` event and notify the user via `vim.notify`. Tokens
+(`NEOKEY_*`) never trigger an abort, only review escalation.
 
 > Boundaries: entropy detection is heuristic, so long non-hex random strings can be false positives;
 > since tokens round-trip losslessly at commit, a false positive does not change the final written
@@ -830,6 +994,41 @@ When a **raw secret** known to the mapping table appears in tool arguments (deep
 > reload cannot be resolved and the candidate is refused at publish (fail-closed). Pure lowercase hex
 > keys, and commands that read a real file and use the secret within the same command (without going
 > through the model), are out of scope.
+
+### 16.1 High-entropy content generated by the AI (watch generated keys too)
+
+Besides host secrets entering the sandbox, key-like high-entropy content the **AI itself generates**
+inside the sandbox is watched too: `secret.detect_generated(files)` runs entropy/named-rule detection
+directly on candidate file contents (complementing `warn_for_files`, which only recognizes already
+tokenized host secrets). On a hit (generated private-key block, random token, API key, …) it:
+
+- writes a `kind="secret"` evidence record (`event="generated_high_entropy"`);
+- emits `SANDBOX_SECRET_DETECTED` (`source="generated"`) and `audit.observe`
+  (`GENERATED_HIGH_ENTROPY`);
+- escalates the candidate as a secret operation and **forces it into review** (`⚠ 密钥操作`), without
+  aborting the agent.
+
+`NEOKEY_*` tokens (the encrypted form of host secrets) are not counted as generated; they are handled
+by `warn_for_files`. Generated keys in command output / tool arguments go through the existing
+tokenization path (`tokenize_result`/`tokenize_args`).
+
+### 16.2 Local SSH service access forbidden
+
+Sandboxed processes may not use the host's SSH service (ssh-agent / sshd):
+
+- **Agent/sshd paths masked** (`mask_paths` defaults): `/run/sshd`, `/run/sshd.pid`,
+  `/run/ssh-agent.socket`, `/run/user/*/keyring*`, `/run/user/*/ssh*`, `/run/user/*/gnupg*`,
+  `/tmp/ssh-*`, `~/.ssh`, `~/.ssh-agent`, etc. (agent sockets become character devices, so `connect`
+  fails).
+- **Environment cleared**: external commands are prefixed with `unset SSH_AUTH_SOCK SSH_AGENT_PID`
+  (`runtime.proxy_unset_snippet` always emits it), so `ssh`/`git` cannot authenticate via the host
+  agent.
+- **Command-level hard reject**: `wrapper` rejects `ssh`/`scp`/`sftp`/`sshpass` or `ssh://` targeting
+  the local machine (`localhost`/`127.`/`::1`/`0.0.0.0`/`169.254.`) with `SSH_LOCAL_SERVICE_DENIED`,
+  recording evidence/event (raw TCP bypasses the proxy under a shared netns, so a command-level gate
+  is required). Remote `ssh` is unaffected.
+- Classification: `sshd`/`ssh-agent`/`ssh-add`/`ssh-keysign`/`gpg-agent` are T2 privileged (host
+  effects require approval).
 
 ## 17. Privilege tiers and auto-escalation
 
@@ -842,9 +1041,9 @@ per tier. Core modules: `sandbox/privilege.lua` (classify/resolve/record) and
 
 | Tier | Name | Use | Isolation | Review |
 |---|---|---|---|---|
-| **T0** | minimal | normal commands | cap-drop ALL + seccomp + masks + **network allowed by default (host-local intercepted via host_proxy, see §6.1)** | no per-command review; fs changes enter the pending queue |
-| **T1** | elevated | network access, controlled docker | runs isolated, network allowed | auto-authorized, recorded; fs changes enter the pending queue |
-| **T2** | privileged | cap_add, host sockets, host mounts | runs inside a **nested userns** (caps scoped, cannot reach the host) | host effects frozen as a **proposal**, replayed after async approval |
+| **T0** | minimal | normal commands | full capabilities by default (`cap_add={ALL}`) minus host-global capabilities (`cap_drop`: network/clock/modules/raw I/O/boot/MAC/audit) + seccomp (incl. device-node barrier) + masks + **network allowed by default (host-local intercepted via host_proxy, see §6.1)** | no per-command review; fs changes enter the pending queue |
+| **T1** | elevated | network access, controlled docker, package installs | runs isolated, network allowed; when `cap_add` is narrowed, package installs (whole command being package managers) get narrow caps via `packages.cap_add`; docker.sock is unmasked only for docker commands | auto-authorized, recorded; fs changes enter the pending queue |
+| **T2** | privileged | cap_add, host sockets, host mounts | runs inside a **nested userns** with full capabilities (caps scoped to the userns, cannot reach the host; the seccomp baseline still applies) | host effects frozen as a **proposal**, replayed after async approval |
 
 - Classification: `privilege.classify()` parses the command; `docker/podman`→T1,
   `curl/git push/pip/npm`→T1 network, `sudo/mount/modprobe/iptables/systemctl`→T2; compound
@@ -899,6 +1098,43 @@ The tool call never blocks.
 
 See `tools.sandbox.privilege` and `tools.sandbox.docker` in [configuration.md](configuration.md).
 
+### 17.1 Non-root payload, overlay write probing and write escalation
+
+**Non-root by default** (`tools.sandbox.run_as`): sandboxed processes run as a non-root user with
+`--cap-drop ALL` (least privilege). When NeoAI is launched as non-root the current uid is used and
+`--unshare-user --uid/--gid` switches to it inside the user namespace. When launched as root the
+configured dedicated non-root uid is used (default nobody 65534): **bwrap itself still runs as root**
+(so it can create mountpoints and mount overlay under 0700 dirs such as `/root`), and only the
+**payload** is dropped via `setpriv --reuid/--regid` — the payload is non-root both on the host and
+inside the namespace, with no capabilities (NoNewPrivs set by bwrap prevents setuid/file-cap
+elevation). Do not use `bwrap --uid N` (as root it maps guest N to host root, i.e. a root disguise).
+Writable sandbox dirs (overlay upper/work, staging, session) are chowned to that uid.
+> Boundary: a non-root payload's **absolute-path** access to 0700 dirs (e.g. `/root`) is still
+> limited by DAC (`cwd`/relative paths work); when launching as root, place the workspace /
+> `workspace_root` where that uid can traverse (e.g. `/home/<user>`).
+
+**Overlay write probing**: `runtime.overlay_writable(lower, upper, work)` probes a real
+write-read-delete with the real execution path and payload uid, cached by
+`(lower, upper.dev, uid, gid)`. Mount success does not imply writability (non-root plus upper
+ownership/DAC can yield EROFS/EACCES), so overlay is used only when it both mounts **and** writes;
+otherwise it degrades to a bind-mounted private writable dir. Diagnose via `:NeoAISandboxCaps` /
+`runtime.overlay_diagnosis()`.
+
+**All writes staged + privilege-first publish**: command writes always go to the overlay/staging
+(never the real disk). The actual publish (CAS) goes through `sandbox/writer.lua`: it first attempts
+as the non-root payload (the root process drops via `setpriv`), yielding `writer=nonroot`; on a
+permission error (EACCES/EPERM/EROFS) it returns `NEEDS_ROOT`, and `review.apply` marks
+`apply_state=NEEDS_ROOT` and queues it in `:NeoAISandboxReview` (no auto-escalation). After the user
+confirms (`allow_root=true`), the plugin writes as root if it is root, otherwise via `sudo`
+(inheriting the tty); the receipt records `writer`/`escalated`. The baseline is re-verified before the
+escalated write (TOCTOU).
+
+**All-tier auto-escalation**: on a permission/network failure (`operation not permitted` /
+`permission denied` / `read-only file system` / network unreachable, etc.) **any** tier can escalate
+(T0→T1→T2 up to `privilege.max_tier`) and re-run in isolation; each step writes a `privilege`
+evidence record, emits `SANDBOX_PRIVILEGE_ESCALATION_REQUESTED` and `audit.observe`s it — never
+silently.
+
 ## 18. Security grading, controlled containers and behavior audit
 
 ### 18.1 Approval graded by security level (`sandbox/risk.lua`)
@@ -910,12 +1146,25 @@ badge, recorded as evidence (`kind="risk"`) and emitted as `SANDBOX_RISK_ASSESSE
 | --- | --- | --- |
 | L0 low | Routine, reversible, inside workspace | Workspace writes, reads |
 | L1 moderate | Network, package install, T1 | Network, `apt/pip/npm…`, T1 |
-| L2 high | User/system path write, T2, dangerous command | `~`/system path writes, T2, `chmod -R 777`, `systemctl` |
-| L3 critical | Secret, host effect, destructive command | Secret ops, host ops, `rm -rf /`, `curl … | sh` |
+| L2 high | User/system path write, T2, dangerous command, **secret op inside workspace** | `~`/system path writes, T2, `chmod -R 777`, `systemctl`, in-workspace secret op |
+| L3 critical | **Secret op outside workspace**, host effect, destructive command | Out-of-workspace secret op, host ops, `rm -rf /`, `curl … | sh` |
 
 `risk.action(level, opts)` returns `auto` / `record` / `review` (async, non-blocking) / `block`.
 The default is `default="review"` (unchanged semantics); override per level via
 `tools.sandbox.approval.levels`.
+
+- **Dedicated package-manager detection + L2 cap**: `apt`/`apt-get`/`dnf`/`pacman`/`pip`/`pipx`/
+  `uv`/`poetry`/`conda`/`mamba`/`npm`/`npx`/`pnpm`/`yarn`/`bun`/`cargo`/`go`/`gem`/`composer` etc.
+  (`tools.sandbox.packages.managers`) are uniformly recognised as package installs (T1 + network +
+  writable package state roots + root capabilities). Additionally, **changed-path signatures**
+  (`privilege.package_path_manager`) recognise `node_modules`, `site-packages`/`dist-packages`,
+  `/var/lib/apt`, `/var/lib/dpkg`, `~/.cargo`, `~/.npm`, `conda/pkgs`, `/var/lib/gems`, … as
+  "modified by a package manager". Package installs are high-risk but not critical: their state
+  files live outside the workspace and often contain high-entropy GPG signatures/hashes, so they
+  must not be escalated to L3 by "outside-workspace write / secret false positive"
+  (`risk.classify` caps `package` at L2 and skips secret detection for package state files); L3 is
+  kept only when the command itself matches a destructive pattern (`rm -rf /`, `mkfs`,
+  `curl … | sh`, …).
 
 - **Write protection first**: file changes always go through the staging layer, so **process
   privilege escalation is record-only** (evidence + `SANDBOX_PRIVILEGE_RECORDED` + audit) for later

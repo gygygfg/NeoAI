@@ -204,7 +204,21 @@ shell_tools.run_command = helpers.define_tool(
         local s = hp.summary()
         if s then text = text .. "\n\n" .. s end
       end
-      on_success(text)
+      -- 非零退出码 / 取消 / 超时视为失败：以结构化结果 resolve（含 error 字段）——
+      -- UI 据此显示 ❌；同时仍 resolve（而非 reject）以保留沙箱门禁的权限升级检测与候选冻结。
+      if result.aborted or result.timed_out or (result.code ~= 0) then
+        local reason
+        if result.aborted then
+          reason = "命令已取消：" .. tostring(result.message or "cancelled")
+        elseif result.timed_out then
+          reason = "命令执行超时"
+        else
+          reason = "命令退出码 " .. tostring(result.code)
+        end
+        on_success(require("NeoAI.utils.json").encode({ error = reason, output = text }))
+      else
+        on_success(text)
+      end
     end, function(err)
       on_error(conceal.redact(err.message or tostring(err)))
     end)

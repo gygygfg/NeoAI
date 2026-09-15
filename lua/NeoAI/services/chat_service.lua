@@ -161,6 +161,12 @@ local function _persist_agent(agent)
     active = agent.plan_mode == true,
     plan = agent.plan,
   }
+  -- 压缩覆盖层随会话持久化：重开后仍用压缩替换发请求；渲染/持久化的 messages 仍是原始上下文。
+  if agent.compaction then
+    session.metadata.compaction = vim.deepcopy(agent.compaction)
+  else
+    session.metadata.compaction = nil
+  end
   if session.metadata.auto_naming == false then end
   local ok, err = session_store.persist(session)
   if not ok then
@@ -807,6 +813,13 @@ function M.load_session(session_id, opts)
   -- 不再注册系统提示段，系统提示保持逐字节稳定以复用前缀缓存。
   local plan_mode = require("NeoAI.tools.builtin.plan_mode")
   plan_mode.restore(agent, session.metadata and session.metadata.plan)
+  -- 还原压缩覆盖层：仅当载入链恰好等于会话自身消息时应用（分支链含祖先/下游，索引会错位，
+  -- 此时放弃还原，由后续阈值触发重新压缩）。
+  local comp = session.metadata and session.metadata.compaction
+  if comp and comp.checkpoint and comp.replaced
+    and #chain_messages == #(session.messages or {}) then
+    agent.compaction = vim.deepcopy(comp)
+  end
   -- 还原累计用量（含前缀缓存命中/未命中统计），避免重开会话后缓存命中率归零
   local meta = session.metadata or {}
   if meta.usage and type(meta.usage) == "table" then

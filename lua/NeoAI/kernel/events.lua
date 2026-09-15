@@ -162,6 +162,9 @@ M.SANDBOX_SECRET_TRACED = "sandbox:secret_traced"
 M.SANDBOX_SECRET_BLOCKED = "sandbox:secret_blocked"
 M.SANDBOX_SENSITIVE_REDACTED = "sandbox:sensitive_redacted"
 
+-- 越界访问留痕：读取/操作当前工作区（cwd）之外的用户目录（home/root 等）
+M.SANDBOX_OUTSIDE_ACCESS = "sandbox:outside_access"
+
 -- ========== 沙箱安全分级 / 行为审计 / 容器受控 ==========
 M.SANDBOX_RISK_ASSESSED = "sandbox:risk_assessed"
 M.SANDBOX_RISK_BLOCKED = "sandbox:risk_blocked"

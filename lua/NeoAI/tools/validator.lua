@@ -172,10 +172,13 @@ function M.check_approval(tool_name, args, approval_config, mode)
 
   -- 路径安全检查 + 参数安全检查
   local filepath = args.filepath or args.path or args.file
+  local command = args.command or args.cmd or args[1]
   local path_safe = not filepath or M.is_path_allowed(filepath, approval_config.allowed_directories)
-  local params_safe = M.is_params_safe(args, approval_config.allowed_param_groups)
+  -- 无命令参数（纯文件/进程内工具）：命令白名单不适用，只看路径是否落在允许目录内。
+  -- 否则空 allowed_param_groups 会让「路径已允许」的文件工具仍被强制审批。
+  local params_safe = (command == nil) or M.is_params_safe(args, approval_config.allowed_param_groups)
   -- 无路径且无命令时按 auto_allow 决定
-  if not filepath and not (args.command or args.cmd) then
+  if not filepath and command == nil then
     return approval_config.auto_allow == false
   end
   if path_safe and params_safe then return false end

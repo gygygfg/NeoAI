@@ -123,6 +123,30 @@ tests.suite("tools", function(_, it)
     t.false_(validator.is_path_allowed("/tmp/abc-evil/x", { "/tmp/abc" }), "不应仅按字符串前缀放行")
   end)
 
+  it("validator 允许目录的子目录自动放行（文件工具无命令组）", function(t)
+    local validator = require("NeoAI.tools.validator")
+    local cfg = { auto_allow = false, allowed_directories = { "/tmp/ws" }, allowed_param_groups = {} }
+    t.false_(validator.check_approval("edit_file", { filepath = "/tmp/ws/sub/a.lua" }, cfg, "prompt"),
+      "允许目录的子目录不应再要求审批")
+    t.false_(validator.check_approval("edit_file", { filepath = "/tmp/ws/deep/nested/b.lua" }, cfg, "prompt"),
+      "多级子目录同样放行")
+    t.true_(validator.check_approval("edit_file", { filepath = "/tmp/other/a.lua" }, cfg, "prompt"),
+      "允许目录之外仍应审批")
+  end)
+
+  it("全局 allowed_directories 并入各工具并对子目录生效", function(t)
+    local config_store = require("NeoAI.kernel.config_store")
+    local saved = config_store.get_all()
+    config_store.load({ tools = { approval = { allowed_directories = { "/tmp/neoai_ws" } } } })
+    local registry = require("NeoAI.tools.registry")
+    local cfg = registry.get_approval_config("edit_file")
+    t.true_(vim.tbl_contains(cfg.allowed_directories, "/tmp/neoai_ws"), "全局工作区目录应并入工具配置")
+    local validator = require("NeoAI.tools.validator")
+    t.false_(validator.check_approval("edit_file", { filepath = "/tmp/neoai_ws/deep/x.lua" }, cfg, "prompt"),
+      "配置的工作区目录的子目录应自动放行")
+    config_store.load(saved)
+  end)
+
   it("validator 拒绝命令注入", function(t)
     local validator = require("NeoAI.tools.validator")
     t.false_(validator.is_params_safe({ command = "ls; rm -rf /" }, { "ls" }))
@@ -585,7 +609,7 @@ tests.suite("tools", function(_, it)
     local registry = require("NeoAI.tools.registry")
     registry.reset()
     local config_store = require("NeoAI.kernel.config_store")
-    config_store.load({ tools = { approval = { mode = "auto_allow" }, sandbox = { mode = "commit" } } })
+    config_store.load({ tools = { approval = { mode = "auto_allow" }, sandbox = { mode = "commit", ephemeral_roots = {} } } })
     local executor = require("NeoAI.tools.executor")
     local file_ops = require("NeoAI.tools.builtin.file_ops")
     registry.register_many(file_ops.get_tools())
@@ -674,6 +698,42 @@ tests.suite("tools", function(_, it)
       print("  tool_service err:", e.message)
       t.true_(false)
     end)
+  end)
+
+  it("审批「加入工作目录」把文件目录并入 allowed_directories", function(t)
+    local config_store = require("NeoAI.kernel.config_store")
+    config_store.load({ tools = { approval = { mode = "prompt", per_tool = {} } } })
+    local tool_service = require("NeoAI.services.tool_service")
+    tool_service.reset()
+    local registry = require("NeoAI.tools.registry")
+    local helpers = require("NeoAI.tools.builtin.tool_helpers")
+    local ran = false
+    registry.register(helpers.define_tool(
+      "ws_tool", "工作目录工具",
+      { type = "object", properties = { filepath = { type = "string" } }, required = { "filepath" } },
+      function(args, on_success) ran = true; on_success("ok") end,
+      { category = "agent" }
+    ))
+    tool_service.set_approval_ui({
+      show = function(config) config.on_add_to_workspace() end,
+      hide = function() end,
+    })
+    local target = "/tmp/neoai_ws_dir/sub/file.txt"
+    local done, err = false, nil
+    tool_service.execute({ id = "ws-agent" }, "ws_tool", { filepath = target, description = "加入工作目录测试" }, nil, {})
+      :then_(function() done = true end, function(e) err = e; done = true end)
+    vim.wait(2000, function() return done end)
+    t.true_(done, "应完成")
+    t.eq(nil, err, "不应出错")
+    t.true_(ran, "应执行工具")
+    local expected = vim.fn.fnamemodify(target, ":p:h")
+    local found = false
+    for _, d in ipairs(registry.get_approval_config("ws_tool").allowed_directories) do
+      if d == expected then found = true end
+    end
+    t.true_(found, "allowed_directories 应包含目标目录: " .. expected)
+    registry.remove("ws_tool")
+    tool_service.reset()
   end)
 
   it("tool_service 审批拒绝", function(t)
@@ -891,7 +951,7 @@ tests.suite("tools", function(_, it)
     local registry = require("NeoAI.tools.registry")
     registry.reset()
     local config_store = require("NeoAI.kernel.config_store")
-    config_store.load({ tools = { approval = { mode = "auto_allow" }, sandbox = { mode = "commit" } } })
+    config_store.load({ tools = { approval = { mode = "auto_allow" }, sandbox = { mode = "commit", ephemeral_roots = {} } } })
     local executor = require("NeoAI.tools.executor")
     local tree_ops = require("NeoAI.tools.builtin.tree_ops")
     registry.register_many(tree_ops.get_tools())
@@ -917,7 +977,7 @@ tests.suite("tools", function(_, it)
     local registry = require("NeoAI.tools.registry")
     registry.reset()
     local config_store = require("NeoAI.kernel.config_store")
-    config_store.load({ tools = { approval = { mode = "auto_allow" }, sandbox = { mode = "commit" } } })
+    config_store.load({ tools = { approval = { mode = "auto_allow" }, sandbox = { mode = "commit", ephemeral_roots = {} } } })
     local executor = require("NeoAI.tools.executor")
     local tree_ops = require("NeoAI.tools.builtin.tree_ops")
     registry.register_many(tree_ops.get_tools())

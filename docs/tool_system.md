@@ -220,7 +220,7 @@ Node 依赖与浏览器内核（`auto_install=true` 时后台异步，首次调�
 - 按名称字典序输出（确定性，前缀缓存友好）。
 - 空 `properties` 不输出该字段（DeepSeek 拒绝 `[]` schema）。
 - 先环境探测（`tools.environment.filter_tools`），禁用依赖不可用环境（workspace/git）的工具。
-- 计划模式下只保留只读/信息查询 + `ask_user`（`plan_mode.apply_tool_filter`）。
+- 计划模式下只保留只读/信息查询 + `run_command`（只读调研）+ `ask_user`（`plan_mode.apply_tool_filter`）。
 
 ## 8. 环境探测（tools/environment.lua）
 

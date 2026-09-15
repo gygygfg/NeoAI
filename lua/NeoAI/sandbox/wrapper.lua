@@ -88,13 +88,56 @@ local function _enc_root(root)
   return (root:gsub("^/", ""):gsub("/", "_"))
 end
 
---- 构造进程 overlay 规格：配置的可写根（剔除不存在、包含 overlay 基目录的根）+ cwd。
+--- 包安装命令的宿主状态目录（可写 overlay 暂存）。仅当命令被判定为包安装时加入可写根，
+--- 使 apt/dpkg/pip/npm 等能写入索引/缓存/元数据；写入同样冻结为候选。支持 `~` 展开。
+--- @return table 已存在目录数组
+local function _package_roots()
+  local pkg = config_store.get("tools.sandbox.packages") or {}
+  local list = pkg.roots
+  if type(list) ~= "table" then return {} end
+  local out, seen = {}, {}
+  for _, r in ipairs(list) do
+    if type(r) == "string" and r ~= "" and r ~= "/" then
+      local p = vim.fn.expand(r):gsub("/+$", "")
+      if p ~= "" and not seen[p] and vim.fn.isdirectory(p) == 1 then
+        seen[p] = true
+        out[#out + 1] = p
+      end
+    end
+  end
+  return out
+end
+
+--- 沙箱内已是 root（完整能力）：剥掉前导 `sudo`/`doas`（及其常见布尔 flag），使
+--- `sudo apt update` 等价于 `apt update`。沙箱用独立 userns 时仅映射 uid 0，sudo 的
+--- `setresuid(...,1,...)` 会 EINVAL，且 `/etc/sudoers` 被遮蔽，故 sudo 无意义且会失败。
+--- 仅处理简单形式；含 `-u/-g/-i/-s/-p/-C` 等改变用户/登录的形式保持原样。
+--- @param cmd string|nil
+--- @return string|nil
+local function _strip_root_prefix(cmd)
+  if type(cmd) ~= "string" or cmd == "" then return cmd end
+  local lead, after = cmd:match("^(%s*)sudo%s+(.*)$")
+  if not after then lead, after = cmd:match("^(%s*)doas%s+(.*)$") end
+  if not after then return cmd end
+  -- 改变用户/组/登录的形式：不处理（避免语义变化）
+  if after:match("^%-%-?[ugi]") or after:match("^%-%-login") or after:match("^%-%-user")
+    or after:match("^%-%-group") then
+    return cmd
+  end
+  after = after:gsub("^%-%-%s+", ""):gsub("^%-[EHnSbkAPv]%s+", "")
+  if after == "" then return cmd end
+  return lead .. after
+end
+
+--- 构造进程 overlay 规格：配置的可写根（剔除不存在、包含 overlay 基目录的根）+ cwd
+--- + 额外可写根（如工具自身缓存/安装/临时目录，供 exec 统一沙箱化时暂存其写入）。
 --- overlay 的 upper 必须位于其 lower 之外，否则内核挂载返回 EINVAL。
 --- 供外部进程（run_command）与 LSP 命名空间覆盖共用。
 --- @param cwd string
 --- @param base_dir string 进程 overlay 基目录（宿主路径）
+--- @param extra_roots table|nil 额外可写根
 --- @return table 数组 { root, upper, work }
-function M.build_overlay_specs(cwd, base_dir)
+function M.build_overlay_specs(cwd, base_dir, extra_roots)
   local cfg_roots = config_store.get("tools.sandbox.process_roots")
   if type(cfg_roots) ~= "table" then
     cfg_roots = {}
@@ -128,6 +171,9 @@ function M.build_overlay_specs(cwd, base_dir)
   for _, r in ipairs(cfg_roots) do
     if not is_tmpfs_root(r) and not (is_nonoverlay(r) and under(cwd, r)) then add(r) end
   end
+  for _, r in ipairs(extra_roots or {}) do
+    if not is_tmpfs_root(r) and not (is_nonoverlay(r) and under(cwd, r)) then add(r) end
+  end
   local covered = false
   for _, r in ipairs(roots) do if under(cwd, r) then covered = true break end end
   if not covered then add(cwd) end
@@ -138,6 +184,8 @@ function M.build_overlay_specs(cwd, base_dir)
     fs.ensure_dir(upper)
     fs.ensure_dir(work)
     fs.ensure_dir(bind)
+    -- 载荷非 root 时，overlay upper/work 必须归载荷所有，否则内核拒绝可写挂载（EROFS）。
+    runtime.chown_payload(d)
     specs[#specs + 1] = { root = r, upper = upper, work = work, bind = bind }
   end
   return specs
@@ -176,6 +224,11 @@ local function _enqueue_review(cand, attempt, cfg, env, meta)
     risk_reasons = meta and meta.risk_reasons or nil,
     package = meta and meta.package or nil,
     action = meta and meta.action or nil,
+    -- 包安装：管理器/包名/合并键/命令，供「按安装命令」合并审批与界面标注。
+    command = meta and meta.command or nil,
+    package_manager = meta and meta.package_manager or nil,
+    package_names = meta and meta.package_names or nil,
+    package_key = meta and meta.package_key or nil,
   })
 end
 
@@ -189,6 +242,39 @@ end
 --- @param process_info table|nil
 --- @return table { ok, value?, err? }
 local function _settle_candidate(cand, attempt, ctx, cfg, spec, result, process_info)
+  -- 命名空间映射的临时根（/tmp、/var/tmp 等）：写入为会话私有、nvim 退出即丢弃，
+  -- 不进入待审队列、不 CAS 发布、也不弹审批悬浮窗；暂存内容保留以供本次会话读取一致。
+  -- 仅当路径**不在 cwd 子树内**时才视为临时根（cwd 位于 /tmp 时其工作区仍走正常审批）。
+  -- 根列表见 `tools.sandbox.ephemeral_roots`（默认同 tmpfs_roots；`{}` 关闭）。
+  do
+    local roots = config_store.get("tools.sandbox.ephemeral_roots")
+    if type(roots) ~= "table" then roots = require("NeoAI.sandbox.runtime").tmpfs_roots() end
+    if #roots > 0 and #(cand.files or {}) > 0 then
+      local cwd = (vim.fn.getcwd() or ""):gsub("/+$", "")
+      local function under(p, r)
+        return p == r or p:sub(1, #r + 1) == r .. "/"
+      end
+      local function ephemeral(p)
+        if type(p) ~= "string" then return false end
+        if cwd ~= "" and under(p, cwd) then return false end
+        for _, r in ipairs(roots) do if under(p, r) then return true end end
+        return false
+      end
+      local keep, dropped = {}, false
+      for _, f in ipairs(cand.files) do
+        if ephemeral(f.path) then dropped = true else keep[#keep + 1] = f end
+      end
+      if dropped then
+        cand.files = keep
+        if #keep == 0 then
+          -- 全部落在临时根：不冻结候选/不入待审/不发布（退出即丢弃）。
+          require("NeoAI.sandbox.store").discard_candidate(cand.candidate_digest)
+          control.transition(attempt, "COMPLETED_READ_ONLY")
+          return { ok = true, value = result }
+        end
+      end
+    end
+  end
   -- 影响与证据（fs/process），未知用 null 表达
   local impacts = impact.from_candidate(cand, { command_id = attempt.command_id, attempt_id = attempt.attempt_id })
   if process_info then impacts[#impacts + 1] = impact.process(process_info) end
@@ -200,19 +286,75 @@ local function _settle_candidate(cand, attempt, ctx, cfg, spec, result, process_
   -- 安全分级：按写路径/包安装/密钥/提权/网络/结果信号评估级别并给出建议动作。
   local risk = require("NeoAI.sandbox.risk")
   local review = require("NeoAI.sandbox.review")
+  local paths = _cand_paths(cand)
+  -- 专用包管理器识别：命令未命中包管理器名单，但改动落在包管理器状态/安装目录
+  -- （node_modules、site-packages、/var/lib/apt、~/.cargo 等）时，同样按包安装处理（封顶 L2）。
+  local pkg_by_path = nil
+  do
+    local privilege = require("NeoAI.sandbox.privilege")
+    for _, p in ipairs(paths) do
+      pkg_by_path = privilege.package_path_manager(p)
+      if pkg_by_path then break end
+    end
+  end
+  local is_pkg = attempt.package == true or pkg_by_path ~= nil
   local secret_warning = nil
   do
-    local ok, s = pcall(require, "NeoAI.sandbox.secret")
-    if ok and s.enabled() then secret_warning = s.warn_for_files(cand.files) end
+    local ok, s = pcall(require("NeoAI.sandbox.secret"))
+    -- 包安装状态文件（apt lists/pkgcache、pip/npm 缓存等）常含高熵签名/哈希，并非用户密钥；
+    -- 跳过密钥检测，避免误报「密钥操作」并误升到 L3。
+    if ok and s.enabled() and not is_pkg then
+      secret_warning = s.warn_for_files(cand.files)
+    end
   end
-  local paths = _cand_paths(cand)
+  -- AI 生成的高熵信息（密钥类）：候选内容含熵/具名候选（非宿主 token）时留痕、发事件、审计，
+  -- 并给出「密钥操作」提示，强制进入待审（不终止 Agent）。与宿主密钥 token 化互补。
+  local generated = {}
+  do
+    local ok, s = pcall(require, "NeoAI.sandbox.secret")
+    if ok and s.enabled() and not is_pkg then
+      generated = s.detect_generated(cand.files)
+      if #generated > 0 then
+        pcall(function()
+          require("NeoAI.sandbox.evidence").add("secret", {
+            event = "generated_high_entropy", count = #generated, hits = generated,
+            source = "observed", coverage = "partial",
+          }, { tool = attempt.tool_name, command_id = attempt.command_id, attempt_id = attempt.attempt_id })
+        end)
+        pcall(function()
+          require("NeoAI.kernel.event_bus").emit(
+            require("NeoAI.kernel.events").SANDBOX_SECRET_DETECTED, {
+              source = "generated", tool = attempt.tool_name, count = #generated,
+              command_id = attempt.command_id,
+            })
+        end)
+        pcall(function()
+          require("NeoAI.sandbox.audit").observe({
+            kind = "secret", tool = attempt.tool_name, level = 2,
+            reasons = { "GENERATED_HIGH_ENTROPY" }, command_id = attempt.command_id,
+          })
+        end)
+        if not secret_warning then
+          secret_warning = { count = #generated, tokens = {}, generated = true,
+            reason = "HIGH_ENTROPY_GENERATED" }
+        end
+      end
+    end
+  end
+  -- 本次调用涉及加密 token 或敏感环境变量名（但候选文件不含 token）时，也给出密钥操作警告，
+  -- 使待审悬浮窗展示 `⚠ 密钥操作`（软提示 + 审批，不终止 Agent）。
+  if not secret_warning and ctx and ctx.secret_operation then
+    secret_warning = { count = 1, tokens = {}, names = ctx.secret_names or {}, reason = "KEY_OPERATION" }
+  end
   local rf = {
     effect = spec.effect,
     paths = paths,
     privilege_tier = attempt.privilege_tier,
-    package = attempt.package == true,
+    package = is_pkg,
     network = attempt.network == true,
-    secret = (secret_warning and (secret_warning.count or 0) > 0) or false,
+    -- 密钥操作：候选文件含 token，或本次调用使用了 KEY 环境变量 token（提级强制待审）。
+    secret = (secret_warning and (secret_warning.count or 0) > 0)
+      or (ctx and ctx.secret_operation == true) or false,
     command = attempt.container_command or (process_info and process_info.command) or nil,
   }
   local r = risk.classify(rf)
@@ -221,6 +363,13 @@ local function _settle_candidate(cand, attempt, ctx, cfg, spec, result, process_
     r.name = risk.level_name(r.level)
     r.badge = risk.badge(r.level)
     for _, x in ipairs(attempt.result_risk.reasons or {}) do r.reasons[#r.reasons + 1] = x end
+  end
+  -- 包安装降级：包安装的状态文件在工作区外、常含高熵签名，结果信号（如磁盘/网络）不应把
+  -- 它推到 L3；仅当命令本身命中破坏性模式时才保留 L3。
+  if rf.package and r.level >= 3 and (risk.dangerous_level(rf.command) or 0) < 3 then
+    r.level = 2
+    r.name = risk.level_name(2)
+    r.badge = risk.badge(2)
   end
   risk.record({
     tool = attempt.tool_name, command_id = attempt.command_id, attempt_id = attempt.attempt_id,
@@ -292,16 +441,51 @@ local function _settle_candidate(cand, attempt, ctx, cfg, spec, result, process_
 
   -- 结果原样返回给模型：不把「已暂存/待审」暴露给 AI，让它认为修改已完成；
   -- 待审状态仅通过 UI 徽标提示用户（见 services.status 的 sandbox 段）。
+  -- 包安装：提取管理器与包名（用于按安装命令合并审批与界面标注）。
+  local pinfo = nil
+  if rf.package then
+    pcall(function() pinfo = require("NeoAI.sandbox.privilege").package_info(rf.command) end)
+  end
+  if not pinfo and pkg_by_path then
+    pinfo = { manager = pkg_by_path, packages = {}, key = pkg_by_path .. ":*" }
+  end
   local item = _enqueue_review(cand, attempt, cfg, env, {
     secret_warning = secret_warning,
     risk_level = r.level, risk_name = r.name, risk_reasons = r.reasons,
     package = rf.package, action = action,
+    command = rf.command,
+    package_manager = pinfo and pinfo.manager or nil,
+    package_names = pinfo and pinfo.packages or nil,
+    package_key = pinfo and pinfo.key or nil,
   })
   if item then
     -- 同一文件被再次编辑：新候选取代同路径的旧待审项（队列只保留最新版本）
     require("NeoAI.sandbox.review").supersede_by_paths(_cand_paths(cand), item.change_set_id)
   end
   control.transition(attempt, "AWAITING_PUBLICATION_AUTH")
+  return { ok = true, value = result }
+end
+
+--- 冻结工具子进程（exec，长驻场景）产生的候选并按模式入队/发布。
+--- 供 MCP stdio server 等长驻进程在 on_exit 时调用；无改动则仅清理暂存。
+--- @param attempt table
+--- @param cand table|nil
+--- @param ctx table
+--- @param spec table
+--- @param result any
+--- @param process_info table|nil
+--- @return table { ok, value?, err? }
+function M.settle_exec_candidate(attempt, cand, ctx, spec, result, process_info)
+  local cfg = config_store.get("tools.sandbox") or {}
+  if cand and #cand.files > 0 then
+    cand.command_id = attempt.command_id
+    store.write_candidate(cand)
+    candidate.merge_candidate(cand)
+    local settled = _settle_candidate(cand, attempt, ctx, cfg, spec, result, process_info)
+    candidate.cleanup(attempt.attempt_id)
+    return settled
+  end
+  candidate.cleanup(attempt.attempt_id)
   return { ok = true, value = result }
 end
 
@@ -461,17 +645,37 @@ function M.gate(tool, args, ctx, call_original)
       return async.reject({ kind = "sandbox", message = rt_err, command_id = attempt.command_id })
     end
     candidate.begin(attempt, root)
-    local real_cwd = vim.fn.getcwd()
+    -- 工具子进程（exec）可指定进程 cwd（通常取可写根公共父目录，避免遮蔽目录把 overlay 遮蔽）；
+    -- 未指定时沿用当前工作目录。
+    local real_cwd = ctx.sandbox_exec_cwd or vim.fn.getcwd()
     -- 会话级共享可写层：同一 agent 循环内所有命令共用（命令 N 看得到命令 N-1 的改动），
     -- agentEnd 轮换会话时随会话目录清理（改动已冻结为候选）。可写根（默认仅 cwd；
     -- /tmp、/var/tmp 属每会话私有 tmpfs，不作为 overlay lower）的写入进会话可写层。
     local proc_dir = candidate.process_dir()
     local staging = proc_dir .. "/fallback" -- overlay 不可用时的私有可写 cwd
     fs.ensure_dir(staging)
-    local specs = M.build_overlay_specs(real_cwd, proc_dir)
+    -- 沙箱内已是 root：剥掉冗余的 sudo/doas（否则会误判为 T2/userns 并失败）。
+    if type(args.command) == "string" then
+      args.command = _strip_root_prefix(args.command)
+    end
+    -- 权限档位：分类命令（需在构建可写根之前，以便包安装命令加入其状态目录作为可写根）。
+    local privilege = require("NeoAI.sandbox.privilege")
+    local pcfg = config_store.get("tools.sandbox.privilege") or {}
+    local req = privilege.classify(attempt.tool_name, args, spec)
+    attempt.package = req.package == true
+    attempt.network = req.network == true
+    -- 可写根 = 工具声明（spec.writable_roots）+（包安装时）包管理器状态目录。
+    -- 包安装写入的索引/缓存/元数据同样进入 overlay，冻结为候选（不直接落盘）。
+    local extra_roots = {}
+    for _, r in ipairs(spec.writable_roots or {}) do extra_roots[#extra_roots + 1] = r end
+    if req.package then
+      attempt.package_roots = _package_roots()
+      for _, r in ipairs(attempt.package_roots) do extra_roots[#extra_roots + 1] = r end
+    end
+    local specs = M.build_overlay_specs(real_cwd, proc_dir, extra_roots)
     -- 选定每个可写根实际使用的层（overlay 或 bind），供物化/捕获/前缀构造一致使用
     for _, spec in ipairs(specs) do
-      if runtime.overlay_available() and runtime.overlay_mountable(spec.root, spec.upper, spec.work) then
+      if runtime.overlay_available() and runtime.overlay_writable(spec.root, spec.upper, spec.work) then
         spec.mode = "overlay"
       else
         spec.mode = "bind"
@@ -487,28 +691,32 @@ function M.gate(tool, args, ctx, call_original)
     if session_shell then
       session_dir = proc_dir .. "/shell"
       fs.ensure_dir(session_dir)
+      -- 会话 shell 状态目录（bind 到沙箱内）须归载荷所有，否则非 root 载荷无法写入
+      -- cwd/env（`sh: cannot create .../cwd: Permission denied`）。
+      runtime.chown_payload(session_dir)
     end
     control.transition(attempt, "STAGING")
-    -- 资源域：配置了 limits 时必须成功创建，否则明确拒绝（不静默降级）
+    -- 资源域（cgroup v2）：默认按宿主资源动态设置 CPU/内存/PID 上限（见 cgroup.resolve_limits）。
+    -- 显式配置 limits 时以静态值为准；cgroup 不可用时默认跳过（记录警告，不阻断），
+    -- 仅当 limits.fail_closed=true 时明确拒绝（不静默降级）。
     local cgroup = require("NeoAI.sandbox.cgroup")
     local cg_handle = nil
     if cgroup.limits_configured() then
-      local limits = config_store.get("tools.sandbox.limits") or {}
+      local lcfg = config_store.get("tools.sandbox.limits") or {}
+      local limits = cgroup.resolve_limits()
       local h, cerr = cgroup.prepare(attempt.attempt_id, limits)
       if not h then
-        candidate.cleanup(attempt.attempt_id)
-        control.transition(attempt, "FAILED")
-        return async.reject({ kind = "sandbox", message = cerr, command_id = attempt.command_id })
+        if lcfg.fail_closed == true then
+          candidate.cleanup(attempt.attempt_id)
+          control.transition(attempt, "FAILED")
+          return async.reject({ kind = "sandbox", message = cerr, command_id = attempt.command_id })
+        end
+        require("NeoAI.kernel.logger").warn("[sandbox] cgroup 资源限制不可用，跳过：%s", tostring(cerr))
+      else
+        cg_handle = h
       end
-      cg_handle = h
     end
 
-    -- 权限档位：分类命令所需权限并解析为隔离参数（T0 = 最小权限 + 默认隔离网络）。
-    local privilege = require("NeoAI.sandbox.privilege")
-    local pcfg = config_store.get("tools.sandbox.privilege") or {}
-    local req = privilege.classify(attempt.tool_name, args, spec)
-    attempt.package = req.package == true
-    attempt.network = req.network == true
     -- 容器受控：docker/podman 等运行时尽量与沙箱同 namespace（podman 无守护进程可共享；
     -- docker 依赖外部 daemon，保持受控 socket 并记录原因）。重写命令以注入共享标志。
     pcall(function()
@@ -532,14 +740,21 @@ function M.gate(tool, args, ctx, call_original)
         active_specs = {}
       end
       -- 审批放行：把本次调用获批解除遮蔽的条目并入 unmask（与档位 unmask 合并）。
+      -- 工具子进程可写根（spec.writable_roots）与包安装状态目录也一并 unmask，
+      -- 避免其被遮蔽目录遮挡（overlay 在遮蔽之前挂载，遮蔽会将其覆盖）。
       local eff_priv = priv
       local approved = ctx.sandbox_unmask
-      if type(approved) == "table" and #approved > 0 then
+      local extra_unmask = {}
+      for _, p in ipairs(spec.writable_roots or {}) do extra_unmask[#extra_unmask + 1] = p end
+      for _, p in ipairs(attempt.package_roots or {}) do extra_unmask[#extra_unmask + 1] = p end
+      if (type(approved) == "table" and #approved > 0)
+        or #extra_unmask > 0 then
         eff_priv = {}
         for k, v in pairs(priv or {}) do eff_priv[k] = v end
         local merged = {}
         for _, p in ipairs((priv and priv.unmask) or {}) do merged[#merged + 1] = p end
-        for _, p in ipairs(approved) do merged[#merged + 1] = p end
+        for _, p in ipairs(approved or {}) do merged[#merged + 1] = p end
+        for _, p in ipairs(extra_unmask or {}) do merged[#merged + 1] = p end
         eff_priv.unmask = merged
       end
       local prefix, perr, eff_cwd = runtime.process_prefix({
@@ -576,6 +791,29 @@ function M.gate(tool, args, ctx, call_original)
       candidate.cleanup(attempt.attempt_id)
       control.transition(attempt, "FAILED")
       return async.reject({ kind = "sandbox", message = msg, command_id = attempt.command_id })
+    end
+
+    -- 禁止访问本机 SSH 服务：命令级硬拒绝（ssh/scp/sftp/sshpass 或 ssh:// 指向回环/本机）。
+    -- 与「agent socket 遮蔽 + SSH_AUTH_SOCK 环境清除」共同封死本机 ssh 服务访问。
+    do
+      local denied, target = require("NeoAI.sandbox.risk").ssh_local_target(args and args.command)
+      if denied then
+        pcall(function()
+          require("NeoAI.sandbox.evidence").add("privilege", {
+            tool = attempt.tool_name, command = args and args.command,
+            reasons = { "SSH_LOCAL_SERVICE_DENIED:" .. tostring(target) },
+            source = "observed", coverage = "full",
+          }, { tool = attempt.tool_name, command_id = attempt.command_id, attempt_id = attempt.attempt_id })
+        end)
+        pcall(function()
+          require("NeoAI.kernel.event_bus").emit(
+            require("NeoAI.kernel.events").SANDBOX_PRIVILEGE_RECORDED, {
+              tool = attempt.tool_name, reason = "SSH_LOCAL_SERVICE_DENIED",
+              command_id = attempt.command_id,
+            })
+        end)
+        return _fail("SSH_LOCAL_SERVICE_DENIED: 禁止访问本机 SSH 服务（" .. tostring(target) .. "）")
+      end
     end
 
     local resolved = privilege.resolve(req.tier, req)
@@ -674,10 +912,11 @@ function M.gate(tool, args, ctx, call_original)
       end
     end
 
-    --- 执行一次；T0 因权限/网络失败时自动发起升级并在隔离内重跑（记录，不静默）。
+    --- 执行一次；权限/网络失败时自动发起升级并在隔离内重跑（记录，不静默）。
+    --- 全档位生效：T0 失败升 T1，T1 失败升 T2（直到 max_tier），每步写证据/事件/审计。
     local function run(priv, current_tier)
       call_original():then_(function(res)
-        if pcfg.auto_escalate ~= false and current_tier == 0 then
+        if pcfg.auto_escalate ~= false and current_tier < (pcfg.max_tier or 2) then
           local raw = ctx.sandbox_last_result
           local esc = privilege.detect_escalation(raw)
           if esc and esc.tier > current_tier then

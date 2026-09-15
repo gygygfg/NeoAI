@@ -159,6 +159,26 @@ tests.suite("status", function(_, it)
     services.provide("services.sandbox", saved)
   end)
 
+  it("沙箱待审含 L3 时显示红色危险高亮与 ⚠危险 标记", function(t)
+    init_chat()
+    local status = require("NeoAI.services.status")
+    local services = require("NeoAI.kernel.services")
+    local saved = services.use("services.sandbox")
+    t.eq("NeoAISandboxDanger", status.colors().sandbox_danger, "应链接红色危险高亮组")
+    t.eq(1, vim.fn.hlexists("NeoAISandboxDanger"), "危险高亮组应已定义")
+    services.provide("services.sandbox", {
+      pending_summary = function() return { count = 2, max_level = 3 } end,
+    })
+    t.eq("待审2 ⚠危险", status.segment("sandbox"), "L3 待审应带危险标记")
+    t.eq(3, status.sandbox_level(), "应报告最高级别 L3")
+    services.provide("services.sandbox", {
+      pending_summary = function() return { count = 1, max_level = 2 } end,
+    })
+    t.eq("待审1", status.segment("sandbox"), "非 L3 不应带危险标记")
+    t.eq(2, status.sandbox_level(), "应报告 L2")
+    services.provide("services.sandbox", saved)
+  end)
+
   it("capacity 优先用 API 最近一次用量并分级告警", function(t)
     local chat = init_chat()
     local status = require("NeoAI.services.status")

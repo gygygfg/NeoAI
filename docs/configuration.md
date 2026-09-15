@@ -98,12 +98,12 @@ Groq 等的 `context_window`）；拿不到才回退内置表。数值优先级�
 context_cache = {
   enabled = true,
   context_window = 64000,       -- 上下文窗口兜底值：用户显式非默认值优先，否则按模型能力表推导
-  threshold_ratio = 0.8,        -- 达到该比例触发压缩（显式缓存模型自动取更保守值）
-  retain_ratio = 0.16,          -- 保留的最近历史比例
-  retain_min_tokens = 4096,     -- 尾部保留下限
+  threshold_ratio = 0.8,        -- 达到该比例触发后台异步压缩（不阻塞、不弹窗；显式缓存模型自动取更保守值）
+  retain_ratio = 0.16,          -- 溢出恢复时保留的最近历史比例（常规压缩折叠第一轮至倒数第二轮）
+  retain_min_tokens = 4096,     -- 溢出恢复的尾部保留下限
   compact_max_tokens = 8192,    -- 压缩摘要输出上限
-  min_shadow_messages = 2,      -- 至少折叠多少条才值得压缩
-  compaction_retries = 1,       -- 摘要后仍高于阈值的重试次数
+  min_shadow_messages = 2,      -- 溢出恢复至少折叠多少条（常规压缩按轮次范围）
+  compaction_retries = 1,       -- 摘要后仍高于阈值的重试次数（常规压缩无新可折叠消息时停止）
   prune_enabled = true,         -- 摘要前先做模型无关的工具结果裁剪
   prune_threshold_chars = 8192, -- 文本码点超过该值的工具结果才裁剪
   prune_head_chars = 4096,      -- 裁剪保留的头部码点数
@@ -112,6 +112,11 @@ context_cache = {
   identity = "你是一个由 NeoAI 驱动的 AI 编程助手。",
 }
 ```
+
+> **压缩行为**：常规（阈值触发）压缩在后台**异步非阻塞**执行——折叠第一轮至倒数第二轮（保留最后一轮完整），
+> 摘要完成后写入**压缩覆盖层**（`agent.compaction`），后续请求与再次压缩都使用压缩后的替换；聊天渲染与会话持久化
+> 仍是**原始上下文**（覆盖层随会话持久化于 `session.metadata.compaction`，重开后继续生效）。压缩**不弹悬浮窗**。
+> 上下文溢出恢复（`force_compact`）仍为阻塞等待，并按 `retain_ratio`/`retain_min_tokens`/`min_shadow_messages` 做最大化缩减。
 
 ### 2.2 `ui`
 
@@ -126,7 +131,7 @@ context_cache = {
 | `input_box` | `{idle_height=1, min_height=5, max_ratio=0.8}` | 输入框高度（空闲/聚焦/增长上限） |
 | `chat` | `{mousescroll_max_blank=3, incremental=true}` | 鼠标滚轮滚到底时末行下方允许的最大空白行数（0=严格贴底）；`incremental` 开启增量刷新（只重渲染变化的消息块且只写差异行），设为 `false` 降级回整 buffer 全量重写 |
 | `trajectory` | `{log_dir=".../NeoAI/logs"}` | 轨迹显示模式的日志保存目录 |
-| `statusline` | `{enabled=true, winbar=true, parts={mode,model,usage,cache,capacity,sandbox}, separator=" ", colors=...}` | lualine 状态栏；`sandbox` 段在沙箱待审数 > 0 时显示 `待审N`（`N` 为待审**文件**总数，审批单位为单个文件），默认链接醒目高亮组 `NeoAISandboxPending`（黄底加粗，可在 `colors.sandbox` 覆盖） |
+| `statusline` | `{enabled=true, winbar=true, parts={mode,model,usage,cache,capacity,sandbox}, separator=" ", colors=...}` | lualine 状态栏；`sandbox` 段在沙箱待审数 > 0 时显示 `待审N`（`N` 为待审**文件**总数，审批单位为单个文件），默认链接醒目高亮组 `NeoAISandboxPending`（黄底加粗，可在 `colors.sandbox` 覆盖）；待审队列含 **L3（高危）** 时该段追加 `⚠危险` 并切换为红色危险高亮组 `NeoAISandboxDanger`（可在 `colors.sandbox_danger` 覆盖） |
 
 ### 2.3 `keymaps`
 
@@ -199,6 +204,9 @@ approval = {
 
 > **审批决策**：`mode=auto_allow` → 不审批；`mode=strict` → 必审批；
 > 工具 `auto_allow=true` → 不审批；路径落允许目录 + 命令首词落参数组 → 不审批。
+> `allowed_directories` 为**全局工作区允许目录**（对所有工具生效，且**包含其所有子目录**）；
+> 工具自身与 `per_tool` 的条目与之**并集**合并，只追加不覆盖。文件类工具只按路径判定
+> （无命令参数时不要求命令白名单），故配置工作区目录后其子目录无需逐个审批。
 
 **sandbox（工具执行沙箱）**：
 
@@ -206,24 +214,46 @@ approval = {
 sandbox = {
   enabled = true,                  -- 总开关
   fail_closed = true,              -- 沙箱服务缺失/禁用时拒绝执行（不静默降级）
+  -- 所有工具内部 spawn 的子进程（run_command/git/curl/node/MCP server 等）统一在沙箱命名空间内
+  -- 创建；工具自身缓存/临时目录经可写绑定暴露，共享根 stdpath('cache')/NeoAI/shared（宿主与沙箱同路径）。
   mode = "dry_run",                -- dry_run（默认，仅冻结候选）| commit（授权后立即 CAS 发布）
   backend = "auto",                -- auto | bwrap | unshare
   offline = false,                 -- 网络默认放行（仅记录，不拦截）；true 时硬拒绝网络并隔离进程网络
   require_seccomp = true,          -- 缺少 seccomp 能力时是否拒绝外部执行（默认开，fail-closed）
   seccomp = { enabled = true, filter_path = "" }, -- seccomp 基线（内置 denylist；默认开；仅 bwrap）
-  cap_add = {},                    -- 按需加回的 capability；默认空 = bwrap --cap-drop ALL
-  -- 最小只读系统集（白名单）：仅这些宿主根/子树/文件以只读方式暴露给外部命令；未列出的路径
-  -- 在沙箱内不存在（不再 `--ro-bind / /`）。不再整目录暴露 /usr（避免泄露 /usr/share/doc
-  -- 包数据库、/usr/local/go_workspace、/usr/src 等）；/lib*、/bin、/sbin 为加载器符号链接根，
-  -- 必须保留。支持 `*` 通配，不存在的条目跳过。
+  cap_add = {},                    -- 默认最小权限（`--cap-drop ALL`）；按命令窄范围加回（包安装经 packages.cap_add）。仅调试时才设 { "ALL" }
+  -- 载荷运行身份（最小权限）：沙箱内进程默认以非 root 用户运行。
+  --   * 非 root 启动 NeoAI：自动用当前 uid/gid（本项被忽略）。
+  --   * root 启动 NeoAI：必须用本项指定的专用非 root uid/gid（默认 nobody 65534）；插件先用
+  --     `setpriv` 把 bwrap 降为该 uid 再进入 userns，使载荷在宿主与 ns 内都非 root。沙箱可写
+  --     目录（overlay upper/work、暂存、会话）会 chown 到该 uid/gid；工作区/存储根须可被其遍历
+  --     （root 启动时勿把工作区/`workspace_root` 放在 0700 的 /root 下）。
+  --   * uid = 0：显式放弃降权（以 root 运行载荷，不推荐）。
+  run_as = { uid = 65534, gid = 65534 },
+  cap_drop = {                     -- 主机全局能力收敛：即便 cap_add 含 ALL 也逐项丢弃（网络栈/时钟/内核模块/裸 I/O/重启/MAC/审计）
+    "CAP_NET_ADMIN", "CAP_SYS_TIME", "CAP_SYS_MODULE", "CAP_SYS_RAWIO",
+    "CAP_SYS_BOOT", "CAP_MAC_ADMIN", "CAP_MAC_OVERRIDE", "CAP_AUDIT_CONTROL",
+  },
+  max_file_bytes = 8 * 1024 * 1024, -- 单文件纳入候选上限（字节）；超过不纳入候选，防 apt/pkgcache.bin 等大缓存阻塞主线程；0 = 不限制
+  -- 读取面（默认开）：true 时整机根以只读方式暴露（`--ro-bind / /`），仅遮蔽 mask_paths 中的
+  -- 重要配置文件/凭据（~/.ssh、~/.aws、/etc/shadow、sudoers、docker.sock 等）与沙箱自身存储；
+  -- mask_dirs（home/root 兄弟目录）不再挂载遮蔽，但访问 cwd 之外的用户目录会**留痕**
+  -- （evidence + `sandbox:outside_access` 事件）并在审批悬浮窗 `:NeoAISandboxReview` 的
+  -- 「越界访问留痕」区展示（非阻塞，仍放行）。false 时退回下面的最小只读白名单。
+  read_all = true,
+  -- 最小只读系统集（白名单，仅在 read_all=false 时生效）：仅这些宿主根/子树/文件以只读方式
+  -- 暴露给外部命令；未列出的路径在沙箱内不存在。不整目录暴露 /usr（避免泄露
+  -- /usr/local/go_workspace、/usr/src 等），但整目录只读暴露 /usr/share 与 /var/lib，使
+  -- run_command 能读取运行时共享数据（nodejs/dotnet/java/git-core/terminfo 等）与宿主包数据库
+  -- （dpkg/apt/rpm 等）；危险/敏感子路径仍由 mask_paths 遮蔽（如 /var/lib/docker）。
+  -- /lib*、/bin、/sbin 为加载器符号链接根，必须保留。支持 `*` 通配，不存在的条目跳过。
   readonly_roots = {
     "/lib", "/lib32", "/lib64", "/libx32", "/bin", "/sbin",
     "/usr/bin", "/usr/sbin", "/usr/lib", "/usr/lib32", "/usr/lib64", "/usr/libx32",
     "/usr/libexec", "/usr/include",
-    "/usr/share/terminfo", "/usr/share/locale", "/usr/share/zoneinfo",
-    "/usr/share/ca-certificates", "/usr/share/misc", "/usr/share/common-licenses",
-    "/usr/share/git-core", "/usr/share/vim", "/usr/share/nvim",
+    "/usr/share",                  -- 运行时共享数据（nodejs/dotnet/java/git-core/terminfo 等）
     "/usr/local/bin", "/usr/local/sbin", "/usr/local/lib", "/usr/local/libexec", "/usr/local/include", "/usr/local/go",
+    "/var/lib",                    -- 宿主包数据库（dpkg/apt/rpm 等）；危险子路径仍由 mask_paths 遮蔽
   },
   readonly_paths = { "/etc/ld.so.cache", "/etc/passwd", "/etc/group", "/etc/nsswitch.conf",
     "/etc/hosts", "/etc/ssl", "/etc/alternatives", "/etc/localtime",
@@ -233,12 +263,17 @@ sandbox = {
   expose_tool_paths = false,       -- 自动直通宿主 PATH 中的工具目录（opt-in）：把宿主 PATH 里存在且非凭据/系统目录的 bin 目录只读暴露并前置到沙箱 PATH，使 node/npm/fd/go 等装在 $HOME 下的工具链可用（会扩大读取面）
   resolv_conf = "sanitize",        -- /etc/resolv.conf：sanitize（默认，仅 nameserver）| hide | passthrough
   tmpfs_roots = { "/tmp", "/var/tmp" }, -- 每会话私有临时根（不作为 overlay lower；退出即销毁）
+  ephemeral_roots = { "/tmp", "/var/tmp" }, -- 临时候选根（cwd 子树除外）：这些根下的文件写入为会话私有、nvim 退出即丢弃，不产生待审候选/不发布/不弹审批悬浮窗；`{}` 关闭
   tmp_private_base = "host",       -- 临时根私有目录位置：host（默认，宿主根下隐藏子目录 /tmp/.cache-<tag>/<session>，命名空间映射回该根，隔离 AI）| session（旧行为：建在会话进程目录）
   hide_proc_paths = { "/proc/cmdline", "/proc/version" }, -- 以空文件覆盖，隐藏宿主内核命令行/版本（危险全局 sysctl 为常驻强制遮蔽，只增不减）
   mask_paths = {                   -- 遮蔽宿主敏感路径（目录 tmpfs / 文件·socket 用 /dev/null 覆盖）
     "/run/docker.sock", "/var/run/docker.sock", "/var/lib/docker", "/var/lib/containerd",
     "/root/.config/herdr", "/etc/1panel", "/run/dbus", "/run/systemd",
     "/root/.ssh", "/root/.aws", "/root/.gnupg", "/root/.kube", "/root/.cache/keyring-*",
+    -- Git 凭据与签名密钥（SSH/GPG/credential store/netrc/gh token），含非 root home
+    "/root/.git-credentials", "/root/.config/git/credentials", "/root/.git-credential-cache", "/root/.config/gh",
+    "/home/*/.ssh", "/home/*/.gnupg", "/home/*/.netrc", "/home/*/.git-credentials",
+    "/home/*/.config/git/credentials", "/home/*/.config/gh", "/home/*/.docker/config.json",
     "/etc/shadow", "/etc/gshadow", "/etc/sudoers", "/etc/machine-id", "/etc/ssh",
     "/var/log", "/var/spool/cron", "/etc/crontab",
     "/root/.bash_history", "/root/.zsh_history", "/root/.python_history", "/root/.wget-hsts",
@@ -264,13 +299,14 @@ sandbox = {
     -- 服务数据，而是把拦截原因（JSON）返回给客户端。仅允许探测宿主本机地址。需 root 与 ip。
     gateway = { enabled = false, probe_timeout_ms = 1000, max_probes = 4096 },
   },
-  -- 权限档位与自动提权：命令默认 T0 最小权限（网络默认放行并拦截本机访问），权限不足自动发起升级。
+  -- 权限档位与自动提权：命令默认 T0 最小权限（非 root 载荷、cap-drop ALL、网络默认放行并拦截本机）。
+  -- 权限/网络失败时**全档位**自动升级（T0→T1→T2，直到 max_tier）并在隔离内重跑，每步写证据/事件/审计。
   privilege = {
     enabled = true, auto_escalate = true, max_tier = 2, record = true,
     tiers = {                       -- 各档位的网络/额外 cap/挂载/解除遮蔽/审查严格度
-      [0] = { name = "minimal", review = "auto", network = true, cap_add = {}, mounts = {}, unmask = {} }, -- 默认放行网络（仅记录）；本机访问经 host_proxy 拦截
-      [1] = { name = "elevated", review = "auto", network = true, cap_add = {}, mounts = {}, unmask = { "/run/docker.sock", "/var/run/docker.sock" } },
-      [2] = { name = "privileged", review = "approve", network = true, userns = true, cap_add = {}, mounts = {}, unmask = { "/run/docker.sock", "/var/run/docker.sock" } },
+      [0] = { name = "minimal", review = "auto", network = true, cap_add = {}, mounts = {}, unmask = {} }, -- 默认最小权限：非 root 载荷、cap-drop ALL。默认放行网络（仅记录）；本机访问经 host_proxy 拦截
+      [1] = { name = "elevated", review = "auto", network = true, cap_add = {}, mounts = {}, unmask = {} }, -- docker.sock 仅 docker 命令按需解除遮蔽
+      [2] = { name = "privileged", review = "approve", network = true, userns = true, cap_add = { "ALL" }, mounts = {}, unmask = {} }, -- 嵌套 userns 内完整能力（作用域受限）；seccomp 仍生效
     },
     classify = {                    -- 命令分类规则（bins 精确可执行名；bin+subs 可执行名+子命令）
       { tier = 2, name = "privileged", bins = { "sudo", "mount", "modprobe", "iptables", "systemctl", "unshare", "nsenter" } },
@@ -290,11 +326,23 @@ sandbox = {
   session_shell = true,            -- run_command 会话内保留 shell 状态（export/cd 跨命令生效；仅 bwrap）
   process_roots = {},              -- run_command 可写根（overlay 覆盖；默认仅 cwd 自动补入）。/tmp、/var/tmp 属 tmpfs_roots；避免把宿主 /root、/home、/etc 等作为只读 lower 暴露；按需显式加回
   -- 异步审批：候选进入待审队列，用户确认后应用。session_auto_approve 开启后 L0/L1 自动应用。
-  review = { enabled = true, auto_apply = false, session_auto_approve = false },
+  -- l3_warning：L3（critical）条目二次确认（AI 生成后果警告 + 自动打开 diff，需再次确认才应用）。
+  review = { enabled = true, auto_apply = false, session_auto_approve = false,
+             l3_warning = { enabled = true, max_tokens = 256, timeout_ms = 15000 } },
   -- 审批按安全级别分级（L0-L3）：动作 auto/record/review/block；默认 default="review"。
   approval = { default = "review", levels = {} },
   -- 安装包（apt/pip/npm 等）额外规则：review（默认，强制待审，不随自动审批放行）| allow | deny。
-  packages = { mode = "review", managers = { "apt", "pip", "npm", "go", "cargo", "gem", "composer" } },
+  -- managers 也用于识别包管理器：包安装候选按「安装命令」合并为一个审批单元（头行整包一次应用）。
+  -- 识别会跳过 sudo/doas/env/bash -c/for…do 等包装器，避免漏判包安装而误升 L3。
+  -- roots = 包管理器状态目录（自动加入可写 overlay 暂存，使 apt/pip/npm 能写索引/缓存/元数据）；
+  -- cap_add = 当全局 cap_add 收窄（如 {}）时，包安装按需加回的窄 capability（仅整条命令均为
+  --           包管理器时授予；不含 CAP_MKNOD，设备节点由 seccomp 基线硬拦，FIFO 不受影响）。
+  packages = {
+    mode = "review",
+    managers = { "apt", "apt-get", "pip", "pip3", "uv", "conda", "npm", "npx", "pnpm", "yarn", "go", "cargo", "gem", "composer" }, -- 包管理器名单（命令识别）；改动路径特征见 privilege.package_path_manager
+    roots = { "/var/lib/apt", "/var/cache/apt", "/var/lib/dpkg", "/usr/local", "~/.cache", "~/.npm" },
+    cap_add = { "CAP_DAC_OVERRIDE", "CAP_CHOWN", "CAP_SETUID", "CAP_SETGID", "CAP_FOWNER" },
+  },
   lsp_overlay = { enabled = true }, -- LSP 进程命名空间覆盖：LSP 磁盘读取看到暂存内容（默认开，仅 bwrap+overlay；不可用时自动跳过）
   secrets = { enabled = true, min_length = 20, max_length = 200, min_entropy = 3.5, min_distinct = 8, exclude_pure_hex = true, tokenize_env = true, extra_rules = {}, allowlist = {} }, -- 密钥/敏感信息防护：熵检测 + 具名规则（私钥块/AKIA/ghp_/sk-/JWT/Bearer…）+ token 加密映射；env 名含 KEY/TOKEN/SECRET/PASSWORD/CREDENTIAL 的值无视熵强制 token 化
   retention = { candidate_days = 7, max_pending = 20 },
@@ -303,7 +351,11 @@ sandbox = {
     deny_tools = {},               -- 硬拒绝工具名（用户确认亦不可覆盖）
     rules = {},                    -- 受限 Lua 规则函数数组：返回 { decision, reason_codes }
   },
-  limits = { wall_ms = 60000, memory_bytes = 0, pids = 0, cpu_max = 0, cgroup_base = "/sys/fs/cgroup" },
+  -- 资源限制（cgroup v2）：默认 dynamic=true，按宿主资源动态推导 CPU/内存/PID 上限，
+  -- 防止沙箱内命令吃满整机卡死；静态值 >0 时优先。fail_closed=false 时 cgroup 不可用则跳过。
+  limits = { wall_ms = 60000, dynamic = true, memory_ratio = 0.5, memory_max_bytes = 0,
+    cpu_cores_max = 4, pids_max = 2048, memory_bytes = 0, pids = 0, cpu_max = 0,
+    cgroup_base = "/sys/fs/cgroup", fail_closed = false },
   seccomp_filter_path = "",        -- 可选：编译后 seccomp BPF 过滤器（配合 require_seccomp）
 }
 ```
@@ -425,7 +477,7 @@ plugins = {
 计划模式作为 **per-agent 状态**（`agent.plan_mode`），激活时：
 
 1. **注入 plan-policy 系统提示段**（`deployment:plan_policy`，order=100）：要求输出清晰、格式化的修改计划。
-2. **工具上下文只保留只读/信息查询工具 + `ask_user` + `exit_plan_mode`**（`PLAN_SAFE_TOOLS` 白名单），不暴露任何修改类工具。
+2. **工具上下文只保留只读/信息查询工具 + `run_command`（只读调研）+ `ask_user` + `exit_plan_mode`**（`PLAN_SAFE_TOOLS` 白名单 + `PLAN_EXTRA_TOOLS`），不暴露任何修改类工具。
 3. **执行期门禁同步收紧**（`plan_mode.check_tool`）：计划模式下调用可见集之外的任何工具都会被驳回。
 
 **计划确认**：AI 调用 `exit_plan_mode`（审批弹窗由用户确认）或用户执行 `:NeoAIApprovePlan`，

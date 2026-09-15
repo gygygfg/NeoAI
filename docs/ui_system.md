@@ -142,14 +142,14 @@
 | --- | --- |
 | `input_box` | 聊天输入框。`create`/`attach_window`/`focus`/`submit`/`on_submitted`/`clear`；`virt_text` 渲染 `>` 前缀；放开 `neoai_input` 文件类型补全。 |
 | `message_list` | 消息列表渲染。`render(buf, messages)`；`toggle_reasoning()`。 |
-| `float_stream_window` | 复用流式悬浮窗。`open(title,{filetype})`/`set_text`/`append`/`get_text`/`close`/`is_open`/`reset`；思考过程 / 接收参数 / 上下文压缩 / 计划蒸馏共享同一窗口。窗口高度按显示行数（`nvim_win_text_height`）自适应，开启 `smoothscroll`，写入后先增高再滚、光标移到内容末尾后 `zb` 贴底。 |
+| `float_stream_window` | 复用流式悬浮窗。`open(title,{filetype})`/`set_text`/`append`/`get_text`/`close`/`is_open`/`reset`；思考过程 / 接收参数 / 计划蒸馏共享同一窗口（上下文压缩为后台异步、不弹窗，不再使用）。窗口高度按显示行数（`nvim_win_text_height`）自适应，开启 `smoothscroll`，写入后先增高再滚、光标移到内容末尾后 `zb` 贴底。 |
 | `reasoning_panel` | 思考过程悬浮窗（`float_stream_window` 适配器）。`open`/`show`/`append`/`close`/`is_open`；`filetype=neoai_reasoning`。 |
 | `tool_args_panel` | 工具参数接收悬浮窗（`float_stream_window` 适配器，流式工具调用参数）。单工具时按分片增量 `append`，否则整段重建；`open`/`show`/`close`/`is_open`/`get_content`/`reset`；`filetype=neoai_tool_args`。 |
 | `model_picker` | 模型选择器（异步加载模型列表）。`open(callback)`。 |
 | `tool_approval` | 工具审批弹窗。`init()`；串行单槽位展示。 |
 | `ask_user` | 向用户提问弹窗。`init()`；经 `ask_user.set_ui` 注入。 |
 | `sub_agent_dock` | 子 Agent 状态监控。`init()`。 |
-| `sandbox_review` | 沙箱待审审批界面。`open()`；按路径级别高亮（工作区绿/用户目录黄/系统红）、按安全级别显示高危/中危/低危风险档与原因；审批单位为单个文件：`<CR>` 仅应用该文件、`d` 仅拒绝该文件（其余文件保留待审）、`i` 临时关闭审批窗并打开该条目的修改 diff 预览（关闭后自动返回并恢复光标），头行仅作信息展示，`r` 刷新、`q` 关闭。 |
+| `sandbox_review` | 沙箱待审审批界面。`open()`；按路径级别高亮（工作区绿/用户目录黄/系统红）、按安全级别显示高危/中危/低危风险档与原因；审批单位为单个文件：`<CR>` 仅应用该文件、`d` 仅拒绝该文件（其余文件保留待审）、`i` 临时关闭审批窗并打开该条目的修改 diff 预览（关闭后自动返回并恢复光标），头行仅作信息展示，`r` 刷新、`q` 关闭。**L3（critical）条目**首次 `<CR>` 不直接应用：调用模型生成一条后果警告并自动打开 diff（顶部展示警告，生成中显示占位），用户在 diff 内再次 `<CR>` 才真正应用、`q`/`<Esc>` 取消；模型不可用时回退规则警告（见 `sandbox/l3_warning.lua`）。 |
 | `fold` | 折叠（推理/工具调用/结果共用实现）。`foldexpr`/`foldtext`/`record_start`/`record_end`/`has_running`/`set_live_timer`/`set_foldexpr_override`/`set_foldtext_override`/`set_reasoning_lines`/`is_reasoning_start`/`generic_label`。 |
 | `display_modes/` | 显示模式插件管理器 + `chat.lua`/`trajectory.lua`。 |
 | `markdown_view` | Markdown 渲染器。 |
@@ -163,7 +163,7 @@
 聊天上下文键位（`keymaps.chat`）：`insert`(i)、`quit`(q)、`send`、`cancel`(<Esc>)、`toggle_reasoning`(r)、
 `switch_model`(M)、`cycle_mode`(m)、`cycle_display`(<C-t>/T)、`reload_display`(<F5>)、
 `tool_approval`(<C-a>)、`sandbox_review`(<leader>ap，触发 `:NeoAISandboxReview`)、
-`approval.confirm/confirm_all/cancel/cancel_with_reason`。
+`approval.confirm/confirm_all/add_to_workspace/cancel/cancel_with_reason`（`add_to_workspace` 把所操作文件所在目录并入该工具运行期 `allowed_directories`，仅当前会话生效）。
 另有主消息区内部滚动映射：`j`/`k`（走 `_scroll`，按行移动光标）、
 `<ScrollWheelUp>`/`<ScrollWheelDown>`（走 `_wheel_scroll`，平滑滚动视口并把末行下方留白钳制在
 `ui.chat.mousescroll_max_blank` 行内）。

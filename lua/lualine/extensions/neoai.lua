@@ -59,8 +59,21 @@ local function capacity_comp()
   }
 end
 
+-- 沙箱待审段：含 L3（高危）时整段切换为红色危险高亮，否则保持黄色待审高亮。
+local function sandbox_comp()
+  local colors = status.colors()
+  return {
+    function() return status.segment("sandbox") end,
+    color = function()
+      local level = status.sandbox_level()
+      if level and level >= 3 then return colors.sandbox_danger or "ErrorMsg" end
+      return colors.sandbox or "Warning"
+    end,
+  }
+end
+
 local function metrics()
-  return { comp("usage"), comp("cache"), capacity_comp(), comp("pending"), comp("sandbox") }
+  return { comp("usage"), comp("cache"), capacity_comp(), comp("pending"), sandbox_comp() }
 end
 -- 身份（winbar 第一行）：模式 / 模型 / 状态
 local function identity()

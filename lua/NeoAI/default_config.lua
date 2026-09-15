@@ -250,6 +250,7 @@ local DEFAULT_CONFIG = {
         brand = "Title",
         pending = "Warning",
         sandbox = "NeoAISandboxPending",
+        sandbox_danger = "NeoAISandboxDanger", -- 待审含 L3 高危时的红色危险高亮
       },
     },
   },
@@ -289,6 +290,7 @@ local DEFAULT_CONFIG = {
       approval = {
         confirm = { key = "<CR>", desc = "允许一次" },
         confirm_all = { key = "A", desc = "允许所有" },
+        add_to_workspace = { key = "D", desc = "允许并加入工作目录" },
         cancel = { key = "<Esc>", desc = "取消" },
         cancel_with_reason = { key = "C", desc = "取消并说明" },
       },
@@ -405,7 +407,10 @@ local DEFAULT_CONFIG = {
       mode = "async", -- async（默认，异步审批：立即沙箱执行，事后确认应用）| prompt | auto_allow | strict
       default_auto_allow = false,
       timeout_ms = 60000, -- 审批弹窗超时（ms），防止弹窗丢失后工具循环永久挂起
+      -- 全局工作区允许目录：对所有工具生效，且包含其全部子目录（配置后子目录无需逐个审批）。
+      -- 工具自身与 per_tool 的 allowed_directories 与之并集（只追加，不覆盖全局工作区）。
       allowed_directories = {},
+      -- 全局命令白名单：命令首词命中即视为参数安全（与工具自身/ per_tool 并集）。
       allowed_param_groups = {},
       per_tool = {
         read_file = { auto_allow = true },
@@ -450,9 +455,43 @@ local DEFAULT_CONFIG = {
       backend = "auto", -- auto | bwrap | unshare（外部隔离后端）
       offline = false, -- 网络默认放行（仅记录审计，不拦截）；true 时硬拒绝网络类工具并隔离进程网络
       require_seccomp = true, -- true 时缺少 seccomp 能力则拒绝外部执行（默认开，fail-closed）
-      -- 载荷 capability：默认全部丢弃（--cap-drop ALL）。仅在此列出需按需加回的
-      -- capability 名（如 "CAP_NET_BIND_SERVICE"）；留空即不持有任何 capability。
+      -- 载荷 capability：默认**最小权限**（`{}` → `--cap-drop ALL`）。沙箱内进程以非 root 用户
+      -- 运行且不持有任何 capability，需要的能力按命令**窄范围**加回（包安装经
+      -- `packages.cap_add`，纯包安装命令才授予；混合命令不授予）。宿主不可修改由
+      -- **命名空间（mount/pid/uts/ipc/cgroup）+ 只读根（`--ro-bind / /`）+ overlay 暂存 +
+      -- 宿主敏感路径遮蔽 + `/proc/sys` 只读绑定 + seccomp（含 mknod/mknodat 设备节点屏障）**
+      -- 保证：所有写入进入 overlay 私有层并冻结为候选，真实系统只读，危险 syscall 与设备节点
+      -- 创建被拦。仅在明确需要完整能力时（不推荐）才设为 `{ "ALL" }`。
       cap_add = {},
+      -- 载荷运行身份（最小权限原则）：沙箱内进程默认以**非 root 用户**运行。
+      --   * 非 root 启动 NeoAI：自动使用当前 uid/gid（本项被忽略）。
+      --   * root 启动 NeoAI：必须使用本项指定的**专用非 root uid/gid**（默认 nobody 65534）；
+      --     bwrap 无法把 root 1:1 之外降权，故由 `setpriv` 先把 bwrap 自身降为该 uid，再进入
+      --     用户命名空间，使载荷在宿主与命名空间内都是非 root（避免「userns 内 root」伪装）。
+      --     沙箱可写目录（overlay upper/work、暂存、会话目录）会被 chown 到该 uid/gid。
+      --   * `uid = 0`：显式放弃降权（以 root 运行载荷，**不推荐**，仅在受控调试时使用）。
+      run_as = {
+        uid = 65534, -- 默认 nobody；root 启动时生效
+        gid = 65534, -- 默认 nogroup
+      },
+      -- 主机全局能力收敛（默认）：即使 cap_add 含 ALL，也逐项丢弃「可修改宿主全局状态」的能力。
+      -- 这些能力与开发/包管理工作流无关（node/python/apt 不需要），丢弃后 netlink 改宿主路由/
+      -- 防火墙、改宿主时钟、加载内核模块、裸端口 I/O、重启、改 MAC/审计策略均被 EPERM 拦截。
+      -- 显式在 cap_add 中列出的能力不会被丢弃；设 `{}` 可保留字面完整能力（不推荐）。
+      cap_drop = {
+        "CAP_NET_ADMIN",     -- 网络栈配置（netlink 改路由/防火墙/接口）
+        "CAP_SYS_TIME",      -- 系统时钟
+        "CAP_SYS_MODULE",    -- 内核模块加载/卸载
+        "CAP_SYS_RAWIO",     -- 裸端口/设备 I/O（ioperm/iopl）
+        "CAP_SYS_BOOT",      -- 重启/关机/kexec
+        "CAP_MAC_ADMIN",     -- MAC（SELinux/AppArmor）策略
+        "CAP_MAC_OVERRIDE",  -- MAC 策略绕过
+        "CAP_AUDIT_CONTROL", -- 审计子系统配置
+      },
+      -- 单文件纳入候选的大小上限（字节）：超过则不纳入候选（写入仍在 overlay 私有层，不落真实盘），
+      -- 避免把 apt/pkgcache.bin、缓存归档、镜像层等超大文件嵌入候选 JSON 而阻塞主线程 / 撑爆磁盘。
+      -- 0 = 不限制。默认 8 MiB。
+      max_file_bytes = 8 * 1024 * 1024,
       -- 在隔离环境内遮蔽的宿主敏感路径（安全默认）：目录以空 tmpfs 遮蔽，
       -- 文件/socket 以 /dev/null 覆盖。含 docker.sock（= 宿主 root）、容器数据、
       -- 编排器/面板/D-Bus 通道、宿主凭据目录，以及宿主身份/日志/命令历史等读取面泄露项。
@@ -468,6 +507,18 @@ local DEFAULT_CONFIG = {
         "/root/.ssh", "/root/.aws", "/root/.gnupg", "/root/.kube",
         "/root/.docker/config.json", "/root/.netrc", "/root/.git-credentials",
         "/root/.cache/keyring-*", "/root/.cache/at-spi", "/root/.local/share/keyrings",
+        -- Git / 版本控制凭据与签名密钥（SSH/GPG、credential store、netrc、gh token）：
+        -- 覆盖 root 与非 root 用户 home（`/home/*`），避免 AI 经 run_command/read_file 读取后外传。
+        "/root/.config/git/credentials", "/root/.git-credential-cache",
+        "/root/.config/gh",
+        "/home/*/.ssh", "/home/*/.gnupg", "/home/*/.netrc",
+        "/home/*/.git-credentials", "/home/*/.config/git/credentials", "/home/*/.git-credential-cache",
+        "/home/*/.config/gh", "/home/*/.aws", "/home/*/.kube", "/home/*/.docker/config.json",
+        "/home/*/.cache/keyring-*", "/home/*/.local/share/keyrings",
+        -- 本机 SSH 服务：sshd 运行目录 + ssh-agent / gpg-agent 套接字（禁止沙箱访问本机 ssh 服务）
+        "/run/sshd", "/run/sshd.pid", "/run/ssh-agent.socket",
+        "/run/user/*/keyring", "/run/user/*/keyring/ssh", "/run/user/*/ssh*",
+        "/run/user/*/gnupg*", "/tmp/ssh-*", "/root/.ssh-agent",
         -- 宿主身份与凭据
         "/etc/shadow", "/etc/shadow-", "/etc/gshadow", "/etc/gshadow-",
         "/etc/sudoers", "/etc/sudoers.d", "/etc/machine-id", "/etc/hostid",
@@ -481,29 +532,35 @@ local DEFAULT_CONFIG = {
         "/root/.sqlite_history", "/root/.node_repl_history", "/root/.wget-hsts",
         "/root/.lesshst", "/root/.viminfo", "/root/.config/gh", "/root/.config/gcloud",
       },
+      -- 读取面（默认开）：true 时整机根以**只读**方式暴露（`--ro-bind / /`），仅遮蔽
+      -- `mask_paths` 中的重要配置文件/凭据（~/.ssh、~/.aws、/etc/shadow、sudoers、
+      -- docker.sock 等）与沙箱自身存储；`mask_dirs`（home/root 兄弟目录）不再挂载遮蔽，
+      -- 但访问 cwd 之外的用户目录会**留痕**并在审批悬浮窗展示（见 trace）。
+      -- false 时退回最小只读白名单（`readonly_roots`/`readonly_paths`）——更小读取面。
+      read_all = true,
       -- 最小只读系统集（白名单）：仅这些宿主根/子树以只读方式暴露给外部命令；未列出的
       -- 路径在沙箱内不存在（不再 `--ro-bind / /`）。`/home`、`/var/log`、`/etc/shadow`、
       -- `/opt`、`/srv`、`/mnt`、`/media`、`/boot` 等默认不可达。
-      -- 不再整目录暴露 `/usr`：宿主根分区挂到同一块磁盘时会泄露 `/usr/share/doc` 包数据库、
-      -- `/usr/local/go_workspace`、`/usr/src` 等软件清单，改为只挂运行时真正需要的子树。
+      -- 仍不整目录暴露 `/usr`（避免泄露 `/usr/local/go_workspace`、`/usr/src` 等），但把
+      -- `/usr/share` 与 `/var/lib` 整目录只读暴露，使 run_command 能读取运行时共享数据
+      -- （nodejs/dotnet/java/git-core/terminfo 等）与宿主包数据库（dpkg/apt/rpm 等）。
+      -- 危险/敏感子路径由 `mask_paths` 遮蔽（如 /var/lib/docker、/var/lib/containerd）。
       -- `/lib*`、`/bin`、`/sbin` 为指向 `/usr/lib*`、`/usr/bin`、`/usr/sbin` 的符号链接，
       -- 必须保留（动态加载器），否则任何二进制无法启动。支持 `*` 通配；不存在的条目跳过。
+      -- 仅在 `read_all=false` 时生效（见下）。
       readonly_roots = {
         -- 动态加载器与二进制符号链接根（必须）
         "/lib", "/lib32", "/lib64", "/libx32", "/bin", "/sbin",
         -- 运行时可执行文件、共享库与头文件
         "/usr/bin", "/usr/sbin", "/usr/lib", "/usr/lib32", "/usr/lib64", "/usr/libx32",
         "/usr/libexec", "/usr/include",
-        -- 运行时共享数据（不含 /usr/share/doc|man|info 等宿主软件清单）
-        "/usr/share/terminfo", "/usr/share/locale", "/usr/share/zoneinfo",
-        "/usr/share/ca-certificates", "/usr/share/misc", "/usr/share/common-licenses",
-        "/usr/share/awk", "/usr/share/perl", "/usr/share/perl5",
-        "/usr/share/pkgconfig", "/usr/share/aclocal", "/usr/share/bash-completion",
-        "/usr/share/git-core", "/usr/share/vim", "/usr/share/nvim",
-        "/usr/share/tabset", "/usr/share/gnupg", "/usr/share/icu",
+        -- 运行时共享数据：整目录只读暴露（nodejs/dotnet/java/git-core/terminfo 等）
+        "/usr/share",
         -- 本地安装工具与 Go 工具链（不含 /usr/local/go_workspace、/usr/local/src、/usr/local/man）
         "/usr/local/bin", "/usr/local/sbin", "/usr/local/lib", "/usr/local/libexec",
         "/usr/local/include", "/usr/local/go",
+        -- 宿主系统状态/包数据库：整目录只读暴露（dpkg/apt/rpm 等）；危险子路径仍由 mask_paths 遮蔽
+        "/var/lib",
       },
       -- 最小 /etc 必要文件（白名单）：命令运行所需，避免整目录暴露（含 shadow/machine-id/ssh）。
       -- 注意 `/etc/resolv.conf` 不在此列，见下方 `resolv_conf`。
@@ -537,6 +594,10 @@ local DEFAULT_CONFIG = {
       -- 每会话私有临时根：始终以会话私有目录（mode 1777，位于 /dev/shm 等 tmpfs）绑定，
       -- 绝不作为 overlay 的只读 lower 暴露宿主真实内容；退出/轮换会话即销毁，杜绝跨会话残留。
       tmpfs_roots = { "/tmp", "/var/tmp" },
+      -- 临时候选根（默认同 tmpfs_roots）：这些根（cwd 子树除外）下的文件写入为**会话私有、
+      -- nvim 退出即丢弃**，不进入待审队列、不 CAS 发布、也不弹审批悬浮窗（内容仅在暂存层，
+      -- 供本次会话读取一致）。设为 `{}` 可关闭（/tmp 下也走正常待审/审批）。
+      ephemeral_roots = { "/tmp", "/var/tmp" },
       -- 临时根私有目录位置：host（默认）= 建在宿主根之下的隐藏临时子目录
       -- （如 /tmp/.cache-<tag>/<session>），命名空间映射回该根，AI 只见自己的私有子目录
       -- （隔离 AI，宿主 /tmp 内容不可见）；session = 建在会话进程目录下（旧行为）。
@@ -549,6 +610,8 @@ local DEFAULT_CONFIG = {
       -- （`/home` 取一级用户子目录，其他目录取自身）；沿 cwd 祖先链遮蔽兄弟条目
       -- （含隐藏文件/目录），cwd 子树自身豁免；cwd 即作用域时遮蔽其隐藏子条目。
       -- 工具命中遮蔽条目时弹窗审批（复用 tools.approval 弹窗），批准后对该次调用解除遮蔽。
+      -- 注意：`read_all=true`（默认）时本组配置**不生效**（目录不再挂载遮蔽/审批），
+      -- 改为只读放行 + 越界访问留痕（见 read_all 与 sandbox.trace）。
       mask_dirs_enabled = true, -- 总开关（默认开）
       mask_dirs = { "/home", "/root" }, -- 遮蔽目录列表（支持 * 通配）
       mask_dirs_approval = true, -- 命中遮蔽目录时是否弹窗审批（false = 直接硬遮蔽）
@@ -589,6 +652,13 @@ local DEFAULT_CONFIG = {
         -- AI 新会话自动审批（默认关闭）：开启后 L0/L1 风险自动应用，L2+ 与包/密钥仍待审。
         -- 目的：即便仅靠本地模型的智能水平，也能在写入保护下管理好 agent 行为。
         session_auto_approve = false,
+        -- L3（critical）操作二次确认：首次 <CR> 时由 AI 生成后果警告并自动打开 diff，
+        -- 需在 diff 内再次确认才真正应用；AI 不可用时回退规则警告，不阻断。
+        l3_warning = {
+          enabled = true,
+          max_tokens = 256, -- 警告正文最大输出
+          timeout_ms = 15000, -- 生成超时（ms），超时回退规则警告
+        },
       },
       -- 审批按安全级别分级（见 sandbox/risk.lua）：级别 L0-L3，动作 auto/record/review/block。
       -- 默认 default="review"（全部进入异步待审，不阻塞 agent）；可覆盖单级动作。
@@ -598,10 +668,48 @@ local DEFAULT_CONFIG = {
       },
       -- 安装包（apt/pip/npm 等）额外规则：默认 review（不随自动审批放行，需显式确认）。
       --   review = 强制进入待审；allow = 允许自动应用；deny = 硬拒绝。
+      --   managers 同时用于识别包管理器：包安装候选按「安装命令」合并为一个审批单元，
+      --   头行标注「包安装 <管理器>: <包名>」，可整包一次应用（privilege.package_info）。
       packages = {
         mode = "review",
-        managers = { "apt", "apt-get", "dnf", "yum", "pacman", "apk", "brew",
-          "pip", "pip3", "npm", "pnpm", "yarn", "go", "cargo", "gem", "composer" },
+        managers = {
+          -- 系统包管理
+          "apt", "apt-get", "aptitude", "dnf", "yum", "rpm", "zypper", "pacman", "apk", "brew", "port",
+          -- Python
+          "pip", "pip3", "pipx", "uv", "uvx", "poetry", "conda", "mamba", "micromamba",
+          -- Node
+          "npm", "npx", "pnpm", "yarn", "bun", "deno", "corepack",
+          -- 其它语言/生态
+          "go", "cargo", "rustup", "gem", "bundler", "bundle", "composer",
+          "nuget", "dotnet", "vcpkg", "conan", "stack", "mix", "pub",
+        },
+        -- 包安装按需加回的 capability（受控启动，仅整条命令均为包管理器时授予）：
+        -- --cap-drop ALL 下 root 失去 CAP_DAC_OVERRIDE，连 `_apt` 拥有的 0700 目录都不可写；
+        -- dpkg/apt/pip/npm 还需要 chown/setuid 等。**不含 CAP_MKNOD**：包管理器不需要
+        -- 创建设备节点（Debian 政策禁止包内携带设备节点），且设备节点不经 overlayfs——
+        -- 创建块/字符设备即可裸读磁盘、绕过暂存/遮蔽，故由 seccomp 基线硬拦
+        -- （mknod/mknodat 的 CHR/BLK 模式返回 EPERM，FIFO/普通文件不受影响）。
+        -- 可按需增减（如自建源）；进程仍在 mount/pid 命名空间 + 遮蔽 + overlay 暂存内。
+        cap_add = {
+          "CAP_DAC_OVERRIDE", "CAP_DAC_READ_SEARCH", "CAP_CHOWN", "CAP_FOWNER",
+          "CAP_SETUID", "CAP_SETGID", "CAP_SETFCAP", "CAP_FSETID",
+          "CAP_SYS_CHROOT", "CAP_KILL",
+        },
+        -- 包安装命令的宿主状态目录：仅当命令判定为包安装时加入可写根（overlay 暂存），
+        -- 使 apt/dpkg/pip/npm 等能写入索引/缓存/元数据，写入冻结为候选。支持 `~` 展开；
+        -- 不存在的目录自动跳过。可按需增减（如自建源/自定义前缀）。
+        roots = {
+          -- Debian/Ubuntu（apt/dpkg）
+          "/var/lib/apt", "/var/cache/apt", "/var/lib/dpkg", "/var/cache/debconf",
+          -- RHEL/Fedora（dnf/yum/rpm）
+          "/var/lib/rpm", "/var/cache/dnf", "/var/cache/yum",
+          -- Arch（pacman）
+          "/var/lib/pacman", "/var/cache/pacman",
+          -- 系统级安装目标与用户级缓存/安装目标
+          "/usr/local", "/usr/lib/node_modules", "/usr/share/nodejs", "/var/lib/gems",
+          "~/.cache", "~/.npm", "~/.cargo", "~/.rustup", "~/.gem", "~/.composer",
+          "~/go", "~/.local",
+        },
       },
       -- 容器受控运行：AI 调用 docker/podman 等时尽量与沙箱同 namespace（受控）。
       -- podman 等无守护进程运行时注入 --net/pid/ipc/uts=host 共享沙箱命名空间；
@@ -631,10 +739,19 @@ local DEFAULT_CONFIG = {
       },
       limits = {
         wall_ms = 60000, -- 外部进程墙钟超时（ms）
-        memory_bytes = 0, -- cgroup 内存上限（0 = 不设置）
-        pids = 0, -- cgroup PID 上限（0 = 不设置）
-        cpu_max = 0, -- cgroup CPU 配额（微秒/100ms；0 = 不设置，如 50000 = 0.5 CPU）
+        -- 动态资源限制（默认开）：未显式设置时按宿主资源推导 CPU/内存/PID 上限，
+        -- 防止沙箱内命令（apt、编译、构建等）吃满整机导致卡死。
+        dynamic = true,
+        memory_ratio = 0.5, -- 内存上限 = 宿主总量 * ratio
+        memory_max_bytes = 0, -- 绝对内存上限（>0 时取 min；0 = 不额外限制）
+        cpu_cores_max = 4, -- CPU 配额上限（核）
+        pids_max = 2048, -- PID 上限
+        -- 静态显式值（>0 时优先于动态推导）：
+        memory_bytes = 0, -- cgroup 内存上限（0 = 用动态值）
+        pids = 0, -- cgroup PID 上限（0 = 用动态值）
+        cpu_max = 0, -- cgroup CPU 配额（微秒/100ms；0 = 用动态值，如 50000 = 0.5 CPU）
         cgroup_base = "/sys/fs/cgroup", -- cgroup v2 挂载点
+        fail_closed = false, -- cgroup 不可用时是否拒绝执行（默认 false：跳过限制，不阻断）
       },
       seccomp_filter_path = "", -- 可选：编译后 seccomp BPF 过滤器路径（供 bwrap --seccomp）
       -- seccomp 基线：默认开启；经 bwrap 在载荷上施加 denylist 过滤器（拦 mount/
@@ -653,15 +770,17 @@ local DEFAULT_CONFIG = {
         record = true, -- 每次档位裁决/升级写入证据与事件
         tiers = {
           -- T0 默认放行网络（仅记录）但经 host_proxy 拦截本机访问；offline=true 时仍硬隔离。
+          -- 档位默认最小权限（--cap-drop ALL）；包安装窄能力由 packages.cap_add 按需加回。
           [0] = { name = "minimal", review = "auto", network = true, cap_add = {}, mounts = {}, unmask = {} },
+          -- T1 提权不默认解除 docker.sock 遮蔽：socket 仅在命令被分类为 docker 时按需挂载并解除。
           [1] = {
-            name = "elevated", review = "auto", network = true, cap_add = {}, mounts = {},
-            unmask = { "/run/docker.sock", "/var/run/docker.sock" },
+            name = "elevated", review = "auto", network = true, cap_add = {}, mounts = {}, unmask = {},
           },
+          -- T2 特权：嵌套 userns 内完整能力（caps 被 userns 作用域限制，够不到宿主）；
+          -- 主机效果冻结为提案异步审批。seccomp 基线（mount/init_module 等）仍然生效。
           [2] = {
             name = "privileged", review = "approve", network = true, userns = true,
-            cap_add = {}, mounts = {},
-            unmask = { "/run/docker.sock", "/var/run/docker.sock" },
+            cap_add = { "ALL" }, mounts = {}, unmask = {},
           },
         },
         -- 命令分类规则：命中即提升到对应档位（多条命中取最高档）。
@@ -671,6 +790,8 @@ local DEFAULT_CONFIG = {
             "sudo", "doas", "mount", "umount", "modprobe", "insmod", "rmmod", "kmod",
             "iptables", "ip6tables", "nft", "systemctl", "reboot", "shutdown", "poweroff",
             "kexec", "sysctl", "swapon", "swapoff", "mknod", "chroot", "unshare", "nsenter",
+            -- 本机 SSH 服务控制：启动/管理 sshd 或 agent 属特权操作（T2，主机效果需审批）
+            "sshd", "ssh-agent", "ssh-add", "ssh-keysign", "gpg-agent",
           } },
           { tier = 1, name = "docker", bins = {
             "docker", "docker-compose", "nerdctl",
@@ -711,7 +832,9 @@ local DEFAULT_CONFIG = {
         enabled = true,
       },
       -- 密钥防护（常开）：基于熵检测高熵密钥，进沙箱替换为随机 token、仅在 commit 还原；
-      -- 对 token 的操作留痕并在待审界面警告；工具参数中出现原始密钥时硬拦截并终止 Agent。
+      -- 对 token（加密后的 key）或敏感环境变量名的出现留痕并提级强制待审（悬浮窗警告），
+      -- 不终止 Agent；仅当**原始密钥**出现在工具参数或 AI 可见上下文中时硬拦截并终止 Agent
+      -- （见 docs/sandbox.md §16）。
       secrets = {
         enabled = true, -- 总开关
         min_length = 20, -- 候选密钥最小长度

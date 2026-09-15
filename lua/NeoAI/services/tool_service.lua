@@ -51,6 +51,25 @@ local function _review_sub_agent(ctx, tool_name)
   return ok, reason
 end
 
+--- 提取工具调用的首个路径参数（供「加入工作目录」定位所操作文件）。
+--- 优先用工具沙箱规格声明的路径字段，回退到常见路径参数名。
+--- @param tool_name string
+--- @param args table
+--- @return string|nil
+local function _target_path(tool_name, args)
+  if type(args) ~= "table" then return nil end
+  local spec = require("NeoAI.sandbox.tool_spec").get(tool_name)
+  for _, field in ipairs(spec.paths or {}) do
+    local p = args[field]
+    if type(p) == "string" and p ~= "" then return p end
+  end
+  for _, field in ipairs({ "filepath", "path", "file" }) do
+    local p = args[field]
+    if type(p) == "string" and p ~= "" then return p end
+  end
+  return nil
+end
+
 --- 构建审批 UI 内容
 --- @param tool_name string
 --- @param args table
@@ -60,10 +79,25 @@ local function _approval_text(tool_name, args)
   local desc = tool and tool.description or ""
   local json = require("NeoAI.utils.json")
   local args_str = json.encode(args)
-  return string.format(
+  local text = string.format(
     "工具: %s\n描述: %s\n参数: %s",
     tool_name, desc, args_str
   )
+  -- 越界访问留痕：把近期访问 cwd 之外用户工作目录的记录附在审批窗内（非阻塞、仅展示）。
+  local ok, trace = pcall(require, "NeoAI.sandbox.trace")
+  if ok and trace then
+    local items = trace.list()
+    if #items > 0 then
+      local lines = { "", "近期越界访问（工作区外，仅记录）:" }
+      local start = math.max(1, #items - 4)
+      for i = start, #items do
+        local it = items[i]
+        lines[#lines + 1] = string.format("  [%s] %s", tostring(it.tool or "?"), tostring(it.path or ""))
+      end
+      text = text .. "\n" .. table.concat(lines, "\n")
+    end
+  end
+  return text
 end
 
 -- ========== 审批 UI（由 ui/components/tool_approval 注入） ==========
@@ -92,6 +126,20 @@ local function _show_approval(tool_name, args, decision_cb, ctx)
       on_cancel = function(reason) decision_cb(false, reason) end,
       on_confirm_all = function()
         state.allow_all[tool_name] = true
+        decision_cb(true)
+      end,
+      on_add_to_workspace = function()
+        local path = _target_path(tool_name, args)
+        if not path then
+          vim.notify("[NeoAI] 该工具无文件路径，无法加入工作目录", vim.log.levels.WARN)
+        else
+          local dir = vim.fn.fnamemodify(vim.fn.expand(path), ":p:h")
+          if registry.add_allowed_directory(tool_name, dir) then
+            vim.notify("[NeoAI] 已加入工作目录: " .. dir, vim.log.levels.INFO)
+          else
+            vim.notify("[NeoAI] 目录已在工作目录中: " .. dir, vim.log.levels.INFO)
+          end
+        end
         decision_cb(true)
       end,
     })
