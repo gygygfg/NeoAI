@@ -263,6 +263,48 @@ end
 
 -- ========== 公开 API ==========
 
+--- 工具调用是否触及疑似密钥文件（决定是否启用昂贵的高熵全文扫描）。
+--- 命中来源：显式路径参数、run_command 命令串中的绝对路径、内核观测到的密钥文件访问。
+--- @param tool_name string
+--- @param args table
+--- @param ctx table|nil
+--- @return boolean
+local function _touches_secret_path(tool_name, args, ctx)
+  -- 内核观测到的路径用**严口径**：`dpkg -l`/`ss`/`python` 等普通命令会顺带打开
+  -- `/etc/ld.so.cache`、`/etc/nsswitch.conf` 等宽口径命中项，若据此启用高熵扫描，
+  -- 会把结果里的软件包名（如 `openjdk-21-jdk-headless`）误 token 化。
+  if ctx and type(ctx.observed_secret_paths) == "table" then
+    for _, p in ipairs(ctx.observed_secret_paths) do
+      if secret.is_sensitive_path and secret.is_sensitive_path(p) then return true end
+    end
+  end
+  local spec = tool_spec.get(tool_name)
+  for _, field in ipairs(spec.paths or {}) do
+    local p = args and args[field]
+    if type(p) == "string" and secret.is_secret_path(p) then return true end
+  end
+  local cmd = args and (args.command or args.cmd)
+  if type(cmd) == "string" then
+    for tok in cmd:gmatch("%S+") do
+      local p = tok:gsub("^['\"]", ""):gsub("['\"]$", "")
+      if secret.is_secret_path(p) then return true end
+    end
+  end
+  return false
+end
+
+--- 是否对本次工具内容启用高熵扫描：默认仅疑似密钥文件（`entropy_secret_paths_only=false`
+--- 时退回旧的「所有内容都做熵检测」行为）。
+--- @param tool_name string
+--- @param args table
+--- @param ctx table|nil
+--- @return boolean
+local function _entropy_enabled(tool_name, args, ctx)
+  local cfg = config_store.get("tools.sandbox.secrets") or {}
+  if cfg.entropy_secret_paths_only == false then return true end
+  return _touches_secret_path(tool_name, args, ctx)
+end
+
 --- 出向密钥防护：扫描工具参数。
 --- - 命中映射表中已知的**原始密钥**（未加密真实值）→ 硬拦截并终止整个 Agent（明确通知用户）；
 --- - 命中 token（加密后的 key）或**敏感环境变量名** → 记录留痕并提级审批
@@ -315,31 +357,46 @@ local function _secret_guard(tool, tool_name, args, ctx)
   end
   local spec = require("NeoAI.sandbox.tool_spec").get(tool_name, tool and tool.category)
   if spec and spec.effect == "fs_write" then
-    secret.tokenize_args(args)
+    secret.tokenize_args(args, { entropy = _entropy_enabled(tool_name, args, ctx) })
   end
   return true
 end
 
 --- 入向：把工具结果中的真实密钥替换为 token，再回传模型（AI 永远看不到原始密钥）。
+--- 高熵扫描仅对疑似密钥文件启用（见 `_entropy_enabled`）；结果到达后判定，可纳入内核
+--- 观测到的密钥文件访问。
 --- @param d Deferred
+--- @param ctx table|nil
+--- @param tool_name string|nil
+--- @param args table|nil
 --- @return Deferred
-local function _tokenize_out(d)
+local function _tokenize_out(d, ctx, tool_name, args)
   if not secret.enabled() then return d end
   local out = async.Deferred.new()
   d:then_(function(v)
-    local ok, tv = pcall(secret.tokenize_result, v)
-    local result = ok and tv or v
-    -- 识别到 AI 读取到 KEY（结果含 token）时追加说明，澄清 token 语义与自动还原。
-    if secret.contains_token(result) then
-      local hint = secret.read_hint()
-      if type(result) == "string" then
-        result = result .. "\n\n" .. hint
-      elseif type(result) == "table" then
-        result = vim.deepcopy(result)
-        result.neoai_secret_hint = hint
+    local entropy = _entropy_enabled(tool_name or "", args or {}, ctx)
+    local function finish(result)
+      -- 识别到 AI 读取到 KEY（结果含 token）时追加说明，澄清 token 语义与自动还原。
+      if secret.contains_token(result) then
+        local hint = secret.read_hint()
+        if type(result) == "string" then
+          result = result .. "\n\n" .. hint
+        elseif type(result) == "table" then
+          result = vim.deepcopy(result)
+          result.neoai_secret_hint = hint
+        end
       end
+      out:resolve(result)
     end
-    out:resolve(result)
+    -- 字符串结果（run_command/read_file 等大输出）经线程池做全文 token 化，避免完成瞬间
+    -- 占满主线程；线程池不可用时 tokenize_async 内部回退同步。表结果仍走同步（结构较小）。
+    if type(v) == "string" then
+      return secret.tokenize_async(v, { entropy = entropy }):then_(finish, function()
+        finish(v)
+      end)
+    end
+    local ok, tv = pcall(secret.tokenize_result, v, { entropy = entropy })
+    finish(ok and tv or v)
   end, function(e)
     out:reject(e)
   end)
@@ -436,11 +493,11 @@ function M.execute(tool_name, raw_args, ctx)
     -- 计时器只在审批通过后才 start，因此等待审批的时间不计入耗时、也不消耗超时预算。
     return _tokenize_out(ctx.tool_service.approve_and_execute(resolved, args, ctx, function()
       return _execute_tool(tool, args, ctx, timer)
-    end))
+    end), ctx, resolved, args)
   end
 
   -- 直接执行
-  return _tokenize_out(_execute_tool(tool, args, ctx, timer))
+  return _tokenize_out(_execute_tool(tool, args, ctx, timer), ctx, resolved, args)
 end
 
 --- 结果字符串化

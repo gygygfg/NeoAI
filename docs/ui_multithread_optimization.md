@@ -6,7 +6,7 @@
 > `tree_window` 等组件已删除）。当前把阻塞式 I/O / CPU 密集计算统一交给 **`utils.work` 线程池**
 > 执行，避免卡住 nvim 主线程；异步原语由 `utils.async` 提供。
 > 对应源码：`lua/NeoAI/utils/work.lua`、`lua/NeoAI/utils/async.lua`、
-> `lua/NeoAI/utils/timer.lua`。
+> `lua/NeoAI/utils/timer.lua`、`lua/NeoAI/utils/textmetrics.lua`。
 
 ## 1. 核心思路
 
@@ -48,6 +48,17 @@ end, function(err) ... end)
 | `tools/builtin/file_ops.lua` | `read_file` / `edit_file` / `list_files` / `search_files` / `delete_file`（异步变体）。 |
 | `tools/builtin/read_image.lua` | 读二进制文件（`work.run(_read_binary, abs_path)`）。 |
 | `tools/builtin/edit_file.lua`（edit 模式） | 读文件 + 结构化替换 + 写盘（在线程池内完成）。 |
+| `sandbox/candidate.lua` | `capture_overlay_async` / `finish_async`：overlay 递归遍历、文件读取、SHA-256 哈希在线程池内完成，主线程只做状态登记/组装。 |
+| `sandbox/conceal.lua` | `redact_async`：命令输出的指纹脱敏（十余次 gsub，可能达 MB 级）在线程池内完成。 |
+| `sandbox/secret.lua` | `tokenize_many_async` / `tokenize_async`：密钥全文扫描（具名规则 + 变量名 + 熵检测）在线程池执行，token 生成/映射/事件仍在主线程。 |
+| `utils/sha256.lua` | 纯 Lua SHA-256；`source` 源码字符串传入线程内 `load`，供候选哈希与线程内 token 派生在独立核心计算。 |
+| `utils/textmetrics.lua` | 纯 Lua 文本度量（显示宽度/码点切片/折行）；`source` 源码字符串传入线程内 `load`。 |
+| `core/session/tool_result_pruner.lua` | `prune_agent_async`：MB 级工具结果的码点统计/切片经线程池计算（实测 12×3.7MB 从主线程阻塞 330ms → 0ms，4 线程并行约 140ms），仅把裁剪结果传回主线程应用；线程池不可用或 `ui.render.threaded=false` 时回退同步。 |
+
+> 渲染侧（`ui/components/markdown_view.lua`）已改为纯 Lua `utils.textmetrics` 单遍扫描
+> （不再逐字符 `vim.fn.strwidth/strcharpart`），CJK 表格折行约快 1.8~3 倍；按当前设计
+> 渲染仍同步执行（`ui.render.threaded` 只控制计算卸载），后续如需可复用 `textmetrics.source`
+> 把整段渲染搬进线程池。
 
 ## 4. 线程池 vs 旧多线程 UI
 

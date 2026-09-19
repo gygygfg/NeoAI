@@ -245,6 +245,88 @@ local function _cap_add(priv)
   return out
 end
 
+--- 把有效 capability 列表转成 setpriv 的 ambient/inheritable 参数（小写、去 `CAP_` 前缀）。
+--- 降权到非 root 时内核会清空 permitted/effective；bwrap 的 `--cap-add` 仅把能力留在可继承集，
+--- 故需显式提升为 ambient，使非 root 载荷仍持有配置的窄能力（如包安装的 DAC_OVERRIDE 等）。
+--- @param priv table|nil
+--- @return string|nil "+cap1,+cap2"（无能力时返回 nil）
+local function _ambient_caps(priv)
+  local caps = _cap_add(priv)
+  if not caps or #caps == 0 then return nil end
+  local out = {}
+  for _, c in ipairs(caps) do
+    if c == "ALL" then return "+all" end
+    local name = tostring(c):lower():gsub("^cap_", "")
+    if name ~= "" then out[#out + 1] = "+" .. name end
+  end
+  if #out == 0 then return nil end
+  return table.concat(out, ",")
+end
+
+--- 宿主逻辑 CPU 数
+--- @return number
+local function _nproc()
+  local ok, cpus = pcall(vim.uv.cpus)
+  if ok and type(cpus) == "table" and #cpus > 0 then return #cpus end
+  local raw = vim.fn.system("nproc 2>/dev/null") or ""
+  local n = tonumber((raw:gsub("%s+$", "")))
+  return (n and n > 0) and n or 1
+end
+
+--- nvim 当前所在 CPU（/proc/self/stat 字段 39；comm 可含空格/括号，取最后一个 ')' 之后解析）
+--- @return number|nil
+local function _nvim_cpu()
+  local f = io.open("/proc/self/stat", "r")
+  if not f then return nil end
+  local s = f:read("*a")
+  f:close()
+  local rest = s:match("%)%s*(.*)$")
+  if not rest then return nil end
+  local fields = {}
+  for tok in rest:gmatch("%S+") do fields[#fields + 1] = tok end
+  -- rest 从字段 3（state）开始；processor 为字段 39 → rest 索引 37。
+  return tonumber(fields[37])
+end
+
+--- 计算沙箱 CPU 亲和性前缀（`taskset -c <cpus>`）：让沙箱在 nvim 当前 CPU 之外的核上运行，
+--- 避免与 nvim 抢占同一核。配置 `tools.sandbox.limits.cpu_affinity`：
+---   "auto"（默认）→ 除 nvim 当前 CPU 外的全部核（单核宿主/无 taskset 时跳过）；
+---   "off"/false → 不绑定；显式 "2,3"/"2-3" → 直接使用该 cpuset。
+--- @return table|nil argv 前缀
+local function _affinity_prefix()
+  local cfg = config_store.get("tools.sandbox.limits") or {}
+  local mode = cfg.cpu_affinity
+  if mode == false or mode == "off" then return nil end
+  if vim.fn.executable("taskset") ~= 1 then return nil end
+  local cpus
+  if type(mode) == "string" and mode ~= "" and mode ~= "auto" then
+    cpus = mode
+  else
+    local n = _nproc()
+    if n <= 1 then return nil end
+    local cur = _nvim_cpu()
+    local list = {}
+    for i = 0, n - 1 do
+      if i ~= cur then list[#list + 1] = tostring(i) end
+    end
+    if #list == 0 then return nil end
+    cpus = table.concat(list, ",")
+  end
+  return { "taskset", "-c", cpus }
+end
+
+--- 把 CPU 亲和性前缀加到 argv 最前（taskset -c X <argv...>）。
+--- @param argv table
+--- @return table
+local function _prepend_affinity(argv)
+  local aff = _affinity_prefix()
+  if not aff then return argv end
+  local out = {}
+  for _, v in ipairs(aff) do out[#out + 1] = v end
+  for _, v in ipairs(argv) do out[#out + 1] = v end
+  return out
+end
+
 local function _executable(name)
   return vim.fn.executable(name) == 1
 end
@@ -269,12 +351,13 @@ local function _is_root()
   return vim.uv.getuid ~= nil and vim.uv.getuid() == 0
 end
 
---- 载荷运行身份（最小权限原则）：返回 uid, gid。
+--- 载荷运行身份：返回 uid, gid。
 ---   * 非 root 启动：始终以当前用户运行（本身即非 root），忽略 run_as 配置；
----   * root 启动：使用 `tools.sandbox.run_as`（默认 nobody 65534）。root 无法在 bwrap 内把
----     自身 1:1 之外降权，故由 `process_prefix` 先用 `setpriv` 把 bwrap 降为该 uid，再进入
----     用户命名空间，使载荷在宿主与命名空间内都是非 root（避免「userns 内 root」伪装）。
----     `uid <= 0` 表示显式放弃降权（以 root 运行载荷，不推荐）。
+---   * root 启动：使用 `tools.sandbox.run_as`（**默认 uid=0，不降权**，使 /root 下的工具链与
+---     包管理（dpkg 需 euid==0）在沙箱内可用；所有写入仍进 overlay 暂存）。配置专用非 root
+---     uid（如 nobody 65534）可加固：root 无法在 bwrap 内把自身 1:1 之外降权，故由
+---     `process_prefix` 先用 `setpriv` 把 bwrap 降为该 uid，再进入用户命名空间，使载荷在宿主
+---     与命名空间内都是非 root（避免「userns 内 root」伪装）。
 --- @return number uid
 --- @return number gid
 local function _payload_ids()
@@ -374,7 +457,11 @@ local function _auto_tool_paths()
         if not skip then
           local ok, store = pcall(require, "NeoAI.sandbox.store")
           local root = (ok and store and store.root and store.root()) or ""
-          if root ~= "" and (dir == root or dir:sub(1, #root + 1) == root .. "/") then skip = true end
+          if root ~= "" then
+            local iok, instance = pcall(require, "NeoAI.sandbox.instance")
+            local base = (iok and instance and instance.base_of) and instance.base_of(root) or root
+            if dir == base or dir:sub(1, #base + 1) == base .. "/" then skip = true end
+          end
         end
         if not skip then out[#out + 1] = dir end
       end
@@ -796,10 +883,11 @@ local function _overlay_write_works(lower, upper, work, flags)
   local nonroot = puid ~= nil and puid > 0
   local user_drop = nonroot and not _is_root()
   local root_drop = nonroot and _is_root()
-  -- user_drop：bwrap 在 userns 内切 uid；root_drop：bwrap 保持 root，载荷经 setpriv 降权。
+  -- user_drop：bwrap 在新建 userns 内把当前用户映射为 root（guest root）；root_drop：
+  -- bwrap 保持 root，载荷经 setpriv 降权。
   if user_drop then
-    argv[#argv + 1] = "--uid"; argv[#argv + 1] = tostring(puid)
-    argv[#argv + 1] = "--gid"; argv[#argv + 1] = tostring(pgid)
+    argv[#argv + 1] = "--uid"; argv[#argv + 1] = "0"
+    argv[#argv + 1] = "--gid"; argv[#argv + 1] = "0"
   elseif root_drop then
     for _, c in ipairs({ "CAP_SETUID", "CAP_SETGID" }) do
       argv[#argv + 1] = "--cap-add"; argv[#argv + 1] = c
@@ -1081,8 +1169,15 @@ local function _masked_paths(unmask, cwd, dac_override)
     out[#out + 1] = { path = p, kind = st.type == "directory" and "dir" or "file" }
   end
   -- 沙箱自身存储永远遮蔽（force），审批放行/档位 unmask 均不得解除。
+  -- store.root() 为「本进程实例」目录；再遮蔽其配置基根，避免从一个实例枚举到
+  -- 其它并发实例的待审内容。
   local ok, store = pcall(require, "NeoAI.sandbox.store")
-  if ok and store and store.root then add(store.root(), true) end
+  if ok and store and store.root then
+    local root = store.root()
+    add(root, true)
+    local iok, instance = pcall(require, "NeoAI.sandbox.instance")
+    if iok and instance and instance.base_of then add(instance.base_of(root), true) end
+  end
   for _, p in ipairs(_config_mask_paths()) do add(p) end
   for _, p in ipairs(_dir_masks(cwd)) do add(p) end
   return out
@@ -1259,10 +1354,19 @@ end
 
 --- 构造沙箱进程环境：密钥 token 化覆盖 + expose_paths 目录前置到 PATH + 代理策略 + 档位 env。
 --- 所有外部进程（run_command / runtime.run）统一经此构造，保证环境一致且可观测。
+--- token→真实密钥的还原**仅允许发生在沙箱内部进程环境**：这里对 `sanitized_env` 的 token
+--- 覆盖值做 `detokenize`，使沙箱内程序（pip/curl/…）拿到真实值；AI 上下文、日志与待审 UI
+--- 仍只看到 token（命令输出回传前会重新 token 化）。
 --- @param privileges table|nil { env? = table }
 --- @return table
 function M.sandbox_env(privileges)
-  local env = require("NeoAI.sandbox.secret").sanitized_env()
+  local secret = require("NeoAI.sandbox.secret")
+  local env = secret.sanitized_env()
+  for k, v in pairs(env) do
+    if type(v) == "string" and v:find("NEOKEY_", 1, true) then
+      env[k] = (secret.detokenize(v))
+    end
+  end
   local expose = _expose_paths()
   if #expose > 0 and config_store.get("tools.sandbox.expose_path_env") ~= false then
     local cur = vim.env.PATH or ""
@@ -1296,6 +1400,11 @@ function M.sandbox_env(privileges)
         env.NO_PROXY, env.no_proxy = "", ""
       end
     end
+  end
+  -- AppImage 支持：沙箱内拦截了 mount/新挂载 API 且不暴露 /dev/fuse，AppImage 无法 FUSE 挂载。
+  -- 注入 APPIMAGE_EXTRACT_AND_RUN=1 让其解包到会话私有 /tmp 运行（不扩大权限）；其他程序忽略该变量。
+  if config_store.get("tools.sandbox.appimage_extract_and_run") ~= false then
+    env.APPIMAGE_EXTRACT_AND_RUN = "1"
   end
   if privileges and type(privileges.env) == "table" then
     for k, v in pairs(privileges.env) do env[k] = v end
@@ -1478,7 +1587,17 @@ function M.overlay_reason(root, upper, work)
     return "OVERLAY_COARSE_PROBE_FAILED(内核/挂载不支持或 upper 文件系统不支持 overlay)"
   end
   if not (root and upper and work) then return nil end
-  if M.overlay_mountable(root, upper, work) then return nil end
+  if M.overlay_mountable(root, upper, work) then
+    -- 可挂载不代表可写：可写层依赖 upper/work 的文件系统支持与载荷身份。此处与真实门禁
+    -- （overlay_writable）保持一致，避免「能挂载但写不了」时返回 nil 导致降级提示无原因。
+    if M.overlay_writable(root, upper, work) then return nil end
+    local st_l = vim.uv.fs_stat(root)
+    local st_u = vim.uv.fs_stat(upper)
+    return string.format(
+      "OVERLAY_NOT_WRITABLE(lower_dev=%s upper_dev=%s; overlay 可挂载但载荷无法写入 upper/work，"
+        .. "可能 upper 所在文件系统不支持可写 overlay 层或权限/身份不匹配)",
+      tostring(st_l and st_l.dev or -1), tostring(st_u and st_u.dev or -1))
+  end
   local st_l = vim.uv.fs_stat(root)
   local st_u = vim.uv.fs_stat(upper)
   local ldev = st_l and st_l.dev or -1
@@ -1513,7 +1632,10 @@ function M.overlay_diagnosis(root)
   local upper, work = base .. "/diag-u", base .. "/diag-w"
   pcall(vim.fn.mkdir, upper, "p")
   pcall(vim.fn.mkdir, work, "p")
-  local ok = M.overlay_mountable(root, upper, work)
+  -- 可写性依赖 upper/work 归属载荷；诊断目录与真实 overlay 目录一致地 chown，避免误报。
+  M.chown_payload(upper)
+  M.chown_payload(work)
+  local ok = M.overlay_writable(root, upper, work)
   return {
     available = ok,
     reason = ok and nil or M.overlay_reason(root, upper, work),
@@ -1564,8 +1686,10 @@ function M.process_prefix(opts)
     local overlays = opts.overlays or {}
     local puid, pgid = _payload_ids()
     local nonroot = puid ~= nil and puid > 0
-    -- 降权方式（最小权限）：
-    --   user_drop：非 root 启动 → bwrap 以当前用户运行 + `--unshare-user --uid/--gid`（guest 非 root）。
+    -- 降权/提权方式：
+    --   user_drop：非 root 启动 → bwrap 用 user namespace 把**当前用户映射为沙箱内 root**
+    --     （guest root，宿主仍为当前非 root 用户）：euid=0 使工具链/包管理在沙箱内可用，
+    --     写入仍全部进 overlay 暂存；真正需要宿主 root 的操作冻结为待审、批准后 sudo。
     --   root_drop：root 启动 + 专用 uid → bwrap 仍以 **root** 运行（挂载权限足够：可处理 /root 下的
     --     挂载点与 overlay lower），仅**载荷**经 `setpriv` 降权（见函数末尾）。若把 bwrap 本身降权，
     --     它将无法在 /root 等 0700 目录下创建挂载点，导致隔离挂载失败/降级。
@@ -1578,7 +1702,7 @@ function M.process_prefix(opts)
     -- 网关模式：网络命名空间由 `ip netns exec` 提供，bwrap 不得再 unshare net，
     -- 故使用不带 net 的隔离标志（--unshare-pid/ipc/uts/cgroup）。
     if gateway_mode then flags = NO_USER_FLAGS end
-    -- 非 root 启动且载荷非 root：需要 user namespace 承载 `--uid/--gid`（bwrap 要求）。
+    -- 非 root 启动：需要 user namespace 承载 guest root（`--uid/--gid 0`，bwrap 要求）。
     if user_drop then
       if gateway_mode then
         flags = { "--unshare-user", "--unshare-pid", "--unshare-ipc", "--unshare-uts", "--unshare-cgroup" }
@@ -1592,15 +1716,19 @@ function M.process_prefix(opts)
     _append_bwrap_base(argv, flags, priv, opts.cwd)
     -- root_drop：为让载荷经 setpriv 降 uid，bwrap 需保留 SETUID/SETGID（其余能力仍被
     -- `--cap-drop ALL` 丢弃）；setuid 后内核清空 permitted/effective，载荷无能力。
-    if root_drop then
+    -- 但嵌套 userns 档位（T2）下 bwrap 新建的 userns 未映射 run_as.uid，setpriv 会
+    -- `setresuid: Invalid argument`；此时保持 userns root（能力被 userns 作用域限制，
+    -- 够不到宿主），由 bwrap 自身完成 uid 命名空间隔离，不再追加 setpriv。
+    if root_drop and not userns then
       for _, c in ipairs({ "CAP_SETUID", "CAP_SETGID" }) do
         argv[#argv + 1] = "--cap-add"; argv[#argv + 1] = c
       end
     end
-    -- user_drop：bwrap 在新建 userns 内切到该 uid/gid（guest 与宿主都非 root）。
+    -- user_drop：bwrap 在新建 userns 内把当前用户映射为 guest root（uid/gid 0，仅命名空间内
+    -- 有效；宿主身份仍是当前非 root 用户）。
     if user_drop then
-      argv[#argv + 1] = "--uid"; argv[#argv + 1] = tostring(puid)
-      argv[#argv + 1] = "--gid"; argv[#argv + 1] = tostring(pgid)
+      argv[#argv + 1] = "--uid"; argv[#argv + 1] = "0"
+      argv[#argv + 1] = "--gid"; argv[#argv + 1] = "0"
     end
     -- F2：临时根覆盖为「会话私有目录」（mode 1777，位于 /dev/shm 等 tmpfs 上），
     -- 覆盖基础参数里的空 tmpfs；绝不把宿主真实 /tmp、/var/tmp 作为 lower/内容暴露，
@@ -1729,17 +1857,28 @@ function M.process_prefix(opts)
     -- 降为专用非 root uid。载荷在宿主与命名空间内都非 root、无能力（bwrap 已 --cap-drop ALL，
     -- 改 uid 时内核清空 caps）；bwrap 设置的 NoNewPrivs 使 setuid/文件能力二进制无法提权。
     -- 用 `--` 分隔后，调用方追加的真实命令即成为 setpriv 的实参。
-    if root_drop then
+    -- 嵌套 userns（T2）例外：userns 内未映射 run_as.uid，setpriv 会 EINVAL，故不降权
+    -- （保持 userns root，能力受 userns 作用域限制）。
+    if root_drop and not userns then
       table.insert(argv, "--")
       for _, v in ipairs({ "setpriv", "--reuid", tostring(puid), "--regid", tostring(pgid),
         "--clear-groups" }) do
         table.insert(argv, v)
       end
+      -- 保留配置的窄能力：bwrap 的 `--cap-add` 在降 uid 前把能力放入可继承集，但 setpriv
+      -- 改 uid 会清空 permitted/effective（CapEff=0）。显式提升为 ambient，使非 root 载荷
+      -- 仍持有这些能力——否则包安装的 CAP_DAC_OVERRIDE/CHOWN/SETUID 等失效，apt/dpkg 因
+      -- 无法获取锁文件（Permission denied）而失败。
+      local amb = _ambient_caps(priv)
+      if amb then
+        table.insert(argv, "--inh-caps"); table.insert(argv, amb)
+        table.insert(argv, "--ambient-caps"); table.insert(argv, amb)
+      end
     end
     if filter then
-      return _wrap_close_fds(argv, "exec 3<'" .. filter .. "'"), nil, opts.cwd
+      return _wrap_close_fds(_prepend_affinity(argv), "exec 3<'" .. filter .. "'"), nil, opts.cwd
     end
-    return _wrap_close_fds(argv), nil, opts.cwd
+    return _wrap_close_fds(_prepend_affinity(argv)), nil, opts.cwd
   end
   -- unshare 后端：无 overlay 支持，退化为空暂存 cwd（仍隔离 net/pid/ipc/uts/user）
   if require("NeoAI.sandbox.seccomp").enabled() then
@@ -1762,7 +1901,7 @@ function M.process_prefix(opts)
   if not want_net then
     table.insert(argv, "--net")
   end
-  return _wrap_close_fds(argv), nil, (opts.fallback_cwd or opts.cwd)
+  return _wrap_close_fds(_prepend_affinity(argv)), nil, (opts.fallback_cwd or opts.cwd)
 end
 
 --- 判断某 effect 是否可在当前环境隔离执行
@@ -1777,14 +1916,11 @@ function M.check_available()
     return false, "SANDBOX_BACKEND_UNAVAILABLE: 既无 bwrap 也无可用的 unshare/userns"
   end
   local cfg = config_store.get("tools.sandbox") or {}
-  -- 最小权限提醒：root 启动且显式放弃降权（run_as.uid<=0）时，载荷以 root 运行。
+  -- root 启动 + 配置专用非 root uid 时需要 setpriv 降权；缺失则 fail-closed，
+  -- 绝不静默以 root 运行载荷。uid=0（默认）不降权，无需 setpriv。
   if _is_root() then
     local uid = _payload_ids()
-    if not uid or uid <= 0 then
-      require("NeoAI.kernel.logger").warn(
-        "[sandbox] root 启动且 tools.sandbox.run_as.uid=0：载荷以 root 运行（不推荐，最小权限失效）")
-    elseif vim.fn.executable("setpriv") ~= 1 then
-      -- root 启动需 setpriv 把载荷降为专用 uid；缺失则 fail-closed，绝不静默以 root 运行载荷。
+    if uid and uid > 0 and vim.fn.executable("setpriv") ~= 1 then
       return false, "SANDBOX_SETPRIV_UNAVAILABLE: root 启动需 setpriv 降权到 run_as.uid"
     end
   end

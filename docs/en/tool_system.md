@@ -149,7 +149,8 @@ approval is allowed by default and a notify is sent.
 `read_file` / `edit_file` / `list_files` / `search_files` / `file_exists` / `create_directory` /
 `ensure_dir` / `delete_file` / `confirm_file_change`.
 
-> `edit_file` supports `mode='write'/'append'/'edit'`. `confirm_file_change` works together with `edit_file`:
+> `edit_file` supports `mode='write'/'append'/'edit'` (when `mode` is omitted it is inferred from the
+> fields: `content` → `write`, `edits` → `edit`). `confirm_file_change` works together with `edit_file`:
 > the model first sees the "preview" result, then calls `confirm_file_change(action='confirm'/'abandon'/'retry')` to confirm.
 > Blocking file I/O (reading large files / recursive search / writing to disk) runs in a thread pool via `utils.work`,
 > without occupying the main thread.
@@ -201,8 +202,7 @@ approval is allowed by default and a notify is sent.
 
 ### 📐 Plan Mode (plan_mode.lua)
 
-`enter_plan_mode` (enter plan mode: the tool context switches to read-only/informational + asking questions) /
-`exit_plan_mode` (after user confirmation, parses the plan into todos and switches to CHAT execution). See [configuration.md](configuration.md) and [chat_enhanced_usage.md](chat_enhanced_usage.md) for details.
+`enter_plan_mode` (enter plan mode: the tool context switches to read-only/informational + asking questions). Plan mode **does not give the AI any mode-switching tool**; after the plan is emitted the user runs `:NeoAIApprovePlan` (or toggles the mode manually) to confirm execution. See [configuration.md](configuration.md) and [chat_enhanced_usage.md](chat_enhanced_usage.md) for details.
 
 ### 💬 Asking the User (ask_user.lua)
 

@@ -34,11 +34,16 @@ local function _client_for(filepath)
   return clients[1]
 end
 
---- 找一个支持指定方法的 LSP 客户端
+--- 找一个支持指定方法的 LSP 客户端（优先 AI 沙箱克隆，回退编辑器客户端）
 --- @param method string
 --- @param bufnr number|nil
 --- @return table|nil
 local function _client_supporting(method, bufnr)
+  local ok, sandbox = pcall(require, "NeoAI.sandbox.lsp")
+  if ok and sandbox then
+    local ok2, clone = pcall(sandbox.client_supporting, method, bufnr)
+    if ok2 and clone then return clone end
+  end
   local clients = bufnr and vim.lsp.get_clients({ bufnr = bufnr }) or vim.lsp.get_clients()
   for _, client in ipairs(clients) do
     if client:supports_method(method, bufnr) then return client end
@@ -56,6 +61,16 @@ end
 --- @param target number|table bufnr 或 LSP 客户端（client:request）
 --- @return Deferred
 local function _request(method, params, target)
+  -- 优先走 AI 专用沙箱 LSP 克隆（独立进程，读暂存内容，诊断不外溢）。
+  -- 未启用 / overlay 不可用 / 无克隆时回退到编辑器客户端（原行为）。
+  if type(target) == "number" then
+    local ok, sandbox = pcall(require, "NeoAI.sandbox.lsp")
+    if ok and sandbox then
+      local ok2, clone = pcall(sandbox.client_supporting, method, target)
+      if ok2 and clone then target = clone end
+    end
+  end
+
   local d = async.Deferred.new()
   local called = false
   local timeout_ms = config_store.get("tools.lsp.timeout_ms") or 10000
@@ -325,14 +340,37 @@ lsp_tools.lsp_diagnostics = helpers.define_tool(
   function(args, on_success, on_error)
     local bufnr = _bufnr(args.filepath)
     if not bufnr then on_error("无法找到文件 buffer") return end
-    local diagnostics = vim.diagnostic.get(bufnr)
-    if #diagnostics == 0 then on_success("无诊断信息") return end
-    local out = {}
-    for _, diag in ipairs(diagnostics) do
-      local sev = vim.diagnostic.severity[diag.severity] or "?"
-      out[#out + 1] = string.format("%s:%d %s: %s", args.filepath or "(当前)", diag.lnum + 1, sev, diag.message)
+    local uri = vim.uri_from_bufnr(bufnr)
+
+    local function _format(diagnostics)
+      if not diagnostics or #diagnostics == 0 then on_success("无诊断信息") return end
+      local out = {}
+      for _, diag in ipairs(diagnostics) do
+        local sev = vim.diagnostic.severity[diag.severity] or "?"
+        out[#out + 1] = string.format("%s:%d %s: %s", args.filepath or "(当前)", diag.lnum + 1, sev, diag.message)
+      end
+      on_success(table.concat(out, "\n"))
     end
-    on_success(table.concat(out, "\n"))
+
+    -- 优先从 AI 沙箱克隆拉取诊断（反映暂存内容）；服务器不支持 pull 时回退编辑器诊断。
+    local clone = _client_supporting("textDocument/diagnostic", bufnr)
+    if clone then
+      _request("textDocument/diagnostic", { textDocument = { uri = uri } }, clone):then_(function(result)
+        local items = type(result) == "table" and result.items or nil
+        if items then
+          _format(vim.tbl_map(function(d)
+            local r = d.range or { start = { line = 0, character = 0 } }
+            return { lnum = r.start.line, severity = d.severity, message = d.message }
+          end, items))
+        else
+          _format(vim.diagnostic.get(bufnr))
+        end
+      end, function()
+        _format(vim.diagnostic.get(bufnr))
+      end)
+      return
+    end
+    _format(vim.diagnostic.get(bufnr))
   end,
   { category = "lsp" }
 )

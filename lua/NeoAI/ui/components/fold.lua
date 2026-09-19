@@ -209,13 +209,14 @@ end
 --- @return string|nil name 工具名（工具类折叠）
 --- @return string|nil desc 目的说明（工具类折叠，可无）
 function M.detect(first)
-  local status = _tool_status(first)
+  local head = first
+  local status = _tool_status(head)
   -- 耗时形如 " · 1.2s" / " · 800ms"（纯数字+单位），先剥掉；剩余部分解析 name 与 desc，
   -- 避免 name/desc 里的 " · " 干扰耗时识别。非耗时结尾（如无耗时的中文描述）不剥。
-  local time = first:match("%·%s*%d+%.?%d*%s*[msd]+%s*$")
-  local body = first
+  local time = head:match("%·%s*%d+%.?%d*%s*[msd]+%s*$")
+  local body = head
   if time then
-    body = first:gsub("%·%s*%d+%.?%d*%s*[msd]+%s*$", "")
+    body = head:gsub("%·%s*%d+%.?%d*%s*[msd]+%s*$", "")
   end
   local call_name = body:match("调用工具:%s*([^%s%(%·]+)")
   if call_name then
@@ -240,6 +241,7 @@ end
 --- 生成折叠占位文本（纯函数，供 foldtext 与测试使用）
 --- 工具折叠格式：工具 emoji + 工具名称 + 目的 + 状态 emoji + 耗时
 --- （🔧 name · 目的 ✅ 1.2s）。推理折叠沿用思考过程摘要。
+--- 密钥警告不在此展示（由 message_list 在折叠块外单独一行高亮）。
 --- @param first string 折叠首行
 --- @param count number 折叠行数
 --- @param is_reasoning boolean|nil 是否为已登记的推理块（默认 true，保持旧语义）

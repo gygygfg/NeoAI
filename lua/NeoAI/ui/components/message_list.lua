@@ -7,6 +7,7 @@ local stringx = require("NeoAI.utils.stringx")
 local fold = require("NeoAI.ui.components.fold")
 local config_store = require("NeoAI.kernel.config_store")
 local json = require("NeoAI.utils.json")
+local ansi = require("NeoAI.utils.ansi")
 local display_modes = require("NeoAI.ui.components.display_modes")
 local incremental = require("NeoAI.ui.components.incremental")
 
@@ -98,6 +99,20 @@ end
 --- @param start_line number|nil marks[1] 对应的 1-based buffer 行号（默认 1）
 --- @param range_from number|nil 增量重贴起始行（1-based，含）
 --- @param range_to number|nil 增量重贴结束行（1-based，含）
+--- 整行高亮：必须用 set_extmark 把 end_row 限定在本行（`hl_eol=true`）。
+--- 不能用 `nvim_buf_add_highlight(..., row, 0, -1)`：其 end_col=-1 会被内部解释为
+--- 下一行行首（end_row=row+1），导致后续增量 `clear_namespace(range_from, ...)`
+--- 在 range_from=row+1 时误清本行高亮（见 secret 告警行消失回归）。
+--- @param b number buffer
+--- @param ns number 命名空间
+--- @param group string 高亮组
+--- @param row number 0-based 行号
+local function _set_line_hl(b, ns, group, row)
+  pcall(vim.api.nvim_buf_set_extmark, b, ns, row, 0, {
+    end_row = row, end_col = 0, hl_eol = true, hl_group = group,
+  })
+end
+
 local function _apply_table_hl(buf, marks, start_line, range_from, range_to)
   if not buf or not vim.api.nvim_buf_is_valid(buf) then return end
   -- marks 与行并行，首行多为 nil（角色头等无高亮），不能用 ipairs（遇 nil 即止）。
@@ -111,7 +126,7 @@ local function _apply_table_hl(buf, marks, start_line, range_from, range_to)
   local paint = function(b, ns, m, row)
     local group = m and TABLE_HL_GROUP[m.tbl]
     if group then
-      pcall(vim.api.nvim_buf_add_highlight, b, ns, group, row, 0, -1)
+      _set_line_hl(b, ns, group, row)
     end
   end
   if range_from and range_to and range_to >= range_from then
@@ -138,6 +153,444 @@ local function _apply_table_hl(buf, marks, start_line, range_from, range_to)
   end
 end
 
+-- ========== 密钥警告高亮 ==========
+
+-- 工具参数 / 工具结果（模型上下文）含密钥时，在对应工具折叠块**外**单独追加一行
+-- 高亮警告（非缩进 → 不并入折叠），折叠标题保持干净（不再追加 `⚠ 密钥`）。
+local SECRET_HL_NS = vim.api.nvim_create_namespace("neoai_secret_hi")
+local SECRET_HL_GROUP = "NeoAISecretWarning"
+
+-- 命令输出的 ANSI SGR 颜色高亮（高亮组由 utils.ansi 惰性创建）。
+local ANSI_HL_NS = vim.api.nvim_create_namespace("neoai_ansi_hi")
+
+--- 定义密钥警告高亮组（default=true，用户可在 colorscheme 覆盖）。
+local function _ensure_secret_hl()
+  vim.api.nvim_set_hl(0, SECRET_HL_GROUP, {
+    default = true, fg = "#ff5555", bold = true, underline = true,
+  })
+end
+
+--- 值是否含密钥：
+--- 1) 沙箱 token（`NEOKEY_*`）——已知密钥被加密映射后的表示，确定命中（字符串/块数组均可）；
+--- 2) 具名规则命中的结构化敏感信息（私钥块 / 带前缀 token 等），确定命中；
+---    仅具名规则（`detect_named`）参与，避免逐行熵检测拖慢大结果渲染。
+--- @param v string|table|nil
+--- @return boolean
+local function _contains_secret(v)
+  if v == nil then return false end
+  local ok, secret = pcall(require, "NeoAI.sandbox.secret")
+  if not ok or type(secret) ~= "table" then return false end
+  if secret.enabled and not secret.enabled() then return false end
+  if secret.contains_token and secret.contains_token(v) then return true end
+  if type(v) == "string" and #v <= 65536 and secret.detect_named then
+    local ok2, hits = pcall(secret.detect_named, v)
+    if ok2 and type(hits) == "table" and #hits > 0 then return true end
+  end
+  return false
+end
+
+--- 单值密钥信息（一次扫描同时得到「是否含密钥」与命中的具名规则），避免重复检测。
+--- @param v string|table|nil
+--- @return table { has = boolean, rules = table }
+local function _secret_info(v)
+  local info = { has = false, rules = {} }
+  if v == nil then return info end
+  local ok, secret = pcall(require, "NeoAI.sandbox.secret")
+  if not ok or type(secret) ~= "table" then return info end
+  if secret.enabled and not secret.enabled() then return info end
+  if secret.contains_token and secret.contains_token(v) then info.has = true end
+  if type(v) == "string" and #v <= 65536 and secret.detect_named then
+    local ok2, hits = pcall(secret.detect_named, v)
+    if ok2 and type(hits) == "table" then
+      for _, hit in ipairs(hits) do
+        if hit and hit.rule ~= nil then
+          info.has = true
+          info.rules[hit.rule] = true
+        end
+      end
+    end
+  end
+  return info
+end
+
+--- 路径是否为真正的凭据/密钥文件（严口径，用于 UI 告警）。
+--- 注意与 `sandbox.secret.is_secret_path`（宽口径，用于高熵扫描门控）区分：后者含 `/etc/*`、
+--- shell 历史等常见配置，若用于告警会把 `cat /etc/os-release`、`uname` 等误报为「获取密钥」。
+--- @param p string
+--- @return boolean
+local function _is_secret_path(p)
+  local ok, secret = pcall(require, "NeoAI.sandbox.secret")
+  if ok and secret.is_sensitive_path then return secret.is_sensitive_path(p) end
+  return false
+end
+
+-- 路径型参数名（含密钥文件路径的工具参数）
+local PATH_KEYS = { filepath = true, file = true, path = true, dir = true, dirs = true, target = true }
+
+-- 仅枚举/列出、不读取内容的工具：其路径参数不构成对密钥文件的读取/使用，不告警。
+local LIST_ONLY_TOOLS = {
+  list_files = true, search_files = true, file_exists = true, create_directory = true,
+}
+
+-- 仅查看元数据/列目录、不读取内容的命令首词：命中则不把命令中的密钥路径视为读取/使用。
+local LIST_ONLY_CMDS = {
+  ls = true, find = true, tree = true, stat = true, file = true, du = true, df = true,
+  realpath = true, readlink = true, basename = true, dirname = true, which = true,
+  ["type"] = true, command = true, locate = true, echo = true, printf = true, pwd = true,
+}
+
+-- 读取密钥内容的命令首词（用于区分「获取」）。
+local READ_CMDS = {
+  cat = true, tac = true, head = true, tail = true, less = true, more = true,
+  grep = true, egrep = true, fgrep = true, rg = true, ag = true, sed = true, awk = true,
+  cut = true, sort = true, uniq = true, strings = true, xxd = true, od = true,
+  hexdump = true, base64 = true, cp = true, mv = true, tar = true, zip = true,
+  unzip = true, diff = true, cmp = true, md5sum = true, sha256sum = true,
+}
+
+-- 使用密钥凭据的命令首词（用于区分「使用」）。
+local USE_CMDS = {
+  ssh = true, scp = true, sftp = true, ["ssh-add"] = true, ["ssh-keygen"] = true,
+  curl = true, wget = true, openssl = true, gpg = true, git = true, rsync = true,
+  mysql = true, psql = true, ["redis-cli"] = true, docker = true, kubectl = true,
+  aws = true, gcloud = true, az = true, ansible = true, ["ansible-playbook"] = true,
+  export = true, ["source"] = true,
+}
+
+-- 命令包装器/外壳：取真实命令首词时跳过。
+local CMD_WRAPPERS = {
+  sudo = true, doas = true, env = true, nohup = true, nice = true, ionice = true,
+  stdbuf = true, setsid = true, timeout = true, command = true, exec = true,
+  bash = true, sh = true, dash = true, zsh = true, ksh = true,
+}
+
+--- 命令首个真实可执行名的基名（跳过 sudo/env/赋值/包装器）。
+--- @param cmd string|nil
+--- @return string|nil
+local function _command_bin(cmd)
+  if type(cmd) ~= "string" then return nil end
+  for tok in cmd:gmatch("%S+") do
+    tok = tok:gsub("^['\"]+", ""):gsub("['\"]+$", "")
+    if tok ~= "" and not tok:find("=", 1, true) then
+      local base = tok:match("[^/]+$") or tok
+      if not CMD_WRAPPERS[base] then return base end
+    end
+  end
+  return nil
+end
+
+--- 命令对密钥的作用类别："read"（获取）/ "use"（使用）/ nil（仅列出或未知）。
+--- @param cmd string|nil
+--- @return string|nil
+local function _command_secret_kind(cmd)
+  local bin = _command_bin(cmd)
+  if not bin then return nil end
+  if LIST_ONLY_CMDS[bin] then return nil end
+  if READ_CMDS[bin] then return "read" end
+  if USE_CMDS[bin] then return "use" end
+  return nil
+end
+
+--- 从工具参数收集疑似密钥文件路径（路径型参数 + 读取/使用型命令中出现的路径）。
+--- 仅列出/查看类工具与命令（ls/find/list_files…）不构成读取或使用，路径不计入。
+--- @param args table|nil
+--- @param tool_name string|nil
+--- @return table 去重后的路径数组
+local function _secret_paths(args, tool_name)
+  local seen, out = {}, {}
+  local function add(p)
+    if type(p) ~= "string" then return end
+    p = p:gsub("^%s+", ""):gsub("%s+$", "")
+    if p == "" or seen[p] or not _is_secret_path(p) then return end
+    seen[p] = true
+    out[#out + 1] = p
+  end
+  if type(args) ~= "table" then return out end
+  if LIST_ONLY_TOOLS[tool_name] then return out end
+  for k, v in pairs(args) do
+    if PATH_KEYS[k] then
+      if type(v) == "string" then add(v)
+      elseif type(v) == "table" then
+        for _, x in ipairs(v) do add(x) end
+      end
+    elseif k == "command" and type(v) == "string" then
+      -- 仅当命令确实读取/使用密钥（非 ls/find 等仅列出）时，命令中的密钥路径才计入。
+      if _command_secret_kind(v) ~= nil then
+        for tok in v:gmatch("[%w%._/%+%-~%$%{%}]+") do add(tok) end
+      end
+    end
+  end
+  return out
+end
+
+--- 收集敏感环境变量名。
+--- @param values table
+--- @return table
+local function _secret_names(values)
+  local ok, secret = pcall(require, "NeoAI.sandbox.secret")
+  if not ok or type(secret) ~= "table" or not secret.scan_names then return {} end
+  local seen, out = {}, {}
+  for _, v in ipairs(values or {}) do
+    local ok2, names = pcall(secret.scan_names, v)
+    if ok2 then
+      for _, n in ipairs(names or {}) do
+        if not seen[n] then seen[n] = true; out[#out + 1] = n end
+      end
+    end
+  end
+  return out
+end
+
+--- 构造密钥警告行，**明确区分「获取」与「使用」**：
+---   * 获取：工具结果 / 内核观测到的密钥文件读取命中密钥内容；
+---   * 使用：工具参数（命令/写入内容）携带密钥值、token 或敏感环境变量名，或使用型命令引用密钥文件。
+--- 仅列出密钥文件（ls/find/list_files 等）不构成读取/使用，不产生告警。
+--- 明细回退顺序：观测到的密钥文件 → 参数中的密钥文件 → 密钥类型（具名规则）→ 敏感环境变量名 → 通用提示。
+--- @param fn table tool_call["function"]
+--- @param result_msg table|nil
+--- @return string|nil
+local function _secret_warning_line(fn, result_msg)
+  if not fn then return nil end
+  local ok, secret = pcall(require, "NeoAI.sandbox.secret")
+  if not ok or type(secret) ~= "table" then return nil end
+  if secret.enabled and not secret.enabled() then return nil end
+
+  local args_str = fn.arguments
+  local result_content = result_msg and result_msg.content or nil
+  local args = nil
+  if type(args_str) == "string" and args_str ~= "" then
+    local dec = json.decode_or_nil(args_str)
+    if type(dec) == "table" then args = dec end
+  end
+
+  -- 内核观测（eBPF/strace/procfs）到实际访问的密钥文件：真实「获取」行为，优先以此为准。
+  -- 仅保留**真正的凭据文件**（严口径）：`/etc/ld.so.cache`、`/etc/passwd`、`go.env`、历史文件等
+  -- 被普通命令频繁打开，不是密钥，不应触发告警。
+  local observed = {}
+  if type(result_msg and result_msg.secret_paths) == "table" then
+    local seen = {}
+    for _, p in ipairs(result_msg.secret_paths) do
+      if type(p) == "string" and p ~= "" and _is_secret_path(p) and not seen[p] then
+        seen[p] = true
+        observed[#observed + 1] = p
+      end
+    end
+  end
+
+  local names_args = _secret_names({ args })
+  local names_result = _secret_names({ result_content })
+  local info_args = _secret_info(args_str)
+  local info_result = _secret_info(result_content)
+  local paths = _secret_paths(args, fn.name)
+  local cmd_kind = args and type(args.command) == "string" and _command_secret_kind(args.command) or nil
+
+  -- 获取：内核观测到密钥文件读取，或结果（模型上下文）含密钥值/token/环境变量名。
+  -- 使用：参数携带密钥值/token/环境变量名，或使用型命令（ssh/scp/curl/gpg…）引用密钥文件。
+  -- 仅读取型命令引用密钥路径（如 read_file / cat 无密钥输出）不作为告警触发，避免误报。
+  local got = #observed > 0 or info_result.has or #names_result > 0
+  local used = info_args.has or #names_args > 0 or (#paths > 0 and cmd_kind == "use")
+  if not (got or used) then return nil end
+
+  local verb = (got and used) and "获取并使用了密钥" or (got and "获取了密钥" or "使用了密钥")
+  local parts = { "⚠ 密钥：" .. (fn.name or "工具") }
+  if args and type(args.command) == "string" and args.command ~= "" then
+    parts[#parts + 1] = " 执行 `" .. stringx.truncate(args.command:gsub("%s+", " "), 80) .. "`"
+  end
+  parts[#parts + 1] = " " .. verb
+  local rule_set = {}
+  for r in pairs(info_args.rules) do rule_set[r] = true end
+  for r in pairs(info_result.rules) do rule_set[r] = true end
+  local rules = {}
+  for r in pairs(rule_set) do rules[#rules + 1] = r end
+  table.sort(rules)
+  local names, name_seen = {}, {}
+  for _, src in ipairs({ names_args, names_result }) do
+    for _, n in ipairs(src) do
+      if not name_seen[n] then name_seen[n] = true; names[#names + 1] = n end
+    end
+  end
+  if #observed > 0 then
+    parts[#parts + 1] = "（观测到密钥文件：" .. table.concat(observed, ", ") .. "）"
+  elseif #paths > 0 then
+    parts[#parts + 1] = "（密钥文件：" .. table.concat(paths, ", ") .. "）"
+  elseif #rules > 0 then
+    parts[#parts + 1] = "（密钥类型：" .. table.concat(rules, ", ") .. "）"
+  elseif #names > 0 then
+    parts[#parts + 1] = "（密钥环境变量：" .. table.concat(names, ", ") .. "）"
+  else
+    parts[#parts + 1] = "（模型上下文含密钥）"
+  end
+  return table.concat(parts)
+end
+
+--- 返回一行文本内的密钥高亮区间（0-based 字节列，左闭右开）。
+--- 同时覆盖具名规则命中的原始密钥（`secret.detect_named`）与沙箱 token（`NEOKEY_*`）。
+--- 仅走具名规则快路径（不做熵检测）：`has_secret` 判定本就不采信无规则的熵命中，
+--- 而逐行熵检测会让含密钥的大结果渲染卡顿。
+--- @param text string
+--- @return table 区间数组 { { start, stop, group } }
+local function _secret_spans(text)
+  local out = {}
+  if type(text) ~= "string" or text == "" then return out end
+  local ok, secret = pcall(require, "NeoAI.sandbox.secret")
+  if not ok or type(secret) ~= "table" then return out end
+  if secret.enabled and not secret.enabled() then return out end
+  if secret.detect_named then
+    local ok2, hits = pcall(secret.detect_named, text)
+    if ok2 and type(hits) == "table" then
+      for _, hit in ipairs(hits) do
+        if hit.start and hit.stop then
+          out[#out + 1] = { hit.start - 1, hit.stop, SECRET_HL_GROUP }
+        end
+      end
+    end
+  end
+  -- token 不参与具名规则（is_candidate 主动排除 NEOKEY_ 前缀），单独按位置补齐。
+  for s, e in text:gmatch("()NEOKEY_%x+()") do
+    out[#out + 1] = { s - 1, e - 1, SECRET_HL_GROUP }
+  end
+  return out
+end
+
+--- 一次扫描整块文本，把命中的密钥区间按行分配（避免逐行调用 detect 的 O(行数×规则) 开销）。
+--- 跨行规则（如私钥块）也能整体命中，命中归属其起始行。
+--- @param rows table 行数组（字符串或 { text, spans } 行对象）
+--- @param enabled boolean
+--- @return table rows（命中行被替换为携带 secret_spans 的行对象）
+local function _with_secret_spans_bulk(rows, enabled)
+  if not enabled or not rows or #rows == 0 then return rows end
+  local texts, offsets = {}, {}
+  local pos = 0
+  for i = 1, #rows do
+    local text = type(rows[i]) == "table" and rows[i].text or rows[i]
+    text = text or ""
+    texts[i] = text
+    offsets[i] = pos
+    pos = pos + #text + 1 -- +1 为连接用的 "\n"
+  end
+  local joined = table.concat(texts, "\n")
+  local hits = {}
+  local ok, secret = pcall(require, "NeoAI.sandbox.secret")
+  if ok and type(secret) == "table" and not (secret.enabled and not secret.enabled()) then
+    if secret.detect_named then
+      local ok2, dh = pcall(secret.detect_named, joined)
+      if ok2 and type(dh) == "table" then
+        for _, h in ipairs(dh) do
+          if h.start and h.stop then hits[#hits + 1] = { start = h.start, stop = h.stop } end
+        end
+      end
+    end
+    for s, e in joined:gmatch("()NEOKEY_%x+()") do
+      hits[#hits + 1] = { start = s, stop = e - 1 }
+    end
+  end
+  if #hits == 0 then return rows end
+  table.sort(hits, function(a, b) return a.start < b.start end)
+  local idx = 1
+  for i = 1, #rows do
+    local row_start = offsets[i] + 1 -- 1-based
+    local row_end = offsets[i] + #texts[i]
+    -- 命中只归属其起始行：跳过已在前面行分配过的命中（含跨行规则的续行）。
+    while idx <= #hits and hits[idx].start < row_start do idx = idx + 1 end
+    local j = idx
+    local spans = nil
+    while j <= #hits and hits[j].start <= row_end do
+      local h = hits[j]
+      local s = h.start - row_start
+      local e = math.min(h.stop - row_start + 1, #texts[i]) -- 跨行命中截断到本行行尾
+      if s < 0 then s = 0 end
+      if e > s then
+        spans = spans or {}
+        spans[#spans + 1] = { s, e, SECRET_HL_GROUP }
+      end
+      j = j + 1
+    end
+    if spans then
+      local row = rows[i]
+      if type(row) == "table" then
+        row.secret_spans = spans
+      else
+        rows[i] = { text = row, secret_spans = spans }
+      end
+    end
+  end
+  return rows
+end
+
+--- 对 buffer 应用密钥警告高亮。
+--- 支持两类标记：`secret`（整行警告行）与 `secret_spans`（行内密钥值区间）。
+--- range_from/range_to 语义与 `_apply_table_hl` 一致（增量重贴差异区间）。
+--- 注意：即使本次无任何 secret 标记，也要清理区间内的旧高亮，避免内容变化后残留。
+--- @param buf number
+--- @param marks table|nil
+--- @param start_line number|nil
+--- @param range_from number|nil
+--- @param range_to number|nil
+local function _apply_secret_hl(buf, marks, start_line, range_from, range_to)
+  if not buf or not vim.api.nvim_buf_is_valid(buf) then return end
+  start_line = start_line or 1
+  local incremental = range_from and range_to and range_to >= range_from
+  if incremental then
+    pcall(vim.api.nvim_buf_clear_namespace, buf, SECRET_HL_NS, range_from - 1, range_to)
+  else
+    pcall(vim.api.nvim_buf_clear_namespace, buf, SECRET_HL_NS, 0, -1)
+  end
+  -- marks 与行并行且存在空洞（无密钥的行标记为 nil），不能用 #marks / ipairs 遍历。
+  local mfrom, mto = 1, math.huge
+  if incremental then
+    mfrom = math.max(1, range_from - start_line + 1)
+    mto = range_to - start_line + 1
+  end
+  local has = false
+  for ln, m in pairs(marks or {}) do
+    if type(ln) == "number" and m and (m.secret or m.secret_spans) and ln >= mfrom and ln <= mto then
+      if not has then
+        _ensure_secret_hl()
+        has = true
+      end
+      local row = start_line - 1 + (ln - 1)
+      if m.secret then
+        _set_line_hl(buf, SECRET_HL_NS, SECRET_HL_GROUP, row)
+      end
+      for _, sp in ipairs(m.secret_spans or {}) do
+        pcall(vim.api.nvim_buf_add_highlight, buf, SECRET_HL_NS, sp[3] or SECRET_HL_GROUP, row, sp[1], sp[2])
+      end
+    end
+  end
+end
+
+--- 对 buffer 应用命令输出的 ANSI 颜色高亮（仅处理带 `ansi` 区间的行）。
+--- 区间为 0-based 字节列（左闭右开），由 utils.ansi 解析并已含缩进偏移。
+--- range_from/range_to 语义与 `_apply_table_hl` 一致（增量重贴差异区间）。
+--- @param buf number
+--- @param marks table|nil
+--- @param start_line number|nil
+--- @param range_from number|nil
+--- @param range_to number|nil
+local function _apply_ansi_hl(buf, marks, start_line, range_from, range_to)
+  if not buf or not vim.api.nvim_buf_is_valid(buf) then return end
+  start_line = start_line or 1
+  local incremental = range_from and range_to and range_to >= range_from
+  if incremental then
+    pcall(vim.api.nvim_buf_clear_namespace, buf, ANSI_HL_NS, range_from - 1, range_to)
+  else
+    pcall(vim.api.nvim_buf_clear_namespace, buf, ANSI_HL_NS, 0, -1)
+  end
+  local mfrom, mto = 1, math.huge
+  if incremental then
+    mfrom = math.max(1, range_from - start_line + 1)
+    mto = range_to - start_line + 1
+  end
+  for ln, m in pairs(marks or {}) do
+    if type(ln) == "number" and m and m.ansi and ln >= mfrom and ln <= mto then
+      local row = start_line - 1 + (ln - 1)
+      for _, sp in ipairs(m.ansi) do
+        pcall(vim.api.nvim_buf_add_highlight, buf, ANSI_HL_NS, sp[3], row, sp[1], sp[2])
+      end
+    end
+  end
+end
+
 --- 追加一行渲染输出，并记录与该行并行的元数据（marks，供斑马纹高亮）。
 --- 注意：marks 与 lines 严格按下标对齐。必须用 lines 的长度做下标——
 --- 不能写 `marks[#marks + 1] = mark`：mark 为 nil（角色头/空行）时不会推进长度，
@@ -159,13 +612,33 @@ end
 --- @param kind string|nil 折叠类型（"reasoning"/"tool"），登记到首行元数据供 foldtext 判定
 local function _append_fold_block(lines, marks, rows, kind)
   if not rows or #rows == 0 then return end
-  for idx, l in ipairs(rows) do
-    local mark = (idx == 1 and kind) and { fold_kind = kind } or nil
-    if l == "" then
-      _push(lines, marks, "", mark)
+  for idx, row in ipairs(rows) do
+    local text, spans, secret_spans
+    if type(row) == "table" then
+      text, spans, secret_spans = row.text, row.spans, row.secret_spans
     else
-      _push(lines, marks, "  " .. l, mark)
+      text = row
     end
+    text = text or ""
+    local mark = nil
+    if idx == 1 and kind then
+      mark = { fold_kind = kind }
+    end
+    local prefix = (text == "") and "" or "  "
+    local off = #prefix
+    if spans and #spans > 0 then
+      mark = mark or {}
+      local adj = {}
+      for _, sp in ipairs(spans) do adj[#adj + 1] = { sp[1] + off, sp[2] + off, sp[3] } end
+      mark.ansi = adj
+    end
+    if secret_spans and #secret_spans > 0 then
+      mark = mark or {}
+      local adj = {}
+      for _, sp in ipairs(secret_spans) do adj[#adj + 1] = { sp[1] + off, sp[2] + off, sp[3] } end
+      mark.secret_spans = adj
+    end
+    _push(lines, marks, prefix .. text, mark)
   end
 end
 
@@ -316,8 +789,9 @@ end
 
 --- 工具调用参数的结构化展示行（解析 JSON，剔除 description 样板字段后缩进展示）。
 --- @param fn table tool_call["function"]
+--- @param opts table|nil { full?: boolean } full=true 时不截断（含密钥的工具调用完整展示）
 --- @return table|nil 行数组（无参数时 nil）
-local function _tool_arguments_lines(fn)
+local function _tool_arguments_lines(fn, opts)
   if not fn or type(fn.arguments) ~= "string" or fn.arguments == "" then return nil end
   local decoded = json.decode_or_nil(fn.arguments)
   if decoded == nil then return { fn.arguments } end
@@ -327,34 +801,56 @@ local function _tool_arguments_lines(fn)
       if k ~= "description" then filtered[k] = v end
     end
     if not next(filtered) then return nil end
-    return _split_lines(stringx.truncate(_pretty_json(filtered), 500))
+    local pretty = _pretty_json(filtered)
+    if not (opts and opts.full) then pretty = stringx.truncate(pretty, 500) end
+    return _split_lines(pretty)
   end
   return { json.encode(decoded) }
 end
 
+--- 把纯文本按行包装为带 ANSI 高亮区间的行对象数组。
+--- @param text string
+--- @return table
+local function _styled_lines(text)
+  local out = {}
+  for _, l in ipairs(ansi.parse(text)) do out[#out + 1] = l end
+  return out
+end
+
 --- 工具结果的结构化展示行（JSON 内容解析后多行缩进展示，非 JSON 原样截断展示）。
 --- 结果含 read_image 的图像引用时先行渲染一条图像摘要行。
+--- 返回行对象数组 { text, spans }（spans 为 ANSI 高亮区间，非 ANSI 内容为空）。
 --- @param content string|nil
---- @return table 行数组
-local function _result_lines(content)
-  if not content or content == "" then return { "(空)" } end
+--- @param opts table|nil { full?: boolean } full=true 时不截断（含密钥的工具调用完整展示）
+--- @return table 行对象数组
+local function _result_lines(content, opts)
+  if not content or content == "" then return { { text = "(空)", spans = {} } } end
+  local full = opts and opts.full
   local decoded = json.decode_or_nil(content)
   if type(decoded) == "table" then
     local img = decoded.image
     if type(img) == "table" and img.attachmentId then
       local dims = img.width and img.height and (string.format(" %dx%dpx", img.width, img.height)) or ""
       local lines = {
-        string.format("🖼️ 图像%s（%s, %d 字节）", dims, img.mediaType or img.media_type or "image", img.bytes or 0),
+        { text = string.format("🖼️ 图像%s（%s, %d 字节）", dims, img.mediaType or img.media_type or "image", img.bytes or 0), spans = {} },
       }
-      local json_lines = _split_lines(stringx.truncate(_pretty_json(decoded), 500))
-      for _, l in ipairs(json_lines) do
-        lines[#lines + 1] = l
+      local pretty = _pretty_json(decoded)
+      if not full then pretty = stringx.truncate(pretty, 500) end
+      for _, l in ipairs(_split_lines(pretty)) do
+        lines[#lines + 1] = { text = l, spans = {} }
       end
       return lines
     end
-    return _split_lines(stringx.truncate(_pretty_json(decoded), 500))
+    local out = {}
+    local pretty = _pretty_json(decoded)
+    if not full then pretty = stringx.truncate(pretty, 500) end
+    for _, l in ipairs(_split_lines(pretty)) do
+      out[#out + 1] = { text = l, spans = {} }
+    end
+    return out
   end
-  return _split_lines(stringx.truncate(content, 500))
+  if full then return _styled_lines(content) end
+  return _styled_lines(stringx.truncate(content, 500))
 end
 
 --- 追加单个工具块（调用 + 结果合并成一个折叠块）。
@@ -368,6 +864,12 @@ end
 --- @param result_msg table|nil 对应的工具结果消息
 local function _append_tool_block(lines, marks, tool_call, result_msg)
   local fn = tool_call["function"]
+  -- 密钥防护：命令参数或结果（模型上下文）含密钥时，在该工具折叠块**外**单独追加
+  -- 一行高亮警告（非缩进 → 不并入折叠），折叠标题保持干净。
+  -- 警告行指明「哪个命令/工具获取或使用了哪个密钥文件」（见 _secret_warning_line）。
+  local secret_line = _secret_warning_line(fn, result_msg)
+  -- 含密钥的工具调用：完整展示参数/结果（不截断），并在行内高亮密钥值。
+  local has_secret = secret_line ~= nil
   local rows = {}
   if fn then
     local name = fn.name or ""
@@ -393,7 +895,7 @@ local function _append_tool_block(lines, marks, tool_call, result_msg)
     end
   end
   -- 结构化调用参数：无论工具最终成功/失败，展开折叠都能看到本次调用传了哪些参数
-  local arg_lines = _tool_arguments_lines(fn)
+  local arg_lines = _tool_arguments_lines(fn, { full = has_secret })
   if arg_lines then
     rows[#rows + 1] = "参数:"
     for _, l in ipairs(arg_lines) do
@@ -403,11 +905,23 @@ local function _append_tool_block(lines, marks, tool_call, result_msg)
   -- 结构化执行结果：成功/失败都有对应的结果内容（失败时通常为 error 对象）
   if result_msg then
     rows[#rows + 1] = "结果:"
-    for _, l in ipairs(_result_lines(result_msg.content)) do
+    for _, l in ipairs(_result_lines(result_msg.content, { full = has_secret })) do
       rows[#rows + 1] = l
     end
   end
+  -- 含密钥：整块一次性扫描并分配行内高亮（避免逐行检测拖慢大结果）
+  if has_secret then _with_secret_spans_bulk(rows, true) end
   _append_fold_block(lines, marks, rows, "tool")
+  -- 密钥警告：折叠块外单独一行（非缩进 → 不并入折叠），施加高亮。
+  if secret_line then
+    _push(lines, marks, secret_line, { secret = true })
+  end
+  -- 工具结果 UI 附加提示（如沙箱降级）：仅用户可见，不进入模型上下文；折叠块外单独一行。
+  if result_msg and result_msg.notice and result_msg.notice ~= "" then
+    for _, l in ipairs(vim.split(tostring(result_msg.notice), "\n", { plain = true })) do
+      _push(lines, marks, l, { notice = true })
+    end
+  end
 end
 
 --- 追加轮次分割线（仅在轮次边界出现）
@@ -616,6 +1130,8 @@ local function _render_chat_full(buf, msgs, opts)
   vim.bo[buf].modifiable = true
   vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
   _apply_table_hl(buf, marks)
+  _apply_secret_hl(buf, marks)
+  _apply_ansi_hl(buf, marks)
   _sync_fold_kinds(buf, marks)
   -- 已直接重写全书：块缓存与内容镜像过期
   incremental.invalidate(buf)
@@ -646,6 +1162,8 @@ function M.render_chat(buf, messages, opts)
   if diff.changed then
     local from, to = incremental.written_range(diff)
     _apply_table_hl(buf, marks, 1, diff.full and nil or from, diff.full and nil or to)
+    _apply_secret_hl(buf, marks, 1, diff.full and nil or from, diff.full and nil or to)
+    _apply_ansi_hl(buf, marks, 1, diff.full and nil or from, diff.full and nil or to)
     _sync_fold_kinds(buf, marks)
   end
   return diff
@@ -668,6 +1186,8 @@ function M.append(buf, message)
   local line_count = vim.api.nvim_buf_line_count(buf)
   vim.api.nvim_buf_set_lines(buf, line_count - 1, -1, false, lines)
   _apply_table_hl(buf, marks, line_count)
+  _apply_secret_hl(buf, marks, line_count, line_count, line_count + #lines - 1)
+  _apply_ansi_hl(buf, marks, line_count, line_count, line_count + #lines - 1)
   -- 直接写入后块缓存的内容镜像过期：置无效，下次渲染走全量替换。
   M.invalidate(buf)
 end
@@ -702,8 +1222,19 @@ M.helpers = {
   split_lines = _split_lines,
   truncate = function(s, n) return stringx.truncate(s, n) end,
   tool_arguments_lines = _tool_arguments_lines,
-  result_lines = _result_lines,
+  result_lines = function(content, opts)
+    local out = {}
+    for _, l in ipairs(_result_lines(content, opts)) do
+      out[#out + 1] = type(l) == "table" and l.text or l
+    end
+    return out
+  end,
   tool_result_failed = _tool_result_failed,
+  contains_secret = _contains_secret,
+  secret_warning_line = _secret_warning_line,
+  secret_spans = _secret_spans,
+  attach_secret_spans = _with_secret_spans_bulk,
+  apply_secret_hl = _apply_secret_hl,
 }
 
 --- 重置（测试用）

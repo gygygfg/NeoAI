@@ -22,6 +22,8 @@ local state = {
 function M.init()
   if state.initialized then return M end
   state.initialized = true
+  -- 隔离 LSP/Copilot：禁止其挂载到 NeoAI 界面 buffer（纯 UI 文本，挂载会空耗 CPU）
+  require("NeoAI.ui.lsp_guard").install()
   -- 注册审批 UI
   local approval_ui = require("NeoAI.ui.components.tool_approval")
   approval_ui.init()
@@ -111,6 +113,7 @@ end
 --- 重置（测试用/插件卸载）：关闭窗口并释放 UI 注入与事件监听
 function M.reset()
   M.close_all()
+  pcall(function() require("NeoAI.ui.lsp_guard").uninstall() end)
   pcall(function() require("NeoAI.ui.components.tool_approval").reset() end)
   pcall(function() require("NeoAI.ui.components.ask_user").reset() end)
   pcall(function() require("NeoAI.ui.components.sub_agent_dock").reset() end)

@@ -135,4 +135,22 @@ tests.suite("fs_io", function(_, it)
       t.eq(nil, result:find("bin.dat", 1, true), "二进制文件应被跳过")
     end)
   end)
+
+  it("list_dir 递归有条目上限（防止超大目录跑满工作线程）", function(t)
+    with_dir(function(dir)
+      for i = 1, 8 do fs.write_file(dir .. "/f" .. i .. ".txt", "x") end
+      -- entry_cap 覆盖内置 50000 上限，验证到达上限即停止。
+      local result = t.await(fs.list_dir_async(dir, 0, { entry_cap = 3 }))
+      local lines = vim.split(result, "\n", { plain = true })
+      t.eq(3, #lines, "应只返回上限条数")
+    end)
+  end)
+
+  it("search_files 无匹配时受遍历上限约束（不无界遍历）", function(t)
+    with_dir(function(dir)
+      for i = 1, 10 do fs.write_file(dir .. "/d" .. i .. ".txt", "nothing here") end
+      local result = t.await(fs.search_files_async(dir, "ZZZ_nomatch", { visit_cap = 5 }))
+      t.matches("已扫描", result, "应提示因目录过大而停止")
+    end)
+  end)
 end)

@@ -9,6 +9,9 @@
 local config_store = require("NeoAI.kernel.config_store")
 local event_bus = require("NeoAI.kernel.event_bus")
 local events = require("NeoAI.kernel.events")
+local async = require("NeoAI.utils.async")
+local tm = require("NeoAI.utils.textmetrics")
+local work = require("NeoAI.utils.work")
 
 local M = {}
 
@@ -30,11 +33,12 @@ local function _is_blob(v)
 end
 
 --- 统计文本码点数（Blob 视为 0，避免 vim.fn.strchars 抛 E976）
+--- 走纯 Lua `utils.textmetrics`：MB 级内容不再逐次 C 边界往返，且可在线程池内计算。
 --- @param text any
 --- @return number
 local function _char_len(text)
   if type(text) ~= "string" or _is_blob(text) then return 0 end
-  return vim.fn.strchars(text)
+  return tm.strchars(text)
 end
 
 --- 获取裁剪配置（允许 opts 覆盖 context_cache）
@@ -60,9 +64,9 @@ end
 --- @return string head, string tail
 local function _slice(text, head_end, tail_start)
   local total = _char_len(text)
-  local head = vim.fn.strcharpart(text, 0, math.max(0, math.min(total, head_end)))
+  local head = tm.strcharpart(text, 0, math.max(0, math.min(total, head_end)))
   local tail_len = math.max(0, total - tail_start)
-  local tail = vim.fn.strcharpart(text, math.max(0, tail_start), tail_len)
+  local tail = tm.strcharpart(text, math.max(0, tail_start), tail_len)
   return head, tail
 end
 
@@ -124,8 +128,8 @@ function M.prune_content(content, cfg)
       local intersects = block_start < removed_end and block_end > removed_start
       local marker_text = (intersects and not marker_inserted) and PRUNE_MARKER or ""
       if marker_text ~= "" then marker_inserted = true end
-      local head = vim.fn.strcharpart(b.text, 0, head_end)
-      local tail = vim.fn.strcharpart(b.text, tail_start, points - tail_start)
+      local head = tm.strcharpart(b.text, 0, head_end)
+      local tail = tm.strcharpart(b.text, tail_start, points - tail_start)
       local text = head .. marker_text .. tail
       if text ~= "" then
         local copy = vim.deepcopy(b)
@@ -180,5 +184,123 @@ end
 
 --- 省略标记（供测试/文档引用）
 M.PRUNE_MARKER = PRUNE_MARKER
+
+-- ========== 线程池卸载（异步裁剪） ==========
+
+--- 工作线程内的字符串裁剪（纯 Lua）：textmetrics 源码经参数传入，线程内 load。
+--- 返回编码结果：`"\0"` = 未超阈值不裁剪；`"\1"<before>"\t"<after>"\n"<text>` = 裁剪结果。
+--- @param content string
+--- @param head_chars number
+--- @param tail_chars number
+--- @param threshold number
+--- @param tm_src string utils.textmetrics 源码
+--- @param marker string 省略标记
+--- @return string
+local function _prune_worker(content, head_chars, tail_chars, threshold, tm_src, marker)
+  local metrics = load(tm_src)()
+  if head_chars + tail_chars >= threshold then return "\0" end
+  local total = metrics.strchars(content)
+  if total <= threshold then return "\0" end
+  local removed_start = head_chars
+  local removed_end = math.max(removed_start, total - tail_chars)
+  local head = metrics.strcharpart(content, 0, removed_start)
+  local tail = metrics.strcharpart(content, removed_end, total - removed_end)
+  local text = head .. marker .. tail
+  return "\1" .. total .. "\t" .. metrics.strchars(text) .. "\n" .. text
+end
+
+--- 是否启用线程池卸载（ui.render.threaded 且线程池与 textmetrics 源码可用）
+--- @return boolean
+local function _offload_enabled()
+  if not work.available() then return false end
+  if tm.source == nil then return false end
+  local cfg = config_store.get("ui.render")
+  if type(cfg) == "table" and cfg.threaded == false then return false end
+  return true
+end
+
+--- 解析 _prune_worker 的编码结果
+--- @param encoded string|nil
+--- @return number|nil before
+--- @return number|nil after
+--- @return string|nil text
+local function _parse_prune_result(encoded)
+  if type(encoded) ~= "string" or encoded:sub(1, 1) ~= "\1" then return nil end
+  local body = encoded:sub(2)
+  local tab = body:find("\t", 1, true)
+  local nl = body:find("\n", 1, true)
+  if not tab or not nl or tab >= nl then return nil end
+  local before = tonumber(body:sub(1, tab - 1))
+  local after = tonumber(body:sub(tab + 1, nl - 1))
+  if not before or not after then return nil end
+  return before, after, body:sub(nl + 1)
+end
+
+--- 异步就地裁剪：把码点统计与切片分配到 `utils.work` 线程池，避免 MB 级工具结果
+--- 在发送/压缩路径阻塞主线程。仅卸载字符串内容；块数组与 Blob 走同步路径。
+--- 线程池不可用或 `ui.render.threaded=false` 时回退同步 `prune_agent`（行为等价）。
+--- 单个任务失败不影响其余结果（视为该条不裁剪）。
+--- @param agent table
+--- @param opts table|nil { context_cache? }
+--- @return Deferred resolve({ pruned = number, chars_removed = number })
+function M.prune_agent_async(agent, opts)
+  local cfg = _cfg(opts)
+  if not cfg.enabled or not agent or not agent.messages then
+    return async.resolve({ pruned = 0, chars_removed = 0 })
+  end
+  if not _offload_enabled() then
+    return async.resolve(M.prune_agent(agent, opts))
+  end
+  local content_mod = require("NeoAI.core.model.content")
+  local items = {}
+  for _, msg in ipairs(agent.messages) do
+    if msg.role == "tool" and type(msg.content) == "string" and msg.content ~= ""
+      and not msg.pruned and not _is_blob(msg.content) then
+      -- 廉价前置过滤：码点数 ≤ 字节数，字节数未超阈值者必不裁剪，避免为其空跑工作线程
+      -- （每轮对全部历史工具结果各起一个 work 任务会随轮次线性放大线程池排队）。
+      if #msg.content > cfg.threshold_chars then
+        -- has_image 已加廉价子串前置过滤：非图像结果不再 JSON 解码，主线程开销可忽略。
+        if not content_mod.has_image({ msg }) then
+          local p = work.run(_prune_worker, msg.content, cfg.head_chars, cfg.tail_chars,
+            cfg.threshold_chars, tm.source, PRUNE_MARKER)
+          local safe = async.Deferred.new()
+          p:then_(function(v) safe:resolve(v) end, function() safe:resolve(nil) end)
+          items[#items + 1] = { msg = msg, deferred = safe }
+        end
+      end
+    end
+  end
+  if #items == 0 then
+    -- 无字符串候选（或仅有块数组内容）：回退同步裁剪，行为与 prune_agent 一致
+    return async.resolve(M.prune_agent(agent, opts))
+  end
+  local deferreds = {}
+  for i, item in ipairs(items) do deferreds[i] = item.deferred end
+  return async.all(deferreds):then_(function(results)
+    local pruned, chars_removed = 0, 0
+    for i, item in ipairs(items) do
+      local before, after, text = _parse_prune_result(results[i])
+      if before and after and text and after < before then
+        item.msg.prune_original_chars = before
+        item.msg.content = text
+        item.msg.pruned = true
+        pruned = pruned + 1
+        chars_removed = chars_removed + (before - after)
+        event_bus.emit(events.TOOL_RESULT_PRUNED, {
+          agent_id = agent.id,
+          tool_name = item.msg.tool_name,
+          chars_before = before,
+          chars_after = after,
+        })
+      end
+    end
+    -- 残余（块数组内容 / 异步任务失败未覆盖）：同步补齐，保证与 prune_agent 行为一致。
+    -- 已裁剪消息带 pruned 标记会被跳过，故此处只处理异步未覆盖的少数项。
+    local residual = M.prune_agent(agent, opts)
+    pruned = pruned + residual.pruned
+    chars_removed = chars_removed + residual.chars_removed
+    return { pruned = pruned, chars_removed = chars_removed }
+  end)
+end
 
 return M

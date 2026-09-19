@@ -153,6 +153,7 @@ local function _persist_agent(agent)
     end
   end
   session.model = agent.model
+  session.provider = agent.config and agent.config.provider or nil
   session.metadata.usage = vim.deepcopy(agent.usage)
   -- 同步待办清单与计划模式状态到 durable surface（重开会话时还原）
   local todo_mod = require("NeoAI.tools.builtin.todo")
@@ -616,11 +617,20 @@ end
 
 --- 切换当前 Agent 模型
 --- @param model_id string
-function M.switch_model(model_id)
+--- @param provider string|nil 模型所属提供商；省略时保持当前 provider 不变
+function M.switch_model(model_id, provider)
   local agent = M.get_current_agent()
-  if agent then
-    agent.model = model_id
+  if not agent then return end
+  agent.model = model_id
+  if provider and provider ~= "" then
+    agent.config.provider = provider
   end
+  event_bus.emit(events.MODEL_SWITCHED, {
+    agent_id = agent.id,
+    model = agent.model,
+    provider = agent.config.provider,
+  })
+  _persist_agent(agent)
 end
 
 --- 切换当前 Agent 的计划模式
@@ -799,6 +809,7 @@ function M.load_session(session_id, opts)
     session_id = session.id,
     scenario = "chat",
     model = session.model,
+    config = session.provider and { provider = session.provider } or nil,
   })
   local registry = require("NeoAI.tools.registry")
   agent.tools = registry.list_as_map()
@@ -837,6 +848,10 @@ function M.load_session(session_id, opts)
   state.current_agent_id = agent.id
   -- 恢复会话后按还原的模式（含计划模式）应用对应 provider/model 配置
   _apply_current_mode(agent)
+  -- 会话保存了显式选择的模型/提供商时以其为准，覆盖模式默认（避免重开后回退到
+  -- 模式默认模型而把不属于该提供商的模型 id 发往错误端点）。
+  if session.model then agent.model = session.model end
+  if session.provider then agent.config.provider = session.provider end
   return agent
 end
 

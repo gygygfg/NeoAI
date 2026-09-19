@@ -19,6 +19,9 @@
 | `timer.lua` | 可暂停计时器（跟踪活跃执行时间，剔除等待人类交互的暂停时长）。 |
 | `image.lua` | 图像类型检测 / 媒体类型。 |
 | `stringx.lua` | 字符串扩展（trim/split/template/glob/uuid 等）。 |
+| `textmetrics.lua` | 纯 Lua 文本度量（显示宽度/码点切片/折行）；源码字符串可传入 `utils.work` 线程内 `load`。 |
+| `sha256.lua` | 纯 Lua SHA-256（LuaJIT bit）；源码字符串可传入 `utils.work` 线程内 `load`。 |
+| `ansi.lua` | ANSI SGR 解析：剥离转义、输出纯文本 + 每行颜色高亮区间（16/256/真彩色 + bold/italic/underline/reverse/strikethrough），供 UI 渲染彩色命令输出。 |
 
 ## 2. async.lua
 
@@ -61,6 +64,10 @@
 - JSONL：`read_jsonl` / `append_jsonl` / `repair_jsonl`（撕裂行恢复）。
 - 异步变体：`read_file_async` / `write_file_async` / `append_file_async` / `delete_file_async` /
   `list_dir_async` / `search_files_async` / `read_file_lines_async`（均走 `utils.work` 线程池）。
+- **递归遍历边界**：`list_dir_async` 有内置条目硬上限（默认 50000，`max<=0` 不再表示无上限），
+  `search_files_async` 无匹配时受遍历条目上限（100000）与 CPU 时间预算（5s）双重约束。否则
+  对 `$HOME` 等超大目录（数十万条目）无界递归 + 逐文件读取会占满 libuv 工作线程
+  （`libuv-worker` CPU 打满）并迟迟不返回。
 
 > 阻塞式文件 I/O（读大文件 / 递归搜索 / 写盘）经 `utils.work` 在线程池执行，
 > 不占用 nvim 主线程，避免工具调用时主界面卡住。
@@ -135,3 +142,32 @@ log = {
   verbose = false,
 }
 ```
+
+## 11. sha256.lua
+
+- `hex(s)`：返回小写十六进制 SHA-256，与 `vim.fn.sha256` 一致。
+- `source`：同一实现的 Lua 源码字符串，供工作线程 `load(source)()` 使用（线程内是全新
+  Lua state，不能 `require` 本模块）。
+
+> 用途：把沙箱候选的 base/after 哈希计算移出主线程（`sandbox/candidate` 经 `utils.work`
+> 在独立线程内计算）。`bit` 在 LuaJIT 工作线程可用，故无需 `vim.fn`。一致性由
+> `test_sha256` 与 `vim.fn.sha256` 交叉校验。
+
+## 12. textmetrics.lua
+
+纯 Lua 文本度量（不依赖 `vim.fn` / `vim.api`），语义对齐 `vim.fn.strwidth` /
+`strchars` / `strcharpart`：
+
+- `strwidth(s)` / `strchars(s)`：显示宽度 / 码点个数（ASCII/CJK/全角/emoji/组合字符；
+  非法 UTF-8 字节按 vim 计宽 4、计 1 字符）。纯 ASCII 走 `#s` 快速路径。
+- `strcharpart(s, start, len)`：按码点切片（越界返回空串；负 start 归零并削减 len）。
+- `split_lines(text)`：等价 `vim.split(text, "\n", { plain = true })`。
+- `each_char(s)`：单遍迭代 `(char, width)`，供折行等逐字符场景使用（避免 O(n²) 切片）。
+- `source`：同一实现的 Lua 源码字符串，供 `utils.work` 线程内 `load(source)()`。
+
+> 用途：markdown 表格渲染（`ui/components/markdown_view`）与工具结果裁剪
+> （`core/session/tool_result_pruner`）曾逐字符调用 `vim.fn.strwidth/strcharpart`，
+> 每次都是一次 C 边界往返；改为纯 Lua 单遍扫描后 CJK 宽度计算约快 1.8 倍、
+> 逐字符折行约快 1.7 倍。`source` 让同一实现可整体搬进线程池，使 MB 级工具结果的
+> 裁剪不再阻塞主线程。一致性由 `test_textmetrics` 与 `vim.fn` 交叉校验。
+

@@ -9,6 +9,8 @@ local M = {}
 
 local FILETYPE = "neoai_reasoning"
 local TITLE = "🤔 思考过程"
+-- 高度上限：思考过程悬浮窗最多 5 行。
+local MAX_HEIGHT = 5
 
 -- ========== 公开 API ==========
 
@@ -16,7 +18,7 @@ local TITLE = "🤔 思考过程"
 --- @param title string|nil
 --- @return number win_id
 function M.open(title)
-  return float_window.open(title or TITLE, { filetype = FILETYPE })
+  return float_window.open(title or TITLE, { filetype = FILETYPE, max_height = MAX_HEIGHT })
 end
 
 --- 显示内容

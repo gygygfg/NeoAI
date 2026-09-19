@@ -229,6 +229,12 @@ local DEFAULT_CONFIG = {
       -- 设为 false 时降级回整 buffer 全量重写（用于排查渲染问题）。
       incremental = true,
     },
+    render = {
+      -- 把 CPU 密集计算（如工具结果裁剪的码点统计/切片）分配到 utils.work 线程池，
+      -- 避免 MB 级工具结果在发送/压缩路径阻塞主线程。设为 false 或线程池不可用时
+      -- 自动回退主线程同步计算（行为等价，仅慢）。
+      threaded = true,
+    },
     trajectory = {
       log_dir = vim.fn.stdpath("cache") .. "/NeoAI/logs", -- 轨迹日志保存目录（可自定义；缺省 ~/.cache/nvim/NeoAI/logs）
     },
@@ -455,24 +461,26 @@ local DEFAULT_CONFIG = {
       backend = "auto", -- auto | bwrap | unshare（外部隔离后端）
       offline = false, -- 网络默认放行（仅记录审计，不拦截）；true 时硬拒绝网络类工具并隔离进程网络
       require_seccomp = true, -- true 时缺少 seccomp 能力则拒绝外部执行（默认开，fail-closed）
-      -- 载荷 capability：默认**最小权限**（`{}` → `--cap-drop ALL`）。沙箱内进程以非 root 用户
-      -- 运行且不持有任何 capability，需要的能力按命令**窄范围**加回（包安装经
-      -- `packages.cap_add`，纯包安装命令才授予；混合命令不授予）。宿主不可修改由
+      -- 载荷 capability：默认**最小权限**（`{}` → `--cap-drop ALL`）。需要的能力按命令
+      -- **窄范围**加回（包安装经 `packages.cap_add`，纯包安装命令才授予；混合命令不授予）。
+      -- 宿主不可修改由
       -- **命名空间（mount/pid/uts/ipc/cgroup）+ 只读根（`--ro-bind / /`）+ overlay 暂存 +
       -- 宿主敏感路径遮蔽 + `/proc/sys` 只读绑定 + seccomp（含 mknod/mknodat 设备节点屏障）**
       -- 保证：所有写入进入 overlay 私有层并冻结为候选，真实系统只读，危险 syscall 与设备节点
       -- 创建被拦。仅在明确需要完整能力时（不推荐）才设为 `{ "ALL" }`。
       cap_add = {},
-      -- 载荷运行身份（最小权限原则）：沙箱内进程默认以**非 root 用户**运行。
-      --   * 非 root 启动 NeoAI：自动使用当前 uid/gid（本项被忽略）。
-      --   * root 启动 NeoAI：必须使用本项指定的**专用非 root uid/gid**（默认 nobody 65534）；
-      --     bwrap 无法把 root 1:1 之外降权，故由 `setpriv` 先把 bwrap 自身降为该 uid，再进入
-      --     用户命名空间，使载荷在宿主与命名空间内都是非 root（避免「userns 内 root」伪装）。
-      --     沙箱可写目录（overlay upper/work、暂存、会话目录）会被 chown 到该 uid/gid。
-      --   * `uid = 0`：显式放弃降权（以 root 运行载荷，**不推荐**，仅在受控调试时使用）。
+      -- 载荷运行身份：默认以 **root** 运行（uid=0），使 AI 能在沙箱内使用宿主工具链
+      -- （/root 下的 nvm/cargo/go 等，0700 目录非 root 不可遍历）与包管理（dpkg 硬检查
+      -- euid==0）。**所有写入仍全部进入 overlay 暂存并冻结为候选，真实磁盘只读**；隔离由
+      -- 命名空间 + 只读根 + overlay + seccomp + 遮蔽保证，不依赖非 root。
+      --   * 非 root 启动 NeoAI：用 user namespace 把当前用户映射为**沙箱内 guest root**
+      --     （euid=0，仅命名空间内有效；宿主身份仍是当前非 root 用户）。本项被忽略。
+      --   * root 启动 NeoAI：uid=0 表示不降权（默认）；设为专用非 root uid（如 nobody 65534）
+      --     可加固——bwrap 仍以 root 完成挂载，仅载荷经 `setpriv` 降权（配置的窄能力以
+      --     ambient 形式保留）。注意：非 root 载荷无法遍历 /root，且 dpkg 等会因 euid!=0 失败。
       run_as = {
-        uid = 65534, -- 默认 nobody；root 启动时生效
-        gid = 65534, -- 默认 nogroup
+        uid = 0, -- 默认 0：root 启动时不降权（工具链/包管理可用；写入仍全部暂存）
+        gid = 0,
       },
       -- 主机全局能力收敛（默认）：即使 cap_add 含 ALL，也逐项丢弃「可修改宿主全局状态」的能力。
       -- 这些能力与开发/包管理工作流无关（node/python/apt 不需要），丢弃后 netlink 改宿主路由/
@@ -587,6 +595,11 @@ local DEFAULT_CONFIG = {
       -- 且非凭据/系统目录的 bin 目录只读暴露并前置到沙箱 PATH，使 node/npm/fd/go 等
       -- 装在 $HOME 下的工具链在沙箱内可用。会扩大读取面，仅在需要时开启。
       expose_tool_paths = false,
+      -- AppImage 支持（默认开）：沙箱内运行 AppImage 时自动注入
+      -- APPIMAGE_EXTRACT_AND_RUN=1，让其解包到会话私有 /tmp 运行，而不是尝试 FUSE 挂载。
+      -- 沙箱按设计拦截 mount/新挂载 API 且不暴露 /dev/fuse，故 FUSE 挂载不可用；解包运行
+      -- 不扩大权限。非 AppImage 程序忽略该变量，无副作用；设为 false 可关闭。
+      appimage_extract_and_run = true,
       -- /etc/resolv.conf 处理方式：sanitize（默认，仅保留 nameserver 行，剥离
       -- search/domain/options，避免泄露宿主内网/Tailscale 域）| hide（不暴露）|
       -- passthrough（原样暴露宿主文件）。
@@ -644,8 +657,27 @@ local DEFAULT_CONFIG = {
           max_probes = 4096, -- 探测记录上限（防滥用）
         },
       },
-      -- 异步审批（设计文档 §15）：AI 修改立即沙箱执行并冻结候选，
-      -- 用户异步确认允许哪些文件/配置修改后再 CAS 应用。
+      -- 内核级行为观测（eBPF / strace / procfs）：以实际 syscall 判定「越界访问」与
+      -- 「密钥文件访问」，替代/补充命令字符串解析启发式；事件按 attempt cgroup 精确归属。
+      -- 后端优先级 auto：ebpf(bpftrace，需 root) → strace（命令前缀包裹）→ procfs(/proc/<pid>/fd)。
+      -- 均不可用时自动回退命令解析启发式（tools/executor），不阻断工具执行。
+      observe = {
+        enabled = true, -- 总开关（关闭后直接使用命令解析启发式）
+        backend = "auto", -- "auto" | "ebpf" | "strace" | "procfs" | "heuristic"
+        poll_ms = 200, -- procfs/strace 轮询间隔（毫秒）
+        notify = true, -- 启动时探测后端：eBPF/strace 不可用或发生回退时 vim.notify
+        -- 探针挂载等待（毫秒）：0（默认）= 不阻塞命令，挂载异步完成（best-effort，早期访问
+        -- 可能漏观测，由命令解析启发式兜底）；设为正值则在命令执行前有界等待，观测更全但
+        -- 每条命令会固定增加该等待（bpftrace 挂载约 0.5s）。
+        wait_ready_ms = 0,
+        -- 观测预热（默认开）：进程命令返回后，在 AI 生成下一轮的间隙后台预创建下一个
+        -- attempt 的 cgroup 并挂载 eBPF 探针，使约 0.5s 的挂载与 AI 输出重叠；下一条进程
+        -- 命令直接复用已挂载探针，无需等待。仅 eBPF 后端生效（strace/procfs 启动廉价）。
+        prewarm = true,
+        -- 预热有效期（毫秒）：超时未被下一条进程命令复用则回收（停止探针、释放 cgroup）。
+        prewarm_ttl_ms = 90000,
+      },
+      -- 异步审批（设计文档 §15）：AI 修改立即沙箱执行并冻结候选，      -- 用户异步确认允许哪些文件/配置修改后再 CAS 应用。
       review = {
         enabled = true, -- 效果类候选自动进入待审队列
         auto_apply = false, -- true 时任务授权内自动应用（默认关闭，需用户确认）
@@ -659,6 +691,20 @@ local DEFAULT_CONFIG = {
           max_tokens = 256, -- 警告正文最大输出
           timeout_ms = 15000, -- 生成超时（ms），超时回退规则警告
         },
+        -- AI 审计（待审界面按 `a`）：把原会话的用户消息与分级的待审变更/修改内容的结构化
+        -- 文本交给模型**逐条**判断是否允许应用（每个文件/主机命令都要有说明；只出结论，不自动
+        -- 应用；结论显示在审批窗顶部与各条目下方）。
+        ai_audit = {
+          enabled = true,
+          auto = false, -- 打开待审审批界面时自动发起 AI 审计（默认关闭；也可按 `key` 手动触发）
+          key = "a", -- 待审审批界面内触发 AI 审计的按键
+          max_concurrent = 10, -- AI 审计全局并发上限（在途请求数；超出排队，FIFO）
+          max_diff_chars = 8000, -- 单个文件 diff 注入上限（超出截断）
+          max_user_chars = 4000, -- 单条用户消息注入上限（超出截断）
+          max_total_chars = 60000, -- 结构化审计文本总长上限（超出提示截断）
+          max_tokens = 2048, -- 审计结论最大输出（逐条说明，需覆盖全部待审项含高危变更）
+          timeout_ms = 30000, -- 审计请求超时（ms）
+        },
       },
       -- 审批按安全级别分级（见 sandbox/risk.lua）：级别 L0-L3，动作 auto/record/review/block。
       -- 默认 default="review"（全部进入异步待审，不阻塞 agent）；可覆盖单级动作。
@@ -666,12 +712,28 @@ local DEFAULT_CONFIG = {
         default = "review",
         levels = {}, -- 覆盖：{ [0]="auto", [1]="review", [2]="review", [3]="review" }
       },
+      -- 脚本间接执行静态扫描（见 sandbox/script_scan.lua）：命令把执行委托给脚本/解释器
+      -- （`bash deploy.sh`、`python setup.py`、`node x.js`、`./run.sh`、`bash -c '…'`）时，
+      -- 执行前读取脚本内容（优先沙箱暂存副本）并提取 Shell 正文与高级语言内嵌 shell 调用，
+      -- 折叠进危险识别/权限分类；脚本内破坏性命令硬拒绝，其余命中或不透明（eval、base64|sh、
+      -- 动态 `-c "$VAR"`、读不到内容等）提升级别并强制复核（不自动应用）。
+      script_scan = {
+        enabled = true, -- 总开关
+        max_depth = 3, -- 递归扫描被引用脚本的最大深度
+        max_files = 8, -- 单次扫描最多读取的脚本文件数
+        max_bytes = 262144, -- 单个脚本读取上限（字节），超出截断并标记不透明
+      },
       -- 安装包（apt/pip/npm 等）额外规则：默认 review（不随自动审批放行，需显式确认）。
       --   review = 强制进入待审；allow = 允许自动应用；deny = 硬拒绝。
       --   managers 同时用于识别包管理器：包安装候选按「安装命令」合并为一个审批单元，
       --   头行标注「包安装 <管理器>: <包名>」，可整包一次应用（privilege.package_info）。
       packages = {
-        mode = "review",
+        mode = "review", -- review（安全安装仅需确认、风险封顶中危）| allow（全部放行）| deny（全部拒绝）
+        -- 放宽风险与提示：普通安装（apt/pip/npm install …）不因写入 /usr /var /etc 升为高危，
+        -- 也不触发密钥误报；仅当命令改动**第三方软件源**（add-apt-repository / sources.list /
+        -- --add-repo / --index-url / npm --registry 等）或**密钥/信任链**（apt-key / trusted.gpg /
+        -- keyring / gpg --import / rpm --import 等）时标为敏感安装并保留高危评级
+        -- （见 privilege.package_sensitive）。包安装仍需用户确认后才写入宿主。
         managers = {
           -- 系统包管理
           "apt", "apt-get", "aptitude", "dnf", "yum", "rpm", "zypper", "pacman", "apk", "brew", "port",
@@ -696,18 +758,21 @@ local DEFAULT_CONFIG = {
           "CAP_SYS_CHROOT", "CAP_KILL",
         },
         -- 包安装命令的宿主状态目录：仅当命令判定为包安装时加入可写根（overlay 暂存），
-        -- 使 apt/dpkg/pip/npm 等能写入索引/缓存/元数据，写入冻结为候选。支持 `~` 展开；
-        -- 不存在的目录自动跳过。可按需增减（如自建源/自定义前缀）。
+        -- 使 apt/dpkg/pip/npm 等能写入索引/缓存/元数据与安装目标，写入冻结为候选。支持 `~`
+        -- 展开；不存在的目录自动跳过。可按需增减（如自建源/自定义前缀）。
         roots = {
-          -- Debian/Ubuntu（apt/dpkg）
-          "/var/lib/apt", "/var/cache/apt", "/var/lib/dpkg", "/var/cache/debconf",
-          -- RHEL/Fedora（dnf/yum/rpm）
-          "/var/lib/rpm", "/var/cache/dnf", "/var/cache/yum",
-          -- Arch（pacman）
-          "/var/lib/pacman", "/var/cache/pacman",
-          -- 系统级安装目标与用户级缓存/安装目标
-          "/usr/local", "/usr/lib/node_modules", "/usr/share/nodejs", "/var/lib/gems",
-          "~/.cache", "~/.npm", "~/.cargo", "~/.rustup", "~/.gem", "~/.composer",
+          -- 系统级安装目标（apt 安装到 /usr/bin、/usr/games 等；/usr 覆盖 /usr/local、
+          -- /usr/lib/node_modules、/usr/share/nodejs 等子路径）与系统状态（/var 覆盖
+          -- /var/lib/dpkg、/var/cache/apt、/var/cache/man、/var/log 等）。
+          "/usr", "/var",
+          -- /etc：dpkg postinst 常写入 /etc（如 libc-bin 刷新 /etc/ld.so.cache，
+          -- update-alternatives 写 /etc/alternatives，服务包写 /etc/<svc> 配置）。只读根下
+          -- 这些写入会以 "Read-only file system" 失败并让 dpkg 退出码非 0。覆盖为 overlay 后
+          -- 写入进会话 upper 并冻结为待审候选；敏感条目（/etc/shadow、/etc/sudoers、/etc/ssh、
+          -- /etc/cron* 等）仍由 mask_paths 遮蔽，不受影响。
+          "/etc",
+          -- 用户级安装/缓存目标
+          "~/.cache", "~/.npm", "~/.nvm", "~/.cargo", "~/.rustup", "~/.gem", "~/.composer",
           "~/go", "~/.local",
         },
       },
@@ -719,7 +784,9 @@ local DEFAULT_CONFIG = {
         share_namespace = true, -- 对无守护进程运行时注入命名空间共享标志
         prefer = "podman", -- 优先使用的无守护进程运行时（供提示/文档）
       },
-      workspace_root = vim.fn.stdpath("cache") .. "/NeoAI/sandbox", -- 暂存/候选/回执根目录
+      -- 存储基根。每进程实例隔离在 <workspace_root>/instances/<pid>_<启动时间>，
+      -- 待审队列/候选/回执/证据不跨 nvim 会话共享（多个会话互不可见对方的审批）。
+      workspace_root = vim.fn.stdpath("cache") .. "/NeoAI/sandbox",
       session_shell = true, -- run_command 会话内保留 shell 状态（export/cd 跨命令生效，仅 bwrap 后端）
       -- run_command 可写根：这些根以 overlay 覆盖（真实内容只读 lower，写入进会话 upper），
       -- 使命令能修改这些根下的任意路径并冻结为候选；cwd 未覆盖时自动补入。
@@ -728,6 +795,11 @@ local DEFAULT_CONFIG = {
       -- home/账户/配置/临时残留作为只读 lower 暴露。需要任意路径写入时按需显式加回
       -- （注意同时收紧 mask_paths）。
       process_roots = {},
+      -- overlay 不可用（无法为可写根挂载 overlay 可写层）时是否拒绝外部进程执行。
+      -- 默认 true（fail-closed）：**不降级**为「私有可写 cwd」——那种视图看不到真实磁盘
+      -- 文件，会把「看不到」误判为「文件不存在/改动未生效」。设为 false 才允许降级运行
+      -- （命令在会话私有 cwd 执行，结果会附加降级提示）。
+      overlay_fail_closed = true,
       retention = {
         candidate_days = 7, -- 未应用候选保留期（天）
         max_pending = 20, -- 每任务最多待审候选数
@@ -744,12 +816,17 @@ local DEFAULT_CONFIG = {
         dynamic = true,
         memory_ratio = 0.5, -- 内存上限 = 宿主总量 * ratio
         memory_max_bytes = 0, -- 绝对内存上限（>0 时取 min；0 = 不额外限制）
-        cpu_cores_max = 4, -- CPU 配额上限（核）
+        cpu_cores_max = 4, -- 单任务 CPU 配额上限（核）
+        cpu_global_max = 0, -- 所有并发沙箱任务的 CPU 总预算（核；0 = max(1, 核数-1)，留 1 核给 nvim）
         pids_max = 2048, -- PID 上限
         -- 静态显式值（>0 时优先于动态推导）：
         memory_bytes = 0, -- cgroup 内存上限（0 = 用动态值）
         pids = 0, -- cgroup PID 上限（0 = 用动态值）
         cpu_max = 0, -- cgroup CPU 配额（微秒/100ms；0 = 用动态值，如 50000 = 0.5 CPU）
+        -- CPU 亲和性：让沙箱进程在 **nvim 当前 CPU 之外**的核上运行，避免与 nvim 抢占同一核。
+        --   "auto"（默认）= 绑定到除 nvim 当前 CPU 外的全部核（单核宿主自动跳过）；
+        --   "off"/false = 不绑定；"2,3" / "2-3" = 显式 cpuset（需 `taskset`，缺失则跳过）。
+        cpu_affinity = "auto",
         cgroup_base = "/sys/fs/cgroup", -- cgroup v2 挂载点
         fail_closed = false, -- cgroup 不可用时是否拒绝执行（默认 false：跳过限制，不阻断）
       },
@@ -824,10 +901,11 @@ local DEFAULT_CONFIG = {
         mode = "controlled", -- off（禁用）| controlled（外部受控 socket）| host（宿主 socket，仅 T2）
         socket = "/run/neoai-docker/docker.sock", -- controlled 模式使用的受控 socket 路径
       },
-      -- LSP 进程命名空间覆盖：把 LSP server 放进 bwrap + overlay（工作区根 lower=真实只读，
-      -- upper=沙箱私有层），使其磁盘读取看到 AI 尚未发布的暂存内容。默认开启，使 LSP 与
-      -- run_command/git 读工具共享同一暂存视图（不再读真实磁盘）；overlay 不可用（如 tmpfs
-      -- 工作区）时自动跳过，不影响 LSP 正常使用。
+      -- AI 专用沙箱 LSP：AI 的 lsp_* 工具按需克隆编辑器同名 server（名称加 @neoai-sandbox
+      -- 后缀），把克隆体放进 bwrap + overlay（工作区根 lower=真实只读，upper=沙箱私有层），
+      -- 使其磁盘读取看到 AI 尚未发布的暂存内容，与 run_command/git 读工具共享同一暂存视图。
+      -- 编辑器自身的 LSP 不受影响（不全局 hook vim.lsp.rpc.start）。overlay 不可用（如 tmpfs
+      -- 工作区）时自动跳过，AI 工具回退编辑器客户端。
       lsp_overlay = {
         enabled = true,
       },
@@ -842,6 +920,15 @@ local DEFAULT_CONFIG = {
         min_entropy = 3.5, -- 香农熵阈值（bits/char）
         min_distinct = 8, -- 最少不同字符数
         exclude_pure_hex = true, -- 排除纯小写十六进制（git SHA/sha256/md5 等哈希）
+        -- 缩小密钥认定范围：裸高熵串须呈密钥形态（含 - / _ 分隔符）或处于敏感变量名赋值
+        -- 上下文（KEY=/TOKEN:/PASSWORD= 等）才 token 化；纯字母数字/base64（SRI integrity、
+        -- 内容哈希、构建产物摘要等）不再误伤 package-lock.json / python -m build。
+        -- 设为 false 退回旧的「任意高熵串即密钥」行为。
+        entropy_requires_context = true,
+        -- 高熵全文扫描仅对疑似密钥文件（~/.ssh、~/.bashrc、/etc/* 等，见 secret.is_secret_path）
+        -- 启用，避免对普通文件/工具输出做昂贵的熵计算；具名规则（AKIA/sk-/JWT 等）与敏感
+        -- 变量名赋值仍对所有内容生效。设为 false 退回旧的「所有内容都做熵检测」行为。
+        entropy_secret_paths_only = true,
         tokenize_env = true, -- 是否对沙箱进程环境变量 token 化（false = 原样注入，调试用）
         -- 具名敏感信息规则（Lua pattern）：命中即脱敏/token 化（无视熵阈值），覆盖
         -- 私钥块、带前缀 token（AKIA/ghp_/sk-…）、JWT、Bearer 等结构化凭据。

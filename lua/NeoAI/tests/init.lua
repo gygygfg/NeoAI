@@ -213,6 +213,11 @@ function M.run_all(...)
     if uc.tools.sandbox.run_as == nil then
       uc.tools.sandbox.run_as = { uid = 0, gid = 0 }
     end
+    -- 测试默认关闭内核级观测（eBPF/strace/procfs）：避免每个进程工具都挂 bpftrace，
+    -- 保持离线可复现与速度。观测专项用例自行覆盖 tools.sandbox.observe。
+    if uc.tools.sandbox.observe == nil then
+      uc.tools.sandbox.observe = { enabled = false }
+    end
     return orig_config_load(uc)
   end
   pcall(function()
@@ -221,6 +226,7 @@ function M.run_all(...)
       cur.tools = cur.tools or {}
       cur.tools.sandbox = cur.tools.sandbox or {}
       cur.tools.sandbox.run_as = { uid = 0, gid = 0 }
+      cur.tools.sandbox.observe = cur.tools.sandbox.observe or { enabled = false }
       orig_config_load(cur)
     end
   end)

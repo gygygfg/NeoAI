@@ -17,6 +17,7 @@ local M = {}
 
 local state = {
   tag = nil,
+  markers = nil, -- 指纹字面量集合（懒加载，用于无指纹时快速短路）
 }
 
 -- ========== 私有函数 ==========
@@ -39,10 +40,26 @@ local function _session_basename()
   return ".s-" .. _tag()
 end
 
---- 按规则表顺序对文本做替换
+--- 动态路径字面量（overlay 基目录、会话挂载点及其 basename），供替换与指纹判定复用。
+--- @return string base_host
+--- @return string session_mount
+--- @return string session_basename
+--- @return string base_base
+local function _literals()
+  local base = M.base_host()
+  return base, M.session_mount(), M.session_basename(), vim.fn.fnamemodify(base, ":t")
+end
+
+--- 纯替换逻辑：自包含（不引用外部 upvalue），可作为 `utils.work` 工作线程函数在独立线程执行。
+--- 线程内无 `vim.fn`/`vim.pesc`，故动态字面量由调用方以参数传入并在此处手动转义。
 --- @param text string
+--- @param base_host string
+--- @param session_mount string
+--- @param session_basename string
+--- @param base_base string
 --- @return string
-local function _apply(text)
+local function _substitute(text, base_host, session_mount, session_basename, base_base)
+  local function esc(s) return (s:gsub("([^%w])", "%%%1")) end
   local s = text
   -- overlay 挂载选项：暴露 lower/upper/work 的真实路径与 overlay 特征
   s = s:gsub("lowerdir=[^,%s]+", "lowerdir=hidden")
@@ -62,14 +79,47 @@ local function _apply(text)
   s = s:gsub("neoai_session", ".s")
   s = s:gsub("__neoai", "_state")
   -- 动态路径（overlay 基目录、会话挂载点）及其 basename
-  s = s:gsub(vim.pesc(M.base_host()), "/tmp/.cache")
-  s = s:gsub(vim.pesc(M.session_mount()), "/tmp/.cache")
-  s = s:gsub(vim.pesc(M.session_basename()), ".cache")
-  s = s:gsub(vim.pesc(vim.fn.fnamemodify(M.base_host(), ":t")), ".cache")
+  if base_host ~= "" then s = s:gsub(esc(base_host), "/tmp/.cache") end
+  if session_mount ~= "" then s = s:gsub(esc(session_mount), "/tmp/.cache") end
+  if session_basename ~= "" then s = s:gsub(esc(session_basename), ".cache") end
+  if base_base ~= "" then s = s:gsub(esc(base_base), ".cache") end
   -- 外层容器（宿主自身）路径线索
   s = s:gsub("/var/lib/containerd[%w%._%-/]*", "/var/lib/.data")
   s = s:gsub("docker/rootfs/overlayfs[%w%._%-/]*", "docker/rootfs")
   return s
+end
+
+--- 需要脱敏的指纹字面量集合：任一出现才需要跑全部替换。
+--- 用字面量（plain find）快速判定，避免对绝大多数不含指纹的命令输出做十余次 gsub。
+--- @return table 字符串数组
+local function _markers()
+  if state.markers then return state.markers end
+  local base, mount, basename, base_base = _literals()
+  state.markers = {
+    "overlay", "bwrap", "lowerdir=", "upperdir=", "workdir=", "userxattr", "uuid=on,",
+    "NeoAI-sandbox", "neoai_session", "__neoai",
+    "/var/lib/containerd", "docker/rootfs/overlayfs",
+    base, mount, basename, base_base,
+  }
+  return state.markers
+end
+
+--- 文本是否含任一指纹字面量
+--- @param text string
+--- @return boolean
+local function _has_marker(text)
+  for _, m in ipairs(_markers()) do
+    if type(m) == "string" and m ~= "" and text:find(m, 1, true) then return true end
+  end
+  return false
+end
+
+--- 按规则表顺序对文本做替换（主线程同步版）
+--- @param text string
+--- @return string
+local function _apply(text)
+  local base, mount, basename, base_base = _literals()
+  return _substitute(text, base, mount, basename, base_base)
 end
 
 -- ========== 公开 API ==========
@@ -113,13 +163,30 @@ end
 --- @return any
 function M.redact(text)
   if type(text) ~= "string" or text == "" then return text end
+  -- 无任何指纹字面量时直接返回：多数命令输出不含沙箱特征，省去全部 gsub。
+  if not _has_marker(text) then return text end
   local ok, out = pcall(_apply, text)
   return ok and out or text
+end
+
+--- 异步脱敏：把字符串替换（可能达 MB 级、十余次 gsub）移到 `utils.work` 线程池，
+--- 避免大输出命令完成时占用主线程。无指纹或线程池不可用时回退同步版。
+--- @param text any
+--- @return Deferred resolve(string)
+function M.redact_async(text)
+  local async = require("NeoAI.utils.async")
+  if type(text) ~= "string" or text == "" then return async.resolve(text) end
+  if not _has_marker(text) then return async.resolve(text) end
+  local work = require("NeoAI.utils.work")
+  if not work.available() then return async.resolve(M.redact(text)) end
+  local base, mount, basename, base_base = _literals()
+  return work.run(_substitute, text, base, mount, basename, base_base)
 end
 
 --- 重置（测试用）
 function M.reset()
   state.tag = nil
+  state.markers = nil
 end
 
 return M

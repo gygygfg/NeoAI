@@ -110,6 +110,45 @@ tests.suite("display_modes", function(_, it)
     display_modes.reset()
   end)
 
+  it("轨迹模式：含密钥的工具调用完整展示并高亮密钥", function(t)
+    local display_modes = require("NeoAI.ui.components.display_modes")
+    local chat_view = require("NeoAI.ui.window.chat_view")
+    local chat_service = require("NeoAI.services.chat_service")
+    display_modes.reset()
+    chat_view.reset()
+    chat_service.reset()
+
+    local opened = chat_view.open()
+    local agent = chat_service.get_current_agent()
+    local pad = string.rep("z", 800)
+    agent.messages = {
+      { role = "user", content = "读一下 env" },
+      { role = "assistant", content = "", tool_calls = {
+        { id = "c1", ["function"] = { name = "read_file", arguments = '{"filepath":"/root/.env"}' } },
+      } },
+      {
+        role = "tool", tool_call_id = "c1", tool_name = "read_file",
+        content = '{"output":"' .. pad .. '","token":"NEOKEY_deadbeef01"}',
+      },
+    }
+
+    chat_view.set_display("trajectory")
+    chat_view.refresh()
+
+    local lines = vim.api.nvim_buf_get_lines(opened.buf, 0, -1, false)
+    local joined = table.concat(lines, "\n")
+    t.true_(joined:find("⚠ 密钥", 1, true) ~= nil, "轨迹模式应有密钥标记")
+    t.true_(joined:find(pad, 1, true) ~= nil, "含密钥时结果应完整展示（不截断）")
+
+    local ns = vim.api.nvim_get_namespaces()["neoai_secret_hi"]
+    local marks = ns and vim.api.nvim_buf_get_extmarks(opened.buf, ns, 0, -1, { details = true }) or {}
+    t.true_(#marks >= 2, "应至少有警告行与行内密钥两处高亮（实际 " .. #marks .. "）")
+
+    chat_view.reset()
+    chat_service.reset()
+    display_modes.reset()
+  end)
+
   it("轨迹模式多级折叠：turn=1、小节=2、子块=3，逐层展开", function(t)
     local display_modes = require("NeoAI.ui.components.display_modes")
     local chat_view = require("NeoAI.ui.window.chat_view")

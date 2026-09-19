@@ -16,7 +16,7 @@
 - **树形会话管理** — 基于分支树管理多个对话会话，支持分支创建、切换、删除
 - **丰富的内置工具** — AI 可调用文件操作、代码分析、LSP、Shell 命令等 40+ 工具
 - **工具审批系统** — 细粒度的工具执行权限控制，支持自动允许/手动审批/参数级别白名单
-- **计划模式（PLAN）与计划蒸馏** — 按 `m` 或 `:NeoAIPlan` 切换，工具上下文只保留只读/信息查询 + `run_command`（只读调研）+ `ask_user` + `exit_plan_mode`（不暴露任何修改类工具）；AI 调研澄清后输出格式化修改计划，调用 `exit_plan_mode` 经用户确认后转入 CHAT 并按任务清单自动执行，并把计划阶段调研上下文**蒸馏**为检查点替换压缩
+- **计划模式（PLAN）与计划蒸馏** — 按 `m` 或 `:NeoAIPlan` 切换，工具上下文只保留只读/信息查询 + `run_command`（只读调研）+ `ask_user`（不暴露任何修改类工具，也不向 AI 提供切换模式的工具）；AI 调研澄清后输出格式化修改计划并结束本轮，由用户确认（`:NeoAIApprovePlan` 或手动切换模式）后转入 CHAT 并按任务清单自动执行，并把计划阶段调研上下文**蒸馏**为检查点替换压缩
 - **后台上下文压缩** — 接近上下文阈值时**后台异步、非阻塞**地折叠第一轮至倒数第二轮（保留最后一轮），以检查点写入**压缩覆盖层**：后续请求与再次压缩使用压缩后的替换，而聊天渲染与会话持久化仍是原始上下文（覆盖层随会话保存，重开后继续生效）；压缩不弹悬浮窗；除回合边界外，**工具循环每轮发送前也会做压力检查**（工具结果已回写、下一轮请求前），长循环逐轮收敛；溢出时自动压缩后重试；计划蒸馏过程仍以悬浮窗实时展示推理与正文
 - **子 Agent 系统** — AI 可创建子 Agent 并行执行子任务，支持边界审核
 - **前后端分离架构** — 事件驱动的异步架构，UI 与业务逻辑解耦
@@ -31,7 +31,7 @@
 - **工具参数接收面板** — 模型流式生成工具调用参数时实时打开「接收参数」悬浮窗（`tool_args_panel`），随分片增量追加、参数结束后自动关闭，与思考过程悬浮窗一致
 - **MCP 支持** — 通过 stdio / Streamable HTTP 连接外部 MCP 服务器，把远端 `tools`/`resources`/`prompts` 注册进工具系统（含预缓存 + 失败驱动的动态刷新，见 [docs/mcp.md](docs/mcp.md)）
 - **Skills 支持** — 扫描 SKILL.md 技能目录，把可用技能列表注入系统提示，模型用 `load_skill` 装载技能正文（Claude/opencode 风格，见 [docs/skills.md](docs/skills.md)）
-- **工具执行沙箱** — 所有工具执行经控制面（预检 → 隔离执行 → 冻结候选 → CAS 发布）；默认异步审批：AI 的修改立即在沙箱内执行并冻结候选，真实工作区改动进入待审队列（聊天窗口状态栏显示醒目的 `待审N` 徽标），用户用 `:NeoAISandboxReview` 或聊天窗口内 `<leader>ap` 键异步确认后应用（审批单位为单个文件）；L3 危险条目二次确认时由 AI 生成一条后果警告并自动打开 diff 展示修改，需再次确认才应用；外部进程经 bwrap/unshare 隔离；命令可写整个文件系统（改动进暂存/候选）、会话内 shell 状态（export/cd）保留；载荷默认 `--cap-drop ALL` + seccomp 基线，并遮蔽 `docker.sock`、宿主凭据等敏感路径（纵深防御）；**权限档位**：命令默认最小权限运行（默认隔离网络），权限不足自动发起升级——T1（网络/受控 docker）隔离内自动执行并留痕，T2（cap/宿主操作）在嵌套 userns 内执行、主机效果冻结为提案异步审批；受控 docker 指向外部受控 socket（rootless/proxy/dind），不绑定宿主 socket；**读取面**默认整机只读（`read_all`，仅遮蔽 `mask_paths` 中的重要配置文件/凭据），访问工作区外用户目录会**留痕**并在审批悬浮窗「越界访问留痕」区展示（非阻塞）（见 [docs/sandbox.md](docs/sandbox.md)）
+- **工具执行沙箱** — 所有工具执行经控制面（预检 → 隔离执行 → 冻结候选 → CAS 发布）；默认异步审批：AI 的修改立即在沙箱内执行并冻结候选，真实工作区改动进入待审队列（聊天窗口状态栏显示醒目的 `待审N` 徽标），用户用 `:NeoAISandboxReview` 或聊天窗口内 `<leader>ap` 键异步确认后应用（审批单位为单个文件；应用时保留**原文件快照**，界面「已保存」区可按 `u` **撤销/重做保存**——与快照交换、冲突拒绝）；L3 危险条目二次确认时由 AI 生成一条后果警告并自动打开 diff 展示修改，需再次确认才应用；外部进程经 bwrap/unshare 隔离；命令可写整个文件系统（改动进暂存/候选）、会话内 shell 状态（export/cd）保留；载荷默认 `--cap-drop ALL` + seccomp 基线，并遮蔽 `docker.sock`、宿主凭据等敏感路径（纵深防御）；**权限档位**：命令默认最小权限运行（默认隔离网络），权限不足自动发起升级——T1（网络/受控 docker）隔离内自动执行并留痕，T2（cap/宿主操作）在嵌套 userns 内执行、主机效果冻结为提案异步审批；受控 docker 指向外部受控 socket（rootless/proxy/dind），不绑定宿主 socket；**读取面**默认整机只读（`read_all`，仅遮蔽 `mask_paths` 中的重要配置文件/凭据），访问工作区外用户目录会**留痕**并在审批悬浮窗「越界访问留痕」区展示（非阻塞，状态栏追加 `越界N` 徽标）（见 [docs/sandbox.md](docs/sandbox.md)）
 
 ---
 
@@ -695,7 +695,6 @@ NeoAI 内置了 40+ 工具，AI 可在对话中自动调用，涵盖以下类别
 | `todo_read`       | 读取当前任务清单                               | ✅ 自动允许 |
 | `todo_clear`      | 清空任务清单                                   | ✅ 自动允许 |
 | `enter_plan_mode` | 进入计划模式（工具上下文切换为只读/信息 + 提问）| ✅ 自动允许 |
-| `exit_plan_mode`  | 用户确认后解析计划为 todo 并转入 CHAT 执行      | ⚠️ 需审批   |
 
 ### 💬 向用户提问
 
@@ -703,12 +702,12 @@ NeoAI 内置了 40+ 工具，AI 可在对话中自动调用，涵盖以下类别
 | ---------- | ---------------------------------------- | ----------- |
 | `ask_user` | 暂停生成并向用户提问，回答回传为工具结果 | ✅ 自动允许 |
 
-> **计划模式（PLAN MODE）**：激活时工具上下文**只包含只读/信息查询工具、`run_command`（只读调研）、`ask_user` 与 `exit_plan_mode`**，
-> 不暴露任何修改类工具（编辑/删除/创建/git 回滚等）；执行期门禁同步收紧，
+> **计划模式（PLAN MODE）**：激活时工具上下文**只包含只读/信息查询工具、`run_command`（只读调研）与 `ask_user`**，
+> 不暴露任何修改类工具（编辑/删除/创建/git 回滚等），**也不向 AI 提供切换模式的工具**；执行期门禁同步收紧，
 > 调用可见集之外的任何工具都会被驳回。AI 在此模式下调研、提问澄清，
 > 并输出**清晰、格式化的修改计划**（目标与背景 / 改动清单 / 实施步骤 / 验证与回滚）。
-> 计划完成后 AI 调用 `exit_plan_mode`（弹出审批窗口由用户确认），
-> 用户确认后**直接转入 CHAT 模式**，系统把计划解析为任务清单（todo），
+> 计划输出后本轮结束，**由用户确认**（执行 `:NeoAIApprovePlan` 或手动切换模式）；
+> 确认后**直接转入 CHAT 模式**，系统把计划解析为任务清单（todo），
 > 并按 `tools.plan_mode.auto_execute_on_approve`（默认开启）自动开始执行。
 > 也可手动执行 `:NeoAIApprovePlan` 完成同样的确认。
 > 生成过程中按 `m` / `:NeoAIPlan` / `:NeoAIAuto` 切换模式会**延迟到当前回合结束后生效**，
@@ -901,7 +900,7 @@ NeoAI/
 │       ├── log_ops.lua        # 日志工具
 │       ├── plan.lua           # 子 Agent + 边界审核
 │       ├── todo.lua           # 待办清单（todo_write/read/clear + 提示段）
-│       ├── plan_mode.lua      # 计划模式（enter_plan_mode/exit_plan_mode + 工具过滤/门禁）
+│       ├── plan_mode.lua      # 计划模式（enter_plan_mode + 工具过滤/门禁）
 │       ├── ask_user.lua       # 向用户提问
 │       ├── read_image.lua     # 图像读取（多模态）
 │       ├── web_fetch.lua      # 网页抓取（无头浏览器渲染 + 注入 JS + 转 Markdown，默认不启用）
@@ -936,10 +935,11 @@ NeoAI/
 │   ├── json.lua              # JSON 编解码
 │   ├── http.lua              # 异步 HTTP 客户端（curl jobstart，流式 SSE）
 │   ├── fs.lua                # 文件操作（JSONL）
-│   ├── work.lua              # 线程池（阻塞式文件 I/O / 图像解码在线程池执行）
+│   ├── work.lua              # 线程池（阻塞式 I/O / CPU 密集计算在线程池执行）
 │   ├── timer.lua             # 可暂停计时器（工具活跃耗时，剔除等待时间）
 │   ├── image.lua             # 图像类型检测/媒体类型
-│   └── stringx.lua           # 字符串扩展
+│   ├── stringx.lua           # 字符串扩展
+│   └── textmetrics.lua       # 纯 Lua 文本度量（显示宽度/码点切片/折行，可入线程池）
 │
 └── tests/                      # 测试（自定义运行器，:NeoAITest；共 45 个 test_*.lua）
     ├── init.lua               # 断言 + 运行器
@@ -982,6 +982,10 @@ NeoAI/
     ├── test_display_modes.lua # 显示模式插件
     ├── test_fold.lua          # 折叠
     ├── test_markdown.lua      # Markdown 渲染
+    ├── test_textmetrics.lua   # 纯 Lua 文本度量（与 vim.fn 交叉校验）
+    ├── test_review_cache.lua  # 待审队列内存缓存（不再反复读盘）
+    ├── test_sandbox_instance.lua # 沙箱进程实例隔离与启动懒加载
+    ├── test_secret_highlight.lua # chat 界面密钥命令高亮
     ├── test_timer.lua         # 可暂停计时器
     ├── test_http.lua          # HTTP 客户端
     └── test_integration.lua   # 集成测试（mock server）

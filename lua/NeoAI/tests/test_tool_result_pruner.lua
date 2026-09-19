@@ -101,4 +101,86 @@ tests.suite("tool_result_pruner", function(_, it)
     t.eq(0, r.pruned)
     t.eq(blob, agent.messages[1].content)
   end)
+
+  local function _big_agent()
+    local big = string.rep("中文内容 line of code\n", 5000)
+    return big, {
+      id = "pa",
+      messages = {
+        { role = "user", content = big },
+        { role = "tool", tool_name = "read_file", tool_call_id = "c1", content = big },
+        { role = "tool", tool_name = "read_file", tool_call_id = "c2", content = string.rep("y", 100) },
+      },
+    }
+  end
+  local _opts = { context_cache = { prune_threshold_chars = 1000, prune_head_chars = 400, prune_tail_chars = 100 } }
+
+  it("prune_agent_async：卸载线程池，结果与同步一致且幂等", function(t)
+    local big, agent = _big_agent()
+    local done, result = false, nil
+    pruner.prune_agent_async(agent, _opts):then_(function(r) result = r; done = true end)
+    t.true_(vim.wait(3000, function() return done end), "异步裁剪未完成")
+    t.eq(1, result.pruned)
+    t.true_(result.chars_removed > 0)
+    t.eq(big, agent.messages[1].content, "用户消息不得裁剪")
+    t.true_(agent.messages[2].pruned)
+    t.eq("read_file", agent.messages[2].tool_name)
+    t.eq("c1", agent.messages[2].tool_call_id)
+    t.true_(agent.messages[2].content:find(pruner.PRUNE_MARKER, 1, true) ~= nil)
+    t.nil_(agent.messages[3].pruned, "未超阈值不裁剪")
+
+    -- 二次调用幂等
+    local done2, result2 = false, nil
+    pruner.prune_agent_async(agent, _opts):then_(function(r) result2 = r; done2 = true end)
+    t.true_(vim.wait(2000, function() return done2 end), "二次异步裁剪未完成")
+    t.eq(0, result2.pruned)
+
+    -- 与同步裁剪文本逐字节一致
+    local _, sync_agent = _big_agent()
+    local sync_r = pruner.prune_agent(sync_agent, _opts)
+    t.eq(sync_r.pruned, result.pruned)
+    t.eq(sync_agent.messages[2].content, agent.messages[2].content, "异步与同步裁剪文本应一致")
+  end)
+
+  it("prune_agent_async：ui.render.threaded=false 时回退同步", function(t)
+    local config_store = require("NeoAI.kernel.config_store")
+    config_store.set("ui.render.threaded", false)
+    local _, agent = _big_agent()
+    local done, result = false, nil
+    pruner.prune_agent_async(agent, _opts):then_(function(r) result = r; done = true end)
+    t.true_(vim.wait(2000, function() return done end), "回退同步路径未完成")
+    config_store.set("ui.render.threaded", true)
+    t.eq(1, result.pruned)
+    t.true_(agent.messages[2].pruned)
+  end)
+
+  it("prune_agent_async：块数组内容与同步路径行为一致", function(t)
+    local function mk()
+      return {
+        id = "pb",
+        messages = {
+          {
+            role = "tool", tool_name = "x",
+            content = {
+              { type = "text", text = string.rep("a", 5000) },
+              { type = "attachment", id = "keep" },
+              { type = "text", text = string.rep("b", 5000) },
+            },
+          },
+        },
+      }
+    end
+    local _, async_agent = nil, mk()
+    local done, result = false, nil
+    pruner.prune_agent_async(async_agent, _opts):then_(function(r) result = r; done = true end)
+    t.true_(vim.wait(3000, function() return done end), "块数组异步裁剪未完成")
+    t.eq(1, result.pruned)
+    local _, sync_agent = nil, mk()
+    local sync_r = pruner.prune_agent(sync_agent, _opts)
+    t.eq(sync_r.pruned, result.pruned)
+    t.eq(sync_r.chars_removed, result.chars_removed)
+    t.eq(sync_agent.messages[1].content[2].type, async_agent.messages[1].content[2].type, "非文本块应保留")
+    t.eq("keep", async_agent.messages[1].content[2].id, "非文本块内容应原样保留")
+    t.eq(sync_agent.messages[1].content[1].text, async_agent.messages[1].content[1].text, "裁剪文本应一致")
+  end)
 end)

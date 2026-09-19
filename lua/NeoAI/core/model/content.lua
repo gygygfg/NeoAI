@@ -28,6 +28,11 @@ local TOOL_RESULT_IMAGE_TEXT = "Attached image(s):"
 --- @return table|nil ref
 local function _image_ref_from_tool(content)
   if not content or content == "" then return nil end
+  -- 仅字符串（工具结果 JSON 文本）需要解码；块数组由 blocks_has_image 处理。
+  if type(content) ~= "string" then return nil end
+  -- 廉价前置过滤：JSON 中图像引用键固定为 "image"，不含该子串的工具结果（如大文件读取）
+  -- 无需 JSON 解码。否则每次裁剪/序列化都要对 MB 级内容做完整解码，阻塞主线程。
+  if not content:find('"image"', 1, true) then return nil end
   local ok, obj = pcall(json.decode, content)
   if not ok or type(obj) ~= "table" then return nil end
   local img = obj.image

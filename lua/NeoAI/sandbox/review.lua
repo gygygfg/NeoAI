@@ -26,6 +26,7 @@ M.APPLY = {
   NOT_REQUESTED = "NOT_REQUESTED",
   APPLYING = "APPLYING",
   APPLIED = "APPLIED",
+  REVERTED = "REVERTED",
   CONFLICT = "CONFLICT",
   FAILED = "FAILED",
   RECONCILING = "RECONCILING",
@@ -38,9 +39,30 @@ local state = {
   items = {}, -- change_set_id -> item
   seq = 0,
   session_auto = nil, -- 会话级自动审批覆盖（nil = 用配置默认，默认关闭）
+  loaded = false, -- 是否已从磁盘水合过历史变更单元
+  -- 待审摘要缓存：待审堆积到数千时，状态栏每次重绘都全量扫描会随轮次线性变慢；
+  -- 任何变更单元写操作（_persist）都会失效缓存，下次读取时重算一次。
+  pending_cache = nil,
 }
 
 -- ========== 私有函数 ==========
+
+--- 首次访问时把磁盘上的历史变更单元水合进内存，之后以内存为准。
+--- 关键：`M.list` 此前每次调用都 `store.list_reviews()`（scandir + 逐文件 JSON 解码），
+--- 待审堆积到数百/上千时，`supersede_by_paths`（每次工具调用）与状态栏
+--- `pending_summary`（每次重绘多次）会退化为 O(n²) 磁盘扫描，占满主线程。
+--- 内存态由 review 自身写入维护，进程内即权威来源，无需反复读盘。
+local function _ensure_loaded()
+  if state.loaded then return end
+  state.loaded = true
+  local ok, persisted = pcall(store.list_reviews)
+  if not ok or type(persisted) ~= "table" then return end
+  for _, item in ipairs(persisted) do
+    local id = item and item.change_set_id
+    if id and not state.items[id] then state.items[id] = item end
+  end
+  state.pending_cache = nil
+end
 
 local function _emit(event, payload)
   local event_bus = require("NeoAI.kernel.event_bus")
@@ -48,7 +70,38 @@ local function _emit(event, payload)
 end
 
 local function _persist(item)
+  -- 写盘即视为状态变更：失效待审摘要缓存（pending_summary 会重算并缓存）。
+  state.pending_cache = nil
   pcall(store.write_review, item)
+end
+
+--- 候选是否仍被某个「可应用」变更单元引用。
+--- 候选按内容寻址（摘要 = manifest 哈希），同一内容被再次编辑会产生相同摘要，
+--- 因此多个变更单元可能共享同一候选文件。删除前必须确认无其他项仍引用，
+--- 否则会孤立其待审项，用户点击「允许」时报 CANDIDATE_NOT_FOUND。
+--- @param digest string
+--- @return boolean
+local function _candidate_referenced(digest)
+  if not digest then return false end
+  _ensure_loaded()
+  for _, item in pairs(state.items) do
+    if item.candidate_digest == digest then
+      local terminal = item.review_state == M.REVIEW.REJECTED
+        or item.review_state == M.REVIEW.SUPERSEDED
+        or item.apply_state == M.APPLY.APPLIED
+        or item.apply_state == M.APPLY.REVERTED
+      if not terminal then return true end
+    end
+  end
+  return false
+end
+
+--- 删除候选，但仅当无其他可应用变更单元仍引用它（防止共享摘要被误删）。
+--- @param digest string
+--- @return boolean
+local function _discard_candidate(digest)
+  if _candidate_referenced(digest) then return false end
+  return store.discard_candidate(digest)
 end
 
 --- @param content string
@@ -56,6 +109,169 @@ end
 local function _sha(content)
   local ok, hex = pcall(vim.fn.sha256, content or "")
   return ok and ("sha256:" .. hex) or "sha256:?"
+end
+
+--- 读取文件内容（不存在返回 nil）
+--- @param path string
+--- @return string|nil
+local function _read_file(path)
+  local f = io.open(path, "rb")
+  if not f then return nil end
+  local c = f:read("*a")
+  f:close()
+  return c
+end
+
+-- ========== 应用快照（保存 / 撤销保存交换原文件与快照）==========
+
+--- 快照单文件内容上限（与候选同源配置，避免删除大文件时读入/落盘巨量内容）
+--- @return number
+local function _snapshot_cap()
+  local n = tonumber(require("NeoAI.kernel.config_store").get("tools.sandbox.max_file_bytes"))
+  if n == nil then return 8 * 1024 * 1024 end
+  return n
+end
+
+--- 应用前捕获「原文件」快照侧（真实文件当前内容），用于撤销保存时交换。
+--- @param cand table 冻结候选（已按选择性应用过滤）
+--- @return table 数组
+local function _capture_snapshot(cand)
+  local cap = _snapshot_cap()
+  local entries = {}
+  for _, f in ipairs(cand.files or {}) do
+    local st = vim.uv.fs_stat(f.path)
+    local is_file = st ~= nil and st.type == "file"
+    local too_large = is_file and cap > 0 and (st.size or 0) > cap
+    entries[#entries + 1] = {
+      path = f.path,
+      action = f.action,
+      alt_exists = st ~= nil,
+      alt_type = st and st.type or nil,
+      alt_mode = st and (st.mode % 512) or nil,
+      alt_content = (is_file and not too_large) and _read_file(f.path) or nil,
+      alt_too_large = too_large or nil,
+      side = "after", -- 真实盘当前为「保存后」版本；快照侧为「保存前」版本
+    }
+  end
+  return entries
+end
+
+--- 发布成功后落盘快照，并记录「当前盘上版本」的哈希用于撤销时冲突检测。
+--- @param item table 变更单元
+--- @param entries table _capture_snapshot 结果
+--- @param operation_id string|nil
+local function _store_snapshot(item, entries, operation_id)
+  for _, e in ipairs(entries) do
+    local st = vim.uv.fs_stat(e.path)
+    e.disk_exists = st ~= nil
+    e.disk_type = st and st.type or nil
+    e.disk_hash = (st and st.type == "file") and _sha(_read_file(e.path) or "") or nil
+  end
+  local rec = {
+    snapshot_id = "snap_" .. tostring(item.change_set_id),
+    change_set_id = item.change_set_id,
+    operation_id = operation_id,
+    state = M.APPLY.APPLIED,
+    created_at = os.time(),
+    updated_at = os.time(),
+    files = entries,
+  }
+  store.write_snapshot(rec)
+  item.snapshot_id = rec.snapshot_id
+  return rec
+end
+
+--- 撤销/重做保存：把真实文件与快照交换（保存与撤销保存对称，可反复切换）。
+--- 写入前做 CAS 校验（真实文件须仍是上次写入的版本），避免覆盖用户外部改动。
+--- @param id string change_set_id
+--- @param opts table|nil { allow_root?: boolean, prefer_sudo?: boolean, force?: boolean }
+--- @return table { ok, state, reason? }
+function M.undo(id, opts)
+  opts = opts or {}
+  local item = M.get(id)
+  if not item then
+    return { ok = false, state = "FAILED", reason = "CHANGE_SET_NOT_FOUND: " .. tostring(id) }
+  end
+  local rec = item.snapshot_id and store.read_snapshot(item.snapshot_id)
+  if not rec then
+    return { ok = false, state = "FAILED", reason = "SNAPSHOT_NOT_FOUND: " .. tostring(id) }
+  end
+  -- 冲突预检：真实文件须仍是上次写入的版本（否则拒绝，避免覆盖外部改动）。
+  if not opts.force then
+    for _, e in ipairs(rec.files or {}) do
+      local st = vim.uv.fs_stat(e.path)
+      local exists = st ~= nil
+      local ok = (exists == (e.disk_exists == true))
+      if ok and exists then
+        if (st.type == "file") ~= (e.disk_type == "file") then
+          ok = false
+        elseif st.type == "file" then
+          ok = (_sha(_read_file(e.path) or "") == e.disk_hash)
+        end
+      end
+      if not ok then
+        return { ok = false, state = "CONFLICT", reason = "TARGET_CHANGED: " .. tostring(e.path) }
+      end
+    end
+  end
+  local writer = require("NeoAI.sandbox.writer")
+  for _, e in ipairs(rec.files or {}) do
+    if e.alt_too_large then
+      return { ok = false, state = "FAILED", reason = "SNAPSHOT_TOO_LARGE: " .. tostring(e.path) }
+    end
+    -- 交换前记录当前（保存侧）版本，交换后成为新的快照侧。
+    local st = vim.uv.fs_stat(e.path)
+    local cur_exists = st ~= nil
+    local cur_type = st and st.type or nil
+    local cur_mode = st and (st.mode % 512) or nil
+    local cur_content = (st and st.type == "file") and _read_file(e.path) or nil
+    -- 交换前记录快照侧（即将写回真实盘的版本），用于更新 disk_* 状态。
+    local wrote_exists, wrote_type, wrote_content = e.alt_exists, e.alt_type, e.alt_content
+
+    local res
+    if not wrote_exists then
+      -- 快照侧不存在：删除当前盘上的文件/目录（两侧都不存在时无需操作）。
+      if not cur_exists then
+        res = { ok = true, state = "WRITTEN" }
+      else
+        local action = (cur_type == "directory") and "rmdir" or "delete"
+        res = writer.apply(action, e.path, nil, {
+          allow_root = opts.allow_root == true, prefer_sudo = opts.prefer_sudo == true,
+        })
+      end
+    elseif wrote_type == "directory" then
+      res = writer.apply("mkdir", e.path, nil, {
+        allow_root = opts.allow_root == true, prefer_sudo = opts.prefer_sudo == true, mode = e.alt_mode,
+      })
+    else
+      res = writer.apply("write", e.path, wrote_content or "", {
+        allow_root = opts.allow_root == true, prefer_sudo = opts.prefer_sudo == true, mode = e.alt_mode,
+      })
+    end
+    if res.state == writer.STATE.NEEDS_ROOT then
+      return { ok = false, state = "NEEDS_ROOT", reason = res.reason or ("WRITE_REQUIRES_ROOT: " .. e.path) }
+    end
+    if not res.ok then
+      return { ok = false, state = "FAILED", reason = res.reason or res.err or ("WRITE_FAILED: " .. e.path) }
+    end
+    -- 交换两侧：当前盘内容成为新的快照侧；disk_* 为刚写回的版本。
+    e.alt_exists, e.alt_type, e.alt_mode, e.alt_content = cur_exists, cur_type, cur_mode, cur_content
+    e.side = (e.side == "after") and "before" or "after"
+    e.disk_exists = wrote_exists
+    e.disk_type = wrote_type
+    e.disk_hash = (wrote_exists and wrote_type == "file") and _sha(wrote_content or "") or nil
+  end
+  rec.state = (rec.state == M.APPLY.APPLIED) and M.APPLY.REVERTED or M.APPLY.APPLIED
+  rec.updated_at = os.time()
+  store.write_snapshot(rec)
+  item.apply_state = rec.state
+  item.reverted_at = (rec.state == M.APPLY.REVERTED) and os.time() or nil
+  state.items[id] = item
+  _persist(item)
+  _emit(require("NeoAI.kernel.events").SANDBOX_REVERTED, {
+    change_set_id = id, apply_state = rec.state,
+  })
+  return { ok = true, state = rec.state, snapshot = rec }
 end
 
 --- 从候选构造写集合（供展示与选择性应用）
@@ -128,13 +344,13 @@ local function _merge_package_item(item, cand)
     it.superseded_by = base.change_set_id
     it.superseded_at = os.time()
     state.items[it.change_set_id] = it
-    if it.candidate_digest ~= digest then store.discard_candidate(it.candidate_digest) end
+    if it.candidate_digest ~= digest then _discard_candidate(it.candidate_digest) end
     _persist(it)
     _emit(require("NeoAI.kernel.events").SANDBOX_REVIEW_SUPERSEDED, {
       change_set_id = it.change_set_id, superseded_by = base.change_set_id,
     })
   end
-  if base.candidate_digest ~= digest then store.discard_candidate(base.candidate_digest) end
+  local old_base_digest = base.candidate_digest
   base.candidate_digest = digest
   base.files = files
   base.write_set = _write_set(newcand)
@@ -150,12 +366,13 @@ local function _merge_package_item(item, cand)
   base.updated_at = os.time()
   state.items[base.change_set_id] = base
   _persist(base)
+  if old_base_digest ~= digest then _discard_candidate(old_base_digest) end
   -- 新条目已并入 base：标记取代并丢弃其候选。
   item.review_state = M.REVIEW.SUPERSEDED
   item.superseded_by = base.change_set_id
   item.superseded_at = os.time()
   state.items[item.change_set_id] = item
-  if item.candidate_digest ~= digest then store.discard_candidate(item.candidate_digest) end
+  if item.candidate_digest ~= digest then _discard_candidate(item.candidate_digest) end
   _persist(item)
   _emit(require("NeoAI.kernel.events").SANDBOX_REVIEW_SUPERSEDED, {
     change_set_id = item.change_set_id, superseded_by = base.change_set_id,
@@ -213,6 +430,7 @@ function M.enqueue(cand, meta)
     package_manager = meta.package_manager,
     package_names = meta.package_names,
     package_key = meta.package_key,
+    package_sensitive = meta.package_sensitive,
     review_state = M.REVIEW.PENDING,
     apply_state = M.APPLY.NOT_REQUESTED,
     created_at = os.time(),
@@ -246,6 +464,10 @@ function M.enqueue_host_op(rec)
     files = {},
     privilege_tier = rec.tier,
     effect = "process",
+    -- 主机操作提案属 L3（critical）：供审批界面红色高危标注与 AI 审计正确分级。
+    risk_level = 3,
+    risk_name = "critical",
+    risk_reasons = { "HOST_OPERATION" },
     review_state = M.REVIEW.PENDING,
     apply_state = M.APPLY.NOT_REQUESTED,
     created_at = os.time(),
@@ -270,19 +492,10 @@ end
 --- @param filter table|nil { review_state?, apply_state? }
 --- @return table 数组
 function M.list(filter)
+  _ensure_loaded()
   filter = filter or {}
-  local out = {}
-  local seen = {}
-  -- 内存态优先（含未落盘的最新状态）
-  for id, item in pairs(state.items) do
-    seen[id] = true
-    out[#out + 1] = item
-  end
-  for _, item in ipairs(store.list_reviews()) do
-    if not seen[item.change_set_id] then out[#out + 1] = item end
-  end
   local filtered = {}
-  for _, item in ipairs(out) do
+  for _, item in pairs(state.items) do
     -- 过滤空变更单元（0 文件）：历史持久化记录可能残留，无审批意义。
     -- 主机操作提案（host_op）无文件但必须保留。
     local has_files = (item.files and #item.files > 0) or (item.write_set and #item.write_set > 0)
@@ -301,20 +514,25 @@ end
 --- 用户需逐个确认，故徽标数应为待审文件总数。
 --- @return table { count = number, max_level = number|nil }
 function M.pending_summary()
+  _ensure_loaded()
+  if state.pending_cache then return state.pending_cache end
   local count, max_level = 0, nil
-  for _, item in ipairs(M.list({ review_state = M.REVIEW.PENDING })) do
-    if item.kind == "host_op" then
-      count = count + 1
-    else
-      local n = #(item.files or {})
-      if n == 0 then n = #(item.write_set or {}) end
-      count = count + n
-    end
-    if item.risk_level and (not max_level or item.risk_level > max_level) then
-      max_level = item.risk_level
+  for _, item in pairs(state.items) do
+    if item.review_state == M.REVIEW.PENDING then
+      if item.kind == "host_op" then
+        count = count + 1
+      else
+        local n = #(item.files or {})
+        if n == 0 then n = #(item.write_set or {}) end
+        count = count + n
+      end
+      if item.risk_level and (not max_level or item.risk_level > max_level) then
+        max_level = item.risk_level
+      end
     end
   end
-  return { count = count, max_level = max_level }
+  state.pending_cache = { count = count, max_level = max_level }
+  return state.pending_cache
 end
 
 --- 待审数量（按文件计）
@@ -377,7 +595,7 @@ function M.reject(id, reason)
     _emit(require("NeoAI.kernel.events").SANDBOX_REVIEW_REJECTED, { change_set_id = id, reason = reason })
     return item
   end
-  store.discard_candidate(item.candidate_digest)
+  _discard_candidate(item.candidate_digest)
   -- 拒绝后暂存副本失效：后续编辑应重新以真实文件为基线，不能带上被拒改动。
   candidate.invalidate(item.write_set)
   _persist(item)
@@ -476,9 +694,23 @@ function M.apply(id, opts)
   if item.apply_state == M.APPLY.APPLIED then
     return { ok = true, state = "ALREADY_APPLIED", receipt = item.receipt }
   end
+  -- 自动批准是为「应用」服务的瞬时状态：一旦应用失败必须回退为待审，
+  -- 否则条目停留在 APPROVED 而从待审悬浮窗（只列 PENDING）中消失，用户无法重试/拒绝。
+  local auto_approved = false
+  local function _restore_pending()
+    if auto_approved and item.review_state == M.REVIEW.APPROVED then
+      item.review_state = M.REVIEW.PENDING
+      item.approved_at = nil
+      state.items[id] = item
+      _persist(item)
+    end
+  end
   -- 主机操作提案：审批后在主机上 replay（无候选、无文件）
   if item.kind == "host_op" then
-    if opts.auto_approve and item.review_state == M.REVIEW.PENDING then M.approve(id) end
+    if opts.auto_approve and item.review_state == M.REVIEW.PENDING then
+      M.approve(id)
+      auto_approved = true
+    end
     if item.review_state ~= M.REVIEW.APPROVED then
       return { ok = false, state = "NOT_APPROVED", reason = "CHANGE_SET_NOT_APPROVED: " .. tostring(id) }
     end
@@ -489,16 +721,19 @@ function M.apply(id, opts)
     item.fail_reason = res.reason
     state.items[id] = item
     _persist(item)
+    if not res.ok then _restore_pending() end
     return res
   end
   if opts.auto_approve and item.review_state == M.REVIEW.PENDING then
     M.approve(id)
+    auto_approved = true
   end
   if item.review_state ~= M.REVIEW.APPROVED then
     return { ok = false, state = "NOT_APPROVED", reason = "CHANGE_SET_NOT_APPROVED: " .. tostring(id) }
   end
   local cand = store.read_candidate(item.candidate_digest)
   if not cand then
+    _restore_pending()
     return { ok = false, state = "FAILED", reason = "CANDIDATE_NOT_FOUND: " .. tostring(item.candidate_digest) }
   end
   -- 选择性应用：按允许文件子集过滤候选，未选中的文件保留为新的待审项
@@ -511,6 +746,7 @@ function M.apply(id, opts)
       if allow[f.path] then filtered[#filtered + 1] = f else remaining[#remaining + 1] = f end
     end
     if #filtered == 0 then
+      _restore_pending()
       return { ok = false, state = "FAILED", reason = "NO_FILES_SELECTED" }
     end
     cand = vim.deepcopy(cand)
@@ -523,13 +759,20 @@ function M.apply(id, opts)
   _emit(require("NeoAI.kernel.events").SANDBOX_PUBLISH_STARTED, {
     change_set_id = id, candidate_digest = item.candidate_digest,
   })
-  local pub = candidate.publish(cand, { expected_base = item.base_version, allow_root = opts.allow_root == true })
+  -- 保存前捕获原文件快照（真实文件当前内容），供撤销保存时交换。
+  local snapshot_entries = _capture_snapshot(cand)
+  local pub = candidate.publish(cand, {
+    expected_base = item.base_version,
+    allow_root = opts.allow_root == true,
+    prefer_sudo = opts.prefer_sudo == true,
+  })
   if pub.ok then
     item.apply_state = M.APPLY.APPLIED
     item.applied_at = os.time()
     item.receipt = pub.receipt
     store.write_receipt(pub.receipt)
-    store.discard_candidate(item.candidate_digest)
+    _discard_candidate(item.candidate_digest)
+    _store_snapshot(item, snapshot_entries, pub.receipt.operation_id)
     _persist(item)
     -- 仅应用了部分文件：其余文件保留待审，供用户逐个确认
     if #remaining > 0 then _requeue_remaining(item, remaining) end
@@ -543,6 +786,7 @@ function M.apply(id, opts)
     item.needs_root = true
     item.fail_reason = pub.reason
     _persist(item)
+    _restore_pending()
     _emit(require("NeoAI.kernel.events").SANDBOX_PRIVILEGE_ESCALATION_REQUESTED, {
       change_set_id = id, reason = "PUBLISH_WRITE_DENIED",
     })
@@ -550,6 +794,7 @@ function M.apply(id, opts)
     item.apply_state = pub.state == "CONFLICT" and M.APPLY.CONFLICT or M.APPLY.FAILED
     item.fail_reason = pub.reason
     _persist(item)
+    _restore_pending()
     _emit(require("NeoAI.kernel.events").SANDBOX_CONFLICT, {
       change_set_id = id, reason = pub.reason,
     })
@@ -636,7 +881,7 @@ function M.supersede_by_paths(paths, except_id)
         item.superseded_by = except_id
         item.superseded_at = os.time()
         state.items[item.change_set_id] = item
-        store.discard_candidate(item.candidate_digest)
+        _discard_candidate(item.candidate_digest)
         _persist(item)
         _emit(require("NeoAI.kernel.events").SANDBOX_REVIEW_SUPERSEDED, {
           change_set_id = item.change_set_id, superseded_by = except_id,
@@ -760,7 +1005,7 @@ function M.apply_set(set)
   local pub = candidate.publish(set.candidate, { expected_base = set.publication_intent_hash })
   if pub.ok then
     store.write_receipt(pub.receipt)
-    store.discard_candidate(set.candidate.candidate_digest)
+    _discard_candidate(set.candidate.candidate_digest)
     for _, m in ipairs(set.members or {}) do
       m.review_state = M.REVIEW.APPROVED
       m.apply_state = M.APPLY.APPLIED
@@ -768,7 +1013,7 @@ function M.apply_set(set)
       m.receipt = pub.receipt
       state.items[m.change_set_id] = m
       _persist(m)
-      store.discard_candidate(m.candidate_digest)
+      _discard_candidate(m.candidate_digest)
       _emit(require("NeoAI.kernel.events").SANDBOX_APPLIED, {
         change_set_id = m.change_set_id, operation_id = pub.receipt.operation_id,
       })
@@ -852,6 +1097,8 @@ function M.reset()
   state.items = {}
   state.seq = 0
   state.session_auto = nil
+  state.loaded = false
+  state.pending_cache = nil
 end
 
 return M

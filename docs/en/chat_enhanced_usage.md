@@ -42,7 +42,7 @@ The chat window = **main message area (top)** + **input box (bottom, split, heig
 | Cycle mode | `m` | CHAT → PLAN → AUTO |
 | Cycle display mode | `<C-t>` (insert) / `T` (normal) | chat / trajectory |
 | Hot-reload display mode | `<F5>` | Reload the current display-mode plugin |
-| Approve plan | — | AI calls `exit_plan_mode` (opens an approval window for confirmation) or run `:NeoAIApprovePlan` |
+| Approve plan | — | Run `:NeoAIApprovePlan` (or toggle the mode manually); the AI no longer holds a mode-switching tool |
 | Tool approval | `<C-a>` | Confirm inside the approval popup |
 | Sandbox review | `<leader>ap` | Equivalent to `:NeoAISandboxReview`; list and apply pending sandbox changes (per-file approval), graded high/medium/low; press `i` to preview that item's diff (temporarily closes the review window and returns with the cursor restored) |
 | Scroll | `j` / `k` / mouse wheel | `j`/`k` move the cursor by line; the wheel smoothly scrolls the viewport, with blank space below the last line capped at `ui.chat.mousescroll_max_blank` lines |
@@ -57,11 +57,12 @@ The chat window = **main message area (top)** + **input box (bottom, split, heig
   a "receiving arguments" window opens in real time and **incrementally appends** as chunks arrive (for a single
   tool call it appends the raw arguments chunk by chunk, consistent with the reasoning floating window, to avoid
   reflowing the entire block), closing on `TOOL_ARG_COMPLETED`. The window height adapts to the **number of
-  displayed lines** (including wrapped lines) and always scrolls automatically to the end of the content.
-- All floating windows share `float_stream_window`: the window height grows with the content (up to a maximum),
-  `smoothscroll` is enabled, and even a long single line can be scrolled to its end; after writing, it first grows
-  taller and then scrolls, moves the cursor to the end of the content (last line, last column), and then uses `zb`
-  to pin it to the bottom.
+  displayed lines** (including wrapped lines; reasoning/argument windows are capped at **5 lines**) and always
+  scrolls automatically to the end of the content.
+- All floating windows share `float_stream_window`: the window height grows with the content (up to a maximum,
+  which is 5 lines for the reasoning/argument windows), `smoothscroll` is enabled, and even a long single line can
+  be scrolled to its end; after writing, it first grows taller and then scrolls, moves the cursor to the end of the
+  content (last line, last column), and then uses `zb` to pin it to the bottom.
 - Auto-follow scrolling and popup floating windows happen only when the cursor is within the last 5 lines of the
   message area; reviewing earlier content does not disturb them.
 
@@ -78,13 +79,13 @@ Expand/collapse: `zM` (collapse all) / `zo` (expand) / `zR` (expand all).
 
 `m` or `:NeoAIPlan` toggles plan mode:
 
-- The tool context keeps only **read-only/information-query tools + `run_command` (read-only research) + `ask_user` + `exit_plan_mode`**, exposing no
-  modifying tools at all.
+- The tool context keeps only **read-only/information-query tools + `run_command` (read-only research) + `ask_user`**, exposing no
+  modifying tools at all and **no mode-switching tool to the AI**.
 - The execution-time gate tightens accordingly; tools outside the visible set are rejected when called.
 - In plan mode the AI researches and asks clarifying questions, then outputs a **clear, well-formatted change
   plan**.
-- After the plan is complete, the AI calls `exit_plan_mode` (an approval window pops up for the user to confirm;
-  you can also run `:NeoAIApprovePlan`); once confirmed, it switches to CHAT mode, parses the plan into a todo
+- After the plan is emitted the turn ends and **the user confirms** (run `:NeoAIApprovePlan` or toggle the mode
+  manually); once confirmed, it switches to CHAT mode, parses the plan into a todo
   list, and executes it automatically.
 - Switching modes during generation (`m` / `:NeoAIPlan` / `:NeoAIAuto`) is deferred until the current turn ends,
   so it does not interrupt an in-progress generation.

@@ -25,7 +25,23 @@ local function _guard_secret_context(agent, messages)
   local sandbox = services.use("services.sandbox")
   local secret = sandbox and sandbox.secret
   if not secret or not secret.context_leak then return true end
-  local leaked = secret.context_leak(messages)
+  -- 增量：仅扫描**新增上下文/工具调用**（append-only 视图）；压缩替换历史时回退全量。
+  local leaked
+  if secret.context_leak_from and agent then
+    local cursor = tonumber(agent._secret_guard_cursor) or 0
+    local replaced = (agent.compaction and tonumber(agent.compaction.replaced)) or 0
+    local last_replaced = tonumber(agent._secret_guard_replaced) or 0
+    local append_only = cursor > 0 and #messages >= cursor and replaced == last_replaced
+    if append_only then
+      leaked = secret.context_leak_from(messages, cursor + 1)
+    else
+      leaked = secret.context_leak(messages)
+    end
+    agent._secret_guard_cursor = #messages
+    agent._secret_guard_replaced = replaced
+  else
+    leaked = secret.context_leak(messages)
+  end
   if not leaked then return true end
   secret.trace("context_blocked", { tool = "request", agent_id = agent and agent.id })
   if agent then

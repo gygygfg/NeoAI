@@ -88,6 +88,21 @@ explicitly registered as reasoning by the renderer show `🤔 思考过程 N 行
 lines after writing the buffer); tool blocks show `🔧 <tool>` and any other unrecognized fold shows a neutral
 placeholder (`📄 <first-line preview> (N lines)`), so not every fold is rendered as a thinking process. During tool
 execution it re-renders once per second (`TOOL_TICK_MS=1000`), so the elapsed time in the fold text ticks in real time.
+When a command's **arguments or result contain a secret** (sandbox token `NEOKEY_*` or a raw secret matched by a
+named rule), a **separate highlighted warning line** (`⚠ 密钥`, `NeoAISecretWarning`) is appended **outside** the
+tool fold block; the fold title stays clean (no `⚠ 密钥` suffix) and the warning remains visible while collapsed.
+The warning **names the exact command/tool and the key file it obtained or used**, e.g.
+`⚠ 密钥：run_command 执行 cat ~/.ssh/id_rsa 获取/使用了密钥（密钥文件：/root/.ssh/id_rsa）`; when the file cannot be
+determined it falls back to the secret type (named rule, e.g. `private_key`) → sensitive environment variable
+name → generic notice (see the secrets section of [sandbox.md](sandbox.md)). Moreover, for a tool call that
+contains a secret, its **arguments and result are shown in full (no 500-char truncation)** and the matched
+secret values (`NEOKEY_*` tokens and raw secrets matched by named rules) are highlighted inline with the same
+`NeoAISecretWarning` group (identical in `message_list` and trajectory mode).
+**ANSI SGR colors** in command output (e.g. `\27[1;36m…\27[0m`) are parsed by `utils.ansi`: escape sequences are
+stripped from the displayed text and the colors/attributes (16/256/truecolor + bold/italic/underline/reverse/
+strikethrough) are applied per span via lazily created highlight groups (`NeoAIAnsi_*`); non-SGR CSI/OSC sequences
+(cursor, erase, window title) are stripped as well. The model-visible result content is unchanged — colors affect
+display only.
 
 ### 4.5 Reasoning and Tool Arguments Floating Windows
 
@@ -103,11 +118,12 @@ execution it re-renders once per second (`TOOL_TICK_MS=1000`), so the elapsed ti
   flag (`_cancel_pending_tool_args`).
 
 Both: do not pop up when the cursor is not following (`_cursor_within_follow_margin`), `minimal` floating window,
-`foldenable=false` (to avoid inheriting global folds and collapsing the content). The shared `float_stream_window`
-additionally: adapts its height to the **number of display lines** (`nvim_win_text_height`, including wrapped lines),
-enables `smoothscroll`, **grows first and then scrolls** after writing, and moves the cursor to the end of the content
-(`G$`) followed by `zb` to stick to the bottom, ensuring that a long single line/large amount of content always
-scrolls to the latest tail.
+`foldenable=false` (to avoid inheriting global folds and collapsing the content), and are **capped at 5 lines**
+(`open(title, { max_height = 5 })`; `float_stream_window` limits its adaptive height by `max_height`). The shared
+`float_stream_window` additionally: adapts its height to the **number of display lines** (`nvim_win_text_height`,
+including wrapped lines), enables `smoothscroll`, **grows first and then scrolls** after writing, and moves the cursor
+to the end of the content (`G$`) followed by `zb` to stick to the bottom, ensuring that a long single line/large
+amount of content always scrolls to the latest tail.
 
 ### 4.6 Input Box Linkage and Scrolling
 
@@ -142,6 +158,23 @@ displayed buffer rather than the window handle): when focus leaves (or the main 
 `:bnext`), the input box is collapsed (`_collapse_aux`), and when returning to the chat it is restored
 (`_restore_aux`, with the input buffer content preserved).
 
+### 4.8 LSP Isolation for UI Buffers (ui/lsp_guard)
+
+NeoAI's chat/input/floating windows are pure UI text; if an LSP client (native LSP / GitHub Copilot) attaches to
+them, `document_color` / `folding_range` / `semantic_tokens` / `inline_completion` keep burning CPU (especially
+Copilot). `ui/lsp_guard` intercepts uniformly:
+
+- Identifies NeoAI buffers by `neoai*` filetype (or the `b:neoai_ui` marker).
+- **One-time**: adds `neoai*` to `g:copilot_filetypes` (empty value = disabled), so copilot.vim never attaches /
+  starts the language server for them (`nofile` is not in its built-in disabled list), avoiding the
+  start-then-detach overhead.
+- On `FileType neoai*`: sets `b:neoai_ui`, changes a normal buftype to `nofile` (blocking native LSP auto-start;
+  `acwrite` is preserved because trajectory-mode `:w` saving depends on it), disables Copilot per buffer
+  (`b:copilot_disabled`/`b:copilot_disable`/`b:copilot_enabled=false`), and detaches attached clients.
+- `LspAttach` fallback: schedules detach for clients that attach to a NeoAI buffer late/asynchronously.
+
+Installed by `ui.init` and removed by `ui.reset` (idempotent, hot-reload friendly).
+
 ## 5. Display Modes (display_modes)
 
 Following deepseek-harness's Cordis plugin model, the chat view's "display modes" are made into plugins:
@@ -161,9 +194,10 @@ Following deepseek-harness's Cordis plugin model, the chat view's "display modes
 | --- | --- |
 | `input_box` | Chat input box. `create`/`attach_window`/`focus`/`submit`/`on_submitted`/`clear`; renders the `>` prefix with `virt_text`; enables completion for the `neoai_input` filetype. |
 | `message_list` | Message list rendering. `render(buf, messages)`; `toggle_reasoning()`. |
-| `float_stream_window` | Reusable streaming floating window. `open(title,{filetype})`/`set_text`/`append`/`get_text`/`close`/`is_open`/`reset`; reasoning process / receiving arguments / context compaction / plan distillation share the same window. The window height adapts to the number of display lines (`nvim_win_text_height`), `smoothscroll` is enabled, and after writing it grows first then scrolls, with the cursor moved to the end of the content followed by `zb` to stick to the bottom. |
-| `reasoning_panel` | Reasoning process floating window (`float_stream_window` adapter). `open`/`show`/`append`/`close`/`is_open`; `filetype=neoai_reasoning`. |
-| `tool_args_panel` | Tool arguments receiving floating window (`float_stream_window` adapter, streaming tool call arguments). For a single tool it `append`s incrementally by chunk, otherwise it rebuilds the whole segment; `open`/`show`/`close`/`is_open`/`get_content`/`reset`; `filetype=neoai_tool_args`. |
+| `float_stream_window` | Reusable streaming floating window. `open(title,{filetype,max_height})`/`set_text`/`append`/`get_text`/`close`/`is_open`/`reset`; reasoning process / receiving arguments / context compaction / plan distillation share the same window. The window height adapts to the number of display lines (`nvim_win_text_height`), bounded by `max_height`, `smoothscroll` is enabled, and after writing it grows first then scrolls, with the cursor moved to the end of the content followed by `zb` to stick to the bottom. |
+| `reasoning_panel` | Reasoning process floating window (`float_stream_window` adapter, height capped at 5 lines). `open`/`show`/`append`/`close`/`is_open`; `filetype=neoai_reasoning`. |
+| `tool_args_panel` | Tool arguments receiving floating window (`float_stream_window` adapter, streaming tool call arguments, height capped at 5 lines). For a single tool it `append`s incrementally by chunk, otherwise it rebuilds the whole segment; `open`/`show`/`close`/`is_open`/`get_content`/`reset`; `filetype=neoai_tool_args`. |
+| `lsp_guard` | LSP isolation for UI buffers. `install()`/`uninstall()`/`disable(buf)`; disables LSP/Copilot for `neoai*` filetypes and detaches attached clients (see §4.8). |
 | `model_picker` | Model picker (asynchronously loads the model list). `open(callback)`. |
 | `tool_approval` | Tool approval popup. `init()`; serial single-slot display. |
 | `ask_user` | User questioning popup. `init()`; injected via `ask_user.set_ui`. |

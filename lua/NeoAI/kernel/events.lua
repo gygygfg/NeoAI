@@ -143,6 +143,8 @@ M.SANDBOX_REVIEW_APPROVED = "sandbox:review_approved"
 M.SANDBOX_REVIEW_REJECTED = "sandbox:review_rejected"
 M.SANDBOX_REVIEW_SUPERSEDED = "sandbox:review_superseded"
 M.SANDBOX_APPLIED = "sandbox:applied"
+-- 撤销/重做保存：把真实文件与保存时保留的原文件快照交换（apply_state APPLIED ↔ REVERTED）
+M.SANDBOX_REVERTED = "sandbox:reverted"
 M.SANDBOX_GRANT_CREATED = "sandbox:grant_created"
 M.SANDBOX_GRANT_REVOKED = "sandbox:grant_revoked"
 

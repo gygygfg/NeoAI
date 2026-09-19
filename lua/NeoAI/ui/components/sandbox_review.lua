@@ -1,7 +1,9 @@
 --- 沙箱待审审批界面
 --- @module NeoAI.ui.components.sandbox_review
 --- 列出待审变更单元，按文件路径级别高亮：
----   工作区文件=绿色 / 用户目录=黄色 / 系统路径=红色；「待审」状态标签=黄色。
+---   工作区文件=绿色 / 用户目录=黄色 / 系统路径=红色；「待审」状态标签按安全等级着色
+---   （L0 灰 / L1 黄 / L2 橙 / L3 红）。
+---   风险徽标配色：L0 灰 / L1·L2 黄 / L3 红（仅 L3 用红色危险高亮）。
 --- 审批单位为单个文件：<CR> 仅应用光标所在文件 / d 仅拒绝该文件（其余文件保留待审）。
 --- r 刷新 / q 关闭。
 --- 经 kernel.services.use 获取 sandbox 服务，缺失时降级提示。
@@ -19,14 +21,22 @@ local LEVEL_HL = {
   user = "NeoAISandboxReviewUser",
   system = "NeoAISandboxReviewSystem",
   pending = "NeoAISandboxReviewPending",
+  pending0 = "NeoAISandboxReviewPending0",
+  pending1 = "NeoAISandboxReviewPending1",
+  pending2 = "NeoAISandboxReviewPending2",
+  pending3 = "NeoAISandboxReviewPending3",
   secret = "NeoAISandboxReviewSecret",
   risk0 = "NeoAISandboxReviewRisk0",
   risk1 = "NeoAISandboxReviewRisk1",
   risk2 = "NeoAISandboxReviewRisk2",
   risk3 = "NeoAISandboxReviewRisk3",
+  ai = "NeoAISandboxReviewAi",
+  note = "NeoAISandboxReviewNote",
+  verdict_safe = "NeoAISandboxReviewVerdictSafe",
+  verdict_unsafe = "NeoAISandboxReviewVerdictUnsafe",
 }
 
-local LEGEND = "级别：工作区(绿) 用户目录(黄) 系统(红)  风险：L0低危/L1中危/L2·L3高危  ⚠密钥操作(红)   |   <CR> 头行=整包应用 / 文件行=应用该文件   d 拒绝该文件   i 预览修改diff   r 刷新   q 关闭"
+local LEGEND = "级别：工作区(绿) 用户目录(黄) 系统(红)  风险：L0低危(灰)/L1中危(黄)/L2高危(黄)/L3严重(红)  ⚠密钥操作(红)   |   <CR> 头行=整包应用 / 文件行=应用该文件   d 拒绝该文件   i 预览修改diff/越界详情   u 撤销/重做保存   a AI审计   r 刷新   q 关闭"
 
 -- L3 后果警告高亮组（diff 预览顶部）
 local L3_WARN_HL = "NeoAISandboxReviewL3Warning"
@@ -38,6 +48,7 @@ local state = {
   buf = nil,
   ns = nil,
   line_to_target = {}, -- 行号 -> { change_set_id, path? }
+  line_to_trace = {}, -- 行号 -> 越界留痕路径（`i` 查看详情，非审批目标）
   last_cursor = nil, -- { line, col } 关闭时记录，重开时恢复
   last_target = nil, -- { change_set_id, path? } 关闭时光标所在条目（优先恢复）
   geom = nil, -- { col, row, width, height } 窗口几何，重开时恢复
@@ -45,6 +56,9 @@ local state = {
   diff = nil, -- { win, buf, ns, mode, warn_start, warn_end, diff_start, width } 当前 diff 预览窗口
   pending_l3 = nil, -- { change_set_id, path } L3 二次确认中待应用的条目
   l3_seq = 0, -- L3 警告生成序号：关闭/重开 diff 后作废过期结果
+  audit = nil, -- { text?, pending?, error? } AI 审计结论（显示在窗口顶部）
+  audit_seq = 0, -- AI 审计请求序号：关闭/重开审批窗后作废过期结果
+  audit_sig = nil, -- 已完成审计对应的待审集合签名（集合变化时自动重审）
 }
 
 -- 安全级别 -> 中文风险档（高危 / 中危 / 低危）
@@ -65,11 +79,21 @@ local function _ensure_hl()
   vim.api.nvim_set_hl(0, LEVEL_HL.user, { default = true, fg = "#e5c07b", bold = true })
   vim.api.nvim_set_hl(0, LEVEL_HL.system, { default = true, fg = "#e06c75", bold = true })
   vim.api.nvim_set_hl(0, LEVEL_HL.pending, { default = true, fg = "#e5c07b", bold = true })
+  -- 「待审」标签按安全等级着不同色（L0 灰 / L1 黄 / L2 橙 / L3 红）
+  vim.api.nvim_set_hl(0, LEVEL_HL.pending0, { default = true, fg = "#7f8c8d", bold = true })
+  vim.api.nvim_set_hl(0, LEVEL_HL.pending1, { default = true, fg = "#e5c07b", bold = true })
+  vim.api.nvim_set_hl(0, LEVEL_HL.pending2, { default = true, fg = "#d19a66", bold = true })
+  vim.api.nvim_set_hl(0, LEVEL_HL.pending3, { default = true, fg = "#ff5555", bold = true, underline = true })
   vim.api.nvim_set_hl(0, LEVEL_HL.secret, { default = true, fg = "#e06c75", bold = true, underline = true })
   vim.api.nvim_set_hl(0, LEVEL_HL.risk0, { default = true, fg = "#7f8c8d", bold = true })
   vim.api.nvim_set_hl(0, LEVEL_HL.risk1, { default = true, fg = "#e5c07b", bold = true })
-  vim.api.nvim_set_hl(0, LEVEL_HL.risk2, { default = true, fg = "#e06c75", bold = true })
+  -- L2（高危）用黄色警示，而非红色；仅 L3（严重）保留红色危险高亮。
+  vim.api.nvim_set_hl(0, LEVEL_HL.risk2, { default = true, fg = "#e5c07b", bold = true })
   vim.api.nvim_set_hl(0, LEVEL_HL.risk3, { default = true, fg = "#ff5555", bold = true, underline = true })
+  vim.api.nvim_set_hl(0, LEVEL_HL.ai, { default = true, fg = "#56b6c2", bold = true })
+  vim.api.nvim_set_hl(0, LEVEL_HL.note, { default = true, fg = "#7f8c8d" })
+  vim.api.nvim_set_hl(0, LEVEL_HL.verdict_safe, { default = true, fg = "#98c379", bold = true })
+  vim.api.nvim_set_hl(0, LEVEL_HL.verdict_unsafe, { default = true, fg = "#ff5555", bold = true })
   vim.api.nvim_set_hl(0, L3_WARN_HL, { default = true, fg = "#ff5555", bold = true })
 end
 
@@ -82,6 +106,19 @@ local function _risk_hl(level)
   if level == 2 then return "risk2" end
   if level == 1 then return "risk1" end
   return "risk0"
+end
+
+--- 「待审」两字的高亮：按条目安全等级着色（L0 灰 / L1 黄 / L2 橙 / L3 红）；
+--- 无安全等级信息时退回默认黄色 pending。
+--- @param item table|nil
+--- @return string
+local function _pending_hl(item)
+  local lv = item and tonumber(item.risk_level)
+  if lv == nil then return "pending" end
+  if lv >= 3 then return "pending3" end
+  if lv == 2 then return "pending2" end
+  if lv == 1 then return "pending1" end
+  return "pending0"
 end
 
 --- 将任意值压成单行（nvim_buf_set_lines 不接受含换行的元素）
@@ -124,11 +161,78 @@ end
 --- 构建展示行与高亮标记（纯函数，测试用）
 --- @param items table list_reviews 结果数组
 --- @param traces table|nil 越界访问留痕数组（sandbox.list_traces）
---- @return table { lines, marks, line_to_target }
-function M.build_lines(items, traces)
-  local lines = { LEGEND, "" }
+--- @param audit table|nil AI 审计 { pending?, error?, fallback?, notes? = { [路径或命令]=说明 } }
+--- @param saved table|nil 已保存/已撤销（含快照）的变更单元数组（sandbox.list_saved）
+--- @return table { lines, marks, line_to_target, line_to_trace }
+function M.build_lines(items, traces, audit, saved)
+  local lines = {}
   local marks = {}
   local line_to_target = {}
+  local line_to_trace = {} -- 行号 -> 越界留痕路径（`i` 查看详情；非审批目标）
+  lines[#lines + 1] = LEGEND
+  lines[#lines + 1] = ""
+  -- AI 审计状态（生成中 / 结论 / 失败 / 兜底说明）：结论先说安全/不安全；正式说明在各自文件行下方。
+  if audit and (audit.pending or audit.notes
+      or (audit.error and audit.error ~= "") or (audit.fallback and audit.fallback ~= "")) then
+    local status, level = nil, "note"
+    if audit.pending then
+      status = "🤖 AI 审计生成中…"
+    elseif audit.notes then
+      local verdict = require("NeoAI.sandbox.ai_audit").verdict(audit.notes)
+      if verdict == "unsafe" then
+        status, level = "🤖 AI 审计结论：⚠ 不安全 — 存在不安全变更，请逐条确认", "verdict_unsafe"
+      elseif verdict == "safe" then
+        status, level = "🤖 AI 审计结论：安全 — 未发现不安全变更", "verdict_safe"
+      else
+        status = "🤖 AI 审计结论：未给出明确安全/不安全结论"
+      end
+    elseif audit.error and audit.error ~= "" then
+      status = "🤖 AI 审计失败：" .. _one_line(audit.error)
+    else
+      status = "🤖 AI 审计：" .. _one_line(audit.fallback)
+    end
+    lines[#lines + 1] = status
+    marks[#marks + 1] = { line = #lines, start_col = 0, end_col = #status, level = level }
+    lines[#lines + 1] = ""
+  end
+  -- 按路径/命令查审计说明（容忍模型省略前缀、带 [action] 前缀或命令 `$ ` 前缀）
+  local function _norm_key(s)
+    s = tostring(s or ""):gsub("^%s+", ""):gsub("%s+$", "")
+    s = s:gsub("^%[.-%]%s*", "") -- 去掉 [action] 前缀
+    s = s:gsub("^%$%s*", "") -- 去掉命令 `$ ` 前缀
+    s = s:gsub("^主机操作命令%s*[:：]%s*", "")
+    return s
+  end
+  local function _note_for(key)
+    local notes = audit and audit.notes
+    if not notes or not key or key == "" then return nil end
+    if notes[key] then return notes[key] end
+    local nk = _norm_key(key)
+    if nk == "" then return nil end
+    for k, v in pairs(notes) do
+      local kk = _norm_key(k)
+      if kk ~= "" and (kk == nk or nk:sub(-#kk) == kk or kk:sub(-#nk) == nk) then return v end
+    end
+    return nil
+  end
+  --- 在当前位置追加一条暗灰审计说明。AI 审计已完成但该条目缺说明时，标注「请人工确认」，
+  --- 确保**每条都要审**：不漏任何文件 / 主机命令。
+  local function _append_note(key)
+    local note = _note_for(key)
+    local missing = false
+    if not note or note == "" then
+      if audit and audit.notes then
+        note = "（AI 未给出说明，请人工确认）"
+        missing = true
+      else
+        return
+      end
+    end
+    local text = "    " .. _one_line(note)
+    local ln = #lines + 1
+    lines[#lines + 1] = text
+    marks[#marks + 1] = { line = ln, start_col = 4, end_col = 4 + #note, level = missing and "verdict_unsafe" or "note" }
+  end
   local risk = require("NeoAI.sandbox.risk")
   for _, item in ipairs(items or {}) do
     local tier = item.privilege_tier or 0
@@ -143,7 +247,7 @@ function M.build_lines(items, traces)
       local base = _one_line(string.format("[%s] %s%s%s（主机操作）  ", item.change_set_id, item.tool or "?", badge, risk_badge))
       local hln = #lines + 1
       lines[#lines + 1] = base .. "待审"
-      marks[#marks + 1] = { line = hln, start_col = #base, end_col = #base + #"待审", level = "pending" }
+      marks[#marks + 1] = { line = hln, start_col = #base, end_col = #base + #"待审", level = _pending_hl(item) }
       if risk_badge ~= "" then
         local rb = base:find("%[L%d%]", 1)
         if rb then marks[#marks + 1] = { line = hln, start_col = rb - 1, end_col = rb + 2, level = _risk_hl(item.risk_level) } end
@@ -153,6 +257,7 @@ function M.build_lines(items, traces)
       lines[#lines + 1] = text
       marks[#marks + 1] = { line = ln, start_col = 2, end_col = 2 + #cmd, level = "system" }
       line_to_target[ln] = { change_set_id = item.change_set_id, host_op = true }
+      _append_note(cmd)
       lines[#lines + 1] = ""
     else
     -- files 缺失（旧持久化记录）时回退 write_set
@@ -173,12 +278,15 @@ function M.build_lines(items, traces)
       else
         pkg = "包安装，"
       end
+      if item.package_sensitive then
+        pkg = pkg .. "⚠ 涉及软件源/密钥，"
+      end
     end
     local base = _one_line(string.format("[%s] %s%s%s（%s%d 个文件）  ", item.change_set_id, item.tool or "?", badge, risk_badge, pkg, #files))
     local hln = #lines + 1
     lines[#lines + 1] = base .. "待审"
-    -- 「待审」标签黄色高亮
-    marks[#marks + 1] = { line = hln, start_col = #base, end_col = #base + #"待审", level = "pending" }
+    -- 「待审」标签按安全等级着色（L0 灰 / L1 黄 / L2 橙 / L3 红）
+    marks[#marks + 1] = { line = hln, start_col = #base, end_col = #base + #"待审", level = _pending_hl(item) }
     -- 头行 = 整单元审批入口：<CR> 一次应用该变更单元的全部文件
     -- （包安装按安装命令合并，整包一次审批，无需逐文件确认）。
     line_to_target[hln] = { change_set_id = item.change_set_id, whole = true }
@@ -216,31 +324,84 @@ function M.build_lines(items, traces)
       lines[#lines + 1] = text
       marks[#marks + 1] = { line = ln, start_col = 2, end_col = 2 + #path, level = M.level_of(path) }
       line_to_target[ln] = { change_set_id = item.change_set_id, path = path }
+      _append_note(path)
     end
     lines[#lines + 1] = ""
     end
   end
-  -- 越界访问留痕（read_all 下访问 cwd 之外用户工作目录；仅记录，非阻塞）。
-  if traces and #traces > 0 then
-    local head = "── 越界访问留痕（工作区外，仅记录）──"
-    lines[#lines + 1] = head
-    for _, tr in ipairs(traces) do
-      local path = _one_line(tr.path or "")
-      local tool = _one_line(tr.tool or "?")
-      local text = string.format("  [%s] %s", tool, path)
-      local ln = #lines + 1
-      lines[#lines + 1] = text
-      local start_col = 2 + #tool + 3
-      marks[#marks + 1] = { line = ln, start_col = start_col, end_col = start_col + #path, level = M.level_of(path) }
+  -- 已保存 / 已撤销（含原文件快照）：展示已发布到真实工作区的变更，`u` 撤销/重做保存
+  -- （把真实文件与保存时保留的原文件快照交换，可反复切换）。
+  if saved and #saved > 0 then
+    -- 标题按实际状态动态展示：撤销后条目仍在（供 u 重做），但不该再显示为「已保存」。
+    local has_applied, has_reverted = false, false
+    for _, item in ipairs(saved) do
+      if item.apply_state == "REVERTED" then has_reverted = true else has_applied = true end
     end
-    lines[#lines + 1] = ""
+    local title
+    if has_applied and has_reverted then
+      title = "已保存/已撤销（u 撤销/重做保存）"
+    elseif has_reverted then
+      title = "已撤销（u 撤销/重做保存）"
+    else
+      title = "已保存（已应用，u 撤销/重做保存）"
+    end
+    lines[#lines + 1] = "── " .. title .. "──"
+    for _, item in ipairs(saved) do
+      local reverted = item.apply_state == "REVERTED"
+      local label = reverted and "已撤销" or "已保存"
+      local files = item.saved_files
+      if not files or #files == 0 then
+        files = item.files or {}
+      end
+      if #files == 0 then
+        for _, p in ipairs(item.write_set or {}) do files[#files + 1] = { path = p } end
+      end
+      local base = _one_line(string.format("[%s] %s（%d 个文件）  ", item.change_set_id, item.tool or "?", #files))
+      local hln = #lines + 1
+      lines[#lines + 1] = base .. label
+      marks[#marks + 1] = { line = hln, start_col = #base, end_col = #base + #label,
+        level = reverted and "pending0" or "workspace" }
+      line_to_target[hln] = { change_set_id = item.change_set_id, saved = true, whole = true }
+      for _, f in ipairs(files) do
+        local path = _one_line(f.path or tostring(f))
+        local suffix = f.action and ("  [" .. _one_line(f.action) .. "]") or ""
+        local text = "  " .. path .. suffix
+        local ln = #lines + 1
+        lines[#lines + 1] = text
+        marks[#marks + 1] = { line = ln, start_col = 2, end_col = 2 + #path, level = M.level_of(path) }
+        line_to_target[ln] = { change_set_id = item.change_set_id, path = path, saved = true }
+      end
+      lines[#lines + 1] = ""
+    end
+  end
+  -- 越界访问留痕（read_all 下访问 cwd 之外用户工作目录；仅记录，非阻塞）。
+  -- 按文件路径合并（同一路径的多工具访问合并）、路径升序排序后展示。
+  if traces and #traces > 0 then
+    local grouped = require("NeoAI.sandbox.trace").group(traces)
+    if #grouped > 0 then
+      local head = "── 越界访问留痕（工作区外，仅记录）──"
+      lines[#lines + 1] = head
+      for _, tr in ipairs(grouped) do
+        local path = _one_line(tr.path or "")
+        local tool = _one_line(table.concat(tr.tools or { tr.tool or "?" }, ", "))
+        if tool == "" then tool = "?" end
+        local text = string.format("  [%s] %s", tool, path)
+        local ln = #lines + 1
+        lines[#lines + 1] = text
+        local start_col = 2 + #tool + 3
+        marks[#marks + 1] = { line = ln, start_col = start_col, end_col = start_col + #path, level = M.level_of(path) }
+        -- 该行不参与审批，仅登记留痕路径：`i` 查看详情（工具/类型/命令/时间）。
+        line_to_trace[ln] = path
+      end
+      lines[#lines + 1] = ""
+    end
   end
   -- 防御：任何元素都必须是单行字符串，否则 nvim_buf_set_lines 会报 E5108。
   for i = 1, #lines do
     if type(lines[i]) ~= "string" then lines[i] = _one_line(lines[i]) end
     if lines[i]:find("[\r\n]") then lines[i] = _one_line(lines[i]) end
   end
-  return { lines = lines, marks = marks, line_to_target = line_to_target }
+  return { lines = lines, marks = marks, line_to_target = line_to_target, line_to_trace = line_to_trace }
 end
 
 -- 前向声明（定义见下方 diff 预览区）
@@ -249,15 +410,116 @@ local _open_l3_confirm
 
 --- 执行一次文件级应用（不刷新界面）
 --- @param target table { change_set_id, path, host_op? }
+--- @param opts table|nil { allow_root?, prefer_sudo? }
 --- @return table|nil sandbox.apply 结果
-local function _do_apply(target)
+local function _do_apply(target, opts)
   local sandbox = services.use("services.sandbox")
   if not sandbox then return nil end
+  opts = opts or {}
+  local req = {
+    auto_approve = true,
+    allow_root = opts.allow_root == true,
+    prefer_sudo = opts.prefer_sudo == true,
+  }
   -- 主机操作 / 整单元（头行）：应用全部文件；文件行：仅应用该文件。
   if target.host_op or target.whole then
-    return sandbox.apply(target.change_set_id, { auto_approve = true })
+    return sandbox.apply(target.change_set_id, req)
   end
-  return sandbox.apply(target.change_set_id, { auto_approve = true, files = { target.path } })
+  req.files = { target.path }
+  return sandbox.apply(target.change_set_id, req)
+end
+
+-- ========== root 提权确认弹窗 ==========
+
+local root_prompt = { win = nil, buf = nil }
+
+local function _close_root_prompt()
+  if root_prompt.win and vim.api.nvim_win_is_valid(root_prompt.win) then
+    pcall(vim.api.nvim_win_close, root_prompt.win, true)
+  end
+  root_prompt.win, root_prompt.buf = nil, nil
+end
+
+--- 需要 root 时弹窗确认；确认后以 allow_root（非 root 进程经 sudo）重试。
+--- @param res table 操作结果（state=NEEDS_ROOT）
+--- @param target table
+--- @param retry function(result) 重试结果回调
+--- @param retry_op function|nil function(prefer_sudo):result 实际提权重试操作；缺省为应用当前条目
+local function _show_root_prompt(res, target, retry, retry_op)
+  _close_root_prompt()
+  local prefer_sudo = vim.uv.getuid() ~= 0
+  retry_op = retry_op or function(ps)
+    return _do_apply(target, { allow_root = true, prefer_sudo = ps })
+  end
+  local lines = {
+    "该变更需要写入 root 拥有的路径，当前权限不足：",
+    "  " .. _one_line(res.reason or target.path or target.change_set_id or ""),
+    "",
+    prefer_sudo and "确认后将调用 sudo 写入真实系统（可能要求输入密码）。"
+      or "确认后将以 root 写入真实系统。",
+    "",
+    "[<CR>] 确认提权    [<Esc>/q] 取消",
+  }
+  local buf = vim.api.nvim_create_buf(false, true)
+  vim.bo[buf].filetype = "neoai_root_prompt"
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+  vim.bo[buf].modifiable = false
+  local width = math.min(72, vim.o.columns - 10)
+  local height = #lines + 2
+  local win = vim.api.nvim_open_win(buf, true, {
+    relative = "editor",
+    width = width,
+    height = height,
+    col = math.floor((vim.o.columns - width) / 2),
+    row = math.floor((vim.o.lines - height) / 2),
+    style = "minimal",
+    border = "rounded",
+    title = "⚠ 需要 root 权限",
+    title_pos = "center",
+  })
+  root_prompt.win, root_prompt.buf = win, buf
+  vim.wo[win].wrap = true
+  pcall(vim.cmd, "stopinsert")
+  local function close_then(fn)
+    _close_root_prompt()
+    if fn then fn() end
+  end
+  local function confirm()
+    close_then(function()
+      retry(retry_op(prefer_sudo))
+    end)
+  end
+  local function cancel()
+    close_then(function() retry({ ok = false, state = "CANCELLED", reason = "用户取消" }) end)
+  end
+  for _, mode in ipairs({ "n", "i" }) do
+    vim.keymap.set(mode, "<CR>", confirm, { buffer = buf })
+    vim.keymap.set(mode, "<Esc>", cancel, { buffer = buf })
+    vim.keymap.set(mode, "q", cancel, { buffer = buf })
+  end
+end
+
+--- 应用并汇报：NEEDS_ROOT 时弹窗确认后用 root/sudo 重试。
+--- @param target table
+--- @param ok_msg function(result):string
+--- @param fail_msg function(result):string
+local function _apply_target(target, ok_msg, fail_msg)
+  local function report(res)
+    if res and res.ok then
+      vim.notify(ok_msg(res), vim.log.levels.INFO)
+    elseif res and res.state == "CANCELLED" then
+      vim.notify("[NeoAI] 已取消（需要 root 权限）", vim.log.levels.WARN)
+    else
+      vim.notify(fail_msg(res), vim.log.levels.ERROR)
+    end
+    M.refresh()
+  end
+  local res = _do_apply(target)
+  if res and not res.ok and res.state == "NEEDS_ROOT" then
+    _show_root_prompt(res, target, report)
+  else
+    report(res)
+  end
 end
 
 --- L3 二次确认门禁是否开启
@@ -276,18 +538,17 @@ local function _apply_current()
     vim.notify("[NeoAI] 请将光标移到要应用的条目行", vim.log.levels.WARN)
     return
   end
+  if target.saved then
+    vim.notify("[NeoAI] 该条目已保存，请用 u 撤销/重做保存", vim.log.levels.WARN)
+    return
+  end
   local sandbox = services.use("services.sandbox")
   if not sandbox then return end
-  -- 主机操作提案：整条审批后在主机 replay
+  -- 主机操作提案：整条审批后在主机 replay（需 root 时弹窗经 sudo）
   if target.host_op then
-    local res = _do_apply(target)
-    if res and res.ok then
-      vim.notify(("[NeoAI] 已执行主机操作 %s"):format(target.change_set_id), vim.log.levels.WARN)
-    else
-      vim.notify(("[NeoAI] 主机操作失败(%s): %s"):format(tostring(res and res.state), tostring(res and res.reason)),
-        vim.log.levels.ERROR)
-    end
-    M.refresh()
+    _apply_target(target,
+      function() return ("[NeoAI] 已执行主机操作 %s"):format(target.change_set_id) end,
+      function(res) return ("[NeoAI] 主机操作失败(%s): %s"):format(tostring(res and res.state), tostring(res and res.reason)) end)
     return
   end
   -- 整单元（头行）：一次应用该变更单元的全部文件（包安装按安装命令合并，整包一次审批）。
@@ -297,15 +558,9 @@ local function _apply_current()
       _open_l3_confirm(target, item)
       return
     end
-    local res = _do_apply(target)
-    if res and res.ok then
-      vim.notify(("[NeoAI] 已应用 %s（整包 %d 个文件）"):format(target.change_set_id, #(item and item.files or {})),
-        vim.log.levels.INFO)
-    else
-      vim.notify(("[NeoAI] 应用失败(%s): %s"):format(tostring(res and res.state), tostring(res and res.reason)),
-        vim.log.levels.ERROR)
-    end
-    M.refresh()
+    _apply_target(target,
+      function() return ("[NeoAI] 已应用 %s（整包 %d 个文件）"):format(target.change_set_id, #(item and item.files or {})) end,
+      function(res) return ("[NeoAI] 应用失败(%s): %s"):format(tostring(res and res.state), tostring(res and res.reason)) end)
     return
   end
   if not target.path then
@@ -317,14 +572,9 @@ local function _apply_current()
     _open_l3_confirm(target, item)
     return
   end
-  local res = _do_apply(target)
-  if res and res.ok then
-    vim.notify(("[NeoAI] 已应用 %s %s"):format(target.change_set_id, target.path), vim.log.levels.INFO)
-  else
-    vim.notify(("[NeoAI] 应用失败(%s): %s"):format(tostring(res and res.state), tostring(res and res.reason)),
-      vim.log.levels.ERROR)
-  end
-  M.refresh()
+  _apply_target(target,
+    function() return ("[NeoAI] 已应用 %s %s"):format(target.change_set_id, target.path) end,
+    function(res) return ("[NeoAI] 应用失败(%s): %s"):format(tostring(res and res.state), tostring(res and res.reason)) end)
 end
 
 --- 拒绝光标所在文件（其余文件保留待审）
@@ -332,6 +582,10 @@ local function _reject_current()
   local target = state.line_to_target[vim.api.nvim_win_get_cursor(0)[1]]
   if not target then
     vim.notify("[NeoAI] 请将光标移到要拒绝的条目行", vim.log.levels.WARN)
+    return
+  end
+  if target.saved then
+    vim.notify("[NeoAI] 该条目已保存，请用 u 撤销/重做保存", vim.log.levels.WARN)
     return
   end
   local sandbox = services.use("services.sandbox")
@@ -361,6 +615,90 @@ local function _reject_current()
   M.refresh()
 end
 
+--- 撤销/重做保存光标所在条目：把真实文件与保存时保留的原文件快照交换。
+--- 已保存 → 撤销（回滚到保存前）；已撤销 → 重新保存。冲突（真实文件被外部改动）时拒绝。
+local function _undo_current()
+  local target = state.line_to_target[vim.api.nvim_win_get_cursor(0)[1]]
+  if not target or not target.saved then
+    vim.notify("[NeoAI] 请将光标移到「已保存/已撤销」条目行", vim.log.levels.WARN)
+    return
+  end
+  local sandbox = services.use("services.sandbox")
+  if not sandbox or not sandbox.undo then return end
+  local function report(res)
+    if res and res.ok then
+      local label = res.state == "REVERTED" and "已撤销保存" or "已重新保存"
+      vim.notify(("[NeoAI] %s %s"):format(label, target.change_set_id), vim.log.levels.INFO)
+    elseif res and res.state == "NEEDS_ROOT" then
+      vim.notify("[NeoAI] 撤销保存需要 root 权限：" .. tostring(res.reason), vim.log.levels.WARN)
+    else
+      vim.notify(("[NeoAI] 撤销/重做失败(%s): %s"):format(tostring(res and res.state), tostring(res and res.reason)),
+        vim.log.levels.ERROR)
+    end
+    M.refresh()
+  end
+  local res = sandbox.undo(target.change_set_id)
+  if res and not res.ok and res.state == "NEEDS_ROOT" then
+    -- 复用 root 提权确认：确认后以 allow_root 重试撤销。
+    _show_root_prompt(res, target, report, function(prefer_sudo)
+      return sandbox.undo(target.change_set_id, { allow_root = true, prefer_sudo = prefer_sudo })
+    end)
+  else
+    report(res)
+  end
+end
+
+-- ========== AI 审计 ==========
+
+--- 待审集合签名：用于判断已完成的审计是否仍适用（集合变化则需重新审计）。
+--- @param items table|nil
+--- @return string
+local function _pending_sig(items)
+  local ids = {}
+  for _, it in ipairs(items or {}) do ids[#ids + 1] = tostring(it.change_set_id or "?") end
+  table.sort(ids)
+  return table.concat(ids, ",")
+end
+
+--- 发起 AI 审计：把原会话的用户消息与分级的待审变更/修改内容的结构化文本交给模型，
+--- 逐条判断是否允许应用；结论直接显示在审批悬浮窗顶部（不进入聊天界面）。
+--- @param opts table|nil { silent?: boolean } 自动触发时不弹「无待审」提示
+local function _ai_audit(opts)
+  opts = opts or {}
+  local sandbox = services.use("services.sandbox")
+  if not sandbox then return end
+  local items = sandbox.list_reviews({ review_state = "PENDING" })
+  if #items == 0 then
+    if not opts.silent then
+      vim.notify("[NeoAI] 无待审修改，无法发起 AI 审计", vim.log.levels.INFO)
+    end
+    return
+  end
+  local ai_audit = require("NeoAI.sandbox.ai_audit")
+  local chat = services.use("services.chat_service")
+  local source_agent = chat and chat.get_current_agent() or nil
+  local user_msgs = ai_audit.user_messages(source_agent)
+  local agent_config = source_agent and source_agent.config or nil
+
+  state.audit_seq = state.audit_seq + 1
+  local seq = state.audit_seq
+  state.audit = { pending = true }
+  state.audit_sig = _pending_sig(items)
+  M.refresh()
+  ai_audit.generate(items, user_msgs, { agent_config = agent_config }, function(result, err)
+    if seq ~= state.audit_seq then return end
+    if err then
+      state.audit = { error = err }
+    else
+      state.audit = {
+        notes = (result and result.notes) or {},
+        fallback = result and result.fallback or nil,
+      }
+    end
+    M.refresh()
+  end)
+end
+
 -- ========== 修改预览（diff） ==========
 
 --- 读取文件内容（不存在返回 ""）
@@ -380,7 +718,7 @@ end
 _find_item = function(change_set_id)
   local sandbox = services.use("services.sandbox")
   if not sandbox then return nil end
-  for _, it in ipairs(sandbox.list_reviews({ review_state = "PENDING" })) do
+  for _, it in ipairs(sandbox.list_reviews()) do
     if it.change_set_id == change_set_id then return it end
   end
   return nil
@@ -622,11 +960,88 @@ local function _open_diff(target, item, opts)
   }
 end
 
+--- 打开一个只读浮窗展示详情行（暂时关闭审批窗，关闭后自动返回）。
+--- 复用 `state.diff` 的关闭/重开机制（mode="detail"）。
+--- @param title string 浮窗标题
+--- @param lines table 内容行
+local function _open_detail_float(title, lines)
+  state.suspended = true
+  M.close()
+  local width = math.min(120, vim.o.columns - 8)
+  local buf = vim.api.nvim_create_buf(false, true)
+  vim.bo[buf].filetype = "neoai_sandbox_detail"
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+  vim.bo[buf].modifiable = false
+  local ns = vim.api.nvim_create_namespace("NeoAISandboxDetail")
+  local height = math.min(30, vim.o.lines - 6)
+  local win = vim.api.nvim_open_win(buf, true, {
+    relative = "editor",
+    width = width,
+    height = height,
+    col = math.floor((vim.o.columns - width) / 2),
+    row = math.floor((vim.o.lines - height) / 2),
+    style = "minimal",
+    border = "rounded",
+    title = title,
+    title_pos = "center",
+  })
+  vim.wo[win].wrap = true
+  vim.wo[win].linebreak = true
+  vim.keymap.set("n", "q", function() _close_diff() end, { buffer = buf })
+  vim.keymap.set("n", "<Esc>", function() _close_diff() end, { buffer = buf })
+  vim.api.nvim_create_autocmd("BufWipeout", {
+    buffer = buf, once = true, callback = function() _close_diff() end,
+  })
+  state.diff = { win = win, buf = buf, ns = ns, mode = "detail", width = width }
+end
+
+--- 查看某条越界留痕的详情：列出每次访问的工具 / 类型 / 命令 / 时间。
+--- @param path string
+local function _open_trace_detail(path)
+  local sandbox = services.use("services.sandbox")
+  local entries = {}
+  if sandbox and sandbox.list_traces then
+    for _, tr in ipairs(sandbox.list_traces() or {}) do
+      if tostring(tr.path or "") == path then entries[#entries + 1] = tr end
+    end
+  end
+  if #entries == 0 then
+    vim.notify("[NeoAI] 越界留痕已不存在: " .. tostring(path), vim.log.levels.WARN)
+    return
+  end
+  local lines = { "越界访问详情（工作区外，仅记录）", "q/Esc 返回审批", "" }
+  lines[#lines + 1] = "路径: " .. _one_line(path)
+  lines[#lines + 1] = ""
+  for i, tr in ipairs(entries) do
+    lines[#lines + 1] = string.format("#%d  工具: %s  类型: %s", i,
+      _one_line(tr.tool or "?"), _one_line(tr.kind or "read"))
+    if type(tr.command) == "string" and tr.command ~= "" then
+      lines[#lines + 1] = "    命令: " .. _one_line(tr.command)
+    end
+    if tr.created_at then
+      lines[#lines + 1] = "    时间: " .. os.date("%Y-%m-%d %H:%M:%S", tonumber(tr.created_at) or os.time())
+    end
+    lines[#lines + 1] = ""
+  end
+  _open_detail_float("🔎 越界访问详情", lines)
+end
+
 --- 打开一个临时 buffer 预览光标所在条目的修改 diff（暂时关闭审批窗，关闭后自动返回）
 local function _open_diff_current()
-  local target = state.line_to_target[vim.api.nvim_win_get_cursor(0)[1]]
+  local line = vim.api.nvim_win_get_cursor(0)[1]
+  -- 越界留痕行：`i` 查看详情（非审批目标，无 diff）。
+  local trace_path = state.line_to_trace[line]
+  if trace_path then
+    _open_trace_detail(trace_path)
+    return
+  end
+  local target = state.line_to_target[line]
   if not target then
     vim.notify("[NeoAI] 请将光标移到要预览的条目行", vim.log.levels.WARN)
+    return
+  end
+  if target.saved then
+    vim.notify("[NeoAI] 已保存条目暂不支持 diff 预览", vim.log.levels.WARN)
     return
   end
   local item = _find_item(target.change_set_id)
@@ -651,13 +1066,23 @@ local function _confirm_l3()
   if not p then return end
   state.pending_l3 = nil
   local res = _do_apply(p)
-  if res and res.ok then
-    vim.notify(("[NeoAI] 已应用 %s %s"):format(p.change_set_id, p.path or ""), vim.log.levels.INFO)
-  else
-    vim.notify(("[NeoAI] 应用失败(%s): %s"):format(tostring(res and res.state), tostring(res and res.reason)),
-      vim.log.levels.ERROR)
-  end
   _close_diff()
+  local function report(res2)
+    if res2 and res2.ok then
+      vim.notify(("[NeoAI] 已应用 %s %s"):format(p.change_set_id, p.path or ""), vim.log.levels.INFO)
+    elseif res2 and res2.state == "CANCELLED" then
+      vim.notify("[NeoAI] 已取消（需要 root 权限）", vim.log.levels.WARN)
+    else
+      vim.notify(("[NeoAI] 应用失败(%s): %s"):format(tostring(res2 and res2.state), tostring(res2 and res2.reason)),
+        vim.log.levels.ERROR)
+    end
+    M.refresh()
+  end
+  if res and not res.ok and res.state == "NEEDS_ROOT" then
+    _show_root_prompt(res, p, report)
+  else
+    report(res)
+  end
 end
 
 --- 打开 L3 二次确认 diff 并异步生成 AI 后果警告
@@ -695,7 +1120,9 @@ function M.open()
     return
   end
   local traces = (sandbox.list_traces and sandbox.list_traces()) or {}
-  if #sandbox.list_reviews({ review_state = "PENDING" }) == 0 and #traces == 0 then
+  local pending = sandbox.list_reviews({ review_state = "PENDING" })
+  local saved = (sandbox.list_saved and sandbox.list_saved()) or {}
+  if #pending == 0 and #traces == 0 and #saved == 0 then
     vim.notify("[NeoAI] 无待审修改", vim.log.levels.INFO)
     return
   end
@@ -726,18 +1153,34 @@ function M.open()
     row = row,
     style = "minimal",
     border = "rounded",
-    title = "🗂 沙箱待审审批",
+    title = "🗂 沙箱待审/已保存",
     title_pos = "center",
   })
+  -- 自动换行：AI 审计结论 / diff 等长文本按窗口宽度折行显示（CJK 按字断行）。
+  vim.wo[state.win_id].wrap = true
+  vim.wo[state.win_id].linebreak = true
 
   vim.keymap.set("n", "q", function() M.close() end, { buffer = state.buf })
   vim.keymap.set("n", "<Esc>", function() M.close() end, { buffer = state.buf })
   vim.keymap.set("n", "<CR>", _apply_current, { buffer = state.buf })
   vim.keymap.set("n", "d", _reject_current, { buffer = state.buf })
   vim.keymap.set("n", "i", _open_diff_current, { buffer = state.buf })
+  vim.keymap.set("n", "u", _undo_current, { buffer = state.buf, desc = "NeoAI 撤销/重做保存" })
   vim.keymap.set("n", "r", function() M.refresh() end, { buffer = state.buf })
+  -- AI 审计（可配置按键；默认 a）
+  local ai_cfg = require("NeoAI.kernel.config_store").get("tools.sandbox.review.ai_audit") or {}
+  if ai_cfg.enabled ~= false then
+    vim.keymap.set("n", ai_cfg.key or "a", function() _ai_audit() end,
+      { buffer = state.buf, desc = "NeoAI AI 审计待审变更" })
+  end
 
   M.refresh()
+  -- 自动 AI 审计（tools.sandbox.review.ai_audit.auto，默认关闭）：集合变化时自动重审。
+  if ai_cfg.enabled ~= false and ai_cfg.auto == true then
+    if state.audit_sig ~= _pending_sig(pending) then
+      _ai_audit({ silent = true })
+    end
+  end
 end
 
 --- 重新拉取待审列表并重绘（无待审时自动关闭）
@@ -756,10 +1199,17 @@ function M.refresh()
   end
   local items = sandbox.list_reviews({ review_state = "PENDING" })
   local traces = (sandbox.list_traces and sandbox.list_traces()) or {}
-  if #items == 0 and #traces == 0 then
+  local saved = (sandbox.list_saved and sandbox.list_saved()) or {}
+  if #items == 0 and #traces == 0 and #saved == 0 then
     vim.notify("[NeoAI] 无待审修改", vim.log.levels.INFO)
     M.close()
     return
+  end
+  -- 待审集合变化：作废已完成的审计（避免展示过期结论；自动模式下 open 会重审）。
+  local sig = _pending_sig(items)
+  if state.audit and not state.audit.pending and state.audit_sig and state.audit_sig ~= sig then
+    state.audit = nil
+    state.audit_sig = nil
   end
   -- 审批按安全级别分级：高风险优先展示。
   table.sort(items, function(a, b)
@@ -767,9 +1217,10 @@ function M.refresh()
     if la ~= lb then return la > lb end
     return (a.created_at or 0) < (b.created_at or 0)
   end)
-  local data = M.build_lines(items, traces)
+  local data = M.build_lines(items, traces, state.audit, saved)
   vim.api.nvim_buf_set_lines(state.buf, 0, -1, false, data.lines)
   state.line_to_target = data.line_to_target
+  state.line_to_trace = data.line_to_trace or {}
   vim.api.nvim_buf_clear_namespace(state.buf, state.ns, 0, -1)
   for _, m in ipairs(data.marks) do
     vim.api.nvim_buf_add_highlight(state.buf, state.ns, LEVEL_HL[m.level], m.line - 1, m.start_col, m.end_col)
@@ -814,6 +1265,9 @@ function M.close()
   state.buf = nil
   state.ns = nil
   state.line_to_target = {}
+  state.line_to_trace = {}
+  -- 作废在途 AI 审计结果；保留已完成结论（diff 预览返回/重开时复用，集合变化时由 refresh 清除）。
+  state.audit_seq = state.audit_seq + 1
 end
 
 --- 获取当前 buffer（测试用）
@@ -834,6 +1288,12 @@ function M.get_diff_buf()
   return state.diff and state.diff.buf or nil
 end
 
+--- 获取 root 提权确认弹窗 buffer（测试用）
+--- @return number|nil
+function M.get_root_prompt_buf()
+  return root_prompt.buf
+end
+
 --- 预览光标所在条目的修改 diff（公开，供键位/测试调用）
 function M.preview_current()
   _open_diff_current()
@@ -847,6 +1307,10 @@ end
 --- 重置（测试用）
 function M.reset()
   state.suspended = false
+  state.audit = nil
+  state.audit_sig = nil
+  state.audit_seq = state.audit_seq + 1
+  _close_root_prompt()
   _close_diff()
   M.close()
 end

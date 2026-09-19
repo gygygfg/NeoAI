@@ -9,8 +9,10 @@
 ---   4. **原始密钥**（映射表中已知的真实值）出现在工具参数或 AI 可见上下文时上报硬拦截，
 ---      由执行器 / 请求前守卫终止 Agent；token（KEY 环境变量操作）只提级审批，不终止。
 ---
---- 边界：熵检测是启发式的，存在误报（长哈希/随机串会被当作密钥，但会原样往返，不破坏内容）；
---- 映射表仅在内存，热重载后 token 无法还原 → commit 明确拒绝（fail-closed），不写入 token。
+--- 边界：熵检测是启发式的，默认按上下文收窄（`entropy_requires_context`）——裸熵串须呈密钥
+--- 形态（含 `-`/`_` 且非 snake_case 代码标识符）或处于敏感变量名赋值上下文，纯字母数字/base64
+--- 元数据（SRI integrity、内容哈希、构建产物摘要等）与回溯函数名不再 token 化；映射表仅在内存，
+--- 热重载后 token 无法还原 → commit 明确拒绝（fail-closed），不写入 token。
 
 local M = {}
 
@@ -18,8 +20,9 @@ local M = {}
 
 local TOKEN_PREFIX = "NEOKEY_"
 local TOKEN_PAT = "NEOKEY_%x+"
--- 环境变量信号：沙箱进程内该变量列出被 token 化的变量名（逗号分隔），
--- 使工具/Agent 能区分「真实密钥」与「沙箱 token」，避免把 token 当真实凭据误判（如 401）。
+-- 环境变量信号：列出「在 AI 可见输出中被 token 化」的变量名（逗号分隔）。
+-- 沙箱进程环境本身经 `runtime.sandbox_env` 还原为真实密钥（token→真实仅限沙箱内部进程），
+-- 但命令输出回传模型前会重新 token 化，故该信号帮助 Agent 判断哪些值在输出中是 token。
 local ENV_MARKER = "NEOAI_TOKENIZED_ENV"
 -- 候选密钥允许的字符集：字母/数字/下划线/连字符/加号（不含 `/`、`.`、`=`，
 -- 避免把路径/域名/赋值前缀并入候选；base64 末尾的 `=` 会留在 token 之外，往返无损）
@@ -28,22 +31,24 @@ local RUN_PAT = "[%w_%-%+]+"
 -- 具名敏感信息规则（Lua pattern）：命中即视为敏感信息，无视熵阈值一律 token 化/脱敏。
 -- 覆盖「高熵熵检测」盲区（结构化凭据、带前缀的 token、私钥块等），实现敏感信息全部脱敏。
 -- 每条 `{ name, pattern }`；pattern 命中整段（含捕获）作为敏感值处理。
+-- prefix：匹配必然包含的字面量子串，用于 gsub 前的 plain find 快速短路——
+-- 大文件（暂存视图）通常不含任何凭据前缀，可省去每条规则一次全文扫描。
 local DEFAULT_RULES = {
-  { name = "private_key", pattern = "%-%-%-%-%-BEGIN[%w ]*PRIVATE KEY%-%-%-%-%-[%s%S]-%-%-%-%-%-END[%w ]*PRIVATE KEY%-%-%-%-%-" },
-  { name = "aws_access_key", pattern = "AKIA[0-9A-Z]+" },
-  { name = "github_token", pattern = "gh[pousr]_[A-Za-z0-9]+" },
-  { name = "slack_token", pattern = "xox[baprs]%-[A-Za-z0-9%-]+" },
-  { name = "google_api_key", pattern = "AIza[0-9A-Za-z_%-]+" },
-  { name = "stripe_key", pattern = "s?[rp]k_(live|test)_[A-Za-z0-9]+" },
-  { name = "openai_key", pattern = "sk%-[A-Za-z0-9_%-]+" },
-  { name = "jwt", pattern = "eyJ[%w_%-]+%.eyJ[%w_%-]+%.[%w_%-]+" },
+  { name = "private_key", prefix = "-----BEGIN", pattern = "%-%-%-%-%-BEGIN[%w ]*PRIVATE KEY%-%-%-%-%-[%s%S]-%-%-%-%-%-END[%w ]*PRIVATE KEY%-%-%-%-%-" },
+  { name = "aws_access_key", prefix = "AKIA", pattern = "AKIA[0-9A-Z]+" },
+  { name = "github_token", prefix = "gh", pattern = "gh[pousr]_[A-Za-z0-9]+" },
+  { name = "slack_token", prefix = "xox", pattern = "xox[baprs]%-[A-Za-z0-9%-]+" },
+  { name = "google_api_key", prefix = "AIza", pattern = "AIza[0-9A-Za-z_%-]+" },
+  { name = "stripe_key", prefix = "k_", pattern = "s?[rp]k_(live|test)_[A-Za-z0-9]+" },
+  { name = "openai_key", prefix = "sk-", pattern = "sk%-[A-Za-z0-9_%-]+" },
+  { name = "jwt", prefix = "eyJ", pattern = "eyJ[%w_%-]+%.eyJ[%w_%-]+%.[%w_%-]+" },
   -- Bearer/Basic 后接普通英文单词（注释/文档，如 "Bearer token"）不应视为凭据：
   -- 要求凭证部分足够长且像 token（含数字或 base64/连接符）。
-  { name = "bearer", pattern = "[Bb]earer%s+[%w%._%-]+", validate = function(m)
+  { name = "bearer", prefix = "earer", validate_kind = "bearer", pattern = "[Bb]earer%s+[%w%._%-]+", validate = function(m)
     local v = m:match("^[Bb]earer%s+(.+)$")
     return v ~= nil and #v >= 16 and (v:match("%d") ~= nil or v:find("[%+/=._%-]") ~= nil)
   end },
-  { name = "basic_auth", pattern = "[Bb]asic%s+[A-Za-z0-9+/=]+", validate = function(m)
+  { name = "basic_auth", prefix = "asic", validate_kind = "basic", pattern = "[Bb]asic%s+[A-Za-z0-9+/=]+", validate = function(m)
     local v = m:match("^[Bb]asic%s+(.+)$")
     return v ~= nil and #v >= 16 and (v:match("%d") ~= nil or v:find("[%+/=]") ~= nil)
   end },
@@ -58,6 +63,12 @@ local DEFAULTS = {
   -- 排除纯小写十六进制串（git SHA / sha256 / md5 等哈希与校验和），避免把常见
   -- 标识符当密钥导致 token 化后不可用；代价是纯小写 hex 形式的密钥不被覆盖。
   exclude_pure_hex = true,
+  -- 缩小认定范围：裸熵串须呈密钥形态（含 - / _ 分隔符）且不是代码标识符（snake_case 符号，
+  -- 如 `create_urllib3_context`），或处于敏感变量名赋值上下文（KEY=/TOKEN:/PASSWORD= 等），
+  -- 才视为密钥；纯字母数字/base64 串（SRI integrity、内容哈希、构建产物摘要等元数据）不再
+  -- token 化，避免误伤 package-lock.json、`python -m build` 及工具输出中的回溯函数名。
+  -- 设为 false 退回旧的「任意高熵串即密钥」行为。
+  entropy_requires_context = true,
   -- 是否对沙箱进程环境变量做 token 化。关闭后环境变量原样注入（调试/本地可信运行时），
   -- 工具结果与暂存内容仍按密钥防护处理。
   tokenize_env = true,
@@ -68,6 +79,225 @@ local DEFAULTS = {
   -- 额外排除的正则（Lua pattern），命中则不视为密钥
   allowlist = {},
 }
+
+-- ========== 扫描核心（主线程与工作线程共用） ==========
+-- 该核心是纯 Lua（不引用 vim / 模块状态），以源码字符串形式提供：主线程 `load` 后直接调用；
+-- 工作线程（utils.work，独立 Lua state）同样 `load` 该源码，从而把「规则匹配 + 变量名 +
+-- 熵检测」的全文扫描移出主线程。token 生成/映射/事件由调用方通过 `token_for` 回调注入：
+--   主线程 -> `_token_for`（写映射、发事件）
+--   工作线程 -> 本地 map 生成 token（纯 Lua sha256），主线程事后合并
+
+local SCAN_SRC = [==[
+local TOKEN_PREFIX = "NEOKEY_"
+local RUN_PAT = "[%w_%-%+]+"
+local NAME_VALUE_CHARS = "[%w%._%+%=/:-]+"
+local SECRET_NAME_SEGMENTS = {
+  "KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL", "CREDENTIALS",
+}
+
+local function entropy(s)
+  if s == "" then return 0 end
+  local freq = {}
+  local n = #s
+  for i = 1, n do
+    local ch = s:sub(i, i)
+    freq[ch] = (freq[ch] or 0) + 1
+  end
+  local e = 0
+  for _, c in pairs(freq) do
+    local p = c / n
+    e = e - p * (math.log(p) / math.log(2))
+  end
+  return e
+end
+
+--- 代码标识符/包名形态：以 - / _ 分段且每段都是「字母 + 可选尾随数字」或纯数字
+--- （如 `create_urllib3_context`、`DEFAULT_CIPHERS_LIST`、`openjdk-21-jdk-headless`、
+--- `libssl-dev`、`python3.11-minimal`）。这类串是源码符号 / 软件包名 / 版本串，不是凭据；
+--- 裸熵检测须排除，避免把回溯函数名与 `dpkg -l` 输出的包名误 token 化。
+local function looks_like_identifier(run)
+  local segs = 0
+  for seg in run:gmatch("[^%-_]+") do
+    if not (seg:match("^%a+%d*$") or seg:match("^%d+$")) then return false end
+    segs = segs + 1
+  end
+  return segs >= 2
+end
+
+local function is_candidate(run, cfg, context)
+  if run:sub(1, #TOKEN_PREFIX) == TOKEN_PREFIX then return false end
+  if #run < cfg.min_length or #run > cfg.max_length then return false end
+  if not (run:find("%a") and run:find("%d")) then return false end
+  if cfg.exclude_pure_hex ~= false and run:match("^[0-9a-f]+$") then return false end
+  -- 内容摘要/完整性校验（sha512-/sha256-/md5-/blake2-/blake3-<base64|hex>）不是凭据：
+  -- 其 base64/hex 主体属元数据，token 化会破坏 package-lock.json 等。即便含 `-` 也排除。
+  if run:match("^sha%d+%-") or run:match("^md5%-") or run:match("^blake[0-9a-z]*%-") then
+    return false
+  end
+  -- 缩小认定范围：裸熵串须呈「密钥形态」（含 - / _ 分隔符），或处于敏感变量名赋值
+  -- 上下文（context，如 KEY=/TOKEN:/PASSWORD=）。纯字母数字/base64 串（SRI integrity、
+  -- 内容哈希、构建产物摘要等元数据）不视为密钥，避免误伤 lockfile / 构建工具。
+  if cfg.entropy_requires_context ~= false and not context then
+    if not run:find("[%-_]") then return false end
+    -- 裸熵串还须不是代码标识符（snake_case 符号），否则会把函数名/常量名当密钥。
+    if looks_like_identifier(run) then return false end
+  end
+  local distinct = {}
+  local nd = 0
+  for i = 1, #run do
+    local ch = run:sub(i, i)
+    if not distinct[ch] then distinct[ch] = true; nd = nd + 1 end
+  end
+  if nd < cfg.min_distinct then return false end
+  for _, pat in ipairs(cfg.allowlist or {}) do
+    if type(pat) == "string" and run:match(pat) then return false end
+  end
+  return entropy(run) >= cfg.min_entropy
+end
+
+local function secret_name(name)
+  if type(name) ~= "string" or name == "" then return false end
+  local n = name:upper()
+  if n:find("APIKEY", 1, true) then return true end
+  for seg in n:gmatch("[A-Z0-9]+") do
+    for _, w in ipairs(SECRET_NAME_SEGMENTS) do
+      if seg == w then return true end
+    end
+  end
+  return false
+end
+
+--- 前缀是否以「敏感变量名 + 赋值分隔符」结尾，用于裸熵串的上下文认定。
+--- 支持 `NAME=` / `NAME:` / `"NAME": "` 等结尾形态（值与名之间允许引号/空白）。
+--- @param prefix string
+--- @return boolean
+local function secret_name_prefix(prefix)
+  if type(prefix) ~= "string" or prefix == "" then return false end
+  local name = prefix:match("([%a_][%w_]*)['\"]?%s*[=:]%s*['\"]?$")
+  return name ~= nil and secret_name(name)
+end
+
+local function looks_like_literal_secret(value)
+  if type(value) ~= "string" or #value < 8 then return false end
+  if value:match("^[0-9a-fA-F]+$") then return true end
+  if value:find("[%+/=:]") then return true end
+  if value:match("%d") and #value >= 12 then return true end
+  return false
+end
+
+--- 规则校验：主线程可用 validate 函数；工作线程无函数，用 validate_kind 复刻同义逻辑。
+local function validate(rule, m)
+  if type(rule.validate) == "function" then return rule.validate(m) end
+  local k = rule.validate_kind
+  if k == "bearer" then
+    local v = m:match("^[Bb]earer%s+(.+)$")
+    return v ~= nil and #v >= 16 and (v:match("%d") ~= nil or v:find("[%+/=._%-]") ~= nil)
+  elseif k == "basic" then
+    local v = m:match("^[Bb]asic%s+(.+)$")
+    return v ~= nil and #v >= 16 and (v:match("%d") ~= nil or v:find("[%+/=]") ~= nil)
+  end
+  return true
+end
+
+local function apply_rules(text, cfg, token_for)
+  for _, rule in ipairs(cfg.rules or {}) do
+    local present = true
+    if type(rule.prefix) == "string" and rule.prefix ~= "" then
+      present = text:find(rule.prefix, 1, true) ~= nil
+    end
+    if type(rule.pattern) == "string" and present then
+      local ok, out = pcall(function()
+        return (text:gsub(rule.pattern, function(m)
+          if not validate(rule, m) then return m end
+          return token_for(m, rule.name)
+        end))
+      end)
+      if ok and type(out) == "string" then text = out end
+    end
+  end
+  return text
+end
+
+local function apply_secret_names(text, token_for)
+  if not (text:find("=", 1, true) or text:find(":", 1, true)) then return text end
+  local function make(name, value)
+    if type(name) ~= "string" or type(value) ~= "string" then return nil end
+    if value == "" or not secret_name(name) then return nil end
+    if value:sub(1, #TOKEN_PREFIX) == TOKEN_PREFIX then return nil end
+    return token_for(value, "env_name:" .. name)
+  end
+  text = text:gsub("([%a_][%w_]*)(%s*=%s*)(" .. NAME_VALUE_CHARS .. ")([%(]?)", function(name, sep, value, paren)
+    if paren == "(" then return nil end
+    if not looks_like_literal_secret(value) then return nil end
+    local token = make(name, value)
+    if not token then return nil end
+    return name .. sep .. token
+  end)
+  for _, q in ipairs({ '"', "'" }) do
+    text = text:gsub("([%a_][%w_]*)(%s*=%s*)" .. q .. "(.-)" .. q, function(name, sep, value)
+      local token = make(name, value)
+      if not token then return nil end
+      return name .. sep .. q .. token .. q
+    end)
+    text = text:gsub(q .. "([%a_][%w_]*)" .. q .. "(%s*:%s*)" .. q .. "(.-)" .. q, function(name, sep, value)
+      local token = make(name, value)
+      if not token then return nil end
+      return q .. name .. q .. sep .. q .. token .. q
+    end)
+  end
+  return text
+end
+
+--- run 是否紧邻路径分隔符（`/`）——即某个文件系统路径的分量。路径分量是 PATH/
+--- LD_LIBRARY_PATH/PYTHONPATH 等环境变量与日志中路径的组成部分，token 化会让程序找不到
+--- 库/模块（如 pip 报 `without an ssl module`），故不参与通用熵 token 化。
+--- @param text string
+--- @param s number 起点（1-based）
+--- @param e number 终点（1-based）
+--- @return boolean
+local function is_path_component(text, s, e)
+  local before = s > 1 and text:sub(s - 1, s - 1) or ""
+  local after = e < #text and text:sub(e + 1, e + 1) or ""
+  return before == "/" or after == "/" or before == "\\" or after == "\\"
+end
+
+--- 全文 token 化：具名规则 -> 变量名赋值 -> 残余高熵串。token_for(secret, rule_name) -> 替换文本。
+--- 残余扫描保留位置，跳过路径分量（见 `is_path_component`）。
+--- `opts.entropy == false` 时跳过残余高熵扫描（仅保留具名规则与敏感变量名赋值），
+--- 供「非密钥文件」路径避免对全文做昂贵的熵计算。
+--- @param text string
+--- @param cfg table
+--- @param token_for function
+--- @param opts table|nil { entropy?: boolean }
+--- @return string
+local function process(text, cfg, token_for, opts)
+  text = apply_rules(text, cfg, token_for)
+  text = apply_secret_names(text, token_for)
+  if opts and opts.entropy == false then return text end
+  local parts, pos = {}, 1
+  while true do
+    local s, e = text:find(RUN_PAT, pos)
+    if not s then
+      parts[#parts + 1] = text:sub(pos)
+      break
+    end
+    parts[#parts + 1] = text:sub(pos, s - 1)
+    local run = text:sub(s, e)
+    if not is_path_component(text, s, e) and is_candidate(run, cfg) then
+      parts[#parts + 1] = token_for(run, nil)
+    else
+      parts[#parts + 1] = run
+    end
+    pos = e + 1
+  end
+  return table.concat(parts)
+end
+
+return { process = process, apply_rules = apply_rules, is_candidate = is_candidate, entropy = entropy,
+  validate = validate, secret_name = secret_name, secret_name_prefix = secret_name_prefix }
+]==]
+
+local _scan = assert(load(SCAN_SRC))()
 
 -- ========== 私有状态 ==========
 
@@ -100,63 +330,22 @@ local function _cfg()
   return out
 end
 
---- 香农熵（bits/char）
---- @param s string
---- @return number
-local function _entropy(s)
-  if s == "" then return 0 end
-  local freq = {}
-  local n = #s
-  for i = 1, n do
-    local ch = s:sub(i, i)
-    freq[ch] = (freq[ch] or 0) + 1
-  end
-  local e = 0
-  for _, c in pairs(freq) do
-    local p = c / n
-    e = e - p * (math.log(p) / math.log(2))
-  end
-  return e
-end
-
---- 是否高熵密钥候选
---- @param run string
---- @param cfg table
---- @return boolean
-local function _is_candidate(run, cfg)
-  if run:sub(1, #TOKEN_PREFIX) == TOKEN_PREFIX then return false end
-  if #run < cfg.min_length or #run > cfg.max_length then return false end
-  -- 至少含字母与数字（降低对长英文标识符的误报）
-  if not (run:find("%a") and run:find("%d")) then return false end
-  -- 纯小写十六进制（哈希/校验和）排除
-  if cfg.exclude_pure_hex ~= false and run:match("^[0-9a-f]+$") then return false end
-  local distinct = {}
-  local nd = 0
-  for i = 1, #run do
-    local ch = run:sub(i, i)
-    if not distinct[ch] then distinct[ch] = true; nd = nd + 1 end
-  end
-  if nd < cfg.min_distinct then return false end
-  for _, pat in ipairs(cfg.allowlist or {}) do
-    if type(pat) == "string" and run:match(pat) then return false end
-  end
-  return _entropy(run) >= cfg.min_entropy
-end
-
---- 生成随机 token（每进程随机盐，跨密钥唯一）
---- @param secret string
---- @param rule_name string|nil 命中的具名规则（用于留痕）
+--- 确保每进程随机盐已就绪（token 派生用；跨密钥唯一）
 --- @return string
-local function _token_for(secret, rule_name)
-  local existing = state.by_secret[secret]
-  if existing then return existing end
-  state.seq = state.seq + 1
-  if not state.salt then
-    local seed = table.concat({ tostring(os.time()), tostring(vim.fn.getpid()), tostring(math.random(1, 2 ^ 30)) })
-    state.salt = tostring(vim.fn.sha256(seed))
-  end
-  local hex = tostring(vim.fn.sha256(state.salt .. "|" .. state.seq .. "|" .. secret))
-  local token = TOKEN_PREFIX .. hex:sub(1, 32)
+local function _ensure_salt()
+  if state.salt then return state.salt end
+  local seed = table.concat({ tostring(os.time()), tostring(vim.fn.getpid()), tostring(math.random(1, 2 ^ 30)) })
+  state.salt = tostring(vim.fn.sha256(seed))
+  return state.salt
+end
+
+--- 登记一个（已生成的）secret->token 映射并触发留痕/事件/审计。
+--- 供主线程 `_token_for` 与工作线程结果合并共用。
+--- @param secret string
+--- @param token string
+--- @param rule_name string|nil
+local function _register_token(secret, token, rule_name)
+  if state.by_secret[secret] then return end
   state.by_secret[secret] = token
   state.by_token[token] = secret
   state.traces[#state.traces + 1] = { event = "detected", token = token, rule = rule_name, at = os.time() }
@@ -172,29 +361,20 @@ local function _token_for(secret, rule_name)
       })
     end)
   end
-  return token
 end
 
---- 应用具名敏感信息规则：命中整段替换为 token（进沙箱加密，可无损还原）。
---- @param text string
---- @param cfg table
---- @param used table token 累加器
+--- 生成随机 token（每进程随机盐，跨密钥唯一）
+--- @param secret string
+--- @param rule_name string|nil 命中的具名规则（用于留痕）
 --- @return string
-local function _apply_rules(text, cfg, used)
-  for _, rule in ipairs(cfg.rules or {}) do
-    if type(rule.pattern) == "string" then
-      local ok, out = pcall(function()
-        return (text:gsub(rule.pattern, function(m)
-          if type(rule.validate) == "function" and not rule.validate(m) then return m end
-          local token = _token_for(m, rule.name)
-          used[#used + 1] = token
-          return token
-        end))
-      end)
-      if ok and type(out) == "string" then text = out end
-    end
-  end
-  return text
+local function _token_for(secret, rule_name)
+  local existing = state.by_secret[secret]
+  if existing then return existing end
+  state.seq = state.seq + 1
+  local hex = tostring(vim.fn.sha256(_ensure_salt() .. "|" .. state.seq .. "|" .. secret))
+  local token = TOKEN_PREFIX .. hex:sub(1, 32)
+  _register_token(secret, token, rule_name)
+  return token
 end
 
 --- 对文本应用具名敏感信息规则做**破坏性脱敏**（用于日志/证据，不可还原）。
@@ -211,7 +391,7 @@ function M.redact(text)
       local ok, out, n = pcall(function()
         local count = 0
         local res = text:gsub(rule.pattern, function(m)
-          if type(rule.validate) == "function" and not rule.validate(m) then return m end
+          if not _scan.validate(rule, m) then return m end
           count = count + 1
           return "[REDACTED:" .. tostring(rule.name) .. "]"
         end)
@@ -243,89 +423,6 @@ local function _record(payload)
   end)
 end
 
--- 环境变量名中出现的敏感词段（按 `_` 切分后整段匹配）。命中则**无视熵阈值**强制
--- token 化，覆盖纯 hex（如 GLM_API_KEY=dfe946…）等熵检测盲区。
--- 刻意不含过宽的 "AUTH"（会误伤 SSH_AUTH_SOCK 等路径类变量）。
-local SECRET_NAME_SEGMENTS = {
-  "KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL", "CREDENTIALS",
-}
-
---- 环境变量名是否暗示其值敏感
---- @param name string
---- @return boolean
-local function _secret_name(name)
-  if type(name) ~= "string" or name == "" then return false end
-  local n = name:upper()
-  if n:find("APIKEY", 1, true) then return true end
-  for seg in n:gmatch("[A-Z0-9]+") do
-    for _, w in ipairs(SECRET_NAME_SEGMENTS) do
-      if seg == w then return true end
-    end
-  end
-  return false
-end
-
--- 具名赋值中敏感值的字符集：仅密钥常见字符，避免把空白/引号/控制符/分隔符并入候选而跨条目吞并
--- （如 /proc/self/environ 以 NUL 分隔、值中含 `.`/`+`/`/`/`=`/`:`）。
-local NAME_VALUE_CHARS = "[%w%._%+%=/:-]+"
-
---- 裸值（`NAME=value`，未加引号）是否像**字面量密钥**，用于把代码表达式（`api_key =
---- os.getenv(...)`、`api_key = api_key`）排除在外。否则 `_apply_secret_names` 会把
---- `os.getenv` 这类代码片段当作密钥写入映射表，进而在编辑该代码时被 `find_real_secret`
---- 误判为「原始密钥」并错误终止 Agent（误报）。
---- 判据（满足其一）：纯十六进制；含 `+ / = :` 等密钥分隔符；含数字且足够长。
---- @param value string
---- @return boolean
-local function _looks_like_literal_secret(value)
-  if type(value) ~= "string" or #value < 8 then return false end
-  if value:match("^[0-9a-fA-F]+$") then return true end -- 纯十六进制（含全 a-f 无数字）
-  if value:find("[%+/=:]") then return true end -- base64 / URL / 连接符风格
-  if value:match("%d") and #value >= 12 then return true end -- 含数字的长串
-  return false
-end
-
---- 按变量名强制 token 化赋值中的敏感值。覆盖熵检测盲区：
----   * 纯小写十六进制（被 `exclude_pure_hex` 排除）；
----   * 含 `.` 等分隔符的多段密钥（被 `RUN_PAT` 拆成不满足候选条件的片段）。
---- 仅当赋值**名字**暗示敏感（`_secret_name`）时才替换值，避免误伤普通配置/代码。
---- 支持 `NAME=value` / `NAME="value"` / `"NAME": "value"` 三种写法；其中裸值额外要求
---- 「像字面量密钥」且不是函数调用（见 `_looks_like_literal_secret`），避免把代码表达式
---- 当密钥。引号包裹的值按字面量处理，不受该限制。
---- @param text string
---- @param used table token 累加器
---- @return string
-local function _apply_secret_names(text, used)
-  local function make(name, value)
-    if type(name) ~= "string" or type(value) ~= "string" then return nil end
-    if value == "" or not _secret_name(name) then return nil end
-    if value:sub(1, #TOKEN_PREFIX) == TOKEN_PREFIX then return nil end
-    local token = _token_for(value, "env_name:" .. name)
-    used[#used + 1] = token
-    return token
-  end
-  -- 裸值：排除函数调用（值后紧跟 `(`）与非字面量代码表达式。
-  text = text:gsub("([%a_][%w_]*)(%s*=%s*)(" .. NAME_VALUE_CHARS .. ")([%(]?)", function(name, sep, value, paren)
-    if paren == "(" then return nil end
-    if not _looks_like_literal_secret(value) then return nil end
-    local token = make(name, value)
-    if not token then return nil end
-    return name .. sep .. token
-  end)
-  for _, q in ipairs({ '"', "'" }) do
-    text = text:gsub("([%a_][%w_]*)(%s*=%s*)" .. q .. "(.-)" .. q, function(name, sep, value)
-      local token = make(name, value)
-      if not token then return nil end
-      return name .. sep .. q .. token .. q
-    end)
-    text = text:gsub(q .. "([%a_][%w_]*)" .. q .. "(%s*:%s*)" .. q .. "(.-)" .. q, function(name, sep, value)
-      local token = make(name, value)
-      if not token then return nil end
-      return q .. name .. q .. sep .. q .. token .. q
-    end)
-  end
-  return text
-end
-
 -- ========== 公开 API ==========
 
 --- 是否启用密钥防护
@@ -338,10 +435,12 @@ end
 --- @param s string
 --- @return number
 function M.entropy(s)
-  return _entropy(s or "")
+  return _scan.entropy(s or "")
 end
 
---- 检测文本中的密钥候选（高熵 + 具名敏感信息规则）
+--- 检测文本中的密钥候选（具名规则 + 带上下文/密钥形态的高熵串）
+--- 高熵串需呈密钥形态（含 - / _）或处于敏感变量名赋值上下文；纯字母数字/base64
+--- （内容哈希、SRI integrity 等）不计入，见 `tools.sandbox.secrets.entropy_requires_context`。
 --- @param text string
 --- @return table 数组 { value, start, stop, entropy, rule? }
 function M.detect(text)
@@ -355,14 +454,17 @@ function M.detect(text)
     if seen[key] then return end
     seen[key] = true
     local v = text:sub(s, e)
-    out[#out + 1] = { value = v, start = s, stop = e, entropy = _entropy(v), rule = rule }
+    out[#out + 1] = { value = v, start = s, stop = e, entropy = _scan.entropy(v), rule = rule }
   end
   local pos = 1
   while true do
     local s, e = text:find(RUN_PAT, pos)
     if not s then break end
     local run = text:sub(s, e)
-    if _is_candidate(run, cfg) then add(s, e) end
+    -- 裸熵串的上下文信号：紧邻的敏感变量名赋值（KEY=/TOKEN:/PASSWORD=）使其无需分隔符。
+    -- 只回看有限窗口，避免在大文本上对每个 run 复制整段前缀（O(n²)）。
+    local prefix = text:sub(s > 64 and s - 64 or 1, s - 1)
+    if _scan.is_candidate(run, cfg, _scan.secret_name_prefix(prefix)) then add(s, e) end
     pos = e + 1
   end
   -- 具名规则：补充结构化敏感信息（私钥块/带前缀 token 等熵检测盲区）；与熵检测重叠时去重。
@@ -371,7 +473,7 @@ function M.detect(text)
       local s, e = text:find(rule.pattern)
       while s do
         local m = text:sub(s, e)
-        if type(rule.validate) ~= "function" or rule.validate(m) then add(s, e, rule.name) end
+        if _scan.validate(rule, m) then add(s, e, rule.name) end
         s, e = text:find(rule.pattern, e + 1)
       end
     end
@@ -379,28 +481,272 @@ function M.detect(text)
   return out
 end
 
---- 把文本中的密钥/敏感信息替换为随机 token（进沙箱加密）
+--- 检测文本中**具名规则**命中的敏感信息（不做熵检测）。
+--- 供 UI 行内高亮等热路径使用：具名规则命中带 `rule`，正是界面告警/高亮所依据的类别；
+--- 熵检测（`detect`）逐行调用代价高，而 UI 只需定位带前缀的结构化凭据与 token。
+--- 每条规则先以其 `prefix` 做 plain find 短路，绝大多数行不含任何前缀时近乎零开销。
 --- @param text string
+--- @return table 数组 { value, start, stop, rule }
+function M.detect_named(text)
+  local out = {}
+  if type(text) ~= "string" or text == "" then return out end
+  local cfg = _cfg()
+  if cfg.enabled == false then return out end
+  local seen = {}
+  for _, rule in ipairs(cfg.rules or {}) do
+    if type(rule.pattern) == "string" then
+      local present = true
+      if type(rule.prefix) == "string" and rule.prefix ~= "" then
+        present = text:find(rule.prefix, 1, true) ~= nil
+      end
+      if present then
+        local s, e = text:find(rule.pattern)
+        while s do
+          local key = s .. ":" .. e
+          if not seen[key] then
+            seen[key] = true
+            local m = text:sub(s, e)
+            if _scan.validate(rule, m) then
+              out[#out + 1] = { value = m, start = s, stop = e, rule = rule.name }
+            end
+          end
+          s, e = text:find(rule.pattern, e + 1)
+        end
+      end
+    end
+  end
+  return out
+end
+--- @param text string
+--- @param opts table|nil { entropy?: boolean } entropy=false 时跳过残余高熵扫描
 --- @return string tokenized
 --- @return table tokens 本次用到的 token 数组
-function M.tokenize(text)
+function M.tokenize(text, opts)
   if not M.enabled() or type(text) ~= "string" or text == "" then return text, {} end
   local cfg = _cfg()
   local used = {}
-  -- 先应用具名敏感信息规则（结构化凭据优先，整段替换）
-  text = _apply_rules(text, cfg, used)
-  -- 再按变量名强制 token 化赋值中的敏感值（覆盖纯 hex / 含点号多段密钥等熵检测盲区）
-  text = _apply_secret_names(text, used)
-  -- 再对残余高熵串做熵检测替换
-  local out = text:gsub(RUN_PAT, function(run)
-    if _is_candidate(run, cfg) then
-      local token = _token_for(run)
-      used[#used + 1] = token
-      return token
-    end
-    return run
-  end)
+  -- 全文扫描核心（规则 -> 变量名赋值 -> 残余高熵串）；token 生成经回调注入。
+  local out = _scan.process(text, cfg, function(secret, rule_name)
+    local token = _token_for(secret, rule_name)
+    used[#used + 1] = token
+    return token
+  end, opts)
   return out, used
+end
+
+-- ========== 工作线程：全文扫描（移出主线程） ==========
+-- 编码统一为二进制安全的 `<len>:<bytes>` 字段顺序拼接（无分隔符），主线程与线程内共用规则。
+
+--- 线程内批量 token 化：扫描核心在独立线程执行，token 由本地 map + 纯 Lua sha256 生成；
+--- 返回新 token 条目与 tokenized 文本，主线程据此登记映射并触发事件/审计。
+--- @param cfg_enc string
+--- @param map_enc string
+--- @param salt string
+--- @param seq number|string
+--- @param texts_enc string
+--- @param sha_src string
+--- @param scan_src string
+--- @param entropy_flags string|nil 与文本并行的 "0"/"1" 串；"0" 跳过该文本的残余高熵扫描
+--- @return string 编码结果
+local function _tokenize_worker(cfg_enc, map_enc, salt, seq, texts_enc, sha_src, scan_src, entropy_flags)
+  local sha = assert(load(sha_src))()
+  local process = assert(load(scan_src))().process
+  local function make_reader(s)
+    local pos = 1
+    return function()
+      local colon = s:find(":", pos, true)
+      local len = tonumber(s:sub(pos, colon - 1))
+      local v = s:sub(colon + 1, colon + len)
+      pos = colon + len + 1
+      return v
+    end
+  end
+  local nxt = make_reader(cfg_enc)
+  local cfg = {
+    min_length = tonumber(nxt()), max_length = tonumber(nxt()),
+    min_entropy = tonumber(nxt()), min_distinct = tonumber(nxt()),
+    exclude_pure_hex = nxt() == "1", entropy_requires_context = nxt() == "1",
+    allowlist = {}, rules = {},
+  }
+  for _ = 1, tonumber(nxt()) do cfg.allowlist[#cfg.allowlist + 1] = nxt() end
+  for _ = 1, tonumber(nxt()) do
+    local name, pattern, vk, prefix = nxt(), nxt(), nxt(), nxt()
+    cfg.rules[#cfg.rules + 1] = {
+      name = name ~= "" and name or nil, pattern = pattern,
+      validate_kind = vk ~= "" and vk or nil, prefix = prefix ~= "" and prefix or nil,
+    }
+  end
+  local map = {}
+  local mn = make_reader(map_enc)
+  for _ = 1, tonumber(mn()) do
+    local secret, token = mn(), mn()
+    map[secret] = token
+  end
+  local tn = make_reader(texts_enc)
+  local texts = {}
+  for i = 1, tonumber(tn()) do texts[i] = tn() end
+
+  seq = tonumber(seq) or 0
+  local new = {}
+  local function token_for(secret, rule)
+    local t = map[secret]
+    if t then return t end
+    seq = seq + 1
+    t = "NEOKEY_" .. sha(salt .. "|" .. seq .. "|" .. secret):sub(1, 32)
+    map[secret] = t
+    new[#new + 1] = { secret, t, rule }
+    return t
+  end
+  local outs = {}
+  for i = 1, #texts do
+    local entropy = not (entropy_flags and entropy_flags:sub(i, i) == "0")
+    outs[i] = process(texts[i], cfg, token_for, { entropy = entropy })
+  end
+
+  local function es(s) s = s or ""; return tostring(#s) .. ":" .. s end
+  local parts = { es(tostring(seq)), es(tostring(#new)) }
+  for _, e in ipairs(new) do
+    parts[#parts + 1] = es(e[1]); parts[#parts + 1] = es(e[2]); parts[#parts + 1] = es(e[3] or "")
+  end
+  parts[#parts + 1] = es(tostring(#outs))
+  for i = 1, #outs do parts[#parts + 1] = es(outs[i]) end
+  return table.concat(parts)
+end
+
+--- 主线程侧编码辅助
+--- @param s string|nil
+--- @return string
+local function _enc_str(s)
+  s = s or ""
+  return tostring(#s) .. ":" .. s
+end
+
+--- @param cfg table
+--- @return string
+local function _encode_cfg(cfg)
+  local p = {
+    _enc_str(tostring(cfg.min_length or 20)), _enc_str(tostring(cfg.max_length or 200)),
+    _enc_str(tostring(cfg.min_entropy or 3.5)), _enc_str(tostring(cfg.min_distinct or 8)),
+    _enc_str(cfg.exclude_pure_hex ~= false and "1" or "0"),
+    _enc_str(cfg.entropy_requires_context ~= false and "1" or "0"),
+  }
+  local al = cfg.allowlist or {}
+  p[#p + 1] = _enc_str(tostring(#al))
+  for _, x in ipairs(al) do p[#p + 1] = _enc_str(tostring(x)) end
+  local rules = cfg.rules or {}
+  p[#p + 1] = _enc_str(tostring(#rules))
+  for _, r in ipairs(rules) do
+    p[#p + 1] = _enc_str(r.name or ""); p[#p + 1] = _enc_str(r.pattern or "")
+    p[#p + 1] = _enc_str(r.validate_kind or ""); p[#p + 1] = _enc_str(r.prefix or "")
+  end
+  return table.concat(p)
+end
+
+--- @param by_secret table
+--- @return string
+local function _encode_map(by_secret)
+  local p = {}
+  local n = 0
+  for secret, token in pairs(by_secret) do
+    n = n + 1
+    p[#p + 1] = _enc_str(secret); p[#p + 1] = _enc_str(token)
+  end
+  return _enc_str(tostring(n)) .. table.concat(p)
+end
+
+--- @param texts table
+--- @return string
+local function _encode_texts(texts)
+  local p = { _enc_str(tostring(#texts)) }
+  for _, t in ipairs(texts) do p[#p + 1] = _enc_str(t) end
+  return table.concat(p)
+end
+
+--- 解析工作线程结果：seq, new_entries, out_texts
+--- @param enc string
+--- @return number seq
+--- @return table new entries { {secret, token, rule?} }
+--- @return table out_texts
+local function _decode_result(enc)
+  local pos = 1
+  local function rd()
+    local colon = enc:find(":", pos, true)
+    local len = tonumber(enc:sub(pos, colon - 1))
+    local v = enc:sub(colon + 1, colon + len)
+    pos = colon + len + 1
+    return v
+  end
+  local seq = tonumber(rd())
+  local new = {}
+  for _ = 1, tonumber(rd()) do
+    local secret, token, rule = rd(), rd(), rd()
+    new[#new + 1] = { secret = secret, token = token, rule = rule ~= "" and rule or nil }
+  end
+  local outs = {}
+  for i = 1, tonumber(rd()) do outs[i] = rd() end
+  return seq, new, outs
+end
+
+--- 规则是否可离线：带 validate 函数但无 validate_kind 的规则无法序列化到线程。
+--- @param cfg table
+--- @return boolean
+local function _can_offload(cfg)
+  for _, r in ipairs(cfg.rules or {}) do
+    if type(r.validate) == "function" and not r.validate_kind then return false end
+  end
+  return true
+end
+
+--- 计算逐项熵开关串：`opts.entropy` 统一开关，`opts.entropy_flags` 按文本下标覆盖。
+--- @param texts table
+--- @param opts table|nil
+--- @return string "0"/"1" 串
+local function _entropy_flags(texts, opts)
+  opts = opts or {}
+  local default = opts.entropy ~= false
+  local flags = opts.entropy_flags
+  local out = {}
+  for i = 1, #texts do
+    local on = default
+    if type(flags) == "table" and flags[i] ~= nil then on = flags[i] ~= false end
+    out[i] = on and "1" or "0"
+  end
+  return table.concat(out)
+end
+
+--- 批量异步 token 化：全文扫描（规则/变量名/熵）在线程池执行，token 生成与登记在主线程。
+--- @param texts table 字符串数组
+--- @param opts table|nil { entropy?: boolean 统一开关；entropy_flags?: boolean[] 按项覆盖 }
+--- @return Deferred resolve(数组：逐项 tokenized 文本)
+function M.tokenize_many_async(texts, opts)
+  local async = require("NeoAI.utils.async")
+  if not M.enabled() then return async.resolve(texts) end
+  local work = require("NeoAI.utils.work")
+  local cfg = _cfg()
+  local flags = _entropy_flags(texts, opts)
+  if not work.available() or not _can_offload(cfg) then
+    local out = {}
+    for i, t in ipairs(texts) do out[i] = (M.tokenize(t, { entropy = flags:sub(i, i) ~= "0" })) end
+    return async.resolve(out)
+  end
+  local sha_src = require("NeoAI.utils.sha256").source
+  local salt = _ensure_salt()
+  local cfg_enc, map_enc, texts_enc = _encode_cfg(cfg), _encode_map(state.by_secret), _encode_texts(texts)
+  return work.run(_tokenize_worker, cfg_enc, map_enc, salt, state.seq, texts_enc, sha_src, SCAN_SRC, flags)
+    :then_(function(enc)
+      local seq, new, outs = _decode_result(enc)
+      for _, e in ipairs(new) do _register_token(e.secret, e.token, e.rule) end
+      if seq and seq > state.seq then state.seq = seq end
+      return outs
+    end)
+end
+
+--- 单文本异步 token 化
+--- @param text string
+--- @param opts table|nil { entropy?: boolean }
+--- @return Deferred resolve(string)
+function M.tokenize_async(text, opts)
+  return M.tokenize_many_async({ text or "" }, opts):then_(function(outs) return outs[1] end)
 end
 
 --- 把 token 还原为真实密钥（出沙箱 commit 解密）
@@ -426,11 +772,14 @@ function M.has_token(text)
   return type(text) == "string" and text:find(TOKEN_PAT) ~= nil
 end
 
--- AI 读取到 KEY（结果被 token 化）时追加的说明：token 仅对 AI 不可见，真实密钥在
--- 网络发送 / 写入文件时自动还原，不改变程序语义。避免 AI 误以为拿到的是真实密钥或
--- 误判密钥无效。
-local READ_HINT = "提示：结果中的 NEOKEY_* 为沙箱密钥 token——仅对 AI 不可见；"
-  .. "网络发送、写入文件时会自动替换回原有真实密钥，不影响程序执行。"
+-- AI 读取到 KEY（结果被 token 化）时追加的说明：真实密钥已被沙箱遮蔽（仅对 AI 不可见），
+-- 这是沙箱的显示层保护，不代表程序出错、也不影响程序实际运行；token 在写入文件时自动还原。
+-- 沙箱只遮蔽密钥形态的高熵串，路径/函数名/构建哈希等原样保留（见 `is_path_component` /
+-- `looks_like_identifier`）；环境变量侧以 `NEOAI_TOKENIZED_ENV` 标识被遮蔽的变量名。
+local READ_HINT = "提示：结果中的 NEOKEY_* 为沙箱密钥 token——真实密钥已被沙箱遮蔽，仅对 AI 不可见，"
+  .. "不代表程序出错、也不影响程序实际运行（写入文件时自动替换回原有真实密钥）。"
+  .. "沙箱只遮蔽密钥形态的高熵串，路径、函数名、构建哈希等原样保留；"
+  .. "被遮蔽的环境变量名见 NEOAI_TOKENIZED_ENV。"
 
 --- AI 读取到 KEY 时的提示文本
 --- @return string
@@ -468,7 +817,7 @@ function M.scan_names(value)
     local t = type(v)
     if t == "string" then
       for name in v:gmatch(ENV_NAME_PAT) do
-        if #name >= 6 and not seen[name] and _secret_name(name) then
+        if #name >= 6 and not seen[name] and _scan.secret_name(name) then
           seen[name] = true
           out[#out + 1] = name
         end
@@ -495,6 +844,26 @@ function M.find_real_secret(text)
   return nil
 end
 
+--- 递归扫描值中是否含映射表已知的原始密钥。
+--- @param v any
+--- @return string|nil secret
+local function _walk_real_secret(v)
+  local t = type(v)
+  if t == "string" then
+    return M.find_real_secret(v)
+  elseif t == "table" then
+    for k, x in pairs(v) do
+      local hit = _walk_real_secret(x)
+      if hit then return hit end
+      if type(k) == "string" then
+        local hk = M.find_real_secret(k)
+        if hk then return hk end
+      end
+    end
+  end
+  return nil
+end
+
 --- 扫描 AI 可见上下文（wire 消息等嵌套结构）是否含映射表中已知的**原始密钥**。
 --- 供请求前终止判定：原始密钥出现在 AI 上下文中说明 token 化被绕过（沙箱上下文被突破）。
 --- token（`NEOKEY_*`）不算命中——KEY 环境变量操作只提级审批，不终止 Agent。
@@ -503,23 +872,23 @@ end
 function M.context_leak(value)
   if not M.enabled() then return nil end
   if next(state.by_secret) == nil then return nil end
-  local function walk(v)
-    local t = type(v)
-    if t == "string" then
-      return M.find_real_secret(v)
-    elseif t == "table" then
-      for k, x in pairs(v) do
-        local hit = walk(x)
-        if hit then return hit end
-        if type(k) == "string" then
-          local hk = M.find_real_secret(k)
-          if hk then return hk end
-        end
-      end
-    end
-    return nil
+  return _walk_real_secret(value)
+end
+
+--- 增量扫描：仅检测 `messages[from..]` 中的新增项是否含原始密钥。
+--- 供请求前守卫只检测**新增上下文/工具调用**，避免每轮对整段历史重扫。
+--- @param messages table 消息数组
+--- @param from number 起始下标（1-based，含）
+--- @return string|nil secret
+function M.context_leak_from(messages, from)
+  if not M.enabled() then return nil end
+  if next(state.by_secret) == nil then return nil end
+  if type(messages) ~= "table" then return nil end
+  for i = math.max(1, tonumber(from) or 1), #messages do
+    local hit = _walk_real_secret(messages[i])
+    if hit then return hit end
   end
-  return walk(value)
+  return nil
 end
 
 --- 深度扫描参数中的字符串：返回是否命中原始密钥与用到的 token
@@ -544,13 +913,14 @@ end
 
 --- 对工具参数做 token 化（深度遍历字符串；由执行器按 fs_write 规格调用）
 --- @param args table
+--- @param opts table|nil { entropy?: boolean }
 --- @return table tokens 用到的 token 数组
-function M.tokenize_args(args)
+function M.tokenize_args(args, opts)
   local used = {}
   local function walk(t)
     for k, v in pairs(t) do
       if type(v) == "string" then
-        local nv, toks = M.tokenize(v)
+        local nv, toks = M.tokenize(v, opts)
         if nv ~= v then t[k] = nv end
         for _, tok in ipairs(toks) do used[#used + 1] = tok end
       elseif type(v) == "table" then
@@ -562,11 +932,12 @@ function M.tokenize_args(args)
   return used
 end
 
---- 生成沙箱进程环境覆盖：把高熵环境变量值替换为 token（命令拿到 token，非真实密钥）。
+--- 生成 token 化的环境变量覆盖（供日志/审计与 AI 可见面；**不是**沙箱进程最终环境）。
 --- 变量名命中敏感词段（KEY/TOKEN/SECRET/PASSWORD/CREDENTIAL）时**无视熵阈值**强制 token 化，
---- 避免纯 hex 密钥（如 GLM_API_KEY）逃过熵检测而原样注入沙箱。
---- 只要发生 token 化，就注入 `NEOAI_TOKENIZED_ENV=<变量名列表>` 信号，使沙箱内
---- 能明确区分「沙箱 token」与真实密钥（避免把 token 当真实凭据而误判 401）。
+--- 避免纯 hex 密钥（如 GLM_API_KEY）逃过熵检测而原样暴露。
+--- 只要发生 token 化，就注入 `NEOAI_TOKENIZED_ENV=<变量名列表>` 信号，标记哪些值在 AI 可见
+--- 输出中会被 token 化。沙箱进程实际环境由 `runtime.sandbox_env` 构造，会把 token 还原为真实
+--- 密钥（token→真实仅限沙箱内部进程）。
 --- 配置 `tools.sandbox.secrets.tokenize_env=false` 可整体关闭环境变量 token 化。
 --- @return table var -> tokenized_value（另含 NEOAI_TOKENIZED_ENV 信号）
 function M.sanitized_env()
@@ -577,9 +948,18 @@ function M.sanitized_env()
   local names = {}
   for k, v in pairs(env) do
     if type(v) == "string" and #v > 0 then
-      if _secret_name(k) then
+      if _scan.secret_name(k) then
         overrides[k] = _token_for(v)
         names[#names + 1] = k
+      elseif v:find("/", 1, true) or v:find("\\", 1, true) then
+        -- 路径/URL 类值：只应用具名规则（结构化凭据），不做通用熵 token 化。
+        -- PATH/LD_LIBRARY_PATH/PYTHONPATH/SSL_CERT_FILE 等是程序运行所必需，
+        -- 把路径段误 token 化会让 pip/ssl 等找不到库或模块。
+        local nv = _scan.apply_rules(v, _cfg(), _token_for)
+        if nv ~= v then
+          overrides[k] = nv
+          names[#names + 1] = k
+        end
       else
         local nv = M.tokenize(v)
         if nv ~= v then
@@ -604,18 +984,19 @@ end
 
 --- 对工具结果做 token 化（字符串或表内字符串字段）
 --- @param value any
+--- @param opts table|nil { entropy?: boolean } entropy=false 时仅脱敏具名规则/敏感变量名
 --- @return any
-function M.tokenize_result(value)
+function M.tokenize_result(value, opts)
   if not M.enabled() then return value end
   local t = type(value)
   if t == "string" then
-    return (M.tokenize(value))
+    return (M.tokenize(value, opts))
   elseif t == "table" then
     local out = vim.deepcopy(value)
     local function walk(v)
       if type(v) == "table" then
         for k, x in pairs(v) do
-          if type(x) == "string" then v[k] = M.tokenize(x)
+          if type(x) == "string" then v[k] = M.tokenize(x, opts)
           elseif type(x) == "table" then walk(x) end
         end
       end
@@ -670,6 +1051,59 @@ function M.detect_generated(files)
     end
   end
   return out
+end
+
+-- 疑似密钥文件（宽口径）：供「高熵精确定位」的启用判定——只对这些文件做昂贵的全文熵扫描。
+-- 含 shell 启动脚本/历史与 /etc/* 等可能内联凭据的配置；**不用于 UI 告警**（见下）。
+local SECRET_PATH_PATS = {
+  -- 凭据目录/文件
+  "%.ssh/", "%.aws/", "%.gnupg/", "%.config/gcloud", "%.kube/", "%.docker/config%.json",
+  "%.netrc$", "%.npmrc$", "%.pypirc$", "%.git%-credentials$", "/%.env$", "/%.env%.",
+  "id_rsa", "id_ed25519", "id_ecdsa", "id_dsa", "%.pem$", "%.key$", "%.p12$", "%.pfx$",
+  "credentials", "secret",
+  -- shell 启动脚本 / 历史（常内联 export KEY=... 与命令行凭据）
+  "%.bashrc", "%.bash_profile", "%.bash_aliases", "%.bash_history", "%.bash_login",
+  "%.zshrc", "%.zprofile", "%.zshenv", "%.zlogin", "%.zsh_history",
+  "%.profile$", "%.pgpass$", "%.htpasswd$",
+  "%.mysql_history$", "%.psql_history$", "%.python_history$", "%.irb_history$",
+  -- 系统敏感配置
+  "^/etc/", "/shadow$", "/sudoers",
+}
+
+--- 路径是否疑似密钥文件（宽口径：用于决定是否做高熵扫描）
+--- @param path string|nil
+--- @return boolean
+function M.is_secret_path(path)
+  if type(path) ~= "string" or path == "" then return false end
+  for _, pat in ipairs(SECRET_PATH_PATS) do
+    if path:find(pat) then return true end
+  end
+  return false
+end
+
+-- 真正的凭据/密钥文件（严口径）：供 UI「获取密钥」告警。刻意排除常见误报——
+-- `/etc/ld.so.cache`、`/etc/nsswitch.conf`、`/etc/passwd`、`/etc/group`、`/etc/os-release`、
+-- `/etc/localtime`、`/etc/ssl/openssl.cnf`、`*.env`（如 `go.env`）、`.npmrc`、shell/解释器
+-- 历史（`.bash_history`/`.python_history`）等：这些被普通命令（uname/cat/python/…）频繁打开，
+-- 并非密钥，不应触发告警。
+local SENSITIVE_PATH_PATS = {
+  "%.ssh/", "%.aws/", "%.gnupg/", "%.config/gcloud", "%.kube/", "%.docker/config%.json",
+  "%.netrc$", "%.pypirc$", "%.git%-credentials$", "/%.env$", "/%.env%.",
+  "id_rsa", "id_ed25519", "id_ecdsa", "id_dsa", "%.pem$", "%.key$", "%.p12$", "%.pfx$",
+  "application_default_credentials", "/credentials$",
+  "/shadow$", "/gshadow$", "/sudoers", "/etc/ssh/", "/etc/apt/auth%.conf",
+  "trusted%.gpg", "keyrings?/",
+}
+
+--- 路径是否为真正的凭据/密钥文件（严口径，供 UI 告警）。
+--- @param path string|nil
+--- @return boolean
+function M.is_sensitive_path(path)
+  if type(path) ~= "string" or path == "" then return false end
+  for _, pat in ipairs(SENSITIVE_PATH_PATS) do
+    if path:find(pat) then return true end
+  end
+  return false
 end
 
 --- 记录一次 token / 密钥环境变量名操作留痕（并写证据）

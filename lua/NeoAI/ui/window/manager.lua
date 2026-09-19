@@ -22,38 +22,6 @@ local BUFFER_NAMES = {
 
 -- ========== 私有函数 ==========
 
--- 全局 LspAttach 拦截的 augroup 与初始化标志。
--- 只在首次调用时注册一次；后续 buffer 只需打 b:neoai_ui 标记即可复用拦截。
-local LSP_BLOCK_GROUP = "NeoAILspBlock"
-local lsp_block_init = false
-
---- 兜底拦截：任何 LSP 客户端（含 Copilot、手动 buf_attach_client 等）试图挂载到
---- NeoAI UI buffer 时立即解绑。创建窗口时同步 detach 只能覆盖当时已挂载的客户端，
---- 异步/延迟挂载（如 Copilot 在窗口显示后才 attach、用户再次进入聊天 buffer 时重新附加）
---- 必须靠这里收口。buffer 以 b:neoai_ui 标记识别，不影响其它插件的 nofile buffer。
-local function _init_lsp_block()
-  if lsp_block_init then return end
-  lsp_block_init = true
-  vim.api.nvim_create_augroup(LSP_BLOCK_GROUP, { clear = false })
-  vim.api.nvim_create_autocmd("LspAttach", {
-    group = LSP_BLOCK_GROUP,
-    callback = function(args)
-      local buf = args.buf
-      if not vim.b[buf] or not vim.b[buf].neoai_ui then return end
-      local client_id = args.data and args.data.client_id
-      if client_id then
-        -- schedule 解绑：等客户端 attach 流程同步跑完再拆，避免其流程内再次挂载；
-        -- 解绑不触发 BufEnter/FileType，不会与插件自身的 attach 逻辑循环。
-        vim.schedule(function()
-          if vim.api.nvim_buf_is_valid(buf) then
-            pcall(vim.lsp.buf_detach_client, buf, client_id)
-          end
-        end)
-      end
-    end,
-  })
-end
-
 --- 获取窗口配置
 --- @return table
 local function _window_config()
@@ -72,25 +40,10 @@ local function _configure_window(win)
   vim.wo[win].spell = false
 end
 
---- 阻止 LSP 服务挂载到 NeoAI 界面 buffer（聊天/会话树为纯 UI 文本，不需要 LSP）。
---- - 内置 LSP 自动启用（lsp_enable_callback）只会在 buftype 为 '' 或 help 的 buffer 上
----   启动客户端，显式设 nofile 可彻底阻断 native LSP 自动挂载；
---- - copilot.vim 的 BufferDisabled() 对 nofile 不豁免，必须显式设 b:copilot_disabled
----   （copilot.lua 兼容 b:copilot_disable）；
---- - 兜底解绑已经挂载到该 buffer 的客户端（含 Copilot 的 LSP client）。
+--- 阻止 LSP 服务挂载到 NeoAI 界面 buffer（统一由 ui.lsp_guard 处理，覆盖所有 neoai* buffer）。
 --- @param buf number
 local function _disable_lsp(buf)
-  _init_lsp_block()
-  vim.b[buf].neoai_ui = true
-  pcall(vim.api.nvim_set_option_value, "buftype", "nofile", { buf = buf })
-  vim.b[buf].copilot_disabled = true
-  vim.b[buf].copilot_disable = true
-  local ok, clients = pcall(vim.lsp.get_clients, { bufnr = buf })
-  if ok and type(clients) == "table" then
-    for _, client in ipairs(clients) do
-      pcall(vim.lsp.buf_detach_client, buf, client.id)
-    end
-  end
+  require("NeoAI.ui.lsp_guard").disable(buf)
 end
 
 --- 创建浮动窗口

@@ -185,7 +185,7 @@ end
 --- @param tool_call_id string
 --- @param tool_name string
 --- @param result string
---- @param extra table|nil { duration_ms? } 附加元数据（仅 UI 展示用，不进入模型上下文）
+--- @param extra table|nil { duration_ms?, notice? } 附加元数据（仅 UI 展示用，不进入模型上下文）
 --- @return table 消息
 function M.add_tool_result(agent, tool_call_id, tool_name, result, extra)
   local msg = {

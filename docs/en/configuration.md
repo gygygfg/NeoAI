@@ -134,8 +134,9 @@ context_cache = {
 | `tree` | `{foldenable=false, ...auto_close_on_select=true}` | Session tree folding/auto-close |
 | `input_box` | `{idle_height=1, min_height=5, max_ratio=0.8}` | Input box height (idle/focused/growth cap) |
 | `chat` | `{mousescroll_max_blank=3, incremental=true}` | Max blank lines allowed below the last line when the wheel reaches the bottom (0 = strictly bottom-aligned); `incremental` enables incremental refresh (re-render only changed message blocks and write only the diff lines). Set to `false` to fall back to a full buffer rewrite |
+| `render` | `{threaded=true}` | Offload CPU-intensive computation (e.g. codepoint counting/slicing for tool-result pruning) to the `utils.work` thread pool so MB-scale tool results never block the main thread. Set to `false` (or when the pool is unavailable) to fall back to synchronous main-thread computation (equivalent behavior, just slower) |
 | `trajectory` | `{log_dir=".../NeoAI/logs"}` | Log directory for the trajectory display mode |
-| `statusline` | `{enabled=true, winbar=true, parts={mode,model,usage,cache,capacity,sandbox}, separator=" ", colors=...}` | lualine statusline; the `sandbox` part shows `待审N` when pending reviews > 0 (`N` is the total number of pending **files**, since the approval unit is a single file), linked to the prominent `NeoAISandboxPending` highlight group by default (bold yellow, override via `colors.sandbox`); when the pending queue contains an **L3 (high-risk)** item, the part appends `⚠危险` and switches to the red `NeoAISandboxDanger` group (override via `colors.sandbox_danger`) |
+| `statusline` | `{enabled=true, winbar=true, parts={mode,model,usage,cache,capacity,sandbox}, separator=" ", colors=...}` | lualine statusline; the `sandbox` part shows `待审N` when pending reviews > 0 (`N` is the total number of pending **files**, since the approval unit is a single file), linked to the prominent `NeoAISandboxPending` highlight group by default (bold yellow, override via `colors.sandbox`); when the pending queue contains an **L3 (high-risk)** item, the part appends `⚠危险` and switches to the red `NeoAISandboxDanger` group (override via `colors.sandbox_danger`); when **outside-workspace traces** exist, the part appends `越界N` (`N` = distinct file count; both shown side by side, e.g. `待审2 越界3`) |
 
 ### 2.3 `keymaps`
 
@@ -230,14 +231,20 @@ sandbox = {
   seccomp = { enabled = true, filter_path = "" }, -- seccomp baseline (built-in denylist; default on; bwrap only)
   cap_add = {},                    -- Least privilege by default (`--cap-drop ALL`); capabilities are added back narrowly per command (package installs via packages.cap_add). Set { "ALL" } only for debugging
   -- Payload identity (least privilege): sandboxed processes run as a non-root user by default.
-  --   * NeoAI launched as non-root: uses the current uid/gid automatically (this setting is ignored).
-  --   * NeoAI launched as root: must use the dedicated non-root uid/gid here (default nobody 65534);
-  --     the plugin runs `setpriv` to drop bwrap to that uid before entering the userns, so the payload
-  --     is non-root both on the host and inside the namespace. Writable sandbox dirs (overlay
-  --     upper/work, staging, session) are chowned to that uid/gid; the workspace and `workspace_root`
-  --     must be traversable by it (do not put them under a 0700 /root when launching as root).
-  --   * uid = 0: explicitly opt out of dropping privileges (run payload as root; not recommended).
-  run_as = { uid = 65534, gid = 65534 },
+  -- Payload identity: runs as root by default (uid=0) so the AI can use host toolchains inside the
+  --   sandbox (/root nvm/cargo/go etc. are 0700 and untraversable by non-root) and package managers
+  --   (dpkg hard-checks euid==0). All writes still go to the overlay staging layer and freeze as
+  --   candidates; the real disk stays read-only. Isolation comes from namespaces + read-only root +
+  --   overlay + seccomp + masking.
+  --   * NeoAI launched as non-root: a user namespace maps the current user to **guest root inside
+  --     the sandbox** (euid=0, effective only within the namespace; host identity stays the current
+  --     non-root user); this setting is ignored. Operations that genuinely need host root are frozen
+  --     for review and run via `sudo` after approval.
+  --   * NeoAI launched as root: uid=0 is the default (no drop); set a dedicated non-root uid (e.g.
+  --     nobody 65534) to harden — the plugin runs `setpriv` to drop the payload to that uid, keeping
+  --     the configured narrow capabilities as ambient. Then /root is untraversable, so place the
+  --     workspace / `workspace_root` where that uid can traverse (not under a 0700 /root).
+  run_as = { uid = 0, gid = 0 },
   cap_drop = {                     -- Host-global capability narrowing: dropped even when cap_add contains ALL (network/clock/modules/raw I/O/boot/MAC/audit)
     "CAP_NET_ADMIN", "CAP_SYS_TIME", "CAP_SYS_MODULE", "CAP_SYS_RAWIO",
     "CAP_SYS_BOOT", "CAP_MAC_ADMIN", "CAP_MAC_OVERRIDE", "CAP_AUDIT_CONTROL",
@@ -273,6 +280,7 @@ sandbox = {
   expose_paths = {},               -- Host runtime passthrough (opt-in): these host paths are exposed read-only after masking/tmpfs and prepended to the sandbox PATH so run_command can invoke host toolchains (e.g. nvim/lua/luajit/mason). Only expose trusted read-only tool dirs
   expose_path_env = true,          -- Whether to prepend expose_paths dirs to the sandbox PATH (false = mount only)
   expose_tool_paths = false,       -- Auto-expose host PATH tool dirs (opt-in): read-only-expose existing, non-credential/system PATH bin dirs and prepend them to the sandbox PATH so toolchains under $HOME (node/npm/fd/go) work (widens the read surface)
+  appimage_extract_and_run = true, -- AppImage support (on by default): when running an AppImage in the sandbox, inject APPIMAGE_EXTRACT_AND_RUN=1 so it extracts into the session-private /tmp (the sandbox blocks mount and exposes no /dev/fuse, so FUSE mounting is unavailable); non-AppImage programs ignore the variable. Set false to disable
   resolv_conf = "sanitize",        -- /etc/resolv.conf: sanitize (default, nameservers only) | hide | passthrough
   tmpfs_roots = { "/tmp", "/var/tmp" }, -- per-session private temporary roots (never an overlay lower; destroyed on exit)
   ephemeral_roots = { "/tmp", "/var/tmp" }, -- ephemeral candidate roots (excluding the cwd subtree): file writes under these roots are session-private, discarded when nvim exits, and produce no pending candidate / no publish / no approval popup; `{}` disables
@@ -295,6 +303,28 @@ sandbox = {
   mask_dirs_enabled = true,        -- master switch
   mask_dirs = { "/home", "/root" }, -- masked dirs (supports * globs)
   mask_dirs_approval = true,       -- request approval on masked hits (reuses tool approval UI)
+  -- Kernel-level behavior observation (eBPF/strace/procfs): decides "outside-workspace access" and
+  -- "secret-file access" from actual syscalls, replacing/augmenting command-string heuristics;
+  -- events are attributed precisely to the attempt cgroup.
+  -- Backend priority auto: ebpf (bpftrace, needs root) -> strace (command prefix) -> procfs
+  -- (/proc/<pid>/fd). When none is available it falls back to command parsing; tools still run.
+  observe = {
+    enabled = true,   -- master switch (off = command-string heuristic only)
+    backend = "auto", -- "auto" | "ebpf" | "strace" | "procfs" | "heuristic"
+    poll_ms = 200,    -- procfs/strace poll interval (ms)
+    notify = true,    -- at startup: notify when eBPF is unavailable/not installed, or strace fallback is missing
+    -- Probe attach wait (ms): 0 (default) = do not block the command; bpftrace attaches
+    -- asynchronously (best-effort — early accesses may be missed and fall back to command
+    -- heuristics), avoiding a fixed ~0.5s wait per command. A positive value waits bounded
+    -- before running the command: fuller observation at a fixed per-command cost.
+    wait_ready_ms = 0,
+    -- Observation prewarm (on by default): after a process command returns, in the gap while the
+    -- AI generates the next turn, pre-create the next attempt's cgroup and attach the eBPF probe
+    -- in the background, overlapping the ~0.5s attach with AI output; the next process command
+    -- reuses the already-attached probe. eBPF backend only (strace/procfs start cheaply).
+    prewarm = true,
+    prewarm_ttl_ms = 90000, -- prewarm TTL (ms): reclaimed if not reused within it
+  },
   network = {
     enabled = false, allowed_endpoints = {}, budget_bytes = 0, -- controlled network gateway
     -- Intercept access to the host itself (loopback/host NIC IPs/link-local/cloud metadata; on by
@@ -341,32 +371,56 @@ sandbox = {
   -- sandbox namespace; docker relies on an external daemon and cannot share, so the controlled
   -- socket scheme is kept and the reason is recorded.
   container = { enabled = true, share_namespace = true, prefer = "podman" },
+  -- Store base root: each process is isolated under <workspace_root>/instances/<pid>_<ts>; pending queue/candidates are not shared across sessions.
   workspace_root = vim.fn.stdpath("cache") .. "/NeoAI/sandbox",
   session_shell = true,            -- persist shell state (export/cd) across run_command within a session (bwrap only)
   process_roots = {},              -- run_command writable roots (overlaid; default cwd only, auto-added). /tmp, /var/tmp belong to tmpfs_roots; host /root, /home, /etc are not exposed as read-only lower; add explicitly if needed
+  overlay_fail_closed = true,      -- reject process tools when overlay is unavailable (no private-cwd downgrade); set false to allow degraded execution
   -- Async review: candidates enter a pending queue. session_auto_approve auto-applies L0/L1.
   -- l3_warning: L3 (critical) items require second confirmation (AI consequence warning + auto diff; apply only after re-confirming).
+  -- ai_audit: press `a` (configurable key) in the review UI to hand the user messages + structured
+  --           text of risk-graded pending changes to the model, which returns a ≤50-char note for
+  --           **every** item (file / host command) starting with a safe/unsafe verdict (rendered
+  --           under the line; high-risk changes come first and are never omitted; items the model
+  --           misses are marked "needs manual confirmation"; the top shows an overall verdict; never
+  --           posted to chat). auto=true runs the audit automatically when the review UI opens
+  --           (default off; re-audits when the pending set changes). Global concurrency cap
+  --           max_concurrent (default 10; excess in-flight requests queue FIFO) avoids a request
+  --           storm when auto fires frequently.
   review = { enabled = true, auto_apply = false, session_auto_approve = false,
-             l3_warning = { enabled = true, max_tokens = 256, timeout_ms = 15000 } },
+             l3_warning = { enabled = true, max_tokens = 256, timeout_ms = 15000 },
+             ai_audit = { enabled = true, auto = false, key = "a", max_concurrent = 10,
+                          max_diff_chars = 8000, max_user_chars = 4000, max_total_chars = 60000,
+                          max_tokens = 2048, timeout_ms = 30000 } },
   -- Approval graded by security level (L0-L3): action auto/record/review/block; default "review".
   approval = { default = "review", levels = {} },
+  -- Static scan of indirect script execution: when a command delegates to a script/interpreter
+  -- (`bash deploy.sh`, `python setup.py`, `node x.js`, `./run.sh`, `bash -c '…'`), the script is
+  -- read before execution (preferring the sandbox staging copy) and its shell body plus embedded
+  -- shell calls in high-level languages (Python/Node/Ruby/Perl/PHP) are folded into danger
+  -- detection and privilege classification: destructive/kernel commands inside scripts are hard
+  -- denied; other hits, or opaque cases (eval, base64|sh, dynamic `-c "$VAR"`, unreadable content),
+  -- raise the level and force review (never auto-applied). max_* bound recursion/reads.
+  script_scan = { enabled = true, max_depth = 3, max_files = 8, max_bytes = 262144 },
   -- Extra rules for package installs: review (default, forced review, not auto-approved) | allow | deny.
   -- `managers` also identifies the package manager: install candidates are grouped per install
   -- command into one approval unit (approve the whole package from the header line).
   -- Detection skips wrappers (sudo/doas/env/bash -c/for…do) so an install is not missed and
   -- escalated to L3.
-  -- `roots` = package-manager state dirs (added as writable overlay staging so apt/pip/npm can write
-  -- indexes/caches/metadata); `cap_add` = narrow capabilities added back for package installs
-  -- when the global cap_add is narrowed (e.g. {}); granted only when the whole command is package
-  -- managers; no CAP_MKNOD — device nodes are hard-blocked by the seccomp baseline, FIFOs unaffected.
+  -- `roots` = package-install writable overlay staging roots so apt/pip/npm can write
+  -- indexes/caches/metadata and install targets (`/usr` covers /usr/bin, /usr/games, …;
+  -- `/var` covers dpkg/apt state, man caches, …); writes freeze as candidates and the real disk
+  -- is unchanged. `cap_add` = narrow capabilities added back for package installs when the global
+  -- cap_add is narrowed (e.g. {}); granted only when the whole command is package managers; no
+  -- CAP_MKNOD — device nodes are hard-blocked by the seccomp baseline, FIFOs unaffected.
   packages = {
-    mode = "review",
-    managers = { "apt", "apt-get", "pip", "pip3", "uv", "conda", "npm", "npx", "pnpm", "yarn", "go", "cargo", "gem", "composer" }, -- 包管理器名单（命令识别）；改动路径特征见 privilege.package_path_manager
-    roots = { "/var/lib/apt", "/var/cache/apt", "/var/lib/dpkg", "/usr/local", "~/.cache", "~/.npm" },
+    mode = "review", -- review (safe installs need confirmation but cap at moderate L1; sensitive installs touching repos/keys stay L2) | allow | deny
+    managers = { "apt", "apt-get", "pip", "pip3", "uv", "conda", "npm", "npx", "pnpm", "yarn", "go", "cargo", "gem", "composer" }, -- package-manager names (command recognition); path signatures via privilege.package_path_manager; sensitive-install detection via privilege.package_sensitive
+    roots = { "/usr", "/var", "/etc", "~/.cache", "~/.npm", "~/.nvm", "~/.cargo", "~/.rustup", "~/go", "~/.local" }, -- package-install writable roots (overlay staging). /etc lets dpkg postinst write /etc/ld.so.cache etc.; sensitive entries stay masked by mask_paths
     cap_add = { "CAP_DAC_OVERRIDE", "CAP_CHOWN", "CAP_SETUID", "CAP_SETGID", "CAP_FOWNER" },
   },
-  lsp_overlay = { enabled = true }, -- LSP process mount-namespace overlay: LSP disk reads see staged content (on by default, bwrap+overlay only; skipped when unavailable)
-  secrets = { enabled = true, min_length = 20, max_length = 200, min_entropy = 3.5, min_distinct = 8, exclude_pure_hex = true, tokenize_env = true, extra_rules = {}, allowlist = {} }, -- Secret/sensitive guard: entropy + named rules (private-key blocks/AKIA/ghp_/sk-/JWT/Bearer…) + token mapping; env values whose names contain KEY/TOKEN/SECRET/PASSWORD/CREDENTIAL are force-tokenized
+  lsp_overlay = { enabled = true }, -- AI-only sandboxed LSP: servers cloned by the AI lsp_* tools read staged content (on by default, bwrap+overlay only; falls back to editor clients when unavailable)
+  secrets = { enabled = true, min_length = 20, max_length = 200, min_entropy = 3.5, min_distinct = 8, exclude_pure_hex = true, entropy_requires_context = true, entropy_secret_paths_only = true, tokenize_env = true, extra_rules = {}, allowlist = {} }, -- Secret/sensitive guard: entropy + named rules (private-key blocks/AKIA/ghp_/sk-/JWT/Bearer…) + token mapping; env values whose names contain KEY/TOKEN/SECRET/PASSWORD/CREDENTIAL are force-tokenized; bare entropy runs require a -/_ separator and must not be a code identifier (snake_case function/constant names) or a sensitive-name context (narrowed scope to avoid corrupting integrity/build hashes/traceback function names/path components); non-sensitive-named env values containing / are redacted by named rules only (never breaking PATH/LD_LIBRARY_PATH); with entropy_secret_paths_only=true the full-text entropy scan runs only on suspected secret files (~/.ssh, ~/.bashrc, /etc/*, etc. per secret.is_secret_path), other files use named rules only
   retention = { candidate_days = 7, max_pending = 20 },
   policy = {
     version = "1",                 -- policy version (for audit replay; bump when rules change)
@@ -375,9 +429,12 @@ sandbox = {
   },
   -- Resource limits (cgroup v2): dynamic=true by default, deriving CPU/memory/PID caps from host
   -- resources so a sandboxed command cannot starve the machine; explicit static values (>0) win.
+  -- All concurrent attempts share a parent domain: cpu_global_max is the total concurrent CPU
+  -- budget (default nproc-1), cpu_cores_max is the per-task quota.
   -- With fail_closed=false, an unavailable cgroup is skipped rather than blocking execution.
   limits = { wall_ms = 60000, dynamic = true, memory_ratio = 0.5, memory_max_bytes = 0,
-    cpu_cores_max = 4, pids_max = 2048, memory_bytes = 0, pids = 0, cpu_max = 0,
+    cpu_cores_max = 4, cpu_global_max = 0, pids_max = 2048, memory_bytes = 0, pids = 0, cpu_max = 0,
+    cpu_affinity = "auto", -- sandbox CPU affinity: auto=pins to cores other than nvim's current CPU (so it does not compete with nvim); off/false=no pinning; "2,3"/"2-3"=explicit cpuset (needs taskset)
     cgroup_base = "/sys/fs/cgroup", fail_closed = false },
   seccomp_filter_path = "",        -- optional: compiled seccomp BPF filter (with require_seccomp)
 }
@@ -502,10 +559,10 @@ plugins = {
 Plan mode is a **per-agent state** (`agent.plan_mode`); when active:
 
 1. **Injects the plan-policy system prompt section** (`deployment:plan_policy`, order=100): requires a clear, formatted modification plan as output.
-2. **Keeps only read-only/informational tools in the tool context, plus `run_command` (read-only research) + `ask_user` + `exit_plan_mode`** (the `PLAN_SAFE_TOOLS` allowlist + `PLAN_EXTRA_TOOLS`), exposing no mutating tools.
+2. **Keeps only read-only/informational tools in the tool context, plus `run_command` (read-only research) + `ask_user`** (the `PLAN_SAFE_TOOLS` allowlist + `PLAN_EXTRA_TOOLS`), exposing no mutating tools and **no mode-switching tool to the AI**.
 3. **Tightens the execution-time gate accordingly** (`plan_mode.check_tool`): in plan mode, any tool outside the visible set is rejected.
 
-**Plan confirmation**: the AI calls `exit_plan_mode` (the approval dialog is confirmed by the user) or the user runs `:NeoAIApprovePlan`;
+**Plan confirmation**: after the AI emits the plan the turn ends; the user confirms by running `:NeoAIApprovePlan` (or toggling the mode manually);
 `chat_service.approve_plan` then parses the plan into a task list (todo) → exits plan mode (switching to CHAT)
 → automatically starts execution according to `auto_execute_on_approve` (enabled by default).
 

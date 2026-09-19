@@ -119,10 +119,20 @@ function M.delete_file(path)
   return true
 end
 
+--- 设置文件/目录权限（八进制 mode，如 493=0755）。失败返回 false。
+--- @param path string
+--- @param mode number
+--- @return boolean
+function M.chmod(path, mode)
+  if type(mode) ~= "number" then return false end
+  local ok = vim.uv.fs_chmod(path, mode)
+  return ok ~= nil
+end
+
 --- 同目录临时文件 + fsync + rename：失败不截断原文件。
 --- @param path string
 --- @param content string
---- @param opts table|nil { backup?: boolean } 保留替换前的 .bak
+--- @param opts table|nil { backup?: boolean, mode?: number 保留原权限位 }
 --- @return boolean, string|nil
 function M.write_file_atomic(path, content, opts)
   local uv = vim.uv
@@ -145,6 +155,10 @@ function M.write_file_atomic(path, content, opts)
   local closed, close_err = uv.fs_close(fd)
   fd = nil
   if not closed then return fail(close_err) end
+  -- 保留原权限位：mkstemp 默认 0600，若不 chmod 会剥离可执行位（venv/bin 脚本等）。
+  if opts and type(opts.mode) == "number" then
+    uv.fs_chmod(tmp, opts.mode)
+  end
   if opts and opts.backup then
     local stat, stat_err, stat_code = uv.fs_stat(path)
     if stat then
@@ -297,10 +311,14 @@ end
 --- @param dir string 起始目录
 --- @param max number 最大条数（0 = 不限）
 --- @return string 每行一条路径
-local function _list_worker(dir, max)
+local function _list_worker(dir, max, entry_cap)
   local out = {}
   local count = 0
-  local limit = max and max > 0 and max or math.huge
+  -- 安全上限：`max<=0` 不再表示「无上限」——对 home/ 等超大目录（数十万条目）无界递归会
+  -- 占满 libuv 工作线程与内存，表现为 `libuv-worker` CPU 打满、工具迟迟不返回。显式传入的
+  -- 大 max 同样被硬上限钳制。`entry_cap` 仅供测试覆盖。
+  local HARD_CAP = (entry_cap and entry_cap > 0) and entry_cap or 50000
+  local limit = (max and max > 0) and math.min(max, HARD_CAP) or HARD_CAP
   local function walk(path)
     if count >= limit then return end
     local handle = vim.uv.fs_scandir(path)
@@ -331,20 +349,31 @@ end
 --- @param max number 最大条数
 --- @param max_bytes number 单文件最大扫描字节数（超过则跳过）
 --- @return string 每行一条：路径 + 匹配片段
-local function _search_worker(dir, query, include_pat, max, max_bytes)
+local function _search_worker(dir, query, include_pat, max, max_bytes, visit_cap, time_budget)
   local out = {}
   local count = 0
   local limit = max and max > 0 and max or 50
   local inc_pat = include_pat or ""
   local scan_cap = (max_bytes and max_bytes > 0) and max_bytes or (8 * 1024 * 1024)
+  -- 无匹配时的遍历边界：否则 search_files 在 home/ 等超大目录会遍历数十万条目并逐个读文件，
+  -- 占满工作线程（`libuv-worker` CPU 打满）且迟迟不返回。同时用**时间预算**兜底：慢文件系统上
+  -- 即使条目数未到上限也可能耗时过久，达到预算即停止遍历。
+  local VISIT_CAP = (visit_cap and visit_cap > 0) and visit_cap or 100000
+  local TIME_BUDGET = (time_budget and time_budget > 0) and time_budget or 5 -- 秒（CPU 时间，纯 Lua os.clock 可用）
+  local visited = 0
+  local deadline = os.clock() + TIME_BUDGET
+  local function expired()
+    return visited >= VISIT_CAP or os.clock() >= deadline
+  end
   local function walk(path)
-    if count >= limit then return end
+    if count >= limit or expired() then return end
     local handle = vim.uv.fs_scandir(path)
     if not handle then return end
     while true do
       local name, t = vim.uv.fs_scandir_next(handle)
       if not name then break end
-      if count >= limit then return end
+      if count >= limit or expired() then return end
+      visited = visited + 1
       local full = path .. "/" .. name
       if t == "directory" then
         walk(full)
@@ -374,8 +403,15 @@ local function _search_worker(dir, query, include_pat, max, max_bytes)
     end
   end
   walk(dir)
-  if #out == 0 then return "未找到匹配内容" end
-  return table.concat(out, "\n")
+  local truncated = expired()
+  if #out == 0 then
+    return truncated
+      and ("未找到匹配内容（目录过大，已扫描 " .. visited .. " 个条目后停止；请缩小范围或指定 include）")
+      or "未找到匹配内容"
+  end
+  local text = table.concat(out, "\n")
+  if truncated then text = text .. "\n（结果可能不完整：已达扫描边界，请缩小范围或指定 include）" end
+  return text
 end
 
 --- 线程内按块逐行读取，避免一次性把超大文件读入内存。
@@ -557,16 +593,18 @@ end
 
 --- 异步递归列出目录
 --- @param dir string
---- @param max number|nil 最大条数（nil/0 = 不限）
+--- @param max number|nil 最大条数（nil/0 = 使用内置安全上限 50000）
+--- @param opts table|nil { entry_cap? = number } 仅测试用于覆盖安全上限
 --- @return Deferred resolve(每行一条路径 string)
-function M.list_dir_async(dir, max)
-  return work.run(_list_worker, dir, max or 0)
+function M.list_dir_async(dir, max, opts)
+  return work.run(_list_worker, dir, max or 0, (opts and opts.entry_cap) or 0)
 end
 
 --- 异步递归搜索文件内容（线程池执行，避免递归遍历卡住主线程）
 --- @param dir string 起始目录
 --- @param query string 搜索关键字
---- @param opts table|nil { include?, max_results?, max_file_bytes? }
+--- @param opts table|nil { include?, max_results?, max_file_bytes?, visit_cap?, time_budget? }
+---   visit_cap/time_budget 仅供测试覆盖遍历边界（默认 100000 条 / 5s CPU）
 --- @return Deferred resolve(每行一条 string)
 function M.search_files_async(dir, query, opts)
   opts = opts or {}
@@ -579,7 +617,8 @@ function M.search_files_async(dir, query, opts)
     local stringx = require("NeoAI.utils.stringx")
     include_pat = stringx.glob_to_pattern(include)
   end
-  return work.run(_search_worker, dir, query, include_pat, opts.max_results or 50, opts.max_file_bytes or 0)
+  return work.run(_search_worker, dir, query, include_pat, opts.max_results or 50,
+    opts.max_file_bytes or 0, opts.visit_cap or 0, opts.time_budget or 0)
 end
 
 return M

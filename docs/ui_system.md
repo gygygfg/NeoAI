@@ -82,6 +82,18 @@
 「🤔 思考过程 N 行」**（`message_list` 写入 buffer 后登记推理块起始行），工具块显示 `🔧 工具名`，
 其余未识别折叠显示中性占位（`📄 首行预览 (N 行)`），避免「所有折叠都渲染成思考过程」。
 工具执行期间每秒重渲染一次（`TOOL_TICK_MS=1000`），让折叠文本中的耗时实时跳动。
+命令**参数或结果含密钥**（沙箱 token `NEOKEY_*` 或具名规则命中的原始密钥）时，在该工具折叠块**外**
+追加**单独一行** `⚠ 密钥` 高亮警告（`NeoAISecretWarning`），折叠文本保持干净（不含 `⚠ 密钥`）。
+警告行**指明具体是哪个命令/工具获取或使用了哪个密钥文件**，例如：
+「⚠ 密钥：run_command 执行 cat ~/.ssh/id_rsa 获取/使用了密钥（密钥文件：/root/.ssh/id_rsa）」；
+无法确定文件时回退为密钥类型（具名规则，如 `private_key`）→ 敏感环境变量名 → 通用提示
+（见 [sandbox.md](sandbox.md) 密钥防护）。同时，**含密钥的工具调用参数与结果不做 500 字截断**
+（完整展示），并在行内把命中的密钥值（`NEOKEY_*` token 与具名规则命中的原始密钥）以同一
+`NeoAISecretWarning` 高亮（`message_list` 与轨迹模式一致）。
+命令输出中的 **ANSI SGR 颜色**（如 `\27[1;36m…\27[0m`）由 `utils.ansi` 解析：转义序列从展示文本中
+剥离，颜色/属性（16/256/真彩色 + bold/italic/underline/reverse/strikethrough）以惰性创建的高亮组
+（`NeoAIAnsi_*`）按区间贴合，非 SGR 的 CSI/OSC 序列（光标、清屏、窗口标题）一并剥离；
+模型可见的结果内容保持原样，颜色仅影响展示。
 
 ### 4.5 推理与工具参数悬浮窗
 
@@ -93,7 +105,8 @@
   参数接收阶段先收起思考悬浮窗（避免两窗重叠）；批量冲刷 + 取消标记（`_cancel_pending_tool_args`）。
 
 两者都：光标不跟随时不弹（`_cursor_within_follow_margin`）、`minimal` 浮窗、`foldenable=false`
-（避免继承全局折叠把内容收起）。共享的 `float_stream_window` 还：按**显示行数**
+（避免继承全局折叠把内容收起），且**高度上限 5 行**（`open(title, { max_height = 5 })`，
+`float_stream_window` 按 `max_height` 限制自适应高度）。共享的 `float_stream_window` 还：按**显示行数**
 （`nvim_win_text_height`，含 wrap 折行）自适应高度、开启 `smoothscroll`、写入后**先增高再滚**，
 并把光标移到内容末尾（`G$`）后 `zb` 贴底，保证长单行/大量内容始终滚到最新尾部。
 
@@ -125,6 +138,22 @@
 焦点离开（或主窗口被 `:bnext` 切到别的文件）时收起输入框（`_collapse_aux`），回到聊天时恢复
 （`_restore_aux`，输入 buffer 内容保留）。
 
+### 4.8 界面 buffer 的 LSP 隔离（ui/lsp_guard）
+
+NeoAI 的聊天/输入框/悬浮窗等都是纯 UI 文本，若 LSP 客户端（native LSP / GitHub Copilot）
+挂载上去，`document_color` / `folding_range` / `semantic_tokens` / `inline_completion` 会持续
+空耗 CPU（Copilot 尤其明显）。`ui/lsp_guard` 统一拦截：
+
+- 以 `neoai*` filetype（或 `b:neoai_ui` 标记）识别 NeoAI buffer；
+- **一次性**把 `neoai*` 写入 `g:copilot_filetypes`（值空 = 禁用）：copilot.vim 从源头就不
+  attach/启动 language server（`nofile` 不在其内置禁用列表里），避免「先启动再被解绑」的开销；
+- `FileType neoai*` 时设置 `b:neoai_ui`、普通 buftype 改 `nofile`（阻断 native LSP 自动启动；
+  保留 `acwrite`，轨迹模式 `:w` 保存依赖它）、逐 buffer 关闭 Copilot
+  （`b:copilot_disabled`/`b:copilot_disable`/`b:copilot_enabled=false`）并解绑已挂载客户端；
+- `LspAttach` 兜底：对 NeoAI buffer 上延迟/异步挂载的客户端 schedule 解绑。
+
+由 `ui.init` 安装、`ui.reset` 卸载（幂等，可热重载）。
+
 ## 5. 显示模式（display_modes）
 
 参照 deepseek-harness 的 Cordis 插件模型，把聊天界面的「显示模式」做成插件：
@@ -142,9 +171,10 @@
 | --- | --- |
 | `input_box` | 聊天输入框。`create`/`attach_window`/`focus`/`submit`/`on_submitted`/`clear`；`virt_text` 渲染 `>` 前缀；放开 `neoai_input` 文件类型补全。 |
 | `message_list` | 消息列表渲染。`render(buf, messages)`；`toggle_reasoning()`。 |
-| `float_stream_window` | 复用流式悬浮窗。`open(title,{filetype})`/`set_text`/`append`/`get_text`/`close`/`is_open`/`reset`；思考过程 / 接收参数 / 计划蒸馏共享同一窗口（上下文压缩为后台异步、不弹窗，不再使用）。窗口高度按显示行数（`nvim_win_text_height`）自适应，开启 `smoothscroll`，写入后先增高再滚、光标移到内容末尾后 `zb` 贴底。 |
-| `reasoning_panel` | 思考过程悬浮窗（`float_stream_window` 适配器）。`open`/`show`/`append`/`close`/`is_open`；`filetype=neoai_reasoning`。 |
-| `tool_args_panel` | 工具参数接收悬浮窗（`float_stream_window` 适配器，流式工具调用参数）。单工具时按分片增量 `append`，否则整段重建；`open`/`show`/`close`/`is_open`/`get_content`/`reset`；`filetype=neoai_tool_args`。 |
+| `float_stream_window` | 复用流式悬浮窗。`open(title,{filetype,max_height})`/`set_text`/`append`/`get_text`/`close`/`is_open`/`reset`；思考过程 / 接收参数 / 计划蒸馏共享同一窗口（上下文压缩为后台异步、不弹窗，不再使用）。窗口高度按显示行数（`nvim_win_text_height`）自适应，受 `max_height` 限制，开启 `smoothscroll`，写入后先增高再滚、光标移到内容末尾后 `zb` 贴底。 |
+| `reasoning_panel` | 思考过程悬浮窗（`float_stream_window` 适配器，高度上限 5 行）。`open`/`show`/`append`/`close`/`is_open`；`filetype=neoai_reasoning`。 |
+| `tool_args_panel` | 工具参数接收悬浮窗（`float_stream_window` 适配器，流式工具调用参数，高度上限 5 行）。单工具时按分片增量 `append`，否则整段重建；`open`/`show`/`close`/`is_open`/`get_content`/`reset`；`filetype=neoai_tool_args`。 |
+| `lsp_guard` | 界面 buffer 的 LSP 隔离。`install()`/`uninstall()`/`disable(buf)`；按 `neoai*` filetype 关闭 LSP/Copilot 并解绑已挂载客户端（见 §4.8）。 |
 | `model_picker` | 模型选择器（异步加载模型列表）。`open(callback)`。 |
 | `tool_approval` | 工具审批弹窗。`init()`；串行单槽位展示。 |
 | `ask_user` | 向用户提问弹窗。`init()`；经 `ask_user.set_ui` 注入。 |

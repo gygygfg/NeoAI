@@ -38,15 +38,17 @@ end
 --- @param action string "write"|"delete"|"mkdir"|"rmdir"
 --- @param path string
 --- @param content string|nil
+--- @param mode number|nil 权限位（保留暂存候选的原权限）
 --- @return boolean, string|nil
-local function _root_op(action, path, content)
+local function _root_op(action, path, content, mode)
   if action == "write" then
     fs.ensure_dir(vim.fn.fnamemodify(path, ":h"))
-    return fs.write_file_atomic(path, content or "")
+    return fs.write_file_atomic(path, content or "", { mode = mode })
   elseif action == "delete" then
     return fs.delete_file(path)
   elseif action == "mkdir" then
     fs.ensure_dir(path)
+    if mode then fs.chmod(path, mode) end
     return true
   elseif action == "rmdir" then
     local r = vim.fn.delete(path, "d")
@@ -60,11 +62,12 @@ end
 --- @return string
 local function _nonroot_snippet(action)
   if action == "write" then
-    return 'tmp="$1.tmp.$$"; umask 022; cat > "$tmp" && mv -f "$tmp" "$1"'
+    -- 保留原权限位：mkstemp/cat 默认 0600 会剥离可执行位（venv/bin 脚本等）。
+    return 'tmp="$1.tmp.$$"; umask 022; cat > "$tmp" && mv -f "$tmp" "$1" && { [ -n "$2" ] && chmod "$2" "$1" || true; }'
   elseif action == "delete" then
     return 'rm -f -- "$1"'
   elseif action == "mkdir" then
-    return 'mkdir -p -- "$1"'
+    return 'mkdir -p -- "$1" && { [ -n "$2" ] && chmod "$2" "$1" || true; }'
   elseif action == "rmdir" then
     return 'rmdir -- "$1"'
   end
@@ -77,14 +80,15 @@ end
 --- @param content string|nil
 --- @param uid number
 --- @param gid number
+--- @param mode number|nil
 --- @return boolean, string|nil
-local function _nonroot_op(action, path, content, uid, gid)
+local function _nonroot_op(action, path, content, uid, gid, mode)
   if vim.fn.executable("setpriv") ~= 1 then
     return false, "SETPRIV_UNAVAILABLE"
   end
   local argv = {
     "setpriv", "--reuid", tostring(uid), "--regid", tostring(gid), "--clear-groups",
-    "sh", "-c", _nonroot_snippet(action), "sh", path,
+    "sh", "-c", _nonroot_snippet(action), "sh", path, mode and string.format("%o", mode) or "",
   }
   local out = vim.fn.system(argv, action == "write" and (content or "") or nil)
   if vim.v.shell_error == 0 then return true end
@@ -95,9 +99,10 @@ end
 --- @param action string
 --- @param path string
 --- @param content string|nil
+--- @param mode number|nil
 --- @return boolean, string|nil
-function M.sudo_op(action, path, content)
-  local argv = { "sudo", "sh", "-c", _nonroot_snippet(action), "sh", path }
+function M.sudo_op(action, path, content, mode)
+  local argv = { "sudo", "sh", "-c", _nonroot_snippet(action), "sh", path, mode and string.format("%o", mode) or "" }
   local out = vim.fn.system(argv, action == "write" and (content or "") or nil)
   if vim.v.shell_error == 0 then return true end
   return false, tostring(out)
@@ -107,28 +112,51 @@ end
 --- @param action string "write"|"delete"|"mkdir"|"rmdir"
 --- @param path string
 --- @param content string|nil
---- @param opts table|nil { allow_root?: boolean, prefer_sudo?: boolean }
+--- @param opts table|nil { allow_root?: boolean, prefer_sudo?: boolean, mode?: number }
 --- @return table { ok, state, writer?, escalated?, reason?, err? }
 function M.apply(action, path, content, opts)
   opts = opts or {}
   local runtime = require("NeoAI.sandbox.runtime")
   local uid, gid = runtime.payload_ids()
-  local nonroot = uid ~= nil and uid > 0
   local cur = vim.uv.getuid()
+  local mode = opts.mode
+  -- 未记录权限时：保留目标已有权限；新建文件用常规 0644（避免 mkstemp 的 0600）。
+  if mode == nil and action == "write" then
+    local st = vim.uv.fs_stat(path)
+    mode = st and (st.mode % 512) or 420
+  end
 
-  -- 非 root 载荷场景：当前进程已是载荷身份（非 root 启动）或显式放弃降权（root + uid=0）。
-  if not nonroot or cur == uid then
-    local ok, err = _root_op(action, path, content)
+  -- NeoAI 本身非 root：先以当前身份写入；权限不足 → NEEDS_ROOT，用户批准后经 sudo 写入。
+  if cur ~= 0 then
+    local ok, err = _root_op(action, path, content, mode)
+    if ok then
+      return { ok = true, state = M.STATE.WRITTEN, writer = "nonroot" }
+    end
+    if not _perm_error(err) then
+      return { ok = false, state = M.STATE.FAILED, err = err }
+    end
+    if not opts.allow_root then
+      return { ok = false, state = M.STATE.NEEDS_ROOT, reason = "WRITE_REQUIRES_ROOT: " .. tostring(path), err = err }
+    end
+    local sok, serr = M.sudo_op(action, path, content, mode)
+    return { ok = sok, state = sok and M.STATE.WRITTEN or M.STATE.FAILED,
+      writer = "sudo", escalated = true, err = serr }
+  end
+
+  local nonroot = uid ~= nil and uid > 0
+  -- root 进程 + run_as=0（显式放弃降权）：直接以 root 写入。
+  if not nonroot then
+    local ok, err = _root_op(action, path, content, mode)
     return {
       ok = ok,
       state = ok and M.STATE.WRITTEN or M.STATE.FAILED,
-      writer = (cur == 0) and "root" or "nonroot",
+      writer = "root",
       err = err,
     }
   end
 
   -- root 进程 + 专用非 root uid：先降权尝试。
-  local ok, err = _nonroot_op(action, path, content, uid, gid)
+  local ok, err = _nonroot_op(action, path, content, uid, gid, mode)
   if ok then
     return { ok = true, state = M.STATE.WRITTEN, writer = "nonroot" }
   end
@@ -140,12 +168,12 @@ function M.apply(action, path, content, opts)
   if not opts.allow_root then
     return { ok = false, state = M.STATE.NEEDS_ROOT, reason = "WRITE_REQUIRES_ROOT: " .. tostring(path), err = err }
   end
-  if opts.prefer_sudo and cur ~= 0 then
-    local sok, serr = M.sudo_op(action, path, content)
+  if opts.prefer_sudo then
+    local sok, serr = M.sudo_op(action, path, content, mode)
     return { ok = sok, state = sok and M.STATE.WRITTEN or M.STATE.FAILED,
       writer = "sudo", escalated = true, err = serr }
   end
-  local rok, rerr = _root_op(action, path, content)
+  local rok, rerr = _root_op(action, path, content, mode)
   return { ok = rok, state = rok and M.STATE.WRITTEN or M.STATE.FAILED,
     writer = "root", escalated = true, err = rerr }
 end

@@ -179,6 +179,25 @@ tests.suite("status", function(_, it)
     services.provide("services.sandbox", saved)
   end)
 
+  it("越界留痕点亮 sandbox 徽标并显示越界N", function(t)
+    init_chat()
+    local status = require("NeoAI.services.status")
+    local services = require("NeoAI.kernel.services")
+    local saved = services.use("services.sandbox")
+    services.provide("services.sandbox", {
+      pending_count = function() return 0 end,
+      trace_count = function() return 2 end,
+    })
+    t.eq("越界2", status.segment("sandbox"), "仅有越界留痕时应显示越界N")
+    t.true_(status.has("sandbox"), "有越界留痕时徽标应渲染")
+    services.provide("services.sandbox", {
+      pending_summary = function() return { count = 1, max_level = 1 } end,
+      trace_count = function() return 3 end,
+    })
+    t.eq("待审1 越界3", status.segment("sandbox"), "待审与越界应并列显示")
+    services.provide("services.sandbox", saved)
+  end)
+
   it("capacity 优先用 API 最近一次用量并分级告警", function(t)
     local chat = init_chat()
     local status = require("NeoAI.services.status")

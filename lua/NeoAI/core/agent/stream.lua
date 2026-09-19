@@ -8,24 +8,36 @@ local M = {}
 local event_bus = require("NeoAI.kernel.event_bus")
 local events = require("NeoAI.kernel.events")
 
+-- ========== 私有常量 ==========
+
+-- 工具参数快照推送节流（毫秒）：`_finalize_tool_calls` 会拼接全部已累积参数，逐分片调用
+-- 对超大参数（如 write_file 写入大文件）是 O(n²) 主线程开销。改为最多每此间隔推一次快照，
+-- 首个分片立即推送（UI 据此打开"接收参数"悬浮窗），完整结果由 finish() 统一给出。
+local TOOL_ARG_EMIT_INTERVAL_MS = 50
+
 -- ========== 私有函数 ==========
 
 --- 累积工具调用增量
+--- 参数/名称分片按数组累积、仅在 finalize 时 concat：逐分片 `s = s .. frag` 对超大参数
+--- （write_file 写入大文件）是 O(n²) 主线程拷贝，会让单核长时间跑满；分片累积为 O(n)。
 --- 输入 chunks 数组，每个可能是 { index, id?, type?, function = { name?, arguments? } }
---- @param acc table|nil 已累积的 { [index] = { id, name, arguments } }
+--- @param acc table|nil 已累积的 { [index] = { id, name_parts, arg_parts } }
 --- @param tool_calls table 增量块
 --- @return table 累积表
 local function _accumulate_tool_calls(acc, tool_calls)
   acc = acc or {}
   for _, tc in ipairs(tool_calls or {}) do
     local idx = tc.index or 0
-    local entry = acc[idx] or { id = nil, name = nil, arguments = "" }
+    local entry = acc[idx] or { id = nil, name = nil, name_parts = {}, arg_parts = {} }
     if tc.id then entry.id = tc.id end
     if tc.type then entry.type = tc.type end
     local fn = tc["function"]
     if fn then
-      if fn.name then entry.name = entry.name and (entry.name .. fn.name) or fn.name end
-      if fn.arguments then entry.arguments = entry.arguments .. fn.arguments end
+      if fn.name then
+        entry.name_parts[#entry.name_parts + 1] = fn.name
+        entry.name = table.concat(entry.name_parts)
+      end
+      if fn.arguments then entry.arg_parts[#entry.arg_parts + 1] = fn.arguments end
     end
     acc[idx] = entry
   end
@@ -43,12 +55,14 @@ local function _finalize_tool_calls(acc)
   for _, idx in ipairs(indices) do
     local entry = acc[idx]
     if entry and entry.name and entry.name ~= "" then
+      local args = entry.arguments
+      if args == nil and entry.arg_parts then args = table.concat(entry.arg_parts) end
       out[#out + 1] = {
         id = entry.id or ("call_" .. tostring(idx)),
         type = "function",
         ["function"] = {
           name = entry.name,
-          arguments = entry.arguments or "{}",
+          arguments = (args ~= nil and args ~= "") and args or "{}",
         },
       }
     end
@@ -64,6 +78,7 @@ end
 function M.create(agent)
   local tool_acc = nil
   local reasoning_active = false
+  local last_arg_emit_ms = 0
 
   local processor = {}
 
@@ -92,11 +107,15 @@ function M.create(agent)
     if parsed.tool_calls then
       tool_acc = _accumulate_tool_calls(tool_acc, parsed.tool_calls)
       updated.tool_calls = true
-      -- 实时推送当前累积的工具调用快照：UI 用它像思考过程悬浮窗一样打开"接收参数"悬浮窗。
-      event_bus.emit(events.TOOL_ARG_CHUNK, {
-        agent_id = agent.id,
-        tool_calls = _finalize_tool_calls(tool_acc),
-      })
+      -- 实时推送当前累积的工具调用快照（节流）：UI 用它像思考过程悬浮窗一样打开"接收参数"悬浮窗。
+      local now_ms = vim.uv.hrtime() / 1e6
+      if now_ms - last_arg_emit_ms >= TOOL_ARG_EMIT_INTERVAL_MS then
+        last_arg_emit_ms = now_ms
+        event_bus.emit(events.TOOL_ARG_CHUNK, {
+          agent_id = agent.id,
+          tool_calls = _finalize_tool_calls(tool_acc),
+        })
+      end
     end
     if parsed.finish_reason then
       updated.finish_reason = parsed.finish_reason
@@ -126,6 +145,7 @@ function M.create(agent)
   function processor.reset()
     tool_acc = nil
     reasoning_active = false
+    last_arg_emit_ms = 0
   end
 
   return processor

@@ -1,16 +1,20 @@
---- LSP 进程命名空间覆盖
+--- AI 专用沙箱 LSP 客户端
 --- @module NeoAI.sandbox.lsp
---- 通过包装 `vim.lsp.rpc.start`，把 LSP server 启动命令放进 bwrap 挂载命名空间，
---- 并在工作区根上挂 overlayfs（lower=真实工作区只读，upper=沙箱私有可写层）。
---- 效果：LSP server 读取磁盘时看到 AI 尚未发布的暂存内容（真实路径），
---- 与进程内工具的用户态暂存保持一致；宿主真实文件不被改动。
+--- 为 AI 的 `lsp_*` 工具提供**独立的**沙箱化 LSP 客户端：把 server 启动命令放进
+--- bwrap 挂载命名空间，并在工作区根上挂 overlayfs（lower=真实工作区只读，
+--- upper=沙箱私有可写层）。效果：该 server 读取磁盘时看到 AI 尚未发布的暂存内容
+--- （真实路径），与进程内工具的用户态暂存保持一致；宿主真实文件不被改动。
+---
+--- 与编辑器自身的 LSP **完全隔离**：不再全局包装 `vim.lsp.rpc.start`，编辑器 LSP
+--- 进程照常读写真实磁盘。只有 AI 工具调用时按需克隆编辑器同名 server（名称加
+--- `@neoai-sandbox` 后缀），克隆体才走沙箱命名空间与暂存层，且其诊断不外溢到编辑器。
 ---
 --- 仅覆盖「磁盘读取」；LSP 返回的编辑仍由 Neovim 应用到 buffer，写盘经
 --- `tool_helpers.persist_buffer` 重定向到暂存层。LSP 自身缓存目录以 rw bind
 --- 直连宿主，避免把缓存写入 overlay 或待审队列。
 ---
---- 默认开启（`tools.sandbox.lsp_overlay.enabled = true`），使 LSP 与 run_command/git 读工具
---- 共享同一暂存视图；overlay 不可用（如 tmpfs 工作区）时自动跳过，不影响 LSP 正常使用。
+--- 默认开启（`tools.sandbox.lsp_overlay.enabled = true`）；overlay 不可用（如 tmpfs
+--- 工作区）时自动跳过，AI 工具回退到编辑器客户端，不影响正常使用。
 
 local fs = require("NeoAI.utils.fs")
 local config_store = require("NeoAI.kernel.config_store")
@@ -19,10 +23,8 @@ local M = {}
 
 -- ========== 私有状态 ==========
 
-local state = {
-  installed = false,
-  original_start = nil,
-}
+-- 克隆客户端缓存：key = "<editor_name>\0<root_dir>" -> client_id
+local clones = {}
 
 -- ========== 私有函数 ==========
 
@@ -65,6 +67,9 @@ local function _rw_dirs()
   add(vim.fn.expand("~/.cache"))
   add(vim.fn.expand("~/.local/share"))
   add(vim.fn.expand("~/.local/state"))
+  -- npm/npx 缓存直连宿主：否则 npx 下载的包会写进 overlay upper，而每次 LSP 启动
+  -- 都会 _wipe_upper，导致（如 copilot）每会话重新下载/解包，失败即 exit 1。
+  add(vim.fn.expand("~/.npm"))
   return dirs
 end
 
@@ -79,6 +84,9 @@ local function _resolve_specs(cwd)
   fs.ensure_dir(upper)
   fs.ensure_dir(work)
   fs.ensure_dir(bind)
+  -- overlay 可写性由隔离标志决定：必须与探测/run_command 使用同一组 bwrap_flags()
+  -- （root 下为 NO_USER_FLAGS，不含 userns）。若硬编码 --unshare-all，overlay 在
+  -- userns 内会变成只读（lower=/ 时甚至挂载 EINVAL），导致 LSP 启动即退出。
   if not runtime.overlay_mountable(cwd, upper, work) then return nil end
   return { { root = cwd, upper = upper, work = work, bind = bind, mode = "overlay" } }
 end
@@ -103,11 +111,17 @@ end
 --- @param cwd string
 --- @return table argv
 local function _prefix(specs, cwd)
-  local argv = {
-    "bwrap", "--unshare-all", "--die-with-parent", "--new-session",
-  }
-  -- 最小只读系统集（与 run_command 一致的读取面），不再 `--ro-bind / /`。
   local runtime = require("NeoAI.sandbox.runtime")
+  -- 隔离标志必须与 overlay 探测/run_command 保持一致（root 下为 NO_USER_FLAGS）。
+  -- 硬编码 --unshare-all 会在 userns 内让 overlay 只读，lower=/ 时更会挂载 EINVAL。
+  local argv = { "bwrap" }
+  for _, f in ipairs(runtime.bwrap_flags()) do
+    table.insert(argv, f)
+  end
+  for _, f in ipairs({ "--die-with-parent", "--new-session" }) do
+    table.insert(argv, f)
+  end
+  -- 最小只读系统集（与 run_command 一致的读取面），不再 `--ro-bind / /`。
   runtime.append_readonly(argv)
   for _, f in ipairs({ "--dev", "/dev", "--proc", "/proc" }) do
     table.insert(argv, f)
@@ -166,37 +180,123 @@ function M.wrap_cmd(cmd, extra)
   return full
 end
 
---- 安装 `vim.lsp.rpc.start` 包装（幂等）。
---- @return function|nil cleanup 卸载函数
-function M.install()
-  if state.installed then return M._cleanup end
-  if type(vim.lsp) ~= "table" or type(vim.lsp.rpc) ~= "table"
-    or type(vim.lsp.rpc.start) ~= "function" then
-    return nil
-  end
-  state.original_start = vim.lsp.rpc.start
-  vim.lsp.rpc.start = function(cmd, dispatchers, extra_spawn_params)
-    local ok, wrapped = pcall(M.wrap_cmd, cmd, extra_spawn_params)
-    if ok and wrapped then cmd = wrapped end
-    return state.original_start(cmd, dispatchers, extra_spawn_params)
-  end
-  state.installed = true
-  return M._cleanup
+--- 克隆客户端名称后缀（用于识别与编辑器客户端的区别）。
+local CLONE_SUFFIX = "@neoai-sandbox"
+
+--- @param name string|nil
+--- @return boolean
+local function _is_clone(name)
+  return type(name) == "string" and name:sub(-#CLONE_SUFFIX) == CLONE_SUFFIX
 end
 
---- 卸载包装，恢复原始 `vim.lsp.rpc.start`。
-function M._cleanup()
-  if not state.installed then return end
-  if state.original_start and type(vim.lsp) == "table" and type(vim.lsp.rpc) == "table" then
-    vim.lsp.rpc.start = state.original_start
+--- 某 buffer 上的编辑器 LSP 客户端（排除本模块的克隆体）。
+--- @param bufnr number
+--- @return table[]
+local function _editor_clients(bufnr)
+  local out = {}
+  for _, c in ipairs(vim.lsp.get_clients({ bufnr = bufnr })) do
+    if not _is_clone(c.name) then out[#out + 1] = c end
   end
-  state.installed = false
-  state.original_start = nil
+  return out
+end
+
+--- 基于编辑器客户端构造沙箱克隆配置；cmd 无法包装（函数式 / overlay 不可用）时返回 nil。
+--- @param ec table 编辑器客户端
+--- @return table|nil
+local function _clone_cfg(ec)
+  local base = ec.config or {}
+  local wrapped = M.wrap_cmd(base.cmd, { cwd = base.root_dir, env = base.cmd_env, detached = base.detached })
+  if not wrapped then return nil end
+  return {
+    name = base.name .. CLONE_SUFFIX,
+    cmd = wrapped,
+    root_dir = base.root_dir,
+    filetypes = base.filetypes,
+    capabilities = base.capabilities,
+    init_options = base.init_options,
+    settings = base.settings,
+    cmd_cwd = base.cmd_cwd,
+    cmd_env = base.cmd_env,
+    detached = base.detached,
+    -- 克隆体的诊断不外溢到编辑器（避免重复诊断/悬浮噪音）；AI 通过 pull diagnostics 读取。
+    handlers = { ["textDocument/publishDiagnostics"] = function() end },
+  }
+end
+
+--- 取得某编辑器客户端的沙箱克隆（按 name+root 缓存并复用）。
+--- @param ec table 编辑器客户端
+--- @param bufnr number
+--- @return table|nil
+local function _clone_of(ec, bufnr)
+  local key = tostring(ec.name) .. "\0" .. tostring((ec.config or {}).root_dir or "")
+  local id = clones[key]
+  local clone = id and vim.lsp.get_client_by_id(id)
+  if clone and clone:is_stopped() then
+    clone = nil
+  end
+  if not clone then
+    local cfg = _clone_cfg(ec)
+    if not cfg then return nil end
+    local ok, new_id = pcall(vim.lsp.start, cfg, { bufnr = bufnr })
+    if not ok or not new_id then return nil end
+    clones[key] = new_id
+    clone = vim.lsp.get_client_by_id(new_id)
+  elseif bufnr and not clone.attached_buffers[bufnr] then
+    pcall(vim.lsp.buf_attach_client, bufnr, clone.id)
+  end
+  return clone
+end
+
+--- 取得某 buffer 上所有编辑器 LSP 的沙箱克隆（按需启动）。
+--- 配置关闭 / overlay 不可用 / 函数式 cmd 时跳过对应 server。
+--- @param bufnr number|nil
+--- @return table[] clients
+function M.clients_for(bufnr)
+  if _cfg().enabled ~= true then return {} end
+  bufnr = bufnr or vim.api.nvim_get_current_buf()
+  if not vim.api.nvim_buf_is_valid(bufnr) then return {} end
+  local out = {}
+  for _, ec in ipairs(_editor_clients(bufnr)) do
+    local clone = _clone_of(ec, bufnr)
+    if clone then out[#out + 1] = clone end
+  end
+  return out
+end
+
+--- 找一个支持指定方法的沙箱克隆。
+--- bufnr 为 nil 时在所有已存在的克隆里查找。
+--- @param method string
+--- @param bufnr number|nil
+--- @return table|nil
+function M.client_supporting(method, bufnr)
+  if _cfg().enabled ~= true then return nil end
+  local list = {}
+  if bufnr then
+    list = M.clients_for(bufnr)
+  else
+    for _, id in pairs(clones) do
+      local c = vim.lsp.get_client_by_id(id)
+      if c and not c:is_stopped() then list[#list + 1] = c end
+    end
+  end
+  for _, c in ipairs(list) do
+    if c:supports_method(method, bufnr) then return c end
+  end
+  return nil
+end
+
+--- 停止全部沙箱克隆并清空缓存。
+function M.stop_all()
+  for key, id in pairs(clones) do
+    local c = vim.lsp.get_client_by_id(id)
+    if c then pcall(function() c:stop() end) end
+    clones[key] = nil
+  end
 end
 
 --- 重置（测试用）
 function M.reset()
-  M._cleanup()
+  M.stop_all()
 end
 
 return M

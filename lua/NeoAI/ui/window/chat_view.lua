@@ -438,7 +438,10 @@ local function _tool_tick()
   if not M.has_window() then return end
   -- 仅刷新折叠文本（工具耗时），保持已展开折叠与光标/视口不变，避免打断用户查看。
   _schedule_render(true)
-  if fold.has_running() then
+  -- 继续刷新需同时满足「有工具在执行」且「agent 确实忙碌」：若某工具漏发结束事件，
+  -- has_running() 会长期为真；仅凭它会每 1s 重渲染整个聊天 buffer（历史很长时占满
+  -- 主线程，agent loop 结束后仍在跑）。agent 空闲即停，杜绝这种空转。
+  if fold.has_running() and chat_service.has_pending_work() then
     state.tool_tick = vim.fn.timer_start(TOOL_TICK_MS, _tool_tick, vim.empty_dict())
   end
 end
@@ -596,6 +599,8 @@ local function _on_agent_end(payload)
   -- 若仍有工作（正忙/暂存消息正逐条刷新、继续生成），保持光标在主窗口观看流式输出，
   -- 避免每个刷新 turn 都触发一次进入插入模式。
   if payload and payload.agent_id == state.agent_id and not chat_service.has_pending_work() then
+    -- 生成真正结束：立即停掉工具耗时刷新定时器，避免残留的 running 记录让它空转。
+    _stop_tool_tick()
     _focus_input_insert()
   end
 end
@@ -631,7 +636,7 @@ end
 --- 切换模型
 local function _switch_model()
   model_picker.open(function(model_id, provider)
-    chat_service.switch_model(model_id)
+    chat_service.switch_model(model_id, provider)
     vim.notify("[NeoAI] 已切换模型: " .. model_id, vim.log.levels.INFO)
   end)
 end

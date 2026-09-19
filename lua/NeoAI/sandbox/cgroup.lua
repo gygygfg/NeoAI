@@ -5,6 +5,10 @@
 
 local M = {}
 
+-- 共享父域名称：所有并发沙箱任务挂在同一父域下，父域持有全局 CPU 预算，
+-- 子域持有单任务配额，从而保证「并发任务 CPU 配额之和」不超过宿主可用核数。
+local PARENT_NAME = "neoai"
+
 -- ========== 私有状态 ==========
 
 local state = {
@@ -36,6 +40,12 @@ end
 
 local function _safe_id(id)
   return tostring(id):gsub("[^%w_%-]", "_")
+end
+
+--- 共享父域路径（承载全局 CPU 预算）
+--- @return string
+local function _parent_path()
+  return _base() .. "/" .. PARENT_NAME
 end
 
 --- 宿主逻辑 CPU 数（用于动态 CPU 配额）
@@ -95,6 +105,28 @@ function M.resolve_limits()
   return out
 end
 
+--- 全局 CPU 预算（核）：静态 `cpu_global_max>0` 优先，否则 `max(1, 核数 - 1)`。
+--- 保留 1 个核给 nvim/UI，避免沙箱并发任务吃满整机导致界面卡顿（计时器无法刷新）。
+--- 父域 `cpu.max` 用该预算，子域配额再按 `cpu_cores_max` 细分，保证总量不超卖。
+--- @return number 核数
+function M.global_cpu_max()
+  local cfg = require("NeoAI.kernel.config_store").get("tools.sandbox.limits") or {}
+  local explicit = tonumber(cfg.cpu_global_max) or 0
+  if explicit > 0 then return explicit end
+  return math.max(1, _nproc() - 1)
+end
+
+--- 单个子域实际生效的 CPU 配额（微秒/100ms）：不超过全局预算。
+--- @param cpu_max number 期望的单任务配额
+--- @return number 生效配额（0 = 不限制）
+function M.effective_cpu_max(cpu_max)
+  cpu_max = tonumber(cpu_max) or 0
+  if cpu_max <= 0 then return 0 end
+  local global_us = M.global_cpu_max() * 100000
+  if global_us > 0 and cpu_max > global_us then return global_us end
+  return cpu_max
+end
+
 -- ========== 公开 API ==========
 
 --- 探测 cgroup v2 能力
@@ -140,17 +172,34 @@ function M.prepare(attempt_id, limits)
     return nil, "SANDBOX_CGROUP_UNAVAILABLE"
   end
   local base = caps.base
-  -- 在根开启需要的控制器（root 允许同时有进程与 subtree_control）
+  -- 需要的控制器（root 允许同时有进程与 subtree_control）
   local wanted = {}
   if (limits.memory_bytes or 0) > 0 then wanted[#wanted + 1] = "memory" end
   if (limits.pids or 0) > 0 then wanted[#wanted + 1] = "pids" end
   if (limits.cpu_max or 0) > 0 then wanted[#wanted + 1] = "cpu" end
-  if #wanted > 0 then
-    pcall(_write_file, base .. "/cgroup.subtree_control", "+" .. table.concat(wanted, " +"))
+  local spec = #wanted > 0 and ("+" .. table.concat(wanted, " +")) or nil
+  -- 共享父域：所有并发任务挂其下。父域持有全局 CPU 预算，把控制器委派给子域；
+  -- 父域自身不驻留进程（进程只在叶子子域），满足 cgroup v2「无内部进程」约束。
+  local parent = _parent_path()
+  vim.fn.mkdir(parent, "p")
+  if vim.fn.isdirectory(parent) ~= 1 then
+    return nil, "SANDBOX_CGROUP_CREATE_FAILED: " .. parent
   end
-  local path = base .. "/neoai_" .. _safe_id(attempt_id)
+  if spec then
+    pcall(_write_file, base .. "/cgroup.subtree_control", spec)
+    pcall(_write_file, parent .. "/cgroup.subtree_control", spec)
+  end
+  local global_us = 0
+  if (limits.cpu_max or 0) > 0 then
+    -- 父域 cpu.max = 全局预算：子域之和被限制在预算内，不再随并发数超卖。
+    global_us = M.global_cpu_max() * 100000
+    if global_us > 0 then
+      pcall(_write_file, parent .. "/cpu.max", tostring(global_us) .. " 100000")
+    end
+  end
+  local path = parent .. "/neoai_" .. _safe_id(attempt_id)
   vim.fn.mkdir(path, "p")
-  if not vim.fn.isdirectory(path) then
+  if vim.fn.isdirectory(path) ~= 1 then
     return nil, "SANDBOX_CGROUP_CREATE_FAILED: " .. path
   end
   if (limits.memory_bytes or 0) > 0 then
@@ -159,11 +208,19 @@ function M.prepare(attempt_id, limits)
   if (limits.pids or 0) > 0 then
     pcall(_write_file, path .. "/pids.max", tostring(limits.pids))
   end
-  if (limits.cpu_max or 0) > 0 then
+  local child_cpu = M.effective_cpu_max(limits.cpu_max)
+  if child_cpu > 0 then
     -- cpu.max 单位：quota period（微秒），如 "50000 100000" = 0.5 CPU
-    pcall(_write_file, path .. "/cpu.max", tostring(limits.cpu_max) .. " 100000")
+    pcall(_write_file, path .. "/cpu.max", tostring(child_cpu) .. " 100000")
   end
-  local handle = { attempt_id = attempt_id, path = path, limits = vim.deepcopy(limits) }
+  local handle = {
+    attempt_id = attempt_id,
+    path = path,
+    parent = parent,
+    limits = vim.deepcopy(limits),
+    cpu_max = child_cpu,
+    global_cpu_max = global_us,
+  }
   state.handles[attempt_id] = handle
   return handle
 end
@@ -176,7 +233,18 @@ function M.join_prefix(handle)
   return { "sh", "-c", "echo $$ > '" .. procs .. "'; exec \"$@\"", "sh" }
 end
 
---- 释放资源域：杀掉残留进程并删除
+--- 认领一个预热资源域到指定 attempt：更新索引与 handle.attempt_id，使 release 正常。
+--- 供观测预热复用（预热时以占位 id 创建，命令到来时改挂到真实 attempt）。
+--- @param handle table
+--- @param attempt_id string
+function M.adopt(handle, attempt_id)
+  if not handle or not attempt_id then return end
+  state.handles[handle.attempt_id] = nil
+  handle.attempt_id = attempt_id
+  state.handles[attempt_id] = handle
+end
+
+--- 释放资源域：杀掉残留进程并删除子域（共享父域保留，供后续任务复用）。
 --- @param handle table
 function M.release(handle)
   if not handle then return end
@@ -191,14 +259,19 @@ end
 
 --- 重置（测试用）
 function M.reset()
+  local parent = _parent_path()
+  pcall(_write_file, parent .. "/cgroup.kill", "1")
   for _, h in pairs(state.handles) do
     pcall(_write_file, h.path .. "/cgroup.kill", "1")
     vim.fn.delete(h.path, "d")
   end
   state.handles = {}
+  -- 子域清空后删除共享父域（cgroupfs 目录须为空才能 rmdir）
+  vim.fn.delete(parent, "d")
   state.caps = nil
 end
 
 M._safe_id = _safe_id
+M._parent_path = _parent_path
 
 return M

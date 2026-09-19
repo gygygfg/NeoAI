@@ -8,6 +8,7 @@
 ---   硬拒绝不可被确认覆盖；未知结果不报告为成功。
 
 local config_store = require("NeoAI.kernel.config_store")
+local instance = require("NeoAI.sandbox.instance")
 local store = require("NeoAI.sandbox.store")
 local control = require("NeoAI.sandbox.control")
 local candidate = require("NeoAI.sandbox.candidate")
@@ -45,13 +46,21 @@ local state = {
   initialized = false,
   active = nil, -- 当前暂存尝试（供 persist_buffer 重定向）
   session_unsubs = nil, -- 会话轮换的事件订阅句柄
+  gc_scheduled = false, -- 已调度过期实例目录回收
 }
 
 -- ========== 私有函数 ==========
 
-local function _root()
+local function _base_root()
   return config_store.get("tools.sandbox.workspace_root")
     or (vim.fn.stdpath("cache") .. "/NeoAI/sandbox")
+end
+
+--- 本进程的实例作用域 store 根。待审队列/候选/回执/证据均落在此目录下，
+--- 与其它并发 nvim 实例完全隔离（见 sandbox.instance）。
+--- @return string
+local function _root()
+  return instance.root(_base_root())
 end
 
 local function _emit(event, payload)
@@ -81,17 +90,34 @@ end
 
 -- ========== 公开 API ==========
 
---- 初始化：探测运行时能力并准备存储
+--- 初始化：准备本进程隔离的存储，并水合本进程的待审队列。
+--- 启动路径保持非阻塞：不再在 setup 时同步探测运行时能力（`runtime.capabilities()`
+--- 首次真正需要时惰性探测），过期实例目录的回收延迟到启动完成后调度。
 --- @return table
 function M.init()
   if state.initialized then return M end
-  store.init(_root())
-  cache.init(_root())
-  candidate.ensure_dirs(_root())
-  runtime.probe()
+  local root = _root()
+  store.init(root)
+  cache.init(root)
+  candidate.ensure_dirs(root)
   state.initialized = true
   _rehydrate_pending()
+  -- 启动探测内核级观测后端（eBPF/strace/procfs）：不可用或发生回退时 notify（异步，不阻塞启动）。
+  vim.schedule(function()
+    pcall(function() require("NeoAI.sandbox.observer").notify_backend() end)
+  end)
+  if not state.gc_scheduled then
+    state.gc_scheduled = true
+    local base = _base_root()
+    vim.schedule(function() pcall(instance.gc, base) end)
+  end
   return M
+end
+
+--- 配置的沙箱存储基根（所有实例目录的父级；不含本进程实例子目录）
+--- @return string
+function M.base_root()
+  return _base_root()
 end
 
 --- 探测运行时能力（含 cgroup / seccomp）
@@ -122,7 +148,22 @@ function M.watch_sessions()
   local event_bus = require("NeoAI.kernel.event_bus")
   local events = require("NeoAI.kernel.events")
   local unsubs = {}
-  local function rotate()
+  local function rotate(payload)
+    -- 仅当「当前主 Agent 仍在工作」时才抑制非本 Agent 的轮换。子 Agent / 辅助生成也会
+    -- 发同名 GENERATION_* 事件；若其结束就轮换，会删除主循环仍在使用的暂存目录
+    -- （进程 bind 挂载源），使运行中的 run_command 突然 ENOENT，表现为间歇性
+    -- `cd: can't cd to ...`。无当前 Agent（测试/无会话）或主 Agent 已空闲时保持旧行为。
+    local agent_id = type(payload) == "table" and payload.agent_id or nil
+    if agent_id ~= nil then
+      local ok, chat = pcall(require, "NeoAI.services.chat_service")
+      if ok and chat and type(chat.get_current_agent) == "function" then
+        local cur = chat.get_current_agent()
+        local busy = type(chat.has_pending_work) == "function" and chat.has_pending_work()
+        if cur and cur.id and cur.id ~= agent_id and busy then
+          return
+        end
+      end
+    end
     pcall(candidate.rotate_session)
   end
   for _, ev in ipairs({
@@ -272,6 +313,18 @@ function M.list_traces()
   return trace.list()
 end
 
+--- 越界访问留痕（按文件路径合并、排序；供审批悬浮窗展示）
+--- @return table 数组
+function M.list_traces_grouped()
+  return trace.list_grouped()
+end
+
+--- 越界访问留痕的去重文件数（供状态栏徽标）
+--- @return number
+function M.trace_count()
+  return trace.file_count()
+end
+
 --- 批准变更单元
 --- @param id string
 --- @return table|nil
@@ -302,6 +355,36 @@ end
 --- @return table
 function M.apply(id, opts)
   return review.apply(id, opts)
+end
+
+--- 撤销/重做保存：把真实文件与保存时保留的原文件快照交换（可反复切换）
+--- @param id string change_set_id
+--- @param opts table|nil { allow_root?, prefer_sudo?, force? }
+--- @return table { ok, state, reason? }
+function M.undo(id, opts)
+  M.init()
+  return review.undo(id, opts)
+end
+
+--- 列出已保存/已撤销（含快照）的变更单元
+--- @return table 数组
+function M.list_saved()
+  M.init()
+  local out = {}
+  for _, item in ipairs(review.list()) do
+    if item.snapshot_id and (item.apply_state == review.APPLY.APPLIED
+        or item.apply_state == review.APPLY.REVERTED) then
+      -- 附加快照文件清单（选择性应用时 item.files 可能含未应用文件）。
+      local snap = store.read_snapshot(item.snapshot_id)
+      local files = {}
+      for _, e in ipairs((snap and snap.files) or {}) do
+        files[#files + 1] = { path = e.path, action = e.action, side = e.side }
+      end
+      item.saved_files = files
+      out[#out + 1] = item
+    end
+  end
+  return out
 end
 
 --- 应用全部待审/已批准变更单元
@@ -419,10 +502,12 @@ function M.prune()
     local stale = (item.created_at or 0) < cutoff
     local terminal = item.review_state == review.REVIEW.REJECTED
       or item.apply_state == review.APPLY.APPLIED
+      or item.apply_state == review.APPLY.REVERTED
       or item.apply_state == review.APPLY.FAILED
       or item.apply_state == review.APPLY.CONFLICT
     if stale and terminal then
       store.discard_candidate(item.candidate_digest)
+      if item.snapshot_id then store.delete_snapshot(item.snapshot_id) end
       store.delete_review(item.change_set_id)
       removed_reviews = removed_reviews + 1
     else
@@ -484,6 +569,10 @@ M.trace = trace
 
 --- 重置（测试用）
 function M.reset()
+  -- 确保 store 根已知：前序代码可能已调用 store.reset() 将 root 置空；此时直接
+  -- store.reset() 会因 root 为 nil 而 no-op，无法删除磁盘上的残留候选/待审，造成
+  -- 跨 reset/跨套件污染。先按当前实例根初始化，使其可被清理。
+  if not store.root() then store.init(_root()) end
   candidate.reset()
   control.reset()
   store.reset()
@@ -507,9 +596,14 @@ function M.reset()
   trace.reset()
   pcall(function() require("NeoAI.sandbox.net_gateway").reset() end)
   pcall(function() require("NeoAI.sandbox.host_proxy").reset() end)
+  -- 回收观测预热（后台预挂载的 bpftrace 探针 + 预创建 cgroup），避免 reset 后残留。
+  pcall(function() require("NeoAI.sandbox.wrapper").clear_prewarm() end)
   state.active = nil
   state.initialized = false
   M.init()
+  -- 测试专用：reset 期望重置后立即具备确定的能力状态，故此处同步探测一次。
+  -- 生产启动路径（setup → init）仍保持惰性探测，不在此列。
+  pcall(runtime.probe)
 end
 
 return M

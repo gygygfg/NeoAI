@@ -16,7 +16,7 @@
 - **Tree-based session management** — manage multiple chat sessions as a branch tree, with branch creation, switching, and deletion
 - **A rich set of built-in tools** — the AI can call 40+ tools for file operations, code analysis, LSP, Shell commands, and more
 - **Tool approval system** — fine-grained control over tool execution permissions, supporting auto-allow / manual approval / argument-level allowlists
-- **Plan mode (PLAN) and plan distillation** — toggle with `m` or `:NeoAIPlan`; the tool context retains only read-only / informational queries plus `run_command` (read-only research), `ask_user` and `exit_plan_mode` (no mutating tools are exposed); after the AI researches and clarifies, it emits a formatted change plan and calls `exit_plan_mode`; once the user confirms, NeoAI switches to CHAT and executes the plan automatically, **distilling** the research context gathered during planning into a checkpoint that replaces the compacted range
+- **Plan mode (PLAN) and plan distillation** — toggle with `m` or `:NeoAIPlan`; the tool context retains only read-only / informational queries plus `run_command` (read-only research) and `ask_user` (no mutating tools are exposed, and no mode-switching tool is given to the AI); after the AI researches and clarifies, it emits a formatted change plan and ends the turn; once the user confirms (`:NeoAIApprovePlan` or manually toggling the mode), NeoAI switches to CHAT and executes the plan automatically, **distilling** the research context gathered during planning into a checkpoint that replaces the compacted range
 - **Background context compaction** — as the context threshold approaches, round 1 through the second-to-last round (keeping the last round intact) is folded **asynchronously in the background, non-blocking**, and a checkpoint is written into a **compaction overlay**: subsequent requests and further compactions use the compacted replacement, while chat rendering and session persistence keep the original context (the overlay is saved with the session and survives a restart); compaction opens no floating window; in addition to turn boundaries, **a pressure check runs before every round of the tool loop** (after tool results are written back and before the next request), so long loops converge round by round; on overflow the request is compacted and retried automatically; plan distillation still shows reasoning and content live in a floating window
 - **Sub-Agent system** — the AI can spawn sub-Agents to run subtasks in parallel, with boundary review
 - **Decoupled frontend/backend architecture** — an event-driven asynchronous architecture that separates the UI from business logic
@@ -31,7 +31,7 @@
 - **Tool argument receiving panel** — while the model streams tool-call arguments, a "receiving arguments" floating window (`tool_args_panel`) opens in real time, appending each chunk incrementally and closing automatically once the arguments end, consistent with the reasoning floating window
 - **MCP support** — connect to external MCP servers over stdio / Streamable HTTP and register remote `tools`/`resources`/`prompts` in the tool system (with pre-caching + failure-driven dynamic refresh, see [docs/en/mcp.md](docs/en/mcp.md))
 - **Skills support** — scan SKILL.md skill directories and inject the list of available skills into the system prompt; the model loads the skill body with `load_skill` (Claude/opencode style, see [docs/en/skills.md](docs/en/skills.md))
-- **Tool execution sandbox** — every tool call goes through the control plane (preflight → isolated execution → freeze candidate → CAS publish); the default async review executes AI changes immediately in the sandbox and freezes candidates, with real workspace changes queued for the user to confirm via `:NeoAISandboxReview` or the `<leader>ap` key in the chat window (per-file approval; a prominent `待审N` badge is shown in the chat statusline), and L3 dangerous items get an AI-generated consequence warning with an auto-opened diff before a second confirmation; external processes are isolated via bwrap/unshare; commands can write the whole filesystem (changes staged as candidates) with session shell state (export/cd) preserved; the payload runs with `--cap-drop ALL` plus a seccomp baseline and masks host-sensitive paths such as `docker.sock` and host credentials (defense in depth); **privilege tiers**: commands run with least privilege by default (network isolated by default) and automatically request escalation when privilege is insufficient — T1 (network / controlled docker) runs isolated and recorded, T2 (caps / host operations) runs inside a nested userns with host effects frozen as proposals for async approval; controlled docker points at an external controlled socket (rootless/proxy/dind) and never binds the host socket; the **read surface** is whole-host read-only by default (`read_all`, masking only the important config files/credentials in `mask_paths`), and accessing user dirs outside the workspace is **traced** and shown in the review window under "越界访问留痕" (non-blocking) (see [docs/en/sandbox.md](docs/en/sandbox.md))
+- **Tool execution sandbox** — every tool call goes through the control plane (preflight → isolated execution → freeze candidate → CAS publish); the default async review executes AI changes immediately in the sandbox and freezes candidates, with real workspace changes queued for the user to confirm via `:NeoAISandboxReview` or the `<leader>ap` key in the chat window (per-file approval; an **original-file snapshot** is kept on apply, and the review window's "已保存" section lets `u` **undo/redo the save** by swapping with the snapshot, refusing on conflict; a prominent `待审N` badge is shown in the chat statusline), and L3 dangerous items get an AI-generated consequence warning with an auto-opened diff before a second confirmation; external processes are isolated via bwrap/unshare; commands can write the whole filesystem (changes staged as candidates) with session shell state (export/cd) preserved; the payload runs with `--cap-drop ALL` plus a seccomp baseline and masks host-sensitive paths such as `docker.sock` and host credentials (defense in depth); **privilege tiers**: commands run with least privilege by default (network isolated by default) and automatically request escalation when privilege is insufficient — T1 (network / controlled docker) runs isolated and recorded, T2 (caps / host operations) runs inside a nested userns with host effects frozen as proposals for async approval; controlled docker points at an external controlled socket (rootless/proxy/dind) and never binds the host socket; the **read surface** is whole-host read-only by default (`read_all`, masking only the important config files/credentials in `mask_paths`), and accessing user dirs outside the workspace is **traced** and shown in the review window under "越界访问留痕" (non-blocking; the statusline appends a `越界N` badge) (see [docs/en/sandbox.md](docs/en/sandbox.md))
 
 ---
 
@@ -711,7 +711,6 @@ categories:
 | `todo_read`       | Read the current task list                               | ✅ Auto-allowed |
 | `todo_clear`      | Clear the task list                                   | ✅ Auto-allowed |
 | `enter_plan_mode` | Enter plan mode (the tool context switches to read-only/informational + questions)| ✅ Auto-allowed |
-| `exit_plan_mode`  | After user confirmation, parse the plan into todos and switch to CHAT execution      | ⚠️ Needs approval   |
 
 ### 💬 Asking the User
 
@@ -719,15 +718,14 @@ categories:
 | ---------- | ---------------------------------------- | ----------- |
 | `ask_user` | Pause generation and ask the user a question; the answer is returned as the tool result | ✅ Auto-allowed |
 
-> **PLAN MODE**: while active, the tool context **contains only read-only/informational query tools, `run_command` (read-only research), `ask_user`, and `exit_plan_mode`**,
-> and exposes no mutating tools whatsoever (edit/delete/create/git rollback, etc.); execution-time
+> **PLAN MODE**: while active, the tool context **contains only read-only/informational query tools, `run_command` (read-only research), and `ask_user`**,
+> and exposes no mutating tools whatsoever (edit/delete/create/git rollback, etc.), **nor any mode-switching tool to the AI**; execution-time
 > gating is tightened accordingly, and any tool outside the visible set is rejected. In this mode the AI investigates,
 > asks clarifying questions,
 > and produces a **clear, well-formatted change plan** (goals and background / list of changes / implementation steps / verification and rollback).
-> Once the plan is complete, the AI calls `exit_plan_mode` (an approval window pops up for the user to confirm);
-> after the user confirms, it **switches directly to CHAT mode**, the system parses the plan into a task list (todos),
+> After the plan is emitted the turn ends and **the user confirms** (run `:NeoAIApprovePlan` or toggle the mode manually);
+> after confirmation it **switches directly to CHAT mode**, the system parses the plan into a task list (todos),
 > and execution starts automatically according to `tools.plan_mode.auto_execute_on_approve` (on by default).
-> You can also run `:NeoAIApprovePlan` manually to perform the same confirmation.
 > During generation, switching modes via `m` / `:NeoAIPlan` / `:NeoAIAuto` is **deferred until the current turn ends**,
 > so an in-progress generation is never interrupted by a mid-flight change to the toolset / system policy / model.
 
@@ -921,7 +919,7 @@ NeoAI/
 │       ├── log_ops.lua        # Log tools
 │       ├── plan.lua           # Sub-agent + boundary review
 │       ├── todo.lua           # Todo list (todo_write/read/clear + prompt segment)
-│       ├── plan_mode.lua      # Plan mode (enter_plan_mode/exit_plan_mode + tool filtering/gating)
+│       ├── plan_mode.lua      # Plan mode (enter_plan_mode + tool filtering/gating)
 │       ├── ask_user.lua       # Ask the user
 │       ├── read_image.lua     # Image reading (multimodal)
 │       ├── skills.lua         # Skills tools (list_skills/load_skill + prompt segment)
@@ -955,10 +953,11 @@ NeoAI/
 │   ├── json.lua              # JSON encoding/decoding
 │   ├── http.lua              # Async HTTP client (curl jobstart, streaming SSE)
 │   ├── fs.lua                # File operations (JSONL)
-│   ├── work.lua              # Thread pool (blocking file I/O / image decoding run on the thread pool)
+│   ├── work.lua              # Thread pool (blocking I/O / CPU-intensive computation run on the thread pool)
 │   ├── timer.lua             # Pausable timer (tool active time, excluding waiting time)
 │   ├── image.lua             # Image type detection/media type
-│   └── stringx.lua           # String extensions
+│   ├── stringx.lua           # String extensions
+│   └── textmetrics.lua       # Pure-Lua text metrics (display width/codepoint slicing/wrapping; thread-pool ready)
 │
 └── tests/                      # Tests (custom runner, :NeoAITest; 45 test_*.lua files total)
     ├── init.lua               # Assertions + runner
@@ -1001,6 +1000,10 @@ NeoAI/
     ├── test_display_modes.lua # Display mode plugins
     ├── test_fold.lua          # Folding
     ├── test_markdown.lua      # Markdown rendering
+    ├── test_textmetrics.lua   # Pure-Lua text metrics (cross-checked against vim.fn)
+    ├── test_review_cache.lua  # Review-queue in-memory cache (no repeated disk scans)
+    ├── test_sandbox_instance.lua # Sandbox per-process instance isolation + lazy startup
+    ├── test_secret_highlight.lua # Chat secret-command highlighting
     ├── test_timer.lua         # Pausable timer
     ├── test_http.lua          # HTTP client
     └── test_integration.lua   # Integration tests (mock server)

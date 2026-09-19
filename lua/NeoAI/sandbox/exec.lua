@@ -154,9 +154,14 @@ function M.run(argv, opts)
   }
   local args = { command = opts.command or table.concat(argv, " ") }
   return sandbox.gate(tool, args, ictx, function()
+    -- token→真实密钥的还原仅限沙箱内部进程：argv 中的 NEOKEY_ 还原后执行；
+    -- 日志/证据用的 args.command 仍保留 token。
+    local secret = require("NeoAI.sandbox.secret")
     local full = {}
     for _, v in ipairs(ictx.sandbox_prefix or {}) do full[#full + 1] = v end
-    for _, v in ipairs(argv) do full[#full + 1] = v end
+    for _, v in ipairs(argv) do
+      full[#full + 1] = (type(v) == "string") and (secret.detokenize(v)) or v
+    end
     return _spawn(full, {
       cwd = ictx.sandbox_cwd or opts.cwd,
       env = ictx.sandbox_env,

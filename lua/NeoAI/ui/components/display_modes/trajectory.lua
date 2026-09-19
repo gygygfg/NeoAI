@@ -87,9 +87,10 @@ end
 
 --- 追加单个工具子块（层级 3）：▸ 工具调用 + 参数/结果
 --- @param lines table
+--- @param marks table 与 lines 并行的元数据数组（登记行内密钥高亮区间）
 --- @param tool_call table
 --- @param result_msg table|nil 对应工具结果消息
-local function _append_tool_sub(lines, tool_call, result_msg)
+local function _append_tool_sub(lines, marks, tool_call, result_msg)
   local fold = require("NeoAI.ui.components.fold")
   local helpers = require("NeoAI.ui.components.message_list").helpers
   local fn = tool_call["function"]
@@ -108,19 +109,49 @@ local function _append_tool_sub(lines, tool_call, result_msg)
     local dur = fold.get_duration(tool_call.id)
     if dur then time_str = " · " .. fold.format_ms(dur) end
   end
-  lines[#lines + 1] = "    ▸ 工具调用: " .. name .. " " .. status_emoji .. time_str
-  local arg_lines = helpers.tool_arguments_lines(fn)
+  -- 密钥防护：命令参数或结果（模型上下文）含密钥时，在工具行追加醒目标记，
+  -- 并在结果下方给出「哪个命令/工具获取或使用了哪个密钥文件」的明细。
+  local secret_line = helpers.secret_warning_line and helpers.secret_warning_line(fn, result_msg) or nil
+  local has_secret = secret_line ~= nil
+  local secret_str = has_secret and "  ⚠ 密钥" or ""
+  -- 含密钥的工具调用：参数/结果完整展示（不截断），并登记行内密钥高亮区间。
+  -- 先收集本子块的行，再整块一次性扫描（避免逐行检测拖慢大结果）。
+  local sub_lines = {}
+  local function push(text) sub_lines[#sub_lines + 1] = text end
+  push("    ▸ 工具调用: " .. name .. " " .. status_emoji .. time_str .. secret_str)
+  local arg_lines = helpers.tool_arguments_lines(fn, { full = has_secret })
   if arg_lines then
-    lines[#lines + 1] = "      参数:"
+    push("      参数:")
     for _, l in ipairs(arg_lines) do
-      lines[#lines + 1] = "        " .. l
+      push("        " .. l)
     end
   end
   if result_msg then
-    lines[#lines + 1] = "      结果:"
-    for _, l in ipairs(helpers.result_lines(result_msg.content)) do
-      lines[#lines + 1] = "        " .. l
+    push("      结果:")
+    for _, l in ipairs(helpers.result_lines(result_msg.content, { full = has_secret })) do
+      push("        " .. l)
     end
+    -- 工具结果 UI 附加提示（如沙箱降级）：仅用户可见，不进入模型上下文。
+    if result_msg.notice and result_msg.notice ~= "" then
+      for _, l in ipairs(vim.split(tostring(result_msg.notice), "\n", { plain = true })) do
+        push("      " .. l)
+      end
+    end
+  end
+  if has_secret and helpers.attach_secret_spans then
+    helpers.attach_secret_spans(sub_lines, true)
+  end
+  for _, l in ipairs(sub_lines) do
+    if type(l) == "table" then
+      lines[#lines + 1] = l.text
+      if l.secret_spans then marks[#lines] = { secret_spans = l.secret_spans } end
+    else
+      lines[#lines + 1] = l
+    end
+  end
+  if secret_line then
+    lines[#lines + 1] = "      " .. secret_line
+    marks[#lines] = { secret = true }
   end
 end
 
@@ -214,9 +245,10 @@ end
 --- - 层级 2 小节：▸ 用户请求、▸ 请求 #N；
 --- - 层级 3 子块：推理、工具调用、原始请求体、原始响应。
 --- @param lines table
+--- @param marks table 与 lines 并行的元数据数组
 --- @param turn table
 --- @param full boolean|nil true=保存日志：不截断 wire 数据
-local function _append_turn(lines, turn, full)
+local function _append_turn(lines, marks, turn, full)
   lines[#lines + 1] = _header(turn)
   if turn.user then
     lines[#lines + 1] = "  ▸ 用户请求"
@@ -247,7 +279,7 @@ local function _append_turn(lines, turn, full)
             result_msg = entries[ridx]
             ridx = ridx + 1
           end
-          _append_tool_sub(lines, tc, result_msg)
+          _append_tool_sub(lines, marks, tc, result_msg)
         end
         i = ridx
       else
@@ -297,22 +329,23 @@ end
 --- 生成轨迹视图的全部行（全量；供 build_lines / build_log / 测试使用）
 --- @param messages table
 --- @param opts table|nil { full? } full=true 时不截断原始请求体/响应分片（供保存日志）
---- @return table
+--- @return table 行数组
+--- @return table 与行并行的元数据数组（密钥高亮等）
 local function _build_lines(messages, opts)
   opts = opts or {}
-  local lines = {}
+  local lines, marks = {}, {}
   local turns = _group_turns(messages)
   if #turns == 0 then
-    return { "NeoAI 聊天（轨迹模式）", "", "输入消息开始对话。", "" }
+    return { "NeoAI 聊天（轨迹模式）", "", "输入消息开始对话。", "" }, {}
   end
   for _, turn in ipairs(turns) do
     if turn.kind == "system" then
       _append_system(lines, turn)
     else
-      _append_turn(lines, turn, opts.full)
+      _append_turn(lines, marks, turn, opts.full)
     end
   end
-  return lines
+  return lines, marks
 end
 
 --- 文本指纹（见 incremental.fingerprint）
@@ -413,13 +446,13 @@ local function _render_blocks(messages, full)
       key = "t:" .. tostring(snap.index) .. ":" .. tostring(snap.kind),
       sig = sig,
       build = function()
-        local lines = {}
+        local lines, marks = {}, {}
         if snap.kind == "system" then
           _append_system(lines, snap)
         else
-          _append_turn(lines, snap, full)
+          _append_turn(lines, marks, snap, full)
         end
-        return { lines = lines, marks = {} }
+        return { lines = lines, marks = marks }
       end,
     }
   end
@@ -500,6 +533,14 @@ function M.render(buf, messages)
   end
   local diff = cache:write(buf)
   vim.bo[buf].modifiable = true
+  -- 行内密钥高亮：仅对本次实际写入的行重贴（含密钥的工具调用参数/结果完整展示）。
+  if diff.changed then
+    local helpers = require("NeoAI.ui.components.message_list").helpers
+    local from, to = incremental.written_range(diff)
+    if from > 0 then
+      helpers.apply_secret_hl(buf, cache.marks, 1, from, to)
+    end
+  end
   return diff
 end
 
@@ -507,7 +548,8 @@ end
 --- @param messages table
 --- @return table 行数组
 function M.build_lines(messages)
-  return _build_lines(messages)
+  local lines = _build_lines(messages)
+  return lines
 end
 
 -- ========== 日志保存 ==========
@@ -516,7 +558,8 @@ end
 --- @param messages table
 --- @return table 行数组
 function M.build_log(messages)
-  return _build_lines(messages, { full = true })
+  local lines = _build_lines(messages, { full = true })
+  return lines
 end
 
 --- 生成文件头（保存时间 / 会话信息）

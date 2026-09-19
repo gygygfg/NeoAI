@@ -28,9 +28,10 @@ local LEVEL_NAME = { [0] = "low", [1] = "moderate", [2] = "high", [3] = "critica
 local LEVEL_BADGE = { [0] = "L0", [1] = "L1", [2] = "L2", [3] = "L3" }
 
 -- 危险命令模式（依据命令文本初判级别）。匹配为 Lua pattern。
+-- 仅覆盖**绕过文件暂存层**的破坏（写块设备、mkfs、wipefs 等）：`rm`/`rm -rf` 等纯文件
+-- 修改由「只读根 + overlay 修改暂存」保护宿主机，不在此硬拦截（其效果冻结为候选待审）。
 local DANGEROUS = {
   { level = 3, name = "DESTRUCTIVE", pats = {
-    "rm%s+%-[%w]*r[%w]*f[%w]*%s+/", "rm%s+%-[%w]*f[%w]*r[%w]*%s+/",
     "mkfs", "dd%s+[^\n]*of=/dev/", ">%s*/dev/sd", ">%s*/dev/nvme",
     "shred%s", "wipefs", "blkdiscard", "of=/dev/",
   } },
@@ -170,7 +171,7 @@ end
 --- 评估一次调用/候选的安全级别
 --- @param facts table {
 ---   effect?, paths? (写路径数组), privilege_tier?, package?, network?,
----   secret?, host_op?, command?, tool?
+---   secret?, host_op?, command?, command_effective?, script_opaque?, tool?
 --- }
 --- @return table { level, name, badge, reasons = table }
 function M.classify(facts)
@@ -187,6 +188,8 @@ function M.classify(facts)
   end
   if facts.network then bump(M.LEVEL.MODERATE, "NETWORK_ACCESS") end
   if facts.package then bump(M.LEVEL.MODERATE, "PACKAGE_INSTALL") end
+  -- 间接执行（脚本/解释器）无法静态解析：提升级别并（由 wrapper）强制复核。
+  if facts.script_opaque then bump(M.LEVEL.MODERATE, "OPAQUE_SCRIPT_EXECUTION") end
   if facts.privilege_tier and facts.privilege_tier >= 1 then
     bump(facts.privilege_tier >= 2 and M.LEVEL.HIGH or M.LEVEL.MODERATE,
       facts.privilege_tier >= 2 and "PRIVILEGE_T2" or "PRIVILEGE_T1")
@@ -204,13 +207,20 @@ function M.classify(facts)
       bump(M.LEVEL.HIGH, "SECRET_OPERATION")
     end
   end
-  local dlevel, dreasons = _dangerous(facts.command)
+  -- command_effective 折叠了脚本间接执行的内容（见 sandbox/script_scan），优先使用。
+  local dlevel, dreasons = _dangerous(facts.command_effective or facts.command)
   if dlevel > level then level = dlevel end
   for _, r in ipairs(dreasons) do reasons[#reasons + 1] = r end
   -- 包安装（apt/pip/npm 等）属高危但非 critical：其状态文件位于工作区外、且常含高熵签名/
   -- 哈希，不因「工作区外写入/密钥误报」升到 L3；仅当命令本身命中破坏性模式时才保留 L3。
   if facts.package and level >= M.LEVEL.CRITICAL and dlevel < M.LEVEL.CRITICAL then
     level = M.LEVEL.HIGH
+  end
+  -- 放宽风险提示：**安全安装**（未改动第三方软件源/密钥）不因写入 /usr /var /etc 等系统路径
+  -- 升到 L2（封顶中危）；敏感安装（`package_sensitive`）保留系统路径写入的高危评级。
+  if facts.package and not facts.package_sensitive
+    and dlevel < M.LEVEL.CRITICAL and level > M.LEVEL.MODERATE then
+    level = M.LEVEL.MODERATE
   end
   return { level = level, name = M.level_name(level), badge = M.badge(level), reasons = reasons }
 end
@@ -221,6 +231,70 @@ end
 function M.dangerous_level(command)
   local l = _dangerous(command)
   return l
+end
+
+-- ========== 内核/危险命令硬拒绝 ==========
+
+-- 内核/系统管理命令（首词命中即硬拒绝，不执行）。普通命令不受影响，仍可在沙箱内执行。
+-- 注意：`mount`/`umount` 属 T2 主机操作（冻结为提案、审批后 sudo），`mknod`/`unshare` 等由
+-- seccomp 基线与命名空间隔离处理，故不在此列表（避免绕过既有的分层防护）。
+local DENY_BINS = {
+  -- 内核模块与内核状态
+  modprobe = true, insmod = true, rmmod = true, kmod = true, modinfo = true,
+  sysctl = true, kexec = true, reboot = true, shutdown = true, poweroff = true,
+  halt = true, sysrq = true, bpf = true, perf = true,
+  -- 文件能力（可提权）
+  setcap = true,
+  -- 内核防火墙/底层网络
+  iptables = true, ip6tables = true, nft = true, arptables = true, ebtables = true,
+  -- 内核交换区
+  swapon = true, swapoff = true,
+}
+
+-- 命令包装器/解释器：段首为它们时，向下扫描段内所有 token 寻找真实命令首词。
+-- 含 shell 关键字（then/do/…）与 xargs：脚本正文/复合命令里危险命令常出现在这些位置
+-- （`if …; then modprobe x; fi`、`… | xargs modprobe`），不扫描会漏判。
+local WRAPPERS = {
+  sudo = true, doas = true, env = true, nohup = true, nice = true, ionice = true,
+  stdbuf = true, setsid = true, timeout = true, command = true, exec = true,
+  bash = true, sh = true, dash = true, zsh = true, ksh = true, fish = true,
+  xargs = true,
+  ["then"] = true, ["do"] = true, ["else"] = true, ["elif"] = true, ["if"] = true,
+  ["while"] = true, ["until"] = true, ["done"] = true, ["fi"] = true, time = true,
+}
+
+--- 内核/破坏性命令硬拒绝判定：命中返回原因（不执行），否则 nil。
+--- 普通命令（含 python/node/go/rust/apt/pip/npm 等）不命中，仍可在沙箱内执行。
+--- @param command string|nil
+--- @return string|nil reason 如 "KERNEL_COMMAND:modprobe" / "DESTRUCTIVE:DESTRUCTIVE"
+function M.deny_reason(command)
+  if type(command) ~= "string" or command == "" then return nil end
+  -- 破坏性 / 管道执行 / fork 炸弹等 L3 模式
+  local dlevel, dreasons = _dangerous(command)
+  if dlevel >= M.LEVEL.CRITICAL then
+    return "DESTRUCTIVE:" .. table.concat(dreasons, ",")
+  end
+  -- 内核/系统管理命令：按段检查首词；段首为包装器/解释器时扫描段内所有 token。
+  local function _base(tok)
+    tok = tok:gsub("^['\"]+", ""):gsub("['\"]+$", "")
+    return tok:match("[^/]+$") or tok
+  end
+  for seg in command:gmatch("[^;|&\n]+") do
+    local toks = {}
+    for t in seg:gmatch("%S+") do toks[#toks + 1] = t end
+    if #toks > 0 then
+      local first = _base(toks[1])
+      if WRAPPERS[first] then
+        for _, t in ipairs(toks) do
+          local base = _base(t)
+          if DENY_BINS[base] then return "KERNEL_COMMAND:" .. base end
+        end
+      elseif DENY_BINS[first] then
+        return "KERNEL_COMMAND:" .. first
+      end
+    end
+  end
+  return nil
 end
 
 --- 依据命令执行结果判断安全级别（失败/网络/包变更等信号）
@@ -250,13 +324,14 @@ end
 
 --- 依据级别给出建议审批动作
 --- @param level number
---- @param opts table|nil { session_auto?, package?, secret? }
+--- @param opts table|nil { session_auto?, package?, package_sensitive?, secret? }
 --- @return string "auto" | "record" | "review" | "block"
 function M.action(level, opts)
   opts = opts or {}
-  -- 密钥与包安装永不因会话自动审批而跳过（需显式确认/规则）。
+  -- 密钥永不因会话自动审批而跳过（需显式确认/规则）。
   if opts.secret then return "review" end
   if opts.package then
+    -- 包安装始终需人工确认（不自动落盘）；packages.mode 可整体放行/拒绝。
     local pkg = _cfg().packages or {}
     local mode = pkg.mode or "review"
     if mode == "allow" then return "auto" end

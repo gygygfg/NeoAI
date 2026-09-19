@@ -19,31 +19,42 @@ local function _emit(event, payload)
 end
 
 --- 在主机上同步执行命令（用户已批准的主机效果），带超时。
+--- 非 root 运行 NeoAI 时经 `sudo` 提权（`pty` 以支持密码提示）；提案已经用户审批。
 --- @param command string
 --- @return table { code, stdout, stderr }
 local function _run_host(command)
   local limits = config_store.get("tools.sandbox.limits") or {}
   local timeout_ms = limits.wall_ms or 60000
   local stdout, stderr = {}, {}
-  local job = vim.fn.jobstart({ "sh", "-c", command }, {
-    stdout_buffered = true,
-    stderr_buffered = true,
+  local use_sudo = vim.uv.getuid ~= nil and vim.uv.getuid() ~= 0
+  local argv = use_sudo and { "sudo", "sh", "-c", command } or { "sh", "-c", command }
+  local done, exit_code = false, nil
+  local job = vim.fn.jobstart(argv, {
+    pty = use_sudo,
+    stdout_buffered = not use_sudo,
+    stderr_buffered = not use_sudo,
     on_stdout = function(_, data)
       for _, line in ipairs(data or {}) do stdout[#stdout + 1] = line end
     end,
     on_stderr = function(_, data)
       for _, line in ipairs(data or {}) do stderr[#stderr + 1] = line end
     end,
+    on_exit = function(_, code)
+      exit_code = code
+      done = true
+    end,
   })
   if job <= 0 then
     return { code = -1, stdout = "", stderr = "HOST_OP_SPAWN_FAILED" }
   end
-  local code = vim.fn.jobwait({ job }, timeout_ms)[1]
-  if code == -1 then
+  -- 非阻塞等待：vim.wait 期间持续处理事件循环，chat 界面计时器/输入仍可刷新；
+  -- 不用 vim.fn.jobwait（会冻结主线程至多 wall_ms，导致计时刷新停摆）。
+  local ok = vim.wait(timeout_ms, function() return done end, 20)
+  if not ok or not done then
     pcall(vim.fn.jobstop, job)
     return { code = -1, stdout = table.concat(stdout, "\n"), stderr = table.concat(stderr, "\n") .. "\nHOST_OP_TIMEOUT" }
   end
-  return { code = code, stdout = table.concat(stdout, "\n"), stderr = table.concat(stderr, "\n") }
+  return { code = exit_code, stdout = table.concat(stdout, "\n"), stderr = table.concat(stderr, "\n") }
 end
 
 -- ========== 公开 API ==========
@@ -56,6 +67,10 @@ end
 --- @return table|nil record
 --- @return table|nil review_item
 function M.freeze(attempt, args, privileges, meta)
+  -- 包安装命令绝不在主机上 replay：沙箱内安装失败即失败，绝不回退到宿主机安装。
+  -- 安装失败常伴随「权限不足 / 只读文件系统」信号而触发 T2 升级并冻结主机提案，
+  -- 若放行会在用户审批后于宿主机执行 `pipx install …` 等，故在此集中拦截。
+  if attempt and attempt.package then return nil end
   local command = args and (args.command or args.cmd)
   if type(command) ~= "string" or command == "" then return nil end
   local store = require("NeoAI.sandbox.store")
@@ -132,6 +147,19 @@ function M.replay(id)
   end
   if rec.state == "APPLIED" then
     return { ok = true, state = "APPLIED", receipt = rec.receipt, result = rec.result }
+  end
+  -- 兜底：即便历史提案已入队，包安装命令也拒绝在主机执行（绝不回退到宿主机安装）。
+  local req = require("NeoAI.sandbox.privilege").classify(
+    rec.tool or "run_command", { command = rec.command }, { effect = "process" })
+  if req and req.package then
+    rec.state = "REJECTED"
+    rec.reject_reason = "HOST_OP_PACKAGE_DENIED"
+    rec.rejected_at = os.time()
+    store.write_host_op(rec)
+    _emit(require("NeoAI.kernel.events").SANDBOX_HOST_OP_REJECTED, {
+      host_op_id = id, reason = "HOST_OP_PACKAGE_DENIED",
+    })
+    return { ok = false, state = "REJECTED", reason = "HOST_OP_PACKAGE_DENIED: 包安装不在宿主机执行" }
   end
   local result = _run_host(rec.command)
   rec.state = result.code == 0 and "APPLIED" or "FAILED"

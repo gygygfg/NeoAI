@@ -139,7 +139,8 @@ M.execute(agent, name, args, tool_call_id, opts)
 `read_file` / `edit_file` / `list_files` / `search_files` / `file_exists` / `create_directory` /
 `ensure_dir` / `delete_file` / `confirm_file_change`。
 
-> `edit_file` 支持 `mode='write'/'append'/'edit'`。`confirm_file_change` 配合 `edit_file`：
+> `edit_file` 支持 `mode='write'/'append'/'edit'`（省略 `mode` 时按字段推断：提供 `content`
+> → `write`，提供 `edits` → `edit`）。`confirm_file_change` 配合 `edit_file`：
 > 模型先看到「预览」结果，再调 `confirm_file_change(action='confirm'/'abandon'/'retry')` 确认。
 > 阻塞式文件 I/O（读大文件/递归搜索/写盘）经 `utils.work` 在线程池执行，不占用主线程。
 >
@@ -189,7 +190,7 @@ M.execute(agent, name, args, tool_call_id, opts)
 
 ### 📐 计划模式（plan_mode.lua）
 
-`enter_plan_mode`（进入计划模式：工具上下文切换为只读/信息 + 提问）/ `exit_plan_mode`（用户确认后解析计划为 todo 并转入 CHAT 执行）。详见 [configuration.md](configuration.md) 与 [chat_enhanced_usage.md](chat_enhanced_usage.md)。
+`enter_plan_mode`（进入计划模式：工具上下文切换为只读/信息 + 提问）。计划模式**不向 AI 提供切换模式的工具**，计划输出后由用户执行 `:NeoAIApprovePlan`（或手动切换模式）确认执行。详见 [configuration.md](configuration.md) 与 [chat_enhanced_usage.md](chat_enhanced_usage.md)。
 
 ### 💬 向用户提问（ask_user.lua）
 

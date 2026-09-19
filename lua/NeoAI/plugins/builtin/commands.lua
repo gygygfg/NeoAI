@@ -252,11 +252,13 @@ function M.start()
     parts[#parts + 1] = "privilege=" .. tostring(pcfg.enabled ~= false)
     parts[#parts + 1] = "max_tier=" .. tostring(pcfg.max_tier or 0)
     parts[#parts + 1] = "docker=" .. tostring(dcfg.mode or "?") .. "(" .. dstat .. ")"
-    -- overlay 可用性诊断：不可用时给出原因（便于排查降级模式）
+    -- overlay 可用性诊断：不可用时给出原因（默认 fail-closed 会拒绝 process 工具）
     local runtime = require("NeoAI.sandbox.runtime")
     local diag = runtime.overlay_diagnosis(vim.fn.getcwd())
     parts[#parts + 1] = "overlay=" .. (diag.available and "ready"
       or ("unavailable(" .. tostring(diag.reason) .. ")"))
+    local scfg = require("NeoAI.kernel.config_store").get("tools.sandbox") or {}
+    parts[#parts + 1] = "overlay_fail_closed=" .. tostring(scfg.overlay_fail_closed ~= false)
     vim.notify("[NeoAI] 沙箱能力: " .. table.concat(parts, " "), vim.log.levels.INFO)
   end, { desc = "显示沙箱运行时能力探测结果" })
 

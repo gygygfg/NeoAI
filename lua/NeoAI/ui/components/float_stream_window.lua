@@ -14,6 +14,8 @@ local state = {
   win_id = nil,
   buf = nil,
   filetype = nil,
+  -- 当前消费者的高度上限（nil = 使用默认上限）；由 open 传入 max_height 时按 filetype 更新。
+  max_height = nil,
 }
 
 -- ========== 私有函数 ==========
@@ -38,8 +40,9 @@ end
 local function _maybe_grow()
   if not state.win_id or not vim.api.nvim_win_is_valid(state.win_id) then return end
   if not state.buf or not vim.api.nvim_buf_is_valid(state.buf) then return end
-  local base = math.min(6, vim.o.lines - 10)
-  local max_h = _max_height()
+  -- 消费者可指定高度上限（如思考过程/接收参数限 5 行）；未指定时用默认上限。
+  local max_h = state.max_height or _max_height()
+  local base = math.min(6, max_h, vim.o.lines - 10)
   -- 以显示行数（含 wrap 折行）为准：长单行也能把窗口撑到足够高度。
   local rows = math.max(vim.api.nvim_buf_line_count(state.buf), _content_rows())
   local h = math.max(base, math.min(max_h, rows + 1))
@@ -77,14 +80,16 @@ end
 
 --- 打开悬浮窗
 --- @param title string|nil
---- @param opts table|nil { filetype? }
+--- @param opts table|nil { filetype?, max_height? } max_height 为高度上限（nil = 默认）
 --- @return number win_id
 function M.open(title, opts)
   opts = opts or {}
   if state.win_id and vim.api.nvim_win_is_valid(state.win_id) then
-    -- 复用已有窗口：切换标题与文件类型（供 reasoning / tool_args / compaction 共享）
+    -- 复用已有窗口：切换标题与文件类型（供 reasoning / tool_args / compaction 共享）。
+    -- 仅在显式给出 filetype 时同步高度上限，避免内部 open()（append/set_text）清掉消费者设置。
     if opts.filetype then
       state.filetype = opts.filetype
+      state.max_height = opts.max_height
       if state.buf and vim.api.nvim_buf_is_valid(state.buf) then
         vim.bo[state.buf].filetype = opts.filetype
       end
@@ -96,11 +101,12 @@ function M.open(title, opts)
   end
   state.buf = vim.api.nvim_create_buf(false, true)
   state.filetype = opts.filetype
+  state.max_height = opts.max_height
   if opts.filetype then
     vim.bo[state.buf].filetype = opts.filetype
   end
   local width = math.min(70, vim.o.columns - 10)
-  local height = math.min(6, vim.o.lines - 10)
+  local height = math.min(state.max_height or 6, vim.o.lines - 10)
   state.win_id = vim.api.nvim_open_win(state.buf, false, {
     relative = "editor",
     width = width,
@@ -169,6 +175,7 @@ function M.close()
   state.win_id = nil
   state.buf = nil
   state.filetype = nil
+  state.max_height = nil
 end
 
 --- 是否打开

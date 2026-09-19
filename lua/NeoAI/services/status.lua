@@ -144,21 +144,38 @@ local function _build_part(info, part)
     if not info.pending or info.pending <= 0 then return nil end
     return "待发" .. info.pending
   elseif part == "sandbox" then
-    -- 沙箱待审变更数：>0 才显示醒目徽标（0 时返回 nil，不渲染、不打扰）
-    if not info.sandbox_pending or info.sandbox_pending <= 0 then return nil end
-    local text = "待审" .. info.sandbox_pending
-    -- L3（高危）时追加红色危险标记（配色见 lualine 扩展的 sandbox_comp）
-    if info.sandbox_level and info.sandbox_level >= 3 then text = text .. " ⚠危险" end
-    return text
+    -- 沙箱待审变更数 + 越界访问留痕文件数：>0 才显示醒目徽标（0 时返回 nil，不渲染、不打扰）
+    local pending = tonumber(info.sandbox_pending) or 0
+    local traces = tonumber(info.sandbox_traces) or 0
+    if pending <= 0 and traces <= 0 then return nil end
+    local segs = {}
+    if pending > 0 then
+      local text = "待审" .. pending
+      -- L3（高危）时追加红色危险标记（配色见 lualine 扩展的 sandbox_comp）
+      if info.sandbox_level and info.sandbox_level >= 3 then text = text .. " ⚠危险" end
+      segs[#segs + 1] = text
+    end
+    if traces > 0 then segs[#segs + 1] = "越界" .. traces end
+    return table.concat(segs, " ")
   elseif part == "display" then
     return info.display and ("[" .. info.display .. "]") or nil
   end
   return nil
 end
 
---- 触发状态栏刷新（lualine 每次渲染会重新调用 component）
+-- 状态栏刷新合并：待审入队/生成等事件可能在同一 tick 内连续触发数百次，若每次都
+-- `redrawstatus`，lualine 会逐次重算所有段（待审扫描 + 上下文估算），主线程被占满。
+-- 这里把同一 tick 内的多次刷新合并为一次（事件驱动、幂等，无信息丢失）。
+local refresh_scheduled = false
+
+--- 触发状态栏刷新（合并到本 tick 结束；lualine 每次渲染会重新调用 component）
 local function _refresh()
-  pcall(vim.cmd, "redrawstatus")
+  if refresh_scheduled then return end
+  refresh_scheduled = true
+  vim.schedule(function()
+    refresh_scheduled = false
+    pcall(vim.cmd, "redrawstatus")
+  end)
 end
 
 --- 是否启用状态栏输出（config ui.statusline.enabled，缺省启用）
@@ -315,6 +332,7 @@ function M.get_info()
     capacity = nil,
     pending = nil,
     sandbox_pending = nil,
+    sandbox_traces = nil,
     sandbox_level = nil,
   }
   -- 当前 agent 正忙时暂存的待发消息数（无 agent 或队列为空则缺省，徽标不渲染）
@@ -330,6 +348,11 @@ function M.get_info()
   elseif sandbox and sandbox.pending_count then
     local ok, n = pcall(sandbox.pending_count)
     if ok and tonumber(n) and tonumber(n) > 0 then info.sandbox_pending = tonumber(n) end
+  end
+  -- 越界访问留痕（去重文件数）：>0 时同样点亮沙箱徽标，提示用户审批窗口有待关注内容。
+  if sandbox and sandbox.trace_count then
+    local ok, n = pcall(sandbox.trace_count)
+    if ok and tonumber(n) and tonumber(n) > 0 then info.sandbox_traces = tonumber(n) end
   end
   if agent then
     local u = agent.usage or {}
@@ -421,7 +444,8 @@ function M.watch()
     events.SANDBOX_REVIEW_ENQUEUED, events.SANDBOX_REVIEW_APPROVED,
     events.SANDBOX_REVIEW_REJECTED, events.SANDBOX_REVIEW_SUPERSEDED,
     events.SANDBOX_APPLIED, events.SANDBOX_COMMITTED,
-    events.SANDBOX_DISCARDED,
+    events.SANDBOX_DISCARDED, events.SANDBOX_OUTSIDE_ACCESS,
+    events.SANDBOX_REVERTED,
   }
   for _, ev in ipairs(subscribed) do
     state.unsubs[#state.unsubs + 1] = event_bus.on(ev, _refresh)

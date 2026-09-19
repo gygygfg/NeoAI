@@ -279,23 +279,30 @@ local function _apply_overlay(agent, summary, added)
 end
 
 --- 模型无关的工具结果裁剪（摘要前的第一道压缩）；有裁剪则作废过期 API 用量。
+--- 裁剪计算（码点统计/切片）经 pruner 卸载到工作线程池，避免 MB 级结果阻塞主线程；
+--- 线程池不可用或 ui.render.threaded=false 时 pruner 自动回退同步，语义不变。
 --- @param agent table
 --- @param cfg table
---- @return boolean 是否发生了裁剪
-local function _prune(agent, cfg)
-  if cfg.prune_enabled == false then return false end
+--- @return Deferred resolve(boolean) 是否发生了裁剪
+local function _prune_async(agent, cfg)
+  if cfg.prune_enabled == false then return async.resolve(false) end
   local pruner = require("NeoAI.core.session.tool_result_pruner")
   -- 裁剪是可选优化：任何异常都不得阻断发送（对齐 harness 的"操作失败告警后继续"）
-  local ok, result = pcall(pruner.prune_agent, agent, { context_cache = cfg })
-  if not ok then
-    logger.warn("[compactor] 工具结果裁剪失败，跳过: %s", tostring(result))
+  local ok, d = pcall(pruner.prune_agent_async, agent, { context_cache = cfg })
+  if not ok or not (type(d) == "table" and type(d.then_) == "function") then
+    logger.warn("[compactor] 工具结果裁剪失败，跳过: %s", tostring(d))
+    return async.resolve(false)
+  end
+  return d:then_(function(result)
+    if result and (result.pruned or 0) > 0 then
+      if agent.usage then agent.usage.last_prompt = nil end
+      return true
+    end
     return false
-  end
-  if result.pruned > 0 then
-    if agent.usage then agent.usage.last_prompt = nil end
-    return true
-  end
-  return false
+  end, function(err)
+    logger.warn("[compactor] 工具结果裁剪失败，跳过: %s", tostring(err and err.message or err))
+    return false
+  end)
 end
 
 -- ========== 公开 API ==========
@@ -402,10 +409,10 @@ function M.maybe_compact(agent, opts)
     return async.resolve(false)
   end
   -- 先裁剪工具结果：多数情况下裁剪后即回到阈值内，无需摘要调用
-  if _prune(agent, cfg) and _estimate(agent) < threshold then
-    return async.resolve(true)
-  end
-  return _compact(agent, cfg, { mode = "round", threshold = threshold })
+  return _prune_async(agent, cfg):then_(function(pruned)
+    if pruned and _estimate(agent) < threshold then return true end
+    return _compact(agent, cfg, { mode = "round", threshold = threshold })
+  end)
 end
 
 --- 后台异步压缩（非阻塞）：达到压力阈值时启动压缩，立即返回，不等待摘要完成。
@@ -422,13 +429,15 @@ function M.start_background(agent, opts)
   local window = _window_for(agent, cfg)
   local threshold = window * _threshold_ratio(cfg, caps)
   if _estimate(agent) < threshold then return end
-  if _prune(agent, cfg) and _estimate(agent) < threshold then return end
-  local d = _compact(agent, cfg, { mode = "round", threshold = threshold })
-  if d and d.catch then
-    d:catch(function(err)
-      logger.warn("[compactor] 后台压缩失败: %s", tostring(err and err.message or err))
-    end)
-  end
+  _prune_async(agent, cfg):then_(function(pruned)
+    if pruned and _estimate(agent) < threshold then return end
+    local d = _compact(agent, cfg, { mode = "round", threshold = threshold })
+    if d and d.catch then
+      d:catch(function(err)
+        logger.warn("[compactor] 后台压缩失败: %s", tostring(err and err.message or err))
+      end)
+    end
+  end)
 end
 
 --- 强制压缩（上下文溢出恢复用）：跳过压力阈值判断。
@@ -449,10 +458,10 @@ function M.force_compact(agent, opts)
   if not _can_compact(agent, opts) then
     return async.resolve(false)
   end
-  if _prune(agent, cfg) and _estimate(agent) < _window_for(agent, cfg) then
-    return async.resolve(true)
-  end
-  return _compact(agent, cfg, { mode = "overflow", retain_tokens = 0, min_shadow = 1 })
+  return _prune_async(agent, cfg):then_(function(pruned)
+    if pruned and _estimate(agent) < _window_for(agent, cfg) then return true end
+    return _compact(agent, cfg, { mode = "overflow", retain_tokens = 0, min_shadow = 1 })
+  end)
 end
 
 --- 构建检查点消息（供测试直接使用）

@@ -10,9 +10,17 @@ local secret = require("NeoAI.sandbox.secret")
 local M = {}
 
 -- 降级视图提示：overlay 不可用时命令运行在会话私有 cwd，看不到真实项目文件（仅暂存改动），
--- 与真实磁盘视图不一致；在结果中明确标注，避免把「看不到」误判为「文件不存在/改动未生效」。
+-- 与真实磁盘视图不一致。**仅用户可见**：挂到 ctx.ui_notice，由 tool_loop 作为工具结果的 UI
+-- 附加元数据展示，不写入模型可见的结果内容（避免把「看不到」误判为「文件不存在/改动未生效」，
+-- 也不让模型感知沙箱状态）。
 local DEGRADED_NOTE = "[NeoAI] 注意：沙箱以降级模式运行（overlay 不可用），命令工作目录为"
   .. "会话私有视图，可能不含真实磁盘上的其他文件；请用 read_file/search_files 核对。"
+
+-- 特权档（T2，嵌套 userns）专用提示：该档天然无 overlay（属有意设计，主机效果冻结为提案），
+-- 并非「overlay 不可用」的降级，故用专门文案，避免误导用户以为沙箱异常。仅用户可见
+-- （挂 ctx.ui_notice，不写入模型可见结果）。
+local PRIVILEGED_NOTE = "[NeoAI] 提示：本次命令以特权档（T2）在嵌套命名空间内执行，工作目录为"
+  .. "会话私有视图，可能不含真实磁盘上的其他文件；其主机效果将冻结为提案待审。"
 
 -- ========== 私有函数 ==========
 
@@ -26,6 +34,13 @@ local function _sandboxed_argv(argv, opts)
   for _, v in ipairs(opts.prefix) do full[#full + 1] = v end
   for _, v in ipairs(argv) do full[#full + 1] = v end
   return full
+end
+
+--- 选择 shell 解释器：优先 bash（支持 PIPESTATUS、[[ ]]、数组等 bash 语法），
+--- 不可用时回退 POSIX sh。沙箱只读根暴露宿主 /，故宿主有 bash 时沙箱内亦可用。
+--- @return string
+local function _shell_bin()
+  return vim.fn.executable("bash") == 1 and "bash" or "sh"
 end
 
 --- 执行 shell 命令（jobstart，实时累积 stdout/stderr）。
@@ -74,7 +89,7 @@ local function _run_command(command, opts)
     end, timeout_ms)
   end
 
-  job = vim.fn.jobstart(_sandboxed_argv({ "sh", "-c", command }, opts), {
+  job = vim.fn.jobstart(_sandboxed_argv({ _shell_bin(), "-c", command }, opts), {
     cwd = opts.cwd,
     -- 环境变量脱敏 + 宿主运行时直通；优先使用门禁预构造的沙箱环境（含档位 env/PATH）。
     env = opts.env or secret.sanitized_env(),
@@ -151,7 +166,9 @@ shell_tools.run_command = helpers.define_tool(
     required = { "command" },
   },
   function(args, on_success, on_error, ctx)
-    local command = args.command
+    -- 沙箱门禁已把命令参数中的 token 还原为真实密钥（仅沙箱内部进程可见）；
+    -- 优先使用它，`args.command`（UI/证据）仍保留 token。
+    local command = (ctx and ctx.sandbox_command) or args.command
     local signal = ctx and ctx.signal
     -- 代理策略：默认不把宿主代理（如不可达的 127.0.0.1:7890）传入沙箱，
     -- 避免 pip/npm 等按代理配置走网络时 Connection refused；仅 opencode 自身用代理。
@@ -173,52 +190,61 @@ shell_tools.run_command = helpers.define_tool(
       -- 供沙箱门禁做权限不足检测（自动提权）：保留原始 {code,stdout,stderr}。
       if ctx then ctx.sandbox_last_result = result end
       -- 输出脱敏：抹去 bwrap/overlay/沙箱自有路径等指纹，使 AI 的外部命令难以识别沙箱。
-      local out = conceal.redact(result.stdout or "")
-      local errout = conceal.redact(result.stderr or "")
-      local text
-      if result.aborted then
-        -- 取消/超时/非零退出都回传已产生的终端内容，模型仍能看到当前进度
-        text = _with_status("命令已取消：" .. tostring(result.message or "cancelled"), out, errout)
-      elseif result.timed_out then
-        text = _with_status("命令执行超时", out, errout)
-      elseif result.code == 0 then
-        text = out ~= "" and out or "（无输出）"
-      else
-        text = _with_status(string.format("命令退出码 %d", result.code), out, errout)
-      end
-      if ctx and ctx.sandbox_degraded then
-        text = text .. "\n\n" .. DEGRADED_NOTE
-        if ctx.sandbox_degraded_reason and ctx.sandbox_degraded_reason ~= "" then
-          text = text .. "（overlay 不可用原因：" .. tostring(ctx.sandbox_degraded_reason) .. "）"
-        end
-      end
-      -- 网络网关模式：把本次命令经网关探测到的宿主端口及拦截原因回传给 AI。
-      local ok_gw, gw = pcall(require, "NeoAI.sandbox.gateway")
-      if ok_gw and gw then
-        local s = gw.summary()
-        if s then text = text .. "\n\n" .. s end
-      end
-      -- 本机访问拦截代理：回传本次经代理放行/拦截的目标摘要（应用层）。
-      local ok_hp, hp = pcall(require, "NeoAI.sandbox.host_proxy")
-      if ok_hp and hp then
-        local s = hp.summary()
-        if s then text = text .. "\n\n" .. s end
-      end
-      -- 非零退出码 / 取消 / 超时视为失败：以结构化结果 resolve（含 error 字段）——
-      -- UI 据此显示 ❌；同时仍 resolve（而非 reject）以保留沙箱门禁的权限升级检测与候选冻结。
-      if result.aborted or result.timed_out or (result.code ~= 0) then
-        local reason
-        if result.aborted then
-          reason = "命令已取消：" .. tostring(result.message or "cancelled")
-        elseif result.timed_out then
-          reason = "命令执行超时"
-        else
-          reason = "命令退出码 " .. tostring(result.code)
-        end
-        on_success(require("NeoAI.utils.json").encode({ error = reason, output = text }))
-      else
-        on_success(text)
-      end
+      -- 大输出（MB 级、十余次 gsub）在 utils.work 线程池执行，避免完成瞬间占满主线程。
+      return conceal.redact_async(result.stdout or ""):then_(function(out)
+        return conceal.redact_async(result.stderr or ""):then_(function(errout)
+          local text
+          if result.aborted then
+            -- 取消/超时/非零退出都回传已产生的终端内容，模型仍能看到当前进度
+            text = _with_status("命令已取消：" .. tostring(result.message or "cancelled"), out, errout)
+          elseif result.timed_out then
+            text = _with_status("命令执行超时", out, errout)
+          elseif result.code == 0 then
+            text = out ~= "" and out or "（无输出）"
+          else
+            text = _with_status(string.format("命令退出码 %d", result.code), out, errout)
+          end
+          if ctx and ctx.sandbox_userns then
+            -- 特权档（T2）：嵌套 userns 天然无 overlay，属有意设计，显示专用提示而非降级告警。
+            ctx.ui_notice = PRIVILEGED_NOTE
+          elseif ctx and ctx.sandbox_degraded then
+            -- 降级提示仅面向用户：挂到 ctx.ui_notice，由 tool_loop 作为工具结果的 UI 附加
+            -- 元数据展示，**不写入模型可见的结果文本**。
+            local note = DEGRADED_NOTE
+            if ctx.sandbox_degraded_reason and ctx.sandbox_degraded_reason ~= "" then
+              note = note .. "（overlay 不可用原因：" .. tostring(ctx.sandbox_degraded_reason) .. "）"
+            end
+            ctx.ui_notice = note
+          end
+          -- 网络网关模式：把本次命令经网关探测到的宿主端口及拦截原因回传给 AI。
+          local ok_gw, gw = pcall(require, "NeoAI.sandbox.gateway")
+          if ok_gw and gw then
+            local s = gw.summary()
+            if s then text = text .. "\n\n" .. s end
+          end
+          -- 本机访问拦截代理：回传本次经代理放行/拦截的目标摘要（应用层）。
+          local ok_hp, hp = pcall(require, "NeoAI.sandbox.host_proxy")
+          if ok_hp and hp then
+            local s = hp.summary()
+            if s then text = text .. "\n\n" .. s end
+          end
+          -- 非零退出码 / 取消 / 超时视为失败：以结构化结果 resolve（含 error 字段）——
+          -- UI 据此显示 ❌；同时仍 resolve（而非 reject）以保留沙箱门禁的权限升级检测与候选冻结。
+          if result.aborted or result.timed_out or (result.code ~= 0) then
+            local reason
+            if result.aborted then
+              reason = "命令已取消：" .. tostring(result.message or "cancelled")
+            elseif result.timed_out then
+              reason = "命令执行超时"
+            else
+              reason = "命令退出码 " .. tostring(result.code)
+            end
+            on_success(require("NeoAI.utils.json").encode({ error = reason, output = text }))
+          else
+            on_success(text)
+          end
+        end)
+      end)
     end, function(err)
       on_error(conceal.redact(err.message or tostring(err)))
     end)

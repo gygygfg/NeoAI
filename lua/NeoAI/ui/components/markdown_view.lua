@@ -2,6 +2,10 @@
 --- @module NeoAI.ui.components.markdown_view
 --- 轻量 markdown 到纯文本/高亮行转换。用于聊天窗口渲染。
 --- 支持代码块、行内代码、标题、列表、表格。
+--- 文本度量（显示宽度 / 切片）全部走纯 Lua 的 `utils.textmetrics`，避免逐字符
+--- 调用 `vim.fn.strwidth/strcharpart/strchars` 的 C 边界开销（表格折行是渲染热点）。
+
+local tm = require("NeoAI.utils.textmetrics")
 
 local M = {}
 
@@ -83,21 +87,19 @@ end
 --- @return table 折行行数组
 local function _wrap_display(str, max_width)
   local out = {}
-  local n = vim.fn.strchars(str)
-  local i = 1
-  while i <= n do
-    local line = ""
-    local w = 0
-    while i <= n do
-      local ch = vim.fn.strcharpart(str, i - 1, 1)
-      local cw = vim.fn.strwidth(ch)
-      if w + cw > max_width and w > 0 then break end
-      line = line .. ch
-      w = w + cw
-      i = i + 1
+  local line = {}
+  local w = 0
+  -- 单遍扫描：纯 Lua 逐码点取宽度（每个码点只解码一次），避免 O(n²) 的逐字符切片。
+  for ch, cw in tm.each_char(str) do
+    if w + cw > max_width and w > 0 then
+      out[#out + 1] = table.concat(line)
+      line = {}
+      w = 0
     end
-    out[#out + 1] = line
+    line[#line + 1] = ch
+    w = w + cw
   end
+  out[#out + 1] = table.concat(line)
   if #out == 0 then out[1] = "" end
   if #out > MAX_CELL_LINES then
     local capped = {}
@@ -109,12 +111,12 @@ local function _wrap_display(str, max_width)
     -- 卡死主线程（思考/历史消息重渲染时命中）。改为 k 从字符数递减到 0，
     -- k=0 取空串必然满足宽度条件，保证终止。
     local last = out[MAX_CELL_LINES]
-    local avail = math.max(0, max_width - vim.fn.strwidth("…"))
-    local k = vim.fn.strchars(last)
-    while k > 0 and vim.fn.strwidth(vim.fn.strcharpart(last, 0, k)) > avail do
+    local avail = math.max(0, max_width - tm.strwidth("…"))
+    local k = tm.strchars(last)
+    while k > 0 and tm.strwidth(tm.strcharpart(last, 0, k)) > avail do
       k = k - 1
     end
-    last = vim.fn.strcharpart(last, 0, k)
+    last = tm.strcharpart(last, 0, k)
     capped[MAX_CELL_LINES] = last .. "…"
     return capped
   end
@@ -137,7 +139,7 @@ end
 --- @param align string "left"|"center"|"right"
 --- @return string
 local function _pad_cell(line, width, align)
-  local extra = math.max(0, width - vim.fn.strwidth(line))
+  local extra = math.max(0, width - tm.strwidth(line))
   if align == "right" then
     return string.rep(" ", extra) .. line
   elseif align == "center" then
@@ -214,7 +216,7 @@ local function _render_table(rows, streaming, table_width)
     local w = 1
     for idx = 1, #split do
       if idx ~= sep_idx then
-        w = math.max(w, vim.fn.strwidth(cleaned[idx][ci] or ""))
+        w = math.max(w, tm.strwidth(cleaned[idx][ci] or ""))
       end
     end
     natural[ci] = w
@@ -364,7 +366,7 @@ end
 --- @return table { { text, style, tbl? } } style = "normal"|"code"|"heading"|"list"|"quote"|"table"
 function M.render(text, opts)
   opts = opts or {}
-  local lines = vim.split(text or "", "\n", { plain = true })
+  local lines = tm.split_lines(text or "")
   local out = {}
   local in_code = false
   local code_lang = nil

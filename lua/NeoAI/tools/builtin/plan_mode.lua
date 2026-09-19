@@ -33,8 +33,8 @@ local PLAN_POLICY_TEXT = table.concat({
   "   - 改动清单（涉及的文件 + 每处改动的内容/操作）",
   "   - 实施步骤（先后顺序）",
   "   - 验证方式与回滚方案",
-  "4. 计划完成后调用 exit_plan_mode 工具：会弹出审批窗口，由用户确认是否按此计划开始执行；",
-  "   用户确认后系统把计划转为任务清单（todo），自动转入 CHAT 模式并按清单执行。",
+  "4. 输出计划后即结束本轮：不要尝试切换模式或开始执行修改。是否按计划执行由用户决定，",
+  "   用户确认（:NeoAIApprovePlan 或手动切换模式）后系统会把计划转为任务清单（todo）并转入执行。",
 }, "\n")
 
 --- 计划模式下可见的只读/信息查询工具白名单
@@ -64,9 +64,10 @@ local PLAN_SAFE_TOOLS = {
 }
 
 --- 计划模式下附加可见工具（非只读类，需显式加入）
+--- 注意：不提供任何「切换模式」工具（如 exit_plan_mode）。计划完成后由用户手动确认执行，
+--- 避免 AI 自行调用工具退出计划模式并立即开始改动。
 local PLAN_EXTRA_TOOLS = {
   "ask_user", -- 向用户提问
-  "exit_plan_mode", -- 用户确认计划后转入 CHAT 执行
   -- 外部命令：用于只读调研（查看版本/依赖/构建配置/git 等）。写命令的改动仍会被沙箱冻结为
   -- 待审候选，但计划模式策略要求仅执行只读命令。
   "run_command",
@@ -222,7 +223,7 @@ end
 function M.check_tool(agent, tool_name)
   if not M.is_active(agent) then return true end
   if not M.is_visible(agent, tool_name) then
-    return false, ("[计划模式] 工具 '%s' 不在计划模式可用工具集内（只允许只读/信息查询工具与 ask_user）。请先输出格式化修改计划，用户确认后会自动转入 CHAT 模式执行。"):format(tool_name)
+    return false, ("[计划模式] 工具 '%s' 不在计划模式可用工具集内（只允许只读/信息查询工具、run_command 与 ask_user）。请输出格式化修改计划并等待用户确认执行。"):format(tool_name)
   end
   return true
 end
@@ -318,53 +319,16 @@ plan_mode_tools.enter_plan_mode = helpers.define_tool(
     end
     M.enter(agent)
     -- 模式互斥：进入计划模式必须关闭 AUTO（自动允许所有工具调用）开关。
-    -- 否则 AUTO 优先级高于 PLAN（chat_service._actual_mode），状态栏仍显示 AUTO、
-    -- 且后续 exit_plan_mode 会被 AUTO 直接批准、弹不出审批窗。
+    -- 否则 AUTO 优先级高于 PLAN（chat_service._actual_mode），状态栏仍显示 AUTO。
     local tool_service = require("NeoAI.kernel.services").use("services.tool_service")
     if tool_service then tool_service.set_auto_mode(false) end
-    on_success("已进入计划模式：只读调研 + 提问，输出格式化计划，等待用户确认后转入 CHAT 执行。")
+    on_success("已进入计划模式：只读调研 + 提问，输出格式化计划，等待用户确认后执行。")
   end,
   { category = "agent", approval = { auto_allow = true } }
 )
 
-plan_mode_tools.exit_plan_mode = helpers.define_tool(
-  "exit_plan_mode",
-  "确认修改计划并转入 CHAT 模式执行。仅在已向用户展示格式化计划、且用户明确表示确认后调用；调用会弹出审批窗口请用户最终确认。确认后系统把计划解析为任务清单（todo）、退出计划模式并按配置开始执行。",
-  {
-    type = "object",
-    properties = {
-      plan = { type = "string", description = "可选：本次要确认执行的计划全文或摘要；缺省时取上一条助手消息作为计划" },
-    },
-    required = {},
-  },
-  function(args, on_success, on_error, ctx)
-    local agent = ctx and ctx.agent
-    if not agent then
-      on_error("缺少 agent 上下文")
-      return
-    end
-    local chat_service = require("NeoAI.kernel.services").use("services.chat_service")
-    if not chat_service then
-      on_error("聊天服务未启用")
-      return
-    end
-    -- 复用 approve_plan：解析计划为任务清单（todo）→ 退出计划模式（转入 CHAT）→ 按配置自动执行。
-    local result = chat_service.approve_plan({ plan = args.plan })
-    if type(result) == "table" and result.then_ then
-      -- 自动执行路径：approve_plan 已在 Agent 忙碌时把执行指令暂存进 pending 队列，
-      -- 由工具循环在本轮工具结果后注入下一轮模型调用。此处绝不能等待该 Deferred，
-      -- 否则工具结果无法返回、注入永不发生，工具循环死锁。
-      on_success("计划已确认，已转入 CHAT 模式，正在按任务清单开始执行。")
-      return
-    end
-    if result and result.approved then
-      on_success(("计划已确认，已转入 CHAT 模式，任务清单 %d 项。请按任务清单逐项执行。"):format(result.todo_count or 0))
-    else
-      on_error((result and result.error) or "确认计划失败")
-    end
-  end,
-  { category = "agent", approval = { auto_allow = false } }
-)
+-- 说明：不再向 AI 暴露 exit_plan_mode 等模式切换工具。计划完成后由用户手动确认执行
+-- （:NeoAIApprovePlan 或手动切换模式），避免 AI 自行退出计划模式并立即开始改动。
 
 -- ========== 测试辅助 ==========
 

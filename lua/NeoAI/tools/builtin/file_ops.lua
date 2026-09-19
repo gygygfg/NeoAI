@@ -480,7 +480,7 @@ file_tools.read_file = helpers.define_tool(
 -- 编辑文件（线程池异步读写）
 file_tools.edit_file = helpers.define_tool(
   "edit_file",
-  "编辑文件。filepath 必填；description 必填（描述本次修改目的）；mode='write' 整体覆写，mode='append' 追加；或提供 edits 数组做结构化替换。",
+  "编辑文件。filepath 必填；description 必填（描述本次修改目的）；mode='write' 整体覆写，mode='append' 追加；或提供 edits 数组做结构化替换。省略 mode 时按字段推断：提供 content → write，提供 edits → edit。",
   {
     type = "object",
     properties = {
@@ -499,7 +499,26 @@ file_tools.edit_file = helpers.define_tool(
   function(args, on_success, on_error)
     local filepath = args.filepath
     local description = args.description
-    local mode = args.mode or "edit"
+    -- 参数归一化：模型常只给 content 而省略 mode，此时应视为 write（整体覆写），
+    -- 而非落到默认 edit 模式报「需要 edits 数组」。显式 mode 优先；含 edits 视为 edit。
+    local mode = args.mode
+    if mode == nil or mode == "" then
+      if type(args.edits) == "table" and #args.edits > 0 then
+        mode = "edit"
+      elseif args.content ~= nil then
+        mode = "write"
+      else
+        mode = "edit"
+      end
+    end
+    mode = tostring(mode):lower()
+    if mode == "overwrite" or mode == "replace" or mode == "create" then
+      mode = "write"
+    elseif mode == "concat" or mode == "add" then
+      mode = "append"
+    elseif mode == "patch" or mode == "update" then
+      mode = "edit"
+    end
 
     if mode == "write" then
       _pipe(fs.write_file_async(filepath, args.content or ""), function()
@@ -584,6 +603,9 @@ file_tools.list_files = helpers.define_tool(
   function(args, on_success, on_error)
     local dir = args.path or "."
     local max = args.max_results or 0
+    -- 安全默认：递归默认最多 2000 条、非递归单层最多 5000 条。否则对 home/ 等超大目录
+    -- 会返回数万行（数 MB）并撑爆模型上下文；显式 max_results 可覆盖（仍受 worker 硬上限钳制）。
+    local RECURSIVE_DEFAULT, FLAT_CAP = 2000, 5000
     if not fs.is_dir(dir) then
       -- 真实目录不存在：若沙箱暂存已在其下创建内容，按沙箱视图合成列举（沙箱对 AI 不可见）。
       if not _sandbox_dir_present(dir) then
@@ -594,8 +616,15 @@ file_tools.list_files = helpers.define_tool(
       return
     end
     if args.recursive then
-      _pipe(fs.list_dir_async(dir, max), function(out)
-        on_success(_merge_list(out, dir, true, max))
+      local eff_max = (max and max > 0) and max or RECURSIVE_DEFAULT
+      _pipe(fs.list_dir_async(dir, eff_max), function(out)
+        local n = 0
+        for _ in out:gmatch("[^\n]+") do n = n + 1 end
+        local text = _merge_list(out, dir, true, eff_max)
+        if n >= eff_max then
+          text = text .. "\n（递归列举上限 " .. eff_max .. " 条，可用 max_results 调整）"
+        end
+        on_success(text)
       end, on_error)
       return
     end
@@ -607,9 +636,12 @@ file_tools.list_files = helpers.define_tool(
       return
     end
     local out = {}
+    local flat_cap = (max and max > 0) and math.min(max, FLAT_CAP) or FLAT_CAP
+    local truncated = false
     while true do
       local name, t = vim.uv.fs_scandir_next(handle)
       if not name then break end
+      if #out >= flat_cap then truncated = true break end
       out[#out + 1] = dir .. "/" .. name .. (t == "directory" and "/" or "")
     end
     table.sort(out)
@@ -618,7 +650,9 @@ file_tools.list_files = helpers.define_tool(
       for i = 1, max do trimmed[i] = out[i] end
       out = trimmed
     end
-    on_success(_merge_list(table.concat(out, "\n"), dir, false, max))
+    local text = _merge_list(table.concat(out, "\n"), dir, false, max)
+    if truncated then text = text .. "\n（已截断，单层最多 " .. FLAT_CAP .. " 条；可用 max_results 调整）" end
+    on_success(text)
   end,
   { category = "file" }
 )

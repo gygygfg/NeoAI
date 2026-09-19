@@ -19,6 +19,9 @@
 | `timer.lua` | Pausable timer (tracks active execution time, excluding pauses spent waiting for human interaction). |
 | `image.lua` | Image type detection / media types. |
 | `stringx.lua` | String extensions (trim/split/template/glob/uuid, etc.). |
+| `textmetrics.lua` | Pure-Lua text metrics (display width/codepoint slicing/wrapping); its source string can be `load`ed inside a `utils.work` thread. |
+| `sha256.lua` | Pure-Lua SHA-256 (LuaJIT bit); the source string can be `load`ed inside a `utils.work` thread. |
+| `ansi.lua` | ANSI SGR parser: strips escape sequences and returns plain text plus per-line color spans (16/256/truecolor + bold/italic/underline/reverse/strikethrough) for rendering colored command output in the UI. |
 
 ## 2. async.lua
 
@@ -61,6 +64,11 @@ An async HTTP client built on `curl` jobstart:
 - JSONL: `read_jsonl` / `append_jsonl` / `repair_jsonl` (torn-line recovery).
 - Async variants: `read_file_async` / `write_file_async` / `append_file_async` / `delete_file_async` /
   `list_dir_async` / `search_files_async` / `read_file_lines_async` (all go through the `utils.work` thread pool).
+- **Recursive traversal bounds**: `list_dir_async` has a built-in hard entry cap (50000 by default; `max<=0`
+  no longer means unlimited), and `search_files_async` is bounded by both a visited-entry cap (100000) and a
+  CPU time budget (5s) when there is no match. Otherwise unbounded recursion plus per-file reads over huge
+  directories (e.g. `$HOME`, hundreds of thousands of entries) would saturate the libuv worker threads
+  (`libuv-worker` pegged at 100% CPU) and never return.
 
 > Blocking file I/O (reading large files / recursive search / writing to disk) runs in the thread pool via `utils.work`,
 > so it does not occupy the nvim main thread and prevents the main UI from freezing during tool calls.
@@ -135,3 +143,37 @@ log = {
   verbose = false,
 }
 ```
+
+## 11. sha256.lua
+
+- `hex(s)`: lowercase hex SHA-256, identical to `vim.fn.sha256`.
+- `source`: the Lua source string of the same implementation, for `load(source)()` inside a
+  worker thread (the thread has a fresh Lua state and cannot `require` this module).
+
+> Purpose: move sandbox candidate base/after hash computation off the main thread
+> (`sandbox/candidate` computes them in a `utils.work` thread). `bit` is available in LuaJIT
+> worker threads, so `vim.fn` is not needed. Consistency is cross-checked by `test_sha256`
+> against `vim.fn.sha256`.
+
+## 12. textmetrics.lua
+
+Pure-Lua text metrics (no `vim.fn` / `vim.api`), matching the semantics of
+`vim.fn.strwidth` / `strchars` / `strcharpart`:
+
+- `strwidth(s)` / `strchars(s)`: display width / codepoint count (ASCII/CJK/fullwidth/emoji/
+  combining marks; invalid UTF-8 bytes count as width 4 and 1 char, like vim). Pure ASCII uses
+  the `#s` fast path.
+- `strcharpart(s, start, len)`: codepoint-based slicing (out of range returns `""`; a negative
+  start clamps to 0 and reduces `len`).
+- `split_lines(text)`: equivalent to `vim.split(text, "\n", { plain = true })`.
+- `each_char(s)`: single-pass `(char, width)` iterator for wrapping (avoids O(n²) slicing).
+- `source`: the Lua source string of the same implementation, for `load(source)()` inside a
+  `utils.work` thread.
+
+> Purpose: markdown table rendering (`ui/components/markdown_view`) and tool-result pruning
+> (`core/session/tool_result_pruner`) used to call `vim.fn.strwidth/strcharpart` per character,
+> paying a C boundary crossing each time. The pure-Lua single pass is ~1.8x faster for CJK width
+> computation and ~1.7x faster for per-character wrapping. `source` lets the same implementation
+> be moved wholesale into the thread pool so pruning MB-scale tool results no longer blocks the
+> main thread. Consistency is cross-checked by `test_textmetrics` against `vim.fn`.
+

@@ -35,11 +35,11 @@ tests.suite("plan_mode", function(_, it)
     t.true_(pm.check_tool(agent, "run_command"), "计划模式放行 run_command（只读调研）")
     t.false_(pm.check_tool(agent, "create_sub_agent"))
     t.false_(pm.check_tool(agent, "todo_write"))
-    -- 只读/信息查询 + ask_user + exit_plan_mode：放行
+    -- 只读/信息查询 + ask_user：放行；模式切换工具不提供给 AI
     t.true_(pm.check_tool(agent, "read_file"))
     t.true_(pm.check_tool(agent, "git_status"))
     t.true_(pm.check_tool(agent, "ask_user"))
-    t.true_(pm.check_tool(agent, "exit_plan_mode"))
+    t.false_(pm.check_tool(agent, "exit_plan_mode"), "计划模式不向 AI 提供模式切换工具")
     pm.exit(agent)
     t.true_(pm.check_tool(agent, "edit_file"))
   end)
@@ -65,7 +65,7 @@ tests.suite("plan_mode", function(_, it)
     t.nil_(filtered.lsp_rename, "计划模式不暴露 lsp_rename")
     t.not_nil(filtered.read_file, "计划模式保留 read_file")
     t.not_nil(filtered.ask_user, "计划模式保留 ask_user")
-    t.not_nil(filtered.exit_plan_mode, "计划模式保留 exit_plan_mode")
+    t.nil_(filtered.exit_plan_mode, "计划模式不向 AI 提供模式切换工具")
     t.not_nil(filtered.git_status, "计划模式保留 git_status")
     t.not_nil(filtered.lsp_diagnostics, "计划模式保留 lsp_diagnostics")
     pm.exit(agent)
@@ -151,49 +151,14 @@ tests.suite("plan_mode", function(_, it)
     todo.reset()
   end)
 
-  it("exit_plan_mode 工具需审批，调用后转入 CHAT 并建立任务清单", function(t)
-    local config_store = require("NeoAI.kernel.config_store")
-    config_store.load({
-      tools = {
-        approval = { mode = "prompt", per_tool = {} },
-        plan_mode = { auto_execute_on_approve = false },
-      },
-    })
-    local chat_service = require("NeoAI.services.chat_service")
-    local tool_service = require("NeoAI.services.tool_service")
-    local todo = require("NeoAI.tools.builtin.todo")
+  it("不向 AI 注册模式切换工具（exit_plan_mode）", function(t)
     local pm = require("NeoAI.tools.builtin.plan_mode")
-    chat_service.reset()
-    tool_service.reset()
-    todo.reset()
-
-    local agent = chat_service.new_session({})
-    pm.enter(agent)
-
-    local tool
     for _, tl in ipairs(pm.get_tools()) do
-      if tl.name == "exit_plan_mode" then tool = tl end
+      t.ne("exit_plan_mode", tl.name, "不应再向 AI 暴露 exit_plan_mode 工具")
     end
-    t.not_nil(tool, "应注册 exit_plan_mode 工具")
-    t.false_(tool.approval and tool.approval.auto_allow, "exit_plan_mode 需用户审批确认")
-
-    local out = {}
-    tool.func(
-      { plan = "- 步骤一：修改 core/init.lua\n- 步骤二：运行验证" },
-      function(m) out.msg = m end,
-      function(e) out.err = e end,
-      { agent = agent })
-
-    t.nil_(out.err)
-    t.matches("转入 CHAT", out.msg or "")
-    t.false_(pm.is_active(agent), "工具调用后应退出计划模式")
-    t.eq("chat", chat_service.get_mode())
-    local items = todo.get(agent.session_id)
-    t.not_nil(items)
-    t.eq(2, #items)
-    chat_service.reset()
-    tool_service.reset()
-    todo.reset()
+    -- 注册表（AI 实际工具上下文）中同样不存在
+    local registry = require("NeoAI.tools.registry")
+    t.nil_(registry.get("exit_plan_mode"), "注册表中不应存在 exit_plan_mode")
   end)
 
   it("approve_plan 无计划 / 非计划模式下失败", function(t)

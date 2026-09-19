@@ -129,6 +129,29 @@ tests.suite("chat_ui", function(_, it)
     chat_service.reset()
   end)
 
+  it("思考过程/接收参数悬浮窗高度限制在 5 行", function(t)
+    local reasoning_panel = require("NeoAI.ui.components.reasoning_panel")
+    local tool_args_panel = require("NeoAI.ui.components.tool_args_panel")
+    local float_window = require("NeoAI.ui.components.float_stream_window")
+    float_window.reset()
+    reasoning_panel.reset()
+    tool_args_panel.reset()
+
+    reasoning_panel.open()
+    for i = 1, 20 do reasoning_panel.append("推理第 " .. i .. " 行") end
+    t.eq(5, vim.api.nvim_win_get_height(reasoning_panel.open()), "思考过程悬浮窗应限高 5 行")
+
+    tool_args_panel.open()
+    for i = 1, 20 do
+      tool_args_panel.show({ { id = "1", ["function"] = { name = "write_file", arguments = string.rep("x", i * 40) } } })
+    end
+    t.eq(5, vim.api.nvim_win_get_height(tool_args_panel.open()), "接收参数悬浮窗应限高 5 行")
+
+    reasoning_panel.close()
+    tool_args_panel.close()
+    float_window.reset()
+  end)
+
   it("接收工具参数时打开悬浮窗并在参数流结束关闭", function(t)
     local chat_view = require("NeoAI.ui.window.chat_view")
     local chat_service = require("NeoAI.services.chat_service")

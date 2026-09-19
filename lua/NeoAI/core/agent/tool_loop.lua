@@ -129,6 +129,7 @@ local function _execute_single(agent, tool_call, tool_service, opts)
   -- 等待用户审批或 ask_user 回答期间暂停，耗时与超时均不含等待时间。
   local timer = require("NeoAI.utils.timer").create()
   local exec_opts = vim.tbl_extend("force", {}, opts or {}, { timer = timer })
+  exec_opts.ui_notice = nil -- 由 tool_service 在执行后回填（仅 UI 展示，不进入模型上下文）
   logger.warn("[tool_loop] 执行工具 %s round=%s", name, tostring(agent._round_seq or ""))
 
   -- 以原对象注册到 fold：事件经 nvim_exec_autocmds 深拷贝会丢失元表/方法，计时器无法随
@@ -151,7 +152,8 @@ local function _execute_single(agent, tool_call, tool_service, opts)
       agent_id = agent.id, name = name, result = result_str,
       tool_call_id = tool_call.id, duration_ms = duration_ms,
     })
-    return { tool_call_id = tool_call.id, name = name, result_str = result_str, duration_ms = duration_ms }
+    return { tool_call_id = tool_call.id, name = name, result_str = result_str, duration_ms = duration_ms,
+      notice = exec_opts.ui_notice, secret_paths = exec_opts.observed_secret_paths }
   end, function(err)
     local duration_ms = timer:elapsed()
     local logger = require("NeoAI.kernel.logger")
@@ -163,7 +165,8 @@ local function _execute_single(agent, tool_call, tool_service, opts)
       agent_id = agent.id, name = name, error = err_msg,
       tool_call_id = tool_call.id, duration_ms = duration_ms,
     })
-    return { tool_call_id = tool_call.id, name = name, result_str = result_str, duration_ms = duration_ms }
+    return { tool_call_id = tool_call.id, name = name, result_str = result_str, duration_ms = duration_ms,
+      notice = exec_opts.ui_notice, secret_paths = exec_opts.observed_secret_paths }
   end)
 end
 
@@ -394,7 +397,9 @@ function M.run(agent, tool_calls, tool_service, opts)
     return async.all(promises):then_(function(results)
       for i, res in ipairs(results) do
         if res then
-          agent:add_tool_result(res.tool_call_id, res.name, res.result_str, { duration_ms = res.duration_ms })
+          agent:add_tool_result(res.tool_call_id, res.name, res.result_str, {
+            duration_ms = res.duration_ms, notice = res.notice, secret_paths = res.secret_paths,
+          })
         end
       end
 

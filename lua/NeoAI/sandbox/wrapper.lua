@@ -229,6 +229,7 @@ local function _enqueue_review(cand, attempt, cfg, env, meta)
     package_manager = meta and meta.package_manager or nil,
     package_names = meta and meta.package_names or nil,
     package_key = meta and meta.package_key or nil,
+    package_sensitive = meta and meta.package_sensitive or nil,
   })
 end
 
@@ -346,16 +347,30 @@ local function _settle_candidate(cand, attempt, ctx, cfg, spec, result, process_
   if not secret_warning and ctx and ctx.secret_operation then
     secret_warning = { count = 1, tokens = {}, names = ctx.secret_names or {}, reason = "KEY_OPERATION" }
   end
+  -- 脚本间接执行：折叠后的 effective 文本用于危险模式识别与包安装识别。
+  local scan = attempt.script_scan
+  local effective = scan and scan.enabled and scan.effective or nil
+  -- 敏感安装（改动第三方软件源/密钥）：保留高危评级；安全安装封顶中危（放宽风险提示）。
+  local pkg_sensitive = false
+  if is_pkg then
+    pcall(function()
+      pkg_sensitive = require("NeoAI.sandbox.privilege").package_sensitive(effective or attempt.container_command
+        or (process_info and process_info.command))
+    end)
+  end
   local rf = {
     effect = spec.effect,
     paths = paths,
     privilege_tier = attempt.privilege_tier,
     package = is_pkg,
+    package_sensitive = pkg_sensitive,
     network = attempt.network == true,
     -- 密钥操作：候选文件含 token，或本次调用使用了 KEY 环境变量 token（提级强制待审）。
     secret = (secret_warning and (secret_warning.count or 0) > 0)
       or (ctx and ctx.secret_operation == true) or false,
     command = attempt.container_command or (process_info and process_info.command) or nil,
+    command_effective = effective,
+    script_opaque = (scan and scan.opaque) or false,
   }
   local r = risk.classify(rf)
   if attempt.result_risk and (attempt.result_risk.level or 0) > r.level then
@@ -366,7 +381,7 @@ local function _settle_candidate(cand, attempt, ctx, cfg, spec, result, process_
   end
   -- 包安装降级：包安装的状态文件在工作区外、常含高熵签名，结果信号（如磁盘/网络）不应把
   -- 它推到 L3；仅当命令本身命中破坏性模式时才保留 L3。
-  if rf.package and r.level >= 3 and (risk.dangerous_level(rf.command) or 0) < 3 then
+  if rf.package and r.level >= 3 and (risk.dangerous_level(effective or rf.command) or 0) < 3 then
     r.level = 2
     r.name = risk.level_name(2)
     r.badge = risk.badge(2)
@@ -386,6 +401,7 @@ local function _settle_candidate(cand, attempt, ctx, cfg, spec, result, process_
   local action = risk.action(r.level, {
     session_auto = review.session_auto(),
     package = rf.package,
+    package_sensitive = pkg_sensitive,
     secret = rf.secret,
   })
   if action == "block" then
@@ -405,6 +421,10 @@ local function _settle_candidate(cand, attempt, ctx, cfg, spec, result, process_
   if rf.package and ((cfg.packages or {}).mode or "review") ~= "allow" then auto = false end
   -- 密钥操作永不自动发布（需显式确认）。
   if rf.secret then auto = false end
+  -- 脚本间接执行：脚本内命中危险命令、或内容无法静态解析（不透明）时强制复核，
+  -- 不随 mode=commit / 会话自动审批放行（沙箱仍保证写入冻结，复核兜住误判）。
+  local script_indirect_risk = scan and scan.enabled and (scan.opaque or (scan.danger or 0) > 0)
+  if script_indirect_risk then auto = false end
   local severity = require("NeoAI.sandbox.privilege").severity(attempt.privilege_tier or 0)
   local env = envelope.build({
     command_id = attempt.command_id,
@@ -444,7 +464,9 @@ local function _settle_candidate(cand, attempt, ctx, cfg, spec, result, process_
   -- 包安装：提取管理器与包名（用于按安装命令合并审批与界面标注）。
   local pinfo = nil
   if rf.package then
-    pcall(function() pinfo = require("NeoAI.sandbox.privilege").package_info(rf.command) end)
+    pcall(function()
+      pinfo = require("NeoAI.sandbox.privilege").package_info(effective or rf.command)
+    end)
   end
   if not pinfo and pkg_by_path then
     pinfo = { manager = pkg_by_path, packages = {}, key = pkg_by_path .. ":*" }
@@ -457,6 +479,7 @@ local function _settle_candidate(cand, attempt, ctx, cfg, spec, result, process_
     package_manager = pinfo and pinfo.manager or nil,
     package_names = pinfo and pinfo.packages or nil,
     package_key = pinfo and pinfo.key or nil,
+    package_sensitive = pkg_sensitive or nil,
   })
   if item then
     -- 同一文件被再次编辑：新候选取代同路径的旧待审项（队列只保留最新版本）
@@ -487,6 +510,171 @@ function M.settle_exec_candidate(attempt, cand, ctx, spec, result, process_info)
   end
   candidate.cleanup(attempt.attempt_id)
   return { ok = true, value = result }
+end
+
+-- ========== 内核级行为观测（eBPF / strace / procfs） ==========
+
+--- 观测事件 → 越界访问留痕 + 密钥文件访问归因（非阻塞，best-effort）。
+--- 以实际 syscall 访问为准，替代/补充命令字符串解析启发式。
+--- @param attempt table
+--- @param ctx table
+--- @param evt table { kind, op, pid, path?, host?, port? }
+local function _on_observed(attempt, ctx, evt)
+  if type(evt) ~= "table" then return end
+  if evt.kind ~= "file" then return end
+  local p = evt.path
+  if type(p) ~= "string" or p == "" then return end
+  local runtime = require("NeoAI.sandbox.runtime")
+  if runtime.read_all() then
+    local hit = runtime.outside_workspace(p, vim.fn.getcwd())
+    if hit then
+      pcall(function()
+        require("NeoAI.sandbox.trace").record({
+          path = hit, tool = attempt.tool_name, kind = "read", source = "observed",
+        })
+      end)
+    end
+  end
+  local secret = require("NeoAI.sandbox.secret")
+  if secret.enabled() and secret.is_secret_path(p) then
+    ctx.observed_secret_paths = ctx.observed_secret_paths or {}
+    local seen = ctx._observed_secret_seen
+    if not seen then seen = {}; ctx._observed_secret_seen = seen end
+    if not seen[p] then
+      seen[p] = true
+      ctx.observed_secret_paths[#ctx.observed_secret_paths + 1] = p
+    end
+  end
+end
+
+-- ========== 观测预热（把 eBPF 探针挂载移出命令关键路径） ==========
+-- eBPF 探针（bpftrace）挂载约需 0.5s：若在命令执行前同步等待，会给每条进程命令带来固定卡顿；
+-- 若完全不等待，短命令可能在挂载完成前结束而漏观测。折中：在**上一条进程命令返回后**（AI 正在
+-- 生成下一轮，主线程空闲）后台预创建下一个 attempt 的 cgroup 并挂载探针，使挂载与 AI 输出重叠；
+-- 下一条进程命令到来时直接复用已挂载的 cgroup + 观测句柄（事件派发目标在复用时指向本次 attempt）。
+-- 未在 TTL 内被复用则回收（停止探针、释放 cgroup）。
+local prewarm = {
+  cg = nil,       -- 预创建的 cgroup handle
+  handle = nil,   -- 已启动的观测句柄（bpftrace）
+  slot = nil,     -- { attempt, ctx }：事件派发目标（复用时填充）
+  limits_key = nil,
+  timer = nil,    -- TTL 定时器
+  seq = 0,
+}
+
+--- cgroup 限制指纹（复用预热前必须一致，否则限制会不匹配）
+--- @param limits table|nil
+--- @return string
+local function _limits_key(limits)
+  limits = limits or {}
+  return table.concat({
+    tostring(limits.memory_bytes or 0), tostring(limits.pids or 0), tostring(limits.cpu_max or 0),
+  }, ":")
+end
+
+--- 停止并回收预热观测（幂等）
+local function _prewarm_clear()
+  if prewarm.timer then pcall(vim.fn.timer_stop, prewarm.timer); prewarm.timer = nil end
+  if prewarm.handle then pcall(prewarm.handle.stop) end
+  if prewarm.cg then
+    pcall(function() require("NeoAI.sandbox.cgroup").release(prewarm.cg) end)
+  end
+  prewarm.cg, prewarm.handle, prewarm.slot, prewarm.limits_key = nil, nil, nil, nil
+end
+
+--- 取出预热观测（若限制匹配）。不匹配或不存在时返回 nil（不匹配会顺带回收）。
+--- @param limits_key string
+--- @return table|nil { cg, handle, slot }
+local function _take_prewarm(limits_key)
+  if not prewarm.cg then return nil end
+  if prewarm.limits_key ~= limits_key then _prewarm_clear(); return nil end
+  local pre = { cg = prewarm.cg, handle = prewarm.handle, slot = prewarm.slot }
+  if prewarm.timer then pcall(vim.fn.timer_stop, prewarm.timer); prewarm.timer = nil end
+  prewarm.cg, prewarm.handle, prewarm.slot, prewarm.limits_key = nil, nil, nil, nil
+  return pre
+end
+
+--- 后台预热下一个 attempt 的 cgroup + eBPF 观测（幂等；仅 ebpf 后端需要，strace/procfs 廉价）。
+--- 应在进程命令返回后调用（主线程空闲、AI 正在生成），使探针挂载与 AI 输出重叠。
+local function _prewarm_observer()
+  local cfg = config_store.get("tools.sandbox.observe") or {}
+  if cfg.enabled == false or cfg.prewarm == false then return end
+  if prewarm.cg or prewarm.handle then return end
+  local observer = require("NeoAI.sandbox.observer")
+  if observer.backend() ~= "ebpf" then return end
+  local cgroup = require("NeoAI.sandbox.cgroup")
+  if not cgroup.limits_configured() then return end
+  local limits = cgroup.resolve_limits()
+  prewarm.seq = prewarm.seq + 1
+  local id = "prewarm_" .. tostring(prewarm.seq)
+  local h = cgroup.prepare(id, limits)
+  if not h then return end
+  local stat = vim.uv.fs_stat(h.path)
+  if not stat then cgroup.release(h); return end
+  local slot = {}
+  local ok, handle = pcall(observer.start, {
+    cgroup_id = stat.ino, cgroup_path = h.path, attempt_id = id,
+    on_event = function(evt)
+      if slot.attempt then pcall(_on_observed, slot.attempt, slot.ctx, evt) end
+    end,
+  })
+  if not ok or not handle then cgroup.release(h); return end
+  prewarm.cg, prewarm.handle, prewarm.slot, prewarm.limits_key = h, handle, slot, _limits_key(limits)
+  local ttl = tonumber(cfg.prewarm_ttl_ms) or 90000
+  if ttl > 0 then
+    prewarm.timer = vim.defer_fn(function() _prewarm_clear() end, ttl)
+  end
+end
+
+--- 清理预热观测（供 sandbox.reset / 测试）
+function M.clear_prewarm()
+  _prewarm_clear()
+end
+
+--- 预热状态快照（测试/诊断）
+--- @return table { active, has_handle, ready, attempt_id }
+function M.prewarm_info()
+  return {
+    active = prewarm.cg ~= nil,
+    has_handle = prewarm.handle ~= nil,
+    ready = prewarm.handle ~= nil and prewarm.handle.ready == true,
+    attempt_id = prewarm.cg and prewarm.cg.attempt_id or nil,
+  }
+end
+
+-- 测试钩子：手动触发一次后台预热（不依赖真实命令时序）。
+M._prewarm_observer = _prewarm_observer
+
+--- 启动带外（out-of-band）观测（ebpf/procfs）。strace 需命令前缀包裹，见 `_build_prefix`。
+--- @param cg_handle table|nil
+--- @param attempt table
+--- @param ctx table
+--- @param prewarmed table|nil 预热观测 { handle, slot }（复用同一 cgroup）
+--- @return table|nil handle
+local function _start_observe(cg_handle, attempt, ctx, prewarmed)
+  local cfg = config_store.get("tools.sandbox.observe") or {}
+  if cfg.enabled == false then return nil end
+  -- 复用预热句柄：把事件派发目标指向本次 attempt/ctx，无需重新挂载。
+  if prewarmed and prewarmed.handle then
+    prewarmed.slot.attempt, prewarmed.slot.ctx = attempt, ctx
+    return prewarmed.handle
+  end
+  local observer = require("NeoAI.sandbox.observer")
+  if not observer.available() then return nil end
+  if not cg_handle or type(cg_handle.path) ~= "string" then return nil end
+  local stat = vim.uv.fs_stat(cg_handle.path)
+  if not stat then return nil end
+  local ok, handle = pcall(observer.start, {
+    cgroup_id = stat.ino,
+    cgroup_path = cg_handle.path,
+    attempt_id = attempt.attempt_id,
+    on_event = function(evt) pcall(_on_observed, attempt, ctx, evt) end,
+    on_error = function(msg)
+      require("NeoAI.kernel.logger").debug("[sandbox] 观测: %s", tostring(msg))
+    end,
+  })
+  if ok and handle then return handle end
+  return nil
 end
 
 -- ========== 公开 API ==========
@@ -543,6 +731,30 @@ function M.gate(tool, args, ctx, call_original)
       reason_codes = verdict.reason_codes,
       command_id = attempt.command_id,
     })
+  end
+  -- 脚本间接执行静态扫描：命令委托给脚本/解释器（bash x.sh、python x.py、./x.sh、
+  -- bash -c '…'）时，读取脚本内容（含 AI 暂存副本）与高级语言内嵌 shell 调用，折叠为
+  -- effective 文本，供硬拒绝/档位/分级复用；无法解析时标记不透明（强制复核）。
+  if spec.effect == "process" and type(args.command) == "string" then
+    local scan = require("NeoAI.sandbox.script_scan").scan(args.command, { cwd = vim.fn.getcwd() })
+    attempt.script_scan = scan
+  end
+  -- 内核/破坏性命令硬拒绝（不执行）：普通命令（python/node/go/rust/apt/pip/npm 等）不受影响，
+  -- 仍可在沙箱内执行并把写入冻结为候选。见 risk.deny_reason。
+  if spec.effect == "process" and type(args.command) == "string" then
+    local scan = attempt.script_scan
+    local deny = require("NeoAI.sandbox.risk").deny_reason(
+      (scan and scan.effective) or args.command)
+    if deny then
+      control.transition(attempt, "PARSED")
+      control.transition(attempt, "BLOCKED")
+      return async.reject({
+        kind = "sandbox",
+        message = "沙箱硬拒绝（内核/危险命令，不执行）: " .. deny,
+        reason_codes = { deny },
+        command_id = attempt.command_id,
+      })
+    end
   end
   control.transition(attempt, "PARSED")
   control.transition(attempt, "PREFLIGHTED")
@@ -661,7 +873,9 @@ function M.gate(tool, args, ctx, call_original)
     -- 权限档位：分类命令（需在构建可写根之前，以便包安装命令加入其状态目录作为可写根）。
     local privilege = require("NeoAI.sandbox.privilege")
     local pcfg = config_store.get("tools.sandbox.privilege") or {}
-    local req = privilege.classify(attempt.tool_name, args, spec)
+    local req = privilege.classify(attempt.tool_name, args, spec, {
+      effective_command = attempt.script_scan and attempt.script_scan.effective,
+    })
     attempt.package = req.package == true
     attempt.network = req.network == true
     -- 可写根 = 工具声明（spec.writable_roots）+（包安装时）包管理器状态目录。
@@ -671,6 +885,11 @@ function M.gate(tool, args, ctx, call_original)
     if req.package then
       attempt.package_roots = _package_roots()
       for _, r in ipairs(attempt.package_roots) do extra_roots[#extra_roots + 1] = r end
+    end
+    -- 已暂存的包安装产物对后续命令可见：把「有暂存改动」的包可写根也加入本次可写根
+    -- （非包安装命令默认只覆盖 cwd，否则后续 `python -m build` 看不到刚装的包）。
+    for _, r in ipairs(require("NeoAI.sandbox.candidate").staged_roots()) do
+      extra_roots[#extra_roots + 1] = r
     end
     local specs = M.build_overlay_specs(real_cwd, proc_dir, extra_roots)
     -- 选定每个可写根实际使用的层（overlay 或 bind），供物化/捕获/前缀构造一致使用
@@ -701,21 +920,39 @@ function M.gate(tool, args, ctx, call_original)
     -- 仅当 limits.fail_closed=true 时明确拒绝（不静默降级）。
     local cgroup = require("NeoAI.sandbox.cgroup")
     local cg_handle = nil
+    local prewarmed = nil
     if cgroup.limits_configured() then
       local lcfg = config_store.get("tools.sandbox.limits") or {}
       local limits = cgroup.resolve_limits()
-      local h, cerr = cgroup.prepare(attempt.attempt_id, limits)
-      if not h then
-        if lcfg.fail_closed == true then
-          candidate.cleanup(attempt.attempt_id)
-          control.transition(attempt, "FAILED")
-          return async.reject({ kind = "sandbox", message = cerr, command_id = attempt.command_id })
-        end
-        require("NeoAI.kernel.logger").warn("[sandbox] cgroup 资源限制不可用，跳过：%s", tostring(cerr))
+      -- 复用上一条进程命令返回后后台预热的 cgroup + 已挂载探针：探针挂载已与 AI 生成
+      -- 下一轮的时间重叠完成，本次命令无需等待挂载。
+      local observe_cfg = config_store.get("tools.sandbox.observe") or {}
+      if observe_cfg.enabled ~= false then
+        prewarmed = _take_prewarm(_limits_key(limits))
+      elseif prewarm.cg then
+        _prewarm_clear()
+      end
+      if prewarmed then
+        cg_handle = prewarmed.cg
+        cgroup.adopt(cg_handle, attempt.attempt_id)
       else
-        cg_handle = h
+        local h, cerr = cgroup.prepare(attempt.attempt_id, limits)
+        if not h then
+          if lcfg.fail_closed == true then
+            candidate.cleanup(attempt.attempt_id)
+            control.transition(attempt, "FAILED")
+            return async.reject({ kind = "sandbox", message = cerr, command_id = attempt.command_id })
+          end
+          require("NeoAI.kernel.logger").warn("[sandbox] cgroup 资源限制不可用，跳过：%s", tostring(cerr))
+        else
+          cg_handle = h
+        end
       end
     end
+
+    -- 内核级行为观测（eBPF/strace/procfs）：优先复用后台预热好的探针；否则在命令前启动
+    -- （不等待挂载完成，挂载异步进行，早期访问可能漏观测，由命令解析启发式兜底）。
+    local observe_handle = _start_observe(cg_handle, attempt, ctx, prewarmed)
 
     -- 容器受控：docker/podman 等运行时尽量与沙箱同 namespace（podman 无守护进程可共享；
     -- docker 依赖外部 daemon，保持受控 socket 并记录原因）。重写命令以注入共享标志。
@@ -736,8 +973,22 @@ function M.gate(tool, args, ctx, call_original)
 
     --- 构造并注入进程前缀（含 cgroup 加入）；失败返回 nil, err
     local function _build_prefix(priv)
-      if priv and priv.userns then
-        active_specs = {}
+      local userns = (priv and priv.userns) == true
+      active_specs = userns and {} or specs
+      -- 视图降级判定：无任何可写根使用 overlay 时，命令只能看到会话私有视图（看不到真实磁盘
+      -- 文件）。默认 fail-closed 直接拒绝，不静默降级；仅 `overlay_fail_closed=false` 才允许
+      -- 以降级私有 cwd 运行（结果会附加降级提示）。T2 嵌套 userns 档位天然无 overlay，
+      -- 其主机效果冻结为提案，属有意设计，不在此拒绝、也不算「降级」（见下方 sandbox_userns）。
+      local degraded = true
+      local degraded_reason
+      for _, s in ipairs(active_specs) do
+        if s.mode == "overlay" then degraded = false end
+        if not degraded_reason and s.overlay_reason then degraded_reason = s.overlay_reason end
+      end
+      if degraded and not userns and cfg.overlay_fail_closed ~= false then
+        local detail = degraded_reason and ("原因：" .. tostring(degraded_reason)) or "无可写根可用 overlay"
+        return nil, "SANDBOX_OVERLAY_UNAVAILABLE: 无法为可写根挂载 overlay 可写层，拒绝以降级模式运行（"
+          .. detail .. "）；请用 :NeoAISandboxCaps 排查，或在 tools.sandbox.overlay_fail_closed=false 显式允许降级"
       end
       -- 审批放行：把本次调用获批解除遮蔽的条目并入 unmask（与档位 unmask 合并）。
       -- 工具子进程可写根（spec.writable_roots）与包安装状态目录也一并 unmask，
@@ -769,24 +1020,41 @@ function M.gate(tool, args, ctx, call_original)
         for _, v in ipairs(prefix) do full[#full + 1] = v end
         prefix = full
       end
+      -- strace 后端：以命令前缀包裹（带外观测拿不到子进程 pid）；trace 文件由 handle 轮询。
+      if require("NeoAI.sandbox.observer").backend() == "strace" then
+        local sp, sh = require("NeoAI.sandbox.observer").strace_prefix({
+          attempt_id = attempt.attempt_id,
+          on_event = function(evt) pcall(_on_observed, attempt, ctx, evt) end,
+        })
+        if sp then
+          local sfull = {}
+          for _, v in ipairs(sp) do sfull[#sfull + 1] = v end
+          for _, v in ipairs(prefix) do sfull[#sfull + 1] = v end
+          prefix = sfull
+          ctx._observe_handle = sh
+        end
+      end
       ctx.sandbox_prefix = prefix
       ctx.sandbox_cwd = eff_cwd
       ctx.sandbox_env = runtime.sandbox_env(eff_priv)
-      -- 视图降级标记：无 overlay（bind 私有层 / userns 档）时命令看不到真实项目文件，
-      -- 只看到会话私有视图；供 run_command 在结果中提示，避免与真实磁盘视图混同。
-      local degraded = true
-      local degraded_reason
-      for _, s in ipairs(active_specs) do
-        if s.mode == "overlay" then degraded = false end
-        if not degraded_reason and s.overlay_reason then degraded_reason = s.overlay_reason end
+      -- token→真实密钥的还原仅限沙箱内部进程：把命令参数中的 NEOKEY_ 还原为真实值后执行，
+      -- 而 `args.command`（UI/证据/日志）仍保留 token，AI 与审计面看不到真实密钥。
+      if type(args.command) == "string" then
+        ctx.sandbox_command = (require("NeoAI.sandbox.secret").detokenize(args.command))
       end
-      ctx.sandbox_degraded = degraded
-      ctx.sandbox_degraded_reason = degraded_reason
+      -- 视图降级标记（degraded/degraded_reason 已在函数开头判定）：无 overlay（bind 私有层）
+      -- 时命令看不到真实项目文件，只看到会话私有视图；供 run_command 结果提示。
+      -- T2 嵌套 userns 档天然无 overlay，但属有意设计（主机效果冻结为提案），不视为降级，
+      -- 单独以 sandbox_userns 标记，供 run_command 显示特权档专用提示。
+      ctx.sandbox_userns = userns
+      ctx.sandbox_degraded = degraded and not userns
+      ctx.sandbox_degraded_reason = (degraded and not userns) and degraded_reason or nil
       ctx.sandbox_shell_state = session_dir and require("NeoAI.sandbox.conceal").session_mount() or nil
       return true
     end
 
     local function _fail(msg)
+      if observe_handle then pcall(observe_handle.stop); observe_handle = nil end
       if cg_handle then cgroup.release(cg_handle) end
       candidate.cleanup(attempt.attempt_id)
       control.transition(attempt, "FAILED")
@@ -834,7 +1102,18 @@ function M.gate(tool, args, ctx, call_original)
     end
 
     local d = async.Deferred.new()
+    -- 带外观测句柄（ebpf/procfs）已在 staging 前启动；进程退出后停止并冲刷事件。
+    local function _stop_observe()
+      if observe_handle then pcall(observe_handle.stop) end
+      observe_handle = nil
+      if ctx._observe_handle then pcall(ctx._observe_handle.stop) end
+      ctx._observe_handle = nil
+      -- 命令结束后（结果即将返回、AI 开始生成下一轮）在后台预热下一条进程命令的探针，
+      -- 使 bpftrace 挂载与 AI 输出重叠；用 vim.schedule 确保结果先返回、不阻塞。
+      vim.schedule(function() pcall(_prewarm_observer) end)
+    end
     local function finish(res, err)
+      _stop_observe()
       if cg_handle then cgroup.release(cg_handle) end
       if err then
         local mapping = candidate.mapping(attempt.attempt_id)
@@ -871,52 +1150,68 @@ function M.gate(tool, args, ctx, call_original)
         d:resolve(res)
         return
       end
-      -- 捕获各可写根 overlay 的改动；overlay 不可用（或 userns 档位）时捕获降级私有 cwd
-      if runtime.backend() == "bwrap" and #active_specs > 0 then
-        for _, spec in ipairs(active_specs) do
-          candidate.capture_overlay(attempt.attempt_id, spec.root,
-            spec.mode == "bind" and spec.bind or spec.upper)
+      -- 捕获各可写根 overlay 的改动；overlay 不可用（或 userns 档位）时捕获降级私有 cwd。
+      -- 遍历/读取/哈希经 utils.work 线程池，避免大量文件/大文件时占满主线程。
+      local function after_capture(cand)
+        if require("NeoAI.sandbox.fault").hit("freeze") then cand = nil end
+        control.transition(attempt, "CANDIDATE_READY")
+        -- T2 特权档：命令已在嵌套 userns 内执行（够不到宿主），其主机效果冻结为提案，
+        -- 异步审批后在主机上 replay（不阻塞工具调用）。
+        if (attempt.privilege_tier or 0) >= 2 and (cfg.review or {}).enabled ~= false then
+          pcall(function()
+            require("NeoAI.sandbox.hostop").freeze(attempt, args,
+              { tier = attempt.privilege_tier, network = true }, { reason = "PRIVILEGED_TIER" })
+          end)
         end
-      else
-        candidate.capture_overlay(attempt.attempt_id, real_cwd, staging)
-      end
-      local cand = candidate.finish(attempt.attempt_id)
-      if require("NeoAI.sandbox.fault").hit("freeze") then cand = nil end
-      control.transition(attempt, "CANDIDATE_READY")
-      -- T2 特权档：命令已在嵌套 userns 内执行（够不到宿主），其主机效果冻结为提案，
-      -- 异步审批后在主机上 replay（不阻塞工具调用）。
-      if (attempt.privilege_tier or 0) >= 2 and (cfg.review or {}).enabled ~= false then
-        pcall(function()
-          require("NeoAI.sandbox.hostop").freeze(attempt, args,
-            { tier = attempt.privilege_tier, network = true }, { reason = "PRIVILEGED_TIER" })
-        end)
-      end
-      if cand and #cand.files > 0 then
-        cand.command_id = attempt.command_id
-        store.write_candidate(cand)
-        -- 双向互通：把命令改动合并进工作区暂存映射，使 read_file/edit_file 可见
-        candidate.merge_candidate(cand)
-        local settled = _settle_candidate(cand, attempt, ctx, cfg, spec, res, { command = args and args.command })
-        candidate.cleanup(attempt.attempt_id)
-        if settled.ok then d:resolve(settled.value) else d:reject(settled.err) end
-      else
-        if cand == nil then
-          control.transition(attempt, "FAILED")
-          candidate.cleanup(attempt.attempt_id)
-          d:reject({ kind = "sandbox", message = "候选冻结失败", command_id = attempt.command_id })
+        if cand and #cand.files > 0 then
+          cand.command_id = attempt.command_id
+          store.write_candidate(cand)
+          -- 双向互通：把命令改动合并进工作区暂存映射，使 read_file/edit_file 可见。
+          -- 密钥 token 化（全文扫描）经线程池，避免大量文件时占满主线程。
+          return candidate.merge_candidate_async(cand):then_(function()
+            local settled = _settle_candidate(cand, attempt, ctx, cfg, spec, res, { command = args and args.command })
+            candidate.cleanup(attempt.attempt_id)
+            if settled.ok then d:resolve(settled.value) else d:reject(settled.err) end
+          end)
         else
-          control.transition(attempt, "COMPLETED_READ_ONLY")
-          candidate.cleanup(attempt.attempt_id)
-          d:resolve(res)
+          if cand == nil then
+            control.transition(attempt, "FAILED")
+            candidate.cleanup(attempt.attempt_id)
+            d:reject({ kind = "sandbox", message = "候选冻结失败", command_id = attempt.command_id })
+          else
+            control.transition(attempt, "COMPLETED_READ_ONLY")
+            candidate.cleanup(attempt.attempt_id)
+            d:resolve(res)
+          end
         end
       end
+      local captures = {}
+      if runtime.backend() == "bwrap" and #active_specs > 0 then
+        for _, cap_spec in ipairs(active_specs) do
+          captures[#captures + 1] = candidate.capture_overlay_async(attempt.attempt_id, cap_spec.root,
+            cap_spec.mode == "bind" and cap_spec.bind or cap_spec.upper)
+        end
+      else
+        captures[#captures + 1] = candidate.capture_overlay_async(attempt.attempt_id, real_cwd, staging)
+      end
+      async.all(captures):then_(function()
+        return candidate.finish_async(attempt.attempt_id)
+      end):then_(after_capture, function(cerr)
+        control.transition(attempt, "FAILED")
+        candidate.cleanup(attempt.attempt_id)
+        d:reject({
+          kind = "sandbox",
+          message = "候选冻结失败: " .. tostring(cerr and (cerr.message or cerr) or cerr),
+          command_id = attempt.command_id,
+        })
+      end)
     end
 
     --- 执行一次；权限/网络失败时自动发起升级并在隔离内重跑（记录，不静默）。
     --- 全档位生效：T0 失败升 T1，T1 失败升 T2（直到 max_tier），每步写证据/事件/审计。
     local function run(priv, current_tier)
       call_original():then_(function(res)
-        if pcfg.auto_escalate ~= false and current_tier < (pcfg.max_tier or 2) then
+        if pcfg.auto_escalate ~= false and not attempt.package and current_tier < (pcfg.max_tier or 2) then
           local raw = ctx.sandbox_last_result
           local esc = privilege.detect_escalation(raw)
           if esc and esc.tier > current_tier then
@@ -956,14 +1251,40 @@ function M.gate(tool, args, ctx, call_original)
       end)
     end
 
+    -- eBPF 探针挂载为异步 best-effort：默认**不阻塞命令**（`observe.wait_ready_ms=0`），
+    -- 避免每条命令固定等待 bpftrace 挂载（约 0.5s）造成可感知卡顿。挂载完成前发生的早期
+    -- 访问可能漏观测（由命令解析启发式兜底）；需要更全观测时把 wait_ready_ms 设为正值（有界等待）。
+    if observe_handle and observe_handle.wait_ready then
+      local ocfg = cfg.observe or {}
+      local wait_ms = tonumber(ocfg.wait_ready_ms) or 0
+      if wait_ms > 0 then pcall(observe_handle.wait_ready, wait_ms) end
+    end
     run(resolved.privileges, req.tier)
     return d
   end
 
   -- 文件系统写：暂存到工作区私有副本，冻结候选，按模式发布/入队
   local record = candidate.begin(attempt, root)
-  local sandbox = require("NeoAI.sandbox")
+  local sandbox = require("NeoAI/sandbox")
   local previous_active = sandbox._set_active_attempt(attempt)
+  -- 目录工具（创建/确保目录）合法地以目录为目标；其余 fs_write（edit_file 等）写文件，
+  -- 若目标在真实盘或沙箱视图中是目录，必须拒绝——否则会把目录覆盖成文件，破坏沙箱视图
+  -- 一致性（后续 `ls dir/` 报 Not a directory，属「文件缓存一致性损坏」）。
+  local DIR_TOOLS = { create_directory = true, ensure_dir = true }
+  if not DIR_TOOLS[attempt.tool_name] then
+    for _, key in ipairs(spec.paths or {}) do
+      if type(args[key]) == "string" and candidate.view_is_dir(args[key]) then
+        sandbox._set_active_attempt(previous_active)
+        candidate.cleanup(attempt.attempt_id)
+        control.transition(attempt, "FAILED")
+        return async.reject({
+          kind = "sandbox",
+          message = "SANDBOX_TARGET_IS_DIR: 目标路径是目录，不能用文件写入工具覆盖: " .. args[key],
+          command_id = attempt.command_id,
+        })
+      end
+    end
+  end
   for _, key in ipairs(spec.paths or {}) do
     if type(args[key]) == "string" then
       local staged = candidate.stage_path(attempt.attempt_id, args[key])
@@ -975,6 +1296,8 @@ function M.gate(tool, args, ctx, call_original)
   local d = async.Deferred.new()
   call_original():then_(function(result)
     sandbox._set_active_attempt(previous_active)
+    -- 单文件写路径（edit_file 等）保持同步冻结：文件数少，线程池往返反而增加延迟；
+    -- 大量文件的 run_command 路径见上方 after_capture（capture/finish 经线程池）。
     local cand = candidate.finish(attempt.attempt_id)
     if require("NeoAI.sandbox.fault").hit("freeze") then cand = nil end
     control.transition(attempt, "CANDIDATE_READY")

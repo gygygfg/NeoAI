@@ -7,7 +7,7 @@
 > computation are delegated uniformly to the **`utils.work` thread pool** to avoid stalling the nvim
 > main thread; async primitives are provided by `utils.async`.
 > Corresponding source: `lua/NeoAI/utils/work.lua`, `lua/NeoAI/utils/async.lua`,
-> `lua/NeoAI/utils/timer.lua`.
+> `lua/NeoAI/utils/timer.lua`, `lua/NeoAI/utils/textmetrics.lua`.
 
 ## 1. Core Idea
 
@@ -51,6 +51,18 @@ end, function(err) ... end)
 | `tools/builtin/file_ops.lua` | `read_file` / `edit_file` / `list_files` / `search_files` / `delete_file` (async variants). |
 | `tools/builtin/read_image.lua` | Reads a binary file (`work.run(_read_binary, abs_path)`). |
 | `tools/builtin/edit_file.lua` (edit mode) | Reads the file + performs structured replacement + writes to disk (all completed inside the thread pool). |
+| `sandbox/candidate.lua` | `capture_overlay_async` / `finish_async`: overlay recursive walk, file reads and SHA-256 hashing run in the thread pool; the main thread only registers/assembles state. |
+| `sandbox/conceal.lua` | `redact_async`: fingerprint redaction of command output (a dozen gsub passes, possibly MB-scale) runs in the thread pool. |
+| `sandbox/secret.lua` | `tokenize_many_async` / `tokenize_async`: full-text secret scanning (named rules + variable names + entropy) runs in the thread pool; token generation/mapping/events stay on the main thread. |
+| `utils/sha256.lua` | Pure-Lua SHA-256; the `source` string is `load`ed inside a thread so candidate hashing and in-thread token derivation run on another core. |
+| `utils/textmetrics.lua` | Pure-Lua text metrics (display width / codepoint slicing / wrapping); the `source` string is `load`ed inside a thread. |
+| `core/session/tool_result_pruner.lua` | `prune_agent_async`: codepoint counting/slicing of MB-scale tool results runs in the thread pool (measured: 12×3.7MB goes from a 330ms main-thread block to 0ms, ~140ms across 4 threads); only the pruned result is handed back to the main thread. Falls back to synchronous when the pool is unavailable or `ui.render.threaded=false`. |
+
+> Rendering (`ui/components/markdown_view.lua`) now uses a pure-Lua single pass via
+> `utils.textmetrics` instead of per-character `vim.fn.strwidth/strcharpart`, making CJK table
+> wrapping ~1.8–3x faster. Rendering still runs synchronously by design (`ui.render.threaded`
+> only governs computation offloading); `textmetrics.source` is available if the whole render
+> is later moved into the thread pool.
 
 ## 4. Thread Pool vs. the Old Multi-threaded UI
 

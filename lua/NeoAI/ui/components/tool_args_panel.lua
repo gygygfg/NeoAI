@@ -17,6 +17,8 @@ local M = {}
 
 local FILETYPE = "neoai_tool_args"
 local TITLE = "🔧 接收参数"
+-- 高度上限：接收参数悬浮窗最多 5 行。
+local MAX_HEIGHT = 5
 
 -- ========== 私有状态 ==========
 
@@ -105,7 +107,7 @@ end
 --- @param title string|nil
 --- @return number win_id
 function M.open(title)
-  return float_window.open(title or TITLE, { filetype = FILETYPE })
+  return float_window.open(title or TITLE, { filetype = FILETYPE, max_height = MAX_HEIGHT })
 end
 
 --- 展示工具调用参数快照（单工具增量追加；否则整段重建）

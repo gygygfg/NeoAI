@@ -234,6 +234,27 @@ tests.suite("tools", function(_, it)
     end)
   end)
 
+  it("edit_file：省略 mode 时按 content 推断 write（参数归一化）", function(t)
+    local file_ops = require("NeoAI.tools.builtin.file_ops")
+    local def
+    for _, d in ipairs(file_ops.get_tools()) do
+      if d.name == "edit_file" then def = d end
+    end
+    t.not_nil(def, "应注册 edit_file")
+    local fs = require("NeoAI.utils.fs")
+    local path = vim.fn.tempname() .. ".txt"
+    local done, ok, result, err = false, nil, nil, nil
+    def.func({ filepath = path, content = "hello\n", description = "t" }, function(r)
+      ok, result, done = true, r, true
+    end, function(e)
+      ok, err, done = false, e, true
+    end)
+    t.true_(vim.wait(2000, function() return done end), "edit_file 应完成")
+    t.true_(ok, "省略 mode 且提供 content 应成功（推断为 write），err=" .. tostring(err))
+    t.matches("文件已写入", result or "", "应走 write 分支")
+    t.eq("hello", (fs.read_file(path):gsub("%s+$", "")), "内容应写入文件")
+  end)
+
   it("read_file 大文件保护：小文件无行范围仍返回全文", function(t)
     local registry = require("NeoAI.tools.registry")
     registry.reset()
@@ -698,6 +719,31 @@ tests.suite("tools", function(_, it)
       print("  tool_service err:", e.message)
       t.true_(false)
     end)
+  end)
+
+  it("tool_service 把 ctx.ui_notice 作为 UI-only 元数据回传（不进入结果内容）", function(t)
+    local config_store = require("NeoAI.kernel.config_store")
+    config_store.load({ tools = { approval = { mode = "auto_allow" } } })
+    local tool_service = require("NeoAI.services.tool_service")
+    tool_service.reset()
+    local registry = require("NeoAI.tools.registry")
+    local helpers = require("NeoAI.tools.builtin.tool_helpers")
+    registry.register(helpers.define_tool(
+      "notice_tool", "notice", { type = "object", properties = {}, required = {} },
+      function(_, on_success, _, ctx)
+        ctx.ui_notice = "[NeoAI] 降级提示"
+        on_success("plain-result")
+      end
+    ))
+    local opts = {}
+    local done, res = false, nil
+    tool_service.execute({ id = "n-agent" }, "notice_tool", { description = "t" }, nil, opts)
+      :then_(function(r) res = r; done = true end, function() done = true end)
+    t.true_(vim.wait(2000, function() return done end), "应完成")
+    t.eq("plain-result", res, "结果内容不应包含 UI 提示")
+    t.matches("降级提示", tostring(opts.ui_notice), "提示应经 opts 回传供 UI 展示")
+    registry.remove("notice_tool")
+    tool_service.reset()
   end)
 
   it("审批「加入工作目录」把文件目录并入 allowed_directories", function(t)

@@ -29,6 +29,7 @@ function M.create(opts)
     created_at = opts.created_at or now,
     updated_at = opts.updated_at or now,
     model = opts.model or nil,
+    provider = opts.provider or nil,
     messages = vim.deepcopy(opts.messages or {}),
     metadata = vim.deepcopy(opts.metadata or {
       name = opts.name or nil,
@@ -61,6 +62,7 @@ function M.deserialize(data)
     created_at = data.created_at,
     updated_at = data.updated_at,
     model = data.model,
+    provider = data.provider,
     messages = data.messages,
     metadata = data.metadata,
   })
@@ -206,6 +208,7 @@ function M.fork(session, opts)
     parent_id = session.id,
     root_id = session.root_id,
     model = session.model,
+    provider = session.provider,
   })
   if opts.copy_messages then
     child.messages = vim.deepcopy(session.messages)

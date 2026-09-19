@@ -84,15 +84,17 @@ local function _approval_text(tool_name, args)
     tool_name, desc, args_str
   )
   -- 越界访问留痕：把近期访问 cwd 之外用户工作目录的记录附在审批窗内（非阻塞、仅展示）。
+  -- 按文件路径合并（同一路径的多工具访问合并）、路径升序排序后展示。
   local ok, trace = pcall(require, "NeoAI.sandbox.trace")
   if ok and trace then
-    local items = trace.list()
+    local items = trace.list_grouped()
     if #items > 0 then
-      local lines = { "", "近期越界访问（工作区外，仅记录）:" }
+      local lines = { "", "越界访问（工作区外，仅记录）:" }
       local start = math.max(1, #items - 4)
       for i = start, #items do
         local it = items[i]
-        lines[#lines + 1] = string.format("  [%s] %s", tostring(it.tool or "?"), tostring(it.path or ""))
+        local tool = table.concat(it.tools or { it.tool or "?" }, ", ")
+        lines[#lines + 1] = string.format("  [%s] %s", tool, tostring(it.path or ""))
       end
       text = text .. "\n" .. table.concat(lines, "\n")
     end
@@ -314,7 +316,20 @@ function M.execute(agent, tool_name, args, tool_call_id, opts)
     timer = opts.timer, -- 可暂停计时器（tool_loop 注入，用于展示活跃耗时并排除等待时间）
   }
 
-  return executor.execute(tool_name, args, ctx)
+  -- UI-only 通知（如沙箱降级提示）：执行完成后经 opts 回传 tool_loop，作为工具结果的
+  -- 附加元数据展示，**不进入模型上下文**。
+  local d = executor.execute(tool_name, args, ctx)
+  local out = async.Deferred.new()
+  local function _settle(ok, v)
+    if opts.ui_notice == nil and ctx.ui_notice ~= nil then opts.ui_notice = ctx.ui_notice end
+    -- 内核观测到的密钥文件访问（eBPF/strace/procfs）：仅 UI 展示，不进入模型上下文。
+    if opts.observed_secret_paths == nil and ctx.observed_secret_paths ~= nil then
+      opts.observed_secret_paths = ctx.observed_secret_paths
+    end
+    if ok then out:resolve(v) else out:reject(v) end
+  end
+  d:then_(function(v) _settle(true, v) end, function(e) _settle(false, e) end)
+  return out
 end
 
 --- 拒绝队列中所有待审批工具（窗口关闭/取消）。

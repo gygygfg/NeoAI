@@ -41,6 +41,10 @@ local function _host_ops_dir()
   return state.root .. "/host_ops"
 end
 
+local function _snapshots_dir()
+  return state.root .. "/snapshots"
+end
+
 --- @return boolean ok
 local function _ensure_dirs()
   if not state.root then return false end
@@ -49,9 +53,10 @@ local function _ensure_dirs()
   fs.ensure_dir(_reviews_dir())
   fs.ensure_dir(_evidence_dir())
   fs.ensure_dir(_host_ops_dir())
+  fs.ensure_dir(_snapshots_dir())
   -- 存储根与子目录收紧到 0700：候选/证据含未发布内容与命令详情，避免同机其他用户枚举/读取。
   -- （同 uid 的本地进程属信任边界之外，无法靠权限或摘要防住——见 docs/sandbox.md。）
-  for _, d in ipairs({ state.root, _candidates_dir(), _receipts_dir(), _reviews_dir(), _evidence_dir(), _host_ops_dir() }) do
+  for _, d in ipairs({ state.root, _candidates_dir(), _receipts_dir(), _reviews_dir(), _evidence_dir(), _host_ops_dir(), _snapshots_dir() }) do
     pcall(vim.uv.fs_chmod, d, 448) -- 0700
   end
   return true
@@ -311,7 +316,61 @@ function M.delete_host_op(host_op_id)
   return fs.delete_file(path)
 end
 
---- 重置（测试用）：清理落盘候选/回执/变更单元/证据并清空根目录
+--- 写入应用快照（保存时保留原文件版本，供撤销保存时交换）
+--- @param record table { snapshot_id }
+--- @return boolean ok
+function M.write_snapshot(record)
+  if not _ensure_dirs() then return false end
+  local path = _snapshots_dir() .. "/" .. _safe_name(record.snapshot_id) .. ".json"
+  return fs.write_file_atomic(path, json.encode(record))
+end
+
+--- 读取应用快照
+--- @param snapshot_id string
+--- @return table|nil
+function M.read_snapshot(snapshot_id)
+  if not state.root then return nil end
+  local path = _snapshots_dir() .. "/" .. _safe_name(snapshot_id) .. ".json"
+  local content = fs.read_file(path)
+  if not content then return nil end
+  local ok, decoded = pcall(json.decode, content)
+  if not ok then return nil end
+  return decoded
+end
+
+--- 删除应用快照
+--- @param snapshot_id string
+--- @return boolean
+function M.delete_snapshot(snapshot_id)
+  if not state.root then return false end
+  local path = _snapshots_dir() .. "/" .. _safe_name(snapshot_id) .. ".json"
+  return fs.delete_file(path)
+end
+
+--- 列出全部应用快照
+--- @return table 数组
+function M.list_snapshots()
+  if not state.root then return {} end
+  local out = {}
+  local dir = _snapshots_dir()
+  local handle = vim.uv.fs_scandir(dir)
+  if not handle then return out end
+  while true do
+    local name = vim.uv.fs_scandir_next(handle)
+    if not name then break end
+    if name:sub(-5) == ".json" then
+      local content = fs.read_file(dir .. "/" .. name)
+      if content then
+        local ok, decoded = pcall(json.decode, content)
+        if ok and decoded then out[#out + 1] = decoded end
+      end
+    end
+  end
+  table.sort(out, function(a, b) return (a.created_at or 0) < (b.created_at or 0) end)
+  return out
+end
+
+--- 重置（测试用）：清理落盘候选/回执/变更单元/证据/快照并清空根目录
 function M.reset()
   if state.root then
     pcall(vim.fn.delete, _candidates_dir(), "rf")
@@ -319,6 +378,7 @@ function M.reset()
     pcall(vim.fn.delete, _reviews_dir(), "rf")
     pcall(vim.fn.delete, _evidence_dir(), "rf")
     pcall(vim.fn.delete, _host_ops_dir(), "rf")
+    pcall(vim.fn.delete, _snapshots_dir(), "rf")
   end
   state.root = nil
 end

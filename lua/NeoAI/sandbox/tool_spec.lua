@@ -81,7 +81,6 @@ local SPECS = {
   confirm_file_change = { effect = "in_process" },
   ask_user = { effect = "in_process" },
   enter_plan_mode = { effect = "in_process" },
-  exit_plan_mode = { effect = "in_process" },
   create_sub_agent = { effect = "in_process" },
   get_sub_agent_status = { effect = "in_process" },
   wait_sub_agent = { effect = "in_process" },

@@ -77,10 +77,14 @@ end
 --- @return string
 local function _plugin_root()
   local root = MODULE_FILE:match("^(.-)[/\\]lua[/\\]NeoAI[/\\]tools[/\\]builtin[/\\][^/\\]+$")
-  if root and root ~= "" then return root end
+  if root and root ~= "" then
+    return root
+  end
   -- 回退：向上 5 层（.../lua/NeoAI/tools/builtin/web_fetch.lua → 插件根）
   local dir = MODULE_FILE
-  for _ = 1, 5 do dir = fs.dirname(dir) end
+  for _ = 1, 5 do
+    dir = fs.dirname(dir)
+  end
   return dir
 end
 
@@ -106,7 +110,9 @@ end
 --- 返回 nil 表示创建失败（Node 侧将放弃转存，图片直接丢弃）。
 --- @return string|nil
 local function _images_dir()
-  if state.images_dir then return state.images_dir end
+  if state.images_dir then
+    return state.images_dir
+  end
   -- 位于宿主与沙箱同路径可见的共享目录：node 在沙箱内转存图片后，宿主侧可读取该路径
   -- （供后续 read_image 使用），且不暴露宿主 /tmp。
   local base = sandbox_exec.ensure_shared()
@@ -145,7 +151,9 @@ end
 --- 幂等注册退出清理钩子（启用后注册一次）
 --- @return boolean 本次是否新注册
 local function _ensure_cleanup_registered()
-  if state.images_cleanup_registered then return false end
+  if state.images_cleanup_registered then
+    return false
+  end
   state.images_cleanup_registered = true
   require("NeoAI.kernel.lifecycle").on_shutdown(function()
     pcall(_cleanup_images)
@@ -167,10 +175,16 @@ end
 --- @param name string
 --- @return string|nil
 local function _sanitize_script_name(name)
-  if type(name) ~= "string" or name == "" then return nil end
+  if type(name) ~= "string" or name == "" then
+    return nil
+  end
   name = name:gsub("%.js$", "")
-  if name:find("%.%.", 1, true) then return nil end
-  if not name:match("^[%w_%-%.]+$") then return nil end
+  if name:find("%.%.", 1, true) then
+    return nil
+  end
+  if not name:match("^[%w_%-%.]+$") then
+    return nil
+  end
   return name
 end
 
@@ -180,7 +194,9 @@ local function _list_scripts()
   local seen = {}
   local out = {}
   local function _scan(dir)
-    if not fs.is_dir(dir) then return end
+    if not fs.is_dir(dir) then
+      return
+    end
     for _, name in ipairs(fs.list_dir(dir)) do
       local base = name:match("^([%w_%-%.]+)%.js$")
       if base and not seen[base] then
@@ -200,11 +216,17 @@ end
 --- @return string|nil 存在的文件路径
 local function _resolve_script_file(name)
   local n = _sanitize_script_name(name)
-  if not n then return nil end
+  if not n then
+    return nil
+  end
   local user = fs.join(_user_scripts_dir(), n .. ".js")
-  if fs.exists(user) then return user end
+  if fs.exists(user) then
+    return user
+  end
   local builtin = fs.join(_assets_dir(), "scripts", n .. ".js")
-  if fs.exists(builtin) then return builtin end
+  if fs.exists(builtin) then
+    return builtin
+  end
   return nil
 end
 
@@ -244,7 +266,9 @@ end
 local function _sync_assets(dir)
   local assets = _assets_dir()
   local ok, err = fs.ensure_dir(dir)
-  if not ok then return false, err end
+  if not ok then
+    return false, err
+  end
 
   local files = { "render_url.js", "package.json" }
   for _, name in ipairs(files) do
@@ -315,7 +339,10 @@ local function _build_install_script(dir, engine, cfg)
     "  " .. npm_install,
     "fi",
     "if [ ! -f " .. q(".browsers_ok_" .. engine) .. " ]; then",
-    "  npx playwright install " .. engine .. (cfg.install_os_deps and " --with-deps" or "") .. " || { echo BROWSER_INSTALL_FAILED; exit 44; }",
+    "  npx playwright install "
+      .. engine
+      .. (cfg.install_os_deps and " --with-deps" or "")
+      .. " || { echo BROWSER_INSTALL_FAILED; exit 44; }",
     "  : > " .. q(".browsers_ok_" .. engine),
     "fi",
     "echo WEB_FETCH_DEPS_OK",
@@ -361,40 +388,50 @@ local function _ensure_deps(opts)
   local install_timeout = tonumber(cfg.install_timeout_ms) or 600000
 
   logger.info("[web_fetch] 检查/安装依赖于 %s（engine=%s）", dir, engine)
-  vim.notify("[NeoAI] web_fetch 正在检查/安装依赖（首次较慢）…", vim.log.levels.INFO)
+  -- vim.notify("[NeoAI] web_fetch 正在检查/安装依赖（首次较慢）…", vim.log.levels.INFO)
 
-  _run_bash(script, { timeout_ms = install_timeout, signal = opts.signal }):then_(function(result)
-    local out = result.stdout or ""
-    if result.aborted then
-      return async.reject({ kind = "web_fetch", message = "依赖安装已取消" })
-    end
-    if result.timed_out then
-      return async.reject({ kind = "web_fetch", message = "依赖安装超时" })
-    end
-    if result.code == 42 or out:find("NODE_MISSING", 1, true) then
-      return async.reject({ kind = "web_fetch", message = "未找到 node，请先安装 Node.js（>=18）并确保在 PATH 中，或用 tools.web_fetch.node_path 指定" })
-    end
-    if result.code == 43 or out:find("NPM_MISSING", 1, true) then
-      return async.reject({ kind = "web_fetch", message = "未找到 npm，请随 Node.js 一并安装" })
-    end
-    if result.code ~= 0 then
-      local tail = (result.stderr or "")
-      if tail == "" then tail = out end
-      tail = tail:sub(-800)
-      return async.reject({ kind = "web_fetch", message = "依赖安装失败（退出码 " .. tostring(result.code) .. "）:\n" .. tail })
-    end
-    return async.resolve({ dir = dir })
-  end):then_(function(v)
-    state.deps_ready = true
-    state.deps = nil
-    logger.info("[web_fetch] 依赖就绪")
-    vim.notify("[NeoAI] web_fetch 依赖已就绪", vim.log.levels.INFO)
-    d:resolve(v)
-  end, function(e)
-    state.deps = nil -- 允许下次重试
-    logger.warn("[web_fetch] 依赖准备失败: %s", type(e) == "table" and (e.message or "") or tostring(e))
-    d:reject(e)
-  end)
+  _run_bash(script, { timeout_ms = install_timeout, signal = opts.signal })
+    :then_(function(result)
+      local out = result.stdout or ""
+      if result.aborted then
+        return async.reject({ kind = "web_fetch", message = "依赖安装已取消" })
+      end
+      if result.timed_out then
+        return async.reject({ kind = "web_fetch", message = "依赖安装超时" })
+      end
+      if result.code == 42 or out:find("NODE_MISSING", 1, true) then
+        return async.reject({
+          kind = "web_fetch",
+          message = "未找到 node，请先安装 Node.js（>=18）并确保在 PATH 中，或用 tools.web_fetch.node_path 指定",
+        })
+      end
+      if result.code == 43 or out:find("NPM_MISSING", 1, true) then
+        return async.reject({ kind = "web_fetch", message = "未找到 npm，请随 Node.js 一并安装" })
+      end
+      if result.code ~= 0 then
+        local tail = (result.stderr or "")
+        if tail == "" then
+          tail = out
+        end
+        tail = tail:sub(-800)
+        return async.reject({
+          kind = "web_fetch",
+          message = "依赖安装失败（退出码 " .. tostring(result.code) .. "）:\n" .. tail,
+        })
+      end
+      return async.resolve({ dir = dir })
+    end)
+    :then_(function(v)
+      state.deps_ready = true
+      state.deps = nil
+      logger.info("[web_fetch] 依赖就绪")
+      -- vim.notify("[NeoAI] web_fetch 依赖已就绪", vim.log.levels.INFO)
+      d:resolve(v)
+    end, function(e)
+      state.deps = nil -- 允许下次重试
+      logger.warn("[web_fetch] 依赖准备失败: %s", type(e) == "table" and (e.message or "") or tostring(e))
+      d:reject(e)
+    end)
 
   return d
 end
@@ -497,43 +534,58 @@ local function _render(url, params, cfg, ctx)
   for _, ln in ipairs(_build_env_exports(cfg)) do
     script_lines[#script_lines + 1] = ln
   end
-  script_lines[#script_lines + 1] = "exec " .. q(node_bin) .. " " .. q(fs.join(dir, "render_url.js")) .. " " .. q(opts_file)
+  script_lines[#script_lines + 1] = "exec "
+    .. q(node_bin)
+    .. " "
+    .. q(fs.join(dir, "render_url.js"))
+    .. " "
+    .. q(opts_file)
   local script = table.concat(script_lines, "\n")
 
   local nav_timeout = tonumber(opts.nav_timeout_ms) or 30000
   local total_timeout = tonumber(cfg.timeout_ms) or 45000
-  if total_timeout <= 0 then total_timeout = nav_timeout + 15000 end
+  if total_timeout <= 0 then
+    total_timeout = nav_timeout + 15000
+  end
 
   local signal = ctx and ctx.signal
   local d = async.Deferred.new()
 
-  _run_bash(script, { timeout_ms = total_timeout, signal = signal }):then_(function(result)
-    pcall(vim.fn.delete, opts_file)
+  _run_bash(script, { timeout_ms = total_timeout, signal = signal })
+    :then_(function(result)
+      pcall(vim.fn.delete, opts_file)
 
-    if result.aborted then
-      return async.reject({ kind = "web_fetch", message = "抓取已取消" })
-    end
-    if result.timed_out then
-      return async.reject({ kind = "web_fetch", message = "抓取超时（" .. tostring(total_timeout) .. "ms）" })
-    end
+      if result.aborted then
+        return async.reject({ kind = "web_fetch", message = "抓取已取消" })
+      end
+      if result.timed_out then
+        return async.reject({ kind = "web_fetch", message = "抓取超时（" .. tostring(total_timeout) .. "ms）" })
+      end
 
-    local parsed = _parse_node_output(result.stdout)
-    if not parsed.ok then
-      local detail = parsed.error or "未知错误"
-      local tail = (result.stderr or ""):sub(-800)
-      if tail ~= "" then detail = detail .. "\n" .. tail end
-      return async.reject({ kind = "web_fetch", message = detail })
-    end
-    return async.resolve({
-      title = parsed.title or "",
-      content = parsed.content or "",
-      engine = parsed.engine or opts.engine,
-      format = parsed.format or opts.format,
-      readability = parsed.readability,
-      images = parsed.images or {},
-      script = _sanitize_script_name(params.script or DEFAULT_SCRIPT) or DEFAULT_SCRIPT,
-    })
-  end):then_(function(v) d:resolve(v) end, function(e) d:reject(e) end)
+      local parsed = _parse_node_output(result.stdout)
+      if not parsed.ok then
+        local detail = parsed.error or "未知错误"
+        local tail = (result.stderr or ""):sub(-800)
+        if tail ~= "" then
+          detail = detail .. "\n" .. tail
+        end
+        return async.reject({ kind = "web_fetch", message = detail })
+      end
+      return async.resolve({
+        title = parsed.title or "",
+        content = parsed.content or "",
+        engine = parsed.engine or opts.engine,
+        format = parsed.format or opts.format,
+        readability = parsed.readability,
+        images = parsed.images or {},
+        script = _sanitize_script_name(params.script or DEFAULT_SCRIPT) or DEFAULT_SCRIPT,
+      })
+    end)
+    :then_(function(v)
+      d:resolve(v)
+    end, function(e)
+      d:reject(e)
+    end)
 
   return d
 end
@@ -562,7 +614,9 @@ end
 local function _iter_cache_entries()
   local dir = _cache_dir()
   local out = {}
-  if not fs.is_dir(dir) then return out end
+  if not fs.is_dir(dir) then
+    return out
+  end
   for _, name in ipairs(fs.list_dir(dir)) do
     local key = name:match("^([%w]+)%.json$")
     if key then
@@ -574,7 +628,9 @@ local function _iter_cache_entries()
         local ok, obj = pcall(json.decode, content)
         if ok and type(obj) == "table" then
           local t = tonumber(obj.ts)
-          if t then ts = t end
+          if t then
+            ts = t
+          end
         end
       end
       out[#out + 1] = { path = path, key = key, ts = ts, size = (size > 0) and size or 0 }
@@ -599,12 +655,18 @@ end
 --- @return table|nil entry
 local function _cache_read(key, cfg)
   local cache_cfg = cfg.cache or {}
-  if cache_cfg.enabled == false then return nil end
+  if cache_cfg.enabled == false then
+    return nil
+  end
   local path = fs.join(_cache_dir(), key .. ".json")
   local content = fs.read_file(path)
-  if not content then return nil end
+  if not content then
+    return nil
+  end
   local ok, entry = pcall(json.decode, content)
-  if not ok or type(entry) ~= "table" then return nil end
+  if not ok or type(entry) ~= "table" then
+    return nil
+  end
   local ttl = tonumber(cache_cfg.ttl_sec) or 3600
   if ttl > 0 and entry.ts and (os.time() - entry.ts) > ttl then
     pcall(vim.fn.delete, path)
@@ -639,12 +701,18 @@ local function _prune_cache(incoming, cfg)
   -- 2) 超限清理（按 ts 最旧优先）
   local live = {}
   for _, e in ipairs(entries) do
-    if not e.deleted then live[#live + 1] = e end
+    if not e.deleted then
+      live[#live + 1] = e
+    end
   end
-  table.sort(live, function(a, b) return a.ts < b.ts end)
+  table.sort(live, function(a, b)
+    return a.ts < b.ts
+  end)
 
   local total = 0
-  for _, e in ipairs(live) do total = total + e.size end
+  for _, e in ipairs(live) do
+    total = total + e.size
+  end
 
   local idx = 1
   local live_left = #live
@@ -657,7 +725,9 @@ local function _prune_cache(incoming, cfg)
   end
 
   local kept = {}
-  for i = idx, #live do kept[#kept + 1] = live[i] end
+  for i = idx, #live do
+    kept[#kept + 1] = live[i]
+  end
   return { size = total, count = #kept }
 end
 
@@ -668,7 +738,9 @@ end
 --- @return boolean written
 local function _cache_write(key, entry, cfg)
   local cache_cfg = cfg.cache or {}
-  if cache_cfg.enabled == false then return false end
+  if cache_cfg.enabled == false then
+    return false
+  end
 
   local dir = _cache_dir()
   fs.ensure_dir(dir)
@@ -686,7 +758,9 @@ local function _cache_write(key, entry, cfg)
   local path = fs.join(dir, key .. ".json")
   local tmp = path .. ".tmp"
   local ok = fs.write_file(tmp, encoded)
-  if not ok then return false end
+  if not ok then
+    return false
+  end
   pcall(vim.fn.rename, tmp, path)
 
   local stats = { size = _cache_size_bytes(), count = #_iter_cache_entries() }
@@ -725,7 +799,9 @@ local function _format_envelope(source, meta, content)
       meta.script or DEFAULT_SCRIPT
     ),
   }
-  if meta.truncated then lines[#lines + 1] = "note: 内容已按 max_bytes 截断" end
+  if meta.truncated then
+    lines[#lines + 1] = "note: 内容已按 max_bytes 截断"
+  end
   lines[#lines + 1] = "---"
   lines[#lines + 1] = content
   return table.concat(lines, "\n")
@@ -746,11 +822,21 @@ local web_fetch = helpers.define_tool(
     type = "object",
     properties = {
       url = { type = "string", description = "要抓取的网页 URL（http/https）" },
-      selector = { type = "string", description = "可选 CSS 选择器：仅提取该子树（缺省自动选 article/main/body）" },
+      selector = {
+        type = "string",
+        description = "可选 CSS 选择器：仅提取该子树（缺省自动选 article/main/body）",
+      },
       wait_selector = { type = "string", description = "可选：加载后等待该选择器出现（用于 SPA）" },
       wait_ms = { type = "integer", description = "可选：加载后额外等待毫秒数" },
-      script = { type = "string", description = "注入脚本名（默认 clean；内置 clean/readability，可用用户目录扩展）" },
-      format = { type = "string", enum = { "markdown", "text" }, description = "输出格式（markdown 或纯文本 text），默认 markdown" },
+      script = {
+        type = "string",
+        description = "注入脚本名（默认 clean；内置 clean/readability，可用用户目录扩展）",
+      },
+      format = {
+        type = "string",
+        enum = { "markdown", "text" },
+        description = "输出格式（markdown 或纯文本 text），默认 markdown",
+      },
       force_refresh = { type = "boolean", description = "为 true 时忽略本地缓存强制抓取" },
     },
     required = { "url" },
@@ -798,30 +884,32 @@ local web_fetch = helpers.define_tool(
 
     -- 2) 确保依赖 → 渲染 → 写缓存
     local signal = ctx and ctx.signal
-    _ensure_deps({ signal = signal }):then_(function()
-      return _render(url, args, cfg, ctx)
-    end):then_(function(res)
-      local content, truncated = _truncate(res.content or "", tonumber(cfg.max_bytes) or 0)
-      _cache_write(cache_key, {
-        url = url,
-        title = res.title,
-        engine = res.engine,
-        format = res.format,
-        script = res.script,
-        content = res.content or "",
-        ts = os.time(),
-      }, cfg)
-      on_success(_format_envelope(url, {
-        title = res.title,
-        engine = res.engine,
-        format = res.format,
-        script = res.script,
-        cached = false,
-        truncated = truncated,
-      }, content))
-    end, function(e)
-      on_error(type(e) == "table" and (e.message or json.encode(e)) or tostring(e))
-    end)
+    _ensure_deps({ signal = signal })
+      :then_(function()
+        return _render(url, args, cfg, ctx)
+      end)
+      :then_(function(res)
+        local content, truncated = _truncate(res.content or "", tonumber(cfg.max_bytes) or 0)
+        _cache_write(cache_key, {
+          url = url,
+          title = res.title,
+          engine = res.engine,
+          format = res.format,
+          script = res.script,
+          content = res.content or "",
+          ts = os.time(),
+        }, cfg)
+        on_success(_format_envelope(url, {
+          title = res.title,
+          engine = res.engine,
+          format = res.format,
+          script = res.script,
+          cached = false,
+          truncated = truncated,
+        }, content))
+      end, function(e)
+        on_error(type(e) == "table" and (e.message or json.encode(e)) or tostring(e))
+      end)
   end,
   { category = "web", approval = { auto_allow = true }, timeout = -1 }
 )
@@ -829,7 +917,9 @@ local web_fetch = helpers.define_tool(
 --- 获取工具列表
 --- @return table 数组
 function M.get_tools()
-  if not _is_enabled() then return {} end
+  if not _is_enabled() then
+    return {}
+  end
 
   local cfg = _cfg()
   -- 退出 nvim 时删除图片临时目录（幂等，仅注册一次）
@@ -868,7 +958,9 @@ M._cache_dir = _cache_dir
 M._images_dir = _images_dir
 M._cleanup_images = _cleanup_images
 M._ensure_cleanup_registered = _ensure_cleanup_registered
-M._set_cache_dir = function(path) state.cache_dir_override = path end
+M._set_cache_dir = function(path)
+  state.cache_dir_override = path
+end
 M._list_scripts = _list_scripts
 M._resolve_script_file = _resolve_script_file
 M._sanitize_script_name = _sanitize_script_name
