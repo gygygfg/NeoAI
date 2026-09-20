@@ -42,6 +42,45 @@ local function _safe_id(id)
   return tostring(id):gsub("[^%w_%-]", "_")
 end
 
+--- 诊断配置（默认关）。开启后仅在 logger 记录，不改变行为。
+--- @return table
+local function _diag()
+  return require("NeoAI.kernel.config_store").get("tools.sandbox.diagnostics") or {}
+end
+
+--- 读取资源域的 memory/pids 事件计数（用于 OOM / 进程终止归因）。
+--- @param path string 资源域目录
+--- @return table { memory_events?, pids_events?, memory_peak?, memory_max?, pids_max? }
+function M.events_snapshot(path)
+  if type(path) ~= "string" or path == "" then return {} end
+  local out = {}
+  local files = {
+    memory_events = "memory.events",
+    pids_events = "pids.events",
+    memory_peak = "memory.peak",
+    memory_max = "memory.max",
+    pids_max = "pids.max",
+    cpu_max = "cpu.max",
+  }
+  for key, name in pairs(files) do
+    local raw = _read_file(path .. "/" .. name)
+    if raw then out[key] = (raw:gsub("%s+$", "")) end
+  end
+  return out
+end
+
+--- 是否为「疑似 OOM 终止」：资源域 memory.events 出现 oom_kill/oom_group_kill > 0。
+--- @param snap table M.events_snapshot 结果
+--- @return boolean
+function M.snapshot_oom(snap)
+  local ev = snap and snap.memory_events or ""
+  for _, k in ipairs({ "oom_kill", "oom_group_kill" }) do
+    local n = tonumber(ev:match(k .. "%s+(%d+)"))
+    if n and n > 0 then return true end
+  end
+  return false
+end
+
 --- 共享父域路径（承载全局 CPU 预算）
 --- @return string
 local function _parent_path()
@@ -222,6 +261,13 @@ function M.prepare(attempt_id, limits)
     global_cpu_max = global_us,
   }
   state.handles[attempt_id] = handle
+  local diag = _diag()
+  if diag.enabled then
+    require("NeoAI.kernel.logger").debug(
+      "[sandbox:diag] cgroup prepare attempt=%s mem=%s pids=%s cpu=%s path=%s",
+      tostring(attempt_id), tostring(limits.memory_bytes or 0), tostring(limits.pids or 0),
+      tostring(child_cpu), path)
+  end
   return handle
 end
 
@@ -244,11 +290,29 @@ function M.adopt(handle, attempt_id)
   state.handles[attempt_id] = handle
 end
 
+--- 立即终止资源域内所有进程（不删除目录，幂等）。
+--- 供命令取消/超时/输出截断时真正杀掉整个进程树：bwrap 载荷运行在独立 pid 命名空间内，
+--- `jobstop` 只杀外层 bwrap，载荷可能继续存活并占住 cgroup；`cgroup.kill` 按域精确终止。
+--- @param handle table
+function M.kill(handle)
+  if not handle or not handle.path then return end
+  local diag = _diag()
+  if diag.enabled then
+    local caller = diag.log_kill_caller and ("\n" .. debug.traceback("", 2)) or ""
+    local snap = diag.dump_cgroup_events and M.events_snapshot(handle.path) or nil
+    require("NeoAI.kernel.logger").warn(
+      "[sandbox:diag] cgroup.kill attempt=%s path=%s%s%s",
+      tostring(handle.attempt_id), handle.path, caller,
+      snap and (" events=" .. vim.inspect(snap)) or "")
+  end
+  pcall(_write_file, handle.path .. "/cgroup.kill", "1")
+end
+
 --- 释放资源域：杀掉残留进程并删除子域（共享父域保留，供后续任务复用）。
 --- @param handle table
 function M.release(handle)
   if not handle then return end
-  pcall(_write_file, handle.path .. "/cgroup.kill", "1")
+  M.kill(handle)
   for _ = 1, 50 do
     if vim.fn.isdirectory(handle.path) == 0 then break end
     pcall(vim.fn.delete, handle.path, "d")

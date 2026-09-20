@@ -66,8 +66,11 @@ Ordinary refreshes (streaming chunks, event-driven re-renders, tool-duration tic
 
 - `components.incremental` caches the render result of each message (chat mode) or each turn (trajectory mode)
   keyed by "block key + signature". The signature covers every input that affects rendering (role/content/reasoning/
-  tool_calls/duration_ms, fold-block state `fold.get_status`/`get_duration`, `streaming`/`table_width`, ...). Blocks
-  whose signature is unchanged are reused; only changed blocks are re-rendered.
+  tool_calls/duration_ms, fold-block state `fold.get_status`, `streaming`/`table_width`, ...). Blocks whose signature
+  is unchanged are reused; only changed blocks are re-rendered. **In chat mode the live elapsed time of a running tool
+  is not part of the signature** (it changes every second, which would invalidate the cache and rebuild the whole block
+  on the main thread for large messages): `message_list.refresh_tool_times` rewrites only the header line in place and reuses the
+  rest of the cached block; a state change (running→success) still rebuilds the block to lock the final duration.
 - The assembled lines are diffed against the last written content via longest common prefix/suffix
   (`incremental.diff_range`), and only the **changed line range** is written back with `nvim_buf_set_lines`. When the
   content is identical the buffer is **not touched at all** (`changed=false`), which also skips the `zx`/`zM` fold
@@ -83,11 +86,20 @@ restored by setting `ui.chat.incremental = false`.
 ### 4.4 Folds
 
 The main window uses `expr` folds (`components.fold.foldexpr`); reasoning / each tool call block (call + result)
-becomes its own independent fold. The fold placeholder text is provided uniformly by `components.fold`. **Only folds
+becomes its own independent fold. **Every line inside a fold block is single-line** (`_append_fold_block`
+splits content containing real newlines): streaming/invalid tool arguments may contain real newlines, and
+writing them as one line would make `nvim_buf_set_lines` error and half-write the buffer, splitting one
+tool fold into two. The fold placeholder text is provided uniformly by `components.fold`. **Only folds
 explicitly registered as reasoning by the renderer show `🤔 思考过程 N 行`** (`message_list` registers reasoning start
 lines after writing the buffer); tool blocks show `🔧 <tool>` and any other unrecognized fold shows a neutral
 placeholder (`📄 <first-line preview> (N lines)`), so not every fold is rendered as a thinking process. During tool
-execution it re-renders once per second (`TOOL_TICK_MS=1000`), so the elapsed time in the fold text ticks in real time.
+execution it refreshes once per second (`TOOL_TICK_MS=1000`), so the elapsed time in the fold text ticks in real
+time; the refresh only rewrites the tool header line in place (see 4.3.1). Whether `foldclose!` is skipped is decided by
+the folds that were **already expanded before the render** (`open_folds`): if hit, skip (otherwise it would close and then
+`zo`-reopen it, causing the block the user is viewing to flicker); if not (including collapsed folds), always run
+`foldclose!`. **Do not** decide from the post-write `foldclosed` — rewriting the line itself briefly makes the fold look
+"expanded", and skipping on that basis leaves collapsed blocks exposing their content (the content is flushed out of the
+fold and back).
 When a command's **arguments or result contain a secret** (sandbox token `NEOKEY_*` or a raw secret matched by a
 named rule), a **separate highlighted warning line** (`⚠ 密钥`, `NeoAISecretWarning`) is appended **outside** the
 tool fold block; the fold title stays clean (no `⚠ 密钥` suffix) and the warning remains visible while collapsed.

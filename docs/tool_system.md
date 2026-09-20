@@ -51,7 +51,8 @@
 （仅注册定义，无 I/O，确保首个 Agent 请求前已就绪）。`tool_helpers.lua` 是工具定义辅助库，不入内置清单。
 
 内置工具模块：`file_ops` / `shell` / `git_ops` / `lsp_ops` / `tree_ops` / `log_ops` / `plan`（子 Agent）/
-`todo` / `plan_mode` / `ask_user` / `read_image` / `web_fetch`（网页抓取，默认不启用）/ `skills`（技能工具 + 系统提示段）。
+`todo` / `plan_mode` / `ask_user` / `read_image` / `web_fetch`（网页抓取，默认不启用）/ `skills`（技能工具 + 系统提示段）/
+`service`（长驻服务，`service_start`/`service_logs`/`service_status`/`service_stop`）。
 MCP 远端工具由 `services/mcp/init.lua` 动态注册（`category = "mcp"`，`source = "mcp"`），详见 [mcp.md](mcp.md)。
 
 ## 4. 执行流程（tools/executor.lua）
@@ -153,6 +154,16 @@ M.execute(agent, name, args, tool_call_id, opts)
 ### 💻 Shell（shell.lua）
 
 `run_command`：异步 jobstart（非交互），收集 stdout/stderr，支持 `timeout_ms`（默认 30000，-1 不限）。
+stdout/stderr 合计超过 `tools.run_command.max_output_bytes`（默认 16 MiB）时截断并终止命令，
+避免超大输出（数百 MB）逐行处理冻结主线程；已产生内容仍回传并标注「已截断」。
+命令以退出码 137（SIGKILL）结束时读取资源域事件区分「疑似 OOM」与「被强制终止」。
+
+### 🔌 长驻服务（service.lua）
+
+`service_start`（启动后台常驻进程，跨工具调用存活）/ `service_logs` / `service_status` / `service_stop`。
+与 `run_command` 的 `&`/nohup 不同：后者随命令结束被回收。服务在独立沙箱 overlay + cgroup 内运行，
+停止时其工作区改动冻结为候选并进入异步审批；生命周期由 `sandbox.shutdown`/`reset` 统一回收。
+详见 [sandbox.md](sandbox.md) 的「长驻服务」。
 
 ### 🗂 Git（git_ops.lua）
 
@@ -209,8 +220,8 @@ description 为选项描述，二者在弹窗中分别展示并高亮）。同�
 `web_fetch`：把动态网页（React/Vue/SPA）在无头浏览器中渲染、注入 JS 后取最终 DOM，再用通用转换器
 （turndown）转 Markdown。**默认不启用**（`tools.web_fetch.enabled = false`，关闭时 `get_tools()` 返回空，
 不注册、不装依赖）。启用后在缓存目录（`stdpath('cache')/NeoAI/web_fetch`）用 bash 检查并安装
-Node 依赖与浏览器内核（`auto_install=true` 时后台异步，首次调用等待完成）。Lua 只做编排，不自行解析
-动态页面。结果按 URL + 参数缓存（TTL / 条数 / 总容量默认 500MB，最旧优先淘汰）。注入脚本可扩展：
+Node 依赖与浏览器内核（**安装在宿主直接执行、不经沙箱**，避免数百 MB 产物进入 overlay 被反复捕获；
+`auto_install=true` 时后台异步，首次调用等待完成）。Lua 只做编排，不自行解析动态页面。结果按 URL + 参数缓存（TTL / 条数 / 总容量默认 500MB，最旧优先淘汰）。注入脚本可扩展：
 内置 `assets/web_fetch/scripts/*.js`，用户目录（`tools.web_fetch.scripts_dir`）同名覆盖。
 详见 [configuration.md](configuration.md)（`tools.web_fetch`）。
 

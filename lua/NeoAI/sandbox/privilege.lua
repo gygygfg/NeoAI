@@ -483,14 +483,14 @@ end
 --- @param args table|nil
 --- @param spec table|nil { effect }
 --- @param opts table|nil { effective_command?=string } 折叠脚本间接执行后的命令文本
---- @return table { tier, reasons, docker, container, network, package, package_all }
+--- @return table { tier, reasons, docker, container, network, package, package_all, sysadmin, apt }
 function M.classify(tool, args, spec, opts)
   local cfg = _cfg()
   if cfg.enabled == false then
-    return { tier = M.TIER.MINIMAL, reasons = { "PRIVILEGE_DISABLED" }, docker = false, container = false, network = false, package = false, package_all = false }
+    return { tier = M.TIER.MINIMAL, reasons = { "PRIVILEGE_DISABLED" }, docker = false, container = false, network = false, package = false, package_all = false, sysadmin = false, apt = false }
   end
   if not spec or spec.effect ~= "process" then
-    return { tier = M.TIER.MINIMAL, reasons = { "NON_PROCESS_EFFECT" }, docker = false, container = false, network = false, package = false, package_all = false }
+    return { tier = M.TIER.MINIMAL, reasons = { "NON_PROCESS_EFFECT" }, docker = false, container = false, network = false, package = false, package_all = false, sysadmin = false, apt = false }
   end
   local command = tostring((args and (args.command or args.cmd)) or "")
   -- 脚本间接执行：用折叠后的 effective 文本做档位/包识别，使 `bash deploy.sh` 内的
@@ -499,12 +499,13 @@ function M.classify(tool, args, spec, opts)
     command = opts.effective_command
   end
   if command == "" then
-    return { tier = M.TIER.MINIMAL, reasons = { "NO_COMMAND" }, docker = false, container = false, network = false, package = false, package_all = false }
+    return { tier = M.TIER.MINIMAL, reasons = { "NO_COMMAND" }, docker = false, container = false, network = false, package = false, package_all = false, sysadmin = false, apt = false }
   end
   local rules = cfg.classify or {}
   local managers = _package_managers()
   local tier, reasons = M.TIER.MINIMAL, {}
-  local docker, container, network, package = false, false, false, false
+  local docker, container, network, package, sysadmin = false, false, false, false, false
+  local apt = false
   local has_pkg, all_pkg = false, true
   for _, seg in ipairs(_segments(command)) do
     local t, name = _classify_segment(seg, rules)
@@ -515,6 +516,8 @@ function M.classify(tool, args, spec, opts)
       if name == "container" then container = true; network = true end
       if name == "network" then network = true end
       if name == "package" then package = true; network = true end
+      -- 系统管理命令（useradd/chown/passwd 等）：按需加回窄能力并解除账户库遮蔽。
+      if name == "sysadmin" then sysadmin = true end
     end
     -- 包管理器名单（apt/pip/npm/npx/uv/conda/cargo 等）统一识别为包安装（T1 + 网络）。
     -- 跳过 sudo/doas/env/bash -c/for…do 等包装器，避免漏判导致风险误升到 L3。
@@ -523,6 +526,8 @@ function M.classify(tool, args, spec, opts)
       has_pkg = true
       package = true
       network = true
+      -- apt 系列：需关闭 apt 自身的 `_apt` 降权（见 resolve / packages.apt_sandbox_user）。
+      if bin == "apt" or bin == "apt-get" or bin == "aptitude" then apt = true end
       if tier < M.TIER.ELEVATED then tier = M.TIER.ELEVATED end
       reasons[#reasons + 1] = "package"
     elseif not _is_package_companion(seg) then
@@ -533,6 +538,7 @@ function M.classify(tool, args, spec, opts)
   return {
     tier = tier, reasons = reasons, docker = docker, container = container,
     network = network, package = package, package_all = has_pkg and all_pkg,
+    sysadmin = sysadmin, apt = apt,
   }
 end
 
@@ -583,6 +589,37 @@ function M.resolve(tier, req)
     if type(pcaps) == "table" then
       for _, c in ipairs(pcaps) do
         if type(c) == "string" and c ~= "" then priv.cap_add[#priv.cap_add + 1] = c end
+      end
+    end
+  end
+  -- apt 系列：apt 在 root 下默认把下载/校验降权到 `_apt` 用户（setgroups + setuid/setgid）。
+  -- 嵌套 user namespace / 受限容器中 setgroups 返回 EPERM，导致 `apt-get update`/`install`
+  -- 直接失败（`setgroups failed - Operation not permitted`）。沙箱已由命名空间 + overlay 暂存
+  -- 隔离，载荷本就以 root 运行，故默认注入 apt 配置关闭该降权（`APT::Sandbox::User "<value>"`，
+  -- 默认 `"root"`；配置为 `"_apt"` 或空串则保留 apt 默认行为）。配置片段由 runtime 以只读
+  -- 绑定挂载并以 APT_CONFIG 指向，写入仍全部进 overlay 暂存。
+  if req and req.apt then
+    local asu = (config_store.get("tools.sandbox.packages") or {}).apt_sandbox_user
+    if type(asu) == "string" and asu ~= "" and asu ~= "_apt" then
+      priv.apt_sandbox_user = asu
+    end
+  end
+  -- 系统管理命令（useradd/usermod/groupadd/chown/passwd 等）：默认最小权限下这些命令会因
+  -- 缺少 CHOWN/SETUID/SETGID/DAC_OVERRIDE 而失败（如 useradd 无法锁 /etc/passwd、打不开
+  -- /etc/gshadow），且账户数据库被遮蔽。命中即按 privilege.sysadmin 加回窄能力并解除对应
+  -- 遮蔽；写入仍全部进 overlay 暂存，真实账户库不受影响（与 packages.cap_add 同一思路）。
+  if req and req.sysadmin then
+    local scfg = cfg.sysadmin or {}
+    if type(scfg.cap_add) == "table" then
+      for _, c in ipairs(scfg.cap_add) do
+        if type(c) == "string" and c ~= "" then priv.cap_add[#priv.cap_add + 1] = c end
+      end
+    end
+    if type(scfg.unmask) == "table" then
+      for _, p in ipairs(scfg.unmask) do
+        if type(p) == "string" and p ~= "" and not vim.tbl_contains(priv.unmask, p) then
+          priv.unmask[#priv.unmask + 1] = p
+        end
       end
     end
   end

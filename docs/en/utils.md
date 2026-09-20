@@ -96,6 +96,18 @@ end, "/path/to/file"):then_(function(data) ... end, function(err) ... end)
 
 Without `vim.uv.new_work` (nvim < 0.10), it falls back to synchronous execution via `vim.schedule` (which still guarantees the call stack is not blocked).
 
+`work.batched(tasks, limit, start)`: **batched concurrency**. `start(task)` is called on the main
+thread and returns a `work.run` Deferred; at most `limit` are in flight per batch, and the next
+batch starts only after the current one completes. Results resolve in `tasks` order. This avoids
+flooding the thread pool with hundreds of chunk jobs and starving later UI-critical jobs
+(redaction / secret tokenization / disk writes).
+
+```lua
+work.batched(chunks, 4, function(chunk)
+  return work.run(worker, encode(chunk))
+end):then_(function(results) ... end)
+```
+
 ## 7. timer.lua (pausable timer)
 
 Tracks "active execution time" (excluding pause time spent waiting for human interaction) and enforces timeouts based on that active time.

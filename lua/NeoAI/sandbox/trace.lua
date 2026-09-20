@@ -53,7 +53,7 @@ function M.record(entry)
     if old then state.seen[tostring(old.tool or "") .. "\0" .. old.path] = nil end
   end
   pcall(function()
-    require("NeoAI.sandbox.evidence").add("observation", {
+    require("NeoAI.sandbox.evidence").add_async("observation", {
       kind = "outside_access", path = path, tool = item.tool, command = item.command,
     }, { tool = item.tool, source = entry.source or "observed", coverage = "full" })
   end)

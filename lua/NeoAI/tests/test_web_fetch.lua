@@ -401,4 +401,51 @@ tests.suite("web_fetch", function(_, it, before_each)
     t.true_(fs.exists(fs.join(assets, "scripts", "clean.js")), "应内置 clean.js")
     t.true_(fs.exists(fs.join(assets, "scripts", "readability.js")), "应内置 readability.js")
   end)
+
+  it("依赖/内核安装在宿主执行（不经沙箱，避免大产物进入 overlay）", function(t)
+    _enable()
+    local async = require("NeoAI.utils.async")
+    local sandbox_exec = require("NeoAI.sandbox.exec")
+    local tmp = vim.fn.tempname()
+    wf._set_install_dir(tmp)
+
+    local orig_run = sandbox_exec.run
+    local sandbox_called = false
+    sandbox_exec.run = function()
+      sandbox_called = true
+      return async.resolve({ code = 0 })
+    end
+
+    local orig_jobstart = vim.fn.jobstart
+    local host_called, host_argv = false, nil
+    vim.fn.jobstart = function(argv, opts)
+      -- 仅拦截安装用的 `bash -c`，其余（如后台 curl 抓取）透传原实现。
+      if argv and argv[1] == "bash" then
+        host_called = true
+        host_argv = argv
+        if opts and opts.on_stdout then opts.on_stdout(0, { "WEB_FETCH_DEPS_OK" }) end
+        if opts and opts.on_exit then opts.on_exit(0, 0) end
+        return 1
+      end
+      return orig_jobstart(argv, opts)
+    end
+
+    local done, err = false, nil
+    wf._ensure_deps({ force = true }):then_(function()
+      done = true
+    end, function(e)
+      err = e
+      done = true
+    end)
+    t.true_(vim.wait(5000, function() return done end, 20),
+      "安装应完成: " .. tostring(err and err.message or err))
+
+    vim.fn.jobstart = orig_jobstart
+    sandbox_exec.run = orig_run
+    pcall(vim.fn.delete, tmp, "rf")
+
+    t.true_(host_called, "安装应在宿主执行")
+    t.false_(sandbox_called, "安装不应经沙箱（避免数百 MB 产物进入 overlay/候选）")
+    t.eq("bash", host_argv and host_argv[1], "宿主执行器应为 bash -c")
+  end)
 end)

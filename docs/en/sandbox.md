@@ -106,14 +106,41 @@ is only kept for other `approval.mode` values (`prompt`/`strict`).
     end of every command, which pinned a single `libuv-worker` core and stalled `run_command` once
     thousands of files were staged. Deletion reconciliation (a sandbox-only file removed by the
     command) is also done on the worker.
-  - **Chunked parallel freeze/secret scan**: `finish_async` dispatches in chunks of
-    `tools.sandbox.work_chunk_files` (default 128) to the thread pool; batch secret tokenization is
-    chunked the same way (equivalent tokens for the same secret across chunks are unified to a
-    canonical token so `detokenize` round-trips). This uses multiple cores on workloads such as
-    npm/cargo that produce tens of thousands of files, instead of single-core serialization.
-  - **Materialize skips unchanged files**: when the staged copy and the previously written overlay
-    target (mtime/size/mode) are both unchanged, repeated materialization does not re-read +
-    detokenize + write; only changed files are rewritten.
+  - **Chunked parallel freeze/capture/secret scan/staging write**: `finish_async`,
+    `capture_overlay_async` base hashing, batch secret tokenization, candidate secret analysis, and
+    the staged-copy writes in `merge_candidate_async` all dispatch in chunks of
+    `tools.sandbox.work_chunk_files` (default 128) to the thread pool; tokenization unifies
+    equivalent tokens for the same secret across chunks to a canonical token (so `detokenize`
+    round-trips). This uses multiple cores on workloads such as npm/cargo that produce tens of
+    thousands of files, instead of single-core serialization. Each staging-write chunk is encoded
+    lazily inside `work.batched`'s start callback, overlapping with the previous group's writes; the
+    worker caches directories to avoid repeating `fs_mkdir` for every path segment per file.
+  - **Command-captured files skip redundant materialization**: the command already wrote the
+    content into the overlay (the capture source is `dest`), so `merge` only registers the staging
+    copy and marks it `fresh`; the next materialization skips the detokenize write-back (invalidated
+    if the staging copy is later edited), avoiding rewriting every changed file on each command.
+  - **Package/generated content skips secret scanning**: when the command is classified as a package
+    install, or candidate paths hit package directories (`/site-packages/`, `/node_modules/`,
+    `~/.cargo/`, ... via `privilege.package_path_manager`), secret tokenization and generated
+    high-entropy analysis are skipped (consistent with `is_pkg` at settlement). This avoids
+    per-file full-text scanning of venv/dependency trees (measured: post-processing after
+    `python -m venv` drops from ~3s to ~0.3s).
+  - **Review items do not duplicate content on disk**: candidate content is already persisted with
+    the candidate, so the review item strips `files[].content` when persisted (rehydrated items read
+    it from the candidate by `candidate_digest`), avoiding a second main-thread JSON encode of large
+    candidates.
+  - **Result risk scan is windowed**: `risk.from_result` only scans the first/last
+    `tools.sandbox.risk.result_scan_bytes` (default 256 KiB) bytes of output, so large `timeout=-1`
+    outputs cannot freeze the UI with a full main-thread lowercase + pattern scan.
+  - **Materialize skips unchanged entries by staged version**: each staged entry carries a version
+    that is bumped on edit/merge/delete; materialization records the version last written per
+    overlay/bind base and **fully skips** an entry whose version matches (no `fs_stat`, no read, no
+    write). Previously every `run_command` start iterated all staged entries and did two `fs_stat`s
+    plus string formatting per entry, which was the main-thread stall at command startup once
+    thousands of files were staged; unchanged entries now cost only a version comparison. When the
+    staged copy and target (mtime/size/mode) are both unchanged it also avoids re-read + detokenize +
+    write. Only when the upper is externally cleared (e.g. `_wipe_upper` before an LSP overlay
+    refresh) is `materialize_overlay(specs, { force = true })` used to force a full rewrite.
   - **No fsync for overlay scratch**: the per-session overlay upper is ephemeral scratch (rotated on
     agentEnd), so `write_file_atomic(..., { sync = false })` drops the per-file fsync; real workspace
     publishing still fsyncs for durability.
@@ -123,13 +150,66 @@ is only kept for other `approval.mode` values (`prompt`/`strict`).
   - **Generated high-entropy detection is budgeted**: `detect_generated` is bounded by
     `tools.sandbox.secrets.generated_scan_max_bytes` / `generated_scan_max_files` so a large
     candidate is not scanned file-by-file full-text.
-  - **Settle is asynchronous**: candidate/review **file writes** run on the thread pool
-    (`store.write_candidate_async` / `write_review_async`, per-path serialized write-behind), and
-    secret analysis (NEOKEY warnings + generated high-entropy) also runs on the worker
-    (`secret.analyze_files_async`); the main thread only does JSON encoding and aggregation. An
-    in-memory cache makes a just-written item immediately readable; it is dropped once flushed
-    (bounded memory). `sandbox.shutdown` / `store.reset` call `store.flush()` first, so shutdown
-    and reset lose no data and are not polluted by late writes.
+  - **Settle is asynchronous**: candidate/review/snapshot **file writes** run on the thread pool
+    (`store.write_candidate_async` / `write_review_async` / `write_snapshot_async`, per-path
+    serialized write-behind), and secret analysis (NEOKEY warnings + generated high-entropy) also
+    runs on the worker (`secret.analyze_files_async`); the main thread only does JSON encoding and
+    aggregation. Candidates rewritten by merge / content-split / selective-apply reordering, and
+    snapshots (which carry original file content for save/undo-save), no longer encode + fsync
+    synchronously on the main thread. An in-memory cache makes a just-written item immediately
+    readable; it is dropped once flushed (bounded memory). `sandbox.shutdown` / `store.reset` call
+    `store.flush()` first, so shutdown and reset lose no data and are not polluted by late writes.
+  - **JSON encoding no longer deep-scans the main thread**: `json.encode_fast` uses `vim.json`
+    (C implementation) directly, skipping the pure-Lua whole-table UTF-8 deep scan in
+    `_sanitize_value` (the main freeze source for large candidates). Before persisting, a C-level
+    `string.find("[\128-\255]")` check lets **pure-ASCII output (the common case) skip** thread-pool
+    UTF-8 validation entirely; only output containing non-ASCII bytes is validated on the thread
+    pool, and only invalid output falls back to `json.encode` (sanitize + re-encode). This avoids a
+    1M-entry candidate/review JSON (~230MB) byte-by-byte scan occupying 10–30s of the thread pool
+    and starving capture/finish/tokenize. Candidate/review/snapshot persistence all use this path.
+  - **Merge writes are chunked and parallel**: `merge_candidate_async` splits tokenized staged
+    copies into `work_chunk_files` chunks and writes them (including mkdir/chmod) concurrently on the
+    thread pool; each chunk is encoded lazily and overlaps the previous group's writes. The main
+    thread only registers mappings and `fresh` signatures, so thousands/millions of files are no
+    longer written single-threaded.
+  - **Capture workspace-consistency check runs in the worker**: `_capture_worker` receives the
+    workspace staging map and compares, in-thread, whether a command change merely reproduces a
+    staged edit; the main thread no longer re-reads two contents per changed file.
+  - **Batched chunk-job submission**: `work.batched` keeps at most
+    `tools.sandbox.work_parallelism` (default 4, matching the libuv pool) in flight per batch, so
+    hundreds of chunk jobs cannot flood the queue and starve later UI-critical jobs
+    (redaction / secret tokenization / disk writes).
+  - **Session rotation migration runs on the thread pool**: `rotate_session` hands the file copies
+    (including directories) to a worker; staged access waits via `_await_rotation` for the
+    migration to finish (usually already done, so the wait is 0). At agentEnd, long sessions with
+    many unpublished changes no longer copy file-by-file on the main thread.
+  - **Incremental pending index**: `review._pending_items` caches PENDING items (sorted by
+    created_at); `supersede_by_paths` / package merging no longer filter + sort **all** change
+    units (including terminal ones) on every call; any write invalidates the cache.
+  - **Settlement main-thread hotspots batched / single-pass (10k staged-file regression)**:
+    - `risk.classify`'s `path_level` no longer re-canonicalizes `cwd`/`~` per path (cached by cwd)
+      and walks `facts.paths` only once (also deriving "write outside workspace" for secret
+      grading), eliminating tens of thousands of Vimscript round-trips.
+    - `secret._merge_chunk_results` rewrites outputs **single-pass** over the token pattern
+      (previously one full-text `gsub` per remap entry, roughly quadratic within a chunk).
+    - `review.apply_all` discards candidates via a **batched reconciliation**
+      (`_defer_discard` + `_discard_candidates`) instead of a full-table reference scan per item
+      (avoiding O(n²)).
+    - `privilege.package_path_manager` scans each candidate only once (cached per attempt),
+      replacing the three duplicate full scans in secret analysis / merge / settlement.
+    - `wrapper._rewrite_value` uses a staging-root prefix guard: when a result string contains no
+      staged path it skips the per-entry `gsub` entirely (previously O(strings × staged files)).
+    - `candidate.capture_overlay_async` scopes the workspace staging encoding to the **capture
+      root**; `_capture_entry` reads the per-file size cap once outside the loop.
+    - `candidate.merge_candidate_async` returns post-write signatures (`fresh_ssig`) from the
+      worker, so the main thread no longer `fs_stat`s every staged file.
+  - **Cancel/timeout/output-truncation truly kill the process tree**: the bwrap payload runs in
+    its own PID namespace, so `jobstop` only kills the outer bwrap. The gate exposes `cgroup.kill`
+    via `ctx.sandbox_kill`; `run_command` / tool subprocesses precisely kill the whole resource
+    domain on cancel, timeout, or output truncation (falling back to `jobstop` when no cgroup).
+  - **Wall-clock safety net**: `tools.run_command.max_wall_ms` (default 0 = unlimited) > 0 bounds
+    every command (including `timeout_ms=-1` "unlimited" ones); on expiry the resource domain is
+    killed, so long tasks cannot occupy resources forever or leave the tool never returning.
   - **Benchmark**: `require("NeoAI.sandbox.diag").bench_capture({ files = N })` returns
     materialize cold/warm and capture main-thread timings for regression comparison (resets the
     sandbox; diagnostic only).
@@ -193,10 +273,21 @@ is only kept for other `approval.mode` values (`prompt`/`strict`).
     - **Oversized files are not captured** (`tools.sandbox.max_file_bytes`, default 8 MiB): files
       above the cap are still written to the overlay private layer (never the real disk) but are
       excluded from candidates/review/publish, so apt's `pkgcache.bin`, cache archives and image
-      layers cannot be embedded into candidate JSON and block the main thread / fill the disk.
-    - **Chunked parallel freeze** (`tools.sandbox.work_chunk_files`, default 128): `finish_async` and
-      batch secret tokenization dispatch in chunks of this many files concurrently to the thread
-      pool, using multiple cores instead of single-core serialization on many-file workloads.
+      layers cannot be embedded into candidate JSON and block the main thread / fill the disk. The
+      async capture skips them **inside the worker** (they never enter the base-hash list), avoiding
+      reading + pure-Lua hashing hundreds of MB of chromium/npm caches.
+    - **The same file is never processed twice (capture signature cache)**: every async capture
+      records the **target signature** (mtime/size) of each overlay entry it processed (file /
+      delete / oversized skip) in that upper's expected map; the next capture compares signatures
+      **inside the worker** and skips unchanged entries entirely — no record emitted, no base hash,
+      no main-thread work. Only genuinely changed (or externally modified) files are reprocessed.
+      Previously every `run_command` re-read and pure-Lua-hashed the same captured files (including
+      hundreds of MB of chromium/npm caches), showing up as a long stall after the command
+      completed; the map is cleared on session rotation.
+    - **Chunked parallel freeze** (`tools.sandbox.work_chunk_files`, default 128): `finish_async`,
+      batch secret tokenization and staged-copy writes in `merge_candidate_async` dispatch in chunks
+      of this many files concurrently to the thread pool, using multiple cores instead of
+      single-core serialization on many-file workloads.
     - **Staged content is persistent**: `PENDING` and `APPROVED` (not yet applied) candidates are
       **re-materialized** from disk by `_rehydrate_pending` after a reload/restart, so large
       staged content such as package installs stays readable until applied or rejected and is not
@@ -349,6 +440,14 @@ detection) and `risk.classify` (security level), so `pip install`, `sudo modprob
   real root is the read-only lower, a session upper is the writable layer. The command can read real
   content under these roots, and creates/modifies/deletes at **any path** below them land in upper and
   are frozen as a candidate (deletions recognized via whiteout device nodes as `delete`/`rmdir`).
+  - **Process commands run serially**: the gate for `effect="process"` tools (`run_command`, git read
+    tools, …) executes them **FIFO, one at a time**. The sandbox's overlay materialization/capture,
+    session-level writable layer and staging map are based on a **shared session** and are not
+    concurrency-safe: several `run_command`s issued in parallel in one turn (parallel tool_calls)
+    would interleave materialization/capture, making commands see missing directories/files and
+    overwrite each other's captures; a command could then block until timeout and be terminated by
+    `cgroup.kill` with SIGKILL (exit code 137, no output). Serialization keeps parallel calls working
+    (they simply queue) and does not affect `read`/`fs_write`/`in_process`/`network` tools.
   - `/tmp` and `/var/tmp` are **per-session private temporary roots** (`tools.sandbox.tmpfs_roots`):
     by default (`tmp_private_base="host"`) a hidden temporary subdirectory is created under the host
     root (e.g. `/tmp/.cache-<tag>/<session>`, mode 1777) and **namespace-bound back onto that root** —
@@ -438,6 +537,53 @@ detection) and `risk.classify` (security level), so `pip install`, `sudo modprob
   and approved-but-unapplied (`APPROVED`/`NOT_REQUESTED`) candidates into the new session's
   staging layer (`_rehydrate_pending`), so read tools see the same view as the review queue after a
   reload/reopen.
+
+### Long-lived services (`service_*`, background processes)
+
+- **Background**: a `run_command` background process (`&`/`nohup`/`setsid`) is reaped as soon as the
+  command ends — every command runs in its own pid namespace + cgroup, and on completion
+  `cgroup.release` → `cgroup.kill` terminates the whole process tree, so background processes do
+  **not survive across tool calls**. For a persistent process (dev server / watch / daemon) use
+  `service_start` / `service_logs` / `service_status` / `service_stop`.
+- **Isolation**: each service builds its own overlay attempt (own upper/work, not competing with the
+  shared session staging used by `run_command`) and its own cgroup. The gate still runs
+  policy/script-scan/hard-deny prechecks (the `long_lived` branch in `wrapper`) but skips the
+  one-shot process capture/freeze flow. Services run concurrently with other commands (they do not
+  occupy the `effect="process"` FIFO).
+- **Boundary sync**: at start the workspace staging is materialized into the service overlay (a
+  **one-way snapshot**, so the service sees the AI's unpublished edits); at stop the service overlay
+  changes are captured → frozen as candidates → merged back into workspace staging and queued for
+  async review (reusing `wrapper.settle_exec_candidate`). A service and `run_command` are **not
+  live-shared**, only synchronized at start/stop.
+- **Lifecycle**: `sandbox.shutdown()` (`:qall` / hot reload / plugin unload) and `sandbox.reset()`
+  stop all services and capture their changes; service logs are an in-session ring buffer
+  (`service.max_log_bytes`), redacted via `conceal` on read.
+- **Config**: `tools.sandbox.service = { enabled, max_services, max_log_bytes, stop_timeout_ms }`.
+
+### 137 / OOM attribution and diagnostics (`tools.sandbox.diagnostics`)
+
+- **Exit code 137 = SIGKILL**: there are two sources — `cgroup.kill` (called by the gate on command
+  timeout/cancel/output truncation via `ctx.sandbox_kill`) or OOM (resource-domain `memory.max` or a
+  host/container memory shortage).
+- **Attribution**: when a command ends with 137, `run_command` reads that resource domain's
+  `memory.events` (`oom_kill` / `oom_group_kill`): a hit reports "suspected memory-limit OOM",
+  otherwise "forcibly terminated (137/SIGKILL)" with a hint to enable diagnostics. With
+  `tools.sandbox.diagnostics.enabled=true`, `cgroup.kill` records the caller traceback and command
+  end records resource-domain memory/pids events (log only, no behavior change).
+- **Diagnostics command**: `:NeoAISandboxDiag` prints host/container cgroup limits (`memory.max` /
+  `memory.events` / `pids.max`), load, PID1 (systemd detection) and resolved sandbox limits, to tell
+  "sandbox resource domain" apart from "host container OOM".
+- **Environment-mismatch hint**: when command output matches `System has not been booted with
+  systemd` / `Failed to connect to bus`, etc., the result appends a hint: "this environment has no
+  systemd; systemctl/service is unavailable — run a foreground command directly".
+
+### Network mirrors (`tools.sandbox.network.mirrors`)
+
+- For restricted networks, mirrors can be configured (empty = inherit system behavior): `pip` →
+  `PIP_INDEX_URL` + `PIP_TRUSTED_HOST`; `npm` → `npm_config_registry`; `maven` → generates a
+  `settings.xml` (mirroring all repositories), read-only binds it into the session-private `/tmp` and
+  points `MAVEN_OPTS -s` at it. Only applies to sandbox external commands, still subject to
+  proxy/`host_local_block` filtering (external targets allowed and recorded).
 
 ### AI-only Sandboxed LSP (on by default)
 
@@ -545,23 +691,26 @@ host-global capabilities are narrowed via `cap_drop`):
   prefers `bash` (supports multi-digit fds), falls back to `python3`'s `os.closerange`, then to
   `sh` (dash only supports single-digit fds — best effort). `run_command`, `runtime.run` and the
   LSP namespace overlay all go through this wrapper.
-- **Full capabilities by default + host-global capability narrowing (`cap_drop`)**: by default
-  `cap_add = { "ALL" }` and `--cap-drop ALL` is **not** applied — node/python/apt/dpkg/pip and
-  any other operation run with full root capabilities. At the same time, the capabilities that
+- **Least privilege by default + narrow per-command add-back + host-global capability narrowing
+  (`cap_drop`)**: by default `cap_add = {}` (`--cap-drop ALL` is applied); the needed capabilities
+  are added back **narrowly per command** — package-install commands (including chained ones like
+  `apt-get install …; echo; tail`) via `packages.cap_add`, system-administration commands
+  (`useradd`/`chown`/`passwd`, …; `req.sysadmin`) via `privilege.sysadmin.cap_add`, which also
+  lifts account-DB masking; ordinary commands get nothing. At the same time, the capabilities that
   can **modify host-global state** are dropped one by one per `cap_drop` (default
   `CAP_NET_ADMIN`/`CAP_SYS_TIME`/`CAP_SYS_MODULE`/`CAP_SYS_RAWIO`/`CAP_SYS_BOOT`/
   `CAP_MAC_ADMIN`/`CAP_MAC_OVERRIDE`/`CAP_AUDIT_CONTROL`), so netlink route/firewall changes,
   clock changes, module loading, raw port I/O, reboot and MAC/audit changes are denied with
   `EPERM`; none of them are needed by dev/package workflows. Capabilities explicitly listed in
   `cap_add` are not dropped. Host **filesystem** immutability does not rely on capabilities but
-  on namespaces + whole-root overlay staging (writes are frozen as candidates). For minimal
-  privileges set `cap_add = {}` (`--cap-drop ALL`); pure package-install commands then add back
-  `CAP_DAC_OVERRIDE`/`CAP_CHOWN`/`CAP_SETUID`, … per `packages.cap_add`, while mixed commands
-  (`apt update && cat /x`) get nothing. The sandbox already
-  runs as root, so a leading `sudo`/`doas` (and its common boolean flags) is **stripped**
-  (`sudo apt update` → `apt update`); otherwise `sudo` fails with `setresuid` EINVAL under the
-  nested userns and a masked `/etc/sudoers`. Forms that change user/login (`-u/-g/-i/-s`, …)
-  are left as-is.
+  on namespaces + whole-root overlay staging (writes are frozen as candidates). For full
+  capabilities (not recommended) set `cap_add = { "ALL" }`. The sandbox already
+  runs as root, so `sudo`/`doas` (and their options) is **stripped** (`sudo apt update` →
+  `apt update`); otherwise `sudo` fails with `setresuid` EINVAL under the nested userns and a
+  masked `/etc/sudoers` (`PERM_SUDOERS`). Stripping is applied **per command segment** (split on
+  unquoted `;`/`&`/`|`/`&&`/`||`/newline), so `a && sudo b`, multi-line scripts,
+  `sudo -u user cmd`, `sudo -i`, … no longer error; separators inside quotes/escapes are not
+  split and the rest of the command (including whitespace inside quotes) is preserved.
   **Note**: capabilities are irrelevant to writing global sysctls such as
   `/proc/sys/kernel/core_pattern` and `modprobe` — these are not namespaced, and their write
   permission is decided by **DAC** (`euid == global root uid`). When the sandbox runs as root
@@ -628,7 +777,14 @@ host-global capabilities are narrowed via `cap_drop`):
     attributed precisely to the attempt cgroup and watching real `openat/open` calls instead of
     parsing command strings; when none is available it falls back to command-string heuristics
     (in-process read tools by path args, `run_command` by absolute paths in the command string).
-    System paths (`/usr`, `/etc`, …) are not traced to avoid noise.
+    System paths (`/usr`, `/etc`, …) are not traced to avoid noise. **The observation hot path is
+    bounded**: builds/tests repeatedly open the same set of files (events can reach millions), so
+    paths are **deduped** (each path processed once per attempt; the set has a bounded cap);
+    `outside_workspace` first does a **pure string prefix pre-filter** against mask dirs and only
+    canonicalizes (symlink resolution via `vim.fn.resolve`, an expensive syscall) for candidates,
+    caching the mask-dir list by config reference; outside-access evidence is written via
+    **async write-behind** (`evidence.add_async`) instead of a synchronous per-record disk write on
+    the main thread.
   - **`read_all = false` (fall back to the minimal allowlist)**: no whole-root bind, and `/usr`
     is **not exposed as a whole** (avoids leaking `/usr/local/go_workspace`, `/usr/src`, etc.). Via
     `tools.sandbox.readonly_roots` it exposes the `/usr` runtime subtrees
@@ -1161,9 +1317,16 @@ expressions like `api_key = os.getenv("..._API_KEY")` are not treated as raw sec
 > `/etc/nsswitch.conf`, `/etc/passwd`, `/etc/group`, `/etc/os-release`, `/etc/localtime`, `*.env` such
 > as `go.env`, `.npmrc`, `.bash_history`/`.python_history`, **public CA bundles/trust stores**
 > (`cacert.pem`/`ca-bundle.pem`/`chain.pem`/`fullchain.pem`/`roots.pem` etc., and certificates under
-> `/certifi/`, `/ca-certificates/`, `/ssl/certs/` — e.g. pip's vendored
-> `.../pip/_vendor/certifi/cacert.pem`) are ignored, so `uname` / `cat /etc/os-release` /
-> `python -m venv && pip install` are not misreported as "obtained a secret". Detail fallback order: observed
+> `/certifi/`, `/ca-certificates/`, `/ssl/certs/`, `/usr/lib/ssl/`, `/usr/share/ca-certificates/` —
+> e.g. Debian/Ubuntu's `/usr/lib/ssl/cert.pem`, `/etc/ssl/certs/ca-certificates.crt`, RHEL's
+> `ca-bundle.crt`, pip's vendored `.../pip/_vendor/certifi/cacert.pem`) and **third-party package
+> caches/vendored source trees** (`~/.cargo/registry/`, `node_modules/`,
+> `site-packages/`/`dist-packages/`, `go/pkg/mod/`, `~/.rustup/`, `~/.gradle/caches/`,
+> `~/.m2/repository/` etc. — their `*.pem`/`*.key`/`*.p12` are dependency-shipped **test
+> fixtures/sample certificates** such as the `openssl` crate's `test/*.pem` or `tokio-native-tls`'s
+> `tests/identity.p12`, opened in bulk by `cargo check`/`pip install`) are ignored, so `uname` /
+> `cat /etc/os-release` / `python -m venv && pip install` / `cargo check` are not misreported as
+> "obtained a secret". Detail fallback order: observed
 > secret file → secret file in arguments → secret type (named rule) → sensitive env name → generic hint.
 > **Failed results** (such as the `SANDBOX_SECRET_BLOCKED` error object returned by the hard secret
 > block) are not treated as "content that was read" for this decision, and `scan_names` excludes
@@ -1184,6 +1347,28 @@ expressions like `api_key = os.getenv("..._API_KEY")` are not treated as raw sec
 > only on **newly added context and tool calls** (the pre-request guard uses the incremental
 > `secret.context_leak_from`, falling back to a full scan only when compaction replaces history), never
 > re-scanning the whole history every round.
+>
+> **Event parsing runs on the thread pool**: the per-line parse of eBPF output (bpftrace `openat`
+> lines) and of the strace trace file both run on `utils.work` worker threads (split lines, keep only
+> file events, dedupe by path); the main thread only classifies the reduced, deduped path set for
+> tracing/secret hits — builds/tests producing millions of events no longer saturate the main thread
+> (previously every event did a `vim.fn.resolve` canonicalization; the strace backend even parsed
+> every line in pure Lua on the main thread). strace polling is now bounded-concurrent: while the
+> previous parse is in flight the next tick is skipped, and it resumes from the new offset once done;
+> `stop` still flushes the remainder synchronously so events are dispatched before the command ends.
+>
+> **Async process post-processing** (`tools.sandbox.postprocess="async"`, default): as soon as the
+> command process exits the result is returned to the main loop immediately; overlay capture,
+> candidate freeze, staging merge, persistence and settlement complete on a background chain. The
+> process-command FIFO slot is held until the background chain finishes so the next process command
+> sees consistent session staging; subsequent non-process (read/write) tools also wait for in-flight
+> post-processing before running (so they never read staging that has not been merged yet).
+> `sandbox.await_postprocess()` waits for the in-flight chain before shutdown/reset, so freeze and
+> review enqueue are not lost. On exit/close the wait is bounded by
+> `tools.sandbox.shutdown_timeout_ms` (default 3s), so `:qall` / hot reload are never blocked for a
+> long time when post-processing is stuck (on timeout the last unfinished freeze/enqueue is dropped).
+> Set `"sync"` to restore "wait for post-processing before returning" (tests inject this by default
+> for determinism).
 >
 > **Startup probe**: on plugin start the backends are probed (eBPF checks the `bpftrace` binary, root,
 > tracefs and kernel BTF; then strace/procfs). When eBPF is unavailable/not installed, or when falling
@@ -1376,13 +1561,15 @@ per tier. Core modules: `sandbox/privilege.lua` (classify/resolve/record) and
 
 | Tier | Name | Use | Isolation | Review |
 |---|---|---|---|---|
-| **T0** | minimal | normal commands | full capabilities by default (`cap_add={ALL}`) minus host-global capabilities (`cap_drop`: network/clock/modules/raw I/O/boot/MAC/audit) + seccomp (incl. device-node barrier) + masks + **network allowed by default (host-local intercepted via host_proxy, see §6.1)** | no per-command review; fs changes enter the pending queue |
-| **T1** | elevated | network access, controlled docker, package installs | runs isolated, network allowed; when `cap_add` is narrowed, commands containing a package manager (`req.package`, incl. chained) get narrow caps via `packages.cap_add`; docker.sock is unmasked only for docker commands | auto-authorized, recorded; fs changes enter the pending queue |
+| **T0** | minimal | normal commands | least privilege (default `cap_add={}` → `--cap-drop ALL`), added back **narrowly** per command (package installs via `packages.cap_add`, system administration via `privilege.sysadmin.cap_add`) + host-global capability narrowing (`cap_drop`: network/clock/modules/raw I/O/boot/MAC/audit) + seccomp (incl. device-node barrier) + masks + **network allowed by default (host-local intercepted via host_proxy, see §6.1)** | no per-command review; fs changes enter the pending queue |
+| **T1** | elevated | network access, controlled docker, package installs, system administration | runs isolated, network allowed; when `cap_add` is narrowed, commands containing a package manager (`req.package`, incl. chained) get narrow caps via `packages.cap_add`; system-administration commands (`useradd`/`chown`/`passwd`, …; `req.sysadmin`) get narrow caps via `privilege.sysadmin.cap_add` and lift account-DB masking; docker.sock is unmasked only for docker commands | auto-authorized, recorded; fs changes enter the pending queue |
 | **T2** | privileged | cap_add, host sockets, host mounts | runs inside a **nested userns** with full capabilities (caps scoped to the userns, cannot reach the host; the seccomp baseline still applies) | host effects frozen as a **proposal**, replayed after async approval |
 
 - Classification: `privilege.classify()` parses the command; `docker/podman`→T1,
-  `curl/git push/pip/npm`→T1 network, `sudo/mount/modprobe/iptables/systemctl`→T2; compound
-  commands take the highest tier. Rules live in `tools.sandbox.privilege.classify`.
+  `curl/git push/pip/npm`→T1 network, `useradd/usermod/groupadd/chown/chgrp/passwd` and similar→T1
+  system administration (`req.sysadmin`: adds `privilege.sysadmin.cap_add` and lifts account-DB
+  masking), `sudo/mount/modprobe/iptables/systemctl`→T2; compound commands take the highest tier.
+  Rules live in `tools.sandbox.privilege.classify`.
   - **Read-only `mount` is not privileged**: bare `mount`, `mount -l`, `mount --show-labels`,
     `mount -t ext4`, and listing pipes like `mount | grep` / `findmnt` only read the mount table
     and run at T0; only `mount` with a positional device/mountpoint or a mutating option
@@ -1556,6 +1743,13 @@ The default is `default="review"` (unchanged semantics); override per level via
     changing a third-party repo or key/trust chain) keeps the L2 high rating and is labelled
     `⚠ 涉及软件源/密钥` on the review header. The relaxation only affects **risk and prompts**: package
     writes still go through staging and require user confirmation, never auto-applying.
+  - **apt privilege drop disabled** (`packages.apt_sandbox_user`, default `"root"`): as root, apt
+    drops downloads/verification to the `_apt` user (`setgroups` + `setuid/setgid`); in a nested user
+    namespace / restricted container `setgroups` returns EPERM, so `apt-get update`/`install` fail
+    with `setgroups failed - Operation not permitted`. The sandbox is already namespace + overlay
+    staging isolated and the payload runs as root, so by default a read-only apt config fragment is
+    bound in and `APT_CONFIG` points at it, setting `APT::Sandbox::User "root"` to disable that drop.
+    Set `"_apt"` or an empty string to keep apt's default behaviour.
   - **Interpreter module form**: `python3 -m pip install …` is also recognised as a package install
     (the module after `-m` is the manager). For package-install commands the sandbox injects
     `PIP_BREAK_SYSTEM_PACKAGES=1`/`PIP_ROOT_USER_ACTION=ignore`, bypassing Debian/Ubuntu's PEP 668

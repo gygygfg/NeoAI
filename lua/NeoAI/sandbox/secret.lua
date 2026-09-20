@@ -248,6 +248,19 @@ end
 
 local function apply_secret_names(text, token_for)
   if not (text:find("=", 1, true) or text:find(":", 1, true)) then return text end
+  -- 廉价预检：敏感名片段须**紧跟 = 或 :**（赋值形态）才可能命中；否则跳过 5 次全文 gsub。
+  -- 大量普通源码/数据文件（如 venv、node_modules）只是恰好含 "key"/"token" 子串，
+  -- 逐文件多次全文 gsub 是主要耗时（实测 36 MB 约 9s）。
+  local hint = false
+  for _, w in ipairs(SECRET_NAME_SEGMENTS) do
+    if text:find(w .. "[%a_]*[\"']?%s*[=:]") or text:find(w:lower() .. "[%a_]*[\"']?%s*[=:]") then
+      hint = true
+      break
+    end
+  end
+  if not hint and not (text:find("APIKEY[%a_]*[\"']?%s*[=:]") or text:find("apikey[%a_]*[\"']?%s*[=:]")) then
+    return text
+  end
   local function make(name, value)
     if type(name) ~= "string" or type(value) ~= "string" then return nil end
     if value == "" or not secret_name(name) then return nil end
@@ -262,18 +275,13 @@ local function apply_secret_names(text, token_for)
     if not token then return nil end
     return name .. sep .. token
   end)
-  for _, q in ipairs({ '"', "'" }) do
-    text = text:gsub("([%a_][%w_]*)(%s*=%s*)" .. q .. "(.-)" .. q, function(name, sep, value)
-      local token = make(name, value)
-      if not token then return nil end
-      return name .. sep .. q .. token .. q
-    end)
-    text = text:gsub(q .. "([%a_][%w_]*)" .. q .. "(%s*:%s*)" .. q .. "(.-)" .. q, function(name, sep, value)
-      local token = make(name, value)
-      if not token then return nil end
-      return q .. name .. q .. sep .. q .. token .. q
-    end)
-  end
+  -- 带引号赋值（含 JSON `"name": "value"`）：名字/值两侧引号可省略或配对，用反向引用一次
+  -- 匹配所有形态。此前对单/双引号各跑两条 gsub（共 4 次全文扫描），大文件时是主要耗时。
+  text = text:gsub("([\"']?)([%a_][%w_]*)%1(%s*[=:]%s*)([\"'])(.-)%4", function(q1, name, sep, q2, value)
+    local token = make(name, value)
+    if not token then return nil end
+    return q1 .. name .. q1 .. sep .. q2 .. token .. q2
+  end)
   return text
 end
 
@@ -751,6 +759,15 @@ local function _work_chunk_files()
   return n
 end
 
+--- 每批并发提交的 chunk 数上限（默认 4，与 libuv 线程池一致），避免一次性排满队列饿死
+--- 后续 UI 关键 job。可经 tools.sandbox.work_parallelism 调整。
+--- @return number
+local function _work_parallelism()
+  local n = tonumber(require("NeoAI.kernel.config_store").get("tools.sandbox.work_parallelism"))
+  if not n or n <= 0 then return 4 end
+  return n
+end
+
 --- 合并并行分块的 token 结果：各块 seq 起点相同，同一 secret 在不同块可能被分配不同 token。
 --- 取首次出现的 token 为规范值，并把其余分块输出中的等价 token 替换回规范 token，
 --- 保证 detokenize 可无损还原；最后统一登记并推进全局 seq。
@@ -780,10 +797,11 @@ local function _merge_chunk_results(results)
       end
     end
     if remap then
+      -- 单遍按 token 模式重写：每个输出文件只扫描一次（此前对每个 remap 项各做一次
+      -- 全文 gsub，块内输出×remap 近似平方，数万文件时占满主线程）。
       for i = 1, #r.outs do
         local out = r.outs[i]
-        for from, to in pairs(remap) do out = out:gsub(from, to) end
-        r.outs[i] = out
+        r.outs[i] = out:gsub(TOKEN_PAT, function(tok) return remap[tok] or tok end)
       end
     end
   end
@@ -828,21 +846,22 @@ function M.tokenize_many_async(texts, opts)
   -- 大量文本（如 npm/cargo 产生的大量候选文件）：按块并发投递到线程池用满多核，
   -- 结果按原顺序合并。各块独立分配 token，合并时统一到规范 token（见 _merge_chunk_results）。
   local map_enc = _encode_map(state.by_secret)
-  local jobs = {}
+  local tasks = {}
   local i = 1
   while i <= #texts do
     local j = math.min(i + chunk - 1, #texts)
     local sub = {}
     for k = i, j do sub[#sub + 1] = texts[k] end
-    local sub_flags = flags:sub(i, j)
-    jobs[#jobs + 1] = work.run(_tokenize_worker, cfg_enc, map_enc, salt, state.seq,
-      _encode_texts(sub), sha_src, SCAN_SRC, sub_flags):then_(function(enc)
+    tasks[#tasks + 1] = { sub = sub, flags = flags:sub(i, j) }
+    i = j + 1
+  end
+  return work.batched(tasks, _work_parallelism(), function(task)
+    return work.run(_tokenize_worker, cfg_enc, map_enc, salt, state.seq,
+      _encode_texts(task.sub), sha_src, SCAN_SRC, task.flags):then_(function(enc)
         local seq, new, outs = _decode_result(enc)
         return { seq = seq, new = new, outs = outs }
       end)
-    i = j + 1
-  end
-  return async.all(jobs):then_(function(results)
+  end):then_(function(results)
     return _merge_chunk_results(results)
   end)
 end
@@ -1007,11 +1026,9 @@ function M.analyze_files_async(files, opts)
     return async.resolve({ offloaded = false }) -- 回退：调用方使用同步版
   end
   local cfg_enc = _encode_cfg(cfg)
-  local texts_enc = _encode_texts(selected)
-  return work.run(_analyze_worker, cfg_enc, texts_enc, SCAN_SRC):then_(function(enc)
-    local per = _decode_analyze(enc)
-    local tokens, count = {}, 0
-    local generated = {}
+  -- 结果聚合：与同步版语义一致（token 去重计数 + 生成高熵命中按文件索引还原）。
+  local function accumulate(per, idxs, tokens, generated)
+    local count = 0
     for k, entry in ipairs(per) do
       for _, tok in ipairs(entry.tokens) do
         count = count + 1
@@ -1020,7 +1037,7 @@ function M.analyze_files_async(files, opts)
       if opts.generated ~= false then
         for _, hit in ipairs(entry.hits) do
           if not hit.value:match("^" .. TOKEN_PAT .. "$") then
-            local fi = idx[k]
+            local fi = idxs[k]
             generated[#generated + 1] = {
               path = files[fi] and files[fi].path, entropy = hit.entropy, rule = hit.rule,
               preview = hit.value:sub(1, 8) .. "…",
@@ -1029,6 +1046,9 @@ function M.analyze_files_async(files, opts)
         end
       end
     end
+    return count
+  end
+  local function finalize(tokens, count, generated)
     local warning = nil
     if count > 0 then
       local list = {}
@@ -1037,6 +1057,36 @@ function M.analyze_files_async(files, opts)
       warning = { count = count, tokens = list }
     end
     return { warning = warning, generated = generated }
+  end
+  local chunk = _work_chunk_files()
+  if #selected <= chunk then
+    return work.run(_analyze_worker, cfg_enc, _encode_texts(selected), SCAN_SRC):then_(function(enc)
+      local tokens, generated = {}, {}
+      local count = accumulate(_decode_analyze(enc), idx, tokens, generated)
+      return finalize(tokens, count, generated)
+    end)
+  end
+  -- 大量文本（大候选）：按块并发投递到线程池用满多核，结果按顺序聚合。
+  local subs, idx_chunks = {}, {}
+  local i = 1
+  while i <= #selected do
+    local j = math.min(i + chunk - 1, #selected)
+    local sub, subidx = {}, {}
+    for k = i, j do sub[#sub + 1] = selected[k]; subidx[#sub + 1] = idx[k] end
+    subs[#subs + 1] = sub
+    idx_chunks[#idx_chunks + 1] = subidx
+    i = j + 1
+  end
+  return work.batched(subs, _work_parallelism(), function(sub)
+    return work.run(_analyze_worker, cfg_enc, _encode_texts(sub), SCAN_SRC):then_(function(enc)
+      return _decode_analyze(enc)
+    end)
+  end):then_(function(results)
+    local tokens, generated, count = {}, {}, 0
+    for ci, per in ipairs(results) do
+      count = count + accumulate(per, idx_chunks[ci], tokens, generated)
+    end
+    return finalize(tokens, count, generated)
   end)
 end
 
@@ -1315,7 +1365,9 @@ function M.warn_for_files(files)
   local tokens = {}
   local count = 0
   for _, f in ipairs(files or {}) do
-    if type(f.content) == "string" then
+    -- 先做 C 级子串预筛：绝大多数候选文件不含 token，避免对每个文件都启动 gmatch
+    -- 模式扫描（1M 文件时是结算主线程的固定热点）。
+    if type(f.content) == "string" and f.content:find("NEOKEY_", 1, true) then
       for tok in f.content:gmatch(TOKEN_PAT) do
         count = count + 1
         tokens[tok] = true
@@ -1393,8 +1445,25 @@ local PUBLIC_CERT_BASENAMES = {
   ["ca-root.pem"] = true, ["roots.pem"] = true, ["bundle.pem"] = true,
   ["chain.pem"] = true, ["fullchain.pem"] = true, ["trusted.pem"] = true,
   ["truststore.pem"] = true,
+  -- 系统 CA 包常见名（证书是公开信息，非私钥）：Debian/Ubuntu 的 `/usr/lib/ssl/cert.pem`、
+  -- `/etc/ssl/certs/ca-certificates.crt`，RHEL 系的 `ca-bundle.crt`/`tls-ca-bundle.pem` 等。
+  ["cert.pem"] = true, ["ca-certificates.crt"] = true, ["ca-bundle.crt"] = true,
+  ["tls-ca-bundle.pem"] = true,
 }
-local PUBLIC_CERT_DIR_PATS = { "/certifi/", "/ca%-certificates/", "/ssl/certs/" }
+local PUBLIC_CERT_DIR_PATS = {
+  "/certifi/", "/ca%-certificates/", "/ssl/certs/",
+  "/usr/lib/ssl/", "/usr/share/ca%-certificates/", "/usr/local/share/ca%-certificates/",
+}
+
+-- 第三方包缓存 / vendored 源码树（非凭据）：其中的 `*.pem`/`*.key`/`*.p12` 是依赖自带的
+-- **测试夹具/示例证书**（如 `openssl` crate 的 `test/*.pem`、`tokio-native-tls` 的
+-- `tests/identity.p12`），并非用户凭据；构建/测试命令（`cargo check`/`pip install`/`npm test`）
+-- 会大量打开，不应触发「获取密钥」告警，也不应做高熵 token 化。
+local NON_CREDENTIAL_DIR_PATS = {
+  "/%.cargo/registry/", "/%.cargo/git/", "/%.rustup/", "/registry/src/",
+  "/node_modules/", "/site%-packages/", "/dist%-packages/",
+  "/go/pkg/mod/", "/%.gradle/caches/", "/%.m2/repository/", "/%.pub%-cache/",
+}
 
 --- 路径是否为公开 CA 证书包/信任库（非密钥）。
 --- @param path string
@@ -1408,12 +1477,22 @@ local function is_public_cert_bundle(path)
   return false
 end
 
+--- 路径是否位于第三方包缓存/vendored 源码树（非用户凭据）。
+--- @param path string
+--- @return boolean
+local function is_non_credential_dir(path)
+  for _, pat in ipairs(NON_CREDENTIAL_DIR_PATS) do
+    if path:find(pat) then return true end
+  end
+  return false
+end
+
 --- 路径是否疑似密钥文件（宽口径：用于决定是否做高熵扫描）
 --- @param path string|nil
 --- @return boolean
 function M.is_secret_path(path)
   if type(path) ~= "string" or path == "" then return false end
-  if is_public_cert_bundle(path) then return false end
+  if is_public_cert_bundle(path) or is_non_credential_dir(path) then return false end
   for _, pat in ipairs(SECRET_PATH_PATS) do
     if path:find(pat) then return true end
   end
@@ -1439,7 +1518,7 @@ local SENSITIVE_PATH_PATS = {
 --- @return boolean
 function M.is_sensitive_path(path)
   if type(path) ~= "string" or path == "" then return false end
-  if is_public_cert_bundle(path) then return false end
+  if is_public_cert_bundle(path) or is_non_credential_dir(path) then return false end
   for _, pat in ipairs(SENSITIVE_PATH_PATS) do
     if path:find(pat) then return true end
   end

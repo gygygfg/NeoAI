@@ -167,6 +167,7 @@ session = {
 | `external` | `{}` | External tools |
 | `read_file` | `{outline_threshold_chars=500, outline_max_nodes=200, outline_max_depth=4, outline_preview_lines=50, max_read_bytes=5242880}` | read_file large-file protection: when no line range is specified and the threshold is exceeded, return a syntax-tree outline (or a truncated preview if no parser is available); files over `max_read_bytes` are never fully read (preview only) to avoid OOM |
 | `search_files` | `{max_file_bytes=8388608}` | Per-file scan cap (bytes) during search; larger files and binaries (containing NUL) are skipped to avoid OOM |
+| `run_command` | `{max_output_bytes=16777216, max_wall_ms=0}` | Combined stdout/stderr cap (bytes): beyond it the command is truncated and terminated, so huge outputs cannot freeze the main thread with line-by-line processing; 0 = unlimited. `max_wall_ms>0` is a wall-clock safety net: the command may run at most that many milliseconds (also bounding `timeout_ms=-1` "unlimited" commands) and is then truly killed via the sandbox resource domain; 0 = unlimited |
 | `lsp` | `{timeout_ms=10000}` | LSP request timeout (fail fast when the server does not respond) |
 | `guard.repeat_tool` | `{enabled=true, thresholds={3,5,8}, messages=...}` | Reminder for consecutive repeated tool calls |
 | `todo.enabled` | `true` | Todo tool + system prompt injection |
@@ -225,6 +226,8 @@ sandbox = {
   -- inside the sandbox namespace; the tool's own cache/temp dirs are exposed read-write, shared root
   -- stdpath('cache')/NeoAI/shared (same path on host and sandbox).
   mode = "dry_run",                -- dry_run (default, only freezes candidates) | commit (CAS publish after authorization)
+  postprocess = "async",           -- Process-command post-processing mode: async (default) = return the result to the main loop as soon as the process exits, while overlay capture/candidate freeze/staging merge/persist/settle run in the background (the FIFO slot is held until the background chain finishes so the next command sees consistent staging; subsequent read/write tools wait for in-flight post-processing); sync = wait for post-processing before returning (deterministic; tests inject this)
+  shutdown_timeout_ms = 3000,      -- Max time (ms) to wait for background post-processing and staging migration on exit/close (`:qall`, plugin hot reload); the wait is abandoned on timeout so quitting never hangs; 0 = don't wait (the last unfinished freeze/pending enqueue may be lost)
   backend = "auto",                -- auto | bwrap | unshare
   offline = false,                 -- Network allowed by default (recorded only, not blocked); true hard-denies network and isolates process networking
   require_seccomp = true,          -- Reject external execution when seccomp is unavailable (default on, fail-closed)
@@ -251,6 +254,7 @@ sandbox = {
   },
   max_file_bytes = 8 * 1024 * 1024, -- Max bytes per file included in a candidate; larger files are skipped to avoid huge apt/pkgcache.bin blocking the main thread; 0 = unlimited
   work_chunk_files = 128, -- Candidate files per worker task: freeze/hash/secret-scan are chunked and dispatched to the thread pool (multi-core) to avoid single-core serialization on many files; 0/default = 128
+  work_parallelism = 4, -- Max chunk jobs submitted concurrently per batch (default 4, matching the libuv pool): prevents hundreds of chunk jobs from flooding the queue and starving UI-critical jobs (redaction/secret tokenization/disk writes); 0/default = 4
   -- Read surface (on by default): when true the whole host root is exposed as a **writable overlay**
   -- (lower `/`, session-private upper/work; mounted as-is, any path under the root is writable). All
   -- writes go to the upper staging layer and freeze as candidates, leaving the host disk untouched;
@@ -329,6 +333,26 @@ sandbox = {
     prewarm = true,
     prewarm_ttl_ms = 90000, -- prewarm TTL (ms): reclaimed if not reused within it
   },
+  -- Diagnostics (off by default): enable when investigating 137 / OOM / resource-domain kills.
+  -- Records to the NeoAI log only; never changes execution or model-visible results. Pair with
+  -- `:NeoAISandboxDiag` to inspect host/container limits and load.
+  diagnostics = {
+    enabled = false,          -- master switch
+    log_kill_caller = false,  -- cgroup.kill caller traceback (who killed the process tree)
+    dump_cgroup_events = false, -- dump resource-domain memory/pids events at command end (OOM attribution)
+  },
+  -- Long-lived services (service_* tools): background processes survive across tool calls until
+  -- explicitly stopped / session end. Each service uses its own overlay attempt: at start the
+  -- workspace staging is materialized into the service view (one-way snapshot); at stop its changes
+  -- are captured and merged back into workspace staging (boundary sync, not live sharing) and queued
+  -- for async review. A resource domain is created per service; stop kills the whole tree via
+  -- cgroup.kill.
+  service = {
+    enabled = true,          -- register the service_* tools
+    max_services = 16,       -- max concurrently alive services
+    max_log_bytes = 262144,  -- per-service log ring-buffer cap (bytes)
+    stop_timeout_ms = 5000,  -- max wait for graceful exit on stop (SIGKILL after)
+  },
   network = {
     enabled = false, allowed_endpoints = {}, budget_bytes = 0, -- controlled network gateway
     -- Intercept access to the host itself (loopback/host NIC IPs/link-local/cloud metadata; on by
@@ -349,6 +373,12 @@ sandbox = {
     -- data — it returns the interception reason (JSON) to the client. Only host-local addresses may
     -- be probed. Requires root and `ip`.
     gateway = { enabled = false, probe_timeout_ms = 1000, max_probes = 4096 },
+    -- CN/restricted-network mirrors (empty = inherit system behavior); sandbox external commands only,
+    -- injected via environment variables:
+    --   pip   -> PIP_INDEX_URL + PIP_TRUSTED_HOST (e.g. "https://pypi.tuna.tsinghua.edu.cn/simple")
+    --   npm   -> npm_config_registry (e.g. "https://registry.npmmirror.com/")
+    --   maven -> generates settings.xml (mirror all repositories), pointed to via MAVEN_OPTS -s
+    mirrors = { pip = "", npm = "", maven = "" },
   },
   -- Privilege tiers and auto-escalation: commands run at T0 least privilege by default
   -- (network allowed by default with host-local access intercepted); escalation is auto-requested
@@ -360,12 +390,23 @@ sandbox = {
       [1] = { name = "elevated", review = "auto", network = true, cap_add = {}, mounts = {}, unmask = {} }, -- docker.sock is unmasked only for docker commands
       [2] = { name = "privileged", review = "approve", network = true, userns = true, cap_add = { "ALL" }, mounts = {}, unmask = {} }, -- full caps inside the nested userns (scoped); seccomp still applies
     },
+    -- System-administration commands (useradd/chown/passwd, ...): on a match, narrowly add back
+    -- capabilities and lift account-database masking so `useradd`/`usermod`/`groupadd`/`chown`/
+    -- `passwd` work in the sandbox (under least privilege they fail for lack of
+    -- CHOWN/SETUID/SETGID/DAC_OVERRIDE and because the account DB is masked). Writes still go to
+    -- the overlay stage, so the real account DB/filesystem is untouched; ordinary commands keep
+    -- least privilege and the account DB stays masked (no password-hash exposure).
+    sysadmin = {
+      cap_add = { "CAP_CHOWN", "CAP_DAC_OVERRIDE", "CAP_DAC_READ_SEARCH", "CAP_FOWNER", "CAP_SETUID", "CAP_SETGID", "CAP_SETFCAP", "CAP_FSETID", "CAP_SYS_CHROOT", "CAP_KILL" },
+      unmask = { "/etc/passwd", "/etc/group", "/etc/shadow", "/etc/shadow-", "/etc/gshadow", "/etc/gshadow-", "/etc/subuid", "/etc/subgid", "/etc/subuid-", "/etc/subgid-" },
+    },
     classify = {                    -- command classification (bins = exact binary; bin+subs = binary + subcommand)
       { tier = 2, name = "privileged", bins = { "sudo", "mount", "modprobe", "iptables", "systemctl", "unshare", "nsenter" } },
       { tier = 1, name = "docker", bins = { "docker", "docker-compose", "nerdctl" } }, -- daemon-backed: controlled socket
       { tier = 1, name = "container", bins = { "podman", "podman-compose", "buildah", "skopeo" } }, -- daemonless: can share the sandbox namespace
       { tier = 1, name = "network", bins = { "curl", "wget", "ssh", "rsync", "ping", "socat" } },
       { tier = 1, name = "network", bin = "git", subs = { "push", "pull", "fetch", "clone" } },
+      { tier = 1, name = "sysadmin", bins = { "useradd", "usermod", "userdel", "adduser", "deluser", "groupadd", "groupmod", "groupdel", "addgroup", "delgroup", "passwd", "chpasswd", "chage", "chfn", "chsh", "chown", "chgrp", "setfacl" } }, -- system administration: narrow caps + account-DB unmask
       { tier = 1, name = "package", bins = { "apt", "apt-get", "dnf", "yum", "pacman", "apk", "brew" } }, -- package install: extra rules
     },
   },
@@ -398,6 +439,11 @@ sandbox = {
                           max_tokens = 2048, timeout_ms = 30000 } },
   -- Approval graded by security level (L0-L3): action auto/record/review/block; default "review".
   approval = { default = "review", levels = {} },
+  -- Risk grading (sandbox/risk.lua): when grading a command result, only the first/last
+  -- result_scan_bytes bytes of stdout/stderr are scanned, so large outputs from `timeout=-1`
+  -- commands (hundreds of MB) cannot freeze the UI with a full main-thread lowercase + pattern
+  -- scan; 0 = unlimited.
+  risk = { result_scan_bytes = 262144 },
   -- Static scan of indirect script execution: when a command delegates to a script/interpreter
   -- (`bash deploy.sh`, `python setup.py`, `node x.js`, `./run.sh`, `bash -c '…'`), the script is
   -- read before execution (preferring the sandbox staging copy) and its shell body plus embedded
@@ -422,6 +468,7 @@ sandbox = {
     managers = { "apt", "apt-get", "pip", "pip3", "uv", "conda", "npm", "npx", "pnpm", "yarn", "go", "cargo", "gem", "composer" }, -- package-manager names (command recognition); path signatures via privilege.package_path_manager; sensitive-install detection via privilege.package_sensitive
     roots = { "/usr", "/var", "/etc", "~/.cache", "~/.npm", "~/.nvm", "~/.cargo", "~/.rustup", "~/go", "~/.local" }, -- package-install writable roots (overlay staging). /etc lets dpkg postinst write /etc/ld.so.cache etc.; sensitive entries stay masked by mask_paths
     cap_add = { "CAP_DAC_OVERRIDE", "CAP_CHOWN", "CAP_SETUID", "CAP_SETGID", "CAP_FOWNER" },
+    apt_sandbox_user = "root", -- apt family: injects APT::Sandbox::User (default "root" disables apt's own `_apt` privilege drop, avoiding setgroups EPERM in nested userns/restricted containers that makes apt update/install fail); "_apt" or empty keeps apt defaults
   },
   lsp_overlay = { enabled = true }, -- AI-only sandboxed LSP: servers cloned by the AI lsp_* tools read staged content (on by default, bwrap+overlay only; falls back to editor clients when unavailable)
   secrets = { enabled = true, min_length = 20, max_length = 200, min_entropy = 3.5, min_distinct = 8, exclude_pure_hex = true, entropy_requires_context = true, entropy_secret_paths_only = true, generated_scan_max_bytes = 2097152, generated_scan_max_files = 200, tokenize_env = true, extra_rules = {}, allowlist = {} }, -- Secret/sensitive guard: entropy + named rules (private-key blocks/AKIA/ghp_/sk-/JWT/Bearer…) + token mapping; env values whose names contain KEY/TOKEN/SECRET/PASSWORD/CREDENTIAL are force-tokenized; bare entropy runs require a -/_ separator and must not be a code identifier (snake_case function/constant names) or a sensitive-name context (narrowed scope to avoid corrupting integrity/build hashes/traceback function names/path components); non-sensitive-named env values containing / are redacted by named rules only (never breaking PATH/LD_LIBRARY_PATH); with entropy_secret_paths_only=true the full-text entropy scan runs only on suspected secret files (~/.ssh, ~/.bashrc, /etc/*, etc. per secret.is_secret_path), other files use named rules only; generated_scan_max_bytes/generated_scan_max_files bound the AI-generated high-entropy detection (detect_generated) scan budget so large candidates do not stall the main thread file-by-file (0 = unlimited)
@@ -485,7 +532,10 @@ web_fetch = {
 
 > **Runtime behavior**: while disabled there are zero side effects (no tool registration, no dependency install);
 > once enabled, deps are installed into the cache dir (`stdpath('cache')/NeoAI/web_fetch`) and browsers are kept in the
-> same dir's `browsers/` — **the system environment is never modified**. If `node`/`npm` is missing it does not invoke a
+> same dir's `browsers/` — **the system environment is never modified**. **Dependency/browser installation runs on the
+> host, outside the sandbox**: the install artifacts (`node_modules`, a browser engine that can be hundreds of MB) would
+> otherwise enter the sandbox overlay and be re-captured by every `run_command`; rendering still runs inside the sandbox
+> (browsers are read-only visible from the host). If `node`/`npm` is missing it does not invoke a
 > system package manager, but returns an actionable error. `approval.per_tool.web_fetch = { auto_allow = true }` (auto-allowed
 > by default). Pipeline: Lua orchestrates → bash installs deps → Node/Playwright renders and injects JS → final DOM →
 > turndown converts to Markdown.

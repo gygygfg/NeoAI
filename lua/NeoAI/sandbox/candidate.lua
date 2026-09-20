@@ -24,8 +24,21 @@ local state = {
   session_seq = 0,
   process_dir_cache = nil, -- 当前会话的进程 overlay 基目录（宿主路径）
   pending_cleanup = {}, -- 轮换后待安全清理的旧会话目录（避免删除运行中命令 bind 挂载的源）
-  materialized = {}, -- upper/bind 基目录 -> { [real] = dest }：本次 materialize 写入的路径
+  -- upper/bind 基目录 -> { [real] = { dest, version, ... } }：本次 materialize 写入的路径。
+  -- 记录写入时的暂存版本，使物化可跳过「自上次写入该 base 后未改动」的项，避免每条
+  -- run_command 开始都对全部暂存文件 fs_stat/读/写（暂存上万文件时是命令启动阶段的主线程卡顿源）。
+  -- 按 base 分别记录：LSP overlay 与进程 overlay 使用不同 upper，需各自物化。
+  materialized = {},
+  version = 0, -- 暂存版本计数器：每次新增/编辑/删除/合并暂存项时递增
+  rotation = nil, -- 会话轮换的在途迁移（Deferred）；暂存访问前经 `_await_rotation` 等待完成
 }
+
+--- 递增暂存版本（每次暂存内容变化时调用）
+--- @return number
+local function _bump_version()
+  state.version = (state.version or 0) + 1
+  return state.version
+end
 
 -- ========== 私有函数 ==========
 
@@ -49,9 +62,18 @@ local function _abs(path)
   return fs.canonical(path)
 end
 
+-- 暂存路径键缓存：`_workspace_path` 在合并/轮换/暂存时对每个真实路径调用，
+-- 每次 `vim.fn.sha256` + `fnamemodify` 是 2 次 Vimscript 往返；暂存上万文件时累积可观。
+-- 键仅依赖路径字符串（与会话无关），跨会话复用安全；reset 时清空以界定内存。
+local _path_key_cache = {}
+
 local function _hash_key(path)
+  local cached = _path_key_cache[path]
+  if cached then return cached end
   local ok, hex = pcall(vim.fn.sha256, path)
-  return ok and hex or path:gsub("[^%w]", "_")
+  local key = ok and hex or path:gsub("[^%w]", "_")
+  _path_key_cache[path] = key
+  return key
 end
 
 local function _read(path)
@@ -104,6 +126,93 @@ local function _rmrf_worker(path)
   return "ok"
 end
 
+--- 线程内批量写暂存副本（纯 vim.uv，自包含）：把大量 `run_command` 改动写入工作区暂存层时，
+--- 逐文件同步写盘（含 mkdir/chmod）此前在主线程完成，数千文件时冻结界面。
+--- 输入编码：`<n>\n` + n 条 `<path_len>:<path><mode_len>:<mode><content_len>:<content>`。
+--- 成功返回 `"\1" .. <m>\n<m 条 <path_len>:<path><sig_len>:<sig>>`（写后签名，供主线程登记
+--- `fresh_ssig` 而无需再逐文件 stat）；失败返回 `"\0<err>"`。
+--- @param encoded string
+--- @return string
+local function _stage_write_worker(encoded)
+  local uv = vim.uv
+  local nl = encoded:find("\n", 1, true)
+  local n = nl and (tonumber(encoded:sub(1, nl - 1)) or 0) or 0
+  local pos = (nl or 0) + 1
+  local function field()
+    local colon = encoded:find(":", pos, true)
+    if not colon then return nil end
+    local len = tonumber(encoded:sub(pos, colon - 1)) or 0
+    local val = encoded:sub(colon + 1, colon + len)
+    pos = colon + len + 1
+    return val
+  end
+  local sigs = {}
+  -- 目录去重缓存：同一批内多数文件共享父目录，避免逐文件对每个路径分量重复 `fs_mkdir`
+  -- （1M 小文件时约 5 次/文件的 mkdir 是单线程写盘的主要固定开销之一）。
+  local seen_dirs = {}
+  local function mkdirp(p)
+    if not p or p == "" then return end
+    local acc = ""
+    for seg in p:gmatch("[^/]+") do
+      acc = acc .. "/" .. seg
+      if not seen_dirs[acc] then
+        seen_dirs[acc] = true
+        uv.fs_mkdir(acc, 448)
+      end
+    end
+  end
+  local function enc(s)
+    s = s or ""
+    sigs[#sigs + 1] = tostring(#s) .. ":" .. s
+  end
+  for _ = 1, n do
+    local path = field()
+    local mode = tonumber(field())
+    local content = field()
+    if path then
+      local dir = path:match("^(.*)/[^/]*$")
+      mkdirp(dir)
+      local fd, err = uv.fs_open(path, "w", mode or 420)
+      if not fd then return "\0" .. tostring(err) end
+      local off = 0
+      local ok = true
+      while off < #content do
+        local w, werr = uv.fs_write(fd, content:sub(off + 1), off)
+        if not w or w == 0 then ok = false; err = werr; break end
+        off = off + w
+      end
+      uv.fs_close(fd)
+      if not ok then return "\0" .. tostring(err) end
+      if mode then pcall(uv.fs_chmod, path, mode) end
+      -- 写后签名（与主线程 `_file_sig` 同格式）：回传后主线程无需再 fs_stat 每个文件。
+      local st = uv.fs_stat(path)
+      local sig = ""
+      if st and st.type == "file" and st.mtime then
+        sig = string.format("%s:%s:%s:%s",
+          tostring(st.mtime.sec), tostring(st.mtime.nsec), tostring(st.size), tostring(st.mode))
+      end
+      enc(path); enc(sig)
+    end
+  end
+  return "\1" .. tostring(#sigs / 2) .. "\n" .. table.concat(sigs)
+end
+
+--- 编码批量暂存写入供 `_stage_write_worker`。
+--- @param writes table 数组 { { path, mode, content } }
+--- @return string
+local function _encode_stage_writes(writes)
+  local out, n = {}, 0
+  local function f(s)
+    s = s or ""
+    return tostring(#s) .. ":" .. s
+  end
+  for _, w in ipairs(writes) do
+    out[#out + 1] = f(w.path) .. f(tostring(w.mode or 420)) .. f(w.content or "")
+    n = n + 1
+  end
+  return tostring(n) .. "\n" .. table.concat(out)
+end
+
 --- 延迟清理旧会话目录：轮换会话时**不立即** `rm -rf`——若仍有在途命令（如子 Agent 并发、
 --- 同 tick 内多工具并行）以该目录为 bind 挂载源，删除会让运行中的命令突然 ENOENT，
 --- 表现为间歇性 `cd: can't cd to ...`（暂存文件系统的原子性/竞态问题）。
@@ -116,6 +225,7 @@ end
 
 --- 在无在途尝试时清理已排队的旧会话目录（幂等；有尝试则留待 cleanup 后再触发）。
 local function _flush_pending_cleanup()
+  if state.rotation then return end
   if next(state.attempts) ~= nil then return end
   if #state.pending_cleanup == 0 then return end
   local dirs = state.pending_cleanup
@@ -129,6 +239,79 @@ local function _flush_pending_cleanup()
       vim.schedule(function() pcall(vim.fn.delete, d, "rf") end)
     end
   end
+end
+
+--- 线程内批量迁移会话暂存（纯 vim.uv，自包含）：轮换时把旧会话的暂存文件复制到新会话目录。
+--- 逐文件 `fs_copyfile` 此前在主线程执行，长会话（未发布改动多）时每个 agentEnd 都卡顿。
+--- 输入编码：`<n>\n` + n 条 `<src_len>:<src><dst_len>:<dst><kind_len>:<kind><mode_len>:<mode>`；
+--- kind: "f"（文件）| "d"（目录）。返回 "\1"。
+--- @param encoded string
+--- @return string
+local function _rotate_copy_worker(encoded)
+  local uv = vim.uv
+  local nl = encoded:find("\n", 1, true)
+  local n = nl and (tonumber(encoded:sub(1, nl - 1)) or 0) or 0
+  local pos = (nl or 0) + 1
+  local function field()
+    local colon = encoded:find(":", pos, true)
+    if not colon then return nil end
+    local len = tonumber(encoded:sub(pos, colon - 1)) or 0
+    local val = encoded:sub(colon + 1, colon + len)
+    pos = colon + len + 1
+    return val
+  end
+  local function mkdirp(p)
+    if not p or p == "" then return end
+    local acc = ""
+    for seg in p:gmatch("[^/]+") do
+      acc = acc .. "/" .. seg
+      uv.fs_mkdir(acc, 448)
+    end
+  end
+  for _ = 1, n do
+    local src = field()
+    local dst = field()
+    local kind = field()
+    local mode = tonumber(field())
+    if dst then
+      if kind == "d" then
+        mkdirp(dst)
+        if mode then pcall(uv.fs_chmod, dst, mode) end
+      else
+        local dir = dst:match("^(.*)/[^/]*$")
+        mkdirp(dir)
+        if src and src ~= "" then
+          pcall(uv.fs_copyfile, src, dst)
+          if mode then pcall(uv.fs_chmod, dst, mode) end
+        end
+      end
+    end
+  end
+  return "\1"
+end
+
+--- 编码轮换迁移任务供 `_rotate_copy_worker`。
+--- @param jobs table 数组 { { src, dst, kind, mode } }
+--- @return string
+local function _encode_copy_jobs(jobs)
+  local out, n = {}, 0
+  local function f(s)
+    s = s or ""
+    return tostring(#s) .. ":" .. s
+  end
+  for _, j in ipairs(jobs) do
+    out[#out + 1] = f(j.src) .. f(j.dst) .. f(j.kind) .. f(tostring(j.mode or 420))
+    n = n + 1
+  end
+  return tostring(n) .. "\n" .. table.concat(out)
+end
+
+--- 暂存访问前等待在途的会话轮换迁移完成（幂等）。`vim.wait` 处理事件循环，
+--- 迁移 worker 的回调可在等待期间执行；通常迁移已在线程池完成，等待耗时为 0。
+--- @param timeout_ms number|nil 等待上限（默认 60s）；关闭/重置时传更短的值避免卡住退出。
+local function _await_rotation(timeout_ms)
+  if not state.rotation then return end
+  pcall(vim.wait, timeout_ms or 60000, function() return state.rotation == nil end, 10)
 end
 
 --- 工作区暂存文件路径（每个真实路径一个稳定副本）。
@@ -167,6 +350,8 @@ local function _base_entry(attempt, real)
     and (ws.deleted or ws_staged_file or (base_type == "directory" and ws_staged_dir))
   if reuse then
     staged = ws.staged -- 复用上一次编辑的沙箱副本（含删除态），使多次编辑可叠加
+    -- 版本记在会话级 workspace（materialize 读取它）；复用后可能被写入，标记新版本。
+    ws.version = _bump_version()
   else
     staged = _workspace_path(real)
     -- 无论新建还是复制，都必须先确保暂存副本的父目录存在：
@@ -178,7 +363,10 @@ local function _base_entry(attempt, real)
       -- 保留原权限位（copyfile 不保证权限；后续 materialize 会据此恢复可执行位）。
       if stat.mode then fs.chmod(staged, _perm(stat.mode)) end
     end
-    state.workspace[real] = { staged = staged, base_hash = base_hash, mode = _perm(stat and stat.mode) }
+    state.workspace[real] = {
+      staged = staged, base_hash = base_hash, mode = _perm(stat and stat.mode),
+      version = _bump_version(),
+    }
   end
   -- 进沙箱加密：暂存视图中的高熵密钥替换为随机 token（真实文件不被改动）。
   -- view_base_hash 记录 token 化后的基线，用于「是否发生改动」判定；
@@ -271,6 +459,7 @@ end
 --- 使跨循环的文件修改保持一致（未发布的改动仍可读回/继续编辑）。
 --- @return string session_id 新会话 id
 function M.rotate_session()
+  _await_rotation()
   local old_dir = state.session_id and _workspace_dir() or nil
   local old_proc = state.process_dir_cache
   local old = state.workspace
@@ -280,6 +469,7 @@ function M.rotate_session()
   state.process_dir_cache = nil
   local migrated = {}
   local migrated_rev = {}
+  local jobs = {}
   for real, entry in pairs(old) do
     local new_path = _workspace_path(real)
     -- 目录暂存（create_directory / run_command 新建目录）不能用 fs.exists 判定：
@@ -291,14 +481,10 @@ function M.rotate_session()
     if entry.deleted then
       migrated[real] = { staged = new_path, base_hash = entry.base_hash, deleted = true, mode = entry.mode }
     elseif staged_exists then
-      fs.ensure_dir(vim.fn.fnamemodify(new_path, ":h"))
-      if is_dir then
-        fs.ensure_dir(new_path)
-        if entry.mode then fs.chmod(new_path, entry.mode) end
-      else
-        fs.copy_file(entry.staged, new_path)
-        if entry.mode then fs.chmod(new_path, entry.mode) end
-      end
+      -- 复制任务移入线程池（长会话未发布改动多时，逐文件主线程复制是 agentEnd 卡顿源）。
+      jobs[#jobs + 1] = {
+        src = entry.staged, dst = new_path, kind = is_dir and "d" or "f", mode = entry.mode,
+      }
       migrated[real] = { staged = new_path, base_hash = entry.base_hash, mode = entry.mode }
     else
       -- 暂存副本缺失（删除态未显式标记）：按删除态迁移，保持一致性。
@@ -308,11 +494,37 @@ function M.rotate_session()
   end
   state.workspace = migrated
   state.staged_to_real = migrated_rev
+  -- 新会话使用新的 overlay 私有层：清空物化记录并给迁移项新版本，下次物化全部重写。
   state.materialized = {}
+  for _, e in pairs(migrated) do e.version = _bump_version() end
   -- 旧目录延后清理（见 _defer_cleanup 注释）：避免删除仍在被 bind 挂载引用的源目录。
   _defer_cleanup(old_dir)
   _defer_cleanup(old_proc)
-  _flush_pending_cleanup()
+  local work = require("NeoAI.utils.work")
+  if #jobs == 0 or not work.available() then
+    if #jobs > 0 then
+      for _, j in ipairs(jobs) do
+        if j.kind == "d" then
+          fs.ensure_dir(j.dst)
+          if j.mode then fs.chmod(j.dst, j.mode) end
+        else
+          fs.ensure_dir(vim.fn.fnamemodify(j.dst, ":h"))
+          fs.copy_file(j.src, j.dst)
+          if j.mode then fs.chmod(j.dst, j.mode) end
+        end
+      end
+    end
+    _flush_pending_cleanup()
+    return state.session_id
+  end
+  -- 迁移在线程池完成；期间暂存访问经 `_await_rotation` 等待（通常已完成，等待为 0）。
+  state.rotation = work.run(_rotate_copy_worker, _encode_copy_jobs(jobs)):then_(function()
+    state.rotation = nil
+    _flush_pending_cleanup()
+  end, function()
+    state.rotation = nil
+    _flush_pending_cleanup()
+  end)
   return state.session_id
 end
 
@@ -321,6 +533,7 @@ end
 --- @param root string 沙箱根目录
 --- @return table
 function M.begin(attempt, root)
+  _await_rotation()
   state.workspace_root = root
   M.begin_session()
   local dir = string.format("%s/attempts/%s", root, attempt.attempt_id)
@@ -337,6 +550,7 @@ end
 --- @param real_path string
 --- @return string|nil staged_path
 function M.stage_path(attempt_id, real_path)
+  _await_rotation()
   local attempt = state.attempts[attempt_id]
   if not attempt then return nil end
   local real = _abs(real_path)
@@ -357,6 +571,7 @@ end
 --- @param real_path string
 --- @return string|nil staged_path
 function M.read_path(real_path)
+  _await_rotation()
   local real = _abs(real_path)
   local stat = vim.uv.fs_stat(real)
   if stat and stat.type == "directory" then return nil end
@@ -375,6 +590,7 @@ end
 --- @param real_path string
 --- @return boolean
 function M.view_is_dir(real_path)
+  _await_rotation()
   local real = _abs(real_path)
   local st = vim.uv.fs_stat(real)
   if st and st.type == "directory" then return true end
@@ -386,6 +602,7 @@ end
 --- 当前工作区暂存覆盖快照（供 list_files/search_files 等目录级只读工具做一致性视图）。
 --- @return table 数组 { real, staged, deleted }
 function M.workspace_overrides()
+  _await_rotation()
   local out = {}
   for real, entry in pairs(state.workspace) do
     -- fs.exists 基于 filereadable，对目录恒为 false；目录暂存（create_directory/
@@ -424,8 +641,11 @@ end
 --- 尚未发布的改动（双向互通）。删除的文件在 overlay 上以 whiteout（char 0:0）表示；
 --- 无 mknod 权限时静默跳过（此时命令仍可能看到被删的真实文件，属已知限制）。
 --- @param specs table 数组 { root, upper, work, mode }
-function M.materialize_overlay(specs)
+--- @param opts table|nil { force?: boolean } force=true 时忽略版本检查全量重物化
+---   （用于 overlay upper 被清空后重新填充，如 LSP overlay 刷新）。
+function M.materialize_overlay(specs, opts)
   if not specs or #specs == 0 then return end
+  local force = opts and opts.force == true
   for real, entry in pairs(state.workspace) do
     local spec = _match_root(real, specs)
     if spec then
@@ -433,6 +653,15 @@ function M.materialize_overlay(specs)
       local rel = spec.root == "/" and real:sub(2) or real:sub(#spec.root + 2)
       local base = (spec.mode == "bind") and spec.bind or spec.upper
       if base then
+        local mat0 = state.materialized[base]
+        local rec0 = mat0 and mat0[real]
+        -- 该 base 已按当前暂存版本物化过：跳过（不做 fs_stat/读/写）。未变项占绝大多数，
+        -- 是「暂存上万文件后每条 run_command 启动卡顿」的主要消除点；编辑/合并会递增版本。
+        -- 捕获记录（capture 签名缓存，无 version）不参与该判定：它们只用于跳过「未变的
+        -- 已捕获文件」，对应 workspace 条目仍需物化。
+        if (not force) and rec0 and rec0.version and rec0.version == entry.version then
+          -- 已物化且未改动：无需处理
+        else
         local dest = base .. "/" .. rel
         if entry.deleted then
           if spec.mode == "overlay" then
@@ -442,7 +671,7 @@ function M.materialize_overlay(specs)
             -- 记录删除态：capture 时工作线程据此判定「whiteout 未被命令重建」= 未改动而跳过。
             local mat = state.materialized[base]
             if not mat then mat = {}; state.materialized[base] = mat end
-            mat[real] = { dest = dest, deleted = true }
+            mat[real] = { dest = dest, deleted = true, version = entry.version }
           end
         elseif entry.staged and vim.fn.isdirectory(entry.staged) == 1 then
           -- 目录暂存（create_directory/ensure_dir）：在 overlay/bind 层建立同名目录，
@@ -461,12 +690,34 @@ function M.materialize_overlay(specs)
           else
             local mat = state.materialized[base]
             if not mat then mat = {}; state.materialized[base] = mat end
+            local sstat = vim.uv.fs_stat(entry.staged)
+            local dstat = vim.uv.fs_stat(dest)
+            -- 命令刚把内容写入 overlay dest（capture 的来源即 dest），merge 已把其 token 化版本
+            -- 写入暂存副本：dest 已是最新，无需再 detokenize + 回写。暂存副本若此后被编辑
+            -- （签名变化）则失效该标记，走正常回写。这是暂存量大时的主要卡顿源。
+            if entry.fresh then
+              local cur_ssig = (sstat and sstat.mtime) and string.format("%s:%s:%s:%s",
+                tostring(sstat.mtime.sec), tostring(sstat.mtime.nsec), tostring(sstat.size), tostring(sstat.mode)) or nil
+              if entry.fresh_ssig and cur_ssig == entry.fresh_ssig and dstat and dstat.mtime then
+                local old = mat[real]
+                mat[real] = {
+                  dest = dest,
+                  hash = (old and old.hash) or "sha256:fresh",
+                  ssig = cur_ssig,
+                  dsig = string.format("%s:%s:%s",
+                    tostring(dstat.mtime.sec), tostring(dstat.mtime.nsec), tostring(dstat.size)),
+                  s_sec = sstat.mtime.sec, s_nsec = sstat.mtime.nsec, s_size = sstat.size,
+                  d_sec = dstat.mtime.sec, d_nsec = dstat.mtime.nsec, d_size = dstat.size,
+                  version = entry.version,
+                }
+              end
+              entry.fresh = nil
+              entry.fresh_ssig = nil
+            end
+            local rec = mat[real]
             -- 跳过未改动的物化：暂存副本与上一次写入的 overlay 目标（mtime/大小）都未变，
             -- 则无需再次读取+detokenize+写入。暂存堆积到数千时，避免每次 run_command
             -- 开始都把所有暂存文件重写一遍。未变路径用数值字段直接比较，不做字符串格式化。
-            local sstat = vim.uv.fs_stat(entry.staged)
-            local dstat = vim.uv.fs_stat(dest)
-            local rec = mat[real]
             local unchanged = rec and rec.hash and sstat and sstat.mtime and dstat and dstat.mtime
               and rec.s_sec == sstat.mtime.sec and rec.s_nsec == sstat.mtime.nsec
               and rec.s_size == sstat.size
@@ -509,20 +760,67 @@ function M.materialize_overlay(specs)
                   d_sec = ndstat and ndstat.mtime and ndstat.mtime.sec,
                   d_nsec = ndstat and ndstat.mtime and ndstat.mtime.nsec,
                   d_size = ndstat and ndstat.size,
+                  version = entry.version,
                 }
               end
             end
           end
+        end
         end
       end
     end
   end
 end
 
+--- 文件签名（mtime.sec:mtime.nsec:size:mode），与物化记录的 `ssig` 格式一致。
+--- @param path string
+--- @return string|nil
+local function _file_sig(path)
+  local st = vim.uv.fs_stat(path)
+  if not (st and st.type == "file" and st.mtime) then return nil end
+  return string.format("%s:%s:%s:%s",
+    tostring(st.mtime.sec), tostring(st.mtime.nsec), tostring(st.size), tostring(st.mode))
+end
+
+--- 每个工作任务的条目数：把大量文件的读取/哈希/写入切成多批并发投递到线程池（默认 4 线程），
+--- 避免单个大 job 只用单核。可经 tools.sandbox.work_chunk_files 调整。
+--- @return number
+local function _work_chunk_files()
+  local n = tonumber(require("NeoAI.kernel.config_store").get("tools.sandbox.work_chunk_files"))
+  if not n or n <= 0 then return 128 end
+  return n
+end
+
+--- 把数组按 size 切块（保留顺序）
+--- @param list table
+--- @param size number
+--- @return table 块数组
+local function _chunk_list(list, size)
+  local chunks, cur = {}, {}
+  for _, v in ipairs(list) do
+    cur[#cur + 1] = v
+    if #cur >= size then chunks[#chunks + 1] = cur; cur = {} end
+  end
+  if #cur > 0 then chunks[#chunks + 1] = cur end
+  return chunks
+end
+
+--- 每批并发提交的 chunk 数上限（默认 4，与 libuv 线程池一致）：避免数百个 chunk job
+--- 一次排满队列，饿死后续 UI 关键 job（脱敏/密钥 token 化/落盘）。
+--- 可经 tools.sandbox.work_parallelism 调整。
+--- @return number
+local function _work_parallelism()
+  local n = tonumber(require("NeoAI.kernel.config_store").get("tools.sandbox.work_parallelism"))
+  if not n or n <= 0 then return 4 end
+  return n
+end
+
 --- 把已冻结候选的改动合并进工作区暂存映射，使 read_file/edit_file 能看到
 --- run_command 产生的改动（双向互通）。
 --- @param cand table 冻结候选
-function M.merge_candidate(cand)
+--- @param opts table|nil { from_command?: boolean, package?: boolean 包/生成内容跳过 token 化 }
+function M.merge_candidate(cand, opts)
+  opts = opts or {}
   for _, f in ipairs(cand.files or {}) do
     local staged = _workspace_path(f.path)
     state.staged_to_real[staged] = f.path
@@ -530,18 +828,29 @@ function M.merge_candidate(cand)
       fs.ensure_dir(vim.fn.fnamemodify(staged, ":h"))
       -- 保持沙箱视图一致：命令产生的改动也以 token 形式进入暂存映射。
       -- 高熵扫描仅对疑似密钥文件启用（具名规则仍始终生效）。
-      local secret = require("NeoAI.sandbox.secret")
-      fs.write_file(staged, secret.tokenize(f.content or "", { entropy = secret.is_secret_path(f.path) }))
+      -- 包/生成内容（site-packages、node_modules 等）不做 token 化：与结算阶段跳过密钥
+      -- 检测一致，避免对 venv/依赖树逐文件多次全文扫描（实测数十 MB 需数秒）。
+      local content = f.content or ""
+      if not opts.package then
+        local secret = require("NeoAI.sandbox.secret")
+        content = secret.tokenize(content, { entropy = secret.is_secret_path(f.path) })
+      end
+      fs.write_file(staged, content)
       if f.mode then fs.chmod(staged, f.mode) end
-      state.workspace[f.path] = { staged = staged, base_hash = f.before_hash, deleted = false, mode = f.mode }
+      state.workspace[f.path] = {
+        staged = staged, base_hash = f.before_hash, deleted = false, mode = f.mode,
+        fresh = opts.from_command == true,
+        fresh_ssig = opts.from_command and _file_sig(staged) or nil,
+        version = _bump_version(),
+      }
     elseif f.action == "delete" or f.action == "rmdir" then
       pcall(vim.fn.delete, staged, "rf")
-      state.workspace[f.path] = { staged = staged, base_hash = f.before_hash, deleted = true }
+      state.workspace[f.path] = { staged = staged, base_hash = f.before_hash, deleted = true, version = _bump_version() }
     elseif f.action == "mkdir" then
       -- 新建目录：登记为目录暂存条目（否则后续 read/list 与轮换迁移会丢失该目录）。
       fs.ensure_dir(staged)
       if f.mode then fs.chmod(staged, f.mode) end
-      state.workspace[f.path] = { staged = staged, base_hash = f.before_hash, deleted = false, mode = f.mode }
+      state.workspace[f.path] = { staged = staged, base_hash = f.before_hash, deleted = false, mode = f.mode, version = _bump_version() }
     end
   end
 end
@@ -549,8 +858,10 @@ end
 --- 异步版：暂存内容的密钥 token 化经 `secret.tokenize_many_async`（线程池）执行，
 --- 避免大量文件时全文扫描占满主线程；写入/映射登记仍在主线程。
 --- @param cand table 冻结候选
+--- @param opts table|nil { from_command?: boolean, package?: boolean }
 --- @return Deferred resolve(cand)
-function M.merge_candidate_async(cand)
+function M.merge_candidate_async(cand, opts)
+  opts = opts or {}
   local files = cand and cand.files or {}
   local texts, entropy_flags = {}, {}
   local secret = require("NeoAI.sandbox.secret")
@@ -561,34 +872,108 @@ function M.merge_candidate_async(cand)
       entropy_flags[#entropy_flags + 1] = secret.is_secret_path(f.path)
     end
   end
-  local function apply(tokenized)
+  --- 写暂存副本：写入（含内容）经线程池批量完成，主线程只登记映射与 fresh 签名。
+  --- 删除/建目录仍在主线程（数量少、无内容）。
+  --- @param tokenized table|nil
+  --- @return Deferred resolve(cand)
+  local function apply_async(tokenized)
     local ti = 0
+    local writes = {}
     for _, f in ipairs(files) do
       local staged = _workspace_path(f.path)
       state.staged_to_real[staged] = f.path
       if f.action == "create" or f.action == "modify" then
         ti = ti + 1
-        fs.ensure_dir(vim.fn.fnamemodify(staged, ":h"))
-        fs.write_file(staged, tokenized[ti] or (f.content or ""))
-        if f.mode then fs.chmod(staged, f.mode) end
-        state.workspace[f.path] = { staged = staged, base_hash = f.before_hash, deleted = false, mode = f.mode }
+        writes[#writes + 1] = {
+          path = staged, mode = f.mode, content = tokenized[ti] or (f.content or ""),
+        }
+        state.workspace[f.path] = {
+          staged = staged, base_hash = f.before_hash, deleted = false, mode = f.mode,
+          fresh = opts.from_command == true,
+          version = _bump_version(),
+        }
       elseif f.action == "delete" or f.action == "rmdir" then
         pcall(vim.fn.delete, staged, "rf")
-        state.workspace[f.path] = { staged = staged, base_hash = f.before_hash, deleted = true }
+        state.workspace[f.path] = { staged = staged, base_hash = f.before_hash, deleted = true, version = _bump_version() }
       elseif f.action == "mkdir" then
         fs.ensure_dir(staged)
         if f.mode then fs.chmod(staged, f.mode) end
-        state.workspace[f.path] = { staged = staged, base_hash = f.before_hash, deleted = false, mode = f.mode }
+        state.workspace[f.path] = { staged = staged, base_hash = f.before_hash, deleted = false, mode = f.mode, version = _bump_version() }
       end
     end
+    local function mark_fresh(sigs)
+      if not opts.from_command then return end
+      for _, w in ipairs(writes) do
+        local real = state.staged_to_real[w.path]
+        local ws = real and state.workspace[real]
+        -- 优先用工作线程写后回传的签名，避免主线程对每个暂存文件再 fs_stat。
+        if ws then ws.fresh_ssig = (sigs and sigs[w.path]) or _file_sig(w.path) end
+      end
+    end
+    --- 解析 `_stage_write_worker` 回传的 path->sig 记录。
+    --- @param encoded string
+    --- @return table
+    local function parse_sigs(encoded)
+      local sigs = {}
+      if type(encoded) ~= "string" then return sigs end
+      local nl = encoded:find("\n", 1, true)
+      if not nl then return sigs end
+      local cnt = tonumber(encoded:sub(1, nl - 1)) or 0
+      local pos = nl + 1
+      local function field()
+        local colon = encoded:find(":", pos, true)
+        if not colon then return nil end
+        local len = tonumber(encoded:sub(pos, colon - 1)) or 0
+        local val = encoded:sub(colon + 1, colon + len)
+        pos = colon + len + 1
+        return val
+      end
+      for _ = 1, cnt do
+        local path, sig = field(), field()
+        if path and sig and sig ~= "" then sigs[path] = sig end
+      end
+      return sigs
+    end
+    if #writes == 0 then return async.resolve(cand) end
+    local work = require("NeoAI.utils.work")
+    if not work.available() then
+      for _, w in ipairs(writes) do
+        fs.ensure_dir(vim.fn.fnamemodify(w.path, ":h"))
+        fs.write_file(w.path, w.content)
+        if w.mode then fs.chmod(w.path, w.mode) end
+      end
+      mark_fresh()
+      return async.resolve(cand)
+    end
+    -- 大量暂存写入：按 `work_chunk_files` 分块并发投递线程池（写盘用满多核），每块的编码
+    -- 在 `work.batched` 的 start 回调内**惰性**完成——该回调按组在主线程调用，编码与上一组
+    -- worker 的写盘重叠，避免一次性编码全部条目（1M 文件时约 20+ s 主线程）后单线程写盘。
+    local all_sigs = opts.from_command and {} or nil
+    return work.batched(_chunk_list(writes, _work_chunk_files()), _work_parallelism(), function(chunk)
+      return work.run(_stage_write_worker, _encode_stage_writes(chunk))
+    end):then_(function(results)
+      for _, res in ipairs(results) do
+        if type(res) == "string" and res:sub(1, 1) == "\0" then
+          return async.reject({ kind = "work", message = "暂存写入失败: " .. tostring(res:sub(2)) })
+        end
+        if all_sigs and type(res) == "string" and res:sub(1, 1) == "\1" then
+          local part = parse_sigs(res:sub(2))
+          for p, s in pairs(part) do all_sigs[p] = s end
+        end
+      end
+      mark_fresh(all_sigs)
+      return cand
+    end)
   end
   if #texts == 0 then
-    apply({})
-    return async.resolve(cand)
+    return apply_async({})
+  end
+  -- 包/生成内容跳过 token 化（与结算阶段跳过密钥检测一致）。
+  if opts.package then
+    return apply_async(texts)
   end
   return secret.tokenize_many_async(texts, { entropy_flags = entropy_flags }):then_(function(tokenized)
-    apply(tokenized)
-    return cand
+    return apply_async(tokenized)
   end)
 end
 
@@ -647,25 +1032,30 @@ end
 --- @param child_rel string 相对 real_root 的路径
 --- @param prefetch table|nil 工作线程预取结果 { base_exists, base_type, base_hash,
 ---   staged_is_file, staged_size }；nil 时在主线程 fs_stat/读取/哈希（同步路径）。
-local function _capture_entry(attempt, real_root, staged, child_rel, prefetch)
+--- @param cap number|nil 单文件纳入上限（字节）；nil 时读取配置（逐条读取配置在暂存上万
+---   文件时是结算主线程的固定开销，故由调用方一次性传入）。
+local function _capture_entry(attempt, real_root, staged, child_rel, prefetch, cap)
   local real = real_root .. "/" .. child_rel
   -- 仅由 materialize_overlay 带入 overlay 的 AI 暂存编辑（命令本身未改动）不产生候选：
   -- 否则只读命令（ls/cat/git status 等）会把暂存编辑重复捕获为 run_command 候选并取代
   -- 原 edit 候选；一旦该命令被拒绝，还会 invalidate 掉这条暂存编辑，表现为「已允许的
   -- 修改被回滚」。内容与当前工作区暂存一致（或已标记删除）即视为未被命令改动。
-  local ws = state.workspace[real]
-  if ws then
-    if ws.deleted then
-      -- 之前标记删除：仅当命令**重新创建**了普通文件时才视为改动（whiteout 设备节点仍跳过）。
-      local sstat = vim.uv.fs_stat(staged)
-      if not (sstat and sstat.type == "file") then return end
-    elseif ws.staged and fs.exists(ws.staged) then
-      local before = _read(ws.staged)
-      local after = _read(staged)
-      if before ~= nil and before == after then return end
+  -- `prefetch.ws_checked`：异步路径已在线程内完成该判定（含内容读取），主线程不再读盘。
+  if not (prefetch and prefetch.ws_checked) then
+    local ws = state.workspace[real]
+    if ws then
+      if ws.deleted then
+        -- 之前标记删除：仅当命令**重新创建**了普通文件时才视为改动（whiteout 设备节点仍跳过）。
+        local sstat = vim.uv.fs_stat(staged)
+        if not (sstat and sstat.type == "file") then return end
+      elseif ws.staged and fs.exists(ws.staged) then
+        local before = _read(ws.staged)
+        local after = _read(staged)
+        if before ~= nil and before == after then return end
+      end
     end
   end
-  local cap = _max_file_bytes()
+  local cap = cap or _max_file_bytes()
   local base_exists, base_type, base_hash, staged_is_file, staged_size, staged_mode
   if prefetch then
     base_exists, base_type, base_hash = prefetch.base_exists, prefetch.base_type, prefetch.base_hash
@@ -756,6 +1146,7 @@ function M.capture_overlay(attempt_id, real_root, upper_root)
     return
   end
   real_root = _abs(real_root):gsub("/$", "")
+  local cap = _max_file_bytes()
   local function walk(dir, rel)
     local handle = vim.uv.fs_scandir(dir)
     if not handle then return end
@@ -768,13 +1159,13 @@ function M.capture_overlay(attempt_id, real_root, upper_root)
         local whiteout, real_name = _is_whiteout(name, t)
         if whiteout then
           local child_rel = rel == "" and real_name or (rel .. "/" .. real_name)
-          _capture_entry(attempt, real_root, dir .. "/" .. name, child_rel)
+          _capture_entry(attempt, real_root, dir .. "/" .. name, child_rel, nil, cap)
         elseif t == "directory" then
           local child_rel = rel == "" and name or (rel .. "/" .. name)
           walk(dir .. "/" .. name, child_rel)
         elseif t == "file" then
           local child_rel = rel == "" and name or (rel .. "/" .. name)
-          _capture_entry(attempt, real_root, dir .. "/" .. name, child_rel)
+          _capture_entry(attempt, real_root, dir .. "/" .. name, child_rel, nil, cap)
         end
       end
     end
@@ -788,20 +1179,19 @@ end
 -- （仅用参数 + 纯 Lua 标准库 + vim.uv）。返回值为二进制安全的分段编码：
 --   `<n>\n` + n 条记录，每条记录由若干 `<len>:<bytes>` 字段顺序拼接。
 
---- 线程内递归遍历 overlay upper，读取 base 内容并返回编码记录。
+--- 线程内递归遍历 overlay upper，返回编码记录（base_hash 留空，由 `_base_hash_worker` 分块并行补算）。
 --- 字段：child_rel, staged, kind, base_exists, base_type, base_hash,
 ---       staged_is_file, staged_size, staged_mode
 --- kind: "file" | "whiteout" | "reconcile"（命令删除了沙箱-only 文件，供删除对账）
---- 若某文件与 `expected` 中记录的「物化内容哈希」一致，说明命令未改动它，**直接跳过**
---- （不读 base、不产出记录），避免主线程对每个暂存文件整文件读取。
+--- 未变快速判定：物化时记录的目标 mtime/size 签名（`dsig`）未变即视为命令未改动，**直接跳过**
+--- （不读文件、不做纯 Lua SHA）。
 --- @param upper_root string
 --- @param real_root string
 --- @param session_basename string 会话挂载点 basename（排除，不算命令改动）
---- @param sha_src string 纯 Lua sha256 实现源码（线程内 load 得到 hex 函数）
---- @param expected_encoded string 物化期望表（real -> hash/"D" + dest）
+--- @param expected_encoded string 物化期望表（real -> hash/"D" + dest + dsig）
+--- @param ws_encoded string 工作区暂存映射（real -> staged / "D" 删除态），供线程内做一致性判定
 --- @return string 编码记录
-local function _capture_worker(upper_root, real_root, session_basename, sha_src, expected_encoded)
-  local sha = assert(load(sha_src))()
+local function _capture_worker(upper_root, real_root, session_basename, expected_encoded, ws_encoded, cap)
   -- 解码物化期望表：real -> { hash = 内容哈希 | nil, deleted = bool, dest = 物化目标 }
   local expected = {}
   do
@@ -833,18 +1223,40 @@ local function _capture_worker(upper_root, real_root, session_basename, sha_src,
       end
     end
   end
+  -- 解码工作区暂存映射：real -> { staged, deleted }，供线程内比对「命令改动是否只是暂存编辑的复现」。
+  local wsm = {}
+  do
+    local nl = type(ws_encoded) == "string" and ws_encoded:find("\n", 1, true)
+    if nl then
+      local n = tonumber(ws_encoded:sub(1, nl - 1)) or 0
+      local pos = nl + 1
+      local function field()
+        local colon = ws_encoded:find(":", pos, true)
+        if not colon then return nil end
+        local len = tonumber(ws_encoded:sub(pos, colon - 1)) or 0
+        local val = ws_encoded:sub(colon + 1, colon + len)
+        pos = colon + len + 1
+        return val
+      end
+      for _ = 1, n do
+        local real = field()
+        local staged = field()
+        if real then wsm[real] = { deleted = (staged == "D"), staged = staged } end
+      end
+    end
+  end
+  local function read_all(path)
+    local f = io.open(path, "rb")
+    if not f then return nil end
+    local c = f:read("*a")
+    f:close()
+    return c
+  end
   local out = {}
   local count = 0
   local function enc(s)
     s = s or ""
     out[#out + 1] = tostring(#s) .. ":" .. s
-  end
-  local function base_hash_of(real, stat)
-    if not (stat and stat.type == "file") then return "" end
-    local content = ""
-    local f = io.open(real, "rb")
-    if f then content = f:read("*a") or ""; f:close() end
-    return "sha256:" .. sha(content)
   end
   --- 目标文件的廉价签名（mtime.sec:mtime.nsec:size）：用于判断物化后是否被命令改动，
   --- 未变即可跳过内容读取与哈希。
@@ -853,6 +1265,12 @@ local function _capture_worker(upper_root, real_root, session_basename, sha_src,
   local function sig_of(path)
     local st = vim.uv.fs_stat(path)
     if not (st and st.type == "file" and st.mtime) then return nil end
+    return string.format("%s:%s:%s",
+      tostring(st.mtime.sec), tostring(st.mtime.nsec), tostring(st.size))
+  end
+  --- 由 stat 直接构造目标签名（避免再 stat 一次）
+  local function dsig_of(st)
+    if not (st and st.type == "file" and st.mtime) then return "" end
     return string.format("%s:%s:%s",
       tostring(st.mtime.sec), tostring(st.mtime.nsec), tostring(st.size))
   end
@@ -872,16 +1290,39 @@ local function _capture_worker(upper_root, real_root, session_basename, sha_src,
         local child_rel = rel == "" and real_name or (rel .. "/" .. real_name)
         local real = real_root .. "/" .. child_rel
         local exp = expected[real]
+        --- 线程内工作区一致性判定：命令改动是否只是 AI 暂存编辑的复现（或删除态）。
+        --- 与 `_capture_entry` 的 ws 分支同口径，但内容读取移到工作线程，避免主线程逐文件读盘。
+        --- @param dest string overlay 中实际路径
+        --- @param sstat table|nil dest 的 stat
+        --- @return boolean skip 是否跳过（不产生候选）
+        local function ws_skip(dest, sstat)
+          local w = wsm[real]
+          if not w then return false end
+          if w.deleted then
+            -- 之前标记删除：仅当命令**重新创建**了普通文件时才视为改动（whiteout 设备节点仍跳过）。
+            return not (sstat and sstat.type == "file")
+          end
+          if w.staged ~= "" then
+            local before = read_all(w.staged)
+            local after = read_all(dest)
+            if before ~= nil and before == after then return true end
+          end
+          return false
+        end
         if whiteout then
           if exp and exp.deleted then
             -- 期望即删除态且未被命令重建：未改动，跳过（不产生候选）。
           else
-            local stat = vim.uv.fs_stat(real)
-            -- whiteout 删除的是基线文件，base_hash 需与真实内容一致（CAS 冲突检测依赖）。
-            enc(child_rel); enc(dir .. "/" .. name); enc("whiteout")
-            enc(stat and "1" or "0"); enc(stat and stat.type or ""); enc(base_hash_of(real, stat))
-            enc("0"); enc("0"); enc("0")
-            count = count + 1
+            local staged_path = dir .. "/" .. name
+            local sstat = vim.uv.fs_stat(staged_path)
+            if not ws_skip(staged_path, sstat) then
+              local stat = vim.uv.fs_stat(real)
+              -- whiteout 删除的是基线文件，base_hash 需与真实内容一致（CAS 冲突检测依赖）。
+              enc(child_rel); enc(staged_path); enc("whiteout")
+              enc(stat and "1" or "0"); enc(stat and stat.type or ""); enc("")
+              enc("0"); enc("0"); enc("0"); enc("")
+              count = count + 1
+            end
           end
         elseif t == "directory" then
           walk(dir .. "/" .. name, child_rel)
@@ -898,12 +1339,23 @@ local function _capture_worker(upper_root, real_root, session_basename, sha_src,
           if not unchanged then
             local stat = vim.uv.fs_stat(real)
             local sstat = vim.uv.fs_stat(dest)
-            enc(child_rel); enc(dest); enc("file")
-            enc(stat and "1" or "0"); enc(stat and stat.type or ""); enc(base_hash_of(real, stat))
-            enc((sstat and sstat.type == "file") and "1" or "0")
-            enc(tostring(sstat and sstat.size or 0))
-            enc(tostring(sstat and sstat.mode or 0))
-            count = count + 1
+            if cap > 0 and sstat and sstat.type == "file" and (sstat.size or 0) > cap then
+              -- 超大文件：不纳入候选，且 base_type 留空 → 不进入 `need`（避免主线程侧
+              -- `_base_hash_worker` 读取/哈希数百 MB）。编码 skip 记录供主线程记日志。
+              enc(child_rel); enc(dest); enc("skip")
+              enc("0"); enc(""); enc("")
+              enc("1"); enc(tostring(sstat.size or 0)); enc(tostring(sstat.mode or 0))
+              enc(dsig_of(sstat))
+              count = count + 1
+            elseif not ws_skip(dest, sstat) then
+              enc(child_rel); enc(dest); enc("file")
+              enc(stat and "1" or "0"); enc(stat and stat.type or ""); enc("")
+              enc((sstat and sstat.type == "file") and "1" or "0")
+              enc(tostring(sstat and sstat.size or 0))
+              enc(tostring(sstat and sstat.mode or 0))
+              enc(dsig_of(sstat))
+              count = count + 1
+            end
           end
         end
       end
@@ -916,7 +1368,7 @@ local function _capture_worker(upper_root, real_root, session_basename, sha_src,
     if exp.hash and exp.dest then
       if not vim.uv.fs_lstat(exp.dest) and not vim.uv.fs_lstat(real) then
         enc(real); enc(""); enc("reconcile")
-        enc("0"); enc(""); enc(""); enc("0"); enc("0"); enc("0")
+        enc("0"); enc(""); enc(""); enc("0"); enc("0"); enc("0"); enc("")
         count = count + 1
       end
     end
@@ -938,6 +1390,29 @@ local function _encode_expected(mat)
     if type(rec) == "table" then
       local h = rec.deleted and "D" or (rec.hash or "")
       out[#out + 1] = f(real) .. f(h) .. f(rec.dest or "") .. f(rec.dsig or "")
+      n = n + 1
+    end
+  end
+  return tostring(n) .. "\n" .. table.concat(out)
+end
+
+--- 编码工作区暂存映射（real -> staged / "D" 删除态）供 `_capture_worker` 做一致性判定。
+--- `root` 非空时只编码该根子树内的条目：工作线程仅会查询本次捕获根下的路径，全量编码整个
+--- 工作区（暂存上万文件）在主线程是固定大开销。
+--- @param ws_map table state.workspace
+--- @param root string|nil
+--- @return string
+local function _encode_ws(ws_map, root)
+  local out, n = {}, 0
+  local function f(s)
+    s = s or ""
+    return tostring(#s) .. ":" .. s
+  end
+  local prefix = root and (root .. "/") or nil
+  for real, ws in pairs(ws_map or {}) do
+    if not prefix or real == root or real:sub(1, #prefix) == prefix then
+      local staged = ws.deleted and "D" or (ws.staged or "")
+      out[#out + 1] = f(real) .. f(staged)
       n = n + 1
     end
   end
@@ -991,8 +1466,63 @@ local function _decode_records(encoded, nfields)
   return out
 end
 
+--- 编码真实路径数组供工作线程计算 base 哈希（字段：real）
+--- @param reals table 路径数组
+--- @return string
+local function _encode_paths(reals)
+  local out = {}
+  for _, p in ipairs(reals) do
+    p = p or ""
+    out[#out + 1] = tostring(#p) .. ":" .. p
+  end
+  return tostring(#reals) .. "\n" .. table.concat(out)
+end
+
+--- 线程内批量计算 base（真实盘）文件的内容哈希：命令改动的文件需与基线做 CAS 冲突检测，
+--- 此哈希此前在 overlay 遍历的单个 job 内串行完成（大量改动时纯 Lua SHA 单核打满）。
+--- 现由主线程按批并发投递到线程池。字段：base_hash（sha256:... 或空）。
+--- @param input string 编码的真实路径数组
+--- @param sha_src string 纯 Lua sha256 实现源码
+--- @return string 编码的哈希数组
+local function _base_hash_worker(input, sha_src, cap)
+  local sha = assert(load(sha_src))()
+  cap = tonumber(cap) or 0
+  local nl = type(input) == "string" and input:find("\n", 1, true)
+  local n = nl and (tonumber(input:sub(1, nl - 1)) or 0) or 0
+  local pos = (nl or 0) + 1
+  local out = {}
+  local function field()
+    local colon = input:find(":", pos, true)
+    if not colon then return nil end
+    local len = tonumber(input:sub(pos, colon - 1)) or 0
+    local val = input:sub(colon + 1, colon + len)
+    pos = colon + len + 1
+    return val
+  end
+  local function enc(s)
+    s = s or ""
+    out[#out + 1] = tostring(#s) .. ":" .. s
+  end
+  for _ = 1, n do
+    local real = field()
+    local st = real and vim.uv.fs_stat(real)
+    local h = ""
+    -- 超大 base 文件不读取/哈希：候选本就因超过上限被跳过（见 `_capture_worker`），
+    -- 在此哈希会白读数百 MB 并占用线程池（日志中同一批超大文件每条命令重复出现即此因）。
+    if st and st.type == "file" and not (cap > 0 and (st.size or 0) > cap) then
+      local content = ""
+      local f = io.open(real, "rb")
+      if f then content = f:read("*a") or ""; f:close() end
+      h = "sha256:" .. sha(content)
+    end
+    enc(h)
+  end
+  return tostring(n) .. "\n" .. table.concat(out)
+end
+
 --- 异步登记 overlay 改动：遍历/读取/哈希 base 在 utils.work 线程池执行，
 --- 主线程仅按预取结果登记 mapping（工作区跳过/上限判定仍与同步版一致）。
+--- 遍历（scandir+stat）在单个 job；base 内容哈希按 `work_chunk_files` 分块并发补算（多核）。
 --- @param attempt_id string
 --- @param real_root string
 --- @param upper_root string
@@ -1008,34 +1538,91 @@ function M.capture_overlay_async(attempt_id, real_root, upper_root)
   local root = _abs(real_root):gsub("/$", "")
   local session_basename = require("NeoAI.sandbox.conceal").session_basename()
   local sha_src = require("NeoAI.utils.sha256").source
+  local cap = _max_file_bytes()
   local expected_encoded = _encode_expected(state.materialized[upper_root])
-  return work.run(_capture_worker, upper_root, root, session_basename, sha_src, expected_encoded):then_(function(encoded)
-    local recons = {}
-    for _, rec in ipairs(_decode_records(encoded, 9)) do
-      local child_rel, staged, kind = rec[1], rec[2], rec[3]
-      if kind == "reconcile" then
-        recons[#recons + 1] = child_rel
-      elseif kind == "whiteout" then
-        _capture_entry(attempt, root, staged, child_rel, {
-          base_exists = rec[4] == "1",
-          base_type = (rec[5] ~= "" and rec[5]) or nil,
-          base_hash = (rec[6] ~= "" and rec[6]) or nil,
-          staged_is_file = false,
-          staged_size = 0,
-          staged_mode = 0,
-        })
-      elseif kind == "file" then
-        _capture_entry(attempt, root, staged, child_rel, {
-          base_exists = rec[4] == "1",
-          base_type = (rec[5] ~= "" and rec[5]) or nil,
-          base_hash = (rec[6] ~= "" and rec[6]) or nil,
-          staged_is_file = rec[7] == "1",
-          staged_size = tonumber(rec[8]) or 0,
-          staged_mode = tonumber(rec[9]) or 0,
-        })
+  local ws_encoded = _encode_ws(state.workspace, root)
+  return work.run(_capture_worker, upper_root, root, session_basename, expected_encoded, ws_encoded, cap):then_(function(encoded)
+    local records = _decode_records(encoded, 10)
+    -- 需要 base 内容哈希的记录（base 为文件）：由分块并行 job 补算。
+    local need = {}
+    for i, rec in ipairs(records) do
+      if rec[5] == "file" then
+        need[#need + 1] = { idx = i, real = root .. "/" .. rec[1] }
       end
     end
-    _apply_reconcile(recons)
+    local function apply_all()
+      local recons = {}
+      local mat = state.materialized[upper_root]
+      --- 记录本次处理过的路径及其目标签名：下次捕获未变即在工作线程内跳过，
+      --- 不再重复遍历/读/哈希/派发（「同一文件不重复处理」的核心）。
+      local function remember(real, dest, dsig, deleted)
+        if not mat then mat = {}; state.materialized[upper_root] = mat end
+        if deleted then
+          mat[real] = { dest = dest, deleted = true }
+        elseif dsig and dsig ~= "" then
+          mat[real] = { dest = dest, hash = "sha256:captured", dsig = dsig }
+        end
+      end
+      for _, rec in ipairs(records) do
+        local child_rel, staged, kind = rec[1], rec[2], rec[3]
+        local real = root .. "/" .. child_rel
+        if kind == "reconcile" then
+          recons[#recons + 1] = child_rel
+        elseif kind == "whiteout" then
+          _capture_entry(attempt, root, staged, child_rel, {
+            base_exists = rec[4] == "1",
+            base_type = (rec[5] ~= "" and rec[5]) or nil,
+            base_hash = (rec[6] ~= "" and rec[6]) or nil,
+            staged_is_file = false,
+            staged_size = 0,
+            staged_mode = 0,
+            ws_checked = true,
+          }, cap)
+          remember(real, staged, nil, true)
+        elseif kind == "file" then
+          _capture_entry(attempt, root, staged, child_rel, {
+            base_exists = rec[4] == "1",
+            base_type = (rec[5] ~= "" and rec[5]) or nil,
+            base_hash = (rec[6] ~= "" and rec[6]) or nil,
+            staged_is_file = rec[7] == "1",
+            staged_size = tonumber(rec[8]) or 0,
+            staged_mode = tonumber(rec[9]) or 0,
+            ws_checked = true,
+          }, cap)
+          remember(real, staged, rec[10])
+        elseif kind == "skip" then
+          -- 超过单文件上限：不纳入候选，仅记录（与同步路径同一日志口径），并记目标签名，
+          -- 下次捕获未变即跳过（不再重复日志/哈希）。
+          remember(real, staged, rec[10])
+          pcall(function()
+            require("NeoAI.kernel.logger").warn(
+              "[sandbox] 跳过超大候选文件（%d 字节 > 上限 %d）：%s",
+              tonumber(rec[8]) or 0, cap, real)
+          end)
+        end
+      end
+      _apply_reconcile(recons)
+    end
+    if #need == 0 then
+      apply_all()
+      return
+    end
+    return work.batched(_chunk_list(need, _work_chunk_files()), _work_parallelism(), function(chunk)
+      local reals = {}
+      for _, item in ipairs(chunk) do reals[#reals + 1] = item.real end
+      return work.run(_base_hash_worker, _encode_paths(reals), sha_src, cap):then_(function(henc)
+        return _decode_records(henc, 1)
+      end)
+    end):then_(function(chunk_hashes)
+      local k = 0
+      for _, hashes in ipairs(chunk_hashes) do
+        for _, h in ipairs(hashes) do
+          k = k + 1
+          records[need[k].idx][6] = h[1] or ""
+        end
+      end
+      apply_all()
+    end)
   end)
 end
 
@@ -1204,29 +1791,6 @@ local function _encode_entries(entries)
   return tostring(n) .. "\n" .. table.concat(out)
 end
 
---- 每个工作任务的条目数：把大量文件的读取/哈希切成多批并发投递到线程池（默认 4 线程），
---- 避免单个大 job 只用单核。可经 tools.sandbox.work_chunk_files 调整。
---- @return number
-local function _work_chunk_files()
-  local n = tonumber(require("NeoAI.kernel.config_store").get("tools.sandbox.work_chunk_files"))
-  if not n or n <= 0 then return 128 end
-  return n
-end
-
---- 把数组按 size 切块（保留顺序）
---- @param list table
---- @param size number
---- @return table 块数组
-local function _chunk_list(list, size)
-  local chunks, cur = {}, {}
-  for _, v in ipairs(list) do
-    cur[#cur + 1] = v
-    if #cur >= size then chunks[#chunks + 1] = cur; cur = {} end
-  end
-  if #cur > 0 then chunks[#chunks + 1] = cur end
-  return chunks
-end
-
 --- 异步冻结：暂存文件读取/哈希在 utils.work 线程池执行；主线程据预取结果组装候选。
 --- 按 `work_chunk_files` 分块并发提交，使大量文件时用满线程池（多核）而非单核串行。
 --- @param attempt_id string
@@ -1241,11 +1805,9 @@ function M.finish_async(attempt_id)
   if #entries == 0 then return async.resolve(M.finish(attempt_id, {})) end
   local sha_src = require("NeoAI.utils.sha256").source
   local cap = _max_file_bytes()
-  local jobs = {}
-  for _, chunk in ipairs(_chunk_list(entries, _work_chunk_files())) do
-    jobs[#jobs + 1] = work.run(_finish_worker, _encode_entries(chunk), cap, sha_src)
-  end
-  return async.all(jobs):then_(function(results)
+  return work.batched(_chunk_list(entries, _work_chunk_files()), _work_parallelism(), function(chunk)
+    return work.run(_finish_worker, _encode_entries(chunk), cap, sha_src)
+  end):then_(function(results)
     local prefetch = {}
     for _, encoded in ipairs(results) do
       for _, rec in ipairs(_decode_records(encoded, 6)) do
@@ -1394,8 +1956,10 @@ function M.cleanup(attempt_id)
   _flush_pending_cleanup()
 end
 
---- 重置（测试用）
-function M.reset()
+--- 重置（测试用 / 关闭时）
+--- @param timeout_ms number|nil 等待在途轮换迁移的上限（默认 60s；关闭时传短值避免卡住退出）
+function M.reset(timeout_ms)
+  _await_rotation(timeout_ms)
   for _, attempt in pairs(state.attempts) do
     _make_removable(attempt.dir)
     pcall(vim.fn.delete, attempt.dir, "rf")
@@ -1410,11 +1974,14 @@ function M.reset()
   pcall(vim.fn.delete, require("NeoAI.sandbox.conceal").base_host(), "rf")
   state.workspace = {}
   state.staged_to_real = {}
+  _path_key_cache = {}
   state.session_id = nil
   state.session_seq = 0
   state.process_dir_cache = nil
   state.pending_cleanup = {}
   state.materialized = {}
+  state.version = 0
+  state.rotation = nil
 end
 
 return M

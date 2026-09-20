@@ -43,6 +43,7 @@ local state = {
   -- 待审摘要缓存：待审堆积到数千时，状态栏每次重绘都全量扫描会随轮次线性变慢；
   -- 任何变更单元写操作（_persist）都会失效缓存，下次读取时重算一次。
   pending_cache = nil,
+  pending_items = nil, -- PENDING 项缓存（_pending_items 维护；任何写操作失效）
   ref_scans = 0, -- 诊断：`_candidate_referenced` 全表扫描次数（测试断言批量删除不再逐项扫描）
 }
 
@@ -63,6 +64,26 @@ local function _ensure_loaded()
     if id and not state.items[id] then state.items[id] = item end
   end
   state.pending_cache = nil
+  state.pending_items = nil
+end
+
+--- 待审项缓存（按 created_at 升序）。`supersede_by_paths`/包合并每次工具调用都要遍历待审项，
+--- 若每次都对**全部**变更单元（含大量终态项）过滤 + 排序，长会话会逐渐变慢；这里增量维护。
+--- 任何写操作（`_persist`）都会失效，下次重建一次。
+--- @return table 数组（PENDING 且有文件/主机操作提案）
+local function _pending_items()
+  if state.pending_items then return state.pending_items end
+  _ensure_loaded()
+  local out = {}
+  for _, item in pairs(state.items) do
+    if item.review_state == M.REVIEW.PENDING then
+      local has_files = (item.files and #item.files > 0) or (item.write_set and #item.write_set > 0)
+      if has_files or item.kind == "host_op" then out[#out + 1] = item end
+    end
+  end
+  table.sort(out, function(a, b) return (a.created_at or 0) < (b.created_at or 0) end)
+  state.pending_items = out
+  return out
 end
 
 local function _emit(event, payload)
@@ -71,8 +92,9 @@ local function _emit(event, payload)
 end
 
 local function _persist(item)
-  -- 写盘即视为状态变更：失效待审摘要缓存（pending_summary 会重算并缓存）。
+  -- 写盘即视为状态变更：失效待审摘要缓存（pending_summary 会重算并缓存）与待审项缓存。
   state.pending_cache = nil
+  state.pending_items = nil
   -- 异步落盘（文件写入移入线程池）：待审项含候选文件内容，大候选时同步 fsync 会卡主线程。
   -- 内存态是权威来源，store 的写缓存保证刚写入即可同步读回；reset/shutdown 前会 flush。
   pcall(store.write_review_async, item)
@@ -205,7 +227,7 @@ local function _store_snapshot(item, entries, operation_id)
     updated_at = os.time(),
     files = entries,
   }
-  store.write_snapshot(rec)
+  store.write_snapshot_async(rec)
   item.snapshot_id = rec.snapshot_id
   return rec
 end
@@ -292,7 +314,7 @@ function M.undo(id, opts)
   end
   rec.state = (rec.state == M.APPLY.APPLIED) and M.APPLY.REVERTED or M.APPLY.APPLIED
   rec.updated_at = os.time()
-  store.write_snapshot(rec)
+  store.write_snapshot_async(rec)
   item.apply_state = rec.state
   item.reverted_at = (rec.state == M.APPLY.REVERTED) and os.time() or nil
   state.items[id] = item
@@ -336,7 +358,7 @@ local function _merge_package_item(item, cand)
   local key = item.package_key
   if type(key) ~= "string" or key == "" then return item end
   local members = {}
-  for _, it in ipairs(M.list({ review_state = M.REVIEW.PENDING })) do
+  for _, it in ipairs(_pending_items()) do
     if it.change_set_id ~= item.change_set_id and it.package_key == key then
       members[#members + 1] = it
     end
@@ -365,7 +387,7 @@ local function _merge_package_item(item, cand)
     candidate_digest = digest, files = files, created_at = os.time(),
     effect = base.effect or cand.effect, command_id = cand.command_id,
   }
-  store.write_candidate(newcand)
+  store.write_candidate_async(newcand)
   local to_discard = {}
   -- 其余同键成员并入 base：标记取代并丢弃各自候选。
   for i = 2, #members do
@@ -686,7 +708,7 @@ local function _requeue_remaining(item, remaining)
     effect = item.effect,
     command_id = item.command_id,
   }
-  store.write_candidate(newcand)
+  store.write_candidate_async(newcand)
   return M.enqueue(newcand, {
     tool = item.tool,
     revision = item.revision or 1,
@@ -802,7 +824,13 @@ function M.apply(id, opts)
     item.applied_at = os.time()
     item.receipt = pub.receipt
     store.write_receipt(pub.receipt)
-    _discard_candidate(item.candidate_digest)
+    -- 批量应用（apply_all）时把候选删除推迟到循环结束后一次性对账，避免对每个候选
+    -- 做一次全表引用扫描（O(n²)）；单项应用仍即时删除。
+    if opts._defer_discard then
+      opts._defer_discard[item.candidate_digest] = true
+    else
+      _discard_candidate(item.candidate_digest)
+    end
     _store_snapshot(item, snapshot_entries, pub.receipt.operation_id)
     _persist(item)
     -- 仅应用了部分文件：其余文件保留待审，供用户逐个确认
@@ -839,13 +867,20 @@ end
 function M.apply_all(opts)
   opts = opts or {}
   local result = { applied = 0, failed = 0 }
-  local items = opts.only_approved
-    and M.list({ review_state = M.REVIEW.APPROVED })
-    or M.list({ review_state = M.REVIEW.PENDING })
+  local items
+  if opts.only_approved then
+    items = M.list({ review_state = M.REVIEW.APPROVED })
+  else
+    items = _pending_items()
+  end
+  -- 候选删除推迟到全部应用结束后批量对账：`_discard_candidates` 只做一次引用统计，
+  -- 避免逐项 `_candidate_referenced` 全表扫描在大批量应用时退化为 O(n²)。
+  local deferred = {}
   for _, item in ipairs(items) do
-    local res = M.apply(item.change_set_id, { auto_approve = true })
+    local res = M.apply(item.change_set_id, { auto_approve = true, _defer_discard = deferred })
     if res.ok then result.applied = result.applied + 1 else result.failed = result.failed + 1 end
   end
+  _discard_candidates(deferred)
   return result
 end
 
@@ -873,7 +908,7 @@ end
 function M.discard_by_digest(digest, reason)
   if not digest then return 0 end
   local n = 0
-  for _, item in ipairs(M.list({ review_state = M.REVIEW.PENDING })) do
+  for _, item in ipairs(_pending_items()) do
     if item.candidate_digest == digest then
       item.review_state = M.REVIEW.REJECTED
       item.reject_reason = reason or "DISCARDED"
@@ -902,7 +937,7 @@ function M.supersede_by_paths(paths, except_id)
   if not next(set) then return 0 end
   local n = 0
   local to_discard = {}
-  for _, item in ipairs(M.list({ review_state = M.REVIEW.PENDING })) do
+  for _, item in ipairs(_pending_items()) do
     if item.change_set_id ~= except_id then
       local overlap = false
       for _, f in ipairs(item.files or {}) do
@@ -1109,7 +1144,7 @@ function M.derive_revision(parent_id, opts)
     effect = parent.effect,
     command_id = parent.command_id,
   }
-  store.write_candidate(newcand)
+  store.write_candidate_async(newcand)
   -- 原变更单元标记 SUPERSEDED，不迁移旧批准
   parent.review_state = M.REVIEW.SUPERSEDED
   state.items[parent_id] = parent
@@ -1134,6 +1169,7 @@ function M.reset()
   state.session_auto = nil
   state.loaded = false
   state.pending_cache = nil
+  state.pending_items = nil
   state.ref_scans = 0
 end
 

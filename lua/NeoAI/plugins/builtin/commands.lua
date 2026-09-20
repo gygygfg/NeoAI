@@ -12,7 +12,7 @@ local COMMANDS = {
   "NeoAIStatusline", "NeoAITest", "NeoAIChatStatus", "NeoAICycleDisplay",
   "NeoAIReloadDisplay", "NeoAIPlan", "NeoAIAuto", "NeoAIReloadAll",
   "NeoAIApprovePlan", "NeoAISandboxCommit", "NeoAISandboxDiscard",
-  "NeoAISandboxList", "NeoAISandboxShow", "NeoAISandboxCaps",
+  "NeoAISandboxList", "NeoAISandboxShow", "NeoAISandboxCaps", "NeoAISandboxDiag",
   "NeoAISandboxReview", "NeoAISandboxApprove", "NeoAISandboxReject",
   "NeoAISandboxApply", "NeoAISandboxApplyAll",
   "NeoAISandboxGrant", "NeoAISandboxRevoke", "NeoAISandboxPrune", "NeoAISandboxMetrics",
@@ -261,6 +261,27 @@ function M.start()
     parts[#parts + 1] = "overlay_fail_closed=" .. tostring(scfg.overlay_fail_closed ~= false)
     vim.notify("[NeoAI] 沙箱能力: " .. table.concat(parts, " "), vim.log.levels.INFO)
   end, { desc = "显示沙箱运行时能力探测结果" })
+
+  --- 137 / OOM 归因：采集宿主/容器 cgroup 限制、负载与已解析沙箱限制
+  _cmd("NeoAISandboxDiag", function()
+    local ok, diag = pcall(require, "NeoAI.sandbox.diag")
+    if not ok or type(diag.sandbox_limits) ~= "function" then
+      vim.notify("[NeoAI] 诊断模块不可用", vim.log.levels.WARN)
+      return
+    end
+    local info = diag.sandbox_limits()
+    local lines = {}
+    for _, k in ipairs({
+      "pid1", "systemd", "nproc", "loadavg", "mem_total_kb",
+      "root_memory_max", "root_memory_events", "root_pids_max", "root_pids_events",
+      "neoai_cpu_max", "neoai_memory_max", "resolved_limits",
+    }) do
+      local v = info[k]
+      if type(v) == "table" then v = vim.inspect(v):gsub("%s+", " ") end
+      lines[#lines + 1] = string.format("%s=%s", k, tostring(v))
+    end
+    vim.notify("[NeoAI] 沙箱诊断:\n" .. table.concat(lines, "\n"), vim.log.levels.INFO)
+  end, { desc = "显示沙箱资源域/负载诊断（137/OOM 归因）" })
 
   --- 异步审批：列出待审修改（按路径级别高亮），选择应用
   _cmd("NeoAISandboxReview", function()

@@ -137,17 +137,51 @@ local function _render(keep_view)
   end
   if state.win_id and vim.api.nvim_win_is_valid(state.win_id) then
     vim.api.nvim_win_call(state.win_id, function()
-      -- 每次重写 buffer 后，expr 折叠并不会自动重算（带 UI 会话里 nvim_buf_set_lines
-      -- 不触发 foldexpr 求值，导致 foldlevel 全为 0、折叠失效）。先 zx 强制按 foldexpr
-      -- 重算折叠。光标跟随（底部）且非仅刷新折叠文本时 zM 全部收起（zc 只对光标处的折叠生效，
-      -- 其它位置会报 E490）；其余情况（光标不跟随——用户回看上方、或仅刷新折叠文本）只重算、
-      -- 不收起，并把重写前已展开的折叠重新展开，保留用户当前查看的折叠状态
-      -- （zx 会保留手动开合的折叠状态，但整块 buffer 重写会丢失它）。
-      if state.following and not keep_view then
-        vim.cmd("silent! normal! zxzM")
-      else
-        vim.cmd("silent! normal! zx")
-        -- 记录光标位置，重开折叠后恢复：不能让用户正在查看的位置被拽走。
+      -- 折叠由 nvim 在 buffer 变更后按 foldexpr 自动重算。这里**不再**整块 `zx`/`zM`：
+      -- 那会对整个 buffer 重新求值折叠并刷新所有旧折叠文本（旧块摘要闪烁、视口跳动），
+      -- 还会覆盖用户手动开合的折叠。只处理本次写入区间内的折叠，区间外旧折叠保持原状。
+      local from, to = incremental.written_range(diff)
+      -- 就地改写折叠首行（行数不变的局部替换，如工具耗时刷新）会触发 nvim 增量折叠更新的
+      -- 缺陷：该折叠的结束行被截断，折叠内容泄漏到折叠外（表现为折叠文本下方一行行露出
+      -- 内容）。这里检测写入区间是否命中折叠首行，命中则重新赋值 foldexpr 强制整段折叠
+      -- 重算以修正边界；该操作不会关闭用户已展开的折叠，且仅在行数不变时触发，代价可控。
+      if from > 0 and diff.inserted == diff.removed then
+        local need_recompute = false
+        for ln = from, to do
+          local prev_lvl = (ln > 1) and vim.fn.foldlevel(ln - 1) or 0
+          local lvl = vim.fn.foldlevel(ln)
+          if lvl > 0 and lvl > prev_lvl then
+            need_recompute = true
+            break
+          end
+        end
+        if need_recompute then
+          local expr = vim.wo[state.win_id].foldexpr
+          vim.wo[state.win_id].foldexpr = expr
+        end
+      end
+      -- 仅当写入区间命中**渲染前就已展开**的折叠首行时才跳过 foldclose!：此时收起再 `zo`
+      -- 重开会造成用户正在查看的块闪烁。不能用写入后的 foldclosed 判定——改写行本身可能让
+      -- 折叠短暂呈现为「展开」，据此跳过 foldclose! 会让原本收起的块持续露出内容
+      -- （工具每秒耗时刷新会反复命中，表现为内容被刷到折叠外又回去）。
+      local in_open_fold = false
+      if from > 0 and keep_view then
+        for _, ln in ipairs(open_folds) do
+          if ln >= from and ln <= to then
+            in_open_fold = true
+            break
+          end
+        end
+      end
+      if from > 0 and not in_open_fold then
+        -- 新到达/更新的块默认收起。`foldclose!` 会关闭与区间重叠的折叠（即使折叠首行
+        -- 在区间之前，如流式追加进已有块），因此区间外旧折叠的开合状态不受影响。
+        pcall(vim.cmd, ("silent! %d,%dfoldclose!"):format(from, to))
+      end
+      -- 保留用户已展开的折叠：不跟随时（用户回看上方）或仅刷新折叠文本时，
+      -- 把重写前已展开的折叠重新展开（区间 foldclose! 可能关掉了与区间重叠的那个）。
+      -- 增量写入时 nvim 本身会保留手动开合状态，此处只对可能被关掉的块做兜底恢复。
+      if (not state.following) or keep_view then
         local cur = vim.api.nvim_win_get_cursor(state.win_id)
         for _, ln in ipairs(open_folds) do
           if vim.fn.foldclosed(ln) ~= -1 then
@@ -182,7 +216,7 @@ local function _scroll_to_end()
 end
 
 -- 渲染合并：流式分片 / 工具事件在同一个事件循环 tick 内可能连续触发多次，
--- 每次都同步全量重渲染 + zxzM 折叠重算会占满主线程，第二/多轮（历史消息更多）
+-- 每次都同步全量重渲染 + 折叠重算会占满主线程，第二/多轮（历史消息更多）
 -- 时尤其明显，表现为"主界面卡住"。这里把渲染延后到本 tick 结束，合并为一次。
 local render_scheduled = false
 local render_pending_follow = false
@@ -225,7 +259,7 @@ local function _schedule_render(keep_view)
   end
   render_scheduled = true
   render_flushed = false
-  -- 在渲染前判断是否跟随（_render 内 zxzM 会把光标从收起的折叠块内拽到折叠首行，
+  -- 在渲染前判断是否跟随（_render 内收起折叠会把光标从折叠块内拽到折叠首行，
   -- 渲染后再判断会导致跟随失效），把决定缓存在调度时，并同步给 state.following
   -- （不跟随时用于抑制思考悬浮窗弹出与折叠收起）。
   render_pending_follow = _cursor_within_follow_margin()

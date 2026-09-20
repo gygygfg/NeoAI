@@ -227,33 +227,82 @@ end
 
 -- ========== eBPF 后端 ==========
 
+--- 线程内解析 bpftrace 输出：按行切分、仅保留文件事件、按路径去重，返回以 `\n` 连接的唯一
+--- 路径。自包含（仅字符串操作，无 upvalue），可 `string.dump` 到工作线程执行——把构建/测试
+--- 产生的百万级事件的解析移出主线程；主线程只需对去重后的少量路径做留痕/密钥判定。
+--- @param text string 若干完整行（以 `\n` 结尾）
+--- @return string 唯一路径以 `\n` 连接
+local function _parse_file_paths(text)
+  local seen, out, n = {}, {}, 0
+  local pos = 1
+  while true do
+    local nl = text:find("\n", pos, true)
+    if not nl then break end
+    local line = text:sub(pos, nl - 1)
+    pos = nl + 1
+    local tag, rest = line:match("^(%a)\t[^\t]+\t%d+\t(.*)$")
+    if tag == "F" and rest and rest ~= "" then
+      local p = (rest:gsub("[%z\1-\31\127]", ""))
+      if p ~= "" and not seen[p] then seen[p] = true; n = n + 1; out[n] = p end
+    end
+  end
+  return table.concat(out, "\n")
+end
+
 --- @param opts table { cgroup_id, on_event, on_error? }
 --- @return table|nil handle
 --- @return string|nil err
 local function _start_ebpf(opts)
   local cg_id = tonumber(opts.cgroup_id)
   if not cg_id then return nil, "OBSERVE_NO_CGROUP" end
-  local handle = { backend = "ebpf", stopped = false, pending = "", ready = false }
+  local work = require("NeoAI.utils.work")
+  local offload = work.available()
+  local handle = {
+    backend = "ebpf", stopped = false, pending = "", ready = false,
+    inflight = 0, queue = {},
+  }
   local function emit(evt)
     if evt and opts.on_event then pcall(opts.on_event, evt) end
   end
-  local function feed(text)
-    handle.pending = handle.pending .. (text or "")
-    local start = 1
+  --- 解析结果（唯一路径串）→ 逐条派发文件事件
+  local function emit_encoded(encoded)
+    if type(encoded) ~= "string" or encoded == "" then return end
+    local pos = 1
     while true do
-      local nl = handle.pending:find("\n", start, true)
-      if not nl then
-        handle.pending = handle.pending:sub(start)
-        break
-      end
-      local line = handle.pending:sub(start, nl - 1)
-      local evt = M.parse_bpftrace_line(line)
-      if evt then
-        handle.ready = true
-        emit(evt)
-      end
-      start = nl + 1
+      local nl = encoded:find("\n", pos, true)
+      local p = nl and encoded:sub(pos, nl - 1) or encoded:sub(pos)
+      if p ~= "" then emit({ kind = "file", path = p }) end
+      if not nl then break end
+      pos = nl + 1
     end
+  end
+  local function parse_sync(text)
+    emit_encoded(_parse_file_paths(text))
+  end
+  -- 有界并发解析：最多 4 个 job 在途，其余排队；避免一次性排满线程池。
+  local pump
+  local function start_job(text)
+    handle.inflight = handle.inflight + 1
+    work.run(_parse_file_paths, text):then_(function(encoded)
+      handle.inflight = handle.inflight - 1
+      emit_encoded(encoded)
+      pump()
+    end, function()
+      handle.inflight = handle.inflight - 1
+      pump()
+    end)
+  end
+  pump = function()
+    while handle.inflight < 4 and #handle.queue > 0 do
+      start_job(table.remove(handle.queue, 1))
+    end
+  end
+  local function dispatch(text)
+    if text == "" then return end
+    handle.ready = true
+    if not offload then parse_sync(text); return end
+    handle.queue[#handle.queue + 1] = text
+    pump()
   end
   local job = vim.fn.jobstart({ "bpftrace", "-e", BTRACE_SCRIPT, tostring(cg_id) }, {
     stdout_buffered = false,
@@ -261,8 +310,10 @@ local function _start_ebpf(opts)
     on_stdout = function(_, data)
       if not data then return end
       -- 末元素可能是未终结的残行，累积到下次
-      for i = 1, #data - 1 do feed(data[i] .. "\n") end
-      if #data >= 1 then handle.pending = handle.pending .. data[#data] end
+      local text = ""
+      if #data > 1 then text = table.concat(data, "\n", 1, #data - 1) .. "\n" end
+      if #data >= 1 then handle.pending = handle.pending .. (data[#data] or "") end
+      if text ~= "" then dispatch(text) end
     end,
     on_stderr = function(_, data)
       local msg = table.concat(data or {}, " ")
@@ -283,6 +334,12 @@ local function _start_ebpf(opts)
   function handle.stop()
     if handle.stopped then return end
     handle.stopped = true
+    -- 冲刷残行（best-effort，小量，同步即可）；在途解析 job 的结果仍会异步派发。
+    if handle.pending and handle.pending ~= "" then
+      local p = handle.pending
+      handle.pending = ""
+      pcall(parse_sync, p)
+    end
     pcall(vim.fn.jobstop, job)
   end
   return handle
@@ -355,6 +412,39 @@ end
 
 -- ========== strace 后端（命令前缀 + 轮询 trace 文件） ==========
 
+--- 线程内解析 strace 新增行（自包含，可 `string.dump` 到工作线程）：从 offset 起读取新行，
+--- 仅保留文件事件（openat/open/execve）路径并按路径去重。构建/测试每秒可产生大量 openat，
+--- 逐行纯 Lua 解析此前在主线程进行，会占满主线程；移入线程池后主线程只派发去重路径。
+--- 输入 `<trace_path>\n<offset>`；返回 `<new_offset>\n<unique paths...>`。
+--- @param encoded string
+--- @return string
+local function _parse_strace_worker(encoded)
+  local nl = encoded:find("\n", 1, true)
+  if not nl then return "0\n" end
+  local path = encoded:sub(1, nl - 1)
+  local offset = tonumber(encoded:sub(nl + 1)) or 0
+  local f = io.open(path, "r")
+  if not f then return tostring(offset) .. "\n" end
+  f:seek("set", offset)
+  local seen, out, n = {}, {}, 0
+  for line in f:lines() do
+    local pid, rest = line:match("^%[pid%s+(%d+)%]%s+(.*)$")
+    if not pid then pid, rest = line:match("^(%d+)%s+(.*)$") end
+    if pid then
+      -- 仅文件打开事件（与 eBPF 后端一致）；execve 归 exec 类，观测消费方不使用。
+      local p = rest:match('^openat%(%s*[^,]+,%s*"([^"]*)"')
+        or rest:match('^open%("([^"]*)"')
+      if p then
+        p = p:gsub("[%z\1-\31\127]", "")
+        if p ~= "" and not seen[p] then seen[p] = true; n = n + 1; out[n] = p end
+      end
+    end
+  end
+  local newoff = f:seek()
+  f:close()
+  return tostring(newoff) .. "\n" .. table.concat(out, "\n")
+end
+
 --- 构造 strace 命令前缀（用于包裹沙箱 argv）。仅 strace 后端可用时返回。
 --- 返回的 handle 轮询 trace 文件并解析事件；进程结束后由调用方 `handle.stop()`。
 --- @param opts table { attempt_id?, on_event, poll_ms? }
@@ -368,8 +458,29 @@ function M.strace_prefix(opts)
   local prefix = { "strace", "-f", "-qq", "-e", "trace=openat,open,connect,execve", "-o", out, "--" }
   local handle = { backend = "strace", stopped = false, offset = 0 }
   local poll_ms = tonumber(opts.poll_ms) or DEFAULT_POLL_MS
-  local function drain()
-    if handle.stopped then return end
+  local work = require("NeoAI.utils.work")
+  local function emit_path(p)
+    if p ~= "" and opts.on_event then
+      pcall(opts.on_event, { kind = "file", op = "open", path = p })
+    end
+  end
+  --- 应用线程内解析结果：更新 offset（单调不回退，避免与同步冲刷竞争）并派发文件事件。
+  local function apply(encoded)
+    if type(encoded) ~= "string" or encoded == "" then return end
+    local nl = encoded:find("\n", 1, true)
+    local off = nl and tonumber(encoded:sub(1, nl - 1))
+    if off and off > handle.offset then handle.offset = off end
+    local pos = (nl or 0) + 1
+    while pos <= #encoded do
+      local n2 = encoded:find("\n", pos, true)
+      local p = n2 and encoded:sub(pos, n2 - 1) or encoded:sub(pos)
+      emit_path(p)
+      if not n2 then break end
+      pos = n2 + 1
+    end
+  end
+  --- 同步冲刷（线程池不可用 / stop 收尾）：逐行解析（含 exec/connect，保持原行为）。
+  local function drain_sync()
     local f = io.open(out, "r")
     if not f then return end
     f:seek("set", handle.offset)
@@ -380,13 +491,26 @@ function M.strace_prefix(opts)
     handle.offset = f:seek()
     f:close()
   end
+  local function drain()
+    if handle.stopped then return end
+    if not work.available() then drain_sync(); return end
+    if handle.draining then return end
+    handle.draining = true
+    work.run(_parse_strace_worker, out .. "\n" .. tostring(handle.offset)):then_(function(encoded)
+      handle.draining = false
+      apply(encoded)
+    end, function()
+      handle.draining = false
+    end)
+  end
   local timer = vim.uv.new_timer()
   timer:start(0, poll_ms, vim.schedule_wrap(drain))
   handle.timer = timer
   handle.path = out
   function handle.stop()
     if handle.stopped then return end
-    drain()
+    -- 同步冲刷残量（通常很小）：保证 stop 返回前事件已派发。
+    drain_sync()
     handle.stopped = true
     pcall(function() timer:stop() end)
     pcall(function() timer:close() end)

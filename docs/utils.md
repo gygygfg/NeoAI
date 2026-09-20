@@ -95,6 +95,17 @@ end, "/path/to/file"):then_(function(data) ... end, function(err) ... end)
 
 无 `vim.uv.new_work`（nvim < 0.10）时回退到 `vim.schedule` 同步执行（仍保证不阻塞调用栈）。
 
+`work.batched(tasks, limit, start)`：**分批并发**提交。`start(task)` 在主线程调用并返回
+一个 `work.run` 的 Deferred；每批最多 `limit` 个在途，完成一批再提交下一批，结果按 `tasks`
+顺序 resolve。用于避免一次性向线程池排入数百个分块 job、饿死后续 UI 关键 job
+（脱敏 / 密钥 token 化 / 落盘）。
+
+```lua
+work.batched(chunks, 4, function(chunk)
+  return work.run(worker, encode(chunk))
+end):then_(function(results) ... end)
+```
+
 ## 7. timer.lua（可暂停计时器）
 
 跟踪「活跃执行时间」（剔除等待人类交互的暂停时长），并基于活跃时间执行超时。

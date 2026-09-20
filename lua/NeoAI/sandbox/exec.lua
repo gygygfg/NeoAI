@@ -53,6 +53,7 @@ local function _spawn(argv, opts)
   end
   if opts.signal then
     opts.signal:subscribe(function(reason)
+      if opts.kill then pcall(opts.kill) end
       if job then pcall(vim.fn.jobstop, job) end
       settle({ code = -1, stdout = table.concat(stdout_chunks, "\n"), stderr = table.concat(stderr_chunks, "\n"), aborted = true, message = reason })
     end)
@@ -61,6 +62,7 @@ local function _spawn(argv, opts)
   if timeout_ms > 0 then
     vim.defer_fn(function()
       if done then return end
+      if opts.kill then pcall(opts.kill) end
       if job then pcall(vim.fn.jobstop, job) end
       settle({ code = -1, stdout = table.concat(stdout_chunks, "\n"), stderr = table.concat(stderr_chunks, "\n"), timed_out = true })
     end, timeout_ms)
@@ -167,6 +169,7 @@ function M.run(argv, opts)
       env = ictx.sandbox_env,
       timeout_ms = opts.timeout_ms,
       signal = opts.signal,
+      kill = ictx.sandbox_kill,
     })
   end)
 end

@@ -8,7 +8,9 @@
 --- 设计要点：
 --- - 默认不启用（`tools.web_fetch.enabled = false`）；关闭时零副作用。
 --- - 启用后在缓存目录（`stdpath('cache')/NeoAI/web_fetch`）用 bash 检查并安装
----   Node 依赖与浏览器内核；`auto_install` 时后台异步触发，首次调用前等待完成。
+---   Node 依赖与浏览器内核；**安装在宿主直接执行、不经沙箱**（安装产物可达数百 MB，
+---   进入沙箱 overlay 会被反复捕获），渲染仍在沙箱内执行（浏览器从宿主只读可见）。
+---   `auto_install` 时后台异步触发，首次调用前等待完成。
 --- - Node/npm 缺失不自动改系统包管理器，返回可操作的错误提示。
 --- - 结果按 URL+参数 缓存，带 TTL / 条数 / 总容量（默认 500MB）上限，LRU 淘汰。
 ---
@@ -52,6 +54,7 @@ local state = {
   deps_ready = false, --- 依赖是否已就绪
   deps = nil, --- 进行中的依赖安装 Deferred
   install_started = false, --- 后台安装是否已触发
+  install_dir_override = nil, --- 测试用：覆盖安装目录
   cache_dir_override = nil, --- 测试用：覆盖缓存目录
   images_dir = nil, --- 当前会话的图片临时目录（懒创建，mktemp -d）
   images_dirs = {}, --- 已创建的所有图片临时目录（供退出时清理）
@@ -97,7 +100,7 @@ end
 --- 安装目录（缓存目录下，含 node_modules / browsers / cache / tmp）
 --- @return string
 local function _install_dir()
-  return fs.join(vim.fn.stdpath("cache"), "NeoAI", "web_fetch")
+  return state.install_dir_override or fs.join(vim.fn.stdpath("cache"), "NeoAI", "web_fetch")
 end
 
 --- 缓存目录（可被测试覆盖）
@@ -251,6 +254,68 @@ local function _run_bash(script, opts)
   })
 end
 
+--- 在**宿主**直接执行 bash 脚本（不经沙箱），返回与沙箱执行一致的结果表。
+--- 仅用于 web_fetch 依赖/浏览器内核**安装**：安装产物（`node_modules`、数百 MB 的
+--- chromium 内核）不应进入沙箱 overlay 并冻结为候选——否则每条 `run_command` 都会
+--- 遍历/哈希这些大文件。渲染仍在沙箱内执行（浏览器从宿主只读可见）。
+--- @param script string
+--- @param opts table { timeout_ms?, signal?, cwd? }
+--- @return Deferred resolve({ code, stdout, stderr, timed_out?, aborted?, message? })
+local function _run_bash_host(script, opts)
+  opts = opts or {}
+  local d = async.Deferred.new()
+  local stdout_chunks, stderr_chunks = {}, {}
+  local done = false
+  local job
+  local function settle(res)
+    if done then return end
+    done = true
+    d:resolve(res)
+  end
+  if opts.signal then
+    opts.signal:subscribe(function(reason)
+      if job then pcall(vim.fn.jobstop, job) end
+      settle({
+        code = -1, stdout = table.concat(stdout_chunks, "\n"),
+        stderr = table.concat(stderr_chunks, "\n"), aborted = true, message = reason,
+      })
+    end)
+  end
+  local timeout_ms = opts.timeout_ms or 30000
+  if timeout_ms > 0 then
+    vim.defer_fn(function()
+      if done then return end
+      if job then pcall(vim.fn.jobstop, job) end
+      settle({
+        code = -1, stdout = table.concat(stdout_chunks, "\n"),
+        stderr = table.concat(stderr_chunks, "\n"), timed_out = true,
+      })
+    end, timeout_ms)
+  end
+  job = vim.fn.jobstart({ "bash", "-c", script }, {
+    cwd = opts.cwd,
+    stdout_buffered = false,
+    stderr_buffered = false,
+    on_stdout = function(_, data)
+      if data and #data > 0 then stdout_chunks[#stdout_chunks + 1] = table.concat(data, "\n") end
+    end,
+    on_stderr = function(_, data)
+      if data and #data > 0 then stderr_chunks[#stderr_chunks + 1] = table.concat(data, "\n") end
+    end,
+    on_exit = function(_, code)
+      settle({
+        code = code, stdout = table.concat(stdout_chunks, "\n"),
+        stderr = table.concat(stderr_chunks, "\n"),
+      })
+    end,
+  })
+  if job <= 0 then
+    done = true
+    return async.reject({ kind = "web_fetch", message = "无法启动依赖安装进程" })
+  end
+  return d
+end
+
 --- bash 单引号安全包裹
 --- @param s string
 --- @return string
@@ -387,10 +452,12 @@ local function _ensure_deps(opts)
   local script = _build_install_script(dir, engine, cfg)
   local install_timeout = tonumber(cfg.install_timeout_ms) or 600000
 
-  logger.info("[web_fetch] 检查/安装依赖于 %s（engine=%s）", dir, engine)
+  logger.info("[web_fetch] 检查/安装依赖于 %s（engine=%s，宿主执行）", dir, engine)
   -- vim.notify("[NeoAI] web_fetch 正在检查/安装依赖（首次较慢）…", vim.log.levels.INFO)
 
-  _run_bash(script, { timeout_ms = install_timeout, signal = opts.signal })
+  -- 依赖/内核安装在宿主直接执行，不经沙箱：避免数百 MB 的 node_modules / 浏览器内核
+  -- 进入沙箱 overlay 并冻结为候选（会被每条 run_command 反复捕获）。
+  _run_bash_host(script, { timeout_ms = install_timeout, signal = opts.signal })
     :then_(function(result)
       local out = result.stdout or ""
       if result.aborted then
@@ -943,6 +1010,7 @@ function M.reset()
   state.deps_ready = false
   state.deps = nil
   state.install_started = false
+  state.install_dir_override = nil
   state.cache_dir_override = nil
   state.images_dir = nil
   state.images_dirs = {}
@@ -961,6 +1029,11 @@ M._ensure_cleanup_registered = _ensure_cleanup_registered
 M._set_cache_dir = function(path)
   state.cache_dir_override = path
 end
+M._set_install_dir = function(path)
+  state.install_dir_override = path
+end
+M._ensure_deps = _ensure_deps
+M._run_bash_host = _run_bash_host
 M._list_scripts = _list_scripts
 M._resolve_script_file = _resolve_script_file
 M._sanitize_script_name = _sanitize_script_name

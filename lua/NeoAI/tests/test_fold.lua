@@ -127,6 +127,17 @@ tests.suite("fold", function(_, it)
           "/etc/passwd", "/etc/group", "/root/.bash_history", "/root/.python_history",
           "/usr/local/go/go.env", "/root/.npmrc" } }),
       "普通系统文件/历史不应触发「获取密钥」告警")
+    -- 构建/测试命令（cargo check）打开的公开 CA 包与依赖测试夹具不应告警
+    t.eq(nil, line(
+      { name = "run_command", arguments = '{"command":"cd /opt/apps/rust && cargo check"}' },
+      { role = "tool", content = "Compiling openssl v0.10.81",
+        secret_paths = {
+          "/usr/lib/ssl/cert.pem",
+          "/root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/openssl-0.10.81/test/key.pem",
+          "/root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/openssl-0.10.81/test/root-ca.key",
+          "/root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-native-tls-0.3.1/tests/identity.p12",
+        } }),
+      "公开 CA 包/依赖测试夹具不应触发「获取密钥」告警")
     -- 真正读取凭据文件才告警
     local got = line(
       { name = "read_file", arguments = '{"filepath":"/root/.ssh/id_rsa"}' },

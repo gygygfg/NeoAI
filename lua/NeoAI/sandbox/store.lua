@@ -136,13 +136,87 @@ local function _drain(path)
   work.run(_atomic_write_worker, path, encoded):then_(done, done)
 end
 
---- 请求异步写入（最新内容覆盖旧请求），并缓存供同步读取命中。
+--- 线程内校验字符串是否为合法 UTF-8（与 `stringx.sanitize_utf8` 同口径，自包含）。
+--- vim.json.encode 会把非法字节原样透传，严格解析器会报错；故先快速编码，再在线程池校验，
+--- 仅当非法时才在主线程走昂贵的 `json.encode`（含全表 UTF-8 深扫）兜底。
+--- 返回 "\1" 合法 / "\0" 非法。
+--- @param s string
+--- @return string
+local function _validate_utf8_worker(s)
+  local i, n = 1, #s
+  while i <= n do
+    local b1 = s:byte(i)
+    if b1 <= 0x7F then
+      i = i + 1
+    else
+      local len, lo, hi = 1, 0, 0
+      if b1 >= 0xC2 and b1 <= 0xDF then
+        len = 2
+      elseif b1 >= 0xE0 and b1 <= 0xEF then
+        len = 3
+        if b1 == 0xE0 then lo = 0xA0 elseif b1 == 0xED then hi = 0x9F end
+      elseif b1 >= 0xF0 and b1 <= 0xF4 then
+        len = 4
+        if b1 == 0xF0 then lo = 0x90 elseif b1 == 0xF4 then hi = 0x8F end
+      else
+        return "\0"
+      end
+      if i + len - 1 > n then return "\0" end
+      local b2 = s:byte(i + 1)
+      if b2 < 0x80 or b2 > 0xBF then return "\0" end
+      if lo > 0 and b2 < lo then return "\0" end
+      if hi > 0 and b2 > hi then return "\0" end
+      for k = 3, len do
+        local b = s:byte(i + k - 1)
+        if b < 0x80 or b > 0xBF then return "\0" end
+      end
+      i = i + len
+    end
+  end
+  return "\1"
+end
+
+--- 异步编码并落盘：主线程先 `encode_fast`（C 实现，跳过纯 Lua 深扫），
+--- 线程池校验输出 UTF-8；非法时才回退 `json.encode`（清洗重编码）。大候选不再冻结主线程。
 --- @param path string
---- @param encoded string
-local function _async_write(path, encoded)
+--- @param value any
+local function _encode_and_write(path, value)
+  local encoded = json.encode_fast(value)
   write_state.mem[path] = encoded
+  -- 立即登记 pending：flush 需等待「编码校验 + 写入」整条链路，否则会在写入前误判已清空。
   write_state.pending[path] = encoded
-  _drain(path)
+  local work = require("NeoAI.utils.work")
+  if not work.available() then
+    write_state.pending[path] = json.encode(value)
+    _drain(path)
+    return
+  end
+  local gen = write_state.gen
+  local function commit(out)
+    if write_state.gen ~= gen or write_state.cancelled[path] then return end
+    write_state.pending[path] = out
+    _drain(path)
+  end
+  -- 纯 ASCII 输出一定为合法 UTF-8：用 C 级 `string.find` 快速判定（大候选时远快于 Lua
+  -- 逐字节校验），跳过线程池校验，避免 1M 条候选/待审 JSON（~230MB）逐字节扫描占用
+  -- 10–30s 线程池、与 capture/finish/tokenize 争抢 worker。仅含非 ASCII 字节时才投校验。
+  if not encoded:find("[\128-\255]") then
+    commit(encoded)
+    return
+  end
+  work.run(_validate_utf8_worker, encoded):then_(function(res)
+    if res == "\1" then
+      commit(encoded)
+    else
+      local safe = json.encode(value)
+      write_state.mem[path] = safe
+      commit(safe)
+    end
+  end, function()
+    local safe = json.encode(value)
+    write_state.mem[path] = safe
+    commit(safe)
+  end)
 end
 
 --- 取消某路径的待写/缓存，并标记在途写入完成后清理（删除后不被迟到的写入复活）。
@@ -238,8 +312,9 @@ function M.write_candidate(candidate)
   return true
 end
 
---- 异步写入候选：编码在主线程（vim.json 为 C 实现），文件写入移入线程池，
---- 大候选不再阻塞主线程等待 fsync/磁盘。写入后立即可经 `read_candidate` 读回（内存缓存）。
+--- 异步写入候选：编码用 `encode_fast`（跳过主线程 UTF-8 深扫），文件写入移入线程池，
+--- 大候选不再阻塞主线程等待 fsync/磁盘；输出非法 UTF-8 时在线程池校验后回退清洗重编码。
+--- 写入后立即可经 `read_candidate` 读回（内存缓存）。
 --- @param candidate table
 --- @return Deferred resolve(boolean)
 function M.write_candidate_async(candidate)
@@ -248,7 +323,7 @@ function M.write_candidate_async(candidate)
   end
   if not _ensure_dirs() then return async.resolve(false) end
   local path = _candidates_dir() .. "/" .. _safe_name(candidate.candidate_digest) .. ".json"
-  _async_write(path, json.encode(candidate))
+  _encode_and_write(path, candidate)
   return async.resolve(true)
 end
 
@@ -302,12 +377,39 @@ function M.read_receipt(operation_id)
 end
 
 --- 写入变更单元（异步审批）
+--- 待审项落盘副本：剥离候选文件内容（内容已在候选文件中，避免待审 JSON 重复编码大内容，
+--- 大候选时是主线程卡顿与内存翻倍的主要来源）。水合后按 candidate_digest 从候选读取内容。
+--- @param item table
+--- @return table
+local function _persistable(item)
+  if type(item) ~= "table" or type(item.files) ~= "table" then return item end
+  local has_content = false
+  for _, f in ipairs(item.files) do
+    if type(f) == "table" and f.content ~= nil then has_content = true; break end
+  end
+  if not has_content then return item end
+  local files = {}
+  for i, f in ipairs(item.files) do
+    if type(f) == "table" and f.content ~= nil then
+      local copy = {}
+      for k, v in pairs(f) do if k ~= "content" then copy[k] = v end end
+      files[i] = copy
+    else
+      files[i] = f
+    end
+  end
+  local copy = {}
+  for k, v in pairs(item) do copy[k] = v end
+  copy.files = files
+  return copy
+end
+
 --- @param item table
 --- @return boolean ok
 function M.write_review(item)
   if not _ensure_dirs() then return false end
   local path = _reviews_dir() .. "/" .. _safe_name(item.change_set_id) .. ".json"
-  return fs.write_file_atomic(path, json.encode(item))
+  return fs.write_file_atomic(path, json.encode(_persistable(item)))
 end
 
 --- 异步写入变更单元：文件写入移入线程池，写入后立即可读回（内存缓存）。
@@ -316,7 +418,7 @@ end
 function M.write_review_async(item)
   if not _ensure_dirs() then return async.resolve(false) end
   local path = _reviews_dir() .. "/" .. _safe_name(item.change_set_id) .. ".json"
-  _async_write(path, json.encode(item))
+  _encode_and_write(path, _persistable(item))
   return async.resolve(true)
 end
 
@@ -354,6 +456,16 @@ function M.write_evidence(record)
   if not _ensure_dirs() then return false end
   local path = _evidence_dir() .. "/" .. _safe_name(record.evidence_id) .. ".json"
   return fs.write_file_atomic(path, json.encode(record))
+end
+
+--- 异步写入证据记录（write-behind）：观测类证据（越界访问留痕）在构建/测试中可能高频产生，
+--- 同步逐条写盘会阻塞主线程；改走 `_encode_and_write`（编码后交线程池写盘，内存缓存保证
+--- 立即可读）。`store.flush` 会等待其落盘。
+--- @param record table { evidence_id }
+function M.write_evidence_async(record)
+  if not _ensure_dirs() then return end
+  local path = _evidence_dir() .. "/" .. _safe_name(record.evidence_id) .. ".json"
+  _encode_and_write(path, record)
 end
 
 --- 读取证据记录
@@ -465,14 +577,29 @@ function M.write_snapshot(record)
   return ok
 end
 
+--- 异步写入应用快照：快照含原文件内容（撤销保存需交换回真实盘），大文件时同步
+--- `json.encode`（含全表 UTF-8 深扫）+ fsync 会卡主线程。改走 `_encode_and_write`
+--- （`encode_fast` + 线程池写盘），内存缓存保证刚写入即可经 `read_snapshot` 读回。
+--- @param record table { snapshot_id }
+--- @return Deferred resolve(boolean)
+function M.write_snapshot_async(record)
+  if not _ensure_dirs() then return async.resolve(false) end
+  local path = _snapshots_dir() .. "/" .. _safe_name(record.snapshot_id) .. ".json"
+  snapshot_cache[record.snapshot_id] = nil
+  _encode_and_write(path, record)
+  return async.resolve(true)
+end
+
 --- 读取应用快照
 --- @param snapshot_id string
 --- @return table|nil
 function M.read_snapshot(snapshot_id)
   if not state.root then return nil end
+  local path = _snapshots_dir() .. "/" .. _safe_name(snapshot_id) .. ".json"
+  -- 异步写入尚未落盘：内存缓存优先（与候选/待审一致），保证刚写入即可读回。
+  if write_state.mem[path] ~= nil then return _read_json(path) end
   local cached = snapshot_cache[snapshot_id]
   if cached ~= nil then return cached or nil end
-  local path = _snapshots_dir() .. "/" .. _safe_name(snapshot_id) .. ".json"
   local content = fs.read_file(path)
   if not content then
     snapshot_cache[snapshot_id] = false -- 负缓存：避免重复读不存在的快照
@@ -491,6 +618,7 @@ function M.delete_snapshot(snapshot_id)
   if not state.root then return false end
   snapshot_cache[snapshot_id] = nil
   local path = _snapshots_dir() .. "/" .. _safe_name(snapshot_id) .. ".json"
+  _cancel_write(path)
   return fs.delete_file(path)
 end
 

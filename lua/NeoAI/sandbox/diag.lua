@@ -164,4 +164,54 @@ function M.bench_capture(opts)
   }
 end
 
+-- ========== 环境/资源域诊断（137 / OOM 归因） ==========
+
+--- 读取一个文件的前 N 字节（去除首尾空白），失败返回 nil。
+--- @param path string
+--- @return string|nil
+local function _read(path)
+  local f = io.open(path, "r")
+  if not f then return nil end
+  local v = f:read("*a")
+  f:close()
+  return v and (v:gsub("%s+$", ""))
+end
+
+--- 采集宿主/容器资源域与负载信息（只读），用于 137 / OOM 归因。
+--- @return table
+function M.sandbox_limits()
+  local out = {
+    loadavg = _read("/proc/loadavg"),
+    pid1 = _read("/proc/1/comm"),
+  }
+  local ok, cpus = pcall(vim.uv.cpus)
+  if ok and type(cpus) == "table" and #cpus > 0 then
+    out.nproc = #cpus
+  else
+    local raw = (vim.fn.system("nproc 2>/dev/null") or ""):gsub("%s+$", "")
+    out.nproc = tonumber(raw) or nil
+  end
+  local meminfo = _read("/proc/meminfo") or ""
+  out.mem_total_kb = tonumber(meminfo:match("MemTotal:%s*(%d+)"))
+  -- 宿主/容器根 cgroup（限制整个 nvim 进程组的内存/PID）。
+  local root = "/sys/fs/cgroup"
+  out.root_memory_max = _read(root .. "/memory.max")
+  out.root_memory_events = _read(root .. "/memory.events")
+  out.root_pids_max = _read(root .. "/pids.max")
+  out.root_pids_events = _read(root .. "/pids.events")
+  -- NeoAI 共享父域。
+  local parent = root .. "/neoai"
+  out.neoai_cpu_max = _read(parent .. "/cpu.max")
+  out.neoai_memory_max = _read(parent .. "/memory.max")
+  -- 系统d 探测：PID1 非 systemd 时 systemctl 不可用。
+  out.systemd = out.pid1 == "systemd"
+  -- 已解析的沙箱限制。
+  local ok_c, cgroup = pcall(require, "NeoAI.sandbox.cgroup")
+  if ok_c and cgroup then
+    local ok_l, limits = pcall(cgroup.resolve_limits)
+    if ok_l then out.resolved_limits = limits end
+  end
+  return out
+end
+
 return M

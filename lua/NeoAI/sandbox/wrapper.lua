@@ -23,6 +23,68 @@ local fs = require("NeoAI.utils.fs")
 
 local M = {}
 
+-- ========== 进程命令串行化 ==========
+
+-- 沙箱的 overlay 物化/捕获、会话级可写层、暂存映射与捕获来源均基于「共享会话」，**非并发
+-- 安全**。同一轮里模型并行发出的多个 `run_command`（并行 tool_calls）会互相污染：物化/捕获
+-- 交错导致命令看到缺失的目录/文件、捕获互相覆盖，命令可能因此阻塞直到超时并被 `cgroup.kill`
+-- 以 SIGKILL 终止（退出码 137，且无输出）。此处把 `effect == "process"` 的门禁按 FIFO
+-- **串行**执行（一次一个），其余工具（read/fs_write/in_process/network）不受影响。
+local process_mutex = { busy = false, queue = {} }
+
+-- 后台后处理链（命令进程退出后的捕获/冻结/合并/落盘/结算）。`postprocess = "async"`（默认）
+-- 时工具结果在进程退出后立即返回，此链在后台完成；`_serialize_process` 在释放 FIFO 槽位前
+-- 等待它，保证下一进程命令看到一致的会话暂存。
+local postprocess = { pending = nil, seq = 0 }
+
+--- 登记后台后处理链（用于 FIFO 保持与测试/关闭时等待）。
+--- @param def Deferred
+local function _track_postprocess(def)
+  postprocess.seq = postprocess.seq + 1
+  local my = postprocess.seq
+  postprocess.pending = def
+  local function clear()
+    if postprocess.seq == my and postprocess.pending == def then postprocess.pending = nil end
+  end
+  def:then_(clear, clear)
+end
+
+--- 串行执行一个返回 Deferred 的进程门禁任务（FIFO）。
+--- @param fn function() -> Deferred
+--- @return Deferred
+local function _serialize_process(fn)
+  local out = async.Deferred.new()
+  local function run()
+    local released = false
+    local function release()
+      if released then return end
+      released = true
+      local function advance()
+        -- 移除当前运行项（table.remove 返回被移除的元素，不能当作「下一项」），再取队首。
+        table.remove(process_mutex.queue, 1)
+        local nxt = process_mutex.queue[1]
+        if nxt then vim.schedule(nxt) else process_mutex.busy = false end
+      end
+      -- async 后处理：结果已返回，但 FIFO 槽位保持到后台链完成，避免下一命令与暂存合并竞争。
+      local pending = postprocess.pending
+      if pending then pending:then_(advance, advance) else advance() end
+    end
+    local ok, inner = pcall(fn)
+    if not ok then release(); out:reject(inner); return end
+    if type(inner) ~= "table" or type(inner.then_) ~= "function" then
+      release(); out:resolve(inner); return
+    end
+    inner:then_(function(v) release(); out:resolve(v) end,
+                function(e) release(); out:reject(e) end)
+  end
+  process_mutex.queue[#process_mutex.queue + 1] = run
+  if not process_mutex.busy then
+    process_mutex.busy = true
+    vim.schedule(run)
+  end
+  return out
+end
+
 -- ========== 私有函数 ==========
 
 --- 为工具附加沙箱规格（幂等）
@@ -32,6 +94,9 @@ function M.attach(tool)
   if type(tool) ~= "table" then return tool end
   if tool.__sandboxed and tool.__sandbox_spec then return tool end
   local spec = tool_spec.get(tool.name, tool.category)
+  -- 长驻服务工具（service_*）：门禁仍完成预检/脚本扫描/硬拒绝，但不进入一次性进程的
+  -- overlay 捕获/冻结流程；隔离与候选结算由 sandbox.service 自建。
+  if tool.long_lived then spec.long_lived = true end
   tool.__sandboxed = true
   tool.__sandbox_spec = spec
   return tool
@@ -52,7 +117,23 @@ end
 --- @return any
 local function _rewrite_value(rev, value)
   if not next(rev) then return value end
+  -- 粗粒度前缀提示（暂存路径前两级目录，通常仅 1~3 个根）：结果字符串不含任一提示时
+  -- 不可能包含暂存路径，直接跳过逐条 gsub。暂存上万文件时，此前每个输出字符串都要对
+  -- 全部暂存路径各做一次全文扫描（O(字符串×N)）；加守卫后无暂存路径的常规输出为 O(1)。
+  local hints = {}
+  for staged in pairs(rev) do
+    hints[staged:match("^(/[^/]+/[^/]+)") or staged] = true
+  end
+  local hint_list = {}
+  for h in pairs(hints) do hint_list[#hint_list + 1] = h end
+  local function maybe(s)
+    for _, h in ipairs(hint_list) do
+      if s:find(h, 1, true) then return true end
+    end
+    return false
+  end
   local function rewrite_str(s)
+    if not maybe(s) then return s end
     local out = s
     for staged, real in pairs(rev) do
       out = out:gsub(vim.pesc(staged), (real:gsub("%%", "%%%%")))
@@ -81,6 +162,10 @@ local function _rewrite_result(mapping, value)
   return _rewrite_value(rev, value)
 end
 
+-- 供测试直接验证路径还原与「无暂存路径快速跳过」语义。
+M._rewrite_value = _rewrite_value
+M._rewrite_result = _rewrite_result
+
 --- 可写根路径编码为 overlay 子目录名
 --- @param root string
 --- @return string
@@ -108,25 +193,123 @@ local function _package_roots()
   return out
 end
 
---- 沙箱内已是 root（完整能力）：剥掉前导 `sudo`/`doas`（及其常见布尔 flag），使
---- `sudo apt update` 等价于 `apt update`。沙箱用独立 userns 时仅映射 uid 0，sudo 的
---- `setresuid(...,1,...)` 会 EINVAL，且 `/etc/sudoers` 被遮蔽，故 sudo 无意义且会失败。
---- 仅处理简单形式；含 `-u/-g/-i/-s/-p/-C` 等改变用户/登录的形式保持原样。
+--- 沙箱内已是 root（完整能力）：剥掉 `sudo`/`doas`（及其选项），使 `sudo apt update`
+--- 等价于 `apt update`。沙箱用独立 userns 时仅映射 uid 0，sudo 的 `setresuid(...,1,...)`
+--- 会 EINVAL，且 `/etc/sudoers` 被遮蔽，故 sudo 无意义且必然失败（`PERM_SUDOERS`）。
+--- 处理**每个命令段**（按未加引号的 `; & | && ||` 换行切分），故 `a && sudo b`、多行脚本、
+--- `sudo -u user cmd`、`sudo -i` 等都不再报错；保留包装器（env/command/nohup/…）与其余原文
+--- （不改动引号内空白）。
 --- @param cmd string|nil
 --- @return string|nil
-local function _strip_root_prefix(cmd)
-  if type(cmd) ~= "string" or cmd == "" then return cmd end
-  local lead, after = cmd:match("^(%s*)sudo%s+(.*)$")
-  if not after then lead, after = cmd:match("^(%s*)doas%s+(.*)$") end
-  if not after then return cmd end
-  -- 改变用户/组/登录的形式：不处理（避免语义变化）
-  if after:match("^%-%-?[ugi]") or after:match("^%-%-login") or after:match("^%-%-user")
-    or after:match("^%-%-group") then
-    return cmd
+local SUDO_VALUE_OPTS = {
+  ["-u"] = true, ["-g"] = true, ["-p"] = true, ["-C"] = true, ["-h"] = true,
+  ["-r"] = true, ["-t"] = true, ["-U"] = true,
+  ["--user"] = true, ["--group"] = true, ["--prompt"] = true, ["--close-from"] = true,
+  ["--host"] = true, ["--role"] = true, ["--type"] = true, ["--other-user"] = true,
+}
+local SUDO_PREFIX_WRAPPERS = {
+  env = true, command = true, nohup = true, time = true, nice = true,
+  ionice = true, stdbuf = true, xargs = true,
+}
+
+--- @param w string
+--- @return boolean 是否为 sudo/doas 可执行名（含 `/usr/bin/sudo` 等绝对路径）
+local function _is_sudo_bin(w)
+  if type(w) ~= "string" or w == "" then return false end
+  local b = vim.fn.fnamemodify(w, ":t")
+  return b == "sudo" or b == "doas"
+end
+
+--- 消费 `sudo`/`doas` 之后的选项（含独立取值的 `-u user` 等），返回剩余命令原文。
+--- @param s string
+--- @return string
+local function _consume_sudo_opts(s)
+  while true do
+    local _, opt, after = s:match("^(%s*)(%S+)(.*)$")
+    if not opt then return "" end
+    if opt == "--" then return after end
+    if opt:sub(1, 1) ~= "-" then return s end
+    if SUDO_VALUE_OPTS[opt] then
+      local _, _, after2 = after:match("^(%s*)(%S+)(.*)$")
+      if not after2 then return "" end
+      s = after2
+    else
+      s = after
+    end
   end
-  after = after:gsub("^%-%-%s+", ""):gsub("^%-[EHnSbkAPv]%s+", "")
-  if after == "" then return cmd end
-  return lead .. after
+end
+
+--- 剥离单个命令段的前导 `sudo`/`doas`（保留前导 env 赋值与包装器）。
+--- @param seg string
+--- @return string
+local function _strip_sudo_segment(seg)
+  local prefix, rest = "", seg
+  while true do
+    local ws, first, after = rest:match("^(%s*)(%S+)(.*)$")
+    if not first then return seg end
+    if first:match("^[%w_]+=") or SUDO_PREFIX_WRAPPERS[first] then
+      prefix = prefix .. ws .. first
+      rest = after
+    elseif _is_sudo_bin(first) then
+      local combined = prefix .. _consume_sudo_opts(after)
+      if combined:match("^%s*$") then return "sh" end
+      return combined
+    else
+      return seg
+    end
+  end
+end
+
+--- 按未加引号的 shell 分隔符切分命令并保留分隔符（引号/转义内的分隔符不切分）。
+--- @param cmd string
+--- @return table { text, sep }
+local function _split_shell(cmd)
+  local segs, cur = {}, {}
+  local i, n, q = 1, #cmd, nil
+  local function flush(sep)
+    segs[#segs + 1] = { text = table.concat(cur), sep = sep }
+    cur = {}
+  end
+  while i <= n do
+    local c = cmd:sub(i, i)
+    if q then
+      cur[#cur + 1] = c
+      if c == "\\" and q == '"' then
+        local nx = cmd:sub(i + 1, i + 1)
+        if nx ~= "" then cur[#cur + 1] = nx; i = i + 1 end
+      elseif c == q then
+        q = nil
+      end
+      i = i + 1
+    elseif c == "'" or c == '"' then
+      q = c; cur[#cur + 1] = c; i = i + 1
+    elseif c == "\\" then
+      cur[#cur + 1] = c
+      local nx = cmd:sub(i + 1, i + 1)
+      if nx ~= "" then cur[#cur + 1] = nx; i = i + 1 end
+      i = i + 1
+    elseif c == ";" or c == "\n" then
+      flush(c); i = i + 1
+    elseif c == "&" or c == "|" then
+      if cmd:sub(i + 1, i + 1) == c then flush(c .. c); i = i + 2 else flush(c); i = i + 1 end
+    else
+      cur[#cur + 1] = c; i = i + 1
+    end
+  end
+  segs[#segs + 1] = { text = table.concat(cur), sep = "" }
+  return segs
+end
+
+--- @param cmd string|nil
+--- @return string|nil
+local function _strip_sudo(cmd)
+  if type(cmd) ~= "string" or cmd == "" then return cmd end
+  local out = {}
+  for _, s in ipairs(_split_shell(cmd)) do
+    out[#out + 1] = _strip_sudo_segment(s.text)
+    out[#out + 1] = s.sep
+  end
+  return table.concat(out)
 end
 
 --- 构造进程 overlay 规格：配置的可写根（剔除不存在、包含 overlay 基目录的根）+ cwd
@@ -261,6 +444,24 @@ local function _enqueue_review(cand, attempt, cfg, env, meta)
   })
 end
 
+--- 候选是否落在包管理器状态/安装目录（结果按 attempt 缓存）。
+--- `package_path_manager` 对每个路径做数十个子串匹配，同一候选在结算链路上会被多个阶段
+--- 询问；缓存后只对全部候选文件扫描一次，避免 3×N 次全量匹配。
+--- @param cand table
+--- @param attempt table|nil
+--- @return string|nil manager
+local function _package_manager_of(cand, attempt)
+  if attempt and attempt.__pkg_manager ~= nil then return attempt.__pkg_manager or nil end
+  local privilege = require("NeoAI.sandbox.privilege")
+  local found = nil
+  for _, f in ipairs(cand.files or {}) do
+    found = privilege.package_path_manager(f.path)
+    if found then break end
+  end
+  if attempt then attempt.__pkg_manager = found or false end
+  return found
+end
+
 --- 异步预计算候选的密钥分析（NEOKEY 警告 + 生成高熵），在工作线程扫描，避免结算阶段
 --- 主线程逐文件全文扫描。线程池不可用时返回 offloaded=false，由调用方回退同步。
 --- @param cand table
@@ -268,7 +469,12 @@ end
 --- @return Deferred resolve({ offloaded, secret_warning, generated })
 local function _analyze_secrets_async(cand, attempt)
   local secret = require("NeoAI.sandbox.secret")
-  if not (secret.enabled() and not attempt.package) then
+  if not secret.enabled() then
+    return async.resolve({ offloaded = true, secret_warning = nil, generated = {} })
+  end
+  -- 包安装（命令判定）或路径判定为包/生成内容（site-packages/node_modules 等）：
+  -- 与结算阶段 `is_pkg` 一致跳过密钥分析，避免对 venv/依赖树逐文件全文熵扫描。
+  if attempt.package or _package_manager_of(cand, attempt) then
     return async.resolve({ offloaded = true, secret_warning = nil, generated = {} })
   end
   return secret.analyze_files_async(cand.files, {}):then_(function(r)
@@ -345,14 +551,7 @@ local function _settle_candidate(cand, attempt, ctx, cfg, spec, result, process_
   local paths = _cand_paths(cand)
   -- 专用包管理器识别：命令未命中包管理器名单，但改动落在包管理器状态/安装目录
   -- （node_modules、site-packages、/var/lib/apt、~/.cargo 等）时，同样按包安装处理（封顶 L2）。
-  local pkg_by_path = nil
-  do
-    local privilege = require("NeoAI.sandbox.privilege")
-    for _, p in ipairs(paths) do
-      pkg_by_path = privilege.package_path_manager(p)
-      if pkg_by_path then break end
-    end
-  end
+  local pkg_by_path = _package_manager_of(cand, attempt)
   local is_pkg = attempt.package == true or pkg_by_path ~= nil
   local secret_warning = nil
   local generated = {}
@@ -575,8 +774,8 @@ function M.settle_exec_candidate(attempt, cand, ctx, spec, result, process_info)
   local cfg = config_store.get("tools.sandbox") or {}
   if cand and #cand.files > 0 then
     cand.command_id = attempt.command_id
-    store.write_candidate(cand)
-    candidate.merge_candidate(cand)
+    store.write_candidate_async(cand)
+    candidate.merge_candidate(cand, { from_command = true })
     local settled = _settle_candidate(cand, attempt, ctx, cfg, spec, result, process_info)
     candidate.cleanup(attempt.attempt_id)
     return settled
@@ -597,9 +796,27 @@ local function _on_observed(attempt, ctx, evt)
   if evt.kind ~= "file" then return end
   local p = evt.path
   if type(p) ~= "string" or p == "" then return end
+  -- 同一路径在一轮命令内会被重复 open（构建/测试反复读同一批文件，事件可达百万级）：
+  -- 按路径去重，只处理首次，避免对每个事件都做路径规范化与密钥模式匹配（主线程热点）。
+  -- 去重后仍能完整覆盖「访问了哪些路径」——留痕与密钥归因只需知道首次访问。
+  -- 去重表设内存上限（超限后不再新增，仅复用已有项），避免极端工作负载下无界增长。
+  local seen = ctx._observed_paths_seen
+  if not seen then
+    seen = {}
+    ctx._observed_paths_seen = seen
+    ctx._observed_paths_count = 0
+  end
+  if seen[p] then return end
+  if ctx._observed_paths_count < 300000 then
+    seen[p] = true
+    ctx._observed_paths_count = ctx._observed_paths_count + 1
+  end
   local runtime = require("NeoAI.sandbox.runtime")
-  if runtime.read_all() then
-    local hit = runtime.outside_workspace(p, vim.fn.getcwd())
+  -- 每 attempt 缓存一次 read_all/cwd，避免逐事件读取配置与 getcwd。
+  if ctx._observed_read_all == nil then ctx._observed_read_all = runtime.read_all() end
+  if ctx._observed_read_all then
+    if ctx._observed_cwd == nil then ctx._observed_cwd = vim.fn.getcwd() end
+    local hit = runtime.outside_workspace(p, ctx._observed_cwd)
     if hit then
       pcall(function()
         require("NeoAI.sandbox.trace").record({
@@ -611,12 +828,7 @@ local function _on_observed(attempt, ctx, evt)
   local secret = require("NeoAI.sandbox.secret")
   if secret.enabled() and secret.is_secret_path(p) then
     ctx.observed_secret_paths = ctx.observed_secret_paths or {}
-    local seen = ctx._observed_secret_seen
-    if not seen then seen = {}; ctx._observed_secret_seen = seen end
-    if not seen[p] then
-      seen[p] = true
-      ctx.observed_secret_paths[#ctx.observed_secret_paths + 1] = p
-    end
+    ctx.observed_secret_paths[#ctx.observed_secret_paths + 1] = p
   end
 end
 
@@ -767,13 +979,13 @@ end
 
 -- ========== 公开 API ==========
 
---- 执行门禁
+--- 执行门禁（内部实现）
 --- @param tool table 工具定义（含 __sandbox_spec）
 --- @param args table
 --- @param ctx table
 --- @param call_original function() -> Deferred 真正执行原工具
 --- @return Deferred
-function M.gate(tool, args, ctx, call_original)
+local function _gate_inner(tool, args, ctx, call_original)
   ctx = ctx or {}
   local cfg = config_store.get("tools.sandbox") or {}
   local root = store.root() or (vim.fn.stdpath("cache") .. "/NeoAI/sandbox")
@@ -846,6 +1058,26 @@ function M.gate(tool, args, ctx, call_original)
   end
   control.transition(attempt, "PARSED")
   control.transition(attempt, "PREFLIGHTED")
+
+  -- 长驻服务（service_*）：预检/脚本扫描/硬拒绝已完成；隔离与候选结算由 sandbox.service
+  -- 自建（独立 overlay + cgroup），此处不进入一次性进程的捕获/冻结流程。
+  if spec.long_lived then
+    control.transition(attempt, "STAGING")
+    local inner = call_original()
+    if type(inner) ~= "table" or type(inner.then_) ~= "function" then
+      control.transition(attempt, "COMPLETED_READ_ONLY")
+      return async.resolve(inner)
+    end
+    local out = async.Deferred.new()
+    inner:then_(function(v)
+      control.transition(attempt, "COMPLETED_READ_ONLY")
+      out:resolve(v)
+    end, function(e)
+      control.transition(attempt, "FAILED")
+      out:reject(e)
+    end)
+    return out
+  end
 
   -- 只读 / 进程内：直接执行并记录只读回执（无候选，无需审批）
   if spec.effect == "read" or spec.effect == "in_process" then
@@ -956,7 +1188,7 @@ function M.gate(tool, args, ctx, call_original)
     fs.ensure_dir(staging)
     -- 沙箱内已是 root：剥掉冗余的 sudo/doas（否则会误判为 T2/userns 并失败）。
     if type(args.command) == "string" then
-      args.command = _strip_root_prefix(args.command)
+      args.command = _strip_sudo(args.command)
     end
     -- 权限档位：分类命令（需在构建可写根之前，以便包安装命令加入其状态目录作为可写根）。
     local privilege = require("NeoAI.sandbox.privilege")
@@ -1042,6 +1274,13 @@ function M.gate(tool, args, ctx, call_original)
     -- （不等待挂载完成，挂载异步进行，早期访问可能漏观测，由命令解析启发式兜底）。
     local observe_handle = _start_observe(cg_handle, attempt, ctx, prewarmed)
 
+    -- 命令取消/超时/输出截断时真正终止整个进程树：bwrap 载荷在独立 pid 命名空间内，
+    -- `jobstop` 只杀外层 bwrap，载荷可能继续存活；`cgroup.kill` 按资源域精确终止全部子进程。
+    -- shell/exec 工具在 settle 前调用它（无 cgroup 时为 no-op，仍走 jobstop）。
+    ctx.sandbox_kill = function()
+      if cg_handle then pcall(cgroup.kill, cg_handle) end
+    end
+
     -- 容器受控：docker/podman 等运行时尽量与沙箱同 namespace（podman 无守护进程可共享；
     -- docker 依赖外部 daemon，保持受控 socket 并记录原因）。重写命令以注入共享标志。
     pcall(function()
@@ -1125,6 +1364,8 @@ function M.gate(tool, args, ctx, call_original)
       ctx.sandbox_prefix = prefix
       ctx.sandbox_cwd = eff_cwd
       ctx.sandbox_env = runtime.sandbox_env(eff_priv)
+      -- 资源域路径（诊断/归因用）：shell 工具在命令退出（137）时读取 memory/pids 事件判定 OOM。
+      ctx.sandbox_cgroup_path = cg_handle and cg_handle.path or nil
       -- token→真实密钥的还原仅限沙箱内部进程：把命令参数中的 NEOKEY_ 还原为真实值后执行，
       -- 而 `args.command`（UI/证据/日志）仍保留 token，AI 与审计面看不到真实密钥。
       if type(args.command) == "string" then
@@ -1202,6 +1443,18 @@ function M.gate(tool, args, ctx, call_original)
     end
     local function finish(res, err)
       _stop_observe()
+      -- 诊断：命令结束时 dump 资源域事件（OOM / 进程终止归因），仅日志，不改变行为。
+      local diag = config_store.get("tools.sandbox.diagnostics") or {}
+      if diag.enabled and cg_handle then
+        local snap = diag.dump_cgroup_events and cgroup.events_snapshot(cg_handle.path) or nil
+        ctx.sandbox_cgroup_events = snap
+        ctx.sandbox_oom = cgroup.snapshot_oom(snap)
+        require("NeoAI.kernel.logger").warn(
+          "[sandbox:diag] command end attempt=%s code=%s timed_out=%s aborted=%s truncated=%s oom=%s%s",
+          tostring(attempt.attempt_id), tostring(res and res.code), tostring(res and res.timed_out),
+          tostring(res and res.aborted), tostring(res and res.truncated), tostring(ctx.sandbox_oom),
+          snap and (" events=" .. vim.inspect(snap)) or "")
+      end
       if cg_handle then cgroup.release(cg_handle) end
       if err then
         local mapping = candidate.mapping(attempt.attempt_id)
@@ -1240,6 +1493,7 @@ function M.gate(tool, args, ctx, call_original)
       end
       -- 捕获各可写根 overlay 的改动；overlay 不可用（或 userns 档位）时捕获降级私有 cwd。
       -- 遍历/读取/哈希经 utils.work 线程池，避免大量文件/大文件时占满主线程。
+      -- 返回 Deferred resolve(settled)：settled.ok/value/err（不直接 resolve `d`）。
       local function after_capture(cand)
         if require("NeoAI.sandbox.fault").hit("freeze") then cand = nil end
         control.transition(attempt, "CANDIDATE_READY")
@@ -1253,27 +1507,28 @@ function M.gate(tool, args, ctx, call_original)
         end
         if cand and #cand.files > 0 then
           cand.command_id = attempt.command_id
+          -- 包/生成内容判定（命令判定或路径判定）：跳过密钥 token 化与密钥分析，
+          -- 避免对 venv/site-packages/node_modules 等逐文件全文扫描。
+          local is_pkg = attempt.package == true or _package_manager_of(cand, attempt) ~= nil
           -- 双向互通：把命令改动合并进工作区暂存映射，使 read_file/edit_file 可见。
           -- 候选落盘与密钥分析均异步（线程池），避免大量文件时占满主线程。
-          return candidate.merge_candidate_async(cand):then_(function()
+          return candidate.merge_candidate_async(cand, { from_command = true, package = is_pkg }):then_(function()
             return _persist_and_settle(cand, attempt, ctx, cfg, spec, res, { command = args and args.command })
           end):then_(function(settled)
             candidate.cleanup(attempt.attempt_id)
-            if settled.ok then d:resolve(settled.value) else d:reject(settled.err) end
+            return settled
           end, function(cerr)
             candidate.cleanup(attempt.attempt_id)
-            d:reject(cerr)
+            return { ok = false, err = cerr }
           end)
+        elseif cand == nil then
+          control.transition(attempt, "FAILED")
+          candidate.cleanup(attempt.attempt_id)
+          return { ok = false, err = { kind = "sandbox", message = "候选冻结失败", command_id = attempt.command_id } }
         else
-          if cand == nil then
-            control.transition(attempt, "FAILED")
-            candidate.cleanup(attempt.attempt_id)
-            d:reject({ kind = "sandbox", message = "候选冻结失败", command_id = attempt.command_id })
-          else
-            control.transition(attempt, "COMPLETED_READ_ONLY")
-            candidate.cleanup(attempt.attempt_id)
-            d:resolve(res)
-          end
+          control.transition(attempt, "COMPLETED_READ_ONLY")
+          candidate.cleanup(attempt.attempt_id)
+          return { ok = true, value = res }
         end
       end
       local captures = {}
@@ -1285,17 +1540,42 @@ function M.gate(tool, args, ctx, call_original)
       else
         captures[#captures + 1] = candidate.capture_overlay_async(attempt.attempt_id, real_cwd, staging)
       end
-      async.all(captures):then_(function()
+      local chain = async.all(captures):then_(function()
         return candidate.finish_async(attempt.attempt_id)
       end):then_(after_capture, function(cerr)
         control.transition(attempt, "FAILED")
         candidate.cleanup(attempt.attempt_id)
-        d:reject({
+        return { ok = false, err = {
           kind = "sandbox",
           message = "候选冻结失败: " .. tostring(cerr and (cerr.message or cerr) or cerr),
           command_id = attempt.command_id,
-        })
+        } }
       end)
+      if (cfg.postprocess or "async") == "sync" then
+        -- 同步模式（测试/确定性）：等待捕获→冻结→合并→落盘→结算完成后再返回结果。
+        chain:then_(function(settled)
+          if settled and settled.ok then
+            d:resolve(settled.value)
+          else
+            d:reject(settled and settled.err or { kind = "sandbox", message = "结算失败" })
+          end
+        end, function(e) d:reject(e) end)
+      else
+        -- 异步模式（默认）：命令进程已退出 → 立即把结果交回主线程下一轮循环；捕获/冻结/合并/
+        -- 落盘/结算在后台完成。FIFO 槽位由 `_serialize_process.release` 等待本链完成后再释放，
+        -- 保证下一进程命令看到一致的会话暂存。
+        _track_postprocess(chain)
+        d:resolve(res)
+        chain:then_(function(settled)
+          if not (settled and settled.ok) then
+            require("NeoAI.kernel.logger").warn("[sandbox] 后台结算失败: %s",
+              tostring(settled and settled.err and (settled.err.message or settled.err) or "unknown"))
+          end
+        end, function(e)
+          require("NeoAI.kernel.logger").warn("[sandbox] 后台后处理异常: %s",
+            tostring(e and (e.message or e) or e))
+        end)
+      end
     end
 
     --- 执行一次；权限/网络失败时自动发起升级并在隔离内重跑（记录，不静默）。
@@ -1306,7 +1586,9 @@ function M.gate(tool, args, ctx, call_original)
           local raw = ctx.sandbox_last_result
           local esc = privilege.detect_escalation(raw)
           if esc and esc.tier > current_tier then
-            local r2 = privilege.resolve(esc.tier, { tier = esc.tier, docker = req.docker, network = req.network })
+            local r2 = privilege.resolve(esc.tier, {
+              tier = esc.tier, docker = req.docker, network = req.network, sysadmin = req.sysadmin,
+            })
             if r2.ok then
               local built2 = _build_prefix(r2.privileges)
               if built2 then
@@ -1419,6 +1701,73 @@ function M.gate(tool, args, ctx, call_original)
     d:reject(_rewrite_result(mapping, err))
   end)
   return d
+end
+
+--- 执行门禁：所有工具执行的唯一强制入口。
+--- `effect == "process"` 的命令按 FIFO **串行**执行（沙箱会话/overlay 非并发安全，见
+--- `_serialize_process`）；沙箱关闭且允许降级时直接执行原工具（不串行）。其余 effect 不串行。
+--- @param tool table 工具定义（含 __sandbox_spec）
+--- @param args table
+--- @param ctx table
+--- @param call_original function() -> Deferred 真正执行原工具
+--- @return Deferred
+function M.gate(tool, args, ctx, call_original)
+  local cfg = config_store.get("tools.sandbox") or {}
+  if cfg.enabled == false and cfg.fail_closed == false then
+    return call_original()
+  end
+  local spec = tool and tool.__sandbox_spec or tool_spec.get(tool and tool.name, tool and tool.category)
+  if spec and spec.effect == "process" then
+    return _serialize_process(function() return _gate_inner(tool, args, ctx, call_original) end)
+  end
+  -- 非进程工具（read/fs_write/in_process）：若上一条进程命令的后处理仍在途（异步模式），
+  -- 先等待其完成——命令的 overlay 改动经后台合并进会话暂存后，读写工具才能看到一致视图
+  -- （否则「命令刚创建的文件」读取会落空）。等待不改变 FIFO 语义。
+  local pending = postprocess.pending
+  if not pending then
+    return _gate_inner(tool, args, ctx, call_original)
+  end
+  local out = async.Deferred.new()
+  local function proceed()
+    _gate_inner(tool, args, ctx, call_original):then_(
+      function(v) out:resolve(v) end, function(e) out:reject(e) end)
+  end
+  pending:then_(proceed, proceed)
+  return out
+end
+
+--- 是否有后台后处理链在途（异步模式下命令结果已返回、捕获/冻结/结算尚未完成）。
+--- @return boolean
+function M.postprocess_pending()
+  return postprocess.pending ~= nil
+end
+
+--- 等待当前后台后处理链完成（测试/关闭/重置前调用，保证不丢冻结与待审入队）。
+--- @param timeout_ms number|nil
+--- @return boolean 是否已完成
+function M.await_postprocess(timeout_ms)
+  local deadline = vim.uv.hrtime() + (timeout_ms or 60000) * 1e6
+  while postprocess.pending do
+    if vim.uv.hrtime() > deadline then return false end
+    local p = postprocess.pending
+    local done = false
+    p:then_(function() done = true end, function() done = true end)
+    vim.wait(50, function() return done or postprocess.pending ~= p end)
+  end
+  return true
+end
+
+--- 重置后台后处理登记（测试用；不取消在途链）。
+function M._reset_postprocess()
+  postprocess.pending = nil
+  postprocess.seq = 0
+end
+
+--- 登记一个后台后处理 Deferred（测试用；模拟卡住/在途的后处理链）。
+--- @param def Deferred|nil
+function M._set_postprocess_pending(def)
+  postprocess.seq = postprocess.seq + 1
+  postprocess.pending = def
 end
 
 return M

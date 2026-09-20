@@ -1209,6 +1209,203 @@ tests.suite("chat_ui", function(_, it)
     chat_service.reset()
   end)
 
+  it("执行中耗时刷新不收起用户展开的工具折叠（避免闪现未折叠块）", function(t)
+    local chat_view = require("NeoAI.ui.window.chat_view")
+    local chat_service = require("NeoAI.services.chat_service")
+    local event_bus = require("NeoAI.kernel.event_bus")
+    local events = require("NeoAI.kernel.events")
+    chat_view.reset()
+    chat_service.reset()
+
+    local opened = chat_view.open()
+    local agent = chat_service.get_current_agent()
+    agent.messages = {
+      { role = "user", content = "跑命令" },
+      { role = "assistant", content = "", tool_calls = {
+        { id = "c_open_1", ["function"] = { name = "run_command", arguments = '{"command":"sleep 5"}' } },
+      } },
+    }
+    chat_view.refresh()
+    event_bus.emit(events.TOOL_EXECUTION_STARTED, {
+      agent_id = agent.id, name = "run_command", tool_call_id = "c_open_1",
+    })
+    chat_view.flush()
+    vim.api.nvim_set_current_win(opened.win_id)
+
+    local function header_line()
+      for i, l in ipairs(vim.api.nvim_buf_get_lines(opened.buf, 0, -1, false)) do
+        if l:find("调用工具", 1, true) then return i end
+      end
+      return 0
+    end
+    local hl = header_line()
+    t.true_(hl > 0, "应找到工具首行")
+    vim.api.nvim_win_set_cursor(opened.win_id, { hl, 0 })
+    vim.cmd("normal! zo")
+    t.eq(-1, vim.fn.foldclosed(hl), "工具折叠应已展开")
+
+    -- 监视 foldclose!：耗时 tick 若先收起再重开用户展开的折叠，会产生可见闪烁。
+    local foldclosed_calls = 0
+    local orig_cmd = vim.cmd
+    vim.cmd = function(c, ...)
+      if type(c) == "string" and c:find("foldclose!", 1, true) then foldclosed_calls = foldclosed_calls + 1 end
+      return orig_cmd(c, ...)
+    end
+    local done = false
+    vim.defer_fn(function() done = true end, 1300)
+    vim.wait(4000, function() return done end)
+    vim.cmd = orig_cmd
+
+    vim.api.nvim_set_current_win(opened.win_id)
+    t.eq(0, foldclosed_calls, "耗时刷新不应 foldclose! 用户已展开的折叠（避免收起再展开的闪烁）")
+    t.eq(-1, vim.fn.foldclosed(header_line()), "耗时刷新后折叠应保持展开")
+
+    chat_view.reset()
+    chat_service.reset()
+  end)
+
+  it("工具参数含真实换行（非法/流式 JSON）不报错且折叠不被拆断", function(t)
+    local chat_view = require("NeoAI.ui.window.chat_view")
+    local chat_service = require("NeoAI.services.chat_service")
+    chat_view.reset()
+    chat_service.reset()
+
+    local opened = chat_view.open()
+    local agent = chat_service.get_current_agent()
+    agent.messages = {
+      { role = "user", content = "装依赖" },
+      { role = "assistant", content = "", tool_calls = {
+        { id = "c1", ["function"] = {
+          name = "run_command",
+          -- 流式未完成的 JSON，且字符串内是真实换行（非 \n 转义）
+          arguments = '{"command": "npm install\nnpm ls --depth=0", "timeout_ms": 300000',
+        } },
+      } },
+    }
+    local ok = pcall(chat_view.refresh)
+    t.true_(ok, "含真实换行的参数不应导致渲染报错（否则 buffer 半写、折叠拆断）")
+    vim.api.nvim_set_current_win(opened.win_id)
+    local lines = vim.api.nvim_buf_get_lines(opened.buf, 0, -1, false)
+    local header, last = nil, nil
+    for i, l in ipairs(lines) do
+      if l:find("调用工具", 1, true) then header = header or i end
+      if l:find("timeout_ms", 1, true) then last = i end
+    end
+    t.true_(header ~= nil and last ~= nil, "应渲染工具首行与参数末行")
+    t.true_(vim.fn.foldclosed(header) > 0, "工具折叠应默认收起")
+    t.eq(vim.fn.foldclosed(header), vim.fn.foldclosed(last), "参数行应与首行同属一个折叠（不被拆断）")
+
+    chat_view.reset()
+    chat_service.reset()
+  end)
+
+  it("执行中耗时刷新：收起的工具折叠保持收起（foldclose! 不被跳过）", function(t)
+    local chat_view = require("NeoAI.ui.window.chat_view")
+    local chat_service = require("NeoAI.services.chat_service")
+    local event_bus = require("NeoAI.kernel.event_bus")
+    local events = require("NeoAI.kernel.events")
+    chat_view.reset()
+    chat_service.reset()
+
+    local opened = chat_view.open()
+    local agent = chat_service.get_current_agent()
+    agent.messages = {
+      { role = "user", content = "跑命令" },
+      { role = "assistant", content = "", tool_calls = {
+        { id = "c_closed_1", ["function"] = { name = "run_command", arguments = '{"command":"sleep 5"}' } },
+      } },
+    }
+    chat_view.refresh()
+    event_bus.emit(events.TOOL_EXECUTION_STARTED, {
+      agent_id = agent.id, name = "run_command", tool_call_id = "c_closed_1",
+    })
+    chat_view.flush()
+    vim.api.nvim_set_current_win(opened.win_id)
+
+    local function header_line()
+      for i, l in ipairs(vim.api.nvim_buf_get_lines(opened.buf, 0, -1, false)) do
+        if l:find("调用工具", 1, true) then return i end
+      end
+      return 0
+    end
+    local hl = header_line()
+    t.true_(hl > 0 and vim.fn.foldclosed(hl) > 0, "工具折叠应默认收起")
+
+    -- 收起的折叠在耗时 tick 刷新时仍必须执行 foldclose!：若因写入后的临时「展开」态而
+    -- 跳过，内容会持续露在折叠外（回归：内容被刷到折叠外又回去）。
+    local closed_calls = 0
+    local orig_cmd = vim.cmd
+    vim.cmd = function(c, ...)
+      if type(c) == "string" and c:find("foldclose!", 1, true) then closed_calls = closed_calls + 1 end
+      return orig_cmd(c, ...)
+    end
+    local done = false
+    vim.defer_fn(function() done = true end, 1300)
+    vim.wait(4000, function() return done end)
+    vim.cmd = orig_cmd
+
+    vim.api.nvim_set_current_win(opened.win_id)
+    t.true_(closed_calls > 0, "收起状态的工具折叠在耗时刷新时应执行 foldclose!")
+    t.true_(vim.fn.foldclosed(header_line()) > 0, "耗时刷新后应保持收起")
+
+    chat_view.reset()
+    chat_service.reset()
+  end)
+
+  it("执行中耗时刷新不截断折叠边界（折叠内容不泄漏到折叠外）", function(t)
+    local chat_view = require("NeoAI.ui.window.chat_view")
+    local chat_service = require("NeoAI.services.chat_service")
+    local event_bus = require("NeoAI.kernel.event_bus")
+    local events = require("NeoAI.kernel.events")
+    chat_view.reset()
+    chat_service.reset()
+
+    local opened = chat_view.open()
+    local agent = chat_service.get_current_agent()
+    agent.messages = {
+      { role = "user", content = "跑命令" },
+      { role = "assistant", content = "", tool_calls = {
+        { id = "c_leak_1", ["function"] = {
+          name = "run_command", arguments = '{"command":"sleep 5"}' } },
+      } },
+    }
+    chat_view.refresh()
+    event_bus.emit(events.TOOL_EXECUTION_STARTED, {
+      agent_id = agent.id, name = "run_command", tool_call_id = "c_leak_1",
+    })
+    chat_view.flush()
+    vim.api.nvim_set_current_win(opened.win_id)
+
+    local function header_line()
+      for i, l in ipairs(vim.api.nvim_buf_get_lines(opened.buf, 0, -1, false)) do
+        if l:find("调用工具", 1, true) then return i end
+      end
+      return 0
+    end
+    local hl = header_line()
+    t.true_(hl > 0 and vim.fn.foldclosed(hl) > 0, "工具折叠应默认收起")
+    local end_before = vim.fn.foldclosedend(hl)
+    t.true_(end_before > hl, "工具折叠应包含多行内容")
+
+    -- 就地改写折叠首行（耗时刷新）会触发 nvim 增量折叠更新缺陷：折叠结束行被截断，
+    -- 使折叠内末行泄漏到折叠外。修复后折叠边界应保持不变。
+    local done = false
+    vim.defer_fn(function() done = true end, 1300)
+    vim.wait(4000, function() return done end)
+    vim.api.nvim_set_current_win(opened.win_id)
+
+    local hl2 = header_line()
+    t.true_(vim.fn.foldclosed(hl2) > 0, "耗时刷新后工具折叠应保持收起")
+    t.eq(end_before, vim.fn.foldclosedend(hl2),
+      "耗时刷新后折叠边界不应被截断（否则折叠内容会一行行泄漏到折叠外）")
+    for i = hl2, end_before do
+      t.eq(hl2, vim.fn.foldclosed(i), "折叠内第 " .. i .. " 行应与首行同属一个折叠")
+    end
+
+    chat_view.reset()
+    chat_service.reset()
+  end)
+
   it("工具折叠文本含结构化调用参数与执行结果（成功/失败均展示）", function(t)
     local chat_view = require("NeoAI.ui.window.chat_view")
     local chat_service = require("NeoAI.services.chat_service")
@@ -1496,6 +1693,57 @@ tests.suite("chat_ui", function(_, it)
     end
     t.true_(reason_line2 > 0, "流式更新后推理内容仍在 buffer")
     t.eq(-1, vim.fn.foldclosed(reason_line2), "光标不跟随时不应把已展开的折叠重新收起")
+
+    chat_view.reset()
+    chat_service.reset()
+  end)
+
+  it("跟随模式流式更新只收起新块，不重算/收起上方旧折叠", function(t)
+    local chat_view = require("NeoAI.ui.window.chat_view")
+    local chat_service = require("NeoAI.services.chat_service")
+    local event_bus = require("NeoAI.kernel.event_bus")
+    local events = require("NeoAI.kernel.events")
+    chat_view.reset()
+    chat_service.reset()
+
+    local opened = chat_view.open()
+    local agent = chat_service.get_current_agent()
+    local body = {}
+    for i = 1, 40 do body[#body + 1] = "正文 " .. i end
+    agent.messages = {
+      { role = "user", content = "q1" },
+      { role = "assistant", content = "早期正文", reasoning = "早期思考内容" },
+      { role = "assistant", content = table.concat(body, "\n") },
+    }
+    chat_view.refresh()
+    vim.api.nvim_set_current_win(opened.win_id)
+
+    -- 展开上方的早期推理折叠（模拟用户手动展开）
+    local reason_line = 0
+    for i, l in ipairs(vim.api.nvim_buf_get_lines(opened.buf, 0, -1, false)) do
+      if l:find("早期思考内容", 1, true) then reason_line = i break end
+    end
+    t.true_(reason_line > 0, "应找到早期推理内容")
+    vim.api.nvim_win_set_cursor(opened.win_id, { reason_line, 0 })
+    t.true_(vim.fn.foldclosed(reason_line) > 0, "早期推理折叠应默认收起")
+    vim.cmd("normal! zo")
+    t.eq(-1, vim.fn.foldclosed(reason_line), "zo 后应展开")
+
+    -- 光标回到底部（跟随），流式追加末尾消息（写入区间在底部，与旧折叠不重叠）
+    local total = vim.api.nvim_buf_line_count(opened.buf)
+    vim.api.nvim_win_set_cursor(opened.win_id, { total, 0 })
+    local last = agent.messages[#agent.messages]
+    last.content = last.content .. "\n流式新内容"
+    event_bus.emit(events.MESSAGE_UPDATED, { agent_id = agent.id, message = last })
+    chat_view.flush()
+
+    -- 旧代码整块 zxzM 会把上方已展开的折叠重新收起；新逻辑只收起写入区间内的折叠。
+    local reason_line2 = 0
+    for i, l in ipairs(vim.api.nvim_buf_get_lines(opened.buf, 0, -1, false)) do
+      if l:find("早期思考内容", 1, true) then reason_line2 = i break end
+    end
+    t.true_(reason_line2 > 0, "更新后早期推理内容仍在 buffer")
+    t.eq(-1, vim.fn.foldclosed(reason_line2), "跟随模式下不应重算并收起上方旧折叠块")
 
     chat_view.reset()
     chat_service.reset()

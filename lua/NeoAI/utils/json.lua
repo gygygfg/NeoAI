@@ -35,7 +35,21 @@ end
 
 -- ========== 编码 ==========
 
---- 编码为 JSON 字符串
+--- 快速编码：直接使用 vim.json（C 实现），**跳过** `_sanitize_value` 的全表 UTF-8 深扫。
+--- 适用于大体积结构（如沙箱候选含大量文件内容）：深扫是纯 Lua 逐字节扫描，是主线程卡顿源。
+--- 调用方须自行保证输出为合法 UTF-8（沙箱落盘路径在 worker 里校验，非法时回退 `encode`）。
+--- 无 vim.json 时退回 `encode`（保证正确性优先）。
+--- @param value any
+--- @return string
+function M.encode_fast(value)
+  if vim_json_available then
+    local ok, encoded = pcall(vim.json.encode, value)
+    if ok then return encoded end
+  end
+  return M.encode(value)
+end
+
+--- 编码为 JSON 字符串（含非法 UTF-8 清洗，保证输出可被严格解析器接受）
 --- @param value any
 --- @return string
 function M.encode(value)

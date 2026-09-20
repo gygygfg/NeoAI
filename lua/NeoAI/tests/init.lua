@@ -218,6 +218,11 @@ function M.run_all(...)
     if uc.tools.sandbox.observe == nil then
       uc.tools.sandbox.observe = { enabled = false }
     end
+    -- 测试默认同步后处理（进程命令结果在捕获/冻结/结算完成后返回），保持既有断言确定性；
+    -- 异步后处理专项用例显式覆盖 tools.sandbox.postprocess="async" 并用 wrapper.await_postprocess 等待。
+    if uc.tools.sandbox.postprocess == nil then
+      uc.tools.sandbox.postprocess = "sync"
+    end
     return orig_config_load(uc)
   end
   pcall(function()
@@ -227,6 +232,7 @@ function M.run_all(...)
       cur.tools.sandbox = cur.tools.sandbox or {}
       cur.tools.sandbox.run_as = { uid = 0, gid = 0 }
       cur.tools.sandbox.observe = cur.tools.sandbox.observe or { enabled = false }
+      cur.tools.sandbox.postprocess = cur.tools.sandbox.postprocess or "sync"
       orig_config_load(cur)
     end
   end)

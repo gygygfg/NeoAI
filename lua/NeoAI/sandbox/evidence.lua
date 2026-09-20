@@ -77,12 +77,12 @@ end
 
 -- ========== 公开 API ==========
 
---- 记录一条证据
---- @param kind string "fs" | "process" | "network" | "decision" | "observation"
---- @param payload table
---- @param meta table|nil { command_id?, attempt_id?, change_set_id?, tool?, source?, coverage? }
---- @return string evidence_id
-function M.add(kind, payload, meta)
+--- 构造证据记录（脱敏 + 截断），不写盘。
+--- @param kind string
+--- @param payload any
+--- @param meta table|nil
+--- @return table record
+local function _build(kind, payload, meta)
   meta = meta or {}
   state.seq = state.seq + 1
   local id = string.format("evidence_%d_%s", state.seq, tostring(os.time()))
@@ -102,8 +102,29 @@ function M.add(kind, payload, meta)
   if #encoded > MAX_BYTES then
     record.payload = { truncated = true, preview = encoded:sub(1, MAX_BYTES) }
   end
+  return record
+end
+
+--- 记录一条证据
+--- @param kind string
+--- @param payload any
+--- @param meta table|nil { command_id?, attempt_id?, change_set_id?, tool?, source?, coverage? }
+--- @return string evidence_id
+function M.add(kind, payload, meta)
+  local record = _build(kind, payload, meta)
   pcall(store.write_evidence, record)
-  return id
+  return record.evidence_id
+end
+
+--- 异步记录一条证据（write-behind，不阻塞主线程）。用于高频观测类证据（越界访问留痕）。
+--- @param kind string
+--- @param payload any
+--- @param meta table|nil
+--- @return string evidence_id
+function M.add_async(kind, payload, meta)
+  local record = _build(kind, payload, meta)
+  pcall(store.write_evidence_async, record)
+  return record.evidence_id
 end
 
 --- 读取证据

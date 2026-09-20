@@ -57,7 +57,19 @@ local function _run_command(command, opts)
   local stderr_chunks = {}
   local done = false
   local job
+  local cfg_rc = require("NeoAI.kernel.config_store").get("tools.run_command") or {}
   local timeout_ms = opts.timeout_ms or 30000
+  -- 墙钟安全网：max_wall_ms>0 时约束所有命令（含 timeout_ms=-1 的「不限」），避免永久运行。
+  local max_wall = tonumber(cfg_rc.max_wall_ms) or 0
+  if max_wall > 0 and (timeout_ms < 0 or timeout_ms > max_wall) then timeout_ms = max_wall end
+  -- 沙箱门禁提供的进程树终止回调（cgroup.kill）：bwrap 载荷在独立 pid 命名空间内，
+  -- 仅 jobstop 外层 bwrap 可能杀不掉载荷；取消/超时/截断时优先按资源域精确终止。
+  local kill = opts.kill
+  -- 资源域路径（诊断/归因）：命令以 SIGKILL（137）结束时读取 cgroup 事件判定是否 OOM。
+  local cgroup_path = opts.cgroup_path
+  local max_out = tonumber(cfg_rc.max_output_bytes) or 0
+  local out_bytes, err_bytes = 0, 0
+  local truncated = false
 
   local function snapshot()
     return table.concat(stdout_chunks), table.concat(stderr_chunks)
@@ -72,8 +84,32 @@ local function _run_command(command, opts)
     d:resolve(result)
   end
 
+  --- 追加一块输出；超过 max_out 时截断并终止命令（避免超大输出冻结主线程）。
+  --- @param chunks table
+  --- @param data table
+  --- @param which string "out" | "err"
+  local function append(chunks, data, which)
+    if done or not data or #data == 0 then return end
+    local s = table.concat(data, "\n")
+    local used = (which == "out") and out_bytes or err_bytes
+    if max_out > 0 and used + #s > max_out then
+      s = s:sub(1, math.max(0, max_out - used))
+      chunks[#chunks + 1] = s
+      if which == "out" then out_bytes = max_out else err_bytes = max_out end
+      if not truncated then
+        truncated = true
+        if kill then pcall(kill) end
+        if job then pcall(vim.fn.jobstop, job) end
+      end
+      return
+    end
+    chunks[#chunks + 1] = s
+    if which == "out" then out_bytes = used + #s else err_bytes = used + #s end
+  end
+
   if opts.signal then
     unsub = opts.signal:subscribe(function(reason)
+      if kill then pcall(kill) end
       if job then pcall(vim.fn.jobstop, job) end
       local out, errout = snapshot()
       settle({ code = -1, stdout = out, stderr = errout, aborted = true, message = reason })
@@ -83,6 +119,7 @@ local function _run_command(command, opts)
   if timeout_ms > 0 then
     vim.defer_fn(function()
       if done then return end
+      if kill then pcall(kill) end
       if job then pcall(vim.fn.jobstop, job) end
       local out, errout = snapshot()
       settle({ code = -1, stdout = out, stderr = errout, timed_out = true })
@@ -96,18 +133,21 @@ local function _run_command(command, opts)
     stdout_buffered = false,
     stderr_buffered = false,
     on_stdout = function(_, data)
-      if data and #data > 0 then
-        stdout_chunks[#stdout_chunks + 1] = table.concat(data, "\n")
-      end
+      append(stdout_chunks, data, "out")
     end,
     on_stderr = function(_, data)
-      if data and #data > 0 then
-        stderr_chunks[#stderr_chunks + 1] = table.concat(data, "\n")
-      end
+      append(stderr_chunks, data, "err")
     end,
     on_exit = function(_, code)
       local out, errout = snapshot()
-      settle({ code = code, stdout = out, stderr = errout })
+      local oom = false
+      if code == 137 and cgroup_path then
+        local ok, cgroup = pcall(require, "NeoAI.sandbox.cgroup")
+        if ok and cgroup then
+          oom = cgroup.snapshot_oom(cgroup.events_snapshot(cgroup_path))
+        end
+      end
+      settle({ code = code, stdout = out, stderr = errout, truncated = truncated, oom = oom })
     end,
   })
 
@@ -150,13 +190,34 @@ local function _with_status(status, out, errout)
   return table.concat(parts, "\n")
 end
 
+--- 环境不匹配提示：容器内无 systemd 时，命令尝试 systemctl/service 会失败。
+--- 反应式注入（仅在输出命中相关特征时），不暴露沙箱实现。
+--- @param text string
+--- @return string
+local function _env_hint(text)
+  if type(text) ~= "string" or text == "" then return text end
+  local hit = text:find("System has not been booted with systemd", 1, true)
+    or text:find("Failed to connect to bus", 1, true)
+    or text:find("systemctl: command not found", 1, true)
+    or text:find("systemctl: not found", 1, true)
+    or text:find("Unit .* not found", 1, false)
+  if hit then
+    return text .. "\n\n[环境提示] 当前环境无 systemd（PID1 非 systemd），"
+      .. "systemctl/service 不可用；请直接运行前台命令，或改用进程管理/容器方式。"
+  end
+  return text
+end
+
 -- ========== 工具定义 ==========
 
 local shell_tools = {}
 
 shell_tools.run_command = helpers.define_tool(
   "run_command",
-  "执行 Shell 命令。command 必填。timeout_ms 可选（默认 30000，-1 为不限）。",
+  "执行 Shell 命令（前台，单次调用内完成）。command 必填。timeout_ms 可选（默认 30000ms，-1 为不限）。"
+  .. "长任务（安装依赖/编译/下载）请在**同一次调用**内显式传较大的 timeout_ms（如 600000），"
+  .. "不要靠重试短命令或后台进程规避超时；后台进程（&/nohup/setsid）不跨调用存活，"
+  .. "需要常驻服务请用 service_start/service_logs/service_stop。",
   {
     type = "object",
     properties = {
@@ -186,6 +247,8 @@ shell_tools.run_command = helpers.define_tool(
       prefix = ctx and ctx.sandbox_prefix,
       cwd = ctx and ctx.sandbox_cwd,
       env = ctx and ctx.sandbox_env,
+      kill = ctx and ctx.sandbox_kill,
+      cgroup_path = ctx and ctx.sandbox_cgroup_path,
     }):then_(function(result)
       -- 供沙箱门禁做权限不足检测（自动提权）：保留原始 {code,stdout,stderr}。
       if ctx then ctx.sandbox_last_result = result end
@@ -194,16 +257,36 @@ shell_tools.run_command = helpers.define_tool(
       return conceal.redact_async(result.stdout or ""):then_(function(out)
         return conceal.redact_async(result.stderr or ""):then_(function(errout)
           local text
-          if result.aborted then
+          if result.truncated then
+            -- 输出超过上限：命令已被终止，已产生内容仍回传并标注截断。
+            text = _with_status(
+              string.format("输出超过 %d 字节上限，已截断并终止命令",
+                tonumber(require("NeoAI.kernel.config_store").get("tools.run_command.max_output_bytes")) or 0),
+              out, errout)
+          elseif result.aborted then
             -- 取消/超时/非零退出都回传已产生的终端内容，模型仍能看到当前进度
             text = _with_status("命令已取消：" .. tostring(result.message or "cancelled"), out, errout)
           elseif result.timed_out then
             text = _with_status("命令执行超时", out, errout)
+          elseif result.oom then
+            -- 资源域 OOM：命令被 SIGKILL（137），memory.events 出现 oom_kill。
+            text = _with_status(
+              "命令被终止（疑似内存超限 OOM）：沙箱资源域内存不足，命令进程被内核杀死。"
+              .. "请减小并发/单次任务内存占用，或在 tools.sandbox.limits 调高 memory_bytes/memory_ratio 后重试",
+              out, errout)
+          elseif result.code == 137 then
+            -- 非超时/取消/截断的 137：SIGKILL 来源不明（资源域终止、宿主 OOM 或外部信号）。
+            text = _with_status(
+              "命令被强制终止（退出码 137 / SIGKILL）：非超时或取消所致。"
+              .. "常见原因：宿主/容器内存不足触发 OOM，或命令被外部信号终止。"
+              .. "可开启 tools.sandbox.diagnostics.enabled 查看资源域事件",
+              out, errout)
           elseif result.code == 0 then
             text = out ~= "" and out or "（无输出）"
           else
             text = _with_status(string.format("命令退出码 %d", result.code), out, errout)
           end
+          text = _env_hint(text)
           if ctx and ctx.sandbox_userns then
             -- 特权档（T2）：嵌套 userns 天然无 overlay，属有意设计，显示专用提示而非降级告警。
             ctx.ui_notice = PRIVILEGED_NOTE
@@ -230,12 +313,17 @@ shell_tools.run_command = helpers.define_tool(
           end
           -- 非零退出码 / 取消 / 超时视为失败：以结构化结果 resolve（含 error 字段）——
           -- UI 据此显示 ❌；同时仍 resolve（而非 reject）以保留沙箱门禁的权限升级检测与候选冻结。
-          if result.aborted or result.timed_out or (result.code ~= 0) then
+          -- 输出截断导致的终止不算失败（命令本身可能已成功，只是输出过多）。
+          if (not result.truncated) and (result.aborted or result.timed_out or (result.code ~= 0)) then
             local reason
             if result.aborted then
               reason = "命令已取消：" .. tostring(result.message or "cancelled")
             elseif result.timed_out then
               reason = "命令执行超时"
+            elseif result.oom then
+              reason = "命令被终止（疑似内存超限 OOM）"
+            elseif result.code == 137 then
+              reason = "命令被强制终止（退出码 137 / SIGKILL）"
             else
               reason = "命令退出码 " .. tostring(result.code)
             end

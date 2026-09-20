@@ -73,6 +73,12 @@ local SPECS = {
   lsp_service_info = { effect = "read" },
   lsp_rename = { effect = "fs_write" },
   lsp_format = { effect = "fs_write" },
+  -- 长驻服务（service_*）：start/stop 为进程效果（门禁预检+脚本扫描+硬拒绝），但隔离与候选
+  -- 结算由 sandbox.service 自建（见 wrapper 的 long_lived 分支）；logs/status 为只读。
+  service_start = { effect = "process" },
+  service_stop = { effect = "process" },
+  service_logs = { effect = "read" },
+  service_status = { effect = "read" },
   -- 网络
   web_fetch = { effect = "network" },
   -- read_image 的 file_path 可为本地路径：进程内读盘，必须纳入遮蔽判定（URL 分支不受影响）。

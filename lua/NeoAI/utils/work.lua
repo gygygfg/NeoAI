@@ -109,4 +109,40 @@ function M.reset()
   has_new_work = vim.uv ~= nil and type(vim.uv.new_work) == "function"
 end
 
+--- 分批并发执行：每次最多 `limit` 个在途任务，完成一批再提交下一批。
+--- 避免一次性向 libuv 线程池（默认 4 线程）排入数百个 chunk job，使后续 UI 关键 job
+--- （脱敏 / 密钥 token 化 / 落盘）不必排在全部 chunk 之后（表现为工具结果迟迟不返回）。
+--- @param tasks table 任务数组
+--- @param limit number 每批并发上限
+--- @param start function(task) -> Deferred 启动单个任务（在主线程调用，可创建闭包）
+--- @return Deferred resolve(结果数组，按 tasks 顺序)
+function M.batched(tasks, limit, start)
+  limit = math.max(1, tonumber(limit) or 4)
+  local out = {}
+  local d = async.Deferred.new()
+  local i = 0
+  local function step()
+    if i >= #tasks then d:resolve(out); return end
+    local group = {}
+    for _ = 1, limit do
+      i = i + 1
+      if i > #tasks then break end
+      group[#group + 1] = { idx = i, res = start(tasks[i]) }
+    end
+    local pending = #group
+    for _, g in ipairs(group) do
+      local gi = g
+      gi.res:then_(function(v)
+        out[gi.idx] = v
+        pending = pending - 1
+        if pending == 0 then step() end
+      end, function(e)
+        d:reject(e)
+      end)
+    end
+  end
+  step()
+  return d
+end
+
 return M

@@ -159,7 +159,8 @@ function M.refresh(cwd)
   local specs = _resolve_specs(cwd)
   if not specs then return nil end
   _wipe_upper(specs)
-  require("NeoAI.sandbox.candidate").materialize_overlay(specs)
+  -- upper 已被清空：强制全量重物化（否则版本未变的暂存项会被跳过，LSP 视图看不到改动）。
+  require("NeoAI.sandbox.candidate").materialize_overlay(specs, { force = true })
   return specs
 end
 

@@ -334,6 +334,16 @@ local DEFAULT_CONFIG = {
     search_files = {
       max_file_bytes = 8 * 1024 * 1024, -- 单文件扫描上限（字节）：超过则跳过，避免大文件 OOM；二进制文件跳过
     },
+    -- run_command 输出保护：stdout/stderr 合计超过 max_output_bytes 时截断并终止命令，
+    -- 避免超大输出（`timeout=-1` 的 `seq`/构建日志可达数百 MB）在 on_stdout 逐行处理 +
+    -- 拼接时冻结主线程（实测 150 MB 输出约 11s 主线程）。命令本身通常也不需如此多输出。
+    -- 0 = 不限制。
+    run_command = {
+      max_output_bytes = 16 * 1024 * 1024,
+      -- 墙钟安全网（ms）：>0 时命令最长运行该时长（同样约束 `timeout_ms=-1` 的「不限」命令），
+      -- 到时经沙箱资源域真正终止进程树，避免长任务永久占用资源、工具永不返回。0 = 不限制。
+      max_wall_ms = 0,
+    },
     lsp = {
       timeout_ms = 10000, -- LSP 请求超时（ms）：服务器无响应时快速失败，避免工具循环挂到 executor 超时
     },
@@ -458,11 +468,22 @@ local DEFAULT_CONFIG = {
       enabled = true, -- 总开关；关闭且 fail_closed=true 时拒绝所有工具执行
       fail_closed = true, -- 沙箱服务缺失/被禁用时是否拒绝执行（不得静默降级）
       mode = "dry_run", -- dry_run（默认，仅出候选）| commit（授权后立即 CAS 发布）
+      -- 进程命令（run_command 等）的后处理模式：
+      --   "async"（默认）= 命令进程退出后**立即**把结果交回主线程下一轮循环；overlay 捕获、
+      --     候选冻结、暂存合并、落盘与结算在后台线程/异步链完成（FIFO 槽位保持到后台完成，
+      --     保证下一命令看到一致的会话暂存）。大输出/大量文件的命令不再阻塞 agent 循环。
+      --   "sync" = 等待后处理完成后再返回结果（确定性；测试默认注入此值）。
+      postprocess = "async",
+      -- 退出 / 关闭（`:qall`、插件热重载）时等待后台后处理与暂存迁移完成的最长时间（ms）。
+      -- 超时即放弃等待，避免后处理卡住时退出长时间无响应；正常后处理在毫秒级完成，不触发超时。
+      -- 0 = 不等待（可能丢失最后一笔未完成的冻结/待审入队）。
+      shutdown_timeout_ms = 3000,
       backend = "auto", -- auto | bwrap | unshare（外部隔离后端）
       offline = false, -- 网络默认放行（仅记录审计，不拦截）；true 时硬拒绝网络类工具并隔离进程网络
       require_seccomp = true, -- true 时缺少 seccomp 能力则拒绝外部执行（默认开，fail-closed）
       -- 载荷 capability：默认**最小权限**（`{}` → `--cap-drop ALL`）。需要的能力按命令
-      -- **窄范围**加回（包安装经 `packages.cap_add`，纯包安装命令才授予；混合命令不授予）。
+      -- **窄范围**加回：包安装经 `packages.cap_add`、系统管理命令（useradd/chown/passwd 等）
+      -- 经 `privilege.sysadmin.cap_add`（见下），均只对命中的命令授予，普通命令不授予。
       -- 宿主不可修改由
       -- **命名空间（mount/pid/uts/ipc/cgroup）+ 整机根 overlay（`read_all` 默认，根文件系统
       -- 原样可写、写入全部进 upper 暂存）+ 宿主敏感路径遮蔽 + `/proc/sys` 只读绑定 +
@@ -504,6 +525,9 @@ local DEFAULT_CONFIG = {
       -- 每个工作线程任务的候选文件数：冻结/哈希按此分块并发提交到线程池（默认 4 线程），
       -- 使 npm/cargo 等产生大量文件的命令用满多核而非单核串行。0/缺省 = 128。
       work_chunk_files = 128,
+      -- 每批并发提交到线程池的 chunk 数上限（默认 4，与 libuv 线程池一致）：避免一次性
+      -- 排入数百个 chunk job，使后续 UI 关键 job（脱敏/密钥 token 化/落盘）不必排在队尾。
+      work_parallelism = 4,
       -- 在隔离环境内遮蔽的宿主敏感路径（安全默认）：目录以空 tmpfs 遮蔽，
       -- 文件/socket 以 /dev/null 覆盖。含 docker.sock（= 宿主 root）、容器数据、
       -- 编排器/面板/D-Bus 通道、宿主凭据目录，以及宿主身份/日志/命令历史等读取面泄露项。
@@ -532,6 +556,9 @@ local DEFAULT_CONFIG = {
         "/run/user/*/keyring", "/run/user/*/keyring/ssh", "/run/user/*/ssh*",
         "/run/user/*/gnupg*", "/tmp/ssh-*", "/root/.ssh-agent",
         -- 宿主身份与凭据
+        -- 账户数据库（/etc/passwd、/etc/group、/etc/shadow、/etc/gshadow）默认遮蔽，避免
+        -- 任意命令读取宿主口令哈希；仅**系统管理命令**（useradd/chown/passwd 等，见
+        -- `privilege.sysadmin.unmask`）按需解除，使其能读写账户库。写入仍进 overlay 暂存。
         "/etc/shadow", "/etc/shadow-", "/etc/gshadow", "/etc/gshadow-",
         "/etc/sudoers", "/etc/sudoers.d", "/etc/machine-id", "/etc/hostid",
         "/etc/ssh", "/etc/ssl/private", "/etc/ipa", "/etc/krb5.keytab",
@@ -652,6 +679,16 @@ local DEFAULT_CONFIG = {
         host_local_block = true,
         -- 宿主过滤代理监听端口（0 = 自动分配 loopback 随机端口）。
         host_local_proxy_port = 0,
+        -- 国内/受限网络镜像（默认空 = 完全沿用系统配置）。仅对**沙箱外部命令**生效，
+        -- 通过环境变量注入（npm 另经 settings 绑定）。用于绕过代理/源站不可达：
+        --   pip   = "https://pypi.tuna.tsinghua.edu.cn/simple"（注入 PIP_INDEX_URL + PIP_TRUSTED_HOST）
+        --   npm   = "https://registry.npmmirror.com/"（注入 npm_config_registry）
+        --   maven = "https://maven.aliyun.com/repository/public"（生成 settings.xml，经 MAVEN_OPTS 指向）
+        mirrors = {
+          pip = "",
+          npm = "",
+          maven = "",
+        },
         -- 独立 netns + 宿主网关（opt-in）：沙箱进程进入隔离网络命名空间，只能到达宿主网关；
         -- 网关对目标 host:port 先做 TCP connect 探针（可探测宿主哪些端口在监听），但不回传
         -- 真实服务数据，而是把拦截原因（JSON）返回给客户端。仅允许探测宿主本机地址。
@@ -682,6 +719,22 @@ local DEFAULT_CONFIG = {
         prewarm = true,
         -- 预热有效期（毫秒）：超时未被下一条进程命令复用则回收（停止探针、释放 cgroup）。
         prewarm_ttl_ms = 90000,
+      },
+      -- 诊断埋点（默认关，排查 137 / OOM / 资源域终止时开启）。开启后仅在
+      -- NeoAI 日志（logger）中记录，不改变执行行为、不写入模型可见结果。
+      diagnostics = {
+        enabled = false, -- 总开关
+        log_kill_caller = false, -- cgroup.kill 调用方堆栈（定位谁终止了进程树）
+        dump_cgroup_events = false, -- 命令结束时 dump 资源域 memory/pids 事件（OOM 归因）
+      },
+      -- 长驻服务（service_* 工具）：后台进程跨工具调用存活，直到显式停止 / 会话结束。
+      -- 每个服务使用独立 overlay attempt，启动时把工作区暂存物化进服务视图（单向快照），
+      -- 停止时把服务改动捕获并合并回工作区暂存（边界同步，非实时互通）。
+      service = {
+        enabled = true, -- 是否注册 service_* 工具
+        max_services = 16, -- 同时存活的服务数上限
+        max_log_bytes = 262144, -- 单服务日志环形缓冲上限（字节）
+        stop_timeout_ms = 5000, -- 停止时等待进程优雅退出的上限（超时 SIGKILL）
       },
       -- 异步审批（设计文档 §15）：AI 修改立即沙箱执行并冻结候选，      -- 用户异步确认允许哪些文件/配置修改后再 CAS 应用。
       review = {
@@ -717,6 +770,13 @@ local DEFAULT_CONFIG = {
       approval = {
         default = "review",
         levels = {}, -- 覆盖：{ [0]="auto", [1]="review", [2]="review", [3]="review" }
+      },
+      -- 风险分级（见 sandbox/risk.lua）。
+      risk = {
+        -- 结果扫描窗口（字节）：命令结果判定安全级别时仅扫描 stdout/stderr 首/尾各 N 字节，
+        -- 避免 `timeout=-1` 的大输出（可达数百 MB）在主线程做全量 lower + 模式匹配而冻结界面。
+        -- 风险信号多在输出首尾；0 = 不限制。
+        result_scan_bytes = 262144,
       },
       -- 脚本间接执行静态扫描（见 sandbox/script_scan.lua）：命令把执行委托给脚本/解释器
       -- （`bash deploy.sh`、`python setup.py`、`node x.js`、`./run.sh`、`bash -c '…'`）时，
@@ -763,6 +823,12 @@ local DEFAULT_CONFIG = {
           "CAP_SETUID", "CAP_SETGID", "CAP_SETFCAP", "CAP_FSETID",
           "CAP_SYS_CHROOT", "CAP_KILL",
         },
+        -- apt 系列命令的 `APT::Sandbox::User`：apt 在 root 下默认把下载/校验降权到 `_apt`
+        -- 用户（setgroups + setuid/setgid）；嵌套 user namespace / 受限容器中 setgroups 返回
+        -- EPERM，`apt-get update`/`install` 直接失败（`setgroups failed - Operation not
+        -- permitted`）。沙箱已由命名空间 + overlay 暂存隔离、载荷本就以 root 运行，故默认
+        -- 注入该配置关闭降权。设为 "_apt" 或空串则保留 apt 默认行为。
+        apt_sandbox_user = "root",
         -- 包安装命令的宿主状态目录：命令判定为包安装时这些路径需可写。`read_all=true`
         -- （默认）下整机根已是可写 overlay，本列表仅用于包路径分类/审批合并；`read_all=false`
         -- 或整机 overlay 不可用时，作为额外可写根加入（overlay 暂存），使 apt/dpkg/pip/npm 等
@@ -866,6 +932,24 @@ local DEFAULT_CONFIG = {
             cap_add = { "ALL" }, mounts = {}, unmask = {},
           },
         },
+        -- 系统管理命令（useradd/usermod/groupadd/chown/passwd 等）：默认最小权限下这些命令
+        -- 会因缺少 CHOWN/SETUID/SETGID/DAC_OVERRIDE 而失败（如 useradd 无法锁 /etc/passwd、
+        -- 打不开 /etc/gshadow；chown 报 Operation not permitted），且账户数据库被遮蔽。
+        -- 命中即加回窄能力并解除账户库遮蔽（写入仍全部进 overlay 暂存，真实账户库/文件系统
+        -- 不受影响）；普通命令仍保持最小权限、账户库仍遮蔽，避免任意命令读取口令哈希。
+        sysadmin = {
+          cap_add = {
+            "CAP_CHOWN", "CAP_DAC_OVERRIDE", "CAP_DAC_READ_SEARCH", "CAP_FOWNER",
+            "CAP_SETUID", "CAP_SETGID", "CAP_SETFCAP", "CAP_FSETID",
+            "CAP_SYS_CHROOT", "CAP_KILL",
+          },
+          -- 需读写账户数据库，故仅对系统管理命令解除这些路径的遮蔽。
+          unmask = {
+            "/etc/passwd", "/etc/group", "/etc/shadow", "/etc/shadow-",
+            "/etc/gshadow", "/etc/gshadow-", "/etc/subuid", "/etc/subgid",
+            "/etc/subuid-", "/etc/subgid-",
+          },
+        },
         -- 命令分类规则：命中即提升到对应档位（多条命中取最高档）。
         -- bins = 精确可执行名；bin+subs = 可执行名 + 子命令。
         classify = {
@@ -888,6 +972,12 @@ local DEFAULT_CONFIG = {
           } },
           { tier = 1, name = "network", bin = "git", subs = {
             "push", "pull", "fetch", "clone", "remote", "ls-remote", "submodule",
+          } },
+          { tier = 1, name = "sysadmin", bins = {
+            "useradd", "usermod", "userdel", "adduser", "deluser",
+            "groupadd", "groupmod", "groupdel", "addgroup", "delgroup",
+            "passwd", "chpasswd", "chage", "chfn", "chsh",
+            "chown", "chgrp", "setfacl",
           } },
           { tier = 1, name = "package", bin = "npm", subs = { "install", "i", "ci", "add", "update", "publish" } },
           { tier = 1, name = "package", bin = "pnpm", subs = { "install", "i", "add", "update", "publish" } },

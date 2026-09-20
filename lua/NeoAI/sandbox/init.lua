@@ -134,9 +134,17 @@ function M.shutdown()
   M.unwatch_sessions()
   pcall(function() require("NeoAI.sandbox.net_gateway").teardown() end)
   pcall(function() require("NeoAI.sandbox.host_proxy").stop() end)
-  -- 先等异步写入（候选/待审）落盘，避免关闭时丢失最后一笔。
-  pcall(function() require("NeoAI.sandbox.store").flush(5000) end)
-  candidate.reset()
+  -- 停止长驻服务：捕获其改动为候选并合并回暂存（有界等待），避免服务进程跨关闭残留。
+  pcall(function() require("NeoAI.sandbox.service").stop_all({ timeout_ms = 10000 }) end)
+  -- 先等后台后处理（异步模式下命令结果已返回、捕获/冻结/结算未完成）与异步写入落盘，
+  -- 避免关闭时丢失最后一笔冻结与待审入队。等待有上限（tools.sandbox.shutdown_timeout_ms，
+  -- 默认 3s）：后处理卡住时不至于让 `:qall` / 插件热重载长时间无响应。
+  local timeout = tonumber(config_store.get("tools.sandbox.shutdown_timeout_ms"))
+  if timeout == nil then timeout = 3000 end
+  timeout = math.max(0, timeout)
+  pcall(function() require("NeoAI.sandbox.wrapper").await_postprocess(timeout) end)
+  pcall(function() require("NeoAI.sandbox.store").flush(timeout) end)
+  candidate.reset(timeout)
   state.active = nil
   state.initialized = false
 end
@@ -307,6 +315,19 @@ end
 --- @return table { count = number, max_level = number|nil }
 function M.pending_summary()
   return review.pending_summary()
+end
+
+--- 是否有后台后处理在途（异步模式下命令结果已返回、捕获/冻结/结算尚未完成）
+--- @return boolean
+function M.postprocess_pending()
+  return require("NeoAI.sandbox.wrapper").postprocess_pending()
+end
+
+--- 等待后台后处理完成（测试/关闭前调用）
+--- @param timeout_ms number|nil
+--- @return boolean
+function M.await_postprocess(timeout_ms)
+  return require("NeoAI.sandbox.wrapper").await_postprocess(timeout_ms)
 end
 
 --- 越界访问留痕（访问 cwd 之外用户工作目录；供审批悬浮窗展示）
@@ -575,6 +596,10 @@ function M.reset()
   -- store.reset() 会因 root 为 nil 而 no-op，无法删除磁盘上的残留候选/待审，造成
   -- 跨 reset/跨套件污染。先按当前实例根初始化，使其可被清理。
   if not store.root() then store.init(_root()) end
+  -- 等待后台后处理完成，避免 reset 时仍有在途捕获/冻结/结算写入旧实例目录造成污染。
+  pcall(function() require("NeoAI.sandbox.wrapper").await_postprocess(60000) end)
+  -- 停止长驻服务并回收其 overlay/cgroup（先于 candidate/control/store 清理）。
+  pcall(function() require("NeoAI.sandbox.service").reset() end)
   candidate.reset()
   control.reset()
   store.reset()

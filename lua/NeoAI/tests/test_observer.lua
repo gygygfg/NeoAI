@@ -200,6 +200,38 @@ tests.suite("observer", function(_, it)
     t.eq(false, wrapper.prewarm_info().active, "清理后应无预热")
   end)
 
+  it("strace 观测：解析移入线程池并按路径去重派发文件事件", function(t)
+    local work = require("NeoAI.utils.work")
+    if not work.available() then return end -- 无 worker：同步回退已另有覆盖
+    local orig_backend = observer.backend
+    observer.backend = function() return "strace" end
+    local got = {}
+    local prefix, handle = observer.strace_prefix({
+      attempt_id = "strace_async_test",
+      on_event = function(evt) got[#got + 1] = evt end,
+      poll_ms = 20,
+    })
+    t.not_nil(prefix, "应返回 strace 前缀")
+    t.not_nil(handle, "应返回 handle")
+    local f = io.open(handle.path, "w")
+    f:write('123 openat(AT_FDCWD, "/root/.ssh/id_rsa", O_RDONLY) = 3\n')
+    f:write('123 openat(AT_FDCWD, "/root/.ssh/id_rsa", O_RDONLY) = 3\n')
+    f:write('123 openat(AT_FDCWD, "/usr/bin/ls", O_RDONLY) = 4\n')
+    f:close()
+    vim.wait(3000, function() return handle.offset > 0 and not handle.draining end, 20)
+    handle.stop()
+    observer.backend = orig_backend
+    local paths, n_rsa = {}, 0
+    for _, e in ipairs(got) do
+      paths[e.path] = true
+      if e.path == "/root/.ssh/id_rsa" then n_rsa = n_rsa + 1 end
+    end
+    t.true_(paths["/root/.ssh/id_rsa"], "应派发密钥文件路径")
+    t.true_(paths["/usr/bin/ls"], "应派发普通文件路径")
+    t.eq(1, n_rsa, "线程内解析应按路径去重（同一路径只派发一次）")
+    pcall(os.remove, handle.path)
+  end)
+
   it("cgroup：预热句柄可认领到 attempt（release 生效）", function(t)
     local cgroup = require("NeoAI.sandbox.cgroup")
     if not cgroup.probe().available then return end

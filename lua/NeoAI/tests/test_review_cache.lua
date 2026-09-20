@@ -126,4 +126,34 @@ tests.suite("review_cache", function(_, it)
     store.reset()
     review.reset()
   end)
+
+  it("apply_all 大量项：候选删除批量对账，不逐项全表扫描（避免 O(n²)）", function(t)
+    local store, review = setup()
+    local candidate = require("NeoAI.sandbox.candidate")
+    for i = 1, 100 do
+      store.write_candidate({
+        candidate_digest = "sha256:e" .. i,
+        files = { { path = "/tmp/apply" .. i, action = "modify", content = "x",
+          after_hash = "sha256:x", before_hash = "sha256:b" } },
+        created_at = i,
+      })
+      review.enqueue({
+        candidate_digest = "sha256:e" .. i,
+        files = { { path = "/tmp/apply" .. i, action = "modify" } },
+        created_at = i,
+      }, { tool = "edit_file" })
+    end
+    -- 隔离发布：只验证删除对账的扫描次数，不落真实文件。
+    local orig_publish, orig_receipt = candidate.publish, store.write_receipt
+    candidate.publish = function() return { ok = true, receipt = { operation_id = "op" } } end
+    store.write_receipt = function() return true end
+    local before = review._ref_scans()
+    local res = review.apply_all()
+    candidate.publish, store.write_receipt = orig_publish, orig_receipt
+    t.eq(100, res.applied, "应全部应用")
+    t.eq(0, res.failed, "不应有失败")
+    t.eq(before, review._ref_scans(), "批量应用不应逐项全表扫描引用")
+    store.reset()
+    review.reset()
+  end)
 end)

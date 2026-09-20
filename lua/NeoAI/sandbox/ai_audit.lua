@@ -171,10 +171,28 @@ local function _append_item(lines, item, index, cfg)
   end
   local files = item.files or {}
   if #files > 0 then
+    -- 水合后的待审项在落盘时剥离了文件内容（避免与候选重复编码大内容）：按 candidate_digest
+    -- 从候选补全内容，使 diff 仍可用。
+    local content_by_path
+    for _, f in ipairs(files) do
+      if type(f) == "table" and f.content == nil then
+        local store = require("NeoAI.sandbox.store")
+        local cand = item.candidate_digest and store.read_candidate(item.candidate_digest)
+        if cand then
+          content_by_path = {}
+          for _, cf in ipairs(cand.files or {}) do content_by_path[cf.path] = cf end
+        end
+        break
+      end
+    end
     lines[#lines + 1] = "- 修改文件："
     for _, f in ipairs(files) do
+      local ff = f
+      if type(f) == "table" and f.content == nil and content_by_path and content_by_path[f.path] then
+        ff = content_by_path[f.path]
+      end
       lines[#lines + 1] = string.format("  - [%s] %s", tostring(f.action or "modify"), tostring(f.path or "?"))
-      local diff = _file_diff(f, cfg)
+      local diff = _file_diff(ff, cfg)
       if diff then
         lines[#lines + 1] = "    ```diff"
         for _, dl in ipairs(vim.split(diff, "\n", { plain = true })) do

@@ -163,6 +163,7 @@ session = {
 | `external` | `{}` | 外部工具 |
 | `read_file` | `{outline_threshold_chars=500, outline_max_nodes=200, outline_max_depth=4, outline_preview_lines=50, max_read_bytes=5242880}` | read_file 大文件保护：未指定行范围且超阈值时返回语法树大纲（无解析器则截断预览）；超过 `max_read_bytes` 则拒绝整读并只给预览，避免 OOM |
 | `search_files` | `{max_file_bytes=8388608}` | 搜索时单文件扫描上限（字节），超过则跳过；二进制文件（含 NUL）跳过，避免大文件 OOM |
+| `run_command` | `{max_output_bytes=16777216, max_wall_ms=0}` | 命令 stdout/stderr 合计上限（字节）：超出则截断并终止命令，避免超大输出逐行处理冻结主线程；0 = 不限制。`max_wall_ms>0` 为墙钟安全网：命令最长运行该毫秒数（同样约束 `timeout_ms=-1` 的「不限」命令），到时经沙箱资源域真正终止进程树；0 = 不限制 |
 | `lsp` | `{timeout_ms=10000}` | LSP 请求超时（服务器无响应快速失败） |
 | `guard.repeat_tool` | `{enabled=true, thresholds={3,5,8}, messages=...}` | 连续重复工具调用提醒 |
 | `todo.enabled` | `true` | 待办工具 + 系统提示注入 |
@@ -218,6 +219,8 @@ sandbox = {
   -- 所有工具内部 spawn 的子进程（run_command/git/curl/node/MCP server 等）统一在沙箱命名空间内
   -- 创建；工具自身缓存/临时目录经可写绑定暴露，共享根 stdpath('cache')/NeoAI/shared（宿主与沙箱同路径）。
   mode = "dry_run",                -- dry_run（默认，仅冻结候选）| commit（授权后立即 CAS 发布）
+  postprocess = "async",           -- 进程命令后处理模式：async（默认）= 命令进程退出后立即返回结果给主循环，overlay 捕获/候选冻结/暂存合并/落盘/结算在后台完成（FIFO 槽位保持到后台完成，保证下一命令看到一致暂存；后续读写工具会等待在途后处理）；sync = 等待后处理完成后再返回（确定性，测试默认）
+  shutdown_timeout_ms = 3000,      -- 退出/关闭（`:qall`、插件热重载）时等待后台后处理与暂存迁移完成的最长时间（ms）；超时即放弃等待，避免卡住退出；0 = 不等待（可能丢失最后一笔未完成的冻结/待审入队）
   backend = "auto",                -- auto | bwrap | unshare
   offline = false,                 -- 网络默认放行（仅记录，不拦截）；true 时硬拒绝网络并隔离进程网络
   require_seccomp = true,          -- 缺少 seccomp 能力时是否拒绝外部执行（默认开，fail-closed）
@@ -240,6 +243,7 @@ sandbox = {
   },
   max_file_bytes = 8 * 1024 * 1024, -- 单文件纳入候选上限（字节）；超过不纳入候选，防 apt/pkgcache.bin 等大缓存阻塞主线程；0 = 不限制
   work_chunk_files = 128, -- 每个工作线程任务的候选文件数：冻结/哈希/密钥扫描按此分块并发投递到线程池（多核），防大量文件时单核串行；0/缺省 = 128
+  work_parallelism = 4, -- 每批并发提交到线程池的 chunk 数上限（默认 4，与 libuv 线程池一致）：避免一次性排入数百个 chunk job，使脱敏/密钥 token 化/落盘等 UI 关键 job 不必排在队尾；0/缺省 = 4
   -- 读取面（默认开）：true 时整机根以**可写 overlay** 方式暴露——以 `/` 为只读 lower、会话私有
   -- upper/work 为可写层（原样挂载、根内任意路径可写），所有写入进 upper 暂存并冻结为候选，
   -- 宿主盘不受影响；仅遮蔽 mask_paths 中的重要配置文件/凭据（~/.ssh、~/.aws、/etc/shadow、
@@ -309,6 +313,23 @@ sandbox = {
     prewarm = true,
     prewarm_ttl_ms = 90000, -- 预热有效期（毫秒）：超时未被复用则回收
   },
+  -- 诊断埋点（默认关）：排查 137 / OOM / 资源域终止时开启，仅在 NeoAI 日志记录，
+  -- 不改变执行行为、不写入模型可见结果。配合 `:NeoAISandboxDiag` 查看宿主/容器限制与负载。
+  diagnostics = {
+    enabled = false,          -- 总开关
+    log_kill_caller = false,  -- cgroup.kill 调用方堆栈（定位谁终止了进程树）
+    dump_cgroup_events = false, -- 命令结束时 dump 资源域 memory/pids 事件（OOM 归因）
+  },
+  -- 长驻服务（service_* 工具）：后台进程跨工具调用存活，直到显式停止 / 会话结束。
+  -- 每个服务使用独立 overlay attempt：启动时物化工作区暂存（单向快照），停止时捕获其改动
+  -- 并合并回工作区暂存（边界同步，非实时互通），经异步审批入队。资源域随服务创建，停止时
+  -- cgroup.kill 精确终止整个进程树。
+  service = {
+    enabled = true,          -- 是否注册 service_* 工具
+    max_services = 16,       -- 同时存活的服务数上限
+    max_log_bytes = 262144,  -- 单服务日志环形缓冲上限（字节）
+    stop_timeout_ms = 5000,  -- 停止时等待进程优雅退出的上限（超时 SIGKILL）
+  },
   network = {
     enabled = false, allowed_endpoints = {}, budget_bytes = 0, -- 受控网络网关
     -- 拦截向宿主本机（回环/宿主网卡 IP/链路本地/云元数据）的访问（默认开）：注入
@@ -325,6 +346,11 @@ sandbox = {
     -- 网关对目标 host:port 先做 TCP connect 探针（可探测宿主哪些端口在监听），但不回传真实
     -- 服务数据，而是把拦截原因（JSON）返回给客户端。仅允许探测宿主本机地址。需 root 与 ip。
     gateway = { enabled = false, probe_timeout_ms = 1000, max_probes = 4096 },
+    -- 国内/受限网络镜像（默认空 = 沿用系统）：仅对沙箱外部命令生效，经环境变量注入。
+    --   pip   → PIP_INDEX_URL + PIP_TRUSTED_HOST（如 "https://pypi.tuna.tsinghua.edu.cn/simple"）
+    --   npm   → npm_config_registry（如 "https://registry.npmmirror.com/"）
+    --   maven → 生成 settings.xml（镜像全部仓库）经 MAVEN_OPTS -s 指向
+    mirrors = { pip = "", npm = "", maven = "" },
   },
   -- 权限档位与自动提权：命令默认 T0 最小权限（非 root 载荷、cap-drop ALL、网络默认放行并拦截本机）。
   -- 权限/网络失败时**全档位**自动升级（T0→T1→T2，直到 max_tier）并在隔离内重跑，每步写证据/事件/审计。
@@ -335,12 +361,21 @@ sandbox = {
       [1] = { name = "elevated", review = "auto", network = true, cap_add = {}, mounts = {}, unmask = {} }, -- docker.sock 仅 docker 命令按需解除遮蔽
       [2] = { name = "privileged", review = "approve", network = true, userns = true, cap_add = { "ALL" }, mounts = {}, unmask = {} }, -- 嵌套 userns 内完整能力（作用域受限）；seccomp 仍生效
     },
+    -- 系统管理命令（useradd/chown/passwd 等）：命中即按需加回窄能力并解除账户库遮蔽，
+    -- 使 `useradd`/`usermod`/`groupadd`/`chown`/`passwd` 在沙箱内可用（默认最小权限下会因
+    -- 缺少 CHOWN/SETUID/SETGID/DAC_OVERRIDE 及账户库被遮蔽而失败）。写入仍进 overlay 暂存，
+    -- 真实账户库/文件系统不受影响；普通命令仍最小权限、账户库仍遮蔽（不泄露口令哈希）。
+    sysadmin = {
+      cap_add = { "CAP_CHOWN", "CAP_DAC_OVERRIDE", "CAP_DAC_READ_SEARCH", "CAP_FOWNER", "CAP_SETUID", "CAP_SETGID", "CAP_SETFCAP", "CAP_FSETID", "CAP_SYS_CHROOT", "CAP_KILL" },
+      unmask = { "/etc/passwd", "/etc/group", "/etc/shadow", "/etc/shadow-", "/etc/gshadow", "/etc/gshadow-", "/etc/subuid", "/etc/subgid", "/etc/subuid-", "/etc/subgid-" },
+    },
     classify = {                    -- 命令分类规则（bins 精确可执行名；bin+subs 可执行名+子命令）
       { tier = 2, name = "privileged", bins = { "sudo", "mount", "modprobe", "iptables", "systemctl", "unshare", "nsenter" } },
       { tier = 1, name = "docker", bins = { "docker", "docker-compose", "nerdctl" } }, -- 有守护进程：受控 socket
       { tier = 1, name = "container", bins = { "podman", "podman-compose", "buildah", "skopeo" } }, -- 无守护进程：可与沙箱同 namespace
       { tier = 1, name = "network", bins = { "curl", "wget", "ssh", "rsync", "ping", "socat" } },
       { tier = 1, name = "network", bin = "git", subs = { "push", "pull", "fetch", "clone" } },
+      { tier = 1, name = "sysadmin", bins = { "useradd", "usermod", "userdel", "adduser", "deluser", "groupadd", "groupmod", "groupdel", "addgroup", "delgroup", "passwd", "chpasswd", "chage", "chfn", "chsh", "chown", "chgrp", "setfacl" } }, -- 系统管理：窄能力 + 账户库解除遮蔽
       { tier = 1, name = "package", bins = { "apt", "apt-get", "dnf", "yum", "pacman", "apk", "brew" } }, -- 包安装：额外规则
     },
   },
@@ -369,6 +404,10 @@ sandbox = {
                           max_tokens = 2048, timeout_ms = 30000 } },
   -- 审批按安全级别分级（L0-L3）：动作 auto/record/review/block；默认 default="review"。
   approval = { default = "review", levels = {} },
+  -- 风险分级（sandbox/risk.lua）：命令结果判定级别时仅扫描 stdout/stderr 首/尾各
+  -- result_scan_bytes 字节，避免 `timeout=-1` 的大输出（可达数百 MB）在主线程全量
+  -- lower + 模式匹配而冻结界面；0 = 不限制。
+  risk = { result_scan_bytes = 262144 },
   -- 脚本间接执行静态扫描：`bash deploy.sh`、`python setup.py`、`node x.js`、`./run.sh`、
   -- `bash -c '…'` 等委托给脚本/解释器时，执行前读取脚本内容（优先沙箱暂存副本）并提取
   -- Shell 正文与高级语言（Python/Node/Ruby/Perl/PHP）内嵌 shell 调用，折叠进危险识别与权限
@@ -388,6 +427,7 @@ sandbox = {
     managers = { "apt", "apt-get", "pip", "pip3", "uv", "conda", "npm", "npx", "pnpm", "yarn", "go", "cargo", "gem", "composer" }, -- 包管理器名单（命令识别）；改动路径特征见 privilege.package_path_manager；敏感安装判定见 privilege.package_sensitive
     roots = { "/usr", "/var", "/etc", "~/.cache", "~/.npm", "~/.nvm", "~/.cargo", "~/.rustup", "~/go", "~/.local" }, -- 包安装可写根（overlay 暂存）。/etc 供 dpkg postinst 写 /etc/ld.so.cache 等；敏感条目仍由 mask_paths 遮蔽
     cap_add = { "CAP_DAC_OVERRIDE", "CAP_CHOWN", "CAP_SETUID", "CAP_SETGID", "CAP_FOWNER" },
+    apt_sandbox_user = "root", -- apt 系列：注入 APT::Sandbox::User（默认 "root" 关闭 apt 自身的 `_apt` 降权，避免嵌套 userns/受限容器中 setgroups EPERM 使 apt update/install 失败）；"_apt" 或空串保留 apt 默认行为
   },
   lsp_overlay = { enabled = true }, -- AI 专用沙箱 LSP：AI 的 lsp_* 工具克隆的 server 读暂存内容（默认开，仅 bwrap+overlay；不可用时回退编辑器客户端）
   secrets = { enabled = true, min_length = 20, max_length = 200, min_entropy = 3.5, min_distinct = 8, exclude_pure_hex = true, entropy_requires_context = true, entropy_secret_paths_only = true, generated_scan_max_bytes = 2097152, generated_scan_max_files = 200, tokenize_env = true, extra_rules = {}, allowlist = {} }, -- 密钥/敏感信息防护：熵检测 + 具名规则（私钥块/AKIA/ghp_/sk-/JWT/Bearer…）+ token 加密映射；env 名含 KEY/TOKEN/SECRET/PASSWORD/CREDENTIAL 的值无视熵强制 token 化；裸熵串须含 -/_ 且非代码标识符（snake_case 函数/常量名）或处于敏感名上下文（缩小认定范围，避免误伤 integrity/构建哈希/回溯函数名/路径分量）；非敏感名且值含 / 的环境变量只按具名规则脱敏（不破坏 PATH/LD_LIBRARY_PATH 等）；entropy_secret_paths_only=true 时全文熵扫描仅对疑似密钥文件（~/.ssh、~/.bashrc、/etc/* 等，见 secret.is_secret_path）执行，普通文件只走具名规则；generated_scan_max_bytes/generated_scan_max_files 限制 AI 生成高熵检测（detect_generated）的单次扫描预算，避免大候选逐文件全文扫描占满主线程（0 = 不限制）
@@ -449,6 +489,9 @@ web_fetch = {
 
 > **运行时行为**：禁用时零副作用（不注册工具、不安装依赖）；启用后依赖装到缓存目录
 > （`stdpath('cache')/NeoAI/web_fetch`）并使用同一目录下的 `browsers/`，**不改动系统环境**。
+> **依赖与浏览器内核的安装在宿主直接执行、不经沙箱**：安装产物（`node_modules`、可达数百 MB
+> 的内核）若进入沙箱 overlay 会被每条 `run_command` 反复捕获；渲染仍在沙箱内执行（浏览器从
+> 宿主只读可见）。
 > 若 `node`/`npm` 缺失，不自动调用系统包管理器，而是返回可操作的错误提示。
 > `approval.per_tool.web_fetch = { auto_allow = true }`（默认自动放行）。
 > 管线：Lua 编排 → bash 装依赖 → Node/Playwright 渲染并注入 JS → 取 DOM → turndown 转 Markdown。

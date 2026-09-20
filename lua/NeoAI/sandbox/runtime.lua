@@ -19,6 +19,9 @@ local state = {
   overlay_probe = {}, -- "dev_lower:dev_upper" -> boolean（按文件系统对缓存实测结果）
   overlay_write_probe = {}, -- "w|lower|dev_upper|uid|gid" -> boolean（可写性依赖载荷身份）
   empty_file = nil, -- 用于覆盖 /proc 泄露项的空文件路径（宿主）
+  apt_conf = nil, -- { path = string, user = string } apt 沙箱配置片段（宿主私有文件）
+  mask_dirs_cache = nil, -- { cfg = <table ref>, dirs = string[] } stat 过滤后的遮蔽目录
+  mask_dirs_raw_cache = nil, -- { cfg = <table ref>, dirs = string[] } 原始遮蔽目录前缀（不 stat）
 }
 
 -- 默认遮蔽的宿主敏感路径（安全默认，可经 tools.sandbox.mask_paths 覆盖）：
@@ -515,6 +518,72 @@ local function _empty_file()
   return p
 end
 
+-- apt 配置片段在沙箱内的挂载点：置于会话私有 /tmp（始终可写），避免在只读 /etc 下无法
+-- 创建挂载点。以 APT_CONFIG 指向，内容关闭 apt 的 `_apt` 降权（嵌套 userns/受限容器中
+-- setgroups 会 EPERM，使 apt update/install 失败）。文件名无沙箱特征。
+local APT_CONF_GUEST = "/tmp/.apt.conf"
+
+--- 生成 apt 沙箱配置片段（宿主私有文件），内容为 `APT::Sandbox::User "<user>"`。
+--- 按 user 缓存；无法写入时返回 nil（调用方跳过注入，apt 退回默认行为）。
+--- @param user string
+--- @return string|nil 宿主路径
+local function _apt_conf(user)
+  user = tostring(user or "")
+  if user == "" then return nil end
+  local cached = state.apt_conf
+  if cached and cached.user == user and vim.uv.fs_stat(cached.path) then return cached.path end
+  local p = _private_dir() .. "/apt.conf"
+  local f = io.open(p, "w")
+  if not f then return nil end
+  f:write('APT::Sandbox::User "' .. user .. '";\n')
+  f:close()
+  pcall(vim.uv.fs_chmod, p, 420) -- 0644：非 root 载荷需可读
+  state.apt_conf = { path = p, user = user }
+  return p
+end
+
+-- Maven 镜像 settings.xml 在沙箱内的挂载点：置于会话私有 /tmp（始终可写），以 MAVEN_OPTS 的
+-- `-s` 指向；文件名无沙箱特征（见 conceal）。
+local MAVEN_SETTINGS_GUEST = "/tmp/.mvn-settings.xml"
+
+--- 读取镜像配置（tools.sandbox.network.mirrors）。
+--- @return table { pip?, npm?, maven? }
+local function _mirrors()
+  local net = require("NeoAI.kernel.config_store").get("tools.sandbox.network") or {}
+  return net.mirrors or {}
+end
+
+--- 生成 Maven settings.xml（把全部仓库镜像到指定 URL），按 URL 缓存。
+--- 无法写入时返回 nil（调用方跳过注入，Maven 退回默认中央仓库）。
+--- @param url string
+--- @return string|nil 宿主路径
+local function _maven_settings(url)
+  url = tostring(url or ""):gsub("%s+$", "")
+  if url == "" then return nil end
+  local cached = state.maven_settings
+  if cached and cached.url == url and vim.uv.fs_stat(cached.path) then return cached.path end
+  local p = _private_dir() .. "/mvn-settings.xml"
+  local f = io.open(p, "w")
+  if not f then return nil end
+  f:write(table.concat({
+    '<?xml version="1.0" encoding="UTF-8"?>',
+    '<settings xmlns="http://maven.apache.org/SETTINGS/1.0.0">',
+    "  <mirrors>",
+    "    <mirror>",
+    "      <id>neoai-mirror</id>",
+    "      <mirrorOf>*</mirrorOf>",
+    "      <url>" .. url .. "</url>",
+    "    </mirror>",
+    "  </mirrors>",
+    "</settings>",
+    "",
+  }, "\n"))
+  f:close()
+  pcall(vim.uv.fs_chmod, p, 420) -- 0644：非 root 载荷需可读
+  state.maven_settings = { path = p, url = url }
+  return p
+end
+
 --- 生成净化后的 resolv.conf（仅保留 nameserver 行，剥离 search/domain/options 等
 --- 泄露宿主内网/Tailscale 域的字段）。无 nameserver 或不可读时返回 nil（退化为不暴露）。
 --- @return string|nil 宿主私有路径
@@ -578,10 +647,13 @@ local function _mask_dirs_enabled()
   return config_store.get("tools.sandbox.mask_dirs_enabled") ~= false
 end
 
---- 配置的遮蔽目录列表（存在性过滤）
+--- 配置的遮蔽目录列表（存在性过滤）。按配置表引用缓存：观测热路径会高频调用，
+--- 逐次 `fs_stat` 每个遮蔽目录在构建/测试的百万级事件下是主线程固定开销。
 --- @return table 字符串数组
 local function _mask_dirs()
   local cfg = config_store.get("tools.sandbox.mask_dirs")
+  local cache = state.mask_dirs_cache
+  if cache and cache.cfg == cfg then return cache.dirs end
   local list = (type(cfg) == "table" and next(cfg) ~= nil) and cfg or DEFAULT_MASK_DIRS
   local out = {}
   for _, d in ipairs(list) do
@@ -590,6 +662,26 @@ local function _mask_dirs()
       if d ~= "" and vim.uv.fs_stat(d) then out[#out + 1] = d end
     end
   end
+  state.mask_dirs_cache = { cfg = cfg, dirs = out }
+  return out
+end
+
+--- 原始遮蔽目录前缀（不做存在性 stat）：供 `outside_workspace` 的快速预筛。
+--- 返回超集，仅用于「该路径是否可能位于遮蔽目录下」的纯字符串判断，避免对每个观测事件
+--- 都调用 `_canonical`（`vim.fn.resolve` 解析符号链接是重 syscall）。
+--- @return table 字符串数组
+local function _mask_dir_raw()
+  local cfg = config_store.get("tools.sandbox.mask_dirs")
+  local cache = state.mask_dirs_raw_cache
+  if cache and cache.cfg == cfg then return cache.dirs end
+  local list = (type(cfg) == "table" and next(cfg) ~= nil) and cfg or DEFAULT_MASK_DIRS
+  local out = {}
+  for _, d in ipairs(list) do
+    if type(d) == "string" and d ~= "" and d ~= "/" then
+      out[#out + 1] = d:gsub("/+$", "")
+    end
+  end
+  state.mask_dirs_raw_cache = { cfg = cfg, dirs = out }
   return out
 end
 
@@ -1454,8 +1546,31 @@ function M.sandbox_env(privileges)
   if config_store.get("tools.sandbox.appimage_extract_and_run") ~= false then
     env.APPIMAGE_EXTRACT_AND_RUN = "1"
   end
+  -- 国内/受限网络镜像（tools.sandbox.network.mirrors，默认空 = 不改动系统行为）：
+  --   pip   → PIP_INDEX_URL + PIP_TRUSTED_HOST
+  --   npm   → npm_config_registry
+  --   maven → 生成 settings.xml（由 process_prefix 只读绑定）+ MAVEN_OPTS -s 指向
+  local mirrors = _mirrors()
+  local pip_url = tostring(mirrors.pip or "")
+  if pip_url ~= "" then
+    env.PIP_INDEX_URL = pip_url
+    local host = pip_url:match("^https?://([^/]+)")
+    if host then env.PIP_TRUSTED_HOST = (host:gsub(":%d+$", "")) end
+  end
+  local npm_url = tostring(mirrors.npm or "")
+  if npm_url ~= "" then env.npm_config_registry = npm_url end
+  local maven_url = tostring(mirrors.maven or "")
+  if maven_url ~= "" and _maven_settings(maven_url) then
+    local prev = env.MAVEN_OPTS or ""
+    env.MAVEN_OPTS = (prev ~= "" and (prev .. " ") or "") .. "-s " .. MAVEN_SETTINGS_GUEST
+  end
   if privileges and type(privileges.env) == "table" then
     for k, v in pairs(privileges.env) do env[k] = v end
+  end
+  -- apt：APT_CONFIG 指向只读绑定的配置片段（见 _apt_conf），关闭 apt 自身的 `_apt` 降权。
+  if privileges and type(privileges.apt_sandbox_user) == "string"
+    and privileges.apt_sandbox_user ~= "" and _apt_conf(privileges.apt_sandbox_user) then
+    env.APT_CONFIG = APT_CONF_GUEST
   end
   return env
 end
@@ -1554,6 +1669,15 @@ end
 function M.outside_workspace(path, cwd)
   if type(path) ~= "string" or path == "" then return nil end
   if type(cwd) ~= "string" or cwd == "" then return nil end
+  -- 快速前缀预筛：只有位于遮蔽目录（home/root 等）下的路径才可能命中。绝大多数观测事件是
+  -- /usr、/proc、/sys、/dev、/etc 等系统路径；先做纯字符串比较，命中后再做规范化与精确判定，
+  -- 避免对每个事件都调用 `_canonical`（`vim.fn.resolve` 是重 syscall，构建/测试百万级 openat
+  -- 时会占满主线程）。预筛是超集（未解析符号链接），不改变最终判定口径。
+  local maybe = false
+  for _, d in ipairs(_mask_dir_raw()) do
+    if path == d or path:sub(1, #d + 1) == d .. "/" then maybe = true; break end
+  end
+  if not maybe then return nil end
   local p = _canonical(path)
   local c = _canonical(cwd)
   if p == "" or p == "/" then return nil end
@@ -1860,6 +1984,24 @@ function M.process_prefix(opts)
         table.insert(argv, "--bind"); table.insert(argv, "/dev/null"); table.insert(argv, mp.path)
       end
     end
+    -- apt 沙箱用户降权关闭：把配置片段只读绑定到会话私有 /tmp，并以 APT_CONFIG 指向它
+    -- （见 sandbox_env / _apt_conf）。置于遮蔽之后，避免被 mask 覆盖；/tmp 始终可写，
+    -- 故在只读 /etc 场景下也能创建挂载点。
+    if priv and type(priv.apt_sandbox_user) == "string" and priv.apt_sandbox_user ~= "" then
+      local ap = _apt_conf(priv.apt_sandbox_user)
+      if ap then
+        table.insert(argv, "--ro-bind"); table.insert(argv, ap); table.insert(argv, APT_CONF_GUEST)
+      end
+    end
+    -- Maven 镜像 settings.xml：只读绑定到会话私有 /tmp，MAVEN_OPTS 的 `-s` 指向它（见 sandbox_env）。
+    -- 置于遮蔽之后，避免被 mask 覆盖；/tmp 始终可写，可在只读 /etc 场景下创建挂载点。
+    local maven_mirror = tostring((_mirrors().maven) or "")
+    if maven_mirror ~= "" then
+      local ms = _maven_settings(maven_mirror)
+      if ms then
+        table.insert(argv, "--ro-bind"); table.insert(argv, ms); table.insert(argv, MAVEN_SETTINGS_GUEST)
+      end
+    end
     -- 工具子进程只读绑定：置于遮蔽之后，用于暴露工具命令自身所在目录（如 $HOME 下的脚本）。
     for _, p in ipairs(opts.ro_binds or {}) do
       if type(p) == "string" and p ~= "" and vim.uv.fs_stat(p) then
@@ -2067,6 +2209,7 @@ function M.reset()
   state.overlay_probe = {}
   state.overlay_write_probe = {}
   state.empty_file = nil
+  state.apt_conf = nil
   pcall(M.cleanup_tmp_roots)
 end
 

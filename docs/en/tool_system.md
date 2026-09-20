@@ -54,7 +54,8 @@ Tool definitions support two execution forms (`executor._call_tool`):
 `tool_helpers.lua` is the tool-definition helper library and is not part of the built-in list.
 
 Built-in tool modules: `file_ops` / `shell` / `git_ops` / `lsp_ops` / `tree_ops` / `log_ops` / `plan` (sub-agent) /
-`todo` / `plan_mode` / `ask_user` / `read_image` / `web_fetch` (web fetch, disabled by default) / `skills` (skill tools + system prompt section).
+`todo` / `plan_mode` / `ask_user` / `read_image` / `web_fetch` (web fetch, disabled by default) / `skills` (skill tools + system prompt section) /
+`service` (long-lived services: `service_start`/`service_logs`/`service_status`/`service_stop`).
 MCP remote tools are registered dynamically by `services/mcp/init.lua` (`category = "mcp"`, `source = "mcp"`); see [mcp.md](mcp.md) for details.
 
 ## 4. Execution Flow (tools/executor.lua)
@@ -165,6 +166,19 @@ approval is allowed by default and a notify is sent.
 ### 💻 Shell (shell.lua)
 
 `run_command`: async jobstart (non-interactive), collects stdout/stderr, supports `timeout_ms` (default 30000, -1 for unlimited).
+When combined stdout/stderr exceeds `tools.run_command.max_output_bytes` (default 16 MiB), the command is
+truncated and terminated so huge outputs (hundreds of MB) cannot freeze the main thread with line-by-line
+processing; already-produced content is still returned and marked "truncated".
+When a command ends with exit code 137 (SIGKILL), the resource-domain events are read to distinguish
+"suspected OOM" from "forcibly terminated".
+
+### 🔌 Long-lived services (service.lua)
+
+`service_start` (start a background persistent process that survives across tool calls) / `service_logs` /
+`service_status` / `service_stop`. Unlike `run_command`'s `&`/nohup (reaped when the command ends), a
+service runs in its own sandbox overlay + cgroup; on stop its workspace changes are frozen as candidates
+and queued for async review. Its lifecycle is reclaimed by `sandbox.shutdown`/`reset`. See the
+"Long-lived services" section of [sandbox.md](sandbox.md).
 
 ### 🗂 Git (git_ops.lua)
 
@@ -223,9 +237,10 @@ fail outright.
 `web_fetch`: renders dynamic pages (React/Vue/SPA) in a headless browser, injects JS, takes the final DOM and
 converts it to Markdown with a general converter (turndown). **Disabled by default** (`tools.web_fetch.enabled = false`;
 while off, `get_tools()` returns nothing — no registration, no dependency install). Once enabled, bash checks and
-installs Node deps and the browser engine inside the cache dir (`stdpath('cache')/NeoAI/web_fetch`); with
-`auto_install=true` this happens in the background and the first call waits for it. Lua only orchestrates and never
-parses dynamic pages itself. Results are cached by URL + args (TTL / entry count / total-size cap default 500MB,
+installs Node deps and the browser engine in the cache dir (`stdpath('cache')/NeoAI/web_fetch`) — **the installation runs
+on the host, outside the sandbox**, so hundreds of MB of artifacts never enter the overlay and get re-captured by every
+`run_command`; with `auto_install=true` this happens in the background and the first call waits for it. Lua only
+orchestrates and never parses dynamic pages itself. Results are cached by URL + args (TTL / entry count / total-size cap default 500MB,
 evicting oldest first). Injection scripts are extensible: built-ins in `assets/web_fetch/scripts/*.js`, overridable by
 same-named scripts in the user dir (`tools.web_fetch.scripts_dir`). See [configuration.md](configuration.md) (`tools.web_fetch`).
 

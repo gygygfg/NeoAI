@@ -75,6 +75,28 @@ tests.suite("sandbox_governance", function(_, it)
     t.eq(1, p.level, "包变更输出应为 L1")
   end)
 
+  it("结果分级：超大输出仅扫描首尾窗口（不全量主线程扫描）", function(t)
+    local risk = require("NeoAI.sandbox.risk")
+    local config_store = require("NeoAI.kernel.config_store")
+    local saved = config_store.get("tools.sandbox.risk.result_scan_bytes")
+    config_store.set("tools.sandbox.risk.result_scan_bytes", 1024)
+    local ok, err = pcall(function()
+      -- 信号在窗口之外（中间）：不应命中（避免数百 MB 输出全量 lower+匹配冻结界面）
+      local mid = string.rep("x", 8000) .. "permission denied" .. string.rep("y", 8000)
+      t.eq(0, risk.from_result({ code = 1, stdout = mid, stderr = "" }).level,
+        "窗口外的信号不应被扫描到")
+      -- 信号在结尾（窗口内）：应命中
+      local tail = string.rep("x", 8000) .. "permission denied"
+      t.eq(2, risk.from_result({ code = 1, stdout = tail, stderr = "" }).level,
+        "结尾窗口内的信号应命中")
+      -- 小输出（不超过窗口）仍全量扫描
+      t.eq(2, risk.from_result({ code = 1, stderr = "bash: Permission denied" }).level,
+        "小输出应正常命中")
+    end)
+    config_store.set("tools.sandbox.risk.result_scan_bytes", saved)
+    if not ok then error(err, 0) end
+  end)
+
   it("容器受控：podman 注入命名空间共享，docker 走受控 socket", function(t)
     local container = require("NeoAI.sandbox.container")
     local plan = container.plan("podman run -it ubuntu bash")
@@ -314,6 +336,88 @@ tests.suite("sandbox_governance", function(_, it)
     local c2 = privilege.classify("run_command", { command = "ls -la" }, { effect = "process" })
     local r2 = privilege.resolve(c2.tier, c2)
     t.false_(vim.tbl_contains(r2.privileges.cap_add, "CAP_CHOWN"), "普通命令不应授予 CAP_CHOWN")
+  end)
+
+  it("系统管理：useradd/chown 按需加回窄能力并解除账户库遮蔽；普通命令不受影响", function(t)
+    local privilege = require("NeoAI.sandbox.privilege")
+    local spec = { effect = "process" }
+    local function resolved(cmd)
+      local c = privilege.classify("run_command", { command = cmd }, spec)
+      local r = privilege.resolve(c.tier, c)
+      t.true_(r.ok, "应可解析: " .. cmd)
+      return c, r.privileges
+    end
+    local c1, p1 = resolved("useradd -M -s /sbin/nologin apprunner")
+    t.true_(c1.sysadmin, "useradd 应识别为系统管理")
+    t.eq(1, c1.tier, "系统管理应为 T1")
+    t.true_(vim.tbl_contains(p1.cap_add, "CAP_CHOWN"), "应加回 CAP_CHOWN")
+    t.true_(vim.tbl_contains(p1.cap_add, "CAP_SETUID"), "应加回 CAP_SETUID")
+    t.true_(vim.tbl_contains(p1.cap_add, "CAP_SETGID"), "应加回 CAP_SETGID")
+    t.true_(vim.tbl_contains(p1.unmask, "/etc/shadow"), "应解除 /etc/shadow 遮蔽")
+    t.true_(vim.tbl_contains(p1.unmask, "/etc/gshadow"), "应解除 /etc/gshadow 遮蔽")
+    local c2, p2 = resolved("chown -R apprunner:apprunner /opt/apps")
+    t.true_(c2.sysadmin, "chown 应识别为系统管理")
+    t.true_(vim.tbl_contains(p2.cap_add, "CAP_CHOWN"), "chown 应加回 CAP_CHOWN")
+    -- 普通命令：不加能力、不解除账户库遮蔽（口令哈希不泄露）。
+    local c3, p3 = resolved("ls -la")
+    t.false_(c3.sysadmin, "普通命令不应识别为系统管理")
+    t.eq(0, #p3.cap_add, "普通命令不应加能力")
+    t.false_(vim.tbl_contains(p3.unmask, "/etc/shadow"), "普通命令不应解除 /etc/shadow 遮蔽")
+  end)
+
+  it("系统管理：沙箱内 useradd 可用，且普通命令读不到真实 /etc/shadow", function(t)
+    local runtime = require("NeoAI.sandbox.runtime")
+    if runtime.backend() ~= "bwrap" then return end
+    local diag = runtime.overlay_diagnosis("/")
+    if not (diag and diag.available) then return end
+    local sandbox = require("NeoAI.sandbox")
+    with_config({ tools = { approval = { mode = "async" }, sandbox = {
+      mode = "dry_run", review = { enabled = true },
+    } } }, function()
+      sandbox.reset()
+      local function run(cmd)
+        local done, out = false, nil
+        require("NeoAI.tools").execute("run_command", { command = cmd, description = "t" }, {})
+          :then_(function(r) out = tostring(r); done = true end,
+            function(e) out = "ERR:" .. tostring(e and e.message or e); done = true end)
+        t.true_(vim.wait(20000, function() return done end), "命令应完成")
+        return out
+      end
+      local out = run("useradd -M -s /sbin/nologin neoai_test_sys 2>&1 && echo USERADD_OK || echo USERADD_FAIL")
+      t.matches("USERADD_OK", out, "沙箱内 useradd 应成功（账户库写入进 overlay 暂存）")
+      local sh = run("cat /etc/shadow 2>&1 | head -c 40; echo; echo SHADOW_DONE")
+      t.true_(sh:find("%$y%$") == nil and sh:find("root:%$") == nil,
+        "普通命令不应读到真实 /etc/shadow 哈希，实际: " .. tostring(sh))
+    end)
+  end)
+
+  it("并发进程命令串行化：并行 run_command 不互相污染", function(t)
+    local runtime = require("NeoAI.sandbox.runtime")
+    if runtime.backend() ~= "bwrap" then return end
+    local sandbox = require("NeoAI.sandbox")
+    with_config({ tools = { approval = { mode = "async" }, sandbox = {
+      mode = "dry_run", review = { enabled = true },
+    } } }, function()
+      sandbox.reset()
+      -- A 先入队且较慢，B 后入队且很快：串行化下 A 必须先完成，文件顺序为 A→B；
+      -- 非串行时 B 会先写完，顺序为 B→A（可稳定区分）。
+      local order_file = "/tmp/neoai_conc_order_" .. tostring(vim.fn.getpid()) .. "_" .. tostring(os.time()) .. ".txt"
+      local a_done, b_done = false, false
+      require("NeoAI.tools").execute("run_command",
+        { command = "sleep 0.5; echo A >> " .. order_file, description = "t", timeout_ms = 20000 }, {})
+        :then_(function() a_done = true end, function() a_done = true end)
+      require("NeoAI.tools").execute("run_command",
+        { command = "echo B >> " .. order_file, description = "t", timeout_ms = 20000 }, {})
+        :then_(function() b_done = true end, function() b_done = true end)
+      t.true_(vim.wait(30000, function() return a_done and b_done end), "两个并发命令应完成")
+      local got, out = false, nil
+      require("NeoAI.tools").execute("run_command",
+        { command = "cat " .. order_file, description = "t", timeout_ms = 10000 }, {})
+        :then_(function(r) out = tostring(r); got = true end, function(e) out = tostring(e); got = true end)
+      t.true_(vim.wait(15000, function() return got end), "读取顺序文件应完成")
+      local body = tostring(out):gsub("%s+$", "")
+      t.true_(body == "A\nB", "进程命令应按 FIFO 串行（期望 A\\nB），实际: " .. tostring(out))
+    end)
   end)
 
   it("staged_roots：已暂存包产物使后续命令也覆盖该根（安装后可见）", function(t)

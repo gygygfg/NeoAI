@@ -102,22 +102,84 @@
     此前每个物化文件在每条命令结束时都要整文件读取 + 纯 Lua SHA-256，暂存数千时表现为
     `libuv-worker` 单核打满、`run_command` 长时间不返回。删除对账（沙箱-only 文件被命令删除）
     也在工作线程完成。
-  - **冻结/密钥扫描分块并行**：`finish_async` 按 `tools.sandbox.work_chunk_files`（默认 128）
-    分块并发投递到线程池；批量密钥 token 化同样分块并发（跨块同一密钥合并为规范 token，
-    保证 detokenize 可还原）。使 npm/cargo 等一次产生数万文件时用满多核，而非单核串行。
-  - **物化跳过未改动文件**：暂存副本与上次写入的 overlay 目标（mtime/大小/权限）都未变时，
-    重复物化不再重读+detokenize+写入；仅改动文件被重写。
+  - **冻结/捕获/密钥扫描/暂存写盘分块并行**：`finish_async`、`capture_overlay_async` 的 base 哈希、
+    批量密钥 token 化、候选密钥分析，以及 `merge_candidate_async` 的暂存副本写盘，均按
+    `tools.sandbox.work_chunk_files`（默认 128）分块并发投递到线程池；密钥 token 化跨块同一密钥
+    合并为规范 token（保证 detokenize 可还原）。使 npm/cargo 等一次产生数万文件时用满多核，
+    而非单核串行。暂存写盘的每块编码在 `work.batched` 的 start 回调内**惰性**完成，与上一组
+    worker 写盘重叠；worker 内对目录做去重缓存，避免逐文件对每个路径分量重复 `fs_mkdir`。
+  - **命令捕获来源免于冗余物化**：命令已把内容写入 overlay（capture 来源即 dest），merge
+    仅登记暂存副本并标记 `fresh`；下次物化跳过 detokenize 回写（暂存副本被编辑则失效），
+    避免每条命令重写全部改动文件。
+  - **包/生成内容跳过密钥扫描**：命令判定为包安装，或候选路径命中包目录
+    （`/site-packages/`、`/node_modules/`、`~/.cargo/` 等，见 `privilege.package_path_manager`）
+    时，跳过密钥 token 化与生成高熵分析（与结算阶段 `is_pkg` 一致）。避免对 venv/依赖树
+    逐文件全文扫描（实测 `python -m venv` 后处理由 ~3s 降至 ~0.3s）。
+  - **待审项落盘不重复存内容**：候选文件内容已随候选落盘，待审项持久化时剥离 `files[].content`
+    （水合后按 `candidate_digest` 从候选读取），避免大候选 JSON 在主线程重复编码。
+  - **结果风险扫描有窗口上限**：`risk.from_result` 仅扫描输出首/尾各
+    `tools.sandbox.risk.result_scan_bytes`（默认 256 KiB）字节，避免 `timeout=-1` 的大输出
+    在主线程全量 lower + 模式匹配而冻结界面。
+  - **物化按暂存版本跳过未改动项**：每个暂存项带版本号，编辑/合并/删除时递增；物化记录各
+    overlay/bind base 上次写入的版本，版本一致即**完全跳过**（不 `fs_stat`、不读、不写）。
+    此前每条 `run_command` 开始都遍历全部暂存项并对每项做两次 `fs_stat` + 字符串格式化，
+    暂存上万文件时是命令启动阶段的主线程卡顿源；现未改动项只做一次版本比较。
+    暂存副本与目标（mtime/大小/权限）都未变时也不会重读+detokenize+写入。
+    仅当上层清空 overlay（如 LSP overlay 刷新前 `_wipe_upper`）时才用
+    `materialize_overlay(specs, { force = true })` 强制全量重物化。
   - **overlay 临时层写入不 fsync**：会话级 overlay 私有可写层是临时草稿（agentEnd 轮换即清理），
     `write_file_atomic(..., { sync = false })` 去掉逐文件 fsync；真实工作区发布仍 fsync 保证持久化。
   - **证据不嵌入文件内容**：`evidence.add("fs", ...)` 只存影响清单（路径/动作/哈希），
     并对文件条目数做上限截断，避免大候选在证据里再做一次巨量 JSON 编码。
   - **生成高熵检测有扫描预算**：`detect_generated` 受 `tools.sandbox.secrets.generated_scan_max_bytes`
     / `generated_scan_max_files` 约束，避免大候选逐文件全文扫描。
-  - **结算异步化**：候选/待审的**文件写入**走线程池（`store.write_candidate_async` /
-    `write_review_async`，按路径串行、write-behind），密钥分析（NEOKEY 警告 + 生成高熵）也在
-    工作线程执行（`secret.analyze_files_async`），主线程只做 JSON 编码与聚合。写入期间以内存
-    缓存保证「刚写入即可读回」；落盘后丢弃缓存（内存有界）。`sandbox.shutdown` / `store.reset`
-    前会 `store.flush()` 等待落盘，关闭/重置不丢数据、不被迟到写入污染。
+  - **结算异步化**：候选/待审/快照的**文件写入**走线程池（`store.write_candidate_async` /
+    `write_review_async` / `write_snapshot_async`，按路径串行、write-behind），密钥分析
+    （NEOKEY 警告 + 生成高熵）也在工作线程执行（`secret.analyze_files_async`），主线程只做 JSON
+    编码与聚合。合并/按内容拆分/选择性应用重排等路径重新落盘的候选、以及保存/撤销保存时含
+    原文件内容的快照，均不再主线程同步编码 + fsync。写入期间以内存缓存保证「刚写入即可读回」；
+    落盘后丢弃缓存（内存有界）。`sandbox.shutdown` / `store.reset` 前会 `store.flush()` 等待落盘，
+    关闭/重置不丢数据、不被迟到写入污染。
+  - **JSON 编码不再主线程深扫**：`json.encode_fast` 直接用 `vim.json`（C 实现），跳过
+    `_sanitize_value` 的纯 Lua 全表 UTF-8 深扫（大候选主要卡顿源）；落盘前用 C 级
+    `string.find("[\128-\255]")` 快速判定，**纯 ASCII 输出（常见）直接跳过**线程池 UTF-8 校验，
+    仅含非 ASCII 字节时才在线程池校验，非法才回退 `json.encode`（清洗重编码）。避免 1M 条
+    候选/待审 JSON（~230MB）逐字节扫描占用 10–30s 线程池、与 capture/finish/tokenize 争抢 worker。
+    候选/待审/快照落盘均走此路径。
+  - **merge 写盘分块并发**：`merge_candidate_async` 把 token 化后的暂存副本按
+    `work_chunk_files` 分块，交给线程池并发写盘（含 mkdir/chmod），每块编码惰性完成并与上一组
+    写盘重叠；主线程只登记映射与 `fresh` 签名，数千/百万文件时不再单线程逐文件同步写。
+  - **捕获的工作区一致性判定在线程内**：`_capture_worker` 接收工作区暂存映射，在线程内完成
+    「命令改动是否只是暂存编辑的复现」的内容比对，主线程不再对每个改动文件重读两份内容。
+  - **分块 job 限批提交**：`work.batched` 每批最多 `tools.sandbox.work_parallelism`（默认 4，
+    与 libuv 线程池一致）个在途，避免数百个 chunk job 一次排满队列、饿死后续 UI 关键 job
+    （脱敏 / 密钥 token 化 / 落盘）。
+  - **会话轮换迁移下线程池**：`rotate_session` 的文件复制（含目录）交给工作线程；暂存访问前经
+    `_await_rotation` 等待迁移完成（通常已完成，等待为 0）。长会话未发布改动多时，agentEnd
+    不再逐文件主线程复制。
+  - **待审项增量索引**：`review._pending_items` 缓存 PENDING 项（按 created_at 排序），
+    `supersede_by_paths` / 包合并不再每次对全部变更单元（含终态）过滤 + 排序；任何写操作失效缓存。
+  - **结算主线程热点批量化/单遍化（暂存上万文件回归）**：
+    - `risk.classify` 的 `path_level` 不再对每个路径重算 `cwd`/`~` 的规范化（按 cwd 缓存），
+      且对 `facts.paths` 只遍历一遍（同时得出「工作区外写入」供密钥分级），消除数万次
+      Vimscript 往返。
+    - `secret._merge_chunk_results` 按 token 模式**单遍**重写输出（此前对每个 remap 项各做一次
+      全文 `gsub`，块内近似平方）。
+    - `review.apply_all` 的候选删除**批量对账**（`_defer_discard` + `_discard_candidates`），
+      不再逐项全表扫描引用（避免 O(n²)）。
+    - `privilege.package_path_manager` 对同一候选只扫描一次（按 attempt 缓存），替代此前在
+      密钥分析/合并/结算三处的重复全量匹配。
+    - `wrapper._rewrite_value` 用暂存根前缀守卫：结果字符串不含暂存路径时**不做**逐条 `gsub`
+      （此前为 O(字符串×暂存文件数)）。
+    - `candidate.capture_overlay_async` 的工作区暂存编码按**本次捕获根**过滤；
+      `_capture_entry` 的单文件上限配置提升到循环外读取。
+    - `candidate.merge_candidate_async` 由工作线程回传写后签名（`fresh_ssig`），
+      不再对每个暂存文件在主线程 `fs_stat`。
+  - **取消/超时/输出截断真正终止进程树**：bwrap 载荷在独立 pid 命名空间内，`jobstop` 只杀外层
+    bwrap；门禁经 `ctx.sandbox_kill` 暴露 `cgroup.kill`，`run_command` / 工具子进程在取消、超时、
+    输出截断时按资源域精确终止全部子进程（无 cgroup 时仍 `jobstop`）。
+  - **墙钟安全网**：`tools.run_command.max_wall_ms`（默认 0 = 不限）>0 时约束所有命令（含
+    `timeout_ms=-1` 的「不限」命令），到时经资源域终止，避免长任务永久占用、工具永不返回。
   - **基准复现**：`require("NeoAI.sandbox.diag").bench_capture({ files = N })` 返回
     物化冷/热与捕获主线程耗时，用于回归对比（会重置沙箱，仅诊断用）。
 - **按 nvim 进程实例隔离**：每个 nvim 进程使用独立实例存储根
@@ -173,8 +235,17 @@
      - **超大文件不纳入候选**（`tools.sandbox.max_file_bytes`，默认 8 MiB）：超过上限的文件
        仍写入 overlay 私有层（不落真实盘），但不进入候选/待审/发布，避免 `apt` 的
        `pkgcache.bin`、缓存归档、镜像层等被嵌入候选 JSON 而阻塞主线程 / 撑爆磁盘。
-     - **冻结分块并行**（`tools.sandbox.work_chunk_files`，默认 128）：`finish_async` 与批量密钥
-       token 化按此文件数分块并发投递到线程池，使大量文件时用满多核而非单核串行。
+       异步捕获在**工作线程内**即按上限跳过（不进入 base 哈希列表），避免为数百 MB 的
+       chromium/npm 缓存读取+纯 Lua 哈希。
+     - **同一文件不重复处理（捕获签名缓存）**：每次异步捕获把处理过的每个 overlay 条目
+       （文件/删除/超限跳过）的**目标签名**（mtime/size）记入该 upper 的期望表；下次捕获在
+       **工作线程内**先比对签名，未变即整体跳过——不派发记录、不做 base 哈希、不占主线程。
+       只有真正变化（或被外部改动）的文件才重新处理。此前每条 `run_command` 都会把同一批
+       已捕获文件（含数百 MB 的 chromium/npm 缓存）重新读取+纯 Lua 哈希，表现为命令完成后
+       主线程长时间停顿；期望表随会话轮换清空。
+     - **冻结分块并行**（`tools.sandbox.work_chunk_files`，默认 128）：`finish_async`、批量密钥
+       token 化与 `merge_candidate_async` 的暂存副本写盘按此文件数分块并发投递到线程池，
+       使大量文件时用满多核而非单核串行。
      - **暂存内容持久**：`PENDING` 与 `APPROVED`（尚未应用）的候选在重载/重开后由
        `_rehydrate_pending` 从落盘候选重新物化进暂存层，包安装等大批量暂存内容在应用或
        拒绝前一直保留可读，不随会话轮转/退出销毁。
@@ -287,6 +358,12 @@
   默认仅 cwd，未覆盖时自动补入）做 overlayfs：真实根为只读 lower、会话 upper 为可写层。
   命令能读取这些根的真实内容，且对其下**任意路径**的新建/修改/删除都落到 upper，随后冻结为
   候选（删除以 whiteout 设备节点识别为 `delete`/`rmdir`）。
+  - **进程命令串行执行**：`effect="process"` 的工具（`run_command`/`git` 读工具等）的门禁按
+    **FIFO 一次一个**执行。沙箱的 overlay 物化/捕获、会话级可写层与暂存映射基于**共享会话**，
+    非并发安全：同一轮里模型并行发出的多个 `run_command`（并行 tool_calls）若同时运行，会
+    物化/捕获交错，导致命令看到缺失的目录/文件、捕获互相覆盖，命令可能因此阻塞直到超时并被
+    `cgroup.kill` 以 SIGKILL 终止（退出码 137 且无输出）。串行化后并行调用仍可用，只是排队
+    逐个执行；`read`/`fs_write`/`in_process`/`network` 类工具不受影响。
   - `/tmp`、`/var/tmp` 属**每会话私有临时根**（`tools.sandbox.tmpfs_roots`）：默认
     （`tmp_private_base="host"`）在宿主根之下建隐藏临时子目录（如 `/tmp/.cache-<tag>/<session>`，
     mode 1777），并经**命名空间 bind 映射回该根**——沙箱内 `/tmp` 即此会话私有子目录，
@@ -352,6 +429,44 @@
   `sandbox.init()` 会按**待审（PENDING）与已批准未应用（APPROVED/NOT_REQUESTED）**候选内容
   **重新物化**进新会话暂存层（`_rehydrate_pending`），使重载/重开后只读工具看到的视图与
   待审队列一致，且已批准未应用的改动在应用/拒绝前仍可读、可应用。
+
+### 长驻服务（`service_*`，后台进程）
+
+- **背景**：`run_command` 的 `&`/`nohup`/`setsid` 后台进程随命令结束即被回收——每个命令在
+  独立 pid namespace + cgroup 内运行，命令结束时 `cgroup.release` → `cgroup.kill` 终止整个
+  进程树，故后台进程**不跨工具调用存活**。需要常驻进程（dev server / watch / 守护进程）时
+  使用 `service_start` / `service_logs` / `service_status` / `service_stop`。
+- **隔离**：每个服务自建独立 overlay attempt（独立 upper/work，不与 `run_command` 的共享会话
+  暂存竞争）与独立 cgroup；门禁仍完成策略/脚本扫描/硬拒绝预检（`wrapper` 的 `long_lived` 分支），
+  但不进入一次性进程的捕获/冻结流程。服务可与其他命令并发运行（不占 `effect="process"` FIFO）。
+- **边界同步**：启动时把工作区暂存内容物化进服务 overlay（**单向快照**，服务可见 AI 未发布
+  编辑）；停止时捕获服务 overlay 改动 → 冻结候选 → 合并回工作区暂存并经异步审批入队
+  （复用 `wrapper.settle_exec_candidate`）。服务与 `run_command` **非实时互通**，仅在启停时点同步。
+- **生命周期**：`sandbox.shutdown()`（`:qall` / 热重载 / 插件卸载）与 `sandbox.reset()` 停止全部
+  服务并捕获改动；服务日志为会话内环形缓冲（`service.max_log_bytes`），读取时经 `conceal` 脱敏。
+- **配置**：`tools.sandbox.service = { enabled, max_services, max_log_bytes, stop_timeout_ms }`。
+
+### 137 / OOM 归因与诊断（`tools.sandbox.diagnostics`）
+
+- **退出码 137 = SIGKILL**：来源有二——`cgroup.kill`（命令超时/取消/输出截断时由门禁调用，
+  `wrapper` 的 `ctx.sandbox_kill`）或 OOM（资源域 `memory.max` 或宿主/容器内存不足）。
+- **归因**：命令以 137 结束时，`run_command` 读取该资源域 `memory.events`（`oom_kill` /
+  `oom_group_kill`）：命中则回传「疑似内存超限 OOM」，否则回传「被强制终止（137/SIGKILL）」
+  并提示开启诊断。`tools.sandbox.diagnostics.enabled=true` 时，`cgroup.kill` 记录调用方堆栈、
+  命令结束记录资源域 memory/pids 事件（仅日志，不改变行为）。
+- **诊断命令**：`:NeoAISandboxDiag` 输出宿主/容器 cgroup 限制（`memory.max` / `memory.events` /
+  `pids.max`）、负载、PID1（systemd 探测）与已解析沙箱限制，用于区分「沙箱资源域」与
+  「宿主容器 OOM」。
+- **环境不匹配提示**：命令输出命中 `System has not been booted with systemd` /
+  `Failed to connect to bus` 等特征时，结果追加提示「本环境无 systemd，systemctl/service 不可用；
+  请直接运行前台命令」。
+
+### 网络镜像（`tools.sandbox.network.mirrors`）
+
+- 受限网络下可配置镜像（默认空 = 沿用系统）：`pip` → `PIP_INDEX_URL` + `PIP_TRUSTED_HOST`；
+  `npm` → `npm_config_registry`；`maven` → 生成 `settings.xml`（镜像全部仓库）并只读绑定到
+  会话私有 `/tmp`，经 `MAVEN_OPTS -s` 指向。仅对沙箱外部命令生效，仍受代理/`host_local_block`
+  过滤（外部目标放行并记录）。
 
 ### AI 专用沙箱 LSP（默认开启）
 
@@ -449,19 +564,22 @@ seccomp（含设备节点屏障）**——沙箱内进程看到的是一份「�
   的 `os.closerange`，最后退回 `sh`（dash 仅支持个位数 fd，属尽力而为）。`run_command`、
   `runtime.run` 与 LSP 命名空间覆盖均经此包装。
 
-- **完整能力默认 + 主机全局能力收敛（`cap_drop`）**：默认 `cap_add = { "ALL" }`，不施加
-  `--cap-drop ALL`——node/python/apt/dpkg/pip 等任意操作以完整 root 能力运行。同时按
+- **默认最小权限 + 按命令窄范围加回 + 主机全局能力收敛（`cap_drop`）**：默认 `cap_add = {}`
+  （施加 `--cap-drop ALL`），需要的能力**按命令窄范围加回**——包安装命令（含 `apt-get
+  install …; echo; tail` 这类链式）按 `packages.cap_add`、系统管理命令（`useradd`/`chown`/
+  `passwd` 等，`req.sysadmin`）按 `privilege.sysadmin.cap_add` 加回 `CAP_DAC_OVERRIDE`/
+  `CAP_CHOWN`/`CAP_SETUID`/`CAP_SETGID` 等窄能力并解除账户库遮蔽；普通命令不授予。同时按
   `cap_drop`（默认 `CAP_NET_ADMIN`/`CAP_SYS_TIME`/`CAP_SYS_MODULE`/`CAP_SYS_RAWIO`/
   `CAP_SYS_BOOT`/`CAP_MAC_ADMIN`/`CAP_MAC_OVERRIDE`/`CAP_AUDIT_CONTROL`）逐项 `--cap-drop`，
   封住「capability 层面的宿主全局修改」（netlink 改路由/防火墙、改时钟、加载模块、裸端口
   I/O、重启、改 MAC/审计）——这些能力开发/包管理工作流不需要；显式在 `cap_add` 列出的能力
   不会被丢弃。宿主**文件系统**的不可修改不依赖 capability，而依赖命名空间 + 整机根 overlay
-  暂存（写入冻结为候选）。需要最小权限时设 `cap_add = {}`（`--cap-drop ALL`，
-  纯包安装命令按 `packages.cap_add` 加回 `CAP_DAC_OVERRIDE`/`CAP_CHOWN`/`CAP_SETUID` 等窄
-  能力；混合命令如 `apt update && cat /x` 不加回）。
-  沙箱内已是 root，命令前导的 `sudo`/`doas`（及其常见布尔 flag）会被**自动剥离**（`sudo apt
-  update` → `apt update`）；否则 `sudo` 在嵌套 userns 下 `setresuid` 会 EINVAL、且
-  `/etc/sudoers` 被遮蔽，必然失败。含 `-u/-g/-i/-s` 等改变用户/登录的形式保持原样。
+  暂存（写入冻结为候选）。需要完整能力时（不推荐）设 `cap_add = { "ALL" }`。
+  沙箱内已是 root，命令中的 `sudo`/`doas` 会被**自动剥离**（含其选项），使 `sudo apt
+  update` → `apt update`；否则 `sudo` 在嵌套 userns 下 `setresuid` 会 EINVAL、且
+  `/etc/sudoers` 被遮蔽，必然失败（`PERM_SUDOERS`）。剥离按**每个命令段**进行（按未加引号的
+  `;`/`&`/`|`/`&&`/`||`/换行切分），故 `a && sudo b`、多行脚本、`sudo -u user cmd`、`sudo -i`
+  等都不再报错；引号/转义内的分隔符不切分，其余原文（含引号内空白）保持不变。
   **注意**：capability 与写 `/proc/sys/kernel/core_pattern`、`modprobe` 等全局 sysctl 无关——
   这些条目非命名空间，其写权限按 **DAC**（`euid == 全局 root uid`）判定；沙箱以 root 运行且
   不建 userns 时 `euid` 即全局 root，任何 capability 配置下都可写，构成 coredump/modprobe
@@ -523,7 +641,11 @@ seccomp（含设备节点屏障）**——沙箱内进程看到的是一份「�
     后端 `ebpf`(bpftrace) → `strace` → `procfs`）：按 attempt 的 cgroup 精确归属，
     观测真实 `openat/open` 访问，不再依赖命令字符串解析；三者均不可用时回退命令解析
     启发式（进程内读取工具按路径参数、`run_command` 按命令串中的绝对路径）。系统路径
-    （`/usr`、`/etc` 等）不计入，避免噪声。
+    （`/usr`、`/etc` 等）不计入，避免噪声。**观测热路径有界**：构建/测试会反复 open 同一批
+    文件（事件可达百万级），因此按路径**去重**（每 attempt 每路径只处理首次，表设有界上限）；
+    `outside_workspace` 先对遮蔽目录做**纯字符串前缀预筛**，仅候选路径才做符号链接规范化
+    （`vim.fn.resolve` 是重 syscall），并把遮蔽目录列表按配置引用缓存；越界证据改走
+    **异步 write-behind**（`evidence.add_async`），不再逐条同步写盘阻塞主线程。
   - **`read_all = false`（退回最小白名单）**：不整机暴露，也**不整目录暴露 `/usr`**
     （避免泄露 `/usr/local/go_workspace`、`/usr/src` 等软件清单）。按 `tools.sandbox.readonly_roots`
     暴露运行时子树：`/usr` 的 `bin`/`sbin`/`lib*`/`libexec`/`include`、
@@ -988,9 +1110,15 @@ wire 消息）中时，才硬拦截并立即终止整个 Agent——后者说明
 > 非密钥文件（`/etc/ld.so.cache`、`/etc/nsswitch.conf`、`/etc/passwd`、`/etc/group`、
 > `/etc/os-release`、`/etc/localtime`、`*.env` 如 `go.env`、`.npmrc`、`.bash_history`/
 > `.python_history`、**公开 CA 证书包/信任库**（`cacert.pem`/`ca-bundle.pem`/`chain.pem`/
-> `fullchain.pem`/`roots.pem` 等，以及 `/certifi/`、`/ca-certificates/`、`/ssl/certs/` 下的
-> 证书——如 pip 随包 vendored 的 `.../pip/_vendor/certifi/cacert.pem`）等）一律忽略，
-> 避免把 `uname`/`cat /etc/os-release`/`python -m venv && pip install` 等误报为「获取密钥」。
+> `fullchain.pem`/`roots.pem` 等，以及 `/certifi/`、`/ca-certificates/`、`/ssl/certs/`、
+> `/usr/lib/ssl/`、`/usr/share/ca-certificates/` 下的证书，如 Debian/Ubuntu 的
+> `/usr/lib/ssl/cert.pem`、`/etc/ssl/certs/ca-certificates.crt`、RHEL 系的 `ca-bundle.crt`、
+> pip 随包 vendored 的 `.../pip/_vendor/certifi/cacert.pem`）与**第三方包缓存/vendored 源码树**
+> （`~/.cargo/registry/`、`node_modules/`、`site-packages/`/`dist-packages/`、`go/pkg/mod/`、
+> `~/.rustup/`、`~/.gradle/caches/`、`~/.m2/repository/` 等——其中的 `*.pem`/`*.key`/`*.p12`
+> 是依赖自带的**测试夹具/示例证书**，如 `openssl` crate 的 `test/*.pem`、`tokio-native-tls` 的
+> `tests/identity.p12`，`cargo check`/`pip install` 会大量打开）等）一律忽略，
+> 避免把 `uname`/`cat /etc/os-release`/`python -m venv && pip install`/`cargo check` 等误报为「获取密钥」。
 > 明细回退顺序：观测到的密钥文件 → 参数中的密钥文件 → 密钥类型（具名规则）→ 敏感环境变量名 → 通用提示。
 > **失败结果**（如密钥硬拦截返回的 `SANDBOX_SECRET_BLOCKED` 错误对象）不作为「读取到的内容」参与
 > 判定，`scan_names` 也排除 `SANDBOX_SECRET_*` 内部事件标识，避免把内部标识误当作敏感环境变量名，
@@ -1005,6 +1133,21 @@ wire 消息）中时，才硬拦截并立即终止整个 Agent——后者说明
 > 指向**实际访问的文件**，优先于命令/参数解析；观测后端不可用时才回退上述内容扫描启发式。
 > 高熵检测只作用于**新增上下文与工具调用**（请求前守卫 `secret.context_leak_from` 增量扫描，
 > 压缩替换历史时才回退全量），不对整段历史每轮重扫。
+>
+> **观测解析下线程池**：eBPF 输出（bpftrace `openat` 行）与 strace trace 文件的**逐行解析**均在
+> `utils.work` 工作线程完成（切行、仅保留文件事件、按路径去重），主线程只对去重后的少量路径
+> 做留痕/密钥判定——构建/测试产生百万级事件时不再占满主线程（此前每事件都做 `vim.fn.resolve`
+> 规范化；strace 后端更是逐行在主线程做纯 Lua 解析）。strace 轮询改为「有界并发」：上一轮
+> 解析在途时跳过本轮，完成后从新 offset 继续；`stop` 仍同步冲刷残量，保证命令结束前事件已派发。
+>
+> **进程后处理异步化**（`tools.sandbox.postprocess="async"`，默认）：命令进程一退出就**立即把
+> 结果交回主线程下一轮循环**；overlay 捕获、候选冻结、暂存合并、落盘与结算在后台链完成。
+> 进程命令 FIFO 槽位保持到后台链完成，保证下一进程命令看到一致的会话暂存；后续读写工具
+> （非进程 effect）在后台后处理在途时也会先等待其完成再执行（避免读到尚未合并的暂存）。
+> 关闭/重置前 `sandbox.await_postprocess()` 等待在途链，避免丢失冻结与待审入队；退出/关闭时
+> 等待上限由 `tools.sandbox.shutdown_timeout_ms`（默认 3s）约束，后处理卡住时 `:qall` / 热重载
+> 不会被长时间阻塞（超时即放弃最后一笔未完成的冻结/入队）。
+> 设为 `"sync"` 可恢复「等待后处理完成后再返回」（测试默认注入此值以保持确定性）。
 >
 > **启动探测**：插件启动时探测后端可用性（eBPF 检查 `bpftrace` 可执行、root、tracefs、
 > 内核 BTF；再依次检查 strace/procfs）。eBPF 内核不可用/未安装、或回退 strace 而 strace
@@ -1165,13 +1308,14 @@ Agent**；发出 `SANDBOX_SECRET_BLOCKED` 事件并 `vim.notify` 明确通知用
 
 | 档 | 名称 | 用途 | 隔离 | 审查 |
 |---|---|---|---|---|
-| **T0** | minimal | 普通命令 | 完整能力（默认 `cap_add={ALL}`）减去主机全局能力（`cap_drop`：网络/时钟/模块/裸 I/O/重启/MAC/审计）+ seccomp（含设备节点屏障）+ 遮蔽 + overlay 暂存 + **默认放行网络（经 host_proxy 拦截本机，见 §6.1）** | 无逐命令审查；fs 改动进待审队列 |
-| **T1** | elevated | 网络访问、受控 docker、包安装 | 隔离内执行，网络放行；`cap_add` 收窄时含包管理器的命令（`req.package`，含链式）按 `packages.cap_add` 加回窄能力；docker.sock 仅 docker 命令解除遮蔽 | 自动授权、留痕；fs 改动进待审队列 |
+| **T0** | minimal | 普通命令 | 最小权限（默认 `cap_add={}` → `--cap-drop ALL`），按命令**窄范围**加回（包安装 `packages.cap_add`、系统管理 `privilege.sysadmin.cap_add`）+ 主机全局能力收敛（`cap_drop`：网络/时钟/模块/裸 I/O/重启/MAC/审计）+ seccomp（含设备节点屏障）+ 遮蔽 + overlay 暂存 + **默认放行网络（经 host_proxy 拦截本机，见 §6.1）** | 无逐命令审查；fs 改动进待审队列 |
+| **T1** | elevated | 网络访问、受控 docker、包安装、系统管理 | 隔离内执行，网络放行；`cap_add` 收窄时含包管理器的命令（`req.package`，含链式）按 `packages.cap_add` 加回窄能力；系统管理命令（`useradd`/`chown`/`passwd` 等，`req.sysadmin`）按 `privilege.sysadmin.cap_add` 加回窄能力并解除账户库遮蔽；docker.sock 仅 docker 命令解除遮蔽 | 自动授权、留痕；fs 改动进待审队列 |
 | **T2** | privileged | cap_add、宿主 socket、宿主挂载 | **嵌套 userns** 内执行并授予完整能力（cap 被 userns 作用域限制，够不到宿主；seccomp 基线仍生效） | 主机效果冻结为**提案**，异步审批后 replay |
 
 - 分类：`privilege.classify()` 解析命令，`docker/podman`→T1，`curl/git push/pip/npm`→T1 网络，
-  `sudo/mount/modprobe/iptables/systemctl`→T2；复合命令取最高档。规则见
-  `tools.sandbox.privilege.classify`（`bins` / `bin`+`subs`）。
+  `useradd/usermod/groupadd/chown/chgrp/passwd` 等→T1 系统管理（`req.sysadmin`：加回
+  `privilege.sysadmin.cap_add` 并解除账户库遮蔽），`sudo/mount/modprobe/iptables/systemctl`→T2；
+  复合命令取最高档。规则见 `tools.sandbox.privilege.classify`（`bins` / `bin`+`subs`）。
   - **只读 `mount` 不算特权**：裸 `mount`、`mount -l`、`mount --show-labels`、`mount -t ext4`
     以及 `mount | grep`/`findmnt` 等仅读取挂载表，按 T0 执行；只有存在位置参数（设备/挂载点）
     或变更型选项（`-a`/`-o`/`--bind`/`--remount`/`--move`/`--make-*` 等）的 `mount` 才是 T2。
@@ -1320,6 +1464,12 @@ upper/work、暂存、会话）会 chown 到该 uid。
      `--index-url`/`npm --registry`，或 `apt-key`/`trusted.gpg`/`keyring`/`gpg --import`/`rpm --import`
      等改动第三方软件源或密钥/信任链）保留 L2 高危，并在审批窗头行标注 `⚠ 涉及软件源/密钥`。
      放宽只作用于**风险与提示**：包安装写入仍在暂存层，需用户确认后才应用，不自动落盘。
+  - **apt 降权关闭**（`packages.apt_sandbox_user`，默认 `"root"`）：apt 在 root 下默认把下载/
+    校验降权到 `_apt` 用户（`setgroups` + `setuid/setgid`）；嵌套 user namespace / 受限容器中
+    `setgroups` 返回 EPERM，使 `apt-get update`/`install` 直接失败
+    （`setgroups failed - Operation not permitted`）。沙箱已由命名空间 + overlay 暂存隔离、载荷
+    本就以 root 运行，故默认以只读绑定注入 apt 配置片段并置 `APT_CONFIG` 指向它，写入
+    `APT::Sandbox::User "root"` 关闭该降权。设为 `"_apt"` 或空串则保留 apt 默认行为。
   - **解释器模块形式**：`python3 -m pip install …` 也识别为包安装（`-m` 后的模块即管理器），
     沙箱内对包安装命令注入 `PIP_BREAK_SYSTEM_PACKAGES=1`/`PIP_ROOT_USER_ACTION=ignore`，
     突破 Debian/Ubuntu 的 PEP 668（`externally-managed`）限制——所有写入仍进 overlay 暂存并

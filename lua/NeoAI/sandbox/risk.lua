@@ -119,15 +119,32 @@ local function _under(path, base)
   return path == base or path:sub(1, #base + 1) == base .. "/"
 end
 
+--- cwd/home 的规范化结果缓存：`path_level` 对每个候选路径都要判定是否在工作区内，
+--- 若每次都 `_norm(vim.fn.getcwd())` + `_norm(vim.fn.expand("~"))`（各含 fnamemodify/
+--- expand/resolve/gsub 数次 Vimscript 往返），暂存上万文件时是结算主线程的主要卡顿源。
+--- 以原始 cwd 字符串为键，cwd 变化（`:cd`/`lcd`）时自动重算。
+local _loc_cache = { cwd_key = nil, cwd = nil, home = nil }
+
+--- @return string cwd 规范化绝对路径
+--- @return string home 规范化绝对路径
+local function _locations()
+  local cwd_raw = vim.fn.getcwd()
+  if _loc_cache.cwd_key ~= cwd_raw then
+    _loc_cache.cwd_key = cwd_raw
+    _loc_cache.cwd = _norm(cwd_raw)
+    _loc_cache.home = _norm(vim.fn.expand("~"))
+  end
+  return _loc_cache.cwd, _loc_cache.home
+end
+
 --- 路径所属级别：workspace=0 / user=1 / system=2
 --- @param path string
 --- @return number
 function M.path_level(path)
   if type(path) ~= "string" or path == "" then return 2 end
   local abs = _norm(path)
-  local cwd = _norm(vim.fn.getcwd())
+  local cwd, home = _locations()
   if _under(abs, cwd) then return 0 end
-  local home = _norm(vim.fn.expand("~"))
   if home ~= "" and _under(abs, home) then return 1 end
   return 2
 end
@@ -181,10 +198,15 @@ function M.classify(facts)
     if l and l > level then level = l end
     if reason then reasons[#reasons + 1] = reason end
   end
-  -- 写入路径级别
+  -- 写入路径级别（单遍：同时记录是否存在工作区外写入，供密钥操作分级复用，
+  -- 避免对 `facts.paths` 二次遍历 + 二次 path_level 规范化）
+  local outside = false
   for _, p in ipairs(facts.paths or {}) do
     local pl = M.path_level(p)
-    if pl > 0 then bump(pl, pl == 1 and "USER_PATH_WRITE" or "SYSTEM_PATH_WRITE") end
+    if pl > 0 then
+      outside = true
+      bump(pl, pl == 1 and "USER_PATH_WRITE" or "SYSTEM_PATH_WRITE")
+    end
   end
   if facts.network then bump(M.LEVEL.MODERATE, "NETWORK_ACCESS") end
   if facts.package then bump(M.LEVEL.MODERATE, "PACKAGE_INSTALL") end
@@ -197,10 +219,6 @@ function M.classify(facts)
   if facts.host_op then bump(M.LEVEL.CRITICAL, "HOST_OPERATION") end
   if facts.secret then
     -- 密钥操作按作用域分级：工作区内 L2（HIGH），工作区外（用户目录/系统路径）L3（CRITICAL）。
-    local outside = false
-    for _, p in ipairs(facts.paths or {}) do
-      if M.path_level(p) > 0 then outside = true break end
-    end
     if outside then
       bump(M.LEVEL.CRITICAL, "SECRET_OPERATION_OUTSIDE_WORKSPACE")
     else
@@ -297,6 +315,16 @@ function M.deny_reason(command)
   return nil
 end
 
+--- 结果扫描窗口上限（字节）：`from_result` 仅扫描输出首/尾各 N 字节，避免无上限输出
+--- （`timeout=-1` 的 run_command 可达数百 MB）在主线程做全量 lower + 模式匹配而冻结界面。
+--- 风险信号（权限不足/网络/包变更/破坏性输出）通常出现在输出开头或结尾。0 = 不限制。
+--- @return number
+local function _result_scan_bytes()
+  local n = tonumber(config_store.get("tools.sandbox.risk.result_scan_bytes"))
+  if n == nil then return 262144 end
+  return n
+end
+
 --- 依据命令执行结果判断安全级别（失败/网络/包变更等信号）
 --- @param result table|nil { code, stdout, stderr }
 --- @param base table|nil classify() 结果（取较大者）
@@ -307,7 +335,14 @@ function M.from_result(result, base)
   for _, r in ipairs(base and base.reasons or {}) do reasons[#reasons + 1] = r end
   local signals = {}
   if type(result) == "table" then
-    local text = (tostring(result.stdout or "") .. "\n" .. tostring(result.stderr or "")):lower()
+    local cap = _result_scan_bytes()
+    local function window(s)
+      s = tostring(s or "")
+      if cap <= 0 or #s <= cap * 2 then return s end
+      -- 保留首尾：中间截断（信号多在首尾），显著降低大输出的主线程扫描成本。
+      return s:sub(1, cap) .. "\n…\n" .. s:sub(-cap)
+    end
+    local text = (window(result.stdout) .. "\n" .. window(result.stderr)):lower()
     for _, rule in ipairs(RESULT_PATTERNS) do
       for _, p in ipairs(rule.pats) do
         if text:find(p) then

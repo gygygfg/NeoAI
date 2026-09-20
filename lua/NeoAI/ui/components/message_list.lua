@@ -618,7 +618,8 @@ end
 --- @param lines table
 --- @param rows table 块内文本行（单行纯文本，不含换行）
 --- @param kind string|nil 折叠类型（"reasoning"/"tool"），登记到首行元数据供 foldtext 判定
-local function _append_fold_block(lines, marks, rows, kind)
+--- @param header_mark table|nil 首行额外元数据（如工具块登记 tool_call_id）
+local function _append_fold_block(lines, marks, rows, kind, header_mark)
   if not rows or #rows == 0 then return end
   for idx, row in ipairs(rows) do
     local text, spans, secret_spans
@@ -628,25 +629,37 @@ local function _append_fold_block(lines, marks, rows, kind)
       text = row
     end
     text = text or ""
-    local mark = nil
-    if idx == 1 and kind then
-      mark = { fold_kind = kind }
+    -- 防御：内容行不得含换行。`nvim_buf_set_lines` 收到含 `\n` 的行会报错并使 buffer
+    -- 半写（后续行未写入），表现为折叠被拆成两段。按行拆开；首行保留块元数据，
+    -- 其余行作为普通内容行（跨行 span 丢弃，属极少数场景）。
+    if text:find("\n", 1, true) then
+      for si, sub in ipairs(_split_lines(text)) do
+        local m = nil
+        if si == 1 and idx == 1 and kind then m = header_mark or { fold_kind = kind } end
+        local p = (sub == "") and "" or "  "
+        _push(lines, marks, p .. sub, m)
+      end
+    else
+      local mark = nil
+      if idx == 1 and kind then
+        mark = header_mark or { fold_kind = kind }
+      end
+      local prefix = (text == "") and "" or "  "
+      local off = #prefix
+      if spans and #spans > 0 then
+        mark = mark or {}
+        local adj = {}
+        for _, sp in ipairs(spans) do adj[#adj + 1] = { sp[1] + off, sp[2] + off, sp[3] } end
+        mark.ansi = adj
+      end
+      if secret_spans and #secret_spans > 0 then
+        mark = mark or {}
+        local adj = {}
+        for _, sp in ipairs(secret_spans) do adj[#adj + 1] = { sp[1] + off, sp[2] + off, sp[3] } end
+        mark.secret_spans = adj
+      end
+      _push(lines, marks, prefix .. text, mark)
     end
-    local prefix = (text == "") and "" or "  "
-    local off = #prefix
-    if spans and #spans > 0 then
-      mark = mark or {}
-      local adj = {}
-      for _, sp in ipairs(spans) do adj[#adj + 1] = { sp[1] + off, sp[2] + off, sp[3] } end
-      mark.ansi = adj
-    end
-    if secret_spans and #secret_spans > 0 then
-      mark = mark or {}
-      local adj = {}
-      for _, sp in ipairs(secret_spans) do adj[#adj + 1] = { sp[1] + off, sp[2] + off, sp[3] } end
-      mark.secret_spans = adj
-    end
-    _push(lines, marks, prefix .. text, mark)
   end
 end
 
@@ -655,8 +668,9 @@ end
 --- @param marks table 与 lines 并行的元数据数组
 local function _sync_fold_kinds(buf, marks)
   local set = {}
-  for i = 1, #(marks or {}) do
-    local m = marks[i]
+  -- 用 pairs 而非 `#marks`：marks 与 lines 并行但多数元素为 nil（角色头/空行），
+  -- `#` 会在首个空洞处截断，漏掉靠后的推理/工具元数据。
+  for i, m in pairs(marks or {}) do
     if m and m.fold_kind == "reasoning" then set[i] = true end
   end
   fold.set_reasoning_lines(buf, set)
@@ -802,7 +816,9 @@ end
 local function _tool_arguments_lines(fn, opts)
   if not fn or type(fn.arguments) ~= "string" or fn.arguments == "" then return nil end
   local decoded = json.decode_or_nil(fn.arguments)
-  if decoded == nil then return { fn.arguments } end
+  -- JSON 解析失败（流式未完成 / 非法）：原样展示，但必须按行拆开——参数里可能含真实换行，
+  -- 单行含 `\n` 传给 `nvim_buf_set_lines` 会报错并使 buffer 半写、折叠被拆断。
+  if decoded == nil then return _split_lines(fn.arguments) end
   if type(decoded) == "table" then
     local filtered = {}
     for k, v in pairs(decoded) do
@@ -870,6 +886,35 @@ end
 --- @param marks table 与 lines 并行的元数据数组
 --- @param tool_call table
 --- @param result_msg table|nil 对应的工具结果消息
+--- 工具块首行文本（不含缩进）：状态 emoji + 工具名 + 目的 + 耗时。
+--- 供整块构建与「执行中耗时」轻量刷新共用（避免为更新时间重建整块）。
+--- @param tool_call table
+--- @param result_msg table|nil
+--- @return string|nil
+local function _tool_header_text(tool_call, result_msg)
+  local fn = tool_call and tool_call["function"]
+  if not fn then return nil end
+  local name = fn.name or ""
+  local desc = _tool_description(fn)
+  local desc_str = desc and (" · " .. desc) or ""
+  -- 已完成工具优先用结果消息里持久化的总时长；执行中/无持久化时回退 fold 计时
+  local duration = (result_msg and result_msg.duration_ms) or fold.get_duration(tool_call.id)
+  local time_str = duration and (" · " .. fold.format_ms(duration)) or ""
+  if result_msg then
+    local failed = _tool_result_failed(result_msg.content)
+    return string.format("%s 工具: %s%s%s", failed and "❌" or "✅", name, desc_str, time_str)
+  end
+  -- 结果消息未到达时按各自执行状态渲染（fold 计时记录了每个工具的开始/结束状态）：
+  -- 已完成的工具立即显示 ✅/❌ 并锁定总耗时，仍在执行的显示 ⏳ + 实时耗时。
+  local status = fold.get_status(tool_call.id)
+  if status == "success" then
+    return string.format("✅ 工具: %s%s%s", name, desc_str, time_str)
+  elseif status == "failure" then
+    return string.format("❌ 工具: %s%s%s", name, desc_str, time_str)
+  end
+  return string.format("⏳ 调用工具: %s%s%s", name, desc_str, time_str)
+end
+
 local function _append_tool_block(lines, marks, tool_call, result_msg)
   local fn = tool_call["function"]
   -- 密钥防护：命令参数或结果（模型上下文）含密钥时，在该工具折叠块**外**单独追加
@@ -879,29 +924,8 @@ local function _append_tool_block(lines, marks, tool_call, result_msg)
   -- 含密钥的工具调用：完整展示参数/结果（不截断），并在行内高亮密钥值。
   local has_secret = secret_line ~= nil
   local rows = {}
-  if fn then
-    local name = fn.name or ""
-    local desc = _tool_description(fn)
-    local desc_str = desc and (" · " .. desc) or ""
-    -- 已完成工具优先用结果消息里持久化的总时长；执行中/无持久化时回退 fold 计时
-    local duration = (result_msg and result_msg.duration_ms) or fold.get_duration(tool_call.id)
-    local time_str = duration and (" · " .. fold.format_ms(duration)) or ""
-    if result_msg then
-      local failed = _tool_result_failed(result_msg.content)
-      rows[#rows + 1] = string.format("%s 工具: %s%s%s", failed and "❌" or "✅", name, desc_str, time_str)
-    else
-      -- 结果消息未到达时按各自执行状态渲染（fold 计时记录了每个工具的开始/结束状态）：
-      -- 已完成的工具立即显示 ✅/❌ 并锁定总耗时，仍在执行的显示 ⏳ + 实时耗时。
-      local status = fold.get_status(tool_call.id)
-      if status == "success" then
-        rows[#rows + 1] = string.format("✅ 工具: %s%s%s", name, desc_str, time_str)
-      elseif status == "failure" then
-        rows[#rows + 1] = string.format("❌ 工具: %s%s%s", name, desc_str, time_str)
-      else
-        rows[#rows + 1] = string.format("⏳ 调用工具: %s%s%s", name, desc_str, time_str)
-      end
-    end
-  end
+  local header_text = _tool_header_text(tool_call, result_msg)
+  if header_text then rows[#rows + 1] = header_text end
   -- 结构化调用参数：无论工具最终成功/失败，展开折叠都能看到本次调用传了哪些参数
   local arg_lines = _tool_arguments_lines(fn, { full = has_secret })
   if arg_lines then
@@ -919,7 +943,10 @@ local function _append_tool_block(lines, marks, tool_call, result_msg)
   end
   -- 含密钥：整块一次性扫描并分配行内高亮（避免逐行检测拖慢大结果）
   if has_secret then _with_secret_spans_bulk(rows, true) end
-  _append_fold_block(lines, marks, rows, "tool")
+  -- 首行登记工具调用 id：供「执行中耗时」轻量刷新与 foldtext 实时耗时读取，
+  -- 避免每秒为更新时间重建整块（大消息时占主线程）与折叠闪烁。
+  _append_fold_block(lines, marks, rows, "tool",
+    { fold_kind = "tool", tool_header = { id = tool_call.id, tc = tool_call, res = result_msg } })
   -- 密钥警告：折叠块外单独一行（非缩进 → 不并入折叠），施加高亮。
   if secret_line then
     _push(lines, marks, secret_line, { secret = true })
@@ -1060,7 +1087,8 @@ local function _blocks(msgs, opts)
         extra[#extra + 1] = tostring(fn.name)
         extra[#extra + 1] = _fingerprint(fn.arguments)
         extra[#extra + 1] = tostring(fold.get_status(pp.tc.id))
-        extra[#extra + 1] = tostring(fold.get_duration(pp.tc.id))
+        -- 实时耗时不计入签名：执行中每秒变化会命中缓存失效→重建整块（大消息时占主线程）。
+        -- 时间由 `refresh_tool_times` 就地改写首行；状态变化（running→success）仍触发重建。
         extra[#extra + 1] = pp.res and "res" or "nil"
         if pp.res then
           extra[#extra + 1] = _fingerprint(pp.res.content)
@@ -1146,6 +1174,36 @@ local function _render_chat_full(buf, msgs, opts)
   return { changed = true, start = 1, removed = -1, inserted = #lines, full = true }
 end
 
+--- 就地刷新执行中工具块首行的耗时（不重建整块）。
+--- 工具耗时每秒变化，若计入块签名会导致整块缓存失效并重建（大消息时占主线程、且 buffer
+--- 重写引发折叠闪烁）；改为仅改写首行文本，块其余内容复用缓存。
+--- @param lines table 行数组（BlockCache 的 new_lines）
+--- @param marks table 与 lines 并行的元数据
+--- @return boolean changed
+function M.refresh_tool_times(lines, marks)
+  local changed = false
+  -- 以 lines 长度为准遍历：marks 与 lines 并行但多数元素为 nil，`#marks` 会在首个
+  -- nil 处截断（角色头/空行），导致工具首行元数据被跳过。
+  for i = 1, #(lines or {}) do
+    local th = marks[i] and marks[i].tool_header
+    -- 仅刷新「尚无结果消息且未结束」的工具：有结果/已结束的首行由整块构建锁定状态与总耗时。
+    if th and th.tc and not th.res then
+      local status = fold.get_status(th.id)
+      if status ~= "success" and status ~= "failure" then
+        local text = _tool_header_text(th.tc, nil)
+        if text then
+          local newline = "  " .. text
+          if lines[i] ~= newline then
+            lines[i] = newline
+            changed = true
+          end
+        end
+      end
+    end
+  end
+  return changed
+end
+
 --- 渲染消息列表到 buffer（默认对话模式，增量：块缓存 + 差分写入）
 --- @param buf number
 --- @param messages table 数组
@@ -1164,6 +1222,8 @@ function M.render_chat(buf, messages, opts)
     lines = { "NeoAI 聊天", "", "输入消息开始对话。", "" }
     marks = { nil, nil, nil, nil }
   end
+  -- 执行中工具的首行耗时就地刷新（块缓存命中时也能更新，且不重建整块）。
+  M.refresh_tool_times(lines, marks)
   cache.new_lines = lines
   cache.new_marks = marks
   local diff = cache:write(buf)
