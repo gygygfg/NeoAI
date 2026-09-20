@@ -286,6 +286,19 @@ tests.suite("sandbox_ai_audit", function(_, it)
     t.matches("AI 未给出说明", text, "漏答条目应标注待人工确认")
   end)
 
+  it("审计说明按后缀匹配（模型省略路径前缀）", function(t)
+    local sr = require("NeoAI.ui.components.sandbox_review")
+    local cwd = vim.fn.getcwd()
+    local items = {
+      { change_set_id = "cs1", tool = "edit_file", files = { { path = cwd .. "/sub/a.lua", action = "modify" } } },
+    }
+    -- 模型只回 "a.lua"（省略前缀）：应命中该文件行下方的说明。
+    local data = sr.build_lines(items, nil, { notes = { ["a.lua"] = "安全：可应用" } })
+    local text = table.concat(data.lines, "\n")
+    t.matches("安全：可应用", text, "后缀匹配应命中")
+    t.true_(not text:find("AI 未给出说明", 1, true), "命中后不应再标注待人工确认")
+  end)
+
   it("auto=true 时打开审批窗自动发起 AI 审计", function(t)
     local services = require("NeoAI.kernel.services")
     local config_store = require("NeoAI.kernel.config_store")

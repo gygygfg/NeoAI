@@ -464,15 +464,16 @@ local DEFAULT_CONFIG = {
       -- 载荷 capability：默认**最小权限**（`{}` → `--cap-drop ALL`）。需要的能力按命令
       -- **窄范围**加回（包安装经 `packages.cap_add`，纯包安装命令才授予；混合命令不授予）。
       -- 宿主不可修改由
-      -- **命名空间（mount/pid/uts/ipc/cgroup）+ 只读根（`--ro-bind / /`）+ overlay 暂存 +
-      -- 宿主敏感路径遮蔽 + `/proc/sys` 只读绑定 + seccomp（含 mknod/mknodat 设备节点屏障）**
-      -- 保证：所有写入进入 overlay 私有层并冻结为候选，真实系统只读，危险 syscall 与设备节点
-      -- 创建被拦。仅在明确需要完整能力时（不推荐）才设为 `{ "ALL" }`。
+      -- **命名空间（mount/pid/uts/ipc/cgroup）+ 整机根 overlay（`read_all` 默认，根文件系统
+      -- 原样可写、写入全部进 upper 暂存）+ 宿主敏感路径遮蔽 + `/proc/sys` 只读绑定 +
+      -- seccomp（含 mknod/mknodat 设备节点屏障）**
+      -- 保证：所有写入进入 overlay 私有层并冻结为候选，真实系统不受影响，危险 syscall 与设备
+      -- 节点创建被拦。仅在明确需要完整能力时（不推荐）才设为 `{ "ALL" }`。
       cap_add = {},
       -- 载荷运行身份：默认以 **root** 运行（uid=0），使 AI 能在沙箱内使用宿主工具链
       -- （/root 下的 nvm/cargo/go 等，0700 目录非 root 不可遍历）与包管理（dpkg 硬检查
-      -- euid==0）。**所有写入仍全部进入 overlay 暂存并冻结为候选，真实磁盘只读**；隔离由
-      -- 命名空间 + 只读根 + overlay + seccomp + 遮蔽保证，不依赖非 root。
+      -- euid==0）。**所有写入仍全部进入 overlay 暂存并冻结为候选，真实磁盘不受影响**；隔离由
+      -- 命名空间 + 整机根 overlay + seccomp + 遮蔽保证，不依赖非 root。
       --   * 非 root 启动 NeoAI：用 user namespace 把当前用户映射为**沙箱内 guest root**
       --     （euid=0，仅命名空间内有效；宿主身份仍是当前非 root 用户）。本项被忽略。
       --   * root 启动 NeoAI：uid=0 表示不降权（默认）；设为专用非 root uid（如 nobody 65534）
@@ -500,6 +501,9 @@ local DEFAULT_CONFIG = {
       -- 避免把 apt/pkgcache.bin、缓存归档、镜像层等超大文件嵌入候选 JSON 而阻塞主线程 / 撑爆磁盘。
       -- 0 = 不限制。默认 8 MiB。
       max_file_bytes = 8 * 1024 * 1024,
+      -- 每个工作线程任务的候选文件数：冻结/哈希按此分块并发提交到线程池（默认 4 线程），
+      -- 使 npm/cargo 等产生大量文件的命令用满多核而非单核串行。0/缺省 = 128。
+      work_chunk_files = 128,
       -- 在隔离环境内遮蔽的宿主敏感路径（安全默认）：目录以空 tmpfs 遮蔽，
       -- 文件/socket 以 /dev/null 覆盖。含 docker.sock（= 宿主 root）、容器数据、
       -- 编排器/面板/D-Bus 通道、宿主凭据目录，以及宿主身份/日志/命令历史等读取面泄露项。
@@ -540,10 +544,12 @@ local DEFAULT_CONFIG = {
         "/root/.sqlite_history", "/root/.node_repl_history", "/root/.wget-hsts",
         "/root/.lesshst", "/root/.viminfo", "/root/.config/gh", "/root/.config/gcloud",
       },
-      -- 读取面（默认开）：true 时整机根以**只读**方式暴露（`--ro-bind / /`），仅遮蔽
-      -- `mask_paths` 中的重要配置文件/凭据（~/.ssh、~/.aws、/etc/shadow、sudoers、
-      -- docker.sock 等）与沙箱自身存储；`mask_dirs`（home/root 兄弟目录）不再挂载遮蔽，
-      -- 但访问 cwd 之外的用户目录会**留痕**并在审批悬浮窗展示（见 trace）。
+      -- 读取面（默认开）：true 时整机根以**可写 overlay** 方式暴露——以 `/` 为只读 lower、
+      -- 会话私有 upper/work 为可写层（原样挂载、根内任意路径可写），所有写入进 upper 暂存并
+      -- 冻结为候选，宿主盘不受影响；仅遮蔽 `mask_paths` 中的重要配置文件/凭据（~/.ssh、
+      -- ~/.aws、/etc/shadow、sudoers、docker.sock 等）与沙箱自身存储；`mask_dirs`
+      -- （home/root 兄弟目录）不再挂载遮蔽，但访问 cwd 之外的用户目录会**留痕**并在审批悬浮窗
+      -- 展示（见 trace）。overlay 不可用时退回只读根（`overlay_fail_closed` 决定是否降级）。
       -- false 时退回最小只读白名单（`readonly_roots`/`readonly_paths`）——更小读取面。
       read_all = true,
       -- 最小只读系统集（白名单）：仅这些宿主根/子树以只读方式暴露给外部命令；未列出的
@@ -757,9 +763,10 @@ local DEFAULT_CONFIG = {
           "CAP_SETUID", "CAP_SETGID", "CAP_SETFCAP", "CAP_FSETID",
           "CAP_SYS_CHROOT", "CAP_KILL",
         },
-        -- 包安装命令的宿主状态目录：仅当命令判定为包安装时加入可写根（overlay 暂存），
-        -- 使 apt/dpkg/pip/npm 等能写入索引/缓存/元数据与安装目标，写入冻结为候选。支持 `~`
-        -- 展开；不存在的目录自动跳过。可按需增减（如自建源/自定义前缀）。
+        -- 包安装命令的宿主状态目录：命令判定为包安装时这些路径需可写。`read_all=true`
+        -- （默认）下整机根已是可写 overlay，本列表仅用于包路径分类/审批合并；`read_all=false`
+        -- 或整机 overlay 不可用时，作为额外可写根加入（overlay 暂存），使 apt/dpkg/pip/npm 等
+        -- 能写入索引/缓存/元数据与安装目标，写入冻结为候选。支持 `~` 展开；不存在的目录跳过。
         roots = {
           -- 系统级安装目标（apt 安装到 /usr/bin、/usr/games 等；/usr 覆盖 /usr/local、
           -- /usr/lib/node_modules、/usr/share/nodejs 等子路径）与系统状态（/var 覆盖
@@ -788,12 +795,11 @@ local DEFAULT_CONFIG = {
       -- 待审队列/候选/回执/证据不跨 nvim 会话共享（多个会话互不可见对方的审批）。
       workspace_root = vim.fn.stdpath("cache") .. "/NeoAI/sandbox",
       session_shell = true, -- run_command 会话内保留 shell 状态（export/cd 跨命令生效，仅 bwrap 后端）
-      -- run_command 可写根：这些根以 overlay 覆盖（真实内容只读 lower，写入进会话 upper），
-      -- 使命令能修改这些根下的任意路径并冻结为候选；cwd 未覆盖时自动补入。
-      -- 安全默认仅 cwd（自动补入）；不再默认覆盖 `/tmp`、`/var/tmp`（属每会话私有 tmpfs，
-      -- 见 `tmpfs_roots`），也不覆盖 `/root`、`/home`、`/etc` 等整目录，避免把宿主真实
-      -- home/账户/配置/临时残留作为只读 lower 暴露。需要任意路径写入时按需显式加回
-      -- （注意同时收紧 mask_paths）。
+      -- 额外可写根（仅 `read_all=false` 或整机 overlay 不可用时生效）：这些根以独立 overlay
+      -- 覆盖（真实内容只读 lower，写入进会话 upper），使命令能修改这些根下的任意路径并冻结为
+      -- 候选；cwd 未覆盖时自动补入。`read_all=true`（默认）时整机根已是可写 overlay，本项不再
+      -- 需要。安全默认仅 cwd（自动补入）；不覆盖 `/tmp`、`/var/tmp`（属每会话私有 tmpfs，
+      -- 见 `tmpfs_roots`）。需要任意路径写入时按需显式加回（注意同时收紧 mask_paths）。
       process_roots = {},
       -- overlay 不可用（无法为可写根挂载 overlay 可写层）时是否拒绝外部进程执行。
       -- 默认 true（fail-closed）：**不降级**为「私有可写 cwd」——那种视图看不到真实磁盘
@@ -929,6 +935,11 @@ local DEFAULT_CONFIG = {
         -- 启用，避免对普通文件/工具输出做昂贵的熵计算；具名规则（AKIA/sk-/JWT 等）与敏感
         -- 变量名赋值仍对所有内容生效。设为 false 退回旧的「所有内容都做熵检测」行为。
         entropy_secret_paths_only = true,
+        -- AI 生成高熵信息检测（detect_generated）的单次扫描预算：候选文件很多/很大时，
+        -- 逐文件全文熵/规则检测会占满主线程。超过预算的文件不再扫描（其余仍扫描），
+        -- 0 表示不限制。默认宽松，兼顾安全与卡顿。
+        generated_scan_max_bytes = 2 * 1024 * 1024,
+        generated_scan_max_files = 200,
         tokenize_env = true, -- 是否对沙箱进程环境变量 token 化（false = 原样注入，调试用）
         -- 具名敏感信息规则（Lua pattern）：命中即脱敏/token 化（无视熵阈值），覆盖
         -- 私钥块、带前缀 token（AKIA/ghp_/sk-…）、JWT、Bearer 等结构化凭据。

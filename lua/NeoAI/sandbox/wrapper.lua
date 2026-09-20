@@ -143,6 +143,52 @@ function M.build_overlay_specs(cwd, base_dir, extra_roots)
     cfg_roots = {}
   end
   local base = base_dir:gsub("/+$", "")
+  -- F2：每会话私有临时根（默认 /tmp、/var/tmp）绝不 overlay——否则会以宿主真实
+  -- /tmp 为只读 lower，泄露宿主/上一会话残留。它们由 runtime 以会话私有目录绑定。
+  local tmpfs_roots = runtime.tmpfs_roots()
+  local function under(p, r)
+    if type(p) ~= "string" or type(r) ~= "string" then return false end
+    return p == r or p:sub(1, #r + 1) == r .. "/"
+  end
+  local function is_tmpfs_root(r)
+    for _, x in ipairs(tmpfs_roots) do if r == x then return true end end
+    return false
+  end
+  local function under_tmpfs(p)
+    for _, x in ipairs(tmpfs_roots) do if under(p, x) then return true end end
+    return false
+  end
+  local function make_spec(r)
+    local d = base_dir .. "/" .. _enc_root(r)
+    local upper, work, bind = d .. "/upper", d .. "/work", d .. "/bind"
+    fs.ensure_dir(upper)
+    fs.ensure_dir(work)
+    fs.ensure_dir(bind)
+    -- 载荷非 root 时，overlay upper/work 必须归载荷所有，否则内核拒绝可写挂载（EROFS）。
+    runtime.chown_payload(d)
+    return { root = r, upper = upper, work = work, bind = bind }
+  end
+  -- read_all（默认）整机根模式：用单一整机 overlay（lower=/，upper/work 会话私有）替换只读根，
+  -- 使沙箱内根文件系统「原样可写」，所有写入进 upper 暂存、宿主盘不受影响；命令结束后从该
+  -- upper 捕获全部改动为候选。overlay 不可写时退回旧的多根逻辑（process_prefix 以只读根运行，
+  -- 是否允许降级由 overlay_fail_closed 决定）。
+  if runtime.read_all() and cwd then
+    local d = base .. "/root"
+    local upper, work, bind = d .. "/upper", d .. "/work", d .. "/bind"
+    fs.ensure_dir(upper)
+    fs.ensure_dir(work)
+    fs.ensure_dir(bind)
+    runtime.chown_payload(d)
+    if runtime.overlay_available() and runtime.overlay_writable("/", upper, work) then
+      local specs = { { root = "/", upper = upper, work = work, bind = bind, mode = "overlay" } }
+      -- 整机 overlay 看不到会话私有 tmpfs 根（/tmp、/var/tmp 被私有目录覆盖），cwd 位于其下时
+      -- 仍需单独 overlay cwd，使命令能在工作目录运行（与旧多根逻辑一致）。
+      if under_tmpfs(cwd) and vim.fn.isdirectory(cwd) == 1 and not under(base, cwd) then
+        specs[#specs + 1] = make_spec(cwd)
+      end
+      return specs
+    end
+  end
   -- 无法 overlay 的 tmpfs 挂载根（overlay lower 为挂载点会 EINVAL）：这些根只能
   -- bind 空会话目录；若 cwd 在其下，bind 会让 cwd 消失，故跳过该根、改为单独 overlay cwd。
   local NON_OVERLAY = { "/dev/shm", "/run" }
@@ -150,17 +196,7 @@ function M.build_overlay_specs(cwd, base_dir, extra_roots)
     for _, x in ipairs(NON_OVERLAY) do if r == x then return true end end
     return false
   end
-  -- F2：每会话私有临时根（默认 /tmp、/var/tmp）绝不 overlay——否则会以宿主真实
-  -- /tmp 为只读 lower，泄露宿主/上一会话残留。它们由 runtime 以会话私有目录绑定。
-  local tmpfs_roots = runtime.tmpfs_roots()
-  local function is_tmpfs_root(r)
-    for _, x in ipairs(tmpfs_roots) do if r == x then return true end end
-    return false
-  end
   local roots = {}
-  local function under(p, r)
-    return p == r or p:sub(1, #r + 1) == r .. "/"
-  end
   local function add(r)
     r = tostring(r or ""):gsub("/+$", "")
     if r == "" or r == "/" or vim.fn.isdirectory(r) ~= 1 then return end
@@ -178,16 +214,7 @@ function M.build_overlay_specs(cwd, base_dir, extra_roots)
   for _, r in ipairs(roots) do if under(cwd, r) then covered = true break end end
   if not covered then add(cwd) end
   local specs = {}
-  for _, r in ipairs(roots) do
-    local d = base_dir .. "/" .. _enc_root(r)
-    local upper, work, bind = d .. "/upper", d .. "/work", d .. "/bind"
-    fs.ensure_dir(upper)
-    fs.ensure_dir(work)
-    fs.ensure_dir(bind)
-    -- 载荷非 root 时，overlay upper/work 必须归载荷所有，否则内核拒绝可写挂载（EROFS）。
-    runtime.chown_payload(d)
-    specs[#specs + 1] = { root = r, upper = upper, work = work, bind = bind }
-  end
+  for _, r in ipairs(roots) do specs[#specs + 1] = make_spec(r) end
   return specs
 end
 
@@ -218,7 +245,8 @@ local function _enqueue_review(cand, attempt, cfg, env, meta)
     base_version = attempt.request_hash,
     evidence = env and env.evidence or nil,
     stats = env and env.stats or nil,
-    secret_warning = meta and meta.secret_warning or nil,
+    -- false 表示「已分析且无警告」：避免 review.enqueue 在主线程对候选做一次同步全文扫描。
+    secret_warning = meta and meta.secret_warning,
     risk_level = meta and meta.risk_level or nil,
     risk_name = meta and meta.risk_name or nil,
     risk_reasons = meta and meta.risk_reasons or nil,
@@ -233,6 +261,29 @@ local function _enqueue_review(cand, attempt, cfg, env, meta)
   })
 end
 
+--- 异步预计算候选的密钥分析（NEOKEY 警告 + 生成高熵），在工作线程扫描，避免结算阶段
+--- 主线程逐文件全文扫描。线程池不可用时返回 offloaded=false，由调用方回退同步。
+--- @param cand table
+--- @param attempt table
+--- @return Deferred resolve({ offloaded, secret_warning, generated })
+local function _analyze_secrets_async(cand, attempt)
+  local secret = require("NeoAI.sandbox.secret")
+  if not (secret.enabled() and not attempt.package) then
+    return async.resolve({ offloaded = true, secret_warning = nil, generated = {} })
+  end
+  return secret.analyze_files_async(cand.files, {}):then_(function(r)
+    if r.offloaded == false then
+      -- 线程池不可用：回退同步（小候选/无 worker 环境）。
+      return {
+        offloaded = true,
+        secret_warning = secret.warn_for_files(cand.files),
+        generated = secret.detect_generated(cand.files),
+      }
+    end
+    return { offloaded = true, secret_warning = r.warning, generated = r.generated or {} }
+  end)
+end
+
 --- 按模式/授权发布或入队；返回解析后的结果/错误
 --- @param cand table
 --- @param attempt table
@@ -241,8 +292,10 @@ end
 --- @param spec table
 --- @param result any
 --- @param process_info table|nil
+--- @param pre table|nil 预计算的密钥分析（{ secret_warning, generated }），由工作线程得出；
+---   nil 时在此同步计算（小候选/线程池不可用）。
 --- @return table { ok, value?, err? }
-local function _settle_candidate(cand, attempt, ctx, cfg, spec, result, process_info)
+local function _settle_candidate(cand, attempt, ctx, cfg, spec, result, process_info, pre)
   -- 命名空间映射的临时根（/tmp、/var/tmp 等）：写入为会话私有、nvim 退出即丢弃，
   -- 不进入待审队列、不 CAS 发布、也不弹审批悬浮窗；暂存内容保留以供本次会话读取一致。
   -- 仅当路径**不在 cwd 子树内**时才视为临时根（cwd 位于 /tmp 时其工作区仍走正常审批）。
@@ -279,7 +332,9 @@ local function _settle_candidate(cand, attempt, ctx, cfg, spec, result, process_
   -- 影响与证据（fs/process），未知用 null 表达
   local impacts = impact.from_candidate(cand, { command_id = attempt.command_id, attempt_id = attempt.attempt_id })
   if process_info then impacts[#impacts + 1] = impact.process(process_info) end
-  local evidence_id = evidence.add("fs", { files = cand.files, process = process_info }, {
+  -- 证据只存影响清单（路径/动作/哈希，不含文件内容）：此前直接嵌入 cand.files 会把每个文件的
+  -- 完整内容再 JSON 编码一遍（大候选时阻塞主线程，且证据本就无需内容）。
+  local evidence_id = evidence.add("fs", { files = impacts }, {
     command_id = attempt.command_id, attempt_id = attempt.attempt_id, tool = attempt.tool_name,
   })
   local stats = impact.stats(impacts)
@@ -300,46 +355,47 @@ local function _settle_candidate(cand, attempt, ctx, cfg, spec, result, process_
   end
   local is_pkg = attempt.package == true or pkg_by_path ~= nil
   local secret_warning = nil
-  do
-    local ok, s = pcall(require("NeoAI.sandbox.secret"))
-    -- 包安装状态文件（apt lists/pkgcache、pip/npm 缓存等）常含高熵签名/哈希，并非用户密钥；
-    -- 跳过密钥检测，避免误报「密钥操作」并误升到 L3。
-    if ok and s.enabled() and not is_pkg then
-      secret_warning = s.warn_for_files(cand.files)
+  local generated = {}
+  if not is_pkg then
+    if pre then
+      -- 工作线程已扫描：直接用结果，主线程不再逐文件全文扫描。
+      secret_warning = pre.secret_warning
+      generated = pre.generated or {}
+    else
+      local ok, s = pcall(require, "NeoAI.sandbox.secret")
+      -- 包安装状态文件（apt lists/pkgcache、pip/npm 缓存等）常含高熵签名/哈希，并非用户密钥；
+      -- 跳过密钥检测，避免误报「密钥操作」并误升到 L3。
+      if ok and s.enabled() then
+        secret_warning = s.warn_for_files(cand.files)
+        -- AI 生成的高熵信息（密钥类）：候选内容含熵/具名候选（非宿主 token）时留痕、发事件、
+        -- 审计，并给出「密钥操作」提示，强制进入待审（不终止 Agent）。
+        generated = s.detect_generated(cand.files)
+      end
     end
   end
-  -- AI 生成的高熵信息（密钥类）：候选内容含熵/具名候选（非宿主 token）时留痕、发事件、审计，
-  -- 并给出「密钥操作」提示，强制进入待审（不终止 Agent）。与宿主密钥 token 化互补。
-  local generated = {}
-  do
-    local ok, s = pcall(require, "NeoAI.sandbox.secret")
-    if ok and s.enabled() and not is_pkg then
-      generated = s.detect_generated(cand.files)
-      if #generated > 0 then
-        pcall(function()
-          require("NeoAI.sandbox.evidence").add("secret", {
-            event = "generated_high_entropy", count = #generated, hits = generated,
-            source = "observed", coverage = "partial",
-          }, { tool = attempt.tool_name, command_id = attempt.command_id, attempt_id = attempt.attempt_id })
-        end)
-        pcall(function()
-          require("NeoAI.kernel.event_bus").emit(
-            require("NeoAI.kernel.events").SANDBOX_SECRET_DETECTED, {
-              source = "generated", tool = attempt.tool_name, count = #generated,
-              command_id = attempt.command_id,
-            })
-        end)
-        pcall(function()
-          require("NeoAI.sandbox.audit").observe({
-            kind = "secret", tool = attempt.tool_name, level = 2,
-            reasons = { "GENERATED_HIGH_ENTROPY" }, command_id = attempt.command_id,
-          })
-        end)
-        if not secret_warning then
-          secret_warning = { count = #generated, tokens = {}, generated = true,
-            reason = "HIGH_ENTROPY_GENERATED" }
-        end
-      end
+  if #generated > 0 then
+    pcall(function()
+      require("NeoAI.sandbox.evidence").add("secret", {
+        event = "generated_high_entropy", count = #generated, hits = generated,
+        source = "observed", coverage = "partial",
+      }, { tool = attempt.tool_name, command_id = attempt.command_id, attempt_id = attempt.attempt_id })
+    end)
+    pcall(function()
+      require("NeoAI.kernel.event_bus").emit(
+        require("NeoAI.kernel.events").SANDBOX_SECRET_DETECTED, {
+          source = "generated", tool = attempt.tool_name, count = #generated,
+          command_id = attempt.command_id,
+        })
+    end)
+    pcall(function()
+      require("NeoAI.sandbox.audit").observe({
+        kind = "secret", tool = attempt.tool_name, level = 2,
+        reasons = { "GENERATED_HIGH_ENTROPY" }, command_id = attempt.command_id,
+      })
+    end)
+    if not secret_warning then
+      secret_warning = { count = #generated, tokens = {}, generated = true,
+        reason = "HIGH_ENTROPY_GENERATED" }
     end
   end
   -- 本次调用涉及加密 token 或敏感环境变量名（但候选文件不含 token）时，也给出密钥操作警告，
@@ -472,7 +528,7 @@ local function _settle_candidate(cand, attempt, ctx, cfg, spec, result, process_
     pinfo = { manager = pkg_by_path, packages = {}, key = pkg_by_path .. ":*" }
   end
   local item = _enqueue_review(cand, attempt, cfg, env, {
-    secret_warning = secret_warning,
+    secret_warning = secret_warning or false,
     risk_level = r.level, risk_name = r.name, risk_reasons = r.reasons,
     package = rf.package, action = action,
     command = rf.command,
@@ -487,6 +543,23 @@ local function _settle_candidate(cand, attempt, ctx, cfg, spec, result, process_
   end
   control.transition(attempt, "AWAITING_PUBLICATION_AUTH")
   return { ok = true, value = result }
+end
+
+--- 持久化候选（异步写）→ 密钥分析（工作线程）→ 结算。返回 Deferred resolve(settled)。
+--- @param cand table
+--- @param attempt table
+--- @param ctx table
+--- @param cfg table
+--- @param spec table
+--- @param result any
+--- @param process_info table|nil
+--- @return Deferred resolve({ ok, value?, err? })
+local function _persist_and_settle(cand, attempt, ctx, cfg, spec, result, process_info)
+  return store.write_candidate_async(cand):then_(function()
+    return _analyze_secrets_async(cand, attempt)
+  end):then_(function(pre)
+    return _settle_candidate(cand, attempt, ctx, cfg, spec, result, process_info, pre)
+  end)
 end
 
 --- 冻结工具子进程（exec，长驻场景）产生的候选并按模式入队/发布。
@@ -572,9 +645,24 @@ local function _limits_key(limits)
   }, ":")
 end
 
+--- 停止并回收预热 TTL 定时器。
+--- `vim.defer_fn` 返回的是 libuv 定时器句柄（userdata），不能传给 `vim.fn.timer_stop`
+--- （会抛 `E5101: Cannot convert given Lua type`）；对 userdata 用 uv 句柄的 stop/close。
+local function _prewarm_stop_timer()
+  local t = prewarm.timer
+  if not t then return end
+  prewarm.timer = nil
+  if type(t) == "userdata" then
+    pcall(function() t:stop() end)
+    pcall(function() t:close() end)
+  else
+    pcall(vim.fn.timer_stop, t)
+  end
+end
+
 --- 停止并回收预热观测（幂等）
 local function _prewarm_clear()
-  if prewarm.timer then pcall(vim.fn.timer_stop, prewarm.timer); prewarm.timer = nil end
+  _prewarm_stop_timer()
   if prewarm.handle then pcall(prewarm.handle.stop) end
   if prewarm.cg then
     pcall(function() require("NeoAI.sandbox.cgroup").release(prewarm.cg) end)
@@ -589,7 +677,7 @@ local function _take_prewarm(limits_key)
   if not prewarm.cg then return nil end
   if prewarm.limits_key ~= limits_key then _prewarm_clear(); return nil end
   local pre = { cg = prewarm.cg, handle = prewarm.handle, slot = prewarm.slot }
-  if prewarm.timer then pcall(vim.fn.timer_stop, prewarm.timer); prewarm.timer = nil end
+  _prewarm_stop_timer()
   prewarm.cg, prewarm.handle, prewarm.slot, prewarm.limits_key = nil, nil, nil, nil
   return pre
 end
@@ -1165,13 +1253,16 @@ function M.gate(tool, args, ctx, call_original)
         end
         if cand and #cand.files > 0 then
           cand.command_id = attempt.command_id
-          store.write_candidate(cand)
           -- 双向互通：把命令改动合并进工作区暂存映射，使 read_file/edit_file 可见。
-          -- 密钥 token 化（全文扫描）经线程池，避免大量文件时占满主线程。
+          -- 候选落盘与密钥分析均异步（线程池），避免大量文件时占满主线程。
           return candidate.merge_candidate_async(cand):then_(function()
-            local settled = _settle_candidate(cand, attempt, ctx, cfg, spec, res, { command = args and args.command })
+            return _persist_and_settle(cand, attempt, ctx, cfg, spec, res, { command = args and args.command })
+          end):then_(function(settled)
             candidate.cleanup(attempt.attempt_id)
             if settled.ok then d:resolve(settled.value) else d:reject(settled.err) end
+          end, function(cerr)
+            candidate.cleanup(attempt.attempt_id)
+            d:reject(cerr)
           end)
         else
           if cand == nil then

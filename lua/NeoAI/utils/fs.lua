@@ -132,7 +132,7 @@ end
 --- 同目录临时文件 + fsync + rename：失败不截断原文件。
 --- @param path string
 --- @param content string
---- @param opts table|nil { backup?: boolean, mode?: number 保留原权限位 }
+--- @param opts table|nil { backup?: boolean, mode?: number 保留原权限位, sync?: boolean 是否 fsync（默认 true） }
 --- @return boolean, string|nil
 function M.write_file_atomic(path, content, opts)
   local uv = vim.uv
@@ -150,8 +150,12 @@ function M.write_file_atomic(path, content, opts)
     if not n or n == 0 then return fail(err or "文件写入未完成") end
     offset = offset + n
   end
-  local synced, sync_err = uv.fs_fsync(fd)
-  if not synced then return fail(sync_err) end
+  -- sync=false：会话级 overlay 私有可写层等临时草稿无需落盘，逐文件 fsync 在暂存量大时
+  -- 是主要卡顿源；真实工作区发布等需要持久化的路径保持默认 fsync。
+  if not (opts and opts.sync == false) then
+    local synced, sync_err = uv.fs_fsync(fd)
+    if not synced then return fail(sync_err) end
+  end
   local closed, close_err = uv.fs_close(fd)
   fd = nil
   if not closed then return fail(close_err) end

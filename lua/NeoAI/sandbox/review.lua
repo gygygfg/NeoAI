@@ -43,6 +43,7 @@ local state = {
   -- 待审摘要缓存：待审堆积到数千时，状态栏每次重绘都全量扫描会随轮次线性变慢；
   -- 任何变更单元写操作（_persist）都会失效缓存，下次读取时重算一次。
   pending_cache = nil,
+  ref_scans = 0, -- 诊断：`_candidate_referenced` 全表扫描次数（测试断言批量删除不再逐项扫描）
 }
 
 -- ========== 私有函数 ==========
@@ -72,7 +73,9 @@ end
 local function _persist(item)
   -- 写盘即视为状态变更：失效待审摘要缓存（pending_summary 会重算并缓存）。
   state.pending_cache = nil
-  pcall(store.write_review, item)
+  -- 异步落盘（文件写入移入线程池）：待审项含候选文件内容，大候选时同步 fsync 会卡主线程。
+  -- 内存态是权威来源，store 的写缓存保证刚写入即可同步读回；reset/shutdown 前会 flush。
+  pcall(store.write_review_async, item)
 end
 
 --- 候选是否仍被某个「可应用」变更单元引用。
@@ -84,6 +87,7 @@ end
 local function _candidate_referenced(digest)
   if not digest then return false end
   _ensure_loaded()
+  state.ref_scans = state.ref_scans + 1
   for _, item in pairs(state.items) do
     if item.candidate_digest == digest then
       local terminal = item.review_state == M.REVIEW.REJECTED
@@ -102,6 +106,31 @@ end
 local function _discard_candidate(digest)
   if _candidate_referenced(digest) then return false end
   return store.discard_candidate(digest)
+end
+
+--- 批量删除候选：先**一次**统计仍被非终态变更单元引用的摘要集合，再删除未被引用者。
+--- `supersede_by_paths` / 包安装合并会一次取代大量同路径候选；若对每个候选都调
+--- `_candidate_referenced`（全表扫描），待审堆积到数百/上千时退化为 O(n²)。批量版
+--- 把引用统计合并为单次 O(n)，删除为 O(k)。
+--- 注意：调用方须先完成所有状态改写（把将被删除的项标记为终态），再调用本函数。
+--- @param digests table digest -> true
+local function _discard_candidates(digests)
+  if not digests or next(digests) == nil then return end
+  _ensure_loaded()
+  local referenced = {}
+  for _, item in pairs(state.items) do
+    local digest = item.candidate_digest
+    if digest and digests[digest] then
+      local terminal = item.review_state == M.REVIEW.REJECTED
+        or item.review_state == M.REVIEW.SUPERSEDED
+        or item.apply_state == M.APPLY.APPLIED
+        or item.apply_state == M.APPLY.REVERTED
+      if not terminal then referenced[digest] = true end
+    end
+  end
+  for digest in pairs(digests) do
+    if not referenced[digest] then store.discard_candidate(digest) end
+  end
 end
 
 --- @param content string
@@ -337,6 +366,7 @@ local function _merge_package_item(item, cand)
     effect = base.effect or cand.effect, command_id = cand.command_id,
   }
   store.write_candidate(newcand)
+  local to_discard = {}
   -- 其余同键成员并入 base：标记取代并丢弃各自候选。
   for i = 2, #members do
     local it = members[i]
@@ -344,7 +374,7 @@ local function _merge_package_item(item, cand)
     it.superseded_by = base.change_set_id
     it.superseded_at = os.time()
     state.items[it.change_set_id] = it
-    if it.candidate_digest ~= digest then _discard_candidate(it.candidate_digest) end
+    if it.candidate_digest ~= digest then to_discard[it.candidate_digest] = true end
     _persist(it)
     _emit(require("NeoAI.kernel.events").SANDBOX_REVIEW_SUPERSEDED, {
       change_set_id = it.change_set_id, superseded_by = base.change_set_id,
@@ -366,14 +396,15 @@ local function _merge_package_item(item, cand)
   base.updated_at = os.time()
   state.items[base.change_set_id] = base
   _persist(base)
-  if old_base_digest ~= digest then _discard_candidate(old_base_digest) end
+  if old_base_digest ~= digest then to_discard[old_base_digest] = true end
   -- 新条目已并入 base：标记取代并丢弃其候选。
   item.review_state = M.REVIEW.SUPERSEDED
   item.superseded_by = base.change_set_id
   item.superseded_at = os.time()
   state.items[item.change_set_id] = item
-  if item.candidate_digest ~= digest then _discard_candidate(item.candidate_digest) end
+  if item.candidate_digest ~= digest then to_discard[item.candidate_digest] = true end
   _persist(item)
+  _discard_candidates(to_discard)
   _emit(require("NeoAI.kernel.events").SANDBOX_REVIEW_SUPERSEDED, {
     change_set_id = item.change_set_id, superseded_by = base.change_set_id,
   })
@@ -870,6 +901,7 @@ function M.supersede_by_paths(paths, except_id)
   for _, p in ipairs(paths or {}) do set[p] = true end
   if not next(set) then return 0 end
   local n = 0
+  local to_discard = {}
   for _, item in ipairs(M.list({ review_state = M.REVIEW.PENDING })) do
     if item.change_set_id ~= except_id then
       local overlap = false
@@ -881,7 +913,7 @@ function M.supersede_by_paths(paths, except_id)
         item.superseded_by = except_id
         item.superseded_at = os.time()
         state.items[item.change_set_id] = item
-        _discard_candidate(item.candidate_digest)
+        if item.candidate_digest then to_discard[item.candidate_digest] = true end
         _persist(item)
         _emit(require("NeoAI.kernel.events").SANDBOX_REVIEW_SUPERSEDED, {
           change_set_id = item.change_set_id, superseded_by = except_id,
@@ -890,6 +922,8 @@ function M.supersede_by_paths(paths, except_id)
       end
     end
   end
+  -- 状态改写完成后再批量删除候选：单次引用统计，避免逐项全表扫描的 O(n²)。
+  _discard_candidates(to_discard)
   return n
 end
 
@@ -1005,7 +1039,7 @@ function M.apply_set(set)
   local pub = candidate.publish(set.candidate, { expected_base = set.publication_intent_hash })
   if pub.ok then
     store.write_receipt(pub.receipt)
-    _discard_candidate(set.candidate.candidate_digest)
+    local to_discard = { [set.candidate.candidate_digest] = true }
     for _, m in ipairs(set.members or {}) do
       m.review_state = M.REVIEW.APPROVED
       m.apply_state = M.APPLY.APPLIED
@@ -1013,11 +1047,12 @@ function M.apply_set(set)
       m.receipt = pub.receipt
       state.items[m.change_set_id] = m
       _persist(m)
-      _discard_candidate(m.candidate_digest)
+      if m.candidate_digest then to_discard[m.candidate_digest] = true end
       _emit(require("NeoAI.kernel.events").SANDBOX_APPLIED, {
         change_set_id = m.change_set_id, operation_id = pub.receipt.operation_id,
       })
     end
+    _discard_candidates(to_discard)
   else
     for _, m in ipairs(set.members or {}) do
       m.apply_state = pub.state == "CONFLICT" and M.APPLY.CONFLICT or M.APPLY.FAILED
@@ -1099,6 +1134,13 @@ function M.reset()
   state.session_auto = nil
   state.loaded = false
   state.pending_cache = nil
+  state.ref_scans = 0
+end
+
+--- 诊断：`_candidate_referenced` 全表扫描累计次数（测试用）
+--- @return number
+function M._ref_scans()
+  return state.ref_scans
 end
 
 return M

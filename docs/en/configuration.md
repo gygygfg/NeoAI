@@ -234,8 +234,8 @@ sandbox = {
   -- Payload identity: runs as root by default (uid=0) so the AI can use host toolchains inside the
   --   sandbox (/root nvm/cargo/go etc. are 0700 and untraversable by non-root) and package managers
   --   (dpkg hard-checks euid==0). All writes still go to the overlay staging layer and freeze as
-  --   candidates; the real disk stays read-only. Isolation comes from namespaces + read-only root +
-  --   overlay + seccomp + masking.
+  --   candidates; the real disk is unaffected. Isolation comes from namespaces + whole-root overlay
+  --   + seccomp + masking.
   --   * NeoAI launched as non-root: a user namespace maps the current user to **guest root inside
   --     the sandbox** (euid=0, effective only within the namespace; host identity stays the current
   --     non-root user); this setting is ignored. Operations that genuinely need host root are frozen
@@ -250,13 +250,17 @@ sandbox = {
     "CAP_SYS_BOOT", "CAP_MAC_ADMIN", "CAP_MAC_OVERRIDE", "CAP_AUDIT_CONTROL",
   },
   max_file_bytes = 8 * 1024 * 1024, -- Max bytes per file included in a candidate; larger files are skipped to avoid huge apt/pkgcache.bin blocking the main thread; 0 = unlimited
-  -- Read surface (on by default): when true the whole host root is exposed read-only
-  -- (`--ro-bind / /`), masking only the important config files/credentials in `mask_paths`
-  -- (~/.ssh, ~/.aws, /etc/shadow, sudoers, docker.sock, ...) plus the sandbox's own storage;
-  -- `mask_dirs` (home/root sibling dirs) are no longer mount-masked, but accessing user dirs
-  -- outside cwd is **traced** (evidence + `sandbox:outside_access` event) and shown in the
-  -- `:NeoAISandboxReview` window under "越界访问留痕" (non-blocking, still allowed). When false,
-  -- falls back to the minimal read-only allowlist below.
+  work_chunk_files = 128, -- Candidate files per worker task: freeze/hash/secret-scan are chunked and dispatched to the thread pool (multi-core) to avoid single-core serialization on many files; 0/default = 128
+  -- Read surface (on by default): when true the whole host root is exposed as a **writable overlay**
+  -- (lower `/`, session-private upper/work; mounted as-is, any path under the root is writable). All
+  -- writes go to the upper staging layer and freeze as candidates, leaving the host disk untouched;
+  -- only the important config files/credentials in `mask_paths` (~/.ssh, ~/.aws, /etc/shadow,
+  -- sudoers, docker.sock, ...) plus the sandbox's own storage are masked; `mask_dirs` (home/root
+  -- sibling dirs) are no longer mount-masked, but accessing user dirs outside cwd is **traced**
+  -- (evidence + `sandbox:outside_access` event) and shown in the `:NeoAISandboxReview` window under
+  -- "越界访问留痕" (non-blocking, still allowed). When the overlay is unavailable it falls back to a
+  -- read-only root (overlay_fail_closed decides whether to degrade). When false, falls back to the
+  -- minimal read-only allowlist below.
   read_all = true,
   -- Minimal read-only system set (allowlist, only when read_all=false): only these host
   -- roots/subtrees/files are exposed read-only to external commands; unlisted paths do not exist
@@ -374,7 +378,7 @@ sandbox = {
   -- Store base root: each process is isolated under <workspace_root>/instances/<pid>_<ts>; pending queue/candidates are not shared across sessions.
   workspace_root = vim.fn.stdpath("cache") .. "/NeoAI/sandbox",
   session_shell = true,            -- persist shell state (export/cd) across run_command within a session (bwrap only)
-  process_roots = {},              -- run_command writable roots (overlaid; default cwd only, auto-added). /tmp, /var/tmp belong to tmpfs_roots; host /root, /home, /etc are not exposed as read-only lower; add explicitly if needed
+  process_roots = {},              -- extra writable roots (only when read_all=false or the whole-root overlay is unavailable; overlaid, default cwd only, auto-added). With read_all=true (default) the whole root is already a writable overlay, so this is unnecessary. /tmp, /var/tmp belong to tmpfs_roots; add explicitly if needed
   overlay_fail_closed = true,      -- reject process tools when overlay is unavailable (no private-cwd downgrade); set false to allow degraded execution
   -- Async review: candidates enter a pending queue. session_auto_approve auto-applies L0/L1.
   -- l3_warning: L3 (critical) items require second confirmation (AI consequence warning + auto diff; apply only after re-confirming).
@@ -420,7 +424,7 @@ sandbox = {
     cap_add = { "CAP_DAC_OVERRIDE", "CAP_CHOWN", "CAP_SETUID", "CAP_SETGID", "CAP_FOWNER" },
   },
   lsp_overlay = { enabled = true }, -- AI-only sandboxed LSP: servers cloned by the AI lsp_* tools read staged content (on by default, bwrap+overlay only; falls back to editor clients when unavailable)
-  secrets = { enabled = true, min_length = 20, max_length = 200, min_entropy = 3.5, min_distinct = 8, exclude_pure_hex = true, entropy_requires_context = true, entropy_secret_paths_only = true, tokenize_env = true, extra_rules = {}, allowlist = {} }, -- Secret/sensitive guard: entropy + named rules (private-key blocks/AKIA/ghp_/sk-/JWT/Bearer…) + token mapping; env values whose names contain KEY/TOKEN/SECRET/PASSWORD/CREDENTIAL are force-tokenized; bare entropy runs require a -/_ separator and must not be a code identifier (snake_case function/constant names) or a sensitive-name context (narrowed scope to avoid corrupting integrity/build hashes/traceback function names/path components); non-sensitive-named env values containing / are redacted by named rules only (never breaking PATH/LD_LIBRARY_PATH); with entropy_secret_paths_only=true the full-text entropy scan runs only on suspected secret files (~/.ssh, ~/.bashrc, /etc/*, etc. per secret.is_secret_path), other files use named rules only
+  secrets = { enabled = true, min_length = 20, max_length = 200, min_entropy = 3.5, min_distinct = 8, exclude_pure_hex = true, entropy_requires_context = true, entropy_secret_paths_only = true, generated_scan_max_bytes = 2097152, generated_scan_max_files = 200, tokenize_env = true, extra_rules = {}, allowlist = {} }, -- Secret/sensitive guard: entropy + named rules (private-key blocks/AKIA/ghp_/sk-/JWT/Bearer…) + token mapping; env values whose names contain KEY/TOKEN/SECRET/PASSWORD/CREDENTIAL are force-tokenized; bare entropy runs require a -/_ separator and must not be a code identifier (snake_case function/constant names) or a sensitive-name context (narrowed scope to avoid corrupting integrity/build hashes/traceback function names/path components); non-sensitive-named env values containing / are redacted by named rules only (never breaking PATH/LD_LIBRARY_PATH); with entropy_secret_paths_only=true the full-text entropy scan runs only on suspected secret files (~/.ssh, ~/.bashrc, /etc/*, etc. per secret.is_secret_path), other files use named rules only; generated_scan_max_bytes/generated_scan_max_files bound the AI-generated high-entropy detection (detect_generated) scan budget so large candidates do not stall the main thread file-by-file (0 = unlimited)
   retention = { candidate_days = 7, max_pending = 20 },
   policy = {
     version = "1",                 -- policy version (for audit replay; bump when rules change)

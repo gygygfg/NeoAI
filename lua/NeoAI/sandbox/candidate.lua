@@ -408,9 +408,14 @@ local function _match_root(real, specs)
   local best
   for _, spec in ipairs(specs or {}) do
     local root = spec.root
-    if real == root or real:sub(1, #root + 1) == root .. "/" then
-      if not best or #root > #best.root then best = spec end
+    -- 整机根 overlay（root="/"）：所有绝对路径都归它；前缀判定需特判（"/" .. "/" == "//"）。
+    local match
+    if root == "/" then
+      match = real:sub(1, 1) == "/"
+    else
+      match = real == root or real:sub(1, #root + 1) == root .. "/"
     end
+    if match and (not best or #root > #best.root) then best = spec end
   end
   return best
 end
@@ -424,7 +429,8 @@ function M.materialize_overlay(specs)
   for real, entry in pairs(state.workspace) do
     local spec = _match_root(real, specs)
     if spec then
-      local rel = real:sub(#spec.root + 2)
+      -- 整机根（root="/"）时去掉开头的 "/"；其余根去掉 "<root>/" 前缀。
+      local rel = spec.root == "/" and real:sub(2) or real:sub(#spec.root + 2)
       local base = (spec.mode == "bind") and spec.bind or spec.upper
       if base then
         local dest = base .. "/" .. rel
@@ -433,6 +439,10 @@ function M.materialize_overlay(specs)
             pcall(vim.fn.delete, dest, "rf")
             fs.ensure_dir(vim.fn.fnamemodify(dest, ":h"))
             pcall(vim.fn.system, { "mknod", dest, "c", "0", "0" })
+            -- 记录删除态：capture 时工作线程据此判定「whiteout 未被命令重建」= 未改动而跳过。
+            local mat = state.materialized[base]
+            if not mat then mat = {}; state.materialized[base] = mat end
+            mat[real] = { dest = dest, deleted = true }
           end
         elseif entry.staged and vim.fn.isdirectory(entry.staged) == 1 then
           -- 目录暂存（create_directory/ensure_dir）：在 overlay/bind 层建立同名目录，
@@ -449,28 +459,58 @@ function M.materialize_overlay(specs)
                 "[sandbox] 跳过类型冲突物化（目标为目录，拒绝文件覆盖）：%s", tostring(real))
             end)
           else
-            -- 原子替换：同目录临时文件 + rename。原先「先 delete 再 copy」在并行运行的
-            -- 命令读到该路径时会看到缺失/半写内容（暂存文件系统原子性）；rename 原子生效。
-            local content = fs.read_file(entry.staged)
-            if content ~= nil then
-              -- 暂存视图对 AI 遮蔽了密钥（token 化），但命令执行层必须拿到**真实内容**：
-              -- 物化进 overlay 前把 token 还原，否则程序（pip/build/python 等）读到
-              -- NEOKEY_* 会失败（如 import 报错、构建 KeyError）。AI 侧仍读 token 视图。
-              content = (require("NeoAI.sandbox.secret").detokenize(content))
-              fs.ensure_dir(vim.fn.fnamemodify(dest, ":h"))
-              local mode = entry.mode or 420 -- 0644：保留原权限位，新建文件用常规默认（不强制 0600）
-              local ok = fs.write_file_atomic(dest, content, { mode = mode })
-              if not ok and vim.fn.isdirectory(dest) == 0 then
-                -- 兜底（rename 不适用等）：退回直接写 + chmod；目标为目录时不删目录。
-                pcall(vim.fn.delete, dest, "rf")
+            local mat = state.materialized[base]
+            if not mat then mat = {}; state.materialized[base] = mat end
+            -- 跳过未改动的物化：暂存副本与上一次写入的 overlay 目标（mtime/大小）都未变，
+            -- 则无需再次读取+detokenize+写入。暂存堆积到数千时，避免每次 run_command
+            -- 开始都把所有暂存文件重写一遍。未变路径用数值字段直接比较，不做字符串格式化。
+            local sstat = vim.uv.fs_stat(entry.staged)
+            local dstat = vim.uv.fs_stat(dest)
+            local rec = mat[real]
+            local unchanged = rec and rec.hash and sstat and sstat.mtime and dstat and dstat.mtime
+              and rec.s_sec == sstat.mtime.sec and rec.s_nsec == sstat.mtime.nsec
+              and rec.s_size == sstat.size
+              and rec.d_sec == dstat.mtime.sec and rec.d_nsec == dstat.mtime.nsec
+              and rec.d_size == dstat.size
+            if not unchanged then
+              -- 原子替换：同目录临时文件 + rename。原先「先 delete 再 copy」在并行运行的
+              -- 命令读到该路径时会看到缺失/半写内容（暂存文件系统原子性）；rename 原子生效。
+              local content = fs.read_file(entry.staged)
+              if content ~= nil then
+                -- 暂存视图对 AI 遮蔽了密钥（token 化），但命令执行层必须拿到**真实内容**：
+                -- 物化进 overlay 前把 token 还原，否则程序（pip/build/python 等）读到
+                -- NEOKEY_* 会失败（如 import 报错、构建 KeyError）。AI 侧仍读 token 视图。
+                content = (require("NeoAI.sandbox.secret").detokenize(content))
                 fs.ensure_dir(vim.fn.fnamemodify(dest, ":h"))
-                fs.write_file(dest, content)
-                fs.chmod(dest, mode)
+                local mode = entry.mode or 420 -- 0644：保留原权限位，新建文件用常规默认（不强制 0600）
+                -- overlay 私有可写层是会话级临时草稿（agentEnd 轮换即清理），无需 fsync 落盘；
+                -- 逐文件 fsync 在暂存量大时是主要卡顿源。
+                local ok = fs.write_file_atomic(dest, content, { mode = mode, sync = false })
+                if not ok and vim.fn.isdirectory(dest) == 0 then
+                  -- 兜底（rename 不适用等）：退回直接写 + chmod；目标为目录时不删目录。
+                  pcall(vim.fn.delete, dest, "rf")
+                  fs.ensure_dir(vim.fn.fnamemodify(dest, ":h"))
+                  fs.write_file(dest, content)
+                  fs.chmod(dest, mode)
+                end
+                local ndstat = vim.uv.fs_stat(dest)
+                -- 记录写入内容哈希与两侧签名：capture 时工作线程据此判断命令是否改动
+                -- （签名未变即跳过读取/哈希）；下次物化据此跳过未变文件。
+                mat[real] = {
+                  dest = dest,
+                  hash = "sha256:" .. vim.fn.sha256(content),
+                  ssig = (sstat and sstat.mtime) and string.format("%s:%s:%s:%s",
+                    tostring(sstat.mtime.sec), tostring(sstat.mtime.nsec), tostring(sstat.size), tostring(sstat.mode)) or nil,
+                  dsig = (ndstat and ndstat.mtime) and string.format("%s:%s:%s",
+                    tostring(ndstat.mtime.sec), tostring(ndstat.mtime.nsec), tostring(ndstat.size)) or nil,
+                  s_sec = sstat and sstat.mtime and sstat.mtime.sec,
+                  s_nsec = sstat and sstat.mtime and sstat.mtime.nsec,
+                  s_size = sstat and sstat.size,
+                  d_sec = ndstat and ndstat.mtime and ndstat.mtime.sec,
+                  d_nsec = ndstat and ndstat.mtime and ndstat.mtime.nsec,
+                  d_size = ndstat and ndstat.size,
+                }
               end
-              -- 记录本次写入的路径，供 capture 后对账「命令删除了沙箱-only 文件」的情况。
-              local mat = state.materialized[base]
-              if not mat then mat = {}; state.materialized[base] = mat end
-              mat[real] = dest
             end
           end
         end
@@ -686,9 +726,10 @@ local function _reconcile_deleted(attempt, real_root, upper_root)
   local mat = state.materialized[upper_root]
   if not mat then return end
   local superseded = {}
-  for real, dest in pairs(mat) do
+  for real, rec in pairs(mat) do
+    local dest = type(rec) == "table" and rec.dest or rec
     local ws = state.workspace[real]
-    if ws and not ws.deleted then
+    if dest and ws and not ws.deleted then
       if vim.uv.fs_stat(dest) == nil and vim.uv.fs_stat(real) == nil then
         ws.deleted = true
         pcall(vim.fn.delete, ws.staged, "rf")
@@ -749,14 +790,49 @@ end
 
 --- 线程内递归遍历 overlay upper，读取 base 内容并返回编码记录。
 --- 字段：child_rel, staged, kind, base_exists, base_type, base_hash,
----       staged_is_file, staged_size
+---       staged_is_file, staged_size, staged_mode
+--- kind: "file" | "whiteout" | "reconcile"（命令删除了沙箱-only 文件，供删除对账）
+--- 若某文件与 `expected` 中记录的「物化内容哈希」一致，说明命令未改动它，**直接跳过**
+--- （不读 base、不产出记录），避免主线程对每个暂存文件整文件读取。
 --- @param upper_root string
 --- @param real_root string
 --- @param session_basename string 会话挂载点 basename（排除，不算命令改动）
 --- @param sha_src string 纯 Lua sha256 实现源码（线程内 load 得到 hex 函数）
+--- @param expected_encoded string 物化期望表（real -> hash/"D" + dest）
 --- @return string 编码记录
-local function _capture_worker(upper_root, real_root, session_basename, sha_src)
+local function _capture_worker(upper_root, real_root, session_basename, sha_src, expected_encoded)
   local sha = assert(load(sha_src))()
+  -- 解码物化期望表：real -> { hash = 内容哈希 | nil, deleted = bool, dest = 物化目标 }
+  local expected = {}
+  do
+    local nl = type(expected_encoded) == "string" and expected_encoded:find("\n", 1, true)
+    if nl then
+      local n = tonumber(expected_encoded:sub(1, nl - 1)) or 0
+      local pos = nl + 1
+      local function field()
+        local colon = expected_encoded:find(":", pos, true)
+        if not colon then return nil end
+        local len = tonumber(expected_encoded:sub(pos, colon - 1)) or 0
+        local val = expected_encoded:sub(colon + 1, colon + len)
+        pos = colon + len + 1
+        return val
+      end
+      for _ = 1, n do
+        local real = field()
+        local h = field()
+        local dest = field()
+        local dsig = field()
+        if real then
+          expected[real] = {
+            hash = (h ~= "" and h ~= "D") and h or nil,
+            deleted = (h == "D"),
+            dest = dest,
+            dsig = (dsig ~= "" and dsig) or nil,
+          }
+        end
+      end
+    end
+  end
   local out = {}
   local count = 0
   local function enc(s)
@@ -769,6 +845,16 @@ local function _capture_worker(upper_root, real_root, session_basename, sha_src)
     local f = io.open(real, "rb")
     if f then content = f:read("*a") or ""; f:close() end
     return "sha256:" .. sha(content)
+  end
+  --- 目标文件的廉价签名（mtime.sec:mtime.nsec:size）：用于判断物化后是否被命令改动，
+  --- 未变即可跳过内容读取与哈希。
+  --- @param path string
+  --- @return string|nil
+  local function sig_of(path)
+    local st = vim.uv.fs_stat(path)
+    if not (st and st.type == "file" and st.mtime) then return nil end
+    return string.format("%s:%s:%s",
+      tostring(st.mtime.sec), tostring(st.mtime.nsec), tostring(st.size))
   end
   local function walk(dir, rel)
     local handle = vim.uv.fs_scandir(dir)
@@ -784,32 +870,98 @@ local function _capture_worker(upper_root, real_root, session_basename, sha_src)
           whiteout = true
         end
         local child_rel = rel == "" and real_name or (rel .. "/" .. real_name)
+        local real = real_root .. "/" .. child_rel
+        local exp = expected[real]
         if whiteout then
-          local real = real_root .. "/" .. child_rel
-          local stat = vim.uv.fs_stat(real)
-          -- whiteout 删除的是基线文件，base_hash 需与真实内容一致（CAS 冲突检测依赖）。
-          enc(child_rel); enc(dir .. "/" .. name); enc("whiteout")
-          enc(stat and "1" or "0"); enc(stat and stat.type or ""); enc(base_hash_of(real, stat))
-          enc("0"); enc("0"); enc("0")
-          count = count + 1
+          if exp and exp.deleted then
+            -- 期望即删除态且未被命令重建：未改动，跳过（不产生候选）。
+          else
+            local stat = vim.uv.fs_stat(real)
+            -- whiteout 删除的是基线文件，base_hash 需与真实内容一致（CAS 冲突检测依赖）。
+            enc(child_rel); enc(dir .. "/" .. name); enc("whiteout")
+            enc(stat and "1" or "0"); enc(stat and stat.type or ""); enc(base_hash_of(real, stat))
+            enc("0"); enc("0"); enc("0")
+            count = count + 1
+          end
         elseif t == "directory" then
           walk(dir .. "/" .. name, child_rel)
         elseif t == "file" then
-          local real = real_root .. "/" .. child_rel
-          local stat = vim.uv.fs_stat(real)
-          local sstat = vim.uv.fs_stat(dir .. "/" .. name)
-          enc(child_rel); enc(dir .. "/" .. name); enc("file")
-          enc(stat and "1" or "0"); enc(stat and stat.type or ""); enc(base_hash_of(real, stat))
-          enc((sstat and sstat.type == "file") and "1" or "0")
-          enc(tostring(sstat and sstat.size or 0))
-          enc(tostring(sstat and sstat.mode or 0))
-          count = count + 1
+          local dest = dir .. "/" .. name
+          -- 未变快速判定：物化时记录的目标签名（mtime/size）未变即视为命令未改动，
+          -- 直接跳过——不读文件、不做纯 Lua SHA。暂存堆积到数千时，这是避免每条
+          -- run_command 重读重算全部物化文件的关键（曾表现为 libuv-worker 单核打满）。
+          local unchanged = false
+          if exp and exp.hash and exp.dsig then
+            local dsig = sig_of(dest)
+            if dsig and dsig == exp.dsig then unchanged = true end
+          end
+          if not unchanged then
+            local stat = vim.uv.fs_stat(real)
+            local sstat = vim.uv.fs_stat(dest)
+            enc(child_rel); enc(dest); enc("file")
+            enc(stat and "1" or "0"); enc(stat and stat.type or ""); enc(base_hash_of(real, stat))
+            enc((sstat and sstat.type == "file") and "1" or "0")
+            enc(tostring(sstat and sstat.size or 0))
+            enc(tostring(sstat and sstat.mode or 0))
+            count = count + 1
+          end
         end
       end
     end
   end
   walk(upper_root, "")
+  -- 删除对账：期望物化的文件若 dest 与真实文件都不存在，说明命令删除了沙箱-only 文件
+  -- （overlayfs 不会为 lower 不存在的文件生成 whiteout，遍历看不到任何条目）。
+  for real, exp in pairs(expected) do
+    if exp.hash and exp.dest then
+      if not vim.uv.fs_lstat(exp.dest) and not vim.uv.fs_lstat(real) then
+        enc(real); enc(""); enc("reconcile")
+        enc("0"); enc(""); enc(""); enc("0"); enc("0"); enc("0")
+        count = count + 1
+      end
+    end
+  end
   return tostring(count) .. "\n" .. table.concat(out)
+end
+
+--- 编码物化期望表（real -> hash/"D" + dest）供 `_capture_worker` 比对。
+--- @param mat table|nil state.materialized[base]
+--- @return string
+local function _encode_expected(mat)
+  local out = {}
+  local n = 0
+  local function f(s)
+    s = s or ""
+    return tostring(#s) .. ":" .. s
+  end
+  for real, rec in pairs(mat or {}) do
+    if type(rec) == "table" then
+      local h = rec.deleted and "D" or (rec.hash or "")
+      out[#out + 1] = f(real) .. f(h) .. f(rec.dest or "") .. f(rec.dsig or "")
+      n = n + 1
+    end
+  end
+  return tostring(n) .. "\n" .. table.concat(out)
+end
+
+--- 异步捕获的删除对账：materialize 记录过、现 upper 与真实盘都不存在的路径 → 标记工作区删除。
+--- @param reals table real 路径数组
+local function _apply_reconcile(reals)
+  if not reals or #reals == 0 then return end
+  local superseded = {}
+  for _, real in ipairs(reals) do
+    local ws = state.workspace[real]
+    if ws and not ws.deleted then
+      ws.deleted = true
+      pcall(vim.fn.delete, ws.staged, "rf")
+      superseded[#superseded + 1] = real
+    end
+  end
+  if #superseded > 0 then
+    pcall(function()
+      require("NeoAI.sandbox.review").supersede_by_paths(superseded)
+    end)
+  end
 end
 
 --- 解析编码记录为字段数组
@@ -856,10 +1008,14 @@ function M.capture_overlay_async(attempt_id, real_root, upper_root)
   local root = _abs(real_root):gsub("/$", "")
   local session_basename = require("NeoAI.sandbox.conceal").session_basename()
   local sha_src = require("NeoAI.utils.sha256").source
-  return work.run(_capture_worker, upper_root, root, session_basename, sha_src):then_(function(encoded)
+  local expected_encoded = _encode_expected(state.materialized[upper_root])
+  return work.run(_capture_worker, upper_root, root, session_basename, sha_src, expected_encoded):then_(function(encoded)
+    local recons = {}
     for _, rec in ipairs(_decode_records(encoded, 9)) do
       local child_rel, staged, kind = rec[1], rec[2], rec[3]
-      if kind == "whiteout" then
+      if kind == "reconcile" then
+        recons[#recons + 1] = child_rel
+      elseif kind == "whiteout" then
         _capture_entry(attempt, root, staged, child_rel, {
           base_exists = rec[4] == "1",
           base_type = (rec[5] ~= "" and rec[5]) or nil,
@@ -879,7 +1035,7 @@ function M.capture_overlay_async(attempt_id, real_root, upper_root)
         })
       end
     end
-    _reconcile_deleted(attempt, root, upper_root)
+    _apply_reconcile(recons)
   end)
 end
 
@@ -1025,13 +1181,13 @@ local function _finish_worker(input, cap, sha_src)
   return tostring(n) .. "\n" .. table.concat(out)
 end
 
---- 编码 mapping 供工作线程读取（字段：real, staged, base_exists, base_type, base_hash, view_base_hash）
---- @param mapping table
+--- 编码一组 mapping 条目供工作线程读取（字段：real, staged, base_exists, base_type, base_hash, view_base_hash）
+--- @param entries table 条目数组
 --- @return string
-local function _encode_mapping(mapping)
+local function _encode_entries(entries)
   local out = {}
   local n = 0
-  for _, entry in pairs(mapping) do
+  for _, entry in ipairs(entries) do
     local fields = {
       entry.real or "", entry.staged or "",
       entry.base_exists and "1" or "0", entry.base_type or "",
@@ -1048,7 +1204,31 @@ local function _encode_mapping(mapping)
   return tostring(n) .. "\n" .. table.concat(out)
 end
 
+--- 每个工作任务的条目数：把大量文件的读取/哈希切成多批并发投递到线程池（默认 4 线程），
+--- 避免单个大 job 只用单核。可经 tools.sandbox.work_chunk_files 调整。
+--- @return number
+local function _work_chunk_files()
+  local n = tonumber(require("NeoAI.kernel.config_store").get("tools.sandbox.work_chunk_files"))
+  if not n or n <= 0 then return 128 end
+  return n
+end
+
+--- 把数组按 size 切块（保留顺序）
+--- @param list table
+--- @param size number
+--- @return table 块数组
+local function _chunk_list(list, size)
+  local chunks, cur = {}, {}
+  for _, v in ipairs(list) do
+    cur[#cur + 1] = v
+    if #cur >= size then chunks[#chunks + 1] = cur; cur = {} end
+  end
+  if #cur > 0 then chunks[#chunks + 1] = cur end
+  return chunks
+end
+
 --- 异步冻结：暂存文件读取/哈希在 utils.work 线程池执行；主线程据预取结果组装候选。
+--- 按 `work_chunk_files` 分块并发提交，使大量文件时用满线程池（多核）而非单核串行。
 --- @param attempt_id string
 --- @return Deferred resolve(candidate|nil)
 function M.finish_async(attempt_id)
@@ -1056,21 +1236,29 @@ function M.finish_async(attempt_id)
   if not attempt then return async.resolve(M.finish(attempt_id)) end
   local work = require("NeoAI.utils.work")
   if not work.available() then return async.resolve(M.finish(attempt_id)) end
-  local input = _encode_mapping(attempt.mapping)
+  local entries = {}
+  for _, entry in pairs(attempt.mapping) do entries[#entries + 1] = entry end
+  if #entries == 0 then return async.resolve(M.finish(attempt_id, {})) end
   local sha_src = require("NeoAI.utils.sha256").source
-  return work.run(_finish_worker, input, _max_file_bytes(), sha_src):then_(function(encoded)
+  local cap = _max_file_bytes()
+  local jobs = {}
+  for _, chunk in ipairs(_chunk_list(entries, _work_chunk_files())) do
+    jobs[#jobs + 1] = work.run(_finish_worker, _encode_entries(chunk), cap, sha_src)
+  end
+  return async.all(jobs):then_(function(results)
     local prefetch = {}
-    for _, rec in ipairs(_decode_records(encoded, 6)) do
-      prefetch[rec[1]] = {
-        exists = rec[2] == "1",
-        type = (rec[3] ~= "" and rec[3]) or nil,
-        size = tonumber(rec[4]) or 0,
-        content = rec[5],
-        after_hash = (rec[6] ~= "" and rec[6]) or nil,
-      }
+    for _, encoded in ipairs(results) do
+      for _, rec in ipairs(_decode_records(encoded, 6)) do
+        prefetch[rec[1]] = {
+          exists = rec[2] == "1",
+          type = (rec[3] ~= "" and rec[3]) or nil,
+          size = tonumber(rec[4]) or 0,
+          content = rec[5],
+          after_hash = (rec[6] ~= "" and rec[6]) or nil,
+        }
+      end
     end
-    local cand = M.finish(attempt_id, prefetch)
-    return cand
+    return M.finish(attempt_id, prefetch)
   end)
 end
 

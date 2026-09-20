@@ -93,6 +93,33 @@
   直接读内存，不再每次全量扫描 `reviews/` 目录。否则待审堆积到数百/上千时，
   `supersede_by_paths`（每次工具调用）与状态栏徽标刷新会退化为 O(n²) 磁盘扫描并占满主线程。
   状态栏刷新（`services.status`）也按 tick 合并，避免同一 tick 内数百次事件各触发一次重绘。
+  取代/合并导致的候选删除走**批量删除**（`_discard_candidates` 单次统计引用，再逐个删除），
+  不再对每个被取代项做一次全表引用扫描（避免 supersede 大量同路径项时的 O(n²)）。
+- **暂存量大时的捕获/物化不占满主线程**（回归：暂存数十/数百文件后 `run_command` 结束会卡顿）：
+  - **捕获未改动判定在工作线程（按签名，不再重算哈希）**：`materialize_overlay` 记录所写文件的
+    mtime/size 签名（`dsig`）；`capture_overlay` 在线程池里遍历 overlay 时先比对签名，
+    签名未变即**直接跳过**（不读文件、不做纯 Lua SHA），仅签名变化的文件才进入候选。
+    此前每个物化文件在每条命令结束时都要整文件读取 + 纯 Lua SHA-256，暂存数千时表现为
+    `libuv-worker` 单核打满、`run_command` 长时间不返回。删除对账（沙箱-only 文件被命令删除）
+    也在工作线程完成。
+  - **冻结/密钥扫描分块并行**：`finish_async` 按 `tools.sandbox.work_chunk_files`（默认 128）
+    分块并发投递到线程池；批量密钥 token 化同样分块并发（跨块同一密钥合并为规范 token，
+    保证 detokenize 可还原）。使 npm/cargo 等一次产生数万文件时用满多核，而非单核串行。
+  - **物化跳过未改动文件**：暂存副本与上次写入的 overlay 目标（mtime/大小/权限）都未变时，
+    重复物化不再重读+detokenize+写入；仅改动文件被重写。
+  - **overlay 临时层写入不 fsync**：会话级 overlay 私有可写层是临时草稿（agentEnd 轮换即清理），
+    `write_file_atomic(..., { sync = false })` 去掉逐文件 fsync；真实工作区发布仍 fsync 保证持久化。
+  - **证据不嵌入文件内容**：`evidence.add("fs", ...)` 只存影响清单（路径/动作/哈希），
+    并对文件条目数做上限截断，避免大候选在证据里再做一次巨量 JSON 编码。
+  - **生成高熵检测有扫描预算**：`detect_generated` 受 `tools.sandbox.secrets.generated_scan_max_bytes`
+    / `generated_scan_max_files` 约束，避免大候选逐文件全文扫描。
+  - **结算异步化**：候选/待审的**文件写入**走线程池（`store.write_candidate_async` /
+    `write_review_async`，按路径串行、write-behind），密钥分析（NEOKEY 警告 + 生成高熵）也在
+    工作线程执行（`secret.analyze_files_async`），主线程只做 JSON 编码与聚合。写入期间以内存
+    缓存保证「刚写入即可读回」；落盘后丢弃缓存（内存有界）。`sandbox.shutdown` / `store.reset`
+    前会 `store.flush()` 等待落盘，关闭/重置不丢数据、不被迟到写入污染。
+  - **基准复现**：`require("NeoAI.sandbox.diag").bench_capture({ files = N })` 返回
+    物化冷/热与捕获主线程耗时，用于回归对比（会重置沙箱，仅诊断用）。
 - **按 nvim 进程实例隔离**：每个 nvim 进程使用独立实例存储根
   `<workspace_root>/instances/<pid>_<启动时间>`，待审队列/候选/回执/证据互不共享——同时
   打开两个会话时**不会看到对方的审批**；关闭任一实例只清理自己的暂存，不影响其它实例
@@ -125,13 +152,13 @@
        候选（索引、元数据、包文件）在待审队列中只显示一个条目，整包一次审批（`<CR>` 应用全部
        文件），无需逐文件确认；仍可用 `files` 选择性只应用部分文件。识别会跳过
        `sudo`/`doas`/`env`/`bash -c`/`for …; do …` 等包装器，避免漏判包安装而使风险误升到 L3。
-     - **包安装的可写根与能力**：包安装命令（任一段命中包管理器，`req.package`）会自动把
-       包安装可写根（`tools.sandbox.packages.roots`：`/usr`、`/var`、`/etc`、`~/.cache`、`~/.npm`、
-       `~/.nvm`、`~/.cargo`、`~/.rustup`、`~/go`、`~/.local` 等）加入可写根并 overlay 暂存，
-       使 `apt update`/`apt install`/`pip install`/`npm install`/`nvm install` 等能写入索引/
-       缓存/元数据**与安装目标**（`/usr` 覆盖 `/usr/bin`、`/usr/games` 等；`/var` 覆盖 dpkg/apt
-       状态、man 缓存等；`/etc` 覆盖 dpkg postinst 的配置写入，如 libc-bin 刷新
-       `/etc/ld.so.cache`——只读根下会以 `Read-only file system` 失败并让 dpkg 退出码非 0），
+     - **包安装的可写根与能力**：`read_all=true`（默认）下整机根已是可写 overlay，包安装可直接
+       写入任意路径；`read_all=false` 或整机 overlay 不可用时，包安装命令（任一段命中包管理器，
+       `req.package`）会自动把包安装可写根（`tools.sandbox.packages.roots`：`/usr`、`/var`、`/etc`、
+       `~/.cache`、`~/.npm`、`~/.nvm`、`~/.cargo`、`~/.rustup`、`~/go`、`~/.local` 等）加入可写根并
+       overlay 暂存，使 `apt update`/`apt install`/`pip install`/`npm install`/`nvm install` 等能写入
+       索引/缓存/元数据**与安装目标**（`/usr` 覆盖 `/usr/bin`、`/usr/games` 等；`/var` 覆盖 dpkg/apt
+       状态、man 缓存等；`/etc` 覆盖 dpkg postinst 的配置写入，如 libc-bin 刷新 `/etc/ld.so.cache`），
        且写入同样冻结为候选，真实盘不变；`/etc` 内的敏感条目（shadow/sudoers/ssh/cron 等）
        仍由 `mask_paths` 遮蔽，不受影响。当 `cap_add` 收窄（如 `{}`）时，
        capability 的按需加回（`req.package`：命令**任一段**命中包管理器即授予）按
@@ -142,10 +169,12 @@
        故按 `tools.sandbox.packages.cap_add` 加回 `CAP_DAC_OVERRIDE`/`CAP_CHOWN`/`CAP_SETUID`
        等窄能力（**不含 `CAP_MKNOD`**：设备节点由 seccomp 基线硬拦，见 §6）；若载荷降权为
        专用非 root uid，这些窄能力以 **ambient** 形式保留，否则改 uid 会清空能力、包安装锁失败。
-       进程始终在 mount/pid 命名空间 + seccomp + 只读根 + 遮蔽 + overlay 暂存约束内。
+       进程始终在 mount/pid 命名空间 + seccomp + 整机根 overlay + 遮蔽 + 暂存约束内。
      - **超大文件不纳入候选**（`tools.sandbox.max_file_bytes`，默认 8 MiB）：超过上限的文件
        仍写入 overlay 私有层（不落真实盘），但不进入候选/待审/发布，避免 `apt` 的
        `pkgcache.bin`、缓存归档、镜像层等被嵌入候选 JSON 而阻塞主线程 / 撑爆磁盘。
+     - **冻结分块并行**（`tools.sandbox.work_chunk_files`，默认 128）：`finish_async` 与批量密钥
+       token 化按此文件数分块并发投递到线程池，使大量文件时用满多核而非单核串行。
      - **暂存内容持久**：`PENDING` 与 `APPROVED`（尚未应用）的候选在重载/重开后由
        `_rehydrate_pending` 从落盘候选重新物化进暂存层，包安装等大批量暂存内容在应用或
        拒绝前一直保留可读，不随会话轮转/退出销毁。
@@ -208,7 +237,7 @@
 `sudo modprobe`、`mkfs.ext4 /dev/sdb1` 不再漏判：
 
 - 脚本内**设备级/内核命令硬拒绝**（与直接命令同规则）；`rm`/`rm -rf` 等纯文件修改不硬拒绝
-  （由只读根 + overlay 修改暂存保护宿主机），其效果冻结为候选待审；
+  （由整机根 overlay 修改暂存保护宿主机），其效果冻结为候选待审；
 - 其余命中（包安装、`systemctl`、`chmod -R 777` 等）提升级别并**强制复核**——不随
   `mode=commit`、任务授权或会话自动审批放行；
 - 无法静态解析的间接执行（`eval`、`base64 -d | sh`、`curl … | sh`、`python -m`、
@@ -406,7 +435,8 @@ dpkg/pip 等任意开发与包管理操作在沙箱内可用；同时按 `tools.
 宿主全局状态」的能力**（网络栈/时钟/内核模块/裸 I/O/重启/MAC/审计）——即便授予 ALL 也逐项
 丢弃，netlink 改宿主路由/防火墙、改宿主时钟等被 `EPERM` 拦截，而这些能力与开发/包管理
 工作流无关。**宿主不可修改**由以下共同保证：**命名空间（mount/pid/uts/ipc/cgroup）+
-只读根（`--ro-bind / /`）+ overlay 暂存 + 宿主敏感路径遮蔽 + `/proc/sys` 只读绑定 +
+整机根 overlay（`read_all` 默认：以 `/` 为只读 lower、会话私有 upper/work 为可写层，根内
+任意路径原样可写、写入全部进 upper 暂存）+ 宿主敏感路径遮蔽 + `/proc/sys` 只读绑定 +
 seccomp（含设备节点屏障）**——沙箱内进程看到的是一份「暂存文件系统」（overlay 私有可写层），
 所有写入冻结为候选、真实系统不受影响，AI 以为修改已成功。需要最小权限时可设
 `cap_add = {}`（`--cap-drop ALL`，包安装按 `packages.cap_add` 按需加回窄能力）。`runtime`
@@ -425,8 +455,8 @@ seccomp（含设备节点屏障）**——沙箱内进程看到的是一份「�
   `CAP_SYS_BOOT`/`CAP_MAC_ADMIN`/`CAP_MAC_OVERRIDE`/`CAP_AUDIT_CONTROL`）逐项 `--cap-drop`，
   封住「capability 层面的宿主全局修改」（netlink 改路由/防火墙、改时钟、加载模块、裸端口
   I/O、重启、改 MAC/审计）——这些能力开发/包管理工作流不需要；显式在 `cap_add` 列出的能力
-  不会被丢弃。宿主**文件系统**的不可修改不依赖 capability，而依赖命名空间 + 只读根 +
-  overlay 暂存（写入冻结为候选）。需要最小权限时设 `cap_add = {}`（`--cap-drop ALL`，
+  不会被丢弃。宿主**文件系统**的不可修改不依赖 capability，而依赖命名空间 + 整机根 overlay
+  暂存（写入冻结为候选）。需要最小权限时设 `cap_add = {}`（`--cap-drop ALL`，
   纯包安装命令按 `packages.cap_add` 加回 `CAP_DAC_OVERRIDE`/`CAP_CHOWN`/`CAP_SETUID` 等窄
   能力；混合命令如 `apt update && cat /x` 不加回）。
   沙箱内已是 root，命令前导的 `sudo`/`doas`（及其常见布尔 flag）会被**自动剥离**（`sudo apt
@@ -478,10 +508,12 @@ seccomp（含设备节点屏障）**——沙箱内进程看到的是一份「�
   进程内 `read`/`fs_write` 工具不经 namespace，mount 遮蔽对其无效；执行器对路径参数额外
   查询 `runtime.is_masked_path`，命中即**硬拒绝**（`路径位于宿主敏感遮蔽路径`，不可审批放行），
   覆盖 `read_file`/`search_files`/`edit_file` 等直接读宿主的路径。
-- **读取面：整机只读（`read_all`，默认开启）**：默认以 `--ro-bind / /` 把宿主根整体**只读**
-  暴露，仅遮蔽 `mask_paths` 中的重要配置文件/凭据（见上）与沙箱自身存储——即「除重要配置
-  文件外均可读」，`/opt`、`/srv`、其他项目目录等都可读。`mask_dirs`（`/home`、`/root`
-  兄弟目录）不再挂载遮蔽。
+- **读取面：整机可写 overlay（`read_all`，默认开启）**：默认以 `/` 为只读 lower、会话私有
+  upper/work 为可写层挂载整机根 overlay——沙箱内根文件系统**原样可写**（任意路径可写，不再有
+  `Read-only file system`），所有写入进 upper 暂存并在命令结束后冻结为候选，宿主盘不受影响。
+  仅遮蔽 `mask_paths` 中的重要配置文件/凭据（见上）与沙箱自身存储——即「除重要配置文件外均可
+  读写」，`/opt`、`/srv`、其他项目目录等都可写。`mask_dirs`（`/home`、`/root` 兄弟目录）
+  不再挂载遮蔽。overlay 不可用时退回只读根（`overlay_fail_closed` 决定是否降级）。
   - **越界访问留痕（非阻塞）**：访问 `cwd` 之外的用户工作目录（home/root 之下）时记录
     证据（`evidence` kind=observation）并发出 `sandbox:outside_access` 事件，同时在审批悬浮窗
     `:NeoAISandboxReview` 的「越界访问留痕」区展示；仍直接放行读取，不阻断。展示时**按文件
@@ -560,7 +592,7 @@ seccomp（含设备节点屏障）**——沙箱内进程看到的是一份「�
 > **残余风险（user namespace）**：NeoAI 以 root 运行时，`bwrap` 只能把调用者 uid 1:1
 > 映射（`uid_map 0 0`），无法在插件内做真正的 uid 重映射；而 `conceal` 为去指纹刻意
 > 不在 root 下新建 userns。默认完整能力下，载荷在命名空间内即宿主 root：**文件系统修改**
-> 由「命名空间 + 只读根 + overlay 暂存 + 遮蔽 + 审批」封死，**宿主全局状态修改**由
+> 由「命名空间 + 整机根 overlay 暂存 + 遮蔽 + 审批」封死，**宿主全局状态修改**由
 > `cap_drop`（网络/时钟/模块/裸 I/O/重启/MAC/审计）+ seccomp（设备节点、时钟、端口 I/O、
 > mount/unshare/bpf/… 屏障）封死；`CAP_DAC_OVERRIDE` 仍可**读取**遮蔽名单之外 DAC 保护的
 > 0600 文件（信息泄露，非修改）。设 `cap_add = {}` 可进一步收敛为最小权限（包安装按
@@ -955,8 +987,14 @@ wire 消息）中时，才硬拦截并立即终止整个 Agent——后者说明
 > `*.pem`/`*.key`/`/etc/shadow`/`/etc/ssh`/`trusted.gpg`/keyring…）计入；普通命令频繁打开的
 > 非密钥文件（`/etc/ld.so.cache`、`/etc/nsswitch.conf`、`/etc/passwd`、`/etc/group`、
 > `/etc/os-release`、`/etc/localtime`、`*.env` 如 `go.env`、`.npmrc`、`.bash_history`/
-> `.python_history` 等）一律忽略，避免把 `uname`/`cat /etc/os-release` 等误报为「获取密钥」。
+> `.python_history`、**公开 CA 证书包/信任库**（`cacert.pem`/`ca-bundle.pem`/`chain.pem`/
+> `fullchain.pem`/`roots.pem` 等，以及 `/certifi/`、`/ca-certificates/`、`/ssl/certs/` 下的
+> 证书——如 pip 随包 vendored 的 `.../pip/_vendor/certifi/cacert.pem`）等）一律忽略，
+> 避免把 `uname`/`cat /etc/os-release`/`python -m venv && pip install` 等误报为「获取密钥」。
 > 明细回退顺序：观测到的密钥文件 → 参数中的密钥文件 → 密钥类型（具名规则）→ 敏感环境变量名 → 通用提示。
+> **失败结果**（如密钥硬拦截返回的 `SANDBOX_SECRET_BLOCKED` 错误对象）不作为「读取到的内容」参与
+> 判定，`scan_names` 也排除 `SANDBOX_SECRET_*` 内部事件标识，避免把内部标识误当作敏感环境变量名，
+> 渲染出「密钥环境变量：SANDBOX_SECRET_BLOCKED」这类无意义告警。
 > 折叠标题保持干净（不再追加 `⚠ 密钥`），收起状态也能看到独立的高亮警告行。含密钥时工具调用的
 > **参数与结果完整展示（不截断）**，行内命中的密钥值（`NEOKEY_*` token / 具名规则原始密钥）以同组
 > 高亮；轨迹显示模式在工具行追加同款文本标记并同样行内高亮。见
@@ -1018,10 +1056,14 @@ wire 消息）中时，才硬拦截并立即终止整个 Agent——后者说明
   PYTHONPATH/SSL_CERT_FILE 等路径或 URL），**只应用具名规则、不做通用熵 token 化**，
   避免把路径段误 token 化导致 pip/ssl 等找不到库或模块。
 - **文本层按名强制 token 化**：`tokenize()`（工具结果/暂存内容）对文本中的赋值
-  `NAME=value`、`NAME="value"`、`"NAME": "value"`，当 `NAME` 命中同一敏感名规则时，
-  无视熵阈值替换 `value`。这补上熵检测的两个盲区：纯小写 hex 段（被 `exclude_pure_hex`
-  排除）与含 `.` 等多段密钥（被 `RUN_PAT` 拆成不满足候选条件的片段），例如
+  `NAME=value`、`NAME="value"`、`"NAME": "value"`，当 `NAME` 命中同一敏感名规则**且 `value`
+  呈凭据形态**时，无视熵阈值替换 `value`。这补上熵检测的两个盲区：纯小写 hex 段（被
+  `exclude_pure_hex` 排除）与含 `.` 等多段密钥（被 `RUN_PAT` 拆成不满足候选条件的片段），例如
   `/proc/self/environ` 中的 `GLM_API_KEY=dfe946….rwbWDAf…`。值字符集刻意收窄，避免跨条目吞并。
+  **值形态校验**：`value` 长度 < 4、普通单词（`bar`）、单字符（`.`）、普通文件名
+  （`pyproject.toml`）、路径/URL（`/root/...`）不作为凭据登记——否则源码里的
+  `'password': 'bar'`、`key_separator = "."`、`CONFIGFILE_KEY = 'pyproject.toml'` 会被误登记为
+  「原始密钥」，污染映射表并让后续含该片段的命令/上下文被 `find_real_secret` 子串匹配误拦截。
 - `allowlist` 可再加 Lua pattern 排除。参数见
   [configuration.md](configuration.md) 的 `tools.sandbox.secrets`。
 
@@ -1137,7 +1179,7 @@ Agent**；发出 `SANDBOX_SECRET_BLOCKED` 事件并 `vim.notify` 明确通知用
   （`PRIVILEGE_TIER_EXCEEDS_MAX`）。
 - **载荷运行身份（默认 root）**：默认 `run_as.uid=0`——沙箱载荷以 root 运行，使 AI 可在沙箱内使用
   `/root` 下的工具链（nvm/cargo/go 等 0700 目录非 root 不可遍历）与包管理（dpkg 硬检查 euid==0）。
-  **所有写入仍全部进入 overlay 暂存并冻结为候选，真实磁盘只读**。设为专用非 root uid（如
+  **所有写入仍全部进入 overlay 暂存并冻结为候选，真实磁盘不受影响**。设为专用非 root uid（如
   `nobody` 65534）可加固：非 userns 档位由 `setpriv` 把载荷降为该 uid，配置的窄能力以 ambient
   形式保留；T2（嵌套 userns）下该 uid 在新建 userns 内未映射，`setpriv` 会
   `setresuid: Invalid argument`，故 **T2 不追加 `setpriv`**，载荷以 userns root 运行（能力受
@@ -1196,8 +1238,8 @@ T2 命令在嵌套 userns 内执行（`--unshare-all` + 可选 `--cap-add`，cap
 
 **默认 root**（`tools.sandbox.run_as.uid=0`）：沙箱载荷以 root 运行，使 AI 可在沙箱内使用 `/root`
 下的工具链（nvm/cargo/go 等 0700 目录非 root 不可遍历）与包管理（`dpkg` 硬检查 `euid==0`，仅
-capability 不够）。**写入仍全部进入 overlay 暂存并冻结为候选，真实磁盘只读**；宿主不可修改由
-命名空间 + 只读根 + overlay + 遮蔽 + `/proc/sys` 只读绑定 + seccomp 保证，不依赖非 root。
+capability 不够）。**写入仍全部进入 overlay 暂存并冻结为候选，真实磁盘不受影响**；宿主不可修改由
+命名空间 + 整机根 overlay + 遮蔽 + `/proc/sys` 只读绑定 + seccomp 保证，不依赖非 root。
 
 **非 root 启动 = 沙箱内 guest root**：NeoAI 以非 root 用户启动时，用 **user namespace** 把当前
 用户映射为沙箱内 root（`--unshare-user --uid 0 --gid 0`）——沙箱内 `euid=0`，工具链与包管理可用，

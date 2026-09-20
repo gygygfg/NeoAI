@@ -171,6 +171,35 @@ tests.suite("observer", function(_, it)
     t.eq(false, wrapper.prewarm_info().active, "清理后应无预热")
   end)
 
+  it("预热 TTL 定时器用 uv 句柄停止（不把 userdata 传给 timer_stop，避免 E5101）", function(t)
+    local wrapper = require("NeoAI.sandbox.wrapper")
+    local cgroup = require("NeoAI.sandbox.cgroup")
+    if not cgroup.probe().available then return end
+    wrapper.clear_prewarm()
+    local observer = require("NeoAI.sandbox.observer")
+    local orig_backend, orig_available, orig_start = observer.backend, observer.available, observer.start
+    observer.backend = function() return "ebpf" end
+    observer.available = function() return true, "ebpf" end
+    observer.start = function() return { backend = "ebpf", ready = false, stop = function() end } end
+    local stop_args = {}
+    local orig_stop = vim.fn.timer_stop
+    vim.fn.timer_stop = function(id)
+      stop_args[#stop_args + 1] = id
+      return orig_stop(id)
+    end
+    with_config({ tools = { sandbox = { observe = { enabled = true, prewarm = true, prewarm_ttl_ms = 60000 } } } }, function()
+      wrapper._prewarm_observer()
+      t.eq(true, wrapper.prewarm_info().has_handle, "应已启动预热探针")
+      wrapper.clear_prewarm()
+    end)
+    vim.fn.timer_stop = orig_stop
+    observer.backend, observer.available, observer.start = orig_backend, orig_available, orig_start
+    for _, id in ipairs(stop_args) do
+      t.ne("userdata", type(id), "不得把 uv 定时器句柄传给 vim.fn.timer_stop（会抛 E5101）")
+    end
+    t.eq(false, wrapper.prewarm_info().active, "清理后应无预热")
+  end)
+
   it("cgroup：预热句柄可认领到 attempt（release 生效）", function(t)
     local cgroup = require("NeoAI.sandbox.cgroup")
     if not cgroup.probe().available then return end

@@ -105,4 +105,25 @@ tests.suite("review_cache", function(_, it)
     store.reset()
     review.reset()
   end)
+
+  it("supersede 大量待审项：批量删除不逐项全表扫描（避免 O(n²)）", function(t)
+    local store, review = setup()
+    local paths = {}
+    for i = 1, 200 do
+      paths[i] = "/tmp/f" .. i
+      review.enqueue({
+        candidate_digest = "sha256:d" .. i,
+        files = { { path = "/tmp/f" .. i } },
+        created_at = i,
+      }, { tool = "edit_file" })
+    end
+    review.pending_summary()
+    local before = review._ref_scans()
+    local n = review.supersede_by_paths(paths, nil)
+    t.eq(200, n, "应取代全部待审项")
+    t.eq(0, review.pending_count(), "取代后待审应清空")
+    t.eq(before, review._ref_scans(), "批量取代不应触发逐项全表扫描")
+    store.reset()
+    review.reset()
+  end)
 end)

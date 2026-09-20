@@ -235,4 +235,29 @@ tests.suite("secret_highlight", function(_, it)
     t.matches("⚠ 密钥：read_file", buffer_text(buf), "更新后应有警告行并指明工具")
     t.eq(2, #secret_extmarks(buf), "更新后警告行 + 结果行内 token 各一处高亮")
   end)
+
+  it("被密钥硬拦截的错误结果：不渲染内部标识告警行", function(t)
+    local buf = render({
+      {
+        role = "assistant", content = "",
+        tool_calls = {
+          {
+            id = "t1",
+            ["function"] = {
+              name = "run_command",
+              arguments = '{"command":"env | grep -i proxy; ls -la /root/test/apps/python/.venv/bin/python*","description":"检查代理环境变量与 venv 可执行文件"}',
+            },
+          },
+        },
+      },
+      {
+        role = "tool", tool_call_id = "t1", tool_name = "run_command", duration_ms = 0,
+        content = '{"error":"SANDBOX_SECRET_BLOCKED: 工具参数包含原始密钥，已终止 Agent","tool":"run_command"}',
+      },
+    })
+    local text = buffer_text(buf)
+    t.false_(text:find("⚠ 密钥", 1, true) ~= nil, "被拦截的错误结果不应再触发密钥告警")
+    t.false_(text:find("密钥环境变量", 1, true) ~= nil, "不应把内部标识当作密钥环境变量名")
+    t.eq(0, #secret_extmarks(buf), "不应有密钥高亮")
+  end)
 end)

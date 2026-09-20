@@ -24,7 +24,28 @@ local SECRET_KEYS = {
 -- 单条证据最大字节（超出截断）
 local MAX_BYTES = 64 * 1024
 
+-- 单条证据最多保留的文件条目数（超出仅保留前 N 条并标注总数）。
+-- 避免大候选（包安装/构建产物上千文件）在证据里做无意义的巨量 JSON 编码。
+local MAX_FILES = 500
+
 -- ========== 私有函数 ==========
+
+--- 浅拷贝并截断 payload.files，避免对超大数组做深拷贝（内容本就不应进入证据）。
+--- @param payload any
+--- @return any
+local function _cap_payload(payload)
+  if type(payload) ~= "table" then return payload end
+  local files = payload.files
+  if type(files) ~= "table" or #files <= MAX_FILES then return payload end
+  local out = {}
+  for k, v in pairs(payload) do out[k] = v end
+  local kept = {}
+  for i = 1, MAX_FILES do kept[i] = files[i] end
+  out.files = kept
+  out.files_total = #files
+  out.files_truncated = true
+  return out
+end
 
 --- 递归脱敏
 --- @param value any
@@ -75,7 +96,7 @@ function M.add(kind, payload, meta)
     change_set_id = meta.change_set_id,
     tool = meta.tool,
     created_at = os.time(),
-    payload = _redact(payload),
+    payload = _redact(_cap_payload(payload)),
   }
   local encoded = json.encode(record)
   if #encoded > MAX_BYTES then

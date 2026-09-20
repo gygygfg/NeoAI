@@ -48,9 +48,9 @@ end, function(err) ... end)
 | `tools/builtin/file_ops.lua` | `read_file` / `edit_file` / `list_files` / `search_files` / `delete_file`（异步变体）。 |
 | `tools/builtin/read_image.lua` | 读二进制文件（`work.run(_read_binary, abs_path)`）。 |
 | `tools/builtin/edit_file.lua`（edit 模式） | 读文件 + 结构化替换 + 写盘（在线程池内完成）。 |
-| `sandbox/candidate.lua` | `capture_overlay_async` / `finish_async`：overlay 递归遍历、文件读取、SHA-256 哈希在线程池内完成，主线程只做状态登记/组装。 |
+| `sandbox/candidate.lua` | `capture_overlay_async` / `finish_async`：overlay 递归遍历、文件读取、SHA-256 哈希在线程池内完成，主线程只做状态登记/组装。**未改动的物化文件按 mtime/size 签名（`dsig`）跳过读取与哈希**；`finish_async` 按 `tools.sandbox.work_chunk_files`（默认 128）分块并发投递，使 npm/cargo 等大量文件场景用满多核。 |
 | `sandbox/conceal.lua` | `redact_async`：命令输出的指纹脱敏（十余次 gsub，可能达 MB 级）在线程池内完成。 |
-| `sandbox/secret.lua` | `tokenize_many_async` / `tokenize_async`：密钥全文扫描（具名规则 + 变量名 + 熵检测）在线程池执行，token 生成/映射/事件仍在主线程。 |
+| `sandbox/secret.lua` | `tokenize_many_async` / `tokenize_async`：密钥全文扫描（具名规则 + 变量名 + 熵检测）在线程池执行，token 生成/映射/事件仍在主线程；文本数超过分块大小时按块并发，合并时把跨块同一密钥的等价 token 统一为规范 token（保证 detokenize 可还原）。 |
 | `utils/sha256.lua` | 纯 Lua SHA-256；`source` 源码字符串传入线程内 `load`，供候选哈希与线程内 token 派生在独立核心计算。 |
 | `utils/textmetrics.lua` | 纯 Lua 文本度量（显示宽度/码点切片/折行）；`source` 源码字符串传入线程内 `load`。 |
 | `core/session/tool_result_pruner.lua` | `prune_agent_async`：MB 级工具结果的码点统计/切片经线程池计算（实测 12×3.7MB 从主线程阻塞 330ms → 0ms，4 线程并行约 140ms），仅把裁剪结果传回主线程应用；线程池不可用或 `ui.render.threaded=false` 时回退同步。 |

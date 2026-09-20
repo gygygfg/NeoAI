@@ -134,6 +134,8 @@ function M.shutdown()
   M.unwatch_sessions()
   pcall(function() require("NeoAI.sandbox.net_gateway").teardown() end)
   pcall(function() require("NeoAI.sandbox.host_proxy").stop() end)
+  -- 先等异步写入（候选/待审）落盘，避免关闭时丢失最后一笔。
+  pcall(function() require("NeoAI.sandbox.store").flush(5000) end)
   candidate.reset()
   state.active = nil
   state.initialized = false

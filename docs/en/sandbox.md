@@ -93,7 +93,46 @@ is only kept for other `approval.mode` values (`prompt`/`strict`).
   hundreds/thousands, `supersede_by_paths` (every tool call) and statusline badge refreshes degrade
   into O(n²) disk scans that saturate the main thread. Statusline refreshes
   (`services.status`) are also coalesced per tick so hundreds of events in one tick cause a single
-  redraw rather than hundreds.
+  redraw rather than hundreds. Candidate deletion during supersede/merge uses a **batch delete**
+  (`_discard_candidates` counts references once, then deletes each), instead of one full-table
+  reference scan per superseded item (avoiding O(n²) when superseding many same-path items).
+- **Capture/materialize with many staged files does not saturate the main thread** (regression:
+  after staging tens/hundreds of files, `run_command` completion stalls):
+  - **Unchanged detection runs on the worker (by signature, no re-hashing)**: `materialize_overlay`
+    records the mtime/size signature (`dsig`) of the bytes it wrote; `capture_overlay` walks the
+    overlay in the thread pool and compares the signature first, **skipping unchanged materialized
+    files outright** (no file read, no pure-Lua SHA); only files whose signature changed become
+    candidates. Previously every materialized file was read whole and pure-Lua SHA-256 hashed at the
+    end of every command, which pinned a single `libuv-worker` core and stalled `run_command` once
+    thousands of files were staged. Deletion reconciliation (a sandbox-only file removed by the
+    command) is also done on the worker.
+  - **Chunked parallel freeze/secret scan**: `finish_async` dispatches in chunks of
+    `tools.sandbox.work_chunk_files` (default 128) to the thread pool; batch secret tokenization is
+    chunked the same way (equivalent tokens for the same secret across chunks are unified to a
+    canonical token so `detokenize` round-trips). This uses multiple cores on workloads such as
+    npm/cargo that produce tens of thousands of files, instead of single-core serialization.
+  - **Materialize skips unchanged files**: when the staged copy and the previously written overlay
+    target (mtime/size/mode) are both unchanged, repeated materialization does not re-read +
+    detokenize + write; only changed files are rewritten.
+  - **No fsync for overlay scratch**: the per-session overlay upper is ephemeral scratch (rotated on
+    agentEnd), so `write_file_atomic(..., { sync = false })` drops the per-file fsync; real workspace
+    publishing still fsyncs for durability.
+  - **Evidence carries no file content**: `evidence.add("fs", ...)` stores only the impact manifest
+    (path/action/hash) and caps the file-entry count, avoiding another huge JSON encode for large
+    candidates.
+  - **Generated high-entropy detection is budgeted**: `detect_generated` is bounded by
+    `tools.sandbox.secrets.generated_scan_max_bytes` / `generated_scan_max_files` so a large
+    candidate is not scanned file-by-file full-text.
+  - **Settle is asynchronous**: candidate/review **file writes** run on the thread pool
+    (`store.write_candidate_async` / `write_review_async`, per-path serialized write-behind), and
+    secret analysis (NEOKEY warnings + generated high-entropy) also runs on the worker
+    (`secret.analyze_files_async`); the main thread only does JSON encoding and aggregation. An
+    in-memory cache makes a just-written item immediately readable; it is dropped once flushed
+    (bounded memory). `sandbox.shutdown` / `store.reset` call `store.flush()` first, so shutdown
+    and reset lose no data and are not polluted by late writes.
+  - **Benchmark**: `require("NeoAI.sandbox.diag").bench_capture({ files = N })` returns
+    materialize cold/warm and capture main-thread timings for regression comparison (resets the
+    sandbox; diagnostic only).
 - **Model visibility**: the tool result is returned to the model **unchanged**, with no
   "staged/awaiting review" note, so the AI believes the change completed. Pending state is
   surfaced to the user only via a **prominent statusline badge** (the `sandbox` part shows a
@@ -150,11 +189,14 @@ is only kept for other `approval.mode` values (`prompt`/`strict`).
       hard-blocked by the seccomp baseline, see §6); if the payload is dropped to a dedicated
       non-root uid these narrow caps are preserved as **ambient**, otherwise changing the uid
       clears them and package-install locks fail. The process still runs under the
-      mount/pid namespace + seccomp + read-only root + masking + overlay staging.
+      mount/pid namespace + seccomp + whole-root overlay + masking + staging.
     - **Oversized files are not captured** (`tools.sandbox.max_file_bytes`, default 8 MiB): files
       above the cap are still written to the overlay private layer (never the real disk) but are
       excluded from candidates/review/publish, so apt's `pkgcache.bin`, cache archives and image
       layers cannot be embedded into candidate JSON and block the main thread / fill the disk.
+    - **Chunked parallel freeze** (`tools.sandbox.work_chunk_files`, default 128): `finish_async` and
+      batch secret tokenization dispatch in chunks of this many files concurrently to the thread
+      pool, using multiple cores instead of single-core serialization on many-file workloads.
     - **Staged content is persistent**: `PENDING` and `APPROVED` (not yet applied) candidates are
       **re-materialized** from disk by `_rehydrate_pending` after a reload/restart, so large
       staged content such as package installs stays readable until applied or rejected and is not
@@ -512,7 +554,7 @@ host-global capabilities are narrowed via `cap_drop`):
   clock changes, module loading, raw port I/O, reboot and MAC/audit changes are denied with
   `EPERM`; none of them are needed by dev/package workflows. Capabilities explicitly listed in
   `cap_add` are not dropped. Host **filesystem** immutability does not rely on capabilities but
-  on namespaces + read-only root + overlay staging (writes are frozen as candidates). For minimal
+  on namespaces + whole-root overlay staging (writes are frozen as candidates). For minimal
   privileges set `cap_add = {}` (`--cap-drop ALL`); pure package-install commands then add back
   `CAP_DAC_OVERRIDE`/`CAP_CHOWN`/`CAP_SETUID`, … per `packages.cap_add`, while mixed commands
   (`apt update && cat /x`) get nothing. The sandbox already
@@ -566,11 +608,15 @@ host-global capabilities are narrowed via `cap_drop`):
   the executor additionally queries `runtime.is_masked_path` for path arguments and **hard-rejects**
   hits (`路径位于宿主敏感遮蔽路径`, no approval), covering `read_file`/`search_files`/`edit_file`
   and other tools that read the host directly.
-- **Read surface: whole host read-only (`read_all`, on by default)**: by default the host root is
-  exposed **read-only** as a whole (`--ro-bind / /`), masking only the important config
-  files/credentials in `mask_paths` (see above) plus the sandbox's own storage — i.e. "everything is
-  readable except important config files", so `/opt`, `/srv`, other project dirs, … are readable.
-  `mask_dirs` (`/home`, `/root` sibling dirs) are no longer mount-masked.
+- **Read surface: whole-root writable overlay (`read_all`, on by default)**: by default the host root
+  is mounted as an overlay with `/` as the read-only lower and a session-private upper/work as the
+  writable layer — the sandbox root filesystem is **writable as-is** (any path, no more
+  `Read-only file system`). All writes go to the upper staging layer and are frozen as candidates
+  after the command, leaving the host disk untouched. Only the important config files/credentials in
+  `mask_paths` (see above) plus the sandbox's own storage are masked — i.e. "everything is
+  readable/writable except important config files", so `/opt`, `/srv`, other project dirs, … are
+  writable. `mask_dirs` (`/home`, `/root` sibling dirs) are no longer mount-masked. When the overlay
+  is unavailable it falls back to a read-only root (`overlay_fail_closed` decides whether to degrade).
   - **Outside-workspace tracing (non-blocking)**: accessing user working dirs outside `cwd` (under
     home/root) records evidence (kind=observation), emits a `sandbox:outside_access` event, and is
     shown in the `:NeoAISandboxReview` window under "越界访问留痕"; the read is still allowed, not
@@ -664,7 +710,7 @@ host-global capabilities are narrowed via `cap_drop`):
 > caller's uid 1:1 (`uid_map 0 0`); it cannot truly remap uids from inside the plugin, and
 > `conceal` deliberately avoids creating a userns under root to hide fingerprints. With full
 > capabilities by default, the payload is host root inside the namespace: **filesystem
-> modification** is closed by namespaces + read-only root + overlay staging + masking +
+> modification** is closed by namespaces + whole-root overlay staging + masking +
 > approval, and **host-global state modification** is closed by `cap_drop` (network/clock/
 > modules/raw I/O/boot/MAC/audit) plus seccomp (device nodes, clock, port I/O,
 > mount/unshare/bpf/… barriers); `CAP_DAC_OVERRIDE` can still **read** 0600 files outside the
@@ -1113,9 +1159,16 @@ expressions like `api_key = os.getenv("..._API_KEY")` are not treated as raw sec
 > files (`~/.ssh`/`~/.aws`/`~/.kube`/`.env`/`id_rsa`/`*.pem`/`*.key`/`/etc/shadow`/`/etc/ssh`/
 > `trusted.gpg`/keyring…) count; non-secret files opened by ordinary commands (`/etc/ld.so.cache`,
 > `/etc/nsswitch.conf`, `/etc/passwd`, `/etc/group`, `/etc/os-release`, `/etc/localtime`, `*.env` such
-> as `go.env`, `.npmrc`, `.bash_history`/`.python_history`, …) are ignored, so `uname` /
-> `cat /etc/os-release` are not misreported as "obtained a secret". Detail fallback order: observed
+> as `go.env`, `.npmrc`, `.bash_history`/`.python_history`, **public CA bundles/trust stores**
+> (`cacert.pem`/`ca-bundle.pem`/`chain.pem`/`fullchain.pem`/`roots.pem` etc., and certificates under
+> `/certifi/`, `/ca-certificates/`, `/ssl/certs/` — e.g. pip's vendored
+> `.../pip/_vendor/certifi/cacert.pem`) are ignored, so `uname` / `cat /etc/os-release` /
+> `python -m venv && pip install` are not misreported as "obtained a secret". Detail fallback order: observed
 > secret file → secret file in arguments → secret type (named rule) → sensitive env name → generic hint.
+> **Failed results** (such as the `SANDBOX_SECRET_BLOCKED` error object returned by the hard secret
+> block) are not treated as "content that was read" for this decision, and `scan_names` excludes
+> `SANDBOX_SECRET_*` internal event identifiers, so the internal identifier is not misread as a
+> sensitive env name and rendered as a meaningless `key env var: SANDBOX_SECRET_BLOCKED` warning.
 > The fold title stays clean (no `⚠ 密钥` suffix), and the standalone highlighted warning line
 > remains visible while collapsed. For a tool call that contains a secret, its **arguments and result are
 > shown in full (no truncation)** and the matched secret values (`NEOKEY_*` tokens / raw secrets matched
@@ -1193,10 +1246,16 @@ expressions like `api_key = os.getenv("..._API_KEY")` are not treated as raw sec
   pip/ssl can still find their libraries and modules.
 - **Text is force-tokenized by name too**: `tokenize()` (tool results / staged content) replaces the
   value in `NAME=value`, `NAME="value"` and `"NAME": "value"` when `NAME` matches the same sensitive
-  name rule, regardless of entropy. This closes two entropy blind spots: pure-lowercase-hex segments
-  (dropped by `exclude_pure_hex`) and dotted multi-segment keys (split by `RUN_PAT` into
-  non-candidates), e.g. `GLM_API_KEY=dfe946….rwbWDAf…` in `/proc/self/environ`. The value charset is
-  deliberately narrow to avoid swallowing across entries.
+  name rule **and the value looks like a credential**, regardless of entropy. This closes two entropy
+  blind spots: pure-lowercase-hex segments (dropped by `exclude_pure_hex`) and dotted multi-segment
+  keys (split by `RUN_PAT` into non-candidates), e.g. `GLM_API_KEY=dfe946….rwbWDAf…` in
+  `/proc/self/environ`. The value charset is deliberately narrow to avoid swallowing across entries.
+  **Value-shape check**: a value shorter than 4 chars, an ordinary word (`bar`), a single character
+  (`.`), a plain filename (`pyproject.toml`), or a path/URL (`/root/...`) is not registered as a
+  credential — otherwise `'password': 'bar'`, `key_separator = "."` and
+  `CONFIGFILE_KEY = 'pyproject.toml'` in source code would be wrongly registered as "raw secrets",
+  polluting the map and making later commands/context containing that fragment false-positive on
+  `find_real_secret` substring matching.
 - `allowlist` adds further Lua-pattern exclusions. See `tools.sandbox.secrets` in
   [configuration.md](configuration.md).
 
@@ -1399,8 +1458,8 @@ See `tools.sandbox.privilege` and `tools.sandbox.docker` in [configuration.md](c
 **Root by default** (`tools.sandbox.run_as.uid=0`): the sandbox payload runs as root so the AI can
 use host toolchains inside the sandbox (nvm/cargo/go under `/root` are 0700, untraversable by
 non-root) and package managers (`dpkg` hard-checks `euid==0`; capabilities alone are not enough).
-**All writes still go to the overlay staging layer and freeze as candidates; the real disk stays
-read-only.** Host immutability is guaranteed by namespaces + read-only root + overlay + masking +
+**All writes still go to the overlay staging layer and freeze as candidates; the real disk is
+unaffected.** Host immutability is guaranteed by namespaces + whole-root overlay + masking +
 `/proc/sys` read-only binds + seccomp, not by running non-root.
 
 **Non-root launch = guest root inside the sandbox**: when NeoAI is launched as a non-root user, a

@@ -177,11 +177,39 @@ local function secret_name_prefix(prefix)
   return name ~= nil and secret_name(name)
 end
 
-local function looks_like_literal_secret(value)
-  if type(value) ~= "string" or #value < 8 then return false end
-  if value:match("^[0-9a-fA-F]+$") then return true end
-  if value:find("[%+/=:]") then return true end
-  if value:match("%d") and #value >= 12 then return true end
+--- 值是否呈文件系统路径 / URL 形态。路径不是凭据：`*_KEY = /path`、`key_separator = "/"`
+--- 这类赋值登记为「原始密钥」后，任何含该路径片段的命令都会被硬拦截（误报）。
+--- @param value any
+--- @return boolean
+local function looks_like_path(value)
+  if type(value) ~= "string" or value == "" then return false end
+  if value:sub(1, 1) == "/" or value:sub(1, 2) == "~/" or value:sub(1, 2) == "./"
+    or value:sub(1, 3) == "../" or value:match("^%a:[/\\]") then
+    return true
+  end
+  if value:match("^%a[%w+.-]*://") then return true end
+  -- 相对/多段路径（含 `/` 且无 Base64 特征）：如 `bin/python`、`apps/python/.venv`。
+  -- Base64 凭据通常含 `+`/`=` 或大写，据此与路径区分。
+  if value:find("/", 1, true) and not value:find("+", 1, true)
+    and not value:find("=", 1, true) and not value:find("%u") then
+    return true
+  end
+  return false
+end
+
+--- 赋值值是否像凭据（供 `NAME = value` / `"NAME": "value"` 的按名脱敏）。
+--- 必须排除普通单词 / 路径 / 单字符，否则源码里的 `'password': 'bar'`、
+--- `key_separator = "."`、`CONFIGFILE_KEY = 'pyproject.toml'` 会被误登记为原始密钥，
+--- 污染映射表并让后续 `find_real_secret` 子串匹配误拦截命令。
+--- 认定：长度 >= 4，含数字；或长度 >= 8 且含大写 / Base64 特殊字符。
+--- @param value any
+--- @return boolean
+local function looks_like_assigned_secret(value)
+  if type(value) ~= "string" or #value < 4 then return false end
+  if looks_like_path(value) then return false end
+  if value:find("%d") then return true end
+  if #value >= 8 and value:find("%u") then return true end
+  if #value >= 8 and value:find("[%+/=:]") then return true end
   return false
 end
 
@@ -224,11 +252,12 @@ local function apply_secret_names(text, token_for)
     if type(name) ~= "string" or type(value) ~= "string" then return nil end
     if value == "" or not secret_name(name) then return nil end
     if value:sub(1, #TOKEN_PREFIX) == TOKEN_PREFIX then return nil end
+    -- 值不像凭据（普通单词/路径/短值）时不登记，避免污染原始密钥映射表。
+    if not looks_like_assigned_secret(value) then return nil end
     return token_for(value, "env_name:" .. name)
   end
   text = text:gsub("([%a_][%w_]*)(%s*=%s*)(" .. NAME_VALUE_CHARS .. ")([%(]?)", function(name, sep, value, paren)
     if paren == "(" then return nil end
-    if not looks_like_literal_secret(value) then return nil end
     local token = make(name, value)
     if not token then return nil end
     return name .. sep .. token
@@ -714,6 +743,59 @@ local function _entropy_flags(texts, opts)
   return table.concat(out)
 end
 
+--- 每个工作任务的文本数（与候选冻结共用同一配置键）。
+--- @return number
+local function _work_chunk_files()
+  local n = tonumber(require("NeoAI.kernel.config_store").get("tools.sandbox.work_chunk_files"))
+  if not n or n <= 0 then return 128 end
+  return n
+end
+
+--- 合并并行分块的 token 结果：各块 seq 起点相同，同一 secret 在不同块可能被分配不同 token。
+--- 取首次出现的 token 为规范值，并把其余分块输出中的等价 token 替换回规范 token，
+--- 保证 detokenize 可无损还原；最后统一登记并推进全局 seq。
+--- @param results table 数组 { seq, new, outs }
+--- @return table 合并后的逐项输出
+local function _merge_chunk_results(results)
+  local canonical, canonical_list = {}, {}
+  local max_seq = state.seq
+  for _, r in ipairs(results) do
+    if r.seq and r.seq > max_seq then max_seq = r.seq end
+    for _, e in ipairs(r.new) do
+      local secret, token = e.secret, e.token
+      if secret and not canonical[secret] then
+        canonical[secret] = token
+        canonical_list[#canonical_list + 1] = e
+      end
+    end
+  end
+  for _, r in ipairs(results) do
+    local remap = nil
+    for _, e in ipairs(r.new) do
+      local secret, token = e.secret, e.token
+      local canon = secret and canonical[secret]
+      if canon and canon ~= token then
+        remap = remap or {}
+        remap[token] = canon
+      end
+    end
+    if remap then
+      for i = 1, #r.outs do
+        local out = r.outs[i]
+        for from, to in pairs(remap) do out = out:gsub(from, to) end
+        r.outs[i] = out
+      end
+    end
+  end
+  for _, e in ipairs(canonical_list) do _register_token(e.secret, e.token, e.rule) end
+  state.seq = max_seq
+  local outs, idx = {}, 0
+  for _, r in ipairs(results) do
+    for i = 1, #r.outs do idx = idx + 1; outs[idx] = r.outs[i] end
+  end
+  return outs
+end
+
 --- 批量异步 token 化：全文扫描（规则/变量名/熵）在线程池执行，token 生成与登记在主线程。
 --- @param texts table 字符串数组
 --- @param opts table|nil { entropy?: boolean 统一开关；entropy_flags?: boolean[] 按项覆盖 }
@@ -731,14 +813,38 @@ function M.tokenize_many_async(texts, opts)
   end
   local sha_src = require("NeoAI.utils.sha256").source
   local salt = _ensure_salt()
-  local cfg_enc, map_enc, texts_enc = _encode_cfg(cfg), _encode_map(state.by_secret), _encode_texts(texts)
-  return work.run(_tokenize_worker, cfg_enc, map_enc, salt, state.seq, texts_enc, sha_src, SCAN_SRC, flags)
-    :then_(function(enc)
-      local seq, new, outs = _decode_result(enc)
-      for _, e in ipairs(new) do _register_token(e.secret, e.token, e.rule) end
-      if seq and seq > state.seq then state.seq = seq end
-      return outs
-    end)
+  local cfg_enc = _encode_cfg(cfg)
+  local chunk = _work_chunk_files()
+  if #texts <= chunk then
+    local map_enc, texts_enc = _encode_map(state.by_secret), _encode_texts(texts)
+    return work.run(_tokenize_worker, cfg_enc, map_enc, salt, state.seq, texts_enc, sha_src, SCAN_SRC, flags)
+      :then_(function(enc)
+        local seq, new, outs = _decode_result(enc)
+        for _, e in ipairs(new) do _register_token(e.secret, e.token, e.rule) end
+        if seq and seq > state.seq then state.seq = seq end
+        return outs
+      end)
+  end
+  -- 大量文本（如 npm/cargo 产生的大量候选文件）：按块并发投递到线程池用满多核，
+  -- 结果按原顺序合并。各块独立分配 token，合并时统一到规范 token（见 _merge_chunk_results）。
+  local map_enc = _encode_map(state.by_secret)
+  local jobs = {}
+  local i = 1
+  while i <= #texts do
+    local j = math.min(i + chunk - 1, #texts)
+    local sub = {}
+    for k = i, j do sub[#sub + 1] = texts[k] end
+    local sub_flags = flags:sub(i, j)
+    jobs[#jobs + 1] = work.run(_tokenize_worker, cfg_enc, map_enc, salt, state.seq,
+      _encode_texts(sub), sha_src, SCAN_SRC, sub_flags):then_(function(enc)
+        local seq, new, outs = _decode_result(enc)
+        return { seq = seq, new = new, outs = outs }
+      end)
+    i = j + 1
+  end
+  return async.all(jobs):then_(function(results)
+    return _merge_chunk_results(results)
+  end)
 end
 
 --- 单文本异步 token 化
@@ -747,6 +853,191 @@ end
 --- @return Deferred resolve(string)
 function M.tokenize_async(text, opts)
   return M.tokenize_many_async({ text or "" }, opts):then_(function(outs) return outs[1] end)
+end
+
+-- ========== 工作线程：候选文件密钥分析（token 警告 + 生成高熵） ==========
+
+--- 线程内逐文件扫描：统计 NEOKEY token 与生成高熵/具名规则命中（检测逻辑与主线程一致）。
+--- @param cfg_enc string
+--- @param texts_enc string
+--- @param scan_src string
+--- @return string 编码结果（每文件：token 数+token 列表，hits 数+各 hit 的 value/entropy/rule）
+local function _analyze_worker(cfg_enc, texts_enc, scan_src)
+  local scan = assert(load(scan_src))()
+  local RUN_PAT = "[%w_%-%+]+"
+  local function make_reader(s)
+    local pos = 1
+    return function()
+      local colon = s:find(":", pos, true)
+      if not colon then return nil end
+      local len = tonumber(s:sub(pos, colon - 1)) or 0
+      local v = s:sub(colon + 1, colon + len)
+      pos = colon + len + 1
+      return v
+    end
+  end
+  local nxt = make_reader(cfg_enc)
+  local cfg = {
+    min_length = tonumber(nxt()), max_length = tonumber(nxt()),
+    min_entropy = tonumber(nxt()), min_distinct = tonumber(nxt()),
+    exclude_pure_hex = nxt() == "1", entropy_requires_context = nxt() == "1",
+    allowlist = {}, rules = {},
+  }
+  for _ = 1, tonumber(nxt()) do cfg.allowlist[#cfg.allowlist + 1] = nxt() end
+  for _ = 1, tonumber(nxt()) do
+    local name, pattern, vk, prefix = nxt(), nxt(), nxt(), nxt()
+    cfg.rules[#cfg.rules + 1] = {
+      name = name ~= "" and name or nil, pattern = pattern,
+      validate_kind = vk ~= "" and vk or nil, prefix = prefix ~= "" and prefix or nil,
+    }
+  end
+  local tn = make_reader(texts_enc)
+  local texts = {}
+  for i = 1, tonumber(tn()) do texts[i] = tn() or "" end
+
+  local function detect(text)
+    local out, seen = {}, {}
+    local function add(s, e, rule)
+      if s == nil then return end
+      local key = s .. ":" .. e
+      if seen[key] then return end
+      seen[key] = true
+      local v = text:sub(s, e)
+      out[#out + 1] = { value = v, entropy = scan.entropy(v), rule = rule }
+    end
+    local pos = 1
+    while true do
+      local s, e = text:find(RUN_PAT, pos)
+      if not s then break end
+      local run = text:sub(s, e)
+      local prefix = text:sub(s > 64 and s - 64 or 1, s - 1)
+      if scan.is_candidate(run, cfg, scan.secret_name_prefix(prefix)) then add(s, e) end
+      pos = e + 1
+    end
+    for _, rule in ipairs(cfg.rules or {}) do
+      if type(rule.pattern) == "string" then
+        local s, e = text:find(rule.pattern)
+        while s do
+          local m = text:sub(s, e)
+          if scan.validate(rule, m) then add(s, e, rule.name) end
+          s, e = text:find(rule.pattern, e + 1)
+        end
+      end
+    end
+    return out
+  end
+
+  local function es(s) s = s or ""; return tostring(#s) .. ":" .. s end
+  local parts = { es(tostring(#texts)) }
+  for i = 1, #texts do
+    local text = texts[i]
+    local toks, ntok = {}, 0
+    for tok in text:gmatch("NEOKEY_%x+") do ntok = ntok + 1; toks[#toks + 1] = tok end
+    parts[#parts + 1] = es(tostring(ntok))
+    for _, t in ipairs(toks) do parts[#parts + 1] = es(t) end
+    local hits = detect(text)
+    parts[#parts + 1] = es(tostring(#hits))
+    for _, h in ipairs(hits) do
+      parts[#parts + 1] = es(h.value); parts[#parts + 1] = es(tostring(h.entropy)); parts[#parts + 1] = es(h.rule or "")
+    end
+  end
+  return table.concat(parts)
+end
+
+--- 主线程解析 `_analyze_worker` 结果：按文件返回 token 与 hits。
+--- @param enc string
+--- @return table 数组 { tokens = string[], hits = { {value, entropy, rule} } }
+local function _decode_analyze(enc)
+  local pos = 1
+  local function rd()
+    local colon = enc:find(":", pos, true)
+    if not colon then return nil end
+    local len = tonumber(enc:sub(pos, colon - 1)) or 0
+    local v = enc:sub(colon + 1, colon + len)
+    pos = colon + len + 1
+    return v
+  end
+  local n = tonumber(rd()) or 0
+  local out = {}
+  for i = 1, n do
+    local ntok = tonumber(rd()) or 0
+    local toks = {}
+    for _ = 1, ntok do toks[#toks + 1] = rd() end
+    local nhits = tonumber(rd()) or 0
+    local hits = {}
+    for _ = 1, nhits do
+      local value = rd(); local entropy = tonumber(rd()); local rule = rd()
+      hits[#hits + 1] = { value = value, entropy = entropy, rule = (rule ~= "" and rule) or nil }
+    end
+    out[i] = { tokens = toks, hits = hits }
+  end
+  return out
+end
+
+--- 批量异步分析候选文件：NEOKEY token 警告 + 生成高熵/具名规则命中在**工作线程**扫描，
+--- 主线程只做预算选择与结果聚合，避免大候选逐文件全文扫描阻塞结算。
+--- @param files table 候选文件数组（含 content）
+--- @param opts table|nil { generated?: boolean 是否做生成高熵检测，默认 true }
+--- @return Deferred resolve({ warning = {count,tokens}|nil, generated = table[] })
+function M.analyze_files_async(files, opts)
+  local async = require("NeoAI.utils.async")
+  opts = opts or {}
+  local empty = { warning = nil, generated = {}, offloaded = true }
+  if not M.enabled() then return async.resolve(empty) end
+  local cfg = _cfg()
+  -- 预算选择：与 detect_generated 同步版一致（生成检测受 generated_scan_max_* 约束）。
+  local max_bytes = tonumber(cfg.generated_scan_max_bytes) or 0
+  local max_files = tonumber(cfg.generated_scan_max_files) or 0
+  local scan_bytes, scan_count = 0, 0
+  local selected, idx = {}, {}
+  for i, f in ipairs(files or {}) do
+    if type(f.content) == "string" and f.content ~= "" then
+      if not (max_files > 0 and scan_count >= max_files)
+        and not (max_bytes > 0 and scan_bytes + #f.content > max_bytes) then
+        scan_bytes = scan_bytes + #f.content
+        scan_count = scan_count + 1
+        selected[#selected + 1] = f.content
+        idx[#idx + 1] = i
+      end
+    end
+  end
+  if #selected == 0 then return async.resolve(empty) end
+  local work = require("NeoAI.utils.work")
+  if not work.available() or not _can_offload(cfg) then
+    return async.resolve({ offloaded = false }) -- 回退：调用方使用同步版
+  end
+  local cfg_enc = _encode_cfg(cfg)
+  local texts_enc = _encode_texts(selected)
+  return work.run(_analyze_worker, cfg_enc, texts_enc, SCAN_SRC):then_(function(enc)
+    local per = _decode_analyze(enc)
+    local tokens, count = {}, 0
+    local generated = {}
+    for k, entry in ipairs(per) do
+      for _, tok in ipairs(entry.tokens) do
+        count = count + 1
+        tokens[tok] = true
+      end
+      if opts.generated ~= false then
+        for _, hit in ipairs(entry.hits) do
+          if not hit.value:match("^" .. TOKEN_PAT .. "$") then
+            local fi = idx[k]
+            generated[#generated + 1] = {
+              path = files[fi] and files[fi].path, entropy = hit.entropy, rule = hit.rule,
+              preview = hit.value:sub(1, 8) .. "…",
+            }
+          end
+        end
+      end
+    end
+    local warning = nil
+    if count > 0 then
+      local list = {}
+      for tok in pairs(tokens) do list[#list + 1] = tok end
+      table.sort(list)
+      warning = { count = count, tokens = list }
+    end
+    return { warning = warning, generated = generated }
+  end)
 end
 
 --- 把 token 还原为真实密钥（出沙箱 commit 解密）
@@ -805,6 +1096,15 @@ end
 -- 敏感环境变量名形态：全大写字母/数字/下划线，长度 >= 6（排除 KEY/TOKEN 等短词噪声）。
 local ENV_NAME_PAT = "%u[%u%d_]*"
 
+--- NeoAI 内部事件/标识（非环境变量）。例如错误文案里的 `SANDBOX_SECRET_BLOCKED`
+--- 含 `SECRET` 段且全大写，会被误判为敏感环境变量名，从而渲染出「密钥环境变量：
+--- SANDBOX_SECRET_BLOCKED」这类无意义告警。按前缀排除。
+--- @param name string
+--- @return boolean
+local function is_internal_identifier(name)
+  return name:match("^SANDBOX_SECRET_") ~= nil
+end
+
 --- 深度扫描值中的**敏感环境变量名**（全大写、名字含 KEY/TOKEN/SECRET/PASSWORD/CREDENTIAL 段）。
 --- 用于「出现了 key 的环境变量名」时的软告警 + 审批：**不终止 Agent**，只提级并把候选送入
 --- 待审（悬浮窗展示 `⚠ 密钥操作`）。全大写 + 长度阈值避免把代码里的 `api_key`/`os.getenv`
@@ -817,7 +1117,8 @@ function M.scan_names(value)
     local t = type(v)
     if t == "string" then
       for name in v:gmatch(ENV_NAME_PAT) do
-        if #name >= 6 and not seen[name] and _scan.secret_name(name) then
+        if #name >= 6 and not seen[name] and not is_internal_identifier(name)
+          and _scan.secret_name(name) then
           seen[name] = true
           out[#out + 1] = name
         end
@@ -1038,14 +1339,28 @@ function M.detect_generated(files)
   local out = {}
   if not M.enabled() then return out end
   local token_pat = "^" .. TOKEN_PAT .. "$"
+  -- 扫描预算：候选文件很多/很大时，逐文件全文熵/规则检测是结算阶段的主线程热点。
+  -- 超预算的文件跳过（0 = 不限制），避免大候选（包安装/构建产物）冻结界面。
+  local cfg = _cfg()
+  local max_bytes = tonumber(cfg.generated_scan_max_bytes) or 0
+  local max_files = tonumber(cfg.generated_scan_max_files) or 0
+  local scanned_bytes, scanned_files = 0, 0
   for _, f in ipairs(files or {}) do
+    if max_files > 0 and scanned_files >= max_files then break end
     if type(f.content) == "string" and f.content ~= "" then
-      for _, hit in ipairs(M.detect(f.content)) do
-        if not hit.value:match(token_pat) then
-          out[#out + 1] = {
-            path = f.path, entropy = hit.entropy, rule = hit.rule,
-            preview = hit.value:sub(1, 8) .. "…",
-          }
+      local size = #f.content
+      if max_bytes > 0 and scanned_bytes + size > max_bytes then
+        -- 本文件超预算：跳过（不再继续消耗主线程）。
+      else
+        scanned_bytes = scanned_bytes + size
+        scanned_files = scanned_files + 1
+        for _, hit in ipairs(M.detect(f.content)) do
+          if not hit.value:match(token_pat) then
+            out[#out + 1] = {
+              path = f.path, entropy = hit.entropy, rule = hit.rule,
+              preview = hit.value:sub(1, 8) .. "…",
+            }
+          end
         end
       end
     end
@@ -1070,11 +1385,35 @@ local SECRET_PATH_PATS = {
   "^/etc/", "/shadow$", "/sudoers",
 }
 
+-- 公开 CA 证书包 / 信任库（非密钥）：pip/certifi、系统 ca-certificates、语言运行时内置信任库等。
+-- 这些 `.pem` 被普通命令（pip/curl/python）频繁打开，内容是公开根证书，不是凭据，
+-- 不应触发「获取密钥」告警，也不应被高熵 token 化（否则会把证书 base64 误当密钥）。
+local PUBLIC_CERT_BASENAMES = {
+  ["cacert.pem"] = true, ["ca-bundle.pem"] = true, ["ca-certificates.pem"] = true,
+  ["ca-root.pem"] = true, ["roots.pem"] = true, ["bundle.pem"] = true,
+  ["chain.pem"] = true, ["fullchain.pem"] = true, ["trusted.pem"] = true,
+  ["truststore.pem"] = true,
+}
+local PUBLIC_CERT_DIR_PATS = { "/certifi/", "/ca%-certificates/", "/ssl/certs/" }
+
+--- 路径是否为公开 CA 证书包/信任库（非密钥）。
+--- @param path string
+--- @return boolean
+local function is_public_cert_bundle(path)
+  local base = path:match("[^/]+$") or path
+  if PUBLIC_CERT_BASENAMES[base:lower()] then return true end
+  for _, pat in ipairs(PUBLIC_CERT_DIR_PATS) do
+    if path:find(pat) then return true end
+  end
+  return false
+end
+
 --- 路径是否疑似密钥文件（宽口径：用于决定是否做高熵扫描）
 --- @param path string|nil
 --- @return boolean
 function M.is_secret_path(path)
   if type(path) ~= "string" or path == "" then return false end
+  if is_public_cert_bundle(path) then return false end
   for _, pat in ipairs(SECRET_PATH_PATS) do
     if path:find(pat) then return true end
   end
@@ -1100,6 +1439,7 @@ local SENSITIVE_PATH_PATS = {
 --- @return boolean
 function M.is_sensitive_path(path)
   if type(path) ~= "string" or path == "" then return false end
+  if is_public_cert_bundle(path) then return false end
   for _, pat in ipairs(SENSITIVE_PATH_PATS) do
     if path:find(pat) then return true end
   end

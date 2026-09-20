@@ -61,4 +61,30 @@ tests.suite("secret_async", function(_, it)
     cfg.set("tools.sandbox.secrets.enabled", true)
     if not ok then error(err, 0) end
   end)
+
+  it("分块并行 token 化：跨块相同密钥合并为规范 token 且可无损还原", function(t)
+    local secret = require("NeoAI.sandbox.secret")
+    local cfg = require("NeoAI.kernel.config_store")
+    secret.reset()
+    local key_a = "AKIAIOSFODNN7EXAMPLE"
+    local key_b = "ghp_abcdefghijklmnopqrstuvwxyz0123456789"
+    -- 每项一块（work_chunk_files=1）：key_b 在块 1 是第 2 个新密钥、在块 2 是第 1 个，
+    -- 各块独立分配 token，合并时须统一为同一 token。
+    cfg.set("tools.sandbox.work_chunk_files", 1)
+    local texts = { "A=" .. key_a .. " B=" .. key_b, "B=" .. key_b }
+    local ok, err = pcall(function()
+      local outs = t.await(secret.tokenize_many_async(texts))
+      t.eq(#texts, #outs)
+      for i = 1, #texts do
+        t.true_(outs[i]:find("NEOKEY_", 1, true) ~= nil, "第 " .. i .. " 项应 token 化")
+        t.eq(texts[i], secret.detokenize(outs[i]), "第 " .. i .. " 项应可无损还原")
+      end
+      -- 两处 key_b 应被替换为同一个 token（合并为规范 token）
+      local t1 = outs[1]:match("B=(NEOKEY_%x+)")
+      local t2 = outs[2]:match("B=(NEOKEY_%x+)")
+      t.eq(t1, t2, "跨块相同密钥应合并为同一 token")
+    end)
+    cfg.set("tools.sandbox.work_chunk_files", nil)
+    if not ok then error(err, 0) end
+  end)
 end)

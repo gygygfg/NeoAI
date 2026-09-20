@@ -59,10 +59,15 @@ function M.container(base)
 end
 
 --- 由实例根反推配置基根（`<base>/instances/<id>` → `<base>`）
---- @param root string 实例根
---- @return string
+--- 仅接受非空绝对路径；nil/相对路径返回 nil（否则 `:h:h` 会得到 `.`，被遮蔽逻辑当成
+--- 当前目录遮蔽，进而 `--tmpfs .` 把沙箱内 `/tmp` 等一并隐藏，命令 `chdir /tmp` 失败）。
+--- @param root string
+--- @return string|nil
 function M.base_of(root)
-  return vim.fn.fnamemodify(tostring(root or ""), ":h:h")
+  if type(root) ~= "string" or root == "" or root:sub(1, 1) ~= "/" then return nil end
+  local base = vim.fn.fnamemodify(root, ":h:h")
+  if base == "" or base == "." or base == "/" then return nil end
+  return base
 end
 
 --- 回收已死进程遗留的实例目录（幂等；保守，不触碰存活进程）。

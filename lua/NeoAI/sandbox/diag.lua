@@ -104,4 +104,64 @@ function M.reset()
   fstate.log = {}
 end
 
+-- ========== 捕获/物化性能基准（暂存堆积回归） ==========
+
+--- 复现「暂存很多文件后 run_command 结束变慢」并给出分段耗时（仅诊断用，会重置沙箱）。
+--- 构造 N 个暂存文件 → 物化进 overlay → 捕获。返回物化与捕获主线程耗时，用于回归对比。
+--- 注意：会修改 `tools.sandbox.workspace_root` 并 `sandbox.reset()`，不要在运行中的会话里调用。
+--- @param opts table|nil { files?: number 暂存文件数，默认 200 }
+--- @return table { files, materialize_ms, capture_ms }
+function M.bench_capture(opts)
+  opts = opts or {}
+  local n = tonumber(opts.files) or 200
+  local fs = require("NeoAI.utils.fs")
+  local config_store = require("NeoAI.kernel.config_store")
+  local candidate = require("NeoAI.sandbox.candidate")
+  local control = require("NeoAI.sandbox.control")
+  local store = require("NeoAI.sandbox.store")
+  local sandbox = require("NeoAI.sandbox")
+  local dir = fs.canonical(vim.fn.tempname())
+  fs.ensure_dir(dir)
+  local prev_root = config_store.get("tools.sandbox.workspace_root")
+  config_store.set("tools.sandbox.workspace_root", vim.fn.tempname() .. "/sb")
+  sandbox.reset()
+  local a = control.new_attempt("run_command", {}, {}, { effect = "process" })
+  candidate.begin(a, store.root())
+  local files = {}
+  for i = 1, n do
+    local p = dir .. "/f" .. i .. ".txt"
+    fs.write_file(p, "base " .. i .. "\n")
+    files[#files + 1] = {
+      path = p, action = "modify", content = "staged " .. i .. "\n",
+      before_hash = "sha256:b" .. i, after_hash = "sha256:s" .. i, mode = 420,
+    }
+  end
+  candidate.merge_candidate({ files = files })
+  local base = vim.fn.tempname()
+  local upper, work = base .. "/upper", base .. "/work"
+  fs.ensure_dir(upper); fs.ensure_dir(work)
+  local specs = { { root = dir, upper = upper, work = work, mode = "overlay" } }
+  -- 第一次物化（冷）：读取+写入全部暂存文件
+  local cold = M.measure(function() candidate.materialize_overlay(specs) end, 1)
+  -- 第二次物化（热）：未改动应跳过
+  local warm = M.measure(function() candidate.materialize_overlay(specs) end, 1)
+  local capture_ms, done = -1, false
+  local t0 = vim.uv.hrtime()
+  candidate.capture_overlay_async(a.attempt_id, dir, upper):then_(function()
+    capture_ms = (vim.uv.hrtime() - t0) / 1e6
+    done = true
+  end, function() done = true end)
+  vim.wait(30000, function() return done end)
+  candidate.cleanup(a.attempt_id)
+  if prev_root ~= nil then config_store.set("tools.sandbox.workspace_root", prev_root) end
+  vim.fn.delete(dir, "rf")
+  vim.fn.delete(base, "rf")
+  return {
+    files = n,
+    materialize_cold_ms = cold.total_ms,
+    materialize_warm_ms = warm.total_ms,
+    capture_ms = capture_ms,
+  }
+end
+
 return M

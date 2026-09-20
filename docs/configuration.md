@@ -225,7 +225,7 @@ sandbox = {
   cap_add = {},                    -- 默认最小权限（`--cap-drop ALL`）；按命令窄范围加回（包安装经 packages.cap_add）。仅调试时才设 { "ALL" }
   -- 载荷运行身份：默认以 root 运行（uid=0），使 AI 能在沙箱内使用宿主工具链（/root 下的
   --   nvm/cargo/go 等 0700 目录非 root 不可遍历）与包管理（dpkg 硬检查 euid==0）。所有写入仍
-  --   全部进入 overlay 暂存并冻结为候选，真实磁盘只读；隔离由命名空间 + 只读根 + overlay +
+  --   全部进入 overlay 暂存并冻结为候选，真实磁盘不受影响；隔离由命名空间 + 整机根 overlay +
   --   seccomp + 遮蔽保证。
   --   * 非 root 启动 NeoAI：用 user namespace 把当前用户映射为**沙箱内 guest root**（euid=0，
   --     仅命名空间内有效；宿主仍是当前非 root 用户），本项被忽略。真正需要宿主 root 的操作
@@ -239,11 +239,14 @@ sandbox = {
     "CAP_SYS_BOOT", "CAP_MAC_ADMIN", "CAP_MAC_OVERRIDE", "CAP_AUDIT_CONTROL",
   },
   max_file_bytes = 8 * 1024 * 1024, -- 单文件纳入候选上限（字节）；超过不纳入候选，防 apt/pkgcache.bin 等大缓存阻塞主线程；0 = 不限制
-  -- 读取面（默认开）：true 时整机根以只读方式暴露（`--ro-bind / /`），仅遮蔽 mask_paths 中的
-  -- 重要配置文件/凭据（~/.ssh、~/.aws、/etc/shadow、sudoers、docker.sock 等）与沙箱自身存储；
-  -- mask_dirs（home/root 兄弟目录）不再挂载遮蔽，但访问 cwd 之外的用户目录会**留痕**
-  -- （evidence + `sandbox:outside_access` 事件）并在审批悬浮窗 `:NeoAISandboxReview` 的
-  -- 「越界访问留痕」区展示（非阻塞，仍放行）。false 时退回下面的最小只读白名单。
+  work_chunk_files = 128, -- 每个工作线程任务的候选文件数：冻结/哈希/密钥扫描按此分块并发投递到线程池（多核），防大量文件时单核串行；0/缺省 = 128
+  -- 读取面（默认开）：true 时整机根以**可写 overlay** 方式暴露——以 `/` 为只读 lower、会话私有
+  -- upper/work 为可写层（原样挂载、根内任意路径可写），所有写入进 upper 暂存并冻结为候选，
+  -- 宿主盘不受影响；仅遮蔽 mask_paths 中的重要配置文件/凭据（~/.ssh、~/.aws、/etc/shadow、
+  -- sudoers、docker.sock 等）与沙箱自身存储；mask_dirs（home/root 兄弟目录）不再挂载遮蔽，但
+  -- 访问 cwd 之外的用户目录会**留痕**（evidence + `sandbox:outside_access` 事件）并在审批悬浮窗
+  -- `:NeoAISandboxReview` 的「越界访问留痕」区展示（非阻塞，仍放行）。overlay 不可用时退回只读根
+  -- （overlay_fail_closed 决定是否降级）。false 时退回下面的最小只读白名单。
   read_all = true,
   -- 最小只读系统集（白名单，仅在 read_all=false 时生效）：仅这些宿主根/子树/文件以只读方式
   -- 暴露给外部命令；未列出的路径在沙箱内不存在。不整目录暴露 /usr（避免泄露
@@ -349,7 +352,7 @@ sandbox = {
   -- 存储基根：每进程实例隔离在 <workspace_root>/instances/<pid>_<ts>，待审队列/候选跨会话互不可见。
   workspace_root = vim.fn.stdpath("cache") .. "/NeoAI/sandbox",
   session_shell = true,            -- run_command 会话内保留 shell 状态（export/cd 跨命令生效；仅 bwrap）
-  process_roots = {},              -- run_command 可写根（overlay 覆盖；默认仅 cwd 自动补入）。/tmp、/var/tmp 属 tmpfs_roots；避免把宿主 /root、/home、/etc 等作为只读 lower 暴露；按需显式加回
+  process_roots = {},              -- 额外可写根（仅 read_all=false 或整机 overlay 不可用时生效；overlay 覆盖，默认仅 cwd 自动补入）。read_all=true（默认）时整机根已是可写 overlay，本项不再需要。/tmp、/var/tmp 属 tmpfs_roots；按需显式加回
   overlay_fail_closed = true,      -- overlay 不可用时拒绝 process 工具（不降级为私有 cwd）；false 才允许降级运行
   -- 异步审批：候选进入待审队列，用户确认后应用。session_auto_approve 开启后 L0/L1 自动应用。
   -- l3_warning：L3（critical）条目二次确认（AI 生成后果警告 + 自动打开 diff，需再次确认才应用）。
@@ -387,7 +390,7 @@ sandbox = {
     cap_add = { "CAP_DAC_OVERRIDE", "CAP_CHOWN", "CAP_SETUID", "CAP_SETGID", "CAP_FOWNER" },
   },
   lsp_overlay = { enabled = true }, -- AI 专用沙箱 LSP：AI 的 lsp_* 工具克隆的 server 读暂存内容（默认开，仅 bwrap+overlay；不可用时回退编辑器客户端）
-  secrets = { enabled = true, min_length = 20, max_length = 200, min_entropy = 3.5, min_distinct = 8, exclude_pure_hex = true, entropy_requires_context = true, entropy_secret_paths_only = true, tokenize_env = true, extra_rules = {}, allowlist = {} }, -- 密钥/敏感信息防护：熵检测 + 具名规则（私钥块/AKIA/ghp_/sk-/JWT/Bearer…）+ token 加密映射；env 名含 KEY/TOKEN/SECRET/PASSWORD/CREDENTIAL 的值无视熵强制 token 化；裸熵串须含 -/_ 且非代码标识符（snake_case 函数/常量名）或处于敏感名上下文（缩小认定范围，避免误伤 integrity/构建哈希/回溯函数名/路径分量）；非敏感名且值含 / 的环境变量只按具名规则脱敏（不破坏 PATH/LD_LIBRARY_PATH 等）；entropy_secret_paths_only=true 时全文熵扫描仅对疑似密钥文件（~/.ssh、~/.bashrc、/etc/* 等，见 secret.is_secret_path）执行，普通文件只走具名规则
+  secrets = { enabled = true, min_length = 20, max_length = 200, min_entropy = 3.5, min_distinct = 8, exclude_pure_hex = true, entropy_requires_context = true, entropy_secret_paths_only = true, generated_scan_max_bytes = 2097152, generated_scan_max_files = 200, tokenize_env = true, extra_rules = {}, allowlist = {} }, -- 密钥/敏感信息防护：熵检测 + 具名规则（私钥块/AKIA/ghp_/sk-/JWT/Bearer…）+ token 加密映射；env 名含 KEY/TOKEN/SECRET/PASSWORD/CREDENTIAL 的值无视熵强制 token 化；裸熵串须含 -/_ 且非代码标识符（snake_case 函数/常量名）或处于敏感名上下文（缩小认定范围，避免误伤 integrity/构建哈希/回溯函数名/路径分量）；非敏感名且值含 / 的环境变量只按具名规则脱敏（不破坏 PATH/LD_LIBRARY_PATH 等）；entropy_secret_paths_only=true 时全文熵扫描仅对疑似密钥文件（~/.ssh、~/.bashrc、/etc/* 等，见 secret.is_secret_path）执行，普通文件只走具名规则；generated_scan_max_bytes/generated_scan_max_files 限制 AI 生成高熵检测（detect_generated）的单次扫描预算，避免大候选逐文件全文扫描占满主线程（0 = 不限制）
   retention = { candidate_days = 7, max_pending = 20 },
   policy = {
     version = "1",                 -- 策略版本（用于审计回放；规则变更时递增）

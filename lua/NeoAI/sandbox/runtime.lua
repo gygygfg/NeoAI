@@ -615,19 +615,47 @@ local function _mask_scopes(cwd)
   return out
 end
 
+--- 追加整机根 overlay（read_all 模式）：以 `/` 为只读 lower、会话私有 upper/work 为可写层，
+--- 使沙箱内根文件系统「原样可写」而所有写入都进 upper 暂存，宿主盘不受影响。
+--- overlay lower 不跨挂载点，故宿主子挂载（/sys、/run 等）需另行只读绑定保留读取面。
+--- @param argv table
+--- @param root_overlay table { upper, work }
+local function _append_root_overlay(argv, root_overlay)
+  argv[#argv + 1] = "--overlay-src"
+  argv[#argv + 1] = "/"
+  argv[#argv + 1] = "--overlay"
+  argv[#argv + 1] = root_overlay.upper
+  argv[#argv + 1] = root_overlay.work
+  argv[#argv + 1] = "/"
+  -- 保留宿主子挂载读取面（overlay lower 不跨挂载点，这些路径会变空）。
+  for _, p in ipairs({ "/sys", "/run" }) do
+    if vim.uv.fs_stat(p) then
+      argv[#argv + 1] = "--ro-bind"
+      argv[#argv + 1] = p
+      argv[#argv + 1] = p
+    end
+  end
+end
+
 --- 追加最小只读系统集挂载（白名单）。未列出的宿主路径在沙箱内不存在，
 --- 因此读取面不再等于整机根。支持 `*` 通配，跳过不存在的条目。
 --- 当 cwd 位于某个遮蔽目录下时，额外把该作用域（用户 home）以只读暴露，使工作目录可访问；
 --- 作用域内的敏感条目由 `_masked_paths` 的目录遮蔽收敛。
 --- @param argv table
 --- @param cwd string|nil
-local function _append_readonly_mounts(argv, cwd)
-  -- read_all（默认）：整机根以只读方式暴露，只遮蔽 mask_paths 中的重要配置文件/凭据
-  -- （在后续 `_masked_paths` 中覆盖）。沙箱自身存储、临时根、/proc 等仍在之后覆盖。
+--- @param root_overlay table|nil { upper, work }：read_all 模式下的整机可写暂存层
+local function _append_readonly_mounts(argv, cwd, root_overlay)
+  -- read_all（默认）：整机根暴露。给定 root_overlay 时以 overlay 提供可写暂存（原样挂载、
+  -- 全部写入进 upper）；否则退回只读 `--ro-bind / /`（如 LSP 只读 rootfs、能力探测）。
+  -- mask_paths 中的重要配置文件/凭据仍在后续 `_masked_paths` 中覆盖。
   if _read_all() then
-    argv[#argv + 1] = "--ro-bind"
-    argv[#argv + 1] = "/"
-    argv[#argv + 1] = "/"
+    if root_overlay and root_overlay.upper and root_overlay.work then
+      _append_root_overlay(argv, root_overlay)
+    else
+      argv[#argv + 1] = "--ro-bind"
+      argv[#argv + 1] = "/"
+      argv[#argv + 1] = "/"
+    end
   end
   local seen = {}
   local function add(p)
@@ -796,11 +824,12 @@ end
 --- @param flags table 隔离标志
 --- @param priv table|nil 档位隔离参数（cap_add 等）
 --- @param cwd string|nil 工作目录（用于决定是否暴露其所在用户 home）
-local function _append_bwrap_base(argv, flags, priv, cwd)
+--- @param root_overlay table|nil { upper, work }：read_all 模式下的整机可写暂存层
+local function _append_bwrap_base(argv, flags, priv, cwd, root_overlay)
   argv[#argv + 1] = "bwrap"
   for _, f in ipairs(flags) do argv[#argv + 1] = f end
   for _, f in ipairs({ "--die-with-parent", "--as-pid-1" }) do argv[#argv + 1] = f end
-  _append_readonly_mounts(argv, cwd)
+  _append_readonly_mounts(argv, cwd, root_overlay)
   for _, f in ipairs({ "--dev", "/dev", "--proc", "/proc" }) do
     argv[#argv + 1] = f
   end
@@ -861,11 +890,19 @@ end
 --- @return boolean
 local function _overlay_mount_works(lower, upper, work, flags)
   local argv = {}
-  _append_bwrap_base(argv, flags)
-  for _, f in ipairs({
-    "--overlay-src", lower, "--overlay", upper, work, lower,
-    "--chdir", lower, "--", "true",
-  }) do argv[#argv + 1] = f end
+  local is_root = (lower == "/")
+  if is_root then
+    -- 整机根：overlay 必须挂在 `--dev/--proc` 之前（否则会遮蔽 /dev、/proc）。
+    _append_bwrap_base(argv, flags, nil, nil, { upper = upper, work = work })
+  else
+    _append_bwrap_base(argv, flags)
+  end
+  if not is_root then
+    for _, f in ipairs({ "--overlay-src", lower, "--overlay", upper, work, lower }) do
+      argv[#argv + 1] = f
+    end
+  end
+  for _, f in ipairs({ "--chdir", lower, "--", "true" }) do argv[#argv + 1] = f end
   return _run_probe(argv)
 end
 
@@ -878,7 +915,12 @@ end
 --- @return boolean
 local function _overlay_write_works(lower, upper, work, flags)
   local argv = {}
-  _append_bwrap_base(argv, flags)
+  local is_root = (lower == "/")
+  if is_root then
+    _append_bwrap_base(argv, flags, nil, nil, { upper = upper, work = work })
+  else
+    _append_bwrap_base(argv, flags)
+  end
   local puid, pgid = _payload_ids()
   local nonroot = puid ~= nil and puid > 0
   local user_drop = nonroot and not _is_root()
@@ -893,9 +935,11 @@ local function _overlay_write_works(lower, upper, work, flags)
       argv[#argv + 1] = "--cap-add"; argv[#argv + 1] = c
     end
   end
-  argv[#argv + 1] = "--overlay-src"; argv[#argv + 1] = lower
-  argv[#argv + 1] = "--overlay"; argv[#argv + 1] = upper
-  argv[#argv + 1] = work; argv[#argv + 1] = lower
+  if not is_root then
+    argv[#argv + 1] = "--overlay-src"; argv[#argv + 1] = lower
+    argv[#argv + 1] = "--overlay"; argv[#argv + 1] = upper
+    argv[#argv + 1] = work; argv[#argv + 1] = lower
+  end
   argv[#argv + 1] = "--chdir"; argv[#argv + 1] = lower
   argv[#argv + 1] = "--"
   if root_drop then
@@ -904,8 +948,9 @@ local function _overlay_write_works(lower, upper, work, flags)
       argv[#argv + 1] = v
     end
   end
+  -- 用 `[ -s ]` 判非空，避免依赖 /dev/null（整机 overlay 探测时 /dev 可能尚未就绪）。
   for _, v in ipairs({ "sh", "-c",
-    'p=.wprobe-$$; printf x > "$p" && cat "$p" >/dev/null && rm -f "$p"' }) do
+    'p=.wprobe-$$; printf x > "$p" && [ -s "$p" ] && rm -f "$p"' }) do
     argv[#argv + 1] = v
   end
   return _run_probe(argv)
@@ -1176,7 +1221,10 @@ local function _masked_paths(unmask, cwd, dac_override)
     local root = store.root()
     add(root, true)
     local iok, instance = pcall(require, "NeoAI.sandbox.instance")
-    if iok and instance and instance.base_of then add(instance.base_of(root), true) end
+    if iok and instance and instance.base_of then
+      local base = instance.base_of(root)
+      if base then add(base, true) end
+    end
   end
   for _, p in ipairs(_config_mask_paths()) do add(p) end
   for _, p in ipairs(_dir_masks(cwd)) do add(p) end
@@ -1684,6 +1732,18 @@ function M.process_prefix(opts)
   end
   if backend == "bwrap" then
     local overlays = opts.overlays or {}
+    -- 整机根 overlay（root="/"）：以可写暂存层替换只读根，必须在 `--dev/--proc` 之前挂载；
+    -- 其余可写根在其上继续 overlay/bind。
+    local root_overlay = nil
+    local rest_overlays = {}
+    for _, ov in ipairs(overlays) do
+      if ov.root == "/" then
+        -- 根不可 overlay（mode="bind"）时退回只读根；是否允许降级由 overlay_fail_closed 决定。
+        if ov.mode ~= "bind" then root_overlay = ov end
+      else
+        rest_overlays[#rest_overlays + 1] = ov
+      end
+    end
     local puid, pgid = _payload_ids()
     local nonroot = puid ~= nil and puid > 0
     -- 降权/提权方式：
@@ -1713,7 +1773,7 @@ function M.process_prefix(opts)
     local userns = false
     for _, f in ipairs(flags) do if f == "--unshare-all" or f == "--unshare-user" then userns = true end end
     local argv = {}
-    _append_bwrap_base(argv, flags, priv, opts.cwd)
+    _append_bwrap_base(argv, flags, priv, opts.cwd, root_overlay)
     -- root_drop：为让载荷经 setpriv 降 uid，bwrap 需保留 SETUID/SETGID（其余能力仍被
     -- `--cap-drop ALL` 丢弃）；setuid 后内核清空 permitted/effective，载荷无能力。
     -- 但嵌套 userns 档位（T2）下 bwrap 新建的 userns 未映射 run_as.uid，setpriv 会
@@ -1749,8 +1809,8 @@ function M.process_prefix(opts)
     end
     -- 多可写根：ext4 等支持 overlay 的根用 overlay（真实内容只读 lower，写入进 upper）；
     -- tmpfs 等不支持 overlay 的根退化为把会话私有目录 bind 到该根（可写、会话内持久）。
-    local overlays_active = false
-    for _, ov in ipairs(overlays) do
+    local overlays_active = root_overlay ~= nil
+    for _, ov in ipairs(rest_overlays) do
       local mode = ov.mode
       if not mode then
         -- 可写性实测：挂载成功但载荷无法写入（非 root + upper 归属/DAC）时降级 bind，
@@ -1770,7 +1830,7 @@ function M.process_prefix(opts)
       end
     end
     -- 兼容：未提供 overlays 时按 cwd 单层 overlay
-    if #overlays == 0 and opts.cwd then
+    if #rest_overlays == 0 and not root_overlay and opts.cwd then
       local overlay_ok = opts.upper and opts.work
         and M.overlay_available()
         and M.overlay_writable(opts.cwd, opts.upper, opts.work)

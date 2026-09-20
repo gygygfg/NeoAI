@@ -357,6 +357,14 @@ local function _secret_warning_line(fn, result_msg)
 
   local args_str = fn.arguments
   local result_content = result_msg and result_msg.content or nil
+  -- 失败结果（如沙箱密钥硬拦截返回的 `SANDBOX_SECRET_BLOCKED` 错误对象）不是「读取到的
+  -- 内容」，不参与密钥判定；否则错误文案里的内部标识会被当成敏感环境变量名，渲染出
+  -- 「密钥环境变量：SANDBOX_SECRET_BLOCKED」这类无意义告警。
+  local result_failed = false
+  if type(result_content) == "string" and result_content ~= "" then
+    local dec = json.decode_or_nil(result_content)
+    if type(dec) == "table" and dec.error ~= nil then result_failed = true end
+  end
   local args = nil
   if type(args_str) == "string" and args_str ~= "" then
     local dec = json.decode_or_nil(args_str)
@@ -378,9 +386,9 @@ local function _secret_warning_line(fn, result_msg)
   end
 
   local names_args = _secret_names({ args })
-  local names_result = _secret_names({ result_content })
+  local names_result = result_failed and {} or _secret_names({ result_content })
   local info_args = _secret_info(args_str)
-  local info_result = _secret_info(result_content)
+  local info_result = result_failed and { has = false, rules = {} } or _secret_info(result_content)
   local paths = _secret_paths(args, fn.name)
   local cmd_kind = args and type(args.command) == "string" and _command_secret_kind(args.command) or nil
 

@@ -136,6 +136,18 @@ local function _norm(p)
   return fs.canonical(p)
 end
 
+--- cwd/home 的规范形式缓存：build_lines 逐文件判级时，此前每次都对 cwd/home 各做一次
+--- fs.canonical（含 fnamemodify+resolve 的 vim.fn 调用）；待审文件数千时是主线程热点。
+--- 键为原始字符串，值随 cwd/$HOME 变化自然失效。
+local _base_canon = {}
+local function _canon_base(raw)
+  local c = _base_canon[raw]
+  if c then return c end
+  c = fs.canonical(raw)
+  _base_canon[raw] = c
+  return c
+end
+
 --- path 是否位于 base 之下（含相等）
 --- @param path string
 --- @param base string
@@ -147,13 +159,14 @@ end
 
 --- 判断文件路径级别
 --- @param path string
+--- @param ctx table|nil { cwd?, home? } 预计算的规范 cwd/home（build_lines 批量传入以复用）
 --- @return string "workspace" | "user" | "system"
-function M.level_of(path)
+function M.level_of(path, ctx)
   if type(path) ~= "string" or path == "" then return "system" end
   local abs = _norm(path)
-  local cwd = _norm(vim.fn.getcwd())
+  local cwd = (ctx and ctx.cwd) or _canon_base(vim.fn.getcwd())
   if _under(abs, cwd) then return "workspace" end
-  local home = _norm(vim.fn.expand("~"))
+  local home = (ctx and ctx.home) or _canon_base(vim.fn.expand("~"))
   if home ~= "" and _under(abs, home) then return "user" end
   return "system"
 end
@@ -169,6 +182,8 @@ function M.build_lines(items, traces, audit, saved)
   local marks = {}
   local line_to_target = {}
   local line_to_trace = {} -- 行号 -> 越界留痕路径（`i` 查看详情；非审批目标）
+  -- 本次渲染复用一次 cwd/home 规范形式，避免逐文件重复 fs.canonical。
+  local lvl_ctx = { cwd = _canon_base(vim.fn.getcwd()), home = _canon_base(vim.fn.expand("~")) }
   lines[#lines + 1] = LEGEND
   lines[#lines + 1] = ""
   -- AI 审计状态（生成中 / 结论 / 失败 / 兜底说明）：结论先说安全/不安全；正式说明在各自文件行下方。
@@ -203,15 +218,45 @@ function M.build_lines(items, traces, audit, saved)
     s = s:gsub("^主机操作命令%s*[:：]%s*", "")
     return s
   end
+  -- 预计算索引：规范化键 -> 说明；以及各分隔处后缀 -> 说明（模型省略前缀时按后缀命中）。
+  -- 此前每条文件/命令都遍历全部 notes，待审与说明各数千时退化为 O(n²) 卡主线程。
+  local notes_norm, notes_suffix
+  if audit and audit.notes then
+    notes_norm, notes_suffix = {}, {}
+    for k, v in pairs(audit.notes) do
+      local kk = _norm_key(k)
+      if kk ~= "" then
+        if notes_norm[kk] == nil then notes_norm[kk] = v end
+        local start = 1
+        while true do
+          local seg = kk:sub(start)
+          if notes_suffix[seg] == nil then notes_suffix[seg] = v end
+          local slash = kk:find("/", start, true)
+          if not slash then break end
+          start = slash + 1
+        end
+      end
+    end
+  end
   local function _note_for(key)
     local notes = audit and audit.notes
     if not notes or not key or key == "" then return nil end
     if notes[key] then return notes[key] end
     local nk = _norm_key(key)
     if nk == "" then return nil end
-    for k, v in pairs(notes) do
-      local kk = _norm_key(k)
-      if kk ~= "" and (kk == nk or nk:sub(-#kk) == kk or kk:sub(-#nk) == nk) then return v end
+    if notes_norm and notes_norm[nk] then return notes_norm[nk] end
+    -- note 键是 nk 的后缀（模型带前缀）
+    if notes_suffix and notes_suffix[nk] then return notes_suffix[nk] end
+    -- nk 是 note 键的后缀（模型省略前缀）：沿分隔符逐级尝试
+    if notes_norm then
+      local start = 1
+      while true do
+        local slash = nk:find("/", start, true)
+        if not slash then break end
+        local seg = nk:sub(slash + 1)
+        if seg ~= "" and notes_norm[seg] then return notes_norm[seg] end
+        start = slash + 1
+      end
     end
     return nil
   end
@@ -322,7 +367,7 @@ function M.build_lines(items, traces, audit, saved)
       local text = "  " .. path .. suffix
       local ln = #lines + 1
       lines[#lines + 1] = text
-      marks[#marks + 1] = { line = ln, start_col = 2, end_col = 2 + #path, level = M.level_of(path) }
+      marks[#marks + 1] = { line = ln, start_col = 2, end_col = 2 + #path, level = M.level_of(path, lvl_ctx) }
       line_to_target[ln] = { change_set_id = item.change_set_id, path = path }
       _append_note(path)
     end
@@ -368,7 +413,7 @@ function M.build_lines(items, traces, audit, saved)
         local text = "  " .. path .. suffix
         local ln = #lines + 1
         lines[#lines + 1] = text
-        marks[#marks + 1] = { line = ln, start_col = 2, end_col = 2 + #path, level = M.level_of(path) }
+        marks[#marks + 1] = { line = ln, start_col = 2, end_col = 2 + #path, level = M.level_of(path, lvl_ctx) }
         line_to_target[ln] = { change_set_id = item.change_set_id, path = path, saved = true }
       end
       lines[#lines + 1] = ""
@@ -389,7 +434,7 @@ function M.build_lines(items, traces, audit, saved)
         local ln = #lines + 1
         lines[#lines + 1] = text
         local start_col = 2 + #tool + 3
-        marks[#marks + 1] = { line = ln, start_col = start_col, end_col = start_col + #path, level = M.level_of(path) }
+        marks[#marks + 1] = { line = ln, start_col = start_col, end_col = start_col + #path, level = M.level_of(path, lvl_ctx) }
         -- 该行不参与审批，仅登记留痕路径：`i` 查看详情（工具/类型/命令/时间）。
         line_to_trace[ln] = path
       end
