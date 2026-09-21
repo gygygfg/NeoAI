@@ -246,7 +246,7 @@ turn and mid-way through the tool loop follow this path).
 ## Appendix: Key Data Flow (Write Tool + Approval)
 
 ```
-1. The model returns edit_file(filepath, description, edits)
+1. The model returns edit_file(file_path, description, edits)
 2. _execute_single → tool_service.execute
 3. executor.execute:
    resolve_name → alias resolution → path expansion → schema validation

@@ -41,6 +41,21 @@ local function _bump_version()
   return state.version
 end
 
+--- 诊断埋点：仅在 `tools.sandbox.diagnostics.enabled = true` 时写 NeoAI 日志（不改变行为）。
+--- 用于排查暂存/捕获/物化的一致性问题（H1-H6）。
+--- @param fmt string
+--- @param ... any
+local function _diag(fmt, ...)
+  local ok, cfg = pcall(function()
+    return require("NeoAI.kernel.config_store").get("tools.sandbox.diagnostics")
+  end)
+  if not (ok and type(cfg) == "table" and cfg.enabled == true) then return end
+  local args = { ... }
+  pcall(function()
+    require("NeoAI.kernel.logger").info("[sandbox:candidate] " .. fmt, unpack(args))
+  end)
+end
+
 -- ========== 私有函数 ==========
 
 --- 取权限位（低 9 位）。st_mode 形如 0o100644；`% 512` 即 0o777 掩码。
@@ -670,9 +685,14 @@ end
 --- @param opts table|nil { force?: boolean } force=true 时忽略版本检查全量重物化
 ---   （用于 overlay upper 被清空后重新填充，如 LSP overlay 刷新）。
 function M.materialize_overlay(specs, opts)
-  if not specs or #specs == 0 then return end
+  if not specs or #specs == 0 then return {} end
   local force = opts and opts.force == true
+  -- 类型冲突（文件暂存物化到真实/overlay 中的目录，或反之）是视图损坏源：静默跳过会让
+  -- 命令/只读工具看到真实目录、而暂存视图认为它是文件，二者分裂。此处收集并返回，
+  -- 由调用方显式报错（H4）。
+  local conflicts = {}
   for real, entry in pairs(state.workspace) do
+    -- `.git` 内部也参与物化（对象先于指针的原子顺序在 apply 阶段保证；物化仅为沙箱视图）。
     local spec = _match_root(real, specs)
     if spec then
       -- 整机根（root="/"）时去掉开头的 "/"；其余根去掉 "<root>/" 前缀。
@@ -706,12 +726,13 @@ function M.materialize_overlay(specs, opts)
           if entry.mode then fs.chmod(dest, entry.mode) end
         elseif entry.staged and fs.exists(entry.staged) then
           -- 类型冲突防御：真实盘/overlay 中该路径是目录时，文件物化会把目录替换成文件，
-          -- 损坏沙箱视图一致性（后续 `ls dir/` 报 Not a directory）。显式跳过并告警，
-          -- 且**绝不删除目录**（旧兜底的 `delete dest rf` 正是损坏来源）。
+          -- 损坏沙箱视图一致性（后续 `ls dir/` 报 Not a directory）。此处收集冲突并返回，
+          -- 由调用方显式报错（H4）——**绝不删除目录**（旧兜底的 `delete dest rf` 正是损坏来源）。
           if vim.fn.isdirectory(real) == 1 or vim.fn.isdirectory(dest) == 1 then
+            conflicts[#conflicts + 1] = { real = real, dest = dest }
             pcall(function()
               require("NeoAI.kernel.logger").warn(
-                "[sandbox] 跳过类型冲突物化（目标为目录，拒绝文件覆盖）：%s", tostring(real))
+                "[sandbox] 类型冲突物化（目标为目录，拒绝文件覆盖）：%s", tostring(real))
             end)
           else
             local mat = state.materialized[base]
@@ -725,6 +746,7 @@ function M.materialize_overlay(specs, opts)
               local cur_ssig = (sstat and sstat.mtime) and string.format("%s:%s:%s:%s",
                 tostring(sstat.mtime.sec), tostring(sstat.mtime.nsec), tostring(sstat.size), tostring(sstat.mode)) or nil
               if entry.fresh_ssig and cur_ssig == entry.fresh_ssig and dstat and dstat.mtime then
+                _diag("materialize fresh-skip（假定 dest 已最新，不重写）real=%s dest=%s", tostring(real), tostring(dest))
                 local old = mat[real]
                 mat[real] = {
                   dest = dest,
@@ -820,6 +842,7 @@ function M.materialize_overlay(specs, opts)
       end
     end
   end
+  return conflicts
 end
 
 --- 文件签名（mtime.sec:mtime.nsec:size:mode），与物化记录的 `ssig` 格式一致。
@@ -869,8 +892,36 @@ end
 --- run_command 产生的改动（双向互通）。
 --- @param cand table 冻结候选
 --- @param opts table|nil { from_command?: boolean, package?: boolean 包/生成内容跳过 token 化 }
+--- 同步「视图同步条目」到工作区暂存（不产生发布候选）：命令还原暂存编辑后，暂存视图必须
+--- 回到命令结果，并撤销该路径上已存在的待审候选（净效果为无改动）。
+--- @param view_files table|nil
+--- @param opts table|nil { package?: boolean }
+local function _apply_view_files(view_files, opts)
+  if not view_files or #view_files == 0 then return end
+  opts = opts or {}
+  local secret = require("NeoAI.sandbox.secret")
+  local paths = {}
+  for _, f in ipairs(view_files) do
+    local ws = state.workspace[f.path]
+    if ws and ws.staged and not ws.deleted then
+      local content = f.content or ""
+      if not opts.package and _is_text_content(content) then
+        content = secret.tokenize(content, { entropy = secret.is_secret_path(f.path) })
+      end
+      fs.write_file(ws.staged, content)
+      if f.mode then fs.chmod(ws.staged, f.mode) end
+      ws.version = _bump_version()
+      paths[#paths + 1] = f.path
+    end
+  end
+  if #paths > 0 then
+    pcall(function() require("NeoAI.sandbox.review").supersede_by_paths(paths) end)
+  end
+end
+
 function M.merge_candidate(cand, opts)
   opts = opts or {}
+  _apply_view_files(cand.view_files, opts)
   for _, f in ipairs(cand.files or {}) do
     local staged = _workspace_path(f.path)
     state.staged_to_real[staged] = f.path
@@ -936,6 +987,14 @@ function M.merge_candidate_async(cand, opts)
       end
     end
   end
+  -- 视图同步条目同样需要 token 化后写入暂存（内容来自命令视图，可能含真实密钥）。
+  for _, f in ipairs(cand.view_files or {}) do
+    if _is_text_content(f.content) then
+      texts[#texts + 1] = f.content or ""
+      entropy_flags[#entropy_flags + 1] = secret.is_secret_path(f.path)
+      text_files[#text_files + 1] = f
+    end
+  end
   --- 写暂存副本：写入（含内容）经线程池批量完成，主线程只登记映射与 fresh 签名。
   --- 删除/建目录仍在主线程（数量少、无内容）。
   --- @param tokenized table|nil 与 text_files 等长的 token 化结果；nil/空表示不做 token 化
@@ -948,6 +1007,7 @@ function M.merge_candidate_async(cand, opts)
     local writes = {}
     local blob_jobs = {}
     for _, f in ipairs(files) do
+      _diag("merge action=%s real=%s", tostring(f.action), tostring(f.path))
       local staged = _workspace_path(f.path)
       state.staged_to_real[staged] = f.path
       if f.action == "create" or f.action == "modify" then
@@ -1009,6 +1069,24 @@ function M.merge_candidate_async(cand, opts)
         if path and sig and sig ~= "" then sigs[path] = sig end
       end
       return sigs
+    end
+    -- 视图同步条目（命令还原暂存编辑）：写入暂存副本并撤销对应待审候选，不产生发布候选。
+    do
+      local view_paths = {}
+      for _, f in ipairs(cand.view_files or {}) do
+        local ws = state.workspace[f.path]
+        if ws and ws.staged and not ws.deleted then
+          local content = tok_of[f] or (f.content or "")
+          fs.ensure_dir(vim.fn.fnamemodify(ws.staged, ":h"))
+          fs.write_file(ws.staged, content)
+          if f.mode then fs.chmod(ws.staged, f.mode) end
+          ws.version = _bump_version()
+          view_paths[#view_paths + 1] = f.path
+        end
+      end
+      if #view_paths > 0 then
+        pcall(function() require("NeoAI.sandbox.review").supersede_by_paths(view_paths) end)
+      end
     end
     if #writes == 0 and #blob_jobs == 0 then return async.resolve(cand) end
     local work = require("NeoAI.utils.work")
@@ -1224,11 +1302,17 @@ local function _capture_entry(attempt, real_root, staged, child_rel, prefetch, c
       if ws.deleted then
         -- 之前标记删除：仅当命令**重新创建**了普通文件时才视为改动（whiteout 设备节点仍跳过）。
         local sstat = vim.uv.fs_stat(staged)
-        if not (sstat and sstat.type == "file") then return end
+        if not (sstat and sstat.type == "file") then
+          _diag("capture ws-skip（删除态未被重建）real=%s", tostring(real))
+          return
+        end
       elseif ws.staged and fs.exists(ws.staged) then
         local before = _read(ws.staged)
         local after = _read(staged)
-        if before ~= nil and before == after then return end
+        if before ~= nil and before == after then
+          _diag("capture ws-skip（内容等于暂存，命令未改动）real=%s", tostring(real))
+          return
+        end
       end
     end
   end
@@ -1332,7 +1416,8 @@ function M.capture_overlay(attempt_id, real_root, upper_root)
     while true do
       local name, t = vim.uv.fs_scandir_next(handle)
       if not name then break end
-      -- 会话 shell 状态 bind 挂载点（无特征名）不视为命令的文件改动
+      -- 会话 shell 状态 bind 挂载点（无特征名）不视为命令的文件改动。
+      -- `.git` 内部**不在此排除**：改为在冻结阶段按 `git_path_class` 原子分类（对象先于指针）。
       if name ~= ".wh..wh..opq" and name ~= require("NeoAI.sandbox.conceal").session_basename() then
         -- opaque 目录标记（.wh..wh..opq）仅表示上层目录内容被替换，跳过不产生候选
         local whiteout, real_name = _is_whiteout(name, t)
@@ -1459,6 +1544,7 @@ local function _capture_worker(upper_root, real_root, session_basename, expected
     while true do
       local name, t = vim.uv.fs_scandir_next(handle)
       if not name then break end
+      -- `.git` 内部不在此排除：冻结阶段按 `git_path_class` 原子分类（对象先于指针）。
       if name ~= ".wh..wh..opq" and name ~= session_basename then
         local whiteout, real_name = false, name
         if name:sub(1, 4) == ".wh." then
@@ -1793,6 +1879,15 @@ function M.capture_overlay_async(attempt_id, real_root, upper_root)
           remember(real, staged, rec[10])
         end
       end
+      do
+        local counts = {}
+        for _, rec in ipairs(records) do
+          counts[rec[3]] = (counts[rec[3]] or 0) + 1
+        end
+        local parts = {}
+        for k, v in pairs(counts) do parts[#parts + 1] = k .. "=" .. v end
+        _diag("capture root=%s records=%d %s", tostring(root), #records, table.concat(parts, " "))
+      end
       _apply_reconcile(recons)
     end
     if #need == 0 then
@@ -1899,22 +1994,31 @@ local function _filter_unpublishable(files, attempt)
   local is_pkg = _is_package_candidate(files, attempt)
   local volatile = is_pkg and _volatile_matcher() or nil
   local out = {}
-  local dropped = { masked = 0, volatile = 0, masked_paths = {}, volatile_paths = {} }
+  local dropped = { masked = 0, volatile = 0, git = 0, masked_paths = {}, volatile_paths = {}, git_paths = {} }
   for _, f in ipairs(files) do
-    if runtime.is_masked_path(f.path, unmask) then
+    local gc = runtime.git_path_class(f.path)
+    local is_obj_del = gc == "object" and (f.action == "delete" or f.action == "rmdir")
+    if gc == "transient" or gc == "other" or is_obj_del then
+      -- `.git` 瞬态（*.lock/gc.log）、配置类（config/hooks/info）与对象删除（gc/prune 的
+      -- 剪枝）不纳入候选：对象删除绝不应用（保留多余对象无害，删除被引用的对象才会悬空）。
+      dropped.git = dropped.git + 1
+      if #dropped.git_paths < 20 then dropped.git_paths[#dropped.git_paths + 1] = f.path end
+    elseif runtime.is_masked_path(f.path, unmask) then
       dropped.masked = dropped.masked + 1
       if #dropped.masked_paths < 20 then dropped.masked_paths[#dropped.masked_paths + 1] = f.path end
     elseif volatile and volatile(f.path) then
       dropped.volatile = dropped.volatile + 1
       if #dropped.volatile_paths < 20 then dropped.volatile_paths[#dropped.volatile_paths + 1] = f.path end
     else
+      f.git_class = gc -- nil 表示普通文件；object/pointer 供原子排序与发布语义
       out[#out + 1] = f
     end
   end
-  if dropped.masked > 0 or dropped.volatile > 0 then
+  if dropped.masked > 0 or dropped.volatile > 0 or dropped.git > 0 then
     pcall(function()
       require("NeoAI.kernel.logger").warn(
-        "[sandbox] 冻结时跳过不可发布文件：遮蔽 %d、易变缓存 %d", dropped.masked, dropped.volatile)
+        "[sandbox] 冻结时跳过不可发布文件：遮蔽 %d、易变缓存 %d、.git 内部 %d",
+        dropped.masked, dropped.volatile, dropped.git)
     end)
   end
   return out, dropped
@@ -1931,6 +2035,10 @@ function M.finish(attempt_id, prefetch)
     return nil
   end
   local files = {}
+  -- 视图同步条目：命令结果等于真实基线（对真实盘无净改动），但**不等于当前工作区暂存**——
+  -- 即命令把 AI 的暂存编辑还原了（如 `git checkout -- <file>`）。这类改动不产生发布候选，
+  -- 但必须同步暂存视图，否则下次物化会用旧暂存内容覆盖命令结果（表现为「命令写入被回滚」）。
+  local view_files = {}
   local cap = _max_file_bytes()
   for real, entry in pairs(attempt.mapping) do
     local pf = prefetch and prefetch[entry.staged]
@@ -2029,6 +2137,18 @@ function M.finish(attempt_id, prefetch)
           mode = (action == "create" or action == "modify") and entry.mode or nil,
           content = (action == "create" or action == "modify") and content or nil,
         }
+      elseif after_hash then
+        -- 对真实盘无净改动；但若工作区暂存仍是旧内容，说明命令还原了暂存编辑，需同步视图。
+        local ws = state.workspace[real]
+        if ws and not ws.deleted and ws.staged and fs.exists(ws.staged) then
+          local cur = _read(ws.staged)
+          local cur_hash = cur and _sha(cur)
+          if cur_hash and cur_hash ~= after_hash then
+            view_files[#view_files + 1] = {
+              path = real, action = "modify", content = content, mode = entry.mode,
+            }
+          end
+        end
       end
     end
   end
@@ -2043,11 +2163,13 @@ function M.finish(attempt_id, prefetch)
   local candidate = {
     candidate_digest = _sha(require("NeoAI.utils.json").encode(manifest)),
     files = files,
+    -- 仅用于同步工作区暂存视图（不发布、不入待审）；见 finish 中的说明。
+    view_files = (#view_files > 0) and view_files or nil,
     created_at = os.time(),
     command_id = attempt.attempt.command_id,
     attempt_id = attempt_id,
     effect = attempt.attempt.effect,
-    dropped = (dropped and (dropped.masked > 0 or dropped.volatile > 0)) and dropped or nil,
+    dropped = (dropped and (dropped.masked > 0 or dropped.volatile > 0 or dropped.git > 0)) and dropped or nil,
   }
   return candidate
 end
@@ -2178,11 +2300,22 @@ end
 --- @param files table
 --- @return table 排序后的副本
 local function _apply_order(files)
+  local runtime = require("NeoAI.sandbox.runtime")
   local out = {}
   for i, f in ipairs(files) do out[i] = f end
   local function is_del(f) return f.action == "delete" or f.action == "rmdir" end
   local function is_ancestor(a, b) return #a < #b and b:sub(1, #a + 1) == a .. "/" end
+  -- 原子顺序：git 对象库（不可变/可累加）→ 普通文件 → git 指针（index/refs/HEAD）。
+  -- 对象先于指针，保证任何被写入的索引/refs 所引用的对象都已存在（绝不悬空）。
+  local function rank(f)
+    local gc = f.git_class or runtime.git_path_class(f.path)
+    if gc == "object" then return 0 end
+    if gc == "pointer" then return 2 end
+    return 1
+  end
   table.sort(out, function(a, b)
+    local ra, rb = rank(a), rank(b)
+    if ra ~= rb then return ra < rb end
     local da, db = is_del(a), is_del(b)
     if da ~= db then return da end
     if is_ancestor(a.path, b.path) then return not da end
@@ -2215,29 +2348,38 @@ function M.publish(candidate, opts)
     if masked then
       return { ok = false, state = "FAILED", reason = "SANDBOX_MASKED_TARGET: " .. tostring(masked) }
     end
+    -- `.git` 瞬态/配置类绝不发布（对象/指针按原子顺序发布，见 _apply_order）。
+    local gc = runtime.git_path_class(canonical)
+    if gc == "transient" or gc == "other" then
+      return { ok = false, state = "FAILED", reason = "SANDBOX_GIT_INTERNAL: " .. tostring(canonical) }
+    end
   end
-  -- 冲突预检：任一文件真实状态偏离基线则整体拒绝
+  -- 冲突预检：任一文件真实状态偏离基线则整体拒绝。
+  -- 例外：git 对象库（内容寻址、不可变、可累加）不做 CAS——写前已存在即幂等满足。
   for _, f in ipairs(candidate.files or {}) do
-    local stat = vim.uv.fs_stat(f.path)
-    local exists = stat ~= nil
-    if f.action == "create" or f.action == "mkdir" then
-      if exists then
-        return { ok = false, state = "CONFLICT", reason = "TARGET_ALREADY_EXISTS: " .. f.path }
-      end
-    else
-      if not exists then
-        return { ok = false, state = "CONFLICT", reason = "TARGET_MISSING: " .. f.path }
-      end
-      if stat.type == "file" then
-        if f.before_sig then
-          -- 超大文件：用 stat 签名做 CAS（不读取数百 MB 内容）。
-          if _stat_sig(stat) ~= f.before_sig then
-            return { ok = false, state = "CONFLICT", reason = "BASELINE_CHANGED: " .. f.path }
-          end
-        else
-          local cur = _read(f.path)
-          if _sha(cur) ~= f.before_hash then
-            return { ok = false, state = "CONFLICT", reason = "BASELINE_CHANGED: " .. f.path }
+    local gc = f.git_class or runtime.git_path_class(f.path)
+    if gc ~= "object" then
+      local stat = vim.uv.fs_stat(f.path)
+      local exists = stat ~= nil
+      if f.action == "create" or f.action == "mkdir" then
+        if exists then
+          return { ok = false, state = "CONFLICT", reason = "TARGET_ALREADY_EXISTS: " .. f.path }
+        end
+      else
+        if not exists then
+          return { ok = false, state = "CONFLICT", reason = "TARGET_MISSING: " .. f.path }
+        end
+        if stat.type == "file" then
+          if f.before_sig then
+            -- 超大文件：用 stat 签名做 CAS（不读取数百 MB 内容）。
+            if _stat_sig(stat) ~= f.before_sig then
+              return { ok = false, state = "CONFLICT", reason = "BASELINE_CHANGED: " .. f.path }
+            end
+          else
+            local cur = _read(f.path)
+            if _sha(cur) ~= f.before_hash then
+              return { ok = false, state = "CONFLICT", reason = "BASELINE_CHANGED: " .. f.path }
+            end
           end
         end
       end
@@ -2267,6 +2409,11 @@ function M.publish(candidate, opts)
       action = "delete"
     elseif f.action == "rmdir" then
       action = "rmdir"
+    end
+    local gc = f.git_class or runtime.git_path_class(f.path)
+    -- git 对象库内容寻址：目标已存在即内容相同（幂等），跳过写入。
+    if action == "write" and gc == "object" and vim.uv.fs_stat(f.path) then
+      action = nil
     end
     if action then
       local res

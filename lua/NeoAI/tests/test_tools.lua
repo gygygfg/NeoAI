@@ -25,7 +25,7 @@ tests.suite("tools", function(_, it)
     local registry = require("NeoAI.tools.registry")
     registry.reset()
     local helpers = require("NeoAI.tools.builtin.tool_helpers")
-    registry.register(helpers.define_tool("test_read", "读取", { type = "object", properties = { filepath = { type = "string" } }, required = { "filepath" } }, function() end, { category = "file" }))
+    registry.register(helpers.define_tool("test_read", "读取", { type = "object", properties = { file_path = { type = "string" } }, required = { "file_path" } }, function() end, { category = "file" }))
     registry.register(helpers.define_tool("test_write", "写入", { type = "object", properties = {}, required = {} }, function() end, { category = "file" }))
     t.true_(registry.has("test_read"))
     t.eq(2, registry.count())
@@ -49,13 +49,13 @@ tests.suite("tools", function(_, it)
 
   it("validator 参数校验", function(t)
     local validator = require("NeoAI.tools.validator")
-    local params = { type = "object", properties = { filepath = { type = "string" }, max = { type = "integer" } }, required = { "filepath" } }
+    local params = { type = "object", properties = { file_path = { type = "string" }, max = { type = "integer" } }, required = { "file_path" } }
     local ok, err = validator.validate_parameters(params, {})
     t.false_(ok)
-    t.matches("filepath", err or "")
-    local ok2 = validator.validate_parameters(params, { filepath = "a.txt", max = 5 })
+    t.matches("file_path", err or "")
+    local ok2 = validator.validate_parameters(params, { file_path = "a.txt", max = 5 })
     t.true_(ok2)
-    local ok3 = validator.validate_parameters(params, { filepath = "a.txt", max = "x" })
+    local ok3 = validator.validate_parameters(params, { file_path = "a.txt", max = "x" })
     t.false_(ok3)
   end)
 
@@ -88,7 +88,7 @@ tests.suite("tools", function(_, it)
     registry.register_many(file_ops.get_tools())
     local tools = require("NeoAI.tools")
     local done = false
-    tools.execute("read_file", { filepath = "/tmp/neoai_test_file.txt" }, {}):then_(function()
+    tools.execute("read_file", { file_path = "/tmp/neoai_test_file.txt" }, {}):then_(function()
       t.true_(false, "缺 description 不应成功")
       done = true
     end, function(e)
@@ -102,11 +102,11 @@ tests.suite("tools", function(_, it)
   it("validator 审批决策", function(t)
     local validator = require("NeoAI.tools.validator")
     local cfg = { auto_allow = false, allowed_directories = {}, allowed_param_groups = {} }
-    t.true_(validator.check_approval("x", { filepath = "/tmp/f" }, cfg, "prompt"))
+    t.true_(validator.check_approval("x", { file_path = "/tmp/f" }, cfg, "prompt"))
     t.false_(validator.check_approval("x", {}, cfg, "auto_allow"))
     t.true_(validator.check_approval("x", {}, cfg, "strict"))
     local cfg_allow = { auto_allow = true, allowed_directories = {}, allowed_param_groups = {} }
-    t.false_(validator.check_approval("x", { filepath = "/tmp/f" }, cfg_allow, "prompt"))
+    t.false_(validator.check_approval("x", { file_path = "/tmp/f" }, cfg_allow, "prompt"))
   end)
 
   it("validator 路径/参数安全", function(t)
@@ -126,11 +126,11 @@ tests.suite("tools", function(_, it)
   it("validator 允许目录的子目录自动放行（文件工具无命令组）", function(t)
     local validator = require("NeoAI.tools.validator")
     local cfg = { auto_allow = false, allowed_directories = { "/tmp/ws" }, allowed_param_groups = {} }
-    t.false_(validator.check_approval("edit_file", { filepath = "/tmp/ws/sub/a.lua" }, cfg, "prompt"),
+    t.false_(validator.check_approval("edit_file", { file_path = "/tmp/ws/sub/a.lua" }, cfg, "prompt"),
       "允许目录的子目录不应再要求审批")
-    t.false_(validator.check_approval("edit_file", { filepath = "/tmp/ws/deep/nested/b.lua" }, cfg, "prompt"),
+    t.false_(validator.check_approval("edit_file", { file_path = "/tmp/ws/deep/nested/b.lua" }, cfg, "prompt"),
       "多级子目录同样放行")
-    t.true_(validator.check_approval("edit_file", { filepath = "/tmp/other/a.lua" }, cfg, "prompt"),
+    t.true_(validator.check_approval("edit_file", { file_path = "/tmp/other/a.lua" }, cfg, "prompt"),
       "允许目录之外仍应审批")
   end)
 
@@ -142,7 +142,7 @@ tests.suite("tools", function(_, it)
     local cfg = registry.get_approval_config("edit_file")
     t.true_(vim.tbl_contains(cfg.allowed_directories, "/tmp/neoai_ws"), "全局工作区目录应并入工具配置")
     local validator = require("NeoAI.tools.validator")
-    t.false_(validator.check_approval("edit_file", { filepath = "/tmp/neoai_ws/deep/x.lua" }, cfg, "prompt"),
+    t.false_(validator.check_approval("edit_file", { file_path = "/tmp/neoai_ws/deep/x.lua" }, cfg, "prompt"),
       "配置的工作区目录的子目录应自动放行")
     config_store.load(saved)
   end)
@@ -228,7 +228,7 @@ tests.suite("tools", function(_, it)
     local fs = require("NeoAI.utils.fs")
     local path = "/tmp/neoai_test_file.txt"
     fs.write_file(path, "line1\nline2\n")
-    tools.execute("read_file", { filepath = path, description = "读取测试文件" }, {}):then_(function(r)
+    tools.execute("read_file", { file_path = path, description = "读取测试文件" }, {}):then_(function(r)
       t.matches("line1", r)
       print("  read_file done")
     end)
@@ -243,7 +243,7 @@ tests.suite("tools", function(_, it)
     t.not_nil(def, "应注册 edit_file")
     local path = vim.fn.tempname() .. ".txt"
     local done, err = false, nil
-    def.func({ filepath = path, content = "hello\n", description = "t" }, function()
+    def.func({ file_path = path, content = "hello\n", description = "t" }, function()
       done = true
     end, function(e)
       err, done = e, true
@@ -265,7 +265,7 @@ tests.suite("tools", function(_, it)
     local content = "local x = 1\n"
     fs.write_file(path, content)
     local done = false
-    executor.execute("read_file", { filepath = path, description = "读取小文件" }, {}):then_(function(r)
+    executor.execute("read_file", { file_path = path, description = "读取小文件" }, {}):then_(function(r)
       t.eq(content, r, "小文件应原样返回全文")
       done = true
     end, function(e)
@@ -295,7 +295,7 @@ tests.suite("tools", function(_, it)
     t.true_(#content > 500, "测试文件应超过 500 字符")
     fs.write_file(path, content)
     local done = false
-    executor.execute("read_file", { filepath = path, description = "读取大文件" }, {}):then_(function(r)
+    executor.execute("read_file", { file_path = path, description = "读取大文件" }, {}):then_(function(r)
       t.matches("语法树节点大纲", r, "应返回语法树大纲")
       t.matches("function_declaration", r, "大纲应含函数节点类型")
       t.matches("start_line/end_line", r, "应提示改用行范围读取")
@@ -327,7 +327,7 @@ tests.suite("tools", function(_, it)
     t.true_(#content > 500, "测试文件应超过 500 字符")
     fs.write_file(path, content)
     local done = false
-    executor.execute("read_file", { filepath = path, description = "读取大日志文件" }, {}):then_(function(r)
+    executor.execute("read_file", { file_path = path, description = "读取大日志文件" }, {}):then_(function(r)
       t.matches("预览", r, "无 parser 时应返回预览")
       t.matches("log line 1 ", r, "预览应含开头内容")
       t.eq(nil, r:find("LOG_TAIL_MARKER", 1, true), "不应回传末尾内容")
@@ -356,7 +356,7 @@ tests.suite("tools", function(_, it)
     fs.write_file(path, table.concat(parts, "\n") .. "\n")
     local done = false
     executor.execute("read_file", {
-      filepath = path,
+      file_path = path,
       start_line = 2,
       end_line = 4,
       description = "读取大文件指定行",
@@ -387,7 +387,7 @@ tests.suite("tools", function(_, it)
     parts[#parts + 1] = "HUGE_TAIL_MARKER"
     fs.write_file(path, table.concat(parts, "\n") .. "\n")
     local done = false
-    executor.execute("read_file", { filepath = path, description = "读取超大文件" }, {}):then_(function(r)
+    executor.execute("read_file", { file_path = path, description = "读取超大文件" }, {}):then_(function(r)
       t.matches("文件过大", r, "应提示文件过大")
       t.matches("start_line/end_line", r, "应提示改用行范围")
       t.eq(nil, r:find("HUGE_TAIL_MARKER", 1, true), "不应整读回传全文")
@@ -408,7 +408,7 @@ tests.suite("tools", function(_, it)
     local file_ops = require("NeoAI.tools.builtin.file_ops")
     registry.register_many(file_ops.get_tools())
     local done = false
-    executor.execute("read_file", { filepath = "/tmp", description = "读取目录" }, {}):then_(function(r)
+    executor.execute("read_file", { file_path = "/tmp", description = "读取目录" }, {}):then_(function(r)
       done = true
       t.true_(false, "目录不应成功: " .. tostring(r))
     end, function(e)
@@ -512,7 +512,7 @@ tests.suite("tools", function(_, it)
       t.matches("sub/", s, "应列出沙箱新建子目录")
       t.matches("one%.txt", s, "应列出沙箱新建文件")
       t.matches("two%.txt", s, "应列出沙箱新建文件")
-      return executor.execute("file_exists", { filepath = base, description = "查目录" }, {})
+      return executor.execute("file_exists", { file_path = base, description = "查目录" }, {})
     end):then_(function(r)
       t.eq("true", tostring(r), "沙箱新建目录应视为存在")
       return executor.execute("search_files", { path = base, query = "two", description = "搜索" }, {})
@@ -544,12 +544,12 @@ tests.suite("tools", function(_, it)
     local dir = vim.fn.tempname()
     vim.fn.delete(dir, "rf")
     local done = false
-    executor.execute("create_directory", { filepath = dir, description = "建目录" }, {}):then_(function()
+    executor.execute("create_directory", { file_path = dir, description = "建目录" }, {}):then_(function()
       return executor.execute("list_files", { path = dir, description = "列目录" }, {})
     end):then_(function(r)
       t.eq("(空目录)", tostring(r), "沙箱新建目录应可被 list_files 看到")
       t.true_(not tostring(r):find("sessions", 1, true), "列举结果不应泄露沙箱内部路径")
-      return executor.execute("delete_file", { filepath = dir .. "/missing.txt", description = "删不存在" }, {})
+      return executor.execute("delete_file", { file_path = dir .. "/missing.txt", description = "删不存在" }, {})
     end):then_(function(r)
       t.true_(false, "删除不存在文件不应成功: " .. tostring(r))
       done = true
@@ -599,6 +599,7 @@ tests.suite("tools", function(_, it)
     local async = require("NeoAI.utils.async")
     tools.execute("ls", { path = "/tmp", description = "列出临时目录" }, {})
       :then_(function() print("  ls done") end)
+    -- 故意使用旧参数名 filepath：验证 executor 的旧名兼容别名仍然生效。
     tools.execute("file_exists", { filepath = "/tmp/neoai_test_file.txt", description = "检查测试文件是否存在" }, {})
       :then_(function(r)
         t.eq("true", r)
@@ -616,7 +617,7 @@ tests.suite("tools", function(_, it)
 
   it("executor edit_file write", function(t)
     local tools = require("NeoAI.tools")
-    tools.execute("edit_file", { filepath = "/tmp/neoai_test_edit.txt", mode = "write", content = "hello", description = "写入测试文件" }, {})
+    tools.execute("edit_file", { file_path = "/tmp/neoai_test_edit.txt", mode = "write", content = "hello", description = "写入测试文件" }, {})
       :then_(function(r)
         t.matches("写入", r)
         print("  edit done")
@@ -636,7 +637,7 @@ tests.suite("tools", function(_, it)
     fs.write_file(path, "local t = OLD_MARKER\n")
     local done = false
     executor.execute("edit_file", {
-      filepath = path,
+      file_path = path,
       description = "替换含百分号的格式串",
       edits = { { old_text = "OLD_MARKER", new_text = 'string.format("n=%d s=%s", 1, "x")' } },
     }, {}):then_(function()
@@ -753,7 +754,7 @@ tests.suite("tools", function(_, it)
     local ran = false
     registry.register(helpers.define_tool(
       "ws_tool", "工作目录工具",
-      { type = "object", properties = { filepath = { type = "string" } }, required = { "filepath" } },
+      { type = "object", properties = { file_path = { type = "string" } }, required = { "file_path" } },
       function(args, on_success) ran = true; on_success("ok") end,
       { category = "agent" }
     ))
@@ -763,7 +764,7 @@ tests.suite("tools", function(_, it)
     })
     local target = "/tmp/neoai_ws_dir/sub/file.txt"
     local done, err = false, nil
-    tool_service.execute({ id = "ws-agent" }, "ws_tool", { filepath = target, description = "加入工作目录测试" }, nil, {})
+    tool_service.execute({ id = "ws-agent" }, "ws_tool", { file_path = target, description = "加入工作目录测试" }, nil, {})
       :then_(function() done = true end, function(e) err = e; done = true end)
     vim.wait(2000, function() return done end)
     t.true_(done, "应完成")
@@ -940,7 +941,7 @@ tests.suite("tools", function(_, it)
     fs.write_file(path, "local function f() end\nf()\n")
     t.eq(-1, vim.fn.bufnr(path), "文件应尚未打开")
     local done = false
-    executor.execute("parse_file", { filepath = path, description = "解析测试文件" }, {}):then_(function(r)
+    executor.execute("parse_file", { file_path = path, description = "解析测试文件" }, {}):then_(function(r)
       t.matches("root", r)
       done = true
     end, function(e)
@@ -961,7 +962,7 @@ tests.suite("tools", function(_, it)
     local path = "/tmp/neoai_unknown_ext.zzz"
     fs.write_file(path, "hello world\n")
     local done = false
-    executor.execute("parse_file", { filepath = path, description = "解析未知类型文件" }, {}):then_(function()
+    executor.execute("parse_file", { file_path = path, description = "解析未知类型文件" }, {}):then_(function()
       done = true
     end, function(e)
       done = true
@@ -980,7 +981,7 @@ tests.suite("tools", function(_, it)
     local path = "/tmp/neoai_bg_lsp.txt"
     fs.write_file(path, "hello\n")
     local done = false
-    executor.execute("lsp_hover", { filepath = path, line = 1, col = 1, description = "测试悬停信息" }):then_(function(r)
+    executor.execute("lsp_hover", { file_path = path, line = 1, col = 1, description = "测试悬停信息" }):then_(function(r)
       done = true
       t.true_(false, "无客户端不应成功: " .. tostring(r))
     end, function(e)
@@ -1028,8 +1029,8 @@ tests.suite("tools", function(_, it)
     end
 
     local r1, r2
-    diag.func({ filepath = path, description = "t" }, function(r) r1 = r end, function(e) r1 = "ERR:" .. tostring(e) end)
-    diag.func({ filepath = path, description = "t" }, function(r) r2 = r end, function(e) r2 = "ERR:" .. tostring(e) end)
+    diag.func({ file_path = path, description = "t" }, function(r) r1 = r end, function(e) r1 = "ERR:" .. tostring(e) end)
+    diag.func({ file_path = path, description = "t" }, function(r) r2 = r end, function(e) r2 = "ERR:" .. tostring(e) end)
     t.true_(vim.wait(2000, function() return r1 and r2 end, 10), "应返回诊断")
     vim.lsp.get_clients = orig_clients
 
@@ -1072,7 +1073,7 @@ tests.suite("tools", function(_, it)
     end
 
     local result, done
-    diag.func({ filepath = path, description = "t" }, function(r) result = r; done = true end,
+    diag.func({ file_path = path, description = "t" }, function(r) result = r; done = true end,
       function(e) result = "ERR:" .. tostring(e); done = true end)
     -- 工具应先触发 didChange，再等待服务器发布诊断
     t.true_(lines_fired >= 1, "应触发一次 didChange（内容不变的缓冲区重设）")
@@ -1136,7 +1137,7 @@ tests.suite("tools", function(_, it)
     local path = "/tmp/neoai_bg_delete.lua"
     fs.write_file(path, "local keep = 1\nlocal remove = 2\n")
     local done = false
-    executor.execute("delete_node", { filepath = path, line = 2, col = 1, description = "删除测试节点" }):then_(function(r)
+    executor.execute("delete_node", { file_path = path, line = 2, col = 1, description = "删除测试节点" }):then_(function(r)
       t.matches("已删除", r)
       done = true
     end, function(e)
@@ -1168,7 +1169,7 @@ tests.suite("tools", function(_, it)
     -- delete_node 定位 removed 节点并删除：此前基于过期 buffer 回写会把 count=100 和
     -- print 行一并覆盖回 42/丢失（编辑全丢）
     local done = false
-    executor.execute("delete_node", { filepath = path, line = 2, col = 1, description = "删除测试节点" }):then_(function()
+    executor.execute("delete_node", { file_path = path, line = 2, col = 1, description = "删除测试节点" }):then_(function()
       done = true
     end, function(e)
       t.true_(false, "不应失败: " .. tostring(e))
@@ -1195,7 +1196,7 @@ tests.suite("tools", function(_, it)
     fs.write_file(path, "local obj = tbl.field\nprint('hi')\n")
     local done = false
     executor.execute("query_tree", {
-      filepath = path,
+      file_path = path,
       query = "(dot_index_expression table: (identifier) @obj field: (identifier) @field)",
       description = "查询测试语法树",
     }):then_(function(r)
@@ -1221,7 +1222,7 @@ tests.suite("tools", function(_, it)
     fs.write_file(path, "local obj = tbl.field\n")
     local done = false
     executor.execute("query_tree", {
-      filepath = path,
+      file_path = path,
       query = "(dot_index_expression object: (identifier) @obj field: (identifier) @field)",
       description = "验证非法字段名纠错",
     }):then_(function(r)
@@ -1258,7 +1259,7 @@ tests.suite("tools", function(_, it)
       return { [1] = 1 }
     end
     local done = false
-    executor.execute("lsp_type_definition", { filepath = path, line = 5, col = 9, description = "测试类型定义" }):then_(function(r)
+    executor.execute("lsp_type_definition", { file_path = path, line = 5, col = 9, description = "测试类型定义" }):then_(function(r)
       t.true_(false, "不应成功: " .. tostring(r))
       done = true
     end, function(e)
@@ -1358,7 +1359,7 @@ tests.suite("tools", function(_, it)
       return { [1] = 1 }
     end
     local done = false
-    executor.execute("lsp_type_definition", { filepath = path, line = 1, col = 1, description = "测试类型定义" }):then_(function(r)
+    executor.execute("lsp_type_definition", { file_path = path, line = 1, col = 1, description = "测试类型定义" }):then_(function(r)
       t.matches("/tmp/x.lua:1:6", r)
       done = true
     end, function(e)
@@ -1392,7 +1393,7 @@ tests.suite("tools", function(_, it)
       return { [1] = 1 }
     end
     local done = false
-    executor.execute("lsp_type_definition", { filepath = path, line = 1, col = 1, description = "测试类型定义" }):then_(function(r)
+    executor.execute("lsp_type_definition", { file_path = path, line = 1, col = 1, description = "测试类型定义" }):then_(function(r)
       t.true_(false, "畸形结果不应成功: " .. tostring(r))
       done = true
     end, function(e)
@@ -1425,7 +1426,7 @@ tests.suite("tools", function(_, it)
     vim.lsp.buf_request = function() return {} end
     vim.lsp.get_clients = function() return { { id = 1, name = "copilot" } } end
     local done = false
-    executor.execute("lsp_declaration", { filepath = path, line = 1, col = 1, description = "测试声明位置" }):then_(function(r)
+    executor.execute("lsp_declaration", { file_path = path, line = 1, col = 1, description = "测试声明位置" }):then_(function(r)
       t.true_(false, "不支持请求不应成功: " .. tostring(r))
       done = true
     end, function(e)
@@ -1437,7 +1438,7 @@ tests.suite("tools", function(_, it)
     -- 完全无客户端：仍报"无 LSP 客户端"
     done = false
     vim.lsp.get_clients = function() return {} end
-    executor.execute("lsp_declaration", { filepath = path, line = 1, col = 1, description = "测试声明位置" }):then_(function(r)
+    executor.execute("lsp_declaration", { file_path = path, line = 1, col = 1, description = "测试声明位置" }):then_(function(r)
       t.true_(false, "无客户端不应成功: " .. tostring(r))
       done = true
     end, function(e)

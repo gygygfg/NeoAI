@@ -13,7 +13,7 @@ local M = {}
 --- @return number|nil bufnr
 --- @return string|nil err 失败原因（供工具给出可操作提示）
 local function _ensure_parsed(filepath)
-  if not filepath or filepath == "" then return nil, "缺少 filepath" end
+  if not filepath or filepath == "" then return nil, "缺少 file_path" end
   local bufnr = helpers.ensure_buffer(filepath)
   if not bufnr then return nil, "文件不存在或无法打开: " .. filepath end
   -- 磁盘直写工具（edit_file 等）只改磁盘不改已加载 buffer，导致内存与磁盘不一致；
@@ -110,14 +110,14 @@ local tree_tools = {}
 
 tree_tools.parse_file = helpers.define_tool(
   "parse_file",
-  "解析文件语法树并返回根节点概览。filepath 必填。",
+  "解析文件语法树并返回根节点概览。file_path 必填。",
   {
     type = "object",
-    properties = { filepath = { type = "string" } },
-    required = { "filepath" },
+    properties = { file_path = { type = "string" } },
+    required = { "file_path" },
   },
   function(args, on_success, on_error)
-    local bufnr, err = _ensure_parsed(args.filepath)
+    local bufnr, err = _ensure_parsed(args.file_path)
     if not bufnr then on_error(err or "无法解析文件") return end
     local root = _root(bufnr)
     if not root then on_error("无法获取语法树（解析失败）") return end
@@ -128,14 +128,14 @@ tree_tools.parse_file = helpers.define_tool(
 
 tree_tools.get_node_at_position = helpers.define_tool(
   "get_node_at_position",
-  "获取指定位置（行/列）的语法树节点。filepath/line/col 必填（1-based）。",
+  "获取指定位置（行/列）的语法树节点。file_path/line/col 必填（1-based）。",
   {
     type = "object",
-    properties = { filepath = { type = "string" }, line = { type = "integer" }, col = { type = "integer" } },
-    required = { "filepath", "line", "col" },
+    properties = { file_path = { type = "string" }, line = { type = "integer" }, col = { type = "integer" } },
+    required = { "file_path", "line", "col" },
   },
   function(args, on_success, on_error)
-    local bufnr = _ensure_parsed(args.filepath)
+    local bufnr = _ensure_parsed(args.file_path)
     if not bufnr then on_error("无法解析文件") return end
     local node = _node_at(bufnr, (args.line or 1) - 1, (args.col or 1) - 1)
     if not node then on_error("位置无节点") return end
@@ -147,14 +147,14 @@ tree_tools.get_node_at_position = helpers.define_tool(
 
 tree_tools.get_node_type = helpers.define_tool(
   "get_node_type",
-  "获取节点类型。filepath/line/col 必填。",
+  "获取节点类型。file_path/line/col 必填。",
   {
     type = "object",
-    properties = { filepath = { type = "string" }, line = { type = "integer" }, col = { type = "integer" } },
-    required = { "filepath", "line", "col" },
+    properties = { file_path = { type = "string" }, line = { type = "integer" }, col = { type = "integer" } },
+    required = { "file_path", "line", "col" },
   },
   function(args, on_success, on_error)
-    local bufnr = _ensure_parsed(args.filepath)
+    local bufnr = _ensure_parsed(args.file_path)
     if not bufnr then on_error("无法解析文件") return end
     local node = _node_at(bufnr, (args.line or 1) - 1, (args.col or 1) - 1)
     if not node then on_error("位置无节点") return end
@@ -165,14 +165,14 @@ tree_tools.get_node_type = helpers.define_tool(
 
 tree_tools.get_node_range = helpers.define_tool(
   "get_node_range",
-  "获取节点范围。filepath/line/col 必填。",
+  "获取节点范围。file_path/line/col 必填。",
   {
     type = "object",
-    properties = { filepath = { type = "string" }, line = { type = "integer" }, col = { type = "integer" } },
-    required = { "filepath", "line", "col" },
+    properties = { file_path = { type = "string" }, line = { type = "integer" }, col = { type = "integer" } },
+    required = { "file_path", "line", "col" },
   },
   function(args, on_success, on_error)
-    local bufnr = _ensure_parsed(args.filepath)
+    local bufnr = _ensure_parsed(args.file_path)
     if not bufnr then on_error("无法解析文件") return end
     local node = _node_at(bufnr, (args.line or 1) - 1, (args.col or 1) - 1)
     if not node then on_error("位置无节点") return end
@@ -184,14 +184,14 @@ tree_tools.get_node_range = helpers.define_tool(
 
 tree_tools.is_named_node = helpers.define_tool(
   "is_named_node",
-  "检查节点是否为命名节点。filepath/line/col 必填。",
+  "检查节点是否为命名节点。file_path/line/col 必填。",
   {
     type = "object",
-    properties = { filepath = { type = "string" }, line = { type = "integer" }, col = { type = "integer" } },
-    required = { "filepath", "line", "col" },
+    properties = { file_path = { type = "string" }, line = { type = "integer" }, col = { type = "integer" } },
+    required = { "file_path", "line", "col" },
   },
   function(args, on_success, on_error)
-    local bufnr = _ensure_parsed(args.filepath)
+    local bufnr = _ensure_parsed(args.file_path)
     if not bufnr then on_error("无法解析文件") return end
     local node = _node_at(bufnr, (args.line or 1) - 1, (args.col or 1) - 1)
     if not node then on_error("位置无节点") return end
@@ -202,14 +202,14 @@ tree_tools.is_named_node = helpers.define_tool(
 
 tree_tools.get_parent_node = helpers.define_tool(
   "get_parent_node",
-  "获取节点父节点。filepath/line/col 必填。",
+  "获取节点父节点。file_path/line/col 必填。",
   {
     type = "object",
-    properties = { filepath = { type = "string" }, line = { type = "integer" }, col = { type = "integer" } },
-    required = { "filepath", "line", "col" },
+    properties = { file_path = { type = "string" }, line = { type = "integer" }, col = { type = "integer" } },
+    required = { "file_path", "line", "col" },
   },
   function(args, on_success, on_error)
-    local bufnr = _ensure_parsed(args.filepath)
+    local bufnr = _ensure_parsed(args.file_path)
     if not bufnr then on_error("无法解析文件") return end
     local node = _node_at(bufnr, (args.line or 1) - 1, (args.col or 1) - 1)
     if not node then on_error("位置无节点") return end
@@ -223,14 +223,14 @@ tree_tools.get_parent_node = helpers.define_tool(
 
 tree_tools.get_child_nodes = helpers.define_tool(
   "get_child_nodes",
-  "获取节点子节点列表。filepath/line/col 必填。",
+  "获取节点子节点列表。file_path/line/col 必填。",
   {
     type = "object",
-    properties = { filepath = { type = "string" }, line = { type = "integer" }, col = { type = "integer" } },
-    required = { "filepath", "line", "col" },
+    properties = { file_path = { type = "string" }, line = { type = "integer" }, col = { type = "integer" } },
+    required = { "file_path", "line", "col" },
   },
   function(args, on_success, on_error)
-    local bufnr = _ensure_parsed(args.filepath)
+    local bufnr = _ensure_parsed(args.file_path)
     if not bufnr then on_error("无法解析文件") return end
     local node = _node_at(bufnr, (args.line or 1) - 1, (args.col or 1) - 1)
     if not node then on_error("位置无节点") return end
@@ -249,14 +249,14 @@ tree_tools.get_child_nodes = helpers.define_tool(
 
 tree_tools.get_node_code = helpers.define_tool(
   "get_node_code",
-  "获取节点源代码。filepath/line/col 必填。",
+  "获取节点源代码。file_path/line/col 必填。",
   {
     type = "object",
-    properties = { filepath = { type = "string" }, line = { type = "integer" }, col = { type = "integer" } },
-    required = { "filepath", "line", "col" },
+    properties = { file_path = { type = "string" }, line = { type = "integer" }, col = { type = "integer" } },
+    required = { "file_path", "line", "col" },
   },
   function(args, on_success, on_error)
-    local bufnr = _ensure_parsed(args.filepath)
+    local bufnr = _ensure_parsed(args.file_path)
     if not bufnr then on_error("无法解析文件") return end
     local node = _node_at(bufnr, (args.line or 1) - 1, (args.col or 1) - 1)
     if not node then on_error("位置无节点") return end
@@ -267,7 +267,7 @@ tree_tools.get_node_code = helpers.define_tool(
 
 tree_tools.query_tree = helpers.define_tool(
   "query_tree",
-  "用 treesitter query 查询节点。filepath 必填，query 必填。"
+  "用 treesitter query 查询节点。file_path 必填，query 必填。"
     .. "字段名（field:）必须是该语言语法对该节点类型定义的有效字段，"
     .. "错误示例(Lua): (dot_index_expression object: ...) 的 object 是错的，应为 table；"
     .. "(function_call function: ...) 的 function 是错的，function_call 无该字段。"
@@ -276,11 +276,11 @@ tree_tools.query_tree = helpers.define_tool(
     .. "(local_variable_declarator name: (identifier) @name value: (expression) @val)。",
   {
     type = "object",
-    properties = { filepath = { type = "string" }, query = { type = "string" } },
-    required = { "filepath", "query" },
+    properties = { file_path = { type = "string" }, query = { type = "string" } },
+    required = { "file_path", "query" },
   },
   function(args, on_success, on_error)
-    local bufnr = _ensure_parsed(args.filepath)
+    local bufnr = _ensure_parsed(args.file_path)
     if not bufnr then on_error("无法解析文件（缺少 parser 或文件未打开）") return end
     local lang = vim.treesitter.language.get_lang(vim.bo[bufnr].filetype) or vim.bo[bufnr].filetype
     local ok, query = pcall(vim.treesitter.query.parse, lang, args.query)
@@ -300,14 +300,14 @@ tree_tools.query_tree = helpers.define_tool(
 
 tree_tools.delete_node = helpers.define_tool(
   "delete_node",
-  "删除语法树节点。filepath/line/col 必填。",
+  "删除语法树节点。file_path/line/col 必填。",
   {
     type = "object",
-    properties = { filepath = { type = "string" }, line = { type = "integer" }, col = { type = "integer" } },
-    required = { "filepath", "line", "col" },
+    properties = { file_path = { type = "string" }, line = { type = "integer" }, col = { type = "integer" } },
+    required = { "file_path", "line", "col" },
   },
   function(args, on_success, on_error)
-    local bufnr = _ensure_parsed(args.filepath)
+    local bufnr = _ensure_parsed(args.file_path)
     if not bufnr then on_error("无法解析文件") return end
     local node = _node_at(bufnr, (args.line or 1) - 1, (args.col or 1) - 1)
     if not node then on_error("位置无节点") return end

@@ -102,15 +102,16 @@ end
 --- @return table 规范化后的参数
 local function _normalize_arguments(tool_name, args)
   if type(args) ~= "table" then
-    -- 简单字符串参数：转成 filepath（针对 read_file 等）
+    -- 简单字符串参数：转成 file_path（针对 read_file 等）
     if tool_name == "read_file" or tool_name == "edit_file" or tool_name == "delete_file" then
-      return { filepath = tostring(args) }
+      return { file_path = tostring(args) }
     end
     return {}
   end
   local normalized = vim.deepcopy(args)
   local aliases = {
-    cmd = "command", file = "filepath", files = "filepath",
+    cmd = "command", file = "file_path", files = "file_path",
+    filepath = "file_path", -- 旧参数名兼容：filepath → file_path
     start = "start_line", ["end"] = "end_line",
     dir = "dirs", dir_path = "dirs", dirs = "dirs",
     -- 注意：不要给 new_text/text 起 content 别名——那会把「局部替换」误判成「整文件覆写」，
@@ -424,7 +425,7 @@ function M.execute(tool_name, raw_args, ctx)
   local tool = registry.get(resolved)
 
   -- 参数规范化：MCP 工具跳过别名改写与路径展开。
-  -- 远端工具的 schema 由服务器权威定义，本地 alias（file→filepath 等）会破坏参数名，
+  -- 远端工具的 schema 由服务器权威定义，本地 alias（file→file_path 等）会破坏参数名，
   -- 且服务器会校验 arguments 与 inputSchema（未知参数报错）。路径语义也归属服务器。
   local is_mcp = tool and tool.source == "mcp"
   local args = raw_args
@@ -479,6 +480,7 @@ function M.execute(tool_name, raw_args, ctx)
   if mode ~= "async" and validator.check_approval(resolved, args, approval_config, mode) then
     needs_approval = true
   end
+
 
   -- 可暂停计时器：tool_loop 在调用前已创建并注入 ctx.timer（用于展示活跃耗时）。
   -- 直接调用（无 tool_loop，如测试）时自建一个，仅用于超时。

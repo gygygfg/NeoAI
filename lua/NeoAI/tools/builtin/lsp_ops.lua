@@ -44,6 +44,20 @@ local function _client_for(filepath)
   return clients[1]
 end
 
+--- 该 buffer 对应的真实文件是否有未发布的沙箱暂存副本（有则 LSP 必须走沙箱视图，
+--- 不得回退编辑器客户端读真实视图）。按文件判定，避免因其它文件的暂存而误伤。
+--- @param bufnr number|nil
+--- @return boolean
+local function _sandbox_staged_for(bufnr)
+  if not bufnr or type(bufnr) ~= "number" or not vim.api.nvim_buf_is_valid(bufnr) then return false end
+  local realpath = vim.api.nvim_buf_get_name(bufnr)
+  if realpath == "" then return false end
+  local ok, cand = pcall(require, "NeoAI.sandbox.candidate")
+  if not ok or not cand or type(cand.read_path) ~= "function" then return false end
+  local ok2, staged = pcall(cand.read_path, realpath)
+  return ok2 and staged ~= nil
+end
+
 --- 找一个支持指定方法的 LSP 客户端（优先 AI 沙箱克隆，回退编辑器客户端）
 --- @param method string
 --- @param bufnr number|nil
@@ -54,6 +68,12 @@ local function _client_supporting(method, bufnr)
     local ok2, clone = pcall(sandbox.client_supporting, method, bufnr)
     if ok2 and clone then
       return clone
+    end
+    -- 沙箱 LSP 已启用且存在未发布暂存改动时，禁止回退编辑器客户端：编辑器客户端基于真实
+    -- 磁盘/buffer 回答，会与 read_file/git_diff 的暂存视图分裂（R3）。此时返回 nil，由工具
+    -- 给出明确「沙箱 LSP 不可用」而非静默读真实视图。
+    if type(sandbox.enabled) == "function" and sandbox.enabled() and _sandbox_staged_for(bufnr) then
+      return nil
     end
   end
   local clients = bufnr and vim.lsp.get_clients({ bufnr = bufnr }) or vim.lsp.get_clients()
@@ -77,17 +97,29 @@ end
 local function _request(method, params, target)
   -- 优先走 AI 专用沙箱 LSP 克隆（独立进程，读暂存内容，诊断不外溢）。
   -- 未启用 / overlay 不可用 / 无克隆时回退到编辑器客户端（原行为）。
+  local sandbox_blocked = false
   if type(target) == "number" then
     local ok, sandbox = pcall(require, "NeoAI.sandbox.lsp")
     if ok and sandbox then
       local ok2, clone = pcall(sandbox.client_supporting, method, target)
       if ok2 and clone then
         target = clone
+      elseif type(sandbox.enabled) == "function" and sandbox.enabled() and _sandbox_staged_for(target) then
+        -- 该文件有暂存改动但沙箱克隆不可用：禁止经编辑器客户端读真实视图（R3）。
+        sandbox_blocked = true
       end
     end
   end
 
   local d = async.Deferred.new()
+  if sandbox_blocked then
+    d:reject({
+      kind = "lsp",
+      message = "沙箱 LSP 不可用（overlay 不可用或 server 无法在沙箱内启动）；"
+        .. "存在未发布暂存改动，拒绝回退真实视图以避免与只读工具不一致",
+    })
+    return d
+  end
   local called = false
   local timeout_ms = config_store.get("tools.lsp.timeout_ms") or 10000
 
@@ -164,7 +196,7 @@ end
 --- @param args table
 --- @return number bufnr, number line, number col
 local function _position(args)
-  local bufnr = _bufnr(args.filepath)
+  local bufnr = _bufnr(args.file_path)
   if not bufnr then
     return nil
   end
@@ -333,11 +365,11 @@ local lsp_tools = {}
 --- 悬停信息
 lsp_tools.lsp_hover = helpers.define_tool(
   "lsp_hover",
-  "获取光标位置悬停信息。filepath/line/col 可选（默认当前）。",
+  "获取光标位置悬停信息。file_path/line/col 可选（默认当前）。",
   {
     type = "object",
     properties = {
-      filepath = { type = "string" },
+      file_path = { type = "string" },
       line = { type = "integer" },
       col = { type = "integer" },
     },
@@ -382,10 +414,10 @@ lsp_tools.lsp_hover = helpers.define_tool(
 --- 定义
 lsp_tools.lsp_definition = helpers.define_tool(
   "lsp_definition",
-  "获取符号定义位置。filepath/line/col 可选。",
+  "获取符号定义位置。file_path/line/col 可选。",
   {
     type = "object",
-    properties = { filepath = { type = "string" }, line = { type = "integer" }, col = { type = "integer" } },
+    properties = { file_path = { type = "string" }, line = { type = "integer" }, col = { type = "integer" } },
     required = {},
   },
   function(args, on_success, on_error)
@@ -426,10 +458,10 @@ lsp_tools.lsp_definition = helpers.define_tool(
 --- 引用
 lsp_tools.lsp_references = helpers.define_tool(
   "lsp_references",
-  "查找符号引用位置。filepath/line/col 可选。",
+  "查找符号引用位置。file_path/line/col 可选。",
   {
     type = "object",
-    properties = { filepath = { type = "string" }, line = { type = "integer" }, col = { type = "integer" } },
+    properties = { file_path = { type = "string" }, line = { type = "integer" }, col = { type = "integer" } },
     required = {},
   },
   function(args, on_success, on_error)
@@ -476,14 +508,14 @@ lsp_tools.lsp_references = helpers.define_tool(
 --- 文档符号
 lsp_tools.lsp_document_symbols = helpers.define_tool(
   "lsp_document_symbols",
-  "获取文档内符号列表。filepath 可选。",
+  "获取文档内符号列表。file_path 可选。",
   {
     type = "object",
-    properties = { filepath = { type = "string" } },
+    properties = { file_path = { type = "string" } },
     required = {},
   },
   function(args, on_success, on_error)
-    local bufnr = _bufnr(args.filepath)
+    local bufnr = _bufnr(args.file_path)
     if not bufnr then
       on_error("无法找到文件 buffer")
       return
@@ -550,10 +582,10 @@ lsp_tools.lsp_workspace_symbols = helpers.define_tool(
 --- 诊断信息
 lsp_tools.lsp_diagnostics = helpers.define_tool("lsp_diagnostics", "重新获取文件诊断信息。", {
   type = "object",
-  properties = { filepath = { type = "string" } },
+  properties = { file_path = { type = "string" } },
   required = {},
 }, function(args, on_success, on_error)
-  local bufnr = _bufnr(args.filepath)
+  local bufnr = _bufnr(args.file_path)
   if not bufnr then
     on_error("无法找到文件 buffer")
     return
@@ -572,7 +604,7 @@ lsp_tools.lsp_diagnostics = helpers.define_tool("lsp_diagnostics", "重新获取
     local out = {}
     for _, diag in ipairs(diagnostics) do
       local sev = vim.diagnostic.severity[diag.severity] or "?"
-      out[#out + 1] = string.format("%s:%d %s: %s", args.filepath or "(当前)", diag.lnum + 1, sev, diag.message)
+      out[#out + 1] = string.format("%s:%d %s: %s", args.file_path or "(当前)", diag.lnum + 1, sev, diag.message)
     end
     on_success(table.concat(out, "\n"))
   end
@@ -624,12 +656,12 @@ lsp_tools.lsp_diagnostics = helpers.define_tool("lsp_diagnostics", "重新获取
 end, { category = "lsp" })
 
 --- 客户端信息
-lsp_tools.lsp_client_info = helpers.define_tool("lsp_client_info", "获取 LSP 客户端信息。filepath 可选。", {
+lsp_tools.lsp_client_info = helpers.define_tool("lsp_client_info", "获取 LSP 客户端信息。file_path 可选。", {
   type = "object",
-  properties = { filepath = { type = "string" } },
+  properties = { file_path = { type = "string" } },
   required = {},
 }, function(args, on_success)
-  local bufnr = _bufnr(args.filepath)
+  local bufnr = _bufnr(args.file_path)
   local clients = vim.lsp.get_clients()
   local out = {}
   for _, c in ipairs(clients) do
@@ -646,10 +678,10 @@ end, { category = "lsp" })
 --- 代码操作
 lsp_tools.lsp_code_action = helpers.define_tool(
   "lsp_code_action",
-  "获取代码操作建议。filepath/line/col 可选。",
+  "获取代码操作建议。file_path/line/col 可选。",
   {
     type = "object",
-    properties = { filepath = { type = "string" }, line = { type = "integer" }, col = { type = "integer" } },
+    properties = { file_path = { type = "string" }, line = { type = "integer" }, col = { type = "integer" } },
     required = {},
   },
   function(args, on_success, on_error)
@@ -683,10 +715,10 @@ lsp_tools.lsp_code_action = helpers.define_tool(
 )
 
 --- 重命名
-lsp_tools.lsp_rename = helpers.define_tool("lsp_rename", "重命名符号。filepath/line/col/new_name 必填。", {
+lsp_tools.lsp_rename = helpers.define_tool("lsp_rename", "重命名符号。file_path/line/col/new_name 必填。", {
   type = "object",
   properties = {
-    filepath = { type = "string" },
+    file_path = { type = "string" },
     line = { type = "integer" },
     col = { type = "integer" },
     new_name = { type = "string" },
@@ -747,12 +779,12 @@ lsp_tools.lsp_rename = helpers.define_tool("lsp_rename", "重命名符号。file
 end, { category = "lsp", approval = { auto_allow = false } })
 
 --- 格式化
-lsp_tools.lsp_format = helpers.define_tool("lsp_format", "格式化文档。filepath 可选。", {
+lsp_tools.lsp_format = helpers.define_tool("lsp_format", "格式化文档。file_path 可选。", {
   type = "object",
-  properties = { filepath = { type = "string" } },
+  properties = { file_path = { type = "string" } },
   required = {},
 }, function(args, on_success, on_error)
-  local bufnr = _bufnr(args.filepath)
+  local bufnr = _bufnr(args.file_path)
   if not bufnr then
     on_error("无法找到文件 buffer")
     return
@@ -793,10 +825,10 @@ end, { category = "lsp", approval = { auto_allow = false } })
 --- 签名帮助
 lsp_tools.lsp_signature_help = helpers.define_tool(
   "lsp_signature_help",
-  "获取函数签名。filepath/line/col 可选。",
+  "获取函数签名。file_path/line/col 可选。",
   {
     type = "object",
-    properties = { filepath = { type = "string" }, line = { type = "integer" }, col = { type = "integer" } },
+    properties = { file_path = { type = "string" }, line = { type = "integer" }, col = { type = "integer" } },
     required = {},
   },
   function(args, on_success, on_error)
@@ -829,9 +861,9 @@ lsp_tools.lsp_signature_help = helpers.define_tool(
 )
 
 --- 补全
-lsp_tools.lsp_completion = helpers.define_tool("lsp_completion", "获取补全建议。filepath/line/col 可选。", {
+lsp_tools.lsp_completion = helpers.define_tool("lsp_completion", "获取补全建议。file_path/line/col 可选。", {
   type = "object",
-  properties = { filepath = { type = "string" }, line = { type = "integer" }, col = { type = "integer" } },
+  properties = { file_path = { type = "string" }, line = { type = "integer" }, col = { type = "integer" } },
   required = {},
 }, function(args, on_success, on_error)
   local bufnr, line, col = _position(args)
@@ -861,10 +893,10 @@ end, { category = "lsp" })
 --- 类型定义
 lsp_tools.lsp_type_definition = helpers.define_tool(
   "lsp_type_definition",
-  "获取符号类型定义。filepath/line/col 可选。",
+  "获取符号类型定义。file_path/line/col 可选。",
   {
     type = "object",
-    properties = { filepath = { type = "string" }, line = { type = "integer" }, col = { type = "integer" } },
+    properties = { file_path = { type = "string" }, line = { type = "integer" }, col = { type = "integer" } },
     required = {},
   },
   function(args, on_success, on_error)
@@ -905,10 +937,10 @@ lsp_tools.lsp_type_definition = helpers.define_tool(
 --- 声明
 lsp_tools.lsp_declaration = helpers.define_tool(
   "lsp_declaration",
-  "获取符号声明位置。filepath/line/col 可选。",
+  "获取符号声明位置。file_path/line/col 可选。",
   {
     type = "object",
-    properties = { filepath = { type = "string" }, line = { type = "integer" }, col = { type = "integer" } },
+    properties = { file_path = { type = "string" }, line = { type = "integer" }, col = { type = "integer" } },
     required = {},
   },
   function(args, on_success, on_error)
@@ -949,10 +981,10 @@ lsp_tools.lsp_declaration = helpers.define_tool(
 --- 实现
 lsp_tools.lsp_implementation = helpers.define_tool(
   "lsp_implementation",
-  "获取符号实现位置。filepath/line/col 可选。",
+  "获取符号实现位置。file_path/line/col 可选。",
   {
     type = "object",
-    properties = { filepath = { type = "string" }, line = { type = "integer" }, col = { type = "integer" } },
+    properties = { file_path = { type = "string" }, line = { type = "integer" }, col = { type = "integer" } },
     required = {},
   },
   function(args, on_success, on_error)

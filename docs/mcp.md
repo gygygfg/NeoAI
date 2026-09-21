@@ -61,7 +61,7 @@ MCP 工具调用按 `sandbox.approval.default`（默认 `review`）进入**待�
 | `mcp__<server>__list_prompts`    | 列出提示模板（只读） |
 | `mcp__<server>__get_prompt`      | 获取模板内容，供拼接上下文 |
 
-> 执行器对 `source == "mcp"` 的工具**跳过参数别名改写与路径展开**（`file→filepath`、`~` 展开等），
+> 执行器对 `source == "mcp"` 的工具**跳过参数别名改写与路径展开**（`file→file_path`、`~` 展开等），
 > 否则会破坏远端 schema、被服务器判为未知参数。
 
 ## 4. 工具时序：预缓存 + 动态更新 + 失败驱动

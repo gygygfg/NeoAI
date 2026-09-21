@@ -209,7 +209,13 @@
       整单元，其余文件保留待审）、`i` 临时关闭审批窗并打开该条目的**修改 diff**
       预览（`q`/`<Esc>` 关闭后自动返回审批窗并恢复光标）；在**越界访问留痕**行按 `i` 则打开
       该路径的**访问详情**（逐次列出工具 / 类型 / 命令 / 时间，非审批目标）、`u` **撤销/重做保存**、
-      `r` 刷新、`q`/`<Esc>` 关闭。
+      `q`/`<Esc>` 关闭。**窗口打开期间订阅沙箱广播事件自动刷新**（待审入队/应用/拒绝/撤销、
+      越界留痕、主机操作等变化即时重绘，同一 tick 内多次事件合并为一次重绘），无需手动刷新。
+      **「已应用」区默认折叠**：整区收起（标题行按 `za`/`zo` 展开），展开后每条仍各自收起
+      （先展开区、再展开条目才看到文件列表），刷新后重新收起；待审普通条目与越界留痕区不折叠，
+      便于逐条审阅；**待审 git 原子组「头行显示、其余折叠」**（头行保留整组审批入口与路径/风险
+      高亮，其后的提示与文件列表默认收起，`za`/`zo` 展开），避免一次 git 操作涉及大量 `.git`
+      内部文件时刷屏。
       聊天主窗口内可按 `<leader>ap` 直接触发（`keymaps.chat.sandbox_review`）。
      - **显示已保存 / 撤销保存**：应用（保存）时保留每个文件的**原文件快照**（真实文件
        应用前的内容），审批界面底部「已应用（已保存/已撤销，u 撤销/重做保存）」区展示已发布到真实
@@ -363,18 +369,42 @@
     沙箱内新建的**整棵目录树**（`run_command`/`create_directory` 创建、真实磁盘尚不存在）也会被
     合成列举：`list_files` 补齐各级父目录条目、`file_exists` 对祖先目录返回 true，
     避免 AI 看到“文件已创建但目录不存在”的不一致视图而尝试绕过沙箱。
+    合并匹配按 `utils.fs.canonical`（解析符号链接、折叠 `..`）规范化，与暂存键**同口径**，
+    故经符号链接 / `..` 写法访问同一文件不会落回真实视图；`search_files` 对**暂存删除的目录**
+    整体丢弃其下真实结果，避免 grep 与 `git_diff`（overlay 视图）矛盾。
   - treesitter 工具（`parse_file` / `query_tree` / `get_node_*`）读暂存副本：暂存路径
     **保留真实 basename（含扩展名）**，故 filetype/parser 正常；`delete_node` 等写类工具
     经同一暂存副本修改后写回暂存（不二次暂存）。
   - LSP 工具与 `run_command`/git 读工具共享同一暂存视图：`tools.sandbox.lsp_overlay.enabled`
     默认开启，AI 克隆出的 LSP server 进程被放进 bwrap + overlay（见下节），其磁盘读取即看到
-    暂存内容（不再读真实磁盘）；overlay 不可用时自动跳过，回退编辑器客户端。写类 LSP 工具
-    （`lsp_rename`/`lsp_format`）的落盘始终经 `persist_buffer` 重定向到暂存层。
+    暂存内容（不再读真实磁盘）。取用克隆前会把**暂存内容**作为 `didChange` 推给克隆（校正文档
+    文本，**不改动用户 buffer**），使 LSP 与文件工具对同一路径给出同一视图；当文件存在未发布
+    暂存改动而沙箱克隆不可用时**拒绝回退编辑器客户端**（返回明确「沙箱 LSP 不可用」而非静默
+    读真实视图）。写类 LSP 工具（`lsp_rename`/`lsp_format`）的落盘始终经 `persist_buffer`
+    重定向到暂存层。
   - **git 读工具（`git_status` / `git_diff` / `git_log` / `git_branch` / `git_file_history` /
     `git_commit_detail`）**：在沙箱命名空间内执行（与 `run_command` 同一 overlay），磁盘读取
     看到的是**暂存内容**而非真实工作区；命令以 `GIT_OPTIONAL_LOCKS=0` 运行避免写 index，
     且作为只读进程工具**不捕获候选**、不入待审队列。真实工作区不会被 git 读操作改动。
-    （`git_rollback` 为写操作，仍按宿主执行并经审批。）
+  - **`.git` 变更原子暂存进审批悬浮窗**：`.git` 是「索引↔对象库↔refs」强耦合数据库——索引只
+    记录 blob 哈希、真正内容在 `.git/objects/**`。逐文件任意顺序暂存/发布可能「存了索引丢了
+    对象」而产生悬空引用（`fatal: unable to read <blob>`，即 git 索引损坏）。因此对 `.git`
+    做**原子化分类 + 有序应用**：
+    - 冻结阶段按 `runtime.git_path_class` 分类：`object`（`.git/objects/**`，内容寻址、不可变、
+      可累加）、`pointer`（index/HEAD/refs/logs/packed-refs 等）、`transient`（`*.lock`/`gc.log`）、
+      `other`（config/hooks/info）。`transient`/`other` 与**对象删除**（gc/prune 剪枝）不纳入候选。
+    - 应用顺序固定为 **对象 → 普通文件 → 指针**（`_apply_order`）：任何被写入的索引/refs 所引用
+      的对象都已存在，绝不悬空；对象库已存在时按内容寻址幂等跳过，不做 CAS。因此 `git_add` /
+      `git_commit` / `git_stash` / `git_restore` / `git_rollback` 的 `.git` 改动与工作区改动一起
+      进入审批悬浮窗，用户确认后原子应用（`SANDBOX_GIT_INTERNAL` 仅兜底拒绝瞬态/配置类目标）。
+    - 这些 git 变更工具在**沙箱内**执行（`effect=process`，看到暂存工作区），改动冻结为候选、
+      dry_run 下不改真实 `.git`。`run_command` 中的 git **变更**子命令被守卫拒绝
+      （`SANDBOX_GIT_MUTATION_VIA_COMMAND`，`sandbox/git_guard.lua`），须改用上述专用工具。
+    - **审批悬浮窗整组呈现**：涉及 `.git` 对象/指针的候选被标记为原子组
+      （`review` 的 `atomic_group="git"`），界面渲染为「git 操作 · N 个文件 · 原子整组」，
+      头行与各文件行都映射到**整组**——`<CR>` 通过、`d` 丢弃均作用于整组，禁止逐文件选择性
+      应用/丢弃（`apply`/`reject_file` 也强制整组），避免只写索引或只写对象导致损坏。
+    - 文件写入工具（`edit_file` 等）以 `.git` 为目标仍直接拒绝（AI 不应直接改仓库内部）。
 - **buffer 写盘工具**（`delete_node` / `lsp_rename` / `lsp_format`）：
   `tool_helpers.persist_buffer` 在沙箱激活时把 `:write!` 重定向到暂存层。**只读不改盘**：
   仅当写类工具**显式**修改过 buffer（`mark_edited`）时才回写；`ensure_buffer` 加载、
@@ -423,6 +453,12 @@
     文件**：与当前工作区暂存内容一致（或已标记删除）的物化文件不产生候选，避免只读命令
     （`ls`/`cat`/`git status` 等）把 AI 的暂存编辑重复捕获为 `run_command` 候选并取代原
     `edit_file` 候选——否则拒绝该只读命令会连带失效暂存编辑，表现为「已允许的修改被回滚」。
+    反向情形（命令**还原**了 AI 的暂存编辑，如 `git checkout -- <file>`）结果等于真实基线、
+    对真实盘无净改动，本不产生发布候选；此时单独记录为 `view_files`，同步暂存视图并撤销该路径
+    的待审候选，否则下次物化会用旧暂存内容覆盖命令结果，表现为「命令写入被回滚」。
+  - **物化类型冲突显式报错**：暂存文件的目标在真实盘/overlay 中是目录（或反之）时，物化会损坏
+    视图一致性，故返回 `SANDBOX_MATERIALIZE_TYPE_CONFLICT` 拒绝执行（`run_command`、工具子进程、
+    长驻服务与 LSP overlay 一致），不再静默跳过。
   - **权限位保留**：候选记录文件权限（`mode`），物化进 overlay 与 CAS 发布时按原权限写回
     （`write_file_atomic` 的 mkstemp 默认 0600，会剥离可执行位，导致 venv/bin 脚本失效）；
     新建文件用常规默认 0644，不强制 0600。
@@ -550,8 +586,9 @@ hostop 提案并在宿主 replay。本门面让**独立**的 `systemctl`/`journa
 ### AI 专用沙箱 LSP（默认开启）
 
 - 开关：`tools.sandbox.lsp_overlay.enabled`（默认 true）。仅 `bwrap` 后端且工作区根可挂载
-  overlay 时生效；不满足条件自动跳过，AI 工具回退编辑器客户端，不影响正常使用。设为 false
-  可关闭（AI 工具改读真实磁盘）。
+  overlay 时生效。无未发布暂存改动时，不满足条件自动跳过、AI 工具回退编辑器客户端，不影响
+  正常使用；但**存在暂存改动时禁止回退**（否则读真实视图，与文件工具分裂），工具明确报
+  「沙箱 LSP 不可用」。设为 false 可关闭（AI 工具改读真实磁盘）。
 - 隔离范围：**只影响 AI 的 `lsp_*` 工具**。不再全局包装 `vim.lsp.rpc.start`，编辑器自身的
   LSP 进程照常读写真实磁盘；AI 工具调用时按需克隆编辑器同名 server（客户端名加
   `@neoai-sandbox` 后缀），只有克隆体走沙箱命名空间与暂存层。
@@ -572,7 +609,9 @@ hostop 提案并在宿主 replay。本门面让**独立**的 `systemctl`/`journa
   回退编辑器诊断。
 - **工具侧 buffer 一致性**：`lsp_*` 工具在后台加载文件后，用暂存内容同步该后台 buffer
   （`tool_helpers.sync_buffer_from_sandbox`），使 didOpen/didChange 文本与 overlay 磁盘视图一致；
-  用户已打开的 buffer 不覆盖（沙箱改动不外泄到编辑器）。
+  用户已打开的 buffer 不覆盖（沙箱改动不外泄到编辑器）。对**用户已打开**的文件，则在取用克隆前
+  把暂存内容作为 `didChange` 直接推给克隆（`sandbox.lsp`，版本号取 `max(changedtick, 上次推送)+1`
+  保证单调），使克隆文档文本 = 暂存视图，而用户 buffer 保持不变。
 - 一致性刷新：每次 LSP 工具调用前、以及克隆 server 启动时，`sandbox.lsp.refresh()` 会用当前
   暂存重新物化**全部覆盖根**的 upper（先清空再写入），使克隆 server 即时看到最新未发布改动。
 - 隔离与缓存：克隆 server 的缓存/状态目录（`stdpath(cache|data|state)`、`~/.cache`、`~/.local/*`、

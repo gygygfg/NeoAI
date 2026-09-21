@@ -134,7 +134,7 @@ tests.suite("observer", function(_, it)
   it("观测到的密钥文件访问驱动 UI 告警行（优先于命令解析）", function(t)
     local ml = require("NeoAI.ui.components.message_list")
     local line = ml.helpers.secret_warning_line(
-      { name = "read_file", arguments = '{"filepath":"/tmp/plain.txt"}' },
+      { name = "read_file", arguments = '{"file_path":"/tmp/plain.txt"}' },
       { role = "tool", content = "ok", secret_paths = { "/root/.ssh/id_rsa" } })
     t.not_nil(line, "观测到密钥访问应产生告警行")
     t.matches("观测到密钥文件", line)

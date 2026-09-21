@@ -170,7 +170,13 @@ function M.refresh(cwd)
   if not specs then return nil end
   _wipe_upper(specs)
   -- upper 已被清空：强制全量重物化（否则版本未变的暂存项会被跳过，LSP 视图看不到改动）。
-  require("NeoAI.sandbox.candidate").materialize_overlay(specs, { force = true })
+  local conflicts = require("NeoAI.sandbox.candidate").materialize_overlay(specs, { force = true })
+  if conflicts and #conflicts > 0 then
+    -- 类型冲突无法安全物化：拒绝启用沙箱 LSP（避免与只读工具视图分裂），回退调用方处理。
+    require("NeoAI.kernel.logger").warn(
+      "[sandbox] LSP 物化类型冲突，跳过沙箱 LSP：%s", tostring(conflicts[1] and conflicts[1].real))
+    return nil
+  end
   return specs
 end
 
@@ -238,6 +244,43 @@ local function _clone_cfg(ec)
   }
 end
 
+--- 已推送暂存文本记录：`clone_id\0uri` -> { text, version }。避免重复推送同一内容。
+local pushed_text = {}
+--- 每克隆的已推送版本号（保证 didChange version 单调递增，覆盖 Neovim 自身的 changedtick）。
+local pushed_version = {}
+
+--- 把**暂存内容**推给沙箱克隆（`textDocument/didChange`），使克隆的文档文本与 overlay
+--- 磁盘视图一致，**不触碰用户 buffer**。用户已打开的文件此前会以真实 buffer 文本 didOpen，
+--- 导致 LSP 与文件工具视图分裂；此处在每次取用克隆前校正文档文本。
+--- 版本号取 `max(changedtick, 上次推送) + 1`，确保不被 Neovim 的自动 didChange 覆盖。
+--- @param clone table LSP 客户端
+--- @param bufnr number 真实路径对应的 buffer（用于 URI 与版本基准）
+--- @param realpath string 真实文件路径
+local function _push_staged_text(clone, bufnr, realpath)
+  if not (clone and bufnr and type(realpath) == "string" and realpath ~= "") then return end
+  local ok_cand, cand = pcall(require, "NeoAI.sandbox.candidate")
+  if not ok_cand or not cand or type(cand.read_path) ~= "function" then return end
+  local staged = cand.read_path(realpath)
+  if not staged then return end
+  local content = require("NeoAI.utils.fs").read_file(staged)
+  if content == nil then return end
+  local uri = vim.uri_from_bufnr(bufnr)
+  local key = tostring(clone.id) .. "\0" .. uri
+  local last = pushed_text[key]
+  if last and last.text == content then return end
+  local tick = 0
+  pcall(function() tick = vim.api.nvim_buf_get_changedtick(bufnr) end)
+  local version = math.max(tick, pushed_version[clone.id] or 0) + 1
+  pushed_version[clone.id] = version
+  pcall(function()
+    clone:notify("textDocument/didChange", {
+      textDocument = { uri = uri, version = version },
+      contentChanges = { { text = content } },
+    })
+  end)
+  pushed_text[key] = { text = content, version = version }
+end
+
 --- 取得某编辑器客户端的沙箱克隆（按 name+root 缓存并复用）。
 --- @param ec table 编辑器客户端
 --- @param bufnr number
@@ -270,12 +313,22 @@ function M.clients_for(bufnr)
   if _cfg().enabled ~= true then return {} end
   bufnr = bufnr or vim.api.nvim_get_current_buf()
   if not vim.api.nvim_buf_is_valid(bufnr) then return {} end
+  local realpath = vim.api.nvim_buf_get_name(bufnr)
   local out = {}
   for _, ec in ipairs(_editor_clients(bufnr)) do
     local clone = _clone_of(ec, bufnr)
-    if clone then out[#out + 1] = clone end
+    if clone then
+      _push_staged_text(clone, bufnr, realpath)
+      out[#out + 1] = clone
+    end
   end
   return out
+end
+
+--- 沙箱 LSP 是否启用（供工具侧决定是否允许回退编辑器客户端）。
+--- @return boolean
+function M.enabled()
+  return _cfg().enabled == true
 end
 
 --- 找一个支持指定方法的沙箱克隆。
@@ -307,6 +360,8 @@ function M.stop_all()
     if c then pcall(function() c:stop() end) end
     clones[key] = nil
   end
+  pushed_text = {}
+  pushed_version = {}
 end
 
 --- 重置（测试用）

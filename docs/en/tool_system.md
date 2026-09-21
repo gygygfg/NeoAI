@@ -64,7 +64,7 @@ The full pipeline of `M.execute(tool_name, raw_args, ctx)`:
 
 ```
 resolve_name (alias/fuzzy matching)
-  → _normalize_arguments (alias mapping, e.g. cmd→command, file→filepath)
+  → _normalize_arguments (alias mapping, e.g. cmd→command, file→file_path)
   → _expand_path_args (expand ~ / $VAR paths)
   → validator.validate_parameters (schema validation)
   → approval decision validator.check_approval(...)
@@ -91,9 +91,9 @@ resolve_name (alias/fuzzy matching)
 
 ### 4.1 Argument Alias Normalization
 
-`_normalize_arguments` handles common aliases: `cmd→command`, `file/files→filepath`, `start→start_line`,
+`_normalize_arguments` handles common aliases: `cmd→command`, `file/files/filepath→file_path`, `start→start_line`,
 `end→end_line`, etc. Plain string arguments (for `read_file` and similar) are converted
-directly to `{ filepath = ... }`.
+directly to `{ file_path = ... }`.
 
 > Note: `new_text` / `text` are **no longer** aliased to `content`. That alias used to make `edit_file`
 > misread a "partial replace" as a "whole-file overwrite" (silent overwrite); it has been removed and a
@@ -101,7 +101,7 @@ directly to `{ filepath = ... }`.
 
 ### 4.2 Path Expansion
 
-`_expand_path_args` expands `~` aliases in the `path` / `filepath` / `file_path` / `dirs` / `dir` fields
+`_expand_path_args` expands `~` aliases in the `path` / `file_path` / `filepath` / `dirs` / `dir` fields
 (`~/...` ↔ home directory), so that paths relative to the home directory can be read and written normally.
 
 ### 4.3 Approval Decision (tools/validator.lua, non-async modes)
@@ -114,7 +114,7 @@ directly to `{ filepath = ... }`.
 - `mode == "auto_allow"` → no approval.
 - `mode == "strict"` → approval always required.
 - `approval_config.auto_allow == true` → no approval.
-- **Path safety**: `filepath` falls within `allowed_directories` → safe.
+- **Path safety**: `file_path` falls within `allowed_directories` → safe.
 - **Parameter safety**: the first word of `command` falls within `allowed_param_groups` (such as `ls`/`grep`) → safe.
 - No path and no command → decided by `auto_allow`.
 
@@ -208,8 +208,15 @@ lifecycle is reclaimed by `sandbox.shutdown`/`reset`. See the "Long-lived servic
 
 ### 🗂 Git (git_ops.lua)
 
-`git_status` / `git_diff` / `git_log` / `git_commit_detail` / `git_branch` / `git_file_history` /
-`git_rollback` / `git_auto_commit_config`.
+Read-only: `git_status` / `git_diff` / `git_log` / `git_commit_detail` / `git_branch` /
+`git_file_history` / `git_auto_commit_config` (executed in the sandbox namespace, seeing the staged view).
+
+Mutations (run **inside the sandbox**, `effect=process`; changes are **staged atomically into the
+review window**): `git_add` / `git_commit` / `git_stash` / `git_restore` / `git_rollback`. `.git` is a
+tightly coupled "index ↔ object store ↔ refs" database, applied atomically in
+`object → normal file → pointer` order so nothing ever dangles (see [sandbox.md](sandbox.md)); git
+mutation subcommands in `run_command` are refused (`SANDBOX_GIT_MUTATION_VIA_COMMAND`) and must use the
+dedicated tools above.
 
 ### 🔧 LSP (lsp_ops.lua, Neovim >= 0.12)
 

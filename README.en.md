@@ -630,14 +630,14 @@ one does). For risk levels and allowlists see the `approval` config and [docs/en
 
 | Tool name             | Description             | Parameters |
 | ------------------ | ---------------- | -------- |
-| `read_file`        | Read file contents (for large files, returns a syntax tree outline/preview by default; see below) | `filepath` (required) file path; `start_line`/`end_line` (optional) 1-based inclusive line range |
-| `edit_file`        | Edit file contents     | `filepath` (required) target file; `description` (required) purpose of the change; `content` (for a full overwrite); `mode` (`write`/`append`/`edit`); `edits` (structured replacements as `{old_text, new_text}` items) |
+| `read_file`        | Read file contents (for large files, returns a syntax tree outline/preview by default; see below) | `file_path` (required) file path; `start_line`/`end_line` (optional) 1-based inclusive line range |
+| `edit_file`        | Edit file contents     | `file_path` (required) target file; `description` (required) purpose of the change; `content` (for a full overwrite); `mode` (`write`/`append`/`edit`); `edits` (structured replacements as `{old_text, new_text}` items) |
 | `list_files`       | List directory files     | `path` (optional, defaults to the current directory); `recursive` (optional); `max_results` (optional) |
 | `search_files`     | Search file contents     | `query` (required) search term; `include` (optional) file glob; `path` (optional) search dir; `max_results` (optional) |
-| `create_directory` | Create a directory         | `filepath` (required) directory path (created recursively) |
-| `ensure_dir`       | Ensure a directory exists     | `filepath` (required) directory path (created if missing) |
-| `delete_file`      | Delete a file         | `filepath` (required) file to delete |
-| `file_exists`      | Check whether a file exists | `filepath` (required) file to check; returns `true`/`false` |
+| `create_directory` | Create a directory         | `file_path` (required) directory path (created recursively) |
+| `ensure_dir`       | Ensure a directory exists     | `file_path` (required) directory path (created if missing) |
+| `delete_file`      | Delete a file         | `file_path` (required) file to delete |
+| `file_exists`      | Check whether a file exists | `file_path` (required) file to check; returns `true`/`false` |
 | `read_image`       | Read an image file and inject the image into a multimodal model | `file_path` (required) local image path or `http(s)` image URL |
 
 > **`read_file` large-file protection**: when `start_line`/`end_line` are not specified and the file exceeds the
@@ -651,36 +651,36 @@ one does). For risk levels and allowlists see the `approval` config and [docs/en
 
 | Tool name                 | Description               | Parameters |
 | ---------------------- | ------------------ | -------- |
-| `parse_file`           | Parse a file's syntax tree     | `filepath` (required) file to parse; returns the root-node outline |
-| `query_tree`           | Query syntax tree nodes     | `filepath` (required) file; `query` (required) tree-sitter query |
-| `get_node_at_position` | Get the node at a given position   | `filepath`, `line`, `col` (required, 1-based) |
-| `get_node_type`        | Get a node's type       | `filepath`, `line`, `col` (required, 1-based) |
-| `get_node_range`       | Get a node's range       | `filepath`, `line`, `col` (required, 1-based) |
-| `is_named_node`        | Check whether it is a named node | `filepath`, `line`, `col` (required, 1-based) |
-| `get_parent_node`      | Get the parent node         | `filepath`, `line`, `col` (required, 1-based) |
-| `get_child_nodes`      | Get the list of child nodes     | `filepath`, `line`, `col` (required, 1-based) |
-| `get_node_code`        | Get a node's source code     | `filepath`, `line`, `col` (required, 1-based) |
-| `delete_node`          | Delete a syntax tree node     | `filepath`, `line`, `col` (required, 1-based) locating the node to delete |
+| `parse_file`           | Parse a file's syntax tree     | `file_path` (required) file to parse; returns the root-node outline |
+| `query_tree`           | Query syntax tree nodes     | `file_path` (required) file; `query` (required) tree-sitter query |
+| `get_node_at_position` | Get the node at a given position   | `file_path`, `line`, `col` (required, 1-based) |
+| `get_node_type`        | Get a node's type       | `file_path`, `line`, `col` (required, 1-based) |
+| `get_node_range`       | Get a node's range       | `file_path`, `line`, `col` (required, 1-based) |
+| `is_named_node`        | Check whether it is a named node | `file_path`, `line`, `col` (required, 1-based) |
+| `get_parent_node`      | Get the parent node         | `file_path`, `line`, `col` (required, 1-based) |
+| `get_child_nodes`      | Get the list of child nodes     | `file_path`, `line`, `col` (required, 1-based) |
+| `get_node_code`        | Get a node's source code     | `file_path`, `line`, `col` (required, 1-based) |
+| `delete_node`          | Delete a syntax tree node     | `file_path`, `line`, `col` (required, 1-based) locating the node to delete |
 
 ### 🔧 LSP Tools, natively supported by Neovim >= 0.12
 
 | Tool name                  | Description                | Parameters |
 | ----------------------- | ------------------- | -------- |
-| `lsp_hover`             | Get hover information        | `filepath`/`line`/`col` (optional; defaults to the current cursor position) |
+| `lsp_hover`             | Get hover information        | `file_path`/`line`/`col` (optional; defaults to the current cursor position) |
 | `lsp_definition`        | Get the definition location        | as above |
 | `lsp_references`        | Get reference locations        | as above |
 | `lsp_implementation`    | Get the implementation location        | as above |
 | `lsp_declaration`       | Get the declaration location        | as above |
-| `lsp_document_symbols`  | Get document symbols        | `filepath` (optional) file path |
+| `lsp_document_symbols`  | Get document symbols        | `file_path` (optional) file path |
 | `lsp_workspace_symbols` | Search workspace symbols      | `query` (required) symbol-name keyword |
-| `lsp_code_action`       | Get code action suggestions    | `filepath`/`line`/`col` (optional) |
-| `lsp_rename`            | Rename symbol          | `filepath`, `line`, `col`, `new_name` (required) |
-| `lsp_format`            | Format code          | `filepath` (optional) file to format |
-| `lsp_diagnostics`       | Get diagnostics        | `filepath` (optional) |
-| `lsp_client_info`       | Get LSP client information | `filepath` (optional) |
-| `lsp_signature_help`    | Get the function signature        | `filepath`/`line`/`col` (optional) |
-| `lsp_completion`        | Get completion suggestions        | `filepath`/`line`/`col` (optional) |
-| `lsp_type_definition`   | Get type definitions        | `filepath`/`line`/`col` (optional) |
+| `lsp_code_action`       | Get code action suggestions    | `file_path`/`line`/`col` (optional) |
+| `lsp_rename`            | Rename symbol          | `file_path`, `line`, `col`, `new_name` (required) |
+| `lsp_format`            | Format code          | `file_path` (optional) file to format |
+| `lsp_diagnostics`       | Get diagnostics        | `file_path` (optional) |
+| `lsp_client_info`       | Get LSP client information | `file_path` (optional) |
+| `lsp_signature_help`    | Get the function signature        | `file_path`/`line`/`col` (optional) |
+| `lsp_completion`        | Get completion suggestions        | `file_path`/`line`/`col` (optional) |
+| `lsp_type_definition`   | Get type definitions        | `file_path`/`line`/`col` (optional) |
 | `lsp_service_info`      | Get LSP service information   | no parameters |
 
 ### 💻 Shell Tools — interactive shells are filled in automatically by the AI
@@ -694,12 +694,16 @@ one does). For risk levels and allowlists see the `approval` config and [docs/en
 | Tool name                  | Description                     | Parameters |
 | ----------------------- | ------------------------ | -------- |
 | `git_status`            | View git status (--short) | `path` (optional) limit to a path |
-| `git_diff`              | View uncommitted changes           | `filepath` (optional) restrict the diff to that file |
+| `git_diff`              | View uncommitted changes           | `file_path` (optional) restrict the diff to that file |
 | `git_log`               | View commit history             | `max` (optional, default 20) entries; `path` (optional) limit to a path |
 | `git_commit_detail`     | View the details of a given commit         | `ref` (required) commit reference (e.g. `HEAD`/`abc123`) |
 | `git_branch`            | View the branch list (-a)       | no parameters |
-| `git_file_history`      | View a file's history             | `filepath` (required); `max` (optional) entries |
-| `git_rollback`          | Roll a file back to a given commit       | `filepath` (required); `commit` (optional, default `HEAD`) target commit |
+| `git_file_history`      | View a file's history             | `file_path` (required); `max` (optional) entries |
+| `git_rollback`          | Roll a file back to a given commit (staged for review) | `file_path` (required); `commit` (optional, default `HEAD`) target commit |
+| `git_add`               | Stage files (staged for review) | `paths` (optional) path array; `all` (optional) stage all changes |
+| `git_commit`            | Commit staged changes (staged for review) | `message` (required); `all` (optional) `-a` stage tracked files first |
+| `git_stash`             | Manage stash (staged for review) | `action` (required) `push`/`pop`/`apply`/`drop`/`list`; `message`/`include_untracked` (push only) |
+| `git_restore`           | Restore a file to a given commit (staged for review) | `file_path` (required); `commit` (optional, default `HEAD`) |
 | `git_auto_commit_config`| View/set the auto-commit configuration    | `auto_commit` (optional) boolean; omit to just query the current setting |
 
 ### 🤖 Sub-Agent Tools

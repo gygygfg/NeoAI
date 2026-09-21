@@ -659,7 +659,7 @@ tests.suite("sandbox_governance", function(_, it)
       sandbox.reset()
       local done = false
       require("NeoAI.tools").execute("edit_file", {
-        filepath = p, mode = "write", content = "next\n", description = "t",
+        file_path = p, mode = "write", content = "next\n", description = "t",
       }, {}):then_(function()
         t.eq("next", trim(fs.read_file(p)), "会话自动审批应自动应用工作区编辑")
         t.eq(0, #sandbox.list_reviews({ review_state = "PENDING" }), "不应残留待审项")

@@ -5,11 +5,15 @@
 ---   （L0 灰 / L1 黄 / L2 橙 / L3 红）。
 ---   风险徽标配色：L0 灰 / L1·L2 黄 / L3 红（仅 L3 用红色危险高亮）。
 --- 审批单位为单个文件：<CR> 仅应用光标所在文件 / d 仅拒绝该文件（其余文件保留待审）。
---- r 刷新 / q 关闭。
+--- 「已应用」区默认整体折叠（区标题一级 / 条目头行二级，za/zo 逐级展开），
+--- 刷新后重新收起；待审区与越界留痕区不折叠。
+--- 沙箱广播事件驱动自动刷新（窗口打开期间订阅，关闭时退订）；q 关闭。
 --- 经 kernel.services.use 获取 sandbox 服务，缺失时降级提示。
 
 local services = require("NeoAI.kernel.services")
 local fs = require("NeoAI.utils.fs")
+local event_bus = require("NeoAI.kernel.event_bus")
+local events = require("NeoAI.kernel.events")
 
 local M = {}
 
@@ -36,7 +40,37 @@ local LEVEL_HL = {
   verdict_unsafe = "NeoAISandboxReviewVerdictUnsafe",
 }
 
-local LEGEND = "级别：工作区(绿) 用户目录(黄) 系统(红)  风险：L0低危(灰)/L1中危(黄)/L2高危(黄)/L3严重(红)  ⚠密钥操作(红)   |   <CR> 头行=整包应用 / 文件行=应用该文件   A 一键同意全部工作区修改   d 拒绝该文件   i 预览修改diff/越界详情   u 撤销/重做保存   a AI审计   r 刷新   q 关闭"
+-- 图例行按级别分段着色（工作区绿 / 用户目录黄 / 系统红；风险徽标 L0 灰 / L1·L2 黄 / L3 红；
+-- 密钥操作红），与下方条目高亮一致，不再用「(绿)」等纯文字说明。
+local LEGEND_SEGMENTS = {
+  { "级别：" },
+  { "工作区", "workspace" },
+  { " " },
+  { "用户目录", "user" },
+  { " " },
+  { "系统", "system" },
+  { "  风险：" },
+  { "L0低危", "risk0" },
+  { "/" },
+  { "L1中危", "risk1" },
+  { "/" },
+  { "L2高危", "risk2" },
+  { "/" },
+  { "L3严重", "risk3" },
+  { "  " },
+  { "⚠密钥操作", "secret" },
+  { "   |   <CR> 头行=整包应用 / 文件行=应用该文件   A 一键同意全部工作区修改   d 拒绝该文件   i 预览修改diff/越界详情   u 撤销/重做保存   a AI审计   q 关闭" },
+}
+
+local LEGEND, LEGEND_MARKS = (function()
+  local s, marks, col = "", {}, 0
+  for _, seg in ipairs(LEGEND_SEGMENTS) do
+    local text, level = seg[1], seg[2]
+    if level then marks[#marks + 1] = { start_col = col, end_col = col + #text, level = level } end
+    s, col = s .. text, col + #text
+  end
+  return s, marks
+end)()
 
 -- L3 后果警告高亮组（diff 预览顶部）
 local L3_WARN_HL = "NeoAISandboxReviewL3Warning"
@@ -51,6 +85,7 @@ local state = {
   ns = nil,
   line_to_target = {}, -- 行号 -> { change_set_id, path? }
   line_to_trace = {}, -- 行号 -> 越界留痕路径（`i` 查看详情，非审批目标）
+  fold_levels = {}, -- 行号 -> 折叠级别（仅「已应用」区 > 0）：区标题=1，条目及其文件行=2
   last_cursor = nil, -- { line, col } 关闭时记录，重开时恢复
   last_target = nil, -- { change_set_id, path? } 关闭时光标所在条目（优先恢复）
   geom = nil, -- { col, row, width, height } 窗口几何，重开时恢复
@@ -62,16 +97,43 @@ local state = {
   audit_seq = 0, -- AI 审计请求序号：关闭/重开审批窗后作废过期结果
   audit_sig = nil, -- 已完成审计对应的待审集合签名（集合变化时自动重审）
   applying_all = false, -- 一键同意批量应用进行中（防重入；逐项让出主循环）
+  unsubs = {}, -- 窗口打开期间的沙箱事件订阅取消函数（关闭时清理）
+  refresh_pending = false, -- 已排队一次自动刷新（同一 tick 内的事件合并）
+}
+
+-- 广播自动刷新订阅的沙箱事件：待审/已应用/越界留痕/主机操作任一变化都会重绘审批窗。
+local WATCH_EVENTS = {
+  events.SANDBOX_REVIEW_ENQUEUED, events.SANDBOX_REVIEW_APPROVED,
+  events.SANDBOX_REVIEW_REJECTED, events.SANDBOX_REVIEW_SUPERSEDED,
+  events.SANDBOX_APPLIED, events.SANDBOX_COMMITTED,
+  events.SANDBOX_DISCARDED, events.SANDBOX_REVERTED,
+  events.SANDBOX_OUTSIDE_ACCESS,
+  events.SANDBOX_HOST_OP_ENQUEUED, events.SANDBOX_HOST_OP_APPLIED,
+  events.SANDBOX_HOST_OP_REJECTED,
 }
 
 -- 安全级别 -> 中文风险档（高危 / 中危 / 低危）
 local RISK_LABEL = { [0] = "低危", [1] = "中危", [2] = "高危", [3] = "高危" }
-
 --- 安全级别对应的风险档名称
 --- @param level number|nil
 --- @return string
 local function _risk_label(level)
   return RISK_LABEL[tonumber(level) or 0] or "低危"
+end
+
+-- ========== 折叠回调（预览窗） ==========
+-- 「已应用」区默认整体收起（区标题一级），展开后每条仍各自收起（条目头行二级）；
+-- 待审区/留痕区不登记级别（=0）故不折叠。实例化为模块级全局函数而非
+-- v:lua.require'...'：后者在带 UI 会话里求值可能失败（参见 chat_view 注释）。
+local function _fold_expr()
+  return tostring(state.fold_levels[vim.v.lnum] or 0)
+end
+
+local function _fold_text()
+  local start = vim.v.foldstart
+  local count = vim.v.foldend - start + 1
+  local first = vim.fn.getline(start) or ""
+  return string.format("  ▸ %s  (%d 行)", first, count)
 end
 
 -- ========== 私有函数 ==========
@@ -99,6 +161,34 @@ local function _ensure_hl()
   vim.api.nvim_set_hl(0, LEVEL_HL.verdict_unsafe, { default = true, fg = "#ff5555", bold = true })
   vim.api.nvim_set_hl(0, L3_WARN_HL, { default = true, fg = "#ff5555", bold = true })
   vim.api.nvim_set_hl(0, HINT_HL, { default = true, fg = "#56b6c2", bold = true })
+end
+
+--- 合并同一 tick 内的多次沙箱事件为一次重绘（批量应用时逐事件重绘会卡界面）。
+local function _schedule_refresh()
+  if state.refresh_pending then return end
+  state.refresh_pending = true
+  vim.schedule(function()
+    state.refresh_pending = false
+    if state.buf and vim.api.nvim_buf_is_valid(state.buf) then
+      M.refresh()
+    end
+  end)
+end
+
+--- 窗口打开期间订阅沙箱广播事件（幂等）；事件驱动自动刷新，无需手动 `r`。
+local function _watch()
+  if #state.unsubs > 0 then return end
+  for _, ev in ipairs(WATCH_EVENTS) do
+    state.unsubs[#state.unsubs + 1] = event_bus.on(ev, _schedule_refresh)
+  end
+end
+
+--- 取消沙箱事件订阅（窗口关闭/重置时调用）。
+local function _unwatch()
+  for _, u in ipairs(state.unsubs) do
+    if u then pcall(u) end
+  end
+  state.unsubs = {}
 end
 
 --- 安全级别 -> 高亮键
@@ -180,15 +270,21 @@ end
 --- @param traces table|nil 越界访问留痕数组（sandbox.list_traces）
 --- @param audit table|nil AI 审计 { pending?, error?, fallback?, notes? = { [路径或命令]=说明 } }
 --- @param saved table|nil 已保存/已撤销（含快照）的变更单元数组（sandbox.list_saved）
---- @return table { lines, marks, line_to_target, line_to_trace }
+--- @return table { lines, marks, line_to_target, line_to_trace, fold_levels }
 function M.build_lines(items, traces, audit, saved)
   local lines = {}
   local marks = {}
   local line_to_target = {}
   local line_to_trace = {} -- 行号 -> 越界留痕路径（`i` 查看详情；非审批目标）
+  -- 折叠级别（稀疏表：仅「已应用」区 > 0）：区标题=1（整区收起），条目头行及其文件行=2
+  -- （展开整区后条目仍各自收起）。待审区/留痕区不登记，保持不折叠。
+  local fold_levels = {}
   -- 本次渲染复用一次 cwd/home 规范形式，避免逐文件重复 fs.canonical。
   local lvl_ctx = { cwd = _canon_base(vim.fn.getcwd()), home = _canon_base(vim.fn.expand("~")) }
   lines[#lines + 1] = LEGEND
+  for _, m in ipairs(LEGEND_MARKS) do
+    marks[#marks + 1] = { line = #lines, start_col = m.start_col, end_col = m.end_col, level = m.level }
+  end
   lines[#lines + 1] = ""
   -- AI 审计状态（生成中 / 结论 / 失败 / 兜底说明）：结论先说安全/不安全；正式说明在各自文件行下方。
   if audit and (audit.pending or audit.notes
@@ -337,7 +433,12 @@ function M.build_lines(items, traces, audit, saved)
         pkg = pkg .. "⚠ 涉及软件源/密钥，"
       end
     end
-    local base = _one_line(string.format("[%s] %s%s%s（%s%d 个文件）  ", item.change_set_id, item.tool or "?", badge, risk_badge, pkg, #files))
+    -- git 操作：一次涉及多个文件（工作区 + `.git` 对象/指针），必须整组通过/丢弃（原子）。
+    local git_op = item.atomic_group == "git"
+    local group_desc = git_op
+      and string.format("（git 操作 · %d 个文件 · 原子整组）", #files)
+      or string.format("（%s%d 个文件）", pkg, #files)
+    local base = _one_line(string.format("[%s] %s%s%s%s  ", item.change_set_id, item.tool or "?", badge, risk_badge, group_desc))
     local hln = #lines + 1
     lines[#lines + 1] = base .. "待审"
     -- 「待审」标签按安全等级着色（L0 灰 / L1 黄 / L2 橙 / L3 红）
@@ -369,7 +470,15 @@ function M.build_lines(items, traces, audit, saved)
       lines[#lines + 1] = reason
       marks[#marks + 1] = { line = #lines, start_col = 0, end_col = #reason, level = _risk_hl(item.risk_level) }
     end
-    -- 头行 = 整单元审批；下方文件行为单文件审批（可选择性只应用某个文件）。
+    -- 头行 = 整单元审批；普通条目下方文件行为单文件审批（可选择性只应用某个文件）。
+    -- git 原子组：整组通过/丢弃，文件行同样映射到整组（不可逐文件）。
+    if git_op then
+      local hint = "  ⚙ 一次 git 操作：整组通过/丢弃（原子，不可逐文件）"
+      local gln = #lines + 1
+      lines[#lines + 1] = hint
+      marks[#marks + 1] = { line = gln, start_col = 0, end_col = #hint, level = "system" }
+      line_to_target[gln] = { change_set_id = item.change_set_id, whole = true }
+    end
 
     for _, f in ipairs(files) do
       local path = _one_line(f.path or tostring(f))
@@ -378,8 +487,17 @@ function M.build_lines(items, traces, audit, saved)
       local ln = #lines + 1
       lines[#lines + 1] = text
       marks[#marks + 1] = { line = ln, start_col = 2, end_col = 2 + #path, level = M.level_of(path, lvl_ctx) }
-      line_to_target[ln] = { change_set_id = item.change_set_id, path = path }
+      if git_op then
+        line_to_target[ln] = { change_set_id = item.change_set_id, whole = true }
+      else
+        line_to_target[ln] = { change_set_id = item.change_set_id, path = path }
+      end
       _append_note(path)
+    end
+    -- git 原子组：头行保持正常显示（整组审批入口，保留路径/风险高亮），其后的提示/风险/文件行
+    -- 登记为一级折叠，默认收起、`za`/`zo` 展开——即「第一行显示、其余折叠」。
+    if git_op then
+      for ln = hln + 1, #lines do fold_levels[ln] = 1 end
     end
     lines[#lines + 1] = ""
     end
@@ -400,7 +518,10 @@ function M.build_lines(items, traces, audit, saved)
     else
       title = "已应用（已保存，u 撤销/重做保存）"
     end
-    lines[#lines + 1] = "── " .. title .. "──"
+    local title_ln = #lines + 1
+    lines[#lines + 1] = "── " .. title .. "──（默认折叠，za/zo 展开）"
+    -- 区标题 = 一级折叠（默认整体收起）
+    fold_levels[title_ln] = 1
     for _, item in ipairs(saved) do
       local reverted = item.apply_state == "REVERTED"
       local label = reverted and "已撤销" or "已保存"
@@ -411,9 +532,15 @@ function M.build_lines(items, traces, audit, saved)
       if #files == 0 then
         for _, p in ipairs(item.write_set or {}) do files[#files + 1] = { path = p } end
       end
-      local base = _one_line(string.format("[%s] %s（%d 个文件）  ", item.change_set_id, item.tool or "?", #files))
+      local git_op = item.atomic_group == "git"
+      local group_desc = git_op
+        and string.format("（git 操作 · %d 个文件 · 原子整组）", #files)
+        or string.format("（%d 个文件）", #files)
+      local base = _one_line(string.format("[%s] %s%s  ", item.change_set_id, item.tool or "?", group_desc))
       local hln = #lines + 1
       lines[#lines + 1] = base .. label
+      -- 条目头行 = 二级折叠（展开整区后仍各自收起）
+      fold_levels[hln] = 2
       marks[#marks + 1] = { line = hln, start_col = #base, end_col = #base + #label,
         level = reverted and "pending0" or "workspace" }
       line_to_target[hln] = { change_set_id = item.change_set_id, saved = true, whole = true }
@@ -423,10 +550,18 @@ function M.build_lines(items, traces, audit, saved)
         local text = "  " .. path .. suffix
         local ln = #lines + 1
         lines[#lines + 1] = text
+        -- 文件行并入所属条目的二级折叠
+        fold_levels[ln] = 2
         marks[#marks + 1] = { line = ln, start_col = 2, end_col = 2 + #path, level = M.level_of(path, lvl_ctx) }
-        line_to_target[ln] = { change_set_id = item.change_set_id, path = path, saved = true }
+        -- git 原子组：整组撤销/重做，文件行同样映射到整组。
+        line_to_target[ln] = git_op
+          and { change_set_id = item.change_set_id, saved = true, whole = true }
+          or { change_set_id = item.change_set_id, path = path, saved = true }
       end
+      -- 条目尾空行计入一级，保证区折叠连续闭合到末条（空行自身不可见）
+      local blk = #lines + 1
       lines[#lines + 1] = ""
+      fold_levels[blk] = 1
     end
   end
   -- 越界访问留痕（read_all 下访问 cwd 之外用户工作目录；仅记录，非阻塞）。
@@ -456,7 +591,7 @@ function M.build_lines(items, traces, audit, saved)
     if type(lines[i]) ~= "string" then lines[i] = _one_line(lines[i]) end
     if lines[i]:find("[\r\n]") then lines[i] = _one_line(lines[i]) end
   end
-  return { lines = lines, marks = marks, line_to_target = line_to_target, line_to_trace = line_to_trace }
+  return { lines = lines, marks = marks, line_to_target = line_to_target, line_to_trace = line_to_trace, fold_levels = fold_levels }
 end
 
 -- 前向声明（定义见下方 diff 预览区）
@@ -714,8 +849,9 @@ local function _apply_current()
       _open_l3_confirm(target, item)
       return
     end
+    local noun = (item and item.atomic_group == "git") and "整组" or "整包"
     _apply_target(target,
-      function() return ("[NeoAI] 已应用 %s（整包 %d 个文件）"):format(target.change_set_id, #(item and item.files or {})) end,
+      function() return ("[NeoAI] 已应用 %s（%s %d 个文件）"):format(target.change_set_id, noun, #(item and item.files or {})) end,
       function(res) return ("[NeoAI] 应用失败(%s): %s"):format(tostring(res and res.state), tostring(res and res.reason)) end)
     return
   end
@@ -753,8 +889,10 @@ local function _reject_current()
     return
   end
   if target.whole then
+    local it = _find_item(target.change_set_id)
     sandbox.reject(target.change_set_id)
-    vim.notify(("[NeoAI] 已拒绝 %s（整包）"):format(target.change_set_id), vim.log.levels.INFO)
+    local noun = (it and it.atomic_group == "git") and "整组" or "整包"
+    vim.notify(("[NeoAI] 已拒绝 %s（%s）"):format(target.change_set_id, noun), vim.log.levels.INFO)
     M.refresh()
     return
   end
@@ -1206,6 +1344,24 @@ local function _open_trace_detail(path)
   _open_detail_float("🔎 越界访问详情", lines)
 end
 
+--- 选择用于 diff 预览的文件路径。
+--- git 原子组优先预览工作区文件；仅含 `.git` 内部（二进制索引/对象）时返回 nil（不预览）。
+--- @param item table|nil
+--- @param target table
+--- @return string|nil
+local function _preview_path(item, target)
+  if target.path then return target.path end
+  if not (item and item.files) then return nil end
+  local rt = require("NeoAI.sandbox.runtime")
+  local first
+  for _, f in ipairs(item.files) do
+    local gc = rt.git_path_class(f.path)
+    if not gc then return f.path end -- 普通工作区文件优先
+    first = first or f.path
+  end
+  return first
+end
+
 --- 打开一个临时 buffer 预览光标所在条目的修改 diff（暂时关闭审批窗，关闭后自动返回）
 local function _open_diff_current()
   local line = vim.api.nvim_win_get_cursor(0)[1]
@@ -1233,9 +1389,13 @@ local function _open_diff_current()
     vim.notify("[NeoAI] 请将光标移到要预览的文件行", vim.log.levels.WARN)
     return
   end
-  -- 整单元（头行）无具体 path：取首个文件作预览（应用仍为整单元）。
-  local path = target.path
-  if not path and item.files and item.files[1] then path = item.files[1].path end
+  -- 整单元（头行）无具体 path：取首个工作区文件作预览（应用仍为整单元）。
+  local path = _preview_path(item, target)
+  if not path then
+    vim.notify("[NeoAI] 该 git 操作仅含 `.git` 内部变更，无 diff 预览（应用/丢弃仍作用于整组）",
+      vim.log.levels.INFO)
+    return
+  end
   _open_diff({ change_set_id = target.change_set_id, path = path, whole = target.whole, host_op = target.host_op },
     item, { mode = "preview" })
 end
@@ -1269,8 +1429,8 @@ end
 --- @param target table
 --- @param item table
 _open_l3_confirm = function(target, item)
-  -- 整单元（头行）无具体 path：取首个文件作预览；应用仍按 target.whole 整单元。
-  local path = target.path
+  -- 整单元（头行）无具体 path：取首个工作区文件作预览；应用仍按 target.whole 整单元。
+  local path = _preview_path(item, target)
   if not path and item and item.files and item.files[1] then path = item.files[1].path end
   state.pending_l3 = { change_set_id = target.change_set_id, path = path, whole = target.whole }
   _open_diff({ change_set_id = target.change_set_id, path = path, whole = target.whole, host_op = target.host_op },
@@ -1307,6 +1467,7 @@ function M.open()
     return
   end
   _ensure_hl()
+  _watch()
 
   state.buf = vim.api.nvim_create_buf(false, true)
   vim.bo[state.buf].filetype = "neoai_sandbox_review"
@@ -1339,6 +1500,16 @@ function M.open()
   -- 自动换行：AI 审计结论 / diff 等长文本按窗口宽度折行显示（CJK 按字断行）。
   vim.wo[state.win_id].wrap = true
   vim.wo[state.win_id].linebreak = true
+  -- 「已应用」区两级折叠：区标题一级 / 条目头行二级，foldlevel=0 使已应用区默认整体收起。
+  -- 显式开启 foldenable，免受用户全局 foldenable=false 影响；foldexpr 用全局函数引用。
+  _G.NeoAISandboxReviewFoldExpr = _fold_expr
+  _G.NeoAISandboxReviewFoldText = _fold_text
+  vim.wo[state.win_id].foldenable = true
+  vim.wo[state.win_id].foldmethod = "expr"
+  vim.wo[state.win_id].foldexpr = "v:lua.NeoAISandboxReviewFoldExpr()"
+  vim.wo[state.win_id].foldtext = "v:lua.NeoAISandboxReviewFoldText()"
+  vim.wo[state.win_id].foldlevel = 0
+  vim.wo[state.win_id].foldminlines = 0
 
   vim.keymap.set("n", "q", function() M.close() end, { buffer = state.buf })
   vim.keymap.set("n", "<Esc>", function() M.close() end, { buffer = state.buf })
@@ -1347,7 +1518,6 @@ function M.open()
   vim.keymap.set("n", "d", _reject_current, { buffer = state.buf })
   vim.keymap.set("n", "i", _open_diff_current, { buffer = state.buf })
   vim.keymap.set("n", "u", _undo_current, { buffer = state.buf, desc = "NeoAI 撤销/重做保存" })
-  vim.keymap.set("n", "r", function() M.refresh() end, { buffer = state.buf })
   -- AI 审计（可配置按键；默认 a）
   local ai_cfg = require("NeoAI.kernel.config_store").get("tools.sandbox.review.ai_audit") or {}
   if ai_cfg.enabled ~= false then
@@ -1399,6 +1569,8 @@ function M.refresh()
     return (a.created_at or 0) < (b.created_at or 0)
   end)
   local data = M.build_lines(items, traces, state.audit, saved)
+  -- 折叠级别必须在写 buffer 前更新：写行后 nvim 会立即按 foldexpr 求值。
+  state.fold_levels = data.fold_levels or {}
   vim.api.nvim_buf_set_lines(state.buf, 0, -1, false, data.lines)
   state.line_to_target = data.line_to_target
   state.line_to_trace = data.line_to_trace or {}
@@ -1429,6 +1601,7 @@ end
 
 --- 关闭界面
 function M.close()
+  _unwatch()
   if state.win_id and vim.api.nvim_win_is_valid(state.win_id) then
     -- 关闭前记录光标/目标/几何，供下次打开恢复。
     pcall(function()
@@ -1447,6 +1620,7 @@ function M.close()
   state.ns = nil
   state.line_to_target = {}
   state.line_to_trace = {}
+  state.fold_levels = {}
   -- 作废在途 AI 审计结果；保留已完成结论（diff 预览返回/重开时复用，集合变化时由 refresh 清除）。
   state.audit_seq = state.audit_seq + 1
 end
@@ -1497,6 +1671,7 @@ function M.reset()
   state.audit = nil
   state.audit_sig = nil
   state.audit_seq = state.audit_seq + 1
+  state.fold_levels = {}
   _close_root_prompt()
   _close_diff()
   M.close()

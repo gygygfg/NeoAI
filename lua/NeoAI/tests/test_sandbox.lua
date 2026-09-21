@@ -48,7 +48,7 @@ tests.suite("sandbox", function(_, it)
     services.revoke("services.sandbox")
     with_config({ tools = { approval = { mode = "auto_allow" }, sandbox = { enabled = true, fail_closed = true } } }, function()
       local done = false
-      require("NeoAI.tools").execute("read_file", { filepath = "/tmp/x", description = "t" }, {})
+      require("NeoAI.tools").execute("read_file", { file_path = "/tmp/x", description = "t" }, {})
         :then_(function() done = true; t.true_(false, "应 fail-closed") end, function(e)
           t.matches("沙箱", tostring(e and e.message or e))
           done = true
@@ -128,7 +128,7 @@ tests.suite("sandbox", function(_, it)
       fs.write_file(p, "base\n")
       local done = false
       require("NeoAI.tools").execute("edit_file", {
-        filepath = p, mode = "write", content = "next\n", description = "t",
+        file_path = p, mode = "write", content = "next\n", description = "t",
       }, {}):then_(function(r)
         t.true_(not tostring(r):find("沙箱", 1, true), "结果不应向模型暴露沙箱暂存")
         t.eq("base", trim(fs.read_file(p)), "dry_run 不应改真实工作区")
@@ -158,14 +158,14 @@ tests.suite("sandbox", function(_, it)
       local r1, read_back
       local done = false
       tools.execute("edit_file", {
-        filepath = p, edits = { { old_text = "A", new_text = "X" } }, description = "t",
+        file_path = p, edits = { { old_text = "A", new_text = "X" } }, description = "t",
       }, {}):then_(function(r)
         r1 = r
-        return tools.execute("read_file", { filepath = p, description = "t" }, {})
+        return tools.execute("read_file", { file_path = p, description = "t" }, {})
       end):then_(function(rr)
         read_back = rr
         return tools.execute("edit_file", {
-          filepath = p, edits = { { old_text = "B", new_text = "Y" } }, description = "t",
+          file_path = p, edits = { { old_text = "B", new_text = "Y" } }, description = "t",
         }, {})
       end):then_(function()
         -- 结果路径应为原文件，不含沙箱暂存路径
@@ -205,10 +205,10 @@ tests.suite("sandbox", function(_, it)
       local tools = require("NeoAI.tools")
       local done = false
       tools.execute("edit_file", {
-        filepath = p, mode = "write", content = "v1\n", description = "t",
+        file_path = p, mode = "write", content = "v1\n", description = "t",
       }, {}):then_(function()
         return tools.execute("edit_file", {
-          filepath = p, mode = "write", content = "v2\n", description = "t",
+          file_path = p, mode = "write", content = "v2\n", description = "t",
         }, {})
       end):then_(function()
         local stale
@@ -248,13 +248,13 @@ tests.suite("sandbox", function(_, it)
       local tools = require("NeoAI.tools")
       local done = false
       tools.execute("edit_file", {
-        filepath = p_mod, mode = "write", content = "staged unique content\n", description = "t",
+        file_path = p_mod, mode = "write", content = "staged unique content\n", description = "t",
       }, {}):then_(function()
         return tools.execute("edit_file", {
-          filepath = p_new, mode = "write", content = "brand new\n", description = "t",
+          file_path = p_new, mode = "write", content = "brand new\n", description = "t",
         }, {})
       end):then_(function()
-        return tools.execute("delete_file", { filepath = p_del, description = "t" }, {})
+        return tools.execute("delete_file", { file_path = p_del, description = "t" }, {})
       end):then_(function()
         return tools.execute("list_files", { path = dir, description = "t" }, {})
       end):then_(function(r)
@@ -269,10 +269,10 @@ tests.suite("sandbox", function(_, it)
         t.matches("staged unique", s, "搜索应命中暂存内容")
         t.matches("mod%.txt", s, "搜索应指向真实文件路径")
         t.true_(not s:find("sessions", 1, true), "搜索不应泄露沙箱暂存路径")
-        return tools.execute("file_exists", { filepath = p_del, description = "t" }, {})
+        return tools.execute("file_exists", { file_path = p_del, description = "t" }, {})
       end):then_(function(r)
         t.eq("false", tostring(r), "已删除文件 file_exists 应为 false")
-        return tools.execute("file_exists", { filepath = p_new, description = "t" }, {})
+        return tools.execute("file_exists", { file_path = p_new, description = "t" }, {})
       end):then_(function(r)
         t.eq("true", tostring(r), "新建文件 file_exists 应为 true")
         t.eq("old content", trim(fs.read_file(p_mod)), "真实文件不应被修改")
@@ -287,6 +287,294 @@ tests.suite("sandbox", function(_, it)
     end)
   end)
 
+  it("只读工具合并视图：符号链接路径与真实路径一致（不落回真实视图）", function(t)
+    local fs = require("NeoAI.utils.fs")
+    local sandbox = require("NeoAI.sandbox")
+    local dir = vim.fn.tempname()
+    fs.ensure_dir(dir)
+    local link = dir .. "-link"
+    vim.uv.fs_symlink(dir, link)
+    local p = dir .. "/mod.txt"
+    fs.write_file(p, "old content here\n")
+    with_config({ tools = { approval = { mode = "async" }, sandbox = { mode = "dry_run", review = { enabled = true } } } }, function()
+      sandbox.reset()
+      local tools = require("NeoAI.tools")
+      local done = false
+      tools.execute("edit_file", { file_path = p, mode = "write", content = "staged marker here\n", description = "t" }, {})
+        :then_(function()
+          return tools.execute("search_files", { path = link, query = "staged marker", description = "t" }, {})
+        end):then_(function(r)
+          t.matches("staged marker", tostring(r), "经符号链接路径搜索应命中暂存内容")
+          return tools.execute("search_files", { path = link, query = "old content", description = "t" }, {})
+        end):then_(function(r)
+          t.true_(not tostring(r):find("old content", 1, true),
+            "暂存覆盖后旧内容不应再被搜到（符号链接路径）: " .. tostring(r))
+          return tools.execute("list_files", { path = link, description = "t" }, {})
+        end):then_(function(r)
+          t.matches("mod%.txt", tostring(r), "符号链接路径列举应包含文件")
+          return tools.execute("file_exists", { file_path = link .. "/mod.txt", description = "t" }, {})
+        end):then_(function(r)
+          t.eq("true", tostring(r), "符号链接路径 file_exists 应为 true")
+          done = true
+        end, function(e)
+          t.true_(false, "不应失败: " .. tostring(e and e.message or e)); done = true
+        end)
+      t.true_(vim.wait(5000, function() return done end), "应完成")
+    end)
+    pcall(vim.fn.delete, link)
+    vim.fn.delete(dir, "rf")
+  end)
+
+  it("只读工具合并视图：暂存删除的目录下真实文件不再被 search_files 命中", function(t)
+    local runtime = require("NeoAI.sandbox.runtime")
+    if runtime.backend() ~= "bwrap" then return end
+    local fs = require("NeoAI.utils.fs")
+    local sandbox = require("NeoAI.sandbox")
+    local dir = vim.fn.tempname()
+    fs.ensure_dir(dir .. "/sub")
+    fs.write_file(dir .. "/sub/a.txt", "deleted-dir-unique-marker\n")
+    local prev = vim.fn.getcwd()
+    vim.fn.chdir(dir)
+    with_config({ tools = { approval = { mode = "async" }, sandbox = { mode = "dry_run", review = { enabled = true } } } }, function()
+      sandbox.reset()
+      local tools = require("NeoAI.tools")
+      local done = false
+      tools.execute("run_command", { command = "rm -rf sub", description = "t" }, {})
+        :then_(function()
+          return tools.execute("search_files", { path = dir, query = "deleted-dir-unique-marker", description = "t" }, {})
+        end):then_(function(r)
+          t.true_(not tostring(r):find("deleted%-dir%-unique%-marker"),
+            "暂存删除目录下的真实文件不应被搜到: " .. tostring(r))
+          done = true
+        end, function(e)
+          t.true_(false, "不应失败: " .. tostring(e and e.message or e)); done = true
+        end)
+      t.true_(vim.wait(20000, function() return done end), "应完成")
+    end)
+    vim.fn.chdir(prev)
+    vim.fn.delete(dir, "rf")
+  end)
+
+  it("只读工具合并视图：暂存删除的文件 read_file 不返回真实内容", function(t)
+    local fs = require("NeoAI.utils.fs")
+    local sandbox = require("NeoAI.sandbox")
+    local dir = vim.fn.tempname()
+    fs.ensure_dir(dir)
+    local p = dir .. "/del.txt"
+    fs.write_file(p, "real-secret-content\n")
+    with_config({ tools = { approval = { mode = "async" }, sandbox = { mode = "dry_run", review = { enabled = true } } } }, function()
+      sandbox.reset()
+      local tools = require("NeoAI.tools")
+      local done = false
+      tools.execute("delete_file", { file_path = p, description = "t" }, {}):then_(function()
+        return tools.execute("read_file", { file_path = p, description = "t" }, {})
+      end):then_(function(r)
+        t.true_(not tostring(r):find("real-secret-content", 1, true),
+          "暂存删除后 read_file 不应返回真实内容")
+        done = true
+      end, function(e)
+        -- 删除态读取失败（读不到）也是可接受结果：只要不泄露真实内容。
+        t.true_(not tostring(e and e.message or e):find("real-secret-content", 1, true),
+          "删除态错误不应泄露真实内容")
+        done = true
+      end)
+      t.true_(vim.wait(5000, function() return done end), "应完成")
+    end)
+    vim.fn.delete(dir, "rf")
+  end)
+
+  it("一致性：run_command 写入对 search_files/read_file 可见（命令视图与 grep 一致）", function(t)
+    local runtime = require("NeoAI.sandbox.runtime")
+    if runtime.backend() ~= "bwrap" then return end
+    local fs = require("NeoAI.utils.fs")
+    local sandbox = require("NeoAI.sandbox")
+    local dir = vim.fn.tempname()
+    fs.ensure_dir(dir)
+    fs.write_file(dir .. "/f.txt", "base-line\n")
+    local prev = vim.fn.getcwd()
+    vim.fn.chdir(dir)
+    with_config({ tools = { approval = { mode = "async" }, sandbox = { mode = "dry_run", review = { enabled = true } } } }, function()
+      sandbox.reset()
+      local tools = require("NeoAI.tools")
+      local done = false
+      tools.execute("run_command", {
+        command = "printf 'cmd-unique-line\\n' >> f.txt", description = "t",
+      }, {}):then_(function()
+        return tools.execute("search_files", { path = dir, query = "cmd-unique-line", description = "t" }, {})
+      end):then_(function(r)
+        t.matches("cmd%-unique%-line", tostring(r), "search_files 应命中命令写入的内容")
+        return tools.execute("read_file", { file_path = dir .. "/f.txt", description = "t" }, {})
+      end):then_(function(r)
+        t.matches("cmd%-unique%-line", tostring(r), "read_file 应读到命令写入的内容")
+        t.eq("base-line\n", fs.read_file(dir .. "/f.txt") or "", "真实文件不应被命令改动（dry_run）")
+        done = true
+      end, function(e)
+        t.true_(false, "不应失败: " .. tostring(e and e.message or e)); done = true
+      end)
+      t.true_(vim.wait(20000, function() return done end), "应完成")
+    end)
+    vim.fn.chdir(prev)
+    vim.fn.delete(dir, "rf")
+  end)
+
+  it("git 变更守卫：run_command 中的 git 变更子命令被拒绝（改走专用 git 工具）", function(t)
+    local runtime = require("NeoAI.sandbox.runtime")
+    if runtime.backend() ~= "bwrap" then return end
+    local sandbox = require("NeoAI.sandbox")
+    with_config({ tools = { approval = { mode = "async" }, sandbox = { mode = "dry_run", review = { enabled = true } } } }, function()
+      sandbox.reset()
+      local done, err = false, nil
+      require("NeoAI.tools").execute("run_command", {
+        command = "git add . && git commit -m x", description = "t",
+      }, {}):then_(function() done = true end, function(e) err = e; done = true end)
+      t.true_(vim.wait(5000, function() return done end), "应完成")
+      t.matches("SANDBOX_GIT_MUTATION_VIA_COMMAND", tostring(err and err.message or err),
+        "git 变更子命令应被拒绝: " .. tostring(err and err.message or err))
+    end)
+    sandbox.reset()
+  end)
+
+  it("git 守卫：识别变更子命令、放行只读子命令", function(t)
+    local g = require("NeoAI.sandbox.git_guard")
+    t.eq("add", g.mutating("git add ."))
+    t.eq("commit", g.mutating("cd x && git -C /repo commit -m hi"))
+    t.eq("stash", g.mutating("git stash push -u"))
+    t.eq("reset", g.mutating("git -c foo=bar reset --hard"))
+    t.nil_(g.mutating("git status"), "status 应放行")
+    t.nil_(g.mutating("git log --oneline"), "log 应放行")
+    t.nil_(g.mutating("echo hello"), "非 git 应放行")
+    local rt = require("NeoAI.sandbox.runtime")
+    t.true_(rt.is_git_internal("/a/.git/index"))
+    t.true_(rt.is_git_internal("/repo/vendor/x/.git"))
+    t.false_(rt.is_git_internal("/a/b.lua"))
+  end)
+
+  it("git 路径分类：对象/指针/瞬态/配置", function(t)
+    local rt = require("NeoAI.sandbox.runtime")
+    t.eq("object", rt.git_path_class("/repo/.git/objects/ab/cdef"))
+    t.eq("pointer", rt.git_path_class("/repo/.git/index"))
+    t.eq("pointer", rt.git_path_class("/repo/.git/HEAD"))
+    t.eq("pointer", rt.git_path_class("/repo/.git/refs/heads/main"))
+    t.eq("pointer", rt.git_path_class("/repo/.git/logs/refs/stash"))
+    t.eq("transient", rt.git_path_class("/repo/.git/index.lock"))
+    t.eq("transient", rt.git_path_class("/repo/.git/gc.log"))
+    t.eq("other", rt.git_path_class("/repo/.git/config"))
+    t.nil_(rt.git_path_class("/repo/a.lua"))
+  end)
+
+  it("git 变更：沙箱内执行，.git 改动原子暂存进审批悬浮窗（dry_run 不改真实 .git）", function(t)
+    local runtime = require("NeoAI.sandbox.runtime")
+    if runtime.backend() ~= "bwrap" then return end
+    if vim.fn.executable("git") ~= 1 then return end
+    local fs = require("NeoAI.utils.fs")
+    local sandbox = require("NeoAI.sandbox")
+    local dir = vim.fn.tempname()
+    fs.ensure_dir(dir)
+    fs.write_file(dir .. "/a.txt", "hello\n")
+    vim.fn.system({ "git", "-C", dir, "init", "-q" })
+    vim.fn.system({ "git", "-C", dir, "config", "user.email", "t@t" })
+    vim.fn.system({ "git", "-C", dir, "config", "user.name", "t" })
+    local index_before = fs.read_file(dir .. "/.git/index") or ""
+    t.eq("process", require("NeoAI.sandbox.tool_spec").get("git_add").effect,
+      "git_add 应在沙箱内执行（process）")
+    local prev = vim.fn.getcwd()
+    vim.fn.chdir(dir)
+    with_config({ tools = { approval = { mode = "async" }, sandbox = { mode = "dry_run", review = { enabled = true } } } }, function()
+      sandbox.reset()
+      local done = false
+      require("NeoAI.tools").execute("git_add", { all = true, description = "t" }, {})
+        :then_(function() done = true end, function() done = true end)
+      t.true_(vim.wait(20000, function() return done end), "应完成")
+      -- 待审队列中应出现该 git 变更，且包含 .git/index（指针）与对象（object）。
+      local found_index, found_object = false, false
+      for _, item in ipairs(sandbox.list_reviews({ review_state = "PENDING" })) do
+        for _, f in ipairs(item.files or {}) do
+          local gc = require("NeoAI.sandbox.runtime").git_path_class(f.path)
+          if gc == "pointer" and f.path:match("/%.git/index$") then found_index = true end
+          if gc == "object" then found_object = true end
+        end
+      end
+      t.true_(found_index, "待审候选应包含 .git/index")
+      t.true_(found_object, "待审候选应包含 git 对象")
+      -- dry_run：真实 .git 不应被改动。
+      t.eq(index_before, fs.read_file(dir .. "/.git/index") or "", "真实 .git/index 不应被改动")
+    end)
+    vim.fn.chdir(prev)
+    vim.fn.delete(dir, "rf")
+  end)
+
+  it("git 原子发布顺序：对象先于指针（对象已存在时幂等跳过）", function(t)
+    local candidate = require("NeoAI.sandbox.candidate")
+    local dir = vim.fn.tempname()
+    require("NeoAI.utils.fs").ensure_dir(dir .. "/.git/objects/ab")
+    -- 构造一个候选：先列出指针，后列出对象；发布排序应把对象排到前面。
+    local cand = {
+      files = {
+        { path = dir .. "/.git/index", action = "create", content = "idx" },
+        { path = dir .. "/.git/objects/ab/cd", action = "create", content = "obj" },
+      },
+    }
+    local order = {}
+    -- 通过 monkeypatch writer 捕获应用顺序，避免真实写盘失败。
+    local writer = require("NeoAI.sandbox.writer")
+    local orig_apply = writer.apply
+    writer.apply = function(action, path, content, opts)
+      order[#order + 1] = path
+      return { ok = true, state = "COMMITTED" }
+    end
+    local res = candidate.publish(cand)
+    writer.apply = orig_apply
+    t.true_(res.ok, "发布应成功: " .. tostring(res.reason))
+    t.true_(#order >= 2, "应有两次写入")
+    t.matches("objects", order[1] or "", "对象应先于指针写入")
+    t.matches("index", order[#order] or "", "指针应后写入")
+    vim.fn.delete(dir, "rf")
+  end)
+
+  it("一致性：命令还原暂存编辑后同步视图（不残留待审候选，不被旧暂存回滚）", function(t)
+    local runtime = require("NeoAI.sandbox.runtime")
+    if runtime.backend() ~= "bwrap" then return end
+    local fs = require("NeoAI.utils.fs")
+    local sandbox = require("NeoAI.sandbox")
+    local dir = vim.fn.tempname()
+    fs.ensure_dir(dir)
+    local real = dir .. "/f.txt"
+    fs.write_file(real, "base\n")
+    local prev = vim.fn.getcwd()
+    vim.fn.chdir(dir)
+    with_config({ tools = { approval = { mode = "async" }, sandbox = { mode = "dry_run", review = { enabled = true } } } }, function()
+      sandbox.reset()
+      local tools = require("NeoAI.tools")
+      local done = false
+      tools.execute("edit_file", {
+        filepath = real, mode = "write", content = "staged-edit\n", description = "t",
+      }, {}):then_(function()
+        -- 非 git 命令把文件还原为真实基线（等价于命令撤销暂存编辑）。
+        return tools.execute("run_command", { command = "printf 'base\\n' > f.txt", description = "t" }, {})
+      end):then_(function()
+        -- 再跑一条空命令触发物化：若 view 未同步，旧暂存会被重新物化回工作区。
+        return tools.execute("run_command", { command = "true", description = "t" }, {})
+      end):then_(function()
+        return tools.execute("read_file", { filepath = real, description = "t" }, {})
+      end):then_(function(r)
+        local s = tostring(r)
+        t.matches("base", s, "命令还原后应读到 base: " .. s)
+        t.true_(not s:find("staged%-edit"), "不应被旧暂存内容回滚: " .. s)
+        for _, item in ipairs(sandbox.list_reviews({ review_state = "PENDING" })) do
+          for _, f in ipairs(item.files or {}) do
+            t.ne(f.path, real, "还原后不应残留该路径的待审候选")
+          end
+        end
+        done = true
+      end, function(e)
+        t.true_(false, "不应失败: " .. tostring(e and e.message or e)); done = true
+      end)
+      t.true_(vim.wait(20000, function() return done end), "应完成")
+    end)
+    vim.fn.chdir(prev)
+    vim.fn.delete(dir, "rf")
+  end)
+
   it("沙箱不可见：treesitter 读取暂存内容且不泄露暂存路径", function(t)
     local fs = require("NeoAI.utils.fs")
     local sandbox = require("NeoAI.sandbox")
@@ -297,9 +585,9 @@ tests.suite("sandbox", function(_, it)
       local done = false
       local tools = require("NeoAI.tools")
       tools.execute("edit_file", {
-        filepath = p, mode = "write", content = "local staged_marker = 1\n", description = "t",
+        file_path = p, mode = "write", content = "local staged_marker = 1\n", description = "t",
       }, {}):then_(function()
-        return tools.execute("get_node_code", { filepath = p, line = 1, col = 8, description = "t" }, {})
+        return tools.execute("get_node_code", { file_path = p, line = 1, col = 8, description = "t" }, {})
       end):then_(function(r)
         t.matches("staged_marker", tostring(r), "treesitter 应基于暂存内容解析")
         t.true_(not tostring(r):find("sessions", 1, true), "结果不应泄露暂存路径")
@@ -324,11 +612,11 @@ tests.suite("sandbox", function(_, it)
       local done = false
       local tools = require("NeoAI.tools")
       tools.execute("edit_file", {
-        filepath = p, mode = "write", content = "local a = 1\nlocal b = 2\n", description = "t",
+        file_path = p, mode = "write", content = "local a = 1\nlocal b = 2\n", description = "t",
       }, {}):then_(function()
-        return tools.execute("delete_node", { filepath = p, line = 2, col = 1, description = "t" }, {})
+        return tools.execute("delete_node", { file_path = p, line = 2, col = 1, description = "t" }, {})
       end):then_(function()
-        return tools.execute("read_file", { filepath = p, description = "t" }, {})
+        return tools.execute("read_file", { file_path = p, description = "t" }, {})
       end):then_(function(r)
         local s = tostring(r)
         t.matches("local a = 1", s, "删除后应保留第一行")
@@ -353,9 +641,9 @@ tests.suite("sandbox", function(_, it)
       fs.write_file(p, string.rep("line content\n", 100))
       local done = false
       local tools = require("NeoAI.tools")
-      tools.execute("edit_file", { filepath = p, mode = "append", content = "appended\n", description = "t" }, {})
+      tools.execute("edit_file", { file_path = p, mode = "append", content = "appended\n", description = "t" }, {})
         :then_(function()
-          return tools.execute("read_file", { filepath = p, description = "t" }, {})
+          return tools.execute("read_file", { file_path = p, description = "t" }, {})
         end):then_(function(r)
           local s = tostring(r)
           t.matches(vim.pesc(p), s, "大文件提示应包含真实文件路径")
@@ -381,7 +669,7 @@ tests.suite("sandbox", function(_, it)
       local p = vim.fn.tempname() .. "/new_file.txt" -- 真实文件不存在
       local done = false
       require("NeoAI.tools").execute("edit_file", {
-        filepath = p, mode = "write", content = "hi\n", description = "t",
+        file_path = p, mode = "write", content = "hi\n", description = "t",
       }, {}):then_(function(r)
         t.matches("已写入", tostring(r), "新建文件写入应成功")
         t.false_(fs.exists(p), "dry_run 不应写真实文件")
@@ -475,7 +763,7 @@ tests.suite("sandbox", function(_, it)
       local done = false
       local tools = require("NeoAI.tools")
       -- 1) edit_file 写入 → run_command 应读到
-      tools.execute("edit_file", { filepath = dir .. "/f.txt", mode = "write", content = "edited\n", description = "t" }, {})
+      tools.execute("edit_file", { file_path = dir .. "/f.txt", mode = "write", content = "edited\n", description = "t" }, {})
         :then_(function()
           return tools.execute("run_command", { command = "cat f.txt", description = "t" }, {})
         end):then_(function(r)
@@ -483,7 +771,7 @@ tests.suite("sandbox", function(_, it)
           -- 2) run_command 追加 → read_file 应读到叠加后的内容
           return tools.execute("run_command", { command = "echo fromcmd >> f.txt", description = "t" }, {})
         end):then_(function()
-          return tools.execute("read_file", { filepath = dir .. "/f.txt", description = "t" }, {})
+          return tools.execute("read_file", { file_path = dir .. "/f.txt", description = "t" }, {})
         end):then_(function(r)
           t.matches("edited", tostring(r), "read_file 应保留 edit_file 的改动")
           t.matches("fromcmd", tostring(r), "read_file 应读到 run_command 的改动")
@@ -517,7 +805,7 @@ tests.suite("sandbox", function(_, it)
     }, function()
       local done = false
       require("NeoAI.tools").execute(
-        "edit_file", { filepath = real, mode = "write", content = "edited\n", description = "t" }, {})
+        "edit_file", { file_path = real, mode = "write", content = "edited\n", description = "t" }, {})
         :then_(function()
           -- 已暂存但不在已知根（cwd）内 → 补其所在目录
           local roots = candidate.staged_overlay_roots({ cwd })
@@ -564,11 +852,11 @@ tests.suite("sandbox", function(_, it)
       local done = false
       local tools = require("NeoAI.tools")
       tools.execute("edit_file",
-        { filepath = dir .. "/f.txt", mode = "write", content = "base\n", description = "noop" }, {})
+        { file_path = dir .. "/f.txt", mode = "write", content = "base\n", description = "noop" }, {})
         :then_(function()
           t.false_(candidate.has_staged(), "空操作不应视为未发布改动")
           return tools.execute("edit_file",
-            { filepath = dir .. "/f.txt", mode = "write", content = "edited\n", description = "t" }, {})
+            { file_path = dir .. "/f.txt", mode = "write", content = "edited\n", description = "t" }, {})
         end):then_(function()
           t.true_(candidate.has_staged(), "实质改动应视为未发布")
           candidate.invalidate(dir .. "/f.txt")
@@ -600,7 +888,7 @@ tests.suite("sandbox", function(_, it)
       local done = false
       local tools = require("NeoAI.tools")
       tools.execute("edit_file",
-        { filepath = dir .. "/f.txt", mode = "write", content = "edited\n", description = "t" }, {})
+        { file_path = dir .. "/f.txt", mode = "write", content = "edited\n", description = "t" }, {})
         :then_(function()
           -- 模拟 overlay 不可用（降级 / 嵌套 userns 无 overlay）
           local saved_avail, saved_writable = runtime.overlay_available, runtime.overlay_writable
@@ -640,9 +928,9 @@ tests.suite("sandbox", function(_, it)
       local done = false
       local tools = require("NeoAI.tools")
       tools.execute("edit_file", {
-        filepath = dir .. "/new.txt", mode = "write", content = "created\n", description = "t",
+        file_path = dir .. "/new.txt", mode = "write", content = "created\n", description = "t",
       }, {}):then_(function()
-        return tools.execute("delete_file", { filepath = dir .. "/del.txt", description = "t" }, {})
+        return tools.execute("delete_file", { file_path = dir .. "/del.txt", description = "t" }, {})
       end):then_(function()
         return tools.execute("run_command", {
           command = "cat new.txt; cat del.txt 2>/dev/null || echo MISSING", description = "t",
@@ -684,7 +972,7 @@ tests.suite("sandbox", function(_, it)
       local tools = require("NeoAI.tools")
       tools.execute("run_command", { command = "echo wholefs > " .. target, description = "t" }, {})
         :then_(function()
-          return tools.execute("read_file", { filepath = target, description = "t" }, {})
+          return tools.execute("read_file", { file_path = target, description = "t" }, {})
         end):then_(function(r)
           t.matches("wholefs", tostring(r), "read_file 应读到 run_command 对绝对路径的改动")
           t.false_(fs.exists(target), "dry_run 不应写真实文件系统")
@@ -773,7 +1061,7 @@ tests.suite("sandbox", function(_, it)
       sandbox.reset()
       local done, err = false, nil
       require("NeoAI.tools").execute("edit_file", {
-        filepath = dir, mode = "write", content = "oops\n", description = "t",
+        file_path = dir, mode = "write", content = "oops\n", description = "t",
       }, {}):then_(function()
         done = true
       end, function(e)
@@ -797,7 +1085,7 @@ tests.suite("sandbox", function(_, it)
       sandbox.reset()
       local newdir = dir .. "/sub"
       local done = false
-      require("NeoAI.tools").execute("create_directory", { filepath = newdir, description = "t" }, {}):then_(function()
+      require("NeoAI.tools").execute("create_directory", { file_path = newdir, description = "t" }, {}):then_(function()
         return require("NeoAI.tools").execute("run_command", {
           command = "test -d " .. newdir .. " && echo ISDIR", description = "t",
         }, {})
@@ -890,7 +1178,7 @@ tests.suite("sandbox", function(_, it)
       fs.write_file(p, "base\n")
       local done = false
       require("NeoAI.tools").execute("edit_file", {
-        filepath = p, mode = "write", content = "agent\n", description = "t",
+        file_path = p, mode = "write", content = "agent\n", description = "t",
       }, {}):then_(function()
         -- 模拟发布前他人修改真实工作区
         fs.write_file(p, "human\n")
@@ -918,7 +1206,7 @@ tests.suite("sandbox", function(_, it)
       fs.write_file(p, "local keep = 1\nlocal remove = 2\n")
       local done = false
       require("NeoAI.tools").execute("delete_node", {
-        filepath = p, line = 2, col = 1, description = "t",
+        file_path = p, line = 2, col = 1, description = "t",
       }, {}):then_(function()
         t.matches("remove", fs.read_file(p) or "", "dry_run 下真实文件不应被删除节点")
         local list = sandbox.list()
@@ -1527,7 +1815,7 @@ tests.suite("sandbox", function(_, it)
       local target = vim.fn.expand("~") .. "/.bashrc"
       if not fs.exists(target) then return end
       local done = false
-      require("NeoAI.tools").execute("read_file", { filepath = target, description = "r" }, {})
+      require("NeoAI.tools").execute("read_file", { file_path = target, description = "r" }, {})
         :then_(function() done = true end, function() done = true end)
       t.true_(vim.wait(8000, function() return done end), "应完成")
       local traces = sandbox.list_traces()
@@ -1566,7 +1854,7 @@ tests.suite("sandbox", function(_, it)
       fs.write_file(p, "base\n")
       local id, done = nil, false
       require("NeoAI.tools").execute("edit_file", {
-        filepath = p, mode = "write", content = "next\n", description = "t",
+        file_path = p, mode = "write", content = "next\n", description = "t",
       }, {}):then_(function()
         local items = sandbox.list_reviews({ review_state = "PENDING" })
         t.eq(1, #items, "应有一个待审单元")
@@ -1619,14 +1907,14 @@ tests.suite("sandbox", function(_, it)
       pcall(fs.delete_file, p)
       local done = false
       require("NeoAI.tools").execute("edit_file",
-        { filepath = p, description = "t", mode = "write", content = "eph\n" }, {}):then_(function()
+        { file_path = p, description = "t", mode = "write", content = "eph\n" }, {}):then_(function()
           t.false_(fs.exists(p), "临时根写入不应落到真实磁盘")
           t.eq(0, #sandbox.list_reviews({ review_state = "PENDING" }), "临时根不应产生待审候选")
           done = true
         end, function(e) t.true_(false, tostring(e and e.message or e)); done = true end)
       t.true_(vim.wait(8000, function() return done end), "edit_file 应完成")
       local done2, out = false, nil
-      require("NeoAI.tools").execute("read_file", { filepath = p, description = "r" }, {})
+      require("NeoAI.tools").execute("read_file", { file_path = p, description = "r" }, {})
         :then_(function(r) out = tostring(r); done2 = true end, function() done2 = true end)
       t.true_(vim.wait(8000, function() return done2 end), "read_file 应完成")
       t.matches("eph", out or "", "读取应看到临时根内容（暂存一致）")
@@ -2395,7 +2683,7 @@ tests.suite("sandbox", function(_, it)
         end,
       }
       local done, result = false, nil
-      require("NeoAI.tools").execute("read_file", { filepath = secret, description = "t" }, { tool_service = stub })
+      require("NeoAI.tools").execute("read_file", { file_path = secret, description = "t" }, { tool_service = stub })
         :then_(function(r)
           result = tostring(r)
           done = true
@@ -2408,7 +2696,7 @@ tests.suite("sandbox", function(_, it)
       t.matches("TOPSECRET", result or "", "批准后应可读取")
       -- 2) 无审批界面：进程内读取 fail-closed 拒绝
       local done2, err2 = false, nil
-      require("NeoAI.tools").execute("read_file", { filepath = secret, description = "t" }, {})
+      require("NeoAI.tools").execute("read_file", { file_path = secret, description = "t" }, {})
         :then_(function(r)
           err2 = "OK:" .. tostring(r)
           done2 = true
@@ -2439,7 +2727,7 @@ tests.suite("sandbox", function(_, it)
       -- 进程内 read_file 命中即硬拒绝（即便有审批界面也不放行）
       local stub = { approve_and_execute = function(_, _, _, cont) return cont() end }
       local done, err = false, nil
-      require("NeoAI.tools").execute("read_file", { filepath = file, description = "t" }, { tool_service = stub })
+      require("NeoAI.tools").execute("read_file", { file_path = file, description = "t" }, { tool_service = stub })
         :then_(function(r)
           err = "OK:" .. tostring(r)
           done = true
@@ -2492,7 +2780,7 @@ tests.suite("sandbox", function(_, it)
       -- 进程内 read_file 经符号链接/`/proc/self/root` 均应硬拒绝
       local function must_reject(path)
         local done, err = false, nil
-        require("NeoAI.tools").execute("read_file", { filepath = path, description = "t" }, {})
+        require("NeoAI.tools").execute("read_file", { file_path = path, description = "t" }, {})
           :then_(function(r)
             err = "OK:" .. tostring(r)
             done = true
@@ -2560,7 +2848,7 @@ tests.suite("sandbox", function(_, it)
     t.eq(1, net.tier, "网络命令应为 T1")
     local sudo = privilege.classify("run_command", { command = "sudo mount /dev/x" }, spec)
     t.eq(2, sudo.tier, "sudo/mount 应为 T2")
-    t.eq(0, privilege.classify("read_file", { filepath = "/x" }, { effect = "read" }).tier, "非 process 应 T0")
+    t.eq(0, privilege.classify("read_file", { file_path = "/x" }, { effect = "read" }).tier, "非 process 应 T0")
     -- 复合命令取最高档
     t.eq(2, privilege.classify("run_command", { command = "ls && sudo id" }, spec).tier, "复合命令取最高档")
     -- 最高档校验
@@ -2895,7 +3183,7 @@ tests.suite("sandbox", function(_, it)
     fs.write_file(envf, "value " .. key .. "\n")
     local function read(p)
       local done, res = false, nil
-      require("NeoAI.tools").execute("read_file", { filepath = p, description = "t" }, {})
+      require("NeoAI.tools").execute("read_file", { file_path = p, description = "t" }, {})
         :then_(function(r) res = tostring(r); done = true end,
           function(e) res = "ERR:" .. tostring(e and e.message or e); done = true end)
       t.true_(vim.wait(10000, function() return done end), "read_file 应完成")
@@ -3053,7 +3341,7 @@ tests.suite("sandbox", function(_, it)
     local ctx = {}
     local done = false
     require("NeoAI.tools").execute("read_file", {
-      filepath = "/nonexistent/" .. tok, description = "t",
+      file_path = "/nonexistent/" .. tok, description = "t",
     }, ctx):then_(function() done = true end, function() done = true end)
     t.true_(vim.wait(5000, function() return done end), "应完成")
     t.eq(true, ctx.secret_operation, "token 操作应提级审批（secret_operation），而非终止")
@@ -3073,7 +3361,7 @@ tests.suite("sandbox", function(_, it)
       sandbox.reset()
       local done = false
       require("NeoAI.tools").execute("edit_file", {
-        filepath = p, mode = "write", content = "KEY=" .. fake .. "\n", description = "t",
+        file_path = p, mode = "write", content = "KEY=" .. fake .. "\n", description = "t",
       }, {}):then_(function()
         local items = sandbox.list_reviews({ review_state = "PENDING" })
         local found
@@ -3360,7 +3648,7 @@ tests.suite("sandbox", function(_, it)
     local ctx = {}
     local done = false
     require("NeoAI.tools").execute("edit_file", {
-      filepath = p, mode = "write", content = code, description = "t",
+      file_path = p, mode = "write", content = code, description = "t",
     }, ctx):then_(function() done = true end, function() done = true end)
     t.true_(vim.wait(10000, function() return done end), "edit_file 应完成")
     t.eq(true, ctx.secret_operation, "应提级（secret_operation），而非终止")
@@ -3405,7 +3693,7 @@ tests.suite("sandbox", function(_, it)
     local path = vim.fn.tempname()
     fs.write_file(path, "API_KEY=" .. fake .. "\n")
     local done = false
-    require("NeoAI.tools").execute("read_file", { filepath = path, description = "t" }, {}):then_(function(r)
+    require("NeoAI.tools").execute("read_file", { file_path = path, description = "t" }, {}):then_(function(r)
       local s = tostring(r)
       t.true_(s:find(fake, 1, true) == nil, "不应回传真实密钥")
       t.matches("NEOKEY_", s, "应回传 token")
@@ -3460,7 +3748,7 @@ tests.suite("sandbox", function(_, it)
       local done = false
       -- 暂存一次修改：真实磁盘仍为 base
       require("NeoAI.tools").execute("edit_file", {
-        filepath = root .. "/a.txt", mode = "write", content = "changed\n", description = "t",
+        file_path = root .. "/a.txt", mode = "write", content = "changed\n", description = "t",
       }, {}):then_(function()
         return require("NeoAI.tools").execute("git_diff", { description = "t" }, {})
       end):then_(function(diff)
@@ -3654,7 +3942,7 @@ tests.suite("sandbox", function(_, it)
       fs.write_file(p, "ORIG\n")
       local done = false
       require("NeoAI.tools").execute("edit_file", {
-        filepath = p, mode = "write", content = "NEW\n", description = "t",
+        file_path = p, mode = "write", content = "NEW\n", description = "t",
       }, {}):then_(function(r)
         t.false_(shown, "async 模式不应弹执行前审批窗")
         t.true_(not tostring(r):find("等待异步确认", 1, true), "结果不应向模型暴露待审状态")
@@ -3685,7 +3973,7 @@ tests.suite("sandbox", function(_, it)
       fs.write_file(p, "KEEP\n")
       local done = false
       require("NeoAI.tools").execute("edit_file", {
-        filepath = p, mode = "write", content = "DROP\n", description = "t",
+        file_path = p, mode = "write", content = "DROP\n", description = "t",
       }, {}):then_(function()
         local item = sandbox.list_reviews({ review_state = "PENDING" })[1]
         t.not_nil(item)
@@ -3963,7 +4251,7 @@ tests.suite("sandbox", function(_, it)
       -- 结果返回后立即读取命令创建的文件：read 工具应等待后台合并完成，看到一致视图。
       local rd, rv = false, nil
       require("NeoAI.tools").execute("read_file",
-        { filepath = dir .. "/made.txt", description = "r" }, {})
+        { file_path = dir .. "/made.txt", description = "r" }, {})
         :then_(function(r) rv = tostring(r); rd = true end,
           function(e) rv = "ERR:" .. tostring(e and e.message or e); rd = true end)
       t.true_(vim.wait(60000, function() return rd end), "read_file 应完成")
@@ -4000,7 +4288,7 @@ tests.suite("sandbox", function(_, it)
       end
       run("edit_file", function(ok, err)
         require("NeoAI.tools").execute("edit_file",
-          { filepath = dir .. "/a.txt", description = "t", mode = "write", content = "changed\n" }, {}):then_(ok, err)
+          { file_path = dir .. "/a.txt", description = "t", mode = "write", content = "changed\n" }, {}):then_(ok, err)
       end)
       run("read-only run_command", function(ok, err)
         require("NeoAI.tools").execute("run_command",
@@ -4717,7 +5005,7 @@ tests.suite("sandbox", function(_, it)
       local p = dir .. "/f.txt"
       fs.write_file(p, "v1\n")
       local done = false
-      require("NeoAI.tools").execute("edit_file", { filepath = p, mode = "write", content = "v2\n", description = "t" }, {})
+      require("NeoAI.tools").execute("edit_file", { file_path = p, mode = "write", content = "v2\n", description = "t" }, {})
         :then_(function()
           t.eq("v2", trim(fs.read_file(p)), "有覆盖授权时应自动应用")
           t.eq(0, #sandbox.list_reviews({ review_state = "PENDING" }), "不应进入待审队列")
@@ -4741,7 +5029,7 @@ tests.suite("sandbox", function(_, it)
       local p = dir .. "/f.txt"
       fs.write_file(p, "v1\n")
       local done = false
-      require("NeoAI.tools").execute("edit_file", { filepath = p, mode = "write", content = "v2\n", description = "t" }, {})
+      require("NeoAI.tools").execute("edit_file", { file_path = p, mode = "write", content = "v2\n", description = "t" }, {})
         :then_(function()
           t.eq("v1", trim(fs.read_file(p)), "范围外不应自动应用")
           t.eq(1, #sandbox.list_reviews({ review_state = "PENDING" }), "应进入待审")
@@ -4790,7 +5078,7 @@ tests.suite("sandbox", function(_, it)
       local p = vim.fn.tempname() .. ".txt"
       fs.write_file(p, "v1\n")
       local done = false
-      require("NeoAI.tools").execute("edit_file", { filepath = p, mode = "write", content = "v2\n", description = "t" }, {})
+      require("NeoAI.tools").execute("edit_file", { file_path = p, mode = "write", content = "v2\n", description = "t" }, {})
         :then_(function()
           local item = sandbox.list_reviews({ review_state = "PENDING" })[1]
           sandbox.reject(item.change_set_id)
@@ -4933,7 +5221,7 @@ tests.suite("sandbox", function(_, it)
       local pending = 0
       local ids = {}
       local function run(p, content, cb)
-        tools.execute("edit_file", { filepath = p, mode = "write", content = content, description = "t" }, {})
+        tools.execute("edit_file", { file_path = p, mode = "write", content = content, description = "t" }, {})
           :then_(function() cb() end, function(e) t.true_(false, tostring(e and e.message or e)); cb() end)
       end
       local done = false
@@ -5204,7 +5492,7 @@ tests.suite("sandbox", function(_, it)
       sandbox.reset()
       local done = false
       require("NeoAI.tools").execute("read_file",
-        { filepath = "/proc/self/mountinfo", description = "t" }, {}):then_(function(r)
+        { file_path = "/proc/self/mountinfo", description = "t" }, {}):then_(function(r)
         local s = tostring(r)
         t.true_(not s:find("/.cache-", 1, true), "不应泄露 overlay 私有基目录，实际: " .. s)
         if store.root() and store.root() ~= "" then
@@ -5315,7 +5603,7 @@ tests.suite("sandbox", function(_, it)
       fs.write_file(p, "v1\n")
       sandbox.fault.set("publish", 1)
       local done = false
-      require("NeoAI.tools").execute("edit_file", { filepath = p, mode = "write", content = "v2\n", description = "t" }, {})
+      require("NeoAI.tools").execute("edit_file", { file_path = p, mode = "write", content = "v2\n", description = "t" }, {})
         :then_(function() t.true_(false, "注入发布失败时不应成功"); done = true end, function(e)
           t.matches("注入的发布失败", tostring(e and e.message or e))
           t.eq("v1", trim(fs.read_file(p)), "发布失败不应写入真实工作区")
@@ -5351,7 +5639,7 @@ tests.suite("sandbox", function(_, it)
       fs.write_file(p, "v1\n")
       sandbox.fault.set("freeze", 1)
       local done = false
-      require("NeoAI.tools").execute("edit_file", { filepath = p, mode = "write", content = "v2\n", description = "t" }, {})
+      require("NeoAI.tools").execute("edit_file", { file_path = p, mode = "write", content = "v2\n", description = "t" }, {})
         :then_(function() t.true_(false, "冻结失败不应成功"); done = true end, function(e)
           t.matches("冻结失败", tostring(e and e.message or e))
           t.eq(0, #sandbox.list_reviews({ review_state = "PENDING" }), "不应产生待审变更单元")
@@ -5381,7 +5669,7 @@ tests.suite("sandbox", function(_, it)
       local p = vim.fn.tempname() .. ".txt"
       fs.write_file(p, "v1\n")
       local done = false
-      require("NeoAI.tools").execute("edit_file", { filepath = p, mode = "write", content = "v2\n", description = "t" }, {})
+      require("NeoAI.tools").execute("edit_file", { file_path = p, mode = "write", content = "v2\n", description = "t" }, {})
         :then_(function()
           local parent = sandbox.list_reviews({ review_state = "PENDING" })[1]
           sandbox.approve(parent.change_set_id) -- 旧版已批准但未应用
@@ -5457,7 +5745,7 @@ tests.suite("sandbox", function(_, it)
         local s = tostring(r)
         t.matches("sub/", s, "重载后仍应看到沙箱新建目录")
         t.matches("a%.txt", s, "重载后仍应看到沙箱新建文件")
-        return tools.execute("read_file", { filepath = dir .. "/sub/a.txt", description = "t" }, {})
+        return tools.execute("read_file", { file_path = dir .. "/sub/a.txt", description = "t" }, {})
       end):then_(function(r)
         t.matches("hi", tostring(r), "重载后应读到待审修改内容")
         done = true

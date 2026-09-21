@@ -62,7 +62,7 @@ with `category = "mcp"`, `source = "mcp"`, and `parameters` taken directly from 
 | `mcp__<server>__get_prompt`      | Get template content for context assembly |
 
 > For tools with `source == "mcp"`, the executor **skips parameter alias rewriting and path expansion**
-> (`file→filepath`, `~` expansion, etc.), otherwise it would break the remote schema and be rejected by the server as unknown parameters.
+> (`file→file_path`, `~` expansion, etc.), otherwise it would break the remote schema and be rejected by the server as unknown parameters.
 
 ## 4. Tool Timing: Pre-caching + Dynamic Updates + Failure-driven
 

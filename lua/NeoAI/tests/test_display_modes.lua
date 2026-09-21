@@ -124,7 +124,7 @@ tests.suite("display_modes", function(_, it)
     agent.messages = {
       { role = "user", content = "读一下 env" },
       { role = "assistant", content = "", tool_calls = {
-        { id = "c1", ["function"] = { name = "read_file", arguments = '{"filepath":"/root/.env"}' } },
+        { id = "c1", ["function"] = { name = "read_file", arguments = '{"file_path":"/root/.env"}' } },
       } },
       {
         role = "tool", tool_call_id = "c1", tool_name = "read_file",

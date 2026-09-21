@@ -241,7 +241,15 @@ is only kept for other `approval.mode` values (`prompt`/`strict`).
     item (`q`/`<Esc>` closes it and returns to the review window with the cursor restored); on an
     **out-of-bounds access trace** line, `i` opens the **access details** for that path (each access's
     tool / kind / command / time; not an approval target),
-    `u` **undoes/redoes the save**, `r` refreshes, `q`/`<Esc>` closes. Inside the chat main window
+    `u` **undoes/redoes the save**, `q`/`<Esc>` closes. **While open, the window subscribes to sandbox
+    broadcast events and refreshes automatically** (enqueue/apply/reject/revert, out-of-bounds traces,
+    host operations; multiple events in the same tick are coalesced into one redraw) — no manual
+    refresh. **The "applied" section is
+    collapsed by default** (whole section collapsed via `za`/`zo`, then each item collapsed again);
+    pending ordinary items and the out-of-bounds trace section do not fold. **A pending git atomic
+    group shows its header line with the rest folded** (the header keeps the whole-group approval
+    entry and its path/risk highlight; the hint and file list start collapsed, `za`/`zo` expands),
+    avoiding a flood of `.git` internal files from a single git operation. Inside the chat main window
     press `<leader>ap` to trigger it (`keymaps.chat.sandbox_review`).
     - **Show saved / undo save**: applying (saving) keeps a **snapshot of the original file** (its
       content before the apply). The review window's "已应用（已保存/已撤销，u 撤销/重做保存）" section lists
@@ -451,21 +459,56 @@ detection) and `risk.classify` (security level), so `pip install`, `sudo modprob
     (`run_command`/`create_directory`, not yet on real disk) are synthesized as well: `list_files`
     fills in parent-directory entries and `file_exists` returns true for ancestor directories, so
     the AI never sees the inconsistent "files created but directory missing" view that would tempt
-    it to bypass the sandbox.
+    it to bypass the sandbox. Merge matching is normalized via `utils.fs.canonical` (symlink
+    resolution, `..` folding), the **same key normalization as staging**, so accessing a file
+    through a symlink/`..` path never falls back to the real view; `search_files` also drops all real
+    results under a **staged-deleted directory**, so grep and `git_diff` (overlay view) cannot
+    contradict each other.
   - Treesitter tools (`parse_file`/`query_tree`/`get_node_*`) read the staged copy: staged paths
     **keep the real basename (and extension)**, so filetype/parsers work; write tools such as
     `delete_node` modify the same staged copy and persist back to it (no double staging).
   - LSP tools share the same staged view as `run_command`/git readers:
     `tools.sandbox.lsp_overlay.enabled` is on by default; the AI-cloned LSP server process is placed
     in a bwrap + overlay (see below), so its disk reads see staged content (no longer the real disk).
-    When overlay is unavailable it is skipped and the AI tools fall back to editor clients. LSP write tools
-    (`lsp_rename`/`lsp_format`) always redirect their disk write to staging via `persist_buffer`.
+    Before the clone is used, the **staged content** is pushed to it as a `didChange` (correcting the
+    document text **without touching the user buffer**), so LSP and file tools agree on the same path.
+    When a file has unpublished staged changes but the sandbox clone is unavailable, falling back to
+    editor clients is **refused** (an explicit "sandbox LSP unavailable" is returned instead of
+    silently reading the real view). LSP write tools (`lsp_rename`/`lsp_format`) always redirect their
+    disk write to staging via `persist_buffer`.
   - **git read tools (`git_status` / `git_diff` / `git_log` / `git_branch` / `git_file_history` /
     `git_commit_detail`)**: executed inside the sandbox namespace (the same overlay as `run_command`),
     so disk reads see the **staged content**, not the real working tree. They run with
     `GIT_OPTIONAL_LOCKS=0` to avoid writing the index and are treated as read-only process tools that
     **do not capture candidates** or enter the review queue. The real working tree is never modified by
-    git reads. (`git_rollback` is a write and still runs on the host under approval.)
+    git reads.
+  - **`.git` changes are staged atomically into the review window**: `.git` is a tightly coupled
+    "index ↔ object store ↔ refs" database — the index only records blob hashes while the actual data
+    lives in `.git/objects/**`. Staging/publishing its files in arbitrary order could "save the index
+    but lose the objects", producing dangling references (`fatal: unable to read <blob>`, i.e. a
+    corrupted git index). So `.git` is handled with **atomic classification + ordered application**:
+    - Freeze classifies each path via `runtime.git_path_class`: `object` (`.git/objects/**`,
+      content-addressed, immutable, additive), `pointer` (index/HEAD/refs/logs/packed-refs, …),
+      `transient` (`*.lock`/`gc.log`) and `other` (config/hooks/info). `transient`/`other` and
+      **object deletions** (gc/prune pruning) are never candidates.
+    - Application order is fixed to **objects → normal files → pointers** (`_apply_order`): any index/ref
+      written references objects that already exist, so nothing dangles; objects already present are
+      skipped idempotently by content address (no CAS). Hence the `.git` changes of `git_add` /
+      `git_commit` / `git_stash` / `git_restore` / `git_rollback` enter the review window together with
+      the worktree changes and are applied atomically on confirmation (`SANDBOX_GIT_INTERNAL` only
+      backstops transient/config targets).
+    - These git mutation tools run **inside the sandbox** (`effect=process`, seeing the staged
+      worktree); their changes freeze as candidates and dry_run does not touch the real `.git`.
+      git **mutation** subcommands inside `run_command` are refused by a guard
+      (`SANDBOX_GIT_MUTATION_VIA_COMMAND`, `sandbox/git_guard.lua`) and must use those dedicated tools.
+    - **The review window presents the operation as one group**: candidates touching `.git`
+      objects/pointers are tagged as an atomic group (`atomic_group="git"` in `review`) and rendered
+      as "git operation · N files · atomic group"; the header and every file line map to the **whole
+      group** — `<CR>` approves and `d` discards the entire group, with per-file selective
+      apply/discard forbidden (`apply`/`reject_file` also force the whole group), so an index or an
+      object can never be written alone and corrupt the repository.
+    - File-writing tools (`edit_file`, …) targeting `.git` are still refused outright (the AI should
+      not edit repository internals directly).
 - **Buffer-persist tools** (`delete_node`/`lsp_rename`/`lsp_format`): `tool_helpers.persist_buffer`
   redirects `:write!` to staging while the sandbox is active. **Reads never write back**: a buffer is
   saved only when a write tool explicitly modified it (`mark_edited`); read-only paths such as
@@ -530,6 +573,15 @@ detection) and `risk.classify` (security level), so `pip install`, `sudo modprob
     …) cannot re-capture the AI's staged edit as a `run_command` candidate and supersede the original
     `edit_file` candidate — otherwise rejecting that read-only command would invalidate the staged edit,
     i.e. an "approved change rolled back".
+    The reverse case (a command **reverts** the AI's staged edit, e.g. `git checkout -- <file>`) has a
+    result equal to the real baseline, so it makes no net change to the real disk and yields no publish
+    candidate; it is recorded separately as `view_files` to sync the staging view and supersede the
+    path's pending candidate — otherwise the next materialization would overwrite the command result
+    with the stale staged content, i.e. a "command write rolled back".
+  - **Materialize type conflicts error out**: when a staged file's target is a directory on the real
+    disk/overlay (or vice versa), materialization would corrupt view consistency, so
+    `SANDBOX_MATERIALIZE_TYPE_CONFLICT` is returned and execution is refused (`run_command`, tool
+    subprocesses, long-lived services and the LSP overlay alike) instead of being skipped silently.
   - **File permissions are preserved**: candidates record the file mode and re-apply it when
     materializing into the overlay and when CAS-publishing (`write_file_atomic`'s `mkstemp` defaults to
     0600 and would strip the executable bit, breaking `venv/bin` scripts); new files use the ordinary
@@ -690,9 +742,10 @@ called and the host is never modified**.
 ### AI-only Sandboxed LSP (on by default)
 
 - Switch: `tools.sandbox.lsp_overlay.enabled` (default true). Effective only with the `bwrap`
-  backend and when the workspace root is overlay-mountable; otherwise it is skipped and the AI tools
-  fall back to the editor clients, working as usual. Set to false to disable (AI tools then read the
-  real disk).
+  backend and when the workspace root is overlay-mountable. With no unpublished staging it is skipped
+  and the AI tools fall back to editor clients, working as usual; **with staging present, falling back
+  is refused** (it would read the real view and diverge from the file tools) and the tool reports
+  "sandbox LSP unavailable". Set to false to disable (AI tools then read the real disk).
 - Scope: **only the AI `lsp_*` tools are affected.** `vim.lsp.rpc.start` is no longer wrapped
   globally, so the editor's own LSP processes keep reading/writing the real disk; when an AI tool
   runs, it lazily clones the matching editor server (client name suffixed with `@neoai-sandbox`) and

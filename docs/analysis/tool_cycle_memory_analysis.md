@@ -226,7 +226,7 @@ assistant 收尾，避免聊天「看起来卡住」。
 ## 附录：关键数据流（Write 工具 + 审批）
 
 ```
-1. 模型返回 edit_file(filepath, description, edits)
+1. 模型返回 edit_file(file_path, description, edits)
 2. _execute_single → tool_service.execute
 3. executor.execute：
    resolve_name → 别名解析 → 路径展开 → schema 校验

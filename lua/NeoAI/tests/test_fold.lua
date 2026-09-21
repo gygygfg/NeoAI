@@ -99,7 +99,7 @@ tests.suite("fold", function(_, it)
     local line = ml.helpers.secret_warning_line
     -- 读取结果含 token => 获取
     local got = line(
-      { name = "read_file", arguments = '{"filepath":"/root/.env"}' },
+      { name = "read_file", arguments = '{"file_path":"/root/.env"}' },
       { role = "tool", content = '{"output":"NEOKEY_deadbeef01"}' })
     t.matches("获取了密钥", got or "", "读取结果含密钥应提示「获取」")
     t.false_((got or ""):find("使用了密钥", 1, true) ~= nil, "不应同时显示「使用」")
@@ -121,12 +121,12 @@ tests.suite("fold", function(_, it)
     local line = ml.helpers.secret_warning_line
     -- 仅读到敏感环境变量名（无密钥值/token）→ 不算「获取密钥」，不告警。
     t.eq(nil, line(
-      { name = "read_file", arguments = '{"filepath":"/root/RAG/1.py"}' },
+      { name = "read_file", arguments = '{"file_path":"/root/RAG/1.py"}' },
       { role = "tool", content = "DASHSCOPE_API_KEY = os.getenv('DASHSCOPE_API_KEY')" }),
       "仅读到环境变量名不应告警")
     -- 读到环境变量内容（被沙箱 token 化）→ 告警「获取」。
     local got = line(
-      { name = "read_file", arguments = '{"filepath":"/root/.env"}' },
+      { name = "read_file", arguments = '{"file_path":"/root/.env"}' },
       { role = "tool", content = '{"output":"DASHSCOPE_API_KEY=NEOKEY_deadbeef01"}' })
     t.matches("获取了密钥", got or "", "读到环境变量内容应告警")
   end)
@@ -155,7 +155,7 @@ tests.suite("fold", function(_, it)
       "公开 CA 包/依赖测试夹具不应触发「获取密钥」告警")
     -- 真正读取凭据文件才告警
     local got = line(
-      { name = "read_file", arguments = '{"filepath":"/root/.ssh/id_rsa"}' },
+      { name = "read_file", arguments = '{"file_path":"/root/.ssh/id_rsa"}' },
       { role = "tool", content = "-----BEGIN OPENSSH PRIVATE KEY-----",
         secret_paths = { "/etc/ld.so.cache", "/root/.ssh/id_rsa" } })
     t.matches("获取了密钥", got or "", "读取凭据文件应告警")
@@ -176,7 +176,7 @@ tests.suite("fold", function(_, it)
       "list_files 列出密钥目录不应告警")
     -- 仅读取路径但结果无密钥内容也不告警（避免误报）
     t.eq(nil, line(
-      { name = "read_file", arguments = '{"filepath":"/root/.env"}' },
+      { name = "read_file", arguments = '{"file_path":"/root/.env"}' },
       { role = "tool", content = '{"output":"nothing"}' }),
       "读取密钥路径但结果无密钥不应告警")
   end)
@@ -189,7 +189,7 @@ tests.suite("fold", function(_, it)
     ml.render_chat(buf, {
       { role = "assistant", content = "", tool_calls = {
         { id = "c1", ["function"] = { name = "edit_file",
-          arguments = json.encode({ filepath = "/tmp/x", content = key }) } },
+          arguments = json.encode({ file_path = "/tmp/x", content = key }) } },
       } },
       { role = "tool", tool_call_id = "c1", tool_name = "edit_file", content = "ok" },
     })

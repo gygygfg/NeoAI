@@ -129,7 +129,11 @@ local function _build(svc, opts)
       s.mode = "bind"
     end
   end
-  candidate.materialize_overlay(specs)
+  local conflicts = candidate.materialize_overlay(specs)
+  if conflicts and #conflicts > 0 then
+    candidate.cleanup(attempt.attempt_id)
+    return nil, "SANDBOX_MATERIALIZE_TYPE_CONFLICT: " .. tostring(conflicts[1] and conflicts[1].real)
+  end
   svc.specs = specs
 
   local priv = {

@@ -63,13 +63,13 @@ tests.suite("agent", function(_, it)
     local chunks = {
       { tool_calls = { { index = 0, id = "c1", ["function"] = { name = "read_" } } } },
       { tool_calls = { { index = 0, ["function"] = { name = "file" } } } },
-      { tool_calls = { { index = 0, ["function"] = { arguments = '{"filepath":' } } } },
+      { tool_calls = { { index = 0, ["function"] = { arguments = '{"file_path":' } } } },
       { tool_calls = { { index = 0, ["function"] = { arguments = '"a.txt"}' } } } },
     }
     local final = stream.accumulate_tool_calls(chunks)
     t.eq(1, #final)
     t.eq("read_file", final[1]["function"].name)
-    t.eq('{"filepath":"a.txt"}', final[1]["function"].arguments)
+    t.eq('{"file_path":"a.txt"}', final[1]["function"].arguments)
   end)
 
   it("stream 多个工具调用", function(t)
@@ -90,7 +90,7 @@ tests.suite("agent", function(_, it)
       tools = {
         read_file = {
           description = "读取文件",
-          parameters = { type = "object", properties = { filepath = { type = "string" } }, required = { "filepath" } },
+          parameters = { type = "object", properties = { file_path = { type = "string" } }, required = { "file_path" } },
         },
       },
     }
@@ -98,7 +98,7 @@ tests.suite("agent", function(_, it)
     t.eq(1, #defs)
     t.eq("function", defs[1].type)
     t.eq("read_file", defs[1]["function"].name)
-    t.eq("filepath", defs[1]["function"].parameters.required[1])
+    t.eq("file_path", defs[1]["function"].parameters.required[1])
   end)
 
   it("request 参数别名规范化", function(t)

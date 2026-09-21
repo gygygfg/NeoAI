@@ -1420,7 +1420,7 @@ tests.suite("chat_ui", function(_, it)
       { role = "user", content = "跑命令" },
       { role = "assistant", content = "", tool_calls = {
         { id = "m1", ["function"] = { name = "run_command", arguments = '{"command":"echo one\\necho two"}' } },
-        { id = "m2", ["function"] = { name = "read_file", arguments = '{"filepath":"/a/b/c.txt"}' } },
+        { id = "m2", ["function"] = { name = "read_file", arguments = '{"file_path":"/a/b/c.txt"}' } },
       } },
     }
     chat_view.refresh()
@@ -1447,7 +1447,7 @@ tests.suite("chat_ui", function(_, it)
     chat_view.flush()
 
     local h2 = find_line("调用工具: read_file")
-    local fp = find_line('"filepath"')
+    local fp = find_line('"file_path"')
     t.true_(h2 > 0 and fp > h2, "应找到仍在执行的 read_file 首行与内容行")
     local close = fp + 1
     t.true_(vim.api.nvim_buf_get_lines(opened.buf, close - 1, close, false)[1]:find("}", 1, true) ~= nil,
@@ -1474,7 +1474,7 @@ tests.suite("chat_ui", function(_, it)
       { role = "user", content = "跑命令" },
       { role = "assistant", content = "", tool_calls = {
         { id = "c_ok", ["function"] = { name = "run_command", arguments = '{"cmd": "ls", "dirs": "/tmp"}' } },
-        { id = "c_err", ["function"] = { name = "read_file", arguments = '{"filepath": "/nope.txt"}' } },
+        { id = "c_err", ["function"] = { name = "read_file", arguments = '{"file_path": "/nope.txt"}' } },
       } },
       { role = "tool", tool_call_id = "c_ok", tool_name = "run_command", content = "file1\nfile2" },
       { role = "tool", tool_call_id = "c_err", tool_name = "read_file", content = '{"error": "文件不存在", "tool": "read_file"}' },
@@ -1490,7 +1490,7 @@ tests.suite("chat_ui", function(_, it)
     t.true_(joined:find("结果:", 1, true) ~= nil, "折叠内应有结果标签")
     t.true_(joined:find("file1", 1, true) ~= nil, "成功工具应展示执行结果")
     -- 失败工具：同样有结构化参数与结构化（JSON）错误结果
-    t.true_(joined:find('"filepath": "/nope.txt"', 1, true) ~= nil, "失败工具也应展示调用参数")
+    t.true_(joined:find('"file_path": "/nope.txt"', 1, true) ~= nil, "失败工具也应展示调用参数")
     t.true_(joined:find('"error": "文件不存在"', 1, true) ~= nil, "失败工具应结构化展示错误结果")
     t.true_(joined:find("❌ 工具: read_file", 1, true) ~= nil, "失败工具首行应为 ❌ 状态")
     -- 参数里不应重复展示 description 样板字段

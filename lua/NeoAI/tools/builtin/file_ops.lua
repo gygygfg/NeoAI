@@ -246,11 +246,22 @@ local function _sandbox_overrides()
   return ov
 end
 
---- 规范化绝对路径（去尾部斜杠）
+--- 规范化绝对路径（展开 ~/$VAR、绝对化、解析符号链接并折叠 `..`，去尾部斜杠）。
+--- 必须与 `candidate` 的暂存键（`fs.canonical`）同口径：否则符号链接 / `..` 写法会让
+--- 合并视图匹配失败，只读工具（list/search/file_exists）落回真实磁盘，与 `git_diff`
+--- （overlay 暂存视图）对同一路径给出矛盾结果。
 --- @param p string
 --- @return string
 local function _abs_norm(p)
-  return (vim.fn.fnamemodify(fs.expand(p), ":p"):gsub("/+$", ""))
+  return fs.canonical(p)
+end
+
+--- 路径 abs 是否等于 dir 或位于 dir 之下（前缀 + 边界判定，避免 `/a/bc` 误配 `/a/b`）。
+--- @param abs string
+--- @param dir string
+--- @return boolean
+local function _is_under(abs, dir)
+  return abs == dir or abs:sub(1, #dir + 1) == dir .. "/"
 end
 
 --- 暂存条目是否为目录（create_directory 等会暂存目录本身）。
@@ -373,14 +384,30 @@ local function _merge_search(base_text, dir, query, include, max)
   if #overrides == 0 then return base_text end
   local absdir = _abs_norm(dir)
   local overridden = {}
-  for _, o in ipairs(overrides) do overridden[o.real] = o.deleted end
+  -- 被暂存覆盖（修改/删除）或整体为暂存目录的路径：其下真实搜索结果必须整体丢弃，
+  -- 否则「暂存删除的目录」下真实文件仍会被搜出，与 git_diff 视图分裂。
+  local overridden_dirs = {}
+  for _, o in ipairs(overrides) do
+    overridden[o.real] = o.deleted
+    if o.deleted or _override_is_dir(o) then
+      overridden_dirs[#overridden_dirs + 1] = o.real
+    end
+  end
+  local function is_overridden(p)
+    local ap = _abs_norm(p)
+    if overridden[ap] ~= nil then return true end
+    for _, d in ipairs(overridden_dirs) do
+      if _is_under(ap, d) then return true end
+    end
+    return false
+  end
   local out, count = {}, 0
   local limit = (max and max > 0) and max or 50
   if base_text ~= "" and base_text ~= "未找到匹配内容" then
     for line in (base_text .. "\n"):gmatch("(.-)\n") do
       if line ~= "" and count < limit then
         local p = line:match("^(.-): ")
-        if p and overridden[_abs_norm(p)] == nil then
+        if p and not is_overridden(p) then
           out[#out + 1] = line
           count = count + 1
         end
@@ -424,21 +451,21 @@ local file_tools = {}
 -- 读取文件（线程池异步）
 file_tools.read_file = helpers.define_tool(
   "read_file",
-  "读取文件内容。filepath 必填；start_line/end_line 可选指定行范围（1-based，含两端）。"
+  "读取文件内容。file_path 必填；start_line/end_line 可选指定行范围（1-based，含两端）。"
     .. "未指定行范围且文件较大（默认超 500 字符）时不返回全文，"
     .. "而返回该文件的语法树节点大纲（无解析器时为截断预览），"
     .. "以避免一次性读取过大文件；此时请改用 start_line/end_line 读取所需区间。",
   {
     type = "object",
     properties = {
-      filepath = { type = "string", description = "文件路径" },
+      file_path = { type = "string", description = "文件路径" },
       start_line = { type = "integer", description = "起始行号（可选）" },
       end_line = { type = "integer", description = "结束行号（可选）" },
     },
-    required = { "filepath" },
+    required = { "file_path" },
   },
   function(args, on_success, on_error)
-    local filepath = args.filepath
+    local filepath = args.file_path
     local guard = _read_guard_opts()
     local max_bytes = guard.max_read_bytes
     if args.start_line or args.end_line then
@@ -480,14 +507,14 @@ file_tools.read_file = helpers.define_tool(
 -- 编辑文件（线程池异步读写）
 file_tools.edit_file = helpers.define_tool(
   "edit_file",
-  "编辑文件。filepath/description 必填。两种用法互斥："
+  "编辑文件。file_path/description 必填。两种用法互斥："
     .. "(1) 局部替换——提供 edits 数组，或用顶层 old_text+new_text 简写单条替换，均不得传 mode；"
     .. "(2) 整文件覆写或追加——必须显式 mode='write'（覆写）/ mode='append'（追加），并提供 content。"
     .. "替换字段与 mode 同时出现、或提供 content 却省略 mode、或两者皆无，都会直接报错（不静默覆写）。",
   {
     type = "object",
     properties = {
-      filepath = { type = "string", description = "文件路径" },
+      file_path = { type = "string", description = "文件路径" },
       description = { type = "string", description = "修改目的说明（必填，供审批与记录）" },
       mode = {
         type = "string",
@@ -503,10 +530,10 @@ file_tools.edit_file = helpers.define_tool(
       old_text = { type = "string", description = "单条替换：被替换文本（须与 new_text 成对，与 mode 互斥）" },
       new_text = { type = "string", description = "单条替换：替换为的文本（须与 old_text 成对，与 mode 互斥）" },
     },
-    required = { "filepath", "description" },
+    required = { "file_path", "description" },
   },
   function(args, on_success, on_error)
-    local filepath = args.filepath
+    local filepath = args.file_path
     local description = args.description
     -- 参数契约（严格互斥，误传即报错，绝不静默降级为覆写）：
     --   · 局部替换：提供 edits（或顶层 old_text/new_text 简写），且不得同时传 mode；
@@ -745,19 +772,19 @@ file_tools.search_files = helpers.define_tool(
 -- 文件是否存在（同步，量级极小）
 file_tools.file_exists = helpers.define_tool(
   "file_exists",
-  "检查文件是否存在。filepath 必填。返回 'true'/'false'。",
+  "检查文件是否存在。file_path 必填。返回 'true'/'false'。",
   {
     type = "object",
-    properties = { filepath = { type = "string" } },
-    required = { "filepath" },
+    properties = { file_path = { type = "string" } },
+    required = { "file_path" },
   },
   function(args, on_success)
-    local sv = _sandbox_path_exists(args.filepath)
+    local sv = _sandbox_path_exists(args.file_path)
     if sv ~= nil then
       on_success(tostring(sv))
       return
     end
-    on_success(tostring(fs.exists(args.filepath)))
+    on_success(tostring(fs.exists(args.file_path)))
   end,
   { category = "file" }
 )
@@ -765,16 +792,16 @@ file_tools.file_exists = helpers.define_tool(
 -- 创建目录
 file_tools.create_directory = helpers.define_tool(
   "create_directory",
-  "创建目录（递归）。filepath 必填。",
+  "创建目录（递归）。file_path 必填。",
   {
     type = "object",
-    properties = { filepath = { type = "string" } },
-    required = { "filepath" },
+    properties = { file_path = { type = "string" } },
+    required = { "file_path" },
   },
   function(args, on_success, on_error)
-    local ok, err = fs.ensure_dir(args.filepath)
+    local ok, err = fs.ensure_dir(args.file_path)
     if not ok then on_error("创建目录失败: " .. tostring(err)) return end
-    on_success("目录已创建: " .. args.filepath)
+    on_success("目录已创建: " .. args.file_path)
   end,
   { category = "file", approval = { auto_allow = false } }
 )
@@ -782,16 +809,16 @@ file_tools.create_directory = helpers.define_tool(
 -- 确保目录存在
 file_tools.ensure_dir = helpers.define_tool(
   "ensure_dir",
-  "确保目录存在（不存在则创建）。filepath 必填。",
+  "确保目录存在（不存在则创建）。file_path 必填。",
   {
     type = "object",
-    properties = { filepath = { type = "string" } },
-    required = { "filepath" },
+    properties = { file_path = { type = "string" } },
+    required = { "file_path" },
   },
   function(args, on_success, on_error)
-    local ok, err = fs.ensure_dir(args.filepath)
+    local ok, err = fs.ensure_dir(args.file_path)
     if not ok then on_error("创建目录失败: " .. tostring(err)) return end
-    on_success("目录已就绪: " .. args.filepath)
+    on_success("目录已就绪: " .. args.file_path)
   end,
   { category = "file", approval = { auto_allow = false } }
 )
@@ -799,20 +826,20 @@ file_tools.ensure_dir = helpers.define_tool(
 -- 删除文件（线程池异步）
 file_tools.delete_file = helpers.define_tool(
   "delete_file",
-  "删除文件。filepath 必填。",
+  "删除文件。file_path 必填。",
   {
     type = "object",
-    properties = { filepath = { type = "string" } },
-    required = { "filepath" },
+    properties = { file_path = { type = "string" } },
+    required = { "file_path" },
   },
   function(args, on_success, on_error)
-    if not fs.exists(args.filepath) then
-      on_error("文件不存在: " .. args.filepath)
+    if not fs.exists(args.file_path) then
+      on_error("文件不存在: " .. args.file_path)
       return
     end
-    _pipe(fs.delete_file_async(args.filepath), function()
-      helpers.reload_buffers_for(args.filepath)
-      on_success("文件已删除: " .. args.filepath)
+    _pipe(fs.delete_file_async(args.file_path), function()
+      helpers.reload_buffers_for(args.file_path)
+      on_success("文件已删除: " .. args.file_path)
     end, on_error)
   end,
   { category = "file", approval = { auto_allow = false } }

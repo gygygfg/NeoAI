@@ -151,7 +151,7 @@ tests.suite("sandbox_lsp", function(_, it)
       sandbox.reset()
       local done = false
       require("NeoAI.tools").execute("edit_file", {
-        filepath = dir .. "/f.txt", mode = "write", content = "staged\n", description = "t",
+        file_path = dir .. "/f.txt", mode = "write", content = "staged\n", description = "t",
       }, {}):then_(function()
         local specs = lsp.refresh(dir)
         if specs then
@@ -196,7 +196,7 @@ tests.suite("sandbox_lsp", function(_, it)
       sandbox.reset()
       local done = false
       require("NeoAI.tools").execute("edit_file", {
-        filepath = outside .. "/g.txt", mode = "write", content = "staged\n", description = "t",
+        file_path = outside .. "/g.txt", mode = "write", content = "staged\n", description = "t",
       }, {}):then_(function()
         local specs = lsp.refresh(cwd)
         if not specs then done = true; return end
@@ -238,7 +238,7 @@ tests.suite("sandbox_lsp", function(_, it)
       t.not_nil(bufnr, "应能后台加载 buffer")
       local done = false
       require("NeoAI.tools").execute("edit_file", {
-        filepath = real, mode = "write", content = "local y = 2\n", description = "t",
+        file_path = real, mode = "write", content = "local y = 2\n", description = "t",
       }, {}):then_(function()
         helpers.sync_buffer_from_sandbox(bufnr, real)
         t.eq("local y = 2",
@@ -275,7 +275,7 @@ tests.suite("sandbox_lsp", function(_, it)
       sandbox.reset()
       local done = false
       require("NeoAI.tools").execute("edit_file", {
-        filepath = dir .. "/f.txt", mode = "write", content = "staged\n", description = "t",
+        file_path = dir .. "/f.txt", mode = "write", content = "staged\n", description = "t",
       }, {}):then_(function()
         local wrapped = lsp.wrap_cmd({ "cat", "f.txt" }, { cwd = dir })
         if not wrapped then done = true; return end

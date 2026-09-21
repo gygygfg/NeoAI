@@ -1701,6 +1701,56 @@ function M.is_masked_path(path, unmask)
   return nil
 end
 
+--- 路径是否位于某个 git 仓库的内部目录（`.git`）之下。
+--- 用于文件写入工具拒绝直接改仓库内部（AI 不应手改 `.git`）。git 变更走专用工具，其 `.git`
+--- 改动由 `git_path_class` 分类后**原子化**暂存/发布（对象先于指针），不会损坏索引。
+--- 判定：任一路径段为 `.git`（兼容 `.git` 为文件的工作树/子模块形式）。
+--- @param path string|nil
+--- @return boolean
+function M.is_git_internal(path)
+  if type(path) ~= "string" or path == "" then return false end
+  for seg in path:gmatch("[^/]+") do
+    if seg == ".git" then return true end
+  end
+  return false
+end
+
+--- 分类 `.git` 内部路径，用于**原子化**暂存/发布：
+---   object    对象库（`.git/objects/**`）——内容寻址、不可变、可累加；**必须先于指针写入**，
+---             且永不单独丢弃/删除，否则索引/refs 会指向不存在的对象（悬空引用）。
+---   pointer   指针（index / HEAD / refs/** / logs/** / packed-refs / *_HEAD 等）——可变，
+---             指向对象；**必须在对象之后写入**，可做 CAS 冲突检测。
+---   transient 瞬态文件（`*.lock`、`gc.log`）——绝不暂存/发布。
+---   other     其它（config/hooks/info 等）——不纳入候选（AI 不应改仓库配置）。
+--- 返回 nil 表示不是 `.git` 内部路径。
+--- @param path string|nil
+--- @return string|nil
+function M.git_path_class(path)
+  if type(path) ~= "string" or path == "" then return nil end
+  local marker = path:find("/%.git/")
+  local prefix_len
+  if marker then
+    prefix_len = marker + 5 -- 指向 ".git" 之后
+  elseif path:match("^%.git/") then
+    prefix_len = 6
+  else
+    -- 路径本身即 `.git`（目录/文件）本身，无内部相对路径。
+    if path == ".git" or path:sub(-5) == "/.git" then return "other" end
+    return nil
+  end
+  local rel = path:sub(prefix_len + 1)
+  if rel == "" then return "other" end
+  if rel:match("%.lock$") or rel == "gc.log" then return "transient" end
+  if rel == "index" or rel == "HEAD" or rel == "packed-refs" or rel == "ORIG_HEAD"
+    or rel == "MERGE_HEAD" or rel == "CHERRY_PICK_HEAD" or rel == "REVERT_HEAD"
+    or rel == "FETCH_HEAD" or rel == "COMMIT_EDITMSG" or rel == "MERGE_MSG"
+    or rel:sub(1, 5) == "refs/" or rel:sub(1, 5) == "logs/" then
+    return "pointer"
+  end
+  if rel:sub(1, 8) == "objects/" then return "object" end
+  return "other"
+end
+
 --- 遮蔽目录总开关与列表（只读查询）
 --- @return boolean
 function M.mask_dirs_enabled()

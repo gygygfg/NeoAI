@@ -1174,6 +1174,24 @@ local function _gate_inner(tool, args, ctx, call_original)
   local spec = tool and tool.__sandbox_spec or tool_spec.get(tool and tool.name, tool and tool.category)
   local attempt = control.new_attempt(tool and tool.name or "unknown", args, ctx, spec)
 
+  -- git 变更命令守卫（所有带 `command` 的进程类工具，含 run_command / service_start）：
+  -- `.git` 是索引↔对象库↔refs 强耦合数据库，不可经命令在沙箱 overlay 内修改（其写入被捕获
+  -- 排除、会静默丢弃；逐文件暂存还会拆散耦合）。变更改走专用宿主 git 工具。
+  if type(args) == "table" and type(args.command) == "string" then
+    local sub = require("NeoAI.sandbox.git_guard").mutating(args.command)
+    if sub then
+      control.transition(attempt, "PARSED")
+      control.transition(attempt, "BLOCKED")
+      return async.reject({
+        kind = "sandbox",
+        message = "SANDBOX_GIT_MUTATION_VIA_COMMAND: 检测到 git 变更子命令 `" .. sub
+          .. "`。`.git` 不可经命令修改，请改用专用 git 工具"
+          .. "（git_add / git_commit / git_stash / git_restore）。",
+        command_id = attempt.command_id,
+      })
+    end
+  end
+
   -- 幂等：同一 client_idempotency_key 携带不同请求必须拒绝
   local ok_idem, idem_reason = control.claim_idempotency(ctx.client_idempotency_key, attempt.request_hash)
   if not ok_idem then
@@ -1343,7 +1361,7 @@ local function _gate_inner(tool, args, ctx, call_original)
     control.transition(attempt, "STAGING")
     control.transition(attempt, "CANDIDATE_READY")
     control.transition(attempt, "COMPLETED_READ_ONLY")
-    local endpoint = args and (args.url or args.endpoint or args.filepath)
+    local endpoint = args and (args.url or args.endpoint or args.file_path or args.filepath)
     local evidence_id = evidence.add("network", {
       endpoint = endpoint, allowed = true, denied = false, source = "observed",
     }, {
@@ -1434,8 +1452,21 @@ local function _gate_inner(tool, args, ctx, call_original)
         spec.overlay_reason = runtime.overlay_reason(spec.root, spec.upper, spec.work)
       end
     end
-    -- 双向互通：把工作区暂存内容物化进所选层，使命令看到 AI 尚未发布的编辑
-    candidate.materialize_overlay(specs)
+    -- 双向互通：把工作区暂存内容物化进所选层，使命令看到 AI 尚未发布的编辑。
+    -- 类型冲突（暂存文件目标在真实/overlay 中是目录）会使命令视图与只读工具视图分裂，
+    -- 显式拒绝而非静默跳过（H4）。
+    local conflicts = candidate.materialize_overlay(specs)
+    if conflicts and #conflicts > 0 then
+      local first = conflicts[1]
+      candidate.cleanup(attempt.attempt_id)
+      control.transition(attempt, "FAILED")
+      return async.reject({
+        kind = "sandbox",
+        message = "SANDBOX_MATERIALIZE_TYPE_CONFLICT: 暂存文件与目录类型冲突，拒绝执行: "
+          .. tostring(first and first.real or "?"),
+        command_id = attempt.command_id,
+      })
+    end
     -- 会话级 shell 状态（export/cd 跨命令保留）：仅 bwrap 后端支持（bind 会话目录）。
     local session_shell = (cfg.session_shell ~= false) and runtime.backend() == "bwrap"
     local session_dir = nil
@@ -1730,14 +1761,22 @@ local function _gate_inner(tool, args, ctx, call_original)
               { tier = attempt.privilege_tier, network = true }, { reason = "PRIVILEGED_TIER" })
           end)
         end
-        if cand and #cand.files > 0 then
+        local has_view = cand and cand.view_files and #cand.view_files > 0
+        if cand and (#cand.files > 0 or has_view) then
           cand.command_id = attempt.command_id
           -- 包/生成内容判定（命令判定或路径判定）：跳过密钥 token 化与密钥分析，
           -- 避免对 venv/site-packages/node_modules 等逐文件全文扫描。
           local is_pkg = attempt.package == true or _package_manager_of(cand, attempt) ~= nil
           -- 双向互通：把命令改动合并进工作区暂存映射，使 read_file/edit_file 可见。
           -- 候选落盘与密钥分析均异步（线程池），避免大量文件时占满主线程。
+          -- `view_files`（命令还原暂存编辑、对真实盘无净改动）也需经 merge 同步暂存视图。
           return candidate.merge_candidate_async(cand, { from_command = true, package = is_pkg }):then_(function()
+            if #cand.files == 0 then
+              -- 仅有视图同步（无发布候选）：直接完成，不入待审。
+              control.transition(attempt, "COMPLETED_READ_ONLY")
+              candidate.cleanup(attempt.attempt_id)
+              return { ok = true, value = res }
+            end
             return _persist_and_settle(cand, attempt, ctx, cfg, spec, res, { command = args and args.command })
           end):then_(function(settled)
             candidate.cleanup(attempt.attempt_id)
@@ -1868,6 +1907,21 @@ local function _gate_inner(tool, args, ctx, call_original)
   -- 目录工具（创建/确保目录）合法地以目录为目标；其余 fs_write（edit_file 等）写文件，
   -- 若目标在真实盘或沙箱视图中是目录，必须拒绝——否则会把目录覆盖成文件，破坏沙箱视图
   -- 一致性（后续 `ls dir/` 报 Not a directory，属「文件缓存一致性损坏」）。
+  -- `.git` 内部禁止经通用文件写入工具修改（索引↔对象库耦合）：改由专用宿主 git 操作处理。
+  for _, key in ipairs(spec.paths or {}) do
+    if type(args[key]) == "string"
+      and require("NeoAI.sandbox.runtime").is_git_internal(args[key]) then
+      sandbox._set_active_attempt(previous_active)
+      candidate.cleanup(attempt.attempt_id)
+      control.transition(attempt, "FAILED")
+      return async.reject({
+        kind = "sandbox",
+        message = "SANDBOX_GIT_INTERNAL: `.git` 内部不可用文件工具修改，"
+          .. "请使用专用 git 工具（git_add/git_commit/git_stash/git_restore）: " .. args[key],
+        command_id = attempt.command_id,
+      })
+    end
+  end
   local DIR_TOOLS = { create_directory = true, ensure_dir = true }
   if not DIR_TOOLS[attempt.tool_name] then
     for _, key in ipairs(spec.paths or {}) do

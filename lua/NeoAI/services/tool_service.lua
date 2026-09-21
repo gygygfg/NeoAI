@@ -63,7 +63,7 @@ local function _target_path(tool_name, args)
     local p = args[field]
     if type(p) == "string" and p ~= "" then return p end
   end
-  for _, field in ipairs({ "filepath", "path", "file" }) do
+  for _, field in ipairs({ "file_path", "filepath", "path", "file" }) do
     local p = args[field]
     if type(p) == "string" and p ~= "" then return p end
   end

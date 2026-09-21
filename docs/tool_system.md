@@ -61,7 +61,7 @@ MCP 远端工具由 `services/mcp/init.lua` 动态注册（`category = "mcp"`，
 
 ```
 resolve_name（别名/模糊匹配）
-  → _normalize_arguments（别名映射，如 cmd→command、file→filepath）
+  → _normalize_arguments（别名映射，如 cmd→command、file→file_path）
   → _expand_path_args（展开 ~ / $VAR 路径）
   → validator.validate_parameters（schema 校验）
   → 审批决策 validator.check_approval(...)
@@ -85,15 +85,15 @@ resolve_name（别名/模糊匹配）
 
 ### 4.1 参数别名规范化
 
-`_normalize_arguments` 处理常见别名：`cmd→command`、`file/files→filepath`、`start→start_line`、
-`end→end_line` 等。简单字符串参数（`read_file` 等）直接转 `{ filepath = ... }`。
+`_normalize_arguments` 处理常见别名：`cmd→command`、`file/files/filepath→file_path`、`start→start_line`、
+`end→end_line` 等。简单字符串参数（`read_file` 等）直接转 `{ file_path = ... }`。
 
 > 注意：**不再**为 `new_text` / `text` 建立 `content` 别名。历史上该别名会把 `edit_file` 的「局部替换」
 > 误判为「整文件覆写」，造成静默覆写；现已移除，误传会直接报错。
 
 ### 4.2 路径展开
 
-`_expand_path_args` 对 `path` / `filepath` / `file_path` / `dirs` / `dir` 字段展开 `~` 别名
+`_expand_path_args` 对 `path` / `file_path` / `filepath` / `dirs` / `dir` 字段展开 `~` 别名
 （`~/...` ↔ 主目录），使相对主目录的路径可正常读写。
 
 ### 4.3 审批决策（tools/validator.lua，非 async 模式）
@@ -106,7 +106,7 @@ resolve_name（别名/模糊匹配）
 - `mode == "auto_allow"` → 不审批。
 - `mode == "strict"` → 必审批。
 - `approval_config.auto_allow == true` → 不审批。
-- **路径安全**：`filepath` 落入 `allowed_directories` → 安全。
+- **路径安全**：`file_path` 落入 `allowed_directories` → 安全。
 - **参数安全**：`command` 首词落入 `allowed_param_groups`（如 `ls`/`grep`）→ 安全。
 - 无路径且无命令 → 按 `auto_allow` 决定。
 
@@ -186,8 +186,14 @@ stdout/stderr 合计超过 `tools.run_command.max_output_bytes`（默认 16 MiB�
 
 ### 🗂 Git（git_ops.lua）
 
-`git_status` / `git_diff` / `git_log` / `git_commit_detail` / `git_branch` / `git_file_history` /
-`git_rollback` / `git_auto_commit_config`。
+只读：`git_status` / `git_diff` / `git_log` / `git_commit_detail` / `git_branch` /
+`git_file_history` / `git_auto_commit_config`（在沙箱命名空间内执行，看到暂存视图）。
+
+变更（在**沙箱内**执行 `effect=process`，改动**原子暂存进审批悬浮窗**）：`git_add` /
+`git_commit` / `git_stash` / `git_restore` / `git_rollback`。`.git` 是「索引↔对象库↔refs」强耦合
+数据库，按 `object → 普通文件 → pointer` 有序原子应用，绝不产生悬空引用（见
+[sandbox.md](sandbox.md)）；`run_command` 中的 git 变更子命令会被拒绝
+（`SANDBOX_GIT_MUTATION_VIA_COMMAND`），须改用上述专用工具。
 
 ### 🔧 LSP（lsp_ops.lua，Neovim >= 0.12）
 

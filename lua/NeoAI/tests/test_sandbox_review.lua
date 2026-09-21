@@ -217,6 +217,194 @@ tests.suite("sandbox_review", function(_, it)
     t.true_(not text:find("已保存", 1, true), "撤销后不应再出现「已保存」，实际: " .. text)
   end)
 
+  it("build_lines 为「已应用」区登记两级折叠级别", function(t)
+    local sr = require("NeoAI.ui.components.sandbox_review")
+    local data = sr.build_lines({}, {}, nil, {
+      { change_set_id = "csF1", tool = "edit_file", apply_state = "APPLIED",
+        saved_files = { { path = "/root/a.txt" }, { path = "/root/b.txt" } } },
+      { change_set_id = "csF2", tool = "edit_file", apply_state = "APPLIED",
+        saved_files = { { path = "/root/c.txt" } } },
+    })
+    local fl = data.fold_levels or {}
+    local title_ln, h1, h2
+    for i, l in ipairs(data.lines) do
+      if l:find("已应用", 1, true) and l:find("──", 1, true) then title_ln = title_ln or i end
+      if l:find("csF1", 1, true) then h1 = i end
+      if l:find("csF2", 1, true) then h2 = i end
+    end
+    t.not_nil(title_ln, "应有已应用区标题")
+    t.eq(1, fl[title_ln], "区标题应为一级折叠")
+    t.eq(2, fl[h1], "条目头行应为二级折叠")
+    t.eq(2, fl[h2], "第二条目头行应为二级折叠")
+    t.eq(2, fl[h1 + 1], "文件行应并入二级折叠")
+    t.eq(2, fl[h1 + 2], "第二个文件行应并入二级折叠")
+    for _, lv in pairs(fl) do
+      t.true_(lv == 1 or lv == 2, "仅已应用区登记折叠级别（1/2）")
+    end
+  end)
+
+  it("build_lines 待审普通条目不折叠（不登记折叠级别）", function(t)
+    local sr = require("NeoAI.ui.components.sandbox_review")
+    local cwd = vim.fn.getcwd()
+    local data = sr.build_lines({ { change_set_id = "csP", tool = "edit_file",
+      files = { { path = cwd .. "/p.lua" } } } }, {}, nil, {})
+    t.eq(0, #vim.tbl_keys(data.fold_levels or {}), "待审普通条目不应登记折叠级别")
+  end)
+
+  it("build_lines 待审 git 原子组登记整组折叠级别", function(t)
+    local sr = require("NeoAI.ui.components.sandbox_review")
+    local cwd = vim.fn.getcwd()
+    local data = sr.build_lines({ { change_set_id = "csGF", tool = "git_add", atomic_group = "git",
+      files = {
+        { path = cwd .. "/.git/index" },
+        { path = cwd .. "/.git/objects/ab/cd" },
+        { path = cwd .. "/a.lua" },
+      } } }, {}, nil, {})
+    local fl = data.fold_levels or {}
+    local head, last
+    for i, l in ipairs(data.lines) do
+      if l:find("csGF", 1, true) then head = i end
+      if l:find("a.lua", 1, true) then last = i end
+    end
+    t.not_nil(head, "应有 git 组头行")
+    t.not_nil(last, "应有 git 组文件行")
+    t.eq(nil, fl[head], "头行不折叠（保持正常显示与高亮）")
+    for ln = head + 1, last do
+      t.eq(1, fl[ln], "头行之后的提示/风险/文件行都应登记一级折叠")
+    end
+    t.eq(nil, fl[last + 1], "组尾空行不应登记折叠级别（避免相邻组合并）")
+  end)
+
+  it("open 后待审 git 原子组默认收起且可展开", function(t)
+    local services = require("NeoAI.kernel.services")
+    local sr = require("NeoAI.ui.components.sandbox_review")
+    sr.reset()
+    local saved = services.use("services.sandbox")
+    local cwd = vim.fn.getcwd()
+    services.provide("services.sandbox", {
+      list_reviews = function()
+        return { { change_set_id = "csGFO", tool = "git_add", atomic_group = "git", risk_level = 0,
+          files = { { path = cwd .. "/.git/index" }, { path = cwd .. "/a.lua" } } } }
+      end,
+      list_traces = function() return {} end,
+      list_saved = function() return {} end,
+      apply = function() return { ok = true } end,
+      reject = function() end,
+    })
+    sr.open()
+    local buf = sr.get_buf()
+    t.not_nil(buf, "应创建审批 buffer")
+    local win = vim.fn.bufwinid(buf)
+    t.true_(win ~= -1, "审批 buffer 应在窗口中显示")
+    local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+    local head
+    for i, l in ipairs(lines) do
+      if l:find("csGFO", 1, true) then head = i end
+    end
+    t.not_nil(head, "应有 git 组头行")
+    local function closed(ln)
+      return vim.api.nvim_win_call(win, function() return vim.fn.foldclosed(ln) end)
+    end
+    t.eq(-1, closed(head), "git 组头行应保持显示（不折叠）")
+    t.eq(head + 1, closed(head + 1), "头行之后（提示/文件）默认应处于折叠状态")
+    vim.api.nvim_win_set_cursor(win, { head + 1, 0 })
+    vim.api.nvim_win_call(win, function() vim.cmd("normal! zo") end)
+    t.eq(-1, closed(head + 1), "zo 后 git 组其余行应展开")
+    sr.close()
+    services.provide("services.sandbox", saved)
+  end)
+
+  it("窗口打开时订阅沙箱广播事件并自动刷新", function(t)
+    local services = require("NeoAI.kernel.services")
+    local sr = require("NeoAI.ui.components.sandbox_review")
+    local event_bus = require("NeoAI.kernel.event_bus")
+    local events = require("NeoAI.kernel.events")
+    sr.reset()
+    local saved = services.use("services.sandbox")
+    local cwd = vim.fn.getcwd()
+    local items = { { change_set_id = "csA", tool = "edit_file",
+      files = { { path = cwd .. "/a.lua" } } } }
+    services.provide("services.sandbox", {
+      list_reviews = function() return vim.deepcopy(items) end,
+      list_traces = function() return {} end,
+      list_saved = function() return {} end,
+      apply = function() return { ok = true } end,
+      reject = function() end,
+    })
+    sr.open()
+    local buf = sr.get_buf()
+    t.not_nil(buf, "应打开审批窗")
+    -- 广播新增待审：无需手动 refresh，事件驱动自动重绘。
+    items = {
+      { change_set_id = "csA", tool = "edit_file", files = { { path = cwd .. "/a.lua" } } },
+      { change_set_id = "csB", tool = "edit_file", files = { { path = cwd .. "/b.lua" } } },
+    }
+    event_bus.emit(events.SANDBOX_REVIEW_ENQUEUED, { change_set_id = "csB" })
+    local found = vim.wait(2000, function()
+      if not (buf and vim.api.nvim_buf_is_valid(buf)) then return false end
+      for _, l in ipairs(vim.api.nvim_buf_get_lines(buf, 0, -1, false)) do
+        if l:find("csB", 1, true) then return true end
+      end
+      return false
+    end, 10)
+    t.true_(found, "广播事件后应自动刷新出 csB")
+    sr.close()
+    services.provide("services.sandbox", saved)
+  end)
+
+  it("open 后「已应用」区默认整体折叠且两级展开", function(t)
+    local services = require("NeoAI.kernel.services")
+    local sr = require("NeoAI.ui.components.sandbox_review")
+    sr.reset()
+    local saved = services.use("services.sandbox")
+    services.provide("services.sandbox", {
+      list_reviews = function() return {} end,
+      list_traces = function() return {} end,
+      list_saved = function()
+        return {
+          { change_set_id = "csFA", tool = "edit_file", apply_state = "APPLIED",
+            saved_files = { { path = "/root/a.txt" }, { path = "/root/b.txt" } } },
+        }
+      end,
+      apply = function() return { ok = true } end,
+      reject = function() end,
+    })
+    sr.open()
+    local buf = sr.get_buf()
+    t.not_nil(buf, "应创建审批 buffer")
+    local win = vim.fn.bufwinid(buf)
+    t.true_(win ~= -1, "审批 buffer 应在窗口中显示")
+    t.eq("expr", vim.wo[win].foldmethod, "应为 expr 折叠")
+    t.true_(vim.wo[win].foldenable == true, "应开启折叠")
+    t.eq(0, vim.wo[win].foldlevel, "默认折叠级别应为 0（整体收起）")
+
+    local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+    local title_ln, header_ln
+    for i, l in ipairs(lines) do
+      if l:find("已应用", 1, true) and l:find("──", 1, true) then title_ln = i end
+      if l:find("csFA", 1, true) then header_ln = i end
+    end
+    t.not_nil(title_ln, "应有已应用区标题")
+    t.not_nil(header_ln, "应有条目头行")
+
+    local function closed(ln)
+      return vim.api.nvim_win_call(win, function() return vim.fn.foldclosed(ln) end)
+    end
+    t.eq(title_ln, closed(title_ln), "已应用区标题默认应处于折叠状态")
+
+    vim.api.nvim_win_set_cursor(win, { title_ln, 0 })
+    vim.api.nvim_win_call(win, function() vim.cmd("normal! zo") end)
+    t.eq(-1, closed(title_ln), "zo 后区标题应展开")
+    t.eq(header_ln, closed(header_ln), "区展开后条目应仍收起")
+
+    vim.api.nvim_win_set_cursor(win, { header_ln, 0 })
+    vim.api.nvim_win_call(win, function() vim.cmd("normal! zo") end)
+    t.eq(-1, closed(header_ln), "zo 后条目应展开")
+
+    sr.close()
+    services.provide("services.sandbox", saved)
+  end)
+
   it("open 仅有越界留痕时也能打开审批窗", function(t)
     local services = require("NeoAI.kernel.services")
     local sr = require("NeoAI.ui.components.sandbox_review")
@@ -876,5 +1064,73 @@ tests.suite("sandbox_review", function(_, it)
     t.eq(3, #calls, "重入不应重复应用")
     sr.close()
     services.provide("services.sandbox", saved)
+  end)
+
+  it("build_lines：git 原子组整组渲染，文件行映射到整组（不可逐文件）", function(t)
+    local sr = require("NeoAI.ui.components.sandbox_review")
+    local dir = vim.fn.tempname()
+    local items = { {
+      change_set_id = "csgit", tool = "git_add", atomic_group = "git",
+      files = {
+        { path = dir .. "/.git/objects/ab/cd", action = "create" },
+        { path = dir .. "/.git/index", action = "modify" },
+        { path = dir .. "/work.txt", action = "modify" },
+      },
+    } }
+    local data = sr.build_lines(items)
+    local head
+    for i, l in ipairs(data.lines) do
+      if l:find("git 操作", 1, true) then head = i break end
+    end
+    t.not_nil(head, "头行应标注 git 操作")
+    local mapped = 0
+    for _, tgt in pairs(data.line_to_target) do
+      if tgt.change_set_id == "csgit" then
+        mapped = mapped + 1
+        t.true_(tgt.whole == true, "git 组的所有行都应映射到整组")
+        t.nil_(tgt.path, "git 组不应有逐文件目标")
+      end
+    end
+    t.true_(mapped >= 4, "应有头行 + 提示行 + 3 个文件行，实际 " .. tostring(mapped))
+  end)
+
+  it("git 原子组：enqueue 标记，apply 忽略文件子集整组应用，reject_file 整组拒绝", function(t)
+    local review = require("NeoAI.sandbox.review")
+    local store = require("NeoAI.sandbox.store")
+    local candidate = require("NeoAI.sandbox.candidate")
+    review.reset()
+    local dir = vim.fn.tempname()
+    local function make_cand()
+      return {
+        candidate_digest = "sha256:gittest-" .. tostring(vim.uv.hrtime()),
+        files = {
+          { path = dir .. "/.git/objects/ab/cd", action = "create", content = "obj", after_hash = "h1" },
+          { path = dir .. "/.git/index", action = "modify", content = "idx", after_hash = "h2" },
+          { path = dir .. "/work.txt", action = "modify", content = "w", after_hash = "h3" },
+        },
+      }
+    end
+    local item = review.enqueue(make_cand(), { tool = "git_add" })
+    t.not_nil(item, "应入队")
+    t.eq("git", item.atomic_group, "应标记为 git 原子组")
+    -- apply 传单文件子集也应整组应用
+    local orig_read, orig_pub = store.read_candidate, candidate.publish
+    local published
+    store.read_candidate = function() return make_cand() end
+    candidate.publish = function(c)
+      published = {}
+      for _, f in ipairs(c.files) do published[#published + 1] = f.path end
+      return { ok = true, state = "COMMITTED", receipt = { operation_id = "op_test" } }
+    end
+    local res = review.apply(item.change_set_id, { auto_approve = true, files = { dir .. "/work.txt" } })
+    store.read_candidate, candidate.publish = orig_read, orig_pub
+    t.true_(res.ok, "应用应成功: " .. tostring(res and res.reason))
+    t.eq(3, #published, "git 原子组应忽略文件子集，整组应用")
+    -- reject_file 应整组拒绝
+    local item2 = review.enqueue(make_cand(), { tool = "git_add" })
+    review.reject_file(item2.change_set_id, dir .. "/work.txt")
+    local after = review.get(item2.change_set_id)
+    t.eq(review.REVIEW.REJECTED, after.review_state, "reject_file 应整组拒绝 git 原子组")
+    review.reset()
   end)
 end)

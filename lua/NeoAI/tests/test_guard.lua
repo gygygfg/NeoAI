@@ -8,7 +8,7 @@ tests.suite("guard", function(_, it)
     local guard = require("NeoAI.core.agent.guard")
     local agent = { id = "g1" }
     local call = function()
-      return { { id = "1", ["function"] = { name = "read_file", arguments = '{"filepath":"a.txt"}' } } }
+      return { { id = "1", ["function"] = { name = "read_file", arguments = '{"file_path":"a.txt"}' } } }
     end
     t.nil_(guard.check_round(agent, call(), nil))
     t.nil_(guard.check_round(agent, call(), nil))
@@ -22,10 +22,10 @@ tests.suite("guard", function(_, it)
     local guard = require("NeoAI.core.agent.guard")
     local agent = { id = "g2" }
     local callA = function()
-      return { { id = "1", ["function"] = { name = "read_file", arguments = '{"filepath":"a.txt"}' } } }
+      return { { id = "1", ["function"] = { name = "read_file", arguments = '{"file_path":"a.txt"}' } } }
     end
     local callB = function()
-      return { { id = "1", ["function"] = { name = "read_file", arguments = '{"filepath":"b.txt"}' } } }
+      return { { id = "1", ["function"] = { name = "read_file", arguments = '{"file_path":"b.txt"}' } } }
     end
     guard.check_round(agent, callA(), nil)
     guard.check_round(agent, callA(), nil)
@@ -60,7 +60,7 @@ tests.suite("guard", function(_, it)
     local agent = { id = "g5" }
     local calls = function()
       return {
-        { id = "1", ["function"] = { name = "read_file", arguments = '{"filepath":"a"}' } },
+        { id = "1", ["function"] = { name = "read_file", arguments = '{"file_path":"a"}' } },
         { id = "2", ["function"] = { name = "search_files", arguments = '{"query":"x"}' } },
       }
     end

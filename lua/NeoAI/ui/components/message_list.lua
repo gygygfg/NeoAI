@@ -225,7 +225,7 @@ local function _is_secret_path(p)
 end
 
 -- 路径型参数名（含密钥文件路径的工具参数）
-local PATH_KEYS = { filepath = true, file = true, path = true, dir = true, dirs = true, target = true }
+local PATH_KEYS = { file_path = true, filepath = true, file = true, path = true, dir = true, dirs = true, target = true }
 
 -- 仅枚举/列出、不读取内容的工具：其路径参数不构成对密钥文件的读取/使用，不告警。
 local LIST_ONLY_TOOLS = {

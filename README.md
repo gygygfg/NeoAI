@@ -613,14 +613,14 @@ NeoAI 内置了 40+ 工具，AI 可在对话中自动调用，涵盖以下类别
 
 | 工具名             | 描述             | 参数说明 |
 | ------------------ | ---------------- | -------- |
-| `read_file`        | 读取文件内容（大文件默认返回语法树大纲/预览，见下） | `filepath`（必填）文件路径；`start_line`/`end_line`（可选）读取的起止行（1-based，含两端） |
-| `edit_file`        | 编辑文件内容     | `filepath`（必填）目标文件；`description`（必填）修改目的说明；`content`（整体覆写用）；`mode`（`write`/`append`/`edit`）；`edits`（结构化替换 `{old_text, new_text}` 数组） |
+| `read_file`        | 读取文件内容（大文件默认返回语法树大纲/预览，见下） | `file_path`（必填）文件路径；`start_line`/`end_line`（可选）读取的起止行（1-based，含两端） |
+| `edit_file`        | 编辑文件内容     | `file_path`（必填）目标文件；`description`（必填）修改目的说明；`content`（整体覆写用）；`mode`（`write`/`append`/`edit`）；`edits`（结构化替换 `{old_text, new_text}` 数组） |
 | `list_files`       | 列出目录文件     | `path`（可选，默认当前目录）目录路径；`recursive`（可选）是否递归；`max_results`（可选）最大返回数量 |
 | `search_files`     | 搜索文件内容     | `query`（必填）搜索关键字；`include`（可选）文件 glob；`path`（可选）搜索目录；`max_results`（可选）最大返回条数 |
-| `create_directory` | 创建目录         | `filepath`（必填）目录路径（递归创建） |
-| `ensure_dir`       | 确保目录存在     | `filepath`（必填）目录路径（不存在则创建） |
-| `delete_file`      | 删除文件         | `filepath`（必填）待删除文件 |
-| `file_exists`      | 检查文件是否存在 | `filepath`（必填）待检查文件；返回 `true`/`false` |
+| `create_directory` | 创建目录         | `file_path`（必填）目录路径（递归创建） |
+| `ensure_dir`       | 确保目录存在     | `file_path`（必填）目录路径（不存在则创建） |
+| `delete_file`      | 删除文件         | `file_path`（必填）待删除文件 |
+| `file_exists`      | 检查文件是否存在 | `file_path`（必填）待检查文件；返回 `true`/`false` |
 | `read_image`       | 读取图像文件，把图像注入多模态模型 | `file_path`（必填）图像文件路径或 `http(s)` 图片 URL |
 
 > **`read_file` 大文件保护**：未指定 `start_line`/`end_line` 且文件超过阈值（默认 500 字符）时，
@@ -632,36 +632,36 @@ NeoAI 内置了 40+ 工具，AI 可在对话中自动调用，涵盖以下类别
 
 | 工具名                 | 描述               | 参数说明 |
 | ---------------------- | ------------------ | -------- |
-| `parse_file`           | 解析文件语法树     | `filepath`（必填）待解析文件；返回根节点概览 |
-| `query_tree`           | 查询语法树节点     | `filepath`（必填）文件；`query`（必填）tree-sitter query |
-| `get_node_at_position` | 获取指定位置节点   | `filepath`、`line`、`col`（必填，1-based） |
-| `get_node_type`        | 获取节点类型       | `filepath`、`line`、`col`（必填，1-based） |
-| `get_node_range`       | 获取节点范围       | `filepath`、`line`、`col`（必填，1-based） |
-| `is_named_node`        | 检查是否为命名节点 | `filepath`、`line`、`col`（必填，1-based） |
-| `get_parent_node`      | 获取父节点         | `filepath`、`line`、`col`（必填，1-based） |
-| `get_child_nodes`      | 获取子节点列表     | `filepath`、`line`、`col`（必填，1-based） |
-| `get_node_code`        | 获取节点源代码     | `filepath`、`line`、`col`（必填，1-based） |
-| `delete_node`          | 删除语法树节点     | `filepath`、`line`、`col`（必填，1-based）定位待删除节点 |
+| `parse_file`           | 解析文件语法树     | `file_path`（必填）待解析文件；返回根节点概览 |
+| `query_tree`           | 查询语法树节点     | `file_path`（必填）文件；`query`（必填）tree-sitter query |
+| `get_node_at_position` | 获取指定位置节点   | `file_path`、`line`、`col`（必填，1-based） |
+| `get_node_type`        | 获取节点类型       | `file_path`、`line`、`col`（必填，1-based） |
+| `get_node_range`       | 获取节点范围       | `file_path`、`line`、`col`（必填，1-based） |
+| `is_named_node`        | 检查是否为命名节点 | `file_path`、`line`、`col`（必填，1-based） |
+| `get_parent_node`      | 获取父节点         | `file_path`、`line`、`col`（必填，1-based） |
+| `get_child_nodes`      | 获取子节点列表     | `file_path`、`line`、`col`（必填，1-based） |
+| `get_node_code`        | 获取节点源代码     | `file_path`、`line`、`col`（必填，1-based） |
+| `delete_node`          | 删除语法树节点     | `file_path`、`line`、`col`（必填，1-based）定位待删除节点 |
 
 ### 🔧 LSP 工具 Neovim >= 0.12 原生支持
 
 | 工具名                  | 描述                | 参数说明 |
 | ----------------------- | ------------------- | -------- |
-| `lsp_hover`             | 获取悬停信息        | `filepath`/`line`/`col`（可选，缺省用当前光标位置） |
+| `lsp_hover`             | 获取悬停信息        | `file_path`/`line`/`col`（可选，缺省用当前光标位置） |
 | `lsp_definition`        | 获取定义位置        | 同上 |
 | `lsp_references`        | 获取引用位置        | 同上 |
 | `lsp_implementation`    | 获取实现位置        | 同上 |
 | `lsp_declaration`       | 获取声明位置        | 同上 |
-| `lsp_document_symbols`  | 获取文档符号        | `filepath`（可选）文件路径 |
+| `lsp_document_symbols`  | 获取文档符号        | `file_path`（可选）文件路径 |
 | `lsp_workspace_symbols` | 搜索工作区符号      | `query`（必填）符号名关键字 |
-| `lsp_code_action`       | 获取代码操作建议    | `filepath`/`line`/`col`（可选） |
-| `lsp_rename`            | 重命名符号          | `filepath`、`line`、`col`、`new_name`（必填） |
-| `lsp_format`            | 格式化代码          | `filepath`（可选）待格式化文件 |
-| `lsp_diagnostics`       | 获取诊断信息        | `filepath`（可选） |
-| `lsp_client_info`       | 获取 LSP 客户端信息 | `filepath`（可选） |
-| `lsp_signature_help`    | 获取函数签名        | `filepath`/`line`/`col`（可选） |
-| `lsp_completion`        | 获取补全建议        | `filepath`/`line`/`col`（可选） |
-| `lsp_type_definition`   | 获取类型定义        | `filepath`/`line`/`col`（可选） |
+| `lsp_code_action`       | 获取代码操作建议    | `file_path`/`line`/`col`（可选） |
+| `lsp_rename`            | 重命名符号          | `file_path`、`line`、`col`、`new_name`（必填） |
+| `lsp_format`            | 格式化代码          | `file_path`（可选）待格式化文件 |
+| `lsp_diagnostics`       | 获取诊断信息        | `file_path`（可选） |
+| `lsp_client_info`       | 获取 LSP 客户端信息 | `file_path`（可选） |
+| `lsp_signature_help`    | 获取函数签名        | `file_path`/`line`/`col`（可选） |
+| `lsp_completion`        | 获取补全建议        | `file_path`/`line`/`col`（可选） |
+| `lsp_type_definition`   | 获取类型定义        | `file_path`/`line`/`col`（可选） |
 | `lsp_service_info`      | 获取 LSP 服务信息   | 无参数 |
 
 ### 💻 Shell 工具 支持交互式shell 由AI自动填写
@@ -675,12 +675,16 @@ NeoAI 内置了 40+ 工具，AI 可在对话中自动调用，涵盖以下类别
 | 工具名                  | 描述                     | 参数说明 |
 | ----------------------- | ------------------------ | -------- |
 | `git_status`            | 查看 git 状态（--short） | `path`（可选）限定路径 |
-| `git_diff`              | 查看未提交改动           | `filepath`（可选）仅看该文件的 diff |
+| `git_diff`              | 查看未提交改动           | `file_path`（可选）仅看该文件的 diff |
 | `git_log`               | 查看提交历史             | `max`（可选，默认 20）条数；`path`（可选）限定路径 |
 | `git_commit_detail`     | 查看某次提交详情         | `ref`（必填）提交引用（如 `HEAD`/`abc123`） |
 | `git_branch`            | 查看分支列表（-a）       | 无参数 |
-| `git_file_history`      | 查看文件历史             | `filepath`（必填）文件路径；`max`（可选）条数 |
-| `git_rollback`          | 回滚文件到指定提交       | `filepath`（必填）文件；`commit`（可选，默认 `HEAD`）目标提交 |
+| `git_file_history`      | 查看文件历史             | `file_path`（必填）文件路径；`max`（可选）条数 |
+| `git_rollback`          | 回滚文件到指定提交（改动暂存待审） | `file_path`（必填）文件；`commit`（可选，默认 `HEAD`）目标提交 |
+| `git_add`               | 暂存文件（改动暂存待审） | `paths`（可选）路径数组；`all`（可选）暂存全部改动 |
+| `git_commit`            | 提交已暂存改动（改动暂存待审） | `message`（必填）提交信息；`all`（可选）先 `-a` 暂存已跟踪文件 |
+| `git_stash`             | 管理 stash（改动暂存待审） | `action`（必填）`push`/`pop`/`apply`/`drop`/`list`；`message`/`include_untracked`（仅 push） |
+| `git_restore`           | 还原文件到指定提交（改动暂存待审） | `file_path`（必填）；`commit`（可选，默认 `HEAD`） |
 | `git_auto_commit_config`| 查看/设置自动提交配置    | `auto_commit`（可选）布尔，省略则仅查询当前配置 |
 
 ### 🤖 子 Agent 工具

@@ -171,7 +171,7 @@ function M.check_approval(tool_name, args, approval_config, mode)
   if approval_config.auto_allow then return false end
 
   -- 路径安全检查 + 参数安全检查
-  local filepath = args.filepath or args.path or args.file
+  local filepath = args.file_path or args.filepath or args.path or args.file
   local command = args.command or args.cmd or args[1]
   local path_safe = not filepath or M.is_path_allowed(filepath, approval_config.allowed_directories)
   -- 无命令参数（纯文件/进程内工具）：命令白名单不适用，只看路径是否落在允许目录内。

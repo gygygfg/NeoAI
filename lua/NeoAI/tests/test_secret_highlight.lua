@@ -53,7 +53,7 @@ tests.suite("secret_highlight", function(_, it)
       {
         role = "assistant", content = "",
         tool_calls = {
-          { id = "t1", ["function"] = { name = "read_file", arguments = '{"filepath":"/root/.env"}' } },
+          { id = "t1", ["function"] = { name = "read_file", arguments = '{"file_path":"/root/.env"}' } },
         },
       },
       {
@@ -115,7 +115,7 @@ tests.suite("secret_highlight", function(_, it)
       {
         role = "assistant", content = "",
         tool_calls = {
-          { id = "t1", ["function"] = { name = "read_file", arguments = '{"filepath":"/tmp/a.txt"}' } },
+          { id = "t1", ["function"] = { name = "read_file", arguments = '{"file_path":"/tmp/a.txt"}' } },
         },
       },
       { role = "tool", tool_call_id = "t1", tool_name = "read_file", content = '{"output":"hello world"}' },
@@ -134,7 +134,7 @@ tests.suite("secret_highlight", function(_, it)
             id = "t1",
             ["function"] = {
               name = "read_file",
-              arguments = '{"filepath":"/root/.env","note":"' .. pad .. '"}',
+              arguments = '{"file_path":"/root/.env","note":"' .. pad .. '"}',
             },
           },
         },
@@ -155,7 +155,7 @@ tests.suite("secret_highlight", function(_, it)
       {
         role = "assistant", content = "",
         tool_calls = {
-          { id = "t1", ["function"] = { name = "read_file", arguments = '{"filepath":"/root/.aws/credentials"}' } },
+          { id = "t1", ["function"] = { name = "read_file", arguments = '{"file_path":"/root/.aws/credentials"}' } },
         },
       },
       {
@@ -175,7 +175,7 @@ tests.suite("secret_highlight", function(_, it)
       {
         role = "assistant", content = "",
         tool_calls = {
-          { id = "t1", ["function"] = { name = "read_file", arguments = '{"filepath":"/tmp/a.txt"}' } },
+          { id = "t1", ["function"] = { name = "read_file", arguments = '{"file_path":"/tmp/a.txt"}' } },
         },
       },
       { role = "tool", tool_call_id = "t1", tool_name = "read_file", content = '{"output":"' .. pad .. '"}' },
@@ -191,7 +191,7 @@ tests.suite("secret_highlight", function(_, it)
       {
         role = "assistant", content = "",
         tool_calls = {
-          { id = "t1", ["function"] = { name = "read_file", arguments = '{"filepath":"/tmp/plain.txt"}' } },
+          { id = "t1", ["function"] = { name = "read_file", arguments = '{"file_path":"/tmp/plain.txt"}' } },
         },
       },
       {
@@ -221,7 +221,7 @@ tests.suite("secret_highlight", function(_, it)
       {
         role = "assistant", content = "",
         tool_calls = {
-          { id = "t1", ["function"] = { name = "read_file", arguments = '{"filepath":"/root/.env"}' } },
+          { id = "t1", ["function"] = { name = "read_file", arguments = '{"file_path":"/root/.env"}' } },
         },
       },
       { role = "tool", tool_call_id = "t1", tool_name = "read_file", content = '{"output":"nothing"}' },

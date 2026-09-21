@@ -222,7 +222,11 @@ function M.open(argv, opts)
       s.mode = "bind"
     end
   end
-  candidate.materialize_overlay(specs)
+  local conflicts = candidate.materialize_overlay(specs)
+  if conflicts and #conflicts > 0 then
+    candidate.cleanup(attempt.attempt_id)
+    return nil, nil, "SANDBOX_MATERIALIZE_TYPE_CONFLICT: " .. tostring(conflicts[1] and conflicts[1].real)
+  end
   local priv = {
     network = (opts.network ~= false) and cfg.offline ~= true,
     cap_add = {}, mounts = {}, userns = false, unmask = roots,

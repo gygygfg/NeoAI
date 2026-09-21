@@ -516,6 +516,20 @@ function M.enqueue(cand, meta)
     apply_state = M.APPLY.NOT_REQUESTED,
     created_at = os.time(),
   }
+  -- git 操作原子组：候选涉及 `.git` 对象/指针时，整条候选是一个不可分割的原子单元
+  -- （索引↔对象库耦合），界面整组通过/丢弃，禁止逐文件选择性应用。
+  if not item.atomic_group then
+    local ok_rt, rt = pcall(require, "NeoAI.sandbox.runtime")
+    if ok_rt and rt and type(rt.git_path_class) == "function" then
+      for _, f in ipairs(item.files or {}) do
+        local gc = rt.git_path_class(f.path)
+        if gc == "object" or gc == "pointer" then
+          item.atomic_group = "git"
+          break
+        end
+      end
+    end
+  end
   state.items[id] = item
   _persist(item)
   _emit(require("NeoAI.kernel.events").SANDBOX_REVIEW_ENQUEUED, {
@@ -692,6 +706,10 @@ end
 function M.reject_file(id, path, reason)
   local item = M.get(id)
   if not item then return nil end
+  -- git 原子组：不允许逐文件丢弃，整体拒绝。
+  if item.atomic_group == "git" then
+    return M.reject(id, reason)
+  end
   local files = item.files
   if not files or #files == 0 then
     return M.reject(id, reason)
@@ -772,6 +790,8 @@ function M.apply(id, opts)
     item = nxt
     id = item.change_set_id
   end
+  -- git 原子组：忽略文件子集，始终整组应用（避免只写索引/只写对象导致损坏）。
+  if item.atomic_group == "git" then opts.files = nil end
   if item.apply_state == M.APPLY.APPLIED then
     return { ok = true, state = "ALREADY_APPLIED", receipt = item.receipt }
   end
