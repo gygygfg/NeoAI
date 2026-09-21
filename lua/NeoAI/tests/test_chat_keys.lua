@@ -287,4 +287,35 @@ tests.suite("chat_keys", function(_, it)
     t.eq("hello from mock", agent.messages[#agent.messages].content)
     vim.fn.jobstop(job)
   end)
+
+  it("输入框普通模式不覆盖 i/a，保持与普通 buffer 一致的插入语义", function(t)
+    local input_box = require("NeoAI.ui.components.input_box")
+    input_box.reset()
+    -- 传入与主界面一致的 chat_actions（含 insert，键位默认 i），验证不会被注册为覆盖映射
+    input_box.create({
+      on_submit = function() end,
+      chat_actions = {
+        quit = function() end,
+        insert = function() end,
+        send = function() end,
+      },
+    })
+    local buf = input_box.get_buf()
+
+    -- 收集输入 buffer 普通模式的 buffer-local 映射
+    local registered = {}
+    for _, m in ipairs(vim.api.nvim_buf_get_keymap(buf, "n")) do
+      registered[m.lhs] = true
+    end
+
+    -- 关键：i / a 不应被重映射为其它键（此前被覆盖为 feedkeys("A")，导致一律跳到行尾）
+    t.false_(registered["i"] == true, "普通模式 i 不应被输入框覆盖（应保留原生光标前插入）")
+    t.false_(registered["a"] == true, "普通模式 a 不应被输入框覆盖（应保留原生光标后插入）")
+    t.false_(registered["A"] == true, "普通模式 A 不应被输入框覆盖（应保留原生行尾追加）")
+
+    -- 对照：普通模式回车发送仍是输入框应有的 buffer-local 覆盖
+    t.true_(registered["<CR>"] == true, "普通模式回车发送应保留")
+
+    input_box.reset()
+  end)
 end)

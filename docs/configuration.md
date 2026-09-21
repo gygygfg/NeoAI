@@ -164,7 +164,7 @@ session = {
 | `read_file` | `{outline_threshold_chars=500, outline_max_nodes=200, outline_max_depth=4, outline_preview_lines=50, max_read_bytes=5242880}` | read_file 大文件保护：未指定行范围且超阈值时返回语法树大纲（无解析器则截断预览）；超过 `max_read_bytes` 则拒绝整读并只给预览，避免 OOM |
 | `search_files` | `{max_file_bytes=8388608}` | 搜索时单文件扫描上限（字节），超过则跳过；二进制文件（含 NUL）跳过，避免大文件 OOM |
 | `run_command` | `{max_output_bytes=16777216, max_wall_ms=0}` | 命令 stdout/stderr 合计上限（字节）：超出则截断并终止命令，避免超大输出逐行处理冻结主线程；0 = 不限制。`max_wall_ms>0` 为墙钟安全网：命令最长运行该毫秒数（同样约束 `timeout_ms=-1` 的「不限」命令），到时经沙箱资源域真正终止进程树；0 = 不限制 |
-| `lsp` | `{timeout_ms=10000}` | LSP 请求超时（服务器无响应快速失败） |
+| `lsp` | `{timeout_ms=10000, attach_timeout_ms=3000}` | LSP 请求超时（服务器无响应快速失败）；`attach_timeout_ms` 为等待客户端附加的超时：后台加载 buffer / 服务器启动或重启期间客户端尚未附加时，`lsp_diagnostics` 等待其就绪再取诊断，而非立即报「无 LSP 客户端」 |
 | `guard.repeat_tool` | `{enabled=true, thresholds={3,5,8}, messages=...}` | 连续重复工具调用提醒 |
 | `todo.enabled` | `true` | 待办工具 + 系统提示注入 |
 | `web_fetch` | 见下（默认 `enabled=false`） | 网页抓取：无头浏览器渲染动态页面并转 Markdown |

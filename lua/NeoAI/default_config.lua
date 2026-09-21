@@ -346,6 +346,9 @@ local DEFAULT_CONFIG = {
     },
     lsp = {
       timeout_ms = 10000, -- LSP 请求超时（ms）：服务器无响应时快速失败，避免工具循环挂到 executor 超时
+      -- 等待 LSP 客户端附加的超时（ms）：后台加载 buffer / 服务器启动或重启期间客户端尚未
+      -- 附加时，lsp_diagnostics 会等待其就绪再取诊断，而不是立即报「无 LSP 客户端」。
+      attach_timeout_ms = 3000,
     },
     guard = {
       repeat_tool = {

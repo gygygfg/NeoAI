@@ -156,6 +156,30 @@ tests.suite("model_metadata", function(_, it)
     cache.clear("groq")
   end)
 
+  it("沙箱内不自动刷新服务商模型列表（避免写入被沙箱待审捕获）", function(t)
+    load({ ai = { model_refresh = { on_startup = true } } })
+    local model_service = require("NeoAI.services.model_service")
+    local env = require("NeoAI.utils.env")
+    local orig_prefetch = model_service.prefetch
+    local calls = 0
+    model_service.prefetch = function() calls = calls + 1 end
+    local saved = vim.env.NEOAI_SANDBOX
+    -- 沙箱内（嵌套 Neovim）：识别标记，不调度自动刷新
+    vim.env.NEOAI_SANDBOX = "1"
+    t.true_(env.in_sandbox(), "应识别沙箱标记")
+    model_service.start_background_refresh()
+    vim.wait(50, function() return false end)
+    t.eq(0, calls, "沙箱内不应触发自动刷新")
+    -- 宿主：无标记时正常调度
+    vim.env.NEOAI_SANDBOX = nil
+    t.false_(env.in_sandbox(), "无标记时不应识别为沙箱")
+    model_service.start_background_refresh()
+    vim.wait(500, function() return calls > 0 end)
+    t.eq(1, calls, "宿主应触发自动刷新")
+    vim.env.NEOAI_SANDBOX = saved
+    model_service.prefetch = orig_prefetch
+  end)
+
   it("cache：兼容旧版字符串数组，经 registry 规范化", function(t)
     local config_store = require("NeoAI.kernel.config_store")
     config_store.load({ ai = { model_refresh = { cache_path = "/tmp/neoai_test_meta2" } } })

@@ -158,14 +158,14 @@ tests.suite("sandbox", function(_, it)
       local r1, read_back
       local done = false
       tools.execute("edit_file", {
-        filepath = p, mode = "edit", edits = { { old_text = "A", new_text = "X" } }, description = "t",
+        filepath = p, edits = { { old_text = "A", new_text = "X" } }, description = "t",
       }, {}):then_(function(r)
         r1 = r
         return tools.execute("read_file", { filepath = p, description = "t" }, {})
       end):then_(function(rr)
         read_back = rr
         return tools.execute("edit_file", {
-          filepath = p, mode = "edit", edits = { { old_text = "B", new_text = "Y" } }, description = "t",
+          filepath = p, edits = { { old_text = "B", new_text = "Y" } }, description = "t",
         }, {})
       end):then_(function()
         -- 结果路径应为原文件，不含沙箱暂存路径
@@ -2101,6 +2101,12 @@ tests.suite("sandbox", function(_, it)
       t.eq(nil, privilege.resolve(1, { tier = 1, package = true, apt = true }).privileges.apt_sandbox_user,
         "配置 _apt 时不注入")
     end)
+  end)
+
+  it("沙箱进程环境注入 NEOAI_SANDBOX 标记，供嵌套 NeoAI 跳过自动外部操作", function(t)
+    local runtime = require("NeoAI.sandbox.runtime")
+    local env = runtime.sandbox_env(nil)
+    t.eq("1", env.NEOAI_SANDBOX, "sandbox_env 应注入 NEOAI_SANDBOX=1")
   end)
 
   it("权限档位：docker unmask 仅对 docker 命令生效", function(t)

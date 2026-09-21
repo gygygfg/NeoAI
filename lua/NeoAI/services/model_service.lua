@@ -90,6 +90,8 @@ end
 function M.start_background_refresh()
   local model_refresh = config_store.get("ai.model_refresh") or {}
   if model_refresh.on_startup == false then return end
+  -- 沙箱内（嵌套 Neovim）不自动刷新：其缓存写入会被沙箱当作待审变更捕获。
+  if require("NeoAI.utils.env").in_sandbox() then return end
   vim.schedule(function()
     M.prefetch()
   end)

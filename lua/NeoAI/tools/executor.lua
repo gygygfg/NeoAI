@@ -113,7 +113,8 @@ local function _normalize_arguments(tool_name, args)
     cmd = "command", file = "filepath", files = "filepath",
     start = "start_line", ["end"] = "end_line",
     dir = "dirs", dir_path = "dirs", dirs = "dirs",
-    content = "content", new_text = "content", text = "content",
+    -- 注意：不要给 new_text/text 起 content 别名——那会把「局部替换」误判成「整文件覆写」，
+    -- 曾导致 edit_file 静默覆写整文件（详见 file_ops.edit_file 的参数契约）。
   }
   for k, target in pairs(aliases) do
     if normalized[k] ~= nil and normalized[target] == nil then

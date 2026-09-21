@@ -193,13 +193,11 @@ local function _set_keymaps()
     M.submit(content)
   end, { buffer = state.buf, desc = "NeoAI 发送" })
 
-  -- 普通模式：进入插入模式（i/a 末尾追加）
-  vim.keymap.set("n", "i", function()
-    vim.api.nvim_feedkeys("A", "n", false)
-  end, { buffer = state.buf, desc = "NeoAI 输入" })
-  vim.keymap.set("n", "a", function()
-    vim.api.nvim_feedkeys("A", "n", false)
-  end, { buffer = state.buf, desc = "NeoAI 输入" })
+  -- 普通模式：不覆盖 i / a，交回 Vim 原生语义（i 在光标前插入、a 在光标后插入），
+  -- 使输入框与普通 buffer 完全一致。
+  -- 历史问题：此前把 i / a 都重映射为 feedkeys("A")（行尾追加），导致输入框内
+  -- 按 i / a 无法在光标处插入、一律跳到行尾，与普通 buffer 行为不一致。
+  -- 需要「到行尾追加」请直接使用原生 A。
 end
 
 -- ========== 公开 API ==========

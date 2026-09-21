@@ -271,6 +271,61 @@ local function _await_publish(bufnr, cb)
   end)
 end
 
+--- 等待 LSP 客户端就绪：后台加载 buffer / 服务器启动或重启期间客户端可能尚未附加，
+--- 立即报「无 LSP 客户端」会让诊断工具在服务端就绪前误失败。这里先立即尝试一次，
+--- 未就绪则监听 `LspAttach` 并周期性重试 `attempt`，直到其返回 true 或超时。
+--- `attempt()` 负责在就绪时完成后续处理并返回 true（幂等：就绪后不再重复调用）。
+--- 超时后调用 `on_timeout()`，由调用方决定报错或降级。等待期间不阻塞主线程。
+--- @param bufnr number
+--- @param attempt function() -> boolean 就绪并已处理时返回 true
+--- @param on_timeout function()
+local function _await_client(bufnr, attempt, on_timeout)
+  if attempt() then
+    return
+  end
+  local done = false
+  local timer, au
+  local function finish(timeout)
+    if done then
+      return
+    end
+    done = true
+    if timer then
+      pcall(function() timer:stop() end)
+      pcall(function() timer:close() end)
+    end
+    if au then
+      pcall(vim.api.nvim_del_autocmd, au)
+    end
+    if timeout then
+      on_timeout()
+    end
+  end
+  au = vim.api.nvim_create_autocmd("LspAttach", {
+    buffer = bufnr,
+    callback = function()
+      if not done and attempt() then
+        finish(false)
+      end
+    end,
+  })
+  local timeout_ms = config_store.get("tools.lsp.attach_timeout_ms") or 3000
+  local deadline = vim.uv.now() + timeout_ms
+  timer = vim.uv.new_timer()
+  timer:start(100, 100, function()
+    vim.schedule(function()
+      if done then
+        return
+      end
+      if attempt() then
+        finish(false)
+      elseif vim.uv.now() >= deadline then
+        finish(true)
+      end
+    end)
+  end)
+end
+
 -- ========== 工具定义 ==========
 
 local lsp_tools = {}
@@ -505,6 +560,10 @@ lsp_tools.lsp_diagnostics = helpers.define_tool("lsp_diagnostics", "重新获取
   end
   local uri = vim.uri_from_bufnr(bufnr)
 
+  -- 每次调用都重新获取：
+  -- 1) pull 客户端（textDocument/diagnostic，优先 AI 沙箱克隆）：直接请求最新诊断；
+  -- 2) 仅 push 客户端：强制触发一次 didChange 让服务器重新 lint，等其发布后再读缓存，
+  --    避免返回陈旧的 `vim.diagnostic.get` 缓存。
   local function _format(diagnostics)
     if not diagnostics or #diagnostics == 0 then
       on_success("无诊断信息")
@@ -518,12 +577,7 @@ lsp_tools.lsp_diagnostics = helpers.define_tool("lsp_diagnostics", "重新获取
     on_success(table.concat(out, "\n"))
   end
 
-  -- 每次调用都重新获取：
-  -- 1) pull 客户端（textDocument/diagnostic，优先 AI 沙箱克隆）：直接请求最新诊断；
-  -- 2) 仅 push 客户端：强制触发一次 didChange 让服务器重新 lint，等其发布后再读缓存，
-  --    避免返回陈旧的 `vim.diagnostic.get` 缓存。
-  local client = _client_supporting("textDocument/diagnostic", bufnr)
-  if client then
+  local function _pull(client)
     _request("textDocument/diagnostic", { textDocument = { uri = uri } }, client):then_(function(result)
       local items = type(result) == "table" and result.items or nil
       if items then
@@ -537,15 +591,35 @@ lsp_tools.lsp_diagnostics = helpers.define_tool("lsp_diagnostics", "重新获取
     end, function()
       _format(vim.diagnostic.get(bufnr))
     end)
+  end
+
+  local function _push()
+    _touch_buffer(bufnr)
+    _await_publish(bufnr, function()
+      _format(vim.diagnostic.get(bufnr))
+    end)
+  end
+
+  -- 就绪后立即处理并返回 true；无客户端时返回 false（由 _await_client 继续等待）。
+  local function _run()
+    local client = _client_supporting("textDocument/diagnostic", bufnr)
+    if client then
+      _pull(client)
+      return true
+    end
+    if #vim.lsp.get_clients({ bufnr = bufnr }) > 0 then
+      _push()
+      return true
+    end
+    return false
+  end
+
+  if _run() then
     return
   end
-  if #vim.lsp.get_clients({ bufnr = bufnr }) == 0 then
+  -- 服务器可能正在启动/重启，客户端尚未附加：等待其就绪后再取诊断，而不是立即报错。
+  _await_client(bufnr, _run, function()
     on_error("无 LSP 客户端（文件可能在后台加载，客户端未附加）")
-    return
-  end
-  _touch_buffer(bufnr)
-  _await_publish(bufnr, function()
-    _format(vim.diagnostic.get(bufnr))
   end)
 end, { category = "lsp" })
 

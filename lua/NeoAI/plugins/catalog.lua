@@ -122,6 +122,9 @@ local function _side_effect_specs()
       start = function()
         local cfg = config_store.get("ai.model_refresh") or {}
         if cfg.on_startup == false then return end
+        -- 沙箱内（嵌套 Neovim）不自动刷新服务商模型列表：其缓存写入位于工作区外，
+        -- 会被沙箱当作待审变更捕获。手动刷新仍可用。
+        if require("NeoAI.utils.env").in_sandbox() then return end
         vim.schedule(function()
           if require("NeoAI.kernel.lifecycle").is_shutting_down() then return end
           local model_service = services.use("services.model_service")

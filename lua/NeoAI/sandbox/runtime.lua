@@ -22,6 +22,7 @@ local state = {
   apt_conf = nil, -- { path = string, user = string } apt 沙箱配置片段（宿主私有文件）
   mask_dirs_cache = nil, -- { cfg = <table ref>, dirs = string[] } stat 过滤后的遮蔽目录
   mask_dirs_raw_cache = nil, -- { cfg = <table ref>, dirs = string[] } 原始遮蔽目录前缀（不 stat）
+  self_paths_cache = nil, -- { key = string, paths = string[] } 沙箱自有作用域路径（越界留痕排除用）
 }
 
 -- 默认遮蔽的宿主敏感路径（安全默认，可经 tools.sandbox.mask_paths 覆盖）：
@@ -1595,6 +1596,9 @@ function M.sandbox_env(privileges)
   if config_store.get("tools.sandbox.appimage_extract_and_run") ~= false then
     env.APPIMAGE_EXTRACT_AND_RUN = "1"
   end
+  -- 沙箱标记：让沙箱内启动的嵌套 NeoAI 识别自身处于沙箱，跳过**自动**外部操作
+  -- （如启动时刷新服务商模型列表）——否则其缓存/日志写入会被沙箱当作待审变更捕获。
+  env.NEOAI_SANDBOX = "1"
   -- 国内/受限网络镜像（tools.sandbox.network.mirrors，默认空 = 不改动系统行为）：
   --   pip   → PIP_INDEX_URL + PIP_TRUSTED_HOST
   --   npm   → npm_config_registry
@@ -1714,9 +1718,52 @@ function M.read_all()
   return _read_all()
 end
 
+--- 沙箱自有作用域（宿主）路径：这些路径位于遮蔽目录（/root、/var/tmp 等）之下，
+--- 但不是「用户工作目录」，不应计入越界访问留痕。观测按 attempt 的 cgroup 归属，会把
+--- 包装器（bash/python3 重新 open seccomp 过滤器到 fd 3）、overlay upper/work、实例目录、
+--- runtime 私有目录等**沙箱自身**的 openat 一并观测到；若不排除，每次外部命令都会产生一条
+--- 指向 `<store.root>/seccomp/baseline-v5-*.bpf` 之类的「越界」记录（自观测噪声）。
+--- 与 `is_masked_path` 的沙箱存储遮蔽口径保持一致（那里永远命中，不受 unmask 影响）。
+--- 结果按 store 根缓存：`conceal.base_host()` 为进程内稳定值，`store.root()` 仅在会话
+--- 初始化后固定，故以 root 为缓存键即可。
+--- @return table 字符串数组（规范化后的绝对路径，已去尾斜杠）
+local function _self_scope_paths()
+  local ok, store = pcall(require, "NeoAI.sandbox.store")
+  local root = (ok and store and store.root and store.root()) or ""
+  local cache = state.self_paths_cache
+  if cache and cache.key == root then return cache.paths end
+  local out, seen = {}, {}
+  local function add(p)
+    if type(p) ~= "string" or p == "" or p == "/" then return end
+    p = p:gsub("/+$", "")
+    if p == "" or p == "/" or seen[p] then return end
+    seen[p] = true
+    out[#out + 1] = p
+  end
+  add(root)
+  local iok, instance = pcall(require, "NeoAI.sandbox.instance")
+  if iok and instance and instance.base_of then
+    local bok, base = pcall(instance.base_of, root)
+    if bok and base then
+      add(base)
+      if instance.container then add(instance.container(base)) end
+    end
+  end
+  local cok, conceal = pcall(require, "NeoAI.sandbox.conceal")
+  if cok and conceal and conceal.base_host then
+    local bok, base = pcall(conceal.base_host)
+    if bok then add(base) end
+  end
+  pcall(function() add(_private_dir()) end)
+  state.self_paths_cache = { key = root, paths = out }
+  return out
+end
+
 --- 判断路径是否属于「工作区之外的用户工作目录」：不在 cwd 子树内、但位于某个
 --- 遮蔽目录（home/root 等）之下。用于越界访问留痕（`read_all` 下这些目录可读，
 --- 但会记录并在审批悬浮窗展示）。系统路径（/usr、/etc 等）不计入，避免噪声。
+--- 沙箱自有路径（store 根/实例目录/overlay 基目录/runtime 私有目录）同样不计入，
+--- 否则每次外部命令的自观测（如重新打开 seccomp 过滤器）都会产生一条伪「越界」记录。
 --- @param path string|nil
 --- @param cwd string|nil
 --- @return string|nil 命中的绝对路径（规范化后）
@@ -1736,6 +1783,13 @@ function M.outside_workspace(path, cwd)
   local c = _canonical(cwd)
   if p == "" or p == "/" then return nil end
   if p == c or _under(p, c) then return nil end
+  -- 沙箱自有路径（store 根/实例目录/overlay 基目录/runtime 私有目录）：位于遮蔽目录之下
+  -- 但不是用户工作目录。观测会捕获沙箱自身（包装器重开 seccomp 过滤器、overlay upper/work
+  -- 等）的 openat，若不排除，每次外部命令都会留下一条伪「越界」记录。与 `is_masked_path`
+  -- 的沙箱存储遮蔽口径一致。
+  for _, sp in ipairs(_self_scope_paths()) do
+    if p == sp or _under(p, sp) then return nil end
+  end
   for _, d in ipairs(_mask_dirs()) do
     if p == d or _under(p, d) then return p end
   end
@@ -2282,6 +2336,7 @@ function M.reset()
   state.overlay_write_probe = {}
   state.empty_file = nil
   state.apt_conf = nil
+  state.self_paths_cache = nil
   pcall(M.cleanup_tmp_roots)
 end
 

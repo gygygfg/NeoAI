@@ -234,25 +234,22 @@ tests.suite("tools", function(_, it)
     end)
   end)
 
-  it("edit_file：省略 mode 时按 content 推断 write（参数归一化）", function(t)
+  it("edit_file：提供 content 但省略 mode 时报错（不静默覆写）", function(t)
     local file_ops = require("NeoAI.tools.builtin.file_ops")
     local def
     for _, d in ipairs(file_ops.get_tools()) do
       if d.name == "edit_file" then def = d end
     end
     t.not_nil(def, "应注册 edit_file")
-    local fs = require("NeoAI.utils.fs")
     local path = vim.fn.tempname() .. ".txt"
-    local done, ok, result, err = false, nil, nil, nil
-    def.func({ filepath = path, content = "hello\n", description = "t" }, function(r)
-      ok, result, done = true, r, true
+    local done, err = false, nil
+    def.func({ filepath = path, content = "hello\n", description = "t" }, function()
+      done = true
     end, function(e)
-      ok, err, done = false, e, true
+      err, done = e, true
     end)
     t.true_(vim.wait(2000, function() return done end), "edit_file 应完成")
-    t.true_(ok, "省略 mode 且提供 content 应成功（推断为 write），err=" .. tostring(err))
-    t.matches("文件已写入", result or "", "应走 write 分支")
-    t.eq("hello", (fs.read_file(path):gsub("%s+$", "")), "内容应写入文件")
+    t.matches("必须显式指定 mode", tostring(err), "省略 mode 且提供 content 应报错而非推断 write")
   end)
 
   it("read_file 大文件保护：小文件无行范围仍返回全文", function(t)

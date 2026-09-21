@@ -733,7 +733,10 @@ seccomp（含设备节点屏障）**——沙箱内进程看到的是一份「�
     后端 `ebpf`(bpftrace) → `strace` → `procfs`）：按 attempt 的 cgroup 精确归属，
     观测真实 `openat/open` 访问，不再依赖命令字符串解析；三者均不可用时回退命令解析
     启发式（进程内读取工具按路径参数、`run_command` 按命令串中的绝对路径）。系统路径
-    （`/usr`、`/etc` 等）不计入，避免噪声。**观测热路径有界**：构建/测试会反复 open 同一批
+    （`/usr`、`/etc` 等）与**沙箱自身存储**（store 根/实例目录/overlay 基目录/runtime 私有目录，
+    如 `<store.root>/seccomp/baseline-v5-*.bpf`）不计入，避免噪声——观测按 cgroup 归属，会把包装器
+    为装载 seccomp 而重新 open 过滤器、overlay upper/work 等沙箱自身访问也捕获到，若不排除则每条
+    外部命令都会产生一条伪「越界」记录。**观测热路径有界**：构建/测试会反复 open 同一批
     文件（事件可达百万级），因此按路径**去重**（每 attempt 每路径只处理首次，表设有界上限）；
     `outside_workspace` 先对遮蔽目录做**纯字符串前缀预筛**，仅候选路径才做符号链接规范化
     （`vim.fn.resolve` 是重 syscall），并把遮蔽目录列表按配置引用缓存；越界证据改走

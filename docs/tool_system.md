@@ -86,7 +86,10 @@ resolve_name（别名/模糊匹配）
 ### 4.1 参数别名规范化
 
 `_normalize_arguments` 处理常见别名：`cmd→command`、`file/files→filepath`、`start→start_line`、
-`end→end_line`、`new_text/text→content` 等。简单字符串参数（`read_file` 等）直接转 `{ filepath = ... }`。
+`end→end_line` 等。简单字符串参数（`read_file` 等）直接转 `{ filepath = ... }`。
+
+> 注意：**不再**为 `new_text` / `text` 建立 `content` 别名。历史上该别名会把 `edit_file` 的「局部替换」
+> 误判为「整文件覆写」，造成静默覆写；现已移除，误传会直接报错。
 
 ### 4.2 路径展开
 
@@ -150,8 +153,13 @@ M.execute(agent, name, args, tool_call_id, opts)
 `read_file` / `edit_file` / `list_files` / `search_files` / `file_exists` / `create_directory` /
 `ensure_dir` / `delete_file` / `confirm_file_change`。
 
-> `edit_file` 支持 `mode='write'/'append'/'edit'`（省略 `mode` 时按字段推断：提供 `content`
-> → `write`，提供 `edits` → `edit`）。`confirm_file_change` 配合 `edit_file`：
+> `edit_file` 采用**严格互斥**的两套用法（误传即报错，绝不静默覆写）：
+> ① 局部替换——提供 `edits` 数组，或用顶层 `old_text`+`new_text` 简写单条替换，**均不得传 `mode`**；
+> ② 整文件覆写 / 追加——**必须显式** `mode='write'`（覆写）或 `mode='append'`（追加），并提供 `content`。
+> 规则：替换字段与 `mode` 同时出现 → 报错；提供 `content` 却省略 `mode` → 报错；两者皆无 → 报错；
+> `content` 与替换字段同时出现 → 报错；顶层 `old_text`/`new_text` 必须成对；`mode` 仅接受 `write`/`append`
+> （`replace`/`edit`/`overwrite` 等同义词一律报错，避免与「覆写」语义混淆）。
+> `confirm_file_change` 配合 `edit_file`：
 > 模型先看到「预览」结果，再调 `confirm_file_change(action='confirm'/'abandon'/'retry')` 确认。
 > 阻塞式文件 I/O（读大文件/递归搜索/写盘）经 `utils.work` 在线程池执行，不占用主线程。
 >

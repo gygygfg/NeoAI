@@ -886,7 +886,11 @@ host-global capabilities are narrowed via `cap_drop`):
     attributed precisely to the attempt cgroup and watching real `openat/open` calls instead of
     parsing command strings; when none is available it falls back to command-string heuristics
     (in-process read tools by path args, `run_command` by absolute paths in the command string).
-    System paths (`/usr`, `/etc`, …) are not traced to avoid noise. **The observation hot path is
+    System paths (`/usr`, `/etc`, …) and the **sandbox's own storage** (store root / instance dir / overlay
+    base / runtime private dir, e.g. `<store.root>/seccomp/baseline-v5-*.bpf`) are not traced to avoid
+    noise — observation is cgroup-attributed, so it also captures the wrapper re-opening the seccomp
+    filter and overlay upper/work accesses; without this exclusion every external command would leave a
+    spurious "outside-workspace" record. **The observation hot path is
     bounded**: builds/tests repeatedly open the same set of files (events can reach millions), so
     paths are **deduped** (each path processed once per attempt; the set has a bounded cap);
     `outside_workspace` first does a **pure string prefix pre-filter** against mask dirs and only

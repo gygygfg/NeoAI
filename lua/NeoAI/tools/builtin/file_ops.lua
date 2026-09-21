@@ -480,44 +480,93 @@ file_tools.read_file = helpers.define_tool(
 -- 编辑文件（线程池异步读写）
 file_tools.edit_file = helpers.define_tool(
   "edit_file",
-  "编辑文件。filepath 必填；description 必填（描述本次修改目的）；mode='write' 整体覆写，mode='append' 追加；或提供 edits 数组做结构化替换。省略 mode 时按字段推断：提供 content → write，提供 edits → edit。",
+  "编辑文件。filepath/description 必填。两种用法互斥："
+    .. "(1) 局部替换——提供 edits 数组，或用顶层 old_text+new_text 简写单条替换，均不得传 mode；"
+    .. "(2) 整文件覆写或追加——必须显式 mode='write'（覆写）/ mode='append'（追加），并提供 content。"
+    .. "替换字段与 mode 同时出现、或提供 content 却省略 mode、或两者皆无，都会直接报错（不静默覆写）。",
   {
     type = "object",
     properties = {
       filepath = { type = "string", description = "文件路径" },
       description = { type = "string", description = "修改目的说明（必填，供审批与记录）" },
-      mode = { type = "string", description = "'write' | 'append' | 'edit'" },
-      content = { type = "string", description = "写入内容（write/append 模式）" },
+      mode = {
+        type = "string",
+        enum = { "write", "append" },
+        description = "'write' 整体覆写 | 'append' 追加（与替换字段互斥，须显式提供）",
+      },
+      content = { type = "string", description = "写入内容（write/append 模式；必须显式指定 mode）" },
       edits = {
         type = "array",
-        description = "结构化编辑 { old_text, new_text } 数组",
+        description = "结构化替换 { old_text, new_text } 数组（与 mode 互斥，不传 mode）",
         items = { type = "object", properties = { old_text = { type = "string" }, new_text = { type = "string" } } },
       },
+      old_text = { type = "string", description = "单条替换：被替换文本（须与 new_text 成对，与 mode 互斥）" },
+      new_text = { type = "string", description = "单条替换：替换为的文本（须与 old_text 成对，与 mode 互斥）" },
     },
     required = { "filepath", "description" },
   },
   function(args, on_success, on_error)
     local filepath = args.filepath
     local description = args.description
-    -- 参数归一化：模型常只给 content 而省略 mode，此时应视为 write（整体覆写），
-    -- 而非落到默认 edit 模式报「需要 edits 数组」。显式 mode 优先；含 edits 视为 edit。
+    -- 参数契约（严格互斥，误传即报错，绝不静默降级为覆写）：
+    --   · 局部替换：提供 edits（或顶层 old_text/new_text 简写），且不得同时传 mode；
+    --   · 整体覆写/追加：显式 mode='write'/'append'，且不得同时传替换字段。
+    -- 规则：R1 替换字段与 mode 互斥 / R2 有 content 必须显式 mode / R3 顶层简写须成对 /
+    --       R4 无 mode 且无替换字段报错 / R5 mode 仅接受 write/append / R6 content 与替换字段冲突。
+    local has_edits = type(args.edits) == "table" and #args.edits > 0
+    local has_top = args.old_text ~= nil or args.new_text ~= nil
+    local has_content = args.content ~= nil
     local mode = args.mode
-    if mode == nil or mode == "" then
-      if type(args.edits) == "table" and #args.edits > 0 then
-        mode = "edit"
-      elseif args.content ~= nil then
-        mode = "write"
-      else
-        mode = "edit"
-      end
+    if type(mode) == "string" then mode = mode:lower() end
+    local has_mode = type(mode) == "string" and mode ~= ""
+
+    -- R6：content 与替换字段语义冲突
+    if has_content and (has_edits or has_top) then
+      on_error(
+        "edit_file：content（整文件写入内容）与 edits/old_text/new_text（局部替换）不能同时提供"
+      )
+      return
     end
-    mode = tostring(mode):lower()
-    if mode == "overwrite" or mode == "replace" or mode == "create" then
-      mode = "write"
-    elseif mode == "concat" or mode == "add" then
-      mode = "append"
-    elseif mode == "patch" or mode == "update" then
-      mode = "edit"
+
+    -- R1：替换字段与 mode 互斥
+    if (has_edits or has_top) and has_mode then
+      on_error(
+        "edit_file：提供 edits/old_text/new_text（局部替换）时不能同时传 mode；"
+          .. "整体覆写/追加请改用 mode='write'/'append' 且不要传替换字段"
+      )
+      return
+    end
+
+    -- R3：顶层 old_text/new_text 必须成对
+    if has_top and not (args.old_text ~= nil and args.new_text ~= nil) then
+      on_error("edit_file：顶层 old_text 与 new_text 必须成对提供")
+      return
+    end
+
+    -- R5：mode 仅接受 write/append（消除 replace/edit 等同义词歧义）
+    if has_mode and mode ~= "write" and mode ~= "append" then
+      on_error(
+        ("edit_file：mode 只支持 'write'（整体覆写）或 'append'（追加），收到 '%s'；"
+          .. "如需局部替换请改用 edits 数组（或顶层 old_text/new_text）且不要传 mode"):format(tostring(args.mode))
+      )
+      return
+    end
+
+    -- R2：不传 mode 禁止覆写（content 必须显式 mode）
+    if has_content and not has_mode then
+      on_error(
+        "edit_file：提供 content 时必须显式指定 mode='write'（整体覆写）或 mode='append'（追加），"
+          .. "不允许省略 mode，以免误覆写整文件"
+      )
+      return
+    end
+
+    -- R4：无 mode 且无替换字段 → 无操作可执行，报错
+    if not has_mode and not has_edits and not has_top then
+      on_error(
+        "edit_file：需要 mode（'write'/'append' 整写/追加）或替换字段（edits 数组 / 顶层 old_text+new_text）"
+      )
+      return
     end
 
     if mode == "write" then
@@ -535,10 +584,16 @@ file_tools.edit_file = helpers.define_tool(
       return
     end
 
-    -- edit 模式：结构化替换（读在子线程，替换与写盘也在子线程）
-    local edits = args.edits or {}
+    -- 替换分支：结构化替换（读在子线程，替换与写盘也在子线程）。
+    -- 顶层 old_text/new_text 为单条替换简写，等价 edits = { { old_text, new_text } }。
+    local edits
+    if has_edits then
+      edits = args.edits
+    else
+      edits = { { old_text = args.old_text, new_text = args.new_text } }
+    end
     if #edits == 0 then
-      on_error("edit 模式需要提供 edits 数组")
+      on_error("替换需要提供非空 edits 数组（或顶层 old_text/new_text）")
       return
     end
     -- 序列化传给子线程（仅原始类型）：分隔符约定

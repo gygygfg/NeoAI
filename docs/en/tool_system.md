@@ -92,8 +92,12 @@ resolve_name (alias/fuzzy matching)
 ### 4.1 Argument Alias Normalization
 
 `_normalize_arguments` handles common aliases: `cmd→command`, `file/files→filepath`, `start→start_line`,
-`end→end_line`, `new_text/text→content`, etc. Plain string arguments (for `read_file` and similar) are converted
+`end→end_line`, etc. Plain string arguments (for `read_file` and similar) are converted
 directly to `{ filepath = ... }`.
+
+> Note: `new_text` / `text` are **no longer** aliased to `content`. That alias used to make `edit_file`
+> misread a "partial replace" as a "whole-file overwrite" (silent overwrite); it has been removed and a
+> misplaced argument now errors out instead.
 
 ### 4.2 Path Expansion
 
@@ -164,8 +168,14 @@ approval is allowed by default and a notify is sent.
 `read_file` / `edit_file` / `list_files` / `search_files` / `file_exists` / `create_directory` /
 `ensure_dir` / `delete_file` / `confirm_file_change`.
 
-> `edit_file` supports `mode='write'/'append'/'edit'` (when `mode` is omitted it is inferred from the
-> fields: `content` → `write`, `edits` → `edit`). `confirm_file_change` works together with `edit_file`:
+> `edit_file` has **two strictly mutually exclusive** usages (misuse errors out; it never silently overwrites):
+> (1) partial replace — provide an `edits` array, or the top-level `old_text`+`new_text` shorthand for a single
+> replacement, and **do not pass `mode`**; (2) whole-file overwrite / append — you **must** pass an explicit
+> `mode='write'` (overwrite) or `mode='append'` (append) together with `content`.
+> Rules: replace fields together with `mode` → error; `content` without `mode` → error; neither → error;
+> `content` together with replace fields → error; top-level `old_text`/`new_text` must come as a pair; `mode`
+> only accepts `write`/`append` (synonyms like `replace`/`edit`/`overwrite` are rejected to avoid ambiguity
+> with overwrite). `confirm_file_change` works together with `edit_file`:
 > the model first sees the "preview" result, then calls `confirm_file_change(action='confirm'/'abandon'/'retry')` to confirm.
 > Blocking file I/O (reading large files / recursive search / writing to disk) runs in a thread pool via `utils.work`,
 > without occupying the main thread.
