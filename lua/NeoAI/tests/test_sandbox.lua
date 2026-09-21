@@ -1672,7 +1672,7 @@ tests.suite("sandbox", function(_, it)
     end)
   end)
 
-  it("工具子进程：超大文件不纳入候选（防阻塞主线程）", function(t)
+  it("工具子进程：超大文件以 blob 进入候选（不落真实盘、不阻塞主线程）", function(t)
     local runtime = require("NeoAI.sandbox.runtime")
     if runtime.backend() ~= "bwrap" then return end
     local sandbox = require("NeoAI.sandbox")
@@ -1694,12 +1694,14 @@ tests.suite("sandbox", function(_, it)
       t.eq(0, vim.fn.filereadable(big), "大文件不应落盘")
       local cand = require("NeoAI.sandbox.candidate")
       t.not_nil(cand.read_path(small), "小文件应进入候选/暂存")
-      t.eq(nil, cand.read_path(big), "超大文件不应进入候选")
+      local big_staged = cand.read_path(big)
+      t.not_nil(big_staged, "超大文件应以 blob 进入候选/暂存")
+      t.eq(4096, vim.fn.getfsize(big_staged), "暂存大文件内容应完整（4096 字节）")
       pcall(vim.fn.delete, dir, "rf")
     end)
   end)
 
-  it("异步捕获：超大文件不纳入候选且不进入 base 哈希列表", function(t)
+  it("异步捕获：超大文件以 blob 进入候选且不进入 base 哈希列表", function(t)
     local fs = require("NeoAI.utils.fs")
     local sandbox = require("NeoAI.sandbox")
     local candidate = require("NeoAI.sandbox.candidate")
@@ -1728,11 +1730,73 @@ tests.suite("sandbox", function(_, it)
       t.true_(vim.wait(20000, function() return done end, 20), "捕获应完成: " .. tostring(err))
       local mapping = candidate.mapping(a.attempt_id)
       t.not_nil(mapping[dir .. "/small.txt"], "小文件应进入候选")
-      t.eq(nil, mapping[dir .. "/big.bin"], "超大文件不应进入候选（也不应被 base 哈希）")
+      local bentry = mapping[dir .. "/big.bin"]
+      t.not_nil(bentry, "超大文件应以 blob 进入候选")
+      t.true_(bentry.large == true, "超大文件应标记 large")
+      t.eq(nil, bentry.base_hash, "超大文件不应做 base 内容哈希")
+      t.not_nil(bentry.base_sig, "超大文件应以 stat 签名做发布 CAS")
       candidate.cleanup(a.attempt_id)
       vim.fn.delete(dir, "rf")
       vim.fn.delete(base, "rf")
     end)
+  end)
+
+  it("冻结+发布：超大文件以 blob 完整落盘（torch .so 场景）", function(t)
+    local fs = require("NeoAI.utils.fs")
+    local sandbox = require("NeoAI.sandbox")
+    local candidate = require("NeoAI.sandbox.candidate")
+    local control = require("NeoAI.sandbox.control")
+    local store = require("NeoAI.sandbox.store")
+    with_config({ tools = { sandbox = {
+      workspace_root = vim.fn.tempname() .. "/sb", max_file_bytes = 1024,
+    } } }, function()
+      sandbox.reset()
+      local dir = fs.canonical(vim.fn.tempname())
+      fs.ensure_dir(dir)
+      local a = control.new_attempt("run_command", {}, {}, { effect = "process" })
+      candidate.begin(a, store.root())
+      local target = dir .. "/libtorch_python.so"
+      local staged = candidate.stage_path(a.attempt_id, target)
+      local content = string.rep("Z", 8192)
+      fs.write_file(staged, content)
+      local cand = candidate.finish(a.attempt_id)
+      local entry
+      for _, f in ipairs(cand.files) do if f.path == target then entry = f end end
+      t.not_nil(entry, "超大文件应进入候选")
+      t.eq(nil, entry.content, "超大文件不应内嵌内容（避免 JSON 膨胀）")
+      t.not_nil(entry.blob, "超大文件应引用 blob")
+      t.eq(8192, vim.fn.getfsize(entry.blob), "blob 应含完整内容")
+      local res = candidate.publish(cand, {})
+      t.true_(res.ok, "应完整发布: " .. tostring(res.reason))
+      t.eq(8192, vim.fn.getfsize(target), "真实文件应完整（不再缺失）")
+      t.eq(content, fs.read_file(target), "落盘内容应与 blob 一致")
+      candidate.cleanup(a.attempt_id)
+    end)
+    vim.fn.delete(dir, "rf")
+  end)
+
+  it("发布：blob 候选按文件复制落盘且内容完整", function(t)
+    local fs = require("NeoAI.utils.fs")
+    local candidate = require("NeoAI.sandbox.candidate")
+    local root = fs.canonical(vim.fn.tempname())
+    fs.ensure_dir(root)
+    local blob = root .. "/blob.bin"
+    local content = string.rep("A", 65536)
+    fs.write_file(blob, content)
+    local target = root .. "/out/libtorch_python.so"
+    with_config({ tools = { sandbox = { max_file_bytes = 1024 } } }, function()
+      local res = candidate.publish({
+        candidate_digest = "sha256:blobpub",
+        files = { {
+          path = target, action = "create", after_hash = "sig:1:1:65536",
+          blob = blob, large = true, mode = 420,
+        } },
+      })
+      t.true_(res.ok, "blob 发布应成功: " .. tostring(res.reason))
+      t.eq(65536, vim.fn.getfsize(target), "落盘内容应与 blob 一致")
+      t.eq(content, fs.read_file(target), "内容应完整")
+    end)
+    vim.fn.delete(root, "rf")
   end)
 
   it("异步捕获：未变文件第二次捕获不重复处理（不进入 mapping）", function(t)

@@ -56,6 +56,16 @@ local function _sha(content)
   return ok and ("sha256:" .. hex) or "sha256:?"
 end
 
+--- 文件 stat 签名（`sig:<mtime.sec>:<mtime.nsec>:<size>`）：超大文件不读取内容做 CAS，
+--- 改用此签名判定基线是否变化（与捕获阶段未变快速判定同口径，避免读取数百 MB）。
+--- @param st table|nil vim.uv.fs_stat 结果
+--- @return string|nil
+local function _stat_sig(st)
+  if not (st and st.type == "file" and st.mtime) then return nil end
+  return string.format("sig:%s:%s:%s",
+    tostring(st.mtime.sec), tostring(st.mtime.nsec), tostring(st.size))
+end
+
 --- 规范化真实路径：展开 ~/$VAR、绝对化、解析符号链接并折叠 `..`。
 --- 必须与内核打开文件时的解析一致，否则「风险分级/审批展示」与「实际写入」会分裂
 --- （例如 `x/../../../etc/cron.d/pwn` 被显示为工作区内 L0，却写到工作区外）。
@@ -742,30 +752,54 @@ function M.materialize_overlay(specs, opts)
             if not unchanged then
               -- 原子替换：同目录临时文件 + rename。原先「先 delete 再 copy」在并行运行的
               -- 命令读到该路径时会看到缺失/半写内容（暂存文件系统原子性）；rename 原子生效。
-              local content = fs.read_file(entry.staged)
-              if content ~= nil then
-                -- 暂存视图对 AI 遮蔽了密钥（token 化），但命令执行层必须拿到**真实内容**：
-                -- 物化进 overlay 前把 token 还原，否则程序（pip/build/python 等）读到
-                -- NEOKEY_* 会失败（如 import 报错、构建 KeyError）。AI 侧仍读 token 视图。
-                content = (require("NeoAI.sandbox.secret").detokenize(content))
+              local is_large = entry.large == true
+              local content
+              if not is_large then
+                content = fs.read_file(entry.staged)
+                if content ~= nil then
+                  -- 暂存视图对 AI 遮蔽了密钥（token 化），但命令执行层必须拿到**真实内容**：
+                  -- 物化进 overlay 前把 token 还原，否则程序（pip/build/python 等）读到
+                  -- NEOKEY_* 会失败（如 import 报错、构建 KeyError）。AI 侧仍读 token 视图。
+                  content = (require("NeoAI.sandbox.secret").detokenize(content))
+                end
+              end
+              if is_large or content ~= nil then
                 fs.ensure_dir(vim.fn.fnamemodify(dest, ":h"))
                 local mode = entry.mode or 420 -- 0644：保留原权限位，新建文件用常规默认（不强制 0600）
-                -- overlay 私有可写层是会话级临时草稿（agentEnd 轮换即清理），无需 fsync 落盘；
-                -- 逐文件 fsync 在暂存量大时是主要卡顿源。
-                local ok = fs.write_file_atomic(dest, content, { mode = mode, sync = false })
-                if not ok and vim.fn.isdirectory(dest) == 0 then
-                  -- 兜底（rename 不适用等）：退回直接写 + chmod；目标为目录时不删目录。
-                  pcall(vim.fn.delete, dest, "rf")
-                  fs.ensure_dir(vim.fn.fnamemodify(dest, ":h"))
-                  fs.write_file(dest, content)
-                  fs.chmod(dest, mode)
+                local ok
+                if is_large then
+                  -- 大文件：直接文件复制（不读入 Lua 内存），临时文件 + rename 原子替换。
+                  local tmp = dest .. ".neoai.tmp"
+                  ok = fs.copy_file(entry.staged, tmp)
+                  if ok then
+                    pcall(vim.uv.fs_chmod, tmp, mode)
+                    ok = vim.uv.fs_rename(tmp, dest)
+                    if not ok then pcall(vim.uv.fs_unlink, tmp) end
+                  end
+                  if not ok and vim.fn.isdirectory(dest) == 0 then
+                    pcall(vim.fn.delete, dest, "rf")
+                    fs.copy_file(entry.staged, dest)
+                    fs.chmod(dest, mode)
+                  end
+                else
+                  -- overlay 私有可写层是会话级临时草稿（agentEnd 轮换即清理），无需 fsync 落盘；
+                  -- 逐文件 fsync 在暂存量大时是主要卡顿源。
+                  ok = fs.write_file_atomic(dest, content, { mode = mode, sync = false })
+                  if not ok and vim.fn.isdirectory(dest) == 0 then
+                    -- 兜底（rename 不适用等）：退回直接写 + chmod；目标为目录时不删目录。
+                    pcall(vim.fn.delete, dest, "rf")
+                    fs.ensure_dir(vim.fn.fnamemodify(dest, ":h"))
+                    fs.write_file(dest, content)
+                    fs.chmod(dest, mode)
+                  end
                 end
                 local ndstat = vim.uv.fs_stat(dest)
                 -- 记录写入内容哈希与两侧签名：capture 时工作线程据此判断命令是否改动
-                -- （签名未变即跳过读取/哈希）；下次物化据此跳过未变文件。
+                -- （签名未变即跳过读取/哈希）；下次物化据此跳过未变文件。大文件用占位哈希
+                -- （capture 未变判定只比较 dsig，不比较 hash 值）。
                 mat[real] = {
                   dest = dest,
-                  hash = "sha256:" .. vim.fn.sha256(content),
+                  hash = is_large and "sha256:large" or ("sha256:" .. vim.fn.sha256(content)),
                   ssig = (sstat and sstat.mtime) and string.format("%s:%s:%s:%s",
                     tostring(sstat.mtime.sec), tostring(sstat.mtime.nsec), tostring(sstat.size), tostring(sstat.mode)) or nil,
                   dsig = (ndstat and ndstat.mtime) and string.format("%s:%s:%s",
@@ -842,23 +876,33 @@ function M.merge_candidate(cand, opts)
     state.staged_to_real[staged] = f.path
     if f.action == "create" or f.action == "modify" then
       fs.ensure_dir(vim.fn.fnamemodify(staged, ":h"))
-      -- 保持沙箱视图一致：命令产生的改动也以 token 形式进入暂存映射。
-      -- 高熵扫描仅对疑似密钥文件启用（具名规则仍始终生效）。
-      -- 包/生成内容（site-packages、node_modules 等）不做 token 化：与结算阶段跳过密钥
-      -- 检测一致，避免对 venv/依赖树逐文件多次全文扫描（实测数十 MB 需数秒）。
-      local content = f.content or ""
-      if not opts.package and _is_text_content(content) then
-        local secret = require("NeoAI.sandbox.secret")
-        content = secret.tokenize(content, { entropy = secret.is_secret_path(f.path) })
+      if f.blob then
+        -- 大文件：从 blob 复制到暂存副本（不读入内存），登记 large 供物化按文件复制。
+        fs.copy_file(f.blob, staged)
+        if f.mode then fs.chmod(staged, f.mode) end
+        state.workspace[f.path] = {
+          staged = staged, base_hash = f.before_hash, deleted = false, mode = f.mode,
+          large = true, version = _bump_version(),
+        }
+      else
+        -- 保持沙箱视图一致：命令产生的改动也以 token 形式进入暂存映射。
+        -- 高熵扫描仅对疑似密钥文件启用（具名规则仍始终生效）。
+        -- 包/生成内容（site-packages、node_modules 等）不做 token 化：与结算阶段跳过密钥
+        -- 检测一致，避免对 venv/依赖树逐文件多次全文扫描（实测数十 MB 需数秒）。
+        local content = f.content or ""
+        if not opts.package and _is_text_content(content) then
+          local secret = require("NeoAI.sandbox.secret")
+          content = secret.tokenize(content, { entropy = secret.is_secret_path(f.path) })
+        end
+        fs.write_file(staged, content)
+        if f.mode then fs.chmod(staged, f.mode) end
+        state.workspace[f.path] = {
+          staged = staged, base_hash = f.before_hash, deleted = false, mode = f.mode,
+          fresh = opts.from_command == true,
+          fresh_ssig = opts.from_command and _file_sig(staged) or nil,
+          version = _bump_version(),
+        }
       end
-      fs.write_file(staged, content)
-      if f.mode then fs.chmod(staged, f.mode) end
-      state.workspace[f.path] = {
-        staged = staged, base_hash = f.before_hash, deleted = false, mode = f.mode,
-        fresh = opts.from_command == true,
-        fresh_ssig = opts.from_command and _file_sig(staged) or nil,
-        version = _bump_version(),
-      }
     elseif f.action == "delete" or f.action == "rmdir" then
       pcall(vim.fn.delete, staged, "rf")
       state.workspace[f.path] = { staged = staged, base_hash = f.before_hash, deleted = true, version = _bump_version() }
@@ -882,8 +926,8 @@ function M.merge_candidate_async(cand, opts)
   local texts, entropy_flags, text_files = {}, {}, {}
   local secret = require("NeoAI.sandbox.secret")
   for _, f in ipairs(files) do
-    if f.action == "create" or f.action == "modify" then
-      -- 仅文本内容做 token 化；二进制（keyring 等）绝不当文本处理。
+    if (f.action == "create" or f.action == "modify") and not f.blob then
+      -- 仅文本内容做 token 化；二进制（keyring 等）绝不当文本处理；大文件 blob 不做 token 化。
       if _is_text_content(f.content) then
         texts[#texts + 1] = f.content or ""
         -- 仅疑似密钥文件做高熵扫描（具名规则始终生效）。
@@ -902,18 +946,28 @@ function M.merge_candidate_async(cand, opts)
       for i, f in ipairs(text_files) do tok_of[f] = tokenized[i] end
     end
     local writes = {}
+    local blob_jobs = {}
     for _, f in ipairs(files) do
       local staged = _workspace_path(f.path)
       state.staged_to_real[staged] = f.path
       if f.action == "create" or f.action == "modify" then
-        writes[#writes + 1] = {
-          path = staged, mode = f.mode, content = tok_of[f] or (f.content or ""),
-        }
-        state.workspace[f.path] = {
-          staged = staged, base_hash = f.before_hash, deleted = false, mode = f.mode,
-          fresh = opts.from_command == true,
-          version = _bump_version(),
-        }
+        if f.blob then
+          -- 大文件：从 blob 复制到暂存副本（不读入内存），登记 large 供物化按文件复制。
+          blob_jobs[#blob_jobs + 1] = { src = f.blob, dst = staged, kind = "f", mode = f.mode }
+          state.workspace[f.path] = {
+            staged = staged, base_hash = f.before_hash, deleted = false, mode = f.mode,
+            large = true, version = _bump_version(),
+          }
+        else
+          writes[#writes + 1] = {
+            path = staged, mode = f.mode, content = tok_of[f] or (f.content or ""),
+          }
+          state.workspace[f.path] = {
+            staged = staged, base_hash = f.before_hash, deleted = false, mode = f.mode,
+            fresh = opts.from_command == true,
+            version = _bump_version(),
+          }
+        end
       elseif f.action == "delete" or f.action == "rmdir" then
         pcall(vim.fn.delete, staged, "rf")
         state.workspace[f.path] = { staged = staged, base_hash = f.before_hash, deleted = true, version = _bump_version() }
@@ -956,33 +1010,54 @@ function M.merge_candidate_async(cand, opts)
       end
       return sigs
     end
-    if #writes == 0 then return async.resolve(cand) end
+    if #writes == 0 and #blob_jobs == 0 then return async.resolve(cand) end
     local work = require("NeoAI.utils.work")
-    if not work.available() then
+    local function copy_blobs_sync()
+      for _, j in ipairs(blob_jobs) do
+        fs.ensure_dir(vim.fn.fnamemodify(j.dst, ":h"))
+        fs.copy_file(j.src, j.dst)
+        if j.mode then fs.chmod(j.dst, j.mode) end
+      end
+    end
+    local function write_sync()
       for _, w in ipairs(writes) do
         fs.ensure_dir(vim.fn.fnamemodify(w.path, ":h"))
         fs.write_file(w.path, w.content)
         if w.mode then fs.chmod(w.path, w.mode) end
       end
+    end
+    if not work.available() then
+      copy_blobs_sync()
+      write_sync()
       mark_fresh()
       return async.resolve(cand)
     end
     -- 大量暂存写入：按 `work_chunk_files` 分块并发投递线程池（写盘用满多核），每块的编码
     -- 在 `work.batched` 的 start 回调内**惰性**完成——该回调按组在主线程调用，编码与上一组
     -- worker 的写盘重叠，避免一次性编码全部条目（1M 文件时约 20+ s 主线程）后单线程写盘。
+    -- 大文件 blob 复制与文本写入并行提交（blob 复制是内核 copyfile，不占 Lua 主线程）。
     local all_sigs = opts.from_command and {} or nil
-    return work.batched(_chunk_list(writes, _work_chunk_files()), _work_parallelism(), function(chunk)
-      return work.run(_stage_write_worker, _encode_stage_writes(chunk))
-    end):then_(function(results)
-      for _, res in ipairs(results) do
-        if type(res) == "string" and res:sub(1, 1) == "\0" then
-          return async.reject({ kind = "work", message = "暂存写入失败: " .. tostring(res:sub(2)) })
+    local promises = {}
+    if #blob_jobs > 0 then
+      promises[#promises + 1] = work.run(_rotate_copy_worker, _encode_copy_jobs(blob_jobs))
+    end
+    if #writes > 0 then
+      promises[#promises + 1] = work.batched(_chunk_list(writes, _work_chunk_files()), _work_parallelism(), function(chunk)
+        return work.run(_stage_write_worker, _encode_stage_writes(chunk))
+      end):then_(function(results)
+        for _, res in ipairs(results) do
+          if type(res) == "string" and res:sub(1, 1) == "\0" then
+            return async.reject({ kind = "work", message = "暂存写入失败: " .. tostring(res:sub(2)) })
+          end
+          if all_sigs and type(res) == "string" and res:sub(1, 1) == "\1" then
+            local part = parse_sigs(res:sub(2))
+            for p, s in pairs(part) do all_sigs[p] = s end
+          end
         end
-        if all_sigs and type(res) == "string" and res:sub(1, 1) == "\1" then
-          local part = parse_sigs(res:sub(2))
-          for p, s in pairs(part) do all_sigs[p] = s end
-        end
-      end
+        return true
+      end)
+    end
+    return async.all(promises):then_(function()
       mark_fresh(all_sigs)
       return cand
     end)
@@ -1158,28 +1233,28 @@ local function _capture_entry(attempt, real_root, staged, child_rel, prefetch, c
     end
   end
   local cap = cap or _max_file_bytes()
-  local base_exists, base_type, base_hash, staged_is_file, staged_size, staged_mode
+  local base_exists, base_type, base_hash, base_sig, staged_is_file, staged_size, staged_mode, large
   if prefetch then
     base_exists, base_type, base_hash = prefetch.base_exists, prefetch.base_type, prefetch.base_hash
+    base_sig = prefetch.base_sig
     staged_is_file, staged_size = prefetch.staged_is_file, prefetch.staged_size
     staged_mode = prefetch.staged_mode
+    large = prefetch.large
   else
     local stat = vim.uv.fs_stat(real)
     base_exists = stat ~= nil
     base_type = stat and stat.type or nil
-    base_hash = (stat and stat.type == "file") and _sha(_read(real)) or nil
     local staged_stat = vim.uv.fs_stat(staged)
     staged_is_file = staged_stat and staged_stat.type == "file"
     staged_size = staged_stat and staged_stat.size
     staged_mode = staged_stat and staged_stat.mode
-  end
-  -- 超大普通文件不纳入候选（写入仍在 overlay 私有层，不落真实盘；只是不进入待审/发布）。
-  if cap > 0 and staged_is_file and (staged_size or 0) > cap then
-    pcall(function()
-      require("NeoAI.kernel.logger").warn(
-        "[sandbox] 跳过超大候选文件（%d 字节 > 上限 %d）：%s", staged_size, cap, real)
-    end)
-    return
+    if cap > 0 and staged_is_file and (staged_size or 0) > cap then
+      -- 超大文件：不做 base 内容哈希（避免读取数百 MB），改用 stat 签名做发布 CAS。
+      large = true
+      base_sig = (stat and stat.type == "file") and _stat_sig(stat) or nil
+    else
+      base_hash = (stat and stat.type == "file") and _sha(_read(real)) or nil
+    end
   end
   attempt.mapping[real] = {
     real = real,
@@ -1187,6 +1262,8 @@ local function _capture_entry(attempt, real_root, staged, child_rel, prefetch, c
     base_exists = base_exists,
     base_type = base_type,
     base_hash = (base_type == "file") and base_hash or nil,
+    base_sig = (base_type == "file") and base_sig or nil,
+    large = large == true or nil,
     mode = staged_is_file and _perm(staged_mode) or nil,
   }
 end
@@ -1423,6 +1500,7 @@ local function _capture_worker(upper_root, real_root, session_basename, expected
               enc(child_rel); enc(staged_path); enc("whiteout")
               enc(stat and "1" or "0"); enc(stat and stat.type or ""); enc("")
               enc("0"); enc("0"); enc("0"); enc("")
+              enc("")
               count = count + 1
             end
           end
@@ -1442,12 +1520,13 @@ local function _capture_worker(upper_root, real_root, session_basename, expected
             local stat = vim.uv.fs_stat(real)
             local sstat = vim.uv.fs_stat(dest)
             if cap > 0 and sstat and sstat.type == "file" and (sstat.size or 0) > cap then
-              -- 超大文件：不纳入候选，且 base_type 留空 → 不进入 `need`（避免主线程侧
-              -- `_base_hash_worker` 读取/哈希数百 MB）。编码 skip 记录供主线程记日志。
-              enc(child_rel); enc(dest); enc("skip")
-              enc("0"); enc(""); enc("")
+              -- 超大文件：仍登记为候选（kind="large"），内容在冻结阶段以 blob 落盘（不嵌入 JSON、
+              -- 不做 base 内容哈希）。base_sig 供发布时以 stat 签名做 CAS（避免读取数百 MB）。
+              enc(child_rel); enc(dest); enc("large")
+              enc(stat and "1" or "0"); enc(stat and stat.type or ""); enc("")
               enc("1"); enc(tostring(sstat.size or 0)); enc(tostring(sstat.mode or 0))
               enc(dsig_of(sstat))
+              enc((stat and stat.type == "file" and ("sig:" .. sig_of(real))) or "")
               count = count + 1
             elseif not ws_skip(dest, sstat) then
               enc(child_rel); enc(dest); enc("file")
@@ -1456,6 +1535,7 @@ local function _capture_worker(upper_root, real_root, session_basename, expected
               enc(tostring(sstat and sstat.size or 0))
               enc(tostring(sstat and sstat.mode or 0))
               enc(dsig_of(sstat))
+              enc("")
               count = count + 1
             end
           end
@@ -1471,6 +1551,7 @@ local function _capture_worker(upper_root, real_root, session_basename, expected
       if not vim.uv.fs_lstat(exp.dest) and not vim.uv.fs_lstat(real) then
         enc(real); enc(""); enc("reconcile")
         enc("0"); enc(""); enc(""); enc("0"); enc("0"); enc("0"); enc("")
+        enc("")
         count = count + 1
       end
     end
@@ -1644,11 +1725,11 @@ function M.capture_overlay_async(attempt_id, real_root, upper_root)
   local expected_encoded = _encode_expected(state.materialized[upper_root])
   local ws_encoded = _encode_ws(state.workspace, root)
   return work.run(_capture_worker, upper_root, root, session_basename, expected_encoded, ws_encoded, cap):then_(function(encoded)
-    local records = _decode_records(encoded, 10)
-    -- 需要 base 内容哈希的记录（base 为文件）：由分块并行 job 补算。
+    local records = _decode_records(encoded, 11)
+    -- 需要 base 内容哈希的记录（base 为文件，且非超大 blob 文件）：由分块并行 job 补算。
     local need = {}
     for i, rec in ipairs(records) do
-      if rec[5] == "file" then
+      if rec[3] ~= "large" and rec[5] == "file" then
         need[#need + 1] = { idx = i, real = root .. "/" .. rec[1] }
       end
     end
@@ -1692,15 +1773,24 @@ function M.capture_overlay_async(attempt_id, real_root, upper_root)
             ws_checked = true,
           }, cap)
           remember(real, staged, rec[10])
-        elseif kind == "skip" then
-          -- 超过单文件上限：不纳入候选，仅记录（与同步路径同一日志口径），并记目标签名，
-          -- 下次捕获未变即跳过（不再重复日志/哈希）。
+        elseif kind == "large" then
+          -- 超大文件：登记为候选（内容在冻结阶段以 blob 落盘），base_hash 留空、用 base_sig
+          -- 做发布 CAS；不进入 `need`（避免主线程/线程池读取数百 MB 真实文件做内容哈希）。
+          _capture_entry(attempt, root, staged, child_rel, {
+            base_exists = rec[4] == "1",
+            base_type = (rec[5] ~= "" and rec[5]) or nil,
+            base_hash = nil,
+            base_sig = (rec[11] ~= "" and rec[11]) or nil,
+            staged_is_file = true,
+            staged_size = tonumber(rec[8]) or 0,
+            staged_mode = tonumber(rec[9]) or 0,
+            ws_checked = true,
+            large = true,
+          }, cap)
           remember(real, staged, rec[10])
-          pcall(function()
-            require("NeoAI.kernel.logger").warn(
-              "[sandbox] 跳过超大候选文件（%d 字节 > 上限 %d）：%s",
-              tonumber(rec[8]) or 0, cap, real)
-          end)
+        elseif kind == "skip" then
+          -- 兼容旧记录：超过单文件上限且未登记为候选（当前实现不再产生）。
+          remember(real, staged, rec[10])
         end
       end
       _apply_reconcile(recons)
@@ -1850,8 +1940,56 @@ function M.finish(attempt_id, prefetch)
     else
       staged_stat = vim.uv.fs_stat(entry.staged)
     end
-    -- 超大普通文件不纳入候选（避免读入内存 / 嵌入候选 JSON 阻塞主线程）。
-    if cap > 0 and staged_stat and staged_stat.type == "file" and (staged_stat.size or 0) > cap then
+    local is_large = entry.large == true
+      or (cap > 0 and staged_stat and staged_stat.type == "file" and (staged_stat.size or 0) > cap)
+    if is_large then
+      -- 超大文件：内容以 blob 承载（不在候选 JSON 内嵌），发布/物化按文件复制。
+      -- 改动判定用 stat 签名（after_hash），不读取内容。
+      local action, after_hash, blob
+      if staged_stat and staged_stat.type == "file" then
+        if pf and pf.blob then
+          after_hash = pf.after_hash
+          blob = pf.blob
+        else
+          local full = vim.uv.fs_stat(entry.staged)
+          after_hash = _stat_sig(full)
+          blob = require("NeoAI.sandbox.store").copy_to_blob(entry.staged, entry.staged)
+        end
+        if not entry.base_exists then
+          action = "create"
+        elseif entry.base_type == "file" then
+          if entry.base_sig ~= after_hash then action = "modify" end
+        else
+          action = "modify"
+        end
+      else
+        if entry.base_exists then action = "delete" end
+      end
+      if action then
+        local ws = state.workspace[real]
+        if ws then ws.deleted = (action == "delete" or action == "rmdir") end
+        if action ~= "delete" and not blob then
+          pcall(function()
+            require("NeoAI.kernel.logger").warn(
+              "[sandbox] 大文件 blob 复制失败，跳过候选：%s", real)
+          end)
+        else
+          files[#files + 1] = {
+            path = real,
+            action = action,
+            before_hash = entry.base_hash,
+            before_sig = entry.base_sig,
+            after_hash = after_hash,
+            base_exists = entry.base_exists,
+            base_type = entry.base_type,
+            mode = (action == "create" or action == "modify") and entry.mode or nil,
+            blob = (action == "create" or action == "modify") and blob or nil,
+            large = true,
+          }
+        end
+      end
+    elseif cap > 0 and staged_stat and staged_stat.type == "file" and (staged_stat.size or 0) > cap then
+      -- 未标记 large 但超限（旧 mapping / 兜底）：不纳入候选（避免读入内存 / 嵌入候选 JSON）。
       pcall(function()
         require("NeoAI.kernel.logger").warn(
           "[sandbox] 跳过超大候选文件（%d 字节 > 上限 %d）：%s", staged_stat.size, cap, real)
@@ -1918,12 +2056,15 @@ end
 
 --- 线程内读取各暂存文件内容（供 finish 判定改动与嵌入候选）。
 --- 输入：`<n>\n` + n 条记录（字段：real, staged, base_exists, base_type, base_hash, view_base_hash）。
---- 输出：`<n>\n` + n 条记录（字段：staged, exists, type, size, content, after_hash）。
+--- 输出：`<n>\n` + n 条记录（字段：staged, exists, type, size, content, after_hash, blob）。
+--- 超过 `cap` 的文件不读取内容，而是复制为 blob（`blob_dir/<sha(staged)>`），`after_hash` 用
+--- stat 签名（避免读取/哈希数百 MB）；`content` 留空、`blob` 非空。
 --- @param input string 编码的 mapping
---- @param cap number 单文件字节上限（>0 且超过时不读取内容，交由主线程跳过）
+--- @param cap number 单文件字节上限（>0 且超过时走 blob）
 --- @param sha_src string 纯 Lua sha256 实现源码（线程内 load 得到 hex 函数）
+--- @param blob_dir string blob 存储目录
 --- @return string 编码的预取结果
-local function _finish_worker(input, cap, sha_src)
+local function _finish_worker(input, cap, sha_src, blob_dir)
   local sha = assert(load(sha_src))()
   local out = {}
   if type(input) ~= "string" then return "0\n" end
@@ -1949,15 +2090,26 @@ local function _finish_worker(input, cap, sha_src)
     local stat = vim.uv.fs_stat(staged)
     local content = ""
     local after_hash = ""
+    local blob = ""
     if stat and stat.type == "file" then
       if cap <= 0 or (stat.size or 0) <= cap then
         local f = io.open(staged, "rb")
         if f then content = f:read("*a") or ""; f:close() end
+        after_hash = "sha256:" .. sha(content)
+      else
+        -- 超大文件：内容复制为 blob（不在候选 JSON 内嵌），哈希用 stat 签名。
+        local target = blob_dir ~= "" and (blob_dir .. "/" .. sha(staged)) or ""
+        if target ~= "" then
+          local ok = pcall(vim.uv.fs_copyfile, staged, target)
+          if ok then blob = target end
+        end
+        after_hash = (stat.mtime and string.format("sig:%s:%s:%s",
+          tostring(stat.mtime.sec), tostring(stat.mtime.nsec), tostring(stat.size)))
+          or ("sig:" .. tostring(stat.size or 0))
       end
-      after_hash = "sha256:" .. sha(content)
     end
     enc(staged); enc(stat and "1" or "0"); enc(stat and stat.type or "")
-    enc(tostring(stat and stat.size or 0)); enc(content); enc(after_hash)
+    enc(tostring(stat and stat.size or 0)); enc(content); enc(after_hash); enc(blob)
   end
   return tostring(n) .. "\n" .. table.concat(out)
 end
@@ -1999,18 +2151,20 @@ function M.finish_async(attempt_id)
   if #entries == 0 then return async.resolve(M.finish(attempt_id, {})) end
   local sha_src = require("NeoAI.utils.sha256").source
   local cap = _max_file_bytes()
+  local blob_dir = require("NeoAI.sandbox.store").blobs_dir() or ""
   return work.batched(_chunk_list(entries, _work_chunk_files()), _work_parallelism(), function(chunk)
-    return work.run(_finish_worker, _encode_entries(chunk), cap, sha_src)
+    return work.run(_finish_worker, _encode_entries(chunk), cap, sha_src, blob_dir)
   end):then_(function(results)
     local prefetch = {}
     for _, encoded in ipairs(results) do
-      for _, rec in ipairs(_decode_records(encoded, 6)) do
+      for _, rec in ipairs(_decode_records(encoded, 7)) do
         prefetch[rec[1]] = {
           exists = rec[2] == "1",
           type = (rec[3] ~= "" and rec[3]) or nil,
           size = tonumber(rec[4]) or 0,
           content = rec[5],
           after_hash = (rec[6] ~= "" and rec[6]) or nil,
+          blob = (rec[7] ~= "" and rec[7]) or nil,
         }
       end
     end
@@ -2075,9 +2229,16 @@ function M.publish(candidate, opts)
         return { ok = false, state = "CONFLICT", reason = "TARGET_MISSING: " .. f.path }
       end
       if stat.type == "file" then
-        local cur = _read(f.path)
-        if _sha(cur) ~= f.before_hash then
-          return { ok = false, state = "CONFLICT", reason = "BASELINE_CHANGED: " .. f.path }
+        if f.before_sig then
+          -- 超大文件：用 stat 签名做 CAS（不读取数百 MB 内容）。
+          if _stat_sig(stat) ~= f.before_sig then
+            return { ok = false, state = "CONFLICT", reason = "BASELINE_CHANGED: " .. f.path }
+          end
+        else
+          local cur = _read(f.path)
+          if _sha(cur) ~= f.before_hash then
+            return { ok = false, state = "CONFLICT", reason = "BASELINE_CHANGED: " .. f.path }
+          end
         end
       end
     end
@@ -2086,7 +2247,7 @@ function M.publish(candidate, opts)
   -- 绝不把 token 当内容写进真实文件（fail-closed）。
   local secret = require("NeoAI.sandbox.secret")
   for _, f in ipairs(candidate.files or {}) do
-    if f.action == "create" or f.action == "modify" then
+    if (f.action == "create" or f.action == "modify") and not f.blob then
       local _, unresolved = secret.detokenize(f.content or "")
       if unresolved > 0 then
         return { ok = false, state = "FAILED", reason = "SECRET_UNRESOLVED: " .. f.path }
@@ -2108,11 +2269,21 @@ function M.publish(candidate, opts)
       action = "rmdir"
     end
     if action then
-      local res = writer.apply(action, f.path, content, {
-        allow_root = opts.allow_root == true,
-        prefer_sudo = opts.prefer_sudo == true,
-        mode = f.mode,
-      })
+      local res
+      if action == "write" and f.blob then
+        -- 大文件：直接按文件复制（不读入 Lua 内存）。
+        res = writer.apply_file("write", f.path, f.blob, {
+          allow_root = opts.allow_root == true,
+          prefer_sudo = opts.prefer_sudo == true,
+          mode = f.mode,
+        })
+      else
+        res = writer.apply(action, f.path, content, {
+          allow_root = opts.allow_root == true,
+          prefer_sudo = opts.prefer_sudo == true,
+          mode = f.mode,
+        })
+      end
       if res.state == writer.STATE.NEEDS_ROOT then
         return { ok = false, state = "NEEDS_ROOT",
           reason = res.reason or ("WRITE_REQUIRES_ROOT: " .. f.path) }

@@ -241,7 +241,7 @@ sandbox = {
     "CAP_NET_ADMIN", "CAP_SYS_TIME", "CAP_SYS_MODULE", "CAP_SYS_RAWIO",
     "CAP_SYS_BOOT", "CAP_MAC_ADMIN", "CAP_MAC_OVERRIDE", "CAP_AUDIT_CONTROL",
   },
-  max_file_bytes = 8 * 1024 * 1024, -- 单文件纳入候选上限（字节）；超过不纳入候选，防 apt/pkgcache.bin 等大缓存阻塞主线程；0 = 不限制
+  max_file_bytes = 8 * 1024 * 1024, -- 单文件内容内嵌候选上限（字节）；超过则内容复制为 blob（候选只记 blob 路径 + stat 签名），发布/物化按文件复制，防大文件嵌入 JSON 阻塞主线程；0 = 不限制（全部内嵌）
   work_chunk_files = 128, -- 每个工作线程任务的候选文件数：冻结/哈希/密钥扫描按此分块并发投递到线程池（多核），防大量文件时单核串行；0/缺省 = 128
   work_parallelism = 4, -- 每批并发提交到线程池的 chunk 数上限（默认 4，与 libuv 线程池一致）：避免一次性排入数百个 chunk job，使脱敏/密钥 token 化/落盘等 UI 关键 job 不必排在队尾；0/缺省 = 4
   -- 读取面（默认开）：true 时整机根以**可写 overlay** 方式暴露——以 `/` 为只读 lower、会话私有

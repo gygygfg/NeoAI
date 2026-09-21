@@ -53,6 +53,12 @@ local function _snapshots_dir()
   return state.root .. "/snapshots"
 end
 
+--- 大文件内容 blob 目录：超过 `tools.sandbox.max_file_bytes` 的候选文件不再把内容嵌入候选
+--- JSON，而是把暂存副本复制到此处，候选条目仅记录 blob 路径（发布/物化时按文件复制）。
+local function _blobs_dir()
+  return state.root .. "/blobs"
+end
+
 --- @return boolean ok
 local function _ensure_dirs()
   if not state.root then return false end
@@ -62,9 +68,10 @@ local function _ensure_dirs()
   fs.ensure_dir(_evidence_dir())
   fs.ensure_dir(_host_ops_dir())
   fs.ensure_dir(_snapshots_dir())
+  fs.ensure_dir(_blobs_dir())
   -- 存储根与子目录收紧到 0700：候选/证据含未发布内容与命令详情，避免同机其他用户枚举/读取。
   -- （同 uid 的本地进程属信任边界之外，无法靠权限或摘要防住——见 docs/sandbox.md。）
-  for _, d in ipairs({ state.root, _candidates_dir(), _receipts_dir(), _reviews_dir(), _evidence_dir(), _host_ops_dir(), _snapshots_dir() }) do
+  for _, d in ipairs({ state.root, _candidates_dir(), _receipts_dir(), _reviews_dir(), _evidence_dir(), _host_ops_dir(), _snapshots_dir(), _blobs_dir() }) do
     pcall(vim.uv.fs_chmod, d, 448) -- 0700
   end
   return true
@@ -297,6 +304,43 @@ end
 --- @return string|nil
 function M.root()
   return state.root
+end
+
+-- ========== 大文件 blob ==========
+
+--- blob 存储目录（不存在时创建）。未初始化存储时返回 nil。
+--- @return string|nil
+function M.blobs_dir()
+  if not state.root then return nil end
+  local dir = _blobs_dir()
+  fs.ensure_dir(dir)
+  pcall(vim.uv.fs_chmod, dir, 448) -- 0700
+  return dir
+end
+
+--- 由任意键（通常是暂存路径）推导稳定的 blob 路径。工作线程用纯 Lua sha256 计算同一名字，
+--- 故主线程与线程池必须对同一键得到相同结果。
+--- @param key string
+--- @return string|nil
+function M.blob_path(key)
+  if not state.root then return nil end
+  local ok, hex = pcall(vim.fn.sha256, tostring(key or ""))
+  if not ok then return nil end
+  return _blobs_dir() .. "/" .. hex
+end
+
+--- 把文件复制进 blob 存储（内容寻址命名由 key 决定，重复复制幂等覆盖）。
+--- @param src string
+--- @param key string
+--- @return string|nil blob_path
+--- @return string|nil err
+function M.copy_to_blob(src, key)
+  local dst = M.blob_path(key)
+  if not dst then return nil, "STORE_NOT_INITIALIZED" end
+  local ok, err = fs.copy_file(src, dst)
+  if not ok then return nil, err end
+  pcall(vim.uv.fs_chmod, dst, 384) -- 0600
+  return dst
 end
 
 --- 写入候选（冻结）
@@ -655,6 +699,7 @@ function M.reset()
     pcall(vim.fn.delete, _evidence_dir(), "rf")
     pcall(vim.fn.delete, _host_ops_dir(), "rf")
     pcall(vim.fn.delete, _snapshots_dir(), "rf")
+    pcall(vim.fn.delete, _blobs_dir(), "rf")
   end
   state.root = nil
 end

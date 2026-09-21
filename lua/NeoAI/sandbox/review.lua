@@ -162,6 +162,15 @@ local function _sha(content)
   return ok and ("sha256:" .. hex) or "sha256:?"
 end
 
+--- 大文件 stat 签名（与 candidate 同口径）：不读取内容做 CAS，避免读取数百 MB。
+--- @param st table|nil
+--- @return string|nil
+local function _stat_sig(st)
+  if not (st and st.type == "file" and st.mtime) then return nil end
+  return string.format("sig:%s:%s:%s",
+    tostring(st.mtime.sec), tostring(st.mtime.nsec), tostring(st.size))
+end
+
 --- 读取文件内容（不存在返回 nil）
 --- @param path string
 --- @return string|nil
@@ -212,11 +221,24 @@ end
 --- @param entries table _capture_snapshot 结果
 --- @param operation_id string|nil
 local function _store_snapshot(item, entries, operation_id)
+  local cap = _snapshot_cap()
   for _, e in ipairs(entries) do
     local st = vim.uv.fs_stat(e.path)
     e.disk_exists = st ~= nil
     e.disk_type = st and st.type or nil
-    e.disk_hash = (st and st.type == "file") and _sha(_read_file(e.path) or "") or nil
+    if st and st.type == "file" then
+      -- 大文件不整读做哈希（会阻塞主线程）：改用 stat 签名做撤销 CAS。
+      if cap > 0 and (st.size or 0) > cap then
+        e.disk_sig = _stat_sig(st)
+        e.disk_hash = nil
+      else
+        e.disk_hash = _sha(_read_file(e.path) or "")
+        e.disk_sig = nil
+      end
+    else
+      e.disk_hash = nil
+      e.disk_sig = nil
+    end
   end
   local rec = {
     snapshot_id = "snap_" .. tostring(item.change_set_id),
@@ -257,7 +279,11 @@ function M.undo(id, opts)
         if (st.type == "file") ~= (e.disk_type == "file") then
           ok = false
         elseif st.type == "file" then
-          ok = (_sha(_read_file(e.path) or "") == e.disk_hash)
+          if e.disk_sig then
+            ok = (_stat_sig(st) == e.disk_sig)
+          else
+            ok = (_sha(_read_file(e.path) or "") == e.disk_hash)
+          end
         end
       end
       if not ok then

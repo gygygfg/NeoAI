@@ -252,7 +252,7 @@ sandbox = {
     "CAP_NET_ADMIN", "CAP_SYS_TIME", "CAP_SYS_MODULE", "CAP_SYS_RAWIO",
     "CAP_SYS_BOOT", "CAP_MAC_ADMIN", "CAP_MAC_OVERRIDE", "CAP_AUDIT_CONTROL",
   },
-  max_file_bytes = 8 * 1024 * 1024, -- Max bytes per file included in a candidate; larger files are skipped to avoid huge apt/pkgcache.bin blocking the main thread; 0 = unlimited
+  max_file_bytes = 8 * 1024 * 1024, -- Max bytes per file embedded in a candidate; larger files are copied to a blob (candidate stores only the blob path + stat signature) and published/materialized by file copy, so huge files cannot block the main thread via JSON; 0 = unlimited (embed all)
   work_chunk_files = 128, -- Candidate files per worker task: freeze/hash/secret-scan are chunked and dispatched to the thread pool (multi-core) to avoid single-core serialization on many files; 0/default = 128
   work_parallelism = 4, -- Max chunk jobs submitted concurrently per batch (default 4, matching the libuv pool): prevents hundreds of chunk jobs from flooding the queue and starving UI-critical jobs (redaction/secret tokenization/disk writes); 0/default = 4
   -- Read surface (on by default): when true the whole host root is exposed as a **writable overlay**

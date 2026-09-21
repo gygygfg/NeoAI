@@ -221,6 +221,18 @@ tests.suite("gateway", function(_, it)
     hp.reset()
   end)
 
+  it("宿主过滤代理：DNS 解析异步执行（不阻塞主线程）", function(t)
+    local hp = require("NeoAI.sandbox.host_proxy")
+    hp.reset()
+    -- 同步 `vim.uv.getaddrinfo`（无回调）会阻塞主线程；请求路径必须走异步解析：
+    -- 调用立即返回、回调在事件循环中稍后触发。
+    local called = false
+    hp._classify_async("example.invalid", function() called = true end)
+    t.false_(called, "回调不应在调用栈内同步触发（否则解析会阻塞主线程）")
+    t.true_(vim.wait(5000, function() return called end, 10), "异步回调应触发")
+    hp.reset()
+  end)
+
   it("宿主过滤代理：SOCKS5 本机拦截与放行", function(t)
     local hp = require("NeoAI.sandbox.host_proxy")
     hp.reset()

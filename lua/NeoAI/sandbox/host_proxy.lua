@@ -140,6 +140,42 @@ local function _classify(host)
   return false, ips
 end
 
+--- 异步解析（回调式 `vim.uv.getaddrinfo`）：DNS 在 libuv 线程池完成，**不阻塞主线程**。
+--- 无回调的 `vim.uv.getaddrinfo` 是同步调用，`uv pip install` 等并发联网命令每条请求都
+--- 会阻塞主线程解析 DNS（慢解析时界面冻结），故请求路径统一走本函数。
+--- @param host string
+--- @param cb function(ips: table)
+local function _resolve_async(host, cb)
+  local ok, req = pcall(vim.uv.getaddrinfo, host, nil, { socktype = "stream" }, function(err, res)
+    local out = {}
+    if not err and type(res) == "table" then
+      for _, a in ipairs(res) do
+        if a.addr then out[#out + 1] = _strip_zone(a.addr) end
+      end
+    end
+    cb(out)
+  end)
+  if not ok then cb({}) end
+end
+
+--- 异步版 `_classify`：回调式返回 `(is_host_local, ips)`，不阻塞主线程。
+--- @param host string
+--- @param cb function(is_host_local: boolean, ips: table)
+local function _classify_async(host, cb)
+  if type(host) ~= "string" or host == "" then return cb(true, {}) end
+  host = host:gsub("^%[", ""):gsub("%]$", "")
+  local lower = host:lower()
+  if lower == "localhost" or lower:sub(-10) == ".localhost" then return cb(true, {}) end
+  if state.opts.host_local_fn then return cb(state.opts.host_local_fn(host) == true, {}) end
+  _resolve_async(host, function(ips)
+    if #ips == 0 then return cb(true, {}) end -- 解析失败：fail-closed
+    for _, ip in ipairs(ips) do
+      if _ip_is_host_local(ip) then return cb(true, ips) end
+    end
+    cb(false, ips)
+  end)
+end
+
 --- 目标是否宿主本机
 --- @param host string
 --- @return boolean
@@ -252,20 +288,22 @@ local function _handle_http(ctx, client, header, rest)
       return
     end
     p = tonumber(p)
-    local local_, ips = _classify(h)
-    if local_ then
-      _record(h, p, "http", "block")
-      _respond(client, 403, "Forbidden", "host_local_blocked")
-      return
-    end
-    ctx.state = "connecting"
-    _open_upstream(h, ips, p, function(up)
-      _record(h, p, "http", "allow")
-      pcall(function() client:write("HTTP/1.1 200 Connection Established\r\n\r\n") end)
-      _start_piping(ctx, client, up, rest)
-    end, function()
-      _record(h, p, "http", "error")
-      _respond(client, 502, "Bad Gateway", "upstream_connect_failed")
+    ctx.state = "resolving"
+    _classify_async(h, function(local_, ips)
+      if local_ then
+        _record(h, p, "http", "block")
+        _respond(client, 403, "Forbidden", "host_local_blocked")
+        return
+      end
+      ctx.state = "connecting"
+      _open_upstream(h, ips, p, function(up)
+        _record(h, p, "http", "allow")
+        pcall(function() client:write("HTTP/1.1 200 Connection Established\r\n\r\n") end)
+        _start_piping(ctx, client, up, rest)
+      end, function()
+        _record(h, p, "http", "error")
+        _respond(client, 502, "Bad Gateway", "upstream_connect_failed")
+      end)
     end)
     return
   end
@@ -278,24 +316,26 @@ local function _handle_http(ctx, client, header, rest)
     _respond(client, 400, "Bad Request", "not_a_proxy_request")
     return
   end
-  local local_, ips = _classify(h)
-  if local_ then
-    _record(h, p, "http", "block")
-    _respond(client, 403, "Forbidden", "host_local_blocked")
-    return
-  end
   -- 请求行改写为 origin-form，便于普通源站处理
   local path = target:match("^https?://[^/]+(.*)$") or "/"
   if path == "" then path = "/" end
   local rewritten = header:gsub("^([^\r\n]+)", method .. " " .. path .. " HTTP/1.1", 1)
-  ctx.state = "connecting"
-  _open_upstream(h, ips, p, function(up)
-    _record(h, p, "http", "allow")
-    pcall(function() up:write(rewritten .. "\r\n\r\n") end)
-    _start_piping(ctx, client, up, rest)
-  end, function()
-    _record(h, p, "http", "error")
-    _respond(client, 502, "Bad Gateway", "upstream_connect_failed")
+  ctx.state = "resolving"
+  _classify_async(h, function(local_, ips)
+    if local_ then
+      _record(h, p, "http", "block")
+      _respond(client, 403, "Forbidden", "host_local_blocked")
+      return
+    end
+    ctx.state = "connecting"
+    _open_upstream(h, ips, p, function(up)
+      _record(h, p, "http", "allow")
+      pcall(function() up:write(rewritten .. "\r\n\r\n") end)
+      _start_piping(ctx, client, up, rest)
+    end, function()
+      _record(h, p, "http", "error")
+      _respond(client, 502, "Bad Gateway", "upstream_connect_failed")
+    end)
   end)
 end
 
@@ -369,22 +409,24 @@ local function _process_socks(ctx, client)
     local rest = ctx.buf
     ctx.buf = ""
 
-    local local_, ips = _classify(host)
-    if local_ then
-      _record(host, port, "socks5", "block")
-      _socks_reply(client, 2) -- connection not allowed by ruleset
-      _close(client)
-      return
-    end
-    ctx.state = "connecting"
-    _open_upstream(host, ips, port, function(up)
-      _record(host, port, "socks5", "allow")
-      _socks_reply(client, 0)
-      _start_piping(ctx, client, up, rest)
-    end, function()
-      _record(host, port, "socks5", "error")
-      _socks_reply(client, 5) -- connection refused
-      _close(client)
+    ctx.state = "resolving"
+    _classify_async(host, function(local_, ips)
+      if local_ then
+        _record(host, port, "socks5", "block")
+        _socks_reply(client, 2) -- connection not allowed by ruleset
+        _close(client)
+        return
+      end
+      ctx.state = "connecting"
+      _open_upstream(host, ips, port, function(up)
+        _record(host, port, "socks5", "allow")
+        _socks_reply(client, 0)
+        _start_piping(ctx, client, up, rest)
+      end, function()
+        _record(host, port, "socks5", "error")
+        _socks_reply(client, 5) -- connection refused
+        _close(client)
+      end)
     end)
   end
 end
@@ -394,7 +436,8 @@ end
 --- @param ctx table
 --- @param client userdata
 local function _process(ctx, client)
-  if ctx.state == "connecting" then return end -- 建连期间只累积，由 _start_piping 冲入上游
+  -- resolving（异步 DNS）或 connecting（建连）期间只累积数据，由回调冲入上游/继续状态机。
+  if ctx.state then return end
   if ctx.proto == nil then
     if #ctx.buf < 1 then return end
     ctx.proto = (ctx.buf:byte(1) == 0x05) and "socks" or "http"
@@ -524,6 +567,11 @@ end
 --- 测试/内部：宿主本机判定
 function M._is_host_local(host)
   return _is_host_local(host)
+end
+
+--- 测试/内部：异步本机判定（不阻塞主线程）
+function M._classify_async(host, cb)
+  return _classify_async(host, cb)
 end
 
 --- 重置（测试用）

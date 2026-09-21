@@ -518,9 +518,11 @@ local DEFAULT_CONFIG = {
         "CAP_MAC_OVERRIDE",  -- MAC 策略绕过
         "CAP_AUDIT_CONTROL", -- 审计子系统配置
       },
-      -- 单文件纳入候选的大小上限（字节）：超过则不纳入候选（写入仍在 overlay 私有层，不落真实盘），
+      -- 单文件内容内嵌候选的上限（字节）：超过则把暂存副本复制到沙箱存储的 blobs/ 目录，
+      -- 候选条目只记 blob 路径 + stat 签名（sig:mtime:size），发布/物化/合并时按文件复制
+      -- （内核 copyfile，不读入内存），因此 torch 的 libtorch_python.so 等大文件也能完整落盘。
       -- 避免把 apt/pkgcache.bin、缓存归档、镜像层等超大文件嵌入候选 JSON 而阻塞主线程 / 撑爆磁盘。
-      -- 0 = 不限制。默认 8 MiB。
+      -- 0 = 不限制（全部内嵌）。
       max_file_bytes = 8 * 1024 * 1024,
       -- 每个工作线程任务的候选文件数：冻结/哈希按此分块并发提交到线程池（默认 4 线程），
       -- 使 npm/cargo 等产生大量文件的命令用满多核而非单核串行。0/缺省 = 128。

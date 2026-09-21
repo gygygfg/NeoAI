@@ -138,6 +138,63 @@ function M.sudo_op(action, path, content, mode)
   return false, tostring(out)
 end
 
+--- 大文件按文件复制（不经 Lua 内存）的非 root shell 片段：`$1`=src `$2`=dst `$3`=mode。
+--- @return string
+local function _copy_snippet()
+  return 'tmp="$2.tmp.$$"; cp -- "$1" "$tmp" && mv -f "$tmp" "$2" && { [ -n "$3" ] && chmod "$3" "$2" || true; }'
+end
+
+--- 以 root/当前身份按文件复制（临时文件 + rename，保留权限位）。
+--- @param src string
+--- @param path string
+--- @param mode number|nil
+--- @return boolean, string|nil
+local function _root_copy(src, path, mode)
+  fs.ensure_dir(vim.fn.fnamemodify(path, ":h"))
+  local tmp = path .. ".neoai-copy-" .. tostring(vim.fn.getpid())
+  local ok, err = fs.copy_file(src, tmp)
+  if not ok then return false, err end
+  if mode then pcall(vim.uv.fs_chmod, tmp, mode) end
+  local renamed, rerr = vim.uv.fs_rename(tmp, path)
+  if not renamed then
+    pcall(vim.uv.fs_unlink, tmp)
+    return false, rerr
+  end
+  return true
+end
+
+--- 以非 root 身份按文件复制（经 setpriv 降权；仅 root 进程可调用）。
+--- @param src string
+--- @param path string
+--- @param uid number
+--- @param gid number
+--- @param mode number|nil
+--- @return boolean, string|nil
+local function _nonroot_copy(src, path, uid, gid, mode)
+  if vim.fn.executable("setpriv") ~= 1 then
+    return false, "SETPRIV_UNAVAILABLE"
+  end
+  local argv = {
+    "setpriv", "--reuid", tostring(uid), "--regid", tostring(gid), "--clear-groups",
+    "sh", "-c", _copy_snippet(), "sh", src, path, mode and string.format("%o", mode) or "",
+  }
+  local out = vim.fn.system(argv)
+  if vim.v.shell_error == 0 then return true end
+  return false, tostring(out)
+end
+
+--- 以 sudo（继承 tty）按文件复制；仅非 root 进程需要，且须用户已批准。
+--- @param src string
+--- @param path string
+--- @param mode number|nil
+--- @return boolean, string|nil
+local function _sudo_copy(src, path, mode)
+  local argv = { "sudo", "sh", "-c", _copy_snippet(), "sh", src, path, mode and string.format("%o", mode) or "" }
+  local out = vim.fn.system(argv)
+  if vim.v.shell_error == 0 then return true end
+  return false, tostring(out)
+end
+
 --- 统一落盘入口：先非 root，权限不足 → NEEDS_ROOT（或已批准时以 root/sudo 写入）。
 --- @param action string "write"|"delete"|"mkdir"|"rmdir"
 --- @param path string
@@ -204,6 +261,63 @@ function M.apply(action, path, content, opts)
       writer = "sudo", escalated = true, err = serr }
   end
   local rok, rerr = _root_op(action, path, content, mode)
+  return { ok = rok, state = rok and M.STATE.WRITTEN or M.STATE.FAILED,
+    writer = "root", escalated = true, err = rerr }
+end
+
+--- 按文件复制落盘（大文件 blob 发布）：语义与 `M.apply` 的 write 一致，但内容来自源文件
+--- 而非 Lua 字符串，避免把数百 MB 读入内存。仅支持 action="write"。
+--- @param action string 仅 "write"
+--- @param path string 目标
+--- @param src string 源文件（blob）
+--- @param opts table|nil { allow_root?: boolean, prefer_sudo?: boolean, mode?: number }
+--- @return table { ok, state, writer?, escalated?, reason?, err? }
+function M.apply_file(action, path, src, opts)
+  opts = opts or {}
+  if action ~= "write" then
+    return { ok = false, state = M.STATE.FAILED, err = "UNSUPPORTED_ACTION: " .. tostring(action) }
+  end
+  if type(src) ~= "string" or src == "" or vim.uv.fs_stat(src) == nil then
+    return { ok = false, state = M.STATE.FAILED, err = "SOURCE_NOT_FOUND: " .. tostring(src) }
+  end
+  local runtime = require("NeoAI.sandbox.runtime")
+  local uid, gid = runtime.payload_ids()
+  local cur = vim.uv.getuid()
+  local mode = opts.mode
+  if mode == nil then
+    local st = vim.uv.fs_stat(path)
+    mode = st and (st.mode % 512) or 420
+  end
+
+  if cur ~= 0 then
+    local ok, err = _root_copy(src, path, mode)
+    if ok then return { ok = true, state = M.STATE.WRITTEN, writer = "nonroot" } end
+    if not _perm_error(err) then return { ok = false, state = M.STATE.FAILED, err = err } end
+    if not opts.allow_root then
+      return { ok = false, state = M.STATE.NEEDS_ROOT, reason = "WRITE_REQUIRES_ROOT: " .. tostring(path), err = err }
+    end
+    local sok, serr = _sudo_copy(src, path, mode)
+    return { ok = sok, state = sok and M.STATE.WRITTEN or M.STATE.FAILED,
+      writer = "sudo", escalated = true, err = serr }
+  end
+
+  local nonroot = uid ~= nil and uid > 0
+  if not nonroot then
+    local ok, err = _root_copy(src, path, mode)
+    return { ok = ok, state = ok and M.STATE.WRITTEN or M.STATE.FAILED, writer = "root", err = err }
+  end
+  local ok, err = _nonroot_copy(src, path, uid, gid, mode)
+  if ok then return { ok = true, state = M.STATE.WRITTEN, writer = "nonroot" } end
+  if not _perm_error(err) then return { ok = false, state = M.STATE.FAILED, err = err } end
+  if not opts.allow_root then
+    return { ok = false, state = M.STATE.NEEDS_ROOT, reason = "WRITE_REQUIRES_ROOT: " .. tostring(path), err = err }
+  end
+  if opts.prefer_sudo then
+    local sok, serr = _sudo_copy(src, path, mode)
+    return { ok = sok, state = sok and M.STATE.WRITTEN or M.STATE.FAILED,
+      writer = "sudo", escalated = true, err = serr }
+  end
+  local rok, rerr = _root_copy(src, path, mode)
   return { ok = rok, state = rok and M.STATE.WRITTEN or M.STATE.FAILED,
     writer = "root", escalated = true, err = rerr }
 end

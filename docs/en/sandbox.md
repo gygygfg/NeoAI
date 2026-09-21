@@ -281,15 +281,19 @@ is only kept for other `approval.mode` values (`prompt`/`strict`).
       non-root uid these narrow caps are preserved as **ambient**, otherwise changing the uid
       clears them and package-install locks fail. The process still runs under the
       mount/pid namespace + seccomp + whole-root overlay + masking + staging.
-    - **Oversized files are not captured** (`tools.sandbox.max_file_bytes`, default 8 MiB): files
-      above the cap are still written to the overlay private layer (never the real disk) but are
-      excluded from candidates/review/publish, so apt's `pkgcache.bin`, cache archives and image
-      layers cannot be embedded into candidate JSON and block the main thread / fill the disk. The
-      async capture skips them **inside the worker** (they never enter the base-hash list), avoiding
-      reading + pure-Lua hashing hundreds of MB of chromium/npm caches.
+    - **Oversized files are captured as blobs** (`tools.sandbox.max_file_bytes`, default 8 MiB):
+      files above the cap do not embed their content in candidate JSON; the staged copy is copied
+      into the sandbox store's `blobs/` directory and the candidate entry records only the `blob`
+      path plus a **stat signature** (`sig:mtime:size`). Publish/materialize/staging-merge then
+      **copy the file** (kernel `copyfile`, never read into Lua memory), so libraries like torch's
+      `libtorch_python.so` (tens to hundreds of MB) land intact instead of leaving an incomplete
+      venv after a package install. Oversized files get **no base content hash** (they never enter
+      the base-hash list); publish CAS uses the stat signature. Blobs live under the instance store
+      and are cleaned by `store.reset` / instance GC. Undo snapshots of edited large files remain
+      bounded by the cap (see "Undo save").
     - **The same file is never processed twice (capture signature cache)**: every async capture
       records the **target signature** (mtime/size) of each overlay entry it processed (file /
-      delete / oversized skip) in that upper's expected map; the next capture compares signatures
+      delete / oversized) in that upper's expected map; the next capture compares signatures
       **inside the worker** and skips unchanged entries entirely — no record emitted, no base hash,
       no main-thread work. Only genuinely changed (or externally modified) files are reprocessed.
       Previously every `run_command` re-read and pure-Lua-hashed the same captured files (including
@@ -996,8 +1000,11 @@ commands (SSRF, e.g. host admin panels, internal ports, cloud metadata):
   (normalizing octal/hex/short-form IPv4, fully-expanded IPv6, IPv4-mapped `::ffff:127.0.0.1`),
   checked numerically against the host-local set, then **connected using the same validated IPs** —
   avoiding both "literal string compare vs. kernel parse" mismatches and DNS-rebinding by a second
-  resolution. Unresolvable targets fail closed (treated as host-local). Records are returned via the
-  `run_command` result summary and stored as `network` evidence.
+  resolution. Unresolvable targets fail closed (treated as host-local). Resolution runs
+  **asynchronously via callback-style `getaddrinfo` (libuv thread pool)** so it never blocks the main
+  thread — otherwise concurrent networked commands like `uv pip install` would freeze the UI on a
+  synchronous DNS lookup per request. Records are returned via the `run_command` result summary and
+  stored as `network` evidence.
 - **T0 allows network by default**: `tools.sandbox.privilege.tiers[0].network = true`, so T0 no
   longer passes `--unshare-net`; `offline=true` still hard-isolates (taking precedence over tiers).
 - **Boundary (important)**: this is **application-layer** filtering. **Raw TCP that ignores the

@@ -241,17 +241,19 @@
        等窄能力（**不含 `CAP_MKNOD`**：设备节点由 seccomp 基线硬拦，见 §6）；若载荷降权为
        专用非 root uid，这些窄能力以 **ambient** 形式保留，否则改 uid 会清空能力、包安装锁失败。
        进程始终在 mount/pid 命名空间 + seccomp + 整机根 overlay + 遮蔽 + 暂存约束内。
-     - **超大文件不纳入候选**（`tools.sandbox.max_file_bytes`，默认 8 MiB）：超过上限的文件
-       仍写入 overlay 私有层（不落真实盘），但不进入候选/待审/发布，避免 `apt` 的
-       `pkgcache.bin`、缓存归档、镜像层等被嵌入候选 JSON 而阻塞主线程 / 撑爆磁盘。
-       异步捕获在**工作线程内**即按上限跳过（不进入 base 哈希列表），避免为数百 MB 的
-       chromium/npm 缓存读取+纯 Lua 哈希。
-     - **同一文件不重复处理（捕获签名缓存）**：每次异步捕获把处理过的每个 overlay 条目
-       （文件/删除/超限跳过）的**目标签名**（mtime/size）记入该 upper 的期望表；下次捕获在
-       **工作线程内**先比对签名，未变即整体跳过——不派发记录、不做 base 哈希、不占主线程。
-       只有真正变化（或被外部改动）的文件才重新处理。此前每条 `run_command` 都会把同一批
-       已捕获文件（含数百 MB 的 chromium/npm 缓存）重新读取+纯 Lua 哈希，表现为命令完成后
-       主线程长时间停顿；期望表随会话轮换清空。
+      - **超大文件以 blob 纳入候选**（`tools.sandbox.max_file_bytes`，默认 8 MiB）：超过上限的
+        文件不把内容嵌入候选 JSON，而是把暂存副本复制到沙箱存储的 `blobs/` 目录，候选条目仅
+        记录 `blob` 路径与 **stat 签名**（`sig:mtime:size`）。发布/物化/暂存合并时按**文件复制**
+        （内核 `copyfile`，不读入 Lua 内存），因此 torch 的 `libtorch_python.so` 等数十至数百 MB
+        的库文件也能完整落盘，不再出现「包安装后 venv 缺失大文件」的损坏。大文件**不做 base 内容
+        哈希**（不进入 base 哈希列表），发布 CAS 用 stat 签名；blob 随实例存储目录在 `store.reset`/
+        实例回收时清理。编辑大文件（`edit_file`）的撤销快照仍受上限约束（见 §…「撤销保存」）。
+      - **同一文件不重复处理（捕获签名缓存）**：每次异步捕获把处理过的每个 overlay 条目
+        （文件/删除/超大文件）的**目标签名**（mtime/size）记入该 upper 的期望表；下次捕获在
+        **工作线程内**先比对签名，未变即整体跳过——不派发记录、不做 base 哈希、不占主线程。
+        只有真正变化（或被外部改动）的文件才重新处理。此前每条 `run_command` 都会把同一批
+        已捕获文件（含数百 MB 的 chromium/npm 缓存）重新读取+纯 Lua 哈希，表现为命令完成后
+        主线程长时间停顿；期望表随会话轮换清空。
      - **冻结分块并行**（`tools.sandbox.work_chunk_files`，默认 128）：`finish_async`、批量密钥
        token 化与 `merge_candidate_async` 的暂存副本写盘按此文件数分块并发投递到线程池，
        使大量文件时用满多核而非单核串行。
@@ -824,7 +826,9 @@ seccomp（含设备节点屏障）**——沙箱内进程看到的是一份「�
   经 `getaddrinfo` 规范化为 IP（把八进制/十六进制/短式 IPv4、全展开 IPv6、IPv4-mapped
   `::ffff:127.0.0.1` 等统一），再按数值判定本机集合，随后**用同一批已校验 IP 连接**——
   避免「字面量字符串比较与内核解析不一致」及「校验/连接两次解析被 DNS rebinding 切换答案」。
-  解析失败时 fail-closed 视为本机拒绝。记录经 `run_command` 结果摘要回传，并写入 `network` 证据。
+  解析失败时 fail-closed 视为本机拒绝。解析经**回调式 `getaddrinfo`（libuv 线程池）异步执行**，
+  不阻塞主线程——否则 `uv pip install` 等并发联网命令会因每条请求的同步 DNS 解析冻结界面。
+  记录经 `run_command` 结果摘要回传，并写入 `network` 证据。
 - **T0 默认放行网络**：`tools.sandbox.privilege.tiers[0].network = true`，T0 不再
   `--unshare-net`；`offline=true` 时仍硬隔离（优先于档位）。
 - **边界（重要）**：这是**应用层**过滤。**不认代理的裸 TCP**（`nc`/`ssh`/数据库客户端、
