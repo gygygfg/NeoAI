@@ -52,9 +52,10 @@ TOOL_LOOP_STARTED (tool_loop.run)
       │      ├─ TOOL_EXECUTION_STARTED
       │      ├─ tool_service.execute → executor.execute
       │      │      ├─ alias resolution → argument normalization → path expansion → schema validation
-      │      │      ├─ approval decision (validator.check_approval)
+      │      │      ├─ approval decision (validator.check_approval, non-async modes only)
       │      │      │      ├─ approval required → approve_and_execute (serial popup)
       │      │      │      └─ direct execution → _execute_tool (pausable timer timeout)
+      │      │      └─ sandbox gate sandbox.gate (async default: execute and freeze candidate)
       │      └─ TOOL_EXECUTION_COMPLETED / _ERROR
       │
       ├─ async.all(promises) all complete
@@ -178,6 +179,10 @@ cleans up when a window closes, plus `tool_service.clear_approval` (releasing th
 ---
 
 ## 5. Interaction Between Approval and the Tool Loop
+
+> Under the default `tools.approval.mode = "async"` there is **no pre-execution blocking approval**;
+> this section describes the popup-approval behavior under `prompt`/`strict` modes (or compatibility
+> cases such as masked-directory hits).
 
 ### 5.1 Timing During Approval
 

@@ -52,10 +52,12 @@ require("NeoAI").setup({
 
 ## 3. 工具
 
-| 工具 | 说明 | 默认审批 |
+| 工具 | 说明 | 参数说明 |
 | --- | --- | --- |
-| `list_skills` | 列出所有技能（name + description） | ✅ 自动允许 |
-| `load_skill(name)` | 装载某技能正文（SKILL.md 正文）给模型 | ✅ 自动允许 |
+| `list_skills` | 列出所有技能（name + description） | 无参数 |
+| `load_skill(name)` | 装载某技能正文（SKILL.md 正文）给模型 | `name`（必填）技能名（来自 `list_skills` 或系统提示清单） |
+
+> 默认异步审批（`tools.approval.mode = "async"`）下不再执行前阻塞审批：工具立即在沙箱内执行，是否进入待审队列由沙箱风险分级（`sandbox.approval`）决定。技能工具均为只读/装载类（L0），直接放行。
 
 系统提示会注入「可用技能」段（`inject_mode`）：
 

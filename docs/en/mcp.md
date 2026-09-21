@@ -28,7 +28,7 @@ require("NeoAI").setup({
         args = { "-y", "@modelcontextprotocol/server-filesystem", vim.fn.getcwd() },
         env = {},
         expose = { tools = true, resources = true, prompts = true },
-        approval = { auto_allow = false },  -- every remote tool requires approval by default
+        approval = { auto_allow = false },  -- every remote tool is non-auto-allowable by default (effective in non-async modes)
         plan_safe = false,                  -- not exposed in plan mode (default)
       },
       remote = {                         -- remote streamable HTTP server
@@ -42,7 +42,9 @@ require("NeoAI").setup({
 })
 ```
 
-`expose.resources/prompts` are enabled by default; `approval.auto_allow` defaults to `false` (remote tools are untrusted and require approval).
+`expose.resources/prompts` are enabled by default; `approval.auto_allow` defaults to `false` (remote tools are untrusted, so they may never be auto-allowed).
+With the default `tools.approval.mode = "async"` there is no pre-execution blocking approval; the sandbox risk level decides the action:
+MCP tool calls follow `sandbox.approval.default` (default `review`) and enter the **review queue**, applied after confirmation via `:NeoAISandboxReview`.
 Setting `plan_safe=true` allows that server's tools in plan mode (only when read-only behavior is confirmed).
 
 ## 3. Tool Registration and Naming
@@ -92,7 +94,9 @@ When a `tools/call` fails due to a parameter/schema mismatch (`isError` and the 
 
 ## 5. Execution and Safety
 
-- Approval reuses `tool_service` (single serialized slot); MCP tools require approval by default.
+- Execution always goes through the sandbox (`sandbox.gate`); MCP tool calls enter the **review queue** by default per risk level
+  (`sandbox.approval.default = "review"`) and are applied after async confirmation via `:NeoAISandboxReview` (only in non-async modes does
+  the pre-execution approval dialog in `tool_service` apply).
 - In plan mode, MCP tools are rejected by default (not in the read-only/information-query allowlist); servers with `plan_safe=true` are allowed.
 - Timeouts use a pausable timer (time waiting for approval is not counted); a request cancellation sends `notifications/cancelled`.
 - On plugin shutdown (`PLUGIN_SHUTDOWN`), stdio servers: close stdin → SIGTERM → SIGKILL as a fallback.

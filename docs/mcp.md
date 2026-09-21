@@ -28,7 +28,7 @@ require("NeoAI").setup({
         args = { "-y", "@modelcontextprotocol/server-filesystem", vim.fn.getcwd() },
         env = {},
         expose = { tools = true, resources = true, prompts = true },
-        approval = { auto_allow = false },  -- 每个远端工具默认需审批
+        approval = { auto_allow = false },  -- 每个远端工具默认不可自动放行（非 async 模式下生效）
         plan_safe = false,                  -- 计划模式下不暴露（默认）
       },
       remote = {                         -- 远端 streamable HTTP 服务器
@@ -42,7 +42,9 @@ require("NeoAI").setup({
 })
 ```
 
-`expose.resources/prompts` 缺省开启；`approval.auto_allow` 默认 `false`（远端工具不可信，需审批）。
+`expose.resources/prompts` 缺省开启；`approval.auto_allow` 默认 `false`（远端工具不可信，不允许自动放行）。
+默认 `tools.approval.mode = "async"` 下不做执行前阻塞审批，而是由沙箱风险分级决定动作：
+MCP 工具调用按 `sandbox.approval.default`（默认 `review`）进入**待审队列**，用 `:NeoAISandboxReview` 确认后应用。
 `plan_safe=true` 可在计划模式下放行该服务器的工具（仅当确认只读）。
 
 ## 3. 工具注册与命名
@@ -92,7 +94,8 @@ require("NeoAI").setup({
 
 ## 5. 执行与安全
 
-- 审批沿用 `tool_service`（串行单槽位），MCP 工具默认需审批。
+- 执行统一经沙箱（`sandbox.gate`）；MCP 工具调用按风险分级默认进入**待审队列**（`sandbox.approval.default = "review"`），
+  用 `:NeoAISandboxReview` 异步确认后应用（非 async 模式下才走 `tool_service` 的执行前弹窗审批）。
 - 计划模式下 MCP 工具默认驳回（不在只读/信息查询白名单）；`plan_safe=true` 的服务器放行。
 - 超时用可暂停计时器（等待审批不计入）；请求取消会发 `notifications/cancelled`。
 - stdio 服务器在插件关闭（`PLUGIN_SHUTDOWN`）时：关 stdin → SIGTERM → SIGKILL 兜底。

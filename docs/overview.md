@@ -36,8 +36,10 @@ NeoAI 是一款面向 Neovim 的 AI 驱动聊天插件，可将 AI 助手直接�
 5. 工具系统
    - 内置工具：file ops、LSP、treesitter、shell、git、logging、todo、
      plan_mode、ask_user、read_image、web_fetch（默认不启用）、sub-agent、skills
-   - 工具审批工作流（串行单槽队列、自动允许配置、
-     按工具权限覆盖、AUTO 模式、审批超时）
+   - 工具审批工作流：默认 `mode="async"`——工具立即在沙箱内执行并冻结候选，
+     真实修改进待审队列（`:NeoAISandboxReview` 确认应用）；`prompt`/`strict` 才用
+     串行单槽队列弹窗确认（自动允许配置、按工具权限覆盖、AUTO 模式、审批超时）
+   - 沙箱风险分级：L0-L3 对应 auto/record/review/block，默认 `review`（待审）
    - Plan mode：仅允许只读/信息类工具 + ask_user；修改类工具受门控
    - Plan 蒸馏：审批通过时，将 plan 阶段的研究上下文蒸馏为一个
      checkpoint，以替代上下文压缩

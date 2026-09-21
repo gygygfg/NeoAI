@@ -52,10 +52,12 @@ require("NeoAI").setup({
 
 ## 3. Tools
 
-| Tool | Description | Default approval |
+| Tool | Description | Parameters |
 | --- | --- | --- |
-| `list_skills` | List all skills (name + description) | ✅ Auto-allowed |
-| `load_skill(name)` | Load a skill's body (the SKILL.md body) into the model | ✅ Auto-allowed |
+| `list_skills` | List all skills (name + description) | no parameters |
+| `load_skill(name)` | Load a skill's body (the SKILL.md body) into the model | `name` (required) skill name (from `list_skills` or the system prompt list) |
+
+> With the default asynchronous approval (`tools.approval.mode = "async"`) there is no pre-execution blocking approval: the tool runs in the sandbox immediately, and whether it enters the review queue is decided by the sandbox risk level (`sandbox.approval`). Skill tools are read-only/load-only (L0) and pass straight through.
 
 The system prompt injects an "available skills" section (`inject_mode`):
 

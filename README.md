@@ -341,7 +341,7 @@ require("NeoAI").setup({
       -- mutating_tools = { ... },       -- 修改类工具（计划模式可见集已覆盖此语义）
     },
     approval = {
-      mode = "prompt",                   -- prompt | auto_allow | strict
+      mode = "async",                    -- async（默认，异步审批：立即沙箱执行，事后确认应用）| prompt | auto_allow | strict
       default_auto_allow = false,
       timeout_ms = 60000,                -- 审批弹窗超时（防永久挂起）
       allowed_directories = {},
@@ -386,7 +386,7 @@ require("NeoAI").setup({
       --   headers = { ["Authorization"] = "Bearer ..." },
       --   -- 通用：
       --   expose = { tools = true, resources = true, prompts = true },
-      --   approval = { auto_allow = false },  -- 默认需审批（远端工具不可信）
+      --   approval = { auto_allow = false },  -- 不允许自动放行（非 async 模式下生效；远端工具不可信）
       --   plan_safe = false,                   -- 计划模式下是否放行
       -- }
     },
@@ -604,19 +604,24 @@ require("NeoAI").setup({
 
 NeoAI 内置了 40+ 工具，AI 可在对话中自动调用，涵盖以下类别：
 
-### 📁 文件操作工具 (默认不更改代码的都自动允许)
+> **关于权限与审批**：所有工具执行都统一经过**沙箱控制面**（预检 → 隔离执行 → 冻结候选 → 授权校验 → CAS 发布）。
+> 默认 `tools.approval.mode = "async"`（异步审批）：效果类工具（编辑 / 删除 / 建目录 / 回滚 / 命令等）在沙箱内立即执行并冻结为候选，
+> **真实工作区改动进入待审队列**，用 `:NeoAISandboxReview` 或聊天窗口内 `<leader>ap` 确认后应用；读取类工具直接放行。
+> 因此下表不再逐工具标注「是否需审批」，只列主要参数（用途简述）；权限分级与白名单见「工具审批」配置与 [docs/tool_system.md](docs/tool_system.md)。
 
-| 工具名             | 描述             | 默认审批    |
-| ------------------ | ---------------- | ----------- |
-| `read_file`        | 读取文件内容（大文件默认返回语法树大纲/预览，见下） | ✅ 自动允许 |
-| `edit_file`        | 编辑文件内容     | ❌ 需审批   |
-| `list_files`       | 列出目录文件     | ✅ 自动允许 |
-| `search_files`     | 搜索文件内容     | ✅ 自动允许 |
-| `create_directory` | 创建目录         | ❌ 需审批   |
-| `ensure_dir`       | 确保目录存在     | ❌ 需审批   |
-| `delete_file`      | 删除文件         | ❌ 需审批   |
-| `file_exists`      | 检查文件是否存在 | ✅ 自动允许 |
-| `read_image`       | 读取图像文件，把图像注入多模态模型 | ✅ 自动允许 |
+### 📁 文件操作工具（读取类直接放行，改动类进待审队列）
+
+| 工具名             | 描述             | 参数说明 |
+| ------------------ | ---------------- | -------- |
+| `read_file`        | 读取文件内容（大文件默认返回语法树大纲/预览，见下） | `filepath`（必填）文件路径；`start_line`/`end_line`（可选）读取的起止行（1-based，含两端） |
+| `edit_file`        | 编辑文件内容     | `filepath`（必填）目标文件；`description`（必填）修改目的说明；`content`（整体覆写用）；`mode`（`write`/`append`/`edit`）；`edits`（结构化替换 `{old_text, new_text}` 数组） |
+| `list_files`       | 列出目录文件     | `path`（可选，默认当前目录）目录路径；`recursive`（可选）是否递归；`max_results`（可选）最大返回数量 |
+| `search_files`     | 搜索文件内容     | `query`（必填）搜索关键字；`include`（可选）文件 glob；`path`（可选）搜索目录；`max_results`（可选）最大返回条数 |
+| `create_directory` | 创建目录         | `filepath`（必填）目录路径（递归创建） |
+| `ensure_dir`       | 确保目录存在     | `filepath`（必填）目录路径（不存在则创建） |
+| `delete_file`      | 删除文件         | `filepath`（必填）待删除文件 |
+| `file_exists`      | 检查文件是否存在 | `filepath`（必填）待检查文件；返回 `true`/`false` |
+| `read_image`       | 读取图像文件，把图像注入多模态模型 | `file_path`（必填）图像文件路径或 `http(s)` 图片 URL |
 
 > **`read_file` 大文件保护**：未指定 `start_line`/`end_line` 且文件超过阈值（默认 500 字符）时，
 > 不返回全文，而返回该文件的 **tree-sitter 语法树节点大纲**（该文件类型无解析器时为前若干行预览），
@@ -625,82 +630,82 @@ NeoAI 内置了 40+ 工具，AI 可在对话中自动调用，涵盖以下类别
 
 ### 🌳 代码分析工具（Tree-sitter）Neovim >= 0.6 原生支持
 
-| 工具名                 | 描述               | 默认审批    |
-| ---------------------- | ------------------ | ----------- |
-| `parse_file`           | 解析文件语法树     | ✅ 自动允许 |
-| `query_tree`           | 查询语法树节点     | ✅ 自动允许 |
-| `get_node_at_position` | 获取指定位置节点   | ✅ 自动允许 |
-| `get_node_type`        | 获取节点类型       | ✅ 自动允许 |
-| `get_node_range`       | 获取节点范围       | ✅ 自动允许 |
-| `is_named_node`        | 检查是否为命名节点 | ✅ 自动允许 |
-| `get_parent_node`      | 获取父节点         | ✅ 自动允许 |
-| `get_child_nodes`      | 获取子节点列表     | ✅ 自动允许 |
-| `get_node_code`        | 获取节点源代码     | ✅ 自动允许 |
-| `delete_node`          | 删除语法树节点     | ❌ 需审批   |
+| 工具名                 | 描述               | 参数说明 |
+| ---------------------- | ------------------ | -------- |
+| `parse_file`           | 解析文件语法树     | `filepath`（必填）待解析文件；返回根节点概览 |
+| `query_tree`           | 查询语法树节点     | `filepath`（必填）文件；`query`（必填）tree-sitter query |
+| `get_node_at_position` | 获取指定位置节点   | `filepath`、`line`、`col`（必填，1-based） |
+| `get_node_type`        | 获取节点类型       | `filepath`、`line`、`col`（必填，1-based） |
+| `get_node_range`       | 获取节点范围       | `filepath`、`line`、`col`（必填，1-based） |
+| `is_named_node`        | 检查是否为命名节点 | `filepath`、`line`、`col`（必填，1-based） |
+| `get_parent_node`      | 获取父节点         | `filepath`、`line`、`col`（必填，1-based） |
+| `get_child_nodes`      | 获取子节点列表     | `filepath`、`line`、`col`（必填，1-based） |
+| `get_node_code`        | 获取节点源代码     | `filepath`、`line`、`col`（必填，1-based） |
+| `delete_node`          | 删除语法树节点     | `filepath`、`line`、`col`（必填，1-based）定位待删除节点 |
 
 ### 🔧 LSP 工具 Neovim >= 0.12 原生支持
 
-| 工具名                  | 描述                | 默认审批    |
-| ----------------------- | ------------------- | ----------- |
-| `lsp_hover`             | 获取悬停信息        | ✅ 自动允许 |
-| `lsp_definition`        | 获取定义位置        | ✅ 自动允许 |
-| `lsp_references`        | 获取引用位置        | ✅ 自动允许 |
-| `lsp_implementation`    | 获取实现位置        | ✅ 自动允许 |
-| `lsp_declaration`       | 获取声明位置        | ✅ 自动允许 |
-| `lsp_document_symbols`  | 获取文档符号        | ✅ 自动允许 |
-| `lsp_workspace_symbols` | 搜索工作区符号      | ✅ 自动允许 |
-| `lsp_code_action`       | 获取代码操作建议    | ✅ 自动允许 |
-| `lsp_rename`            | 重命名符号          | ❌ 需审批   |
-| `lsp_format`            | 格式化代码          | ❌ 需审批   |
-| `lsp_diagnostics`       | 获取诊断信息        | ✅ 自动允许 |
-| `lsp_client_info`       | 获取 LSP 客户端信息 | ✅ 自动允许 |
-| `lsp_signature_help`    | 获取函数签名        | ✅ 自动允许 |
-| `lsp_completion`        | 获取补全建议        | ✅ 自动允许 |
-| `lsp_type_definition`   | 获取类型定义        | ✅ 自动允许 |
-| `lsp_service_info`      | 获取 LSP 服务信息   | ✅ 自动允许 |
+| 工具名                  | 描述                | 参数说明 |
+| ----------------------- | ------------------- | -------- |
+| `lsp_hover`             | 获取悬停信息        | `filepath`/`line`/`col`（可选，缺省用当前光标位置） |
+| `lsp_definition`        | 获取定义位置        | 同上 |
+| `lsp_references`        | 获取引用位置        | 同上 |
+| `lsp_implementation`    | 获取实现位置        | 同上 |
+| `lsp_declaration`       | 获取声明位置        | 同上 |
+| `lsp_document_symbols`  | 获取文档符号        | `filepath`（可选）文件路径 |
+| `lsp_workspace_symbols` | 搜索工作区符号      | `query`（必填）符号名关键字 |
+| `lsp_code_action`       | 获取代码操作建议    | `filepath`/`line`/`col`（可选） |
+| `lsp_rename`            | 重命名符号          | `filepath`、`line`、`col`、`new_name`（必填） |
+| `lsp_format`            | 格式化代码          | `filepath`（可选）待格式化文件 |
+| `lsp_diagnostics`       | 获取诊断信息        | `filepath`（可选） |
+| `lsp_client_info`       | 获取 LSP 客户端信息 | `filepath`（可选） |
+| `lsp_signature_help`    | 获取函数签名        | `filepath`/`line`/`col`（可选） |
+| `lsp_completion`        | 获取补全建议        | `filepath`/`line`/`col`（可选） |
+| `lsp_type_definition`   | 获取类型定义        | `filepath`/`line`/`col`（可选） |
+| `lsp_service_info`      | 获取 LSP 服务信息   | 无参数 |
 
 ### 💻 Shell 工具 支持交互式shell 由AI自动填写
 
-| 工具名        | 描述               | 默认审批                    |
-| ------------- | ------------------ | --------------------------- |
-| `run_command` | 执行 Shell 命令（非交互，异步 jobstart） | ❌ 需审批（支持参数白名单 `ls`/`wc`/`find`/`grep`/`pwd`） |
+| 工具名        | 描述               | 参数说明 |
+| ------------- | ------------------ | -------- |
+| `run_command` | 执行 Shell 命令（非交互，异步 jobstart） | `command`（必填）要执行的命令（必要时用引号包裹以免提前拆分）；`timeout_ms`（可选，默认 30000，-1 为不限）超时毫秒数。长任务请在同一次调用显式传较大值；命令以 `&`/`nohup` 结束后自动转为后台服务，用 `service_logs`/`service_status`/`service_stop` 管理。常见只读命令 `ls`/`wc`/`find`/`grep`/`pwd` 命中参数白名单 |
 
 ### 🔄 Git 工具
 
-| 工具名                  | 描述                     | 默认审批    |
-| ----------------------- | ------------------------ | ----------- |
-| `git_status`            | 查看 git 状态（--short） | ✅ 自动允许 |
-| `git_diff`              | 查看未提交改动           | ✅ 自动允许 |
-| `git_log`               | 查看提交历史             | ✅ 自动允许 |
-| `git_commit_detail`     | 查看某次提交详情         | ✅ 自动允许 |
-| `git_branch`            | 查看分支列表（-a）       | ✅ 自动允许 |
-| `git_file_history`      | 查看文件历史             | ✅ 自动允许 |
-| `git_rollback`          | 回滚文件到指定提交       | ❌ 需审批   |
-| `git_auto_commit_config`| 查看/设置自动提交配置    | ✅ 自动允许 |
+| 工具名                  | 描述                     | 参数说明 |
+| ----------------------- | ------------------------ | -------- |
+| `git_status`            | 查看 git 状态（--short） | `path`（可选）限定路径 |
+| `git_diff`              | 查看未提交改动           | `filepath`（可选）仅看该文件的 diff |
+| `git_log`               | 查看提交历史             | `max`（可选，默认 20）条数；`path`（可选）限定路径 |
+| `git_commit_detail`     | 查看某次提交详情         | `ref`（必填）提交引用（如 `HEAD`/`abc123`） |
+| `git_branch`            | 查看分支列表（-a）       | 无参数 |
+| `git_file_history`      | 查看文件历史             | `filepath`（必填）文件路径；`max`（可选）条数 |
+| `git_rollback`          | 回滚文件到指定提交       | `filepath`（必填）文件；`commit`（可选，默认 `HEAD`）目标提交 |
+| `git_auto_commit_config`| 查看/设置自动提交配置    | `auto_commit`（可选）布尔，省略则仅查询当前配置 |
 
 ### 🤖 子 Agent 工具
 
-| 工具名                 | 描述                                                      | 默认审批    |
-| ---------------------- | --------------------------------------------------------- | ----------- |
-| `create_sub_agent`     | 创建子 Agent 执行子任务（支持 `foreground` 前台等待结果；`mode` 可选，`boundaries` 可选约束） | ❌ 需审批   |
-| `wait_sub_agent`       | 等待子 Agent 完成并返回完整结果（若已完成则立即返回）     | ❌ 需审批   |
-| `get_sub_agent_status` | 查询子 Agent 状态与结果                                   | ✅ 自动允许 |
-| `cancel_sub_agent`     | 取消子 Agent                                              | ✅ 自动允许 |
+| 工具名                 | 描述                                                      | 参数说明 |
+| ---------------------- | --------------------------------------------------------- | -------- |
+| `create_sub_agent`     | 创建子 Agent 执行子任务（支持 `foreground` 前台等待结果）  | `task`（必填）子任务描述；`mode`（可选，`background` 默认/`foreground`）执行模式；`model`（可选）指定模型；`boundaries`（可选）约束 `{allowed_tools, allowed_directories, allowed_commands, max_tool_calls, max_iterations}`；`context`（可选）额外上下文 |
+| `wait_sub_agent`       | 等待子 Agent 完成并返回完整结果（若已完成则立即返回）     | `sub_agent_id`（必填）子 Agent 标识 |
+| `get_sub_agent_status` | 查询子 Agent 状态与结果                                   | `sub_agent_id`（必填）子 Agent 标识 |
+| `cancel_sub_agent`     | 取消子 Agent                                              | `sub_agent_id`（必填）子 Agent 标识 |
 
 ### 📋 待办与计划
 
-| 工具名            | 描述                                           | 默认审批    |
-| ----------------- | ---------------------------------------------- | ----------- |
-| `todo_write`      | 整表替换任务清单（自动注入系统提示）           | ✅ 自动允许 |
-| `todo_read`       | 读取当前任务清单                               | ✅ 自动允许 |
-| `todo_clear`      | 清空任务清单                                   | ✅ 自动允许 |
-| `enter_plan_mode` | 进入计划模式（工具上下文切换为只读/信息 + 提问）| ✅ 自动允许 |
+| 工具名            | 描述                                           | 参数说明 |
+| ----------------- | ---------------------------------------------- | -------- |
+| `todo_write`      | 整表替换任务清单（自动注入系统提示）           | `todos`（必填）完整清单数组，每项 `{content, status}`，`status` ∈ `pending`/`in_progress`/`completed`/`cancelled`（同一时刻至多一个 `in_progress`） |
+| `todo_read`       | 读取当前任务清单                               | 无参数 |
+| `todo_clear`      | 清空任务清单                                   | 无参数 |
+| `enter_plan_mode` | 进入计划模式（工具上下文切换为只读/信息 + 提问）| 无参数 |
 
 ### 💬 向用户提问
 
-| 工具名     | 描述                                     | 默认审批    |
-| ---------- | ---------------------------------------- | ----------- |
-| `ask_user` | 暂停生成并向用户提问，回答回传为工具结果 | ✅ 自动允许 |
+| 工具名     | 描述                                     | 参数说明 |
+| ---------- | ---------------------------------------- | -------- |
+| `ask_user` | 暂停生成并向用户提问，回答回传为工具结果 | `question`（必填）要提问的问题；`options`（可选）供快速选择的选项数组（字符串，或 `{label, description}` 对象） |
 
 > **计划模式（PLAN MODE）**：激活时工具上下文**只包含只读/信息查询工具、`run_command`（只读调研）与 `ask_user`**，
 > 不暴露任何修改类工具（编辑/删除/创建/git 回滚等），**也不向 AI 提供切换模式的工具**；执行期门禁同步收紧，
@@ -715,16 +720,16 @@ NeoAI 内置了 40+ 工具，AI 可在对话中自动调用，涵盖以下类别
 
 ### 🪵 日志工具
 
-| 工具名           | 描述             | 默认审批    |
-| ---------------- | ---------------- | ----------- |
-| `log_message`    | 记录日志消息     | ✅ 自动允许 |
-| `get_log_levels` | 获取可用日志级别 | ✅ 自动允许 |
+| 工具名           | 描述             | 参数说明 |
+| ---------------- | ---------------- | -------- |
+| `log_message`    | 记录日志消息     | `message`（必填）日志内容；`level`（可选）`debug`/`info`/`warn`/`error` |
+| `get_log_levels` | 获取可用日志级别 | 无参数 |
 
 ### 🔁 系统工具
 
-| 工具名       | 描述                                          | 默认审批      |
-| ------------ | --------------------------------------------- | ------------- |
-| `reload_all` | 热重载整个 NeoAI 插件（含隔离子进程预检）     | ⚠️ 需审批      |
+| 工具名       | 描述                                          | 参数说明 |
+| ------------ | --------------------------------------------- | -------- |
+| `reload_all` | 热重载整个 NeoAI 插件（含隔离子进程预检）     | 无参数 |
 
 > **插件热重载（隔离且安全）**：`reload_all` 工具与 `:NeoAIReloadAll` 命令无需重启 nvim 即可
 > 重载整个 NeoAI 插件（源码改动即时生效）。为避免半加载状态破坏当前会话，采用两阶段策略：
@@ -740,13 +745,13 @@ NeoAI 内置了 40+ 工具，AI 可在对话中自动调用，涵盖以下类别
 `mcp.servers.<name>` 配置的服务器会把其能力注册为工具，命名 `mcp__<server>__<tool>`。
 远端 `tools/list` → 每个远端工具一个 NeoAI 工具；`resources`/`prompts` → 每服务器各一个浏览工具。
 
-| 工具名（示例，`server`=配置名） | 描述 | 默认审批 |
+| 工具名（示例，`server`=配置名） | 描述 | 参数说明 |
 | ------------------------------ | ---- | -------- |
-| `mcp__<server>__<远端工具>`   | 调用 MCP 服务器的远端工具 | ❌ 需审批（`approval.auto_allow`） |
-| `mcp__<server>__list_resources` | 列出服务器资源（只读） | ✅ 自动允许 |
-| `mcp__<server>__read_resource`  | 读取指定资源（只读） | ❌ 需审批 |
-| `mcp__<server>__list_prompts`   | 列出提示模板（只读） | ✅ 自动允许 |
-| `mcp__<server>__get_prompt`     | 获取提示模板内容 | ❌ 需审批 |
+| `mcp__<server>__<远端工具>`   | 调用 MCP 服务器的远端工具 | 参数由远端服务器 `tools/list` 的 `inputSchema` 决定（名称/类型/是否必填均以远端为准）；执行统一经沙箱，按风险分级进入待审队列 |
+| `mcp__<server>__list_resources` | 列出服务器资源（只读） | 无参数 |
+| `mcp__<server>__read_resource`  | 读取指定资源（只读） | `uri`（必填）资源 URI |
+| `mcp__<server>__list_prompts`   | 列出提示模板（只读） | 无参数 |
+| `mcp__<server>__get_prompt`     | 获取提示模板内容 | `name`（必填）提示名；`arguments`（可选）模板参数对象 |
 
 > **工具时序**：启动时先从 `mcp_cache.json` 预缓存注册（连接前可见）；连接/变更通知后动态刷新；
 > 因参数 schema 变化导致远端调用失败时标记 stale，下一轮发送前自动刷新并重绑定工具定义
@@ -754,19 +759,19 @@ NeoAI 内置了 40+ 工具，AI 可在对话中自动调用，涵盖以下类别
 
 ### 🧩 技能工具（Skills）
 
-| 工具名         | 描述                           | 默认审批    |
-| -------------- | ------------------------------ | ----------- |
-| `list_skills`  | 列出可用技能                   | ✅ 自动允许 |
-| `load_skill`   | 装载某技能正文给模型（SKILL.md）| ✅ 自动允许 |
+| 工具名         | 描述                           | 参数说明 |
+| -------------- | ------------------------------ | -------- |
+| `list_skills`  | 列出可用技能                   | 无参数 |
+| `load_skill`   | 装载某技能正文给模型（SKILL.md）| `name`（必填）技能名（来自 `list_skills` 或系统提示清单） |
 
 > 系统提示会注入「可用技能」清单（`skills.inject_mode`），模型可 `load_skill` 装载正文。
 > 详见 [docs/skills.md](docs/skills.md)。
 
 ### 🌐 网页抓取工具（默认不启用）
 
-| 工具名      | 描述 | 默认审批 |
+| 工具名      | 描述 | 参数说明 |
 | ----------- | ---- | -------- |
-| `web_fetch` | 抓取网页并渲染为可读内容（Markdown/纯文本，只输出正文、不含原始 HTML）；对动态网页在无头浏览器执行 JS 后取最终 DOM | ✅ 自动允许 |
+| `web_fetch` | 抓取网页并渲染为可读内容（Markdown/纯文本，只输出正文、不含原始 HTML）；对动态网页在无头浏览器执行 JS 后取最终 DOM | `url`（必填）；`selector`/`wait_selector`/`wait_ms` 定位与等待；`script`（`clean`/`readability`）；`format`（`markdown`/`text`）；`force_refresh`（跳过缓存） |
 
 **管线**：Neovim（Lua 只做编排）→ bash 检查/安装依赖 → Node + Playwright 渲染并注入 JS → 取最终 DOM → turndown 转 Markdown → 回传（可选落缓存）。Lua 不自行解析动态页面。
 

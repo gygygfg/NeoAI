@@ -342,7 +342,7 @@ require("NeoAI").setup({
       -- mutating_tools = { ... },       -- mutating tools (the visible set in plan mode already covers this semantics)
     },
     approval = {
-      mode = "prompt",                   -- prompt | auto_allow | strict
+      mode = "async",                    -- async (default: run in the sandbox now, confirm & apply after the fact) | prompt | auto_allow | strict
       default_auto_allow = false,
       timeout_ms = 60000,                -- approval dialog timeout (prevents an indefinite hang)
       allowed_directories = {},
@@ -387,7 +387,7 @@ require("NeoAI").setup({
       --   headers = { ["Authorization"] = "Bearer ..." },
       --   -- common:
       --   expose = { tools = true, resources = true, prompts = true },
-      --   approval = { auto_allow = false },  -- approval required by default (remote tools are untrusted)
+      --   approval = { auto_allow = false },  -- never auto-allowed (effective in non-async modes; remote tools are untrusted)
       --   plan_safe = false,                   -- whether to allow it in plan mode
       -- }
     },
@@ -618,19 +618,27 @@ require("NeoAI").setup({
 NeoAI ships with 40+ built-in tools that the AI can call automatically during a conversation, covering the following
 categories:
 
-### 📁 File Operation Tools (operations that don't change code are auto-allowed by default)
+> **On permissions and approval**: every tool execution goes through the **sandbox control plane** (pre-check → isolated
+execution → freeze candidate → authorization check → CAS publish). The default `tools.approval.mode = "async"`
+(asynchronous approval) means effectful tools (edit / delete / mkdir / rollback / commands, etc.) run inside the sandbox
+immediately and their results are frozen as candidates, while **real workspace changes enter the pending-review queue**
+apply them with `:NeoAISandboxReview` or `<leader>ap` inside the chat window; read-only tools pass straight through.
+So the tables below no longer mark each tool as "needs approval" — they list only the main parameters (and what each
+one does). For risk levels and allowlists see the `approval` config and [docs/en/tool_system.md](docs/en/tool_system.md).
 
-| Tool name             | Description             | Default approval    |
-| ------------------ | ---------------- | ----------- |
-| `read_file`        | Read file contents (for large files, returns a syntax tree outline/preview by default; see below) | ✅ Auto-allowed |
-| `edit_file`        | Edit file contents     | ❌ Needs approval   |
-| `list_files`       | List directory files     | ✅ Auto-allowed |
-| `search_files`     | Search file contents     | ✅ Auto-allowed |
-| `create_directory` | Create a directory         | ❌ Needs approval   |
-| `ensure_dir`       | Ensure a directory exists     | ❌ Needs approval   |
-| `delete_file`      | Delete a file         | ❌ Needs approval   |
-| `file_exists`      | Check whether a file exists | ✅ Auto-allowed |
-| `read_image`       | Read an image file and inject the image into a multimodal model | ✅ Auto-allowed |
+### 📁 File Operation Tools (read-only pass through; changing ones enter the review queue)
+
+| Tool name             | Description             | Parameters |
+| ------------------ | ---------------- | -------- |
+| `read_file`        | Read file contents (for large files, returns a syntax tree outline/preview by default; see below) | `filepath` (required) file path; `start_line`/`end_line` (optional) 1-based inclusive line range |
+| `edit_file`        | Edit file contents     | `filepath` (required) target file; `description` (required) purpose of the change; `content` (for a full overwrite); `mode` (`write`/`append`/`edit`); `edits` (structured replacements as `{old_text, new_text}` items) |
+| `list_files`       | List directory files     | `path` (optional, defaults to the current directory); `recursive` (optional); `max_results` (optional) |
+| `search_files`     | Search file contents     | `query` (required) search term; `include` (optional) file glob; `path` (optional) search dir; `max_results` (optional) |
+| `create_directory` | Create a directory         | `filepath` (required) directory path (created recursively) |
+| `ensure_dir`       | Ensure a directory exists     | `filepath` (required) directory path (created if missing) |
+| `delete_file`      | Delete a file         | `filepath` (required) file to delete |
+| `file_exists`      | Check whether a file exists | `filepath` (required) file to check; returns `true`/`false` |
+| `read_image`       | Read an image file and inject the image into a multimodal model | `file_path` (required) local image path or `http(s)` image URL |
 
 > **`read_file` large-file protection**: when `start_line`/`end_line` are not specified and the file exceeds the
 > threshold (500 characters by default), the full text is not returned; instead the file's **tree-sitter syntax tree
@@ -641,82 +649,82 @@ categories:
 
 ### 🌳 Code Analysis Tools (Tree-sitter), natively supported by Neovim >= 0.6
 
-| Tool name                 | Description               | Default approval    |
-| ---------------------- | ------------------ | ----------- |
-| `parse_file`           | Parse a file's syntax tree     | ✅ Auto-allowed |
-| `query_tree`           | Query syntax tree nodes     | ✅ Auto-allowed |
-| `get_node_at_position` | Get the node at a given position   | ✅ Auto-allowed |
-| `get_node_type`        | Get a node's type       | ✅ Auto-allowed |
-| `get_node_range`       | Get a node's range       | ✅ Auto-allowed |
-| `is_named_node`        | Check whether it is a named node | ✅ Auto-allowed |
-| `get_parent_node`      | Get the parent node         | ✅ Auto-allowed |
-| `get_child_nodes`      | Get the list of child nodes     | ✅ Auto-allowed |
-| `get_node_code`        | Get a node's source code     | ✅ Auto-allowed |
-| `delete_node`          | Delete a syntax tree node     | ❌ Needs approval   |
+| Tool name                 | Description               | Parameters |
+| ---------------------- | ------------------ | -------- |
+| `parse_file`           | Parse a file's syntax tree     | `filepath` (required) file to parse; returns the root-node outline |
+| `query_tree`           | Query syntax tree nodes     | `filepath` (required) file; `query` (required) tree-sitter query |
+| `get_node_at_position` | Get the node at a given position   | `filepath`, `line`, `col` (required, 1-based) |
+| `get_node_type`        | Get a node's type       | `filepath`, `line`, `col` (required, 1-based) |
+| `get_node_range`       | Get a node's range       | `filepath`, `line`, `col` (required, 1-based) |
+| `is_named_node`        | Check whether it is a named node | `filepath`, `line`, `col` (required, 1-based) |
+| `get_parent_node`      | Get the parent node         | `filepath`, `line`, `col` (required, 1-based) |
+| `get_child_nodes`      | Get the list of child nodes     | `filepath`, `line`, `col` (required, 1-based) |
+| `get_node_code`        | Get a node's source code     | `filepath`, `line`, `col` (required, 1-based) |
+| `delete_node`          | Delete a syntax tree node     | `filepath`, `line`, `col` (required, 1-based) locating the node to delete |
 
 ### 🔧 LSP Tools, natively supported by Neovim >= 0.12
 
-| Tool name                  | Description                | Default approval    |
-| ----------------------- | ------------------- | ----------- |
-| `lsp_hover`             | Get hover information        | ✅ Auto-allowed |
-| `lsp_definition`        | Get the definition location        | ✅ Auto-allowed |
-| `lsp_references`        | Get reference locations        | ✅ Auto-allowed |
-| `lsp_implementation`    | Get the implementation location        | ✅ Auto-allowed |
-| `lsp_declaration`       | Get the declaration location        | ✅ Auto-allowed |
-| `lsp_document_symbols`  | Get document symbols        | ✅ Auto-allowed |
-| `lsp_workspace_symbols` | Search workspace symbols      | ✅ Auto-allowed |
-| `lsp_code_action`       | Get code action suggestions    | ✅ Auto-allowed |
-| `lsp_rename`            | Rename symbol          | ❌ Needs approval   |
-| `lsp_format`            | Format code          | ❌ Needs approval   |
-| `lsp_diagnostics`       | Get diagnostics        | ✅ Auto-allowed |
-| `lsp_client_info`       | Get LSP client information | ✅ Auto-allowed |
-| `lsp_signature_help`    | Get the function signature        | ✅ Auto-allowed |
-| `lsp_completion`        | Get completion suggestions        | ✅ Auto-allowed |
-| `lsp_type_definition`   | Get type definitions        | ✅ Auto-allowed |
-| `lsp_service_info`      | Get LSP service information   | ✅ Auto-allowed |
+| Tool name                  | Description                | Parameters |
+| ----------------------- | ------------------- | -------- |
+| `lsp_hover`             | Get hover information        | `filepath`/`line`/`col` (optional; defaults to the current cursor position) |
+| `lsp_definition`        | Get the definition location        | as above |
+| `lsp_references`        | Get reference locations        | as above |
+| `lsp_implementation`    | Get the implementation location        | as above |
+| `lsp_declaration`       | Get the declaration location        | as above |
+| `lsp_document_symbols`  | Get document symbols        | `filepath` (optional) file path |
+| `lsp_workspace_symbols` | Search workspace symbols      | `query` (required) symbol-name keyword |
+| `lsp_code_action`       | Get code action suggestions    | `filepath`/`line`/`col` (optional) |
+| `lsp_rename`            | Rename symbol          | `filepath`, `line`, `col`, `new_name` (required) |
+| `lsp_format`            | Format code          | `filepath` (optional) file to format |
+| `lsp_diagnostics`       | Get diagnostics        | `filepath` (optional) |
+| `lsp_client_info`       | Get LSP client information | `filepath` (optional) |
+| `lsp_signature_help`    | Get the function signature        | `filepath`/`line`/`col` (optional) |
+| `lsp_completion`        | Get completion suggestions        | `filepath`/`line`/`col` (optional) |
+| `lsp_type_definition`   | Get type definitions        | `filepath`/`line`/`col` (optional) |
+| `lsp_service_info`      | Get LSP service information   | no parameters |
 
 ### 💻 Shell Tools — interactive shells are filled in automatically by the AI
 
-| Tool name        | Description               | Default approval                    |
-| ------------- | ------------------ | --------------------------- |
-| `run_command` | Execute a Shell command (non-interactive, asynchronous jobstart) | ❌ Needs approval (supports an argument allowlist of `ls`/`wc`/`find`/`grep`/`pwd`) |
+| Tool name        | Description               | Parameters |
+| ------------- | ------------------ | -------- |
+| `run_command` | Execute a Shell command (non-interactive, asynchronous jobstart) | `command` (required) the command to run (quote it when needed so it isn't split early); `timeout_ms` (optional, default 30000, -1 = unlimited). Pass a larger value explicitly in the same call for long tasks; a command ending in `&`/`nohup` is turned into a long-running service managed via `service_logs`/`service_status`/`service_stop`. Common read-only commands `ls`/`wc`/`find`/`grep`/`pwd` hit the argument allowlist |
 
 ### 🔄 Git Tools
 
-| Tool name                  | Description                     | Default approval    |
-| ----------------------- | ------------------------ | ----------- |
-| `git_status`            | View git status (--short) | ✅ Auto-allowed |
-| `git_diff`              | View uncommitted changes           | ✅ Auto-allowed |
-| `git_log`               | View commit history             | ✅ Auto-allowed |
-| `git_commit_detail`     | View the details of a given commit         | ✅ Auto-allowed |
-| `git_branch`            | View the branch list (-a)       | ✅ Auto-allowed |
-| `git_file_history`      | View a file's history             | ✅ Auto-allowed |
-| `git_rollback`          | Roll a file back to a given commit       | ❌ Needs approval   |
-| `git_auto_commit_config`| View/set the auto-commit configuration    | ✅ Auto-allowed |
+| Tool name                  | Description                     | Parameters |
+| ----------------------- | ------------------------ | -------- |
+| `git_status`            | View git status (--short) | `path` (optional) limit to a path |
+| `git_diff`              | View uncommitted changes           | `filepath` (optional) restrict the diff to that file |
+| `git_log`               | View commit history             | `max` (optional, default 20) entries; `path` (optional) limit to a path |
+| `git_commit_detail`     | View the details of a given commit         | `ref` (required) commit reference (e.g. `HEAD`/`abc123`) |
+| `git_branch`            | View the branch list (-a)       | no parameters |
+| `git_file_history`      | View a file's history             | `filepath` (required); `max` (optional) entries |
+| `git_rollback`          | Roll a file back to a given commit       | `filepath` (required); `commit` (optional, default `HEAD`) target commit |
+| `git_auto_commit_config`| View/set the auto-commit configuration    | `auto_commit` (optional) boolean; omit to just query the current setting |
 
 ### 🤖 Sub-Agent Tools
 
-| Tool name                 | Description                                                      | Default approval    |
-| ---------------------- | --------------------------------------------------------- | ----------- |
-| `create_sub_agent`     | Create a sub-agent to run a subtask (supports `foreground` to wait for the result in the foreground; `mode` optional, `boundaries` optional constraints) | ❌ Needs approval   |
-| `wait_sub_agent`       | Wait for a sub-agent to finish and return the complete result (returns immediately if already finished)     | ❌ Needs approval   |
-| `get_sub_agent_status` | Query a sub-agent's status and result                                   | ✅ Auto-allowed |
-| `cancel_sub_agent`     | Cancel a sub-agent                                              | ✅ Auto-allowed |
+| Tool name                 | Description                                                      | Parameters |
+| ---------------------- | --------------------------------------------------------- | -------- |
+| `create_sub_agent`     | Create a sub-agent to run a subtask (supports `foreground` to wait for the result in the foreground) | `task` (required) subtask description; `mode` (optional, `background` default / `foreground`); `model` (optional); `boundaries` (optional) `{allowed_tools, allowed_directories, allowed_commands, max_tool_calls, max_iterations}`; `context` (optional) extra context |
+| `wait_sub_agent`       | Wait for a sub-agent to finish and return the complete result (returns immediately if already finished)     | `sub_agent_id` (required) |
+| `get_sub_agent_status` | Query a sub-agent's status and result                                   | `sub_agent_id` (required) |
+| `cancel_sub_agent`     | Cancel a sub-agent                                              | `sub_agent_id` (required) |
 
 ### 📋 Todos and Plans
 
-| Tool name            | Description                                           | Default approval    |
-| ----------------- | ---------------------------------------------- | ----------- |
-| `todo_write`      | Replace the whole task list (with an auto-injected system prompt)           | ✅ Auto-allowed |
-| `todo_read`       | Read the current task list                               | ✅ Auto-allowed |
-| `todo_clear`      | Clear the task list                                   | ✅ Auto-allowed |
-| `enter_plan_mode` | Enter plan mode (the tool context switches to read-only/informational + questions)| ✅ Auto-allowed |
+| Tool name            | Description                                           | Parameters |
+| ----------------- | ---------------------------------------------- | -------- |
+| `todo_write`      | Replace the whole task list (with an auto-injected system prompt)           | `todos` (required) full list; each item is `{content, status}` with `status` ∈ `pending`/`in_progress`/`completed`/`cancelled` (at most one `in_progress`) |
+| `todo_read`       | Read the current task list                               | no parameters |
+| `todo_clear`      | Clear the task list                                   | no parameters |
+| `enter_plan_mode` | Enter plan mode (the tool context switches to read-only/informational + questions)| no parameters |
 
 ### 💬 Asking the User
 
-| Tool name     | Description                                     | Default approval    |
-| ---------- | ---------------------------------------- | ----------- |
-| `ask_user` | Pause generation and ask the user a question; the answer is returned as the tool result | ✅ Auto-allowed |
+| Tool name     | Description                                     | Parameters |
+| ---------- | ---------------------------------------- | -------- |
+| `ask_user` | Pause generation and ask the user a question; the answer is returned as the tool result | `question` (required); `options` (optional) array of choices for quick selection (strings, or `{label, description}` objects) |
 
 > **PLAN MODE**: while active, the tool context **contains only read-only/informational query tools, `run_command` (read-only research), and `ask_user`**,
 > and exposes no mutating tools whatsoever (edit/delete/create/git rollback, etc.), **nor any mode-switching tool to the AI**; execution-time
@@ -731,16 +739,16 @@ categories:
 
 ### 🪵 Logging Tools
 
-| Tool name           | Description             | Default approval    |
-| ---------------- | ---------------- | ----------- |
-| `log_message`    | Log a message     | ✅ Auto-allowed |
-| `get_log_levels` | Get the available log levels | ✅ Auto-allowed |
+| Tool name           | Description             | Parameters |
+| ---------------- | ---------------- | -------- |
+| `log_message`    | Log a message     | `message` (required); `level` (optional) `debug`/`info`/`warn`/`error` |
+| `get_log_levels` | Get the available log levels | no parameters |
 
 ### 🔁 System Tools
 
-| Tool name    | Description                                          | Default approval |
-| ------------ | ---------------------------------------------------- | ---------------- |
-| `reload_all` | Hot-reload the whole NeoAI plugin (isolated pre-check) | ⚠️ Requires approval |
+| Tool name    | Description                                          | Parameters |
+| ------------ | ---------------------------------------------------- | -------- |
+| `reload_all` | Hot-reload the whole NeoAI plugin (isolated pre-check) | no parameters |
 
 > **Plugin hot-reload (isolated & safe)**: the `reload_all` tool and the `:NeoAIReloadAll` command
 > reload the whole NeoAI plugin without restarting nvim (so source edits take effect immediately).
@@ -759,13 +767,13 @@ categories:
 Servers configured under `mcp.servers.<name>` register their capabilities as tools named `mcp__<server>__<tool>`.
 Remote `tools/list` → one NeoAI tool per remote tool; `resources`/`prompts` → one browsing tool per server each.
 
-| Tool name (example, `server` = config name) | Description | Default approval |
+| Tool name (example, `server` = config name) | Description | Parameters |
 | ------------------------------ | ---- | -------- |
-| `mcp__<server>__<remote-tool>`   | Call a remote tool on the MCP server | ❌ Needs approval (`approval.auto_allow`) |
-| `mcp__<server>__list_resources` | List server resources (read-only) | ✅ Auto-allowed |
-| `mcp__<server>__read_resource`  | Read a given resource (read-only) | ❌ Needs approval |
-| `mcp__<server>__list_prompts`   | List prompt templates (read-only) | ✅ Auto-allowed |
-| `mcp__<server>__get_prompt`     | Get the content of a prompt template | ❌ Needs approval |
+| `mcp__<server>__<remote-tool>`   | Call a remote tool on the MCP server | Parameters come from the remote server's `tools/list` `inputSchema` (name/type/required are whatever the remote declares); all MCP calls go through asynchronous approval |
+| `mcp__<server>__list_resources` | List server resources (read-only) | no parameters |
+| `mcp__<server>__read_resource`  | Read a given resource (read-only) | `uri` (required) resource URI |
+| `mcp__<server>__list_prompts`   | List prompt templates (read-only) | no parameters |
+| `mcp__<server>__get_prompt`     | Get the content of a prompt template | `name` (required) prompt name; `arguments` (optional) template-argument object |
 
 > **Tool timing**: at startup, tools are registered from the `mcp_cache.json` pre-cache (visible before connecting); they
 > are refreshed dynamically after connect/change notifications;
@@ -775,19 +783,19 @@ Remote `tools/list` → one NeoAI tool per remote tool; `resources`/`prompts` �
 
 ### 🧩 Skill Tools (Skills)
 
-| Tool name         | Description                           | Default approval    |
-| -------------- | ------------------------------ | ----------- |
-| `list_skills`  | List the available skills                   | ✅ Auto-allowed |
-| `load_skill`   | Load a skill's body text into the model (SKILL.md)| ✅ Auto-allowed |
+| Tool name         | Description                           | Parameters |
+| -------------- | ------------------------------ | -------- |
+| `list_skills`  | List the available skills                   | no parameters |
+| `load_skill`   | Load a skill's body text into the model (SKILL.md)| `name` (required) skill name (from `list_skills` or the system prompt list) |
 
 > The system prompt injects the list of "available skills" (`skills.inject_mode`), and the model can `load_skill` to load the body text.
 > See [docs/en/skills.md](docs/en/skills.md).
 
 ### 🌐 Web Fetch Tool (disabled by default)
 
-| Tool name   | Description | Default approval |
-| ----------- | ----------- | ---------------- |
-| `web_fetch` | Fetch a page and render it to readable content (Markdown/plain text, body only, no raw HTML); for dynamic pages it runs JS in a headless browser and takes the final DOM | ✅ Auto-allowed |
+| Tool name   | Description | Parameters |
+| ----------- | ----------- | -------- |
+| `web_fetch` | Fetch a page and render it to readable content (Markdown/plain text, body only, no raw HTML); for dynamic pages it runs JS in a headless browser and takes the final DOM | `url` (required); `selector`/`wait_selector`/`wait_ms` for locating and waiting; `script` (`clean`/`readability`); `format` (`markdown`/`text`); `force_refresh` (skip cache) |
 
 **Pipeline**: Neovim (Lua only orchestrates) → bash checks/installs deps → Node + Playwright renders and injects JS → final DOM → turndown converts to Markdown → returned (optionally cached). Lua never parses dynamic pages itself.
 

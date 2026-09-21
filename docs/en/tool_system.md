@@ -68,7 +68,7 @@ resolve_name (alias/fuzzy matching)
   → _expand_path_args (expand ~ / $VAR paths)
   → validator.validate_parameters (schema validation)
   → approval decision validator.check_approval(...)
-      ├─ approval required → tool_service.approve_and_execute(...)
+      ├─ approval required (when applicable) → tool_service.approve_and_execute(...)
       │           (continue_fn resumes after approval; the timer starts only after approval)
       └─ direct execution → _execute_tool(...)
           → sandbox gate sandbox.gate(...) (preflight → isolated execution → freeze candidate → CAS publish)
@@ -82,6 +82,12 @@ resolve_name (alias/fuzzy matching)
 > a candidate without blocking; real changes enter a review queue and are applied after async
 > confirmation via `:NeoAISandboxReview`. When the sandbox service is missing and
 > `fail_closed=true`, execution is rejected. See [sandbox.md](sandbox.md).
+>
+> **Note**: in `async` (the default) there is **no pre-execution blocking approval** — the "approval
+> decision" branch above is skipped and the tool goes straight to the sandbox; whether human
+> confirmation is needed is decided afterwards by the sandbox risk level (`sandbox.approval`).
+> Exception: if a tool path hits a **masked directory** (even under async) an approval dialog still
+> pops up, and approving it unmasks only that single call.
 
 ### 4.1 Argument Alias Normalization
 
@@ -94,7 +100,10 @@ directly to `{ filepath = ... }`.
 `_expand_path_args` expands `~` aliases in the `path` / `filepath` / `file_path` / `dirs` / `dir` fields
 (`~/...` ↔ home directory), so that paths relative to the home directory can be read and written normally.
 
-### 4.3 Approval Decision (tools/validator.lua)
+### 4.3 Approval Decision (tools/validator.lua, non-async modes)
+
+> Used for the pre-execution decision only when `tools.approval.mode` is `prompt` / `strict`
+> (or `auto_allow`); it does not apply under the default `async`.
 
 `validator.check_approval(tool_name, args, approval_config, mode)`:
 
@@ -112,7 +121,12 @@ it pauses while waiting for approval/question, neither accumulating elapsed time
 The default timeout is `tools.executor.timeout_ms` (30s), and can be overridden by the tool's own `timeout`
 or by `ctx.timeout_ms`.
 
-## 5. Approval (services/tool_service.lua)
+## 5. Approval Dialog (services/tool_service.lua)
+
+> The default `async` mode **does not take this path**: the tool has already run in the sandbox and
+> confirmation happens through the review queue (`:NeoAISandboxReview`). This section describes the
+> **pre-execution approval dialog** under `prompt`/`strict` modes with `AUTO` off, plus fallback cases
+> such as masked-directory hits.
 
 Approval is a **serial, single-slot** design: tool execution itself is parallel (issued concurrently by tool_loop),
 but "popup confirmation" is serialized — only one approval popup is shown at a time, and the rest queue up

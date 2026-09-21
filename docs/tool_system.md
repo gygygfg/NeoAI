@@ -65,7 +65,7 @@ resolve_name（别名/模糊匹配）
   → _expand_path_args（展开 ~ / $VAR 路径）
   → validator.validate_parameters（schema 校验）
   → 审批决策 validator.check_approval(...)
-      ├─ 需审批 → tool_service.approve_and_execute(...)
+      ├─ 适用时需审批 → tool_service.approve_and_execute(...)
       │           （审批通过后 continue_fn 继续，计时器审批后才 start）
       └─ 直接执行 → _execute_tool(...)
           → 沙箱门禁 sandbox.gate(...)（预检 → 隔离执行 → 冻结候选 → CAS 发布）
@@ -78,6 +78,10 @@ resolve_name（别名/模糊匹配）
 > 效果类工具立即在沙箱内执行并冻结候选，不阻塞等待；真实修改进入待审队列，用
 > `:NeoAISandboxReview` 异步确认后应用。沙箱服务缺失且 `fail_closed=true` 时拒绝执行。
 > 详见 [sandbox.md](sandbox.md)。
+>
+> **注意**：`async`（默认）模式下**不做执行前阻塞审批**——上面的「审批决策」分支被跳过，
+> 工具直接交给沙箱；是否需要人确认由沙箱风险分级（`sandbox.approval`）事后决定。
+> 例外：工具路径命中**遮蔽目录**（即使 async）仍会弹出审批窗，批准后仅对该次调用解除遮蔽。
 
 ### 4.1 参数别名规范化
 
@@ -89,7 +93,10 @@ resolve_name（别名/模糊匹配）
 `_expand_path_args` 对 `path` / `filepath` / `file_path` / `dirs` / `dir` 字段展开 `~` 别名
 （`~/...` ↔ 主目录），使相对主目录的路径可正常读写。
 
-### 4.3 审批决策（tools/validator.lua）
+### 4.3 审批决策（tools/validator.lua，非 async 模式）
+
+> 仅在 `tools.approval.mode` 为 `prompt` / `strict`（或 `auto_allow`）时用于执行前决策；
+> 默认 `async` 下不参与。
 
 `validator.check_approval(tool_name, args, approval_config, mode)`：
 
@@ -106,7 +113,10 @@ resolve_name（别名/模糊匹配）
 等待审批/提问期间暂停，不累计耗时、不消耗超时预算。超时缺省 `tools.executor.timeout_ms`（30s），
 可被工具自带 `timeout` 或 `ctx.timeout_ms` 覆盖。
 
-## 5. 审批（services/tool_service.lua）
+## 5. 审批弹窗（services/tool_service.lua）
+
+> 默认 `async` 模式下**不走这条路径**：工具已在沙箱内执行，确认由待审队列（`:NeoAISandboxReview`）完成。
+> 本节描述 `prompt`/`strict` 模式、`AUTO` 关闭时的**执行前弹窗审批**，以及遮蔽目录命中等兜底场景。
 
 审批是**串行单槽位**设计：工具执行本身并行（tool_loop 并发发起），但「弹窗确认」串行化——
 一次只展示一个审批弹窗，其余排队，互不覆盖。

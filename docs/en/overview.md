@@ -42,8 +42,11 @@ and async-by-default (all I/O non-blocking).
 5. Tool System
    - Built-in tools: file ops, LSP, treesitter, shell, git, logging, todo,
      plan_mode, ask_user, read_image, web_fetch (disabled by default), sub-agent, skills
-   - Tool approval workflow (serial single-slot queue, auto-allow config,
-     per-tool permission overrides, AUTO mode, approval timeout)
+   - Tool approval workflow: the default `mode="async"` runs the tool in the sandbox immediately and
+     freezes candidates, with real changes queued for confirmation via `:NeoAISandboxReview`; only
+     `prompt`/`strict` use the serial single-slot approval dialog (auto-allow config, per-tool
+     permission overrides, AUTO mode, approval timeout)
+   - Sandbox risk levels: L0-L3 map to auto/record/review/block, default `review` (pending review)
    - Plan mode: read-only/info tools + ask_user only; mutating tools gated
    - Plan distillation: on approve, distill plan-phase research context into a
      checkpoint replacing compaction

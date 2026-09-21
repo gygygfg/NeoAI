@@ -52,9 +52,10 @@ TOOL_LOOP_STARTED (tool_loop.run)
       │      ├─ TOOL_EXECUTION_STARTED
       │      ├─ tool_service.execute → executor.execute
       │      │      ├─ 别名解析 → 参数规范化 → 路径展开 → schema 校验
-      │      │      ├─ 审批决策（validator.check_approval）
+      │      │      ├─ 审批决策（validator.check_approval，仅非 async 模式）
       │      │      │      ├─ 需审批 → approve_and_execute（串行弹窗）
       │      │      │      └─ 直接执行 → _execute_tool（可暂停计时器超时）
+      │      │      └─ 沙箱门禁 sandbox.gate（async 默认：执行并冻结候选）
       │      └─ TOOL_EXECUTION_COMPLETED / _ERROR
       │
       ├─ async.all(promises) 全部完成
@@ -168,6 +169,9 @@ end
 ---
 
 ## 5. 审批与工具循环的交互
+
+> 默认 `tools.approval.mode = "async"` 下**没有执行前阻塞审批**，本节描述的是
+> `prompt`/`strict` 模式（或遮蔽目录命中等兼容场景）下的弹窗审批行为。
 
 ### 5.1 审批期间的计时
 

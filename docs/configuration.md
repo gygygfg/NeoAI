@@ -204,7 +204,8 @@ approval = {
 }
 ```
 
-> **审批决策**：`mode=auto_allow` → 不审批；`mode=strict` → 必审批；
+> **审批决策**（仅 `mode` 为 `prompt`/`strict` 时的执行前弹窗判定；默认 `async` 不经此路径，
+> 由沙箱风险分级 `sandbox.approval` 决定是否待审）：`mode=auto_allow` → 不审批；`mode=strict` → 必审批；
 > 工具 `auto_allow=true` → 不审批；路径落允许目录 + 命令首词落参数组 → 不审批。
 > `allowed_directories` 为**全局工作区允许目录**（对所有工具生效，且**包含其所有子目录**）；
 > 工具自身与 `per_tool` 的条目与之**并集**合并，只追加不覆盖。文件类工具只按路径判定

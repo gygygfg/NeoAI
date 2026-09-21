@@ -77,15 +77,16 @@ end
 
 ## 3. 工具列表
 
-| 工具 | 描述 | 默认审批 |
+| 工具 | 描述 | 参数说明 |
 | --- | --- | --- |
-| `create_sub_agent` | 创建子 Agent；`mode` 可选 background/foreground；`boundaries` 可选约束（allowed_tools / allowed_directories / allowed_commands / max_tool_calls / max_iterations）；`context` 可选 | ❌ 需审批 |
-| `wait_sub_agent` | 等待子 Agent 完成并返回完整结果；若已完成则立即返回 | ❌ 需审批 |
-| `get_sub_agent_status` | 查询子 Agent 状态与结果 | ✅ 自动允许 |
-| `cancel_sub_agent` | 取消子 Agent | ✅ 自动允许 |
+| `create_sub_agent` | 创建子 Agent | `task`（必填）子任务描述；`mode`（可选，`background` 默认 / `foreground` 前台等待）；`model`（可选）指定模型；`boundaries`（可选）约束 `{allowed_tools, allowed_directories, allowed_commands, max_tool_calls, max_iterations}`；`context`（可选）额外上下文 |
+| `wait_sub_agent` | 等待子 Agent 完成并返回完整结果；若已完成则立即返回 | `sub_agent_id`（必填）子 Agent 标识 |
+| `get_sub_agent_status` | 查询子 Agent 状态与结果 | `sub_agent_id`（必填） |
+| `cancel_sub_agent` | 取消子 Agent | `sub_agent_id`（必填） |
 
-> `create_sub_agent` 与 `wait_sub_agent` 默认需审批（`auto_allow=false`，无 `timeout` 时按
-> `tools.executor.timeout_ms` 兜底；`create_sub_agent` 设定了 `timeout = -1` 表示不限）。
+> 默认异步审批（`tools.approval.mode = "async"`）下不再有执行前阻塞审批；子 Agent 的工具调用是否进待审队列由沙箱风险分级决定。
+> `tools.approval.per_tool.create_sub_agent.auto_allow = false` 仅在非 async 模式（`prompt`/`strict`）下生效；
+> 无 `timeout` 时按 `tools.executor.timeout_ms` 兜底（`create_sub_agent` 设定了 `timeout = -1` 表示不限）。
 
 ## 4. 子 Agent 状态与事件
 

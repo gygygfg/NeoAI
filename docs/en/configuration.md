@@ -208,7 +208,9 @@ approval = {
 }
 ```
 
-> **Approval decisions**: `mode=auto_allow` → no approval; `mode=strict` → always approve;
+> **Approval decisions** (the pre-execution dialog rule, used only when `mode` is `prompt`/`strict`; the default
+> `async` does not take this path — the sandbox risk level `sandbox.approval` decides whether an item is pending review):
+> `mode=auto_allow` → no approval; `mode=strict` → always approve;
 > a tool with `auto_allow=true` → no approval; a path inside an allowed directory + the command's first word in an
 > allowed parameter group → no approval.
 > `allowed_directories` is the **global workspace allowlist** (applies to every tool and **includes all of its

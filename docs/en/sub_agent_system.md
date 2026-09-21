@@ -77,15 +77,17 @@ The `wait_sub_agent` tool is a wrapper around exactly that semantics (foreground
 
 ## 3. Tool List
 
-| Tool | Description | Default Approval |
+| Tool | Description | Parameters |
 | --- | --- | --- |
-| `create_sub_agent` | Creates a sub-agent; `mode` is optional (background/foreground); `boundaries` is an optional set of constraints (allowed_tools / allowed_directories / allowed_commands / max_tool_calls / max_iterations); `context` is optional | ❌ Requires approval |
-| `wait_sub_agent` | Waits for the sub-agent to finish and returns the full result; if it has already finished, returns immediately | ❌ Requires approval |
-| `get_sub_agent_status` | Queries sub-agent status and result | ✅ Auto-allowed |
-| `cancel_sub_agent` | Cancels the sub-agent | ✅ Auto-allowed |
+| `create_sub_agent` | Creates a sub-agent | `task` (required) subtask description; `mode` (optional, `background` default / `foreground`); `model` (optional); `boundaries` (optional) `{allowed_tools, allowed_directories, allowed_commands, max_tool_calls, max_iterations}`; `context` (optional) extra context |
+| `wait_sub_agent` | Waits for the sub-agent to finish and returns the full result; if it has already finished, returns immediately | `sub_agent_id` (required) |
+| `get_sub_agent_status` | Queries sub-agent status and result | `sub_agent_id` (required) |
+| `cancel_sub_agent` | Cancels the sub-agent | `sub_agent_id` (required) |
 
-> `create_sub_agent` and `wait_sub_agent` require approval by default (`auto_allow=false`; when there is no `timeout`, it
-> falls back to `tools.executor.timeout_ms`; `create_sub_agent` sets `timeout = -1`, meaning unlimited).
+> With the default asynchronous approval (`tools.approval.mode = "async"`) there is no pre-execution blocking approval; whether
+> a sub-agent tool call enters the review queue is decided by the sandbox risk level.
+> `tools.approval.per_tool.create_sub_agent.auto_allow = false` only takes effect in non-async modes (`prompt`/`strict`);
+> when there is no `timeout`, it falls back to `tools.executor.timeout_ms` (`create_sub_agent` sets `timeout = -1`, meaning unlimited).
 
 ## 4. Sub-Agent State and Events
 
