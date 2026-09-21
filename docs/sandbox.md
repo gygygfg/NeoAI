@@ -249,12 +249,15 @@
      - **暂存内容持久**：`PENDING` 与 `APPROVED`（尚未应用）的候选在重载/重开后由
        `_rehydrate_pending` 从落盘候选重新物化进暂存层，包安装等大批量暂存内容在应用或
        拒绝前一直保留可读，不随会话轮转/退出销毁。
-    - **L3 二次确认**（`tools.sandbox.review.l3_warning.enabled`，默认开）：对 `risk_level=3`
-      的条目，首次 `<CR>` **不直接应用**，而是由模型（`sandbox/l3_warning.lua` 经
+    - **高危二次确认**（`tools.sandbox.review.l3_warning.enabled`，默认开）：对 `risk_level=3`
+      的条目，以及 **L2 的包安装/敏感安装**（`package_confirm`，默认开；如 `apt-key`、`gpg --import`、
+      改软件源等），首次 `<CR>` **不直接应用**，而是由模型（`sandbox/l3_warning.lua` 经
       `core/agent/request`）生成一条简洁的中文**后果警告**，并自动打开该条目的**修改 diff**，
-      警告展示在 diff 顶部（生成期间显示占位）。用户在 diff 内再次 `<CR>` 才真正应用，
+      警告展示在 diff 顶部（生成期间显示占位）。确认窗顶部标题按级别区分（`⚠ L2 高危 · 确认应用` /
+      `⚠ L3 严重 · 确认应用`），按键提示行高亮；若冻结时剔除了遮蔽/易变缓存文件，警告区追加
+      `ℹ 将跳过 N 个遮蔽/缓存文件（不写入宿主）`。用户在 diff 内再次 `<CR>` 才真正应用，
       `q`/`<Esc>` 取消并返回审批窗。模型不可用/超时/未配置 provider 时回退为基于
-      `risk_reasons`/路径的确定性规则警告，不阻断流程。
+      `risk_reasons`/路径的确定性规则警告，不阻断流程。安全安装（L1）仍只需一次确认。
     - **AI 审计**（`tools.sandbox.review.ai_audit`，默认开，待审界面内按 `a`，可配置 `key`）：
       把**原会话的用户消息**（排除运行上下文快照与压缩检查点）与**分级的待审变更/修改内容
       的结构化文本**（`sandbox/ai_audit.lua`：变更单元 id、工具、权限档、风险级别与原因、
@@ -283,6 +286,15 @@
   路径不一致（`..`/符号链接被引入或替换，如落盘候选被篡改）→ `CONFLICT/PATH_CHANGED`；
   命中宿主敏感遮蔽路径（`is_masked_path`）→ `FAILED/SANDBOX_MASKED_TARGET`。候选内容即便
   被本地进程改写也无法写出到未经验证的真实位置。
+- **冻结时剔除不可发布文件**：`candidate.finish` 在生成候选前剔除两类文件，避免个别文件
+  让**整个**变更单元发布失败（如包安装因 apt 索引基线变化而整体回滚）：
+  1. **有效遮蔽路径**——按本次 attempt 的 `effective_unmask`（档位提权 + 审批放行 + 可写根）
+     判定 `is_masked_path`，命中即剔除（与运行时挂载遮蔽一致；被 unmask 放行的路径保留）；
+  2. **易变包索引/缓存**——`tools.sandbox.packages.volatile_paths`（默认含 `/var/lib/apt/lists`、
+     `/var/cache/apt` 等），仅对包安装候选生效。这些文件由包管理器随时重新生成，应用时基线
+     往往已变化，会触发 `CONFLICT/BASELINE_CHANGED`；剔除不影响安装效果
+     （`/var/lib/dpkg/status`、包文件等仍应用），宿主可自行 `apt update` 重建索引。
+  剔除数量记录在候选 `dropped` 字段并在审批界面提示；发布时的遮蔽硬拒绝仍保留为纵深防御。
 - **同文件取代**：同一文件被再次编辑（新候选入队）或直接发布时，覆盖该路径的旧 `PENDING`
   变更单元被标记为 `SUPERSEDED` 并丢弃候选，队列只保留最新版本，避免用户看到同一文件的
   多个版本（`review.supersede_by_paths`）。
@@ -353,7 +365,12 @@
     且作为只读进程工具**不捕获候选**、不入待审队列。真实工作区不会被 git 读操作改动。
     （`git_rollback` 为写操作，仍按宿主执行并经审批。）
 - **buffer 写盘工具**（`delete_node` / `lsp_rename` / `lsp_format`）：
-  `tool_helpers.persist_buffer` 在沙箱激活时把 `:write!` 重定向到暂存层。
+  `tool_helpers.persist_buffer` 在沙箱激活时把 `:write!` 重定向到暂存层。**只读不改盘**：
+  仅当写类工具**显式**修改过 buffer（`mark_edited`）时才回写；`ensure_buffer` 加载、
+  `sync_buffer_from_disk` 同步等只读路径**绝不触发保存**——否则「nvim 读取后重新保存」会把
+  文件按文本重新编码而损坏。**二进制文件**（含 NUL 或非打印控制字节占比过高）**绝不载入文本
+  buffer、也绝不回写**（`ensure_buffer` 返回 nil、`persist_buffer` 返回 `BINARY_SKIP`），
+  避免 OpenPGP keyring 等被替换字符（U+FFFD）破坏。
 - **外部进程**（`run_command`）：bwrap 后端对一组**可写根**（`tools.sandbox.process_roots`，
   默认仅 cwd，未覆盖时自动补入）做 overlayfs：真实根为只读 lower、会话 upper 为可写层。
   命令能读取这些根的真实内容，且对其下**任意路径**的新建/修改/删除都落到 upper，随后冻结为
@@ -445,6 +462,36 @@
 - **生命周期**：`sandbox.shutdown()`（`:qall` / 热重载 / 插件卸载）与 `sandbox.reset()` 停止全部
   服务并捕获改动；服务日志为会话内环形缓冲（`service.max_log_bytes`），读取时经 `conceal` 脱敏。
 - **配置**：`tools.sandbox.service = { enabled, max_services, max_log_bytes, stop_timeout_ms }`。
+
+### systemctl 门面（`tools.sandbox.systemd`，方案 A）
+
+**背景**：AI 常以 `systemctl start/restart <unit>` 验证服务。宿主 systemd 控制通道默认被遮蔽
+（`/run/dbus`、`/run/systemd`），沙箱内 `systemctl` 必然失败；默认 T2 路径会把主机效果冻结为
+hostop 提案并在宿主 replay。本门面让**独立**的 `systemctl`/`journalctl` 调用在沙箱内完成：
+服务进程在沙箱命名空间内运行（复用 `sandbox.service` 的独立 overlay + cgroup），写入停止时
+冻结为候选，**不调用宿主 systemd、也不修改宿主机**。
+
+- **拦截**：`sandbox/systemd.lua` 的 `parse_command` 只识别**独立调用**（可跳过
+  `sudo`/`doas`/`env` 等前缀；复合命令 `a && systemctl …`、管道、脚本内调用不拦截）。
+  门禁在 `effect="process"` 分支、`container.plan` 同级调用 `wrapper._maybe_systemd`。
+- **支持矩阵**：
+  - 动词：`start`/`stop`/`restart`/`status`/`is-active`/`is-enabled`/`show`/`cat`/
+    `daemon-reload`/`list-units`/`list-unit-files`。
+  - 类型：`Type=simple`（默认）/`exec` 为长驻服务；`oneshot` 跑完即返回。
+  - 依赖：`Requires`/`Wants` 递归拉起，`After`/`Before` 拓扑排序（`max_deps` 上限）。
+  - 单元文件**优先读沙箱暂存副本**（AI 用 `edit_file`/`run_command` 新建/修改的 unit 可见）。
+- **明确拒绝（不落宿主机、不回退 hostop）**：`Type=notify`/`notify-reload`/`forking`/`dbus`/
+  `idle`、`.socket`/`.timer` 等单元、`User=`/`Group=`、systemd 说明符（`%n` 等）、
+  `Requisite`/`BindsTo`/`PartOf`；动词 `enable`/`disable`/`mask`/`reload`/`kill` 等，
+  以及 `poweroff`/`reboot`/`halt`/`kexec`/`suspend` 等宿主电源/内核状态操作。
+  返回「沙箱环境不支持 …」并发出 `SANDBOX_SYSTEMD_UNSUPPORTED`。
+- **回退 hostop**：门面不处理的动词（如 `isolate`）或指定其它主机/根的选项
+  （`-H`/`--host`/`--root` 等）不拦截，落到既有 T2/hostop 提案路径（审批后宿主 replay）。
+- **留痕**：命中门面记录 `kind="privilege"` 证据并发出 `SANDBOX_SYSTEMD_ROUTED`；
+  输出经 `conceal` 脱敏，不泄露沙箱指纹。
+- **配置**：`tools.sandbox.systemd = { enabled, mode="facade", max_deps, unit_roots }`。
+- **已知限制**：`enable`/`disable` 不会修改宿主，也不入待审队列（候选层暂不表示符号链接）；
+  模板/实例化单元（`foo@bar.service`）不支持。
 
 ### 137 / OOM 归因与诊断（`tools.sandbox.diagnostics`）
 
@@ -1095,12 +1142,29 @@ CPU 之外**的核，避免与 nvim 抢占同一核；单核宿主或 `taskset` 
 仅当**原始密钥**（未加密的真实值）出现在**工具参数**或 **AI 可见上下文**（即将发给模型的
 wire 消息）中时，才硬拦截并立即终止整个 Agent——后者说明 token 化被绕过（沙箱上下文被突破）。
 注：检测前会解析路径/代码语义，`api_key = os.getenv("..._API_KEY")` 这类代码表达式不会被当作
-原始密钥。
+原始密钥；赋值右侧为**敏感环境变量名引用**（如 `api_key=DASHSCOPE_API_KEY`、`PASSWORD=MY_SECRET_TOKEN`）
+时同样不登记为原始密钥——变量名只是引用，登记会让后续任何提及该名字的普通代码/文档被误判为
+泄露。**敏感环境变量名（全大写、含敏感段）只监控**：留痕 + 提级待审，永不触发硬拦截/终止。
+
+**环境变量密钥值软处理**：`sanitized_env` 会把敏感环境变量的真实值登记为「环境变量密钥」
+（`secret.is_env_secret`）。这类值在 AI 可见输出中被**兜底明文 token 化**——即便裸值（纯 hex /
+无具名前缀）未处于 `NAME=value` 赋值上下文、所在文件不触发高熵扫描，也会被替换为 token；
+且它们**不触发上下文硬拦截**（`context_leak` 跳过环境变量密钥）。即「密钥环境变量只
+token 化/告警，不终止 Agent」。非环境变量的原始密钥（具名规则命中或高熵登记）仍照常硬拦截。
+
+**二进制内容不当文本处理（无损）**：暂存/冻结时，仅对**文本**内容（合法 UTF-8 且不含 NUL）
+做密钥 token 化；二进制文件（OpenPGP keyring、图片、可执行文件等）**跳过 token 化**，逐字节
+保留。候选/待审/快照的 JSON 持久化改用**无损编码**（`json.encode_lossless`：非法 UTF-8 字符串
+以 base64 哨兵表保存，`decode_lossless` 还原），不再把非法字节清洗为 U+FFFD（`EF BF BD`）——
+此前该清洗会在「二次确认 → 应用」链路把二进制 keyring 内容损坏（无法再被 `sqv`/gpg 解析）。
+普通文本的编码结果与原来完全一致。
 
 > **chat 界面高亮「获取/使用密钥的命令」**：工具块渲染时扫描其**参数**与**结果**（模型上下文），
 > 命中沙箱 token（`NEOKEY_*`）或**具名规则**命中的原始密钥时，在该工具折叠块**外**单独追加一行
 > 告警并施加 `NeoAISecretWarning`（红色加粗下划线）高亮。告警**明确区分两种情况**：
-> `⚠ 密钥：<工具> 获取了密钥（…）`——结果/内核观测到读取了密钥；`⚠ 密钥：<工具> 使用了密钥（…）`
+> `⚠ 密钥：<工具> 获取了密钥（…）`——结果/内核观测到读取了密钥**内容**（token / 具名规则命中的
+> 凭据）；结果中**仅出现敏感环境变量名**（如 `read_file` 读到 `DASHSCOPE_API_KEY = os.getenv(...)`）
+> **不算「获取」、不告警**——变量名只是引用，读取它并未拿到密钥内容；`⚠ 密钥：<工具> 使用了密钥（…）`
 > ——参数携带密钥值/token/敏感环境变量名，或使用型命令（`ssh -i`/`curl`/`gpg`…）引用密钥文件；
 > 两者兼具时提示「获取并使用了密钥」。**仅列出/查看密钥文件不告警**：`ls`/`find`/`stat` 等
 > 仅列出型命令与 `list_files`/`search_files`/`file_exists` 等工具不构成读取或使用；读取型命令
@@ -1264,6 +1328,11 @@ wire 消息）中时，才硬拦截并立即终止整个 Agent——后者说明
 Agent**；发出 `SANDBOX_SECRET_BLOCKED` 事件并 `vim.notify` 明确通知用户。token
 （`NEOKEY_*`）不触发终止，只提级审批。
 
+> **环境变量名不算原始密钥**：映射表只登记**凭据值**，不登记敏感环境变量名本身。赋值右侧为
+> 变量名引用（`api_key=DASHSCOPE_API_KEY`）不登记；即便因历史状态被登记，`find_real_secret`
+> 也会跳过全大写标识符形态的名字。故 `DASHSCOPE_API_KEY`/`GIT_COMMIT_AI_API_KEY` 等名字出现
+> 在工具参数或 AI 上下文中**只监控**（`scan_names` 留痕 + 提级待审），**永不终止 Agent**。
+
 > 边界：熵检测为启发式；默认按上下文收窄（`entropy_requires_context`）后，无分隔符、无
 > 敏感名上下文的纯字母数字/base64 串不再视为密钥——可消除 integrity/构建哈希误伤，代价是
 > 无前缀、无上下文的纯 base64 密钥（如 AWS secret key）不再覆盖。token 在 commit 时无损还原，
@@ -1357,7 +1426,10 @@ docker run -d --name neoai-docker-proxy \
 #   docker.socket = "<dind 容器挂载出的 docker.sock>"
 ```
 
-`mode="off"` 禁用 docker（T1 docker 命令拒绝）；`mode="host"` 仅 T2 允许，且主机效果需异步审批。
+`mode="off"`（**默认**）：容器门面直接拒绝 docker/nerdctl，返回「沙箱环境不支持 docker…请改用
+podman」，不碰宿主、不回退 hostop（见 §18.3）。`mode="controlled"`：显式提供受控 socket 时按
+上表 bind 到沙箱内（容器由受控 daemon 创建，属部署侧显式选择）。`mode="host"` 已不再由容器门面
+放行（会触及宿主）；如需宿主 daemon 请在宿主手动执行。
 
 ### T2 主机效果提案
 
@@ -1474,8 +1546,13 @@ upper/work、暂存、会话）会 chown 到该 uid。
     沙箱内对包安装命令注入 `PIP_BREAK_SYSTEM_PACKAGES=1`/`PIP_ROOT_USER_ACTION=ignore`，
     突破 Debian/Ubuntu 的 PEP 668（`externally-managed`）限制——所有写入仍进 overlay 暂存并
     冻结为候选，绝不落宿主。
-  - **安装产物跨命令可见**：存在暂存改动的包可写根（如 `/usr`、`~/.local`）会自动加入后续
-    命令的可写层，使后续 `python -m build` 等能看到刚安装的包（否则非包安装命令默认只覆盖 cwd）。
+   - **安装产物跨命令可见**：存在暂存改动的包可写根（如 `/usr`、`~/.local`）会自动加入后续
+     命令的可写层，使后续 `python -m build` 等能看到刚安装的包（否则非包安装命令默认只覆盖 cwd）。
+   - **易变索引/缓存跳过**（`packages.volatile_paths`，默认非空）：`apt update`/`pip`/`npm` 等
+     会重写包索引与缓存（如 `/var/lib/apt/lists`），这些文件应用时基线常已变化，会让整个安装
+     因 `BASELINE_CHANGED` 失败。冻结候选时直接跳过这些路径（不进入待审、不 CAS 发布）；
+     安装效果不受影响（包文件、`/var/lib/dpkg/status` 等仍应用），索引由宿主自行重新生成。
+     设为 `{}` 可关闭跳过（回到旧行为）。
 
 - **写入保护优先**：文件改动始终经暂存层，故**进程提权行为仅做记录**（证据 + `SANDBOX_PRIVILEGE_RECORDED`
   + 审计），用于后续异常行为分析，不作为阻塞式审批门槛。T2 主机效果仍冻结为提案（见 §17）。
@@ -1489,17 +1566,30 @@ upper/work、暂存、会话）会 chown 到该 uid。
 `Setting up …`/`Successfully installed …` → L1，破坏性输出 → L3），与调用前分级取较大者，
 记录证据并驱动自动提权检测（§17）。只读进程工具也会记录结果分级。
 
-### 18.3 容器受控运行（`sandbox/container.lua`）
+### 18.3 容器门面（`sandbox/container.lua`）
 
-AI 调用容器运行时（docker/podman 等）时，尽量让容器与沙箱处于**同一 namespace**：
+AI 调用容器运行时（docker/podman 等）时，**在沙箱内管理、容器不改变宿主机**。门面
+（`container.facade`）在 `effect="process"` 分支拦截命令并判定：
 
-- **无守护进程运行时**（`podman`/`buildah`）：CLI 在沙箱内执行、容器是 CLI 子进程，命令重写为
-  注入 `--net=host --pid=host --ipc=host --uts=host`，容器复用沙箱的 pid/net/ipc/uts
-  命名空间，被沙箱隔离边界一并约束（`tools.sandbox.container.share_namespace`，默认开）。
-- **有守护进程运行时**（`docker`/`nerdctl`）：容器由宿主侧 daemon 创建，无法复用沙箱命名空间，
-  保持「受控 socket」方案（§17）并记录原因 `DOCKER_NAMESPACE_NOT_SHARABLE`。
+- **无守护进程运行时**（`podman`/`buildah`）：支持。CLI 在沙箱内执行、容器是 CLI 子进程，
+  命令重写为注入 `--net=host --pid=host --ipc=host --uts=host`，容器复用沙箱的
+  pid/net/ipc/uts 命名空间，被沙箱隔离边界一并约束，写入进 overlay 暂存
+  （`tools.sandbox.container.share_namespace`，默认开）。
+- **docker / docker-compose**：默认**改写为 `podman` / `podman-compose`** 在沙箱内执行
+  （`tools.sandbox.container.docker_to_podman`，默认开）——podman 无守护进程，容器随沙箱
+  namespace 隔离、写入进 overlay，**不碰宿主**。沙箱内无 podman 时**明确拒绝**
+  （`CONTAINER_PODMAN_UNAVAILABLE`，提示安装 podman），**不回退 hostop**。
+- **nerdctl / 有守护进程运行时**：容器由宿主侧 daemon 创建，默认**明确拒绝**
+  （`CONTAINER_REQUIRES_HOST_DAEMON`，**不碰宿主、不回退 hostop**）。仅当显式配置
+  `tools.sandbox.docker.mode="controlled"` 且 `socket` 存在时，才放行受控 socket
+  （rootless / socket-proxy / dind，见 §17；显式配置优先于改写）。
+- **远程/连接型选项**（`--remote`/`-r`/`-H`/`--host`/`--connection`/`--url`）与**宿主 VM 子命令**
+  （`podman machine`）明确拒绝（`CONTAINER_REMOTE_UNSUPPORTED` / `CONTAINER_SUBCOMMAND_UNSUPPORTED`）。
+- 门面只识别**独立调用**（可跳过 `sudo`/`env` 等前缀）；复合命令中的容器调用不拦截。
 
-计划写入 `kind="container"` 证据并发出 `SANDBOX_CONTAINER_PLANNED`。
+受控计划写入 `kind="container"` 证据并发出 `SANDBOX_CONTAINER_PLANNED`；被拒绝的调用发出
+`SANDBOX_CONTAINER_UNSUPPORTED` 并写入审计。配置：`tools.sandbox.container`
+（`enabled`/`share_namespace`）与 `tools.sandbox.docker`（`mode="off"|"controlled"`、`socket`）。
 
 ### 18.4 新会话自动审批（默认关闭）
 
@@ -1512,8 +1602,9 @@ L2+ 与包/密钥仍进入待审。目的是即便仅靠本地模型的智能水
 包安装命令（`apt/pip/npm/go/cargo/gem/composer…`）分类为 `package`（T1，需网络）。
 `tools.sandbox.packages.mode`：`review`（默认，强制进入待审，**不随会话自动审批放行**）、
 `allow`（允许自动应用）、`deny`（硬拒绝）。包安装的写入仍在暂存层，不会直接改动宿主。
-放宽后安全安装仅需一次确认（风险封顶中危），敏感安装（改动第三方软件源/密钥）保留高危标注；
-两者均不自动落盘。
+放宽后安全安装仅需一次确认（风险封顶中危）；敏感安装（改动第三方软件源/密钥）保留高危标注，
+并在审批时走「AI 告知后果 → 二次确认」（`review.l3_warning.package_confirm`，默认开）；
+两者均不自动落盘。易变索引/缓存（`packages.volatile_paths`）在冻结时跳过，避免整单元发布冲突。
 
 ### 18.6 敏感信息全部脱敏与行为审计
 
@@ -1529,5 +1620,6 @@ L2+ 与包/密钥仍进入待审。目的是即便仅靠本地模型的智能水
 
 - 命令：`:NeoAISandboxAudit`、`:NeoAISandboxAutoApprove [on|off|status]`。
 - 事件：`SANDBOX_RISK_ASSESSED` / `SANDBOX_RISK_BLOCKED` / `SANDBOX_AUDIT_OBSERVED` /
-  `SANDBOX_AUDIT_ANOMALY` / `SANDBOX_CONTAINER_PLANNED` / `SANDBOX_SENSITIVE_REDACTED`。
+  `SANDBOX_AUDIT_ANOMALY` / `SANDBOX_CONTAINER_PLANNED` / `SANDBOX_CONTAINER_UNSUPPORTED` /
+  `SANDBOX_SYSTEMD_ROUTED` / `SANDBOX_SYSTEMD_UNSUPPORTED` / `SANDBOX_SENSITIVE_REDACTED`。
 - 测试：`lua/NeoAI/tests/test_sandbox_governance.lua`。

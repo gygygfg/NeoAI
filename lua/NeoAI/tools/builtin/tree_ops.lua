@@ -314,6 +314,7 @@ tree_tools.delete_node = helpers.define_tool(
     local sr, sc, er, ec = _node_range(node)
     local ok = pcall(vim.api.nvim_buf_set_text, bufnr, sr, sc, er, ec, {})
     if not ok then on_error("删除失败") return end
+    helpers.mark_edited(bufnr) -- 显式编辑：允许回写（只读加载路径不标记、不回写）
     local saved, err = helpers.persist_buffer(bufnr)
     if not saved then on_error("删除失败：无法保存文件（" .. tostring(err) .. "）") return end
     on_success(string.format("已删除节点 %s (%d:%d-%d:%d)", node:type(), sr + 1, sc + 1, er + 1, ec + 1))

@@ -1,6 +1,6 @@
 --- L3 危险操作后果警告生成
 --- @module NeoAI.sandbox.l3_warning
---- 待审界面确认 L3（critical）变更时，调用模型生成一条简洁的中文后果警告，
+--- 待审界面确认高危变更（L3 critical，或 L2 包/敏感安装）时，调用模型生成一条简洁的中文后果警告，
 --- 展示在修改 diff 预览顶部，供用户二次确认。模型不可用/超时/未配置 provider 时，
 --- 由调用方回退到 `M.fallback()` 的确定性规则警告，不阻断流程。
 ---
@@ -16,11 +16,17 @@ local state = {
   generator = nil, -- 测试注入：function(item, target, on_done)
 }
 
-local SYSTEM_PROMPT = table.concat({
-  "你是代码变更安全审查助手。用户即将把一个高风险（L3 严重）的沙箱变更应用到真实文件系统。",
-  "请用简体中文给出一条简洁的后果警告，2-4 句，直接说明该操作可能造成的不可逆后果与需要特别注意的风险点。",
-  "不要客套、不要复述文件内容、不要使用 Markdown 标题或列表，只输出警告正文。",
-}, "\n")
+--- 按风险级别生成系统提示词
+--- @param level number|nil
+--- @return string
+local function _system_prompt(level)
+  local label = (tonumber(level) or 3) >= 3 and "L3 严重" or "L2 高危"
+  return table.concat({
+    "你是代码变更安全审查助手。用户即将把一个高风险（" .. label .. "）的沙箱变更应用到真实文件系统。",
+    "请用简体中文给出一条简洁的后果警告，2-4 句，直接说明该操作可能造成的不可逆后果与需要特别注意的风险点。",
+    "不要客套、不要复述文件内容、不要使用 Markdown 标题或列表，只输出警告正文。",
+  }, "\n")
+end
 
 -- ========== 私有函数 ==========
 
@@ -58,6 +64,15 @@ local function _description(item, target)
   if item.secret_warning and (item.secret_warning.count or 0) > 0 then
     lines[#lines + 1] = "注意: 该变更涉及密钥/敏感凭据"
   end
+  local dropped = item.dropped
+  if type(dropped) == "table" then
+    local n = (dropped.masked or 0) + (dropped.volatile or 0)
+    if n > 0 then
+      lines[#lines + 1] = string.format(
+        "注意: 冻结时已跳过 %d 个遮蔽/易变缓存文件（如 %s），不会写入宿主",
+        n, tostring((dropped.masked_paths or {})[1] or (dropped.volatile_paths or {})[1] or "包索引"))
+    end
+  end
   return table.concat(lines, "\n")
 end
 
@@ -69,15 +84,22 @@ end
 --- @return string
 function M.fallback(item, target)
   item = item or {}
+  local level = tonumber(item.risk_level) or 3
+  local label = level >= 3 and "L3 严重" or "L2 高危"
   local reasons = table.concat(item.risk_reasons or {}, ", ")
   local paths = _paths(item)
   local parts = {}
-  parts[#parts + 1] = string.format("该操作为 L3 严重风险（%s）。", reasons ~= "" and reasons or "critical")
+  parts[#parts + 1] = string.format("该操作为 %s风险（%s）。", label, reasons ~= "" and reasons or "high")
   if #paths > 0 then
     parts[#parts + 1] = "影响路径: " .. table.concat(paths, ", ") .. "。"
   end
   if target and target.path then
     parts[#parts + 1] = "将写入: " .. tostring(target.path) .. "。"
+  end
+  local dropped = item.dropped
+  if type(dropped) == "table" then
+    local n = (dropped.masked or 0) + (dropped.volatile or 0)
+    if n > 0 then parts[#parts + 1] = string.format("其中 %d 个遮蔽/易变缓存文件将被跳过。", n) end
   end
   parts[#parts + 1] = "应用后可能对系统或用户数据造成不可逆改动，请确认确有必要。"
   return table.concat(parts, "")
@@ -89,7 +111,7 @@ end
 --- @return table messages
 function M.build_messages(item, target)
   return {
-    { role = "system", content = SYSTEM_PROMPT },
+    { role = "system", content = _system_prompt(item and item.risk_level) },
     { role = "user", content = _description(item, target) },
   }
 end

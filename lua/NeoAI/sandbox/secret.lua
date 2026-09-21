@@ -197,16 +197,29 @@ local function looks_like_path(value)
   return false
 end
 
+--- 值是否为「敏感环境变量名引用」（如 `api_key = DASHSCOPE_API_KEY`）。全大写标识符形态且
+--- 自身含敏感段（KEY/TOKEN/SECRET/...）→ 是变量名引用而非凭据值。登记这类值会让后续任何
+--- 提到该变量名的普通代码/文档命中 `find_real_secret`，进而误终止 Agent（知识库案例回归）。
+--- @param value any
+--- @return boolean
+local function looks_like_env_name_ref(value)
+  if type(value) ~= "string" or #value < 6 then return false end
+  if value:match("^%u[%u%d_]*$") == nil then return false end
+  return secret_name(value)
+end
+
 --- 赋值值是否像凭据（供 `NAME = value` / `"NAME": "value"` 的按名脱敏）。
 --- 必须排除普通单词 / 路径 / 单字符，否则源码里的 `'password': 'bar'`、
 --- `key_separator = "."`、`CONFIGFILE_KEY = 'pyproject.toml'` 会被误登记为原始密钥，
 --- 污染映射表并让后续 `find_real_secret` 子串匹配误拦截命令。
+--- 环境变量名引用（如 `api_key=DASHSCOPE_API_KEY`）同样不是凭据值，须排除。
 --- 认定：长度 >= 4，含数字；或长度 >= 8 且含大写 / Base64 特殊字符。
 --- @param value any
 --- @return boolean
 local function looks_like_assigned_secret(value)
   if type(value) ~= "string" or #value < 4 then return false end
   if looks_like_path(value) then return false end
+  if looks_like_env_name_ref(value) then return false end
   if value:find("%d") then return true end
   if #value >= 8 and value:find("%u") then return true end
   if #value >= 8 and value:find("[%+/=:]") then return true end
@@ -298,18 +311,44 @@ local function is_path_component(text, s, e)
   return before == "/" or after == "/" or before == "\\" or after == "\\"
 end
 
---- 全文 token 化：具名规则 -> 变量名赋值 -> 残余高熵串。token_for(secret, rule_name) -> 替换文本。
---- 残余扫描保留位置，跳过路径分量（见 `is_path_component`）。
---- `opts.entropy == false` 时跳过残余高熵扫描（仅保留具名规则与敏感变量名赋值），
+--- 已知环境变量密钥的兜底明文替换。环境变量值（尤其纯 hex / 无具名前缀、未处于
+--- `NAME=value` 赋值上下文）在「非密钥文件」路径下不会被熵检测覆盖，但其真实值已在
+--- `by_secret` 映射表中。若原样回传，AI 上下文守卫会判定为「原始密钥泄漏」并终止 Agent。
+--- 按已知环境变量密钥做明文替换，把裸值也 token 化（按长度降序避免子串互相覆盖）。
+--- @param text string
+--- @param secrets table|nil 已知环境变量密钥值数组
+--- @param token_for function
+--- @return string
+local function apply_plain_secrets(text, secrets, token_for)
+  if type(secrets) ~= "table" or #secrets == 0 then return text end
+  local list = {}
+  for _, s in ipairs(secrets) do
+    if type(s) == "string" and #s >= 8 then list[#list + 1] = s end
+  end
+  if #list == 0 then return text end
+  table.sort(list, function(a, b) return #a > #b end)
+  for _, s in ipairs(list) do
+    if text:find(s, 1, true) then
+      local pat = (s:gsub("([^%w])", "%%%1"))
+      text = text:gsub(pat, function() return token_for(s, nil) end)
+    end
+  end
+  return text
+end
+
+--- 全文 token 化：具名规则 -> 变量名赋值 -> 已知环境变量密钥明文 -> 残余高熵串。
+--- token_for(secret, rule_name) -> 替换文本。残余扫描保留位置，跳过路径分量（见 `is_path_component`）。
+--- `opts.entropy == false` 时跳过残余高熵扫描（仅保留具名规则、敏感变量名赋值与已知环境变量密钥），
 --- 供「非密钥文件」路径避免对全文做昂贵的熵计算。
 --- @param text string
 --- @param cfg table
 --- @param token_for function
---- @param opts table|nil { entropy?: boolean }
+--- @param opts table|nil { entropy?: boolean, plain_secrets?: string[] }
 --- @return string
 local function process(text, cfg, token_for, opts)
   text = apply_rules(text, cfg, token_for)
   text = apply_secret_names(text, token_for)
+  text = apply_plain_secrets(text, opts and opts.plain_secrets, token_for)
   if opts and opts.entropy == false then return text end
   local parts, pos = {}, 1
   while true do
@@ -331,7 +370,8 @@ local function process(text, cfg, token_for, opts)
 end
 
 return { process = process, apply_rules = apply_rules, is_candidate = is_candidate, entropy = entropy,
-  validate = validate, secret_name = secret_name, secret_name_prefix = secret_name_prefix }
+  validate = validate, secret_name = secret_name, secret_name_prefix = secret_name_prefix,
+  looks_like_env_name_ref = looks_like_env_name_ref }
 ]==]
 
 local _scan = assert(load(SCAN_SRC))()
@@ -341,6 +381,7 @@ local _scan = assert(load(SCAN_SRC))()
 local state = {
   by_secret = {}, -- secret -> token
   by_token = {}, -- token -> secret
+  env_secrets = {}, -- 来自环境变量的密钥值（软信号：只 token 化/告警，不终止 Agent）
   seq = 0,
   salt = nil,
   traces = {}, -- 留痕：{ event, tool, path, tokens, at }
@@ -555,19 +596,28 @@ function M.detect_named(text)
   return out
 end
 --- @param text string
---- @param opts table|nil { entropy?: boolean } entropy=false 时跳过残余高熵扫描
+--- @param opts table|nil { entropy?: boolean, plain_secrets?: string[] } entropy=false 时跳过残余高熵扫描
 --- @return string tokenized
 --- @return table tokens 本次用到的 token 数组
 function M.tokenize(text, opts)
   if not M.enabled() or type(text) ~= "string" or text == "" then return text, {} end
   local cfg = _cfg()
   local used = {}
-  -- 全文扫描核心（规则 -> 变量名赋值 -> 残余高熵串）；token 生成经回调注入。
+  -- 默认注入已知环境变量密钥：裸值（纯 hex / 无具名前缀、非赋值上下文）也强制 token 化，
+  -- 避免 AI 可见输出暴露宿主环境变量密钥（否则请求前守卫会误判为上下文被突破并终止 Agent）。
+  local scan_opts = {}
+  if opts then for k, v in pairs(opts) do scan_opts[k] = v end end
+  if scan_opts.plain_secrets == nil then
+    local list = {}
+    for s in pairs(state.env_secrets) do list[#list + 1] = s end
+    scan_opts.plain_secrets = list
+  end
+  -- 全文扫描核心（规则 -> 变量名赋值 -> 已知环境变量密钥 -> 残余高熵串）；token 生成经回调注入。
   local out = _scan.process(text, cfg, function(secret, rule_name)
     local token = _token_for(secret, rule_name)
     used[#used + 1] = token
     return token
-  end, opts)
+  end, scan_opts)
   return out, used
 end
 
@@ -583,9 +633,9 @@ end
 --- @param texts_enc string
 --- @param sha_src string
 --- @param scan_src string
---- @param entropy_flags string|nil 与文本并行的 "0"/"1" 串；"0" 跳过该文本的残余高熵扫描
+--- @param meta_enc string 元信息：`entropy_flags` + 已知环境变量密钥值列表（见 `_encode_meta`）
 --- @return string 编码结果
-local function _tokenize_worker(cfg_enc, map_enc, salt, seq, texts_enc, sha_src, scan_src, entropy_flags)
+local function _tokenize_worker(cfg_enc, map_enc, salt, seq, texts_enc, sha_src, scan_src, meta_enc)
   local sha = assert(load(sha_src))()
   local process = assert(load(scan_src))().process
   local function make_reader(s)
@@ -623,6 +673,14 @@ local function _tokenize_worker(cfg_enc, map_enc, salt, seq, texts_enc, sha_src,
   local texts = {}
   for i = 1, tonumber(tn()) do texts[i] = tn() end
 
+  -- 元信息：首项为 entropy_flags，随后是已知环境变量密钥值列表（编码格式同 `_encode_texts`）。
+  local entropy_flags, env_secrets = nil, {}
+  if type(meta_enc) == "string" and meta_enc ~= "" then
+    local mr = make_reader(meta_enc)
+    entropy_flags = mr()
+    for _ = 1, (tonumber(mr()) or 0) do env_secrets[#env_secrets + 1] = mr() end
+  end
+
   seq = tonumber(seq) or 0
   local new = {}
   local function token_for(secret, rule)
@@ -637,7 +695,7 @@ local function _tokenize_worker(cfg_enc, map_enc, salt, seq, texts_enc, sha_src,
   local outs = {}
   for i = 1, #texts do
     local entropy = not (entropy_flags and entropy_flags:sub(i, i) == "0")
-    outs[i] = process(texts[i], cfg, token_for, { entropy = entropy })
+    outs[i] = process(texts[i], cfg, token_for, { entropy = entropy, plain_secrets = env_secrets })
   end
 
   local function es(s) s = s or ""; return tostring(#s) .. ":" .. s end
@@ -697,6 +755,15 @@ local function _encode_texts(texts)
   local p = { _enc_str(tostring(#texts)) }
   for _, t in ipairs(texts) do p[#p + 1] = _enc_str(t) end
   return table.concat(p)
+end
+
+--- 元信息编码：`entropy_flags` 串 + 已知环境变量密钥值列表。
+--- 合并为单个参数，因为 `vim.uv.new_work` 的 `queue` 只可靠传递有限个参数（第 9 个起丢失）。
+--- @param flags string
+--- @param env_list table
+--- @return string
+local function _encode_meta(flags, env_list)
+  return _enc_str(flags or "") .. _encode_texts(env_list or {})
 end
 
 --- 解析工作线程结果：seq, new_entries, out_texts
@@ -832,10 +899,13 @@ function M.tokenize_many_async(texts, opts)
   local sha_src = require("NeoAI.utils.sha256").source
   local salt = _ensure_salt()
   local cfg_enc = _encode_cfg(cfg)
+  local env_list = {}
+  for s in pairs(state.env_secrets) do env_list[#env_list + 1] = s end
+  local meta_enc = _encode_meta(flags, env_list)
   local chunk = _work_chunk_files()
   if #texts <= chunk then
     local map_enc, texts_enc = _encode_map(state.by_secret), _encode_texts(texts)
-    return work.run(_tokenize_worker, cfg_enc, map_enc, salt, state.seq, texts_enc, sha_src, SCAN_SRC, flags)
+    return work.run(_tokenize_worker, cfg_enc, map_enc, salt, state.seq, texts_enc, sha_src, SCAN_SRC, meta_enc)
       :then_(function(enc)
         local seq, new, outs = _decode_result(enc)
         for _, e in ipairs(new) do _register_token(e.secret, e.token, e.rule) end
@@ -857,7 +927,7 @@ function M.tokenize_many_async(texts, opts)
   end
   return work.batched(tasks, _work_parallelism(), function(task)
     return work.run(_tokenize_worker, cfg_enc, map_enc, salt, state.seq,
-      _encode_texts(task.sub), sha_src, SCAN_SRC, task.flags):then_(function(enc)
+      _encode_texts(task.sub), sha_src, SCAN_SRC, _encode_meta(task.flags, env_list)):then_(function(enc)
         local seq, new, outs = _decode_result(enc)
         return { seq = seq, new = new, outs = outs }
       end)
@@ -1184,30 +1254,45 @@ function M.scan_names(value)
   return out
 end
 
---- 文本是否含映射表中已知的**原始密钥**
+--- 已登记密钥是否为「敏感环境变量名引用」形态（全大写标识符 + 敏感段）。这类值即使因历史/
+--- 外部路径被登记，也**只监控不硬拦截**：出现在工具参数或 AI 上下文时不触发
+--- `SANDBOX_SECRET_BLOCKED`，由 `scan_names` 走软升级路径（留痕 + 提级待审）。
+--- @param s string
+--- @return boolean
+local function _is_env_name_secret(s)
+  return _scan.looks_like_env_name_ref ~= nil and _scan.looks_like_env_name_ref(s)
+end
+
+--- 文本是否含映射表中已知的**原始密钥**（排除环境变量名引用形态，见 `_is_env_name_secret`）
 --- @param text string
+--- @param opts table|nil { skip_env?: boolean } 跳过来自环境变量的密钥（软信号，不终止 Agent）
 --- @return string|nil secret
-function M.find_real_secret(text)
+function M.find_real_secret(text, opts)
   if type(text) ~= "string" or text == "" then return nil end
+  local skip_env = opts and opts.skip_env
   for secret in pairs(state.by_secret) do
-    if #secret >= 8 and text:find(secret, 1, true) then return secret end
+    if #secret >= 8 and not _is_env_name_secret(secret)
+      and not (skip_env and state.env_secrets[secret]) and text:find(secret, 1, true) then
+      return secret
+    end
   end
   return nil
 end
 
 --- 递归扫描值中是否含映射表已知的原始密钥。
 --- @param v any
+--- @param opts table|nil { skip_env?: boolean }
 --- @return string|nil secret
-local function _walk_real_secret(v)
+local function _walk_real_secret(v, opts)
   local t = type(v)
   if t == "string" then
-    return M.find_real_secret(v)
+    return M.find_real_secret(v, opts)
   elseif t == "table" then
     for k, x in pairs(v) do
-      local hit = _walk_real_secret(x)
+      local hit = _walk_real_secret(x, opts)
       if hit then return hit end
       if type(k) == "string" then
-        local hk = M.find_real_secret(k)
+        local hk = M.find_real_secret(k, opts)
         if hk then return hk end
       end
     end
@@ -1217,13 +1302,14 @@ end
 
 --- 扫描 AI 可见上下文（wire 消息等嵌套结构）是否含映射表中已知的**原始密钥**。
 --- 供请求前终止判定：原始密钥出现在 AI 上下文中说明 token 化被绕过（沙箱上下文被突破）。
---- token（`NEOKEY_*`）不算命中——KEY 环境变量操作只提级审批，不终止 Agent。
+--- token（`NEOKEY_*`）不算命中；**来自环境变量的密钥值也不算命中**——它们已被兜底明文
+--- token 化，且按设计「密钥环境变量只 token 化/告警，不终止 Agent」，故不触发终止。
 --- @param value any
 --- @return string|nil secret 命中的原始密钥
 function M.context_leak(value)
   if not M.enabled() then return nil end
   if next(state.by_secret) == nil then return nil end
-  return _walk_real_secret(value)
+  return _walk_real_secret(value, { skip_env = true })
 end
 
 --- 增量扫描：仅检测 `messages[from..]` 中的新增项是否含原始密钥。
@@ -1236,7 +1322,7 @@ function M.context_leak_from(messages, from)
   if next(state.by_secret) == nil then return nil end
   if type(messages) ~= "table" then return nil end
   for i = math.max(1, tonumber(from) or 1), #messages do
-    local hit = _walk_real_secret(messages[i])
+    local hit = _walk_real_secret(messages[i], { skip_env = true })
     if hit then return hit end
   end
   return nil
@@ -1301,6 +1387,7 @@ function M.sanitized_env()
     if type(v) == "string" and #v > 0 then
       if _scan.secret_name(k) then
         overrides[k] = _token_for(v)
+        state.env_secrets[v] = true
         names[#names + 1] = k
       elseif v:find("/", 1, true) or v:find("\\", 1, true) then
         -- 路径/URL 类值：只应用具名规则（结构化凭据），不做通用熵 token 化。
@@ -1309,12 +1396,14 @@ function M.sanitized_env()
         local nv = _scan.apply_rules(v, _cfg(), _token_for)
         if nv ~= v then
           overrides[k] = nv
+          state.env_secrets[v] = true
           names[#names + 1] = k
         end
       else
         local nv = M.tokenize(v)
         if nv ~= v then
           overrides[k] = nv
+          state.env_secrets[v] = true
           names[#names + 1] = k
         end
       end
@@ -1547,10 +1636,18 @@ function M.traces()
   return vim.deepcopy(state.traces)
 end
 
+--- 值是否来自环境变量（软信号：只 token 化/告警，不终止 Agent）
+--- @param secret string
+--- @return boolean
+function M.is_env_secret(secret)
+  return state.env_secrets[secret] == true
+end
+
 --- 重置（测试用）
 function M.reset()
   state.by_secret = {}
   state.by_token = {}
+  state.env_secrets = {}
   state.seq = 0
   state.salt = nil
   state.traces = {}

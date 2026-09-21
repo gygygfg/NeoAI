@@ -196,6 +196,12 @@ end
 --- @return string
 local function _env_hint(text)
   if type(text) ~= "string" or text == "" then return text end
+  -- systemctl 门面启用时，独立 `systemctl` 调用已被沙箱路由（不会走到这里）；此处仅在
+  -- 复合命令/脚本等未拦截场景命中，追加「无 systemd」提示反而误导，故跳过。
+  local ok_cfg, cfg = pcall(function()
+    return require("NeoAI.kernel.config_store").get("tools.sandbox.systemd")
+  end)
+  if ok_cfg and type(cfg) == "table" and cfg.enabled ~= false then return text end
   local hit = text:find("System has not been booted with systemd", 1, true)
     or text:find("Failed to connect to bus", 1, true)
     or text:find("systemctl: command not found", 1, true)

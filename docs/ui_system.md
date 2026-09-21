@@ -96,7 +96,8 @@
 警告行**指明具体是哪个命令/工具获取或使用了哪个密钥文件**，例如：
 「⚠ 密钥：run_command 执行 cat ~/.ssh/id_rsa 获取/使用了密钥（密钥文件：/root/.ssh/id_rsa）」；
 无法确定文件时回退为密钥类型（具名规则，如 `private_key`）→ 敏感环境变量名 → 通用提示
-（见 [sandbox.md](sandbox.md) 密钥防护）。同时，**含密钥的工具调用参数与结果不做 500 字截断**
+（见 [sandbox.md](sandbox.md) 密钥防护）。**结果中仅出现敏感环境变量名不触发告警**（变量名只是
+引用，未读到密钥内容）；参数中出现才按「使用密钥」告警。同时，**含密钥的工具调用参数与结果不做 500 字截断**
 （完整展示），并在行内把命中的密钥值（`NEOKEY_*` token 与具名规则命中的原始密钥）以同一
 `NeoAISecretWarning` 高亮（`message_list` 与轨迹模式一致）。
 命令输出中的 **ANSI SGR 颜色**（如 `\27[1;36m…\27[0m`）由 `utils.ansi` 解析：转义序列从展示文本中
@@ -188,7 +189,7 @@ NeoAI 的聊天/输入框/悬浮窗等都是纯 UI 文本，若 LSP 客户端（
 | `tool_approval` | 工具审批弹窗。`init()`；串行单槽位展示。 |
 | `ask_user` | 向用户提问弹窗。`init()`；经 `ask_user.set_ui` 注入。 |
 | `sub_agent_dock` | 子 Agent 状态监控。`init()`。 |
-| `sandbox_review` | 沙箱待审审批界面。`open()`；按路径级别高亮（工作区绿/用户目录黄/系统红）、按安全级别显示高危/中危/低危风险档与原因；审批单位为单个文件：`<CR>` 仅应用该文件、`d` 仅拒绝该文件（其余文件保留待审）、`i` 临时关闭审批窗并打开该条目的修改 diff 预览（关闭后自动返回并恢复光标），头行仅作信息展示，`r` 刷新、`q` 关闭。**L3（critical）条目**首次 `<CR>` 不直接应用：调用模型生成一条后果警告并自动打开 diff（顶部展示警告，生成中显示占位），用户在 diff 内再次 `<CR>` 才真正应用、`q`/`<Esc>` 取消；模型不可用时回退规则警告（见 `sandbox/l3_warning.lua`）。 |
+| `sandbox_review` | 沙箱待审审批界面。`open()`；按路径级别高亮（工作区绿/用户目录黄/系统红）、按安全级别显示高危/中危/低危风险档与原因；审批单位为单个文件：`<CR>` 仅应用该文件、`d` 仅拒绝该文件（其余文件保留待审）、`i` 临时关闭审批窗并打开该条目的修改 diff 预览（关闭后自动返回并恢复光标），头行仅作信息展示，`r` 刷新、`q` 关闭。**高危条目**（L3 critical，以及 `package_confirm` 开启时的 L2 包/敏感安装）首次 `<CR>` 不直接应用：调用模型生成一条后果警告并自动打开 diff（顶部展示警告，生成中显示占位；标题按级别区分 `⚠ L2 高危 · 确认应用` / `⚠ L3 严重 · 确认应用`，按键提示行高亮，若冻结时剔除了遮蔽/易变缓存文件会追加「将跳过 N 个」说明），用户在 diff 内再次 `<CR>` 才真正应用、`q`/`<Esc>` 取消；模型不可用时回退规则警告（见 `sandbox/l3_warning.lua`）。 |
 | `fold` | 折叠（推理/工具调用/结果共用实现）。`foldexpr`/`foldtext`/`record_start`/`record_end`/`has_running`/`set_live_timer`/`set_foldexpr_override`/`set_foldtext_override`/`set_reasoning_lines`/`is_reasoning_start`/`generic_label`。 |
 | `display_modes/` | 显示模式插件管理器 + `chat.lua`/`trajectory.lua`。 |
 | `markdown_view` | Markdown 渲染器。 |

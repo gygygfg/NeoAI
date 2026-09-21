@@ -1157,22 +1157,44 @@ tests.suite("sandbox", function(_, it)
     store.reset()
   end)
 
-  it("存储：非法 UTF-8 候选经线程校验后回退清洗（落盘为合法 UTF-8）", function(t)
+  it("存储：非法 UTF-8 候选经线程校验后无损落盘（二进制不损坏）", function(t)
     local store = require("NeoAI.sandbox.store")
     local fs = require("NeoAI.utils.fs")
     local root = vim.fn.tempname()
     vim.fn.mkdir(root, "p")
     store.init(root)
+    -- 模拟 OpenPGP keyring：含 NUL 与大量非法 UTF-8 字节的二进制内容。
+    local bin = "\xef\xbf\xbd\x02\x0d\x04\x63\x17\x2e\xcf\x98\x1f\x06\x7d\xff\xfe\x00\x80\xc0"
     local cand = {
       candidate_digest = "sha256:badutf8",
-      files = { { path = "/tmp/x", content = "ok\xff\xfeend" } },
+      files = { { path = "/tmp/x", content = "ok\xff\xfeend" .. bin } },
     }
     store.write_candidate_async(cand)
     t.true_(store.flush(5000), "flush 应完成")
     local raw = fs.read_file(root .. "/candidates/sha256_badutf8.json")
     t.not_nil(raw, "应落盘")
     t.false_(raw:find("\xff", 1, true) ~= nil, "落盘 JSON 不应含非法 UTF-8 字节")
+    -- 关键：读回内容必须与原二进制**逐字节一致**（此前会被替换为 U+FFFD 而损坏）。
+    local got = store.read_candidate("sha256:badutf8")
+    t.not_nil(got, "应可读回")
+    t.eq(cand.files[1].content, got.files[1].content, "二进制内容应无损往返")
     store.reset()
+  end)
+
+  it("JSON：encode_lossless/decode_lossless 无损往返二进制，encode 会损坏", function(t)
+    local json = require("NeoAI.utils.json")
+    local bin = "abc\xff\xfe\x00\x80\xc0\xef\xbf\xbddef"
+    local enc = json.encode_lossless({ content = bin, nested = { { v = bin } } })
+    t.true_(enc:find("__neoai_bytes_b64__", 1, true) ~= nil, "应使用 base64 哨兵")
+    local dec = json.decode_lossless(enc)
+    t.eq(bin, dec.content, "顶层二进制应无损")
+    t.eq(bin, dec.nested[1].v, "嵌套二进制应无损")
+    -- 对照：普通 encode 会把非法字节替换为 U+FFFD（因此持久化不能用它）
+    local lossy = json.decode(json.encode({ content = bin }))
+    t.true_(lossy.content ~= bin, "encode 应有损（证明必须用 lossless）")
+    t.matches("\239\191\189", lossy.content, "encode 应替换为 U+FFFD")
+    -- 合法文本：lossless 与 encode 输出一致
+    t.eq(json.encode({ a = "中文ok" }), json.encode_lossless({ a = "中文ok" }), "合法文本编码应一致")
   end)
 
   it("存储：异步写入快照立即可读且 flush 后落盘", function(t)
@@ -2187,6 +2209,22 @@ tests.suite("sandbox", function(_, it)
     vim.fn.delete(dir, "rf")
   end)
 
+  it("加固：is_masked_path 支持本次 attempt 的 unmask（档位/审批放行）", function(t)
+    local runtime = require("NeoAI.sandbox.runtime")
+    local fs = require("NeoAI.utils.fs")
+    local dir = vim.fn.tempname()
+    fs.ensure_dir(dir)
+    local file = dir .. "/secret.env"
+    fs.write_file(file, "x")
+    with_config({ tools = { sandbox = { mask_paths = { file } } } }, function()
+      t.eq(file, runtime.is_masked_path(file), "默认应命中")
+      t.nil_(runtime.is_masked_path(file, { file }), "unmask 精确命中应放行")
+      t.nil_(runtime.is_masked_path(file, { dir }), "unmask 祖先命中应放行")
+      t.eq(file, runtime.is_masked_path(file, { "/tmp/neoai_other" }), "无关 unmask 不应放行")
+    end)
+    vim.fn.delete(dir, "rf")
+  end)
+
   it("加固：遮蔽路径解析符号链接与 /proc/<pid>/root，防进程内绕过", function(t)
     local runtime = require("NeoAI.sandbox.runtime")
     local fs = require("NeoAI.utils.fs")
@@ -2983,6 +3021,90 @@ tests.suite("sandbox", function(_, it)
     secret.reset()
   end)
 
+  it("密钥防护：环境变量名引用（api_key=DASHSCOPE_API_KEY）不登记、不终止 Agent", function(t)
+    local secret = require("NeoAI.sandbox.secret")
+    secret.reset()
+    -- 知识库案例回归：`api_key=DASHSCOPE_API_KEY` 的右值是**变量名引用**而非凭据值，不得登记为
+    -- 原始密钥；否则同文件内裸变量名（`os.getenv('DASHSCOPE_API_KEY')` 等）会让请求前守卫
+    -- 误命中并终止 Agent。
+    local code = table.concat({
+      "import os",
+      "DASHSCOPE_API_KEY = os.getenv('DASHSCOPE_API_KEY')",
+      "client = OpenAI(api_key=DASHSCOPE_API_KEY)",
+    }, "\n")
+    local out, used = secret.tokenize(code)
+    t.eq(code, out, "变量名引用不应被 token 化")
+    t.eq(0, #used, "变量名引用不应产生 token")
+    t.nil_(secret.find_real_secret(code), "变量名引用不应登记为原始密钥")
+    -- 监控保留：环境变量名仍由 scan_names 识别（软升级路径）。
+    t.true_(vim.tbl_contains(secret.scan_names({ out }), "DASHSCOPE_API_KEY"),
+      "环境变量名仍应被监控识别")
+    -- 请求前守卫：上下文含该变量名不终止 Agent。
+    local recovery = require("NeoAI.core.agent.recovery")
+    local abort_reason
+    local agent = {
+      id = "a_env_name_ref",
+      signal = {
+        abort = function(_, r) abort_reason = r end,
+        reason = function() return abort_reason end,
+        aborted = function() return abort_reason ~= nil end,
+      },
+    }
+    t.true_(recovery._guard_secret_context(agent, { { role = "user", content = out } }),
+      "环境变量名不应终止 Agent")
+    t.eq(nil, abort_reason, "不应触发 abort")
+    secret.reset()
+  end)
+
+  it("密钥防护：环境变量密钥裸值兜底 token 化且不终止 Agent", function(t)
+    local secret = require("NeoAI.sandbox.secret")
+    secret.reset()
+    -- 纯 hex / 无具名前缀的环境变量密钥：处于非赋值上下文（知识库裸值）时熵检测不会覆盖，
+    -- 必须由「已知环境变量密钥」兜底明文替换 token 化，否则 AI 上下文守卫会误判并终止。
+    local hexkey = "dfe946fb66864c48927f31f2aa49164d"
+    local otherkey = "6xYSL2abcdefghijklmnopqrstuvwxyz0123456789"
+    vim.env.NEOAI_TEST_BARE_KEY = hexkey
+    vim.env.NEOAI_TEST_PLAIN_KEY = otherkey
+    local ov = secret.sanitized_env()
+    t.true_(secret.is_env_secret(hexkey), "应登记为环境变量密钥（软信号）")
+    t.true_(secret.has_token(ov.NEOAI_TEST_BARE_KEY), "环境变量覆盖值应为 token")
+    -- 非赋值上下文的裸值（entropy=false，模拟普通文件）也必须被兜底 token 化。
+    for _, raw in ipairs({ hexkey, otherkey }) do
+      local out = secret.tokenize("处理案例裸值：\n" .. raw .. "\n", { entropy = false })
+      t.true_(not out:find(raw, 1, true), "裸环境变量密钥不应原样回传: " .. out)
+      t.true_(secret.has_token(out), "裸环境变量密钥应被替换为 token")
+    end
+    -- 异步（工作线程）路径同样兜底：不能因线程参数传递而漏掉。
+    local done, res = false, nil
+    secret.tokenize_async("值：" .. hexkey .. "\n", { entropy = false }):then_(function(v)
+      res = v; done = true
+    end, function() done = true end)
+    t.true_(vim.wait(3000, function() return done end), "异步 token 化应完成")
+    t.true_(res ~= nil and not res:find(hexkey, 1, true), "异步路径裸值也应 token 化")
+    -- 请求前守卫：环境变量密钥值出现在上下文不终止 Agent。
+    local recovery = require("NeoAI.core.agent.recovery")
+    local abort_reason
+    local agent = {
+      id = "a_env_value",
+      signal = {
+        abort = function(_, r) abort_reason = r end,
+        reason = function() return abort_reason end,
+        aborted = function() return abort_reason ~= nil end,
+      },
+    }
+    t.true_(recovery._guard_secret_context(agent, { { role = "tool", content = hexkey } }),
+      "环境变量密钥值不应终止 Agent")
+    t.eq(nil, abort_reason, "不应触发 abort")
+    -- 非环境变量密钥仍应硬拦截（回归保护）。
+    local fake = "sk-Ab3xY9pQ2mNv7Kd4Lw8Zr1Tg6Hs5"
+    secret.tokenize(fake)
+    t.not_nil(secret.context_leak({ { role = "tool", content = fake } }),
+      "非环境变量原始密钥仍应命中")
+    vim.env.NEOAI_TEST_BARE_KEY = nil
+    vim.env.NEOAI_TEST_PLAIN_KEY = nil
+    secret.reset()
+  end)
+
   it("密钥防护：敏感环境变量名出现只提级待审（不终止，带警告）", function(t)
     local secret = require("NeoAI.sandbox.secret")
     local fs = require("NeoAI.utils.fs")
@@ -3739,6 +3861,55 @@ tests.suite("sandbox", function(_, it)
     vim.fn.delete(dir, "rf")
   end)
 
+  it("冻结：剔除有效遮蔽与易变包缓存文件（避免整单元发布失败）", function(t)
+    local fs = require("NeoAI.utils.fs")
+    local sandbox = require("NeoAI.sandbox")
+    local candidate = require("NeoAI.sandbox.candidate")
+    local control = require("NeoAI.sandbox.control")
+    local store = require("NeoAI.sandbox.store")
+    local dir = fs.canonical(vim.fn.tempname())
+    fs.ensure_dir(dir)
+    local masked = dir .. "/masked.env"
+    local unmasked = dir .. "/allowed.env"
+    local volatile_dir = dir .. "/apt/lists"
+    fs.ensure_dir(volatile_dir)
+    local volatile_file = volatile_dir .. "/Packages"
+    local normal = dir .. "/normal.txt"
+    with_config({
+      tools = { sandbox = {
+        workspace_root = vim.fn.tempname() .. "/sb",
+        mask_paths = { masked, unmasked },
+        packages = { volatile_paths = { volatile_dir } },
+      } },
+    }, function()
+      sandbox.reset()
+      local a = control.new_attempt("run_command", {}, {}, { effect = "process" })
+      a.package = true
+      a.effective_unmask = { unmasked }
+      candidate.begin(a, store.root())
+      local function stage(p, content)
+        local staged = candidate.stage_path(a.attempt_id, p)
+        fs.write_file(staged, content)
+      end
+      stage(masked, "secret\n")
+      stage(unmasked, "allowed\n")
+      stage(volatile_file, "index\n")
+      stage(normal, "ok\n")
+      local cand = candidate.finish(a.attempt_id)
+      local paths = {}
+      for _, f in ipairs(cand.files) do paths[f.path] = true end
+      t.nil_(paths[masked], "遮蔽文件应被剔除")
+      t.nil_(paths[volatile_file], "易变包缓存应被剔除")
+      t.not_nil(paths[normal], "普通文件应保留")
+      t.not_nil(paths[unmasked], "被 unmask 放行的遮蔽文件应保留")
+      t.not_nil(cand.dropped, "应记录剔除信息")
+      t.eq(1, cand.dropped.masked, "应记录剔除的遮蔽文件数")
+      t.eq(1, cand.dropped.volatile, "应记录剔除的易变缓存数")
+      candidate.cleanup(a.attempt_id)
+    end)
+    vim.fn.delete(dir, "rf")
+  end)
+
   it("物化：未改动的暂存文件重复物化跳过写入（不重读/重写）", function(t)
     local fs = require("NeoAI.utils.fs")
     local sandbox = require("NeoAI.sandbox")
@@ -3899,6 +4070,38 @@ tests.suite("sandbox", function(_, it)
       }, { package = true })
       t.eq(secret_text, fs.read_file(candidate.read_path(dir .. "/b.txt")) or "",
         "包内容不应 token 化（与结算阶段跳过密钥检测一致）")
+      candidate.cleanup(a2.attempt_id)
+    end)
+    vim.fn.delete(dir, "rf")
+  end)
+
+  it("二进制内容：merge/stage 不做密钥 token 化（不当文本处理）", function(t)
+    local fs = require("NeoAI.utils.fs")
+    local sandbox = require("NeoAI.sandbox")
+    local candidate = require("NeoAI.sandbox.candidate")
+    local control = require("NeoAI.sandbox.control")
+    local store = require("NeoAI.sandbox.store")
+    with_config({ tools = { sandbox = { workspace_root = vim.fn.tempname() .. "/sb" } } }, function()
+      sandbox.reset()
+      local dir = fs.canonical(vim.fn.tempname())
+      fs.ensure_dir(dir)
+      -- 含 NUL 与非法 UTF-8 的二进制（模拟 OpenPGP keyring）
+      local bin = "\x99\x01\x0d\x04\x63\x17\x2e\xcf\x98\x1f\x06\x7d\xff\xfe\x00\x80"
+      local a = control.new_attempt("run_command", {}, {}, { effect = "process" })
+      candidate.begin(a, store.root())
+      candidate.merge_candidate({
+        files = { { path = dir .. "/key.gpg", action = "create", content = bin, mode = 420 } },
+      })
+      t.eq(bin, fs.read_file(candidate.read_path(dir .. "/key.gpg")) or "",
+        "二进制内容不应被 token 化（逐字节保留）")
+      candidate.cleanup(a.attempt_id)
+      -- stage_path（_base_entry）同样跳过 token 化
+      local real = dir .. "/real.gpg"
+      fs.write_file(real, bin)
+      local a2 = control.new_attempt("edit_file", {}, {}, { effect = "fs_write" })
+      candidate.begin(a2, store.root())
+      local staged = candidate.stage_path(a2.attempt_id, real)
+      t.eq(bin, fs.read_file(staged) or "", "stage 的二进制副本应逐字节一致")
       candidate.cleanup(a2.attempt_id)
     end)
     vim.fn.delete(dir, "rf")
@@ -4135,6 +4338,20 @@ tests.suite("sandbox", function(_, it)
     t.true_(res2.ok, tostring(res2.err))
     t.eq(420, (vim.uv.fs_stat(p2).mode % 512), "新建文件应为 0644")
     fs.delete_file(p2)
+  end)
+
+  it("落盘：二进制内容经 writer 无损写入（不当文本处理）", function(t)
+    local writer = require("NeoAI.sandbox.writer")
+    local fs = require("NeoAI.utils.fs")
+    local dir = fs.canonical(vim.fn.tempname())
+    fs.ensure_dir(dir)
+    local p = dir .. "/key.gpg"
+    local bin = "\x99\x01\x0d\x04\x63\x17\x2e\xff\xfe\x00\x80\xc0"
+    local res = writer.apply("write", p, bin, { mode = 420 })
+    t.true_(res.ok, "应写入成功")
+    t.eq(bin, fs.read_file(p) or "", "二进制内容应逐字节一致（不被当文本处理）")
+    fs.delete_file(p)
+    vim.fn.delete(dir, "rf")
   end)
 
   it("run_command：命令创建的文件保留可执行位（物化/发布）", function(t)

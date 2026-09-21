@@ -633,6 +633,21 @@ local function _canonical(path)
   return fs.canonical(path)
 end
 
+--- 某路径是否被 unmask 条目覆盖（精确或祖先命中），与 `_masked_paths` 的 `unmasked()` 语义一致。
+--- @param unmask table|nil 解除遮蔽的路径数组（档位提权 / 审批放行）
+--- @param path string 待判定的路径（通常是遮蔽条目本身）
+--- @return boolean
+local function _unmasked_by(unmask, path)
+  if type(unmask) ~= "table" or type(path) ~= "string" or path == "" then return false end
+  for _, u in ipairs(unmask) do
+    if type(u) == "string" and u ~= "" then
+      u = u:gsub("/+$", "")
+      if u ~= "" and (_under(path, u) or _under(path, _canonical(u))) then return true end
+    end
+  end
+  return false
+end
+
 --- 读取面总开关（`tools.sandbox.read_all`，默认开）：true 时整机根只读暴露，
 --- 仅遮蔽 mask_paths 中的重要配置文件/凭据；false 时退回最小只读白名单。
 --- @return boolean
@@ -1623,9 +1638,12 @@ end
 --- 供**进程内** read/fs_write 工具显式拦截：这些工具不经 namespace，mount 遮蔽对其无效，
 --- 必须由执行器按此查询 fail-closed。不含按 cwd 的遮蔽目录（由 `mask_entry` 处理，
 --- 语义与审批放行不同）。
+--- 可选 `unmask`（本次 attempt 的档位提权 / 审批放行条目）：被其覆盖的遮蔽条目不算命中，
+--- 与 `_masked_paths` 一致。沙箱自身存储永远命中，不受 unmask 影响。
 --- @param path string|nil 绝对路径
+--- @param unmask table|nil 本次 attempt 解除遮蔽的路径数组
 --- @return string|nil 命中的遮蔽条目
-function M.is_masked_path(path)
+function M.is_masked_path(path, unmask)
   if type(path) ~= "string" or path == "" then return nil end
   -- 解析符号链接与 `/proc/<pid>/root|cwd|fd`：进程内工具只按路径比对遮蔽，
   -- 若不做规范化，`/proc/self/root/etc/shadow` 或指向宿主凭据的符号链接可绕过。
@@ -1638,7 +1656,9 @@ function M.is_masked_path(path)
   end
   for _, p in ipairs(_config_mask_paths()) do
     -- 同时比对原始与规范化后的遮蔽条目：条目自身可能含符号链接（如 /var/run → /run）。
-    if _under(path, p) or _under(path, _canonical(p)) then return p end
+    if _under(path, p) or _under(path, _canonical(p)) then
+      if not _unmasked_by(unmask, p) then return p end
+    end
   end
   return nil
 end

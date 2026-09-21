@@ -187,6 +187,20 @@ local function _utf8_sequence_len(s, i)
   return len
 end
 
+--- 字符串是否为合法 UTF-8（单次逐字节扫描，不做任何替换）
+--- @param s string|nil
+--- @return boolean
+function M.is_valid_utf8(s)
+  if not s or s == "" then return true end
+  local i, n = 1, #s
+  while i <= n do
+    local len = _utf8_sequence_len(s, i)
+    if len == 0 then return false end
+    i = i + len
+  end
+  return true
+end
+
 --- 将字符串修复为合法 UTF-8：非法字节序替换为 U+FFFD（替换字符）
 --- vim.json.encode 会把非法 UTF-8 字节原样透传进 JSON 输出，导致对方严格 JSON
 --- 解析器报 "invalid unicode code point"。本函数在编码前清洗，保持合法内容不变。

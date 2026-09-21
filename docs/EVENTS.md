@@ -267,6 +267,10 @@ vim.api.nvim_create_autocmd("User", {
 | `SANDBOX_GRANT_CREATED` | `sandbox:grant_created` | 创建任务授权 | `{ grant_id, scope, operations }` |
 | `SANDBOX_GRANT_REVOKED` | `sandbox:grant_revoked` | 撤销任务授权 | `{ grant_id }` |
 | `SANDBOX_OUTSIDE_ACCESS` | `sandbox:outside_access` | 越界访问留痕（访问 cwd 之外用户工作目录，非阻塞） | `{ trace_id, path, tool, kind }` |
+| `SANDBOX_SYSTEMD_ROUTED` | `sandbox:systemd_routed` | systemctl/journalctl 调用被门面路由到沙箱内长驻服务 | `{ verb, units, ok, command_id }` |
+| `SANDBOX_SYSTEMD_UNSUPPORTED` | `sandbox:systemd_unsupported` | 门面明确拒绝不支持的 systemd 语义（不落宿主机） | `{ verb, units, command_id }` |
+| `SANDBOX_CONTAINER_PLANNED` | `sandbox:container_planned` | 容器受控计划（命名空间共享 / 受控 socket） | `{ manager, mode, share_namespace, reason, command_id }` |
+| `SANDBOX_CONTAINER_UNSUPPORTED` | `sandbox:container_unsupported` | 容器门面拒绝需宿主守护进程/远程/宿主子命令 | `{ manager, sub, reason, command_id }` |
 
 ## 4. 事件订阅最佳实践
 

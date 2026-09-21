@@ -736,6 +736,19 @@ local DEFAULT_CONFIG = {
         max_log_bytes = 262144, -- 单服务日志环形缓冲上限（字节）
         stop_timeout_ms = 5000, -- 停止时等待进程优雅退出的上限（超时 SIGKILL）
       },
+      -- systemctl 门面（方案 A）：AI 的 `systemctl`/`journalctl` 独立调用被路由到沙箱内
+      -- 长驻服务（复用 sandbox.service），不调用宿主 systemd、也不修改宿主机。支持
+      -- simple/exec/oneshot 与 Requires/Wants/After/Before 依赖；Type=notify/forking/dbus、
+      -- socket/timer 等语义明确报错；门面不处理的动词回退 T2/hostop 提案路径。
+      systemd = {
+        enabled = true, -- 总开关
+        mode = "facade", -- facade（默认）：沙箱内处理；其余值保留给未来实现
+        max_deps = 32, -- 单次调用的依赖闭包上限（防止依赖环/超大图）
+        unit_roots = { -- 单元文件搜索目录（优先沙箱暂存副本，再读真实文件）
+          "/etc/systemd/system", "/run/systemd/system",
+          "/usr/lib/systemd/system", "/lib/systemd/system",
+        },
+      },
       -- 异步审批（设计文档 §15）：AI 修改立即沙箱执行并冻结候选，      -- 用户异步确认允许哪些文件/配置修改后再 CAS 应用。
       review = {
         enabled = true, -- 效果类候选自动进入待审队列
@@ -745,8 +758,11 @@ local DEFAULT_CONFIG = {
         session_auto_approve = false,
         -- L3（critical）操作二次确认：首次 <CR> 时由 AI 生成后果警告并自动打开 diff，
         -- 需在 diff 内再次确认才真正应用；AI 不可用时回退规则警告，不阻断。
+        -- `package_confirm=true` 时，L2 的包安装/敏感安装（apt-key、gpg --import、改软件源等）
+        -- 也走同一「AI 告知后果 → 二次确认」流程（默认开，覆盖高危安装场景）。
         l3_warning = {
           enabled = true,
+          package_confirm = true, -- L2 包/敏感安装是否也需 AI 后果警告 + 二次确认
           max_tokens = 256, -- 警告正文最大输出
           timeout_ms = 15000, -- 生成超时（ms），超时回退规则警告
         },
@@ -848,14 +864,40 @@ local DEFAULT_CONFIG = {
           "~/.cache", "~/.npm", "~/.nvm", "~/.cargo", "~/.rustup", "~/.gem", "~/.composer",
           "~/go", "~/.local",
         },
+        -- 易变的包索引/缓存：冻结候选时**跳过**这些路径，不进入待审、不 CAS 发布。
+        -- 原因：这些文件由包管理器随时重新生成（如 `apt update` 重写 `/var/lib/apt/lists`），
+        -- 应用时真实文件往往已变化，触发 `CONFLICT/BASELINE_CHANGED` 并否决**整个**变更单元，
+        -- 使安装无法落盘。跳过它们不影响安装效果（包文件/`/var/lib/dpkg/status` 等仍会应用），
+        -- 宿主可自行 `apt update` 重新生成索引。支持 `~` 展开与 `*` 通配；设为 `{}` 关闭跳过。
+        -- 注意：**不要**放入 `/var/lib/dpkg/status`、`/var/lib/dpkg/info` 等安装状态文件。
+        volatile_paths = {
+          -- Debian/Ubuntu：索引与下载缓存
+          "/var/lib/apt/lists", "/var/cache/apt",
+          -- 其他系统包管理器缓存
+          "/var/cache/dnf", "/var/cache/yum", "/var/cache/pacman/pkg", "/var/cache/apk",
+          -- 语言生态缓存（pip/npm/yarn/cargo/go）
+          "~/.cache/pip", "~/.cache/uv", "~/.npm/_cacache", "~/.cache/yarn",
+          "~/.cargo/registry/cache", "~/.cache/go-build",
+        },
       },
-      -- 容器受控运行：AI 调用 docker/podman 等时尽量与沙箱同 namespace（受控）。
-      -- podman 等无守护进程运行时注入 --net/pid/ipc/uts=host 共享沙箱命名空间；
-      -- docker 依赖外部 daemon，保持受控 socket 方案并记录原因。
+      -- 容器门面：AI 调用 docker/podman 等时在沙箱内管理，容器不改变宿主机。
+      --   * podman/buildah（无守护进程）：容器是 CLI 子进程，注入 --net/pid/ipc/uts=host
+      --     共享沙箱命名空间 → 容器在沙箱内运行、写入进 overlay 暂存；
+      --   * docker/nerdctl（依赖宿主守护进程）：默认明确报错「沙箱环境不支持」，不碰宿主；
+      --     仅当显式配置 docker.mode="controlled" 且 socket 存在时才放行受控 socket。
       container = {
         enabled = true,
         share_namespace = true, -- 对无守护进程运行时注入命名空间共享标志
         prefer = "podman", -- 优先使用的无守护进程运行时（供提示/文档）
+        -- docker/docker-compose 在沙箱内改写为 podman/podman-compose（无守护进程，容器受沙箱
+        -- 约束）；沙箱内无 podman 时明确报错。设为 false 则 docker 直接拒绝（不改写）。
+        docker_to_podman = true,
+      },
+      docker = {
+        -- 容器门面下 docker/nerdctl 的处理：off（默认，明确拒绝，不碰宿主）|
+        -- controlled（显式受控 socket：rootless / socket-proxy / dind）。
+        mode = "off",
+        socket = "", -- 受控 socket 路径（mode="controlled" 时必填且须存在）
       },
       -- 存储基根。每进程实例隔离在 <workspace_root>/instances/<pid>_<启动时间>，
       -- 待审队列/候选/回执/证据不跨 nvim 会话共享（多个会话互不可见对方的审批）。

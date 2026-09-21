@@ -55,6 +55,34 @@ function M.base64_length(n)
   return math.ceil(n / 3) * 4
 end
 
+local B64_DECODE = {}
+for i = 1, #B64_CHARS do B64_DECODE[B64_CHARS:sub(i, i)] = i - 1 end
+
+--- base64 解码（字节串）
+--- @param data string base64 文本（可含 `=` padding 与换行）
+--- @return string|nil 原始字节串；非法输入返回 nil
+function M.base64_decode(data)
+  if type(data) ~= "string" then return nil end
+  data = data:gsub("[^%w%+/=]", "") -- 去掉换行/空白
+  local bit = require("bit")
+  local bor, lshift = bit.bor, bit.lshift
+  local out = {}
+  local acc, nbits = 0, 0
+  for i = 1, #data do
+    local ch = data:sub(i, i)
+    if ch == "=" then break end
+    local v = B64_DECODE[ch]
+    if v == nil then return nil end
+    acc = bor(lshift(acc, 6), v)
+    nbits = nbits + 6
+    if nbits >= 8 then
+      nbits = nbits - 8
+      out[#out + 1] = string.char(bit.band(bit.rshift(acc, nbits), 0xFF))
+    end
+  end
+  return table.concat(out)
+end
+
 -- ========== 媒体类型识别 ==========
 
 --- 支持的图像媒体类型

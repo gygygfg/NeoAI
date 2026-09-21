@@ -7,9 +7,38 @@ local M = {}
 --- ensure_buffer 后台加载的 buffer 集合（bufnr -> true）
 local bg_loaded = {}
 
+--- 被写类工具**显式修改**过的后台 buffer 集合（bufnr -> true）。
+--- 仅这些 buffer 允许 `persist_buffer` 回写：加载（bufload）/同步（sync_buffer_from_disk）
+--- 等只读路径绝不触发保存，避免「nvim 读取后重新保存」把文件按文本重新编码而损坏。
+local bg_edited = {}
+
 --- Neovim >= 0.13 起由内置文件监听（autoread）自动把外部改动的文件重载进 buffer，
 --- 无需手动同步；更早版本依赖 sync_buffer_from_disk / reload_buffers_for。
 local use_autoread = vim.fn.has("nvim-0.13") == 1
+
+--- 采样判定文件是否为二进制：含 NUL，或非打印控制字节占比过高（>10%）。
+--- 二进制**绝不载入文本 buffer，也绝不回写**：nvim 的 buffer/`:write!` 会按文本重新编码，
+--- 把非法字节替换为 U+FFFD（`EF BF BD`）而损坏文件（如 OpenPGP keyring 被破坏后无法解析）。
+--- @param filepath string
+--- @return boolean
+local function _is_binary_file(filepath)
+  if type(filepath) ~= "string" or filepath == "" then return false end
+  local f = io.open(filepath, "rb")
+  if not f then return false end
+  local sample = f:read(8192) or ""
+  f:close()
+  if sample == "" then return false end
+  if sample:find("\0", 1, true) then return true end
+  local ctrl, n = 0, #sample
+  for i = 1, n do
+    local b = sample:byte(i)
+    -- 允许 tab/LF/FF/CR/ESC；其余 C0/C1 控制字节与 DEL 计入
+    if (b < 32 and b ~= 9 and b ~= 10 and b ~= 12 and b ~= 13 and b ~= 27) or b == 127 then
+      ctrl = ctrl + 1
+    end
+  end
+  return ctrl * 10 > n
+end
 
 --- 构造工具定义
 --- @param name string
@@ -100,6 +129,8 @@ function M.ensure_buffer(filepath)
   local bufnr = vim.fn.bufnr(filepath)
   if bufnr >= 0 then return bufnr end
   if vim.fn.filereadable(filepath) ~= 1 then return nil end
+  -- 二进制文件不载入文本 buffer：避免 buffer/回写按文本重新编码而损坏内容。
+  if _is_binary_file(filepath) then return nil end
   -- bufload 不能创建不存在的 buffer，须先 bufadd 注册再加载
   local add_ok = pcall(vim.fn.bufadd, filepath)
   if not add_ok then return nil end
@@ -134,6 +165,14 @@ function M.is_background_loaded(bufnr)
   return bg_loaded[bufnr] == true
 end
 
+--- 标记某后台 buffer 已被写类工具**显式修改**，允许 `persist_buffer` 回写。
+--- 只有显式编辑路径（delete_node/lsp_rename/lsp_format 等）才调用；加载/同步绝不调用，
+--- 从而保证「只读不改盘」。
+--- @param bufnr number
+function M.mark_edited(bufnr)
+  if type(bufnr) == "number" and bufnr > 0 then bg_edited[bufnr] = true end
+end
+
 --- 磁盘内容与内存不一致时从磁盘同步 buffer（仅当 buffer 无未保存改动）。
 --- edit_file 等磁盘直写工具只改磁盘、不改已加载 buffer 的内容，导致后续
 --- LSP / treesitter 操作基于过期内容（读错位置、lsp_rename 把旧内容写回磁盘等）。
@@ -147,6 +186,8 @@ function M.sync_buffer_from_disk(bufnr)
   if vim.bo[bufnr].modified then return true end -- 有未保存改动，绝不覆盖
   local filepath = vim.api.nvim_buf_get_name(bufnr)
   if filepath == "" or vim.fn.filereadable(filepath) ~= 1 then return true end
+  -- 二进制文件不同步：readfile 会按行拆分并丢失 NUL/非法字节，破坏内容。
+  if _is_binary_file(filepath) then return true end
   local disk_lines = vim.fn.readfile(filepath)
   local mem_lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
   local same = #disk_lines == #mem_lines
@@ -196,10 +237,16 @@ end
 --- @return boolean, string|nil
 function M.persist_buffer(bufnr)
   if not bg_loaded[bufnr] then return true end
+  -- 仅显式编辑过的 buffer 允许回写：加载（bufload）/同步（sync_buffer_from_disk）等只读路径
+  -- 绝不触发保存——否则 nvim 读取后重新保存会把文件按文本重新编码而损坏（二进制尤其严重）。
+  if not bg_edited[bufnr] then return true end
   if not vim.api.nvim_buf_is_loaded(bufnr) or not vim.bo[bufnr].modifiable then return true end
   if not vim.bo[bufnr].modified then return true end
   -- 沙箱激活时把 buffer 写盘重定向到私有暂存层，不落真实工作区。
   local filepath = vim.api.nvim_buf_get_name(bufnr)
+  -- 二进制文件绝不回写：buffer 已按文本处理，写回会把非法字节替换为 U+FFFD 而损坏内容
+  -- （如 OpenPGP keyring）。二进制只读、不保存。
+  if filepath ~= "" and _is_binary_file(filepath) then return false, "BINARY_SKIP" end
   local target = nil
   if filepath ~= "" then
     local ok_sb, sandbox = pcall(require, "NeoAI.sandbox")
@@ -215,6 +262,7 @@ function M.persist_buffer(bufnr)
     vim.cmd(write_cmd)
   end)
   if not ok then return false, tostring(err) end
+  bg_edited[bufnr] = nil -- 已保存：清除编辑标记，后续只读路径不再回写
   return true
 end
 

@@ -903,6 +903,35 @@ tests.suite("tools", function(_, it)
     t.eq("lua", vim.bo[buf].filetype, "后台加载后应补齐 filetype")
   end)
 
+  it("二进制：ensure_buffer 不载入，persist_buffer 不回写（不重新保存文件）", function(t)
+    local helpers = require("NeoAI.tools.builtin.tool_helpers")
+    local fs = require("NeoAI.utils.fs")
+    local dir = fs.canonical(vim.fn.tempname())
+    fs.ensure_dir(dir)
+    -- 二进制（含 NUL 与非法 UTF-8，模拟 OpenPGP keyring）：绝不载入文本 buffer。
+    local bin = dir .. "/key.gpg"
+    fs.write_file(bin, "\x99\x01\x0d\x04\xff\xfe\x00\x80\xc0" .. string.rep("\x02\x0d", 200))
+    t.nil_(helpers.ensure_buffer(bin), "二进制文件不应载入 buffer")
+    -- 文本正常载入；磁盘随后被改为二进制时，persist 必须拒绝回写（不重新保存）。
+    local txt = dir .. "/a.txt"
+    fs.write_file(txt, "hello\n")
+    local buf = helpers.ensure_buffer(txt)
+    t.not_nil(buf, "文本应载入 buffer")
+    t.true_(helpers.is_background_loaded(buf), "应为后台加载")
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "changed by ai" })
+    local bin_content = "\xff\xfe\x00binary-keyring"
+    fs.write_file(txt, bin_content)
+    helpers.mark_edited(buf) -- 显式编辑后才走到二进制回写门禁
+    local ok, err = helpers.persist_buffer(buf)
+    t.false_(ok, "二进制应拒绝回写")
+    t.eq("BINARY_SKIP", err)
+    t.eq(bin_content, fs.read_file(txt), "磁盘二进制内容应保持不变（未被文本化覆盖）")
+    pcall(vim.api.nvim_buf_delete, buf, { force = true })
+    fs.delete_file(bin)
+    fs.delete_file(txt)
+    vim.fn.delete(dir, "rf")
+  end)
+
   it("parse_file 自动后台打开未加载文件", function(t)
     local registry = require("NeoAI.tools.registry")
     registry.reset()
@@ -976,6 +1005,11 @@ tests.suite("tools", function(_, it)
     local bg = helpers.ensure_buffer(bg_path)
     t.true_(helpers.is_background_loaded(bg))
     pcall(vim.api.nvim_buf_set_text, bg, 0, 0, 0, -1, { "bg-persisted" })
+    -- 未显式标记编辑：只读路径绝不回写（「nvim 读取后重新保存」会损坏文件）
+    helpers.persist_buffer(bg)
+    t.eq("bg-original", fs.read_file(bg_path):match("[^\r\n]+"), "未标记编辑不应回写")
+    -- 显式编辑（mark_edited）后才允许回写
+    helpers.mark_edited(bg)
     local saved, err = helpers.persist_buffer(bg)
     t.true_(saved, "后台 buffer 应可保存: " .. tostring(err))
     t.eq("bg-persisted", fs.read_file(bg_path):match("[^\r\n]+"))

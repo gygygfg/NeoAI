@@ -677,6 +677,111 @@ tests.suite("sandbox_review", function(_, it)
     services.provide("services.sandbox", saved)
   end)
 
+  it("L2 包/敏感安装首次 <CR> 打开 AI 警告 diff，二次确认后才应用", function(t)
+    local services = require("NeoAI.kernel.services")
+    local sr = require("NeoAI.ui.components.sandbox_review")
+    local l3 = require("NeoAI.sandbox.l3_warning")
+    sr.reset()
+    l3.reset()
+    l3.set_generator(function(_, _, on_done) on_done("安装后果警告") end)
+    local saved = services.use("services.sandbox")
+    local cwd = vim.fn.getcwd()
+    local path = cwd .. "/pkg2.txt"
+    local fs = require("NeoAI.utils.fs")
+    fs.write_file(path, "old\n")
+    local applied = {}
+    services.provide("services.sandbox", {
+      list_reviews = function()
+        return {
+          {
+            change_set_id = "csP2", tool = "run_command", risk_level = 2,
+            risk_name = "high", package = true, package_sensitive = true,
+            files = { { path = path, action = "modify", content = "new\n" } },
+          },
+        }
+      end,
+      apply = function(id, opts) applied[#applied + 1] = { id, opts }; return { ok = true } end,
+      reject = function() end,
+      reject_file = function() end,
+    })
+
+    sr.open()
+    local buf = sr.get_buf()
+    local file_line
+    for ln, target in pairs(sr.get_line_map()) do
+      if target.path == path then file_line = ln end
+    end
+    vim.api.nvim_win_set_cursor(0, { file_line, 0 })
+    local cr
+    for _, m in ipairs(vim.api.nvim_buf_get_keymap(buf, "n")) do
+      if m.lhs == "<CR>" then cr = m.callback end
+    end
+    t.not_nil(cr, "应注册 <CR> 应用键")
+    cr()
+    t.eq(0, #applied, "L2 包安装首次 <CR> 不应直接应用")
+    local dbuf = sr.get_diff_buf()
+    t.not_nil(dbuf, "应自动打开 diff 预览")
+    local dtext = table.concat(vim.api.nvim_buf_get_lines(dbuf, 0, -1, false), "\n")
+    t.matches("L2 高危风险操作", dtext, "diff 顶部应展示 L2 警告标题")
+    t.matches("安装后果警告", dtext, "应展示 AI 生成的警告文本")
+
+    local dcr
+    for _, m in ipairs(vim.api.nvim_buf_get_keymap(dbuf, "n")) do
+      if m.lhs == "<CR>" then dcr = m.callback end
+    end
+    t.not_nil(dcr, "diff 内应注册 <CR> 确认键")
+    dcr()
+    t.eq(1, #applied, "二次确认后应应用一次")
+    t.eq("csP2", applied[1][1])
+
+    sr.close()
+    l3.reset()
+    fs.delete_file(path)
+    services.provide("services.sandbox", saved)
+  end)
+
+  it("package_confirm=false 时 L2 包安装直接应用（不二次确认）", function(t)
+    local config_store = require("NeoAI.kernel.config_store")
+    local services = require("NeoAI.kernel.services")
+    local sr = require("NeoAI.ui.components.sandbox_review")
+    sr.reset()
+    local saved = services.use("services.sandbox")
+    local prev = config_store.get("tools.sandbox.review.l3_warning.package_confirm")
+    config_store.set("tools.sandbox.review.l3_warning.package_confirm", false)
+    local cwd = vim.fn.getcwd()
+    local path = cwd .. "/pkg2off.txt"
+    local applied = 0
+    services.provide("services.sandbox", {
+      list_reviews = function()
+        return {
+          {
+            change_set_id = "csP2off", tool = "run_command", risk_level = 2,
+            package = true, package_sensitive = true,
+            files = { { path = path, action = "modify", content = "new\n" } },
+          },
+        }
+      end,
+      apply = function() applied = applied + 1; return { ok = true } end,
+      reject = function() end,
+      reject_file = function() end,
+    })
+    sr.open()
+    local buf = sr.get_buf()
+    local file_line
+    for ln, target in pairs(sr.get_line_map()) do
+      if target.path == path then file_line = ln end
+    end
+    vim.api.nvim_win_set_cursor(0, { file_line, 0 })
+    for _, m in ipairs(vim.api.nvim_buf_get_keymap(buf, "n")) do
+      if m.lhs == "<CR>" then m.callback() end
+    end
+    t.eq(1, applied, "关闭 package_confirm 后应直接应用")
+    t.nil_(sr.get_diff_buf(), "不应打开二次确认 diff")
+    sr.close()
+    config_store.set("tools.sandbox.review.l3_warning.package_confirm", prev)
+    services.provide("services.sandbox", saved)
+  end)
+
   it("l3_warning.fallback 生成确定性警告", function(t)
     local l3 = require("NeoAI.sandbox.l3_warning")
     local w = l3.fallback(

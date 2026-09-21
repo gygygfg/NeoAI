@@ -441,6 +441,8 @@ local function _enqueue_review(cand, attempt, cfg, env, meta)
     package_names = meta and meta.package_names or nil,
     package_key = meta and meta.package_key or nil,
     package_sensitive = meta and meta.package_sensitive or nil,
+    -- 冻结时剔除的不可发布文件（遮蔽/易变缓存）：供审批界面提示「部分文件将被跳过」。
+    dropped = cand and cand.dropped or nil,
   })
 end
 
@@ -977,6 +979,121 @@ local function _start_observe(cg_handle, attempt, ctx, prewarmed)
   return nil
 end
 
+--- systemctl/journalctl 门面（方案 A）：把独立调用路由到沙箱内长驻服务，不触碰宿主 systemd。
+--- 返回 Deferred（已处理）或 nil（不处理，回退既有 T2/hostop 提案路径）。
+--- @param attempt table
+--- @param args table
+--- @param ctx table
+--- @param spec table
+--- @return Deferred|nil
+local function _maybe_systemd(attempt, args, ctx, spec)
+  if spec.effect ~= "process" then return nil end
+  local cfg = config_store.get("tools.sandbox.systemd") or {}
+  if cfg.enabled == false then return nil end
+  if type(args.command) ~= "string" or args.command == "" then return nil end
+  local systemd = require("NeoAI.sandbox.systemd")
+  local plan = systemd.parse_command(args.command)
+  if not plan or plan.route == "hostop" then return nil end
+
+  control.transition(attempt, "STAGING")
+  control.transition(attempt, "CANDIDATE_READY")
+  control.transition(attempt, "COMPLETED_READ_ONLY")
+
+  local out = async.Deferred.new()
+  local function _record(ok)
+    pcall(function()
+      evidence.add("privilege", {
+        tool = attempt.tool_name, command = args.command,
+        reasons = { "SYSTEMD_FACADE:" .. tostring(plan.verb) },
+        source = "observed", coverage = "full",
+      }, { tool = attempt.tool_name, command_id = attempt.command_id, attempt_id = attempt.attempt_id })
+    end)
+    pcall(function()
+      require("NeoAI.kernel.event_bus").emit(
+        require("NeoAI.kernel.events").SANDBOX_SYSTEMD_ROUTED, {
+          verb = plan.verb, units = plan.units, ok = ok, command_id = attempt.command_id,
+        })
+    end)
+    pcall(function()
+      require("NeoAI.sandbox.audit").observe({
+        kind = "process", tool = attempt.tool_name, level = 2,
+        reasons = { "SYSTEMD_FACADE" }, command_id = attempt.command_id,
+      })
+    end)
+  end
+
+  if plan.route == "reject" then
+    pcall(function()
+      require("NeoAI.kernel.event_bus").emit(
+        require("NeoAI.kernel.events").SANDBOX_SYSTEMD_UNSUPPORTED, {
+          verb = plan.verb, units = plan.units, command_id = attempt.command_id,
+        })
+    end)
+    _record(false)
+    out:resolve(systemd.reject_text(plan.verb))
+    return out
+  end
+
+  systemd.handle(plan):then_(function(text)
+    _record(true)
+    out:resolve(text)
+  end, function(err)
+    _record(false)
+    out:resolve(systemd.error_text(err))
+  end)
+  return out
+end
+
+--- 容器门面：docker/podman 等容器管理不触碰宿主机。
+--- 无守护进程运行时（podman/buildah）继续走既有 namespace 注入（容器在沙箱内）；
+--- 有守护进程运行时（docker/nerdctl）默认明确拒绝（不落宿主、不回退 hostop）。
+--- 返回 Deferred（已拒绝）或 nil（放行，交既有 container.plan/rewrite 处理）。
+--- @param attempt table
+--- @param args table
+--- @param ctx table
+--- @param spec table
+--- @return Deferred|nil
+local function _maybe_container(attempt, args, ctx, spec)
+  if spec.effect ~= "process" then return nil end
+  local cfg = config_store.get("tools.sandbox.container") or {}
+  if cfg.enabled == false then return nil end
+  if type(args.command) ~= "string" or args.command == "" then return nil end
+  local container = require("NeoAI.sandbox.container")
+  local plan = container.facade(args.command)
+  if not plan then return nil end
+  -- docker → podman 改写：改写在沙箱内执行，容器随沙箱 namespace 隔离。
+  if plan.mode == "sandbox" and plan.rewritten and plan.command then
+    args.command = plan.command
+    pcall(function()
+      require("NeoAI.kernel.event_bus").emit(
+        require("NeoAI.kernel.events").SANDBOX_CONTAINER_PLANNED, {
+          manager = plan.manager, original_manager = plan.original_manager, mode = "sandbox",
+          reason = "DOCKER_REWRITTEN_TO_PODMAN", command_id = attempt.command_id,
+        })
+    end)
+    return nil
+  end
+  if plan.mode ~= "unsupported" then return nil end
+
+  control.transition(attempt, "STAGING")
+  control.transition(attempt, "CANDIDATE_READY")
+  control.transition(attempt, "COMPLETED_READ_ONLY")
+  pcall(function()
+    require("NeoAI.kernel.event_bus").emit(
+      require("NeoAI.kernel.events").SANDBOX_CONTAINER_UNSUPPORTED, {
+        manager = plan.manager, sub = plan.sub, reason = plan.reason,
+        command_id = attempt.command_id,
+      })
+  end)
+  pcall(function()
+    require("NeoAI.sandbox.audit").observe({
+      kind = "container", tool = attempt.tool_name, level = 2,
+      reasons = { plan.reason }, command_id = attempt.command_id,
+    })
+  end)
+  return async.resolve(container.unsupported_text(plan))
+end
+
 -- ========== 公开 API ==========
 
 --- 执行门禁（内部实现）
@@ -1176,6 +1293,13 @@ local function _gate_inner(tool, args, ctx, call_original)
       control.transition(attempt, "FAILED")
       return async.reject({ kind = "sandbox", message = rt_err, command_id = attempt.command_id })
     end
+    -- systemctl/journalctl 门面：独立调用在沙箱内路由到长驻服务，不触碰宿主 systemd；
+    -- 门面不处理的动词/单元回退既有 T2/hostop 提案路径（见 docs/sandbox.md §5.1）。
+    local routed = _maybe_systemd(attempt, args, ctx, spec)
+    if routed then return routed end
+    -- 容器门面：docker 等依赖宿主 daemon 的运行时默认明确拒绝（不碰宿主）；podman 放行。
+    local blocked = _maybe_container(attempt, args, ctx, spec)
+    if blocked then return blocked end
     candidate.begin(attempt, root)
     -- 工具子进程（exec）可指定进程 cwd（通常取可写根公共父目录，避免遮蔽目录把 overlay 遮蔽）；
     -- 未指定时沿用当前工作目录。
@@ -1335,6 +1459,9 @@ local function _gate_inner(tool, args, ctx, call_original)
         for _, p in ipairs(extra_unmask or {}) do merged[#merged + 1] = p end
         eff_priv.unmask = merged
       end
+      -- 记录本次 attempt 的有效 unmask（档位提权 + 审批放行 + 可写根）：冻结阶段据此
+      -- 剔除「运行时实际未被遮蔽」的路径，避免把被放行的写入误判为遮蔽目标而整单元失败。
+      attempt.effective_unmask = eff_priv and eff_priv.unmask or nil
       local prefix, perr, eff_cwd = runtime.process_prefix({
         cwd = real_cwd, overlays = active_specs, fallback_cwd = staging,
         session_dir = session_dir, session_tmp_dir = proc_dir, privileges = eff_priv,

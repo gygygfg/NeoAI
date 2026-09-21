@@ -106,7 +106,9 @@ tool fold block; the fold title stays clean (no `⚠ 密钥` suffix) and the war
 The warning **names the exact command/tool and the key file it obtained or used**, e.g.
 `⚠ 密钥：run_command 执行 cat ~/.ssh/id_rsa 获取/使用了密钥（密钥文件：/root/.ssh/id_rsa）`; when the file cannot be
 determined it falls back to the secret type (named rule, e.g. `private_key`) → sensitive environment variable
-name → generic notice (see the secrets section of [sandbox.md](sandbox.md)). Moreover, for a tool call that
+name → generic notice (see the secrets section of [sandbox.md](sandbox.md)). A result that **merely mentions a
+sensitive env-var name** does not trigger a warning (the name is only a reference, no key content was read);
+only an env-var name in the **arguments** is reported as "used a secret". Moreover, for a tool call that
 contains a secret, its **arguments and result are shown in full (no 500-char truncation)** and the matched
 secret values (`NEOKEY_*` tokens and raw secrets matched by named rules) are highlighted inline with the same
 `NeoAISecretWarning` group (identical in `message_list` and trajectory mode).

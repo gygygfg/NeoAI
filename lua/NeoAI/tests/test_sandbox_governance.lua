@@ -123,6 +123,98 @@ tests.suite("sandbox_governance", function(_, it)
     end)
   end)
 
+  it("容器门面：podman 沙箱内、docker 默认拒绝、远程/宿主子命令拒绝", function(t)
+    local container = require("NeoAI.sandbox.container")
+    -- podman/buildah 无守护进程 → 沙箱内支持
+    t.eq("sandbox", container.facade("podman run ubuntu true").mode)
+    t.eq("sandbox", container.facade("buildah bud .").mode)
+    t.eq("sandbox", container.facade("sudo podman ps").mode, "应跳过 sudo 前缀")
+    -- docker/nerdctl 默认（docker.mode=off、无 podman）→ 明确拒绝
+    container._set_podman_available(false)
+    with_config({ tools = { sandbox = { container = { docker_to_podman = false } } } }, function()
+      local d0 = container.facade("docker run ubuntu true")
+      t.eq("unsupported", d0.mode)
+      t.eq("CONTAINER_REQUIRES_HOST_DAEMON", d0.reason)
+    end)
+    local d = container.facade("docker run ubuntu true")
+    t.eq("unsupported", d.mode)
+    t.eq("CONTAINER_PODMAN_UNAVAILABLE", d.reason, "无 podman 时应提示不可替代")
+    t.eq("unsupported", container.facade("nerdctl run ubuntu").mode)
+    container._set_podman_available(nil)
+    -- 远程/连接型与宿主 VM 子命令 → 拒绝
+    t.eq("CONTAINER_REMOTE_UNSUPPORTED", container.facade("podman --remote ps").reason)
+    t.eq("CONTAINER_REMOTE_UNSUPPORTED", container.facade("docker -H tcp://x ps").reason)
+    t.eq("CONTAINER_SUBCOMMAND_UNSUPPORTED", container.facade("podman machine ls").reason)
+    -- 非容器命令
+    t.nil_(container.facade("ls -la"))
+    -- 拒绝文案
+    t.matches("沙箱环境不支持", container.unsupported_text(d))
+    t.matches("podman", container.unsupported_text(d))
+    -- 显式受控 socket 时 docker 放行
+    local dir = vim.fn.tempname()
+    vim.fn.mkdir(dir, "p")
+    local sock = dir .. "/docker.sock"
+    local f = assert(io.open(sock, "w")); f:close()
+    with_config({ tools = { sandbox = { docker = { mode = "controlled", socket = sock } } } }, function()
+      local c = container.facade("docker ps")
+      t.eq("controlled", c.mode, "配置受控 socket 后应放行")
+    end)
+    vim.fn.delete(dir, "rf")
+  end)
+
+  it("容器门面：docker 改写为 podman（沙箱内），保留引号与参数", function(t)
+    local container = require("NeoAI.sandbox.container")
+    container._set_podman_available(true)
+    local p = container.facade("docker run -e \"A=b c\" ubuntu true")
+    t.eq("sandbox", p.mode)
+    t.true_(p.rewritten, "应标记改写")
+    t.eq("podman", p.manager)
+    t.eq("docker", p.original_manager)
+    t.matches("^podman run", p.command)
+    t.matches("\"A=b c\"", p.command, "应保留引号内空白与参数原文")
+    local c = container.facade("docker-compose up -d")
+    t.matches("^podman%-compose up", c.command)
+    local s = container.facade("sudo docker ps")
+    t.matches("podman", s.command)
+    -- 关闭改写则拒绝
+    with_config({ tools = { sandbox = { container = { docker_to_podman = false } } } }, function()
+      t.eq("unsupported", container.facade("docker ps").mode)
+    end)
+    -- 显式受控 socket 优先于改写
+    local dir = vim.fn.tempname()
+    vim.fn.mkdir(dir, "p")
+    local sock = dir .. "/docker.sock"
+    local f = assert(io.open(sock, "w")); f:close()
+    with_config({ tools = { sandbox = { docker = { mode = "controlled", socket = sock } } } }, function()
+      t.eq("controlled", container.facade("docker ps").mode)
+    end)
+    vim.fn.delete(dir, "rf")
+    container._set_podman_available(nil)
+  end)
+
+  it("容器门面：门禁拒绝 docker 且不落宿主机", function(t)
+    with_config({
+      tools = {
+        approval = { mode = "auto_allow" },
+        sandbox = {
+          enabled = true, fail_closed = true, mode = "dry_run", ephemeral_roots = {},
+          container = { enabled = true, docker_to_podman = false },
+          docker = { mode = "off" },
+        },
+      },
+    }, function()
+      require("NeoAI.sandbox").reset()
+      local done, err, text
+      require("NeoAI.tools").execute("run_command",
+        { command = "docker run ubuntu true", description = "t" }, {})
+        :then_(function(v) text = v; done = true end, function(e) err = e; done = true end)
+      t.true_(vim.wait(15000, function() return done end, 50), "应返回")
+      t.eq(nil, err, tostring(err and (err.message or err)))
+      t.matches("不支持", text or "")
+      t.matches("宿主机", text or "")
+    end)
+  end)
+
   it("行为审计：记录观测、累计风险分与异常", function(t)
     local audit = require("NeoAI.sandbox.audit")
     audit.reset()

@@ -173,6 +173,10 @@ M.SANDBOX_RISK_BLOCKED = "sandbox:risk_blocked"
 M.SANDBOX_AUDIT_OBSERVED = "sandbox:audit_observed"
 M.SANDBOX_AUDIT_ANOMALY = "sandbox:audit_anomaly"
 M.SANDBOX_CONTAINER_PLANNED = "sandbox:container_planned"
+M.SANDBOX_CONTAINER_UNSUPPORTED = "sandbox:container_unsupported"
+-- systemctl 门面：命令在沙箱内被路由到长驻服务 / 命中不支持语义
+M.SANDBOX_SYSTEMD_ROUTED = "sandbox:systemd_routed"
+M.SANDBOX_SYSTEMD_UNSUPPORTED = "sandbox:systemd_unsupported"
 
 -- ========== 计划蒸馏 ==========
 M.PLAN_DISTILL_STARTED = "plan_distill:started"

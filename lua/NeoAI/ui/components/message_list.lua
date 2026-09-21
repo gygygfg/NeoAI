@@ -392,10 +392,12 @@ local function _secret_warning_line(fn, result_msg)
   local paths = _secret_paths(args, fn.name)
   local cmd_kind = args and type(args.command) == "string" and _command_secret_kind(args.command) or nil
 
-  -- 获取：内核观测到密钥文件读取，或结果（模型上下文）含密钥值/token/环境变量名。
+  -- 获取：内核观测到密钥文件读取，或结果（模型上下文）含密钥值/token/具名规则命中的凭据。
+  -- 结果中**仅出现敏感环境变量名**（如 read_file 读到 `DASHSCOPE_API_KEY`）不算「获取密钥」——
+  -- 变量名只是引用，读取它不代表拿到了密钥内容；只有结果真正含密钥值/token 才告警。
   -- 使用：参数携带密钥值/token/环境变量名，或使用型命令（ssh/scp/curl/gpg…）引用密钥文件。
   -- 仅读取型命令引用密钥路径（如 read_file / cat 无密钥输出）不作为告警触发，避免误报。
-  local got = #observed > 0 or info_result.has or #names_result > 0
+  local got = #observed > 0 or info_result.has
   local used = info_args.has or #names_args > 0 or (#paths > 0 and cmd_kind == "use")
   if not (got or used) then return nil end
 

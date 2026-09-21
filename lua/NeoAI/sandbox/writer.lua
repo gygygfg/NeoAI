@@ -58,12 +58,17 @@ local function _root_op(action, path, content, mode)
 end
 
 --- 以非 root uid 执行文件操作的 shell 片段（内容经 stdin，路径经 argv，避免注入）。
+--- `binary=true` 时内容为 base64（见 `_input_for`）：`vim.fn.system` 的 String 入参不能含 NUL，
+--- 二进制内容必须 base64 传输后在目标端解码，避免 E976 / 截断损坏。
 --- @param action string
+--- @param binary boolean|nil
 --- @return string
-local function _nonroot_snippet(action)
+local function _nonroot_snippet(action, binary)
   if action == "write" then
     -- 保留原权限位：mkstemp/cat 默认 0600 会剥离可执行位（venv/bin 脚本等）。
-    return 'tmp="$1.tmp.$$"; umask 022; cat > "$tmp" && mv -f "$tmp" "$1" && { [ -n "$2" ] && chmod "$2" "$1" || true; }'
+    local reader = binary and "base64 -d" or "cat"
+    return 'tmp="$1.tmp.$$"; umask 022; ' .. reader
+      .. ' > "$tmp" && mv -f "$tmp" "$1" && { [ -n "$2" ] && chmod "$2" "$1" || true; }'
   elseif action == "delete" then
     return 'rm -f -- "$1"'
   elseif action == "mkdir" then
@@ -72,6 +77,29 @@ local function _nonroot_snippet(action)
     return 'rmdir -- "$1"'
   end
   return "exit 2"
+end
+
+--- 内容是否为二进制（含 NUL 或非法 UTF-8）：需 base64 传输，绝不当文本经 system() 传入。
+--- @param content string|nil
+--- @return boolean
+local function _is_binary_content(content)
+  if type(content) ~= "string" or content == "" then return false end
+  if content:find("\0", 1, true) then return true end
+  return not require("NeoAI.utils.stringx").is_valid_utf8(content)
+end
+
+--- 构造传给 `vim.fn.system` 的 stdin：write 时二进制走 base64，文本原样；其他动作 nil。
+--- @param action string
+--- @param content string|nil
+--- @return string|nil
+local function _input_for(action, content)
+  if action ~= "write" then return nil end
+  local c = content or ""
+  if _is_binary_content(c) then
+    if vim.base64 and vim.base64.encode then return vim.base64.encode(c) end
+    return require("NeoAI.utils.image").base64_encode(c)
+  end
+  return c
 end
 
 --- 以非 root 身份执行（经 setpriv 降权；仅 root 进程可调用）
@@ -86,11 +114,12 @@ local function _nonroot_op(action, path, content, uid, gid, mode)
   if vim.fn.executable("setpriv") ~= 1 then
     return false, "SETPRIV_UNAVAILABLE"
   end
+  local binary = action == "write" and _is_binary_content(content or "")
   local argv = {
     "setpriv", "--reuid", tostring(uid), "--regid", tostring(gid), "--clear-groups",
-    "sh", "-c", _nonroot_snippet(action), "sh", path, mode and string.format("%o", mode) or "",
+    "sh", "-c", _nonroot_snippet(action, binary), "sh", path, mode and string.format("%o", mode) or "",
   }
-  local out = vim.fn.system(argv, action == "write" and (content or "") or nil)
+  local out = vim.fn.system(argv, _input_for(action, content))
   if vim.v.shell_error == 0 then return true end
   return false, tostring(out)
 end
@@ -102,8 +131,9 @@ end
 --- @param mode number|nil
 --- @return boolean, string|nil
 function M.sudo_op(action, path, content, mode)
-  local argv = { "sudo", "sh", "-c", _nonroot_snippet(action), "sh", path, mode and string.format("%o", mode) or "" }
-  local out = vim.fn.system(argv, action == "write" and (content or "") or nil)
+  local binary = action == "write" and _is_binary_content(content or "")
+  local argv = { "sudo", "sh", "-c", _nonroot_snippet(action, binary), "sh", path, mode and string.format("%o", mode) or "" }
+  local out = vim.fn.system(argv, _input_for(action, content))
   if vim.v.shell_error == 0 then return true end
   return false, tostring(out)
 end

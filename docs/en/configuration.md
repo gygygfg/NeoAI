@@ -353,6 +353,20 @@ sandbox = {
     max_log_bytes = 262144,  -- per-service log ring-buffer cap (bytes)
     stop_timeout_ms = 5000,  -- max wait for graceful exit on stop (SIGKILL after)
   },
+  -- systemctl facade (option A): standalone `systemctl`/`journalctl` calls from the AI are routed
+  -- to in-sandbox long-lived services (reusing sandbox.service); the host systemd is never called
+  -- and the host is never modified. Supports simple/exec/oneshot and Requires/Wants/After/Before
+  -- dependencies; Type=notify/forking/dbus and socket/timer units fail explicitly; verbs the facade
+  -- does not handle fall back to the existing T2/hostop proposal path.
+  systemd = {
+    enabled = true,          -- master switch
+    mode = "facade",         -- facade (default): handled inside the sandbox
+    max_deps = 32,           -- per-call dependency-closure cap (guards against cycles/huge graphs)
+    unit_roots = {           -- unit-file search dirs (sandbox staging copy first, then real file)
+      "/etc/systemd/system", "/run/systemd/system",
+      "/usr/lib/systemd/system", "/lib/systemd/system",
+    },
+  },
   network = {
     enabled = false, allowed_endpoints = {}, budget_bytes = 0, -- controlled network gateway
     -- Intercept access to the host itself (loopback/host NIC IPs/link-local/cloud metadata; on by
@@ -410,19 +424,26 @@ sandbox = {
       { tier = 1, name = "package", bins = { "apt", "apt-get", "dnf", "yum", "pacman", "apk", "brew" } }, -- package install: extra rules
     },
   },
-  -- Controlled docker: never binds the host /var/run/docker.sock; controlled points at an external controlled socket.
-  docker = { mode = "controlled", socket = "/run/neoai-docker/docker.sock" }, -- off | controlled | host
-  -- Controlled containers: daemonless runtimes (podman) get --net/pid/ipc/uts=host to share the
-  -- sandbox namespace; docker relies on an external daemon and cannot share, so the controlled
-  -- socket scheme is kept and the reason is recorded.
-  container = { enabled = true, share_namespace = true, prefer = "podman" },
+  -- Container facade: docker/nerdctl need a host daemon, so the default is off (explicitly reported as
+  -- "unsupported in the sandbox", never touching the host). Set to controlled with a socket (rootless /
+  -- socket-proxy / dind) to allow a controlled socket explicitly.
+  docker = { mode = "off", socket = "" }, -- off | controlled
+  -- Container facade: daemonless runtimes (podman/buildah) get --net/pid/ipc/uts=host to share the
+  -- sandbox namespace and run containers inside the sandbox; docker/docker-compose are rewritten to
+  -- podman/podman-compose inside the sandbox by default (docker_to_podman=false rejects them); nerdctl
+  -- is rejected by default.
+  container = { enabled = true, share_namespace = true, prefer = "podman", docker_to_podman = true },
   -- Store base root: each process is isolated under <workspace_root>/instances/<pid>_<ts>; pending queue/candidates are not shared across sessions.
   workspace_root = vim.fn.stdpath("cache") .. "/NeoAI/sandbox",
   session_shell = true,            -- persist shell state (export/cd) across run_command within a session (bwrap only)
   process_roots = {},              -- extra writable roots (only when read_all=false or the whole-root overlay is unavailable; overlaid, default cwd only, auto-added). With read_all=true (default) the whole root is already a writable overlay, so this is unnecessary. /tmp, /var/tmp belong to tmpfs_roots; add explicitly if needed
   overlay_fail_closed = true,      -- reject process tools when overlay is unavailable (no private-cwd downgrade); set false to allow degraded execution
   -- Async review: candidates enter a pending queue. session_auto_approve auto-applies L0/L1.
-  -- l3_warning: L3 (critical) items require second confirmation (AI consequence warning + auto diff; apply only after re-confirming).
+  -- l3_warning: high-risk items require second confirmation (AI consequence warning + auto diff; apply only after re-confirming).
+  --   L3 (critical) always triggers; with package_confirm=true, L2 package/sensitive installs (apt-key,
+  --   gpg --import, repo changes, etc.) also trigger; safe installs (L1) still need one confirmation.
+  --   The confirm window title is level-aware and the key hint is highlighted; dropped masked/volatile
+  --   files are reported in the warning block as "N will be skipped".
   -- ai_audit: press `a` (configurable key) in the review UI to hand the user messages + structured
   --           text of risk-graded pending changes to the model, which returns a ≤50-char note for
   --           **every** item (file / host command) starting with a safe/unsafe verdict (rendered
@@ -433,7 +454,7 @@ sandbox = {
   --           max_concurrent (default 10; excess in-flight requests queue FIFO) avoids a request
   --           storm when auto fires frequently.
   review = { enabled = true, auto_apply = false, session_auto_approve = false,
-             l3_warning = { enabled = true, max_tokens = 256, timeout_ms = 15000 },
+             l3_warning = { enabled = true, package_confirm = true, max_tokens = 256, timeout_ms = 15000 },
              ai_audit = { enabled = true, auto = false, key = "a", max_concurrent = 10,
                           max_diff_chars = 8000, max_user_chars = 4000, max_total_chars = 60000,
                           max_tokens = 2048, timeout_ms = 30000 } },
@@ -467,6 +488,7 @@ sandbox = {
     mode = "review", -- review (safe installs need confirmation but cap at moderate L1; sensitive installs touching repos/keys stay L2) | allow | deny
     managers = { "apt", "apt-get", "pip", "pip3", "uv", "conda", "npm", "npx", "pnpm", "yarn", "go", "cargo", "gem", "composer" }, -- package-manager names (command recognition); path signatures via privilege.package_path_manager; sensitive-install detection via privilege.package_sensitive
     roots = { "/usr", "/var", "/etc", "~/.cache", "~/.npm", "~/.nvm", "~/.cargo", "~/.rustup", "~/go", "~/.local" }, -- package-install writable roots (overlay staging). /etc lets dpkg postinst write /etc/ld.so.cache etc.; sensitive entries stay masked by mask_paths
+    volatile_paths = { "/var/lib/apt/lists", "/var/cache/apt", "/var/cache/dnf", "/var/cache/yum", "/var/cache/pacman/pkg", "/var/cache/apk", "~/.cache/pip", "~/.cache/uv", "~/.npm/_cacache", "~/.cache/yarn", "~/.cargo/registry/cache", "~/.cache/go-build" }, -- volatile package indexes/caches: skipped when freezing a candidate (not queued, not published) so an apt-update baseline change cannot fail the whole install with BASELINE_CHANGED; the install is unaffected (dpkg/status, package files still apply); {} disables. Do not add state files like /var/lib/dpkg/status
     cap_add = { "CAP_DAC_OVERRIDE", "CAP_CHOWN", "CAP_SETUID", "CAP_SETGID", "CAP_FOWNER" },
     apt_sandbox_user = "root", -- apt family: injects APT::Sandbox::User (default "root" disables apt's own `_apt` privilege drop, avoiding setgroups EPERM in nested userns/restricted containers that makes apt update/install fail); "_apt" or empty keeps apt defaults
   },

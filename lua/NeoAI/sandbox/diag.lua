@@ -203,8 +203,11 @@ function M.sandbox_limits()
   local parent = root .. "/neoai"
   out.neoai_cpu_max = _read(parent .. "/cpu.max")
   out.neoai_memory_max = _read(parent .. "/memory.max")
-  -- 系统d 探测：PID1 非 systemd 时 systemctl 不可用。
+  -- 系统d 探测：PID1 非 systemd 时宿主 systemctl 不可用。
   out.systemd = out.pid1 == "systemd"
+  -- systemctl 门面（方案 A）：独立调用在沙箱内路由到长驻服务，不依赖宿主 systemd。
+  local ok_sd, sd = pcall(require, "NeoAI.sandbox.systemd")
+  if ok_sd and sd then out.systemd_facade = sd.describe() end
   -- 已解析的沙箱限制。
   local ok_c, cgroup = pcall(require, "NeoAI.sandbox.cgroup")
   if ok_c and cgroup then

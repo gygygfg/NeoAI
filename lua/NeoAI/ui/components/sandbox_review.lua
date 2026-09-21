@@ -40,6 +40,8 @@ local LEGEND = "级别：工作区(绿) 用户目录(黄) 系统(红)  风险：
 
 -- L3 后果警告高亮组（diff 预览顶部）
 local L3_WARN_HL = "NeoAISandboxReviewL3Warning"
+-- 二次确认弹窗的按键提示高亮组
+local HINT_HL = "NeoAISandboxReviewConfirmHint"
 
 -- ========== 私有状态 ==========
 
@@ -95,6 +97,7 @@ local function _ensure_hl()
   vim.api.nvim_set_hl(0, LEVEL_HL.verdict_safe, { default = true, fg = "#98c379", bold = true })
   vim.api.nvim_set_hl(0, LEVEL_HL.verdict_unsafe, { default = true, fg = "#ff5555", bold = true })
   vim.api.nvim_set_hl(0, L3_WARN_HL, { default = true, fg = "#ff5555", bold = true })
+  vim.api.nvim_set_hl(0, HINT_HL, { default = true, fg = "#56b6c2", bold = true })
 end
 
 --- 安全级别 -> 高亮键
@@ -567,15 +570,31 @@ local function _apply_target(target, ok_msg, fail_msg)
   end
 end
 
---- L3 二次确认门禁是否开启
+--- 二次确认门禁是否开启
 --- @return boolean
 local function _l3_gate_enabled()
   local config_store = require("NeoAI.kernel.config_store")
   return config_store.get("tools.sandbox.review.l3_warning.enabled") ~= false
 end
 
+--- 该条目是否需要「AI 后果警告 + 二次确认」。
+--- L3（critical）恒需；L2 的包安装/敏感安装由 `l3_warning.package_confirm` 控制（默认开）。
+--- @param item table|nil
+--- @return boolean
+local function _needs_confirm(item)
+  if not item or not _l3_gate_enabled() then return false end
+  local level = tonumber(item.risk_level) or 0
+  if level >= 3 then return true end
+  if item.package and level >= 2 then
+    local config_store = require("NeoAI.kernel.config_store")
+    if config_store.get("tools.sandbox.review.l3_warning.package_confirm") == false then return false end
+    return true
+  end
+  return false
+end
+
 --- 应用光标所在文件（审批单位为单个文件）。
---- L3（critical）条目首次 <CR> 不直接应用：由 AI 生成后果警告并自动打开 diff，
+--- 高危条目（L3 或 L2 包/敏感安装）首次 <CR> 不直接应用：由 AI 生成后果警告并自动打开 diff，
 --- 用户在 diff 内再次确认后才真正应用（q/Esc 取消）。
 local function _apply_current()
   local target = state.line_to_target[vim.api.nvim_win_get_cursor(0)[1]]
@@ -599,7 +618,7 @@ local function _apply_current()
   -- 整单元（头行）：一次应用该变更单元的全部文件（包安装按安装命令合并，整包一次审批）。
   local item = _find_item(target.change_set_id)
   if target.whole then
-    if _l3_gate_enabled() and item and (tonumber(item.risk_level) or 0) >= 3 then
+    if _needs_confirm(item) then
       _open_l3_confirm(target, item)
       return
     end
@@ -612,8 +631,8 @@ local function _apply_current()
     vim.notify("[NeoAI] 请将光标移到要应用的文件行", vim.log.levels.WARN)
     return
   end
-  -- L3 二次确认门禁
-  if _l3_gate_enabled() and item and (tonumber(item.risk_level) or 0) >= 3 then
+  -- 高危二次确认门禁
+  if _needs_confirm(item) then
     _open_l3_confirm(target, item)
     return
   end
@@ -858,40 +877,56 @@ local function _wrap(s, width)
   return out
 end
 
---- 构造 L3 警告区行（含标题；pending 时显示占位）
+--- 构造二次确认警告区行（含标题；pending 时显示占位）。
+--- 标题按风险级别区分（L3 严重 / L2 高危）；若冻结时剔除了不可发布文件，追加说明行。
 --- @param text string|nil
 --- @param pending boolean
 --- @param width number
+--- @param meta table|nil { level?: number, dropped?: { masked?: number, volatile?: number } }
 --- @return table
-local function _warning_lines(text, pending, width)
-  local out = { "⚠ L3 严重风险操作 — 后果警告" }
+local function _warning_lines(text, pending, width, meta)
+  meta = meta or {}
+  local level = tonumber(meta.level) or 3
+  local label = level >= 3 and "L3 严重" or "L2 高危"
+  local out = { ("⚠ %s风险操作 — 后果警告"):format(label) }
   if pending then
     out[#out + 1] = "（正在生成后果警告…）"
     return out
   end
   if type(text) ~= "string" or text:gsub("%s", "") == "" then
     out[#out + 1] = "（无警告内容）"
-    return out
-  end
-  for _, para in ipairs(vim.split(text, "\n", { plain = true })) do
-    if para == "" then
-      out[#out + 1] = ""
-    else
-      for _, l in ipairs(_wrap(para, width)) do out[#out + 1] = l end
+  else
+    for _, para in ipairs(vim.split(text, "\n", { plain = true })) do
+      if para == "" then
+        out[#out + 1] = ""
+      else
+        for _, l in ipairs(_wrap(para, width)) do out[#out + 1] = l end
+      end
     end
+  end
+  local dropped = meta.dropped
+  local n = 0
+  if type(dropped) == "table" then n = (dropped.masked or 0) + (dropped.volatile or 0) end
+  if n > 0 then
+    out[#out + 1] = ""
+    out[#out + 1] = ("ℹ 将跳过 %d 个遮蔽/缓存文件（不写入宿主）"):format(n)
   end
   return out
 end
 
---- 为 L3 警告区着色
+--- 为二次确认警告区着色：标题行用红色警示，跳过说明行用暗灰，其余正文保持默认。
 --- @param buf number
 --- @param ns number
 --- @param start0 number|nil 0-based 起始行
 --- @param count number|nil 行数
-local function _paint_warning(buf, ns, start0, count)
+--- @param lines table|nil 完整缓冲区行（1-based），用于区分说明行
+local function _paint_warning(buf, ns, start0, count, lines)
   if start0 == nil or count == nil then return end
   for i = 0, count - 1 do
-    pcall(vim.api.nvim_buf_add_highlight, buf, ns, L3_WARN_HL, start0 + i, 0, -1)
+    local hl = L3_WARN_HL
+    local l = lines and lines[start0 + i + 1]
+    if type(l) == "string" and l:sub(1, 3) == "ℹ" then hl = LEVEL_HL.note end
+    pcall(vim.api.nvim_buf_add_highlight, buf, ns, hl, start0 + i, 0, -1)
   end
 end
 
@@ -901,14 +936,14 @@ local function _set_diff_warning(text)
   local d = state.diff
   if not d or not d.buf or not vim.api.nvim_buf_is_valid(d.buf) then return end
   if d.mode ~= "l3_confirm" or d.warn_start == nil then return end
-  local wl = _warning_lines(text, false, (d.width or 80) - 4)
+  local wl = _warning_lines(text, false, (d.width or 80) - 4, d.warn_meta)
   vim.bo[d.buf].modifiable = true
   vim.api.nvim_buf_set_lines(d.buf, d.warn_start, d.warn_end, false, wl)
   vim.bo[d.buf].modifiable = false
   d.warn_end = d.warn_start + #wl
   local lines = vim.api.nvim_buf_get_lines(d.buf, 0, -1, false)
   vim.api.nvim_buf_clear_namespace(d.buf, d.ns, 0, -1)
-  _paint_warning(d.buf, d.ns, d.warn_start, #wl)
+  _paint_warning(d.buf, d.ns, d.warn_start, #wl, lines)
   _paint_diff(d.buf, d.ns, lines, d.diff_start)
 end
 
@@ -935,14 +970,17 @@ local function _preview_data(target, item)
   return string.format("%s · %s · %s", action, _risk_label(level), target.path), before, after
 end
 
---- 打开 diff 预览窗口（可选 L3 二次确认模式）
+--- 打开 diff 预览窗口（可选二次确认模式）
 --- @param target table
 --- @param item table
 --- @param opts table|nil { mode?, on_confirm?, warning?, pending? }
 local function _open_diff(target, item, opts)
   opts = opts or {}
   local mode = opts.mode or "preview"
+  local is_confirm = (mode == "l3_confirm")
   local title, before, after = _preview_data(target, item)
+  local level = tonumber(item and item.risk_level) or 0
+  local confirm_title = level >= 3 and "⚠ L3 严重 · 确认应用" or "⚠ L2 高危 · 确认应用"
 
   -- 暂时关闭审批窗（保留光标/几何，关闭 diff 后自动重开并恢复光标）
   state.suspended = true
@@ -950,19 +988,20 @@ local function _open_diff(target, item, opts)
 
   local width = math.min(120, vim.o.columns - 8)
   local lines = {
-    ("%s  %s"):format(mode == "l3_confirm" and "确认应用" or "修改预览", _one_line(title)),
+    ("%s  %s"):format(is_confirm and "确认应用" or "修改预览", _one_line(title)),
   }
-  if mode == "l3_confirm" then
-    lines[#lines + 1] = "<CR> 确认应用    q/Esc 取消    （+ 新增  - 删除）"
+  if is_confirm then
+    lines[#lines + 1] = "<CR> 确认应用    q / Esc 取消    （+ 新增  - 删除）"
   else
-    lines[#lines + 1] = "q/Esc 返回审批    （+ 新增  - 删除）"
+    lines[#lines + 1] = "q / Esc 返回审批    （+ 新增  - 删除）"
   end
   lines[#lines + 1] = ""
 
-  local warn_start, warn_end
-  if mode == "l3_confirm" then
+  local warn_start, warn_end, warn_meta
+  if is_confirm then
+    warn_meta = { level = level, dropped = item and item.dropped }
     warn_start = #lines -- 0-based 起始（当前已有行数）
-    local wl = _warning_lines(opts.warning, opts.pending == true, width - 4)
+    local wl = _warning_lines(opts.warning, opts.pending == true, width - 4, warn_meta)
     for _, l in ipairs(wl) do lines[#lines + 1] = l end
     warn_end = #lines
     lines[#lines + 1] = ""
@@ -975,8 +1014,10 @@ local function _open_diff(target, item, opts)
   vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
   vim.bo[buf].modifiable = false
   local ns = vim.api.nvim_create_namespace("NeoAISandboxDiff")
-  _paint_warning(buf, ns, warn_start, warn_end and (warn_end - (warn_start or 0)) or nil)
+  _paint_warning(buf, ns, warn_start, warn_end and (warn_end - (warn_start or 0)) or nil, lines)
   _paint_diff(buf, ns, lines, diff_start)
+  -- 按键提示行高亮，使确认/取消操作更醒目。
+  pcall(vim.api.nvim_buf_add_highlight, buf, ns, HINT_HL, 1, 0, -1)
 
   local height = math.min(30, vim.o.lines - 6)
   local win = vim.api.nvim_open_win(buf, true, {
@@ -987,13 +1028,14 @@ local function _open_diff(target, item, opts)
     row = math.floor((vim.o.lines - height) / 2),
     style = "minimal",
     border = "rounded",
-    title = mode == "l3_confirm" and "⚠ L3 确认应用" or "🔍 修改预览",
+    title = is_confirm and confirm_title or "🔍 修改预览",
     title_pos = "center",
   })
   vim.wo[win].wrap = true
+  vim.wo[win].linebreak = true
   vim.keymap.set("n", "q", function() _close_diff() end, { buffer = buf })
   vim.keymap.set("n", "<Esc>", function() _close_diff() end, { buffer = buf })
-  if mode == "l3_confirm" and opts.on_confirm then
+  if is_confirm and opts.on_confirm then
     vim.keymap.set("n", "<CR>", function() opts.on_confirm() end, { buffer = buf })
   end
   vim.api.nvim_create_autocmd("BufWipeout", {
@@ -1002,6 +1044,7 @@ local function _open_diff(target, item, opts)
   state.diff = {
     win = win, buf = buf, ns = ns, mode = mode,
     warn_start = warn_start, warn_end = warn_end, diff_start = diff_start, width = width,
+    warn_meta = warn_meta,
   }
 end
 

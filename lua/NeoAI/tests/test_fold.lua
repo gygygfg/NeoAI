@@ -116,6 +116,21 @@ tests.suite("fold", function(_, it)
     t.matches("密钥文件：/root/%.ssh/id_rsa", ssh or "", "应指明密钥文件")
   end)
 
+  it("密钥警告行：结果仅含环境变量名不告警，含密钥内容才告警", function(t)
+    local ml = require("NeoAI.ui.components.message_list")
+    local line = ml.helpers.secret_warning_line
+    -- 仅读到敏感环境变量名（无密钥值/token）→ 不算「获取密钥」，不告警。
+    t.eq(nil, line(
+      { name = "read_file", arguments = '{"filepath":"/root/RAG/1.py"}' },
+      { role = "tool", content = "DASHSCOPE_API_KEY = os.getenv('DASHSCOPE_API_KEY')" }),
+      "仅读到环境变量名不应告警")
+    -- 读到环境变量内容（被沙箱 token 化）→ 告警「获取」。
+    local got = line(
+      { name = "read_file", arguments = '{"filepath":"/root/.env"}' },
+      { role = "tool", content = '{"output":"DASHSCOPE_API_KEY=NEOKEY_deadbeef01"}' })
+    t.matches("获取了密钥", got or "", "读到环境变量内容应告警")
+  end)
+
   it("观测到的普通系统文件/历史不告警，真正凭据文件才告警", function(t)
     local ml = require("NeoAI.ui.components.message_list")
     local line = ml.helpers.secret_warning_line

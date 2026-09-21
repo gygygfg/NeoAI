@@ -96,14 +96,15 @@ end
 local function _build(svc, opts)
   local cfg = _cfg()
   local sandbox_cfg = config_store.get("tools.sandbox") or {}
+  local base_cwd = opts.workdir or opts.cwd or vim.fn.getcwd()
   local roots = {}
-  for _, r in ipairs(opts.writable_roots or { svc.cwd }) do
+  for _, r in ipairs(opts.writable_roots or { base_cwd }) do
     if type(r) == "string" and r ~= "" then
       pcall(vim.fn.mkdir, r, "p")
       if vim.fn.isdirectory(r) == 1 then roots[#roots + 1] = (r:gsub("/+$", "")) end
     end
   end
-  local real_cwd = opts.cwd or (roots[1] or vim.fn.getcwd())
+  local real_cwd = opts.workdir or opts.cwd or (roots[1] or vim.fn.getcwd())
   svc.cwd = real_cwd
   svc.roots = roots
   local svc_dir = _services_root() .. "/" .. svc.id
@@ -152,7 +153,13 @@ local function _build(svc, opts)
   full[#full + 1] = _shell_bin()
   full[#full + 1] = "-c"
   full[#full + 1] = command
-  svc.env = runtime.sandbox_env(priv)
+  svc.env = runtime.sandbox_env(priv) or {}
+  -- systemctl 门面等调用方可注入单元 Environment= 变量（覆盖沙箱环境同名项）。
+  if type(opts.env) == "table" then
+    for k, v in pairs(opts.env) do
+      if type(k) == "string" and v ~= nil then svc.env[k] = tostring(v) end
+    end
+  end
   return full, nil
 end
 
@@ -177,6 +184,7 @@ function M.start(name, command, opts)
   local id = string.format("svc_%d_%d", os.time(), state.seq)
   local svc = {
     id = id, name = name, command = command,
+    unit = opts.unit,
     logs = {}, log_bytes = 0,
     started_at = os.time(), status = "starting", exit_code = nil,
   }
@@ -238,7 +246,7 @@ function M.status(key)
   return {
     id = svc.id, name = svc.name, status = svc.status, exit_code = svc.exit_code,
     pid = svc.job, cwd = svc.cwd, started_at = svc.started_at, stopped_at = svc.stopped_at,
-    log_bytes = svc.log_bytes, command = svc.command,
+    log_bytes = svc.log_bytes, command = svc.command, unit = svc.unit,
   }
 end
 

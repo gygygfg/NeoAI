@@ -448,6 +448,7 @@ lsp_tools.lsp_rename = helpers.define_tool(
         for _, ch in ipairs(changes) do
           pcall(vim.api.nvim_buf_set_text, b, ch.range.start.line, ch.range.start.character, ch.range["end"].line, ch.range["end"].character, vim.split(ch.newText, "\n", { plain = true }))
         end
+        helpers.mark_edited(b) -- 显式编辑：允许回写（只读加载/同步不标记、不回写）
         local saved, err = helpers.persist_buffer(b)
         if not saved then error("重命名失败：无法保存文件 " .. vim.uri_to_fname(uri) .. " (" .. tostring(err) .. ")") end
         changed = changed + 1
@@ -475,6 +476,7 @@ lsp_tools.lsp_format = helpers.define_tool(
         for _, e in ipairs(edits) do
           pcall(vim.api.nvim_buf_set_text, bufnr, e.range.start.line, e.range.start.character, e.range["end"].line, e.range["end"].character, vim.split(e.newText, "\n", { plain = true }))
         end
+        helpers.mark_edited(bufnr) -- 显式编辑：允许回写（只读加载路径不标记、不回写）
         local saved, err = helpers.persist_buffer(bufnr)
         if not saved then error("格式化失败：无法保存文件（" .. tostring(err) .. "）") end
         return "格式化完成"

@@ -31,6 +31,7 @@ local state = {
   materialized = {},
   version = 0, -- 暂存版本计数器：每次新增/编辑/删除/合并暂存项时递增
   rotation = nil, -- 会话轮换的在途迁移（Deferred）；暂存访问前经 `_await_rotation` 等待完成
+  volatile_cache = nil, -- { cfg = <配置引用>, fn = function } 易变包缓存匹配器缓存
 }
 
 --- 递增暂存版本（每次暂存内容变化时调用）
@@ -82,6 +83,17 @@ local function _read(path)
   local content = f:read("*a")
   f:close()
   return content
+end
+
+--- 内容是否可安全当文本处理：合法 UTF-8 且不含 NUL。
+--- 二进制（keyring/图片/可执行文件等）返回 false——绝不对其做密钥 token 化或 UTF-8 清洗，
+--- 否则会把二进制当文本处理而损坏（如 OpenPGP keyring 被替换字符破坏）。
+--- @param content string|nil
+--- @return boolean
+local function _is_text_content(content)
+  if type(content) ~= "string" or content == "" then return true end
+  if content:find("\0", 1, true) then return false end
+  return require("NeoAI.utils.stringx").is_valid_utf8(content)
 end
 
 --- 当前沙箱会话的暂存目录
@@ -377,8 +389,12 @@ local function _base_entry(attempt, real)
     if c ~= nil then
       local secret = require("NeoAI.sandbox.secret")
       -- 高熵扫描仅对疑似密钥文件启用，避免对普通文件全文做熵计算（具名规则仍始终生效）。
-      local tok = secret.tokenize(c, { entropy = secret.is_secret_path(real) })
-      if tok ~= c then fs.write_file(staged, tok) end
+      -- 二进制内容（keyring 等）跳过 token 化：绝不当文本处理。
+      local tok = c
+      if _is_text_content(c) then
+        tok = secret.tokenize(c, { entropy = secret.is_secret_path(real) })
+        if tok ~= c then fs.write_file(staged, tok) end
+      end
       view_base_hash = _sha(tok)
     end
   end
@@ -831,7 +847,7 @@ function M.merge_candidate(cand, opts)
       -- 包/生成内容（site-packages、node_modules 等）不做 token 化：与结算阶段跳过密钥
       -- 检测一致，避免对 venv/依赖树逐文件多次全文扫描（实测数十 MB 需数秒）。
       local content = f.content or ""
-      if not opts.package then
+      if not opts.package and _is_text_content(content) then
         local secret = require("NeoAI.sandbox.secret")
         content = secret.tokenize(content, { entropy = secret.is_secret_path(f.path) })
       end
@@ -863,29 +879,35 @@ end
 function M.merge_candidate_async(cand, opts)
   opts = opts or {}
   local files = cand and cand.files or {}
-  local texts, entropy_flags = {}, {}
+  local texts, entropy_flags, text_files = {}, {}, {}
   local secret = require("NeoAI.sandbox.secret")
   for _, f in ipairs(files) do
     if f.action == "create" or f.action == "modify" then
-      texts[#texts + 1] = f.content or ""
-      -- 仅疑似密钥文件做高熵扫描（具名规则始终生效）。
-      entropy_flags[#entropy_flags + 1] = secret.is_secret_path(f.path)
+      -- 仅文本内容做 token 化；二进制（keyring 等）绝不当文本处理。
+      if _is_text_content(f.content) then
+        texts[#texts + 1] = f.content or ""
+        -- 仅疑似密钥文件做高熵扫描（具名规则始终生效）。
+        entropy_flags[#entropy_flags + 1] = secret.is_secret_path(f.path)
+        text_files[#text_files + 1] = f
+      end
     end
   end
   --- 写暂存副本：写入（含内容）经线程池批量完成，主线程只登记映射与 fresh 签名。
   --- 删除/建目录仍在主线程（数量少、无内容）。
-  --- @param tokenized table|nil
+  --- @param tokenized table|nil 与 text_files 等长的 token 化结果；nil/空表示不做 token 化
   --- @return Deferred resolve(cand)
   local function apply_async(tokenized)
-    local ti = 0
+    local tok_of = {}
+    if tokenized then
+      for i, f in ipairs(text_files) do tok_of[f] = tokenized[i] end
+    end
     local writes = {}
     for _, f in ipairs(files) do
       local staged = _workspace_path(f.path)
       state.staged_to_real[staged] = f.path
       if f.action == "create" or f.action == "modify" then
-        ti = ti + 1
         writes[#writes + 1] = {
-          path = staged, mode = f.mode, content = tokenized[ti] or (f.content or ""),
+          path = staged, mode = f.mode, content = tok_of[f] or (f.content or ""),
         }
         state.workspace[f.path] = {
           staged = staged, base_hash = f.before_hash, deleted = false, mode = f.mode,
@@ -966,11 +988,11 @@ function M.merge_candidate_async(cand, opts)
     end)
   end
   if #texts == 0 then
-    return apply_async({})
+    return apply_async(nil)
   end
   -- 包/生成内容跳过 token 化（与结算阶段跳过密钥检测一致）。
   if opts.package then
-    return apply_async(texts)
+    return apply_async(nil)
   end
   return secret.tokenize_many_async(texts, { entropy_flags = entropy_flags }):then_(function(tokenized)
     return apply_async(tokenized)
@@ -1640,6 +1662,94 @@ function M.persist_target(real_path)
   return M.stage_path(active.attempt_id, real), active.attempt_id
 end
 
+-- ========== 冻结前剔除「不可发布」文件 ==========
+-- 目的：避免整单元因个别文件无法发布而失败——运行时被遮蔽的路径（发布硬拒绝）与
+-- 包管理器易变索引/缓存（CAS 基线冲突）都不应阻塞其余文件的正常应用。
+
+--- 易变包索引/缓存匹配器（配置 `tools.sandbox.packages.volatile_paths`，支持 `~` 与 glob）。
+--- 结果按配置引用缓存；配置变更时自动重建。
+--- @return function(path) -> boolean
+local function _volatile_matcher()
+  local cfg = require("NeoAI.kernel.config_store").get("tools.sandbox.packages") or {}
+  local list = cfg.volatile_paths
+  if state.volatile_cache and state.volatile_cache.cfg == list then return state.volatile_cache.fn end
+  local roots = {}
+  if type(list) == "table" then
+    for _, p in ipairs(list) do
+      if type(p) == "string" and p ~= "" and p ~= "/" then
+        p = vim.fn.expand(p):gsub("/+$", "")
+        if p ~= "" and p ~= "/" then
+          if p:find("[*?[]") then
+            local okg, matches = pcall(vim.fn.glob, p, false, true)
+            if okg and type(matches) == "table" then
+              for _, m in ipairs(matches) do
+                m = m:gsub("/+$", "")
+                if m ~= "" and m ~= "/" then roots[#roots + 1] = m end
+              end
+            end
+          else
+            roots[#roots + 1] = p
+          end
+        end
+      end
+    end
+  end
+  local function under(p, r) return p == r or p:sub(1, #r + 1) == r .. "/" end
+  local fn = function(path)
+    if type(path) ~= "string" or path == "" then return false end
+    for _, r in ipairs(roots) do if under(path, r) then return true end end
+    return false
+  end
+  state.volatile_cache = { cfg = list, fn = fn }
+  return fn
+end
+
+--- 候选是否由包管理器产生（命令判定或路径特征），决定是否套用易变缓存过滤。
+--- @param files table
+--- @param attempt table|nil 控制层 attempt
+--- @return boolean
+local function _is_package_candidate(files, attempt)
+  if attempt and attempt.package == true then return true end
+  local ok, privilege = pcall(require, "NeoAI.sandbox.privilege")
+  if not ok or type(privilege.package_path_manager) ~= "function" then return false end
+  for _, f in ipairs(files or {}) do
+    if privilege.package_path_manager(f.path) then return true end
+  end
+  return false
+end
+
+--- 剔除命中「有效遮蔽」与「易变包索引/缓存」的文件。
+--- @param files table
+--- @param attempt table|nil 控制层 attempt（含 effective_unmask / package）
+--- @return table files 过滤后的文件
+--- @return table dropped { masked=number, volatile=number, masked_paths=table, volatile_paths=table }
+local function _filter_unpublishable(files, attempt)
+  local runtime = require("NeoAI.sandbox.runtime")
+  local unmask = attempt and attempt.effective_unmask or nil
+  local is_pkg = _is_package_candidate(files, attempt)
+  local volatile = is_pkg and _volatile_matcher() or nil
+  local out = {}
+  local dropped = { masked = 0, volatile = 0, masked_paths = {}, volatile_paths = {} }
+  for _, f in ipairs(files) do
+    if runtime.is_masked_path(f.path, unmask) then
+      dropped.masked = dropped.masked + 1
+      if #dropped.masked_paths < 20 then dropped.masked_paths[#dropped.masked_paths + 1] = f.path end
+    elseif volatile and volatile(f.path) then
+      dropped.volatile = dropped.volatile + 1
+      if #dropped.volatile_paths < 20 then dropped.volatile_paths[#dropped.volatile_paths + 1] = f.path end
+    else
+      out[#out + 1] = f
+    end
+  end
+  if dropped.masked > 0 or dropped.volatile > 0 then
+    pcall(function()
+      require("NeoAI.kernel.logger").warn(
+        "[sandbox] 冻结时跳过不可发布文件：遮蔽 %d、易变缓存 %d", dropped.masked, dropped.volatile)
+    end)
+  end
+  return out, dropped
+end
+
 --- 冻结：生成候选（不修改真实工作区）
 --- @param attempt_id string
 --- @param prefetch table|nil 工作线程预取结果：staged 路径 -> { exists, type, size, content }；
@@ -1705,6 +1815,9 @@ function M.finish(attempt_id, prefetch)
     end
   end
   table.sort(files, function(a, b) return a.path < b.path end)
+  -- 剔除运行时遮蔽（发布硬拒绝）与易变包缓存（CAS 冲突）文件，避免整单元失败。
+  local dropped
+  files, dropped = _filter_unpublishable(files, attempt.attempt)
   local manifest = {}
   for _, f in ipairs(files) do
     manifest[#manifest + 1] = { path = f.path, action = f.action, after_hash = f.after_hash }
@@ -1716,6 +1829,7 @@ function M.finish(attempt_id, prefetch)
     command_id = attempt.attempt.command_id,
     attempt_id = attempt_id,
     effect = attempt.attempt.effect,
+    dropped = (dropped and (dropped.masked > 0 or dropped.volatile > 0)) and dropped or nil,
   }
   return candidate
 end

@@ -484,6 +484,8 @@ function M.enqueue(cand, meta)
     package_names = meta.package_names,
     package_key = meta.package_key,
     package_sensitive = meta.package_sensitive,
+    -- 冻结时剔除的不可发布文件（遮蔽/易变缓存），供审批界面提示。
+    dropped = meta.dropped,
     review_state = M.REVIEW.PENDING,
     apply_state = M.APPLY.NOT_REQUESTED,
     created_at = os.time(),

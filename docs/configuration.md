@@ -330,6 +330,19 @@ sandbox = {
     max_log_bytes = 262144,  -- 单服务日志环形缓冲上限（字节）
     stop_timeout_ms = 5000,  -- 停止时等待进程优雅退出的上限（超时 SIGKILL）
   },
+  -- systemctl 门面（方案 A）：AI 的独立 `systemctl`/`journalctl` 调用被路由到沙箱内长驻
+  -- 服务（复用 sandbox.service），不调用宿主 systemd、也不修改宿主机。支持
+  -- simple/exec/oneshot 与 Requires/Wants/After/Before 依赖；Type=notify/forking/dbus、
+  -- socket/timer 等语义明确报错；门面不处理的动词回退 T2/hostop 提案路径。
+  systemd = {
+    enabled = true,          -- 总开关
+    mode = "facade",         -- facade（默认）：沙箱内处理
+    max_deps = 32,           -- 单次调用的依赖闭包上限（防依赖环/超大图）
+    unit_roots = {           -- 单元文件搜索目录（优先沙箱暂存副本，再读真实文件）
+      "/etc/systemd/system", "/run/systemd/system",
+      "/usr/lib/systemd/system", "/lib/systemd/system",
+    },
+  },
   network = {
     enabled = false, allowed_endpoints = {}, budget_bytes = 0, -- 受控网络网关
     -- 拦截向宿主本机（回环/宿主网卡 IP/链路本地/云元数据）的访问（默认开）：注入
@@ -379,18 +392,23 @@ sandbox = {
       { tier = 1, name = "package", bins = { "apt", "apt-get", "dnf", "yum", "pacman", "apk", "brew" } }, -- 包安装：额外规则
     },
   },
-  -- 受控 docker：不绑定宿主 /var/run/docker.sock；controlled 指向外部受控 socket。
-  docker = { mode = "controlled", socket = "/run/neoai-docker/docker.sock" }, -- off | controlled | host
-  -- 容器受控运行：podman 等无守护进程运行时注入 --net/pid/ipc/uts=host，与沙箱同 namespace；
-  -- docker 依赖外部 daemon，无法共享，保持受控 socket 并记录原因。
-  container = { enabled = true, share_namespace = true, prefer = "podman" },
+  -- 容器门面：docker/nerdctl 依赖宿主守护进程，默认 off（明确报错「沙箱环境不支持」，不碰宿主）。
+  -- 需要时显式设为 controlled 并给出受控 socket（rootless / socket-proxy / dind）。
+  docker = { mode = "off", socket = "" }, -- off | controlled
+  -- 容器门面：podman/buildah 无守护进程运行时注入 --net/pid/ipc/uts=host，与沙箱同 namespace，
+  -- 容器在沙箱内运行；docker/docker-compose 默认改写为 podman/podman-compose 在沙箱内执行
+  -- （docker_to_podman=false 则直接拒绝）；nerdctl 默认拒绝（见上）。
+  container = { enabled = true, share_namespace = true, prefer = "podman", docker_to_podman = true },
   -- 存储基根：每进程实例隔离在 <workspace_root>/instances/<pid>_<ts>，待审队列/候选跨会话互不可见。
   workspace_root = vim.fn.stdpath("cache") .. "/NeoAI/sandbox",
   session_shell = true,            -- run_command 会话内保留 shell 状态（export/cd 跨命令生效；仅 bwrap）
   process_roots = {},              -- 额外可写根（仅 read_all=false 或整机 overlay 不可用时生效；overlay 覆盖，默认仅 cwd 自动补入）。read_all=true（默认）时整机根已是可写 overlay，本项不再需要。/tmp、/var/tmp 属 tmpfs_roots；按需显式加回
   overlay_fail_closed = true,      -- overlay 不可用时拒绝 process 工具（不降级为私有 cwd）；false 才允许降级运行
   -- 异步审批：候选进入待审队列，用户确认后应用。session_auto_approve 开启后 L0/L1 自动应用。
-  -- l3_warning：L3（critical）条目二次确认（AI 生成后果警告 + 自动打开 diff，需再次确认才应用）。
+  -- l3_warning：高危条目二次确认（AI 生成后果警告 + 自动打开 diff，需再次确认才应用）。
+  --   L3（critical）恒触发；package_confirm=true 时 L2 包安装/敏感安装（apt-key、gpg --import、
+  --   改软件源等）也触发；安全安装（L1）仍只需一次确认。确认窗标题按级别区分并高亮按键提示，
+  --   若冻结时剔除了遮蔽/易变缓存文件会在警告区提示「将跳过 N 个」。
   -- ai_audit：待审界面按 `a`（可配置 key）把用户消息 + 分级的待审变更结构化文本交给模型，
   --           **逐条**（每个文件/主机命令）生成 ≤50 字、以「安全/不安全」开头的暗灰补充说明
   --           （显示在文件行下方，高危变更优先且不得省略；模型漏答的条目标注「请人工确认」，
@@ -398,7 +416,7 @@ sandbox = {
   --           发起审计（默认关闭；集合变化时自动重审）。全局并发上限 max_concurrent（默认 10，
   --           在途请求超出即排队 FIFO），避免 auto 频繁触发时请求风暴。
   review = { enabled = true, auto_apply = false, session_auto_approve = false,
-             l3_warning = { enabled = true, max_tokens = 256, timeout_ms = 15000 },
+             l3_warning = { enabled = true, package_confirm = true, max_tokens = 256, timeout_ms = 15000 },
              ai_audit = { enabled = true, auto = false, key = "a", max_concurrent = 10,
                           max_diff_chars = 8000, max_user_chars = 4000, max_total_chars = 60000,
                           max_tokens = 2048, timeout_ms = 30000 } },
@@ -426,6 +444,7 @@ sandbox = {
     mode = "review", -- review（安全安装仅需确认、风险封顶中危 L1；改动软件源/密钥的敏感安装保留 L2）| allow（放行）| deny（拒绝）
     managers = { "apt", "apt-get", "pip", "pip3", "uv", "conda", "npm", "npx", "pnpm", "yarn", "go", "cargo", "gem", "composer" }, -- 包管理器名单（命令识别）；改动路径特征见 privilege.package_path_manager；敏感安装判定见 privilege.package_sensitive
     roots = { "/usr", "/var", "/etc", "~/.cache", "~/.npm", "~/.nvm", "~/.cargo", "~/.rustup", "~/go", "~/.local" }, -- 包安装可写根（overlay 暂存）。/etc 供 dpkg postinst 写 /etc/ld.so.cache 等；敏感条目仍由 mask_paths 遮蔽
+    volatile_paths = { "/var/lib/apt/lists", "/var/cache/apt", "/var/cache/dnf", "/var/cache/yum", "/var/cache/pacman/pkg", "/var/cache/apk", "~/.cache/pip", "~/.cache/uv", "~/.npm/_cacache", "~/.cache/yarn", "~/.cargo/registry/cache", "~/.cache/go-build" }, -- 易变包索引/缓存：冻结候选时跳过（不待审、不发布），避免 apt update 后基线变化触发 BASELINE_CHANGED 使整个安装失败；不影响安装效果（dpkg/status、包文件仍应用）；{} 关闭。勿放 /var/lib/dpkg/status 等状态文件
     cap_add = { "CAP_DAC_OVERRIDE", "CAP_CHOWN", "CAP_SETUID", "CAP_SETGID", "CAP_FOWNER" },
     apt_sandbox_user = "root", -- apt 系列：注入 APT::Sandbox::User（默认 "root" 关闭 apt 自身的 `_apt` 降权，避免嵌套 userns/受限容器中 setgroups EPERM 使 apt update/install 失败）；"_apt" 或空串保留 apt 默认行为
   },

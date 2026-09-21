@@ -138,7 +138,7 @@ end
 
 --- 线程内校验字符串是否为合法 UTF-8（与 `stringx.sanitize_utf8` 同口径，自包含）。
 --- vim.json.encode 会把非法字节原样透传，严格解析器会报错；故先快速编码，再在线程池校验，
---- 仅当非法时才在主线程走昂贵的 `json.encode`（含全表 UTF-8 深扫）兜底。
+--- 仅当非法时才在主线程走 `json.encode_lossless`（base64 无损打包，不损坏二进制）兜底。
 --- 返回 "\1" 合法 / "\0" 非法。
 --- @param s string
 --- @return string
@@ -177,7 +177,7 @@ local function _validate_utf8_worker(s)
 end
 
 --- 异步编码并落盘：主线程先 `encode_fast`（C 实现，跳过纯 Lua 深扫），
---- 线程池校验输出 UTF-8；非法时才回退 `json.encode`（清洗重编码）。大候选不再冻结主线程。
+--- 线程池校验输出 UTF-8；非法时才回退 `json.encode_lossless`（base64 无损打包）。大候选不再冻结主线程。
 --- @param path string
 --- @param value any
 local function _encode_and_write(path, value)
@@ -187,7 +187,7 @@ local function _encode_and_write(path, value)
   write_state.pending[path] = encoded
   local work = require("NeoAI.utils.work")
   if not work.available() then
-    write_state.pending[path] = json.encode(value)
+    write_state.pending[path] = json.encode_lossless(value)
     _drain(path)
     return
   end
@@ -208,12 +208,13 @@ local function _encode_and_write(path, value)
     if res == "\1" then
       commit(encoded)
     else
-      local safe = json.encode(value)
+      -- 含非法 UTF-8（二进制内容）：改用无损编码（base64 哨兵），绝不替换为 U+FFFD。
+      local safe = json.encode_lossless(value)
       write_state.mem[path] = safe
       commit(safe)
     end
   end, function()
-    local safe = json.encode(value)
+    local safe = json.encode_lossless(value)
     write_state.mem[path] = safe
     commit(safe)
   end)
@@ -234,9 +235,7 @@ local function _read_json(path)
   local encoded = write_state.mem[path]
   if encoded == nil then encoded = fs.read_file(path) end
   if not encoded then return nil end
-  local ok, decoded = pcall(json.decode, encoded)
-  if not ok then return nil end
-  return decoded
+  return json.decode_lossless(encoded)
 end
 
 --- 列出 dir 下的 JSON 条目：以磁盘为准，但**异步写缓存（最新）覆盖**同路径的旧磁盘内容，
@@ -254,16 +253,16 @@ local function _list_json_dir(dir)
         local path = dir .. "/" .. name
         local content = fs.read_file(path)
         if content then
-          local ok, decoded = pcall(json.decode, content)
-          if ok and decoded then by_path[path] = decoded end
+          local decoded = json.decode_lossless(content)
+          if decoded then by_path[path] = decoded end
         end
       end
     end
   end
   for path, encoded in pairs(write_state.mem) do
     if path:sub(1, #dir + 1) == dir .. "/" then
-      local ok, decoded = pcall(json.decode, encoded)
-      if ok and decoded then by_path[path] = decoded end
+      local decoded = json.decode_lossless(encoded)
+      if decoded then by_path[path] = decoded end
     end
   end
   local out = {}
@@ -307,7 +306,7 @@ function M.write_candidate(candidate)
   if require("NeoAI.sandbox.fault").hit("store") then return false, "injected store failure" end
   if not _ensure_dirs() then return false end
   local path = _candidates_dir() .. "/" .. _safe_name(candidate.candidate_digest) .. ".json"
-  local ok, err = fs.write_file_atomic(path, json.encode(candidate))
+  local ok, err = fs.write_file_atomic(path, json.encode_lossless(candidate))
   if not ok then return false, err end
   return true
 end
@@ -360,7 +359,7 @@ end
 function M.write_receipt(receipt)
   if not _ensure_dirs() then return false end
   local path = _receipts_dir() .. "/" .. _safe_name(receipt.operation_id) .. ".json"
-  return fs.write_file_atomic(path, json.encode(receipt))
+  return fs.write_file_atomic(path, json.encode_lossless(receipt))
 end
 
 --- 读取发布回执
@@ -371,9 +370,7 @@ function M.read_receipt(operation_id)
   local path = _receipts_dir() .. "/" .. _safe_name(operation_id) .. ".json"
   local content = fs.read_file(path)
   if not content then return nil end
-  local ok, decoded = pcall(json.decode, content)
-  if not ok then return nil end
-  return decoded
+  return json.decode_lossless(content)
 end
 
 --- 写入变更单元（异步审批）
@@ -409,7 +406,7 @@ end
 function M.write_review(item)
   if not _ensure_dirs() then return false end
   local path = _reviews_dir() .. "/" .. _safe_name(item.change_set_id) .. ".json"
-  return fs.write_file_atomic(path, json.encode(_persistable(item)))
+  return fs.write_file_atomic(path, json.encode_lossless(_persistable(item)))
 end
 
 --- 异步写入变更单元：文件写入移入线程池，写入后立即可读回（内存缓存）。
@@ -455,7 +452,7 @@ end
 function M.write_evidence(record)
   if not _ensure_dirs() then return false end
   local path = _evidence_dir() .. "/" .. _safe_name(record.evidence_id) .. ".json"
-  return fs.write_file_atomic(path, json.encode(record))
+  return fs.write_file_atomic(path, json.encode_lossless(record))
 end
 
 --- 异步写入证据记录（write-behind）：观测类证据（越界访问留痕）在构建/测试中可能高频产生，
@@ -476,9 +473,7 @@ function M.read_evidence(evidence_id)
   local path = _evidence_dir() .. "/" .. _safe_name(evidence_id) .. ".json"
   local content = fs.read_file(path)
   if not content then return nil end
-  local ok, decoded = pcall(json.decode, content)
-  if not ok then return nil end
-  return decoded
+  return json.decode_lossless(content)
 end
 
 --- 列出全部证据记录（按创建时间）
@@ -494,8 +489,8 @@ function M.list_evidence()  if not state.root then return {} end
     if name:sub(-5) == ".json" then
       local content = fs.read_file(dir .. "/" .. name)
       if content then
-        local ok, decoded = pcall(json.decode, content)
-        if ok and decoded then out[#out + 1] = decoded end
+        local decoded = json.decode_lossless(content)
+        if decoded then out[#out + 1] = decoded end
       end
     end
   end
@@ -518,7 +513,7 @@ end
 function M.write_host_op(record)
   if not _ensure_dirs() then return false end
   local path = _host_ops_dir() .. "/" .. _safe_name(record.host_op_id) .. ".json"
-  return fs.write_file_atomic(path, json.encode(record))
+  return fs.write_file_atomic(path, json.encode_lossless(record))
 end
 
 --- 读取主机操作提案
@@ -529,9 +524,7 @@ function M.read_host_op(host_op_id)
   local path = _host_ops_dir() .. "/" .. _safe_name(host_op_id) .. ".json"
   local content = fs.read_file(path)
   if not content then return nil end
-  local ok, decoded = pcall(json.decode, content)
-  if not ok then return nil end
-  return decoded
+  return json.decode_lossless(content)
 end
 
 --- 列出主机操作提案（按创建时间）
@@ -548,8 +541,8 @@ function M.list_host_ops()
     if name:sub(-5) == ".json" then
       local content = fs.read_file(dir .. "/" .. name)
       if content then
-        local ok, decoded = pcall(json.decode, content)
-        if ok and decoded then out[#out + 1] = decoded end
+        local decoded = json.decode_lossless(content)
+        if decoded then out[#out + 1] = decoded end
       end
     end
   end
@@ -572,7 +565,7 @@ end
 function M.write_snapshot(record)
   if not _ensure_dirs() then return false end
   local path = _snapshots_dir() .. "/" .. _safe_name(record.snapshot_id) .. ".json"
-  local ok = fs.write_file_atomic(path, json.encode(record))
+  local ok = fs.write_file_atomic(path, json.encode_lossless(record))
   if ok then snapshot_cache[record.snapshot_id] = nil end
   return ok
 end
@@ -605,8 +598,8 @@ function M.read_snapshot(snapshot_id)
     snapshot_cache[snapshot_id] = false -- 负缓存：避免重复读不存在的快照
     return nil
   end
-  local ok, decoded = pcall(json.decode, content)
-  if not ok or not decoded then return nil end
+  local decoded = json.decode_lossless(content)
+  if not decoded then return nil end
   snapshot_cache[snapshot_id] = decoded
   return decoded
 end
@@ -636,8 +629,8 @@ function M.list_snapshots()
     if name:sub(-5) == ".json" then
       local content = fs.read_file(dir .. "/" .. name)
       if content then
-        local ok, decoded = pcall(json.decode, content)
-        if ok and decoded then out[#out + 1] = decoded end
+        local decoded = json.decode_lossless(content)
+        if decoded then out[#out + 1] = decoded end
       end
     end
   end
