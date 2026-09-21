@@ -441,9 +441,9 @@ function M.session_dir()
   return _workspace_dir()
 end
 
---- 进程 overlay 基目录的宿主根：优先 /dev/shm（须位于所有可写根之外，避免
---- overlay 的 upper 落在 lower 之下导致内核 EINVAL）；不可用时退回沙箱根目录。
---- 目录名由 conceal 统一生成（无特征命名，不暴露沙箱自身）。
+--- 进程 overlay 基目录的宿主根：由 `tools.sandbox.staging_backend` 决定（默认磁盘，
+--- 见 conceal.base_host）；须位于所有可写根之外，避免 overlay 的 upper 落在 lower 之下
+--- 导致内核 EINVAL。目录名由 conceal 统一生成（无特征命名，不暴露沙箱自身）。
 --- @return string
 local function _process_base_host()
   return require("NeoAI.sandbox.conceal").base_host()
@@ -1021,6 +1021,86 @@ function M.staged_roots()
     end
   end
   return out
+end
+
+--- 覆盖所有已暂存路径所需的最小可写根（`known_roots` 之外的部分）。
+--- 目的：让 `run_command` / 长驻服务 / 工具子进程的 overlay **始终**包含暂存文件所在目录，
+--- 使命令视图与只读工具看到的暂存视图一致。否则工作区外的暂存编辑不会被物化，命令读到
+--- 真实磁盘内容——既与 `read_file` 分裂（同一路径两种内容），也构成绕过暂存直接读写真实
+--- 文件的旁路。
+--- 返回「最近的存在祖先目录」（overlay lower 必须是存在的目录）；已被 `known_roots` 覆盖
+--- 的路径不返回；返回的根之间互不嵌套（较浅的根覆盖较深者，避免嵌套 overlay）。
+--- 根为 `/` 时无法安全收窄（会暴露整机），此处不返回，由调用方按「无 overlay 禁止降级」
+--- fail-closed。
+--- @param known_roots string[]|nil 已规划的可写根（cwd / process_roots / 工具可写根 / 包根）
+--- @return string[] 需追加的可写根
+function M.staged_overlay_roots(known_roots)
+  _await_rotation()
+  local function under(p, r)
+    if r == "/" then return p:sub(1, 1) == "/" end
+    return p == r or p:sub(1, #r + 1) == r .. "/"
+  end
+  local known = {}
+  for _, r in ipairs(known_roots or {}) do
+    if type(r) == "string" and r ~= "" then known[#known + 1] = fs.canonical(r) end
+  end
+  local candidates = {}
+  for real in pairs(state.workspace) do
+    local covered = false
+    for _, r in ipairs(known) do
+      if under(real, r) then covered = true break end
+    end
+    if not covered then
+      -- overlay lower 必须是存在的目录：向上找最近的存在祖先。
+      local dir = vim.fn.fnamemodify(real, ":h")
+      while dir ~= "" and dir ~= "/" and vim.fn.isdirectory(dir) ~= 1 do
+        local parent = vim.fn.fnamemodify(dir, ":h")
+        if parent == dir then break end
+        dir = parent
+      end
+      if dir ~= "" and dir ~= "/" and vim.fn.isdirectory(dir) == 1 then
+        candidates[#candidates + 1] = dir
+      end
+    end
+  end
+  -- 去重后按深度排序：浅根优先，跳过已被选中根覆盖者。
+  local uniq, seen = {}, {}
+  for _, d in ipairs(candidates) do
+    if not seen[d] then seen[d] = true; uniq[#uniq + 1] = d end
+  end
+  table.sort(uniq, function(a, b)
+    if #a ~= #b then return #a < #b end
+    return a < b
+  end)
+  local out = {}
+  for _, d in ipairs(uniq) do
+    local covered = false
+    for _, r in ipairs(out) do if under(d, r) then covered = true break end end
+    if not covered then out[#out + 1] = d end
+  end
+  return out
+end
+
+--- 是否存在**未发布的实质暂存改动**（与真实基线不同，或删除/新建）。
+--- 供「无 overlay 时禁止降级」判定：若命令将运行在看不到 overlay 的降级 / 嵌套 userns
+--- 模式下，命令会读到真实磁盘、与只读工具的暂存视图分裂，且可能绕过暂存直接读写真实文件，
+--- 故必须 fail-closed。仅登记了暂存副本但内容与基线一致的（空操作）不计入。
+--- @return boolean
+function M.has_staged()
+  _await_rotation()
+  for _, entry in pairs(state.workspace) do
+    if entry.deleted then return true end
+    -- base_hash 为 nil 表示真实盘原不存在（新建文件/目录）；目录无 base_hash。
+    if entry.base_hash == nil then return true end
+    if entry.staged and fs.exists(entry.staged) then
+      local c = _read(entry.staged)
+      if c == nil then return true end
+      if _sha(c) ~= (entry.view_base_hash or entry.base_hash) then return true end
+    else
+      return true
+    end
+  end
+  return false
 end
 
 --- 使某些真实路径的暂存副本失效（发布/拒绝后调用），下次编辑重新从真实文件复制。
@@ -1938,6 +2018,26 @@ function M.finish_async(attempt_id)
   end)
 end
 
+--- 发布应用顺序：删除/rmdir 先于写入，且同组内「子路径先于父路径」（删除）/
+--- 「父路径先于子路径」（写入）。否则 `rm -rf <dir>` 产生的候选会按路径升序先对
+--- 非空父目录 rmdir，导致整个变更单元 WRITE_FAILED。
+--- @param files table
+--- @return table 排序后的副本
+local function _apply_order(files)
+  local out = {}
+  for i, f in ipairs(files) do out[i] = f end
+  local function is_del(f) return f.action == "delete" or f.action == "rmdir" end
+  local function is_ancestor(a, b) return #a < #b and b:sub(1, #a + 1) == a .. "/" end
+  table.sort(out, function(a, b)
+    local da, db = is_del(a), is_del(b)
+    if da ~= db then return da end
+    if is_ancestor(a.path, b.path) then return not da end
+    if is_ancestor(b.path, a.path) then return da end
+    return a.path < b.path
+  end)
+  return out
+end
+
 --- CAS 发布候选到真实工作区
 --- 仅当真实当前状态等于候选基线时应用；否则 CONFLICT（设计文档 §4.5）。
 --- @param candidate table
@@ -1995,7 +2095,7 @@ function M.publish(candidate, opts)
   end
   -- 应用：统一经 writer（先非 root，权限不足 → NEEDS_ROOT，待用户批准 root 写入）。
   local writer = require("NeoAI.sandbox.writer")
-  for _, f in ipairs(candidate.files or {}) do
+  for _, f in ipairs(_apply_order(candidate.files or {})) do
     local action, content
     if f.action == "create" or f.action == "modify" then
       action = "write"
@@ -2018,7 +2118,7 @@ function M.publish(candidate, opts)
           reason = res.reason or ("WRITE_REQUIRES_ROOT: " .. f.path) }
       end
       if not res.ok then
-        return { ok = false, state = "ROLLBACK_FAILED",
+        return { ok = false, state = "FAILED",
           reason = "WRITE_FAILED: " .. f.path .. " " .. tostring(res.err) }
       end
     end

@@ -214,6 +214,12 @@ function M.sandbox_limits()
     local ok_l, limits = pcall(cgroup.resolve_limits)
     if ok_l then out.resolved_limits = limits end
   end
+  -- 沙箱暂存磁盘用量与上限（异步统计的缓存；尚未就绪时 used=nil）。
+  local ok_d, disk = pcall(require, "NeoAI.sandbox.disk")
+  if ok_d and disk then
+    pcall(function() disk.refresh() end)
+    out.disk = disk.info()
+  end
   return out
 end
 

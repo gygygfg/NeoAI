@@ -155,4 +155,84 @@ tests.suite("sandbox_service", function(_, it)
     t.eq("table", type(limits))
     t.eq("boolean", type(limits.systemd))
   end)
+
+  it("service：停止先发 SIGTERM 优雅退出（trap 生效），不立即 SIGKILL", function(t)
+    local dir = vim.fn.tempname()
+    vim.fn.mkdir(dir, "p")
+    with_config({
+      tools = { sandbox = sandbox_config({ service = { enabled = true, stop_timeout_ms = 2000 } }) },
+    }, function()
+      require("NeoAI.sandbox").reset()
+      local svc_mod = require("NeoAI.sandbox.service")
+      local candidate = require("NeoAI.sandbox.candidate")
+      local term = dir .. "/term.txt"
+      local svc, err = svc_mod.start("grace",
+        "trap 'echo GRACEFUL > " .. term .. "; exit 0' TERM; echo READY; "
+        .. "while true; do sleep 0.1; done", { cwd = dir })
+      t.not_nil(svc, "启动失败: " .. tostring(err))
+      t.true_(vim.wait(5000, function()
+        return (svc_mod.logs("grace") or ""):find("READY", 1, true) ~= nil
+      end, 50), "服务应就绪（trap 已安装）")
+      local t0 = vim.uv.hrtime()
+      local stopped = false
+      svc_mod.stop("grace", function() stopped = true end)
+      t.true_(vim.wait(10000, function() return stopped end, 50), "停止应完成")
+      local dt = (vim.uv.hrtime() - t0) / 1e6
+      t.true_(dt < 1800, string.format("优雅退出应在 stop_timeout_ms 内完成（实际 %.0f ms）", dt))
+      local staged = candidate.read_path(term)
+      t.not_nil(staged, "SIGTERM trap 应写入 term.txt（证 SIGTERM 到达载荷而非立即 SIGKILL）")
+      t.matches("GRACEFUL", require("NeoAI.utils.fs").read_file(staged) or "")
+    end)
+    vim.fn.delete(dir, "rf")
+  end)
+
+  it("service：载荷忽略 SIGTERM 时，stop_timeout_ms 后 SIGKILL", function(t)
+    local dir = vim.fn.tempname()
+    vim.fn.mkdir(dir, "p")
+    with_config({
+      tools = { sandbox = sandbox_config({ service = { enabled = true, stop_timeout_ms = 700 } }) },
+    }, function()
+      require("NeoAI.sandbox").reset()
+      local svc_mod = require("NeoAI.sandbox.service")
+      local svc, err = svc_mod.start("stubborn",
+        "trap '' TERM; echo READY; while true; do sleep 0.1; done", { cwd = dir })
+      t.not_nil(svc, "启动失败: " .. tostring(err))
+      t.true_(vim.wait(5000, function()
+        return (svc_mod.logs("stubborn") or ""):find("READY", 1, true) ~= nil
+      end, 50), "服务应就绪")
+      local t0 = vim.uv.hrtime()
+      local stopped = false
+      svc_mod.stop("stubborn", function() stopped = true end)
+      t.true_(vim.wait(10000, function() return stopped end, 50), "停止应完成")
+      local dt = (vim.uv.hrtime() - t0) / 1e6
+      t.true_(dt >= 500, string.format("应等待优雅窗口后才强杀（实际 %.0f ms）", dt))
+    end)
+    vim.fn.delete(dir, "rf")
+  end)
+
+  it("stop_all：对长驻服务同样优雅停止并捕获改动", function(t)
+    local dir = vim.fn.tempname()
+    vim.fn.mkdir(dir, "p")
+    with_config({
+      tools = { sandbox = sandbox_config({ service = { enabled = true, stop_timeout_ms = 2000 } }) },
+    }, function()
+      require("NeoAI.sandbox").reset()
+      local svc_mod = require("NeoAI.sandbox.service")
+      local candidate = require("NeoAI.sandbox.candidate")
+      local term = dir .. "/term.txt"
+      local svc, err = svc_mod.start("grace_all",
+        "trap 'echo GRACEFUL > " .. term .. "; exit 0' TERM; echo READY; "
+        .. "while true; do sleep 0.1; done", { cwd = dir })
+      t.not_nil(svc, "启动失败: " .. tostring(err))
+      t.true_(vim.wait(5000, function()
+        return (svc_mod.logs("grace_all") or ""):find("READY", 1, true) ~= nil
+      end, 50), "服务应就绪")
+      svc_mod.stop_all({ timeout_ms = 3000 })
+      t.eq(0, #svc_mod.list(), "stop_all 后应清空")
+      local staged = candidate.read_path(term)
+      t.not_nil(staged, "stop_all 也应优雅停止并捕获 trap 写入")
+      t.matches("GRACEFUL", require("NeoAI.utils.fs").read_file(staged) or "")
+    end)
+    vim.fn.delete(dir, "rf")
+  end)
 end)

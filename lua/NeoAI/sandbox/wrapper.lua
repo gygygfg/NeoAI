@@ -384,7 +384,13 @@ function M.build_overlay_specs(cwd, base_dir, extra_roots)
     r = tostring(r or ""):gsub("/+$", "")
     if r == "" or r == "/" or vim.fn.isdirectory(r) ~= 1 then return end
     if under(base, r) then return end -- upper 在 lower 之下会 EINVAL
-    for _, x in ipairs(roots) do if x == r then return end end
+    -- 避免嵌套 overlay：跳过已被现有根覆盖的根；新根若覆盖现有根则移除之。
+    -- 嵌套 overlay（lower 本身是 overlay 挂载点）行为脆弱，且会让物化/捕获的 base 选择歧义。
+    for i = #roots, 1, -1 do
+      local x = roots[i]
+      if under(r, x) then return end
+      if under(x, r) then table.remove(roots, i) end
+    end
     roots[#roots + 1] = r
   end
   for _, r in ipairs(cfg_roots) do
@@ -1094,6 +1100,56 @@ local function _maybe_container(attempt, args, ctx, spec)
   return async.resolve(container.unsupported_text(plan))
 end
 
+--- 后台命令门面：`run_command` 中的 `&`/nohup/setsid 自动转为长驻服务（`sandbox.service`），
+--- 使其跨工具调用存活（一次性进程随命令结束被 cgroup.kill 回收）。返回 Deferred（已处理）
+--- 或 nil（不处理，按一次性进程执行）。服务不可用/启动失败时回退一次性执行，不改变行为。
+--- @param attempt table
+--- @param args table
+--- @param ctx table
+--- @param spec table
+--- @return Deferred|nil
+local function _maybe_background(attempt, args, ctx, spec)
+  if spec.effect ~= "process" then return nil end
+  if attempt.tool_name ~= "run_command" then return nil end
+  local cfg = config_store.get("tools.sandbox.service") or {}
+  if cfg.enabled == false or cfg.auto_background == false then return nil end
+  if type(args.command) ~= "string" or args.command == "" then return nil end
+  local bg = require("NeoAI.sandbox.background").parse(_strip_sudo(args.command))
+  if not bg then return nil end
+
+  local service = require("NeoAI.sandbox.service")
+  local name = "bg_" .. tostring(attempt.command_id):gsub("[^%w_%-]", "_")
+  local svc, err = service.start(name, bg.command, {
+    cwd = ctx.sandbox_exec_cwd or vim.fn.getcwd(),
+  })
+  if not svc then
+    -- 服务不可用/启动失败：回退一次性执行（保持既有行为，不静默吞掉命令）。
+    require("NeoAI.kernel.logger").warn(
+      "[sandbox] 后台命令转长驻服务失败，回退一次性执行：%s", tostring(err))
+    return nil
+  end
+
+  control.transition(attempt, "STAGING")
+  control.transition(attempt, "CANDIDATE_READY")
+  control.transition(attempt, "COMPLETED_READ_ONLY")
+  pcall(function()
+    require("NeoAI.kernel.event_bus").emit(
+      require("NeoAI.kernel.events").SANDBOX_BACKGROUND_ROUTED, {
+        name = name, service_id = svc.id, kind = bg.kind, command_id = attempt.command_id,
+      })
+  end)
+  pcall(function()
+    require("NeoAI.sandbox.audit").observe({
+      kind = "process", tool = attempt.tool_name, level = 1,
+      reasons = { "BACKGROUND_SERVICE:" .. tostring(bg.kind) }, command_id = attempt.command_id,
+    })
+  end)
+  return async.resolve(string.format(
+    "[后台服务] 检测到后台执行（%s），已转为长驻服务 `%s`（跨工具调用存活）。"
+    .. "用 service_logs name=\"%s\" 查看输出，service_status 查看状态，service_stop 停止。",
+    tostring(bg.kind), name, name))
+end
+
 -- ========== 公开 API ==========
 
 --- 执行门禁（内部实现）
@@ -1176,6 +1232,16 @@ local function _gate_inner(tool, args, ctx, call_original)
   control.transition(attempt, "PARSED")
   control.transition(attempt, "PREFLIGHTED")
 
+  -- 磁盘上限门禁：暂存占用超 `tools.sandbox.limits.disk_bytes`（默认 64 GiB）时拒绝写类/
+  -- 外部进程工具，避免暂存撑满宿主磁盘。用量为异步统计的缓存，未就绪时放行（不阻断命令开始）。
+  if spec.effect == "process" or spec.effect == "fs_write" then
+    local dok, derr = require("NeoAI.sandbox.disk").check()
+    if not dok then
+      control.transition(attempt, "BLOCKED")
+      return async.reject({ kind = "sandbox", message = derr, command_id = attempt.command_id })
+    end
+  end
+
   -- 长驻服务（service_*）：预检/脚本扫描/硬拒绝已完成；隔离与候选结算由 sandbox.service
   -- 自建（独立 overlay + cgroup），此处不进入一次性进程的捕获/冻结流程。
   if spec.long_lived then
@@ -1211,8 +1277,10 @@ local function _gate_inner(tool, args, ctx, call_original)
     -- 对所有声明了路径参数的只读工具生效（read_file/file_exists/treesitter 等）；
     -- 暂存副本保留真实 basename（含扩展名），故依赖 filetype 的 treesitter 也能正确解析。
     -- 目录参数（list_files/search_files 的 path）由 candidate.read_path 返回 nil，原样保留，
-    -- 其目录级一致性由工具自身叠加暂存视图实现。LSP 工具不重写：把无项目根的暂存路径
-    -- 交给 LSP 会导致 root_dir/client 匹配错误，故仍读真实内容（已知边界）。
+    -- 其目录级一致性由工具自身叠加暂存视图实现。LSP 工具**不重写路径**（把无项目根的暂存
+    -- 路径交给 LSP 会导致 root_dir/client 匹配错误）：改为在沙箱命名空间内启动同名 LSP
+    -- server（`sandbox/lsp`），其 overlay 覆盖所有已暂存路径，且工具侧用暂存内容同步后台
+    -- buffer（`tool_helpers.sync_buffer_from_sandbox`），使 LSP 与文件工具共享同一暂存视图。
     local rev = {}
     local read_proc = false -- 读 /proc/* 时结果需经 conceal 脱敏（防沙箱指纹/宿主路径泄露）
     if spec.effect == "read" then
@@ -1222,7 +1290,9 @@ local function _gate_inner(tool, args, ctx, call_original)
           if v:match("^/proc/") then read_proc = true end
           local staged = candidate.read_path(v)
           if staged then
-            rev[staged] = vim.fn.fnamemodify(fs.expand(v), ":p"):gsub("/+$", "")
+            -- 还原用规范化真实路径（与 candidate 的暂存键一致：resolve 符号链接 + 折叠 ..）。
+            -- 否则同一文件经不同写法（符号链接/`..`）会还原成不同字符串，模型看到不一致路径。
+            rev[staged] = fs.canonical(v)
             args[key] = staged
           end
         end
@@ -1300,6 +1370,9 @@ local function _gate_inner(tool, args, ctx, call_original)
     -- 容器门面：docker 等依赖宿主 daemon 的运行时默认明确拒绝（不碰宿主）；podman 放行。
     local blocked = _maybe_container(attempt, args, ctx, spec)
     if blocked then return blocked end
+    -- 后台命令门面：&/nohup/setsid 自动转为长驻服务，使其跨工具调用存活。
+    local background = _maybe_background(attempt, args, ctx, spec)
+    if background then return background end
     candidate.begin(attempt, root)
     -- 工具子进程（exec）可指定进程 cwd（通常取可写根公共父目录，避免遮蔽目录把 overlay 遮蔽）；
     -- 未指定时沿用当前工作目录。
@@ -1332,8 +1405,23 @@ local function _gate_inner(tool, args, ctx, call_original)
     end
     -- 已暂存的包安装产物对后续命令可见：把「有暂存改动」的包可写根也加入本次可写根
     -- （非包安装命令默认只覆盖 cwd，否则后续 `python -m build` 看不到刚装的包）。
-    for _, r in ipairs(require("NeoAI.sandbox.candidate").staged_roots()) do
+    local cand = require("NeoAI.sandbox.candidate")
+    for _, r in ipairs(cand.staged_roots()) do
       extra_roots[#extra_roots + 1] = r
+    end
+    -- 补齐所有已暂存路径的覆盖根（不限包安装根）：让命令 overlay 与只读工具看到同一
+    -- 暂存视图。否则工作区外的暂存编辑不会被物化，命令读到真实磁盘（路径不一致 + 绕过）。
+    do
+      local known_roots = { real_cwd }
+      for _, r in ipairs(spec.writable_roots or {}) do known_roots[#known_roots + 1] = r end
+      for _, r in ipairs(attempt.package_roots or {}) do known_roots[#known_roots + 1] = r end
+      local pr = config_store.get("tools.sandbox.process_roots")
+      if type(pr) == "table" then
+        for _, r in ipairs(pr) do known_roots[#known_roots + 1] = r end
+      end
+      for _, r in ipairs(cand.staged_overlay_roots(known_roots)) do
+        extra_roots[#extra_roots + 1] = r
+      end
     end
     local specs = M.build_overlay_specs(real_cwd, proc_dir, extra_roots)
     -- 选定每个可写根实际使用的层（overlay 或 bind），供物化/捕获/前缀构造一致使用
@@ -1435,6 +1523,16 @@ local function _gate_inner(tool, args, ctx, call_original)
       for _, s in ipairs(active_specs) do
         if s.mode == "overlay" then degraded = false end
         if not degraded_reason and s.overlay_reason then degraded_reason = s.overlay_reason end
+      end
+      -- 无 overlay 时禁止降级：存在未发布的实质暂存改动时，命令只能读到真实磁盘，
+      -- 与只读工具看到的暂存视图分裂，且可能绕过暂存直接读写真实文件。此时**无条件**
+      -- fail-closed（含 T2 嵌套 userns：其无 overlay 是常态，但同样不能看到暂存视图）。
+      if degraded and require("NeoAI.sandbox.candidate").has_staged() then
+        local why = degraded_reason or (userns and "T2 嵌套 userns 无 overlay" or "无可写根可用 overlay")
+        return nil, "SANDBOX_STAGING_UNCOVERED: 存在未发布的暂存改动，但本次命令无 overlay 可写层（"
+          .. tostring(why) .. "）；命令将读到真实磁盘、与只读工具的暂存视图分裂，已拒绝执行"
+          .. "（无 overlay 时禁止降级）。请先在审批界面应用/丢弃暂存改动，或排查 overlay 可用性"
+          .. "（:NeoAISandboxCaps）。"
       end
       if degraded and not userns and cfg.overlay_fail_closed ~= false then
         local detail = degraded_reason and ("原因：" .. tostring(degraded_reason)) or "无可写根可用 overlay"

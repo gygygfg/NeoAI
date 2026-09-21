@@ -222,8 +222,9 @@ shell_tools.run_command = helpers.define_tool(
   "run_command",
   "执行 Shell 命令（前台，单次调用内完成）。command 必填。timeout_ms 可选（默认 30000ms，-1 为不限）。"
   .. "长任务（安装依赖/编译/下载）请在**同一次调用**内显式传较大的 timeout_ms（如 600000），"
-  .. "不要靠重试短命令或后台进程规避超时；后台进程（&/nohup/setsid）不跨调用存活，"
-  .. "需要常驻服务请用 service_start/service_logs/service_stop。",
+  .. "不要靠重试短命令规避超时。命令以后台方式结束（`&`/nohup/setsid）时会自动转为长驻服务"
+  .. "（跨工具调用存活，用 service_logs/service_status/service_stop 管理）；需要常驻服务"
+  .. "也可直接用 service_start/service_logs/service_stop。",
   {
     type = "object",
     properties = {

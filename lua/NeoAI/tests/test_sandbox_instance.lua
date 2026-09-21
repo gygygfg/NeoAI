@@ -125,6 +125,16 @@ tests.suite("sandbox_instance", function(_, it)
     pcall(vim.fn.delete, base, "rf")
   end)
 
+  it("runtime.warm 预热能力与 overlay 探测（幂等、可重复调用）", function(t)
+    local runtime = require("NeoAI.sandbox.runtime")
+    local out = runtime.warm()
+    t.eq("table", type(out))
+    t.eq("boolean", type(out.capabilities), "应返回 capabilities 布尔")
+    t.eq("table", type(runtime.capabilities()), "预热后能力应可用")
+    -- 幂等：重复调用不报错（探测结果本身有缓存）
+    t.eq("table", type(runtime.warm()))
+  end)
+
   it("gc 只回收已死进程的实例目录", function(t)
     local instance = require("NeoAI.sandbox.instance")
     local base = vim.fn.tempname()

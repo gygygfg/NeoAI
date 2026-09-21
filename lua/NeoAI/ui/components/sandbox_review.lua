@@ -36,7 +36,7 @@ local LEVEL_HL = {
   verdict_unsafe = "NeoAISandboxReviewVerdictUnsafe",
 }
 
-local LEGEND = "级别：工作区(绿) 用户目录(黄) 系统(红)  风险：L0低危(灰)/L1中危(黄)/L2高危(黄)/L3严重(红)  ⚠密钥操作(红)   |   <CR> 头行=整包应用 / 文件行=应用该文件   d 拒绝该文件   i 预览修改diff/越界详情   u 撤销/重做保存   a AI审计   r 刷新   q 关闭"
+local LEGEND = "级别：工作区(绿) 用户目录(黄) 系统(红)  风险：L0低危(灰)/L1中危(黄)/L2高危(黄)/L3严重(红)  ⚠密钥操作(红)   |   <CR> 头行=整包应用 / 文件行=应用该文件   A 一键同意全部工作区修改   d 拒绝该文件   i 预览修改diff/越界详情   u 撤销/重做保存   a AI审计   r 刷新   q 关闭"
 
 -- L3 后果警告高亮组（diff 预览顶部）
 local L3_WARN_HL = "NeoAISandboxReviewL3Warning"
@@ -61,6 +61,7 @@ local state = {
   audit = nil, -- { text?, pending?, error? } AI 审计结论（显示在窗口顶部）
   audit_seq = 0, -- AI 审计请求序号：关闭/重开审批窗后作废过期结果
   audit_sig = nil, -- 已完成审计对应的待审集合签名（集合变化时自动重审）
+  applying_all = false, -- 一键同意批量应用进行中（防重入；逐项让出主循环）
 }
 
 -- 安全级别 -> 中文风险档（高危 / 中危 / 低危）
@@ -282,6 +283,12 @@ function M.build_lines(items, traces, audit, saved)
     marks[#marks + 1] = { line = ln, start_col = 4, end_col = 4 + #note, level = missing and "verdict_unsafe" or "note" }
   end
   local risk = require("NeoAI.sandbox.risk")
+  -- 审批分区：未应用（待审）在前，已应用（含快照，可撤销）在后，边界醒目。
+  if items and #items > 0 then
+    local head = ("── 未应用（待审 %d 个变更单元）──"):format(#items)
+    lines[#lines + 1] = head
+    lines[#lines + 1] = ""
+  end
   for _, item in ipairs(items or {}) do
     local tier = item.privilege_tier or 0
     local badge = tier > 0 and string.format(" [T%d]", tier) or ""
@@ -387,11 +394,11 @@ function M.build_lines(items, traces, audit, saved)
     end
     local title
     if has_applied and has_reverted then
-      title = "已保存/已撤销（u 撤销/重做保存）"
+      title = "已应用（已保存/已撤销，u 撤销/重做保存）"
     elseif has_reverted then
-      title = "已撤销（u 撤销/重做保存）"
+      title = "已应用（已撤销，u 撤销/重做保存）"
     else
-      title = "已保存（已应用，u 撤销/重做保存）"
+      title = "已应用（已保存，u 撤销/重做保存）"
     end
     lines[#lines + 1] = "── " .. title .. "──"
     for _, item in ipairs(saved) do
@@ -568,6 +575,91 @@ local function _apply_target(target, ok_msg, fail_msg)
   else
     report(res)
   end
+end
+
+--- 设置审批窗标题（用于展示批量应用进度）。
+--- @param title string
+local function _set_review_title(title)
+  if state.win_id and vim.api.nvim_win_is_valid(state.win_id) then
+    pcall(function()
+      local cfg = vim.api.nvim_win_get_config(state.win_id)
+      cfg.title = title
+      cfg.title_pos = "center"
+      vim.api.nvim_win_set_config(state.win_id, cfg)
+    end)
+  end
+end
+
+--- 一键同意：应用所有「工作区内」的待审文件（按文件粒度）。
+--- 工作区外的文件与主机操作提案保留待审，供用户逐条确认；同一变更单元中工作区外的
+--- 文件同样保留（选择性应用），不影响已应用的工作区部分。
+---
+--- 大批量时**逐项应用并在每项之间让出主循环**（vim.defer_fn），且候选删除用批量会话
+--- 统一对账，避免同步 for 循环 + 逐项 O(n) 全表扫描 + 逐文件落盘冻结界面（"一次同意太多卡死"）。
+local function _apply_all_workspace()
+  local sandbox = services.use("services.sandbox")
+  if not sandbox then return end
+  if state.applying_all then
+    vim.notify("[NeoAI] 正在批量应用中，请稍候…", vim.log.levels.INFO)
+    return
+  end
+  local pending = sandbox.list_reviews({ review_state = "PENDING" })
+  local jobs = {}
+  for _, item in ipairs(pending) do
+    if item.kind ~= "host_op" then
+      local files = {}
+      for _, f in ipairs(item.files or {}) do
+        if type(f.path) == "string" and M.level_of(f.path) == "workspace" then
+          files[#files + 1] = f.path
+        end
+      end
+      if #files > 0 then jobs[#jobs + 1] = { id = item.change_set_id, files = files } end
+    end
+  end
+  if #jobs == 0 then
+    vim.notify("[NeoAI] 工作区内没有待审修改", vim.log.levels.INFO)
+    return
+  end
+
+  state.applying_all = true
+  local batch = sandbox.begin_batch and sandbox.begin_batch() or nil
+  local files_n, items_n, failed_n, root_n = 0, 0, 0, 0
+  local i = 0
+  local function step()
+    if i >= #jobs then
+      state.applying_all = false
+      if batch and sandbox.end_batch then pcall(sandbox.end_batch, batch) end
+      if failed_n == 0 then
+        vim.notify(("[NeoAI] 已一键同意工作区内 %d 个变更单元（%d 个文件）"):format(items_n, files_n),
+          vim.log.levels.INFO)
+      else
+        local extra = root_n > 0 and ("，其中 %d 个需要 root 权限（请逐条确认提权）"):format(root_n) or ""
+        vim.notify(("[NeoAI] 已应用工作区内 %d 个文件，%d 个变更单元失败%s"):format(files_n, failed_n, extra),
+          vim.log.levels.WARN)
+      end
+      _set_review_title("🗂 沙箱待审/已保存")
+      M.refresh()
+      return
+    end
+    i = i + 1
+    local job = jobs[i]
+    local opts = { auto_approve = true, files = job.files }
+    if batch then opts.batch = batch end
+    -- 单项异常不能中断整批并永久锁住 applying_all（否则 `A` 之后无法再用）。
+    local ok, res = pcall(sandbox.apply, job.id, opts)
+    if not ok then res = nil end
+    if res and res.ok then
+      files_n = files_n + #job.files
+      items_n = items_n + 1
+    else
+      failed_n = failed_n + 1
+      if res and res.state == "NEEDS_ROOT" then root_n = root_n + 1 end
+    end
+    _set_review_title(("🗂 沙箱待审/已保存（应用中 %d/%d）"):format(i, #jobs))
+    vim.defer_fn(step, 0)
+  end
+  _set_review_title(("🗂 沙箱待审/已保存（应用中 0/%d）"):format(#jobs))
+  vim.defer_fn(step, 0)
 end
 
 --- 二次确认门禁是否开启
@@ -1251,6 +1343,7 @@ function M.open()
   vim.keymap.set("n", "q", function() M.close() end, { buffer = state.buf })
   vim.keymap.set("n", "<Esc>", function() M.close() end, { buffer = state.buf })
   vim.keymap.set("n", "<CR>", _apply_current, { buffer = state.buf })
+  vim.keymap.set("n", "A", _apply_all_workspace, { buffer = state.buf, desc = "NeoAI 一键同意全部工作区修改" })
   vim.keymap.set("n", "d", _reject_current, { buffer = state.buf })
   vim.keymap.set("n", "i", _open_diff_current, { buffer = state.buf })
   vim.keymap.set("n", "u", _undo_current, { buffer = state.buf, desc = "NeoAI 撤销/重做保存" })
@@ -1368,6 +1461,12 @@ end
 --- @return table
 function M.get_line_map()
   return state.line_to_target
+end
+
+--- 一键同意批量应用是否进行中（测试用）
+--- @return boolean
+function M.is_applying_all()
+  return state.applying_all
 end
 
 --- 获取当前 diff 预览 buffer（测试用）

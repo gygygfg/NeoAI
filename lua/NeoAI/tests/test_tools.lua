@@ -994,6 +994,106 @@ tests.suite("tools", function(_, it)
     t.true_(waited, "lsp_hover 应立刻拒绝（无客户端），不得挂起")
   end)
 
+  --- 取出 lsp_ops 的某个工具定义
+  local function _lsp_tool(name)
+    local lsp_ops = require("NeoAI.tools.builtin.lsp_ops")
+    for _, tool in ipairs(lsp_ops.get_tools()) do
+      if tool.name == name then return tool end
+    end
+    return nil
+  end
+
+  it("lsp_diagnostics 每次调用都重新拉取（pull，非缓存）", function(t)
+    local diag = _lsp_tool("lsp_diagnostics")
+    t.not_nil(diag, "应暴露 lsp_diagnostics")
+    local fs = require("NeoAI.utils.fs")
+    local path = "/tmp/neoai_diag_pull.lua"
+    fs.write_file(path, "local x = 1\n")
+    local buf = vim.fn.bufadd(path)
+    vim.fn.bufload(buf)
+    vim.bo[buf].filetype = "lua"
+
+    local requests = 0
+    local fake = {
+      supports_method = function(_, method)
+        return method == "textDocument/diagnostic"
+      end,
+      request = function(_, _, _, handler)
+        requests = requests + 1
+        handler(nil, {
+          items = { { range = { start = { line = 0, character = 0 } }, severity = 1, message = "boom" .. requests } },
+        })
+      end,
+    }
+    local orig_clients = vim.lsp.get_clients
+    vim.lsp.get_clients = function()
+      return { fake }
+    end
+
+    local r1, r2
+    diag.func({ filepath = path, description = "t" }, function(r) r1 = r end, function(e) r1 = "ERR:" .. tostring(e) end)
+    diag.func({ filepath = path, description = "t" }, function(r) r2 = r end, function(e) r2 = "ERR:" .. tostring(e) end)
+    t.true_(vim.wait(2000, function() return r1 and r2 end, 10), "应返回诊断")
+    vim.lsp.get_clients = orig_clients
+
+    t.matches("boom1", tostring(r1), "首次应返回最新诊断")
+    t.matches("boom2", tostring(r2), "再次调用应重新拉取（非缓存）")
+    t.eq(2, requests, "每次调用都应发起一次 pull 请求")
+    cleanup_test_buffers({ buf }, { path })
+    vim.fn.delete(path)
+  end)
+
+  it("lsp_diagnostics 无 pull 客户端时强制 didChange 并等待重新发布（push）", function(t)
+    local diag = _lsp_tool("lsp_diagnostics")
+    t.not_nil(diag, "应暴露 lsp_diagnostics")
+    local fs = require("NeoAI.utils.fs")
+    local path = "/tmp/neoai_diag_push.lua"
+    fs.write_file(path, "local y = 1\n")
+    local buf = vim.fn.bufadd(path)
+    vim.fn.bufload(buf)
+    vim.bo[buf].filetype = "lua"
+
+    local lines_fired = 0
+    vim.api.nvim_buf_attach(buf, false, {
+      on_lines = function()
+        lines_fired = lines_fired + 1
+      end,
+    })
+    local fake = {
+      supports_method = function() return false end,
+      request = function() error("push 客户端不应走 pull 请求") end,
+    }
+    local orig_clients = vim.lsp.get_clients
+    local orig_diag = vim.diagnostic.get
+    vim.lsp.get_clients = function()
+      return { fake }
+    end
+    local reads = 0
+    vim.diagnostic.get = function()
+      reads = reads + 1
+      return { { lnum = 4, severity = 1, message = "fresh" } }
+    end
+
+    local result, done
+    diag.func({ filepath = path, description = "t" }, function(r) result = r; done = true end,
+      function(e) result = "ERR:" .. tostring(e); done = true end)
+    -- 工具应先触发 didChange，再等待服务器发布诊断
+    t.true_(lines_fired >= 1, "应触发一次 didChange（内容不变的缓冲区重设）")
+    t.eq(nil, done, "服务器发布前不应返回")
+    vim.api.nvim_exec_autocmds("LspNotify", {
+      buffer = buf,
+      data = { method = "textDocument/publishDiagnostics", client_id = 1 },
+    })
+    t.true_(vim.wait(2000, function() return done end, 10), "发布后应返回")
+    vim.lsp.get_clients = orig_clients
+    vim.diagnostic.get = orig_diag
+
+    t.matches("fresh", tostring(result), "应返回重新发布的诊断")
+    t.true_(reads >= 1, "应读取诊断缓存")
+    cleanup_test_buffers({ buf }, { path })
+    vim.fn.delete(path)
+  end)
+
   it("persist_buffer 仅写回后台加载的 buffer", function(t)
     local helpers = require("NeoAI.tools.builtin.tool_helpers")
     local fs = require("NeoAI.utils.fs")

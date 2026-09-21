@@ -345,13 +345,14 @@ sandbox = {
   -- explicitly stopped / session end. Each service uses its own overlay attempt: at start the
   -- workspace staging is materialized into the service view (one-way snapshot); at stop its changes
   -- are captured and merged back into workspace staging (boundary sync, not live sharing) and queued
-  -- for async review. A resource domain is created per service; stop kills the whole tree via
-  -- cgroup.kill.
+  -- for async review. A resource domain is created per service; stop first sends SIGTERM to the
+  -- payload and waits for a graceful exit, then cgroup.kill terminates the whole tree on timeout.
   service = {
     enabled = true,          -- register the service_* tools
     max_services = 16,       -- max concurrently alive services
     max_log_bytes = 262144,  -- per-service log ring-buffer cap (bytes)
-    stop_timeout_ms = 5000,  -- max wait for graceful exit on stop (SIGKILL after)
+    stop_timeout_ms = 5000,  -- max wait for graceful exit (SIGTERM first) before SIGKILL
+    auto_background = true,  -- promote run_command &/nohup/setsid to a long-lived service (survives calls)
   },
   -- systemctl facade (option A): standalone `systemctl`/`journalctl` calls from the AI are routed
   -- to in-sandbox long-lived services (reusing sandbox.service); the host systemd is never called
@@ -435,6 +436,10 @@ sandbox = {
   container = { enabled = true, share_namespace = true, prefer = "podman", docker_to_podman = true },
   -- Store base root: each process is isolated under <workspace_root>/instances/<pid>_<ts>; pending queue/candidates are not shared across sessions.
   workspace_root = vim.fn.stdpath("cache") .. "/NeoAI/sandbox",
+  -- Sandbox staging backend (process overlay upper/work, per-session private /tmp, LSP overlay, ...):
+  --   "disk" (default) = a hidden featureless dir on disk (prefers /var/tmp, falls back to the nvim cache dir);
+  --   "shm" = /dev/shm (RAM, faster but memory-hungry); an absolute path = use that dir as the base.
+  staging_backend = "disk",
   session_shell = true,            -- persist shell state (export/cd) across run_command within a session (bwrap only)
   process_roots = {},              -- extra writable roots (only when read_all=false or the whole-root overlay is unavailable; overlaid, default cwd only, auto-added). With read_all=true (default) the whole root is already a writable overlay, so this is unnecessary. /tmp, /var/tmp belong to tmpfs_roots; add explicitly if needed
   overlay_fail_closed = true,      -- reject process tools when overlay is unavailable (no private-cwd downgrade); set false to allow degraded execution
@@ -505,10 +510,15 @@ sandbox = {
   -- All concurrent attempts share a parent domain: cpu_global_max is the total concurrent CPU
   -- budget (default nproc-1), cpu_cores_max is the per-task quota.
   -- With fail_closed=false, an unavailable cgroup is skipped rather than blocking execution.
+  -- disk_bytes: sandbox staging disk cap (bytes; 0 = unlimited). It totals the staging base
+  -- (process overlay/private tmp) plus the sandbox store root (candidates/review/evidence/service
+  -- overlay); when exceeded, write/process tools are rejected (usage is measured async and cached,
+  -- never blocking command start).
   limits = { wall_ms = 60000, dynamic = true, memory_ratio = 0.5, memory_max_bytes = 0,
     cpu_cores_max = 4, cpu_global_max = 0, pids_max = 2048, memory_bytes = 0, pids = 0, cpu_max = 0,
     cpu_affinity = "auto", -- sandbox CPU affinity: auto=pins to cores other than nvim's current CPU (so it does not compete with nvim); off/false=no pinning; "2,3"/"2-3"=explicit cpuset (needs taskset)
-    cgroup_base = "/sys/fs/cgroup", fail_closed = false },
+    cgroup_base = "/sys/fs/cgroup", fail_closed = false,
+    disk_bytes = 64 * 1024 * 1024 * 1024 }, -- 64 GiB (0 = unlimited)
   seccomp_filter_path = "",        -- optional: compiled seccomp BPF filter (with require_seccomp)
 }
 ```

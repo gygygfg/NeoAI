@@ -290,6 +290,27 @@ function M.adopt(handle, attempt_id)
   state.handles[attempt_id] = handle
 end
 
+--- 向资源域内载荷进程发送 SIGTERM（优雅停止；不删除目录，幂等）。
+--- 跳过 bwrap 监视进程：bwrap 载荷在独立 pid 命名空间内运行，对 bwrap 发 SIGTERM 会立即
+--- 触发命名空间销毁，载荷来不及执行 SIGTERM trap（实测 trap 不生效）。只对载荷进程发
+--- SIGTERM，让真正的服务/命令有机会清理并退出；到时仍存活由调用方 `cgroup.kill` 兜底。
+--- @param handle table
+--- @return number 已发送信号的进程数
+function M.term(handle)
+  if not handle or not handle.path then return 0 end
+  local raw = _read_file(handle.path .. "/cgroup.procs")
+  if not raw then return 0 end
+  local n = 0
+  for pid in raw:gmatch("%d+") do
+    local comm = _read_file("/proc/" .. pid .. "/comm")
+    if not (comm and comm:match("^bwrap")) then
+      local ok = pcall(vim.uv.kill, tonumber(pid), 15)
+      if ok then n = n + 1 end
+    end
+  end
+  return n
+end
+
 --- 立即终止资源域内所有进程（不删除目录，幂等）。
 --- 供命令取消/超时/输出截断时真正杀掉整个进程树：bwrap 载荷运行在独立 pid 命名空间内，
 --- `jobstop` 只杀外层 bwrap，载荷可能继续存活并占住 cgroup；`cgroup.kill` 按域精确终止。

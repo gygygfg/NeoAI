@@ -322,13 +322,14 @@ sandbox = {
   },
   -- 长驻服务（service_* 工具）：后台进程跨工具调用存活，直到显式停止 / 会话结束。
   -- 每个服务使用独立 overlay attempt：启动时物化工作区暂存（单向快照），停止时捕获其改动
-  -- 并合并回工作区暂存（边界同步，非实时互通），经异步审批入队。资源域随服务创建，停止时
-  -- cgroup.kill 精确终止整个进程树。
+  -- 并合并回工作区暂存（边界同步，非实时互通），经异步审批入队。资源域随服务创建；停止时
+  -- 先向载荷进程发 SIGTERM 等待优雅退出，超时才 cgroup.kill 终止整个进程树。
   service = {
     enabled = true,          -- 是否注册 service_* 工具
     max_services = 16,       -- 同时存活的服务数上限
     max_log_bytes = 262144,  -- 单服务日志环形缓冲上限（字节）
-    stop_timeout_ms = 5000,  -- 停止时等待进程优雅退出的上限（超时 SIGKILL）
+    stop_timeout_ms = 5000,  -- 停止时先发 SIGTERM 等待优雅退出的上限（超时 SIGKILL）
+    auto_background = true,  -- run_command 的 &/nohup/setsid 自动转为长驻服务（跨调用存活）
   },
   -- systemctl 门面（方案 A）：AI 的独立 `systemctl`/`journalctl` 调用被路由到沙箱内长驻
   -- 服务（复用 sandbox.service），不调用宿主 systemd、也不修改宿主机。支持
@@ -401,6 +402,10 @@ sandbox = {
   container = { enabled = true, share_namespace = true, prefer = "podman", docker_to_podman = true },
   -- 存储基根：每进程实例隔离在 <workspace_root>/instances/<pid>_<ts>，待审队列/候选跨会话互不可见。
   workspace_root = vim.fn.stdpath("cache") .. "/NeoAI/sandbox",
+  -- 沙箱暂存后端（进程 overlay upper/work、每会话私有 /tmp、LSP overlay 等）：
+  --   "disk"（默认）= 磁盘（优先 /var/tmp，退回 nvim 缓存目录）下的无特征隐藏目录；
+  --   "shm" = /dev/shm（内存，更快但占内存）；绝对路径 = 以该目录为基。
+  staging_backend = "disk",
   session_shell = true,            -- run_command 会话内保留 shell 状态（export/cd 跨命令生效；仅 bwrap）
   process_roots = {},              -- 额外可写根（仅 read_all=false 或整机 overlay 不可用时生效；overlay 覆盖，默认仅 cwd 自动补入）。read_all=true（默认）时整机根已是可写 overlay，本项不再需要。/tmp、/var/tmp 属 tmpfs_roots；按需显式加回
   overlay_fail_closed = true,      -- overlay 不可用时拒绝 process 工具（不降级为私有 cwd）；false 才允许降级运行
@@ -460,10 +465,14 @@ sandbox = {
   -- 防止沙箱内命令吃满整机卡死；静态值 >0 时优先。所有并发任务挂在共享父域下，
   -- cpu_global_max 为并发 CPU 总预算（默认 核数-1），cpu_cores_max 为单任务配额。
   -- fail_closed=false 时 cgroup 不可用则跳过。
+  -- disk_bytes：沙箱暂存磁盘上限（字节；0=不限）。统计暂存基目录（进程 overlay/私有 tmp）
+  -- 与沙箱存储根（候选/待审/证据/服务 overlay）总占用；超限时拒绝写类/进程工具（用量异步
+  -- 统计并缓存，不阻塞命令开始）。
   limits = { wall_ms = 60000, dynamic = true, memory_ratio = 0.5, memory_max_bytes = 0,
     cpu_cores_max = 4, cpu_global_max = 0, pids_max = 2048, memory_bytes = 0, pids = 0, cpu_max = 0,
     cpu_affinity = "auto", -- 沙箱 CPU 亲和性：auto=绑定到 nvim 当前 CPU 之外的核（避免挤占 nvim）；off/ false=不绑定；"2,3"/"2-3"=显式 cpuset（需 taskset）
-    cgroup_base = "/sys/fs/cgroup", fail_closed = false },
+    cgroup_base = "/sys/fs/cgroup", fail_closed = false,
+    disk_bytes = 64 * 1024 * 1024 * 1024 }, -- 64 GiB（0 = 不限）
   seccomp_filter_path = "",        -- 可选：编译后 seccomp BPF 过滤器（配合 require_seccomp）
 }
 ```

@@ -47,6 +47,7 @@ local state = {
   active = nil, -- 当前暂存尝试（供 persist_buffer 重定向）
   session_unsubs = nil, -- 会话轮换的事件订阅句柄
   gc_scheduled = false, -- 已调度过期实例目录回收
+  warm_scheduled = false, -- 已调度运行时能力/overlay 探测预热（每进程一次）
 }
 
 -- ========== 私有函数 ==========
@@ -111,6 +112,19 @@ function M.init()
     local base = _base_root()
     vim.schedule(function() pcall(instance.gc, base) end)
   end
+  -- 预热运行时能力与 overlay 可写性探测：把首条进程命令开始处的同步功能实测（bwrap/
+  -- overlay，约百 ms）提前到启动空闲时机完成并写入缓存，避免 run_command 开始时卡主线程。
+  -- 每进程一次；延迟一小段让启动 UI 先渲染。探测函数被替换（测试桩）时跳过，避免干扰。
+  if not state.warm_scheduled then
+    state.warm_scheduled = true
+    local probe_ref = runtime.probe
+    vim.defer_fn(function()
+      if runtime.probe ~= probe_ref then return end
+      pcall(runtime.warm)
+    end, 200)
+  end
+  -- 后台统计一次沙箱暂存磁盘用量（供磁盘上限门禁读缓存；不阻塞启动）。
+  vim.schedule(function() pcall(function() require("NeoAI.sandbox.disk").refresh(true) end) end)
   return M
 end
 
@@ -417,6 +431,19 @@ function M.apply_all(opts)
   return review.apply_all(opts)
 end
 
+--- 开始批量应用会话：会话内 apply(id, { batch = ctx }) 把候选删除推迟到 end_batch
+--- 统一对账（避免逐项 O(n) 全表扫描在待审堆积时退化为 O(n²)）。供 UI 逐项让出主循环时使用。
+--- @return table ctx
+function M.begin_batch()
+  return review.begin_batch()
+end
+
+--- 结束批量应用会话：一次对账删除会话内已应用的候选。
+--- @param ctx table
+function M.end_batch(ctx)
+  return review.end_batch(ctx)
+end
+
 -- ========== 任务授权（task grant）==========
 
 --- 创建窄范围任务授权
@@ -624,6 +651,7 @@ function M.reset()
   trace.reset()
   pcall(function() require("NeoAI.sandbox.net_gateway").reset() end)
   pcall(function() require("NeoAI.sandbox.host_proxy").reset() end)
+  pcall(function() require("NeoAI.sandbox.disk").reset() end)
   -- 回收观测预热（后台预挂载的 bpftrace 探针 + 预创建 cgroup），避免 reset 后残留。
   pcall(function() require("NeoAI.sandbox.wrapper").clear_prewarm() end)
   state.active = nil

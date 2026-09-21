@@ -100,6 +100,14 @@ the folds that were **already expanded before the render** (`open_folds`): if hi
 `foldclose!`. **Do not** decide from the post-write `foldclosed` — rewriting the line itself briefly makes the fold look
 "expanded", and skipping on that basis leaves collapsed blocks exposing their content (the content is flushed out of the
 fold and back).
+Rewriting a fold's first line in place also triggers an nvim incremental-fold-update defect: the fold's end line is
+truncated and its content leaks outside the fold. Whenever the written range hits a fold's first line, `foldexpr` is
+reassigned to force a full fold recompute and repair the boundary. Detecting the first line **must not rely only on a
+`foldlevel` rise**: adjacent tool folds are all level 1, and the previous line is still the previous fold's level 1, so
+the level does not rise; combine it with the "closed-fold first line" check (`foldclosed(ln)==ln`) and the tool-block
+header text. Moreover, a structural change (e.g. a tool completing and appending result lines) can be written **in the
+same batch** as in-place refreshes, so this must not be gated on `inserted==removed`; otherwise the fold of a tool still
+running in the same batch is missed and its content leaks line by line outside the fold.
 When a command's **arguments or result contain a secret** (sandbox token `NEOKEY_*` or a raw secret matched by a
 named rule), a **separate highlighted warning line** (`⚠ 密钥`, `NeoAISecretWarning`) is appended **outside** the
 tool fold block; the fold title stays clean (no `⚠ 密钥` suffix) and the warning remains visible while collapsed.
@@ -216,6 +224,7 @@ Following deepseek-harness's Cordis plugin model, the chat view's "display modes
 | `tool_approval` | Tool approval popup. `init()`; serial single-slot display. |
 | `ask_user` | User questioning popup. `init()`; injected via `ask_user.set_ui`. |
 | `sub_agent_dock` | Sub-agent status monitoring. `init()`. |
+| `sandbox_review` | Sandbox pending-review UI. `open()`; highlights by path level (workspace green / user yellow / system red) and shows high/medium/low risk grades; items are sectioned into **unapplied (pending)** and **applied (snapshotted, revertible)**. Per-file approval: `<CR>` applies the file under the cursor, `A` approves every workspace change in one key (files outside the workspace and host-operation proposals stay pending; yields to the main loop between items, shows progress in the title, and refuses re-entry while running), `d` rejects only that file, `i` opens that item's diff preview (returns with cursor restored), `u` undoes/redoes the save, `r` refreshes, `q` closes. High-risk items (L3, and L2 package/sensitive installs when `package_confirm` is on) require an AI consequence warning plus a second `<CR>` in the diff. |
 | `fold` | Folds (shared implementation for reasoning/tool calls/results). `foldexpr`/`foldtext`/`record_start`/`record_end`/`has_running`/`set_live_timer`/`set_foldexpr_override`/`set_foldtext_override`/`set_reasoning_lines`/`is_reasoning_start`/`generic_label`. |
 | `display_modes/` | Display mode plugin manager + `chat.lua`/`trajectory.lua`. |
 | `markdown_view` | Markdown renderer. |

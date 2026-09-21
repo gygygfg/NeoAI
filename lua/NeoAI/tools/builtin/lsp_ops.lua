@@ -19,6 +19,12 @@ local function _bufnr(filepath)
     -- 磁盘直写工具（edit_file 等）只改磁盘不改已加载 buffer，导致内存与磁盘不一致；
     -- 这里把磁盘最新内容同步进 buffer，避免 LSP 基于过期内容（读错位置 / 重命名写回旧内容）。
     helpers.sync_buffer_from_disk(bufnr)
+    -- 沙箱激活且该文件有暂存副本时，用暂存内容覆盖**后台加载**的 buffer，使 LSP 客户端
+    -- 的 didOpen 文本与沙箱命名空间内的磁盘视图一致（与文件工具共享同一暂存视图）。
+    -- 用户已打开的 buffer 不受影响（sync_buffer_from_sandbox 仅作用于后台 buffer）。
+    if filepath and filepath ~= "" then
+      helpers.sync_buffer_from_sandbox(bufnr, filepath)
+    end
   end
   return bufnr
 end
@@ -28,9 +34,13 @@ end
 --- @return table|nil client
 local function _client_for(filepath)
   local bufnr = _bufnr(filepath)
-  if not bufnr then return nil end
+  if not bufnr then
+    return nil
+  end
   local clients = vim.lsp.get_clients({ bufnr = bufnr })
-  if #clients == 0 then return nil end
+  if #clients == 0 then
+    return nil
+  end
   return clients[1]
 end
 
@@ -42,11 +52,15 @@ local function _client_supporting(method, bufnr)
   local ok, sandbox = pcall(require, "NeoAI.sandbox.lsp")
   if ok and sandbox then
     local ok2, clone = pcall(sandbox.client_supporting, method, bufnr)
-    if ok2 and clone then return clone end
+    if ok2 and clone then
+      return clone
+    end
   end
   local clients = bufnr and vim.lsp.get_clients({ bufnr = bufnr }) or vim.lsp.get_clients()
   for _, client in ipairs(clients) do
-    if client:supports_method(method, bufnr) then return client end
+    if client:supports_method(method, bufnr) then
+      return client
+    end
   end
   return nil
 end
@@ -67,7 +81,9 @@ local function _request(method, params, target)
     local ok, sandbox = pcall(require, "NeoAI.sandbox.lsp")
     if ok and sandbox then
       local ok2, clone = pcall(sandbox.client_supporting, method, target)
-      if ok2 and clone then target = clone end
+      if ok2 and clone then
+        target = clone
+      end
     end
   end
 
@@ -77,7 +93,9 @@ local function _request(method, params, target)
 
   local timer
   local function _settle(ok_, value)
-    if called then return end
+    if called then
+      return
+    end
     called = true
     if timer and timer:is_active() then
       pcall(timer.stop, timer)
@@ -117,13 +135,19 @@ local function _request(method, params, target)
       -- 区分两者给出准确错误，避免误导为"无 LSP 客户端"。
       local clients = vim.lsp.get_clients({ bufnr = target })
       if #clients == 0 then
-        _settle(false, { kind = "lsp", message = "无 LSP 客户端（文件可能在后台加载，客户端未附加）" })
+        _settle(
+          false,
+          { kind = "lsp", message = "无 LSP 客户端（文件可能在后台加载，客户端未附加）" }
+        )
       else
         _settle(false, { kind = "lsp", message = ("当前 LSP 客户端不支持请求: %s"):format(method) })
       end
     elseif id == 0 then
       -- 旧版 API：返回 0 表示无客户端
-      _settle(false, { kind = "lsp", message = "无 LSP 客户端（文件可能在后台加载，客户端未附加）" })
+      _settle(
+        false,
+        { kind = "lsp", message = "无 LSP 客户端（文件可能在后台加载，客户端未附加）" }
+      )
     end
   else
     local ok, err = pcall(function()
@@ -141,7 +165,9 @@ end
 --- @return number bufnr, number line, number col
 local function _position(args)
   local bufnr = _bufnr(args.filepath)
-  if not bufnr then return nil end
+  if not bufnr then
+    return nil
+  end
   local line = (args.line or 0) - 1 -- LSP 为 0-based
   local col = args.col or 0
   return bufnr, math.max(0, line), math.max(0, col)
@@ -174,7 +200,75 @@ local function _safe_then(d, process, on_success, on_error)
     else
       on_error("LSP 结果处理失败: " .. tostring(out))
     end
-  end, function(e) on_error(e.message) end)
+  end, function(e)
+    on_error(e.message)
+  end)
+end
+
+--- 触发一次 didChange（内容不变）让已附加的 LSP 服务器重新 lint。
+--- push 模型服务器只在收到 didChange 后重新发布诊断，读缓存会拿到陈旧结果；
+--- 这里重设相同内容：Neovim 的 LSP sync 随之发送 didChange。不改内容、不产生撤销项、
+--- 不残留 modified 标记（`undolevels=-1` 期间写入，事后恢复）。
+--- @param bufnr number
+--- @return boolean
+local function _touch_buffer(bufnr)
+  if not vim.api.nvim_buf_is_loaded(bufnr) or not vim.bo[bufnr].modifiable then
+    return false
+  end
+  local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+  local was_modified = vim.bo[bufnr].modified
+  local undolevels = vim.bo[bufnr].undolevels
+  local ok = pcall(function()
+    vim.bo[bufnr].undolevels = -1
+    vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, lines)
+  end)
+  pcall(function()
+    vim.bo[bufnr].undolevels = undolevels
+  end)
+  if not was_modified then
+    pcall(function()
+      vim.bo[bufnr].modified = false
+    end)
+  end
+  return ok
+end
+
+--- 等待服务器针对该 buffer 重新发布诊断（`textDocument/publishDiagnostics`），
+--- 超时（`tools.lsp.timeout_ms`）后仍返回当前缓存。等待期间不阻塞主线程。
+--- @param bufnr number
+--- @param cb function
+local function _await_publish(bufnr, cb)
+  local done = false
+  local timer, au
+  local function finish()
+    if done then
+      return
+    end
+    done = true
+    if timer then
+      pcall(function() timer:stop() end)
+      pcall(function() timer:close() end)
+    end
+    if au then
+      pcall(vim.api.nvim_del_autocmd, au)
+    end
+    -- 诊断缓存由 publishDiagnostics 处理器写入；LspNotify 可能早于处理器，延后一个 tick 再读。
+    vim.schedule(cb)
+  end
+  au = vim.api.nvim_create_autocmd("LspNotify", {
+    buffer = bufnr,
+    callback = function(opts)
+      local data = opts and opts.data
+      if data and data.method == "textDocument/publishDiagnostics" then
+        finish()
+      end
+    end,
+  })
+  local timeout_ms = config_store.get("tools.lsp.timeout_ms") or 10000
+  timer = vim.uv.new_timer()
+  timer:start(timeout_ms, 0, function()
+    vim.schedule(finish)
+  end)
 end
 
 -- ========== 工具定义 ==========
@@ -196,24 +290,36 @@ lsp_tools.lsp_hover = helpers.define_tool(
   },
   function(args, on_success, on_error)
     local bufnr, line, col = _position(args)
-    if not bufnr then on_error("无法找到文件 buffer") return end
-    _safe_then(_request("textDocument/hover", { textDocument = { uri = vim.uri_from_bufnr(bufnr) }, position = { line = line, character = col } }, bufnr), function(result)
-      if result and result.contents then
-        local out = {}
-        local contents = result.contents
-        if type(contents) == "string" then
-          out[1] = contents
-        elseif type(contents) == "table" and contents.value then
-          out[1] = contents.value
-        elseif type(contents) == "table" then
-          for _, c in ipairs(contents) do
-            out[#out + 1] = type(c) == "table" and (c.value or "") or tostring(c)
+    if not bufnr then
+      on_error("无法找到文件 buffer")
+      return
+    end
+    _safe_then(
+      _request(
+        "textDocument/hover",
+        { textDocument = { uri = vim.uri_from_bufnr(bufnr) }, position = { line = line, character = col } },
+        bufnr
+      ),
+      function(result)
+        if result and result.contents then
+          local out = {}
+          local contents = result.contents
+          if type(contents) == "string" then
+            out[1] = contents
+          elseif type(contents) == "table" and contents.value then
+            out[1] = contents.value
+          elseif type(contents) == "table" then
+            for _, c in ipairs(contents) do
+              out[#out + 1] = type(c) == "table" and (c.value or "") or tostring(c)
+            end
           end
+          return table.concat(out, "\n")
         end
-        return table.concat(out, "\n")
-      end
-      return "无悬停信息"
-    end, on_success, on_error)
+        return "无悬停信息"
+      end,
+      on_success,
+      on_error
+    )
   end,
   { category = "lsp" }
 )
@@ -229,16 +335,35 @@ lsp_tools.lsp_definition = helpers.define_tool(
   },
   function(args, on_success, on_error)
     local bufnr, line, col = _position(args)
-    if not bufnr then on_error("无法找到文件 buffer") return end
-    _safe_then(_request("textDocument/definition", { textDocument = { uri = vim.uri_from_bufnr(bufnr) }, position = { line = line, character = col } }, bufnr), function(locations)
-      if not locations or #locations == 0 then return "未找到定义" end
-      local out = {}
-      for _, loc in ipairs(locations) do
-        local uri, range = _location_fields(loc)
-        out[#out + 1] = string.format("%s:%d:%d", vim.uri_to_fname(uri), (range and range.start.line or 0) + 1, range and range.start.character or 0)
-      end
-      return table.concat(out, "\n")
-    end, on_success, on_error)
+    if not bufnr then
+      on_error("无法找到文件 buffer")
+      return
+    end
+    _safe_then(
+      _request(
+        "textDocument/definition",
+        { textDocument = { uri = vim.uri_from_bufnr(bufnr) }, position = { line = line, character = col } },
+        bufnr
+      ),
+      function(locations)
+        if not locations or #locations == 0 then
+          return "未找到定义"
+        end
+        local out = {}
+        for _, loc in ipairs(locations) do
+          local uri, range = _location_fields(loc)
+          out[#out + 1] = string.format(
+            "%s:%d:%d",
+            vim.uri_to_fname(uri),
+            (range and range.start.line or 0) + 1,
+            range and range.start.character or 0
+          )
+        end
+        return table.concat(out, "\n")
+      end,
+      on_success,
+      on_error
+    )
   end,
   { category = "lsp" }
 )
@@ -254,18 +379,41 @@ lsp_tools.lsp_references = helpers.define_tool(
   },
   function(args, on_success, on_error)
     local bufnr, line, col = _position(args)
-    if not bufnr then on_error("无法找到文件 buffer") return end
+    if not bufnr then
+      on_error("无法找到文件 buffer")
+      return
+    end
     -- context 为 LSP 必填字段（ReferenceParams），缺失时部分服务器（如 lua-language-server
     -- provider.lua 会访问 params.context.includeDeclaration）直接内部异常。
-    _safe_then(_request("textDocument/references", { textDocument = { uri = vim.uri_from_bufnr(bufnr) }, position = { line = line, character = col }, context = { includeDeclaration = true } }, bufnr), function(locations)
-      if not locations or #locations == 0 then return "未找到引用" end
-      local out = {}
-      for _, loc in ipairs(locations) do
-        local uri, range = _location_fields(loc)
-        out[#out + 1] = string.format("%s:%d:%d", vim.uri_to_fname(uri), (range and range.start.line or 0) + 1, range and range.start.character or 0)
-      end
-      return table.concat(out, "\n")
-    end, on_success, on_error)
+    _safe_then(
+      _request(
+        "textDocument/references",
+        {
+          textDocument = { uri = vim.uri_from_bufnr(bufnr) },
+          position = { line = line, character = col },
+          context = { includeDeclaration = true },
+        },
+        bufnr
+      ),
+      function(locations)
+        if not locations or #locations == 0 then
+          return "未找到引用"
+        end
+        local out = {}
+        for _, loc in ipairs(locations) do
+          local uri, range = _location_fields(loc)
+          out[#out + 1] = string.format(
+            "%s:%d:%d",
+            vim.uri_to_fname(uri),
+            (range and range.start.line or 0) + 1,
+            range and range.start.character or 0
+          )
+        end
+        return table.concat(out, "\n")
+      end,
+      on_success,
+      on_error
+    )
   end,
   { category = "lsp" }
 )
@@ -281,19 +429,33 @@ lsp_tools.lsp_document_symbols = helpers.define_tool(
   },
   function(args, on_success, on_error)
     local bufnr = _bufnr(args.filepath)
-    if not bufnr then on_error("无法找到文件 buffer") return end
-    _safe_then(_request("textDocument/documentSymbol", { textDocument = { uri = vim.uri_from_bufnr(bufnr) } }, bufnr), function(symbols)
-      if not symbols or #symbols == 0 then return "无符号" end
-      local out = {}
-      local function walk(sym, depth)
-        local name = sym.name or ""
-        local kind = vim.lsp.protocol.SymbolKind[sym.kind] or tostring(sym.kind)
-        out[#out + 1] = string.rep("  ", depth) .. name .. " (" .. kind .. ")"
-        for _, child in ipairs(sym.children or {}) do walk(child, depth + 1) end
-      end
-      for _, sym in ipairs(symbols) do walk(sym, 0) end
-      return table.concat(out, "\n")
-    end, on_success, on_error)
+    if not bufnr then
+      on_error("无法找到文件 buffer")
+      return
+    end
+    _safe_then(
+      _request("textDocument/documentSymbol", { textDocument = { uri = vim.uri_from_bufnr(bufnr) } }, bufnr),
+      function(symbols)
+        if not symbols or #symbols == 0 then
+          return "无符号"
+        end
+        local out = {}
+        local function walk(sym, depth)
+          local name = sym.name or ""
+          local kind = vim.lsp.protocol.SymbolKind[sym.kind] or tostring(sym.kind)
+          out[#out + 1] = string.rep("  ", depth) .. name .. " (" .. kind .. ")"
+          for _, child in ipairs(sym.children or {}) do
+            walk(child, depth + 1)
+          end
+        end
+        for _, sym in ipairs(symbols) do
+          walk(sym, 0)
+        end
+        return table.concat(out, "\n")
+      end,
+      on_success,
+      on_error
+    )
   end,
   { category = "lsp" }
 )
@@ -316,7 +478,9 @@ lsp_tools.lsp_workspace_symbols = helpers.define_tool(
       return
     end
     _safe_then(_request("workspace/symbol", { query = args.query }, client), function(symbols)
-      if not symbols or #symbols == 0 then return "无匹配符号" end
+      if not symbols or #symbols == 0 then
+        return "无匹配符号"
+      end
       local out = {}
       for _, sym in ipairs(symbols) do
         local uri = sym.location and (sym.location.uri or sym.location.targetUri)
@@ -329,72 +493,81 @@ lsp_tools.lsp_workspace_symbols = helpers.define_tool(
 )
 
 --- 诊断信息
-lsp_tools.lsp_diagnostics = helpers.define_tool(
-  "lsp_diagnostics",
-  "获取文件诊断信息。filepath 可选。",
-  {
-    type = "object",
-    properties = { filepath = { type = "string" } },
-    required = {},
-  },
-  function(args, on_success, on_error)
-    local bufnr = _bufnr(args.filepath)
-    if not bufnr then on_error("无法找到文件 buffer") return end
-    local uri = vim.uri_from_bufnr(bufnr)
+lsp_tools.lsp_diagnostics = helpers.define_tool("lsp_diagnostics", "重新获取文件诊断信息。", {
+  type = "object",
+  properties = { filepath = { type = "string" } },
+  required = {},
+}, function(args, on_success, on_error)
+  local bufnr = _bufnr(args.filepath)
+  if not bufnr then
+    on_error("无法找到文件 buffer")
+    return
+  end
+  local uri = vim.uri_from_bufnr(bufnr)
 
-    local function _format(diagnostics)
-      if not diagnostics or #diagnostics == 0 then on_success("无诊断信息") return end
-      local out = {}
-      for _, diag in ipairs(diagnostics) do
-        local sev = vim.diagnostic.severity[diag.severity] or "?"
-        out[#out + 1] = string.format("%s:%d %s: %s", args.filepath or "(当前)", diag.lnum + 1, sev, diag.message)
-      end
-      on_success(table.concat(out, "\n"))
-    end
-
-    -- 优先从 AI 沙箱克隆拉取诊断（反映暂存内容）；服务器不支持 pull 时回退编辑器诊断。
-    local clone = _client_supporting("textDocument/diagnostic", bufnr)
-    if clone then
-      _request("textDocument/diagnostic", { textDocument = { uri = uri } }, clone):then_(function(result)
-        local items = type(result) == "table" and result.items or nil
-        if items then
-          _format(vim.tbl_map(function(d)
-            local r = d.range or { start = { line = 0, character = 0 } }
-            return { lnum = r.start.line, severity = d.severity, message = d.message }
-          end, items))
-        else
-          _format(vim.diagnostic.get(bufnr))
-        end
-      end, function()
-        _format(vim.diagnostic.get(bufnr))
-      end)
+  local function _format(diagnostics)
+    if not diagnostics or #diagnostics == 0 then
+      on_success("无诊断信息")
       return
     end
+    local out = {}
+    for _, diag in ipairs(diagnostics) do
+      local sev = vim.diagnostic.severity[diag.severity] or "?"
+      out[#out + 1] = string.format("%s:%d %s: %s", args.filepath or "(当前)", diag.lnum + 1, sev, diag.message)
+    end
+    on_success(table.concat(out, "\n"))
+  end
+
+  -- 每次调用都重新获取：
+  -- 1) pull 客户端（textDocument/diagnostic，优先 AI 沙箱克隆）：直接请求最新诊断；
+  -- 2) 仅 push 客户端：强制触发一次 didChange 让服务器重新 lint，等其发布后再读缓存，
+  --    避免返回陈旧的 `vim.diagnostic.get` 缓存。
+  local client = _client_supporting("textDocument/diagnostic", bufnr)
+  if client then
+    _request("textDocument/diagnostic", { textDocument = { uri = uri } }, client):then_(function(result)
+      local items = type(result) == "table" and result.items or nil
+      if items then
+        _format(vim.tbl_map(function(d)
+          local r = d.range or { start = { line = 0, character = 0 } }
+          return { lnum = r.start.line, severity = d.severity, message = d.message }
+        end, items))
+      else
+        _format(vim.diagnostic.get(bufnr))
+      end
+    end, function()
+      _format(vim.diagnostic.get(bufnr))
+    end)
+    return
+  end
+  if #vim.lsp.get_clients({ bufnr = bufnr }) == 0 then
+    on_error("无 LSP 客户端（文件可能在后台加载，客户端未附加）")
+    return
+  end
+  _touch_buffer(bufnr)
+  _await_publish(bufnr, function()
     _format(vim.diagnostic.get(bufnr))
-  end,
-  { category = "lsp" }
-)
+  end)
+end, { category = "lsp" })
 
 --- 客户端信息
-lsp_tools.lsp_client_info = helpers.define_tool(
-  "lsp_client_info",
-  "获取 LSP 客户端信息。filepath 可选。",
-  {
-    type = "object",
-    properties = { filepath = { type = "string" } },
-    required = {},
-  },
-  function(args, on_success)
-    local bufnr = _bufnr(args.filepath)
-    local clients = vim.lsp.get_clients()
-    local out = {}
-    for _, c in ipairs(clients) do
-      out[#out + 1] = string.format("%s (%s)%s", c.name, c.root_dir or "", (bufnr and vim.lsp.get_client_by_id(c.id) and " [active]" or ""))
-    end
-    on_success(#out > 0 and table.concat(out, "\n") or "无 LSP 客户端")
-  end,
-  { category = "lsp" }
-)
+lsp_tools.lsp_client_info = helpers.define_tool("lsp_client_info", "获取 LSP 客户端信息。filepath 可选。", {
+  type = "object",
+  properties = { filepath = { type = "string" } },
+  required = {},
+}, function(args, on_success)
+  local bufnr = _bufnr(args.filepath)
+  local clients = vim.lsp.get_clients()
+  local out = {}
+  for _, c in ipairs(clients) do
+    out[#out + 1] = string.format(
+      "%s (%s)%s",
+      c.name,
+      c.root_dir or "",
+      (bufnr and vim.lsp.get_client_by_id(c.id) and " [active]" or "")
+    )
+  end
+  on_success(#out > 0 and table.concat(out, "\n") or "无 LSP 客户端")
+end, { category = "lsp" })
 
 --- 代码操作
 lsp_tools.lsp_code_action = helpers.define_tool(
@@ -407,85 +580,141 @@ lsp_tools.lsp_code_action = helpers.define_tool(
   },
   function(args, on_success, on_error)
     local bufnr, line, col = _position(args)
-    if not bufnr then on_error("无法找到文件 buffer") return end
+    if not bufnr then
+      on_error("无法找到文件 buffer")
+      return
+    end
     local range = { start = { line = line, character = col }, ["end"] = { line = line, character = col + 1 } }
-    _safe_then(_request("textDocument/codeAction", { textDocument = { uri = vim.uri_from_bufnr(bufnr) }, range = range, context = { diagnostics = {} } }, bufnr), function(actions)
-      if not actions or #actions == 0 then return "无代码操作" end
-      local out = {}
-      for _, a in ipairs(actions) do
-        out[#out + 1] = (a.title or a.kind or "action")
-      end
-      return table.concat(out, "\n")
-    end, on_success, on_error)
+    _safe_then(
+      _request(
+        "textDocument/codeAction",
+        { textDocument = { uri = vim.uri_from_bufnr(bufnr) }, range = range, context = { diagnostics = {} } },
+        bufnr
+      ),
+      function(actions)
+        if not actions or #actions == 0 then
+          return "无代码操作"
+        end
+        local out = {}
+        for _, a in ipairs(actions) do
+          out[#out + 1] = (a.title or a.kind or "action")
+        end
+        return table.concat(out, "\n")
+      end,
+      on_success,
+      on_error
+    )
   end,
   { category = "lsp" }
 )
 
 --- 重命名
-lsp_tools.lsp_rename = helpers.define_tool(
-  "lsp_rename",
-  "重命名符号。filepath/line/col/new_name 必填。",
-  {
-    type = "object",
-    properties = {
-      filepath = { type = "string" }, line = { type = "integer" }, col = { type = "integer" },
-      new_name = { type = "string" },
-    },
-    required = { "new_name" },
+lsp_tools.lsp_rename = helpers.define_tool("lsp_rename", "重命名符号。filepath/line/col/new_name 必填。", {
+  type = "object",
+  properties = {
+    filepath = { type = "string" },
+    line = { type = "integer" },
+    col = { type = "integer" },
+    new_name = { type = "string" },
   },
-  function(args, on_success, on_error)
-    local bufnr, line, col = _position(args)
-    if not bufnr then on_error("无法找到文件 buffer") return end
-    _safe_then(_request("textDocument/rename", { textDocument = { uri = vim.uri_from_bufnr(bufnr) }, position = { line = line, character = col }, newName = args.new_name }, bufnr), function(edit)
-      if not edit or not edit.changes then return "无重命名编辑" end
+  required = { "new_name" },
+}, function(args, on_success, on_error)
+  local bufnr, line, col = _position(args)
+  if not bufnr then
+    on_error("无法找到文件 buffer")
+    return
+  end
+  _safe_then(
+    _request(
+      "textDocument/rename",
+      {
+        textDocument = { uri = vim.uri_from_bufnr(bufnr) },
+        position = { line = line, character = col },
+        newName = args.new_name,
+      },
+      bufnr
+    ),
+    function(edit)
+      if not edit or not edit.changes then
+        return "无重命名编辑"
+      end
       local changed = 0
       for uri, changes in pairs(edit.changes) do
         local b = helpers.ensure_buffer(vim.uri_to_fname(uri))
-        if not b then error("重命名失败：无法加载文件 " .. vim.uri_to_fname(uri)) end
+        if not b then
+          error("重命名失败：无法加载文件 " .. vim.uri_to_fname(uri))
+        end
         -- 目标文件可能因磁盘直写工具（edit_file 等）而陈旧：先同步再应用编辑，
         -- 否则基于过期内容写回会把磁盘新内容覆盖成旧内容（改名错位）。
         helpers.sync_buffer_from_disk(b)
         for _, ch in ipairs(changes) do
-          pcall(vim.api.nvim_buf_set_text, b, ch.range.start.line, ch.range.start.character, ch.range["end"].line, ch.range["end"].character, vim.split(ch.newText, "\n", { plain = true }))
+          pcall(
+            vim.api.nvim_buf_set_text,
+            b,
+            ch.range.start.line,
+            ch.range.start.character,
+            ch.range["end"].line,
+            ch.range["end"].character,
+            vim.split(ch.newText, "\n", { plain = true })
+          )
         end
         helpers.mark_edited(b) -- 显式编辑：允许回写（只读加载/同步不标记、不回写）
         local saved, err = helpers.persist_buffer(b)
-        if not saved then error("重命名失败：无法保存文件 " .. vim.uri_to_fname(uri) .. " (" .. tostring(err) .. ")") end
+        if not saved then
+          error("重命名失败：无法保存文件 " .. vim.uri_to_fname(uri) .. " (" .. tostring(err) .. ")")
+        end
         changed = changed + 1
       end
       return ("重命名完成（%d 个文件）"):format(changed)
-    end, on_success, on_error)
-  end,
-  { category = "lsp", approval = { auto_allow = false } }
-)
+    end,
+    on_success,
+    on_error
+  )
+end, { category = "lsp", approval = { auto_allow = false } })
 
 --- 格式化
-lsp_tools.lsp_format = helpers.define_tool(
-  "lsp_format",
-  "格式化文档。filepath 可选。",
-  {
-    type = "object",
-    properties = { filepath = { type = "string" } },
-    required = {},
-  },
-  function(args, on_success, on_error)
-    local bufnr = _bufnr(args.filepath)
-    if not bufnr then on_error("无法找到文件 buffer") return end
-    _safe_then(_request("textDocument/formatting", { textDocument = { uri = vim.uri_from_bufnr(bufnr) }, options = { tabSize = 2, insertSpaces = true } }, bufnr), function(edits)
+lsp_tools.lsp_format = helpers.define_tool("lsp_format", "格式化文档。filepath 可选。", {
+  type = "object",
+  properties = { filepath = { type = "string" } },
+  required = {},
+}, function(args, on_success, on_error)
+  local bufnr = _bufnr(args.filepath)
+  if not bufnr then
+    on_error("无法找到文件 buffer")
+    return
+  end
+  _safe_then(
+    _request(
+      "textDocument/formatting",
+      { textDocument = { uri = vim.uri_from_bufnr(bufnr) }, options = { tabSize = 2, insertSpaces = true } },
+      bufnr
+    ),
+    function(edits)
       if edits and #edits > 0 then
         for _, e in ipairs(edits) do
-          pcall(vim.api.nvim_buf_set_text, bufnr, e.range.start.line, e.range.start.character, e.range["end"].line, e.range["end"].character, vim.split(e.newText, "\n", { plain = true }))
+          pcall(
+            vim.api.nvim_buf_set_text,
+            bufnr,
+            e.range.start.line,
+            e.range.start.character,
+            e.range["end"].line,
+            e.range["end"].character,
+            vim.split(e.newText, "\n", { plain = true })
+          )
         end
         helpers.mark_edited(bufnr) -- 显式编辑：允许回写（只读加载路径不标记、不回写）
         local saved, err = helpers.persist_buffer(bufnr)
-        if not saved then error("格式化失败：无法保存文件（" .. tostring(err) .. "）") end
+        if not saved then
+          error("格式化失败：无法保存文件（" .. tostring(err) .. "）")
+        end
         return "格式化完成"
       end
       return "无需格式化"
-    end, on_success, on_error)
-  end,
-  { category = "lsp", approval = { auto_allow = false } }
-)
+    end,
+    on_success,
+    on_error
+  )
+end, { category = "lsp", approval = { auto_allow = false } })
 
 --- 签名帮助
 lsp_tools.lsp_signature_help = helpers.define_tool(
@@ -498,44 +727,62 @@ lsp_tools.lsp_signature_help = helpers.define_tool(
   },
   function(args, on_success, on_error)
     local bufnr, line, col = _position(args)
-    if not bufnr then on_error("无法找到文件 buffer") return end
-    _safe_then(_request("textDocument/signatureHelp", { textDocument = { uri = vim.uri_from_bufnr(bufnr) }, position = { line = line, character = col } }, bufnr), function(result)
-      if result and result.signatures and #result.signatures > 0 then
-        local out = {}
-        for _, s in ipairs(result.signatures) do
-          out[#out + 1] = s.label or ""
+    if not bufnr then
+      on_error("无法找到文件 buffer")
+      return
+    end
+    _safe_then(
+      _request(
+        "textDocument/signatureHelp",
+        { textDocument = { uri = vim.uri_from_bufnr(bufnr) }, position = { line = line, character = col } },
+        bufnr
+      ),
+      function(result)
+        if result and result.signatures and #result.signatures > 0 then
+          local out = {}
+          for _, s in ipairs(result.signatures) do
+            out[#out + 1] = s.label or ""
+          end
+          return table.concat(out, "\n")
         end
-        return table.concat(out, "\n")
-      end
-      return "无签名信息"
-    end, on_success, on_error)
+        return "无签名信息"
+      end,
+      on_success,
+      on_error
+    )
   end,
   { category = "lsp" }
 )
 
 --- 补全
-lsp_tools.lsp_completion = helpers.define_tool(
-  "lsp_completion",
-  "获取补全建议。filepath/line/col 可选。",
-  {
-    type = "object",
-    properties = { filepath = { type = "string" }, line = { type = "integer" }, col = { type = "integer" } },
-    required = {},
-  },
-  function(args, on_success, on_error)
-    local bufnr, line, col = _position(args)
-    if not bufnr then on_error("无法找到文件 buffer") return end
-    _safe_then(_request("textDocument/completion", { textDocument = { uri = vim.uri_from_bufnr(bufnr) }, position = { line = line, character = col } }, bufnr), function(result)
+lsp_tools.lsp_completion = helpers.define_tool("lsp_completion", "获取补全建议。filepath/line/col 可选。", {
+  type = "object",
+  properties = { filepath = { type = "string" }, line = { type = "integer" }, col = { type = "integer" } },
+  required = {},
+}, function(args, on_success, on_error)
+  local bufnr, line, col = _position(args)
+  if not bufnr then
+    on_error("无法找到文件 buffer")
+    return
+  end
+  _safe_then(
+    _request(
+      "textDocument/completion",
+      { textDocument = { uri = vim.uri_from_bufnr(bufnr) }, position = { line = line, character = col } },
+      bufnr
+    ),
+    function(result)
       local items = result and (result.items or result) or {}
       local out = {}
       for _, item in ipairs(items) do
         out[#out + 1] = item.label or ""
       end
       return #out > 0 and table.concat(out, "\n") or "无补全建议"
-    end, on_success, on_error)
-  end,
-  { category = "lsp" }
-)
+    end,
+    on_success,
+    on_error
+  )
+end, { category = "lsp" })
 
 --- 类型定义
 lsp_tools.lsp_type_definition = helpers.define_tool(
@@ -548,16 +795,35 @@ lsp_tools.lsp_type_definition = helpers.define_tool(
   },
   function(args, on_success, on_error)
     local bufnr, line, col = _position(args)
-    if not bufnr then on_error("无法找到文件 buffer") return end
-    _safe_then(_request("textDocument/typeDefinition", { textDocument = { uri = vim.uri_from_bufnr(bufnr) }, position = { line = line, character = col } }, bufnr), function(locations)
-      if not locations or #locations == 0 then return "未找到类型定义" end
-      local out = {}
-      for _, loc in ipairs(locations) do
-        local uri, range = _location_fields(loc)
-        out[#out + 1] = string.format("%s:%d:%d", vim.uri_to_fname(uri), (range and range.start.line or 0) + 1, range and range.start.character or 0)
-      end
-      return table.concat(out, "\n")
-    end, on_success, on_error)
+    if not bufnr then
+      on_error("无法找到文件 buffer")
+      return
+    end
+    _safe_then(
+      _request(
+        "textDocument/typeDefinition",
+        { textDocument = { uri = vim.uri_from_bufnr(bufnr) }, position = { line = line, character = col } },
+        bufnr
+      ),
+      function(locations)
+        if not locations or #locations == 0 then
+          return "未找到类型定义"
+        end
+        local out = {}
+        for _, loc in ipairs(locations) do
+          local uri, range = _location_fields(loc)
+          out[#out + 1] = string.format(
+            "%s:%d:%d",
+            vim.uri_to_fname(uri),
+            (range and range.start.line or 0) + 1,
+            range and range.start.character or 0
+          )
+        end
+        return table.concat(out, "\n")
+      end,
+      on_success,
+      on_error
+    )
   end,
   { category = "lsp" }
 )
@@ -573,16 +839,35 @@ lsp_tools.lsp_declaration = helpers.define_tool(
   },
   function(args, on_success, on_error)
     local bufnr, line, col = _position(args)
-    if not bufnr then on_error("无法找到文件 buffer") return end
-    _safe_then(_request("textDocument/declaration", { textDocument = { uri = vim.uri_from_bufnr(bufnr) }, position = { line = line, character = col } }, bufnr), function(locations)
-      if not locations or #locations == 0 then return "未找到声明" end
-      local out = {}
-      for _, loc in ipairs(locations) do
-        local uri, range = _location_fields(loc)
-        out[#out + 1] = string.format("%s:%d:%d", vim.uri_to_fname(uri), (range and range.start.line or 0) + 1, range and range.start.character or 0)
-      end
-      return table.concat(out, "\n")
-    end, on_success, on_error)
+    if not bufnr then
+      on_error("无法找到文件 buffer")
+      return
+    end
+    _safe_then(
+      _request(
+        "textDocument/declaration",
+        { textDocument = { uri = vim.uri_from_bufnr(bufnr) }, position = { line = line, character = col } },
+        bufnr
+      ),
+      function(locations)
+        if not locations or #locations == 0 then
+          return "未找到声明"
+        end
+        local out = {}
+        for _, loc in ipairs(locations) do
+          local uri, range = _location_fields(loc)
+          out[#out + 1] = string.format(
+            "%s:%d:%d",
+            vim.uri_to_fname(uri),
+            (range and range.start.line or 0) + 1,
+            range and range.start.character or 0
+          )
+        end
+        return table.concat(out, "\n")
+      end,
+      on_success,
+      on_error
+    )
   end,
   { category = "lsp" }
 )
@@ -598,16 +883,35 @@ lsp_tools.lsp_implementation = helpers.define_tool(
   },
   function(args, on_success, on_error)
     local bufnr, line, col = _position(args)
-    if not bufnr then on_error("无法找到文件 buffer") return end
-    _safe_then(_request("textDocument/implementation", { textDocument = { uri = vim.uri_from_bufnr(bufnr) }, position = { line = line, character = col } }, bufnr), function(locations)
-      if not locations or #locations == 0 then return "未找到实现" end
-      local out = {}
-      for _, loc in ipairs(locations) do
-        local uri, range = _location_fields(loc)
-        out[#out + 1] = string.format("%s:%d:%d", vim.uri_to_fname(uri), (range and range.start.line or 0) + 1, range and range.start.character or 0)
-      end
-      return table.concat(out, "\n")
-    end, on_success, on_error)
+    if not bufnr then
+      on_error("无法找到文件 buffer")
+      return
+    end
+    _safe_then(
+      _request(
+        "textDocument/implementation",
+        { textDocument = { uri = vim.uri_from_bufnr(bufnr) }, position = { line = line, character = col } },
+        bufnr
+      ),
+      function(locations)
+        if not locations or #locations == 0 then
+          return "未找到实现"
+        end
+        local out = {}
+        for _, loc in ipairs(locations) do
+          local uri, range = _location_fields(loc)
+          out[#out + 1] = string.format(
+            "%s:%d:%d",
+            vim.uri_to_fname(uri),
+            (range and range.start.line or 0) + 1,
+            range and range.start.character or 0
+          )
+        end
+        return table.concat(out, "\n")
+      end,
+      on_success,
+      on_error
+    )
   end,
   { category = "lsp" }
 )

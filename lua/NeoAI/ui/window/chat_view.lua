@@ -143,14 +143,23 @@ local function _render(keep_view)
       local from, to = incremental.written_range(diff)
       -- 就地改写折叠首行（行数不变的局部替换，如工具耗时刷新）会触发 nvim 增量折叠更新的
       -- 缺陷：该折叠的结束行被截断，折叠内容泄漏到折叠外（表现为折叠文本下方一行行露出
-      -- 内容）。这里检测写入区间是否命中折叠首行，命中则重新赋值 foldexpr 强制整段折叠
-      -- 重算以修正边界；该操作不会关闭用户已展开的折叠，且仅在行数不变时触发，代价可控。
-      if from > 0 and diff.inserted == diff.removed then
+      -- 内容）。只要写入区间命中**折叠首行**，就重新赋值 foldexpr 强制整段折叠重算以修正
+      -- 边界；该操作不会关闭用户已展开的折叠。
+      -- 识别折叠首行不能只看 foldlevel 上升：相邻工具折叠同为 level 1，前一行仍是上一
+      -- 折叠的 level 1，级别并不上升；需结合「闭合折叠首行」(foldclosed(ln)==ln) 与工具块
+      -- 首行文本兜底。且结构性变化（如某工具完成追加结果行）可能与就地刷新同批写入，故不能
+      -- 只在 inserted==removed 时判定，否则同批中仍在执行工具的折叠会漏修（内容泄漏）。
+      if from > 0 and not diff.full then
         local need_recompute = false
         for ln = from, to do
           local prev_lvl = (ln > 1) and vim.fn.foldlevel(ln - 1) or 0
           local lvl = vim.fn.foldlevel(ln)
-          if lvl > 0 and lvl > prev_lvl then
+          if lvl > 0 and (lvl > prev_lvl or vim.fn.foldclosed(ln) == ln) then
+            need_recompute = true
+            break
+          end
+          local kind = fold.detect(vim.fn.getline(ln) or "")
+          if kind == "tool_call" or kind == "tool_result" then
             need_recompute = true
             break
           end

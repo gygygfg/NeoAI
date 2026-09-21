@@ -175,10 +175,12 @@ When a command ends with exit code 137 (SIGKILL), the resource-domain events are
 ### 🔌 Long-lived services (service.lua)
 
 `service_start` (start a background persistent process that survives across tool calls) / `service_logs` /
-`service_status` / `service_stop`. Unlike `run_command`'s `&`/nohup (reaped when the command ends), a
-service runs in its own sandbox overlay + cgroup; on stop its workspace changes are frozen as candidates
-and queued for async review. Its lifecycle is reclaimed by `sandbox.shutdown`/`reset`. See the
-"Long-lived services" section of [sandbox.md](sandbox.md).
+`service_status` / `service_stop`. A `run_command` that ends with a terminal `&` or starts with
+`nohup`/`setsid` is automatically promoted into a long-lived service (survives across calls); a service
+runs in its own sandbox overlay + cgroup; on stop it first gets SIGTERM for a graceful exit and is only
+SIGKILLed on timeout, with its workspace changes frozen as candidates and queued for async review. Its
+lifecycle is reclaimed by `sandbox.shutdown`/`reset`. See the "Long-lived services" section of
+[sandbox.md](sandbox.md).
 
 ### 🗂 Git (git_ops.lua)
 
@@ -194,6 +196,11 @@ and queued for async review. Its lifecycle is reclaimed by `sandbox.shutdown`/`r
 
 > `lsp_ops` has a **request-level timeout** fallback (`tools.lsp.timeout_ms`, default 10s): it fails fast when the
 > server does not respond, preventing the tool loop from hanging until the executor timeout.
+>
+> `lsp_diagnostics` **re-fetches on every call**: pull clients (`textDocument/diagnostic`, sandbox clone
+> preferred) are queried directly for the latest diagnostics; when only push clients exist, it forces a
+> didChange (content unchanged, no undo entry) so the server re-lints, then waits for `publishDiagnostics`
+> before reading the cache (with timeout fallback) instead of returning a stale cache.
 
 ### 🌳 Tree-sitter (tree_ops.lua)
 

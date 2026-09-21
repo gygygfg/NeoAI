@@ -49,6 +49,15 @@ function M.setup(user_config)
     require("NeoAI.kernel.plugins").stop_all()
   end)
 
+  -- 关闭前先把活跃 Agent 的进行中进度落盘。清理函数逆序执行：此处晚于 stop_all 注册，
+  -- 故先于插件卸载运行，保证在 Agent 被销毁（messages 清空）前完成保存。
+  kernel.lifecycle.on_shutdown(function()
+    local chat = services.use("services.chat_service")
+    if chat and chat.persist_active_sessions then
+      pcall(chat.persist_active_sessions)
+    end
+  end)
+
   return M
 end
 

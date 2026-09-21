@@ -34,7 +34,8 @@ local function _cfg()
   return config_store.get("tools.sandbox.lsp_overlay") or {}
 end
 
---- overlay upper/work 宿主目录：优先 /dev/shm（须在工作区之外，避免 upper 落在 lower 之下）。
+--- overlay upper/work 宿主目录：位于暂存基目录（`conceal.base_host`，默认磁盘）之下，
+--- 须在工作区之外，避免 upper 落在 lower 之下。
 --- 用稳定目录而非会话目录：LSP server 生命周期跨 agent 会话，overlay 挂载点不能随会话轮换。
 --- 按 cwd hash 分片，避免多项目共用同一 upper 造成相对路径串扰。
 --- @param cwd string
@@ -44,22 +45,19 @@ local function _base_dir(cwd)
     local ok, hex = pcall(vim.fn.sha256, s)
     return ok and hex or (s or ""):gsub("[^%w]", "_")
   end
-  local root
-  local shm = "/dev/shm"
-  if vim.fn.isdirectory(shm) == 1 and vim.fn.filewritable(shm) == 2 then
-    root = require("NeoAI.sandbox.conceal").base_host() .. "/lsp"
-  else
-    root = (require("NeoAI.sandbox.store").root() or (vim.fn.stdpath("cache") .. "/NeoAI/sandbox")) .. "/lsp"
-  end
+  local root = require("NeoAI.sandbox.conceal").base_host() .. "/lsp"
   return root .. "/" .. hash(cwd)
 end
 
 --- LSP 需要可写的工作区外目录（缓存/状态），直连宿主，避免污染 overlay/待审队列。
 --- @return table 路径数组
 local function _rw_dirs()
-  local dirs = {}
+  local dirs, seen = {}, {}
   local function add(d)
-    if d and d ~= "" and vim.fn.isdirectory(d) == 1 then dirs[#dirs + 1] = d end
+    if not d or d == "" then return end
+    d = d:gsub("/+$", "")
+    if d == "" or seen[d] then return end
+    if vim.fn.isdirectory(d) == 1 then seen[d] = true; dirs[#dirs + 1] = d end
   end
   add(vim.fn.stdpath("cache"))
   add(vim.fn.stdpath("data"))
@@ -70,25 +68,48 @@ local function _rw_dirs()
   -- npm/npx 缓存直连宿主：否则 npx 下载的包会写进 overlay upper，而每次 LSP 启动
   -- 都会 _wipe_upper，导致（如 copilot）每会话重新下载/解包，失败即 exit 1。
   add(vim.fn.expand("~/.npm"))
+  -- LSP server 的配置/认证状态目录（XDG_CONFIG_HOME，默认 ~/.config）必须可写：
+  -- 否则 server 打开其状态库（如 copilot 的 ~/.config/github-copilot/auth.db）时报
+  -- `attempt to write a readonly database` 并退出（exit 1）。敏感子路径（~/.config/gh、
+  -- gcloud、git/credentials 等）仍由随后的 mask_paths 遮蔽，不随本 bind 暴露。
+  add(vim.fn.stdpath("config") and vim.fn.fnamemodify(vim.fn.stdpath("config"), ":h") or "")
+  add(vim.fn.expand("$XDG_CONFIG_HOME"))
+  add(vim.fn.expand("~/.config"))
   return dirs
 end
 
---- 工作区根的 overlay 规格；overlay 不可用时返回 nil（调用方跳过包装，不降级为 bind）。
+--- overlay 规格：与 `run_command` **完全同构**（`wrapper.build_overlay_specs`）——同一读取面
+--- （`read_all` 时整机只读/可写暂存）、同一可写根集合（cwd + `process_roots` + 所有已暂存
+--- 路径所在目录）。overlay 不可用时返回 nil（调用方跳过包装，不降级为 bind）。
+--- 稳定目录（不随会话轮换）：LSP server 生命周期跨 agent 会话，挂载点不能随会话销毁。
 --- @param cwd string
 --- @return table|nil 数组 { root, upper, work, bind, mode }
 local function _resolve_specs(cwd)
   local runtime = require("NeoAI.sandbox.runtime")
   if not runtime.overlay_available() then return nil end
+  local candidate = require("NeoAI.sandbox.candidate")
+  local wrapper = require("NeoAI.sandbox.wrapper")
+  local cfg = config_store.get("tools.sandbox") or {}
   local base = _base_dir(cwd)
-  local upper, work, bind = base .. "/upper", base .. "/work", base .. "/bind"
-  fs.ensure_dir(upper)
-  fs.ensure_dir(work)
-  fs.ensure_dir(bind)
-  -- overlay 可写性由隔离标志决定：必须与探测/run_command 使用同一组 bwrap_flags()
-  -- （root 下为 NO_USER_FLAGS，不含 userns）。若硬编码 --unshare-all，overlay 在
-  -- userns 内会变成只读（lower=/ 时甚至挂载 EINVAL），导致 LSP 启动即退出。
-  if not runtime.overlay_mountable(cwd, upper, work) then return nil end
-  return { { root = cwd, upper = upper, work = work, bind = bind, mode = "overlay" } }
+  -- 已暂存的包安装根 + 所有已暂存路径的覆盖根（与 run_command 的补齐逻辑一致）。
+  local extra = {}
+  for _, r in ipairs(candidate.staged_roots()) do extra[#extra + 1] = r end
+  local known = { cwd }
+  if type(cfg.process_roots) == "table" then
+    for _, r in ipairs(cfg.process_roots) do known[#known + 1] = r end
+  end
+  for _, r in ipairs(candidate.staged_overlay_roots(known)) do extra[#extra + 1] = r end
+  local specs = wrapper.build_overlay_specs(cwd, base, extra)
+  local any = false
+  for _, s in ipairs(specs) do
+    if runtime.overlay_writable(s.root, s.upper, s.work) then
+      s.mode = "overlay"; any = true
+    else
+      s.mode = "bind"
+    end
+  end
+  if not any then return nil end
+  return specs
 end
 
 --- 清空 overlay upper 内容（保留目录本身，overlay 挂载点不可删除）。
@@ -106,45 +127,34 @@ local function _wipe_upper(specs)
   end
 end
 
---- 构造 bwrap 前缀：只读 rootfs + 工作区 overlay + 缓存 rw bind + chdir。
+--- 构造 bwrap 前缀：复用 `runtime.process_prefix`——与 `run_command` **同一命名空间构造**
+--- （相同隔离标志、读取面、overlay/遮蔽、seccomp、能力收敛）。LSP server 因此与
+--- `run_command` 调用 LSP 看到完全一致的沙箱视图；缓存/状态目录经 `priv.mounts` rw 直连宿主。
 --- @param specs table
 --- @param cwd string
---- @return table argv
+--- @return table|nil argv
+--- @return string|nil err
 local function _prefix(specs, cwd)
   local runtime = require("NeoAI.sandbox.runtime")
-  -- 隔离标志必须与 overlay 探测/run_command 保持一致（root 下为 NO_USER_FLAGS）。
-  -- 硬编码 --unshare-all 会在 userns 内让 overlay 只读，lower=/ 时更会挂载 EINVAL。
-  local argv = { "bwrap" }
-  for _, f in ipairs(runtime.bwrap_flags()) do
-    table.insert(argv, f)
-  end
-  for _, f in ipairs({ "--die-with-parent", "--new-session" }) do
-    table.insert(argv, f)
-  end
-  -- 最小只读系统集（与 run_command 一致的读取面），不再 `--ro-bind / /`。
-  runtime.append_readonly(argv)
-  for _, f in ipairs({ "--dev", "/dev", "--proc", "/proc" }) do
-    table.insert(argv, f)
-  end
-  -- /proc/sys 只读（与 run_command 一致）：LSP server 也不得写宿主全局 sysctl。
-  runtime.append_proc_sys_ro(argv)
-  -- 临时根用私有 tmpfs，并隐藏 /proc 泄露项（与 run_command 一致）。
-  runtime.append_tmpfs_roots(argv)
-  runtime.append_hidden_proc(argv)
-  for _, ov in ipairs(specs or {}) do
-    table.insert(argv, "--overlay-src"); table.insert(argv, ov.root)
-    table.insert(argv, "--overlay"); table.insert(argv, ov.upper)
-    table.insert(argv, ov.work); table.insert(argv, ov.root)
-  end
+  local priv = { network = true, cap_add = {}, mounts = {}, userns = false }
   for _, d in ipairs(_rw_dirs()) do
-    table.insert(argv, "--bind"); table.insert(argv, d); table.insert(argv, d)
+    priv.mounts[#priv.mounts + 1] = { src = d, dst = d, mode = "rw" }
   end
-  -- 遮蔽宿主敏感路径（与 run_command 一致的遮蔽面）：rw bind 之后覆盖，避免把
-  -- keyring / 凭据等随缓存目录（~/.local/share、~/.cache）一并暴露给 LSP server。
-  runtime.append_masked(argv)
-  table.insert(argv, "--chdir"); table.insert(argv, cwd)
-  -- 关闭继承 fd 后再 exec bwrap，避免 LSP server 继承宿主目录 fd（chroot 逃逸）。
-  return runtime.wrap_close_fds(argv)
+  local base = _base_dir(cwd)
+  local fallback = base .. "/bind"
+  fs.ensure_dir(fallback)
+  local prefix, err = runtime.process_prefix({
+    cwd = cwd,
+    overlays = specs,
+    privileges = priv,
+    session_tmp_dir = base,
+    fallback_cwd = fallback,
+    -- Node 系 LSP server（copilot/pyright 等）在 `--unshare-pid` 下启动后即退出（exit 1）；
+    -- 不隔离 PID。文件视图（overlay/遮蔽）与 run_command 保持一致，仅放弃 PID 隔离。
+    no_pid_ns = true,
+  })
+  if not prefix then return nil, err end
+  return prefix
 end
 
 -- ========== 公开 API ==========
@@ -176,7 +186,11 @@ function M.wrap_cmd(cmd, extra)
   local cwd = (extra and extra.cwd) or vim.fn.getcwd()
   local specs = M.refresh(cwd)
   if not specs then return nil end
-  local full = _prefix(specs, cwd)
+  local full, err = _prefix(specs, cwd)
+  if not full then
+    require("NeoAI.kernel.logger").warn("[sandbox] LSP 沙箱前缀构造失败，回退编辑器客户端：%s", tostring(err))
+    return nil
+  end
   for _, v in ipairs(cmd) do full[#full + 1] = v end
   return full
 end

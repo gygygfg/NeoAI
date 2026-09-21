@@ -499,6 +499,132 @@ tests.suite("sandbox", function(_, it)
     vim.fn.delete(dir, "rf")
   end)
 
+  it("暂存覆盖：staged_overlay_roots 补齐工作区外暂存路径的覆盖根", function(t)
+    local fs = require("NeoAI.utils.fs")
+    local sandbox = require("NeoAI.sandbox")
+    local candidate = require("NeoAI.sandbox.candidate")
+    local runtime = require("NeoAI.sandbox.runtime")
+    if runtime.backend() ~= "bwrap" then return end
+    sandbox.reset()
+    local cwd = vim.fn.tempname()
+    local outside = vim.fn.tempname()
+    fs.ensure_dir(cwd)
+    fs.ensure_dir(outside)
+    local real = outside .. "/a.txt"
+    fs.write_file(real, "base\n")
+    with_config({
+      tools = { approval = { mode = "async" }, sandbox = { mode = "dry_run", read_all = false, review = { enabled = true } } },
+    }, function()
+      local done = false
+      require("NeoAI.tools").execute(
+        "edit_file", { filepath = real, mode = "write", content = "edited\n", description = "t" }, {})
+        :then_(function()
+          -- 已暂存但不在已知根（cwd）内 → 补其所在目录
+          local roots = candidate.staged_overlay_roots({ cwd })
+          t.eq(1, #roots, "应补一个覆盖根")
+          t.eq(fs.canonical(outside), roots[1], "覆盖根应为暂存文件所在目录")
+          -- 被已知根覆盖时不返回
+          t.eq(0, #candidate.staged_overlay_roots({ cwd, outside }), "已覆盖则不再补根")
+          -- 纳入 overlay 规格后，规格覆盖该暂存文件（命令视图与只读视图一致）
+          local wrapper = require("NeoAI.sandbox.wrapper")
+          local specs = wrapper.build_overlay_specs(cwd, candidate.process_dir(), roots)
+          local covered = false
+          local creal = fs.canonical(real)
+          for _, s in ipairs(specs) do
+            local r = s.root
+            if r == "/" or creal == r or creal:sub(1, #r + 1) == r .. "/" then covered = true end
+          end
+          t.true_(covered, "overlay 规格应覆盖暂存文件")
+          done = true
+        end, function(e)
+          t.true_(false, "edit_file 不应失败: " .. tostring(e and e.message or e))
+          done = true
+        end)
+      t.true_(vim.wait(10000, function() return done end), "应完成")
+    end)
+    sandbox.reset()
+    vim.fn.delete(cwd, "rf")
+    vim.fn.delete(outside, "rf")
+  end)
+
+  it("暂存一致性：has_staged 反映未发布的实质改动", function(t)
+    local fs = require("NeoAI.utils.fs")
+    local sandbox = require("NeoAI.sandbox")
+    local candidate = require("NeoAI.sandbox.candidate")
+    local runtime = require("NeoAI.sandbox.runtime")
+    if runtime.backend() ~= "bwrap" then return end
+    local dir = vim.fn.tempname()
+    fs.ensure_dir(dir)
+    fs.write_file(dir .. "/f.txt", "base\n")
+    local prev = vim.fn.getcwd()
+    vim.fn.chdir(dir)
+    with_config({ tools = { approval = { mode = "async" }, sandbox = { mode = "dry_run", review = { enabled = true } } } }, function()
+      sandbox.reset()
+      t.false_(candidate.has_staged(), "初始无暂存")
+      local done = false
+      local tools = require("NeoAI.tools")
+      tools.execute("edit_file",
+        { filepath = dir .. "/f.txt", mode = "write", content = "base\n", description = "noop" }, {})
+        :then_(function()
+          t.false_(candidate.has_staged(), "空操作不应视为未发布改动")
+          return tools.execute("edit_file",
+            { filepath = dir .. "/f.txt", mode = "write", content = "edited\n", description = "t" }, {})
+        end):then_(function()
+          t.true_(candidate.has_staged(), "实质改动应视为未发布")
+          candidate.invalidate(dir .. "/f.txt")
+          t.false_(candidate.has_staged(), "失效后不应再有暂存")
+          done = true
+        end, function(e)
+          t.true_(false, "不应失败: " .. tostring(e and e.message or e))
+          done = true
+        end)
+      t.true_(vim.wait(10000, function() return done end), "应完成")
+    end)
+    vim.fn.chdir(prev)
+    sandbox.reset()
+    vim.fn.delete(dir, "rf")
+  end)
+
+  it("无 overlay 时禁止降级：存在未发布暂存改动则拒绝命令", function(t)
+    local fs = require("NeoAI.utils.fs")
+    local sandbox = require("NeoAI.sandbox")
+    local runtime = require("NeoAI.sandbox.runtime")
+    if runtime.backend() ~= "bwrap" then return end
+    local dir = vim.fn.tempname()
+    fs.ensure_dir(dir)
+    fs.write_file(dir .. "/f.txt", "base\n")
+    local prev = vim.fn.getcwd()
+    vim.fn.chdir(dir)
+    with_config({ tools = { approval = { mode = "async" }, sandbox = { mode = "dry_run", review = { enabled = true } } } }, function()
+      sandbox.reset()
+      local done = false
+      local tools = require("NeoAI.tools")
+      tools.execute("edit_file",
+        { filepath = dir .. "/f.txt", mode = "write", content = "edited\n", description = "t" }, {})
+        :then_(function()
+          -- 模拟 overlay 不可用（降级 / 嵌套 userns 无 overlay）
+          local saved_avail, saved_writable = runtime.overlay_available, runtime.overlay_writable
+          runtime.overlay_available = function() return false end
+          runtime.overlay_writable = function() return false end
+          local ok, err
+          tools.execute("run_command", { command = "cat f.txt", description = "t" }, {})
+            :then_(function() ok = true end, function(e) err = e end)
+          t.true_(vim.wait(15000, function() return ok or err end), "命令应返回")
+          runtime.overlay_available, runtime.overlay_writable = saved_avail, saved_writable
+          t.true_(err ~= nil, "无 overlay 且有暂存时应拒绝命令（不降级）")
+          t.matches("SANDBOX_STAGING_UNCOVERED", tostring(err and err.message or err))
+          done = true
+        end, function(e)
+          t.true_(false, "edit_file 不应失败: " .. tostring(e and e.message or e))
+          done = true
+        end)
+      t.true_(vim.wait(20000, function() return done end), "应完成")
+    end)
+    vim.fn.chdir(prev)
+    sandbox.reset()
+    vim.fn.delete(dir, "rf")
+  end)
+
   it("沙箱不可见：run_command 反映暂存的新建与删除", function(t)
     local fs = require("NeoAI.utils.fs")
     local sandbox = require("NeoAI.sandbox")
@@ -865,6 +991,54 @@ tests.suite("sandbox", function(_, it)
       t.true_(not conceal.base_host():find("sandbox", 1, true), "基目录不应含 sandbox")
     end
     t.true_(not conceal.session_basename():find("neoai", 1, true), "会话名不应含 neoai")
+  end)
+
+  it("暂存后端：默认落盘（不占 /dev/shm 内存），可切回 shm；私有 tmp 与基目录同后端", function(t)
+    local conceal = require("NeoAI.sandbox.conceal")
+    with_config({ tools = { sandbox = { staging_backend = "disk" } } }, function()
+      local base = conceal.base_host()
+      t.true_(base:sub(1, #"/dev/shm") ~= "/dev/shm", "默认不应在 /dev/shm（内存）")
+      t.true_(base:find("NeoAI", 1, true) == nil and base:find("sandbox", 1, true) == nil,
+        "基目录应无特征命名: " .. base)
+      local tmp_base = conceal.tmp_base_host("/tmp")
+      t.eq(base, tmp_base:sub(1, #base), "私有 /tmp 基目录应位于暂存基目录之下（同后端）")
+    end)
+    if vim.fn.isdirectory("/dev/shm") == 1 and vim.fn.filewritable("/dev/shm") == 2 then
+      with_config({ tools = { sandbox = { staging_backend = "shm" } } }, function()
+        t.eq("/dev/shm", conceal.base_host():sub(1, #"/dev/shm"), "shm 后端应使用 /dev/shm")
+      end)
+    end
+  end)
+
+  it("磁盘上限：默认 64GiB；暂存超限时拒绝写类/进程工具", function(t)
+    local disk = require("NeoAI.sandbox.disk")
+    local conceal = require("NeoAI.sandbox.conceal")
+    with_config({ tools = { sandbox = { limits = { disk_bytes = 64 * 1024 * 1024 * 1024 } } } }, function()
+      t.eq(64 * 1024 * 1024 * 1024, disk.limit(), "默认上限应为 64GiB")
+      disk.refresh(true)
+      t.true_(vim.wait(10000, function() return disk.usage() ~= nil end, 20), "用量统计应完成")
+      t.true_(disk.check(), "未超限应放行")
+    end)
+    with_config({ tools = { sandbox = { limits = { disk_bytes = 1 } } } }, function()
+      -- 确保暂存有字节占用（否则 0 < 1 不会触发）
+      vim.fn.mkdir(conceal.base_host(), "p")
+      require("NeoAI.utils.fs").write_file(conceal.base_host() .. "/x", "hello")
+      disk.refresh(true)
+      t.true_(vim.wait(10000, function() return (disk.usage() or 0) > 0 end, 20), "用量统计应完成且 > 0")
+      local ok, err = disk.check()
+      t.false_(ok, "超限应拒绝")
+      t.matches("SANDBOX_DISK_LIMIT_EXCEEDED", err or "")
+      -- 门禁：run_command 在超限时应被拒绝（不执行）
+      local rejected
+      local done = false
+      require("NeoAI.tools").execute("run_command", { command = "echo hi", description = "t" }, {})
+        :then_(function() done = true end, function(e) rejected = e; done = true end)
+      t.true_(vim.wait(10000, function() return done end, 20), "应返回")
+      t.not_nil(rejected, "超限时 run_command 应被拒绝")
+      t.matches("DISK_LIMIT", tostring(rejected and (rejected.message or rejected)) .. "")
+    end)
+    pcall(vim.fn.delete, conceal.base_host() .. "/x")
+    disk.reset()
   end)
 
   it("加固：默认最小权限（cap-drop ALL + 主机全局能力收敛），可显式放宽", function(t)
@@ -5225,6 +5399,31 @@ tests.suite("sandbox", function(_, it)
     end)
     vim.fn.chdir(prev)
     vim.fn.delete(dir, "rf")
+  end)
+
+  it("发布：递归删除先删子项再 rmdir 父目录（避免非空 rmdir 失败）", function(t)
+    local fs = require("NeoAI.utils.fs")
+    local candidate = require("NeoAI.sandbox.candidate")
+    local root = fs.canonical(vim.fn.tempname())
+    fs.ensure_dir(root .. "/pip")
+    fs.write_file(root .. "/pip/a.txt", "x")
+    fs.write_file(root .. "/pip/b.txt", "y")
+    local function sha(p) return "sha256:" .. vim.fn.sha256(fs.read_file(p)) end
+    local res = candidate.publish({
+      candidate_digest = "sha256:rmtree",
+      files = {
+        -- 故意按路径升序（父目录在前），模拟 finish 的排序结果：
+        -- 修复前会先对非空父目录 rmdir 而整单元 WRITE_FAILED。
+        { path = root .. "/pip", action = "rmdir", base_exists = true, base_type = "directory" },
+        { path = root .. "/pip/a.txt", action = "delete", base_exists = true, base_type = "file",
+          before_hash = sha(root .. "/pip/a.txt") },
+        { path = root .. "/pip/b.txt", action = "delete", base_exists = true, base_type = "file",
+          before_hash = sha(root .. "/pip/b.txt") },
+      },
+    })
+    t.true_(res.ok, "递归删除应成功: " .. tostring(res.reason))
+    t.false_(fs.exists(root .. "/pip"), "父目录应被删除")
+    vim.fn.delete(root, "rf")
   end)
 
   it("加固：发布前重规范化路径，拒绝 `..` 穿越与遮蔽目标", function(t)

@@ -124,16 +124,33 @@ end
 
 -- ========== 公开 API ==========
 
---- overlay 私有暂存基目录（宿主路径）。优先 /dev/shm；不可用时退回沙箱根下。
+--- overlay 私有暂存基目录（宿主路径）。
+--- 后端由 `tools.sandbox.staging_backend` 决定：
+---   "disk"（默认）= 磁盘（优先 /var/tmp，退回 nvim 缓存目录）下的无特征隐藏目录 `.cache-<tag>`；
+---   "shm" = /dev/shm（内存，更快但占内存）；
+---   绝对路径 = 以该目录为基（其下建 `.cache-<tag>`）。
+--- 目录名不含 NeoAI/sandbox 字样；位于所有可写根之外（避免 overlay upper 落在 lower 之下）。
 --- @return string
 function M.base_host()
-  local shm = "/dev/shm"
-  if vim.fn.isdirectory(shm) == 1 and vim.fn.filewritable(shm) == 2 then
-    return shm .. "/.cache-" .. _tag()
+  local mode = "disk"
+  pcall(function()
+    local v = require("NeoAI.kernel.config_store").get("tools.sandbox.staging_backend")
+    if type(v) == "string" and v ~= "" then mode = v end
+  end)
+  local suffix = "/.cache-" .. _tag()
+  if mode == "shm" then
+    if vim.fn.isdirectory("/dev/shm") == 1 and vim.fn.filewritable("/dev/shm") == 2 then
+      return "/dev/shm" .. suffix
+    end
+  elseif mode:sub(1, 1) == "/" then
+    return (mode:gsub("/+$", "")) .. suffix
   end
-  local ok, store = pcall(require, "NeoAI.sandbox.store")
-  local root = (ok and store.root and store.root()) or (vim.fn.stdpath("cache") .. "/NeoAI/sandbox")
-  return root .. "/process"
+  -- disk（默认）：/var/tmp 通常为磁盘且全局可遍历（非 root 载荷可读 --ro-bind 源文件）；
+  -- 不可写时退回 nvim 缓存目录。
+  if vim.fn.isdirectory("/var/tmp") == 1 and vim.fn.filewritable("/var/tmp") == 2 then
+    return "/var/tmp" .. suffix
+  end
+  return vim.fn.stdpath("cache") .. suffix
 end
 
 --- 会话 shell 状态在沙箱内的固定挂载点
@@ -142,14 +159,16 @@ function M.session_mount()
   return "/tmp/" .. _session_basename()
 end
 
---- 沙箱内某 tmpfs 根（如 /tmp）的宿主私有基目录：位于该根之下的隐藏临时子目录。
---- 命名空间把「该子目录」bind 回根路径，使沙箱内的 /tmp 只暴露会话私有临时子目录，
---- 宿主 /tmp 的真实内容对 AI 不可见（隔离 AI）。目录名同样无特征。
+--- 沙箱内某临时根（如 /tmp）的宿主私有基目录：位于暂存基目录（`base_host`）之下，
+--- 与进程 overlay 目录并列（`tmp_<编码根>`），使每会话私有 /tmp 也落在同一后端（默认磁盘，
+--- 不再占用 /tmp tmpfs 内存）。命名空间把「该子目录/<session>」bind 回根路径，使沙箱内的
+--- /tmp 只暴露会话私有临时子目录，宿主 /tmp 的真实内容对 AI 不可见（隔离 AI）。目录名无特征。
 --- @param root string 宿主根路径（如 "/tmp"）
 --- @return string
 function M.tmp_base_host(root)
   root = tostring(root or ""):gsub("/+$", "")
-  return root .. "/.cache-" .. _tag()
+  local enc = root:gsub("[^%w]", "_")
+  return M.base_host() .. "/tmp" .. enc
 end
 
 --- 会话挂载点 basename（供 overlay 捕获排除）

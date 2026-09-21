@@ -148,6 +148,13 @@ local function _persist_agent(agent)
         tool_calls = msg.tool_calls,
         tool_call_id = msg.tool_call_id,
         checkpoint = msg.checkpoint,
+        ts = msg.ts,
+        -- 工具结果的 UI-only 元数据（不进入模型上下文，仅审批/渲染用）：必须随会话持久化，
+        -- 否则关闭会话再打开后密钥告警、沙箱降级/特权档提示、耗时等「额外提示」会消失。
+        tool_name = msg.tool_name,
+        duration_ms = msg.duration_ms,
+        notice = msg.notice,
+        secret_paths = msg.secret_paths,
       })
       synced[#synced + 1] = msg
     end
@@ -190,14 +197,34 @@ local function _is_busy(agent)
   return agent.state == "generating" or agent.state == "tool_running" or agent._turn_claim ~= nil
 end
 
+-- 轮末持久化钩子是否已注册（幂等）
+local persist_hook_registered = false
+
+--- 懒加载地把轮末持久化钩子注册到 tool_loop（幂等）。core 模块不反向依赖服务，
+--- 因此通过 tool_loop.set_round_persist 把「保存本回合进度」的实现注入进去。
+--- 长工具循环每轮工具结果落库后即增量落盘，中途意外退出不丢已完成进度。
+local function _ensure_persist_hook()
+  if persist_hook_registered then return end
+  persist_hook_registered = true
+  local tool_loop = require("NeoAI.core.agent.tool_loop")
+  tool_loop.set_round_persist(function(agent)
+    _persist_agent(agent)
+  end)
+end
+
 --- 实际执行一轮生成（含 MESSAGE_SENT 事件 + 持久化）
 --- @param agent table
 --- @param content string
 --- @param opts table|nil
 --- @return Deferred
 local function _do_run(agent, content, opts)
+  _ensure_persist_hook()
   event_bus.emit(events.MESSAGE_SENT, { agent_id = agent.id, content = content })
-  return runtime.run(agent, content):then_(function(resp)
+  local run_d = runtime.run(agent, content)
+  -- 立即落盘用户消息：长回合/意外退出时不丢用户输入（runtime.run 同步写入用户消息后
+  -- 才返回 Deferred）。后续每个工具循环轮末由 _ensure_persist_hook 注册的钩子继续增量保存。
+  _persist_agent(agent)
+  return run_d:then_(function(resp)
     local ok, err = _persist_agent(agent)
     if not ok then return async.reject({ kind = "persistence", message = tostring(err) }) end
     return resp
@@ -855,6 +882,21 @@ function M.load_session(session_id, opts)
   return agent
 end
 
+--- 立即持久化所有活跃 Agent 的进行中进度（供关闭/意外退出前兜底保存）。
+--- 幂等：已同步消息不重复写入，仅落盘本回合尚未保存的新增消息。
+--- @return number 已尝试保存的 Agent 数
+function M.persist_active_sessions()
+  local n = 0
+  for agent_id in pairs(state.agents) do
+    local agent = runtime.get(agent_id)
+    if agent then
+      n = n + 1
+      pcall(_persist_agent, agent)
+    end
+  end
+  return n
+end
+
 --- 重置（测试用）
 function M.reset()
   for _, agent_id in pairs(state.windows) do
@@ -876,7 +918,9 @@ function M.reset()
   local tool_loop = require("NeoAI.core.agent.tool_loop")
   tool_loop.set_inject_user(nil)
   tool_loop.set_pre_round_refresh(nil)
+  tool_loop.set_round_persist(nil)
   injector_registered = false
+  persist_hook_registered = false
   mcp_pre_round_registered = false
   if mcp_observer_sub then
     mcp_observer_sub()

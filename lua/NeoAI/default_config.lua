@@ -734,7 +734,11 @@ local DEFAULT_CONFIG = {
         enabled = true, -- 是否注册 service_* 工具
         max_services = 16, -- 同时存活的服务数上限
         max_log_bytes = 262144, -- 单服务日志环形缓冲上限（字节）
-        stop_timeout_ms = 5000, -- 停止时等待进程优雅退出的上限（超时 SIGKILL）
+        -- 停止时先向服务进程发 SIGTERM，等待该时长让其优雅退出；到时仍存活才 SIGKILL。
+        stop_timeout_ms = 5000,
+        -- run_command 中的后台命令（`&`/nohup/setsid）自动转为长驻服务，使其跨工具调用存活
+        -- （一次性进程随命令结束被 cgroup.kill 回收）。关闭则保持旧行为（后台进程被回收）。
+        auto_background = true,
       },
       -- systemctl 门面（方案 A）：AI 的 `systemctl`/`journalctl` 独立调用被路由到沙箱内
       -- 长驻服务（复用 sandbox.service），不调用宿主 systemd、也不修改宿主机。支持
@@ -902,6 +906,12 @@ local DEFAULT_CONFIG = {
       -- 存储基根。每进程实例隔离在 <workspace_root>/instances/<pid>_<启动时间>，
       -- 待审队列/候选/回执/证据不跨 nvim 会话共享（多个会话互不可见对方的审批）。
       workspace_root = vim.fn.stdpath("cache") .. "/NeoAI/sandbox",
+      -- 沙箱暂存后端（进程 overlay upper/work、每会话私有临时根 /tmp、LSP overlay 等）：
+      --   "disk"（默认）= 磁盘（优先 /var/tmp，退回 nvim 缓存目录）下的无特征隐藏目录；
+      --   "shm" = /dev/shm（内存，更快但占内存；大构建/安装会把大量文件暂存在内存）；
+      --   绝对路径 = 以该目录为基（其下建无特征隐藏目录）。
+      -- 默认落盘，避免「好多文件暂存在内存里」把内存占满（暂存内容随会话结束/重置清理）。
+      staging_backend = "disk",
       session_shell = true, -- run_command 会话内保留 shell 状态（export/cd 跨命令生效，仅 bwrap 后端）
       -- 额外可写根（仅 `read_all=false` 或整机 overlay 不可用时生效）：这些根以独立 overlay
       -- 覆盖（真实内容只读 lower，写入进会话 upper），使命令能修改这些根下的任意路径并冻结为
@@ -943,6 +953,10 @@ local DEFAULT_CONFIG = {
         cpu_affinity = "auto",
         cgroup_base = "/sys/fs/cgroup", -- cgroup v2 挂载点
         fail_closed = false, -- cgroup 不可用时是否拒绝执行（默认 false：跳过限制，不阻断）
+        -- 沙箱暂存磁盘上限（字节；0 = 不限）。统计暂存基目录（进程 overlay / 私有 tmp）与
+        -- 沙箱存储根（候选/待审/证据/服务 overlay）的总占用；超限时拒绝新的外部进程/写类
+        -- 工具，避免暂存撑满宿主磁盘。用量经工作线程异步统计并缓存，不阻塞命令开始。
+        disk_bytes = 64 * 1024 * 1024 * 1024, -- 64 GiB
       },
       seccomp_filter_path = "", -- 可选：编译后 seccomp BPF 过滤器路径（供 bwrap --seccomp）
       -- seccomp 基线：默认开启；经 bwrap 在载荷上施加 denylist 过滤器（拦 mount/

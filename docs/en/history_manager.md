@@ -44,6 +44,11 @@ A session is a pure data structure with no side effects and no I/O:
 - **get_chain(session_id)**: the ancestor chain from the root to the specified session (including itself, root first).
 - **get_downstream(session_id)**: the single-child chain descending through the session tree. It only continues deeper when there is exactly one child session;
   it stops at a split branch (multiple child sessions) or at the end. Used to reconstruct the full linear conversation.
+- **Tool-result UI metadata persistence**: a tool-result message's `tool_name` / `duration_ms` / `notice`
+  (user-visible extras such as sandbox downgrade or privilege-tier notices) / `secret_paths`
+  (kernel-observed secret files) are persisted with the session, so the "extra hints" needed for
+  review and rendering survive closing and reopening the session. These fields are UI-only and never
+  enter the model context (adapters whitelist fields when encoding).
 
 ### 3.1 Torn-Line Recovery
 

@@ -40,6 +40,8 @@ Invariants:
 | `sandbox/broker.lua` | External-operation adapter protocol (idempotency/query/compensation capability declarations and reconcile) |
 | `sandbox/replay.lua` | Policy replay (reproduce a decision from the same rules and facts) |
 | `sandbox/cgroup.lua` | cgroup v2 resource domain (memory/PID/CPU), one per attempt |
+| `sandbox/disk.lua` | Sandbox staging disk usage measurement and cap gate (async cached; rejects write/process tools when over) |
+| `sandbox/background.lua` | Background-command detection (`&`/nohup/setsid) for gate promotion to a long-lived service |
 | `sandbox/seccomp.lua` | seccomp capability probe and require_seccomp gate |
 | `sandbox/cache.lua` | Content-addressed cache (isolated writes, prunable) |
 | `sandbox/diag.lua` | Fault injection (backend/freeze/publish/store) and critical-path benchmarks; merges former `fault`+`bench` (old files are compat shims) |
@@ -223,9 +225,18 @@ is only kept for other `approval.mode` values (`prompt`/`strict`).
     with the `待审` state label **colored by security level** (L0 gray / L1 yellow / L2 orange / L3 red),
     and shows a **high/medium/low** risk grade (`[L0]低危` …
     `[L2]/[L3]高危`) plus risk reasons. Risk badges are colored **L0 gray / L1·L2 yellow /
-    L3 red** — only L3 uses the red danger highlight. **The header line approves the whole change set**
+    L3 red** — only L3 uses the red danger highlight. Items are **sectioned into "unapplied" and
+    "applied"**: pending (unapplied) changes come first, already-published (snapshotted, revertible)
+    changes after. **The header line approves the whole change set**
     (`<CR>` applies every file in it), while a **file line approves a single file**
-    (`<CR>` applies only the file under the cursor); `d` rejects that file (on the header, the
+    (`<CR>` applies only the file under the cursor); `A` **approves every workspace change in one
+    key** (applies workspace-scoped pending files at file granularity; files outside the workspace and
+    host-operation proposals stay pending for individual review, and root-requiring items prompt for
+    per-item escalation). Batch application **yields to the main loop between items** (each change set
+    is followed by `vim.defer_fn` back to the event loop, with `应用中 i/N` progress in the title) and
+    reuses a batch session (`sandbox.begin_batch`/`end_batch`) to reconcile candidate deletion once,
+    avoiding a synchronous for-loop + per-item O(n) full scan + per-file writes freezing the UI
+    ("approving too many at once hangs"); pressing `A` again while running is refused; `d` rejects that file (on the header, the
     whole unit), `i` temporarily closes the review window and opens a **diff preview** of that
     item (`q`/`<Esc>` closes it and returns to the review window with the cursor restored); on an
     **out-of-bounds access trace** line, `i` opens the **access details** for that path (each access's
@@ -233,7 +244,7 @@ is only kept for other `approval.mode` values (`prompt`/`strict`).
     `u` **undoes/redoes the save**, `r` refreshes, `q`/`<Esc>` closes. Inside the chat main window
     press `<leader>ap` to trigger it (`keymaps.chat.sandbox_review`).
     - **Show saved / undo save**: applying (saving) keeps a **snapshot of the original file** (its
-      content before the apply). The review window's "已保存（已应用，u 撤销/重做保存）" section lists
+      content before the apply). The review window's "已应用（已保存/已撤销，u 撤销/重做保存）" section lists
       changes already published to the real workspace; pressing `u` on an item **swaps** the real file
       with the snapshot — saved → undone (rolls back to the pre-apply content), undone → saved again,
       toggling repeatedly. A CAS check runs before the swap: if the real file was changed externally
@@ -490,6 +501,19 @@ detection) and `risk.classify` (security level), so `pip install`, `sudo modprob
   - Broad directories such as `/root`, `/home`, `/etc` are no longer overlaid by default, so host
     home/accounts/config are not exposed as read-only lowers; add them back explicitly to
     `process_roots` if needed, and tighten `mask_paths` accordingly.
+  - **Every staged path is covered (no cross-root divergence)**: besides configured roots and cwd, the
+    command's writable roots automatically include **the directory of every staged file**
+    (`candidate.staged_overlay_roots`, nearest existing ancestor; paths already covered by a known root
+    are skipped and returned roots never nest). Otherwise a staged edit outside the workspace is not
+    materialized and the command reads the real disk — diverging from `read_file`/`list_files`'s staged
+    view (one path, two contents) and bypassing staging to read/write real files. Long-lived services
+    and tool subprocesses (`sandbox.exec`) are covered the same way.
+  - **No degradation without an overlay**: when a command would run with **no overlay writable layer**
+    (overlay unavailable and degraded to bind, or T2 nested userns with no overlay) and there is an
+    **unpublished substantive staged change** (`candidate.has_staged`), execution is rejected with
+    `SANDBOX_STAGING_UNCOVERED` — the command would only see the real disk, diverging from the read-only
+    tools' staged view and bypassing staging. This tightens the existing `overlay_fail_closed` (which
+    only rejected non-userns degradation): **with staging present, userns is not allowed either**.
   - The writable layer is **session-shared**: all commands in the same agent loop share it (command N
     sees command N-1's writes); on agentEnd the session rotates and it is cleaned with the session
     directory (changes already frozen as candidates).
@@ -564,11 +588,17 @@ detection) and `risk.classify` (security level), so `pip install`, `sudo modprob
 
 ### Long-lived services (`service_*`, background processes)
 
-- **Background**: a `run_command` background process (`&`/`nohup`/`setsid`) is reaped as soon as the
-  command ends — every command runs in its own pid namespace + cgroup, and on completion
-  `cgroup.release` → `cgroup.kill` terminates the whole process tree, so background processes do
-  **not survive across tool calls**. For a persistent process (dev server / watch / daemon) use
-  `service_start` / `service_logs` / `service_status` / `service_stop`.
+- **Background**: every one-shot command runs in its own pid namespace + cgroup, and on completion
+  `cgroup.release` → `cgroup.kill` terminates the whole process tree. Background processes that are
+  **not promoted** therefore do not survive across tool calls.
+- **Automatic promotion of background commands**: a `run_command` that ends with a **terminal `&`**
+  or starts with `nohup`/`setsid` is automatically promoted by the gate into a long-lived service
+  (`sandbox/background.lua` parses conservatively, excluding `&&`, `2>&1`, quoted `&`, and a
+  mid-command `&`), so it **survives across tool calls**. The result returns the service name for
+  `service_logs` / `service_status` / `service_stop` (event `SANDBOX_BACKGROUND_ROUTED`). If the
+  service is unavailable or fails to start, it falls back to one-shot execution. For a persistent
+  process you want to name/manage explicitly (dev server / watch / daemon) use `service_start` /
+  `service_logs` / `service_status` / `service_stop`.
 - **Isolation**: each service builds its own overlay attempt (own upper/work, not competing with the
   shared session staging used by `run_command`) and its own cgroup. The gate still runs
   policy/script-scan/hard-deny prechecks (the `long_lived` branch in `wrapper`) but skips the
@@ -579,10 +609,17 @@ detection) and `risk.classify` (security level), so `pip install`, `sudo modprob
   changes are captured → frozen as candidates → merged back into workspace staging and queued for
   async review (reusing `wrapper.settle_exec_candidate`). A service and `run_command` are **not
   live-shared**, only synchronized at start/stop.
+- **Graceful stop**: `service_stop` / `stop_all` first send SIGTERM to the service **payload**
+  processes (`cgroup.term` skips the bwrap monitor — signalling bwrap immediately tears down the
+  namespace, so the payload never gets to run its trap), waiting `stop_timeout_ms` for a graceful
+  exit; only if it is still alive is `cgroup.kill` (SIGKILL) applied to the whole process tree.
+  Changes are captured after the process is confirmed exited (so writes are flushed). `stop_all`'s
+  grace window is `min(stop_timeout_ms, caller timeout_ms)`.
 - **Lifecycle**: `sandbox.shutdown()` (`:qall` / hot reload / plugin unload) and `sandbox.reset()`
-  stop all services and capture their changes; service logs are an in-session ring buffer
-  (`service.max_log_bytes`), redacted via `conceal` on read.
-- **Config**: `tools.sandbox.service = { enabled, max_services, max_log_bytes, stop_timeout_ms }`.
+  stop all services (gracefully) and capture their changes; service logs are an in-session ring
+  buffer (`service.max_log_bytes`), redacted via `conceal` on read.
+- **Config**: `tools.sandbox.service = { enabled, max_services, max_log_bytes, stop_timeout_ms,
+  auto_background }`.
 
 ### systemctl facade (`tools.sandbox.systemd`, option A)
 
@@ -656,12 +693,16 @@ called and the host is never modified**.
   globally, so the editor's own LSP processes keep reading/writing the real disk; when an AI tool
   runs, it lazily clones the matching editor server (client name suffixed with `@neoai-sandbox`) and
   only that clone enters the sandbox mount namespace and staging layer.
-- Mechanism: the clone's server command becomes
-  `bwrap <isolation flags> <minimal read-only system set> … --overlay-src <workspace> --overlay <upper> <work> <workspace> --chdir <workspace> <original cmd>`;
-  the isolation flags match the overlay probe/`run_command` (explicit flags without a user namespace
-  under root). The lower is the real workspace (read-only) and the upper is the sandbox's private
-  writable layer. The clone sees a merged view of "real files + staged changes" at the real paths. It
-  uses the same minimal read-only system set as `run_command` (see §6), not `--ro-bind / /`.
+- Mechanism: the clone's server command reuses **`runtime.process_prefix`** (the **same namespace
+  construction as `run_command`**: same read surface, overlay/masking, seccomp and capability
+  tightening), and its overlay specs reuse `wrapper.build_overlay_specs`. The lower is the real root
+  and the upper is the sandbox's private writable layer. Therefore an LSP launched via `run_command`
+  (e.g. `pyright`, `pylsp`, `npx tsserver`) and the `lsp_*` tools see the **exact same** sandbox view
+  (same real path, same staged content).
+  - **PID namespace is not unshared** (`process_prefix` with `no_pid_ns=true`, which also drops
+    `--as-pid-1`): Node-based servers (copilot/pyright, …) **exit (exit 1) right after startup** under
+    `--unshare-pid`. The file view (mount/overlay/masking) is unaffected and still matches
+    `run_command`; only PID isolation is given up.
 - Diagnostics: the clone's `textDocument/publishDiagnostics` does not leak into the editor;
   `lsp_diagnostics` prefers pull diagnostics (`textDocument/diagnostic`) from the clone (reflecting
   staged content) and falls back to editor diagnostics when the server does not support it.
@@ -669,11 +710,14 @@ called and the host is never modified**.
   re-materializes the upper from the current workspace staging (wipe then write), so the clone
   immediately sees the latest unpublished changes.
 - Isolation & caches: the clone's cache/state dirs (`stdpath(cache|data|state)`, `~/.cache`,
-  `~/.local/*`, `~/.npm`) are rw-bound straight to the host, so caches never enter the overlay or the
-  review queue; overlay uppers are sharded by workspace hash (no cross-project bleed) under
-  `/dev/shm/.cache-<tag>/lsp/<hash>`. After the rw binds, the same `mask_paths` as `run_command` are
-  applied (e.g. `~/.local/share/keyrings`, `~/.cache/keyring-*`), so keyrings/credentials are not
-  exposed to the clone via cache dirs.
+  `~/.local/*`, `~/.npm`, and **XDG_CONFIG_HOME (default `~/.config`)**) are rw-bound straight to the
+  host, so caches/state never enter the overlay or the review queue. `~/.config` must be writable:
+  otherwise a server opening its state DB (e.g. copilot's `~/.config/github-copilot/auth.db`) reports
+  `attempt to write a readonly database` and exits (exit 1). Overlay uppers are sharded by workspace
+  hash (no cross-project bleed) under `/dev/shm/.cache-<tag>/lsp/<hash>`. After the rw binds, the same
+  `mask_paths` as `run_command` are applied (e.g. `~/.config/gh`, `~/.config/gcloud`,
+  `~/.config/git/credentials`, `~/.local/share/keyrings`, `~/.cache/keyring-*`), so credentials are not
+  exposed to the clone via config/cache dirs.
 - Lifecycle: clones are started and cached on demand by `sandbox.lsp.clients_for` /
   `client_supporting`, and stopped by `stop_all()`. No global hook is registered, so unload/disable
   never affects the editor LSP.
@@ -1227,6 +1271,24 @@ same core; on a single-core host or without `taskset` it is skipped. Set `"off"`
 or `"2,3"`/`"2-3"` for an explicit cpuset. Affinity is applied before bwrap (`_prepend_affinity`) and
 covers the whole sandbox process tree; it stacks with the cgroup `cpu.max` quota.
 
+### Staging backend and disk cap
+
+**Staging backend** (`tools.sandbox.staging_backend`, default `"disk"`): the process overlay
+upper/work, the per-session private tmp roots (/tmp, ...), and the LSP overlay are staged on **disk**
+by default (a hidden featureless dir, preferring `/var/tmp`, falling back to the nvim cache dir) so
+that "lots of files staged in memory" (`/dev/shm`) is avoided. Set `"shm"` to go back to `/dev/shm`
+(faster but memory-hungry), or give an absolute path to use as the base. `conceal.base_host` is the
+single locator for that base.
+
+**Disk cap** (`tools.sandbox.limits.disk_bytes`, default `64 GiB`, `0` = unlimited): it totals the
+staging base (process overlay / private tmp) plus the sandbox store root (candidates/review/evidence/
+service overlay), and rejects write/process tools when exceeded (`SANDBOX_DISK_LIMIT_EXCEEDED`) so
+staging cannot fill the host disk. Usage is recursively measured on a **worker thread and cached**
+(TTL 5s); the gate only reads the cache and never runs a synchronous `du` at command start, passing
+through while the measurement is not ready. See the `disk` field of `:NeoAISandboxDiag`. When over the
+cap, apply/reject pending candidates (`:NeoAISandboxReview`), prune expired ones (`:NeoAISandboxPrune`),
+or raise the cap.
+
 ### seccomp baseline
 
 A built-in denylist filter is generated (x86_64/aarch64): first validate `AUDIT_ARCH`
@@ -1474,6 +1536,13 @@ ordinary text is byte-identical to before.
 > process command reuses the **already-attached** cgroup + probe (the event dispatch target is pointed at
 > this attempt on reuse), with no attach wait. If not reused within the TTL (90s by default,
 > `prewarm_ttl_ms`) the probe and cgroup are reclaimed. eBPF backend only (strace/procfs start cheaply).
+>
+> **Capability / overlay probe prewarm** (`runtime.warm`): at the start of a process command the
+> bwrap/overlay capability is probed synchronously (a functional test that spawns bwrap, ~100ms), so the
+> first command can feel blocked. After sandbox `init()`, at an idle moment during startup (delayed 200ms,
+> once per process) `runtime.probe` / `cgroup.probe` are run ahead of time and `overlay_writable` is
+> prewarmed for both the process overlay base and the sandbox store base, so the first `run_command` and
+> the first long-lived service hit the cache and do not block the main thread at command start.
 
 ### Detection (entropy + charset heuristics)
 

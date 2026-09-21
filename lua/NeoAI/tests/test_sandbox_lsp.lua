@@ -73,8 +73,12 @@ tests.suite("sandbox_lsp", function(_, it)
       -- 导致 LSP 启动即退出；必须使用探测所用的 bwrap_flags()。
       t.true_(joined:find("--unshare-all", 1, true) == nil, "不应使用 --unshare-all")
       for _, f in ipairs(runtime.bwrap_flags()) do
-        t.true_(joined:find(f, 1, true) ~= nil, "应包含探测标志 " .. f)
+        -- --unshare-pid 对 Node 系 LSP server 会致其启动后退出（exit 1），LSP 前缀有意去掉。
+        if f ~= "--unshare-pid" then
+          t.true_(joined:find(f, 1, true) ~= nil, "应包含探测标志 " .. f)
+        end
       end
+      t.true_(joined:find("--unshare-pid", 1, true) == nil, "LSP 不应隔离 PID 命名空间（Node server 会退出）")
     end)
     vim.fn.delete(dir, "rf")
   end)
@@ -104,6 +108,31 @@ tests.suite("sandbox_lsp", function(_, it)
     vim.fn.delete(dir, "rf")
   end)
 
+  it("LSP server 的 ~/.config 可写（避免状态库只读导致 exit 1）", function(t)
+    local lsp = require("NeoAI.sandbox.lsp")
+    local sandbox = require("NeoAI.sandbox")
+    local runtime = require("NeoAI.sandbox.runtime")
+    if runtime.backend() ~= "bwrap" then return end
+    local cfg_dir = vim.fn.stdpath("config") ~= "" and vim.fn.fnamemodify(vim.fn.stdpath("config"), ":h") or vim.fn.expand("~/.config")
+    if vim.fn.isdirectory(cfg_dir) ~= 1 then return end
+    local fs = require("NeoAI.utils.fs")
+    local dir = vim.fn.tempname()
+    fs.ensure_dir(dir)
+    with_config({ tools = { sandbox = { mode = "dry_run", review = { enabled = true }, lsp_overlay = { enabled = true } } } }, function()
+      sandbox.reset()
+      local wrapped = lsp.wrap_cmd({ "fake-lsp", "--stdio" }, { cwd = dir })
+      if not wrapped then return end
+      local found = false
+      for i = 1, #wrapped - 2 do
+        if wrapped[i] == "--bind" and wrapped[i + 1] == cfg_dir and wrapped[i + 2] == cfg_dir then
+          found = true
+        end
+      end
+      t.true_(found, "应把配置目录（XDG_CONFIG_HOME，默认 ~/.config）rw bind 到宿主")
+    end)
+    vim.fn.delete(dir, "rf")
+  end)
+
   it("refresh 把暂存内容物化进 LSP overlay upper", function(t)
     local lsp = require("NeoAI.sandbox.lsp")
     local sandbox = require("NeoAI.sandbox")
@@ -126,7 +155,14 @@ tests.suite("sandbox_lsp", function(_, it)
       }, {}):then_(function()
         local specs = lsp.refresh(dir)
         if specs then
-          t.eq("staged\n", fs.read_file(specs[1].upper .. "/f.txt"), "upper 应含暂存内容")
+          local creal = fs.canonical(dir .. "/f.txt")
+          local found, rel
+          for _, s in ipairs(specs) do
+            if s.root == "/" then found = s; rel = creal:sub(2)
+            elseif creal:sub(1, #s.root + 1) == s.root .. "/" then found = s; rel = creal:sub(#s.root + 2) end
+          end
+          t.not_nil(found, "应有一个覆盖暂存文件的 overlay 规格")
+          t.eq("staged\n", fs.read_file(found.upper .. "/" .. rel), "upper 应含暂存内容")
         end
         t.eq("real\n", fs.read_file(dir .. "/f.txt"), "真实文件不应改动")
         done = true
@@ -137,6 +173,130 @@ tests.suite("sandbox_lsp", function(_, it)
       t.true_(vim.wait(5000, function() return done end), "应完成")
     end)
     vim.fn.chdir(prev)
+    vim.fn.delete(dir, "rf")
+  end)
+
+  it("LSP overlay 覆盖所有已暂存路径（与文件工具同一命名空间视图）", function(t)
+    local lsp = require("NeoAI.sandbox.lsp")
+    local sandbox = require("NeoAI.sandbox")
+    local runtime = require("NeoAI.sandbox.runtime")
+    if runtime.backend() ~= "bwrap" then return end
+    local fs = require("NeoAI.utils.fs")
+    local cwd = vim.fn.tempname()
+    local outside = vim.fn.tempname()
+    fs.ensure_dir(cwd)
+    fs.ensure_dir(outside)
+    fs.write_file(outside .. "/g.txt", "real\n")
+    local prev = vim.fn.getcwd()
+    vim.fn.chdir(cwd)
+    with_config({ tools = {
+      approval = { mode = "async" },
+      sandbox = { mode = "dry_run", read_all = false, review = { enabled = true }, lsp_overlay = { enabled = true } },
+    } }, function()
+      sandbox.reset()
+      local done = false
+      require("NeoAI.tools").execute("edit_file", {
+        filepath = outside .. "/g.txt", mode = "write", content = "staged\n", description = "t",
+      }, {}):then_(function()
+        local specs = lsp.refresh(cwd)
+        if not specs then done = true; return end
+        local creal = fs.canonical(outside .. "/g.txt")
+        local found
+        for _, s in ipairs(specs) do
+          if s.root == creal or creal:sub(1, #s.root + 1) == s.root .. "/" then found = s end
+        end
+        t.not_nil(found, "LSP overlay 应覆盖工作区外的暂存路径")
+        local rel = creal:sub(#found.root + 2)
+        t.eq("staged\n", fs.read_file(found.upper .. "/" .. rel), "LSP upper 应含暂存内容")
+        t.eq("real\n", fs.read_file(outside .. "/g.txt"), "真实文件不应改动")
+        done = true
+      end, function(e)
+        t.true_(false, "不应失败: " .. tostring(e and e.message or e))
+        done = true
+      end)
+      t.true_(vim.wait(10000, function() return done end), "应完成")
+    end)
+    vim.fn.chdir(prev)
+    sandbox.reset()
+    vim.fn.delete(cwd, "rf")
+    vim.fn.delete(outside, "rf")
+  end)
+
+  it("LSP 工具用暂存内容同步后台 buffer（didOpen 与沙箱视图一致）", function(t)
+    local fs = require("NeoAI.utils.fs")
+    local sandbox = require("NeoAI.sandbox")
+    local helpers = require("NeoAI.tools.builtin.tool_helpers")
+    local runtime = require("NeoAI.sandbox.runtime")
+    if runtime.backend() ~= "bwrap" then return end
+    local dir = vim.fn.tempname()
+    fs.ensure_dir(dir)
+    local real = dir .. "/f.lua"
+    fs.write_file(real, "local x = 1\n")
+    with_config({ tools = { approval = { mode = "async" }, sandbox = { mode = "dry_run", review = { enabled = true } } } }, function()
+      sandbox.reset()
+      local bufnr = helpers.ensure_buffer(real)
+      t.not_nil(bufnr, "应能后台加载 buffer")
+      local done = false
+      require("NeoAI.tools").execute("edit_file", {
+        filepath = real, mode = "write", content = "local y = 2\n", description = "t",
+      }, {}):then_(function()
+        helpers.sync_buffer_from_sandbox(bufnr, real)
+        t.eq("local y = 2",
+          table.concat(vim.api.nvim_buf_get_lines(bufnr, 0, -1, false), "\n"),
+          "后台 buffer 应同步为暂存内容")
+        t.eq("local x = 1\n", fs.read_file(real), "真实文件不应改动")
+        done = true
+      end, function(e)
+        t.true_(false, "不应失败: " .. tostring(e and e.message or e))
+        done = true
+      end)
+      t.true_(vim.wait(10000, function() return done end), "应完成")
+      pcall(vim.api.nvim_buf_delete, bufnr, { force = true })
+    end)
+    sandbox.reset()
+    vim.fn.delete(dir, "rf")
+  end)
+
+  it("LSP 命名空间与 run_command 共享暂存视图（同一路径同一内容）", function(t)
+    local lsp = require("NeoAI.sandbox.lsp")
+    local sandbox = require("NeoAI.sandbox")
+    local runtime = require("NeoAI.sandbox.runtime")
+    if runtime.backend() ~= "bwrap" then return end
+    local fs = require("NeoAI.utils.fs")
+    local dir = vim.fn.tempname()
+    fs.ensure_dir(dir)
+    fs.write_file(dir .. "/f.txt", "real\n")
+    local prev = vim.fn.getcwd()
+    vim.fn.chdir(dir)
+    with_config({ tools = {
+      approval = { mode = "async" },
+      sandbox = { mode = "dry_run", review = { enabled = true }, lsp_overlay = { enabled = true } },
+    } }, function()
+      sandbox.reset()
+      local done = false
+      require("NeoAI.tools").execute("edit_file", {
+        filepath = dir .. "/f.txt", mode = "write", content = "staged\n", description = "t",
+      }, {}):then_(function()
+        local wrapped = lsp.wrap_cmd({ "cat", "f.txt" }, { cwd = dir })
+        if not wrapped then done = true; return end
+        local out = {}
+        vim.fn.jobstart(wrapped, {
+          stdout_buffered = true, stderr_buffered = true,
+          on_stdout = function(_, d) for _, l in ipairs(d) do if l ~= "" then out[#out + 1] = l end end end,
+          on_stderr = function(_, d) for _, l in ipairs(d) do if l ~= "" then out[#out + 1] = "ERR:" .. l end end end,
+          on_exit = function(_, c) out[#out + 1] = "EXIT=" .. c end,
+        })
+        t.true_(vim.wait(15000, function() return #out > 0 and out[#out]:match("^EXIT=") ~= nil end), "命令应完成")
+        t.matches("staged", table.concat(out, "\n"), "LSP 命名空间应看到暂存内容")
+        done = true
+      end, function(e)
+        t.true_(false, "不应失败: " .. tostring(e and e.message or e))
+        done = true
+      end)
+      t.true_(vim.wait(10000, function() return done end), "应完成")
+    end)
+    vim.fn.chdir(prev)
+    sandbox.reset()
     vim.fn.delete(dir, "rf")
   end)
 

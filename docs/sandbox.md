@@ -39,6 +39,8 @@
 | `sandbox/broker.lua` | 外部操作适配器协议（幂等/查询/补偿能力声明与对账） |
 | `sandbox/replay.lua` | 策略回放（同规则同事实复现裁决） |
 | `sandbox/cgroup.lua` | cgroup v2 资源域（内存/PID/CPU），每次尝试独立域 |
+| `sandbox/disk.lua` | 沙箱暂存磁盘用量统计与上限门禁（异步缓存，超限拒绝写类/进程工具） |
+| `sandbox/background.lua` | 后台命令识别（`&`/nohup/setsid），供门禁转长驻服务 |
 | `sandbox/seccomp.lua` | seccomp 能力探测与 require_seccomp 门禁 |
 | `sandbox/privilege.lua` | 权限档位（T0/T1/T2）分类、解析、自动升级检测与留痕 |
 | `sandbox/hostop.lua` | T2 主机效果提案（冻结/审批后 replay/拒绝） |
@@ -195,15 +197,22 @@
     按文件路径级别高亮 —— **工作区文件=绿色、用户目录=黄色、系统路径=红色**，
     「待审」状态标签**按安全等级着色**（L0 灰 / L1 黄 / L2 橙 / L3 红）；并按安全级别显示
     **高危/中危/低危** 风险档（`[L0]低危` …
-     `[L2]/[L3]高危`）与风险原因。**头行 = 整单元审批**（`<CR>` 一次应用该变更单元的全部
-     文件），**文件行 = 单文件审批**（`<CR>` 仅应用光标所在文件）；`d` 拒绝该文件（头行则拒绝
-     整单元，其余文件保留待审）、`i` 临时关闭审批窗并打开该条目的**修改 diff**
-     预览（`q`/`<Esc>` 关闭后自动返回审批窗并恢复光标）；在**越界访问留痕**行按 `i` 则打开
-     该路径的**访问详情**（逐次列出工具 / 类型 / 命令 / 时间，非审批目标）、`u` **撤销/重做保存**、
-     `r` 刷新、`q`/`<Esc>` 关闭。
-     聊天主窗口内可按 `<leader>ap` 直接触发（`keymaps.chat.sandbox_review`）。
+      `[L2]/[L3]高危`）与风险原因。界面**按「未应用 / 已应用」分区展示**：待审（未应用）
+      变更在前，已发布（含快照，可撤销）变更在后。**头行 = 整单元审批**（`<CR>` 一次应用该变更
+      单元的全部文件），**文件行 = 单文件审批**（`<CR>` 仅应用光标所在文件）；`A` **一键同意
+      所有工作区内修改**（按文件粒度应用工作区内待审文件；工作区外的文件与主机操作提案保留
+      待审，供逐条确认，需要 root 时提示逐条提权）。批量应用**逐项让出主循环**（每应用一个
+      变更单元后经 `vim.defer_fn` 回到事件循环，标题显示 `应用中 i/N` 进度），并复用批量
+      应用会话（`sandbox.begin_batch`/`end_batch`）把候选删除统一对账，避免同步 for 循环 +
+      逐项 O(n) 全表扫描 + 逐文件落盘冻结界面（"一次同意太多卡死"）；进行中重按 `A` 会被
+      拒绝；`d` 拒绝该文件（头行则拒绝
+      整单元，其余文件保留待审）、`i` 临时关闭审批窗并打开该条目的**修改 diff**
+      预览（`q`/`<Esc>` 关闭后自动返回审批窗并恢复光标）；在**越界访问留痕**行按 `i` 则打开
+      该路径的**访问详情**（逐次列出工具 / 类型 / 命令 / 时间，非审批目标）、`u` **撤销/重做保存**、
+      `r` 刷新、`q`/`<Esc>` 关闭。
+      聊天主窗口内可按 `<leader>ap` 直接触发（`keymaps.chat.sandbox_review`）。
      - **显示已保存 / 撤销保存**：应用（保存）时保留每个文件的**原文件快照**（真实文件
-       应用前的内容），审批界面底部「已保存（已应用，u 撤销/重做保存）」区展示已发布到真实
+       应用前的内容），审批界面底部「已应用（已保存/已撤销，u 撤销/重做保存）」区展示已发布到真实
        工作区的变更；在条目行按 `u` 把真实文件与快照**交换**——已保存 → 撤销（回滚到应用前
        内容），已撤销 → 重新保存，可反复切换。交换前做 CAS 校验：真实文件若已被外部改动
        （哈希不符）则拒绝并报 `CONFLICT`，绝不覆盖用户改动。快照随每进程实例隔离存储
@@ -394,6 +403,16 @@
     `ephemeral_roots = {}` 可关闭（`/tmp` 下也走正常待审/审批）。
   - 默认不再覆盖 `/root`、`/home`、`/etc` 等整目录，避免把宿主真实 home/账户/配置作为
     只读 lower 暴露；需要写这些路径时显式加回 `process_roots`，并同步收紧 `mask_paths`。
+  - **覆盖所有暂存路径（消除跨根不一致）**：命令的可写根除配置项与 cwd 外，还会自动补入
+    **所有已暂存文件所在目录**（`candidate.staged_overlay_roots`，取最近的存在祖先，已被
+    已知根覆盖者不重复、根之间不嵌套）。否则工作区外的暂存编辑不会被物化，命令读到真实
+    磁盘内容——既与 `read_file`/`list_files` 的暂存视图分裂（同一路径两种内容），也构成
+    绕过暂存直接读写真实文件的旁路。长驻服务与工具子进程（`sandbox.exec`）同样补齐。
+  - **无 overlay 时禁止降级**：命令将运行在**没有任何 overlay 可写层**的模式（overlay 不
+    可用降级为 bind、或 T2 嵌套 userns 无 overlay）且存在**未发布的实质暂存改动**
+    （`candidate.has_staged`）时，直接以 `SANDBOX_STAGING_UNCOVERED` 拒绝执行——此时命令只能
+    读到真实磁盘、与只读工具的暂存视图分裂，且可能绕过暂存。这是对既有
+    `overlay_fail_closed`（仅拒绝非 userns 降级）的收紧：**有暂存时 userns 也不放行**。
   - 可写层为**会话级共享**：同一 agent 循环内所有命令共用（命令 N 看得到命令 N-1 的
     写入）；agentEnd 轮换会话时随会话目录清理（改动已冻结为候选）。
   - **双向互通**：命令执行前把工作区暂存内容物化进可写层（命令能看到 `edit_file`
@@ -449,19 +468,30 @@
 
 ### 长驻服务（`service_*`，后台进程）
 
-- **背景**：`run_command` 的 `&`/`nohup`/`setsid` 后台进程随命令结束即被回收——每个命令在
-  独立 pid namespace + cgroup 内运行，命令结束时 `cgroup.release` → `cgroup.kill` 终止整个
-  进程树，故后台进程**不跨工具调用存活**。需要常驻进程（dev server / watch / 守护进程）时
-  使用 `service_start` / `service_logs` / `service_status` / `service_stop`。
+- **背景**：每个一次性命令在独立 pid namespace + cgroup 内运行，命令结束时 `cgroup.release`
+  → `cgroup.kill` 终止整个进程树。因此**未被提升**的后台进程不跨工具调用存活。
+- **后台命令自动提升**：`run_command` 中以**终止 `&`** 或**前导 `nohup`/`setsid`** 形式结束的
+  命令，经门禁自动转为长驻服务（`sandbox/background.lua` 保守识别，排除 `&&`、`2>&1`、
+  引号内 `&`、中段 `&`），使其**跨工具调用存活**，并返回服务名供 `service_logs` /
+  `service_status` / `service_stop` 管理（事件 `SANDBOX_BACKGROUND_ROUTED`）。服务不可用/
+  启动失败时回退一次性执行。需要显式命名/管理常驻进程（dev server / watch / 守护进程）时
+  直接使用 `service_start` / `service_logs` / `service_status` / `service_stop`。
 - **隔离**：每个服务自建独立 overlay attempt（独立 upper/work，不与 `run_command` 的共享会话
   暂存竞争）与独立 cgroup；门禁仍完成策略/脚本扫描/硬拒绝预检（`wrapper` 的 `long_lived` 分支），
   但不进入一次性进程的捕获/冻结流程。服务可与其他命令并发运行（不占 `effect="process"` FIFO）。
 - **边界同步**：启动时把工作区暂存内容物化进服务 overlay（**单向快照**，服务可见 AI 未发布
   编辑）；停止时捕获服务 overlay 改动 → 冻结候选 → 合并回工作区暂存并经异步审批入队
   （复用 `wrapper.settle_exec_candidate`）。服务与 `run_command` **非实时互通**，仅在启停时点同步。
+- **优雅停止**：`service_stop` / `stop_all` 先向服务**载荷进程**发 SIGTERM（`cgroup.term` 跳过
+  bwrap 监视进程——对 bwrap 发信号会立即销毁命名空间，载荷来不及执行 trap），等待
+  `stop_timeout_ms` 让其优雅退出；到时仍存活才 `cgroup.kill`（SIGKILL）整个进程树。进程确认
+  退出后再捕获改动（确保写入落盘）。`stop_all` 的优雅窗口取 `min(stop_timeout_ms, 调用方
+  timeout_ms)`。
 - **生命周期**：`sandbox.shutdown()`（`:qall` / 热重载 / 插件卸载）与 `sandbox.reset()` 停止全部
-  服务并捕获改动；服务日志为会话内环形缓冲（`service.max_log_bytes`），读取时经 `conceal` 脱敏。
-- **配置**：`tools.sandbox.service = { enabled, max_services, max_log_bytes, stop_timeout_ms }`。
+  服务（优雅停止）并捕获改动；服务日志为会话内环形缓冲（`service.max_log_bytes`），读取时经
+  `conceal` 脱敏。
+- **配置**：`tools.sandbox.service = { enabled, max_services, max_log_bytes, stop_timeout_ms,
+  auto_background }`。
 
 ### systemctl 门面（`tools.sandbox.systemd`，方案 A）
 
@@ -523,21 +553,34 @@ hostop 提案并在宿主 replay。本门面让**独立**的 `systemctl`/`journa
 - 隔离范围：**只影响 AI 的 `lsp_*` 工具**。不再全局包装 `vim.lsp.rpc.start`，编辑器自身的
   LSP 进程照常读写真实磁盘；AI 工具调用时按需克隆编辑器同名 server（客户端名加
   `@neoai-sandbox` 后缀），只有克隆体走沙箱命名空间与暂存层。
-- 机制：把克隆 server 的启动命令包成
-  `bwrap <隔离标志> <最小只读系统集> … --overlay-src <工作区> --overlay <upper> <work> <工作区> --chdir <工作区> <原命令>`；
-  隔离标志与 overlay 探测/`run_command` 一致（root 下为不含 user namespace 的显式标志）。
-  lower 为真实工作区（只读），upper 为沙箱私有可写层。克隆 server 读到的是「真实文件 + 暂存改动」
-  的合并视图，且路径仍是真实路径。
+- 机制：克隆 server 的启动命令复用 **`runtime.process_prefix`**（与 `run_command` **同一命名空间
+  构造**：相同读取面、overlay/遮蔽、seccomp、能力收敛），overlay 规格也复用
+  `wrapper.build_overlay_specs`。lower 为真实根，upper 为沙箱私有可写层。因此 `run_command`
+  调用 LSP（如 `pyright`、`pylsp`、`npx tsserver`）与 `lsp_*` 工具看到**完全一致**的沙箱视图
+  （同一真实路径、同一份暂存内容）。
+  - **不隔离 PID 命名空间**（`process_prefix` 的 `no_pid_ns=true`，同时去掉 `--as-pid-1`）：
+    Node 系 server（copilot/pyright 等）在 `--unshare-pid` 下会**启动后即退出**（exit 1）。
+    文件视图（mount/overlay/遮蔽）不受影响、仍与 `run_command` 一致，仅放弃 PID 隔离。
+- **与文件工具共享同一命名空间视图**：overlay 覆盖根 = cwd + `process_roots` + **所有已暂存
+  路径所在目录**（`candidate.staged_roots` / `staged_overlay_roots`），与 `run_command` 的覆盖
+  一致。同一真实路径在 LSP server 与文件工具中看到同一份（暂存）内容，消除「LSP 读真实盘、
+  文件工具读暂存」的分裂。
 - 诊断：克隆体的 `textDocument/publishDiagnostics` 不外溢到编辑器；`lsp_diagnostics` 优先通过
   pull diagnostics（`textDocument/diagnostic`）读取克隆体诊断（反映暂存内容），服务器不支持时
   回退编辑器诊断。
+- **工具侧 buffer 一致性**：`lsp_*` 工具在后台加载文件后，用暂存内容同步该后台 buffer
+  （`tool_helpers.sync_buffer_from_sandbox`），使 didOpen/didChange 文本与 overlay 磁盘视图一致；
+  用户已打开的 buffer 不覆盖（沙箱改动不外泄到编辑器）。
 - 一致性刷新：每次 LSP 工具调用前、以及克隆 server 启动时，`sandbox.lsp.refresh()` 会用当前
-  工作区暂存重新物化 upper（先清空再写入），使克隆 server 即时看到最新未发布改动。
+  暂存重新物化**全部覆盖根**的 upper（先清空再写入），使克隆 server 即时看到最新未发布改动。
 - 隔离与缓存：克隆 server 的缓存/状态目录（`stdpath(cache|data|state)`、`~/.cache`、`~/.local/*`、
-  `~/.npm`）以 rw bind 直连宿主，避免缓存写入 overlay 或被当作待审候选；overlay upper 按工作区
-  hash 分片，多项目互不串扰，位于 `/dev/shm/.cache-<tag>/lsp/<hash>`。rw bind 之后应用与
-  `run_command` 一致的 `mask_paths` 遮蔽（如 `~/.local/share/keyrings`、`~/.cache/keyring-*`），
-  避免随缓存目录把 keyring/凭据暴露给克隆 server。
+  `~/.npm`、以及 **XDG_CONFIG_HOME（默认 `~/.config`）**）以 rw bind 直连宿主，避免缓存/状态写入
+  overlay 或被当作待审候选。`~/.config` 必须可写：否则 server 打开其状态库（如 copilot 的
+  `~/.config/github-copilot/auth.db`）时报 `attempt to write a readonly database` 并退出（exit 1）。
+  overlay upper 按工作区 hash 分片，多项目互不串扰，位于 `/dev/shm/.cache-<tag>/lsp/<hash>`。
+  rw bind 之后应用与 `run_command` 一致的 `mask_paths` 遮蔽（如 `~/.config/gh`、`~/.config/gcloud`、
+  `~/.config/git/credentials`、`~/.local/share/keyrings`、`~/.cache/keyring-*`），避免随配置/缓存
+  目录把凭据暴露给克隆 server。
 - 生命周期：克隆客户端由 `sandbox.lsp.clients_for` / `client_supporting` 按需启动并缓存，
   `stop_all()` 统一停止；不注册任何全局 hook，卸载/禁用不影响编辑器 LSP。
 
@@ -1031,6 +1074,20 @@ CPU 之外**的核，避免与 nvim 抢占同一核；单核宿主或 `taskset` 
 关闭，或用 `"2,3"`/`"2-3"` 指定显式 cpuset。亲和性在 bwrap 之前施加（`_prepend_affinity`），
 覆盖整个沙箱进程树；与 cgroup `cpu.max` 配额叠加。
 
+### 暂存后端与磁盘上限
+
+**暂存后端**（`tools.sandbox.staging_backend`，默认 `"disk"`）：进程 overlay 的 upper/work、
+每会话私有临时根（/tmp 等）、LSP overlay 等沙箱暂存默认落在**磁盘**（优先 `/var/tmp`，退回 nvim
+缓存目录）下的无特征隐藏目录，避免「大量文件暂存在内存」（`/dev/shm`）。设 `"shm"` 可回到
+`/dev/shm`（更快但占内存）；给绝对路径则以该目录为基。`conceal.base_host` 统一定位该基目录。
+
+**磁盘上限**（`tools.sandbox.limits.disk_bytes`，默认 `64 GiB`，`0` = 不限）：统计暂存基目录
+（进程 overlay / 私有 tmp）与沙箱存储根（候选/待审/证据/服务 overlay）的总占用，超限时拒绝
+写类/外部进程工具（`SANDBOX_DISK_LIMIT_EXCEEDED`），避免暂存撑满宿主磁盘。用量经工作线程
+**异步递归统计并缓存**（TTL 5s），门禁只读缓存、不在命令开始处做同步 `du`，统计未就绪时放行；
+诊断见 `:NeoAISandboxDiag` 的 `disk` 字段。超限时可用 `:NeoAISandboxReview` 应用/拒绝待审候选、
+`:NeoAISandboxPrune` 清理过期候选，或调大该上限。
+
 ### seccomp 基线
 
 内置生成 denylist 过滤器（x86_64/aarch64）：先校验 `AUDIT_ARCH`（不符直接 `KILL_PROCESS`），
@@ -1227,6 +1284,12 @@ token 化/告警，不终止 Agent」。非环境变量的原始密钥（具名�
 > 重叠；下一条进程命令直接复用**已挂载**的 cgroup + 探针（事件派发目标在复用时指向本次 attempt），
 > 无需等待挂载。超时未被复用（默认 90s，`prewarm_ttl_ms`）则回收探针与 cgroup。仅 eBPF 后端
 > 需要预热（strace/procfs 启动廉价）。
+>
+> **能力/overlay 探测预热**（`runtime.warm`）：进程命令开始处会同步实测 bwrap/overlay 能力
+> （功能实测需起 bwrap，约百 ms），首条命令因此可感知卡顿。沙箱 `init()` 后在启动空闲时机
+> （延迟 200ms，每进程一次）预跑 `runtime.probe` / `cgroup.probe` 并对进程 overlay 基目录与
+> 沙箱存储基目录分别预热 `overlay_writable` 探测，使首条 `run_command` 与首个长驻服务直接命中
+> 缓存，不在命令开始处阻塞主线程。
 
 ### 检测（熵 + 字符集启发式）
 

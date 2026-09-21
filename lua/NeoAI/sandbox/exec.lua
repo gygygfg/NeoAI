@@ -207,7 +207,14 @@ function M.open(argv, opts)
   local attempt = control.new_attempt("exec_" .. tostring(opts.name or "open"), { command = opts.command }, ctx, spec)
   candidate.begin(attempt, root)
   local proc_dir = candidate.process_dir()
-  local specs = wrapper.build_overlay_specs(real_cwd, proc_dir, roots)
+  -- 覆盖所有已暂存路径：使工具子进程与只读工具看到同一暂存视图（否则工作区外的暂存编辑
+  -- 不会被物化，子进程读到真实磁盘——不一致且可绕过暂存）。
+  local extra = {}
+  for _, r in ipairs(roots) do extra[#extra + 1] = r end
+  local known = { real_cwd }
+  for _, r in ipairs(roots) do known[#known + 1] = r end
+  for _, r in ipairs(candidate.staged_overlay_roots(known)) do extra[#extra + 1] = r end
+  local specs = wrapper.build_overlay_specs(real_cwd, proc_dir, extra)
   for _, s in ipairs(specs) do
     if runtime.overlay_available() and runtime.overlay_writable(s.root, s.upper, s.work) then
       s.mode = "overlay"

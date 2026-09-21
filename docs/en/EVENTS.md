@@ -247,6 +247,16 @@ All event constants are defined in `NeoAI.kernel.events`. They are listed below 
 > Context compaction is **asynchronous in the background and opens no window**: it no longer emits `COMPACTION_STARTED` / `COMPACTION_CHUNK` (constants reserved),
 > only `COMPACTION_COMPLETED`. Plan distillation still opens the "🧬 Plan Distillation" floating window and emits `PLAN_DISTILL_STARTED` / `PLAN_DISTILL_CHUNK`.
 
+### Sandbox
+
+| Constant | Value | When it fires | Key payload fields |
+| --- | --- | --- | --- |
+| `SANDBOX_SYSTEMD_ROUTED` | `sandbox:systemd_routed` | A systemctl/journalctl call is routed by the facade to a long-lived sandbox service | `{ verb, units, ok, command_id }` |
+| `SANDBOX_SYSTEMD_UNSUPPORTED` | `sandbox:systemd_unsupported` | The facade explicitly rejects unsupported systemd semantics (never touches the host) | `{ verb, units, command_id }` |
+| `SANDBOX_CONTAINER_PLANNED` | `sandbox:container_planned` | Container control plan (namespace sharing / controlled socket) | `{ manager, mode, share_namespace, reason, command_id }` |
+| `SANDBOX_CONTAINER_UNSUPPORTED` | `sandbox:container_unsupported` | Container facade rejects host-daemon/remote/host subcommands | `{ manager, sub, reason, command_id }` |
+| `SANDBOX_BACKGROUND_ROUTED` | `sandbox:background_routed` | A `run_command` background command (`&`/nohup/setsid) is routed by the facade to a long-lived service | `{ name, service_id, kind, command_id }` |
+
 ## 4. Event Subscription Best Practices
 
 1. **Always reference constants**: trigger and subscribe through the constants in `NeoAI.kernel.events`; do not hard-code strings.

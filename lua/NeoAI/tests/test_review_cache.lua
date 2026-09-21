@@ -156,4 +156,39 @@ tests.suite("review_cache", function(_, it)
     store.reset()
     review.reset()
   end)
+
+  it("begin_batch/end_batch：逐项应用候选删除一次对账，不逐项全表扫描", function(t)
+    local store, review = setup()
+    local candidate = require("NeoAI.sandbox.candidate")
+    local ids = {}
+    for i = 1, 100 do
+      store.write_candidate({
+        candidate_digest = "sha256:g" .. i,
+        files = { { path = "/tmp/batch" .. i, action = "modify", content = "x",
+          after_hash = "sha256:x", before_hash = "sha256:b" } },
+        created_at = i,
+      })
+      local item = review.enqueue({
+        candidate_digest = "sha256:g" .. i,
+        files = { { path = "/tmp/batch" .. i, action = "modify" } },
+        created_at = i,
+      }, { tool = "edit_file" })
+      ids[i] = item.change_set_id
+    end
+    -- 隔离发布：只验证删除对账的扫描次数，不落真实文件。
+    local orig_publish, orig_receipt = candidate.publish, store.write_receipt
+    candidate.publish = function() return { ok = true, receipt = { operation_id = "op" } } end
+    store.write_receipt = function() return true end
+    local before = review._ref_scans()
+    local ctx = review.begin_batch()
+    for i = 1, 100 do
+      review.apply(ids[i], { auto_approve = true, batch = ctx })
+    end
+    review.end_batch(ctx)
+    candidate.publish, store.write_receipt = orig_publish, orig_receipt
+    t.eq(before, review._ref_scans(), "批量会话不应逐项全表扫描引用")
+    t.eq(0, review.pending_count(), "全部应用后待审应清空")
+    store.reset()
+    review.reset()
+  end)
 end)

@@ -212,6 +212,46 @@ function M.sync_buffer_from_disk(bufnr)
   return ok1 and ok2 and ok3
 end
 
+--- 用**沙箱暂存内容**同步 buffer（供 LSP 工具使用），使 LSP 客户端的 didOpen/didChange
+--- 文本与沙箱命名空间内的磁盘视图（overlay 物化的暂存内容）一致。否则 server 会同时看到
+--- 「buffer 文本=真实内容」与「磁盘=暂存内容」两份，诊断/补全基于真实内容，与文件工具
+--- （读暂存）分裂——即「LSP 工具与文件共享同一命名空间视图」要消除的问题。
+--- 仅作用于 `ensure_buffer` 后台加载、非用户打开的 buffer；用户已打开的 buffer 绝不覆盖
+--- （避免把沙箱内未发布的改动泄露到用户编辑器视图）。
+--- @param bufnr number
+--- @param filepath string 真实路径（后台 buffer 名即真实路径）
+--- @return boolean
+function M.sync_buffer_from_sandbox(bufnr, filepath)
+  if type(filepath) ~= "string" or filepath == "" then return true end
+  if not vim.api.nvim_buf_is_loaded(bufnr) then return true end
+  if vim.bo[bufnr].modified then return true end -- 有未保存改动，绝不覆盖
+  if not bg_loaded[bufnr] then return true end -- 仅后台加载的 buffer
+  local ok, cand = pcall(require, "NeoAI.sandbox.candidate")
+  if not ok or not cand or type(cand.read_path) ~= "function" then return true end
+  local staged = cand.read_path(filepath)
+  if not staged then return true end
+  local content = require("NeoAI.utils.fs").read_file(staged)
+  if content == nil then return true end
+  local has_eol = content:sub(-1) == "\n"
+  local disk_lines = vim.split(content:gsub("\n$", ""), "\n", { plain = true })
+  if content == "" then disk_lines = { "" } end
+  local mem_lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+  local same = #disk_lines == #mem_lines
+  if same then
+    for i = 1, #disk_lines do
+      if disk_lines[i] ~= mem_lines[i] then same = false break end
+    end
+  end
+  if same then
+    pcall(vim.api.nvim_buf_set_option, bufnr, "eol", has_eol)
+    return true
+  end
+  local ok1 = pcall(vim.api.nvim_buf_set_lines, bufnr, 0, -1, false, disk_lines)
+  local ok2 = pcall(vim.api.nvim_buf_set_option, bufnr, "eol", has_eol)
+  pcall(vim.api.nvim_buf_set_option, bufnr, "modified", false)
+  return ok1 and ok2
+end
+
 --- AI 工具直写磁盘后，同步所有已加载且指向该文件的 buffer（仅当无未保存改动）。
 --- 解决 edit_file/write_file/append_file/git_rollback 改盘后，已打开 buffer 展示
 --- 过期内容（看不见 AI 的修改、按旧行号操作读错位置）的问题。

@@ -114,7 +114,14 @@ local function _build(svc, opts)
   local attempt = control.new_attempt("service_" .. svc.name, { command = svc.command }, svc.ctx or {}, svc.spec)
   svc.attempt = attempt
   candidate.begin(attempt, store.root())
-  local specs = wrapper.build_overlay_specs(real_cwd, svc_dir, roots)
+  -- 覆盖所有已暂存路径：使服务与只读工具看到同一暂存视图（边界同步为单向快照，
+  -- 但快照必须包含工作区外的暂存编辑，否则服务读到真实磁盘、视图分裂）。
+  local extra = {}
+  for _, r in ipairs(roots) do extra[#extra + 1] = r end
+  local known = { real_cwd }
+  for _, r in ipairs(roots) do known[#known + 1] = r end
+  for _, r in ipairs(candidate.staged_overlay_roots(known)) do extra[#extra + 1] = r end
+  local specs = wrapper.build_overlay_specs(real_cwd, svc_dir, extra)
   for _, s in ipairs(specs) do
     if runtime.overlay_available() and runtime.overlay_writable(s.root, s.upper, s.work) then
       s.mode = "overlay"
@@ -208,6 +215,7 @@ function M.start(name, command, opts)
     end,
     on_exit = function(_, code)
       svc.status = "exited"
+      svc.exited = true
       svc.exit_code = code
       svc.stopped_at = os.time()
       if svc.cg then pcall(cgroup.release, svc.cg); svc.cg = nil end
@@ -262,23 +270,21 @@ function M.list()
 end
 
 --- 停止服务并把其改动冻结/合并回工作区暂存（异步）。
+--- 优雅停止：先向资源域内进程发 SIGTERM，等待 stop_timeout_ms（`opts.grace_ms` 可覆盖）
+--- 让载荷清理退出；到时仍存活才 SIGKILL 整个进程树。进程确认退出后再捕获（确保写入落盘）。
 --- @param key string
 --- @param cb function|nil cb(err, info)
-function M.stop(key, cb)
+--- @param opts table|nil { grace_ms? } 优雅退出窗口（ms），默认 tools.sandbox.service.stop_timeout_ms
+function M.stop(key, cb, opts)
   cb = cb or function() end
+  opts = opts or {}
   local svc = _find(key)
   if not svc then cb("服务不存在：" .. tostring(key)); return end
   state.services[svc.id] = nil
   for i, id in ipairs(state.order) do
     if id == svc.id then table.remove(state.order, i); break end
   end
-  -- 终止：cgroup.kill 精确杀整个进程树；jobstop 兜底。
-  if svc.cg then pcall(cgroup.kill, svc.cg) end
-  if type(svc.job) == "number" and svc.job > 0 then
-    pcall(vim.fn.jobstop, svc.job)
-  end
-  svc.status = "stopped"
-  svc.stopped_at = os.time()
+  if not svc.exited then svc.status = "stopping" end
   local cg = svc.cg
   svc.cg = nil
 
@@ -312,25 +318,62 @@ function M.stop(key, cb)
     end)
   end
 
-  -- 等待进程优雅退出（有界），再捕获（确保写入落盘）。
-  local timeout = tonumber(_cfg().stop_timeout_ms) or 5000
-  vim.defer_fn(function()
+  --- 强制终止整个进程树（优雅窗口耗尽后的兜底）：优先 cgroup.kill，其次按宿主 PID SIGKILL。
+  local function hard_kill()
+    if cg then pcall(cgroup.kill, cg) end
     if type(svc.job) == "number" and svc.job > 0 then
-      local ok, st = pcall(vim.fn.job_status, svc.job)
-      if ok and st == "run" then pcall(vim.fn.jobstop, svc.job) end
+      if not cg then
+        local pid = vim.fn.jobpid(svc.job)
+        if pid and pid > 0 then pcall(vim.uv.kill, pid, 9) end
+      end
+      pcall(vim.fn.jobstop, svc.job)
     end
-    finish_capture()
-  end, math.min(300, timeout))
+  end
+
+  -- 先优雅：只向资源域内的载荷进程发 SIGTERM（`cgroup.term` 会跳过 bwrap 监视进程——
+  -- 对 bwrap 发信号会立即销毁命名空间，载荷来不及执行 trap），给载荷 stop_timeout_ms 的
+  -- 优雅退出窗口；到时仍存活才 SIGKILL。无资源域时无法只对载荷发信号，直接 jobstop。
+  local grace = tonumber(opts.grace_ms) or tonumber(_cfg().stop_timeout_ms) or 5000
+  if cg then
+    pcall(cgroup.term, cg)
+  elseif type(svc.job) == "number" and svc.job > 0 then
+    pcall(vim.fn.jobstop, svc.job)
+  end
+
+  local deadline = vim.uv.hrtime() + math.max(0, grace) * 1e6
+  local function poll()
+    if svc.exited then
+      finish_capture()
+      return
+    end
+    if vim.uv.hrtime() >= deadline then
+      hard_kill()
+      -- 给 on_exit 一点时间触发（SIGKILL 立即生效），再捕获，确保写入已落盘。
+      vim.defer_fn(function()
+        if not svc.exited then
+          svc.status = "stopped"
+          svc.stopped_at = os.time()
+        end
+        finish_capture()
+      end, 200)
+      return
+    end
+    vim.defer_fn(poll, 50)
+  end
+  poll()
 end
 
 --- 停止全部服务（会话结束 / 卸载 / 关闭）。best-effort，捕获经 vim.wait 有界等待。
+--- 优雅停止窗口取 min(stop_timeout_ms, opts.timeout_ms)，避免总等待超出调用方预算。
 --- @param opts table|nil { timeout_ms? }
 function M.stop_all(opts)
   opts = opts or {}
   local ids = vim.deepcopy(state.order)
   if #ids == 0 then return end
+  local total = tonumber(opts.timeout_ms) or 10000
+  local grace = tonumber(_cfg().stop_timeout_ms) or 5000
+  if total > 0 then grace = math.min(grace, total) end
   local remaining = #ids
-  local done = false
   for _, id in ipairs(ids) do
     local svc = state.services[id]
     if not svc then
@@ -338,11 +381,11 @@ function M.stop_all(opts)
     else
       M.stop(id, function()
         remaining = remaining - 1
-      end)
+      end, { grace_ms = grace })
     end
   end
   if remaining > 0 then
-    vim.wait(tonumber(opts.timeout_ms) or 10000, function() return remaining <= 0 end, 20)
+    vim.wait(total, function() return remaining <= 0 end, 20)
   end
   state.services = {}
   state.order = {}

@@ -32,6 +32,11 @@ local inject_user = nil
 -- 使下一 Turn 模型看到最新工具签名（失败驱动的时序保证）。
 local pre_round_refresh = nil
 
+-- 轮末持久化钩子：由 chat_service 注册（避免 core→service 反向依赖）。
+-- 工具循环每轮工具结果落库、运行时上下文刷新后调用，把本回合新增消息增量写入会话存储，
+-- 使长循环中途意外退出也能保留已完成进度，而不是等整个循环结束才由调用方统一保存。
+local round_persist = nil
+
 -- 达到轮数上限时写入 agent 消息队列的停止说明（chat 界面经 MESSAGE_ADDED 直接可见）
 local LOOP_LIMIT_MESSAGE = "⚠️ 工具循环达到最大轮数限制（" .. tostring(MAX_ROUNDS) .. "），已停止继续执行。"
 
@@ -325,6 +330,13 @@ function M.set_pre_round_refresh(fn)
   pre_round_refresh = fn
 end
 
+--- 注册轮末持久化钩子（由 chat_service 调用；nil 清除）。
+--- 每轮工具结果落库后调用，用于把本回合进度增量落盘（长循环中途意外退出不丢进度）。
+--- @param fn function(agent)|nil
+function M.set_round_persist(fn)
+  round_persist = fn
+end
+
 --- 在轮末触发一次 pending 注入（工具循环每轮结束调用；也可手动复用）
 --- @param agent table
 function M.inject_pending(agent)
@@ -420,6 +432,10 @@ function M.run(agent, tool_calls, tool_service, opts)
       -- 同步最新的运行时上下文快照（todos/计划模式可能在上一轮工具执行中变化）；
       -- 仅在内容变化时追加，系统提示保持稳定，不影响前缀缓存。
       require("NeoAI.core.session.runtime_context").ensure(agent)
+
+      -- 轮末增量落盘：本轮工具结果与新增消息已就绪，立即持久化。长工具循环中途意外
+      -- 退出时保留已完成进度，而不是等整个循环结束才由 chat_service 统一保存。
+      if round_persist then pcall(round_persist, agent) end
 
       agent:set_state("generating")
       event_bus.emit(events.TOOL_LOOP_FINISHED, { agent_id = agent.id, rounds = rounds })

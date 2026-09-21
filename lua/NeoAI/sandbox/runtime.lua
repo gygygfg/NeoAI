@@ -491,7 +491,7 @@ local function _expose_paths()
 end
 
 --- 沙箱运行时私有目录（宿主，不暴露给沙箱）：存放空文件、净化 resolv.conf 等。
---- 放在 conceal 的无特征基目录（/dev/shm 等可被非 root 载荷遍历的位置），而非沙箱存储根
+--- 放在 conceal 的无特征基目录（默认 /var/tmp，可被非 root 载荷遍历），而非沙箱存储根
 --- （0700，root 专属）——否则非 root 载荷无法读取 `--ro-bind` 的源文件（EACCES）。
 --- @return string
 local function _private_dir()
@@ -832,8 +832,9 @@ local function _prune_tmp_base(base, keep_session)
 end
 
 --- 追加每会话私有临时根挂载。
---- host 模式：在宿主根（如 /tmp）下建隐藏子目录 <root>/.cache-<tag>/<session>（1777），
---- 命名空间 bind 回该根——AI 在沙箱内看到的 /tmp 即此私有子目录，宿主 /tmp 内容不可见。
+--- host 模式：在暂存基目录（`conceal.base_host`，默认磁盘）下按根编码建隐藏子目录
+--- <base>/tmp<编码根>/<session>（1777），命名空间 bind 回该根——AI 在沙箱内看到的 /tmp
+--- 即此私有子目录，宿主 /tmp 内容不可见，且不再占用 /tmp tmpfs 内存。
 --- session 模式/不可用时：退回进程目录下的私有目录；再退回空 tmpfs。
 --- @param argv table
 --- @param session_base string|nil 会话进程目录（其 basename 即会话 id）
@@ -932,10 +933,12 @@ end
 --- @param priv table|nil 档位隔离参数（cap_add 等）
 --- @param cwd string|nil 工作目录（用于决定是否暴露其所在用户 home）
 --- @param root_overlay table|nil { upper, work }：read_all 模式下的整机可写暂存层
-local function _append_bwrap_base(argv, flags, priv, cwd, root_overlay)
+local function _append_bwrap_base(argv, flags, priv, cwd, root_overlay, no_pid_ns)
   argv[#argv + 1] = "bwrap"
   for _, f in ipairs(flags) do argv[#argv + 1] = f end
-  for _, f in ipairs({ "--die-with-parent", "--as-pid-1" }) do argv[#argv + 1] = f end
+  argv[#argv + 1] = "--die-with-parent"
+  -- --as-pid-1 需要 --unshare-pid；no_pid_ns（如 LSP server）时二者都不加。
+  if not no_pid_ns then argv[#argv + 1] = "--as-pid-1" end
   _append_readonly_mounts(argv, cwd, root_overlay)
   for _, f in ipairs({ "--dev", "/dev", "--proc", "/proc" }) do
     argv[#argv + 1] = f
@@ -1344,6 +1347,37 @@ end
 function M.probe()
   state.caps = _probe()
   return state.caps
+end
+
+--- 预热运行时能力与 overlay 可写性探测。
+--- 首次进程命令会在开始处同步实测 bwrap/overlay 能力（功能实测需起 bwrap，约百 ms），
+--- 造成 run_command 开始时主线程卡顿；此处把该实测提前到启动后的空闲时机完成并写入
+--- 缓存，使首条 run_command / 首个长驻服务直接命中缓存。探测结果本身有缓存，重复调用廉价。
+--- @return table 诊断 { capabilities: boolean, overlay: table<string, boolean> }
+function M.warm()
+  local out = { capabilities = false, overlay = {} }
+  local ok_caps = pcall(function()
+    M.probe() -- bwrap/overlay/seccomp 能力（缓存到 state.caps）
+    require("NeoAI.sandbox.cgroup").probe() -- cgroup v2 能力（stat -fc + 可写性）
+  end)
+  if not ok_caps or not M.overlay_available() then return out end
+  local bases = {}
+  local ok_c, conceal = pcall(require, "NeoAI.sandbox.conceal")
+  if ok_c and conceal.base_host then bases[#bases + 1] = conceal.base_host() end
+  local ok_s, store = pcall(require, "NeoAI.sandbox.store")
+  if ok_s and store.root and store.root() then bases[#bases + 1] = store.root() end
+  for _, base in ipairs(bases) do
+    local probe = base .. "/.probe"
+    local upper, work = probe .. "/upper", probe .. "/work"
+    pcall(vim.fn.mkdir, upper, "p")
+    pcall(vim.fn.mkdir, work, "p")
+    -- 用 "/" 为 lower 预热（read_all 整机 overlay 模式的探测键）；服务/命令共用同一
+    -- (lower, dev, uid, gid) 缓存键，故同一文件系统上的后续探测均命中。
+    local wok, res = pcall(M.overlay_writable, "/", upper, work)
+    out.overlay[base] = (wok and res) and true or false
+    pcall(vim.fn.delete, probe, "rf")
+  end
+  return out
 end
 
 --- @return table
@@ -1914,10 +1948,28 @@ function M.process_prefix(opts)
         flags = USER_FLAGS
       end
     end
+    -- no_pid_ns：不隔离 PID 命名空间（同时去掉 --as-pid-1）。供长驻 LSP server 使用：
+    -- Node 系 server（copilot/pyright 等）在 `--unshare-pid` 下会启动后即退出（exit 1）。
+    -- 文件视图（mount/overlay/遮蔽）不受影响，仍与 run_command 一致；仅放弃 PID 隔离。
+    local no_pid_ns = opts.no_pid_ns == true
+    if no_pid_ns then
+      local f2 = {}
+      for _, f in ipairs(flags) do
+        if f == "--unshare-all" then
+          -- 展开为显式标志并去掉 pid（保留 user/net/ipc/uts/cgroup，隔离面不变）。
+          for _, x in ipairs({ "--unshare-user", "--unshare-net", "--unshare-ipc", "--unshare-uts", "--unshare-cgroup" }) do
+            f2[#f2 + 1] = x
+          end
+        elseif f ~= "--unshare-pid" then
+          f2[#f2 + 1] = f
+        end
+      end
+      flags = f2
+    end
     local userns = false
     for _, f in ipairs(flags) do if f == "--unshare-all" or f == "--unshare-user" then userns = true end end
     local argv = {}
-    _append_bwrap_base(argv, flags, priv, opts.cwd, root_overlay)
+    _append_bwrap_base(argv, flags, priv, opts.cwd, root_overlay, no_pid_ns)
     -- root_drop：为让载荷经 setpriv 降 uid，bwrap 需保留 SETUID/SETGID（其余能力仍被
     -- `--cap-drop ALL` 丢弃）；setuid 后内核清空 permitted/effective，载荷无能力。
     -- 但嵌套 userns 档位（T2）下 bwrap 新建的 userns 未映射 run_as.uid，setpriv 会

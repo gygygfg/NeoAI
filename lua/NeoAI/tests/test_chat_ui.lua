@@ -1406,6 +1406,62 @@ tests.suite("chat_ui", function(_, it)
     chat_service.reset()
   end)
 
+  it("一轮内多工具折叠刷新：结构变化与就地刷新同批写入不泄漏折叠内容", function(t)
+    local chat_view = require("NeoAI.ui.window.chat_view")
+    local chat_service = require("NeoAI.services.chat_service")
+    local event_bus = require("NeoAI.kernel.event_bus")
+    local events = require("NeoAI.kernel.events")
+    chat_view.reset()
+    chat_service.reset()
+
+    local opened = chat_view.open()
+    local agent = chat_service.get_current_agent()
+    agent.messages = {
+      { role = "user", content = "跑命令" },
+      { role = "assistant", content = "", tool_calls = {
+        { id = "m1", ["function"] = { name = "run_command", arguments = '{"command":"echo one\\necho two"}' } },
+        { id = "m2", ["function"] = { name = "read_file", arguments = '{"filepath":"/a/b/c.txt"}' } },
+      } },
+    }
+    chat_view.refresh()
+    event_bus.emit(events.TOOL_EXECUTION_STARTED, { agent_id = agent.id, name = "run_command", tool_call_id = "m1" })
+    event_bus.emit(events.TOOL_EXECUTION_STARTED, { agent_id = agent.id, name = "read_file", tool_call_id = "m2" })
+    chat_view.flush()
+    vim.api.nvim_set_current_win(opened.win_id)
+
+    local function find_line(pat)
+      for i, l in ipairs(vim.api.nvim_buf_get_lines(opened.buf, 0, -1, false)) do
+        if l:find(pat, 1, true) then return i end
+      end
+      return 0
+    end
+
+    -- m1 完成（追加结果消息 = 结构变化），m2 仍在执行（首行耗时就地刷新）：
+    -- 两者在同一次渲染中写入，仍执行中的 m2 折叠不应被截断（相邻同级别折叠的缺陷）。
+    agent.messages[#agent.messages + 1] = {
+      role = "tool", tool_call_id = "m1", tool_name = "run_command", content = "one\ntwo",
+    }
+    event_bus.emit(events.TOOL_EXECUTION_COMPLETED, {
+      agent_id = agent.id, name = "run_command", tool_call_id = "m1", duration_ms = 1234,
+    })
+    chat_view.flush()
+
+    local h2 = find_line("调用工具: read_file")
+    local fp = find_line('"filepath"')
+    t.true_(h2 > 0 and fp > h2, "应找到仍在执行的 read_file 首行与内容行")
+    local close = fp + 1
+    t.true_(vim.api.nvim_buf_get_lines(opened.buf, close - 1, close, false)[1]:find("}", 1, true) ~= nil,
+      "read_file 参数应在下一行以 } 收尾")
+    t.eq(vim.fn.foldclosed(h2), vim.fn.foldclosed(close),
+      "仍在执行的工具折叠边界不应被截断（内容不泄漏到折叠外）")
+    for i = h2, close do
+      t.eq(h2, vim.fn.foldclosed(i), "折叠内第 " .. i .. " 行应与首行同属一个折叠")
+    end
+
+    chat_view.reset()
+    chat_service.reset()
+  end)
+
   it("工具折叠文本含结构化调用参数与执行结果（成功/失败均展示）", function(t)
     local chat_view = require("NeoAI.ui.window.chat_view")
     local chat_service = require("NeoAI.services.chat_service")

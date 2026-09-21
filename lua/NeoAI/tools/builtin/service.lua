@@ -2,7 +2,8 @@
 --- @module NeoAI.tools.builtin.service
 --- 后台常驻进程（dev server / watch / 守护进程）跨工具调用存活，直到显式停止或会话结束。
 --- 每个服务在独立沙箱 overlay + 资源域内运行；停止时其工作区改动冻结为候选并经异步审批。
---- 与 run_command 的 `&`/nohup 不同：那些后台进程随命令结束即被回收，不能跨调用复用。
+--- run_command 中的 `&`/nohup/setsid 会自动转为长驻服务（跨调用存活）；需要显式命名/管理时
+--- 直接用本模块的 service_start。
 
 local helpers = require("NeoAI.tools.builtin.tool_helpers")
 
@@ -40,8 +41,8 @@ service_tools.service_start = helpers.define_tool(
   "service_start",
   "启动一个**后台常驻服务**（dev server、watch、守护进程等），跨工具调用持续运行，直到 "
   .. "service_stop 或会话结束。命令在独立沙箱内运行，其工作区写入在停止时进入待审。"
-  .. "与 run_command 的 `&`/nohup 不同：那些后台进程随命令结束被回收，不能跨调用存活。"
-  .. "启动后用 service_logs 查看输出、service_status 查看状态。",
+  .. "run_command 中以后台方式结束的命令（`&`/nohup/setsid）会自动转为长驻服务；"
+  .. "需要显式命名/管理时用本工具。启动后用 service_logs 查看输出、service_status 查看状态。",
   {
     type = "object",
     properties = {

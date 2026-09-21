@@ -826,10 +826,11 @@ function M.apply(id, opts)
     item.applied_at = os.time()
     item.receipt = pub.receipt
     store.write_receipt(pub.receipt)
-    -- 批量应用（apply_all）时把候选删除推迟到循环结束后一次性对账，避免对每个候选
-    -- 做一次全表引用扫描（O(n²)）；单项应用仍即时删除。
-    if opts._defer_discard then
-      opts._defer_discard[item.candidate_digest] = true
+    -- 批量应用（apply_all / begin_batch 会话）时把候选删除推迟到全部应用后一次性对账，
+    -- 避免对每个候选做一次全表引用扫描（O(n²)）；单项应用仍即时删除。
+    local deferred = opts._defer_discard or (opts.batch and opts.batch.deferred)
+    if deferred then
+      deferred[item.candidate_digest] = true
     else
       _discard_candidate(item.candidate_digest)
     end
@@ -861,6 +862,20 @@ function M.apply(id, opts)
     })
   end
   return pub
+end
+
+--- 开始一次批量应用会话：会话内 `apply` 把候选删除推迟到 `end_batch` 统一对账。
+--- 供 UI 在**逐项让出主循环**地应用大量变更时复用——否则每项都触发一次 O(n) 引用扫描，
+--- 待审堆积到数百/上千时退化为 O(n²)，占满主线程。
+--- @return table ctx { deferred = table }
+function M.begin_batch()
+  return { deferred = {} }
+end
+
+--- 结束批量应用会话：对会话内已应用候选做一次 O(n) 引用统计，删除未被引用者。
+--- @param ctx table M.begin_batch 返回值
+function M.end_batch(ctx)
+  if ctx and ctx.deferred then _discard_candidates(ctx.deferred) end
 end
 
 --- 应用所有已批准（或全部待审）变更单元

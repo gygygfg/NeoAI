@@ -790,4 +790,91 @@ tests.suite("sandbox_review", function(_, it)
     t.matches("L3", w)
     t.matches("/etc/nginx%.conf", w)
   end)
+
+  it("build_lines 分区显示未应用与已应用", function(t)
+    local sr = require("NeoAI.ui.components.sandbox_review")
+    local cwd = vim.fn.getcwd()
+    local data = sr.build_lines(
+      { { change_set_id = "csU", tool = "edit_file",
+          files = { { path = cwd .. "/a.lua", action = "modify" } } } },
+      {}, nil,
+      { { change_set_id = "csA", tool = "edit_file", apply_state = "APPLIED",
+          saved_files = { { path = cwd .. "/b.lua", action = "modify" } } } })
+    local text = table.concat(data.lines, "\n")
+    t.matches("未应用", text, "应有未应用分区")
+    t.matches("已应用", text, "应有已应用分区")
+  end)
+
+  it("A 键一键同意所有工作区内修改（跳过工作区外）", function(t)
+    local services = require("NeoAI.kernel.services")
+    local sr = require("NeoAI.ui.components.sandbox_review")
+    sr.reset()
+    local saved = services.use("services.sandbox")
+    local cwd = vim.fn.getcwd()
+    local calls = {}
+    services.provide("services.sandbox", {
+      list_reviews = function()
+        return {
+          { change_set_id = "csW", tool = "edit_file", files = {
+            { path = cwd .. "/a.lua", action = "modify" },
+            { path = "/etc/nginx.conf", action = "modify" },
+          } },
+          { change_set_id = "csSys", tool = "edit_file", files = {
+            { path = "/etc/hosts", action = "modify" } } },
+        }
+      end,
+      apply = function(id, opts) calls[#calls + 1] = { id = id, opts = opts }; return { ok = true } end,
+      reject = function() end,
+    })
+    sr.open()
+    local buf = sr.get_buf()
+    local cb
+    for _, m in ipairs(vim.api.nvim_buf_get_keymap(buf, "n")) do
+      if m.lhs == "A" then cb = m.callback end
+    end
+    t.not_nil(cb, "应注册 A 一键同意键")
+    cb()
+    -- 批量应用逐项让出主循环（异步），等待完成后再断言。
+    t.true_(vim.wait(2000, function() return not sr.is_applying_all() end, 10), "批量应用应完成")
+    t.eq(1, #calls, "仅对含工作区文件的变更单元调用一次")
+    t.eq("csW", calls[1].id)
+    t.eq(1, #calls[1].opts.files, "仅应用工作区文件")
+    t.eq(cwd .. "/a.lua", calls[1].opts.files[1])
+    sr.close()
+    services.provide("services.sandbox", saved)
+  end)
+
+  it("A 键批量应用逐项让出主循环，且重入被拒绝", function(t)
+    local services = require("NeoAI.kernel.services")
+    local sr = require("NeoAI.ui.components.sandbox_review")
+    sr.reset()
+    local saved = services.use("services.sandbox")
+    local cwd = vim.fn.getcwd()
+    local calls = {}
+    services.provide("services.sandbox", {
+      list_reviews = function()
+        local items = {}
+        for i = 1, 3 do
+          items[i] = { change_set_id = "csY" .. i, tool = "edit_file",
+            files = { { path = cwd .. "/y" .. i .. ".lua", action = "modify" } } }
+        end
+        return items
+      end,
+      apply = function(id, opts) calls[#calls + 1] = { id = id, opts = opts }; return { ok = true } end,
+      reject = function() end,
+    })
+    sr.open()
+    local buf = sr.get_buf()
+    local cb
+    for _, m in ipairs(vim.api.nvim_buf_get_keymap(buf, "n")) do
+      if m.lhs == "A" then cb = m.callback end
+    end
+    cb()
+    -- 首个 tick 后仍在应用中，此时重入不应重复触发。
+    cb()
+    t.true_(vim.wait(2000, function() return not sr.is_applying_all() end, 10), "批量应用应完成")
+    t.eq(3, #calls, "重入不应重复应用")
+    sr.close()
+    services.provide("services.sandbox", saved)
+  end)
 end)

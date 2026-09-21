@@ -161,8 +161,9 @@ stdout/stderr 合计超过 `tools.run_command.max_output_bytes`（默认 16 MiB�
 ### 🔌 长驻服务（service.lua）
 
 `service_start`（启动后台常驻进程，跨工具调用存活）/ `service_logs` / `service_status` / `service_stop`。
-与 `run_command` 的 `&`/nohup 不同：后者随命令结束被回收。服务在独立沙箱 overlay + cgroup 内运行，
-停止时其工作区改动冻结为候选并进入异步审批；生命周期由 `sandbox.shutdown`/`reset` 统一回收。
+`run_command` 中以终止 `&` 或前导 `nohup`/`setsid` 结束的后台命令会被自动转为长驻服务（跨调用存活）；
+服务在独立沙箱 overlay + cgroup 内运行，停止时先 SIGTERM 优雅退出、超时才 SIGKILL，其工作区改动冻结为
+候选并进入异步审批；生命周期由 `sandbox.shutdown`/`reset` 统一回收。
 详见 [sandbox.md](sandbox.md) 的「长驻服务」。
 
 ### 🗂 Git（git_ops.lua）
@@ -179,6 +180,10 @@ stdout/stderr 合计超过 `tools.run_command.max_output_bytes`（默认 16 MiB�
 
 > `lsp_ops` 有**请求级超时**兜底（`tools.lsp.timeout_ms` 默认 10s）：服务器无响应时快速失败，
 > 避免工具循环挂到 executor 超时。
+>
+> `lsp_diagnostics` **每次调用都重新获取**：pull 客户端（`textDocument/diagnostic`，优先 AI 沙箱克隆）
+> 直接请求最新诊断；仅 push 客户端时强制触发一次 didChange（内容不变、不产生撤销项）让服务器重新
+> lint，等其 `publishDiagnostics` 后再读缓存（超时兜底），不返回陈旧缓存。
 
 ### 🌳 Tree-sitter（tree_ops.lua）
 
