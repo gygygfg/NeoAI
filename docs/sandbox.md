@@ -40,7 +40,8 @@
 | `sandbox/replay.lua` | 策略回放（同规则同事实复现裁决） |
 | `sandbox/cgroup.lua` | cgroup v2 资源域（内存/PID/CPU），每次尝试独立域 |
 | `sandbox/disk.lua` | 沙箱暂存磁盘用量统计与上限门禁（异步缓存，超限拒绝写类/进程工具） |
-| `sandbox/background.lua` | 后台命令识别（`&`/nohup/setsid），供门禁转长驻服务 |
+| `sandbox/background.lua` | 后台命令识别（`&`/nohup/setsid） |
+| `sandbox/resident.lua` | 会话级常驻沙箱实例（命令服务器，后台进程跨调用存活） |
 | `sandbox/seccomp.lua` | seccomp 能力探测与 require_seccomp 门禁 |
 | `sandbox/privilege.lua` | 权限档位（T0/T1/T2）分类、解析、自动升级检测与留痕 |
 | `sandbox/hostop.lua` | T2 主机效果提案（冻结/审批后 replay/拒绝） |
@@ -122,6 +123,15 @@
   - **结果风险扫描有窗口上限**：`risk.from_result` 仅扫描输出首/尾各
     `tools.sandbox.risk.result_scan_bytes`（默认 256 KiB）字节，避免 `timeout=-1` 的大输出
     在主线程全量 lower + 模式匹配而冻结界面。
+  - **覆盖根解析按父目录去重**：`staged_overlay_roots` 对同一目录下的多个暂存文件（如缓存
+    目录下成千上万文件）只解析一次「最近存在祖先」，不再逐文件 `fnamemodify`/`isdirectory`。
+    冻结结果本身已由 `state.materialized` 的签名/版本增量跳过，故「读取+哈希+冻结」过的文件
+    在后续命令中不再重复参与计算（实测 3000 暂存文件时该步由 ~16ms 降至 <1ms）。
+  - **写日志增量捕获**（`tools.sandbox.journal_capture`，默认 auto）：用 eBPF 观测到的「本轮
+    写入/删除路径」驱动 capture，**只处理这些路径**（`_capture_worker` 路径驱动分支），不再
+    全量遍历会话累积的 overlay upper；`_encode_expected`/`_encode_ws` 也按这些路径增量编码。
+    仅在观测可信时生效（eBPF + 命令前就绪 + 已排空 + 全绝对路径 + 日志非空），否则回退全量
+    遍历（正确性优先）。实测 3000 累积文件、单文件写入时 capture 由 ~10ms 降至 <1ms。
   - **物化按暂存版本跳过未改动项**：每个暂存项带版本号，编辑/合并/删除时递增；物化记录各
     overlay/bind base 上次写入的版本，版本一致即**完全跳过**（不 `fs_stat`、不读、不写）。
     此前每条 `run_command` 开始都遍历全部暂存项并对每项做两次 `fs_stat` + 字符串格式化，
@@ -197,7 +207,8 @@
     按文件路径级别高亮 —— **工作区文件=绿色、用户目录=黄色、系统路径=红色**，
     「待审」状态标签**按安全等级着色**（L0 灰 / L1 黄 / L2 橙 / L3 红）；并按安全级别显示
     **高危/中危/低危** 风险档（`[L0]低危` …
-      `[L2]/[L3]高危`）与风险原因。界面**按「未应用 / 已应用」分区展示**：待审（未应用）
+      `[L2]/[L3]高危`）与风险原因（同类原因**去重合并计数**，如 `SYSTEM_PATH_WRITE×2797`，
+      避免包安装逐文件重复刷屏；`sandbox/risk.lua` 已在源头按类别去重）。界面**按「未应用 / 已应用」分区展示**：待审（未应用）
       变更在前，已发布（含快照，可撤销）变更在后。**头行 = 整单元审批**（`<CR>` 一次应用该变更
       单元的全部文件），**文件行 = 单文件审批**（`<CR>` 仅应用光标所在文件）；`A` **一键同意
       所有工作区内修改**（按文件粒度应用工作区内待审文件；工作区外的文件与主机操作提案保留
@@ -212,10 +223,10 @@
       `q`/`<Esc>` 关闭。**窗口打开期间订阅沙箱广播事件自动刷新**（待审入队/应用/拒绝/撤销、
       越界留痕、主机操作等变化即时重绘，同一 tick 内多次事件合并为一次重绘），无需手动刷新。
       **「已应用」区默认折叠**：整区收起（标题行按 `za`/`zo` 展开），展开后每条仍各自收起
-      （先展开区、再展开条目才看到文件列表），刷新后重新收起；待审普通条目与越界留痕区不折叠，
-      便于逐条审阅；**待审 git 原子组「头行显示、其余折叠」**（头行保留整组审批入口与路径/风险
-      高亮，其后的提示与文件列表默认收起，`za`/`zo` 展开），避免一次 git 操作涉及大量 `.git`
-      内部文件时刷屏。
+      （先展开区、再展开条目才看到文件列表），刷新后重新收起；**待审条目「头行显示、其余折叠」**：
+      头行（工具/风险徽标/文件数/`待审`）保持正常显示并作为整单元审批入口，其后的密钥警告/风险
+      原因/git 提示/文件列表默认收起，`za`/`zo` 展开——包安装、git 操作等可达上千文件，折叠
+      避免刷屏；越界留痕区不折叠，便于逐条审阅。
       聊天主窗口内可按 `<leader>ap` 直接触发（`keymaps.chat.sandbox_review`）。
      - **显示已保存 / 撤销保存**：应用（保存）时保留每个文件的**原文件快照**（真实文件
        应用前的内容），审批界面底部「已应用（已保存/已撤销，u 撤销/重做保存）」区展示已发布到真实
@@ -416,12 +427,13 @@
   默认仅 cwd，未覆盖时自动补入）做 overlayfs：真实根为只读 lower、会话 upper 为可写层。
   命令能读取这些根的真实内容，且对其下**任意路径**的新建/修改/删除都落到 upper，随后冻结为
   候选（删除以 whiteout 设备节点识别为 `delete`/`rmdir`）。
-  - **进程命令串行执行**：`effect="process"` 的工具（`run_command`/`git` 读工具等）的门禁按
-    **FIFO 一次一个**执行。沙箱的 overlay 物化/捕获、会话级可写层与暂存映射基于**共享会话**，
-    非并发安全：同一轮里模型并行发出的多个 `run_command`（并行 tool_calls）若同时运行，会
-    物化/捕获交错，导致命令看到缺失的目录/文件、捕获互相覆盖，命令可能因此阻塞直到超时并被
-    `cgroup.kill` 以 SIGKILL 终止（退出码 137 且无输出）。串行化后并行调用仍可用，只是排队
-    逐个执行；`read`/`fs_write`/`in_process`/`network` 类工具不受影响。
+  - **进程命令并行执行**：`effect="process"` 的工具（`run_command`/`git` 读工具等）的门禁按阶段拆锁：
+    **搭建阶段**（`candidate.begin`/物化/`resident.ensure`/构建前缀）串行（避免常驻实例重复启动、
+    物化交错）；**命令执行**并发（常驻命令服务器按 id 多路复用，一次性进程各用独立 attempt）；
+    **捕获/冻结/合并/结算**串行（`_serialize_capture`，避免捕获互相覆盖）。共享会话状态
+    （overlay 物化/捕获、暂存映射）非并发安全，故不整体并发；并发命令的改动按**完成顺序**归因
+    （`state.materialized` 目标签名使后完成的捕获只处理尚未捕获的改动，改动不丢失/不重复）。
+    `read`/`fs_write`/`in_process`/`network` 类工具的门禁不占进程槽位。
   - `/tmp`、`/var/tmp` 属**每会话私有临时根**（`tools.sandbox.tmpfs_roots`）：默认
     （`tmp_private_base="host"`）在宿主根之下建隐藏临时子目录（如 `/tmp/.cache-<tag>/<session>`，
     mode 1777），并经**命名空间 bind 映射回该根**——沙箱内 `/tmp` 即此会话私有子目录，
@@ -456,9 +468,10 @@
     反向情形（命令**还原**了 AI 的暂存编辑，如 `git checkout -- <file>`）结果等于真实基线、
     对真实盘无净改动，本不产生发布候选；此时单独记录为 `view_files`，同步暂存视图并撤销该路径
     的待审候选，否则下次物化会用旧暂存内容覆盖命令结果，表现为「命令写入被回滚」。
-  - **物化类型冲突显式报错**：暂存文件的目标在真实盘/overlay 中是目录（或反之）时，物化会损坏
+  - **物化类型冲突显式报错**：暂存文件的目标在真实盘/overlay 中是**真实目录**（或反之）时，物化会损坏
     视图一致性，故返回 `SANDBOX_MATERIALIZE_TYPE_CONFLICT` 拒绝执行（`run_command`、工具子进程、
-    长驻服务与 LSP overlay 一致），不再静默跳过。
+    长驻服务与 LSP overlay 一致），不再静默跳过。判定用 `lstat` 只看路径自身类型：指向目录的符号
+    链接（如 venv 的 `lib64 -> lib`）不算目录，可安全 unlink 后重建，不误报冲突。
   - **权限位保留**：候选记录文件权限（`mode`），物化进 overlay 与 CAS 发布时按原权限写回
     （`write_file_atomic` 的 mkstemp 默认 0600，会剥离可执行位，导致 venv/bin 脚本失效）；
     新建文件用常规默认 0644，不强制 0600。
@@ -504,32 +517,48 @@
   **重新物化**进新会话暂存层（`_rehydrate_pending`），使重载/重开后只读工具看到的视图与
   待审队列一致，且已批准未应用的改动在应用/拒绝前仍可读、可应用。
 
-### 长驻服务（`service_*`，后台进程）
+### 会话级常驻沙箱实例（`resident`，后台进程）
 
-- **背景**：每个一次性命令在独立 pid namespace + cgroup 内运行，命令结束时 `cgroup.release`
-  → `cgroup.kill` 终止整个进程树。因此**未被提升**的后台进程不跨工具调用存活。
-- **后台命令自动提升**：`run_command` 中以**终止 `&`** 或**前导 `nohup`/`setsid`** 形式结束的
-  命令，经门禁自动转为长驻服务（`sandbox/background.lua` 保守识别，排除 `&&`、`2>&1`、
-  引号内 `&`、中段 `&`），使其**跨工具调用存活**，并返回服务名供 `service_logs` /
-  `service_status` / `service_stop` 管理（事件 `SANDBOX_BACKGROUND_ROUTED`）。服务不可用/
-  启动失败时回退一次性执行。需要显式命名/管理常驻进程（dev server / watch / 守护进程）时
-  直接使用 `service_start` / `service_logs` / `service_status` / `service_stop`。
-- **隔离**：每个服务自建独立 overlay attempt（独立 upper/work，不与 `run_command` 的共享会话
-  暂存竞争）与独立 cgroup；门禁仍完成策略/脚本扫描/硬拒绝预检（`wrapper` 的 `long_lived` 分支），
-  但不进入一次性进程的捕获/冻结流程。服务可与其他命令并发运行（不占 `effect="process"` FIFO）。
-- **边界同步**：启动时把工作区暂存内容物化进服务 overlay（**单向快照**，服务可见 AI 未发布
-  编辑）；停止时捕获服务 overlay 改动 → 冻结候选 → 合并回工作区暂存并经异步审批入队
-  （复用 `wrapper.settle_exec_candidate`）。服务与 `run_command` **非实时互通**，仅在启停时点同步。
-- **优雅停止**：`service_stop` / `stop_all` 先向服务**载荷进程**发 SIGTERM（`cgroup.term` 跳过
-  bwrap 监视进程——对 bwrap 发信号会立即销毁命名空间，载荷来不及执行 trap），等待
-  `stop_timeout_ms` 让其优雅退出；到时仍存活才 `cgroup.kill`（SIGKILL）整个进程树。进程确认
-  退出后再捕获改动（确保写入落盘）。`stop_all` 的优雅窗口取 `min(stop_timeout_ms, 调用方
-  timeout_ms)`。
-- **生命周期**：`sandbox.shutdown()`（`:qall` / 热重载 / 插件卸载）与 `sandbox.reset()` 停止全部
-  服务（优雅停止）并捕获改动；服务日志为会话内环形缓冲（`service.max_log_bytes`），读取时经
-  `conceal` 脱敏。
-- **配置**：`tools.sandbox.service = { enabled, max_services, max_log_bytes, stop_timeout_ms,
-  auto_background }`。
+- **背景**：关闭常驻实例（`resident.enabled=false`）时，每个一次性命令在独立 pid namespace +
+  cgroup 内运行，命令结束时 `cgroup.release` → `cgroup.kill` 终止整个进程树，后台进程不跨调用存活。
+- **常驻实例**：默认开启（`tools.sandbox.resident.enabled=true`）时，同一沙箱会话内 `run_command` 的
+  T0 进程命令共享一个**常驻 bwrap 实例**——它在一个持久的 mount+pid+net+ipc+uts+cgroup
+  命名空间内运行一个**命令服务器**（`bash` 从 stdin 读取请求），命令在服务器内执行。
+  因此 `&`/nohup/setsid 启动的后台进程**跨工具调用存活**，同一会话内 `ps`/`kill` 可见，
+  行为接近普通 bash（`sandbox/resident.lua`）。
+- **并发执行**：命令服务器按请求 id **多路复用**——每条命令独立 `setsid` 后台运行、输出写独立
+  文件，完成后以 `flock` 加锁原子输出 `BEGIN/内容/END` 块，客户端按 id 解复用，故同一实例内
+  多条命令**真正并行**且输出不交错。超时/取消由服务器在命名空间内按命令进程组终止（宿主无法
+  直接 kill 沙箱 pid），被终止的命令仍回传终止前已产生的部分输出。搭建/捕获阶段仍串行（见
+  「进程命令并行执行」）。
+- **为何用命令服务器而非 nsenter**：bwrap 的根视图由 `chroot`/`pivot_root` 施加在**进程**
+  （fs_struct）上，不属于 mount 命名空间；外部 `nsenter -m` 只能进入挂载表、拿不到该根，
+  exec 会 `No such file or directory`。服务器在命名空间**内部**执行命令，天然拥有正确根视图。
+- **独立 overlay**：常驻实例使用独立 overlay 基目录（`<proc_dir>/resident`），不与一次性进程的
+  `<proc_dir>/<enc_root>` 竞争（同一 upper 不可并发挂载）；二者通过候选暂存层同步。
+  首次启动在**挂载前**把工作区暂存物化进 upper（宿主侧写入安全）；挂载后 AI 的新编辑由
+  `resident.materialize()` 在**命名空间内**写回（写入走 overlay 挂载，避免 overlayfs
+  「挂载期间宿主侧改 upper 未定义」）。命令结束后门禁在宿主侧**只读**遍历 upper 捕获改动。
+- **资源域**：会话级 cgroup；命令是服务器（已在资源域内）的子进程，继承资源域。超时/取消按
+  进程组精确终止当前命令（`setsid` 独立进程组），不波及常驻实例与其它后台进程。
+- **回退**：overlay 不可用、嵌套 userns（T2）档位、特权档升级、启动/健康检查失败时自动回退
+  一次性进程路径（不静默失败）。常驻实例与一次性路径的权限档位不可原地变更，档位升级会重建
+  常驻实例（其后台进程随之终止）。
+- **生命周期**：`sandbox.shutdown()`（`:qall` / 热重载 / 插件卸载）、会话轮换（agentEnd）与
+  `sandbox.reset()` 停止常驻实例（终止其命名空间内全部进程）。
+- **配置**：`tools.sandbox.resident = { enabled }`（默认 `true`）。
+
+### 内部长驻服务（`sandbox.service`，无 AI 工具）
+
+- **AI 不可见**：`service_start`/`service_logs`/`service_status`/`service_stop` 不再注册为工具。
+  后台进程由上述常驻实例承载，AI 用普通 shell 命令（`ps`/`kill`/重定向日志）管理。
+- **内部复用**：`sandbox/service.lua` 仍作为内部能力保留，供 systemctl 门面（`sandbox/systemd`）
+  在沙箱内启动/停止单元进程（独立 overlay + 资源域，停止时捕获改动为候选）。
+- **隔离/边界同步/优雅停止**：与常驻实例一致——独立 overlay attempt、启动时单向物化暂存、
+  停止时捕获合并回暂存并经异步审批（复用 `wrapper.settle_exec_candidate`）；`cgroup.term`
+  优雅停止后 `cgroup.kill` 兜底。
+- **配置**：`tools.sandbox.service = { enabled, max_services, max_log_bytes, stop_timeout_ms }`。
+  `auto_background` 与事件 `SANDBOX_BACKGROUND_ROUTED` 保留常量但不再触发（旧后台门面已移除）。
 
 ### systemctl 门面（`tools.sandbox.systemd`，方案 A）
 
@@ -543,8 +572,10 @@ hostop 提案并在宿主 replay。本门面让**独立**的 `systemctl`/`journa
   `sudo`/`doas`/`env` 等前缀；复合命令 `a && systemctl …`、管道、脚本内调用不拦截）。
   门禁在 `effect="process"` 分支、`container.plan` 同级调用 `wrapper._maybe_systemd`。
 - **支持矩阵**：
-  - 动词：`start`/`stop`/`restart`/`status`/`is-active`/`is-enabled`/`show`/`cat`/
-    `daemon-reload`/`list-units`/`list-unit-files`。
+  - 动词：`start`/`stop`/`restart`/`status`/`is-active`/`is-enabled`/`is-system-running`/
+    `is-failed`/`show`/`cat`/`daemon-reload`/`list-units`/`list-unit-files`；无单元名的
+    `status` 合成系统总览（`State: running`），`is-system-running` 恒返回 `running`，
+    `is-failed` 恒返回 `active`（沙箱无失败单元），避免环境探测暴露「非 systemd 环境」。
   - 类型：`Type=simple`（默认）/`exec` 为长驻服务；`oneshot` 跑完即返回。
   - 依赖：`Requires`/`Wants` 递归拉起，`After`/`Before` 拓扑排序（`max_deps` 上限）。
   - 单元文件**优先读沙箱暂存副本**（AI 用 `edit_file`/`run_command` 新建/修改的 unit 可见）。
@@ -557,9 +588,48 @@ hostop 提案并在宿主 replay。本门面让**独立**的 `systemctl`/`journa
   （`-H`/`--host`/`--root` 等）不拦截，落到既有 T2/hostop 提案路径（审批后宿主 replay）。
 - **留痕**：命中门面记录 `kind="privilege"` 证据并发出 `SANDBOX_SYSTEMD_ROUTED`；
   输出经 `conceal` 脱敏，不泄露沙箱指纹。
-- **配置**：`tools.sandbox.systemd = { enabled, mode="facade", max_deps, unit_roots }`。
-- **已知限制**：`enable`/`disable` 不会修改宿主，也不入待审队列（候选层暂不表示符号链接）；
-  模板/实例化单元（`foo@bar.service`）不支持。
+- **环境外观（不可区分）**：门面开启（`systemd.enabled`，默认）时，进程沙箱额外建立
+  `sd_booted()` 标记 `/run/systemd/system`，并把 PID1 伪装为 `systemd`（覆盖
+  `/proc/1/comm|cmdline|stat|status`），使 `cat /proc/1/comm`、`ps -p 1 -o comm=` 等探测
+  无法区分「沙箱」与「真实 systemd 宿主」。伪装仅在 PID 命名空间隔离（`--as-pid-1`，
+  PID1 为载荷）时生效；LSP 等 `no_pid_ns` 场景 PID1 是宿主 init，不做伪装。门面关闭时
+  不建立标记、不伪装（`/run/systemd` 仍被遮蔽）。边界：D-Bus/真实 systemd 控制通道仍不可用，
+  深度探测（`systemd-analyze`、`sd_bus`）可能识破。
+- **配置**：`tools.sandbox.systemd = { enabled, mode="facade", max_deps, unit_roots, stage_install }`。
+- **enable/disable 软链暂存**：`stage_install`（默认开）时，系统级 `systemctl enable/disable`
+  不再直接拒绝：门面解析单元 `[Install] WantedBy/RequiredBy`，把软链变更（enable 建
+  `/etc/systemd/system/<target>.wants/<unit>` 链、disable 删链）经 `candidate.stage_link` /
+  `stage_delete` 暂存为待审候选，审批后应用；不落宿主机。用户级 `systemctl --user enable/disable`
+  由嵌套真实 systemd 执行，软链同样被捕获为候选（见「嵌套真实 systemd --user」）。
+- **已知限制**：模板/实例化单元（`foo@bar.service`）不支持；`[Install] Also=` 暂不展开。
+
+### 嵌套真实 systemd --user（`tools.sandbox.systemd.user`）
+
+**背景**：门面（facade）以沙箱内长驻服务模拟 systemd，语义有限。开启本项后，会话级常驻沙箱实例
+内启动一个**真实的 `systemd --user` 用户实例**，AI 的 `systemctl --user ...` 命中真实 systemd
+语义（`daemon-reload`/`start`/`stop`/`status`/`list-units`/`is-active` …），且所有修改都不落宿主机。
+
+- **引导**：常驻实例的命令服务器在进入读取循环前执行引导片段（幂等）：
+  `mkdir /run/systemd/system`（满足 `sd_booted()`）、私有 `XDG_RUNTIME_DIR=/run/neoai-user`
+  （mode 0700）、私有会话 `dbus-daemon`，随后启动 `systemd --user` 并等待
+  `$XDG_RUNTIME_DIR/systemd/private` 就绪。环境变量 `XDG_RUNTIME_DIR`/`DBUS_SESSION_BUS_ADDRESS`
+  注入常驻实例，供后续命令继承。
+- **委派 cgroup**：`cgroup.prepare_delegated` 在共享父域 `neoai` 下创建一个**不驻留进程**的
+  子域并委派控制器，沙箱将其以可写方式 bind 到 `/sys/fs/cgroup`。systemd 只能在该子树内创建/
+  移动 cgroup（`<base>/neoai/neoai_deleg_sd_<session>`），不污染宿主其它 cgroup；释放时
+  `cgroup.kill` 后递归删除。这是 systemd 标准 delegation 模型，避免「宿主 cgroup 整体可写」。
+- **暂存与隔离**：单元文件位于 `$HOME/.config/systemd/user`（工作区 overlay），写入按次冻结为
+  候选；运行态在私有 tmpfs；服务进程在沙箱命名空间内。宿主 `/root/.config/systemd/user` 与
+  宿主 cgroup 层次不被改动。
+- **enable/disable 软链暂存**：`systemctl --user enable/disable` 由真实 user manager 执行，
+  其在 overlay 中创建的 `.wants/*.service` 软链被捕获为**符号链接候选**（候选文件条目新增
+  `link` 字段），与单元文件同批进入待审；审批后发布时以 `writer` 的 `symlink` 动作在真实盘创建
+  软链（CAS 用 `lstat`/`readlink` 校验基线）。`disable` 删除软链则作为 delete 候选。
+- **门面协同**：`systemd.parse_command` 识别 `--user` 为 `route="native"`，门面不拦截；
+  `privilege.classify` 将 `systemctl --user`/`journalctl --user` 视为最小权限（T0）。
+  未同时启用 `resident` 与 `systemd.user` 时，门面返回明确提示（不静默失败）。
+- **配置**：`tools.sandbox.systemd.user = { enabled }`（默认关闭；需同时开启
+  `tools.sandbox.resident.enabled`）。
 
 ### 137 / OOM 归因与诊断（`tools.sandbox.diagnostics`）
 
@@ -676,17 +746,19 @@ hostop 提案并在宿主 replay。本门面让**独立**的 `systemctl`/`journa
 
 ### 权限收敛与宿主敏感路径遮蔽（默认开启）
 
-沙箱默认**授予完整 root 能力**（`tools.sandbox.cap_add = { "ALL" }`），使 node/python/apt/
-dpkg/pip 等任意开发与包管理操作在沙箱内可用；同时按 `tools.sandbox.cap_drop` **收敛「可修改
-宿主全局状态」的能力**（网络栈/时钟/内核模块/裸 I/O/重启/MAC/审计）——即便授予 ALL 也逐项
-丢弃，netlink 改宿主路由/防火墙、改宿主时钟等被 `EPERM` 拦截，而这些能力与开发/包管理
-工作流无关。**宿主不可修改**由以下共同保证：**命名空间（mount/pid/uts/ipc/cgroup）+
-整机根 overlay（`read_all` 默认：以 `/` 为只读 lower、会话私有 upper/work 为可写层，根内
-任意路径原样可写、写入全部进 upper 暂存）+ 宿主敏感路径遮蔽 + `/proc/sys` 只读绑定 +
+沙箱默认以 **root 载荷**运行（`tools.sandbox.run_as.uid = 0`），并施加 `--cap-drop ALL` + 档位基线
+`CAP_DAC_OVERRIDE`（T0/T1 `cap_add`），使 node/python/apt/dpkg/pip 等开发与包管理操作在沙箱内
+可用、且 root 能像真实 root 一样绕过 DAC 访问他人属主的 0700 目录（如 `_apt` 拥有的
+`/var/cache/apt/archives/partial`）；包安装/系统管理所需的其余窄能力再按需加回。同时按
+`tools.sandbox.cap_drop` **收敛「可修改宿主全局状态」的能力**（网络栈/时钟/内核模块/裸 I/O/
+重启/MAC/审计）——逐项丢弃，netlink 改宿主路由/防火墙、改宿主时钟等被 `EPERM` 拦截，而这些
+能力与开发/包管理工作流无关。**宿主不可修改**由以下共同保证：**命名空间（mount/pid/uts/ipc/
+cgroup）+ 整机根 overlay（`read_all` 默认：以 `/` 为只读 lower、会话私有 upper/work 为可写层，
+根内任意路径原样可写、写入全部进 upper 暂存）+ 宿主敏感路径遮蔽 + `/proc/sys` 只读绑定 +
 seccomp（含设备节点屏障）**——沙箱内进程看到的是一份「暂存文件系统」（overlay 私有可写层），
-所有写入冻结为候选、真实系统不受影响，AI 以为修改已成功。需要最小权限时可设
-`cap_add = {}`（`--cap-drop ALL`，包安装按 `packages.cap_add` 按需加回窄能力）。`runtime`
-在 bwrap 前缀中默认施加以下约束：
+所有写入冻结为候选、真实系统不受影响，AI 以为修改已成功。需要更小权限时可设
+`cap_add = {}` 并在档位 `tiers[n].cap_add = {}` 中一并收窄（`--cap-drop ALL`，包安装按
+`packages.cap_add` 按需加回窄能力）。`runtime` 在 bwrap 前缀中默认施加以下约束：
 
 - **关闭继承 fd（防 chroot 逃逸）**：启动载荷前先关闭除 0/1/2 外所有继承 fd。否则宿主
   进程（如 AppImage 运行时）持有的**目录 fd**（如 `/tmp/.mount_*`）会被沙箱继承，AI 可用
@@ -695,11 +767,12 @@ seccomp（含设备节点屏障）**——沙箱内进程看到的是一份「�
   的 `os.closerange`，最后退回 `sh`（dash 仅支持个位数 fd，属尽力而为）。`run_command`、
   `runtime.run` 与 LSP 命名空间覆盖均经此包装。
 
-- **默认最小权限 + 按命令窄范围加回 + 主机全局能力收敛（`cap_drop`）**：默认 `cap_add = {}`
-  （施加 `--cap-drop ALL`），需要的能力**按命令窄范围加回**——包安装命令（含 `apt-get
-  install …; echo; tail` 这类链式）按 `packages.cap_add`、系统管理命令（`useradd`/`chown`/
-  `passwd` 等，`req.sysadmin`）按 `privilege.sysadmin.cap_add` 加回 `CAP_DAC_OVERRIDE`/
-  `CAP_CHOWN`/`CAP_SETUID`/`CAP_SETGID` 等窄能力并解除账户库遮蔽；普通命令不授予。同时按
+- **最小权限 + 档位基线 + 按命令窄范围加回 + 主机全局能力收敛（`cap_drop`）**：默认
+  `--cap-drop ALL` + 档位基线 `CAP_DAC_OVERRIDE`（T0/T1 `tiers[n].cap_add`），需要的能力再
+  **按命令窄范围加回**——包安装命令（含 `apt-get install …; echo; tail` 这类链式）按
+  `packages.cap_add`、系统管理命令（`useradd`/`chown`/`passwd` 等，`req.sysadmin`）按
+  `privilege.sysadmin.cap_add` 加回 `CAP_DAC_OVERRIDE`/`CAP_CHOWN`/`CAP_SETUID`/`CAP_SETGID`
+  等窄能力并解除账户库遮蔽；普通命令只保留基线。同时按
   `cap_drop`（默认 `CAP_NET_ADMIN`/`CAP_SYS_TIME`/`CAP_SYS_MODULE`/`CAP_SYS_RAWIO`/
   `CAP_SYS_BOOT`/`CAP_MAC_ADMIN`/`CAP_MAC_OVERRIDE`/`CAP_AUDIT_CONTROL`）逐项 `--cap-drop`，
   封住「capability 层面的宿主全局修改」（netlink 改路由/防火墙、改时钟、加载模块、裸端口
@@ -847,13 +920,13 @@ seccomp（含设备节点屏障）**——沙箱内进程看到的是一份「�
 
 > **残余风险（user namespace）**：NeoAI 以 root 运行时，`bwrap` 只能把调用者 uid 1:1
 > 映射（`uid_map 0 0`），无法在插件内做真正的 uid 重映射；而 `conceal` 为去指纹刻意
-> 不在 root 下新建 userns。默认完整能力下，载荷在命名空间内即宿主 root：**文件系统修改**
-> 由「命名空间 + 整机根 overlay 暂存 + 遮蔽 + 审批」封死，**宿主全局状态修改**由
-> `cap_drop`（网络/时钟/模块/裸 I/O/重启/MAC/审计）+ seccomp（设备节点、时钟、端口 I/O、
+> 不在 root 下新建 userns。默认 root 载荷（含档位基线 `CAP_DAC_OVERRIDE`）在命名空间内即宿主
+> root：**文件系统修改**由「命名空间 + 整机根 overlay 暂存 + 遮蔽 + 审批」封死，**宿主全局状态
+> 修改**由 `cap_drop`（网络/时钟/模块/裸 I/O/重启/MAC/审计）+ seccomp（设备节点、时钟、端口 I/O、
 > mount/unshare/bpf/… 屏障）封死；`CAP_DAC_OVERRIDE` 仍可**读取**遮蔽名单之外 DAC 保护的
-> 0600 文件（信息泄露，非修改）。设 `cap_add = {}` 可进一步收敛为最小权限（包安装按
-> `packages.cap_add` 按需加回，混合命令不加回）。**彻底根治需在容器运行时层启用
-> `userns-remap` / rootless**，使容器 root 映射到高位宿主 uid——属部署侧配置，不在本插件内。
+> 0600 文件（信息泄露，非修改）。设 `cap_add = {}` 与档位 `tiers[n].cap_add = {}` 可进一步收敛为
+> 最小权限（包安装按 `packages.cap_add` 按需加回，混合命令不加回）。**彻底根治需在容器运行时层
+> 启用 `userns-remap` / rootless**，使容器 root 映射到高位宿主 uid——属部署侧配置，不在本插件内。
 
 ### 6.1 宿主本机访问拦截（`tools.sandbox.network.host_local_block`，默认开启）
 
@@ -909,7 +982,7 @@ require("NeoAI").setup({
       backend = "auto",              -- auto | bwrap | unshare
       offline = false,               -- 网络默认放行（仅记录）
       require_seccomp = true,        -- 缺少 seccomp 能力则拒绝外部执行（默认开，fail-closed）
-      cap_add = {},                  -- 默认最小权限（`--cap-drop ALL`）；按命令窄范围加回（包安装经 packages.cap_add）
+      cap_add = {},                  -- 全局额外 capability（默认空）；档位基线另加回 CAP_DAC_OVERRIDE，包安装按需加回更多
       run_as = { uid = 0, gid = 0 }, -- 载荷运行身份：默认 root（工具链/包管理可用，写入仍全部暂存）；非 root 启动自动用当前 uid；设为 nobody 等专用非 root uid 可加固（/root 将不可遍历）
       cap_drop = {                   -- 主机全局能力收敛（即便 cap_add 含 ALL 也逐项丢弃）
         "CAP_NET_ADMIN", "CAP_SYS_TIME", "CAP_SYS_MODULE", "CAP_SYS_RAWIO",
@@ -1263,8 +1336,10 @@ token 化/告警，不终止 Agent」。非环境变量的原始密钥（具名�
 普通文本的编码结果与原来完全一致。
 
 > **chat 界面高亮「获取/使用密钥的命令」**：工具块渲染时扫描其**参数**与**结果**（模型上下文），
-> 命中沙箱 token（`NEOKEY_*`）或**具名规则**命中的原始密钥时，在该工具折叠块**外**单独追加一行
-> 告警并施加 `NeoAISecretWarning`（红色加粗下划线）高亮。告警**明确区分两种情况**：
+> 命中沙箱 token（`NEOKEY_*`）或**具名规则**命中的原始密钥时，在该工具折叠块**外**单独追加
+> 告警并施加 `NeoAISecretWarning`（红色加粗下划线）高亮。告警**按项换行格式化**（便于阅读，
+> 不再把多项逗号挤在一行）：首行 `⚠ 密钥：<工具> <获取/使用>`，命令单独一行，命中的密钥文件 /
+> 类型 / 环境变量**各占一行**（标题行 + 逐项缩进）。告警**明确区分两种情况**：
 > `⚠ 密钥：<工具> 获取了密钥（…）`——结果/内核观测到读取了密钥**内容**（token / 具名规则命中的
 > 凭据）；结果中**仅出现敏感环境变量名**（如 `read_file` 读到 `DASHSCOPE_API_KEY = os.getenv(...)`）
 > **不算「获取」、不告警**——变量名只是引用，读取它并未拿到密钥内容；`⚠ 密钥：<工具> 使用了密钥（…）`
@@ -1309,8 +1384,10 @@ token 化/告警，不终止 Agent」。非环境变量的原始密钥（具名�
 >
 > **进程后处理异步化**（`tools.sandbox.postprocess="async"`，默认）：命令进程一退出就**立即把
 > 结果交回主线程下一轮循环**；overlay 捕获、候选冻结、暂存合并、落盘与结算在后台链完成。
-> 进程命令 FIFO 槽位保持到后台链完成，保证下一进程命令看到一致的会话暂存；后续读写工具
+> 捕获/结算槽位（`_serialize_capture`）保持到后台链完成，保证暂存合并有序；后续读写工具
 > （非进程 effect）在后台后处理在途时也会先等待其完成再执行（避免读到尚未合并的暂存）。
+> 并发进程命令下，搭建阶段由 `_serialize_setup` 串行但**命令执行并发**（常驻实例多路复用），
+> 见「进程命令并行执行」。
 > 关闭/重置前 `sandbox.await_postprocess()` 等待在途链，避免丢失冻结与待审入队；退出/关闭时
 > 等待上限由 `tools.sandbox.shutdown_timeout_ms`（默认 3s）约束，后处理卡住时 `:qall` / 热重载
 > 不会被长时间阻塞（超时即放弃最后一笔未完成的冻结/入队）。
@@ -1486,8 +1563,8 @@ Agent**；发出 `SANDBOX_SECRET_BLOCKED` 事件并 `vim.notify` 明确通知用
 
 | 档 | 名称 | 用途 | 隔离 | 审查 |
 |---|---|---|---|---|
-| **T0** | minimal | 普通命令 | 最小权限（默认 `cap_add={}` → `--cap-drop ALL`），按命令**窄范围**加回（包安装 `packages.cap_add`、系统管理 `privilege.sysadmin.cap_add`）+ 主机全局能力收敛（`cap_drop`：网络/时钟/模块/裸 I/O/重启/MAC/审计）+ seccomp（含设备节点屏障）+ 遮蔽 + overlay 暂存 + **默认放行网络（经 host_proxy 拦截本机，见 §6.1）** | 无逐命令审查；fs 改动进待审队列 |
-| **T1** | elevated | 网络访问、受控 docker、包安装、系统管理 | 隔离内执行，网络放行；`cap_add` 收窄时含包管理器的命令（`req.package`，含链式）按 `packages.cap_add` 加回窄能力；系统管理命令（`useradd`/`chown`/`passwd` 等，`req.sysadmin`）按 `privilege.sysadmin.cap_add` 加回窄能力并解除账户库遮蔽；docker.sock 仅 docker 命令解除遮蔽 | 自动授权、留痕；fs 改动进待审队列 |
+| **T0** | minimal | 普通命令 | `--cap-drop ALL` + 档位基线 `CAP_DAC_OVERRIDE`，按命令**窄范围**加回（包安装 `packages.cap_add`、系统管理 `privilege.sysadmin.cap_add`）+ 主机全局能力收敛（`cap_drop`：网络/时钟/模块/裸 I/O/重启/MAC/审计）+ seccomp（含设备节点屏障）+ 遮蔽 + overlay 暂存 + **默认放行网络（经 host_proxy 拦截本机，见 §6.1）** | 无逐命令审查；fs 改动进待审队列 |
+| **T1** | elevated | 网络访问、受控 docker、包安装、系统管理 | 隔离内执行，网络放行；基线 `CAP_DAC_OVERRIDE`；含包管理器的命令（`req.package`，含链式）按 `packages.cap_add` 加回窄能力；系统管理命令（`useradd`/`chown`/`passwd` 等，`req.sysadmin`）按 `privilege.sysadmin.cap_add` 加回窄能力并解除账户库遮蔽；docker.sock 仅 docker 命令解除遮蔽 | 自动授权、留痕；fs 改动进待审队列 |
 | **T2** | privileged | cap_add、宿主 socket、宿主挂载 | **嵌套 userns** 内执行并授予完整能力（cap 被 userns 作用域限制，够不到宿主；seccomp 基线仍生效） | 主机效果冻结为**提案**，异步审批后 replay |
 
 - 分类：`privilege.classify()` 解析命令，`docker/podman`→T1，`curl/git push/pip/npm`→T1 网络，
@@ -1599,6 +1676,13 @@ upper/work、暂存、会话）会 chown 到该 uid。
 `read-only file system`/网络不可达等）时，**任意档位**都可自动升档（T0→T1→T2，直到
 `privilege.max_tier`）并在隔离内重跑；每步写 `privilege` 证据、发
 `SANDBOX_PRIVILEGE_ESCALATION_REQUESTED` 并 `audit.observe`，不静默。
+
+**缺 root 时显式向用户索要**：当载荷**非 root**（NeoAI 非 root 启动，或 `tools.sandbox.run_as.uid != 0`）
+且命令因权限不足失败（结果命中 `PERMISSION_DENIED`）时，除自动升档外还会**显式冻结一条
+`ROOT_REQUIRED` 主机操作提案**（`hostop`，进入 `:NeoAISandboxReview` 待审队列 + 状态栏徽标）；
+用户审批后以 root/`sudo`（继承 tty）在宿主 replay 该命令。不静默失败、也不静默提权；有 root
+（`run_as.uid = 0`）时不生成该请求（避免误报）。包安装不在此列（`hostop` 拒绝包安装，绝不在
+宿主机安装）。
 
 ## 18. 安全分级、容器受控与行为审计
 
@@ -1732,3 +1816,30 @@ L2+ 与包/密钥仍进入待审。目的是即便仅靠本地模型的智能水
   `SANDBOX_AUDIT_ANOMALY` / `SANDBOX_CONTAINER_PLANNED` / `SANDBOX_CONTAINER_UNSUPPORTED` /
   `SANDBOX_SYSTEMD_ROUTED` / `SANDBOX_SYSTEMD_UNSUPPORTED` / `SANDBOX_SENSITIVE_REDACTED`。
 - 测试：`lua/NeoAI/tests/test_sandbox_governance.lua`。
+
+### 18.8 常见沙箱限制与绕路
+
+- **`/run` 可写**（默认）：`/run`（含 `/var/run`）纳入每会话私有可写根（`tmpfs_roots`），
+  dpkg postinst 的 `adduser` 锁文件（`/run/adduser`）、`/var/run/postgresql` 等可创建；宿主
+  `/run` 的敏感项（dbus/sshd/docker.sock 等）仍由 `mask_paths` 遮蔽。
+- **dpkg 安装**：`dpkg`/`dpkg-deb`/`update-alternatives`/`ldconfig`/`debconf` 识别为包安装，
+  加回 `packages.cap_add`（含 `CAP_CHOWN`）并按 `packages.unmask` 解除账户库遮蔽，使 postinst
+  的 `adduser`/`chown`/`su - <svc>` 可用（写入仍进 overlay 暂存，需审批发布）。
+- **`/var/cache/apt` 等他人属主目录**：载荷以 root 运行且 T0/T1 基线含 `CAP_DAC_OVERRIDE`，
+  可绕过 DAC 访问 `_apt` 等属主的 0700 目录（如 `/var/cache/apt/archives/partial`）；缺该能力时
+  普通命令会得到 `Permission denied`（包安装命令另有 `packages.cap_add`，不受影响）。如需更严
+  最小权限，可在 `tools.sandbox.privilege.tiers[n].cap_add` 中移除（并自行承担相应限制）。
+- **overlay 下层 `chown`**：即便有 `CAP_CHOWN`，overlayfs 对「合并目录」的 `chown` 在部分内核
+  仍返回 `EPERM`（需 copy-up）。属内核限制，postinst 通常已容错；必要时在脚本里 `|| true`。
+- **`git clone`/`git init`**：放行（新建仓库，`.git` 由候选层按 `git_path_class` 原子捕获）；
+  `commit/checkout/fetch/pull/push/add/reset/…` 仍拦截，改走专用 git 工具。
+- **本机端口白名单**：默认拦截所有本机目标；沙箱内服务自测可设
+  `tools.sandbox.network.allow_localhost_ports = { 5432, 6379 }`（仅放行**回环 + 白名单端口**；
+  宿主网卡 IP/链路本地/云元数据永不放行）。
+- **`grpcurl` 等不在发行版源**：非沙箱限制；走语言生态安装（如
+  `go install github.com/fullstorydev/grpcurl/cmd/grpcurl@latest`，经 Go proxy）。
+- **`SANDBOX_STAGING_UNCOVERED`**：存在未发布暂存但本次命令无 overlay 可写层时默认拒绝；
+  可先应用/丢弃暂存，或设 `tools.sandbox.staging_uncovered = "warn"` 降级执行（结果附提示）。
+- **定位固定开销**：`tools.sandbox.diagnostics.enabled = true` 后，日志记录
+  `[sandbox-profile] gate:<tool>` 端到端耗时与 `settle`（风险分级/入队/发布）耗时，用于区分
+  执行慢还是冻结/结算慢。

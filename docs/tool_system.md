@@ -51,8 +51,8 @@
 （仅注册定义，无 I/O，确保首个 Agent 请求前已就绪）。`tool_helpers.lua` 是工具定义辅助库，不入内置清单。
 
 内置工具模块：`file_ops` / `shell` / `git_ops` / `lsp_ops` / `tree_ops` / `log_ops` / `plan`（子 Agent）/
-`todo` / `plan_mode` / `ask_user` / `read_image` / `web_fetch`（网页抓取，默认不启用）/ `skills`（技能工具 + 系统提示段）/
-`service`（长驻服务，`service_start`/`service_logs`/`service_status`/`service_stop`）。
+`todo` / `plan_mode` / `ask_user` / `read_image` / `web_fetch`（网页抓取，默认不启用）/ `skills`（技能工具 + 系统提示段）。
+（`service` 长驻服务模块已不再注册；后台进程由会话级常驻沙箱实例承载，见 `sandbox/resident.lua`。）
 MCP 远端工具由 `services/mcp/init.lua` 动态注册（`category = "mcp"`，`source = "mcp"`），详见 [mcp.md](mcp.md)。
 
 ## 4. 执行流程（tools/executor.lua）
@@ -176,13 +176,14 @@ stdout/stderr 合计超过 `tools.run_command.max_output_bytes`（默认 16 MiB�
 避免超大输出（数百 MB）逐行处理冻结主线程；已产生内容仍回传并标注「已截断」。
 命令以退出码 137（SIGKILL）结束时读取资源域事件区分「疑似 OOM」与「被强制终止」。
 
-### 🔌 长驻服务（service.lua）
+### 🔌 后台进程（会话级常驻沙箱实例）
 
-`service_start`（启动后台常驻进程，跨工具调用存活）/ `service_logs` / `service_status` / `service_stop`。
-`run_command` 中以终止 `&` 或前导 `nohup`/`setsid` 结束的后台命令会被自动转为长驻服务（跨调用存活）；
-服务在独立沙箱 overlay + cgroup 内运行，停止时先 SIGTERM 优雅退出、超时才 SIGKILL，其工作区改动冻结为
-候选并进入异步审批；生命周期由 `sandbox.shutdown`/`reset` 统一回收。
-详见 [sandbox.md](sandbox.md) 的「长驻服务」。
+`run_command` 中以终止 `&` 或前导 `nohup`/`setsid` 启动的后台进程，在开启
+`tools.sandbox.resident.enabled=true` 后由**会话级常驻沙箱实例**承载：命令在同一 mount+pid
+命名空间内执行，后台进程跨工具调用存活（同一会话内 `ps`/`kill` 可见），行为接近普通 bash。
+命令改动仍按次捕获冻结为候选并进入异步审批。不再注册 `service_*` 工具（AI 用普通 shell 管理）；
+`sandbox.service` 仅作内部能力供 systemctl 门面复用。
+详见 [sandbox.md](sandbox.md) 的「会话级常驻沙箱实例」。
 
 ### 🗂 Git（git_ops.lua）
 

@@ -27,6 +27,22 @@ M.LEVEL = { LOW = 0, MODERATE = 1, HIGH = 2, CRITICAL = 3 }
 local LEVEL_NAME = { [0] = "low", [1] = "moderate", [2] = "high", [3] = "critical" }
 local LEVEL_BADGE = { [0] = "L0", [1] = "L1", [2] = "L2", [3] = "L3" }
 
+--- 去重风险原因（保留首次出现顺序）。风险原因是「类别」而非逐文件计数：包安装会对每个
+--- 工作区外写入路径重复追加 `SYSTEM_PATH_WRITE`（可达数千次），直接透传会撑爆待审展示、
+--- AI 审计与后果警告文本。此处按类别去重，界面如需数量再自行合并计数。
+--- @param list table|nil
+--- @return table
+local function _dedupe(list)
+  local out, seen = {}, {}
+  for _, r in ipairs(list or {}) do
+    if type(r) == "string" and not seen[r] then
+      seen[r] = true
+      out[#out + 1] = r
+    end
+  end
+  return out
+end
+
 -- 危险命令模式（依据命令文本初判级别）。匹配为 Lua pattern。
 -- 仅覆盖**绕过文件暂存层**的破坏（写块设备、mkfs、wipefs 等）：`rm`/`rm -rf` 等纯文件
 -- 修改由「只读根 + overlay 修改暂存」保护宿主机，不在此硬拦截（其效果冻结为候选待审）。
@@ -240,7 +256,7 @@ function M.classify(facts)
     and dlevel < M.LEVEL.CRITICAL and level > M.LEVEL.MODERATE then
     level = M.LEVEL.MODERATE
   end
-  return { level = level, name = M.level_name(level), badge = M.badge(level), reasons = reasons }
+  return { level = level, name = M.level_name(level), badge = M.badge(level), reasons = _dedupe(reasons) }
 end
 
 --- 命令文本命中的最高危险级别（供包安装降级判定）
@@ -354,7 +370,7 @@ function M.from_result(result, base)
       end
     end
   end
-  return { level = level, name = M.level_name(level), badge = M.badge(level), reasons = reasons, signals = signals }
+  return { level = level, name = M.level_name(level), badge = M.badge(level), reasons = _dedupe(reasons), signals = signals }
 end
 
 --- 依据级别给出建议审批动作

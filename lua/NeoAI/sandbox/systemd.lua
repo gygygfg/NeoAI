@@ -34,6 +34,8 @@ local SUPPORTED_VERBS = {
   start = true, stop = true, restart = true, status = true, ["is-active"] = true,
   ["is-enabled"] = true, show = true, cat = true, ["daemon-reload"] = true,
   ["list-units"] = true, ["list-unit-files"] = true,
+  -- 环境探测类：合成「已启动/无失败」输出，避免暴露「非 systemd 环境」。
+  ["is-system-running"] = true, ["is-failed"] = true,
 }
 
 -- 明确拒绝（不落到宿主机，也不回退 hostop）的动词。
@@ -191,6 +193,13 @@ function M.parse_command(command)
     i = i + 1
   end
   if not verb then return nil end
+
+  -- `systemctl --user`：交给沙箱内**真实**的嵌套 systemd 用户实例原生执行（门面不拦截）。
+  for _, o in ipairs(opts) do
+    if o == "--user" then
+      return { kind = kind, verb = verb, units = units, opts = opts, route = "native", raw = command }
+    end
+  end
 
   local route
   if host_target then
@@ -682,6 +691,89 @@ end
 
 -- ========== 公开 API ==========
 
+--- 计算并暂存 systemd `enable`/`disable` 的符号链接变更（不落宿主机，进入待审）。
+--- enable：解析单元 `[Install] WantedBy/RequiredBy`，在 `/etc/systemd/system/<target>.wants/`
+--- 下暂存指向单元文件的软链候选；disable：删除各单元根下已有的 `<target>.wants/<unit>` 软链。
+--- @param attempt table
+--- @param plan table M.parse_command 结果（verb=enable/disable）
+--- @param ctx table
+--- @param spec table
+--- @return Deferred
+function M.stage_install(attempt, plan, ctx, spec)
+  local control = require("NeoAI.sandbox.control")
+  local candidate = require("NeoAI.sandbox.candidate")
+  local store = require("NeoAI.sandbox.store")
+  local wrapper = require("NeoAI.sandbox.wrapper")
+  local root = store.root() or (vim.fn.stdpath("cache") .. "/NeoAI/sandbox")
+  local unit_name = plan.units[1]
+  if not unit_name then
+    return async.resolve("请指定要 " .. tostring(plan.verb) .. " 的单元名。")
+  end
+  unit_name = _normalize_unit_name(unit_name)
+  local unit, uerr, upath = _load_unit(unit_name)
+  if not unit then
+    return async.resolve(M.error_text(uerr or ("Unit " .. unit_name .. " not found")))
+  end
+  local unit_path = unit.path or upath
+
+  control.transition(attempt, "STAGING")
+  candidate.begin(attempt, root)
+  local staged = 0
+  if plan.verb == "enable" then
+    local content = _read_view(unit_path)
+    local sections = content and _parse_ini(content) or {}
+    local targets = {}
+    local function add_targets(key)
+      local _, vals = _get(sections, "Install", key)
+      for _, line in ipairs(vals or {}) do
+        for tok in line:gmatch("%S+") do targets[#targets + 1] = tok end
+      end
+    end
+    add_targets("WantedBy")
+    add_targets("RequiredBy")
+    if #targets == 0 then
+      candidate.cleanup(attempt.attempt_id)
+      return async.resolve("单元 " .. unit_name .. " 无 [Install] WantedBy/RequiredBy，无法 enable。")
+    end
+    local admin_root = "/etc/systemd/system"
+    for _, t in ipairs(targets) do
+      local link = admin_root .. "/" .. t .. ".wants/" .. unit_name
+      if candidate.stage_link(attempt.attempt_id, link, unit_path) then staged = staged + 1 end
+    end
+  else
+    for _, r in ipairs(_unit_roots()) do
+      local handle = vim.uv.fs_scandir(r)
+      if handle then
+        while true do
+          local name, t = vim.uv.fs_scandir_next(handle)
+          if not name then break end
+          if t == "directory" and name:sub(-6) == ".wants" then
+            local link = r .. "/" .. name .. "/" .. unit_name
+            local lst = vim.uv.fs_lstat(link)
+            if lst and lst.type == "link" then
+              if candidate.stage_delete(attempt.attempt_id, link) then staged = staged + 1 end
+            end
+          end
+        end
+      end
+    end
+  end
+
+  local cand = candidate.finish(attempt.attempt_id)
+  if not cand or #(cand.files or {}) == 0 then
+    candidate.cleanup(attempt.attempt_id)
+    control.transition(attempt, "COMPLETED_READ_ONLY")
+    return async.resolve(plan.verb == "enable"
+      and ("（无变更：软链已存在或单元无需 enable）：" .. unit_name)
+      or ("（无变更：未找到可删除的软链）：" .. unit_name))
+  end
+  cand.command_id = attempt.command_id
+  wrapper.settle_exec_candidate(attempt, cand, ctx or {}, spec, { code = 0 }, { command = plan.raw })
+  return async.resolve(string.format(
+    "已暂存 systemctl %s %s 的软链变更（%d 个），等待用户确认后应用。",
+    tostring(plan.verb), unit_name, staged))
+end
+
 --- 处理一个门面计划。
 --- @param plan table M.parse_command 的结果
 --- @return Deferred resolve(text) / reject(err)
@@ -705,6 +797,26 @@ function M.handle(plan)
 
   if verb == "daemon-reload" then
     return async.resolve(_redact("沙箱门面：已重新加载单元（每次调用均重新读取暂存单元文件）。"))
+  end
+
+  -- 环境探测：真实 systemd 会返回系统运行态。沙箱门面恒为已启动（running），避免暴露差异。
+  if verb == "is-system-running" then
+    return async.resolve("running")
+  end
+  -- `is-failed` 无失败单元时真实 systemd 打印 active（退出码 1）。
+  if verb == "is-failed" then
+    return async.resolve("active")
+  end
+  -- 无单元名的 `systemctl status`：真实 systemd 打印系统总览；合成一段等价概览。
+  if verb == "status" and #plan.units == 0 then
+    return async.resolve(_redact(table.concat({
+      "● sandbox",
+      "    State: running",
+      "     Jobs: 0 queued",
+      "   Failed: 0 units",
+      "    Since: 沙箱会话启动",
+      "   CGroup: /",
+    }, "\n")))
   end
 
   if verb == "list-units" or verb == "list-unit-files" then

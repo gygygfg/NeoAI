@@ -90,7 +90,35 @@ tests.suite("fold", function(_, it)
     local lines = table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), "\n")
     t.matches("⚠ 密钥：run_command", lines, "应含工具名")
     t.matches("cat /root/.ssh/id_rsa", lines, "应含具体命令")
-    t.matches("密钥文件：/root/%.ssh/id_rsa", lines, "应含密钥文件路径")
+    t.matches("密钥文件：", lines, "应含密钥文件标题")
+    t.matches("/root/%.ssh/id_rsa", lines, "应含密钥文件路径")
+    vim.api.nvim_buf_delete(buf, { force = true })
+  end)
+
+  it("密钥警告按文件换行：每个密钥文件单独一行", function(t)
+    local ml = require("NeoAI.ui.components.message_list")
+    local buf = vim.api.nvim_create_buf(false, true)
+    ml.render_chat(buf, {
+      { role = "assistant", content = "", tool_calls = {
+        { id = "c1", ["function"] = { name = "read_file",
+          arguments = '{"file_path":"/root/.ssh/id_rsa"}' } },
+      } },
+      { role = "tool", tool_call_id = "c1", tool_name = "read_file",
+        content = "-----BEGIN OPENSSH PRIVATE KEY-----",
+        secret_paths = { "/root/.ssh/id_rsa", "/root/.aws/credentials" } },
+    })
+    local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+    local header_ln, file1_ln, file2_ln
+    for i, l in ipairs(lines) do
+      if l:find("密钥文件：", 1, true) then header_ln = i end
+      if l:find("/root/.ssh/id_rsa", 1, true) then file1_ln = i end
+      if l:find("/root/.aws/credentials", 1, true) then file2_ln = i end
+    end
+    t.not_nil(header_ln, "应有密钥文件标题行")
+    t.not_nil(file1_ln, "应有第一个密钥文件行")
+    t.not_nil(file2_ln, "应有第二个密钥文件行")
+    t.true_(file1_ln ~= file2_ln, "两个密钥文件应各自成行")
+    t.true_(header_ln ~= file1_ln, "标题与文件应分行")
     vim.api.nvim_buf_delete(buf, { force = true })
   end)
 
@@ -195,7 +223,8 @@ tests.suite("fold", function(_, it)
     })
     local lines = table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), "\n")
     t.matches("⚠ 密钥：edit_file", lines, "应含工具名")
-    t.matches("密钥类型：private_key", lines, "应回退到具名规则类型")
+    t.matches("密钥类型：", lines, "应回退到具名规则类型标题")
+    t.matches("private_key", lines, "应含具名规则类型")
     vim.api.nvim_buf_delete(buf, { force = true })
   end)
 

@@ -221,6 +221,27 @@ tests.suite("gateway", function(_, it)
     hp.reset()
   end)
 
+  it("宿主过滤代理：本机端口白名单仅放行回环+指定端口", function(t)
+    local hp = require("NeoAI.sandbox.host_proxy")
+    hp.reset()
+    local echo_port, close_srv = echo_server()
+    -- 白名单放行回环上的 echo_port
+    local addr = hp.start("127.0.0.1", 0, { allow_localhost_ports = { echo_port } })
+    local ok_resp = tcp_exchange(addr.host, addr.port,
+      ("CONNECT 127.0.0.1:%d HTTP/1.1\r\n\r\n"):format(echo_port))
+    t.matches("200 Connection Established", ok_resp, "白名单端口应放行")
+    hp.stop()
+    -- 白名单之外的端口仍拦截
+    local other = hp.start("127.0.0.1", 0, { allow_localhost_ports = { echo_port } })
+    local blocked = tcp_exchange(other.host, other.port,
+      ("CONNECT 127.0.0.1:%d HTTP/1.1\r\n\r\n"):format(echo_port + 1))
+    t.matches("403", blocked, "非白名单端口仍应拦截")
+    t.matches("host_local_blocked", blocked, "应标明本机拦截原因")
+    hp.stop()
+    close_srv()
+    hp.reset()
+  end)
+
   it("宿主过滤代理：DNS 解析异步执行（不阻塞主线程）", function(t)
     local hp = require("NeoAI.sandbox.host_proxy")
     hp.reset()

@@ -35,9 +35,9 @@ local function _perm_error(err)
 end
 
 --- 以 root 身份执行文件操作（当前进程即 root 或已是载荷 uid 时使用）
---- @param action string "write"|"delete"|"mkdir"|"rmdir"
+--- @param action string "write"|"delete"|"mkdir"|"rmdir"|"symlink"
 --- @param path string
---- @param content string|nil
+--- @param content string|nil write 内容 / symlink 目标
 --- @param mode number|nil 权限位（保留暂存候选的原权限）
 --- @return boolean, string|nil
 local function _root_op(action, path, content, mode)
@@ -53,6 +53,20 @@ local function _root_op(action, path, content, mode)
   elseif action == "rmdir" then
     local r = vim.fn.delete(path, "d")
     return r == 0, r ~= 0 and ("rmdir 失败: " .. path) or nil
+  elseif action == "symlink" then
+    fs.ensure_dir(vim.fn.fnamemodify(path, ":h"))
+    -- 覆盖既有文件/符号链接（不覆盖目录）。
+    local st = vim.uv.fs_lstat(path)
+    if st then
+      if st.type == "directory" then
+        return false, "SYMLINK_TARGET_IS_DIR: " .. tostring(path)
+      end
+      local ok_del = vim.uv.fs_unlink(path)
+      if not ok_del then return false, "SYMLINK_UNLINK_FAILED: " .. tostring(path) end
+    end
+    local ok, err = vim.uv.fs_symlink(content or "", path)
+    if not ok then return false, tostring(err) end
+    return true
   end
   return false, "UNKNOWN_ACTION: " .. tostring(action)
 end
@@ -60,6 +74,7 @@ end
 --- 以非 root uid 执行文件操作的 shell 片段（内容经 stdin，路径经 argv，避免注入）。
 --- `binary=true` 时内容为 base64（见 `_input_for`）：`vim.fn.system` 的 String 入参不能含 NUL，
 --- 二进制内容必须 base64 传输后在目标端解码，避免 E976 / 截断损坏。
+--- symlink：`$1`=path，`$2`=目标（经 argv，不经 stdin）。
 --- @param action string
 --- @param binary boolean|nil
 --- @return string
@@ -75,6 +90,8 @@ local function _nonroot_snippet(action, binary)
     return 'mkdir -p -- "$1" && { [ -n "$2" ] && chmod "$2" "$1" || true; }'
   elseif action == "rmdir" then
     return 'rmdir -- "$1"'
+  elseif action == "symlink" then
+    return 'mkdir -p -- "$(dirname -- "$1")" && ln -sfn -- "$2" "$1"'
   end
   return "exit 2"
 end
@@ -115,9 +132,10 @@ local function _nonroot_op(action, path, content, uid, gid, mode)
     return false, "SETPRIV_UNAVAILABLE"
   end
   local binary = action == "write" and _is_binary_content(content or "")
+  local arg2 = action == "symlink" and (content or "") or (mode and string.format("%o", mode) or "")
   local argv = {
     "setpriv", "--reuid", tostring(uid), "--regid", tostring(gid), "--clear-groups",
-    "sh", "-c", _nonroot_snippet(action, binary), "sh", path, mode and string.format("%o", mode) or "",
+    "sh", "-c", _nonroot_snippet(action, binary), "sh", path, arg2,
   }
   local out = vim.fn.system(argv, _input_for(action, content))
   if vim.v.shell_error == 0 then return true end
@@ -132,7 +150,8 @@ end
 --- @return boolean, string|nil
 function M.sudo_op(action, path, content, mode)
   local binary = action == "write" and _is_binary_content(content or "")
-  local argv = { "sudo", "sh", "-c", _nonroot_snippet(action, binary), "sh", path, mode and string.format("%o", mode) or "" }
+  local arg2 = action == "symlink" and (content or "") or (mode and string.format("%o", mode) or "")
+  local argv = { "sudo", "sh", "-c", _nonroot_snippet(action, binary), "sh", path, arg2 }
   local out = vim.fn.system(argv, _input_for(action, content))
   if vim.v.shell_error == 0 then return true end
   return false, tostring(out)

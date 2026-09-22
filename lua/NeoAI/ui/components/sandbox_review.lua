@@ -223,6 +223,26 @@ local function _one_line(s)
   return (tostring(s):gsub("\r\n", "⏎"):gsub("[\r\n]", "⏎"))
 end
 
+--- 合并重复风险原因并计数：包安装等会对每个写入路径重复同一原因（如数千个
+--- SYSTEM_PATH_WRITE），展示为 `SYSTEM_PATH_WRITE×2797`（保留首次出现顺序）。
+--- @param list table|nil
+--- @return table 形如 { "PACKAGE_INSTALL", "SYSTEM_PATH_WRITE×2797" }
+local function _merge_reasons(list)
+  local order, count = {}, {}
+  for _, r in ipairs(list or {}) do
+    local key = _one_line(r)
+    if key ~= "" then
+      if count[key] == nil then order[#order + 1] = key; count[key] = 0 end
+      count[key] = count[key] + 1
+    end
+  end
+  local out = {}
+  for _, key in ipairs(order) do
+    out[#out + 1] = count[key] > 1 and (key .. "×" .. count[key]) or key
+  end
+  return out
+end
+
 --- 规范化绝对路径（去尾部斜杠）
 --- @param p string
 --- @return string
@@ -466,7 +486,7 @@ function M.build_lines(items, traces, audit, saved)
     end
     -- 安全分级原因（非空时展示，便于理解为何需要审批）
     if item.risk_reasons and #item.risk_reasons > 0 then
-      local reason = "  风险: " .. _one_line(table.concat(item.risk_reasons, ", "))
+      local reason = "  风险: " .. table.concat(_merge_reasons(item.risk_reasons), ", ")
       lines[#lines + 1] = reason
       marks[#marks + 1] = { line = #lines, start_col = 0, end_col = #reason, level = _risk_hl(item.risk_level) }
     end
@@ -494,11 +514,10 @@ function M.build_lines(items, traces, audit, saved)
       end
       _append_note(path)
     end
-    -- git 原子组：头行保持正常显示（整组审批入口，保留路径/风险高亮），其后的提示/风险/文件行
-    -- 登记为一级折叠，默认收起、`za`/`zo` 展开——即「第一行显示、其余折叠」。
-    if git_op then
-      for ln = hln + 1, #lines do fold_levels[ln] = 1 end
-    end
+    -- 头行保持正常显示（审批入口，保留工具/风险/文件数与高亮），其后的密钥警告/风险原因/
+    -- git 提示/文件行统一登记为一级折叠，默认收起、`za`/`zo` 展开——即「第一行显示、其余折叠」。
+    -- 包安装/git 操作可达上千文件，折叠避免刷屏；头行已含文件数，审批仍可整单元进行。
+    for ln = hln + 1, #lines do fold_levels[ln] = 1 end
     lines[#lines + 1] = ""
     end
   end

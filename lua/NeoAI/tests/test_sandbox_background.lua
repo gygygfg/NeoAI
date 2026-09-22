@@ -1,7 +1,7 @@
---- 沙箱后台命令门面测试
+--- 沙箱后台进程（会话级常驻实例）测试
 --- @module NeoAI.tests.test_sandbox_background
---- 覆盖：`&`/nohup/setsid 识别（保守，避免误判 &&/重定向/中段 &）；run_command 后台命令自动
---- 转为长驻服务（跨调用存活）并可从注册表管理与停止；非后台命令保持一次性执行。
+--- 覆盖：`&`/nohup/setsid 识别（保守，避免误判 &&/重定向/中段 &）；会话级常驻沙箱实例使
+--- `run_command` 的后台进程跨工具调用存活（同一命名空间内 `ps` 可见）；非后台命令正常返回。
 
 local tests = require("NeoAI.tests")
 
@@ -18,6 +18,15 @@ local function with_config(overrides, fn)
   local ok, err = pcall(fn)
   config_store.load(saved)
   if not ok then error(err, 0) end
+end
+
+local function resident_sandbox_config(extra)
+  local base = {
+    enabled = true, fail_closed = true, mode = "dry_run",
+    ephemeral_roots = {}, resident = { enabled = true },
+  }
+  for k, v in pairs(extra or {}) do base[k] = v end
+  return base
 end
 
 tests.suite("sandbox_background", function(_, it)
@@ -45,77 +54,49 @@ tests.suite("sandbox_background", function(_, it)
     t.eq(nil, bg.parse(""), "空命令不应识别")
   end)
 
-  it("run_command：后台命令自动转为长驻服务并可停止", function(t)
+  it("run_command：后台进程跨调用存活（会话级常驻沙箱）", function(t)
+    local runtime = require("NeoAI.sandbox.runtime")
+    if runtime.backend() ~= "bwrap" then return end
+    local resident = require("NeoAI.sandbox.resident")
+    if not resident.available() then return end
     with_config({
-      tools = {
-        approval = { mode = "auto_allow" },
-        sandbox = {
-          enabled = true, fail_closed = true, mode = "dry_run",
-          ephemeral_roots = {}, service = { enabled = true, auto_background = true },
-        },
-      },
+      tools = { approval = { mode = "auto_allow" }, sandbox = resident_sandbox_config() },
     }, function()
       require("NeoAI.sandbox").reset()
-      local svc_mod = require("NeoAI.sandbox.service")
-      local result, err
-      local done = false
-      require("NeoAI.tools").execute("run_command",
-        { command = "sleep 30 &", description = "t" }, {})
-        :then_(function(v) result = v; done = true end, function(e) err = e; done = true end)
+      local tools = require("NeoAI.tools")
+      local done, err = false, nil
+      tools.execute("run_command",
+        { command = "sleep 30 & echo started", description = "t" }, {})
+        :then_(function() done = true end, function(e) err = e; done = true end)
       t.true_(vim.wait(15000, function() return done end, 50), "应返回")
       t.eq(nil, err, "不应报错: " .. tostring(err and (err.message or err)))
-      t.eq("string", type(result), "结果应为文本")
-      t.matches("长驻服务", result)
-      local list = svc_mod.list()
-      t.eq(1, #list, "应注册一个长驻服务")
-      t.matches("^bg_", list[1].name, "服务名应以 bg_ 前缀")
-      svc_mod.stop_all({ timeout_ms = 10000 })
-      t.eq(0, #svc_mod.list(), "stop_all 后应清空")
+      t.not_nil(resident.active(), "应存在常驻实例")
+      -- 第二条命令在同一命名空间内应能看到上一条启动的后台进程。
+      local out, done2 = nil, false
+      tools.execute("run_command",
+        { command = "ps -e -o args 2>/dev/null | grep '[s]leep 30' | wc -l", description = "t" }, {})
+        :then_(function(v) out = v; done2 = true end, function() done2 = true end)
+      t.true_(vim.wait(15000, function() return done2 end, 50), "应返回")
+      t.matches("[1-9]", tostring(out), "后台进程应跨调用存活")
+      resident.stop({ timeout_ms = 5000 })
     end)
   end)
 
-  it("run_command：非后台命令保持一次性执行，不注册服务", function(t)
+  it("run_command：非后台命令正常返回输出", function(t)
+    local runtime = require("NeoAI.sandbox.runtime")
+    if runtime.backend() ~= "bwrap" then return end
     with_config({
-      tools = {
-        approval = { mode = "auto_allow" },
-        sandbox = {
-          enabled = true, fail_closed = true, mode = "dry_run",
-          ephemeral_roots = {}, service = { enabled = true, auto_background = true },
-        },
-      },
+      tools = { approval = { mode = "auto_allow" }, sandbox = resident_sandbox_config() },
     }, function()
       require("NeoAI.sandbox").reset()
-      local svc_mod = require("NeoAI.sandbox.service")
-      local result, err
-      local done = false
+      local result, err, done = nil, nil, false
       require("NeoAI.tools").execute("run_command",
         { command = "echo a && echo b", description = "t" }, {})
         :then_(function(v) result = v; done = true end, function(e) err = e; done = true end)
       t.true_(vim.wait(15000, function() return done end, 50), "应返回")
       t.eq(nil, err, "不应报错: " .. tostring(err and (err.message or err)))
       t.matches("b", tostring(result), "应执行并返回输出")
-      t.eq(0, #svc_mod.list(), "非后台命令不应注册服务")
-    end)
-  end)
-
-  it("run_command：auto_background=false 时后台命令仍一次性执行（保持旧行为）", function(t)
-    with_config({
-      tools = {
-        approval = { mode = "auto_allow" },
-        sandbox = {
-          enabled = true, fail_closed = true, mode = "dry_run",
-          ephemeral_roots = {}, service = { enabled = true, auto_background = false },
-        },
-      },
-    }, function()
-      require("NeoAI.sandbox").reset()
-      local svc_mod = require("NeoAI.sandbox.service")
-      local done = false
-      require("NeoAI.tools").execute("run_command",
-        { command = "sleep 30 &", description = "t" }, {})
-        :then_(function() done = true end, function() done = true end)
-      t.true_(vim.wait(15000, function() return done end, 50), "应返回")
-      t.eq(0, #svc_mod.list(), "关闭自动提升时不应注册服务")
+      require("NeoAI.sandbox.resident").stop({ timeout_ms = 5000 })
     end)
   end)
 end)

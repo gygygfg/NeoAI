@@ -172,13 +172,14 @@ end
 --- @return table
 function M.probe()
   local caps = { available = false, base = _base(), controllers = {}, writable = false }
-  local fstype = vim.fn.system("stat -fc %T /sys/fs/cgroup 2>/dev/null"):gsub("%s+$", "")
+  local base = caps.base
+  local fstype = vim.fn.system("stat -fc %T " .. vim.fn.shellescape(base) .. " 2>/dev/null"):gsub("%s+$", "")
   if fstype == "cgroup2fs" then
-    local controllers = _read_file("/sys/fs/cgroup/cgroup.controllers")
+    local controllers = _read_file(base .. "/cgroup.controllers")
     if controllers then
       for c in controllers:gmatch("%S+") do caps.controllers[#caps.controllers + 1] = c end
     end
-    caps.writable = vim.fn.filewritable("/sys/fs/cgroup/cgroup.procs") ~= 0
+    caps.writable = vim.fn.filewritable(base .. "/cgroup.procs") ~= 0
     caps.available = caps.writable
   end
   state.caps = caps
@@ -340,6 +341,81 @@ function M.release(handle)
     vim.wait(10)
   end
   state.handles[handle.attempt_id] = nil
+end
+
+--- 创建一个可向下委派控制器的 cgroup（供沙箱内 systemd --user 管理其子域）。
+--- 该 cgroup 本身不驻留进程（cgroup v2「无内部进程」约束），控制器经
+--- `cgroup.subtree_control` 委派给沙箱内的 user manager；沙箱将其以可写方式 bind 到
+--- `/sys/fs/cgroup`，systemd 只能在本子树内创建/移动 cgroup，不污染宿主其它 cgroup。
+--- @param id string
+--- @param limits table|nil
+--- @return table|nil handle { path, parent, limits }
+--- @return string|nil err
+function M.prepare_delegated(id, limits)
+  limits = limits or M.resolve_limits()
+  local caps = M.capabilities()
+  if not caps.available then return nil, "SANDBOX_CGROUP_UNAVAILABLE" end
+  local parent = _parent_path()
+  vim.fn.mkdir(parent, "p")
+  if vim.fn.isdirectory(parent) ~= 1 then
+    return nil, "SANDBOX_CGROUP_CREATE_FAILED: " .. parent
+  end
+  local ctrls = {}
+  if (limits.memory_bytes or 0) > 0 then ctrls[#ctrls + 1] = "memory" end
+  if (limits.pids or 0) > 0 then ctrls[#ctrls + 1] = "pids" end
+  if (limits.cpu_max or 0) > 0 then ctrls[#ctrls + 1] = "cpu" end
+  local spec = #ctrls > 0 and ("+" .. table.concat(ctrls, " +")) or nil
+  if spec then
+    pcall(_write_file, caps.base .. "/cgroup.subtree_control", spec)
+    pcall(_write_file, parent .. "/cgroup.subtree_control", spec)
+  end
+  local path = parent .. "/neoai_deleg_" .. _safe_id(id)
+  vim.fn.mkdir(path, "p")
+  if vim.fn.isdirectory(path) ~= 1 then
+    return nil, "SANDBOX_CGROUP_CREATE_FAILED: " .. path
+  end
+  -- 委派控制器给子域（systemd 需要以之创建 service/app slice）。
+  if spec then pcall(_write_file, path .. "/cgroup.subtree_control", spec) end
+  -- 资源限制按层级生效（子域进程同样受此约束）。
+  if (limits.memory_bytes or 0) > 0 then
+    pcall(_write_file, path .. "/memory.max", tostring(limits.memory_bytes))
+  end
+  if (limits.pids or 0) > 0 then
+    pcall(_write_file, path .. "/pids.max", tostring(limits.pids))
+  end
+  local child_cpu = M.effective_cpu_max(limits.cpu_max)
+  if child_cpu > 0 then
+    pcall(_write_file, path .. "/cpu.max", tostring(child_cpu) .. " 100000")
+  end
+  return { path = path, parent = parent, limits = vim.deepcopy(limits) }
+end
+
+--- 递归删除空的 cgroup 目录树（best-effort；调用前应先 kill 并等进程退出）。
+--- @param path string
+local function _rmdir_tree(path)
+  local handle = vim.uv.fs_scandir(path)
+  if handle then
+    while true do
+      local name, t = vim.uv.fs_scandir_next(handle)
+      if not name then break end
+      if t == "directory" then _rmdir_tree(path .. "/" .. name) end
+    end
+  end
+  pcall(vim.fn.delete, path, "d")
+end
+
+--- 释放委派 cgroup：kill 残留进程后递归删除子树。
+--- @param handle table|nil
+function M.release_delegated(handle)
+  if not handle or not handle.path then return end
+  pcall(_write_file, handle.path .. "/cgroup.kill", "1")
+  local deadline = vim.uv.hrtime() + 500 * 1e6
+  while vim.uv.hrtime() < deadline do
+    local raw = _read_file(handle.path .. "/cgroup.procs")
+    if not raw or raw:gsub("%s", "") == "" then break end
+    vim.wait(20)
+  end
+  _rmdir_tree(handle.path)
 end
 
 --- 重置（测试用）

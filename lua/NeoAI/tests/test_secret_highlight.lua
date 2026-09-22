@@ -63,7 +63,8 @@ tests.suite("secret_highlight", function(_, it)
     })
     local text = buffer_text(buf)
     t.matches("⚠ 密钥：read_file", text, "应有独立一行密钥警告并指明工具")
-    t.matches("密钥文件：/root/%.env", text, "应指明密钥文件路径")
+    t.matches("密钥文件：", text, "应指明密钥文件标题")
+    t.matches("/root/%.env", text, "应指明密钥文件路径")
     t.matches("read_file", text, "应仍展示工具名")
     local tool_has_mark = false
     for _, l in ipairs(buffer_lines(buf)) do
@@ -73,20 +74,23 @@ tests.suite("secret_highlight", function(_, it)
     local marks = secret_extmarks(buf)
     local wl = warning_line(buf)
     t.not_nil(wl, "应找到警告行")
-    -- 两处高亮：折叠外警告行（整行）+ 结果行内的 NEOKEY_ token
-    t.eq(2, #marks, "应有警告行与行内密钥两处高亮（实际 " .. #marks .. "）")
+    -- 多行警告：每行整行高亮（主行 + 密钥文件标题 + 路径），外加结果行内 NEOKEY_ token 一处
+    t.eq(4, #marks, "应有 3 行警告整行高亮 + 行内密钥一处（实际 " .. #marks .. "）")
     local on_warning, inline = false, false
     for _, m in ipairs(marks) do
       t.eq("NeoAISecretWarning", m[4] and m[4].hl_group or nil, "高亮组应为 NeoAISecretWarning")
-      if m[2] == wl - 1 then on_warning = true else inline = true end
+      if m[2] >= wl - 1 and m[2] <= wl + 1 then on_warning = true else inline = true end
     end
     t.true_(on_warning, "警告行应有整行高亮")
     t.true_(inline, "结果行内的密钥值应有高亮")
     t.eq(1, vim.fn.hlexists("NeoAISecretWarning"), "应定义 NeoAISecretWarning 高亮组")
+    -- 所有警告行（含续行）都在折叠块外、不并入折叠
+    for i = wl, wl + 2 do
+      t.eq(0, vim.fn.foldlevel(i), "警告行（含续行）不应并入折叠")
+    end
     t.false_(buffer_lines(buf)[wl]:match("^%s") ~= nil, "警告行应在折叠块外（非缩进）")
     -- 折叠文本（收起状态）不应含 ⚠ 密钥
     t.false_(fold_text(buf, 2):find("⚠ 密钥", 1, true) ~= nil, "折叠文本不应含 ⚠ 密钥")
-    t.eq(0, vim.fn.foldlevel(wl), "警告行不应并入折叠")
   end)
 
   it("工具参数含密钥 token：同样在折叠外高亮警告", function(t)
@@ -106,7 +110,8 @@ tests.suite("secret_highlight", function(_, it)
       { role = "tool", tool_call_id = "t1", tool_name = "run_command", content = '{"ok":true}' },
     })
     t.matches("⚠ 密钥：run_command", buffer_text(buf), "参数含密钥应有警告行并指明命令")
-    t.eq(2, #secret_extmarks(buf), "警告行 + 参数行内 token 各一处高亮")
+    -- 3 行警告（主行 + 执行命令 + 通用提示）整行高亮 + 参数行内 token 一处
+    t.eq(4, #secret_extmarks(buf), "多行警告 + 参数行内 token 高亮")
     t.false_(fold_text(buf, 2):find("⚠ 密钥", 1, true) ~= nil, "折叠文本不应含 ⚠ 密钥")
   end)
 
@@ -200,16 +205,19 @@ tests.suite("secret_highlight", function(_, it)
       },
     }
     message_list.render_chat(buf, base, {})
-    t.matches("观测到密钥文件：/root/%.ssh/id_rsa", buffer_text(buf), "应给出观测告警行")
+    local obs_text = buffer_text(buf)
+    t.matches("观测到密钥文件：", obs_text, "应给出观测告警标题")
+    t.matches("/root/%.ssh/id_rsa", obs_text, "应给出观测到的密钥文件")
     local wl = warning_line(buf)
     t.not_nil(wl, "应找到观测告警行")
-    t.eq(1, #secret_extmarks(buf), "应有告警行整行高亮")
+    -- 主行 + 观测到密钥文件标题 + 路径 = 3 行整行高亮
+    t.eq(3, #secret_extmarks(buf), "应有 3 行告警整行高亮")
     -- 追加下一条消息触发增量刷新：告警行位于差异区间之前，其整行高亮不应被清除
     local updated = vim.deepcopy(base)
     updated[#updated + 1] = { role = "assistant", content = "done" }
     message_list.render_chat(buf, updated, {})
     local marks = secret_extmarks(buf)
-    t.eq(1, #marks, "增量刷新后告警行高亮应保留（实际 " .. #marks .. "）")
+    t.eq(3, #marks, "增量刷新后告警行高亮应保留（实际 " .. #marks .. "）")
     t.eq(wl - 1, marks[1][2], "高亮仍应位于告警行")
   end)
 
@@ -233,7 +241,8 @@ tests.suite("secret_highlight", function(_, it)
     updated[2].content = '{"output":"TOKEN=NEOKEY_cafebabe99"}'
     message_list.render_chat(buf, updated, {})
     t.matches("⚠ 密钥：read_file", buffer_text(buf), "更新后应有警告行并指明工具")
-    t.eq(2, #secret_extmarks(buf), "更新后警告行 + 结果行内 token 各一处高亮")
+    -- 3 行警告整行高亮 + 结果行内 token 一处
+    t.eq(4, #secret_extmarks(buf), "更新后多行警告 + 结果行内 token 高亮")
   end)
 
   it("被密钥硬拦截的错误结果：不渲染内部标识告警行", function(t)

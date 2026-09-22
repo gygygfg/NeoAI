@@ -64,11 +64,26 @@ local _register_input_resize
 -- 否则用户正在回看上方内容，不动光标。
 local FOLLOW_MARGIN = 5
 
+--- 聊天窗口当前是否显示聊天 buffer（state.buf）。
+--- 用户 :bnext 把窗口切到别的 buffer 后，窗口上下文内的折叠/光标操作（foldlevel/foldclose!/
+--- set_cursor/foldexpr 等）会落到别的 buffer 上，必须据此跳过，避免污染用户正在看的文件；
+--- 但聊天内容仍照常写入 state.buf（见 _render），保证切换期间流式内容不丢。
+--- @return boolean
+local function _win_shows_buf()
+  if not state.win_id or not vim.api.nvim_win_is_valid(state.win_id) then return false end
+  if not state.buf or not vim.api.nvim_buf_is_valid(state.buf) then return false end
+  local ok, shown = pcall(vim.api.nvim_win_get_buf, state.win_id)
+  return ok and shown == state.buf
+end
+
 --- 光标是否位于 buffer 最后 5 行内
 --- @return boolean
 local function _cursor_within_follow_margin()
   if not state.win_id or not vim.api.nvim_win_is_valid(state.win_id) then return true end
   if not state.buf or not vim.api.nvim_buf_is_valid(state.buf) then return true end
+  -- 窗口被切到别的 buffer：用户没在看聊天内容，视为不跟随；同时避免把别的 buffer 的光标
+  -- 误当成聊天光标（否则会误判为跟随，把思考/参数悬浮窗弹到用户文件上）。
+  if not _win_shows_buf() then return false end
   local cur = vim.api.nvim_win_get_cursor(state.win_id)
   local line_count = vim.api.nvim_buf_line_count(state.buf)
   -- 最后 5 行 = line_count-4 .. line_count；光标只在这些行内才自动跟随
@@ -81,7 +96,9 @@ end
 --- @return table 行号数组
 local function _open_fold_start_lines()
   local starts = {}
-  if not state.buf or not vim.api.nvim_buf_is_valid(state.buf) then return starts end
+  -- 窗口不在聊天 buffer 上时，foldlevel/foldclosed 读的是别的 buffer 的折叠，直接跳过，
+  -- 避免把别的 buffer 的折叠行号误当成聊天折叠并在恢复时操作到别的 buffer。
+  if not _win_shows_buf() then return starts end
   local total = vim.api.nvim_buf_line_count(state.buf)
   local prev_level = 0
   for ln = 1, total do
@@ -135,7 +152,11 @@ local function _render(keep_view)
   if diff and diff.changed == false then
     return false
   end
-  if state.win_id and vim.api.nvim_win_is_valid(state.win_id) then
+  -- 折叠/视口操作只在窗口确实显示聊天 buffer 时执行：nvim_win_call 内的 foldlevel/
+  -- foldclose!/set_cursor/getline/foldexpr 都作用于窗口当前 buffer，若窗口已被 :bnext
+  -- 切到别的文件，这些会按聊天 buffer 的行号作用到用户文件上（误关折叠、挪动光标、
+  -- 覆盖 foldexpr）。内容写入已在上面无条件写入 state.buf，不受此保护影响。
+  if _win_shows_buf() then
     vim.api.nvim_win_call(state.win_id, function()
       -- 折叠由 nvim 在 buffer 变更后按 foldexpr 自动重算。这里**不再**整块 `zx`/`zM`：
       -- 那会对整个 buffer 重新求值折叠并刷新所有旧折叠文本（旧块摘要闪烁、视口跳动），

@@ -150,6 +150,8 @@ function M.shutdown()
   pcall(function() require("NeoAI.sandbox.host_proxy").stop() end)
   -- 停止长驻服务：捕获其改动为候选并合并回暂存（有界等待），避免服务进程跨关闭残留。
   pcall(function() require("NeoAI.sandbox.service").stop_all({ timeout_ms = 10000 }) end)
+  -- 停止会话级常驻沙箱实例（连同其命名空间内的后台进程）。
+  pcall(function() require("NeoAI.sandbox.resident").stop({ timeout_ms = 2000 }) end)
   -- 先等后台后处理（异步模式下命令结果已返回、捕获/冻结/结算未完成）与异步写入落盘，
   -- 避免关闭时丢失最后一笔冻结与待审入队。等待有上限（tools.sandbox.shutdown_timeout_ms，
   -- 默认 3s）：后处理卡住时不至于让 `:qall` / 插件热重载长时间无响应。
@@ -188,6 +190,8 @@ function M.watch_sessions()
         end
       end
     end
+    -- 会话轮换前先终止常驻沙箱实例（其命名空间绑定当前会话的 overlay 目录）。
+    pcall(function() require("NeoAI.sandbox.resident").stop({ timeout_ms = 2000 }) end)
     pcall(candidate.rotate_session)
   end
   for _, ev in ipairs({
@@ -627,6 +631,8 @@ function M.reset()
   pcall(function() require("NeoAI.sandbox.wrapper").await_postprocess(60000) end)
   -- 停止长驻服务并回收其 overlay/cgroup（先于 candidate/control/store 清理）。
   pcall(function() require("NeoAI.sandbox.service").reset() end)
+  -- 停止会话级常驻沙箱实例（连同其后台进程与资源域）。
+  pcall(function() require("NeoAI.sandbox.resident").reset() end)
   candidate.reset()
   control.reset()
   store.reset()

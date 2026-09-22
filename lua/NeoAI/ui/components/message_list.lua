@@ -341,15 +341,16 @@ local function _secret_names(values)
   return out
 end
 
---- 构造密钥警告行，**明确区分「获取」与「使用」**：
+--- 解析密钥告警的结构化信息，供单行 / 多行两种渲染共用。
+--- **明确区分「获取」与「使用」**：
 ---   * 获取：工具结果 / 内核观测到的密钥文件读取命中密钥内容；
 ---   * 使用：工具参数（命令/写入内容）携带密钥值、token 或敏感环境变量名，或使用型命令引用密钥文件。
 --- 仅列出密钥文件（ls/find/list_files 等）不构成读取/使用，不产生告警。
 --- 明细回退顺序：观测到的密钥文件 → 参数中的密钥文件 → 密钥类型（具名规则）→ 敏感环境变量名 → 通用提示。
 --- @param fn table tool_call["function"]
 --- @param result_msg table|nil
---- @return string|nil
-local function _secret_warning_line(fn, result_msg)
+--- @return table|nil { name, command, verb, observed, paths, rules, names }
+local function _secret_warning_data(fn, result_msg)
   if not fn then return nil end
   local ok, secret = pcall(require, "NeoAI.sandbox.secret")
   if not ok or type(secret) ~= "table" then return nil end
@@ -402,11 +403,6 @@ local function _secret_warning_line(fn, result_msg)
   if not (got or used) then return nil end
 
   local verb = (got and used) and "获取并使用了密钥" or (got and "获取了密钥" or "使用了密钥")
-  local parts = { "⚠ 密钥：" .. (fn.name or "工具") }
-  if args and type(args.command) == "string" and args.command ~= "" then
-    parts[#parts + 1] = " 执行 `" .. stringx.truncate(args.command:gsub("%s+", " "), 80) .. "`"
-  end
-  parts[#parts + 1] = " " .. verb
   local rule_set = {}
   for r in pairs(info_args.rules) do rule_set[r] = true end
   for r in pairs(info_result.rules) do rule_set[r] = true end
@@ -419,18 +415,70 @@ local function _secret_warning_line(fn, result_msg)
       if not name_seen[n] then name_seen[n] = true; names[#names + 1] = n end
     end
   end
-  if #observed > 0 then
-    parts[#parts + 1] = "（观测到密钥文件：" .. table.concat(observed, ", ") .. "）"
-  elseif #paths > 0 then
-    parts[#parts + 1] = "（密钥文件：" .. table.concat(paths, ", ") .. "）"
-  elseif #rules > 0 then
-    parts[#parts + 1] = "（密钥类型：" .. table.concat(rules, ", ") .. "）"
-  elseif #names > 0 then
-    parts[#parts + 1] = "（密钥环境变量：" .. table.concat(names, ", ") .. "）"
+  return {
+    name = fn.name or "工具",
+    command = (args and type(args.command) == "string" and args.command ~= "") and args.command or nil,
+    verb = verb,
+    observed = observed,
+    paths = paths,
+    rules = rules,
+    names = names,
+  }
+end
+
+--- 密钥警告（单行文本，供测试 / 工具复用；明细以逗号分隔）。
+--- @param fn table tool_call["function"]
+--- @param result_msg table|nil
+--- @return string|nil
+local function _secret_warning_line(fn, result_msg)
+  local d = _secret_warning_data(fn, result_msg)
+  if not d then return nil end
+  local parts = { "⚠ 密钥：" .. d.name }
+  if d.command then
+    parts[#parts + 1] = " 执行 `" .. stringx.truncate(d.command:gsub("%s+", " "), 80) .. "`"
+  end
+  parts[#parts + 1] = " " .. d.verb
+  if #d.observed > 0 then
+    parts[#parts + 1] = "（观测到密钥文件：" .. table.concat(d.observed, ", ") .. "）"
+  elseif #d.paths > 0 then
+    parts[#parts + 1] = "（密钥文件：" .. table.concat(d.paths, ", ") .. "）"
+  elseif #d.rules > 0 then
+    parts[#parts + 1] = "（密钥类型：" .. table.concat(d.rules, ", ") .. "）"
+  elseif #d.names > 0 then
+    parts[#parts + 1] = "（密钥环境变量：" .. table.concat(d.names, ", ") .. "）"
   else
     parts[#parts + 1] = "（模型上下文含密钥）"
   end
   return table.concat(parts)
+end
+
+--- 密钥警告（多行文本，供聊天主界面展示）：首行概要（工具 + 获取/使用），命令单独一行，
+--- 命中的密钥文件 / 类型 / 环境变量**按项换行**列出，避免多项逗号挤在一行难以阅读。
+--- 注意：每行都以 `· ` 起头（**不用空格缩进**）——聊天窗口按缩进折叠，缩进行会被并入折叠块、
+--- 收起后看不到，故用行首标记保持所有告警行在折叠块外可见。
+--- @param fn table tool_call["function"]
+--- @param result_msg table|nil
+--- @return table|nil 行数组
+local function _secret_warning_lines(fn, result_msg)
+  local d = _secret_warning_data(fn, result_msg)
+  if not d then return nil end
+  local out = { ("⚠ 密钥：%s %s"):format(d.name, d.verb) }
+  if d.command then
+    out[#out + 1] = "· 执行 `" .. stringx.truncate(d.command:gsub("%s+", " "), 80) .. "`"
+  end
+  local function _list(label, items)
+    if #items == 0 then return false end
+    out[#out + 1] = "· " .. label
+    for _, it in ipairs(items) do out[#out + 1] = "·   " .. it end
+    return true
+  end
+  if not (_list("观测到密钥文件：", d.observed)
+      or _list("密钥文件：", d.paths)
+      or _list("密钥类型：", d.rules)
+      or _list("密钥环境变量：", d.names)) then
+    out[#out + 1] = "· 模型上下文含密钥"
+  end
+  return out
 end
 
 --- 返回一行文本内的密钥高亮区间（0-based 字节列，左闭右开）。
@@ -919,12 +967,12 @@ end
 
 local function _append_tool_block(lines, marks, tool_call, result_msg)
   local fn = tool_call["function"]
-  -- 密钥防护：命令参数或结果（模型上下文）含密钥时，在该工具折叠块**外**单独追加
-  -- 一行高亮警告（非缩进 → 不并入折叠），折叠标题保持干净。
-  -- 警告行指明「哪个命令/工具获取或使用了哪个密钥文件」（见 _secret_warning_line）。
-  local secret_line = _secret_warning_line(fn, result_msg)
+  -- 密钥防护：命令参数或结果（模型上下文）含密钥时，在该工具折叠块**外**追加
+  -- 高亮警告（非缩进 → 不并入折叠），折叠标题保持干净。
+  -- 警告按项换行指明「哪个命令/工具获取或使用了哪些密钥文件/变量」（见 _secret_warning_lines）。
+  local secret_lines = _secret_warning_lines(fn, result_msg)
   -- 含密钥的工具调用：完整展示参数/结果（不截断），并在行内高亮密钥值。
-  local has_secret = secret_line ~= nil
+  local has_secret = secret_lines ~= nil
   local rows = {}
   local header_text = _tool_header_text(tool_call, result_msg)
   if header_text then rows[#rows + 1] = header_text end
@@ -949,9 +997,11 @@ local function _append_tool_block(lines, marks, tool_call, result_msg)
   -- 避免每秒为更新时间重建整块（大消息时占主线程）与折叠闪烁。
   _append_fold_block(lines, marks, rows, "tool",
     { fold_kind = "tool", tool_header = { id = tool_call.id, tc = tool_call, res = result_msg } })
-  -- 密钥警告：折叠块外单独一行（非缩进 → 不并入折叠），施加高亮。
-  if secret_line then
-    _push(lines, marks, secret_line, { secret = true })
+  -- 密钥警告：折叠块外单独若干行（非缩进 → 不并入折叠），逐行施加高亮。
+  if secret_lines then
+    for _, l in ipairs(secret_lines) do
+      _push(lines, marks, l, { secret = true })
+    end
   end
   -- 工具结果 UI 附加提示（如沙箱降级）：仅用户可见，不进入模型上下文；折叠块外单独一行。
   if result_msg and result_msg.notice and result_msg.notice ~= "" then
@@ -1302,6 +1352,7 @@ M.helpers = {
   tool_result_failed = _tool_result_failed,
   contains_secret = _contains_secret,
   secret_warning_line = _secret_warning_line,
+  secret_warning_lines = _secret_warning_lines,
   secret_spans = _secret_spans,
   attach_secret_spans = _with_secret_spans_bulk,
   apply_secret_hl = _apply_secret_hl,

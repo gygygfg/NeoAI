@@ -234,7 +234,7 @@ sandbox = {
   offline = false,                 -- Network allowed by default (recorded only, not blocked); true hard-denies network and isolates process networking
   require_seccomp = true,          -- Reject external execution when seccomp is unavailable (default on, fail-closed)
   seccomp = { enabled = true, filter_path = "" }, -- seccomp baseline (built-in denylist; default on; bwrap only)
-  cap_add = {},                    -- Least privilege by default (`--cap-drop ALL`); capabilities are added back narrowly per command (package installs via packages.cap_add). Set { "ALL" } only for debugging
+  cap_add = {},                    -- Global extra capabilities (empty by default); the tier baseline adds CAP_DAC_OVERRIDE (see privilege.tiers), package installs/system administration add more on demand. Set { "ALL" } only for debugging
   -- Payload identity (least privilege): sandboxed processes run as a non-root user by default.
   -- Payload identity: runs as root by default (uid=0) so the AI can use host toolchains inside the
   --   sandbox (/root nvm/cargo/go etc. are 0700 and untraversable by non-root) and package managers
@@ -249,6 +249,9 @@ sandbox = {
   --     nobody 65534) to harden — the plugin runs `setpriv` to drop the payload to that uid, keeping
   --     the configured narrow capabilities as ambient. Then /root is untraversable, so place the
   --     workspace / `workspace_root` where that uid can traverse (not under a 0700 /root).
+  --   When the payload is non-root (non-root launch or uid!=0) and a command fails on a permission
+  --     error, an explicit ROOT_REQUIRED host-op proposal is frozen (replayed with root/sudo after
+  --     approval) — never a silent failure or silent escalation (see sandbox.md §17).
   run_as = { uid = 0, gid = 0 },
   cap_drop = {                     -- Host-global capability narrowing: dropped even when cap_add contains ALL (network/clock/modules/raw I/O/boot/MAC/audit)
     "CAP_NET_ADMIN", "CAP_SYS_TIME", "CAP_SYS_MODULE", "CAP_SYS_RAWIO",
@@ -292,7 +295,7 @@ sandbox = {
   expose_tool_paths = false,       -- Auto-expose host PATH tool dirs (opt-in): read-only-expose existing, non-credential/system PATH bin dirs and prepend them to the sandbox PATH so toolchains under $HOME (node/npm/fd/go) work (widens the read surface)
   appimage_extract_and_run = true, -- AppImage support (on by default): when running an AppImage in the sandbox, inject APPIMAGE_EXTRACT_AND_RUN=1 so it extracts into the session-private /tmp (the sandbox blocks mount and exposes no /dev/fuse, so FUSE mounting is unavailable); non-AppImage programs ignore the variable. Set false to disable
   resolv_conf = "sanitize",        -- /etc/resolv.conf: sanitize (default, nameservers only) | hide | passthrough
-  tmpfs_roots = { "/tmp", "/var/tmp" }, -- per-session private temporary roots (never an overlay lower; destroyed on exit)
+  tmpfs_roots = { "/tmp", "/var/tmp", "/run" }, -- per-session private temporary roots (never an overlay lower; destroyed on exit). /run (and /var/run) is included by default so dpkg postinst can create the adduser lock file and /var/run/postgresql; sensitive host /run entries stay masked by mask_paths
   ephemeral_roots = { "/tmp", "/var/tmp" }, -- ephemeral candidate roots (excluding the cwd subtree): file writes under these roots are session-private, discarded when nvim exits, and produce no pending candidate / no publish / no approval popup; `{}` disables
   tmp_private_base = "host",       -- location of the private temp dir: host (default: hidden subdir under the host root, e.g. /tmp/.cache-<tag>/<session>, namespace-bound back onto the root to isolate the AI) | session (old behavior: under the session process dir)
   hide_proc_paths = { "/proc/cmdline", "/proc/version" }, -- overridden with an empty file; hides host kernel cmdline/version (dangerous global sysctls are mandatory and can only grow)
@@ -335,26 +338,38 @@ sandbox = {
     prewarm = true,
     prewarm_ttl_ms = 90000, -- prewarm TTL (ms): reclaimed if not reused within it
   },
+  -- Write-journal incremental capture (default "auto"): use the eBPF-observed write/delete paths of
+  -- this command to drive capture, processing only those paths instead of walking the whole
+  -- session-accumulated overlay upper (eliminates "many cache files, multi-round read/write stutter").
+  -- Effective only when observation is trusted (eBPF + ready before the command + drained + all
+  -- absolute paths + non-empty journal); otherwise falls back to a full walk. Set "off" to disable.
+  -- Note: events are cgroup-scoped, so back-to-back commands may lose events entirely -> empty-journal fallback.
+  journal_capture = "auto",
   -- Diagnostics (off by default): enable when investigating 137 / OOM / resource-domain kills.
   -- Records to the NeoAI log only; never changes execution or model-visible results. Pair with
   -- `:NeoAISandboxDiag` to inspect host/container limits and load.
   diagnostics = {
-    enabled = false,          -- master switch
+    enabled = false,          -- master switch (when on, also logs [sandbox-profile] stage timings: gate:<tool> end-to-end + settle freeze/settle)
     log_kill_caller = false,  -- cgroup.kill caller traceback (who killed the process tree)
     dump_cgroup_events = false, -- dump resource-domain memory/pids events at command end (OOM attribution)
   },
-  -- Long-lived services (service_* tools): background processes survive across tool calls until
-  -- explicitly stopped / session end. Each service uses its own overlay attempt: at start the
-  -- workspace staging is materialized into the service view (one-way snapshot); at stop its changes
-  -- are captured and merged back into workspace staging (boundary sync, not live sharing) and queued
-  -- for async review. A resource domain is created per service; stop first sends SIGTERM to the
-  -- payload and waits for a graceful exit, then cgroup.kill terminates the whole tree on timeout.
+  -- Session-resident sandbox instance: when enabled, run_command commands execute inside one
+  -- persistent mount+pid namespace, so background processes (&/nohup/setsid) survive across tool
+  -- calls (close to normal bash). Dedicated overlay base dir and session-level resource domain; AI
+  -- edits are written back inside the namespace, command changes are still frozen as candidates.
+  -- Falls back to one-shot process execution when overlay is unavailable / T2 tier / startup fails.
+  resident = {
+    enabled = true, -- session-resident sandbox instance (run_command background procs survive calls); auto-fallback
+  },
+  -- Internal long-lived services (sandbox.service): the service_* tools are no longer registered
+  -- (invisible to the AI); kept only for the systemctl facade to start/stop unit processes in-sandbox
+  -- (own overlay + resource domain, changes captured as candidates on stop).
   service = {
-    enabled = true,          -- register the service_* tools
+    enabled = true,          -- internal capability master switch
     max_services = 16,       -- max concurrently alive services
     max_log_bytes = 262144,  -- per-service log ring-buffer cap (bytes)
     stop_timeout_ms = 5000,  -- max wait for graceful exit (SIGTERM first) before SIGKILL
-    auto_background = true,  -- promote run_command &/nohup/setsid to a long-lived service (survives calls)
+    auto_background = true,  -- retained constant (old background facade removed; no longer emitted)
   },
   -- systemctl facade (option A): standalone `systemctl`/`journalctl` calls from the AI are routed
   -- to in-sandbox long-lived services (reusing sandbox.service); the host systemd is never called
@@ -369,6 +384,14 @@ sandbox = {
       "/etc/systemd/system", "/run/systemd/system",
       "/usr/lib/systemd/system", "/lib/systemd/system",
     },
+    -- Nested real systemd --user (requires resident): starts a real user manager inside the
+    -- resident sandbox instance; `systemctl --user` hits real semantics; unit files stage in the
+    -- workspace overlay, cgroups are confined to a delegated subtree, nothing lands on the host.
+    -- Off by default.
+    user = { enabled = false },
+    -- System-level systemctl enable/disable: parse [Install] WantedBy/RequiredBy and stage the
+    -- symlink changes as review candidates, applied after approval; nothing lands on the host.
+    stage_install = true,
   },
   network = {
     enabled = false, allowed_endpoints = {}, budget_bytes = 0, -- controlled network gateway
@@ -378,6 +401,7 @@ sandbox = {
     -- boundary: raw TCP that ignores the proxy can bypass it (see docs/en/sandbox.md §6.1).
     host_local_block = true,
     host_local_proxy_port = 0,       -- host filtering proxy port (0 = random loopback port)
+    allow_localhost_ports = {},      -- localhost port allowlist (empty = block all): only loopback + these ports are allowed (e.g. self-testing a service inside the sandbox on 5432/6379); host NIC IPs / link-local / cloud metadata are never allowed
     -- Proxy policy for sandbox external commands: strip (default: do not pass host proxies into the
     -- sandbox; e.g. mihomo only proxies opencode itself, avoiding an unreachable host
     -- HTTPS_PROXY=127.0.0.1:7890 breaking pip/npm) | passthrough (keep host proxies) |
@@ -403,8 +427,8 @@ sandbox = {
   privilege = {
     enabled = true, auto_escalate = true, max_tier = 2, record = true,
     tiers = {                       -- per-tier network/extra caps/mounts/unmask/review strictness
-      [0] = { name = "minimal", review = "auto", network = true, cap_add = {}, mounts = {}, unmask = {} }, -- least privilege: non-root payload, cap-drop ALL. network allowed (recorded); host-local intercepted via host_proxy
-      [1] = { name = "elevated", review = "auto", network = true, cap_add = {}, mounts = {}, unmask = {} }, -- docker.sock is unmasked only for docker commands
+      [0] = { name = "minimal", review = "auto", network = true, cap_add = { "CAP_DAC_OVERRIDE" }, mounts = {}, unmask = {} }, -- least privilege: `--cap-drop ALL` + baseline CAP_DAC_OVERRIDE (root payload reaches foreign-owner 0700 dirs such as _apt's apt cache). network allowed (recorded); host-local intercepted via host_proxy
+      [1] = { name = "elevated", review = "auto", network = true, cap_add = { "CAP_DAC_OVERRIDE" }, mounts = {}, unmask = {} }, -- docker.sock is unmasked only for docker commands
       [2] = { name = "privileged", review = "approve", network = true, userns = true, cap_add = { "ALL" }, mounts = {}, unmask = {} }, -- full caps inside the nested userns (scoped); seccomp still applies
     },
     -- System-administration commands (useradd/chown/passwd, ...): on a match, narrowly add back
@@ -445,6 +469,7 @@ sandbox = {
   session_shell = true,            -- persist shell state (export/cd) across run_command within a session (bwrap only)
   process_roots = {},              -- extra writable roots (only when read_all=false or the whole-root overlay is unavailable; overlaid, default cwd only, auto-added). With read_all=true (default) the whole root is already a writable overlay, so this is unnecessary. /tmp, /var/tmp belong to tmpfs_roots; add explicitly if needed
   overlay_fail_closed = true,      -- reject process tools when overlay is unavailable (no private-cwd downgrade); set false to allow degraded execution
+  staging_uncovered = "reject",    -- when unpublished staged changes exist but the command has no writable overlay layer: "reject" (default, fail-closed) | "warn" (run degraded with a notice, to bypass transient failures)
   -- Async review: candidates enter a pending queue. session_auto_approve auto-applies L0/L1.
   -- l3_warning: high-risk items require second confirmation (AI consequence warning + auto diff; apply only after re-confirming).
   --   L3 (critical) always triggers; with package_confirm=true, L2 package/sensitive installs (apt-key,
@@ -497,6 +522,7 @@ sandbox = {
     roots = { "/usr", "/var", "/etc", "~/.cache", "~/.npm", "~/.nvm", "~/.cargo", "~/.rustup", "~/go", "~/.local" }, -- package-install writable roots (overlay staging). /etc lets dpkg postinst write /etc/ld.so.cache etc.; sensitive entries stay masked by mask_paths
     volatile_paths = { "/var/lib/apt/lists", "/var/cache/apt", "/var/cache/dnf", "/var/cache/yum", "/var/cache/pacman/pkg", "/var/cache/apk", "~/.cache/pip", "~/.cache/uv", "~/.npm/_cacache", "~/.cache/yarn", "~/.cargo/registry/cache", "~/.cache/go-build" }, -- volatile package indexes/caches: skipped when freezing a candidate (not queued, not published) so an apt-update baseline change cannot fail the whole install with BASELINE_CHANGED; the install is unaffected (dpkg/status, package files still apply); {} disables. Do not add state files like /var/lib/dpkg/status
     cap_add = { "CAP_DAC_OVERRIDE", "CAP_CHOWN", "CAP_SETUID", "CAP_SETGID", "CAP_FOWNER" },
+    unmask = { "/etc/passwd", "/etc/group", "/etc/shadow", "/etc/shadow-", "/etc/gshadow", "/etc/gshadow-" }, -- unmask the account DB during package installs: dpkg postinst adduser/useradd/su subprocesses need it; writes still go to overlay staging and require approval to publish
     apt_sandbox_user = "root", -- apt family: injects APT::Sandbox::User (default "root" disables apt's own `_apt` privilege drop, avoiding setgroups EPERM in nested userns/restricted containers that makes apt update/install fail); "_apt" or empty keeps apt defaults
   },
   lsp_overlay = { enabled = true }, -- AI-only sandboxed LSP: servers cloned by the AI lsp_* tools read staged content (on by default, bwrap+overlay only; falls back to editor clients when unavailable)

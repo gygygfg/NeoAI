@@ -134,6 +134,13 @@ is only kept for other `approval.mode` values (`prompt`/`strict`).
   - **Result risk scan is windowed**: `risk.from_result` only scans the first/last
     `tools.sandbox.risk.result_scan_bytes` (default 256 KiB) bytes of output, so large `timeout=-1`
     outputs cannot freeze the UI with a full main-thread lowercase + pattern scan.
+  - **Write-journal incremental capture** (`tools.sandbox.journal_capture`, default auto): drives
+    capture from the eBPF-observed write/delete paths of this command, **processing only those paths**
+    (`_capture_worker` path-driven branch) instead of walking the whole session-accumulated overlay
+    upper; `_encode_expected`/`_encode_ws` also encode incrementally by these paths. Effective only
+    when observation is trusted (eBPF + ready before the command + drained + all absolute paths +
+    non-empty journal), otherwise it falls back to a full walk (correctness first). Measured: with
+    3000 accumulated files and a single-file write, capture drops from ~10ms to <1ms.
   - **Materialize skips unchanged entries by staged version**: each staged entry carries a version
     that is bumped on edit/merge/delete; materialization records the version last written per
     overlay/bind base and **fully skips** an entry whose version matches (no `fs_stat`, no read, no
@@ -224,7 +231,9 @@ is only kept for other `approval.mode` values (`prompt`/`strict`).
     highlights files by path level — **workspace=green, user directory=yellow, system=red** —
     with the `待审` state label **colored by security level** (L0 gray / L1 yellow / L2 orange / L3 red),
     and shows a **high/medium/low** risk grade (`[L0]低危` …
-    `[L2]/[L3]高危`) plus risk reasons. Risk badges are colored **L0 gray / L1·L2 yellow /
+    `[L2]/[L3]高危`) plus risk reasons (duplicate categories are **merged and counted**, e.g.
+    `SYSTEM_PATH_WRITE×2797`, so package installs do not flood the view per file; `sandbox/risk.lua`
+    already dedupes by category at the source). Risk badges are colored **L0 gray / L1·L2 yellow /
     L3 red** — only L3 uses the red danger highlight. Items are **sectioned into "unapplied" and
     "applied"**: pending (unapplied) changes come first, already-published (snapshotted, revertible)
     changes after. **The header line approves the whole change set**
@@ -246,10 +255,11 @@ is only kept for other `approval.mode` values (`prompt`/`strict`).
     host operations; multiple events in the same tick are coalesced into one redraw) — no manual
     refresh. **The "applied" section is
     collapsed by default** (whole section collapsed via `za`/`zo`, then each item collapsed again);
-    pending ordinary items and the out-of-bounds trace section do not fold. **A pending git atomic
-    group shows its header line with the rest folded** (the header keeps the whole-group approval
-    entry and its path/risk highlight; the hint and file list start collapsed, `za`/`zo` expands),
-    avoiding a flood of `.git` internal files from a single git operation. Inside the chat main window
+    **a pending item shows its header line with the rest folded** (the header — tool / risk badge /
+    file count / `待审` — stays visible and is the whole-unit approval entry; the secret warning, risk
+    reasons, git hint and file list start collapsed, `za`/`zo` expands), avoiding a flood from package
+    installs or git operations with up to thousands of files; the out-of-bounds trace section does not
+    fold. Inside the chat main window
     press `<leader>ap` to trigger it (`keymaps.chat.sandbox_review`).
     - **Show saved / undo save**: applying (saving) keeps a **snapshot of the original file** (its
       content before the apply). The review window's "已应用（已保存/已撤销，u 撤销/重做保存）" section lists
@@ -522,14 +532,17 @@ detection) and `risk.classify` (security level), so `pip install`, `sudo modprob
   real root is the read-only lower, a session upper is the writable layer. The command can read real
   content under these roots, and creates/modifies/deletes at **any path** below them land in upper and
   are frozen as a candidate (deletions recognized via whiteout device nodes as `delete`/`rmdir`).
-  - **Process commands run serially**: the gate for `effect="process"` tools (`run_command`, git read
-    tools, …) executes them **FIFO, one at a time**. The sandbox's overlay materialization/capture,
-    session-level writable layer and staging map are based on a **shared session** and are not
-    concurrency-safe: several `run_command`s issued in parallel in one turn (parallel tool_calls)
-    would interleave materialization/capture, making commands see missing directories/files and
-    overwrite each other's captures; a command could then block until timeout and be terminated by
-    `cgroup.kill` with SIGKILL (exit code 137, no output). Serialization keeps parallel calls working
-    (they simply queue) and does not affect `read`/`fs_write`/`in_process`/`network` tools.
+  - **Process commands run in parallel**: the gate for `effect="process"` tools (`run_command`, git
+    read tools, …) splits locks by phase: the **setup phase** (`candidate.begin`/materialize/
+    `resident.ensure`/prefix build) is serialized (avoids duplicate resident startup and interleaved
+    materialization); **command execution** is concurrent (the resident command server multiplexes by
+    id; one-shot processes each use their own attempt); **capture/freeze/merge/settle** is serialized
+    (`_serialize_capture`, avoids overwriting each other's captures). The shared session state
+    (overlay materialization/capture, staging map) is not concurrency-safe, so it is not made fully
+    concurrent; concurrent commands' changes are attributed by **completion order** (the
+    `state.materialized` destination signature makes a later capture process only not-yet-captured
+    changes, so changes are neither lost nor duplicated). `read`/`fs_write`/`in_process`/`network`
+    tools do not occupy the process slot.
   - `/tmp` and `/var/tmp` are **per-session private temporary roots** (`tools.sandbox.tmpfs_roots`):
     by default (`tmp_private_base="host"`) a hidden temporary subdirectory is created under the host
     root (e.g. `/tmp/.cache-<tag>/<session>`, mode 1777) and **namespace-bound back onto that root** —
@@ -578,10 +591,13 @@ detection) and `risk.classify` (security level), so `pip install`, `sudo modprob
     candidate; it is recorded separately as `view_files` to sync the staging view and supersede the
     path's pending candidate — otherwise the next materialization would overwrite the command result
     with the stale staged content, i.e. a "command write rolled back".
-  - **Materialize type conflicts error out**: when a staged file's target is a directory on the real
-    disk/overlay (or vice versa), materialization would corrupt view consistency, so
+  - **Materialize type conflicts error out**: when a staged file's target is a **real directory** on the
+    real disk/overlay (or vice versa), materialization would corrupt view consistency, so
     `SANDBOX_MATERIALIZE_TYPE_CONFLICT` is returned and execution is refused (`run_command`, tool
     subprocesses, long-lived services and the LSP overlay alike) instead of being skipped silently.
+    The check uses `lstat` to inspect the path's own type: a symlink pointing to a directory (e.g. a
+    venv's `lib64 -> lib`) is not a directory, can be safely unlinked and recreated, and is not a false
+    conflict.
   - **File permissions are preserved**: candidates record the file mode and re-apply it when
     materializing into the overlay and when CAS-publishing (`write_file_atomic`'s `mkstemp` defaults to
     0600 and would strip the executable bit, breaking `venv/bin` scripts); new files use the ordinary
@@ -642,40 +658,60 @@ detection) and `risk.classify` (security level), so `pip install`, `sudo modprob
   staging layer (`_rehydrate_pending`), so read tools see the same view as the review queue after a
   reload/reopen.
 
-### Long-lived services (`service_*`, background processes)
+### Session-resident sandbox instance (`resident`, background processes)
 
-- **Background**: every one-shot command runs in its own pid namespace + cgroup, and on completion
-  `cgroup.release` → `cgroup.kill` terminates the whole process tree. Background processes that are
-  **not promoted** therefore do not survive across tool calls.
-- **Automatic promotion of background commands**: a `run_command` that ends with a **terminal `&`**
-  or starts with `nohup`/`setsid` is automatically promoted by the gate into a long-lived service
-  (`sandbox/background.lua` parses conservatively, excluding `&&`, `2>&1`, quoted `&`, and a
-  mid-command `&`), so it **survives across tool calls**. The result returns the service name for
-  `service_logs` / `service_status` / `service_stop` (event `SANDBOX_BACKGROUND_ROUTED`). If the
-  service is unavailable or fails to start, it falls back to one-shot execution. For a persistent
-  process you want to name/manage explicitly (dev server / watch / daemon) use `service_start` /
-  `service_logs` / `service_status` / `service_stop`.
-- **Isolation**: each service builds its own overlay attempt (own upper/work, not competing with the
-  shared session staging used by `run_command`) and its own cgroup. The gate still runs
-  policy/script-scan/hard-deny prechecks (the `long_lived` branch in `wrapper`) but skips the
-  one-shot process capture/freeze flow. Services run concurrently with other commands (they do not
-  occupy the `effect="process"` FIFO).
-- **Boundary sync**: at start the workspace staging is materialized into the service overlay (a
-  **one-way snapshot**, so the service sees the AI's unpublished edits); at stop the service overlay
-  changes are captured → frozen as candidates → merged back into workspace staging and queued for
-  async review (reusing `wrapper.settle_exec_candidate`). A service and `run_command` are **not
-  live-shared**, only synchronized at start/stop.
-- **Graceful stop**: `service_stop` / `stop_all` first send SIGTERM to the service **payload**
-  processes (`cgroup.term` skips the bwrap monitor — signalling bwrap immediately tears down the
-  namespace, so the payload never gets to run its trap), waiting `stop_timeout_ms` for a graceful
-  exit; only if it is still alive is `cgroup.kill` (SIGKILL) applied to the whole process tree.
-  Changes are captured after the process is confirmed exited (so writes are flushed). `stop_all`'s
-  grace window is `min(stop_timeout_ms, caller timeout_ms)`.
-- **Lifecycle**: `sandbox.shutdown()` (`:qall` / hot reload / plugin unload) and `sandbox.reset()`
-  stop all services (gracefully) and capture their changes; service logs are an in-session ring
-  buffer (`service.max_log_bytes`), redacted via `conceal` on read.
-- **Config**: `tools.sandbox.service = { enabled, max_services, max_log_bytes, stop_timeout_ms,
-  auto_background }`.
+- **Background**: with the resident instance off (`resident.enabled=false`), every one-shot command
+  runs in its own pid namespace + cgroup, and on completion `cgroup.release` → `cgroup.kill`
+  terminates the whole process tree; background processes do not survive across tool calls.
+- **Resident instance**: with `tools.sandbox.resident.enabled=true` (default), `run_command` process
+  commands in a sandbox session share one **long-lived bwrap instance** that runs a **command server**
+  (bash reading requests from stdin) inside one persistent mount+pid+net+ipc+uts+cgroup namespace.
+  Commands execute inside the server, so `&`/nohup/setsid background processes **survive across tool
+  calls** and `ps`/`kill` see them within the session — close to normal bash (`sandbox/resident.lua`).
+- **Concurrent execution**: the command server **multiplexes by request id** — each command runs
+  independently under `setsid` in the background with output written to its own file, and on
+  completion emits a `BEGIN/content/END` block atomically under `flock`; the client demultiplexes by
+  id, so multiple commands in one instance **truly run in parallel** with non-interleaved output.
+  Timeouts/cancellation are terminated inside the namespace by the server (per command process group;
+  the host cannot `kill` a sandbox pid), and a terminated command still returns the partial output
+  produced before termination. The setup/capture phases remain serialized (see "Process commands run
+  in parallel").
+- **Why a command server instead of nsenter**: bwrap's root view is applied by `chroot`/`pivot_root`
+  on the **process** (`fs_struct`), not the mount namespace; an external `nsenter -m` only enters the
+  mount table and cannot get that root, so exec fails with `No such file or directory`. The server
+  executes commands **inside** the namespace and naturally has the correct root view.
+- **Dedicated overlay**: the resident instance uses its own overlay base (`<proc_dir>/resident`), so it
+  never competes with the one-shot process uppers (`<proc_dir>/<enc_root>`) — the same upper cannot be
+  mounted twice. They sync through the candidate staging layer. The first start materializes workspace
+  staging **before** mounting (host-side writes are safe); later AI edits are written back **inside the
+  namespace** by `resident.materialize()` (writes go through the overlay mount, avoiding overlayfs'
+  "host-side upper changes while mounted are undefined"). After a command the gate captures changes by
+  **reading** the upper host-side.
+- **Resource domain**: session-level cgroup; commands are children of the server (already in the
+  domain) and inherit it. Timeout/cancel kills only the current command's process group (`setsid`),
+  not the resident instance or other background processes.
+- **Fallback**: overlay unavailable, nested userns (T2) tier, privilege-tier escalation, or
+  startup/health-check failure automatically falls back to the one-shot process path (no silent
+  failure). Privilege tiers cannot be changed in place, so a tier escalation rebuilds the resident
+  instance (its background processes are terminated).
+- **Lifecycle**: `sandbox.shutdown()` (`:qall` / hot reload / plugin unload), session rotation
+  (agentEnd) and `sandbox.reset()` stop the resident instance (terminating everything in its namespace).
+- **Config**: `tools.sandbox.resident = { enabled }` (default `true`).
+
+### Internal long-lived services (`sandbox.service`, no AI tools)
+
+- **Invisible to the AI**: `service_start`/`service_logs`/`service_status`/`service_stop` are no longer
+  registered as tools. Background processes are carried by the resident instance above; the AI manages
+  them with plain shell commands (`ps`/`kill`/redirect logs).
+- **Internal reuse**: `sandbox/service.lua` is kept as an internal capability for the systemctl facade
+  (`sandbox/systemd`) to start/stop unit processes in-sandbox (own overlay + resource domain; changes
+  captured as candidates on stop).
+- **Isolation / boundary sync / graceful stop**: as before — own overlay attempt, one-way staging
+  materialization at start, capture-and-merge into staging at stop with async review (reusing
+  `wrapper.settle_exec_candidate`); `cgroup.term` graceful stop then `cgroup.kill` as the fallback.
+- **Config**: `tools.sandbox.service = { enabled, max_services, max_log_bytes, stop_timeout_ms }`.
+  `auto_background` and the `SANDBOX_BACKGROUND_ROUTED` event are retained as constants but no longer
+  emitted (the old background facade was removed).
 
 ### systemctl facade (`tools.sandbox.systemd`, option A)
 
@@ -692,8 +728,11 @@ called and the host is never modified**.
   inside scripts are not intercepted). The gate calls `wrapper._maybe_systemd` in the
   `effect="process"` branch, next to `container.plan`.
 - **Support matrix**:
-  - Verbs: `start`/`stop`/`restart`/`status`/`is-active`/`is-enabled`/`show`/`cat`/
-    `daemon-reload`/`list-units`/`list-unit-files`.
+  - Verbs: `start`/`stop`/`restart`/`status`/`is-active`/`is-enabled`/`is-system-running`/
+    `is-failed`/`show`/`cat`/`daemon-reload`/`list-units`/`list-unit-files`; unit-less `status`
+    synthesizes a system overview (`State: running`), `is-system-running` always returns `running`,
+    `is-failed` always returns `active` (no failed units in the sandbox), so environment probes do
+    not reveal a "non-systemd environment".
   - Types: `Type=simple` (default)/`exec` as long-lived services; `oneshot` runs to completion.
   - Dependencies: `Requires`/`Wants` pulled recursively, `After`/`Before` topologically ordered
     (bounded by `max_deps`).
@@ -709,10 +748,59 @@ called and the host is never modified**.
   T2/hostop proposal path (host replay after approval).
 - **Audit**: a facade hit records a `kind="privilege"` evidence entry and emits
   `SANDBOX_SYSTEMD_ROUTED`; output is redacted via `conceal` (no sandbox fingerprints).
-- **Config**: `tools.sandbox.systemd = { enabled, mode="facade", max_deps, unit_roots }`.
-- **Known limits**: `enable`/`disable` neither modify the host nor enter the review queue (the
-  candidate layer cannot yet represent symlinks); template/instance units (`foo@bar.service`) are
-  unsupported.
+- **Environment appearance (indistinguishable)**: when the facade is enabled (`systemd.enabled`,
+  default), the process sandbox additionally creates the `sd_booted()` marker
+  `/run/systemd/system` and disguises PID1 as `systemd` (overriding
+  `/proc/1/comm|cmdline|stat|status`), so probes such as `cat /proc/1/comm` and
+  `ps -p 1 -o comm=` cannot tell the sandbox apart from a real systemd host. The disguise only
+  applies under PID-namespace isolation (`--as-pid-1`, PID1 is the payload); in `no_pid_ns`
+  scenarios (LSP) PID1 is the host init and is not disguised. When the facade is disabled, no
+  marker is created and PID1 is not disguised (`/run/systemd` stays masked). Limits: D-Bus / the
+  real systemd control channel remain unavailable, and deep probes (`systemd-analyze`, `sd_bus`)
+  may still detect it.
+- **Config**: `tools.sandbox.systemd = { enabled, mode="facade", max_deps, unit_roots, stage_install }`.
+- **enable/disable symlink staging**: with `stage_install` (on by default), system-level
+  `systemctl enable/disable` is no longer rejected: the facade parses the unit's `[Install]
+  WantedBy/RequiredBy` and stages the symlink changes (enable creates
+  `/etc/systemd/system/<target>.wants/<unit>`, disable removes it) as review candidates via
+  `candidate.stage_link` / `stage_delete`, applied after approval; nothing lands on the host.
+  User-level `systemctl --user enable/disable` is executed by the nested real systemd and its
+  symlinks are likewise captured as candidates (see "Nested real systemd --user").
+- **Known limits**: template/instance units (`foo@bar.service`) are unsupported; `[Install] Also=` is
+  not expanded yet.
+
+### Nested real systemd --user (`tools.sandbox.systemd.user`)
+
+**Background**: the facade simulates systemd with in-sandbox long-lived services and has limited
+fidelity. When enabled, the session-resident sandbox instance starts a **real `systemd --user`**
+instance, so the AI's `systemctl --user ...` hits real systemd semantics
+(`daemon-reload`/`start`/`stop`/`status`/`list-units`/`is-active` …), and no change lands on the host.
+
+- **Boot**: before entering its read loop, the resident command server runs an idempotent boot snippet:
+  `mkdir /run/systemd/system` (satisfies `sd_booted()`), a private `XDG_RUNTIME_DIR=/run/neoai-user`
+  (mode 0700), a private session `dbus-daemon`, then `systemd --user`, waiting for
+  `$XDG_RUNTIME_DIR/systemd/private`. `XDG_RUNTIME_DIR`/`DBUS_SESSION_BUS_ADDRESS` are injected into
+  the resident instance so later commands inherit them.
+- **Delegated cgroup**: `cgroup.prepare_delegated` creates a **process-free** child domain under the
+  shared `neoai` parent and delegates controllers; the sandbox binds it writable at `/sys/fs/cgroup`.
+  systemd can only create/move cgroups inside that subtree (`<base>/neoai/neoai_deleg_sd_<session>`),
+  never touching other host cgroups; on release it `cgroup.kill`s and recursively removes it. This is
+  systemd's standard delegation model, avoiding "host cgroup fully writable".
+- **Staging & isolation**: unit files live in `$HOME/.config/systemd/user` (workspace overlay) and are
+  frozen as candidates per call; runtime state is in the private tmpfs; service processes run in the
+  sandbox namespace. Host `/root/.config/systemd/user` and host cgroups are untouched.
+- **enable/disable symlink staging**: `systemctl --user enable/disable` is executed by the real user
+  manager; the `.wants/*.service` symlinks it creates in the overlay are captured as **symlink
+  candidates** (candidate file entries gained a `link` field) and enter review together with the unit
+  file. On approval, publishing creates the real symlink via the writer's `symlink` action (CAS
+  validates the baseline with `lstat`/`readlink`). `disable` removing a symlink becomes a delete
+  candidate.
+- **Facade cooperation**: `systemd.parse_command` marks `--user` as `route="native"` and does not
+  intercept it; `privilege.classify` treats `systemctl --user`/`journalctl --user` as minimal (T0).
+  If `resident` and `systemd.user` are not both enabled, the facade returns a clear message (no silent
+  failure).
+- **Config**: `tools.sandbox.systemd.user = { enabled }` (off by default; requires
+  `tools.sandbox.resident.enabled`).
 
 ### 137 / OOM attribution and diagnostics (`tools.sandbox.diagnostics`)
 
@@ -843,8 +931,8 @@ called and the host is never modified**.
 
 Namespace isolation alone is not enough to stop escape when a root payload keeps all
 capabilities and can reach host sockets. `runtime` therefore applies the following
-defense-in-depth to the bwrap prefix by default (capabilities stay full for compatibility, while
-host-global capabilities are narrowed via `cap_drop`):
+defense-in-depth to the bwrap prefix by default (`--cap-drop ALL` plus the tier baseline
+`CAP_DAC_OVERRIDE`, while host-global capabilities are narrowed via `cap_drop`):
 
 - **Close inherited fds (anti-chroot-escape)**: before starting the payload, all inherited fds
   except 0/1/2 are closed. Otherwise a **directory fd** held by a host process (e.g. the AppImage
@@ -853,12 +941,15 @@ host-global capabilities are narrowed via `cap_drop`):
   prefers `bash` (supports multi-digit fds), falls back to `python3`'s `os.closerange`, then to
   `sh` (dash only supports single-digit fds — best effort). `run_command`, `runtime.run` and the
   LSP namespace overlay all go through this wrapper.
-- **Least privilege by default + narrow per-command add-back + host-global capability narrowing
-  (`cap_drop`)**: by default `cap_add = {}` (`--cap-drop ALL` is applied); the needed capabilities
-  are added back **narrowly per command** — package-install commands (including chained ones like
-  `apt-get install …; echo; tail`) via `packages.cap_add`, system-administration commands
-  (`useradd`/`chown`/`passwd`, …; `req.sysadmin`) via `privilege.sysadmin.cap_add`, which also
-  lifts account-DB masking; ordinary commands get nothing. At the same time, the capabilities that
+- **Least privilege + tier baseline + narrow per-command add-back + host-global capability
+  narrowing (`cap_drop`)**: by default `--cap-drop ALL` plus the tier baseline
+  `CAP_DAC_OVERRIDE` (T0/T1 `tiers[n].cap_add`), so a root payload can bypass DAC to reach
+  0700 directories owned by other uids (e.g. `_apt`'s `/var/cache/apt/archives/partial`). The
+  needed capabilities are added back **narrowly per command** — package-install commands
+  (including chained ones like `apt-get install …; echo; tail`) via `packages.cap_add`,
+  system-administration commands (`useradd`/`chown`/`passwd`, …; `req.sysadmin`) via
+  `privilege.sysadmin.cap_add`, which also lifts account-DB masking; ordinary commands keep only
+  the baseline. At the same time, the capabilities that
   can **modify host-global state** are dropped one by one per `cap_drop` (default
   `CAP_NET_ADMIN`/`CAP_SYS_TIME`/`CAP_SYS_MODULE`/`CAP_SYS_RAWIO`/`CAP_SYS_BOOT`/
   `CAP_MAC_ADMIN`/`CAP_MAC_OVERRIDE`/`CAP_AUDIT_CONTROL`), so netlink route/firewall changes,
@@ -1030,16 +1121,16 @@ host-global capabilities are narrowed via `cap_drop`):
 
 > **Residual risk (user namespace)**: when NeoAI runs as root, `bwrap` can only map the
 > caller's uid 1:1 (`uid_map 0 0`); it cannot truly remap uids from inside the plugin, and
-> `conceal` deliberately avoids creating a userns under root to hide fingerprints. With full
-> capabilities by default, the payload is host root inside the namespace: **filesystem
-> modification** is closed by namespaces + whole-root overlay staging + masking +
-> approval, and **host-global state modification** is closed by `cap_drop` (network/clock/
+> `conceal` deliberately avoids creating a userns under root to hide fingerprints. With the
+> default root payload (plus the tier baseline `CAP_DAC_OVERRIDE`), the payload is host root inside
+> the namespace: **filesystem modification** is closed by namespaces + whole-root overlay staging +
+> masking + approval, and **host-global state modification** is closed by `cap_drop` (network/clock/
 > modules/raw I/O/boot/MAC/audit) plus seccomp (device nodes, clock, port I/O,
 > mount/unshare/bpf/… barriers); `CAP_DAC_OVERRIDE` can still **read** 0600 files outside the
-> mask list (information disclosure, not modification). Set `cap_add = {}` to narrow further to
-> minimal privileges. **The complete fix is to enable `userns-remap` / rootless at the container
-> runtime layer** so container root maps to a high host uid — a deployment-side setting,
-> outside this plugin.
+> mask list (information disclosure, not modification). Set `cap_add = {}` together with tier
+> `tiers[n].cap_add = {}` to narrow further to minimal privileges. **The complete fix is to enable
+> `userns-remap` / rootless at the container runtime layer** so container root maps to a high host
+> uid — a deployment-side setting, outside this plugin.
 
 ### 6.1 Host-local access interception (`tools.sandbox.network.host_local_block`, on by default)
 
@@ -1106,7 +1197,7 @@ require("NeoAI").setup({
       backend = "auto",              -- auto | bwrap | unshare
       offline = false,               -- network allowed by default (recorded only)
       require_seccomp = true,        -- reject external execution when seccomp is unavailable (default on, fail-closed)
-      cap_add = { "ALL" },           -- full root capabilities by default (namespaces/read-only/overlay/seccomp keep the host unmodified); {} = minimal
+      cap_add = {},                  -- global extra capabilities (default empty); tier baseline adds CAP_DAC_OVERRIDE, package installs add more on demand
       cap_drop = {                   -- host-global capability narrowing (dropped even when cap_add contains ALL)
         "CAP_NET_ADMIN", "CAP_SYS_TIME", "CAP_SYS_MODULE", "CAP_SYS_RAWIO",
         "CAP_SYS_BOOT", "CAP_MAC_ADMIN", "CAP_MAC_OVERRIDE", "CAP_AUDIT_CONTROL",
@@ -1511,9 +1602,11 @@ ordinary text is byte-identical to before.
 
 > **Chat highlights the command that obtained/used a secret**: when rendering a tool block, its
 > **arguments** and **result** (model context) are scanned; on a sandbox token (`NEOKEY_*`) or a raw
-> secret matched by a **named rule**, a **separate warning line** (highlighted with
-> `NeoAISecretWarning`, red bold underline) is appended **outside** the tool fold block. The warning
-> **clearly distinguishes the two cases**: `⚠ 密钥：<tool> 获取了密钥（…）` (obtained — the result or
+> secret matched by a **named rule**, a **warning** (highlighted with
+> `NeoAISecretWarning`, red bold underline) is appended **outside** the tool fold block, formatted
+> **one item per line** (no comma-joined lists): first line `⚠ 密钥：<tool> <obtained/used>`, the
+> command on its own line, then the matched key files / types / env vars each on its own line. The
+> warning **clearly distinguishes the two cases**: `⚠ 密钥：<tool> 获取了密钥（…）` (obtained — the result or
 > kernel observation read secret **content**, i.e. a token or a named-rule credential; a result that
 > merely mentions a **sensitive env-var name**, e.g. `read_file` reading
 > `DASHSCOPE_API_KEY = os.getenv(...)`, does **not** count as "obtained" and does **not** warn — the
@@ -1572,9 +1665,11 @@ ordinary text is byte-identical to before.
 > **Async process post-processing** (`tools.sandbox.postprocess="async"`, default): as soon as the
 > command process exits the result is returned to the main loop immediately; overlay capture,
 > candidate freeze, staging merge, persistence and settlement complete on a background chain. The
-> process-command FIFO slot is held until the background chain finishes so the next process command
-> sees consistent session staging; subsequent non-process (read/write) tools also wait for in-flight
-> post-processing before running (so they never read staging that has not been merged yet).
+> capture/settle slot (`_serialize_capture`) is held until the background chain finishes so staging
+> merges stay ordered; subsequent non-process (read/write) tools also wait for in-flight
+> post-processing before running (so they never read staging that has not been merged yet). With
+> concurrent process commands the setup phase is serialized (`_serialize_setup`) while **command
+> execution is concurrent** (resident multiplexing), see "Process commands run in parallel".
 > `sandbox.await_postprocess()` waits for the in-flight chain before shutdown/reset, so freeze and
 > review enqueue are not lost. On exit/close the wait is bounded by
 > `tools.sandbox.shutdown_timeout_ms` (default 3s), so `:qall` / hot reload are never blocked for a
@@ -1787,8 +1882,8 @@ per tier. Core modules: `sandbox/privilege.lua` (classify/resolve/record) and
 
 | Tier | Name | Use | Isolation | Review |
 |---|---|---|---|---|
-| **T0** | minimal | normal commands | least privilege (default `cap_add={}` → `--cap-drop ALL`), added back **narrowly** per command (package installs via `packages.cap_add`, system administration via `privilege.sysadmin.cap_add`) + host-global capability narrowing (`cap_drop`: network/clock/modules/raw I/O/boot/MAC/audit) + seccomp (incl. device-node barrier) + masks + **network allowed by default (host-local intercepted via host_proxy, see §6.1)** | no per-command review; fs changes enter the pending queue |
-| **T1** | elevated | network access, controlled docker, package installs, system administration | runs isolated, network allowed; when `cap_add` is narrowed, commands containing a package manager (`req.package`, incl. chained) get narrow caps via `packages.cap_add`; system-administration commands (`useradd`/`chown`/`passwd`, …; `req.sysadmin`) get narrow caps via `privilege.sysadmin.cap_add` and lift account-DB masking; docker.sock is unmasked only for docker commands | auto-authorized, recorded; fs changes enter the pending queue |
+| **T0** | minimal | normal commands | `--cap-drop ALL` + tier baseline `CAP_DAC_OVERRIDE`, added back **narrowly** per command (package installs via `packages.cap_add`, system administration via `privilege.sysadmin.cap_add`) + host-global capability narrowing (`cap_drop`: network/clock/modules/raw I/O/boot/MAC/audit) + seccomp (incl. device-node barrier) + masks + **network allowed by default (host-local intercepted via host_proxy, see §6.1)** | no per-command review; fs changes enter the pending queue |
+| **T1** | elevated | network access, controlled docker, package installs, system administration | runs isolated, network allowed; tier baseline `CAP_DAC_OVERRIDE`; commands containing a package manager (`req.package`, incl. chained) get narrow caps via `packages.cap_add`; system-administration commands (`useradd`/`chown`/`passwd`, …; `req.sysadmin`) get narrow caps via `privilege.sysadmin.cap_add` and lift account-DB masking; docker.sock is unmasked only for docker commands | auto-authorized, recorded; fs changes enter the pending queue |
 | **T2** | privileged | cap_add, host sockets, host mounts | runs inside a **nested userns** with full capabilities (caps scoped to the userns, cannot reach the host; the seccomp baseline still applies) | host effects frozen as a **proposal**, replayed after async approval |
 
 - Classification: `privilege.classify()` parses the command; `docker/podman`→T1,
@@ -1919,6 +2014,15 @@ escalated write (TOCTOU).
 (T0→T1→T2 up to `privilege.max_tier`) and re-run in isolation; each step writes a `privilege`
 evidence record, emits `SANDBOX_PRIVILEGE_ESCALATION_REQUESTED` and `audit.observe`s it — never
 silently.
+
+**Explicit root request when root is missing**: when the payload is **non-root** (NeoAI started as a
+non-root user, or `tools.sandbox.run_as.uid != 0`) and a command fails on a permission error (result
+matches `PERMISSION_DENIED`), besides auto-escalation an explicit **`ROOT_REQUIRED` host-op
+proposal** is frozen (`hostop`, entering the `:NeoAISandboxReview` pending queue + statusline badge);
+after the user approves, the command is replayed on the host with root/`sudo` (inheriting the tty).
+It never fails silently and never escalates silently; when root is available (`run_as.uid = 0`) no
+such request is generated (to avoid false positives). Package installs are excluded (`hostop`
+refuses package installs — never install on the host).
 
 ## 18. Security grading, controlled containers and behavior audit
 
@@ -2073,3 +2177,37 @@ freeze time to avoid whole-unit publish conflicts.
   `SANDBOX_AUDIT_ANOMALY` / `SANDBOX_CONTAINER_PLANNED` / `SANDBOX_CONTAINER_UNSUPPORTED` /
   `SANDBOX_SYSTEMD_ROUTED` / `SANDBOX_SYSTEMD_UNSUPPORTED` / `SANDBOX_SENSITIVE_REDACTED`.
 - Tests: `lua/NeoAI/tests/test_sandbox_governance.lua`.
+
+### 18.8 Common sandbox limitations and workarounds
+
+- **`/run` is writable** (default): `/run` (and `/var/run`) is a per-session private writable root
+  (`tmpfs_roots`), so dpkg postinst can create the `adduser` lock file (`/run/adduser`) and
+  `/var/run/postgresql`; sensitive host `/run` entries (dbus/sshd/docker.sock, ...) stay masked by
+  `mask_paths`.
+- **dpkg installs**: `dpkg`/`dpkg-deb`/`update-alternatives`/`ldconfig`/`debconf` are classified as
+  package installs, regaining `packages.cap_add` (incl. `CAP_CHOWN`) and unmasking the account DB via
+  `packages.unmask`, so postinst `adduser`/`chown`/`su - <svc>` work (writes still go to the overlay
+  staging and require approval to publish).
+- **`/var/cache/apt` and other foreign-owner dirs**: the payload runs as root and the T0/T1 baseline
+  includes `CAP_DAC_OVERRIDE`, so it can bypass DAC to reach 0700 directories owned by other uids
+  (e.g. `_apt`'s `/var/cache/apt/archives/partial`); without that capability ordinary commands get
+  `Permission denied` (package-install commands also get `packages.cap_add` and are unaffected). For
+  stricter least privilege, remove it in `tools.sandbox.privilege.tiers[n].cap_add` (and accept the
+  resulting limits).
+- **Overlay lower `chown`**: even with `CAP_CHOWN`, overlayfs may return `EPERM` for `chown` on a
+  **merged directory** on some kernels (copy-up needed). This is a kernel limitation; postinst
+  scripts usually tolerate it (`|| true`).
+- **`git clone`/`git init`**: allowed (they create a new repository; `.git` is captured atomically by
+  `git_path_class`); `commit/checkout/fetch/pull/push/add/reset/...` remain blocked and must use the
+  dedicated git tools.
+- **Localhost port allowlist**: all host-local targets are blocked by default; to self-test a service
+  started inside the sandbox set `tools.sandbox.network.allow_localhost_ports = { 5432, 6379 }`
+  (only **loopback + listed ports**; host NIC IPs / link-local / cloud metadata are never allowed).
+- **`grpcurl` etc. not in distro repos**: not a sandbox limitation; install via the language ecosystem
+  (e.g. `go install github.com/fullstorydev/grpcurl/cmd/grpcurl@latest`, via the Go proxy).
+- **`SANDBOX_STAGING_UNCOVERED`**: when unpublished staged changes exist but the command has no
+  writable overlay layer, execution is rejected by default; apply/discard the staged changes first, or
+  set `tools.sandbox.staging_uncovered = "warn"` to run degraded (with a notice).
+- **Locating fixed overhead**: with `tools.sandbox.diagnostics.enabled = true`, logs record
+  `[sandbox-profile] gate:<tool>` end-to-end time and `settle` (risk grading/enqueue/publish) time, to
+  tell slow execution from slow freeze/settle.

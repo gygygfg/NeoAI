@@ -226,7 +226,7 @@ sandbox = {
   offline = false,                 -- 网络默认放行（仅记录，不拦截）；true 时硬拒绝网络并隔离进程网络
   require_seccomp = true,          -- 缺少 seccomp 能力时是否拒绝外部执行（默认开，fail-closed）
   seccomp = { enabled = true, filter_path = "" }, -- seccomp 基线（内置 denylist；默认开；仅 bwrap）
-  cap_add = {},                    -- 默认最小权限（`--cap-drop ALL`）；按命令窄范围加回（包安装经 packages.cap_add）。仅调试时才设 { "ALL" }
+  cap_add = {},                    -- 全局额外 capability（默认空）；档位基线另加回 CAP_DAC_OVERRIDE（见 privilege.tiers），包安装/系统管理再按需加回。仅调试时才设 { "ALL" }
   -- 载荷运行身份：默认以 root 运行（uid=0），使 AI 能在沙箱内使用宿主工具链（/root 下的
   --   nvm/cargo/go 等 0700 目录非 root 不可遍历）与包管理（dpkg 硬检查 euid==0）。所有写入仍
   --   全部进入 overlay 暂存并冻结为候选，真实磁盘不受影响；隔离由命名空间 + 整机根 overlay +
@@ -237,6 +237,8 @@ sandbox = {
   --   * root 启动 NeoAI：uid=0 为默认（不降权）；设为专用非 root uid（如 nobody 65534）可加固，
   --     插件先用 `setpriv` 把载荷降为该 uid，配置的窄能力以 ambient 形式保留。此时 /root 不可
   --     遍历，工作区/`workspace_root` 须放在可被其遍历的位置（勿放 0700 的 /root 下）。
+  --   载荷非 root（非 root 启动或 uid!=0）且命令因权限不足失败时，会显式冻结 ROOT_REQUIRED
+  --     主机操作提案（审批后以 root/sudo 在宿主 replay），不静默失败/提权（见 sandbox.md §17）。
   run_as = { uid = 0, gid = 0 },
   cap_drop = {                     -- 主机全局能力收敛：即便 cap_add 含 ALL 也逐项丢弃（网络栈/时钟/内核模块/裸 I/O/重启/MAC/审计）
     "CAP_NET_ADMIN", "CAP_SYS_TIME", "CAP_SYS_MODULE", "CAP_SYS_RAWIO",
@@ -275,7 +277,7 @@ sandbox = {
   expose_tool_paths = false,       -- 自动直通宿主 PATH 中的工具目录（opt-in）：把宿主 PATH 里存在且非凭据/系统目录的 bin 目录只读暴露并前置到沙箱 PATH，使 node/npm/fd/go 等装在 $HOME 下的工具链可用（会扩大读取面）
   appimage_extract_and_run = true, -- AppImage 支持（默认开）：沙箱内运行 AppImage 时注入 APPIMAGE_EXTRACT_AND_RUN=1，解包到会话私有 /tmp 运行（沙箱按设计拦截 mount/不暴露 /dev/fuse，无法 FUSE 挂载）；非 AppImage 程序忽略该变量。false 关闭
   resolv_conf = "sanitize",        -- /etc/resolv.conf：sanitize（默认，仅 nameserver）| hide | passthrough
-  tmpfs_roots = { "/tmp", "/var/tmp" }, -- 每会话私有临时根（不作为 overlay lower；退出即销毁）
+  tmpfs_roots = { "/tmp", "/var/tmp", "/run" }, -- 每会话私有临时根（不作为 overlay lower；退出即销毁）。/run（含 /var/run）默认纳入，使 dpkg postinst 的 adduser 锁文件、/var/run/postgresql 可写；宿主 /run 敏感项仍由 mask_paths 遮蔽
   ephemeral_roots = { "/tmp", "/var/tmp" }, -- 临时候选根（cwd 子树除外）：这些根下的文件写入为会话私有、nvim 退出即丢弃，不产生待审候选/不发布/不弹审批悬浮窗；`{}` 关闭
   tmp_private_base = "host",       -- 临时根私有目录位置：host（默认，宿主根下隐藏子目录 /tmp/.cache-<tag>/<session>，命名空间映射回该根，隔离 AI）| session（旧行为：建在会话进程目录）
   hide_proc_paths = { "/proc/cmdline", "/proc/version" }, -- 以空文件覆盖，隐藏宿主内核命令行/版本（危险全局 sysctl 为常驻强制遮蔽，只增不减）
@@ -314,23 +316,33 @@ sandbox = {
     prewarm = true,
     prewarm_ttl_ms = 90000, -- 预热有效期（毫秒）：超时未被复用则回收
   },
+  -- 写日志增量捕获（默认 "auto"）：用 eBPF 观测到的「本轮写入/删除路径」驱动 capture，只处理
+  -- 这些路径，不再全量遍历会话累积的 overlay upper（消除「缓存文件大量、多轮读写卡顿」）。
+  -- 仅在观测可信时生效（eBPF + 命令前就绪 + 已排空 + 全绝对路径 + 日志非空）；否则回退全量遍历。
+  -- 设为 "off" 关闭。注意：事件按 cgroup 归属，背靠背无间隔的命令可能整体漏事件 → 空日志回退。
+  journal_capture = "auto",
   -- 诊断埋点（默认关）：排查 137 / OOM / 资源域终止时开启，仅在 NeoAI 日志记录，
   -- 不改变执行行为、不写入模型可见结果。配合 `:NeoAISandboxDiag` 查看宿主/容器限制与负载。
   diagnostics = {
-    enabled = false,          -- 总开关
+    enabled = false,          -- 总开关（开启后另记录 [sandbox-profile] 分段耗时：gate:<tool> 端到端 + settle 冻结/结算）
     log_kill_caller = false,  -- cgroup.kill 调用方堆栈（定位谁终止了进程树）
     dump_cgroup_events = false, -- 命令结束时 dump 资源域 memory/pids 事件（OOM 归因）
   },
-  -- 长驻服务（service_* 工具）：后台进程跨工具调用存活，直到显式停止 / 会话结束。
-  -- 每个服务使用独立 overlay attempt：启动时物化工作区暂存（单向快照），停止时捕获其改动
-  -- 并合并回工作区暂存（边界同步，非实时互通），经异步审批入队。资源域随服务创建；停止时
-  -- 先向载荷进程发 SIGTERM 等待优雅退出，超时才 cgroup.kill 终止整个进程树。
+  -- 会话级常驻沙箱实例：开启后 run_command 的命令在同一 mount+pid 命名空间内执行，
+  -- 后台进程（&/nohup/setsid）跨工具调用存活（接近普通 bash）。独立 overlay 基目录与会话级
+  -- 资源域；AI 编辑经命名空间内物化写回，命令改动仍按次冻结为候选。overlay 不可用 / T2 档位
+  -- / 启动失败时自动回退一次性进程路径。仅适用于 T0 的 run_command。
+  resident = {
+    enabled = true, -- 会话级常驻沙箱实例（run_command 后台进程跨调用存活）；不适用时自动回退
+  },
+  -- 内部长驻服务（sandbox.service）：不再注册 service_* 工具（AI 不可见），仅由 systemctl
+  -- 门面复用在沙箱内启停单元进程（独立 overlay + 资源域，停止时捕获改动为候选）。
   service = {
-    enabled = true,          -- 是否注册 service_* 工具
+    enabled = true,          -- 内部能力总开关
     max_services = 16,       -- 同时存活的服务数上限
     max_log_bytes = 262144,  -- 单服务日志环形缓冲上限（字节）
     stop_timeout_ms = 5000,  -- 停止时先发 SIGTERM 等待优雅退出的上限（超时 SIGKILL）
-    auto_background = true,  -- run_command 的 &/nohup/setsid 自动转为长驻服务（跨调用存活）
+    auto_background = true,  -- 保留常量（旧后台门面已移除，不再触发）
   },
   -- systemctl 门面（方案 A）：AI 的独立 `systemctl`/`journalctl` 调用被路由到沙箱内长驻
   -- 服务（复用 sandbox.service），不调用宿主 systemd、也不修改宿主机。支持
@@ -344,6 +356,13 @@ sandbox = {
       "/etc/systemd/system", "/run/systemd/system",
       "/usr/lib/systemd/system", "/lib/systemd/system",
     },
+    -- 嵌套真实 systemd --user（需同时开启 resident）：常驻沙箱实例内启动真实 user manager，
+    -- `systemctl --user` 命中真实语义；单元文件落工作区 overlay 暂存、cgroup 仅限委派子树，
+    -- 所有修改不落宿主机。默认关闭。
+    user = { enabled = false },
+    -- 系统级 systemctl enable/disable：解析 [Install] WantedBy/RequiredBy，把软链变更暂存为
+    -- 待审候选，审批后应用；不落宿主机。默认开启。
+    stage_install = true,
   },
   network = {
     enabled = false, allowed_endpoints = {}, budget_bytes = 0, -- 受控网络网关
@@ -352,6 +371,7 @@ sandbox = {
     -- 应用层边界：不认代理的裸 TCP 可绕过（详见 docs/sandbox.md §6.1）。
     host_local_block = true,
     host_local_proxy_port = 0,       -- 宿主过滤代理端口（0 = 自动分配 loopback 随机端口）
+    allow_localhost_ports = {},      -- 本机端口白名单（默认空=全拦）：仅放行「回环地址 + 这些端口」的本机访问（如沙箱内服务自测 5432/6379）；宿主网卡 IP/链路本地/云元数据永不放行
     -- 沙箱外部命令代理策略：strip（默认，不把宿主代理传入沙箱，如 mihomo 只代理 opencode 自身，
     -- 避免宿主 HTTPS_PROXY=127.0.0.1:7890 在沙箱内不可达导致 pip/npm 失败）| passthrough（沿用宿主）|
     -- table { http, https, all, no_proxy }（显式设置；未列出的代理变量清除）。
@@ -367,13 +387,13 @@ sandbox = {
     --   maven → 生成 settings.xml（镜像全部仓库）经 MAVEN_OPTS -s 指向
     mirrors = { pip = "", npm = "", maven = "" },
   },
-  -- 权限档位与自动提权：命令默认 T0 最小权限（非 root 载荷、cap-drop ALL、网络默认放行并拦截本机）。
+  -- 权限档位与自动提权：命令默认 T0 最小权限（cap-drop ALL + 基线 CAP_DAC_OVERRIDE、网络默认放行并拦截本机）。
   -- 权限/网络失败时**全档位**自动升级（T0→T1→T2，直到 max_tier）并在隔离内重跑，每步写证据/事件/审计。
   privilege = {
     enabled = true, auto_escalate = true, max_tier = 2, record = true,
     tiers = {                       -- 各档位的网络/额外 cap/挂载/解除遮蔽/审查严格度
-      [0] = { name = "minimal", review = "auto", network = true, cap_add = {}, mounts = {}, unmask = {} }, -- 默认最小权限：非 root 载荷、cap-drop ALL。默认放行网络（仅记录）；本机访问经 host_proxy 拦截
-      [1] = { name = "elevated", review = "auto", network = true, cap_add = {}, mounts = {}, unmask = {} }, -- docker.sock 仅 docker 命令按需解除遮蔽
+      [0] = { name = "minimal", review = "auto", network = true, cap_add = { "CAP_DAC_OVERRIDE" }, mounts = {}, unmask = {} }, -- 默认最小权限：cap-drop ALL + 基线 CAP_DAC_OVERRIDE（root 载荷访问他人属主 0700 目录，如 _apt 的 apt 缓存）。默认放行网络（仅记录）；本机访问经 host_proxy 拦截
+      [1] = { name = "elevated", review = "auto", network = true, cap_add = { "CAP_DAC_OVERRIDE" }, mounts = {}, unmask = {} }, -- docker.sock 仅 docker 命令按需解除遮蔽
       [2] = { name = "privileged", review = "approve", network = true, userns = true, cap_add = { "ALL" }, mounts = {}, unmask = {} }, -- 嵌套 userns 内完整能力（作用域受限）；seccomp 仍生效
     },
     -- 系统管理命令（useradd/chown/passwd 等）：命中即按需加回窄能力并解除账户库遮蔽，
@@ -410,6 +430,7 @@ sandbox = {
   session_shell = true,            -- run_command 会话内保留 shell 状态（export/cd 跨命令生效；仅 bwrap）
   process_roots = {},              -- 额外可写根（仅 read_all=false 或整机 overlay 不可用时生效；overlay 覆盖，默认仅 cwd 自动补入）。read_all=true（默认）时整机根已是可写 overlay，本项不再需要。/tmp、/var/tmp 属 tmpfs_roots；按需显式加回
   overlay_fail_closed = true,      -- overlay 不可用时拒绝 process 工具（不降级为私有 cwd）；false 才允许降级运行
+  staging_uncovered = "reject",    -- 有未发布暂存但本次命令无 overlay 可写层时："reject"（默认，fail-closed）| "warn"（降级执行并在结果附提示，便于临时绕过偶发失败）
   -- 异步审批：候选进入待审队列，用户确认后应用。session_auto_approve 开启后 L0/L1 自动应用。
   -- l3_warning：高危条目二次确认（AI 生成后果警告 + 自动打开 diff，需再次确认才应用）。
   --   L3（critical）恒触发；package_confirm=true 时 L2 包安装/敏感安装（apt-key、gpg --import、
@@ -452,6 +473,7 @@ sandbox = {
     roots = { "/usr", "/var", "/etc", "~/.cache", "~/.npm", "~/.nvm", "~/.cargo", "~/.rustup", "~/go", "~/.local" }, -- 包安装可写根（overlay 暂存）。/etc 供 dpkg postinst 写 /etc/ld.so.cache 等；敏感条目仍由 mask_paths 遮蔽
     volatile_paths = { "/var/lib/apt/lists", "/var/cache/apt", "/var/cache/dnf", "/var/cache/yum", "/var/cache/pacman/pkg", "/var/cache/apk", "~/.cache/pip", "~/.cache/uv", "~/.npm/_cacache", "~/.cache/yarn", "~/.cargo/registry/cache", "~/.cache/go-build" }, -- 易变包索引/缓存：冻结候选时跳过（不待审、不发布），避免 apt update 后基线变化触发 BASELINE_CHANGED 使整个安装失败；不影响安装效果（dpkg/status、包文件仍应用）；{} 关闭。勿放 /var/lib/dpkg/status 等状态文件
     cap_add = { "CAP_DAC_OVERRIDE", "CAP_CHOWN", "CAP_SETUID", "CAP_SETGID", "CAP_FOWNER" },
+    unmask = { "/etc/passwd", "/etc/group", "/etc/shadow", "/etc/shadow-", "/etc/gshadow", "/etc/gshadow-" }, -- 包安装期间解除账户库遮蔽：dpkg postinst 的 adduser/useradd/su 子进程需读写账户库；写入仍进 overlay 暂存、需审批发布
     apt_sandbox_user = "root", -- apt 系列：注入 APT::Sandbox::User（默认 "root" 关闭 apt 自身的 `_apt` 降权，避免嵌套 userns/受限容器中 setgroups EPERM 使 apt update/install 失败）；"_apt" 或空串保留 apt 默认行为
   },
   lsp_overlay = { enabled = true }, -- AI 专用沙箱 LSP：AI 的 lsp_* 工具克隆的 server 读暂存内容（默认开，仅 bwrap+overlay；不可用时回退编辑器客户端）

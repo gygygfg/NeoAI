@@ -124,7 +124,9 @@ end)
 | `test_sandbox` | 工具沙箱：加载器附加规格、fail-closed、状态机/幂等/fencing、策略聚合与受限规则、dry-run 不落盘、CAS 发布与冲突、buffer 写盘重定向、运行时能力探测与隔离进程、异步审批入队/应用/拒绝、选择性应用、保存/撤销保存（原文件与快照交换、CAS 冲突拒绝）、run_command overlay 候选捕获、影响模型、证据脱敏分页、任务授权自动应用/范围、约束聚合、裁决信封、保留期与指标、受控网络网关、broker 幂等与对账、依赖图闭包、组合发布与路径冲突、策略回放、证据保留期、cgroup 资源域与 PID 上限、seccomp 基线施加与门禁、内容寻址缓存、故障注入（发布/后端/冻结）、性能基准、revision 派生、密钥原始值（工具参数/AI 上下文）终止与 token 操作提级不终止、环境变量名引用/环境变量密钥裸值不登记且不终止、暂存后端默认落盘/可切 shm、磁盘上限门禁 |
 | `test_sandbox_instance` | 沙箱进程实例隔离：实例 store 根互不可见、热重载保留本实例待审、`init` 不阻塞探测运行时能力（懒加载）、过期实例目录回收 |
 | `test_sandbox_service` | 长驻服务/镜像/诊断：service 启动/日志/状态/停止与注册表清理、停止时捕获服务改动回暂存、优雅停止（SIGTERM 优雅退出/超时 SIGKILL/`stop_all`）、`long_lived` 门禁分支、pip/npm/maven 镜像注入（含 settings.xml）、cgroup 事件快照与 OOM 判定 |
-| `test_sandbox_background` | 后台命令门面：`&`/nohup/setsid 识别（排除 `&&`/重定向/中段 `&`）、`run_command` 后台命令自动转长驻服务并可停止、非后台命令保持一次性执行、`auto_background=false` 时回退旧行为 |
+| `test_sandbox_background` | 后台进程/会话级常驻实例：`&`/nohup/setsid 识别（排除 `&&`/重定向/中段 `&`）、开启 `resident` 后 `run_command` 的后台进程跨工具调用存活（同一命名空间内 `ps` 可见）、非后台命令正常返回 |
+| `test_sandbox_systemd_user` | 嵌套真实 `systemd --user`：常驻沙箱内启动真实 user manager、`systemctl --user` 原生执行、用户单元在沙箱内运行且单元文件/运行态不落宿主机；`--user` 解析为 native 路由 |
+| `test_sandbox_symlink` | 符号链接候选：`stage_link` → finish → merge → publish 在真实盘创建软链；`systemctl --user enable` 与系统级门面 `systemctl enable` 的软链被捕获为候选且不落宿主机 |
 | `test_sandbox_systemd` | systemctl 门面（方案 A）：独立调用解析与路由、unit 解析与类型门禁、依赖闭包（Requires/Wants/After、缺失依赖）、start/status/is-active/stop 在沙箱内运行、不支持语义明确拒绝（不落宿主机）、门禁拦截不调用宿主 systemctl |
 
 ### 5.1 沙箱逃逸/信息泄露审计（`scripts/sandbox_audit.lua`）

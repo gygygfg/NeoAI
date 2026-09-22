@@ -503,6 +503,8 @@ local DEFAULT_CONFIG = {
       --   * root 启动 NeoAI：uid=0 表示不降权（默认）；设为专用非 root uid（如 nobody 65534）
       --     可加固——bwrap 仍以 root 完成挂载，仅载荷经 `setpriv` 降权（配置的窄能力以
       --     ambient 形式保留）。注意：非 root 载荷无法遍历 /root，且 dpkg 等会因 euid!=0 失败。
+      -- 载荷非 root（非 root 启动或 uid!=0）时，命令因权限不足失败会**显式冻结 ROOT_REQUIRED
+      -- 主机操作提案**（审批后以 root/sudo 在宿主 replay），不静默失败/提权（见 docs/sandbox.md §17）。
       run_as = {
         uid = 0, -- 默认 0：root 启动时不降权（工具链/包管理可用；写入仍全部暂存）
         gid = 0,
@@ -644,7 +646,11 @@ local DEFAULT_CONFIG = {
       resolv_conf = "sanitize",
       -- 每会话私有临时根：始终以会话私有目录（mode 1777，位于 /dev/shm 等 tmpfs）绑定，
       -- 绝不作为 overlay 的只读 lower 暴露宿主真实内容；退出/轮换会话即销毁，杜绝跨会话残留。
-      tmpfs_roots = { "/tmp", "/var/tmp" },
+      -- `/run`（含 `/var/run` 符号链接）默认纳入：整机 overlay 会先把它只读绑定，此处覆盖为
+      -- 会话私有可写目录，使 dpkg postinst 的 adduser 锁文件（/run/adduser）、
+      -- /var/run/postgresql 等能创建；宿主 /run 的敏感项仍由 mask_paths 遮蔽（dbus/sshd/
+      -- docker.sock 等）。
+      tmpfs_roots = { "/tmp", "/var/tmp", "/run" },
       -- 临时候选根（默认同 tmpfs_roots）：这些根（cwd 子树除外）下的文件写入为**会话私有、
       -- nvim 退出即丢弃**，不进入待审队列、不 CAS 发布、也不弹审批悬浮窗（内容仅在暂存层，
       -- 供本次会话读取一致）。设为 `{}` 可关闭（/tmp 下也走正常待审/审批）。
@@ -684,6 +690,10 @@ local DEFAULT_CONFIG = {
         host_local_block = true,
         -- 宿主过滤代理监听端口（0 = 自动分配 loopback 随机端口）。
         host_local_proxy_port = 0,
+        -- 本机端口白名单（默认空 = 拦截所有本机目标）：仅放行**回环地址 + 这些端口**的
+        -- 本机访问，供沙箱内启动的服务自测（如 DB/Redis：5432/6379）。宿主网卡 IP、链路本地、
+        -- 云元数据（169.254.169.254）永不放行。例：{ 5432, 6379 }。
+        allow_localhost_ports = {},
         -- 国内/受限网络镜像（默认空 = 完全沿用系统配置）。仅对**沙箱外部命令**生效，
         -- 通过环境变量注入（npm 另经 settings 绑定）。用于绕过代理/源站不可达：
         --   pip   = "https://pypi.tuna.tsinghua.edu.cn/simple"（注入 PIP_INDEX_URL + PIP_TRUSTED_HOST）
@@ -725,6 +735,12 @@ local DEFAULT_CONFIG = {
         -- 预热有效期（毫秒）：超时未被下一条进程命令复用则回收（停止探针、释放 cgroup）。
         prewarm_ttl_ms = 90000,
       },
+      -- 写日志增量捕获（默认 "auto"）：利用 eBPF 观测到的「本轮写入/删除路径」，capture 只处理
+      -- 这些路径，不再全量遍历会话累积的 overlay upper（消除「缓存文件大量、多轮读写卡顿」）。
+      -- 仅在观测可信时生效（eBPF + 命令前就绪 + 已排空 + 全绝对路径 + 日志非空）；否则回退全量
+      -- 遍历（正确性优先，绝不静默丢改动）。设为 "off" 关闭该优化。
+      -- 注意：事件按 cgroup 归属，背靠背无间隔的进程命令可能整体漏事件 → 触发「空日志回退」。
+      journal_capture = "auto",
       -- 诊断埋点（默认关，排查 137 / OOM / 资源域终止时开启）。开启后仅在
       -- NeoAI 日志（logger）中记录，不改变执行行为、不写入模型可见结果。
       diagnostics = {
@@ -745,6 +761,16 @@ local DEFAULT_CONFIG = {
         -- （一次性进程随命令结束被 cgroup.kill 回收）。关闭则保持旧行为（后台进程被回收）。
         auto_background = true,
       },
+      -- 会话级常驻沙箱实例：`run_command` 的命令在同一 mount+pid+net+ipc+uts+cgroup 命名空间内
+      -- 执行（命令服务器），后台进程（`&`/nohup/setsid）跨工具调用存活，行为接近普通 bash
+      -- （同一会话内 `ps`/`kill` 可见）。命令服务器按请求 id 多路复用，多条命令**并行**执行且
+      -- 输出不交错；超时/取消由服务器在命名空间内按命令进程组终止。使用独立 overlay 基目录与会话级
+      -- 资源域；AI 编辑经命名空间内物化写回，命令改动仍按次冻结为候选。仅适用于 T0 的
+      -- `run_command` 进程命令；overlay 不可用 / 嵌套 userns（T2）档位 / 启动或健康检查失败时
+      -- 自动回退一次性执行。
+      resident = {
+        enabled = true,
+      },
       -- systemctl 门面（方案 A）：AI 的 `systemctl`/`journalctl` 独立调用被路由到沙箱内
       -- 长驻服务（复用 sandbox.service），不调用宿主 systemd、也不修改宿主机。支持
       -- simple/exec/oneshot 与 Requires/Wants/After/Before 依赖；Type=notify/forking/dbus、
@@ -757,6 +783,16 @@ local DEFAULT_CONFIG = {
           "/etc/systemd/system", "/run/systemd/system",
           "/usr/lib/systemd/system", "/lib/systemd/system",
         },
+        -- 嵌套真实 systemd --user：在会话级常驻沙箱实例内运行 user manager，AI 的
+        -- `systemctl --user` 命中真实 systemd 语义；单元文件/软链落在工作区 overlay 暂存，
+        -- 运行态在私有 XDG_RUNTIME_DIR，cgroup 仅限委派的会话子树——所有修改不落宿主机。
+        -- 需同时开启 tools.sandbox.resident.enabled。默认关闭。
+        user = {
+          enabled = false, -- 是否在沙箱内启动真实 systemd --user
+        },
+        -- 系统级 `systemctl enable/disable`：解析单元 [Install] WantedBy/RequiredBy，
+        -- 把软链变更（enable 建链 / disable 删链）暂存为待审候选，审批后应用；不落宿主机。
+        stage_install = true,
       },
       -- 异步审批（设计文档 §15）：AI 修改立即沙箱执行并冻结候选，      -- 用户异步确认允许哪些文件/配置修改后再 CAS 应用。
       review = {
@@ -848,6 +884,14 @@ local DEFAULT_CONFIG = {
           "CAP_SETUID", "CAP_SETGID", "CAP_SETFCAP", "CAP_FSETID",
           "CAP_SYS_CHROOT", "CAP_KILL",
         },
+        -- 包安装期间按需解除账户库遮蔽：dpkg postinst 常以子进程调用 adduser/useradd/su
+        -- （如 postgresql-common、redis-tools），需要写 /etc/passwd|group|shadow|gshadow
+        -- 与读 /etc/shadow（否则 adduser 无法建用户、`su - <svc>` 认证失败）。写入仍全部进
+        -- overlay 暂存并冻结为候选，真实账户库不受影响（需审批发布）。
+        unmask = {
+          "/etc/passwd", "/etc/group", "/etc/shadow", "/etc/shadow-",
+          "/etc/gshadow", "/etc/gshadow-",
+        },
         -- apt 系列命令的 `APT::Sandbox::User`：apt 在 root 下默认把下载/校验降权到 `_apt`
         -- 用户（setgroups + setuid/setgid）；嵌套 user namespace / 受限容器中 setgroups 返回
         -- EPERM，`apt-get update`/`install` 直接失败（`setgroups failed - Operation not
@@ -929,6 +973,11 @@ local DEFAULT_CONFIG = {
       -- 文件，会把「看不到」误判为「文件不存在/改动未生效」。设为 false 才允许降级运行
       -- （命令在会话私有 cwd 执行，结果会附加降级提示）。
       overlay_fail_closed = true,
+      -- 存在未发布暂存改动、但本次命令无 overlay 可写层时的处理（默认 fail-closed）：
+      --   "reject"（默认）= 拒绝执行（命令会读到真实磁盘、与只读工具的暂存视图分裂）；
+      --   "warn" = 降级执行并在结果里附「未发布暂存改动不可见」提示，便于临时绕过
+      --            （如安装脚本触碰 /run 等路径时的偶发失败，重试或改用等价命令）。
+      staging_uncovered = "reject",
       retention = {
         candidate_days = 7, -- 未应用候选保留期（天）
         max_pending = 20, -- 每任务最多待审候选数
@@ -980,11 +1029,15 @@ local DEFAULT_CONFIG = {
         record = true, -- 每次档位裁决/升级写入证据与事件
         tiers = {
           -- T0 默认放行网络（仅记录）但经 host_proxy 拦截本机访问；offline=true 时仍硬隔离。
-          -- 档位默认最小权限（--cap-drop ALL）；包安装窄能力由 packages.cap_add 按需加回。
-          [0] = { name = "minimal", review = "auto", network = true, cap_add = {}, mounts = {}, unmask = {} },
+          -- 档位基线为 `--cap-drop ALL` + 仅 `CAP_DAC_OVERRIDE`：沙箱载荷以 root 运行，
+          -- 真实 root 依赖该能力绕过 DAC 访问他人属主的 0700 目录（如 `_apt` 的
+          -- `/var/cache/apt/archives/partial`）；缺它会让 root 表现为「权限受限」而误报失败。
+          -- 隔离不依赖 capability，而由命名空间 + 整机根 overlay 暂存 + 遮蔽 + seccomp 保证；
+          -- 其余能力（CHOWN/SETUID/SETFCAP 等）仍由 packages.cap_add / sysadmin.cap_add 按需加回。
+          [0] = { name = "minimal", review = "auto", network = true, cap_add = { "CAP_DAC_OVERRIDE" }, mounts = {}, unmask = {} },
           -- T1 提权不默认解除 docker.sock 遮蔽：socket 仅在命令被分类为 docker 时按需挂载并解除。
           [1] = {
-            name = "elevated", review = "auto", network = true, cap_add = {}, mounts = {}, unmask = {},
+            name = "elevated", review = "auto", network = true, cap_add = { "CAP_DAC_OVERRIDE" }, mounts = {}, unmask = {},
           },
           -- T2 特权：嵌套 userns 内完整能力（caps 被 userns 作用域限制，够不到宿主）；
           -- 主机效果冻结为提案异步审批。seccomp 基线（mount/init_module 等）仍然生效。
@@ -1049,7 +1102,13 @@ local DEFAULT_CONFIG = {
           { tier = 1, name = "package", bin = "cargo", subs = { "install", "add", "update", "publish" } },
           { tier = 1, name = "package", bin = "gem", subs = { "install", "update" } },
           { tier = 1, name = "package", bin = "composer", subs = { "install", "require", "update" } },
-          { tier = 1, name = "package", bins = { "apt", "apt-get", "apt-key", "add-apt-repository", "dnf", "yum", "pacman", "apk", "brew" } },
+          { tier = 1, name = "package", bins = {
+            "apt", "apt-get", "apt-key", "add-apt-repository", "dnf", "yum", "pacman", "apk", "brew",
+            -- dpkg 及其配套：`dpkg --configure -a` / `dpkg -i` 的 postinst 会以子进程调用
+            -- adduser/chown/su，需要包安装能力与账户库访问（否则 chown EPERM、su 认证失败）。
+            "dpkg", "dpkg-deb", "dpkg-preconfigure", "update-alternatives", "ldconfig", "debconf",
+            "debconf-set-selections",
+          } },
         },
       },
       -- 受控 docker：不绑定宿主 /var/run/docker.sock。controlled 指向外部受控 socket

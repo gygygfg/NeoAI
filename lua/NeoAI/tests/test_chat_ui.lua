@@ -1148,6 +1148,81 @@ tests.suite("chat_ui", function(_, it)
     chat_service.reset()
   end)
 
+  it("聊天窗口切到别的 buffer 时 UI 更新不改动该 buffer（内容/光标/折叠）", function(t)
+    local chat_view = require("NeoAI.ui.window.chat_view")
+    local chat_service = require("NeoAI.services.chat_service")
+    local event_bus = require("NeoAI.kernel.event_bus")
+    local events = require("NeoAI.kernel.events")
+    chat_view.reset()
+    chat_service.reset()
+
+    local opened = chat_view.open()
+
+    -- 别的 buffer：缩进内容在聊天窗口的 expr 折叠下会形成折叠，模拟用户文件
+    local other = vim.api.nvim_create_buf(false, true)
+    local other_lines = {}
+    for i = 1, 40 do other_lines[i] = "  indented line " .. i end
+    vim.api.nvim_buf_set_lines(other, 0, -1, false, other_lines)
+    vim.api.nvim_win_set_buf(opened.win_id, other)
+    t.eq(other, vim.api.nvim_win_get_buf(opened.win_id), "前置条件：聊天窗口已显示别的 buffer")
+
+    -- 用户把该折叠展开，并在文件中间放置光标
+    vim.api.nvim_set_current_win(opened.win_id)
+    vim.api.nvim_win_set_cursor(opened.win_id, { 1, 0 })
+    vim.api.nvim_win_call(opened.win_id, function() vim.cmd("silent! normal! zo") end)
+    vim.api.nvim_win_set_cursor(opened.win_id, { 7, 0 })
+    t.eq(-1, vim.fn.foldclosed(1), "前置条件：别的 buffer 的折叠已展开")
+    local before_folds = {}
+    vim.api.nvim_win_call(opened.win_id, function()
+      for ln = 1, 40 do before_folds[ln] = vim.fn.foldclosed(ln) end
+    end)
+
+    -- 流式更新到达：内容应写入聊天 buffer，但绝不能操作别的 buffer 的折叠/光标
+    local agent = chat_service.get_current_agent()
+    agent.messages = { { role = "assistant", content = "streamed answer", reasoning = "folded thought" } }
+    event_bus.emit(events.MESSAGE_UPDATED, { agent_id = agent.id, message = agent.messages[1] })
+    chat_view.flush()
+
+    t.eq(table.concat(other_lines, "\n"),
+      table.concat(vim.api.nvim_buf_get_lines(other, 0, -1, false), "\n"),
+      "别的 buffer 内容不应被改写")
+    t.eq(7, vim.api.nvim_win_get_cursor(opened.win_id)[1], "别的 buffer 光标不应被移动")
+    vim.api.nvim_win_call(opened.win_id, function()
+      for ln = 1, 40 do
+        t.eq(before_folds[ln], vim.fn.foldclosed(ln), "别的 buffer 第 " .. ln .. " 行折叠状态不应改变")
+      end
+    end)
+    -- 聊天 buffer 仍应收到流式内容（切换期间不丢内容）
+    local chat_text = table.concat(vim.api.nvim_buf_get_lines(opened.buf, 0, -1, false), "\n")
+    t.true_(chat_text:find("streamed answer", 1, true) ~= nil, "流式文本仍应写入聊天 buffer")
+
+    pcall(vim.api.nvim_buf_delete, other, { force = true })
+    chat_view.reset()
+    chat_service.reset()
+  end)
+
+  it("聊天窗口切到别的 buffer 后关闭，仅删除聊天 buffer，不误删别的 buffer", function(t)
+    local chat_view = require("NeoAI.ui.window.chat_view")
+    local chat_service = require("NeoAI.services.chat_service")
+    chat_view.reset()
+    chat_service.reset()
+
+    local opened = chat_view.open()
+    local other = vim.api.nvim_create_buf(false, true)
+    vim.api.nvim_buf_set_lines(other, 0, -1, false, { "KEEP" })
+    vim.api.nvim_win_set_buf(opened.win_id, other)
+    t.eq(other, vim.api.nvim_win_get_buf(opened.win_id), "前置条件：聊天窗口已显示别的 buffer")
+
+    chat_view.close()
+
+    t.false_(vim.api.nvim_buf_is_valid(opened.buf), "关闭聊天应删除聊天 buffer")
+    t.true_(vim.api.nvim_buf_is_valid(other), "关闭聊天不应误删窗口切到的别的 buffer")
+
+    pcall(vim.api.nvim_buf_delete, other, { force = true })
+    chat_view.reset()
+    chat_service.reset()
+  end)
+
   it("工具执行中折叠文本实时刷新耗时（回归 timer_start 竞态）", function(t)
     local chat_view = require("NeoAI.ui.window.chat_view")
     local chat_service = require("NeoAI.services.chat_service")

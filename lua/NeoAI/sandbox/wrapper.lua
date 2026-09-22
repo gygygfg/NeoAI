@@ -23,21 +23,91 @@ local fs = require("NeoAI.utils.fs")
 
 local M = {}
 
--- ========== 进程命令串行化 ==========
+-- ========== 性能埋点（tools.sandbox.diagnostics.enabled） ==========
+-- 仅写 NeoAI 日志，不改变行为、不进入模型可见结果。用于定位 run_command 固定开销
+-- （执行 vs 冻结/结算 vs 后处理）。开启后每条命令记录分段耗时。
+
+local function _profile_enabled()
+  local d = config_store.get("tools.sandbox.diagnostics") or {}
+  return d.enabled == true
+end
+
+--- 记录一段耗时（毫秒）
+--- @param stage string
+--- @param ms number
+--- @param extra string|nil
+local function _profile(stage, ms, extra)
+  if not _profile_enabled() then return end
+  -- 预格式化后作为纯文本写日志：logger 的 `_format` 只支持 %s/%d/%q/%f，不支持 %.0f。
+  local msg = ("[sandbox-profile] %s: %dms%s"):format(
+    stage, math.floor((ms or 0) + 0.5), extra and (" " .. extra) or "")
+  pcall(function() require("NeoAI.kernel.logger").info(msg) end)
+end
+
+--- 包裹门禁返回的 Deferred，记录该工具从门禁到完成的端到端耗时（含冻结/结算）。
+--- @param name string|nil
+--- @param d Deferred
+--- @return Deferred
+local function _profile_gate(name, d)
+  if not _profile_enabled() then return d end
+  local t0 = vim.uv.hrtime()
+  local out = async.Deferred.new()
+  d:then_(function(v)
+    _profile("gate:" .. tostring(name), (vim.uv.hrtime() - t0) / 1e6, "ok")
+    out:resolve(v)
+  end, function(e)
+    _profile("gate:" .. tostring(name), (vim.uv.hrtime() - t0) / 1e6,
+      "err=" .. tostring(e and e.message or e))
+    out:reject(e)
+  end)
+  return out
+end
+
+-- ========== 进程命令并发化 ==========
 
 -- 沙箱的 overlay 物化/捕获、会话级可写层、暂存映射与捕获来源均基于「共享会话」，**非并发
--- 安全**。同一轮里模型并行发出的多个 `run_command`（并行 tool_calls）会互相污染：物化/捕获
--- 交错导致命令看到缺失的目录/文件、捕获互相覆盖，命令可能因此阻塞直到超时并被 `cgroup.kill`
--- 以 SIGKILL 终止（退出码 137，且无输出）。此处把 `effect == "process"` 的门禁按 FIFO
--- **串行**执行（一次一个），其余工具（read/fs_write/in_process/network）不受影响。
-local process_mutex = { busy = false, queue = {} }
+-- 安全**。为让同一轮里模型并行发出的多个 `run_command`（并行 tool_calls）真正并行，同时
+-- 不互相污染，按阶段拆锁：
+--   * **搭建阶段**（`candidate.begin` / 物化 / `resident.ensure` / 构建前缀）经 `_serialize_setup`
+--     串行：避免常驻实例被重复启动、避免物化/前缀构建交错。
+--   * **命令执行**并发：常驻命令服务器按 id 多路复用（见 sandbox/resident），一次性进程各用
+--     独立 attempt/overlay。
+--   * **捕获/冻结/合并/结算**经 `_serialize_capture` 串行：避免捕获互相覆盖；`state.materialized`
+--     的目标签名使后完成的捕获只处理尚未捕获的改动（按完成顺序归因，改动不丢失/不重复）。
+local setup_mutex = { busy = false, queue = {} }
+local capture_mutex = { busy = false, queue = {} }
+
+--- 串行执行同步搭建任务；`fn` 返回后**立即释放**槽位（命令执行不在锁内，可并发）。
+--- @param fn function() -> any
+--- @return Deferred
+local function _serialize_setup(fn)
+  local out = async.Deferred.new()
+  local function run()
+    local ok, inner = pcall(fn)
+    table.remove(setup_mutex.queue, 1)
+    local nxt = setup_mutex.queue[1]
+    if nxt then vim.schedule(nxt) else setup_mutex.busy = false end
+    if not ok then out:reject(inner); return end
+    if type(inner) ~= "table" or type(inner.then_) ~= "function" then
+      out:resolve(inner)
+      return
+    end
+    -- 槽位已释放；out 继续跟随 inner（命令执行/捕获链）完成。
+    inner:then_(function(v) out:resolve(v) end, function(e) out:reject(e) end)
+  end
+  setup_mutex.queue[#setup_mutex.queue + 1] = run
+  if not setup_mutex.busy then
+    setup_mutex.busy = true
+    vim.schedule(run)
+  end
+  return out
+end
 
 -- 后台后处理链（命令进程退出后的捕获/冻结/合并/落盘/结算）。`postprocess = "async"`（默认）
--- 时工具结果在进程退出后立即返回，此链在后台完成；`_serialize_process` 在释放 FIFO 槽位前
--- 等待它，保证下一进程命令看到一致的会话暂存。
+-- 时工具结果在进程退出后立即返回，此链在后台完成，由 `_serialize_capture` 串行化。
 local postprocess = { pending = nil, seq = 0 }
 
---- 登记后台后处理链（用于 FIFO 保持与测试/关闭时等待）。
+--- 登记后台后处理链（用于测试/关闭时等待）。
 --- @param def Deferred
 local function _track_postprocess(def)
   postprocess.seq = postprocess.seq + 1
@@ -49,25 +119,19 @@ local function _track_postprocess(def)
   def:then_(clear, clear)
 end
 
---- 串行执行一个返回 Deferred 的进程门禁任务（FIFO）。
+--- 串行执行一个返回 Deferred 的捕获/结算任务（FIFO，槽位保持到链完成）。
 --- @param fn function() -> Deferred
 --- @return Deferred
-local function _serialize_process(fn)
+local function _serialize_capture(fn)
   local out = async.Deferred.new()
   local function run()
     local released = false
     local function release()
       if released then return end
       released = true
-      local function advance()
-        -- 移除当前运行项（table.remove 返回被移除的元素，不能当作「下一项」），再取队首。
-        table.remove(process_mutex.queue, 1)
-        local nxt = process_mutex.queue[1]
-        if nxt then vim.schedule(nxt) else process_mutex.busy = false end
-      end
-      -- async 后处理：结果已返回，但 FIFO 槽位保持到后台链完成，避免下一命令与暂存合并竞争。
-      local pending = postprocess.pending
-      if pending then pending:then_(advance, advance) else advance() end
+      table.remove(capture_mutex.queue, 1)
+      local nxt = capture_mutex.queue[1]
+      if nxt then vim.schedule(nxt) else capture_mutex.busy = false end
     end
     local ok, inner = pcall(fn)
     if not ok then release(); out:reject(inner); return end
@@ -77,9 +141,9 @@ local function _serialize_process(fn)
     inner:then_(function(v) release(); out:resolve(v) end,
                 function(e) release(); out:reject(e) end)
   end
-  process_mutex.queue[#process_mutex.queue + 1] = run
-  if not process_mutex.busy then
-    process_mutex.busy = true
+  capture_mutex.queue[#capture_mutex.queue + 1] = run
+  if not capture_mutex.busy then
+    capture_mutex.busy = true
     vim.schedule(run)
   end
   return out
@@ -752,6 +816,18 @@ local function _settle_candidate(cand, attempt, ctx, cfg, spec, result, process_
   return { ok = true, value = result }
 end
 
+-- 结算（风险分级/入队/发布）耗时埋点：包安装等上千文件时是固定开销的主要嫌疑段。
+do
+  local raw = _settle_candidate
+  _settle_candidate = function(cand, attempt, ctx, cfg, spec, result, process_info, pre)
+    local t0 = vim.uv.hrtime()
+    local r = raw(cand, attempt, ctx, cfg, spec, result, process_info, pre)
+    _profile("settle", (vim.uv.hrtime() - t0) / 1e6,
+      "files=" .. tostring(cand and #(cand.files or {}) or 0))
+    return r
+  end
+end
+
 --- 持久化候选（异步写）→ 密钥分析（工作线程）→ 结算。返回 Deferred resolve(settled)。
 --- @param cand table
 --- @param attempt table
@@ -804,6 +880,24 @@ local function _on_observed(attempt, ctx, evt)
   if evt.kind ~= "file" then return end
   local p = evt.path
   if type(p) ~= "string" or p == "" then return end
+  -- 写日志：收集本命令写入/创建/删除的绝对路径（供 capture 只处理本轮改动，免全量遍历）。
+  -- 相对路径无法可靠映射到 overlay upper，标记为不可信 → capture 回退全量遍历。
+  if evt.write or evt.delete then
+    if p:sub(1, 1) ~= "/" then
+      ctx._observed_relative = true
+      local rp = ctx._observed_relative_paths
+      if not rp then rp = {}; ctx._observed_relative_paths = rp end
+      if #rp < 10 then rp[#rp + 1] = p end
+    elseif evt.delete then
+      local d = ctx._observed_deletes
+      if not d then d = {}; ctx._observed_deletes = d end
+      d[p] = true
+    else
+      local w = ctx._observed_writes
+      if not w then w = {}; ctx._observed_writes = w end
+      w[p] = true
+    end
+  end
   -- 同一路径在一轮命令内会被重复 open（构建/测试反复读同一批文件，事件可达百万级）：
   -- 按路径去重，只处理首次，避免对每个事件都做路径规范化与密钥模式匹配（主线程热点）。
   -- 去重后仍能完整覆盖「访问了哪些路径」——留痕与密钥归因只需知道首次访问。
@@ -1001,6 +1095,27 @@ local function _maybe_systemd(attempt, args, ctx, spec)
   local plan = systemd.parse_command(args.command)
   if not plan or plan.route == "hostop" then return nil end
 
+  -- `systemctl --user`：交由沙箱内真实嵌套 systemd 用户实例原生执行（需 resident + systemd.user）。
+  if plan.route == "native" then
+    local ok, mod = pcall(require, "NeoAI.sandbox.systemd_user")
+    local resident_ok = require("NeoAI.sandbox.resident").available()
+    if ok and mod and mod.available() and resident_ok then
+      return nil
+    end
+    control.transition(attempt, "STAGING")
+    control.transition(attempt, "CANDIDATE_READY")
+    control.transition(attempt, "COMPLETED_READ_ONLY")
+    return async.resolve(
+      "沙箱环境不支持 `systemctl --user`：未启用嵌套 systemd 用户实例。"
+      .. "请同时开启 tools.sandbox.resident.enabled 与 tools.sandbox.systemd.user.enabled。")
+  end
+
+  -- systemd enable/disable：计算软链并暂存为待审候选（不落宿主机）。
+  if plan.route == "reject" and (plan.verb == "enable" or plan.verb == "disable")
+    and cfg.stage_install ~= false then
+    return systemd.stage_install(attempt, plan, ctx, spec)
+  end
+
   control.transition(attempt, "STAGING")
   control.transition(attempt, "CANDIDATE_READY")
   control.transition(attempt, "COMPLETED_READ_ONLY")
@@ -1100,54 +1215,27 @@ local function _maybe_container(attempt, args, ctx, spec)
   return async.resolve(container.unsupported_text(plan))
 end
 
---- 后台命令门面：`run_command` 中的 `&`/nohup/setsid 自动转为长驻服务（`sandbox.service`），
---- 使其跨工具调用存活（一次性进程随命令结束被 cgroup.kill 回收）。返回 Deferred（已处理）
---- 或 nil（不处理，按一次性进程执行）。服务不可用/启动失败时回退一次性执行，不改变行为。
+--- 会话级常驻沙箱是否适用：仅 `run_command` 的 T0 非包安装进程命令，且运行时可用。
+--- 常驻实例共享一个 mount+pid 命名空间（后台进程跨调用存活），命令经 nsenter 进入执行。
+--- 特权档（T1/T2）会改变命名空间能力/网络/挂载，无法在既有常驻实例上变更，故不适用。
 --- @param attempt table
---- @param args table
---- @param ctx table
 --- @param spec table
---- @return Deferred|nil
-local function _maybe_background(attempt, args, ctx, spec)
-  if spec.effect ~= "process" then return nil end
-  if attempt.tool_name ~= "run_command" then return nil end
-  local cfg = config_store.get("tools.sandbox.service") or {}
-  if cfg.enabled == false or cfg.auto_background == false then return nil end
-  if type(args.command) ~= "string" or args.command == "" then return nil end
-  local bg = require("NeoAI.sandbox.background").parse(_strip_sudo(args.command))
-  if not bg then return nil end
-
-  local service = require("NeoAI.sandbox.service")
-  local name = "bg_" .. tostring(attempt.command_id):gsub("[^%w_%-]", "_")
-  local svc, err = service.start(name, bg.command, {
-    cwd = ctx.sandbox_exec_cwd or vim.fn.getcwd(),
-  })
-  if not svc then
-    -- 服务不可用/启动失败：回退一次性执行（保持既有行为，不静默吞掉命令）。
-    require("NeoAI.kernel.logger").warn(
-      "[sandbox] 后台命令转长驻服务失败，回退一次性执行：%s", tostring(err))
-    return nil
-  end
-
-  control.transition(attempt, "STAGING")
-  control.transition(attempt, "CANDIDATE_READY")
-  control.transition(attempt, "COMPLETED_READ_ONLY")
-  pcall(function()
-    require("NeoAI.kernel.event_bus").emit(
-      require("NeoAI.kernel.events").SANDBOX_BACKGROUND_ROUTED, {
-        name = name, service_id = svc.id, kind = bg.kind, command_id = attempt.command_id,
-      })
-  end)
-  pcall(function()
-    require("NeoAI.sandbox.audit").observe({
-      kind = "process", tool = attempt.tool_name, level = 1,
-      reasons = { "BACKGROUND_SERVICE:" .. tostring(bg.kind) }, command_id = attempt.command_id,
-    })
-  end)
-  return async.resolve(string.format(
-    "[后台服务] 检测到后台执行（%s），已转为长驻服务 `%s`（跨工具调用存活）。"
-    .. "用 service_logs name=\"%s\" 查看输出，service_status 查看状态，service_stop 停止。",
-    tostring(bg.kind), name, name))
+--- @param args table
+--- @param req table|nil 权限分类结果
+--- @return boolean
+local function _resident_eligible(attempt, spec, args, req)
+  if not spec or spec.effect ~= "process" then return false end
+  if attempt.tool_name ~= "run_command" then return false end
+  if spec.long_lived then return false end
+  if (req and req.tier or 0) ~= 0 then return false end
+  if attempt.package then return false end
+  if type(args.command) ~= "string" or args.command == "" then return false end
+  -- overlay 不可用时（降级/无 overlay）常驻实例无法提供一致暂存视图：交回一次性路径处理
+  -- （其 staging_uncovered / overlay_fail_closed 语义与提示更完整）。
+  if not runtime.overlay_available() then return false end
+  local ok, mod = pcall(require, "NeoAI.sandbox.resident")
+  if not ok or not mod then return false end
+  return mod.available()
 end
 
 -- ========== 公开 API ==========
@@ -1388,9 +1476,6 @@ local function _gate_inner(tool, args, ctx, call_original)
     -- 容器门面：docker 等依赖宿主 daemon 的运行时默认明确拒绝（不碰宿主）；podman 放行。
     local blocked = _maybe_container(attempt, args, ctx, spec)
     if blocked then return blocked end
-    -- 后台命令门面：&/nohup/setsid 自动转为长驻服务，使其跨工具调用存活。
-    local background = _maybe_background(attempt, args, ctx, spec)
-    if background then return background end
     candidate.begin(attempt, root)
     -- 工具子进程（exec）可指定进程 cwd（通常取可写根公共父目录，避免遮蔽目录把 overlay 遮蔽）；
     -- 未指定时沿用当前工作目录。
@@ -1413,6 +1498,11 @@ local function _gate_inner(tool, args, ctx, call_original)
     })
     attempt.package = req.package == true
     attempt.network = req.network == true
+    -- 常驻沙箱：会话级共享 mount+pid 命名空间，`run_command` 的后台进程跨工具调用存活。
+    -- 仅 T0 的 run_command 适用；使用独立 overlay 基目录（`<proc_dir>/resident`），
+    -- 避免与一次性进程的 upper 并发挂载冲突。
+    local resident_mod = require("NeoAI.sandbox.resident")
+    local resident_ok = _resident_eligible(attempt, spec, args, req)
     -- 可写根 = 工具声明（spec.writable_roots）+（包安装时）包管理器状态目录。
     -- 包安装写入的索引/缓存/元数据同样进入 overlay，冻结为候选（不直接落盘）。
     local extra_roots = {}
@@ -1441,7 +1531,8 @@ local function _gate_inner(tool, args, ctx, call_original)
         extra_roots[#extra_roots + 1] = r
       end
     end
-    local specs = M.build_overlay_specs(real_cwd, proc_dir, extra_roots)
+    local specs = M.build_overlay_specs(real_cwd,
+      resident_ok and (proc_dir .. "/resident") or proc_dir, extra_roots)
     -- 选定每个可写根实际使用的层（overlay 或 bind），供物化/捕获/前缀构造一致使用
     for _, spec in ipairs(specs) do
       if runtime.overlay_available() and runtime.overlay_writable(spec.root, spec.upper, spec.work) then
@@ -1455,17 +1546,21 @@ local function _gate_inner(tool, args, ctx, call_original)
     -- 双向互通：把工作区暂存内容物化进所选层，使命令看到 AI 尚未发布的编辑。
     -- 类型冲突（暂存文件目标在真实/overlay 中是目录）会使命令视图与只读工具视图分裂，
     -- 显式拒绝而非静默跳过（H4）。
-    local conflicts = candidate.materialize_overlay(specs)
-    if conflicts and #conflicts > 0 then
-      local first = conflicts[1]
-      candidate.cleanup(attempt.attempt_id)
-      control.transition(attempt, "FAILED")
-      return async.reject({
-        kind = "sandbox",
-        message = "SANDBOX_MATERIALIZE_TYPE_CONFLICT: 暂存文件与目录类型冲突，拒绝执行: "
-          .. tostring(first and first.real or "?"),
-        command_id = attempt.command_id,
-      })
+    -- 常驻沙箱：首次由 resident.ensure 在挂载前物化；已挂载时由 resident.materialize
+    -- 在命名空间内写回（避免挂载期间宿主侧改 upper）。此处不重复宿主侧物化。
+    if not resident_ok then
+      local conflicts = candidate.materialize_overlay(specs)
+      if conflicts and #conflicts > 0 then
+        local first = conflicts[1]
+        candidate.cleanup(attempt.attempt_id)
+        control.transition(attempt, "FAILED")
+        return async.reject({
+          kind = "sandbox",
+          message = "SANDBOX_MATERIALIZE_TYPE_CONFLICT: 暂存文件与目录类型冲突，拒绝执行: "
+            .. tostring(first and first.real or "?"),
+          command_id = attempt.command_id,
+        })
+      end
     end
     -- 会话级 shell 状态（export/cd 跨命令保留）：仅 bwrap 后端支持（bind 会话目录）。
     local session_shell = (cfg.session_shell ~= false) and runtime.backend() == "bwrap"
@@ -1484,7 +1579,8 @@ local function _gate_inner(tool, args, ctx, call_original)
     local cgroup = require("NeoAI.sandbox.cgroup")
     local cg_handle = nil
     local prewarmed = nil
-    if cgroup.limits_configured() then
+    -- 常驻沙箱：资源域为会话级（由 resident 自建并让命令加入），此处不创建一次性资源域。
+    if (not resident_ok) and cgroup.limits_configured() then
       local lcfg = config_store.get("tools.sandbox.limits") or {}
       local limits = cgroup.resolve_limits()
       -- 复用上一条进程命令返回后后台预热的 cgroup + 已挂载探针：探针挂载已与 AI 生成
@@ -1543,6 +1639,47 @@ local function _gate_inner(tool, args, ctx, call_original)
 
     --- 构造并注入进程前缀（含 cgroup 加入）；失败返回 nil, err
     local function _build_prefix(priv)
+      -- 常驻沙箱：会话级共享命名空间。首次启动时在挂载前物化暂存；后续命令由
+      -- resident.materialize 在命名空间内写回。命令在常驻命令服务器内执行。
+      if resident_ok and (priv and priv.userns) == true then
+        -- 嵌套 userns 档位（T2）无 overlay、且改变命名空间能力，无法复用常驻实例：
+        -- 停止常驻实例并交回一次性路径（私有无 overlay 视图）。
+        resident_mod.stop({ timeout_ms = 2000 })
+        resident_ok = false
+        pcall(candidate.materialize_overlay, specs)
+      end
+      if resident_ok then
+        local inst, rerr = resident_mod.ensure({
+          specs = specs, cwd = real_cwd, privileges = priv,
+          session_dir = session_dir, session_tmp_dir = proc_dir,
+          fallback_cwd = staging, env = runtime.sandbox_env(priv),
+        })
+        if inst then
+          active_specs = specs
+          ctx.sandbox_resident = true
+          ctx.sandbox_resident_specs = specs
+          ctx.sandbox_cwd = real_cwd
+          ctx.sandbox_env = inst.env
+          -- 显式标记为非降级/非 userns（消费方按布尔判断，nil 会被误判）。
+          ctx.sandbox_degraded = false
+          ctx.sandbox_userns = false
+          ctx.sandbox_degraded_reason = nil
+          ctx.sandbox_shell_state = session_dir
+            and require("NeoAI.sandbox.conceal").session_mount() or nil
+          -- token→真实密钥的还原仅限沙箱内部进程（与一次性路径一致）。
+          if type(args.command) == "string" then
+            ctx.sandbox_command = require("NeoAI.sandbox.secret").detokenize(args.command)
+          end
+          ctx.sandbox_kill = function() resident_mod.kill_current() end
+          return true
+        end
+        -- 启动失败：回退一次性执行（不静默失败）。specs 基目录与一次性路径不同，
+        -- 不与任何挂载冲突；因前面跳过了宿主侧物化，此处补做以保持暂存视图一致。
+        require("NeoAI.kernel.logger").warn(
+          "[sandbox] 常驻沙箱启动失败，回退一次性执行：%s", tostring(rerr))
+        resident_ok = false
+        pcall(candidate.materialize_overlay, specs)
+      end
       local userns = (priv and priv.userns) == true
       active_specs = userns and {} or specs
       -- 视图降级判定：无任何可写根使用 overlay 时，命令只能看到会话私有视图（看不到真实磁盘
@@ -1560,12 +1697,18 @@ local function _gate_inner(tool, args, ctx, call_original)
       -- fail-closed（含 T2 嵌套 userns：其无 overlay 是常态，但同样不能看到暂存视图）。
       if degraded and require("NeoAI.sandbox.candidate").has_staged() then
         local why = degraded_reason or (userns and "T2 嵌套 userns 无 overlay" or "无可写根可用 overlay")
-        return nil, "SANDBOX_STAGING_UNCOVERED: 存在未发布的暂存改动，但本次命令无 overlay 可写层（"
-          .. tostring(why) .. "）；命令将读到真实磁盘、与只读工具的暂存视图分裂，已拒绝执行"
-          .. "（无 overlay 时禁止降级）。请先在审批界面应用/丢弃暂存改动，或排查 overlay 可用性"
-          .. "（:NeoAISandboxCaps）。"
+        if (cfg.staging_uncovered or "reject") ~= "warn" then
+          return nil, "SANDBOX_STAGING_UNCOVERED: 存在未发布的暂存改动，但本次命令无 overlay 可写层（"
+            .. tostring(why) .. "）；命令将读到真实磁盘、与只读工具的暂存视图分裂，已拒绝执行"
+            .. "（无 overlay 时禁止降级）。请先在审批界面应用/丢弃暂存改动，或排查 overlay 可用性"
+            .. "（:NeoAISandboxCaps）；也可设 tools.sandbox.staging_uncovered=\"warn\" 允许降级执行。"
+        end
+        -- warn：降级执行，并让结果附加「未发布暂存改动不可见」的降级提示（见 shell.lua）。
+        degraded_reason = "存在未发布暂存改动但无 overlay 可写层（" .. tostring(why) .. "）"
       end
-      if degraded and not userns and cfg.overlay_fail_closed ~= false then
+      -- staging_uncovered="warn" 亦视为显式允许降级（否则会被下面的 overlay_fail_closed 再次拒绝）。
+      if degraded and not userns and cfg.overlay_fail_closed ~= false
+        and (cfg.staging_uncovered or "reject") ~= "warn" then
         local detail = degraded_reason and ("原因：" .. tostring(degraded_reason)) or "无可写根可用 overlay"
         return nil, "SANDBOX_OVERLAY_UNAVAILABLE: 无法为可写根挂载 overlay 可写层，拒绝以降级模式运行（"
           .. detail .. "）；请用 :NeoAISandboxCaps 排查，或在 tools.sandbox.overlay_fail_closed=false 显式允许降级"
@@ -1689,6 +1832,11 @@ local function _gate_inner(tool, args, ctx, call_original)
     local d = async.Deferred.new()
     -- 带外观测句柄（ebpf/procfs）已在 staging 前启动；进程退出后停止并冲刷事件。
     local function _stop_observe()
+      -- 写日志：capture 前确保在途/排队的解析 job 全部派发完成（否则写集不完整 → 不可信）。
+      if observe_handle and observe_handle.drain then
+        local ok, drained = pcall(observe_handle.drain, 1000)
+        ctx._journal_drained = (ok and drained == true)
+      end
       if observe_handle then pcall(observe_handle.stop) end
       observe_handle = nil
       if ctx._observe_handle then pcall(ctx._observe_handle.stop) end
@@ -1755,11 +1903,28 @@ local function _gate_inner(tool, args, ctx, call_original)
         control.transition(attempt, "CANDIDATE_READY")
         -- T2 特权档：命令已在嵌套 userns 内执行（够不到宿主），其主机效果冻结为提案，
         -- 异步审批后在主机上 replay（不阻塞工具调用）。
+        local hostop_frozen = false
         if (attempt.privilege_tier or 0) >= 2 and (cfg.review or {}).enabled ~= false then
           pcall(function()
-            require("NeoAI.sandbox.hostop").freeze(attempt, args,
-              { tier = attempt.privilege_tier, network = true }, { reason = "PRIVILEGED_TIER" })
+            hostop_frozen = require("NeoAI.sandbox.hostop").freeze(attempt, args,
+              { tier = attempt.privilege_tier, network = true }, { reason = "PRIVILEGED_TIER" }) ~= nil
           end)
+        end
+        -- 缺 root（载荷非 root）且命令因权限不足失败 → 显式向用户索要 root：冻结主机操作提案
+        -- （审批后以 root/sudo 在宿主 replay）。不静默失败，也不静默提权。包安装不在此列
+        -- （hostop 拒绝包安装，绝不在宿主机安装）。
+        if not hostop_frozen and (cfg.review or {}).enabled ~= false
+          and runtime.payload_nonroot() and not attempt.package then
+          local denied = false
+          for _, sig in ipairs((attempt.result_risk and attempt.result_risk.signals) or {}) do
+            if sig == "PERMISSION_DENIED" then denied = true break end
+          end
+          if denied then
+            pcall(function()
+              require("NeoAI.sandbox.hostop").freeze(attempt, args,
+                { tier = attempt.privilege_tier or 0, network = true }, { reason = "ROOT_REQUIRED" })
+            end)
+          end
         end
         local has_view = cand and cand.view_files and #cand.view_files > 0
         if cand and (#cand.files > 0 or has_view) then
@@ -1795,25 +1960,45 @@ local function _gate_inner(tool, args, ctx, call_original)
           return { ok = true, value = res }
         end
       end
-      local captures = {}
-      if runtime.backend() == "bwrap" and #active_specs > 0 then
-        for _, cap_spec in ipairs(active_specs) do
-          captures[#captures + 1] = candidate.capture_overlay_async(attempt.attempt_id, cap_spec.root,
-            cap_spec.mode == "bind" and cap_spec.bind or cap_spec.upper)
+      -- 写日志提示：仅当可信（eBPF + 命令前就绪 + 已排空 + 全绝对路径）时提供；capture 据此
+      -- 只遍历「本轮写/删路径涉及的目录」，不再全量遍历会话累积 upper。否则回退全量遍历。
+      local journal_hint = nil
+      if cfg.journal_capture ~= false and cfg.journal_capture ~= "off"
+        and ctx._journal_ready and ctx._journal_drained and not ctx._observed_relative then
+        local nw, nd = 0, 0
+        for _ in pairs(ctx._observed_writes or {}) do nw = nw + 1 end
+        for _ in pairs(ctx._observed_deletes or {}) do nd = nd + 1 end
+        -- 安全网：日志为空时无法区分「无改动」与「事件丢失」，一律回退全量遍历（绝不静默丢改动）。
+        if nw + nd > 0 then
+          journal_hint = { writes = ctx._observed_writes, deletes = ctx._observed_deletes }
         end
-      else
-        captures[#captures + 1] = candidate.capture_overlay_async(attempt.attempt_id, real_cwd, staging)
       end
-      local chain = async.all(captures):then_(function()
-        return candidate.finish_async(attempt.attempt_id)
-      end):then_(after_capture, function(cerr)
-        control.transition(attempt, "FAILED")
-        candidate.cleanup(attempt.attempt_id)
-        return { ok = false, err = {
-          kind = "sandbox",
-          message = "候选冻结失败: " .. tostring(cerr and (cerr.message or cerr) or cerr),
-          command_id = attempt.command_id,
-        } }
+      local chain = _serialize_capture(function()
+        local captures = {}
+        if runtime.backend() == "bwrap" and #active_specs > 0 then
+          for _, cap_spec in ipairs(active_specs) do
+            captures[#captures + 1] = candidate.capture_overlay_async(attempt.attempt_id, cap_spec.root,
+              cap_spec.mode == "bind" and cap_spec.bind or cap_spec.upper, journal_hint)
+          end
+        else
+          captures[#captures + 1] = candidate.capture_overlay_async(attempt.attempt_id, real_cwd, staging, journal_hint)
+        end
+        local _t_freeze = vim.uv.hrtime()
+        return async.all(captures):then_(function()
+          return candidate.finish_async(attempt.attempt_id)
+        end):then_(function(cand)
+          _profile("freeze", (vim.uv.hrtime() - _t_freeze) / 1e6,
+            "files=" .. tostring(cand and #(cand.files or {}) or 0))
+          return after_capture(cand)
+        end, function(cerr)
+          control.transition(attempt, "FAILED")
+          candidate.cleanup(attempt.attempt_id)
+          return { ok = false, err = {
+            kind = "sandbox",
+            message = "候选冻结失败: " .. tostring(cerr and (cerr.message or cerr) or cerr),
+            command_id = attempt.command_id,
+          } }
+        end)
       end)
       if (cfg.postprocess or "async") == "sync" then
         -- 同步模式（测试/确定性）：等待捕获→冻结→合并→落盘→结算完成后再返回结果。
@@ -1826,8 +2011,8 @@ local function _gate_inner(tool, args, ctx, call_original)
         end, function(e) d:reject(e) end)
       else
         -- 异步模式（默认）：命令进程已退出 → 立即把结果交回主线程下一轮循环；捕获/冻结/合并/
-        -- 落盘/结算在后台完成。FIFO 槽位由 `_serialize_process.release` 等待本链完成后再释放，
-        -- 保证下一进程命令看到一致的会话暂存。
+        -- 落盘/结算在后台完成。捕获槽位由 `_serialize_capture` 保持到本链完成后再释放，
+        -- 避免并发命令的捕获互相覆盖（按完成顺序归因，改动不丢失/不重复）。
         _track_postprocess(chain)
         d:resolve(res)
         chain:then_(function(settled)
@@ -1846,7 +2031,8 @@ local function _gate_inner(tool, args, ctx, call_original)
     --- 全档位生效：T0 失败升 T1，T1 失败升 T2（直到 max_tier），每步写证据/事件/审计。
     local function run(priv, current_tier)
       call_original():then_(function(res)
-        if pcfg.auto_escalate ~= false and not attempt.package and current_tier < (pcfg.max_tier or 2) then
+        if pcfg.auto_escalate ~= false and not attempt.package
+          and current_tier < (pcfg.max_tier or 2) then
           local raw = ctx.sandbox_last_result
           local esc = privilege.detect_escalation(raw)
           if esc and esc.tier > current_tier then
@@ -1895,6 +2081,11 @@ local function _gate_inner(tool, args, ctx, call_original)
       local ocfg = cfg.observe or {}
       local wait_ms = tonumber(ocfg.wait_ready_ms) or 0
       if wait_ms > 0 then pcall(observe_handle.wait_ready, wait_ms) end
+    end
+    -- 写日志可信性：仅 eBPF + 写探针可用 + 命令开始前探针已就绪（否则早期写入会漏观测）。
+    -- 就绪后 capture 才据「本轮写/删路径」跳过全量遍历；否则回退全量遍历（正确性优先）。
+    if observe_handle and observe_handle.backend == "ebpf" and observe_handle.ready == true then
+      if require("NeoAI.sandbox.observer").writes_available() then ctx._journal_ready = true end
     end
     run(resolved.privileges, req.tier)
     return d
@@ -1983,8 +2174,9 @@ local function _gate_inner(tool, args, ctx, call_original)
 end
 
 --- 执行门禁：所有工具执行的唯一强制入口。
---- `effect == "process"` 的命令按 FIFO **串行**执行（沙箱会话/overlay 非并发安全，见
---- `_serialize_process`）；沙箱关闭且允许降级时直接执行原工具（不串行）。其余 effect 不串行。
+--- `effect == "process"` 的命令：**搭建阶段**串行（`_serialize_setup`），**命令执行**并发
+--- （常驻命令服务器多路复用），**捕获/结算**串行（`_serialize_capture`）——见上方注释。
+--- 沙箱关闭且允许降级时直接执行原工具（不串行）。
 --- @param tool table 工具定义（含 __sandbox_spec）
 --- @param args table
 --- @param ctx table
@@ -1996,15 +2188,16 @@ function M.gate(tool, args, ctx, call_original)
     return call_original()
   end
   local spec = tool and tool.__sandbox_spec or tool_spec.get(tool and tool.name, tool and tool.category)
+  local name = tool and tool.name
   if spec and spec.effect == "process" then
-    return _serialize_process(function() return _gate_inner(tool, args, ctx, call_original) end)
+    return _profile_gate(name, _serialize_setup(function() return _gate_inner(tool, args, ctx, call_original) end))
   end
   -- 非进程工具（read/fs_write/in_process）：若上一条进程命令的后处理仍在途（异步模式），
   -- 先等待其完成——命令的 overlay 改动经后台合并进会话暂存后，读写工具才能看到一致视图
   -- （否则「命令刚创建的文件」读取会落空）。等待不改变 FIFO 语义。
   local pending = postprocess.pending
   if not pending then
-    return _gate_inner(tool, args, ctx, call_original)
+    return _profile_gate(name, _gate_inner(tool, args, ctx, call_original))
   end
   local out = async.Deferred.new()
   local function proceed()
@@ -2012,7 +2205,7 @@ function M.gate(tool, args, ctx, call_original)
       function(v) out:resolve(v) end, function(e) out:reject(e) end)
   end
   pending:then_(proceed, proceed)
-  return out
+  return _profile_gate(name, out)
 end
 
 --- 是否有后台后处理链在途（异步模式下命令结果已返回、捕获/冻结/结算尚未完成）。

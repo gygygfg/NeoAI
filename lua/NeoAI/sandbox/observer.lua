@@ -19,32 +19,136 @@ local M = {}
 
 -- ========== 私有常量 ==========
 
---- bpftrace 探针脚本：按 `$1`（cgroup id）过滤，输出制表符分隔事件行。
---- F=file / X=exec / N=net；路径由 Lua 侧清洗（制表符/换行）。
-local BTRACE_SCRIPT = table.concat({
-  'tracepoint:syscalls:sys_enter_openat /cgroup == $1/ {',
-  '  printf("F\\topenat\\t%d\\t%s\\n", pid, str(args->filename));',
-  '}',
-  'tracepoint:syscalls:sys_enter_open /cgroup == $1/ {',
-  '  printf("F\\topen\\t%d\\t%s\\n", pid, str(args->filename));',
-  '}',
-  'tracepoint:syscalls:sys_enter_execve /cgroup == $1/ {',
-  '  printf("X\\texecve\\t%d\\t%s\\n", pid, str(args->filename));',
-  '}',
-  'tracepoint:syscalls:sys_enter_connect /cgroup == $1/ {',
-  '  $sa = (struct sockaddr *)args->uservaddr;',
-  '  $fam = $sa->sa_family;',
-  '  if ($fam == 2) {',
-  '    $sin = (struct sockaddr_in *)$sa;',
-  '    printf("N\\tconnect\\t%d\\t%s:%d\\n", pid, ntop($fam, $sin->sin_addr.s_addr), bswap($sin->sin_port));',
-  '  } else if ($fam == 10) {',
-  '    $sin6 = (struct sockaddr_in6 *)$sa;',
-  '    printf("N\\tconnect\\t%d\\t[%s]:%d\\n", pid, ntop($fam, $sin6->sin6_addr.in6_u.u6_addr32), bswap($sin6->sin6_port));',
-  '  } else {',
-  '    printf("N\\tconnect\\t%d\\tfamily=%d\\n", pid, $fam);',
-  '  }',
-  '}',
-}, "\n")
+--- tracefs 事件目录（优先新路径）
+local function _tracefs_events_dir()
+  if vim.fn.isdirectory("/sys/kernel/tracing/events/syscalls") == 1 then
+    return "/sys/kernel/tracing/events/syscalls"
+  end
+  if vim.fn.isdirectory("/sys/kernel/debug/tracing/events/syscalls") == 1 then
+    return "/sys/kernel/debug/tracing/events/syscalls"
+  end
+  return nil
+end
+
+--- 某 syscall tracepoint 是否存在（脚本按内核可用性动态拼装，避免引用不存在的 tracepoint 导致
+--- bpftrace 编译失败）。
+--- @param name string 如 "sys_enter_openat"
+--- @return boolean
+local function _has_tp(name)
+  local dir = _tracefs_events_dir()
+  if not dir then return false end
+  return vim.fn.isdirectory(dir .. "/" .. name) == 1
+end
+
+--- 生成 bpftrace 探针脚本：按 `$1`（cgroup id）过滤，输出制表符分隔事件行。
+--- 标签：F=file 打开（读或写，保留原读取面/越界/密钥归因）／W=写入或创建／D=删除／
+--- R=重命名（拆成 D old + W new）／X=exec／N=net。路径由 Lua 侧清洗。
+--- W/D 用于「写日志」：capture 据此只处理本轮真正改动的路径，避免全量遍历会话累积 upper。
+--- 仅纳入内核实际存在的 tracepoint（不同内核 `*at` 变体不同）。
+local function _build_btrace_script()
+  local L = {}
+  local function add(s) L[#L + 1] = s end
+  -- 打开（读/写都记 F；写意图另记 W）
+  for _, tp in ipairs({ "sys_enter_openat", "sys_enter_open" }) do
+    if _has_tp(tp) then
+      add('tracepoint:syscalls:' .. tp .. ' /cgroup == $1 && comm != "bwrap"/ {')
+      add('  $p = str(args->filename);')
+      add('  printf("F\\t' .. tp .. '\\t%d\\t%s\\n", pid, $p);')
+      -- O_WRONLY=1 / O_RDWR=2 / O_CREAT=0x40 / O_TRUNC=0x200
+      add('  if (args->flags & 1 || args->flags & 2 || args->flags & 64 || args->flags & 512) {')
+      add('    printf("W\\t' .. tp .. '\\t%d\\t%s\\n", pid, $p);')
+      add('  }')
+      add('}')
+    end
+  end
+  -- 其它写入/创建类
+  if _has_tp("sys_enter_creat") then
+    add('tracepoint:syscalls:sys_enter_creat /cgroup == $1 && comm != "bwrap"/ {')
+    add('  printf("W\\tcreat\\t%d\\t%s\\n", pid, str(args->pathname));')
+    add('}')
+  end
+  if _has_tp("sys_enter_truncate") then
+    add('tracepoint:syscalls:sys_enter_truncate /cgroup == $1 && comm != "bwrap"/ {')
+    add('  printf("W\\ttruncate\\t%d\\t%s\\n", pid, str(args->path));')
+    add('}')
+  end
+  for _, tp in ipairs({ "sys_enter_mkdirat", "sys_enter_mkdir" }) do
+    if _has_tp(tp) then
+      add('tracepoint:syscalls:' .. tp .. ' /cgroup == $1 && comm != "bwrap"/ {')
+      add('  printf("W\\t' .. tp .. '\\t%d\\t%s\\n", pid, str(args->pathname));')
+      add('}')
+    end
+  end
+  for _, tp in ipairs({ "sys_enter_symlinkat", "sys_enter_symlink" }) do
+    if _has_tp(tp) then
+      add('tracepoint:syscalls:' .. tp .. ' /cgroup == $1 && comm != "bwrap"/ {')
+      add('  printf("W\\t' .. tp .. '\\t%d\\t%s\\n", pid, str(args->newname));')
+      add('}')
+    end
+  end
+  for _, tp in ipairs({ "sys_enter_linkat", "sys_enter_link" }) do
+    if _has_tp(tp) then
+      add('tracepoint:syscalls:' .. tp .. ' /cgroup == $1 && comm != "bwrap"/ {')
+      add('  printf("W\\t' .. tp .. '\\t%d\\t%s\\n", pid, str(args->newname));')
+      add('}')
+    end
+  end
+  -- 删除类
+  for _, tp in ipairs({ "sys_enter_unlinkat", "sys_enter_unlink" }) do
+    if _has_tp(tp) then
+      add('tracepoint:syscalls:' .. tp .. ' /cgroup == $1 && comm != "bwrap"/ {')
+      add('  printf("D\\t' .. tp .. '\\t%d\\t%s\\n", pid, str(args->pathname));')
+      add('}')
+    end
+  end
+  if _has_tp("sys_enter_rmdir") then
+    add('tracepoint:syscalls:sys_enter_rmdir /cgroup == $1 && comm != "bwrap"/ {')
+    add('  printf("D\\trmdir\\t%d\\t%s\\n", pid, str(args->pathname));')
+    add('}')
+  end
+  -- 重命名：old 记 D、new 记 W
+  for _, tp in ipairs({ "sys_enter_renameat2", "sys_enter_renameat", "sys_enter_rename" }) do
+    if _has_tp(tp) then
+      add('tracepoint:syscalls:' .. tp .. ' /cgroup == $1 && comm != "bwrap"/ {')
+      add('  printf("D\\t' .. tp .. '\\t%d\\t%s\\n", pid, str(args->oldname));')
+      add('  printf("W\\t' .. tp .. '\\t%d\\t%s\\n", pid, str(args->newname));')
+      add('}')
+    end
+  end
+  -- exec / net（原行为）
+  if _has_tp("sys_enter_execve") then
+    add('tracepoint:syscalls:sys_enter_execve /cgroup == $1 && comm != "bwrap"/ {')
+    add('  printf("X\\texecve\\t%d\\t%s\\n", pid, str(args->filename));')
+    add('}')
+  end
+  if _has_tp("sys_enter_connect") then
+    add('tracepoint:syscalls:sys_enter_connect /cgroup == $1 && comm != "bwrap"/ {')
+    add('  $sa = (struct sockaddr *)args->uservaddr;')
+    add('  $fam = $sa->sa_family;')
+    add('  if ($fam == 2) {')
+    add('    $sin = (struct sockaddr_in *)$sa;')
+    add('    printf("N\\tconnect\\t%d\\t%s:%d\\n", pid, ntop($fam, $sin->sin_addr.s_addr), bswap($sin->sin_port));')
+    add('  } else if ($fam == 10) {')
+    add('    $sin6 = (struct sockaddr_in6 *)$sa;')
+    add('    printf("N\\tconnect\\t%d\\t[%s]:%d\\n", pid, ntop($fam, $sin6->sin6_addr.in6_u.u6_addr32), bswap($sin6->sin6_port));')
+    add('  } else {')
+    add('    printf("N\\tconnect\\t%d\\tfamily=%d\\n", pid, $fam);')
+    add('  }')
+    add('}')
+  end
+  return table.concat(L, "\n")
+end
+
+local BTRACE_SCRIPT = _build_btrace_script()
+
+--- 当前脚本是否包含写入/删除探针（用于判断「写日志」是否可用）。
+local WRITES_AVAILABLE = _has_tp("sys_enter_openat") or _has_tp("sys_enter_open")
+
+--- 写日志是否可用（eBPF 后端 + 内核含 openat/open tracepoint）。
+--- @return boolean
+function M.writes_available()
+  return WRITES_AVAILABLE
+end
 
 local DEFAULT_POLL_MS = 200
 
@@ -102,6 +206,10 @@ function M.parse_bpftrace_line(line)
   local pidn = tonumber(pid)
   if tag == "F" then
     return { kind = "file", op = op, pid = pidn, path = _clean(rest) }
+  elseif tag == "W" then
+    return { kind = "file", op = op, pid = pidn, path = _clean(rest), write = true }
+  elseif tag == "D" then
+    return { kind = "file", op = op, pid = pidn, path = _clean(rest), delete = true }
   elseif tag == "X" then
     return { kind = "exec", op = op, pid = pidn, path = _clean(rest) }
   elseif tag == "N" then
@@ -227,11 +335,11 @@ end
 
 -- ========== eBPF 后端 ==========
 
---- 线程内解析 bpftrace 输出：按行切分、仅保留文件事件、按路径去重，返回以 `\n` 连接的唯一
---- 路径。自包含（仅字符串操作，无 upvalue），可 `string.dump` 到工作线程执行——把构建/测试
---- 产生的百万级事件的解析移出主线程；主线程只需对去重后的少量路径做留痕/密钥判定。
+--- 线程内解析 bpftrace 输出：按行切分、保留文件事件（F 读/写打开、W 写入/创建、D 删除），
+--- 按「标签+路径」去重，返回 `tag\tpath` 行（`\n` 连接）。自包含（仅字符串操作，无 upvalue），
+--- 可 `string.dump` 到工作线程执行——把构建/测试产生的百万级事件的解析移出主线程。
 --- @param text string 若干完整行（以 `\n` 结尾）
---- @return string 唯一路径以 `\n` 连接
+--- @return string 唯一记录以 `\n` 连接
 local function _parse_file_paths(text)
   local seen, out, n = {}, {}, 0
   local pos = 1
@@ -241,9 +349,10 @@ local function _parse_file_paths(text)
     local line = text:sub(pos, nl - 1)
     pos = nl + 1
     local tag, rest = line:match("^(%a)\t[^\t]+\t%d+\t(.*)$")
-    if tag == "F" and rest and rest ~= "" then
+    if (tag == "F" or tag == "W" or tag == "D") and rest and rest ~= "" then
       local p = (rest:gsub("[%z\1-\31\127]", ""))
-      if p ~= "" and not seen[p] then seen[p] = true; n = n + 1; out[n] = p end
+      local key = tag .. "\0" .. p
+      if p ~= "" and not seen[key] then seen[key] = true; n = n + 1; out[n] = tag .. "\t" .. p end
     end
   end
   return table.concat(out, "\n")
@@ -264,14 +373,19 @@ local function _start_ebpf(opts)
   local function emit(evt)
     if evt and opts.on_event then pcall(opts.on_event, evt) end
   end
-  --- 解析结果（唯一路径串）→ 逐条派发文件事件
+  --- 解析结果（`tag\tpath` 记录串）→ 逐条派发文件事件（W/D 带写/删标记）
   local function emit_encoded(encoded)
     if type(encoded) ~= "string" or encoded == "" then return end
     local pos = 1
     while true do
       local nl = encoded:find("\n", pos, true)
-      local p = nl and encoded:sub(pos, nl - 1) or encoded:sub(pos)
-      if p ~= "" then emit({ kind = "file", path = p }) end
+      local rec = nl and encoded:sub(pos, nl - 1) or encoded:sub(pos)
+      if rec ~= "" then
+        local tag, p = rec:match("^(%a)\t(.*)$")
+        if p and p ~= "" then
+          emit({ kind = "file", path = p, write = (tag == "W"), delete = (tag == "D") })
+        end
+      end
       if not nl then break end
       pos = nl + 1
     end
@@ -341,6 +455,18 @@ local function _start_ebpf(opts)
       pcall(parse_sync, p)
     end
     pcall(vim.fn.jobstop, job)
+  end
+  --- 等待在途/排队的解析 job 全部派发完成（供「写日志」在 capture 前确保事件完整）。
+  --- @param ms number|nil 最长等待（默认 500ms）
+  --- @return boolean 是否已排空
+  function handle.drain(ms)
+    local deadline = vim.uv.hrtime() + (tonumber(ms) or 500) * 1e6
+    local function empty() return handle.inflight == 0 and #handle.queue == 0 end
+    while not empty() do
+      if vim.uv.hrtime() > deadline then return false end
+      vim.wait(10, empty, 5)
+    end
+    return true
   end
   return handle
 end

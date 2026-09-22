@@ -109,10 +109,20 @@ header text. Moreover, a structural change (e.g. a tool completing and appending
 same batch** as in-place refreshes, so this must not be gated on `inserted==removed`; otherwise the fold of a tool still
 running in the same batch is missed and its content leaks line by line outside the fold.
 When a command's **arguments or result contain a secret** (sandbox token `NEOKEY_*` or a raw secret matched by a
-named rule), a **separate highlighted warning line** (`⚠ 密钥`, `NeoAISecretWarning`) is appended **outside** the
+named rule), a **highlighted warning** (`NeoAISecretWarning`) is appended **outside** the
 tool fold block; the fold title stays clean (no `⚠ 密钥` suffix) and the warning remains visible while collapsed.
-The warning **names the exact command/tool and the key file it obtained or used**, e.g.
-`⚠ 密钥：run_command 执行 cat ~/.ssh/id_rsa 获取/使用了密钥（密钥文件：/root/.ssh/id_rsa）`; when the file cannot be
+The warning **names the exact command/tool and the key files it obtained or used**, formatted **one item per
+line** (no more comma-joined lists): first line `⚠ 密钥：<tool> <obtained/used>`, the command on its own line,
+then the matched key files / types / env vars each on its own line, e.g.
+```
+⚠ 密钥：run_command 获取了密钥
+· 执行 `cat ~/.ssh/id_rsa`
+· 密钥文件：
+·   /root/.ssh/id_rsa
+```
+(Each line starts with `· ` instead of space indentation — the chat folds by indentation, so indented
+lines would be pulled into a fold block and hidden.)
+When the file cannot be
 determined it falls back to the secret type (named rule, e.g. `private_key`) → sensitive environment variable
 name → generic notice (see the secrets section of [sandbox.md](sandbox.md)). A result that **merely mentions a
 sensitive env-var name** does not trigger a warning (the name is only a reference, no key content was read);
@@ -224,7 +234,7 @@ Following deepseek-harness's Cordis plugin model, the chat view's "display modes
 | `tool_approval` | Tool approval popup. `init()`; serial single-slot display. |
 | `ask_user` | User questioning popup. `init()`; injected via `ask_user.set_ui`. |
 | `sub_agent_dock` | Sub-agent status monitoring. `init()`. |
-| `sandbox_review` | Sandbox pending-review UI. `open()`; highlights by path level (workspace green / user yellow / system red) and shows high/medium/low risk grades; items are sectioned into **unapplied (pending)** and **applied (snapshotted, revertible)**. Per-file approval: `<CR>` applies the file under the cursor, `A` approves every workspace change in one key (files outside the workspace and host-operation proposals stay pending; yields to the main loop between items, shows progress in the title, and refuses re-entry while running), `d` rejects only that file, `i` opens that item's diff preview (returns with cursor restored), `u` undoes/redoes the save, `q` closes; while open the window subscribes to sandbox broadcast events and refreshes automatically (multiple events in the same tick are coalesced). The applied section is collapsed by default (two-level fold); pending ordinary items and the trace section do not fold, while a **pending git atomic group shows its header line with the rest folded and can be expanded with `za`/`zo`** (header keeps the whole-group approval entry and highlight). High-risk items (L3, and L2 package/sensitive installs when `package_confirm` is on) require an AI consequence warning plus a second `<CR>` in the diff. |
+| `sandbox_review` | Sandbox pending-review UI. `open()`; highlights by path level (workspace green / user yellow / system red) and shows high/medium/low risk grades; items are sectioned into **unapplied (pending)** and **applied (snapshotted, revertible)**. Per-file approval: `<CR>` applies the file under the cursor, `A` approves every workspace change in one key (files outside the workspace and host-operation proposals stay pending; yields to the main loop between items, shows progress in the title, and refuses re-entry while running), `d` rejects only that file, `i` opens that item's diff preview (returns with cursor restored), `u` undoes/redoes the save, `q` closes; while open the window subscribes to sandbox broadcast events and refreshes automatically (multiple events in the same tick are coalesced). The applied section is collapsed by default (two-level fold); **a pending item shows its header line with the rest folded and can be expanded with `za`/`zo`** (header keeps the whole-unit approval entry and highlight), while the trace section does not fold. High-risk items (L3, and L2 package/sensitive installs when `package_confirm` is on) require an AI consequence warning plus a second `<CR>` in the diff. |
 | `fold` | Folds (shared implementation for reasoning/tool calls/results). `foldexpr`/`foldtext`/`record_start`/`record_end`/`has_running`/`set_live_timer`/`set_foldexpr_override`/`set_foldtext_override`/`set_reasoning_lines`/`is_reasoning_start`/`generic_label`. |
 | `display_modes/` | Display mode plugin manager + `chat.lua`/`trajectory.lua`. |
 | `markdown_view` | Markdown renderer. |

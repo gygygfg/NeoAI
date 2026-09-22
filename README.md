@@ -668,7 +668,7 @@ NeoAI 内置了 40+ 工具，AI 可在对话中自动调用，涵盖以下类别
 
 | 工具名        | 描述               | 参数说明 |
 | ------------- | ------------------ | -------- |
-| `run_command` | 执行 Shell 命令（非交互，异步 jobstart） | `command`（必填）要执行的命令（必要时用引号包裹以免提前拆分）；`timeout_ms`（可选，默认 30000，-1 为不限）超时毫秒数。长任务请在同一次调用显式传较大值；命令以 `&`/`nohup` 结束后自动转为后台服务，用 `service_logs`/`service_status`/`service_stop` 管理。常见只读命令 `ls`/`wc`/`find`/`grep`/`pwd` 命中参数白名单 |
+| `run_command` | 执行 Shell 命令（非交互，异步 jobstart） | `command`（必填）要执行的命令（必要时用引号包裹以免提前拆分）；`timeout_ms`（可选，默认 30000，-1 为不限）超时毫秒数。长任务请在同一次调用显式传较大值；开启 `tools.sandbox.resident` 后，`&`/`nohup`/`setsid` 启动的后台进程跨工具调用存活（同一会话共享沙箱命名空间）。常见只读命令 `ls`/`wc`/`find`/`grep`/`pwd` 命中参数白名单 |
 
 ### 🔄 Git 工具
 

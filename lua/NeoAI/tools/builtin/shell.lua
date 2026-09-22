@@ -52,6 +52,12 @@ end
 --- @return Deferred resolve({ code, stdout, stderr, timed_out?, aborted?, message? })
 local function _run_command(command, opts)
   opts = opts or {}
+  -- 常驻沙箱：命令经 nsenter 进入会话级共享命名空间执行（后台进程跨调用存活）。
+  if opts.resident then
+    return require("NeoAI.sandbox.resident").exec(command, {
+      timeout_ms = opts.timeout_ms, signal = opts.signal, cwd = opts.cwd,
+    })
+  end
   local d = async.Deferred.new()
   local stdout_chunks = {}
   local stderr_chunks = {}
@@ -222,9 +228,8 @@ shell_tools.run_command = helpers.define_tool(
   "run_command",
   "执行 Shell 命令（前台，单次调用内完成）。command 必填。timeout_ms 可选（默认 30000ms，-1 为不限）。"
   .. "长任务（安装依赖/编译/下载）请在**同一次调用**内显式传较大的 timeout_ms（如 600000），"
-  .. "不要靠重试短命令规避超时。命令以后台方式结束（`&`/nohup/setsid）时会自动转为长驻服务"
-  .. "（跨工具调用存活，用 service_logs/service_status/service_stop 管理）；需要常驻服务"
-  .. "也可直接用 service_start/service_logs/service_stop。",
+  .. "不要靠重试短命令规避超时。以 `&`/nohup/setsid 启动的后台进程会跨工具调用持续运行"
+  .. "（同一会话共享沙箱命名空间，可用 ps/kill 等命令管理）；其输出建议重定向到文件。",
   {
     type = "object",
     properties = {
@@ -256,6 +261,7 @@ shell_tools.run_command = helpers.define_tool(
       env = ctx and ctx.sandbox_env,
       kill = ctx and ctx.sandbox_kill,
       cgroup_path = ctx and ctx.sandbox_cgroup_path,
+      resident = ctx and ctx.sandbox_resident,
     }):then_(function(result)
       -- 供沙箱门禁做权限不足检测（自动提权）：保留原始 {code,stdout,stderr}。
       if ctx then ctx.sandbox_last_result = result end

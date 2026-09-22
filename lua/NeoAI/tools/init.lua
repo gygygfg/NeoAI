@@ -35,7 +35,6 @@ local BUILTIN_MODULES = {
   "NeoAI.tools.builtin.web_fetch",
   "NeoAI.tools.builtin.skills",
   "NeoAI.tools.builtin.reload_all",
-  "NeoAI.tools.builtin.service",
 }
 
 -- ========== 公开 API ==========

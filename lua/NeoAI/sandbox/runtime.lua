@@ -115,7 +115,7 @@ local DEFAULT_READONLY_PATHS = {
 --   host（默认）= 建在宿主根之下的隐藏临时子目录（如 /tmp/.cache-<tag>/<session>），
 --                  命名空间映射回该根，AI 只见自己的私有子目录（隔离 AI）；
 --   session     = 建在会话进程目录下（/dev/shm 等），保持旧行为。
-local DEFAULT_TMPFS_ROOTS = { "/tmp", "/var/tmp" }
+local DEFAULT_TMPFS_ROOTS = { "/tmp", "/var/tmp", "/run" }
 
 -- 默认隐藏的 /proc 泄露项：这些文件在 procfs 中全局可见（不随 pid namespace 隔离），
 -- 会泄露宿主内核命令行（root=UUID、crashkernel）与内核版本。以空文件只读覆盖，
@@ -211,7 +211,7 @@ local function _wrap_close_fds(inner, pre)
   return out
 end
 
---- 配置的按需加回 capability（默认 `{ "ALL" }`：载荷持有完整 root 能力）
+--- 配置的按需加回 capability（默认 `{}`：由档位 cap_add 决定，T0/T1 基线仅 `CAP_DAC_OVERRIDE`）
 --- @return table 字符串数组
 local function _global_cap_add()
   local list = config_store.get("tools.sandbox.cap_add")
@@ -928,6 +928,50 @@ local function _append_expose_mounts(argv)
   end
 end
 
+--- 构造「PID1 = systemd」外观的绑定源文件（宿主侧，仅作 bwrap `--ro-bind` 源，沙箱内不可见）。
+--- 使沙箱内 `/proc/1/comm|cmdline|stat|status` 显示为 systemd，消除「PID1 是 bash/载荷」这一
+--- 沙箱指纹。systemd 门面关闭（`tools.sandbox.systemd.enabled=false`）时返回 nil，不做伪装。
+--- @return table|nil { comm, cmdline, stat, status }
+local _pid1_spoof_cache
+local function _pid1_spoof_files()
+  local cfg = config_store.get("tools.sandbox.systemd") or {}
+  if cfg.enabled == false then return nil end
+  if _pid1_spoof_cache then
+    -- 缓存失效（如 store 清理）时重建：绑定源缺失会让 bwrap 失败。
+    if vim.uv.fs_stat(_pid1_spoof_cache.comm) then return _pid1_spoof_cache end
+    _pid1_spoof_cache = nil
+  end
+  local root = require("NeoAI.sandbox.store").root() or (vim.fn.stdpath("cache") .. "/NeoAI/sandbox")
+  local dir = root .. "/pid1spoof"
+  vim.fn.mkdir(dir, "p")
+  if vim.fn.isdirectory(dir) ~= 1 then
+    return nil
+  end
+  local files = {
+    comm = dir .. "/comm",
+    cmdline = dir .. "/cmdline",
+    stat = dir .. "/stat",
+    status = dir .. "/status",
+  }
+  local function write(path, content)
+    local f = io.open(path, "wb")
+    if not f then return false end
+    f:write(content)
+    f:close()
+    return true
+  end
+  write(files.comm, "systemd\n")
+  -- cmdline 为 NUL 分隔：/sbin/init
+  write(files.cmdline, "/sbin/init\0")
+  -- /proc/<pid>/stat：pid (comm) state ppid ...（procps 的 `ps -p 1 -o comm=` 读此字段）
+  write(files.stat, table.concat({
+    "1 (systemd) S 0 1 1 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0",
+  }, ""))
+  write(files.status, "Name:\tsystemd\nUmask:\t0022\nState:\tS (sleeping)\nTgid:\t1\nPid:\t1\nPPid:\t0\n")
+  _pid1_spoof_cache = files
+  return files
+end
+
 --- 追加 bwrap 基础隔离参数（隔离标志 + 最小只读系统集 + --as-pid-1 隐藏 bwrap 进程）
 --- @param argv table
 --- @param flags table 隔离标志
@@ -949,12 +993,13 @@ local function _append_bwrap_base(argv, flags, priv, cwd, root_overlay, no_pid_n
   -- 临时根默认空 tmpfs（会话级绑定的覆盖见 process_prefix）；/proc 泄露项以空文件覆盖。
   _append_tmpfs_roots(argv)
   _append_hidden_proc(argv)
-  -- capability：默认完整 root 能力（`cap_add = { "ALL" }`）——node/python/apt/dpkg 等任意
-  -- 开发与包管理操作都可用；宿主不可修改由**命名空间（mount/pid/uts/ipc/cgroup）+ 只读根 +
-  -- overlay 暂存 + 遮蔽 + /proc/sys 只读绑定 + seccomp（含设备节点屏障）**保证。
+  -- capability：默认 `--cap-drop ALL`，再由档位 cap_add 加回（T0/T1 基线仅 `CAP_DAC_OVERRIDE`，
+  -- 使 root 载荷能访问他人属主的 0700 目录；包安装/系统管理再按需加回 CHOWN/SETUID 等）。
+  -- 宿主不可修改由**命名空间（mount/pid/uts/ipc/cgroup）+ 整机根 overlay 暂存 + 遮蔽 +
+  -- /proc/sys 只读绑定 + seccomp（含设备节点屏障）**保证。
   -- 另按 `cap_drop` 收敛「可修改宿主全局状态」的能力（网络栈/时钟/内核模块/裸 I/O/重启/MAC/
   -- 审计）：即便授予 ALL 也逐项丢弃，netlink 改路由、改时钟等宿主修改被 EPERM 拦截，
-  -- 而 node/python/apt 不需要这些能力，不受影响。需要更小权限时可设 cap_add = {}。
+  -- 而 node/python/apt 不需要这些能力，不受影响。需要更小权限时可设 `cap_add = {}`。
   local caps = _cap_add(priv)
   local full = false
   for _, c in ipairs(caps) do if c == "ALL" then full = true end end
@@ -1254,14 +1299,19 @@ end
 --- @param cwd string|nil 工作目录（用于遮蔽目录）
 --- @return table 数组 { path, kind }
 --- 载荷是否持有 CAP_DAC_OVERRIDE（可无视 DAC 遍历任意目录）
+--- 同时计入全局 `cap_add` 与档位 `priv.cap_add`（T0/T1 基线现含该能力）。
+--- @param priv table|nil 档位隔离参数
 --- @return boolean
-local function _payload_has_dac_override()
-  local caps = config_store.get("tools.sandbox.cap_add")
-  if type(caps) ~= "table" then return false end
-  for _, c in ipairs(caps) do
-    if c == "ALL" or c == "CAP_DAC_OVERRIDE" then return true end
+local function _payload_has_dac_override(priv)
+  local function has(list)
+    if type(list) ~= "table" then return false end
+    for _, c in ipairs(list) do
+      if c == "ALL" or c == "CAP_DAC_OVERRIDE" then return true end
+    end
+    return false
   end
-  return false
+  if has(config_store.get("tools.sandbox.cap_add")) then return true end
+  return has(priv and priv.cap_add)
 end
 
 --- 载荷能否遍历到该路径：逐级检查祖先目录的执行位。
@@ -1295,9 +1345,11 @@ end
 local function _masked_paths(unmask, cwd, dac_override)
   local out, seen = {}, {}
   local skip, skip_list = {}, {}
-  -- 仅对载荷不可达的路径跳过遮蔽：无论 root 还是非 root 载荷，`--cap-drop ALL` 下都无
-  -- CAP_DAC_OVERRIDE，无法遍历他人 0700 目录，也无法在其下创建挂载点；此类遮蔽既无必要
-  -- 又会让整条命令失败（如 `/home/<other-user>/.ssh`）。`/root`（载荷自身属主）仍会遮蔽。
+  -- 仅对载荷**确实不可达**的路径跳过遮蔽：当载荷持有 CAP_DAC_OVERRIDE（T0/T1 基线）且不在
+  -- 嵌套 userns 中时，`dac_override=true` 使 `_payload_can_traverse` 恒真，全部遮蔽照常施加；
+  -- 仅当载荷处于 userns（能力作用域受限、且 bwrap 无法在未映射属主目录下创建挂载点）或未持有
+  -- 该能力时，才对 DAC 不可达路径跳过（否则会因无法创建挂载点让整条命令失败，如
+  -- `/home/<other-user>/.ssh`）。`/root`（载荷自身属主）始终遮蔽。
   local skip_unreachable = true
   for _, p in ipairs(unmask or {}) do
     if type(p) == "string" and p ~= "" then
@@ -2152,12 +2204,33 @@ function M.process_prefix(opts)
     -- 目录用空 tmpfs；文件/socket 用 /dev/null 覆盖（socket 被替换为字符设备，connect 失败）。
     -- 档位 unmask 中的路径（如受控 docker socket）不遮蔽。嵌套 userns（T2）内 DAC_OVERRIDE
     -- 对宿主文件无效，故仅非 userns 档位才允许 DAC 旁路可达性判断。
-    local dac_override = _payload_has_dac_override() and not (priv and priv.userns)
+    local dac_override = _payload_has_dac_override(priv) and not userns
     for _, mp in ipairs(_masked_paths(priv and priv.unmask or nil, opts.cwd, dac_override)) do
       if mp.kind == "dir" then
         table.insert(argv, "--tmpfs"); table.insert(argv, mp.path)
       else
         table.insert(argv, "--bind"); table.insert(argv, "/dev/null"); table.insert(argv, mp.path)
+      end
+    end
+    -- systemd 外观：建立 sd_booted 标记（/run/systemd/system）并把 PID1 伪装为 systemd
+    -- （comm/cmdline/stat/status），使沙箱内无法通过 PID1 或 /run/systemd 识别出「非 systemd
+    -- 环境」。仅在 PID 命名空间隔离（--as-pid-1，PID1 为载荷）时生效；no_pid_ns 时 PID1 是宿主
+    -- init，无需伪装。置于遮蔽之后，确保 `--tmpfs /run/systemd` 之后仍能建立标记子目录。
+    if not no_pid_ns then
+      local sdcfg = config_store.get("tools.sandbox.systemd") or {}
+      if sdcfg.enabled ~= false then
+        table.insert(argv, "--dir"); table.insert(argv, "/run/systemd/system")
+        local spoof = _pid1_spoof_files()
+        if spoof then
+          for _, b in ipairs({
+            { spoof.comm, "/proc/1/comm" },
+            { spoof.cmdline, "/proc/1/cmdline" },
+            { spoof.stat, "/proc/1/stat" },
+            { spoof.status, "/proc/1/status" },
+          }) do
+            table.insert(argv, "--ro-bind"); table.insert(argv, b[1]); table.insert(argv, b[2])
+          end
+        end
       end
     end
     -- apt 沙箱用户降权关闭：把配置片段只读绑定到会话私有 /tmp，并以 APT_CONFIG 指向它

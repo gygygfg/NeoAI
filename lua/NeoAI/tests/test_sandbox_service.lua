@@ -77,38 +77,12 @@ tests.suite("sandbox_service", function(_, it)
     vim.fn.delete(dir, "rf")
   end)
 
-  it("service_* 工具为 long_lived 进程规格，logs/status 为只读", function(t)
+  it("service_* 工具不再对 AI 注册（内部模块仅供 systemd 门面复用）", function(t)
     local registry = require("NeoAI.tools.registry")
-    local start = registry.get("service_start")
-    t.not_nil(start, "service_start 应已注册")
-    t.eq("process", start.__sandbox_spec.effect)
-    t.true_(start.__sandbox_spec.long_lived == true, "service_start 应标记 long_lived")
-    local stop = registry.get("service_stop")
-    t.not_nil(stop)
-    t.true_(stop.__sandbox_spec.long_lived == true, "service_stop 应标记 long_lived")
-    t.eq("read", registry.get("service_logs").__sandbox_spec.effect)
-    t.eq("read", registry.get("service_status").__sandbox_spec.effect)
-  end)
-
-  it("门禁：service_start 经 long_lived 分支执行并可停止", function(t)
-    with_config({
-      tools = {
-        approval = { mode = "auto_allow" },
-        sandbox = sandbox_config(),
-      },
-    }, function()
-      require("NeoAI.sandbox").reset()
-      local done, err = false, nil
-      require("NeoAI.tools").execute("service_start",
-        { name = "gate1", command = "echo hi; sleep 30", description = "t" }, {})
-        :then_(function() done = true end, function(e) err = e; done = true end)
-      t.true_(vim.wait(15000, function() return done end, 50), "应返回")
-      t.eq(nil, err, "不应报错: " .. tostring(err and (err.message or err)))
-      local svc_mod = require("NeoAI.sandbox.service")
-      t.not_nil(svc_mod.status("gate1"), "服务应已注册")
-      svc_mod.stop_all({ timeout_ms = 10000 })
-      t.eq(nil, svc_mod.status("gate1"), "stop_all 后应清空")
-    end)
+    t.eq(nil, registry.get("service_start"), "service_start 不应注册")
+    t.eq(nil, registry.get("service_stop"), "service_stop 不应注册")
+    t.eq(nil, registry.get("service_logs"), "service_logs 不应注册")
+    t.eq(nil, registry.get("service_status"), "service_status 不应注册")
   end)
 
   it("镜像：pip/npm 环境变量 + maven settings.xml 与 MAVEN_OPTS", function(t)

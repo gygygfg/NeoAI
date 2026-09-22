@@ -14,7 +14,10 @@ local MUTATING = {
   add = true, commit = true, stash = true, checkout = true, reset = true, restore = true,
   merge = true, rebase = true, ["cherry-pick"] = true, revert = true, switch = true,
   rm = true, mv = true, apply = true, clean = true, pull = true, fetch = true, push = true,
-  init = true, clone = true, gc = true, prune = true, ["update-ref"] = true, am = true,
+  -- `clone`/`init` 不在拦截列表：它们**新建**仓库（不修改现有索引↔对象↔refs 耦合），
+  -- 供 pyenv/nvm 等官方安装脚本使用；新建的 `.git` 由 candidate 按 git_path_class 原子
+  -- 捕获/发布（对象先于指针）。其余变更子命令仍拦截，改走专用 git 工具。
+  gc = true, prune = true, ["update-ref"] = true, am = true,
   worktree = true, submodule = true, ["symbolic-ref"] = true, ["commit-tree"] = true,
   ["write-tree"] = true, ["read-tree"] = true, ["hash-object"] = true, ["update-index"] = true,
   ["add--interactive"] = true, ["checkout-index"] = true, filter = true,

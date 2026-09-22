@@ -221,4 +221,21 @@ tests.suite("sandbox_systemd", function(_, it)
     end)
     vim.fn.delete(dir, "rf")
   end)
+
+  it("外观：is-system-running / is-failed / 无单元 status 合成真实 systemd 输出", function(t)
+    local sd = require("NeoAI.sandbox.systemd")
+    local function run(cmd)
+      local plan = sd.parse_command(cmd)
+      t.not_nil(plan, "应识别: " .. cmd)
+      t.eq("facade", plan.route, cmd .. " 应路由到门面")
+      local done, text, err
+      sd.handle(plan):then_(function(v) text = v; done = true end, function(e) err = e; done = true end)
+      t.true_(vim.wait(2000, function() return done end, 10), cmd .. " 应返回")
+      t.eq(nil, err, tostring(err))
+      return text or ""
+    end
+    t.matches("running", run("systemctl is-system-running"))
+    t.matches("active", run("systemctl is-failed"))
+    t.matches("running", run("systemctl status"))
+  end)
 end)

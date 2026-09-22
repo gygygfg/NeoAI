@@ -687,7 +687,7 @@ one does). For risk levels and allowlists see the `approval` config and [docs/en
 
 | Tool name        | Description               | Parameters |
 | ------------- | ------------------ | -------- |
-| `run_command` | Execute a Shell command (non-interactive, asynchronous jobstart) | `command` (required) the command to run (quote it when needed so it isn't split early); `timeout_ms` (optional, default 30000, -1 = unlimited). Pass a larger value explicitly in the same call for long tasks; a command ending in `&`/`nohup` is turned into a long-running service managed via `service_logs`/`service_status`/`service_stop`. Common read-only commands `ls`/`wc`/`find`/`grep`/`pwd` hit the argument allowlist |
+| `run_command` | Execute a Shell command (non-interactive, asynchronous jobstart) | `command` (required) the command to run (quote it when needed so it isn't split early); `timeout_ms` (optional, default 30000, -1 = unlimited). Pass a larger value explicitly in the same call for long tasks; with `tools.sandbox.resident` enabled, background processes started with `&`/`nohup`/`setsid` survive across tool calls (shared sandbox namespace per session). Common read-only commands `ls`/`wc`/`find`/`grep`/`pwd` hit the argument allowlist |
 
 ### 🔄 Git Tools
 

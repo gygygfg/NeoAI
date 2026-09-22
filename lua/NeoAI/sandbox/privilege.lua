@@ -20,13 +20,14 @@ M.TIER = { MINIMAL = 0, ELEVATED = 1, PRIVILEGED = 2 }
 -- 档位默认（配置缺省时兜底；与 default_config.lua 保持一致）
 local TIER_DEFAULTS = {
   -- T0 默认放行网络（仅记录）但经 host_proxy 拦截本机访问；offline=true 时仍硬隔离。
-  -- 档位默认不授予任何 capability（受控启动：全局 cap_add 默认空 → --cap-drop ALL），
-  -- 包安装所需的窄能力由 resolve() 按 `packages.cap_add` 按需加回。
-  [0] = { name = "minimal", review = "auto", network = true, cap_add = {}, mounts = {}, unmask = {} },
+  -- 基线为 `--cap-drop ALL` + `CAP_DAC_OVERRIDE`：载荷以 root 运行，需该能力访问他人属主的
+  -- 0700 目录（如 `_apt` 的 `/var/cache/apt/archives/partial`）；隔离由命名空间 + overlay 暂存 +
+  -- 遮蔽 + seccomp 保证。包安装/系统管理所需的其余窄能力由 resolve() 按需加回。
+  [0] = { name = "minimal", review = "auto", network = true, cap_add = { "CAP_DAC_OVERRIDE" }, mounts = {}, unmask = {} },
   -- T1 提权不默认解除 docker.sock 遮蔽：socket 仅在命令被分类为 docker（req.docker）时
   -- 由 resolve() 按需挂载并解除遮蔽，避免 `pip install` 这类 T1 命令连带放行 docker。
   [1] = {
-    name = "elevated", review = "auto", network = true, cap_add = {}, mounts = {}, unmask = {},
+    name = "elevated", review = "auto", network = true, cap_add = { "CAP_DAC_OVERRIDE" }, mounts = {}, unmask = {},
   },
   -- T2 特权：嵌套 userns 内授予完整能力（caps 被 userns 作用域限制，够不到宿主；
   -- 主机效果冻结为提案异步审批）。seccomp 基线仍然生效（mount/init_module 等被拦）。
@@ -287,6 +288,13 @@ local function _classify_segment(seg, rules)
   if not raw then return nil, nil end
   local bin = vim.fn.fnamemodify(raw, ":t")
   local sub = toks[i + 1]
+  -- `systemctl --user` / `journalctl --user`：用户级 systemd，非特权操作（由沙箱内嵌套
+  -- 真实 systemd 用户实例处理；不触碰宿主 systemd），不提升档位。
+  if bin == "systemctl" or bin == "journalctl" then
+    for _, tk in ipairs(toks) do
+      if tk == "--user" then return nil, nil end
+    end
+  end
   -- 只读列举的 `mount`（无位置参数、无变更型选项）不算特权操作。
   if bin == "mount" and not _mount_mutates(toks, i + 1) then
     return nil, nil
@@ -585,10 +593,21 @@ function M.resolve(tier, req)
   -- echo; tail`、`apt update | tee log` 这类常见链式命令误判为混合命令而不授予，导致安装失败。
   -- 写入仍全部进 overlay 暂存，敏感路径由遮蔽挂载保护，故混合命令继承窄能力不扩大宿主面。
   if req and req.package then
-    local pcaps = (config_store.get("tools.sandbox.packages") or {}).cap_add
+    local pcfg = config_store.get("tools.sandbox.packages") or {}
+    local pcaps = pcfg.cap_add
     if type(pcaps) == "table" then
       for _, c in ipairs(pcaps) do
         if type(c) == "string" and c ~= "" then priv.cap_add[#priv.cap_add + 1] = c end
+      end
+    end
+    -- 账户库解除遮蔽：postinst 的 adduser/su 子进程需要读写 /etc/{passwd,group,shadow,gshadow}
+    -- （否则 adduser 无法建用户、`su - <svc>` 认证失败）。写入仍进 overlay 暂存，需审批发布。
+    local punmask = pcfg.unmask
+    if type(punmask) == "table" then
+      for _, p in ipairs(punmask) do
+        if type(p) == "string" and p ~= "" and not vim.tbl_contains(priv.unmask, p) then
+          priv.unmask[#priv.unmask + 1] = p
+        end
       end
     end
   end

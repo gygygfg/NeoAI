@@ -54,8 +54,9 @@ Tool definitions support two execution forms (`executor._call_tool`):
 `tool_helpers.lua` is the tool-definition helper library and is not part of the built-in list.
 
 Built-in tool modules: `file_ops` / `shell` / `git_ops` / `lsp_ops` / `tree_ops` / `log_ops` / `plan` (sub-agent) /
-`todo` / `plan_mode` / `ask_user` / `read_image` / `web_fetch` (web fetch, disabled by default) / `skills` (skill tools + system prompt section) /
-`service` (long-lived services: `service_start`/`service_logs`/`service_status`/`service_stop`).
+`todo` / `plan_mode` / `ask_user` / `read_image` / `web_fetch` (web fetch, disabled by default) / `skills` (skill tools + system prompt section).
+(The `service` long-lived-service module is no longer registered; background processes are carried by the
+session-resident sandbox instance, see `sandbox/resident.lua`.)
 MCP remote tools are registered dynamically by `services/mcp/init.lua` (`category = "mcp"`, `source = "mcp"`); see [mcp.md](mcp.md) for details.
 
 ## 4. Execution Flow (tools/executor.lua)
@@ -196,15 +197,15 @@ processing; already-produced content is still returned and marked "truncated".
 When a command ends with exit code 137 (SIGKILL), the resource-domain events are read to distinguish
 "suspected OOM" from "forcibly terminated".
 
-### 🔌 Long-lived services (service.lua)
+### 🔌 Background processes (session-resident sandbox instance)
 
-`service_start` (start a background persistent process that survives across tool calls) / `service_logs` /
-`service_status` / `service_stop`. A `run_command` that ends with a terminal `&` or starts with
-`nohup`/`setsid` is automatically promoted into a long-lived service (survives across calls); a service
-runs in its own sandbox overlay + cgroup; on stop it first gets SIGTERM for a graceful exit and is only
-SIGKILLed on timeout, with its workspace changes frozen as candidates and queued for async review. Its
-lifecycle is reclaimed by `sandbox.shutdown`/`reset`. See the "Long-lived services" section of
-[sandbox.md](sandbox.md).
+A `run_command` that ends with a terminal `&` or starts with `nohup`/`setsid` is carried by the
+**session-resident sandbox instance** when `tools.sandbox.resident.enabled=true`: commands execute
+inside one persistent mount+pid namespace, so background processes survive across tool calls
+(visible to `ps`/`kill` within the session), close to normal bash. Command changes are still captured
+per call and frozen as candidates for async review. The `service_*` tools are no longer registered
+(the AI manages background processes with plain shell); `sandbox.service` is kept only for the
+systemctl facade. See the "Session-resident sandbox instance" section of [sandbox.md](sandbox.md).
 
 ### 🗂 Git (git_ops.lua)
 

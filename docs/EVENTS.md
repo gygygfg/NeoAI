@@ -271,7 +271,7 @@ vim.api.nvim_create_autocmd("User", {
 | `SANDBOX_SYSTEMD_UNSUPPORTED` | `sandbox:systemd_unsupported` | 门面明确拒绝不支持的 systemd 语义（不落宿主机） | `{ verb, units, command_id }` |
 | `SANDBOX_CONTAINER_PLANNED` | `sandbox:container_planned` | 容器受控计划（命名空间共享 / 受控 socket） | `{ manager, mode, share_namespace, reason, command_id }` |
 | `SANDBOX_CONTAINER_UNSUPPORTED` | `sandbox:container_unsupported` | 容器门面拒绝需宿主守护进程/远程/宿主子命令 | `{ manager, sub, reason, command_id }` |
-| `SANDBOX_BACKGROUND_ROUTED` | `sandbox:background_routed` | run_command 的后台命令（`&`/nohup/setsid）被门面转为长驻服务 | `{ name, service_id, kind, command_id }` |
+| `SANDBOX_BACKGROUND_ROUTED` | `sandbox:background_routed` | （保留常量）旧后台命令门面转为长驻服务时发出；后台门面已移除，不再触发 | `{ name, service_id, kind, command_id }` |
 
 ## 4. 事件订阅最佳实践
 

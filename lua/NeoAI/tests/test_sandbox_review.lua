@@ -243,12 +243,25 @@ tests.suite("sandbox_review", function(_, it)
     end
   end)
 
-  it("build_lines 待审普通条目不折叠（不登记折叠级别）", function(t)
+  it("build_lines 待审普通条目「头行显示、其余折叠」", function(t)
     local sr = require("NeoAI.ui.components.sandbox_review")
     local cwd = vim.fn.getcwd()
-    local data = sr.build_lines({ { change_set_id = "csP", tool = "edit_file",
-      files = { { path = cwd .. "/p.lua" } } } }, {}, nil, {})
-    t.eq(0, #vim.tbl_keys(data.fold_levels or {}), "待审普通条目不应登记折叠级别")
+    local data = sr.build_lines({ { change_set_id = "csP", tool = "edit_file", risk_level = 1,
+      risk_reasons = { "PACKAGE_INSTALL" },
+      files = { { path = cwd .. "/p.lua" }, { path = cwd .. "/q.lua" } } } }, {}, nil, {})
+    local fl = data.fold_levels or {}
+    local head, last
+    for i, l in ipairs(data.lines) do
+      if l:find("csP", 1, true) then head = i end
+      if l:find("q.lua", 1, true) then last = i end
+    end
+    t.not_nil(head, "应有头行")
+    t.not_nil(last, "应有文件行")
+    t.eq(nil, fl[head], "头行不折叠（保持正常显示与高亮）")
+    for ln = head + 1, last do
+      t.eq(1, fl[ln], "头行之后的风险原因/文件行都应登记一级折叠")
+    end
+    t.eq(nil, fl[last + 1], "条目尾空行不应登记折叠级别（避免相邻条目合并）")
   end)
 
   it("build_lines 待审 git 原子组登记整组折叠级别", function(t)
@@ -312,6 +325,19 @@ tests.suite("sandbox_review", function(_, it)
     t.eq(-1, closed(head + 1), "zo 后 git 组其余行应展开")
     sr.close()
     services.provide("services.sandbox", saved)
+  end)
+
+  it("build_lines 合并重复风险原因并计数", function(t)
+    local sr = require("NeoAI.ui.components.sandbox_review")
+    local cwd = vim.fn.getcwd()
+    local reasons = { "PACKAGE_INSTALL" }
+    for _ = 1, 2797 do reasons[#reasons + 1] = "SYSTEM_PATH_WRITE" end
+    local data = sr.build_lines({ { change_set_id = "csDup", tool = "run_command", risk_level = 1,
+      risk_reasons = reasons, files = { { path = cwd .. "/p.lua" } } } }, {}, nil, {})
+    local text = table.concat(data.lines, "\n")
+    t.matches("SYSTEM_PATH_WRITE×2797", text, "重复原因应合并计数")
+    local _, bare = text:gsub("SYSTEM_PATH_WRITE,", "")
+    t.eq(0, bare, "SYSTEM_PATH_WRITE 不应再逐条重复列出")
   end)
 
   it("窗口打开时订阅沙箱广播事件并自动刷新", function(t)

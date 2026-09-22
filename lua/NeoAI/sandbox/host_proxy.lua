@@ -105,6 +105,58 @@ local function _ip_is_host_local(ip)
   return false
 end
 
+--- 回环地址（127/8 或 ::1）——端口白名单只放行回环，不放行宿主网卡 IP/元数据/链路本地。
+--- @param ip string
+--- @return boolean
+local function _is_loopback(ip)
+  ip = _canon_ip(ip)
+  local n = _ipv4_to_num(ip)
+  if n then return math.floor(n / 0x1000000) == 127 end
+  return ip == "::1"
+end
+
+--- 本机端口白名单（如沙箱内启动的 DB/Redis 自测）：`tools.sandbox.network.allow_localhost_ports`。
+--- @return table 端口数组
+local function _allow_local_ports()
+  if state.opts.allow_localhost_ports ~= nil then return state.opts.allow_localhost_ports end
+  local ok, cfg = pcall(function()
+    return require("NeoAI.kernel.config_store").get("tools.sandbox.network") or {}
+  end)
+  return (ok and cfg.allow_localhost_ports) or {}
+end
+
+--- 端口是否在白名单
+--- @param port number|string
+--- @return boolean
+local function _port_allowed(port)
+  local list = _allow_local_ports()
+  if type(list) ~= "table" then return false end
+  local p = tonumber(port)
+  if not p then return false end
+  for _, v in ipairs(list) do
+    if tonumber(v) == p then return true end
+  end
+  return false
+end
+
+--- 是否放行该本机目标：仅「回环地址 + 白名单端口」。宿主网卡 IP/元数据/链路本地永不放行。
+--- @param host string
+--- @param port number|string
+--- @param ips table|nil 已解析 IP（可空）
+--- @return boolean
+local function _allow_local(host, port, ips)
+  if not _port_allowed(port) then return false end
+  local lower = tostring(host or ""):lower():gsub("^%[", ""):gsub("%]$", "")
+  if lower == "localhost" or lower:sub(-10) == ".localhost" then return true end
+  if type(ips) == "table" and #ips > 0 then
+    for _, ip in ipairs(ips) do
+      if _is_loopback(ip) then return true end
+    end
+    return false
+  end
+  return _is_loopback(lower)
+end
+
 --- 解析主机名为规范化 IP 列表（同步，含 IP 字面量）。
 --- 统一经 getaddrinfo：它把八进制/十六进制/短式 IPv4 与全展开 IPv6 全部规范化为标准形式，
 --- 避免「字面量字符串比较」与「连接时内核解析」不一致造成的绕过。
@@ -290,14 +342,14 @@ local function _handle_http(ctx, client, header, rest)
     p = tonumber(p)
     ctx.state = "resolving"
     _classify_async(h, function(local_, ips)
-      if local_ then
+      if local_ and not _allow_local(h, p, ips) then
         _record(h, p, "http", "block")
         _respond(client, 403, "Forbidden", "host_local_blocked")
         return
       end
       ctx.state = "connecting"
       _open_upstream(h, ips, p, function(up)
-        _record(h, p, "http", "allow")
+        _record(h, p, "http", local_ and "allow_local" or "allow")
         pcall(function() client:write("HTTP/1.1 200 Connection Established\r\n\r\n") end)
         _start_piping(ctx, client, up, rest)
       end, function()
@@ -322,14 +374,14 @@ local function _handle_http(ctx, client, header, rest)
   local rewritten = header:gsub("^([^\r\n]+)", method .. " " .. path .. " HTTP/1.1", 1)
   ctx.state = "resolving"
   _classify_async(h, function(local_, ips)
-    if local_ then
+    if local_ and not _allow_local(h, p, ips) then
       _record(h, p, "http", "block")
       _respond(client, 403, "Forbidden", "host_local_blocked")
       return
     end
     ctx.state = "connecting"
     _open_upstream(h, ips, p, function(up)
-      _record(h, p, "http", "allow")
+      _record(h, p, "http", local_ and "allow_local" or "allow")
       pcall(function() up:write(rewritten .. "\r\n\r\n") end)
       _start_piping(ctx, client, up, rest)
     end, function()
@@ -411,7 +463,7 @@ local function _process_socks(ctx, client)
 
     ctx.state = "resolving"
     _classify_async(host, function(local_, ips)
-      if local_ then
+      if local_ and not _allow_local(host, port, ips) then
         _record(host, port, "socks5", "block")
         _socks_reply(client, 2) -- connection not allowed by ruleset
         _close(client)
@@ -419,7 +471,7 @@ local function _process_socks(ctx, client)
       end
       ctx.state = "connecting"
       _open_upstream(host, ips, port, function(up)
-        _record(host, port, "socks5", "allow")
+        _record(host, port, "socks5", local_ and "allow_local" or "allow")
         _socks_reply(client, 0)
         _start_piping(ctx, client, up, rest)
       end, function()

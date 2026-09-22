@@ -45,6 +45,19 @@ tests.suite("sandbox_governance", function(_, it)
       "管道执行应为 L3")
   end)
 
+  it("风险原因去重：大量同类写入路径只保留一个类别", function(t)
+    local risk = require("NeoAI.sandbox.risk")
+    local paths = {}
+    for i = 1, 500 do paths[i] = "/usr/lib/pkg/file" .. i end
+    local r = risk.classify({ effect = "process", paths = paths, package = true })
+    local n = 0
+    for _, reason in ipairs(r.reasons) do
+      if reason == "SYSTEM_PATH_WRITE" then n = n + 1 end
+    end
+    t.eq(1, n, "SYSTEM_PATH_WRITE 应去重为 1 条")
+    t.true_(vim.tbl_contains(r.reasons, "PACKAGE_INSTALL"), "应保留 PACKAGE_INSTALL")
+  end)
+
   it("审批分级动作：默认 review；会话自动审批仅放行 L0/L1；包/密钥不自动", function(t)
     local risk = require("NeoAI.sandbox.risk")
     t.eq("review", risk.action(0, {}), "默认 L0 应待审")
@@ -450,10 +463,12 @@ tests.suite("sandbox_governance", function(_, it)
     local c2, p2 = resolved("chown -R apprunner:apprunner /opt/apps")
     t.true_(c2.sysadmin, "chown 应识别为系统管理")
     t.true_(vim.tbl_contains(p2.cap_add, "CAP_CHOWN"), "chown 应加回 CAP_CHOWN")
-    -- 普通命令：不加能力、不解除账户库遮蔽（口令哈希不泄露）。
+    -- 普通命令：不按 sysadmin 加回 CHOWN/SETUID 等，也不解除账户库遮蔽（口令哈希不泄露）；
+    -- 仅保留档位基线 CAP_DAC_OVERRIDE（root 载荷访问他人属主 0700 目录所需）。
     local c3, p3 = resolved("ls -la")
     t.false_(c3.sysadmin, "普通命令不应识别为系统管理")
-    t.eq(0, #p3.cap_add, "普通命令不应加能力")
+    t.eq(1, #p3.cap_add, "普通命令仅应含档位基线能力")
+    t.eq("CAP_DAC_OVERRIDE", p3.cap_add[1], "普通命令仅应含 CAP_DAC_OVERRIDE")
     t.false_(vim.tbl_contains(p3.unmask, "/etc/shadow"), "普通命令不应解除 /etc/shadow 遮蔽")
   end)
 
@@ -483,16 +498,17 @@ tests.suite("sandbox_governance", function(_, it)
     end)
   end)
 
-  it("并发进程命令串行化：并行 run_command 不互相污染", function(t)
+  it("并发进程命令并行执行：并行 run_command 互不阻塞（常驻实例多路复用）", function(t)
     local runtime = require("NeoAI.sandbox.runtime")
     if runtime.backend() ~= "bwrap" then return end
     local sandbox = require("NeoAI.sandbox")
+    -- /tmp 视为真正的临时根（不产生候选）：避免「测试把 /tmp 当工作区」引入的物化竞争干扰并行时序。
     with_config({ tools = { approval = { mode = "async" }, sandbox = {
-      mode = "dry_run", review = { enabled = true },
+      mode = "dry_run", review = { enabled = true }, ephemeral_roots = { "/tmp", "/var/tmp" },
     } } }, function()
       sandbox.reset()
-      -- A 先入队且较慢，B 后入队且很快：串行化下 A 必须先完成，文件顺序为 A→B；
-      -- 非串行时 B 会先写完，顺序为 B→A（可稳定区分）。
+      -- A 先发起且较慢，B 后发起且很快：并行执行下 B 先写完，文件顺序为 B→A；
+      -- 若仍串行则 A 先完成，顺序为 A→B（可稳定区分）。
       local order_file = "/tmp/neoai_conc_order_" .. tostring(vim.fn.getpid()) .. "_" .. tostring(os.time()) .. ".txt"
       local a_done, b_done = false, false
       require("NeoAI.tools").execute("run_command",
@@ -508,7 +524,7 @@ tests.suite("sandbox_governance", function(_, it)
         :then_(function(r) out = tostring(r); got = true end, function(e) out = tostring(e); got = true end)
       t.true_(vim.wait(15000, function() return got end), "读取顺序文件应完成")
       local body = tostring(out):gsub("%s+$", "")
-      t.true_(body == "A\nB", "进程命令应按 FIFO 串行（期望 A\\nB），实际: " .. tostring(out))
+      t.true_(body == "B\nA", "进程命令应并行执行（期望 B\\nA），实际: " .. tostring(out))
     end)
   end)
 
