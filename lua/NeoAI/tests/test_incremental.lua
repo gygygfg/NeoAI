@@ -420,4 +420,72 @@ tests.suite("incremental", function(_, it)
     chat_view.reset()
     chat_service.reset()
   end)
+
+  it("块描述符复用：未变化块复用，尾部/推理开关变化触发重建", function(t)
+    local message_list = require("NeoAI.ui.components.message_list")
+    local inc = require("NeoAI.ui.components.incremental")
+    message_list.reset()
+    local buf = _new_buf()
+    local msgs = {
+      { role = "user", content = "q" },
+      { role = "assistant", content = "a1" },
+      { role = "assistant", content = "a2" },
+    }
+    message_list.render(buf, msgs, {})
+    local cache = inc.cache_for(buf)
+    local first = cache.blocks
+    t.not_nil(first, "应记录块描述符")
+    message_list.render(buf, msgs, {})
+    t.eq(first[1], cache.blocks[1], "内容未变：首块描述符应复用")
+    t.eq(first[3], cache.blocks[3], "内容未变：末块描述符应复用")
+
+    -- 尾部流式增长：仅末块重建，前缀复用
+    msgs[3].content = "a2 增长"
+    message_list.render(buf, msgs, { streaming = true })
+    t.eq(first[1], cache.blocks[1], "尾部变化：前缀块仍复用")
+    t.ne(first[3], cache.blocks[3], "尾部变化：末块应重建")
+
+    -- 推理开关变化：渲染输入变化 → 块重建
+    local show = message_list.is_show_reasoning()
+    local before_show = cache.blocks[2]
+    message_list.set_show_reasoning(not show)
+    message_list.render(buf, msgs, {})
+    t.ne(before_show, cache.blocks[2], "推理开关变化应重建块")
+    message_list.set_show_reasoning(show)
+
+    inc.invalidate(buf)
+    vim.api.nvim_buf_delete(buf, { force = true })
+  end)
+
+  it("工具结果就地增长（同一消息表）触发重建且与全量一致", function(t)
+    local message_list = require("NeoAI.ui.components.message_list")
+    local inc = require("NeoAI.ui.components.incremental")
+    message_list.reset()
+    local buf = _new_buf()
+    local res = { role = "tool", tool_call_id = "c1", tool_name = "run_command", content = "" }
+    local msgs = {
+      { role = "user", content = "q" },
+      { role = "assistant", content = "", tool_calls = {
+        { id = "c1", ["function"] = { name = "run_command", arguments = "{}" } },
+      } },
+      res,
+    }
+    message_list.render(buf, msgs, {})
+    t.false_(_joined(buf):find("结果行 1", 1, true) ~= nil, "空结果不应含结果行")
+
+    -- 就地改写同一结果消息的 content（不换表）：廉价输入须检测长度变化并重建
+    res.content = "结果行 1\n结果行 2\n结果行 3"
+    local diff = message_list.render(buf, msgs, {})
+    t.true_(diff.changed, "结果内容增长应触发写入")
+    local inc_text = _joined(buf)
+    t.true_(inc_text:find("结果行 1", 1, true) ~= nil, "应渲染出新结果内容")
+
+    -- 与全量重建逐行一致
+    inc.invalidate(buf)
+    message_list.render(buf, msgs, {})
+    t.eq(inc_text, _joined(buf), "增量与全量重写应逐行一致")
+
+    inc.invalidate(buf)
+    vim.api.nvim_buf_delete(buf, { force = true })
+  end)
 end)

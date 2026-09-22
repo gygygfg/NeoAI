@@ -4,6 +4,7 @@
 --- 追加写入无需解析整个文件；崩溃恢复截断最后不完整行即可。
 
 local fs = require("NeoAI.utils.fs")
+local async = require("NeoAI.utils.async")
 local session_mod = require("NeoAI.core.session.session")
 local config_store = require("NeoAI.kernel.config_store")
 local event_bus = require("NeoAI.kernel.event_bus")
@@ -62,7 +63,7 @@ local function _rewrite_all(path, sessions)
   local sizes = {}
   for id, s in pairs(sessions) do
     if s then
-      local line = json.encode(session_mod.serialize(s))
+      local line = json.encode_fast(session_mod.serialize(s))
       lines[#lines + 1] = line
       sizes[id] = #line + 1
     end
@@ -168,15 +169,19 @@ function M.create(opts)
   return s, err
 end
 
---- 追加式持久化单个会话
+--- 准备一次追加持久化：编码单行并确保目录/日志状态就绪。
+--- 编码走 C 实现的 encode_fast（跳过纯 Lua UTF-8 深扫），是主线程唯一的大对象序列化。
 --- @param session table
---- @return boolean
-function M.persist(session)
+--- @return string|nil path
+--- @return string|nil line
+--- @return table|nil log
+--- @return any err
+local function _prepare_persist(session)
   local path = _session_path()
   local ok, err = fs.ensure_dir(fs.dirname(path))
-  if not ok then return false, err end
+  if not ok then return nil, nil, nil, err end
   local json = require("NeoAI.utils.json")
-  local line = json.encode(session_mod.serialize(session)) .. "\n"
+  local line = json.encode_fast(session_mod.serialize(session)) .. "\n"
   local log = state.logs[path]
   if not log then
     local stat = vim.uv.fs_stat(path)
@@ -186,15 +191,19 @@ function M.persist(session)
   end
   if log.dirty then
     local _, repair_err = fs.repair_jsonl(path)
-    if repair_err then return false, repair_err end
+    if repair_err then return nil, nil, nil, repair_err end
     log.dirty = false
   end
-  ok, err = fs.append_file(path, line)
-  if not ok then
-    -- 失败追加可能留下半行，后续重试不能直接接到其后。
-    log.dirty = true
-    return false, err
-  end
+  return path, line, log
+end
+
+--- 追加成功后的记账与周期合并。
+--- @param path string
+--- @param line string
+--- @param log table
+--- @param session table
+--- @return boolean
+local function _finish_persist(path, line, log, session)
   _record(log, session.id, #line)
   if _should_compact(log) then
     -- 追加已落盘；合并失败保留原日志并记录错误，下次持久化重试合并。
@@ -202,6 +211,37 @@ function M.persist(session)
     _save(path, sessions)
   end
   return true
+end
+
+--- 追加式持久化单个会话
+--- @param session table
+--- @return boolean
+function M.persist(session)
+  local path, line, log, err = _prepare_persist(session)
+  if not path then return false, err end
+  local ok
+  ok, err = fs.append_file(path, line)
+  if not ok then
+    -- 失败追加可能留下半行，后续重试不能直接接到其后。
+    log.dirty = true
+    return false, err
+  end
+  return _finish_persist(path, line, log, session)
+end
+
+--- 异步追加式持久化（写盘在 utils.work 线程池，不阻塞主线程）
+--- 编码使用 C 实现的 encode_fast（跳过纯 Lua UTF-8 深扫），主线程仅做一次 JSON 序列化。
+--- @param session table
+--- @return Deferred resolve(true), reject(err)
+function M.persist_async(session)
+  local path, line, log, err = _prepare_persist(session)
+  if not path then return async.reject(err) end
+  return fs.append_file_async(path, line):then_(function()
+    return _finish_persist(path, line, log, session)
+  end, function(e)
+    log.dirty = true
+    return async.reject(e)
+  end)
 end
 
 --- 保存（重写整个文件，用于删除/批量变更后）

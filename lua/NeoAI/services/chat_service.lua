@@ -107,15 +107,30 @@ local function _get_or_create_agent(opts)
   return agent
 end
 
---- 持久化 Agent 消息到会话
+--- 构建待持久化的会话快照（浅拷贝外壳，共享消息表，不做整会话 vim.deepcopy）
 --- @param agent table
-local function _persist_agent(agent)
+--- @return table|nil session
+--- @return table|nil stored
+--- @return table synced
+local function _build_persist_session(agent)
   local info = state.agents[agent.id]
-  if not info then return true end
+  if not info then return nil end
   local stored = session_store.get(info.session_id)
-  if not stored then return true end
-  -- 在候选快照上同步，落盘成功后再标记 _synced；写入失败可安全重试。
-  local session = vim.deepcopy(stored)
+  if not stored then return nil end
+  -- 浅拷贝会话外壳：消息表按引用共享（Lua 字符串不复制字节），仅新建 messages 数组与
+  -- metadata，避免对整个会话做 vim.deepcopy（大历史下是显著的主线程开销）。
+  local session = {
+    id = stored.id,
+    parent_id = stored.parent_id,
+    root_id = stored.root_id,
+    created_at = stored.created_at,
+    updated_at = stored.updated_at,
+    model = stored.model,
+    provider = stored.provider,
+    messages = {},
+    metadata = vim.tbl_extend("force", {}, stored.metadata or {}),
+  }
+  for i, m in ipairs(stored.messages or {}) do session.messages[i] = m end
   local synced = {}
   -- 同步消息；跳过运行时上下文快照（runtime_context），重开会话时由快照重新渲染，
   -- 避免把易变运行态固化到持久历史并污染「用户轮次」计数。
@@ -161,7 +176,7 @@ local function _persist_agent(agent)
   end
   session.model = agent.model
   session.provider = agent.config and agent.config.provider or nil
-  session.metadata.usage = vim.deepcopy(agent.usage)
+  session.metadata.usage = agent.usage
   -- 同步待办清单与计划模式状态到 durable surface（重开会话时还原）
   local todo_mod = require("NeoAI.tools.builtin.todo")
   session.metadata.todos = todo_mod.get(info.session_id)
@@ -171,19 +186,76 @@ local function _persist_agent(agent)
   }
   -- 压缩覆盖层随会话持久化：重开后仍用压缩替换发请求；渲染/持久化的 messages 仍是原始上下文。
   if agent.compaction then
-    session.metadata.compaction = vim.deepcopy(agent.compaction)
+    session.metadata.compaction = agent.compaction
   else
     session.metadata.compaction = nil
   end
-  if session.metadata.auto_naming == false then end
+  return session, stored, synced
+end
+
+--- 持久化成功后提交到内存 durable surface 并标记已同步
+local function _commit_persist(stored, session, synced)
+  for k, v in pairs(session) do stored[k] = v end
+  for _, msg in ipairs(synced) do msg._synced = true end
+end
+
+--- 异步持久化 Agent 消息（写盘在线程池，不阻塞主线程）
+--- @param agent table
+--- @return Deferred resolve(true), reject(err)
+local function _do_persist_agent(agent)
+  local session, stored, synced = _build_persist_session(agent)
+  if not session then return async.resolve(true) end
+  -- 异步写盘（线程池）：编码为 C 实现的 encode_fast，写盘不阻塞主线程。
+  return session_store.persist_async(session):then_(function()
+    _commit_persist(stored, session, synced)
+    return true
+  end, function(err)
+    vim.notify("[NeoAI] 会话保存失败，消息仍保留在内存中: " .. tostring(err), vim.log.levels.ERROR)
+    return async.reject(err)
+  end)
+end
+
+--- 同步持久化（窗口关闭等非热路径；保持同步失败语义）
+--- @param agent table
+--- @return boolean ok
+--- @return any err
+local function _persist_agent_sync(agent)
+  local session, stored, synced = _build_persist_session(agent)
+  if not session then return true end
   local ok, err = session_store.persist(session)
   if not ok then
     vim.notify("[NeoAI] 会话保存失败，消息仍保留在内存中: " .. tostring(err), vim.log.levels.ERROR)
     return false, err
   end
-  for k, v in pairs(session) do stored[k] = v end
-  for _, msg in ipairs(synced) do msg._synced = true end
+  _commit_persist(stored, session, synced)
   return true
+end
+
+-- 每会话持久化串行链：保证多次 persist 按调用顺序落盘，且快照构建在上一轮 _synced 标记
+-- 之后进行（否则会重复落盘同一批消息）。
+local persist_chains = {}
+
+--- 持久化 Agent 消息到会话（按会话串行；返回 Deferred）
+--- @param agent table
+--- @return Deferred
+local function _persist_agent(agent)
+  local info = state.agents[agent.id]
+  if not info then return async.resolve(true) end
+  local sid = info.session_id
+  local prev = persist_chains[sid]
+  local d
+  if prev then
+    d = prev:then_(function()
+      return _do_persist_agent(agent)
+    end, function()
+      return _do_persist_agent(agent)
+    end)
+  else
+    d = _do_persist_agent(agent)
+  end
+  -- 链尾吞掉拒绝，避免后续任务被中断；调用方仍能拿到 d 的拒绝。
+  persist_chains[sid] = d:then_(function() end, function() end)
+  return d
 end
 
 -- ========== 正忙暂存队列 ==========
@@ -225,9 +297,11 @@ local function _do_run(agent, content, opts)
   -- 才返回 Deferred）。后续每个工具循环轮末由 _ensure_persist_hook 注册的钩子继续增量保存。
   _persist_agent(agent)
   return run_d:then_(function(resp)
-    local ok, err = _persist_agent(agent)
-    if not ok then return async.reject({ kind = "persistence", message = tostring(err) }) end
-    return resp
+    return _persist_agent(agent):then_(function()
+      return resp
+    end, function(err)
+      return async.reject({ kind = "persistence", message = tostring(err and err.message or err) })
+    end)
   end, function(err)
     _persist_agent(agent)
     return async.reject(err)
@@ -571,7 +645,8 @@ function M.detach_window(win_id)
   if not agent_id then return end
   local agent = runtime.get(agent_id)
   if agent then
-    local ok, err = _persist_agent(agent)
+    -- 窗口关闭走同步持久化：保持失败时不 dispose 的既有语义。
+    local ok, err = _persist_agent_sync(agent)
     if not ok then return false, err end
     local session_id = agent.session_id
     runtime.dispose(agent)
@@ -657,7 +732,8 @@ function M.switch_model(model_id, provider)
     model = agent.model,
     provider = agent.config.provider,
   })
-  _persist_agent(agent)
+  -- 模型切换需立即随会话持久化（同步写盘，保证随后读取会话即见新模型）。
+  _persist_agent_sync(agent)
 end
 
 --- 切换当前 Agent 的计划模式
@@ -891,7 +967,8 @@ function M.persist_active_sessions()
     local agent = runtime.get(agent_id)
     if agent then
       n = n + 1
-      pcall(_persist_agent, agent)
+      -- 关闭/退出前兜底：同步写盘，保证调用返回后日志已落盘。
+      pcall(_persist_agent_sync, agent)
     end
   end
   return n

@@ -88,15 +88,15 @@ All event constants are defined in `NeoAI.kernel.events`. They are listed below 
 | Constant | Value | When it fires | Key payload fields |
 | --- | --- | --- | --- |
 | `REASONING_STARTED` | `reasoning:started` | Reasoning starts | `{ agent_id }` |
-| `REASONING_CHUNK` | `reasoning:chunk` | Reasoning content chunk | `{ agent_id, chunk, reasoning }` |
+| `REASONING_CHUNK` | `reasoning:chunk` | Reasoning content chunk | `{ agent_id, chunk }` (full accumulated reasoning is not carried per chunk; read it from the Agent message queue when needed) |
 | `REASONING_COMPLETED` | `reasoning:completed` | Reasoning completes | `{ agent_id }` |
 
 ### Messages
 
 | Constant | Value | When it fires | Key payload fields |
 | --- | --- | --- | --- |
-| `MESSAGE_ADDED` | `message:added` | Message added | `{ agent_id, message }` |
-| `MESSAGE_UPDATED` | `message:updated` | Message updated | `{ agent_id, message }` |
+| `MESSAGE_ADDED` | `message:added` | Message added | `{ agent_id, message }` (message is a lightweight view: `role/ts/tool_call_id/tool_name/has_content/has_reasoning/tool_call_count`, no body text; read the body from the Agent message queue) |
+| `MESSAGE_UPDATED` | `message:updated` | Message updated | `{ agent_id, message }` (same lightweight view, no body text) |
 | `MESSAGE_EDITED` | `message:edited` | Message edited | `{ agent_id, message }` |
 | `MESSAGE_DELETED` | `message:deleted` | Message deleted | `{ agent_id, message }` |
 | `MESSAGE_SENT` | `message:sent` | User sends a message | `{ agent_id, content }` |
@@ -132,10 +132,10 @@ All event constants are defined in `NeoAI.kernel.events`. They are listed below 
 | `TOOL_LOOP_LIMIT_REACHED` | `tool_loop:limit_reached` | Maximum rounds reached (1000) | `{ agent_id, rounds }` |
 | `TOOL_LOOP_GUARD_REMINDER` | `tool_loop:guard_reminder` | Guardrail injects a repeated-call reminder | `{ agent_id, repeats }` |
 | `TOOL_EXECUTION_STARTED` | `tool:execution_started` | A single tool starts executing | `{ agent_id, name, args, tool_call_id }` |
-| `TOOL_EXECUTION_COMPLETED` | `tool:execution_completed` | A single tool completes | `{ agent_id, name, result, tool_call_id, duration_ms }` |
+| `TOOL_EXECUTION_COMPLETED` | `tool:execution_completed` | A single tool completes | `{ agent_id, name, tool_call_id, duration_ms }` (no full result; read it from the Agent message queue) |
 | `TOOL_EXECUTION_ERROR` | `tool:execution_error` | A single tool errors | `{ agent_id, name, error, tool_call_id, duration_ms }` |
 | `TOOL_CALL_DETECTED` | `tool:call_detected` | Tool call detected | `{ agent_id, tool_calls }` |
-| `TOOL_RESULT_RECEIVED` | `tool:result_received` | Tool result received | `{ agent_id, message }` |
+| `TOOL_RESULT_RECEIVED` | `tool:result_received` | Tool result received | `{ agent_id, message }` (lightweight view, no result body) |
 | `TOOL_RESULT_PRUNED` | `tool:result_pruned` | Oversized tool results truncated before compaction | `{ agent_id, tool_name, chars_before, chars_after }` |
 | `TOOL_APPROVAL_REQUESTED` | `tool:approval_requested` | Tool approval initiated (enqueued) | `{ tool_name, args, agent_id }` |
 | `TOOL_APPROVED` | `tool:approved` | Approval granted | `{ tool_name, agent_id }` |

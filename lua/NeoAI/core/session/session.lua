@@ -42,10 +42,12 @@ end
 -- ========== 序列化 ==========
 
 --- 序列化为纯数据表（不含函数/引用）
+--- 直接返回会话表：JSON 编码只读不修改，无需 `vim.deepcopy`（整会话深拷贝是主线程开销）。
+--- 调用方不得修改返回值。
 --- @param session table
 --- @return table
 function M.serialize(session)
-  return vim.deepcopy(session)
+  return session
 end
 
 --- 反序列化

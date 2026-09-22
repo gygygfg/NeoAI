@@ -178,8 +178,13 @@ local function _append_request_meta(lines, msg, full)
       if body.stream ~= nil then parts[#parts + 1] = "流式 " .. tostring(body.stream) end
       if body.temperature ~= nil then parts[#parts + 1] = "温度 " .. tostring(body.temperature) end
       if body.max_tokens then parts[#parts + 1] = "max_tokens " .. tostring(body.max_tokens) end
-      if body.messages then parts[#parts + 1] = "消息 " .. #body.messages .. " 条" end
-      if body.tools then parts[#parts + 1] = "工具 " .. #body.tools .. " 个" end
+      -- 完整轮次用 messages/tools 数组；超出内存保留窗口的旧轮降级为 *_count 摘要。
+      local msg_count = body.message_count
+        or (type(body.messages) == "table" and #body.messages or nil)
+      if msg_count then parts[#parts + 1] = "消息 " .. msg_count .. " 条" end
+      local tool_count = body.tool_count
+        or (type(body.tools) == "table" and #body.tools or nil)
+      if tool_count then parts[#parts + 1] = "工具 " .. tool_count .. " 个" end
     end
     if #parts > 0 then
       lines[#lines + 1] = "    ⚙ 请求参数: " .. table.concat(parts, " · ")

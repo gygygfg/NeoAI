@@ -118,6 +118,7 @@ function M.new_block_cache()
     marks = nil, -- 与 lines 并行的元数据镜像
     new_lines = nil,
     new_marks = nil,
+    blocks = nil, -- 上一轮渲染的块描述符数组（供调用方复用未变化块的 build 闭包）
     stats = { hits = 0, misses = 0 },
   }, BlockCache)
 end
@@ -130,6 +131,7 @@ function BlockCache:reset()
   self.marks = nil
   self.new_lines = nil
   self.new_marks = nil
+  self.blocks = nil
   self.stats = { hits = 0, misses = 0 }
 end
 

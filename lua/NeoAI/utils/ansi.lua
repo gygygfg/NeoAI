@@ -113,6 +113,18 @@ local function _apply_sgr(st, params)
   end
 end
 
+--- 清洗显示用文本段：剥离 C0 控制字节（保留制表符；换行/回车/ESC 由 parse 处理）并把非法
+--- UTF-8 字节替换为 U+FFFD，避免命令输出中的控制字节/半个多字节字符在聊天窗口渲染成
+--- `^P` / `<f9>` 之类乱码。返回值的字节列即 span 使用的列（调用方据此计算区间）。
+--- @param run string
+--- @return string
+local function _sanitize_run(run)
+  if run == "" then return run end
+  local out = run:gsub("[%z\1-\8\11\12\14-\31\127]", "")
+  local stringx = require("NeoAI.utils.stringx")
+  return stringx.sanitize_utf8(out) or out
+end
+
 --- 解析文本为「行」数组：每行 { text = 纯文本, spans = { {start_col, end_col, hl}, ... } }。
 --- start_col/end_col 为 0-based 字节列（左闭右开）。含换行时按行切分。
 --- @param text string
@@ -158,7 +170,7 @@ function M.parse(text)
         if c == 27 or c == 10 or c == 13 then break end
         j = j + 1
       end
-      local run = text:sub(i, j - 1)
+      local run = _sanitize_run(text:sub(i, j - 1))
       local hl = _ensure_hl(st)
       if hl and #run > 0 then
         local s = #cur.text

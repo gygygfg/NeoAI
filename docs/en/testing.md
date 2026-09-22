@@ -93,6 +93,9 @@ ensures there are no leftover subscriptions or state between tests.
 | File | Coverage |
 | --- | --- |
 | `test_kernel` | Kernel: config merging, event bus, lifecycle |
+| `test_work_codec` | `vim.mpack` structured offload, binary round-trip and error propagation |
+| `test_stream_batching` | Streaming chunk accumulation (small content immediately visible; large content and the 8KB boundary lossless after finalize) |
+| `test_incremental` | Incremental rendering (line diff, block cache, block-descriptor reuse, in-place tool-result growth rebuild; incremental output matches full rebuild line-by-line) |
 | `test_session` | Session object, JSONL storage, context building, compaction |
 | `test_tool_result_pruner` | Tool result pruning (code point accounting, head/marker/tail, image skipping) |
 | `test_agent / test_guard / test_overflow` | Agent state machine, guardrails, overflow recovery, pairing-safe splitting |

@@ -664,7 +664,10 @@ detection) and `risk.classify` (security level), so `pip install`, `sudo modprob
 
 - **Background**: with the resident instance off (`resident.enabled=false`), every one-shot command
   runs in its own pid namespace + cgroup, and on completion `cgroup.release` → `cgroup.kill`
-  terminates the whole process tree; background processes do not survive across tool calls.
+  terminates the whole process tree; background processes do not survive across tool calls. In this
+  case `run_command` surfaces a UI notice (`ctx.ui_notice`) for commands with `&`/nohup/setsid intent,
+  telling the user that background processes will not survive (user-visible only; not written into the
+  model-visible result), so they do not assume the background task is still running.
 - **Resident instance**: with `tools.sandbox.resident.enabled=true` (default), `run_command` process
   commands in a sandbox session share one **long-lived bwrap instance** that runs a **command server**
   (bash reading requests from stdin) inside one persistent mount+pid+net+ipc+uts+cgroup namespace.
@@ -678,6 +681,18 @@ detection) and `risk.classify` (security level), so `pip install`, `sudo modprob
   the host cannot `kill` a sandbox pid), and a terminated command still returns the partial output
   produced before termination. The setup/capture phases remain serialized (see "Process commands run
   in parallel").
+- **Output framing**: command output blocks are carried as **base64** (decoded by the client). Command
+  output may contain the same control bytes as the frame delimiters (`\x1e`/`\x1f`) or NUL (Neovim's
+  job output layer rewrites NUL to a newline); a direct `cat` would break the `BEGIN/END` framing and
+  lose/cross-wire output. Base64 is pure ASCII, so framing is safe and binary output is lossless.
+- **Server self-healing**: if the command server exits unexpectedly (outer OOM / killed by a signal),
+  an in-flight command no longer reports a bare "exit code -1, no output" — the client **rebuilds the
+  resident instance from the retained startup parameters and retries once** (only for non-timeout,
+  non-cancel cases). If the instance is already dead, the next command also rebuilds from it instead of
+  silently falling back to the one-shot path.
+- **Dependency preflight**: the command server needs `base64`/`flock` for frame encoding and atomic
+  concurrent output; if missing, `resident.available()` returns false and the one-shot path is used
+  (avoiding commands hanging with no output until timeout).
 - **Why a command server instead of nsenter**: bwrap's root view is applied by `chroot`/`pivot_root`
   on the **process** (`fs_struct`), not the mount namespace; an external `nsenter -m` only enters the
   mount table and cannot get that root, so exec fails with `No such file or directory`. The server
@@ -689,6 +704,23 @@ detection) and `risk.classify` (security level), so `pip install`, `sudo modprob
   namespace** by `resident.materialize()` (writes go through the overlay mount, avoiding overlayfs'
   "host-side upper changes while mounted are undefined"). After a command the gate captures changes by
   **reading** the upper host-side.
+- **Large-file materialization (inbox copy)**: the resident command server reads requests from stdin.
+  Each frame header (one line) carries the **payload byte length**; the payload is **raw bytes**
+  (no base64) consumed with `head -c` in **blocks** — this removes one whole-frame base64 encode
+  (client main thread) and decode (server), and avoids the bash `read` builtin's **byte-by-byte**
+  read of tens-of-MB frames (1 byte per syscall), which pegs the CPU. Materialization is built and
+  sent in batches (up to 128 entries / 1MB), yielding to the main loop via `vim.defer_fn` between
+  batches so a hundred-MB payload never blocks the nvim main thread for long. Staged files that are
+  `large` (content carried as a blob) or exceed `tools.sandbox.resident.max_embed_bytes` (default
+  256KB) are copied host-side into an inbox under the session directory (already bind-mounted into
+  the namespace); the server receives only a small frame and `cp`s it into place inside the
+  namespace. If the inbox copy fails it fails closed (skips the file rather than embedding oversized
+  content).
+- **Command output is not written back**: when a command ran inside the resident overlay, its output
+  already exists there; if the staged copy has not been edited since the command
+  (`fresh_resident` signature matches), materialization **skips the write-back**, avoiding resending
+  thousands of package artifacts (measured near 100MB) after every command. This holds only when the
+  command truly ran in the resident overlay (`ctx.sandbox_resident`); one-shot fallback is unaffected.
 - **Resource domain**: session-level cgroup; commands are children of the server (already in the
   domain) and inherit it. Timeout/cancel kills only the current command's process group (`setsid`),
   not the resident instance or other background processes.
@@ -801,8 +833,33 @@ instance, so the AI's `systemctl --user ...` hits real systemd semantics
   intercept it; `privilege.classify` treats `systemctl --user`/`journalctl --user` as minimal (T0).
   If `resident` and `systemd.user` are not both enabled, the facade returns a clear message (no silent
   failure).
-- **Config**: `tools.sandbox.systemd.user = { enabled }` (off by default; requires
-  `tools.sandbox.resident.enabled`).
+- **Config**: `tools.sandbox.systemd.user = { enabled }` (**on by default**; requires
+  `tools.sandbox.resident.enabled`; skipped automatically when prerequisites bwrap + `dbus-daemon` +
+  `systemd` are missing). Enabling it makes the first resident start wait for the user manager (a few
+  seconds); disable it if you do not need user-level systemd.
+
+### In-sandbox privilege drop and cgroup write isolation (PostgreSQL etc.)
+
+- **Privilege drop**: the payload runs as root, but the T0/T1 baseline adds `CAP_SETUID`/`CAP_SETGID`
+  so commands can drop to a non-root user inside the sandbox. `runuser -u <user>`, `setpriv --reuid`
+  and `su <user>` work directly; `sudo -u <user>` additionally needs `/etc/sudoers`, so
+  `sudo`/`doas`/`su`/`runuser`/`setpriv` are recognized as **privilege-drop wrappers**
+  (`privilege.PRIVDROP_BINS`): treated as `sysadmin` (add narrow caps and lift account-DB + sudoers
+  masking). They do not change the wrapped command's tier (`sudo mount` is still T2). Services that
+  refuse to run as root (e.g. PostgreSQL) can therefore be started as a non-root user inside the
+  sandbox (`runuser -u postgres -- initdb …` / `pg_ctl …`).
+- **Ownership persists across commands**: `chown` and other `sysadmin` commands now run in the
+  session-level resident instance (`wrapper._resident_eligible` allows T1 sysadmin), sharing the
+  persistent overlay upper (`<proc_dir>/resident`). Previously sysadmin commands used the one-shot
+  path with an independent overlay, so ownership changes were not persistent.
+- **cgroup write isolation**: by default (`tools.sandbox.limits.delegate_cgroup=true`) the delegated
+  session cgroup subtree is bound writable at `/sys/fs/cgroup` inside the sandbox (reusing
+  `cgroup.prepare_delegated`), so the AI/services can create child cgroups and write
+  `memory.max`/`cpu.max`; confined to that subtree, never touching other host cgroups. In gateway
+  mode (`ip netns exec`) the bind source is unresolvable, so it is skipped.
+- **Relaxed resource limits**: defaults are `memory_ratio=0.75`, `cpu_cores_max=8`, `pids_max=8192`,
+  avoiding OOM on large npm dependency trees / parallel builds (too-small `pids.max` shows up as
+  process-creation failures/OOM).
 
 ### 137 / OOM attribution and diagnostics (`tools.sandbox.diagnostics`)
 
@@ -832,7 +889,9 @@ instance, so the AI's `systemctl --user ...` hits real systemd semantics
 - For restricted networks, mirrors can be configured (empty = inherit system behavior): `pip` →
   `PIP_INDEX_URL` + `PIP_TRUSTED_HOST`; `npm` → `npm_config_registry`; `maven` → generates a
   `settings.xml` (mirroring all repositories), read-only binds it into the session-private `/tmp` and
-  points `MAVEN_OPTS -s` at it. Only applies to sandbox external commands, still subject to
+  points `MAVEN_OPTS -s` at it; `apk` → rewrites `/etc/apk/repositories` keeping version paths and
+  read-only binds it (Alpine/musl); `go` → `GOPROXY`; `rustup` → `RUSTUP_DIST_SERVER` /
+  `RUSTUP_UPDATE_ROOT`. Only applies to sandbox external commands, still subject to
   proxy/`host_local_block` filtering (external targets allowed and recorded).
 
 ### AI-only Sandboxed LSP (on by default)

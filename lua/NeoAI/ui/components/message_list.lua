@@ -115,13 +115,6 @@ end
 
 local function _apply_table_hl(buf, marks, start_line, range_from, range_to)
   if not buf or not vim.api.nvim_buf_is_valid(buf) then return end
-  -- marks 与行并行，首行多为 nil（角色头等无高亮），不能用 ipairs（遇 nil 即止）。
-  local has = false
-  for i = 1, #(marks or {}) do
-    if marks[i] and marks[i].tbl then has = true break end
-  end
-  if not has then return end
-  _ensure_table_hl()
   start_line = start_line or 1
   local paint = function(b, ns, m, row)
     local group = m and TABLE_HL_GROUP[m.tbl]
@@ -130,20 +123,36 @@ local function _apply_table_hl(buf, marks, start_line, range_from, range_to)
     end
   end
   if range_from and range_to and range_to >= range_from then
-    -- 增量：只重贴差异区间（marks 是全量数组，需按 start_line 偏移换算行号）
+    -- 增量：只处理差异区间（marks 是全量数组，需按 start_line 偏移换算行号）。
+    -- 仅扫描区间内标记，避免每次渲染全量 O(总行数) 扫描。
     local mfrom = range_from - start_line + 1
     local mto = range_to - start_line + 1
     local from = math.max(1, mfrom)
     local to = math.min(#(marks or {}), mto)
-    pcall(vim.api.nvim_buf_clear_namespace, buf, TABLE_HL_NS, range_from - 1, range_to)
+    local has = false
     for ln = from, to do
       local m = marks[ln]
-      if m and m.tbl then
-        paint(buf, TABLE_HL_NS, m, start_line - 1 + (ln - 1))
+      if m and m.tbl then has = true break end
+    end
+    if has then _ensure_table_hl() end
+    pcall(vim.api.nvim_buf_clear_namespace, buf, TABLE_HL_NS, range_from - 1, range_to)
+    if has then
+      for ln = from, to do
+        local m = marks[ln]
+        if m and m.tbl then
+          paint(buf, TABLE_HL_NS, m, start_line - 1 + (ln - 1))
+        end
       end
     end
     return
   end
+  -- 全量：marks 与行并行，首行多为 nil（角色头等无高亮），不能用 ipairs（遇 nil 即止）。
+  local has = false
+  for i = 1, #(marks or {}) do
+    if marks[i] and marks[i].tbl then has = true break end
+  end
+  if not has then return end
+  _ensure_table_hl()
   vim.api.nvim_buf_clear_namespace(buf, TABLE_HL_NS, 0, -1)
   for ln = 1, #marks do
     local m = marks[ln]
@@ -349,8 +358,10 @@ end
 --- 明细回退顺序：观测到的密钥文件 → 参数中的密钥文件 → 密钥类型（具名规则）→ 敏感环境变量名 → 通用提示。
 --- @param fn table tool_call["function"]
 --- @param result_msg table|nil
+--- @param provided table|nil { args?: table, result_failed?: boolean } 已由调用方解析好的参数/结果
+---   状态；提供时跳过内部 JSON 解码（同一工具块内避免重复解码超大参数/结果）。
 --- @return table|nil { name, command, verb, observed, paths, rules, names }
-local function _secret_warning_data(fn, result_msg)
+local function _secret_warning_data(fn, result_msg, provided)
   if not fn then return nil end
   local ok, secret = pcall(require, "NeoAI.sandbox.secret")
   if not ok or type(secret) ~= "table" then return nil end
@@ -361,15 +372,21 @@ local function _secret_warning_data(fn, result_msg)
   -- 失败结果（如沙箱密钥硬拦截返回的 `SANDBOX_SECRET_BLOCKED` 错误对象）不是「读取到的
   -- 内容」，不参与密钥判定；否则错误文案里的内部标识会被当成敏感环境变量名，渲染出
   -- 「密钥环境变量：SANDBOX_SECRET_BLOCKED」这类无意义告警。
-  local result_failed = false
-  if type(result_content) == "string" and result_content ~= "" then
-    local dec = json.decode_or_nil(result_content)
-    if type(dec) == "table" and dec.error ~= nil then result_failed = true end
-  end
-  local args = nil
-  if type(args_str) == "string" and args_str ~= "" then
-    local dec = json.decode_or_nil(args_str)
-    if type(dec) == "table" then args = dec end
+  local result_failed, args
+  if provided then
+    result_failed = provided.result_failed == true
+    args = provided.args
+  else
+    result_failed = false
+    if type(result_content) == "string" and result_content ~= "" then
+      local dec = json.decode_or_nil(result_content)
+      if type(dec) == "table" and dec.error ~= nil then result_failed = true end
+    end
+    args = nil
+    if type(args_str) == "string" and args_str ~= "" then
+      local dec = json.decode_or_nil(args_str)
+      if type(dec) == "table" then args = dec end
+    end
   end
 
   -- 内核观测（eBPF/strace/procfs）到实际访问的密钥文件：真实「获取」行为，优先以此为准。
@@ -429,9 +446,10 @@ end
 --- 密钥警告（单行文本，供测试 / 工具复用；明细以逗号分隔）。
 --- @param fn table tool_call["function"]
 --- @param result_msg table|nil
+--- @param provided table|nil 见 _secret_warning_data
 --- @return string|nil
-local function _secret_warning_line(fn, result_msg)
-  local d = _secret_warning_data(fn, result_msg)
+local function _secret_warning_line(fn, result_msg, provided)
+  local d = _secret_warning_data(fn, result_msg, provided)
   if not d then return nil end
   local parts = { "⚠ 密钥：" .. d.name }
   if d.command then
@@ -458,9 +476,10 @@ end
 --- 收起后看不到，故用行首标记保持所有告警行在折叠块外可见。
 --- @param fn table tool_call["function"]
 --- @param result_msg table|nil
+--- @param provided table|nil 见 _secret_warning_data
 --- @return table|nil 行数组
-local function _secret_warning_lines(fn, result_msg)
-  local d = _secret_warning_data(fn, result_msg)
+local function _secret_warning_lines(fn, result_msg, provided)
+  local d = _secret_warning_data(fn, result_msg, provided)
   if not d then return nil end
   local out = { ("⚠ 密钥：%s %s"):format(d.name, d.verb) }
   if d.command then
@@ -594,25 +613,31 @@ local function _apply_secret_hl(buf, marks, start_line, range_from, range_to)
     pcall(vim.api.nvim_buf_clear_namespace, buf, SECRET_HL_NS, 0, -1)
   end
   -- marks 与行并行且存在空洞（无密钥的行标记为 nil），不能用 #marks / ipairs 遍历。
-  local mfrom, mto = 1, math.huge
-  if incremental then
-    mfrom = math.max(1, range_from - start_line + 1)
-    mto = range_to - start_line + 1
-  end
   local has = false
-  for ln, m in pairs(marks or {}) do
-    if type(ln) == "number" and m and (m.secret or m.secret_spans) and ln >= mfrom and ln <= mto then
-      if not has then
-        _ensure_secret_hl()
-        has = true
-      end
-      local row = start_line - 1 + (ln - 1)
-      if m.secret then
-        _set_line_hl(buf, SECRET_HL_NS, SECRET_HL_GROUP, row)
-      end
-      for _, sp in ipairs(m.secret_spans or {}) do
-        pcall(vim.api.nvim_buf_add_highlight, buf, SECRET_HL_NS, sp[3] or SECRET_HL_GROUP, row, sp[1], sp[2])
-      end
+  local function paint(ln, m)
+    if not has then
+      _ensure_secret_hl()
+      has = true
+    end
+    local row = start_line - 1 + (ln - 1)
+    if m.secret then
+      _set_line_hl(buf, SECRET_HL_NS, SECRET_HL_GROUP, row)
+    end
+    for _, sp in ipairs(m.secret_spans or {}) do
+      pcall(vim.api.nvim_buf_add_highlight, buf, SECRET_HL_NS, sp[3] or SECRET_HL_GROUP, row, sp[1], sp[2])
+    end
+  end
+  if incremental then
+    -- 只扫描差异区间，避免每次渲染全量 O(总行数) 扫描。
+    local mfrom = math.max(1, range_from - start_line + 1)
+    local mto = range_to - start_line + 1
+    for ln = mfrom, mto do
+      local m = marks and marks[ln]
+      if m and (m.secret or m.secret_spans) then paint(ln, m) end
+    end
+  else
+    for ln, m in pairs(marks or {}) do
+      if type(ln) == "number" and m and (m.secret or m.secret_spans) then paint(ln, m) end
     end
   end
 end
@@ -634,17 +659,23 @@ local function _apply_ansi_hl(buf, marks, start_line, range_from, range_to)
   else
     pcall(vim.api.nvim_buf_clear_namespace, buf, ANSI_HL_NS, 0, -1)
   end
-  local mfrom, mto = 1, math.huge
-  if incremental then
-    mfrom = math.max(1, range_from - start_line + 1)
-    mto = range_to - start_line + 1
+  local function paint(ln, m)
+    local row = start_line - 1 + (ln - 1)
+    for _, sp in ipairs(m.ansi) do
+      pcall(vim.api.nvim_buf_add_highlight, buf, ANSI_HL_NS, sp[3], row, sp[1], sp[2])
+    end
   end
-  for ln, m in pairs(marks or {}) do
-    if type(ln) == "number" and m and m.ansi and ln >= mfrom and ln <= mto then
-      local row = start_line - 1 + (ln - 1)
-      for _, sp in ipairs(m.ansi) do
-        pcall(vim.api.nvim_buf_add_highlight, buf, ANSI_HL_NS, sp[3], row, sp[1], sp[2])
-      end
+  if incremental then
+    -- 只扫描差异区间，避免每次渲染全量 O(总行数) 扫描。
+    local mfrom = math.max(1, range_from - start_line + 1)
+    local mto = range_to - start_line + 1
+    for ln = mfrom, mto do
+      local m = marks and marks[ln]
+      if m and m.ansi then paint(ln, m) end
+    end
+  else
+    for ln, m in pairs(marks or {}) do
+      if type(ln) == "number" and m and m.ansi then paint(ln, m) end
     end
   end
 end
@@ -796,6 +827,11 @@ local function _append_content(lines, marks, message, opts)
   end
 end
 
+--- 工具结果「全量 JSON 解码」的字节上限：超过则不解析结构化展示，直接按有界原始前缀
+--- 渲染。超大结果（命令输出/大文件读取）的解码本身是 O(size) 主线程开销（~2.3ms/MB），
+--- 而折叠块只展示 500 字节，全量解码是纯浪费。上限内的结果仍走结构化美化展示。
+local RESULT_DECODE_MAX_BYTES = 262144
+
 --- 工具结果是否为失败（错误 JSON 对象含 error 字段）
 --- 工具结果可能是任意 JSON（布尔/字符串/数字/数组），只有对象含 error 字段才算失败，
 --- 非对象（如 is_named_node 返回的 true/false）一律视为成功。
@@ -803,6 +839,10 @@ end
 --- @return boolean
 local function _tool_result_failed(content)
   if not content or content == "" then return false end
+  if #content > RESULT_DECODE_MAX_BYTES then
+    -- 超大结果不做全量解码：错误对象通常以 {"error"... 开头，用有界前缀启发式判定。
+    return content:match('^%s*{%s*"error"') ~= nil
+  end
   local json = require("NeoAI.utils.json")
   local decoded = json.decode_or_nil(content)
   if type(decoded) ~= "table" then return false end
@@ -814,6 +854,8 @@ end
 --- @return string|nil
 local function _tool_description(fn)
   if not fn or type(fn.arguments) ~= "string" or fn.arguments == "" then return nil end
+  -- 超大参数不做全量解码：description 只是折叠标题的装饰，不值得为它解析 MB 级参数。
+  if #fn.arguments > RESULT_DECODE_MAX_BYTES then return nil end
   local json = require("NeoAI.utils.json")
   local decoded = json.decode_or_nil(fn.arguments)
   if type(decoded) ~= "table" then return nil end
@@ -859,13 +901,95 @@ local function _pretty_json(value, indent)
   return "{\n" .. table.concat(parts, ",\n") .. "\n" .. pad .. "}"
 end
 
+--- 有界美化打印：输出与 `_pretty_json` 逐字节一致，但累计输出达到 budget 字节即停止。
+--- 供「只展示有界前缀」的调用方使用，避免对超大工具结果/参数做全量序列化后再截断
+--- （10MB 结果全量美化是 ~100ms 主线程无用功）。截断点可能落在多字节字符中间，
+--- 调用方需再做 UTF-8 安全截断（见 `_pretty_for_display`）。
+--- @param value any
+--- @param budget number 最大输出字节数
+--- @return table { text = string, truncated = boolean }
+local function _pretty_json_bounded(value, budget)
+  local buf = {}
+  local used = 0
+  local truncated = false
+  local function emit(s)
+    if truncated then return end
+    local room = budget - used
+    if #s > room then
+      if room > 0 then buf[#buf + 1] = s:sub(1, room) end
+      used = budget
+      truncated = true
+      return
+    end
+    buf[#buf + 1] = s
+    used = used + #s
+  end
+  local function rec(v, indent)
+    if truncated then return end
+    if type(v) ~= "table" then emit(json.encode(v)); return end
+    if not next(v) then emit("{}"); return end
+    local pad = string.rep("  ", indent)
+    local is_array = #v > 0
+    if is_array then
+      for i = 1, #v do
+        if v[i] == nil then is_array = false break end
+      end
+    end
+    emit(is_array and "[\n" or "{\n")
+    local first = true
+    if is_array then
+      for i = 1, #v do
+        if truncated then return end
+        if not first then emit(",\n") end
+        first = false
+        emit(pad .. "  ")
+        rec(v[i], indent + 1)
+      end
+    else
+      for k, val in pairs(v) do
+        if truncated then return end
+        if not first then emit(",\n") end
+        first = false
+        emit(pad .. "  " .. json.encode(k) .. ": ")
+        rec(val, indent + 1)
+      end
+    end
+    emit("\n" .. pad .. (is_array and "]" or "}"))
+  end
+  rec(value, 0)
+  return { text = table.concat(buf), truncated = truncated }
+end
+
+-- 展示截断预算（字节）与有界生成预算：有界预算略大于截断预算，保证
+-- `stringx.truncate(有界文本, 500)` 与「先全量 `_pretty_json` 再 `truncate(...,500)`」
+-- 逐字节一致（500 内容 + 3 省略号 + UTF-8 回退余量）。
+local PRETTY_TRUNC_BYTES = 500
+local PRETTY_BOUNDED_BUDGET = 512
+
+--- 展示用美化打印：full=true 全量（含密钥场景需完整展示）；否则有界生成后截断。
+--- @param value any
+--- @param full boolean|nil
+--- @return string
+local function _pretty_for_display(value, full)
+  if full then return _pretty_json(value) end
+  return stringx.truncate(_pretty_json_bounded(value, PRETTY_BOUNDED_BUDGET).text, PRETTY_TRUNC_BYTES)
+end
+
 --- 工具调用参数的结构化展示行（解析 JSON，剔除 description 样板字段后缩进展示）。
 --- @param fn table tool_call["function"]
---- @param opts table|nil { full?: boolean } full=true 时不截断（含密钥的工具调用完整展示）
+--- @param opts table|nil { full?: boolean, decoded?: any, has_decoded?: boolean, oversized?: boolean }
+---   full=true 时不截断（含密钥的工具调用完整展示）；has_decoded=true 表示 decoded 已由调用方
+---   解析（避免同一参数在密钥扫描与参数渲染间重复 JSON 解码）；oversized=true 表示参数过大、
+---   调用方已跳过解码，此处按有界原始前缀展示。
 --- @return table|nil 行数组（无参数时 nil）
 local function _tool_arguments_lines(fn, opts)
   if not fn or type(fn.arguments) ~= "string" or fn.arguments == "" then return nil end
-  local decoded = json.decode_or_nil(fn.arguments)
+  -- 超大参数且无需完整展示：按有界原始前缀展示，避免倾倒 MB 级内容。
+  if opts and opts.oversized and not opts.full then
+    return _split_lines(stringx.truncate(fn.arguments, 500))
+  end
+  local decoded
+  if opts and opts.has_decoded then decoded = opts.decoded else decoded = json.decode_or_nil(fn.arguments) end
   -- JSON 解析失败（流式未完成 / 非法）：原样展示，但必须按行拆开——参数里可能含真实换行，
   -- 单行含 `\n` 传给 `nvim_buf_set_lines` 会报错并使 buffer 半写、折叠被拆断。
   if decoded == nil then return _split_lines(fn.arguments) end
@@ -875,9 +999,7 @@ local function _tool_arguments_lines(fn, opts)
       if k ~= "description" then filtered[k] = v end
     end
     if not next(filtered) then return nil end
-    local pretty = _pretty_json(filtered)
-    if not (opts and opts.full) then pretty = stringx.truncate(pretty, 500) end
-    return _split_lines(pretty)
+    return _split_lines(_pretty_for_display(filtered, opts and opts.full))
   end
   return { json.encode(decoded) }
 end
@@ -895,12 +1017,22 @@ end
 --- 结果含 read_image 的图像引用时先行渲染一条图像摘要行。
 --- 返回行对象数组 { text, spans }（spans 为 ANSI 高亮区间，非 ANSI 内容为空）。
 --- @param content string|nil
---- @param opts table|nil { full?: boolean } full=true 时不截断（含密钥的工具调用完整展示）
+--- @param opts table|nil { full?: boolean, decoded?: any, has_decoded?: boolean }
+---   full=true 时不截断（含密钥的工具调用完整展示）；has_decoded=true 表示 decoded 已由调用方
+---   解析（避免同一结果在密钥扫描与结果渲染间重复 JSON 解码）。
 --- @return table 行对象数组
 local function _result_lines(content, opts)
   if not content or content == "" then return { { text = "(空)", spans = {} } } end
   local full = opts and opts.full
-  local decoded = json.decode_or_nil(content)
+  local decoded
+  if opts and opts.has_decoded then
+    decoded = opts.decoded
+  elseif #content <= RESULT_DECODE_MAX_BYTES then
+    decoded = json.decode_or_nil(content)
+  else
+    -- 超大结果：跳过全量解码，按有界原始前缀展示（折叠块本也只显示 500 字节）。
+    decoded = nil
+  end
   if type(decoded) == "table" then
     local img = decoded.image
     if type(img) == "table" and img.attachmentId then
@@ -908,17 +1040,13 @@ local function _result_lines(content, opts)
       local lines = {
         { text = string.format("🖼️ 图像%s（%s, %d 字节）", dims, img.mediaType or img.media_type or "image", img.bytes or 0), spans = {} },
       }
-      local pretty = _pretty_json(decoded)
-      if not full then pretty = stringx.truncate(pretty, 500) end
-      for _, l in ipairs(_split_lines(pretty)) do
+      for _, l in ipairs(_split_lines(_pretty_for_display(decoded, full))) do
         lines[#lines + 1] = { text = l, spans = {} }
       end
       return lines
     end
     local out = {}
-    local pretty = _pretty_json(decoded)
-    if not full then pretty = stringx.truncate(pretty, 500) end
-    for _, l in ipairs(_split_lines(pretty)) do
+    for _, l in ipairs(_split_lines(_pretty_for_display(decoded, full))) do
       out[#out + 1] = { text = l, spans = {} }
     end
     return out
@@ -967,17 +1095,46 @@ end
 
 local function _append_tool_block(lines, marks, tool_call, result_msg)
   local fn = tool_call["function"]
+  -- 同一工具块的参数/结果只 JSON 解码一次：结果同时供密钥扫描与结果渲染，参数同时供
+  -- 密钥扫描与参数渲染。超大工具输出下重复解码是可见的主线程开销。
+  local result_content = result_msg and result_msg.content or nil
+  local decoded_result, result_failed
+  if type(result_content) == "string" and result_content ~= "" then
+    if #result_content <= RESULT_DECODE_MAX_BYTES then
+      decoded_result = json.decode_or_nil(result_content)
+      result_failed = type(decoded_result) == "table" and decoded_result.error ~= nil or false
+    else
+      -- 超大结果：跳过全量解码（O(size) 主线程开销），失败判定用有界前缀启发式。
+      decoded_result = nil
+      result_failed = result_content:match('^%s*{%s*"error"') ~= nil
+    end
+  else
+    result_failed = false
+  end
+  local decoded_args
+  local args_oversized = false
+  if fn and type(fn.arguments) == "string" and fn.arguments ~= "" then
+    if #fn.arguments <= RESULT_DECODE_MAX_BYTES then
+      decoded_args = json.decode_or_nil(fn.arguments)
+    else
+      args_oversized = true
+    end
+  end
+  local provided = {
+    args = (type(decoded_args) == "table") and decoded_args or nil,
+    result_failed = result_failed,
+  }
   -- 密钥防护：命令参数或结果（模型上下文）含密钥时，在该工具折叠块**外**追加
   -- 高亮警告（非缩进 → 不并入折叠），折叠标题保持干净。
   -- 警告按项换行指明「哪个命令/工具获取或使用了哪些密钥文件/变量」（见 _secret_warning_lines）。
-  local secret_lines = _secret_warning_lines(fn, result_msg)
+  local secret_lines = _secret_warning_lines(fn, result_msg, provided)
   -- 含密钥的工具调用：完整展示参数/结果（不截断），并在行内高亮密钥值。
   local has_secret = secret_lines ~= nil
   local rows = {}
   local header_text = _tool_header_text(tool_call, result_msg)
   if header_text then rows[#rows + 1] = header_text end
   -- 结构化调用参数：无论工具最终成功/失败，展开折叠都能看到本次调用传了哪些参数
-  local arg_lines = _tool_arguments_lines(fn, { full = has_secret })
+  local arg_lines = _tool_arguments_lines(fn, { full = has_secret, decoded = decoded_args, has_decoded = true, oversized = args_oversized })
   if arg_lines then
     rows[#rows + 1] = "参数:"
     for _, l in ipairs(arg_lines) do
@@ -987,7 +1144,7 @@ local function _append_tool_block(lines, marks, tool_call, result_msg)
   -- 结构化执行结果：成功/失败都有对应的结果内容（失败时通常为 error 对象）
   if result_msg then
     rows[#rows + 1] = "结果:"
-    for _, l in ipairs(_result_lines(result_msg.content, { full = has_secret })) do
+    for _, l in ipairs(_result_lines(result_content, { full = has_secret, decoded = decoded_result, has_decoded = true })) do
       rows[#rows + 1] = l
     end
   end
@@ -1102,12 +1259,21 @@ end
 --- 把消息序列切分为可缓存的渲染块。每个块 = 一条消息；带工具调用的 assistant
 --- 消息与其配对的工具结果消息合并为一个块（工具结果消息不再单独成块）。
 --- 运行时上下文快照与 system 消息不渲染（不产生块）。
+--- 增量复用：传入上一轮的块描述符数组 `prev` 时，用「廉价输入」（消息身份、content/reasoning
+--- 长度、turn_end、流式/表格宽度/推理开关、工具调用与结果身份及状态）比对，全部一致则直接
+--- 复用上一轮描述符（连同 build 闭包与已算好的签名），跳过指纹/签名拼接与闭包分配——长会话
+--- 流式渲染的主线程与 GC 开销主要来自这里。廉价输入任一变化才重算签名并重建描述符。
 --- @param msgs table
 --- @param opts table|nil
+--- @param prev table|nil 上一轮返回的块数组
 --- @return table 块数组 { { key, sig, build } }
-local function _blocks(msgs, opts)
+local function _blocks(msgs, opts, prev)
   local blocks = {}
+  local n = 0
   local i = 1
+  local tw = opts and opts.table_width
+  local show = state.show_reasoning
+  local streaming = opts and opts.streaming
   while i <= #msgs do
     local idx = i
     local msg = msgs[idx]
@@ -1131,58 +1297,108 @@ local function _blocks(msgs, opts)
       end
       local consumed_until = ridx - 1
       local turn_end = _is_turn_end(msgs, idx)
-      local extra = { "assistant", _fingerprint(snap.content), _fingerprint(snap.reasoning) }
-      for _, pp in ipairs(paired) do
-        local fn = pp.tc["function"] or {}
-        extra[#extra + 1] = "tc"
-        extra[#extra + 1] = tostring(pp.tc.id)
-        extra[#extra + 1] = tostring(fn.name)
-        extra[#extra + 1] = _fingerprint(fn.arguments)
-        extra[#extra + 1] = tostring(fold.get_status(pp.tc.id))
-        -- 实时耗时不计入签名：执行中每秒变化会命中缓存失效→重建整块（大消息时占主线程）。
-        -- 时间由 `refresh_tool_times` 就地改写首行；状态变化（running→success）仍触发重建。
-        extra[#extra + 1] = pp.res and "res" or "nil"
-        if pp.res then
-          extra[#extra + 1] = _fingerprint(pp.res.content)
-          extra[#extra + 1] = tostring(pp.res.duration_ms)
+      local is_stream = (streaming == true) and idx == #msgs
+      local eopts = _msg_opts(is_stream, opts)
+      local key = "c:" .. idx
+      local role = snap.role or ""
+      local clen, rlen = #(snap.content or ""), #(snap.reasoning or "")
+      n = n + 1
+      local p = prev and prev[n]
+      local same = p ~= nil and p.key == key and p.in_msg == snap and p.in_role == role
+        and p.in_clen == clen and p.in_rlen == rlen and p.in_turn == turn_end
+        and p.in_stream == is_stream and p.in_tw == tw and p.in_show == show
+        and p.in_tc ~= nil and #p.in_tc == #paired
+      if same then
+        for k, pp in ipairs(paired) do
+          local res = pp.res
+          if p.in_tc[k] ~= pp.tc or p.in_res[k] ~= res
+            or p.in_reslen[k] ~= (res and #(res.content or "") or 0)
+            or p.in_resdur[k] ~= (res and res.duration_ms or nil)
+            or p.in_status[k] ~= fold.get_status(pp.tc.id) then
+            same = false
+            break
+          end
         end
       end
-      local is_stream = opts and opts.streaming and idx == #msgs
-      local eopts = _msg_opts(is_stream, opts)
-      local sig = _sig(eopts, turn_end, extra)
-      blocks[#blocks + 1] = {
-        key = "c:" .. idx,
-        sig = sig,
-        build = function()
-          local lines, marks = {}, {}
-          _append_role_header(lines, marks, snap)
-          _append_reasoning(lines, marks, snap, eopts)
-          _append_content(lines, marks, snap, eopts)
-          for _, pp in ipairs(paired) do
-            _append_tool_block(lines, marks, pp.tc, pp.res)
+      if same then
+        blocks[n] = p
+      else
+        local extra = { "assistant", _fingerprint(snap.content), _fingerprint(snap.reasoning) }
+        local in_tc, in_res, in_status, in_reslen, in_resdur = {}, {}, {}, {}, {}
+        for k, pp in ipairs(paired) do
+          local fn = pp.tc["function"] or {}
+          extra[#extra + 1] = "tc"
+          extra[#extra + 1] = tostring(pp.tc.id)
+          extra[#extra + 1] = tostring(fn.name)
+          extra[#extra + 1] = _fingerprint(fn.arguments)
+          local status = fold.get_status(pp.tc.id)
+          extra[#extra + 1] = tostring(status)
+          -- 实时耗时不计入签名：执行中每秒变化会命中缓存失效→重建整块（大消息时占主线程）。
+          -- 时间由 `refresh_tool_times` 就地改写首行；状态变化（running→success）仍触发重建。
+          extra[#extra + 1] = pp.res and "res" or "nil"
+          if pp.res then
+            extra[#extra + 1] = _fingerprint(pp.res.content)
+            extra[#extra + 1] = tostring(pp.res.duration_ms)
           end
-          if turn_end then
-            _append_turn_sep(lines, marks)
-          end
-          return { lines = lines, marks = marks }
-        end,
-      }
+          in_tc[k] = pp.tc
+          in_res[k] = pp.res
+          in_status[k] = status
+          in_reslen[k] = pp.res and #(pp.res.content or "") or 0
+          in_resdur[k] = pp.res and pp.res.duration_ms or nil
+        end
+        local sig = _sig(eopts, turn_end, extra)
+        blocks[n] = {
+          key = key,
+          sig = sig,
+          in_msg = snap, in_role = role, in_clen = clen, in_rlen = rlen,
+          in_turn = turn_end, in_stream = is_stream, in_tw = tw, in_show = show,
+          in_tc = in_tc, in_res = in_res, in_status = in_status,
+          in_reslen = in_reslen, in_resdur = in_resdur,
+          build = function()
+            local lines, marks = {}, {}
+            _append_role_header(lines, marks, snap)
+            _append_reasoning(lines, marks, snap, eopts)
+            _append_content(lines, marks, snap, eopts)
+            for _, pp in ipairs(paired) do
+              _append_tool_block(lines, marks, pp.tc, pp.res)
+            end
+            if turn_end then
+              _append_turn_sep(lines, marks)
+            end
+            return { lines = lines, marks = marks }
+          end,
+        }
+      end
       i = consumed_until + 1
     else
       local snap = msg
       local turn_end = _is_turn_end(msgs, idx)
-      local is_stream = opts and opts.streaming and idx == #msgs
+      local is_stream = (streaming == true) and idx == #msgs
       local eopts = _msg_opts(is_stream, opts)
-      local sig = _sig(eopts, turn_end, { snap.role or "", _fingerprint(snap.content), _fingerprint(snap.reasoning) })
-      blocks[#blocks + 1] = {
-        key = "c:" .. idx,
-        sig = sig,
-        build = function()
-          local lines, marks = {}, {}
-          _format_message(lines, marks, snap, turn_end, eopts)
-          return { lines = lines, marks = marks }
-        end,
-      }
+      local key = "c:" .. idx
+      local role = snap.role or ""
+      local clen, rlen = #(snap.content or ""), #(snap.reasoning or "")
+      n = n + 1
+      local p = prev and prev[n]
+      if p and p.key == key and p.in_msg == snap and p.in_role == role
+        and p.in_clen == clen and p.in_rlen == rlen and p.in_turn == turn_end
+        and p.in_stream == is_stream and p.in_tw == tw and p.in_show == show
+        and p.in_tc == nil then
+        blocks[n] = p
+      else
+        local sig = _sig(eopts, turn_end, { role, _fingerprint(snap.content), _fingerprint(snap.reasoning) })
+        blocks[n] = {
+          key = key,
+          sig = sig,
+          in_msg = snap, in_role = role, in_clen = clen, in_rlen = rlen,
+          in_turn = turn_end, in_stream = is_stream, in_tw = tw, in_show = show,
+          build = function()
+            local lines, marks = {}, {}
+            _format_message(lines, marks, snap, turn_end, eopts)
+            return { lines = lines, marks = marks }
+          end,
+        }
+      end
       i = i + 1
     end
   end
@@ -1268,7 +1484,10 @@ function M.render_chat(buf, messages, opts)
     return _render_chat_full(buf, msgs, opts)
   end
   local cache = _cache_for(buf)
-  local lines, marks = cache:render(_blocks(msgs, opts))
+  -- 复用上一轮未变化块的描述符（含 build 闭包），只重算变化块的签名与构建。
+  local blocks = _blocks(msgs, opts, cache.blocks)
+  cache.blocks = blocks
+  local lines, marks = cache:render(blocks)
   if #lines == 0 then
     -- 空对话占位（与旧行为一致）
     lines = { "NeoAI 聊天", "", "输入消息开始对话。", "" }

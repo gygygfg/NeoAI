@@ -20,6 +20,7 @@ local state = {
   watching = false, -- 是否已订阅事件
   lualine_injected = false, -- 是否已把 'neoai' 注入 lualine extensions
   unsubs = {}, -- 事件订阅句柄
+  capacity_cache = {}, -- agent_id -> { key, value }：容量估算缓存（避免每次状态栏重绘重算）
 }
 
 -- 沙箱待审徽标的自定义高亮组：黄底加粗，醒目；用户可在
@@ -232,13 +233,34 @@ function M.setup(opts)
   return _opts()
 end
 
---- 计算某 Agent 的上下文容量信息。
+--- 容量缓存键：仅包含会改变估算结果的廉价状态（消息条数/最近 API 输入 token/模型/模式）。
+--- 流式期间内容增长不改 key（usage 未更新），避免每个分片重算；usage 到达后 key 变化即重算。
+--- @param agent table
+--- @return string
+local function _capacity_key(agent)
+  local provider_name = (agent.config and agent.config.provider)
+    or config_store.get("ai.default_provider")
+  return table.concat({
+    tostring(#(agent.messages or {})),
+    tostring(agent.usage and agent.usage.last_prompt),
+    tostring(agent.model),
+    tostring(provider_name),
+    tostring(agent.plan_mode),
+  }, "|")
+end
+
+--- 计算某 Agent 的上下文容量信息（按 key 缓存；状态栏每次重绘只读缓存）。
 --- used 优先取 API 最近一次请求回传的输入 token（真实上下文规模，含系统提示/工具/缓存命中），
 --- 无 API 用量时回退本地完整请求估算；total 为有效窗口（用户显式配置 → 模型能力表 → 兜底）。
 --- @param agent table
 --- @return table|nil { used, total, pct, level, warn_ratio, source }
 function M.capacity_for(agent)
   if not agent then return nil end
+  local key = _capacity_key(agent)
+  local cached = state.capacity_cache[agent.id]
+  if cached and cached.key == key then
+    return cached.value
+  end
   local provider_name = (agent.config and agent.config.provider)
     or config_store.get("ai.default_provider")
   local capabilities = require("NeoAI.core.model.capabilities")
@@ -260,7 +282,7 @@ function M.capacity_for(agent)
   elseif pct >= warn_ratio then
     level = "warn"
   end
-  return {
+  local value = {
     used = used,
     total = total,
     pct = pct,
@@ -268,6 +290,8 @@ function M.capacity_for(agent)
     warn_ratio = warn_ratio,
     source = source,
   }
+  state.capacity_cache[agent.id] = { key = key, value = value }
+  return value
 end
 
 --- 当前 Agent 的容量告警级别（供状态栏动态配色）
@@ -450,6 +474,10 @@ function M.watch()
   for _, ev in ipairs(subscribed) do
     state.unsubs[#state.unsubs + 1] = event_bus.on(ev, _refresh)
   end
+  -- Agent 销毁时清理其容量缓存条目，避免 capacity_cache 随会话数无界增长。
+  state.unsubs[#state.unsubs + 1] = event_bus.on(events.AGENT_DISPOSED, function(data)
+    if data and data.agent_id then state.capacity_cache[data.agent_id] = nil end
+  end)
 end
 
 --- 取消事件订阅并复位监听状态（插件卸载/测试用）
@@ -459,6 +487,7 @@ function M.unwatch()
   end
   state.unsubs = {}
   state.watching = false
+  state.capacity_cache = {}
 end
 
 --- 刷新状态栏（供扩展 init / 手动调用）

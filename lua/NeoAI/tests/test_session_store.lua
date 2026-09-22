@@ -125,7 +125,7 @@ tests.suite("session_store_recovery", function(_, it)
       local chat = require("NeoAI.services.chat_service")
       local runtime = require("NeoAI.core.agent.runtime")
       local async = require("NeoAI.utils.async")
-      local original_run, original_append = runtime.run, fs.append_file
+      local original_run, original_append = runtime.run, fs.append_file_async
       chat.reset()
       local agent = chat.new_session({})
       runtime.run = function(a, content)
@@ -134,13 +134,13 @@ tests.suite("session_store_recovery", function(_, it)
         return async.resolve({ content = "answer" })
       end
       local ok, err = xpcall(function()
-        fs.append_file = function() return false, "disk full" end
+        fs.append_file_async = function() return async.reject("disk full") end
         local failure
         t.await(chat.send_message("first"):catch(function(e) failure = e end))
         t.eq("persistence", failure.kind)
         t.eq(0, #store.get(agent.session_id).messages)
         for _, msg in ipairs(agent.messages) do t.false_(msg._synced == true) end
-        fs.append_file = original_append
+        fs.append_file_async = original_append
         t.await(chat.send_message("second"))
         t.eq(4, #store.get(agent.session_id).messages)
         for _, msg in ipairs(agent.messages) do t.true_(msg._synced) end
@@ -149,7 +149,7 @@ tests.suite("session_store_recovery", function(_, it)
         t.eq("first", store.get(agent.session_id).messages[1].content)
         t.eq("second", store.get(agent.session_id).messages[3].content)
       end, function(e) return e end)
-      runtime.run, fs.append_file = original_run, original_append
+      runtime.run, fs.append_file_async = original_run, original_append
       chat.reset()
       runtime.dispose(agent)
       if not ok then error(err, 0) end

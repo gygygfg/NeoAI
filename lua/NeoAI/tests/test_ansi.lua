@@ -37,4 +37,15 @@ tests.suite("ansi", function(_, it)
     t.false_(ansi.has_ansi("plain"), "无转义应判 false")
     t.true_(ansi.has_ansi("\27[0m"), "含转义应判 true")
   end)
+
+  it("控制字节与非法 UTF-8 被清洗（不渲染成 ^P / <f9> 乱码）", function(t)
+    local ansi = require("NeoAI.utils.ansi")
+    -- C0 控制字节（0x16 / DEL）应剥离，制表符保留。
+    local lines = ansi.parse("a\22b\127c\9keep")
+    t.eq("abc\tkeep", lines[1].text, "C0 控制字节剥离、制表符保留")
+    -- 非法首字节 0xF9 应替换为 U+FFFD。
+    local l2 = ansi.parse("\249ok")
+    t.true_(l2[1].text:find("\239\191\189", 1, true) ~= nil, "非法字节替换为 U+FFFD")
+    t.true_(l2[1].text:find("ok", 1, true) ~= nil, "其余文本保留")
+  end)
 end)

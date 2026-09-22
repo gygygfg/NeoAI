@@ -108,7 +108,9 @@ local function _normalize_arguments(tool_name, args)
     end
     return {}
   end
-  local normalized = vim.deepcopy(args)
+  -- 浅拷贝：仅改写顶层别名键，不需要 vim.deepcopy（对 MB 级参数深拷贝是主线程开销）。
+  local normalized = {}
+  for k, v in pairs(args) do normalized[k] = v end
   local aliases = {
     cmd = "command", file = "file_path", files = "file_path",
     filepath = "file_path", -- 旧参数名兼容：filepath → file_path
@@ -320,9 +322,29 @@ end
 --- @param ctx table
 --- @return boolean ok
 --- @return table|nil err
-local function _secret_guard(tool, tool_name, args, ctx)
-  if not secret.enabled() then return true end
-  local scan = secret.scan(args)
+-- 小参数同步扫描上限：小参数下保持「审批/执行同步可见」的既有语义（状态栏/审批窗立即弹出），
+-- 仅当参数字节数超过该阈值才下放线程池（大参数扫描的线程往返延迟可接受）。
+local SECRET_SCAN_SYNC_BYTES = 65536
+
+--- 递归统计参数中的字符串总字节数（廉价；仅用于决定同步/异步扫描路径）
+--- @param v any
+--- @return number
+local function _args_string_bytes(v)
+  local t = type(v)
+  if t == "string" then return #v end
+  if t ~= "table" then return 0 end
+  local n = 0
+  for k, x in pairs(v) do
+    n = n + _args_string_bytes(x)
+    if type(k) == "string" then n = n + #k end
+  end
+  return n
+end
+
+--- 处理扫描结果（命中硬拦截 / 软提级 / fs_write token 化）
+--- @return boolean ok
+--- @return table|nil err
+local function _handle_scan_result(scan, tool, tool_name, args, ctx)
   if scan.secret then
     secret.trace("blocked", { tool = tool_name })
     local agent = ctx and ctx.agent
@@ -340,7 +362,7 @@ local function _secret_guard(tool, tool_name, args, ctx)
     return false, { kind = "secret", message = "SANDBOX_SECRET_BLOCKED: 工具参数包含原始密钥，已终止 Agent" }
   end
   -- 加密后的 key（token）与敏感环境变量名：软信号，只提级待审，不终止。
-  local names = secret.scan_names and secret.scan_names(args) or {}
+  local names = scan.names or {}
   if next(scan.tokens) or #names > 0 then
     if next(scan.tokens) then secret.trace("token_used", { tool = tool_name, tokens = scan.tokens }) end
     if #names > 0 then secret.trace("name_used", { tool = tool_name, names = names }) end
@@ -349,10 +371,12 @@ local function _secret_guard(tool, tool_name, args, ctx)
       ctx.secret_operation = true
       ctx.secret_names = names
     end
+    local n = 0
+    for _ in pairs(scan.tokens) do n = n + 1 end
     pcall(function()
       require("NeoAI.kernel.event_bus").emit(require("NeoAI.kernel.events").SANDBOX_SECRET_TRACED, {
         tool = tool_name,
-        count = (function() local n = 0; for _ in pairs(scan.tokens) do n = n + 1 end; return n end)(),
+        count = n,
         names = names,
       })
     end)
@@ -362,6 +386,31 @@ local function _secret_guard(tool, tool_name, args, ctx)
     secret.tokenize_args(args, { entropy = _entropy_enabled(tool_name, args, ctx) })
   end
   return true
+end
+
+--- 出向密钥防护。返回值：
+--- - `true`：通过（同步）
+--- - `false, err`：硬拦截（同步）
+--- - `Deferred`：大参数异步扫描（resolve(true) / reject(err)）
+--- @return boolean|Deferred
+local function _secret_guard(tool, tool_name, args, ctx)
+  if not secret.enabled() then return true end
+  -- 小参数：同步扫描，保持审批/执行同步语义（避免多一个 tick 才弹审批窗）。
+  if _args_string_bytes(args) <= SECRET_SCAN_SYNC_BYTES then
+    local scan = secret.scan(args)
+    local names = secret.scan_names and secret.scan_names(args) or {}
+    scan.names = names
+    return _handle_scan_result(scan, tool, tool_name, args, ctx)
+  end
+  -- 大参数：线程池扫描（可能 MB 级、含多次 gmatch），命中后的副作用回主线程处理。
+  return secret.scan_all_async(args):then_(function(scan)
+    local ok, err = _handle_scan_result(scan, tool, tool_name, args, ctx)
+    if not ok then return async.reject(err) end
+    return true
+  end, function(e)
+    -- 扫描失败按 fail-closed 处理：密钥防护不可用时不放行工具。
+    return async.reject({ kind = "secret", message = "密钥扫描失败: " .. tostring(type(e) == "table" and (e.message or e.kind) or e) })
+  end)
 end
 
 --- 入向：把工具结果中的真实密钥替换为 token，再回传模型（AI 永远看不到原始密钥）。
@@ -405,51 +454,13 @@ local function _tokenize_out(d, ctx, tool_name, args)
   return out
 end
 
---- 执行工具
---- @param tool_name string
---- @param raw_args any
---- @param ctx table { agent?, tool_call_id?, signal?, is_sub_agent?, tool_service? }
---- @return Deferred resolve(结果), reject(错误)
-function M.execute(tool_name, raw_args, ctx)
-  ctx = ctx or {}
-  local signal = ctx.signal
-  if signal and signal:aborted() then
-    return async.reject({ kind = "aborted", message = "工具执行前已取消" })
-  end
-
-  -- 名称解析（别名/模糊匹配）
-  local resolved = registry.resolve_name(tool_name)
-  if not resolved then
-    return async.reject({ kind = "tool", message = "工具不存在: " .. tool_name })
-  end
-  local tool = registry.get(resolved)
-
-  -- 参数规范化：MCP 工具跳过别名改写与路径展开。
-  -- 远端工具的 schema 由服务器权威定义，本地 alias（file→file_path 等）会破坏参数名，
-  -- 且服务器会校验 arguments 与 inputSchema（未知参数报错）。路径语义也归属服务器。
-  local is_mcp = tool and tool.source == "mcp"
-  local args = raw_args
-  if not is_mcp then
-    args = _normalize_arguments(resolved, raw_args)
-    -- 展开路径字段的 ~ 别名（~/... ↔ 主目录）
-    args = _expand_path_args(args)
-  end
-
-  -- schema 校验
-  local valid, verr = validator.validate_parameters(tool.parameters, args)
-  if not valid then
-    return async.reject({ kind = "validation", message = verr })
-  end
-
-  -- 越界访问留痕（read_all 下）：记录 cwd 之外用户工作目录的访问，非阻塞。
-  pcall(_trace_outside_access, resolved, args, ctx)
-
-  -- 出向密钥防护（原始密钥硬拦截 + token 留痕 + 写入 token 化）
-  local ok_secret, serr = _secret_guard(tool, resolved, args, ctx)
-  if not ok_secret then
-    return async.reject(serr)
-  end
-
+--- 密钥防护通过后的审批与执行
+--- @param tool table
+--- @param resolved string
+--- @param args table
+--- @param ctx table
+--- @return Deferred
+local function _execute_after_secret_guard(tool, resolved, args, ctx)
   -- 审批检查。async 模式（默认）不使用执行前阻塞审批：工具立即在沙箱内执行并冻结
   -- 候选，真实修改进入异步待审队列由用户确认后应用（设计文档 §15）。
   -- 例外：命中「遮蔽目录」的工具调用（即使 async）也走审批弹窗；批准后仅对该次调用
@@ -501,6 +512,58 @@ function M.execute(tool_name, raw_args, ctx)
 
   -- 直接执行
   return _tokenize_out(_execute_tool(tool, args, ctx, timer), ctx, resolved, args)
+end
+
+--- 执行工具
+--- @param tool_name string
+--- @param raw_args any
+--- @param ctx table { agent?, tool_call_id?, signal?, is_sub_agent?, tool_service? }
+--- @return Deferred resolve(结果), reject(错误)
+function M.execute(tool_name, raw_args, ctx)
+  ctx = ctx or {}
+  local signal = ctx.signal
+  if signal and signal:aborted() then
+    return async.reject({ kind = "aborted", message = "工具执行前已取消" })
+  end
+
+  -- 名称解析（别名/模糊匹配）
+  local resolved = registry.resolve_name(tool_name)
+  if not resolved then
+    return async.reject({ kind = "tool", message = "工具不存在: " .. tool_name })
+  end
+  local tool = registry.get(resolved)
+
+  -- 参数规范化：MCP 工具跳过别名改写与路径展开。
+  -- 远端工具的 schema 由服务器权威定义，本地 alias（file→file_path 等）会破坏参数名，
+  -- 且服务器会校验 arguments 与 inputSchema（未知参数报错）。路径语义也归属服务器。
+  local is_mcp = tool and tool.source == "mcp"
+  local args = raw_args
+  if not is_mcp then
+    args = _normalize_arguments(resolved, raw_args)
+    -- 展开路径字段的 ~ 别名（~/... ↔ 主目录）
+    args = _expand_path_args(args)
+  end
+
+  -- schema 校验
+  local valid, verr = validator.validate_parameters(tool.parameters, args)
+  if not valid then
+    return async.reject({ kind = "validation", message = verr })
+  end
+
+  -- 越界访问留痕（read_all 下）：记录 cwd 之外用户工作目录的访问，非阻塞。
+  pcall(_trace_outside_access, resolved, args, ctx)
+
+  -- 出向密钥防护（原始密钥硬拦截 + token 留痕 + 写入 token 化）。
+  -- 小参数同步扫描（保持审批/执行同步语义）；大参数返回 Deferred 走线程池。
+  local guard, guard_err = _secret_guard(tool, resolved, args, ctx)
+  if guard == true then
+    return _execute_after_secret_guard(tool, resolved, args, ctx)
+  elseif guard == false then
+    return async.reject(guard_err)
+  end
+  return guard:then_(function()
+    return _execute_after_secret_guard(tool, resolved, args, ctx)
+  end)
 end
 
 --- 结果字符串化

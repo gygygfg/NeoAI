@@ -85,11 +85,11 @@ local function _canonical(value)
     table.sort(keys)
     local parts = {}
     for _, k in ipairs(keys) do
-      parts[#parts + 1] = json.encode(k) .. ":" .. _canonical(value[k])
+      parts[#parts + 1] = json.encode_fast(k) .. ":" .. _canonical(value[k])
     end
     return "{" .. table.concat(parts, ",") .. "}"
   end
-  if t == "string" then return json.encode(value) end
+  if t == "string" then return json.encode_fast(value) end
   if value == nil then return "null" end
   return tostring(value)
 end

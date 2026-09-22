@@ -522,6 +522,8 @@
 
 - **背景**：关闭常驻实例（`resident.enabled=false`）时，每个一次性命令在独立 pid namespace +
   cgroup 内运行，命令结束时 `cgroup.release` → `cgroup.kill` 终止整个进程树，后台进程不跨调用存活。
+  此时对带 `&`/nohup/setsid 意图的命令，`run_command` 会经 UI 提示（`ctx.ui_notice`）告知
+  「后台进程不会跨调用存活」（仅用户可见，不写入模型结果），避免误以为后台任务仍在运行。
 - **常驻实例**：默认开启（`tools.sandbox.resident.enabled=true`）时，同一沙箱会话内 `run_command` 的
   T0 进程命令共享一个**常驻 bwrap 实例**——它在一个持久的 mount+pid+net+ipc+uts+cgroup
   命名空间内运行一个**命令服务器**（`bash` 从 stdin 读取请求），命令在服务器内执行。
@@ -532,6 +534,14 @@
   多条命令**真正并行**且输出不交错。超时/取消由服务器在命名空间内按命令进程组终止（宿主无法
   直接 kill 沙箱 pid），被终止的命令仍回传终止前已产生的部分输出。搭建/捕获阶段仍串行（见
   「进程命令并行执行」）。
+- **输出帧编码**：命令输出块的内容以 **base64** 承载（客户端解码）。命令输出可能包含与帧定界
+  相同的控制字节（`\x1e`/`\x1f`）或 NUL（nvim 的 job 输出层会把 NUL 改写为换行），直接 `cat`
+  会破坏 `BEGIN/END` 定界导致输出丢失/串扰；base64 为纯 ASCII，帧定界安全且二进制输出无损。
+- **服务器自愈**：命令服务器意外退出（外层 OOM / 被信号杀死）时，在途命令不再直接报
+  「退出码 -1、无输出」——客户端据保留的启动参数**自动重建常驻实例并重试一次**（仅限非超时/
+  非取消）；实例已死时下一条命令也据此重建，而不是静默回退一次性执行。
+- **依赖预检**：命令服务器依赖 `base64`/`flock` 做帧编解码与并发输出串行化；缺失时
+  `resident.available()` 返回 false，回退一次性执行（避免命令无输出地挂到超时）。
 - **为何用命令服务器而非 nsenter**：bwrap 的根视图由 `chroot`/`pivot_root` 施加在**进程**
   （fs_struct）上，不属于 mount 命名空间；外部 `nsenter -m` 只能进入挂载表、拿不到该根，
   exec 会 `No such file or directory`。服务器在命名空间**内部**执行命令，天然拥有正确根视图。
@@ -540,6 +550,18 @@
   首次启动在**挂载前**把工作区暂存物化进 upper（宿主侧写入安全）；挂载后 AI 的新编辑由
   `resident.materialize()` 在**命名空间内**写回（写入走 overlay 挂载，避免 overlayfs
   「挂载期间宿主侧改 upper 未定义」）。命令结束后门禁在宿主侧**只读**遍历 upper 捕获改动。
+- **大文件物化（收件箱复制）**：常驻命令服务器从 stdin 读请求。帧头（一行）带**载荷字节长度**，
+  载荷为**原始字节**（无需 base64）并由 `head -c` **分块**消费——既省去客户端一次整帧 base64
+  编码（主线程）与服务器一次解码，也避免 bash `read` 内建**逐字节**读取数十 MB 物化帧
+  （1 字节/系统调用）打满 CPU。物化按批（最多 128 条 / 1MB）构建与发送，批间 `vim.defer_fn`
+  让出主循环，避免一次性构建上百 MB 载荷长时间阻塞 nvim 主线程。`large`（内容以 blob 承载）
+  或超过 `tools.sandbox.resident.max_embed_bytes`（默认 256KB）的暂存文件由宿主侧复制进会话
+  目录下的收件箱（会话目录已 bind 进命名空间），服务器只收到一个小帧并在命名空间内 `cp` 落地。
+  收件箱复制失败时 fail-closed 跳过该文件（宁可该命令暂看不到，也不内嵌超大内容）。
+- **命令产物不回写**：命令在常驻 overlay 内执行时，其产物已存在于该 overlay；暂存副本自命令后
+  未被再次编辑（`fresh_resident` 签名一致）时物化**跳过回写**，避免每次命令后把上千个包产物
+  （实测近百 MB）重发一遍。仅命令确在常驻 overlay 内执行（`ctx.sandbox_resident`）时成立，
+  一次性回退路径不受影响。
 - **资源域**：会话级 cgroup；命令是服务器（已在资源域内）的子进程，继承资源域。超时/取消按
   进程组精确终止当前命令（`setsid` 独立进程组），不波及常驻实例与其它后台进程。
 - **回退**：overlay 不可用、嵌套 userns（T2）档位、特权档升级、启动/健康检查失败时自动回退
@@ -629,8 +651,27 @@ hostop 提案并在宿主 replay。本门面让**独立**的 `systemctl`/`journa
 - **门面协同**：`systemd.parse_command` 识别 `--user` 为 `route="native"`，门面不拦截；
   `privilege.classify` 将 `systemctl --user`/`journalctl --user` 视为最小权限（T0）。
   未同时启用 `resident` 与 `systemd.user` 时，门面返回明确提示（不静默失败）。
-- **配置**：`tools.sandbox.systemd.user = { enabled }`（默认关闭；需同时开启
-  `tools.sandbox.resident.enabled`）。
+- **配置**：`tools.sandbox.systemd.user = { enabled }`（**默认开启**；需同时开启
+  `tools.sandbox.resident.enabled`，前置条件 bwrap + `dbus-daemon` + `systemd` 缺失时自动跳过）。
+  开启后首次启动常驻实例会等待 user manager 就绪（数秒）；不需要用户级 systemd 时可关闭。
+
+### 沙箱内降权与 cgroup 写隔离（PostgreSQL 等服务）
+
+- **降权**：载荷以 root 运行，但 T0/T1 基线额外加回 `CAP_SETUID`/`CAP_SETGID`，使命令可在
+  沙箱内降权到非 root 用户。`runuser -u <user>`、`setpriv --reuid`、`su <user>` 直接可用；
+  `sudo -u <user>` 另需读取 `/etc/sudoers`，故 `sudo`/`doas`/`su`/`runuser`/`setpriv` 被识别为
+  **降权包装器**（`privilege.PRIVDROP_BINS`）：按 `sysadmin` 加回窄能力并解除账户库 + sudoers 遮蔽。
+  它们不改变被包裹命令的档位（`sudo mount` 仍为 T2）。因此 PostgreSQL 等「拒绝 root 运行」的
+  服务可在沙箱内以非 root 用户启动（`runuser -u postgres -- initdb …` / `pg_ctl …`）。
+- **属主跨命令持久**：`chown` 等 `sysadmin` 命令现走**会话级常驻实例**（`wrapper._resident_eligible`
+  允许 T1 sysadmin），与普通命令共享持久 overlay upper（`<proc_dir>/resident`）。此前 sysadmin
+  命令走一次性路径、overlay 独立，命令结束后属主改动不持久。
+- **cgroup 写隔离**：默认（`tools.sandbox.limits.delegate_cgroup=true`）在沙箱内把「委派的会话
+  cgroup 子树」以可写方式 bind 到 `/sys/fs/cgroup`（复用 `cgroup.prepare_delegated`），使 AI/服务
+  可创建子 cgroup 并写 `memory.max`/`cpu.max` 等，仅限该子树、不污染宿主其它 cgroup。网关模式
+  （`ip netns exec`）下该 bind 源不可解析，自动跳过。
+- **资源上限放宽**：默认 `memory_ratio=0.75`、`cpu_cores_max=8`、`pids_max=8192`，避免 npm 大依赖
+  树/并行构建触发 OOM（`pids.max` 过小会表现为进程创建失败/OOM）。
 
 ### 137 / OOM 归因与诊断（`tools.sandbox.diagnostics`）
 
@@ -654,8 +695,10 @@ hostop 提案并在宿主 replay。本门面让**独立**的 `systemctl`/`journa
 
 - 受限网络下可配置镜像（默认空 = 沿用系统）：`pip` → `PIP_INDEX_URL` + `PIP_TRUSTED_HOST`；
   `npm` → `npm_config_registry`；`maven` → 生成 `settings.xml`（镜像全部仓库）并只读绑定到
-  会话私有 `/tmp`，经 `MAVEN_OPTS -s` 指向。仅对沙箱外部命令生效，仍受代理/`host_local_block`
-  过滤（外部目标放行并记录）。
+  会话私有 `/tmp`，经 `MAVEN_OPTS -s` 指向；`apk` → 按原版本路径重写 `/etc/apk/repositories`
+  并只读绑定（Alpine/musl）；`go` → `GOPROXY`；`rustup` → `RUSTUP_DIST_SERVER` /
+  `RUSTUP_UPDATE_ROOT`。仅对沙箱外部命令生效，仍受代理/`host_local_block` 过滤
+  （外部目标放行并记录）。
 
 ### AI 专用沙箱 LSP（默认开启）
 

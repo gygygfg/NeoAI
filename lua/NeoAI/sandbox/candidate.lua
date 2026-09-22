@@ -719,6 +719,15 @@ function M.workspace_overrides()
       real = real,
       staged = entry.staged,
       deleted = entry.deleted == true or not exists,
+      -- 超大文件（内容以 blob 承载）：物化方据此后走「按文件复制」而非内嵌内容，
+      -- 避免把数百 MB 内容经常驻命令服务器 stdin（bash 逐字节 read）传输。
+      large = entry.large == true,
+      -- 命令产物（run_command 捕获并合并）：常驻 overlay 已有其输出，暂存副本未再被编辑时
+      -- 物化方可跳过回写（避免每次命令后把上千个包产物重发一遍）。
+      fresh = entry.fresh == true,
+      fresh_ssig = entry.fresh_ssig,
+      -- 命令确在常驻 overlay 内执行：产物已存在于该 overlay，常驻物化可安全跳过。
+      fresh_resident = entry.fresh_resident == true,
     }
   end
   return out
@@ -1082,7 +1091,8 @@ end
 --- 把已冻结候选的改动合并进工作区暂存映射，使 read_file/edit_file 能看到
 --- run_command 产生的改动（双向互通）。
 --- @param cand table 冻结候选
---- @param opts table|nil { from_command?: boolean, package?: boolean 包/生成内容跳过 token 化 }
+--- @param opts table|nil { from_command?: boolean, package?: boolean 包/生成内容跳过 token 化,
+---   resident?: boolean 命令是否在常驻 overlay 内执行（产物已在该 overlay，常驻物化可跳过回写） }
 --- 同步「视图同步条目」到工作区暂存（不产生发布候选）：命令还原暂存编辑后，暂存视图必须
 --- 回到命令结果，并撤销该路径上已存在的待审候选（净效果为无改动）。
 --- @param view_files table|nil
@@ -1151,6 +1161,8 @@ function M.merge_candidate(cand, opts)
           staged = staged, base_hash = f.before_hash, deleted = false, mode = f.mode,
           fresh = opts.from_command == true,
           fresh_ssig = opts.from_command and _file_sig(staged) or nil,
+          -- 仅当命令确实在常驻 overlay 内执行时，产物才已存在于该 overlay，常驻物化方可跳过回写。
+          fresh_resident = opts.from_command == true and opts.resident == true,
           version = _bump_version(),
         }
       end
@@ -1169,7 +1181,8 @@ end
 --- 异步版：暂存内容的密钥 token 化经 `secret.tokenize_many_async`（线程池）执行，
 --- 避免大量文件时全文扫描占满主线程；写入/映射登记仍在主线程。
 --- @param cand table 冻结候选
---- @param opts table|nil { from_command?: boolean, package?: boolean }
+--- @param opts table|nil { from_command?: boolean, package?: boolean,
+---   resident?: boolean 命令是否在常驻 overlay 内执行 }
 --- @return Deferred resolve(cand)
 function M.merge_candidate_async(cand, opts)
   opts = opts or {}
@@ -1234,6 +1247,7 @@ function M.merge_candidate_async(cand, opts)
           state.workspace[f.path] = {
             staged = staged, base_hash = f.before_hash, deleted = false, mode = f.mode,
             fresh = opts.from_command == true,
+            fresh_resident = opts.from_command == true and opts.resident == true,
             version = _bump_version(),
           }
         end

@@ -153,8 +153,10 @@ local function _execute_single(agent, tool_call, tool_service, opts)
       local json = require("NeoAI.utils.json")
       result_str = json.encode(result)
     end
+    -- 不携带完整结果：事件 data 会被 nvim_exec_autocmds 深拷贝，而订阅方（UI）只读
+    -- tool_call_id/耗时；结果内容从 agent 消息队列读取渲染。
     event_bus.emit(events.TOOL_EXECUTION_COMPLETED, {
-      agent_id = agent.id, name = name, result = result_str,
+      agent_id = agent.id, name = name,
       tool_call_id = tool_call.id, duration_ms = duration_ms,
     })
     return { tool_call_id = tool_call.id, name = name, result_str = result_str, duration_ms = duration_ms,

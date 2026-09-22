@@ -41,6 +41,7 @@ See `lua/NeoAI/default_config.lua` for the full configuration. The main sections
 | `system_prompt` | Default Chinese prompt | persona section |
 | `timeout_ms` | `60000` | Request timeout |
 | `max_retries` | `3` | Number of request retries |
+| `trace` | `{capture=true, max_rounds=8}` | In-memory retention policy for trajectory/diagnostic wire data (raw request body + SSE chunks): only the most recent `max_rounds` rounds keep full data; older rounds degrade to a lightweight summary (`capture=false` keeps none). Prevents long tool loops from bloating memory |
 | `attachments` | See below | Multimodal image configuration |
 | `model_policy` | See below | Automatic per-model selection: capability table + vendor dialect + explicit cache |
 | `context_cache` | See below | Prefix-cache identity + automatic context compaction |
@@ -134,7 +135,6 @@ context_cache = {
 | `tree` | `{foldenable=false, ...auto_close_on_select=true}` | Session tree folding/auto-close |
 | `input_box` | `{idle_height=1, min_height=5, max_ratio=0.8}` | Input box height (idle/focused/growth cap) |
 | `chat` | `{mousescroll_max_blank=3, incremental=true}` | Max blank lines allowed below the last line when the wheel reaches the bottom (0 = strictly bottom-aligned); `incremental` enables incremental refresh (re-render only changed message blocks and write only the diff lines). Set to `false` to fall back to a full buffer rewrite |
-| `render` | `{threaded=true}` | Offload CPU-intensive computation (e.g. codepoint counting/slicing for tool-result pruning) to the `utils.work` thread pool so MB-scale tool results never block the main thread. Set to `false` (or when the pool is unavailable) to fall back to synchronous main-thread computation (equivalent behavior, just slower) |
 | `trajectory` | `{log_dir=".../NeoAI/logs"}` | Log directory for the trajectory display mode |
 | `statusline` | `{enabled=true, winbar=true, parts={mode,model,usage,cache,capacity,sandbox}, separator=" ", colors=...}` | lualine statusline; the `sandbox` part shows `待审N` when pending reviews > 0 (`N` is the total number of pending **files**, since the approval unit is a single file), linked to the prominent `NeoAISandboxPending` highlight group by default (bold yellow, override via `colors.sandbox`); when the pending queue contains an **L3 (high-risk)** item, the part appends `⚠危险` and switches to the red `NeoAISandboxDanger` group (override via `colors.sandbox_danger`); when **outside-workspace traces** exist, the part appends `越界N` (`N` = distinct file count; both shown side by side, e.g. `待审2 越界3`) |
 
@@ -360,6 +360,11 @@ sandbox = {
   -- Falls back to one-shot process execution when overlay is unavailable / T2 tier / startup fails.
   resident = {
     enabled = true, -- session-resident sandbox instance (run_command background procs survive calls); auto-fallback
+    -- Per-file embed cap (bytes) for materialization: larger files are copied host-side into an inbox
+    -- and copied by the server inside the namespace (small frame only), so large content never flows
+    -- through the resident stdin (bash reads it byte-by-byte and pegs the CPU). 0 = fall back to
+    -- tools.sandbox.max_file_bytes.
+    max_embed_bytes = 262144,
   },
   -- Internal long-lived services (sandbox.service): the service_* tools are no longer registered
   -- (invisible to the AI); kept only for the systemctl facade to start/stop unit processes in-sandbox
@@ -387,8 +392,10 @@ sandbox = {
     -- Nested real systemd --user (requires resident): starts a real user manager inside the
     -- resident sandbox instance; `systemctl --user` hits real semantics; unit files stage in the
     -- workspace overlay, cgroups are confined to a delegated subtree, nothing lands on the host.
-    -- Off by default.
-    user = { enabled = false },
+    -- On by default; skipped automatically when prerequisites (bwrap + dbus-daemon + systemd) are
+    -- missing. Note: enabling it makes the first resident start wait for the user manager (a few
+    -- seconds); disable if you do not need user-level systemd.
+    user = { enabled = true },
     -- System-level systemctl enable/disable: parse [Install] WantedBy/RequiredBy and stage the
     -- symlink changes as review candidates, applied after approval; nothing lands on the host.
     stage_install = true,
@@ -419,7 +426,11 @@ sandbox = {
     --   pip   -> PIP_INDEX_URL + PIP_TRUSTED_HOST (e.g. "https://pypi.tuna.tsinghua.edu.cn/simple")
     --   npm   -> npm_config_registry (e.g. "https://registry.npmmirror.com/")
     --   maven -> generates settings.xml (mirror all repositories), pointed to via MAVEN_OPTS -s
-    mirrors = { pip = "", npm = "", maven = "" },
+    --   apk   -> rewrites /etc/apk/repositories keeping version paths (Alpine/musl,
+    --            e.g. "https://mirrors.tuna.tsinghua.edu.cn/alpine")
+    --   go    -> GOPROXY (e.g. "https://goproxy.cn,direct")
+    --   rustup-> RUSTUP_DIST_SERVER / RUSTUP_UPDATE_ROOT (e.g. "https://mirrors.tuna.tsinghua.edu.cn/rustup")
+    mirrors = { pip = "", npm = "", maven = "", apk = "", go = "", rustup = "" },
   },
   -- Privilege tiers and auto-escalation: commands run at T0 least privilege by default
   -- (network allowed by default with host-local access intercepted); escalation is auto-requested
@@ -427,8 +438,8 @@ sandbox = {
   privilege = {
     enabled = true, auto_escalate = true, max_tier = 2, record = true,
     tiers = {                       -- per-tier network/extra caps/mounts/unmask/review strictness
-      [0] = { name = "minimal", review = "auto", network = true, cap_add = { "CAP_DAC_OVERRIDE" }, mounts = {}, unmask = {} }, -- least privilege: `--cap-drop ALL` + baseline CAP_DAC_OVERRIDE (root payload reaches foreign-owner 0700 dirs such as _apt's apt cache). network allowed (recorded); host-local intercepted via host_proxy
-      [1] = { name = "elevated", review = "auto", network = true, cap_add = { "CAP_DAC_OVERRIDE" }, mounts = {}, unmask = {} }, -- docker.sock is unmasked only for docker commands
+      [0] = { name = "minimal", review = "auto", network = true, cap_add = { "CAP_DAC_OVERRIDE", "CAP_SETUID", "CAP_SETGID" }, mounts = {}, unmask = {} }, -- least privilege: `--cap-drop ALL` + baseline CAP_DAC_OVERRIDE (root payload reaches foreign-owner 0700 dirs) + CAP_SETUID/SETGID (drop privileges inside the sandbox for PostgreSQL etc. / runuser / setpriv). network allowed (recorded); host-local intercepted via host_proxy
+      [1] = { name = "elevated", review = "auto", network = true, cap_add = { "CAP_DAC_OVERRIDE", "CAP_SETUID", "CAP_SETGID" }, mounts = {}, unmask = {} }, -- docker.sock is unmasked only for docker commands
       [2] = { name = "privileged", review = "approve", network = true, userns = true, cap_add = { "ALL" }, mounts = {}, unmask = {} }, -- full caps inside the nested userns (scoped); seccomp still applies
     },
     -- System-administration commands (useradd/chown/passwd, ...): on a match, narrowly add back
@@ -437,12 +448,18 @@ sandbox = {
     -- CHOWN/SETUID/SETGID/DAC_OVERRIDE and because the account DB is masked). Writes still go to
     -- the overlay stage, so the real account DB/filesystem is untouched; ordinary commands keep
     -- least privilege and the account DB stays masked (no password-hash exposure).
+    -- System-administration commands + privilege-drop wrappers (sudo/doas/su/runuser/setpriv):
+    -- on a match, add back narrow caps and lift account-DB/sudoers masking so
+    -- `sudo -u <user>` / `runuser -u <user>` / `setpriv` can drop privileges inside the sandbox.
     sysadmin = {
       cap_add = { "CAP_CHOWN", "CAP_DAC_OVERRIDE", "CAP_DAC_READ_SEARCH", "CAP_FOWNER", "CAP_SETUID", "CAP_SETGID", "CAP_SETFCAP", "CAP_FSETID", "CAP_SYS_CHROOT", "CAP_KILL" },
-      unmask = { "/etc/passwd", "/etc/group", "/etc/shadow", "/etc/shadow-", "/etc/gshadow", "/etc/gshadow-", "/etc/subuid", "/etc/subgid", "/etc/subuid-", "/etc/subgid-" },
+      unmask = { "/etc/passwd", "/etc/group", "/etc/shadow", "/etc/shadow-", "/etc/gshadow", "/etc/gshadow-", "/etc/subuid", "/etc/subgid", "/etc/subuid-", "/etc/subgid-", "/etc/sudoers", "/etc/sudoers.d" },
     },
     classify = {                    -- command classification (bins = exact binary; bin+subs = binary + subcommand)
-      { tier = 2, name = "privileged", bins = { "sudo", "mount", "modprobe", "iptables", "systemctl", "unshare", "nsenter" } },
+      -- Note: sudo/doas are NOT listed here: they are privilege-drop wrappers, skipped during
+      -- classification so the wrapped command decides the tier (`sudo mount` is still T2); their
+      -- privilege-drop need is handled as sysadmin (above).
+      { tier = 2, name = "privileged", bins = { "mount", "modprobe", "iptables", "systemctl", "unshare", "nsenter" } },
       { tier = 1, name = "docker", bins = { "docker", "docker-compose", "nerdctl" } }, -- daemon-backed: controlled socket
       { tier = 1, name = "container", bins = { "podman", "podman-compose", "buildah", "skopeo" } }, -- daemonless: can share the sandbox namespace
       { tier = 1, name = "network", bins = { "curl", "wget", "ssh", "rsync", "ping", "socat" } },
@@ -546,10 +563,14 @@ sandbox = {
   -- (process overlay/private tmp) plus the sandbox store root (candidates/review/evidence/service
   -- overlay); when exceeded, write/process tools are rejected (usage is measured async and cached,
   -- never blocking command start).
-  limits = { wall_ms = 60000, dynamic = true, memory_ratio = 0.5, memory_max_bytes = 0,
-    cpu_cores_max = 4, cpu_global_max = 0, pids_max = 2048, memory_bytes = 0, pids = 0, cpu_max = 0,
+  -- delegate_cgroup: expose the delegated session cgroup subtree writable at /sys/fs/cgroup inside
+  -- the sandbox, so the AI/services can create child cgroups and write memory.max/cpu.max
+  -- (cgroup v2 write isolation); confined to that subtree, never touching other host cgroups;
+  -- skipped automatically in gateway mode (ip netns exec).
+  limits = { wall_ms = 60000, dynamic = true, memory_ratio = 0.75, memory_max_bytes = 0,
+    cpu_cores_max = 8, cpu_global_max = 0, pids_max = 8192, memory_bytes = 0, pids = 0, cpu_max = 0,
     cpu_affinity = "auto", -- sandbox CPU affinity: auto=pins to cores other than nvim's current CPU (so it does not compete with nvim); off/false=no pinning; "2,3"/"2-3"=explicit cpuset (needs taskset)
-    cgroup_base = "/sys/fs/cgroup", fail_closed = false,
+    cgroup_base = "/sys/fs/cgroup", fail_closed = false, delegate_cgroup = true,
     disk_bytes = 64 * 1024 * 1024 * 1024 }, -- 64 GiB (0 = unlimited)
   seccomp_filter_path = "",        -- optional: compiled seccomp BPF filter (with require_seccomp)
 }

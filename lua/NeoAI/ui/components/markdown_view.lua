@@ -359,6 +359,12 @@ end
 
 -- ========== 公开 API ==========
 
+-- 渲染结果记忆化：同一内容/选项在多次渲染间复用（工具耗时 tick、折叠刷新、同 tick 多次
+-- 渲染等），避免重复解析整段 markdown。键含内容与选项；内容变化（流式）时不命中。
+local render_cache = {}
+local render_cache_n = 0
+local RENDER_CACHE_MAX = 64
+
 --- 将 markdown 文本转换为可渲染的行数组
 --- @param text string
 --- @param opts table|nil { streaming? boolean; table_width? number }
@@ -366,6 +372,9 @@ end
 --- @return table { { text, style, tbl? } } style = "normal"|"code"|"heading"|"list"|"quote"|"table"
 function M.render(text, opts)
   opts = opts or {}
+  local cache_key = (text or "") .. "\0" .. tostring(opts.streaming) .. "\0" .. tostring(opts.table_width)
+  local cached = render_cache[cache_key]
+  if cached then return cached end
   local lines = tm.split_lines(text or "")
   local out = {}
   local in_code = false
@@ -428,6 +437,12 @@ function M.render(text, opts)
       i = i + 1
     end
   end
+  if render_cache_n >= RENDER_CACHE_MAX then
+    render_cache = {}
+    render_cache_n = 0
+  end
+  render_cache[cache_key] = out
+  render_cache_n = render_cache_n + 1
   return out
 end
 

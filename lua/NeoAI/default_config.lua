@@ -128,6 +128,13 @@ local DEFAULT_CONFIG = {
     system_prompt = "你是一个AI编程助手，帮助用户解决编程问题。",
     timeout_ms = 60000,
     max_retries = 3,
+    -- 轨迹/诊断用 wire 数据（原始请求体 + 原始 SSE 分片）的内存保留策略：
+    -- 每轮请求体随上下文增长，若全部常驻会导致长工具循环内存线性/二次膨胀。这里只保留
+    -- 最近 max_rounds 轮完整数据，更早轮次降级为轻量摘要（完整数据由实时落盘机制保存）。
+    trace = {
+      capture = true, -- false = 完全不保留完整 wire 数据（轨迹模式仅显示摘要）
+      max_rounds = 8, -- 内存中保留完整 wire 数据的最近轮数
+    },
     -- ===== 多模态 / 附件 =====
     attachments = {
       enabled = true, -- 多模态图像注入总开关（read_image 工具 + 图像消息解析）
@@ -228,12 +235,6 @@ local DEFAULT_CONFIG = {
       -- 增量刷新：仅重渲染变化的消息块并只写入差异行（默认开启）。
       -- 设为 false 时降级回整 buffer 全量重写（用于排查渲染问题）。
       incremental = true,
-    },
-    render = {
-      -- 把 CPU 密集计算（如工具结果裁剪的码点统计/切片）分配到 utils.work 线程池，
-      -- 避免 MB 级工具结果在发送/压缩路径阻塞主线程。设为 false 或线程池不可用时
-      -- 自动回退主线程同步计算（行为等价，仅慢）。
-      threaded = true,
     },
     trajectory = {
       log_dir = vim.fn.stdpath("cache") .. "/NeoAI/logs", -- 轨迹日志保存目录（可自定义；缺省 ~/.cache/nvim/NeoAI/logs）
@@ -699,10 +700,17 @@ local DEFAULT_CONFIG = {
         --   pip   = "https://pypi.tuna.tsinghua.edu.cn/simple"（注入 PIP_INDEX_URL + PIP_TRUSTED_HOST）
         --   npm   = "https://registry.npmmirror.com/"（注入 npm_config_registry）
         --   maven = "https://maven.aliyun.com/repository/public"（生成 settings.xml，经 MAVEN_OPTS 指向）
+        --   apk   = "https://mirrors.tuna.tsinghua.edu.cn/alpine"（按原版本路径重写 /etc/apk/repositories；
+        --           用于 Alpine/musl，避免默认源站不可达）
+        --   go    = "https://goproxy.cn,direct"（注入 GOPROXY）
+        --   rustup= "https://mirrors.tuna.tsinghua.edu.cn/rustup"（注入 RUSTUP_DIST_SERVER/UPDATE_ROOT）
         mirrors = {
           pip = "",
           npm = "",
           maven = "",
+          apk = "",
+          go = "",
+          rustup = "",
         },
         -- 独立 netns + 宿主网关（opt-in）：沙箱进程进入隔离网络命名空间，只能到达宿主网关；
         -- 网关对目标 host:port 先做 TCP connect 探针（可探测宿主哪些端口在监听），但不回传
@@ -770,6 +778,11 @@ local DEFAULT_CONFIG = {
       -- 自动回退一次性执行。
       resident = {
         enabled = true,
+        -- 物化单文件内嵌上限（字节）：超过则宿主侧复制进收件箱、服务器在命名空间内按文件
+        -- 复制（只发小帧），避免把大文件内容经常驻命令服务器 stdin 传输（bash 逐字节 read
+        -- 会打满 CPU）。默认 256KB，远低于候选冻结上限（tools.sandbox.max_file_bytes=8MB），
+        -- 使更多大文件走复制、缩小每次物化帧。0 = 回退 tools.sandbox.max_file_bytes。
+        max_embed_bytes = 262144,
       },
       -- systemctl 门面（方案 A）：AI 的 `systemctl`/`journalctl` 独立调用被路由到沙箱内
       -- 长驻服务（复用 sandbox.service），不调用宿主 systemd、也不修改宿主机。支持
@@ -786,9 +799,9 @@ local DEFAULT_CONFIG = {
         -- 嵌套真实 systemd --user：在会话级常驻沙箱实例内运行 user manager，AI 的
         -- `systemctl --user` 命中真实 systemd 语义；单元文件/软链落在工作区 overlay 暂存，
         -- 运行态在私有 XDG_RUNTIME_DIR，cgroup 仅限委派的会话子树——所有修改不落宿主机。
-        -- 需同时开启 tools.sandbox.resident.enabled。默认关闭。
+        -- 需同时开启 tools.sandbox.resident.enabled。默认开启（前置条件缺失时自动跳过）。
         user = {
-          enabled = false, -- 是否在沙箱内启动真实 systemd --user
+          enabled = true, -- 是否在沙箱内启动真实 systemd --user
         },
         -- 系统级 `systemctl enable/disable`：解析单元 [Install] WantedBy/RequiredBy，
         -- 把软链变更（enable 建链 / disable 删链）暂存为待审候选，审批后应用；不落宿主机。
@@ -1001,11 +1014,11 @@ local DEFAULT_CONFIG = {
         -- 动态资源限制（默认开）：未显式设置时按宿主资源推导 CPU/内存/PID 上限，
         -- 防止沙箱内命令（apt、编译、构建等）吃满整机导致卡死。
         dynamic = true,
-        memory_ratio = 0.5, -- 内存上限 = 宿主总量 * ratio
+        memory_ratio = 0.75, -- 内存上限 = 宿主总量 * ratio（大依赖树/构建留足余量，避免误 OOM）
         memory_max_bytes = 0, -- 绝对内存上限（>0 时取 min；0 = 不额外限制）
-        cpu_cores_max = 4, -- 单任务 CPU 配额上限（核）
+        cpu_cores_max = 8, -- 单任务 CPU 配额上限（核）
         cpu_global_max = 0, -- 所有并发沙箱任务的 CPU 总预算（核；0 = max(1, 核数-1)，留 1 核给 nvim）
-        pids_max = 2048, -- PID 上限
+        pids_max = 8192, -- PID/线程上限（npm 大依赖树/并行构建会创建大量线程/进程）
         -- 静态显式值（>0 时优先于动态推导）：
         memory_bytes = 0, -- cgroup 内存上限（0 = 用动态值）
         pids = 0, -- cgroup PID 上限（0 = 用动态值）
@@ -1016,6 +1029,10 @@ local DEFAULT_CONFIG = {
         cpu_affinity = "auto",
         cgroup_base = "/sys/fs/cgroup", -- cgroup v2 挂载点
         fail_closed = false, -- cgroup 不可用时是否拒绝执行（默认 false：跳过限制，不阻断）
+        -- 在沙箱内以**可写**方式暴露一个委派的会话 cgroup 子树（挂到 /sys/fs/cgroup）：
+        -- 使 AI 与服务能在其中创建子 cgroup 并写 memory.max/cpu.max 等（cgroup v2 写隔离），
+        -- 仅限该子树，不污染宿主其它 cgroup。需 root + cgroup v2 可写；不可用时静默跳过。
+        delegate_cgroup = true,
         -- 沙箱暂存磁盘上限（字节；0 = 不限）。统计暂存基目录（进程 overlay / 私有 tmp）与
         -- 沙箱存储根（候选/待审/证据/服务 overlay）的总占用；超限时拒绝新的外部进程/写类
         -- 工具，避免暂存撑满宿主磁盘。用量经工作线程异步统计并缓存，不阻塞命令开始。
@@ -1042,11 +1059,18 @@ local DEFAULT_CONFIG = {
           -- 真实 root 依赖该能力绕过 DAC 访问他人属主的 0700 目录（如 `_apt` 的
           -- `/var/cache/apt/archives/partial`）；缺它会让 root 表现为「权限受限」而误报失败。
           -- 隔离不依赖 capability，而由命名空间 + 整机根 overlay 暂存 + 遮蔽 + seccomp 保证；
-          -- 其余能力（CHOWN/SETUID/SETFCAP 等）仍由 packages.cap_add / sysadmin.cap_add 按需加回。
-          [0] = { name = "minimal", review = "auto", network = true, cap_add = { "CAP_DAC_OVERRIDE" }, mounts = {}, unmask = {} },
+          -- 其余能力（CHOWN/SETFCAP 等）仍由 packages.cap_add / sysadmin.cap_add 按需加回。
+          -- CAP_SETUID/CAP_SETGID：载荷以 root 运行，需在沙箱内降权到非 root 用户
+          -- （runuser/setpriv/su、PostgreSQL 等拒绝 root 的服务、systemd User= 单元）；
+          -- 缺少时 setuid/setgid/setgroups 报 EPERM。改 uid 只在沙箱内生效，不扩大宿主面。
+          [0] = {
+            name = "minimal", review = "auto", network = true,
+            cap_add = { "CAP_DAC_OVERRIDE", "CAP_SETUID", "CAP_SETGID" }, mounts = {}, unmask = {},
+          },
           -- T1 提权不默认解除 docker.sock 遮蔽：socket 仅在命令被分类为 docker 时按需挂载并解除。
           [1] = {
-            name = "elevated", review = "auto", network = true, cap_add = { "CAP_DAC_OVERRIDE" }, mounts = {}, unmask = {},
+            name = "elevated", review = "auto", network = true,
+            cap_add = { "CAP_DAC_OVERRIDE", "CAP_SETUID", "CAP_SETGID" }, mounts = {}, unmask = {},
           },
           -- T2 特权：嵌套 userns 内完整能力（caps 被 userns 作用域限制，够不到宿主）；
           -- 主机效果冻结为提案异步审批。seccomp 基线（mount/init_module 等）仍然生效。
@@ -1066,18 +1090,24 @@ local DEFAULT_CONFIG = {
             "CAP_SETUID", "CAP_SETGID", "CAP_SETFCAP", "CAP_FSETID",
             "CAP_SYS_CHROOT", "CAP_KILL",
           },
-          -- 需读写账户数据库，故仅对系统管理命令解除这些路径的遮蔽。
+          -- 需读写账户数据库，故仅对系统管理/降权命令解除这些路径的遮蔽。
+          -- sudoers 一并解除：`sudo -u <user>` 需要读取 /etc/sudoers 才能降权（沙箱内 root
+          -- 本就无需密码；写入仍全部进 overlay 暂存，真实 sudoers 不受影响）。
           unmask = {
             "/etc/passwd", "/etc/group", "/etc/shadow", "/etc/shadow-",
             "/etc/gshadow", "/etc/gshadow-", "/etc/subuid", "/etc/subgid",
             "/etc/subuid-", "/etc/subgid-",
+            "/etc/sudoers", "/etc/sudoers.d",
           },
         },
         -- 命令分类规则：命中即提升到对应档位（多条命中取最高档）。
         -- bins = 精确可执行名；bin+subs = 可执行名 + 子命令。
         classify = {
+          -- 注：sudo/doas 不在此列——它们是「以他人身份运行」的包装器，分类时被跳过，
+          -- 由被包裹命令决定档位（`sudo mount` 仍为 T2）；其降权需求经 privilege.PRIVDROP_BINS
+          -- 检测并按 sysadmin 加回能力/解除账户库与 sudoers 遮蔽。
           { tier = 2, name = "privileged", bins = {
-            "sudo", "doas", "mount", "umount", "modprobe", "insmod", "rmmod", "kmod",
+            "mount", "umount", "modprobe", "insmod", "rmmod", "kmod",
             "iptables", "ip6tables", "nft", "systemctl", "reboot", "shutdown", "poweroff",
             "kexec", "sysctl", "swapon", "swapoff", "mknod", "chroot", "unshare", "nsenter",
             -- 本机 SSH 服务控制：启动/管理 sshd 或 agent 属特权操作（T2，主机效果需审批）

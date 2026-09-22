@@ -209,13 +209,11 @@ local function _prune_worker(content, head_chars, tail_chars, threshold, tm_src,
   return "\1" .. total .. "\t" .. metrics.strchars(text) .. "\n" .. text
 end
 
---- 是否启用线程池卸载（ui.render.threaded 且线程池与 textmetrics 源码可用）
+--- 线程池与 textmetrics 源码是否可用（已强制多线程，无同步回退开关）
 --- @return boolean
 local function _offload_enabled()
   if not work.available() then return false end
   if tm.source == nil then return false end
-  local cfg = config_store.get("ui.render")
-  if type(cfg) == "table" and cfg.threaded == false then return false end
   return true
 end
 
@@ -238,7 +236,7 @@ end
 
 --- 异步就地裁剪：把码点统计与切片分配到 `utils.work` 线程池，避免 MB 级工具结果
 --- 在发送/压缩路径阻塞主线程。仅卸载字符串内容；块数组与 Blob 走同步路径。
---- 线程池不可用或 `ui.render.threaded=false` 时回退同步 `prune_agent`（行为等价）。
+--- 线程池不可用时回退同步 `prune_agent`（行为等价）。
 --- 单个任务失败不影响其余结果（视为该条不裁剪）。
 --- @param agent table
 --- @param opts table|nil { context_cache? }

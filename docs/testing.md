@@ -95,6 +95,9 @@ end)
 | 文件 | 覆盖 |
 | --- | --- |
 | `test_kernel` | 内核：配置合并、事件总线、生命周期 |
+| `test_work_codec` | `vim.mpack` 结构化卸载、二进制往返与错误传播 |
+| `test_stream_batching` | 流式分片累积（小内容即时可见、大内容与 8KB 边界 finalize 不丢数据） |
+| `test_incremental` | 增量渲染（行差异、块缓存、块描述符复用、工具结果就地增长重建，增量与全量逐行一致） |
 | `test_session` | 会话对象、JSONL 存储、上下文构建、压缩 |
 | `test_tool_result_pruner` | 工具结果裁剪（码点计量、头/标记/尾、图像跳过） |
 | `test_agent / test_guard / test_overflow` | Agent 状态机、护栏、溢出恢复、配对安全切分 |

@@ -45,7 +45,7 @@ function M.write(provider, models)
     models = models,
   }
   local json = require("NeoAI.utils.json")
-  return fs.write_file(path, json.encode(data))
+  return fs.write_file(path, json.encode_fast(data))
 end
 
 --- 清空缓存

@@ -79,9 +79,9 @@
 **约束**（libuv 线程内是全新 Lua state，不共享闭包 / require / vim.fn / vim.api）：
 
 - 工作函数必须以**字节码**（`string.dump`）传入：仅能用参数 + 纯 Lua 标准库 + `vim.uv`。
-- 参数与返回值必须是**原始类型**（string / number / boolean / nil），不能是 table。
+- 参数与返回值必须是**原始类型**（string / number / boolean / nil），不能是 table（结构化数据用 `run_codec`）。
 - 返回值应为 string（nil / 其它原始类型会自动 `tostring`）。
-- 线程池默认 4 根线程，文件系统操作也在池里，排队共享。
+- 线程池大小 = CPU 核数（`vim.uv.new_work`），文件系统操作也在池里，排队共享。
 
 ```lua
 local work = require("NeoAI.utils.work")
@@ -93,7 +93,21 @@ work.run(function(path)
 end, "/path/to/file"):then_(function(data) ... end, function(err) ... end)
 ```
 
-无 `vim.uv.new_work`（nvim < 0.10）时回退到 `vim.schedule` 同步执行（仍保证不阻塞调用栈）。
+`work.run_codec(fn, input, ...)`：**结构化输入/输出**。主线程把 `input` 经 `vim.mpack` 编码为
+二进制单串传入（规避 table 不能跨线程），线程内用 `vim.mpack` 解码（worker 内 `vim.mpack` 可用）；
+`fn(data, ...)` 返回任意可 msgpack 化的值，主线程再解码。额外原始类型参数打包传递（规避 `queue`
+参数丢失）。相比 JSON 更快、原生支持二进制（无需 base64 哨兵）。
+
+```lua
+work.run_codec(function(data)
+  local sum = 0
+  for _, v in ipairs(data.list) do sum = sum + v end
+  return { sum = sum }
+end, { list = { 1, 2, 3 } }):then_(function(res) ... end)
+```
+
+> 已强制多线程、无同步回退：启动时 `work.require()` 校验 `vim.uv.new_work`（nvim < 0.10 即报错），
+> 并跑一次 worker 往返自检（`work.selfcheck`）确认 worker 内 `vim.mpack` 可用；任一不满足即显式报错。
 
 `work.batched(tasks, limit, start)`：**分批并发**提交。`start(task)` 在主线程调用并返回
 一个 `work.run` 的 Deferred；每批最多 `limit` 个在途，完成一批再提交下一批，结果按 `tasks`

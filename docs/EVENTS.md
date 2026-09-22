@@ -88,15 +88,15 @@ vim.api.nvim_create_autocmd("User", {
 | 常量 | 值 | 触发时机 | payload 关键字段 |
 | --- | --- | --- | --- |
 | `REASONING_STARTED` | `reasoning:started` | 推理开始 | `{ agent_id }` |
-| `REASONING_CHUNK` | `reasoning:chunk` | 推理内容分片 | `{ agent_id, chunk, reasoning }` |
+| `REASONING_CHUNK` | `reasoning:chunk` | 推理内容分片 | `{ agent_id, chunk }`（不随分片携带完整累计 reasoning，需要完整文本时从 Agent 消息队列读取） |
 | `REASONING_COMPLETED` | `reasoning:completed` | 推理完成 | `{ agent_id }` |
 
 ### 消息
 
 | 常量 | 值 | 触发时机 | payload 关键字段 |
 | --- | --- | --- | --- |
-| `MESSAGE_ADDED` | `message:added` | 添加消息 | `{ agent_id, message }` |
-| `MESSAGE_UPDATED` | `message:updated` | 更新消息 | `{ agent_id, message }` |
+| `MESSAGE_ADDED` | `message:added` | 添加消息 | `{ agent_id, message }`（message 为轻量视图：`role/ts/tool_call_id/tool_name/has_content/has_reasoning/tool_call_count`，不含正文；正文从 Agent 消息队列读取） |
+| `MESSAGE_UPDATED` | `message:updated` | 更新消息 | `{ agent_id, message }`（同上轻量视图，不含正文） |
 | `MESSAGE_EDITED` | `message:edited` | 编辑消息 | `{ agent_id, message }` |
 | `MESSAGE_DELETED` | `message:deleted` | 删除消息 | `{ agent_id, message }` |
 | `MESSAGE_SENT` | `message:sent` | 用户发送消息 | `{ agent_id, content }` |
@@ -132,10 +132,10 @@ vim.api.nvim_create_autocmd("User", {
 | `TOOL_LOOP_LIMIT_REACHED` | `tool_loop:limit_reached` | 达到最大轮数（1000） | `{ agent_id, rounds }` |
 | `TOOL_LOOP_GUARD_REMINDER` | `tool_loop:guard_reminder` | 护栏注入重复调用提醒 | `{ agent_id, repeats }` |
 | `TOOL_EXECUTION_STARTED` | `tool:execution_started` | 单个工具开始执行 | `{ agent_id, name, args, tool_call_id }` |
-| `TOOL_EXECUTION_COMPLETED` | `tool:execution_completed` | 单个工具完成 | `{ agent_id, name, result, tool_call_id, duration_ms }` |
+| `TOOL_EXECUTION_COMPLETED` | `tool:execution_completed` | 单个工具完成 | `{ agent_id, name, tool_call_id, duration_ms }`（不含完整结果；结果从 Agent 消息队列读取） |
 | `TOOL_EXECUTION_ERROR` | `tool:execution_error` | 单个工具出错 | `{ agent_id, name, error, tool_call_id, duration_ms }` |
 | `TOOL_CALL_DETECTED` | `tool:call_detected` | 检测到工具调用 | `{ agent_id, tool_calls }` |
-| `TOOL_RESULT_RECEIVED` | `tool:result_received` | 收到工具结果 | `{ agent_id, message }` |
+| `TOOL_RESULT_RECEIVED` | `tool:result_received` | 收到工具结果 | `{ agent_id, message }`（轻量视图，不含结果正文） |
 | `TOOL_RESULT_PRUNED` | `tool:result_pruned` | 压缩前裁剪超长工具结果 | `{ agent_id, tool_name, chars_before, chars_after }` |
 | `TOOL_APPROVAL_REQUESTED` | `tool:approval_requested` | 发起工具审批（入队） | `{ tool_name, args, agent_id }` |
 | `TOOL_APPROVED` | `tool:approved` | 审批通过 | `{ tool_name, agent_id }` |

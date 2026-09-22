@@ -20,6 +20,10 @@ local M = {}
 
 local TOKEN_PREFIX = "NEOKEY_"
 local TOKEN_PAT = "NEOKEY_%x+"
+-- 敏感环境变量名段（与 SCAN_SRC 内同名常量保持一致；模块级供工作线程参数传递）
+local NAME_SEGMENTS = {
+  "KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL", "CREDENTIALS",
+}
 -- 环境变量信号：列出「在 AI 可见输出中被 token 化」的变量名（逗号分隔）。
 -- 沙箱进程环境本身经 `runtime.sandbox_env` 还原为真实密钥（token→真实仅限沙箱内部进程），
 -- 但命令输出回传模型前会重新 token 化，故该信号帮助 Agent 判断哪些值在输出中是 token。
@@ -1346,6 +1350,88 @@ function M.scan(value, acc)
     end
   end
   return acc
+end
+
+-- 单遍扫描工作线程：一次遍历同时产出原始密钥命中 / token 集合 / 敏感环境变量名。
+-- 自包含（无 upvalue / require），可经 utils.work.run_codec 在独立线程执行。
+-- 参数为单个结构：{ value = args, secrets = {...}, segments = {...}, token_pat, env_name_pat }。
+local function _SCAN_ALL_WORKER(payload)
+  local secrets = payload.secrets or {}
+  local segments = payload.segments or {}
+  local token_pat = payload.token_pat
+  local env_name_pat = payload.env_name_pat
+  local tokens, names, seen = {}, {}, {}
+  local result = {}
+  local function secret_name(name)
+    if type(name) ~= "string" or name == "" then return false end
+    local n = name:upper()
+    if n:find("APIKEY", 1, true) then return true end
+    for seg in n:gmatch("[A-Z0-9]+") do
+      for i = 1, #segments do
+        if seg == segments[i] then return true end
+      end
+    end
+    return false
+  end
+  local function find_secret(text)
+    for i = 1, #secrets do
+      local s = secrets[i]
+      if #s >= 8 and text:find(s, 1, true) then return s end
+    end
+    return nil
+  end
+  local function walk(v)
+    local t = type(v)
+    if t == "string" then
+      if not result.secret then
+        local s = find_secret(v)
+        if s then result.secret = s end
+      end
+      for tok in v:gmatch(token_pat) do tokens[tok] = true end
+      for name in v:gmatch(env_name_pat) do
+        if #name >= 6 and not seen[name] and not name:match("^SANDBOX_SECRET_") and secret_name(name) then
+          seen[name] = true
+          names[#names + 1] = name
+        end
+      end
+    elseif t == "table" then
+      for k, x in pairs(v) do
+        walk(x)
+        if type(k) == "string" then walk(k) end
+      end
+    end
+  end
+  walk(payload.value)
+  local toks = {}
+  for tok in pairs(tokens) do toks[#toks + 1] = tok end
+  return { secret = result.secret, tokens = toks, names = names }
+end
+
+--- 异步深度扫描工具参数（单遍产出 secret/tokens/names），供出向密钥防护。
+--- 遍历（可能 MB 级、含多次 gmatch）在线程池执行，避免阻塞主线程。
+--- @param value any
+--- @return Deferred resolve({ secret?: string, tokens: table, names: table })
+function M.scan_all_async(value)
+  local async = require("NeoAI.utils.async")
+  if not M.enabled() then
+    return async.resolve({ tokens = {}, names = {} })
+  end
+  local secrets = {}
+  for s in pairs(state.by_secret) do
+    if #s >= 8 and not _is_env_name_secret(s) then secrets[#secrets + 1] = s end
+  end
+  local work = require("NeoAI.utils.work")
+  return work.run_codec(_SCAN_ALL_WORKER, {
+    value = value,
+    secrets = secrets,
+    segments = NAME_SEGMENTS,
+    token_pat = TOKEN_PAT,
+    env_name_pat = ENV_NAME_PAT,
+  }):then_(function(res)
+    local set = {}
+    for _, tok in ipairs(res.tokens or {}) do set[tok] = true end
+    return { secret = res.secret, tokens = set, names = res.names or {} }
+  end)
 end
 
 --- 对工具参数做 token 化（深度遍历字符串；由执行器按 fs_write 规格调用）

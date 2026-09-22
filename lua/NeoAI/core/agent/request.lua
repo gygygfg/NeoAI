@@ -42,7 +42,9 @@ function M.build_round_meta(response, opts)
     request = {
       model = response and response.model,
       provider = response and response.provider,
-      body = body and vim.deepcopy(body),
+      -- 直接引用请求体：仅用于轨迹展示，发送后不再修改，避免对整段 body（含全部消息+
+      -- 工具 schema）做 vim.deepcopy（每轮一次的大对象拷贝）。
+      body = body,
     },
     response = {
       finish_reason = response and response.finish_reason,
@@ -290,7 +292,7 @@ function M.send_stream(messages, opts, on_chunk)
     local timeout_ms = opts.timeout_ms or config_store.get("ai.timeout_ms") or 60000
     local max_retries = opts.max_retries or config_store.get("ai.max_retries") or 3
 
-    local acc = { content = "", reasoning = "", tool_calls = nil, finish_reason = nil, usage = nil }
+    local acc = { content_parts = {}, reasoning_parts = {}, tool_calls = nil, finish_reason = nil, usage = nil }
     local raw = { chunks = {}, bytes = 0, truncated = false }
     local done = false
     local emitted = false
@@ -301,7 +303,7 @@ function M.send_stream(messages, opts, on_chunk)
       system = ctx.system, tools = ctx.tools, stream = true, signal = opts.signal,
     }):then_(function()
     return async.retry(function()
-      acc = { content = "", reasoning = "", tool_calls = nil, finish_reason = nil, usage = nil }
+      acc = { content_parts = {}, reasoning_parts = {}, tool_calls = nil, finish_reason = nil, usage = nil }
       raw = { chunks = {}, bytes = 0, truncated = false }
       done = false
       emitted = false
@@ -326,12 +328,12 @@ function M.send_stream(messages, opts, on_chunk)
           if not parsed then return end
           if type(parsed.content) == "string" then
             emitted = emitted or parsed.content ~= ""
-            acc.content = acc.content .. parsed.content
+            acc.content_parts[#acc.content_parts + 1] = parsed.content
             if on_chunk then on_chunk({ content = parsed.content }) end
           end
           if type(parsed.reasoning) == "string" then
             emitted = emitted or parsed.reasoning ~= ""
-            acc.reasoning = acc.reasoning .. parsed.reasoning
+            acc.reasoning_parts[#acc.reasoning_parts + 1] = parsed.reasoning
             if on_chunk then on_chunk({ reasoning = parsed.reasoning }) end
           end
           if parsed.tool_calls then
@@ -353,9 +355,11 @@ function M.send_stream(messages, opts, on_chunk)
           end
         end,
       }):then_(function()
+        local content = table.concat(acc.content_parts)
+        local reasoning = table.concat(acc.reasoning_parts)
         return {
-          content = acc.content ~= "" and acc.content or nil,
-          reasoning = acc.reasoning ~= "" and acc.reasoning or nil,
+          content = content ~= "" and content or nil,
+          reasoning = reasoning ~= "" and reasoning or nil,
           tool_calls = acc.tool_calls,
           finish_reason = acc.finish_reason,
           usage = acc.usage,

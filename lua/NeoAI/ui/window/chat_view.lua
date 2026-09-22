@@ -252,11 +252,16 @@ local render_scheduled = false
 local render_pending_follow = false
 local render_pending_keep_view = false
 local render_flushed = false
+-- 流式渲染最小间隔（毫秒）：分片到达极快时，每个 tick 全量重渲染仍是 O(n²) 主线程开销。
+-- 生成中把渲染频率限制为至多每此间隔一次（非流式事件仍即时渲染，保证响应性）。
+local RENDER_MIN_INTERVAL_MS = 80
+local last_render_ms = 0
 
 --- 执行一次实际渲染（由调度回调或 flush 调用）
 local function _do_render()
   render_scheduled = false
   render_flushed = true
+  last_render_ms = vim.uv.hrtime() / 1e6
   local keep_view = render_pending_keep_view
   render_pending_keep_view = false
   local changed = _render(keep_view)
@@ -295,14 +300,22 @@ local function _schedule_render(keep_view)
   render_pending_follow = _cursor_within_follow_margin()
   state.following = render_pending_follow
   render_pending_keep_view = kv
-  vim.schedule(function()
+  local function _run()
     if render_flushed then
       -- 已被 flush 同步执行过，跳过以避免重复渲染
       render_scheduled = false
       return
     end
     _do_render()
-  end)
+  end
+  local now = vim.uv.hrtime() / 1e6
+  local streaming = chat_service.has_pending_work()
+  local wait_ms = RENDER_MIN_INTERVAL_MS - (now - last_render_ms)
+  if streaming and wait_ms > 0 then
+    vim.defer_fn(_run, math.ceil(wait_ms))
+  else
+    vim.schedule(_run)
+  end
 end
 
 -- 推理分片批量：推理 token 高频到达时，逐片 nvim_buf_set_lines / set_cursor 会
@@ -429,7 +442,9 @@ end
 local function _on_message_updated(payload)
   if not payload or not payload.agent_id then return end
   if payload.agent_id ~= state.agent_id then return end
-  if payload.message and payload.message.content ~= "" then
+  local msg = payload.message
+  -- 事件 payload 只带标量标志（has_content）；兼容直接传完整 message 的调用方（测试/插件）。
+  if msg and (msg.has_content or msg.content ~= "") then
     -- 正文开始：取消尚未冲刷的推理分片并关闭悬浮窗。若不取消，已 vim.schedule 的
     -- _flush_reasoning 稍后还会把残留分片 append 上去、把已关闭的悬浮窗重新打开。
     _cancel_pending_reasoning()
@@ -480,7 +495,14 @@ local function _on_reasoning_chunk(payload)
     end
   else
     if not _cursor_within_follow_margin() then return end
-    reasoning_panel.show(payload.reasoning)
+    -- 事件不再随分片携带完整 reasoning；缺失时从当前 Agent 消息队列取末条正文兜底。
+    local text = payload.reasoning
+    if not text then
+      local msgs = chat_service.get_messages()
+      local last = msgs and msgs[#msgs]
+      text = last and last.reasoning or ""
+    end
+    reasoning_panel.show(text)
   end
 end
 
@@ -665,6 +687,8 @@ local function _on_agent_end(payload)
   if payload and payload.agent_id == state.agent_id and not chat_service.has_pending_work() then
     -- 生成真正结束：立即停掉工具耗时刷新定时器，避免残留的 running 记录让它空转。
     _stop_tool_tick()
+    -- 回收已完成工具的计时记录：耗时已落库到结果消息，fold 表无需继续持有（避免长会话膨胀）。
+    fold.prune_finished()
     _focus_input_insert()
   end
 end

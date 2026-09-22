@@ -15,6 +15,9 @@ local events = require("NeoAI.kernel.events")
 -- 首个分片立即推送（UI 据此打开"接收参数"悬浮窗），完整结果由 finish() 统一给出。
 local TOOL_ARG_EMIT_INTERVAL_MS = 50
 
+-- 快照参数预览上限（字节）：节流快照只展示有界前缀，避免每次快照都拼接全部累积参数。
+local ARG_PREVIEW_BYTES = 4096
+
 -- ========== 私有函数 ==========
 
 --- 累积工具调用增量
@@ -28,7 +31,7 @@ local function _accumulate_tool_calls(acc, tool_calls)
   acc = acc or {}
   for _, tc in ipairs(tool_calls or {}) do
     local idx = tc.index or 0
-    local entry = acc[idx] or { id = nil, name = nil, name_parts = {}, arg_parts = {} }
+    local entry = acc[idx] or { id = nil, name = nil, name_parts = {}, arg_parts = {}, arg_bytes = 0, arg_preview = "", arg_preview_len = 0 }
     if tc.id then entry.id = tc.id end
     if tc.type then entry.type = tc.type end
     local fn = tc["function"]
@@ -37,7 +40,17 @@ local function _accumulate_tool_calls(acc, tool_calls)
         entry.name_parts[#entry.name_parts + 1] = fn.name
         entry.name = table.concat(entry.name_parts)
       end
-      if fn.arguments then entry.arg_parts[#entry.arg_parts + 1] = fn.arguments end
+      if fn.arguments then
+        entry.arg_parts[#entry.arg_parts + 1] = fn.arguments
+        entry.arg_bytes = (entry.arg_bytes or 0) + #fn.arguments
+        -- 有界预览：仅累积到 ARG_PREVIEW_BYTES，供节流快照展示，避免快照时全量拼接。
+        local room = ARG_PREVIEW_BYTES - (entry.arg_preview_len or 0)
+        if room > 0 then
+          local piece = #fn.arguments > room and fn.arguments:sub(1, room) or fn.arguments
+          entry.arg_preview = (entry.arg_preview or "") .. piece
+          entry.arg_preview_len = (entry.arg_preview_len or 0) + #piece
+        end
+      end
     end
     acc[idx] = entry
   end
@@ -64,6 +77,29 @@ local function _finalize_tool_calls(acc)
           name = entry.name,
           arguments = (args ~= nil and args ~= "") and args or "{}",
         },
+      }
+    end
+  end
+  return out
+end
+
+--- 节流快照：只使用有界预览（不拼接全部累积参数），供 UI 展示"接收参数中"。
+--- @param acc table
+--- @return table
+local function _snapshot_tool_calls(acc)
+  local out = {}
+  local indices = {}
+  for idx in pairs(acc) do indices[#indices + 1] = idx end
+  table.sort(indices)
+  for _, idx in ipairs(indices) do
+    local entry = acc[idx]
+    if entry and entry.name and entry.name ~= "" then
+      local args = entry.arg_preview or ""
+      if (entry.arg_bytes or 0) > #args then args = args .. "…" end
+      out[#out + 1] = {
+        id = entry.id or ("call_" .. tostring(idx)),
+        type = "function",
+        ["function"] = { name = entry.name, arguments = args },
       }
     end
   end
@@ -113,7 +149,7 @@ function M.create(agent)
         last_arg_emit_ms = now_ms
         event_bus.emit(events.TOOL_ARG_CHUNK, {
           agent_id = agent.id,
-          tool_calls = _finalize_tool_calls(tool_acc),
+          tool_calls = _snapshot_tool_calls(tool_acc),
         })
       end
     end
@@ -126,6 +162,8 @@ function M.create(agent)
   --- 结束流：把累积的 tool_calls 写入 agent
   --- @return table|nil 完成的 tool_calls
   function processor.finish()
+    -- 物化流式累积的 content/reasoning（分片数组 → 完整字符串）
+    if agent.finalize_stream then agent:finalize_stream() end
     if reasoning_active then
       reasoning_active = false
       event_bus.emit(events.REASONING_COMPLETED, { agent_id = agent.id })

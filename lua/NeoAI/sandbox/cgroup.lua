@@ -340,6 +340,15 @@ function M.capabilities()
   return state.caps
 end
 
+--- 是否应在沙箱内暴露可写委派 cgroup 子树（`limits.delegate_cgroup`，默认开）。
+--- 需 cgroup v2 可写；不可用时返回 false（调用方静默跳过）。
+--- @return boolean
+function M.delegation_enabled()
+  local cfg = require("NeoAI.kernel.config_store").get("tools.sandbox.limits") or {}
+  if cfg.delegate_cgroup == false then return false end
+  return M.capabilities().available == true
+end
+
 --- 是否启用资源限制（动态默认开启；或任一静态限制 > 0）
 --- @return boolean
 function M.limits_configured()

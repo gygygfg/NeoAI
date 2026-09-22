@@ -1396,10 +1396,12 @@ tests.suite("sandbox", function(_, it)
       t.true_(joined:find("--cap-drop CAP_SYS_TIME", 1, true) ~= nil, "应丢弃 CAP_SYS_TIME（禁改宿主时钟）")
       t.true_(joined:find("--cap-drop CAP_SYS_MODULE", 1, true) ~= nil, "应丢弃 CAP_SYS_MODULE")
       t.true_(joined:find("--cap-drop CAP_SYS_RAWIO", 1, true) ~= nil, "应丢弃 CAP_SYS_RAWIO")
-      -- 基线仅加回 CAP_DAC_OVERRIDE（使 root 载荷可访问他人属主 0700 目录），不加回其它能力。
+      -- 基线加回 CAP_DAC_OVERRIDE（root 载荷访问他人属主 0700 目录）+ CAP_SETUID/CAP_SETGID
+      -- （沙箱内降权，供 PostgreSQL 等拒绝 root 运行的服务）；CHOWN 等仍按命令窄授予。
       t.true_(joined:find("--cap-add CAP_DAC_OVERRIDE", 1, true) ~= nil, "应基线加回 CAP_DAC_OVERRIDE")
       t.true_(joined:find("--cap-add CAP_CHOWN", 1, true) == nil, "默认不应加回 CAP_CHOWN")
-      t.true_(joined:find("--cap-add CAP_SETUID", 1, true) == nil, "默认不应加回 CAP_SETUID")
+      t.true_(joined:find("--cap-add CAP_SETUID", 1, true) ~= nil, "应基线加回 CAP_SETUID（沙箱内降权）")
+      t.true_(joined:find("--cap-add CAP_SETGID", 1, true) ~= nil, "应基线加回 CAP_SETGID（沙箱内降权）")
       t.true_(joined:find("--tmpfs " .. dir, 1, true) ~= nil, "目录应以空 tmpfs 遮蔽")
       t.true_(joined:find("--bind /dev/null " .. file, 1, true) ~= nil, "文件/socket 应以 /dev/null 遮蔽")
     end)
@@ -2263,6 +2265,63 @@ tests.suite("sandbox", function(_, it)
     vim.fn.delete(root, "rf")
   end)
 
+  it("工作区暂存快照：大文件条目暴露 large 标记（供常驻物化走复制而非内嵌）", function(t)
+    local fs = require("NeoAI.utils.fs")
+    local sandbox = require("NeoAI.sandbox")
+    local candidate = require("NeoAI.sandbox.candidate")
+    local control = require("NeoAI.sandbox.control")
+    local store = require("NeoAI.sandbox.store")
+    local dir = fs.canonical(vim.fn.tempname())
+    fs.ensure_dir(dir)
+    with_config({ tools = { sandbox = {
+      workspace_root = vim.fn.tempname() .. "/sb", max_file_bytes = 1024,
+    } } }, function()
+      sandbox.reset()
+      local a = control.new_attempt("run_command", {}, {}, { effect = "process" })
+      candidate.begin(a, store.root())
+      local target = dir .. "/big.bin"
+      local staged = candidate.stage_path(a.attempt_id, target)
+      fs.write_file(staged, string.rep("Z", 4096))
+      local cand = candidate.finish(a.attempt_id)
+      candidate.merge_candidate(cand)
+      local entry
+      for _, o in ipairs(candidate.workspace_overrides()) do
+        if o.real == target then entry = o end
+      end
+      t.not_nil(entry, "应存在暂存条目")
+      t.true_(entry.large == true, "大文件条目应暴露 large 标记")
+      candidate.cleanup(a.attempt_id)
+    end)
+    vim.fn.delete(dir, "rf")
+  end)
+
+  it("工作区暂存快照：常驻命令产物暴露 fresh_resident（供物化跳过回写）", function(t)
+    local fs = require("NeoAI.utils.fs")
+    local sandbox = require("NeoAI.sandbox")
+    local candidate = require("NeoAI.sandbox.candidate")
+    local control = require("NeoAI.sandbox.control")
+    local store = require("NeoAI.sandbox.store")
+    local dir = fs.canonical(vim.fn.tempname())
+    fs.ensure_dir(dir)
+    with_config({ tools = { sandbox = { workspace_root = vim.fn.tempname() .. "/sb" } } }, function()
+      sandbox.reset()
+      local a = control.new_attempt("run_command", {}, {}, { effect = "process" })
+      candidate.begin(a, store.root())
+      local p = dir .. "/a.txt"
+      local staged = candidate.stage_path(a.attempt_id, p)
+      fs.write_file(staged, "hello\n")
+      local cand = candidate.finish(a.attempt_id)
+      candidate.merge_candidate(cand, { from_command = true, resident = true })
+      local entry
+      for _, o in ipairs(candidate.workspace_overrides()) do if o.real == p then entry = o end end
+      t.not_nil(entry, "应存在暂存条目")
+      t.true_(entry.fresh_resident == true, "常驻命令产物应暴露 fresh_resident")
+      t.not_nil(entry.fresh_ssig, "应记录 fresh_ssig")
+      candidate.cleanup(a.attempt_id)
+    end)
+    vim.fn.delete(dir, "rf")
+  end)
+
   it("异步捕获：未变文件第二次捕获不重复处理（不进入 mapping）", function(t)
     local fs = require("NeoAI.utils.fs")
     local sandbox = require("NeoAI.sandbox")
@@ -2547,10 +2606,11 @@ tests.suite("sandbox", function(_, it)
     -- 写入仍全部进 overlay 暂存、敏感路径由遮蔽挂载保护，不扩大宿主面。
     local r2 = privilege.resolve(1, { tier = 1, package = true, package_all = false })
     t.true_(vim.tbl_contains(r2.privileges.cap_add, "CAP_DAC_OVERRIDE"), "链式包命令应加回")
-    -- 非包安装不按 packages.cap_add 加回包管理专属能力（DAC_OVERRIDE 属档位基线，始终存在）。
+    -- 非包安装不按 packages.cap_add 加回包管理专属能力（DAC_OVERRIDE/SETUID/SETGID 属档位基线，
+    -- 始终存在以支持沙箱内降权）；CHOWN 等仍不授予。
     local r3 = privilege.resolve(1, { tier = 1, package = false, package_all = false })
     t.true_(not vim.tbl_contains(r3.privileges.cap_add, "CAP_CHOWN"), "非包安装不应加回 CAP_CHOWN")
-    t.true_(not vim.tbl_contains(r3.privileges.cap_add, "CAP_SETUID"), "非包安装不应加回 CAP_SETUID")
+    t.true_(vim.tbl_contains(r3.privileges.cap_add, "CAP_SETUID"), "SETUID 属档位基线（沙箱内降权）")
   end)
 
   it("加固：基线 CAP_DAC_OVERRIDE 使 root 载荷可访问他人属主 0700 目录", function(t)
@@ -3057,6 +3117,36 @@ tests.suite("sandbox", function(_, it)
     vim.fn.delete(dir, "rf")
   end)
 
+  it("性能回归：遮蔽路径 glob/规范化按配置缓存，不随逐文件判定重算", function(t)
+    local runtime = require("NeoAI.sandbox.runtime")
+    local glob = vim.fn.glob
+    local calls = 0
+    vim.fn.glob = function(...)
+      calls = calls + 1
+      return glob(...)
+    end
+    local ok, err = pcall(function()
+      with_config({ tools = { sandbox = { mask_paths = { "/tmp/neoai_mask_glob_*", "/etc/shadow" } } } }, function()
+        -- 预热缓存：首次判定会 glob 展开通配条目
+        runtime.is_masked_path("/tmp/neoai_x")
+        calls = 0
+        -- 大候选捕获/合并会对每个文件逐次判定：命中缓存后不得再逐次 glob（主线程 CPU 热点）
+        for i = 1, 100 do runtime.is_masked_path("/tmp/plain_" .. i) end
+        t.eq(0, calls, "缓存命中后不应逐次 glob")
+      end)
+      -- 配置变更应失效缓存并采用新规则
+      with_config({ tools = { sandbox = { mask_paths = { "/tmp/neoai_mask_a" } } } }, function()
+        t.not_nil(runtime.is_masked_path("/tmp/neoai_mask_a"), "新配置应生效")
+      end)
+      with_config({ tools = { sandbox = { mask_paths = { "/tmp/neoai_mask_b" } } } }, function()
+        t.nil_(runtime.is_masked_path("/tmp/neoai_mask_a"), "配置变更应失效旧缓存")
+        t.not_nil(runtime.is_masked_path("/tmp/neoai_mask_b"), "配置变更后新条目应命中")
+      end)
+    end)
+    vim.fn.glob = glob
+    if not ok then error(err) end
+  end)
+
   it("加固：遮蔽路径解析符号链接与 /proc/<pid>/root，防进程内绕过", function(t)
     local runtime = require("NeoAI.sandbox.runtime")
     local fs = require("NeoAI.utils.fs")
@@ -3148,9 +3238,14 @@ tests.suite("sandbox", function(_, it)
     t.eq(1, net.tier, "网络命令应为 T1")
     local sudo = privilege.classify("run_command", { command = "sudo mount /dev/x" }, spec)
     t.eq(2, sudo.tier, "sudo/mount 应为 T2")
+    -- sudo/doas 是降权包装器（载荷本就 root）：档位由被包裹命令决定；被包裹命令普通时至少 T1
+    -- 并标记 privdrop（按 sysadmin 加回能力/解除 sudoers 遮蔽），使 `sudo -u <user>` 可用。
+    local sudo_id = privilege.classify("run_command", { command = "sudo id" }, spec)
+    t.eq(1, sudo_id.tier, "sudo id 应为 T1（降权包装器）")
+    t.true_(sudo_id.privdrop, "应标记 privdrop")
     t.eq(0, privilege.classify("read_file", { file_path = "/x" }, { effect = "read" }).tier, "非 process 应 T0")
     -- 复合命令取最高档
-    t.eq(2, privilege.classify("run_command", { command = "ls && sudo id" }, spec).tier, "复合命令取最高档")
+    t.eq(1, privilege.classify("run_command", { command = "ls && sudo id" }, spec).tier, "复合命令取最高档")
     -- 最高档校验
     with_config({ tools = { sandbox = { privilege = { max_tier = 1 } } } }, function()
       t.false_(privilege.resolve(2, { tier = 2 }).ok, "超过 max_tier 应拒绝")
@@ -6084,8 +6179,10 @@ tests.suite("sandbox", function(_, it)
       end, function(e) t.true_(false, tostring(e and e.message or e)); done = true end)
       t.true_(vim.wait(8000, function() return done end), "命令应完成")
       t.matches("Seccomp:%s*2", out, "应加载 seccomp 过滤器")
-      -- 基线仅 CAP_DAC_OVERRIDE（bit1 = 0x2）：root 载荷可访问他人属主 0700 目录；其余能力仍丢弃。
-      t.true_(out:find("CapEff:%s*0*2\n") ~= nil, "默认应仅持有 CAP_DAC_OVERRIDE")
+      -- 基线：CAP_DAC_OVERRIDE（bit1=0x2）+ CAP_SETGID（bit6=0x40）+ CAP_SETUID（bit7=0x80）= 0xc2。
+      -- DAC_OVERRIDE 使 root 载荷可访问他人属主 0700 目录；SETUID/SETGID 供沙箱内降权（PG 等）；
+      -- 其余能力仍丢弃。
+      t.matches("CapEff:%s*0*[cC]2\n", out, "默认应仅持有 DAC_OVERRIDE + SETUID/SETGID")
     end)
     -- 显式放宽：cap_add = { "ALL" } → 持有完整能力，seccomp 仍生效。
     with_config({

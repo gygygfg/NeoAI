@@ -20,8 +20,13 @@ local state = {
   overlay_write_probe = {}, -- "w|lower|dev_upper|uid|gid" -> boolean（可写性依赖载荷身份）
   empty_file = nil, -- 用于覆盖 /proc 泄露项的空文件路径（宿主）
   apt_conf = nil, -- { path = string, user = string } apt 沙箱配置片段（宿主私有文件）
+  apk_repos = nil, -- { path = string, url = string } 重写镜像后的 apk repositories（宿主私有文件）
   mask_dirs_cache = nil, -- { cfg = <table ref>, dirs = string[] } stat 过滤后的遮蔽目录
   mask_dirs_raw_cache = nil, -- { cfg = <table ref>, dirs = string[] } 原始遮蔽目录前缀（不 stat）
+  mask_paths_cache = nil, -- { list = <table ref>, read_all = bool, paths = string[] } glob 展开后的遮蔽路径
+  mask_paths_canon_cache = nil, -- { paths = <table ref>, canon = string[] } 遮蔽路径的规范化形式
+  store_root_raw = nil, -- 已缓存的 store 根原始串
+  store_root_canon = nil, -- store 根的规范化形式（避免逐文件 resolve）
   self_paths_cache = nil, -- { key = string, paths = string[] } 沙箱自有作用域路径（越界留痕排除用）
 }
 
@@ -547,6 +552,10 @@ end
 -- `-s` 指向；文件名无沙箱特征（见 conceal）。
 local MAVEN_SETTINGS_GUEST = "/tmp/.mvn-settings.xml"
 
+-- apk（Alpine/musl）镜像 repositories 在沙箱内的挂载点：必须落在 /etc/apk/repositories
+-- （apk 只读该路径），故直接以只读绑定覆盖；/etc 在 read_all 模式下可写，挂载点可创建。
+local APK_REPOS_GUEST = "/etc/apk/repositories"
+
 --- 读取镜像配置（tools.sandbox.network.mirrors）。
 --- @return table { pip?, npm?, maven? }
 local function _mirrors()
@@ -582,6 +591,38 @@ local function _maven_settings(url)
   f:close()
   pcall(vim.uv.fs_chmod, p, 420) -- 0644：非 root 载荷需可读
   state.maven_settings = { path = p, url = url }
+  return p
+end
+
+--- 生成替换镜像源后的 apk repositories 文件（宿主私有）：读取宿主 /etc/apk/repositories，
+--- 把每行源的 scheme+host 前缀替换为配置的镜像基址（保留 /alpine/vX/main 等版本路径）。
+--- 非 Alpine（无该文件或无有效行）返回 nil（调用方跳过注入，apk 退回默认源）。
+--- @param url string
+--- @return string|nil 宿主路径
+local function _apk_repositories(url)
+  url = tostring(url or ""):gsub("/+$", "")
+  if url == "" then return nil end
+  local cached = state.apk_repos
+  if cached and cached.url == url and vim.uv.fs_stat(cached.path) then return cached.path end
+  local src = io.open("/etc/apk/repositories", "r")
+  if not src then return nil end
+  local lines = {}
+  for line in src:lines() do
+    local t = line:gsub("^%s+", ""):gsub("%s+$", "")
+    if t ~= "" and t:sub(1, 1) ~= "#" then
+      local path = t:match("^%a+://[^/]+(/.*)$") or t
+      if path:sub(1, 1) == "/" then lines[#lines + 1] = url .. path end
+    end
+  end
+  src:close()
+  if #lines == 0 then return nil end
+  local p = _private_dir() .. "/apk-repositories"
+  local f = io.open(p, "w")
+  if not f then return nil end
+  f:write(table.concat(lines, "\n") .. "\n")
+  f:close()
+  pcall(vim.uv.fs_chmod, p, 420) -- 0644：非 root 载荷需可读
+  state.apk_repos = { path = p, url = url }
   return p
 end
 
@@ -1264,10 +1305,15 @@ end
 --- 配置/内置的宿主敏感遮蔽路径（展开 glob、去重）。不含沙箱自身存储与按 cwd 的遮蔽目录。
 --- @return table 字符串数组
 local function _config_mask_paths()
-  local out, seen = {}, {}
   local cfg = config_store.get("tools.sandbox.mask_paths")
   local list = type(cfg) == "table" and cfg or DEFAULT_MASK_PATHS
   local read_all = _read_all()
+  -- 按配置表引用 + read_all 缓存：`vim.fn.glob` 展开通配条目（`/home/*`、
+  -- `/root/.cache/keyring-*` 等）是重 syscall，而遮蔽判定在候选捕获/合并热路径上按文件
+  -- 逐次调用；逐次 glob 会让数千文件的候选把主线程 CPU 拉满。
+  local cache = state.mask_paths_cache
+  if cache and cache.list == list and cache.read_all == read_all then return cache.paths end
+  local out, seen = {}, {}
   for _, p in ipairs(list) do
     -- `/home/*` 凭据遮蔽仅在 read_all（整机只读）时生效：read_all=false 时 home 不在白名单内
     -- （本就不暴露），而为其创建挂载点会让 /home 意外可见（信息泄露）；cwd 位于 home 时由
@@ -1287,7 +1333,22 @@ local function _config_mask_paths()
       end
     end
   end
+  state.mask_paths_cache = { list = list, read_all = read_all, paths = out }
   return out
+end
+
+--- 遮蔽路径的规范化形式（与 `_config_mask_paths()` 逐项对齐），按路径数组引用缓存。
+--- `_canonical` 走 `vim.fn.resolve`（重 syscall），逐文件对全部遮蔽条目重算是主线程热点；
+--- 遮蔽条目是静态配置，规范化一次即可复用。
+--- @return table 字符串数组
+local function _mask_paths_canonical()
+  local paths = _config_mask_paths()
+  local cache = state.mask_paths_canon_cache
+  if cache and cache.paths == paths then return cache.canon end
+  local canon = {}
+  for i, p in ipairs(paths) do canon[i] = _canonical(p) end
+  state.mask_paths_canon_cache = { paths = paths, canon = canon }
+  return canon
 end
 
 --- 需要在隔离环境内遮蔽的宿主路径，返回 { path, kind } 数组（kind = "dir" | "file"）。
@@ -1669,6 +1730,13 @@ function M.sandbox_env(privileges)
     local prev = env.MAVEN_OPTS or ""
     env.MAVEN_OPTS = (prev ~= "" and (prev .. " ") or "") .. "-s " .. MAVEN_SETTINGS_GUEST
   end
+  local go_url = tostring(mirrors.go or "")
+  if go_url ~= "" then env.GOPROXY = go_url end
+  local rustup_url = tostring(mirrors.rustup or "")
+  if rustup_url ~= "" then
+    env.RUSTUP_DIST_SERVER = rustup_url
+    env.RUSTUP_UPDATE_ROOT = rustup_url
+  end
   if privileges and type(privileges.env) == "table" then
     for k, v in pairs(privileges.env) do env[k] = v end
   end
@@ -1742,11 +1810,21 @@ function M.is_masked_path(path, unmask)
   local ok, store = pcall(require, "NeoAI.sandbox.store")
   if ok and store and store.root then
     local sr = (store.root() or ""):gsub("/+$", "")
-    if sr ~= "" and (_under(path, sr) or _under(path, _canonical(sr))) then return sr end
+    if sr ~= "" then
+      -- store 根规范化结果缓存：避免逐文件对同一根重做 resolve。
+      local canon_sr = state.store_root_canon
+      if state.store_root_raw ~= sr or canon_sr == nil then
+        canon_sr = _canonical(sr)
+        state.store_root_raw, state.store_root_canon = sr, canon_sr
+      end
+      if _under(path, sr) or _under(path, canon_sr) then return sr end
+    end
   end
-  for _, p in ipairs(_config_mask_paths()) do
+  local paths = _config_mask_paths()
+  local canon = _mask_paths_canonical()
+  for i, p in ipairs(paths) do
     -- 同时比对原始与规范化后的遮蔽条目：条目自身可能含符号链接（如 /var/run → /run）。
-    if _under(path, p) or _under(path, _canonical(p)) then
+    if _under(path, p) or _under(path, canon[i]) then
       if not _unmasked_by(unmask, p) then return p end
     end
   end
@@ -2251,6 +2329,16 @@ function M.process_prefix(opts)
         table.insert(argv, "--ro-bind"); table.insert(argv, ms); table.insert(argv, MAVEN_SETTINGS_GUEST)
       end
     end
+    -- apk（Alpine/musl）镜像：把重写后的 repositories 只读绑定到 /etc/apk/repositories。
+    -- 先 `--dir /etc/apk` 保证挂载点存在（非 Alpine 主机无该目录）；置于遮蔽之后。
+    local apk_mirror = tostring((_mirrors().apk) or "")
+    if apk_mirror ~= "" then
+      local ar = _apk_repositories(apk_mirror)
+      if ar then
+        table.insert(argv, "--dir"); table.insert(argv, "/etc/apk")
+        table.insert(argv, "--ro-bind"); table.insert(argv, ar); table.insert(argv, APK_REPOS_GUEST)
+      end
+    end
     -- 工具子进程只读绑定：置于遮蔽之后，用于暴露工具命令自身所在目录（如 $HOME 下的脚本）。
     for _, p in ipairs(opts.ro_binds or {}) do
       if type(p) == "string" and p ~= "" and vim.uv.fs_stat(p) then
@@ -2459,6 +2547,8 @@ function M.reset()
   state.overlay_write_probe = {}
   state.empty_file = nil
   state.apt_conf = nil
+  state.apk_repos = nil
+  state.maven_settings = nil
   state.self_paths_cache = nil
   pcall(M.cleanup_tmp_roots)
 end

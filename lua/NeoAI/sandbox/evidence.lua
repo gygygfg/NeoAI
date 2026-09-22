@@ -98,7 +98,7 @@ local function _build(kind, payload, meta)
     created_at = os.time(),
     payload = _redact(_cap_payload(payload)),
   }
-  local encoded = json.encode(record)
+  local encoded = json.encode_fast(record)
   if #encoded > MAX_BYTES then
     record.payload = { truncated = true, preview = encoded:sub(1, MAX_BYTES) }
   end

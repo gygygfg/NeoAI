@@ -223,6 +223,12 @@ function M.run_all(...)
     if uc.tools.sandbox.postprocess == nil then
       uc.tools.sandbox.postprocess = "sync"
     end
+    -- 测试默认关闭嵌套真实 systemd --user：启动较慢且非测试目标（专项用例自行覆盖）。
+    uc.tools.sandbox.systemd = uc.tools.sandbox.systemd or {}
+    uc.tools.sandbox.systemd.user = uc.tools.sandbox.systemd.user or {}
+    if uc.tools.sandbox.systemd.user.enabled == nil then
+      uc.tools.sandbox.systemd.user.enabled = false
+    end
     return orig_config_load(uc)
   end
   pcall(function()
@@ -233,6 +239,11 @@ function M.run_all(...)
       cur.tools.sandbox.run_as = { uid = 0, gid = 0 }
       cur.tools.sandbox.observe = cur.tools.sandbox.observe or { enabled = false }
       cur.tools.sandbox.postprocess = cur.tools.sandbox.postprocess or "sync"
+      cur.tools.sandbox.systemd = cur.tools.sandbox.systemd or {}
+      cur.tools.sandbox.systemd.user = cur.tools.sandbox.systemd.user or {}
+      if cur.tools.sandbox.systemd.user.enabled == nil then
+        cur.tools.sandbox.systemd.user.enabled = false
+      end
       orig_config_load(cur)
     end
   end)

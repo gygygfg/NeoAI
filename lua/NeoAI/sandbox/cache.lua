@@ -29,10 +29,10 @@ local function _canonical(value)
     for k in pairs(value) do keys[#keys + 1] = tostring(k) end
     table.sort(keys)
     local parts = {}
-    for _, k in ipairs(keys) do parts[#parts + 1] = json.encode(k) .. ":" .. _canonical(value[k]) end
+    for _, k in ipairs(keys) do parts[#parts + 1] = json.encode_fast(k) .. ":" .. _canonical(value[k]) end
     return "{" .. table.concat(parts, ",") .. "}"
   end
-  if type(value) == "string" then return json.encode(value) end
+  if type(value) == "string" then return json.encode_fast(value) end
   if value == nil then return "null" end
   return tostring(value)
 end

@@ -280,7 +280,7 @@ end
 
 --- 模型无关的工具结果裁剪（摘要前的第一道压缩）；有裁剪则作废过期 API 用量。
 --- 裁剪计算（码点统计/切片）经 pruner 卸载到工作线程池，避免 MB 级结果阻塞主线程；
---- 线程池不可用或 ui.render.threaded=false 时 pruner 自动回退同步，语义不变。
+--- 线程池不可用时 pruner 仍可同步处理块数组内容，语义不变。
 --- @param agent table
 --- @param cfg table
 --- @return Deferred resolve(boolean) 是否发生了裁剪

@@ -80,9 +80,9 @@ Moves pure Lua computation off the main thread using the libuv thread pool (`vim
 **Constraints** (the libuv thread has a fresh Lua state and shares no closures / require / vim.fn / vim.api):
 
 - The work function must be passed as **bytecode** (`string.dump`): it can only use arguments + the pure Lua standard library + `vim.uv`.
-- Arguments and return values must be **primitive types** (string / number / boolean / nil), never tables.
+- Arguments and return values must be **primitive types** (string / number / boolean / nil), never tables (use `run_codec` for structured data).
 - The return value should be a string (nil / other primitive types are automatically `tostring`ed).
-- The thread pool defaults to 4 threads; file system operations also run in the pool and share its queue.
+- The thread pool size = CPU count (`vim.uv.new_work`); file system operations also run in the pool and share its queue.
 
 ```lua
 local work = require("NeoAI.utils.work")
@@ -94,7 +94,21 @@ work.run(function(path)
 end, "/path/to/file"):then_(function(data) ... end, function(err) ... end)
 ```
 
-Without `vim.uv.new_work` (nvim < 0.10), it falls back to synchronous execution via `vim.schedule` (which still guarantees the call stack is not blocked).
+`work.run_codec(fn, input, ...)`: **structured input/output**. The main thread encodes `input` into a
+single binary string with `vim.mpack` (to work around tables not crossing threads), and the thread
+decodes it with `vim.mpack` (available inside workers); `fn(data, ...)` returns any msgpack-able value
+that the main thread decodes. Extra primitive arguments are packed to avoid `queue` argument loss.
+Compared with JSON it is faster and natively supports binary (no base64 sentinel).
+
+```lua
+work.run_codec(function(data)
+  local sum = 0
+  for _, v in ipairs(data.list) do sum = sum + v end
+  return { sum = sum }
+end, { list = { 1, 2, 3 } }):then_(function(res) ... end)
+```
+
+> Threading is mandatory, with no synchronous fallback: at startup `work.require()` validates `vim.uv.new_work` (errors on nvim < 0.10) and runs a worker round-trip self-check (`work.selfcheck`) to confirm `vim.mpack` is available inside workers; any failure is reported loudly.
 
 `work.batched(tasks, limit, start)`: **batched concurrency**. `start(task)` is called on the main
 thread and returns a `work.run` Deferred; at most `limit` are in flight per batch, and the next

@@ -41,6 +41,7 @@
 | `system_prompt` | 默认中文提示 | persona 段 |
 | `timeout_ms` | `60000` | 请求超时 |
 | `max_retries` | `3` | 请求重试次数 |
+| `trace` | `{capture=true, max_rounds=8}` | 轨迹/诊断用 wire 数据（原始请求体 + SSE 分片）的内存保留策略：只保留最近 `max_rounds` 轮完整数据，更早轮降级为轻量摘要（`capture=false` 完全不保留）。避免长工具循环内存膨胀 |
 | `attachments` | 见下 | 多模态图像配置 |
 | `model_policy` | 见下 | 按模型自动选择：能力表 + 厂商方言 + 显式缓存 |
 | `context_cache` | 见下 | 前缀缓存身份 + 自动上下文压缩 |
@@ -130,7 +131,6 @@ context_cache = {
 | `tree` | `{foldenable=false, ...auto_close_on_select=true}` | 会话树折叠/自动关闭 |
 | `input_box` | `{idle_height=1, min_height=5, max_ratio=0.8}` | 输入框高度（空闲/聚焦/增长上限） |
 | `chat` | `{mousescroll_max_blank=3, incremental=true}` | 鼠标滚轮滚到底时末行下方允许的最大空白行数（0=严格贴底）；`incremental` 开启增量刷新（只重渲染变化的消息块且只写差异行），设为 `false` 降级回整 buffer 全量重写 |
-| `render` | `{threaded=true}` | 把 CPU 密集计算（如工具结果裁剪的码点统计/切片）分配到 `utils.work` 线程池，避免 MB 级工具结果阻塞主线程；设为 `false` 或线程池不可用时自动回退主线程同步计算（行为等价，仅慢） |
 | `trajectory` | `{log_dir=".../NeoAI/logs"}` | 轨迹显示模式的日志保存目录 |
 | `statusline` | `{enabled=true, winbar=true, parts={mode,model,usage,cache,capacity,sandbox}, separator=" ", colors=...}` | lualine 状态栏；`sandbox` 段在沙箱待审数 > 0 时显示 `待审N`（`N` 为待审**文件**总数，审批单位为单个文件），默认链接醒目高亮组 `NeoAISandboxPending`（黄底加粗，可在 `colors.sandbox` 覆盖）；待审队列含 **L3（高危）** 时该段追加 `⚠危险` 并切换为红色危险高亮组 `NeoAISandboxDanger`（可在 `colors.sandbox_danger` 覆盖）；存在**越界访问留痕**时该段追加 `越界N`（`N` 为去重文件数，两者都有时并列显示，如 `待审2 越界3`） |
 
@@ -226,7 +226,7 @@ sandbox = {
   offline = false,                 -- 网络默认放行（仅记录，不拦截）；true 时硬拒绝网络并隔离进程网络
   require_seccomp = true,          -- 缺少 seccomp 能力时是否拒绝外部执行（默认开，fail-closed）
   seccomp = { enabled = true, filter_path = "" }, -- seccomp 基线（内置 denylist；默认开；仅 bwrap）
-  cap_add = {},                    -- 全局额外 capability（默认空）；档位基线另加回 CAP_DAC_OVERRIDE（见 privilege.tiers），包安装/系统管理再按需加回。仅调试时才设 { "ALL" }
+  cap_add = {},                    -- 全局额外 capability（默认空）；档位基线另加回 CAP_DAC_OVERRIDE + CAP_SETUID/CAP_SETGID（沙箱内降权，见 privilege.tiers），包安装/系统管理再按需加回。仅调试时才设 { "ALL" }
   -- 载荷运行身份：默认以 root 运行（uid=0），使 AI 能在沙箱内使用宿主工具链（/root 下的
   --   nvm/cargo/go 等 0700 目录非 root 不可遍历）与包管理（dpkg 硬检查 euid==0）。所有写入仍
   --   全部进入 overlay 暂存并冻结为候选，真实磁盘不受影响；隔离由命名空间 + 整机根 overlay +
@@ -334,6 +334,10 @@ sandbox = {
   -- / 启动失败时自动回退一次性进程路径。仅适用于 T0 的 run_command。
   resident = {
     enabled = true, -- 会话级常驻沙箱实例（run_command 后台进程跨调用存活）；不适用时自动回退
+    -- 物化单文件内嵌上限（字节）：超过则宿主侧复制进收件箱、服务器在命名空间内按文件复制
+    -- （只发小帧），避免大文件内容经常驻 stdin 传输（bash 逐字节 read 打满 CPU）。
+    -- 0 = 回退 tools.sandbox.max_file_bytes。
+    max_embed_bytes = 262144,
   },
   -- 内部长驻服务（sandbox.service）：不再注册 service_* 工具（AI 不可见），仅由 systemctl
   -- 门面复用在沙箱内启停单元进程（独立 overlay + 资源域，停止时捕获改动为候选）。
@@ -358,8 +362,9 @@ sandbox = {
     },
     -- 嵌套真实 systemd --user（需同时开启 resident）：常驻沙箱实例内启动真实 user manager，
     -- `systemctl --user` 命中真实语义；单元文件落工作区 overlay 暂存、cgroup 仅限委派子树，
-    -- 所有修改不落宿主机。默认关闭。
-    user = { enabled = false },
+    -- 所有修改不落宿主机。默认开启；前置条件（bwrap + dbus-daemon + systemd）缺失时自动跳过。
+    -- 注意：开启后首次启动常驻实例会等待 user manager 就绪（数秒），不需要用户级 systemd 时可关闭。
+    user = { enabled = true },
     -- 系统级 systemctl enable/disable：解析 [Install] WantedBy/RequiredBy，把软链变更暂存为
     -- 待审候选，审批后应用；不落宿主机。默认开启。
     stage_install = true,
@@ -385,27 +390,34 @@ sandbox = {
     --   pip   → PIP_INDEX_URL + PIP_TRUSTED_HOST（如 "https://pypi.tuna.tsinghua.edu.cn/simple"）
     --   npm   → npm_config_registry（如 "https://registry.npmmirror.com/"）
     --   maven → 生成 settings.xml（镜像全部仓库）经 MAVEN_OPTS -s 指向
-    mirrors = { pip = "", npm = "", maven = "" },
+    --   apk   → 按原版本路径重写 /etc/apk/repositories（Alpine/musl，如 "https://mirrors.tuna.tsinghua.edu.cn/alpine"）
+    --   go    → GOPROXY（如 "https://goproxy.cn,direct"）
+    --   rustup→ RUSTUP_DIST_SERVER / RUSTUP_UPDATE_ROOT（如 "https://mirrors.tuna.tsinghua.edu.cn/rustup"）
+    mirrors = { pip = "", npm = "", maven = "", apk = "", go = "", rustup = "" },
   },
-  -- 权限档位与自动提权：命令默认 T0 最小权限（cap-drop ALL + 基线 CAP_DAC_OVERRIDE、网络默认放行并拦截本机）。
+  -- 权限档位与自动提权：命令默认 T0 最小权限（cap-drop ALL + 基线 CAP_DAC_OVERRIDE + CAP_SETUID/CAP_SETGID、网络默认放行并拦截本机）。
   -- 权限/网络失败时**全档位**自动升级（T0→T1→T2，直到 max_tier）并在隔离内重跑，每步写证据/事件/审计。
   privilege = {
     enabled = true, auto_escalate = true, max_tier = 2, record = true,
     tiers = {                       -- 各档位的网络/额外 cap/挂载/解除遮蔽/审查严格度
-      [0] = { name = "minimal", review = "auto", network = true, cap_add = { "CAP_DAC_OVERRIDE" }, mounts = {}, unmask = {} }, -- 默认最小权限：cap-drop ALL + 基线 CAP_DAC_OVERRIDE（root 载荷访问他人属主 0700 目录，如 _apt 的 apt 缓存）。默认放行网络（仅记录）；本机访问经 host_proxy 拦截
-      [1] = { name = "elevated", review = "auto", network = true, cap_add = { "CAP_DAC_OVERRIDE" }, mounts = {}, unmask = {} }, -- docker.sock 仅 docker 命令按需解除遮蔽
+      [0] = { name = "minimal", review = "auto", network = true, cap_add = { "CAP_DAC_OVERRIDE", "CAP_SETUID", "CAP_SETGID" }, mounts = {}, unmask = {} }, -- 默认最小权限：cap-drop ALL + 基线 CAP_DAC_OVERRIDE（root 载荷访问他人属主 0700 目录）+ CAP_SETUID/SETGID（沙箱内降权到非 root，供 PostgreSQL 等拒绝 root 的服务/runuser/setpriv）。默认放行网络（仅记录）；本机访问经 host_proxy 拦截
+      [1] = { name = "elevated", review = "auto", network = true, cap_add = { "CAP_DAC_OVERRIDE", "CAP_SETUID", "CAP_SETGID" }, mounts = {}, unmask = {} }, -- docker.sock 仅 docker 命令按需解除遮蔽
       [2] = { name = "privileged", review = "approve", network = true, userns = true, cap_add = { "ALL" }, mounts = {}, unmask = {} }, -- 嵌套 userns 内完整能力（作用域受限）；seccomp 仍生效
     },
     -- 系统管理命令（useradd/chown/passwd 等）：命中即按需加回窄能力并解除账户库遮蔽，
     -- 使 `useradd`/`usermod`/`groupadd`/`chown`/`passwd` 在沙箱内可用（默认最小权限下会因
     -- 缺少 CHOWN/SETUID/SETGID/DAC_OVERRIDE 及账户库被遮蔽而失败）。写入仍进 overlay 暂存，
     -- 真实账户库/文件系统不受影响；普通命令仍最小权限、账户库仍遮蔽（不泄露口令哈希）。
+    -- 系统管理命令 + 降权包装器（sudo/doas/su/runuser/setpriv）：命中即按需加回窄能力并解除
+    -- 账户库/sudoers 遮蔽，使 `sudo -u <user>`/`runuser -u <user>`/`setpriv` 可在沙箱内降权。
     sysadmin = {
       cap_add = { "CAP_CHOWN", "CAP_DAC_OVERRIDE", "CAP_DAC_READ_SEARCH", "CAP_FOWNER", "CAP_SETUID", "CAP_SETGID", "CAP_SETFCAP", "CAP_FSETID", "CAP_SYS_CHROOT", "CAP_KILL" },
-      unmask = { "/etc/passwd", "/etc/group", "/etc/shadow", "/etc/shadow-", "/etc/gshadow", "/etc/gshadow-", "/etc/subuid", "/etc/subgid", "/etc/subuid-", "/etc/subgid-" },
+      unmask = { "/etc/passwd", "/etc/group", "/etc/shadow", "/etc/shadow-", "/etc/gshadow", "/etc/gshadow-", "/etc/subuid", "/etc/subgid", "/etc/subuid-", "/etc/subgid-", "/etc/sudoers", "/etc/sudoers.d" },
     },
     classify = {                    -- 命令分类规则（bins 精确可执行名；bin+subs 可执行名+子命令）
-      { tier = 2, name = "privileged", bins = { "sudo", "mount", "modprobe", "iptables", "systemctl", "unshare", "nsenter" } },
+      -- 注：sudo/doas 不在此列——它们是降权包装器，分类时被跳过、由被包裹命令决定档位
+      -- （`sudo mount` 仍为 T2）；其降权需求按 sysadmin 处理（见上）。
+      { tier = 2, name = "privileged", bins = { "mount", "modprobe", "iptables", "systemctl", "unshare", "nsenter" } },
       { tier = 1, name = "docker", bins = { "docker", "docker-compose", "nerdctl" } }, -- 有守护进程：受控 socket
       { tier = 1, name = "container", bins = { "podman", "podman-compose", "buildah", "skopeo" } }, -- 无守护进程：可与沙箱同 namespace
       { tier = 1, name = "network", bins = { "curl", "wget", "ssh", "rsync", "ping", "socat" } },
@@ -491,13 +503,16 @@ sandbox = {
   -- （/proc/self/cgroup 沿父链的 memory.max/cpu.max）并取 min，避免按宿主高估。
   -- 所有并发任务挂在共享父域下，cpu_global_max 为并发 CPU 总预算（默认 核数-1），
   -- cpu_cores_max 为单任务配额。fail_closed=false 时 cgroup 不可用则跳过。
+  -- delegate_cgroup：在沙箱内把「委派的会话 cgroup 子树」以可写方式挂到 /sys/fs/cgroup，
+  -- 使 AI/服务可创建子 cgroup 并写 memory.max/cpu.max（cgroup v2 写隔离）；仅限该子树，
+  -- 不污染宿主其它 cgroup；网关模式（ip netns exec）下自动跳过。
   -- disk_bytes：沙箱暂存磁盘上限（字节；0=不限）。统计暂存基目录（进程 overlay/私有 tmp）
   -- 与沙箱存储根（候选/待审/证据/服务 overlay）总占用；超限时拒绝写类/进程工具（用量异步
   -- 统计并缓存，不阻塞命令开始）。
-  limits = { wall_ms = 60000, dynamic = true, memory_ratio = 0.5, memory_max_bytes = 0,
-    cpu_cores_max = 4, cpu_global_max = 0, pids_max = 2048, memory_bytes = 0, pids = 0, cpu_max = 0,
+  limits = { wall_ms = 60000, dynamic = true, memory_ratio = 0.75, memory_max_bytes = 0,
+    cpu_cores_max = 8, cpu_global_max = 0, pids_max = 8192, memory_bytes = 0, pids = 0, cpu_max = 0,
     cpu_affinity = "auto", -- 沙箱 CPU 亲和性：auto=绑定到 nvim 当前 CPU 之外的核（避免挤占 nvim）；off/ false=不绑定；"2,3"/"2-3"=显式 cpuset（需 taskset）
-    cgroup_base = "/sys/fs/cgroup", fail_closed = false,
+    cgroup_base = "/sys/fs/cgroup", fail_closed = false, delegate_cgroup = true,
     disk_bytes = 64 * 1024 * 1024 * 1024 }, -- 64 GiB（0 = 不限）
   seccomp_filter_path = "",        -- 可选：编译后 seccomp BPF 过滤器（配合 require_seccomp）
 }

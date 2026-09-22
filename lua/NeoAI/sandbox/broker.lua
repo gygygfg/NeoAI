@@ -38,7 +38,7 @@ local state = {
 -- ========== 私有函数 ==========
 
 local function _hash(value)
-  local ok, hex = pcall(vim.fn.sha256, json.encode(value))
+  local ok, hex = pcall(vim.fn.sha256, json.encode_fast(value))
   return ok and ("sha256:" .. hex) or "sha256:?"
 end
 

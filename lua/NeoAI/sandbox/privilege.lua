@@ -23,11 +23,19 @@ local TIER_DEFAULTS = {
   -- 基线为 `--cap-drop ALL` + `CAP_DAC_OVERRIDE`：载荷以 root 运行，需该能力访问他人属主的
   -- 0700 目录（如 `_apt` 的 `/var/cache/apt/archives/partial`）；隔离由命名空间 + overlay 暂存 +
   -- 遮蔽 + seccomp 保证。包安装/系统管理所需的其余窄能力由 resolve() 按需加回。
-  [0] = { name = "minimal", review = "auto", network = true, cap_add = { "CAP_DAC_OVERRIDE" }, mounts = {}, unmask = {} },
+  -- CAP_SETUID/CAP_SETGID：载荷以 root 运行，需在沙箱内**降权**到非 root 用户
+  -- （runuser/setpriv/su、PostgreSQL 等拒绝 root 运行的服务、systemd User= 单元）。
+  -- 缺少时 setuid/setgid/setgroups 返回 EPERM。载荷已在 mount/pid/net 命名空间 + overlay
+  -- 暂存 + 遮蔽内，改 uid 只在沙箱内生效，不扩大宿主面。
+  [0] = {
+    name = "minimal", review = "auto", network = true,
+    cap_add = { "CAP_DAC_OVERRIDE", "CAP_SETUID", "CAP_SETGID" }, mounts = {}, unmask = {},
+  },
   -- T1 提权不默认解除 docker.sock 遮蔽：socket 仅在命令被分类为 docker（req.docker）时
   -- 由 resolve() 按需挂载并解除遮蔽，避免 `pip install` 这类 T1 命令连带放行 docker。
   [1] = {
-    name = "elevated", review = "auto", network = true, cap_add = { "CAP_DAC_OVERRIDE" }, mounts = {}, unmask = {},
+    name = "elevated", review = "auto", network = true,
+    cap_add = { "CAP_DAC_OVERRIDE", "CAP_SETUID", "CAP_SETGID" }, mounts = {}, unmask = {},
   },
   -- T2 特权：嵌套 userns 内授予完整能力（caps 被 userns 作用域限制，够不到宿主；
   -- 主机效果冻结为提案异步审批）。seccomp 基线仍然生效（mount/init_module 等被拦）。
@@ -64,10 +72,18 @@ local ESCALATION_PATTERNS = {
   },
 }
 
--- 可跳过的命令前缀（不含 sudo/doas：它们本身就是特权信号，保留分类）
+-- 可跳过的命令前缀。sudo/doas 也跳过：它们只是「以他人身份运行」的包装器，载荷本就以 root
+-- 运行，真正需要的权限由**被包裹的命令**决定（`sudo mount` 仍由 mount 规则判为 T2）。
+-- 使用 sudo/doas 的事实另经 PRIVDROP_BINS 检测，用于加回降权所需能力与解除 sudoers 遮蔽。
 local SKIP_PREFIX = {
   env = true, command = true, nohup = true, time = true, nice = true,
-  stdbuf = true, xargs = true,
+  stdbuf = true, xargs = true, sudo = true, doas = true,
+}
+
+-- 降权包装器：命中即需要 SETUID/SETGID/CHOWN 等能力与账户库/sudoers 访问
+-- （`sudo -u <user> …`、`runuser -u <user> …`、`setpriv --reuid …`、`su <user>`）。
+local PRIVDROP_BINS = {
+  sudo = true, doas = true, su = true, runuser = true, setpriv = true,
 }
 
 -- 识别包管理器时需要跳过的「包装器/外壳」token：`sudo apt`、`env sudo apt`、
@@ -514,8 +530,14 @@ function M.classify(tool, args, spec, opts)
   local tier, reasons = M.TIER.MINIMAL, {}
   local docker, container, network, package, sysadmin = false, false, false, false, false
   local apt = false
+  local privdrop = false
   local has_pkg, all_pkg = false, true
   for _, seg in ipairs(_segments(command)) do
+    -- 降权包装器检测（sudo/doas/su/runuser/setpriv）：需要 SETUID/SETGID/CHOWN 与
+    -- 账户库/sudoers 访问；按 sysadmin 处理（加回窄能力 + 解除账户库/sudoers 遮蔽）。
+    for w in seg:gmatch("%S+") do
+      if PRIVDROP_BINS[vim.fn.fnamemodify(_strip_token(w), ":t")] then privdrop = true end
+    end
     local t, name = _classify_segment(seg, rules)
     if t then
       if t > tier then tier = t end
@@ -543,10 +565,14 @@ function M.classify(tool, args, spec, opts)
       all_pkg = false
     end
   end
+  -- 降权包装器（sudo/doas/su/runuser/setpriv）至少 T1：需要在隔离内以他人身份运行并留痕；
+  -- 被包裹命令若本身更高档（如 `sudo mount` → T2）则取更高档。
+  if privdrop and tier < M.TIER.ELEVATED then tier = M.TIER.ELEVATED end
+  if privdrop then reasons[#reasons + 1] = "privdrop" end
   return {
     tier = tier, reasons = reasons, docker = docker, container = container,
     network = network, package = package, package_all = has_pkg and all_pkg,
-    sysadmin = sysadmin, apt = apt,
+    sysadmin = sysadmin or privdrop, privdrop = privdrop, apt = apt,
   }
 end
 

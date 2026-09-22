@@ -36,6 +36,11 @@ function M.setup(user_config)
   -- 内核引导：事件常量表、日志、生命周期
   kernel.bootstrap()
 
+  -- 强制多线程：CPU 密集计算/阻塞 I/O 一律卸载到 libuv 线程池，无同步回退。
+  -- 需要 Neovim 0.10+ 的 vim.uv.new_work；不可用时显式报错而非静默降级。
+  -- 同时跑一次 worker 往返自检，确认 worker 内 vim.mpack 可用（run_codec 的硬前提）。
+  require("NeoAI.utils.work").require()
+
   -- 登记并启动内置插件（服务提供方 + 副作用 + 每个内置工具）
   local catalog = require("NeoAI.plugins.catalog")
   local res = catalog.setup()

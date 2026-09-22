@@ -408,7 +408,7 @@ local function _merge_package_item(item, cand)
   local manifest = {}
   for _, f in ipairs(files) do manifest[#manifest + 1] = { path = f.path, action = f.action, after_hash = f.after_hash } end
   local json = require("NeoAI.utils.json")
-  local digest = "sha256:" .. vim.fn.sha256(json.encode(manifest))
+  local digest = "sha256:" .. vim.fn.sha256(json.encode_fast(manifest))
   local newcand = {
     candidate_digest = digest, files = files, created_at = os.time(),
     effect = base.effect or cand.effect, command_id = cand.command_id,
@@ -748,7 +748,7 @@ local function _requeue_remaining(item, remaining)
   end
   local json = require("NeoAI.utils.json")
   local newcand = {
-    candidate_digest = "sha256:" .. vim.fn.sha256(json.encode(manifest)),
+    candidate_digest = "sha256:" .. vim.fn.sha256(json.encode_fast(manifest)),
     files = remaining,
     created_at = os.time(),
     effect = item.effect,
@@ -1077,7 +1077,7 @@ local function _compose(members)
   local manifest = {}
   for _, f in ipairs(files) do manifest[#manifest + 1] = { path = f.path, action = f.action, after_hash = f.after_hash } end
   local json = require("NeoAI.utils.json")
-  local digest = "sha256:" .. vim.fn.sha256(json.encode(manifest))
+  local digest = "sha256:" .. vim.fn.sha256(json.encode_fast(manifest))
   return { candidate = { candidate_digest = digest, files = files, created_at = os.time() }, conflicts = conflicts }
 end
 
@@ -1113,7 +1113,7 @@ function M.prepare_publication_set(ids)
   local json = require("NeoAI.utils.json")
   local revisions = {}
   for _, m in ipairs(members) do revisions[#revisions + 1] = { id = m.change_set_id, revision = m.revision or 1, digest = m.candidate_digest } end
-  local intent_hash = "sha256:" .. vim.fn.sha256(json.encode({
+  local intent_hash = "sha256:" .. vim.fn.sha256(json.encode_fast({
     members = revisions,
     candidate_digest = composed.candidate.candidate_digest,
   }))
@@ -1201,7 +1201,7 @@ function M.derive_revision(parent_id, opts)
   for _, f in ipairs(files) do manifest[#manifest + 1] = { path = f.path, action = f.action, after_hash = f.after_hash } end
   local json = require("NeoAI.utils.json")
   local newcand = {
-    candidate_digest = _sha(json.encode(manifest)),
+    candidate_digest = _sha(json.encode_fast(manifest)),
     files = files,
     created_at = os.time(),
     effect = parent.effect,

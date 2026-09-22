@@ -99,4 +99,114 @@ tests.suite("sandbox_background", function(_, it)
       require("NeoAI.sandbox.resident").stop({ timeout_ms = 5000 })
     end)
   end)
+
+  it("resident：输出含控制字节/NUL 不破坏帧定界（base64 承载）", function(t)
+    local runtime = require("NeoAI.sandbox.runtime")
+    if runtime.backend() ~= "bwrap" then return end
+    local resident = require("NeoAI.sandbox.resident")
+    if not resident.available() then return end
+    with_config({
+      tools = { approval = { mode = "auto_allow" }, sandbox = resident_sandbox_config() },
+    }, function()
+      require("NeoAI.sandbox").reset()
+      local out, done = nil, false
+      -- 输出同时包含帧定界控制字节（\x1e/\x1f）、NUL 与伪造 END 标记。
+      require("NeoAI.tools").execute("run_command",
+        { command = "printf 'A\\036END 1 0\\037B\\000C'", description = "t" }, {})
+        :then_(function(v) out = tostring(v); done = true end, function() done = true end)
+      t.true_(vim.wait(20000, function() return done end, 50), "应返回")
+      t.not_nil(out, "应有输出")
+      t.true_(out:find("A\30END 1 0\31B\0C", 1, true) ~= nil,
+        "控制字节与 NUL 应原样保留（base64 帧），实际: " .. vim.inspect(out))
+      resident.stop({ timeout_ms = 5000 })
+    end)
+  end)
+
+  it("resident：服务器意外退出后自动重建实例并执行命令", function(t)
+    local runtime = require("NeoAI.sandbox.runtime")
+    if runtime.backend() ~= "bwrap" then return end
+    local resident = require("NeoAI.sandbox.resident")
+    if not resident.available() then return end
+    with_config({
+      tools = { approval = { mode = "auto_allow" }, sandbox = resident_sandbox_config() },
+    }, function()
+      require("NeoAI.sandbox").reset()
+      local tools = require("NeoAI.tools")
+      -- 先建实例
+      local d0 = false
+      tools.execute("run_command", { command = "echo WARM", description = "t" }, {})
+        :then_(function() d0 = true end, function() d0 = true end)
+      t.true_(vim.wait(20000, function() return d0 end, 50), "预热应返回")
+      local inst = resident.active()
+      t.not_nil(inst, "应存在常驻实例")
+      -- 直接杀掉服务器（模拟外层 OOM/信号），不调用 stop（保留 ensure_opts）。
+      vim.fn.jobstop(inst.job)
+      t.true_(vim.wait(5000, function() return not inst.alive end, 20), "服务器应退出")
+      t.eq(nil, resident.active(), "已退出的实例不应为 active")
+      -- 下一次 exec 应据 ensure_opts 自动重建并成功执行。
+      local out, done = nil, false
+      resident.exec("echo RECOVERED", {}):then_(
+        function(r) out = r; done = true end, function(e) out = { err = e }; done = true end)
+      t.true_(vim.wait(20000, function() return done end, 50), "重试应返回")
+      t.not_nil(out and out.code, "应有结果")
+      t.eq(0, out.code)
+      t.true_(tostring(out.stdout):find("RECOVERED", 1, true) ~= nil, "应执行成功")
+      resident.stop({ timeout_ms = 5000 })
+    end)
+  end)
+
+  it("resident：大文件物化走收件箱复制（不内嵌内容）且命令可见", function(t)
+    local runtime = require("NeoAI.sandbox.runtime")
+    if runtime.backend() ~= "bwrap" then return end
+    local resident = require("NeoAI.sandbox.resident")
+    if not resident.available() then return end
+    -- 极小上限：用 200KB 文件即触发「大文件」路径，测试保持快速。
+    with_config({
+      tools = {
+        approval = { mode = "auto_allow" },
+        sandbox = resident_sandbox_config({ max_file_bytes = 65536 }),
+      },
+    }, function()
+      require("NeoAI.sandbox").reset()
+      local tools = require("NeoAI.tools")
+      local big = (vim.fn.stdpath("cache") .. "/NeoAI/tests_resident_big.bin"):gsub("/+$", "")
+      pcall(os.remove, big)
+      local d1 = false
+      tools.execute("run_command",
+        { command = "dd if=/dev/zero of=" .. big .. " bs=1024 count=200 2>/dev/null; echo made", description = "t" }, {})
+        :then_(function() d1 = true end, function() d1 = true end)
+      t.true_(vim.wait(20000, function() return d1 end, 50), "生成大文件应返回")
+      t.not_nil(resident.active(), "应存在常驻实例")
+      -- 第二条命令：常驻物化必须把该大文件送进沙箱视图（走 c 复制），命令应读到完整字节数。
+      local out, d2 = nil, false
+      tools.execute("run_command",
+        { command = "wc -c < " .. big, description = "t" }, {})
+        :then_(function(v) out = v; d2 = true end, function() d2 = true end)
+      t.true_(vim.wait(20000, function() return d2 end, 50), "读取大文件应返回")
+      t.matches("204800", tostring(out), "大文件应经收件箱复制后在沙箱内可见")
+      resident.stop({ timeout_ms = 5000 })
+      pcall(os.remove, big)
+    end)
+  end)
+
+  it("run_command：非常驻（resident 关闭）时后台意图给出 UI 提示", function(t)
+    local runtime = require("NeoAI.sandbox.runtime")
+    if runtime.backend() ~= "bwrap" then return end
+    with_config({
+      tools = {
+        approval = { mode = "auto_allow" },
+        sandbox = resident_sandbox_config({ resident = { enabled = false } }),
+      },
+    }, function()
+      require("NeoAI.sandbox").reset()
+      local ctx = {}
+      local done = false
+      require("NeoAI.tools").execute("run_command",
+        { command = "sleep 1 &", description = "t" }, ctx)
+        :then_(function() done = true end, function() done = true end)
+      t.true_(vim.wait(20000, function() return done end, 50), "应返回")
+      t.not_nil(ctx.ui_notice, "应给出后台进程不存活的 UI 提示")
+      t.matches("后台", ctx.ui_notice)
+    end)
+  end)
 end)

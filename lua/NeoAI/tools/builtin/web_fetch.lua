@@ -587,7 +587,7 @@ local function _render(url, params, cfg, ctx)
   fs.ensure_dir(tmp_dir)
   local opts_file = fs.join(tmp_dir, string.format("opts_%d_%d.json", vim.fn.getpid(), math.random(1e8)))
 
-  local wok, werr = fs.write_file(opts_file, json.encode(opts))
+  local wok, werr = fs.write_file(opts_file, json.encode_fast(opts))
   if not wok then
     return async.reject({ kind = "web_fetch", message = "写入选项文件失败: " .. tostring(werr) })
   end
@@ -812,7 +812,7 @@ local function _cache_write(key, entry, cfg)
   local dir = _cache_dir()
   fs.ensure_dir(dir)
 
-  local encoded = json.encode(entry)
+  local encoded = json.encode_fast(entry)
   local max_bytes = tonumber(cache_cfg.max_bytes) or (500 * 1024 * 1024)
   -- 单条守卫：单条即超总容量时不写
   if #encoded >= max_bytes then

@@ -58,7 +58,7 @@ end
 
 --- 估算稳定前缀 token（字符/4 粗估，用于 Gemini 最小可缓存判断）
 local function _estimate_prefix_tokens(spec)
-  local raw = json.encode({ system = spec.system or "", tools = spec.tools or {} })
+  local raw = json.encode_fast({ system = spec.system or "", tools = spec.tools or {} })
   return math.ceil(#raw / 4)
 end
 

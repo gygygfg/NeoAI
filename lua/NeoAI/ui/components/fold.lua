@@ -179,6 +179,21 @@ function M.clear_timing()
   timing = {}
 end
 
+--- 回收已完成工具的计时记录（批次结束 / Agent 空闲时调用）。
+--- 完成后耗时已持久化到对应工具结果消息（result_msg.duration_ms），fold 计时不再被读取，
+--- 保留会让长会话的 timing 表随工具调用数无界增长。
+--- @return number 回收条数
+function M.prune_finished()
+  local removed = 0
+  for id, rec in pairs(timing) do
+    if rec.duration_ms then
+      timing[id] = nil
+      removed = removed + 1
+    end
+  end
+  return removed
+end
+
 --- 格式化毫秒为可读文本：<1s 用 ms，否则用 s
 --- @param ms number
 --- @return string
@@ -268,11 +283,17 @@ end
 --- @param count number 折叠行数
 --- @return string
 function M.generic_label(first, count)
-  local preview = (first or ""):gsub("^%s+", ""):gsub("%s+$", ""):gsub("%s+", " ")
+  -- 剥离控制字节并修复非法 UTF-8：首行可能来自含二进制/控制字节的工具输出，
+  -- 直接进 foldtext 会渲染成 ^P / <f9> 等乱码。
+  local preview = (first or ""):gsub("[%z\1-\8\11\12\14-\31\127]", "")
+  preview = preview:gsub("^%s+", ""):gsub("%s+$", ""):gsub("%s+", " ")
+  preview = require("NeoAI.utils.stringx").sanitize_utf8(preview) or preview
   if preview == "" then
     return string.format("  📄 折叠 %d 行", count)
   end
-  if #preview > 40 then preview = preview:sub(1, 40) .. "…" end
+  if #preview > 40 then
+    preview = require("NeoAI.utils.stringx").safe_truncate(preview, 40, "…") or preview
+  end
   return string.format("  📄 %s  (%d 行)", preview, count)
 end
 

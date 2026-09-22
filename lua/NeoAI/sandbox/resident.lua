@@ -67,12 +67,17 @@ local function _setsid_bin()
   return (p ~= "" and p) or nil
 end
 
---- 常驻实例是否可用（配置 + 后端）。
+--- 常驻实例是否可用（配置 + 后端 + 命令服务器所需工具）。
 --- @return boolean
 --- @return string|nil reason
 function M.available()
   if _cfg().enabled == false then return false, "RESIDENT_DISABLED" end
   if runtime.backend() ~= "bwrap" then return false, "RESIDENT_REQUIRES_BWRAP" end
+  -- 命令服务器依赖这些工具做请求/输出帧编解码与并发输出串行化；缺失会让命令无输出地
+  -- 挂到超时（间歇性且难定位），故预先探测：缺失即回退一次性执行（不静默产生超时）。
+  for _, b in ipairs({ "base64", "flock" }) do
+    if vim.fn.executable(b) ~= 1 then return false, "RESIDENT_MISSING_BIN:" .. b end
+  end
   return true
 end
 
@@ -89,6 +94,9 @@ local function _sig(entry)
 end
 
 --- 权限档位指纹：档位/能力/挂载变化需重建常驻实例（命名空间能力不可原地变更）。
+--- 重建复用同一 overlay upper（`<proc_dir>/resident`），故属主/文件等跨命令状态不丢失；
+--- 关键是让 sysadmin（chown 等）命令也走常驻实例（见 wrapper._resident_eligible），
+--- 而非一次性路径（一次性路径 overlay 独立、命令后即丢弃，属主改动不持久）。
 --- @param priv table|nil
 --- @return string
 local function _priv_key(priv)
@@ -111,9 +119,17 @@ local function _priv_key(priv)
   return table.concat(parts, ";")
 end
 
---- 命令服务器脚本：从 stdin 逐行读取请求（base64 字段，避免二进制/换行破坏帧）。
----   X\t<id>\t<base64(cmd)>  执行命令，输出以 BEGIN/PID/END 标记帧定界
----   M\t<id>\t<base64(payload)>  物化（payload 为 op\treal_b64\tcontent_b64 行）
+--- 命令服务器脚本：从 stdin 读取请求。帧头为一行（以换行结尾），载荷为定长二进制块
+--- （由帧头中的字节长度界定），用 `head -c` 分块消费——bash `read` 逐字节读大载荷会打满 CPU。
+---   X\t<id>\t<len>\n<cmd>              执行命令，输出以 BEGIN/PID/END 标记帧定界
+---   M\t<id>\t<len>\n<payload>          物化（payload 为 op\treal_b64\tcontent_b64 行，原始文本）
+---   K\t<id>\t\n                          终止当前命令进程组
+--- 载荷为**原始字节**（长度界定，无需 base64）：省去客户端一次整帧 base64 编码（主线程）
+--- 与服务器一次解码，减小主线程压力与帧体积。payload 内容本身仍以 base64 承载字段
+--- （content_b64），以便用制表符/换行解析。
+--- 命令输出块的内容以 base64 承载（客户端解码）：nvim 的 job 输出层会把 NUL 字节
+--- 改写成换行，且命令输出可能包含与帧定界相同的控制字节（\x1e/\x1f），直接 `cat` 会
+--- 破坏 BEGIN/END 帧定界导致输出丢失/串扰；base64 为纯 ASCII，帧定界安全。
 --- @param boot string|nil 服务器进入读取循环前的引导片段（如启动 systemd --user）
 --- @return string
 local function _server_script(boot)
@@ -131,8 +147,11 @@ local function _server_script(boot)
     "    X*)",
     "      __rest=${__line#X$'\\t'}",
     "      __id=${__rest%%$'\\t'*}",
-    "      __cb=${__rest#*$'\\t'}",
-    "      __cmd=$(printf '%s' \"$__cb\" | base64 -d)",
+    "      __len=${__rest#*$'\\t'}",
+    -- 定长载荷：帧头带字节长度，用 `head -c`（分块读）消费，避免 bash `read` 逐字节读取
+    -- 大载荷（物化帧可达数十 MB，逐字节读会打满 CPU 数分钟）。
+    "      head -c \"$__len\" > \"$__p/in\" 2>/dev/null",
+    "      __cmd=$(cat \"$__p/in\")",
     "      __of=\"$__p/out.$__id\"",
     -- 并发执行：每条命令后台运行（launch 内 setsid，进程组=会话，便于按组终止），
     -- 输出写独立文件；完成后以 flock 加锁**原子地**输出 BEGIN/内容/END 块，
@@ -144,7 +163,7 @@ local function _server_script(boot)
       .. "sh -c 'printf \"\\036PID %s %s\\037\" \"$__id\" \"$__c\"'; "
       .. "wait \"$__c\"; __rc=$?; "
       .. "__id=\"$__id\" __rc=\"$__rc\" __of=\"$__of\" flock \"$__p/lock\" "
-      .. "sh -c 'printf \"\\036BEGIN %s\\037\" \"$__id\"; cat \"$__of\"; "
+      .. "sh -c 'printf \"\\036BEGIN %s\\037\" \"$__id\"; base64 \"$__of\"; "
       .. "printf \"\\036END %s %s\\037\" \"$__id\" \"$__rc\"'; rm -f \"$__of\" \"$__p/pid.$__id\" ) &",
     "      ;;",
     -- 终止控制帧：宿主侧无法按 pid 杀沙箱命名空间内的进程，改由服务器在命名空间内
@@ -158,14 +177,19 @@ local function _server_script(boot)
     "    M*)",
     "      __rest=${__line#M$'\\t'}",
     "      __id=${__rest%%$'\\t'*}",
-    "      __cb=${__rest#*$'\\t'}",
-    "      printf '%s' \"$__cb\" | base64 -d > \"$__p/m\" 2>/dev/null",
+    "      __len=${__rest#*$'\\t'}",
+    "      head -c \"$__len\" > \"$__p/m\" 2>/dev/null",
     "      while IFS=$'\\t' read -r __op __a __b; do",
     "        [ -z \"$__op\" ] && continue",
     "        __pp=$(printf '%s' \"$__a\" | base64 -d)",
     "        case \"$__op\" in",
     "          d) rm -rf -- \"$__pp\" ;;",
     "          D) mkdir -p -- \"$__pp\" ;;",
+    -- 大文件物化：内容不内嵌于帧，改为从收件箱（会话目录 bind 进命名空间）按文件复制，
+    -- 临时文件 + rename 原子替换，避免 bash 逐字节 read 读取数百 MB 内容撑爆 CPU。
+    "          c) mkdir -p -- \"$(dirname -- \"$__pp\")\"; "
+      .. "__src=$(printf '%s' \"$__b\" | base64 -d); "
+      .. "cp -f -- \"$__src\" \"$__pp.neoai.tmp\" && mv -f -- \"$__pp.neoai.tmp\" \"$__pp\" ;;",
     "          w) mkdir -p -- \"$(dirname -- \"$__pp\")\"; printf '%s' \"$__b\" | base64 -d > \"$__pp\" ;;",
     "        esac",
     "      done < \"$__p/m\"",
@@ -233,14 +257,29 @@ local function _drain(inst)
   inst.buf = buf
 end
 
---- 发起一个请求（串行）：设置 pending，发送一行，处理超时/取消。
+--- 解码命令输出块（服务器以 base64 承载，避免控制字节/NUL 破坏帧定界）。
+--- 超时/取消时可能只有部分 base64，按 4 的倍数截断后尽力解码，失败则回退原文。
+--- @param chunks table
+--- @return string
+local function _decode_chunks(chunks)
+  local b64 = table.concat(chunks or {})
+  if b64 == "" then return "" end
+  b64 = b64:gsub("%s", "")
+  local n = #b64 - (#b64 % 4)
+  if n <= 0 then return "" end
+  local ok, dec = pcall(vim.base64.decode, b64:sub(1, n))
+  if ok and type(dec) == "string" then return dec end
+  return b64
+end
+
+--- 发起一个请求（串行）：设置 pending，发送帧头 + 原始载荷，处理超时/取消。
 --- resolve 结果表：{ code, stdout, stderr, is_mat?, cpid?, timed_out?, aborted?, message? }
 --- @param inst table
 --- @param kind string "X" | "M"
---- @param b64 string base64 编码的载荷
+--- @param payload string 原始载荷（命令字符串 / 物化 payload），非 base64
 --- @param opts table { timeout_ms?, signal? }
 --- @return Deferred
-local function _request(inst, kind, b64, opts)
+local function _request(inst, kind, payload, opts)
   local d = async.Deferred.new()
   inst.seq = inst.seq + 1
   local id = tostring(inst.seq)
@@ -257,7 +296,7 @@ local function _request(inst, kind, b64, opts)
       settle({ code = 0, stdout = table.concat(pending.chunks or {}), stderr = "", is_mat = true })
     else
       settle({
-        code = rc, stdout = table.concat(pending.chunks or {}), stderr = "",
+        code = rc, stdout = _decode_chunks(pending.chunks), stderr = "",
         cpid = pending.cpid, timed_out = pending.timed_out, aborted = pending.aborted,
         message = pending.abort_message,
       })
@@ -286,7 +325,7 @@ local function _request(inst, kind, b64, opts)
       -- 给短暂宽限等待该块，避免丢失部分输出。
       vim.defer_fn(function()
         if done then return end
-        settle({ code = -1, stdout = table.concat(pending.chunks or {}), stderr = "", aborted = true, message = reason })
+        settle({ code = -1, stdout = _decode_chunks(pending.chunks), stderr = "", aborted = true, message = reason })
       end, 1500)
     end)
   end
@@ -297,12 +336,14 @@ local function _request(inst, kind, b64, opts)
       kill_group()
       vim.defer_fn(function()
         if done then return end
-        settle({ code = -1, stdout = table.concat(pending.chunks or {}), stderr = "", timed_out = true })
+        settle({ code = -1, stdout = _decode_chunks(pending.chunks), stderr = "", timed_out = true })
       end, 1500)
     end, timeout_ms)
   end
 
-  local ok = pcall(vim.fn.chansend, inst.job, kind .. "\t" .. id .. "\t" .. b64 .. "\n")
+  -- 帧头带载荷字节长度，随后紧跟**原始载荷**（无尾随换行）：服务器用 `head -c` 分块读取。
+  -- 原始载荷（不 base64）省去客户端一次整帧编码（主线程）与服务器一次解码。
+  local ok = pcall(vim.fn.chansend, inst.job, kind .. "\t" .. id .. "\t" .. tostring(#payload) .. "\n" .. payload)
   if not ok then
     settle({ code = -1, stdout = "", stderr = "", message = "常驻沙箱请求发送失败" })
   end
@@ -335,18 +376,28 @@ function M.ensure(opts)
     return nil, "SANDBOX_MATERIALIZE_TYPE_CONFLICT: " .. tostring(conflicts[1] and conflicts[1].real)
   end
 
-  -- 嵌套 systemd --user（可选）：委派一个可写 cgroup 子树 bind 到 /sys/fs/cgroup，
-  -- 使沙箱内真实 user manager 能在本子树内管理服务，且不污染宿主其它 cgroup。
+  -- 委派一个可写 cgroup 子树 bind 到 /sys/fs/cgroup：
+  --   * 嵌套 systemd --user 需要它来在沙箱内管理服务；
+  --   * 普通命令也需要它，使 AI 能在沙箱内创建子 cgroup 并写 memory.max/cpu.max
+  --     （cgroup v2 写隔离；否则 /sys/fs/cgroup 为只读）。
+  -- 仅限委派子树，不污染宿主其它 cgroup；不可用时静默跳过（不阻断命令）。
   local sduser_mod = nil
   local deleg = nil
   local priv = opts.privileges
   do
     local ok, mod = pcall(require, "NeoAI.sandbox.systemd_user")
-    if ok and mod and mod.available() then
-      local h, derr = cgroup.prepare_delegated("sd_" .. tostring(session_id), cgroup.resolve_limits())
+    local sd_ok = ok and mod and mod.available()
+    -- 网关模式（ip netns exec）下委派 cgroup 的 bind 源不可解析，跳过（见 wrapper 同处说明）。
+    local gateway_on = false
+    do
+      local okg, ng = pcall(require, "NeoAI.sandbox.net_gateway")
+      gateway_on = okg and ng and ng.enabled()
+    end
+    if (sd_ok or cgroup.delegation_enabled()) and not gateway_on then
+      local h, derr = cgroup.prepare_delegated("sess_" .. tostring(session_id), cgroup.resolve_limits())
       if h then
         deleg = h
-        sduser_mod = mod
+        if sd_ok then sduser_mod = mod end
         local p2 = {}
         for k, v in pairs(priv or {}) do p2[k] = v end
         local mounts = {}
@@ -355,7 +406,7 @@ function M.ensure(opts)
         p2.mounts = mounts
         priv = p2
       else
-        logger.warn("[sandbox:systemd_user] 委派 cgroup 不可用，跳过：%s", tostring(derr))
+        logger.warn("[sandbox:resident] 委派 cgroup 不可用，跳过：%s", tostring(derr))
       end
     end
   end
@@ -392,10 +443,24 @@ function M.ensure(opts)
   argv[#argv + 1] = "-c"
   argv[#argv + 1] = _server_script(sduser_mod and sduser_mod.boot_snippet() or nil)
 
+  -- 大文件物化收件箱：会话目录已 bind 进命名空间（沙箱内固定路径），宿主把大文件复制进
+  -- 其 `.mat` 子目录后，只需向服务器发小帧令其在命名空间内复制，无需经 stdin 传输内容。
+  local session_mount = nil
+  if opts.session_dir then
+    local okc, conceal = pcall(require, "NeoAI.sandbox.conceal")
+    if okc and conceal and conceal.session_mount then session_mount = conceal.session_mount() end
+  end
   inst = {
     session_id = session_id, specs = specs, cwd = opts.cwd, env = env,
     cg = cg_handle, deleg = deleg, alive = true, materialized = {}, seq = 0,
     buf = "", pendings = {}, block = nil, noise = nil, priv_key = want_key,
+    session_dir = opts.session_dir, session_mount = session_mount,
+    -- 保留启动参数：服务器意外退出（外层 OOM/被杀）时可据此自动重建并重试在途命令。
+    ensure_opts = {
+      specs = opts.specs, cwd = opts.cwd, privileges = opts.privileges,
+      session_dir = opts.session_dir, session_tmp_dir = opts.session_tmp_dir,
+      fallback_cwd = opts.fallback_cwd,
+    },
   }
   local job = vim.fn.jobstart(argv, {
     cwd = opts.cwd,
@@ -437,7 +502,7 @@ function M.ensure(opts)
   -- systemd --user 引导在服务器进入读取循环前执行，可能耗时数秒（含就绪等待），故放宽。
   local health_ms = sduser_mod and 25000 or 3000
   local healthy = false
-  _request(inst, "X", vim.base64.encode("true"), { timeout_ms = health_ms }):then_(
+  _request(inst, "X", "true", { timeout_ms = health_ms }):then_(
     function(res) healthy = res and res.code == 0 end, function() end)
   vim.wait(health_ms + 3000, function() return healthy or not inst.alive end, 20)
   if not healthy then
@@ -455,34 +520,129 @@ function M.active()
   return nil
 end
 
+--- 单文件内嵌上限（字节）：超过则改走收件箱按文件复制，避免超大帧经常驻 stdin
+--- （bash `read` 逐字节读，数百 MB 内容会打满 CPU）。优先用常驻专属上限
+--- `tools.sandbox.resident.max_embed_bytes`（默认 256KB，远低于候选冻结的 8MB），
+--- 使更多大文件走复制、显著缩小每次物化帧；未配置时回退 `tools.sandbox.max_file_bytes`。
+--- @return number
+local function _max_embed_bytes()
+  local n = tonumber(_cfg().max_embed_bytes)
+  if n == nil then n = tonumber(config_store.get("tools.sandbox.max_file_bytes")) end
+  if n == nil then return 8 * 1024 * 1024 end
+  return n
+end
+
+--- 文件签名（mtime.sec:mtime.nsec:size:mode），与候选 `fresh_ssig` 格式一致。
+--- @param path string
+--- @return string|nil
+local function _file_sig4(path)
+  local st = vim.uv.fs_stat(path)
+  if not (st and st.type == "file" and st.mtime) then return nil end
+  return string.format("%s:%s:%s:%s",
+    tostring(st.mtime.sec), tostring(st.mtime.nsec), tostring(st.size), tostring(st.mode))
+end
+
+--- 物化分块大小：每批最多条目数 / 载荷字节，批间 `vim.defer_fn` 让出主循环，
+--- 避免一次性构建上百 MB 载荷长时间阻塞 nvim 主线程（UI 卡顿）。
+local MAT_CHUNK_ENTRIES = 128
+local MAT_CHUNK_BYTES = 1024 * 1024
+
 --- 把 AI 尚未物化的暂存编辑在命名空间内写回沙箱视图（写走 overlay 挂载）。
+--- 大文件（`large` 或超过内嵌上限）不内嵌内容：宿主侧复制进会话目录的收件箱
+--- （已 bind 进命名空间），只发小帧令服务器在命名空间内 `cp`。分块构建/发送，批间让出主循环。
 --- @return Deferred
 function M.materialize()
   local inst = M.active()
   if not inst then return async.resolve() end
-  local lines, changed = {}, false
+  local max_embed = _max_embed_bytes()
+  local inbox_host = inst.session_dir and (inst.session_dir .. "/.mat") or nil
+  local inbox_mount = inst.session_mount and (inst.session_mount .. "/.mat") or nil
+  local token = tostring(vim.uv.hrtime())
+
+  -- 主线程只做签名比较收集待物化条目；内容读取/base64 分块进行，批间让出。
+  local pending = {}
   for _, o in ipairs(candidate.workspace_overrides()) do
     local sig = _sig(o)
     if inst.materialized[o.real] ~= sig then
-      changed = true
       inst.materialized[o.real] = sig
-      if o.deleted then
-        lines[#lines + 1] = "d\t" .. vim.base64.encode(o.real)
-      else
-        local content = fs.read_file(o.staged)
-        if content == nil then
-          lines[#lines + 1] = "D\t" .. vim.base64.encode(o.real)
-        else
-          lines[#lines + 1] = "w\t" .. vim.base64.encode(o.real) .. "\t" .. vim.base64.encode(content)
-        end
-      end
+      pending[#pending + 1] = o
     end
   end
-  if not changed then return async.resolve() end
-  local payload = table.concat(lines, "\n") .. "\n"
+  if #pending == 0 then return async.resolve() end
+
   local out = async.Deferred.new()
-  _request(inst, "M", vim.base64.encode(payload), { timeout_ms = 120000 }):then_(
-    function(res) out:resolve(res and res.is_mat == true) end, function(e) out:reject(e) end)
+
+  --- 构建单条物化记录（追加到 lines；大文件复制进收件箱登记 created）。
+  --- @return string|nil line 追加的行（nil 表示跳过）
+  local function build_line(o, created)
+    if o.deleted then
+      return "d\t" .. vim.base64.encode(o.real)
+    end
+    if o.fresh_resident and o.fresh_ssig and _file_sig4(o.staged) == o.fresh_ssig then
+      -- 命令在常驻 overlay 内执行（产物已在该 overlay），且暂存副本自命令后未再被编辑
+      -- → 无需回写。避免每次命令后把上千个包产物重发一遍（实测可达近百 MB）。
+      return nil
+    end
+    local st = vim.uv.fs_stat(o.staged)
+    local is_file = st ~= nil and st.type == "file"
+    local big = is_file
+      and (o.large == true or (max_embed > 0 and (st.size or 0) > max_embed))
+    if big then
+      if not (inbox_host and inbox_mount) then
+        logger.warn("[sandbox:resident] 无收件箱，跳过超大文件物化：%s", tostring(o.real))
+        return nil
+      end
+      local name = token .. "_" .. tostring(#created) .. "_" .. vim.fn.sha256(o.real):sub(1, 16)
+      local host_src = inbox_host .. "/" .. name
+      fs.ensure_dir(inbox_host)
+      if fs.copy_file(o.staged, host_src) then
+        created[#created + 1] = host_src
+        return "c\t" .. vim.base64.encode(o.real)
+          .. "\t" .. vim.base64.encode(inbox_mount .. "/" .. name)
+      end
+      -- fail-closed：不内嵌超大内容（宁可该命令暂看不到此文件，也不撑爆 CPU）。
+      logger.warn("[sandbox:resident] 大文件收件箱复制失败，跳过物化：%s", tostring(o.real))
+      return nil
+    elseif is_file then
+      local content = fs.read_file(o.staged)
+      if content == nil then
+        return "D\t" .. vim.base64.encode(o.real)
+      end
+      return "w\t" .. vim.base64.encode(o.real) .. "\t" .. vim.base64.encode(content)
+    end
+    -- 目录（或非常规文件）：建目录。与原行为一致。
+    return "D\t" .. vim.base64.encode(o.real)
+  end
+
+  local idx = 1
+  local function step()
+    if idx > #pending then out:resolve(true); return end
+    local lines, created = {}, {}
+    local bytes, n = 0, 0
+    while idx <= #pending and n < MAT_CHUNK_ENTRIES and bytes < MAT_CHUNK_BYTES do
+      local line = build_line(pending[idx], created)
+      idx = idx + 1
+      n = n + 1
+      if line then
+        lines[#lines + 1] = line
+        bytes = bytes + #line
+      end
+    end
+    if #lines == 0 then
+      -- 本批无实际写入（全部跳过/失败）：让出后继续下一批。
+      vim.defer_fn(step, 0)
+      return
+    end
+    local payload = table.concat(lines, "\n") .. "\n"
+    _request(inst, "M", payload, { timeout_ms = 120000 }):then_(function()
+      for _, p in ipairs(created) do pcall(vim.uv.fs_unlink, p) end
+      vim.defer_fn(step, 0) -- 批间让出主循环，避免长时间阻塞 UI
+    end, function(e)
+      for _, p in ipairs(created) do pcall(vim.uv.fs_unlink, p) end
+      out:reject(e)
+    end)
+  end
+  step()
   return out
 end
 
@@ -491,20 +651,53 @@ end
 --- @param opts table { cwd?, timeout_ms?, signal? }
 --- @return Deferred
 function M.exec(command, opts)
+  opts = opts or {}
   local inst = M.active()
+  if not inst then
+    -- 服务器已在上一轮意外退出（外层 OOM / 被信号杀死）：用保留的启动参数重建，避免把
+    -- 服务器崩溃误报为「实例不可用」而交回一次性执行（后台进程/会话状态随之丢失）。
+    local last = state.instance
+    if last and last.ensure_opts then
+      local restarted = M.ensure(last.ensure_opts)
+      if restarted then inst = restarted end
+    end
+  end
   if not inst then
     return async.reject({ kind = "sandbox", message = "常驻沙箱实例不可用" })
   end
-  opts = opts or {}
   local out = async.Deferred.new()
-  -- 会话级资源域跨命令复用：记录命令开始时的 OOM 计数基线，结束后差分归因。
-  local cg_baseline = nil
-  if inst.cg and inst.cg.path and cgroup.oom_baseline then
-    pcall(function() cg_baseline = cgroup.oom_baseline(inst.cg.path) end)
+
+  local function _run_on(cur)
+    -- 会话级资源域跨命令复用：记录命令开始时的 OOM 计数基线，结束后差分归因。
+    local cg_baseline = nil
+    if cur.cg and cur.cg.path and cgroup.oom_baseline then
+      pcall(function() cg_baseline = cgroup.oom_baseline(cur.cg.path) end)
+    end
+    return M.materialize():then_(function()
+      return _request(cur, "X", command, opts)
+    end):then_(function(res)
+      return { res = res, cur = cur, cg_baseline = cg_baseline }
+    end)
   end
-  M.materialize():then_(function()
-    return _request(inst, "X", vim.base64.encode(command), opts)
-  end):then_(function(res)
+
+  local retried = false
+  local function attempt(cur)
+    return _run_on(cur):then_(function(ctx)
+      local res, c = ctx.res, ctx.cur
+      -- 服务器意外退出（非超时/取消，且实例已不存活）：重建并重试一次，避免把瞬时服务器
+      -- 崩溃误报为命令失败（退出码 -1、无输出），与「重试即成功」的观测一致。
+      if (not retried) and (not c.alive) and res.code == -1
+        and not res.timed_out and not res.aborted and c.ensure_opts then
+        retried = true
+        local restarted = M.ensure(c.ensure_opts)
+        if restarted then return attempt(restarted) end
+      end
+      return ctx
+    end)
+  end
+
+  attempt(inst):then_(function(ctx)
+    local res, c = ctx.res, ctx.cur
     local cfg_rc = config_store.get("tools.run_command") or {}
     local max_out = tonumber(cfg_rc.max_output_bytes) or 0
     local stdout = res.stdout or ""
@@ -514,12 +707,12 @@ function M.exec(command, opts)
       truncated = true
     end
     local oom, oom_level = false, nil
-    if inst.cg and inst.cg.path and (res.code == 137 or res.code == -1) then
+    if c.cg and c.cg.path and (res.code == 137 or res.code == -1) then
       if cgroup.oom_attribution then
-        local attr = cgroup.oom_attribution(inst.cg.path, { baseline = cg_baseline })
+        local attr = cgroup.oom_attribution(c.cg.path, { baseline = ctx.cg_baseline })
         oom, oom_level = attr.oom, attr.level
       else
-        oom = cgroup.snapshot_oom(cgroup.events_snapshot(inst.cg.path))
+        oom = cgroup.snapshot_oom(cgroup.events_snapshot(c.cg.path))
       end
     end
     out:resolve({

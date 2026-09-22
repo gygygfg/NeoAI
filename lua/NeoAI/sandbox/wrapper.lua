@@ -1281,7 +1281,12 @@ local function _resident_eligible(attempt, spec, args, req)
   if not spec or spec.effect ~= "process" then return false end
   if attempt.tool_name ~= "run_command" then return false end
   if spec.long_lived then return false end
-  if (req and req.tier or 0) ~= 0 then return false end
+  -- T0 与「系统管理/降权」（sysadmin，如 chown/useradd/runuser）走常驻实例：常驻实例的
+  -- overlay upper 跨命令持久（<proc_dir>/resident），使属主等元数据改动不因一次性路径的
+  -- 独立 overlay 而丢失（chown 跨命令不持久）。包安装（挂载/环境不同）与更高档位仍走一次性。
+  local tier = req and req.tier or 0
+  if tier > 1 then return false end
+  if tier == 1 and not (req and req.sysadmin) then return false end
   if attempt.package then return false end
   if type(args.command) ~= "string" or args.command == "" then return false end
   -- overlay 不可用时（降级/无 overlay）常驻实例无法提供一致暂存视图：交回一次性路径处理
@@ -1654,6 +1659,7 @@ local function _gate_inner(tool, args, ctx, call_original)
     -- 仅当 limits.fail_closed=true 时明确拒绝（不静默降级）。
     local cgroup = require("NeoAI.sandbox.cgroup")
     local cg_handle = nil
+    local deleg_handle = nil -- 一次性路径委派的可写 cgroup 子树（挂到 /sys/fs/cgroup）
     local prewarmed = nil
     -- 常驻沙箱：资源域为会话级（由 resident 自建并让命令加入），此处不创建一次性资源域。
     if (not resident_ok) and cgroup.limits_configured() then
@@ -1797,6 +1803,30 @@ local function _gate_inner(tool, args, ctx, call_original)
       -- 记录本次 attempt 的有效 unmask（档位提权 + 审批放行 + 可写根）：冻结阶段据此
       -- 剔除「运行时实际未被遮蔽」的路径，避免把被放行的写入误判为遮蔽目标而整单元失败。
       attempt.effective_unmask = eff_priv and eff_priv.unmask or nil
+      -- 委派可写 cgroup 子树（挂到 /sys/fs/cgroup）：使命令能在沙箱内创建子 cgroup 并写
+      -- memory.max/cpu.max（cgroup v2 写隔离），仅限该子树，不污染宿主其它 cgroup。
+      local gateway_on = false
+      do
+        local okg, ng = pcall(require, "NeoAI.sandbox.net_gateway")
+        gateway_on = okg and ng and ng.enabled()
+      end
+      -- 网关模式经 `ip netns exec` 进入独立 netns：委派 cgroup 的 bind 源在该命名空间下
+      -- 不可解析（bwrap `init: Can't find source path`），故网关模式不注入委派 cgroup。
+      if not deleg_handle and not gateway_on and cgroup.delegation_enabled() then
+        local dh, derr = cgroup.prepare_delegated("cmd_" .. tostring(attempt.attempt_id), cgroup.resolve_limits())
+        if dh then
+          deleg_handle = dh
+          local cloned = {}
+          for k, v in pairs(eff_priv or {}) do cloned[k] = v end
+          local m = {}
+          for _, x in ipairs((eff_priv and eff_priv.mounts) or {}) do m[#m + 1] = x end
+          m[#m + 1] = { src = dh.path, dst = "/sys/fs/cgroup", mode = "rw" }
+          cloned.mounts = m
+          eff_priv = cloned
+        else
+          require("NeoAI.kernel.logger").warn("[sandbox] 委派 cgroup 不可用，跳过：%s", tostring(derr))
+        end
+      end
       local prefix, perr, eff_cwd = runtime.process_prefix({
         cwd = real_cwd, overlays = active_specs, fallback_cwd = staging,
         session_dir = session_dir, session_tmp_dir = proc_dir, privileges = eff_priv,
@@ -1847,6 +1877,7 @@ local function _gate_inner(tool, args, ctx, call_original)
     local function _fail(msg)
       if observe_handle then pcall(observe_handle.stop); observe_handle = nil end
       if cg_handle then cgroup.release(cg_handle) end
+      if deleg_handle then cgroup.release_delegated(deleg_handle); deleg_handle = nil end
       candidate.cleanup(attempt.attempt_id)
       control.transition(attempt, "FAILED")
       return async.reject({ kind = "sandbox", message = msg, command_id = attempt.command_id })
@@ -1923,6 +1954,7 @@ local function _gate_inner(tool, args, ctx, call_original)
           snap and (" events=" .. vim.inspect(snap)) or "")
       end
       if cg_handle then cgroup.release(cg_handle) end
+      if deleg_handle then cgroup.release_delegated(deleg_handle); deleg_handle = nil end
       if err then
         local mapping = candidate.mapping(attempt.attempt_id)
         control.transition(attempt, "FAILED")
@@ -1998,7 +2030,11 @@ local function _gate_inner(tool, args, ctx, call_original)
           -- 双向互通：把命令改动合并进工作区暂存映射，使 read_file/edit_file 可见。
           -- 候选落盘与密钥分析均异步（线程池），避免大量文件时占满主线程。
           -- `view_files`（命令还原暂存编辑、对真实盘无净改动）也需经 merge 同步暂存视图。
-          return candidate.merge_candidate_async(cand, { from_command = true, package = is_pkg }):then_(function()
+          return candidate.merge_candidate_async(cand, {
+            from_command = true, package = is_pkg,
+            -- 命令在常驻 overlay 内执行时，产物已存在于该 overlay：常驻物化可跳过回写。
+            resident = ctx.sandbox_resident == true,
+          }):then_(function()
             if #cand.files == 0 then
               -- 仅有视图同步（无发布候选）：直接完成，不入待审。
               control.transition(attempt, "COMPLETED_READ_ONLY")

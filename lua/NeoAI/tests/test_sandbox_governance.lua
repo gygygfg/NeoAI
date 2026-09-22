@@ -463,13 +463,24 @@ tests.suite("sandbox_governance", function(_, it)
     local c2, p2 = resolved("chown -R apprunner:apprunner /opt/apps")
     t.true_(c2.sysadmin, "chown 应识别为系统管理")
     t.true_(vim.tbl_contains(p2.cap_add, "CAP_CHOWN"), "chown 应加回 CAP_CHOWN")
-    -- 普通命令：不按 sysadmin 加回 CHOWN/SETUID 等，也不解除账户库遮蔽（口令哈希不泄露）；
-    -- 仅保留档位基线 CAP_DAC_OVERRIDE（root 载荷访问他人属主 0700 目录所需）。
+    -- 普通命令：不按 sysadmin 加回 CHOWN 等，也不解除账户库遮蔽（口令哈希不泄露）；
+    -- 仅保留档位基线（CAP_DAC_OVERRIDE 访问他人属主 0700 目录 + CAP_SETUID/SETGID 供沙箱内降权）。
     local c3, p3 = resolved("ls -la")
     t.false_(c3.sysadmin, "普通命令不应识别为系统管理")
-    t.eq(1, #p3.cap_add, "普通命令仅应含档位基线能力")
-    t.eq("CAP_DAC_OVERRIDE", p3.cap_add[1], "普通命令仅应含 CAP_DAC_OVERRIDE")
+    t.eq(3, #p3.cap_add, "普通命令应仅含档位基线能力")
+    t.eq("CAP_DAC_OVERRIDE", p3.cap_add[1], "基线应含 CAP_DAC_OVERRIDE")
+    t.true_(vim.tbl_contains(p3.cap_add, "CAP_SETUID"), "基线应含 CAP_SETUID（沙箱内降权）")
+    t.true_(vim.tbl_contains(p3.cap_add, "CAP_SETGID"), "基线应含 CAP_SETGID（沙箱内降权）")
+    t.false_(vim.tbl_contains(p3.cap_add, "CAP_CHOWN"), "普通命令不应加回 CAP_CHOWN")
     t.false_(vim.tbl_contains(p3.unmask, "/etc/shadow"), "普通命令不应解除 /etc/shadow 遮蔽")
+    -- 降权包装器：sudo/runuser/setpriv 按 sysadmin 加回能力并解除 sudoers/账户库遮蔽。
+    local c4, p4 = resolved("runuser -u postgres -- initdb -D /var/lib/pgsql")
+    t.true_(c4.sysadmin, "runuser 应识别为降权（sysadmin）")
+    t.true_(vim.tbl_contains(p4.cap_add, "CAP_SETUID"), "降权应加回 CAP_SETUID")
+    t.true_(vim.tbl_contains(p4.unmask, "/etc/sudoers"), "降权应解除 /etc/sudoers 遮蔽")
+    -- sudo 包装器不改变被包裹命令的档位：`sudo mount` 仍判为 T2。
+    local c5 = privilege.classify("run_command", { command = "sudo mount /dev/sdb1 /mnt" }, spec)
+    t.eq(2, c5.tier, "sudo mount 应仍为 T2")
   end)
 
   it("系统管理：沙箱内 useradd 可用，且普通命令读不到真实 /etc/shadow", function(t)

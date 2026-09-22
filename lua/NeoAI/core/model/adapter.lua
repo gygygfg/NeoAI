@@ -45,13 +45,28 @@ local function _is_text(part)
   return type(part) == "table" and part.type == "text"
 end
 
---- 解析工具调用 arguments（JSON 字符串）为对象
+--- 解析工具调用 arguments（JSON 字符串）为对象。
+--- 按 arguments 字符串做有界记忆化：历史工具调用参数每轮请求都会被重新解码，
+--- 对长会话是重复的主线程开销；参数串不可变，可安全复用解码结果（调用方只读）。
 --- @param arguments string|table|nil
 --- @return table
+local _args_cache = {}
+local _args_cache_n = 0
+local ARGS_CACHE_MAX = 512
+
 local function _args_object(arguments)
   if type(arguments) == "table" then return arguments end
-  local decoded = _json().decode_or_nil(arguments or "{}")
+  local key = arguments or "{}"
+  local hit = _args_cache[key]
+  if hit then return hit end
+  local decoded = _json().decode_or_nil(key)
   if type(decoded) ~= "table" then return {} end
+  if _args_cache_n >= ARGS_CACHE_MAX then
+    _args_cache = {}
+    _args_cache_n = 0
+  end
+  _args_cache[key] = decoded
+  _args_cache_n = _args_cache_n + 1
   return decoded
 end
 
