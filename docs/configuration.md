@@ -431,6 +431,8 @@ sandbox = {
   process_roots = {},              -- 额外可写根（仅 read_all=false 或整机 overlay 不可用时生效；overlay 覆盖，默认仅 cwd 自动补入）。read_all=true（默认）时整机根已是可写 overlay，本项不再需要。/tmp、/var/tmp 属 tmpfs_roots；按需显式加回
   overlay_fail_closed = true,      -- overlay 不可用时拒绝 process 工具（不降级为私有 cwd）；false 才允许降级运行
   staging_uncovered = "reject",    -- 有未发布暂存但本次命令无 overlay 可写层时："reject"（默认，fail-closed）| "warn"（降级执行并在结果附提示，便于临时绕过偶发失败）
+  degraded_seed = false,           -- 无 overlay 播种视图：true 时把可写根真实内容复制进会话私有 bind 目录，使降级/嵌套 userns 视图也能看到真实文件（写入仍落私有副本并冻结为候选；真实盘只读）。默认 false；容器/无 overlay 环境可开启，配合 overlay_fail_closed=false
+  degraded_seed_max_bytes = 2 * 1024 * 1024 * 1024, -- 播种字节上限（0=不限）；超限放弃播种并回退 fail-closed（避免复制超大工作区）
   -- 异步审批：候选进入待审队列，用户确认后应用。session_auto_approve 开启后 L0/L1 自动应用。
   -- l3_warning：高危条目二次确认（AI 生成后果警告 + 自动打开 diff，需再次确认才应用）。
   --   L3（critical）恒触发；package_confirm=true 时 L2 包安装/敏感安装（apt-key、gpg --import、
@@ -485,9 +487,10 @@ sandbox = {
     rules = {},                    -- 受限 Lua 规则函数数组：返回 { decision, reason_codes }
   },
   -- 资源限制（cgroup v2）：默认 dynamic=true，按宿主资源动态推导 CPU/内存/PID 上限，
-  -- 防止沙箱内命令吃满整机卡死；静态值 >0 时优先。所有并发任务挂在共享父域下，
-  -- cpu_global_max 为并发 CPU 总预算（默认 核数-1），cpu_cores_max 为单任务配额。
-  -- fail_closed=false 时 cgroup 不可用则跳过。
+  -- 防止沙箱内命令吃满整机卡死；静态值 >0 时优先。容器内还会读当前 cgroup 的实际配额
+  -- （/proc/self/cgroup 沿父链的 memory.max/cpu.max）并取 min，避免按宿主高估。
+  -- 所有并发任务挂在共享父域下，cpu_global_max 为并发 CPU 总预算（默认 核数-1），
+  -- cpu_cores_max 为单任务配额。fail_closed=false 时 cgroup 不可用则跳过。
   -- disk_bytes：沙箱暂存磁盘上限（字节；0=不限）。统计暂存基目录（进程 overlay/私有 tmp）
   -- 与沙箱存储根（候选/待审/证据/服务 overlay）总占用；超限时拒绝写类/进程工具（用量异步
   -- 统计并缓存，不阻塞命令开始）。

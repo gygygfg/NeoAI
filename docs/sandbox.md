@@ -474,7 +474,8 @@
     链接（如 venv 的 `lib64 -> lib`）不算目录，可安全 unlink 后重建，不误报冲突。
   - **权限位保留**：候选记录文件权限（`mode`），物化进 overlay 与 CAS 发布时按原权限写回
     （`write_file_atomic` 的 mkstemp 默认 0600，会剥离可执行位，导致 venv/bin 脚本失效）；
-    新建文件用常规默认 0644，不强制 0600。
+    新建文件用常规默认 0644，不强制 0600。权限位**完整保留**（含 setuid/setgid/sticky），不因
+    「安全默认」有意丢弃。无 overlay 的 bind 视图同样保留可执行位（见 §12「无 overlay 播种视图」）。
   - **目录一致性**：目录暂存（`create_directory`/`ensure_dir`/`run_command` 新建目录）必须用
     `isdirectory` 判定，不能用 `fs.exists`（基于 filereadable，对目录恒为 false）。否则会话
     轮换会把目录误判为「暂存缺失」并标记删除，物化为 whiteout，沙箱视图里目录变成设备节点/
@@ -635,13 +636,16 @@ hostop 提案并在宿主 replay。本门面让**独立**的 `systemctl`/`journa
 
 - **退出码 137 = SIGKILL**：来源有二——`cgroup.kill`（命令超时/取消/输出截断时由门禁调用，
   `wrapper` 的 `ctx.sandbox_kill`）或 OOM（资源域 `memory.max` 或宿主/容器内存不足）。
-- **归因**：命令以 137 结束时，`run_command` 读取该资源域 `memory.events`（`oom_kill` /
-  `oom_group_kill`）：命中则回传「疑似内存超限 OOM」，否则回传「被强制终止（137/SIGKILL）」
-  并提示开启诊断。`tools.sandbox.diagnostics.enabled=true` 时，`cgroup.kill` 记录调用方堆栈、
+- **归因**：命令以 137 结束、或以「裸 -1」（无超时/取消标记、进程树被终止后无法回传退出码）
+  结束时，`run_command` **沿资源域 → 父域 → 容器根**查 `memory.events` 的 `oom_kill` /
+  `oom_group_kill` **增量**（命令开始时记录祖先计数基线并差分，避免把命令前已存在的祖先 OOM
+  误判为本次）：子域命中回传「沙箱资源域内存不足」，仅祖先命中回传「容器/宿主内存不足
+  （外层 cgroup OOM）」，均未命中则回传「被强制终止（137/SIGKILL）」并提示开启诊断。
+  `tools.sandbox.diagnostics.enabled=true` 时，`cgroup.kill` 记录调用方堆栈、
   命令结束记录资源域 memory/pids 事件（仅日志，不改变行为）。
 - **诊断命令**：`:NeoAISandboxDiag` 输出宿主/容器 cgroup 限制（`memory.max` / `memory.events` /
-  `pids.max`）、负载、PID1（systemd 探测）与已解析沙箱限制，用于区分「沙箱资源域」与
-  「宿主容器 OOM」。
+  `pids.max`）、负载、PID1（systemd 探测）、容器实际配额（`cgroup_quota`）与已解析沙箱限制，
+  用于区分「沙箱资源域」与「宿主容器 OOM」。
 - **环境不匹配提示**：命令输出命中 `System has not been booted with systemd` /
   `Failed to connect to bus` 等特征时，结果追加提示「本环境无 systemd，systemctl/service 不可用；
   请直接运行前台命令」。
@@ -873,7 +877,9 @@ seccomp（含设备节点屏障）**——沙箱内进程看到的是一份「�
   沿用最小只读白名单与宿主敏感路径遮蔽。工具临时/下载目录统一落在共享根
   `stdpath('cache')/NeoAI/shared`（位于沙箱存储之外，宿主与沙箱同路径可见，避免暴露宿主 `/tmp`）。
   后端不可用/沙箱禁用时按 `tools.sandbox.fail_closed` 决定：`true` 拒绝执行（默认），
-  否则回退宿主（不静默降级读取面）。
+  否则回退宿主（不静默降级读取面）。长驻工具子进程（MCP stdio server，`exec.open`）与
+  `run_command` 共用同一 overlay 门禁：无 overlay 可写层时按 `overlay_fail_closed`/
+  `staging_uncovered` 决定（默认拒绝），不再静默以 bind 降级视图启动。
 - **宿主运行时直通（`tools.sandbox.expose_paths`，opt-in，默认空）**：这些宿主路径在
   遮蔽/临时根**之后**以只读方式暴露，并把目录前置到沙箱 `PATH`（`expose_path_env`），
   使 `run_command` 能调用宿主工具链（如 appimage `nvim` 的 `/tmp/.mount_*`、`lua`/`luajit`、
@@ -1178,6 +1184,13 @@ run_command overlay 候选捕获（含删除 whiteout 捕获与尝试目录清�
 CPU = `min(核数, cpu_cores_max)` 个核（默认 4）、PID = `pids_max`（默认 2048）；静态
 `memory_bytes`/`pids`/`cpu_max`（>0）优先于动态推导。
 
+**容器感知**：容器内 `/proc/meminfo` 的 `MemTotal` 与 `nproc` 常反映**宿主**资源，若直接按之推导
+会把 `memory.max` 设得比容器实际可用还高（形同虚设，OOM 由外层容器触发而子域 `memory.events`
+无 `oom_kill` 记录，137 归因落空）。故推导时还会读 `/proc/self/cgroup` 定位当前 cgroup，沿
+`/sys/fs/cgroup` 父链向上取最近的有限 `memory.max`/`cpu.max`，与宿主推导**取 min**（静态显式值
+仍优先）；`cpu_global_max` 同样受容器 CPU 配额封顶。容器配额经 `:NeoAISandboxDiag` 的
+`cgroup_quota` 字段展示。
+
 所有并发任务挂在共享父域 `neoai` 下：父域 `cpu.max` = 全局预算 `cpu_global_max`
 （默认 `max(1, 核数-1)`，留 1 核给 nvim/UI），子域 `cpu.max` = `min(cpu_cores_max, 全局预算)`。
 因此并发任务 CPU 配额之和不会超过宿主可用核数（避免「每个任务各 N 核、合计远超核数」的
@@ -1206,6 +1219,25 @@ CPU 之外**的核，避免与 nvim 抢占同一核；单核宿主或 `taskset` 
 **异步递归统计并缓存**（TTL 5s），门禁只读缓存、不在命令开始处做同步 `du`，统计未就绪时放行；
 诊断见 `:NeoAISandboxDiag` 的 `disk` 字段。超限时可用 `:NeoAISandboxReview` 应用/拒绝待审候选、
 `:NeoAISandboxPrune` 清理过期候选，或调大该上限。
+
+### 无 overlay 播种视图（`tools.sandbox.degraded_seed`）
+
+容器/嵌套 userns 下 overlay 常不可挂载（宿主 `/` superblock 归属 init userns，新建 userns 里
+overlay 会 `EINVAL`），此时命令只能运行在「只读根 + 私有可写根」的降级视图，默认 fail-closed
+（`overlay_fail_closed` / `staging_uncovered`，见 §6）。开启 `degraded_seed = true` 后，沙箱在
+运行前把各可写根（`process_roots`/包根/cwd）的**真实内容**复制进会话私有 bind 目录
+（`candidate.seed_view`：内容/权限/符号链接原样保留），再把工作区暂存物化到其上；命令因此能
+看到真实磁盘文件，而写入仍落私有副本、冻结为候选，**真实盘保持只读**。T2 的私有 cwd
+（`staging`）同样播种。播种视图覆盖的根内暂存不再触发 `SANDBOX_STAGING_UNCOVERED`
+（`candidate.has_staged_outside`），仅覆盖根之外的暂存仍 fail-closed。
+
+- **增量**：会话级记录已播种项，源 mtime/size/mode 未变则跳过；会话轮换时重置。
+- **不覆盖已有权限**：仅对**新建**副本按真实盘对齐权限；暂存视图中已存在的文件/目录不改其权限。
+- **上限**：`degraded_seed_max_bytes`（默认 2 GiB，0=不限）超限即放弃播种并回退 fail-closed，
+  避免复制超大工作区。
+- **边界**：会话内真实盘的外部改动不被反映（快照语义）；仅播种配置的可写根，不播种整机 `/`。
+- 需配合 `overlay_fail_closed=false`（或 `staging_uncovered="warn"`）使用：`overlay_fail_closed`
+  仍为 true 时，无暂存也会拒绝（播种不改变该既有行为）。
 
 ### seccomp 基线
 

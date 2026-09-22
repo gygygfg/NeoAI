@@ -81,6 +81,82 @@ function M.snapshot_oom(snap)
   return false
 end
 
+--- 从 memory.events 文本累加 oom_kill/oom_group_kill 计数。
+--- @param ev string|nil
+--- @return number
+local function _oom_count(ev)
+  if type(ev) ~= "string" then return 0 end
+  local total = 0
+  for _, k in ipairs({ "oom_kill", "oom_group_kill" }) do
+    local n = tonumber(ev:match(k .. "%s+(%d+)"))
+    if n then total = total + n end
+  end
+  return total
+end
+
+--- 从资源域目录向上构造到 cgroup 根的链（含子域与根）。
+--- @param path string
+--- @param base string
+--- @return table
+local function _cgroup_chain(path, base)
+  local chain = {}
+  local p = tostring(path or ""):gsub("/+$", "")
+  while p ~= "" and #chain < 64 do
+    chain[#chain + 1] = p
+    if p == base then break end
+    local parent = p:match("^(.*)/[^/]+$")
+    if not parent or parent == "" or parent == p then break end
+    p = parent
+  end
+  return chain
+end
+
+--- 采集资源域及其祖先（父域/容器根）的 OOM 计数基线。
+--- 用于命令结束后做差分，避免把「命令开始前已存在的祖先 OOM 计数」误判为本次 OOM。
+--- @param path string 子域目录
+--- @param opts table|nil { base?, reader? }
+--- @return table map[dir] = count
+function M.oom_baseline(path, opts)
+  opts = opts or {}
+  local base = (opts.base or _base()):gsub("/+$", "")
+  local read = opts.reader or _read_file
+  local out = {}
+  for _, dir in ipairs(_cgroup_chain(path, base)) do
+    out[dir] = _oom_count(read(dir .. "/memory.events"))
+  end
+  return out
+end
+
+--- 归因 OOM：沿子域 → 父域 → 容器根查 memory.events 的 oom_kill 增量。
+--- 子域优先（命令自身的资源域）；子域无记录时再看祖先（容器/宿主 OOM）。
+--- @param path string 子域目录
+--- @param opts table|nil { baseline?, base?, reader? }
+--- @return table { oom=boolean, level?, path?, oom_kill? }
+function M.oom_attribution(path, opts)
+  opts = opts or {}
+  if type(path) ~= "string" or path == "" then return { oom = false } end
+  local base = (opts.base or _base()):gsub("/+$", "")
+  local read = opts.reader or _read_file
+  local baseline = opts.baseline or {}
+  local chain = _cgroup_chain(path, base)
+  for i, dir in ipairs(chain) do
+    local ev = read(dir .. "/memory.events")
+    if ev then
+      local n = _oom_count(ev)
+      local b = tonumber(baseline[dir]) or 0
+      if n > b then
+        return {
+          oom = true,
+          level = (i == 1) and "sandbox" or "ancestor",
+          path = dir,
+          oom_kill = n - b,
+        }
+      end
+    end
+  end
+  return { oom = false }
+end
+
 --- 共享父域路径（承载全局 CPU 预算）
 --- @return string
 local function _parent_path()
@@ -111,6 +187,69 @@ local function _mem_total_bytes()
   return total or 0
 end
 
+--- 当前进程所在 cgroup v2 路径（相对 cgroup 根，如 "/docker/abc"）。无法解析返回 nil。
+--- 容器内 `/proc/meminfo` 的 MemTotal 通常是**宿主**总量，故需据此向上找容器实际配额。
+--- @return string|nil
+local function _self_cgroup_path()
+  local f = io.open("/proc/self/cgroup", "r")
+  if not f then return nil end
+  local out = nil
+  for line in f:lines() do
+    -- cgroup v2 统一层级： "0::/path"
+    local p = line:match("^0::(.*)$")
+    if p then out = p break end
+  end
+  f:close()
+  return out
+end
+
+--- 容器/宿主 cgroup 实际可用配额：沿当前 cgroup 向上找最近的有限 memory.max / cpu.max。
+--- 宿主直接运行（cgroup 无限制）时返回 {}。用于避免在容器内按宿主资源高估限额。
+--- @param opts table|nil { rel?, base?, reader? }（测试注入用；缺省读真实 /proc 与 cgroup）
+--- @return table { memory_bytes?, cpu_cores? }
+local function _cgroup_quota(opts)
+  opts = opts or {}
+  local rel = opts.rel
+  if rel == nil then rel = _self_cgroup_path() end
+  if not rel then return {} end
+  local base = (opts.base or _base()):gsub("/+$", "")
+  local read = opts.reader or _read_file
+  local p = rel:gsub("/+$", "")
+  -- 构造从当前 cgroup 到根的路径链（含根）。
+  local chain = {}
+  while true do
+    chain[#chain + 1] = (p == "" or p == "/") and base or (base .. p)
+    if p == "" or p == "/" then break end
+    p = p:match("^(.*)/[^/]+$") or ""
+    p = p:gsub("/+$", "")
+  end
+  local out = {}
+  for _, dir in ipairs(chain) do
+    if out.memory_bytes == nil then
+      local raw = read(dir .. "/memory.max")
+      if raw then
+        local v = raw:gsub("%s+$", "")
+        if v ~= "max" then
+          local n = tonumber(v)
+          if n and n > 0 then out.memory_bytes = n end
+        end
+      end
+    end
+    if out.cpu_cores == nil then
+      local raw = read(dir .. "/cpu.max")
+      if raw then
+        local quota, period = raw:match("^(%S+)%s+(%d+)")
+        if quota and quota ~= "max" then
+          local q, pr = tonumber(quota), tonumber(period)
+          if q and pr and pr > 0 then out.cpu_cores = math.max(1, math.floor(q / pr)) end
+        end
+      end
+    end
+    if out.memory_bytes and out.cpu_cores then break end
+  end
+  return out
+end
+
 --- 解析实际生效的资源限制：静态显式值优先，未设置时按宿主资源动态推导。
 --- @return table { memory_bytes, pids, cpu_max }
 function M.resolve_limits()
@@ -121,13 +260,18 @@ function M.resolve_limits()
     cpu_max = tonumber(cfg.cpu_max) or 0,
   }
   if cfg.dynamic == false then return out end
-  -- 动态：内存取宿主总量的比例（受 memory_max_bytes 上限约束）
+  -- 容器/宿主 cgroup 实际配额：容器内 /proc/meminfo 与 nproc 常反映宿主资源，
+  -- 故限额须再与容器实际可用取 min，避免 memory.max 设得比容器还高（形同虚设、
+  -- OOM 由外层容器触发而子域 memory.events 无记录）。
+  local quota = _cgroup_quota()
+  -- 动态：内存取宿主总量的比例（受 memory_max_bytes 上限约束），且不超容器配额
   if out.memory_bytes <= 0 then
     local total = _mem_total_bytes()
     local ratio = tonumber(cfg.memory_ratio) or 0.5
     local mb = math.floor(total * ratio)
     local cap = tonumber(cfg.memory_max_bytes) or 0
     if cap > 0 and (mb <= 0 or mb > cap) then mb = cap end
+    if quota.memory_bytes and (mb <= 0 or quota.memory_bytes < mb) then mb = quota.memory_bytes end
     if mb > 0 then out.memory_bytes = mb end
   end
   -- 动态：PID 上限
@@ -135,10 +279,11 @@ function M.resolve_limits()
     local pm = tonumber(cfg.pids_max) or 2048
     if pm > 0 then out.pids = pm end
   end
-  -- 动态：CPU 配额取 min(宿主核数, cpu_cores_max) 个核
+  -- 动态：CPU 配额取 min(宿主核数, cpu_cores_max, 容器配额) 个核
   if out.cpu_max <= 0 then
     local cores_max = tonumber(cfg.cpu_cores_max) or 4
     local cores = math.min(_nproc(), math.max(1, cores_max))
+    if quota.cpu_cores then cores = math.min(cores, quota.cpu_cores) end
     if cores > 0 then out.cpu_max = cores * 100000 end
   end
   return out
@@ -152,7 +297,10 @@ function M.global_cpu_max()
   local cfg = require("NeoAI.kernel.config_store").get("tools.sandbox.limits") or {}
   local explicit = tonumber(cfg.cpu_global_max) or 0
   if explicit > 0 then return explicit end
-  return math.max(1, _nproc() - 1)
+  local n = _nproc()
+  local quota = _cgroup_quota()
+  if quota.cpu_cores then n = math.min(n, quota.cpu_cores) end
+  return math.max(1, n - 1)
 end
 
 --- 单个子域实际生效的 CPU 配额（微秒/100ms）：不超过全局预算。
@@ -434,5 +582,6 @@ end
 
 M._safe_id = _safe_id
 M._parent_path = _parent_path
+M.cgroup_quota = _cgroup_quota
 
 return M

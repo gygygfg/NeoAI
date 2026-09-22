@@ -2011,6 +2011,131 @@ tests.suite("sandbox", function(_, it)
     end)
   end)
 
+  it("工具子进程：无 overlay 时按 fail-closed 拒绝（与 run_command 一致）", function(t)
+    local runtime = require("NeoAI.sandbox.runtime")
+    if runtime.backend() ~= "bwrap" then return end
+    local sandbox = require("NeoAI.sandbox")
+    local exec = require("NeoAI.sandbox.exec")
+    local saved_avail, saved_writable = runtime.overlay_available, runtime.overlay_writable
+    runtime.overlay_available = function() return false end
+    runtime.overlay_writable = function() return false end
+    local ok, err = pcall(function()
+      with_config({ tools = { sandbox = { mode = "dry_run", review = { enabled = true } } } }, function()
+        sandbox.reset()
+        local full, finish, werr = exec.open({ "true" }, { network = true })
+        t.eq(nil, full, "无 overlay 且 fail-closed 应拒绝工具子进程")
+        t.eq(nil, finish, "拒绝时不应返回结束回调")
+        t.matches("SANDBOX_OVERLAY_UNAVAILABLE", tostring(werr))
+        -- 显式允许降级时放行（仍以私有 bind 视图运行）。
+        with_config({ tools = { sandbox = { mode = "dry_run", review = { enabled = true }, overlay_fail_closed = false } } }, function()
+          local full2, _, werr2 = exec.open({ "true" }, { network = true })
+          t.not_nil(full2, "overlay_fail_closed=false 应放行: " .. tostring(werr2))
+        end)
+      end)
+    end)
+    runtime.overlay_available, runtime.overlay_writable = saved_avail, saved_writable
+    sandbox.reset()
+    if not ok then error(err, 0) end
+  end)
+
+  it("播种视图门禁：覆盖根内暂存不拒绝、覆盖根外仍 fail-closed", function(t)
+    local wrapper = require("NeoAI.sandbox.wrapper")
+    local sandbox = require("NeoAI.sandbox")
+    local fs = require("NeoAI.utils.fs")
+    local dir = vim.fn.tempname()
+    fs.ensure_dir(dir)
+    fs.write_file(dir .. "/in.txt", "base\n")
+    with_config({ tools = { approval = { mode = "async" }, sandbox = { mode = "dry_run", review = { enabled = true } } } }, function()
+      sandbox.reset()
+      local done = false
+      require("NeoAI.tools").execute("edit_file",
+        { file_path = dir .. "/in.txt", mode = "write", content = "edited\n", description = "t" }, {})
+        :then_(function()
+          -- 覆盖 dir：暂存在覆盖根内 → 放行（无 overlay 的 T2 视图）。
+          local ok1, err1 = wrapper.overlay_gate({}, { userns = true, covered_roots = { dir } })
+          t.true_(ok1, "覆盖根内暂存不应拒绝: " .. tostring(err1))
+          -- 未覆盖：仍 fail-closed。
+          local ok2, err2 = wrapper.overlay_gate({}, { userns = true })
+          t.false_(ok2, "覆盖根外暂存应拒绝")
+          t.matches("SANDBOX_STAGING_UNCOVERED", tostring(err2))
+          done = true
+        end, function(e) t.true_(false, "edit_file 不应失败: " .. tostring(e and e.message or e)); done = true end)
+      t.true_(vim.wait(15000, function() return done end), "应完成")
+    end)
+    sandbox.reset()
+    vim.fn.delete(dir, "rf")
+  end)
+
+  it("无 overlay 播种视图：命令可见真实文件，写入仍冻结为候选", function(t)
+    local fs = require("NeoAI.utils.fs")
+    local sandbox = require("NeoAI.sandbox")
+    local runtime = require("NeoAI.sandbox.runtime")
+    if runtime.backend() ~= "bwrap" then return end
+    local dir = vim.fn.tempname()
+    fs.ensure_dir(dir)
+    fs.write_file(dir .. "/real.txt", "REAL_CONTENT\n")
+    local prev = vim.fn.getcwd()
+    vim.fn.chdir(dir)
+    local saved_avail, saved_writable = runtime.overlay_available, runtime.overlay_writable
+    runtime.overlay_available = function() return false end
+    runtime.overlay_writable = function() return false end
+    local ok, err = pcall(function()
+      with_config({ tools = { approval = { mode = "async" }, sandbox = {
+        mode = "dry_run", review = { enabled = true },
+        overlay_fail_closed = false, degraded_seed = true,
+      } } }, function()
+        sandbox.reset()
+        local done = false
+        require("NeoAI.tools").execute("run_command", {
+          command = "cat real.txt && echo NEW > added.txt", description = "t",
+        }, {}):then_(function(r)
+          t.matches("REAL_CONTENT", tostring(r), "播种视图应能看到真实磁盘文件")
+          t.eq(0, vim.fn.filereadable(dir .. "/added.txt"), "命令写入不应落真实盘（已暂存）")
+          t.not_nil(require("NeoAI.sandbox.candidate").read_path(dir .. "/added.txt"),
+            "应存在暂存副本")
+          done = true
+        end, function(e) t.true_(false, "不应失败: " .. tostring(e and e.message or e)); done = true end)
+        t.true_(vim.wait(20000, function() return done end), "run_command 应完成")
+      end)
+    end)
+    runtime.overlay_available, runtime.overlay_writable = saved_avail, saved_writable
+    vim.fn.chdir(prev)
+    sandbox.reset()
+    vim.fn.delete(dir, "rf")
+    if not ok then error(err, 0) end
+  end)
+
+  it("seed_view：播种真实根（内容/权限/链接/增量/上限）", function(t)
+    local fs = require("NeoAI.utils.fs")
+    local candidate = require("NeoAI.sandbox.candidate")
+    local src = vim.fn.tempname()
+    fs.ensure_dir(src)
+    fs.write_file(src .. "/a.txt", "A\n")
+    fs.ensure_dir(src .. "/sub")
+    fs.write_file(src .. "/sub/b.sh", "#!/bin/sh\n")
+    fs.chmod(src .. "/sub/b.sh", 493) -- 0755
+    vim.uv.fs_symlink("a.txt", src .. "/link")
+    local dst = vim.fn.tempname()
+    fs.ensure_dir(dst)
+    local r = candidate.seed_view(src, dst, { max_bytes = 1024 * 1024 })
+    t.eq(3, r.copied, "应播种 2 文件 + 1 链接（目录不计）")
+    t.eq("A\n", fs.read_file(dst .. "/a.txt"), "内容应一致")
+    t.eq(493, (vim.uv.fs_stat(dst .. "/sub/b.sh").mode % 512), "应保留可执行位")
+    t.eq("a.txt", vim.uv.fs_readlink(dst .. "/link"), "符号链接应保留")
+    -- 增量：源未变时全部跳过。
+    local r2 = candidate.seed_view(src, dst, { max_bytes = 1024 * 1024 })
+    t.eq(0, r2.copied, "源未变时应全部跳过")
+    t.eq(3, r2.skipped, "应跳过 3 项")
+    -- 上限：超过上限截断（调用方据此 fail-closed）。
+    local dst2 = vim.fn.tempname()
+    fs.ensure_dir(dst2)
+    local r3 = candidate.seed_view(src, dst2, { max_bytes = 1 })
+    t.true_(r3.truncated, "超过上限应截断")
+    vim.fn.delete(src, "rf")
+    vim.fn.delete(dst, "rf")
+    vim.fn.delete(dst2, "rf")
+  end)
+
   it("工具子进程：超大文件以 blob 进入候选（不落真实盘、不阻塞主线程）", function(t)
     local runtime = require("NeoAI.sandbox.runtime")
     if runtime.backend() ~= "bwrap" then return end
@@ -2333,6 +2458,40 @@ tests.suite("sandbox", function(_, it)
       t.eq(100000, cgroup.effective_cpu_max(100000), "低于预算的单任务配额保持")
       t.eq(0, cgroup.effective_cpu_max(0), "0 表示不限制")
     end)
+  end)
+
+  it("资源限制：容器 cgroup 配额参与推导（不超容器实际可用）", function(t)
+    local cgroup = require("NeoAI.sandbox.cgroup")
+    -- 解析：子 cgroup 为 max 时沿父链向上取最近有限值。
+    local files = {
+      ["/sys/fs/cgroup/docker/abc/memory.max"] = "max\n",
+      ["/sys/fs/cgroup/docker/abc/cpu.max"] = "max 100000\n",
+      ["/sys/fs/cgroup/docker/memory.max"] = tostring(3 * 1024 * 1024 * 1024) .. "\n",
+      ["/sys/fs/cgroup/docker/cpu.max"] = "250000 100000\n",
+    }
+    local q = cgroup.cgroup_quota({
+      rel = "/docker/abc", base = "/sys/fs/cgroup",
+      reader = function(p) return files[p] end,
+    })
+    t.eq(3 * 1024 * 1024 * 1024, q.memory_bytes, "应取最近父域有限 memory.max")
+    t.eq(2, q.cpu_cores, "cpu.max 250000/100000 应向下取整为 2 核")
+    -- 全部为 max（宿主直跑）：无配额。
+    local q2 = cgroup.cgroup_quota({
+      rel = "/", base = "/sys/fs/cgroup",
+      reader = function(p) return "max\n" end,
+    })
+    t.eq(nil, q2.memory_bytes, "无限制时不报告内存配额")
+    t.eq(nil, q2.cpu_cores, "无限制时不报告 CPU 配额")
+    -- 不变量：存在配额时，解析限制不得超配额。
+    local real = cgroup.cgroup_quota()
+    local l = cgroup.resolve_limits()
+    if real.memory_bytes then
+      t.true_(l.memory_bytes <= real.memory_bytes, "沙箱内存上限不得超容器配额")
+    end
+    if real.cpu_cores then
+      t.true_(l.cpu_max <= real.cpu_cores * 100000, "沙箱 CPU 配额不得超容器配额")
+      t.true_(cgroup.global_cpu_max() <= real.cpu_cores, "全局 CPU 预算不得超容器配额")
+    end
   end)
 
   it("包安装：提取管理器与包名（按安装命令合并）", function(t)
@@ -5128,6 +5287,56 @@ tests.suite("sandbox", function(_, it)
     end)
     vim.fn.chdir(prev)
     vim.fn.delete(dir, "rf")
+  end)
+
+  it("无 overlay（bind 视图）：命令创建的可执行位跨命令保留并发布", function(t)
+    local fs = require("NeoAI.utils.fs")
+    local sandbox = require("NeoAI.sandbox")
+    local runtime = require("NeoAI.sandbox.runtime")
+    if runtime.backend() ~= "bwrap" then return end
+    local dir = vim.fn.tempname()
+    fs.ensure_dir(dir)
+    local prev = vim.fn.getcwd()
+    vim.fn.chdir(dir)
+    local saved_avail, saved_writable = runtime.overlay_available, runtime.overlay_writable
+    runtime.overlay_available = function() return false end
+    runtime.overlay_writable = function() return false end
+    local ok, err = pcall(function()
+      with_config({ tools = { approval = { mode = "async" }, sandbox = {
+        mode = "dry_run", review = { enabled = true },
+        overlay_fail_closed = false, staging_uncovered = "warn",
+      } } }, function()
+        sandbox.reset()
+        local tools = require("NeoAI.tools")
+        local done = false
+        tools.execute("run_command", {
+          command = "printf '#!/bin/sh\\necho hi\\n' > mk.sh && chmod +x mk.sh", description = "t",
+        }, {}):then_(function()
+          return tools.execute("run_command",
+            { command = "test -x mk.sh && echo EXEC || echo NOEXEC", description = "t" }, {})
+        end):then_(function(r)
+          t.matches("EXEC", tostring(r), "bind 视图下命令创建的可执行脚本应保持 +x")
+          for _, item in ipairs(sandbox.list_reviews({ review_state = "PENDING" })) do
+            for _, f in ipairs(item.files or {}) do
+              if f.path == dir .. "/mk.sh" then
+                sandbox.apply(item.change_set_id, { auto_approve = true })
+              end
+            end
+          end
+          local st = vim.uv.fs_stat(dir .. "/mk.sh")
+          t.not_nil(st, "发布后真实文件应存在")
+          local perm = st and (st.mode % 512) or 0
+          t.true_(math.floor(perm / 64) % 2 == 1, "发布后应保留可执行位（实际 perm=" .. tostring(perm) .. "）")
+          done = true
+        end, function(e) t.true_(false, "不应失败: " .. tostring(e and e.message or e)); done = true end)
+        t.true_(vim.wait(20000, function() return done end), "run_command 应完成")
+      end)
+    end)
+    runtime.overlay_available, runtime.overlay_writable = saved_avail, saved_writable
+    vim.fn.chdir(prev)
+    sandbox.reset()
+    vim.fn.delete(dir, "rf")
+    if not ok then error(err, 0) end
   end)
 
   it("run_command：仅 chmod 已存在文件时保留可执行位（发布）", function(t)

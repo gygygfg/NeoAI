@@ -213,6 +213,11 @@ function M.sandbox_limits()
   if ok_c and cgroup then
     local ok_l, limits = pcall(cgroup.resolve_limits)
     if ok_l then out.resolved_limits = limits end
+    -- 容器/宿主 cgroup 实际配额（容器内 /proc/meminfo 常为宿主值，故单独展示）。
+    if cgroup.cgroup_quota then
+      local ok_q, quota = pcall(cgroup.cgroup_quota)
+      if ok_q then out.cgroup_quota = quota end
+    end
   end
   -- 沙箱暂存磁盘用量与上限（异步统计的缓存；尚未就绪时 used=nil）。
   local ok_d, disk = pcall(require, "NeoAI.sandbox.disk")

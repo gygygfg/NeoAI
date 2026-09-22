@@ -497,6 +497,11 @@ function M.exec(command, opts)
   end
   opts = opts or {}
   local out = async.Deferred.new()
+  -- 会话级资源域跨命令复用：记录命令开始时的 OOM 计数基线，结束后差分归因。
+  local cg_baseline = nil
+  if inst.cg and inst.cg.path and cgroup.oom_baseline then
+    pcall(function() cg_baseline = cgroup.oom_baseline(inst.cg.path) end)
+  end
   M.materialize():then_(function()
     return _request(inst, "X", vim.base64.encode(command), opts)
   end):then_(function(res)
@@ -508,13 +513,19 @@ function M.exec(command, opts)
       stdout = stdout:sub(1, max_out)
       truncated = true
     end
-    local oom = false
-    if res.code == 137 and inst.cg and inst.cg.path then
-      oom = cgroup.snapshot_oom(cgroup.events_snapshot(inst.cg.path))
+    local oom, oom_level = false, nil
+    if inst.cg and inst.cg.path and (res.code == 137 or res.code == -1) then
+      if cgroup.oom_attribution then
+        local attr = cgroup.oom_attribution(inst.cg.path, { baseline = cg_baseline })
+        oom, oom_level = attr.oom, attr.level
+      else
+        oom = cgroup.snapshot_oom(cgroup.events_snapshot(inst.cg.path))
+      end
     end
     out:resolve({
       code = res.code, stdout = stdout, stderr = "", truncated = truncated,
-      oom = oom, timed_out = res.timed_out, aborted = res.aborted, message = res.message,
+      oom = oom, oom_level = oom_level,
+      timed_out = res.timed_out, aborted = res.aborted, message = res.message,
     })
   end, function(e) out:reject(e) end)
   return out

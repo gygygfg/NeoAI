@@ -229,7 +229,7 @@ function M.apply(action, path, content, opts)
   -- 未记录权限时：保留目标已有权限；新建文件用常规 0644（避免 mkstemp 的 0600）。
   if mode == nil and action == "write" then
     local st = vim.uv.fs_stat(path)
-    mode = st and (st.mode % 512) or 420
+    mode = st and (st.mode % 4096) or 420
   end
 
   -- NeoAI 本身非 root：先以当前身份写入；权限不足 → NEEDS_ROOT，用户批准后经 sudo 写入。
@@ -305,7 +305,7 @@ function M.apply_file(action, path, src, opts)
   local mode = opts.mode
   if mode == nil then
     local st = vim.uv.fs_stat(path)
-    mode = st and (st.mode % 512) or 420
+    mode = st and (st.mode % 4096) or 420
   end
 
   if cur ~= 0 then

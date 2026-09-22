@@ -124,10 +124,30 @@ tests.suite("sandbox_service", function(_, it)
     t.false_(cgroup.snapshot_oom({ memory_events = "oom_kill 0" }))
     t.true_(cgroup.snapshot_oom({ memory_events = "oom_kill 1" }))
     t.true_(cgroup.snapshot_oom({ memory_events = "low 0\noom_group_kill 2" }))
+    -- 归因：子域优先；子域无记录时沿父链上溯祖先，并用基线差分避免历史计数误报。
+    local files = {
+      ["/cg/neoai/a/memory.events"] = "oom_kill 0\n",
+      ["/cg/neoai/memory.events"] = "oom_kill 1\n",
+      ["/cg/memory.events"] = "oom_kill 5\n",
+    }
+    local reader = function(p) return files[p] end
+    local attr = cgroup.oom_attribution("/cg/neoai/a", { base = "/cg", reader = reader })
+    t.true_(attr.oom, "子域无 OOM 时应上溯父域")
+    t.eq("ancestor", attr.level, "父域 OOM 应标记为 ancestor")
+    t.eq("/cg/neoai", attr.path, "应定位到父域路径")
+    local baseline = cgroup.oom_baseline("/cg/neoai/a", { base = "/cg", reader = reader })
+    t.eq(1, baseline["/cg/neoai"], "基线应记录父域当前计数")
+    local attr2 = cgroup.oom_attribution("/cg/neoai/a", { base = "/cg", reader = reader, baseline = baseline })
+    t.false_(attr2.oom, "计数未变时不应归因为本次 OOM")
+    files["/cg/neoai/a/memory.events"] = "oom_kill 3\n"
+    local attr3 = cgroup.oom_attribution("/cg/neoai/a", { base = "/cg", reader = reader, baseline = baseline })
+    t.true_(attr3.oom, "子域新增 OOM 应归因")
+    t.eq("sandbox", attr3.level, "子域 OOM 应标记为 sandbox")
     local diag = require("NeoAI.sandbox.diag")
     local limits = diag.sandbox_limits()
     t.eq("table", type(limits))
     t.eq("boolean", type(limits.systemd))
+    t.eq("table", type(limits.cgroup_quota), "诊断应含容器 cgroup 配额")
   end)
 
   it("service：停止先发 SIGTERM 优雅退出（trap 生效），不立即 SIGKILL", function(t)

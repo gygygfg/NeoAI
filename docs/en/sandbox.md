@@ -601,7 +601,9 @@ detection) and `risk.classify` (security level), so `pip install`, `sudo modprob
   - **File permissions are preserved**: candidates record the file mode and re-apply it when
     materializing into the overlay and when CAS-publishing (`write_file_atomic`'s `mkstemp` defaults to
     0600 and would strip the executable bit, breaking `venv/bin` scripts); new files use the ordinary
-    0644 default, never a forced 0600.
+    0644 default, never a forced 0600. Permission bits are **fully preserved** (including
+    setuid/setgid/sticky); they are not intentionally dropped for "security defaults". The no-overlay
+    bind view preserves the executable bit the same way (see §12 "seeded view without overlay").
   - **Directory consistency**: staged directories (`create_directory`/`ensure_dir`/`run_command`-created
     dirs) must be detected with `isdirectory`, never `fs.exists` (which is based on `filereadable` and
     is always false for directories). Otherwise session rotation would misread them as a missing staged
@@ -807,14 +809,20 @@ instance, so the AI's `systemctl --user ...` hits real systemd semantics
 - **Exit code 137 = SIGKILL**: there are two sources — `cgroup.kill` (called by the gate on command
   timeout/cancel/output truncation via `ctx.sandbox_kill`) or OOM (resource-domain `memory.max` or a
   host/container memory shortage).
-- **Attribution**: when a command ends with 137, `run_command` reads that resource domain's
-  `memory.events` (`oom_kill` / `oom_group_kill`): a hit reports "suspected memory-limit OOM",
-  otherwise "forcibly terminated (137/SIGKILL)" with a hint to enable diagnostics. With
-  `tools.sandbox.diagnostics.enabled=true`, `cgroup.kill` records the caller traceback and command
-  end records resource-domain memory/pids events (log only, no behavior change).
+- **Attribution**: when a command ends with 137, or with a "bare -1" (no timeout/cancel flag and the
+  process tree was killed before the exit code could be returned), `run_command` scans the
+  `oom_kill` / `oom_group_kill` **delta** in `memory.events` along **resource domain → parent →
+  container root** (an ancestor counter baseline is recorded at command start and diffed, so a
+  pre-existing ancestor OOM is not misattributed to this command): a child hit reports "sandbox
+  resource domain out of memory", an ancestor-only hit reports "container/host out of memory (outer
+  cgroup OOM)", and no hit reports "forcibly terminated (137/SIGKILL)" with a hint to enable
+  diagnostics. With `tools.sandbox.diagnostics.enabled=true`, `cgroup.kill` records the caller
+  traceback and command end records resource-domain memory/pids events (log only, no behavior
+  change).
 - **Diagnostics command**: `:NeoAISandboxDiag` prints host/container cgroup limits (`memory.max` /
-  `memory.events` / `pids.max`), load, PID1 (systemd detection) and resolved sandbox limits, to tell
-  "sandbox resource domain" apart from "host container OOM".
+  `memory.events` / `pids.max`), load, PID1 (systemd detection), the container quota
+  (`cgroup_quota`) and resolved sandbox limits, to tell "sandbox resource domain" apart from "host
+  container OOM".
 - **Environment-mismatch hint**: when command output matches `System has not been booted with
   systemd` / `Failed to connect to bus`, etc., the result appends a hint: "this environment has no
   systemd; systemctl/service is unavailable — run a foreground command directly".
@@ -1066,7 +1074,10 @@ defense-in-depth to the bwrap prefix by default (`--cap-drop ALL` plus the tier 
   dirs live under the shared root `stdpath('cache')/NeoAI/shared` (outside the sandbox store, same
   path on host and sandbox, avoiding exposing the host `/tmp`). When the backend is unavailable or the
   sandbox is disabled, `tools.sandbox.fail_closed` decides: `true` rejects execution (default),
-  otherwise it falls back to the host (no silent read-surface downgrade).
+  otherwise it falls back to the host (no silent read-surface downgrade). Long-lived tool child
+  processes (MCP stdio servers, `exec.open`) share the same overlay gate as `run_command`: with no
+  writable overlay layer, `overlay_fail_closed`/`staging_uncovered` decides (reject by default) and it
+  no longer silently starts in a degraded bind view.
 - **Host runtime passthrough (`tools.sandbox.expose_paths`, opt-in, empty by default)**: these host
   paths are exposed read-only **after** masking/tmpfs and their directories are prepended to the
   sandbox `PATH` (`expose_path_env`), so `run_command` can invoke host toolchains (e.g. the appimage
@@ -1407,6 +1418,15 @@ bounded by `memory_max_bytes`), CPU = `min(nproc, cpu_cores_max)` cores (default
 `pids_max` (default 2048); explicit static `memory_bytes`/`pids`/`cpu_max` (>0) win over the derived
 values.
 
+**Container awareness**: inside a container, `/proc/meminfo` `MemTotal` and `nproc` often reflect the
+**host** resources. Deriving directly from them would set `memory.max` above what the container
+actually allows (making it a no-op, with the OOM triggered by the outer container cgroup and no
+`oom_kill` recorded in the child domain — losing the 137 attribution). The derivation therefore also
+reads `/proc/self/cgroup` to locate the current cgroup and walks up the `/sys/fs/cgroup` parent chain
+to the nearest finite `memory.max`/`cpu.max`, taking the **min** with the host-derived value (explicit
+static values still win); `cpu_global_max` is likewise capped by the container CPU quota. The container
+quota is shown by `:NeoAISandboxDiag` in the `cgroup_quota` field.
+
 All concurrent attempts share a parent domain `neoai`: the parent's `cpu.max` is the global budget
 `cpu_global_max` (default `max(1, nproc-1)`, reserving one core for nvim/UI), and each child's
 `cpu.max` is `min(cpu_cores_max, global budget)`. The sum of concurrent per-task quotas therefore
@@ -1443,6 +1463,31 @@ staging cannot fill the host disk. Usage is recursively measured on a **worker t
 through while the measurement is not ready. See the `disk` field of `:NeoAISandboxDiag`. When over the
 cap, apply/reject pending candidates (`:NeoAISandboxReview`), prune expired ones (`:NeoAISandboxPrune`),
 or raise the cap.
+
+### Seeded view without overlay (`tools.sandbox.degraded_seed`)
+
+Inside a container / nested userns, overlay often cannot be mounted (the host `/` superblock belongs
+to the init userns, so overlay returns `EINVAL` in a fresh userns). The command then only runs in a
+degraded "read-only root + private writable roots" view, which is fail-closed by default
+(`overlay_fail_closed` / `staging_uncovered`, see §6). With `degraded_seed = true`, before running the
+sandbox copies the **real content** of each writable root (`process_roots`/package roots/cwd) into the
+session-private bind dir (`candidate.seed_view`: content/permissions/symlinks preserved), then
+materializes the workspace staging on top; the command can therefore see real files while writes still
+land in the private copy and freeze as candidates, keeping the **real disk read-only**. T2's private
+cwd (`staging`) is seeded the same way. Staged changes inside the seeded roots no longer trigger
+`SANDBOX_STAGING_UNCOVERED` (`candidate.has_staged_outside`); only staged changes outside the covered
+roots remain fail-closed.
+
+- **Incremental**: seeded entries are recorded per session and skipped while the source
+  mtime/size/mode is unchanged; reset on session rotation.
+- **Existing permissions untouched**: only **new** copies are aligned to the real disk; files/dirs
+  already present in the staging view keep their permissions.
+- **Cap**: `degraded_seed_max_bytes` (default 2 GiB, 0 = unlimited); over the cap seeding is abandoned
+  and falls back to fail-closed, avoiding copying a huge workspace.
+- **Boundary**: external changes to the real disk during the session are not reflected (snapshot
+  semantics); only configured writable roots are seeded, never the whole `/`.
+- Requires `overlay_fail_closed=false` (or `staging_uncovered="warn"`): while `overlay_fail_closed`
+  is still true, execution is rejected even with no staged changes (seeding does not change that).
 
 ### seccomp baseline
 

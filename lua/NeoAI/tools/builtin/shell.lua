@@ -73,6 +73,14 @@ local function _run_command(command, opts)
   local kill = opts.kill
   -- 资源域路径（诊断/归因）：命令以 SIGKILL（137）结束时读取 cgroup 事件判定是否 OOM。
   local cgroup_path = opts.cgroup_path
+  -- 命令开始时的祖先 OOM 计数基线：结束后差分，避免把命令前已存在的祖先 OOM 误判为本次。
+  local cgroup_baseline = nil
+  if cgroup_path then
+    local ok_cg, cg = pcall(require, "NeoAI.sandbox.cgroup")
+    if ok_cg and cg and cg.oom_baseline then
+      pcall(function() cgroup_baseline = cg.oom_baseline(cgroup_path) end)
+    end
+  end
   local max_out = tonumber(cfg_rc.max_output_bytes) or 0
   local out_bytes, err_bytes = 0, 0
   local truncated = false
@@ -146,14 +154,21 @@ local function _run_command(command, opts)
     end,
     on_exit = function(_, code)
       local out, errout = snapshot()
-      local oom = false
-      if code == 137 and cgroup_path then
+      local oom, oom_level = false, nil
+      -- 137（SIGKILL）与裸 -1（无超时/取消标记、进程树被终止后无法回传退出码）都做 OOM 归因。
+      if cgroup_path and (code == 137 or code == -1) then
         local ok, cgroup = pcall(require, "NeoAI.sandbox.cgroup")
         if ok and cgroup then
-          oom = cgroup.snapshot_oom(cgroup.events_snapshot(cgroup_path))
+          if cgroup.oom_attribution then
+            local attr = cgroup.oom_attribution(cgroup_path, { baseline = cgroup_baseline })
+            oom, oom_level = attr.oom, attr.level
+          else
+            oom = cgroup.snapshot_oom(cgroup.events_snapshot(cgroup_path))
+          end
         end
       end
-      settle({ code = code, stdout = out, stderr = errout, truncated = truncated, oom = oom })
+      settle({ code = code, stdout = out, stderr = errout, truncated = truncated,
+        oom = oom, oom_level = oom_level })
     end,
   })
 
@@ -282,15 +297,18 @@ shell_tools.run_command = helpers.define_tool(
           elseif result.timed_out then
             text = _with_status("命令执行超时", out, errout)
           elseif result.oom then
-            -- 资源域 OOM：命令被 SIGKILL（137），memory.events 出现 oom_kill。
+            -- 资源域 OOM：命令被 SIGKILL（137），memory.events 出现 oom_kill 增量。
+            local where = (result.oom_level == "sandbox")
+              and "沙箱资源域内存不足" or "容器/宿主内存不足（外层 cgroup OOM）"
             text = _with_status(
-              "命令被终止（疑似内存超限 OOM）：沙箱资源域内存不足，命令进程被内核杀死。"
-              .. "请减小并发/单次任务内存占用，或在 tools.sandbox.limits 调高 memory_bytes/memory_ratio 后重试",
+              "命令被终止（疑似内存超限 OOM）：" .. where .. "，命令进程被内核杀死。"
+              .. "请减小并发/单次任务内存占用，或在 tools.sandbox.limits 调高 memory_bytes/memory_ratio"
+              .. "（容器场景还受外层 cgroup 限制）后重试",
               out, errout)
           elseif result.code == 137 then
             -- 非超时/取消/截断的 137：SIGKILL 来源不明（资源域终止、宿主 OOM 或外部信号）。
             text = _with_status(
-              "命令被强制终止（退出码 137 / SIGKILL）：非超时或取消所致。"
+              "命令被强制终止（退出码 137 / SIGKILL）：非超时或取消所致，且未定位到资源域 OOM 事件。"
               .. "常见原因：宿主/容器内存不足触发 OOM，或命令被外部信号终止。"
               .. "可开启 tools.sandbox.diagnostics.enabled 查看资源域事件",
               out, errout)
@@ -334,7 +352,8 @@ shell_tools.run_command = helpers.define_tool(
             elseif result.timed_out then
               reason = "命令执行超时"
             elseif result.oom then
-              reason = "命令被终止（疑似内存超限 OOM）"
+              reason = "命令被终止（疑似内存超限 OOM"
+                .. (result.oom_level == "ancestor" and "，容器/宿主内存不足" or "") .. "）"
             elseif result.code == 137 then
               reason = "命令被强制终止（退出码 137 / SIGKILL）"
             else

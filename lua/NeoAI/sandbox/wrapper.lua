@@ -471,6 +471,60 @@ function M.build_overlay_specs(cwd, base_dir, extra_roots)
   return specs
 end
 
+--- 可写根视图门禁：无 overlay 可写层时的 fail-closed 判定（run_command 与工具子进程共用）。
+--- 无任何可写根使用 overlay 时，命令只能看到会话私有视图（看不到真实磁盘文件）；默认拒绝，
+--- 不静默降级。`covered_roots` 仅在播种视图（`degraded_seed`）时传入——此时这些根的真实内容
+--- 已进入私有视图，落在其内的暂存不再构成视图分裂。
+--- @param specs table 已定级 mode 的可写根规格（可为空）
+--- @param opts table { userns? boolean, covered_roots? table, cfg? table }
+--- @return boolean ok
+--- @return string|nil err
+--- @return boolean degraded
+--- @return string|nil degraded_reason
+function M.overlay_gate(specs, opts)
+  opts = opts or {}
+  local cfg = opts.cfg or config_store.get("tools.sandbox") or {}
+  local candidate = require("NeoAI.sandbox.candidate")
+  local userns = opts.userns == true
+  local degraded = true
+  local degraded_reason
+  for _, s in ipairs(specs or {}) do
+    if s.mode == "overlay" then degraded = false end
+    if not degraded_reason and s.overlay_reason then degraded_reason = s.overlay_reason end
+  end
+  if not degraded then return true, nil, false, nil end
+  -- 无 overlay 时禁止降级：存在（未被覆盖根包含的）未发布实质暂存改动时，命令只能读到真实
+  -- 磁盘，与只读工具的暂存视图分裂，且可能绕过暂存直接读写真实文件。此时**无条件** fail-closed
+  -- （含 T2 嵌套 userns：其无 overlay 是常态，但同样不能看到未覆盖的暂存视图）。
+  local covered = opts.covered_roots
+  local split
+  if covered and #covered > 0 then
+    split = candidate.has_staged_outside(covered)
+  else
+    split = candidate.has_staged()
+  end
+  if split then
+    local why = degraded_reason or (userns and "T2 嵌套 userns 无 overlay" or "无可写根可用 overlay")
+    if (cfg.staging_uncovered or "reject") ~= "warn" then
+      return false, "SANDBOX_STAGING_UNCOVERED: 存在未发布的暂存改动，但本次命令无 overlay 可写层（"
+        .. tostring(why) .. "）；命令将读到真实磁盘、与只读工具的暂存视图分裂，已拒绝执行"
+        .. "（无 overlay 时禁止降级）。请先在审批界面应用/丢弃暂存改动，或排查 overlay 可用性"
+        .. "（:NeoAISandboxCaps）；也可设 tools.sandbox.staging_uncovered=\"warn\" 允许降级执行。",
+        true, degraded_reason
+    end
+    degraded_reason = "存在未发布暂存改动但无 overlay 可写层（" .. tostring(why) .. "）"
+  end
+  -- staging_uncovered="warn" 亦视为显式允许降级（否则会被 overlay_fail_closed 再次拒绝）。
+  if not userns and cfg.overlay_fail_closed ~= false
+    and (cfg.staging_uncovered or "reject") ~= "warn" then
+    local detail = degraded_reason and ("原因：" .. tostring(degraded_reason)) or "无可写根可用 overlay"
+    return false, "SANDBOX_OVERLAY_UNAVAILABLE: 无法为可写根挂载 overlay 可写层，拒绝以降级模式运行（"
+      .. detail .. "）；请用 :NeoAISandboxCaps 排查，或在 tools.sandbox.overlay_fail_closed=false 显式允许降级",
+      true, degraded_reason
+  end
+  return true, nil, true, degraded_reason
+end
+
 --- 候选涉及的真实路径数组
 --- @param cand table
 --- @return table
@@ -1543,6 +1597,28 @@ local function _gate_inner(tool, args, ctx, call_original)
         spec.overlay_reason = runtime.overlay_reason(spec.root, spec.upper, spec.work)
       end
     end
+    -- 无 overlay 播种视图：把可写根真实内容复制进会话私有 bind 目录，使降级视图也能看到
+    -- 真实磁盘文件（写入仍落私有副本、冻结为候选；真实盘保持只读）。仅在无 overlay 且
+    -- `degraded_seed=true` 时启用；T2 的私有 cwd（staging）在 _build_prefix 内单独播种。
+    local seed_max_bytes = tonumber(cfg.degraded_seed_max_bytes) or (2 * 1024 * 1024 * 1024)
+    local seeded_covered_roots = nil
+    do
+      local any_overlay = false
+      for _, s in ipairs(specs) do if s.mode == "overlay" then any_overlay = true end end
+      -- 仅当降级确会被允许时才播种（否则门禁必然拒绝，避免白复制）；T2 不受 overlay_fail_closed 约束。
+      local degrade_allowed = cfg.overlay_fail_closed == false or cfg.staging_uncovered == "warn"
+      if (not any_overlay) and cfg.degraded_seed == true and degrade_allowed then
+        local covered, truncated = {}, false
+        for _, s in ipairs(specs) do
+          if s.mode == "bind" and s.bind then
+            local r = candidate.seed_view(s.root, s.bind, { max_bytes = seed_max_bytes })
+            if r and r.truncated then truncated = true break end
+            covered[#covered + 1] = s.root
+          end
+        end
+        if (not truncated) and #covered > 0 then seeded_covered_roots = covered end
+      end
+    end
     -- 双向互通：把工作区暂存内容物化进所选层，使命令看到 AI 尚未发布的编辑。
     -- 类型冲突（暂存文件目标在真实/overlay 中是目录）会使命令视图与只读工具视图分裂，
     -- 显式拒绝而非静默跳过（H4）。
@@ -1682,37 +1758,24 @@ local function _gate_inner(tool, args, ctx, call_original)
       end
       local userns = (priv and priv.userns) == true
       active_specs = userns and {} or specs
-      -- 视图降级判定：无任何可写根使用 overlay 时，命令只能看到会话私有视图（看不到真实磁盘
-      -- 文件）。默认 fail-closed 直接拒绝，不静默降级；仅 `overlay_fail_closed=false` 才允许
-      -- 以降级私有 cwd 运行（结果会附加降级提示）。T2 嵌套 userns 档位天然无 overlay，
-      -- 其主机效果冻结为提案，属有意设计，不在此拒绝、也不算「降级」（见下方 sandbox_userns）。
-      local degraded = true
-      local degraded_reason
-      for _, s in ipairs(active_specs) do
-        if s.mode == "overlay" then degraded = false end
-        if not degraded_reason and s.overlay_reason then degraded_reason = s.overlay_reason end
-      end
-      -- 无 overlay 时禁止降级：存在未发布的实质暂存改动时，命令只能读到真实磁盘，
-      -- 与只读工具看到的暂存视图分裂，且可能绕过暂存直接读写真实文件。此时**无条件**
-      -- fail-closed（含 T2 嵌套 userns：其无 overlay 是常态，但同样不能看到暂存视图）。
-      if degraded and require("NeoAI.sandbox.candidate").has_staged() then
-        local why = degraded_reason or (userns and "T2 嵌套 userns 无 overlay" or "无可写根可用 overlay")
-        if (cfg.staging_uncovered or "reject") ~= "warn" then
-          return nil, "SANDBOX_STAGING_UNCOVERED: 存在未发布的暂存改动，但本次命令无 overlay 可写层（"
-            .. tostring(why) .. "）；命令将读到真实磁盘、与只读工具的暂存视图分裂，已拒绝执行"
-            .. "（无 overlay 时禁止降级）。请先在审批界面应用/丢弃暂存改动，或排查 overlay 可用性"
-            .. "（:NeoAISandboxCaps）；也可设 tools.sandbox.staging_uncovered=\"warn\" 允许降级执行。"
+      -- T2（嵌套 userns，active_specs 为空）单独播种私有 cwd：把真实工作区复制进 staging，
+      -- 再把工作区暂存物化到其上，使命令看到真实文件 + AI 暂存编辑（写入仍落私有副本）。
+      if userns and cfg.degraded_seed == true then
+        local r = candidate.seed_view(real_cwd, staging, { max_bytes = seed_max_bytes })
+        if r and not r.truncated then
+          pcall(candidate.materialize_overlay,
+            { { root = real_cwd, bind = staging, mode = "bind" } })
+          seeded_covered_roots = { real_cwd }
+        else
+          seeded_covered_roots = nil
         end
-        -- warn：降级执行，并让结果附加「未发布暂存改动不可见」的降级提示（见 shell.lua）。
-        degraded_reason = "存在未发布暂存改动但无 overlay 可写层（" .. tostring(why) .. "）"
       end
-      -- staging_uncovered="warn" 亦视为显式允许降级（否则会被下面的 overlay_fail_closed 再次拒绝）。
-      if degraded and not userns and cfg.overlay_fail_closed ~= false
-        and (cfg.staging_uncovered or "reject") ~= "warn" then
-        local detail = degraded_reason and ("原因：" .. tostring(degraded_reason)) or "无可写根可用 overlay"
-        return nil, "SANDBOX_OVERLAY_UNAVAILABLE: 无法为可写根挂载 overlay 可写层，拒绝以降级模式运行（"
-          .. detail .. "）；请用 :NeoAISandboxCaps 排查，或在 tools.sandbox.overlay_fail_closed=false 显式允许降级"
-      end
+      -- 视图降级门禁（与工具子进程共用）。`seeded_covered_roots` 仅在播种视图时非空：
+      -- 这些根的真实内容已进入私有视图，落在其内的暂存不再构成视图分裂。
+      local ok_view, view_err, degraded, degraded_reason = M.overlay_gate(active_specs, {
+        userns = userns, cfg = cfg, covered_roots = seeded_covered_roots,
+      })
+      if not ok_view then return nil, view_err end
       -- 审批放行：把本次调用获批解除遮蔽的条目并入 unmask（与档位 unmask 合并）。
       -- 工具子进程可写根（spec.writable_roots）与包安装状态目录也一并 unmask，
       -- 避免其被遮蔽目录遮挡（overlay 在遮蔽之前挂载，遮蔽会将其覆盖）。

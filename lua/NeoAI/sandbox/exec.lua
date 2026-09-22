@@ -222,6 +222,13 @@ function M.open(argv, opts)
       s.mode = "bind"
     end
   end
+  -- 与 run_command 同一门禁：无 overlay 可写层且存在未发布暂存时不得静默以降级视图运行
+  -- （子进程会读到真实磁盘、与只读工具/暂存视图分裂）。默认 fail-closed。
+  local ok_view, view_err = wrapper.overlay_gate(specs, { userns = false, cfg = cfg })
+  if not ok_view then
+    candidate.cleanup(attempt.attempt_id)
+    return nil, nil, view_err
+  end
   local conflicts = candidate.materialize_overlay(specs)
   if conflicts and #conflicts > 0 then
     candidate.cleanup(attempt.attempt_id)

@@ -978,6 +978,15 @@ local DEFAULT_CONFIG = {
       --   "warn" = 降级执行并在结果里附「未发布暂存改动不可见」提示，便于临时绕过
       --            （如安装脚本触碰 /run 等路径时的偶发失败，重试或改用等价命令）。
       staging_uncovered = "reject",
+      -- 无 overlay 播种视图（`true` 时，overlay 不可用的降级/bind 视图会先把可写根的**真实
+      -- 内容**复制进会话私有目录，使命令既能看到真实磁盘文件、写入又落私有副本并冻结为候选；
+      -- 真实盘保持只读）。仅对配置的可写根（process_roots/包根/cwd）生效，不播种整机 `/`。
+      -- 默认 false（关闭，保持原 fail-closed 行为）；容器/嵌套 userns 无 overlay 环境可开启，
+      -- 并配合 `overlay_fail_closed=false`（或 `staging_uncovered="warn"`）使用。
+      degraded_seed = false,
+      -- 播种字节上限（0 = 不限）。超过上限时放弃播种并回退 fail-closed（拒绝执行），
+      -- 避免把超大工作区复制进私有目录。默认 2 GiB。
+      degraded_seed_max_bytes = 2 * 1024 * 1024 * 1024,
       retention = {
         candidate_days = 7, -- 未应用候选保留期（天）
         max_pending = 20, -- 每任务最多待审候选数

@@ -470,6 +470,8 @@ sandbox = {
   process_roots = {},              -- extra writable roots (only when read_all=false or the whole-root overlay is unavailable; overlaid, default cwd only, auto-added). With read_all=true (default) the whole root is already a writable overlay, so this is unnecessary. /tmp, /var/tmp belong to tmpfs_roots; add explicitly if needed
   overlay_fail_closed = true,      -- reject process tools when overlay is unavailable (no private-cwd downgrade); set false to allow degraded execution
   staging_uncovered = "reject",    -- when unpublished staged changes exist but the command has no writable overlay layer: "reject" (default, fail-closed) | "warn" (run degraded with a notice, to bypass transient failures)
+  degraded_seed = false,           -- seeded view without overlay: when true, copy the writable roots' real content into the session-private bind dir so a degraded/nested-userns view can see real files (writes still land in the private copy and freeze as candidates; the real disk stays read-only). Default false; enable in containers/no-overlay setups together with overlay_fail_closed=false
+  degraded_seed_max_bytes = 2 * 1024 * 1024 * 1024, -- seeding byte cap (0 = unlimited); over the cap seeding is abandoned and falls back to fail-closed (avoids copying a huge workspace)
   -- Async review: candidates enter a pending queue. session_auto_approve auto-applies L0/L1.
   -- l3_warning: high-risk items require second confirmation (AI consequence warning + auto diff; apply only after re-confirming).
   --   L3 (critical) always triggers; with package_confirm=true, L2 package/sensitive installs (apt-key,
@@ -535,6 +537,8 @@ sandbox = {
   },
   -- Resource limits (cgroup v2): dynamic=true by default, deriving CPU/memory/PID caps from host
   -- resources so a sandboxed command cannot starve the machine; explicit static values (>0) win.
+  -- Inside a container the actual cgroup quota is also read (/proc/self/cgroup, walking the parent
+  -- chain for memory.max/cpu.max) and min-ed in, so host resources are never over-estimated.
   -- All concurrent attempts share a parent domain: cpu_global_max is the total concurrent CPU
   -- budget (default nproc-1), cpu_cores_max is the per-task quota.
   -- With fail_closed=false, an unavailable cgroup is skipped rather than blocking execution.

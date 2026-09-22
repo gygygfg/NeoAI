@@ -207,7 +207,7 @@ local function _capture_snapshot(cand)
       action = f.action,
       alt_exists = st ~= nil,
       alt_type = st and st.type or nil,
-      alt_mode = st and (st.mode % 512) or nil,
+      alt_mode = st and (st.mode % 4096) or nil,
       alt_content = (is_file and not too_large) and _read_file(f.path) or nil,
       alt_too_large = too_large or nil,
       side = "after", -- 真实盘当前为「保存后」版本；快照侧为「保存前」版本
@@ -300,7 +300,7 @@ function M.undo(id, opts)
     local st = vim.uv.fs_stat(e.path)
     local cur_exists = st ~= nil
     local cur_type = st and st.type or nil
-    local cur_mode = st and (st.mode % 512) or nil
+    local cur_mode = st and (st.mode % 4096) or nil
     local cur_content = (st and st.type == "file") and _read_file(e.path) or nil
     -- 交换前记录快照侧（即将写回真实盘的版本），用于更新 disk_* 状态。
     local wrote_exists, wrote_type, wrote_content = e.alt_exists, e.alt_type, e.alt_content

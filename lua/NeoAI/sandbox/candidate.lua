@@ -29,6 +29,9 @@ local state = {
   -- run_command 开始都对全部暂存文件 fs_stat/读/写（暂存上万文件时是命令启动阶段的主线程卡顿源）。
   -- 按 base 分别记录：LSP overlay 与进程 overlay 使用不同 upper，需各自物化。
   materialized = {},
+  -- 无 overlay 播种视图：真实根 -> { dest, files = { [rel] = { mtime, size, mode } } }。
+  -- 会话级增量：已播种且源未变的路径跳过，避免每条命令重复复制整个工作区。
+  seeded = {},
   version = 0, -- 暂存版本计数器：每次新增/编辑/删除/合并暂存项时递增
   rotation = nil, -- 会话轮换的在途迁移（Deferred）；暂存访问前经 `_await_rotation` 等待完成
   volatile_cache = nil, -- { cfg = <配置引用>, fn = function } 易变包缓存匹配器缓存
@@ -58,12 +61,13 @@ end
 
 -- ========== 私有函数 ==========
 
---- 取权限位（低 9 位）。st_mode 形如 0o100644；`% 512` 即 0o777 掩码。
+--- 取权限位（低 12 位，含 setuid/setgid/sticky）。st_mode 形如 0o104755；`% 4096` 即 0o7777 掩码。
+--- 完整保留权限位：不因「安全默认」有意丢弃特殊位（权限以真实盘/暂存视图为准）。
 --- @param mode number|nil
 --- @return number|nil
 local function _perm(mode)
   if type(mode) ~= "number" then return nil end
-  return mode % 512
+  return mode % 4096
 end
 
 local function _sha(content)
@@ -537,6 +541,7 @@ function M.rotate_session()
   state.staged_to_real = migrated_rev
   -- 新会话使用新的 overlay 私有层：清空物化记录并给迁移项新版本，下次物化全部重写。
   state.materialized = {}
+  state.seeded = {}
   for _, e in pairs(migrated) do e.version = _bump_version() end
   -- 旧目录延后清理（见 _defer_cleanup 注释）：避免删除仍在被 bind 挂载引用的源目录。
   _defer_cleanup(old_dir)
@@ -750,6 +755,103 @@ local function _is_real_dir(path)
   return st ~= nil and st.type == "directory"
 end
 
+--- 无 overlay 播种视图：把真实根内容复制进会话私有可写目录，使降级 bind 视图也能看到真实
+--- 磁盘文件（写入仍落私有副本，真实盘只读；真实盘的后续外部改动在本会话内不反映）。
+--- 会话级增量：已播种且源 mtime/size/mode 未变的路径跳过。返回统计；超过 max_bytes 时
+--- `truncated=true`（调用方据此 fail-closed，不进入播种覆盖）。
+--- @param src string 真实根
+--- @param dst string 私有可写目录（bind 目标）
+--- @param opts table|nil { max_bytes? number }
+--- @return table { copied, skipped, bytes, truncated }
+function M.seed_view(src, dst, opts)
+  opts = opts or {}
+  local max_bytes = tonumber(opts.max_bytes) or 0
+  local rec = state.seeded[src]
+  if not rec or rec.dest ~= dst then
+    rec = { dest = dst, files = {} }
+    state.seeded[src] = rec
+  end
+  local out = { copied = 0, skipped = 0, bytes = 0, truncated = false }
+  local src_norm = tostring(src):gsub("/+$", "")
+  local dst_norm = tostring(dst):gsub("/+$", "")
+  local base_host = require("NeoAI.sandbox.conceal").base_host():gsub("/+$", "")
+  local function _skip(p)
+    if p == dst_norm or p:sub(1, #dst_norm + 1) == dst_norm .. "/" then return true end
+    if p == base_host or p:sub(1, #base_host + 1) == base_host .. "/" then return true end
+    return false
+  end
+  local function _dest(rel)
+    return rel == "" and dst_norm or (dst_norm .. "/" .. rel)
+  end
+  local function walk(rel)
+    if out.truncated then return end
+    local abs = rel == "" and src_norm or (src_norm .. "/" .. rel)
+    local handle = vim.uv.fs_scandir(abs)
+    if not handle then return end
+    while true do
+      local name, typ = vim.uv.fs_scandir_next(handle)
+      if not name then break end
+      if out.truncated then break end
+      local crel = rel == "" and name or (rel .. "/" .. name)
+      local cabs = abs .. "/" .. name
+      -- 已暂存删除的路径不播种（避免把命令删除的文件复活；删除由物化阶段保持）。
+      local wse = state.workspace[src_norm .. "/" .. crel]
+      if (not _skip(cabs)) and not (wse and wse.deleted) then
+        local cdest = _dest(crel)
+        if typ == "directory" then
+          local existed = vim.fn.isdirectory(cdest) == 1
+          fs.ensure_dir(cdest)
+          local st = vim.uv.fs_stat(cabs)
+          -- 不更改暂存视图中已存在目录的权限：仅新建时对齐真实盘。
+          if (not existed) and st then pcall(fs.chmod, cdest, _perm(st.mode)) end
+          walk(crel)
+        elseif typ == "link" then
+          local lst = vim.uv.fs_lstat(cabs)
+          local target = vim.uv.fs_readlink(cabs)
+          local sig = "L:" .. tostring(target) .. ":"
+            .. tostring(lst and lst.mtime and lst.mtime.sec or "")
+          local prev = rec.files[crel]
+          if prev and prev.sig == sig then
+            out.skipped = out.skipped + 1
+          else
+            pcall(vim.uv.fs_unlink, cdest)
+            fs.ensure_dir(vim.fn.fnamemodify(cdest, ":h"))
+            if pcall(vim.uv.fs_symlink, target, cdest) then rec.files[crel] = { sig = sig } end
+            out.copied = out.copied + 1
+          end
+        elseif typ == "file" then
+          local st = vim.uv.fs_stat(cabs)
+          if st then
+            local sig = string.format("F:%s:%s:%s", tostring(st.size),
+              tostring(st.mtime and st.mtime.sec or ""), tostring(_perm(st.mode)))
+            local prev = rec.files[crel]
+            local existed = fs.exists(cdest)
+            if prev and prev.sig == sig and existed then
+              out.skipped = out.skipped + 1
+            elseif max_bytes > 0 and (out.bytes + (st.size or 0)) > max_bytes then
+              out.truncated = true
+              break
+            else
+              fs.ensure_dir(vim.fn.fnamemodify(cdest, ":h"))
+              if fs.copy_file(cabs, cdest) then
+                -- 不更改暂存视图中已存在文件的权限：仅新建副本时对齐真实盘。
+                if not existed then pcall(fs.chmod, cdest, _perm(st.mode)) end
+                rec.files[crel] = { sig = sig }
+                out.copied = out.copied + 1
+                out.bytes = out.bytes + (st.size or 0)
+              end
+            end
+          end
+        end
+        -- 其它类型（socket/device/fifo）跳过：不影响构建视图，复制可能失败/危险。
+      end
+    end
+  end
+  fs.ensure_dir(dst_norm)
+  walk("")
+  return out
+end
+
 --- 把工作区暂存内容物化进进程 overlay 的 upper，使 run_command 能看到 edit_file
 --- 尚未发布的改动（双向互通）。删除的文件在 overlay 上以 whiteout（char 0:0）表示；
 --- 无 mknod 权限时静默跳过（此时命令仍可能看到被删的真实文件，属已知限制）。
@@ -841,7 +943,7 @@ function M.materialize_overlay(specs, opts)
                   ssig = cur_ssig,
                   dsig = string.format("%s:%s:%s:%s",
                     tostring(dstat.mtime.sec), tostring(dstat.mtime.nsec), tostring(dstat.size),
-                    tostring(dstat.mode % 512)),
+                    tostring(dstat.mode % 4096)),
                   s_sec = sstat.mtime.sec, s_nsec = sstat.mtime.nsec, s_size = sstat.size,
                   d_sec = dstat.mtime.sec, d_nsec = dstat.mtime.nsec, d_size = dstat.size,
                   version = entry.version,
@@ -914,7 +1016,7 @@ function M.materialize_overlay(specs, opts)
                     tostring(sstat.mtime.sec), tostring(sstat.mtime.nsec), tostring(sstat.size), tostring(sstat.mode)) or nil,
                   dsig = (ndstat and ndstat.mtime) and string.format("%s:%s:%s:%s",
                     tostring(ndstat.mtime.sec), tostring(ndstat.mtime.nsec), tostring(ndstat.size),
-                    tostring(ndstat.mode % 512)) or nil,
+                    tostring(ndstat.mode % 4096)) or nil,
                   s_sec = sstat and sstat.mtime and sstat.mtime.sec,
                   s_nsec = sstat and sstat.mtime and sstat.mtime.nsec,
                   s_size = sstat and sstat.size,
@@ -1351,6 +1453,36 @@ function M.staged_overlay_roots(known_roots)
   return out
 end
 
+--- 单条暂存条目是否为「实质改动」（删除/新建/内容与基线不同/副本缺失）。
+--- @param entry table
+--- @return boolean
+local function _entry_is_staged(entry)
+  if entry.deleted then return true end
+  -- base_hash 为 nil 表示真实盘原不存在（新建文件/目录）；目录无 base_hash。
+  if entry.base_hash == nil then return true end
+  if entry.staged and fs.exists(entry.staged) then
+    local c = _read(entry.staged)
+    if c == nil then return true end
+    if _sha(c) ~= (entry.view_base_hash or entry.base_hash) then return true end
+  else
+    return true
+  end
+  return false
+end
+
+--- 路径是否落在某个覆盖根之下（根为 "/" 表示全覆盖）。
+--- @param path string
+--- @param roots table
+--- @return boolean
+local function _under_any(path, roots)
+  for _, r in ipairs(roots or {}) do
+    if r == "/" then return true end
+    r = tostring(r):gsub("/+$", "")
+    if r ~= "" and (path == r or path:sub(1, #r + 1) == r .. "/") then return true end
+  end
+  return false
+end
+
 --- 是否存在**未发布的实质暂存改动**（与真实基线不同，或删除/新建）。
 --- 供「无 overlay 时禁止降级」判定：若命令将运行在看不到 overlay 的降级 / 嵌套 userns
 --- 模式下，命令会读到真实磁盘、与只读工具的暂存视图分裂，且可能绕过暂存直接读写真实文件，
@@ -1359,16 +1491,21 @@ end
 function M.has_staged()
   _await_rotation()
   for _, entry in pairs(state.workspace) do
-    if entry.deleted then return true end
-    -- base_hash 为 nil 表示真实盘原不存在（新建文件/目录）；目录无 base_hash。
-    if entry.base_hash == nil then return true end
-    if entry.staged and fs.exists(entry.staged) then
-      local c = _read(entry.staged)
-      if c == nil then return true end
-      if _sha(c) ~= (entry.view_base_hash or entry.base_hash) then return true end
-    else
-      return true
-    end
+    if _entry_is_staged(entry) then return true end
+  end
+  return false
+end
+
+--- 是否存在**未被给定覆盖根覆盖**的未发布实质暂存改动。
+--- 供「无 overlay / 播种视图」判定：只有落在已覆盖根（其真实内容将被物化/播种进私有视图）内的
+--- 暂存改动才不构成视图分裂；覆盖根之外的暂存（命令看不到）仍必须 fail-closed。
+--- @param covered_roots table|nil 覆盖根列表（含 "/" 表示全覆盖）
+--- @return boolean
+function M.has_staged_outside(covered_roots)
+  _await_rotation()
+  if not covered_roots or #covered_roots == 0 then return M.has_staged() end
+  for real, entry in pairs(state.workspace) do
+    if _entry_is_staged(entry) and not _under_any(real, covered_roots) then return true end
   end
   return false
 end
@@ -1710,7 +1847,7 @@ local function _capture_worker(upper_root, real_root, session_basename, expected
   local function dsig_of(st)
     if not (st and st.type == "file" and st.mtime) then return "" end
     return string.format("%s:%s:%s:%s",
-      tostring(st.mtime.sec), tostring(st.mtime.nsec), tostring(st.size), tostring(st.mode % 512))
+      tostring(st.mtime.sec), tostring(st.mtime.nsec), tostring(st.size), tostring(st.mode % 4096))
   end
   --- 线程内工作区一致性判定：命令改动是否只是 AI 暂存编辑的复现（或删除态）。
   --- 与 `_capture_entry` 的 ws 分支同口径，但内容读取移到工作线程，避免主线程逐文件读盘。
@@ -1730,7 +1867,7 @@ local function _capture_worker(upper_root, real_root, session_basename, expected
       local after = read_all(dest)
       if before ~= nil and before == after then
         -- 内容一致；但命令可能仅改了权限（chmod）：权限位不同则不能跳过。
-        local dmode = sstat and sstat.mode and (sstat.mode % 512)
+        local dmode = sstat and sstat.mode and (sstat.mode % 4096)
         if not (w.mode and dmode and w.mode ~= dmode) then return true end
       end
     end
@@ -2811,6 +2948,7 @@ function M.reset(timeout_ms)
   state.process_dir_cache = nil
   state.pending_cleanup = {}
   state.materialized = {}
+  state.seeded = {}
   state.version = 0
   state.rotation = nil
 end
