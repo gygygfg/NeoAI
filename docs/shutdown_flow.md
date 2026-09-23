@@ -13,7 +13,8 @@
 
 1. 初始化日志（`logger.init(config_store.get("log"))`）。
 2. 注册 `VimLeavePre` 自动命令（`NeoAILifecycle` 组）：退出时调用 `M.shutdown()`。
-3. `schedule` 延迟 100ms 后台刷新模型列表（`model_service.prefetch`，启动不阻塞）。
+
+> 模型列表后台刷新已迁移为 `model_prefetch` 插件（阶段 2 启动，`vim.schedule` 非阻塞）。
 
 ## 2. 生命周期（kernel/lifecycle.lua）
 
@@ -38,22 +39,29 @@
 
 ## 3. setup 流程（NeoAI.init）
 
-`NeoAI.setup(user_config)` 是插件入口，极薄：
+`NeoAI.setup(user_config)` 是插件入口，极薄且**不启动任何插件**（懒加载默认）：
 
 ```
 config_store.load(user_config)      -- 纯函数：合并 + 校验
-kernel.bootstrap()                  -- 内核引导（日志、VimLeavePre、模型后台刷新）
-herder.init()                       -- Herder 终端状态信号（懒检测环境，no-op）
-tools.init()                        -- 初始化工具系统（同步注册内置工具）
-skills.init()                       -- 扫描技能目录，填充索引
-mcp.init()                          -- 预缓存注册 + 异步连接 MCP 服务器
-lifecycle.on_shutdown(mcp.shutdown) -- 关闭时关 MCP 子进程/会话
-_register_commands()                -- 注册用户命令（懒加载业务模块）
-_register_global_keymaps()          -- 注册全局快捷键
-status.ensure_lualine_extension()   -- 注入 lualine 扩展（若已加载）
+configure_threadpool()              -- 启动早期设置 libuv 线程池大小
+kernel.bootstrap()                  -- 内核引导（日志、VimLeavePre）
+work.require()                      -- 校验多线程可用 + worker 往返自检
+catalog.register_builtins()        -- 仅登记内置插件规格（不启动）
+lifecycle.on_shutdown(stop_all)     -- 关闭时逆序卸载所有已启动插件
+lifecycle.on_shutdown(persist)      -- 关闭前先落盘活跃 Agent 进度
+lazy.register(...)                  -- 注册命令/键位占位符
 ```
 
-命令注册均懒加载对应的业务模块（`require(...)` 在命令调用时才执行）。
+首次触发（`:NeoAI*` 命令、全局快捷键或主动 API）后才启动，且分**两阶段异步**：
+
+```
+ensure_phase1()  -- 阶段 1：session/agent/model/chat/status/ui/commands/keymaps（UI 就绪）
+ensure_started() -- 阶段 2：tools/sandbox/tool_service/skills/mcp/herder + 全部 tool.*
+```
+
+- `plugins.start_list_async(ids, on_done)` 每帧启动一个插件并 `vim.defer_fn(...,0)` 让出事件循环；阶段 1 完成即打开界面。
+- `ensure_started_sync(timeout)` 供测试 / `reload_all` 同步等待两阶段完成。
+- 只读访问器（`get_*_service` / `get_statusline*`）不触发启动。
 
 ## 4. AbortSignal 级联取消
 

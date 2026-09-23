@@ -171,6 +171,14 @@ Using lazy.nvim:
 }
 ```
 
+> **Startup model (lazy by default, no configuration)**: `setup()` only loads the config,
+> bootstraps the kernel, registers plugins, and installs placeholders for all `:NeoAI*`
+> commands and global keymaps. The first trigger drives a **two-phase asynchronous start**
+> via `NeoAI.ensure_phase1/ensure_started`: phase 1 (session/agent/model/chat/status/ui) opens
+> the interface as soon as it is ready; phase 2 (tools/sandbox/tool_service/skills/mcp/herder
+> and all `tool.*`) loads in the background frame-by-frame (`kernel.plugins.start_list_async`)
+> without blocking the event loop. Read-only accessors never trigger startup.
+
 ## Quick Start
 
 Basic usage:

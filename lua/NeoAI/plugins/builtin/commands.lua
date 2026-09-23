@@ -41,6 +41,9 @@ end
 
 -- ========== 公开 API ==========
 
+--- 本插件注册的全部命令名（懒加载占位需要据此枚举）
+M.NAMES = COMMANDS
+
 --- 注册命令
 --- @return function 清理函数
 function M.start()

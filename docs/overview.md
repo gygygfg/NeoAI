@@ -164,6 +164,12 @@ lua/NeoAI/
 }
 ```
 
+> **启动模型（懒加载，默认，无需配置）**：`setup()` 只加载配置、引导内核、登记插件，并
+> 注册全部 `:NeoAI*` 命令与全局快捷键的占位符。首次触发时由 `NeoAI.ensure_phase1/ensure_started`
+> 驱动**两阶段异步启动**：阶段 1（session/agent/model/chat/status/ui）就绪后立即打开界面；
+> 阶段 2（tools/sandbox/tool_service/skills/mcp/herder 及全部 `tool.*`）在后台按帧加载
+> （`kernel.plugins.start_list_async`），期间事件循环不被阻塞。只读访问器不会触发启动。
+
 ## 快速开始
 
 基本用法：

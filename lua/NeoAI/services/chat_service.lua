@@ -561,6 +561,26 @@ function M.send_message(content, opts)
   if not content or content:gsub("%s", "") == "" then
     return async.resolve(nil)
   end
+  -- 懒加载：阶段 2（工具/沙箱/skills 等后台服务）未就绪时先等待，
+  -- 避免在工具尚未注册时构建 Agent 导致工具集缺失。
+  local ok_entry, NeoAI = pcall(require, "NeoAI")
+  if ok_entry and type(NeoAI) == "table" and type(NeoAI.is_fully_started) == "function"
+    and not NeoAI.is_fully_started() then
+    local d = async.Deferred.new()
+    NeoAI.ensure_fully_started(function(started)
+      if not started then
+        d:reject({ kind = "startup", message = "NeoAI 启动失败，无法发送消息" })
+        return
+      end
+      local p = M.send_message(content, opts)
+      if type(p) == "table" and type(p.then_) == "function" then
+        p:then_(function(v) d:resolve(v) end, function(e) d:reject(e) end)
+      else
+        d:resolve(p)
+      end
+    end)
+    return d
+  end
   local agent = _get_or_create_agent(opts)
   -- AI 正忙：不入库、不报错，暂存起来等本轮 turn 结束后再发送。
   if _is_busy(agent) then

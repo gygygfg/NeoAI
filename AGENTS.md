@@ -44,7 +44,12 @@ nvim --headless --clean -u NONE --cmd "set rtp+=$PWD" \
 6. **插件生命周期**：`register → start（依赖优先、提供服务、执行 start）→ started`；
    失败回滚本次新启动的插件；`stop` 逆序清理并注销服务。启动/停止必须幂等。
 7. `NeoAIReloadAll` / `reload_all` 必须先 `plugins.stop_all()` 再清缓存重载。
-8. **工具执行必须过沙箱**：所有工具经 `services.sandbox` 门禁（`tools/executor` 强制，
+8. **懒加载启动（默认，无配置）**：`NeoAI.setup()` 只登记插件并注册命令/键位占位符，**不启动**；
+   首次触发经 `NeoAI.ensure_phase1/ensure_started` 两阶段异步启动（阶段 1 UI 就绪即打开界面，
+   阶段 2 后台按帧加载；见 `plugins/builtin/lazy.lua`、`kernel/plugins.start_list_async`）。
+   新增副作用插件时须标注 `phase`（`catalog.lua`）；只读访问器不得触发启动。
+   测试/热重载用 `ensure_started_sync()` 同步等待全量启动。
+9. **工具执行必须过沙箱**：所有工具经 `services.sandbox` 门禁（`tools/executor` 强制，
    `tools/registry`/加载器附加 `__sandbox_spec`）。沙箱服务缺失且 `fail_closed` 时拒绝执行，
    不得绕过或静默降级。默认异步审批（`tools.approval.mode="async"`）：效果类工具立即在沙箱内
    执行并冻结候选，真实修改进入待审队列，用户经 `:NeoAISandboxReview` 异步确认后应用。

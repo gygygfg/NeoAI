@@ -71,6 +71,15 @@ require("NeoAI").setup({})
 
 ```
 
+> **Lazy by default (no configuration needed)**: `setup()` only loads the config, bootstraps the
+> kernel, registers plugins, and installs **placeholder** `:NeoAI*` commands and global keymaps.
+> The plugin graph is started on first use, **asynchronously in two phases** — phase 1
+> (UI/chat/status) opens the interface as soon as it is ready, while phase 2 (tools/sandbox/
+> skills/mcp, etc.) keeps loading in the background in chunks, never blocking the editor.
+> Read-only accessors (`NeoAI.get_*_service()` / `get_statusline*()`) never trigger startup and
+> return `nil`/empty until ready. Opening Neovim therefore never stutters because of NeoAI, and
+> no `lazy.nvim`-style command lazy-loading is required.
+
 ---
 
 ## 🚀 Quick Start

@@ -249,6 +249,68 @@ function M.start_all()
   return { ok = true }
 end
 
+--- 按给定顺序分帧异步启动插件（每帧启动 batch 个后让出事件循环，避免阻塞 UI）。
+--- 依赖须在 ids 中靠前（调用方保证）；已启动的条目会跳过。
+--- 失败时回滚本次新启动的插件（不停止调用前已启动的），并以 on_done(false, info) 回调。
+--- @param ids table 插件 id 数组
+--- @param on_done function(ok: boolean, info: table|nil) info = { failed, error }
+--- @param opts table|nil { batch?: number } 每帧启动个数（默认 1）
+function M.start_list_async(ids, on_done, opts)
+  opts = opts or {}
+  local batch = math.max(1, tonumber(opts.batch) or 1)
+  ids = ids or {}
+  if #ids == 0 then
+    on_done(true, nil)
+    return
+  end
+
+  local before = {}
+  for id, p in pairs(state.plugins) do
+    if p.status == "started" then before[id] = true end
+  end
+
+  local idx = 1
+  local finished = false
+
+  local function rollback_pass()
+    for i = #state.order, 1, -1 do
+      local oid = state.order[i]
+      local p = state.plugins[oid]
+      if p and p.status == "started" and not before[oid] then
+        M.stop(oid)
+      end
+    end
+  end
+
+  local function step()
+    if finished then return end
+    local done = 0
+    while done < batch and idx <= #ids do
+      local id = ids[idx]
+      idx = idx + 1
+      local p = state.plugins[id]
+      if p and p.status ~= "started" then
+        local ok, err = M.start(id)
+        if not ok then
+          rollback_pass()
+          finished = true
+          on_done(false, { failed = id, error = err })
+          return
+        end
+      end
+      done = done + 1
+    end
+    if idx > #ids then
+      finished = true
+      on_done(true, nil)
+      return
+    end
+    vim.defer_fn(step, 0)
+  end
+
+  vim.defer_fn(step, 0)
+end
+
 --- 停止所有已启动插件（注册顺序逆序）
 --- @return number 停止数量
 function M.stop_all()

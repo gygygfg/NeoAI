@@ -70,6 +70,7 @@ function M._precheck_script()
     '    mcp = { enabled = false },',
     '    ai = { model_refresh = { on_startup = false } },',
     '  })',
+    '  assert(require("NeoAI").ensure_started_sync(60000), "懒加载启动未完成")',
     '  require("NeoAI.tools").init()',
     '  local n = require("NeoAI.tools.registry").count()',
     '  assert(n and n > 0, "内置工具注册数为 0")',
@@ -210,6 +211,9 @@ function M._perform_reload()
 
     -- 重新引导（全新模块表，once-guard 已随缓存清空而复位）
     require("NeoAI").setup(user_config or {})
+
+    -- 懒加载：显式同步完成两阶段启动，才能重建界面/恢复会话
+    require("NeoAI").ensure_started_sync(60000)
 
     -- 重建聊天界面（经服务定位器；UI 被禁用时跳过）
     local ui = require("NeoAI.kernel.services").use("services.ui")

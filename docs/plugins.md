@@ -58,6 +58,7 @@ end
 | `start(id)` | 启动本体及其依赖；失败回滚本次新启动的插件 |
 | `stop(id)` | 逆序清理并注销服务（幂等） |
 | `start_all()` | 按注册顺序启动全部；任一失败则整批回滚 |
+| `start_list_async(ids, on_done, opts?)` | 按 `ids` 顺序**分帧异步**启动（每帧 `opts.batch` 个，默认 1，`vim.defer_fn` 让出事件循环）；失败回滚本次新启动 |
 | `stop_all()` | 逆序停止全部 |
 | `status(id)` / `is_started(id)` / `spec(id)` / `list()` | 查询 |
 | `unregister(id)` / `reset()` | 注销 / 清空（测试用） |
@@ -73,6 +74,21 @@ stop：逆序执行清理 → 注销服务 → stopped
 - 依赖优先：`deps` 中的插件先启动；循环依赖会被检测并报错。
 - 失败回滚：`start(id)` 失败只回滚**本次新启动**的插件；`start_all()` 失败整批回滚。
 - 幂等：重复 `start`/`stop` 不重复执行副作用。
+
+### 2.4 懒启动与两阶段异步（NeoAI.init）
+
+`NeoAI.setup()` **不启动**任何插件，只登记并注册命令/键位占位符。首次触发（命令、键位或
+主动 API）后，由 `NeoAI.ensure_phase1(cb)` / `NeoAI.ensure_fully_started(cb)` /
+`NeoAI.ensure_started_sync(timeout)` 驱动启动：
+
+- **阶段 1**（`catalog.phase_ids(1)`）：UI 就绪所需（`services.session/agent/model_service/
+  chat_service/status`、`ui`、`commands`、`keymaps`）。完成后立即打开界面。
+- **阶段 2**（`catalog.phase_ids(2)`）：工具/沙箱/skills/mcp/herder 及全部 `tool.*`，在后台
+  按帧继续加载。
+- 每帧由 `plugins.start_list_async` 启动一个插件并 `vim.defer_fn(...,0)` 让出事件循环，
+  编辑器输入/渲染全程可响应；阶段 1 失败则两阶段等待者一并失败。
+- `chat_service.send_message` 在阶段 2 未完成时会先等待，避免工具缺失。
+- 只读访问器（`NeoAI.get_*_service()` / `get_statusline*()`）不触发启动。
 
 ## 3. 默认组合（plugins/catalog.lua）
 

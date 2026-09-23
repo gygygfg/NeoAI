@@ -62,6 +62,7 @@ When a service is disabled `use()` returns `nil`; callers must degrade explicitl
 | `start(id)` | Start the plugin and its deps; on failure roll back plugins newly started by this call |
 | `stop(id)` | Run cleanups in reverse and revoke the service (idempotent) |
 | `start_all()` | Start all in registration order; any failure rolls back the whole batch |
+| `start_list_async(ids, on_done, opts?)` | Start in `ids` order **frame-by-frame asynchronously** (`opts.batch` per frame, default 1, yielding via `vim.defer_fn`); on failure roll back plugins newly started by this call |
 | `stop_all()` | Stop all in reverse order |
 | `status(id)` / `is_started(id)` / `spec(id)` / `list()` | Query |
 | `unregister(id)` / `reset()` | Unregister / clear (tests) |
@@ -77,6 +78,21 @@ stop: cleanups in reverse → revoke service → stopped
 - Dependencies first; circular dependencies are detected and reported.
 - Rollback: `start(id)` rolls back only plugins newly started by that call; `start_all()` rolls back the batch.
 - Idempotent: repeated `start`/`stop` do not repeat side effects.
+
+### 2.4 Lazy startup and two-phase async (NeoAI.init)
+
+`NeoAI.setup()` starts **no** plugin: it only registers plugins and installs command/keymap
+placeholders. On first trigger (command, keymap or active API), startup is driven by
+`NeoAI.ensure_phase1(cb)` / `NeoAI.ensure_fully_started(cb)` / `NeoAI.ensure_started_sync(timeout)`:
+
+- **Phase 1** (`catalog.phase_ids(1)`): what UI needs (`services.session/agent/model_service/
+  chat_service/status`, `ui`, `commands`, `keymaps`). The interface is opened as soon as it finishes.
+- **Phase 2** (`catalog.phase_ids(2)`): tools/sandbox/skills/mcp/herder and all `tool.*`, kept
+  loading in the background frame-by-frame.
+- Each frame starts one plugin via `plugins.start_list_async` then yields with `vim.defer_fn(...,0)`,
+  so input/rendering stay responsive. A phase-1 failure fails both phases' waiters.
+- `chat_service.send_message` waits for phase 2 to complete, avoiding missing tools.
+- Read-only accessors (`NeoAI.get_*_service()` / `get_statusline*()`) never trigger startup.
 
 ## 3. Default Composition (plugins/catalog.lua)
 

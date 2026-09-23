@@ -47,6 +47,7 @@ local function _tool_spec(default_mod)
     id = "tool." .. short,
     module = default_mod,
     deps = { "services.tools", "services.sandbox" },
+    phase = 2,
     start = function(ctx)
       local tools = require("NeoAI.tools")
       local spec = ctx.plugins.spec(ctx.id)
@@ -68,11 +69,11 @@ local function _service_specs()
     { id = "services.session", module = "NeoAI.core.session.session_store", service = "services.session" },
     { id = "services.agent", module = "NeoAI.core.agent.agent", service = "services.agent" },
     {
-      id = "services.tools", module = "NeoAI.tools", service = "services.tools",
+      id = "services.tools", module = "NeoAI.tools", service = "services.tools", phase = 2,
       start = function() require("NeoAI.tools").init({ builtin = false }) end,
     },
     {
-      id = "services.sandbox", module = "NeoAI.sandbox", service = "services.sandbox",
+      id = "services.sandbox", module = "NeoAI.sandbox", service = "services.sandbox", phase = 2,
       start = function() require("NeoAI.sandbox").init() end,
       stop = function() pcall(require("NeoAI.sandbox").shutdown) end,
     },
@@ -83,18 +84,18 @@ local function _service_specs()
     },
     {
       id = "services.tool_service", module = "NeoAI.services.tool_service", service = "services.tool_service",
-      deps = { "services.tools" },
+      deps = { "services.tools" }, phase = 2,
     },
-    { id = "services.skills", module = "NeoAI.services.skills", service = "services.skills" },
+    { id = "services.skills", module = "NeoAI.services.skills", service = "services.skills", phase = 2 },
     {
       id = "services.mcp", module = "NeoAI.services.mcp", service = "services.mcp",
-      deps = { "services.tools" },
+      deps = { "services.tools" }, phase = 2,
     },
     {
       id = "services.status", module = "NeoAI.services.status", service = "services.status",
       deps = { "services.chat_service" },
     },
-    { id = "services.herder", module = "NeoAI.services.herder", service = "services.herder" },
+    { id = "services.herder", module = "NeoAI.services.herder", service = "services.herder", phase = 2 },
   }
 end
 
@@ -110,7 +111,7 @@ local function _side_effect_specs()
     },
     {
       id = "commands",
-      deps = { "ui", "services.chat_service", "services.tool_service", "services.status" },
+      deps = { "ui", "services.chat_service", "services.status" },
       start = function() return require("NeoAI.plugins.builtin.commands").start() end,
     },
     {
@@ -118,7 +119,7 @@ local function _side_effect_specs()
       start = function() return require("NeoAI.plugins.builtin.keymaps").start() end,
     },
     {
-      id = "model_prefetch", deps = { "services.model_service" },
+      id = "model_prefetch", deps = { "services.model_service" }, phase = 2,
       start = function()
         local cfg = config_store.get("ai.model_refresh") or {}
         if cfg.on_startup == false then return end
@@ -133,7 +134,7 @@ local function _side_effect_specs()
       end,
     },
     {
-      id = "mcp.connect", deps = { "services.mcp", "services.tools" },
+      id = "mcp.connect", deps = { "services.mcp", "services.tools" }, phase = 2,
       start = function()
         local mcp = services.use("services.mcp")
         if mcp then mcp.init() end
@@ -144,7 +145,7 @@ local function _side_effect_specs()
       end,
     },
     {
-      id = "skills.scan", deps = { "services.skills" },
+      id = "skills.scan", deps = { "services.skills" }, phase = 2,
       start = function()
         local skills = services.use("services.skills")
         if skills then skills.init() end
@@ -156,14 +157,14 @@ local function _side_effect_specs()
     },
     {
       -- agent 循环内共用同一沙箱会话；agentEnd 时轮换并迁移暂存内容
-      id = "sandbox.session", deps = { "services.sandbox" },
+      id = "sandbox.session", deps = { "services.sandbox" }, phase = 2,
       start = function()
         local sandbox = services.use("services.sandbox")
         if sandbox then return sandbox.watch_sessions() end
       end,
     },
     {
-      id = "statusline", deps = { "services.status" },
+      id = "statusline", deps = { "services.status" }, phase = 2,
       start = function()
         local status = services.use("services.status")
         if not status then return end
@@ -176,7 +177,7 @@ local function _side_effect_specs()
       end,
     },
     {
-      id = "herder", deps = { "services.herder" },
+      id = "herder", deps = { "services.herder" }, phase = 2,
       start = function()
         local herder = services.use("services.herder")
         if herder then herder.init() end
@@ -266,6 +267,18 @@ end
 function M.builtin_ids()
   local out = {}
   for _, s in ipairs(M.build_specs()) do out[#out + 1] = s.id end
+  return out
+end
+
+--- 按启动阶段取插件 id（保持登记顺序，供两阶段异步启动）。
+--- 阶段 1：UI 就绪所需（默认）；阶段 2：后台服务/工具/副作用。
+--- @param phase number 1|2
+--- @return table 数组
+function M.phase_ids(phase)
+  local out = {}
+  for _, s in ipairs(M.build_specs()) do
+    if (s.phase or 1) == phase then out[#out + 1] = s.id end
+  end
   return out
 end
 

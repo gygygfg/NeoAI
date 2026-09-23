@@ -313,6 +313,10 @@ function M.run_all(...)
     suites_to_run = state.suites
   end
 
+  -- 懒加载：默认 setup 只登记占位，这里显式完成两阶段启动，
+  -- 保证各套件依赖的服务/工具就绪（与旧行为一致）。
+  pcall(function() require("NeoAI").ensure_started_sync(180000) end)
+
   local ok_run, run_err = xpcall(function()
     print(string.format("\n=== NeoAI 测试 (%d 套件) ===", #suites_to_run))
     for _, suite in ipairs(suites_to_run) do

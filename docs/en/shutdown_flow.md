@@ -13,7 +13,8 @@
 
 1. Initialize logging (`logger.init(config_store.get("log"))`).
 2. Register the `VimLeavePre` autocmd (`NeoAILifecycle` group): calls `M.shutdown()` on exit.
-3. `schedule` a background refresh of the model list after a 100 ms delay (`model_service.prefetch`, non-blocking at startup).
+
+> Background model-list refresh has moved to the `model_prefetch` plugin (started in phase 2 via `vim.schedule`, non-blocking).
 
 ## 2. Lifecycle (kernel/lifecycle.lua)
 
@@ -38,22 +39,30 @@ but at shutdown they run in **reverse** order (the one registered last is cleane
 
 ## 3. setup Flow (NeoAI.init)
 
-`NeoAI.setup(user_config)` is the plugin entry point, and it is extremely thin:
+`NeoAI.setup(user_config)` is the plugin entry point. It is thin and **starts no plugin** (lazy by default):
 
 ```
 config_store.load(user_config)      -- pure function: merge + validate
-kernel.bootstrap()                  -- kernel bootstrap (logging, VimLeavePre, background model refresh)
-herder.init()                       -- Herder terminal status signal (lazy environment detection, no-op)
-tools.init()                        -- initialize the tool system (registers built-in tools synchronously)
-skills.init()                       -- scan the skills directory and populate the index
-mcp.init()                          -- pre-cache registration + asynchronously connect to MCP servers
-lifecycle.on_shutdown(mcp.shutdown) -- close MCP child processes/sessions on shutdown
-_register_commands()                -- register user commands (lazy-loads business modules)
-_register_global_keymaps()          -- register global keymaps
-status.ensure_lualine_extension()   -- inject the lualine extension (if already loaded)
+configure_threadpool()              -- set libuv thread pool size early
+kernel.bootstrap()                  -- kernel bootstrap (logging, VimLeavePre)
+work.require()                      -- verify multithreading + worker round-trip self-check
+catalog.register_builtins()         -- register builtin plugin specs only (no start)
+lifecycle.on_shutdown(stop_all)     -- unload all started plugins on shutdown
+lifecycle.on_shutdown(persist)      -- persist active Agents before teardown
+lazy.register(...)                  -- install command/keymap placeholders
 ```
 
-Command registration always lazy-loads the corresponding business module (`require(...)` runs only when the command is invoked).
+On first trigger (`:NeoAI*` command, global keymap or active API) startup runs in
+**two asynchronous phases**:
+
+```
+ensure_phase1()  -- phase 1: session/agent/model/chat/status/ui/commands/keymaps (UI ready)
+ensure_started() -- phase 2: tools/sandbox/tool_service/skills/mcp/herder + all tool.*
+```
+
+- `plugins.start_list_async(ids, on_done)` starts one plugin per frame and yields via `vim.defer_fn(...,0)`; the UI opens once phase 1 finishes.
+- `ensure_started_sync(timeout)` lets tests / `reload_all` wait for both phases synchronously.
+- Read-only accessors (`get_*_service` / `get_statusline*`) never trigger startup.
 
 ## 4. AbortSignal Cascade Cancellation
 
