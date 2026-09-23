@@ -418,11 +418,19 @@ local function _base_entry(attempt, real)
     if c ~= nil then
       local secret = require("NeoAI.sandbox.secret")
       -- 高熵扫描仅对疑似密钥文件启用，避免对普通文件全文做熵计算（具名规则仍始终生效）。
-      -- 二进制内容（keyring 等）跳过 token 化：绝不当文本处理。
+      -- 二进制内容（keyring 等）通常跳过文本 token 化；但**敏感二进制密钥文件**（.p12/.pfx/
+      -- keystore/raw key 等）用同长度随机字节假化（整块映射），物化/发布时精确还原真实字节。
       local tok = c
       if _is_text_content(c) then
         tok = secret.tokenize(c, { entropy = secret.is_secret_path(real) })
         if tok ~= c then fs.write_file(staged, tok) end
+      else
+        local cfg = require("NeoAI.kernel.config_store").get("tools.sandbox.secrets") or {}
+        if cfg.binary_fake ~= false and secret.is_sensitive_path(real) then
+          local fake = secret.fake_binary(c)
+          if fake ~= c then fs.write_file(staged, fake) end
+          tok = fake
+        end
       end
       view_base_hash = _sha(tok)
     end
@@ -970,6 +978,8 @@ function M.materialize_overlay(specs, opts)
               and rec.s_size == sstat.size
               and rec.d_sec == dstat.mtime.sec and rec.d_nsec == dstat.mtime.nsec
               and rec.d_size == dstat.size
+              -- 权限位变化（chmod，执行位等）也要重新物化：mtime/size 可能不变。
+              and (dstat.mode % 4096) == (entry.mode or 420)
             if not unchanged then
               -- 原子替换：同目录临时文件 + rename。原先「先 delete 再 copy」在并行运行的
               -- 命令读到该路径时会看到缺失/半写内容（暂存文件系统原子性）；rename 原子生效。
@@ -1399,6 +1409,29 @@ function M.staged_roots()
   return out
 end
 
+--- 单条暂存条目是否为「实质改动」（删除/新建/内容与基线不同/副本缺失）。
+--- 目录条目本身不算实质改动：新建目录的可见性由其下文件条目承载，而空目录不应让
+--- `has_staged()` 永为真、进而把无 overlay 的命令误判为视图分裂（SANDBOX_STAGING_UNCOVERED）。
+--- @param entry table
+--- @return boolean
+local function _entry_is_staged(entry)
+  if entry.deleted then return true end
+  -- 目录暂存（create_directory / run_command 新建目录）不携带文件内容，跳过。
+  if entry.link == nil and entry.staged and vim.fn.isdirectory(entry.staged) == 1 then
+    return false
+  end
+  -- base_hash 为 nil 表示真实盘原不存在（新建文件/符号链接）。
+  if entry.base_hash == nil then return true end
+  if entry.staged and fs.exists(entry.staged) then
+    local c = _read(entry.staged)
+    if c == nil then return true end
+    if _sha(c) ~= (entry.view_base_hash or entry.base_hash) then return true end
+  else
+    return true
+  end
+  return false
+end
+
 --- 覆盖所有已暂存路径所需的最小可写根（`known_roots` 之外的部分）。
 --- 目的：让 `run_command` / 长驻服务 / 工具子进程的 overlay **始终**包含暂存文件所在目录，
 --- 使命令视图与只读工具看到的暂存视图一致。否则工作区外的暂存编辑不会被物化，命令读到
@@ -1439,17 +1472,20 @@ function M.staged_overlay_roots(known_roots)
     return out
   end
   local candidates, seen = {}, {}
-  for real in pairs(state.workspace) do
-    local covered = false
-    for _, r in ipairs(known) do
-      if under(real, r) then covered = true break end
-    end
-    if not covered then
-      -- overlay lower 必须是存在的目录：向上找最近的存在祖先（按父目录去重解析）。
-      local dir = real:match("^(.*)/[^/]+$")
-      if dir == nil or dir == "" then dir = "/" end
-      local d = resolve_dir(dir)
-      if d and not seen[d] then seen[d] = true; candidates[#candidates + 1] = d end
+  for real, entry in pairs(state.workspace) do
+    -- 只处理实质暂存改动：空操作/目录条目无需覆盖根，否则会多挂无用 overlay 并放大门禁开销。
+    if _entry_is_staged(entry) then
+      local covered = false
+      for _, r in ipairs(known) do
+        if under(real, r) then covered = true break end
+      end
+      if not covered then
+        -- overlay lower 必须是存在的目录：向上找最近的存在祖先（按父目录去重解析）。
+        local dir = real:match("^(.*)/[^/]+$")
+        if dir == nil or dir == "" then dir = "/" end
+        local d = resolve_dir(dir)
+        if d and not seen[d] then seen[d] = true; candidates[#candidates + 1] = d end
+      end
     end
   end
   -- 去重后按深度排序：浅根优先，跳过已被选中根覆盖者。
@@ -1465,23 +1501,6 @@ function M.staged_overlay_roots(known_roots)
     if not covered then out[#out + 1] = d end
   end
   return out
-end
-
---- 单条暂存条目是否为「实质改动」（删除/新建/内容与基线不同/副本缺失）。
---- @param entry table
---- @return boolean
-local function _entry_is_staged(entry)
-  if entry.deleted then return true end
-  -- base_hash 为 nil 表示真实盘原不存在（新建文件/目录）；目录无 base_hash。
-  if entry.base_hash == nil then return true end
-  if entry.staged and fs.exists(entry.staged) then
-    local c = _read(entry.staged)
-    if c == nil then return true end
-    if _sha(c) ~= (entry.view_base_hash or entry.base_hash) then return true end
-  else
-    return true
-  end
-  return false
 end
 
 --- 路径是否落在某个覆盖根之下（根为 "/" 表示全覆盖）。
@@ -1524,10 +1543,29 @@ function M.has_staged_outside(covered_roots)
   return false
 end
 
+--- 是否存在**落在给定根之下**的未发布实质暂存改动。
+--- 供 T2（嵌套 userns，无 overlay，cwd 以会话私有 staging 呈现）判定：未播种时 cwd 内的暂存
+--- 对命令不可见，属视图分裂；cwd 之外的暂存不在其工作集内，不阻塞命令（避免无关暂存把
+--- systemctl/unshare 这类命令误拒）。
+--- @param roots table 根列表
+--- @return boolean
+function M.has_staged_under(roots)
+  _await_rotation()
+  if not roots or #roots == 0 then return false end
+  for real, entry in pairs(state.workspace) do
+    if _entry_is_staged(entry) and _under_any(real, roots) then return true end
+  end
+  return false
+end
+
 --- 使某些真实路径的暂存副本失效（发布/拒绝后调用），下次编辑重新从真实文件复制。
+--- 同时失效 overlay 视图中的同名物化条目：否则命令会继续读到发布/拒绝前的旧物化内容
+--- （overlay upper 会话级持久、遮蔽 lower 的新真实内容），表现为「读到旧版本」。
+--- 常驻实例已挂载时经其命名空间内删除（宿主侧改已挂载 upper 未定义）；否则宿主侧删除。
 --- @param paths string|table
 function M.invalidate(paths)
   if type(paths) == "string" then paths = { paths } end
+  local reals = {}
   for _, p in ipairs(paths or {}) do
     local real = _abs(p)
     local ws = state.workspace[real]
@@ -1535,6 +1573,43 @@ function M.invalidate(paths)
       pcall(vim.fn.delete, ws.staged, "rf")
       state.staged_to_real[ws.staged] = nil
       state.workspace[real] = nil
+    end
+    reals[#reals + 1] = real
+  end
+  if #reals > 0 then
+    local ok, resident = pcall(require, "NeoAI.sandbox.resident")
+    if ok and resident and type(resident.invalidate_paths) == "function" and resident.active() then
+      pcall(resident.invalidate_paths, reals)
+    else
+      M._invalidate_overlay_host(reals)
+    end
+  end
+end
+
+--- 宿主侧把真实盘内容同步进 overlay upper（无常驻实例时）。overlay lower 在挂载后变更不可靠
+--- 可见，删除 upper 条目会回退到过期 lower，故写入真实内容：文件复制、目录建目录、不存在删除。
+--- 仅在无常驻实例挂载时调用（发布/拒绝后命令已结束）。
+--- @param reals table 规范化真实路径数组
+function M._invalidate_overlay_host(reals)
+  for _, real in ipairs(reals or {}) do
+    for _, mat in pairs(state.materialized or {}) do
+      local rec = mat[real]
+      if rec and rec.dest then
+        local st = vim.uv.fs_lstat(real)
+        if st == nil then
+          pcall(vim.fn.delete, rec.dest, "rf")
+        elseif st.type == "file" then
+          local dest = rec.dest
+          pcall(vim.uv.fs_unlink, dest)
+          fs.ensure_dir(vim.fn.fnamemodify(dest, ":h"))
+          if fs.copy_file(real, dest) then
+            pcall(vim.uv.fs_chmod, dest, st.mode % 4096)
+          end
+        elseif st.type == "directory" then
+          fs.ensure_dir(rec.dest)
+        end
+        mat[real] = nil
+      end
     end
   end
 end
@@ -2650,7 +2725,11 @@ local function _finish_worker(input, cap, sha_src, blob_dir)
         local target = blob_dir ~= "" and (blob_dir .. "/" .. sha(staged)) or ""
         if target ~= "" then
           local ok = pcall(vim.uv.fs_copyfile, staged, target)
-          if ok then blob = target end
+          if ok then
+            blob = target
+            -- fs_copyfile 不保留权限位；显式 chmod，避免执行位在发布后丢失。
+            if stat.mode then pcall(vim.uv.fs_chmod, target, stat.mode % 4096) end
+          end
         end
         after_hash = (stat.mtime and string.format("sig:%s:%s:%s",
           tostring(stat.mtime.sec), tostring(stat.mtime.nsec), tostring(stat.size)))
@@ -2853,6 +2932,10 @@ function M.publish(candidate, opts)
     elseif f.action == "create" or f.action == "modify" then
       action = "write"
       content = (secret.detokenize(f.content or ""))
+      -- 数据流账本：记录假密钥在宿主落盘路径的汇聚点。
+      pcall(function()
+        require("NeoAI.sandbox.secret_flow").record("commit", { path = f.path })
+      end)
     elseif f.action == "mkdir" then
       action = "mkdir"
     elseif f.action == "delete" then

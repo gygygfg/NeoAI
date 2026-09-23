@@ -134,19 +134,23 @@ tests.suite("sandbox_symlink", function(_, it)
       local unit_name = "neoai-enable-" .. tostring(os.time()) .. ".service"
       local link = "/root/.config/systemd/user/default.target.wants/" .. unit_name
       vim.fn.delete(link)
-      local cmd = table.concat({
+      local write_cmd = table.concat({
         "mkdir -p \"$HOME/.config/systemd/user\"",
         "cat > \"$HOME/.config/systemd/user/" .. unit_name .. "\" <<'UNIT'",
         "[Unit]", "Description=NeoAI enable test", "[Service]", "Type=oneshot",
         "ExecStart=/bin/true", "[Install]", "WantedBy=default.target", "UNIT",
-        "systemctl --user daemon-reload",
-        "systemctl --user enable " .. unit_name,
       }, "\n")
+      local tools = require("NeoAI.tools")
       local done, result = false, nil
-      require("NeoAI.tools").execute("run_command", { command = cmd, description = "t" }, {})
+      tools.execute("run_command", { command = write_cmd, description = "t" }, {})
+        :then_(function()
+          -- 伪造 systemd 解析器：`systemctl --user enable` 走门面，软链暂存到用户单元根。
+          return tools.execute("run_command",
+            { command = "systemctl --user enable " .. unit_name, description = "t" }, {})
+        end)
         :then_(function(r) result = tostring(r); done = true end, function() done = true end)
       t.true_(vim.wait(60000, function() return done end, 100), "命令应完成")
-      t.matches("Created symlink", result, "enable 应创建软链（沙箱内）")
+      t.matches("Created symlink", result, "enable 应暂存软链变更（沙箱内）: " .. tostring(result))
       t.true_(vim.uv.fs_lstat(link) == nil, "软链不应落宿主机")
       t.not_nil(require("NeoAI.sandbox.candidate").read_path(link), "软链应进入暂存视图")
       vim.fn.chdir(prev)
@@ -189,7 +193,7 @@ tests.suite("sandbox_symlink", function(_, it)
       require("NeoAI.tools").execute("run_command", { command = "systemctl enable " .. unit, description = "t" }, {})
         :then_(function(r) result = tostring(r); done2 = true end, function(e) result = "ERR:" .. tostring(e and (e.message or e)); done2 = true end)
       t.true_(vim.wait(30000, function() return done2 end, 50), "enable 应完成")
-      t.matches("已暂存", result, "enable 应暂存软链变更: " .. tostring(result))
+      t.matches("Created symlink", result, "enable 应暂存软链变更: " .. tostring(result))
       t.true_(vim.uv.fs_lstat(link) == nil, "软链不应落宿主机")
       t.not_nil(require("NeoAI.sandbox.candidate").read_path(link), "软链应进入暂存视图")
       vim.fn.chdir(prev)

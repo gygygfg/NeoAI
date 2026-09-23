@@ -36,7 +36,7 @@
 | 关闭窗口 | `q` | |
 | 切换思考显示 | `r` | `message_list.toggle_reasoning` |
 | 切换模型 | `M` | 弹出模型选择器 |
-| 循环模式 | `m` | CHAT → PLAN → AUTO |
+| 循环模式 | `m` | CHAT → PLAN |
 | 循环显示模式 | `<C-t>`（插入）/ `T`（普通） | chat / trajectory |
 | 热重载显示模式 | `<F5>` | 重载当前显示模式插件 |
 | 确认计划 | — | 执行 `:NeoAIApprovePlan`（或手动切换模式）；AI 不再持有切换模式的工具 |
@@ -73,22 +73,15 @@
 - AI 在计划模式下调研、提问澄清，输出**清晰、格式化的修改计划**。
 - 计划输出后本轮结束，**由用户确认**（执行 `:NeoAIApprovePlan` 或手动切换模式），
   确认后转入 CHAT 模式，把计划解析为任务清单（todo）并自动执行。
-- 生成过程中切换模式（`m` / `:NeoAIPlan` / `:NeoAIAuto`）会延迟到当前回合结束后生效，
+- 生成过程中切换模式（`m` / `:NeoAIPlan`）会延迟到当前回合结束后生效，
   不打断正在进行的生成。
 
-## 7. AUTO 模式
-
-`:NeoAIAuto` 或 `m` 循环到 AUTO 模式：自动允许所有工具调用（运行期开关），开启时立即批准当前
-待审批/排队的工具。**生成/工具执行过程中**切到 AUTO 也会**立即生效**（审批放宽与工具集/模型
-变更解耦），不会等到本轮结束——避免「切了 AUTO 本轮还在弹审批框」；离开 AUTO 与其它模式切换
-仍延迟到本轮结束，避免中途打断当前回合。
-
-## 8. 向用户提问（ask_user）
+## 7. 向用户提问（ask_user）
 
 AI 在生成过程中可通过 `ask_user` 暂停并向用户提问，等待回答。提问弹窗（`ui/components/ask_user`）
 支持选项快速选择；回答作为工具结果回传给 AI。未注册 UI 时回退到 `vim.ui.input`。
 
-## 9. 相关文档
+## 8. 相关文档
 
 - [configuration.md](configuration.md)：`ui.*` / `keymaps.*` 配置。
 - [ui_system.md](ui_system.md)：`chat_view` 内部实现。

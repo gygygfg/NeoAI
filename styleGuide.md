@@ -641,7 +641,7 @@ if signal:aborted() then return end
 - `send_message(content)` — 发送消息（创建或复用当前 Agent）。
 - `attach_window` / `detach_window` — 绑定/解绑窗口（关闭时持久化 + 清理审批）。
 - `new_session` / `load_session` — 新建/加载会话（还原计划模式、待办清单）。
-- `toggle_plan_mode` / `toggle_auto_mode` / `cycle_mode` / `approve_plan` / `get_mode` / `cancel_generation` / `switch_model` / `get_todos`。
+- `toggle_plan_mode` / `cycle_mode` / `approve_plan` / `get_mode` / `cancel_generation` / `switch_model` / `get_todos`。
 
 ### `services/tool_service.lua` — 工具服务
 
@@ -890,10 +890,9 @@ require("NeoAI").setup({
       -- 共 13 家内置 provider，均可 models_override 手动覆盖
     },
     model_refresh = { on_startup = true, interval_sec = 3600, timeout_ms = 10000 },
-    modes = {          -- 按模式（CHAT/PLAN/AUTO）分别配置 provider/model/temperature/max_tokens/stream
+    modes = {          -- 按模式（CHAT/PLAN）分别配置 provider/model/temperature/max_tokens/stream
       chat = { provider = "deepseek", model = "auto", temperature = 0.7, max_tokens = 4096, stream = true },
       plan = { provider = "deepseek", model = "auto", temperature = 0.3, max_tokens = 8192, stream = true },
-      auto = { provider = "deepseek", model = "auto", temperature = 0.7, max_tokens = 8192, stream = true },
     },
     reasoning_enabled = true,
     system_prompt = "你是一个AI编程助手...",

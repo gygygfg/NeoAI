@@ -100,10 +100,10 @@ context_cache = {
   enabled = true,
   context_window = 64000,       -- 上下文窗口兜底值：用户显式非默认值优先，否则按模型能力表推导
   threshold_ratio = 0.8,        -- 达到该比例触发后台异步压缩（不阻塞、不弹窗；显式缓存模型自动取更保守值）
-  retain_ratio = 0.16,          -- 溢出恢复时保留的最近历史比例（常规压缩折叠第一轮至倒数第二轮）
-  retain_min_tokens = 4096,     -- 溢出恢复的尾部保留下限
+  retain_ratio = 0.16,          -- 保留的最近历史比例（单轮长循环回退/溢出恢复用；常规压缩折叠第一轮至倒数第二轮）
+  retain_min_tokens = 4096,     -- 尾部保留下限（单轮长循环回退/溢出恢复用）
   compact_max_tokens = 8192,    -- 压缩摘要输出上限
-  min_shadow_messages = 2,      -- 溢出恢复至少折叠多少条（常规压缩按轮次范围）
+  min_shadow_messages = 2,      -- 至少折叠多少条（溢出恢复/单轮回退；常规压缩按轮次范围）
   compaction_retries = 1,       -- 摘要后仍高于阈值的重试次数（常规压缩无新可折叠消息时停止）
   prune_enabled = true,         -- 摘要前先做模型无关的工具结果裁剪
   prune_threshold_chars = 8192, -- 文本码点超过该值的工具结果才裁剪
@@ -114,7 +114,9 @@ context_cache = {
 }
 ```
 
-> **压缩行为**：常规（阈值触发）压缩在后台**异步非阻塞**执行——折叠第一轮至倒数第二轮（保留最后一轮完整），
+> **压缩行为**：常规（阈值触发）压缩在后台**异步非阻塞**执行——折叠第一轮至倒数第二轮（保留最后一轮完整）；
+> 当没有更早的用户轮次可折叠（单轮长工具循环）时，回退为按 `retain_ratio`/`retain_min_tokens` 的平衡头部缩减，
+> 折叠本回合较早轮次、保留最近尾部（切点保持 tool_calls 与结果的配对）。
 > 摘要完成后写入**压缩覆盖层**（`agent.compaction`），后续请求与再次压缩都使用压缩后的替换；聊天渲染与会话持久化
 > 仍是**原始上下文**（覆盖层随会话持久化于 `session.metadata.compaction`，重开后继续生效）。压缩**不弹悬浮窗**。
 > 上下文溢出恢复（`force_compact`）仍为阻塞等待，并按 `retain_ratio`/`retain_min_tokens`/`min_shadow_messages` 做最大化缩减。
@@ -268,6 +270,10 @@ sandbox = {
     "/usr/share",                  -- 运行时共享数据（nodejs/dotnet/java/git-core/terminfo 等）
     "/usr/local/bin", "/usr/local/sbin", "/usr/local/lib", "/usr/local/libexec", "/usr/local/include", "/usr/local/go",
     "/var/lib",                    -- 宿主包数据库（dpkg/apt/rpm 等）；危险子路径仍由 mask_paths 遮蔽
+    -- 语言运行时/虚拟环境解释器（uv/pyenv/virtualenv）：venv 的 bin/python 常是指向这些目录的
+    -- 符号链接；read_all=false 时若不暴露，激活 venv 后 python 会变成悬空链接（command not found）
+    "/usr/share/pyenv", "~/.pyenv", "~/.local/share/uv/python", "~/.local/share/virtualenvs",
+    "~/.virtualenvs", "~/.local/bin", "~/.nvm", "~/.cargo", "~/.rustup",
   },
   readonly_paths = { "/etc/ld.so.cache", "/etc/passwd", "/etc/group", "/etc/nsswitch.conf",
     "/etc/hosts", "/etc/ssl", "/etc/alternatives", "/etc/localtime",
@@ -348,10 +354,12 @@ sandbox = {
     stop_timeout_ms = 5000,  -- 停止时先发 SIGTERM 等待优雅退出的上限（超时 SIGKILL）
     auto_background = true,  -- 保留常量（旧后台门面已移除，不再触发）
   },
-  -- systemctl 门面（方案 A）：AI 的独立 `systemctl`/`journalctl` 调用被路由到沙箱内长驻
-  -- 服务（复用 sandbox.service），不调用宿主 systemd、也不修改宿主机。支持
-  -- simple/exec/oneshot 与 Requires/Wants/After/Before 依赖；Type=notify/forking/dbus、
-  -- socket/timer 等语义明确报错；门面不处理的动词回退 T2/hostop 提案路径。
+  -- systemctl 门面（方案 A）：解析/实现全在 Lua（sandbox/systemd），沙箱内
+  -- /usr/bin/systemctl、/usr/bin/journalctl 为极薄入口（bash 文件 IPC 客户端），把 argv 转发
+  -- 给宿主门面并按真实 stdout/stderr/退出码返回。独立调用由门禁直接路由，脚本/管道调用经入口
+  -- 走同一门面；不调用宿主 systemd、也不修改宿主机。支持 simple/exec/oneshot 与
+  -- Requires/Wants/After/Before 依赖；Type=notify/forking/dbus、socket/timer 等语义明确报错；
+  -- 门面不处理的动词回退 T2/hostop 提案路径。
   systemd = {
     enabled = true,          -- 总开关
     mode = "facade",         -- facade（默认）：沙箱内处理
@@ -360,14 +368,21 @@ sandbox = {
       "/etc/systemd/system", "/run/systemd/system",
       "/usr/lib/systemd/system", "/lib/systemd/system",
     },
-    -- 嵌套真实 systemd --user（需同时开启 resident）：常驻沙箱实例内启动真实 user manager，
-    -- `systemctl --user` 命中真实语义；单元文件落工作区 overlay 暂存、cgroup 仅限委派子树，
-    -- 所有修改不落宿主机。默认开启；前置条件（bwrap + dbus-daemon + systemd）缺失时自动跳过。
-    -- 注意：开启后首次启动常驻实例会等待 user manager 就绪（数秒），不需要用户级 systemd 时可关闭。
+    -- 伪造 systemd --user 解析器：`systemctl --user` 由门面解析用户单元根并处理简单
+    -- start/stop/is-active/status/show/cat/list-units/daemon-reload 与 enable/disable（软链暂存）。
+    -- 不启动真实 systemd/dbus（临时沙箱环境更稳定）。默认开启；enabled=false 时 `--user` 报错。
     user = { enabled = true },
+    -- 用户单元文件搜索目录（优先沙箱暂存副本，再读真实文件）。缺省见下。
+    -- user_unit_roots = { "~/.config/systemd/user", "/etc/systemd/user", "/usr/lib/systemd/user" },
     -- 系统级 systemctl enable/disable：解析 [Install] WantedBy/RequiredBy，把软链变更暂存为
     -- 待审候选，审批后应用；不落宿主机。默认开启。
     stage_install = true,
+    -- 维护脚本兼容桩（默认开）：包安装的 dpkg/apt postinst 会调用
+    -- invoke-rc.d/deb-systemd-invoke/systemctl；沙箱 PID1 非 systemd、无系统 dbus，直接调用宿主
+    -- systemctl 会连接总线失败。为包安装命令额外注入 policy-rc.d（拒绝服务动作，退出 101），
+    -- 使包安装成功、服务不真正启动（沙箱内手动前台运行）。systemctl/journalctl 入口本身由
+    -- enabled 控制、对所有命令生效，与此开关无关。
+    maintscript_stubs = true,
   },
   network = {
     enabled = false, allowed_endpoints = {}, budget_bytes = 0, -- 受控网络网关
@@ -375,8 +390,15 @@ sandbox = {
     -- HTTP(S)_PROXY/ALL_PROXY 指向宿主侧 Lua 过滤代理，本机目标拦截、外部放行并记录。
     -- 应用层边界：不认代理的裸 TCP 可绕过（详见 docs/sandbox.md §6.1）。
     host_local_block = true,
+    block_proxy_evasion = true,      -- host_local_block 生效时拒绝显式清除/绕过代理的命令（unset *proxy、env -u、--noproxy、--proxy ""），防止过滤失效直达宿主本机
     host_local_proxy_port = 0,       -- 宿主过滤代理端口（0 = 自动分配 loopback 随机端口）
-    allow_localhost_ports = {},      -- 本机端口白名单（默认空=全拦）：仅放行「回环地址 + 这些端口」的本机访问（如沙箱内服务自测 5432/6379）；宿主网卡 IP/链路本地/云元数据永不放行
+    allow_localhost_ports = {},      -- 本机端口白名单（默认空=全拦）：仅放行「回环地址 + 这些端口」的本机访问（如沙箱内服务自测 5432/6379）；宿主网卡 IP/链路本地/云元数据永不放行。沙箱内命令启动的临时监听端口会按 cgroup 归属自动登记免权限，无需在此列出
+    -- 沙箱网络访问策略：沙箱内部创建的进程/端口（回环 + allow_localhost_ports + 服务端口登记表）
+    -- 在沙箱内访问免权限；访问沙箱外（宿主本机其他端口、宿主网卡、外部主机）按此策略处理：
+    --   "ask"（默认）= 弹窗请求用户同意（headless/无 UI 时失败关闭）；
+    --   "allow"       = 直接放行并记录（旧行为）；
+    --   "deny"        = 直接拒绝。
+    access = "ask",
     -- 沙箱外部命令代理策略：strip（默认，不把宿主代理传入沙箱，如 mihomo 只代理 opencode 自身，
     -- 避免宿主 HTTPS_PROXY=127.0.0.1:7890 在沙箱内不可达导致 pip/npm 失败）| passthrough（沿用宿主）|
     -- table { http, https, all, no_proxy }（显式设置；未列出的代理变量清除）。
@@ -491,7 +513,7 @@ sandbox = {
     apt_sandbox_user = "root", -- apt 系列：注入 APT::Sandbox::User（默认 "root" 关闭 apt 自身的 `_apt` 降权，避免嵌套 userns/受限容器中 setgroups EPERM 使 apt update/install 失败）；"_apt" 或空串保留 apt 默认行为
   },
   lsp_overlay = { enabled = true }, -- AI 专用沙箱 LSP：AI 的 lsp_* 工具克隆的 server 读暂存内容（默认开，仅 bwrap+overlay；不可用时回退编辑器客户端）
-  secrets = { enabled = true, min_length = 20, max_length = 200, min_entropy = 3.5, min_distinct = 8, exclude_pure_hex = true, entropy_requires_context = true, entropy_secret_paths_only = true, generated_scan_max_bytes = 2097152, generated_scan_max_files = 200, tokenize_env = true, extra_rules = {}, allowlist = {} }, -- 密钥/敏感信息防护：熵检测 + 具名规则（私钥块/AKIA/ghp_/sk-/JWT/Bearer…）+ token 加密映射；env 名含 KEY/TOKEN/SECRET/PASSWORD/CREDENTIAL 的值无视熵强制 token 化；裸熵串须含 -/_ 且非代码标识符（snake_case 函数/常量名）或处于敏感名上下文（缩小认定范围，避免误伤 integrity/构建哈希/回溯函数名/路径分量）；非敏感名且值含 / 的环境变量只按具名规则脱敏（不破坏 PATH/LD_LIBRARY_PATH 等）；entropy_secret_paths_only=true 时全文熵扫描仅对疑似密钥文件（~/.ssh、~/.bashrc、/etc/* 等，见 secret.is_secret_path）执行，普通文件只走具名规则；generated_scan_max_bytes/generated_scan_max_files 限制 AI 生成高熵检测（detect_generated）的单次扫描预算，避免大候选逐文件全文扫描占满主线程（0 = 不限制）
+  secrets = { enabled = true, min_length = 20, max_length = 200, min_entropy = 3.5, min_distinct = 8, exclude_pure_hex = true, entropy_requires_context = true, entropy_secret_paths_only = true, generated_scan_max_bytes = 2097152, generated_scan_max_files = 200, tokenize_env = true, binary_fake = true, disclose_fakes = false, flow_tracking = true, alert = { enabled = true, timeout_ms = 0 }, trusted_services = {}, auto_trust_providers = true, extra_rules = {}, allowlist = {} }, -- 密钥/敏感信息防护：熵检测 + 具名规则（私钥块/AKIA/ghp_/sk-/JWT/Bearer…）+ **格式保真假密钥**（同长度/同字符类/熵不低于原始；进程内映射表不落盘）；env 名含 KEY/TOKEN/SECRET/PASSWORD/CREDENTIAL 的值无视熵强制假化；裸熵串须含 -/_ 且非代码标识符（snake_case 函数/常量名）或处于敏感名上下文；非敏感名且值含 / 的环境变量只按具名规则处理（不破坏 PATH/LD_LIBRARY_PATH 等）；entropy_secret_paths_only=true 时全文熵扫描仅对疑似密钥文件执行。**假密钥**出现在工具参数/AI 上下文时警告用户（不阻断）；**真实密钥**出现时立即停止 Agent 并弹窗，用户确认后才继续（headless 无 UI 时失败关闭）。binary_fake=true 时敏感二进制密钥文件（.p12/.pfx/keystore/raw key）被读取/暂存时用同长度随机字节假化（base64 标记传输，落盘/执行时精确还原）。flow_tracking=true 时记录假密钥来源与所有流经点（工具/命令/环境变量/落盘），命令/脚本加密等不可逆变换产生的派生文件标记「不透明派生」并在发布前强制人工确认。trusted_services 为出网白名单（精确主机/`*.suffix`/IP/CIDR）：向白名单发送密钥不弹窗也不警告；auto_trust_providers=true 时已配置的模型供应商 base_url 主机自动信任；disclose_fakes=true 时向 AI 披露「这是假密钥」（默认不披露以保持格式保真）
   retention = { candidate_days = 7, max_pending = 20 },
   policy = {
     version = "1",                 -- 策略版本（用于审计回放；规则变更时递增）

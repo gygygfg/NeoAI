@@ -29,6 +29,10 @@ function M.init()
   approval_ui.init()
   -- 注册向用户提问 UI
   require("NeoAI.ui.components.ask_user").init()
+  -- 注册密钥告警 UI（真实密钥/非白名单发送时阻塞确认）
+  pcall(function() require("NeoAI.ui.components.secret_alert").init() end)
+  -- 注册网络访问同意 UI（沙箱外部命令访问沙箱外目标时阻塞确认）
+  pcall(function() require("NeoAI.ui.components.net_consent").init() end)
   -- 启动子 Agent 监控监听
   local sub_agent_dock = require("NeoAI.ui.components.sub_agent_dock")
   sub_agent_dock.init()
@@ -116,6 +120,8 @@ function M.reset()
   pcall(function() require("NeoAI.ui.lsp_guard").uninstall() end)
   pcall(function() require("NeoAI.ui.components.tool_approval").reset() end)
   pcall(function() require("NeoAI.ui.components.ask_user").reset() end)
+  pcall(function() require("NeoAI.ui.components.secret_alert").reset() end)
+  pcall(function() require("NeoAI.ui.components.net_consent").reset() end)
   pcall(function() require("NeoAI.ui.components.sub_agent_dock").reset() end)
   pcall(function() require("NeoAI.ui.components.sandbox_review").reset() end)
   state.initialized = false

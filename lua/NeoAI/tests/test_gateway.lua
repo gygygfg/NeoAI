@@ -184,7 +184,7 @@ tests.suite("gateway", function(_, it)
 
     local echo_port, close_srv = echo_server()
     -- 把 127.0.0.1 视为外部（覆盖判定），验证转发路径
-    local addr = hp.start("127.0.0.1", 0, { host_local_fn = function() return false end })
+    local addr = hp.start("127.0.0.1", 0, { host_local_fn = function() return false end, access = "allow" })
     t.not_nil(addr, "代理应能启动")
     local cli = vim.uv.new_tcp()
     local got, done, phase = {}, false, "header"
@@ -258,7 +258,7 @@ tests.suite("gateway", function(_, it)
     local hp = require("NeoAI.sandbox.host_proxy")
     hp.reset()
     local echo_port, close_srv = echo_server()
-    local addr = hp.start("127.0.0.1", 0, { host_local_fn = function() return false end })
+    local addr = hp.start("127.0.0.1", 0, { host_local_fn = function() return false end, access = "allow" })
     -- 目标 127.0.0.1（判定覆盖为外部）
     local ip = { 127, 0, 0, 1 }
     local req = string.char(5, 1, 0) -- greeting

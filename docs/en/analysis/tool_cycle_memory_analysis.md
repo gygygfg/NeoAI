@@ -202,8 +202,6 @@ confirmation" is serialized.
 - **Popup failure tolerance**: when showing fails (`pcall`), the serial slot is released and that entry is
   rejected; the tool finishes with an error result and the loop continues, so it never deadlocks due to
   `approval_showing` being left true.
-- **AUTO mode**: `toggle_auto_mode` automatically allows all tool calls; when enabled it immediately approves
-  the current pending/queued tools.
 
 ### 5.3 Plan Mode Gate
 

@@ -148,4 +148,35 @@ tests.suite("sandbox_instance", function(_, it)
     t.eq(0, vim.fn.isdirectory(dead), "已死实例目录应删除")
     vim.fn.delete(base, "rf")
   end)
+
+  it("异步落盘失败被检测并保留内存缓存（写入失败不被当作成功）", function(t)
+    local sandbox = require("NeoAI.sandbox")
+    local store = require("NeoAI.sandbox.store")
+    local work = require("NeoAI.utils.work")
+    local async = require("NeoAI.utils.async")
+    local base = vim.fn.tempname()
+    with_config({ tools = { sandbox = { workspace_root = base } } }, function()
+      sandbox.reset()
+      -- 模拟线程池原子写失败：work.run 直接以 "\0<err>" 解析，不真正落盘。
+      local orig_run = work.run
+      work.run = function()
+        local d = async.Deferred.new()
+        d:resolve("\0ENOSPC")
+        return d
+      end
+      local ok, err = pcall(function()
+        local cand = { candidate_digest = "sha256:asyncfail", created_at = 1, files = {} }
+        store.write_candidate_async(cand)
+        t.true_(vim.wait(2000, function()
+          return next(store.write_errors()) ~= nil
+        end, 20), "写入失败应被记录（不再静默当作成功）")
+        t.not_nil(store.read_candidate("sha256:asyncfail"),
+          "失败时内存缓存应保留，刚写入的内容仍可读回")
+      end)
+      work.run = orig_run
+      if not ok then error(err, 0) end
+    end)
+    sandbox.reset()
+    pcall(vim.fn.delete, base, "rf")
+  end)
 end)

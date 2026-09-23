@@ -125,6 +125,12 @@ function M.init()
   end
   -- 后台统计一次沙箱暂存磁盘用量（供磁盘上限门禁读缓存；不阻塞启动）。
   vim.schedule(function() pcall(function() require("NeoAI.sandbox.disk").refresh(true) end) end)
+  -- 注册出网密钥守卫：向非白名单地址发送密钥时弹窗阻止（utils/http 程序化路径）。
+  pcall(function()
+    require("NeoAI.utils.http").set_guard(function(o, c)
+      return require("NeoAI.sandbox.secret_egress").guard_http(o, c)
+    end)
+  end)
   return M
 end
 
@@ -148,6 +154,8 @@ function M.shutdown()
   M.unwatch_sessions()
   pcall(function() require("NeoAI.sandbox.net_gateway").teardown() end)
   pcall(function() require("NeoAI.sandbox.host_proxy").stop() end)
+  -- 停止 systemd 门面 IPC 桥（沙箱内 systemctl/journalctl 入口的宿主服务端）。
+  pcall(function() require("NeoAI.sandbox.systemd_ipc").stop() end)
   -- 停止长驻服务：捕获其改动为候选并合并回暂存（有界等待），避免服务进程跨关闭残留。
   pcall(function() require("NeoAI.sandbox.service").stop_all({ timeout_ms = 10000 }) end)
   -- 停止会话级常驻沙箱实例（连同其命名空间内的后台进程）。
@@ -190,9 +198,21 @@ function M.watch_sessions()
         end
       end
     end
-    -- 会话轮换前先终止常驻沙箱实例（其命名空间绑定当前会话的 overlay 目录）。
-    pcall(function() require("NeoAI.sandbox.resident").stop({ timeout_ms = 2000 }) end)
-    pcall(candidate.rotate_session)
+    -- 会话轮换只迁移工作区暂存内容；**不再停止常驻实例**——其 overlay/shell 目录为稳定路径
+    -- （不随会话目录清理），实例连同其中的后台进程跨轮次保活。有在途命令时仍延迟轮换，
+    -- 避免迁移暂存与命令读取/物化交错。
+    local function do_rotate()
+      pcall(candidate.rotate_session)
+    end
+    local function rotate_when_idle(tries)
+      local resident = require("NeoAI.sandbox.resident")
+      if resident.busy() and tries > 0 then
+        vim.defer_fn(function() rotate_when_idle(tries - 1) end, 500)
+        return
+      end
+      do_rotate()
+    end
+    rotate_when_idle(20)
   end
   for _, ev in ipairs({
     events.GENERATION_COMPLETED,
@@ -629,6 +649,8 @@ function M.reset()
   if not store.root() then store.init(_root()) end
   -- 等待后台后处理完成，避免 reset 时仍有在途捕获/冻结/结算写入旧实例目录造成污染。
   pcall(function() require("NeoAI.sandbox.wrapper").await_postprocess(60000) end)
+  -- 停止 systemd 门面 IPC 桥（测试隔离：避免跨套件残留定时器/监听）。
+  pcall(function() require("NeoAI.sandbox.systemd_ipc").reset() end)
   -- 停止长驻服务并回收其 overlay/cgroup（先于 candidate/control/store 清理）。
   pcall(function() require("NeoAI.sandbox.service").reset() end)
   -- 停止会话级常驻沙箱实例（连同其后台进程与资源域）。

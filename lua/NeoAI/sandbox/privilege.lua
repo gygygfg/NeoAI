@@ -289,6 +289,33 @@ local function _in(value, list)
   return false
 end
 
+-- 无害的版本/帮助查询标志：这些命令只打印信息、不改变系统状态，不提升权限档。
+local HARMLESS_QUERY_FLAGS = {
+  ["--version"] = true, ["-V"] = true, ["--help"] = true, ["-h"] = true,
+  ["-?"] = true, ["--usage"] = true,
+}
+
+--- 命令是否为「纯版本/帮助查询」：除可执行名与重定向外，所有参数都是无害查询标志。
+--- 避免 `systemctl --version`/`mount --help` 等被当作特权操作（进而在 T2 嵌套 userns 无
+--- overlay 时被暂存视图门禁误拒）。
+--- @param toks table
+--- @param bin_idx number 可执行名在 toks 中的下标
+--- @return boolean
+local function _is_harmless_query(toks, bin_idx)
+  local seen = false
+  for j = bin_idx + 1, #toks do
+    local t = toks[j]
+    if t:find("[<>]") then
+      -- 重定向 token（如 `2>1`）：忽略
+    elseif HARMLESS_QUERY_FLAGS[t] then
+      seen = true
+    else
+      return false
+    end
+  end
+  return seen
+end
+
 --- 对单个命令段分类，返回最高匹配档位与规则名
 --- @param seg string
 --- @param rules table
@@ -315,6 +342,8 @@ local function _classify_segment(seg, rules)
   if bin == "mount" and not _mount_mutates(toks, i + 1) then
     return nil, nil
   end
+  -- 纯版本/帮助查询（`systemctl --version`、`mount --help` 等）不改变系统状态，不提升档位。
+  if _is_harmless_query(toks, i) then return nil, nil end
   local best, name
   for _, rule in ipairs(rules or {}) do
     local hit = false
@@ -569,10 +598,21 @@ function M.classify(tool, args, spec, opts)
   -- 被包裹命令若本身更高档（如 `sudo mount` → T2）则取更高档。
   if privdrop and tier < M.TIER.ELEVATED then tier = M.TIER.ELEVATED end
   if privdrop then reasons[#reasons + 1] = "privdrop" end
+  -- 复合/管道命令中的 systemctl/journalctl：门面只处理独立调用，此处标记以便注入 systemctl
+  -- shim（见 resolve），使脚本/管道不命中宿主真实 systemctl（无系统 dbus，必然失败）。
+  local systemd_compound = false
+  for _, seg in ipairs(_segments(command)) do
+    for w in seg:gmatch("%S+") do
+      local b = vim.fn.fnamemodify(_strip_token(w), ":t")
+      if b == "systemctl" or b == "journalctl" then systemd_compound = true break end
+    end
+    if systemd_compound then break end
+  end
   return {
     tier = tier, reasons = reasons, docker = docker, container = container,
     network = network, package = package, package_all = has_pkg and all_pkg,
     sysadmin = sysadmin or privdrop, privdrop = privdrop, apt = apt,
+    systemd_compound = systemd_compound,
   }
 end
 
@@ -649,6 +689,24 @@ function M.resolve(tier, req)
       priv.apt_sandbox_user = asu
     end
   end
+  -- 维护脚本兼容桩：包安装的 postinst 会调用 invoke-rc.d/deb-systemd-invoke/systemctl，而沙箱
+  -- PID1 非 systemd、无系统 dbus，直接调用宿主 systemctl 会失败。默认注入 policy-rc.d +
+  -- systemctl shim（见 runtime._maintscript_stubs），使 dpkg 配置成功（服务不真正启动）。
+  if req and req.package then
+    local scfg = config_store.get("tools.sandbox.systemd") or {}
+    if scfg.maintscript_stubs ~= false then
+      priv.maintscript_stubs = true
+    end
+  end
+  -- 复合/管道命令中的 systemctl/journalctl：门禁无法拆分 shell 复合命令，故由沙箱内入口
+  -- （runtime.process_prefix 在 `systemd.enabled` 时对所有命令注入）转发到同一 Lua 门面。
+  -- 此标记保留用于分类/留痕，不再影响注入范围。
+  if req and req.systemd_compound then
+    local scfg = config_store.get("tools.sandbox.systemd") or {}
+    if scfg.maintscript_stubs ~= false then
+      priv.systemctl_shim = true
+    end
+  end
   -- 系统管理命令（useradd/usermod/groupadd/chown/passwd 等）：默认最小权限下这些命令会因
   -- 缺少 CHOWN/SETUID/SETGID/DAC_OVERRIDE 而失败（如 useradd 无法锁 /etc/passwd、打不开
   -- /etc/gshadow），且账户数据库被遮蔽。命中即按 privilege.sysadmin 加回窄能力并解除对应
@@ -682,6 +740,28 @@ end
 --- @return string "auto" | "confirm" | "approve"
 function M.review_mode(tier)
   return _tier_cfg(tier).review or "auto"
+end
+
+--- 命令实际被授予的能力集合（供按能力门禁判定，如 risk.deny_reason 的 CAP_GATED_BINS）。
+--- 注意：`ALL` 不展开为具体能力——runtime 的全局 cap_drop 会把未显式列出的能力
+--- （如 CAP_NET_ADMIN）重新丢弃，故只有显式 cap_add 的能力才算「已授予」。
+--- @param tool_name string
+--- @param args table
+--- @param spec table|nil
+--- @param opts table|nil 透传 classify（如 effective_command）
+--- @return table<string, boolean>
+function M.effective_caps(tool_name, args, spec, opts)
+  local set = {}
+  local ok, req = pcall(M.classify, tool_name, args, spec, opts)
+  if not ok or type(req) ~= "table" then return set end
+  local ok2, res = pcall(M.resolve, req.tier or M.TIER.MINIMAL, req)
+  if not ok2 or type(res) ~= "table" or not res.ok or type(res.privileges) ~= "table" then
+    return set
+  end
+  for _, c in ipairs(res.privileges.cap_add or {}) do
+    if type(c) == "string" and c ~= "" and c ~= "ALL" then set[c] = true end
+  end
+  return set
 end
 
 --- 档位对应的信封 severity

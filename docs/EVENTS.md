@@ -140,10 +140,8 @@ vim.api.nvim_create_autocmd("User", {
 | `TOOL_APPROVAL_REQUESTED` | `tool:approval_requested` | 发起工具审批（入队） | `{ tool_name, args, agent_id }` |
 | `TOOL_APPROVED` | `tool:approved` | 审批通过 | `{ tool_name, agent_id }` |
 | `TOOL_APPROVAL_CANCELLED` | `tool:approval_cancelled` | 审批取消/拒绝 | `{ tool_name, reason, agent_id }` |
-| `AUTO_MODE_CHANGED` | `approval_mode:auto_changed` | AUTO 模式（自动允许）切换 | `{ active }` |
 
 > 审批事件携带 `agent_id`，供 Herder 等订阅者区分不同 Agent 的阻塞状态。
-> `AUTO_MODE_CHANGED` 的值为 `approval_mode:auto_changed`（注意与名不一致，属既有约定）。
 
 ### 用户提问（ask_user）
 
@@ -272,6 +270,7 @@ vim.api.nvim_create_autocmd("User", {
 | `SANDBOX_CONTAINER_PLANNED` | `sandbox:container_planned` | 容器受控计划（命名空间共享 / 受控 socket） | `{ manager, mode, share_namespace, reason, command_id }` |
 | `SANDBOX_CONTAINER_UNSUPPORTED` | `sandbox:container_unsupported` | 容器门面拒绝需宿主守护进程/远程/宿主子命令 | `{ manager, sub, reason, command_id }` |
 | `SANDBOX_BACKGROUND_ROUTED` | `sandbox:background_routed` | （保留常量）旧后台命令门面转为长驻服务时发出；后台门面已移除，不再触发 | `{ name, service_id, kind, command_id }` |
+| `SANDBOX_NET_CONSENT_REQUESTED` | `sandbox:net_consent_requested` | 沙箱外部命令访问沙箱外目标（宿主本机其他端口/外部主机）时请求用户同意 | `{ host, port, local_, proto }` |
 
 ## 4. 事件订阅最佳实践
 

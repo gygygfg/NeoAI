@@ -88,7 +88,7 @@ Under `lua/NeoAI/tests/`, tests are organized by module/feature:
 | `test_cache_strategy.lua` | Prefix caching strategy |
 | `test_cache_usage.lua` | Cache hit usage statistics |
 | `test_model_picker.lua` | Model picker |
-| `test_modes.lua` | Modes (CHAT/PLAN/AUTO) |
+| `test_modes.lua` | Modes (CHAT/PLAN) |
 | `test_multimodal.lua` | Multimodal images |
 | `test_tools.lua` | Tool system |
 | `test_tool_pending.lua` | Pending/staged tools |

@@ -157,6 +157,83 @@ local function _allow_local(host, port, ips)
   return _is_loopback(lower)
 end
 
+--- 网络访问策略：`ask`（默认）| `allow` | `deny`。`state.opts.access` 优先（测试/内部注入）。
+--- @return string
+local function _access_policy()
+  local p = state.opts.access
+  if p ~= "allow" and p ~= "deny" and p ~= "ask" then
+    local ok, cfg = pcall(function()
+      return require("NeoAI.kernel.config_store").get("tools.sandbox.network")
+    end)
+    p = (ok and type(cfg) == "table" and cfg.access) or "ask"
+  end
+  if p ~= "allow" and p ~= "deny" then p = "ask" end
+  return p
+end
+
+--- 端口是否为已登记的沙箱内部服务端口
+--- @param port number
+--- @return boolean
+local function _internal_port(port)
+  local ok, nc = pcall(require, "NeoAI.sandbox.net_consent")
+  return ok and nc.is_internal_port(port) or false
+end
+
+--- 访问门禁：沙箱内部（回环白名单/内部端口）免权限；其余按策略 ask/allow/deny。
+--- 异步（ask 时弹窗），回调 `cb(allow: boolean, reason: string)`。
+--- @param local_ boolean
+--- @param host string
+--- @param port number
+--- @param ips table|nil
+--- @param proto string
+--- @param cb function(allow: boolean, reason: string)
+local function _gate(local_, host, port, ips, proto, cb)
+  local block_reason = local_ and "host_local_blocked" or "external_blocked"
+  if local_ then
+    if _allow_local(host, port, ips) or _internal_port(port) then
+      return cb(true, "allow_local")
+    end
+    -- 自动登记沙箱内命令启动的临时监听端口：共享 netns 下无法按地址区分宿主/沙箱，
+    -- 故按 cgroup 归属识别 LISTEN socket 持有者。沙箱自己监听的回环端口免权限，
+    -- 宿主回环服务仍走 ask/deny（SSRF 防护不削弱），修复对 127.0.0.1 的过度拦截。
+    local oknc, nc = pcall(require, "NeoAI.sandbox.net_consent")
+    if oknc and nc and type(nc.is_sandbox_listening) == "function" then
+      local okv, is_sb = pcall(nc.is_sandbox_listening, port)
+      if okv and is_sb then return cb(true, "allow_local") end
+      -- 首次判定可能命中短负缓存（服务刚启动、探测发生在监听之前）：强制重新扫描一次
+      -- 沙箱域监听端口，避免把沙箱自己的服务误判为宿主回环而弹窗/拒绝（headless 下直接 deny）。
+      if type(nc.register_sandbox_listeners) == "function" then
+        local okr, ports = pcall(nc.register_sandbox_listeners)
+        if okr and type(ports) == "table" then
+          for _, p in ipairs(ports) do
+            if tonumber(p) == tonumber(port) then return cb(true, "allow_local") end
+          end
+        end
+      end
+    end
+  end
+  local policy = _access_policy()
+  if policy == "allow" then return cb(true, local_ and "allow_local" or "allow") end
+  if policy == "deny" then return cb(false, block_reason) end
+  local ok, nc = pcall(require, "NeoAI.sandbox.net_consent")
+  if not ok then return cb(false, block_reason) end
+  if nc.is_session_allowed(host, port) then
+    return cb(true, local_ and "allow_local" or "allow")
+  end
+  pcall(function()
+    require("NeoAI.kernel.event_bus").emit(
+      require("NeoAI.kernel.events").SANDBOX_NET_CONSENT_REQUESTED,
+      { host = host, port = port, local_ = local_, proto = proto })
+  end)
+  nc.request({ host = host, port = port, local_ = local_, proto = proto }):then_(function(decision)
+    if decision == "deny" then return cb(false, block_reason) end
+    if decision == "allow_session" then nc.allow_session(host, port) end
+    cb(true, local_ and "allow_local" or "allow")
+  end, function()
+    cb(false, block_reason)
+  end)
+end
+
 --- 解析主机名为规范化 IP 列表（同步，含 IP 字面量）。
 --- 统一经 getaddrinfo：它把八进制/十六进制/短式 IPv4 与全展开 IPv6 全部规范化为标准形式，
 --- 避免「字面量字符串比较」与「连接时内核解析」不一致造成的绕过。
@@ -342,19 +419,21 @@ local function _handle_http(ctx, client, header, rest)
     p = tonumber(p)
     ctx.state = "resolving"
     _classify_async(h, function(local_, ips)
-      if local_ and not _allow_local(h, p, ips) then
-        _record(h, p, "http", "block")
-        _respond(client, 403, "Forbidden", "host_local_blocked")
-        return
-      end
-      ctx.state = "connecting"
-      _open_upstream(h, ips, p, function(up)
-        _record(h, p, "http", local_ and "allow_local" or "allow")
-        pcall(function() client:write("HTTP/1.1 200 Connection Established\r\n\r\n") end)
-        _start_piping(ctx, client, up, rest)
-      end, function()
-        _record(h, p, "http", "error")
-        _respond(client, 502, "Bad Gateway", "upstream_connect_failed")
+      _gate(local_, h, p, ips, "http", function(allow, reason)
+        if not allow then
+          _record(h, p, "http", "block")
+          _respond(client, 403, "Forbidden", reason)
+          return
+        end
+        ctx.state = "connecting"
+        _open_upstream(h, ips, p, function(up)
+          _record(h, p, "http", reason)
+          pcall(function() client:write("HTTP/1.1 200 Connection Established\r\n\r\n") end)
+          _start_piping(ctx, client, up, rest)
+        end, function()
+          _record(h, p, "http", "error")
+          _respond(client, 502, "Bad Gateway", "upstream_connect_failed")
+        end)
       end)
     end)
     return
@@ -374,19 +453,21 @@ local function _handle_http(ctx, client, header, rest)
   local rewritten = header:gsub("^([^\r\n]+)", method .. " " .. path .. " HTTP/1.1", 1)
   ctx.state = "resolving"
   _classify_async(h, function(local_, ips)
-    if local_ and not _allow_local(h, p, ips) then
-      _record(h, p, "http", "block")
-      _respond(client, 403, "Forbidden", "host_local_blocked")
-      return
-    end
-    ctx.state = "connecting"
-    _open_upstream(h, ips, p, function(up)
-      _record(h, p, "http", local_ and "allow_local" or "allow")
-      pcall(function() up:write(rewritten .. "\r\n\r\n") end)
-      _start_piping(ctx, client, up, rest)
-    end, function()
-      _record(h, p, "http", "error")
-      _respond(client, 502, "Bad Gateway", "upstream_connect_failed")
+    _gate(local_, h, p, ips, "http", function(allow, reason)
+      if not allow then
+        _record(h, p, "http", "block")
+        _respond(client, 403, "Forbidden", reason)
+        return
+      end
+      ctx.state = "connecting"
+      _open_upstream(h, ips, p, function(up)
+        _record(h, p, "http", reason)
+        pcall(function() up:write(rewritten .. "\r\n\r\n") end)
+        _start_piping(ctx, client, up, rest)
+      end, function()
+        _record(h, p, "http", "error")
+        _respond(client, 502, "Bad Gateway", "upstream_connect_failed")
+      end)
     end)
   end)
 end
@@ -463,21 +544,23 @@ local function _process_socks(ctx, client)
 
     ctx.state = "resolving"
     _classify_async(host, function(local_, ips)
-      if local_ and not _allow_local(host, port, ips) then
-        _record(host, port, "socks5", "block")
-        _socks_reply(client, 2) -- connection not allowed by ruleset
-        _close(client)
-        return
-      end
-      ctx.state = "connecting"
-      _open_upstream(host, ips, port, function(up)
-        _record(host, port, "socks5", local_ and "allow_local" or "allow")
-        _socks_reply(client, 0)
-        _start_piping(ctx, client, up, rest)
-      end, function()
-        _record(host, port, "socks5", "error")
-        _socks_reply(client, 5) -- connection refused
-        _close(client)
+      _gate(local_, host, port, ips, "socks5", function(allow, reason)
+        if not allow then
+          _record(host, port, "socks5", "block")
+          _socks_reply(client, 2) -- connection not allowed by ruleset
+          _close(client)
+          return
+        end
+        ctx.state = "connecting"
+        _open_upstream(host, ips, port, function(up)
+          _record(host, port, "socks5", reason)
+          _socks_reply(client, 0)
+          _start_piping(ctx, client, up, rest)
+        end, function()
+          _record(host, port, "socks5", "error")
+          _socks_reply(client, 5) -- connection refused
+          _close(client)
+        end)
       end)
     end)
   end

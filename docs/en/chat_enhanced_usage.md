@@ -39,7 +39,7 @@ The chat window = **main message area (top)** + **input box (bottom, split, heig
 | Close window | `q` | |
 | Toggle reasoning display | `r` | `message_list.toggle_reasoning` |
 | Switch model | `M` | Opens the model selector |
-| Cycle mode | `m` | CHAT → PLAN → AUTO |
+| Cycle mode | `m` | CHAT → PLAN |
 | Cycle display mode | `<C-t>` (insert) / `T` (normal) | chat / trajectory |
 | Hot-reload display mode | `<F5>` | Reload the current display-mode plugin |
 | Approve plan | — | Run `:NeoAIApprovePlan` (or toggle the mode manually); the AI no longer holds a mode-switching tool |
@@ -87,25 +87,16 @@ Expand/collapse: `zM` (collapse all) / `zo` (expand) / `zR` (expand all).
 - After the plan is emitted the turn ends and **the user confirms** (run `:NeoAIApprovePlan` or toggle the mode
   manually); once confirmed, it switches to CHAT mode, parses the plan into a todo
   list, and executes it automatically.
-- Switching modes during generation (`m` / `:NeoAIPlan` / `:NeoAIAuto`) is deferred until the current turn ends,
+- Switching modes during generation (`m` / `:NeoAIPlan`) is deferred until the current turn ends,
   so it does not interrupt an in-progress generation.
 
-## 7. AUTO Mode
-
-`:NeoAIAuto` or `m` cycles to AUTO mode: automatically allow all tool calls (a runtime switch); when enabled it
-immediately approves currently pending/queued tools. Switching to AUTO **during generation/tool execution** also
-takes effect **immediately** (approval relaxation is decoupled from tool-set/model changes), rather than waiting
-until the end of the turn — avoiding "I switched to AUTO but this turn still keeps popping up approval dialogs".
-Leaving AUTO and switching to other modes is still deferred until the end of the turn, to avoid interrupting the
-current turn midway.
-
-## 8. Asking the User (ask_user)
+## 7. Asking the User (ask_user)
 
 During generation the AI can pause and ask the user a question via `ask_user`, waiting for the answer. The question
 popup (`ui/components/ask_user`) supports quick option selection; the answer is passed back to the AI as a tool
 result. When no UI is registered, it falls back to `vim.ui.input`.
 
-## 9. Related Documentation
+## 8. Related Documentation
 
 - [configuration.md](configuration.md): `ui.*` / `keymaps.*` configuration.
 - [ui_system.md](ui_system.md): `chat_view` internal implementation.

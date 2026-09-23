@@ -92,7 +92,11 @@ writing them as one line would make `nvim_buf_set_lines` error and half-write th
 tool fold into two. The fold placeholder text is provided uniformly by `components.fold`. **Only folds
 explicitly registered as reasoning by the renderer show `🤔 思考过程 N 行`** (`message_list` registers reasoning start
 lines after writing the buffer); tool blocks show `🔧 <tool>` and any other unrecognized fold shows a neutral
-placeholder (`📄 <first-line preview> (N lines)`), so not every fold is rendered as a thinking process. During tool
+placeholder (`📄 <first-line preview> (N lines)`), so not every fold is rendered as a thinking process. Both tool
+header lines and **registered reasoning-block start lines** return `>1` to force a new fold: when the AI emits no
+body text, the next assistant's reasoning lines directly follow the previous tool block's result lines at the same
+indentation level, and without a forced break they would be merged into that tool block (i.e. "the thinking process
+gets folded into the tool-call fold"). During tool
 execution it refreshes once per second (`TOOL_TICK_MS=1000`), so the elapsed time in the fold text ticks in real
 time; the refresh only rewrites the tool header line in place (see 4.3.1). Whether `foldclose!` is skipped is decided by
 the folds that were **already expanded before the render** (`open_folds`): if hit, skip (otherwise it would close and then
@@ -108,7 +112,7 @@ the level does not rise; combine it with the "closed-fold first line" check (`fo
 header text. Moreover, a structural change (e.g. a tool completing and appending result lines) can be written **in the
 same batch** as in-place refreshes, so this must not be gated on `inserted==removed`; otherwise the fold of a tool still
 running in the same batch is missed and its content leaks line by line outside the fold.
-When a command's **arguments or result contain a secret** (sandbox token `NEOKEY_*` or a raw secret matched by a
+When a command's **arguments or result contain a secret** (sandbox fake key or a raw secret matched by a
 named rule), a **highlighted warning** (`NeoAISecretWarning`) is appended **outside** the
 tool fold block; the fold title stays clean (no `⚠ 密钥` suffix) and the warning remains visible while collapsed.
 The warning **names the exact command/tool and the key files it obtained or used**, formatted **one item per
@@ -128,7 +132,7 @@ name → generic notice (see the secrets section of [sandbox.md](sandbox.md)). A
 sensitive env-var name** does not trigger a warning (the name is only a reference, no key content was read);
 only an env-var name in the **arguments** is reported as "used a secret". Moreover, for a tool call that
 contains a secret, its **arguments and result are shown in full (no 500-char truncation)** and the matched
-secret values (`NEOKEY_*` tokens and raw secrets matched by named rules) are highlighted inline with the same
+secret values (fake keys and raw secrets matched by named rules) are highlighted inline with the same
 `NeoAISecretWarning` group (identical in `message_list` and trajectory mode).
 **ANSI SGR colors** in command output (e.g. `\27[1;36m…\27[0m`) are parsed by `utils.ansi`: escape sequences are
 stripped from the displayed text and the colors/attributes (16/256/truecolor + bold/italic/underline/reverse/
@@ -177,11 +181,6 @@ when scrolling down with the last line already visible `_wheel_scroll` clamps th
 `ui.chat.mousescroll_max_blank` (default 3; `0` means strictly bottom-aligned): if there is too much blank space it
 scrolls back, and if too little it adds breathing room. The blank count is computed with `nvim_win_text_height`
 (correctly accounting for folds and wrapped lines), minus the 1 line taken by the winbar.
-
-> **AUTO takes effect immediately**: while the Agent is busy (generating/tool_running), `chat_service._request_mode`
-> calls `tool_service.set_auto_mode(true)` **immediately** if the target is AUTO (internally auto-approving the current
-> pending approval/queued items), rather than waiting until the end of the current turn; other mode switches
-> (toolset/model, including leaving AUTO) are still deferred and applied at the end of the current turn.
 
 ### 4.7 Background Collapse / Restore
 

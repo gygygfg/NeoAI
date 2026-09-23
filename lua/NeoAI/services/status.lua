@@ -119,7 +119,7 @@ end
 --- @return string|nil
 local function _build_part(info, part)
   if part == "mode" then
-    local label = info.mode == "auto" and "AUTO" or (info.mode == "plan" and "PLAN" or "CHAT")
+    local label = info.mode == "plan" and "PLAN" or "CHAT"
     return "[" .. label .. "]"
   elseif part == "model" then
     return _fmt_model(info.model)
@@ -463,7 +463,7 @@ function M.watch()
     events.AGENT_ABORTED, events.MODEL_SWITCHED,
     events.SESSION_LOADED, events.MESSAGE_ADDED,
     events.MESSAGE_QUEUED, events.MESSAGE_SENT,
-    events.AUTO_MODE_CHANGED, events.PLAN_MODE_CHANGED,
+    events.PLAN_MODE_CHANGED,
     events.DISPLAY_MODE_CHANGED, events.TODO_UPDATED,
     events.SANDBOX_REVIEW_ENQUEUED, events.SANDBOX_REVIEW_APPROVED,
     events.SANDBOX_REVIEW_REJECTED, events.SANDBOX_REVIEW_SUPERSEDED,

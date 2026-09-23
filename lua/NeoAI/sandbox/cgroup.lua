@@ -2,6 +2,8 @@
 --- @module NeoAI.sandbox.cgroup
 --- 每次尝试使用独立 cgroup v2 资源域，限制内存/PID/CPU（设计文档 §7.1）。
 --- 能力缺失时返回明确错误，不静默降级；limits 全为 0 时不创建。
+--- 控制器按 `cgroup.controllers` 实际可用集合逐项启用：缺失或写入失败的限制记入
+--- `handle.unavailable` 并经 `M.applied(handle)` 暴露，避免把「意图」当作「已生效」。
 
 local M = {}
 
@@ -25,9 +27,33 @@ end
 local function _write_file(path, content)
   local f = io.open(path, "w")
   if not f then return false end
-  f:write(content)
+  local ok = f:write(content)
   f:close()
-  return true
+  -- f:write 成功返回 file handle，失败返回 nil+err；必须校验，否则 EINVAL/EBUSY 被吞掉。
+  return ok ~= nil
+end
+
+--- 控制器可用集合（来自 cgroup.controllers）。
+--- @param caps table
+--- @return table<string, boolean>
+local function _controller_set(caps)
+  local set = {}
+  for _, c in ipairs((caps and caps.controllers) or {}) do set[c] = true end
+  return set
+end
+
+--- 资源域实际生效的限制（供诊断：区分「意图」与「内核已应用」）。
+--- @param handle table
+--- @return table { memory?, pids?, cpu? } 各键为 boolean（true=已写入成功）
+function M.applied(handle)
+  return (handle and handle.applied) or {}
+end
+
+--- 因控制器不可用/写入失败而未生效的限制名列表。
+--- @param handle table
+--- @return table 字符串数组
+function M.unavailable(handle)
+  return (handle and handle.unavailable) or {}
 end
 
 local function _read_file(path)
@@ -369,11 +395,13 @@ function M.prepare(attempt_id, limits)
     return nil, "SANDBOX_CGROUP_UNAVAILABLE"
   end
   local base = caps.base
-  -- 需要的控制器（root 允许同时有进程与 subtree_control）
+  local ctrls = _controller_set(caps)
+  -- 需要的控制器：仅当内核在 cgroup.controllers 中实际暴露时才请求（否则写 subtree_control
+  -- 会失败，且写 cpu.max 会 EINVAL）。缺失的控制器记入 unavailable，不虚报已限制。
   local wanted = {}
-  if (limits.memory_bytes or 0) > 0 then wanted[#wanted + 1] = "memory" end
-  if (limits.pids or 0) > 0 then wanted[#wanted + 1] = "pids" end
-  if (limits.cpu_max or 0) > 0 then wanted[#wanted + 1] = "cpu" end
+  if (limits.memory_bytes or 0) > 0 and ctrls.memory then wanted[#wanted + 1] = "memory" end
+  if (limits.pids or 0) > 0 and ctrls.pids then wanted[#wanted + 1] = "pids" end
+  if (limits.cpu_max or 0) > 0 and ctrls.cpu then wanted[#wanted + 1] = "cpu" end
   local spec = #wanted > 0 and ("+" .. table.concat(wanted, " +")) or nil
   -- 共享父域：所有并发任务挂其下。父域持有全局 CPU 预算，把控制器委派给子域；
   -- 父域自身不驻留进程（进程只在叶子子域），满足 cgroup v2「无内部进程」约束。
@@ -387,11 +415,11 @@ function M.prepare(attempt_id, limits)
     pcall(_write_file, parent .. "/cgroup.subtree_control", spec)
   end
   local global_us = 0
-  if (limits.cpu_max or 0) > 0 then
+  if (limits.cpu_max or 0) > 0 and ctrls.cpu then
     -- 父域 cpu.max = 全局预算：子域之和被限制在预算内，不再随并发数超卖。
     global_us = M.global_cpu_max() * 100000
     if global_us > 0 then
-      pcall(_write_file, parent .. "/cpu.max", tostring(global_us) .. " 100000")
+      _write_file(parent .. "/cpu.max", tostring(global_us) .. " 100000")
     end
   end
   local path = parent .. "/neoai_" .. _safe_id(attempt_id)
@@ -399,17 +427,26 @@ function M.prepare(attempt_id, limits)
   if vim.fn.isdirectory(path) ~= 1 then
     return nil, "SANDBOX_CGROUP_CREATE_FAILED: " .. path
   end
+  local applied = { memory = false, pids = false, cpu = false }
+  local unavailable = {}
   if (limits.memory_bytes or 0) > 0 then
-    pcall(_write_file, path .. "/memory.max", tostring(limits.memory_bytes))
+    if ctrls.memory then
+      applied.memory = _write_file(path .. "/memory.max", tostring(limits.memory_bytes))
+    end
+    if not applied.memory then unavailable[#unavailable + 1] = "memory" end
   end
   if (limits.pids or 0) > 0 then
-    pcall(_write_file, path .. "/pids.max", tostring(limits.pids))
+    if ctrls.pids then
+      applied.pids = _write_file(path .. "/pids.max", tostring(limits.pids))
+    end
+    if not applied.pids then unavailable[#unavailable + 1] = "pids" end
   end
   local child_cpu = M.effective_cpu_max(limits.cpu_max)
-  if child_cpu > 0 then
+  if child_cpu > 0 and ctrls.cpu then
     -- cpu.max 单位：quota period（微秒），如 "50000 100000" = 0.5 CPU
-    pcall(_write_file, path .. "/cpu.max", tostring(child_cpu) .. " 100000")
+    applied.cpu = _write_file(path .. "/cpu.max", tostring(child_cpu) .. " 100000")
   end
+  if (limits.cpu_max or 0) > 0 and not applied.cpu then unavailable[#unavailable + 1] = "cpu" end
   local handle = {
     attempt_id = attempt_id,
     path = path,
@@ -417,14 +454,21 @@ function M.prepare(attempt_id, limits)
     limits = vim.deepcopy(limits),
     cpu_max = child_cpu,
     global_cpu_max = global_us,
+    applied = applied,
+    unavailable = unavailable,
   }
   state.handles[attempt_id] = handle
+  if #unavailable > 0 then
+    require("NeoAI.kernel.logger").warn(
+      "[sandbox:cgroup] 控制器不可用或写入失败，以下限制未生效: %s (path=%s)",
+      table.concat(unavailable, ","), path)
+  end
   local diag = _diag()
   if diag.enabled then
     require("NeoAI.kernel.logger").debug(
-      "[sandbox:diag] cgroup prepare attempt=%s mem=%s pids=%s cpu=%s path=%s",
+      "[sandbox:diag] cgroup prepare attempt=%s mem=%s pids=%s cpu=%s applied=%s unavailable=%s path=%s",
       tostring(attempt_id), tostring(limits.memory_bytes or 0), tostring(limits.pids or 0),
-      tostring(child_cpu), path)
+      tostring(child_cpu), vim.inspect(applied), table.concat(unavailable, ","), path)
   end
   return handle
 end
@@ -433,7 +477,18 @@ end
 --- @param handle table
 --- @return table prefix
 function M.join_prefix(handle)
-  local procs = handle.path .. "/cgroup.procs"
+  local target = handle.path
+  -- cgroup v2 的 no-internal-process 约束：启用了 subtree_control 的 cgroup 是「内部节点」，
+  -- 不能再容纳进程，直接写其 cgroup.procs 会返回 EBUSY（Device or resource busy）。委派给
+  -- 沙箱的可写叶子正是这种内部节点（供 systemd/AI 创建子 cgroup）。此时在其下建一个进程
+  -- 承载子域，把载荷放进去；上层层级限额仍然物理封顶。
+  local ctrl = _read_file(target .. "/cgroup.subtree_control")
+  if ctrl and ctrl:gsub("%s", "") ~= "" then
+    local child = target .. "/payload"
+    if vim.fn.isdirectory(child) ~= 1 then pcall(vim.fn.mkdir, child, "p") end
+    if vim.fn.isdirectory(child) == 1 then target = child end
+  end
+  local procs = target .. "/cgroup.procs"
   return { "sh", "-c", "echo $$ > '" .. procs .. "'; exec \"$@\"", "sh" }
 end
 
@@ -517,10 +572,11 @@ function M.prepare_delegated(id, limits)
   if vim.fn.isdirectory(parent) ~= 1 then
     return nil, "SANDBOX_CGROUP_CREATE_FAILED: " .. parent
   end
+  local avail = _controller_set(caps)
   local ctrls = {}
-  if (limits.memory_bytes or 0) > 0 then ctrls[#ctrls + 1] = "memory" end
-  if (limits.pids or 0) > 0 then ctrls[#ctrls + 1] = "pids" end
-  if (limits.cpu_max or 0) > 0 then ctrls[#ctrls + 1] = "cpu" end
+  if (limits.memory_bytes or 0) > 0 and avail.memory then ctrls[#ctrls + 1] = "memory" end
+  if (limits.pids or 0) > 0 and avail.pids then ctrls[#ctrls + 1] = "pids" end
+  if (limits.cpu_max or 0) > 0 and avail.cpu then ctrls[#ctrls + 1] = "cpu" end
   local spec = #ctrls > 0 and ("+" .. table.concat(ctrls, " +")) or nil
   if spec then
     pcall(_write_file, caps.base .. "/cgroup.subtree_control", spec)
@@ -531,20 +587,50 @@ function M.prepare_delegated(id, limits)
   if vim.fn.isdirectory(path) ~= 1 then
     return nil, "SANDBOX_CGROUP_CREATE_FAILED: " .. path
   end
-  -- 委派控制器给子域（systemd 需要以之创建 service/app slice）。
-  if spec then pcall(_write_file, path .. "/cgroup.subtree_control", spec) end
-  -- 资源限制按层级生效（子域进程同样受此约束）。
+  -- 父域全局 CPU 预算（与一次性路径一致）：委派子域之和受此物理封顶，避免「记账封顶但
+  -- 物理分配不受控」——此前 prepare_delegated 只设子域 cpu.max，未设父域预算。
+  if (limits.cpu_max or 0) > 0 and avail.cpu then
+    local global_us = M.global_cpu_max() * 100000
+    if global_us > 0 then _write_file(parent .. "/cpu.max", tostring(global_us) .. " 100000") end
+  end
+  -- 限额写在 path 上（path **不暴露**给沙箱）：沙箱只看到可写叶子 leaf，即便抬升 leaf 的
+  -- memory.max/cpu.max，path 的限额仍按层级物理封顶（cgroup v2 层级限制）。
+  local applied = { memory = false, pids = false, cpu = false }
+  local unavailable = {}
   if (limits.memory_bytes or 0) > 0 then
-    pcall(_write_file, path .. "/memory.max", tostring(limits.memory_bytes))
+    if avail.memory then
+      applied.memory = _write_file(path .. "/memory.max", tostring(limits.memory_bytes))
+    end
+    if not applied.memory then unavailable[#unavailable + 1] = "memory" end
   end
   if (limits.pids or 0) > 0 then
-    pcall(_write_file, path .. "/pids.max", tostring(limits.pids))
+    if avail.pids then
+      applied.pids = _write_file(path .. "/pids.max", tostring(limits.pids))
+    end
+    if not applied.pids then unavailable[#unavailable + 1] = "pids" end
   end
   local child_cpu = M.effective_cpu_max(limits.cpu_max)
-  if child_cpu > 0 then
-    pcall(_write_file, path .. "/cpu.max", tostring(child_cpu) .. " 100000")
+  if child_cpu > 0 and avail.cpu then
+    applied.cpu = _write_file(path .. "/cpu.max", tostring(child_cpu) .. " 100000")
   end
-  return { path = path, parent = parent, limits = vim.deepcopy(limits) }
+  if (limits.cpu_max or 0) > 0 and not applied.cpu then unavailable[#unavailable + 1] = "cpu" end
+  if #unavailable > 0 then
+    require("NeoAI.kernel.logger").warn(
+      "[sandbox:cgroup] 委派域控制器不可用或写入失败，以下限制未生效: %s (path=%s)",
+      table.concat(unavailable, ","), path)
+  end
+  -- 暴露给沙箱的可写叶子：path 委派控制器给 leaf；leaf 再向下委派，供 systemd/AI 建子 cgroup。
+  local leaf = path .. "/leaf"
+  if spec then pcall(_write_file, path .. "/cgroup.subtree_control", spec) end
+  vim.fn.mkdir(leaf, "p")
+  if vim.fn.isdirectory(leaf) ~= 1 then
+    return nil, "SANDBOX_CGROUP_CREATE_FAILED: " .. leaf
+  end
+  if spec then pcall(_write_file, leaf .. "/cgroup.subtree_control", spec) end
+  return {
+    path = leaf, limit_path = path, parent = parent,
+    limits = vim.deepcopy(limits), applied = applied, unavailable = unavailable,
+  }
 end
 
 --- 递归删除空的 cgroup 目录树（best-effort；调用前应先 kill 并等进程退出）。
@@ -565,14 +651,16 @@ end
 --- @param handle table|nil
 function M.release_delegated(handle)
   if not handle or not handle.path then return end
-  pcall(_write_file, handle.path .. "/cgroup.kill", "1")
+  -- 从限额层（未暴露）递归删除，连同可写叶子 leaf 一并清理。
+  local root = handle.limit_path or handle.path
+  pcall(_write_file, root .. "/cgroup.kill", "1")
   local deadline = vim.uv.hrtime() + 500 * 1e6
   while vim.uv.hrtime() < deadline do
-    local raw = _read_file(handle.path .. "/cgroup.procs")
+    local raw = _read_file(root .. "/cgroup.procs")
     if not raw or raw:gsub("%s", "") == "" then break end
     vim.wait(20)
   end
-  _rmdir_tree(handle.path)
+  _rmdir_tree(root)
 end
 
 --- 重置（测试用）

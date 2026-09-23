@@ -10,6 +10,15 @@ local async = require("NeoAI.utils.async")
 
 local M = {}
 
+-- 出网守卫（由沙箱密钥防护注册；返回 Deferred 则在真正发送前 await，reject 则阻止发送）。
+local _guard = nil
+
+--- 注册出网守卫（nil 注销）。guard(opts, callbacks) -> Deferred|nil
+--- @param fn function|nil
+function M.set_guard(fn)
+  _guard = fn
+end
+
 -- 流式成功响应只经 on_chunk 交付；仅保留有界错误体供诊断/溢出恢复。
 local MAX_STREAM_ERROR_BYTES = 64 * 1024
 
@@ -208,6 +217,17 @@ function M.request(opts, callbacks)
   callbacks = callbacks or {}
   if callbacks.signal and callbacks.signal:aborted() then
     return async.reject({ kind = "aborted", message = callbacks.signal:reason() })
+  end
+  -- 出网守卫：向非白名单地址发送密钥时弹窗阻止。仅检查一次（重入时跳过）。
+  if _guard and not opts._egress_checked then
+    local g = _guard(opts, callbacks)
+    if g ~= nil then
+      return g:then_(function()
+        local o = vim.tbl_extend("force", {}, opts)
+        o._egress_checked = true
+        return M.request(o, callbacks)
+      end)
+    end
   end
   local curl = _which_curl()
   if not curl then

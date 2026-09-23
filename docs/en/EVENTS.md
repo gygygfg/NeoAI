@@ -140,10 +140,8 @@ All event constants are defined in `NeoAI.kernel.events`. They are listed below 
 | `TOOL_APPROVAL_REQUESTED` | `tool:approval_requested` | Tool approval initiated (enqueued) | `{ tool_name, args, agent_id }` |
 | `TOOL_APPROVED` | `tool:approved` | Approval granted | `{ tool_name, agent_id }` |
 | `TOOL_APPROVAL_CANCELLED` | `tool:approval_cancelled` | Approval cancelled/rejected | `{ tool_name, reason, agent_id }` |
-| `AUTO_MODE_CHANGED` | `approval_mode:auto_changed` | AUTO mode (auto-allow) toggled | `{ active }` |
 
 > Approval events carry `agent_id` so subscribers such as Herder can distinguish the blocked state of different Agents.
-> The value of `AUTO_MODE_CHANGED` is `approval_mode:auto_changed` (note that it does not match the name; this is an existing convention).
 
 ### User Prompts (ask_user)
 

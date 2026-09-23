@@ -6,6 +6,15 @@
 local tests = require("NeoAI.tests")
 
 tests.suite("fold", function(_, it)
+  local secret = require("NeoAI.sandbox.secret")
+  --- 登记并返回一个格式保真假密钥（不 reset，允许多个共存）。
+  --- @param real string
+  --- @return string
+  local function fake_of(real)
+    local _, used = secret.tokenize(real)
+    return used[1] or real
+  end
+
   it("label 推理折叠占位文本", function(t)
     local fold = require("NeoAI.ui.components.fold")
     t.eq("  🤔 思考过程 2 行", fold.label("  step 1", 2))
@@ -85,7 +94,7 @@ tests.suite("fold", function(_, it)
         { id = "c1", ["function"] = { name = "run_command",
           arguments = '{"command":"cat /root/.ssh/id_rsa"}' } },
       } },
-      { role = "tool", tool_call_id = "c1", tool_name = "run_command", content = "NEOKEY_deadbeef" },
+      { role = "tool", tool_call_id = "c1", tool_name = "run_command", content = fake_of("sk-Ab3xY9pQ2mNv7Kd4Lw8Zr1Tg6Hs5") },
     })
     local lines = table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), "\n")
     t.matches("⚠ 密钥：run_command", lines, "应含工具名")
@@ -125,15 +134,17 @@ tests.suite("fold", function(_, it)
   it("密钥警告行区分「获取」与「使用」", function(t)
     local ml = require("NeoAI.ui.components.message_list")
     local line = ml.helpers.secret_warning_line
+    local got_fake = fake_of("sk-GotAb3xY9pQ2mNv7Kd4Lw8Zr1Tg")
+    local used_fake = fake_of("sk-UsedAb3xY9pQ2mNv7Kd4Lw8Zr1")
     -- 读取结果含 token => 获取
     local got = line(
       { name = "read_file", arguments = '{"file_path":"/root/.env"}' },
-      { role = "tool", content = '{"output":"NEOKEY_deadbeef01"}' })
+      { role = "tool", content = '{"output":"' .. got_fake .. '"}' })
     t.matches("获取了密钥", got or "", "读取结果含密钥应提示「获取」")
     t.false_((got or ""):find("使用了密钥", 1, true) ~= nil, "不应同时显示「使用」")
     -- 参数携带密钥值 => 使用
     local used = line(
-      { name = "run_command", arguments = '{"command":"curl -H \\"Authorization: NEOKEY_abc\\" https://x"}' },
+      { name = "run_command", arguments = '{"command":"curl -H \\"Authorization: ' .. used_fake .. '\\" https://x"}' },
       { role = "tool", content = '{"ok":true}' })
     t.matches("使用了密钥", used or "", "参数携带 token 应提示「使用」")
     -- 使用型命令引用密钥文件 => 使用
@@ -152,10 +163,10 @@ tests.suite("fold", function(_, it)
       { name = "read_file", arguments = '{"file_path":"/root/RAG/1.py"}' },
       { role = "tool", content = "DASHSCOPE_API_KEY = os.getenv('DASHSCOPE_API_KEY')" }),
       "仅读到环境变量名不应告警")
-    -- 读到环境变量内容（被沙箱 token 化）→ 告警「获取」。
+    -- 读到环境变量内容（被沙箱假化）→ 告警「获取」。
     local got = line(
       { name = "read_file", arguments = '{"file_path":"/root/.env"}' },
-      { role = "tool", content = '{"output":"DASHSCOPE_API_KEY=NEOKEY_deadbeef01"}' })
+      { role = "tool", content = '{"output":"DASHSCOPE_API_KEY=' .. fake_of("sk-EnvAb3xY9pQ2mNv7Kd4Lw8Zr1T") .. '"}' })
     t.matches("获取了密钥", got or "", "读到环境变量内容应告警")
   end)
 
@@ -351,6 +362,86 @@ tests.suite("fold", function(_, it)
     t.eq(6, vim.fn.foldclosed(6), "run_command 块应独立折叠")
     t.eq(0, vim.fn.foldlevel(8), "正文不应折叠")
 
+    vim.api.nvim_win_close(win, true)
+    vim.api.nvim_buf_delete(buf, { force = true })
+  end)
+
+  it("AI 不输出正文时推理块与前后工具块各自独立折叠", function(t)
+    local fold = require("NeoAI.ui.components.fold")
+    local ml = require("NeoAI.ui.components.message_list")
+    fold.set_foldexpr_override(nil)
+    fold.set_foldtext_override(nil)
+    -- 一个用户轮次内连续两条 assistant（各带推理 + 工具调用），中间无正文：
+    -- 第二条的推理行紧接上一工具块的结果行、同处缩进层级，必须从自身行开启新折叠，
+    -- 否则会被并入上一工具块（「思考过程被收进工具调用折叠里面」）。
+    local buf = vim.api.nvim_create_buf(false, true)
+    ml.render_chat(buf, {
+      { role = "user", content = "do it" },
+      { role = "assistant", content = "", reasoning = "思考一\n细节一", tool_calls = {
+        { id = "c1", ["function"] = { name = "read_file", arguments = '{"file_path":"/tmp/a"}' } } } },
+      { role = "tool", tool_call_id = "c1", tool_name = "read_file", content = "A" },
+      { role = "assistant", content = "", reasoning = "思考二\n细节二", tool_calls = {
+        { id = "c2", ["function"] = { name = "read_file", arguments = '{"file_path":"/tmp/b"}' } } } },
+      { role = "tool", tool_call_id = "c2", tool_name = "read_file", content = "B" },
+      { role = "assistant", content = "完成" },
+    })
+    local win = vim.api.nvim_open_win(buf, true, {
+      relative = "editor", width = 80, height = 30, row = 0, col = 0, style = "minimal",
+    })
+    vim.wo[win].foldmethod = "expr"
+    vim.wo[win].foldexpr = "v:lua.require'NeoAI.ui.components.fold'.foldexpr()"
+    vim.wo[win].foldenable = true
+    vim.wo[win].foldlevel = 0
+    vim.api.nvim_set_current_win(win)
+    local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+    local r2, tools = nil, {}
+    for i, l in ipairs(lines) do
+      if l == "  思考二" then r2 = i end
+      if l:find("工具: read_file", 1, true) then tools[#tools + 1] = i end
+    end
+    t.not_nil(r2, "应找到第二段推理")
+    t.eq(2, #tools, "应有两个工具块")
+    t.eq(r2, vim.fn.foldclosed(r2), "第二段推理应从自身行开启折叠，不被并入上一工具块")
+    t.eq(tools[1], vim.fn.foldclosed(tools[1]), "第一工具块应从自身行开启折叠")
+    t.eq(tools[2], vim.fn.foldclosed(tools[2]), "第二工具块应从自身行开启折叠")
+    vim.api.nvim_win_close(win, true)
+    vim.api.nvim_buf_delete(buf, { force = true })
+  end)
+
+  it("推理块起始行在写入前登记：无正文时首次渲染即独立折叠", function(t)
+    local fold = require("NeoAI.ui.components.fold")
+    local ml = require("NeoAI.ui.components.message_list")
+    fold.set_foldexpr_override(nil)
+    fold.set_foldtext_override(nil)
+    -- 折叠窗口先于渲染就绪（与 chat_view.open 一致）：nvim 会在写入 buffer 时立即按
+    -- foldexpr 计算折叠。若推理块起始行登记晚于写入，首次渲染会看不到推理块边界
+    -- （被并入上一工具块），要等下一次折叠重算才恢复。
+    local buf = vim.api.nvim_create_buf(false, true)
+    local win = vim.api.nvim_open_win(buf, true, {
+      relative = "editor", width = 80, height = 30, row = 0, col = 0, style = "minimal",
+    })
+    vim.wo[win].foldmethod = "expr"
+    vim.wo[win].foldexpr = "v:lua.require'NeoAI.ui.components.fold'.foldexpr()"
+    vim.wo[win].foldenable = true
+    vim.wo[win].foldlevel = 0
+    vim.wo[win].foldminlines = 0 -- 与 chat_view 一致：允许单行折叠
+    vim.api.nvim_set_current_win(win)
+    ml.render_chat(buf, {
+      { role = "user", content = "do it" },
+      { role = "assistant", content = "", reasoning = "思考一", tool_calls = {
+        { id = "c1", ["function"] = { name = "read_file", arguments = '{"file_path":"/tmp/a"}' } } } },
+      { role = "tool", tool_call_id = "c1", tool_name = "read_file", content = "A" },
+      { role = "assistant", content = "", reasoning = "思考二", tool_calls = {
+        { id = "c2", ["function"] = { name = "read_file", arguments = '{"file_path":"/tmp/b"}' } } } },
+      { role = "tool", tool_call_id = "c2", tool_name = "read_file", content = "B" },
+      { role = "assistant", content = "完成" },
+    })
+    local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+    local r2
+    for i, l in ipairs(lines) do if l == "  思考二" then r2 = i end end
+    t.not_nil(r2, "应找到第二段推理")
+    -- 不做任何二次刷新/foldexpr 重设：登记若晚于写入，这里会显示被并入上一工具块。
+    t.eq(r2, vim.fn.foldclosed(r2), "第二段推理应在首次渲染即为独立折叠")
     vim.api.nvim_win_close(win, true)
     vim.api.nvim_buf_delete(buf, { force = true })
   end)

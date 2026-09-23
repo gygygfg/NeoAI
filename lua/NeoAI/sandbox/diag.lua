@@ -211,6 +211,9 @@ function M.sandbox_limits()
   -- 已解析的沙箱限制。
   local ok_c, cgroup = pcall(require, "NeoAI.sandbox.cgroup")
   if ok_c and cgroup then
+    -- 内核实际暴露的控制器：resolved_limits 是「意图」，控制器缺失时对应限制不会生效。
+    local ok_caps, caps = pcall(cgroup.capabilities)
+    if ok_caps and type(caps) == "table" then out.cgroup_controllers = caps.controllers end
     local ok_l, limits = pcall(cgroup.resolve_limits)
     if ok_l then out.resolved_limits = limits end
     -- 容器/宿主 cgroup 实际配额（容器内 /proc/meminfo 常为宿主值，故单独展示）。

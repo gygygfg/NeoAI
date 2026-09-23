@@ -104,7 +104,7 @@ ensures there are no leftover subscriptions or state between tests.
 | `test_protocol_adapter` | Protocol encoding and decoding |
 | `test_prompt_cache / test_cache_strategy / test_cache_usage` | Explicit cache, prefix cache strategy, cache hit usage |
 | `test_model_picker` | Model picker |
-| `test_modes` | Modes (CHAT/PLAN/AUTO) |
+| `test_modes` | Modes (CHAT/PLAN) |
 | `test_multimodal` | Multimodal images |
 | `test_tools / test_tool_pending` | Tool execution, pending/staged tools |
 | `test_max_tokens / test_truncation` | max_tokens sending strategy, output truncation and continuation |
@@ -126,9 +126,12 @@ ensures there are no leftover subscriptions or state between tests.
 | `test_sandbox_instance` | Sandbox per-process instance isolation: instance store roots mutually invisible, hot reload keeps this instance's pending queue, `init` does not block on runtime probe (lazy), dead-instance directory reclamation |
 | `test_sandbox_service` | Long-lived services/mirrors/diagnostics: service start/logs/status/stop and registry cleanup, capturing service changes back into staging on stop, graceful stop (SIGTERM graceful exit / SIGKILL on timeout / `stop_all`), `long_lived` gate branch, pip/npm/maven mirror injection (incl. settings.xml), cgroup event snapshot and OOM detection |
 | `test_sandbox_background` | Background processes / session-resident instance: `&`/nohup/setsid detection (excluding `&&`/redirection/mid-command `&`), with `resident` enabled `run_command` background processes survive across tool calls (visible to `ps` in the same namespace), non-background commands return normally |
-| `test_sandbox_systemd_user` | Nested real `systemd --user`: a real user manager starts inside the resident sandbox, `systemctl --user` runs natively, user units execute in-sandbox with unit files/runtime state not landing on the host; `--user` parses to the native route |
-| `test_sandbox_symlink` | Symlink candidates: `stage_link` → finish → merge → publish creates the real symlink; `systemctl --user enable` and the system-level facade `systemctl enable` symlinks are captured as candidates without landing on the host |
-| `test_sandbox_systemd` | systemctl facade (option A): standalone-call parsing and routing, unit parsing and type gating, dependency closure (Requires/Wants/After, missing deps), start/status/is-active/stop running inside the sandbox, unsupported semantics rejected explicitly (no host fallback), gate interception without calling host systemctl |
+| `test_sandbox_systemd_user` | Fake `systemd --user` parser: `systemctl --user` is handled by the facade (start/stop/is-active), user units run in-sandbox with unit files/runtime state not landing on the host; `--user` parses to facade+scope=user |
+| `test_sandbox_symlink` | Symlink candidates: `stage_link` → finish → merge → publish creates the real symlink; `systemctl --user enable` and the system-level facade `systemctl enable` symlinks are captured as candidates without landing on the host (returns real `Created symlink …` text) |
+| `test_sandbox_systemd` | systemctl facade (option A): standalone-call parsing and routing, unit parsing and type gating, dependency closure (Requires/Wants/After, missing deps), silent `start` success, real-style `status`/`is-active`/`is-system-running`/`is-failed` output and exit codes, unsupported verbs return real errors (no sandbox leakage), gate interception without calling host systemctl |
+| `test_sandbox_maintscript` | systemd facade entry: `process_prefix` binds the thin entry over the real binary paths (no more PATH-prepended `/tmp/.dynbin`), package installs inject policy-rc.d, and the entry forwards over file IPC to the Lua facade (stdout/stderr/exit code match real systemctl) |
+| `test_net_consent` | Sandbox network consent: ask/allow/deny policy, internal-port registration is permission-free, headless fail-closed, prompt allow_once/deny/allow_session memory, external targets handled per policy |
+| `test_sandbox_overlay_invalidate` | Overlay view sync: after publish/reject `resident.sync_real` makes commands read the new real content (no stale materialization; view-split fix); permission-bit changes trigger re-materialization |
 
 ### 5.1 Sandbox Escape / Info-leak Audit (`scripts/sandbox_audit.lua`)
 

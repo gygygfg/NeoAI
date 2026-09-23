@@ -103,10 +103,10 @@ context_cache = {
   enabled = true,
   context_window = 64000,       -- Context window fallback: an explicit non-default user value wins, otherwise it is derived from the model capability table
   threshold_ratio = 0.8,        -- Reaching this ratio triggers background async compaction (non-blocking, no window; explicit-cache models use a more conservative value)
-  retain_ratio = 0.16,          -- Proportion of recent history retained for overflow recovery (regular compaction folds round 1 through the second-to-last round)
-  retain_min_tokens = 4096,     -- Lower bound for the retained tail during overflow recovery
+  retain_ratio = 0.16,          -- Proportion of recent history retained (single-round fallback / overflow recovery; regular compaction folds round 1 through the second-to-last round)
+  retain_min_tokens = 4096,     -- Lower bound for the retained tail (single-round fallback / overflow recovery)
   compact_max_tokens = 8192,    -- Max output for the compaction summary
-  min_shadow_messages = 2,      -- Minimum messages to collapse during overflow recovery (regular compaction uses the round range)
+  min_shadow_messages = 2,      -- Minimum messages to collapse (overflow recovery / single-round fallback; regular compaction uses the round range)
   compaction_retries = 1,       -- Retries when still above the threshold (regular compaction stops when no new messages are foldable)
   prune_enabled = true,         -- Perform model-agnostic tool-result pruning before summarization
   prune_threshold_chars = 8192, -- Only tool results whose text code points exceed this value are pruned
@@ -118,7 +118,9 @@ context_cache = {
 ```
 
 > **Compaction behavior**: regular (threshold-triggered) compaction runs **asynchronously in the background and non-blocking** — it folds round 1
-> through the second-to-last round (keeping the last round intact) and, once the summary completes, writes a **compaction overlay** (`agent.compaction`).
+> through the second-to-last round (keeping the last round intact). When there is no earlier user round to fold (a single-round long tool loop),
+> it falls back to a balanced head reduction using `retain_ratio`/`retain_min_tokens`, folding the earlier rounds of the current turn while
+> keeping the recent tail (the cut point keeps `tool_calls` paired with their results). Once the summary completes, it writes a **compaction overlay** (`agent.compaction`).
 > Subsequent requests and further compactions use the compacted replacement, while chat rendering and session persistence keep the **original context**
 > (the overlay is persisted in `session.metadata.compaction` and survives a restart). Compaction opens **no floating window**. Context-overflow
 > recovery (`force_compact`) still blocks and awaits, and uses `retain_ratio`/`retain_min_tokens`/`min_shadow_messages` for a maximal reduction.
@@ -286,6 +288,11 @@ sandbox = {
     "/usr/share",                  -- runtime shared data (nodejs/dotnet/java/git-core/terminfo, ...)
     "/usr/local/bin", "/usr/local/sbin", "/usr/local/lib", "/usr/local/libexec", "/usr/local/include", "/usr/local/go",
     "/var/lib",                    -- host package DB (dpkg/apt/rpm, ...); dangerous subpaths still masked
+    -- Language runtime / venv interpreters (uv/pyenv/virtualenv): a venv's bin/python is usually a
+    -- symlink into these dirs; if not exposed with read_all=false, `python` dangles after activation
+    -- (command not found)
+    "/usr/share/pyenv", "~/.pyenv", "~/.local/share/uv/python", "~/.local/share/virtualenvs",
+    "~/.virtualenvs", "~/.local/bin", "~/.nvm", "~/.cargo", "~/.rustup",
   },
   readonly_paths = { "/etc/ld.so.cache", "/etc/passwd", "/etc/group", "/etc/nsswitch.conf",
     "/etc/hosts", "/etc/ssl", "/etc/alternatives", "/etc/localtime",
@@ -376,11 +383,13 @@ sandbox = {
     stop_timeout_ms = 5000,  -- max wait for graceful exit (SIGTERM first) before SIGKILL
     auto_background = true,  -- retained constant (old background facade removed; no longer emitted)
   },
-  -- systemctl facade (option A): standalone `systemctl`/`journalctl` calls from the AI are routed
-  -- to in-sandbox long-lived services (reusing sandbox.service); the host systemd is never called
-  -- and the host is never modified. Supports simple/exec/oneshot and Requires/Wants/After/Before
-  -- dependencies; Type=notify/forking/dbus and socket/timer units fail explicitly; verbs the facade
-  -- does not handle fall back to the existing T2/hostop proposal path.
+  -- systemctl facade (option A): all parsing/implementation is in Lua (sandbox/systemd); inside the
+  -- sandbox /usr/bin/systemctl and /usr/bin/journalctl are thin entries (bash file-IPC clients) that
+  -- forward argv to the host facade and return the real stdout/stderr/exit code. Standalone calls are
+  -- routed by the gate; script/pipeline calls go through the entry to the same facade; the host
+  -- systemd is never called and the host is never modified. Supports simple/exec/oneshot and
+  -- Requires/Wants/After/Before dependencies; Type=notify/forking/dbus and socket/timer units fail
+  -- explicitly; verbs the facade does not handle fall back to the existing T2/hostop proposal path.
   systemd = {
     enabled = true,          -- master switch
     mode = "facade",         -- facade (default): handled inside the sandbox
@@ -389,16 +398,23 @@ sandbox = {
       "/etc/systemd/system", "/run/systemd/system",
       "/usr/lib/systemd/system", "/lib/systemd/system",
     },
-    -- Nested real systemd --user (requires resident): starts a real user manager inside the
-    -- resident sandbox instance; `systemctl --user` hits real semantics; unit files stage in the
-    -- workspace overlay, cgroups are confined to a delegated subtree, nothing lands on the host.
-    -- On by default; skipped automatically when prerequisites (bwrap + dbus-daemon + systemd) are
-    -- missing. Note: enabling it makes the first resident start wait for the user manager (a few
-    -- seconds); disable if you do not need user-level systemd.
+    -- Fake systemd --user parser: `systemctl --user` is parsed by the facade from the user unit
+    -- roots and handles simple start/stop/is-active/status/show/cat/list-units/daemon-reload plus
+    -- enable/disable (symlinks staged). Does not start a real systemd/dbus (more stable in temp
+    -- sandboxes). On by default; with enabled=false, `--user` reports an error.
     user = { enabled = true },
+    -- User unit-file search dirs (sandbox staging copy first, then real file). Defaults shown.
+    -- user_unit_roots = { "~/.config/systemd/user", "/etc/systemd/user", "/usr/lib/systemd/user" },
     -- System-level systemctl enable/disable: parse [Install] WantedBy/RequiredBy and stage the
     -- symlink changes as review candidates, applied after approval; nothing lands on the host.
     stage_install = true,
+    -- Maintenance-script compatibility stubs (on by default): package install dpkg/apt postinst
+    -- scripts call invoke-rc.d/deb-systemd-invoke/systemctl; the sandbox PID 1 is not systemd and
+    -- has no system dbus, so calling the host systemctl fails to connect. Additionally injects
+    -- policy-rc.d (deny service actions, exit 101) for package install commands so the install
+    -- succeeds while services are not actually started (run them in the foreground in the sandbox).
+    -- The systemctl/journalctl entry itself is controlled by `enabled` and applies to all commands.
+    maintscript_stubs = true,
   },
   network = {
     enabled = false, allowed_endpoints = {}, budget_bytes = 0, -- controlled network gateway
@@ -407,8 +423,17 @@ sandbox = {
     -- host-local targets are blocked, external targets allowed and recorded. Application-layer
     -- boundary: raw TCP that ignores the proxy can bypass it (see docs/en/sandbox.md §6.1).
     host_local_block = true,
+    block_proxy_evasion = true,      -- when host_local_block is active, reject commands that explicitly clear/bypass proxies (unset *proxy, env -u, --noproxy, --proxy ""), preventing the filter from being defeated to reach the host directly
     host_local_proxy_port = 0,       -- host filtering proxy port (0 = random loopback port)
-    allow_localhost_ports = {},      -- localhost port allowlist (empty = block all): only loopback + these ports are allowed (e.g. self-testing a service inside the sandbox on 5432/6379); host NIC IPs / link-local / cloud metadata are never allowed
+    allow_localhost_ports = {},      -- localhost port allowlist (empty = block all): only loopback + these ports are allowed (e.g. self-testing a service inside the sandbox on 5432/6379); host NIC IPs / link-local / cloud metadata are never allowed. Temporary listeners started by sandbox commands are auto-registered by cgroup membership and need not be listed here
+    -- Sandbox network access policy: processes/ports created inside the sandbox (loopback +
+    -- allow_localhost_ports + registered service ports) are accessible within the sandbox without
+    -- permission; access to outside the sandbox (other host-local ports, host NICs, external
+    -- hosts) follows this policy:
+    --   "ask" (default) = prompt the user for consent (fail-closed when headless / no UI);
+    --   "allow"         = allow directly and record (previous behaviour);
+    --   "deny"          = deny directly.
+    access = "ask",
     -- Proxy policy for sandbox external commands: strip (default: do not pass host proxies into the
     -- sandbox; e.g. mihomo only proxies opencode itself, avoiding an unreachable host
     -- HTTPS_PROXY=127.0.0.1:7890 breaking pip/npm) | passthrough (keep host proxies) |
@@ -545,7 +570,7 @@ sandbox = {
     apt_sandbox_user = "root", -- apt family: injects APT::Sandbox::User (default "root" disables apt's own `_apt` privilege drop, avoiding setgroups EPERM in nested userns/restricted containers that makes apt update/install fail); "_apt" or empty keeps apt defaults
   },
   lsp_overlay = { enabled = true }, -- AI-only sandboxed LSP: servers cloned by the AI lsp_* tools read staged content (on by default, bwrap+overlay only; falls back to editor clients when unavailable)
-  secrets = { enabled = true, min_length = 20, max_length = 200, min_entropy = 3.5, min_distinct = 8, exclude_pure_hex = true, entropy_requires_context = true, entropy_secret_paths_only = true, generated_scan_max_bytes = 2097152, generated_scan_max_files = 200, tokenize_env = true, extra_rules = {}, allowlist = {} }, -- Secret/sensitive guard: entropy + named rules (private-key blocks/AKIA/ghp_/sk-/JWT/Bearer…) + token mapping; env values whose names contain KEY/TOKEN/SECRET/PASSWORD/CREDENTIAL are force-tokenized; bare entropy runs require a -/_ separator and must not be a code identifier (snake_case function/constant names) or a sensitive-name context (narrowed scope to avoid corrupting integrity/build hashes/traceback function names/path components); non-sensitive-named env values containing / are redacted by named rules only (never breaking PATH/LD_LIBRARY_PATH); with entropy_secret_paths_only=true the full-text entropy scan runs only on suspected secret files (~/.ssh, ~/.bashrc, /etc/*, etc. per secret.is_secret_path), other files use named rules only; generated_scan_max_bytes/generated_scan_max_files bound the AI-generated high-entropy detection (detect_generated) scan budget so large candidates do not stall the main thread file-by-file (0 = unlimited)
+  secrets = { enabled = true, min_length = 20, max_length = 200, min_entropy = 3.5, min_distinct = 8, exclude_pure_hex = true, entropy_requires_context = true, entropy_secret_paths_only = true, generated_scan_max_bytes = 2097152, generated_scan_max_files = 200, tokenize_env = true, binary_fake = true, disclose_fakes = false, flow_tracking = true, alert = { enabled = true, timeout_ms = 0 }, trusted_services = {}, auto_trust_providers = true, extra_rules = {}, allowlist = {} }, -- Secret/sensitive guard: entropy + named rules (private-key blocks/AKIA/ghp_/sk-/JWT/Bearer…) + **format-preserving fake keys** (same length / character classes / entropy >= original; in-process map never persisted); env values whose names contain KEY/TOKEN/SECRET/PASSWORD/CREDENTIAL are force-faked; bare entropy runs require a -/_ separator and must not be a code identifier or a sensitive-name context; non-sensitive-named env values containing / are handled by named rules only (never breaking PATH/LD_LIBRARY_PATH); with entropy_secret_paths_only=true the full-text entropy scan runs only on suspected secret files. A **fake key** in tool args/AI context warns the user (non-blocking); a **real key** immediately stops the Agent and pops a confirm dialog, continuing only after user confirmation (fail-closed when headless/no UI). binary_fake=true fakes sensitive binary key files (.p12/.pfx/keystore/raw key) on read/stage with same-length random bytes (base64 marker transport; restored exactly on write/exec). flow_tracking=true records each fake key's origin and every flow sink (tool/command/env/disk); files derived through irreversible command/script transforms are marked "opaque-derived" and force manual confirmation before publish. trusted_services is the egress whitelist (exact host / `*.suffix` / IP / CIDR): sending a key to a whitelisted host never warns or pops; auto_trust_providers=true auto-trusts configured model-provider base_url hosts; disclose_fakes=true tells the AI these are fake (off by default to preserve format fidelity)
   retention = { candidate_days = 7, max_pending = 20 },
   policy = {
     version = "1",                 -- policy version (for audit replay; bump when rules change)

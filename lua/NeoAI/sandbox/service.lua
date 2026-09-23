@@ -123,7 +123,7 @@ local function _build(svc, opts)
   for _, r in ipairs(candidate.staged_overlay_roots(known)) do extra[#extra + 1] = r end
   local specs = wrapper.build_overlay_specs(real_cwd, svc_dir, extra)
   for _, s in ipairs(specs) do
-    if runtime.overlay_available() and runtime.overlay_writable(s.root, s.upper, s.work) then
+    if runtime.overlay_writable(s.root, s.upper, s.work) then
       s.mode = "overlay"
     else
       s.mode = "bind"
@@ -223,6 +223,9 @@ function M.start(name, command, opts)
       svc.exit_code = code
       svc.stopped_at = os.time()
       if svc.cg then pcall(cgroup.release, svc.cg); svc.cg = nil end
+      pcall(function()
+        require("NeoAI.sandbox.net_consent").unregister_ports(svc.internal_ports)
+      end)
       _append_log(svc, string.format("\n[service] 进程已退出，退出码 %d\n", code))
     end,
   })
@@ -235,6 +238,10 @@ function M.start(name, command, opts)
   svc.status = "running"
   state.services[id] = svc
   state.order[#state.order + 1] = id
+  -- 沙箱内部服务端口登记：沙箱内访问这些端口免权限（出沙箱仍按网络策略处理）。
+  pcall(function()
+    svc.internal_ports = require("NeoAI.sandbox.net_consent").register_from_command(command, svc.env)
+  end)
   return svc
 end
 
@@ -288,6 +295,9 @@ function M.stop(key, cb, opts)
   for i, id in ipairs(state.order) do
     if id == svc.id then table.remove(state.order, i); break end
   end
+  pcall(function()
+    require("NeoAI.sandbox.net_consent").unregister_ports(svc.internal_ports)
+  end)
   if not svc.exited then svc.status = "stopping" end
   local cg = svc.cg
   svc.cg = nil

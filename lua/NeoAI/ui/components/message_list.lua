@@ -522,9 +522,14 @@ local function _secret_spans(text)
       end
     end
   end
-  -- token 不参与具名规则（is_candidate 主动排除 NEOKEY_ 前缀），单独按位置补齐。
-  for s, e in text:gmatch("()NEOKEY_%x+()") do
-    out[#out + 1] = { s - 1, e - 1, SECRET_HL_GROUP }
+  -- 假密钥不参与具名规则（is_candidate 主动排除已知假密钥），单独按位置补齐。
+  if secret.detect_tokens then
+    local ok3, toks = pcall(secret.detect_tokens, text)
+    if ok3 and type(toks) == "table" then
+      for _, tk in ipairs(toks) do
+        out[#out + 1] = { tk.start - 1, tk.stop, SECRET_HL_GROUP }
+      end
+    end
   end
   return out
 end
@@ -557,8 +562,13 @@ local function _with_secret_spans_bulk(rows, enabled)
         end
       end
     end
-    for s, e in joined:gmatch("()NEOKEY_%x+()") do
-      hits[#hits + 1] = { start = s, stop = e - 1 }
+    if secret.detect_tokens then
+      local ok3, toks = pcall(secret.detect_tokens, joined)
+      if ok3 and type(toks) == "table" then
+        for _, tk in ipairs(toks) do
+          hits[#hits + 1] = { start = tk.start, stop = tk.stop }
+        end
+      end
     end
   end
   if #hits == 0 then return rows end
@@ -1183,8 +1193,11 @@ end
 --- @param message table
 --- @param is_turn_end boolean
 --- @param opts table|nil 渲染选项（流式表格）
-local function _format_message(lines, marks, message, is_turn_end, opts)
-  _append_role_header(lines, marks, message)
+--- @param show_header boolean|nil 是否绘制角色头（false 时省略；缺省绘制）
+local function _format_message(lines, marks, message, is_turn_end, opts, show_header)
+  if show_header ~= false then
+    _append_role_header(lines, marks, message)
+  end
   _append_reasoning(lines, marks, message, opts)
   _append_content(lines, marks, message, opts)
   if is_turn_end then
@@ -1274,6 +1287,9 @@ local function _blocks(msgs, opts, prev)
   local tw = opts and opts.table_width
   local show = state.show_reasoning
   local streaming = opts and opts.streaming
+  -- Agent loop 内同一用户轮次会连续产生多条 assistant 消息（工具调用 → 结果 → 再调用…）。
+  -- 角色头 "🤖 AI" 只在本轮第一条 assistant 消息上展示，后续条省略；遇真实用户消息重置。
+  local assistant_header_shown = false
   while i <= #msgs do
     local idx = i
     local msg = msgs[idx]
@@ -1299,6 +1315,8 @@ local function _blocks(msgs, opts, prev)
       local turn_end = _is_turn_end(msgs, idx)
       local is_stream = (streaming == true) and idx == #msgs
       local eopts = _msg_opts(is_stream, opts)
+      local show_header = not assistant_header_shown
+      assistant_header_shown = true
       local key = "c:" .. idx
       local role = snap.role or ""
       local clen, rlen = #(snap.content or ""), #(snap.reasoning or "")
@@ -1307,6 +1325,7 @@ local function _blocks(msgs, opts, prev)
       local same = p ~= nil and p.key == key and p.in_msg == snap and p.in_role == role
         and p.in_clen == clen and p.in_rlen == rlen and p.in_turn == turn_end
         and p.in_stream == is_stream and p.in_tw == tw and p.in_show == show
+        and p.in_header == show_header
         and p.in_tc ~= nil and #p.in_tc == #paired
       if same then
         for k, pp in ipairs(paired) do
@@ -1323,7 +1342,8 @@ local function _blocks(msgs, opts, prev)
       if same then
         blocks[n] = p
       else
-        local extra = { "assistant", _fingerprint(snap.content), _fingerprint(snap.reasoning) }
+        local extra = { "assistant", _fingerprint(snap.content), _fingerprint(snap.reasoning),
+          show_header and "H" or "-" }
         local in_tc, in_res, in_status, in_reslen, in_resdur = {}, {}, {}, {}, {}
         for k, pp in ipairs(paired) do
           local fn = pp.tc["function"] or {}
@@ -1352,11 +1372,12 @@ local function _blocks(msgs, opts, prev)
           sig = sig,
           in_msg = snap, in_role = role, in_clen = clen, in_rlen = rlen,
           in_turn = turn_end, in_stream = is_stream, in_tw = tw, in_show = show,
+          in_header = show_header,
           in_tc = in_tc, in_res = in_res, in_status = in_status,
           in_reslen = in_reslen, in_resdur = in_resdur,
           build = function()
             local lines, marks = {}, {}
-            _append_role_header(lines, marks, snap)
+            if show_header then _append_role_header(lines, marks, snap) end
             _append_reasoning(lines, marks, snap, eopts)
             _append_content(lines, marks, snap, eopts)
             for _, pp in ipairs(paired) do
@@ -1375,6 +1396,13 @@ local function _blocks(msgs, opts, prev)
       local turn_end = _is_turn_end(msgs, idx)
       local is_stream = (streaming == true) and idx == #msgs
       local eopts = _msg_opts(is_stream, opts)
+      local show_header = true
+      if snap.role == "assistant" then
+        show_header = not assistant_header_shown
+        assistant_header_shown = true
+      elseif snap.role == "user" then
+        assistant_header_shown = false
+      end
       local key = "c:" .. idx
       local role = snap.role or ""
       local clen, rlen = #(snap.content or ""), #(snap.reasoning or "")
@@ -1383,18 +1411,21 @@ local function _blocks(msgs, opts, prev)
       if p and p.key == key and p.in_msg == snap and p.in_role == role
         and p.in_clen == clen and p.in_rlen == rlen and p.in_turn == turn_end
         and p.in_stream == is_stream and p.in_tw == tw and p.in_show == show
+        and p.in_header == show_header
         and p.in_tc == nil then
         blocks[n] = p
       else
-        local sig = _sig(eopts, turn_end, { role, _fingerprint(snap.content), _fingerprint(snap.reasoning) })
+        local sig = _sig(eopts, turn_end, { role, _fingerprint(snap.content), _fingerprint(snap.reasoning),
+          show_header and "H" or "-" })
         blocks[n] = {
           key = key,
           sig = sig,
           in_msg = snap, in_role = role, in_clen = clen, in_rlen = rlen,
           in_turn = turn_end, in_stream = is_stream, in_tw = tw, in_show = show,
+          in_header = show_header,
           build = function()
             local lines, marks = {}, {}
-            _format_message(lines, marks, snap, turn_end, eopts)
+            _format_message(lines, marks, snap, turn_end, eopts, show_header)
             return { lines = lines, marks = marks }
           end,
         }
@@ -1432,12 +1463,12 @@ local function _render_chat_full(buf, msgs, opts)
     marks = { nil, nil, nil, nil }
   end
   vim.bo[buf].modifiable = true
+  -- 推理块起始行须在写入前登记（foldexpr 在写入时即被求值，见 render_chat 说明）。
+  _sync_fold_kinds(buf, marks)
   vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
   _apply_table_hl(buf, marks)
   _apply_secret_hl(buf, marks)
   _apply_ansi_hl(buf, marks)
-  _sync_fold_kinds(buf, marks)
-  -- 已直接重写全书：块缓存与内容镜像过期
   incremental.invalidate(buf)
   return { changed = true, start = 1, removed = -1, inserted = #lines, full = true }
 end
@@ -1497,13 +1528,17 @@ function M.render_chat(buf, messages, opts)
   M.refresh_tool_times(lines, marks)
   cache.new_lines = lines
   cache.new_marks = marks
+  -- 推理块起始行必须在写入 buffer **之前**登记：foldexpr 依赖 is_reasoning_start 判定
+  -- 是否强制开启新折叠，而 nvim 会在写入时立即按 foldexpr 计算折叠。若登记晚于写入，
+  -- 本次写入算出的折叠就看不到推理块边界（AI 不输出正文时，推理块会被并入上一工具块），
+  -- 直到下一次折叠重算（如工具耗时刷新）才恢复——表现为「刷新时折叠结构才变化」。
+  _sync_fold_kinds(buf, marks)
   local diff = cache:write(buf)
   if diff.changed then
     local from, to = incremental.written_range(diff)
     _apply_table_hl(buf, marks, 1, diff.full and nil or from, diff.full and nil or to)
     _apply_secret_hl(buf, marks, 1, diff.full and nil or from, diff.full and nil or to)
     _apply_ansi_hl(buf, marks, 1, diff.full and nil or from, diff.full and nil or to)
-    _sync_fold_kinds(buf, marks)
   end
   return diff
 end

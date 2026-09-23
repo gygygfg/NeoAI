@@ -45,7 +45,7 @@ and async-by-default (all I/O non-blocking).
    - Tool approval workflow: the default `mode="async"` runs the tool in the sandbox immediately and
      freezes candidates, with real changes queued for confirmation via `:NeoAISandboxReview`; only
      `prompt`/`strict` use the serial single-slot approval dialog (auto-allow config, per-tool
-     permission overrides, AUTO mode, approval timeout)
+     permission overrides, approval timeout)
    - Sandbox risk levels: L0-L3 map to auto/record/review/block, default `review` (pending review)
    - Plan mode: read-only/info tools + ask_user only; mutating tools gated
    - Plan distillation: on approve, distill plan-phase research context into a
@@ -186,7 +186,6 @@ Basic usage:
 :NeoAICycleDisplay  " Cycle display mode (chat / trajectory)
 :NeoAIReloadDisplay " Hot-reload display mode plugin
 :NeoAIPlan          " Toggle plan mode
-:NeoAIAuto          " Toggle AUTO mode (auto-allow all tool calls)
 :NeoAIApprovePlan   " Approve plan and switch to CHAT mode
 :NeoAIStatusline    " Preview the lualine statusline component content
 ```
@@ -265,6 +264,5 @@ require('NeoAI').setup({
 | `:NeoAICycleDisplay` | Cycle chat display mode (chat / trajectory) |
 | `:NeoAIReloadDisplay [name]` | Hot-reload a display mode plugin |
 | `:NeoAIPlan` | Toggle plan mode (read-only/info tools + ask_user) |
-| `:NeoAIAuto` | Toggle AUTO mode (auto-allow all tool calls) |
 | `:NeoAIApprovePlan` | Approve plan, switch to CHAT, execute task list |
 | `:NeoAIStatusline` | Preview the lualine statusline component content |

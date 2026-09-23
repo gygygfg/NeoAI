@@ -230,11 +230,14 @@ end
 M._rewrite_value = _rewrite_value
 M._rewrite_result = _rewrite_result
 
---- 可写根路径编码为 overlay 子目录名
+--- 可写根路径编码为 overlay 子目录名。
+--- 加 `r_` 前缀，避免根 `/root`（编码为 `r_root`）与整机根 overlay 目录 `base/root`
+--- 共用同一 upper/work——两者 lower 语义不同（`/` vs `/root`），混用会让物化/捕获互相
+--- 误读对方布局，表现为「文件写入后命令看不到、之后又消失」的视图分裂。
 --- @param root string
 --- @return string
 local function _enc_root(root)
-  return (root:gsub("^/", ""):gsub("/", "_"))
+  return "r_" .. (root:gsub("^/", ""):gsub("/", "_"))
 end
 
 --- 包安装命令的宿主状态目录（可写 overlay 暂存）。仅当命令被判定为包安装时加入可写根，
@@ -426,7 +429,7 @@ function M.build_overlay_specs(cwd, base_dir, extra_roots)
     fs.ensure_dir(work)
     fs.ensure_dir(bind)
     runtime.chown_payload(d)
-    if runtime.overlay_available() and runtime.overlay_writable("/", upper, work) then
+    if runtime.overlay_writable("/", upper, work) then
       local specs = { { root = "/", upper = upper, work = work, bind = bind, mode = "overlay" } }
       -- 整机 overlay 看不到会话私有 tmpfs 根（/tmp、/var/tmp 被私有目录覆盖），cwd 位于其下时
       -- 仍需单独 overlay cwd，使命令能在工作目录运行（与旧多根逻辑一致）。
@@ -473,10 +476,10 @@ end
 
 --- 可写根视图门禁：无 overlay 可写层时的 fail-closed 判定（run_command 与工具子进程共用）。
 --- 无任何可写根使用 overlay 时，命令只能看到会话私有视图（看不到真实磁盘文件）；默认拒绝，
---- 不静默降级。`covered_roots` 仅在播种视图（`degraded_seed`）时传入——此时这些根的真实内容
---- 已进入私有视图，落在其内的暂存不再构成视图分裂。
+--- 不静默降级。可覆盖根 = `mode=="overlay"` 的可写根 + 播种视图覆盖根（`opts.covered_roots`，
+--- 其真实内容已进入私有视图）；仅当暂存改动落在这些根之外（命令看不到）时才构成视图分裂。
 --- @param specs table 已定级 mode 的可写根规格（可为空）
---- @param opts table { userns? boolean, covered_roots? table, cfg? table }
+--- @param opts table { userns? boolean, covered_roots? table, cwd? string, cfg? table }
 --- @return boolean ok
 --- @return string|nil err
 --- @return boolean degraded
@@ -486,20 +489,31 @@ function M.overlay_gate(specs, opts)
   local cfg = opts.cfg or config_store.get("tools.sandbox") or {}
   local candidate = require("NeoAI.sandbox.candidate")
   local userns = opts.userns == true
-  local degraded = true
+  -- 收集实际可覆盖的根：只有这些根内的暂存内容对命令可见（overlay 物化或播种视图）。
+  local covered = {}
+  local any_overlay = false
   local degraded_reason
   for _, s in ipairs(specs or {}) do
-    if s.mode == "overlay" then degraded = false end
+    if s.mode == "overlay" then
+      any_overlay = true
+      covered[#covered + 1] = s.root
+    end
     if not degraded_reason and s.overlay_reason then degraded_reason = s.overlay_reason end
   end
-  if not degraded then return true, nil, false, nil end
-  -- 无 overlay 时禁止降级：存在（未被覆盖根包含的）未发布实质暂存改动时，命令只能读到真实
-  -- 磁盘，与只读工具的暂存视图分裂，且可能绕过暂存直接读写真实文件。此时**无条件** fail-closed
-  -- （含 T2 嵌套 userns：其无 overlay 是常态，但同样不能看到未覆盖的暂存视图）。
-  local covered = opts.covered_roots
+  for _, r in ipairs(opts.covered_roots or {}) do covered[#covered + 1] = r end
+  -- 视图分裂判定：暂存改动落在可覆盖根之外 → 命令读到真实磁盘、与只读工具视图分裂。
+  -- 有 overlay 但仅覆盖部分根时也必须判（此前「存在任一 overlay 即放行」会漏掉未覆盖根的暂存）。
   local split
-  if covered and #covered > 0 then
+  if #covered > 0 then
     split = candidate.has_staged_outside(covered)
+  elseif userns then
+    -- T2（嵌套 userns，无 overlay）：cwd 以会话私有 staging 呈现。未播种时 cwd 内暂存对命令
+    -- 不可见（分裂）；cwd 之外的暂存不在其工作集内，不阻塞命令（避免无关暂存误拒 systemctl 等）。
+    if opts.cwd then
+      split = candidate.has_staged_under({ opts.cwd })
+    else
+      split = candidate.has_staged()
+    end
   else
     split = candidate.has_staged()
   end
@@ -514,15 +528,16 @@ function M.overlay_gate(specs, opts)
     end
     degraded_reason = "存在未发布暂存改动但无 overlay 可写层（" .. tostring(why) .. "）"
   end
-  -- staging_uncovered="warn" 亦视为显式允许降级（否则会被 overlay_fail_closed 再次拒绝）。
-  if not userns and cfg.overlay_fail_closed ~= false
+  -- 降级门禁：仅在**完全没有任何 overlay**（整机/多根都不可 overlay）时因「降级」拒绝；
+  -- 有 overlay 但部分根未覆盖已由上面的 split 分支处理。
+  if not userns and not any_overlay and cfg.overlay_fail_closed ~= false
     and (cfg.staging_uncovered or "reject") ~= "warn" then
     local detail = degraded_reason and ("原因：" .. tostring(degraded_reason)) or "无可写根可用 overlay"
     return false, "SANDBOX_OVERLAY_UNAVAILABLE: 无法为可写根挂载 overlay 可写层，拒绝以降级模式运行（"
       .. detail .. "）；请用 :NeoAISandboxCaps 排查，或在 tools.sandbox.overlay_fail_closed=false 显式允许降级",
       true, degraded_reason
   end
-  return true, nil, true, degraded_reason
+  return true, nil, not any_overlay, degraded_reason
 end
 
 --- 候选涉及的真实路径数组
@@ -728,6 +743,19 @@ local function _settle_candidate(cand, attempt, ctx, cfg, spec, result, process_
   if not secret_warning and ctx and ctx.secret_operation then
     secret_warning = { count = 1, tokens = {}, names = ctx.secret_names or {}, reason = "KEY_OPERATION" }
   end
+  -- 数据流账本：本次调用使用了假密钥/敏感环境变量且产生候选文件 → 命令/脚本可能加密/变换了
+  -- 密钥，输出无法逐字还原；标记这些文件为「不透明派生」，强制待审（发布前人工确认）。
+  local derived_opaque = false
+  do
+    local ok_flow, flow = pcall(require, "NeoAI.sandbox.secret_flow")
+    if ok_flow and flow and ctx and ctx.secret_operation and #(cand.files or {}) > 0 then
+      derived_opaque = (flow.mark_derived(cand.files, {
+        tool = attempt.tool_name,
+        command = attempt.container_command or (process_info and process_info.command),
+        fakes = ctx.secret_names,
+      }) or 0) > 0
+    end
+  end
   -- 脚本间接执行：折叠后的 effective 文本用于危险模式识别与包安装识别。
   local scan = attempt.script_scan
   local effective = scan and scan.enabled and scan.effective or nil
@@ -802,6 +830,8 @@ local function _settle_candidate(cand, attempt, ctx, cfg, spec, result, process_
   if rf.package and ((cfg.packages or {}).mode or "review") ~= "allow" then auto = false end
   -- 密钥操作永不自动发布（需显式确认）。
   if rf.secret then auto = false end
+  -- 不透明派生（命令/脚本加密变换后的密钥流）同样强制复核。
+  if derived_opaque then auto = false end
   -- 脚本间接执行：脚本内命中危险命令、或内容无法静态解析（不透明）时强制复核，
   -- 不随 mode=commit / 会话自动审批放行（沙箱仍保证写入冻结，复核兜住误判）。
   local script_indirect_risk = scan and scan.enabled and (scan.opaque or (scan.danger or 0) > 0)
@@ -854,6 +884,7 @@ local function _settle_candidate(cand, attempt, ctx, cfg, spec, result, process_
   end
   local item = _enqueue_review(cand, attempt, cfg, env, {
     secret_warning = secret_warning or false,
+    derived_opaque = derived_opaque or nil,
     risk_level = r.level, risk_name = r.name, risk_reasons = r.reasons,
     package = rf.package, action = action,
     command = rf.command,
@@ -1140,6 +1171,41 @@ end
 --- @param ctx table
 --- @param spec table
 --- @return Deferred|nil
+--- 查询类动词：非零退出是**正常语义**（is-active 3=inactive、is-enabled 1=disabled、
+--- is-failed 1=非 failed、is-system-running 1=非 running、status 3=inactive），
+--- 不应被包装成工具失败（ok=false）；否则 AI 会把「服务未运行」误判为工具报错。
+local SYSTEMD_QUERY_VERBS = {
+  ["is-active"] = true, ["is-enabled"] = true, ["is-failed"] = true,
+  ["is-system-running"] = true, ["status"] = true,
+}
+
+--- 把门面结果 {stdout, stderr, code} 转成工具结果文本：成功/查询动词=原文；其它非零=结构化
+--- 失败标记（与 run_command 的约定一致，UI/模型可据 ok=false + exit_code 识别失败）。
+--- @param res table|string
+--- @param plan table|nil 门面计划（用于识别查询动词）
+--- @return string
+local function _systemd_result_text(res, plan)
+  if type(res) ~= "table" then return tostring(res or "") end
+  local stdout = tostring(res.stdout or "")
+  local stderr = tostring(res.stderr or "")
+  local code = tonumber(res.code) or 0
+  local combined = stdout
+  if stderr ~= "" then combined = (combined ~= "" and (combined .. "\n") or "") .. stderr end
+  if code == 0 then return combined end
+  local verb = type(plan) == "table" and plan.verb or nil
+  if verb and SYSTEMD_QUERY_VERBS[verb] then return combined end
+  local ok, json = pcall(require, "NeoAI.utils.json")
+  if ok and json and json.encode then
+    return json.encode({
+      error = "命令退出码 " .. tostring(code),
+      output = combined,
+      ok = false,
+      exit_code = code,
+    })
+  end
+  return combined
+end
+
 local function _maybe_systemd(attempt, args, ctx, spec)
   if spec.effect ~= "process" then return nil end
   local cfg = config_store.get("tools.sandbox.systemd") or {}
@@ -1149,25 +1215,18 @@ local function _maybe_systemd(attempt, args, ctx, spec)
   local plan = systemd.parse_command(args.command)
   if not plan or plan.route == "hostop" then return nil end
 
-  -- `systemctl --user`：交由沙箱内真实嵌套 systemd 用户实例原生执行（需 resident + systemd.user）。
-  if plan.route == "native" then
-    local ok, mod = pcall(require, "NeoAI.sandbox.systemd_user")
-    local resident_ok = require("NeoAI.sandbox.resident").available()
-    if ok and mod and mod.available() and resident_ok then
-      return nil
-    end
-    control.transition(attempt, "STAGING")
-    control.transition(attempt, "CANDIDATE_READY")
-    control.transition(attempt, "COMPLETED_READ_ONLY")
-    return async.resolve(
-      "沙箱环境不支持 `systemctl --user`：未启用嵌套 systemd 用户实例。"
-      .. "请同时开启 tools.sandbox.resident.enabled 与 tools.sandbox.systemd.user.enabled。")
-  end
+  -- `systemctl --user` 现由**伪造的 systemd 解析器**在门面内处理（见 systemd.parse_command 的
+  -- scope="user"）：无需真实嵌套 systemd/dbus。旧的 route="native" 已不再产生；若仍出现，
+  -- 按门面处理（下面的通用分支）。
 
   -- systemd enable/disable：计算软链并暂存为待审候选（不落宿主机）。
   if plan.route == "reject" and (plan.verb == "enable" or plan.verb == "disable")
     and cfg.stage_install ~= false then
-    return systemd.stage_install(attempt, plan, ctx, spec)
+    local staged = systemd.stage_install(attempt, plan, ctx, spec)
+    local wrapped = async.Deferred.new()
+    staged:then_(function(res) wrapped:resolve(_systemd_result_text(res, plan)) end,
+      function(e) wrapped:resolve(systemd.error_text(e)) end)
+    return wrapped
   end
 
   control.transition(attempt, "STAGING")
@@ -1205,13 +1264,15 @@ local function _maybe_systemd(attempt, args, ctx, spec)
         })
     end)
     _record(false)
-    out:resolve(systemd.reject_text(plan.verb))
+    out:resolve(_systemd_result_text({
+      stdout = "", stderr = systemd.reject_text(plan.verb, plan.units and plan.units[1]), code = 1,
+    }, plan))
     return out
   end
 
-  systemd.handle(plan):then_(function(text)
-    _record(true)
-    out:resolve(text)
+  systemd.handle(plan):then_(function(res)
+    _record(not (type(res) == "table" and (tonumber(res.code) or 0) ~= 0))
+    out:resolve(_systemd_result_text(res, plan))
   end, function(err)
     _record(false)
     out:resolve(systemd.error_text(err))
@@ -1282,8 +1343,8 @@ local function _resident_eligible(attempt, spec, args, req)
   if attempt.tool_name ~= "run_command" then return false end
   if spec.long_lived then return false end
   -- T0 与「系统管理/降权」（sysadmin，如 chown/useradd/runuser）走常驻实例：常驻实例的
-  -- overlay upper 跨命令持久（<proc_dir>/resident），使属主等元数据改动不因一次性路径的
-  -- 独立 overlay 而丢失（chown 跨命令不持久）。包安装（挂载/环境不同）与更高档位仍走一次性。
+  -- overlay upper 跨命令**且跨轮次**持久（<sandbox_root>/resident，稳定路径），使属主等元数据
+  -- 改动不因一次性路径的独立 overlay 或会话轮换而丢失。包安装（挂载/环境不同）与更高档位仍走一次性。
   local tier = req and req.tier or 0
   if tier > 1 then return false end
   if tier == 1 and not (req and req.sysadmin) then return false end
@@ -1381,8 +1442,27 @@ local function _gate_inner(tool, args, ctx, call_original)
   -- 仍可在沙箱内执行并把写入冻结为候选。见 risk.deny_reason。
   if spec.effect == "process" and type(args.command) == "string" then
     local scan = attempt.script_scan
+    -- 能力感知：底层网络/防火墙命令（iptables/nft…）按「是否授予所需能力」判定，
+    -- 而非按命令名无条件拒绝（见 risk.CAP_GATED_BINS）。缺省（无法解析档位）视为无能力。
+    local caps
+    pcall(function()
+      caps = require("NeoAI.sandbox.privilege").effective_caps(attempt.tool_name, args, spec, {
+        effective_command = scan and scan.effective,
+      })
+    end)
     local deny = require("NeoAI.sandbox.risk").deny_reason(
-      (scan and scan.effective) or args.command)
+      (scan and scan.effective) or args.command, { caps = caps })
+    -- 代理规避门禁：host_local_block 生效时，显式清除/绕过代理变量会让应用层过滤失效、
+    -- 直达宿主本机。裸 TCP 不在覆盖范围（已知边界）。
+    if not deny then
+      local net = config_store.get("tools.sandbox.network") or {}
+      local ok_rt, rt = pcall(require, "NeoAI.sandbox.runtime")
+      if net.block_proxy_evasion ~= false and ok_rt and rt.host_local_block_enabled
+        and rt.host_local_block_enabled() then
+        deny = require("NeoAI.sandbox.risk").network_evasion_reason(
+          (scan and scan.effective) or args.command)
+      end
+    end
     if deny then
       control.transition(attempt, "PARSED")
       control.transition(attempt, "BLOCKED")
@@ -1545,6 +1625,10 @@ local function _gate_inner(tool, args, ctx, call_original)
     local proc_dir = candidate.process_dir()
     local staging = proc_dir .. "/fallback" -- overlay 不可用时的私有可写 cwd
     fs.ensure_dir(staging)
+    -- 稳定临时根基目录（进程/实例级，不随会话轮换）：resident 与一次性命令共用同一 /tmp、
+    -- /var/tmp 私有目录，使 `mkdir`/`python -m venv`（常驻路径）与 `cargo`/`pip`（一次性路径）
+    -- 跨命令、跨 agentEnd 轮换看到同一临时工作区（修复 /tmp 目录与 venv 符号链接丢失）。
+    local tmp_base = runtime.stable_tmp_base()
     -- 沙箱内已是 root：剥掉冗余的 sudo/doas（否则会误判为 T2/userns 并失败）。
     if type(args.command) == "string" then
       args.command = _strip_sudo(args.command)
@@ -1558,10 +1642,18 @@ local function _gate_inner(tool, args, ctx, call_original)
     attempt.package = req.package == true
     attempt.network = req.network == true
     -- 常驻沙箱：会话级共享 mount+pid 命名空间，`run_command` 的后台进程跨工具调用存活。
-    -- 仅 T0 的 run_command 适用；使用独立 overlay 基目录（`<proc_dir>/resident`），
+    -- 仅 T0 的 run_command 适用；使用稳定 overlay 基目录（`<sandbox_root>/resident`，跨轮次保活），
     -- 避免与一次性进程的 upper 并发挂载冲突。
     local resident_mod = require("NeoAI.sandbox.resident")
     local resident_ok = _resident_eligible(attempt, spec, args, req)
+    -- 常驻实例的 overlay/session 基目录**不随会话轮换**（放在沙箱存储根下的稳定目录），
+    -- 使实例（连同其中的后台进程）跨轮次保活：agentEnd 轮换只迁移工作区暂存，不再停实例。
+    local resident_base = nil
+    if resident_ok then
+      local sroot = require("NeoAI.sandbox.store").root()
+        or (vim.fn.stdpath("cache") .. "/NeoAI/sandbox")
+      resident_base = (sroot:gsub("/+$", "")) .. "/resident"
+    end
     -- 可写根 = 工具声明（spec.writable_roots）+（包安装时）包管理器状态目录。
     -- 包安装写入的索引/缓存/元数据同样进入 overlay，冻结为候选（不直接落盘）。
     local extra_roots = {}
@@ -1591,10 +1683,10 @@ local function _gate_inner(tool, args, ctx, call_original)
       end
     end
     local specs = M.build_overlay_specs(real_cwd,
-      resident_ok and (proc_dir .. "/resident") or proc_dir, extra_roots)
+      resident_base or proc_dir, extra_roots)
     -- 选定每个可写根实际使用的层（overlay 或 bind），供物化/捕获/前缀构造一致使用
     for _, spec in ipairs(specs) do
-      if runtime.overlay_available() and runtime.overlay_writable(spec.root, spec.upper, spec.work) then
+      if runtime.overlay_writable(spec.root, spec.upper, spec.work) then
         spec.mode = "overlay"
       else
         spec.mode = "bind"
@@ -1652,6 +1744,13 @@ local function _gate_inner(tool, args, ctx, call_original)
       -- 会话 shell 状态目录（bind 到沙箱内）须归载荷所有，否则非 root 载荷无法写入
       -- cwd/env（`sh: cannot create .../cwd: Permission denied`）。
       runtime.chown_payload(session_dir)
+    end
+    -- 常驻实例的 shell 状态目录也用稳定路径（跨轮次保活，含大文件物化收件箱）。
+    local resident_session_dir = nil
+    if session_shell and resident_base then
+      resident_session_dir = resident_base .. "/shell"
+      fs.ensure_dir(resident_session_dir)
+      runtime.chown_payload(resident_session_dir)
     end
     control.transition(attempt, "STAGING")
     -- 资源域（cgroup v2）：默认按宿主资源动态设置 CPU/内存/PID 上限（见 cgroup.resolve_limits）。
@@ -1733,7 +1832,8 @@ local function _gate_inner(tool, args, ctx, call_original)
       if resident_ok then
         local inst, rerr = resident_mod.ensure({
           specs = specs, cwd = real_cwd, privileges = priv,
-          session_dir = session_dir, session_tmp_dir = proc_dir,
+          session_dir = resident_session_dir, session_tmp_dir = tmp_base,
+          tmpfs_base = tmp_base,
           fallback_cwd = staging, env = runtime.sandbox_env(priv),
         })
         if inst then
@@ -1746,7 +1846,7 @@ local function _gate_inner(tool, args, ctx, call_original)
           ctx.sandbox_degraded = false
           ctx.sandbox_userns = false
           ctx.sandbox_degraded_reason = nil
-          ctx.sandbox_shell_state = session_dir
+          ctx.sandbox_shell_state = resident_session_dir
             and require("NeoAI.sandbox.conceal").session_mount() or nil
           -- token→真实密钥的还原仅限沙箱内部进程（与一次性路径一致）。
           if type(args.command) == "string" then
@@ -1766,20 +1866,25 @@ local function _gate_inner(tool, args, ctx, call_original)
       active_specs = userns and {} or specs
       -- T2（嵌套 userns，active_specs 为空）单独播种私有 cwd：把真实工作区复制进 staging，
       -- 再把工作区暂存物化到其上，使命令看到真实文件 + AI 暂存编辑（写入仍落私有副本）。
-      if userns and cfg.degraded_seed == true then
-        local r = candidate.seed_view(real_cwd, staging, { max_bytes = seed_max_bytes })
-        if r and not r.truncated then
-          pcall(candidate.materialize_overlay,
-            { { root = real_cwd, bind = staging, mode = "bind" } })
-          seeded_covered_roots = { real_cwd }
-        else
-          seeded_covered_roots = nil
+      -- 除 `degraded_seed` 外，只要 cwd 内有未发布暂存也必须播种：否则 T2 命令看不到暂存
+      -- 视图、会被门禁拒绝（systemctl/unshare 等因此间歇性失败）；播种失败（超限）则回退拒绝。
+      if userns then
+        local cwd_staged = candidate.has_staged_under({ real_cwd })
+        if cfg.degraded_seed == true or cwd_staged then
+          local r = candidate.seed_view(real_cwd, staging, { max_bytes = seed_max_bytes })
+          if r and not r.truncated then
+            pcall(candidate.materialize_overlay,
+              { { root = real_cwd, bind = staging, mode = "bind" } })
+            seeded_covered_roots = { real_cwd }
+          else
+            seeded_covered_roots = nil
+          end
         end
       end
       -- 视图降级门禁（与工具子进程共用）。`seeded_covered_roots` 仅在播种视图时非空：
       -- 这些根的真实内容已进入私有视图，落在其内的暂存不再构成视图分裂。
       local ok_view, view_err, degraded, degraded_reason = M.overlay_gate(active_specs, {
-        userns = userns, cfg = cfg, covered_roots = seeded_covered_roots,
+        userns = userns, cfg = cfg, covered_roots = seeded_covered_roots, cwd = real_cwd,
       })
       if not ok_view then return nil, view_err end
       -- 审批放行：把本次调用获批解除遮蔽的条目并入 unmask（与档位 unmask 合并）。
@@ -1829,7 +1934,8 @@ local function _gate_inner(tool, args, ctx, call_original)
       end
       local prefix, perr, eff_cwd = runtime.process_prefix({
         cwd = real_cwd, overlays = active_specs, fallback_cwd = staging,
-        session_dir = session_dir, session_tmp_dir = proc_dir, privileges = eff_priv,
+        session_dir = session_dir, session_tmp_dir = tmp_base, tmpfs_base = tmp_base,
+        privileges = eff_priv,
       })
       if not prefix then return nil, perr end
       if cg_handle then

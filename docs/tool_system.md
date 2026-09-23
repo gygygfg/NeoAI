@@ -119,7 +119,7 @@ resolve_name（别名/模糊匹配）
 ## 5. 审批弹窗（services/tool_service.lua）
 
 > 默认 `async` 模式下**不走这条路径**：工具已在沙箱内执行，确认由待审队列（`:NeoAISandboxReview`）完成。
-> 本节描述 `prompt`/`strict` 模式、`AUTO` 关闭时的**执行前弹窗审批**，以及遮蔽目录命中等兜底场景。
+> 本节描述 `prompt`/`strict` 模式下的**执行前弹窗审批**，以及遮蔽目录命中等兜底场景。
 
 审批是**串行单槽位**设计：工具执行本身并行（tool_loop 并发发起），但「弹窗确认」串行化——
 一次只展示一个审批弹窗，其余排队，互不覆盖。
@@ -140,7 +140,6 @@ M.execute(agent, name, args, tool_call_id, opts)
 - 否则入 `approval_queue`，`_drain_approval_queue` 逐条弹窗（单槽位）。
 - **审批超时兜底**：`tools.approval.timeout_ms` 默认 60s，超时拒绝而不是永久挂起；
   一旦决策（`item.d = nil`）超时即失效，不干扰已批准工具的执行。
-- `AUTO` 模式（`toggle_auto_mode`）：自动允许所有工具调用，开启时立刻批批准当前待审批/排队的工具。
 
 ### 5.2 审批 UI
 

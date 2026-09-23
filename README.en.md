@@ -117,7 +117,6 @@ require("NeoAI").setup({
 | `:NeoAIReloadDisplay`| Hot-reload the display mode plugin (reloads the current mode by default) |
 | `:NeoAIReloadAll`  | Hot-reload the whole NeoAI plugin (isolated pre-check first; cancel on failure) |
 | `:NeoAIPlan`       | Toggle plan mode (the tool context retains only read-only / informational queries + asking the user) |
-| `:NeoAIAuto`       | Toggle AUTO mode (automatically allow all tool calls) |
 | `:NeoAIApprovePlan`| Confirm the plan and switch to CHAT mode to execute it per the task list |
 | `:NeoAISandboxCommit`| Apply a sandbox candidate to the real workspace (CAS publish; arg = candidate digest) |
 | `:NeoAISandboxReview`| List pending changes and apply the selected one (async review) |
@@ -178,14 +177,13 @@ require("NeoAI").setup({
       timeout_ms = 10000,                -- timeout for a single request
     },
 
-    -- Configure the provider and model parameters separately per mode (CHAT / PLAN / AUTO);
+    -- Configure the provider and model parameters separately per mode (CHAT / PLAN);
     -- entering a mode applies its provider/model/temperature/stream, falling back to ai.default_provider by default.
     -- max_tokens is unset by default: the parameter is not sent with the request, and the default maximum output of the
     -- model/vendor applies; it is only sent when configured explicitly.
     modes = {
       chat = { provider = "deepseek", model = "auto", temperature = 0.7, stream = true },
       plan = { provider = "deepseek", model = "auto", temperature = 0.3, stream = true },
-      auto = { provider = "deepseek", model = "auto", temperature = 0.7, stream = true },
     },
 
     -- Automatically continue when the output is truncated (finish_reason=length/max_tokens/MAX_TOKENS) and no tool
@@ -284,7 +282,7 @@ require("NeoAI").setup({
       cancel = { key = "<Esc>", desc = "Cancel generation" },
       switch_model = { key = "M", desc = "Switch model" },
       toggle_reasoning = { key = "r", desc = "Toggle the display of the reasoning process" },
-      cycle_mode = { key = "m", desc = "Cycle through modes (CHAT/PLAN/AUTO)" },
+      cycle_mode = { key = "m", desc = "Cycle through modes (CHAT/PLAN)" },
       cycle_display = {
         insert = { key = "<C-t>", desc = "Cycle display modes (chat/trajectory)" },
         normal = { key = "T", desc = "Cycle display modes (chat/trajectory)" },
@@ -738,7 +736,7 @@ one does). For risk levels and allowlists see the `approval` config and [docs/en
 > After the plan is emitted the turn ends and **the user confirms** (run `:NeoAIApprovePlan` or toggle the mode manually);
 > after confirmation it **switches directly to CHAT mode**, the system parses the plan into a task list (todos),
 > and execution starts automatically according to `tools.plan_mode.auto_execute_on_approve` (on by default).
-> During generation, switching modes via `m` / `:NeoAIPlan` / `:NeoAIAuto` is **deferred until the current turn ends**,
+> During generation, switching modes via `m` / `:NeoAIPlan` is **deferred until the current turn ends**,
 > so an in-progress generation is never interrupted by a mid-flight change to the toolset / system policy / model.
 
 ### 🪵 Logging Tools
@@ -988,7 +986,7 @@ NeoAI/
     ├── test_model_metadata.lua# Live model metadata
     ├── test_protocol_adapter.lua # Protocol encoding/decoding
     ├── test_model_picker.lua  # Model picker
-    ├── test_modes.lua         # Modes (CHAT/PLAN/AUTO)
+    ├── test_modes.lua         # Modes (CHAT/PLAN)
     ├── test_multimodal.lua    # Multimodal images
     ├── test_runtime_context.lua # Runtime context
     ├── test_tools.lua         # Tool system

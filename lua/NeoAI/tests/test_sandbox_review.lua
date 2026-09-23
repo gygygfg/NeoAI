@@ -627,6 +627,77 @@ tests.suite("sandbox_review", function(_, it)
     t.not_nil(l3mark, "主机操作风险徽标应用 risk3 高亮")
   end)
 
+  it("主机操作头行也是有效审批目标（<CR> 应用 / i 预览命令）", function(t)
+    local services = require("NeoAI.kernel.services")
+    local sr = require("NeoAI.ui.components.sandbox_review")
+    sr.reset()
+    local saved = services.use("services.sandbox")
+    local applied = {}
+    services.provide("services.sandbox", {
+      list_reviews = function()
+        return {
+          { change_set_id = "csH", kind = "host_op", tool = "run_command",
+            host_op_id = "ho1", risk_level = 3, privilege_tier = 2,
+            write_set = { "systemctl restart nginx" }, files = {} },
+        }
+      end,
+      list_traces = function() return {} end,
+      list_saved = function() return {} end,
+      apply = function(id, opts) applied[#applied + 1] = { id = id, opts = opts }; return { ok = true } end,
+      reject = function() end,
+      reject_file = function() end,
+    })
+    sr.open()
+    local buf = sr.get_buf()
+    local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+    local header
+    for i, l in ipairs(lines) do
+      if l:find("csH", 1, true) then header = i break end
+    end
+    t.not_nil(header, "应有主机操作头行")
+    local tgt = sr.get_line_map()[header]
+    t.not_nil(tgt, "头行应参与审批")
+    t.eq(true, tgt.host_op, "头行目标应为主机操作")
+    -- 头行 <CR> 应直接应用（整条审批）
+    vim.api.nvim_win_set_cursor(0, { header, 0 })
+    for _, m in ipairs(vim.api.nvim_buf_get_keymap(buf, "n")) do
+      if m.lhs == "<CR>" then m.callback() end
+    end
+    t.eq(1, #applied, "头行 <CR> 应应用主机操作")
+    t.eq("csH", applied[1].id)
+    -- 头行 i 应预览命令（而非误报 git 无 diff）
+    vim.api.nvim_win_set_cursor(0, { header, 0 })
+    sr.preview_current()
+    local dbuf = sr.get_diff_buf()
+    t.not_nil(dbuf, "主机操作头行 i 应打开预览")
+    local dtext = table.concat(vim.api.nvim_buf_get_lines(dbuf, 0, -1, false), "\n")
+    t.true_(dtext:find("systemctl restart nginx", 1, true) ~= nil, "预览应包含命令")
+    sr.close_diff()
+    sr.close()
+    services.provide("services.sandbox", saved)
+  end)
+
+  it("命令型变更单元显示实际命令，受影响文件按级别高亮", function(t)
+    local sr = require("NeoAI.ui.components.sandbox_review")
+    local cwd = vim.fn.getcwd()
+    local data = sr.build_lines({
+      { change_set_id = "csC", tool = "run_command", risk_level = 1,
+        command = "sed -i 's/a/b/' src/a.lua",
+        files = { { path = cwd .. "/src/a.lua", action = "modify" },
+                  { path = "/etc/hosts", action = "modify" } } },
+    })
+    local text = table.concat(data.lines, "\n")
+    t.true_(text:find("sed -i", 1, true) ~= nil, "应显示实际命令")
+    local ws, sys
+    for _, m in ipairs(data.marks) do
+      local ln = data.lines[m.line]
+      if ln and ln:find("src/a.lua", 1, true) then ws = m.level end
+      if ln and ln:find("/etc/hosts", 1, true) then sys = m.level end
+    end
+    t.eq("workspace", ws, "工作区文件应 workspace 高亮")
+    t.eq("system", sys, "系统文件应 system 高亮")
+  end)
+
   it("按 i 临时关闭审批窗并打开修改 diff，关闭 diff 后恢复", function(t)
     local services = require("NeoAI.kernel.services")
     local sr = require("NeoAI.ui.components.sandbox_review")

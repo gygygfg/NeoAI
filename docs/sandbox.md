@@ -226,7 +226,10 @@
       （先展开区、再展开条目才看到文件列表），刷新后重新收起；**待审条目「头行显示、其余折叠」**：
       头行（工具/风险徽标/文件数/`待审`）保持正常显示并作为整单元审批入口，其后的密钥警告/风险
       原因/git 提示/文件列表默认收起，`za`/`zo` 展开——包安装、git 操作等可达上千文件，折叠
-      避免刷屏；越界留痕区不折叠，便于逐条审阅。
+      避免刷屏；越界留痕区不折叠，便于逐条审阅。**命令型变更单元**（`run_command` / 包安装等）
+      在头行下显示实际命令 `$ <命令>`，其后的文件行即该命令影响的文件，按工作区/用户/系统级别
+      高亮；**主机操作的头行与命令行为同一审批目标**（`<CR>` 应用 / `d` 拒绝 / `i` 预览命令），
+      光标停在任一行均可操作。
       聊天主窗口内可按 `<leader>ap` 直接触发（`keymaps.chat.sandbox_review`）。
      - **显示已保存 / 撤销保存**：应用（保存）时保留每个文件的**原文件快照**（真实文件
        应用前的内容），审批界面底部「已应用（已保存/已撤销，u 撤销/重做保存）」区展示已发布到真实
@@ -437,9 +440,15 @@
   - `/tmp`、`/var/tmp` 属**每会话私有临时根**（`tools.sandbox.tmpfs_roots`）：默认
     （`tmp_private_base="host"`）在宿主根之下建隐藏临时子目录（如 `/tmp/.cache-<tag>/<session>`，
     mode 1777），并经**命名空间 bind 映射回该根**——沙箱内 `/tmp` 即此会话私有子目录，
-    宿主 `/tmp` 真实内容对 AI 不可见（隔离 AI）。**不**作为 overlay 只读 lower，退出/轮换
-     会话即销毁。命令对 `/tmp` 的写入属临时草稿，不冻结为候选，杜绝跨会话残留与宿主 `/tmp` 泄露。
+    宿主 `/tmp` 真实内容对 AI 不可见（隔离 AI）。**不**作为 overlay 只读 lower。
+    命令对 `/tmp` 的写入属临时草稿，不冻结为候选，杜绝跨会话残留与宿主 `/tmp` 泄露。
     `tmp_private_base="session"` 可退回旧的「建在会话进程目录（/dev/shm）」行为。
+    - **同一 nvim 进程内 `/tmp` 稳定持久**：常驻实例与一次性命令（以及工具子进程 `exec`）
+      共用**同一个进程/实例级临时根基目录**（`<store.root>/tmp`），且不随 `agentEnd` 会话轮换
+      被 prune——使 `mkdir`/`python -m venv`（常驻路径）与 `cargo`/`npm`/`pip`（一次性路径）
+      跨命令、跨轮次看到同一 `/tmp`（修复此前「常驻与一次性各用不同 `/tmp`、轮换即清空」导致的
+      `/tmp/rustapp`、`/tmp/node` 目录与 venv `bin/python` 符号链接丢失）。该目录在 nvim 退出/
+      实例回收时清理；`ephemeral_roots` 语义不变（仍不产生候选）。
   - **临时候选根（`tools.sandbox.ephemeral_roots`，默认同 `tmpfs_roots`）**：这些根（**cwd 子树
     除外**）下的文件写入为**会话私有、nvim 退出即丢弃**——不进入待审队列、不 CAS 发布、也不弹
     审批悬浮窗（内容仅在暂存层，供本次会话读取一致）。对进程内工具（`edit_file`/`create_directory`
@@ -457,6 +466,13 @@
     （`candidate.has_staged`）时，直接以 `SANDBOX_STAGING_UNCOVERED` 拒绝执行——此时命令只能
     读到真实磁盘、与只读工具的暂存视图分裂，且可能绕过暂存。这是对既有
     `overlay_fail_closed`（仅拒绝非 userns 降级）的收紧：**有暂存时 userns 也不放行**。
+    - **覆盖判定精确到根**：门禁只在暂存改动落在**本次命令实际可覆盖的根之外**时才拒绝——
+      可覆盖根 = `mode=overlay` 的可写根 + 播种视图覆盖根。此前「存在任一 overlay 即放行」
+      会漏掉「cwd 是 overlay、但暂存位于 bind 根」的视图分裂；现在按 `has_staged_outside`
+      逐个核对。T2（无 overlay）在 cwd 有暂存时**自动播种 cwd**（`degraded_seed` 之外的补充），
+      使 `systemctl`/`unshare` 等命令不再因无关暂存被误拒；仅 cwd 内暂存且播种失败时才拒绝。
+    - **目录条目不算实质改动**：`create_directory`/新建目录本身不产生内容，不再让
+      `has_staged()` 永为真（否则空目录/目录条目会把后续无 overlay 命令长期误判为视图分裂）。
   - 可写层为**会话级共享**：同一 agent 循环内所有命令共用（命令 N 看得到命令 N-1 的
     写入）；agentEnd 轮换会话时随会话目录清理（改动已冻结为候选）。
   - **双向互通**：命令执行前把工作区暂存内容物化进可写层（命令能看到 `edit_file`
@@ -527,8 +543,8 @@
 - **常驻实例**：默认开启（`tools.sandbox.resident.enabled=true`）时，同一沙箱会话内 `run_command` 的
   T0 进程命令共享一个**常驻 bwrap 实例**——它在一个持久的 mount+pid+net+ipc+uts+cgroup
   命名空间内运行一个**命令服务器**（`bash` 从 stdin 读取请求），命令在服务器内执行。
-  因此 `&`/nohup/setsid 启动的后台进程**跨工具调用存活**，同一会话内 `ps`/`kill` 可见，
-  行为接近普通 bash（`sandbox/resident.lua`）。
+  因此 `&`/nohup/setsid 启动的后台进程**跨工具调用、且跨轮次（agentEnd 会话轮换）存活**，
+  同一会话内 `ps`/`kill` 可见，行为接近普通 bash（`sandbox/resident.lua`）。
 - **并发执行**：命令服务器按请求 id **多路复用**——每条命令独立 `setsid` 后台运行、输出写独立
   文件，完成后以 `flock` 加锁原子输出 `BEGIN/内容/END` 块，客户端按 id 解复用，故同一实例内
   多条命令**真正并行**且输出不交错。超时/取消由服务器在命名空间内按命令进程组终止（宿主无法
@@ -540,16 +556,32 @@
 - **服务器自愈**：命令服务器意外退出（外层 OOM / 被信号杀死）时，在途命令不再直接报
   「退出码 -1、无输出」——客户端据保留的启动参数**自动重建常驻实例并重试一次**（仅限非超时/
   非取消）；实例已死时下一条命令也据此重建，而不是静默回退一次性执行。
-- **依赖预检**：命令服务器依赖 `base64`/`flock` 做帧编解码与并发输出串行化；缺失时
-  `resident.available()` 返回 false，回退一次性执行（避免命令无输出地挂到超时）。
+- **卡死自愈（协议失步）**：帧头声明的载荷长度与实际发送字节不符时，服务器会阻塞在
+  `head -c`，读取循环停摆、后续所有请求排队后**全部超时**（表现为「命令通道整体卡死，连
+  `echo ok` 都超时」）。两道防线：①服务器脚本用 `timeout 30 head -c … || exit 1` 给载荷读取
+  加上限（缺失 `timeout` 时退化为无上限）；②命令超时后客户端主动发一个短超时探活 `X true`
+  ——服务器忙（命令仍在后台并发执行）时探针会立即返回，**保留实例与后台进程**；仅当探针也
+  超时（服务器确实卡死）才判定实例不可用并停止（保留启动参数），下一次命令自动重建。这样
+  卡死最多影响一条命令，不会让通道永久失效，也不会因误判而重建、误杀后台进程。
+- **依赖预检**：命令服务器依赖 `base64`/`flock` 做帧编解码与并发输出串行化、`mktemp` 创建每实例
+  唯一结果目录；缺失时 `resident.available()` 返回 false，回退一次性执行（避免命令无输出地挂到超时）。
+- **每实例独立结果目录**：请求载荷/输出/pid/lock 放在 `mktemp -d /tmp/.neoai_res.XXXXXX` 创建的
+  **每服务器唯一**目录（退出时 trap 清理），不再共用固定 `/tmp/.neoai_res`。固定路径会让**并存**
+  的命令服务器（并发 `ensure`、上个 nvim 会话残留的孤儿服务器）共用同一目录；它们各自从此实例的
+  `inst.seq`（从 1 起）编号，`out.<id>`/`pid.<id>` 同名互相 `rm`/读取，一方 `base64 "$__of"`
+  读到已被另一方删除的文件，把 `base64: ... No such file or directory` 写进该命令的输出块并顶替
+  命令结果。注意**不能**改用 `$$` 唯一化：常驻实例以 `--as-pid-1` 运行在独立 PID 命名空间内，
+  `$$` 恒为 1，无法区分并存实例。
 - **为何用命令服务器而非 nsenter**：bwrap 的根视图由 `chroot`/`pivot_root` 施加在**进程**
   （fs_struct）上，不属于 mount 命名空间；外部 `nsenter -m` 只能进入挂载表、拿不到该根，
   exec 会 `No such file or directory`。服务器在命名空间**内部**执行命令，天然拥有正确根视图。
-- **独立 overlay**：常驻实例使用独立 overlay 基目录（`<proc_dir>/resident`），不与一次性进程的
-  `<proc_dir>/<enc_root>` 竞争（同一 upper 不可并发挂载）；二者通过候选暂存层同步。
+- **独立 overlay**：常驻实例使用**稳定** overlay 基目录（`<sandbox_root>/resident`，不随会话轮换），
+  不与一次性进程的 `<proc_dir>/<enc_root>` 竞争（同一 upper 不可并发挂载）；二者通过候选暂存层同步。
   首次启动在**挂载前**把工作区暂存物化进 upper（宿主侧写入安全）；挂载后 AI 的新编辑由
   `resident.materialize()` 在**命名空间内**写回（写入走 overlay 挂载，避免 overlayfs
   「挂载期间宿主侧改 upper 未定义」）。命令结束后门禁在宿主侧**只读**遍历 upper 捕获改动。
+  shell 状态目录与私有 `/tmp` 也使用稳定/专用基目录（`resident.tmpfs_base`），避免与一次性路径
+  的会话目录互相清理。
 - **大文件物化（收件箱复制）**：常驻命令服务器从 stdin 读请求。帧头（一行）带**载荷字节长度**，
   载荷为**原始字节**（无需 base64）并由 `head -c` **分块**消费——既省去客户端一次整帧 base64
   编码（主线程）与服务器一次解码，也避免 bash `read` 内建**逐字节**读取数十 MB 物化帧
@@ -566,9 +598,16 @@
   进程组精确终止当前命令（`setsid` 独立进程组），不波及常驻实例与其它后台进程。
 - **回退**：overlay 不可用、嵌套 userns（T2）档位、特权档升级、启动/健康检查失败时自动回退
   一次性进程路径（不静默失败）。常驻实例与一次性路径的权限档位不可原地变更，档位升级会重建
-  常驻实例（其后台进程随之终止）。
-- **生命周期**：`sandbox.shutdown()`（`:qall` / 热重载 / 插件卸载）、会话轮换（agentEnd）与
-  `sandbox.reset()` 停止常驻实例（终止其命名空间内全部进程）。
+  常驻实例（其后台进程随之终止）。**有在途命令时不重建**：`resident.busy()` 为真时 `ensure`
+  返回 `RESIDENT_BUSY` 交回一次性执行，避免 `cgroup.kill` 连带杀死在途编译/后台进程
+  （表现为非 OOM 的 exit 137）。
+- **发布/拒绝后视图同步**：overlay lower 在挂载后变更不可靠可见，发布/拒绝后不能仅删除 upper
+  条目（会回退到过期 lower）。`resident.sync_real(paths)` 在命名空间内把真实盘内容写回 upper，
+  使后续命令读到最新内容（修复「读到旧版本」视图分裂）。
+- **生命周期**：`sandbox.shutdown()`（`:qall` / 热重载 / 插件卸载）与 `sandbox.reset()` 停止常驻实例
+  （终止其命名空间内全部进程）。**agentEnd 会话轮换不再停止实例**——只迁移工作区暂存内容；实例的
+  overlay/shell/tmp 目录为稳定路径，故后台进程跨轮次存活。轮换在 `resident.busy()` 时**延迟**
+  （最多重试若干次），避免迁移暂存与在途命令交错。
 - **配置**：`tools.sandbox.resident = { enabled }`（默认 `true`）。
 
 ### 内部长驻服务（`sandbox.service`，无 AI 工具）
@@ -586,74 +625,137 @@
 ### systemctl 门面（`tools.sandbox.systemd`，方案 A）
 
 **背景**：AI 常以 `systemctl start/restart <unit>` 验证服务。宿主 systemd 控制通道默认被遮蔽
-（`/run/dbus`、`/run/systemd`），沙箱内 `systemctl` 必然失败；默认 T2 路径会把主机效果冻结为
-hostop 提案并在宿主 replay。本门面让**独立**的 `systemctl`/`journalctl` 调用在沙箱内完成：
-服务进程在沙箱命名空间内运行（复用 `sandbox.service` 的独立 overlay + cgroup），写入停止时
-冻结为候选，**不调用宿主 systemd、也不修改宿主机**。
+（`/run/dbus`、`/run/systemd`），沙箱内真实 `systemctl` 必然 `Failed to connect to system scope
+bus`；默认 T2 路径会把主机效果冻结为 hostop 提案并在宿主 replay。本门面让 `systemctl`/
+`journalctl` 调用在沙箱内完成：服务进程在沙箱命名空间内运行（复用 `sandbox.service` 的独立
+overlay + cgroup），写入停止时冻结为候选，**不调用宿主 systemd、也不修改宿主机**。
 
-- **拦截**：`sandbox/systemd.lua` 的 `parse_command` 只识别**独立调用**（可跳过
-  `sudo`/`doas`/`env` 等前缀；复合命令 `a && systemctl …`、管道、脚本内调用不拦截）。
-  门禁在 `effect="process"` 分支、`container.plan` 同级调用 `wrapper._maybe_systemd`。
-- **支持矩阵**：
+**架构（解析/实现全在 Lua，沙箱内只有极薄入口）**：所有解析与实现都在
+`sandbox/systemd.lua` 的 `M.exec(argv)`（返回 `{stdout, stderr, code}`）。沙箱内
+`/usr/bin/systemctl`、`/usr/bin/journalctl`、`/usr/bin/systemd-run`、`/usr/bin/systemd-analyze`
+由 `runtime._maintscript_stubs` 生成的**极薄入口**覆盖（`--ro-bind` 到真实二进制路径，不再
+PATH 前置 `/tmp/.dynbin`）。入口是一个 bash 文件 IPC
+客户端：把 argv（NUL 分隔）写入宿主绑定进来的收件目录 `/run/systemd/units`，等待响应后按真实
+stdout/stderr/退出码返回。宿主侧由 `sandbox/systemd_ipc.lua` 以 fs_event（+ 兜底定时器）扫描并
+调用门面。因此**独立调用与脚本/管道调用走同一份实现、行为完全一致**，入口文件本身不含任何
+逻辑或可识别沙箱的注释/字样。
+
+- **拦截**：`sandbox/systemd.lua` 的 `parse_command` 识别**独立调用**（可跳过
+  `sudo`/`doas`/`env` 等前缀）。独立调用由门禁在 `effect="process"` 分支、`container.plan`
+  同级经 `wrapper._maybe_systemd` 直接路由到门面；复合命令 `a && systemctl …`、管道、脚本内
+  调用无法在门禁拆分，改由沙箱内入口经 IPC 转发到同一门面。
+- **支持矩阵（输出/错误/退出码对齐真实 systemctl）**：
   - 动词：`start`/`stop`/`restart`/`status`/`is-active`/`is-enabled`/`is-system-running`/
-    `is-failed`/`show`/`cat`/`daemon-reload`/`list-units`/`list-unit-files`；无单元名的
-    `status` 合成系统总览（`State: running`），`is-system-running` 恒返回 `running`，
-    `is-failed` 恒返回 `active`（沙箱无失败单元），避免环境探测暴露「非 systemd 环境」。
-  - 类型：`Type=simple`（默认）/`exec` 为长驻服务；`oneshot` 跑完即返回。
-  - 依赖：`Requires`/`Wants` 递归拉起，`After`/`Before` 拓扑排序（`max_deps` 上限）。
-  - 单元文件**优先读沙箱暂存副本**（AI 用 `edit_file`/`run_command` 新建/修改的 unit 可见）。
+    `is-failed`/`show`/`cat`/`daemon-reload`/`list-units`/`list-unit-files`。
+  - 成功静默：`start`/`stop`/`restart`/`daemon-reload` 成功时不打印（真实 systemctl 行为）。
+  - `is-system-running`/`is-failed` 反映**门面自身运行态**（有失败单元→`degraded`，否则
+    `running`；**不查询宿主**，避免把宿主的 `degraded` 泄漏进沙箱、与「健康 systemd」自相
+    矛盾）。退出码对齐真实：`is-system-running` running=0/否则 1；`is-failed` 仅 `failed`=0、
+    否则 1（`degraded` 也算非 failed）。
+  - `is-active`：`active`/`inactive`/`failed`/`activating`/`deactivating`；缺失单元返回
+    `inactive` 且退出码 4。`exited` 仅在退出码非零时计 `failed`（oneshot 正常退出=inactive）。
+  - **查询类动词非零退出不是工具失败**：`is-active`(3)/`is-enabled`(1)/`is-failed`(1)/
+    `is-system-running`(1)/`status`(3) 的非零退出是正常语义，工具层直接回传原文，不包装成
+    `{"ok":false}`（避免 AI 把「服务未运行」误判为工具报错）。
+  - `list-units`/`list-unit-files` 支持 `--failed`/`--state=`/`--type=`（`-t`）/`--all`：
+    `--state` 按 LOAD/ACTIVE/SUB 任一匹配（真实语义），`--type` 按后缀过滤；默认（无 `--all`）
+    只列非 inactive 的已加载单元，不再把全部单元文件一律列为 `inactive dead`。
+  - **无动词的 `systemctl` 等价于 `list-units`**（真实默认动词）：`systemctl --failed`、
+    `systemctl --state=failed`、`systemctl --all` 等过滤选项生效，不再因无动词而回退到
+    「默认列出全部 active 单元」。
+  - **基线运行单元**：系统 scope 额外呈现真实已启动系统必然存在的核心 target/基础服务
+    （`sysinit/basic/multi-user` 等 target、`systemd-journald`/`systemd-udevd`）为 `active`，
+    使 `list-units`、`--state=running`、`status` 与 `is-system-running=running` 自洽。
+  - `is-enabled`：`enabled`/`disabled`/`static`/`masked`/`not-found`（依据 `[Install]` 与
+    `.wants` 软链判定），退出码对齐（enabled/static=0，disabled/masked=1，not-found=4）。
+  - `status`/`show`/`cat`/`list-units`/`list-unit-files` 按真实字段与表头合成；`--version`
+    输出与宿主 `systemctl --version` 完全一致（生成时读取宿主版本，不再硬编码 `systemd 255`）。
+  - 缺失单元错误文本对齐真实：`Unit X not found.`、`Failed to start X: Unit X not found.`
+    （退出码 5）、`Unit X could not be found.`（status，退出码 4）、`Unknown command verb 'X'.`
+    （退出码 1）等；输出不含任何「沙箱/sandbox」字样。
+   - 类型：`Type=simple`（默认）/`exec` 为长驻服务；`oneshot` 跑完即返回。
+   - 依赖：`Requires`/`Wants` 递归拉起，`After`/`Before` 拓扑排序（`max_deps` 上限）。
+   - 单元文件**优先读沙箱暂存副本**（AI 用 `edit_file`/`run_command` 新建/修改的 unit 可见）。
+   - **基线单元写操作**：对基线运行单元（如 `systemd-journald`）执行 `start`/`restart` 幂等
+     成功、`stop` 置为 inactive，`start` 可再恢复——不再对系统单元一律报
+     `Operation not permitted`（受限容器/非真实 PID1 下真实 systemd 的拒绝语义）。
+- **`systemd-run`（临时单元，同样路由到门面）**：沙箱内 `/usr/bin/systemd-run` 也由极薄入口
+  覆盖并转发到同一门面（独立调用、复合/管道一致）。门面把命令作为**沙箱内后台服务**启动
+  （复用 `sandbox.service`），打印真实风格 `Running as unit: <name>`；支持 `--unit`/`-u`、
+  `--wait`（等待结束并透传单元退出码）、`--user`、`--setenv`/`-E`、`--working-directory`、
+  `-p WorkingDirectory=/Environment=/Description=`；未给 `--unit` 时自动命名
+  `run-r<hex>.service`。`--scope`/`-t`/`--pty`/`-P`/`--pipe` 等前台/交互 IO 语义无法经门面
+  可靠实现，返回明确错误（不再命中宿主真实二进制报「无法连接总线」）。临时单元在
+  `list-units`/`is-active` 中可见，`--collect` 由服务销毁自动等效。
+- **`systemd-analyze`（启动分析，路由到门面）**：沙箱内 `/usr/bin/systemd-analyze` 同样由极薄
+  入口覆盖并转发到门面。真实 `systemd-analyze` 依赖 system D-Bus 从 PID1 取启动分析（沙箱无
+  D-Bus，必然 `Failed to connect to system scope bus`）；门面改为合成**确定性且自洽**的数据：
+  `time`（firmware/loader/kernel/userspace 分段 + `… reached after …s in userspace.`）、
+  `blame`（按耗时降序的服务列表）、`critical-chain`、`unit-paths`、`--version`；无动词默认
+  `time`。未知动词返回真实风格 `Unknown command verb`。
+- **`journalctl`**：由门面合成输出（`-- Logs begin at …` 头 + 各单元服务日志；无日志时合成
+  若干系统行，`-n <N>` 限制行数），不再落到宿主真实 `journalctl`（后者会输出
+  `No journal files were found.`）。各行时间戳**逐条递增**（首尾覆盖 `Logs begin/end`），
+  不再所有行共用一个时间点。
 - **明确拒绝（不落宿主机、不回退 hostop）**：`Type=notify`/`notify-reload`/`forking`/`dbus`/
   `idle`、`.socket`/`.timer` 等单元、`User=`/`Group=`、systemd 说明符（`%n` 等）、
-  `Requisite`/`BindsTo`/`PartOf`；动词 `enable`/`disable`/`mask`/`reload`/`kill` 等，
-  以及 `poweroff`/`reboot`/`halt`/`kexec`/`suspend` 等宿主电源/内核状态操作。
-  返回「沙箱环境不支持 …」并发出 `SANDBOX_SYSTEMD_UNSUPPORTED`。
+  `Requisite`/`BindsTo`/`PartOf`；以及 `poweroff`/`reboot`/`halt`/`kexec`/`suspend` 等宿主
+  电源/内核状态操作。返回真实 systemctl 风格错误（如 `Failed to poweroff system via logind:
+  Access denied`），不暴露沙箱并发出 `SANDBOX_SYSTEMD_UNSUPPORTED`。
 - **回退 hostop**：门面不处理的动词（如 `isolate`）或指定其它主机/根的选项
   （`-H`/`--host`/`--root` 等）不拦截，落到既有 T2/hostop 提案路径（审批后宿主 replay）。
-- **留痕**：命中门面记录 `kind="privilege"` 证据并发出 `SANDBOX_SYSTEMD_ROUTED`；
-  输出经 `conceal` 脱敏，不泄露沙箱指纹。
+- **留痕**：命中门面记录 `kind="privilege"` 证据并发出 `SANDBOX_SYSTEMD_ROUTED`。
 - **环境外观（不可区分）**：门面开启（`systemd.enabled`，默认）时，进程沙箱额外建立
-  `sd_booted()` 标记 `/run/systemd/system`，并把 PID1 伪装为 `systemd`（覆盖
-  `/proc/1/comm|cmdline|stat|status`），使 `cat /proc/1/comm`、`ps -p 1 -o comm=` 等探测
-  无法区分「沙箱」与「真实 systemd 宿主」。伪装仅在 PID 命名空间隔离（`--as-pid-1`，
-  PID1 为载荷）时生效；LSP 等 `no_pid_ns` 场景 PID1 是宿主 init，不做伪装。门面关闭时
-  不建立标记、不伪装（`/run/systemd` 仍被遮蔽）。边界：D-Bus/真实 systemd 控制通道仍不可用，
-  深度探测（`systemd-analyze`、`sd_bus`）可能识破。
-- **配置**：`tools.sandbox.systemd = { enabled, mode="facade", max_deps, unit_roots, stage_install }`。
+  `sd_booted()` 标记 `/run/systemd/system`、把 PID1 伪装为 `systemd`（覆盖
+  `/proc/1/comm|cmdline|stat|status`），并绑定一个 `/run/systemd/private` 占位 socket
+  （仅外观，不实现 D-Bus 协议），使 `cat /proc/1/comm`、`ps -p 1 -o comm=`、`test -S
+  /run/systemd/private` 等探测无法区分「沙箱」与「真实 systemd 宿主」。伪装仅在 PID 命名空间
+  隔离（`--as-pid-1`，PID1 为载荷）时生效；LSP 等 `no_pid_ns` 场景 PID1 是宿主 init，不做伪装。
+  门面关闭时不建立标记、不伪装（`/run/systemd` 仍被遮蔽）。**边界**：入口是脚本而非 ELF
+  （`file /usr/bin/systemctl` 可识别）、D-Bus/真实 systemd 控制通道不可用，深度探测
+  （`systemd-analyze`、`sd_bus`、直接连接 `/run/systemd/private` 发 D-Bus 握手）可能识破。
+- **配置**：`tools.sandbox.systemd = { enabled, mode="facade", max_deps, unit_roots, stage_install, maintscript_stubs }`。
+- **维护脚本兼容桩**：`maintscript_stubs`（默认开）对**包安装命令**额外注入 `policy-rc.d`
+  （标准容器语义：拒绝维护脚本的服务动作，退出 101）。沙箱 PID1 非 systemd、无系统 dbus，
+  dpkg/apt postinst 直接调用宿主 `systemctl`/`invoke-rc.d`/`deb-systemd-invoke` 会连接总线失败
+  导致安装失败；注入后安装成功，服务不真正启动（沙箱内手动前台运行）。`systemctl --user` 由
+  伪造解析器处理（见上）；`maintscript_stubs=false` 可关闭 policy-rc.d。**入口本身**由
+  `systemd.enabled` 控制，对**所有**进程命令生效，与 `maintscript_stubs` 无关。
 - **enable/disable 软链暂存**：`stage_install`（默认开）时，系统级 `systemctl enable/disable`
-  不再直接拒绝：门面解析单元 `[Install] WantedBy/RequiredBy`，把软链变更（enable 建
+  解析单元 `[Install] WantedBy/RequiredBy`，把软链变更（enable 建
   `/etc/systemd/system/<target>.wants/<unit>` 链、disable 删链）经 `candidate.stage_link` /
-  `stage_delete` 暂存为待审候选，审批后应用；不落宿主机。用户级 `systemctl --user enable/disable`
-  由嵌套真实 systemd 执行，软链同样被捕获为候选（见「嵌套真实 systemd --user」）。
-- **已知限制**：模板/实例化单元（`foo@bar.service`）不支持；`[Install] Also=` 暂不展开。
+  `stage_delete` 暂存为待审候选，审批后应用；不落宿主机。返回真实 `Created symlink …` /
+  `Removed "…"` 文本。用户级 `systemctl --user enable/disable` 同样由门面的**伪造解析器**处理，
+  软链暂存到用户单元根（见「伪造 systemd --user 解析器」）。
+- **已知限制**：模板/实例化单元（`foo@bar.service`）不支持；`[Install] Also=` 暂不展开；
+  `Type=notify/forking/dbus` 等仍明确拒绝（真实 systemd 会执行，故此处是已知可识别差异）。
 
-### 嵌套真实 systemd --user（`tools.sandbox.systemd.user`）
+### 伪造 systemd --user 解析器（`tools.sandbox.systemd.user`）
 
-**背景**：门面（facade）以沙箱内长驻服务模拟 systemd，语义有限。开启本项后，会话级常驻沙箱实例
-内启动一个**真实的 `systemd --user` 用户实例**，AI 的 `systemctl --user ...` 命中真实 systemd
-语义（`daemon-reload`/`start`/`stop`/`status`/`list-units`/`is-active` …），且所有修改都不落宿主机。
+**背景**：沙箱环境是临时的（容器/评测机通常没有可用的 dbus 与 `systemd --user`，启动真实用户实例
+不稳定且依赖 cgroup 委派与 `/run/systemd` 标记）。因此 `systemctl --user` **不再启动真实
+`systemd --user`**，而由门面（`sandbox/systemd.lua`）用**伪造的解析器**处理，只覆盖简单
+`start`/`stop`/`restart`/`is-active`/`status`/`show`/`cat`/`list-units`/`daemon-reload` 与
+`enable`/`disable`。
 
-- **引导**：常驻实例的命令服务器在进入读取循环前执行引导片段（幂等）：
-  `mkdir /run/systemd/system`（满足 `sd_booted()`）、私有 `XDG_RUNTIME_DIR=/run/neoai-user`
-  （mode 0700）、私有会话 `dbus-daemon`，随后启动 `systemd --user` 并等待
-  `$XDG_RUNTIME_DIR/systemd/private` 就绪。环境变量 `XDG_RUNTIME_DIR`/`DBUS_SESSION_BUS_ADDRESS`
-  注入常驻实例，供后续命令继承。
-- **委派 cgroup**：`cgroup.prepare_delegated` 在共享父域 `neoai` 下创建一个**不驻留进程**的
-  子域并委派控制器，沙箱将其以可写方式 bind 到 `/sys/fs/cgroup`。systemd 只能在该子树内创建/
-  移动 cgroup（`<base>/neoai/neoai_deleg_sd_<session>`），不污染宿主其它 cgroup；释放时
-  `cgroup.kill` 后递归删除。这是 systemd 标准 delegation 模型，避免「宿主 cgroup 整体可写」。
-- **暂存与隔离**：单元文件位于 `$HOME/.config/systemd/user`（工作区 overlay），写入按次冻结为
-  候选；运行态在私有 tmpfs；服务进程在沙箱命名空间内。宿主 `/root/.config/systemd/user` 与
-  宿主 cgroup 层次不被改动。
-- **enable/disable 软链暂存**：`systemctl --user enable/disable` 由真实 user manager 执行，
-  其在 overlay 中创建的 `.wants/*.service` 软链被捕获为**符号链接候选**（候选文件条目新增
-  `link` 字段），与单元文件同批进入待审；审批后发布时以 `writer` 的 `symlink` 动作在真实盘创建
-  软链（CAS 用 `lstat`/`readlink` 校验基线）。`disable` 删除软链则作为 delete 候选。
-- **门面协同**：`systemd.parse_command` 识别 `--user` 为 `route="native"`，门面不拦截；
-  `privilege.classify` 将 `systemctl --user`/`journalctl --user` 视为最小权限（T0）。
-  未同时启用 `resident` 与 `systemd.user` 时，门面返回明确提示（不静默失败）。
-- **配置**：`tools.sandbox.systemd.user = { enabled }`（**默认开启**；需同时开启
-  `tools.sandbox.resident.enabled`，前置条件 bwrap + `dbus-daemon` + `systemd` 缺失时自动跳过）。
-  开启后首次启动常驻实例会等待 user manager 就绪（数秒）；不需要用户级 systemd 时可关闭。
+- **单元来源**：用户单元根 `~/.config/systemd/user`、`/etc/systemd/user`、`/usr/lib/systemd/user`、
+  `/lib/systemd/user`、`/run/systemd/user`（**优先沙箱暂存副本**，故 AI 本次写入的单元立即可见）。
+  可用 `tools.sandbox.systemd.user_unit_roots` 覆盖。
+- **解析**：复用系统级门面同一套 `.service` 解析（`[Unit]` 依赖、`[Service]` `Type`/`ExecStart`/
+  `Environment`/`WorkingDirectory`，仅支持 `simple`/`exec`/`oneshot`）。`start` 把 `ExecStart`
+  交给 `sandbox.service` 在沙箱内启动；`is-active`/`status` 由服务状态合成。
+- **命名空间隔离**：用户单元的服务 key 前缀为 `user-unit:`，与系统级 `unit:` 隔离，同名单元互不干扰。
+- **enable/disable 软链暂存**：`systemctl --user enable/disable` 把软链变更（enable 建
+  `~/.config/systemd/user/<target>.wants/<unit>` 链、disable 删链）经 `candidate.stage_link` /
+  `stage_delete` 暂存为待审候选，审批后应用；不落宿主机。
+- **门面协同**：`systemd.parse_command` 识别 `--user` 为 `route="facade"` 且 `scope="user"`
+  （不再有 `route="native"`）；`systemd_user.available()` 现仅要求门面启用（**不再需要**
+  `dbus-daemon`/`systemd` 二进制/真实 user manager），`systemd_user.needs_boot()` 恒为 false。
+- **配置**：`tools.sandbox.systemd.user = { enabled }`（默认开启；`enabled=false` 时
+  `systemctl --user` 报明确错误）。`tools.sandbox.systemd.user_unit_roots` 可自定义用户单元根。
+- **限制**：这是**伪造**语义——`Type=notify/forking/dbus` 等不支持；`systemctl --user` 无论
+  独立调用还是脚本/管道调用都由门面处理（后者经沙箱内入口 IPC 转发，见 §「systemctl 门面」）。
+
 
 ### 沙箱内降权与 cgroup 写隔离（PostgreSQL 等服务）
 
@@ -664,12 +766,12 @@ hostop 提案并在宿主 replay。本门面让**独立**的 `systemctl`/`journa
   它们不改变被包裹命令的档位（`sudo mount` 仍为 T2）。因此 PostgreSQL 等「拒绝 root 运行」的
   服务可在沙箱内以非 root 用户启动（`runuser -u postgres -- initdb …` / `pg_ctl …`）。
 - **属主跨命令持久**：`chown` 等 `sysadmin` 命令现走**会话级常驻实例**（`wrapper._resident_eligible`
-  允许 T1 sysadmin），与普通命令共享持久 overlay upper（`<proc_dir>/resident`）。此前 sysadmin
+  允许 T1 sysadmin），与普通命令共享持久 overlay upper（`<sandbox_root>/resident`，跨会话轮换稳定）。此前 sysadmin
   命令走一次性路径、overlay 独立，命令结束后属主改动不持久。
 - **cgroup 写隔离**：默认（`tools.sandbox.limits.delegate_cgroup=true`）在沙箱内把「委派的会话
-  cgroup 子树」以可写方式 bind 到 `/sys/fs/cgroup`（复用 `cgroup.prepare_delegated`），使 AI/服务
-  可创建子 cgroup 并写 `memory.max`/`cpu.max` 等，仅限该子树、不污染宿主其它 cgroup。网关模式
-  （`ip netns exec`）下该 bind 源不可解析，自动跳过。
+  cgroup **可写叶子**」bind 到 `/sys/fs/cgroup`（`cgroup.prepare_delegated`），使 AI/服务可创建
+  子 cgroup 并写 `memory.max`/`cpu.max` 等；上层限额层不可写，故写入无法突破会话限额、也不污染
+  宿主其它 cgroup。网关模式（`ip netns exec`）下该 bind 源不可解析，自动跳过。
 - **资源上限放宽**：默认 `memory_ratio=0.75`、`cpu_cores_max=8`、`pids_max=8192`，避免 npm 大依赖
   树/并行构建触发 OOM（`pids.max` 过小会表现为进程创建失败/OOM）。
 
@@ -688,8 +790,10 @@ hostop 提案并在宿主 replay。本门面让**独立**的 `systemctl`/`journa
   `pids.max`）、负载、PID1（systemd 探测）、容器实际配额（`cgroup_quota`）与已解析沙箱限制，
   用于区分「沙箱资源域」与「宿主容器 OOM」。
 - **环境不匹配提示**：命令输出命中 `System has not been booted with systemd` /
-  `Failed to connect to bus` 等特征时，结果追加提示「本环境无 systemd，systemctl/service 不可用；
-  请直接运行前台命令」。
+  `Failed to connect to bus` 等特征、**且 systemd 门面未启用**时，结果追加提示「本环境无
+  systemd，systemctl/service 不可用；请直接运行前台命令」。门面启用时 `systemctl`/`journalctl`
+  独立与复合调用均由门面处理、且 `/proc/1` 被伪装为 systemd，故不注入该提示（避免与沙箱内视图
+  「PID1 非 systemd」自相矛盾）。
 
 ### 网络镜像（`tools.sandbox.network.mirrors`）
 
@@ -883,6 +987,12 @@ seccomp（含设备节点屏障）**——沙箱内进程看到的是一份「�
   仅遮蔽 `mask_paths` 中的重要配置文件/凭据（见上）与沙箱自身存储——即「除重要配置文件外均可
   读写」，`/opt`、`/srv`、其他项目目录等都可写。`mask_dirs`（`/home`、`/root` 兄弟目录）
   不再挂载遮蔽。overlay 不可用时退回只读根（`overlay_fail_closed` 决定是否降级）。
+  > **「系统目录可写」是设计而非缺陷**：`/usr/bin`、`/etc` 等看似可写，是因为整机根以
+  > **可写 overlay** 暴露——写入只落会话私有 upper 并冻结为待审候选，**宿主真实盘不被改动**；
+  > 敏感条目（`/etc/shadow`、`/etc/sudoers`、`/etc/ssh`、cron 等）仍被 `mask_paths` 遮蔽。
+  > `/sys/fs/cgroup` 可写亦仅限于 `delegate_cgroup` 暴露的**委派子树**（`prepare_delegated`
+  > 的 `leaf`），限额写在不可写的 `limit_path` 上并按 cgroup v2 层级物理封顶；宿主其它 cgroup
+  > 不可见、不可写。`read_all=false` 时这些路径退回只读。
   - **越界访问留痕（非阻塞）**：访问 `cwd` 之外的用户工作目录（home/root 之下）时记录
     证据（`evidence` kind=observation）并发出 `sandbox:outside_access` 事件，同时在审批悬浮窗
     `:NeoAISandboxReview` 的「越界访问留痕」区展示；仍直接放行读取，不阻断。展示时**按文件
@@ -995,11 +1105,26 @@ seccomp（含设备节点屏障）**——沙箱内进程看到的是一份「�
   记录经 `run_command` 结果摘要回传，并写入 `network` 证据。
 - **T0 默认放行网络**：`tools.sandbox.privilege.tiers[0].network = true`，T0 不再
   `--unshare-net`；`offline=true` 时仍硬隔离（优先于档位）。
+- **访问策略（`network.access`）**：沙箱内部创建的进程/端口（回环 + `allow_localhost_ports` +
+  服务端口登记表，见 `sandbox/net_consent.lua`）在沙箱内访问**免权限**；访问沙箱外（宿主本机
+  其他端口、宿主网卡 IP、外部主机）按 `access` 处理：`"ask"`（默认）弹窗请求用户同意，
+  `"allow"` 直接放行并记录（旧行为），`"deny"` 直接拒绝。弹窗由
+  `ui/components/net_consent.lua` 提供（`<CR>` 仅本次 / `S` 本次会话始终 / `Esc` 拒绝），
+  决策经 `sandbox/net_consent` 的服务端会话白名单记忆。headless/无 UI 时失败关闭（拒绝）。
+  发起请求时发 `sandbox:net_consent_requested` 事件。长驻服务启动时按 `PORT`/`--port` 等
+  声明自动登记内部端口（`net_consent.register_from_command`）。
 - **边界（重要）**：这是**应用层**过滤。**不认代理的裸 TCP**（`nc`/`ssh`/数据库客户端、
   忽略代理变量的工具）在共享 netns 下可直连宿主本机，不受此层约束。要硬拦截裸 TCP 只能：
   root + iptables/nft（按目的地过滤），或无 root 的 `slirp4netns`/`passt`（原生用户态
   网络栈，本机未安装）——本插件不引入这些依赖。故本机拦截为「非硬边界」，见
   `sandbox/host_proxy.lua` 模块头。
+- **代理规避门禁**：显式清除/绕过代理（`unset *proxy`、`env -u *proxy`、`curl --noproxy`、
+  `--proxy ""`/`-x ''`、`export *proxy=`）会使上述过滤失效，门禁在进入沙箱前对**折叠后的
+  有效命令**拒绝（`PROXY_EVASION:*`，`network.block_proxy_evasion`，默认开）。判定前先做
+  shell 规范化：还原引号拼接（`--noprox''y`）、ANSI-C 引用（`$'--noproxy'`）与反斜杠转义，
+  并展开同一命令内 `NAME=value` 的简单变量（`c=--noproxy; curl $c`），防止静态扫描被拼接/
+  变量绕过。`-x` 仅在 curl 段上等同 `--proxy`（`set -x`/`tar -x`/`grep -x`/`bash -x` 等
+  非代理开关不再误报硬拒绝）。
 - **残余信息泄露（共享 netns 固有）**：因 T0 共享宿主网络命名空间，`/proc/net/tcp`、
   `/proc/net/unix`（宿主连接/Unix socket 清单）、`ip addr`/`ip route`（netlink，宿主拓扑）
   对沙箱可见。`/proc/net` 是 `self/net` 符号链接，无法用挂载遮蔽；netlink 也不经挂载。
@@ -1017,6 +1142,17 @@ seccomp（含设备节点屏障）**——沙箱内进程看到的是一份「�
   `ssh-keysign`/`fusermount3`/`chrome-sandbox` 等），但 `NoNewPrivs=1` 使 setuid/文件 capability
   一律被忽略，且 `mount`/`clone(CLONE_NEWUSER)` 已被 seccomp 拦截、`/dev/fuse` 不存在，
   故不可借其提权。
+- **capability bounding set（残余，已被 NNP 中和）**：`bwrap --cap-drop ALL` 只清空
+  effective/permitted/ambient，**不缩减 bounding set**——`/proc/self/status` 的 `CapBnd`
+  仍为全 1。这是 bubblewrap 的既定行为（它没有设置 bounding set 的选项）。但载荷同时带有
+  `NoNewPrivs=1`，execve 会忽略 setuid 位与文件 capability，且 `CapEff` 无 `CAP_SETPCAP`，
+  进程无法自行从 bounding set 抬升能力，故不可利用。若追求 defense-in-depth，可在 bwrap 外
+  再套 `setpriv --bounding-set=-all`（本插件未引入，依赖属可选加固）。
+- **`LD_PRELOAD` / 动态库注入（非安全边界）**：沙箱**不剥离** `LD_PRELOAD`/`LD_LIBRARY_PATH`；
+  在载荷进程内注入代码无法越过内核强制的 namespace/seccomp/cgroup 边界，但可绕过
+  **应用层**的观测 shim（PATH/`LD_PRELOAD` 包装）。文档中的「共享库冲突」行为（缺失库仅告警、
+  进程照常运行）是 glibc `ld.so` 语义，非沙箱逻辑，也不构成隔离缺陷。
+
 - **与独立 netns 网关（`network.gateway`）互斥**：后者启用时由网关提供代理，本拦截自动让位。
 
 ## 7. 配置
@@ -1056,7 +1192,7 @@ require("NeoAI").setup({
       expose_tool_paths = false,     -- 自动直通宿主 PATH 工具目录（opt-in，默认关；使 $HOME 下 node/npm/fd/go 可用）
       appimage_extract_and_run = true, -- AppImage：注入 APPIMAGE_EXTRACT_AND_RUN=1 解包运行（沙箱不暴露 /dev/fuse，无法挂载）
       resolv_conf = "sanitize",      -- /etc/resolv.conf：sanitize（默认，仅 nameserver）| hide | passthrough
-      tmpfs_roots = { "/tmp", "/var/tmp" }, -- 每会话私有临时根（不作为 overlay lower；退出即销毁）
+      tmpfs_roots = { "/tmp", "/var/tmp" }, -- 每会话私有临时根（不作为 overlay lower；同一 nvim 进程内稳定持久，退出/实例回收清理）
       ephemeral_roots = { "/tmp", "/var/tmp" }, -- 临时候选根（cwd 子树除外）：写入会话私有、退出即丢弃，不产生待审/审批
       tmp_private_base = "host",     -- host（默认，宿主根下的隐藏子目录，命名空间映射回该根）| session
       hide_proc_paths = { "/proc/cmdline", "/proc/version" }, -- 追加隐藏项（危险 sysctl 强制表只增不减）
@@ -1085,7 +1221,7 @@ require("NeoAI").setup({
         deny_tools = {},             -- 硬拒绝工具名（确认亦不可覆盖）
         rules = {},                  -- 受限 Lua 规则函数数组
       },
-      limits = { wall_ms = 60000, dynamic = true, memory_ratio = 0.5, cpu_cores_max = 4, cpu_global_max = 0, pids_max = 2048 },
+      limits = { wall_ms = 60000, dynamic = true, memory_ratio = 0.75, cpu_cores_max = 8, cpu_global_max = 0, pids_max = 8192 },
     },
   },
 })
@@ -1175,10 +1311,11 @@ run_command overlay 候选捕获（含删除 whiteout 捕获与尝试目录清�
 
 ### AI 读取到密钥时的提示
 
-当工具结果被 token 化（AI 读取到 `NEOKEY_*`）时，`tools/executor` 会在结果末尾附加说明：
-「`NEOKEY_*` 为沙箱密钥 token——真实密钥已被沙箱遮蔽，仅对 AI 不可见，**不代表程序出错、
-也不影响程序实际运行**（写入文件时自动替换回原有真实密钥）。沙箱只遮蔽密钥形态的高熵串，
-路径、函数名、构建哈希等原样保留。」环境变量侧另有 `NEOAI_TOKENIZED_ENV` 信号（见密钥防护章节）。
+当工具结果被假化（AI 读取到密钥）时，默认**不附加说明**（保持格式保真，AI 无感）；
+设 `tools.sandbox.secrets.disclose_fakes=true` 后 `tools/executor` 会在结果末尾附加说明：
+「结果中的密钥为沙箱生成的**格式保真假密钥**——真实密钥已被沙箱遮蔽，仅对 AI 不可见，
+**不影响程序实际运行**（写入文件/沙箱执行时自动替换回真实密钥）。」环境变量侧另有
+`NEOAI_TOKENIZED_ENV` 信号（见密钥防护章节）。
 
 ### 外部操作 broker
 
@@ -1223,9 +1360,17 @@ run_command overlay 候选捕获（含删除 whiteout 捕获与尝试目录清�
 ### cgroup v2 资源域
 
 每次外部进程尝试使用独立资源域 `tools.sandbox.limits`。默认 `dynamic = true`：按宿主资源
-动态推导上限——内存 = `MemTotal * memory_ratio`（默认 0.5，受 `memory_max_bytes` 上限约束）、
-CPU = `min(核数, cpu_cores_max)` 个核（默认 4）、PID = `pids_max`（默认 2048）；静态
+动态推导上限——内存 = `MemTotal * memory_ratio`（默认 0.75，受 `memory_max_bytes` 上限约束）、
+CPU = `min(核数, cpu_cores_max)` 个核（默认 8）、PID = `pids_max`（默认 8192）；静态
 `memory_bytes`/`pids`/`cpu_max`（>0）优先于动态推导。
+
+**进程归属与越限语义**：载荷通过 `cgroup.join_prefix` 加入资源域，而该前缀被**前置在 `bwrap`
+之前**执行（`sh -c 'echo $$ > cgroup.procs; exec "$@"' sh bwrap …`）——写入的是宿主 PID，
+`bwrap` 及其全部后代按进程血缘**继承**该资源域，故载荷确实受 `memory.max`/`pids.max`/`cpu.max`
+约束。cgroup v2 越限的表现是内核**先回收、再 OOM-kill（SIGKILL，退出码 137）**，而**不是**
+进程内可捕获的 `MemoryError`/`ENOMEM`；`memory.events` 的 `max`/`oom_kill` 计数增长恰说明限额
+**已被执行**。用「Python 分配未抛 `MemoryError`」判定配额失效是语义误读：若限额高于测试分配量
+（动态默认 `MemTotal*0.75` 通常远大于 400 MiB）则不会触发任何回收。
 
 **容器感知**：容器内 `/proc/meminfo` 的 `MemTotal` 与 `nproc` 常反映**宿主**资源，若直接按之推导
 会把 `memory.max` 设得比容器实际可用还高（形同虚设，OOM 由外层容器触发而子域 `memory.events`
@@ -1386,32 +1531,63 @@ overlay 会 `EINVAL`），此时命令只能运行在「只读根 + 私有可写
 
 ## 16. 密钥防护（secrets，常开）
 
-`sandbox/secret.lua` 让 AI 看不到、也用不了真实密钥：基于熵检测，进沙箱加密为随机 token，
-仅在 commit 发布到真实工作区时解密。**加密后的 key（token）与敏感环境变量名**出现时只留痕
-并在待审悬浮窗**提级警告**（判为密钥操作：工作区内 L2 / 工作区外 L3，强制待审，
-`⚠ 密钥操作`），**不终止 Agent**；
-仅当**原始密钥**（未加密的真实值）出现在**工具参数**或 **AI 可见上下文**（即将发给模型的
-wire 消息）中时，才硬拦截并立即终止整个 Agent——后者说明 token 化被绕过（沙箱上下文被突破）。
+`sandbox/secret.lua` 让 AI 看不到、也用不了真实密钥：基于熵检测 + 具名规则，进沙箱把密钥替换为
+**格式保真假密钥**（保留原格式前缀、长度与字符类，香农熵不低于原始值；进程内映射表，不落盘），
+仅在 commit 落盘、沙箱进程执行、私有视图物化时还原为真实值。
+
+- **假密钥**出现在工具参数或 AI 可见上下文时**警告用户并留痕**（`⚠ 密钥操作`，工作区内 L2 /
+  工作区外 L3，强制待审），**不终止 Agent**。
+- **真实密钥**（未假化的真实值）出现在工具参数或 AI 可见上下文时，**立即停止 Agent 并弹窗**
+  （`ui/components/secret_alert`），用户确认后才继续，否则保持停止；headless 无 UI 时失败关闭。
+  弹窗**标明来源命令/工具、命中的真实密钥、以及将替换使用的假密钥**，选项：保留真实密钥仅本次允许 /
+  **替换为假密钥并继续** / 停止 Agent（出网场景另有「加入白名单」）。
+  可经 `tools.sandbox.secrets.alert.enabled=false` 关闭弹窗（此时按 fail-closed 直接停止）。
+- **误还原判断**：还原仅当假密钥**不嵌于更长的凭据字符串**（前后非字母/数字/`_`/`-`）时发生；
+  二进制 blob 走整块精确匹配，避免部分子串误替换。
+
 注：检测前会解析路径/代码语义，`api_key = os.getenv("..._API_KEY")` 这类代码表达式不会被当作
-原始密钥；赋值右侧为**敏感环境变量名引用**（如 `api_key=DASHSCOPE_API_KEY`、`PASSWORD=MY_SECRET_TOKEN`）
-时同样不登记为原始密钥——变量名只是引用，登记会让后续任何提及该名字的普通代码/文档被误判为
-泄露。**敏感环境变量名（全大写、含敏感段）只监控**：留痕 + 提级待审，永不触发硬拦截/终止。
+原始密钥；赋值右侧为**敏感环境变量名引用**（如 `api_key=DASHSCOPE_API_KEY`）时同样不登记。
+**敏感环境变量名（全大写、含敏感段）只监控**：留痕 + 提级待审，永不触发硬拦截/终止。
 
 **环境变量密钥值软处理**：`sanitized_env` 会把敏感环境变量的真实值登记为「环境变量密钥」
-（`secret.is_env_secret`）。这类值在 AI 可见输出中被**兜底明文 token 化**——即便裸值（纯 hex /
-无具名前缀）未处于 `NAME=value` 赋值上下文、所在文件不触发高熵扫描，也会被替换为 token；
-且它们**不触发上下文硬拦截**（`context_leak` 跳过环境变量密钥）。即「密钥环境变量只
-token 化/告警，不终止 Agent」。非环境变量的原始密钥（具名规则命中或高熵登记）仍照常硬拦截。
+（`secret.is_env_secret`），在 AI 可见输出中兜底假化；且它们**不触发上下文停止**（`context_leak`
+跳过环境变量密钥）。即「密钥环境变量只假化/告警，不停止 Agent」。
 
-**二进制内容不当文本处理（无损）**：暂存/冻结时，仅对**文本**内容（合法 UTF-8 且不含 NUL）
-做密钥 token 化；二进制文件（OpenPGP keyring、图片、可执行文件等）**跳过 token 化**，逐字节
-保留。候选/待审/快照的 JSON 持久化改用**无损编码**（`json.encode_lossless`：非法 UTF-8 字符串
-以 base64 哨兵表保存，`decode_lossless` 还原），不再把非法字节清洗为 U+FFFD（`EF BF BD`）——
-此前该清洗会在「二次确认 → 应用」链路把二进制 keyring 内容损坏（无法再被 `sqv`/gpg 解析）。
-普通文本的编码结果与原来完全一致。
+### 16.1 格式保真假密钥
+
+具名规则（私钥块、`AKIA`、`ghp_`、`xoxb-`、`AIza`、`sk-`、JWT、Bearer/Basic 等）按各自的
+前缀与字符集生成假值（JWT 保留 `eyJ` 头与 `.` 分隔、私钥块保留头/尾行，仅随机化 base64 主体）；
+未登记的规则按**逐字符类保持**（大写/小写/数字各自随机，符号原样）。生成时以不同派生种子重试，
+直到长度一致且熵不低于原始值。对已假化文本再次假化是幂等的（不会产生「假密钥的假密钥」）。
+默认**不告知 AI**（保持格式保真）；`disclose_fakes=true` 时在工具结果附加说明。
+
+### 16.2 二进制密钥文件
+
+`binary_fake=true`（默认）时，敏感二进制密钥文件（`.p12`/`.pfx`/keystore/raw key 等，按
+`secret.is_sensitive_path` 判定）被读取或暂存时，用**同长度随机字节**整块假化，以
+`NEOAI_BINARY:<len>:<b64>` 标记经 AI 可见通道传输；落盘/执行时按整块精确匹配还原真实字节。
+普通二进制（图片、可执行文件、非敏感 keyring）仍逐字节保留、不做任何替换。
+
+### 16.3 出网白名单与密钥外发拦截
+
+向**非白名单**地址发送密钥（真实值，或将在沙箱内被还原的假密钥）时弹窗阻止并警告；白名单地址
+**不弹窗也不警告**。`tools.sandbox.secrets.trusted_services` 支持精确主机、`*.suffix` 通配、
+IP/CIDR；`auto_trust_providers=true` 时已配置的模型供应商 `base_url` 主机自动信任。覆盖路径：
+`utils/http`（程序化 HTTP：模型/MCP-HTTP）、沙箱子进程（`curl`/`wget`/`nc` 等网络命令）、
+`run_command`。目标主机不可判定时按非白名单处理。**环境变量仅在其变量名被命令引用时**参与判定，
+避免沙箱注入的真实密钥环境变量导致所有命令被误判。弹窗**标明目标、来源命令与命中的密钥**，
+选项：仅本次允许 / 加入白名单 / 停止 Agent；headless 失败关闭。
+
+### 16.4 数据流账本与不透明派生
+
+`flow_tracking=true` 时记录每个假密钥的来源（具名规则 / 环境变量 / 文件 / 二进制）与所有流经点
+（工具参数、命令、环境变量、宿主落盘路径、commit），并写入 evidence（`kind="secret_flow"`）。
+命令/脚本可能对密钥做**不可逆加密/变换**，此类派生文件无法逐字还原，故标记为
+`derived_opaque`（「不透明派生」），在待审界面红色提示并**强制人工确认**后才可发布。
+
 
 > **chat 界面高亮「获取/使用密钥的命令」**：工具块渲染时扫描其**参数**与**结果**（模型上下文），
-> 命中沙箱 token（`NEOKEY_*`）或**具名规则**命中的原始密钥时，在该工具折叠块**外**单独追加
+> 命中沙箱假密钥或**具名规则**命中的原始密钥时，在该工具折叠块**外**单独追加
 > 告警并施加 `NeoAISecretWarning`（红色加粗下划线）高亮。告警**按项换行格式化**（便于阅读，
 > 不再把多项逗号挤在一行）：首行 `⚠ 密钥：<工具> <获取/使用>`，命令单独一行，命中的密钥文件 /
 > 类型 / 环境变量**各占一行**（标题行 + 逐项缩进）。告警**明确区分两种情况**：
@@ -1441,7 +1617,7 @@ token 化/告警，不终止 Agent」。非环境变量的原始密钥（具名�
 > 判定，`scan_names` 也排除 `SANDBOX_SECRET_*` 内部事件标识，避免把内部标识误当作敏感环境变量名，
 > 渲染出「密钥环境变量：SANDBOX_SECRET_BLOCKED」这类无意义告警。
 > 折叠标题保持干净（不再追加 `⚠ 密钥`），收起状态也能看到独立的高亮警告行。含密钥时工具调用的
-> **参数与结果完整展示（不截断）**，行内命中的密钥值（`NEOKEY_*` token / 具名规则原始密钥）以同组
+> **参数与结果完整展示（不截断）**，行内命中的密钥值（假密钥 / 具名规则原始密钥）以同组
 > 高亮；轨迹显示模式在工具行追加同款文本标记并同样行内高亮。见
 > `ui/components/message_list.lua`、`ui/components/fold.lua`。
 >
@@ -1535,59 +1711,67 @@ token 化/告警，不终止 Agent」。非环境变量的原始密钥（具名�
 - `allowlist` 可再加 Lua pattern 排除。参数见
   [configuration.md](configuration.md) 的 `tools.sandbox.secrets`。
 
-### 环境变量：沙箱进程拿到真实值，AI 只见 token
+### 环境变量：沙箱进程拿到真实值，AI 只见假密钥
 
-`sanitized_env()` 生成 token 化覆盖（供日志/审计与 AI 可见面）；`sandbox_env()` 在构造沙箱
-进程环境时会把 token 还原为真实密钥——**token→真实密钥的替换仅允许发生在沙箱内部进程**。
+`sanitized_env()` 生成假化覆盖（供日志/审计与 AI 可见面）；`sandbox_env()` 在构造沙箱
+进程环境时会把假密钥还原为真实密钥——**假→真实的替换仅允许发生在沙箱内部进程**。
 因此：
 
 - 沙箱内程序（`curl`/`pip`/`python` 等）使用**真实密钥**，不会因遮蔽而 401 / 构建失败。
-- 命令输出回传模型前会重新 token 化，AI 仍只看到 `NEOKEY_<hex>`；`NEOAI_TOKENIZED_ENV`
-  列出被遮蔽的变量名，便于判断哪些值在 AI 可见输出中是 token。
-- 需要整体关闭环境变量 token 化（调试 / 本地可信运行时）时，设
+- 命令输出回传模型前会重新假化，AI 仍只看到格式保真的假密钥；`NEOAI_TOKENIZED_ENV`
+  列出被遮蔽的变量名，便于判断哪些值在 AI 可见输出中是假密钥。
+- 需要整体关闭环境变量假化（调试 / 本地可信运行时）时，设
   `tools.sandbox.secrets.tokenize_env = false`；工具结果与暂存内容仍按密钥防护处理。
   **注意这会降低隔离强度，仅建议在可信环境临时使用。**
 
 ### 加密映射与生命周期
 
-- 每个真实密钥分配一个随机 token（`NEOKEY_<hex>`）；映射表**仅在内存**，不落盘。
-- **进沙箱加密**：工具结果（`read_file`/`run_command`/… 回传模型前）、工作区暂存视图
-  （`candidate._base_entry` / `merge_candidate`）与 `run_command` 的**环境变量**都做 token 化，
+- 每个真实密钥分配一个**格式保真假密钥**（前缀/长度/字符类一致，熵不低于原始）；映射表
+  **仅在内存**，不落盘（仅假密钥集合可在会话内持久化用于热重载 fail-closed 检测）。
+- **进沙箱假化**：工具结果（`read_file`/`run_command`/… 回传模型前）、工作区暂存视图
+  （`candidate._base_entry` / `merge_candidate`）与 `run_command` 的**环境变量**都做假化，
   供 AI / 日志 / 待审 UI 面使用。
-- **token→真实密钥的替换仅限沙箱内部进程**：`sandbox_env()` 还原环境变量，门禁把命令参数
+- **假→真实密钥的替换仅限沙箱内部进程**：`sandbox_env()` 还原环境变量，门禁把命令参数
   （`ctx.sandbox_command`，exec 工具还原 argv）与物化进 overlay 的文件
-  （`materialize_overlay`）中的 `NEOKEY_` 还原为真实值，使 `pip`/`python -m build`/`curl`
-  等程序正常运行。AI 上下文、日志、证据与待审 UI 仍只看到 token（命令输出回传前重新 token 化）。
-- **出沙箱解密**：只在 commit / CAS 发布写入真实文件时把 token 还原为密钥
+  （`materialize_overlay`）中的假密钥还原为真实值，使 `pip`/`python -m build`/`curl`
+  等程序正常运行。AI 上下文、日志、证据与待审 UI 仍只看到假密钥（命令输出回传前重新假化）。
+- **出沙箱解密**：只在 commit / CAS 发布写入真实文件时把假密钥还原为密钥
   （`candidate.publish`）。映射缺失（如热重载后）时**拒绝发布**（`SECRET_UNRESOLVED`），
-  绝不把 token 当内容写入真实文件。
-- 暂存视图 token 化后，`base_hash`（真实基线，用于 CAS 冲突检测）与
-  `view_base_hash`（token 化基线，用于改动判定）分开记录，保证只读工具与编辑一致。
+  绝不把假密钥当内容写入真实文件。
+- 暂存视图假化后，`base_hash`（真实基线，用于 CAS 冲突检测）与
+  `view_base_hash`（假化基线，用于改动判定）分开记录，保证只读工具与编辑一致。
 
 ### 留痕与告警
 
-- 每次检测到新密钥、以及工具参数中用到 token 或出现敏感环境变量名，都写入一条
+- 每次检测到新密钥、以及工具参数中用到假密钥或出现敏感环境变量名，都写入一条
   `kind="secret"` 证据。
-- 工具参数用到 token 或出现敏感环境变量名（全大写、含 `KEY`/`TOKEN`/`SECRET`/`PASSWORD`/
+- 工具参数用到假密钥或出现敏感环境变量名（全大写、含 `KEY`/`TOKEN`/`SECRET`/`PASSWORD`/
   `CREDENTIAL` 段，长度 ≥ 6；如 `GIT_COMMIT_AI_API_KEY`）时置 `ctx.secret_operation`，
   候选按密钥操作判级（工作区内 L2 / 工作区外 L3）并**强制待审**（`auto=false`），
-  **不终止 Agent**。
-- 候选内容涉及 token，或本次调用命中敏感环境变量名时，待审变更单元带 `secret_warning`，
-  `NeoAISandboxReview` 悬浮窗以红色 `⚠ 密钥操作×N` 醒目提示（含环境变量名，见
-  [configuration.md](configuration.md)）。
-- 事件：`SANDBOX_SECRET_DETECTED` / `SANDBOX_SECRET_TRACED` / `SANDBOX_SECRET_BLOCKED`。
+  **不终止 Agent**，同时 `vim.notify` 警告用户。
+- 候选内容涉及假密钥，或本次调用命中敏感环境变量名时，待审变更单元带 `secret_warning`，
+  `NeoAISandboxReview` 悬浮窗以红色 `⚠ 密钥操作×N` 醒目提示。
+- 事件：`SANDBOX_SECRET_DETECTED` / `SANDBOX_SECRET_TRACED` / `SANDBOX_SECRET_BLOCKED` /
+  `SANDBOX_SECRET_ALERT` / `SANDBOX_SECRET_EGRESS`。
 
-### 原始密钥硬拦截（工具参数与 AI 上下文）
+### 原始密钥：立即停止 + 弹窗确认
 
-映射表中已知的**原始密钥**出现在以下**任一**位置时终止整个 Agent：
+映射表中已知的**原始密钥**出现在以下**任一**位置时，**立即停止 Agent 并弹窗**：
 
-1. **工具参数**（深度扫描，出向）：拒绝该工具调用（`SANDBOX_SECRET_BLOCKED`）；
+1. **工具参数**（深度扫描，出向）：停止 Agent，弹窗请用户确认（`secret_alert`）；
 2. **AI 可见上下文**（请求前扫描 `core/agent/recovery` 即将发送的 wire 消息）：说明沙箱
-   token 化被绕过（沙箱上下文被突破），拒绝该轮请求。
+   假化被绕过（沙箱上下文被突破），停止 Agent 并弹窗。
 
-两种情况都会：调用 `core.agent.runtime.abort(agent, "secret_exposure")` **立即终止整个
-Agent**；发出 `SANDBOX_SECRET_BLOCKED` 事件并 `vim.notify` 明确通知用户。token
-（`NEOKEY_*`）不触发终止，只提级审批。
+弹窗明确展示：**哪个命令/工具获取到**（工具名 + 命令/路径；上下文场景为命中的消息序号与角色）、
+**获取到了什么密钥**（命中的真实密钥值）、以及**将替换使用的假密钥**。选项：
+
+- **保留真实密钥仅本次允许**：继续执行/发送（发 `SANDBOX_SECRET_ALERT` 事件）；
+- **替换为假密钥并继续**：工具参数（`secret.tokenize_args`）或 AI 可见上下文/历史消息
+  （`secret.replace_value`）中的真实密钥被就地替换为格式保真假密钥后继续；
+- **停止 Agent**：调用 `core.agent.runtime.abort(agent, "secret_exposure")` 保持停止。
+
+**headless 无 UI 时失败关闭**（直接停止）。假密钥不触发停止，只警告 + 提级审批。
+
 
 > **环境变量名不算原始密钥**：映射表只登记**凭据值**，不登记敏感环境变量名本身。赋值右侧为
 > 变量名引用（`api_key=DASHSCOPE_API_KEY`）不登记；即便因历史状态被登记，`find_real_secret`
@@ -1611,8 +1795,8 @@ Agent**；发出 `SANDBOX_SECRET_BLOCKED` 事件并 `vim.notify` 明确通知用
 - 发 `SANDBOX_SECRET_DETECTED`（`source="generated"`）并 `audit.observe`（`GENERATED_HIGH_ENTROPY`）；
 - 候选按密钥操作提级并**强制进入待审**（悬浮窗 `⚠ 密钥操作`），不终止 Agent。
 
-`NEOKEY_*` token（宿主密钥的加密形式）不计入生成检测，由 `warn_for_files` 处理。命令输出/
-工具参数中的生成密钥经 `tokenize_result`/`tokenize_args` 走既有 token 化路径。
+已知假密钥（宿主密钥的遮蔽形式）不计入生成检测，由 `warn_for_files` 处理。命令输出/
+工具参数中的生成密钥经 `tokenize_result`/`tokenize_args` 走既有假化路径。
 
 ### 16.2 本机 SSH 服务禁止访问
 
@@ -1908,9 +2092,11 @@ L2+ 与包/密钥仍进入待审。目的是即便仅靠本地模型的智能水
   仍返回 `EPERM`（需 copy-up）。属内核限制，postinst 通常已容错；必要时在脚本里 `|| true`。
 - **`git clone`/`git init`**：放行（新建仓库，`.git` 由候选层按 `git_path_class` 原子捕获）；
   `commit/checkout/fetch/pull/push/add/reset/…` 仍拦截，改走专用 git 工具。
-- **本机端口白名单**：默认拦截所有本机目标；沙箱内服务自测可设
-  `tools.sandbox.network.allow_localhost_ports = { 5432, 6379 }`（仅放行**回环 + 白名单端口**；
-  宿主网卡 IP/链路本地/云元数据永不放行）。
+- **本机端口白名单 / 沙箱外访问**：沙箱内启动的服务端口默认免权限（长驻服务按 `PORT`/`--port`
+  自动登记，或设 `tools.sandbox.network.allow_localhost_ports = { 5432, 6379 }`，仅放行
+  **回环 + 白名单端口**；宿主网卡 IP/链路本地/云元数据永不放行）。其余沙箱外目标按
+  `tools.sandbox.network.access` 处理：`ask`（默认，弹窗同意）| `allow` | `deny`；headless
+  无 UI 时失败关闭。
 - **`grpcurl` 等不在发行版源**：非沙箱限制；走语言生态安装（如
   `go install github.com/fullstorydev/grpcurl/cmd/grpcurl@latest`，经 Go proxy）。
 - **`SANDBOX_STAGING_UNCOVERED`**：存在未发布暂存但本次命令无 overlay 可写层时默认拒绝；
@@ -1918,3 +2104,85 @@ L2+ 与包/密钥仍进入待审。目的是即便仅靠本地模型的智能水
 - **定位固定开销**：`tools.sandbox.diagnostics.enabled = true` 后，日志记录
   `[sandbox-profile] gate:<tool>` 端到端耗时与 `settle`（风险分级/入队/发布）耗时，用于区分
   执行慢还是冻结/结算慢。
+
+## 19. 已知边界与残余风险（审计分级）
+
+本节按审计发现分级记录：**已修复 / 已缓解 / 设计边界**。设计边界是「不引入新依赖或
+不破坏正常联网/构建」的取舍结果，不是缺陷；缓解手段也可能被更复杂的命令绕过。
+
+### 19.1 网络
+
+- **代理规避（已缓解）**：`host_local_block` 依赖代理变量生效，显式清除/绕过代理
+  （`unset *proxy`、`env -u *proxy`、`curl --noproxy`、`--proxy ""`/`-x ''`、`export *proxy=`）
+  会让过滤失效、直达宿主本机。门禁在命令进入沙箱前识别并对**脚本折叠后的有效命令**拒绝
+  （`PROXY_EVASION:*`），由 `tools.sandbox.network.block_proxy_evasion`（默认开）控制。
+  判定前先做 shell 规范化（引号拼接 `--noprox''y`、ANSI-C 引用 `$'--noproxy'`、反斜杠转义）
+  并展开同命令内简单变量（`c=--noproxy; curl $c`），避免拼接/变量绕过；`-x` 仅对 curl 视为
+  `--proxy`，避免 `set -x` 等被误报。
+- **裸 TCP（设计边界）**：不认代理的工具（`nc`/`ssh`/数据库客户端/自建 socket）在共享 netns
+  下不经代理即可直连宿主本机。内核层按目的地过滤需要 root + iptables/nft 或
+  `slirp4netns`/`passt`（本插件不引入）。要硬边界请启用 `network.gateway`（独立 netns）。
+- **回环过度拦截（已缓解）**：共享 netns 下无法按地址区分宿主/沙箱回环，故默认对未登记的回环
+  目标走 ask/deny。现按 **cgroup 归属**自动识别沙箱内进程监听的端口（LISTEN socket inode 属于
+  `/neoai/` 域）并登记为内部端口免权限——沙箱内命令启动的临时服务（未走 service 模块、未声明
+  `PORT`）首次被访问即放行；宿主回环服务仍走策略（SSRF 防护不削弱）。
+- **私网地址不拦截（设计边界）**：`host_proxy` 只判定「宿主本机」（回环/宿主网卡 IP/链路本地/
+  元数据），RFC1918 私网（`10/8`、`172.16/12`、`192.168/16`）中非宿主网卡的地址仍可经代理转发。
+  如需拦截，将其加入 `host_local_block` 的判定集合（会同时阻断正常 LAN 访问）。
+
+### 19.2 systemd 门面
+
+- **行为对齐真实 systemctl（已完善）**：`daemon-reload`/`start`/`stop`/`restart` 成功静默；
+  `is-system-running`/`is-failed` 返回**门面自身运行态**（不再查询宿主，避免泄漏宿主
+  `degraded`）；`is-active`/`is-enabled` 按状态与退出码返回；`status`/`show`/`cat`/
+  `list-units`/`list-unit-files` 按真实字段合成，`list-units` 支持 `--failed`/`--state`/
+  `--type`/`--all` 且默认隐藏 inactive、并呈现核心基线运行单元；`journalctl` 各行时间戳递增；
+  错误文本与退出码对齐（`Unit X not found.`、`Unknown command verb` 等），输出不含「沙箱」字样。
+  查询类动词（`is-active`/`is-enabled`/`is-failed`/`is-system-running`/`status`）的非零退出
+  是正常语义，工具层不包装为 `ok:false`。
+- **入口一致性（已修复）**：解析/实现全在 Lua；沙箱内 `systemctl`/`journalctl`/`systemd-run`/
+  `systemd-analyze` 为极薄入口，独立调用由门禁直接路由、脚本/管道调用经入口文件 IPC 转发到
+  同一门面，**两者行为完全一致**，不再存在「复合命令命中真实二进制并报无法连接总线」的矛盾。
+  `systemd-run` 的临时单元在沙箱内以后台服务运行（`--wait` 透传退出码）；`systemd-analyze`
+  的 `time`/`blame` 等由门面合成；基线系统单元的 start/stop/restart 幂等成功（不再报
+  `Operation not permitted`）；无动词 `systemctl` 按 `list-units` 处理（`--failed` 等生效）。
+- **`service`/`invoke-rc.d` 未路由（设计边界）**：门面拦截 `systemctl`/`journalctl`/`systemd-run`/`systemd-analyze`；
+  `service`/`invoke-rc.d` 仅在**包安装**时经 policy-rc.d 兼容（服务不真正启动）。
+  需要用户级服务请用 `systemctl --user`（由门面的伪造解析器处理简单 start/stop；
+  见「伪造 systemd --user 解析器」）。
+- **深度伪装边界**：入口是脚本而非 ELF；D-Bus/真实 systemd 控制通道不可用；`/run/systemd/private`
+  仅为占位 socket（无 D-Bus 握手）。`systemd-analyze`/`sd_bus` 等深度探测仍可能识破。
+
+### 19.3 能力与资源域
+
+- **底层网络命令按能力门禁（已修复）**：`iptables`/`ip6tables`/`nft`/`arptables`/`ebtables`
+  不再按命令名无条件拒绝；缺少 `CAP_NET_ADMIN` 时拒绝（`CAPABILITY_REQUIRED:*`），显式授予
+  该能力后放行。注意 `cap_add = { "ALL" }` **不会**重新授予被全局 `cap_drop` 丢弃的能力
+  （如 `CAP_NET_ADMIN`），必须在档位/全局显式列出。
+- **cgroup 控制器门禁（已修复）**：仅当 `cgroup.controllers` 实际暴露对应控制器时才写
+  `memory.max`/`pids.max`/`cpu.max`；写入结果经 `handle.applied`/`handle.unavailable` 暴露，
+  `:NeoAISandboxDiag` 增加 `cgroup_controllers`，避免把 `resolved_limits`（意图）当作已生效。
+  控制器缺失/写入失败时记录告警，不再静默虚报。
+- **委派子树物理封顶（已修复）**：`prepare_delegated` 改为**两层**——限额写在不可写的
+  `limit_path`（`.../neoai_deleg_<id>`，不暴露给沙箱），暴露给沙箱的是其下可写叶子
+  `.../leaf`（`handle.path`，systemd/AI 只能在此建子 cgroup）。沙箱即便抬升叶子的
+  `memory.max`/`cpu.max`，`limit_path` 仍按 cgroup v2 层级物理封顶；并补写父域全局
+  `cpu.max`（此前委派路径漏设，导致「记账封顶但物理分配不受控」）。
+
+### 19.4 文件与进程
+
+- **tar 属主还原（已修复）**：沙箱环境默认注入 `TAR_OPTIONS=--no-same-owner`（保留并追加已有
+  值），避免载荷 euid=0 但无 `CAP_CHOWN` 时 GNU tar `fchown` EPERM（典型：node-gyp 解压头文件）。
+- **可执行位（已加固）**：大文件 blob 复制后显式 `chmod`（`fs_copyfile` 不保留权限位）；发布/
+  物化路径本就携带 `mode` 并在权限位变化时重新物化。
+- **overlay 视图一致性（设计边界）**：overlayfs lower 在挂载后变更不可靠可见；发布/拒绝后经
+  `candidate.invalidate` 失效物化条目。会话内**真实盘的外部改动**不被反映（快照语义），
+  这是 overlay 一致性边界，非延迟 bug。
+- **`/var/cache/apt` 等他人属主目录**：依赖 T0/T1 基线的 `CAP_DAC_OVERRIDE`；移除该能力后
+  普通命令会 `Permission denied`（见 18.8）。
+- **后台进程存活（设计边界）**：默认启用会话级常驻实例（`tools.sandbox.resident`）时后台进程
+  跨调用存活；常驻不可用（overlay 不可用 / T2 嵌套 userns / 启动失败）时回退一次性 pid
+  命名空间，命令结束即 `cgroup.kill` 回收，后台进程不存活（结果附 UI 提示）。
+- **PID 复用（残余）**：一次性实例每次从 PID 1 重新编号；常驻实例按记录的进程组终止命令，
+  极端情况下（进程组 leader 已退出且 PID 被复用）可能误伤同命名空间内无关进程组；实例目录 GC
+  按宿主 PID 判定，PID 复用时会保守地保留陈旧目录（仅占磁盘，不误删）。

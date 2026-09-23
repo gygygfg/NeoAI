@@ -107,14 +107,13 @@ local DEFAULT_CONFIG = {
       interval_sec = 3600,
       timeout_ms = 10000,
     },
-    -- 按三种会话模式（CHAT / PLAN / AUTO）分别配置提供商与模型参数。
+    -- 按两种会话模式（CHAT / PLAN）分别配置提供商与模型参数。
     -- 进入某模式时应用该模式对应的 provider/model/temperature/stream，
     -- 系统提示等全局项仍由 ai.system_prompt 提供。缺省字段回退到 ai.default_provider / 默认值。
     -- max_tokens 缺省不配置：请求不发送该参数，由模型/厂商默认最大输出决定；仅在此显式配置时才下发。
     modes = {
       chat = { provider = "deepseek", model = "auto", temperature = 0.7, stream = true },
       plan = { provider = "deepseek", model = "auto", temperature = 0.3, stream = true },
-      auto = { provider = "deepseek", model = "auto", temperature = 0.7, stream = true },
     },
     -- 输出被截断（finish_reason=length/max_tokens/MAX_TOKENS）且无工具调用时的处理：
     -- 自动附加续写提示重发（提示只进请求、不落库），直到获得正文/工具调用或达到次数上限；
@@ -286,7 +285,7 @@ local DEFAULT_CONFIG = {
       cancel = { key = "<Esc>", desc = "取消生成" },
       toggle_reasoning = { key = "r", desc = "切换思考过程显示" },
       switch_model = { key = "M", desc = "切换模型" },
-      cycle_mode = { key = "m", desc = "循环切换模式（CHAT/PLAN/AUTO）" },
+      cycle_mode = { key = "m", desc = "循环切换模式（CHAT/PLAN）" },
       cycle_display = {
         insert = { key = "<C-t>", desc = "循环切换显示模式（对话/轨迹）" },
         normal = { key = "T", desc = "循环切换显示模式（对话/轨迹）" },
@@ -610,6 +609,11 @@ local DEFAULT_CONFIG = {
         "/usr/local/include", "/usr/local/go",
         -- 宿主系统状态/包数据库：整目录只读暴露（dpkg/apt/rpm 等）；危险子路径仍由 mask_paths 遮蔽
         "/var/lib",
+        -- 语言运行时/虚拟环境解释器：venv 的 `bin/python` 常是指向这些目录的符号链接
+        -- （uv 管理的 CPython、pyenv、virtualenv）。read_all=false 时若不暴露，激活 venv 后
+        -- `python` 会变成悬空链接并报 `command not found`。仅暴露解释器与工具目录，不含凭据。
+        "/usr/share/pyenv", "~/.pyenv", "~/.local/share/uv/python", "~/.local/share/virtualenvs",
+        "~/.virtualenvs", "~/.local/bin", "~/.nvm", "~/.cargo", "~/.rustup",
       },
       -- 最小 /etc 必要文件（白名单）：命令运行所需，避免整目录暴露（含 shadow/machine-id/ssh）。
       -- 注意 `/etc/resolv.conf` 不在此列，见下方 `resolv_conf`。
@@ -689,12 +693,23 @@ local DEFAULT_CONFIG = {
         -- 代理拦截本机目标、放行外部并记录；网络整体仍为「放行 + 记录」。
         -- 边界：应用层过滤——不认代理的裸 TCP 可绕过（共享 netns 无法按目的地做内核过滤）。
         host_local_block = true,
+        -- 代理规避门禁（默认开）：host_local_block 生效时，拒绝显式清除/绕过代理变量的命令
+        -- （unset *proxy、env -u *proxy、curl --noproxy、--proxy "" 等），因为这些命令会使
+        -- 应用层过滤失效、直达宿主本机。裸 TCP（nc/ssh/自建 socket）无法由此覆盖，属已知边界。
+        block_proxy_evasion = true,
         -- 宿主过滤代理监听端口（0 = 自动分配 loopback 随机端口）。
         host_local_proxy_port = 0,
         -- 本机端口白名单（默认空 = 拦截所有本机目标）：仅放行**回环地址 + 这些端口**的
         -- 本机访问，供沙箱内启动的服务自测（如 DB/Redis：5432/6379）。宿主网卡 IP、链路本地、
         -- 云元数据（169.254.169.254）永不放行。例：{ 5432, 6379 }。
         allow_localhost_ports = {},
+        -- 沙箱网络访问策略：沙箱内部创建的进程/端口（回环 + allow_localhost_ports +
+        -- 内部端口登记表）在沙箱内访问**免权限**；访问沙箱外部（宿主本机其他端口、宿主网卡、
+        -- 外部主机）按此策略处理：
+        --   "ask"（默认）= 弹窗请求用户同意（headless/无 UI 时失败关闭）；
+        --   "allow"       = 直接放行并记录（旧行为）；
+        --   "deny"        = 直接拒绝。
+        access = "ask",
         -- 国内/受限网络镜像（默认空 = 完全沿用系统配置）。仅对**沙箱外部命令**生效，
         -- 通过环境变量注入（npm 另经 settings 绑定）。用于绕过代理/源站不可达：
         --   pip   = "https://pypi.tuna.tsinghua.edu.cn/simple"（注入 PIP_INDEX_URL + PIP_TRUSTED_HOST）
@@ -784,8 +799,10 @@ local DEFAULT_CONFIG = {
         -- 使更多大文件走复制、缩小每次物化帧。0 = 回退 tools.sandbox.max_file_bytes。
         max_embed_bytes = 262144,
       },
-      -- systemctl 门面（方案 A）：AI 的 `systemctl`/`journalctl` 独立调用被路由到沙箱内
-      -- 长驻服务（复用 sandbox.service），不调用宿主 systemd、也不修改宿主机。支持
+      -- systemctl 门面（方案 A）：**所有**解析与实现都在 Lua（`sandbox/systemd`），沙箱内
+      -- `/usr/bin/systemctl`、`/usr/bin/journalctl` 是极薄入口（bash 文件 IPC 客户端），把 argv
+      -- 转发给宿主门面后按真实 stdout/stderr/退出码返回。独立调用由门禁直接路由；脚本/管道调用
+      -- 经入口走同一门面，行为与独立调用完全一致。不调用宿主 systemd、也不修改宿主机。支持
       -- simple/exec/oneshot 与 Requires/Wants/After/Before 依赖；Type=notify/forking/dbus、
       -- socket/timer 等语义明确报错；门面不处理的动词回退 T2/hostop 提案路径。
       systemd = {
@@ -796,16 +813,25 @@ local DEFAULT_CONFIG = {
           "/etc/systemd/system", "/run/systemd/system",
           "/usr/lib/systemd/system", "/lib/systemd/system",
         },
-        -- 嵌套真实 systemd --user：在会话级常驻沙箱实例内运行 user manager，AI 的
-        -- `systemctl --user` 命中真实 systemd 语义；单元文件/软链落在工作区 overlay 暂存，
-        -- 运行态在私有 XDG_RUNTIME_DIR，cgroup 仅限委派的会话子树——所有修改不落宿主机。
-        -- 需同时开启 tools.sandbox.resident.enabled。默认开启（前置条件缺失时自动跳过）。
+        -- 伪造 systemd --user 解析器：`systemctl --user` 由门面解析用户单元根，处理简单
+        -- start/stop/is-active/status/show/cat/list-units/daemon-reload 与 enable/disable（软链暂存）。
+        -- 不启动真实 systemd/dbus（临时沙箱环境更稳定）。默认开启；enabled=false 时 `--user` 报错。
         user = {
-          enabled = true, -- 是否在沙箱内启动真实 systemd --user
+          enabled = true, -- 是否启用伪造的 systemctl --user 解析
         },
+        -- 用户单元文件搜索目录（优先沙箱暂存副本，再读真实文件）；缺省为
+        -- `~/.config/systemd/user`、`/etc/systemd/user`、`/usr/lib/systemd/user`、`/lib/systemd/user`、
+        -- `/run/systemd/user`。
+        user_unit_roots = nil,
         -- 系统级 `systemctl enable/disable`：解析单元 [Install] WantedBy/RequiredBy，
         -- 把软链变更（enable 建链 / disable 删链）暂存为待审候选，审批后应用；不落宿主机。
         stage_install = true,
+        -- 维护脚本兼容桩（默认开）：包安装的 dpkg/apt postinst 会调用
+        -- invoke-rc.d/deb-systemd-invoke/systemctl；沙箱 PID1 非 systemd、无系统 dbus，直接调用
+        -- 宿主 systemctl 会连接总线失败。为包安装命令额外注入 policy-rc.d（标准容器语义：拒绝
+        -- 维护脚本的服务动作，退出 101），使安装成功、服务不真正启动（沙箱内手动前台运行）。
+        -- systemctl/journalctl 入口本身由 `enabled` 控制，对所有命令生效，与此开关无关。
+        maintscript_stubs = true,
       },
       -- 异步审批（设计文档 §15）：AI 修改立即沙箱执行并冻结候选，      -- 用户异步确认允许哪些文件/配置修改后再 CAS 应用。
       review = {
@@ -1164,10 +1190,10 @@ local DEFAULT_CONFIG = {
       lsp_overlay = {
         enabled = true,
       },
-      -- 密钥防护（常开）：基于熵检测高熵密钥，进沙箱替换为随机 token、仅在 commit 还原；
-      -- 对 token（加密后的 key）或敏感环境变量名的出现留痕并提级强制待审（悬浮窗警告），
-      -- 不终止 Agent；仅当**原始密钥**出现在工具参数或 AI 可见上下文中时硬拦截并终止 Agent
-      -- （见 docs/sandbox.md §16）。
+      -- 密钥防护（常开）：基于熵检测高熵密钥，进沙箱替换为**格式保真假密钥**（同长度/同字符类/
+      -- 熵不低于原始；进程内映射表，不落盘），仅在 commit 落盘、沙箱执行、私有视图物化时还原为
+      -- 真实值。**假密钥**出现在工具参数或 AI 上下文时警告用户（不阻断）；**真实密钥**出现时
+      -- 立即停止 Agent 并弹窗，用户确认后才继续（headless 失败关闭）。详见 docs/sandbox.md §16。
       secrets = {
         enabled = true, -- 总开关
         min_length = 20, -- 候选密钥最小长度
@@ -1176,7 +1202,7 @@ local DEFAULT_CONFIG = {
         min_distinct = 8, -- 最少不同字符数
         exclude_pure_hex = true, -- 排除纯小写十六进制（git SHA/sha256/md5 等哈希）
         -- 缩小密钥认定范围：裸高熵串须呈密钥形态（含 - / _ 分隔符）或处于敏感变量名赋值
-        -- 上下文（KEY=/TOKEN:/PASSWORD= 等）才 token 化；纯字母数字/base64（SRI integrity、
+        -- 上下文（KEY=/TOKEN:/PASSWORD= 等）才替换；纯字母数字/base64（SRI integrity、
         -- 内容哈希、构建产物摘要等）不再误伤 package-lock.json / python -m build。
         -- 设为 false 退回旧的「任意高熵串即密钥」行为。
         entropy_requires_context = true,
@@ -1189,8 +1215,25 @@ local DEFAULT_CONFIG = {
         -- 0 表示不限制。默认宽松，兼顾安全与卡顿。
         generated_scan_max_bytes = 2 * 1024 * 1024,
         generated_scan_max_files = 200,
-        tokenize_env = true, -- 是否对沙箱进程环境变量 token 化（false = 原样注入，调试用）
-        -- 具名敏感信息规则（Lua pattern）：命中即脱敏/token 化（无视熵阈值），覆盖
+        tokenize_env = true, -- 是否对沙箱进程环境变量替换为假密钥（false = 原样注入，调试用）
+        -- 二进制密钥文件（.p12/.pfx/keystore/raw key 等）被读取时，用同长度随机字节替换，
+        -- 以 base64 标记 `NEOAI_BINARY:<len>:<b64>` 传输，落盘/执行时精确还原真实字节。
+        binary_fake = true,
+        -- 是否向 AI 披露「这些是假密钥」。默认 false（保持格式保真）。
+        disclose_fakes = false,
+        -- 数据流账本：记录假密钥来源与所有流经点（工具/命令/环境变量/落盘），命令/脚本加密
+        -- 等不可逆变换产生的派生文件标记为「不透明派生」，发布前强制人工确认。
+        flow_tracking = true,
+        -- 真实密钥出现时的确认弹窗（headless 无 UI 时失败关闭 = 停止 Agent）。
+        alert = {
+          enabled = true,
+          timeout_ms = 0, -- 0 = 不超时（一直等待用户决策）
+        },
+        -- 置信服务白名单：向这些主机发送密钥不弹窗也不警告。支持精确主机、`*.example.com`
+        -- 通配、IP/CIDR。已配置的模型供应商 base_url 主机默认自动信任（见 auto_trust_providers）。
+        trusted_services = {},
+        auto_trust_providers = true,
+        -- 具名敏感信息规则（Lua pattern）：命中即假化（无视熵阈值），覆盖
         -- 私钥块、带前缀 token（AKIA/ghp_/sk-…）、JWT、Bearer 等结构化凭据。
         -- 配置 rules 将替换内置规则；extra_rules 在内置/配置规则之外追加。
         extra_rules = {},

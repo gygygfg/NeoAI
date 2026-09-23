@@ -3,8 +3,10 @@
 --- 后台异步、非阻塞压缩：
 --- 1. 达到 token 压力阈值时，先做模型无关的工具结果裁剪（tool_result_pruner）；
 ---    裁剪后已回到阈值内则跳过摘要调用。
---- 2. 仍需摘要时，折叠第一轮至倒数第二轮（保留最后一轮完整）；溢出恢复则做最大化
----    平衡头部缩减（retain 0，只保留最新一个不可分单元，绝不拆散 tool_calls 与其结果）。
+--- 2. 仍需摘要时，折叠第一轮至倒数第二轮（保留最后一轮完整）；若没有更早的用户轮次
+---    （单轮长工具循环），回退为按 retain 预算的平衡头部缩减，折叠本回合较早轮次；
+---    溢出恢复则做最大化平衡头部缩减（retain 0，只保留最新一个不可分单元，绝不拆散
+---    tool_calls 与其结果）。
 --- 3. 辅助摘要调用「逐字节回放」请求视图前缀：相同的系统提示、工具 schema、被折叠区消息，
 ---    再把压缩指令作为最后的 user 消息追加 → 复用 provider 的热前缀缓存。
 --- 4. 摘要结果写入压缩覆盖层 `agent.compaction = { checkpoint, replaced }`，**不改动
@@ -330,20 +332,23 @@ local function _compact(agent, cfg, opts)
     else
       -- 默认（阈值触发）：折叠第一轮至倒数第二轮，保留最后一轮完整。
       shadow, added = _select_round_shadow(agent, cfg)
-    end
-    if #shadow == 0 then
-      if not compacted_any then
-        logger.warn("[compactor] 可折叠消息过少，无法压缩")
+      -- 单轮长工具循环：没有更早的用户轮次可折叠（最后一条 user 即本回合起点）时，
+      -- 回退为按保留预算的头部缩减，折叠本回合较早轮次、保留最近尾部；
+      -- 切点保持工具配对平衡，避免压缩后出现孤立 tool 结果。
+      if not added or added == 0 then
+        shadow = _select_shadow_range(agent, cfg, {})
       end
-      return finish(compacted_any)
     end
-    if opts.mode == "overflow" then
+    if opts.mode == "overflow" or not added or added == 0 then
       added = 0
       for _, m in ipairs(shadow) do
         if m and not m.runtime_context and not m.checkpoint then added = added + 1 end
       end
-    elseif not added or added == 0 then
-      -- 仅剩检查点、没有可折叠的原始消息：不再重复摘要。
+    end
+    if #shadow == 0 or added == 0 then
+      if not compacted_any then
+        logger.warn("[compactor] 可折叠消息过少，无法压缩")
+      end
       return finish(compacted_any)
     end
     return _summarize(agent, shadow, cfg):then_(function(response)

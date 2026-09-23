@@ -38,7 +38,7 @@ NeoAI 是一款面向 Neovim 的 AI 驱动聊天插件，可将 AI 助手直接�
      plan_mode、ask_user、read_image、web_fetch（默认不启用）、sub-agent、skills
    - 工具审批工作流：默认 `mode="async"`——工具立即在沙箱内执行并冻结候选，
      真实修改进待审队列（`:NeoAISandboxReview` 确认应用）；`prompt`/`strict` 才用
-     串行单槽队列弹窗确认（自动允许配置、按工具权限覆盖、AUTO 模式、审批超时）
+     串行单槽队列弹窗确认（自动允许配置、按工具权限覆盖、审批超时）
    - 沙箱风险分级：L0-L3 对应 auto/record/review/block，默认 `review`（待审）
    - Plan mode：仅允许只读/信息类工具 + ask_user；修改类工具受门控
    - Plan 蒸馏：审批通过时，将 plan 阶段的研究上下文蒸馏为一个
@@ -179,7 +179,6 @@ lua/NeoAI/
 :NeoAICycleDisplay  " 循环切换显示模式（chat / trajectory）
 :NeoAIReloadDisplay " 热重载显示模式插件
 :NeoAIPlan          " 切换 plan mode
-:NeoAIAuto          " 切换 AUTO 模式（自动允许所有工具调用）
 :NeoAIApprovePlan   " 批准 plan 并切换到 CHAT 模式
 :NeoAIStatusline    " 预览 lualine 状态栏组件内容
 ```
@@ -257,6 +256,5 @@ require('NeoAI').setup({
 | `:NeoAICycleDisplay` | 循环切换聊天显示模式（chat / trajectory） |
 | `:NeoAIReloadDisplay [name]` | 热重载某个显示模式插件 |
 | `:NeoAIPlan` | 切换 plan mode（只读/信息类工具 + ask_user） |
-| `:NeoAIAuto` | 切换 AUTO 模式（自动允许所有工具调用） |
 | `:NeoAIApprovePlan` | 批准 plan，切换到 CHAT，执行任务列表 |
 | `:NeoAIStatusline` | 预览 lualine 状态栏组件内容 |

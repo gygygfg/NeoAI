@@ -164,13 +164,24 @@ function M.run(argv, opts)
     for _, v in ipairs(argv) do
       full[#full + 1] = (type(v) == "string") and (secret.detokenize(v)) or v
     end
-    return _spawn(full, {
-      cwd = ictx.sandbox_cwd or opts.cwd,
-      env = ictx.sandbox_env,
-      timeout_ms = opts.timeout_ms,
-      signal = opts.signal,
-      kill = ictx.sandbox_kill,
-    })
+    local function spawn()
+      return _spawn(full, {
+        cwd = ictx.sandbox_cwd or opts.cwd,
+        env = ictx.sandbox_env,
+        timeout_ms = opts.timeout_ms,
+        signal = opts.signal,
+        kill = ictx.sandbox_kill,
+      })
+    end
+    -- 出网守卫：命令/env 含密钥且指向非白名单地址时弹窗阻止（白名单不警告）。
+    local real_cmd = {}
+    for _, v in ipairs(argv) do
+      real_cmd[#real_cmd + 1] = (type(v) == "string") and (secret.detokenize(v)) or tostring(v)
+    end
+    local guard = require("NeoAI.sandbox.secret_egress").guard_process(
+      table.concat(real_cmd, " "), ictx.sandbox_env, { tool = tool.name })
+    if guard then return guard:then_(spawn) end
+    return spawn()
   end)
 end
 
@@ -202,6 +213,9 @@ function M.open(argv, opts)
   local candidate = require("NeoAI.sandbox.candidate")
   local store = require("NeoAI.sandbox.store")
   local root = store.root() or (vim.fn.stdpath("cache") .. "/NeoAI/sandbox")
+  -- 与 run_command 共用同一稳定临时根基目录：子进程与命令看到同一 /tmp（否则子进程得到
+  -- 空 `--tmpfs`，与命令的 /tmp 分裂，临时产物/venv 符号链接在两侧不可见）。
+  local tmp_base = runtime.stable_tmp_base()
   local spec = { effect = "process", paths = {}, writable_roots = roots }
   local ctx = {}
   local attempt = control.new_attempt("exec_" .. tostring(opts.name or "open"), { command = opts.command }, ctx, spec)
@@ -216,7 +230,7 @@ function M.open(argv, opts)
   for _, r in ipairs(candidate.staged_overlay_roots(known)) do extra[#extra + 1] = r end
   local specs = wrapper.build_overlay_specs(real_cwd, proc_dir, extra)
   for _, s in ipairs(specs) do
-    if runtime.overlay_available() and runtime.overlay_writable(s.root, s.upper, s.work) then
+    if runtime.overlay_writable(s.root, s.upper, s.work) then
       s.mode = "overlay"
     else
       s.mode = "bind"
@@ -240,6 +254,7 @@ function M.open(argv, opts)
   }
   local prefix, perr = runtime.process_prefix({
     cwd = real_cwd, overlays = specs, privileges = priv, ro_binds = opts.ro_binds,
+    session_tmp_dir = tmp_base, tmpfs_base = tmp_base,
   })
   if not prefix then
     candidate.cleanup(attempt.attempt_id)

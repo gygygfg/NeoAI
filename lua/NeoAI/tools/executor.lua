@@ -341,32 +341,91 @@ local function _args_string_bytes(v)
   return n
 end
 
---- 处理扫描结果（命中硬拦截 / 软提级 / fs_write token 化）
---- @return boolean ok
+--- 处理扫描结果（命中真实密钥 → 停止+弹窗确认；假密钥 → 警告不阻断；fs_write 参数假化）
+--- 返回：
+--- - `true`：通过（同步）
+--- - `false, err`：拒绝（同步）
+--- - `Deferred`：需要用户确认（resolve true 继续 / reject err 停止）
+--- @return boolean|Deferred
 --- @return table|nil err
 local function _handle_scan_result(scan, tool, tool_name, args, ctx)
   if scan.secret then
     secret.trace("blocked", { tool = tool_name })
     local agent = ctx and ctx.agent
-    if agent then
-      pcall(function() require("NeoAI.core.agent.runtime").abort(agent, "secret_exposure") end)
-    end
     pcall(function()
       require("NeoAI.kernel.event_bus").emit(require("NeoAI.kernel.events").SANDBOX_SECRET_BLOCKED, {
         tool = tool_name, agent_id = agent and agent.id,
       })
     end)
-    pcall(vim.notify,
-      "[NeoAI] 检测到对原始密钥的操作，已拦截并终止 Agent（工具: " .. tostring(tool_name) .. "）",
-      vim.log.levels.ERROR)
-    return false, { kind = "secret", message = "SANDBOX_SECRET_BLOCKED: 工具参数包含原始密钥，已终止 Agent" }
+    local err = { kind = "secret", message = "SANDBOX_SECRET_BLOCKED: 工具参数包含原始密钥，已终止 Agent" }
+    local function stop()
+      if agent then
+        pcall(function() require("NeoAI.core.agent.runtime").abort(agent, "secret_exposure") end)
+      end
+      pcall(vim.notify,
+        "[NeoAI] 检测到对原始密钥的操作，已停止 Agent（工具: " .. tostring(tool_name) .. "）",
+        vim.log.levels.ERROR)
+      return false, err
+    end
+    -- 来源命令/参数描述：优先取命令类工具的 command，否则回退到路径，供弹窗标明「哪个命令获取到」。
+    local source
+    if type(args) == "table" then
+      if type(args.command) == "string" and args.command ~= "" then
+        source = args.command
+      elseif type(args.file_path) == "string" then
+        source = "文件: " .. args.file_path
+      elseif type(args.path) == "string" then
+        source = "路径: " .. args.path
+      end
+    end
+    -- 替换为假密钥：弹窗展示的 fake 与实际替换使用的一致。
+    local fake = secret.fake_for and secret.fake_for(scan.secret) or nil
+    local function replace_with_fake()
+      secret.tokenize_args(args, { entropy = _entropy_enabled(tool_name, args, ctx) })
+      pcall(function()
+        require("NeoAI.sandbox.secret_flow").record("arg", { tool = tool_name, fake = fake, command = source })
+      end)
+      pcall(function()
+        require("NeoAI.kernel.event_bus").emit(require("NeoAI.kernel.events").SANDBOX_SECRET_ALERT, {
+          tool = tool_name, agent_id = agent and agent.id, scope = "tool", decision = "fake",
+        })
+      end)
+      return true
+    end
+    -- 先立即停止 Agent，再弹窗请用户确认；确认后继续，否则保持停止。
+    local alert = require("NeoAI.sandbox.secret_alert")
+    if not alert.available() then return stop() end
+    return alert.request({
+      kind = "tool", tool = tool_name, agent = agent, command = source,
+      secret = scan.secret, secret_preview = (scan.secret or ""):sub(1, 6) .. "…", fake = fake,
+    }):then_(function(decision)
+      if decision == "stop" then
+        if agent then
+          pcall(function() require("NeoAI.core.agent.runtime").abort(agent, "secret_exposure") end)
+        end
+        pcall(vim.notify,
+          "[NeoAI] 检测到对原始密钥的操作，已停止 Agent（工具: " .. tostring(tool_name) .. "）",
+          vim.log.levels.ERROR)
+        return async.reject(err)
+      end
+      if decision == "fake" then return replace_with_fake() end
+      pcall(function()
+        require("NeoAI.kernel.event_bus").emit(require("NeoAI.kernel.events").SANDBOX_SECRET_ALERT, {
+          tool = tool_name, agent_id = agent and agent.id, scope = "tool", decision = decision,
+        })
+      end)
+      local spec = require("NeoAI.sandbox.tool_spec").get(tool_name, tool and tool.category)
+      if spec and spec.effect == "fs_write" then
+        secret.tokenize_args(args, { entropy = _entropy_enabled(tool_name, args, ctx) })
+      end
+      return true
+    end)
   end
-  -- 加密后的 key（token）与敏感环境变量名：软信号，只提级待审，不终止。
+  -- 假密钥（已知遮蔽值）与敏感环境变量名：警告用户，不阻断。
   local names = scan.names or {}
   if next(scan.tokens) or #names > 0 then
     if next(scan.tokens) then secret.trace("token_used", { tool = tool_name, tokens = scan.tokens }) end
     if #names > 0 then secret.trace("name_used", { tool = tool_name, names = names }) end
-    -- KEY 环境变量操作：提级审批（wrapper 据此把候选判为密钥操作 L3，强制待审），不终止。
     if ctx then
       ctx.secret_operation = true
       ctx.secret_names = names
@@ -379,6 +438,14 @@ local function _handle_scan_result(scan, tool, tool_name, args, ctx)
         count = n,
         names = names,
       })
+    end)
+    pcall(vim.notify,
+      string.format("[NeoAI] 工具 %s 使用了沙箱假密钥（%d 个）——已警告并留痕", tostring(tool_name), n),
+      vim.log.levels.WARN)
+    -- 数据流账本：记录假密钥在工具参数中的汇聚点。
+    pcall(function()
+      local flow = require("NeoAI.sandbox.secret_flow")
+      for tok in pairs(scan.tokens) do flow.record("arg", { tool = tool_name, fake = tok }) end
     end)
   end
   local spec = require("NeoAI.sandbox.tool_spec").get(tool_name, tool and tool.category)
@@ -405,6 +472,10 @@ local function _secret_guard(tool, tool_name, args, ctx)
   -- 大参数：线程池扫描（可能 MB 级、含多次 gmatch），命中后的副作用回主线程处理。
   return secret.scan_all_async(args):then_(function(scan)
     local ok, err = _handle_scan_result(scan, tool, tool_name, args, ctx)
+    if type(ok) == "table" and ok.then_ then
+      -- 需要用户确认：直接透传（resolve true 继续 / reject 停止）。
+      return ok
+    end
     if not ok then return async.reject(err) end
     return true
   end, function(e)
@@ -430,11 +501,13 @@ local function _tokenize_out(d, ctx, tool_name, args)
       -- 识别到 AI 读取到 KEY（结果含 token）时追加说明，澄清 token 语义与自动还原。
       if secret.contains_token(result) then
         local hint = secret.read_hint()
-        if type(result) == "string" then
-          result = result .. "\n\n" .. hint
-        elseif type(result) == "table" then
-          result = vim.deepcopy(result)
-          result.neoai_secret_hint = hint
+        if type(hint) == "string" and hint ~= "" then
+          if type(result) == "string" then
+            result = result .. "\n\n" .. hint
+          elseif type(result) == "table" then
+            result = vim.deepcopy(result)
+            result.neoai_secret_hint = hint
+          end
         end
       end
       out:resolve(result)
@@ -442,6 +515,13 @@ local function _tokenize_out(d, ctx, tool_name, args)
     -- 字符串结果（run_command/read_file 等大输出）经线程池做全文 token 化，避免完成瞬间
     -- 占满主线程；线程池不可用时 tokenize_async 内部回退同步。表结果仍走同步（结构较小）。
     if type(v) == "string" then
+      -- 敏感二进制密钥文件被读取：用同长度随机字节假化（base64 标记传输），落盘/执行时还原。
+      local bcfg = config_store.get("tools.sandbox.secrets") or {}
+      if bcfg.binary_fake ~= false and v:find("\0", 1, true)
+        and _touches_secret_path(tool_name or "", args or {}, ctx) then
+        local _, marker = secret.fake_binary(v)
+        return finish(marker)
+      end
       return secret.tokenize_async(v, { entropy = entropy }):then_(finish, function()
         finish(v)
       end)

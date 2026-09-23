@@ -137,7 +137,11 @@ local function _render(keep_view)
   if not state.following or keep_view then
     open_folds = _open_fold_start_lines()
   end
-  local messages = chat_service.get_messages()
+  local messages = chat_service.get_messages and chat_service.get_messages()
+  -- 服务不可用（插件停止/热重载期间已注销 services.chat_service）：跳过渲染而非报错。
+  -- 典型触发：reload_all → plugins.stop_all 停止沙箱（cgroup.release 的 vim.wait 处理事件循环）
+  -- 时，先前调度的渲染回调执行，而此时 chat_service 已注销（get_messages 为 nil）。
+  if messages == nil then return false end
   -- 还在生成（agent 忙碌 / 暂存队列非空）时，仅对末尾消息做流式渲染：
   -- 表格在生成期间原样输出，生成结束后才做对齐填充，避免列宽随流式跳动。
   -- table_width 随聊天窗口宽度自适应：窄窗把表收紧（更多折行），宽窗放宽表，避免整表超出屏幕。
@@ -252,6 +256,9 @@ local render_scheduled = false
 local render_pending_follow = false
 local render_pending_keep_view = false
 local render_flushed = false
+-- 渲染代次：close/reload 时递增，使 close 之前已 vim.schedule/vim.defer_fn 的渲染回调作废，
+-- 避免它们在插件停止、`services.chat_service` 注销之后执行（get_messages 为 nil 报错）。
+local render_epoch = 0
 -- 流式渲染最小间隔（毫秒）：分片到达极快时，每个 tick 全量重渲染仍是 O(n²) 主线程开销。
 -- 生成中把渲染频率限制为至多每此间隔一次（非流式事件仍即时渲染，保证响应性）。
 local RENDER_MIN_INTERVAL_MS = 80
@@ -300,7 +307,13 @@ local function _schedule_render(keep_view)
   render_pending_follow = _cursor_within_follow_margin()
   state.following = render_pending_follow
   render_pending_keep_view = kv
+  local epoch = render_epoch
   local function _run()
+    -- 代次已变（close/reload 后）：作废本次渲染，避免在服务注销后访问 chat_service。
+    if render_epoch ~= epoch then
+      render_scheduled = false
+      return
+    end
     if render_flushed then
       -- 已被 flush 同步执行过，跳过以避免重复渲染
       render_scheduled = false
@@ -309,7 +322,8 @@ local function _schedule_render(keep_view)
     _do_render()
   end
   local now = vim.uv.hrtime() / 1e6
-  local streaming = chat_service.has_pending_work()
+  local has_pending = chat_service.has_pending_work
+  local streaming = type(has_pending) == "function" and has_pending() or false
   local wait_ms = RENDER_MIN_INTERVAL_MS - (now - last_render_ms)
   if streaming and wait_ms > 0 then
     vim.defer_fn(_run, math.ceil(wait_ms))
@@ -498,7 +512,8 @@ local function _on_reasoning_chunk(payload)
     -- 事件不再随分片携带完整 reasoning；缺失时从当前 Agent 消息队列取末条正文兜底。
     local text = payload.reasoning
     if not text then
-      local msgs = chat_service.get_messages()
+      local get_messages = chat_service.get_messages
+      local msgs = type(get_messages) == "function" and get_messages() or nil
       local last = msgs and msgs[#msgs]
       text = last and last.reasoning or ""
     end
@@ -527,7 +542,7 @@ local function _tool_tick()
   -- 继续刷新需同时满足「有工具在执行」且「agent 确实忙碌」：若某工具漏发结束事件，
   -- has_running() 会长期为真；仅凭它会每 1s 重渲染整个聊天 buffer（历史很长时占满
   -- 主线程，agent loop 结束后仍在跑）。agent 空闲即停，杜绝这种空转。
-  if fold.has_running() and chat_service.has_pending_work() then
+  if fold.has_running() and chat_service.has_pending_work and chat_service.has_pending_work() then
     state.tool_tick = vim.fn.timer_start(TOOL_TICK_MS, _tool_tick, vim.empty_dict())
   end
 end
@@ -756,7 +771,7 @@ local function _build_chat_actions()
     insert = function() input_box.focus() end,
     send = function() input_box.focus() end,
     cycle_mode = function()
-      local names = { chat = "CHAT", plan = "PLAN", auto = "AUTO" }
+      local names = { chat = "CHAT", plan = "PLAN" }
       local mode = chat_service.cycle_mode()
       local suffix = chat_service.has_pending_mode() and "（将在本轮生成结束后生效）" or ""
       vim.notify("[NeoAI] 模式已切换: " .. (names[mode] or mode) .. suffix, vim.log.levels.INFO)
@@ -1352,6 +1367,8 @@ function M.close()
   ctxop_flush_scheduled = false
   ctxop_cancelled = true
   render_scheduled = false
+  -- 递增代次：使 close 之前已调度的渲染回调作废（reload 时服务可能已注销）。
+  render_epoch = render_epoch + 1
   if state.input_win_id and vim.api.nvim_win_is_valid(state.input_win_id) then
     pcall(vim.api.nvim_win_close, state.input_win_id, true)
   end

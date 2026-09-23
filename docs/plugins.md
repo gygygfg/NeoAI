@@ -160,7 +160,7 @@ require("NeoAI").setup({
 `reload_all` 的受控重载流程：
 
 1. 快照 `NeoAI.*` 模块缓存（失败回滚用）；
-2. 读取当前配置、会话 id、AUTO 状态；
+2. 读取当前配置、会话 id；
 3. `plugins.stop_all()` → `event_bus.clear_all()` → 清空 `NeoAI.*` 缓存 → 重新 `setup()`；
 4. 重建界面并恢复会话；失败则恢复模块缓存快照。
 

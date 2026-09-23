@@ -56,6 +56,55 @@ tests.suite("chat_ui", function(_, it)
     chat_service.reset()
   end)
 
+  it("热重载期间渲染：chat_service 注销后刷新不报错（回归 reload_all 崩溃）", function(t)
+    local chat_view = require("NeoAI.ui.window.chat_view")
+    local chat_service = require("NeoAI.services.chat_service")
+    local services = require("NeoAI.kernel.services")
+    chat_view.reset()
+    chat_service.reset()
+    chat_view.open()
+    local agent = chat_service.get_current_agent()
+    agent.messages = { { role = "assistant", content = "answer" } }
+    chat_view.refresh()
+    -- 模拟 plugins.stop_all 已注销 chat_service：reload_all 停止沙箱时 cgroup.release 的
+    -- vim.wait 会处理事件循环，使先前调度的渲染回调在服务注销后执行（get_messages 为 nil）。
+    services.revoke("services.chat_service")
+    local ok, err = pcall(function()
+      chat_view.refresh()
+      chat_view.flush()
+    end)
+    services.provide("services.chat_service", chat_service)
+    t.true_(ok, "chat_service 注销后渲染不应报错: " .. tostring(err))
+    chat_view.reset()
+    chat_service.reset()
+  end)
+
+  it("Agent loop 内仅首条助手消息显示角色头", function(t)
+    local message_list = require("NeoAI.ui.components.message_list")
+    message_list.reset()
+    local buf = vim.api.nvim_create_buf(false, true)
+    message_list.render_chat(buf, {
+      { role = "user", content = "第一个问题" },
+      { role = "assistant", content = "思考中", reasoning = "推理" },
+      { role = "assistant", content = "", tool_calls = {
+        { id = "c1", ["function"] = { name = "read_file", arguments = "{}" } },
+      } },
+      { role = "tool", tool_call_id = "c1", tool_name = "read_file", content = "文件内容" },
+      { role = "assistant", content = "最终答案" },
+      { role = "user", content = "第二个问题" },
+      { role = "assistant", content = "第二个答案" },
+    })
+    local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+    local ai_headers = 0
+    for _, l in ipairs(lines) do
+      if l == "🤖 AI" then ai_headers = ai_headers + 1 end
+    end
+    -- 两轮对话各保留一个助手角色头；轮内多条 assistant 消息不再重复显示。
+    t.eq(2, ai_headers, "每轮 Agent loop 仅首个助手消息显示角色头")
+    t.true_(vim.tbl_contains(lines, "👤 用户"), "用户角色头应保留")
+    vim.api.nvim_buf_delete(buf, { force = true })
+  end)
+
   it("打开已加载会话时主界面光标先定位到消息底部再聚焦输入框", function(t)
     local config_store = require("NeoAI.kernel.config_store")
     local fs = require("NeoAI.utils.fs")

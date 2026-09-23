@@ -26,8 +26,13 @@ local write_state = {
   pending = {},   -- path -> encoded（等待写入的最新内容）
   running = {},   -- path -> true（正在写）
   cancelled = {}, -- path -> true（写入期间被删除，完成后清理）
+  errors = {},    -- path -> 最近一次写入失败原因（诊断）
+  attempts = {},  -- path -> 已重试次数
   gen = 0,        -- 代次：reset 后使在途完成回调失效
 }
+
+-- 写入失败的最大自动重试次数（之后保留内存缓存并记录错误，等待下次写入自然重试）。
+local MAX_WRITE_RETRY = 3
 
 local function _candidates_dir()
   return state.root .. "/candidates"
@@ -112,6 +117,10 @@ local function _atomic_write_worker(path, encoded)
 end
 
 --- 写入队列推进：同路径串行；完成后若有更新内容则继续写最新一份。
+--- 关键：`_atomic_write_worker` 返回 "\1" 成功 / "\0<err>" 失败，**必须检查**——此前 `done`
+--- 忽略返回值，写入失败（ENOSPC/EACCES/mkstemp 失败等）被当作成功：内存缓存被清除、调用方
+--- 收到 resolve(true)，随后读取回退磁盘却读不到内容（表现为「文件写了却读不到」）。失败时
+--- 保留内存缓存（「刚写入即可读回」仍成立）、记录错误并有限重试。
 --- @param path string
 local function _drain(path)
   if write_state.running[path] then return end
@@ -120,24 +129,46 @@ local function _drain(path)
   write_state.pending[path] = nil
   write_state.running[path] = true
   local gen = write_state.gen
-  local function done()
+  local function done(res)
     write_state.running[path] = nil
+    local failed = type(res) == "string" and res:sub(1, 1) == "\0"
     if write_state.gen ~= gen or write_state.cancelled[path] then
       -- reset/删除后到达的写入：清理，避免污染新实例存储。
       pcall(fs.delete_file, path)
       write_state.cancelled[path] = nil
       write_state.mem[path] = nil
+      write_state.errors[path] = nil
+      write_state.attempts[path] = nil
+    elseif failed then
+      local err = tostring(res):sub(2)
+      write_state.errors[path] = err
+      local n = (write_state.attempts[path] or 0) + 1
+      write_state.attempts[path] = n
+      require("NeoAI.kernel.logger").warn(
+        "[sandbox:store] 异步落盘失败(%d/%d) %s: %s", n, MAX_WRITE_RETRY, path, err)
+      if n <= MAX_WRITE_RETRY then
+        -- 保留内存缓存使读取一致，并把最新内容重新入队重试（有更新内容则用更新内容）。
+        write_state.pending[path] = write_state.mem[path] or encoded
+        vim.defer_fn(function()
+          if write_state.gen == gen then _drain(path) end
+        end, 200)
+      end
+      -- 超过重试上限：保留 mem 与 errors，等待下一次写入自然重试（不忙等）。
     elseif write_state.pending[path] ~= nil then
+      write_state.errors[path] = nil
+      write_state.attempts[path] = nil
       _drain(path)
     else
       -- 已落盘：丢弃缓存，避免长时间会话内存无界增长（读取回退磁盘）。
       write_state.mem[path] = nil
+      write_state.errors[path] = nil
+      write_state.attempts[path] = nil
     end
   end
   local work = require("NeoAI.utils.work")
   if not work.available() then
-    pcall(_atomic_write_worker, path, encoded)
-    done()
+    local res = _atomic_write_worker(path, encoded)
+    done(res)
     return
   end
   work.run(_atomic_write_worker, path, encoded):then_(done, done)
@@ -292,6 +323,15 @@ function M.flush(timeout_ms)
     if vim.uv.hrtime() > deadline then return false end
     vim.wait(10, function() return false end)
   end
+end
+
+--- 异步落盘失败的路径与原因（诊断用；成功后清除）。用于区分「文件写了却读不到」是否由
+--- 落盘失败引起。
+--- @return table path -> err
+function M.write_errors()
+  local out = {}
+  for path, err in pairs(write_state.errors) do out[path] = err end
+  return out
 end
 
 --- 初始化存储根目录
@@ -691,6 +731,8 @@ function M.reset()
   write_state.pending = {}
   write_state.running = {}
   write_state.cancelled = {}
+  write_state.errors = {}
+  write_state.attempts = {}
   snapshot_cache = {}
   if state.root then
     pcall(vim.fn.delete, _candidates_dir(), "rf")
@@ -700,6 +742,9 @@ function M.reset()
     pcall(vim.fn.delete, _host_ops_dir(), "rf")
     pcall(vim.fn.delete, _snapshots_dir(), "rf")
     pcall(vim.fn.delete, _blobs_dir(), "rf")
+    -- 常驻实例的稳定 overlay/shell 目录（<root>/resident）：实例已由 resident.reset 停止，
+    -- 此处清理其磁盘残留，避免跨 reset/跨套件复用过期 overlay 视图。
+    pcall(vim.fn.delete, state.root:gsub("/+$", "") .. "/resident", "rf")
   end
   state.root = nil
 end

@@ -26,10 +26,10 @@ local state = {
 -- ========== 私有函数 ==========
 
 --- 解析 agent 的模式配置
---- 按当前会话模式（chat/plan/auto）从 ai.modes 取 provider/model/temperature/etc.，
+--- 按当前会话模式（chat/plan）从 ai.modes 取 provider/model/temperature/etc.，
 --- 再叠加用户级覆盖，最后把 "auto" 模型解析为 registry 默认模型。
 --- @param config table 用户/系统配置（覆盖层）
---- @param mode string|nil "chat" | "plan" | "auto"
+--- @param mode string|nil "chat" | "plan"
 --- @return table agent_config
 local function _resolve_agent_config(config, mode)
   mode = mode or "chat"
@@ -178,7 +178,7 @@ end
 --- 应用某模式的模型配置到已有 Agent（模式切换时调用）。
 --- 提供者/模型/温度/max_tokens/流式随 modes 变化；系统提示等全局项不改。
 --- @param agent table
---- @param mode string "chat" | "plan" | "auto"
+--- @param mode string "chat" | "plan"
 --- @return table Agent
 function M.apply_mode(agent, mode)
   if not agent then return nil end

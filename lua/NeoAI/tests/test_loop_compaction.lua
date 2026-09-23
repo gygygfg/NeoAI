@@ -193,6 +193,39 @@ tests.suite("loop_compaction", function(_, it)
     t.eq("最终回答", agent.messages[#agent.messages].content, "压缩后循环应继续到最终回答")
   end)
 
+  it("单轮长工具循环：无更早用户轮次时回退头部缩减并真正压缩", function(t)
+    load_cfg()
+    local restore = stub_summarize()
+    local compactor = require("NeoAI.core.session.compactor")
+    local context_builder = require("NeoAI.core.session.context_builder")
+    local agent_mod = require("NeoAI.core.agent.agent")
+    local agent = agent_mod.create({
+      config = { system_prompt = "persona", provider = "p1", model = "gpt-4o" },
+    })
+    -- 单个用户轮次内的长工具循环：user + N 组 assistant(tool_calls)/tool 配对
+    agent_mod.add_message(agent, "user", ("U"):rep(80))
+    for i = 1, 8 do
+      agent_mod.set_tool_calls(agent, {
+        { id = "t" .. i, type = "function", ["function"] = { name = "tool1", arguments = "{}" } },
+      })
+      agent_mod.add_message(agent, "tool", ("R"):rep(200))
+    end
+    local before = #agent.messages
+
+    local done, val = false, nil
+    compactor.maybe_compact(agent, { allow_busy = true }):then_(function(r) done = true; val = r end)
+    t.true_(vim.wait(3000, function() return done end), "异步未完成")
+    restore()
+
+    t.eq(true, val, "单轮长循环也应压缩（修复前恒 no-op）")
+    t.not_nil(agent.compaction, "应写入压缩覆盖层")
+    t.true_(agent.compaction.checkpoint.checkpoint)
+    t.eq(before, #agent.messages, "原始消息不应被改动")
+    local view = context_builder.request_view(agent)
+    t.true_(view[1].checkpoint, "请求视图首条应为检查点")
+    t.true_(#view < #agent.messages, "请求视图应短于原始消息（真正替换）")
+  end)
+
   it("循环中途压缩的检查点只按已同步条数删除（durable 不误删）", function(t)
     load_cfg()
     local session_store = require("NeoAI.core.session.session_store")

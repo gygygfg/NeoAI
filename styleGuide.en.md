@@ -641,7 +641,7 @@ clearing the cache and reloading.
 - `send_message(content)` — sends a message (creating or reusing the current Agent).
 - `attach_window` / `detach_window` — bind/unbind a window (persist + clear approvals on close).
 - `new_session` / `load_session` — create/load a session (restores plan mode and the todo list).
-- `toggle_plan_mode` / `toggle_auto_mode` / `cycle_mode` / `approve_plan` / `get_mode` / `cancel_generation` / `switch_model` / `get_todos`.
+- `toggle_plan_mode` / `cycle_mode` / `approve_plan` / `get_mode` / `cancel_generation` / `switch_model` / `get_todos`.
 
 ### `services/tool_service.lua` — Tool service
 
@@ -889,10 +889,9 @@ require("NeoAI").setup({
       -- 13 built-in providers in total, all of which can be overridden manually with models_override
     },
     model_refresh = { on_startup = true, interval_sec = 3600, timeout_ms = 10000 },
-    modes = {          -- configure provider/model/temperature/max_tokens/stream separately per mode (CHAT/PLAN/AUTO)
+    modes = {          -- configure provider/model/temperature/max_tokens/stream separately per mode (CHAT/PLAN)
       chat = { provider = "deepseek", model = "auto", temperature = 0.7, max_tokens = 4096, stream = true },
       plan = { provider = "deepseek", model = "auto", temperature = 0.3, max_tokens = 8192, stream = true },
-      auto = { provider = "deepseek", model = "auto", temperature = 0.7, max_tokens = 8192, stream = true },
     },
     reasoning_enabled = true,
     system_prompt = "You are an AI programming assistant...",

@@ -17,7 +17,9 @@ local M = {}
 local state = {
   caps = nil,
   overlay_probe = {}, -- "dev_lower:dev_upper" -> boolean（按文件系统对缓存实测结果）
+  overlay_probe_neg = {}, -- 同键 -> 到期 hrtime(ms)：失败结果短 TTL 缓存，避免瞬时失败永久降级
   overlay_write_probe = {}, -- "w|lower|dev_upper|uid|gid" -> boolean（可写性依赖载荷身份）
+  overlay_write_neg = {}, -- 同键 -> 到期 hrtime(ms)：失败结果短 TTL 缓存
   empty_file = nil, -- 用于覆盖 /proc 泄露项的空文件路径（宿主）
   apt_conf = nil, -- { path = string, user = string } apt 沙箱配置片段（宿主私有文件）
   apk_repos = nil, -- { path = string, url = string } 重写镜像后的 apk repositories（宿主私有文件）
@@ -552,6 +554,67 @@ end
 -- `-s` 指向；文件名无沙箱特征（见 conceal）。
 local MAVEN_SETTINGS_GUEST = "/tmp/.mvn-settings.xml"
 
+-- systemctl/journalctl 入口（极薄客户端）：把 argv 经文件 IPC 转发给宿主 Lua 门面
+-- （`NeoAI.sandbox.systemd.exec`，见 systemd_ipc），按真实 stdout/stderr/退出码返回。
+-- 全部解析与实现都在 Lua，入口不含任何逻辑，也不携带可识别沙箱的注释/字样。
+-- 另生成 policy-rc.d（标准容器语义：拒绝维护脚本的服务动作，101=不启动），仅包安装命令绑定。
+local POLICY_RC_GUEST = "/usr/sbin/policy-rc.d"
+
+--- 生成门面入口桩（宿主私有目录）。返回 { dir, policy }；无法写入返回 nil（跳过注入）。
+--- @return table|nil
+local function _maintscript_stubs()
+  if state.maint_stubs and vim.uv.fs_stat(state.maint_stubs.dir) then return state.maint_stubs end
+  local dir = _private_dir() .. "/sd-bin"
+  pcall(vim.fn.mkdir, dir, "p")
+  local policy = dir .. "/policy-rc.d"
+  do
+    local f = io.open(policy, "w")
+    if not f then return nil end
+    f:write("#!/bin/sh\nexit 101\n")
+    f:close()
+    pcall(vim.uv.fs_chmod, policy, 493) -- 0755
+  end
+  -- 入口：bash 文件 IPC 客户端。id 用 PID+随机数避免并发沙箱 PID 复用冲突。
+  local client = table.concat({
+    "#!/bin/bash",
+    "bin=$(basename \"$0\")",
+    "dir=/run/systemd/units",
+    "if [ ! -d \"$dir\" ]; then",
+    "  echo \"$bin: Failed to connect to system scope bus via local transport: No such file or directory\" >&2",
+    "  exit 1",
+    "fi",
+    "id=\"$$.$RANDOM.$RANDOM\"",
+    "tmp=\"$dir/tmp.$id\"",
+    "req=\"$dir/req.$id\"",
+    "printf '%s\\0' \"$bin\" \"$@\" > \"$tmp\" || { echo \"$bin: transport error\" >&2; exit 1; }",
+    "mv -f \"$tmp\" \"$req\" || { echo \"$bin: transport error\" >&2; exit 1; }",
+    "i=0",
+    "while [ ! -f \"$dir/done.$id\" ]; do",
+    "  i=$((i+1))",
+    "  if [ \"$i\" -gt 6000 ]; then",
+    "    rm -f \"$req\"",
+    "    echo \"$bin: Connection timed out\" >&2",
+    "    exit 1",
+    "  fi",
+    "  sleep 0.01",
+    "done",
+    "if [ -f \"$dir/out.$id\" ]; then cat \"$dir/out.$id\"; fi",
+    "if [ -f \"$dir/err.$id\" ]; then cat \"$dir/err.$id\" >&2; fi",
+    "code=$(cat \"$dir/code.$id\" 2>/dev/null)",
+    "rm -f \"$req\" \"$dir/out.$id\" \"$dir/err.$id\" \"$dir/code.$id\" \"$dir/done.$id\"",
+    "exit \"${code:-0}\"",
+  }, "\n") .. "\n"
+  for _, name in ipairs({ "systemctl", "journalctl", "systemd-run", "systemd-analyze" }) do
+    local f = io.open(dir .. "/" .. name, "w")
+    if not f then return nil end
+    f:write(client)
+    f:close()
+    pcall(vim.uv.fs_chmod, dir .. "/" .. name, 493) -- 0755
+  end
+  state.maint_stubs = { dir = dir, policy = policy }
+  return state.maint_stubs
+end
+
 -- apk（Alpine/musl）镜像 repositories 在沙箱内的挂载点：必须落在 /etc/apk/repositories
 -- （apk 只读该路径），故直接以只读绑定覆盖；/etc 在 read_all 模式下可写，挂载点可创建。
 local APK_REPOS_GUEST = "/etc/apk/repositories"
@@ -880,21 +943,27 @@ end
 --- session 模式/不可用时：退回进程目录下的私有目录；再退回空 tmpfs。
 --- @param argv table
 --- @param session_base string|nil 会话进程目录（其 basename 即会话 id）
-local function _append_tmpfs_roots(argv, session_base)
+--- @param base_override string|nil 专用 tmp 基目录（如常驻实例的稳定目录）：提供时其下建
+---   `tmp_<编码根>/<session>`，且不参与共享基目录的跨会话清理（避免与一次性路径互相 prune）。
+local function _append_tmpfs_roots(argv, session_base, base_override)
   local session = (type(session_base) == "string" and session_base ~= "")
     and vim.fn.fnamemodify(session_base, ":t") or nil
   local mode = _tmp_private_base_mode()
   local conceal = require("NeoAI.sandbox.conceal")
+  local has_override = type(base_override) == "string" and base_override ~= ""
   for _, p in ipairs(_tmpfs_roots()) do
     local bound = false
     -- host 模式：私有目录建在宿主根之下，命名空间映射回该根
     if mode == "host" and session and vim.fn.isdirectory(p) == 1 then
-      local base = conceal.tmp_base_host(p)
+      local base = has_override
+        and (base_override:gsub("/+$", "") .. "/tmp" .. p:gsub("[^%w]", "_"))
+        or conceal.tmp_base_host(p)
       local dir = base .. "/" .. session
       pcall(vim.fn.mkdir, dir, "p")
       pcall(vim.uv.fs_chmod, dir, 1023) -- 01777（sticky + world-writable）
       if vim.fn.isdirectory(dir) == 1 then
-        _prune_tmp_base(base, session)
+        -- 专用基目录只服务单一实例，无需跨会话清理；共享基目录才 prune。
+        if not has_override then _prune_tmp_base(base, session) end
         argv[#argv + 1] = "--bind"
         argv[#argv + 1] = dir
         argv[#argv + 1] = p
@@ -1158,7 +1227,21 @@ end
 --- @param flags table 隔离标志
 --- @return boolean
 local function _overlay_works(flags)
-  local tmp = vim.fn.tempname()
+  -- 探测目录须位于支持 overlay upper 的文件系统上：`/tmp` 常为 tmpfs（不能作 overlay upper），
+  -- 在 /tmp 探测会把「overlay 可用」误判为不可用并永久降级（overlay_writable 随之短路）。
+  -- 优先用沙箱存储基目录（磁盘），不可用时再退回 tempname。
+  local base
+  local okc, conceal = pcall(require, "NeoAI.sandbox.conceal")
+  if okc and conceal.base_host then
+    local b = conceal.base_host()
+    if type(b) == "string" and b ~= "" then base = b end
+  end
+  if not base then
+    local oks, store = pcall(require, "NeoAI.sandbox.store")
+    if oks and store.root and store.root() then base = store.root() end
+  end
+  if not base then base = vim.fn.tempname() end
+  local tmp = base .. "/.ovl_probe"
   local lower, upper, work = tmp .. "/lower", tmp .. "/upper", tmp .. "/work"
   pcall(vim.fn.mkdir, lower, "p")
   pcall(vim.fn.mkdir, upper, "p")
@@ -1485,6 +1568,9 @@ function M.warm()
     local upper, work = probe .. "/upper", probe .. "/work"
     pcall(vim.fn.mkdir, upper, "p")
     pcall(vim.fn.mkdir, work, "p")
+    -- 预热目录须归载荷所有：否则 run_as.uid>0 时真实挂载会因 upper 归属非载荷而失败，
+    -- 把整机根键误缓存为不可写（表现为后续命令无 overlay 降级）。
+    pcall(M.chown_payload, probe)
     -- 用 "/" 为 lower 预热（read_all 整机 overlay 模式的探测键）；服务/命令共用同一
     -- (lower, dev, uid, gid) 缓存键，故同一文件系统上的后续探测均命中。
     local wok, res = pcall(M.overlay_writable, "/", upper, work)
@@ -1666,7 +1752,7 @@ function M.sandbox_env(privileges)
   local secret = require("NeoAI.sandbox.secret")
   local env = secret.sanitized_env()
   for k, v in pairs(env) do
-    if type(v) == "string" and v:find("NEOKEY_", 1, true) then
+    if type(v) == "string" and secret.has_token(v) then
       env[k] = (secret.detokenize(v))
     end
   end
@@ -1674,6 +1760,11 @@ function M.sandbox_env(privileges)
   if #expose > 0 and config_store.get("tools.sandbox.expose_path_env") ~= false then
     local cur = vim.env.PATH or ""
     env.PATH = table.concat(expose, ":") .. (cur ~= "" and (":" .. cur) or "")
+  end
+  -- systemd 门面：确保宿主 IPC 桥已启动（沙箱内 systemctl/journalctl 入口经它转发到 Lua 门面）。
+  -- 入口以只读绑定覆盖真实二进制路径（见 process_prefix），不再前置非标准 PATH。
+  if (config_store.get("tools.sandbox.systemd") or {}).enabled ~= false then
+    pcall(function() require("NeoAI.sandbox.systemd_ipc").ensure() end)
   end
   -- 代理策略：显式代理写入 env（strip 时由外部命令前置 unset 清除，避免宿主代理不可达导致失败）。
   local proxy = _proxy_policy()
@@ -1740,6 +1831,15 @@ function M.sandbox_env(privileges)
   if privileges and type(privileges.env) == "table" then
     for k, v in pairs(privileges.env) do env[k] = v end
   end
+  -- tar 属主还原兼容（在 privileges.env 之后合并，保证不会被静默移除）：载荷 euid=0 但基线
+  -- cap_add 无 CAP_CHOWN，GNU tar 以 root 解包时默认 fchown 还原属主会 EPERM（典型：node-gyp
+  -- 解压头文件失败）。默认追加 --no-same-owner；沙箱内文件归属本无意义。已有 TAR_OPTIONS 保留。
+  local tar_opts = env.TAR_OPTIONS
+  if tar_opts == nil then
+    env.TAR_OPTIONS = "--no-same-owner"
+  elseif not tostring(tar_opts):find("%-%-no%-same%-owner") then
+    env.TAR_OPTIONS = tostring(tar_opts) .. " --no-same-owner"
+  end
   -- apt：APT_CONFIG 指向只读绑定的配置片段（见 _apt_conf），关闭 apt 自身的 `_apt` 降权。
   if privileges and type(privileges.apt_sandbox_user) == "string"
     and privileges.apt_sandbox_user ~= "" and _apt_conf(privileges.apt_sandbox_user) then
@@ -1754,6 +1854,12 @@ function M.proxy_unset_snippet()
   return _proxy_unset_snippet()
 end
 
+--- 是否启用「宿主本机访问拦截」代理（供代理规避门禁判定是否处于过滤生效状态）。
+--- @return boolean
+function M.host_local_block_enabled()
+  return _host_local_block_enabled()
+end
+
 --- 用 shell 包装 argv：先关闭除 0/1/2 外所有继承 fd，再 exec argv。
 --- 供 LSP 等自建 bwrap 前缀复用，避免继承宿主目录 fd 造成 chroot 逃逸。
 --- @param argv table
@@ -1766,6 +1872,16 @@ end
 --- @return table 字符串数组
 function M.tmpfs_roots()
   return _tmpfs_roots()
+end
+
+--- 进程/实例级稳定临时根基目录（不随会话轮换）。常驻实例、一次性命令与工具子进程（exec）
+--- 共用该目录下的 /tmp、/var/tmp 私有子目录，使跨命令/跨轮次看到同一临时工作区（修复
+--- 常驻↔一次性路径各用不同 /tmp、轮换即清空导致的 /tmp 目录与 venv 符号链接丢失）。
+--- @return string
+function M.stable_tmp_base()
+  local root = require("NeoAI.sandbox.store").root()
+    or (vim.fn.stdpath("cache") .. "/NeoAI/sandbox")
+  return (tostring(root):gsub("/+$", "")) .. "/tmp"
 end
 
 --- 追加宿主敏感路径遮蔽挂载（供 LSP 命名空间等复用，保持与 run_command 一致的遮蔽面）：
@@ -1995,33 +2111,52 @@ function M.overlay_mountable(lower, upper, work)
   local key = tostring(lower) .. "|" .. tostring(st_u and st_u.dev or -1)
   local cached = state.overlay_probe[key]
   if cached ~= nil then return cached end
+  -- 失败结果只短 TTL 缓存：并发挂载的瞬时 EBUSY/EINVAL 不应把该键永久判为不可用。
+  local now = vim.uv.hrtime() / 1e6
+  local neg = state.overlay_probe_neg[key]
+  if neg and neg > now then return false end
   local ok = _overlay_mount_works(lower, upper, work, M.bwrap_flags())
-  state.overlay_probe[key] = ok
+  if ok then
+    state.overlay_probe[key] = true
+    state.overlay_probe_neg[key] = nil
+  else
+    state.overlay_probe_neg[key] = now + 3000
+  end
   return ok
 end
 
 --- 用真实执行路径 + 真实载荷 uid 实测 overlay **可写**（挂载成功不代表可写）。
 --- 结果按 (lower, upper.dev, uid, gid) 缓存——可写性依赖载荷身份，不能只按文件系统对缓存。
+--- 失败结果只短 TTL 缓存：瞬时失败不应永久降级该键（否则后续命令一直被误判为无 overlay）。
 --- @param lower string
 --- @param upper string
 --- @param work string
 --- @return boolean
 function M.overlay_writable(lower, upper, work)
   if not (lower and upper and work) then return false end
-  if not M.overlay_available() then return false end
+  -- 不因粗粒度 overlay_available() 为假就直接短路：粗探测可能在 /tmp 等不支持 overlay upper
+  -- 的文件系统上误判；真实挂载+写入实测才是权威判定。若 overlay 确不可用，实测会快速失败。
   local puid, pgid = _payload_ids()
   local st_u = vim.uv.fs_stat(upper)
   local key = string.format("w|%s|%s|%s|%s",
     tostring(lower), tostring(st_u and st_u.dev or -1), tostring(puid), tostring(pgid))
   local cached = state.overlay_write_probe[key]
   if cached ~= nil then return cached end
+  local now = vim.uv.hrtime() / 1e6
+  local neg = state.overlay_write_neg[key]
+  if neg and neg > now then return false end
   local flags = M.bwrap_flags()
   local nonroot = puid ~= nil and puid > 0
   -- 仅「非 root 启动」需要 userns 承载 --uid；root 启动时 bwrap 保持 root（载荷经 setpriv 降权）。
   if nonroot and not _is_root() then flags = USER_FLAGS end
   local ok = _overlay_mount_works(lower, upper, work, flags)
     and _overlay_write_works(lower, upper, work, flags)
-  state.overlay_write_probe[key] = ok
+  if ok then
+    state.overlay_write_probe[key] = true
+    state.overlay_write_neg[key] = nil
+  else
+    state.overlay_write_neg[key] = now + 3000
+  end
   return ok
 end
 
@@ -2223,7 +2358,7 @@ function M.process_prefix(opts)
     -- F2：临时根覆盖为「会话私有目录」（mode 1777，位于 /dev/shm 等 tmpfs 上），
     -- 覆盖基础参数里的空 tmpfs；绝不把宿主真实 /tmp、/var/tmp 作为 lower/内容暴露，
     -- 退出/轮换会话即销毁，杜绝跨会话残留泄露。
-    _append_tmpfs_roots(argv, opts.session_tmp_dir)
+    _append_tmpfs_roots(argv, opts.session_tmp_dir, opts.tmpfs_base)
     -- --new-session：新终端会话；--as-pid-1 已在基础参数中，使载荷成为 PID 1，
     -- 避免进程表出现 `bwrap --unshare-all ...` 这一沙箱指纹。
     table.insert(argv, "--new-session")
@@ -2245,8 +2380,7 @@ function M.process_prefix(opts)
       if not mode then
         -- 可写性实测：挂载成功但载荷无法写入（非 root + upper 归属/DAC）时降级 bind，
         -- 避免命令因 overlay 只读而失败（设计：实测 overlay 可写）。
-        mode = (M.overlay_available() and M.overlay_writable(ov.root, ov.upper, ov.work))
-          and "overlay" or "bind"
+        mode = M.overlay_writable(ov.root, ov.upper, ov.work) and "overlay" or "bind"
       end
       if mode == "overlay" then
         table.insert(argv, "--overlay-src"); table.insert(argv, ov.root)
@@ -2262,7 +2396,6 @@ function M.process_prefix(opts)
     -- 兼容：未提供 overlays 时按 cwd 单层 overlay
     if #rest_overlays == 0 and not root_overlay and opts.cwd then
       local overlay_ok = opts.upper and opts.work
-        and M.overlay_available()
         and M.overlay_writable(opts.cwd, opts.upper, opts.work)
       if overlay_ok then
         table.insert(argv, "--overlay-src"); table.insert(argv, opts.cwd)
@@ -2318,6 +2451,52 @@ function M.process_prefix(opts)
       local ap = _apt_conf(priv.apt_sandbox_user)
       if ap then
         table.insert(argv, "--ro-bind"); table.insert(argv, ap); table.insert(argv, APT_CONF_GUEST)
+      end
+    end
+    -- systemd 门面入口：把极薄入口（systemctl/journalctl）只读绑定**覆盖真实二进制路径**，
+    -- 对所有进程命令生效（独立调用仍由门面优先拦截；脚本/管道调用经入口转发到同一 Lua 门面）。
+    -- 同时绑定宿主 IPC 目录与 /run/systemd/private 占位 socket，使外观与真实 systemd 一致。
+    if (config_store.get("tools.sandbox.systemd") or {}).enabled ~= false then
+      local stubs = _maintscript_stubs()
+      if stubs then
+        for _, bin in ipairs({ "/usr/bin/systemctl", "/bin/systemctl", "/usr/sbin/systemctl", "/sbin/systemctl" }) do
+          if vim.uv.fs_stat(bin) then
+            table.insert(argv, "--ro-bind"); table.insert(argv, stubs.dir .. "/systemctl"); table.insert(argv, bin)
+          end
+        end
+        for _, bin in ipairs({ "/usr/bin/journalctl", "/bin/journalctl" }) do
+          if vim.uv.fs_stat(bin) then
+            table.insert(argv, "--ro-bind"); table.insert(argv, stubs.dir .. "/journalctl"); table.insert(argv, bin)
+          end
+        end
+        for _, name in ipairs({ "systemd-run", "systemd-analyze" }) do
+          for _, dir in ipairs({ "/usr/bin", "/bin", "/usr/local/bin", "/usr/sbin", "/sbin" }) do
+            local bin = dir .. "/" .. name
+            if vim.uv.fs_stat(bin) then
+              table.insert(argv, "--ro-bind"); table.insert(argv, stubs.dir .. "/" .. name); table.insert(argv, bin)
+            end
+          end
+        end
+      end
+      local ipc_ok, ipc = pcall(require, "NeoAI.sandbox.systemd_ipc")
+      if ipc_ok and ipc then
+        local hostdir = ipc.ensure()
+        if hostdir then
+          table.insert(argv, "--bind"); table.insert(argv, hostdir); table.insert(argv, ipc.guest_dir())
+        end
+        local sock = ipc.ensure_private_socket()
+        if sock and vim.uv.fs_stat(sock) then
+          table.insert(argv, "--ro-bind"); table.insert(argv, sock); table.insert(argv, "/run/systemd/private")
+        end
+      end
+    end
+    -- policy-rc.d：仅包安装命令（标准容器语义：拒绝维护脚本服务动作，退出 101）。
+    -- 其目标 `/usr/sbin/policy-rc.d` 在只读根（T2/read_all=false）下无法创建挂载点，故不随
+    -- 门面入口一并注入（否则 bwrap 会因 `Read-only file system` 让整条命令失败）。
+    if priv and priv.maintscript_stubs then
+      local stubs = _maintscript_stubs()
+      if stubs then
+        table.insert(argv, "--ro-bind"); table.insert(argv, stubs.policy); table.insert(argv, POLICY_RC_GUEST)
       end
     end
     -- Maven 镜像 settings.xml：只读绑定到会话私有 /tmp，MAVEN_OPTS 的 `-s` 指向它（见 sandbox_env）。
@@ -2544,7 +2723,9 @@ end
 function M.reset()
   state.caps = nil
   state.overlay_probe = {}
+  state.overlay_probe_neg = {}
   state.overlay_write_probe = {}
+  state.overlay_write_neg = {}
   state.empty_file = nil
   state.apt_conf = nil
   state.apk_repos = nil

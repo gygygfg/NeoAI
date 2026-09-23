@@ -1,25 +1,24 @@
---- 沙箱密钥防护：熵检测 + 随机加密映射（进沙箱加密 / 出沙箱 commit 时解密）
+--- 沙箱密钥防护：熵检测 + **格式保真假密钥**（进沙箱假化 / 出沙箱 commit 时还原）
 --- @module NeoAI.sandbox.secret
 --- 常开（配置 `tools.sandbox.secrets` 可调阈值/关闭）。职责：
 ---   1. 基于香农熵 + 字符集启发式检测高熵密钥候选；
----   2. 为每个真实密钥生成随机 token（进程内映射表，不落盘），
----      「进沙箱」时把密钥替换为 token（工具结果、暂存视图、环境变量），
----      「出沙箱」仅在 commit 发布到真实工作区时把 token 还原为密钥；
----   3. 对 token 或**敏感环境变量名**的操作留痕（证据 + 待审警告），只提级不终止；
----   4. **原始密钥**（映射表中已知的真实值）出现在工具参数或 AI 可见上下文时上报硬拦截，
----      由执行器 / 请求前守卫终止 Agent；token（KEY 环境变量操作）只提级审批，不终止。
+---   2. 为每个真实密钥生成**格式保真假密钥**（前缀/长度/字符类一致，熵不低于原始；
+---      进程内映射表，不落盘），「进沙箱」时把密钥替换为假密钥（工具结果、暂存视图、
+---      环境变量），「出沙箱」仅在 commit 发布到真实工作区、沙箱进程执行、私有视图物化时
+---      还原为真实值；
+---   3. 对假密钥或**敏感环境变量名**的操作留痕 + 警告用户（只提级不终止）；
+---   4. **原始密钥**（映射表中已知的真实值）出现在工具参数或 AI 可见上下文时**立即停止 Agent
+---      并弹窗确认**（用户确认后继续，否则保持停止；headless 失败关闭）。
 ---
 --- 边界：熵检测是启发式的，默认按上下文收窄（`entropy_requires_context`）——裸熵串须呈密钥
---- 形态（含 `-`/`_` 且非 snake_case 代码标识符）或处于敏感变量名赋值上下文，纯字母数字/base64
---- 元数据（SRI integrity、内容哈希、构建产物摘要等）与回溯函数名不再 token 化；映射表仅在内存，
---- 热重载后 token 无法还原 → commit 明确拒绝（fail-closed），不写入 token。
+--- 形态（含 `-`/`_` 且非 snake_case 代码标识符）或处于敏感变量名赋值上下文。映射表仅在内存，
+--- 热重载后假密钥无法还原 → commit 明确拒绝（fail-closed），不写入假密钥。
 
 local M = {}
 
 -- ========== 私有常量 ==========
 
 local TOKEN_PREFIX = "NEOKEY_"
-local TOKEN_PAT = "NEOKEY_%x+"
 -- 敏感环境变量名段（与 SCAN_SRC 内同名常量保持一致；模块级供工作线程参数传递）
 local NAME_SEGMENTS = {
   "KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL", "CREDENTIALS",
@@ -39,13 +38,15 @@ local RUN_PAT = "[%w_%-%+]+"
 -- 大文件（暂存视图）通常不含任何凭据前缀，可省去每条规则一次全文扫描。
 local DEFAULT_RULES = {
   { name = "private_key", prefix = "-----BEGIN", pattern = "%-%-%-%-%-BEGIN[%w ]*PRIVATE KEY%-%-%-%-%-[%s%S]-%-%-%-%-%-END[%w ]*PRIVATE KEY%-%-%-%-%-" },
-  { name = "aws_access_key", prefix = "AKIA", pattern = "AKIA[0-9A-Z]+" },
-  { name = "github_token", prefix = "gh", pattern = "gh[pousr]_[A-Za-z0-9]+" },
-  { name = "slack_token", prefix = "xox", pattern = "xox[baprs]%-[A-Za-z0-9%-]+" },
-  { name = "google_api_key", prefix = "AIza", pattern = "AIza[0-9A-Za-z_%-]+" },
-  { name = "stripe_key", prefix = "k_", pattern = "s?[rp]k_(live|test)_[A-Za-z0-9]+" },
-  { name = "openai_key", prefix = "sk-", pattern = "sk%-[A-Za-z0-9_%-]+" },
-  { name = "jwt", prefix = "eyJ", pattern = "eyJ[%w_%-]+%.eyJ[%w_%-]+%.[%w_%-]+" },
+  -- 各具名前缀规则以 `%f[%w]`（词首边界，零宽）打头：避免 `sk-` 命中 `disk-VU`/`risk-` 等
+  -- 普通单词内部（误报并破坏输出），同时不消耗前导字符、保证替换/还原只针对凭据本身。
+  { name = "aws_access_key", prefix = "AKIA", pattern = "%f[%w]AKIA[0-9A-Z]+" },
+  { name = "github_token", prefix = "gh", pattern = "%f[%w]gh[pousr]_[A-Za-z0-9]+" },
+  { name = "slack_token", prefix = "xox", pattern = "%f[%w]xox[baprs]%-[A-Za-z0-9%-]+" },
+  { name = "google_api_key", prefix = "AIza", pattern = "%f[%w]AIza[0-9A-Za-z_%-]+" },
+  { name = "stripe_key", prefix = "k_", pattern = "%f[%w]s?[rp]k_(live|test)_[A-Za-z0-9]+" },
+  { name = "openai_key", prefix = "sk-", pattern = "%f[%w]sk%-[A-Za-z0-9_%-]+" },
+  { name = "jwt", prefix = "eyJ", pattern = "%f[%w]eyJ[%w_%-]+%.eyJ[%w_%-]+%.[%w_%-]+" },
   -- Bearer/Basic 后接普通英文单词（注释/文档，如 "Bearer token"）不应视为凭据：
   -- 要求凭证部分足够长且像 token（含数字或 base64/连接符）。
   { name = "bearer", prefix = "earer", validate_kind = "bearer", pattern = "[Bb]earer%s+[%w%._%-]+", validate = function(m)
@@ -128,7 +129,14 @@ local function looks_like_identifier(run)
   return segs >= 2
 end
 
-local function is_candidate(run, cfg, context)
+local function is_candidate(run, cfg, context, known, fakes)
+  if known and known[run] then return false end
+  -- 已知假密钥的子串（被 `.` 等分隔符切分）不再二次假化，避免「假密钥的假密钥」。
+  if fakes then
+    for i = 1, #fakes do
+      if #fakes[i] > #run and fakes[i]:find(run, 1, true) then return false end
+    end
+  end
   if run:sub(1, #TOKEN_PREFIX) == TOKEN_PREFIX then return false end
   if #run < cfg.min_length or #run > cfg.max_length then return false end
   if not (run:find("%a") and run:find("%d")) then return false end
@@ -244,6 +252,185 @@ local function validate(rule, m)
   return true
 end
 
+-- ===== 假密钥生成（格式保真：同长度 + 同字符类 + 熵不低于原始）=====
+local FAKE_UPPER = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+local FAKE_LOWER = "abcdefghijklmnopqrstuvwxyz"
+local FAKE_DIGIT = "0123456789"
+local FAKE_ALNUM = FAKE_UPPER .. FAKE_LOWER .. FAKE_DIGIT
+local FAKE_B64 = FAKE_ALNUM .. "+/="
+local FAKE_B64URL = FAKE_ALNUM .. "-_"
+
+-- 具名规则的格式提示：字面前缀 / 前缀 pattern / 主体字符集 / 结构类型。
+-- 未登记的规则退回「逐字符类保持」。
+local FAKE_HINTS = {
+  private_key = { kind = "pem" },
+  aws_access_key = { prefix = "AKIA", charset = FAKE_UPPER .. FAKE_DIGIT },
+  github_token = { prefix_pat = "^gh[pousr]_", charset = FAKE_ALNUM },
+  slack_token = { prefix_pat = "^xox[baprs]%-", charset = FAKE_ALNUM .. "-" },
+  google_api_key = { prefix = "AIza", charset = FAKE_B64URL },
+  stripe_key = { prefix_pat = "^s?[rp]k_%a+_", charset = FAKE_ALNUM },
+  openai_key = { prefix = "sk-", charset = FAKE_B64URL },
+  jwt = { kind = "jwt" },
+  bearer = { kind = "bearer" },
+  basic_auth = { kind = "basic" },
+}
+
+local function class_charset(c)
+  if c:match("%u") then return FAKE_UPPER end
+  if c:match("%l") then return FAKE_LOWER end
+  if c:match("%d") then return FAKE_DIGIT end
+  return nil
+end
+
+-- 字符类分组（固定顺序，保证主线程/工作线程生成一致）
+local CLASS_SETS = { { "%u", FAKE_UPPER }, { "%l", FAKE_LOWER }, { "%d", FAKE_DIGIT } }
+
+--- 由 sha 派生的确定性随机字节流（主线程/工作线程一致，无需 math.random）。
+local function rand_bytes(sha, seed, need)
+  local out = {}
+  local block = sha(seed)
+  local i, n = 1, 0
+  while n < need do
+    if i > #block then
+      seed = block
+      block = sha(seed)
+      i = 1
+    end
+    n = n + 1
+    out[n] = tonumber(block:sub(i, i + 1), 16) or 0
+    i = i + 2
+  end
+  return out
+end
+
+--- 生成「尽可能多不同字符」的序列并打乱：均匀覆盖字符集 → 熵 ≈ log2(min(L, |charset|))，
+--- 从而不高于原始熵的概率极低（配合重试可保证 >= 原始）。
+local function diverse_sequence(charset, L, sha, seed)
+  local k = #charset
+  if k == 0 or L == 0 then return {} end
+  local off = rand_bytes(sha, seed, 1)[1] % k
+  local seq = {}
+  for i = 1, L do
+    local idx = ((off + i - 1) % k) + 1
+    seq[i] = charset:sub(idx, idx)
+  end
+  local rb = rand_bytes(sha, seed .. "|sh", L)
+  for i = L, 2, -1 do
+    local j = (rb[i] % i) + 1
+    seq[i], seq[j] = seq[j], seq[i]
+  end
+  return seq
+end
+
+--- 把位置列表按字符集做多样性填充。
+local function fill_diverse(out, positions, charset, sha, seed)
+  if #positions == 0 then return end
+  local seq = diverse_sequence(charset, #positions, sha, seed)
+  for i, p in ipairs(positions) do out[p] = seq[i] end
+end
+
+--- 逐字符类保持填充（符号原样保留）。
+local function fill_classes(out, secret, from, sha, seed)
+  local n = #secret
+  local gi = 0
+  for _, cs in ipairs(CLASS_SETS) do
+    local pat, set = cs[1], cs[2]
+    local pos = {}
+    for i = from, n do
+      if secret:sub(i, i):match(pat) then pos[#pos + 1] = i end
+    end
+    gi = gi + 1
+    fill_diverse(out, pos, set, sha, seed .. "|g" .. gi)
+  end
+end
+
+local function gen_fake(secret, hint, sha, seed)
+  local n = #secret
+  local out = {}
+  -- 默认原样保留：分支仅覆盖「可变」位置，保证无 nil 且符号/换行等字面量不变。
+  for i = 1, n do out[i] = secret:sub(i, i) end
+  if hint and hint.kind == "pem" then
+    -- 保留头/尾行字面量，仅随机化 base64 主体（首尾换行之间的可编码字符）。
+    local first_nl = secret:find("\n", 1, true)
+    local last_nl = secret:match("()\n[^\n]*$")
+    local from = first_nl and (first_nl + 1) or 1
+    local to = last_nl and (last_nl - 1) or n
+    local pos = {}
+    for i = from, to do
+      if secret:sub(i, i):match("[%w%+/=]") then pos[#pos + 1] = i end
+    end
+    fill_diverse(out, pos, FAKE_B64, sha, seed)
+    return table.concat(out)
+  elseif hint and hint.kind == "jwt" then
+    -- 保留每段 `eyJ` 头部与 `.` 分隔符，仅随机化其余部分。
+    local pos, seg_start = {}, 1
+    for i = 1, n + 1 do
+      if i > n or secret:sub(i, i) == "." then
+        for j = seg_start, i - 1 do
+          if j - seg_start >= 3 then pos[#pos + 1] = j end
+        end
+        seg_start = i + 1
+      end
+    end
+    fill_diverse(out, pos, FAKE_B64URL, sha, seed)
+    return table.concat(out)
+  elseif hint and (hint.kind == "bearer" or hint.kind == "basic") then
+    local kw = secret:match("^([Bb]earer%s+)") or secret:match("^([Bb]asic%s+)")
+    local set = (hint.kind == "basic") and FAKE_B64 or FAKE_B64URL
+    if kw then
+      for i = 1, #kw do out[i] = kw:sub(i, i) end
+      local pos = {}
+      for i = #kw + 1, n do pos[#pos + 1] = i end
+      fill_diverse(out, pos, set, sha, seed)
+      return table.concat(out)
+    end
+  end
+  local pre
+  if hint then
+    if hint.prefix then pre = hint.prefix
+    elseif hint.prefix_pat then pre = secret:match(hint.prefix_pat) end
+  end
+  if pre and #pre <= n then
+    for i = 1, #pre do out[i] = pre:sub(i, i) end
+    local cs = hint and hint.charset
+    if cs then
+      local pos = {}
+      for i = #pre + 1, n do pos[#pos + 1] = i end
+      fill_diverse(out, pos, cs, sha, seed)
+    else
+      fill_classes(out, secret, #pre + 1, sha, seed)
+    end
+    return table.concat(out)
+  end
+  -- 通用：逐字符类保持（符号原样保留）
+  fill_classes(out, secret, 1, sha, seed)
+  return table.concat(out)
+end
+
+--- 生成与 secret 同格式、同长度且香农熵不低于 secret 的假密钥。
+--- 熵不足时以不同 attempt 重新派生（最多 16 次），仍不足则返回最后一次候选。
+--- @param secret string
+--- @param rule_name string|nil
+--- @param sha function 十六进制 sha256（主线程 vim.fn.sha256 / 工作线程纯 Lua）
+--- @param salt string
+--- @param seq number|string
+--- @return string
+local function fake_for(secret, rule_name, sha, salt, seq)
+  if type(secret) ~= "string" or secret == "" then return secret end
+  local hint = FAKE_HINTS[rule_name or ""]
+  local target = entropy(secret)
+  local last = secret
+  for attempt = 1, 16 do
+    local seed = tostring(salt) .. "|" .. tostring(seq) .. "|" .. tostring(attempt) .. "|" .. secret
+    local cand = gen_fake(secret, hint, sha, seed)
+    last = cand
+    if cand ~= secret and #cand == #secret and entropy(cand) + 1e-9 >= target then
+      return cand
+    end
+  end
+  return last
+end
+
 local function apply_rules(text, cfg, token_for)
   for _, rule in ipairs(cfg.rules or {}) do
     local present = true
@@ -263,7 +450,7 @@ local function apply_rules(text, cfg, token_for)
   return text
 end
 
-local function apply_secret_names(text, token_for)
+local function apply_secret_names(text, token_for, known)
   if not (text:find("=", 1, true) or text:find(":", 1, true)) then return text end
   -- 廉价预检：敏感名片段须**紧跟 = 或 :**（赋值形态）才可能命中；否则跳过 5 次全文 gsub。
   -- 大量普通源码/数据文件（如 venv、node_modules）只是恰好含 "key"/"token" 子串，
@@ -282,6 +469,8 @@ local function apply_secret_names(text, token_for)
     if type(name) ~= "string" or type(value) ~= "string" then return nil end
     if value == "" or not secret_name(name) then return nil end
     if value:sub(1, #TOKEN_PREFIX) == TOKEN_PREFIX then return nil end
+    -- 已是已知假密钥：不再二次假化（否则产生「假密钥的假密钥」，破坏往返还原）。
+    if known and known[value] then return nil end
     -- 值不像凭据（普通单词/路径/短值）时不登记，避免污染原始密钥映射表。
     if not looks_like_assigned_secret(value) then return nil end
     return token_for(value, "env_name:" .. name)
@@ -351,7 +540,7 @@ end
 --- @return string
 local function process(text, cfg, token_for, opts)
   text = apply_rules(text, cfg, token_for)
-  text = apply_secret_names(text, token_for)
+  text = apply_secret_names(text, token_for, opts and opts.known)
   text = apply_plain_secrets(text, opts and opts.plain_secrets, token_for)
   if opts and opts.entropy == false then return text end
   local parts, pos = {}, 1
@@ -363,7 +552,7 @@ local function process(text, cfg, token_for, opts)
     end
     parts[#parts + 1] = text:sub(pos, s - 1)
     local run = text:sub(s, e)
-    if not is_path_component(text, s, e) and is_candidate(run, cfg) then
+    if not is_path_component(text, s, e) and is_candidate(run, cfg, nil, opts and opts.known, opts and opts.fakes) then
       parts[#parts + 1] = token_for(run, nil)
     else
       parts[#parts + 1] = run
@@ -375,7 +564,7 @@ end
 
 return { process = process, apply_rules = apply_rules, is_candidate = is_candidate, entropy = entropy,
   validate = validate, secret_name = secret_name, secret_name_prefix = secret_name_prefix,
-  looks_like_env_name_ref = looks_like_env_name_ref }
+  looks_like_env_name_ref = looks_like_env_name_ref, fake_for = fake_for }
 ]==]
 
 local _scan = assert(load(SCAN_SRC))()
@@ -383,8 +572,11 @@ local _scan = assert(load(SCAN_SRC))()
 -- ========== 私有状态 ==========
 
 local state = {
-  by_secret = {}, -- secret -> token
-  by_token = {}, -- token -> secret
+  by_secret = {}, -- secret -> fake（格式保真假密钥）
+  by_token = {}, -- fake -> secret
+  fake_set = {}, -- fake -> true（检测排除 / 命中判定）
+  by_blob = {}, -- binary fake(bytes) -> real(bytes)
+  stale_fakes = {}, -- 热重载后残留的 fake（映射缺失 → 不可还原，fail-closed）
   env_secrets = {}, -- 来自环境变量的密钥值（软信号：只 token 化/告警，不终止 Agent）
   seq = 0,
   salt = nil,
@@ -421,15 +613,16 @@ local function _ensure_salt()
   return state.salt
 end
 
---- 登记一个（已生成的）secret->token 映射并触发留痕/事件/审计。
+--- 登记一个（已生成的）secret->fake 映射并触发留痕/事件/审计。
 --- 供主线程 `_token_for` 与工作线程结果合并共用。
 --- @param secret string
---- @param token string
+--- @param token string 假密钥
 --- @param rule_name string|nil
 local function _register_token(secret, token, rule_name)
   if state.by_secret[secret] then return end
   state.by_secret[secret] = token
   state.by_token[token] = secret
+  state.fake_set[token] = true
   state.traces[#state.traces + 1] = { event = "detected", token = token, rule = rule_name, at = os.time() }
   pcall(function()
     require("NeoAI.kernel.event_bus").emit(require("NeoAI.kernel.events").SANDBOX_SECRET_DETECTED, {
@@ -443,20 +636,29 @@ local function _register_token(secret, token, rule_name)
       })
     end)
   end
+  pcall(function()
+    require("NeoAI.sandbox.secret_flow").on_register(secret, token, rule_name)
+  end)
 end
 
---- 生成随机 token（每进程随机盐，跨密钥唯一）
+--- 生成格式保真假密钥（每进程随机盐派生；熵不低于原始）。
 --- @param secret string
---- @param rule_name string|nil 命中的具名规则（用于留痕）
+--- @param rule_name string|nil 命中的具名规则（用于留痕与格式提示）
 --- @return string
 local function _token_for(secret, rule_name)
   local existing = state.by_secret[secret]
   if existing then return existing end
-  state.seq = state.seq + 1
-  local hex = tostring(vim.fn.sha256(_ensure_salt() .. "|" .. state.seq .. "|" .. secret))
-  local token = TOKEN_PREFIX .. hex:sub(1, 32)
-  _register_token(secret, token, rule_name)
-  return token
+  -- 已是已知假密钥：原样返回，避免「假密钥被再次假化」。
+  if state.fake_set[secret] then return secret end
+  local fake
+  local guard = 0
+  repeat
+    state.seq = state.seq + 1
+    fake = _scan.fake_for(secret, rule_name, vim.fn.sha256, _ensure_salt(), state.seq)
+    guard = guard + 1
+  until (not state.fake_set[fake] and fake ~= secret) or guard >= 8
+  _register_token(secret, fake, rule_name)
+  return fake
 end
 
 --- 对文本应用具名敏感信息规则做**破坏性脱敏**（用于日志/证据，不可还原）。
@@ -529,6 +731,8 @@ function M.detect(text)
   local out = {}
   if type(text) ~= "string" or text == "" then return out end
   local cfg = _cfg()
+  local fake_list = {}
+  for f in pairs(state.fake_set) do fake_list[#fake_list + 1] = f end
   local seen = {}
   local function add(s, e, rule)
     if s == nil then return end
@@ -546,7 +750,7 @@ function M.detect(text)
     -- 裸熵串的上下文信号：紧邻的敏感变量名赋值（KEY=/TOKEN:/PASSWORD=）使其无需分隔符。
     -- 只回看有限窗口，避免在大文本上对每个 run 复制整段前缀（O(n²)）。
     local prefix = text:sub(s > 64 and s - 64 or 1, s - 1)
-    if _scan.is_candidate(run, cfg, _scan.secret_name_prefix(prefix)) then add(s, e) end
+    if _scan.is_candidate(run, cfg, _scan.secret_name_prefix(prefix), state.fake_set, fake_list) then add(s, e) end
     pos = e + 1
   end
   -- 具名规则：补充结构化敏感信息（私钥块/带前缀 token 等熵检测盲区）；与熵检测重叠时去重。
@@ -617,9 +821,21 @@ function M.tokenize(text, opts)
     scan_opts.plain_secrets = list
   end
   -- 全文扫描核心（规则 -> 变量名赋值 -> 已知环境变量密钥 -> 残余高熵串）；token 生成经回调注入。
+  scan_opts.known = state.fake_set
+  local fakes
+  if scan_opts.fakes == nil then
+    fakes = {}
+    for f in pairs(state.fake_set) do fakes[#fakes + 1] = f end
+    scan_opts.fakes = fakes
+  else
+    fakes = scan_opts.fakes
+  end
   local out = _scan.process(text, cfg, function(secret, rule_name)
     local token = _token_for(secret, rule_name)
     used[#used + 1] = token
+    -- 保持 fakes 列表实时更新：本轮新生成的假密钥也要参与「子串排除」，否则其被分隔符
+    -- 切分的片段会在残余熵扫描中被二次假化。
+    fakes[#fakes + 1] = token
     return token
   end, scan_opts)
   return out, used
@@ -641,7 +857,8 @@ end
 --- @return string 编码结果
 local function _tokenize_worker(cfg_enc, map_enc, salt, seq, texts_enc, sha_src, scan_src, meta_enc)
   local sha = assert(load(sha_src))()
-  local process = assert(load(scan_src))().process
+  local scan = assert(load(scan_src))()
+  local process = scan.process
   local function make_reader(s)
     local pos = 1
     return function()
@@ -677,29 +894,41 @@ local function _tokenize_worker(cfg_enc, map_enc, salt, seq, texts_enc, sha_src,
   local texts = {}
   for i = 1, tonumber(tn()) do texts[i] = tn() end
 
-  -- 元信息：首项为 entropy_flags，随后是已知环境变量密钥值列表（编码格式同 `_encode_texts`）。
-  local entropy_flags, env_secrets = nil, {}
+  -- 元信息：首项为 entropy_flags，随后是已知环境变量密钥值列表，再是已知假密钥列表。
+  local entropy_flags, env_secrets, known, fakes = nil, {}, {}, {}
   if type(meta_enc) == "string" and meta_enc ~= "" then
     local mr = make_reader(meta_enc)
     entropy_flags = mr()
     for _ = 1, (tonumber(mr()) or 0) do env_secrets[#env_secrets + 1] = mr() end
+    for _ = 1, (tonumber(mr()) or 0) do
+      local f = mr()
+      known[f] = true
+      fakes[#fakes + 1] = f
+    end
   end
 
   seq = tonumber(seq) or 0
   local new = {}
   local function token_for(secret, rule)
+    if known[secret] then return secret end
     local t = map[secret]
     if t then return t end
-    seq = seq + 1
-    t = "NEOKEY_" .. sha(salt .. "|" .. seq .. "|" .. secret):sub(1, 32)
+    local guard = 0
+    repeat
+      seq = seq + 1
+      t = scan.fake_for(secret, rule, sha, salt, seq)
+      guard = guard + 1
+    until (not known[t] and t ~= secret) or guard >= 8
     map[secret] = t
+    known[t] = true
+    fakes[#fakes + 1] = t
     new[#new + 1] = { secret, t, rule }
     return t
   end
   local outs = {}
   for i = 1, #texts do
     local entropy = not (entropy_flags and entropy_flags:sub(i, i) == "0")
-    outs[i] = process(texts[i], cfg, token_for, { entropy = entropy, plain_secrets = env_secrets })
+    outs[i] = process(texts[i], cfg, token_for, { entropy = entropy, plain_secrets = env_secrets, known = known, fakes = fakes })
   end
 
   local function es(s) s = s or ""; return tostring(#s) .. ":" .. s end
@@ -761,13 +990,14 @@ local function _encode_texts(texts)
   return table.concat(p)
 end
 
---- 元信息编码：`entropy_flags` 串 + 已知环境变量密钥值列表。
+--- 元信息编码：`entropy_flags` 串 + 已知环境变量密钥值列表 + 已知假密钥列表。
 --- 合并为单个参数，因为 `vim.uv.new_work` 的 `queue` 只可靠传递有限个参数（第 9 个起丢失）。
 --- @param flags string
 --- @param env_list table
+--- @param fakes table|nil
 --- @return string
-local function _encode_meta(flags, env_list)
-  return _enc_str(flags or "") .. _encode_texts(env_list or {})
+local function _encode_meta(flags, env_list, fakes)
+  return _enc_str(flags or "") .. _encode_texts(env_list or {}) .. _encode_texts(fakes or {})
 end
 
 --- 解析工作线程结果：seq, new_entries, out_texts
@@ -868,11 +1098,16 @@ local function _merge_chunk_results(results)
       end
     end
     if remap then
-      -- 单遍按 token 模式重写：每个输出文件只扫描一次（此前对每个 remap 项各做一次
-      -- 全文 gsub，块内输出×remap 近似平方，数万文件时占满主线程）。
+      -- 逐 remap 项做 plain-find 预筛 + 转义 gsub（假密钥为任意字符串，无法用固定 pattern）。
       for i = 1, #r.outs do
         local out = r.outs[i]
-        r.outs[i] = out:gsub(TOKEN_PAT, function(tok) return remap[tok] or tok end)
+        for bad, canon in pairs(remap) do
+          if out:find(bad, 1, true) then
+            local pat = bad:gsub("([^%w])", "%%%1")
+            out = out:gsub(pat, function() return canon end)
+          end
+        end
+        r.outs[i] = out
       end
     end
   end
@@ -905,7 +1140,9 @@ function M.tokenize_many_async(texts, opts)
   local cfg_enc = _encode_cfg(cfg)
   local env_list = {}
   for s in pairs(state.env_secrets) do env_list[#env_list + 1] = s end
-  local meta_enc = _encode_meta(flags, env_list)
+  local fake_list = {}
+  for f in pairs(state.fake_set) do fake_list[#fake_list + 1] = f end
+  local meta_enc = _encode_meta(flags, env_list, fake_list)
   local chunk = _work_chunk_files()
   if #texts <= chunk then
     local map_enc, texts_enc = _encode_map(state.by_secret), _encode_texts(texts)
@@ -931,7 +1168,7 @@ function M.tokenize_many_async(texts, opts)
   end
   return work.batched(tasks, _work_parallelism(), function(task)
     return work.run(_tokenize_worker, cfg_enc, map_enc, salt, state.seq,
-      _encode_texts(task.sub), sha_src, SCAN_SRC, _encode_meta(task.flags, env_list)):then_(function(enc)
+      _encode_texts(task.sub), sha_src, SCAN_SRC, _encode_meta(task.flags, env_list, fake_list)):then_(function(enc)
         local seq, new, outs = _decode_result(enc)
         return { seq = seq, new = new, outs = outs }
       end)
@@ -950,12 +1187,13 @@ end
 
 -- ========== 工作线程：候选文件密钥分析（token 警告 + 生成高熵） ==========
 
---- 线程内逐文件扫描：统计 NEOKEY token 与生成高熵/具名规则命中（检测逻辑与主线程一致）。
+--- 线程内逐文件扫描：统计已知假密钥命中与生成高熵/具名规则命中（检测逻辑与主线程一致）。
 --- @param cfg_enc string
 --- @param texts_enc string
 --- @param scan_src string
+--- @param fakes_enc string|nil 已知假密钥列表（编码同 `_encode_texts`）
 --- @return string 编码结果（每文件：token 数+token 列表，hits 数+各 hit 的 value/entropy/rule）
-local function _analyze_worker(cfg_enc, texts_enc, scan_src)
+local function _analyze_worker(cfg_enc, texts_enc, scan_src, fakes_enc)
   local scan = assert(load(scan_src))()
   local RUN_PAT = "[%w_%-%+]+"
   local function make_reader(s)
@@ -987,6 +1225,13 @@ local function _analyze_worker(cfg_enc, texts_enc, scan_src)
   local tn = make_reader(texts_enc)
   local texts = {}
   for i = 1, tonumber(tn()) do texts[i] = tn() or "" end
+  local fakes = {}
+  if type(fakes_enc) == "string" and fakes_enc ~= "" then
+    local fr = make_reader(fakes_enc)
+    for _ = 1, (tonumber(fr()) or 0) do fakes[#fakes + 1] = fr() end
+  end
+  local known = {}
+  for _, f in ipairs(fakes) do known[f] = true end
 
   local function detect(text)
     local out, seen = {}, {}
@@ -1004,7 +1249,7 @@ local function _analyze_worker(cfg_enc, texts_enc, scan_src)
       if not s then break end
       local run = text:sub(s, e)
       local prefix = text:sub(s > 64 and s - 64 or 1, s - 1)
-      if scan.is_candidate(run, cfg, scan.secret_name_prefix(prefix)) then add(s, e) end
+      if scan.is_candidate(run, cfg, scan.secret_name_prefix(prefix), known, fakes) then add(s, e) end
       pos = e + 1
     end
     for _, rule in ipairs(cfg.rules or {}) do
@@ -1012,7 +1257,7 @@ local function _analyze_worker(cfg_enc, texts_enc, scan_src)
         local s, e = text:find(rule.pattern)
         while s do
           local m = text:sub(s, e)
-          if scan.validate(rule, m) then add(s, e, rule.name) end
+          if not known[m] and scan.validate(rule, m) then add(s, e, rule.name) end
           s, e = text:find(rule.pattern, e + 1)
         end
       end
@@ -1025,7 +1270,9 @@ local function _analyze_worker(cfg_enc, texts_enc, scan_src)
   for i = 1, #texts do
     local text = texts[i]
     local toks, ntok = {}, 0
-    for tok in text:gmatch("NEOKEY_%x+") do ntok = ntok + 1; toks[#toks + 1] = tok end
+    for _, fake in ipairs(fakes) do
+      if text:find(fake, 1, true) then ntok = ntok + 1; toks[#toks + 1] = fake end
+    end
     parts[#parts + 1] = es(tostring(ntok))
     for _, t in ipairs(toks) do parts[#parts + 1] = es(t) end
     local hits = detect(text)
@@ -1100,6 +1347,9 @@ function M.analyze_files_async(files, opts)
     return async.resolve({ offloaded = false }) -- 回退：调用方使用同步版
   end
   local cfg_enc = _encode_cfg(cfg)
+  local fake_list = {}
+  for f in pairs(state.fake_set) do fake_list[#fake_list + 1] = f end
+  local fakes_enc = _encode_texts(fake_list)
   -- 结果聚合：与同步版语义一致（token 去重计数 + 生成高熵命中按文件索引还原）。
   local function accumulate(per, idxs, tokens, generated)
     local count = 0
@@ -1110,7 +1360,7 @@ function M.analyze_files_async(files, opts)
       end
       if opts.generated ~= false then
         for _, hit in ipairs(entry.hits) do
-          if not hit.value:match("^" .. TOKEN_PAT .. "$") then
+          if not state.fake_set[hit.value] then
             local fi = idxs[k]
             generated[#generated + 1] = {
               path = files[fi] and files[fi].path, entropy = hit.entropy, rule = hit.rule,
@@ -1134,7 +1384,7 @@ function M.analyze_files_async(files, opts)
   end
   local chunk = _work_chunk_files()
   if #selected <= chunk then
-    return work.run(_analyze_worker, cfg_enc, _encode_texts(selected), SCAN_SRC):then_(function(enc)
+    return work.run(_analyze_worker, cfg_enc, _encode_texts(selected), SCAN_SRC, fakes_enc):then_(function(enc)
       local tokens, generated = {}, {}
       local count = accumulate(_decode_analyze(enc), idx, tokens, generated)
       return finalize(tokens, count, generated)
@@ -1152,7 +1402,7 @@ function M.analyze_files_async(files, opts)
     i = j + 1
   end
   return work.batched(subs, _work_parallelism(), function(sub)
-    return work.run(_analyze_worker, cfg_enc, _encode_texts(sub), SCAN_SRC):then_(function(enc)
+    return work.run(_analyze_worker, cfg_enc, _encode_texts(sub), SCAN_SRC, fakes_enc):then_(function(enc)
       return _decode_analyze(enc)
     end)
   end):then_(function(results)
@@ -1164,41 +1414,171 @@ function M.analyze_files_async(files, opts)
   end)
 end
 
---- 把 token 还原为真实密钥（出沙箱 commit 解密）
---- @param text string
---- @return string restored
---- @return number unresolved 未解析的 token 数（映射缺失，调用方应 fail-closed）
-function M.detokenize(text)
-  if type(text) ~= "string" or text == "" then return text, 0 end
-  local unresolved = 0
-  local out = text:gsub(TOKEN_PAT, function(tok)
-    local secret = state.by_token[tok]
-    if secret then return secret end
-    unresolved = unresolved + 1
-    return tok
-  end)
-  return out, unresolved
+-- 凭据字符（用于「误还原」边界判断：假密钥嵌于更长凭据串中时不还原）。
+-- 只含字母/数字/`_`/`-`；`=`（赋值/base64 padding）与 `.` 视为边界，避免 `key=<fake>` 无法还原。
+local function _is_cred_char(c)
+  return c ~= "" and c:match("[%w_%-]") ~= nil
 end
 
---- 文本是否含 token
+--- 位置感知的精确替换（plain find + 边界校验），返回新文本与替换次数。
+--- @param text string
+--- @param needle string
+--- @param repl string
+--- @param counter table { n = number }
+--- @return string
+local function _replace_bounded(text, needle, repl, counter)
+  local out, pos, n = {}, 1, #needle
+  while true do
+    local s, e = text:find(needle, pos, true)
+    if not s then break end
+    local before = s > 1 and text:sub(s - 1, s - 1) or ""
+    local after = e < #text and text:sub(e + 1, e + 1) or ""
+    out[#out + 1] = text:sub(pos, s - 1)
+    if not _is_cred_char(before) and not _is_cred_char(after) then
+      out[#out + 1] = repl
+      counter.n = counter.n + 1
+    else
+      out[#out + 1] = needle
+    end
+    pos = e + 1
+  end
+  out[#out + 1] = text:sub(pos)
+  return table.concat(out)
+end
+
+--- 还原二进制假内容标记（`NEOAI_BINARY:<len>:<b64>`）为真实字节。
+--- @param text string
+--- @return string
+local function _restore_binary_markers(text)
+  if type(text) ~= "string" or not text:find("NEOAI_BINARY:", 1, true) then return text end
+  local function b64decode(s)
+    local b = s:gsub("-", "+"):gsub("_", "/")
+    local pad = (4 - (#b % 4)) % 4
+    b = b .. string.rep("=", pad)
+    local map = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+    local out, acc, bits = {}, 0, 0
+    for i = 1, #b do
+      local c = b:sub(i, i)
+      if c == "=" then break end
+      local v = map:find(c, 1, true)
+      if not v then return nil end
+      acc = acc * 64 + (v - 1)
+      bits = bits + 6
+      if bits >= 8 then
+        bits = bits - 8
+        local byte = math.floor(acc / (2 ^ bits)) % 256
+        out[#out + 1] = string.char(byte)
+        acc = acc % (2 ^ bits)
+      end
+    end
+    return table.concat(out)
+  end
+  return (text:gsub("NEOAI_BINARY:%d+:([A-Za-z0-9%+%/%_%-%=]+)", function(b64)
+    local fake = b64decode(b64)
+    if fake and state.by_blob[fake] then return state.by_blob[fake] end
+    return "NEOAI_BINARY:" .. #b64 .. ":" .. b64
+  end))
+end
+
+--- 把假密钥/二进制假内容还原为真实密钥（出沙箱 commit / 进程执行 / 私有视图物化）。
+--- 误还原判断：仅当假密钥**不嵌于更长的凭据字符串**（前后非凭据字符）时才替换；
+--- 二进制 blob 走整块精确匹配。热重载后映射缺失的 stale fake 计入 unresolved（fail-closed）。
+--- @param text string
+--- @return string restored
+--- @return number unresolved 未解析的假密钥数（映射缺失，调用方应 fail-closed）
+function M.detokenize(text)
+  if type(text) ~= "string" or text == "" then return text, 0 end
+  local counter = { n = 0 }
+  -- 1) 二进制标记
+  text = _restore_binary_markers(text)
+  -- 2) 二进制 blob（整块精确匹配，按长度降序避免子串互相覆盖）
+  local blobs = {}
+  for fake in pairs(state.by_blob) do blobs[#blobs + 1] = fake end
+  if #blobs > 0 then
+    table.sort(blobs, function(a, b) return #a > #b end)
+    for _, fake in ipairs(blobs) do
+      if text:find(fake, 1, true) then
+        local repl = state.by_blob[fake]
+        local out, pos = {}, 1
+        while true do
+          local s, e = text:find(fake, pos, true)
+          if not s then break end
+          out[#out + 1] = text:sub(pos, s - 1)
+          out[#out + 1] = repl
+          pos = e + 1
+        end
+        out[#out + 1] = text:sub(pos)
+        text = table.concat(out)
+      end
+    end
+  end
+  -- 3) 假密钥（按长度降序，带边界校验）
+  local fakes = {}
+  for fake in pairs(state.by_token) do fakes[#fakes + 1] = fake end
+  table.sort(fakes, function(a, b) return #a > #b end)
+  for _, fake in ipairs(fakes) do
+    local real = state.by_token[fake]
+    if real and text:find(fake, 1, true) then
+      text = _replace_bounded(text, fake, real, counter)
+    end
+  end
+  -- 4) stale fake（映射缺失）→ unresolved
+  local unresolved = 0
+  for fake in pairs(state.stale_fakes) do
+    if text:find(fake, 1, true) then unresolved = unresolved + 1 end
+  end
+  return text, unresolved
+end
+
+--- 文本是否含已知假密钥（token）
 --- @param text string
 --- @return boolean
 function M.has_token(text)
-  return type(text) == "string" and text:find(TOKEN_PAT) ~= nil
+  if type(text) ~= "string" or text == "" then return false end
+  for fake in pairs(state.fake_set) do
+    if text:find(fake, 1, true) then return true end
+  end
+  return false
 end
 
--- AI 读取到 KEY（结果被 token 化）时追加的说明：真实密钥已被沙箱遮蔽（仅对 AI 不可见），
--- 这是沙箱的显示层保护，不代表程序出错、也不影响程序实际运行；token 在写入文件时自动还原。
--- 沙箱只遮蔽密钥形态的高熵串，路径/函数名/构建哈希等原样保留（见 `is_path_component` /
--- `looks_like_identifier`）；环境变量侧以 `NEOAI_TOKENIZED_ENV` 标识被遮蔽的变量名。
-local READ_HINT = "提示：结果中的 NEOKEY_* 为沙箱密钥 token——真实密钥已被沙箱遮蔽，仅对 AI 不可见，"
-  .. "不代表程序出错、也不影响程序实际运行（写入文件时自动替换回原有真实密钥）。"
-  .. "沙箱只遮蔽密钥形态的高熵串，路径、函数名、构建哈希等原样保留；"
-  .. "被遮蔽的环境变量名见 NEOAI_TOKENIZED_ENV。"
+--- 文本中所有已知假密钥出现位置（供 UI 高亮）
+--- @param text string
+--- @return table 数组 { value, start, stop }
+function M.detect_tokens(text)
+  local out = {}
+  if type(text) ~= "string" or text == "" then return out end
+  for fake in pairs(state.fake_set) do
+    local pos = 1
+    while true do
+      local s, e = text:find(fake, pos, true)
+      if not s then break end
+      out[#out + 1] = { value = fake, start = s, stop = e }
+      pos = e + 1
+    end
+  end
+  table.sort(out, function(a, b)
+    if a.start == b.start then return a.stop < b.stop end
+    return a.start < b.start
+  end)
+  return out
+end
 
---- AI 读取到 KEY 时的提示文本
+--- 文本是否含假密钥（别名，语义同 has_token）
+--- @param text string
+--- @return boolean
+function M.is_fake(text)
+  return M.has_token(text)
+end
+
+-- AI 读取到 KEY（结果被假密钥替换）时追加的说明。默认**不告知** AI（保持格式保真），
+-- 仅当 `tools.sandbox.secrets.disclose_fakes=true` 时返回。
+local READ_HINT = "提示：结果中的密钥为沙箱生成的**格式保真假密钥**——真实密钥已被沙箱遮蔽，"
+  .. "仅对 AI 不可见，不影响程序实际运行（写入文件/沙箱执行时自动替换回真实密钥）。"
+
+--- AI 读取到 KEY 时的提示文本（默认空 = 不告知）
 --- @return string
 function M.read_hint()
+  if _cfg().disclose_fakes ~= true then return "" end
   return READ_HINT
 end
 
@@ -1283,6 +1663,18 @@ function M.find_real_secret(text, opts)
   return nil
 end
 
+--- 获取某真实密钥的格式保真假密钥（已存在则复用；不存在则生成并登记）。
+--- 供密钥告警弹窗展示「将替换为」的假值，并保证展示值与用户选择「替换为假密钥」时实际使用值一致。
+--- @param secret string
+--- @param rule_name string|nil
+--- @return string|nil fake
+function M.fake_for(secret, rule_name)
+  if type(secret) ~= "string" or secret == "" then return nil end
+  if not M.enabled() then return nil end
+  return _token_for(secret, rule_name)
+end
+
+
 --- 递归扫描值中是否含映射表已知的原始密钥。
 --- @param v any
 --- @param opts table|nil { skip_env?: boolean }
@@ -1342,7 +1734,9 @@ function M.scan(value, acc)
   if t == "string" then
     local secret = M.find_real_secret(value)
     if secret and not acc.secret then acc.secret = secret end
-    for tok in value:gmatch(TOKEN_PAT) do acc.tokens[tok] = true end
+    for fake in pairs(state.fake_set) do
+      if value:find(fake, 1, true) then acc.tokens[fake] = true end
+    end
   elseif t == "table" then
     for k, v in pairs(value) do
       M.scan(v, acc)
@@ -1352,13 +1746,13 @@ function M.scan(value, acc)
   return acc
 end
 
--- 单遍扫描工作线程：一次遍历同时产出原始密钥命中 / token 集合 / 敏感环境变量名。
+-- 单遍扫描工作线程：一次遍历同时产出原始密钥命中 / 假密钥集合 / 敏感环境变量名。
 -- 自包含（无 upvalue / require），可经 utils.work.run_codec 在独立线程执行。
--- 参数为单个结构：{ value = args, secrets = {...}, segments = {...}, token_pat, env_name_pat }。
+-- 参数为单个结构：{ value = args, secrets = {...}, fakes = {...}, segments = {...}, env_name_pat }。
 local function _SCAN_ALL_WORKER(payload)
   local secrets = payload.secrets or {}
+  local fakes = payload.fakes or {}
   local segments = payload.segments or {}
-  local token_pat = payload.token_pat
   local env_name_pat = payload.env_name_pat
   local tokens, names, seen = {}, {}, {}
   local result = {}
@@ -1387,7 +1781,10 @@ local function _SCAN_ALL_WORKER(payload)
         local s = find_secret(v)
         if s then result.secret = s end
       end
-      for tok in v:gmatch(token_pat) do tokens[tok] = true end
+      for i = 1, #fakes do
+        local f = fakes[i]
+        if v:find(f, 1, true) then tokens[f] = true end
+      end
       for name in v:gmatch(env_name_pat) do
         if #name >= 6 and not seen[name] and not name:match("^SANDBOX_SECRET_") and secret_name(name) then
           seen[name] = true
@@ -1420,12 +1817,14 @@ function M.scan_all_async(value)
   for s in pairs(state.by_secret) do
     if #s >= 8 and not _is_env_name_secret(s) then secrets[#secrets + 1] = s end
   end
+  local fakes = {}
+  for f in pairs(state.fake_set) do fakes[#fakes + 1] = f end
   local work = require("NeoAI.utils.work")
   return work.run_codec(_SCAN_ALL_WORKER, {
     value = value,
     secrets = secrets,
+    fakes = fakes,
     segments = NAME_SEGMENTS,
-    token_pat = TOKEN_PAT,
     env_name_pat = ENV_NAME_PAT,
   }):then_(function(res)
     local set = {}
@@ -1453,6 +1852,29 @@ function M.tokenize_args(args, opts)
   end
   if type(args) == "table" then walk(args) end
   return used
+end
+
+--- 递归把值（表）中所有字符串里的 `real`（按凭据词界）就地替换为 `fake`。
+--- 供「替换为假密钥并继续」在 AI 可见上下文/历史消息中脱去真实密钥。
+--- @param value any 表（数组/映射，支持嵌套）
+--- @param real string 真实密钥
+--- @param fake string 假密钥
+--- @return number 替换处数
+function M.replace_value(value, real, fake)
+  if type(real) ~= "string" or real == "" or type(fake) ~= "string" or fake == "" then return 0 end
+  if type(value) ~= "table" then return 0 end
+  local counter = { n = 0 }
+  local function walk(t)
+    for k, v in pairs(t) do
+      if type(v) == "string" then
+        if v:find(real, 1, true) then t[k] = _replace_bounded(v, real, fake, counter) end
+      elseif type(v) == "table" then
+        walk(v)
+      end
+    end
+  end
+  walk(value)
+  return counter.n
 end
 
 --- 生成 token 化的环境变量覆盖（供日志/审计与 AI 可见面；**不是**沙箱进程最终环境）。
@@ -1533,19 +1955,22 @@ function M.tokenize_result(value, opts)
   return value
 end
 
---- 扫描候选文件内容中的 token，返回警告信息（供待审队列展示）
+--- 扫描候选文件内容中的假密钥，返回警告信息（供待审队列展示）
 --- @param files table 候选文件数组
 --- @return table|nil { count, tokens }
 function M.warn_for_files(files)
   local tokens = {}
   local count = 0
+  local fakes = {}
+  for fake in pairs(state.fake_set) do fakes[#fakes + 1] = fake end
+  if #fakes == 0 then return nil end
   for _, f in ipairs(files or {}) do
-    -- 先做 C 级子串预筛：绝大多数候选文件不含 token，避免对每个文件都启动 gmatch
-    -- 模式扫描（1M 文件时是结算主线程的固定热点）。
-    if type(f.content) == "string" and f.content:find("NEOKEY_", 1, true) then
-      for tok in f.content:gmatch(TOKEN_PAT) do
-        count = count + 1
-        tokens[tok] = true
+    if type(f.content) == "string" and f.content ~= "" then
+      for _, fake in ipairs(fakes) do
+        if f.content:find(fake, 1, true) then
+          count = count + 1
+          tokens[fake] = true
+        end
       end
     end
   end
@@ -1557,15 +1982,14 @@ function M.warn_for_files(files)
 end
 
 --- 检测 AI **生成/写入**的高熵/结构化敏感内容（候选文件内容）。
---- 与 `warn_for_files`（只识别已 token 化的宿主密钥）不同：此函数直接对候选内容做熵/具名规则
+--- 与 `warn_for_files`（只识别已假化的宿主密钥）不同：此函数直接对候选内容做熵/具名规则
 --- 检测，捕获 AI 自行生成的密钥类信息（生成的私钥、随机 token、API key 等），供留痕与审批提示。
---- token（`NEOKEY_*`）不计入（那是宿主密钥的加密形式，由 `warn_for_files` 处理）。
+--- 已知假密钥不计入（那是宿主密钥的遮蔽形式，由 `warn_for_files` 处理）。
 --- @param files table 候选文件数组
 --- @return table 数组 { path, entropy, rule, preview }
 function M.detect_generated(files)
   local out = {}
   if not M.enabled() then return out end
-  local token_pat = "^" .. TOKEN_PAT .. "$"
   -- 扫描预算：候选文件很多/很大时，逐文件全文熵/规则检测是结算阶段的主线程热点。
   -- 超预算的文件跳过（0 = 不限制），避免大候选（包安装/构建产物）冻结界面。
   local cfg = _cfg()
@@ -1582,7 +2006,7 @@ function M.detect_generated(files)
         scanned_bytes = scanned_bytes + size
         scanned_files = scanned_files + 1
         for _, hit in ipairs(M.detect(f.content)) do
-          if not hit.value:match(token_pat) then
+          if not state.fake_set[hit.value] then
             out[#out + 1] = {
               path = f.path, entropy = hit.entropy, rule = hit.rule,
               preview = hit.value:sub(1, 8) .. "…",
@@ -1729,10 +2153,92 @@ function M.is_env_secret(secret)
   return state.env_secrets[secret] == true
 end
 
+--- 登记二进制假内容（整块同长随机字节）并返回假字节。
+--- @param real string 真实二进制内容
+--- @return string fake 同长度随机字节
+--- @return string marker 供 AI 可见通道传输的标记（base64）
+function M.fake_binary(real)
+  if type(real) ~= "string" or real == "" then return real, real end
+  local existing = state.by_blob_real and state.by_blob_real[real]
+  if existing then return existing, M.binary_marker(existing) end
+  local fake
+  local guard = 0
+  repeat
+    state.seq = state.seq + 1
+    local hex = tostring(vim.fn.sha256(_ensure_salt() .. "|bin|" .. state.seq .. "|" .. real))
+    local bytes = {}
+    for i = 1, #real do
+      local byte = tonumber(hex:sub(((i - 1) % 32) * 2 + 1, ((i - 1) % 32) * 2 + 2), 16)
+      if not byte then
+        hex = tostring(vim.fn.sha256(hex))
+        byte = tonumber(hex:sub(1, 2), 16) or 0
+      end
+      bytes[i] = string.char(byte)
+    end
+    fake = table.concat(bytes)
+    guard = guard + 1
+  until (not state.by_blob[fake] and fake ~= real) or guard >= 8
+  state.by_blob[fake] = real
+  state.by_blob_real = state.by_blob_real or {}
+  state.by_blob_real[real] = fake
+  pcall(function()
+    require("NeoAI.sandbox.secret_flow").on_register_binary(real, fake)
+  end)
+  return fake, M.binary_marker(fake)
+end
+
+--- 二进制假内容的可见传输标记（base64）
+--- @param bytes string
+--- @return string
+function M.binary_marker(bytes)
+  if type(bytes) ~= "string" then return "" end
+  local map = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+  local out, i, n = {}, 1, #bytes
+  while i <= n do
+    local a = bytes:byte(i) or 0
+    local b = bytes:byte(i + 1)
+    local c = bytes:byte(i + 2)
+    local n1 = math.floor(a / 4)
+    local n2 = (a % 4) * 16 + (b and math.floor(b / 16) or 0)
+    local n3 = b and ((b % 16) * 4 + (c and math.floor(c / 64) or 0)) or nil
+    local n4 = c and (c % 64) or nil
+    out[#out + 1] = map:sub(n1 + 1, n1 + 1)
+    out[#out + 1] = map:sub(n2 + 1, n2 + 1)
+    out[#out + 1] = n3 and map:sub(n3 + 1, n3 + 1) or "="
+    out[#out + 1] = n4 and map:sub(n4 + 1, n4 + 1) or "="
+    i = i + 3
+  end
+  return "NEOAI_BINARY:" .. n .. ":" .. table.concat(out)
+end
+
+--- 当前已知假密钥集合快照（供持久化做热重载 fail-closed 检测）
+--- @return table 数组
+function M.fake_snapshot()
+  local out = {}
+  for f in pairs(state.fake_set) do out[#out + 1] = f end
+  for f in pairs(state.by_blob) do out[#out + 1] = f end
+  return out
+end
+
+--- 载入历史假密钥（热重载后映射缺失）作为 stale 集合，命中即不可还原。
+--- @param fakes table|nil
+function M.load_stale_fakes(fakes)
+  state.stale_fakes = {}
+  for _, f in ipairs(fakes or {}) do
+    if type(f) == "string" and f ~= "" and not state.fake_set[f] then
+      state.stale_fakes[f] = true
+    end
+  end
+end
+
 --- 重置（测试用）
 function M.reset()
   state.by_secret = {}
   state.by_token = {}
+  state.fake_set = {}
+  state.by_blob = {}
+  state.by_blob_real = {}
+  state.stale_fakes = {}
   state.env_secrets = {}
   state.seq = 0
   state.salt = nil

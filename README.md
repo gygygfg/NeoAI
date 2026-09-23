@@ -117,7 +117,6 @@ require("NeoAI").setup({
 | `:NeoAIReloadDisplay`| 热重载显示模式插件（缺省重载当前模式）            |
 | `:NeoAIReloadAll`  | 热重载整个 NeoAI 插件（先做隔离预检，失败则取消）  |
 | `:NeoAIPlan`       | 切换计划模式（工具上下文只保留只读/信息查询 + 提问）|
-| `:NeoAIAuto`       | 切换 AUTO 模式（自动允许所有工具调用）             |
 | `:NeoAIApprovePlan`| 确认计划并转入 CHAT 模式按任务清单执行             |
 | `:NeoAISandboxCommit`| 应用沙箱候选到真实工作区（CAS 发布，参数为候选摘要）|
 | `:NeoAISandboxReview`| 列出待审修改并选择应用（异步审批）              |
@@ -179,13 +178,12 @@ require("NeoAI").setup({
       timeout_ms = 10000,                -- 单次请求超时
     },
 
-    -- 按模式（CHAT / PLAN / AUTO）分别配置提供商与模型参数；
+    -- 按模式（CHAT / PLAN）分别配置提供商与模型参数；
     -- 进入某模式时应用其 provider/model/temperature/stream，缺省回退 ai.default_provider。
     -- max_tokens 缺省不配置：请求不发送该参数，由模型/厂商默认最大输出决定；仅显式配置时才下发。
     modes = {
       chat = { provider = "deepseek", model = "auto", temperature = 0.7, stream = true },
       plan = { provider = "deepseek", model = "auto", temperature = 0.3, stream = true },
-      auto = { provider = "deepseek", model = "auto", temperature = 0.7, stream = true },
     },
 
     -- 输出被截断（finish_reason=length/max_tokens/MAX_TOKENS）且无工具调用时自动续写：
@@ -283,7 +281,7 @@ require("NeoAI").setup({
       cancel = { key = "<Esc>", desc = "取消生成" },
       switch_model = { key = "M", desc = "切换模型" },
       toggle_reasoning = { key = "r", desc = "切换思考过程显示" },
-      cycle_mode = { key = "m", desc = "循环切换模式（CHAT/PLAN/AUTO）" },
+      cycle_mode = { key = "m", desc = "循环切换模式（CHAT/PLAN）" },
       cycle_display = {
         insert = { key = "<C-t>", desc = "循环切换显示模式（对话/轨迹）" },
         normal = { key = "T", desc = "循环切换显示模式（对话/轨迹）" },
@@ -719,7 +717,7 @@ NeoAI 内置了 40+ 工具，AI 可在对话中自动调用，涵盖以下类别
 > 确认后**直接转入 CHAT 模式**，系统把计划解析为任务清单（todo），
 > 并按 `tools.plan_mode.auto_execute_on_approve`（默认开启）自动开始执行。
 > 也可手动执行 `:NeoAIApprovePlan` 完成同样的确认。
-> 生成过程中按 `m` / `:NeoAIPlan` / `:NeoAIAuto` 切换模式会**延迟到当前回合结束后生效**，
+> 生成过程中按 `m` / `:NeoAIPlan` 切换模式会**延迟到当前回合结束后生效**，
 > 不会中途改变工具集 / 系统策略 / 模型而打断正在进行的生成。
 
 ### 🪵 日志工具
@@ -967,7 +965,7 @@ NeoAI/
     ├── test_model_metadata.lua# 实时模型元数据
     ├── test_protocol_adapter.lua # 协议编解码
     ├── test_model_picker.lua  # 模型选择器
-    ├── test_modes.lua         # 模式（CHAT/PLAN/AUTO）
+    ├── test_modes.lua         # 模式（CHAT/PLAN）
     ├── test_multimodal.lua    # 多模态图像
     ├── test_runtime_context.lua # 运行时上下文
     ├── test_tools.lua         # 工具系统

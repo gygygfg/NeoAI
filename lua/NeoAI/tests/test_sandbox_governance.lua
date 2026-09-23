@@ -443,6 +443,23 @@ tests.suite("sandbox_governance", function(_, it)
     t.false_(vim.tbl_contains(r2.privileges.cap_add, "CAP_CHOWN"), "普通命令不应授予 CAP_CHOWN")
   end)
 
+  it("无害查询：systemctl/mount --version/--help 不提升权限档", function(t)
+    local privilege = require("NeoAI.sandbox.privilege")
+    local spec = { effect = "process" }
+    for _, cmd in ipairs({
+      "systemctl --version", "systemctl --version 2>&1 | head -1",
+      "mount --help", "iptables --version", "sysctl --help",
+    }) do
+      local c = privilege.classify("run_command", { command = cmd }, spec)
+      t.eq(0, c.tier or 0, "无害查询不应提权: " .. cmd)
+    end
+    -- 真正的特权调用仍为 T2
+    local c2 = privilege.classify("run_command", { command = "systemctl restart nginx" }, spec)
+    t.eq(2, c2.tier, "systemctl restart 仍应为 T2")
+    local c3 = privilege.classify("run_command", { command = "mount /dev/sdb1 /mnt" }, spec)
+    t.eq(2, c3.tier, "mount 挂载仍应为 T2")
+  end)
+
   it("系统管理：useradd/chown 按需加回窄能力并解除账户库遮蔽；普通命令不受影响", function(t)
     local privilege = require("NeoAI.sandbox.privilege")
     local spec = { effect = "process" }

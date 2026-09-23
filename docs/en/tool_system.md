@@ -130,7 +130,7 @@ or by `ctx.timeout_ms`.
 
 > The default `async` mode **does not take this path**: the tool has already run in the sandbox and
 > confirmation happens through the review queue (`:NeoAISandboxReview`). This section describes the
-> **pre-execution approval dialog** under `prompt`/`strict` modes with `AUTO` off, plus fallback cases
+> **pre-execution approval dialog** under `prompt`/`strict` modes, plus fallback cases
 > such as masked-directory hits.
 
 Approval is a **serial, single-slot** design: tool execution itself is parallel (issued concurrently by tool_loop),
@@ -154,8 +154,6 @@ M.execute(agent, name, args, tool_call_id, opts)
 - **Approval timeout fallback**: `tools.approval.timeout_ms` defaults to 60s; on timeout the request is rejected
   rather than hanging forever; once a decision exists (`item.d = nil`), the timeout is void and does not interfere
   with the execution of already-approved tools.
-- `AUTO` mode (`toggle_auto_mode`): automatically allows all tool calls; when enabled, it immediately approves the
-  tools currently awaiting approval or queued.
 
 ### 5.2 Approval UI
 

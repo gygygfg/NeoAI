@@ -279,10 +279,18 @@ local DENY_BINS = {
   halt = true, sysrq = true, bpf = true, perf = true,
   -- 文件能力（可提权）
   setcap = true,
-  -- 内核防火墙/底层网络
-  iptables = true, ip6tables = true, nft = true, arptables = true, ebtables = true,
   -- 内核交换区
   swapon = true, swapoff = true,
+}
+
+-- 需要特定 Linux 能力才能生效的「底层网络/防火墙」命令：**按能力判定**而非按命令名一刀切。
+-- 沙箱基线（--cap-drop ALL + 窄 cap_add）默认不授予这些能力，故默认仍拒绝；但若调用方
+-- 显式授予所需能力（tools.sandbox.privilege.tiers[*].cap_add 或全局 cap_add），则放行，
+-- 使 `iptables` 等不再因「命令名」被无条件否决。opts.caps 为已授予能力集合（见
+-- privilege.effective_caps）；注意 `ALL` 不解除全局 cap_drop，故不视为授予被全局丢弃的能力。
+local CAP_GATED_BINS = {
+  iptables = "CAP_NET_ADMIN", ip6tables = "CAP_NET_ADMIN",
+  nft = "CAP_NET_ADMIN", arptables = "CAP_NET_ADMIN", ebtables = "CAP_NET_ADMIN",
 }
 
 -- 命令包装器/解释器：段首为它们时，向下扫描段内所有 token 寻找真实命令首词。
@@ -300,13 +308,25 @@ local WRAPPERS = {
 --- 内核/破坏性命令硬拒绝判定：命中返回原因（不执行），否则 nil。
 --- 普通命令（含 python/node/go/rust/apt/pip/npm 等）不命中，仍可在沙箱内执行。
 --- @param command string|nil
---- @return string|nil reason 如 "KERNEL_COMMAND:modprobe" / "DESTRUCTIVE:DESTRUCTIVE"
-function M.deny_reason(command)
+--- @param opts table|nil { caps? = table<string, boolean> 已授予能力集合；缺省视为空（fail-closed） }
+--- @return string|nil reason 如 "KERNEL_COMMAND:modprobe" / "CAPABILITY_REQUIRED:iptables:CAP_NET_ADMIN"
+function M.deny_reason(command, opts)
   if type(command) ~= "string" or command == "" then return nil end
+  opts = opts or {}
+  local caps = opts.caps or {}
   -- 破坏性 / 管道执行 / fork 炸弹等 L3 模式
   local dlevel, dreasons = _dangerous(command)
   if dlevel >= M.LEVEL.CRITICAL then
     return "DESTRUCTIVE:" .. table.concat(dreasons, ",")
+  end
+  -- 单条命令名判定：无条件拒绝表 → 拒绝；能力门禁表 → 能力缺失才拒绝。
+  local function _deny_bin(base)
+    if DENY_BINS[base] then return "KERNEL_COMMAND:" .. base end
+    local cap = CAP_GATED_BINS[base]
+    if cap and not caps[cap] then
+      return "CAPABILITY_REQUIRED:" .. base .. ":" .. cap
+    end
+    return nil
   end
   -- 内核/系统管理命令：按段检查首词；段首为包装器/解释器时扫描段内所有 token。
   local function _base(tok)
@@ -320,11 +340,99 @@ function M.deny_reason(command)
       local first = _base(toks[1])
       if WRAPPERS[first] then
         for _, t in ipairs(toks) do
-          local base = _base(t)
-          if DENY_BINS[base] then return "KERNEL_COMMAND:" .. base end
+          local reason = _deny_bin(_base(t))
+          if reason then return reason end
         end
-      elseif DENY_BINS[first] then
-        return "KERNEL_COMMAND:" .. first
+      else
+        local reason = _deny_bin(first)
+        if reason then return reason end
+      end
+    end
+  end
+  return nil
+end
+
+--- 代理规避判定：显式清除/绕过 HTTP(S)_PROXY/ALL_PROXY 的命令。
+--- host_local_block 依赖代理变量生效；`unset *proxy`、`env -u *proxy`、`curl --noproxy`、
+--- `--proxy ""` 等会使其失效而直连宿主本机。仅覆盖**显式**规避；不认代理的裸 TCP
+--- （nc/ssh/自建 socket）无法由此覆盖，属已知应用层边界（见 docs/sandbox.md）。
+---
+--- 规范化：shell 会做引号拼接与 ANSI-C 引用（`--noprox''y`、`$'--noproxy'`），静态扫描须
+--- 还原为实际 token，否则可用拼接绕过。另收集简单变量赋值（`c=--noproxy`）以展开 `$c`。
+--- 短选项 `-x` 是 curl 的 `--proxy`，但在 `set -x`/`tar -x`/`grep -x`/`bash -x` 中是常见
+--- 无关开关，故仅在 curl 段上按代理选项判定，避免误报硬拒绝。
+--- @param command string|nil 折叠后的有效命令文本
+--- @return string|nil reason 如 "PROXY_EVASION:unset"
+function M.network_evasion_reason(command)
+  if type(command) ~= "string" or command == "" then return nil end
+  -- 还原 shell 引号拼接 / ANSI-C 引用 / 反斜杠转义（仅用于匹配，不改变实际命令）。
+  local function _norm(tok)
+    local s = tostring(tok)
+    s = s:gsub("%$'", ""):gsub('%$"', "")
+    s = s:gsub("['\"]", ""):gsub("\\", "")
+    return s
+  end
+  -- 收集 `NAME=value`（含行首/分号后），用于展开 `$NAME`/`${NAME}`，防止变量间接绕过。
+  local vars = {}
+  for name, val in command:gmatch("([%a_][%w_]*)%=([^%s;|&]+)") do
+    vars[name] = _norm(val)
+  end
+  local function _expand(tok)
+    local s = _norm(tok)
+    s = s:gsub("%${([%a_][%w_]*)}", function(n) return vars[n] or "" end)
+    s = s:gsub("%$([%a_][%w_]*)", function(n) return vars[n] or "" end)
+    return s
+  end
+  local function _is_proxy_var(tok)
+    return _expand(tok):lower():match("^[%a_]*proxy$") ~= nil
+  end
+  for seg in command:gmatch("[^;|&\n]+") do
+    local toks = {}
+    for t in seg:gmatch("%S+") do toks[#toks + 1] = t end
+    if #toks > 0 then
+      local f0 = _expand(toks[1])
+      local first = (f0:match("[^/]+$") or f0):lower()
+      -- `-x` 仅在 curl 上等同 `--proxy`；其它命令（set/tar/grep/bash…）的 `-x` 无关代理。
+      local short_x_proxy = first == "curl" or first:match("^curl") ~= nil
+      if first == "unset" then
+        for i = 2, #toks do
+          if _is_proxy_var(toks[i]) then return "PROXY_EVASION:unset" end
+        end
+      elseif first == "env" then
+        for i = 2, #toks do
+          local t = _expand(toks[i])
+          if (t == "-u" or t == "--unset") and _is_proxy_var(toks[i + 1]) then
+            return "PROXY_EVASION:env-unset"
+          elseif t:match("^%-%-unset=") and _is_proxy_var(t:sub(9)) then
+            return "PROXY_EVASION:env-unset"
+          end
+        end
+      elseif first == "export" then
+        for i = 2, #toks do
+          local name = _expand(toks[i]):match("^([%a_]+)=$")
+          if name and _is_proxy_var(name) then return "PROXY_EVASION:export-clear" end
+        end
+      end
+      for i = 1, #toks do
+        local t = _expand(toks[i])
+        if t == "--noproxy" or t == "--no-proxy"
+          or t:match("^%-%-noproxy=") or t:match("^%-%-no%-proxy=") then
+          return "PROXY_EVASION:noproxy"
+        end
+        if t == "--proxy" or (short_x_proxy and t == "-x") then
+          -- 仅把「字面空值」或「已知被赋空值的变量」视为清空代理；未展开的 `$var` 不误判
+          -- （可能是合法代理变量）。
+          local raw = toks[i + 1]
+          local empty = raw == nil or _norm(raw) == ""
+          if not empty and raw then
+            local name = _norm(raw):match("^%$?{?([%a_][%w_]*)%}?$")
+            if name and vars[name] == "" then empty = true end
+          end
+          if empty then return "PROXY_EVASION:proxy-empty" end
+        elseif t:match("^%-%-proxy=") or (short_x_proxy and t:match("^%-x=")) then
+          local v = t:gsub("^%-%-proxy=", ""):gsub("^%-x=", "")
+          if v == "" then return "PROXY_EVASION:proxy-empty" end
+        end
       end
     end
   end

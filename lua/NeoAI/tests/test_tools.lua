@@ -801,42 +801,6 @@ tests.suite("tools", function(_, it)
     end)
   end)
 
-  it("AUTO 模式自动允许所有工具调用", function(t)
-    local config_store = require("NeoAI.kernel.config_store")
-    config_store.load({ tools = { approval = { mode = "prompt", per_tool = {} } } })
-    local tool_service = require("NeoAI.services.tool_service")
-    tool_service.reset()
-    local registry = require("NeoAI.tools.registry")
-    local helpers = require("NeoAI.tools.builtin.tool_helpers")
-    registry.register(helpers.define_tool(
-      "auto_tool", "自动", { type = "object", properties = {}, required = {} },
-      function(args, on_success) on_success("ran") end
-    ))
-    local shown = false
-    tool_service.set_approval_ui({
-      show = function() shown = true end,
-      hide = function() end,
-    })
-    t.false_(tool_service.is_auto_mode())
-    t.true_(tool_service.set_auto_mode(true), "应开启 AUTO 模式")
-    t.true_(tool_service.is_auto_mode())
-    local agent = { id = "auto-agent" }
-    local ran = false
-    tool_service.execute(agent, "auto_tool", { description = "测试AUTO模式" }, nil, {}):then_(function(r)
-      t.eq("ran", r)
-      ran = true
-    end):catch(function(e)
-      t.true_(false, "AUTO 模式不应失败: " .. tostring(e.message))
-    end)
-    local waited = vim.wait(2000, function() return ran end)
-    t.true_(waited, "AUTO 模式应直接执行工具")
-    t.false_(shown, "AUTO 模式不应弹审批窗")
-    -- 关闭后恢复弹窗审批
-    t.false_(tool_service.set_auto_mode(false))
-    t.false_(tool_service.is_auto_mode())
-    tool_service.reset()
-  end)
-
   it("子 Agent 边界审核", function(t)
     local plan = require("NeoAI.tools.builtin.plan")
     local registry = require("NeoAI.tools.registry")

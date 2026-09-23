@@ -21,15 +21,13 @@ local state = {
   approval_showing = false, -- 串行审批槽位：true 表示当前正有一个弹窗在展示
   current_approval = nil, -- 当前正在审批的条目（已从队列弹出）
   allow_all = {}, -- tool_name -> true
-  auto_mode = false, -- AUTO 模式：自动允许所有工具调用（运行期开关）
 }
 
 -- ========== 私有函数 ==========
 
---- 当前生效的审批模式：AUTO 模式优先于配置
+--- 当前生效的审批模式
 --- @return string "prompt" | "auto_allow" | "strict"
 local function _current_mode()
-  if state.auto_mode then return "auto_allow" end
   return config_store.get("tools.approval.mode") or "prompt"
 end
 
@@ -218,33 +216,6 @@ local function _drain_approval_queue()
   end
 end
 
---- 批准单个待审批条目（绕过审批直接执行工具）
---- @param item table { d, continue_fn }
-local function _approve_item(item)
-  local d = item.d
-  item.d = nil -- 已决策：审批超时不再作用于本条目
-  if d and d:is_pending() then
-    item.continue_fn():then_(function(r) d:resolve(r) end, function(e) d:reject(e) end)
-  end
-end
-
---- AUTO 模式开启时，自动批准所有待审批/排队的工具
-local function _approve_all_pending()
-  for _, item in ipairs(state.approval_queue) do
-    _approve_item(item)
-  end
-  state.approval_queue = {}
-  if state.current_approval then
-    if approval_ui and approval_ui.hide then
-      pcall(approval_ui.hide)
-    end
-    _approve_item(state.current_approval)
-    state.current_approval = nil
-    state.approval_showing = false
-    vim.schedule(_drain_approval_queue)
-  end
-end
-
 --- 审批 + 执行
 --- @param tool_name string
 --- @param args table
@@ -369,39 +340,12 @@ function M.set_allow_all(tool_name, allow)
   end
 end
 
---- 是否处于 AUTO 模式
---- @return boolean
-function M.is_auto_mode()
-  return state.auto_mode
-end
-
---- 设置 AUTO 模式（自动允许所有工具调用）。开启时自动批准当前待审批/排队的工具。
---- @param enable boolean
---- @return boolean 切换后的状态
-function M.set_auto_mode(enable)
-  local active = not not enable
-  if active == state.auto_mode then return state.auto_mode end
-  state.auto_mode = active
-  if active then
-    _approve_all_pending()
-  end
-  event_bus.emit(events.AUTO_MODE_CHANGED, { active = state.auto_mode })
-  return state.auto_mode
-end
-
---- 切换 AUTO 模式
---- @return boolean 切换后的状态
-function M.toggle_auto_mode()
-  return M.set_auto_mode(not state.auto_mode)
-end
-
 --- 重置（测试用）
 function M.reset()
   state.approval_queue = {}
   state.current_approval = nil
   state.approval_showing = false
   state.allow_all = {}
-  state.auto_mode = false
 end
 
 return M

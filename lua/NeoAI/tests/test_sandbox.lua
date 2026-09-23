@@ -752,6 +752,38 @@ tests.suite("sandbox", function(_, it)
     vim.fn.delete(dir, "rf")
   end)
 
+  it("run_command：/tmp 内容在同一会话内跨命令保留", function(t)
+    local fs = require("NeoAI.utils.fs")
+    local sandbox = require("NeoAI.sandbox")
+    local runtime = require("NeoAI.sandbox.runtime")
+    if runtime.backend() ~= "bwrap" then return end
+    local dir = vim.fn.tempname()
+    fs.ensure_dir(dir)
+    local prev = vim.fn.getcwd()
+    vim.fn.chdir(dir)
+    with_config({ tools = { approval = { mode = "async" }, sandbox = { mode = "dry_run", review = { enabled = true } } } }, function()
+      sandbox.reset()
+      local done = false
+      local tools = require("NeoAI.tools")
+      local tag = "neoai_tmp_" .. tostring(vim.uv.hrtime())
+      tools.execute("run_command",
+        { command = "mkdir -p /tmp/" .. tag .. " && echo hi > /tmp/" .. tag .. "/a.txt", description = "t" }, {})
+        :then_(function()
+          return tools.execute("run_command",
+            { command = "cat /tmp/" .. tag .. "/a.txt", description = "t" }, {})
+        end):then_(function(r)
+          t.matches("hi", tostring(r), "/tmp 内容应在同一会话内跨命令可见")
+          done = true
+        end, function(e)
+          t.true_(false, "不应失败: " .. tostring(e and e.message or e))
+          done = true
+        end)
+      t.true_(vim.wait(20000, function() return done end), "run_command 应完成")
+    end)
+    vim.fn.chdir(prev)
+    vim.fn.delete(dir, "rf")
+  end)
+
   it("run_command 与 edit_file 双向互通（同一会话暂存）", function(t)
     local fs = require("NeoAI.utils.fs")
     local sandbox = require("NeoAI.sandbox")
@@ -3538,8 +3570,10 @@ tests.suite("sandbox", function(_, it)
     local back, unresolved = secret.detokenize(tok)
     t.eq("v=" .. fake, back, "应可无损还原")
     t.eq(0, unresolved, "应全部解析")
+    -- 热重载后残留的假密钥（映射缺失）应计为 unresolved（fail-closed）
+    secret.load_stale_fakes({ "NEOKEY_deadbeef" })
     local _, u2 = secret.detokenize("NEOKEY_deadbeef")
-    t.eq(1, u2, "未知 token 应计为 unresolved")
+    t.eq(1, u2, "未知/残留假密钥应计为 unresolved")
     secret.reset()
   end)
 
@@ -3563,7 +3597,7 @@ tests.suite("sandbox", function(_, it)
     t.eq(ctx, (secret.detokenize(out)), "上下文密钥应可无损还原")
     -- 密钥形态（含分隔符）仍认定
     local key = "sk-Ab3xY9pQ2mNv7Kd4Lw8Zr1Tg6Hs5"
-    t.matches("NEOKEY_", (secret.tokenize(key)), "带分隔符的密钥形态仍应被 token 化")
+    t.true_(secret.has_token((secret.tokenize(key))), "带分隔符的密钥形态仍应被 token 化")
     secret.reset()
   end)
 
@@ -3586,10 +3620,10 @@ tests.suite("sandbox", function(_, it)
     end
     -- 真正的密钥形态（混合大小写 + 分隔符）仍应被 token 化
     local key = "sk-Ab3xY9pQ2mNv7Kd4Lw8Zr1Tg6Hs5"
-    t.matches("NEOKEY_", (secret.tokenize(key)), "混合大小写密钥形态仍应被 token 化")
+    t.true_(secret.has_token((secret.tokenize(key))), "混合大小写密钥形态仍应被 token 化")
     -- 敏感变量名上下文中的小写值仍强制脱敏
     local ctx = "API_KEY=my_lowercase_secret_value_1234"
-    t.matches("NEOKEY_", (secret.tokenize(ctx)), "敏感名上下文仍应脱敏")
+    t.true_(secret.has_token((secret.tokenize(ctx))), "敏感名上下文仍应脱敏")
     secret.reset()
   end)
 
@@ -3603,7 +3637,7 @@ tests.suite("sandbox", function(_, it)
     t.eq(list, (secret.tokenize(list)), "路径列表不应被 token 化")
     -- URL 中的结构化凭据仍应脱敏
     local url = "https://user:sk-Ab3xY9pQ2mNv7Kd4Lw8Zr1Tg6Hs5@host/simple"
-    t.matches("NEOKEY_", (secret.tokenize(url)), "URL 中的凭据仍应被 token 化")
+    t.true_(secret.has_token((secret.tokenize(url))), "URL 中的凭据仍应被 token 化")
     -- 路径类环境变量（LD_LIBRARY_PATH / CA bundle）不应被覆盖
     vim.env.NEOAI_TEST_LD_LIBRARY_PATH = path
     vim.env.NEOAI_TEST_CA_BUNDLE = "/etc/ssl/certs/build_0abc123def456789abcdef.pem"
@@ -3620,13 +3654,13 @@ tests.suite("sandbox", function(_, it)
     secret.reset()
     -- 不匹配任何具名规则的高熵密钥形态串（仅靠熵检测命中）
     local key = "Zx9Kd-Qm2Lp5Zr8Tv1Wn4Bc"
-    t.matches("NEOKEY_", (secret.tokenize(key)), "默认应做熵扫描")
+    t.true_(secret.has_token((secret.tokenize(key))), "默认应做熵扫描")
     t.eq(key, (secret.tokenize(key, { entropy = false })), "关闭熵扫描后高熵串应原样保留")
     local aws = "AKIAIOSFODNN7EXAMPLE"
-    t.matches("NEOKEY_", (secret.tokenize(aws, { entropy = false })), "具名规则不受熵开关影响")
+    t.true_(secret.has_token((secret.tokenize(aws, { entropy = false }))), "具名规则不受熵开关影响")
     local out = secret.tokenize_result({ output = key, id = aws }, { entropy = false })
     t.eq(key, out.output, "结果字段高熵串不应 token 化")
-    t.matches("NEOKEY_", out.id, "结果字段具名规则仍 token 化")
+    t.true_(secret.has_token(out.id), "结果字段具名规则仍 token 化")
     secret.reset()
   end)
 
@@ -3650,7 +3684,7 @@ tests.suite("sandbox", function(_, it)
     local r1 = read(plain)
     t.true_(r1:find(key, 1, true) ~= nil, "普通文件高熵串应原样返回，实际: " .. tostring(r1))
     local r2 = read(envf)
-    t.true_(r2:find("NEOKEY_", 1, true) ~= nil, "疑似密钥文件高熵串应被 token 化，实际: " .. tostring(r2))
+    t.true_(secret.has_token(r2), "疑似密钥文件高熵串应被 token 化，实际: " .. tostring(r2))
     fs.delete_file(plain)
     fs.delete_file(envf)
     secret.reset()
@@ -3748,18 +3782,21 @@ tests.suite("sandbox", function(_, it)
       },
     }
     local done = false
-    require("NeoAI.tools").execute("run_command", {
-      command = "echo " .. fake,
-      description = "t",
-    }, { agent = agent }):then_(function()
-      t.true_(false, "含原始密钥的调用应被拒绝")
-      done = true
-    end, function(e)
-      t.matches("SANDBOX_SECRET_BLOCKED", tostring(e and e.message or e))
-      t.eq("secret_exposure", abort_reason, "应立即终止整个 Agent")
-      done = true
+    -- 关闭告警弹窗：无 UI 确认时按 fail-closed 立即硬拦截。
+    with_config({ tools = { sandbox = { secrets = { alert = { enabled = false } } } } }, function()
+      require("NeoAI.tools").execute("run_command", {
+        command = "echo " .. fake,
+        description = "t",
+      }, { agent = agent }):then_(function()
+        t.true_(false, "含原始密钥的调用应被拒绝")
+        done = true
+      end, function(e)
+        t.matches("SANDBOX_SECRET_BLOCKED", tostring(e and e.message or e))
+        t.eq("secret_exposure", abort_reason, "应立即终止整个 Agent")
+        done = true
+      end)
+      t.true_(vim.wait(5000, function() return done end), "应快速拒绝")
     end)
-    t.true_(vim.wait(5000, function() return done end), "应快速拒绝")
     secret.reset()
   end)
 
@@ -3779,15 +3816,17 @@ tests.suite("sandbox", function(_, it)
         aborted = function() return abort_reason ~= nil end,
       },
     }
-    -- 原始密钥出现在 AI 可见上下文（wire 消息）→ 终止整个 Agent
-    local ok, err = recovery._guard_secret_context(agent,
-      { { role = "assistant", content = "KEY=" .. fake } })
-    t.false_(ok, "上下文含原始密钥应被拒绝")
-    t.matches("SANDBOX_SECRET_BLOCKED", tostring(err and err.message or err))
-    t.eq("secret_exposure", abort_reason, "应终止整个 Agent")
-    -- token（KEY 环境变量操作）出现在上下文不终止
-    t.true_(recovery._guard_secret_context(agent,
-      { { role = "assistant", content = "KEY=" .. tok } }), "token 不应终止 Agent")
+    -- 原始密钥出现在 AI 可见上下文（wire 消息）→ 无告警 UI 时 fail-closed 终止 Agent
+    with_config({ tools = { sandbox = { secrets = { alert = { enabled = false } } } } }, function()
+      local ok, err = recovery._guard_secret_context(agent,
+        { { role = "assistant", content = "KEY=" .. fake } })
+      t.false_(ok, "上下文含原始密钥应被拒绝")
+      t.matches("SANDBOX_SECRET_BLOCKED", tostring(err and err.message or err))
+      t.eq("secret_exposure", abort_reason, "应终止整个 Agent")
+      -- 假密钥（已知遮蔽值）出现在上下文不终止
+      t.true_(recovery._guard_secret_context(agent,
+        { { role = "assistant", content = "KEY=" .. tok } }), "假密钥不应终止 Agent")
+    end)
     secret.reset()
   end)
 
@@ -3885,12 +3924,12 @@ tests.suite("sandbox", function(_, it)
     t.eq(fake, env.NEOAI_TEST_REPL_KEY, "sandbox_env 应还原真实密钥")
     vim.env.NEOAI_TEST_REPL_KEY = nil
     if runtime.backend() ~= "bwrap" then secret.reset(); return end
-    -- 命令参数中的 token：沙箱内应还原为真实密钥（长度 #fake vs token 更长）
+    -- 命令参数中的假密钥：沙箱内应还原为真实密钥（用 sha256 观测，避免长度相同无法区分）
     local tok = secret.tokenize(fake)
     with_config({ tools = { approval = { mode = "auto_allow" }, sandbox = { mode = "dry_run" } } }, function()
       local done, out = false, nil
       require("NeoAI.tools").execute("run_command", {
-        command = "printf '%s' '" .. tok .. "' | wc -c", description = "t",
+        command = "printf '%s' '" .. tok .. "' | sha256sum", description = "t",
       }, {}):then_(function(r)
         out = tostring(r)
         done = true
@@ -3899,10 +3938,9 @@ tests.suite("sandbox", function(_, it)
         done = true
       end)
       t.true_(vim.wait(15000, function() return done end), "run_command 应完成")
-      t.true_(out ~= nil and out:find(tostring(#fake), 1, true) ~= nil,
-        "命令应拿到真实密钥（长度 " .. #fake .. "，实际: " .. tostring(out) .. "）")
-      t.true_(out == nil or out:find(tostring(#tok), 1, true) == nil,
-        "命令不应拿到 token 长度 " .. #tok)
+      local want = vim.fn.sha256(fake)
+      t.true_(out ~= nil and out:find(want, 1, true) ~= nil,
+        "命令应拿到真实密钥（sha256 " .. want .. "，实际: " .. tostring(out) .. "）")
     end)
     secret.reset()
   end)
@@ -3927,7 +3965,7 @@ tests.suite("sandbox", function(_, it)
     local out = secret.tokenize(line)
     t.true_(not out:find(raw, 1, true), "按变量名应强制 token 化，实际: " .. out)
     t.true_(not out:find("dfe946fb", 1, true), "纯 hex 段也不应泄露")
-    t.matches("NEOKEY_", out, "应回传 token")
+    t.true_(secret.has_token(out), "应回传假密钥")
     local back, unresolved = secret.detokenize(out)
     t.eq(line, back, "应可无损还原")
     t.eq(0, unresolved, "应全部解析")
@@ -3963,7 +4001,7 @@ tests.suite("sandbox", function(_, it)
     t.nil_(secret.find_real_secret(doc), "注释不应进入映射表")
     -- 真实 Bearer 凭据仍应被 token 化
     local hdr = "Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV"
-    t.matches("NEOKEY_", (secret.tokenize(hdr)), "真实 Bearer 凭据应被 token 化")
+    t.true_(secret.has_token((secret.tokenize(hdr))), "真实 Bearer 凭据应被 token 化")
     secret.reset()
   end)
 
@@ -4143,28 +4181,38 @@ tests.suite("sandbox", function(_, it)
     secret.reset()
   end)
 
-  it("密钥防护：AI 读取到 KEY 时结果附加 token 说明", function(t)
+  it("密钥防护：AI 读取到 KEY 时按配置披露假密钥说明（默认不披露）", function(t)
     local secret = require("NeoAI.sandbox.secret")
     local fs = require("NeoAI.utils.fs")
     secret.reset()
     local fake = "sk-Ab3xY9pQ2mNv7Kd4Lw8Zr1Tg6Hs5"
     local path = vim.fn.tempname()
     fs.write_file(path, "API_KEY=" .. fake .. "\n")
-    local done = false
-    require("NeoAI.tools").execute("read_file", { file_path = path, description = "t" }, {}):then_(function(r)
-      local s = tostring(r)
+    local function read(t2)
+      local done = false
+      require("NeoAI.tools").execute("read_file", { file_path = path, description = "t" }, {}):then_(function(r)
+        t2(tostring(r))
+        done = true
+      end, function(e)
+        t2("ERR:" .. tostring(e and e.message or e))
+        done = true
+      end)
+      t.true_(vim.wait(5000, function() return done end), "应完成")
+    end
+    -- 默认不披露：结果只含假密钥，无说明
+    read(function(s)
       t.true_(s:find(fake, 1, true) == nil, "不应回传真实密钥")
-      t.matches("NEOKEY_", s, "应回传 token")
-      t.matches("仅对 AI 不可见", s, "应附加 token 说明")
-      t.matches("自动替换回原有", s, "说明应包含自动还原语义")
-      t.matches("不影响程序实际运行", s, "说明应澄清遮蔽不影响程序运行")
-      t.matches("不代表程序出错", s, "说明应澄清遮蔽不代表程序出错")
-      done = true
-    end, function(e)
-      t.true_(false, "read_file 失败: " .. tostring(e and e.message or e))
-      done = true
+      t.true_(secret.has_token(s), "应回传假密钥")
+      t.true_(s:find("格式保真假密钥", 1, true) == nil, "默认不应披露")
     end)
-    t.true_(vim.wait(5000, function() return done end), "应完成")
+    -- 开启披露：附带说明
+    with_config({ tools = { sandbox = { secrets = { disclose_fakes = true } } } }, function()
+      read(function(s)
+        t.matches("格式保真假密钥", s, "开启后应附加说明")
+        t.matches("仅对 AI 不可见", s, "说明应含不可见语义")
+        t.matches("自动替换回真实密钥", s, "说明应含自动还原语义")
+      end)
+    end)
     vim.fn.delete(path)
     secret.reset()
   end)
@@ -4241,8 +4289,10 @@ tests.suite("sandbox", function(_, it)
     local sandbox = require("NeoAI.sandbox")
     with_config({ tools = { approval = { mode = "async" }, sandbox = { mode = "dry_run", review = { enabled = true } } } }, function()
       sandbox.reset()
-      -- 模拟容器内 userns 限制：overlay 实测不可挂载
+      -- 模拟容器内 userns 限制：粗粒度能力与真实可写实测均失败。
       runtime.probe().overlayfs = false
+      local saved_writable = runtime.overlay_writable
+      runtime.overlay_writable = function() return false end
       t.false_(runtime.overlay_available(), "overlay 应被判定为不可用")
       local done, rejected = false, nil
       require("NeoAI.tools").execute("run_command", { command = "ls", description = "t" }, {}):then_(function()
@@ -4252,6 +4302,7 @@ tests.suite("sandbox", function(_, it)
         done = true
       end)
       t.true_(vim.wait(10000, function() return done end), "run_command 应完成")
+      runtime.overlay_writable = saved_writable
       t.not_nil(rejected, "overlay 不可用时默认应拒绝执行，而非降级运行")
       t.matches("SANDBOX_OVERLAY_UNAVAILABLE", tostring(rejected and rejected.message), "应给出 overlay 不可用错误")
       t.true_(fs.exists(dir .. "/real.txt"), "真实文件不应被改动")
@@ -4275,8 +4326,10 @@ tests.suite("sandbox", function(_, it)
       mode = "dry_run", review = { enabled = true }, overlay_fail_closed = false,
     } } }, function()
       sandbox.reset()
-      -- 模拟容器内 userns 限制：overlay 实测不可挂载
+      -- 模拟容器内 userns 限制：粗粒度能力与真实可写实测均失败。
       runtime.probe().overlayfs = false
+      local saved_writable = runtime.overlay_writable
+      runtime.overlay_writable = function() return false end
       t.false_(runtime.overlay_available(), "overlay 应被判定为不可用")
       local done = false
       local ctx = {}
@@ -4292,6 +4345,7 @@ tests.suite("sandbox", function(_, it)
         done = true
       end)
       t.true_(vim.wait(10000, function() return done end), "run_command 应完成")
+      runtime.overlay_writable = saved_writable
     end)
     vim.fn.chdir(prev)
     vim.fn.delete(dir, "rf")
@@ -4348,7 +4402,7 @@ tests.suite("sandbox", function(_, it)
       sandbox.reset()
       local done = false
       local ctx = {}
-      require("NeoAI.tools").execute("run_command", { command = "unshare --version", description = "t" }, ctx):then_(function(r)
+      require("NeoAI.tools").execute("run_command", { command = "unshare -m true", description = "t" }, ctx):then_(function(r)
         t.eq(true, ctx.sandbox_userns, "T2 应标记 userns")
         t.false_(ctx.sandbox_degraded, "T2 属有意设计，不应标记为降级")
         t.matches("特权档", tostring(ctx.ui_notice), "T2 应显示特权档专用提示")
@@ -5050,8 +5104,8 @@ tests.suite("sandbox", function(_, it)
       candidate.merge_candidate({
         files = { { path = dir .. "/a.txt", action = "create", content = secret_text, mode = 420 } },
       })
-      t.matches("NEOKEY_", fs.read_file(candidate.read_path(dir .. "/a.txt")) or "",
-        "非包内容应 token 化")
+      t.true_(require("NeoAI.sandbox.secret").has_token(fs.read_file(candidate.read_path(dir .. "/a.txt")) or ""),
+        "非包内容应假化")
       candidate.cleanup(a1.attempt_id)
       local a2 = control.new_attempt("run_command", {}, {}, { effect = "process" })
       candidate.begin(a2, store.root())

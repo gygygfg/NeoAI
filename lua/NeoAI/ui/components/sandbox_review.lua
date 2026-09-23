@@ -423,6 +423,8 @@ function M.build_lines(items, traces, audit, saved)
         local rb = base:find("%[L%d%]", 1)
         if rb then marks[#marks + 1] = { line = hln, start_col = rb - 1, end_col = rb + 2, level = _risk_hl(item.risk_level) } end
       end
+      -- 头行同样作为整条审批入口（<CR> 应用 / d 拒绝 / i 预览命令），与命令行的目标一致。
+      line_to_target[hln] = { change_set_id = item.change_set_id, host_op = true }
       local text = "  $ " .. cmd
       local ln = #lines + 1
       lines[#lines + 1] = text
@@ -471,6 +473,15 @@ function M.build_lines(items, traces, audit, saved)
       local rb = base:find("%[L%d%]", 1)
       if rb then marks[#marks + 1] = { line = hln, start_col = rb - 1, end_col = rb + 2, level = _risk_hl(item.risk_level) } end
     end
+    -- 命令型变更单元（run_command / 包安装等）：展示实际命令，便于用户了解具体操作；
+    -- 其后的文件行即该命令影响的文件，按工作区/用户/系统级别高亮。
+    if type(item.command) == "string" and item.command ~= "" then
+      local cmd_text = _one_line(item.command)
+      local cmd_line = "  $ " .. cmd_text
+      local cln = #lines + 1
+      lines[#lines + 1] = cmd_line
+      marks[#marks + 1] = { line = cln, start_col = 4, end_col = 4 + #cmd_text, level = "system" }
+    end
     -- 密钥防护警告：该变更涉及被加密映射的密钥（token）或敏感环境变量名，红色醒目提示。
     if item.secret_warning and (item.secret_warning.count or 0) > 0 then
       local sw = item.secret_warning
@@ -481,6 +492,12 @@ function M.build_lines(items, traces, audit, saved)
         detail = "涉及密钥环境变量：" .. _one_line(table.concat(sw.names, ", "))
       end
       local warn = string.format("  ⚠ 密钥操作×%d（%s）", sw.count, detail)
+      lines[#lines + 1] = warn
+      marks[#marks + 1] = { line = #lines, start_col = 0, end_col = #warn, level = "secret" }
+    end
+    -- 不透明派生：命令/脚本可能加密/变换了密钥，输出无法逐字还原；应用前需人工确认。
+    if item.derived_opaque then
+      local warn = "  ⚠ 不透明派生密钥流（命令/脚本可能加密变换，无法逐字还原）——请人工确认后再应用"
       lines[#lines + 1] = warn
       marks[#marks + 1] = { line = #lines, start_col = 0, end_col = #warn, level = "secret" }
     end
@@ -1406,6 +1423,11 @@ local function _open_diff_current()
   end
   if not target.host_op and not target.path and not target.whole then
     vim.notify("[NeoAI] 请将光标移到要预览的文件行", vim.log.levels.WARN)
+    return
+  end
+  -- 主机操作无文件：直接预览其命令（_preview_data 按 host_op 展示命令），不走文件路径解析。
+  if target.host_op then
+    _open_diff({ change_set_id = target.change_set_id, host_op = true }, item, { mode = "preview" })
     return
   end
   -- 整单元（头行）无具体 path：取首个工作区文件作预览（应用仍为整单元）。

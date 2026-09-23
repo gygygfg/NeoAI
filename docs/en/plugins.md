@@ -163,7 +163,7 @@ clearing the module cache and reloading.
 The controlled reload in `reload_all`:
 
 1. Snapshot the `NeoAI.*` module cache (for rollback);
-2. Read the current config, session id, AUTO state;
+2. Read the current config, session id;
 3. `plugins.stop_all()` → `event_bus.clear_all()` → clear `NeoAI.*` cache → `setup()` again;
 4. Rebuild the UI and restore the session; on failure restore the cache snapshot.
 

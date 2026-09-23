@@ -496,6 +496,8 @@ function M.enqueue(cand, meta)
     stats = meta.stats or {},
     -- 密钥防护：候选内容涉及 token 操作时的警告（供待审界面醒目提示）
     secret_warning = secret_warning,
+    -- 不透明派生：命令/脚本加密变换后的密钥流，发布前需人工确认。
+    derived_opaque = meta.derived_opaque,
     depends_on = meta.depends_on or {},
     atomic_group = meta.atomic_group,
     -- 安全分级：级别、原因、包安装标记与建议动作（供审批分级展示与决策）

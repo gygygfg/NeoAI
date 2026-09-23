@@ -52,6 +52,15 @@ end
 --- @return Deferred resolve({ code, stdout, stderr, timed_out?, aborted?, message? })
 local function _run_command(command, opts)
   opts = opts or {}
+  -- 出网密钥守卫：命令含密钥（真实值或将被还原的假密钥）且指向非白名单地址时弹窗阻止。
+  if not opts._egress_checked then
+    local guard = require("NeoAI.sandbox.secret_egress").guard_process(command, opts.env, { tool = "run_command" })
+    if guard then
+      local opts2 = vim.tbl_extend("force", {}, opts)
+      opts2._egress_checked = true
+      return guard:then_(function() return _run_command(command, opts2) end)
+    end
+  end
   -- 常驻沙箱：命令经 nsenter 进入会话级共享命名空间执行（后台进程跨调用存活）。
   if opts.resident then
     return require("NeoAI.sandbox.resident").exec(command, {
@@ -213,26 +222,28 @@ end
 
 --- 环境不匹配提示：容器内无 systemd 时，命令尝试 systemctl/service 会失败。
 --- 反应式注入（仅在输出命中相关特征时），不暴露沙箱实现。
+--- 启用 systemd 门面时，独立的**及**复合/管道/脚本内的 `systemctl`/`journalctl` 都由沙箱门面
+--- （`/usr/bin/systemctl` 极薄入口 → 宿主 Lua）处理，不会再命中真实二进制报「无法连接总线」；
+--- 且门面把 `/proc/1` 呈现为 systemd。此时再附加「PID1 非 systemd」的提示会与沙箱内视图
+--- 自相矛盾，故**不注入**该提示。仅门面禁用时才说明环境无 systemd。
 --- @param text string
 --- @return string
 local function _env_hint(text)
   if type(text) ~= "string" or text == "" then return text end
-  -- systemctl 门面启用时，独立 `systemctl` 调用已被沙箱路由（不会走到这里）；此处仅在
-  -- 复合命令/脚本等未拦截场景命中，追加「无 systemd」提示反而误导，故跳过。
-  local ok_cfg, cfg = pcall(function()
-    return require("NeoAI.kernel.config_store").get("tools.sandbox.systemd")
-  end)
-  if ok_cfg and type(cfg) == "table" and cfg.enabled ~= false then return text end
   local hit = text:find("System has not been booted with systemd", 1, true)
     or text:find("Failed to connect to bus", 1, true)
     or text:find("systemctl: command not found", 1, true)
     or text:find("systemctl: not found", 1, true)
-    or text:find("Unit .* not found", 1, false)
-  if hit then
-    return text .. "\n\n[环境提示] 当前环境无 systemd（PID1 非 systemd），"
-      .. "systemctl/service 不可用；请直接运行前台命令，或改用进程管理/容器方式。"
-  end
-  return text
+  if not hit then return text end
+  local facade = false
+  local ok_cfg, cfg = pcall(function()
+    return require("NeoAI.kernel.config_store").get("tools.sandbox.systemd")
+  end)
+  if ok_cfg and type(cfg) == "table" and cfg.enabled ~= false then facade = true end
+  if facade then return text end
+  local msg = "[环境提示] 当前环境无 systemd（PID1 非 systemd）。"
+    .. "请直接运行前台命令，或改用进程管理/容器方式。"
+  return text .. "\n\n" .. msg
 end
 
 -- ========== 工具定义 ==========
@@ -244,7 +255,7 @@ shell_tools.run_command = helpers.define_tool(
   "执行 Shell 命令（前台，单次调用内完成）。command 必填。timeout_ms 可选（默认 30000ms，-1 为不限）。"
   .. "长任务（安装依赖/编译/下载）请在**同一次调用**内显式传较大的 timeout_ms（如 600000），"
   .. "不要靠重试短命令规避超时。以 `&`/nohup/setsid 启动的后台进程，仅在会话使用常驻沙箱时"
-  .. "跨工具调用持续运行（可用 ps/kill 管理）；否则命令结束即被回收，其输出建议重定向到文件。",
+  .. "跨工具调用**且跨轮次**持续运行（可用 ps/kill 管理）；否则命令结束即被回收，其输出建议重定向到文件。",
   {
     type = "object",
     properties = {
@@ -318,13 +329,32 @@ shell_tools.run_command = helpers.define_tool(
               out, errout)
           elseif result.code == 137 then
             -- 非超时/取消/截断的 137：SIGKILL 来源不明（资源域终止、宿主 OOM 或外部信号）。
+            local diag = ""
+            if cgroup_path then
+              local ok_cg, cg = pcall(require, "NeoAI.sandbox.cgroup")
+              if ok_cg and cg and cg.events_snapshot then
+                local snap = cg.events_snapshot(cgroup_path) or {}
+                local parts = {}
+                if snap.memory_peak then parts[#parts + 1] = "memory.peak=" .. snap.memory_peak end
+                if snap.memory_max then parts[#parts + 1] = "memory.max=" .. snap.memory_max end
+                if snap.memory_events then parts[#parts + 1] = "memory.events={" .. snap.memory_events:gsub("%s+", ",") .. "}" end
+                if snap.pids_events then parts[#parts + 1] = "pids.events={" .. snap.pids_events:gsub("%s+", ",") .. "}" end
+                if #parts > 0 then diag = "\n资源域事件：" .. table.concat(parts, " ") end
+              end
+            end
             text = _with_status(
               "命令被强制终止（退出码 137 / SIGKILL）：非超时或取消所致，且未定位到资源域 OOM 事件。"
-              .. "常见原因：宿主/容器内存不足触发 OOM，或命令被外部信号终止。"
-              .. "可开启 tools.sandbox.diagnostics.enabled 查看资源域事件",
+              .. "常见原因：宿主/容器内存不足触发 OOM、资源域被终止，或命令/其后台子进程被外部信号杀死。"
+              .. "可开启 tools.sandbox.diagnostics.enabled 查看资源域事件" .. diag,
               out, errout)
           elseif result.code == 0 then
             text = out ~= "" and out or "（无输出）"
+          elseif result.code == 127 then
+            text = _with_status(
+              "命令未找到（退出码 127）：可执行文件不在 PATH 中。若刚激活了虚拟环境，请确认其 "
+              .. "bin 目录与解释器符号链接在沙箱内可达（tools.sandbox.read_all=true，或用 "
+              .. "tools.sandbox.expose_paths 暴露解释器目录），也可用 `command -v <cmd>` 定位。",
+              out, errout)
           else
             text = _with_status(string.format("命令退出码 %d", result.code), out, errout)
           end
@@ -370,7 +400,16 @@ shell_tools.run_command = helpers.define_tool(
             else
               reason = "命令退出码 " .. tostring(result.code)
             end
-            on_success(require("NeoAI.utils.json").encode({ error = reason, output = text }))
+            -- 显式机器可读的失败标记（ok=false + 退出码），避免下游把「无 rc 字段的伪 JSON」
+            -- 当作 rc=0/成功（失败开放）。仍 resolve 以保留沙箱门禁的候选冻结与提权检测。
+            on_success(require("NeoAI.utils.json").encode({
+              error = reason,
+              output = text,
+              ok = false,
+              exit_code = tonumber(result.code) or -1,
+              timed_out = result.timed_out or false,
+              aborted = result.aborted or false,
+            }))
           else
             on_success(text)
           end

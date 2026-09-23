@@ -10,7 +10,7 @@ local M = {}
 local COMMANDS = {
   "NeoAIOpen", "NeoAIChat", "NeoAITree", "NeoAIClose", "NeoAIKeymaps",
   "NeoAIStatusline", "NeoAITest", "NeoAIChatStatus", "NeoAICycleDisplay",
-  "NeoAIReloadDisplay", "NeoAIPlan", "NeoAIAuto", "NeoAIReloadAll",
+  "NeoAIReloadDisplay", "NeoAIPlan", "NeoAIReloadAll",
   "NeoAIApprovePlan", "NeoAISandboxCommit", "NeoAISandboxDiscard",
   "NeoAISandboxList", "NeoAISandboxShow", "NeoAISandboxCaps", "NeoAISandboxDiag",
   "NeoAISandboxReview", "NeoAISandboxApprove", "NeoAISandboxReject",
@@ -137,14 +137,6 @@ function M.start()
       vim.notify("[NeoAI] 计划模式已" .. (active and "开启" or "关闭") .. suffix, vim.log.levels.INFO)
     end
   end, { desc = "切换计划模式" })
-
-  _cmd("NeoAIAuto", function()
-    local chat_service = _svc("services.chat_service")
-    if not chat_service then return end
-    local active = chat_service.toggle_auto_mode()
-    local suffix = chat_service.has_pending_mode() and "（将在本轮生成结束后生效）" or ""
-    vim.notify("[NeoAI] AUTO 模式（自动允许所有工具调用）已" .. (active and "开启" or "关闭") .. suffix, vim.log.levels.INFO)
-  end, { desc = "切换AUTO模式（自动允许所有工具调用）" })
 
   _cmd("NeoAIReloadAll", function()
     local reload_all = require("NeoAI.tools.builtin.reload_all")
@@ -274,7 +266,7 @@ function M.start()
     for _, k in ipairs({
       "pid1", "systemd", "nproc", "loadavg", "mem_total_kb",
       "root_memory_max", "root_memory_events", "root_pids_max", "root_pids_events",
-      "neoai_cpu_max", "neoai_memory_max", "resolved_limits",
+      "neoai_cpu_max", "neoai_memory_max", "cgroup_controllers", "resolved_limits",
     }) do
       local v = info[k]
       if type(v) == "table" then v = vim.inspect(v):gsub("%s+", " ") end

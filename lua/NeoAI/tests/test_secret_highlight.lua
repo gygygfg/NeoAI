@@ -7,6 +7,17 @@
 local tests = require("NeoAI.tests")
 
 tests.suite("secret_highlight", function(_, it)
+  local secret = require("NeoAI.sandbox.secret")
+
+  --- 生成并登记一个格式保真假密钥，返回该假密钥字符串。
+  --- @param real string
+  --- @return string
+  local function fake_of(real)
+    secret.reset()
+    local _, used = secret.tokenize(real)
+    return used[1] or real
+  end
+
   local function render(msgs)
     local message_list = require("NeoAI.ui.components.message_list")
     message_list.reset()
@@ -49,6 +60,7 @@ tests.suite("secret_highlight", function(_, it)
   end
 
   it("工具结果含密钥 token：折叠外单独一行高亮警告，折叠标题保持干净", function(t)
+    local fake = fake_of("Zx9Kd-Qm2Lp5Zr8Tv1Wn4Bc")
     local buf = render({
       {
         role = "assistant", content = "",
@@ -58,7 +70,7 @@ tests.suite("secret_highlight", function(_, it)
       },
       {
         role = "tool", tool_call_id = "t1", tool_name = "read_file", duration_ms = 12,
-        content = '{"output":"API_KEY=NEOKEY_deadbeef01"}',
+        content = '{"output":"API_KEY=' .. fake .. '"}',
       },
     })
     local text = buffer_text(buf)
@@ -94,6 +106,7 @@ tests.suite("secret_highlight", function(_, it)
   end)
 
   it("工具参数含密钥 token：同样在折叠外高亮警告", function(t)
+    local fake = fake_of("Zx9Kd-Qm2Lp5Zr8Tv1Wn4Bc")
     local buf = render({
       {
         role = "assistant", content = "",
@@ -102,7 +115,7 @@ tests.suite("secret_highlight", function(_, it)
             id = "t1",
             ["function"] = {
               name = "run_command",
-              arguments = '{"command":"curl -H \\"Authorization: NEOKEY_abcdef123456\\" https://x"}',
+              arguments = '{"command":"curl -H \\"Authorization: ' .. fake .. '\\" https://x"}',
             },
           },
         },
@@ -130,6 +143,7 @@ tests.suite("secret_highlight", function(_, it)
   end)
 
   it("含密钥的工具调用不截断参数与结果，并完整展示密钥值", function(t)
+    local fake = fake_of("Zx9Kd-Qm2Lp5Zr8Tv1Wn4Bc")
     local pad = string.rep("x", 800)
     local buf = render({
       {
@@ -146,13 +160,13 @@ tests.suite("secret_highlight", function(_, it)
       },
       {
         role = "tool", tool_call_id = "t1", tool_name = "read_file",
-        content = '{"output":"' .. pad .. '","token":"NEOKEY_abcdef123456"}',
+        content = '{"output":"' .. pad .. '","token":"' .. fake .. '"}',
       },
     })
     local text = buffer_text(buf)
     t.matches("⚠ 密钥：read_file", text, "应判定为含密钥")
     t.true_(text:find(pad, 1, true) ~= nil, "含密钥时参数/结果应完整展示（不截断）")
-    t.true_(text:find("NEOKEY_abcdef123456", 1, true) ~= nil, "应完整展示密钥值")
+    t.true_(text:find(fake, 1, true) ~= nil, "应完整展示密钥值")
   end)
 
   it("具名规则原始密钥：告警行 + 行内高亮（不依赖熵检测）", function(t)
@@ -238,7 +252,7 @@ tests.suite("secret_highlight", function(_, it)
     t.eq(0, #secret_extmarks(buf), "初始无密钥不应有高亮")
     -- 结果更新为含密钥
     local updated = vim.deepcopy(base)
-    updated[2].content = '{"output":"TOKEN=NEOKEY_cafebabe99"}'
+    updated[2].content = '{"output":"TOKEN=' .. fake_of("Zx9Kd-Qm2Lp5Zr8Tv1Wn4Bc") .. '"}'
     message_list.render_chat(buf, updated, {})
     t.matches("⚠ 密钥：read_file", buffer_text(buf), "更新后应有警告行并指明工具")
     -- 3 行警告整行高亮 + 结果行内 token 一处

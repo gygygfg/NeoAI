@@ -355,6 +355,13 @@ function M.foldexpr()
     if _is_tool_block_start(text) then
       return ">1"
     end
+    -- 推理块起始行同样强制开启新折叠：否则当 AI 不输出正文时，上一工具块的结果行与
+    -- 下一条 assistant 的推理行同处缩进层级、无正文/分隔行，会被并入同一个折叠，
+    -- 表现为「思考过程被收进工具调用折叠里面」。
+    local buf = vim.api.nvim_get_current_buf()
+    if M.is_reasoning_start(buf, ln) then
+      return ">1"
+    end
     return "1"
   end
 

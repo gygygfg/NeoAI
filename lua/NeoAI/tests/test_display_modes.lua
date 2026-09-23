@@ -120,6 +120,9 @@ tests.suite("display_modes", function(_, it)
 
     local opened = chat_view.open()
     local agent = chat_service.get_current_agent()
+    local secret = require("NeoAI.sandbox.secret")
+    local _, fake_used = secret.tokenize("sk-Ab3xY9pQ2mNv7Kd4Lw8Zr1Tg6Hs5")
+    local fake = fake_used[1]
     local pad = string.rep("z", 800)
     agent.messages = {
       { role = "user", content = "读一下 env" },
@@ -128,7 +131,7 @@ tests.suite("display_modes", function(_, it)
       } },
       {
         role = "tool", tool_call_id = "c1", tool_name = "read_file",
-        content = '{"output":"' .. pad .. '","token":"NEOKEY_deadbeef01"}',
+        content = '{"output":"' .. pad .. '","token":"' .. fake .. '"}',
       },
     }
 

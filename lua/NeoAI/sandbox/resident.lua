@@ -11,8 +11,8 @@
 --- `No such file or directory`。服务器在命名空间**内部**执行命令，天然拥有正确根视图。
 ---
 --- 与一次性进程的关系：
----   * overlay upper/work 使用**独立**基目录（`<proc_dir>/resident`），不与一次性进程的
----     `<proc_dir>/<enc_root>` 竞争（同一 upper 不可并发挂载）；二者通过候选暂存层同步。
+---   * overlay upper/work 使用**稳定**基目录（`<sandbox_root>/resident`，不随会话轮换），
+---     不与一次性进程的 `<proc_dir>/<enc_root>` 竞争（同一 upper 不可并发挂载）；二者通过候选暂存层同步。
 ---   * 常驻实例在挂载前把工作区暂存物化进 upper（宿主侧写入，安全）；挂载后 AI 的新编辑
 ---     经 `materialize()` 在**命名空间内**写回（写入走 overlay 挂载，避免 overlayfs
 ---     「挂载期间宿主侧改 upper 未定义」的问题）。
@@ -67,15 +67,26 @@ local function _setsid_bin()
   return (p ~= "" and p) or nil
 end
 
+--- timeout 绝对路径（可选）：给 `head -c` 加读取上限。协议失步（帧头声明的长度与实际发送
+--- 字节不符）时，`head -c` 会永久阻塞、读取循环停摆，后续所有请求排队后全部超时；加超时后
+--- 服务器会退出，客户端据 on_exit 重建实例。缺失时仍由客户端探活兜底。
+--- @return string|nil
+local function _timeout_bin()
+  if vim.fn.executable("timeout") ~= 1 then return nil end
+  local p = vim.fn.exepath("timeout")
+  return (p ~= "" and p) or nil
+end
+
 --- 常驻实例是否可用（配置 + 后端 + 命令服务器所需工具）。
 --- @return boolean
 --- @return string|nil reason
 function M.available()
   if _cfg().enabled == false then return false, "RESIDENT_DISABLED" end
   if runtime.backend() ~= "bwrap" then return false, "RESIDENT_REQUIRES_BWRAP" end
-  -- 命令服务器依赖这些工具做请求/输出帧编解码与并发输出串行化；缺失会让命令无输出地
-  -- 挂到超时（间歇性且难定位），故预先探测：缺失即回退一次性执行（不静默产生超时）。
-  for _, b in ipairs({ "base64", "flock" }) do
+  -- 命令服务器依赖这些工具做请求/输出帧编解码与并发输出串行化；`mktemp` 用于为每个服务器
+  -- 实例创建**唯一**的请求/结果目录（避免并存/孤儿服务器共用固定目录而互相踩踏）。缺失会让
+  -- 命令无输出地挂到超时（间歇性且难定位），故预先探测：缺失即回退一次性执行（不静默产生超时）。
+  for _, b in ipairs({ "base64", "flock", "mktemp" }) do
     if vim.fn.executable(b) ~= 1 then return false, "RESIDENT_MISSING_BIN:" .. b end
   end
   return true
@@ -94,7 +105,7 @@ local function _sig(entry)
 end
 
 --- 权限档位指纹：档位/能力/挂载变化需重建常驻实例（命名空间能力不可原地变更）。
---- 重建复用同一 overlay upper（`<proc_dir>/resident`），故属主/文件等跨命令状态不丢失；
+--- 重建复用同一 overlay upper（`<sandbox_root>/resident`，稳定），故属主/文件等跨命令状态不丢失；
 --- 关键是让 sysadmin（chown 等）命令也走常驻实例（见 wrapper._resident_eligible），
 --- 而非一次性路径（一次性路径 overlay 独立、命令后即丢弃，属主改动不持久）。
 --- @param priv table|nil
@@ -102,7 +113,7 @@ end
 local function _priv_key(priv)
   if type(priv) ~= "table" then return "none" end
   local parts = {}
-  for _, k in ipairs({ "userns", "network", "cap_add", "mounts", "unmask", "apt_sandbox_user" }) do
+  for _, k in ipairs({ "userns", "network", "cap_add", "mounts", "unmask", "apt_sandbox_user", "maintscript_stubs", "systemctl_shim" }) do
     local v = priv[k]
     if type(v) == "table" then
       local vs = {}
@@ -137,11 +148,26 @@ local function _server_script(boot)
   local setsid = _setsid_bin()
   local launch = setsid and (setsid .. " " .. shell .. " -c \"$__cmd\"")
     or (shell .. " -c \"$__cmd\"")
+  local timeout = _timeout_bin()
+  -- 定长载荷读取：`head -c "$__len"`。加 timeout 上限，避免协议失步时永久阻塞读取循环；
+  -- 超时/出错即退出服务器（客户端 on_exit 后重建），而不是让后续所有请求排队超时。
+  local function head_cmd(dst)
+    local base = "head -c \"$__len\" > \"$__p/" .. dst .. "\" 2>/dev/null"
+    if timeout then return timeout .. " 30 " .. base .. " || exit 1" end
+    return base
+  end
   local head = (type(boot) == "string" and boot ~= "") and (boot .. "\n") or ""
   return head .. table.concat({
     "set +e",
-    "__p=/tmp/.neoai_res",
-    "mkdir -p \"$__p\" 2>/dev/null",
+    -- 每服务器实例唯一的结果目录：并用固定路径 `/tmp/.neoai_res` 会让**并存**的服务器
+    -- （并发 ensure、上个 nvim 会话残留的孤儿服务器）共用同一目录；它们各自从此实例的
+    -- `inst.seq`（从 1 起）编号，out.<id>/pid.<id> 同名互相 rm/读取，一方 `base64 "$__of"`
+    -- 读到已被另一方删除的文件，把 `base64: ... No such file or directory` 写进该命令的
+    -- 输出块并顶替命令结果。`mktemp -d` 由内核保证名字唯一。注意**不能**改用 `$$`：常驻
+    -- 实例以 `--as-pid-1` 运行在独立 PID 命名空间内，`$$` 恒为 1，无法区分并存实例。
+    "__p=$(mktemp -d /tmp/.neoai_res.XXXXXX 2>/dev/null) || exit 1",
+    "trap 'rm -rf \"$__p\"' EXIT",
+    "trap 'rm -rf \"$__p\"; exit' TERM INT HUP",
     "while IFS= read -r __line; do",
     "  case \"$__line\" in",
     "    X*)",
@@ -150,7 +176,7 @@ local function _server_script(boot)
     "      __len=${__rest#*$'\\t'}",
     -- 定长载荷：帧头带字节长度，用 `head -c`（分块读）消费，避免 bash `read` 逐字节读取
     -- 大载荷（物化帧可达数十 MB，逐字节读会打满 CPU 数分钟）。
-    "      head -c \"$__len\" > \"$__p/in\" 2>/dev/null",
+    "      " .. head_cmd("in"),
     "      __cmd=$(cat \"$__p/in\")",
     "      __of=\"$__p/out.$__id\"",
     -- 并发执行：每条命令后台运行（launch 内 setsid，进程组=会话，便于按组终止），
@@ -178,7 +204,7 @@ local function _server_script(boot)
     "      __rest=${__line#M$'\\t'}",
     "      __id=${__rest%%$'\\t'*}",
     "      __len=${__rest#*$'\\t'}",
-    "      head -c \"$__len\" > \"$__p/m\" 2>/dev/null",
+    "      " .. head_cmd("m"),
     "      while IFS=$'\\t' read -r __op __a __b; do",
     "        [ -z \"$__op\" ] && continue",
     "        __pp=$(printf '%s' \"$__a\" | base64 -d)",
@@ -350,6 +376,38 @@ local function _request(inst, kind, payload, opts)
   return d
 end
 
+--- 健康探测：短超时 `X true`。命令在服务器内并发执行，读取循环始终空闲，故服务器健康时
+--- 探针会立即返回（即便有命令在后台跑）；服务器卡死（协议失步/僵死）时探针同样超时。
+--- @param inst table
+--- @return Deferred resolve(boolean healthy)
+local function _probe(inst)
+  return _request(inst, "X", "true", { timeout_ms = 3000 }):then_(function(res)
+    return res ~= nil and res.code == 0 and not res.timed_out and not res.aborted
+  end, function()
+    return false
+  end)
+end
+
+--- 停止实例的进程与资源，但**保留 `state.instance`**（`alive=false` + `ensure_opts`），
+--- 使下一次 `exec` 能据 `ensure_opts` 自动重建（与服务器意外退出同一恢复路径）。
+--- @param inst table
+--- @param timeout_ms number|nil jobwait 等待上限（默认 2000）
+local function _kill_instance(inst, timeout_ms)
+  if not inst then return end
+  local wait_ms = math.max(0, tonumber(timeout_ms) or 2000)
+  if inst.cg then pcall(cgroup.kill, inst.cg) end
+  if inst.job and inst.job > 0 then
+    pcall(vim.fn.jobstop, inst.job)
+    pcall(vim.fn.jobwait, { inst.job }, wait_ms)
+  end
+  if inst.cg then pcall(cgroup.release, inst.cg) end
+  if inst.deleg then pcall(cgroup.release_delegated, inst.deleg) end
+  inst.job = nil
+  inst.cg = nil
+  inst.deleg = nil
+  inst.alive = false
+end
+
 -- ========== 公开 API ==========
 
 --- 启动（或复用）当前会话的常驻沙箱实例。
@@ -363,11 +421,21 @@ function M.ensure(opts)
   local session_id = candidate.session_id() or candidate.begin_session()
   local want_key = _priv_key(opts.privileges)
   local inst = state.instance
-  if inst and inst.session_id == session_id and inst.alive and inst.job and inst.job > 0
+  if inst and inst.alive and inst.job and inst.job > 0
     and inst.priv_key == want_key then
+    -- 跨轮次保活：会话轮换后仍复用同一实例（overlay/shell 目录为稳定路径），使后台进程
+    -- 跨回合存活；仅权限档位变化、实例死亡或启动参数变化才重建。会话 id 仅用于记账。
+    inst.session_id = session_id
     return inst
   end
-  if inst then M.stop() end
+  if inst then
+    -- 有在途命令时不得重建：重建会 cgroup.kill 整个会话域，连带杀死在途编译/后台进程
+    -- （表现为非 OOM 的 exit 137）。交回调用方回退一次性执行，保留在途命令与后台进程。
+    if M.busy() then
+      return nil, "RESIDENT_BUSY: 常驻实例有在途命令，暂不重建"
+    end
+    M.stop()
+  end
 
   local specs = opts.specs or {}
   -- 首次：挂载前把工作区暂存物化进 upper（宿主侧写入安全）。
@@ -397,7 +465,9 @@ function M.ensure(opts)
       local h, derr = cgroup.prepare_delegated("sess_" .. tostring(session_id), cgroup.resolve_limits())
       if h then
         deleg = h
-        if sd_ok then sduser_mod = mod end
+        -- 仅**真实** systemd --user（needs_boot）需要注入 XDG/dbus 与引导片段；伪造解析器
+        -- （systemd_user.fake）由门面处理 `systemctl --user`，不需要常驻用户实例。
+        if sd_ok and mod.needs_boot and mod.needs_boot() then sduser_mod = mod end
         local p2 = {}
         for k, v in pairs(priv or {}) do p2[k] = v end
         local mounts = {}
@@ -414,6 +484,7 @@ function M.ensure(opts)
   local prefix, perr = runtime.process_prefix({
     cwd = opts.cwd, overlays = specs, fallback_cwd = opts.fallback_cwd,
     session_dir = opts.session_dir, session_tmp_dir = opts.session_tmp_dir,
+    tmpfs_base = opts.tmpfs_base,
     privileges = priv,
   })
   if not prefix then
@@ -459,6 +530,7 @@ function M.ensure(opts)
     ensure_opts = {
       specs = opts.specs, cwd = opts.cwd, privileges = opts.privileges,
       session_dir = opts.session_dir, session_tmp_dir = opts.session_tmp_dir,
+      tmpfs_base = opts.tmpfs_base,
       fallback_cwd = opts.fallback_cwd,
     },
   }
@@ -518,6 +590,14 @@ function M.active()
   local inst = state.instance
   if inst and inst.alive and inst.job and inst.job > 0 then return inst end
   return nil
+end
+
+--- 是否有在途命令（含物化请求）。重建/轮换前据此避免连带终止在途命令与后台进程。
+--- @return boolean
+function M.busy()
+  local inst = state.instance
+  if not (inst and inst.alive and inst.job and inst.job > 0) then return false end
+  return next(inst.pendings or {}) ~= nil
 end
 
 --- 单文件内嵌上限（字节）：超过则改走收件箱按文件复制，避免超大帧经常驻 stdin
@@ -715,6 +795,18 @@ function M.exec(command, opts)
         oom = cgroup.snapshot_oom(cgroup.events_snapshot(c.cg.path))
       end
     end
+    -- 命令超时后主动探活：服务器忙（命令仍在后台并发执行）时读取循环空闲，探针会立即返回，
+    -- 从而**保留实例与后台进程**；仅当服务器卡死（协议失步/僵死）时探针也超时，才判定实例
+    -- 不可用并停止，下一次 exec 重建——避免「一个卡死实例让后续所有命令永久超时」。
+    if res.timed_out and state.instance == c then
+      local healthy = false
+      _probe(c):then_(function(ok) healthy = ok end, function() healthy = false end)
+      vim.wait(5000, function() return healthy or not c.alive end, 20)
+      if not healthy and state.instance == c then
+        -- 保留 state.instance（alive=false + ensure_opts），下一次 exec 自动重建。
+        _kill_instance(c)
+      end
+    end
     out:resolve({
       code = res.code, stdout = stdout, stderr = "", truncated = truncated,
       oom = oom, oom_level = oom_level,
@@ -722,6 +814,40 @@ function M.exec(command, opts)
     })
   end, function(e) out:reject(e) end)
   return out
+end
+
+--- 发布/拒绝后把真实盘内容同步进常驻 overlay（overlay lower 在挂载后变更不可靠可见，
+--- 删除 upper 条目会回退到过期的 lower，故必须把真实内容写回 upper）。对文件写内容，
+--- 目录建目录，不存在则删除 upper 条目。经命名空间内 `M` 帧执行。
+--- @param paths table 规范化真实路径数组
+function M.sync_real(paths)
+  local inst = M.active()
+  if not inst then return end
+  local max_embed = _max_embed_bytes()
+  local lines = {}
+  for _, p in ipairs(paths or {}) do
+    if type(p) == "string" and p ~= "" then
+      inst.materialized[p] = nil
+      local st = vim.uv.fs_lstat(p)
+      if st == nil then
+        lines[#lines + 1] = "d\t" .. vim.base64.encode(p)
+      elseif st.type == "file" then
+        local content = fs.read_file(p)
+        if content ~= nil and (max_embed <= 0 or #content <= max_embed) then
+          lines[#lines + 1] = "w\t" .. vim.base64.encode(p) .. "\t" .. vim.base64.encode(content)
+        end
+      elseif st.type == "directory" then
+        lines[#lines + 1] = "D\t" .. vim.base64.encode(p)
+      end
+    end
+  end
+  if #lines == 0 then return end
+  _request(inst, "M", table.concat(lines, "\n") .. "\n", { timeout_ms = 120000 })
+end
+
+--- 兼容别名（旧调用方）
+function M.invalidate_paths(paths)
+  return M.sync_real(paths)
 end
 
 --- 终止当前正在执行的命令（超时/取消）；不影响常驻实例与其它后台进程。
@@ -740,15 +866,7 @@ function M.stop(opts)
   opts = opts or {}
   local inst = state.instance
   state.instance = nil
-  if not inst then return end
-  if inst.cg then pcall(cgroup.kill, inst.cg) end
-  if inst.job and inst.job > 0 then
-    pcall(vim.fn.jobstop, inst.job)
-    pcall(vim.fn.jobwait, { inst.job }, math.max(0, tonumber(opts.timeout_ms) or 2000))
-  end
-  if inst.cg then pcall(cgroup.release, inst.cg) end
-  -- 释放委派 cgroup（systemd --user 子域随命名空间销毁后清空）。
-  if inst.deleg then pcall(cgroup.release_delegated, inst.deleg) end
+  _kill_instance(inst, opts.timeout_ms)
 end
 
 --- 重置（测试用）
@@ -756,5 +874,8 @@ function M.reset()
   M.stop({ timeout_ms = 2000 })
   state.instance = nil
 end
+
+-- 测试钩子：暴露服务器脚本（不改变运行时行为）。
+M._server_script = _server_script
 
 return M

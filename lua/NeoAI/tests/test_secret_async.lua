@@ -46,7 +46,7 @@ tests.suite("secret_async", function(_, it)
     local key = "Zx9Kd-Qm2Lp5Zr8Tv1Wn4Bc"
     local outs = t.await(secret.tokenize_many_async({ key, key }, { entropy_flags = { false, true } }))
     t.eq(key, outs[1], "flag=false 的项不应做熵扫描")
-    t.matches("NEOKEY_", outs[2], "flag=true 的项应做熵扫描")
+    t.true_(secret.has_token(outs[2]), "flag=true 的项应做熵扫描")
     secret.reset()
   end)
 
@@ -76,12 +76,12 @@ tests.suite("secret_async", function(_, it)
       local outs = t.await(secret.tokenize_many_async(texts))
       t.eq(#texts, #outs)
       for i = 1, #texts do
-        t.true_(outs[i]:find("NEOKEY_", 1, true) ~= nil, "第 " .. i .. " 项应 token 化")
+        t.true_(secret.has_token(outs[i]), "第 " .. i .. " 项应 token 化")
         t.eq(texts[i], secret.detokenize(outs[i]), "第 " .. i .. " 项应可无损还原")
       end
       -- 两处 key_b 应被替换为同一个 token（合并为规范 token）
-      local t1 = outs[1]:match("B=(NEOKEY_%x+)")
-      local t2 = outs[2]:match("B=(NEOKEY_%x+)")
+      local t1 = outs[1]:match("B=(.+)$")
+      local t2 = outs[2]:match("B=(.+)$")
       t.eq(t1, t2, "跨块相同密钥应合并为同一 token")
     end)
     cfg.set("tools.sandbox.work_chunk_files", nil)

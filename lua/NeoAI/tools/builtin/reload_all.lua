@@ -183,15 +183,11 @@ function M._perform_reload()
   end
 
   -- 2) 读取必要信息（必须在清缓存前完成）
-  local user_config, session_id, auto_on
+  local user_config, session_id
   pcall(function() user_config = require("NeoAI.kernel.config_store").get_all() end)
   pcall(function()
     local cs = require("NeoAI.kernel.services").use("services.chat_service")
     session_id = cs and cs.get_current_session_id()
-  end)
-  pcall(function()
-    local ts = require("NeoAI.kernel.services").use("services.tool_service")
-    auto_on = ts and ts.is_auto_mode()
   end)
 
   -- 3) 受控重载
@@ -225,10 +221,6 @@ function M._perform_reload()
       local cs = services.use("services.chat_service")
       if cs then
         cs.load_session(session_id)
-        if auto_on then
-          local ts = services.use("services.tool_service")
-          if ts then ts.set_auto_mode(true) end
-        end
       end
     end
   end)

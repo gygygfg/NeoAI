@@ -63,7 +63,6 @@ M.TOOL_APPROVED = "tool:approved"
 M.TOOL_APPROVAL_CANCELLED = "tool:approval_cancelled"
 M.TOOL_RESULT_RECEIVED = "tool:result_received"
 M.TOOL_LOOP_GUARD_REMINDER = "tool_loop:guard_reminder"
-M.AUTO_MODE_CHANGED = "approval_mode:auto_changed"
 
 -- ========== 用户提问（ask_user） ==========
 -- 开始等待用户回答时触发（agent 处于 blocked 候选），回答/取消后触发 answered。
@@ -162,7 +161,12 @@ M.SANDBOX_HOST_OP_REJECTED = "sandbox:host_op_rejected"
 M.SANDBOX_SECRET_DETECTED = "sandbox:secret_detected"
 M.SANDBOX_SECRET_TRACED = "sandbox:secret_traced"
 M.SANDBOX_SECRET_BLOCKED = "sandbox:secret_blocked"
+M.SANDBOX_SECRET_ALERT = "sandbox:secret_alert"
+M.SANDBOX_SECRET_EGRESS = "sandbox:secret_egress"
 M.SANDBOX_SENSITIVE_REDACTED = "sandbox:sensitive_redacted"
+
+-- 沙箱网络访问同意：沙箱外部命令访问沙箱外目标（宿主本机其他端口/外部主机）时请求用户同意
+M.SANDBOX_NET_CONSENT_REQUESTED = "sandbox:net_consent_requested"
 
 -- 越界访问留痕：读取/操作当前工作区（cwd）之外的用户目录（home/root 等）
 M.SANDBOX_OUTSIDE_ACCESS = "sandbox:outside_access"

@@ -1,6 +1,6 @@
 --- 模式化模型配置测试
 --- @module NeoAI.tests.test_modes
---- 验证：ai.scenarios / ai.presets 已重构为按模式（CHAT/PLAN/AUTO）的 ai.modes，
+--- 验证：ai.scenarios / ai.presets 已重构为按模式（CHAT/PLAN）的 ai.modes，
 --- agent 创建与模式切换时按当前模式应用 provider/model/temperature/max_tokens/stream。
 
 local tests = require("NeoAI.tests")
@@ -19,7 +19,6 @@ tests.suite("modes", function(_, it)
         modes = {
           chat = { provider = "deepseek", model = "chat-model", temperature = 0.7, max_tokens = 4096, stream = true },
           plan = { provider = "deepseek", model = "plan-model", temperature = 0.3, max_tokens = 8192, stream = true },
-          auto = { provider = "other", model = "auto-model", temperature = 0.9, max_tokens = 1024, stream = true },
         },
       },
     }, overrides or {}))
@@ -34,10 +33,11 @@ tests.suite("modes", function(_, it)
     t.eq("deepseek", a.config.provider)
     t.eq(0.7, a.config.temperature)
     t.eq(4096, a.config.max_tokens)
-    local b = runtime.create({ mode = "auto" })
-    t.eq("auto-model", b.model)
-    t.eq("other", b.config.provider)
-    t.eq(1024, b.config.max_tokens)
+    local b = runtime.create({ mode = "plan" })
+    t.eq("plan-model", b.model)
+    t.eq("deepseek", b.config.provider)
+    t.eq(0.3, b.config.temperature)
+    t.eq(8192, b.config.max_tokens)
   end)
 
   it("apply_mode 切换 provider/model 等", function(t)
@@ -49,10 +49,10 @@ tests.suite("modes", function(_, it)
     t.eq("plan-model", a.model)
     t.eq(0.3, a.config.temperature)
     t.eq(8192, a.config.max_tokens)
-    runtime.apply_mode(a, "auto")
-    t.eq("auto-model", a.model)
-    t.eq("other", a.config.provider)
-    t.eq(0.9, a.config.temperature)
+    runtime.apply_mode(a, "chat")
+    t.eq("chat-model", a.model)
+    t.eq("deepseek", a.config.provider)
+    t.eq(0.7, a.config.temperature)
   end)
 
   it("模式缺失时回退默认 provider 与默认温度", function(t)
@@ -102,10 +102,6 @@ tests.suite("modes", function(_, it)
     t.eq("plan", mode)
     t.eq("plan-model", agent.model, "进入 plan 模式应用 plan 模型")
     t.eq(8192, agent.config.max_tokens)
-    mode = chat.cycle_mode()
-    t.eq("auto", mode)
-    t.eq("auto-model", agent.model, "进入 auto 模式应用 auto 模型")
-    t.eq("other", agent.config.provider)
     mode = chat.cycle_mode()
     t.eq("chat", mode)
     t.eq("chat-model", agent.model, "回到 chat 应用 chat 模型")
