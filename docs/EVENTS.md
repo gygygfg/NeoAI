@@ -143,6 +143,17 @@ vim.api.nvim_create_autocmd("User", {
 
 > 审批事件携带 `agent_id`，供 Herder 等订阅者区分不同 Agent 的阻塞状态。
 
+### 交互式终端（run_command PTY）
+
+| 常量 | 值 | 触发时机 | payload 关键字段 |
+| --- | --- | --- | --- |
+| `PTY_STARTED` | `pty:started` | 交互式 PTY 会话启动 | `{ id, pid, command }` |
+| `PTY_WAITING_INPUT` | `pty:waiting_input` | 轮询检测到进程阻塞读终端（等待输入） | `{ id, pid, description, command }` |
+| `PTY_INPUT_SENT` | `pty:input_sent` | 判官/用户注入字节 | `{ id, bytes }` |
+| `PTY_EXITED` | `pty:exited` | 会话退出 | `{ id, code }` |
+
+> 仅当 `tools.run_command.interactive.enabled` 时触发。检测基于 `/proc` 阻塞读终端状态，非终端文字匹配。
+
 ### 用户提问（ask_user）
 
 | 常量 | 值 | 触发时机 | payload 关键字段 |

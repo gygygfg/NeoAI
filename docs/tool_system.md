@@ -170,7 +170,17 @@ M.execute(agent, name, args, tool_call_id, opts)
 
 ### 💻 Shell（shell.lua）
 
-`run_command`：异步 jobstart（非交互），收集 stdout/stderr，支持 `timeout_ms`（默认 30000，-1 不限）。
+`run_command`：异步 jobstart（非交互，默认），收集 stdout/stderr，支持 `timeout_ms`（默认 30000，-1 不限）。
+`tools.run_command.interactive.enabled` **默认开启**，`run_command` 以 **PTY** 运行（`jobstart pty=true`）：
+轮询 `/proc/<pid>/{fd/0,syscall,wchan}` 检测“进程阻塞在读取终端”（OS 级判据，不解析终端文字），
+并用 `/proc/<pid>/io` 的 `rchar` 增长区分连续两次读取；每次检测到等待输入都会发起**单轮大模型请求**
+（判官），模型返回 `{"action":"text"|"keys"|"kill"|"none",...}` JSON，直接注入文本/按键/结束进程；
+无法确定或判官不可用时由用户在悬浮终端手动输入。悬浮终端窗口由
+`ui/components/terminal_window.lua` 用 `nvim_open_term` 渲染，焦点在内时可手动键入。详见
+[configuration.md](configuration.md) 的 `tools.run_command.interactive`。
+
+`terminal_send_text` / `terminal_send_keys` / `terminal_kill`：交互式命令等待输入时注入一行文本 /
+按键序列 / 结束进程（`effect=in_process`，仅操作已存在的 PTY 会话，不新起进程）。
 stdout/stderr 合计超过 `tools.run_command.max_output_bytes`（默认 16 MiB）时截断并终止命令，
 避免超大输出（数百 MB）逐行处理冻结主线程；已产生内容仍回传并标注「已截断」。
 命令以退出码 137（SIGKILL）结束时读取资源域事件区分「疑似 OOM」与「被强制终止」。

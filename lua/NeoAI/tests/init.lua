@@ -229,6 +229,13 @@ function M.run_all(...)
     if uc.tools.sandbox.systemd.user.enabled == nil then
       uc.tools.sandbox.systemd.user.enabled = false
     end
+    -- 测试默认关闭交互式 run_command（默认产品为开启）：PTY 执行会改变普通命令的
+    -- 终端语义并旁路常驻沙箱，绝大多数用例以非交互路径为准；交互功能由 test_pty 显式开启覆盖。
+    uc.tools.run_command = uc.tools.run_command or {}
+    uc.tools.run_command.interactive = uc.tools.run_command.interactive or {}
+    if uc.tools.run_command.interactive.enabled == nil then
+      uc.tools.run_command.interactive.enabled = false
+    end
     return orig_config_load(uc)
   end
   pcall(function()
@@ -243,6 +250,11 @@ function M.run_all(...)
       cur.tools.sandbox.systemd.user = cur.tools.sandbox.systemd.user or {}
       if cur.tools.sandbox.systemd.user.enabled == nil then
         cur.tools.sandbox.systemd.user.enabled = false
+      end
+      cur.tools.run_command = cur.tools.run_command or {}
+      cur.tools.run_command.interactive = cur.tools.run_command.interactive or {}
+      if cur.tools.run_command.interactive.enabled == nil then
+        cur.tools.run_command.interactive.enabled = false
       end
       orig_config_load(cur)
     end

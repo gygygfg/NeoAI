@@ -694,7 +694,17 @@ one does). For risk levels and allowlists see the `approval` config and [docs/en
 
 | Tool name        | Description               | Parameters |
 | ------------- | ------------------ | -------- |
-| `run_command` | Execute a Shell command (non-interactive, asynchronous jobstart) | `command` (required) the command to run (quote it when needed so it isn't split early); `timeout_ms` (optional, default 30000, -1 = unlimited). Pass a larger value explicitly in the same call for long tasks; with `tools.sandbox.resident` enabled, background processes started with `&`/`nohup`/`setsid` survive across tool calls (shared sandbox namespace per session). Common read-only commands `ls`/`wc`/`find`/`grep`/`pwd` hit the argument allowlist |
+| `run_command` | Execute a Shell command (asynchronous jobstart; with interactive enabled it runs under a PTY and is answered automatically) | `command` (required) the command to run (quote it when needed so it isn't split early); `timeout_ms` (optional, default 30000, -1 = unlimited). Pass a larger value explicitly in the same call for long tasks; with `tools.sandbox.resident` enabled, background processes started with `&`/`nohup`/`setsid` survive across tool calls (shared sandbox namespace per session). Common read-only commands `ls`/`wc`/`find`/`grep`/`pwd` hit the argument allowlist |
+| `terminal_send_text` | Type a line of text + Enter when an interactive command awaits input | `text` (required) |
+| `terminal_send_keys` | Send keys (Enter/Tab/Escape/Up/Ctrl-C, ...) when an interactive command awaits input | `keys` (required) array of key names |
+| `terminal_kill` | End the interactive command awaiting input | none |
+
+> Interactive shell: with `tools.run_command.interactive.enabled` (**on by default**), `run_command` runs under a **PTY** and
+> polls `/proc` to detect "process blocked reading the terminal = waiting for input" (an OS-level signal,
+> not text matching); each wait fires a **single-turn LLM request** (the judge) that returns a
+> `{"action":"text"|"keys"|"kill"|"none",...}` decision applied automatically, and an `nvim_open_term`
+> floating terminal mirrors the output for manual input as a fallback.
+> See [docs/en/configuration.md](docs/en/configuration.md).
 
 ### 🔄 Git Tools
 

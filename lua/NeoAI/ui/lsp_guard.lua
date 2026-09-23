@@ -22,6 +22,7 @@ local COPILOT_FILETYPES = {
   "neoai", "neoai_input", "neoai_reasoning", "neoai_tool_args", "neoai_context_op",
   "neoai_ask_user", "neoai_approval", "neoai_model_picker", "neoai_root_prompt",
   "neoai_sandbox_diff", "neoai_sandbox_review", "neoai_subagents", "neoai_traj_path",
+  "neoai_terminal",
 }
 
 -- ========== 私有状态 ==========

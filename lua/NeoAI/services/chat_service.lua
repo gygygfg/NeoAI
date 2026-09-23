@@ -97,9 +97,10 @@ local function _get_or_create_agent(opts)
       model = opts.model,
       config = opts.config,
     })
-    -- 绑定工具（懒加载工具系统）
+    -- 绑定工具（懒加载工具系统）；标记「工具集由注册表托管」，供请求构建时自动刷新。
     local registry = require("NeoAI.tools.registry")
     agent.tools = registry.list_as_map()
+    agent._tools_from_registry = true
     state.agents[agent.id] = { session_id = session.id }
     state.sessions[session.id] = agent.id
     state.current_agent_id = agent.id
@@ -442,6 +443,12 @@ local mcp_observer_sub = nil
 --- @param agent table
 --- @return Deferred resolve(boolean changed)
 local function _mcp_pre_round(agent)
+  -- 自动挂载：每轮请求前把**主 Agent** 的工具集与注册表同步，补齐晚于 Agent 创建而注册的工具
+  -- （插件阶段 2、热重载、按配置启用后的 terminal_* 等）。子 Agent 的工具子集由 spawn 显式指定，
+  -- 绝不在此刷新，避免越权获得全部工具。
+  if agent and not agent.parent and agent._tools_from_registry then
+    agent.tools = require("NeoAI.tools.registry").list_as_map()
+  end
   local mcp = services.use("services.mcp")
   if not mcp then return async.resolve(false) end
   return mcp.pre_round():then_(function(changed)
@@ -476,6 +483,7 @@ local function _ensure_mcp_observer()
     local agent = aid and runtime.get(aid)
     if agent and not agent_mod_is_disposed(agent) and not _is_busy(agent) and agent.tools then
       agent.tools = registry.list_as_map()
+      agent._tools_from_registry = true
     end
   end)
 end
@@ -897,6 +905,7 @@ function M.load_session(session_id, opts)
   })
   local registry = require("NeoAI.tools.registry")
   agent.tools = registry.list_as_map()
+  agent._tools_from_registry = true
   -- 载入历史消息（标记已同步，避免 _persist_agent 把祖先/下游消息误写进选中会话）
   local chain_messages = _build_chain_messages(session, opts.round)
   for _, msg in ipairs(chain_messages) do

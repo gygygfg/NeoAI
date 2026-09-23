@@ -165,7 +165,7 @@ session = {
 | `external` | `{}` | 外部工具 |
 | `read_file` | `{outline_threshold_chars=500, outline_max_nodes=200, outline_max_depth=4, outline_preview_lines=50, max_read_bytes=5242880}` | read_file 大文件保护：未指定行范围且超阈值时返回语法树大纲（无解析器则截断预览）；超过 `max_read_bytes` 则拒绝整读并只给预览，避免 OOM |
 | `search_files` | `{max_file_bytes=8388608}` | 搜索时单文件扫描上限（字节），超过则跳过；二进制文件（含 NUL）跳过，避免大文件 OOM |
-| `run_command` | `{max_output_bytes=16777216, max_wall_ms=0}` | 命令 stdout/stderr 合计上限（字节）：超出则截断并终止命令，避免超大输出逐行处理冻结主线程；0 = 不限制。`max_wall_ms>0` 为墙钟安全网：命令最长运行该毫秒数（同样约束 `timeout_ms=-1` 的「不限」命令），到时经沙箱资源域真正终止进程树；0 = 不限制 |
+| `run_command` | `{max_output_bytes=16777216, max_wall_ms=0, interactive={enabled=true, engine="auto", poll_ms=80, show_window="on_wait", judge={enabled=true, model=nil, max_rounds=12, timeout_ms=120000, output_tail_lines=80}}}` | 命令 stdout/stderr 合计上限（字节）：超出则截断并终止命令，避免超大输出逐行处理冻结主线程；0 = 不限制。`max_wall_ms>0` 为墙钟安全网：命令最长运行该毫秒数（同样约束 `timeout_ms=-1` 的「不限」命令），到时经沙箱资源域真正终止进程树；0 = 不限制。`interactive`（**默认开启**）：`run_command` 以 **PTY** 运行，轮询 `/proc` 检测「进程阻塞读终端 = 等待输入」（OS 级判据，非文字匹配；用 `/proc/<pid>/io` 的 `rchar` 增长区分连续两次读取），每轮等待由**判官**（**单轮大模型请求**：模型返回 `{"action":"text"|"keys"|"kill"|"none",...}` JSON 决策，直接注入文本/按键/结束进程；非子 agent、无工具循环）或用户在悬浮终端手动输入作答；`poll_ms` 轮询间隔，`show_window` 控制悬浮终端弹出时机（always=会话启动即开 / on_wait=检测到等待输入时开 / never=不开；**均要求聊天光标跟随，不跟随时不弹**），`engine="off"` 等价不启用；`enabled=false` 则退回原非交互路径并恢复常驻沙箱语义（命令走**一次性**沙箱路径，常驻沙箱 stdin 为 /dev/null 无法交互） |
 | `lsp` | `{timeout_ms=10000, attach_timeout_ms=3000}` | LSP 请求超时（服务器无响应快速失败）；`attach_timeout_ms` 为等待客户端附加的超时：后台加载 buffer / 服务器启动或重启期间客户端尚未附加时，`lsp_diagnostics` 等待其就绪再取诊断，而非立即报「无 LSP 客户端」 |
 | `guard.repeat_tool` | `{enabled=true, thresholds={3,5,8}, messages=...}` | 连续重复工具调用提醒 |
 | `todo.enabled` | `true` | 待办工具 + 系统提示注入 |
@@ -340,6 +340,9 @@ sandbox = {
   -- 后台进程（&/nohup/setsid）跨工具调用存活（接近普通 bash）。独立 overlay 基目录与会话级
   -- 资源域；AI 编辑经命名空间内物化写回，命令改动仍按次冻结为候选。overlay 不可用 / T2 档位
   -- / 启动失败时自动回退一次性进程路径。仅适用于 T0 的 run_command。
+  -- 注意：tools.run_command.interactive.enabled 默认为 true，此时 run_command 强制走一次性路径
+  -- （常驻命令服务器 stdin 为 /dev/null，无法交互），本节默认不生效；如需后台进程跨调用存活，
+  -- 请设 tools.run_command.interactive.enabled=false。
   resident = {
     enabled = true, -- 会话级常驻沙箱实例（run_command 后台进程跨调用存活）；不适用时自动回退
     -- 物化单文件内嵌上限（字节）：超过则宿主侧复制进收件箱、服务器在命名空间内按文件复制

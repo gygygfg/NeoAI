@@ -249,4 +249,23 @@ tests.suite("plugins", function(_, it)
     t.true_(services.has("services.chat_service"), "重启后服务应恢复")
     t.true_(registry.has("run_command"), "重启后插件工具应恢复")
   end)
+
+  it("请求构建时自动把注册表工具挂到主 Agent（防懒加载竞态）", function(t)
+    local tool_loop = require("NeoAI.core.agent.tool_loop")
+    local agent = { id = "diag", tools = {}, _tools_from_registry = true } -- 模拟「创建早于工具加载」的空工具集
+    local defs = tool_loop._tool_definitions(agent)
+    local has_run = false
+    local count = 0
+    for _, d in ipairs(defs) do
+      count = count + 1
+      if d["function"] and d["function"].name == "run_command" then has_run = true end
+    end
+    t.true_(has_run, "主 Agent 请求工具应包含 run_command")
+    t.true_(count > 0, "主 Agent 请求工具不应为空")
+    -- 子 Agent 的子集不被刷新
+    local sub = { id = "sub", parent = "diag", tools = {} }
+    tool_loop._tool_definitions(sub)
+    t.eq(0, (function() local n = 0 for _ in pairs(sub.tools) do n = n + 1 end return n end)(),
+      "子 Agent 工具子集不应被自动填充")
+  end)
 end)

@@ -107,6 +107,7 @@ ensures there are no leftover subscriptions or state between tests.
 | `test_modes` | Modes (CHAT/PLAN) |
 | `test_multimodal` | Multimodal images |
 | `test_tools / test_tool_pending` | Tool execution, pending/staged tools |
+| `test_pty` | Interactive PTY: key mapping, /proc blocked-read detection, judge injection, sandboxed run_command auto-answer |
 | `test_max_tokens / test_truncation` | max_tokens sending strategy, output truncation and continuation |
 | `test_sub_agent_result` | Sub-agent results |
 | `test_pending_queue` | Pending message queue |

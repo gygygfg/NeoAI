@@ -93,6 +93,10 @@ local SPECS = {
   confirm_file_change = { effect = "in_process" },
   ask_user = { effect = "in_process" },
   enter_plan_mode = { effect = "in_process" },
+  -- 交互式终端控制：仅操作已存在的 PTY 会话，不新起进程。
+  terminal_send_text = { effect = "in_process" },
+  terminal_send_keys = { effect = "in_process" },
+  terminal_kill = { effect = "in_process" },
   create_sub_agent = { effect = "in_process" },
   get_sub_agent_status = { effect = "in_process" },
   wait_sub_agent = { effect = "in_process" },

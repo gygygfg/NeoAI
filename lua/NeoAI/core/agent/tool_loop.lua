@@ -185,6 +185,27 @@ end
 --- @param agent table
 --- @return table 数组
 function M._tool_definitions(agent)
+  -- 自动挂载（每次请求）：主 Agent 的工具集始终与注册表保持一致。修复「Agent 创建早于
+  -- 工具懒加载完成」导致的工具集缺失——否则首轮请求会以空工具集发出，且工具循环不触发、
+  -- 永远不再刷新。子 Agent（agent.parent 非空）的工具子集由 spawn 显式指定，绝不刷新。
+  do
+    -- 仅对「由注册表托管工具集」的主 Agent（chat_service 绑定，打 _tools_from_registry 标记）刷新；
+    -- 合成/受限 Agent（单元测试、子 Agent）不刷新，避免越权或破坏隔离。
+    if agent and not agent.parent and agent._tools_from_registry then
+      local registry = require("NeoAI.tools.registry")
+      if registry.count() > 0 then
+        agent.tools = registry.list_as_map()
+      else
+        -- 注册表仍为空（阶段 2 尚未加载）：触发全量启动，本轮先按现有工具集发送。
+        pcall(function()
+          local NeoAI = require("NeoAI")
+          if type(NeoAI.ensure_fully_started) == "function" then
+            NeoAI.ensure_fully_started(function() end)
+          end
+        end)
+      end
+    end
+  end
   local environment = require("NeoAI.tools.environment")
   local tools = environment.filter_tools(agent.tools or {})
   -- 计划模式：工具上下文只保留只读/信息查询 + ask_user（不暴露任何修改类工具）

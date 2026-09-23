@@ -1403,6 +1403,13 @@ function M.has_window()
   return state.win_id ~= nil and vim.api.nvim_win_is_valid(state.win_id)
 end
 
+--- 聊天窗口当前是否「跟随光标」（光标在内容最后若干行内 / 窗口未打开）。
+--- 供临时悬浮窗（推理/接收参数/命令终端）据此决定是否弹出，避免干扰用户回看上方内容。
+--- @return boolean
+function M.is_following()
+  return _cursor_within_follow_margin()
+end
+
 --- 刷新聊天窗口
 --- 立即重绘聊天界面（显式刷新：强制全量重绘，保证折叠状态重置与容器重算）
 function M.refresh()

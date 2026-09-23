@@ -188,7 +188,19 @@ approval is allowed by default and a notify is sent.
 
 ### 💻 Shell (shell.lua)
 
-`run_command`: async jobstart (non-interactive), collects stdout/stderr, supports `timeout_ms` (default 30000, -1 for unlimited).
+`run_command`: async jobstart (non-interactive by default), collects stdout/stderr, supports `timeout_ms` (default 30000, -1 for unlimited).
+With `tools.run_command.interactive.enabled` (**on by default**), `run_command` runs under a **PTY** (`jobstart pty=true`):
+it polls `/proc/<pid>/{fd/0,syscall,wchan}` to detect "process blocked reading the terminal" (an OS-level
+signal, not terminal-text parsing) and uses `/proc/<pid>/io` `rchar` growth to tell consecutive reads apart.
+Each awaited input triggers a **single-turn LLM request** (the judge), which returns
+`{"action":"text"|"keys"|"kill"|"none",...}` JSON that directly injects text/keys or ends the process; when
+it cannot decide (or the judge is unavailable) the user answers manually. The floating terminal window is rendered with `nvim_open_term` by
+`ui/components/terminal_window.lua` and forwards manual typing when focused. See
+[configuration.md](configuration.md) `tools.run_command.interactive`.
+
+`terminal_send_text` / `terminal_send_keys` / `terminal_kill`: inject a line of text / a key sequence /
+end the process while an interactive command awaits input (`effect=in_process`; only operates on an
+existing PTY session, never spawns a process).
 When combined stdout/stderr exceeds `tools.run_command.max_output_bytes` (default 16 MiB), the command is
 truncated and terminated so huge outputs (hundreds of MB) cannot freeze the main thread with line-by-line
 processing; already-produced content is still returned and marked "truncated".

@@ -28,6 +28,7 @@ local BUILTIN_MODULES = {
   "NeoAI.tools.builtin.tree_ops",
   "NeoAI.tools.builtin.log_ops",
   "NeoAI.tools.builtin.plan",
+  "NeoAI.tools.builtin.terminal",
   "NeoAI.tools.builtin.todo",
   "NeoAI.tools.builtin.plan_mode",
   "NeoAI.tools.builtin.ask_user",

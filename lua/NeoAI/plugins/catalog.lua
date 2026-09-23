@@ -86,6 +86,12 @@ local function _service_specs()
       id = "services.tool_service", module = "NeoAI.services.tool_service", service = "services.tool_service",
       deps = { "services.tools" }, phase = 2,
     },
+    {
+      -- 交互式 PTY 会话管理（run_command 等待输入检测 + 判官编排）
+      id = "services.pty", module = "NeoAI.services.pty", service = "services.pty",
+      deps = { "services.sandbox" }, phase = 2,
+      stop = function() pcall(require("NeoAI.services.pty").stop_all) end,
+    },
     { id = "services.skills", module = "NeoAI.services.skills", service = "services.skills", phase = 2 },
     {
       id = "services.mcp", module = "NeoAI.services.mcp", service = "services.mcp",

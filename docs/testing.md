@@ -109,6 +109,7 @@ end)
 | `test_modes` | 模式（CHAT/PLAN） |
 | `test_multimodal` | 多模态图像 |
 | `test_tools / test_tool_pending` | 工具执行、工具待发/暂存 |
+| `test_pty` | 交互式 PTY：按键映射、/proc 阻塞读检测、判官注入、经门禁的 run_command 自动应答 |
 | `test_max_tokens / test_truncation` | max_tokens 发送策略、输出截断续写 |
 | `test_sub_agent_result` | 子 Agent 结果 |
 | `test_pending_queue` | 待发消息队列 |

@@ -343,6 +343,25 @@ local DEFAULT_CONFIG = {
       -- 墙钟安全网（ms）：>0 时命令最长运行该时长（同样约束 `timeout_ms=-1` 的「不限」命令），
       -- 到时经沙箱资源域真正终止进程树，避免长任务永久占用资源、工具永不返回。0 = 不限制。
       max_wall_ms = 0,
+      -- 交互式等待输入（默认开启）：以 PTY 运行命令，轮询 /proc 检测“阻塞读终端 = 等待输入”，
+      -- 由判官子 agent 或用户手动输入注入答案。启用时 run_command 走一次性沙箱路径
+      -- （常驻沙箱命令服务器 stdin 为 /dev/null，无法交互），即 tools.sandbox.resident 对其不生效。
+      -- 如需恢复常驻沙箱（后台进程跨调用存活）语义，可设 enabled=false。
+      interactive = {
+        enabled = true,           -- 启用交互式 PTY 执行层（替换 run_command 的进程执行方式）
+        engine = "auto",          -- "auto" | "procfs" | "off"（off 等价于不启用）
+        poll_ms = 80,             -- /proc 轮询间隔（ms）
+        -- 悬浮终端弹出时机：always=会话启动即开 | on_wait=检测到等待输入时开 | never=不开。
+        -- 二者都要求「聊天光标跟随」：光标不跟随（用户回看上方）时一律不弹。
+        show_window = "on_wait",
+        judge = {
+          enabled = true,         -- 用判官子 agent 自动决定输入
+          model = nil,            -- nil = 继承父 agent 模型
+          max_rounds = 12,        -- 单会话最多判官决策次数，超出后转手动
+          timeout_ms = 120000,    -- 保留（判官循环超时）
+          output_tail_lines = 80, -- 提供给判官的近期输出行数
+        },
+      },
     },
     lsp = {
       timeout_ms = 10000, -- LSP 请求超时（ms）：服务器无响应时快速失败，避免工具循环挂到 executor 超时

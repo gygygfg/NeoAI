@@ -185,6 +185,14 @@ M.SANDBOX_SYSTEMD_UNSUPPORTED = "sandbox:systemd_unsupported"
 -- 后台命令门面：run_command 的 &/nohup/setsid 被路由到长驻服务（跨调用存活）
 M.SANDBOX_BACKGROUND_ROUTED = "sandbox:background_routed"
 
+-- ========== 交互式终端（run_command PTY） ==========
+-- run_command 以 PTY 运行命令时，轮询 /proc 检测到“阻塞读终端 = 等待输入”触发 waiting_input；
+-- 判官子 agent / 用户手动注入时触发 input_sent；命令退出触发 exited。
+M.PTY_STARTED = "pty:started"
+M.PTY_WAITING_INPUT = "pty:waiting_input"
+M.PTY_INPUT_SENT = "pty:input_sent"
+M.PTY_EXITED = "pty:exited"
+
 -- ========== 计划蒸馏 ==========
 M.PLAN_DISTILL_STARTED = "plan_distill:started"
 M.PLAN_DISTILL_CHUNK = "plan_distill:chunk"

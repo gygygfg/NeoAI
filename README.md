@@ -673,7 +673,15 @@ NeoAI 内置了 40+ 工具，AI 可在对话中自动调用，涵盖以下类别
 
 | 工具名        | 描述               | 参数说明 |
 | ------------- | ------------------ | -------- |
-| `run_command` | 执行 Shell 命令（非交互，异步 jobstart） | `command`（必填）要执行的命令（必要时用引号包裹以免提前拆分）；`timeout_ms`（可选，默认 30000，-1 为不限）超时毫秒数。长任务请在同一次调用显式传较大值；开启 `tools.sandbox.resident` 后，`&`/`nohup`/`setsid` 启动的后台进程跨工具调用存活（同一会话共享沙箱命名空间）。常见只读命令 `ls`/`wc`/`find`/`grep`/`pwd` 命中参数白名单 |
+| `run_command` | 执行 Shell 命令（异步 jobstart；开启交互式后以 PTY 运行并自动应答） | `command`（必填）要执行的命令（必要时用引号包裹以免提前拆分）；`timeout_ms`（可选，默认 30000，-1 为不限）超时毫秒数。长任务请在同一次调用显式传较大值；开启 `tools.sandbox.resident` 后，`&`/`nohup`/`setsid` 启动的后台进程跨工具调用存活（同一会话共享沙箱命名空间）。常见只读命令 `ls`/`wc`/`find`/`grep`/`pwd` 命中参数白名单 |
+| `terminal_send_text` | 交互式命令等待输入时输入一行文本并回车 | `text`（必填）文本 |
+| `terminal_send_keys` | 交互式命令等待输入时发送按键（Enter/Tab/Escape/Up/Ctrl-C 等） | `keys`（必填）按键名数组 |
+| `terminal_kill` | 结束正在等待输入的交互式命令 | 无 |
+
+> 交互式 shell：`tools.run_command.interactive.enabled` **默认开启**，`run_command` 以 **PTY** 运行，
+> 轮询 `/proc` 检测「进程阻塞读终端 = 等待输入」（OS 级判据，非文字匹配），每次等待都会发起
+> **单轮大模型请求**（判官）返回 `{"action":"text"|"keys"|"kill"|"none",...}` 决策自动作答；同时弹出
+> `nvim_open_term` 悬浮终端实时显示，可手动键入兜底。详见 [docs/configuration.md](docs/configuration.md)。
 
 ### 🔄 Git 工具
 

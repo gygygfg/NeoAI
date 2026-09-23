@@ -161,6 +161,9 @@ function M.attach(tool)
   -- 长驻服务工具（service_*）：门禁仍完成预检/脚本扫描/硬拒绝，但不进入一次性进程的
   -- overlay 捕获/冻结流程；隔离与候选结算由 sandbox.service 自建。
   if tool.long_lived then spec.long_lived = true end
+  -- 交互式工具（run_command 开启 interactive 时）：不适用常驻命令服务器（其 stdin 为 /dev/null），
+  -- 交回一次性路径以取得可交互的沙箱前缀。
+  if tool.__interactive then spec.interactive = true end
   tool.__sandboxed = true
   tool.__sandbox_spec = spec
   return tool
@@ -1388,6 +1391,14 @@ local function _resident_eligible(attempt, spec, args, req)
   if not spec or spec.effect ~= "process" then return false end
   if attempt.tool_name ~= "run_command" then return false end
   if spec.long_lived then return false end
+  -- 交互式（PTY）run_command 需要一次性路径的沙箱前缀与 stdin/PTY，常驻命令服务器不适用。
+  if spec.interactive then return false end
+  do
+    local icfg = config_store.get("tools.run_command.interactive")
+    if type(icfg) == "table" and icfg.enabled and (icfg.engine or "auto") ~= "off" then
+      return false
+    end
+  end
   -- T0 与「系统管理/降权」（sysadmin，如 chown/useradd/runuser）走常驻实例：常驻实例的
   -- overlay upper 跨命令**且跨轮次**持久（<sandbox_root>/resident，稳定路径），使属主等元数据
   -- 改动不因一次性路径的独立 overlay 或会话轮换而丢失。包安装（挂载/环境不同）与更高档位仍走一次性。
