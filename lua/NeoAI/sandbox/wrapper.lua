@@ -656,6 +656,15 @@ end
 ---   nil 时在此同步计算（小候选/线程池不可用）。
 --- @return table { ok, value?, err? }
 local function _settle_candidate(cand, attempt, ctx, cfg, spec, result, process_info, pre)
+  -- 分段埋点：把结算拆成 ephemeral/impact/secret/risk/enqueue，定位大量文件时的主线程热点。
+  -- 由 `_profile` 内部按 `tools.sandbox.diagnostics.enabled` 决定是否记录。
+  local _t_prev = vim.uv.hrtime()
+  local _files_n = #(cand.files or {})
+  local function _lap(stage)
+    local now = vim.uv.hrtime()
+    _profile(stage, (now - _t_prev) / 1e6, "files=" .. tostring(_files_n))
+    _t_prev = now
+  end
   -- 命名空间映射的临时根（/tmp、/var/tmp 等）：写入为会话私有、nvim 退出即丢弃，
   -- 不进入待审队列、不 CAS 发布、也不弹审批悬浮窗；暂存内容保留以供本次会话读取一致。
   -- 仅当路径**不在 cwd 子树内**时才视为临时根（cwd 位于 /tmp 时其工作区仍走正常审批）。
@@ -689,8 +698,13 @@ local function _settle_candidate(cand, attempt, ctx, cfg, spec, result, process_
       end
     end
   end
+  _lap("settle.ephemeral")
   -- 影响与证据（fs/process），未知用 null 表达
-  local impacts = impact.from_candidate(cand, { command_id = attempt.command_id, attempt_id = attempt.attempt_id })
+  -- 大候选（包安装/git 等）聚合为单条影响，避免数万条记录的主线程 JSON 编码。
+  local _sample = tonumber(config_store.get("tools.sandbox.review.max_display_files")) or 0
+  local impacts = impact.from_candidate(cand,
+    { command_id = attempt.command_id, attempt_id = attempt.attempt_id },
+    { sample = _sample })
   if process_info then impacts[#impacts + 1] = impact.process(process_info) end
   -- 证据只存影响清单（路径/动作/哈希，不含文件内容）：此前直接嵌入 cand.files 会把每个文件的
   -- 完整内容再 JSON 编码一遍（大候选时阻塞主线程，且证据本就无需内容）。
@@ -698,6 +712,7 @@ local function _settle_candidate(cand, attempt, ctx, cfg, spec, result, process_
     command_id = attempt.command_id, attempt_id = attempt.attempt_id, tool = attempt.tool_name,
   })
   local stats = impact.stats(impacts)
+  _lap("settle.impact")
 
   -- 安全分级：按写路径/包安装/密钥/提权/网络/结果信号评估级别并给出建议动作。
   local risk = require("NeoAI.sandbox.risk")
@@ -769,6 +784,7 @@ local function _settle_candidate(cand, attempt, ctx, cfg, spec, result, process_
       }) or 0) > 0
     end
   end
+  _lap("settle.secret")
   -- 脚本间接执行：折叠后的 effective 文本用于危险模式识别与包安装识别。
   local scan = attempt.script_scan
   local effective = scan and scan.enabled and scan.effective or nil
@@ -783,6 +799,8 @@ local function _settle_candidate(cand, attempt, ctx, cfg, spec, result, process_
   local rf = {
     effect = spec.effect,
     paths = paths,
+    -- 包候选的分类工作线程已算好每个路径的级别；有则免主线程逐文件 resolve。
+    path_levels = require("NeoAI.sandbox.candidate").levels_for(cand),
     privilege_tier = attempt.privilege_tier,
     package = is_pkg,
     package_sensitive = pkg_sensitive,
@@ -818,6 +836,7 @@ local function _settle_candidate(cand, attempt, ctx, cfg, spec, result, process_
       reasons = r.reasons, paths = paths, command_id = attempt.command_id,
     })
   end)
+  _lap("settle.risk")
 
   -- 建议动作：block 直接拒绝；auto 立即发布；review 入待审队列（不阻塞 agent）。
   local action = risk.action(r.level, {
@@ -910,6 +929,7 @@ local function _settle_candidate(cand, attempt, ctx, cfg, spec, result, process_
     -- 同一文件被再次编辑：新候选取代同路径的旧待审项（队列只保留最新版本）
     require("NeoAI.sandbox.review").supersede_by_paths(_cand_paths(cand), item.change_set_id)
   end
+  _lap("settle.enqueue")
   control.transition(attempt, "AWAITING_PUBLICATION_AUTH")
   return { ok = true, value = result }
 end
@@ -936,9 +956,22 @@ end
 --- @param process_info table|nil
 --- @return Deferred resolve({ ok, value?, err? })
 local function _persist_and_settle(cand, attempt, ctx, cfg, spec, result, process_info)
-  return store.write_candidate_async(cand):then_(function()
-    return _analyze_secrets_async(cand, attempt)
-  end):then_(function(pre)
+  local pre
+  local _t_persist = vim.uv.hrtime()
+  return _analyze_secrets_async(cand, attempt):then_(function(p)
+    pre = p
+    -- 内容磁盘化：把候选文件内容从内存/候选 JSON 移到 blob（内容寻址），
+    -- 之后写候选 JSON 只含元数据（体积/编解码开销大减）；发布按文件复制/解密。
+    return candidate.blobify_async(cand)
+  end):then_(function()
+    store.write_candidate_async(cand)
+    -- 确保候选**落盘**后再入待审：`write_candidate_async` 只把写入排入线程池，进程在写入完成
+    -- 前退出/热重载或写入失败都会使待审项指向一个不存在的候选，用户应用时报
+    -- `CANDIDATE_NOT_FOUND`。此处有界等待落盘（大候选约百 ms～数百 ms，且在主线程异步链上，
+    -- 不阻塞 Agent 拿到命令结果），保证入队即已持久化。
+    pcall(store.flush, 30000)
+    _profile("persist", (vim.uv.hrtime() - _t_persist) / 1e6,
+      "files=" .. tostring(#(cand.files or {})))
     return _settle_candidate(cand, attempt, ctx, cfg, spec, result, process_info, pre)
   end)
 end
@@ -2167,14 +2200,21 @@ local function _gate_inner(tool, args, ctx, call_original)
           -- 包/生成内容判定（命令判定或路径判定）：跳过密钥 token 化与密钥分析，
           -- 避免对 venv/site-packages/node_modules 等逐文件全文扫描。
           local is_pkg = attempt.package == true or _package_manager_of(cand, attempt) ~= nil
+          -- 包/生成内容不做 token 化：先把内容移到 blob（内容寻址、不占内存/候选 JSON），
+          -- merge 再按文件复制到暂存视图。这样 uv sync 等数千文件不再把内容整批读进内存。
+          local pre = (is_pkg and #cand.files > 0) and candidate.blobify_async(cand) or nil
           -- 双向互通：把命令改动合并进工作区暂存映射，使 read_file/edit_file 可见。
           -- 候选落盘与密钥分析均异步（线程池），避免大量文件时占满主线程。
           -- `view_files`（命令还原暂存编辑、对真实盘无净改动）也需经 merge 同步暂存视图。
-          return candidate.merge_candidate_async(cand, {
-            from_command = true, package = is_pkg,
-            -- 命令在常驻 overlay 内执行时，产物已存在于该 overlay：常驻物化可跳过回写。
-            resident = ctx.sandbox_resident == true,
-          }):then_(function()
+          local function do_merge()
+            return candidate.merge_candidate_async(cand, {
+              from_command = true, package = is_pkg,
+              -- 命令在常驻 overlay 内执行时，产物已存在于该 overlay：常驻物化可跳过回写。
+              resident = ctx.sandbox_resident == true,
+            })
+          end
+          local merged = pre and pre:then_(do_merge) or do_merge()
+          return merged:then_(function()
             if #cand.files == 0 then
               -- 仅有视图同步（无发布候选）：直接完成，不入待审。
               control.transition(attempt, "COMPLETED_READ_ONLY")
@@ -2214,19 +2254,28 @@ local function _gate_inner(tool, args, ctx, call_original)
       end
       local chain = _serialize_capture(function()
         local captures = {}
+        local pkg_opts = { package = attempt.package == true }
         if runtime.backend() == "bwrap" and #active_specs > 0 then
           for _, cap_spec in ipairs(active_specs) do
             captures[#captures + 1] = candidate.capture_overlay_async(attempt.attempt_id, cap_spec.root,
-              cap_spec.mode == "bind" and cap_spec.bind or cap_spec.upper, journal_hint)
+              cap_spec.mode == "bind" and cap_spec.bind or cap_spec.upper, journal_hint, pkg_opts)
           end
         else
-          captures[#captures + 1] = candidate.capture_overlay_async(attempt.attempt_id, real_cwd, staging, journal_hint)
+          captures[#captures + 1] = candidate.capture_overlay_async(
+            attempt.attempt_id, real_cwd, staging, journal_hint, pkg_opts)
         end
         local _t_freeze = vim.uv.hrtime()
         return async.all(captures):then_(function()
-          return candidate.finish_async(attempt.attempt_id)
+          _profile("capture", (vim.uv.hrtime() - _t_freeze) / 1e6)
+          -- 包安装命令（attempt.package）：内容磁盘化为 blob（不整批读入内存），且遮蔽/git/级别
+          -- 判定移入工作线程（免主线程对上万文件逐个 `vim.fn.resolve`）。
+          -- `packages.signature_mode=false` 时回退内容哈希（最强一致性，较慢）。
+          local pkg_sig = attempt.package == true
+            and ((cfg.packages or {}).signature_mode ~= false)
+          return candidate.finish_async(attempt.attempt_id,
+            { blob = pkg_sig, classify = pkg_sig })
         end):then_(function(cand)
-          _profile("freeze", (vim.uv.hrtime() - _t_freeze) / 1e6,
+          _profile("finish", (vim.uv.hrtime() - _t_freeze) / 1e6,
             "files=" .. tostring(cand and #(cand.files or {}) or 0))
           return after_capture(cand)
         end, function(cerr)

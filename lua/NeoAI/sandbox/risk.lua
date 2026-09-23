@@ -216,9 +216,12 @@ function M.classify(facts)
   end
   -- 写入路径级别（单遍：同时记录是否存在工作区外写入，供密钥操作分级复用，
   -- 避免对 `facts.paths` 二次遍历 + 二次 path_level 规范化）
+  -- `facts.path_levels`（path -> level）由包候选分类工作线程预计算：有则直接用，
+  -- 免主线程对每个路径 `fs.canonical`。
+  local levels = facts.path_levels
   local outside = false
   for _, p in ipairs(facts.paths or {}) do
-    local pl = M.path_level(p)
+    local pl = (levels and levels[p]) or M.path_level(p)
     if pl > 0 then
       outside = true
       bump(pl, pl == 1 and "USER_PATH_WRITE" or "SYSTEM_PATH_WRITE")

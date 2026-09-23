@@ -35,6 +35,7 @@ local state = {
   version = 0, -- 暂存版本计数器：每次新增/编辑/删除/合并暂存项时递增
   rotation = nil, -- 会话轮换的在途迁移（Deferred）；暂存访问前经 `_await_rotation` 等待完成
   volatile_cache = nil, -- { cfg = <配置引用>, fn = function } 易变包缓存匹配器缓存
+  cand_levels = nil, -- { digest = <候选人 digest>, map = { [path] = level } }：工作线程分类结果接力
 }
 
 --- 递增暂存版本（每次暂存内容变化时调用）
@@ -92,6 +93,21 @@ local function _abs(path)
   return fs.canonical(path)
 end
 
+--- 规范化「读写目标」路径：解析**祖先**符号链接并折叠 `..`，但末段按字面处理。
+--- 与 `_abs` 不同，绝不跟随叶子符号链接——否则 venv 的 `bin/python`（合法软链）
+--- 会被解析到 uv 的 Python 安装目录，使发布前「路径一致性」校验误报
+--- `CONFLICT/PATH_CHANGED`（见 `M.publish`）。末段为 `.`/`..`/空视为非法（返回 nil 以触发拒绝）。
+--- @param path string
+--- @return string|nil
+local function _abs_literal_leaf(path)
+  if type(path) ~= "string" or path == "" then return nil end
+  local base = vim.fn.fnamemodify(path, ":t")
+  if base == "" or base == "." or base == ".." then return nil end
+  local dir = fs.canonical(vim.fn.fnamemodify(path, ":h"))
+  if dir == "" or dir == "/" then return "/" .. base end
+  return dir .. "/" .. base
+end
+
 -- 暂存路径键缓存：`_workspace_path` 在合并/轮换/暂存时对每个真实路径调用，
 -- 每次 `vim.fn.sha256` + `fnamemodify` 是 2 次 Vimscript 往返；暂存上万文件时累积可观。
 -- 键仅依赖路径字符串（与会话无关），跨会话复用安全；reset 时清空以界定内存。
@@ -112,6 +128,15 @@ local function _read(path)
   local content = f:read("*a")
   f:close()
   return content
+end
+
+--- 读取候选条目的发布内容（供发布解密预检与写入）：
+--- 非大文件 blob 从 blob 读取（token 化内容，需 detokenize）；大文件 blob 返回 nil（按文件复制）。
+--- @param f table
+--- @return string|nil
+local function _candidate_content(f)
+  if f.blob and not f.large then return _read(f.blob) end
+  return f.content
 end
 
 --- 内容是否可安全当文本处理：合法 UTF-8 且不含 NUL。
@@ -1102,14 +1127,11 @@ local function _chunk_list(list, size)
   return chunks
 end
 
---- 每批并发提交的 chunk 数上限（默认 4，与 libuv 线程池一致）：避免数百个 chunk job
---- 一次排满队列，饿死后续 UI 关键 job（脱敏/密钥 token 化/落盘）。
---- 可经 tools.sandbox.work_parallelism 调整。
+--- 每批并发提交的 chunk 数上限：避免数百个 chunk job 一次排满队列，饿死后续 UI 关键 job
+--- （脱敏/密钥 token 化/落盘）。统一 `max(1, 核数-2)`（与放大的 libuv 线程池一致）。
 --- @return number
 local function _work_parallelism()
-  local n = tonumber(require("NeoAI.kernel.config_store").get("tools.sandbox.work_parallelism"))
-  if not n or n <= 0 then return 4 end
-  return n
+  return require("NeoAI.utils.work").parallelism()
 end
 
 --- 把已冻结候选的改动合并进工作区暂存映射，使 read_file/edit_file 能看到
@@ -1724,6 +1746,12 @@ local function _capture_entry(attempt, real_root, staged, child_rel, prefetch, c
       base_hash = (stat and stat.type == "file") and _sha(_read(real)) or nil
     end
   end
+  -- 包/生成内容的 base 以 stat 签名（`sig:` 前缀）承载：与内容哈希分开存储，发布时按
+  -- `base_sig` 做 CAS（不读内容）。捕获 worker 直接写入 base_hash 字段，这里归一化。
+  if type(base_hash) == "string" and base_hash:sub(1, 4) == "sig:" then
+    base_sig = base_hash
+    base_hash = nil
+  end
   attempt.mapping[real] = {
     real = real,
     staged = staged,
@@ -1844,8 +1872,10 @@ end
 --- @param expected_encoded string 物化期望表（real -> hash/"D" + dest + dsig）
 --- @param ws_encoded string 工作区暂存映射（real -> staged / "D" 删除态），供线程内做一致性判定
 --- @param paths_encoded string|nil 写日志「本轮写入/删除的绝对路径」集（nil=全量遍历；空=无改动）
+--- @param package boolean 包/生成内容（`uv sync` 等）：现有 base 文件用 stat 签名代替内容哈希，
+---   避免逐文件读取+纯 Lua SHA（主线程/线程池的 CPU 热点）。
 --- @return string 编码记录
-local function _capture_worker(upper_root, real_root, session_basename, expected_encoded, ws_encoded, cap, paths_encoded)
+local function _capture_worker(upper_root, real_root, session_basename, expected_encoded, ws_encoded, cap, paths_encoded, package)
   --- 解码路径集（`<n>\n<len>:<path>...`），返回 set 或 nil。
   local function decode_set(encoded)
     if type(encoded) ~= "string" then return nil end
@@ -2012,8 +2042,11 @@ local function _capture_worker(upper_root, real_root, session_basename, expected
       enc(tostring(stat and stat.mode or 0))
       count = count + 1
     elseif not ws_skip(real, dest, sstat) then
+      -- 包/生成内容：base 为文件时用 stat 签名代替内容哈希（不读真实盘内容）。
+      local base_field = ""
+      if package and stat and stat.type == "file" then base_field = "sig:" .. sig_of(real) end
       enc(child_rel); enc(dest); enc("file")
-      enc(stat and "1" or "0"); enc(stat and stat.type or ""); enc("")
+      enc(stat and "1" or "0"); enc(stat and stat.type or ""); enc(base_field)
       enc((sstat and sstat.type == "file") and "1" or "0")
       enc(tostring(sstat and sstat.size or 0))
       enc(tostring(sstat and sstat.mode or 0))
@@ -2254,6 +2287,112 @@ local function _base_hash_worker(input, sha_src, cap)
   return tostring(n) .. "\n" .. table.concat(out)
 end
 
+--- 工作线程：对一批真实路径做「遮蔽 / git 分类 / 风险级别」判定（包/生成内容候选专用）。
+--- 用原生 `vim.uv.fs_realpath` 解析祖先与叶子软链，避免主线程对每个文件 `vim.fn.resolve`
+--- （数千 venv 文件时是主线程卡顿源）。自包含：仅用 vim.uv + 纯 Lua。
+--- @param payload table {
+---   paths: string[], masks: string[], mask_canon: string[],
+---   store_root?: string, store_root_canon?: string, unmask?: string[], cwd?: string, home?: string }
+--- @return table 与 paths 对齐：{ { masked = string|false, git_class = string|false, level = number }, ... }
+local function _classify_paths_worker(payload)
+  local uv = vim.uv
+  local function strip(p)
+    p = tostring(p or "")
+    p = p:gsub("^/+", "/"):gsub("/+$", "")
+    if p == "" then p = "/" end
+    return p
+  end
+  local function realpath(p)
+    if type(p) ~= "string" or p == "" then return p end
+    local rp = uv.fs_realpath(p)
+    if rp and rp ~= "" then return strip(rp) end
+    local dir, base = p:match("^(.*)/([^/]+)$")
+    if not dir or dir == "" then return strip(p) end
+    local rd = uv.fs_realpath(dir)
+    if rd and rd ~= "" then return strip(rd) .. "/" .. base end
+    return strip(p)
+  end
+  local function under(p, r)
+    if type(r) ~= "string" or r == "" then return false end
+    return p == r or p:sub(1, #r + 1) == r .. "/"
+  end
+  local masks = payload.masks or {}
+  local canon = payload.mask_canon or {}
+  local unmask = payload.unmask or {}
+  local sr, src = payload.store_root, payload.store_root_canon
+  local cwd, home = payload.cwd or "", payload.home or ""
+  local out = {}
+  for i, p in ipairs(payload.paths or {}) do
+    local abs = realpath(p)
+    local masked = false
+    if sr and sr ~= "" and (under(abs, sr) or (src and src ~= "" and under(abs, src))) then
+      masked = sr
+    else
+      for k = 1, #masks do
+        if under(abs, masks[k]) or (canon[k] and under(abs, canon[k])) then
+          local u = false
+          for _, x in ipairs(unmask) do
+            if under(masks[k], x) or (canon[k] and under(canon[k], x)) then u = true break end
+          end
+          if not u then masked = masks[k] end
+          break
+        end
+      end
+    end
+    local gc = false
+    local marker = abs:find("/%.git/")
+    local prefix_len
+    if marker then
+      prefix_len = marker + 5
+    elseif abs:match("^%.git/") then
+      prefix_len = 6
+    elseif abs == ".git" or abs:sub(-5) == "/.git" then
+      gc = "other"
+    end
+    if prefix_len then
+      local rel = abs:sub(prefix_len + 1)
+      if rel == "" then gc = "other"
+      elseif rel:match("%.lock$") or rel == "gc.log" then gc = "transient"
+      elseif rel == "index" or rel == "HEAD" or rel == "packed-refs" or rel == "ORIG_HEAD"
+        or rel == "MERGE_HEAD" or rel == "CHERRY_PICK_HEAD" or rel == "REVERT_HEAD"
+        or rel == "FETCH_HEAD" or rel == "COMMIT_EDITMSG" or rel == "MERGE_MSG"
+        or rel:sub(1, 5) == "refs/" or rel:sub(1, 5) == "logs/" then gc = "pointer"
+      elseif rel:sub(1, 8) == "objects/" then gc = "object"
+      else gc = "other" end
+    end
+    local level = 2
+    if cwd ~= "" and under(abs, cwd) then level = 0
+    elseif home ~= "" and under(abs, home) then level = 1 end
+    -- 不使用 vim.NIL（worker 内不保证存在）：nil 用 false 表达，主线程归一化。
+    out[i] = { masked = masked or false, git_class = gc or false, level = level }
+  end
+  return out
+end
+
+--- 异步批量分类真实路径（仅包/生成内容候选）：返回 Deferred resolve(结果数组，与 paths 对齐)。
+--- 线程池不可用时 resolve(nil)，调用方回退同步判定。
+--- @param paths table 真实路径数组
+--- @param unmask table|nil 本次 attempt 解除遮蔽的路径数组
+--- @return Deferred
+local function _classify_paths_async(paths, unmask)
+  local work = require("NeoAI.utils.work")
+  if not work.available() or #paths == 0 then return async.resolve(nil) end
+  local runtime = require("NeoAI.sandbox.runtime")
+  local ctx = runtime.mask_context()
+  local cwd = fs.canonical(vim.fn.getcwd() or "")
+  local home = fs.canonical(vim.fn.expand("~"))
+  return work.run_codec(_classify_paths_worker, {
+    paths = paths,
+    masks = ctx.paths,
+    mask_canon = ctx.canon,
+    store_root = ctx.store_root,
+    store_root_canon = ctx.store_root_canon,
+    unmask = unmask or {},
+    cwd = cwd,
+    home = home,
+  })
+end
+
 --- 异步登记 overlay 改动：遍历/读取/哈希 base 在 utils.work 线程池执行，
 --- 主线程仅按预取结果登记 mapping（工作区跳过/上限判定仍与同步版一致）。
 --- 遍历（scandir+stat）在单个 job；base 内容哈希按 `work_chunk_files` 分块并发补算（多核）。
@@ -2261,8 +2400,11 @@ end
 --- @param real_root string
 --- @param upper_root string
 --- @param hint table|nil 写日志 { writes = {path=true}, deletes = {path=true} }（可信时）
+--- @param opts table|nil { package?: boolean 包/生成内容：base 用 stat 签名，免逐文件内容哈希 }
 --- @return Deferred
-function M.capture_overlay_async(attempt_id, real_root, upper_root, hint)
+function M.capture_overlay_async(attempt_id, real_root, upper_root, hint, opts)
+  opts = opts or {}
+  local package = opts.package == true
   local attempt = state.attempts[attempt_id]
   if not attempt then return async.resolve() end
   local work = require("NeoAI.utils.work")
@@ -2295,12 +2437,18 @@ function M.capture_overlay_async(attempt_id, real_root, upper_root, hint)
   local expected_encoded = _encode_expected(state.materialized[upper_root], paths_set)
   local ws_encoded = _encode_ws(state.workspace, root, paths_set)
   return work.run(_capture_worker, upper_root, root, session_basename, expected_encoded, ws_encoded, cap,
-    paths_encoded):then_(function(encoded)
+    paths_encoded, package):then_(function(encoded)
     local records = _decode_records(encoded, 12)
     -- 需要 base 内容哈希的记录（base 为文件，且非超大 blob 文件）：由分块并行 job 补算。
+    -- 包/生成内容已被 worker 以 stat 签名（rec[6] 前缀 `sig:`）填充，无需内容哈希；
+    -- 仅保留 whiteout（删除）——删除需与基线做 CAS，删除量小，仍用内容哈希最稳。
     local need = {}
     for i, rec in ipairs(records) do
-      if rec[3] ~= "large" and rec[3] ~= "link" and rec[5] == "file" then
+      if package then
+        if rec[3] == "whiteout" and rec[5] == "file" then
+          need[#need + 1] = { idx = i, real = root .. "/" .. rec[1] }
+        end
+      elseif rec[3] ~= "large" and rec[3] ~= "link" and rec[5] == "file" then
         need[#need + 1] = { idx = i, real = root .. "/" .. rec[1] }
       end
     end
@@ -2485,9 +2633,10 @@ end
 --- 剔除命中「有效遮蔽」与「易变包索引/缓存」的文件。
 --- @param files table
 --- @param attempt table|nil 控制层 attempt（含 effective_unmask / package）
+--- @param classify table|nil 工作线程预分类结果：path -> { masked, git_class, level }（包候选专用）
 --- @return table files 过滤后的文件
 --- @return table dropped { masked=number, volatile=number, masked_paths=table, volatile_paths=table }
-local function _filter_unpublishable(files, attempt)
+local function _filter_unpublishable(files, attempt, classify)
   local runtime = require("NeoAI.sandbox.runtime")
   local unmask = attempt and attempt.effective_unmask or nil
   local is_pkg = _is_package_candidate(files, attempt)
@@ -2495,14 +2644,24 @@ local function _filter_unpublishable(files, attempt)
   local out = {}
   local dropped = { masked = 0, volatile = 0, git = 0, masked_paths = {}, volatile_paths = {}, git_paths = {} }
   for _, f in ipairs(files) do
-    local gc = runtime.git_path_class(f.path)
+    local c = classify and classify[f.path]
+    local gc, masked
+    if c then
+      gc = c.git_class
+      if gc == false then gc = nil end
+      masked = c.masked or false
+    else
+      -- 无预分类（非包候选/线程池不可用/路径缺失）时回退主线程完整解析。
+      gc = runtime.git_path_class(f.path)
+      masked = runtime.is_masked_path(f.path, unmask) or false
+    end
     local is_obj_del = gc == "object" and (f.action == "delete" or f.action == "rmdir")
     if gc == "transient" or gc == "other" or is_obj_del then
       -- `.git` 瞬态（*.lock/gc.log）、配置类（config/hooks/info）与对象删除（gc/prune 的
       -- 剪枝）不纳入候选：对象删除绝不应用（保留多余对象无害，删除被引用的对象才会悬空）。
       dropped.git = dropped.git + 1
       if #dropped.git_paths < 20 then dropped.git_paths[#dropped.git_paths + 1] = f.path end
-    elseif runtime.is_masked_path(f.path, unmask) then
+    elseif masked then
       dropped.masked = dropped.masked + 1
       if #dropped.masked_paths < 20 then dropped.masked_paths[#dropped.masked_paths + 1] = f.path end
     elseif volatile and volatile(f.path) then
@@ -2527,8 +2686,9 @@ end
 --- @param attempt_id string
 --- @param prefetch table|nil 工作线程预取结果：staged 路径 -> { exists, type, size, content }；
 ---   nil 时在主线程 fs_stat/读取（同步路径）。
+--- @param classify table|nil 工作线程预分类结果：path -> { masked, git_class, level }（包候选专用）
 --- @return table candidate
-function M.finish(attempt_id, prefetch)
+function M.finish(attempt_id, prefetch, classify)
   local attempt = state.attempts[attempt_id]
   if not attempt then
     return nil
@@ -2615,7 +2775,7 @@ function M.finish(attempt_id, prefetch)
           "[sandbox] 跳过超大候选文件（%d 字节 > 上限 %d）：%s", staged_stat.size, cap, real)
       end)
     else
-      local action, after_hash, content
+      local action, after_hash, content, blob
       if entry.base_type == "directory" then
         if staged_stat and staged_stat.type == "directory" then
           if not entry.base_exists then action = "mkdir" end
@@ -2624,15 +2784,26 @@ function M.finish(attempt_id, prefetch)
         end
       else
         if staged_stat and staged_stat.type == "file" then
-          content = pf and pf.content or _read(entry.staged)
-          after_hash = pf and pf.after_hash or _sha(content)
+          if pf and pf.blob then
+            -- 包/生成内容：冻结阶段已磁盘化为 blob，不内嵌内容（发布时按文件解密/复制）。
+            blob = pf.blob
+            after_hash = pf.after_hash
+          else
+            content = pf and pf.content or _read(entry.staged)
+            after_hash = pf and pf.after_hash or _sha(content)
+          end
           if not entry.base_exists then
             action = "create"
-          elseif (entry.view_base_hash or entry.base_hash) ~= after_hash then
-            action = "modify"
-          elseif entry.mode and entry.base_mode and entry.mode ~= entry.base_mode then
-            -- 内容未变、仅权限变化（如 `chmod +x`）：仍需候选，否则可执行位丢失。
-            action = "modify"
+          else
+            -- 包/生成内容用 `base_sig`（stat 签名）与 after_hash（同为 sig）比较；
+            -- 普通内容仍用内容哈希比较（含工作区暂存视图基线）。
+            local base_ref = entry.base_sig or entry.view_base_hash or entry.base_hash
+            if base_ref ~= after_hash then
+              action = "modify"
+            elseif entry.mode and entry.base_mode and entry.mode ~= entry.base_mode then
+              -- 内容未变、仅权限变化（如 `chmod +x`）：仍需候选，否则可执行位丢失。
+              action = "modify"
+            end
           end
         else
           if entry.base_exists then action = "delete" end
@@ -2646,21 +2817,27 @@ function M.finish(attempt_id, prefetch)
           path = real,
           action = action,
           before_hash = entry.base_hash,
+          before_sig = entry.base_sig,
           after_hash = after_hash,
           base_exists = entry.base_exists,
           base_type = entry.base_type,
           mode = (action == "create" or action == "modify") and entry.mode or nil,
-          content = (action == "create" or action == "modify") and content or nil,
+          content = ((action == "create" or action == "modify") and not blob) and content or nil,
+          blob = ((action == "create" or action == "modify") and blob) or nil,
         }
-      elseif after_hash then
+      elseif after_hash and not entry.base_sig then
         -- 对真实盘无净改动；但若工作区暂存仍是旧内容，说明命令还原了暂存编辑，需同步视图。
+        -- 包/生成内容（base_sig）不做该比对：其 after_hash 是 stat 签名而非内容哈希，且内容为生成物。
         local ws = state.workspace[real]
         if ws and not ws.deleted and ws.staged and fs.exists(ws.staged) then
           local cur = _read(ws.staged)
           local cur_hash = cur and _sha(cur)
           if cur_hash and cur_hash ~= after_hash then
+            -- 内容已磁盘化为 blob 时按需读取，供 merge 同步暂存视图。
+            local view_content = content
+            if not view_content and blob then view_content = _read(blob) end
             view_files[#view_files + 1] = {
-              path = real, action = "modify", content = content, mode = entry.mode,
+              path = real, action = "modify", content = view_content, mode = entry.mode,
             }
           end
         end
@@ -2671,7 +2848,7 @@ function M.finish(attempt_id, prefetch)
   table.sort(files, function(a, b) return a.path < b.path end)
   -- 剔除运行时遮蔽（发布硬拒绝）与易变包缓存（CAS 冲突）文件，避免整单元失败。
   local dropped
-  files, dropped = _filter_unpublishable(files, attempt.attempt)
+  files, dropped = _filter_unpublishable(files, attempt.attempt, classify)
   local manifest = {}
   for _, f in ipairs(files) do
     manifest[#manifest + 1] = { path = f.path, action = f.action, after_hash = f.after_hash }
@@ -2687,7 +2864,28 @@ function M.finish(attempt_id, prefetch)
     effect = attempt.attempt.effect,
     dropped = (dropped and (dropped.masked > 0 or dropped.volatile > 0 or dropped.git > 0)) and dropped or nil,
   }
+  -- 工作线程分类结果（风险级别）接力给结算阶段，免主线程再对每个路径 resolve。单槽即可：
+  -- 捕获/冻结/合并/落盘/结算经 `_serialize_capture` 串行，同一时刻至多一个 in-flight 候选。
+  if classify then
+    local levels = {}
+    for _, f in ipairs(files) do
+      local c = classify[f.path]
+      levels[f.path] = (c and tonumber(c.level)) or 2
+    end
+    state.cand_levels = { digest = candidate.candidate_digest, map = levels }
+  else
+    state.cand_levels = nil
+  end
   return candidate
+end
+
+--- 取候选对应的路径风险级别映射（仅包候选分类阶段写入；digest 不匹配时返回 nil 回退计算）。
+--- @param cand table|nil
+--- @return table|nil path -> level
+function M.levels_for(cand)
+  local rec = state.cand_levels
+  if rec and cand and rec.digest == cand.candidate_digest then return rec.map end
+  return nil
 end
 
 -- ========== 工作线程：候选文件读取（主线程只做判定/组装） ==========
@@ -2701,8 +2899,9 @@ end
 --- @param cap number 单文件字节上限（>0 且超过时走 blob）
 --- @param sha_src string 纯 Lua sha256 实现源码（线程内 load 得到 hex 函数）
 --- @param blob_dir string blob 存储目录
+--- @param force_blob string "1" 时把（未超上限的）内容也复制为 blob（包/生成内容，避免返回大内容）
 --- @return string 编码的预取结果
-local function _finish_worker(input, cap, sha_src, blob_dir)
+local function _finish_worker(input, cap, sha_src, blob_dir, force_blob)
   local sha = assert(load(sha_src))()
   local out = {}
   if type(input) ~= "string" then return "0\n" end
@@ -2730,12 +2929,15 @@ local function _finish_worker(input, cap, sha_src, blob_dir)
     local after_hash = ""
     local blob = ""
     if stat and stat.type == "file" then
-      if cap <= 0 or (stat.size or 0) <= cap then
+      local within = cap <= 0 or (stat.size or 0) <= cap
+      if within and force_blob ~= "1" then
+        -- 普通内容（小文件）：读入内容并哈希，供候选内嵌/变更判定。
         local f = io.open(staged, "rb")
         if f then content = f:read("*a") or ""; f:close() end
         after_hash = "sha256:" .. sha(content)
       else
-        -- 超大文件：内容复制为 blob（不在候选 JSON 内嵌），哈希用 stat 签名。
+        -- 超大文件 / 包生成内容（force_blob）：内容按文件复制为 blob（不读入 Lua 内存），
+        -- after_hash 用 stat 签名——避免对 venv/site-packages 等数千文件做纯 Lua SHA（CPU 热点）。
         local target = blob_dir ~= "" and (blob_dir .. "/" .. sha(staged)) or ""
         if target ~= "" then
           local ok = pcall(vim.uv.fs_copyfile, staged, target)
@@ -2745,9 +2947,16 @@ local function _finish_worker(input, cap, sha_src, blob_dir)
             if stat.mode then pcall(vim.uv.fs_chmod, target, stat.mode % 4096) end
           end
         end
-        after_hash = (stat.mtime and string.format("sig:%s:%s:%s",
-          tostring(stat.mtime.sec), tostring(stat.mtime.nsec), tostring(stat.size)))
-          or ("sig:" .. tostring(stat.size or 0))
+        if within and force_blob == "1" and blob == "" then
+          -- 包内容 blob 复制不可用/失败：回退读取内容，绝不产生「无内容且无 blob」的候选。
+          local f = io.open(staged, "rb")
+          if f then content = f:read("*a") or ""; f:close() end
+          after_hash = "sha256:" .. sha(content)
+        else
+          after_hash = (stat.mtime and string.format("sig:%s:%s:%s",
+            tostring(stat.mtime.sec), tostring(stat.mtime.nsec), tostring(stat.size)))
+            or ("sig:" .. tostring(stat.size or 0))
+        end
       end
     end
     enc(staged); enc(stat and "1" or "0"); enc(stat and stat.type or "")
@@ -2782,8 +2991,11 @@ end
 --- 异步冻结：暂存文件读取/哈希在 utils.work 线程池执行；主线程据预取结果组装候选。
 --- 按 `work_chunk_files` 分块并发提交，使大量文件时用满线程池（多核）而非单核串行。
 --- @param attempt_id string
+--- @param opts table|nil { blob?: boolean 包/生成内容：内容直接磁盘化为 blob，不内嵌;
+---   classify?: boolean 包/生成内容：遮蔽/git/风险级别判定移入工作线程（免主线程逐文件 resolve） }
 --- @return Deferred resolve(candidate|nil)
-function M.finish_async(attempt_id)
+function M.finish_async(attempt_id, opts)
+  opts = opts or {}
   local attempt = state.attempts[attempt_id]
   if not attempt then return async.resolve(M.finish(attempt_id)) end
   local work = require("NeoAI.utils.work")
@@ -2794,23 +3006,46 @@ function M.finish_async(attempt_id)
   local sha_src = require("NeoAI.utils.sha256").source
   local cap = _max_file_bytes()
   local blob_dir = require("NeoAI.sandbox.store").blobs_dir() or ""
-  return work.batched(_chunk_list(entries, _work_chunk_files()), _work_parallelism(), function(chunk)
-    return work.run(_finish_worker, _encode_entries(chunk), cap, sha_src, blob_dir)
-  end):then_(function(results)
-    local prefetch = {}
-    for _, encoded in ipairs(results) do
-      for _, rec in ipairs(_decode_records(encoded, 7)) do
-        prefetch[rec[1]] = {
-          exists = rec[2] == "1",
-          type = (rec[3] ~= "" and rec[3]) or nil,
-          size = tonumber(rec[4]) or 0,
-          content = rec[5],
-          after_hash = (rec[6] ~= "" and rec[6]) or nil,
-          blob = (rec[7] ~= "" and rec[7]) or nil,
-        }
+  local force_blob = opts.blob and "1" or "0"
+  local function run_finish(classify)
+    return work.batched(_chunk_list(entries, _work_chunk_files()), _work_parallelism(), function(chunk)
+      return work.run(_finish_worker, _encode_entries(chunk), cap, sha_src, blob_dir, force_blob)
+    end):then_(function(results)
+      local prefetch = {}
+      for _, encoded in ipairs(results) do
+        for _, rec in ipairs(_decode_records(encoded, 7)) do
+          prefetch[rec[1]] = {
+            exists = rec[2] == "1",
+            type = (rec[3] ~= "" and rec[3]) or nil,
+            size = tonumber(rec[4]) or 0,
+            content = rec[5],
+            after_hash = (rec[6] ~= "" and rec[6]) or nil,
+            blob = (rec[7] ~= "" and rec[7]) or nil,
+          }
+        end
+      end
+      return M.finish(attempt_id, prefetch, classify)
+    end)
+  end
+  if not opts.classify then return run_finish(nil) end
+  -- 分类（遮蔽/git/级别）在工作线程用原生 realpath 完成，主线程只消费结果。
+  local paths = {}
+  for i, entry in ipairs(entries) do paths[i] = entry.real end
+  local unmask = attempt.attempt and attempt.attempt.effective_unmask or nil
+  return _classify_paths_async(paths, unmask):then_(function(cls)
+    if not cls then return run_finish(nil) end
+    local map = {}
+    for i, entry in ipairs(entries) do
+      local c = cls[i]
+      if type(c) == "table" then
+        local masked = c.masked
+        if masked == vim.NIL or masked == nil then masked = false end
+        local gc = c.git_class
+        if gc == vim.NIL or gc == nil then gc = nil end
+        map[entry.real] = { masked = masked, git_class = gc, level = tonumber(c.level) or 2 }
       end
     end
-    return M.finish(attempt_id, prefetch)
+    return run_finish(map)
   end)
 end
 
@@ -2845,6 +3080,38 @@ local function _apply_order(files)
   return out
 end
 
+--- 发布前校验（纵深防御）：候选路径可能来自落盘存储（本地可篡改）或旧版本记录。
+--- 逐文件重规范化：若解析结果与记录的路径不一致（`..`/符号链接被引入或替换），
+--- 或命中宿主敏感遮蔽路径，一律拒绝，绝不把内容写到未经验证的真实位置。
+--- @param candidate table
+--- @return table|nil 校验失败时返回 { ok=false, state, reason }
+local function _publish_validate(candidate)
+  local runtime = require("NeoAI.sandbox.runtime")
+  for _, f in ipairs(candidate.files or {}) do
+    if type(f.path) ~= "string" or f.path == "" then
+      return { ok = false, state = "FAILED", reason = "INVALID_PATH" }
+    end
+    -- 一致性判定只解析祖先软链（`..` 穿越 / 祖先被替换仍拒绝），末段按字面——
+    -- 叶子是合法软链（如 venv 的 bin/python）时不误报 PATH_CHANGED。
+    local canonical = _abs_literal_leaf(f.path)
+    if canonical == nil or canonical ~= f.path then
+      return { ok = false, state = "CONFLICT", reason = "PATH_CHANGED: " .. tostring(f.path) }
+    end
+    -- 遮蔽与 git 内部判定仍按完整解析（跟随叶子软链），保留「软链指向敏感路径」的防护。
+    local resolved = _abs(f.path)
+    local masked = runtime.is_masked_path(resolved)
+    if masked then
+      return { ok = false, state = "FAILED", reason = "SANDBOX_MASKED_TARGET: " .. tostring(masked) }
+    end
+    -- `.git` 瞬态/配置类绝不发布（对象/指针按原子顺序发布，见 _apply_order）。
+    local gc = runtime.git_path_class(resolved)
+    if gc == "transient" or gc == "other" then
+      return { ok = false, state = "FAILED", reason = "SANDBOX_GIT_INTERNAL: " .. tostring(resolved) }
+    end
+  end
+  return nil
+end
+
 --- CAS 发布候选到真实工作区
 --- 仅当真实当前状态等于候选基线时应用；否则 CONFLICT（设计文档 §4.5）。
 --- @param candidate table
@@ -2852,28 +3119,9 @@ end
 --- @return table { ok, state, reason?, receipt? }
 function M.publish(candidate, opts)
   opts = opts or {}
-  -- 发布前校验（纵深防御）：候选路径可能来自落盘存储（本地可篡改）或旧版本记录。
-  -- 逐文件重规范化：若解析结果与记录的路径不一致（`..`/符号链接被引入或替换），
-  -- 或命中宿主敏感遮蔽路径，一律拒绝，绝不把内容写到未经验证的真实位置。
+  local invalid = _publish_validate(candidate)
+  if invalid then return invalid end
   local runtime = require("NeoAI.sandbox.runtime")
-  for _, f in ipairs(candidate.files or {}) do
-    if type(f.path) ~= "string" or f.path == "" then
-      return { ok = false, state = "FAILED", reason = "INVALID_PATH" }
-    end
-    local canonical = _abs(f.path)
-    if canonical ~= f.path then
-      return { ok = false, state = "CONFLICT", reason = "PATH_CHANGED: " .. tostring(f.path) }
-    end
-    local masked = runtime.is_masked_path(canonical)
-    if masked then
-      return { ok = false, state = "FAILED", reason = "SANDBOX_MASKED_TARGET: " .. tostring(masked) }
-    end
-    -- `.git` 瞬态/配置类绝不发布（对象/指针按原子顺序发布，见 _apply_order）。
-    local gc = runtime.git_path_class(canonical)
-    if gc == "transient" or gc == "other" then
-      return { ok = false, state = "FAILED", reason = "SANDBOX_GIT_INTERNAL: " .. tostring(canonical) }
-    end
-  end
   -- 冲突预检：任一文件真实状态偏离基线则整体拒绝。
   -- 例外：git 对象库（内容寻址、不可变、可累加）不做 CAS——写前已存在即幂等满足。
   for _, f in ipairs(candidate.files or {}) do
@@ -2926,13 +3174,16 @@ function M.publish(candidate, opts)
     end
   end
   -- 出沙箱解密预检：任何未解析的 token（映射缺失，如热重载后）都拒绝发布，
-  -- 绝不把 token 当内容写进真实文件（fail-closed）。
+  -- 绝不把 token 当内容写进真实文件（fail-closed）。大文件 blob 跳过（不做 token 化）。
   local secret = require("NeoAI.sandbox.secret")
   for _, f in ipairs(candidate.files or {}) do
-    if (f.action == "create" or f.action == "modify") and not f.blob and not f.link then
-      local _, unresolved = secret.detokenize(f.content or "")
-      if unresolved > 0 then
-        return { ok = false, state = "FAILED", reason = "SECRET_UNRESOLVED: " .. f.path }
+    if (f.action == "create" or f.action == "modify") and not f.link and not f.large then
+      local raw = _candidate_content(f)
+      if raw ~= nil then
+        local _, unresolved = secret.detokenize(raw)
+        if unresolved > 0 then
+          return { ok = false, state = "FAILED", reason = "SECRET_UNRESOLVED: " .. f.path }
+        end
       end
     end
   end
@@ -2945,7 +3196,8 @@ function M.publish(candidate, opts)
       content = f.link
     elseif f.action == "create" or f.action == "modify" then
       action = "write"
-      content = (secret.detokenize(f.content or ""))
+      -- 非大文件 blob：从 blob 读取（token 化内容）后解密；内嵌内容直接解密；大文件按文件复制。
+      content = secret.detokenize(_candidate_content(f) or "")
       -- 数据流账本：记录假密钥在宿主落盘路径的汇聚点。
       pcall(function()
         require("NeoAI.sandbox.secret_flow").record("commit", { path = f.path })
@@ -2964,7 +3216,7 @@ function M.publish(candidate, opts)
     end
     if action then
       local res
-      if action == "write" and f.blob then
+      if action == "write" and f.blob and f.large then
         -- 大文件：直接按文件复制（不读入 Lua 内存）。
         res = writer.apply_file("write", f.path, f.blob, {
           allow_root = opts.allow_root == true,
@@ -3002,6 +3254,451 @@ function M.publish(candidate, opts)
     file_count = #(candidate.files or {}),
   }
   return { ok = true, state = "COMMITTED", receipt = receipt }
+end
+
+--- 候选是否与顺序无关（无删除、无 git 对象/指针）：其写入可并行而无需保序。
+--- 删除/rmdir 需「子先于父」，git 对象须先于指针，故这些情况必须顺序发布。
+--- @param files table
+--- @return boolean
+local function _order_insensitive(files)
+  local runtime = require("NeoAI.sandbox.runtime")
+  for _, f in ipairs(files) do
+    local gc = f.git_class or runtime.git_path_class(f.path)
+    if gc == "object" or gc == "pointer" then return false end
+    if f.action == "delete" or f.action == "rmdir" then return false end
+  end
+  return true
+end
+
+--- 当前进程能否以自身身份直接写（无需 setpriv/sudo）：仅 root + run_as>0 需提权。
+--- 非 root 进程以自身身份写；root + run_as=0 直接写——两者都可在线程池执行。
+--- @return boolean
+local function _needs_privileged_writer()
+  if vim.uv.getuid() ~= 0 then return false end
+  local uid = select(1, require("NeoAI.sandbox.runtime").payload_ids())
+  return uid ~= nil and uid > 0
+end
+
+--- 工作线程：对一组写操作做 CAS 校验（phase="cas"）或写入（phase="write"）。
+--- 纯 uv + 纯 Lua sha（worker 内无 vim.fn / vim.api）。返回结构化结果供主线程汇总。
+--- @param payload table { ops = {...}, phase = "cas"|"write", cas_mode?, max_file_bytes? }
+--- @param sha_src string 纯 Lua sha256 源码（worker 内 load）
+--- @return table { status = "ok"|"conflict"|"needs_root"|"error", reason?, path? }
+local function _publish_worker(payload, sha_src)
+  local uv = vim.uv
+  local sha = assert(load(sha_src))()
+  local cas_mode = payload.cas_mode or "hash"
+  local cap = tonumber(payload.max_file_bytes) or 0
+  local phase = payload.phase or "write"
+  local function nn(v) if v == vim.NIL then return nil end; return v end
+
+  local function perm_error(err)
+    local s = tostring(err or ""):lower()
+    return s:find("permission denied", 1, true) ~= nil
+      or s:find("operation not permitted", 1, true) ~= nil
+      or s:find("read-only file system", 1, true) ~= nil
+      or s:find("eacces", 1, true) ~= nil
+      or s:find("eperm", 1, true) ~= nil
+      or s:find("erofs", 1, true) ~= nil
+  end
+  local function sha_hex(content) return "sha256:" .. sha(content or "") end
+  local function stat_sig(st)
+    if not (st and st.type == "file" and st.mtime) then return nil end
+    return string.format("sig:%s:%s:%s",
+      tostring(st.mtime.sec), tostring(st.mtime.nsec), tostring(st.size))
+  end
+  local function read_all(path)
+    local f = io.open(path, "rb")
+    if not f then return nil end
+    local c = f:read("*a") or ""
+    f:close()
+    return c
+  end
+  -- 目录去重缓存：同一批文件多共享父目录，避免逐文件对每个路径分量重复 mkdir。
+  local seen_dirs = {}
+  local function mkdirp(p)
+    if not p or p == "" then return end
+    local acc = ""
+    for seg in p:gmatch("[^/]+") do
+      acc = acc .. "/" .. seg
+      if not seen_dirs[acc] then
+        seen_dirs[acc] = true
+        uv.fs_mkdir(acc, 448)
+      end
+    end
+  end
+  --- 同目录临时文件 + fsync + rename（保持真实工作区发布的持久化语义）。
+  local function write_atomic(path, content, mode)
+    local dir = path:match("^(.*)/[^/]*$")
+    mkdirp(dir)
+    local fd, tmp = uv.fs_mkstemp(path .. ".tmp.XXXXXX")
+    if not fd then return false, tmp end
+    local off = 0
+    while off < #content do
+      local n, err = uv.fs_write(fd, content:sub(off + 1), off)
+      if not n or n == 0 then uv.fs_close(fd); uv.fs_unlink(tmp); return false, err end
+      off = off + n
+    end
+    local synced, serr = uv.fs_fsync(fd)
+    uv.fs_close(fd)
+    if not synced then uv.fs_unlink(tmp); return false, serr end
+    if mode then pcall(uv.fs_chmod, tmp, mode) end
+    local ok, rerr = uv.fs_rename(tmp, path)
+    if not ok then uv.fs_unlink(tmp); return false, rerr end
+    return true
+  end
+  --- 大文件 blob：读源文件内容后原子写目标（worker 内不便用 fs_copyfile + rename 组合）。
+  local function copy_blob(src, dst, mode)
+    local content = read_all(src)
+    if content == nil then return false, "SOURCE_NOT_FOUND: " .. tostring(src) end
+    return write_atomic(dst, content, mode)
+  end
+
+  for _, op in ipairs(payload.ops or {}) do
+    local path = op.path
+    local action = nn(op.action)
+    local link = nn(op.link)
+    local blob = nn(op.blob)
+    local base_type = nn(op.base_type)
+    local before_hash = nn(op.before_hash)
+    local before_sig = nn(op.before_sig)
+    local gc = nn(op.git_class)
+    -- ---- CAS（git 对象库内容寻址，不做 CAS）----
+    if phase == "cas" and gc ~= "object" then
+      local lstat = uv.fs_lstat(path)
+      local stat = uv.fs_stat(path)
+      local exists = lstat ~= nil
+      local conflict
+      if link then
+        if action == "create" then
+          if exists then conflict = "TARGET_ALREADY_EXISTS: " .. path end
+        else
+          if not exists then conflict = "TARGET_MISSING: " .. path
+          elseif lstat.type ~= "link" or uv.fs_readlink(path) ~= before_hash then
+            conflict = "BASELINE_CHANGED: " .. path
+          end
+        end
+      elseif action == "create" or action == "mkdir" then
+        if exists then conflict = "TARGET_ALREADY_EXISTS: " .. path end
+      else
+        if not exists then conflict = "TARGET_MISSING: " .. path
+        elseif base_type == "link" then
+          if lstat.type ~= "link" or uv.fs_readlink(path) ~= before_hash then
+            conflict = "BASELINE_CHANGED: " .. path
+          end
+        elseif stat and stat.type == "file" then
+          local use_sig = before_sig ~= nil
+          if not use_sig and cas_mode == "sig" then use_sig = true end
+          if not use_sig and cas_mode == "auto" and cap > 0 and (stat.size or 0) > cap then
+            use_sig = true
+          end
+          if use_sig then
+            if before_sig and stat_sig(stat) ~= before_sig then
+              conflict = "BASELINE_CHANGED: " .. path
+            end
+          else
+            local cur = read_all(path)
+            if sha_hex(cur or "") ~= before_hash then
+              conflict = "BASELINE_CHANGED: " .. path
+            end
+          end
+        end
+      end
+      if conflict then return { status = "conflict", reason = conflict, path = path } end
+    end
+    -- ---- 写入 ----
+    if phase == "write" then
+      local stage, werr
+      if link then
+        local st = uv.fs_lstat(path)
+        if st then
+          if st.type == "directory" then
+            return { status = "error", reason = "SYMLINK_TARGET_IS_DIR: " .. path, path = path }
+          end
+          uv.fs_unlink(path)
+        end
+        local dir = path:match("^(.*)/[^/]*$")
+        mkdirp(dir)
+        local ok, e = uv.fs_symlink(link or "", path)
+        if not ok then stage, werr = "symlink", e end
+      elseif action == "write" or action == "create" or action == "modify" then
+        local mode = nn(op.mode)
+        -- git 对象库：目标已存在即内容相同（幂等），跳过写入。
+        if gc == "object" and uv.fs_stat(path) then
+          -- skip
+        elseif blob then
+          local ok, e = copy_blob(blob, path, mode)
+          if not ok then stage, werr = "write", e end
+        else
+          if mode == nil then
+            local st = uv.fs_stat(path)
+            mode = st and (st.mode % 4096) or 420
+          end
+          local ok, e = write_atomic(path, nn(op.content) or "", mode)
+          if not ok then stage, werr = "write", e end
+        end
+      elseif action == "delete" then
+        uv.fs_unlink(path) -- 不存在视为成功
+      elseif action == "rmdir" then
+        local ok, e = uv.fs_rmdir(path)
+        if not ok and not tostring(e or ""):lower():find("not found", 1, true) then
+          stage, werr = "rmdir", e
+        end
+      elseif action == "mkdir" then
+        mkdirp(path)
+        local mode = nn(op.mode)
+        if mode then pcall(uv.fs_chmod, path, mode) end
+      end
+      if stage then
+        if perm_error(werr) then
+          return { status = "needs_root", reason = "WRITE_REQUIRES_ROOT: " .. path, path = path }
+        end
+        local pref = (stage == "write") and "WRITE_FAILED: " or (stage .. "_FAILED: ")
+        return { status = "error", reason = pref .. path .. " " .. tostring(werr), path = path }
+      end
+    end
+  end
+  return { status = "ok" }
+end
+
+--- 把工作线程返回结果映射为发布结果。
+--- @param res table|nil
+--- @return table
+local function _worker_pub(res)
+  res = res or {}
+  if res.status == "conflict" then
+    return { ok = false, state = "CONFLICT", reason = res.reason }
+  elseif res.status == "needs_root" then
+    return { ok = false, state = "NEEDS_ROOT", reason = res.reason }
+  elseif res.status == "secret_unresolved" then
+    return { ok = false, state = "FAILED", reason = res.reason }
+  end
+  return { ok = false, state = "FAILED", reason = res.reason or "PUBLISH_FAILED" }
+end
+
+--- CAS 发布候选（异步）：校验在主线程，CAS 与写入经 `utils.work` 分块并行执行。
+--- 两阶段：先并行 CAS（只读，任一冲突即中止，绝不部分写入），全部通过后并行写入。
+--- 提权（allow_root / root+run_as 降权）、顺序敏感（git 原子组/删除）或线程池不可用时，
+--- 回落同步 `M.publish`（主线程），语义完全一致。
+--- @param candidate table
+--- @param opts table|nil
+--- @return Deferred resolve(table { ok, state, reason?, receipt? })
+function M.publish_async(candidate, opts)
+  opts = opts or {}
+  local async = require("NeoAI.utils.async")
+  local invalid = _publish_validate(candidate)
+  if invalid then return async.resolve(invalid) end
+  local files = _apply_order(candidate.files or {})
+  local work = require("NeoAI.utils.work")
+  if not work.available() or opts.allow_root == true or _needs_privileged_writer()
+    or not _order_insensitive(files) then
+    return async.resolve(M.publish(candidate, opts))
+  end
+  -- 出沙箱解密预检（主线程，仅内嵌内容；blob 内容在写入阶段按块读取并解密预检）。
+  local secret = require("NeoAI.sandbox.secret")
+  local runtime = require("NeoAI.sandbox.runtime")
+  local specs = {}
+  for i, f in ipairs(files) do
+    local spec = {
+      path = f.path, action = f.action, mode = f.mode, link = f.link,
+      blob = f.blob, large = f.large, content = (not f.blob) and f.content or nil,
+      git_class = f.git_class or runtime.git_path_class(f.path),
+      base_type = f.base_type, before_hash = f.before_hash, before_sig = f.before_sig,
+    }
+    if (f.action == "create" or f.action == "modify") and not f.link and not f.large
+      and not f.blob and spec.content ~= nil then
+      local _, unresolved = secret.detokenize(spec.content)
+      if unresolved > 0 then
+        return async.resolve({ ok = false, state = "FAILED", reason = "SECRET_UNRESOLVED: " .. f.path })
+      end
+    end
+    specs[i] = spec
+  end
+  local cas_mode = require("NeoAI.kernel.config_store").get("tools.sandbox.review.cas_mode") or "hash"
+  local cap = _max_file_bytes()
+  local chunks = _chunk_list(specs, _work_chunk_files())
+  local limit = _work_parallelism()
+  local sha_src = require("NeoAI.utils.sha256").source
+  --- 按阶段把规格物化为写操作：CAS 阶段剥离内容；写入阶段读取非大文件 blob 并解密。
+  --- @param spec table
+  --- @param phase string
+  --- @return table { op? , error? }
+  local function materialize(spec, phase)
+    local op = {
+      path = spec.path, action = spec.action, mode = spec.mode, link = spec.link,
+      git_class = spec.git_class, base_type = spec.base_type,
+      before_hash = spec.before_hash, before_sig = spec.before_sig,
+    }
+    if phase == "write" and spec.link == nil
+      and (spec.action == "create" or spec.action == "modify") then
+      if spec.large then
+        op.blob = spec.blob -- 大文件按文件复制，不做 token 化
+      elseif spec.blob then
+        local raw = _read(spec.blob) or ""
+        local _, unresolved = secret.detokenize(raw)
+        if unresolved > 0 then return { error = "SECRET_UNRESOLVED: " .. spec.path } end
+        op.content = secret.detokenize(raw)
+      else
+        op.content = secret.detokenize(spec.content or "")
+      end
+    end
+    return { op = op }
+  end
+  local function run_phase(phase)
+    return work.batched(chunks, limit, function(spec_chunk)
+      local payload_ops = {}
+      for i, spec in ipairs(spec_chunk) do
+        local m = materialize(spec, phase)
+        if m.error then
+          return async.resolve({ status = "secret_unresolved", reason = m.error, path = spec.path })
+        end
+        payload_ops[i] = m.op
+      end
+      return work.run_codec(_publish_worker, {
+        ops = payload_ops, phase = phase, cas_mode = cas_mode, max_file_bytes = cap,
+      }, sha_src)
+    end)
+  end
+  -- 阶段一：只读 CAS（并行）。任一冲突立即返回，尚未产生任何写入。
+  return run_phase("cas"):then_(function(results)
+    for _, r in ipairs(results or {}) do
+      if not (r and r.status == "ok") then return _worker_pub(r) end
+    end
+    -- 阶段二：写入（并行；CAS 已在阶段一通过，不再重复读取）。
+    return run_phase("write"):then_(function(results2)
+      for _, r in ipairs(results2 or {}) do
+        if not (r and r.status == "ok") then return _worker_pub(r) end
+      end
+      -- 已发布：失效暂存副本 + 数据流账本（主线程维护状态）。
+      for _, f in ipairs(candidate.files or {}) do
+        M.invalidate(f.path)
+        if f.action == "create" or f.action == "modify" then
+          pcall(function() require("NeoAI.sandbox.secret_flow").record("commit", { path = f.path }) end)
+        end
+      end
+      local receipt = {
+        operation_id = "op_" .. (candidate.candidate_digest or ""):gsub("[^%w]", ""),
+        candidate_digest = candidate.candidate_digest,
+        old_version = opts.expected_base,
+        new_version = candidate.candidate_digest,
+        target = "workspace",
+        published_at = os.time(),
+        file_count = #(candidate.files or {}),
+      }
+      return { ok = true, state = "COMMITTED", receipt = receipt }
+    end, function(e)
+      -- 写入阶段基础设施错误：可能已有部分写入，如实报失败，不重跑（避免 create 冲突）。
+      return { ok = false, state = "FAILED",
+        reason = "PUBLISH_WORKER_ERROR: "
+          .. tostring(type(e) == "table" and (e.message or e.kind) or e) }
+    end)
+  end, function(e)
+    -- CAS 阶段基础设施错误：尚未写入，回落同步发布（主线程），保证语义一致。
+    require("NeoAI.kernel.logger").warn("[sandbox] 异步发布回落同步: %s",
+      tostring(type(e) == "table" and (e.message or e.kind) or e))
+    return M.publish(candidate, opts)
+  end)
+end
+
+--- 收集候选内容磁盘化任务：create/modify 的非大文件内容改存 blob（内容寻址）。
+--- 内容来自工作区暂存副本（已由 merge 写入，可能含 token），按文件复制、不读入 Lua 内存。
+--- 暂存副本缺失时该文件保留内嵌内容（正确性优先）。
+--- @param cand table
+--- @return table jobs { { f, src, blob, mode } }
+local function _blobify_jobs(cand)
+  local store = require("NeoAI.sandbox.store")
+  local jobs = {}
+  for _, f in ipairs(cand.files or {}) do
+    if type(f) == "table" and not f.blob and f.link == nil
+      and (f.action == "create" or f.action == "modify") then
+      local ws = state.workspace[f.path]
+      local staged = (ws and not ws.deleted and ws.staged) or nil
+      local st = staged and vim.uv.fs_stat(staged)
+      local blob = store.blob_path(f.after_hash or f.path)
+      if blob then
+        if st and st.type == "file" then
+          jobs[#jobs + 1] = { f = f, src = staged, blob = blob, mode = f.mode }
+        elseif f.content ~= nil then
+          -- 暂存副本尚未建立（命令捕获、包内容）：直接把内嵌内容写入 blob。
+          jobs[#jobs + 1] = { f = f, content = f.content, blob = blob, mode = f.mode }
+        end
+      end
+    end
+  end
+  return jobs
+end
+
+--- 同步内容磁盘化（少量文件，如 fs_write 工具路径）：复制暂存副本到 blob，候选条目改记 blob。
+--- @param cand table
+--- @return table cand
+function M.blobify(cand)
+  local fs = require("NeoAI.utils.fs")
+  for _, j in ipairs(_blobify_jobs(cand)) do
+    fs.ensure_dir(vim.fn.fnamemodify(j.blob, ":h"))
+    local ok
+    if j.src then ok = fs.copy_file(j.src, j.blob)
+    else ok = fs.write_file(j.blob, j.content or "") end
+    if ok then
+      if j.mode then pcall(vim.uv.fs_chmod, j.blob, j.mode) end
+      j.f.blob = j.blob
+      j.f.content = nil
+    end
+  end
+  return cand
+end
+
+--- 异步内容磁盘化（大量文件，如 run_command 捕获）：复制/写入经线程池分块并行。
+--- @param cand table
+--- @return Deferred resolve(cand)
+function M.blobify_async(cand)
+  local async = require("NeoAI.utils.async")
+  local jobs = _blobify_jobs(cand)
+  if #jobs == 0 then return async.resolve(cand) end
+  local function finalize()
+    for _, j in ipairs(jobs) do
+      if vim.uv.fs_stat(j.blob) then
+        j.f.blob = j.blob
+        j.f.content = nil
+      end
+    end
+    return cand
+  end
+  local copy_jobs, write_jobs = {}, {}
+  for _, j in ipairs(jobs) do
+    if j.src then
+      copy_jobs[#copy_jobs + 1] = { src = j.src, dst = j.blob, kind = "f", mode = j.mode }
+    else
+      write_jobs[#write_jobs + 1] = { path = j.blob, mode = j.mode, content = j.content }
+    end
+  end
+  local work = require("NeoAI.utils.work")
+  if not work.available() then
+    local fs = require("NeoAI.utils.fs")
+    for _, j in ipairs(copy_jobs) do
+      fs.ensure_dir(vim.fn.fnamemodify(j.dst, ":h"))
+      fs.copy_file(j.src, j.dst)
+      if j.mode then pcall(vim.uv.fs_chmod, j.dst, j.mode) end
+    end
+    for _, w in ipairs(write_jobs) do
+      fs.ensure_dir(vim.fn.fnamemodify(w.path, ":h"))
+      fs.write_file(w.path, w.content or "")
+      if w.mode then pcall(vim.uv.fs_chmod, w.path, w.mode) end
+    end
+    return async.resolve(finalize())
+  end
+  local promises = {}
+  if #copy_jobs > 0 then
+    promises[#promises + 1] = work.run(_rotate_copy_worker, _encode_copy_jobs(copy_jobs))
+  end
+  if #write_jobs > 0 then
+    promises[#promises + 1] = work.batched(_chunk_list(write_jobs, _work_chunk_files()),
+      _work_parallelism(), function(chunk)
+        return work.run(_stage_write_worker, _encode_stage_writes(chunk))
+      end)
+  end
+  return async.all(promises):then_(function()
+    return finalize()
+  end)
 end
 
 --- 递归修复目录树权限，使后续递归删除可进入。
@@ -3062,6 +3759,7 @@ function M.reset(timeout_ms)
   state.seeded = {}
   state.version = 0
   state.rotation = nil
+  state.cand_levels = nil
 end
 
 return M

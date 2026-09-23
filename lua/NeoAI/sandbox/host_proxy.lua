@@ -752,16 +752,22 @@ function M.drain_records()
   return out
 end
 
---- 记录摘要（人类可读）
+--- 记录摘要（人类可读）。仅回传真正需要关注的事件（**拦截** / 上游连接失败）：软件源自动放行
+--- （`allow_source`）、本机白名单/内部端口（`allow_local`）与用户已同意/策略放行（`allow`）不再
+--- 回传，避免 `pip`/`uv`/`npm` 等大量正常连接把「…[http]放行」刷进命令结果。
 --- @return string|nil
 function M.summary()
   local recs = M.drain_records()
   if #recs == 0 then return nil end
   local parts = {}
   for _, r in ipairs(recs) do
-    parts[#parts + 1] = ("%s:%d[%s]%s"):format(
-      r.host, r.port, r.proto, r.decision == "block" and "已拦截" or "放行")
+    if r.decision == "block" then
+      parts[#parts + 1] = ("%s:%d[%s]已拦截"):format(r.host, r.port, r.proto)
+    elseif r.decision == "error" then
+      parts[#parts + 1] = ("%s:%d[%s]连接失败"):format(r.host, r.port, r.proto)
+    end
   end
+  if #parts == 0 then return nil end
   return "[NeoAI] 网络访问过滤：" .. table.concat(parts, "，")
     .. "（本机地址经代理拦截；裸 TCP 不经代理不受此层约束）"
 end
@@ -779,6 +785,11 @@ end
 --- 测试/内部：软件源判定
 function M._is_package_source(host)
   return _is_package_source(host)
+end
+
+--- 测试/内部：写入一条访问记录（仅用于验证摘要过滤）
+function M._record_for_test(host, port, proto, decision)
+  _record(host, port, proto, decision)
 end
 
 --- 测试/内部：访问门禁（异步回调 allow/reason）

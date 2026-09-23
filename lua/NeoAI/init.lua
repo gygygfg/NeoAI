@@ -27,6 +27,11 @@ function M.setup(user_config)
   -- 纯函数：合并 + 校验，返回不可变配置
   config_store.load(user_config or {})
 
+  -- 启动早期放大 libuv 线程池：libuv 默认仅 4 个 worker 线程，大量读写文件（命令产物
+  -- 冻结/token 化/落盘）会因此只跑 4 个核。必须在任何 worker/异步任务创建线程池之前调用
+  -- （池大小一旦创建不可再变）；用户已显式设置 UV_THREADPOOL_SIZE 时尊重用户值。
+  require("NeoAI.utils.work").configure_threadpool()
+
   -- Neovim >= 0.13 起由 autoread 自动把外部改动的文件重载进 buffer，
   -- 替代内置工具写盘后的手动缓冲区同步；更早版本走 sync_buffer_from_disk。
   if vim.fn.has("nvim-0.13") == 1 then

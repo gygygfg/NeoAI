@@ -248,7 +248,8 @@ sandbox = {
   },
   max_file_bytes = 8 * 1024 * 1024, -- 单文件内容内嵌候选上限（字节）；超过则内容复制为 blob（候选只记 blob 路径 + stat 签名），发布/物化按文件复制，防大文件嵌入 JSON 阻塞主线程；0 = 不限制（全部内嵌）
   work_chunk_files = 128, -- 每个工作线程任务的候选文件数：冻结/哈希/密钥扫描按此分块并发投递到线程池（多核），防大量文件时单核串行；0/缺省 = 128
-  work_parallelism = 4, -- 每批并发提交到线程池的 chunk 数上限（默认 4，与 libuv 线程池一致）：避免一次性排入数百个 chunk job，使脱敏/密钥 token 化/落盘等 UI 关键 job 不必排在队尾；0/缺省 = 4
+  -- 每批并发 chunk 数与 libuv 线程池统一走内部 max(1, 核数-2)（见 utils/host.lua；启动时据此放大
+  -- UV_THREADPOOL_SIZE，用户已显式设置该环境变量时尊重用户值），不再提供配置项
   -- 读取面（默认开）：true 时整机根以**可写 overlay** 方式暴露——以 `/` 为只读 lower、会话私有
   -- upper/work 为可写层（原样挂载、根内任意路径可写），所有写入进 upper 暂存并冻结为候选，
   -- 宿主盘不受影响；仅遮蔽 mask_paths 中的重要配置文件/凭据（~/.ssh、~/.aws、/etc/shadow、
@@ -360,8 +361,10 @@ sandbox = {
   -- 给宿主门面并按真实 stdout/stderr/退出码返回。独立调用由门禁直接路由，脚本/管道调用经入口
   -- 走同一门面；不调用宿主 systemd、也不修改宿主机。支持 simple/exec/oneshot 与
   -- Requires/Wants/After/Before 依赖，展开 `%` 说明符与 `${VAR}`；notify/forking/dbus/idle
-  -- 类型与 User=/Group= 按 best-effort 兼容；socket/timer、模板单元、未知 Type 等明确报错
-  -- （透传清洗后的具体原因）；门面不处理的动词回退 T2/hostop 提案路径。
+  -- 类型与 User=/Group= 按 best-effort 兼容；socket/模板单元、未知 Type 等明确报错
+  -- （透传清洗后的具体原因）；门面不处理的动词回退 T2/hostop 提案路径。另支持 kill -s、
+  -- show --property、Restart=/MemoryMax/CPUQuota（自动重启 + cgroup 映射）、.timer 单元与
+  -- systemd-run --on-active（会话内调度）、reset-failed（清除失败态/degraded）。
   systemd = {
     enabled = true,          -- 总开关
     mode = "facade",         -- facade（默认）：沙箱内处理
@@ -401,7 +404,7 @@ sandbox = {
     --   "allow"       = 直接放行并记录（旧行为）；
     --   "deny"        = 直接拒绝。
     access = "ask",
-    auto_allow_sources = true,       -- 软件源自动放行（默认开）：pip/uv/npm/go/cargo/apt 等**外部**软件源（PyPI、npm、crates、清华/阿里/中科大等镜像）经代理访问时免弹窗直接放行，避免包安装被网络同意门禁拦截。仅对非本机目标生效（解析到本机或解析失败仍拒绝，SSRF 防护不削弱）；access="deny" 时仍拒绝
+    auto_allow_sources = true,       -- 软件源自动放行（默认开）：pip/uv/npm/go/cargo/apt 等**外部**软件源（PyPI、npm、crates、清华/阿里/中科大等镜像）经代理访问时免弹窗直接放行，避免包安装被网络同意门禁拦截。仅对非本机目标生效（解析到本机或解析失败仍拒绝，SSRF 防护不削弱）；access="deny" 时仍拒绝；自动放行不回传命令结果（仅回传拦截/失败）
     extra_package_sources = {},      -- 额外软件源域名后缀（私有源/自建镜像），如 { "pypi.mycorp.com" }；子域自动匹配
     -- 沙箱外部命令代理策略：strip（默认，不把宿主代理传入沙箱，如 mihomo 只代理 opencode 自身，
     -- 避免宿主 HTTPS_PROXY=127.0.0.1:7890 在沙箱内不可达导致 pip/npm 失败）| passthrough（沿用宿主）|
@@ -482,7 +485,20 @@ sandbox = {
   --           顶部先给出整体安全/不安全结论，不进入聊天界面）。auto=true 时打开待审界面自动
   --           发起审计（默认关闭；集合变化时自动重审）。全局并发上限 max_concurrent（默认 10，
   --           在途请求超出即排队 FIFO），避免 auto 频繁触发时请求风暴。
+  -- 大量文件优化：
+  --   max_display_files：审批窗每个变更单元最多渲染的文件行数（0=不限），超限折叠为一行
+  --     「其余 M 个文件」汇总（映射整单元审批）；避免包安装/git 操作数千文件时开窗/刷新慢。
+  --   refresh_debounce_ms：审批窗刷新防抖（ms），同一窗口内多个沙箱事件合并为一次重绘。
+  --   content_cache_max：按需读取的候选文件内容 LRU 上限（diff 预览用）；内存条目落盘后
+  --     剥离 content，避免暂存大量文件时内存翻倍。
+  --   terminal_cache_max：内存保留的终态（REJECTED/SUPERSEDED/EXPIRED）变更单元上限，
+  --     超限淘汰、按需从磁盘回读（数据不丢）。
+  --   cas_mode：发布 CAS 校验模式 "hash"（默认，最严）|"auto"|"sig"；非默认放宽一致性检出。
+  --   snapshot_cas：撤销保存的快照 CAS "sig"（默认，签名，省 CPU）|"hash"（内容哈希，最严）。
   review = { enabled = true, auto_apply = false, session_auto_approve = false,
+             max_display_files = 200, refresh_debounce_ms = 80,
+             content_cache_max = 64, terminal_cache_max = 200, cas_mode = "hash",
+             snapshot_cas = "sig",
              l3_warning = { enabled = true, package_confirm = true, max_tokens = 256, timeout_ms = 15000 },
              ai_audit = { enabled = true, auto = false, key = "a", max_concurrent = 10,
                           max_diff_chars = 8000, max_user_chars = 4000, max_total_chars = 60000,
@@ -509,6 +525,7 @@ sandbox = {
   --           包管理器时授予；不含 CAP_MKNOD，设备节点由 seccomp 基线硬拦，FIFO 不受影响）。
   packages = {
     mode = "review", -- review（安全安装仅需确认、风险封顶中危 L1；改动软件源/密钥的敏感安装保留 L2）| allow（放行）| deny（拒绝）
+    signature_mode = true, -- 包/生成内容（uv sync 的 .venv、node_modules、site-packages 等）候选冻结改用 mtime/nsec/size 签名替代逐文件内容哈希，并把遮蔽/git/级别判定移入工作线程：数千文件时避免纯 Lua SHA 与主线程 resolve（CPU/界面卡顿源）。代价：同大小且同 mtime 的内容修改不被检出（这些目录本就强制人工复核）。false 回退内容哈希（最强一致性，较慢）
     managers = { "apt", "apt-get", "pip", "pip3", "uv", "conda", "npm", "npx", "pnpm", "yarn", "go", "cargo", "gem", "composer" }, -- 包管理器名单（命令识别）；改动路径特征见 privilege.package_path_manager；敏感安装判定见 privilege.package_sensitive
     roots = { "/usr", "/var", "/etc", "~/.cache", "~/.npm", "~/.nvm", "~/.cargo", "~/.rustup", "~/go", "~/.local" }, -- 包安装可写根（overlay 暂存）。/etc 供 dpkg postinst 写 /etc/ld.so.cache 等；敏感条目仍由 mask_paths 遮蔽
     volatile_paths = { "/var/lib/apt/lists", "/var/cache/apt", "/var/cache/dnf", "/var/cache/yum", "/var/cache/pacman/pkg", "/var/cache/apk", "~/.cache/pip", "~/.cache/uv", "~/.npm/_cacache", "~/.cache/yarn", "~/.cargo/registry/cache", "~/.cache/go-build" }, -- 易变包索引/缓存：冻结候选时跳过（不待审、不发布），避免 apt update 后基线变化触发 BASELINE_CHANGED 使整个安装失败；不影响安装效果（dpkg/status、包文件仍应用）；{} 关闭。勿放 /var/lib/dpkg/status 等状态文件
@@ -527,8 +544,9 @@ sandbox = {
   -- 资源限制（cgroup v2）：默认 dynamic=true，按宿主资源动态推导 CPU/内存/PID 上限，
   -- 防止沙箱内命令吃满整机卡死；静态值 >0 时优先。容器内还会读当前 cgroup 的实际配额
   -- （/proc/self/cgroup 沿父链的 memory.max/cpu.max）并取 min，避免按宿主高估。
-  -- 所有并发任务挂在共享父域下，cpu_global_max 为并发 CPU 总预算（默认 核数-1），
-  -- cpu_cores_max 为单任务配额。fail_closed=false 时 cgroup 不可用则跳过。
+  -- CPU 核数预算统一走内部 max(1, 核数-2)（见 utils/host.lua）：所有并发任务挂在共享父域下，
+  -- 父域总预算与子域单任务配额均由该值推导（容器配额仍会封顶），不再提供配置项。
+  -- fail_closed=false 时 cgroup 不可用则跳过。
   -- delegate_cgroup：在沙箱内把「委派的会话 cgroup 子树」以可写方式挂到 /sys/fs/cgroup，
   -- 使 AI/服务可创建子 cgroup 并写 memory.max/cpu.max（cgroup v2 写隔离）；仅限该子树，
   -- 不污染宿主其它 cgroup；网关模式（ip netns exec）下自动跳过。
@@ -536,7 +554,7 @@ sandbox = {
   -- 与沙箱存储根（候选/待审/证据/服务 overlay）总占用；超限时拒绝写类/进程工具（用量异步
   -- 统计并缓存，不阻塞命令开始）。
   limits = { wall_ms = 60000, dynamic = true, memory_ratio = 0.75, memory_max_bytes = 0,
-    cpu_cores_max = 8, cpu_global_max = 0, pids_max = 8192, memory_bytes = 0, pids = 0, cpu_max = 0,
+    pids_max = 8192, memory_bytes = 0, pids = 0,
     cpu_affinity = "auto", -- 沙箱 CPU 亲和性：auto=绑定到 nvim 当前 CPU 之外的核（避免挤占 nvim）；off/ false=不绑定；"2,3"/"2-3"=显式 cpuset（需 taskset）
     cgroup_base = "/sys/fs/cgroup", fail_closed = false, delegate_cgroup = true,
     disk_bytes = 64 * 1024 * 1024 * 1024 }, -- 64 GiB（0 = 不限）

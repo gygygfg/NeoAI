@@ -431,6 +431,31 @@ tests.suite("sandbox_review", function(_, it)
     services.provide("services.sandbox", saved)
   end)
 
+  it("应用后 reveal_applied 展开「已应用」区使条目可见（不改变默认折叠）", function(t)
+    local services = require("NeoAI.kernel.services")
+    local sr = require("NeoAI.ui.components.sandbox_review")
+    sr.reset()
+    local saved = services.use("services.sandbox")
+    services.provide("services.sandbox", {
+      list_reviews = function() return {} end,
+      list_traces = function() return {} end,
+      list_saved = function()
+        return {
+          { change_set_id = "csRA", tool = "edit_file", apply_state = "APPLIED",
+            saved_files = { { path = "/root/a.txt" } } },
+        }
+      end,
+      apply = function() return { ok = true } end,
+      reject = function() end,
+    })
+    sr.open()
+    t.eq(0, sr.get_foldlevel(), "默认仍整体折叠")
+    sr.reveal_applied()
+    t.eq(1, sr.get_foldlevel(), "reveal 后应展开到区标题一级")
+    sr.close()
+    services.provide("services.sandbox", saved)
+  end)
+
   it("open 仅有越界留痕时也能打开审批窗", function(t)
     local services = require("NeoAI.kernel.services")
     local sr = require("NeoAI.ui.components.sandbox_review")

@@ -365,6 +365,16 @@ function M.list_reviews(filter)
   return review.list(filter)
 end
 
+--- 按需读取某变更单元中单个文件的候选内容（审批 diff 预览用）。
+--- 内存条目落盘后已剥离 content（避免暂存大量文件时内存翻倍），此处按候选摘要惰性读取。
+--- @param id string change_set_id
+--- @param path string
+--- @return string|nil
+function M.content_for(id, path)
+  M.init()
+  return review.content_for(id, path)
+end
+
 --- 待审数量
 --- @return number
 function M.pending_count()
@@ -440,6 +450,16 @@ function M.apply(id, opts)
   return review.apply(id, opts)
 end
 
+--- 应用变更单元（异步）：CAS + 写入在线程池分块执行，主线程不被大量文件落盘阻塞。
+--- 提权/顺序敏感/线程池不可用时内部回落同步发布。返回 Deferred（结果同 `apply`）。
+--- @param id string
+--- @param opts table|nil
+--- @return Deferred
+function M.apply_async(id, opts)
+  M.init()
+  return review.apply_async(id, opts)
+end
+
 --- 撤销/重做保存：把真实文件与保存时保留的原文件快照交换（可反复切换）
 --- @param id string change_set_id
 --- @param opts table|nil { allow_root?, prefer_sudo?, force? }
@@ -458,7 +478,9 @@ function M.list_saved()
     if item.snapshot_id and (item.apply_state == review.APPLY.APPLIED
         or item.apply_state == review.APPLY.REVERTED) then
       -- 附加快照文件清单（选择性应用时 item.files 可能含未应用文件）。
-      local snap = store.read_snapshot(item.snapshot_id)
+      -- 用元数据（剥离原文件内容）而非完整快照：避免每次开窗/刷新把每个已保存项的
+      -- 原始内容全量解码进内存。
+      local snap = store.read_snapshot_meta(item.snapshot_id)
       local files = {}
       for _, e in ipairs((snap and snap.files) or {}) do
         files[#files + 1] = { path = e.path, action = e.action, side = e.side }

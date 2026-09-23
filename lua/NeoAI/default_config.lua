@@ -529,12 +529,11 @@ local DEFAULT_CONFIG = {
       -- 避免把 apt/pkgcache.bin、缓存归档、镜像层等超大文件嵌入候选 JSON 而阻塞主线程 / 撑爆磁盘。
       -- 0 = 不限制（全部内嵌）。
       max_file_bytes = 8 * 1024 * 1024,
-      -- 每个工作线程任务的候选文件数：冻结/哈希按此分块并发提交到线程池（默认 4 线程），
+      -- 每个工作线程任务的候选文件数：冻结/哈希按此分块并发提交到线程池，
       -- 使 npm/cargo 等产生大量文件的命令用满多核而非单核串行。0/缺省 = 128。
+      -- 每批并发 chunk 数与 libuv 线程池统一走内部 `max(1, 核数-2)`（见 utils/host.lua，
+      -- 启动时据此放大 `UV_THREADPOOL_SIZE`），不再提供配置项。
       work_chunk_files = 128,
-      -- 每批并发提交到线程池的 chunk 数上限（默认 4，与 libuv 线程池一致）：避免一次性
-      -- 排入数百个 chunk job，使后续 UI 关键 job（脱敏/密钥 token 化/落盘）不必排在队尾。
-      work_parallelism = 4,
       -- 在隔离环境内遮蔽的宿主敏感路径（安全默认）：目录以空 tmpfs 遮蔽，
       -- 文件/socket 以 /dev/null 覆盖。含 docker.sock（= 宿主 root）、容器数据、
       -- 编排器/面板/D-Bus 通道、宿主凭据目录，以及宿主身份/日志/命令历史等读取面泄露项。
@@ -830,8 +829,12 @@ local DEFAULT_CONFIG = {
       -- 转发给宿主门面后按真实 stdout/stderr/退出码返回。独立调用由门禁直接路由；脚本/管道调用
       -- 经入口走同一门面，行为与独立调用完全一致。不调用宿主 systemd、也不修改宿主机。支持
       -- simple/exec/oneshot 与 Requires/Wants/After/Before 依赖，展开 `%` 说明符与 `${VAR}`；
-      -- notify/forking/dbus/idle 类型与 User=/Group= 按 best-effort 兼容；socket/timer、模板单元、
+      -- notify/forking/dbus/idle 类型与 User=/Group= 按 best-effort 兼容；socket/模板单元、
       -- 未知 Type 等明确报错（透传清洗后的具体原因）；门面不处理的动词回退 T2/hostop 提案路径。
+      -- 另支持：`kill -s`（向载荷进程树发信号）、`show --property`（含 Restart/RestartUSec/
+      -- NRestarts/MemoryMax/MemoryCurrent/CPUQuota 等）、`Restart=/RestartSec=` 自动重启与
+      -- MemoryMax/CPUQuota 的 cgroup 映射、`.timer` 单元与 `systemd-run --on-active`（会话内
+      -- 宿主事件循环调度）、`reset-failed`（清除失败态/degraded）。
       systemd = {
         enabled = true, -- 总开关
         mode = "facade", -- facade（默认）：沙箱内处理；其余值保留给未来实现
@@ -864,9 +867,31 @@ local DEFAULT_CONFIG = {
       review = {
         enabled = true, -- 效果类候选自动进入待审队列
         auto_apply = false, -- true 时任务授权内自动应用（默认关闭，需用户确认）
+        -- 审批悬浮窗每个变更单元最多渲染的文件行数：包安装/git 操作可达数千文件，
+        -- 即使默认折叠也会为每个文件生成行字符串、高亮与行→目标映射，堆积时开窗/刷新很慢。
+        -- 超限的文件不逐行渲染，改为一行「其余 M 个文件」汇总（头行一键整单元应用/拒绝不受影响）。
+        -- 0 = 不限制（全部渲染）。
+        max_display_files = 200,
+        -- 审批窗刷新防抖（ms）：捕获/冻结可在一瞬间产生大量沙箱事件，逐事件重绘会卡主线程；
+        -- 同一窗口内的多次事件合并为一次重绘。
+        refresh_debounce_ms = 80,
         -- AI 新会话自动审批（默认关闭）：开启后 L0/L1 风险自动应用，L2+ 与包/密钥仍待审。
         -- 目的：即便仅靠本地模型的智能水平，也能在写入保护下管理好 agent 行为。
         session_auto_approve = false,
+        -- 内存中保留的「终态」变更单元上限（REJECTED/SUPERSEDED/APPLIED/REVERTED）：
+        -- 待审/已应用堆积到数百上千时，state.items 会长期驻留全部单元（含文件条目），
+        -- 超限的终态项从内存淘汰，`get`/`list` 按需从磁盘回读（数据不丢）。
+        terminal_cache_max = 200,
+        -- 按需读取的候选文件内容 LRU 上限（diff 预览/合并回退用）：避免为展示一两个文件
+        -- 而把整候选（可能数百 MB）常驻内存。
+        content_cache_max = 64,
+        -- 发布 CAS 校验模式："hash"（默认，逐文件整读+哈希，最强一致性）|
+        -- "auto"（超大文件/blob 用 mtime/size 签名，其余哈希）| "sig"（全部用签名，最快）。
+        -- 非默认值放宽了「同尺寸同 mtime 内容变化」的检出，仅在明确知晓影响时使用。
+        cas_mode = "hash",
+        -- 撤销保存的快照 CAS 模式："sig"（默认，用真实文件 mtime/size 签名，省去应用后逐文件
+        -- 读取+哈希的 CPU 开销）| "hash"（逐文件内容哈希，最强一致性）。
+        snapshot_cas = "sig",
         -- L3（critical）操作二次确认：首次 <CR> 时由 AI 生成后果警告并自动打开 diff，
         -- 需在 diff 内再次确认才真正应用；AI 不可用时回退规则警告，不阻断。
         -- `package_confirm=true` 时，L2 的包安装/敏感安装（apt-key、gpg --import、改软件源等）
@@ -922,6 +947,12 @@ local DEFAULT_CONFIG = {
       --   头行标注「包安装 <管理器>: <包名>」，可整包一次应用（privilege.package_info）。
       packages = {
         mode = "review", -- review（安全安装仅需确认、风险封顶中危）| allow（全部放行）| deny（全部拒绝）
+        -- 包/生成内容（uv sync 的 .venv、node_modules、site-packages 等）候选冻结使用
+        -- mtime/nsec/size 签名代替逐文件内容哈希，并把遮蔽/git/级别判定移入工作线程：
+        -- 数千文件时避免纯 Lua SHA 与主线程 resolve（显著的 CPU/界面卡顿源）。
+        -- 代价：同大小且同 mtime 的内容修改不被检出（这些目录本就强制人工复核）。
+        -- 设为 false 回退内容哈希（最强一致性，但大量文件时较慢）。
+        signature_mode = true,
         -- 放宽风险与提示：普通安装（apt/pip/npm install …）不因写入 /usr /var /etc 升为高危，
         -- 也不触发密钥误报；仅当命令改动**第三方软件源**（add-apt-repository / sources.list /
         -- --add-repo / --index-url / npm --registry 等）或**密钥/信任链**（apt-key / trusted.gpg /
@@ -1069,13 +1100,13 @@ local DEFAULT_CONFIG = {
         dynamic = true,
         memory_ratio = 0.75, -- 内存上限 = 宿主总量 * ratio（大依赖树/构建留足余量，避免误 OOM）
         memory_max_bytes = 0, -- 绝对内存上限（>0 时取 min；0 = 不额外限制）
-        cpu_cores_max = 8, -- 单任务 CPU 配额上限（核）
-        cpu_global_max = 0, -- 所有并发沙箱任务的 CPU 总预算（核；0 = max(1, 核数-1)，留 1 核给 nvim）
+        -- 单任务 CPU 配额与并发总预算统一走内部 `max(1, 核数-2)`（见 utils/host.lua），
+        -- 不再提供配置项；父域总预算与子域配额均由该值推导（容器配额仍会封顶）。
         pids_max = 8192, -- PID/线程上限（npm 大依赖树/并行构建会创建大量线程/进程）
         -- 静态显式值（>0 时优先于动态推导）：
         memory_bytes = 0, -- cgroup 内存上限（0 = 用动态值）
         pids = 0, -- cgroup PID 上限（0 = 用动态值）
-        cpu_max = 0, -- cgroup CPU 配额（微秒/100ms；0 = 用动态值，如 50000 = 0.5 CPU）
+        -- CPU 配额无静态覆盖项：始终按内部 `max(1, 核数-2)`（容器配额封顶）推导。
         -- CPU 亲和性：让沙箱进程在 **nvim 当前 CPU 之外**的核上运行，避免与 nvim 抢占同一核。
         --   "auto"（默认）= 绑定到除 nvim 当前 CPU 外的全部核（单核宿主自动跳过）；
         --   "off"/false = 不绑定；"2,3" / "2-3" = 显式 cpuset（需 `taskset`，缺失则跳过）。

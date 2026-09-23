@@ -152,6 +152,13 @@
     原文件内容的快照，均不再主线程同步编码 + fsync。写入期间以内存缓存保证「刚写入即可读回」；
     落盘后丢弃缓存（内存有界）。`sandbox.shutdown` / `store.reset` 前会 `store.flush()` 等待落盘，
     关闭/重置不丢数据、不被迟到写入污染。
+  - **入待审前先确保候选落盘**：`_persist_and_settle` 在 `write_candidate_async` 后有界
+    `store.flush` 再入队；包合并 `_merge_package_item` 写入合并候选后同样先 flush 再丢弃各成员
+    旧候选——否则大候选（含非 ASCII，需线程池校验）的写入可能在进程退出/热重载前未完成、或旧
+    候选先被删而新候选尚不存在，待审项指向不存在的候选，用户应用时报 `CANDIDATE_NOT_FOUND`。
+    `review.apply` 读取候选失败时先 `flush` 重试；若该候选**曾成功写入**（`store.was_written`）
+    且待审项仍持有文件内容，则从待审项条目重建候选并回写后继续应用（记录 `store.root` 诊断）；
+    从未写入的候选仍如实报错，不掩盖真实缺失。
   - **JSON 编码不再主线程深扫**：`json.encode_fast` 直接用 `vim.json`（C 实现），跳过
     `_sanitize_value` 的纯 Lua 全表 UTF-8 深扫（大候选主要卡顿源）；落盘前用 C 级
     `string.find("[\128-\255]")` 快速判定，**纯 ASCII 输出（常见）直接跳过**线程池 UTF-8 校验，
@@ -163,9 +170,11 @@
     写盘重叠；主线程只登记映射与 `fresh` 签名，数千/百万文件时不再单线程逐文件同步写。
   - **捕获的工作区一致性判定在线程内**：`_capture_worker` 接收工作区暂存映射，在线程内完成
     「命令改动是否只是暂存编辑的复现」的内容比对，主线程不再对每个改动文件重读两份内容。
-  - **分块 job 限批提交**：`work.batched` 每批最多 `tools.sandbox.work_parallelism`（默认 4，
-    与 libuv 线程池一致）个在途，避免数百个 chunk job 一次排满队列、饿死后续 UI 关键 job
-    （脱敏 / 密钥 token 化 / 落盘）。
+  - **分块 job 限批提交**：`work.batched` 每批最多内部 `max(1, 核数-2)`
+    （`utils/host.lua`）个在途，避免数百个 chunk job 一次排满队列、饿死后续 UI 关键
+    job（脱敏 / 密钥 token 化 / 落盘）。**libuv 线程池默认仅 4 线程**，启动时经
+    `NeoAI.utils.work.configure_threadpool()` 按同一值放大 `UV_THREADPOOL_SIZE`（须在池首次
+    创建前；用户已显式设置时尊重用户值），否则再多核也只跑 4 个 worker。
   - **会话轮换迁移下线程池**：`rotate_session` 的文件复制（含目录）交给工作线程；暂存访问前经
     `_await_rotation` 等待迁移完成（通常已完成，等待为 0）。长会话未发布改动多时，agentEnd
     不再逐文件主线程复制。
@@ -200,6 +209,59 @@
     `timeout_ms=-1` 的「不限」命令），到时经资源域终止，避免长任务永久占用、工具永不返回。
   - **基准复现**：`require("NeoAI.sandbox.diag").bench_capture({ files = N })` 返回
     物化冷/热与捕获主线程耗时，用于回归对比（会重置沙箱，仅诊断用）。
+- **大量文件进入审批悬浮窗/应用到落盘/暂存内存的优化**（暂存上万文件回归）：
+  - **审批窗渲染上限 + 刷新防抖**：`tools.sandbox.review.max_display_files`（默认 200）限制
+    每个变更单元渲染的文件行数——包安装/git 操作可达数千文件，即使默认折叠也会为每个文件
+    生成行字符串、高亮与「行→目标」映射，堆积时开窗/刷新很慢。超限折叠为一行
+    `… 其余 M 个文件（已折叠；<CR> 应用整单元 / d 拒绝整单元）`，并映射到整单元审批目标
+    （头行/汇总行均可整包应用/拒绝；前 N 个文件仍可单文件审批）。`tools.sandbox.review.refresh_debounce_ms`
+    （默认 80）把同一时间窗内的多个沙箱事件合并为一次重绘，避免捕获风暴期间反复全量重建。
+  - **异步发布（两阶段、线程池）**：`review.apply_async` / `sandbox.apply_async` 把
+    CAS 校验与写入经 `utils.work` 分块并行执行，主线程不再被大量文件的逐文件读取/哈希/fsync
+    阻塞。**阶段一**并行只读 CAS，任一冲突立即中止（**绝不部分写入**）；全部通过后**阶段二**
+    并行写入（保持每文件 fsync 的持久化语义）。提权（`allow_root` / root+run_as 降权、`sudo`）、
+    顺序敏感（git 原子组「对象→普通→指针」、删除「子先于父」）或线程池不可用时，**回落同步
+    `candidate.publish`**（语义完全一致）。审批界面（`<CR>`/`A`/L3 二次确认）默认走异步发布，
+    并在批量应用会话中逐项让出主循环。
+  - **CAS 模式**：`tools.sandbox.review.cas_mode`（`hash` 默认，逐文件整读+哈希，最强一致性；
+    `auto` 对超大文件/blob 用 mtime/size 签名，其余哈希；`sig` 全部用签名，最快）。非默认值
+    放宽了「同尺寸同 mtime 内容变化」的检出，仅在明确知晓影响时使用。
+  - **内存不长期驻留候选内容**：待审项/终态项的 `files[].content` 在落盘后从内存**剥离**
+    （候选内容已单独落盘），审批 diff 预览经 `sandbox.content_for(id, path)` 按需读取
+    （`tools.sandbox.review.content_cache_max`，默认 64 的 LRU）。旧「候选文件丢失时从待审项
+    重建」改为从**沙箱暂存副本**（`candidate.read_path`）恢复。包安装合并（`_merge_package_item`）
+    与组合发布（`_compose`）不再 `vim.deepcopy` 含内容的大候选，改为只读复用/浅拷贝。
+  - **候选内容磁盘化（blob，内容寻址）**：命令捕获的候选内容不再嵌入候选 JSON/常驻内存，而是
+    **按文件复制到实例存储的 `blobs/`**（`candidate.blobify_async`），候选条目只记 `blob` 路径与
+    内容哈希；包/生成内容（`uv sync` 的 `.venv`、`node_modules` 等）在 merge 前即磁盘化，数千
+    文件不再整批读入内存。发布时非大文件 blob 按文件读取并解密后写入，大文件直接按文件复制
+    （不读入 Lua 内存）；`merge_candidate`/物化按文件复制回暂存视图，重启后 blob 随实例存活仍可发布。
+    blob 随实例存储目录在 `store.reset`/实例回收时清理。
+  - **包/生成内容签名模式（`packages.signature_mode`，默认开）**：`uv sync` 的 `.venv`、
+    `node_modules`、`site-packages` 等数千文件候选在冻结时**不读取内容、不做纯 Lua SHA-256**，
+    base 与 after 均改用 `sig:<mtime.sec>:<mtime.nsec>:<size>` 签名（内容直接由内核 `fs_copyfile`
+    复制为 blob），改动判定与发布 CAS 均按签名比较。同大小且同 mtime 的内容修改不再被检出——
+    这些目录本就强制人工复核；设为 `false` 回退内容哈希（最强一致性，但大量文件时明显更慢）。
+  - **遮蔽/git/级别判定移入工作线程**：包候选的「有效遮蔽 / `.git` 分类 / 工作区内外级别」不再由
+    主线程对每个文件 `vim.fn.resolve`/`fnamemodify`，而是经 `utils.work` 在工作线程用原生
+    `vim.uv.fs_realpath` 批量完成（`candidate._classify_paths_worker`），主线程只消费结果；
+    `risk.classify` 直接使用预取级别（`facts.path_levels`）。非包候选仍走原同步路径，行为不变。
+  - **大候选影响/证据聚合**：影响记录（`observe.from_candidate`）超过 `review.max_display_files`
+    时聚合为单条（含动作计数与前 N 条采样路径），避免数万条记录的主线程 JSON 编码；审批界面仍按
+    `cand.files` 全量展示。
+  - **后处理链分段埋点**：开启 `tools.sandbox.diagnostics.enabled` 后，日志分别记录
+    `capture` / `finish` / `persist` 与结算子段 `settle.ephemeral` / `settle.impact` /
+    `settle.secret` / `settle.risk` / `settle.enqueue`，便于定位大量文件时的固定开销段。
+  - **应用与撤销按文件复制、快照磁盘化**：应用前把真实文件**复制到 blob**（`_capture_snapshot`）
+    作为撤销快照，撤销时按文件复制回写——不再把原文件内容嵌入快照 JSON 或常驻内存；撤销 CAS
+    默认用 mtime/size 签名（`tools.sandbox.review.snapshot_cas="sig"`，省去应用后逐文件读取+哈希的
+    CPU；`"hash"` 恢复最强一致性）。
+  - **终态项有界淘汰**：`tools.sandbox.review.terminal_cache_max`（默认 200）限制内存中保留的
+    已拒绝/已被取代（REJECTED/SUPERSEDED/EXPIRED）变更单元；超限项从内存移除，`get`/`list`
+    按需从磁盘回读（数据不丢）。APPLIED/REVERTED 保留（撤销列表依赖）。
+  - **快照元数据与有界缓存**：快照落盘时同时写一份**剥离原文件内容**的元数据副本
+    （`snapshots_meta/`），审批界面列示「已应用」项只读元数据，不再每次开窗把每个已保存项的
+    原始内容全量解码进内存；完整快照读缓存加 LRU 上限（默认 8），避免随保存次数无界占用内存。
 - **按 nvim 进程实例隔离**：每个 nvim 进程使用独立实例存储根
   `<workspace_root>/instances/<pid>_<启动时间>`，待审队列/候选/回执/证据互不共享——同时
   打开两个会话时**不会看到对方的审批**；关闭任一实例只清理自己的暂存，不影响其它实例
@@ -225,11 +287,13 @@
       拒绝；`d` 拒绝该文件（头行则拒绝
       整单元，其余文件保留待审）、`i` 临时关闭审批窗并打开该条目的**修改 diff**
       预览（`q`/`<Esc>` 关闭后自动返回审批窗并恢复光标）；在**越界访问留痕**行按 `i` 则打开
-      该路径的**访问详情**（逐次列出工具 / 类型 / 命令 / 时间，非审批目标）、`u` **撤销/重做保存**、
+      该路径的**访问详情**（逐次列出工具 / 类型 / 命令 / 时间，非审批目标）、`u` **撤销保存（回到待审）**、
       `q`/`<Esc>` 关闭。**窗口打开期间订阅沙箱广播事件自动刷新**（待审入队/应用/拒绝/撤销、
       越界留痕、主机操作等变化即时重绘，同一 tick 内多次事件合并为一次重绘），无需手动刷新。
       **「已应用」区默认折叠**：整区收起（标题行按 `za`/`zo` 展开），展开后每条仍各自收起
-      （先展开区、再展开条目才看到文件列表），刷新后重新收起；**待审条目「头行显示、其余折叠」**：
+      （先展开区、再展开条目才看到文件列表），刷新后重新收起；**应用成功后会将该区自动展开到
+      区标题一级**（`reveal_applied`，条目头行可见、文件仍折叠），使刚应用的条目不再因默认折叠
+      而看似「消失」；**待审条目「头行显示、其余折叠」**：
       头行（工具/风险徽标/文件数/`待审`）保持正常显示并作为整单元审批入口，其后的密钥警告/风险
       原因/git 提示/文件列表默认收起，`za`/`zo` 展开——包安装、git 操作等可达上千文件，折叠
       避免刷屏；越界留痕区不折叠，便于逐条审阅。**命令型变更单元**（`run_command` / 包安装等）
@@ -237,12 +301,12 @@
       高亮；**主机操作的头行与命令行为同一审批目标**（`<CR>` 应用 / `d` 拒绝 / `i` 预览命令），
       光标停在任一行均可操作。
       聊天主窗口内可按 `<leader>ap` 直接触发（`keymaps.chat.sandbox_review`）。
-     - **显示已保存 / 撤销保存**：应用（保存）时保留每个文件的**原文件快照**（真实文件
-       应用前的内容），审批界面底部「已应用（已保存/已撤销，u 撤销/重做保存）」区展示已发布到真实
-       工作区的变更；在条目行按 `u` 把真实文件与快照**交换**——已保存 → 撤销（回滚到应用前
-       内容），已撤销 → 重新保存，可反复切换。交换前做 CAS 校验：真实文件若已被外部改动
-       （哈希不符）则拒绝并报 `CONFLICT`，绝不覆盖用户改动。快照随每进程实例隔离存储
-       （`store` 的 `snapshots/`），随实例目录回收。
+      - **显示已保存 / 撤销保存**：应用（保存）时保留每个文件的**原文件快照**（真实文件
+        应用前的内容），审批界面底部「已应用（已保存，u 撤销保存）」区展示已发布到真实
+        工作区的变更；在条目行按 `u` 把真实文件**回滚到应用前内容**，并把该变更单元**移回
+        「未应用（待审）」区**——用快照中已应用侧内容重建候选、清空快照，可重新审批/应用。
+        回滚前做 CAS 校验：真实文件若已被外部改动（哈希不符）则拒绝并报 `CONFLICT`，绝不覆盖
+        用户改动。快照随每进程实例隔离存储（`store` 的 `snapshots/`），随实例目录回收。
      - **包安装按安装命令合并**：npm/pip/apt 等包安装命令产生的候选在头行标注
        `包安装 <管理器>: <包名>`（`privilege.package_info`），并**按安装命令键
        `package_key`（`<管理器>:<包名列表>`）合并为一个审批单元**——同一安装命令产生的多个
@@ -319,10 +383,12 @@
     否则重开聊天/审批界面会重新显示一个候选已不存在、无法应用的待审项。
 - 选择性应用：`sandbox.apply(id, { files = { ... } })` 只应用指定文件子集（重新冻结组合候选后 CAS）；
   未选中的文件会保留为新的待审变更单元，供用户逐个确认。`sandbox.reject_file(id, path)` 按文件拒绝。
-- **发布前重校验（纵深防御）**：`candidate.publish` 对每个文件重新规范化路径——解析结果与记录
-  路径不一致（`..`/符号链接被引入或替换，如落盘候选被篡改）→ `CONFLICT/PATH_CHANGED`；
-  命中宿主敏感遮蔽路径（`is_masked_path`）→ `FAILED/SANDBOX_MASKED_TARGET`。候选内容即便
-  被本地进程改写也无法写出到未经验证的真实位置。
+- **发布前重校验（纵深防御）**：`candidate.publish` 对每个文件重新规范化路径——**解析祖先**符号
+  链接并折叠 `..`，但**末段按字面**（不跟随叶子软链）；若结果与记录路径不一致（`..` 穿越 / 祖先
+  目录被软链替换，如落盘候选被篡改）→ `CONFLICT/PATH_CHANGED`。末段字面处理使合法叶子软链
+  （如 `uv sync` 生成的 `.venv/bin/python`）不会因解析到 uv 的 Python 安装目录而误报整个变更单元。
+  命中宿主敏感遮蔽路径（`is_masked_path`，仍完整解析并跟随叶子软链）→ `FAILED/SANDBOX_MASKED_TARGET`。
+  候选内容即便被本地进程改写也无法写出到未经验证的真实位置。
 - **冻结时剔除不可发布文件**：`candidate.finish` 在生成候选前剔除两类文件，避免个别文件
   让**整个**变更单元发布失败（如包安装因 apt 索引基线变化而整体回滚）：
   1. **有效遮蔽路径**——按本次 attempt 的 `effective_unmask`（档位提权 + 审批放行 + 可写根）
@@ -659,7 +725,8 @@ stdout/stderr/退出码返回。宿主侧由 `sandbox/systemd_ipc.lua` 以 fs_ev
   调用无法在门禁拆分，改由沙箱内入口经 IPC 转发到同一门面。
 - **支持矩阵（输出/错误/退出码对齐真实 systemctl）**：
   - 动词：`start`/`stop`/`restart`/`status`/`is-active`/`is-enabled`/`is-system-running`/
-    `is-failed`/`show`/`cat`/`daemon-reload`/`list-units`/`list-unit-files`。
+    `is-failed`/`show`/`cat`/`daemon-reload`/`list-units`/`list-unit-files`/`kill`/
+    `list-timers`/`reset-failed`。
   - 成功静默：`start`/`stop`/`restart`/`daemon-reload` 成功时不打印（真实 systemctl 行为）。
   - `is-system-running`/`is-failed` 反映**门面自身运行态**（有失败单元→`degraded`，否则
     `running`；**不查询宿主**，避免把宿主的 `degraded` 泄漏进沙箱、与「健康 systemd」自相
@@ -676,9 +743,27 @@ stdout/stderr/退出码返回。宿主侧由 `sandbox/systemd_ipc.lua` 以 fs_ev
   - **无动词的 `systemctl` 等价于 `list-units`**（真实默认动词）：`systemctl --failed`、
     `systemctl --state=failed`、`systemctl --all` 等过滤选项生效，不再因无动词而回退到
     「默认列出全部 active 单元」。
-  - **`reset-failed`**：门面无持久失败单元，按真实语义幂等成功（不再报
-    `Unknown command verb`）。另有 `get-default`/`set-default`/`show-environment`/
-    `list-timers`/`list-sockets`/`list-jobs`（合成真实风格输出，退出 0）。
+  - **`reset-failed`**：清除失败态（记录于门面会话状态）——之后该单元 `is-active` 回到
+    `inactive`、不再出现在 `--failed`，系统态从 `degraded` 回到 `running`；无参数时清除全部
+    当前失败单元。再次 `start` 也会清除失败态。另有 `get-default`/`set-default`/
+    `show-environment`/`list-sockets`/`list-jobs`（合成真实风格输出，退出 0）。
+  - **`show` 支持 `--property`/`-p`（逗号分隔或重复）与 `--value`**；属性集含真实
+    `Type`/`Restart`/`RestartUSec`/`RestartSec`/`NRestarts`/`MemoryMax`/`MemoryHigh`/
+    `MemoryCurrent`/`CPUQuota`/`CPUQuotaPerSecUSec`/`TimeoutStartUSec`/`TimeoutStopUSec`/
+    `RemainAfterExit`/`LoadState`/`ActiveState`/`SubState` 等。
+  - **`Restart=`/`RestartSec=`（含 `StartLimitBurst`/`StartLimitIntervalSec`）**：非 `no` 时长驻
+    服务进程**意外退出后由 `sandbox.service` 自动重启**（延迟 `RestartSec`，限流后置失败），
+    `NRestarts` 随重启次数累加并经 `show`/`status` 暴露。`Restart=on-failure`/`on-success`/
+    `on-abnormal` 语义按退出码/信号判定。
+  - **`kill`（支持 `-s`/`--signal`，如 `SIGTERM`/`SIGKILL`/`15`）**：向该单元当前载荷进程树
+    发信号（经资源域），不再回退宿主。
+  - **`MemoryMax`/`MemoryHigh`/`CPUQuota`**：解析并进入 `show`；同时映射到该服务的 cgroup
+    资源域（`MemoryMax`→`memory.max`、`CPUQuota=50%`→`cpu.max`），cgroup 不可用时仅报告意图。
+  - **`.timer` 单元（`OnActiveSec`/`OnBootSec`/`OnStartupSec`/`OnUnitActiveSec`/`OnCalendar`
+    关键字与 `*-*-* HH:MM[:SS]`）**：`start`/`stop`/`restart`/`status`/`is-active` 与
+    `list-timers` 均由门面在**会话内**用宿主事件循环调度；到点启动 `Unit=`（默认同名
+    `.service`），重复条件（`OnUnitActiveSec`/`OnCalendar`）继续排程，一次性触发后转 inactive。
+    定时器状态在 `reset`/会话结束时清理，不写宿主。
   - **单元 ExecStart 语义对齐真实 systemd**：展开 systemd 说明符（`%n`/`%N`/`%p`/`%i`/`%u`/
     `%h`/`%t` 等，`%%`→字面 `%`；未知说明符保留原文）；仅展开 `${VAR}`（`$$`→`$`），**不**展开
     裸 `$VAR`（`ExecStart=/bin/sh -c 'i=1; [ $i -lt 2 ]'` 不再被误展开）；argv 逐参数单引号转义后
@@ -724,7 +809,9 @@ stdout/stderr/退出码返回。宿主侧由 `sandbox/systemd_ipc.lua` 以 fs_ev
   `-p WorkingDirectory=/Environment=/Description=`；未给 `--unit` 时自动命名
   `run-r<hex>.service`。`--pipe`/`-P`/`--pty`/`-t`/`--scope` 以前台语义执行并**回传命令输出与
   退出码**（真实无 tty，但不再报「不支持」）。临时单元在 `list-units`/`is-active` 中可见，
-  `--collect` 由服务销毁自动等效。
+  `--collect` 由服务销毁自动等效。`--on-active=`/`--on-calendar=` 建立**瞬态定时器**
+  （`<unit>.timer` + `<unit>.service`），返回 `Running timer as unit: <name>`，到点执行命令并
+  在 `list-timers` 中可见。
 - **`systemd-analyze`（启动分析，路由到门面）**：沙箱内 `/usr/bin/systemd-analyze` 同样由极薄
   入口覆盖并转发到门面。真实 `systemd-analyze` 依赖 system D-Bus 从 PID1 取启动分析（沙箱无
   D-Bus，必然 `Failed to connect to system scope bus`）；门面改为合成**确定性且自洽**的数据：
@@ -742,7 +829,7 @@ stdout/stderr/退出码返回。宿主侧由 `sandbox/systemd_ipc.lua` 以 fs_ev
   若干系统行，`-n <N>` 限制行数），不再落到宿主真实 `journalctl`（后者会输出
   `No journal files were found.`）。各行时间戳**逐条递增**（首尾覆盖 `Logs begin/end`），
   不再所有行共用一个时间点。
-- **明确拒绝（不落宿主机、不回退 hostop）**：`.socket`/`.timer` 等单元、模板/实例化单元、
+- **明确拒绝（不落宿主机、不回退 hostop）**：`.socket` 等单元、模板/实例化单元、
   `Requisite`/`BindsTo`/`PartOf`/`OnFailure` 依赖、未知 `Type=`；以及 `poweroff`/`reboot`/
   `halt`/`kexec`/`suspend` 等宿主电源/内核状态操作。返回真实 systemctl 风格错误（如
   `Failed to poweroff system via logind: Access denied`），不暴露沙箱并发出
@@ -766,15 +853,20 @@ stdout/stderr/退出码返回。宿主侧由 `sandbox/systemd_ipc.lua` 以 fs_ev
   导致安装失败；注入后安装成功，服务不真正启动（沙箱内手动前台运行）。`systemctl --user` 由
   伪造解析器处理（见上）；`maintscript_stubs=false` 可关闭 policy-rc.d。**入口本身**由
   `systemd.enabled` 控制，对**所有**进程命令生效，与 `maintscript_stubs` 无关。
-- **enable/disable 软链暂存**：`stage_install`（默认开）时，系统级 `systemctl enable/disable`
-  解析单元 `[Install] WantedBy/RequiredBy`，把软链变更（enable 建
+- **enable/disable 软链暂存与虚拟视图**：`stage_install`（默认开）时，系统级
+  `systemctl enable/disable` 解析单元 `[Install] WantedBy/RequiredBy`，把软链变更（enable 建
   `/etc/systemd/system/<target>.wants/<unit>` 链、disable 删链）经 `candidate.stage_link` /
   `stage_delete` 暂存为待审候选，审批后应用；不落宿主机。返回真实 `Created symlink …` /
-  `Removed "…"` 文本。用户级 `systemctl --user enable/disable` 同样由门面的**伪造解析器**处理，
-  软链暂存到用户单元根（见「伪造 systemd --user 解析器」）。
+  `Removed "…"` 文本。由于软链在审批前尚不存在，门面维护**会话内待审虚拟视图**：enable 后
+  `is-enabled`/`list-unit-files` 立即报 `enabled`、disable 后立即报 `disabled`（与真实软链
+  出现后一致），`reset`/会话结束时清空。用户级 `systemctl --user enable/disable` 同样由门面的
+  **伪造解析器**处理，软链暂存到用户单元根（见「伪造 systemd --user 解析器」）。
 - **已知限制**：模板/实例化单元（`foo@bar.service`）不支持；`[Install] Also=` 暂不展开；
   `notify`/`forking`/`dbus` 等类型虽可启动，但**不做 READY 通知与 daemonize 子进程跟踪**（按
-  simple 语义 best-effort），故与真实 systemd 的可观测行为存在差异（已知可识别差异）。
+  simple 语义 best-effort），故与真实 systemd 的可观测行为存在差异（已知可识别差异）。定时器为
+  **会话内调度**：仅在门面宿主进程存活期间有效，不跨重启持久化（不写宿主计时器）；门面启动的
+  服务进程运行在嵌套命名空间内，故沙箱内 `ps`/`pgrep` **看不到**这些进程（但 `status`/
+  `journalctl`/`is-active` 一致），这是与真实 systemd 的已知可识别差异。
 
 ### 伪造 systemd --user 解析器（`tools.sandbox.systemd.user`）
 
@@ -789,7 +881,8 @@ stdout/stderr/退出码返回。宿主侧由 `sandbox/systemd_ipc.lua` 以 fs_ev
   可用 `tools.sandbox.systemd.user_unit_roots` 覆盖。
 - **解析**：复用系统级门面同一套 `.service` 解析（`[Unit]` 依赖、`[Service]` `Type`/`ExecStart`/
   说明符与环境变量展开、`Environment`/`WorkingDirectory`；类型支持同系统级门面）。`start` 把 `ExecStart`
-  交给 `sandbox.service` 在沙箱内启动；`is-active`/`status` 由服务状态合成。
+  交给 `sandbox.service` 在沙箱内启动；`is-active`/`status` 由服务状态合成。系统级门面的
+  `.timer` 调度、`kill`、`Restart=` 自动重启与 `show --property` 能力对 `--user` 同样适用。
 - **命名空间隔离**：用户单元的服务 key 前缀为 `user-unit:`，与系统级 `unit:` 隔离，同名单元互不干扰。
 - **enable/disable 软链暂存**：`systemctl --user enable/disable` 把软链变更（enable 建
   `~/.config/systemd/user/<target>.wants/<unit>` 链、disable 删链）经 `candidate.stage_link` /
@@ -819,8 +912,9 @@ stdout/stderr/退出码返回。宿主侧由 `sandbox/systemd_ipc.lua` 以 fs_ev
   cgroup **可写叶子**」bind 到 `/sys/fs/cgroup`（`cgroup.prepare_delegated`），使 AI/服务可创建
   子 cgroup 并写 `memory.max`/`cpu.max` 等；上层限额层不可写，故写入无法突破会话限额、也不污染
   宿主其它 cgroup。网关模式（`ip netns exec`）下该 bind 源不可解析，自动跳过。
-- **资源上限放宽**：默认 `memory_ratio=0.75`、`cpu_cores_max=8`、`pids_max=8192`，避免 npm 大依赖
-  树/并行构建触发 OOM（`pids.max` 过小会表现为进程创建失败/OOM）。
+- **资源上限放宽**：默认 `memory_ratio=0.75`、CPU 核数预算 `max(1, 核数-2)`（内部统一推导，
+  不可配置）、`pids_max=8192`，避免 npm 大依赖树/并行构建触发 OOM（`pids.max` 过小会表现为
+  进程创建失败/OOM）。
 
 ### 137 / OOM 归因与诊断（`tools.sandbox.diagnostics`）
 
@@ -1169,9 +1263,11 @@ seccomp（含设备节点屏障）**——沙箱内进程看到的是一份「�
   对**外部**软件源（PyPI/pythonhosted、npm/npmmirror、crates/rust-lang、proxy.golang.org/goproxy、
   Maven、Debian/Ubuntu/Alpine/Docker 源，以及 `tuna.tsinghua.edu.cn`、`mirrors.aliyun.com`、
   `mirrors.ustc.edu.cn` 等公共镜像）经代理访问时**免弹窗直接放行**（记录为 `allow_source`）。
-  仅当目标判定为**非本机**时生效：解析到本机、或 DNS 解析失败（fail-closed）仍按本机拒绝，
-  SSRF 防护不削弱；`access="deny"` 时仍拒绝。可用 `network.extra_package_sources` 追加私有源
-  域名后缀（子域自动匹配）；`auto_allow_sources=false` 关闭该放行。
+  自动放行**不回传命令结果**（不显示「…[http]放行」，避免包安装大量正常连接刷屏；仅在内部记录/
+  证据中留痕），命令结果只回传**拦截/上游失败**。仅当目标判定为**非本机**时生效：解析到本机、
+  或 DNS 解析失败（fail-closed）仍按本机拒绝，SSRF 防护不削弱；`access="deny"` 时仍拒绝。可用
+  `network.extra_package_sources` 追加私有源域名后缀（子域自动匹配）；`auto_allow_sources=false`
+  关闭该放行。
 - **边界（重要）**：这是**应用层**过滤。**不认代理的裸 TCP**（`nc`/`ssh`/数据库客户端、
   忽略代理变量的工具）在共享 netns 下可直连宿主本机，不受此层约束。要硬拦截裸 TCP 只能：
   root + iptables/nft（按目的地过滤），或无 root 的 `slirp4netns`/`passt`（原生用户态
@@ -1281,7 +1377,7 @@ require("NeoAI").setup({
         deny_tools = {},             -- 硬拒绝工具名（确认亦不可覆盖）
         rules = {},                  -- 受限 Lua 规则函数数组
       },
-      limits = { wall_ms = 60000, dynamic = true, memory_ratio = 0.75, cpu_cores_max = 8, cpu_global_max = 0, pids_max = 8192 },
+      limits = { wall_ms = 60000, dynamic = true, memory_ratio = 0.75, pids_max = 8192 },
     },
   },
 })
@@ -1421,8 +1517,9 @@ run_command overlay 候选捕获（含删除 whiteout 捕获与尝试目录清�
 
 每次外部进程尝试使用独立资源域 `tools.sandbox.limits`。默认 `dynamic = true`：按宿主资源
 动态推导上限——内存 = `MemTotal * memory_ratio`（默认 0.75，受 `memory_max_bytes` 上限约束）、
-CPU = `min(核数, cpu_cores_max)` 个核（默认 8）、PID = `pids_max`（默认 8192）；静态
-`memory_bytes`/`pids`/`cpu_max`（>0）优先于动态推导。
+CPU = `max(1, 核数-2)` 个核（内部统一推导，见 `utils/host.lua`，不可配置）、
+PID = `pids_max`（默认 8192）；静态
+`memory_bytes`/`pids`（>0）优先于动态推导；CPU 配额无静态覆盖项。
 
 **进程归属与越限语义**：载荷通过 `cgroup.join_prefix` 加入资源域，而该前缀被**前置在 `bwrap`
 之前**执行（`sh -c 'echo $$ > cgroup.procs; exec "$@"' sh bwrap …`）——写入的是宿主 PID，
@@ -1436,13 +1533,13 @@ CPU = `min(核数, cpu_cores_max)` 个核（默认 8）、PID = `pids_max`（默
 会把 `memory.max` 设得比容器实际可用还高（形同虚设，OOM 由外层容器触发而子域 `memory.events`
 无 `oom_kill` 记录，137 归因落空）。故推导时还会读 `/proc/self/cgroup` 定位当前 cgroup，沿
 `/sys/fs/cgroup` 父链向上取最近的有限 `memory.max`/`cpu.max`，与宿主推导**取 min**（静态显式值
-仍优先）；`cpu_global_max` 同样受容器 CPU 配额封顶。容器配额经 `:NeoAISandboxDiag` 的
+仍优先）；CPU 核数预算同样受容器 CPU 配额封顶。容器配额经 `:NeoAISandboxDiag` 的
 `cgroup_quota` 字段展示。
 
-所有并发任务挂在共享父域 `neoai` 下：父域 `cpu.max` = 全局预算 `cpu_global_max`
-（默认 `max(1, 核数-1)`，留 1 核给 nvim/UI），子域 `cpu.max` = `min(cpu_cores_max, 全局预算)`。
+所有并发任务挂在共享父域 `neoai` 下：父域 `cpu.max` = 全局预算 `max(1, 核数-2)`
+（内部统一推导，留 2 核给 nvim/UI），子域 `cpu.max` = `min(该预算, 全局预算)`。
 因此并发任务 CPU 配额之和不会超过宿主可用核数（避免「每个任务各 N 核、合计远超核数」的
-超卖导致整机打满、chat 界面卡顿），单任务仍受 `cpu_cores_max` 细分约束。
+超卖导致整机打满、chat 界面卡顿），单任务仍受该预算细分约束。
 
 控制面创建 cgroup v2 子域并把进程加入
 （`join_prefix` 先写 `cgroup.procs` 再 exec），结束/异常时 `cgroup.kill` 并删除子域，确保进程树

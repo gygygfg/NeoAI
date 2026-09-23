@@ -108,6 +108,73 @@ tests.suite("sandbox_symlink", function(_, it)
     end)
   end)
 
+  it("发布：宿主叶子已是软链（如 uv sync 的 .venv/bin/python）不误报 PATH_CHANGED", function(t)
+    local fs = require("NeoAI.utils.fs")
+    local sandbox = require("NeoAI.sandbox")
+    local candidate = require("NeoAI.sandbox.candidate")
+    local control = require("NeoAI.sandbox.control")
+    local store = require("NeoAI.sandbox.store")
+    with_config({ tools = { sandbox = { enabled = true, mode = "dry_run" } } }, function()
+      sandbox.reset()
+      local base = fs.canonical(vim.fn.tempname())
+      local dir = base .. "/app"
+      local upper = base .. "/upper"
+      fs.ensure_dir(dir .. "/bin")
+      fs.ensure_dir(upper .. "/bin")
+      local old_target = base .. "/python-old"
+      local new_target = base .. "/python-new"
+      -- 宿主已有同名软链（旧目标）：候选把它改指向新目标——旧实现用 resolve 跟随叶子软链，
+      -- 解析到 old_target 后与记录路径不符，误报 CONFLICT/PATH_CHANGED 否决整个变更单元。
+      vim.uv.fs_symlink(old_target, dir .. "/bin/python")
+      vim.uv.fs_symlink(new_target, upper .. "/bin/python")
+      local attempt = control.new_attempt("run_command", { command = "uv sync" }, {}, { effect = "process" })
+      candidate.begin(attempt, store.root())
+      candidate.capture_overlay(attempt.attempt_id, dir, upper)
+      local cand = candidate.finish(attempt.attempt_id)
+      local f
+      for _, x in ipairs(cand and cand.files or {}) do
+        if x.path == dir .. "/bin/python" then f = x end
+      end
+      t.not_nil(f, "候选应含软链")
+      t.eq(new_target, f.link, "软链目标应为新目标")
+      local pub = candidate.publish(cand, {})
+      t.true_(pub.ok, "叶子为宿主已有软链时发布不应误报: " .. tostring(pub.reason))
+      t.eq(new_target, vim.uv.fs_readlink(dir .. "/bin/python"), "软链目标应更新")
+      candidate.cleanup(attempt.attempt_id)
+      vim.fn.delete(base, "rf")
+    end)
+  end)
+
+  it("发布：普通文件候选覆盖宿主已有叶子软链不误报 PATH_CHANGED", function(t)
+    local fs = require("NeoAI.utils.fs")
+    local sandbox = require("NeoAI.sandbox")
+    local candidate = require("NeoAI.sandbox.candidate")
+    local control = require("NeoAI.sandbox.control")
+    local store = require("NeoAI.sandbox.store")
+    with_config({ tools = { sandbox = { enabled = true, mode = "dry_run" } } }, function()
+      sandbox.reset()
+      local base = fs.canonical(vim.fn.tempname())
+      local dir = base .. "/app"
+      local upper = base .. "/upper"
+      fs.ensure_dir(dir .. "/bin")
+      fs.ensure_dir(upper .. "/bin")
+      fs.write_file(base .. "/python-old", "old\n")
+      vim.uv.fs_symlink(base .. "/python-old", dir .. "/bin/python")
+      fs.write_file(upper .. "/bin/python", "#!/bin/sh\n")
+      local attempt = control.new_attempt("run_command", { command = "uv sync" }, {}, { effect = "process" })
+      candidate.begin(attempt, store.root())
+      candidate.capture_overlay(attempt.attempt_id, dir, upper)
+      local cand = candidate.finish(attempt.attempt_id)
+      local pub = candidate.publish(cand, {})
+      t.true_(pub.ok, "覆盖宿主叶子软链时发布不应误报: " .. tostring(pub.reason))
+      local lst = vim.uv.fs_lstat(dir .. "/bin/python")
+      t.eq("file", lst and lst.type, "软链应被普通文件取代")
+      t.eq("#!/bin/sh\n", fs.read_file(dir .. "/bin/python"), "内容应写入")
+      candidate.cleanup(attempt.attempt_id)
+      vim.fn.delete(base, "rf")
+    end)
+  end)
+
   it("systemctl --user enable：软链暂存为候选且不落宿主机", function(t)
     local runtime = require("NeoAI.sandbox.runtime")
     if runtime.backend() ~= "bwrap" then return end

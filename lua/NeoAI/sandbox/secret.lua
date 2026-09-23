@@ -1060,13 +1060,11 @@ local function _work_chunk_files()
   return n
 end
 
---- 每批并发提交的 chunk 数上限（默认 4，与 libuv 线程池一致），避免一次性排满队列饿死
---- 后续 UI 关键 job。可经 tools.sandbox.work_parallelism 调整。
+--- 每批并发提交的 chunk 数上限，避免一次性排满队列饿死后续 UI 关键 job。
+--- 统一 `max(1, 核数-2)`（与放大的 libuv 线程池一致）。
 --- @return number
 local function _work_parallelism()
-  local n = tonumber(require("NeoAI.kernel.config_store").get("tools.sandbox.work_parallelism"))
-  if not n or n <= 0 then return 4 end
-  return n
+  return require("NeoAI.utils.work").parallelism()
 end
 
 --- 合并并行分块的 token 结果：各块 seq 起点相同，同一 secret 在不同块可能被分配不同 token。

@@ -18,6 +18,26 @@ local M = {}
 --- 被 `systemctl stop` 停掉的基线单元（门面基线默认 active）。`start` 清除，`reset` 清空。
 local stopped_baseline = {}
 
+--- 被 `systemctl reset-failed` 清除的失败态（服务 key -> true）。清除后 `_active_state`
+--- 不再把该单元的退出码非零视作 failed，`--failed`/degraded 也随之消失。
+local reset_failed = {}
+
+--- 待审 enable/disable 软链的会话内虚拟视图（服务 key -> 记录）。
+--- `stage_install` 把软链暂存为异步待审候选（不落宿主、也不写入沙箱可见路径），因此后续
+--- `is-enabled`/`list-unit-files` 看不到它。这里登记待审状态，让 enable/disable 在审批前
+--- 就有一致的可见语义（approve 后真实软链存在，视图自然一致；reset 时清空）。
+local pending_install = {} -- key -> { targets = {..}, path = .., scope = .. }
+local pending_disable = {} -- key -> true
+
+--- 门面定时器（.timer 单元 / `systemd-run --on-active` 瞬态定时器）运行态。
+--- key -> { name, scope, activates, active, next_at, last_at, interval_sec,
+---          calendar, oneshot, command, handle }
+local timers = {}
+
+--- systemd-run --on-active/--on-calendar 建立的瞬态服务命令（定时器触发时启动）。
+--- key -> { command, scope }
+local transient_units = {}
+
 -- ========== 常量 ==========
 
 local KNOWN_SUFFIXES = {
@@ -76,6 +96,7 @@ local SUPPORTED_VERBS = {
   ["list-units"] = true, ["list-unit-files"] = true,
   ["list-timers"] = true, ["list-sockets"] = true, ["list-jobs"] = true,
   ["get-default"] = true, ["set-default"] = true, ["show-environment"] = true,
+  kill = true,
   -- 环境探测类：合成「已启动/无失败」输出，避免暴露「非 systemd 环境」。
   ["is-system-running"] = true, ["is-failed"] = true,
   -- 清除失败状态：门面无持久失败单元，幂等成功（真实 systemd 支持该动词）。
@@ -94,7 +115,7 @@ local LIST_OPTS = {
 local REJECT_VERBS = {
   enable = true, disable = true, reenable = true, mask = true, unmask = true,
   reload = true, ["reload-or-restart"] = true, ["try-reload-or-restart"] = true,
-  kill = true, edit = true, link = true, revert = true,
+  edit = true, link = true, revert = true,
   isolate = true, ["switch-root"] = true, ["set-property"] = true,
   -- 宿主电源/内核状态：明确拒绝（绝不回退 hostop 在宿主执行）。
   poweroff = true, reboot = true, halt = true, kexec = true, suspend = true,
@@ -383,6 +404,7 @@ local RUN_OPT_VALUE = {
 function M._parse_systemd_run(toks, i, raw)
   local unit, scope, wait = nil, "system", false
   local workdir, env, pipe = nil, {}, false
+  local on_active, on_calendar, timer_prop = nil, nil, nil
   local rest = {}
   while i <= #toks do
     local t = toks[i]
@@ -425,6 +447,15 @@ function M._parse_systemd_run(toks, i, raw)
       elseif name == "--working-directory" then
         workdir = val
         if not workdir and toks[i + 1] then workdir = toks[i + 1]; i = i + 1 end
+      elseif name == "--on-active" then
+        on_active = val
+        if not on_active and toks[i + 1] then on_active = toks[i + 1]; i = i + 1 end
+      elseif name == "--on-calendar" then
+        on_calendar = val
+        if not on_calendar and toks[i + 1] then on_calendar = toks[i + 1]; i = i + 1 end
+      elseif name == "--timer-property" then
+        timer_prop = val
+        if not timer_prop and toks[i + 1] then timer_prop = toks[i + 1]; i = i + 1 end
       elseif name == "--description" then
         if not val and toks[i + 1] then i = i + 1 end
       elseif RUN_OPT_VALUE[name] then
@@ -443,6 +474,7 @@ function M._parse_systemd_run(toks, i, raw)
     kind = "systemd-run", verb = "run", route = "facade", scope = scope,
     units = unit and { unit } or {}, argv = rest, wait = wait, pipe = pipe,
     workdir = workdir, env = env, raw = raw,
+    on_active = on_active, on_calendar = on_calendar, timer_property = timer_prop,
   }
 end
 
@@ -618,6 +650,100 @@ local function _get(sections, sec, key)
   local s = sections[sec]
   if not s or not s[key] then return nil, {} end
   return s[key][1], s[key]
+end
+
+--- 解析 systemd 时间跨度（`5`/`5s`/`100ms`/`1min 30s`/`2h` 等），返回秒数。
+--- @param s string|nil
+--- @return number|nil
+local function _parse_sec(s)
+  if s == nil then return nil end
+  s = tostring(s):gsub("^%s+", ""):gsub("%s+$", "")
+  if s == "" then return nil end
+  if s:match("^%d+$") then return tonumber(s) end
+  local total, found = 0, false
+  for num, unit in s:gmatch("([%d%.]+)%s*([%a]+)") do
+    local n = tonumber(num)
+    if n then
+      local u = unit:lower()
+      local mul
+      if u == "us" or u == "usec" or u == "usecs" then mul = 1e-6
+      elseif u == "ms" or u == "msec" or u == "msecs" then mul = 1e-3
+      elseif u:sub(1, 1) == "s" then mul = 1
+      elseif u == "month" or u == "months" then mul = 2629800
+      elseif u:sub(1, 2) == "mo" then mul = 2629800
+      elseif u:sub(1, 1) == "m" then mul = 60
+      elseif u:sub(1, 1) == "h" then mul = 3600
+      elseif u:sub(1, 1) == "d" then mul = 86400
+      elseif u:sub(1, 1) == "w" then mul = 604800
+      elseif u:sub(1, 1) == "y" then mul = 31557600
+      end
+      if mul then total = total + n * mul; found = true end
+    end
+  end
+  return found and total or nil
+end
+
+--- 解析 systemd 容量（`512M`/`1G`/`infinity` 等），返回字节数或 math.huge。
+--- @param s string|nil
+--- @return number|nil
+local function _parse_size(s)
+  if s == nil then return nil end
+  s = tostring(s):gsub("%s+", "")
+  if s == "" then return nil end
+  if s:lower() == "infinity" then return math.huge end
+  local n, u = s:match("^([%d%.]+)([%a]*)$")
+  if not n then return nil end
+  local ul = u:lower()
+  local mul
+  if ul == "" or ul == "b" then mul = 1
+  elseif ul == "k" or ul == "kb" or ul == "kib" then mul = 1024
+  elseif ul == "m" or ul == "mb" or ul == "mib" then mul = 1024 ^ 2
+  elseif ul == "g" or ul == "gb" or ul == "gib" then mul = 1024 ^ 3
+  elseif ul == "t" or ul == "tb" or ul == "tib" then mul = 1024 ^ 4
+  end
+  if not mul then return nil end
+  return math.floor(tonumber(n) * mul)
+end
+
+--- 解析 CPUQuota 百分比（`50%` → 50；也接受裸数字）。返回百分数。
+--- @param s string|nil
+--- @return number|nil
+local function _parse_quota(s)
+  if s == nil then return nil end
+  local str = tostring(s):gsub("%s+", "")
+  local p = str:match("^(%d+)%%$")
+  if p then return tonumber(p) end
+  return tonumber(str)
+end
+
+--- 秒数 → systemd 风格时长字符串（`100ms`/`1.5s`/`1min 30s`/`2h`）。
+--- @param sec number|nil
+--- @return string
+local function _format_sec(sec)
+  sec = tonumber(sec) or 0
+  if sec <= 0 then return "0" end
+  if sec < 1 then return string.format("%dms", math.floor(sec * 1000 + 0.5)) end
+  if sec < 60 then
+    if sec == math.floor(sec) then return string.format("%ds", math.floor(sec)) end
+    return string.format("%.3gs", sec)
+  end
+  local m = math.floor(sec / 60)
+  local s = sec - m * 60
+  if m < 60 then
+    if s > 0 then return string.format("%dmin %ds", m, math.floor(s + 0.5)) end
+    return string.format("%dmin", m)
+  end
+  local h = math.floor(m / 60)
+  m = m - h * 60
+  if m > 0 then return string.format("%dh %dmin", h, m) end
+  return string.format("%dh", h)
+end
+
+--- systemctl show 的 USec 风格字段（微秒 → 人类可读，与 _format_sec 一致）。
+--- @param sec number|nil
+--- @return string
+local function _format_usec(sec)
+  return _format_sec(sec)
 end
 
 --- 展开 `${VAR}`（`$$` → 字面 `$`）。未定义变量展开为空（systemd 语义）。
@@ -819,6 +945,11 @@ function M.parse_unit(content, name)
   end
 
   local desc = _get(sections, "Unit", "Description")
+  -- 资源限制 / 重启策略 / 超时等 Service 属性（供 show 报告与执行时应用）。
+  local restart = tostring(_get(sections, "Service", "Restart") or "no"):gsub("%s+$", "")
+  local restart_sec = _parse_sec(_get(sections, "Service", "RestartSec")) or 0.1
+  local start_limit_burst = tonumber((_get(sections, "Unit", "StartLimitBurst")))
+  local start_limit_interval = _parse_sec(_get(sections, "Unit", "StartLimitIntervalSec"))
   return {
     name = name,
     description = desc or name,
@@ -834,7 +965,131 @@ function M.parse_unit(content, name)
     wants = wants,
     after = after,
     before = before,
+    -- Restart=/RestartSec=：非 no 时由 sandbox.service 做自动重启（含 StartLimit 限流）。
+    restart = restart,
+    restart_sec = restart_sec,
+    start_limit_burst = start_limit_burst,
+    start_limit_interval = start_limit_interval,
+    -- 资源限制：MemoryMax/MemoryHigh 字节数；CPUQuota 百分数。
+    memory_max = _parse_size(_get(sections, "Service", "MemoryMax")),
+    memory_high = _parse_size(_get(sections, "Service", "MemoryHigh")),
+    cpu_quota = _parse_quota(_get(sections, "Service", "CPUQuota")),
+    cpu_quota_period = _parse_sec(_get(sections, "Service", "CPUQuotaPeriodSec")),
+    remain_after_exit = tostring(_get(sections, "Service", "RemainAfterExit") or "no"):gsub("%s+$", ""),
+    timeout_start_sec = _parse_sec(_get(sections, "Service", "TimeoutStartSec")),
+    timeout_stop_sec = _parse_sec(_get(sections, "Service", "TimeoutStopSec")),
+    kill_signal = tostring(_get(sections, "Service", "KillSignal") or "SIGTERM"):gsub("%s+$", ""),
   }
+end
+
+--- 解析 `.timer` 单元（`OnActiveSec`/`OnBootSec`/`OnUnitActiveSec`/`OnCalendar` 等）。
+--- 沙箱门面用宿主事件循环在会话内调度：到点后启动 `Unit=`（默认同名 `.service`）。
+--- @param content string
+--- @param name string
+--- @return table|nil timer
+--- @return string|nil err
+function M.parse_timer(content, name)
+  local sections = _parse_ini(content)
+  local function first(key) return _get(sections, "Timer", key) end
+  local activates = first("Unit")
+  if activates == nil or activates == "" then
+    activates = name:gsub("%.timer$", ".service")
+  else
+    activates = _normalize_unit_name(activates)
+  end
+  local on_calendar = select(1, _get(sections, "Timer", "OnCalendar"))
+  local t = {
+    name = name, timer = true, activates = activates,
+    description = first("Description") or (_get(sections, "Unit", "Description")) or name,
+    on_active_sec = _parse_sec(first("OnActiveSec")),
+    on_boot_sec = _parse_sec(first("OnBootSec")),
+    on_startup_sec = _parse_sec(first("OnStartupSec")),
+    on_unit_active_sec = _parse_sec(first("OnUnitActiveSec")),
+    on_unit_inactive_sec = _parse_sec(first("OnUnitInactiveSec")),
+    on_calendar = on_calendar,
+    persistent = tostring(first("Persistent") or "no"):gsub("%s+$", ""),
+    remain_after_elapse = tostring(first("RemainAfterElapse") or "yes"):gsub("%s+$", ""),
+    requires = {}, wants = {}, after = {}, before = {},
+    type = "timer",
+  }
+  if not (t.on_active_sec or t.on_boot_sec or t.on_startup_sec
+    or t.on_unit_active_sec or t.on_unit_inactive_sec or t.on_calendar) then
+    return nil, "Timer unit lacks On*= setting"
+  end
+  return t
+end
+
+--- `OnCalendar=` 下一次触发延迟（秒）。支持 `minutely`/`hourly`/`daily`/`weekly`/
+--- `monthly`/`yearly` 关键字与 `*-*-* HH:MM[:SS]`（含 `*` 通配），不支持复杂列表/区间。
+--- @param cal string|nil
+--- @param from number 基准 epoch
+--- @return number|nil delay
+local function _next_calendar_delay(cal, from)
+  if type(cal) ~= "string" or cal == "" then return nil end
+  from = tonumber(from) or os.time()
+  local c = cal:lower():gsub("^%s+", ""):gsub("%s+$", "")
+  local function at(day_offset, hh, mm, ss)
+    local base = os.date("*t", from)
+    base.hour, base.min, base.sec = hh or 0, mm or 0, ss or 0
+    local epoch = os.time(base) + (day_offset or 0) * 86400
+    while epoch <= from do epoch = epoch + 86400 end
+    return epoch - from
+  end
+  if c == "minutely" then
+    local sec = 60 - (from % 60)
+    return sec
+  end
+  if c == "hourly" then
+    local nxt = from - (from % 3600) + 3600
+    return nxt - from
+  end
+  if c == "daily" or c == "midnight" then return at(1, 0, 0, 0) end
+  if c == "weekly" then
+    -- 下周一 00:00
+    local day = tonumber(os.date("%w", from)) -- 0=Sun
+    local delta = ((8 - day) % 7)
+    if delta == 0 then delta = 7 end
+    return at(delta, 0, 0, 0)
+  end
+  if c == "monthly" then
+    local d = os.date("*t", from)
+    local base = { year = d.year, month = d.month, day = 1, hour = 0, min = 0, sec = 0 }
+    local epoch = os.time(base)
+    epoch = os.time({ year = d.year, month = d.month + 1, day = 1, hour = 0, min = 0, sec = 0 })
+    while epoch <= from do
+      local nd = os.date("*t", epoch)
+      epoch = os.time({ year = nd.year, month = nd.month + 1, day = 1, hour = 0, min = 0, sec = 0 })
+    end
+    return epoch - from
+  end
+  if c == "yearly" or c == "annually" then
+    local d = os.date("*t", from)
+    local epoch = os.time({ year = d.year + 1, month = 1, day = 1, hour = 0, min = 0, sec = 0 })
+    return epoch - from
+  end
+  -- `*-*-* HH:MM[:SS]` / `*:0/15` 简化：取时间字段的固定下一次（按秒/分/小时步进）。
+  local time = c:match("%s(%d?%d:%d%d:%d%d)$") or c:match("%s(%d?%d:%d%d)$")
+  local hh, mm, ss
+  if time then
+    local a, b, d = time:match("^(%d?%d):(%d%d):?(%d?%d?)$")
+    hh, mm, ss = tonumber(a), tonumber(b), tonumber(d or 0)
+  else
+    -- `*:0/15` 形式：分步进。
+    local step = c:match(":%d+/(%d+)")
+    if step then
+      local n = tonumber(step)
+      local cur = tonumber(os.date("%M", from)) * 60 + tonumber(os.date("%S", from))
+      local nxt = (math.floor(cur / (n * 60)) + 1) * n * 60
+      return nxt - cur
+    end
+    return nil
+  end
+  if not hh or not mm then return nil end
+  local today = os.date("*t", from)
+  today.hour, today.min, today.sec = hh, mm, ss or 0
+  local epoch = os.time(today)
+  if epoch <= from then epoch = epoch + 86400 end
+  return epoch - from
 end
 
 --- 定位并加载一个单元（优先沙箱暂存副本）。
@@ -849,8 +1104,8 @@ local function _load_unit(name, scope)
     return nil, "沙箱门面不支持模板/实例化单元：" .. name
   end
   local suffix = norm:match("(%.[%w]+)$")
-  if suffix and suffix ~= ".service" and suffix ~= ".target" then
-    return nil, "沙箱环境不支持 " .. suffix .. " 单元（仅支持 .service/.target）"
+  if suffix and suffix ~= ".service" and suffix ~= ".target" and suffix ~= ".timer" then
+    return nil, "沙箱环境不支持 " .. suffix .. " 单元（仅支持 .service/.target/.timer）"
   end
   for _, root in ipairs(_unit_roots(scope)) do
     local path = root .. "/" .. norm
@@ -858,6 +1113,12 @@ local function _load_unit(name, scope)
     if content then
       if norm:sub(-8) == ".target" then
         return { name = norm, target = true, description = norm, requires = {}, wants = {}, after = {}, before = {} }, nil, path
+      end
+      if suffix == ".timer" then
+        local timer, terr = M.parse_timer(content, norm)
+        if not timer then return nil, terr, path end
+        timer.path = path
+        return timer, nil, path
       end
       local unit, err = M.parse_unit(content, norm)
       if not unit then return nil, err, path end
@@ -1014,6 +1275,9 @@ local function _redact(text)
   return text
 end
 
+--- 前向声明：定时器实现位于 `_start_one` 之后（需要回调 `_start_one` 启动被激活单元）。
+local _timer_start, _timer_stop
+
 --- 启动一个已解析单元（不处理依赖）。
 --- @param unit table
 --- @param scope string|nil "system"（默认）| "user"
@@ -1021,9 +1285,12 @@ end
 --- @return string|nil err
 local function _start_one(unit, scope)
   if unit.target then return { name = unit.name, target = true }, nil end
+  if unit.timer then return _timer_start(unit, scope) end
   local svc = _svc()
   if not svc then return nil, "长驻服务模块不可用" end
   local key = _unit_key(unit, scope)
+  -- 重新启动已 reset 的失败单元：清除失败态标记（真实 systemd start 会清除 failed）。
+  reset_failed[key] = nil
   local existing = svc.status(key)
   if existing and (existing.status == "running" or existing.status == "exited") then
     -- 已在运行，或 oneshot 已结束（真实 systemctl start 幂等）。
@@ -1042,12 +1309,29 @@ local function _start_one(unit, scope)
     for _, a in ipairs(list) do parts[#parts + 1] = _quote_argv(a) end
     command = table.concat(parts, " && ")
   end
-  local started, err = svc.start(key, command, {
+  local opts = {
     workdir = unit.workdir,
     cwd = unit.workdir,
     env = unit.env,
     unit = unit.name,
-  })
+  }
+  -- Restart=/RestartSec=：交给 sandbox.service 做进程级自动重启（含 StartLimit 限流）。
+  if unit.restart and unit.restart ~= "no" then
+    opts.restart = {
+      policy = unit.restart,
+      sec = unit.restart_sec or 0.1,
+      burst = unit.start_limit_burst,
+      interval = unit.start_limit_interval,
+    }
+  end
+  -- MemoryMax/CPUQuota：映射到该服务的 cgroup 资源域（cgroup 不可用时忽略，show 仍报告意图）。
+  local limits = {}
+  if unit.memory_max and unit.memory_max ~= math.huge and unit.memory_max > 0 then
+    limits.memory_bytes = unit.memory_max
+  end
+  if unit.cpu_quota and unit.cpu_quota > 0 then limits.cpu_max = math.floor(unit.cpu_quota * 1000) end
+  if next(limits) then opts.limits = limits end
+  local started, err = svc.start(key, command, opts)
   if not started then return nil, err or ("启动失败：" .. unit.name) end
   return started, nil
 end
@@ -1112,6 +1396,10 @@ end
 --- @param scope string|nil "system"（默认）| "user"
 --- @return Deferred
 local function _stop_one(unit, scope)
+  if unit.timer then
+    _timer_stop(unit, scope)
+    return async.resolve(true)
+  end
   local svc = _svc()
   if not svc then return async.reject("长驻服务模块不可用") end
   local d = async.Deferred.new()
@@ -1120,6 +1408,129 @@ local function _stop_one(unit, scope)
     d:resolve(true)
   end)
   return d
+end
+
+-- ========== 定时器（.timer / systemd-run --on-active） ==========
+
+--- 清除定时器的宿主定时句柄（uv.timer）。
+--- @param t table
+local function _timer_clear_handle(t)
+  if t and t.handle then
+    pcall(function() t.handle:stop() end)
+    pcall(function() t.handle:close() end)
+    t.handle = nil
+  end
+end
+
+--- 计算定时器「下一次触发延迟」（秒）。优先 OnCalendar，其次一次性/重复间隔。
+--- @param unit table
+--- @return number|nil
+local function _timer_delay(unit)
+  if unit.on_calendar then
+    return _next_calendar_delay(unit.on_calendar, os.time())
+  end
+  return unit.on_active_sec or unit.on_boot_sec or unit.on_startup_sec
+    or unit.on_unit_active_sec or unit.on_unit_inactive_sec
+end
+
+--- 定时器触发：启动被激活单元，并按需计算下一次（重复定时器/日历）。
+--- @param key string
+local function _timer_fire(key)
+  local t = timers[key]
+  if not t or not t.active then return end
+  t.last_at = os.time()
+  local unit = t.unit
+  local target = _load_unit(t.activates, t.scope)
+  if not target then
+    -- 瞬态定时器（systemd-run --on-active）：被激活单元无文件，用登记命令合成伪 unit。
+    local tu = transient_units[_unit_key({ name = t.activates }, t.scope)]
+    if tu then
+      target = {
+        name = t.activates, transient = true, command = tu.command, type = "simple",
+        description = tu.command, argv = {}, env = {}, requires = {}, wants = {}, after = {}, before = {},
+      }
+    end
+  end
+  if not target then
+    -- 被激活单元缺失：不再重复。
+    t.active = false
+    t.next_at = nil
+    _timer_clear_handle(t)
+    return
+  end
+  _start_one(target, t.scope)
+  local repeat_sec = nil
+  if unit.on_unit_active_sec or unit.on_unit_inactive_sec then
+    repeat_sec = unit.on_unit_active_sec or unit.on_unit_inactive_sec
+  elseif unit.on_calendar then
+    repeat_sec = _next_calendar_delay(unit.on_calendar, os.time())
+  end
+  if repeat_sec and repeat_sec > 0 then
+    t.next_at = os.time() + repeat_sec
+    local handle = (vim.uv or vim.loop).new_timer()
+    t.handle = handle
+    handle:start(math.max(1, math.floor(repeat_sec * 1000)), 0, vim.schedule_wrap(function()
+      _timer_fire(key)
+    end))
+  else
+    t.active = false
+    t.next_at = nil
+    _timer_clear_handle(t)
+  end
+end
+
+--- 启动/重新激活一个定时器单元。
+--- @param unit table
+--- @param scope string
+--- @return table|nil
+--- @return string|nil err
+_timer_start = function(unit, scope)
+  local key = _unit_key(unit, scope)
+  if timers[key] and timers[key].active then return { name = unit.name, timer = true }, nil end
+  local t = timers[key] or {}
+  t.name = unit.name
+  t.scope = scope
+  t.activates = unit.activates or _normalize_unit_name(unit.name:gsub("%.timer$", ".service"))
+  t.unit = unit
+  t.active = true
+  if unit.transient_command then
+    t.transient_command = unit.transient_command
+    transient_units[_unit_key({ name = t.activates }, scope)] = {
+      command = unit.transient_command, scope = scope,
+    }
+  end
+  timers[key] = t
+  local delay = _timer_delay(unit)
+  if delay == nil then return nil, "定时器缺少 On*= 触发条件" end
+  if delay <= 0 then delay = 0.001 end
+  t.next_at = os.time() + delay
+  _timer_clear_handle(t)
+  local handle = (vim.uv or vim.loop).new_timer()
+  t.handle = handle
+  handle:start(math.max(1, math.floor(delay * 1000)), 0, vim.schedule_wrap(function()
+    _timer_fire(key)
+  end))
+  return { name = unit.name, timer = true }, nil
+end
+
+--- 停止一个定时器（保留条目置为 inactive，供 list-timers --all 展示）。
+--- @param unit table
+--- @param scope string
+_timer_stop = function(unit, scope)
+  local key = _unit_key(unit, scope)
+  local t = timers[key]
+  if not t then return end
+  _timer_clear_handle(t)
+  t.active = false
+  t.next_at = nil
+end
+
+--- 门面定时器运行态（供 _active_state/_status_block/list-timers 使用）。
+--- @param name string
+--- @param scope string
+--- @return table|nil
+local function _timer_info(name, scope)
+  return timers[_unit_key({ name = name }, scope)]
 end
 
 --- 明确拒绝动词的真实 systemctl 风格错误文本（不暴露沙箱）。
@@ -1218,6 +1629,11 @@ function M.stage_install(attempt, plan, ctx, spec)
         staged = staged + 1; links[#links + 1] = link
       end
     end
+    if staged > 0 then
+      local key = _unit_key({ name = unit_name }, scope)
+      pending_install[key] = { targets = targets, path = unit_path, scope = scope }
+      pending_disable[key] = nil
+    end
   else
     for _, r in ipairs(_unit_roots(scope)) do
       local handle = vim.uv.fs_scandir(r)
@@ -1237,6 +1653,7 @@ function M.stage_install(attempt, plan, ctx, spec)
         end
       end
     end
+    if staged > 0 then pending_disable[_unit_key({ name = unit_name }, scope)] = true end
   end
 
   local cand = candidate.finish(attempt.attempt_id)
@@ -1332,6 +1749,9 @@ end
 --- @return number
 local function _enabled_state(name, scope, path)
   if not path then return "not-found", 4 end
+  local key = _unit_key({ name = name }, scope)
+  -- 待审 disable：即使真实软链存在也按 disabled 报告（会话内虚拟视图）。
+  if pending_disable[key] then return "disabled", 1 end
   for _, root in ipairs(_unit_roots(scope)) do
     local l = root .. "/" .. name
     local st = vim.uv.fs_lstat(l)
@@ -1350,6 +1770,10 @@ local function _enabled_state(name, scope, path)
       if st and st.type == "link" then return "enabled", 0 end
     end
   end
+  -- 待审 enable：approve 前真实软链尚不存在，但会话内报告 enabled，使 enable → is-enabled
+  -- 一致（否则 AI 观察到「Created symlink」后立刻 disabled，自相矛盾）。
+  local pending = pending_install[key]
+  if pending and #(pending.targets or {}) > 0 then return "enabled", 0 end
   return "disabled", 1
 end
 
@@ -1362,6 +1786,12 @@ end
 local function _active_state(name, scope)
   local svc = _svc()
   local key = _unit_key({ name = name }, scope)
+  -- 定时器运行态优先（.timer 无进程，由门面调度器驱动）。
+  local timer = timers[key]
+  if timer then
+    if timer.active then return "active", 0, { timer = true, next_at = timer.next_at } end
+    return "inactive", 3, { timer = true }
+  end
   local info = svc and svc.status(key) or nil
   if info then
     if info.status == "running" then return "active", 0, info end
@@ -1371,7 +1801,7 @@ local function _active_state(name, scope)
       -- 进程已结束：退出码非零才是 failed；零退出按 inactive(dead)（未跟踪 RemainAfterExit）。
       -- 真实 systemd 的 oneshot 成功既不是 failed、`is-active` 也不返回 3=inactive。
       local rc = tonumber(info.exit_code) or 0
-      if rc ~= 0 then return "failed", 3, info end
+      if rc ~= 0 and not reset_failed[key] then return "failed", 3, info end
       return "inactive", 3, info
     end
     return "inactive", 3, info
@@ -1390,6 +1820,7 @@ end
 --- @return string
 local function _sub_state(name, scope)
   local active, _, info = _active_state(name, scope)
+  if info and info.timer then return active == "active" and "waiting" or "dead" end
   if info and info.baseline then
     local base = _baseline(name, scope)
     return base and base.sub or "active"
@@ -1411,7 +1842,8 @@ local function _facade_state()
   if svc then
     for _, info in ipairs(svc.list()) do
       if info.status == "exited" and (tonumber(info.exit_code) or 0) ~= 0 then
-        return "degraded"
+        -- svc.status().name 即服务 key（unit:<name> / user-unit:<name>），与 reset_failed 对齐。
+        if not reset_failed[info.name] then return "degraded" end
       end
     end
   end
@@ -1426,6 +1858,26 @@ local function _has_opt(opts, name)
     if o == name or tostring(o):sub(1, #name + 1) == name .. "=" then return true end
   end
   return false
+end
+
+--- `systemctl kill` 信号名 → 编号（`SIGTERM`/`TERM`/`15` 均可）。
+local KILL_SIGNALS = {
+  SIGHUP = 1, SIGINT = 2, SIGQUIT = 3, SIGILL = 4, SIGTRAP = 5, SIGABRT = 6,
+  SIGBUS = 7, SIGFPE = 8, SIGKILL = 9, SIGUSR1 = 10, SIGSEGV = 11, SIGUSR2 = 12,
+  SIGPIPE = 13, SIGALRM = 14, SIGTERM = 15, SIGSTKFLT = 16, SIGCHLD = 17,
+  SIGCONT = 18, SIGSTOP = 19, SIGTSTP = 20, SIGTTIN = 21, SIGTTOU = 22,
+  SIGURG = 23, SIGXCPU = 24, SIGXFSZ = 25, SIGVTALRM = 26, SIGPROF = 27,
+  SIGWINCH = 28, SIGIO = 29, SIGPWR = 30, SIGSYS = 31,
+}
+
+--- @param s string|nil
+--- @return number
+local function _signal_number(s)
+  if s == nil then return 15 end
+  local str = tostring(s):upper()
+  if str:match("^%d+$") then return tonumber(str) end
+  if str:sub(1, 3) ~= "SIG" then str = "SIG" .. str end
+  return KILL_SIGNALS[str] or 15
 end
 
 --- 收集 `--state=` / `-t|--type=` / `--failed` / `--all` 过滤条件（list-units/list-unit-files）。
@@ -1495,6 +1947,41 @@ local function _enum_units(scope)
   return names
 end
 
+--- 定时器 status 文本块（`● foo.timer - desc / Active: active (waiting) / Trigger / Triggers`）。
+--- @param name string
+--- @param scope string
+--- @param path string|nil
+--- @return string|nil
+--- @return string|nil
+--- @return number
+local function _timer_status_block(name, scope, path)
+  local t = _timer_info(name, scope)
+  if not t and not path then return nil, "Unit " .. name .. " could not be found.", 4 end
+  local unit = nil
+  if path then
+    local content = _read_view(path)
+    unit = content and M.parse_timer(content, name) or nil
+  end
+  unit = t and t.unit or unit or { name = name, activates = t and t.activates }
+  local active = (t and t.active) and "active" or "inactive"
+  local sub = (t and t.active) and "waiting" or "dead"
+  local enabled = select(1, _enabled_state(name, scope, path))
+  local dot = active == "active" and "●" or "○"
+  local lines = {
+    string.format("%s %s - %s", dot, name, tostring((unit and unit.description) or name)),
+    string.format("     Loaded: loaded (%s; %s; preset: enabled)", path or "(builtin)", enabled),
+  }
+  if active == "active" then
+    lines[#lines + 1] = string.format("     Active: active (waiting) since %s; 0s ago", _now_stamp())
+    lines[#lines + 1] = string.format("    Trigger: %s",
+      t.next_at and os.date("%a %Y-%m-%d %H:%M:%S", t.next_at) or "n/a")
+    lines[#lines + 1] = string.format("   Triggers: ● %s", tostring(t.activates))
+    return table.concat(lines, "\n"), nil, 0
+  end
+  lines[#lines + 1] = "     Active: inactive (dead)"
+  return table.concat(lines, "\n"), nil, 3
+end
+
 --- 单个单元 status 文本块。
 --- @param name string
 --- @param scope string
@@ -1503,6 +1990,7 @@ end
 --- @return number code
 local function _status_block(name, scope)
   local norm, path = _unit_find(name, scope)
+  if norm:sub(-6) == ".timer" then return _timer_status_block(norm, scope, path) end
   local base = _baseline(norm, scope)
   if not path and not base then
     -- 瞬态单元（systemd-run）：无单元文件但有运行态，合成真实风格 status。
@@ -1563,61 +2051,120 @@ local function _status_block(name, scope)
   return table.concat(lines, "\n"), nil, 3
 end
 
---- systemctl show 的 Key=Value 属性集。
+--- systemctl show 的 Key=Value 属性集。支持 `--property`/`-p`（逗号分隔或重复）过滤与
+--- `--value`（仅输出值）。Service 属性（Restart/RestartUSec/NRestarts/MemoryMax/
+--- MemoryHigh/MemoryCurrent/CPUQuotaPerSecUSec/CPUQuota/Type/Timeout*/RemainAfterExit）
+--- 从单元文件与 sandbox.service 运行态合成；`.timer` 输出 NextElapseUSecRealtime/Unit 等。
 --- @param name string
 --- @param scope string
+--- @param props table|nil 请求的属性集合（nil/空 = 全部）
+--- @param value_only boolean|nil 仅输出值
 --- @return string
-local function _show_text(name, scope)
+local function _show_text(name, scope, props, value_only)
   local norm, path = _unit_find(name, scope)
   local active, _, info = _active_state(norm, scope)
   local is_baseline = info ~= nil and info.baseline == true
-  local is_runtime = (not path) and info ~= nil and info.baseline ~= true
-  local loaded = (path or is_baseline or is_runtime) and "loaded" or "not-found"
+  local is_runtime = (not path) and info ~= nil and info.baseline ~= true and not info.timer
+  local is_timer = norm:sub(-6) == ".timer"
+  local loaded = (path or is_baseline or is_runtime or (is_timer and info ~= nil))
+    and "loaded" or "not-found"
   local sub = _sub_state(norm, scope)
-  local lines = {
-    "Type=simple",
-    "Restart=no",
-    "TimeoutStartUSec=1min 30s",
-    "TimeoutStopUSec=1min 30s",
-    "RemainAfterExit=no",
-    "GuessMainPID=yes",
-    "MainPID=" .. tostring((info and info.pid) or 0),
-    "ControlPID=0",
-    "Result=success",
-    "NRestarts=0",
-    "MemoryCurrent=[not set]",
-    "TasksCurrent=[not set]",
-    "Id=" .. norm,
-    "Names=" .. norm,
-  }
-  if path then
+
+  local sections = {}
+  if path and not is_timer then
     local content = _read_view(path)
-    local sections = content and _parse_ini(content) or {}
-    local desc = _get(sections, "Unit", "Description")
-    lines[#lines + 1] = "Description=" .. tostring(desc or norm)
-    local exec = _get(sections, "Service", "ExecStart")
-    if exec then lines[#lines + 1] = "ExecStart=" .. tostring(exec) end
-    local wd = _get(sections, "Service", "WorkingDirectory")
-    if wd then lines[#lines + 1] = "WorkingDirectory=" .. tostring(wd) end
-  elseif is_runtime then
-    lines[#lines + 1] = "Description=" .. tostring(info.command or norm)
-    lines[#lines + 1] = "ExecStart=" .. tostring(info.command or "")
+    sections = content and _parse_ini(content) or {}
+  end
+  local function g(sec, key) return _get(sections, sec, key) end
+
+  local typ = is_runtime and "simple" or tostring(g("Service", "Type") or "simple")
+  local restart = tostring(g("Service", "Restart") or "no")
+  local restart_sec = _parse_sec(g("Service", "RestartSec")) or 0.1
+  local mem_max = _parse_size(g("Service", "MemoryMax"))
+  local mem_high = _parse_size(g("Service", "MemoryHigh"))
+  local cpu_quota = _parse_quota(g("Service", "CPUQuota"))
+  local remain = tostring(g("Service", "RemainAfterExit") or "no")
+  local timeout_start = _parse_sec(g("Service", "TimeoutStartSec")) or 90
+  local timeout_stop = _parse_sec(g("Service", "TimeoutStopSec")) or 90
+  local nrestarts = tonumber(info and info.restart_count) or 0
+  local mem_cur = info and info.memory_current or nil
+  local result = (active == "failed") and "exit-code" or "success"
+
+  local pair, order = {}, {}
+  local function put(k, v)
+    if pair[k] == nil then order[#order + 1] = k end
+    pair[k] = tostring(v)
+  end
+  put("Type", typ)
+  put("Restart", restart)
+  put("RestartUSec", _format_usec(restart_sec))
+  put("RestartSec", _format_sec(restart_sec))
+  put("TimeoutStartUSec", _format_usec(timeout_start))
+  put("TimeoutStopUSec", _format_usec(timeout_stop))
+  put("RemainAfterExit", remain)
+  put("GuessMainPID", "yes")
+  put("MainPID", (info and info.pid) or 0)
+  put("ControlPID", 0)
+  put("Result", result)
+  put("NRestarts", nrestarts)
+  put("MemoryMax", mem_max == nil and "infinity" or (mem_max == math.huge and "infinity" or tostring(mem_max)))
+  put("MemoryHigh", mem_high == nil and "infinity" or tostring(mem_high))
+  put("MemoryCurrent", mem_cur and tostring(mem_cur) or "[not set]")
+  if cpu_quota then
+    put("CPUQuotaPerSecUSec", tostring(math.floor(cpu_quota * 10000)))
+    put("CPUQuota", tostring(cpu_quota) .. "%")
   else
-    lines[#lines + 1] = "Description=" .. norm
+    put("CPUQuotaPerSecUSec", "infinity")
   end
-  lines[#lines + 1] = "LoadState=" .. loaded
-  lines[#lines + 1] = "ActiveState=" .. ((path or is_baseline or is_runtime) and active or "inactive")
-  lines[#lines + 1] = "SubState=" .. sub
-  lines[#lines + 1] = "CanStart=" .. ((path or is_runtime) and "yes" or "no")
-  lines[#lines + 1] = "CanStop=yes"
-  lines[#lines + 1] = "CanReload=no"
-  lines[#lines + 1] = "NeedDaemonReload=no"
-  lines[#lines + 1] = "Transient=" .. (is_runtime and "yes" or "no")
-  if not path and not is_baseline and not is_runtime then
-    lines[#lines + 1] = string.format(
-      'LoadError=org.freedesktop.systemd1.NoSuchUnit "Unit %s not found."', norm)
+  put("TasksCurrent", "[not set]")
+  put("Id", norm)
+  put("Names", norm)
+  if is_timer then
+    local t = _timer_info(norm, scope)
+    local unit = nil
+    if path then
+      local content = _read_view(path)
+      unit = content and M.parse_timer(content, norm) or nil
+    end
+    unit = (t and t.unit) or unit or {}
+    put("Description", tostring(unit.description or norm))
+    put("Unit", tostring((t and t.activates) or unit.activates or norm:gsub("%.timer$", ".service")))
+    put("NextElapseUSecRealtime",
+      (t and t.active and t.next_at) and _format_usec(t.next_at - os.time()) or "0")
+    put("LastTriggerUSec", (t and t.last_at) and _stamp(t.last_at) or "n/a")
+  elseif path then
+    put("Description", tostring(g("Unit", "Description") or norm))
+    local exec = g("Service", "ExecStart")
+    if exec then put("ExecStart", tostring(exec)) end
+    local wd = g("Service", "WorkingDirectory")
+    if wd then put("WorkingDirectory", tostring(wd)) end
+  elseif is_runtime then
+    put("Description", tostring(info.command or norm))
+    put("ExecStart", tostring(info.command or ""))
+  else
+    put("Description", norm)
   end
-  return table.concat(lines, "\n")
+  put("LoadState", loaded)
+  put("ActiveState", ((path or is_baseline or is_runtime or (is_timer and info)) and active or "inactive"))
+  put("SubState", sub)
+  put("CanStart", ((path or is_runtime or (is_timer and info ~= nil)) and "yes" or "no"))
+  put("CanStop", "yes")
+  put("CanReload", "no")
+  put("NeedDaemonReload", "no")
+  put("Transient", ((is_runtime or (is_timer and not path and info ~= nil)) and "yes" or "no"))
+  if not path and not is_baseline and not is_runtime and not (is_timer and info) then
+    put("LoadError", string.format(
+      'org.freedesktop.systemd1.NoSuchUnit "Unit %s not found."', norm))
+  end
+
+  local filter = next(props) ~= nil
+  local out = {}
+  for _, k in ipairs(order) do
+    if not filter or props[k] then
+      out[#out + 1] = value_only and pair[k] or (k .. "=" .. pair[k])
+    end
+  end
+  return table.concat(out, "\n")
 end
 
 --- @param name string
@@ -1661,6 +2208,11 @@ local function _list_units(scope, no_legend, opts)
       local n = info.unit
       if n and not seen[n] then seen[n] = true; names[#names + 1] = n end
     end
+  end
+  -- 门面定时器（含 systemd-run 建立的瞬态定时器，无单元文件）。
+  for _, t in pairs(timers) do
+    local n = t.name
+    if n and not seen[n] then seen[n] = true; names[#names + 1] = n end
   end
   table.sort(names)
   local lines, count = {}, 0
@@ -1728,6 +2280,68 @@ local function _list_unit_files(scope, no_legend, opts)
   if not no_legend then
     lines[#lines + 1] = ""
     lines[#lines + 1] = string.format("%d unit files listed.", count)
+  end
+  return _ok(table.concat(lines, "\n"))
+end
+
+--- @param epoch number|nil
+--- @return string
+local function _rel_left(epoch)
+  if not epoch then return "n/a" end
+  local d = epoch - os.time()
+  if d <= 0 then return "now" end
+  if d < 60 then return d .. "s left" end
+  if d < 3600 then return math.floor(d / 60) .. "min left" end
+  if d < 86400 then
+    return string.format("%dh %dmin left", math.floor(d / 3600), math.floor((d % 3600) / 60))
+  end
+  return string.format("%dd left", math.floor(d / 86400))
+end
+
+--- @param epoch number|nil
+--- @return string
+local function _rel_passed(epoch)
+  if not epoch then return "n/a" end
+  local d = os.time() - epoch
+  if d < 0 then return "n/a" end
+  if d < 60 then return d .. "s ago" end
+  if d < 3600 then return math.floor(d / 60) .. "min ago" end
+  if d < 86400 then return math.floor(d / 3600) .. "h ago" end
+  return math.floor(d / 86400) .. "d ago"
+end
+
+--- list-timers：列出会话内定时器（.timer 单元 + systemd-run 瞬态定时器）。
+--- 默认隐藏 inactive（`--all` 显示），`--no-legend` 去表头，退出 0。
+--- @param no_legend boolean
+--- @param opts table|nil
+--- @return table
+local function _list_timers(no_legend, opts)
+  local all = _has_opt(opts, "--all") or _has_opt(opts, "-a")
+  local rows = {}
+  for _, t in pairs(timers) do
+    if all or t.active then rows[#rows + 1] = t end
+  end
+  table.sort(rows, function(a, b)
+    return (tonumber(a.next_at) or math.huge) < (tonumber(b.next_at) or math.huge)
+  end)
+  local lines = {}
+  if not no_legend then
+    lines[#lines + 1] = string.format("  %-28s %-14s %-28s %-12s %-32s %s",
+      "NEXT", "LEFT", "LAST", "PASSED", "UNIT", "ACTIVATES")
+  end
+  for _, t in ipairs(rows) do
+    lines[#lines + 1] = string.format("  %-28s %-14s %-28s %-12s %-32s %s",
+      t.next_at and os.date("%a %Y-%m-%d %H:%M:%S", t.next_at) or "n/a",
+      _rel_left(t.next_at),
+      t.last_at and os.date("%a %Y-%m-%d %H:%M:%S", t.last_at) or "n/a",
+      _rel_passed(t.last_at),
+      t.name,
+      tostring(t.activates))
+  end
+  lines[#lines + 1] = ""
+  lines[#lines + 1] = string.format("%d timers listed.", #rows)
+  if not all then
+    lines[#lines + 1] = "Pass --all to see loaded but inactive timers, too."
   end
   return _ok(table.concat(lines, "\n"))
 end
@@ -2066,7 +2680,22 @@ local function _dispatch(plan)
   if verb == "logs" then return async.resolve(_journal(plan, scope)) end
   if verb == "daemon-reload" then return async.resolve(_ok("")) end
   if verb == "reset-failed" then
-    -- 清除失败状态：门面无持久失败单元（服务退出码即状态来源），幂等成功（真实语义）。
+    -- 清除失败态：标记 reset_failed，使 `is-active`/`--failed`/degraded 不再把退出码非零
+    -- 视作 failed（真实 systemd 语义：reset-failed 后单元回到 inactive，系统回到 running）。
+    if #units == 0 then
+      local svcs = _svc()
+      if svcs then
+        for _, info in ipairs(svcs.list()) do
+          if info.status == "exited" and (tonumber(info.exit_code) or 0) ~= 0 then
+            reset_failed[info.name] = true
+          end
+        end
+      end
+    else
+      for _, name in ipairs(units) do
+        reset_failed[_unit_key({ name = _normalize_unit_name(name) }, scope)] = true
+      end
+    end
     return async.resolve(_ok(""))
   end
   if verb == "get-default" then
@@ -2084,14 +2713,7 @@ local function _dispatch(plan)
     return async.resolve(_ok("No jobs running."))
   end
   if verb == "list-timers" then
-    local lines = {}
-    if not no_legend then
-      lines[#lines + 1] = string.format("  %-24s %-12s %-24s %-12s %-32s %s",
-        "NEXT", "LEFT", "LAST", "PASSED", "UNIT", "ACTIVATES")
-    end
-    lines[#lines + 1] = ""
-    lines[#lines + 1] = "0 timers listed."
-    return async.resolve(_ok(table.concat(lines, "\n")))
+    return async.resolve(_list_timers(no_legend, opts))
   end
   if verb == "list-sockets" then
     local lines = {}
@@ -2122,7 +2744,8 @@ local function _dispatch(plan)
     local svcs = _svc()
     if svcs then
       for _, info in ipairs(svcs.list()) do
-        if info.status == "exited" and (tonumber(info.exit_code) or 0) ~= 0 then failed = failed + 1 end
+        if info.status == "exited" and (tonumber(info.exit_code) or 0) ~= 0
+          and not reset_failed[info.name] then failed = failed + 1 end
       end
     end
     local text = table.concat({
@@ -2184,9 +2807,52 @@ local function _dispatch(plan)
 
   if verb == "show" then
     if #units == 0 then return async.resolve(_fail("Unit name missing.", 1)) end
+    -- `--property`/`-p`（可逗号分隔、可重复）过滤；`--value` 仅输出值。
+    local props = {}
+    for _, o in ipairs(opts) do
+      local k, v = tostring(o):match("^([^=]+)=(.*)$")
+      if k == "--property" or k == "-p" then
+        for p in tostring(v):gmatch("[^,]+") do
+          p = p:gsub("^%s+", ""):gsub("%s+$", "")
+          if p ~= "" then props[p] = true end
+        end
+      end
+    end
+    local value_only = _has_opt(opts, "--value")
     local outs = {}
-    for _, name in ipairs(units) do outs[#outs + 1] = _show_text(name, scope) end
+    for _, name in ipairs(units) do
+      outs[#outs + 1] = _show_text(name, scope, props, value_only)
+    end
     return async.resolve({ stdout = table.concat(outs, "\n"), stderr = "", code = 0 })
+  end
+
+  if verb == "kill" then
+    if #units == 0 then return async.resolve(_fail("Unit name missing.", 1)) end
+    local sig = nil
+    for _, o in ipairs(opts) do
+      local k, v = tostring(o):match("^([^=]+)=(.*)$")
+      if k == "--signal" or k == "-s" then sig = v end
+    end
+    local signum = _signal_number(sig or "SIGTERM")
+    local outs, errs, code = {}, {}, 0
+    for _, name in ipairs(units) do
+      local norm = _normalize_unit_name(name)
+      local key = _unit_key({ name = norm }, scope)
+      local svcs = _svc()
+      local info = svcs and svcs.status(key) or nil
+      if not info or info.status == "exited" then
+        errs[#errs + 1] = string.format(
+          "Failed to kill unit %s: Unit %s is not active, cannot kill.", norm, norm)
+        code = math.max(code, 1)
+      else
+        local ok = svcs.signal(key, signum)
+        if not ok then
+          errs[#errs + 1] = string.format("Failed to kill unit %s: Operation not permitted", norm)
+          code = math.max(code, 1)
+        end
+      end
+    end
+    return async.resolve({ stdout = table.concat(outs, "\n"), stderr = table.concat(errs, "\n"), code = code })
   end
 
   if verb == "status" then
@@ -2203,8 +2869,40 @@ local function _dispatch(plan)
   if verb == "run" then
     -- systemd-run：启动一个沙箱内临时单元（后台服务）。真实 systemd-run 立即返回
     -- `Running as unit: <name>`；`--wait` 时等待其结束并返回单元退出码；`--pipe`/`-P`/`--pty`
-    -- 回传单元输出（无 tty）。
+    -- 回传单元输出（无 tty）。`--on-active`/`--on-calendar` 建立瞬态定时器。
     local argv = plan.argv or {}
+    if plan.on_active or plan.on_calendar then
+      if #argv == 0 then
+        return async.resolve(_fail("Failed to start transient timer: No command specified.", 1))
+      end
+      local base
+      if units[1] then
+        base = units[1]:gsub("%.timer$", ""):gsub("%.service$", "")
+      else
+        base = _transient_name():gsub("%.service$", "")
+      end
+      local timer_name = base .. ".timer"
+      local svc_name = base .. ".service"
+      local tkey = _unit_key({ name = timer_name }, scope)
+      if timers[tkey] and timers[tkey].active then
+        return async.resolve(_fail(string.format(
+          "Failed to start transient timer: Unit %s already exists.", timer_name), 1))
+      end
+      local unit = {
+        name = timer_name, timer = true, activates = svc_name,
+        description = "Transient timer for " .. svc_name,
+        on_active_sec = plan.on_active and _parse_sec(plan.on_active) or nil,
+        on_calendar = plan.on_active and nil or plan.on_calendar,
+        transient_command = _quote_argv(argv),
+        requires = {}, wants = {}, after = {}, before = {},
+      }
+      local started, terr = _timer_start(unit, scope)
+      if not started then
+        return async.resolve(_fail(string.format(
+          "Failed to start transient timer: %s", tostring(terr or "failed")), 1))
+      end
+      return async.resolve(_ok(string.format("Running timer as unit: %s", timer_name)))
+    end
     if #argv == 0 then
       return async.resolve(_fail("Failed to start transient service: No command specified.", 1))
     end
@@ -2334,7 +3032,14 @@ local function _dispatch(plan)
         .. "in the [Install] section, and DefaultInstance= for template units). This means they are "
         .. "not meant to be enabled using systemctl.", 1))
     end
-    if verb == "disable" then return async.resolve(_ok("")) end
+    local key = _unit_key({ name = norm }, scope)
+    if verb == "disable" then
+      pending_disable[key] = true
+      pending_install[key] = nil
+      return async.resolve(_ok(""))
+    end
+    pending_install[key] = { targets = targets, path = path, scope = scope }
+    pending_disable[key] = nil
     local admin_root = scope == "user" and _user_admin_root() or "/etc/systemd/system"
     local lines = {}
     for _, t in ipairs(targets) do
@@ -2429,6 +3134,22 @@ end
 --- 重置（测试用）。
 function M.reset()
   stopped_baseline = {}
+  reset_failed = {}
+  pending_install = {}
+  pending_disable = {}
+  transient_units = {}
+  for _, t in pairs(timers) do _timer_clear_handle(t) end
+  timers = {}
+end
+
+--- 诊断：当前门面定时器表（测试用）。
+--- @return table
+function M._debug_timers()
+  local out = {}
+  for k, t in pairs(timers) do
+    out[k] = { name = t.name, active = t.active, next_at = t.next_at, activates = t.activates }
+  end
+  return out
 end
 
 return M

@@ -9,7 +9,9 @@
 ---   会触及 nvim 主状态的 `vim.api.*`（非线程安全）。
 --- - `M.run` 的参数与返回值必须是原始类型（string / number / boolean / nil），不能是 table。
 --- - `M.run_codec` 用 `vim.mpack` 编解码结构化 table。
---- - 线程池大小 = CPU 核数，文件系统操作本身也在池里，排队共享。
+--- - 线程池大小 = libuv 线程池大小（默认 4，受 `UV_THREADPOOL_SIZE` 控制），文件系统操作
+---   本身也在池里，排队共享。启动时经 `M.configure_threadpool()` 按宿主核数放大
+---   （默认 `max(1, 核数-2)`），使大量读写文件的卸载获得真实并行。
 
 local async = require("NeoAI.utils.async")
 
@@ -91,6 +93,30 @@ function M.require()
     error("[NeoAI.work] 需要 Neovim 0.10+ 的 vim.uv.new_work；多线程卸载不可用", 2)
   end
   M.selfcheck()
+end
+
+--- 实际工作并行度：统一 `max(1, 核数-2)`（`utils.host.core_budget`），并限制在显式设置的
+--- libuv 线程池大小（`UV_THREADPOOL_SIZE`）内，避免提交数超过池容量堆积。
+--- @return number
+function M.parallelism()
+  local n = require("NeoAI.utils.host").core_budget()
+  local pool = tonumber(vim.env.UV_THREADPOOL_SIZE)
+  if pool and pool > 0 and n > pool then n = pool end
+  return n
+end
+
+--- 启动早期设置 libuv 线程池大小（`UV_THREADPOOL_SIZE`），使 `new_work` 能用上多核。
+--- 必须在 libuv 线程池首次创建（任何 worker/异步 fs 任务）之前调用才生效；用户已显式
+--- 设置该环境变量时尊重用户值。libuv 线程池大小一旦创建不可再变，故只能尽力而为。
+--- @return number 目标线程数（未改写环境变量时返回既有的用户值）
+function M.configure_threadpool()
+  local cur = vim.env.UV_THREADPOOL_SIZE
+  if cur and cur ~= "" then
+    return tonumber(cur) or require("NeoAI.utils.host").core_budget()
+  end
+  local n = require("NeoAI.utils.host").core_budget()
+  vim.env.UV_THREADPOOL_SIZE = tostring(n)
+  return n
 end
 
 --- 工作线程自检：在 worker 内跑一次结构化往返，验证 `vim.mpack` 可用。

@@ -16,11 +16,35 @@ end
 --- 从候选生成 fs 影响记录
 --- @param cand table
 --- @param meta table { command_id?, attempt_id?, evidence_id? }
+--- @param opts table|nil { sample?: number 超过该文件数时聚合为单条（含计数与采样路径），
+---   避免数万条影响记录在主线程 JSON 编码（包安装/大候选） }
 --- @return table 数组
-function M.from_candidate(cand, meta)
+function M.from_candidate(cand, meta, opts)
   meta = meta or {}
+  opts = opts or {}
+  local files = cand.files or {}
+  local sample = tonumber(opts.sample) or 0
+  if sample > 0 and #files > sample then
+    -- 大候选：聚合为一条，仅保留前 sample 条采样路径（审批 UI 仍按 cand.files 全量展示）。
+    local counts = { create = 0, modify = 0, delete = 0, mkdir = 0, rmdir = 0 }
+    local sample_paths = {}
+    for _, f in ipairs(files) do
+      counts[f.action] = (counts[f.action] or 0) + 1
+      if #sample_paths < sample then sample_paths[#sample_paths + 1] = f.path end
+    end
+    return { {
+      type = "fs",
+      action = "aggregate",
+      counts = counts,
+      file_count = #files,
+      sample_paths = sample_paths,
+      source = "observed",
+      coverage = "partial",
+      evidence_id = meta.evidence_id,
+    } }
+  end
   local out = {}
-  for _, f in ipairs(cand.files or {}) do
+  for _, f in ipairs(files) do
     out[#out + 1] = {
       type = "fs",
       action = f.action,
@@ -79,7 +103,12 @@ function M.stats(impacts)
   local network = { observed_tx_bytes = nil, estimated_tx_bytes = nil, denied = 0 }
   for _, i in ipairs(impacts or {}) do
     if i.type == "fs" then
-      if i.action == "create" then fs.observed_creates = fs.observed_creates + 1
+      if i.action == "aggregate" and i.counts then
+        fs.observed_creates = fs.observed_creates + (i.counts.create or 0)
+        fs.observed_writes = fs.observed_writes + (i.counts.modify or 0)
+        fs.observed_deletes = fs.observed_deletes + (i.counts.delete or 0)
+        fs.observed_mkdirs = fs.observed_mkdirs + (i.counts.mkdir or 0)
+      elseif i.action == "create" then fs.observed_creates = fs.observed_creates + 1
       elseif i.action == "modify" then fs.observed_writes = fs.observed_writes + 1
       elseif i.action == "delete" then fs.observed_deletes = fs.observed_deletes + 1
       elseif i.action == "mkdir" then fs.observed_mkdirs = fs.observed_mkdirs + 1

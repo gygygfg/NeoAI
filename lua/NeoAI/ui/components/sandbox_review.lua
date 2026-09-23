@@ -167,12 +167,17 @@ end
 local function _schedule_refresh()
   if state.refresh_pending then return end
   state.refresh_pending = true
-  vim.schedule(function()
+  -- 防抖：捕获/冻结可在一瞬间产生大量沙箱事件；同一窗口内合并为一次重绘，
+  -- 避免待审数千文件时每个事件都触发一次全量 build_lines + 写 buffer。
+  local ms = tonumber(require("NeoAI.kernel.config_store").get(
+    "tools.sandbox.review.refresh_debounce_ms")) or 80
+  local function run()
     state.refresh_pending = false
     if state.buf and vim.api.nvim_buf_is_valid(state.buf) then
       M.refresh()
     end
-  end)
+  end
+  if ms > 0 then vim.defer_fn(run, ms) else vim.schedule(run) end
 end
 
 --- 窗口打开期间订阅沙箱广播事件（幂等）；事件驱动自动刷新，无需手动 `r`。
@@ -399,6 +404,21 @@ function M.build_lines(items, traces, audit, saved)
     marks[#marks + 1] = { line = ln, start_col = 4, end_col = 4 + #note, level = missing and "verdict_unsafe" or "note" }
   end
   local risk = require("NeoAI.sandbox.risk")
+  -- 每单元最多渲染的文件行数（0 = 不限）：包安装/git 操作可达数千文件，逐行渲染（字符串 +
+  -- 高亮 + 行→目标映射）在开窗/每次刷新时都很慢；超限折叠为一行汇总。
+  local max_files = tonumber(require("NeoAI.kernel.config_store").get(
+    "tools.sandbox.review.max_display_files"))
+  if max_files == nil then max_files = 200 end
+  --- 追加「其余 M 个文件」汇总行，映射到整单元审批目标（与头行一致）。
+  local function _append_rest(rest, target, indent)
+    local text = ("%s… 其余 %d 个文件（已折叠；<CR> 应用整单元 / d 拒绝整单元）"):format(
+      indent or "  ", rest)
+    local ln = #lines + 1
+    lines[#lines + 1] = text
+    marks[#marks + 1] = { line = ln, start_col = 0, end_col = #text, level = "system" }
+    line_to_target[ln] = target
+    return ln
+  end
   -- 审批分区：未应用（待审）在前，已应用（含快照，可撤销）在后，边界醒目。
   if items and #items > 0 then
     local head = ("── 未应用（待审 %d 个变更单元）──"):format(#items)
@@ -527,7 +547,10 @@ function M.build_lines(items, traces, audit, saved)
       line_to_target[gln] = { change_set_id = item.change_set_id, whole = true }
     end
 
+    local shown = 0
     for _, f in ipairs(files) do
+      if max_files > 0 and shown >= max_files then break end
+      shown = shown + 1
       local path = _one_line(f.path or tostring(f))
       local suffix = f.action and ("  [" .. _one_line(f.action) .. "]") or ""
       local text = "  " .. path .. suffix
@@ -541,6 +564,9 @@ function M.build_lines(items, traces, audit, saved)
       end
       _append_note(path)
     end
+    if max_files > 0 and #files > shown then
+      _append_rest(#files - shown, { change_set_id = item.change_set_id, whole = true })
+    end
     -- 头行保持正常显示（审批入口，保留工具/风险/文件数与高亮），其后的密钥警告/风险原因/
     -- git 提示/文件行统一登记为一级折叠，默认收起、`za`/`zo` 展开——即「第一行显示、其余折叠」。
     -- 包安装/git 操作可达上千文件，折叠避免刷屏；头行已含文件数，审批仍可整单元进行。
@@ -548,8 +574,8 @@ function M.build_lines(items, traces, audit, saved)
     lines[#lines + 1] = ""
     end
   end
-  -- 已保存 / 已撤销（含原文件快照）：展示已发布到真实工作区的变更，`u` 撤销/重做保存
-  -- （把真实文件与保存时保留的原文件快照交换，可反复切换）。
+  -- 已保存（含原文件快照）：展示已发布到真实工作区的变更，`u` 撤销保存（回滚真实文件并回到待审）。
+  -- 历史遗留的「已撤销」记录仍展示，`u` 可重做保存。
   if saved and #saved > 0 then
     -- 标题按实际状态动态展示：撤销后条目仍在（供 u 重做），但不该再显示为「已保存」。
     local has_applied, has_reverted = false, false
@@ -558,11 +584,11 @@ function M.build_lines(items, traces, audit, saved)
     end
     local title
     if has_applied and has_reverted then
-      title = "已应用（已保存/已撤销，u 撤销/重做保存）"
+      title = "已应用（已保存/已撤销，u 撤销保存）"
     elseif has_reverted then
-      title = "已应用（已撤销，u 撤销/重做保存）"
+      title = "已应用（已撤销，u 重做保存）"
     else
-      title = "已应用（已保存，u 撤销/重做保存）"
+      title = "已应用（已保存，u 撤销保存）"
     end
     local title_ln = #lines + 1
     lines[#lines + 1] = "── " .. title .. "──（默认折叠，za/zo 展开）"
@@ -590,7 +616,10 @@ function M.build_lines(items, traces, audit, saved)
       marks[#marks + 1] = { line = hln, start_col = #base, end_col = #base + #label,
         level = reverted and "pending0" or "workspace" }
       line_to_target[hln] = { change_set_id = item.change_set_id, saved = true, whole = true }
+      local shown = 0
       for _, f in ipairs(files) do
+        if max_files > 0 and shown >= max_files then break end
+        shown = shown + 1
         local path = _one_line(f.path or tostring(f))
         local suffix = f.action and ("  [" .. _one_line(f.action) .. "]") or ""
         local text = "  " .. path .. suffix
@@ -603,6 +632,11 @@ function M.build_lines(items, traces, audit, saved)
         line_to_target[ln] = git_op
           and { change_set_id = item.change_set_id, saved = true, whole = true }
           or { change_set_id = item.change_set_id, path = path, saved = true }
+      end
+      if max_files > 0 and #files > shown then
+        local rln = _append_rest(#files - shown,
+          { change_set_id = item.change_set_id, saved = true, whole = true })
+        fold_levels[rln] = 2
       end
       -- 条目尾空行计入一级，保证区折叠连续闭合到末条（空行自身不可见）
       local blk = #lines + 1
@@ -665,6 +699,39 @@ local function _do_apply(target, opts)
   return sandbox.apply(target.change_set_id, req)
 end
 
+--- 执行一次应用（异步发布）：CAS + 写入在线程池执行，主线程不被大量文件阻塞。
+--- 若沙箱服务未提供 `apply_async`（旧版/测试桩）则回落同步结果。
+--- @param target table
+--- @param opts table|nil
+--- @return any Deferred|table
+local function _do_apply_async(target, opts)
+  local sandbox = services.use("services.sandbox")
+  if not sandbox then return nil end
+  opts = opts or {}
+  local req = {
+    auto_approve = true,
+    allow_root = opts.allow_root == true,
+    prefer_sudo = opts.prefer_sudo == true,
+  }
+  if not sandbox.apply_async then
+    -- 测试桩/旧服务：回落同步 apply。
+    if target.host_op or target.whole then return sandbox.apply(target.change_set_id, req) end
+    req.files = { target.path }
+    return sandbox.apply(target.change_set_id, req)
+  end
+  if target.host_op or target.whole then
+    return sandbox.apply_async(target.change_set_id, req)
+  end
+  req.files = { target.path }
+  return sandbox.apply_async(target.change_set_id, req)
+end
+
+--- @param v any
+--- @return boolean
+local function _is_deferred(v)
+  return type(v) == "table" and type(v.then_) == "function"
+end
+
 -- ========== root 提权确认弹窗 ==========
 
 local root_prompt = { win = nil, buf = nil }
@@ -722,7 +789,14 @@ local function _show_root_prompt(res, target, retry, retry_op)
   end
   local function confirm()
     close_then(function()
-      retry(retry_op(prefer_sudo))
+      local r = retry_op(prefer_sudo)
+      if _is_deferred(r) then
+        r:then_(function(res) retry(res) end, function()
+          retry({ ok = false, state = "FAILED", reason = "提权应用失败" })
+        end)
+      else
+        retry(r)
+      end
     end)
   end
   local function cancel()
@@ -749,8 +823,23 @@ local function _apply_target(target, ok_msg, fail_msg)
       vim.notify(fail_msg(res), vim.log.levels.ERROR)
     end
     M.refresh()
+    if res and res.ok then M.reveal_applied() end
   end
-  local res = _do_apply(target)
+  local res = _do_apply_async(target)
+  if _is_deferred(res) then
+    res:then_(function(r)
+      if r and not r.ok and r.state == "NEEDS_ROOT" then
+        _show_root_prompt(r, target, report, function(ps)
+          return _do_apply_async(target, { allow_root = true, prefer_sudo = ps })
+        end)
+      else
+        report(r)
+      end
+    end, function()
+      report({ ok = false, state = "FAILED", reason = "应用失败" })
+    end)
+    return
+  end
   if res and not res.ok and res.state == "NEEDS_ROOT" then
     _show_root_prompt(res, target, report)
   else
@@ -820,24 +909,37 @@ local function _apply_all_workspace()
       end
       _set_review_title("🗂 沙箱待审/已保存")
       M.refresh()
+      if items_n > 0 then M.reveal_applied() end
       return
     end
     i = i + 1
     local job = jobs[i]
     local opts = { auto_approve = true, files = job.files }
     if batch then opts.batch = batch end
-    -- 单项异常不能中断整批并永久锁住 applying_all（否则 `A` 之后无法再用）。
-    local ok, res = pcall(sandbox.apply, job.id, opts)
-    if not ok then res = nil end
-    if res and res.ok then
-      files_n = files_n + #job.files
-      items_n = items_n + 1
-    else
-      failed_n = failed_n + 1
-      if res and res.state == "NEEDS_ROOT" then root_n = root_n + 1 end
+    local function finish(res)
+      if res and res.ok then
+        files_n = files_n + #job.files
+        items_n = items_n + 1
+      else
+        failed_n = failed_n + 1
+        if res and res.state == "NEEDS_ROOT" then root_n = root_n + 1 end
+      end
+      _set_review_title(("🗂 沙箱待审/已保存（应用中 %d/%d）"):format(i, #jobs))
+      vim.defer_fn(step, 0)
     end
-    _set_review_title(("🗂 沙箱待审/已保存（应用中 %d/%d）"):format(i, #jobs))
-    vim.defer_fn(step, 0)
+    -- 异步发布（线程池）避免单个巨型变更单元阻塞主线程；单项异常不能中断整批。
+    local ok, res
+    if sandbox.apply_async then
+      ok, res = pcall(sandbox.apply_async, job.id, opts)
+    else
+      ok, res = pcall(sandbox.apply, job.id, opts)
+    end
+    if not ok then res = nil end
+    if _is_deferred(res) then
+      res:then_(finish, function() finish(nil) end)
+    else
+      finish(res)
+    end
   end
   _set_review_title(("🗂 沙箱待审/已保存（应用中 0/%d）"):format(#jobs))
   vim.defer_fn(step, 0)
@@ -955,19 +1057,26 @@ local function _reject_current()
   M.refresh()
 end
 
---- 撤销/重做保存光标所在条目：把真实文件与保存时保留的原文件快照交换。
---- 已保存 → 撤销（回滚到保存前）；已撤销 → 重新保存。冲突（真实文件被外部改动）时拒绝。
+--- 撤销保存光标所在条目：把真实文件回滚到保存前，并把该变更单元移回待审队列。
+--- 冲突（真实文件被外部改动）时拒绝。
 local function _undo_current()
   local target = state.line_to_target[vim.api.nvim_win_get_cursor(0)[1]]
   if not target or not target.saved then
-    vim.notify("[NeoAI] 请将光标移到「已保存/已撤销」条目行", vim.log.levels.WARN)
+    vim.notify("[NeoAI] 请将光标移到「已保存」条目行", vim.log.levels.WARN)
     return
   end
   local sandbox = services.use("services.sandbox")
   if not sandbox or not sandbox.undo then return end
   local function report(res)
     if res and res.ok then
-      local label = res.state == "REVERTED" and "已撤销保存" or "已重新保存"
+      local label
+      if res.requeued or res.state == "PENDING" then
+        label = "已撤销保存并回到待审"
+      elseif res.state == "REVERTED" then
+        label = "已撤销保存"
+      else
+        label = "已重新保存"
+      end
       vim.notify(("[NeoAI] %s %s"):format(label, target.change_set_id), vim.log.levels.INFO)
     elseif res and res.state == "NEEDS_ROOT" then
       vim.notify("[NeoAI] 撤销保存需要 root 权限：" .. tostring(res.reason), vim.log.levels.WARN)
@@ -1238,6 +1347,12 @@ local function _preview_data(target, item)
   local action = f and f.action or "modify"
   local before = (action == "create" or action == "mkdir") and "" or _read_file(target.path)
   local after = (action == "delete" or action == "rmdir") and "" or ((f and f.content) or "")
+  -- 内存 item 落盘后 content 已剥离：按候选摘要按需读取（小型 LRU）。
+  if (action ~= "delete" and action ~= "rmdir") and after == "" and not (f and f.content) then
+    local review = require("NeoAI.sandbox.review")
+    local lazy = review.content_for(item.change_set_id, target.path)
+    if lazy then after = lazy end
+  end
   -- 预览给用户看：token 还原为真实密钥（best-effort）。
   pcall(function()
     local restored = require("NeoAI.sandbox.secret").detokenize(after)
@@ -1456,7 +1571,7 @@ local function _confirm_l3()
   local p = state.pending_l3
   if not p then return end
   state.pending_l3 = nil
-  local res = _do_apply(p)
+  local res = _do_apply_async(p)
   _close_diff()
   local function report(res2)
     if res2 and res2.ok then
@@ -1468,6 +1583,17 @@ local function _confirm_l3()
         vim.log.levels.ERROR)
     end
     M.refresh()
+    if res2 and res2.ok then M.reveal_applied() end
+  end
+  if _is_deferred(res) then
+    res:then_(function(r)
+      if r and not r.ok and r.state == "NEEDS_ROOT" then
+        _show_root_prompt(r, p, report)
+      else
+        report(r)
+      end
+    end, function() report({ ok = false, state = "FAILED", reason = "应用失败" }) end)
+    return
   end
   if res and not res.ok and res.state == "NEEDS_ROOT" then
     _show_root_prompt(res, p, report)
@@ -1568,7 +1694,7 @@ function M.open()
   vim.keymap.set("n", "A", _apply_all_workspace, { buffer = state.buf, desc = "NeoAI 一键同意全部工作区修改" })
   vim.keymap.set("n", "d", _reject_current, { buffer = state.buf })
   vim.keymap.set("n", "i", _open_diff_current, { buffer = state.buf })
-  vim.keymap.set("n", "u", _undo_current, { buffer = state.buf, desc = "NeoAI 撤销/重做保存" })
+  vim.keymap.set("n", "u", _undo_current, { buffer = state.buf, desc = "NeoAI 撤销保存（回到待审）" })
   -- AI 审计（可配置按键；默认 a）
   local ai_cfg = require("NeoAI.kernel.config_store").get("tools.sandbox.review.ai_audit") or {}
   if ai_cfg.enabled ~= false then
@@ -1686,6 +1812,25 @@ end
 --- @return table
 function M.get_line_map()
   return state.line_to_target
+end
+
+--- 应用后展开「已应用」区：至少显示区标题与条目头行，使刚应用的条目可见。
+--- 「已应用」区默认整体折叠（foldlevel=0），应用后条目会移入该区但被折叠隐藏，看起来像「消失」。
+--- 这里只在当前折叠级别 < 1 时提升到 1（区展开、条目仍各自折叠），不干扰用户已手动展开的层级。
+function M.reveal_applied()
+  if state.win_id and vim.api.nvim_win_is_valid(state.win_id) then
+    local cur = tonumber(vim.wo[state.win_id].foldlevel) or 0
+    if cur < 1 then vim.wo[state.win_id].foldlevel = 1 end
+  end
+end
+
+--- 获取当前审批窗折叠级别（测试用）
+--- @return number|nil
+function M.get_foldlevel()
+  if state.win_id and vim.api.nvim_win_is_valid(state.win_id) then
+    return tonumber(vim.wo[state.win_id].foldlevel) or 0
+  end
+  return nil
 end
 
 --- 一键同意批量应用是否进行中（测试用）

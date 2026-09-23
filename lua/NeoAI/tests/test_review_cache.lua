@@ -274,4 +274,39 @@ tests.suite("review_cache", function(_, it)
     store.reset()
     review.reset()
   end)
+
+  it("应用兜底：候选文件外部丢失但曾落盘时，从暂存副本重建并应用", function(t)
+    local store, review = setup()
+    local candidate = require("NeoAI.sandbox.candidate")
+    local dir = vim.fn.tempname()
+    vim.fn.mkdir(dir, "p")
+    local p = dir .. "/f.txt"
+    local cand = {
+      candidate_digest = "sha256:lost",
+      files = { { path = p, action = "create", after_hash = "h", content = "hi" } },
+      created_at = 1, effect = "fs_write",
+    }
+    -- 生产路径：候选先并入暂存层（暂存副本保存内容），再冻结候选、入待审。
+    candidate.reset()
+    candidate.ensure_dirs(store.root())
+    candidate.begin_session()
+    candidate.merge_candidate(cand)
+    store.write_candidate(cand)
+    local item = review.enqueue(cand, { tool = "edit_file" })
+    t.true_(store.was_written("sha256:lost"), "应记录候选曾写入")
+    -- 外部删除候选文件（不经 discard_candidate，模拟实例存储被清理）
+    vim.fn.delete(store.root() .. "/candidates/sha256_lost.json")
+    t.nil_(store.read_candidate("sha256:lost"), "候选文件应已丢失")
+    local orig = candidate.publish
+    local published
+    candidate.publish = function(c) published = c; return { ok = true, receipt = { operation_id = "op" } } end
+    local res = review.apply(item.change_set_id, { auto_approve = true })
+    candidate.publish = orig
+    t.true_(res and res.ok, "应从暂存副本重建候选并应用: " .. tostring(res and res.reason))
+    t.not_nil(published, "应调用 publish")
+    t.eq("hi", ((published.files or {})[1] or {}).content, "重建内容应来自暂存副本")
+    candidate.reset()
+    store.reset()
+    review.reset()
+  end)
 end)

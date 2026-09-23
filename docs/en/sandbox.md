@@ -168,6 +168,16 @@ is only kept for other `approval.mode` values (`prompt`/`strict`).
     synchronously on the main thread. An in-memory cache makes a just-written item immediately
     readable; it is dropped once flushed (bounded memory). `sandbox.shutdown` / `store.reset` call
     `store.flush()` first, so shutdown and reset lose no data and are not polluted by late writes.
+  - **Flush the candidate before it is enqueued**: `_persist_and_settle` does a bounded `store.flush`
+    after `write_candidate_async` and before enqueuing; package merging (`_merge_package_item`) also
+    flushes the merged candidate before discarding the members' old candidates — otherwise a large
+    (non-ASCII, hence thread-pool-validated) candidate write may not finish before process
+    exit/hot-reload, or old candidates may be deleted while the new one does not exist yet, leaving
+    the review item pointing at a missing candidate and `CANDIDATE_NOT_FOUND` on apply.
+    `review.apply` flushes and retries once when the candidate read fails; if the candidate was
+    **previously written** (`store.was_written`) and the review item still holds file content, it
+    rebuilds the candidate from the item and continues (logging `store.root` as a diagnostic); a
+    never-written candidate still fails honestly, not masking a real loss.
   - **JSON encoding no longer deep-scans the main thread**: `json.encode_fast` uses `vim.json`
     (C implementation) directly, skipping the pure-Lua whole-table UTF-8 deep scan in
     `_sanitize_value` (the main freeze source for large candidates). Before persisting, a C-level
@@ -184,10 +194,13 @@ is only kept for other `approval.mode` values (`prompt`/`strict`).
   - **Capture workspace-consistency check runs in the worker**: `_capture_worker` receives the
     workspace staging map and compares, in-thread, whether a command change merely reproduces a
     staged edit; the main thread no longer re-reads two contents per changed file.
-  - **Batched chunk-job submission**: `work.batched` keeps at most
-    `tools.sandbox.work_parallelism` (default 4, matching the libuv pool) in flight per batch, so
-    hundreds of chunk jobs cannot flood the queue and starve later UI-critical jobs
-    (redaction / secret tokenization / disk writes).
+  - **Batched chunk-job submission**: `work.batched` keeps at most the internal `max(1, cores-2)`
+    (`utils/host.lua`) in flight per batch, so hundreds of chunk jobs cannot flood the queue and
+    starve later UI-critical jobs (redaction / secret tokenization / disk writes). The **libuv
+    thread pool defaults to only 4 threads**; at startup
+    `NeoAI.utils.work.configure_threadpool()` enlarges `UV_THREADPOOL_SIZE` to the same value (must
+    run before the pool is first created; an explicitly set env var is respected) — otherwise extra
+    cores still only run 4 workers.
   - **Session rotation migration runs on the thread pool**: `rotate_session` hands the file copies
     (including directories) to a worker; staged access waits via `_await_rotation` for the
     migration to finish (usually already done, so the wait is 0). At agentEnd, long sessions with
@@ -259,11 +272,14 @@ is only kept for other `approval.mode` values (`prompt`/`strict`).
     item (`q`/`<Esc>` closes it and returns to the review window with the cursor restored); on an
     **out-of-bounds access trace** line, `i` opens the **access details** for that path (each access's
     tool / kind / command / time; not an approval target),
-    `u` **undoes/redoes the save**, `q`/`<Esc>` closes. **While open, the window subscribes to sandbox
+    `u` **undoes the save (back to pending)**, `q`/`<Esc>` closes. **While open, the window subscribes to sandbox
     broadcast events and refreshes automatically** (enqueue/apply/reject/revert, out-of-bounds traces,
     host operations; multiple events in the same tick are coalesced into one redraw) — no manual
     refresh. **The "applied" section is
     collapsed by default** (whole section collapsed via `za`/`zo`, then each item collapsed again);
+    **after a successful apply the section is auto-revealed to level one** (`reveal_applied`, item
+    headers visible, files still folded) so a just-applied item no longer looks "gone" because of the
+    default fold;
     **a pending item shows its header line with the rest folded** (the header — tool / risk badge /
     file count / `待审` — stays visible and is the whole-unit approval entry; the secret warning, risk
     reasons, git hint and file list start collapsed, `za`/`zo` expands), avoiding a flood from package
@@ -275,12 +291,14 @@ is only kept for other `approval.mode` values (`prompt`/`strict`).
     so the cursor may sit on either. Inside the chat main window
     press `<leader>ap` to trigger it (`keymaps.chat.sandbox_review`).
     - **Show saved / undo save**: applying (saving) keeps a **snapshot of the original file** (its
-      content before the apply). The review window's "已应用（已保存/已撤销，u 撤销/重做保存）" section lists
-      changes already published to the real workspace; pressing `u` on an item **swaps** the real file
-      with the snapshot — saved → undone (rolls back to the pre-apply content), undone → saved again,
-      toggling repeatedly. A CAS check runs before the swap: if the real file was changed externally
-      (hash mismatch) the operation is refused with `CONFLICT`, never overwriting user edits. Snapshots
-      live in the per-process instance store (`snapshots/`) and are reclaimed with the instance dir.
+      content before the apply). The review window's "已应用（已保存，u 撤销保存）" section lists changes
+      already published to the real workspace; pressing `u` on an item **rolls the real file back to its
+      pre-apply content** and **moves the change unit back to the "未应用（待审）" (pending) section** —
+      rebuilding a candidate from the applied side of the snapshot and clearing the snapshot — so it can
+      be reviewed and applied again. A CAS check runs before the rollback: if the real file was changed
+      externally (hash mismatch) the operation is refused with `CONFLICT`, never overwriting user edits.
+      Snapshots live in the per-process instance store (`snapshots/`) and are reclaimed with the
+      instance dir.
     - **Package installs are grouped per install command**: candidates produced by npm/pip/apt
       package installs are labelled on the header as `包安装 <manager>: <packages>`
       (`privilege.package_info`) and **merged into a single approval unit by the install-command
@@ -338,6 +356,81 @@ is only kept for other `approval.mode` values (`prompt`/`strict`).
       **re-materialized** from disk by `_rehydrate_pending` after a reload/restart, so large
       staged content such as package installs stays readable until applied or rejected and is not
       destroyed by session rotation/exit.
+    - **Many files entering the approval UI / applying to disk / staging memory** (regression with
+      thousands of staged files):
+      - **Review-window render cap + refresh debounce**: `tools.sandbox.review.max_display_files`
+        (default 200) caps the file rows rendered per change set — package installs/git ops can carry
+        thousands of files and, even when folded, each file would otherwise produce a line string,
+        highlight and line→target mapping, making open/refresh slow as reviews pile up. Beyond the cap
+        they collapse into one `… N more files (folded; <CR> apply whole unit / d reject whole unit)`
+        row mapped to the whole-unit target (header/summary both apply or reject the whole unit;
+        the first N files remain individually approvable). `tools.sandbox.review.refresh_debounce_ms`
+        (default 80) coalesces multiple sandbox events in the same window into one redraw.
+      - **Async publish (two-phase, thread pool)**: `review.apply_async` / `sandbox.apply_async` run
+        CAS checks and writes in parallel chunks via `utils.work`, so the main thread is no longer
+        blocked by per-file read/hash/fsync over many files. **Phase one** is a parallel read-only CAS;
+        any conflict aborts immediately (**never a partial write**). Only if all pass does **phase two**
+        write in parallel (keeping per-file fsync durability). Privilege escalation (`allow_root` /
+        root+run_as drop, `sudo`), order-sensitive cases (git atomic group object→normal→pointer,
+        deletes child-before-parent) or an unavailable thread pool **fall back to synchronous
+        `candidate.publish`** with identical semantics. The review UI (`<CR>`/`A`/L3 re-confirm) uses
+        async publish by default and yields the main loop per item in a batch-apply session.
+      - **CAS mode**: `tools.sandbox.review.cas_mode` (`hash` default — full read+hash per file, the
+        strongest consistency; `auto` — stat signature for very large files/blobs, hash otherwise;
+        `sig` — signatures only, fastest). Non-default values loosen detection of "same-size,
+        same-mtime content change"; use only with a clear understanding of the impact.
+      - **Candidate content is not kept resident in memory**: `files[].content` is **stripped** from
+        pending/terminal items once persisted (candidate content lives on disk); the diff preview
+        reads it on demand via `sandbox.content_for(id, path)` (`tools.sandbox.review.content_cache_max`,
+        an LRU defaulting to 64). The old "rebuild from the pending item when the candidate file is
+        lost" now recovers from the **sandbox staged copy** (`candidate.read_path`). Package-merge
+        (`_merge_package_item`) and composite publish (`_compose`) no longer `vim.deepcopy`
+        content-bearing candidates — they reuse read-only references / shallow copies.
+      - **Candidate content on disk (content-addressed blobs)**: command-capture candidate content is
+        no longer embedded in the candidate JSON or held resident; it is **copied per file into the
+        instance store's `blobs/`** (`candidate.blobify_async`), and entries only record the `blob`
+        path and content hash. Package/generated content (uv sync's `.venv`, `node_modules`, etc.) is
+        disk-backed before merge, so thousands of files are no longer read into memory in bulk. At
+        publish, non-large blobs are read per file and decrypted before writing; large files are copied
+        straight from the blob (never loaded into Lua memory). `merge_candidate`/materialization copy
+        blobs back into the staged view per file, and blobs survive restarts with the instance store so
+        the candidate can still be published. Blobs are cleaned with the instance dir on
+        `store.reset`/GC.
+      - **Package/generated-content signature mode (`packages.signature_mode`, on by default)**: for
+        candidates with thousands of files (uv sync's `.venv`, `node_modules`, `site-packages`, ...),
+        freezing **does not read content or compute pure-Lua SHA-256** — both base and after use
+        `sig:<mtime.sec>:<mtime.nsec>:<size>` signatures (content is copied to a blob directly by the
+        kernel via `fs_copyfile`), and change detection and publish CAS compare signatures. Same-size +
+        same-mtime content edits are no longer detected — these trees are force-reviewed anyway; set to
+        `false` to revert to content hashing (strongest consistency, noticeably slower for many files).
+      - **Mask/git/level classification moved to worker threads**: for package candidates, effective
+        masking, `.git` classification, and workspace-level are no longer resolved per file on the main
+        thread via `vim.fn.resolve`/`fnamemodify`; `utils.work` runs a batch classifier in a worker
+        using native `vim.uv.fs_realpath` (`candidate._classify_paths_worker`) and the main thread only
+        consumes the result; `risk.classify` uses the prefetched levels (`facts.path_levels`).
+        Non-package candidates keep the original synchronous path, unchanged.
+      - **Impact/evidence aggregation for large candidates**: when impact records
+        (`observe.from_candidate`) exceed `review.max_display_files`, they are aggregated into one record
+        (action counts + first-N sample paths), avoiding main-thread JSON encoding of tens of thousands
+        of rows; the review UI still shows all `cand.files`.
+      - **Post-process stage profiling**: with `tools.sandbox.diagnostics.enabled`, logs separately
+        record `capture` / `finish` / `persist` and the settle sub-stages `settle.ephemeral` /
+        `settle.impact` / `settle.secret` / `settle.risk` / `settle.enqueue`, making the fixed-cost
+        segment easy to spot for large file sets.
+      - **Apply and undo copy files; snapshots are disk-backed**: before applying, the real file is
+        **copied into a blob** (`_capture_snapshot`) as the undo snapshot and copied back on undo — the
+        original content is never embedded in the snapshot JSON or held resident. Undo CAS uses an
+        mtime/size signature by default (`tools.sandbox.review.snapshot_cas="sig"`, avoiding per-file
+        read+hash CPU after apply; `"hash"` restores the strictest consistency).
+      - **Bounded terminal eviction**: `tools.sandbox.review.terminal_cache_max` (default 200) caps the
+        rejected/superseded (REJECTED/SUPERSEDED/EXPIRED) change sets kept in memory; excess items are
+        dropped from memory and `get`/`list` fall back to disk on demand (no data loss).
+        APPLIED/REVERTED are retained (the undo list depends on them).
+      - **Snapshot metadata and bounded cache**: snapshots are written together with a metadata copy
+        that strips the original file content (`snapshots_meta/`), so listing "applied" items in the
+        review UI only reads metadata instead of decoding every saved snapshot's original content into
+        memory on each open; the full-snapshot read cache has an LRU cap (default 8), bounding memory
+        as saves accumulate.
     - **Per-nvim-process isolation**: each nvim process uses its own instance store root
       `<workspace_root>/instances/<pid>_<started_at>`; the pending queue, candidates, receipts and
       evidence are **not shared** across processes — with two sessions open, neither sees the other's
@@ -394,9 +487,13 @@ is only kept for other `approval.mode` values (`prompt`/`strict`).
   pending change set so the user can confirm them one by one. `sandbox.reject_file(id, path)`
   rejects a single file.
 - **Re-validation before publish (defense in depth)**: `candidate.publish` re-canonicalizes every
-  file path — if the resolved result differs from the recorded path (`..`/symlink introduced or
-  swapped, e.g. a tampered on-disk candidate) it returns `CONFLICT/PATH_CHANGED`; if it hits a
-  host-sensitive masked path (`is_masked_path`) it returns `FAILED/SANDBOX_MASKED_TARGET`. Even a
+  file path — it resolves **ancestor** symlinks and collapses `..`, but treats the **final component
+  literally** (it does not follow a leaf symlink); if the result differs from the recorded path
+  (`..` traversal / an ancestor directory swapped for a symlink, e.g. a tampered on-disk candidate)
+  it returns `CONFLICT/PATH_CHANGED`. Treating the leaf literally keeps legitimate leaf symlinks
+  (e.g. `uv sync`'s `.venv/bin/python`) from resolving to uv's Python install dir and wrongly
+  vetoing the whole change set. If it hits a host-sensitive masked path (`is_masked_path`, which
+  still resolves fully and follows leaf symlinks) it returns `FAILED/SANDBOX_MASKED_TARGET`. Even a
   locally-rewritten candidate cannot write to an unvalidated real location.
 - **Unpublishable files dropped at freeze**: before building the candidate, `candidate.finish`
   drops two kinds of files so a single one cannot fail the **whole** change set (e.g. a package
@@ -853,7 +950,8 @@ sandbox-identifying comments/strings.
   instead go through the in-sandbox entry, which forwards to the same facade over IPC.
 - **Support matrix (output/errors/exit codes aligned with real systemctl)**:
   - Verbs: `start`/`stop`/`restart`/`status`/`is-active`/`is-enabled`/`is-system-running`/
-    `is-failed`/`show`/`cat`/`daemon-reload`/`list-units`/`list-unit-files`.
+    `is-failed`/`show`/`cat`/`daemon-reload`/`list-units`/`list-unit-files`/`kill`/
+    `list-timers`/`reset-failed`.
   - Silent success: `start`/`stop`/`restart`/`daemon-reload` print nothing on success (real
     `systemctl` behavior).
   - `is-system-running`/`is-failed` reflect the **facade's own state** (a failed unit → `degraded`,
@@ -868,7 +966,8 @@ sandbox-identifying comments/strings.
     the raw output instead of wrapping it as `{"ok":false}` (so the AI does not mistake "service not
     running" for a tool error).
   - `is-enabled`: `enabled`/`disabled`/`static`/`masked`/`not-found` (from `[Install]` and `.wants`
-    symlinks) with matching exit codes.
+    symlinks) with matching exit codes. A staged-but-unapproved `enable`/`disable` is reflected by an
+    in-session **pending virtual view** (see below).
   - `status`/`show`/`cat`/`list-units`/`list-unit-files` are synthesized with real fields/headers;
     `--version` matches the host's `systemctl --version` exactly (read at generation time; no more
     hardcoded `systemd 255`).
@@ -907,7 +1006,9 @@ sandbox-identifying comments/strings.
   `-p WorkingDirectory=/Environment=/Description=`; without `--unit` it auto-names
   `run-r<hex>.service`. `--pipe`/`-P`/`--pty`/`-t`/`--scope` run with foreground semantics and
   **return the command output and exit code** (no real tty, but no more "not supported" error). Transient units show up in `list-units`/`is-active`;
-  `--collect` is effectively automatic when the service is destroyed.
+  `--collect` is effectively automatic when the service is destroyed. `--on-active=`/`--on-calendar=`
+  create a **transient timer** (`<unit>.timer` + `<unit>.service`), print
+  `Running timer as unit: <name>`, run the command on expiry, and appear in `list-timers`.
 - **`systemd-analyze` (boot analysis, routed to the facade)**: the in-sandbox
   `/usr/bin/systemd-analyze` is likewise overridden by the thin entry and forwarded to the facade.
   Real `systemd-analyze` needs system D-Bus to fetch boot data from PID1 (the sandbox has no D-Bus,
@@ -926,9 +1027,30 @@ sandbox-identifying comments/strings.
   `-T`/`--ctime` and `-l`/`--level`) with no host kernel info.
 - **Transient-unit consistency**: units created by `systemd-run` (no unit file) are first-class across
   `status`/`show`/`cat`/`is-enabled` (`generated`)/`start`/`stop`/`restart`.
-- **`reset-failed`**: the facade has no persistent failed units, so it succeeds idempotently (real
-  semantics; no more `Unknown command verb`). Also `get-default`/`set-default`/`show-environment`/
-  `list-timers`/`list-sockets`/`list-jobs` are synthesized (real-style output, exit 0).
+- **`reset-failed`**: clears the failed state (recorded in the facade's session state) — afterwards
+  the unit's `is-active` returns to `inactive`, it no longer appears in `--failed`, and the system
+  state recovers from `degraded` to `running`; with no argument it clears all currently failed units.
+  A subsequent `start` also clears the failed state. Also `get-default`/`set-default`/
+  `show-environment`/`list-sockets`/`list-jobs` are synthesized (real-style output, exit 0).
+- **`show` honors `--property`/`-p` (comma-separated or repeated) and `--value`**; the property set
+  includes real `Type`/`Restart`/`RestartUSec`/`RestartSec`/`NRestarts`/`MemoryMax`/`MemoryHigh`/
+  `MemoryCurrent`/`CPUQuota`/`CPUQuotaPerSecUSec`/`TimeoutStartUSec`/`TimeoutStopUSec`/
+  `RemainAfterExit`/`LoadState`/`ActiveState`/`SubState`, etc.
+- **`Restart=`/`RestartSec=` (with `StartLimitBurst`/`StartLimitIntervalSec`)**: for a non-`no`
+  long-running service, `sandbox.service` **auto-restarts the process after an unexpected exit**
+  (delayed by `RestartSec`, rate-limited afterwards), and `NRestarts` accumulates and is exposed via
+  `show`/`status`. `Restart=on-failure`/`on-success`/`on-abnormal` decide by exit code/signal.
+- **`kill` (supports `-s`/`--signal`, e.g. `SIGTERM`/`SIGKILL`/`15`)**: signals the unit's current
+  payload process tree (through the resource domain); no host fallback.
+- **`MemoryMax`/`MemoryHigh`/`CPUQuota`**: parsed and reported by `show`; also mapped onto the
+  service's cgroup resource domain (`MemoryMax`→`memory.max`, `CPUQuota=50%`→`cpu.max`), reported as
+  intent only when cgroups are unavailable.
+- **`.timer` units (`OnActiveSec`/`OnBootSec`/`OnStartupSec`/`OnUnitActiveSec`/`OnCalendar`
+  keywords and `*-*-* HH:MM[:SS]`)**: `start`/`stop`/`restart`/`status`/`is-active` and
+  `list-timers` are all enforced by the facade **in-session** using the host event loop; on expiry
+  it starts `Unit=` (default: same-named `.service`), keeps scheduling for repeating conditions
+  (`OnUnitActiveSec`/`OnCalendar`), and becomes inactive after a one-shot trigger. Timer state is
+  cleared on `reset`/session end and never written to the host.
 - **ExecStart semantics match real systemd**: systemd specifiers are expanded (`%n`/`%N`/`%p`/`%i`/
   `%u`/`%h`/`%t` …, `%%`→literal `%`; unknown specifiers are left literal); only `${VAR}` is expanded
   (`$$`→`$`), bare `$VAR` is left literal (`ExecStart=/bin/sh -c 'i=1; [ $i -lt 2 ]'` is no longer
@@ -955,7 +1077,7 @@ sandbox-identifying comments/strings.
   host's real `journalctl` (which would print `No journal files were found.`). Each line's timestamp
   **increments**, with `Logs begin/end` spanning the first/last, instead of all lines sharing one
   instant.
-- **Explicitly rejected (no host fallback, no hostop)**: `.socket`/`.timer` units, template/instance
+- **Explicitly rejected (no host fallback, no hostop)**: `.socket` units, template/instance
   units, `Requisite`/`BindsTo`/`PartOf`/`OnFailure` dependencies, unknown `Type=`; plus host
   power/kernel-state operations
   `poweroff`/`reboot`/`halt`/`kexec`/`suspend`. Returns real-systemctl-style errors (e.g.
@@ -987,17 +1109,25 @@ sandbox-identifying comments/strings.
   parser (above); set `maintscript_stubs=false` to disable `policy-rc.d`. The **entry itself** is
   controlled by `systemd.enabled` and applies to **all** process commands, independent of
   `maintscript_stubs`.
-- **enable/disable symlink staging**: with `stage_install` (on by default), system-level
-  `systemctl enable/disable` parses the unit's `[Install] WantedBy/RequiredBy` and stages the
-  symlink changes (enable creates `/etc/systemd/system/<target>.wants/<unit>`, disable removes it)
-  as review candidates via `candidate.stage_link` / `stage_delete`, applied after approval; nothing
-  lands on the host. It prints real `Created symlink …` / `Removed "…"` text. User-level
-  `systemctl --user enable/disable` is handled by the facade's **fake parser** and its symlinks are
-  staged under the user unit root (see "Fake systemd --user parser").
+- **enable/disable symlink staging and virtual view**: with `stage_install` (on by default),
+  system-level `systemctl enable/disable` parses the unit's `[Install] WantedBy/RequiredBy` and
+  stages the symlink changes (enable creates `/etc/systemd/system/<target>.wants/<unit>`, disable
+  removes it) as review candidates via `candidate.stage_link` / `stage_delete`, applied after
+  approval; nothing lands on the host. It prints real `Created symlink …` / `Removed "…"` text.
+  Because the symlink does not exist before approval, the facade keeps an in-session **pending
+  virtual view**: after `enable`, `is-enabled`/`list-unit-files` immediately report `enabled`, and
+  after `disable` they immediately report `disabled` (consistent with the real symlink once it
+  appears); cleared on `reset`/session end. User-level `systemctl --user enable/disable` is handled
+  by the facade's **fake parser** and its symlinks are staged under the user unit root (see "Fake
+  systemd --user parser").
 - **Known limits**: template/instance units (`foo@bar.service`) are unsupported; `[Install] Also=` is
   not expanded yet; `notify`/`forking`/`dbus` etc. can start but do **no READY notification or
   daemonize child tracking** (best-effort simple semantics), so their observable behavior differs
-  from a real systemd (a known detectable difference).
+  from a real systemd (a known detectable difference). Timers are **scheduled in-session**: they
+  only run while the facade host process is alive and are not persisted across restarts (no host
+  timer is written). Services started by the facade run in a nested namespace, so `ps`/`pgrep`
+  **inside the sandbox cannot see them** (while `status`/`journalctl`/`is-active` stay consistent) —
+  a known detectable difference from real systemd.
 
 ### Fake systemd --user parser (`tools.sandbox.systemd.user`)
 
@@ -1016,7 +1146,8 @@ the facade (`sandbox/systemd.lua`) with a **fake parser** covering only simple
   `[Service]` `Type`/`ExecStart` with specifier & env expansion/`Environment`/`WorkingDirectory`;
   the same type set as the system-level facade).
   `start` hands `ExecStart` to `sandbox.service` to run in the sandbox; `is-active`/`status` are
-  synthesized from service state.
+  synthesized from service state. The system-level facade's `.timer` scheduling, `kill`,
+  `Restart=` auto-restart and `show --property` apply to `--user` as well.
 - **Namespace isolation**: user unit service keys are prefixed `user-unit:`, separate from system
   `unit:`, so same-named units do not collide.
 - **enable/disable symlink staging**: `systemctl --user enable/disable` stages symlink changes (enable
@@ -1055,9 +1186,9 @@ the facade (`sandbox/systemd.lua`) with a **fake parser** covering only simple
   `memory.max`/`cpu.max`; the upper limit-holder is not writable, so writes cannot exceed the session
   limits or touch other host cgroups. In gateway mode (`ip netns exec`) the bind source is
   unresolvable, so it is skipped.
-- **Relaxed resource limits**: defaults are `memory_ratio=0.75`, `cpu_cores_max=8`, `pids_max=8192`,
-  avoiding OOM on large npm dependency trees / parallel builds (too-small `pids.max` shows up as
-  process-creation failures/OOM).
+- **Relaxed resource limits**: defaults are `memory_ratio=0.75`, CPU core budget `max(1, cores-2)`
+  (derived internally, not configurable), and `pids_max=8192`, avoiding OOM on large npm dependency
+  trees / parallel builds (too-small `pids.max` shows up as process-creation failures/OOM).
 
 ### 137 / OOM attribution and diagnostics (`tools.sandbox.diagnostics`)
 
@@ -1458,11 +1589,13 @@ commands (SSRF, e.g. host admin panels, internal ports, cloud metadata):
   (PyPI/pythonhosted, npm/npmmirror, crates/rust-lang, proxy.golang.org/goproxy, Maven,
   Debian/Ubuntu/Alpine/Docker repos, and public mirrors such as `tuna.tsinghua.edu.cn`,
   `mirrors.aliyun.com`, `mirrors.ustc.edu.cn`) through the proxy is **allowed without a prompt**
-  (recorded as `allow_source`). It only applies when the target is judged **non-host-local**:
-  resolving to the host, or failed DNS (fail-closed), is still denied as host-local, so SSRF
-  protection is unchanged; `access="deny"` still denies. Add private/self-hosted mirrors via
-  `network.extra_package_sources` (subdomains match automatically); set `auto_allow_sources=false`
-  to disable the carve-out.
+  (recorded as `allow_source`). Auto-allowed requests are **not returned in the command result**
+  (no `…[http] allowed` lines, avoiding noise from the many normal connections a package install
+  makes; they are still recorded internally/in evidence) — only **blocks / upstream failures** are
+  surfaced. It only applies when the target is judged **non-host-local**: resolving to the host, or
+  failed DNS (fail-closed), is still denied as host-local, so SSRF protection is unchanged;
+  `access="deny"` still denies. Add private/self-hosted mirrors via `network.extra_package_sources`
+  (subdomains match automatically); set `auto_allow_sources=false` to disable the carve-out.
 - **Boundary (important)**: this is **application-layer** filtering. **Raw TCP that ignores the
   proxy** (`nc`/`ssh`/database clients, tools ignoring proxy env) can connect directly to the host
   under a shared netns and is not covered. Hard-interception of raw TCP requires either root +
@@ -1578,7 +1711,7 @@ require("NeoAI").setup({
       review = { enabled = true, auto_apply = false }, -- async review: candidates enter a pending queue
       retention = { candidate_days = 7, max_pending = 20 },
       policy = { deny_tools = {}, rules = {} },
-      limits = { wall_ms = 60000, dynamic = true, memory_ratio = 0.75, cpu_cores_max = 8, cpu_global_max = 0, pids_max = 8192 },
+      limits = { wall_ms = 60000, dynamic = true, memory_ratio = 0.75, pids_max = 8192 },
     },
   },
 })
@@ -1735,9 +1868,9 @@ decision records are kept by default for policy replay (`evidence.prune(days, { 
 
 Each external process attempt gets its own resource domain from `tools.sandbox.limits`. By default
 `dynamic = true` derives caps from host resources — memory = `MemTotal * memory_ratio` (default 0.75,
-bounded by `memory_max_bytes`), CPU = `min(nproc, cpu_cores_max)` cores (default 8), PIDs =
-`pids_max` (default 8192); explicit static `memory_bytes`/`pids`/`cpu_max` (>0) win over the derived
-values.
+bounded by `memory_max_bytes`), CPU = `max(1, cores-2)` cores (derived internally via
+`utils/host.lua`, not configurable), PIDs = `pids_max` (default 8192); explicit static
+`memory_bytes`/`pids` (>0) win over the derived values; there is no static CPU override.
 
 **Process membership and over-limit semantics**: the payload joins the domain via
 `cgroup.join_prefix`, and that prefix is **prepended before `bwrap`**
@@ -1756,15 +1889,15 @@ actually allows (making it a no-op, with the OOM triggered by the outer containe
 `oom_kill` recorded in the child domain — losing the 137 attribution). The derivation therefore also
 reads `/proc/self/cgroup` to locate the current cgroup and walks up the `/sys/fs/cgroup` parent chain
 to the nearest finite `memory.max`/`cpu.max`, taking the **min** with the host-derived value (explicit
-static values still win); `cpu_global_max` is likewise capped by the container CPU quota. The container
-quota is shown by `:NeoAISandboxDiag` in the `cgroup_quota` field.
+static values still win); the CPU core budget is likewise capped by the container CPU quota. The
+container quota is shown by `:NeoAISandboxDiag` in the `cgroup_quota` field.
 
 All concurrent attempts share a parent domain `neoai`: the parent's `cpu.max` is the global budget
-`cpu_global_max` (default `max(1, nproc-1)`, reserving one core for nvim/UI), and each child's
-`cpu.max` is `min(cpu_cores_max, global budget)`. The sum of concurrent per-task quotas therefore
-never exceeds the host's available cores (no oversubscription where each task gets N cores and the
-total far exceeds the core count, saturating the machine and stalling the chat UI), while a single
-task is still subdivided by `cpu_cores_max`.
+`max(1, cores-2)` (derived internally, reserving two cores for nvim/UI), and each child's `cpu.max`
+is `min(that budget, global budget)`. The sum of concurrent per-task quotas therefore never exceeds
+the host's available cores (no oversubscription where each task gets N cores and the total far
+exceeds the core count, saturating the machine and stalling the chat UI), while a single task is
+still subdivided by that budget.
 
 The control plane creates a cgroup v2 child and joins the process (`join_prefix` writes
 `cgroup.procs` before exec); on completion/error it `cgroup.kill`s and removes the child so the

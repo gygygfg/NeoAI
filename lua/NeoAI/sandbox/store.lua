@@ -14,9 +14,54 @@ local state = {
   root = nil,
 }
 
+-- 已写入过的候选摘要集合：用于区分「候选曾成功落盘（文件后续丢失可兜底重建）」与
+-- 「从未写入（应用应如实报 CANDIDATE_NOT_FOUND）」。仅内存态，进程退出即失效。
+local written_candidates = {}
+
 -- 快照读缓存：`list_saved` 每次刷新都为每个已保存项读盘 + JSON 解码；待审/已保存
--- 堆积时是主线程热点。写入/删除快照时失效，reset 清空。
+-- 堆积时是主线程热点。写入/删除快照时失效，reset 清空。缓存**有界**（LRU）：
+-- 完整快照含应用前原文件内容，无界缓存会随保存次数持续占用内存。
 local snapshot_cache = {}
+local snapshot_cache_order = {}
+local snapshot_cache_set = {}
+local SNAPSHOT_CACHE_MAX = 8
+
+local function _snapshot_cache_order_remove(id)
+  for i = 1, #snapshot_cache_order do
+    if snapshot_cache_order[i] == id then table.remove(snapshot_cache_order, i); break end
+  end
+end
+
+local function _snapshot_cache_touch(id)
+  if not snapshot_cache_set[id] then return end
+  _snapshot_cache_order_remove(id)
+  snapshot_cache_order[#snapshot_cache_order + 1] = id
+end
+
+local function _snapshot_cache_put(id, value)
+  if not snapshot_cache_set[id] then
+    snapshot_cache_order[#snapshot_cache_order + 1] = id
+    snapshot_cache_set[id] = true
+  else
+    _snapshot_cache_touch(id)
+  end
+  snapshot_cache[id] = value
+  while #snapshot_cache_order > SNAPSHOT_CACHE_MAX do
+    local old = table.remove(snapshot_cache_order, 1)
+    snapshot_cache[old] = nil
+    snapshot_cache_set[old] = nil
+  end
+end
+
+local function _snapshot_cache_invalidate(id)
+  snapshot_cache[id] = nil
+  snapshot_cache_set[id] = nil
+  _snapshot_cache_order_remove(id)
+end
+
+local function _snapshot_cache_clear()
+  snapshot_cache, snapshot_cache_order, snapshot_cache_set = {}, {}, {}
+end
 
 -- 异步落盘（write-behind）：候选/待审体积大（含文件内容），主线程 JSON 编码 + fsync 写入
 -- 会在大候选时卡顿。这里把**文件写入**移到线程池，主线程只做编码；写入按路径串行化
@@ -58,6 +103,12 @@ local function _snapshots_dir()
   return state.root .. "/snapshots"
 end
 
+--- 快照元数据目录：与完整快照同源，但剥离 `alt_content`（原文件内容可能很大）。
+--- 审批界面列示已保存项只需路径/动作/状态，不必把每个快照的原始内容全量解码进内存。
+local function _snapshots_meta_dir()
+  return state.root .. "/snapshots_meta"
+end
+
 --- 变更单元「部分取代」增量目录：记录被更新候选覆盖的路径集合（每个 change_set 一个小文件）。
 --- 单独存放是为了让部分取代只需 O(重叠) 写入，而不必重编码含上万文件的整个变更单元/候选。
 local function _removed_dir()
@@ -79,11 +130,12 @@ local function _ensure_dirs()
   fs.ensure_dir(_evidence_dir())
   fs.ensure_dir(_host_ops_dir())
   fs.ensure_dir(_snapshots_dir())
+  fs.ensure_dir(_snapshots_meta_dir())
   fs.ensure_dir(_blobs_dir())
   fs.ensure_dir(_removed_dir())
   -- 存储根与子目录收紧到 0700：候选/证据含未发布内容与命令详情，避免同机其他用户枚举/读取。
   -- （同 uid 的本地进程属信任边界之外，无法靠权限或摘要防住——见 docs/sandbox.md。）
-  for _, d in ipairs({ state.root, _candidates_dir(), _receipts_dir(), _reviews_dir(), _evidence_dir(), _host_ops_dir(), _snapshots_dir(), _blobs_dir(), _removed_dir() }) do
+  for _, d in ipairs({ state.root, _candidates_dir(), _receipts_dir(), _reviews_dir(), _evidence_dir(), _host_ops_dir(), _snapshots_dir(), _snapshots_meta_dir(), _blobs_dir(), _removed_dir() }) do
     pcall(vim.uv.fs_chmod, d, 448) -- 0700
   end
   return true
@@ -399,6 +451,7 @@ function M.write_candidate(candidate)
   local path = _candidates_dir() .. "/" .. _safe_name(candidate.candidate_digest) .. ".json"
   local ok, err = fs.write_file_atomic(path, json.encode_lossless(candidate))
   if not ok then return false, err end
+  written_candidates[candidate.candidate_digest] = true
   return true
 end
 
@@ -414,6 +467,7 @@ function M.write_candidate_async(candidate)
   if not _ensure_dirs() then return async.resolve(false) end
   local path = _candidates_dir() .. "/" .. _safe_name(candidate.candidate_digest) .. ".json"
   _encode_and_write(path, candidate)
+  written_candidates[candidate.candidate_digest] = true
   return async.resolve(true)
 end
 
@@ -441,7 +495,15 @@ function M.discard_candidate(digest)
   if not state.root then return false end
   local path = _candidates_dir() .. "/" .. _safe_name(digest) .. ".json"
   _cancel_write(path)
+  written_candidates[digest] = nil
   return fs.delete_file(path)
+end
+
+--- 候选摘要是否曾成功写入（用于应用时区分「文件后续丢失」与「从未写入」）。
+--- @param digest string
+--- @return boolean
+function M.was_written(digest)
+  return digest ~= nil and written_candidates[digest] == true
 end
 
 --- 写入发布回执（按 operation_id 可查询，重启后返回同一结果）
@@ -681,26 +743,72 @@ end
 
 --- 写入应用快照（保存时保留原文件版本，供撤销保存时交换）
 --- @param record table { snapshot_id }
+--- 快照元数据（剥离 `alt_content`）：审批界面列示已保存项无需原始内容，落盘小文件避免
+--- 每次开窗全量解码含原文件内容的快照。
+--- @param record table
+--- @return table
+local function _snapshot_meta(record)
+  local files = {}
+  for i, e in ipairs(record.files or {}) do
+    local copy = {}
+    for k, v in pairs(e) do if k ~= "alt_content" then copy[k] = v end end
+    files[i] = copy
+  end
+  local meta = {}
+  for k, v in pairs(record) do meta[k] = v end
+  meta.files = files
+  return meta
+end
+
 --- @return boolean ok
 function M.write_snapshot(record)
   if not _ensure_dirs() then return false end
   local path = _snapshots_dir() .. "/" .. _safe_name(record.snapshot_id) .. ".json"
   local ok = fs.write_file_atomic(path, json.encode_lossless(record))
-  if ok then snapshot_cache[record.snapshot_id] = nil end
+  if ok then
+    _snapshot_cache_invalidate(record.snapshot_id)
+    local mpath = _snapshots_meta_dir() .. "/" .. _safe_name(record.snapshot_id) .. ".json"
+    fs.write_file_atomic(mpath, json.encode_lossless(_snapshot_meta(record)))
+  end
   return ok
 end
 
 --- 异步写入应用快照：快照含原文件内容（撤销保存需交换回真实盘），大文件时同步
 --- `json.encode`（含全表 UTF-8 深扫）+ fsync 会卡主线程。改走 `_encode_and_write`
 --- （`encode_fast` + 线程池写盘），内存缓存保证刚写入即可经 `read_snapshot` 读回。
+--- 同时写入剥离内容的元数据副本（供审批界面列示，内存小）。
 --- @param record table { snapshot_id }
 --- @return Deferred resolve(boolean)
 function M.write_snapshot_async(record)
   if not _ensure_dirs() then return async.resolve(false) end
   local path = _snapshots_dir() .. "/" .. _safe_name(record.snapshot_id) .. ".json"
-  snapshot_cache[record.snapshot_id] = nil
+  local mpath = _snapshots_meta_dir() .. "/" .. _safe_name(record.snapshot_id) .. ".json"
+  _snapshot_cache_invalidate(record.snapshot_id)
   _encode_and_write(path, record)
+  _encode_and_write(mpath, _snapshot_meta(record))
   return async.resolve(true)
+end
+
+--- 读取应用快照元数据（不含 `alt_content`）：优先读元数据文件，缺失时回退完整快照并剥离。
+--- @param snapshot_id string
+--- @return table|nil
+function M.read_snapshot_meta(snapshot_id)
+  if not state.root then return nil end
+  local mpath = _snapshots_meta_dir() .. "/" .. _safe_name(snapshot_id) .. ".json"
+  if write_state.mem[mpath] == nil then
+    local content = fs.read_file(mpath)
+    if content then
+      local decoded = json.decode_lossless(content)
+      if decoded then return decoded end
+    end
+  else
+    local decoded = _read_json(mpath)
+    if decoded then return decoded end
+  end
+  -- 回退：读完整快照（旧记录无元数据文件）并剥离内容。
+  local full = M.read_snapshot(snapshot_id)
+  if not full then return nil end
+  return _snapshot_meta(full)
 end
 
 --- 读取应用快照
@@ -712,15 +820,18 @@ function M.read_snapshot(snapshot_id)
   -- 异步写入尚未落盘：内存缓存优先（与候选/待审一致），保证刚写入即可读回。
   if write_state.mem[path] ~= nil then return _read_json(path) end
   local cached = snapshot_cache[snapshot_id]
-  if cached ~= nil then return cached or nil end
+  if cached ~= nil then
+    _snapshot_cache_touch(snapshot_id)
+    return cached or nil
+  end
   local content = fs.read_file(path)
   if not content then
-    snapshot_cache[snapshot_id] = false -- 负缓存：避免重复读不存在的快照
+    _snapshot_cache_put(snapshot_id, false) -- 负缓存：避免重复读不存在的快照
     return nil
   end
   local decoded = json.decode_lossless(content)
   if not decoded then return nil end
-  snapshot_cache[snapshot_id] = decoded
+  _snapshot_cache_put(snapshot_id, decoded)
   return decoded
 end
 
@@ -729,9 +840,12 @@ end
 --- @return boolean
 function M.delete_snapshot(snapshot_id)
   if not state.root then return false end
-  snapshot_cache[snapshot_id] = nil
+  _snapshot_cache_invalidate(snapshot_id)
   local path = _snapshots_dir() .. "/" .. _safe_name(snapshot_id) .. ".json"
+  local mpath = _snapshots_meta_dir() .. "/" .. _safe_name(snapshot_id) .. ".json"
   _cancel_write(path)
+  _cancel_write(mpath)
+  fs.delete_file(mpath)
   return fs.delete_file(path)
 end
 
@@ -769,7 +883,8 @@ function M.reset()
   write_state.cancelled = {}
   write_state.errors = {}
   write_state.attempts = {}
-  snapshot_cache = {}
+  _snapshot_cache_clear()
+  written_candidates = {}
   if state.root then
     pcall(vim.fn.delete, _candidates_dir(), "rf")
     pcall(vim.fn.delete, _receipts_dir(), "rf")
@@ -777,6 +892,7 @@ function M.reset()
     pcall(vim.fn.delete, _evidence_dir(), "rf")
     pcall(vim.fn.delete, _host_ops_dir(), "rf")
     pcall(vim.fn.delete, _snapshots_dir(), "rf")
+    pcall(vim.fn.delete, _snapshots_meta_dir(), "rf")
     pcall(vim.fn.delete, _blobs_dir(), "rf")
     pcall(vim.fn.delete, _removed_dir(), "rf")
     -- 常驻实例的稳定 overlay/shell 目录（<root>/resident）：实例已由 resident.reset 停止，

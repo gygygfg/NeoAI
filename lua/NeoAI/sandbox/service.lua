@@ -88,10 +88,141 @@ local function _logs_text(svc, tail)
   return text
 end
 
+--- 是否允许按 Restart= 策略自动重启（含 StartLimitBurst/Interval 限流）。
+--- @param svc table
+--- @param restart table { policy, sec?, burst?, interval? }
+--- @param code number 刚退出的退出码
+--- @return boolean
+local function _restart_allows(svc, restart, code)
+  local policy = restart.policy
+  local allow
+  if policy == "always" then allow = true
+  elseif policy == "on-failure" then allow = (code ~= 0)
+  elseif policy == "on-success" then allow = (code == 0)
+  elseif policy == "on-abnormal" then allow = (code ~= 0 and code ~= 143 and code ~= 130)
+  elseif policy == "on-abort" then allow = (svc.signaled == true)
+  else allow = false end
+  if not allow then return false end
+  -- StartLimit：burst 次重启 / interval 秒窗口内，超过则不再重启（真实 systemd 语义）。
+  local burst = tonumber(restart.burst) or 5
+  local interval = tonumber(restart.interval) or 10
+  local now = vim.uv.now()
+  local times = {}
+  for _, tm in ipairs(svc.restart_times or {}) do
+    if now - tm < interval * 1000 then times[#times + 1] = tm end
+  end
+  if #times >= burst then
+    svc.restart_times = times
+    svc.start_limit_hit = true
+    return false
+  end
+  times[#times + 1] = now
+  svc.restart_times = times
+  return true
+end
+
+--- 启动/重启服务进程：按当前 overlay/前缀装配 argv 并（重建）资源域。
+--- `svc.restart` 存在时，进程意外退出会按 RestartSec 延迟自动重启（NRestarts 累加）。
+--- @param svc table
+--- @return boolean|nil ok
+--- @return string|nil err
+local function _spawn(svc)
+  if svc.cg then pcall(cgroup.release, svc.cg); svc.cg = nil end
+  local limits = svc.limits or {}
+  local want_cg = cgroup.limits_configured()
+    or (tonumber(limits.memory_bytes) or 0) > 0
+    or (tonumber(limits.pids) or 0) > 0
+    or (tonumber(limits.cpu_max) or 0) > 0
+  local cg_handle = nil
+  if want_cg then
+    local h, cerr = cgroup.prepare("svc_" .. svc.id, limits)
+    if h then cg_handle = h
+    else logger.warn("[sandbox:service] cgroup 不可用，跳过：%s", tostring(cerr)) end
+  end
+  svc.cg = cg_handle
+
+  local full = {}
+  if cg_handle then
+    for _, v in ipairs(cgroup.join_prefix(cg_handle)) do full[#full + 1] = v end
+  end
+  for _, v in ipairs(svc.prefix) do full[#full + 1] = v end
+  full[#full + 1] = _shell_bin()
+  full[#full + 1] = "-c"
+  full[#full + 1] = svc.shell_command
+
+  local function finish(code)
+    svc.status = "exited"
+    svc.exited = true
+    svc.exit_code = code
+    svc.stopped_at = os.time()
+  end
+
+  local function on_exit(_, code)
+    if svc.cg then pcall(cgroup.release, svc.cg); svc.cg = nil end
+    pcall(function()
+      require("NeoAI.sandbox.net_consent").unregister_ports(svc.internal_ports)
+    end)
+    local restart = svc.restart
+    if restart and not svc.stopping and _restart_allows(svc, restart, code) then
+      svc.restart_count = (svc.restart_count or 0) + 1
+      svc.status = "starting"
+      svc.exited = false
+      svc.exit_code = nil
+      _append_log(svc, string.format(
+        "\n[service] 进程退出（退出码 %s），按 Restart=%s 于 %ss 后重启（第 %d 次）\n",
+        tostring(code), tostring(restart.policy), tostring(restart.sec or 0.1), svc.restart_count))
+      local delay = math.max(100, math.floor((tonumber(restart.sec) or 0.1) * 1000))
+      vim.defer_fn(function()
+        if svc.stopping then return end
+        local ok, err = _spawn(svc)
+        if not ok then
+          finish(1)
+          _append_log(svc, "\n[service] 自动重启失败：" .. tostring(err) .. "\n")
+        end
+      end, delay)
+      return
+    end
+    finish(code)
+    if svc.start_limit_hit then
+      _append_log(svc, string.format(
+        "\n[service] 进程已退出（退出码 %d）；超过 StartLimitBurst，不再自动重启\n", code))
+    else
+      _append_log(svc, string.format("\n[service] 进程已退出，退出码 %d\n", code))
+    end
+  end
+
+  local job = vim.fn.jobstart(full, {
+    cwd = svc.cwd,
+    env = svc.env,
+    stdout_buffered = false,
+    stderr_buffered = false,
+    on_stdout = function(_, data)
+      if data and #data > 0 then _append_log(svc, table.concat(data, "\n") .. "\n") end
+    end,
+    on_stderr = function(_, data)
+      if data and #data > 0 then _append_log(svc, table.concat(data, "\n") .. "\n") end
+    end,
+    on_exit = on_exit,
+  })
+  if job <= 0 then
+    if cg_handle then pcall(cgroup.release, cg_handle) end
+    svc.cg = nil
+    return nil, "无法启动服务进程"
+  end
+  svc.job = job
+  svc.status = "running"
+  svc.exited = false
+  -- 沙箱内部服务端口登记：沙箱内访问这些端口免权限（出沙箱仍按网络策略处理）。
+  pcall(function()
+    svc.internal_ports = require("NeoAI.sandbox.net_consent").register_from_command(svc.command, svc.env)
+  end)
+  return true
+end
+
 --- 构造服务运行环境与进程前缀。
 --- @param svc table
---- @param opts table { cwd?, network?, writable_roots? }
---- @return table|nil full_argv
+--- @param opts table { cwd?, network?, writable_roots?, limits?, restart?, env? }
+--- @return boolean|nil ok
 --- @return string|nil err
 local function _build(svc, opts)
   local cfg = _cfg()
@@ -148,26 +279,26 @@ local function _build(svc, opts)
     session_tmp_dir = tmp_base, tmpfs_base = tmp_base,
   })
   if not prefix then return nil, perr end
+  svc.prefix = prefix
 
-  -- 资源域：服务独立 cgroup，停止时精确终止整个进程树。
-  local cg_handle = nil
-  if cgroup.limits_configured() then
-    local h, cerr = cgroup.prepare("svc_" .. svc.id, cgroup.resolve_limits())
-    if h then cg_handle = h else logger.warn("[sandbox:service] cgroup 不可用，跳过：%s", tostring(cerr)) end
+  -- 资源限制：全局推导基线；单元 MemoryMax/CPUQuota 覆盖对应项。
+  local limits = cgroup.resolve_limits()
+  if type(opts.limits) == "table" then
+    if (tonumber(opts.limits.memory_bytes) or 0) > 0 then
+      limits.memory_bytes = tonumber(opts.limits.memory_bytes)
+    end
+    if (tonumber(opts.limits.cpu_max) or 0) > 0 then limits.cpu_max = tonumber(opts.limits.cpu_max) end
+    if (tonumber(opts.limits.pids) or 0) > 0 then limits.pids = tonumber(opts.limits.pids) end
   end
-  svc.cg = cg_handle
+  svc.limits = limits
+  svc.restart = type(opts.restart) == "table" and opts.restart or nil
+  svc.stopping = false
+  svc.restart_count = 0
 
-  local full = {}
-  if cg_handle then
-    for _, v in ipairs(cgroup.join_prefix(cg_handle)) do full[#full + 1] = v end
-  end
-  for _, v in ipairs(prefix) do full[#full + 1] = v end
-  local unset = runtime.proxy_unset_snippet()
   local command = secret.detokenize(svc.command)
+  local unset = runtime.proxy_unset_snippet()
   if unset then command = unset .. "\n" .. command end
-  full[#full + 1] = _shell_bin()
-  full[#full + 1] = "-c"
-  full[#full + 1] = command
+  svc.shell_command = command
   svc.env = runtime.sandbox_env(priv) or {}
   -- systemctl 门面等调用方可注入单元 Environment= 变量（覆盖沙箱环境同名项）。
   if type(opts.env) == "table" then
@@ -175,7 +306,7 @@ local function _build(svc, opts)
       if type(k) == "string" and v ~= nil then svc.env[k] = tostring(v) end
     end
   end
-  return full, nil
+  return _spawn(svc)
 end
 
 -- ========== 公开 API ==========
@@ -183,7 +314,7 @@ end
 --- 启动一个长驻服务。
 --- @param name string 服务名（唯一）
 --- @param command string shell 命令
---- @param opts table|nil { cwd?, network?, writable_roots? }
+--- @param opts table|nil { cwd?, network?, writable_roots?, limits?, restart?, env?, unit? }
 --- @return table|nil svc
 --- @return string|nil err
 function M.start(name, command, opts)
@@ -203,49 +334,14 @@ function M.start(name, command, opts)
     logs = {}, log_bytes = 0,
     started_at = os.time(), status = "starting", exit_code = nil,
   }
-  local full, err = _build(svc, opts)
-  if not full then
+  local ok, err = _build(svc, opts)
+  if not ok then
     if svc.attempt then candidate.cleanup(svc.attempt.attempt_id) end
     if svc.cg then cgroup.release(svc.cg) end
     return nil, err or "服务启动失败"
   end
-
-  local job = vim.fn.jobstart(full, {
-    cwd = svc.cwd,
-    env = svc.env,
-    stdout_buffered = false,
-    stderr_buffered = false,
-    on_stdout = function(_, data)
-      if data and #data > 0 then _append_log(svc, table.concat(data, "\n") .. "\n") end
-    end,
-    on_stderr = function(_, data)
-      if data and #data > 0 then _append_log(svc, table.concat(data, "\n") .. "\n") end
-    end,
-    on_exit = function(_, code)
-      svc.status = "exited"
-      svc.exited = true
-      svc.exit_code = code
-      svc.stopped_at = os.time()
-      if svc.cg then pcall(cgroup.release, svc.cg); svc.cg = nil end
-      pcall(function()
-        require("NeoAI.sandbox.net_consent").unregister_ports(svc.internal_ports)
-      end)
-      _append_log(svc, string.format("\n[service] 进程已退出，退出码 %d\n", code))
-    end,
-  })
-  if job <= 0 then
-    if svc.attempt then candidate.cleanup(svc.attempt.attempt_id) end
-    if svc.cg then cgroup.release(svc.cg) end
-    return nil, "无法启动服务进程"
-  end
-  svc.job = job
-  svc.status = "running"
   state.services[id] = svc
   state.order[#state.order + 1] = id
-  -- 沙箱内部服务端口登记：沙箱内访问这些端口免权限（出沙箱仍按网络策略处理）。
-  pcall(function()
-    svc.internal_ports = require("NeoAI.sandbox.net_consent").register_from_command(command, svc.env)
-  end)
   return svc
 end
 
@@ -266,11 +362,40 @@ end
 function M.status(key)
   local svc = _find(key)
   if not svc then return nil end
+  local restarts = tonumber(svc.restart_count) or 0
+  local policy = svc.restart and svc.restart.policy or "no"
   return {
     id = svc.id, name = svc.name, status = svc.status, exit_code = svc.exit_code,
     pid = svc.job, cwd = svc.cwd, started_at = svc.started_at, stopped_at = svc.stopped_at,
     log_bytes = svc.log_bytes, command = svc.command, unit = svc.unit,
+    restart_count = restarts, restart_policy = policy,
+    start_limit_hit = svc.start_limit_hit == true,
+    memory_current = cgroup.current_memory(svc.cg),
   }
+end
+
+--- 向服务进程发送信号（systemctl kill 语义）。优先 cgroup 内载荷进程，回退 job PID。
+--- @param key string
+--- @param sig number|nil 信号编号（默认 15/SIGTERM）
+--- @return boolean ok
+--- @return string|nil err
+function M.signal(key, sig)
+  local svc = _find(key)
+  if not svc then return false, "服务不存在：" .. tostring(key) end
+  sig = tonumber(sig) or 15
+  if not svc.exited then svc.signaled = true end
+  if svc.cg then
+    local ok = cgroup.signal(svc.cg, sig)
+    if ok then return true end
+  end
+  if type(svc.job) == "number" and svc.job > 0 then
+    local pid = vim.fn.jobpid(svc.job)
+    if pid and pid > 0 then
+      local ok = pcall(vim.uv.kill, pid, sig)
+      return ok
+    end
+  end
+  return false, "Unit has no processes"
 end
 
 --- 列出全部服务。
@@ -295,6 +420,7 @@ function M.stop(key, cb, opts)
   opts = opts or {}
   local svc = _find(key)
   if not svc then cb("服务不存在：" .. tostring(key)); return end
+  svc.stopping = true
   state.services[svc.id] = nil
   for i, id in ipairs(state.order) do
     if id == svc.id then table.remove(state.order, i); break end
@@ -416,6 +542,7 @@ function M._info(svc)
   return {
     id = svc.id, name = svc.name, status = svc.status, exit_code = svc.exit_code,
     log_bytes = svc.log_bytes, cwd = svc.cwd,
+    restart_count = tonumber(svc.restart_count) or 0,
   }
 end
 

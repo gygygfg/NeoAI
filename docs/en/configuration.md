@@ -261,7 +261,9 @@ sandbox = {
   },
   max_file_bytes = 8 * 1024 * 1024, -- Max bytes per file embedded in a candidate; larger files are copied to a blob (candidate stores only the blob path + stat signature) and published/materialized by file copy, so huge files cannot block the main thread via JSON; 0 = unlimited (embed all)
   work_chunk_files = 128, -- Candidate files per worker task: freeze/hash/secret-scan are chunked and dispatched to the thread pool (multi-core) to avoid single-core serialization on many files; 0/default = 128
-  work_parallelism = 4, -- Max chunk jobs submitted concurrently per batch (default 4, matching the libuv pool): prevents hundreds of chunk jobs from flooding the queue and starving UI-critical jobs (redaction/secret tokenization/disk writes); 0/default = 4
+  -- Concurrent chunk jobs and the libuv thread pool both use the internal max(1, cores-2)
+  -- (see utils/host.lua; UV_THREADPOOL_SIZE is enlarged at startup, an explicitly set env var
+  -- is respected) — no config knob anymore
   -- Read surface (on by default): when true the whole host root is exposed as a **writable overlay**
   -- (lower `/`, session-private upper/work; mounted as-is, any path under the root is writable). All
   -- writes go to the upper staging layer and freeze as candidates, leaving the host disk untouched;
@@ -390,9 +392,12 @@ sandbox = {
   -- routed by the gate; script/pipeline calls go through the entry to the same facade; the host
   -- systemd is never called and the host is never modified. Supports simple/exec/oneshot and
   -- Requires/Wants/After/Before dependencies, expanding `%` specifiers and `${VAR}`;
-  -- notify/forking/dbus/idle types and User=/Group= are best-effort compatible; socket/timer units,
-  -- template units and unknown Type fail explicitly (passing through the sanitized real reason);
-  -- verbs the facade does not handle fall back to the existing T2/hostop proposal path.
+  -- notify/forking/dbus/idle types and User=/Group= are best-effort compatible; socket/template
+  -- units and unknown Type fail explicitly (passing through the sanitized real reason);
+  -- verbs the facade does not handle fall back to the existing T2/hostop proposal path. Also
+  -- supports kill -s, show --property, Restart=/MemoryMax/CPUQuota (auto-restart + cgroup mapping),
+  -- .timer units and systemd-run --on-active (scheduled in-session), and reset-failed (clears the
+  -- failed state/degraded).
   systemd = {
     enabled = true,          -- master switch
     mode = "facade",         -- facade (default): handled inside the sandbox
@@ -437,7 +442,7 @@ sandbox = {
     --   "allow"         = allow directly and record (previous behaviour);
     --   "deny"          = deny directly.
     access = "ask",
-    auto_allow_sources = true,       -- auto-allow software sources (default on): external package sources (PyPI, npm, crates, Tsinghua/Aliyun/USTC mirrors, …) used by pip/uv/npm/go/cargo/apt are allowed through the proxy without a prompt, so package installs are not intercepted by the consent gate. Only non-host-local targets qualify (resolve-to-host/failed DNS is still denied; SSRF protection unchanged); still denied when access="deny"
+    auto_allow_sources = true,       -- auto-allow software sources (default on): external package sources (PyPI, npm, crates, Tsinghua/Aliyun/USTC mirrors, …) used by pip/uv/npm/go/cargo/apt are allowed through the proxy without a prompt, so package installs are not intercepted by the consent gate. Only non-host-local targets qualify (resolve-to-host/failed DNS is still denied; SSRF protection unchanged); still denied when access="deny"; auto-allowed requests are not returned in the command result (only blocks/failures are)
     extra_package_sources = {},      -- extra software-source domain suffixes (private/self-hosted mirrors), e.g. { "pypi.mycorp.com" }; subdomains match automatically
     -- Proxy policy for sandbox external commands: strip (default: do not pass host proxies into the
     -- sandbox; e.g. mihomo only proxies opencode itself, avoiding an unreachable host
@@ -534,7 +539,24 @@ sandbox = {
   --           (default off; re-audits when the pending set changes). Global concurrency cap
   --           max_concurrent (default 10; excess in-flight requests queue FIFO) avoids a request
   --           storm when auto fires frequently.
+  -- Many-file optimizations:
+  --   max_display_files: max file rows rendered per change set in the review UI (0 = unlimited);
+  --     beyond it they collapse into one "N more files" summary row (mapped to whole-unit approval),
+  --     so opening/refreshing stays fast with thousands of files (package installs/git ops).
+  --   refresh_debounce_ms: review-window refresh debounce (ms); multiple sandbox events within the
+  --     window are coalesced into one redraw.
+  --   content_cache_max: LRU cap for on-demand candidate file content (diff preview); in-memory items
+  --     strip content after persisting, so staging many files does not double memory.
+  --   terminal_cache_max: cap on terminal (REJECTED/SUPERSEDED/EXPIRED) change sets kept in memory;
+  --     excess items are evicted and re-read from disk on demand (no data loss).
+  --   cas_mode: publish CAS mode "hash" (default, strictest) | "auto" | "sig"; non-default loosens
+  --     consistency detection.
+  --   snapshot_cas: undo-snapshot CAS "sig" (default, signatures, less CPU) | "hash" (content hash,
+  --     strictest).
   review = { enabled = true, auto_apply = false, session_auto_approve = false,
+             max_display_files = 200, refresh_debounce_ms = 80,
+             content_cache_max = 64, terminal_cache_max = 200, cas_mode = "hash",
+             snapshot_cas = "sig",
              l3_warning = { enabled = true, package_confirm = true, max_tokens = 256, timeout_ms = 15000 },
              ai_audit = { enabled = true, auto = false, key = "a", max_concurrent = 10,
                           max_diff_chars = 8000, max_user_chars = 4000, max_total_chars = 60000,
@@ -567,6 +589,7 @@ sandbox = {
   -- CAP_MKNOD — device nodes are hard-blocked by the seccomp baseline, FIFOs unaffected.
   packages = {
     mode = "review", -- review (safe installs need confirmation but cap at moderate L1; sensitive installs touching repos/keys stay L2) | allow | deny
+    signature_mode = true, -- package/generated content (uv sync .venv, node_modules, site-packages, ...) freezes candidates with mtime/nsec/size signatures instead of per-file content hashing, and moves mask/git/level classification into worker threads: avoids pure-Lua SHA and main-thread resolve for thousands of files (CPU/UI stalls). Trade-off: same-size + same-mtime content edits are not detected (these trees are force-reviewed anyway). false reverts to content hashing (strongest consistency, slower)
     managers = { "apt", "apt-get", "pip", "pip3", "uv", "conda", "npm", "npx", "pnpm", "yarn", "go", "cargo", "gem", "composer" }, -- package-manager names (command recognition); path signatures via privilege.package_path_manager; sensitive-install detection via privilege.package_sensitive
     roots = { "/usr", "/var", "/etc", "~/.cache", "~/.npm", "~/.nvm", "~/.cargo", "~/.rustup", "~/go", "~/.local" }, -- package-install writable roots (overlay staging). /etc lets dpkg postinst write /etc/ld.so.cache etc.; sensitive entries stay masked by mask_paths
     volatile_paths = { "/var/lib/apt/lists", "/var/cache/apt", "/var/cache/dnf", "/var/cache/yum", "/var/cache/pacman/pkg", "/var/cache/apk", "~/.cache/pip", "~/.cache/uv", "~/.npm/_cacache", "~/.cache/yarn", "~/.cargo/registry/cache", "~/.cache/go-build" }, -- volatile package indexes/caches: skipped when freezing a candidate (not queued, not published) so an apt-update baseline change cannot fail the whole install with BASELINE_CHANGED; the install is unaffected (dpkg/status, package files still apply); {} disables. Do not add state files like /var/lib/dpkg/status
@@ -586,8 +609,9 @@ sandbox = {
   -- resources so a sandboxed command cannot starve the machine; explicit static values (>0) win.
   -- Inside a container the actual cgroup quota is also read (/proc/self/cgroup, walking the parent
   -- chain for memory.max/cpu.max) and min-ed in, so host resources are never over-estimated.
-  -- All concurrent attempts share a parent domain: cpu_global_max is the total concurrent CPU
-  -- budget (default nproc-1), cpu_cores_max is the per-task quota.
+  -- CPU core budget is the internal max(1, cores-2) (see utils/host.lua): all concurrent attempts
+  -- share a parent domain whose total budget and each child's per-task quota are derived from it
+  -- (the container quota still caps it); no config knobs anymore.
   -- With fail_closed=false, an unavailable cgroup is skipped rather than blocking execution.
   -- disk_bytes: sandbox staging disk cap (bytes; 0 = unlimited). It totals the staging base
   -- (process overlay/private tmp) plus the sandbox store root (candidates/review/evidence/service
@@ -598,7 +622,7 @@ sandbox = {
   -- (cgroup v2 write isolation); confined to that subtree, never touching other host cgroups;
   -- skipped automatically in gateway mode (ip netns exec).
   limits = { wall_ms = 60000, dynamic = true, memory_ratio = 0.75, memory_max_bytes = 0,
-    cpu_cores_max = 8, cpu_global_max = 0, pids_max = 8192, memory_bytes = 0, pids = 0, cpu_max = 0,
+    pids_max = 8192, memory_bytes = 0, pids = 0,
     cpu_affinity = "auto", -- sandbox CPU affinity: auto=pins to cores other than nvim's current CPU (so it does not compete with nvim); off/false=no pinning; "2,3"/"2-3"=explicit cpuset (needs taskset)
     cgroup_base = "/sys/fs/cgroup", fail_closed = false, delegate_cgroup = true,
     disk_bytes = 64 * 1024 * 1024 * 1024 }, -- 64 GiB (0 = unlimited)

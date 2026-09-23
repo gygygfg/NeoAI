@@ -189,16 +189,6 @@ local function _parent_path()
   return _base() .. "/" .. PARENT_NAME
 end
 
---- 宿主逻辑 CPU 数（用于动态 CPU 配额）
---- @return number
-local function _nproc()
-  local ok, cpus = pcall(vim.uv.cpus)
-  if ok and type(cpus) == "table" and #cpus > 0 then return #cpus end
-  local raw = vim.fn.system("nproc 2>/dev/null") or ""
-  local n = tonumber((raw:gsub("%s+$", "")))
-  return (n and n > 0) and n or 1
-end
-
 --- 宿主物理内存总量（字节；读取 /proc/meminfo）
 --- @return number
 local function _mem_total_bytes()
@@ -283,7 +273,8 @@ function M.resolve_limits()
   local out = {
     memory_bytes = tonumber(cfg.memory_bytes) or 0,
     pids = tonumber(cfg.pids) or 0,
-    cpu_max = tonumber(cfg.cpu_max) or 0,
+    -- CPU 配额无静态配置项：始终按内部 `max(1, 核数-2)`（容器配额封顶）推导。
+    cpu_max = 0,
   }
   if cfg.dynamic == false then return out end
   -- 容器/宿主 cgroup 实际配额：容器内 /proc/meminfo 与 nproc 常反映宿主资源，
@@ -305,28 +296,24 @@ function M.resolve_limits()
     local pm = tonumber(cfg.pids_max) or 2048
     if pm > 0 then out.pids = pm end
   end
-  -- 动态：CPU 配额取 min(宿主核数, cpu_cores_max, 容器配额) 个核
+  -- 动态：CPU 配额取 min(核数预算 max(1, 核数-2), 容器配额) 个核
   if out.cpu_max <= 0 then
-    local cores_max = tonumber(cfg.cpu_cores_max) or 4
-    local cores = math.min(_nproc(), math.max(1, cores_max))
+    local cores = require("NeoAI.utils.host").core_budget()
     if quota.cpu_cores then cores = math.min(cores, quota.cpu_cores) end
     if cores > 0 then out.cpu_max = cores * 100000 end
   end
   return out
 end
 
---- 全局 CPU 预算（核）：静态 `cpu_global_max>0` 优先，否则 `max(1, 核数 - 1)`。
---- 保留 1 个核给 nvim/UI，避免沙箱并发任务吃满整机导致界面卡顿（计时器无法刷新）。
---- 父域 `cpu.max` 用该预算，子域配额再按 `cpu_cores_max` 细分，保证总量不超卖。
+--- 全局 CPU 预算（核）：统一 `max(1, 核数 - 2)`（`utils.host.core_budget`），并受容器配额封顶。
+--- 预留 2 个核给 nvim/UI，避免沙箱并发任务吃满整机导致界面卡顿（计时器无法刷新）。
+--- 父域 `cpu.max` 用该预算，子域配额再据此细分，保证总量不超卖。
 --- @return number 核数
 function M.global_cpu_max()
-  local cfg = require("NeoAI.kernel.config_store").get("tools.sandbox.limits") or {}
-  local explicit = tonumber(cfg.cpu_global_max) or 0
-  if explicit > 0 then return explicit end
-  local n = _nproc()
+  local n = require("NeoAI.utils.host").core_budget()
   local quota = _cgroup_quota()
   if quota.cpu_cores then n = math.min(n, quota.cpu_cores) end
-  return math.max(1, n - 1)
+  return math.max(1, n)
 end
 
 --- 单个子域实际生效的 CPU 配额（微秒/100ms）：不超过全局预算。
@@ -380,7 +367,7 @@ end
 function M.limits_configured()
   local limits = require("NeoAI.kernel.config_store").get("tools.sandbox.limits") or {}
   if limits.dynamic ~= false then return true end
-  return (limits.memory_bytes or 0) > 0 or (limits.pids or 0) > 0 or (limits.cpu_max or 0) > 0
+  return (limits.memory_bytes or 0) > 0 or (limits.pids or 0) > 0
 end
 
 --- 准备资源域并写入限制
@@ -503,6 +490,26 @@ function M.adopt(handle, attempt_id)
   state.handles[attempt_id] = handle
 end
 
+--- 向资源域内载荷进程发送信号（跳过 bwrap 监视进程）。返回是否有进程收到信号。
+--- @param handle table
+--- @param sig number 信号编号
+--- @return boolean
+function M.signal(handle, sig)
+  if not handle or not handle.path then return false end
+  sig = tonumber(sig) or 15
+  local raw = _read_file(handle.path .. "/cgroup.procs")
+  if not raw then return false end
+  local n = 0
+  for pid in raw:gmatch("%d+") do
+    local comm = _read_file("/proc/" .. pid .. "/comm")
+    if not (comm and comm:match("^bwrap")) then
+      local ok = pcall(vim.uv.kill, tonumber(pid), sig)
+      if ok then n = n + 1 end
+    end
+  end
+  return n > 0
+end
+
 --- 向资源域内载荷进程发送 SIGTERM（优雅停止；不删除目录，幂等）。
 --- 跳过 bwrap 监视进程：bwrap 载荷在独立 pid 命名空间内运行，对 bwrap 发 SIGTERM 会立即
 --- 触发命名空间销毁，载荷来不及执行 SIGTERM trap（实测 trap 不生效）。只对载荷进程发
@@ -522,6 +529,16 @@ function M.term(handle)
     end
   end
   return n
+end
+
+--- 资源域当前内存占用（字节；读取 memory.current，不可用返回 nil）。
+--- @param handle table|nil
+--- @return number|nil
+function M.current_memory(handle)
+  if not handle or not handle.path then return nil end
+  local raw = _read_file(handle.path .. "/memory.current")
+  if not raw then return nil end
+  return tonumber((raw:gsub("%s+$", "")))
 end
 
 --- 立即终止资源域内所有进程（不删除目录，幂等）。

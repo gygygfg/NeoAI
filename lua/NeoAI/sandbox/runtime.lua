@@ -2010,6 +2010,27 @@ function M.is_masked_path(path, unmask)
   return nil
 end
 
+--- 遮蔽判定所需的上下文快照（供工作线程用原生 `vim.uv.fs_realpath` 批量分类，避免主线程
+--- 逐文件 `vim.fn.resolve`）。返回配置的遮蔽条目及其规范化形式、沙箱存储根（原始/规范化）。
+--- @return table { paths: string[], canon: string[], store_root: string, store_root_canon: string }
+function M.mask_context()
+  local paths = _config_mask_paths()
+  local canon = _mask_paths_canonical()
+  local sr = ""
+  local ok, store = pcall(require, "NeoAI.sandbox.store")
+  if ok and store and store.root then
+    sr = (store.root() or ""):gsub("/+$", "")
+  end
+  local canon_sr = ""
+  if sr ~= "" then
+    if state.store_root_raw ~= sr or state.store_root_canon == nil then
+      state.store_root_raw, state.store_root_canon = sr, _canonical(sr)
+    end
+    canon_sr = state.store_root_canon
+  end
+  return { paths = paths, canon = canon, store_root = sr, store_root_canon = canon_sr }
+end
+
 --- 路径是否位于某个 git 仓库的内部目录（`.git`）之下。
 --- 用于文件写入工具拒绝直接改仓库内部（AI 不应手改 `.git`）。git 变更走专用工具，其 `.git`
 --- 改动由 `git_path_class` 分类后**原子化**暂存/发布（对象先于指针），不会损坏索引。
